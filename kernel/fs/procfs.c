@@ -1470,27 +1470,163 @@ static int r_net_unix(usize pid, struct sbuf *s) {
 }
 
 /* /proc/net/route: hex, tab-separated. Destination/Gateway/Mask are 8 hex
- * digits in little-endian byte order. BusyBox `route` parses this. We emit the
- * default route via the DHCP-learnt gateway. */
+ * digits in little-endian byte order. BusyBox `route` parses this. M84: the
+ * rows are the real FIB (kernel/net/route.c), not a synthesised /24 + default
+ * pair, so a manually added or non-/24 route shows up here. */
 static int r_net_route(usize pid, struct sbuf *s) {
   (void)pid;
   sb_puts(s, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask"
              "\t\tMTU\tWindow\tIRTT\n");
-  struct ipv4_addr ip = net_get_ip();
-  struct ipv4_addr gw = net_get_gateway();
-  const char *ifn = "eth0";
-  if ((ip.bytes[0] | ip.bytes[1] | ip.bytes[2] | ip.bytes[3]) != 0) {
-    /* On-link subnet route, assumed /24 (the QEMU SLIRP default and what the
-     * smoke uses): dest = ip & 0xFFFFFF00, no gateway, flags UP (0x0001). */
-    sb_addf(s,
-            "%s\t%02X%02X%02X00\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n",
-            ifn, ip.bytes[2], ip.bytes[1], ip.bytes[0]);
+  struct route_info rt[32];
+  usize n = route_snapshot(rt, 32);
+  for (usize i = 0; i < n; i++) {
+    /* Host-order u32 -> the little-endian hex Linux prints (least significant
+     * byte first, i.e. the first octet of the dotted quad last). */
+    sb_addf(s, "%s\t%02X%02X%02X%02X\t%02X%02X%02X%02X\t%04X\t0\t0\t%u"
+               "\t%02X%02X%02X%02X\t0\t0\t0\n",
+            rt[i].iface,
+            (unsigned)(rt[i].dst & 0xFF), (unsigned)((rt[i].dst >> 8) & 0xFF),
+            (unsigned)((rt[i].dst >> 16) & 0xFF), (unsigned)((rt[i].dst >> 24) & 0xFF),
+            (unsigned)(rt[i].gateway & 0xFF), (unsigned)((rt[i].gateway >> 8) & 0xFF),
+            (unsigned)((rt[i].gateway >> 16) & 0xFF),
+            (unsigned)((rt[i].gateway >> 24) & 0xFF),
+            (unsigned)rt[i].flags, (unsigned)rt[i].metric,
+            (unsigned)(rt[i].mask & 0xFF), (unsigned)((rt[i].mask >> 8) & 0xFF),
+            (unsigned)((rt[i].mask >> 16) & 0xFF),
+            (unsigned)((rt[i].mask >> 24) & 0xFF));
   }
-  if ((gw.bytes[0] | gw.bytes[1] | gw.bytes[2] | gw.bytes[3]) != 0) {
-    /* default route: 0.0.0.0/0 -> gateway, flags UP|GATEWAY (0x0003) */
-    sb_addf(s,
-            "%s\t00000000\t%02X%02X%02X%02X\t0003\t0\t0\t0\t00000000\t0\t0\t0\n",
-            ifn, gw.bytes[3], gw.bytes[2], gw.bytes[1], gw.bytes[0]);
+  return 0;
+}
+
+/* /proc/net/rt_tables — every route in every policy table, plus the write
+ * interface that manages them (see kernel/net/route.c for the grammar). This
+ * is b1nix's equivalent of `ip route add ... table N`: there is no rtnetlink,
+ * so the control plane is text. */
+static int r_net_rt_tables(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "# table\tprefix\tgateway\tdev\tmetric\tflags\n");
+  struct route_info rt[64];
+  usize n = route_snapshot(rt, 64);
+  for (usize i = 0; i < n; i++) {
+    int plen = 0;
+    for (int b = 31; b >= 0; b--) {
+      if (rt[i].mask & (1u << b))
+        plen++;
+    }
+    sb_addf(s, "%u\t%u.%u.%u.%u/%d\t%u.%u.%u.%u\t%s\t%u\t%04X\n",
+            (unsigned)rt[i].table, (unsigned)((rt[i].dst >> 24) & 0xFF),
+            (unsigned)((rt[i].dst >> 16) & 0xFF),
+            (unsigned)((rt[i].dst >> 8) & 0xFF), (unsigned)(rt[i].dst & 0xFF),
+            plen, (unsigned)((rt[i].gateway >> 24) & 0xFF),
+            (unsigned)((rt[i].gateway >> 16) & 0xFF),
+            (unsigned)((rt[i].gateway >> 8) & 0xFF),
+            (unsigned)(rt[i].gateway & 0xFF), rt[i].iface,
+            (unsigned)rt[i].metric, (unsigned)rt[i].flags);
+  }
+
+  struct route6_info r6[64];
+  usize n6 = route6_snapshot(r6, 64);
+  for (usize i = 0; i < n6; i++) {
+    sb_addf(s, "%u\t", (unsigned)r6[i].table);
+    for (int b = 0; b < 16; b++)
+      sb_addf(s, "%02x", (unsigned)r6[i].dst[b]);
+    sb_addf(s, "/%u\t", (unsigned)r6[i].plen);
+    for (int b = 0; b < 16; b++)
+      sb_addf(s, "%02x", (unsigned)r6[i].gateway[b]);
+    sb_addf(s, "\t%s\t%u\t%04X\n", r6[i].iface, (unsigned)r6[i].metric,
+            (unsigned)r6[i].flags);
+  }
+  return 0;
+}
+
+static int w_net_rt_tables(usize pid, const char *buf, usize len) {
+  (void)pid;
+  if (route_control_write(buf, len) != 0)
+    return -EINVAL;
+  return (int)len;
+}
+
+/* /proc/net/rt_rules — the policy rules themselves (`ip rule` equivalent). */
+static int r_net_rt_rules(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "# prio\tfamily\tfrom\tiif\ttable\n");
+  struct route_rule_info ru[16];
+  usize n = route_rule_snapshot(ru, 16);
+  /* Ascending priority, the order the lookup consults them in. */
+  for (usize pass = 0; pass < n; pass++) {
+    usize best = n;
+    for (usize i = 0; i < n; i++) {
+      if (ru[i].prio == 0xFFFFFFFFu)
+        continue;
+      if (best == n || ru[i].prio < ru[best].prio)
+        best = i;
+    }
+    if (best == n)
+      break;
+    char ifname[8] = "any";
+    if (ru[best].iif)
+      netdev_ifname(ru[best].iif, ifname, sizeof(ifname));
+    if (ru[best].family == 6) {
+      sb_addf(s, "%u\tinet6\t", (unsigned)ru[best].prio);
+      if (ru[best].src6_plen) {
+        for (int b = 0; b < 16; b++)
+          sb_addf(s, "%02x", (unsigned)ru[best].src6[b]);
+        sb_addf(s, "/%u", (unsigned)ru[best].src6_plen);
+      } else {
+        sb_puts(s, "all");
+      }
+      sb_addf(s, "\t%s\t%u\n", ifname, (unsigned)ru[best].table);
+    } else {
+      int plen = 0;
+      for (int b = 31; b >= 0; b--) {
+        if (ru[best].src_mask & (1u << b))
+          plen++;
+      }
+      sb_addf(s, "%u\tinet\t", (unsigned)ru[best].prio);
+      if (ru[best].src_mask)
+        sb_addf(s, "%u.%u.%u.%u/%d", (unsigned)((ru[best].src >> 24) & 0xFF),
+                (unsigned)((ru[best].src >> 16) & 0xFF),
+                (unsigned)((ru[best].src >> 8) & 0xFF),
+                (unsigned)(ru[best].src & 0xFF), plen);
+      else
+        sb_puts(s, "all");
+      sb_addf(s, "\t%s\t%u\n", ifname, (unsigned)ru[best].table);
+    }
+    ru[best].prio = 0xFFFFFFFFu; /* consumed */
+  }
+  return 0;
+}
+
+static int w_net_rt_rules(usize pid, const char *buf, usize len) {
+  (void)pid;
+  if (route_rule_control_write(buf, len) != 0)
+    return -EINVAL;
+  return (int)len;
+}
+
+/* /proc/net/ipv6_route: Linux format — 32 hex digits of destination, prefix
+ * length, 32 hex digits of source, source prefix length, 32 hex digits of the
+ * next hop, metric, refcnt, use, flags, interface name. M84: rendered from the
+ * real IPv6 FIB. */
+static void sb_put_in6_hex(struct sbuf *s, const u8 *a) {
+  for (int i = 0; i < 16; i++)
+    sb_addf(s, "%02x", (unsigned)a[i]);
+}
+
+static int r_net_ipv6_route(usize pid, struct sbuf *s) {
+  (void)pid;
+  struct route6_info rt[32];
+  usize n = route6_snapshot(rt, 32);
+  u8 zero[16];
+  memset(zero, 0, sizeof(zero));
+  for (usize i = 0; i < n; i++) {
+    sb_put_in6_hex(s, rt[i].dst);
+    sb_addf(s, " %02x ", (unsigned)rt[i].plen);
+    sb_put_in6_hex(s, zero);
+    sb_puts(s, " 00 ");
+    sb_put_in6_hex(s, rt[i].gateway);
+    sb_addf(s, " %08x %08x %08x %08x %8s\n", (unsigned)rt[i].metric, 0u, 0u,
+            (unsigned)rt[i].flags, rt[i].iface);
   }
   return 0;
 }
@@ -1598,6 +1734,10 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
     procfs_mkchild(netd, "udp6", VFS_DEVICE, r_net_udp6, 0);
     procfs_mkchild(netd, "unix", VFS_DEVICE, r_net_unix, 0);
     procfs_mkchild(netd, "route", VFS_DEVICE, r_net_route, 0);
+    procfs_mkchild(netd, "ipv6_route", VFS_DEVICE, r_net_ipv6_route, 0);
+    procfs_mkchild_writable(netd, "rt_tables", r_net_rt_tables,
+                            w_net_rt_tables);
+    procfs_mkchild_writable(netd, "rt_rules", r_net_rt_rules, w_net_rt_rules);
     procfs_mkchild(netd, "dev", VFS_DEVICE, r_net_dev, 0);
   }
 

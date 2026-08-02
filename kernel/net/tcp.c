@@ -65,21 +65,106 @@ struct tcp_pseudo {
  * plus the white-box kernel TCP tests that run right after would otherwise
  * exhaust a 16-slot table and fail to allocate (tcp_accept -> NULL). */
 #define MAX_TCP_CONNS_CEIL 256
-/* Receive buffer / advertised window. Sized to hold a full 16 KiB TLS record
- * (and a typical TLS handshake cert flight) so HTTPS handshakes don't have to
- * be drained in 4 KiB chunks. Combined with the window-update ACK in
- * tcp_recv() (see recv_window_update), this keeps the peer from ever parking on
- * its zero-window persist timer — which previously cost ~5 s per fresh HTTPS
- * connection (zero-window stall on multi-KiB cert flights). */
-#define TCP_RECV_BUF_SIZE 16384
+/* Receive buffer / advertised window. Sized to hold several TLS records so
+ * HTTPS handshakes don't have to be drained in small chunks. Combined with the
+ * window-update ACK in tcp_recv() (see recv_window_update), this keeps the peer
+ * from ever parking on its zero-window persist timer — which previously cost
+ * ~5 s per fresh HTTPS connection (zero-window stall on multi-KiB cert
+ * flights).
+ *
+ * M84: the buffer is allocated per connection instead of being an array inside
+ * struct tcp_conn. A 64 KiB inline buffer times the 256-slot connection table
+ * would be 16 MiB of permanently resident BSS; heap-allocating it costs memory
+ * only for live connections, and it is what makes a receive window larger than
+ * the unscaled 16-bit maximum — and therefore a non-zero advertised window
+ * scale — affordable at all. */
+#define TCP_RECV_BUF_SIZE 65536
+/* The window field of a SYN is never scaled, so it cannot express more than
+ * 65535 no matter how large the buffer is. */
+#define TCP_SYN_WINDOW                                                         \
+  (TCP_RECV_BUF_SIZE > 65535 ? 65535 : TCP_RECV_BUF_SIZE)
 #define TCP_SEND_BUF_SIZE 4096
 #define TCP_MSS 1460
 #define TCP_TIME_WAIT_TICKS 200
+
+/* ── M84: TCP options ──────────────────────────────────────────────────────
+ * Before this the stack neither sent nor parsed a single option: every SYN
+ * went out with a bare 20-byte header, so the peer's advertised window was
+ * read unscaled (capped at 64 KB no matter what the peer offered) and its MSS
+ * was ignored. */
+#define TCP_OPT_END       0
+#define TCP_OPT_NOP       1
+#define TCP_OPT_MSS       2
+#define TCP_OPT_WSCALE    3
+#define TCP_OPT_SACK_PERM 4
+#define TCP_OPT_SACK      5
+
+/* NOP, NOP, kind, len + up to 3 eight-byte blocks. Three is what every real
+ * stack emits: it is what fits alongside a timestamp option, and it covers the
+ * holes that matter in practice. */
+#define TCP_SACK_MAX_BLOCKS 3
+#define TCP_SACK_OPT_LEN(n) ((n) ? (4 + 8 * (n)) : 0)
+#define TCP_ACK_MAX_LEN                                                        \
+  (sizeof(struct tcp_header) + TCP_SACK_OPT_LEN(TCP_SACK_MAX_BLOCKS))
+
+/* MSS(4) + SACK-permitted(2) + window-scale(3) + NOP,NOP,EOL(3) — 12 bytes,
+ * 4-byte aligned so the data offset is exactly 8 words. */
+#define TCP_SYN_OPT_LEN 12
+#define TCP_OPT_EOL_PAD TCP_OPT_END
+#define TCP_SYN_HDR_LEN (sizeof(struct tcp_header) + TCP_SYN_OPT_LEN)
+
+/* The shift we advertise: the smallest one that lets our receive buffer be
+ * expressed in the 16-bit window field. At 16 KiB that is 0 — we still send
+ * the option, because a window-scale option in our SYN is what permits the
+ * *peer* to scale its own (potentially much larger) window. */
+#define TCP_RCV_WSCALE                                                         \
+  (TCP_RECV_BUF_SIZE <= 65535 ? 0                                              \
+   : TCP_RECV_BUF_SIZE <= 131071 ? 1                                           \
+   : TCP_RECV_BUF_SIZE <= 262143 ? 2                                           \
+                                 : 3)
+
+/* Out-of-order reassembly budget. A segment arriving past a hole is buffered
+ * here instead of being dropped (which forced the peer into a retransmit
+ * timeout for every reordered or single-lost packet). */
+#define TCP_OOO_MAX_SEGS 16
+#define TCP_OOO_MAX_BYTES TCP_RECV_BUF_SIZE
+
+struct tcp_opts {
+  u16 mss;
+  u8 wscale;
+  u8 has_wscale;
+  u8 sack_ok;
+  /* SACK blocks carried by this segment (kind 5), left/right edges. */
+  u8 nsack;
+  u32 sack_left[TCP_SACK_MAX_BLOCKS + 1];
+  u32 sack_right[TCP_SACK_MAX_BLOCKS + 1];
+};
+
+/* One buffered out-of-order segment. The list is kept sorted by sequence
+ * number; overlaps are resolved when it drains, not on insert. */
+struct tcp_ooo_seg {
+  u32 seq;
+  u32 len;
+  u8 *data;
+  struct tcp_ooo_seg *next;
+};
 
 struct tcp_retransmit_pkt {
   u8 *data;
   usize len;
   u32 seq;
+  /* M84: sequence space this packet occupies (payload bytes, or 1 for a bare
+   * SYN/FIN) — needed to decide whether a SACK block covers it. */
+  u32 dlen;
+  /* M84: the peer reported this segment as received out of order. It must not
+   * be retransmitted, but it stays queued until the cumulative ACK covers it,
+   * because SACK information is advisory and may be reneged. */
+  u8 sacked;
+  /* M84 (RFC 6675): the scoreboard declared this segment lost — enough
+   * higher-sequence data has been SACKed that it cannot still be in flight.
+   * `retransmitted` keeps the pipe estimate honest after we resend it. */
+  u8 lost;
+  u8 retransmitted;
   u64 timestamp;
   int retries;
   struct tcp_retransmit_pkt *next;
@@ -119,10 +204,48 @@ struct tcp_conn {
   u32 cwnd;
   u32 ssthresh;
   int dup_acks;
-  u8 recv_buf[TCP_RECV_BUF_SIZE];
+  u8 *recv_buf; /* TCP_RECV_BUF_SIZE bytes, allocated on connection setup */
   u32 recv_len;
   u32 recv_read;
   u8 wnd_closed; /* last advertised receive window was < 1 MSS (peer throttled) */
+  /* M84: negotiated options.
+   *   snd_wscale — shift to apply to the peer's advertised window. Non-zero
+   *                only when both SYNs carried a window-scale option.
+   *   snd_mss    — largest segment the peer accepts (its MSS option, or the
+   *                RFC 1122 default of 536 when it sent none).
+   *   sack_ok    — peer permitted SACK. We do not emit SACK blocks yet, but
+   *                the flag records the negotiation. */
+  u8 snd_wscale;
+  u8 rcv_wscale;
+  u8 wscale_ok;
+  u8 sack_ok;
+  u16 snd_mss;
+  /* M84: SACK scoreboard (RFC 6675) and DSACK (RFC 2883) state.
+   *
+   *   sacked_bytes   — bytes above snd_una the peer reported as received.
+   *   high_sack      — highest right edge ever SACKed in this recovery.
+   *   in_recovery    — inside SACK-based loss recovery. While set, cwnd is
+   *                    NOT inflated per dup-ACK; transmission is governed by
+   *                    the pipe estimate instead.
+   *   recovery_point — snd_nxt when recovery started. Recovery ends once the
+   *                    cumulative ACK reaches it.
+   *   prior_*        — cwnd/ssthresh before recovery, so a DSACK proving the
+   *                    retransmission was spurious can undo the reduction.
+   *   dsack_*        — a duplicate we owe the peer a D-SACK report for. */
+  u32 sacked_bytes;
+  u32 high_sack;
+  u8 in_recovery;
+  u8 dsack_pending;
+  u32 recovery_point;
+  u32 prior_cwnd;
+  u32 prior_ssthresh;
+  u32 dsack_left;
+  u32 dsack_right;
+  u32 dsack_seen;   /* count of D-SACKs received (spurious retransmits) */
+  /* Out-of-order reassembly queue, sorted by sequence number. */
+  struct tcp_ooo_seg *ooo_queue;
+  u32 ooo_bytes;
+  u32 ooo_segs;
   int handed_to_user;
   u64 time_wait_since;
   struct tcp_retransmit_pkt *retransmit_queue;
@@ -177,6 +300,427 @@ static void tcp_clear_retransmit_queue(struct tcp_conn *conn) {
   tcp_unlock();
   irq_restore(irq);
   tcp_free_retransmit_list(detached);
+}
+
+static u16 bswap16(u16 v);
+static u32 bswap32(u32 v);
+
+/* ── M84: option parsing / emission ──────────────────────────────────────── */
+
+static void tcp_parse_options(const void *segment, usize data_offset,
+                              struct tcp_opts *o) {
+  o->mss = 0;
+  o->wscale = 0;
+  o->has_wscale = 0;
+  o->sack_ok = 0;
+  o->nsack = 0;
+  if (data_offset <= sizeof(struct tcp_header))
+    return;
+
+  const u8 *p = (const u8 *)segment + sizeof(struct tcp_header);
+  usize left = data_offset - sizeof(struct tcp_header);
+  while (left > 0) {
+    u8 kind = p[0];
+    if (kind == TCP_OPT_END)
+      break;
+    if (kind == TCP_OPT_NOP) {
+      p++;
+      left--;
+      continue;
+    }
+    if (left < 2)
+      break;
+    u8 len = p[1];
+    /* A length below 2 would not advance the walk (infinite loop), and one
+     * past the option area is a malformed segment. */
+    if (len < 2 || (usize)len > left)
+      break;
+    if (kind == TCP_OPT_MSS && len == 4) {
+      o->mss = (u16)(((u16)p[2] << 8) | p[3]);
+    } else if (kind == TCP_OPT_WSCALE && len == 3) {
+      o->has_wscale = 1;
+      /* RFC 7323: shifts above 14 must be clamped. */
+      o->wscale = p[2] > 14 ? 14 : p[2];
+    } else if (kind == TCP_OPT_SACK_PERM && len == 2) {
+      o->sack_ok = 1;
+    } else if (kind == TCP_OPT_SACK && len >= 10 && ((len - 2) % 8) == 0) {
+      u8 n = (u8)((len - 2) / 8);
+      if (n > TCP_SACK_MAX_BLOCKS + 1)
+        n = TCP_SACK_MAX_BLOCKS + 1;
+      for (u8 b = 0; b < n; b++) {
+        const u8 *q = p + 2 + b * 8;
+        o->sack_left[b] = ((u32)q[0] << 24) | ((u32)q[1] << 16) |
+                          ((u32)q[2] << 8) | q[3];
+        o->sack_right[b] = ((u32)q[4] << 24) | ((u32)q[5] << 16) |
+                           ((u32)q[6] << 8) | q[7];
+      }
+      o->nsack = n;
+    }
+    p += len;
+    left -= len;
+  }
+}
+
+/* Fill the TCP_SYN_OPT_LEN option area of a SYN / SYN-ACK. */
+static void tcp_build_syn_options(u8 *opt) {
+  opt[0] = TCP_OPT_MSS;
+  opt[1] = 4;
+  opt[2] = (u8)(TCP_MSS >> 8);
+  opt[3] = (u8)(TCP_MSS & 0xFF);
+  opt[4] = TCP_OPT_SACK_PERM;
+  opt[5] = 2;
+  opt[6] = TCP_OPT_WSCALE;
+  opt[7] = 3;
+  opt[8] = (u8)TCP_RCV_WSCALE;
+  opt[9] = TCP_OPT_NOP;
+  opt[10] = TCP_OPT_NOP;
+  opt[11] = TCP_OPT_EOL_PAD;
+}
+
+/* The window we advertise, already shifted by our own scale factor. */
+static u16 tcp_adv_window(const struct tcp_conn *conn) {
+  u32 free_wnd = TCP_RECV_BUF_SIZE - conn->recv_len;
+  u32 scaled = free_wnd >> conn->rcv_wscale;
+  if (scaled > 65535)
+    scaled = 65535;
+  return (u16)scaled;
+}
+
+/* The per-connection receive buffer is heap-allocated (see TCP_RECV_BUF_SIZE).
+ * Allocation always happens outside the TCP lock — kmalloc takes the heap lock,
+ * and that nesting is what every other send path here avoids. */
+static u8 *tcp_alloc_recv_buf(void) { return kmalloc(TCP_RECV_BUF_SIZE); }
+
+static void tcp_free_recv_buf(struct tcp_conn *conn) {
+  u8 *buf;
+  u64 irq = irq_save();
+  tcp_lock();
+  buf = conn->recv_buf;
+  conn->recv_buf = 0;
+  conn->recv_len = 0;
+  conn->recv_read = 0;
+  tcp_unlock();
+  irq_restore(irq);
+  if (buf)
+    kfree(buf);
+}
+
+/* ── M84: out-of-order reassembly ────────────────────────────────────────── */
+
+static void tcp_free_ooo_list(struct tcp_ooo_seg *head) {
+  while (head) {
+    struct tcp_ooo_seg *next = head->next;
+    kfree(head->data);
+    kfree(head);
+    head = next;
+  }
+}
+
+/* Append in-order bytes to the receive buffer, clamped to the free space, and
+ * advance rcv_nxt by exactly what was accepted. Returns the accepted count. */
+static u32 tcp_recv_append(struct tcp_conn *conn, const u8 *data, u32 len) {
+  if (!conn->recv_buf)
+    return 0; /* buffer allocation failed — behave as a zero window */
+  u32 space = TCP_RECV_BUF_SIZE - conn->recv_len;
+  if (len > space)
+    len = space;
+  if (len == 0)
+    return 0;
+  memcpy(conn->recv_buf + conn->recv_len, data, len);
+  conn->recv_len += len;
+  conn->rcv_nxt += len;
+  return len;
+}
+
+/* Move every queued segment that is now contiguous with rcv_nxt into the
+ * receive buffer. Returns the consumed segments as a detached list for the
+ * caller to free outside the lock. */
+static struct tcp_ooo_seg *tcp_ooo_drain(struct tcp_conn *conn) {
+  struct tcp_ooo_seg *freed = 0;
+  while (conn->ooo_queue) {
+    struct tcp_ooo_seg *s = conn->ooo_queue;
+    if ((i32)(s->seq - conn->rcv_nxt) > 0)
+      break; /* still a hole before this segment */
+    u32 off = conn->rcv_nxt - s->seq;
+    if (off < s->len) {
+      u32 want = s->len - off;
+      if (tcp_recv_append(conn, s->data + off, want) < want)
+        break; /* receive buffer full — keep the remainder queued */
+    }
+    conn->ooo_queue = s->next;
+    conn->ooo_bytes -= s->len;
+    conn->ooo_segs--;
+    s->next = freed;
+    freed = s;
+  }
+  return freed;
+}
+
+/* Insert a pre-allocated segment into the sorted queue. Returns 0 on success;
+ * -1 means the caller must free the node (duplicate or over budget). */
+static int tcp_ooo_insert(struct tcp_conn *conn, struct tcp_ooo_seg *node) {
+  if (conn->ooo_segs >= TCP_OOO_MAX_SEGS ||
+      conn->ooo_bytes + node->len > TCP_OOO_MAX_BYTES)
+    return -1;
+
+  struct tcp_ooo_seg **prev = &conn->ooo_queue;
+  while (*prev && (i32)((*prev)->seq - node->seq) < 0)
+    prev = &(*prev)->next;
+  /* Exact duplicate of a segment we already hold: drop the retransmission. */
+  if (*prev && (*prev)->seq == node->seq && (*prev)->len >= node->len)
+    return -1;
+  node->next = *prev;
+  *prev = node;
+  conn->ooo_bytes += node->len;
+  conn->ooo_segs++;
+  return 0;
+}
+
+/* Build the SACK blocks describing what the reassembly queue holds. Adjacent
+ * queued segments are merged into one block. RFC 2018 wants the block covering
+ * the most recently received segment first, so `recent_seq` (the segment that
+ * just arrived out of order, or 0) is promoted to the front. Returns the block
+ * count; must be called with the TCP lock held. */
+static u8 tcp_build_sack_blocks(const struct tcp_conn *conn, u32 recent_seq,
+                                u32 *left, u32 *right) {
+  u8 n = 0;
+  const struct tcp_ooo_seg *s = conn->ooo_queue;
+  while (s && n < TCP_SACK_MAX_BLOCKS + 1) {
+    u32 l = s->seq;
+    u32 r = s->seq + s->len;
+    const struct tcp_ooo_seg *next = s->next;
+    while (next && (i32)(next->seq - r) <= 0) {
+      if ((i32)((next->seq + next->len) - r) > 0)
+        r = next->seq + next->len;
+      next = next->next;
+    }
+    left[n] = l;
+    right[n] = r;
+    n++;
+    s = next;
+  }
+
+  /* Promote the block containing the newest segment. */
+  if (recent_seq) {
+    for (u8 i = 1; i < n; i++) {
+      if ((i32)(recent_seq - left[i]) >= 0 && (i32)(right[i] - recent_seq) > 0) {
+        u32 tl = left[i], tr = right[i];
+        for (u8 j = i; j > 0; j--) {
+          left[j] = left[j - 1];
+          right[j] = right[j - 1];
+        }
+        left[0] = tl;
+        right[0] = tr;
+        break;
+      }
+    }
+  }
+  if (n > TCP_SACK_MAX_BLOCKS)
+    n = TCP_SACK_MAX_BLOCKS;
+  return n;
+}
+
+/* Fill a bare ACK (optionally carrying SACK blocks) for `conn`. Returns the
+ * segment length. Must be called with the TCP lock held. */
+static usize tcp_build_ack(struct tcp_conn *conn, u8 *pkt, int with_sack,
+                           u32 recent_seq) {
+  memset(pkt, 0, TCP_ACK_MAX_LEN);
+  struct tcp_header *a = (struct tcp_header *)pkt;
+  a->src_port = bswap16(conn->local_port);
+  a->dst_port = bswap16(conn->remote_port);
+  a->seq_num = bswap32(conn->snd_nxt);
+  a->ack_num = bswap32(conn->rcv_nxt);
+  a->data_offset = (5 << 4);
+  a->flags = TCP_ACK;
+  a->window = bswap16(tcp_adv_window(conn));
+
+  usize len = sizeof(struct tcp_header);
+  if (with_sack && conn->sack_ok && (conn->ooo_queue || conn->dsack_pending)) {
+    u32 l[TCP_SACK_MAX_BLOCKS + 1], r[TCP_SACK_MAX_BLOCKS + 1];
+    u8 n = conn->ooo_queue ? tcp_build_sack_blocks(conn, recent_seq, l, r) : 0;
+    if (conn->dsack_pending) {
+      /* RFC 2883: the D-SACK block reporting duplicated data goes first, and
+       * the ordinary blocks follow it. */
+      if (n >= TCP_SACK_MAX_BLOCKS)
+        n = TCP_SACK_MAX_BLOCKS - 1;
+      for (u8 i = n; i > 0; i--) {
+        l[i] = l[i - 1];
+        r[i] = r[i - 1];
+      }
+      l[0] = conn->dsack_left;
+      r[0] = conn->dsack_right;
+      n++;
+    }
+    if (n) {
+      u8 *o = pkt + sizeof(struct tcp_header);
+      o[0] = TCP_OPT_NOP;
+      o[1] = TCP_OPT_NOP;
+      o[2] = TCP_OPT_SACK;
+      o[3] = (u8)(2 + 8 * n);
+      for (u8 i = 0; i < n; i++) {
+        u8 *q = o + 4 + i * 8;
+        q[0] = (u8)(l[i] >> 24); q[1] = (u8)(l[i] >> 16);
+        q[2] = (u8)(l[i] >> 8);  q[3] = (u8)l[i];
+        q[4] = (u8)(r[i] >> 24); q[5] = (u8)(r[i] >> 16);
+        q[6] = (u8)(r[i] >> 8);  q[7] = (u8)r[i];
+      }
+      len += TCP_SACK_OPT_LEN(n);
+      a->data_offset = (u8)((len / 4) << 4);
+      conn->dsack_pending = 0;
+    }
+  }
+  return len;
+}
+
+/* ── M84: SACK scoreboard (RFC 6675) ─────────────────────────────────────
+ * Everything here runs with the TCP lock held. */
+
+/* Recompute sacked_bytes and the per-segment `lost` marks. A segment counts as
+ * lost once DUPTHRESH (3) segments *above* it have been SACKed — the same rule
+ * that justifies a fast retransmit, applied per hole instead of once. */
+#define TCP_DUPTHRESH 3
+
+static void tcp_scoreboard_update(struct tcp_conn *conn) {
+  conn->sacked_bytes = 0;
+  for (struct tcp_retransmit_pkt *rp = conn->retransmit_queue; rp;
+       rp = rp->next) {
+    if (rp->sacked)
+      conn->sacked_bytes += rp->dlen;
+  }
+
+  for (struct tcp_retransmit_pkt *rp = conn->retransmit_queue; rp;
+       rp = rp->next) {
+    if (rp->sacked) {
+      rp->lost = 0;
+      continue;
+    }
+    u32 above = 0;
+    for (struct tcp_retransmit_pkt *q = rp->next; q; q = q->next) {
+      if (q->sacked)
+        above++;
+    }
+    rp->lost = (u8)(above >= TCP_DUPTHRESH ? 1 : 0);
+  }
+}
+
+/* RFC 6675 pipe: the sender's estimate of how much data is actually in the
+ * network. Segments the peer SACKed have left it; segments the scoreboard
+ * declared lost have left it too (they were dropped), except for the copy we
+ * retransmitted. */
+static u32 tcp_pipe(const struct tcp_conn *conn) {
+  u32 pipe = 0;
+  for (const struct tcp_retransmit_pkt *rp = conn->retransmit_queue; rp;
+       rp = rp->next) {
+    if (rp->sacked)
+      continue;
+    if (!rp->lost)
+      pipe += rp->dlen;
+    else if (rp->retransmitted)
+      pipe += rp->dlen;
+  }
+  return pipe;
+}
+
+/* Enter SACK-based loss recovery. Unlike the Reno path this does not inflate
+ * cwnd by 3 MSS and then by 1 MSS per dup-ACK: the scoreboard already tells us
+ * how much has left the network, so cwnd stays at ssthresh and the pipe
+ * estimate governs what may be sent. */
+static void tcp_enter_recovery(struct tcp_conn *conn) {
+  if (conn->in_recovery)
+    return;
+  conn->prior_cwnd = conn->cwnd;
+  conn->prior_ssthresh = conn->ssthresh;
+  conn->ssthresh = conn->cwnd / 2;
+  if (conn->ssthresh < 2 * TCP_MSS)
+    conn->ssthresh = 2 * TCP_MSS;
+  conn->cwnd = conn->ssthresh;
+  conn->in_recovery = 1;
+  conn->recovery_point = conn->snd_nxt;
+}
+
+/* A D-SACK proved the retransmission was unnecessary (the original had merely
+ * been reordered, not lost), so the congestion reduction it caused was wrong:
+ * put cwnd and ssthresh back. */
+static void tcp_undo_recovery(struct tcp_conn *conn) {
+  if (conn->prior_cwnd > conn->cwnd)
+    conn->cwnd = conn->prior_cwnd;
+  if (conn->prior_ssthresh > conn->ssthresh)
+    conn->ssthresh = conn->prior_ssthresh;
+  conn->in_recovery = 0;
+  conn->dup_acks = 0;
+  for (struct tcp_retransmit_pkt *rp = conn->retransmit_queue; rp; rp = rp->next)
+    rp->lost = 0;
+}
+
+/* Pick the next segment to resend during recovery: the first one the
+ * scoreboard says is lost and that is not already back in flight. */
+static struct tcp_retransmit_pkt *tcp_next_retransmit(struct tcp_conn *conn) {
+  for (struct tcp_retransmit_pkt *rp = conn->retransmit_queue; rp;
+       rp = rp->next) {
+    if (!rp->sacked && (rp->lost || rp == conn->retransmit_queue) &&
+        !rp->retransmitted)
+      return rp;
+  }
+  for (struct tcp_retransmit_pkt *rp = conn->retransmit_queue; rp;
+       rp = rp->next) {
+    if (!rp->sacked)
+      return rp;
+  }
+  return 0;
+}
+
+/* Mark every queued retransmission the peer selectively acknowledged. Those
+ * segments arrived; retransmitting them wastes the window. Must be called with
+ * the TCP lock held. Returns the number newly marked. */
+static int tcp_apply_sack(struct tcp_conn *conn, const struct tcp_opts *o,
+                          u32 cum_ack) {
+  int marked = 0;
+  for (u8 b = 0; b < o->nsack; b++) {
+    u32 l = o->sack_left[b];
+    u32 r = o->sack_right[b];
+    if ((i32)(r - l) <= 0)
+      continue;
+    /* RFC 2883: a first block at or below the cumulative ACK is a D-SACK —
+     * the peer is reporting a duplicate, which means our retransmission was
+     * spurious. Undo the congestion reduction it caused instead of treating
+     * the block as new SACK information. */
+    if (b == 0 && (i32)(r - cum_ack) <= 0) {
+      conn->dsack_seen++;
+      tcp_undo_recovery(conn);
+      continue;
+    }
+    for (struct tcp_retransmit_pkt *rp = conn->retransmit_queue; rp;
+         rp = rp->next) {
+      if (rp->sacked || rp->dlen == 0)
+        continue;
+      if ((i32)(rp->seq - l) >= 0 && (i32)(r - (rp->seq + rp->dlen)) >= 0) {
+        rp->sacked = 1;
+        marked++;
+      }
+    }
+    if ((i32)(r - conn->high_sack) > 0)
+      conn->high_sack = r;
+  }
+  if (marked)
+    tcp_scoreboard_update(conn);
+  return marked;
+}
+
+/* Detach and free the reassembly queue. Freeing happens outside the TCP lock
+ * (kfree takes the heap lock, and that nesting is what the send paths already
+ * avoid). Every path that releases a connection slot must call this, otherwise
+ * the memset over a reused slot leaks the queued segments. */
+static void tcp_clear_ooo_queue(struct tcp_conn *conn) {
+  struct tcp_ooo_seg *detached;
+  u64 irq = irq_save();
+  tcp_lock();
+  detached = conn->ooo_queue;
+  conn->ooo_queue = 0;
+  conn->ooo_bytes = 0;
+  conn->ooo_segs = 0;
+  tcp_unlock();
+  irq_restore(irq);
+  tcp_free_ooo_list(detached);
 }
 
 static void tcp_enter_time_wait(struct tcp_conn *conn) {
@@ -312,8 +856,16 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   struct tcp_retransmit_pkt *rp = kmalloc(sizeof(struct tcp_retransmit_pkt));
   if (!rp)
     return 0;
-  rp->data = kmalloc(sizeof(struct tcp_header));
+  rp->data = kmalloc(TCP_SYN_HDR_LEN);
   if (!rp->data) {
+    kfree(rp);
+    return 0;
+  }
+  /* M84: the receive buffer is per-connection heap memory now. Allocate it
+   * here, outside the TCP lock, so the heap lock is never taken under it. */
+  u8 *rcvbuf = tcp_alloc_recv_buf();
+  if (!rcvbuf) {
+    kfree(rp->data);
     kfree(rp);
     return 0;
   }
@@ -331,6 +883,7 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   if (!conn) {
     tcp_unlock();
     irq_restore(irq);
+    kfree(rcvbuf);
     kfree(rp->data);
     kfree(rp);
     console_write("tcp: no free connection slots\n");
@@ -339,6 +892,7 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
 
   memset(conn, 0, sizeof(*conn));
   conn->used = 1;
+  conn->recv_buf = rcvbuf;
   conn->state = TCP_CLOSED;
   conn->family = family;
   conn->remote_ip = v4;
@@ -355,17 +909,26 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   conn->cwnd = TCP_MSS;                /* slow start: 1 MSS */
   conn->ssthresh = 65535;
   conn->dup_acks = 0;
+  /* M84: option state. Until the SYN-ACK is parsed we assume no scaling and
+   * the RFC 1122 default MSS. */
+  conn->rcv_wscale = (u8)TCP_RCV_WSCALE;
+  conn->snd_wscale = 0;
+  conn->wscale_ok = 0;
+  conn->snd_mss = 536;
 
-  u8 packet[sizeof(struct tcp_header)];
+  u8 packet[TCP_SYN_HDR_LEN];
   memset(packet, 0, sizeof(packet));
   struct tcp_header *tcp = (struct tcp_header *)packet;
   tcp->src_port = bswap16(conn->local_port);
   tcp->dst_port = bswap16(dst_port);
   tcp->seq_num = bswap32(conn->iss);
   tcp->ack_num = 0;
-  tcp->data_offset = (5 << 4);
+  /* M84: SYN carries MSS + window-scale, so the header is 7 words. The window
+   * in a SYN is never scaled (RFC 7323), and our buffer fits 16 bits. */
+  tcp->data_offset = (u8)((5 + TCP_SYN_OPT_LEN / 4) << 4);
   tcp->flags = TCP_SYN;
-  tcp->window = bswap16(TCP_RECV_BUF_SIZE);
+  tcp->window = bswap16(TCP_SYN_WINDOW);
+  tcp_build_syn_options(packet + sizeof(struct tcp_header));
 
   conn->state = TCP_SYN_SENT;
 
@@ -374,6 +937,8 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   rp->len = sizeof(packet);
   rp->seq = conn->iss;
   rp->timestamp = scheduler_get_uptime_ticks();
+  rp->dlen = 1;
+  rp->sacked = 0;
   rp->retries = 0;
   rp->next = 0;
 
@@ -653,7 +1218,12 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
   }
 
   u32 window = conn->snd_wnd < conn->cwnd ? conn->snd_wnd : conn->cwnd;
-  u32 inflight = conn->snd_nxt - conn->snd_una;
+  /* M84: inside SACK recovery the amount actually in the network is the RFC
+   * 6675 pipe estimate, not everything between snd_una and snd_nxt — segments
+   * the peer already SACKed have left the network and must not hold the
+   * window hostage. */
+  u32 inflight = conn->in_recovery ? tcp_pipe(conn)
+                                   : (conn->snd_nxt - conn->snd_una);
   if (inflight >= window) {
     tcp_unlock();
     irq_restore(irq);
@@ -668,9 +1238,12 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
     return -EAGAIN;
   }
   u32 usable = window - inflight;
+  /* M84: never emit a segment larger than the MSS the peer advertised. */
+  u32 eff_mss = conn->snd_mss && conn->snd_mss < TCP_MSS ? conn->snd_mss
+                                                         : TCP_MSS;
   usize to_send = len;
-  if (to_send > TCP_MSS)
-    to_send = TCP_MSS;
+  if (to_send > eff_mss)
+    to_send = eff_mss;
   if (to_send > usable)
     to_send = usable;
   if (to_send == 0) {
@@ -691,7 +1264,7 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
   tcp->ack_num = bswap32(conn->rcv_nxt);
   tcp->data_offset = (5 << 4);
   tcp->flags = TCP_PSH | TCP_ACK;
-  tcp->window = bswap16(TCP_RECV_BUF_SIZE - conn->recv_len);
+  tcp->window = bswap16(tcp_adv_window(conn));
 
   memcpy(packet + sizeof(struct tcp_header), data, to_send);
 
@@ -702,6 +1275,8 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
   rp->len = packet_len;
   rp->seq = seq_start;
   rp->timestamp = scheduler_get_uptime_ticks();
+  rp->dlen = (u32)to_send;
+  rp->sacked = 0;
   rp->retries = 0;
   rp->next = 0;
 
@@ -774,7 +1349,7 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
       a->ack_num = bswap32(conn->rcv_nxt);
       a->data_offset = (5 << 4);
       a->flags = TCP_ACK;
-      a->window = bswap16(free_wnd);
+      a->window = bswap16(tcp_adv_window(conn));
       send_wnd_update = 1;
     }
   }
@@ -852,7 +1427,7 @@ int tcp_close(struct tcp_conn *conn) {
   tcp->ack_num = bswap32(conn->rcv_nxt);
   tcp->data_offset = (5 << 4);
   tcp->flags = TCP_FIN | TCP_ACK;
-  tcp->window = bswap16(TCP_RECV_BUF_SIZE);
+  tcp->window = bswap16(tcp_adv_window(conn));
 
   u32 seq_start = conn->snd_nxt;
   conn->state = TCP_FIN_WAIT1;
@@ -863,6 +1438,8 @@ int tcp_close(struct tcp_conn *conn) {
   rp->len = sizeof(packet);
   rp->seq = seq_start;
   rp->timestamp = scheduler_get_uptime_ticks();
+  rp->dlen = 1;
+  rp->sacked = 0;
   rp->retries = 0;
   rp->next = 0;
 
@@ -898,6 +1475,8 @@ int tcp_close(struct tcp_conn *conn) {
     tcp_unlock();
     irq_restore(irq);
     tcp_clear_retransmit_queue(conn);
+    tcp_clear_ooo_queue(conn);
+    tcp_free_recv_buf(conn);
     irq = irq_save();
     tcp_lock();
     conn->used = 0;
@@ -952,24 +1531,50 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
   if (conn && (flags & TCP_ACK)) {
     u32 ack_new = bswap32(tcp->ack_num);
     u16 wnd_new = bswap16(tcp->window);
-    conn->snd_wnd = wnd_new;
+    /* M84: the window field of a SYN is never scaled (RFC 7323 §2.2); every
+     * later segment is, by the shift the peer advertised in its SYN. */
+    conn->snd_wnd = (flags & TCP_SYN) ? (u32)wnd_new
+                                      : ((u32)wnd_new << conn->snd_wscale);
     if (ack_new == conn->snd_una && payload_size == 0) {
       conn->dup_acks++;
-      if (conn->dup_acks == 3) {
-        /* Reno fast retransmit: cut ssthresh, drop cwnd, and resend
-         * the oldest unacked segment immediately (don't wait for the
-         * RTO). The retransmit queue is FIFO; the head is snd_una. */
-        conn->ssthresh = conn->cwnd / 2;
-        if (conn->ssthresh < TCP_MSS) conn->ssthresh = TCP_MSS;
-        conn->cwnd = conn->ssthresh + 3 * TCP_MSS;  /* inflate per RFC 5681 */
-        struct tcp_retransmit_pkt *head = conn->retransmit_queue;
+      /* M84: a duplicate ACK may carry SACK blocks telling us exactly which
+       * segments past the hole already arrived — and a D-SACK telling us a
+       * retransmission was unnecessary. */
+      int sacked_now = 0;
+      if (conn->sack_ok) {
+        struct tcp_opts dopt;
+        tcp_parse_options(data, data_offset, &dopt);
+        if (dopt.nsack)
+          sacked_now = tcp_apply_sack(conn, &dopt, ack_new);
+      }
+      (void)sacked_now;
+
+      /* Enter recovery on the third duplicate ACK, or as soon as the
+       * scoreboard declares any segment lost — whichever comes first. */
+      int have_lost = 0;
+      for (struct tcp_retransmit_pkt *rp = conn->retransmit_queue; rp;
+           rp = rp->next) {
+        if (rp->lost && !rp->retransmitted) {
+          have_lost = 1;
+          break;
+        }
+      }
+      if (!conn->in_recovery && (conn->dup_acks >= TCP_DUPTHRESH || have_lost))
+        tcp_enter_recovery(conn);
+
+      if (conn->in_recovery && tcp_pipe(conn) < conn->cwnd) {
+        /* Retransmit what the scoreboard says is missing. Unlike Reno this is
+         * not necessarily the queue head: the head may already be sitting in
+         * the peer's reassembly queue. */
+        struct tcp_retransmit_pkt *hole = tcp_next_retransmit(conn);
         u8 *resend_data = 0;
         usize resend_len = 0;
-        if (head) {
-          resend_data = head->data;
-          resend_len = head->len;
-          head->timestamp = scheduler_get_uptime_ticks();
-          head->retries++;
+        if (hole) {
+          resend_data = hole->data;
+          resend_len = hole->len;
+          hole->timestamp = scheduler_get_uptime_ticks();
+          hole->retries++;
+          hole->retransmitted = 1;
         }
         tcp_unlock();
         irq_restore(irq);
@@ -979,14 +1584,30 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         }
         irq = irq_save();
         tcp_lock();
-      } else if (conn->dup_acks > 3) {
-        /* Each additional dup ACK inflates cwnd by 1 MSS during fast
-         * recovery (RFC 5681 section 3.2). */
-        conn->cwnd += TCP_MSS;
       }
     } else if (ack_new > conn->snd_una) {
       conn->dup_acks = 0;
-      if (conn->cwnd < conn->ssthresh) {
+      /* A cumulative ACK may also carry a D-SACK (RFC 2883 allows one on a
+       * non-duplicate ACK) and it retires scoreboard state. */
+      if (conn->sack_ok) {
+        struct tcp_opts aopt;
+        tcp_parse_options(data, data_offset, &aopt);
+        if (aopt.nsack)
+          tcp_apply_sack(conn, &aopt, ack_new);
+      }
+      if (conn->in_recovery) {
+        /* Recovery ends when everything outstanding at entry is acknowledged;
+         * a partial ACK keeps it going (and frees another retransmission). */
+        if ((i32)(ack_new - conn->recovery_point) >= 0) {
+          conn->in_recovery = 0;
+          conn->cwnd = conn->ssthresh;
+          conn->sacked_bytes = 0;
+          conn->high_sack = 0;
+        }
+      }
+      if (conn->in_recovery) {
+        /* No growth inside recovery: the pipe estimate governs sending. */
+      } else if (conn->cwnd < conn->ssthresh) {
         /* Slow start: exponential — +MSS per new ACK. */
         conn->cwnd += TCP_MSS;
       } else {
@@ -1035,8 +1656,27 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           new_conn->ssthresh = 65535;
           new_conn->dup_acks = 0;
 
+          /* M84: negotiate options from the client's SYN. Window scaling is
+           * symmetric — we may only scale our advertisement (and interpret
+           * theirs) when both SYNs carried the option, so a client that sent
+           * none pins both shifts to 0. */
+          struct tcp_opts sopt;
+          tcp_parse_options(data, data_offset, &sopt);
+          new_conn->snd_mss = sopt.mss ? sopt.mss : 536;
+          new_conn->sack_ok = sopt.sack_ok;
+          if (sopt.has_wscale) {
+            new_conn->wscale_ok = 1;
+            new_conn->snd_wscale = sopt.wscale;
+            new_conn->rcv_wscale = (u8)TCP_RCV_WSCALE;
+          } else {
+            new_conn->wscale_ok = 0;
+            new_conn->snd_wscale = 0;
+            new_conn->rcv_wscale = 0;
+          }
+
           /* Send SYN-ACK */
-          u8 packet[sizeof(struct tcp_header)];
+          u8 packet[TCP_SYN_HDR_LEN];
+          usize packet_len = sizeof(struct tcp_header);
           memset(packet, 0, sizeof(packet));
           struct tcp_header *tcp_hdr = (struct tcp_header *)packet;
           tcp_hdr->src_port = bswap16(new_conn->local_port);
@@ -1045,19 +1685,42 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           tcp_hdr->ack_num = bswap32(new_conn->rcv_nxt);
           tcp_hdr->data_offset = (5 << 4);
           tcp_hdr->flags = TCP_SYN | TCP_ACK;
-          tcp_hdr->window = bswap16(TCP_RECV_BUF_SIZE);
+          tcp_hdr->window = bswap16(TCP_SYN_WINDOW);
+          if (new_conn->wscale_ok || new_conn->sack_ok) {
+            u8 *sopts = packet + sizeof(struct tcp_header);
+            tcp_build_syn_options(sopts);
+            /* RFC 2018: only offer SACK back if the client asked for it; RFC
+             * 7323: same for window scaling. */
+            if (!new_conn->sack_ok) {
+              sopts[4] = TCP_OPT_NOP;
+              sopts[5] = TCP_OPT_NOP;
+            }
+            if (!new_conn->wscale_ok) {
+              sopts[6] = TCP_OPT_NOP;
+              sopts[7] = TCP_OPT_NOP;
+              sopts[8] = TCP_OPT_NOP;
+            }
+            tcp_hdr->data_offset = (u8)((5 + TCP_SYN_OPT_LEN / 4) << 4);
+            packet_len = TCP_SYN_HDR_LEN;
+          }
 
           tcp_unlock();
           irq_restore(irq);
 
           struct tcp_retransmit_pkt *rp = kmalloc(sizeof(struct tcp_retransmit_pkt));
-          u8 *rp_data = rp ? kmalloc(sizeof(packet)) : 0;
+          u8 *rp_data = rp ? kmalloc(packet_len) : 0;
+          /* Same rule as the active open: heap allocation happens while the
+           * TCP lock is dropped. tcp_recv_append() treats a NULL buffer as a
+           * closed window, so a failure here degrades rather than crashes. */
+          u8 *acc_buf = tcp_alloc_recv_buf();
           if (rp && rp_data) {
-            memcpy(rp_data, packet, sizeof(packet));
+            memcpy(rp_data, packet, packet_len);
             rp->data = rp_data;
-            rp->len = sizeof(packet);
+            rp->len = packet_len;
             rp->seq = new_conn->iss;
             rp->timestamp = scheduler_get_uptime_ticks();
+            rp->dlen = 1;
+            rp->sacked = 0;
             rp->retries = 0;
             rp->next = 0;
           } else {
@@ -1067,10 +1730,16 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
             }
           }
 
-          tcp_conn_emit(new_conn, packet, sizeof(packet));
+          tcp_conn_emit(new_conn, packet, packet_len);
 
           irq = irq_save();
           tcp_lock();
+
+          u8 *stale_buf = 0;
+          if (acc_buf && new_conn->used && !new_conn->recv_buf)
+            new_conn->recv_buf = acc_buf;
+          else
+            stale_buf = acc_buf; /* freed below, outside the lock */
 
           if (rp && rp_data && new_conn->used && new_conn->state == TCP_SYN_RECEIVED) {
             struct tcp_retransmit_pkt **prev = &new_conn->retransmit_queue;
@@ -1081,6 +1750,11 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
             if (rp_data) kfree(rp_data);
             kfree(rp);
           }
+          tcp_unlock();
+          irq_restore(irq);
+          if (stale_buf)
+            kfree(stale_buf);
+          return;
         }
         tcp_unlock();
         irq_restore(irq);
@@ -1141,6 +1815,25 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         conn->snd_una = ack;
         conn->snd_nxt = ack;
 
+        /* M84: our SYN always offers window scaling, so the peer's SYN-ACK
+         * decides whether it is in effect. If it did not echo the option,
+         * both directions stay unscaled and our advertisement must not be
+         * shifted either. Re-scale snd_wnd, which was recorded unscaled
+         * above (the SYN-ACK window field is never scaled). */
+        struct tcp_opts sopt;
+        tcp_parse_options(data, data_offset, &sopt);
+        conn->snd_mss = sopt.mss ? sopt.mss : 536;
+        conn->sack_ok = sopt.sack_ok;
+        if (sopt.has_wscale) {
+          conn->wscale_ok = 1;
+          conn->snd_wscale = sopt.wscale;
+          conn->rcv_wscale = (u8)TCP_RCV_WSCALE;
+        } else {
+          conn->wscale_ok = 0;
+          conn->snd_wscale = 0;
+          conn->rcv_wscale = 0;
+        }
+
         /* Send ACK */
         u8 ack_pkt[sizeof(struct tcp_header)];
         memset(ack_pkt, 0, sizeof(ack_pkt));
@@ -1151,7 +1844,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         a->ack_num = bswap32(conn->rcv_nxt);
         a->data_offset = (5 << 4);
         a->flags = TCP_ACK;
-        a->window = bswap16(TCP_RECV_BUF_SIZE);
+        a->window = bswap16(tcp_adv_window(conn));
 
         tcp_unlock();
         irq_restore(irq);
@@ -1193,28 +1886,101 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
       }
     }
 
-    /* Receive data */
+    /* Receive data.
+     *
+     * M84: a segment that does not start exactly at rcv_nxt used to be
+     * dropped on the floor, so a single lost or reordered packet cost the
+     * peer a full retransmit timeout. Now:
+     *   - bytes already delivered (a retransmission) are trimmed off the
+     *     front rather than rejecting the whole segment;
+     *   - a segment past a hole is queued for reassembly and dup-ACKed, which
+     *     is what drives the peer's fast retransmit;
+     *   - filling the hole drains everything that became contiguous. */
     if (payload_size > 0 && (flags & (TCP_PSH | TCP_ACK))) {
-      if (seq == conn->rcv_nxt) {
-        u32 space = TCP_RECV_BUF_SIZE - conn->recv_len;
-        if (payload_size > space)
-          payload_size = space;
-        memcpy(conn->recv_buf + conn->recv_len, payload, payload_size);
-        conn->recv_len += (u32)payload_size;
-        conn->rcv_nxt += (u32)payload_size;
+      const u8 *seg = payload;
+      u32 seg_seq = seq;
+      u32 seg_len = (u32)payload_size;
+      int send_ack = 0;
+      u32 ooo_recent = 0; /* seq of a segment just queued out of order */
+      struct tcp_ooo_seg *ooo_freed = 0;
 
-        /* Send ACK for data */
-        u8 ack_pkt[sizeof(struct tcp_header)];
-        memset(ack_pkt, 0, sizeof(ack_pkt));
-        struct tcp_header *a = (struct tcp_header *)ack_pkt;
-        a->src_port = bswap16(conn->local_port);
-        a->dst_port = bswap16(conn->remote_port);
-        a->seq_num = bswap32(conn->snd_nxt);
-        a->ack_num = bswap32(conn->rcv_nxt);
-        a->data_offset = (5 << 4);
-        a->flags = TCP_ACK;
+      if ((i32)(conn->rcv_nxt - seg_seq) > 0) {
+        u32 already = conn->rcv_nxt - seg_seq;
+        /* RFC 2883: report the duplicated range back so the sender can tell a
+         * spurious retransmission (reordering) from a real loss. */
+        conn->dsack_pending = 1;
+        conn->dsack_left = seg_seq;
+        conn->dsack_right =
+            (already >= seg_len) ? seg_seq + seg_len : conn->rcv_nxt;
+        if (already >= seg_len) {
+          seg_len = 0; /* pure duplicate — still ACK so the peer moves on */
+          send_ack = 1;
+        } else {
+          seg += already;
+          seg_len -= already;
+          seg_seq += already;
+        }
+      }
+
+      if (seg_len > 0 && seg_seq == conn->rcv_nxt) {
+        tcp_recv_append(conn, seg, seg_len);
+        ooo_freed = tcp_ooo_drain(conn);
+        send_ack = 1;
+      } else if (seg_len > 0 && (i32)(seg_seq - conn->rcv_nxt) > 0) {
+        /* Past a hole. Only buffer what fits inside the window we advertised;
+         * anything beyond it the peer should not have sent. */
+        u32 wnd = TCP_RECV_BUF_SIZE - conn->recv_len;
+        if ((u32)(seg_seq - conn->rcv_nxt) + seg_len <= wnd &&
+            conn->ooo_segs < TCP_OOO_MAX_SEGS &&
+            conn->ooo_bytes + seg_len <= TCP_OOO_MAX_BYTES) {
+          /* Allocate outside the lock: kmalloc takes the heap lock, and this
+           * path must not nest it under the TCP lock. */
+          tcp_unlock();
+          irq_restore(irq);
+          struct tcp_ooo_seg *node = kmalloc(sizeof(struct tcp_ooo_seg));
+          u8 *copy = node ? kmalloc(seg_len) : 0;
+          if (node && copy)
+            memcpy(copy, seg, seg_len);
+          irq = irq_save();
+          tcp_lock();
+          if (node && copy && conn->used && conn->state == TCP_ESTABLISHED &&
+              (i32)(seg_seq - conn->rcv_nxt) > 0) {
+            node->seq = seg_seq;
+            node->len = seg_len;
+            node->data = copy;
+            node->next = 0;
+            if (tcp_ooo_insert(conn, node) != 0) {
+              /* Rejected as a duplicate of something already queued — that is
+               * also worth a D-SACK. */
+              conn->dsack_pending = 1;
+              conn->dsack_left = seg_seq;
+              conn->dsack_right = seg_seq + seg_len;
+              kfree(copy);
+              kfree(node);
+            } else {
+              ooo_recent = seg_seq;
+            }
+          } else {
+            /* The hole closed (or the connection went away) while the lock
+             * was dropped: discard the copy rather than queueing a segment
+             * that is now in the past. */
+            if (copy)
+              kfree(copy);
+            if (node)
+              kfree(node);
+          }
+        }
+        /* Dup-ACK for rcv_nxt: tells the peer exactly which byte is missing. */
+        send_ack = 1;
+      }
+
+      if (send_ack) {
+        /* M84: when the reassembly queue is non-empty the ACK carries SACK
+         * blocks, so the peer learns which segments past the hole already
+         * arrived and retransmits only the hole. */
+        u8 ack_pkt[TCP_ACK_MAX_LEN];
+        usize ack_len = tcp_build_ack(conn, ack_pkt, 1, ooo_recent);
         u32 adv_wnd = TCP_RECV_BUF_SIZE - conn->recv_len;
-        a->window = bswap16(adv_wnd);
         /* Remember if we just throttled the peer below 1 MSS so tcp_recv() knows
          * to send an unsolicited window-update once the app drains the buffer,
          * instead of leaving the peer parked on its zero-window persist timer. */
@@ -1223,12 +1989,19 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
 
         tcp_unlock();
         irq_restore(irq);
-        tcp_conn_emit(conn, ack_pkt, sizeof(ack_pkt));
+        tcp_conn_emit(conn, ack_pkt, ack_len);
+        tcp_free_ooo_list(ooo_freed);
         irq = irq_save();
         tcp_lock();
 
         extern void *vfs_poll_chan;
         scheduler_wake_all(vfs_poll_chan);
+      } else if (ooo_freed) {
+        tcp_unlock();
+        irq_restore(irq);
+        tcp_free_ooo_list(ooo_freed);
+        irq = irq_save();
+        tcp_lock();
       }
     }
 
@@ -1352,6 +2125,8 @@ void tcp_timer_tick(void) {
         tcp_unlock();
         irq_restore(irq);
         tcp_clear_retransmit_queue(conn);
+        tcp_clear_ooo_queue(conn);
+        tcp_free_recv_buf(conn);
         irq = irq_save();
         tcp_lock();
         conn->used = 0;
@@ -1363,12 +2138,21 @@ void tcp_timer_tick(void) {
 
     struct tcp_retransmit_pkt *rp = conn->retransmit_queue;
     while (rp) {
+      /* M84: a selectively-acknowledged segment reached the peer. Do not burn
+       * the window retransmitting it; it stays queued until the cumulative ACK
+       * releases it. */
+      if (rp->sacked) {
+        rp = rp->next;
+        continue;
+      }
       if (now - rp->timestamp >= 50) { // 500ms
         if (rp->retries >= 5) {
           conn->state = TCP_CLOSED;
           tcp_unlock();
           irq_restore(irq);
           tcp_clear_retransmit_queue(conn);
+          tcp_clear_ooo_queue(conn);
+          tcp_free_recv_buf(conn);
           irq = irq_save();
           tcp_lock();
           conn->used = 0;
@@ -1457,4 +2241,416 @@ usize tcp_conn_snapshot(struct net_sock_info *out, usize max) {
   tcp_unlock();
   irq_restore(irq);
   return n;
+}
+
+/* ── M84 self-test: options, window scaling, out-of-order reassembly ───────
+ * White-box, in-kernel: the option parser is driven directly with a crafted
+ * header, and the reassembly path is exercised by injecting segments into
+ * tcp_input() through the loopback datapath — the same code an off-link peer
+ * reaches, minus the wire. */
+void tcp_robustness_smoke(void) {
+  /* 1. Option parsing: MSS + NOP-padded window scale + SACK-permitted. */
+  {
+    u8 seg[sizeof(struct tcp_header) + 12];
+    memset(seg, 0, sizeof(seg));
+    struct tcp_header *h = (struct tcp_header *)seg;
+    h->data_offset = (u8)((5 + 3) << 4);
+    u8 *o = seg + sizeof(struct tcp_header);
+    o[0] = TCP_OPT_MSS;  o[1] = 4;  o[2] = 0x05; o[3] = 0xB4; /* 1460 */
+    o[4] = TCP_OPT_SACK_PERM; o[5] = 2;
+    o[6] = TCP_OPT_NOP;
+    o[7] = TCP_OPT_WSCALE; o[8] = 3; o[9] = 7;
+    o[10] = TCP_OPT_END;
+    o[11] = 0;
+
+    struct tcp_opts opt;
+    tcp_parse_options(seg, (5 + 3) * 4, &opt);
+    if (opt.mss == 1460 && opt.has_wscale && opt.wscale == 7 && opt.sack_ok)
+      console_write("M84-TCP: ok opt-parse\n");
+    else
+      console_write("M84-TCP: FAIL opt-parse\n");
+
+    /* A truncated / malformed option must terminate the walk instead of
+     * running off the end or spinning on a zero length. */
+    memset(seg, 0, sizeof(seg));
+    h->data_offset = (u8)((5 + 3) << 4);
+    o[0] = TCP_OPT_WSCALE; o[1] = 0; /* illegal length */
+    tcp_parse_options(seg, (5 + 3) * 4, &opt);
+    if (!opt.has_wscale && opt.mss == 0)
+      console_write("M84-TCP: ok opt-malformed\n");
+    else
+      console_write("M84-TCP: FAIL opt-malformed\n");
+  }
+
+  /* 2/3/4. Live loopback connection: MSS negotiation, scaled window
+   * interpretation, and out-of-order reassembly. */
+  struct ipv4_addr lo = {{127, 0, 0, 1}};
+  u16 port = 7940;
+  struct tcp_conn *srv = tcp_listen(port, 1);
+  if (!srv) {
+    console_write("M84-TCP: FAIL listen\n");
+    return;
+  }
+  struct tcp_conn *cli = tcp_connect(lo, port);
+  if (!cli) {
+    console_write("M84-TCP: FAIL connect\n");
+    tcp_close(srv);
+    return;
+  }
+  struct ipv4_addr peer_ip;
+  u16 peer_port = 0;
+  struct tcp_conn *acc = 0;
+  for (int i = 0; i < 100 && !acc; i++) {
+    acc = tcp_accept(port, &peer_ip, &peer_port);
+    if (!acc)
+      net_poll();
+  }
+  if (!acc) {
+    console_write("M84-TCP: FAIL accept\n");
+    tcp_close(cli);
+    tcp_close(srv);
+    return;
+  }
+
+  /* Both SYNs carried our MSS, window-scale and SACK-permitted options, so
+   * each side learned the other's. */
+  if (cli->snd_mss == TCP_MSS && acc->snd_mss == TCP_MSS && cli->wscale_ok &&
+      acc->wscale_ok && cli->sack_ok && acc->sack_ok)
+    console_write("M84-TCP: ok mss-negotiated\n");
+  else
+    console_write("M84-TCP: FAIL mss-negotiated\n");
+
+  /* The advertised window is our real buffer, shifted by the scale we
+   * negotiated — a receive window past the unscaled 16-bit ceiling. */
+  {
+    u32 advertised = (u32)tcp_adv_window(acc) << acc->rcv_wscale;
+    if (acc->rcv_wscale > 0 && advertised == TCP_RECV_BUF_SIZE &&
+        TCP_RECV_BUF_SIZE > 65535)
+      console_write("M84-TCP: ok rcv-wscale\n");
+    else
+      console_write("M84-TCP: FAIL rcv-wscale\n");
+  }
+
+  /* Window scaling: with a shift of 3 in effect, a 1000-byte advertisement
+   * must be read as 8000 bytes of peer buffer. */
+  {
+    cli->snd_wscale = 3;
+    u8 ackseg[sizeof(struct tcp_header)];
+    memset(ackseg, 0, sizeof(ackseg));
+    struct tcp_header *h = (struct tcp_header *)ackseg;
+    h->src_port = bswap16(port);
+    h->dst_port = bswap16(cli->local_port);
+    h->seq_num = bswap32(cli->rcv_nxt);
+    h->ack_num = bswap32(cli->snd_nxt);
+    h->data_offset = (5 << 4);
+    h->flags = TCP_ACK;
+    h->window = bswap16(1000);
+    tcp_receive(lo, ackseg, sizeof(ackseg));
+
+    if (cli->snd_wnd == 8000)
+      console_write("M84-TCP: ok wscale\n");
+    else
+      console_write("M84-TCP: FAIL wscale\n");
+    cli->snd_wscale = 0;
+  }
+
+  /* Out-of-order reassembly: deliver "world" (the second half) first, then
+   * "hello". The first must be queued, not dropped, and the pair must read
+   * back as one contiguous stream. */
+  {
+    u32 base = acc->rcv_nxt;
+    u8 seg[sizeof(struct tcp_header) + 5];
+    struct tcp_header *h = (struct tcp_header *)seg;
+
+    memset(seg, 0, sizeof(seg));
+    h->src_port = bswap16(cli->local_port);
+    h->dst_port = bswap16(port);
+    h->seq_num = bswap32(base + 5);
+    h->ack_num = bswap32(acc->snd_nxt);
+    h->data_offset = (5 << 4);
+    h->flags = TCP_ACK | TCP_PSH;
+    h->window = bswap16(TCP_SYN_WINDOW);
+    memcpy(seg + sizeof(struct tcp_header), "world", 5);
+    tcp_receive(lo, seg, sizeof(seg));
+
+    int queued = (acc->ooo_segs == 1 && acc->recv_len == 0 &&
+                  acc->rcv_nxt == base);
+    if (queued)
+      console_write("M84-TCP: ok ooo-queued\n");
+    else
+      console_write("M84-TCP: FAIL ooo-queued\n");
+
+    memset(seg, 0, sizeof(seg));
+    h->src_port = bswap16(cli->local_port);
+    h->dst_port = bswap16(port);
+    h->seq_num = bswap32(base);
+    h->ack_num = bswap32(acc->snd_nxt);
+    h->data_offset = (5 << 4);
+    h->flags = TCP_ACK | TCP_PSH;
+    h->window = bswap16(TCP_SYN_WINDOW);
+    memcpy(seg + sizeof(struct tcp_header), "hello", 5);
+    tcp_receive(lo, seg, sizeof(seg));
+
+    char buf[16];
+    memset(buf, 0, sizeof(buf));
+    int n = tcp_recv(acc, buf, sizeof(buf) - 1, 0);
+    if (n == 10 && memcmp(buf, "helloworld", 10) == 0 && acc->ooo_segs == 0 &&
+        acc->rcv_nxt == base + 10)
+      console_write("M84-TCP: ok ooo-reassembly\n");
+    else
+      console_write("M84-TCP: FAIL ooo-reassembly\n");
+
+    /* A retransmission of already-delivered bytes must be trimmed, not
+     * re-appended to the stream. */
+    memset(seg, 0, sizeof(seg));
+    h->src_port = bswap16(cli->local_port);
+    h->dst_port = bswap16(port);
+    h->seq_num = bswap32(base);
+    h->ack_num = bswap32(acc->snd_nxt);
+    h->data_offset = (5 << 4);
+    h->flags = TCP_ACK | TCP_PSH;
+    h->window = bswap16(TCP_SYN_WINDOW);
+    memcpy(seg + sizeof(struct tcp_header), "hello", 5);
+    tcp_receive(lo, seg, sizeof(seg));
+    if (acc->rcv_nxt == base + 10 && acc->recv_len == 0)
+      console_write("M84-TCP: ok dup-trim\n");
+    else
+      console_write("M84-TCP: FAIL dup-trim\n");
+  }
+
+  /* SACK emission: with a hole in the stream, the ACK the receiver builds must
+   * carry a block describing exactly the queued range. */
+  {
+    u32 base = acc->rcv_nxt;
+    u8 seg[sizeof(struct tcp_header) + 4];
+    struct tcp_header *h = (struct tcp_header *)seg;
+    memset(seg, 0, sizeof(seg));
+    h->src_port = bswap16(cli->local_port);
+    h->dst_port = bswap16(port);
+    h->seq_num = bswap32(base + 8); /* 8-byte hole in front */
+    h->ack_num = bswap32(acc->snd_nxt);
+    h->data_offset = (5 << 4);
+    h->flags = TCP_ACK | TCP_PSH;
+    h->window = bswap16(TCP_SYN_WINDOW);
+    memcpy(seg + sizeof(struct tcp_header), "SACK", 4);
+    tcp_receive(lo, seg, sizeof(seg));
+
+    u8 ack[TCP_ACK_MAX_LEN];
+    u64 irq = irq_save();
+    tcp_lock();
+    usize alen = tcp_build_ack(acc, ack, 1, base + 8);
+    tcp_unlock();
+    irq_restore(irq);
+
+    struct tcp_opts o;
+    tcp_parse_options(ack, ((ack[12] >> 4) * 4), &o);
+    if (alen > sizeof(struct tcp_header) && o.nsack == 1 &&
+        o.sack_left[0] == base + 8 && o.sack_right[0] == base + 12)
+      console_write("M84-TCP: ok sack-emit\n");
+    else
+      console_write("M84-TCP: FAIL sack-emit\n");
+  }
+
+  /* SACK consumption: a dup-ACK carrying a block covering the second queued
+   * segment must mark it, leaving the first (the real hole) unmarked so the
+   * fast-retransmit path resends that one.
+   *
+   * This runs on its own connection pair: the injections above deliberately
+   * faked data the client never sent, which leaves the first client's send
+   * sequence state ahead of itself (its peer ACKed bytes it never queued), and
+   * tcp_send() would correctly refuse to send more on it. */
+  {
+    u16 port2 = 7941;
+    struct tcp_conn *srv2 = tcp_listen(port2, 1);
+    struct tcp_conn *cli2 = srv2 ? tcp_connect(lo, port2) : 0;
+    struct tcp_conn *acc2 = 0;
+    for (int i = 0; i < 100 && cli2 && !acc2; i++) {
+      acc2 = tcp_accept(port2, &peer_ip, &peer_port);
+      if (!acc2)
+        net_poll();
+    }
+
+    int rc1 = cli2 ? tcp_send(cli2, "0123456789", 10) : -1;
+    int rc2 = cli2 ? tcp_send(cli2, "abcdefghij", 10) : -1;
+    struct tcp_retransmit_pkt *first = cli2 ? cli2->retransmit_queue : 0;
+    struct tcp_retransmit_pkt *second = first ? first->next : 0;
+    int ok = (acc2 && rc1 == 10 && rc2 == 10 && first && second);
+
+    if (ok) {
+      struct tcp_conn *cli = cli2;
+      u16 port = port2;
+      u8 sackack[sizeof(struct tcp_header) + 12];
+      memset(sackack, 0, sizeof(sackack));
+      struct tcp_header *h = (struct tcp_header *)sackack;
+      h->src_port = bswap16(port);
+      h->dst_port = bswap16(cli->local_port);
+      h->seq_num = bswap32(cli->rcv_nxt);
+      h->ack_num = bswap32(cli->snd_una); /* duplicate ACK: hole not filled */
+      h->data_offset = (u8)((5 + 3) << 4);
+      h->flags = TCP_ACK;
+      h->window = bswap16(1000);
+      u8 *o = sackack + sizeof(struct tcp_header);
+      o[0] = TCP_OPT_NOP;
+      o[1] = TCP_OPT_NOP;
+      o[2] = TCP_OPT_SACK;
+      o[3] = 10;
+      u32 l = second->seq, r = second->seq + second->dlen;
+      o[4] = (u8)(l >> 24); o[5] = (u8)(l >> 16);
+      o[6] = (u8)(l >> 8);  o[7] = (u8)l;
+      o[8] = (u8)(r >> 24); o[9] = (u8)(r >> 16);
+      o[10] = (u8)(r >> 8); o[11] = (u8)r;
+      tcp_receive(lo, sackack, sizeof(sackack));
+
+      ok = (second->sacked == 1 && first->sacked == 0);
+    }
+    console_write(ok ? "M84-TCP: ok sack-consume\n"
+                     : "M84-TCP: FAIL sack-consume\n");
+
+    /* Scoreboard: with three segments SACKed above the head, the head is
+     * declared lost, the pipe estimate drops by what left the network, and
+     * entering recovery leaves cwnd at ssthresh instead of the Reno
+     * ssthresh + 3*MSS inflation. */
+    if (ok && cli2) {
+      int sb_ok = 1;
+      /* Build the scenario inside the lock and re-check it there: the net_task
+       * daemon drains the loopback queue in the background, so peer ACKs can
+       * retire queued segments between two of our calls. Send until at least
+       * four segments are outstanding at the instant we look. */
+      u64 irq = 0;
+      struct tcp_retransmit_pkt *head = 0;
+      u32 total = 0;
+      int n = 0;
+      for (int attempt = 0; attempt < 12; attempt++) {
+        irq = irq_save();
+        tcp_lock();
+        n = 0;
+        for (struct tcp_retransmit_pkt *rp = cli2->retransmit_queue; rp;
+             rp = rp->next)
+          n++;
+        tcp_unlock();
+        irq_restore(irq);
+        if (n >= 4)
+          break;
+        if (tcp_send(cli2, "xxxxxxxxxx", 10) != 10)
+          sb_ok = 0;
+      }
+
+      irq = irq_save();
+      tcp_lock();
+      head = cli2->retransmit_queue;
+      total = 0;
+      n = 0;
+      for (struct tcp_retransmit_pkt *rp = head; rp; rp = rp->next) {
+        total += rp->dlen;
+        n++;
+        /* Scenario: the head is the hole, everything above it arrived. The
+         * head may already carry a SACK mark from the previous step, so clear
+         * it explicitly rather than assuming. */
+        rp->sacked = (u8)(n > 1);
+        rp->retransmitted = 0;
+        rp->lost = 0;
+      }
+      /* Start from a clean congestion state: earlier steps in this test drove
+       * duplicate ACKs through the connection. */
+      cli2->in_recovery = 0;
+      cli2->dup_acks = 0;
+      tcp_scoreboard_update(cli2);
+      u32 pipe = tcp_pipe(cli2);
+      int head_lost = head && head->lost;
+      u32 sacked = cli2->sacked_bytes;
+      cli2->cwnd = 8 * TCP_MSS;
+      tcp_enter_recovery(cli2);
+      u32 cwnd = cli2->cwnd, ssthresh = cli2->ssthresh;
+      tcp_unlock();
+      irq_restore(irq);
+
+      sb_ok = sb_ok && n >= 4 && head_lost && sacked == total - head->dlen &&
+              pipe == 0 && cwnd == ssthresh && cwnd == 4 * TCP_MSS;
+      if (sb_ok) {
+        console_write("M84-TCP: ok scoreboard-pipe\n");
+      } else {
+        console_write("M84-TCP: FAIL scoreboard-pipe n=");
+        console_write_dec((u64)n);
+        console_write(" lost=");
+        console_write_dec((u64)head_lost);
+        console_write(" sacked=");
+        console_write_dec((u64)sacked);
+        console_write(" total=");
+        console_write_dec((u64)total);
+        console_write(" pipe=");
+        console_write_dec((u64)pipe);
+        console_write(" cwnd=");
+        console_write_dec((u64)cwnd);
+        console_write(" ssthresh=");
+        console_write_dec((u64)ssthresh);
+        console_write("\n");
+      }
+
+      /* D-SACK undo: a block below the cumulative ACK says the retransmission
+       * was spurious, so the congestion reduction must be rolled back. */
+      u8 dpkt[sizeof(struct tcp_header) + 12];
+      memset(dpkt, 0, sizeof(dpkt));
+      struct tcp_header *h = (struct tcp_header *)dpkt;
+      h->src_port = bswap16(port2);
+      h->dst_port = bswap16(cli2->local_port);
+      h->seq_num = bswap32(cli2->rcv_nxt);
+      h->ack_num = bswap32(cli2->snd_una);
+      h->data_offset = (u8)((5 + 3) << 4);
+      h->flags = TCP_ACK;
+      h->window = bswap16(4096);
+      u8 *o = dpkt + sizeof(struct tcp_header);
+      o[0] = TCP_OPT_NOP;
+      o[1] = TCP_OPT_NOP;
+      o[2] = TCP_OPT_SACK;
+      o[3] = 10;
+      u32 dl = cli2->snd_una - 10, dr = cli2->snd_una;
+      o[4] = (u8)(dl >> 24); o[5] = (u8)(dl >> 16);
+      o[6] = (u8)(dl >> 8);  o[7] = (u8)dl;
+      o[8] = (u8)(dr >> 24); o[9] = (u8)(dr >> 16);
+      o[10] = (u8)(dr >> 8); o[11] = (u8)dr;
+      u32 prior = cli2->prior_cwnd;
+      u32 seen_before = cli2->dsack_seen;
+      tcp_receive(lo, dpkt, sizeof(dpkt));
+      int undo_ok = cli2->dsack_seen == seen_before + 1 &&
+                    !cli2->in_recovery && cli2->cwnd == prior;
+      console_write(undo_ok ? "M84-TCP: ok dsack-undo\n"
+                            : "M84-TCP: FAIL dsack-undo\n");
+
+      /* End-to-end D-SACK: let the peer receive a segment, then replay it.
+       * The receiver must report the duplicate as a D-SACK block, and this
+       * sender must recognise it — neither side is faked, the block travels
+       * over the loopback datapath. */
+      for (int i = 0; i < 60 && acc2 && cli2->snd_una != cli2->snd_nxt; i++)
+        net_poll();
+      u32 dsack_before = cli2->dsack_seen;
+      u32 dup_seq = cli2->snd_nxt - 10;
+      u8 dup[sizeof(struct tcp_header) + 10];
+      memset(dup, 0, sizeof(dup));
+      struct tcp_header *dh = (struct tcp_header *)dup;
+      dh->src_port = bswap16(cli2->local_port);
+      dh->dst_port = bswap16(port2);
+      dh->seq_num = bswap32(dup_seq);
+      dh->ack_num = bswap32(acc2->snd_nxt);
+      dh->data_offset = (5 << 4);
+      dh->flags = TCP_ACK | TCP_PSH;
+      dh->window = bswap16(TCP_SYN_WINDOW);
+      memcpy(dup + sizeof(struct tcp_header), "xxxxxxxxxx", 10);
+      tcp_receive(lo, dup, sizeof(dup));
+      for (int i = 0; i < 60 && cli2->dsack_seen == dsack_before; i++)
+        net_poll();
+      console_write(cli2->dsack_seen > dsack_before
+                        ? "M84-TCP: ok dsack-emit\n"
+                        : "M84-TCP: FAIL dsack-emit\n");
+    }
+    if (acc2)
+      tcp_close(acc2);
+    if (cli2)
+      tcp_close(cli2);
+    if (srv2)
+      tcp_close(srv2);
+  }
+
+  tcp_close(acc);
+  tcp_close(cli);
+  tcp_close(srv);
 }

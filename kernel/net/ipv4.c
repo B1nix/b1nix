@@ -1,4 +1,5 @@
 #include <b1nix/net.h>
+#include <b1nix/netdev.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <string.h>
@@ -143,24 +144,34 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 		return;
 	}
 
-	// Wait, we need to check if target is in subnet or use gateway.
-	// We'll just assume /24 mask for now to determine if local or external.
-	struct ipv4_addr my_ip = net_get_ip();
-	struct ipv4_addr route_ip;
-	if (dst.bytes[0] == my_ip.bytes[0] && dst.bytes[1] == my_ip.bytes[1] && dst.bytes[2] == my_ip.bytes[2]) {
-		route_ip = dst;
-	} else {
-		route_ip = net_get_gateway();
-		if (route_ip.bytes[0] == 0 && route_ip.bytes[1] == 0 &&
-		    route_ip.bytes[2] == 0 && route_ip.bytes[3] == 0) {
-			kfree(buffer);
-			return;
-		}
+	/* M84: consult the FIB. Longest-prefix-match picks the next hop — the
+	 * destination itself for an on-link route, the gateway otherwise — and
+	 * the interface to send it out of. No route means the destination is
+	 * unreachable, so drop rather than guessing a /24 and firing ARP at a
+	 * host that isn't on this link. */
+	/* M84: hash the 5-tuple so equal-cost routes spread flows, not packets.
+	 * The transport header sits at the start of the payload for TCP/UDP, which
+	 * is the only case where ports exist at all. */
+	u16 sport = 0, dport = 0;
+	if ((protocol == IP_PROTO_TCP || protocol == IP_PROTO_UDP) && size >= 4) {
+		const u8 *l4 = payload;
+		sport = (u16)(((u16)l4[0] << 8) | l4[1]);
+		dport = (u16)(((u16)l4[2] << 8) | l4[3]);
 	}
+	struct ipv4_addr local = net_get_ip();
+	u32 flow = route_flow_hash(local.bytes, dst.bytes, 4, protocol, sport, dport);
+
+	struct ipv4_addr route_ip;
+	int oif = 0;
+	if (!route_lookup_ex(local, dst, flow, 0, &route_ip, 0, &oif)) {
+		kfree(buffer);
+		return;
+	}
+	struct netdev *dev = oif ? netdev_by_index(oif) : 0;
 
 	for (int tries = 0; tries < 25; tries++) {
-		if (arp_resolve(route_ip, &dst_mac)) {
-			net_send_ethernet(dst_mac, 0x0800, buffer, total_size);
+		if (arp_resolve_dev(route_ip, &dst_mac, dev)) {
+			net_send_ethernet_dev(dev, dst_mac, 0x0800, buffer, total_size);
 			kfree(buffer);
 			return;
 		}

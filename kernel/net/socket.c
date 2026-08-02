@@ -568,8 +568,9 @@ static void socket_release(struct vfs_handle *h) {
  * handle refcount reaches zero (see socket_teardown). */
 /* ── Interface ioctls (SIOCGIF*) for BusyBox ifconfig ──
  * b1nix models a single configured interface, "eth0", carrying the
- * DHCP-assigned IPv4 address and the active NIC's MAC. Route-mutation ioctls
- * (SIOCADDRT/SIOCDELRT) are accepted as no-ops. */
+ * DHCP-assigned IPv4 address and the active NIC's MAC. M84: the route-mutation
+ * ioctls (SIOCADDRT/SIOCDELRT) really mutate the FIB — `route add -net
+ * 10.0.0.0 netmask 255.0.0.0 gw ...` now changes where packets go. */
 #define SIOC_ADDRT      0x890B
 #define SIOC_DELRT      0x890C
 #define SIOC_GIFNAME    0x8910
@@ -609,18 +610,132 @@ struct k_ifconf {
   char *buf; /* user pointer (natural alignment matches userspace per arch) */
 };
 
+/* Linux `struct rtentry` (SIOCADDRT/SIOCDELRT payload), laid out to match the
+ * x86_64 userspace ABI byte for byte — BusyBox `route` fills this in. The pad
+ * fields are part of the ABI and must stay. */
+struct k_sockaddr_generic {
+  u16 sa_family;
+  u8 sa_data[14];
+};
+
+struct k_rtentry {
+  u64 rt_pad1;
+  struct k_sockaddr_generic rt_dst;
+  struct k_sockaddr_generic rt_gateway;
+  struct k_sockaddr_generic rt_genmask;
+  u16 rt_flags;
+  i16 rt_pad2;
+  u64 rt_pad3;
+  u8 rt_tos;
+  u8 rt_class;
+  i16 rt_pad4[3];
+  i16 rt_metric;
+  char *rt_dev;
+  u64 rt_mtu;
+  u64 rt_window;
+  u16 rt_irtt;
+};
+
+/* Linux `struct in6_rtmsg` — the SIOCADDRT/SIOCDELRT payload on an AF_INET6
+ * socket. */
+struct k_in6_rtmsg {
+  u8 rtmsg_dst[16];
+  u8 rtmsg_src[16];
+  u8 rtmsg_gateway[16];
+  u32 rtmsg_type;
+  u16 rtmsg_dst_len;
+  u16 rtmsg_src_len;
+  u32 rtmsg_metric;
+  u64 rtmsg_info;
+  u32 rtmsg_flags;
+  int rtmsg_ifindex;
+};
+
+/* sockaddr_in payload of an rtentry field -> host-order IPv4. sa_data[2..5] is
+ * sin_addr (sa_data[0..1] is sin_port). */
+static u32 rtentry_addr(const struct k_sockaddr_generic *sa) {
+  return ((u32)sa->sa_data[2] << 24) | ((u32)sa->sa_data[3] << 16) |
+         ((u32)sa->sa_data[4] << 8) | (u32)sa->sa_data[5];
+}
+
 static u32 net_ip_as_be(struct ipv4_addr a) {
   return (u32)a.bytes[0] | ((u32)a.bytes[1] << 8) | ((u32)a.bytes[2] << 16) |
          ((u32)a.bytes[3] << 24);
 }
 
 static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
-  (void)h;
   if (!arg)
     return -EFAULT;
 
-  if (request == SIOC_ADDRT || request == SIOC_DELRT)
-    return 0; /* routing table is implicit; accept the request */
+  if (request == SIOC_ADDRT || request == SIOC_DELRT) {
+    /* Linux dispatches on the socket's family: an AF_INET6 socket carries a
+     * struct in6_rtmsg, an AF_INET one a struct rtentry. `route -A inet6` and
+     * `ip -6 route` take the former path. */
+    struct vfs_socket_state *ss = (struct vfs_socket_state *)h->private_data;
+    if (ss && ss->domain == B1NIX_AF_INET6) {
+      struct k_in6_rtmsg r6;
+      if (syscall_copyin(&r6, arg, sizeof(r6)) != 0)
+        return -EFAULT;
+      struct in6_addr_k dst, gw;
+      memcpy(dst.bytes, r6.rtmsg_dst, 16);
+      memcpy(gw.bytes, r6.rtmsg_gateway, 16);
+      u8 plen = r6.rtmsg_dst_len > 128 ? 128 : (u8)r6.rtmsg_dst_len;
+      if (request == SIOC_DELRT)
+        return route6_del(dst, plen, gw) == 0 ? 0 : -ESRCH;
+      if (!(r6.rtmsg_flags & RTF_UP))
+        return -EINVAL;
+      u16 metric = r6.rtmsg_metric > 0 ? (u16)(r6.rtmsg_metric - 1) : 0;
+      return route6_add(dst, plen, gw, (u16)r6.rtmsg_flags, metric,
+                        r6.rtmsg_ifindex) == 0
+                 ? 0
+                 : -ENOBUFS;
+    }
+
+    struct k_rtentry rt;
+    if (syscall_copyin(&rt, arg, sizeof(rt)) != 0)
+      return -EFAULT;
+    if (rt.rt_dst.sa_family != B1NIX_AF_INET ||
+        (rt.rt_genmask.sa_family != B1NIX_AF_INET &&
+         rt.rt_genmask.sa_family != 0))
+      return -EAFNOSUPPORT;
+
+    u32 dst = rtentry_addr(&rt.rt_dst);
+    u32 mask = rtentry_addr(&rt.rt_genmask);
+    u32 gw = rtentry_addr(&rt.rt_gateway);
+    /* RTF_HOST means the destination is a single host: the mask field is
+     * unused, the prefix is /32. */
+    if (rt.rt_flags & RTF_HOST)
+      mask = 0xFFFFFFFFu;
+
+    if (request == SIOC_DELRT)
+      return route_del(dst, mask, gw) == 0 ? 0 : -ESRCH;
+
+    if (!(rt.rt_flags & RTF_UP))
+      return -EINVAL;
+    if ((rt.rt_flags & RTF_GATEWAY) && gw == 0)
+      return -EINVAL;
+    u16 metric = rt.rt_metric > 0 ? (u16)(rt.rt_metric - 1) : 0;
+    /* rt_dev names the output interface ("route add ... dev eth0"); an unknown
+     * or absent name leaves the route unbound (index 0 = active interface). */
+    int oif = 0;
+    if (rt.rt_dev) {
+      char devname[16];
+      usize di = 0;
+      /* Byte at a time: the name may sit at the end of a page, and a bulk
+       * copyin of the whole buffer would fault on the unmapped next one. */
+      for (; di < sizeof(devname) - 1; di++) {
+        if (syscall_copyin(&devname[di], rt.rt_dev + di, 1) != 0)
+          break;
+        if (devname[di] == '\0')
+          break;
+      }
+      devname[di] = '\0';
+      oif = netdev_index_by_name(devname);
+    }
+    return route_add_oif(dst, mask, gw, rt.rt_flags, metric, oif) == 0
+               ? 0
+               : -ENOBUFS;
+  }
 
   if (request == SIOC_GIFCONF) {
     struct k_ifconf ifc;
@@ -659,15 +774,26 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     r.u.addr.sin_addr = net_ip_as_be(net_get_ip());
     break;
   case SIOC_GIFNETMASK: {
-    struct ipv4_addr nm = {{255, 255, 255, 0}};
+    /* M84: report the lease's real mask; fall back to /24 only when DHCP
+     * never supplied option 1. */
+    struct ipv4_addr nm = net_get_netmask();
+    if ((nm.bytes[0] | nm.bytes[1] | nm.bytes[2] | nm.bytes[3]) == 0)
+      nm = (struct ipv4_addr){{255, 255, 255, 0}};
     memset(&r.u, 0, sizeof(r.u));
     r.u.addr.sin_family = B1NIX_AF_INET;
     r.u.addr.sin_addr = net_ip_as_be(nm);
     break;
   }
   case SIOC_GIFBRDADDR: {
+    /* Broadcast = address | ~netmask, derived from the lease (M84) rather
+     * than assuming the last octet is the host part. */
     struct ipv4_addr ip = net_get_ip();
-    struct ipv4_addr bc = {{ip.bytes[0], ip.bytes[1], ip.bytes[2], 255}};
+    struct ipv4_addr nm = net_get_netmask();
+    if ((nm.bytes[0] | nm.bytes[1] | nm.bytes[2] | nm.bytes[3]) == 0)
+      nm = (struct ipv4_addr){{255, 255, 255, 0}};
+    struct ipv4_addr bc;
+    for (int i = 0; i < 4; i++)
+      bc.bytes[i] = (u8)(ip.bytes[i] | (u8)~nm.bytes[i]);
     memset(&r.u, 0, sizeof(r.u));
     r.u.addr.sin_family = B1NIX_AF_INET;
     r.u.addr.sin_addr = net_ip_as_be(bc);
@@ -687,7 +813,11 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     r.u.ival = 1500;
     break;
   case SIOC_GIFINDEX:
-    r.u.ival = 1;
+    /* M84: the real registration index, so a route bound to "eth0" and the
+     * ifindex userspace sees agree. */
+    r.u.ival = netdev_index_of(netdev_active());
+    if (r.u.ival == 0)
+      r.u.ival = 1;
     break;
   case SIOC_GIFMETRIC:
     r.u.ival = 0;

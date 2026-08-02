@@ -1,4 +1,5 @@
 #include <b1nix/net.h>
+#include <b1nix/netdev.h>
 #include <b1nix/console.h>
 #include <b1nix/bootinfo.h>
 #include <string.h>
@@ -72,7 +73,7 @@ static void arp_cache_put(struct ipv4_addr ip, struct mac_addr mac)
 	}
 }
 
-int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac)
+int arp_resolve_dev(struct ipv4_addr ip, struct mac_addr *mac, struct netdev *dev)
 {
 	int found = 0;
 	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
@@ -99,7 +100,11 @@ int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac)
 		req.target_ip = ip;
 
 		struct mac_addr bcast = { { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF } };
-		net_send_ethernet(bcast, 0x0806, &req, sizeof(req));
+		/* M84: broadcast the request out of the interface the route picked,
+		 * not blindly out of the active one. */
+		if (dev)
+			req.sender_mac = dev->mac;
+		net_send_ethernet_dev(dev, bcast, 0x0806, &req, sizeof(req));
 		
 			if (bootinfo_has_flag("b1nix.test=1") && !arp_smoke_request_logged) {
 			console_write("\nARP-SMOKE: request-sent\n");
@@ -114,6 +119,11 @@ int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac)
 
 	// We don't block here. Returning 0 means not found yet. The upper layer should retry later.
 	return 0;
+}
+
+int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac)
+{
+	return arp_resolve_dev(ip, mac, 0);
 }
 
 void arp_receive(const void *data, usize size)

@@ -293,6 +293,8 @@ void dhcp_stop(void)
 	retry_not_before_ticks = 0;
 	net_set_ip(zero);
 	net_set_gateway(zero);
+	net_set_netmask(zero);
+	route_flush_dynamic();
 }
 
 void dhcp_receive(const void *data, usize size)
@@ -369,6 +371,11 @@ void dhcp_receive(const void *data, usize size)
 		                     parsed_mask, parsed_dns, parsed_srv);
 		net_set_ip(ack_ip);
 		net_set_gateway(parsed_gw);
+		/* M84: the lease defines the on-link prefix. Feed address, mask and
+		 * router into the FIB so ipv4_send does a real longest-prefix-match
+		 * instead of assuming /24 + one gateway. */
+		net_set_netmask(parsed_mask);
+		route_configure_interface(ack_ip, parsed_mask, parsed_gw);
 		if (parsed_dns.bytes[0] || parsed_dns.bytes[1] ||
 		    parsed_dns.bytes[2] || parsed_dns.bytes[3])
 			dns_set_server(parsed_dns);
@@ -423,8 +430,11 @@ void dhcp_tick(u64 now_ticks) {
       now_ticks - transaction_start_ticks >= 600 && !dhcp_fallback_announced) {
     struct ipv4_addr fallback_ip = {{10, 0, 2, 15}};
     struct ipv4_addr fallback_gw = {{10, 0, 2, 2}};
+    struct ipv4_addr fallback_mask = {{255, 255, 255, 0}};
     net_set_ip(fallback_ip);
 	    net_set_gateway(fallback_gw);
+	    net_set_netmask(fallback_mask);
+	    route_configure_interface(fallback_ip, fallback_mask, fallback_gw);
 	    dhcp_state = 2;
 	    dhcp_fallback_announced = 1;
 	    if (bootinfo_has_flag("b1nix.test=1"))
@@ -470,6 +480,8 @@ void dhcp_tick(u64 now_ticks) {
       struct ipv4_addr zero = {{0, 0, 0, 0}};
       net_set_ip(zero);
       net_set_gateway(zero);
+      net_set_netmask(zero);
+      route_flush_dynamic();
       dhcp_init();
       return;
     }
