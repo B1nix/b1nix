@@ -153,6 +153,20 @@ struct user_loaded_image {
 	 * none). /proc/<pid>/maps names the interpreter's mappings with it, which is
 	 * how a reader tells ld.so's text from the executable's. */
 	char interp_path[64];
+	/* M108: the credentials this image will run under once execve commits the
+	 * file's set-user-ID / set-group-ID bits. The bits are only applied to the
+	 * task AFTER the image has loaded (an exec that fails must not leave the
+	 * caller privileged), but the auxiliary vector is built during the load —
+	 * so without these the kernel would publish the PRE-exec euid/egid in
+	 * AT_EUID/AT_EGID and AT_SECURE=0 for a setuid binary. musl's ld.so derives
+	 * its "secure" mode (which is what suppresses LD_PRELOAD and
+	 * LD_LIBRARY_PATH) from exactly those entries, so getting them wrong is a
+	 * privilege escalation: an unprivileged caller could preload a library into
+	 * /bin/su. cred_override != 0 means cred_euid/cred_egid are authoritative.
+	 */
+	u8 cred_override;
+	u32 cred_euid;
+	u32 cred_egid;
 };
 
 void userspace_init(void);

@@ -3,7 +3,7 @@
  * tools/ports/build-openpam.sh) against b1nix's own pam_unix.so service
  * module (tools/ports/openpam-pam_unix.c), which authenticates against the
  * real /etc/shadow via musl's crypt(3) "$6$" scheme — the same check
- * userspace/bin/su.c performs directly.
+ * BusyBox's su/passwd applets perform (M108).
  *
  * This binary links libpam.so.2 as a normal DT_NEEDED shared library (see
  * userspace/Makefile's m104_pam_smoke rule) and calls the genuine OpenPAM

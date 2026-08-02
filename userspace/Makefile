@@ -196,8 +196,6 @@ BINARIES := \
 	$(BUILD)/bin/m35_smoke \
 	$(BUILD)/bin/m36_smoke \
 	$(BUILD)/bin/diskbench \
-	$(BUILD)/bin/su \
-	$(BUILD)/bin/passwd \
 	$(BUILD)/bin/id \
 	$(BUILD)/bin/whoami \
 	$(BUILD)/bin/groups \
@@ -238,6 +236,8 @@ BINARIES += $(BUILD)/bin/m75_smoke
 BINARIES += $(BUILD)/bin/m73_smoke
 # M104: OpenPAM smoke — links libpam.so.2 (tools/ports/build-openpam.sh)
 BINARIES += $(BUILD)/bin/m104_pam_smoke
+# M108: BusyBox su/passwd/init smoke — also links libpam.so.2 (bespoke rule).
+BINARIES += $(BUILD)/bin/m108_smoke
 # M80: ptrace register sets, /proc/<pid>/task|auxv|mem, crash capture.
 BINARIES += $(BUILD)/bin/m80_smoke
 # M86: per-thread CPU accounting, tkill/tgkill, pthread_exit return values.
@@ -294,7 +294,7 @@ endif
 
 # /bin/js has a custom multi-source rule (duktape.c + js.c) — exclude it from
 # the generic single-source BIN_OBJS pattern.
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m57_smoke $(BUILD)/bin/m53_httpsd $(BUILD)/bin/m104_pam_smoke,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m57_smoke $(BUILD)/bin/m53_httpsd $(BUILD)/bin/m104_pam_smoke $(BUILD)/bin/m108_smoke,$(BINARIES)))
 DEPS := $(BIN_OBJS:.o=.d)
 
 .PHONY: all clean install install-headers-libs
@@ -546,6 +546,24 @@ $(BUILD)/bin/m104_pam_smoke: bin/m104_pam_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPO
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(OPENPAM_DIR)/include -c $< -o $(BUILD)/bin/m104_pam_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -L $(OPENPAM_DIR)/lib -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m104_pam_smoke.o \
+	  -l:libpam.so.2 $(BESPOKE_LIBC)
+	$(if $(BESPOKE_MUSL_POSTLINK), \
+	  python3 -c "\
+	  import sys; f=sys.argv[1]; \
+	  d=open(f,'rb').read(); \
+	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
+	  open(f,'wb').write(d); \
+	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	)
+
+# M108: BusyBox su/passwd/init smoke. Links libpam.so.2 for the same reason
+# m104_pam_smoke does — it has to ask the REAL pam_unix.so whether the password
+# BusyBox's passwd applet wrote is accepted — so it needs the same bespoke rule
+# rather than the generic single-source pattern.
+$(BUILD)/bin/m108_smoke: bin/m108_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(OPENPAM_DIR)/lib/libpam.so.2
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(OPENPAM_DIR)/include -c $< -o $(BUILD)/bin/m108_smoke.o
+	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -L $(OPENPAM_DIR)/lib -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m108_smoke.o \
 	  -l:libpam.so.2 $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  python3 -c "\
@@ -1059,8 +1077,12 @@ ifneq ($(GUI_BINARIES),)
 	cp $(GUI_BINARIES) $(ROOTFS)/bin/
 endif
 	@chmod 4755 $(ROOTFS)/bin/m31_setuid 2>/dev/null || true
-	@chmod 4755 $(ROOTFS)/bin/su 2>/dev/null || true
-	@chmod 4755 $(ROOTFS)/bin/passwd 2>/dev/null || true
+	@# M108: /bin/su and /bin/passwd are no longer ELFs of their own — they are
+	@# BusyBox applet symlinks onto /opt/busybox/bin/busybox-suid, which carries
+	@# the setuid bit (see the symlink block at the end of this target). Drop any
+	@# stale copies an older tree installed here, otherwise `cp` would keep an
+	@# unmaintained setuid-root binary alive in the image forever.
+	@rm -f $(ROOTFS)/bin/su $(ROOTFS)/bin/passwd
 	@for b in m12_smoke:m12-smoke m13_smoke:m13-smoke m13_job_control:m13-job-control m14_smoke:m14-smoke m15_smoke:m15-smoke m17_smoke:m17-smoke m24b_smoke:m24b-smoke m25_smoke:m25-smoke m26_smoke:m26-smoke m27_smoke:m27-smoke m29_smoke:m29-smoke m31_smoke:m31-smoke m31_setuid:m31-setuid m32_smoke:m32-smoke m34_smoke:m34-smoke m35_smoke:m35-smoke m36_smoke:m36-smoke m47_smoke:m47-smoke m48_smoke:m48-smoke m49_smoke:m49-smoke m50_smoke:m50-smoke m51_smoke:m51-smoke m52_gl_smoke:m52-gl-smoke m57_smoke:m57-smoke m75_smoke:m75-smoke; do \
 		src=$${b%%:*}; dst=$${b##*:}; \
 		ln -sfn $$src $(ROOTFS)/bin/$$dst; \
@@ -1092,6 +1114,17 @@ endif
 	fi
 	@mkdir -p $(ROOTFS)/etc
 	@printf "root:x:0:0:root:/root:/bin/zsh\nuser:x:1000:1000:b1nix user:/home/user:/bin/zsh\npamtest:x:1001:1001:M104 PAM smoke test account:/home/pamtest:/bin/sh\n" > $(ROOTFS)/etc/passwd
+	@# M108: three accounts for the BusyBox su/passwd smoke
+	@# (userspace/bin/m108_smoke.c), kept apart from root/user/pamtest so the
+	@# test never touches a credential another test depends on.
+	@#   m108user  the *caller* in the unprivileged su test. Its login shell is
+	@#             /bin/m108shell, a two-line script that announces itself — that
+	@#             is how the test proves su ran THE ACCOUNT'S shell rather than
+	@#             whatever shell it happened to inherit.
+	@#   m108peer  the su *target*.
+	@#   m108pw    the account whose password `passwd` rewrites.
+	@printf "m108user:x:1002:1002:M108 su caller:/home/m108user:/bin/m108shell\nm108peer:x:1003:1003:M108 su target:/home/m108peer:/bin/sh\nm108pw:x:1004:1004:M108 passwd target:/home/m108pw:/bin/sh\n" >> $(ROOTFS)/etc/passwd
+	@mkdir -p $(ROOTFS)/home/m108user $(ROOTFS)/home/m108peer $(ROOTFS)/home/m108pw
 	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:0:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:0:0:99999:7:::\n' > $(ROOTFS)/etc/shadow
 	@# M104: dedicated /etc/shadow entry for the OpenPAM smoke test
 	@# (userspace/bin/m104_pam_smoke.c) — a real SHA-512 "$$6$$" hash of the
@@ -1100,8 +1133,17 @@ endif
 	@# from root/user so this test never depends on — or risks perturbing —
 	@# their credentials.
 	@printf 'pamtest:$$6$$pamtestsalt$$.8vbtO9GTrzzFPO1mFgs22hz1YDCsqQnz/AucCx/9DkM5GoSWTqA78BSIVE4IESMY2ZYdF7Ywln/2p2LVLdd20:0:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
-	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\npamtest:x:1001:pamtest\n" > $(ROOTFS)/etc/group
-	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
+	@# M108: SHA-512 "$$6$$" hashes for the BusyBox su/passwd accounts. Same
+	@# scheme, same file and same crypt(3) comparison pam_unix.so uses, which is
+	@# the whole point of the milestone: one shadow format for the applet and
+	@# the PAM path. Plaintexts (host: `openssl passwd -6 -salt <salt> <pw>`):
+	@#   m108user = M108user!   m108peer = M108peer!   m108pw = M108old!
+	@# m108pw's password is the one m108_smoke rewrites with `passwd`.
+	@printf 'm108user:$$6$$m108usersalt$$U7uuAPJyfx58AT26qAudu8PvVKsmO6jTB5EiK/pag6OV8oGNxzS9DPtQlEhTAc4URuN2oMFLgarPW2Utx3DGA1:0:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf 'm108peer:$$6$$m108peersalt$$TCl.o4K5Iw7SlNXrk9dNp4NHfvT0JPCUmyk9otIuGpjRuq8d0trvLR6DDBava0iQY5MBTlU6kRnSNF4XOZXPF/:0:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf 'm108pw:$$6$$m108pwsalt$$YvQPFIRKzF9l53ejsICs/u66sJBq6NfeOai7reDJDsOGog0q.k7t7bHAfGgVrOs3Ni0rrwKmaEwEWvZv3Tl9V1:0:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\npamtest:x:1001:pamtest\nm108user:x:1002:\nm108peer:x:1003:\nm108pw:x:1004:\n" > $(ROOTFS)/etc/group
+	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/bin/m108shell\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
 	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/zsh/bpkg-smoke.sh,
 	@# sshd init.d, bb-w6/bb-w2b fixtures — real files (not embedded kernel C
 	@# strings) copied verbatim onto the ext4 root. cp -R preserves the tree
@@ -1118,10 +1160,22 @@ endif
 	@# explicitly.
 	@mkdir -p $(ROOTFS)/bin
 	@awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$1); gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); if ($$2 == "upstream") print $$1; }' ../tools/configs/applet-manifest.conf | \
-		grep -vE '^(id|whoami|chown|chmod)$$' | \
+		grep -vE '^(id|whoami|chown|chmod|su|passwd|login)$$' | \
 		while read -r cmd; do ln -sfn /opt/busybox/bin/busybox "$(ROOTFS)/bin/$$cmd"; done
 	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/bin/sh
 	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/bin/ash
+	@# M108: su, passwd and login are BusyBox's three BB_SUID_REQUIRE applets —
+	@# they need euid 0 to read /etc/shadow and to change identity, so they get
+	@# the setuid copy of the multicall ELF (build-busybox.sh installs
+	@# busybox-suid mode 4755 root; the top-level Makefile stamps that mode onto
+	@# the ext4 image). Everything else above keeps the plain, non-setuid copy,
+	@# so the setuid inode is reachable under exactly three names. Combined with
+	@# CONFIG_FEATURE_SUID=y (libbb check_suid() drops euid for every applet
+	@# that is not BB_SUID_REQUIRE), even a hand-made symlink from `sh` to
+	@# busybox-suid yields no privilege.
+	@ln -sfn /opt/busybox/bin/busybox-suid $(ROOTFS)/bin/su
+	@ln -sfn /opt/busybox/bin/busybox-suid $(ROOTFS)/bin/passwd
+	@ln -sfn /opt/busybox/bin/busybox-suid $(ROOTFS)/bin/login
 
 
 clean:

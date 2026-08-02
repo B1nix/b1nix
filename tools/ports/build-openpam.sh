@@ -33,7 +33,7 @@
 #   lib/libpam.so                unversioned symlink, for -lpam-style linking
 #   lib/security/pam_unix.so     b1nix's pam_unix module (authenticates via
 #                                 /etc/shadow + musl crypt(3), same check
-#                                 userspace/bin/su.c performs directly)
+#                                 BusyBox's su/passwd applets perform)
 #   etc/pam.d/sshd                default policy staged into the rootfs by
 #                                 `make install-headers-libs` (see below)
 set -eu

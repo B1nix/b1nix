@@ -2,7 +2,8 @@
  * pam_unix.c — b1nix's pam_unix.so: a real OpenPAM service module that
  * authenticates against /etc/shadow using musl's crypt(3) (the SHA-512
  * "$6$" scheme already used by su(1)/login/dropbear). This is the same
- * shadow-line parsing and crypt() comparison su.c performs directly; the
+ * shadow-line parsing and crypt() comparison BusyBox's su/passwd applets
+ * perform through libbb's pw_encrypt() (M108); the
  * point of this module is that any PAM-aware program (dropbear included)
  * gets that check via the standard pam_sm_authenticate()/pam_sm_acct_mgmt()
  * entry points dlopen'd at runtime by libpam, instead of hardcoding it.
@@ -28,8 +29,9 @@
 #include <unistd.h>
 
 /* Look up the crypt(3) hash field for `username` in /etc/shadow. Mirrors
- * userspace/bin/su.c's get_shadow_hash() — same file, same format, same
- * trust boundary (both run privileged enough to read /etc/shadow). */
+ * what BusyBox's libbb get_passwd()/check_password() does for the su and
+ * passwd applets — same file, same format, same trust boundary (both run
+ * privileged enough to read /etc/shadow). */
 static int
 pam_unix_shadow_hash(const char *username, char *hash_out, size_t max_len)
 {

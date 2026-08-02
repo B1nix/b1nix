@@ -431,7 +431,7 @@ else
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
 		V8_ISO_TARGET=""
 		[ "$SMOKE_V8" = "1" ] && V8_ISO_TARGET="iso-v8"
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-sys iso-blk iso-posix iso-gfx iso-openrc $V8_ISO_TARGET >"$BUILD_LOG" 2>&1 || {
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-bbinit $V8_ISO_TARGET >"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
 		}
@@ -469,7 +469,7 @@ _mkimg() {  # mkimg <instance-suffix>
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
-    _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc
+    _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg bbinit
 }
 
 # Define logs
@@ -480,6 +480,7 @@ BLK_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-blk-$ARCH.log"
 POSIX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-posix-$ARCH.log"
 GFX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-gfx-$ARCH.log"
 OPENRC_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-openrc-$ARCH.log"
+BBINIT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-bbinit-$ARCH.log"
 
 echo ""
 if [ "$SMOKE_PARALLEL" = "1" ]; then
@@ -603,6 +604,24 @@ launch_openrc() {
 	pid_openrc=$!
 }
 
+# M108: BusyBox init as PID 1 (init=/opt/busybox/bin/init). openrc-init is
+# still the default PID 1 — this instance exists to prove the other, opt-in
+# configuration boots the same system: /etc/inittab drives OpenRC's runlevels,
+# then runs /etc/bbinit-smoke.sh, which is where the M108 init markers come from.
+launch_bbinit() {
+	(
+		SATA_IMG=$(disk_img sata bbinit)
+		NVME_IMG=$(disk_img nvme bbinit)
+		SWAP_IMG=$(disk_img swap bbinit)
+		B1NIX_ISO_NAME=b1nix-bbinit.iso
+		SMOKE_DONE_PATTERN="M108-SMOKE: done-init|KERNEL PANIC|\[PANIC\]"
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[bbinit]"
+		run_qemu "$BBINIT_LOG"
+	) &
+	pid_bbinit=$!
+}
+
 launch_v8() {
 	(
 		SATA_IMG=$(disk_img sata v8)
@@ -677,7 +696,7 @@ run_slot_pool() {
 if [ "$SMOKE_PARALLEL" = "1" ]; then
 	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
-	_inst_list="sys blk posix gfx openrc"
+	_inst_list="sys blk posix gfx openrc bbinit"
 	[ "$SMOKE_V8" = "1" ] && _inst_list="$_inst_list v8"
 	[ -n "${SMOKE_INSTANCES:-}" ] && _inst_list="$SMOKE_INSTANCES"
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
@@ -705,7 +724,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	for _i in sys blk posix gfx openrc smp v8; do
+	for _i in sys blk posix gfx openrc bbinit smp v8; do
 	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
@@ -1834,6 +1853,25 @@ check_output "$LOG" "M80-SMOKE: ok ptrace-ignored-signal" "a tracee stops for a 
 check_output "$LOG" "M80-SMOKE: ok process-vm-rw" "process_vm_readv/writev read and write another process's memory"
 check_output "$LOG" "M80-SMOKE: ok so-peercred" "SO_PEERCRED reports the peer's real pid/uid on socketpair and accepted connections"
 check_output "$LOG" "M80-SMOKE: done" "M80 ptrace/crash-capture suite completes"
+
+# ── M108: BusyBox owns su, passwd and (optionally) init ──
+# su/passwd run on the posix instance under openrc-init; the init markers come
+# from the dedicated bbinit instance, where PID 1 is /opt/busybox/bin/init.
+check_output "$LOG" "M108-SMOKE: ok setuid-layout" "/bin/su and /bin/passwd resolve to a setuid-root busybox-suid, and the plain multicall ELF is not setuid"
+check_output "$LOG" "M108-SMOKE: ok su-uid-and-shell" "BusyBox su becomes the target uid and execs that account's own login shell"
+check_output "$LOG" "M108-SMOKE: ok su-password-auth" "an unprivileged caller su's with the correct /etc/shadow password through the setuid bit"
+check_output "$LOG" "M108-SMOKE: ok su-wrong-password" "BusyBox su rejects a wrong password and never reaches the target uid"
+check_output "$LOG" "M108-SMOKE: ok pam-accepts-initial" "pam_unix.so authenticates the shipped password before passwd touches it"
+check_output "$LOG" "M108-SMOKE: ok passwd-writes-sha512" "BusyBox passwd rewrites the /etc/shadow field as a SHA-512 crypt string"
+check_output "$LOG" "M108-SMOKE: ok passwd-pam-accepts-new" "the PAM path accepts the password BusyBox passwd wrote"
+check_output "$LOG" "M108-SMOKE: ok passwd-pam-rejects-old" "the PAM path rejects the password BusyBox passwd replaced"
+check_output "$LOG" "M108-SMOKE: ok su-accepts-passwd-hash" "BusyBox su authenticates the hash BusyBox passwd wrote"
+check_output "$LOG" "M108-SMOKE: done" "M108 su/passwd suite completes"
+check_output "$BBINIT_LOG" "M108-SMOKE: ok bbinit-pid1" "with init=/opt/busybox/bin/init, PID 1 is the BusyBox multicall ELF running as init"
+check_output "$BBINIT_LOG" "M108-SMOKE: ok bbinit-openrc-runlevels" "OpenRC's default runlevel and its local.d hooks run under BusyBox init"
+check_output "$BBINIT_LOG" "M108-SMOKE: ok bbinit-shell" "the BusyBox-init boot reaches a usable shell"
+check_output "$BBINIT_LOG" "M108-SMOKE: ok bbinit-reaps-orphan" "BusyBox init reaps an orphaned grandchild re-parented to PID 1"
+check_output "$BBINIT_LOG" "M108-SMOKE: done-init" "M108 BusyBox-init instance completes"
 # ── M86: per-thread CPU accounting + thread-directed signals ──
 check_output "$LOG" "M86-SMOKE: ok thread-cputime" "CLOCK_THREAD_CPUTIME_ID tracks CPU actually burned and stays flat while the thread sleeps"
 check_output "$LOG" "M86-SMOKE: ok process-cputime" "CLOCK_PROCESS_CPUTIME_ID sums the whole thread group, not just the caller"
@@ -2188,7 +2226,7 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-for _i in sys blk posix gfx openrc smp v8; do
+for _i in sys blk posix gfx openrc bbinit smp v8; do
     rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
 done
 echo ""

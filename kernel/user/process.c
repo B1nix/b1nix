@@ -459,20 +459,34 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
   if (user_stack_push_usize(stack, &sp, AT_BASE) < 0) return -1;
   if (user_stack_push_usize(stack, &sp, 100) < 0) return -1;                   /* AT_CLKTCK = 100 Hz tick */
   if (user_stack_push_usize(stack, &sp, AT_CLKTCK) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, (usize)current_task->cred->uid) < 0) return -1;
+  /* M108: publish the credentials the image will actually run with. For a
+   * set-user-ID/set-group-ID exec those are not the caller's — see the
+   * cred_override comment on struct user_loaded_image. */
+  usize a_uid = (usize)current_task->cred->uid;
+  usize a_gid = (usize)current_task->cred->gid;
+  usize a_euid = image->cred_override ? (usize)image->cred_euid
+                                      : (usize)current_task->cred->euid;
+  usize a_egid = image->cred_override ? (usize)image->cred_egid
+                                      : (usize)current_task->cred->egid;
+  if (user_stack_push_usize(stack, &sp, a_uid) < 0) return -1;
   if (user_stack_push_usize(stack, &sp, AT_UID) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, (usize)current_task->cred->euid) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, a_euid) < 0) return -1;
   if (user_stack_push_usize(stack, &sp, AT_EUID) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, (usize)current_task->cred->gid) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, a_gid) < 0) return -1;
   if (user_stack_push_usize(stack, &sp, AT_GID) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, (usize)current_task->cred->egid) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, a_egid) < 0) return -1;
   if (user_stack_push_usize(stack, &sp, AT_EGID) < 0) return -1;
   /* AT_RANDOM points to the payload reserved above the auxv. */
   if (user_stack_push_usize(stack, &sp, rand_va) < 0) return -1;
   if (user_stack_push_usize(stack, &sp, AT_RANDOM) < 0) return -1;
   if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;                     /* AT_HWCAP = 0 */
   if (user_stack_push_usize(stack, &sp, AT_HWCAP) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;                     /* AT_SECURE = 0 */
+  /* AT_SECURE mirrors Linux's bprm->secureexec: set when the exec changed the
+   * effective ids away from the real ones, i.e. exactly when a loader must not
+   * honour LD_PRELOAD / LD_LIBRARY_PATH / $ORIGIN from the caller. */
+  if (user_stack_push_usize(stack, &sp,
+                            (a_euid != a_uid || a_egid != a_gid) ? 1 : 0) < 0)
+    return -1;
   if (user_stack_push_usize(stack, &sp, AT_SECURE) < 0) return -1;
   /* AT_EXECFN: program filename for /proc/self/exe. String data was pushed
    * earlier (before alignment); just push the pointer and type here. */
@@ -1334,15 +1348,24 @@ static int user_load_elf32(struct user_loaded_image *image, const char *path) {
   return 0;
 }
 
+/* cred_override != 0: the caller (execve) already knows the effective ids the
+ * new image will run with — set-user-ID/set-group-ID are applied to the task
+ * only after this returns, so the auxv has to be told up front. See the
+ * cred_override field on struct user_loaded_image. */
 static struct user_loaded_image *user_load_image(const char *path, int argc,
                                                  const char **argv,
                                                  const char **envp,
                                                  int argv_is_user,
-                                                 int envp_is_user) {
+                                                 int envp_is_user,
+                                                 int cred_override,
+                                                 u32 cred_euid, u32 cred_egid) {
   struct user_loaded_image *image = kzalloc(sizeof(*image));
   if (!image)
     return 0;
   image->refcount = 1;
+  image->cred_override = cred_override ? 1 : 0;
+  image->cred_euid = cred_euid;
+  image->cred_egid = cred_egid;
 
   if (copy_string_vector(argv, USER_MAX_ARGS, &image->argv, &image->argc,
                          argv_is_user) != 0) {
@@ -1935,7 +1958,7 @@ int user_spawn_env(const char *path, int argc, const char **argv,
   vfs_node_put(node);
 
   struct user_loaded_image *image =
-      user_load_image(path, argc, argv, envp, 0, 0);
+      user_load_image(path, argc, argv, envp, 0, 0, 0, 0, 0);
   if (!image) {
     return -1;
   }
@@ -2086,7 +2109,20 @@ resolve:
 
   vfs_node_put(node);
 
-  struct user_loaded_image *image = user_load_image(path, 0, argv, envp, 0, 0);
+  /* M108: work out the post-exec effective ids BEFORE loading, so the auxv the
+   * loader builds describes the image that is about to run rather than the one
+   * calling execve. The task's own credentials are still only changed after a
+   * successful load below — a failed exec must never leave the caller
+   * privileged. */
+  u32 new_euid = current_task->cred->euid;
+  u32 new_egid = current_task->cred->egid;
+  if (file_mode & 04000) /* S_ISUID */
+    new_euid = file_uid;
+  if (file_mode & 02000) /* S_ISGID */
+    new_egid = file_gid;
+
+  struct user_loaded_image *image =
+      user_load_image(path, 0, argv, envp, 0, 0, 1, new_euid, new_egid);
   if (!image)
     /* -1 here reached userspace as -errno, i.e. EPERM ("operation not
      * permitted") for what is really "this image could not be loaded" — the

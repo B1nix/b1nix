@@ -1,0 +1,8 @@
+#!/bin/sh
+# M108: the login shell of the m108user account. It exists so the su smoke can
+# tell "su ran THE ACCOUNT'S shell" from "su ran whatever shell it inherited":
+# only this file prints the line below, and only /etc/passwd points at it.
+# $0 carries the argv[0] su chose ("-m108shell" for a login shell), which is the
+# second half of the proof.
+echo "m108shell-argv0=$0"
+exec /bin/sh "$@"

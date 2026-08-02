@@ -913,6 +913,8 @@ kernel work first. Each line is the subsystem, not the applet.
 Alpine's own init is BusyBox, and once packages come from Alpine the b1nix-specific
 replacements become the odd ones out. Retire them in favour of the multicall ELF.
 
-- [ ] `planned` `su` and `passwd` — currently dedicated setuid ELFs in `/bin`, deliberately excluded from the applet manifest so the symlinks do not shadow them. BusyBox has both compiled in already; switching means moving the setuid bit and making sure `/etc/shadow` handling matches what `pam_unix.so` expects (M105).
-- [ ] `planned` `init` — PID 1 is `openrc-init` (M94). Moving to BusyBox init means an `/etc/inittab` path and reconciling it with the OpenRC runlevels already in the image.
-- [ ] `planned` Once the above land, drop the corresponding entries from the "deliberately NOT listed" block in `tools/configs/applet-manifest.conf`.
+- [x] `done` `su` and `passwd` are BusyBox applets. The dedicated ELFs (`userspace/bin/{su,passwd}.c`) are deleted. The setuid bit moved off `/bin/*` onto a second copy of the multicall ELF, `/opt/busybox/bin/busybox-suid` (mode 4755 root), which only `su`/`passwd`/`login` symlink to; `CONFIG_FEATURE_SUID=y` makes libbb drop euid for every other applet.
+- [x] `done` One shadow format end to end: BusyBox writes SHA-512 `$6$` (`CONFIG_FEATURE_DEFAULT_PASSWD_ALGO`), which is exactly what `pam_unix.so` (M105) reads — a password changed with the applet authenticates through PAM and vice versa, verified by `M108-SMOKE`.
+- [x] `done` BusyBox init as an alternative PID 1 via `/etc/inittab`, selected with the M94 `init=/opt/busybox/bin/init` cmdline. `openrc-init` stays the **default** (it owns the `/run/openrc/init.ctl` control channel); inittab drives the same OpenRC runlevels, so both inits reach the same system. New `iso-bbinit` smoke instance proves it; `iso-openrc` is untouched.
+- [x] `done` Kernel fix found on the way: `execve` published the *pre*-exec euid/egid and `AT_SECURE=0` in the auxv of a setuid image, so musl's ld.so would have honoured `LD_PRELOAD` in `/bin/su`. The auxv now describes the post-exec credentials.
+- [x] `done` The "deliberately NOT listed" block in `tools/configs/applet-manifest.conf` no longer mentions `su`/`passwd`; both are listed as `upstream`.

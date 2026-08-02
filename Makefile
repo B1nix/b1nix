@@ -519,7 +519,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@echo "Analysis results in $(ANALYZE_DIR)"
 	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
 
-.PHONY: all analyze objects FORCE iso iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-live iso-test iso-full check-dynamic \
+.PHONY: all analyze objects FORCE iso iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-bbinit iso-live iso-test iso-full check-dynamic \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source install-ports root-image disk-image \
@@ -1333,8 +1333,15 @@ SMOKE_CMDLINE_blk=init=/sbin/openrc-init b1nix.test=1 b1nix.kvtest=abc123 b1nix.
 # then a local.d hook asks PID 1 to power off through /run/openrc/init.ctl — the
 # control-FIFO path openrc-shutdown and telinit use. A clean poweroff proves the channel works.
 SMOKE_CMDLINE_openrc=init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest
+# M108 bbinit: BusyBox init as PID 1 instead of openrc-init. openrc-init stays
+# the DEFAULT PID 1 (kernel/main.c); BusyBox init is opt-in through the standard
+# M94 `init=` cmdline parameter, which is exactly the selection mechanism M94
+# built. /etc/inittab then drives the SAME OpenRC runlevels (Alpine's model:
+# BusyBox init supervises, OpenRC provides the services), so both inits reach
+# the same usable system. This instance proves the BusyBox side end to end.
+SMOKE_CMDLINE_bbinit=init=/opt/busybox/bin/init b1nix.test=1 b1nix.smoke=bbinit
 
-iso-sys iso-gfx iso-posix iso-blk iso-openrc: root-image check-dynamic $(KERNEL_ELF)
+iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-bbinit: root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
@@ -1571,6 +1578,20 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 		cp -f "$$OPENPAM_DIR"/etc/pam.d/* $(BUILD_DIR)/rootfs/etc/pam.d/; \
 		cp -f "$$OPENPAM_DIR"/include/security/*.h $(BUILD_DIR)/rootfs/include/security/; \
 	fi
+	@# M108: PAM policy for the BusyBox su/passwd smoke. Written here rather than
+	@# in build-openpam.sh because that script short-circuits on its build stamp,
+	@# so an incremental tree would never regenerate its etc/pam.d. Same three
+	@# lines as the sshd/m104 policies — the point of the test is that a password
+	@# BusyBox's `passwd` wrote is accepted by this very module.
+	@mkdir -p $(BUILD_DIR)/rootfs/etc/pam.d
+	@printf '# M108 smoke policy (userspace/bin/m108_smoke.c): pam_unix.so reads\n# the same /etc/shadow "$$6$$" hashes BusyBox su/passwd read and write.\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(BUILD_DIR)/rootfs/etc/pam.d/m108-smoke
+	@# M108: the su/passwd/init smoke ELF links libpam.so.2 as DT_NEEDED, same
+	@# bespoke rule as m104_pam_smoke, so build + stage it the same way.
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m108_smoke >/dev/null 2>&1 || true
+	@if [ -f userspace/build/$(ARCH)/bin/m108_smoke ]; then \
+		cp -f userspace/build/$(ARCH)/bin/m108_smoke $(BUILD_DIR)/rootfs/bin/m108_smoke; \
+		chmod +x $(BUILD_DIR)/rootfs/bin/m108_smoke; \
+	fi
 	@# M104: the OpenPAM smoke ELF (links libpam.so.2 as DT_NEEDED) — build
 	@# it if missing, same pattern as the Mesa/Skia demo staging below.
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m104_pam_smoke >/dev/null 2>&1 || true
@@ -1725,10 +1746,14 @@ endif
 	@rm -f $(BUILD_DIR)/root.ext4.own
 	@$(DEBUGFS) -w -R "sif /bin/m31_setuid uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@$(DEBUGFS) -w -R "sif /bin/m31_setuid mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
-	@$(DEBUGFS) -w -R "sif /bin/su uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
-	@$(DEBUGFS) -w -R "sif /bin/su mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
-	@$(DEBUGFS) -w -R "sif /bin/passwd uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
-	@$(DEBUGFS) -w -R "sif /bin/passwd mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@# M108: /bin/{su,passwd,login} are symlinks onto the BusyBox multicall ELF
+	@# now, so the setuid bit belongs on the inode they resolve to — the
+	@# dedicated busybox-suid copy — and NOT on the symlinks (stamping a mode on
+	@# a symlink inode would only corrupt it). The plain /opt/busybox/bin/busybox
+	@# that every other applet resolves to is deliberately left non-setuid.
+	@$(DEBUGFS) -w -R "sif /opt/busybox/bin/busybox-suid uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /opt/busybox/bin/busybox-suid gid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /opt/busybox/bin/busybox-suid mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@$(DEBUGFS) -w -R "sif /etc/shadow uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@$(DEBUGFS) -w -R "sif /etc/shadow mode 0100400" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@printf 'created %s (%s)\n' "$(BUILD_DIR)/root.ext4" "$$(du -sh $(BUILD_DIR)/root.ext4 | cut -f1)"
