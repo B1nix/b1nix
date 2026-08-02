@@ -20,6 +20,15 @@ elif grep -q 'b1nix.smoke=posix' /proc/cmdline 2>/dev/null; then
     SMOKE_POSIX=1
 elif grep -q 'b1nix.smoke=blk' /proc/cmdline 2>/dev/null; then
     SMOKE_BLK=1
+elif grep -q 'b1nix.smoke=bbinit' /proc/cmdline 2>/dev/null; then
+    # M108: BusyBox init is PID 1 on this instance and drives the checks itself
+    # from /etc/inittab (see /etc/bbinit-smoke.sh). Nothing of the ordinary
+    # suite runs here — but leaving a breadcrumb proves something the test can
+    # not otherwise see from the outside: that OpenRC's `default` runlevel
+    # really executed, with its local.d hooks, under BusyBox init. m108_smoke
+    # checks for this file; it is never written on any other instance.
+    : > /tmp/m108-openrc-local-ran
+    exit 0
 elif grep -q 'b1nix.openrc-ctltest' /proc/cmdline 2>/dev/null; then
     echo "M94-OPENRC: ok init-fifo-present"
     echo "/etc/init.d/killprocs start"
@@ -140,6 +149,7 @@ run_test /bin/m29_smoke posix
 run_test /bin/m31_smoke posix
 run_test /bin/m73_smoke posix
 run_test /bin/m80_smoke posix
+run_test /bin/m108_smoke posix
 run_test /bin/m86_smoke posix
 run_test /bin/m95_smoke posix
 run_test /bin/m96_smoke posix

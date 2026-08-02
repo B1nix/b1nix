@@ -24,8 +24,12 @@ if [ -f "$SRC_DIR/miscutils/tree.c" ] && ! grep -q "__b1nix__" "$SRC_DIR/miscuti
   cp "$PATCH_DIR/tree.c" "$SRC_DIR/miscutils/tree.c"
 fi
 
-# The system password scheme is libc crypt()'s "$b1$". BusyBox's builtin crypt
-# dies with "bad salt", so defer only those settings to libc.
+# /etc/shadow is SHA-512 crypt ("$6$"), which BusyBox hashes itself
+# (USE_BB_CRYPT_SHA) and which musl's crypt(3) — the PAM path, M105 — accepts
+# unchanged, so su/passwd and pam_unix.so agree on every account by default.
+# The legacy b1nix-native scheme "$b1$" (kernel/lib/crypt.c) is not something
+# BusyBox's builtin crypt knows: it would die with "bad salt". Defer only those
+# settings to libc so an old shadow line still authenticates.
 PW="$SRC_DIR/libbb/pw_encrypt.c"
 if [ -f "$PW" ] && ! grep -q "__b1nix__" "$PW"; then
   python3 - "$PW" <<'PY'
@@ -33,9 +37,10 @@ import sys
 path = sys.argv[1]
 src = open(path).read()
 anchor = "\tencrypted = my_crypt(clear, salt);"
-patch = """\t/* __b1nix__: the system password scheme is the libc crypt()'s "$b1$"
-\t * (b1nix /etc/shadow, dropbear, native su/passwd). The builtin crypt
-\t * would die with "bad salt" on it, so defer those settings to libc. */
+patch = """\t/* __b1nix__: /etc/shadow is "$6$" (SHA-512), which the builtin crypt
+\t * below handles and pam_unix.so accepts unchanged. The legacy b1nix
+\t * scheme "$b1$" only libc crypt() knows; the builtin would die with
+\t * "bad salt" on it, so defer those settings to libc. */
 \tif (salt && strncmp(salt, "$b1$", 4) == 0) {
 \t\textern char *crypt(const char *key, const char *setting);
 \t\tencrypted = crypt(clear, salt);

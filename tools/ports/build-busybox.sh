@@ -196,6 +196,24 @@ make -C "$BUILD_DIR" -j"$NPROC" \
 echo "Installing standalone BusyBox package..."
 mkdir -p "$INSTALL_DIR"
 cp "$BUILD_DIR/busybox" "$INSTALL_DIR/busybox"
+chmod 0755 "$INSTALL_DIR/busybox"
+
+# M108: su/passwd/login need euid 0 to read /etc/shadow and to change identity.
+# Rather than making THE multicall binary setuid — which would put a
+# setuid-root path behind all 194 applets — install a second copy that is, the
+# way Alpine splits busybox / busybox-suid. /bin/{su,passwd,login} point here;
+# every other applet symlink keeps pointing at the plain, non-setuid busybox.
+# Two lines of defence, both required:
+#   1. only three applet names resolve to this inode at all, and
+#   2. CONFIG_FEATURE_SUID=y makes libbb's check_suid() drop euid back to the
+#      real uid for every applet that is not BB_SUID_REQUIRE, so even a
+#      hand-made symlink pointing `sh` at this copy gets no privilege.
+# A hard link cannot be used: the setuid bit lives in the inode, so the two
+# names have to be two inodes. The real mode is stamped onto the ext4 image by
+# the top-level Makefile (debugfs `sif`), since mke2fs -d does not reliably
+# carry setuid bits; the chmod here keeps the staging tree honest.
+cp "$BUILD_DIR/busybox" "$INSTALL_DIR/busybox-suid"
+chmod 4755 "$INSTALL_DIR/busybox-suid"
 
 # Remove links created by the earlier integration, but leave unrelated files
 # and links in /bin untouched.
