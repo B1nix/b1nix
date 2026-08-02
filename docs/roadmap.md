@@ -869,13 +869,6 @@ Status:
 - [ ] `open` Discontiguous sg-backed buffers are not asserted (`gem-sg-discontig` is emitted as a skip): under QEMU the allocator hands back contiguous frames, so the path that matters — a BO whose pages are scattered — is exercised only incidentally.
 - [ ] `open` The GEM kernel vmap window needs its PML4 slot to exist before any process is created, so `drm_dev_init` touches one page there to install the path. A GEM mapping that faults in one process but not another points at this.
 
-### M108 — open
-
-- [ ] `open` BusyBox `su` fails to authenticate against `/etc/shadow` (`su-uid-and-shell`, `su-password-auth`, `su-accepts-passwd-hash`): the setuid layout, `passwd`'s own write path and the PAM read path all verify, so the failure is in how the applet reads or compares the hash. Unproven either way until it is traced in the guest.
-- [ ] `open` `useradd`/`userdel`/`groupadd`/`groups`/`id`/`whoami` are still dedicated ELFs.
-- [ ] `open` BusyBox `passwd` locks `/etc/shadow` with `fcntl(F_SETLK)` + `link()`; whether b1nix's ext4 honours both is unconfirmed, so a concurrent password change is not known to be safe.
-- [ ] `open` The BusyBox-init instance's `getty` respawn is unexercised — the smoke's done-marker kills the VM before a respawn cycle.
-
 ## M101: Intel i915 (Gen8/Gen9.5) + Mesa iris
 
 - [ ] `planned` GTT/PPGTT, execlists submission, contexts; no firmware needed on Gen8/Gen9.
@@ -925,9 +918,6 @@ kernel work first. Each line is the subsystem, not the applet.
 - [x] `done` **i2c** — `/dev/i2c-0` on the PIIX4/ICH9 SMBus host controller, with I2C_SLAVE/I2C_FUNCS/I2C_SMBUS. The node exists only when a controller was probed, and I2C_FUNCS declines to claim raw-I2C support the silicon cannot deliver, so `i2ctransfer` reports the limit instead of misbehaving.
 - [ ] `planned` **MTD/UBI** — `flash*`, `nandwrite`, `ubi*`. Only worth it if b1nix ever targets flash storage.
 - [ ] `deferred` **loadable modules** — `insmod`, `rmmod`, `lsmod`, `modprobe`, `depmod`, `modinfo`. Not a gap to close: the kernel is monolithic by design, so these stay unavailable rather than unimplemented.
-
-### M107 — open
-
 - [ ] `open` `vfs_fd_abspath()` cannot rebuild a path whose parent chain crosses the ext4 root's lazily materialised directories, so `LOOP_GET_STATUS64` reports an empty `lo_file_name` and BusyBox `losetup -a` shows no backing file (`loop-attach`, `loop-write`, `applet-losetup`). The association itself works — reads and writes go to the right file.
 - [ ] `open` IPv6 neighbours: `RTM_GETNEIGH` returns an empty AF_INET6 table and `RTM_NEWNEIGH` reports `EAFNOSUPPORT` (needs the enumeration API listed under M96).
 - [ ] `open` `ip link set <if> up/down` reports `EOPNOTSUPP` — b1nix has no per-interface administrative state.
@@ -946,3 +936,7 @@ replacements become the odd ones out. Retire them in favour of the multicall ELF
 - [x] `done` BusyBox init as an alternative PID 1 via `/etc/inittab`, selected with the M94 `init=/opt/busybox/bin/init` cmdline. `openrc-init` stays the **default** (it owns the `/run/openrc/init.ctl` control channel); inittab drives the same OpenRC runlevels, so both inits reach the same system. New `iso-bbinit` smoke instance proves it; `iso-openrc` is untouched.
 - [x] `done` Kernel fix found on the way: `execve` published the *pre*-exec euid/egid and `AT_SECURE=0` in the auxv of a setuid image, so musl's ld.so would have honoured `LD_PRELOAD` in `/bin/su`. The auxv now describes the post-exec credentials.
 - [x] `done` The "deliberately NOT listed" block in `tools/configs/applet-manifest.conf` no longer mentions `su`/`passwd`; both are listed as `upstream`.
+- [ ] `open` BusyBox `su` fails to authenticate against `/etc/shadow` (`su-uid-and-shell`, `su-password-auth`, `su-accepts-passwd-hash`): the setuid layout, `passwd`'s own write path and the PAM read path all verify, so the failure is in how the applet reads or compares the hash. Unproven either way until it is traced in the guest.
+- [ ] `open` `useradd`/`userdel`/`groupadd`/`groups`/`id`/`whoami` are still dedicated ELFs.
+- [ ] `open` BusyBox `passwd` locks `/etc/shadow` with `fcntl(F_SETLK)` + `link()`; whether b1nix's ext4 honours both is unconfirmed, so a concurrent password change is not known to be safe.
+- [ ] `open` The BusyBox-init instance's `getty` respawn is unexercised — the smoke's done-marker kills the VM before a respawn cycle.
