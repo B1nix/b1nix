@@ -72,4 +72,14 @@ struct drm_event_vblank {
 #define DRM_IOCTL_MODE_MAP_DUMB DRM_IOWR(0xB3, struct drm_mode_map_dumb)
 #define DRM_IOCTL_MODE_DESTROY_DUMB DRM_IOWR(0xB4, struct drm_mode_destroy_dumb)
 
+/* M100: how a GEM object is physically backed (b1nix-specific, read-only). */
+struct drm_b1nix_gem_info {
+  uint32_t handle;
+  uint32_t nents;
+  uint32_t npages;
+  uint32_t contiguous;
+  uint64_t size;
+};
+#define DRM_IOCTL_B1NIX_GEM_INFO DRM_IOWR(0xC0, struct drm_b1nix_gem_info)
+
 #endif

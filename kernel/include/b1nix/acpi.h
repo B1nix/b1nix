@@ -127,6 +127,12 @@ int acpi_init(void);
 /* True after acpi_init() found a usable MADT. */
 int acpi_ready(void);
 
+/* Look up any ACPI table by its four-character signature ("MCFG", "FADT", ...)
+ * in the RSDT/XSDT captured at acpi_init(). Returns a mapped, checksum-verified
+ * header, or NULL when the table is absent or ACPI was never found. The mapping
+ * is permanent (boot-time MMIO window), so the caller may keep the pointer. */
+const struct acpi_sdt_header *acpi_find_table(const char *signature);
+
 /* Discovered CPU count (BSP + enabled APs), 0 if ACPI unavailable. */
 int acpi_cpu_count(void);
 

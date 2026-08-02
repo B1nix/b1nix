@@ -32,8 +32,7 @@
 #define VIRTIO_VENDOR_ID 0x1AF4
 #define VIRTIO_INPUT_DEVICE_ID_MODERN 0x1052 /* virtio device type 18 (input) */
 
-#define PCI_STATUS_CAP_LIST 0x10
-#define PCI_CAP_ID_VENDOR 0x09
+/* PCI_STATUS_CAP_LIST / PCI_CAP_ID_VENDOR now come from <b1nix/pci.h> (M98). */
 #define VIRTIO_PCI_CAP_COMMON_CFG 1
 #define VIRTIO_PCI_CAP_NOTIFY_CFG 2
 #define VIRTIO_PCI_CAP_ISR_CFG 3

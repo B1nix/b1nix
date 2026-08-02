@@ -242,6 +242,8 @@ BINARIES += $(BUILD)/bin/m104_pam_smoke
 BINARIES += $(BUILD)/bin/m80_smoke
 # M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
 BINARIES += $(BUILD)/bin/m98_smoke
+# M100: DRM core -- scatter-gather GEM objects through /dev/dri/card0.
+BINARIES += $(BUILD)/bin/m100_smoke
 BINARIES += $(BUILD)/bin/m63_smoke
 BINARIES += $(BUILD)/bin/m71_aslr
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke

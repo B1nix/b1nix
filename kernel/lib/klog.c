@@ -277,6 +277,34 @@ usize klog_read(char *buf, usize max_len)
 	return available;
 }
 
+/* ── Cursor-based drain (netconsole, M98) ── */
+usize klog_cursor_now(void)
+{
+	return klog_write_pos;
+}
+
+usize klog_drain(usize *cursor, char *buf, usize max_len)
+{
+	if (!cursor || !buf || max_len < 2)
+		return 0;
+
+	usize w = klog_write_pos;
+	usize c = *cursor % KLOG_BUF_SIZE;
+	if (c == w)
+		return 0;
+
+	usize available = (w >= c) ? (w - c) : (KLOG_BUF_SIZE - c + w);
+	if (available > max_len - 1)
+		available = max_len - 1;
+
+	for (usize i = 0; i < available; i++)
+		buf[i] = klog_buf[(c + i) % KLOG_BUF_SIZE];
+	buf[available] = '\0';
+
+	*cursor = (c + available) % KLOG_BUF_SIZE;
+	return available;
+}
+
 /* ── Get total log size (for userspace query) ── */
 usize klog_size(void)
 {

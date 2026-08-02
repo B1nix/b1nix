@@ -1,6 +1,8 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
+#include <b1nix/dma_fence.h>
 #include <b1nix/errno.h>
+#include <b1nix/gpu_scheduler.h>
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
 #include <b1nix/sched.h>
@@ -40,8 +42,7 @@
 #define VIRGL_BIND_RENDER_TARGET (1u << 1)
 #define VIRGL_BIND_SAMPLER_VIEW (1u << 3)
 #define PIPE_CLEAR_COLOR0 (1u << 2)
-#define PCI_STATUS_CAP_LIST 0x10
-#define PCI_CAP_ID_VENDOR 0x09
+/* PCI_STATUS_CAP_LIST / PCI_CAP_ID_VENDOR now come from <b1nix/pci.h> (M98). */
 #define VIRTIO_PCI_CAP_COMMON_CFG 1
 #define VIRTIO_PCI_CAP_NOTIFY_CFG 2
 #define VIRTIO_PCI_CAP_ISR_CFG 3
@@ -1023,8 +1024,12 @@ static int vgpu_res_create_attach(u32 ctx_id, const struct b1nix_virgl_res_creat
     return 0;
 }
 
-/* Submit a userspace-built virgl command stream on the context. */
-static int vgpu_submit_stream(u32 ctx_id, const u32 *cmd, u32 cmd_bytes)
+/* Build and push one SUBMIT_3D request at the device. Caller holds
+ * vgpu_udev_lock (the staging buffer and the control queue are shared). This is
+ * the part that actually talks to the hardware; who calls it — the scheduler
+ * thread or, before the scheduler exists, the submitting task — is decided by
+ * vgpu_submit_stream below. */
+static int vgpu_submit_stream_locked(u32 ctx_id, const u32 *cmd, u32 cmd_bytes)
 {
     struct virtio_gpu_ctrl_hdr resp;
     if (!vgpu_udev_submit_buf || cmd_bytes == 0 ||
@@ -1043,6 +1048,118 @@ static int vgpu_submit_stream(u32 ctx_id, const u32 *cmd, u32 cmd_bytes)
         resp.type != VIRTIO_GPU_RESP_OK_NODATA)
         return -1;
     return 0;
+}
+
+/* ── M100: command submission through the DRM GPU scheduler ─────────
+ *
+ * Before M100 a SUBMIT_3D ran inline in the caller's context and the caller
+ * then sat inside virtio_gpu_wait_used(), a TSC-bounded busy-spin on the
+ * virtqueue used index, with vgpu_udev_lock held and interrupts disabled for
+ * the whole device round trip.
+ *
+ * Now the caller hands the stream to a scheduler entity and waits on the job's
+ * dma-fence, which parks the task instead of burning the CPU. The scheduler
+ * thread is the single writer of the control queue for these submissions, so
+ * ordering is inherent rather than lock-enforced, and completion is an object
+ * other code can hold rather than a return value only the submitter sees.
+ *
+ * The synchronous path is kept as a fallback for the window before the
+ * scheduler thread exists (and for a kernel where kthread creation failed):
+ * dropping work silently there would be worse than briefly spinning.
+ */
+struct vgpu_submit_job {
+    struct drm_sched_job base;
+    u32 ctx_id;
+    u32 cmd_bytes;
+    const u32 *cmd;
+    int result;
+};
+
+static struct drm_gpu_scheduler vgpu_sched;
+static struct drm_sched_entity vgpu_sched_entity;
+static int vgpu_sched_ready;
+
+static int vgpu_sched_run_job(struct drm_sched_job *job)
+{
+    struct vgpu_submit_job *sj = (struct vgpu_submit_job *)job;
+    u64 flags;
+    spin_lock_irqsave(&vgpu_udev_lock, &flags);
+    sj->result = vgpu_submit_stream_locked(sj->ctx_id, sj->cmd, sj->cmd_bytes);
+    spin_unlock_irqrestore(&vgpu_udev_lock, flags);
+    /* The device round trip completed inside vgpu_submit_stream_locked, so the
+     * job is done by the time run_job returns; the scheduler signals the fence
+     * with this result. */
+    return sj->result < 0 ? -EIO : DRM_SCHED_RUN_DONE;
+}
+
+static void vgpu_job_release(struct dma_fence *f)
+{
+    struct vgpu_submit_job *sj =
+        (struct vgpu_submit_job *)(void *)((u8 *)f -
+                                           __builtin_offsetof(struct vgpu_submit_job,
+                                                              base.finished));
+    kfree(sj);
+}
+
+static const struct drm_sched_backend_ops vgpu_sched_ops = {
+    .run_job = vgpu_sched_run_job,
+    .free_job = 0,
+};
+
+/* Bring the scheduler up. Called once the VirGL context exists. */
+static void vgpu_sched_start(void)
+{
+    if (vgpu_sched_ready)
+        return;
+    if (drm_sched_init(&vgpu_sched, &vgpu_sched_ops, "virtio-gpu-sched") < 0) {
+        console_write("virtio-gpu: scheduler thread unavailable, "
+                      "falling back to synchronous submit\n");
+        return;
+    }
+    if (drm_sched_entity_init(&vgpu_sched_entity, &vgpu_sched, "virgl") < 0)
+        return;
+    vgpu_sched_ready = 1;
+}
+
+/* Submit a userspace-built virgl command stream on the context. Must be called
+ * WITHOUT vgpu_udev_lock held: the fence wait sleeps. */
+static int vgpu_submit_stream(u32 ctx_id, const u32 *cmd, u32 cmd_bytes)
+{
+    if (!vgpu_sched_ready || !drm_sched_ready(&vgpu_sched) ||
+        !scheduler_can_block()) {
+        u64 flags;
+        spin_lock_irqsave(&vgpu_udev_lock, &flags);
+        int rc = vgpu_submit_stream_locked(ctx_id, cmd, cmd_bytes);
+        spin_unlock_irqrestore(&vgpu_udev_lock, flags);
+        return rc;
+    }
+
+    /* Heap-allocated, freed through the fence's release callback: the
+     * scheduler thread still holds a reference after the fence signals, so the
+     * job must not live on the submitter's stack. */
+    struct vgpu_submit_job *job = kzalloc(sizeof(*job));
+    if (!job)
+        return -1;
+    job->ctx_id = ctx_id;
+    job->cmd = cmd;
+    job->cmd_bytes = cmd_bytes;
+    job->result = -1;
+    if (drm_sched_job_init(&job->base, &vgpu_sched_entity) < 0) {
+        kfree(job);
+        return -1;
+    }
+    job->base.finished.release = vgpu_job_release;
+
+    struct dma_fence *fence = drm_sched_job_submit(&job->base);
+    if (!fence) {
+        dma_fence_put(&job->base.finished); /* runs the release, frees job */
+        return -1;
+    }
+    int err = dma_fence_wait(fence);
+    int result = job->result;
+    dma_fence_put(fence);
+    dma_fence_put(&job->base.finished); /* the creator's reference */
+    return (err || result < 0) ? -1 : 0;
 }
 
 /* Copy a GPU-rendered resource region back into its guest backing. */
@@ -1282,10 +1399,10 @@ static int vgpu_udev_ioctl(struct vfs_node *node, u64 request, void *arg)
             kfree(cmd);
             return -EFAULT;
         }
-        u64 flags;
-        spin_lock_irqsave(&vgpu_udev_lock, &flags);
+        /* No lock here: vgpu_submit_stream sleeps on the job's fence, and
+         * the scheduler thread takes vgpu_udev_lock itself around the device
+         * round trip. */
         int rc = vgpu_submit_stream(VGPU_UDEV_CTX, cmd, sub.cmd_size);
-        spin_unlock_irqrestore(&vgpu_udev_lock, flags);
         kfree(cmd);
         return rc < 0 ? -EIO : 0;
     }
@@ -1316,9 +1433,9 @@ static int vgpu_udev_ioctl(struct vfs_node *node, u64 request, void *arg)
         return rc < 0 ? -EIO : 0;
     }
     case B1NIX_VIRGL_WAIT:
-        /* SUBMIT/TRANSFER are synchronous here (virtio_gpu_send_cmd blocks on
-         * the host fence), so by the time userspace calls WAIT the GPU work is
-         * already complete — signal immediately. */
+        /* SUBMIT waits on its job's dma-fence before returning and TRANSFER is
+         * synchronous, so by the time userspace calls WAIT the GPU work has
+         * already completed — signal immediately. */
         return 0;
     case B1NIX_VIRGL_CONTEXT_INIT:
         /* The kernel created the implicit 3D context at device init; userspace
@@ -1409,6 +1526,9 @@ void virtio_gpu_dev_init(void)
         if (!buf_phys)
             return;
         vgpu_udev_submit_buf = (u8 *)(usize)(buf_phys + vmm_direct_map_base());
+        /* M100: command submission runs through the DRM GPU scheduler from
+         * here on (see vgpu_submit_stream). */
+        vgpu_sched_start();
     }
 
     struct vfs_node *node = vfs_add_node("/dev/virtio-gpu", VFS_DEVICE, 0, 0, 0);

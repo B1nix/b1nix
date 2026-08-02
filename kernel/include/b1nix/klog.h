@@ -28,6 +28,17 @@ void klog_putc(char ch);
 usize klog_read(char *buf, usize max_len);
 usize klog_size(void);
 
+/* Secondary, cursor-based consumer of the same ring (M98 netconsole).
+ *
+ * klog_read is a "give me the tail" call shared by every dmesg reader and must
+ * not consume. A log shipper instead keeps its own cursor: klog_cursor_now()
+ * returns the current write position, and klog_drain copies everything written
+ * since *cursor into buf (NUL-terminated), advancing *cursor by what it took.
+ * Best-effort, like every netconsole: if the writer laps the cursor while the
+ * drain thread is descheduled, the lapped bytes are lost rather than resent. */
+usize klog_cursor_now(void);
+usize klog_drain(usize *cursor, char *buf, usize max_len);
+
 /* Symbol table for backtraces */
 void klog_register_symbol(u64 address, const char *name);
 void panic_backtrace(void);

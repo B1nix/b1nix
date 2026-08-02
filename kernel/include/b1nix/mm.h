@@ -60,6 +60,14 @@ extern u64 g_direct_map_size;
 #define VMM_SHARED (1ULL << 8)
 #define VMM_PWT (1ULL << 3)
 #define VMM_PCD (1ULL << 4)
+/* Leaf-PTE PAT bit (bit 7). Only ever set on a 4 KiB PTE — in a PDE/PDPTE the
+ * same bit is PS (huge page), so VMM_WC must never reach a directory entry. */
+#define VMM_PAT (1ULL << 7)
+/* M98: write-combining. Selects PAT slot 5, which pat_init_cpu() programs to
+ * WC (see kernel/include/b1nix/memtype.h). Falls back to write-through — the
+ * reset meaning of slot 5 — on a CPU without PAT, which is correct but slow
+ * rather than wrong. */
+#define VMM_WC (VMM_PAT | VMM_PWT)
 
 #ifdef __x86_64__
 #define VMM_NO_EXECUTE (1ULL << 63)
@@ -162,6 +170,9 @@ u64 vmm_direct_map_base(void);
 u64 vmm_virt_to_phys(void *ptr);
 extern int direct_map_ready;
 void paging_dump_entries(u64 virtual_address);
+/* Raw leaf page-table entry backing `vaddr` in the current address space, or 0
+ * when nothing 4 KiB-mapped is there. Used to verify memory-type bits (M98). */
+u64 paging_leaf_pte(u64 virtual_address);
 
 // M2 Aliases / Helpers
 void paging_map_page(u64 virtual_address, u64 physical_address, u64 flags);

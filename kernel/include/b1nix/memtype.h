@@ -1,0 +1,93 @@
+#ifndef B1NIX_MEMTYPE_H
+#define B1NIX_MEMTYPE_H
+
+#include <b1nix/types.h>
+
+/*
+ * M98 T2 — memory typing (IA32_PAT) and cache-maintenance primitives.
+ *
+ * b1nix only ever mapped pages write-back (no PAT/PCD/PWT) or uncacheable
+ * (PCD, via vmm_map_mmio). A GPU needs a third type: write-combining. A GTT or
+ * a scanout buffer mapped UC is written one uncached store at a time, which is
+ * one to two orders of magnitude slower than the WC write-combining buffers,
+ * and the display engine does not snoop the LLC — so a WB framebuffer has to be
+ * flushed to memory before the device reads it.
+ *
+ * The PAT is a per-CPU MSR holding eight memory types indexed by
+ * (PAT << 2) | (PCD << 1) | PWT taken from the page-table entry. The reset
+ * value is
+ *
+ *     PA0 WB   PA1 WT   PA2 UC-  PA3 UC   PA4 WB   PA5 WT   PA6 UC-  PA7 UC
+ *
+ * and b1nix rewrites exactly one slot: PA5 becomes write-combining. Slots 0-3
+ * are the ones every existing mapping selects (the PTE PAT bit, bit 7, is
+ * always clear today), so no live mapping changes meaning and the rewrite needs
+ * no cache/TLB flush dance. VMM_WC is therefore PAT|PWT == index 5.
+ */
+
+#define IA32_MSR_PAT 0x277u
+
+/* The eight-slot encoding programmed by pat_init_cpu(). */
+#define B1NIX_PAT_VALUE 0x0007010600070406ULL
+
+static inline u64 rdmsr(u32 msr)
+{
+	u32 lo, hi;
+	__asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+	return ((u64)hi << 32) | lo;
+}
+
+static inline void wrmsr(u32 msr, u64 value)
+{
+	__asm__ volatile("wrmsr"
+	                 :
+	                 : "c"(msr), "a"((u32)(value & 0xffffffffu)),
+	                   "d"((u32)(value >> 32)));
+}
+
+/* Full memory fence — orders WC stores against a subsequent doorbell write. */
+static inline void mem_mfence(void)
+{
+	__asm__ volatile("mfence" ::: "memory");
+}
+
+static inline void mem_sfence(void)
+{
+	__asm__ volatile("sfence" ::: "memory");
+}
+
+/* Evict one cache line containing `addr` from every level of the hierarchy. */
+static inline void mem_clflush(const void *addr)
+{
+	__asm__ volatile("clflush (%0)" : : "r"(addr) : "memory");
+}
+
+/* Write back and invalidate the whole cache hierarchy. Expensive; only for the
+ * cases where a device rewrites a large region behind the CPU's back. */
+static inline void mem_wbinvd(void)
+{
+	__asm__ volatile("wbinvd" ::: "memory");
+}
+
+/* Program this CPU's IA32_PAT. Called once on the BSP from arch_init and once
+ * per AP from x86_ap_arch_init — the PAT is per-CPU state and an AP that never
+ * runs this would interpret a WC PTE as write-through. */
+void pat_init_cpu(void);
+
+/* 1 once the BSP has programmed the PAT (i.e. VMM_WC is meaningful). */
+int pat_available(void);
+
+/* Cache-line size reported by CPUID leaf 1 (CLFLUSH line size * 8), 64 when
+ * the CPU does not report one. */
+u32 cache_line_size(void);
+
+/* clflush every line of [addr, addr+size), bracketed by fences. Safe to call on
+ * any mapping; a no-op when the CPU lacks CLFLUSH. */
+void cache_flush_range(const void *addr, usize size);
+
+/* M98 in-kernel self-test: verifies the PAT MSR readback, that a WC mapping
+ * carries the expected PTE bits, and that data written through it is coherent.
+ * Emits M98-DRV-SMOKE markers. No-op outside b1nix.test=1. */
+void memtype_selftest(void);
+
+#endif

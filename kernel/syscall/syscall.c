@@ -3169,6 +3169,24 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
       vmm_map_page(v, frame, vmm_flags | VMM_PRESENT);
     }
   } else if (node && node->inode && node->inode->type == VFS_DEVICE &&
+             node->inode->mmap_handle_page_phys_cb) {
+    /* M100: scatter-gather device memory. The pages backing the range need not
+     * be physically adjacent, so resolve one page at a time instead of
+     * extrapolating from a single base. */
+    struct vfs_handle *handle = scheduler_fd_get(fd);
+    for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+      u64 phys = 0;
+      int rc = node->inode->mmap_handle_page_phys_cb(
+          handle, (u64)offset + (v - vaddr), &phys);
+      if (rc < 0 || !phys) {
+        for (u64 u = vaddr; u < v; u += PAGE_SIZE)
+          vmm_unmap_page(u);
+        return (u64)(rc < 0 ? rc : -EINVAL);
+      }
+      vmm_map_page(v, phys, vmm_flags | VMM_SHARED | VMM_PRESENT);
+      pmm_ref_frame(phys);
+    }
+  } else if (node && node->inode && node->inode->type == VFS_DEVICE &&
              (node->inode->mmap_handle_phys_cb || node->inode->mmap_phys_cb)) {
     /* M47 device-memory mmap (/dev/fb0): map the device's physical frames
      * directly, shared across fork (VMM_SHARED bypasses CoW) and refcounted
