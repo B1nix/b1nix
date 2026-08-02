@@ -1,0 +1,883 @@
+/* M86 smoke: per-thread CPU accounting, thread-directed signals, and
+ * pthread_exit return values.
+ *
+ * Every marker is emitted only after the operation ran AND its result was
+ * checked against something the test knows independently.
+ *
+ *   thread-cputime    CLOCK_THREAD_CPUTIME_ID advances with the CPU a thread
+ *                     actually burns and stays flat while it sleeps — the two
+ *                     cases a monotonic-uptime stand-in cannot tell apart.
+ *   process-cputime   CLOCK_PROCESS_CPUTIME_ID counts every thread in the
+ *                     group, so it exceeds the caller's own thread clock once a
+ *                     sibling has burned CPU.
+ *   getcpuclockid     the per-thread clock id pthread_getcpuclockid() hands out
+ *                     reads the same time as that thread's own
+ *                     CLOCK_THREAD_CPUTIME_ID, and the resolution is nanoseconds.
+ *   rusage-thread     getrusage(RUSAGE_THREAD) is the calling thread while
+ *                     RUSAGE_SELF is the whole process, and both carry
+ *                     sub-tick (microsecond) precision.
+ *   times-process     times(2) reports process CPU time that grows across a
+ *                     burn and covers all threads.
+ *   rusage-children   getrusage(RUSAGE_CHILDREN) picks up a reaped child's CPU
+ *                     time.
+ *   proc-stat-times   /proc/self/stat fields 14/15 (utime/stime) are non-zero
+ *                     after a burn and field 20 counts the live threads.
+ *   tkill-self        tkill(gettid(), sig) delivers to the calling thread.
+ *   tgkill-thread     tgkill()/pthread_kill() delivers to the NAMED thread,
+ *                     not to whichever one the kernel finds first.
+ *   tgkill-esrch      tgkill() with the wrong tgid, and tkill() of a dead tid,
+ *                     both fail with ESRCH instead of signalling someone else.
+ *   kill-unblocked    kill(getpid(), sig) with the signal blocked in the main
+ *                     thread is delivered to a sibling that has it unblocked —
+ *                     process-directed, not leader-directed.
+ *   rusage-maxrss     ru_maxrss is a high-water mark: it survives the munmap of
+ *                     the pages that produced it.
+ *   group-stop-blocked  a stop signal sent to a process stops even the threads
+ *                     parked in a blocking syscall, and SIGCONT resumes them.
+ *   pthread-exit-rv   pthread_exit(v) delivers v to pthread_join, including
+ *                     from a deep call and after cleanup handlers run.
+ *   pthread-exit-main pthread_exit() in main keeps the process alive until the
+ *                     last thread finishes, and the exit status is 0.
+ */
+#include <errno.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <sys/times.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef RUSAGE_THREAD
+#define RUSAGE_THREAD 1
+#endif
+
+static int g_fail;
+
+static void marker(const char *s) {
+  write(1, s, strlen(s));
+  write(1, "\n", 1);
+}
+
+static void ok(const char *name) {
+  char line[128];
+  snprintf(line, sizeof(line), "M86-SMOKE: ok %s", name);
+  marker(line);
+}
+
+static void fail(const char *name, long v) {
+  char line[160];
+  snprintf(line, sizeof(line), "M86-SMOKE: FAIL %s (%ld, errno=%d)", name, v,
+           errno);
+  marker(line);
+  g_fail = 1;
+}
+
+static void check(const char *name, int cond, long v) {
+  if (cond)
+    ok(name);
+  else
+    fail(name, v);
+}
+
+static pid_t my_tid(void) { return (pid_t)syscall(SYS_gettid); }
+
+static long long ns_of(const struct timespec *ts) {
+  return (long long)ts->tv_sec * 1000000000LL + ts->tv_nsec;
+}
+
+static long long clock_ns(clockid_t id) {
+  struct timespec ts;
+  if (clock_gettime(id, &ts) != 0)
+    return -1;
+  return ns_of(&ts);
+}
+
+/* Burn CPU for at least `ms` milliseconds of WALL time, doing work the compiler
+ * cannot fold away. Wall time is the right bound here: the point of the test is
+ * that CPU time tracks work, so it must not be measured with the clock under
+ * test. */
+static volatile unsigned long g_sink;
+static void burn_ms(int ms) {
+  struct timespec start, now;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  unsigned long acc = 1;
+  for (;;) {
+    for (int i = 0; i < 200000; i++)
+      acc = acc * 1103515245UL + 12345UL;
+    g_sink = acc;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long elapsed = (now.tv_sec - start.tv_sec) * 1000LL +
+                        (now.tv_nsec - start.tv_nsec) / 1000000LL;
+    if (elapsed >= ms)
+      return;
+  }
+}
+
+/* ── 1: per-thread CPU time ─────────────────────────────────────────────── */
+
+static void test_thread_cputime(void) {
+  long long t0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+  if (t0 < 0) {
+    fail("thread-cputime-gettime", t0);
+    return;
+  }
+  burn_ms(120);
+  long long t1 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+  long long burned = t1 - t0;
+
+  /* Sleeping is not CPU time: 150 ms of sleep must cost far less than the
+   * 120 ms burn did. This is what fails when the "CPU clock" is really the
+   * uptime clock in disguise. */
+  long long t2 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+  usleep(150000);
+  long long t3 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+  long long slept = t3 - t2;
+
+  if (burned < 50000000LL) { /* ≥ 50 ms of the 120 ms burn landed on us */
+    fail("thread-cputime-burn", (long)(burned / 1000000));
+    return;
+  }
+  if (slept > 40000000LL) { /* a 150 ms sleep must not look like 40 ms of CPU */
+    fail("thread-cputime-sleep", (long)(slept / 1000000));
+    return;
+  }
+  ok("thread-cputime");
+}
+
+struct burner_arg {
+  int ms;
+  long long cpu_ns;   /* thread's own CPU time, filled in by the thread */
+  pid_t tid;
+  clockid_t clk;
+  volatile int started;
+};
+
+static void *burner_entry(void *p) {
+  struct burner_arg *a = (struct burner_arg *)p;
+  a->tid = my_tid();
+  a->started = 1;
+  long long t0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+  burn_ms(a->ms);
+  a->cpu_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID) - t0;
+  return (void *)0x8686;
+}
+
+static void test_process_cputime(void) {
+  long long own0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+  long long proc0 = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+  if (proc0 < 0) {
+    fail("process-cputime-gettime", proc0);
+    return;
+  }
+
+  struct burner_arg a = {.ms = 150};
+  pthread_t th;
+  if (pthread_create(&th, 0, burner_entry, &a) != 0) {
+    fail("process-cputime-create", -1);
+    return;
+  }
+  void *rv = 0;
+  if (pthread_join(th, &rv) != 0 || (unsigned long)rv != 0x8686) {
+    fail("process-cputime-join", (long)(unsigned long)rv);
+    return;
+  }
+
+  long long own1 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+  long long proc1 = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
+  long long own_delta = own1 - own0;
+  long long proc_delta = proc1 - proc0;
+
+  /* The sibling burned ≥ 150 ms of wall time; this thread only waited. So the
+   * process clock must have advanced substantially more than our own. */
+  if (a.cpu_ns < 50000000LL) {
+    fail("process-cputime-sibling", (long)(a.cpu_ns / 1000000));
+    return;
+  }
+  if (proc_delta <= own_delta + 40000000LL) {
+    fail("process-cputime-sum", (long)((proc_delta - own_delta) / 1000000));
+    return;
+  }
+  ok("process-cputime");
+}
+
+static void *idclock_entry(void *p) {
+  struct burner_arg *a = (struct burner_arg *)p;
+  a->tid = my_tid();
+  if (pthread_getcpuclockid(pthread_self(), &a->clk) != 0)
+    a->clk = (clockid_t)-1;
+  a->started = 1;
+  burn_ms(120);
+  a->cpu_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+  /* Hold the thread alive until the main thread has read our clock. */
+  while (a->ms == 0)
+    usleep(2000);
+  return 0;
+}
+
+static void test_getcpuclockid(void) {
+  struct burner_arg a = {.ms = 0};
+  pthread_t th;
+  if (pthread_create(&th, 0, idclock_entry, &a) != 0) {
+    fail("getcpuclockid-create", -1);
+    return;
+  }
+  while (!a.started || a.cpu_ns == 0)
+    usleep(2000);
+
+  if (a.clk == (clockid_t)-1) {
+    fail("getcpuclockid-id", -1);
+    a.ms = 1;
+    pthread_join(th, 0);
+    return;
+  }
+  long long via_id = clock_ns(a.clk);
+  struct timespec res;
+  int rres = clock_getres(a.clk, &res);
+  a.ms = 1;
+  pthread_join(th, 0);
+
+  if (via_id < 0) {
+    fail("getcpuclockid-gettime", (long)via_id);
+    return;
+  }
+  /* The thread sampled its own clock just before we read it through the id, so
+   * the two must agree closely (the thread only spun a couple of usleeps in
+   * between). */
+  long long diff = via_id - a.cpu_ns;
+  if (diff < 0)
+    diff = -diff;
+  if (via_id < 50000000LL || diff > 50000000LL) {
+    fail("getcpuclockid-match", (long)(diff / 1000000));
+    return;
+  }
+  if (rres != 0 || res.tv_sec != 0 || res.tv_nsec > 1000) {
+    fail("getcpuclockid-res", (long)res.tv_nsec);
+    return;
+  }
+  ok("getcpuclockid");
+}
+
+/* ── 2: rusage / times ──────────────────────────────────────────────────── */
+
+static void test_rusage_and_times(void) {
+  struct rusage self0, thr0;
+  if (getrusage(RUSAGE_SELF, &self0) != 0 ||
+      getrusage(RUSAGE_THREAD, &thr0) != 0) {
+    fail("rusage-get", -1);
+    return;
+  }
+  struct tms tms0;
+  clock_t wall0 = times(&tms0);
+  if (wall0 == (clock_t)-1) {
+    fail("times-call", -1);
+    return;
+  }
+
+  struct burner_arg a = {.ms = 150};
+  pthread_t th;
+  if (pthread_create(&th, 0, burner_entry, &a) != 0) {
+    fail("rusage-create", -1);
+    return;
+  }
+  burn_ms(120);
+  pthread_join(th, 0);
+
+  struct rusage self1, thr1;
+  getrusage(RUSAGE_SELF, &self1);
+  getrusage(RUSAGE_THREAD, &thr1);
+  struct tms tms1;
+  clock_t wall1 = times(&tms1);
+
+  long long self_us =
+      (long long)(self1.ru_utime.tv_sec - self0.ru_utime.tv_sec) * 1000000LL +
+      (self1.ru_utime.tv_usec - self0.ru_utime.tv_usec);
+  long long thr_us =
+      (long long)(thr1.ru_utime.tv_sec - thr0.ru_utime.tv_sec) * 1000000LL +
+      (thr1.ru_utime.tv_usec - thr0.ru_utime.tv_usec);
+
+  if (thr_us < 50000) {
+    fail("rusage-thread-burn", (long)(thr_us / 1000));
+    return;
+  }
+  /* RUSAGE_SELF covers this thread AND the sibling, so it must exceed the
+   * calling thread's own time by roughly the sibling's burn. */
+  if (self_us < thr_us + 50000) {
+    fail("rusage-self-group", (long)((self_us - thr_us) / 1000));
+    return;
+  }
+  /* Nanosecond accounting means the microsecond field carries information: a
+   * pure 10 ms-tick counter can only ever produce multiples of 10000. */
+  if ((self1.ru_utime.tv_usec % 10000) == 0 &&
+      (thr1.ru_utime.tv_usec % 10000) == 0 &&
+      (self1.ru_stime.tv_usec % 10000) == 0) {
+    fail("rusage-precision", (long)self1.ru_utime.tv_usec);
+    return;
+  }
+  if (self1.ru_nvcsw + self1.ru_nivcsw <= 0) {
+    fail("rusage-ctxsw", (long)(self1.ru_nvcsw + self1.ru_nivcsw));
+    return;
+  }
+  ok("rusage-thread");
+
+  /* times(2): process CPU time, in USER_HZ ticks, covering both threads. */
+  clock_t dut = tms1.tms_utime - tms0.tms_utime;
+  if (wall1 == (clock_t)-1 || wall1 < wall0) {
+    fail("times-wall", (long)wall1);
+    return;
+  }
+  if (dut < 10) { /* ≥ 100 ms of the ≥ 270 ms burned by the two threads */
+    fail("times-utime", (long)dut);
+    return;
+  }
+  ok("times-process");
+}
+
+static void test_rusage_children(void) {
+  struct rusage ch0, ch1;
+  if (getrusage(RUSAGE_CHILDREN, &ch0) != 0) {
+    fail("rusage-children-get", -1);
+    return;
+  }
+  pid_t pid = fork();
+  if (pid == 0) {
+    burn_ms(150);
+    _exit(0);
+  }
+  if (pid < 0) {
+    fail("rusage-children-fork", pid);
+    return;
+  }
+  int st = 0;
+  if (waitpid(pid, &st, 0) != pid) {
+    fail("rusage-children-wait", -1);
+    return;
+  }
+  getrusage(RUSAGE_CHILDREN, &ch1);
+  long long d_us =
+      (long long)(ch1.ru_utime.tv_sec - ch0.ru_utime.tv_sec) * 1000000LL +
+      (ch1.ru_utime.tv_usec - ch0.ru_utime.tv_usec);
+  check("rusage-children", d_us >= 50000, (long)(d_us / 1000));
+}
+
+/* /proc/self/stat: pid (comm) state ppid pgrp session tty tpgid flags minflt
+ * cminflt majflt cmajflt utime stime ... — fields are 1-based, so utime is 14,
+ * stime 15 and num_threads 20. The comm field is parenthesised and may contain
+ * spaces, so parsing starts after the last ')'. */
+static void test_proc_stat_times(void) {
+  burn_ms(120);
+  struct burner_arg a = {.ms = 200};
+  pthread_t th;
+  if (pthread_create(&th, 0, burner_entry, &a) != 0) {
+    fail("proc-stat-create", -1);
+    return;
+  }
+  while (!a.started)
+    usleep(2000);
+
+  char buf[1024];
+  int fd = open("/proc/self/stat", O_RDONLY);
+  if (fd < 0) {
+    fail("proc-stat-open", fd);
+    pthread_join(th, 0);
+    return;
+  }
+  long n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) {
+    fail("proc-stat-read", n);
+    pthread_join(th, 0);
+    return;
+  }
+  buf[n] = 0;
+
+  char *close_paren = strrchr(buf, ')');
+  if (!close_paren) {
+    fail("proc-stat-comm", 0);
+    pthread_join(th, 0);
+    return;
+  }
+  /* Field 3 (state) is the first token after ')'. */
+  long fields[24];
+  int nf = 0;
+  char *p = close_paren + 1;
+  char *tok = strtok(p, " \t\n"); /* state — skipped, not numeric */
+  tok = strtok(0, " \t\n");
+  while (tok && nf < 22) {
+    fields[nf++] = strtol(tok, 0, 10);
+    tok = strtok(0, " \t\n");
+  }
+  pthread_join(th, 0);
+
+  /* fields[0] is field 4 (ppid), so field N is fields[N - 4]. */
+  if (nf < 17) {
+    fail("proc-stat-fields", nf);
+    return;
+  }
+  long utime = fields[14 - 4];
+  long stime = fields[15 - 4];
+  long threads = fields[20 - 4];
+  if (utime < 5) {
+    fail("proc-stat-utime", utime);
+    return;
+  }
+  if (stime < 0 || utime + stime < 5) {
+    fail("proc-stat-stime", stime);
+    return;
+  }
+  if (threads < 2) {
+    fail("proc-stat-threads", threads);
+    return;
+  }
+  ok("proc-stat-times");
+}
+
+/* ru_maxrss must be a PEAK, not the current footprint: touch 8 MiB, drop it,
+ * and the reported figure has to remember the 8 MiB. */
+static void test_rusage_maxrss(void) {
+  struct rusage before;
+  if (getrusage(RUSAGE_SELF, &before) != 0) {
+    fail("maxrss-get", -1);
+    return;
+  }
+  const size_t span = 8u * 1024 * 1024;
+  char *p = mmap(0, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                 -1, 0);
+  if (p == MAP_FAILED) {
+    fail("maxrss-mmap", -1);
+    return;
+  }
+  for (size_t i = 0; i < span; i += 4096)
+    p[i] = (char)(i >> 12); /* fault every page in */
+  struct rusage peak;
+  getrusage(RUSAGE_SELF, &peak);
+  munmap(p, span);
+  struct rusage after;
+  getrusage(RUSAGE_SELF, &after);
+
+  long grew = peak.ru_maxrss - before.ru_maxrss;
+  if (grew < 4096) { /* ≥ 4 MiB of the 8 MiB shows up as resident */
+    fail("maxrss-growth", grew);
+    return;
+  }
+  /* After the unmap the pages are gone, but the high-water mark is not. */
+  check("rusage-maxrss", after.ru_maxrss >= peak.ru_maxrss,
+        after.ru_maxrss - peak.ru_maxrss);
+}
+
+/* Read the single-character state field of /proc/<tid>/stat (field 3, right
+ * after the parenthesised comm). Returns 0 if it cannot be read. */
+static char proc_state(pid_t tid) {
+  char path[64], buf[512];
+  snprintf(path, sizeof(path), "/proc/%d/stat", (int)tid);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return 0;
+  long n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0)
+    return 0;
+  buf[n] = 0;
+  char *close_paren = strrchr(buf, ')');
+  if (!close_paren)
+    return 0;
+  char *p = close_paren + 1;
+  while (*p == ' ')
+    p++;
+  return *p;
+}
+
+/* A stop signal sent to the PROCESS must reach a thread parked in a blocking
+ * syscall, not just the threads that happen to be running. */
+struct blocker_arg {
+  volatile pid_t tid;
+  int fd;
+  volatile int woke;
+};
+
+static void *blocker_entry(void *p) {
+  struct blocker_arg *a = (struct blocker_arg *)p;
+  a->tid = my_tid();
+  char c;
+  /* Blocks until the main thread writes — a genuinely sleeping syscall. */
+  while (read(a->fd, &c, 1) < 0 && errno == EINTR)
+    ;
+  a->woke = 1;
+  return 0;
+}
+
+static void test_group_stop_blocked(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("group-stop-pipe", -1);
+    return;
+  }
+  /* Run the whole thing in a child: stopping our own process would stop the
+   * test itself, and only a separate process can be resumed from outside. */
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(fds[1]);
+    struct blocker_arg a;
+    memset((void *)&a, 0, sizeof(a));
+    a.fd = fds[0];
+    pthread_t th;
+    if (pthread_create(&th, 0, blocker_entry, &a) != 0)
+      _exit(4);
+    while (!a.tid)
+      usleep(2000);
+    /* Publish the blocked thread's tid, then idle so the parent can stop us. */
+    char line[32];
+    int n = snprintf(line, sizeof(line), "%d\n", (int)a.tid);
+    if (write(2, line, (size_t)n) < 0)
+      _exit(5);
+    for (;;)
+      usleep(5000);
+  }
+  if (pid < 0) {
+    fail("group-stop-fork", pid);
+    return;
+  }
+  close(fds[0]);
+  usleep(120000); /* let the child create the thread and block it */
+
+  /* The child's threads: its tids follow its pid, and /proc/<pid>/task lists
+   * them. Find the one that is not the leader. */
+  pid_t blocked = 0;
+  {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/task", (int)pid);
+    DIR *d = opendir(path);
+    if (d) {
+      struct dirent *e;
+      while ((e = readdir(d)) != 0) {
+        int tid = atoi(e->d_name);
+        if (tid > 0 && tid != (int)pid)
+          blocked = (pid_t)tid;
+      }
+      closedir(d);
+    }
+  }
+  if (blocked == 0) {
+    fail("group-stop-find-thread", 0);
+    kill(pid, SIGKILL);
+    waitpid(pid, 0, 0);
+    return;
+  }
+
+  if (kill(pid, SIGSTOP) != 0) {
+    fail("group-stop-kill", -1);
+    kill(pid, SIGKILL);
+    waitpid(pid, 0, 0);
+    return;
+  }
+  int st = 0;
+  if (waitpid(pid, &st, WUNTRACED) != pid || !WIFSTOPPED(st)) {
+    fail("group-stop-wait", st);
+    kill(pid, SIGKILL);
+    waitpid(pid, 0, 0);
+    return;
+  }
+  /* The blocked thread must be stopped too — 'T' in its own /proc entry. */
+  char state = 0;
+  for (int i = 0; i < 100; i++) {
+    state = proc_state(blocked);
+    if (state == 'T')
+      break;
+    usleep(5000);
+  }
+  int stopped_ok = (state == 'T');
+
+  kill(pid, SIGCONT);
+  usleep(50000);
+  char after = proc_state(blocked);
+  kill(pid, SIGKILL);
+  waitpid(pid, 0, 0);
+  close(fds[1]);
+
+  check("group-stop-blocked", stopped_ok && after != 'T',
+        (long)state * 1000 + after);
+}
+
+/* ── 3: thread-directed signals ─────────────────────────────────────────── */
+
+static volatile pid_t g_sig_tid;
+static volatile int g_sig_count;
+static volatile int g_sig_seen;
+
+static void usr_handler(int sig) {
+  (void)sig;
+  g_sig_tid = my_tid();
+  g_sig_count++;
+  g_sig_seen = 1;
+}
+
+static void test_tkill_self(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = usr_handler;
+  sigaction(SIGUSR1, &sa, 0);
+
+  g_sig_tid = 0;
+  g_sig_seen = 0;
+  pid_t me = my_tid();
+  if (syscall(SYS_tkill, me, SIGUSR1) != 0) {
+    fail("tkill-self-call", -1);
+    return;
+  }
+  for (int i = 0; i < 200 && !g_sig_seen; i++)
+    usleep(2000);
+  check("tkill-self", g_sig_seen && g_sig_tid == me, (long)g_sig_tid);
+}
+
+struct target_arg {
+  volatile pid_t tid;
+  volatile int handled_by; /* tid that ran the handler */
+  volatile int stop;
+  int unblock_sig;
+};
+
+static struct target_arg *g_target;
+
+static void target_handler(int sig) {
+  (void)sig;
+  if (g_target)
+    g_target->handled_by = (int)my_tid();
+}
+
+static void *target_entry(void *p) {
+  struct target_arg *a = (struct target_arg *)p;
+  a->tid = my_tid();
+  sigset_t set;
+  sigemptyset(&set);
+  if (a->unblock_sig) {
+    /* This thread is the only one with the signal unblocked. */
+    sigaddset(&set, a->unblock_sig);
+    pthread_sigmask(SIG_UNBLOCK, &set, 0);
+  }
+  while (!a->stop)
+    usleep(2000);
+  return 0;
+}
+
+static void test_tgkill_thread(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = target_handler;
+  sigaction(SIGUSR2, &sa, 0);
+
+  struct target_arg a;
+  memset((void *)&a, 0, sizeof(a));
+  g_target = &a;
+  pthread_t th;
+  if (pthread_create(&th, 0, target_entry, &a) != 0) {
+    fail("tgkill-create", -1);
+    return;
+  }
+  while (!a.tid)
+    usleep(2000);
+
+  /* Address the sibling by tid: the handler must run ON that thread. */
+  if (syscall(SYS_tgkill, getpid(), a.tid, SIGUSR2) != 0) {
+    fail("tgkill-call", -1);
+    a.stop = 1;
+    pthread_join(th, 0);
+    return;
+  }
+  for (int i = 0; i < 200 && !a.handled_by; i++)
+    usleep(2000);
+  int handled = a.handled_by;
+  pid_t tid = a.tid;
+
+  /* ESRCH cases: wrong thread group for a live tid, and a tid that is not a
+   * task at all. */
+  errno = 0;
+  long wrong_group = syscall(SYS_tgkill, getpid() + 100000, tid, SIGUSR2);
+  int wrong_errno = errno;
+  errno = 0;
+  long dead_tid = syscall(SYS_tkill, 0x7ffffff, SIGUSR2);
+  int dead_errno = errno;
+
+  a.stop = 1;
+  pthread_join(th, 0);
+  g_target = 0;
+
+  check("tgkill-thread", handled == (int)tid, (long)handled);
+  check("tgkill-esrch",
+        wrong_group == -1 && wrong_errno == ESRCH && dead_tid == -1 &&
+            dead_errno == ESRCH,
+        (long)wrong_errno * 1000 + dead_errno);
+}
+
+/* kill(2) targets the PROCESS: with SIGUSR2 blocked in the main thread and
+ * unblocked in a sibling, the sibling must be the one that runs the handler. */
+static void test_kill_unblocked(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = target_handler;
+  sigaction(SIGUSR2, &sa, 0);
+
+  sigset_t block, old;
+  sigemptyset(&block);
+  sigaddset(&block, SIGUSR2);
+  pthread_sigmask(SIG_BLOCK, &block, &old);
+
+  struct target_arg a;
+  memset((void *)&a, 0, sizeof(a));
+  a.unblock_sig = SIGUSR2;
+  g_target = &a;
+  pthread_t th;
+  if (pthread_create(&th, 0, target_entry, &a) != 0) {
+    fail("kill-unblocked-create", -1);
+    pthread_sigmask(SIG_SETMASK, &old, 0);
+    return;
+  }
+  while (!a.tid)
+    usleep(2000);
+  usleep(20000); /* let the sibling reach its unblock + wait loop */
+
+  if (kill(getpid(), SIGUSR2) != 0) {
+    fail("kill-unblocked-call", -1);
+    a.stop = 1;
+    pthread_join(th, 0);
+    pthread_sigmask(SIG_SETMASK, &old, 0);
+    return;
+  }
+  for (int i = 0; i < 300 && !a.handled_by; i++)
+    usleep(2000);
+  int handled = a.handled_by;
+  pid_t tid = a.tid;
+  a.stop = 1;
+  pthread_join(th, 0);
+  g_target = 0;
+  pthread_sigmask(SIG_SETMASK, &old, 0);
+
+  check("kill-unblocked", handled == (int)tid, (long)handled);
+}
+
+/* ── 4: pthread_exit ────────────────────────────────────────────────────── */
+
+static volatile int g_cleanup_ran;
+
+static void cleanup_cb(void *arg) { g_cleanup_ran = (int)(long)arg; }
+
+static void exit_deep(int depth, void *rv) {
+  if (depth > 0) {
+    exit_deep(depth - 1, rv);
+    return;
+  }
+  pthread_exit(rv);
+}
+
+static void *exit_rv_entry(void *arg) {
+  pthread_cleanup_push(cleanup_cb, (void *)0x77);
+  exit_deep(4, arg);
+  pthread_cleanup_pop(0);
+  return (void *)0xBAD;
+}
+
+static void test_pthread_exit_retval(void) {
+  g_cleanup_ran = 0;
+  pthread_t th;
+  void *want = (void *)0xFEEDBEEFUL;
+  if (pthread_create(&th, 0, exit_rv_entry, want) != 0) {
+    fail("pthread-exit-create", -1);
+    return;
+  }
+  void *rv = (void *)0x1;
+  if (pthread_join(th, &rv) != 0) {
+    fail("pthread-exit-join", -1);
+    return;
+  }
+  if (rv != want) {
+    fail("pthread-exit-value", (long)(unsigned long)rv);
+    return;
+  }
+  if (g_cleanup_ran != 0x77) {
+    fail("pthread-exit-cleanup", g_cleanup_ran);
+    return;
+  }
+  /* pthread_exit(PTHREAD_CANCELED-like sentinel) and a plain return must both
+   * make it through the same path. */
+  if (pthread_create(&th, 0, burner_entry,
+                     &(struct burner_arg){.ms = 1}) != 0) {
+    fail("pthread-exit-create2", -1);
+    return;
+  }
+  rv = 0;
+  pthread_join(th, &rv);
+  check("pthread-exit-rv", (unsigned long)rv == 0x8686, (long)(unsigned long)rv);
+}
+
+/* pthread_exit() from main must NOT tear the process down: the remaining thread
+ * keeps running and the process exits 0 once it finishes. Run in a child so the
+ * test binary itself survives. */
+static void *late_writer(void *arg) {
+  int fd = (int)(long)arg;
+  usleep(120000);
+  const char msg[] = "late";
+  ssize_t w = write(fd, msg, 4);
+  (void)w;
+  close(fd);
+  return 0;
+}
+
+static void test_pthread_exit_main(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pthread-exit-main-pipe", -1);
+    return;
+  }
+  pid_t pid = fork();
+  if (pid == 0) {
+    close(fds[0]);
+    pthread_t th;
+    int rc = pthread_create(&th, 0, late_writer, (void *)(long)fds[1]);
+    if (rc != 0)
+      _exit(rc & 0x7f);
+    pthread_exit(0); /* main thread leaves; the process must live on */
+  }
+  if (pid < 0) {
+    fail("pthread-exit-main-fork", pid);
+    return;
+  }
+  close(fds[1]);
+  char buf[8] = {0};
+  ssize_t n = read(fds[0], buf, sizeof(buf));
+  close(fds[0]);
+  int st = 0;
+  waitpid(pid, &st, 0);
+  check("pthread-exit-main",
+        n == 4 && memcmp(buf, "late", 4) == 0 && WIFEXITED(st) &&
+            WEXITSTATUS(st) == 0,
+        (long)n * 1000 + st);
+}
+
+int main(void) {
+  marker("M86-SMOKE: start");
+
+  test_thread_cputime();
+  test_process_cputime();
+  test_getcpuclockid();
+  test_rusage_and_times();
+  test_rusage_children();
+  test_proc_stat_times();
+  test_rusage_maxrss();
+  test_group_stop_blocked();
+
+  test_tkill_self();
+  test_tgkill_thread();
+  test_kill_unblocked();
+
+  test_pthread_exit_retval();
+  test_pthread_exit_main();
+
+  marker(g_fail ? "M86-SMOKE: done with failures" : "M86-SMOKE: done");
+  return g_fail ? 1 : 0;
+}

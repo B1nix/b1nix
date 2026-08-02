@@ -1459,18 +1459,72 @@ static u64 sys_alarm(unsigned int seconds) {
   return remaining;
 }
 
-/* clock_getres(2). b1nix drives every clock off the 100 Hz scheduler tick (see
- * SYS_CLOCK_GETTIME), so the honest resolution is 10 ms for all of them —
- * reporting Linux's 1 ns would be a lie a caller can act on (poll loops sized
- * from the resolution). */
+/* M86: resolve one of the CPU-time clocks to nanoseconds.
+ *
+ * Positive ids are the two fixed clocks: CLOCK_PROCESS_CPUTIME_ID(2) is the
+ * caller's whole thread group, CLOCK_THREAD_CPUTIME_ID(3) is the calling
+ * thread. Negative ids are the dynamic clocks clock_getcpuclockid(3) and
+ * pthread_getcpuclockid(3) return, in Linux's encoding:
+ *
+ *   clockid = (~pid_or_tid << 3) | (perthread ? 4 : 0) | which
+ *   which: 0 = PROF (user+system), 1 = VIRT (user only), 2 = SCHED (user+system)
+ *
+ * so `~(clockid >> 3)` recovers the pid (arithmetic shift — the id is
+ * negative), and the low three bits say what to report. Returns -1 for an id
+ * that names no live task. */
+static isize sys_cpu_clock_ns(int clk_id, u64 *out_ns) {
+  u64 u = 0, s = 0;
+  if (clk_id == 2) { /* CLOCK_PROCESS_CPUTIME_ID */
+    task_group_cputime_ns(current_task, &u, &s);
+    *out_ns = u + s;
+    return 0;
+  }
+  if (clk_id == 3) { /* CLOCK_THREAD_CPUTIME_ID */
+    *out_ns = task_utime_ns(current_task) + task_stime_ns(current_task);
+    return 0;
+  }
+  if (clk_id >= 0)
+    return -1;
+
+  int which = clk_id & 3;
+  int perthread = (clk_id & 4) != 0;
+  usize id = (usize)(~(clk_id >> 3));
+  if (id == 0)
+    return -1;
+  struct task *t = scheduler_task_by_pid(id);
+  if (!t)
+    return -1;
+  if (perthread) {
+    u = task_utime_ns(t);
+    s = task_stime_ns(t);
+  } else {
+    task_group_cputime_ns(t, &u, &s);
+  }
+  *out_ns = (which == 1) ? u : (u + s); /* VIRT is user time only */
+  return 0;
+}
+
+/* clock_getres(2). The wall/monotonic clocks are driven off the 100 Hz
+ * scheduler tick (see SYS_CLOCK_GETTIME), so 10 ms is their honest resolution
+ * — reporting Linux's 1 ns would be a lie a caller can act on (poll loops
+ * sized from the resolution). The CPU-time clocks are different: M86 accounts
+ * them from the TSC, so their resolution really is nanoseconds. */
 static isize sys_clock_getres(int clk_id, struct timespec *user_res) {
-  if (clk_id < 0 || clk_id > 7)
+  int is_cpu_clock = (clk_id < 0 || clk_id == 2 || clk_id == 3);
+  if (clk_id > 7)
     return -EINVAL;
+  if (clk_id < 0) {
+    /* A dynamic CPU clock must name a live task, exactly as clock_gettime
+     * requires — otherwise the id is not a clock at all. */
+    u64 probe = 0;
+    if (sys_cpu_clock_ns(clk_id, &probe) < 0)
+      return -EINVAL;
+  }
   if (!user_res)
     return 0; /* Linux allows a NULL res: the call then only validates clk_id */
   struct timespec res;
   res.tv_sec = 0;
-  res.tv_nsec = 10000000; /* 1 tick at 100 Hz */
+  res.tv_nsec = is_cpu_clock ? 1 : 10000000; /* 1 tick at 100 Hz */
   if (syscall_copyout(user_res, &res, sizeof(res)) != 0)
     return -EFAULT;
   return 0;
@@ -3660,8 +3714,29 @@ u32 sched_user_cpu_mask(void) { return g_user_cpu_mask; }
 static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                      u64 arg4, u64 arg5, struct interrupt_frame *frame);
 
+static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
+                                   u64 arg3, u64 arg4, u64 arg5,
+                                   struct interrupt_frame *frame);
+
+/* M86: CPU-time accounting boundary. A syscall with a frame came from ring 3,
+ * so the interval that ends here is user time and everything until the return
+ * is system time. Kernel-internal callers pass frame == 0 and are already
+ * inside a system-time interval. */
 u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
-                     u64 arg4, u64 arg5, struct interrupt_frame *frame) {
+                          u64 arg4, u64 arg5, struct interrupt_frame *frame) {
+  if (!frame)
+    return syscall_dispatch_traced(number, arg0, arg1, arg2, arg3, arg4, arg5,
+                                   frame);
+  sched_acct_enter_kernel();
+  u64 r = syscall_dispatch_traced(number, arg0, arg1, arg2, arg3, arg4, arg5,
+                                  frame);
+  sched_acct_leave_kernel();
+  return r;
+}
+
+static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
+                                   u64 arg3, u64 arg4, u64 arg5,
+                                   struct interrupt_frame *frame) {
   /* M80: PTRACE_SYSCALL entry stop. The plain-load ptrace_any_traced() gate
    * keeps an untraced system at one memory read per syscall. A tracer that
    * rewrites registers during the stop is obeyed: the number and arguments are
@@ -3953,15 +4028,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       if (number == 280)
         return (u64)sys_linux_utimensat((int)arg0, (const char *)(usize)arg1,
                                         arg2, 1);
-      /* tkill(tid, sig) / tgkill(tgid, tid, sig): b1nix has no thread-kill, but
-       * its tids are task ids, so target the tid directly via scheduler_kill
-       * (for a single-threaded process tid == pid). Remap the signo. */
+      /* tkill(tid, sig) / tgkill(tgid, tid, sig): b1nix tids are task ids, so
+       * the tid targets a thread directly. tgkill also verifies the thread
+       * group, so a tid recycled into another process is rejected rather than
+       * signalled (M86). Remap the signo. */
       if (number == LINUX_NR_TKILL)
-        return (u64)scheduler_kill((usize)arg0,
-                                   linux_signo_to_b1nix((int)arg1));
+        return (u64)scheduler_tkill(0, (usize)arg0,
+                                    linux_signo_to_b1nix((int)arg1));
       if (number == LINUX_NR_TGKILL)
-        return (u64)scheduler_kill((usize)arg1,
-                                   linux_signo_to_b1nix((int)arg2));
+        return (u64)scheduler_tkill((usize)arg0, (usize)arg1,
+                                    linux_signo_to_b1nix((int)arg2));
       /* waitid(247): idtype/id/options values match b1nix, but the siginfo
        * layouts differ (b1nix packs 6 ints; Linux is a 128-byte struct with
        * si_errno/si_code swapped and the CLD fields at offset 16). Let
@@ -5874,7 +5950,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     ret = (u64)sys_write((int)arg0, (const void *)(usize)arg1, (usize)arg2);
     break;
   case SYS_EXIT:
-    scheduler_exit_current((int)arg0);
+    /* exit(2) ends this THREAD (Linux nr 60); exit_group(2) ends the process.
+     * A group leader with live threads parks until they are done (M86). */
+    scheduler_exit_thread((int)arg0);
     ret = 0;
     break;
   case SYS_SPAWN: {
@@ -6202,8 +6280,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     struct tms *user_tms = (struct tms *)(usize)arg0;
     if (user_tms) {
       struct tms k_tms;
-      k_tms.tms_utime = (clock_t)task_utime(current_task);
-      k_tms.tms_stime = (clock_t)task_stime(current_task);
+      /* POSIX: times() reports the PROCESS, so every thread's CPU time counts
+       * (M86 — this used to report the calling thread alone). */
+      u64 gu = 0, gs = 0;
+      task_group_cputime_ns(current_task, &gu, &gs);
+      k_tms.tms_utime = (clock_t)(gu / NS_PER_USER_TICK);
+      k_tms.tms_stime = (clock_t)(gs / NS_PER_USER_TICK);
       k_tms.tms_cutime = (clock_t)task_cutime(current_task);
       k_tms.tms_cstime = (clock_t)task_cstime(current_task);
       if (syscall_copyout(user_tms, &k_tms, sizeof(struct tms)) < 0) {
@@ -6221,29 +6303,34 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     struct rusage k_ru;
     memset(&k_ru, 0, sizeof(struct rusage));
 
+    /* M86: nanosecond accounting, so the microsecond field is exact rather than
+     * a 10 ms tick scaled up. RUSAGE_SELF is the whole thread group; only
+     * RUSAGE_THREAD is the calling thread. */
+    u64 uns = 0, sns = 0;
     if (who == RUSAGE_SELF) {
-      u64 utime = task_utime(current_task);
-      u64 stime = task_stime(current_task);
-      k_ru.ru_utime.tv_sec = (i64)(utime / 100);
-      k_ru.ru_utime.tv_usec = (i64)((utime % 100) * 10000);
-      k_ru.ru_stime.tv_sec = (i64)(stime / 100);
-      k_ru.ru_stime.tv_usec = (i64)((stime % 100) * 10000);
+      task_group_cputime_ns(current_task, &uns, &sns);
     } else if (who == RUSAGE_CHILDREN) {
-      u64 cutime = task_cutime(current_task);
-      u64 cstime = task_cstime(current_task);
-      k_ru.ru_utime.tv_sec = (i64)(cutime / 100);
-      k_ru.ru_utime.tv_usec = (i64)((cutime % 100) * 10000);
-      k_ru.ru_stime.tv_sec = (i64)(cstime / 100);
-      k_ru.ru_stime.tv_usec = (i64)((cstime % 100) * 10000);
+      uns = task_cutime_ns(current_task);
+      sns = task_cstime_ns(current_task);
     } else if (who == RUSAGE_THREAD) {
-      u64 utime = task_utime(current_task);
-      u64 stime = task_stime(current_task);
-      k_ru.ru_utime.tv_sec = (i64)(utime / 100);
-      k_ru.ru_utime.tv_usec = (i64)((utime % 100) * 10000);
-      k_ru.ru_stime.tv_sec = (i64)(stime / 100);
-      k_ru.ru_stime.tv_usec = (i64)((stime % 100) * 10000);
+      uns = task_utime_ns(current_task);
+      sns = task_stime_ns(current_task);
     } else {
       return (u64)-EINVAL;
+    }
+    k_ru.ru_utime.tv_sec = (i64)(uns / 1000000000ULL);
+    k_ru.ru_utime.tv_usec = (i64)((uns % 1000000000ULL) / 1000ULL);
+    k_ru.ru_stime.tv_sec = (i64)(sns / 1000000000ULL);
+    k_ru.ru_stime.tv_usec = (i64)((sns % 1000000000ULL) / 1000ULL);
+    if (who != RUSAGE_CHILDREN) {
+      k_ru.ru_nvcsw = (long)task_nvcsw(current_task);
+      k_ru.ru_nivcsw = (long)task_nivcsw(current_task);
+      /* Resident set high-water mark, in kilobytes, as Linux reports it: the
+       * sampler measures the address space now and keeps the largest value it
+       * has ever seen (samples are also taken just before every unmap, so a
+       * peak that has already been released still counts). */
+      u64 peak = task_rss_sample(current_task, 1);
+      k_ru.ru_maxrss = (long)(peak * (PAGE_SIZE / 1024));
     }
 
     if (syscall_copyout(user_ru, &k_ru, sizeof(struct rusage)) < 0) {
@@ -6333,23 +6420,30 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     } else if (target < 0) {
       kill_ret = (u64)scheduler_kill_process_group((usize)(-target), (int)arg1);
     } else {
-      kill_ret = (u64)scheduler_kill((usize)target, (int)arg1);
+      /* M86: a positive pid names a PROCESS. The signal goes to a thread in
+       * that group that does not block it, and stop/continue act on the whole
+       * group — kill(pid) used to hit the leader alone. */
+      kill_ret = (u64)scheduler_kill_thread_group((usize)target, (int)arg1);
     }
     /* Signal delivery handled by the wrapper. */
     return kill_ret;
   }
+  case SYS_TKILL:
+    /* tkill(tid, sig): no thread-group check (that is what tgkill adds). */
+    return (u64)scheduler_tkill(0, (usize)arg0, (int)arg1);
+  case SYS_TGKILL:
+    return (u64)scheduler_tkill((usize)arg0, (usize)arg1, (int)arg2);
   case SYS_RT_TGSIGQUEUEINFO: {
-    /* rt_tgsigqueueinfo(tgid, tid, sig, siginfo): Linux lets a process send a
-     * signal to one of its own threads with attached siginfo. b1nix has no
-     * per-thread siginfo delivery, so we honor the common in-tree use (LLVM's
-     * crash handler re-raising a fault on itself) by re-raising the signal to
-     * the calling process. The siginfo payload (arg3) is intentionally dropped
-     * — exactly the semantics of raise(3), which callers fall back to. */
+    /* rt_tgsigqueueinfo(tgid, tid, sig, siginfo): send a signal to one thread
+     * of a thread group. M86 targets the named tid for real (it used to
+     * re-raise on the caller regardless of who was addressed, which is only
+     * correct when a crash handler addresses itself). The siginfo payload
+     * (arg3) is still dropped for non-RT signals, which have no queue to carry
+     * it; an RT signal keeps its queued instance via scheduler_sigqueue. */
     int rsig = (int)arg2;
     if (rsig <= 0 || rsig >= 64)
       return (u64)-EINVAL;
-    /* Re-raise to self; signal delivery is performed by the wrapper. */
-    return (u64)scheduler_kill((usize)scheduler_get_pid(), rsig);
+    return (u64)scheduler_tkill((usize)arg0, (usize)arg1, rsig);
   }
   case SYS_SIGNAL: {
     int sig = (int)arg0;
@@ -6496,6 +6590,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)(isize)scheduler_get_priority(pid);
   }
   case SYS_BRK:
+    /* A shrinking brk drops pages — same reason as munmap. */
+    task_rss_sample(current_task, 0);
     return sys_brk(arg0);
   case SYS_MMAP: {
     vma_mutator_lock();
@@ -6505,6 +6601,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return r;
   }
   case SYS_MUNMAP: {
+    /* Sample before the pages go: this is where the resident set falls, so it
+     * is where an unrecorded peak would be lost (M86). */
+    task_rss_sample(current_task, 0);
     vma_mutator_lock();
     u64 r = (u64)sys_munmap((void *)(usize)arg0, (usize)arg1);
     vma_mutator_unlock();
@@ -6943,14 +7042,26 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     int clk_id = (int)arg0;
     struct timespec ktp;
     u64 ticks = scheduler_get_uptime_ticks();
-    /* Monotonic family: CLOCK_MONOTONIC(1), CLOCK_PROCESS_CPUTIME_ID(2),
-     * CLOCK_THREAD_CPUTIME_ID(3), CLOCK_MONOTONIC_RAW(4),
+    /* M86: the CPU-time clocks report real per-thread/per-process CPU time,
+     * not uptime. CLOCK_PROCESS_CPUTIME_ID(2) is the thread group's
+     * user+system time; CLOCK_THREAD_CPUTIME_ID(3) is the calling thread's.
+     * Negative ids are the dynamic per-task clocks that
+     * clock_getcpuclockid(3)/pthread_getcpuclockid(3) hand out. */
+    if (clk_id < 0 || clk_id == 2 || clk_id == 3) {
+      u64 ns = 0;
+      if (sys_cpu_clock_ns(clk_id, &ns) < 0)
+        return (u64)-EINVAL;
+      ktp.tv_sec = (i64)(ns / 1000000000ULL);
+      ktp.tv_nsec = (i64)(ns % 1000000000ULL);
+      if (syscall_copyout((void *)(usize)arg1, &ktp, sizeof(struct timespec)) != 0)
+        return (u64)-EFAULT;
+      return 0;
+    }
+    /* Monotonic family: CLOCK_MONOTONIC(1), CLOCK_MONOTONIC_RAW(4),
      * CLOCK_MONOTONIC_COARSE(6), CLOCK_BOOTTIME(7) -> uptime monotonic clock.
-     * b1nix has no separate boot/raw clocks and no fine-grained per-task CPU
-     * accounting, so the CPU-time ids are a best-effort monotonic value (added
-     * for the Chromium port; values match Linux). CLOCK_REALTIME(0) and
+     * b1nix has no separate boot/raw clocks. CLOCK_REALTIME(0) and
      * CLOCK_REALTIME_COARSE(5) -> wall clock. */
-    if (clk_id == 1 || clk_id == 2 || clk_id == 3 || clk_id == 4 ||
+    if (clk_id == 1 || clk_id == 4 ||
         clk_id == 6 || clk_id == 7) {
       ktp.tv_sec = (i64)(ticks / 100);
       ktp.tv_nsec = (i64)((ticks % 100) * 10000000);
@@ -7107,7 +7218,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* SYS_EXIT_THREAD(code) — thread-only exit. For an is_thread task
      * scheduler_exit_current already handles the CLONE_CHILD_CLEARTID
      * futex wake. For a process leader this acts the same as SYS_EXIT. */
-    scheduler_exit_current((int)arg0);
+    scheduler_exit_thread((int)arg0);
     return 0;
   case SYS_SELECT: {
     /* SYS_SELECT(nfds, readfds, writefds, exceptfds, timeout_ms).

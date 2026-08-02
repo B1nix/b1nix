@@ -1465,6 +1465,10 @@ static int user_run_elf_image(struct user_loaded_image *image) {
    * double-allocating. */
   if (current_task) {
     int replacing = (current_task->vma_list != NULL);
+    /* M86: the old image's resident set is about to be released — record its
+     * peak first, so getrusage after an execve still reports the largest
+     * footprint this process ever had. */
+    task_rss_sample(current_task, 1);
     user_address_space_cleanup(current_task);
     if (replacing) {
       u64 old_pml4 = current_task->pml4_phys;
@@ -1877,6 +1881,11 @@ static int user_run_elf_image(struct user_loaded_image *image) {
    * translations on every CPU before a freshly loaded image can migrate. */
   extern void tlb_shootdown_all(void);
   tlb_shootdown_all();
+
+  /* M86: from here on the CPU runs ring-3 code — close the kernel-time
+   * interval so the process's first user instructions are charged as user
+   * time, not to whatever loaded it. */
+  sched_acct_leave_kernel();
 
   x86_user_jump((usize)image->entry, (usize)image->address_space.stack_base,
                 (usize)image->argc,

@@ -739,7 +739,11 @@ Status:
 
 ## M86: Per-thread CPU accounting + signal targeting
 
-- [ ] `planned` Per-task CPU-time accounting, kernel `tkill`/`tgkill`, and `pthread_exit` retval delivery.
+- [x] TSC-exact per-thread user/system CPU accounting (ring-3 entry/exit + context-switch boundaries); tick sampling removed.
+- [x] Real `CLOCK_THREAD_CPUTIME_ID` / `CLOCK_PROCESS_CPUTIME_ID` plus the dynamic per-task clock ids of `clock_getcpuclockid`/`pthread_getcpuclockid`.
+- [x] `times(2)`, `getrusage` (SELF = thread group, THREAD, CHILDREN, `ru_nvcsw`/`ru_nivcsw`, `ru_maxrss` as a true high-water mark sampled before every unmap) and `/proc/<pid>[/task/<tid>]/stat` report real CPU time.
+- [x] `tkill(2)`/`tgkill(2)` syscalls with thread-group validation; `kill(2)` is process-directed (picks a thread that does not block the signal, group-wide stop/continue that also wakes threads parked in a blocking syscall).
+- [x] `exit(2)` ends one thread: a leader that calls it (musl's `pthread_exit` from main) waits for its remaining threads instead of killing them, and hands them its tid futex first.
 
 ## M87: Dynamic-loader maturation + Rust proc-macros - Retired
 

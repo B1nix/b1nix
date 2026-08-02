@@ -433,7 +433,6 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
      * service and never delivers another tick. Issue EOI first so the
      * LAPIC unblocks immediately, then run the (preemptible) tick work. */
     lapic_eoi();
-    scheduler_charge_tick(frame->cs == 0x1B || frame->cs == 0x23);
     /* Record the user RIP the tick preempted, so the silence watchdog's task
      * dump can name the exact user function a wedged thread group spins in
      * (a thread group burning CPU in the same address forever is a lockup;
@@ -484,7 +483,6 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
       fb_console_blink_cursor();
     }
     irq_eoi(frame->vector);
-    scheduler_charge_tick(frame->cs == 0x1B || frame->cs == 0x23);
     scheduler_on_timer_tick();
     return;
   }
@@ -539,7 +537,24 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
  * the LAPIC level.
  */
 static int addr_is_kernel_text(u64 addr); /* defined below; used by the fault dump */
+static void x86_irq_handler_dispatch(struct interrupt_frame *frame);
 void x86_irq_handler(struct interrupt_frame *frame) {
+  /* M86: an IRQ taken in ring 3 closes that task's user-time interval; the
+   * handler's own cost is charged to it as system time (Unix accounts device
+   * interrupts to whoever was interrupted). The two IPI vectors below return
+   * before any of that — they can arrive at any point in kernel code, and a
+   * shootdown ACK is not the interrupted task's CPU time in any useful sense.
+   * They only ever fire with the CPU already in ring 0, so skipping them costs
+   * no accuracy. */
+  int from_user = (frame->cs == 0x1B || frame->cs == 0x23);
+  if (from_user)
+    sched_acct_enter_kernel();
+  x86_irq_handler_dispatch(frame);
+  if (from_user)
+    sched_acct_leave_kernel();
+}
+
+static void x86_irq_handler_dispatch(struct interrupt_frame *frame) {
   if (frame->vector == 65) {
     tlb_shootdown_handler();
     return;
@@ -974,7 +989,15 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
  * The faulting task runs on its own CPU and kernel stack, so there is no
  * cross-CPU state the BKL was protecting here. */
 void x86_exception_handler(struct interrupt_frame *frame) {
+  /* M86: a fault taken in ring 3 ends a user-time interval and starts a
+   * kernel-time one (page faults on demand-paged user memory are a real and
+   * frequent part of a process's system time). */
+  int from_user = (frame->cs == 0x1B || frame->cs == 0x23);
+  if (from_user)
+    sched_acct_enter_kernel();
   x86_exception_handler_inner(frame);
+  if (from_user)
+    sched_acct_leave_kernel();
 }
 
 /* ── Stack Backtrace ──────────────────────────────────────────── */

@@ -240,6 +240,8 @@ BINARIES += $(BUILD)/bin/m73_smoke
 BINARIES += $(BUILD)/bin/m104_pam_smoke
 # M80: ptrace register sets, /proc/<pid>/task|auxv|mem, crash capture.
 BINARIES += $(BUILD)/bin/m80_smoke
+# M86: per-thread CPU accounting, tkill/tgkill, pthread_exit return values.
+BINARIES += $(BUILD)/bin/m86_smoke
 # M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
 BINARIES += $(BUILD)/bin/m98_smoke
 BINARIES += $(BUILD)/bin/m63_smoke

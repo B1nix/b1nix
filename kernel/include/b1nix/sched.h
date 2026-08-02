@@ -336,10 +336,41 @@ usize task_tgid(const struct task *t);
  * then keeps working with x87+SSE only. */
 void *task_xsave_area(const struct task *t);
 int task_fpu_alloc(struct task *t);
+/* ── M86: per-thread CPU time ─────────────────────────────────────────────── */
+/* USER_HZ: times(2) and /proc report CPU time in 10 ms clock ticks. The kernel
+ * keeps nanoseconds and converts at the edge. */
+#define NS_PER_USER_TICK 10000000ULL
+u64  task_utime_ns(const struct task *t);
+u64  task_stime_ns(const struct task *t);
+u64  task_cutime_ns(const struct task *t);
+u64  task_cstime_ns(const struct task *t);
+/* Sum the CPU time of every live thread in `t`'s thread group (the process
+ * totals POSIX times(2)/getrusage(RUSAGE_SELF)/CLOCK_PROCESS_CPUTIME_ID want).
+ * Either output pointer may be NULL. */
+void task_group_cputime_ns(const struct task *t, u64 *utime_ns, u64 *stime_ns);
 u64  task_utime(const struct task *t);
 u64  task_stime(const struct task *t);
 u64  task_cutime(const struct task *t);
 u64  task_cstime(const struct task *t);
+/* Scheduler tick at which the task was created (procfs starttime). */
+u64  task_start_ticks(const struct task *t);
+/* M86: peak resident set (getrusage ru_maxrss), in pages. task_rss_sample()
+ * measures the task's resident set by walking its page tables and folds the
+ * result into the peak; call it right before anything that unmaps user pages
+ * (munmap, brk shrink, exec teardown) so no peak is missed. `force` bypasses
+ * the once-per-tick rate limit. */
+u64  task_rss_sample(struct task *t, int force);
+u64  task_maxrss_pages(const struct task *t);
+/* Voluntary / involuntary context-switch counts (getrusage ru_nvcsw/ru_nivcsw). */
+u64  task_nvcsw(const struct task *t);
+u64  task_nivcsw(const struct task *t);
+/* CPU-time accounting boundaries. Called from the ring-3 entry/exit paths
+ * (syscall, IRQ and exception handlers) so every interval is credited to the
+ * right task in the right mode. sched_acct_on_switch is internal to the
+ * scheduler's context switch. */
+void sched_acct_enter_kernel(void);
+void sched_acct_leave_kernel(void);
+void sched_acct_on_switch(struct task *prev);
 /* Last userspace RIP at the moment the LAPIC timer tick preempted this task
  * (0 for kernel tasks / never-preempted). Watchdog diagnostic: names the user
  * function a wedged thread group is spinning in. */
@@ -478,7 +509,6 @@ void scheduler_wake_all(void *chan);
 void scheduler_notify_wait_event(usize parent_id);
 void scheduler_sleep_ticks(u64 ticks);
 void scheduler_on_timer_tick(void);
-void scheduler_charge_tick(int is_user);
 void scheduler_exit_current(int exit_code) __attribute__((noreturn));
 /* Tell the scheduler which pid is /bin/init, so its death is reported loudly
  * instead of ending the run in silence (see scheduler_exit_current). */
@@ -486,6 +516,10 @@ void scheduler_set_init_pid(usize pid);
 /* Non-zero once /bin/init has been spawned; 0 before that. */
 usize scheduler_get_init_pid(void);
 void scheduler_exit_group(int exit_code) __attribute__((noreturn));
+/* M86: exit(2) semantics — end the calling thread only. A thread-group leader
+ * waits for its remaining threads first, so the process (and its address space)
+ * survives a pthread_exit() from main. */
+void scheduler_exit_thread(int exit_code) __attribute__((noreturn));
 int scheduler_wait(usize pid, int *status);
 int scheduler_waitpid(usize pid, int *status, int options);
 int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options);
@@ -514,6 +548,15 @@ void scheduler_fd_close_on_exec(void);
 
 /* ── Signal API ── */
 int scheduler_kill(usize task_id, int sig);
+/* M86: kill(2) semantics for a positive pid — the signal targets the PROCESS,
+ * so a thread that does not block it is chosen, and stop/continue signals act
+ * on the whole thread group. A tid that is not a group leader keeps the plain
+ * thread-directed behaviour of scheduler_kill. */
+int scheduler_kill_thread_group(usize pid, int sig);
+/* M86: tkill(2)/tgkill(2) — deliver to exactly one thread. `tgid` of 0 skips
+ * the thread-group check (tkill); a non-zero tgid that does not match the tid's
+ * group is -ESRCH, which is how tgkill refuses to signal a recycled tid. */
+int scheduler_tkill(usize tgid, usize tid, int sig);
 /* OOM reclaim: SIGKILL the current userspace task (the memory demander). Returns
  * 1 if a victim was signalled (skips kernel threads and init). */
 int scheduler_oom_kill_current(void);

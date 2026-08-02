@@ -730,18 +730,38 @@ static int r_pid_stat(usize pid, struct sbuf *s) {
     sb_addf(s, "%lu (gone) Z 0\n", (unsigned long)pid);
     return 0;
   }
-  sb_addf(s, "%lu (%s) %s %lu\n", (unsigned long)t->id,
-          t->name ? t->name : "?", scheduler_state_name((int)t->state),
-          (unsigned long)t->parent_id);
   u64 vsz = t->user_brk > t->heap_start ? t->user_brk - t->heap_start : 0;
   char comm[PROC_COMM_LEN];
   proc_comm(t, comm);
+  /* Thread count for field 20 (num_threads) — a debugger reads it to know how
+   * many /proc/<pid>/task entries to expect. */
+  unsigned long nthreads = 0;
+  {
+    usize tgid = task_tgid(t);
+    usize slots = scheduler_task_slots();
+    for (usize i = 0; i < slots; i++) {
+      struct task *o = scheduler_task_slot(i);
+      if (o && o->id && task_tgid(o) == tgid)
+        nthreads++;
+    }
+    if (!nthreads)
+      nthreads = 1;
+  }
+  /* Fields, in Linux order: pid comm state ppid pgrp session tty_nr tpgid flags
+   * minflt cminflt majflt cmajflt utime stime cutime cstime priority nice
+   * num_threads itrealvalue starttime vsize rss. M86 fills 14-17 (the CPU
+   * times, in USER_HZ ticks — they were hard-coded zeros, so every `top`/`ps`
+   * in the tree reported 0 % for every process), 20 and 22. */
   sb_addf(s,
-          "%lu (%s) %s %lu %lu %lu 0 -1 0 0 0 0 0 0 0 0 0 %d 0 1 0 0 %lu %lu\n",
+          "%lu (%s) %s %lu %lu %lu 0 -1 0 0 0 0 0 %lu %lu %lu %lu %d 0 %lu 0 "
+          "%lu %lu %lu\n",
           (unsigned long)t->id, comm,
           scheduler_state_name((int)t->state), (unsigned long)t->parent_id,
           (unsigned long)t->process_group_id, (unsigned long)t->session_id,
-          t->priority, (unsigned long)vsz, (unsigned long)(vsz / 4096));
+          (unsigned long)task_utime(t), (unsigned long)task_stime(t),
+          (unsigned long)task_cutime(t), (unsigned long)task_cstime(t),
+          t->priority, nthreads, (unsigned long)task_start_ticks(t),
+          (unsigned long)vsz, (unsigned long)(vsz / 4096));
   return 0;
 }
 
@@ -786,6 +806,9 @@ static int r_pid_statm(usize pid, struct sbuf *s) {
           resident++;
     }
   }
+  /* The walk above already measured the resident set, so let the peak tracker
+   * see it too (M86) — a `ps`/`top` poll then also refreshes ru_maxrss. */
+  task_rss_sample(t, 0);
   sb_addf(s, "%lu %lu %lu %lu 0 %lu 0\n", size, resident, shared, text, data);
   return 0;
 }

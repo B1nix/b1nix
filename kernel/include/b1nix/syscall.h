@@ -238,6 +238,13 @@ enum {
 	SYS_FLOCK            = 240, /* flock(fd, operation) — whole-file advisory lock */
 	SYS_CLOCK_GETRES     = 241, /* clock_getres(clk_id, res) */
 	SYS_SIGTIMEDWAIT     = 242, /* sigtimedwait(set, info, timeout) */
+
+	/* M86: thread-directed signals. kill(2) targets a process and the kernel
+	 * picks the thread; these two name the thread. tgkill additionally checks
+	 * that the tid still belongs to the expected thread group, which is what
+	 * makes signalling a thread safe against tid reuse. */
+	SYS_TKILL            = 243, /* tkill(tid, sig) */
+	SYS_TGKILL           = 244, /* tgkill(tgid, tid, sig) */
 };
 
 /* Aliases: linux_abi.c references these generic names; map to the versioned ones. */
