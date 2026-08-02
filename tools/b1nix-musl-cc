@@ -43,7 +43,7 @@ CLANG_RES_DIR="$(clang -print-resource-dir 2>/dev/null || true)"
 MUSL_RES_INC=""
 [ -n "$CLANG_RES_DIR" ] && MUSL_RES_INC="-isystem $CLANG_RES_DIR/include"
 
-MUSL_CFLAGS="--target=$B1NIX_TRIPLET -ffreestanding -nostdinc -fno-builtin -fno-stack-protector -msoft-float -mno-implicit-float -O2 -Wall -I$MUSL_INCLUDE $MUSL_RES_INC -D__linux__ -D__b1nix__ -Db1nix"
+MUSL_CFLAGS="--target=$B1NIX_TRIPLET -ffreestanding -nostdinc -fno-builtin -fno-stack-protector -msoft-float -mno-implicit-float -O2 -Wall -I$MUSL_INCLUDE $MUSL_RES_INC -D__linux__ -D__linux -D__unix__ -D_GNU_SOURCE -D_LARGEFILE64_SOURCE -D__b1nix__ -Db1nix"
 
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"

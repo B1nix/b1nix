@@ -176,6 +176,10 @@ void paging_switch_address_space(u64 pml4_phys);
  * or 0 if the page is not present. Used to measure a task's real resident set
  * (/proc/<pid>/statm) without touching the current address space. */
 u64 paging_user_frame(u64 pml4_phys, u64 vaddr);
+/* Physical address backing a user VA, resolving huge (1 GiB / 2 MiB) mappings
+ * too. Readers of another task's memory must use this rather than
+ * paging_user_frame, which reports a huge-mapped address as absent. */
+u64 paging_user_phys(u64 pml4_phys, u64 vaddr);
 
 // Demand Paging / Swap
 void vmm_set_lazy(u64 virtual_address);

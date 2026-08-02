@@ -469,6 +469,14 @@ u32 lapic_ticks_per_ms(void) {
 extern u8 inb(u16 port);
 extern void outb(u16 port, u8 value);
 
+/* Timestamp counter. Serialised on both ends of the calibration window so the
+ * two reads bracket exactly the interval the PIT measured. */
+static inline u64 arch_rdtsc(void) {
+    u32 lo, hi;
+    __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
+
 static void apic_timer_calibrate_against_pit(void) {
     /* 1) Quiesce: disable speaker, disable gate. */
     u8 gate = inb(PIT2_GATE);
@@ -492,12 +500,14 @@ static void apic_timer_calibrate_against_pit(void) {
      *    Setting INITCNT and the gate back-to-back keeps the window tight. */
     outb(PIT2_GATE, (u8)((gate & ~0x02) | 0x01));
     lapic_write(LAPIC_TIMER_INITCNT, 0xFFFFFFFFU);
+    u64 tsc_start = arch_rdtsc();
 
     /* 6) Wait for PIT2 OUT to go high (count reached zero). */
     while ((inb(PIT2_GATE) & 0x20) == 0)
         __asm__ volatile("pause");
 
-    /* 7) Snapshot LAPIC remaining count, then mask the timer. */
+    /* 7) Snapshot LAPIC remaining count and the TSC, then mask the timer. */
+    u64 tsc_end = arch_rdtsc();
     u32 end = lapic_read(LAPIC_TIMER_CURCNT);
     lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
     /* Restore PIT2 gate to whatever it was (speaker off either way). */
@@ -507,6 +517,17 @@ static void apic_timer_calibrate_against_pit(void) {
      *    (max - end) / 10 — divide-by-16 already applied at LVT level. */
     u32 elapsed = 0xFFFFFFFFU - end;
     g_lapic_ticks_per_ms = elapsed / 10U;
+
+    /* The same 10 ms window measures the CPU's own clock: the TSC advances at
+     * a fixed rate on every CPU b1nix runs on (constant_tsc), so ticks/10 ms
+     * scaled to kHz IS the processor frequency. This is what /proc/cpuinfo's
+     * "cpu MHz" and /sys/.../cpufreq report; without it the only honest answer
+     * was to publish nothing at all. */
+    {
+        u64 tsc_elapsed = (tsc_end > tsc_start) ? (tsc_end - tsc_start) : 0;
+        if (tsc_elapsed)
+            arch_set_cpu_khz(tsc_elapsed / 10U); /* ticks per 10 ms -> kHz */
+    }
 
     console_write("lapic: calibrated against PIT: ");
     console_write_dec(g_lapic_ticks_per_ms);

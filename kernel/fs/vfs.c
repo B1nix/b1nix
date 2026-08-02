@@ -921,10 +921,20 @@ int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
 
 /* ── Node/Inode allocation ── */
 
+/* Filesystem id of the mount currently being set up, or 0. A filesystem builds
+ * its whole tree inside its mount callback — before vfs_mount can stamp the
+ * root it has not returned yet — so every inode created in that window would
+ * otherwise carry fs_id 0. That id is not cosmetic: the page cache keys pages
+ * by (fs_id, ino), so two filesystems whose nodes both carry 0 and reuse the
+ * same on-disk inode number share cache entries, and one mount reads the
+ * other's data. Publishing the id before the callback runs closes that. */
+static u32 g_mounting_fs_id;
+
 static struct vfs_inode *alloc_inode(void) {
   struct vfs_inode *inode = vfs_alloc_inode();
   if (inode) {
     inode->refcount = 0;
+    inode->fs_id = g_mounting_fs_id;
   }
   return inode;
 }
@@ -1629,9 +1639,40 @@ struct vfs_node *vfs_create_node(enum vfs_node_type type) {
   return n;
 }
 
+/* st_dev of the filesystem this node belongs to. A filesystem that builds its
+ * whole tree inside its mount callback does so before vfs_mount can stamp the
+ * root (the root node does not exist until the callback returns), so nodes
+ * created then carry 0. Resolve it by walking up to the first ancestor that has
+ * one — the mount root — and cache it on the way. Without this a file on such a
+ * filesystem reports st_dev 0, and /proc/<pid>/maps calls its mapping
+ * anonymous. */
+u32 vfs_node_dev(struct vfs_node *node) {
+  if (!node || !node->inode)
+    return 0;
+  if (node->inode->dev)
+    return node->inode->dev;
+  struct vfs_node *p = node->parent;
+  for (int depth = 0; p && depth < 64; depth++) {
+    if (p->inode && p->inode->dev) {
+      node->inode->dev = p->inode->dev;
+      return node->inode->dev;
+    }
+    p = p->parent;
+  }
+  return 0;
+}
+
 void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child) {
   if (!parent || !child)
     return;
+  /* st_dev is a property of the filesystem, not of the individual file, so a
+   * node inherits it from the directory it is attached to. Doing it here covers
+   * every filesystem at once: each one used to have to remember, and the ones
+   * that forgot handed out files with st_dev 0 — which a reader of
+   * /proc/<pid>/maps treats as "anonymous memory, no backing file". A node that
+   * already carries its own id (devpts) keeps it. */
+  if (child->inode && parent->inode && !child->inode->dev)
+    child->inode->dev = parent->inode->dev;
   u64 flags;
   vfs_tree_write_acquire(&flags);
   child->next_sibling = parent->first_child;
@@ -2068,6 +2109,7 @@ static int devpts_lookup(struct vfs_node *dir, const char *name) {
   n->inode->uid = ROOT_UID;
   n->inode->gid = 5; /* tty */
   n->inode->fs_id = DEVPTS_FSID;
+  n->inode->dev = DEVPTS_FSID; /* stat() and ttyname() must agree on st_dev */
   n->inode->ino = devpts_ino(idx);
   n->inode->data = (void *)(usize)(((u64)136 << 8) | (u64)idx); /* pts rdev */
   n->parent = dir;
@@ -2100,6 +2142,7 @@ void vfs_init(void) {
   root_node->inode->atime = root_node->inode->mtime = root_node->inode->ctime =
       vfs_get_unix_time();
   root_node->inode->fs_id = 1;
+  root_node->inode->dev = 1; /* anonymous device for the initial RAM root */
   next_fs_id = 2;
 
   add_node("/dev", VFS_DIRECTORY, 0, 0, 0);
@@ -3428,7 +3471,9 @@ static int vfs_stat_node(struct vfs_node *node, struct b1nix_stat *st) {
   st->st_mtim.tv_sec = inode->mtime;
   st->st_ctim.tv_sec = inode->ctime;
 
-  st->st_dev = inode->fs_id;
+  /* vfs_node_dev, not a raw field read: a filesystem that populated its tree
+   * inside its own mount callback left these nodes unstamped. */
+  st->st_dev = vfs_node_dev(node);
   if (inode->type == VFS_DEVICE) {
     st->st_rdev = (u64)inode->data;
   }
@@ -4232,7 +4277,14 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
   currently_mounting = &mounts[midx];
+  u32 new_fs_id;
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  new_fs_id = next_fs_id++;
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  g_mounting_fs_id = new_fs_id;
   struct vfs_node *root_node = fs->mount(source, flags, (void *)target);
+  g_mounting_fs_id = 0;
   currently_mounting = NULL;
 
   if (IS_ERR(root_node)) {
@@ -4244,7 +4296,21 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
   mounts[midx].root_node = root_node;
-  root_node->inode->fs_id = next_fs_id++;
+  /* st_dev for everything on this mount. A filesystem mounted from a block
+   * device reports that device's number, so tools that map a file back to its
+   * disk (and /proc/<pid>/maps' dev column) name the real thing. A pseudo or
+   * RAM filesystem has no device, so it gets an anonymous number — major 0 with
+   * a unique minor — exactly as Linux does for tmpfs and friends. */
+  root_node->inode->fs_id = new_fs_id; /* keys the inode cache: per-mount */
+  {
+    /* st_dev: the block device this filesystem was mounted from, or an
+     * anonymous number (major 0, unique minor) for a pseudo/RAM filesystem —
+     * the same distinction Linux makes for tmpfs. */
+    static u32 next_anon_minor = 1;
+    struct block_device *bdev = source ? blk_get(source) : 0;
+    u32 devno = bdev ? blk_devno(bdev) : 0;
+    root_node->inode->dev = devno ? devno : (next_anon_minor++ & 0xFFu);
+  }
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
   return 0;

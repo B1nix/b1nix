@@ -617,12 +617,60 @@ Status:
 
 ## M79: Audio Stack
 
-- [ ] `planned` Audio subsystem with HDA/AC'97 driver, mixer, and ALSA-compatible userspace shim.
+- [x] Audio subsystem with HDA/AC'97 driver, mixer, and ALSA-compatible userspace shim.
 
 ## M80: Kernel ptrace + Crash Capture
 
 - [x] Implement `ptrace(2)` and register/memory reading (`PTRACE_PEEKTEXT`, `PTRACE_GETREGS`, etc.).
-- [ ] `planned` `/proc/<pid>/task` and crashpad integration.
+- [x] `PTRACE_GETREGSET`/`SETREGSET` (NT_PRSTATUS/NT_PRFPREG), `GETFPREGS`/`SETFPREGS`,
+      `GETSIGINFO`, `SEIZE`/`INTERRUPT`; a tracer now also gets first refusal on a
+      fatal fault, so a traced crash stops instead of dying.
+- [x] `/proc/<pid>/task/<tid>/` (status, stat, comm, maps, statm), `/proc/<pid>/auxv`,
+      `/proc/<pid>/mem`, plus Tgid/Threads/TracerPid in status and direct `/proc/<pid>` lookup.
+- [x] Crash capture: the fault handler records signal/address/si_code, surfaced through
+      SA_SIGINFO `si_addr` and `PTRACE_GETSIGINFO`; `prctl(PR_SET_PTRACER)` and
+      `/proc/sys/kernel/yama/ptrace_scope` gate who may attach. Proven end to end by
+      `userspace/bin/m80_smoke.c`, which runs the crashpad handshake (crashing client →
+      handler over a socket → attach → enumerate threads → dump).
+- [x] `PTRACE_SETOPTIONS` with the fork/vfork/clone/exec events + `PTRACE_GETEVENTMSG`
+      (a traced child is attached and stopped before it runs), `PTRACE_LISTEN`,
+      `PTRACE_O_EXITKILL`, `NT_X86_XSTATE`, `process_vm_readv/writev` and `SO_PEERCRED`.
+      (`PTRACE_O_TRACEEXIT` and `TRACESYSGOOD` followed in the next item.)
+- [x] `PTRACE_SYSCALL` entry/exit stops (`PTRACE_O_TRACESYSGOOD`, and a tracer-written
+      return value reaches userspace), `PTRACE_O_TRACEEXIT`, and a tracee that stops
+      for signals its own process ignores — the remaining ptrace(2) gaps.
+- [x] Real XSAVE in the context switch: AVX (YMM) state now survives a switch, and
+      `NT_X86_XSTATE` reports the area the kernel actually manages. Capped at
+      x87|SSE|AVX; a CPU needing a larger area stays on FXSAVE rather than losing state.
+- [x] **Upstream Crashpad ported and running** (`tools/ports/build-crashpad.sh`):
+      `/bin/crashpad_handler` attaches to a crashing process and writes a real
+      minidump. Getting there closed six more ABI gaps: `SOCK_SEQPACKET` on AF_UNIX,
+      `SO_PASSCRED`/`SO_PEERCRED`, a tracer's `waitpid` seeing ptrace stops without
+      WUNTRACED, Linux-shaped `Uid/Gid/Groups` lines in `/proc/<pid>/status`, an
+      ordered `/proc/<pid>/maps` that names the executable's and interpreter's own
+      mappings, and reading pages the 4 KiB-only page walk could not see.
+      Proven by `userspace/bin/crashpad_smoke.cpp` (CRASHPAD-SMOKE markers).
+- [x] CPU clock measured against the PIT during LAPIC calibration and published in
+      `/proc/cpuinfo` (`cpu MHz`) and `/sys/devices/system/cpu/cpuN/cpufreq/*`. The
+      files exist only once the clock has actually been measured.
+- [x] Crashpad builds from **unpatched upstream sources**: the platform defines live
+      in the b1nix toolchain wrapper and the UAPI headers (`linux/`, `asm/`,
+      `sys/cdefs.h`) are staged into the cross sysroot — a linux-headers package, not
+      a per-port shim. The only build flags are the ones an APKBUILD would carry.
+      Every mapping also reports the device it lives on: a filesystem now carries a
+      real st_dev (the block device's number, or an anonymous one for a RAM/pseudo
+      filesystem), kept separate from the per-mount id that keys the inode cache.
+      Chasing that separation also found a page-cache aliasing bug: a filesystem
+      builds its tree inside its own mount callback, so every inode created there
+      carried fs_id 0 — and the page cache, keyed by (fs_id, ino), then shared
+      entries between two filesystems that reuse the same on-disk inode number.
+      One mount read the other's file contents (M14 block-cache). The mount id is
+      now published before the callback runs.
+      Closing the last of its complaints fixed three more kernel defects: huge-page
+      mappings were invisible to every reader of another task's memory
+      (`paging_user_phys`), `/proc/<pid>/maps` reported file offset 0 for every
+      segment (so each looked like a module start), and file-backed mappings had no
+      inode (so a reader treated them as anonymous).
 
 ## M81: Chromium GPU Acceleration
 

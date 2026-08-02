@@ -238,6 +238,8 @@ BINARIES += $(BUILD)/bin/m75_smoke
 BINARIES += $(BUILD)/bin/m73_smoke
 # M104: OpenPAM smoke — links libpam.so.2 (tools/ports/build-openpam.sh)
 BINARIES += $(BUILD)/bin/m104_pam_smoke
+# M80: ptrace register sets, /proc/<pid>/task|auxv|mem, crash capture.
+BINARIES += $(BUILD)/bin/m80_smoke
 # M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
 BINARIES += $(BUILD)/bin/m98_smoke
 BINARIES += $(BUILD)/bin/m63_smoke

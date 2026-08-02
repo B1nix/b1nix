@@ -330,6 +330,12 @@ void task_set_alarm_ticks(struct task *t, u64 ticks);
 u64  task_alarm_interval_ticks(const struct task *t);
 void task_set_alarm_interval_ticks(struct task *t, u64 ticks);
 usize task_tgid(const struct task *t);
+/* M80: per-task XSAVE area (0 when the task keeps to the FXSAVE image in
+ * struct task). task_fpu_alloc ensures one exists before a task runs userspace
+ * code; it returns 0 when XSAVE is unavailable or memory is short, and the task
+ * then keeps working with x87+SSE only. */
+void *task_xsave_area(const struct task *t);
+int task_fpu_alloc(struct task *t);
 u64  task_utime(const struct task *t);
 u64  task_stime(const struct task *t);
 u64  task_cutime(const struct task *t);

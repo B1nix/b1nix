@@ -121,6 +121,102 @@ void x86_syscall_init(void) {
   __asm__ volatile("wrmsr" : : "a"(0x200), "d"(0), "c"(0xC0000084));
 }
 
+/* ── XSAVE / AVX (M80) ───────────────────────────────────────────────────────
+ * With FXSAVE alone the kernel saved x87+SSE and silently dropped everything
+ * above it, so a userspace thread's AVX (YMM upper halves) was clobbered by any
+ * context switch. Enabling XSAVE with an explicitly chosen XCR0 fixes that and
+ * makes the state the kernel manages self-describing — which is also what
+ * ptrace's NT_X86_XSTATE reports. The feature set is deliberately capped at
+ * x87|SSE|AVX: it keeps the per-task area at a fixed, modest size and covers
+ * everything the userspace toolchain emits. */
+#define XCR0_X87 0x1
+#define XCR0_SSE 0x2
+#define XCR0_AVX 0x4
+
+static int g_xsave_enabled;
+static u64 g_xsave_mask;
+static u32 g_xsave_size;
+
+int arch_xsave_enabled(void) { return g_xsave_enabled; }
+u64 arch_xsave_mask(void) { return g_xsave_mask; }
+usize arch_xsave_area_size(void) { return (usize)g_xsave_size; }
+
+static void cpuid_count(u32 leaf, u32 sub, u32 *a, u32 *b, u32 *c, u32 *d) {
+  __asm__ volatile("cpuid"
+                   : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d)
+                   : "a"(leaf), "c"(sub));
+}
+
+/* Measured processor frequency in kHz (0 = never measured). Written once by the
+ * PIT calibration in lapic.c, read by /proc/cpuinfo and the sysfs cpufreq
+ * files. */
+static u32 g_cpu_khz;
+
+void arch_set_cpu_khz(u32 khz) {
+  /* Ignore an implausible measurement rather than publishing it: a value from
+   * a window the hypervisor stretched is worse than no value. */
+  if (khz >= 100000u && khz <= 20000000u)
+    g_cpu_khz = khz;
+}
+
+u32 arch_cpu_khz(void) { return g_cpu_khz; }
+
+/* The processor's nominal maximum, from CPUID leaf 16h when the CPU publishes
+ * it (EBX = max frequency in MHz). Falls back to the measured rate. */
+u32 arch_cpu_max_khz(void) {
+  u32 a, b, c, d;
+  cpuid_count(0, 0, &a, &b, &c, &d);
+  if (a >= 0x16) {
+    cpuid_count(0x16, 0, &a, &b, &c, &d);
+    if (b)
+      return b * 1000u;
+  }
+  return g_cpu_khz;
+}
+
+static void x86_enable_xsave(void) {
+  u32 a, b, c, d;
+  cpuid_count(1, 0, &a, &b, &c, &d);
+  int has_xsave = (c & (1u << 26)) != 0;
+  int has_avx = (c & (1u << 28)) != 0;
+  if (!has_xsave)
+    return; /* stay on FXSAVE: every save path falls back on its own */
+
+  u64 cr4;
+  __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+  cr4 |= (1ULL << 18); /* OSXSAVE — required before XGETBV/XSETBV */
+  __asm__ volatile("movq %0, %%cr4" : : "r"(cr4) : "memory");
+
+  /* Which components this CPU can be asked to manage comes from
+   * CPUID.(EAX=0Dh,ECX=0):EDX:EAX — NOT from XGETBV, which merely reads back
+   * the XCR0 the OS has already set (0x1 right after reset). Reading the wrong
+   * one caps the mask at x87, and a later XRSTOR of an area that legitimately
+   * declares SSE then #GPs. */
+  cpuid_count(0x0D, 0, &a, &b, &c, &d);
+  u64 supported = ((u64)d << 32) | a;
+  u64 want = XCR0_X87 | XCR0_SSE;
+  if (has_avx && (supported & XCR0_AVX))
+    want |= XCR0_AVX;
+  want &= supported;
+  if ((want & (XCR0_X87 | XCR0_SSE)) != (XCR0_X87 | XCR0_SSE))
+    return; /* x87+SSE is the floor; without both, stay on FXSAVE */
+
+  __asm__ volatile("xsetbv" : : "a"((u32)want), "d"((u32)(want >> 32)), "c"(0));
+
+  /* CPUID.(EAX=0Dh,ECX=0):EBX is the area size for the components currently
+   * enabled in XCR0, which is exactly what was just written. */
+  cpuid_count(0x0D, 0, &a, &b, &c, &d);
+  u32 size = b;
+  if (size < 576)
+    size = 576; /* legacy region + XSAVE header, the minimum a CPU may report */
+  if (size > ARCH_XSAVE_MAX_SIZE)
+    return; /* larger than the per-task area the scheduler reserves: stay on FXSAVE */
+
+  g_xsave_mask = want;
+  g_xsave_size = size;
+  g_xsave_enabled = 1;
+}
+
 static void x86_enable_sse(void) {
   u64 cr0;
   __asm__ volatile("movq %%cr0, %0" : "=r"(cr0));
@@ -134,6 +230,10 @@ static void x86_enable_sse(void) {
   cr4 |= (1ULL << 9);  // Set OSFXSR (FXSAVE/FXRSTOR Support)
   cr4 |= (1ULL << 10); // Set OSXMMEXCPT (SIMD Exception Support)
   __asm__ volatile("movq %0, %%cr4" : : "r"(cr4) : "memory");
+
+  /* Per-CPU: every core must have OSXSAVE and the same XCR0, or a task moved
+   * to another core would xrstor a state that core does not manage. */
+  x86_enable_xsave();
 }
 
 void arch_init(void) {

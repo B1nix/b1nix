@@ -15,6 +15,7 @@
 #include <b1nix/posix.h>
 #include <b1nix/procfs.h>
 #include <b1nix/sched.h>
+#include <b1nix/arch.h>
 #include <b1nix/vfs.h>
 #include <b1nix/version.h>
 #include <stdarg.h>
@@ -258,6 +259,30 @@ static int g_kversion(char *b, usize c) {
   return snprintf(b, c, "#1 SMP b1nix\n");
 }
 
+/* cpufreq: the measured processor clock, in kHz, the unit every reader of these
+ * files expects. b1nix does not scale frequency, so the current, minimum and
+ * maximum are the same measured value — except cpuinfo_max_freq, which prefers
+ * the CPU's own nominal maximum when CPUID publishes one. A CPU whose clock was
+ * never measured gets no cpufreq directory at all rather than a made-up number. */
+static int g_cpu_cur_freq(char *b, usize c) {
+  return snprintf(b, c, "%lu\n", (unsigned long)arch_cpu_khz());
+}
+
+static int g_cpu_max_freq(char *b, usize c) {
+  u32 khz = arch_cpu_max_khz();
+  return snprintf(b, c, "%lu\n",
+                  (unsigned long)(khz ? khz : arch_cpu_khz()));
+}
+
+static int g_cpu_min_freq(char *b, usize c) {
+  return snprintf(b, c, "%lu\n", (unsigned long)arch_cpu_khz());
+}
+
+static int g_cpu_governor(char *b, usize c) {
+  /* No frequency scaling: the clock is whatever the hardware runs at. */
+  return snprintf(b, c, "performance\n");
+}
+
 static int g_cpu_range(char *b, usize c) {
   int n = (g_max_cpus > 0) ? g_max_cpus : 1;
   if (n == 1)
@@ -364,6 +389,30 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
   sysfs_mkchild(cpu, "possible", VFS_DEVICE, g_cpu_range);
   sysfs_mkchild(cpu, "online", VFS_DEVICE, g_cpu_range);
   sysfs_mkchild(cpu, "present", VFS_DEVICE, g_cpu_range);
+
+  /* Per-CPU clock under /sys/devices/system/cpu/cpuN/cpufreq. Crash
+   * reporters and monitoring tools read these; they exist only once the clock
+   * has actually been measured. */
+  if (arch_cpu_khz()) {
+    int ncpu = (g_max_cpus > 0) ? g_max_cpus : 1;
+    for (int i = 0; i < ncpu; i++) {
+      char name[16];
+      snprintf(name, sizeof(name), "cpu%d", i);
+      struct vfs_node *cn = sysfs_mkchild(cpu, name, VFS_DIRECTORY, 0);
+      if (!cn)
+        continue;
+      struct vfs_node *cf = sysfs_mkchild(cn, "cpufreq", VFS_DIRECTORY, 0);
+      if (!cf)
+        continue;
+      sysfs_mkchild(cf, "scaling_cur_freq", VFS_DEVICE, g_cpu_cur_freq);
+      sysfs_mkchild(cf, "scaling_max_freq", VFS_DEVICE, g_cpu_max_freq);
+      sysfs_mkchild(cf, "scaling_min_freq", VFS_DEVICE, g_cpu_min_freq);
+      sysfs_mkchild(cf, "cpuinfo_cur_freq", VFS_DEVICE, g_cpu_cur_freq);
+      sysfs_mkchild(cf, "cpuinfo_max_freq", VFS_DEVICE, g_cpu_max_freq);
+      sysfs_mkchild(cf, "cpuinfo_min_freq", VFS_DEVICE, g_cpu_min_freq);
+      sysfs_mkchild(cf, "scaling_governor", VFS_DEVICE, g_cpu_governor);
+    }
+  }
 
   struct vfs_node *mem = sysfs_mkchild(root, "memory", VFS_DIRECTORY, 0);
   sysfs_mkchild(mem, "total_kb", VFS_DEVICE, g_memtotal);

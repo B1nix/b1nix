@@ -75,4 +75,29 @@ static inline void interrupts_restore(u64 f) {
 #endif
 }
 
+
+/* ── FPU / XSAVE state management (M80) ──────────────────────────────────────
+ * The kernel saves userspace FPU state on every context switch. With XSAVE
+ * available it saves x87+SSE+AVX into a per-task area of arch_xsave_area_size()
+ * bytes; without it, the 512-byte FXSAVE area in struct task. ARCH_XSAVE_MAX_SIZE
+ * bounds what the scheduler is willing to reserve per task — a CPU that would
+ * need more simply stays on FXSAVE rather than silently losing state. */
+#define ARCH_XSAVE_MAX_SIZE 1088
+
+void arch_fpu_save(void *area);
+void arch_fpu_restore(void *area);
+void arch_fpu_capture_clean(void *area);
+void arch_xsave(void *area, u64 mask);
+void arch_xrstor(void *area, u64 mask);
+void arch_xsave_capture_clean(void *area, u64 mask);
+/* Processor clock, measured against the PIT during LAPIC calibration. 0 means
+ * it was never measured (nothing is reported rather than guessed). */
+void arch_set_cpu_khz(u32 khz);
+u32 arch_cpu_khz(void);
+u32 arch_cpu_max_khz(void);
+
+int arch_xsave_enabled(void);
+u64 arch_xsave_mask(void);
+usize arch_xsave_area_size(void);
+
 #endif

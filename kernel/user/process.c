@@ -5,6 +5,7 @@
 #include <b1nix/linux_abi.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
+#include <b1nix/ptrace.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
@@ -431,6 +432,7 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
    * — read forwards from the low end, where getauxval() starts after the envp
    * NULL — each entry appears in the ABI's {a_type, a_val} order and AT_NULL
    * terminates the array at the high end. */
+  usize auxv_end_sp = sp; /* high end of the auxv block, for /proc/<pid>/auxv */
   if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL  a_val */
   if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL  a_type */
   if (user_stack_push_usize(stack, &sp, (usize)image->phdr_vaddr) < 0) return -1;
@@ -476,6 +478,11 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
    * earlier (before alignment); just push the pointer and type here. */
   if (user_stack_push_usize(stack, &sp, execfn_va) < 0) return -1;
   if (user_stack_push_usize(stack, &sp, AT_EXECFN) < 0) return -1;
+
+  /* The auxv block now spans [sp, auxv_end_sp) in this staging buffer; record
+   * the equivalent user VA + length so /proc/<pid>/auxv can read it back. */
+  image->auxv_vaddr = USER_STACK_TOP - USER_STACK_SIZE + sp;
+  image->auxv_size = (u32)(auxv_end_sp - sp);
 
   if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
   for (int i = envc - 1; i >= 0; i--) {
@@ -867,6 +874,13 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     }
     image->app_entry = image->entry;
     image->interp_base = USER_LDSO_LOAD_BASE;
+    {
+      usize il = strlen(interp);
+      if (il >= sizeof(image->interp_path))
+        il = sizeof(image->interp_path) - 1;
+      memcpy(image->interp_path, interp, il);
+      image->interp_path[il] = '\0';
+    }
     image->entry = interp_entry;
     snprintf(line, sizeof(line), "ELF load: PT_INTERP=%s (userspace ld.so, base=0x%lx)\n",
              interp, (unsigned long)USER_LDSO_LOAD_BASE);
@@ -1852,6 +1866,10 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     if (current_task) {
       arch_fpu_save(current_task->fpu_state);
       current_task->fpu_initialized = 1;
+      /* M80: this task is about to run userspace code, which may use AVX —
+       * give it an XSAVE area so the upper YMM halves survive a context
+       * switch. Seeded from the clean FXSAVE image just captured. */
+      task_fpu_alloc(current_task);
     }
   }
 
@@ -2101,6 +2119,10 @@ resolve:
   /* The new image is committed: from here on, a parent's setpgid() on this
    * (child) task must fail with EACCES (POSIX). */
   scheduler_mark_execed_current();
+  /* M80: PTRACE_O_TRACEEXEC — report the exec to the tracer. The stop happens
+   * when the new image first returns to ring 3, i.e. before its entry point
+   * runs, which is where a debugger expects to regain control. */
+  ptrace_event_exec(current_task);
   task_set_tls_base(current_task, 0);
   {
     extern void arch_set_fs_base(u64 base);

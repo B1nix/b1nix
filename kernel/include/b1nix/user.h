@@ -143,6 +143,16 @@ struct user_loaded_image {
 	 * app_entry preserves the executable's own entry point for AT_ENTRY. */
 	u64 app_entry;
 	u64 interp_base;
+	/* M80: where the auxiliary vector ended up on the initial user stack, so
+	 * /proc/<pid>/auxv can read it back out of the process's own address space
+	 * (a crash reporter reads AT_PHDR/AT_ENTRY/AT_BASE from there to locate the
+	 * executable and its interpreter). 0 = not populated. */
+	u64 auxv_vaddr;
+	u32 auxv_size;
+	/* Path of the ELF interpreter this image runs under (empty when it has
+	 * none). /proc/<pid>/maps names the interpreter's mappings with it, which is
+	 * how a reader tells ld.so's text from the executable's. */
+	char interp_path[64];
 };
 
 void userspace_init(void);

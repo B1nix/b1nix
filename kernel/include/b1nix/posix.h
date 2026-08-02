@@ -56,6 +56,9 @@
 
 #define B1NIX_SOCK_STREAM 1
 #define B1NIX_SOCK_DGRAM 2
+/* SOCK_SEQPACKET: connection-oriented like SOCK_STREAM, but message boundaries
+ * are preserved like SOCK_DGRAM. Crashpad's handler protocol is built on it. */
+#define B1NIX_SOCK_SEQPACKET 5
 #define B1NIX_SOCK_RAW 3
 
 /* Mount flags */

@@ -1564,6 +1564,17 @@ static u64 sigsuspend_with_mask(u64 mask) {
           __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
         } else if (handler == SIG_DFL &&
                    (i == SIGSTOP || i == SIGTSTP ||
+                    i == SIGTTIN || i == SIGTTOU) &&
+                   ptrace_is_traced(current_task)) {
+          /* A traced task must stop through ptrace, not here: stopping it in
+           * the middle of sigsuspend/pause leaves its tracer with a task in
+           * TASK_STOPPED that ptrace never parked, so every PTRACE_GETREGS
+           * against it fails with ESRCH. Leave the signal pending and end the
+           * wait — the syscall-return path (arch_check_and_deliver_signals)
+           * parks it with a complete ring-3 register frame. */
+          has_deliverable = 1;
+        } else if (handler == SIG_DFL &&
+                   (i == SIGSTOP || i == SIGTSTP ||
                     i == SIGTTIN || i == SIGTTOU)) {
           current_task->state = TASK_STOPPED;
           current_task->last_stop_signal = i;
@@ -2875,9 +2886,20 @@ static u64 sys_listen(int fd, int backlog) {
  * b1nix SIGTTIN (17) where it expected Linux SIGTTIN (21). */
 static int wait_status_to_linux(int kstatus) {
   if ((kstatus & 0xff) == 0x7f && kstatus != 0xffff) {
-    int linux_sig = b1nix_signo_to_linux((kstatus >> 8) & 0xff);
+    /* A syscall trace stop reports SIGTRAP|0x80 (PTRACE_O_TRACESYSGOOD); bit 7
+     * is a marker, not part of the signal number, so it is set aside across the
+     * remap and put back afterwards. */
+    int raw = (kstatus >> 8) & 0xff;
+    int sysgood = raw & 0x80;
+    int linux_sig = b1nix_signo_to_linux(raw & 0x7f);
     if (linux_sig > 0)
-      return (linux_sig << 8) | 0x7f;
+      linux_sig |= sysgood;
+    /* Bits 16-23 carry the ptrace event code (SIGTRAP | event << 8 sits in the
+     * high half of a stopped status). Only the signal number is remapped —
+     * dropping the event byte would make every PTRACE_EVENT_* stop look like a
+     * plain SIGTRAP to a Linux-personality tracer. */
+    if (linux_sig > 0)
+      return (kstatus & 0x00ff0000) | (linux_sig << 8) | 0x7f;
   } else if ((kstatus & 0x7f) != 0 && kstatus != 0xffff) {
     int linux_sig = b1nix_signo_to_linux(kstatus & 0x7f);
     if (linux_sig > 0)
@@ -3640,6 +3662,22 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 
 u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                      u64 arg4, u64 arg5, struct interrupt_frame *frame) {
+  /* M80: PTRACE_SYSCALL entry stop. The plain-load ptrace_any_traced() gate
+   * keeps an untraced system at one memory read per syscall. A tracer that
+   * rewrites registers during the stop is obeyed: the number and arguments are
+   * re-read from the frame afterwards, which is what makes syscall
+   * interception (strace -e inject, seccomp-style rewrites) actually work. */
+  if (frame && current_task && ptrace_any_traced()) {
+    ptrace_syscall_stop(current_task, frame, 0);
+    number = frame->rax;
+    arg0 = frame->rdi;
+    arg1 = frame->rsi;
+    arg2 = frame->rdx;
+    arg3 = frame->r10;
+    arg4 = frame->r8;
+    arg5 = frame->r9;
+  }
+
   u64 ret = syscall_dispatch_impl_inner(number, arg0, arg1, arg2, arg3, arg4, arg5, frame);
 
   if (frame) {
@@ -3683,6 +3721,12 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     }
 
     frame->rax = ret;
+    /* PTRACE_SYSCALL exit stop: the tracer sees the return value in rax and may
+     * replace it before the task resumes. */
+    if (current_task && ptrace_any_traced()) {
+      ptrace_syscall_stop(current_task, frame, 1);
+      ret = frame->rax;
+    }
     arch_check_and_deliver_signals(frame);
     if (!user_frame_is_valid(frame)) {
       scheduler_exit_current(-SIGSEGV);
@@ -5697,6 +5741,77 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       /* ptrace(101)(request, pid, addr, data). A PEEK returns the word itself,
        * so it comes back through a separate out-parameter — the value is
        * indistinguishable from an error code otherwise. */
+      /* process_vm_readv(310) / process_vm_writev(311): move bytes between two
+       * processes' address spaces without stopping the target. A crash reporter
+       * reaches for these before falling back to /proc/<pid>/mem, so the same
+       * ptrace_may_access() check that guards attaching applies here. Partial
+       * progress is reported honestly: the return value is the byte count that
+       * actually moved. */
+      if (number == 310 || number == 311) {
+        int write = (number == 311);
+        usize target_pid = (usize)arg0;
+        const struct k_iovec_u {
+          u64 base;
+          u64 len;
+        } *lvec = (const void *)(usize)arg1;
+        usize liovcnt = (usize)arg2;
+        const struct k_iovec_u *rvec = (const void *)(usize)arg3;
+        usize riovcnt = (usize)arg4;
+        if (arg5 != 0) /* flags must be 0 */
+          return (u64)-EINVAL;
+        if (liovcnt > 1024 || riovcnt > 1024)
+          return (u64)-EINVAL;
+        struct task *target = scheduler_task_by_pid(target_pid);
+        if (!target)
+          return (u64)-ESRCH;
+        if (!ptrace_may_access(target))
+          return (u64)-EPERM;
+
+        usize moved = 0, li = 0, ri = 0;
+        u64 loff = 0, roff = 0;
+        struct k_iovec_u lcur = {0, 0}, rcur = {0, 0};
+        u8 buf[512];
+        while (li < liovcnt && ri < riovcnt) {
+          if (lcur.len == loff) {
+            if (syscall_copyin(&lcur, &lvec[li], sizeof(lcur)) < 0)
+              return moved ? (u64)moved : (u64)-EFAULT;
+            loff = 0;
+            if (lcur.len == 0) { li++; continue; }
+          }
+          if (rcur.len == roff) {
+            if (syscall_copyin(&rcur, &rvec[ri], sizeof(rcur)) < 0)
+              return moved ? (u64)moved : (u64)-EFAULT;
+            roff = 0;
+            if (rcur.len == 0) { ri++; continue; }
+          }
+          usize chunk = sizeof(buf);
+          if (chunk > lcur.len - loff) chunk = (usize)(lcur.len - loff);
+          if (chunk > rcur.len - roff) chunk = (usize)(rcur.len - roff);
+
+          isize rc;
+          if (write) {
+            if (syscall_copyin(buf, (const void *)(usize)(lcur.base + loff),
+                               chunk) < 0)
+              return moved ? (u64)moved : (u64)-EFAULT;
+            rc = ptrace_copy_to_task(target, rcur.base + roff, buf, chunk);
+          } else {
+            rc = ptrace_copy_from_task(target, rcur.base + roff, buf, chunk);
+            if (rc > 0 &&
+                syscall_copyout((void *)(usize)(lcur.base + loff), buf,
+                                (usize)rc) < 0)
+              return moved ? (u64)moved : (u64)-EFAULT;
+          }
+          if (rc <= 0)
+            return moved ? (u64)moved : (u64)rc;
+          moved += (usize)rc;
+          loff += (u64)rc;
+          roff += (u64)rc;
+          if (loff == lcur.len) { li++; loff = 0; lcur.len = 0; }
+          if (roff == rcur.len) { ri++; roff = 0; rcur.len = 0; }
+        }
+        return (u64)moved;
+      }
+
       if (number == 101) {
         u64 word = 0;
         isize rc = ptrace_request((long)arg0, (usize)arg1, arg2, arg3, &word);
@@ -6471,6 +6586,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)seccomp_set_no_new_privs();
     if (option == PR_GET_NO_NEW_PRIVS)
       return (u64)seccomp_get_no_new_privs();
+    /* PR_SET_PTRACER (Yama): nominate the process allowed to ptrace this one
+     * when /proc/sys/kernel/yama/ptrace_scope is 1. arg1 == 0 withdraws the
+     * declaration, PR_SET_PTRACER_ANY allows any process. This is how a crash
+     * handler that is not the crashing process's parent gets permission to
+     * attach after the fault. */
+    if (option == PR_SET_PTRACER) {
+      usize tracer = (arg1 == (u64)PR_SET_PTRACER_ANY) ? PTRACE_ANY_TRACER
+                                                       : (usize)arg1;
+      if (tracer != 0 && tracer != PTRACE_ANY_TRACER &&
+          !scheduler_task_by_pid(tracer))
+        return (u64)-EINVAL;
+      return (u64)ptrace_set_declared_tracer(current_task, tracer);
+    }
     return (u64)-EINVAL; /* other prctl options unsupported */
   }
   case SYS_MEM:

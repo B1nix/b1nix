@@ -1315,6 +1315,38 @@ u64 paging_user_frame(u64 pml4_phys, u64 vaddr) {
   return pte & 0x000FFFFFFFFFF000ULL;
 }
 
+/* Physical address backing `vaddr`, resolving 1 GiB and 2 MiB mappings as well
+ * as 4 KiB ones. paging_user_frame above answers only for a 4 KiB leaf and
+ * reports "not mapped" for a huge page — fine for callers that want to install
+ * a page, wrong for anyone reading memory: b1nix maps large runs with huge
+ * pages, so a reader built on the 4 KiB-only walk (ptrace PEEK,
+ * /proc/<pid>/mem, process_vm_readv) sees whole regions of a live process as
+ * absent. Returns 0 when nothing is mapped. */
+u64 paging_user_phys(u64 pml4_phys, u64 vaddr) {
+  u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE)
+                                       : (u64)(usize)kernel_pml4_virt);
+  u64 pml4e = pml4[pml4_index(vaddr)];
+  if (!(pml4e & VMM_PRESENT))
+    return 0;
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(vaddr)];
+  if (!(pdpte & VMM_PRESENT))
+    return 0;
+  if (pdpte & HUGE_PAGE_FLAG) /* 1 GiB page */
+    return (pdpte & 0x000FFFFFC0000000ULL) + (vaddr & 0x3FFFFFFFULL);
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(vaddr)];
+  if (!(pde & VMM_PRESENT))
+    return 0;
+  if (pde & HUGE_PAGE_FLAG) /* 2 MiB page */
+    return (pde & 0x000FFFFFFFE00000ULL) + (vaddr & 0x1FFFFFULL);
+  u64 *pt = table_from_entry(pde);
+  u64 pte = pt[pt_index(vaddr)];
+  if (!(pte & VMM_PRESENT))
+    return 0;
+  return (pte & 0x000FFFFFFFFFF000ULL) + (vaddr & 0xFFFULL);
+}
+
 void paging_dump_entries(u64 virtual_address) {
   u64 *pml4 = get_current_pml4();
   u64 pml4e = pml4[pml4_index(virtual_address)];

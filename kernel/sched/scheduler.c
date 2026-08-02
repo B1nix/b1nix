@@ -90,6 +90,69 @@ extern void arch_fpu_save(void *area);
 extern void arch_fpu_restore(void *area);
 extern void arch_fpu_capture_clean(void *area);
 
+/* M80: per-task XSAVE area (x87+SSE+AVX). Allocated lazily, the first time a
+ * task is about to run userspace code, and then CACHED ON THE SLOT: a slot is
+ * recycled by the next task that lands in it, so keeping the buffer costs one
+ * allocation per concurrently-live slot and removes any chance of freeing an
+ * area a context switch is still using. Kernel threads never touch the FPU and
+ * so never get one — they keep using the 512-byte FXSAVE area in struct task. */
+static void *g_task_xsave[MAX_TASKS];
+static void *g_task_xsave_raw[MAX_TASKS];
+
+static usize task_index(const struct task *task);
+
+/* Save/restore whichever representation this task uses. A task with an XSAVE
+ * area uses it exclusively; one without keeps to FXSAVE. The two never mix for
+ * a given task, because task_fpu_alloc seeds a fresh area from the task's
+ * existing FXSAVE image. */
+static void task_fpu_save(struct task *t) {
+  void *area = g_task_xsave[task_index(t)];
+  if (area)
+    arch_xsave(area, arch_xsave_mask());
+  else
+    arch_fpu_save(t->fpu_state);
+}
+
+static void task_fpu_restore(struct task *t) {
+  void *area = g_task_xsave[task_index(t)];
+  if (area)
+    arch_xrstor(area, arch_xsave_mask());
+  else
+    arch_fpu_restore(t->fpu_state);
+}
+
+void *task_xsave_area(const struct task *t) {
+  if (!t || !arch_xsave_enabled())
+    return 0;
+  return g_task_xsave[task_index(t)];
+}
+
+int task_fpu_alloc(struct task *t) {
+  if (!t || !arch_xsave_enabled())
+    return 0;
+  usize idx = task_index(t);
+  if (g_task_xsave[idx])
+    return 1;
+  usize size = arch_xsave_area_size();
+  void *raw = kzalloc(size + 64);
+  if (!raw)
+    return 0; /* stay on FXSAVE: correct, just without the AVX half */
+  usize aligned = ((usize)raw + 63) & ~(usize)63;
+  void *area = (void *)aligned;
+  memset(area, 0, size);
+  /* Seed the area from whatever FXSAVE image this task already carries (a
+   * fork inherits one), and declare x87+SSE present so xrstor loads it. The
+   * AVX half starts in its init state, which is what a fresh thread has. */
+  memcpy(area, t->fpu_state, 512);
+  u64 bv = arch_xsave_mask() & 0x3; /* x87+SSE seeded; AVX starts in init state */
+  memcpy((u8 *)area + 512, &bv, sizeof(bv));
+  u64 flags = interrupts_save();
+  g_task_xsave_raw[idx] = raw;
+  g_task_xsave[idx] = area;
+  interrupts_restore(flags);
+  return 1;
+}
+
 /* Canonical clean FXSAVE image, loaded into tasks that have never run. */
 static __attribute__((aligned(16))) u8 g_clean_fpu[512];
 static int g_clean_fpu_ready = 0;
@@ -1203,6 +1266,14 @@ int scheduler_fork_current(void) {
    * rather than a stale/zero one (see the exec-time flush in process.c). */
   arch_fpu_save(child->fpu_state);
   child->fpu_initialized = 1;
+  /* The child inherits the parent's full FPU state, AVX included: allocate its
+   * area (seeded from the FXSAVE image just taken) and refresh it from the live
+   * registers, which are still the parent's. */
+  if (task_fpu_alloc(child)) {
+    void *area = g_task_xsave[task_index(child)];
+    if (area)
+      arch_xsave(area, arch_xsave_mask());
+  }
   child->parent_id = parent->id;
   child->state = TASK_BLOCKED;
   child->name = parent->name ? strdup(parent->name) : 0;
@@ -1473,6 +1544,9 @@ int scheduler_fork_current(void) {
   }
 
   int child_id = (int)child->id;
+  /* M80: PTRACE_O_TRACEFORK — attach the child to the same tracer and stop it
+   * before it runs, then report the event on the parent. */
+  ptrace_event_child(parent, child, PTRACE_EVENT_FORK);
   /* M28 T4: publish stack_released=1 BEFORE state=READY so a concurrent
    * pick on an AP doesn't observe READY with stack_released=0 (which would
    * make it spin forever — fork sets up the child stack synchronously and
@@ -2275,6 +2349,15 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
     syscall_copyout((void *)(usize)child_tid_addr, &child->id, sizeof(u32));
   }
 
+  /* M80: a new thread runs userspace code too, so give it its own XSAVE area
+   * before it can be scheduled. */
+  task_fpu_alloc(child);
+  /* M80: PTRACE_O_TRACECLONE / TRACEVFORK — same as fork, with the event that
+   * matches how this child was created. */
+  ptrace_event_child(parent, child,
+                     (flags & B1NIX_CLONE_VFORK)  ? PTRACE_EVENT_VFORK
+                     : (flags & B1NIX_CLONE_THREAD) ? PTRACE_EVENT_CLONE
+                                                    : PTRACE_EVENT_CLONE);
   interrupts_disable();
   /* M28 T4: see fork/kthread_create_impl — fresh task's kernel stack is set
    * up synchronously without going through arch_context_switch, so publish
@@ -2589,7 +2672,7 @@ int scheduler_yield(void) {
    * task's live state, then load the incoming task's (or a clean image if it
    * has never run). Without this, userspace XMM registers are clobbered by
    * other tasks and FP-heavy programs (e.g. cc1) corrupt silently. */
-  arch_fpu_save(old_task->fpu_state);
+  task_fpu_save(old_task);
   old_task->fpu_initialized = 1;
   if (!g_clean_fpu_ready) {
     /* old_task's state is already saved above; capture_clean reinits the live
@@ -2598,7 +2681,7 @@ int scheduler_yield(void) {
     g_clean_fpu_ready = 1;
   }
   if (new_task->fpu_initialized) {
-    arch_fpu_restore(new_task->fpu_state);
+    task_fpu_restore(new_task);
   } else {
     arch_fpu_restore(g_clean_fpu);
     new_task->fpu_initialized = 1;
@@ -3213,6 +3296,11 @@ void scheduler_exit_current(int exit_code) {
     panic("scheduler_exit_current without current task");
   }
 
+  /* M80: PTRACE_O_TRACEEXIT — hold the task here, still whole, so its tracer
+   * can read the exit status and its final registers. No-op unless a tracer
+   * asked for the event. */
+  ptrace_exit_stop(current_task, exit_code);
+
   /* /bin/init dying takes the whole run with it: nothing else spawns the
    * remaining tests, so the log simply stops. A default-action signal death is
    * otherwise silent (arch signal delivery logs only fault signals), which made
@@ -3544,14 +3632,27 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               }
             }
              return child_id;
-          } else if ((options & (B1NIX_WUNTRACED | B1NIX_WCONTINUED)) &&
+          } else if (((options & (B1NIX_WUNTRACED | B1NIX_WCONTINUED)) ||
+                      ptrace_tracer_pid(T(i)) == current_task->id) &&
                      (T(i)->state == TASK_STOPPED ||
                       T(i)->continued_report_pending)) {
             int child_id = T(i)->id;
-            if ((options & B1NIX_WUNTRACED) && T(i)->state == TASK_STOPPED &&
-                T(i)->stop_report_pending) {
+            /* A tracer always sees its tracee's ptrace stops, whether or not it
+             * passed WUNTRACED — that flag governs ordinary job-control stops.
+             * Crashpad's handler waits with __WALL alone, and without this it
+             * would sleep forever next to a tracee that is already stopped. */
+            int is_tracer = (ptrace_tracer_pid(T(i)) == current_task->id);
+            if (((options & B1NIX_WUNTRACED) || is_tracer) &&
+                T(i)->state == TASK_STOPPED && T(i)->stop_report_pending) {
               if (status)
-                *status = ((T(i)->last_stop_signal & 0xFF) << 8) | 0x7F;
+                {
+                  /* A ptrace event stop reports (SIGTRAP | event << 8) in the
+                   * high half of the status word, which is how a tracer tells
+                   * a fork/exec event from a plain signal stop. */
+                  int ss = T(i)->last_stop_signal & 0xFF;
+                  int ev = ptrace_stop_event(T(i));
+                  *status = (((ss | (ev << 8)) & 0xFFFF) << 8) | 0x7F;
+                }
               T(i)->stop_report_pending = 0;
               if (may_block)
                 scheduler_waitpid_fast_return();
@@ -5159,6 +5260,7 @@ void scheduler_deliver_pending_signals(void) {
       thread_release_ctid(current_task);
       scheduler_futex_cleanup_task(current_task->id);
   scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
+      ptrace_task_cleanup(current_task); /* M80: never leave a stale tracee link */
       task_lease_clear(current_task, __func__);
       current_task->state = TASK_DEAD;
       g_have_proc_zombies = 1;
@@ -5166,6 +5268,15 @@ void scheduler_deliver_pending_signals(void) {
       scheduler_notify_wait_event(current_task->parent_id);
       return;
     }
+
+    /* M80: a traced task must not be acted on from inside the scheduler for any
+     * signal but SIGKILL — its tracer gets first refusal, and that decision
+     * happens at the next return to ring 3, where ptrace_signal_stop has a
+     * complete register frame. This sits ABOVE the SIG_IGN case on purpose: a
+     * tracee stops for an ignored signal too, exactly as it does on Linux, so
+     * a debugger can see signals the process itself discards. */
+    if (ptrace_is_traced(current_task))
+      continue;
 
     if (handler == SIG_IGN) {
       /* Ignored — just clear (atomic: races with a concurrent killer's set) */
@@ -5200,6 +5311,7 @@ void scheduler_deliver_pending_signals(void) {
         thread_release_ctid(current_task);
         scheduler_futex_cleanup_task(current_task->id);
   scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
+        ptrace_task_cleanup(current_task); /* M80: never leave a stale tracee link */
         task_lease_clear(current_task, __func__);
         current_task->state = TASK_DEAD;
         g_have_proc_zombies = 1;

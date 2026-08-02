@@ -211,5 +211,8 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
                         usize *nhandles, struct b1nix_ucred *cred,
                         int *has_cred);
 int unix_poll(struct vfs_socket_state *s, struct b1nix_pollfd *pfd);
+/* SO_PEERCRED — credentials of the peer socket's creator. -ENOTCONN if the
+ * socket has no peer. */
+int unix_peer_cred(struct vfs_socket_state *s, struct b1nix_ucred *out);
 
 #endif

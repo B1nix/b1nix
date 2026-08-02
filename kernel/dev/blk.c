@@ -391,6 +391,44 @@ struct block_device *blk_get(const char *name) {
 
 usize blk_count(void) { return blk_device_count; }
 
+/* Device number for a registered block device, in the classic dev_t packing
+ * (major << 8 | minor) that /proc/<pid>/maps and stat's st_dev use. The major
+ * follows the device class the way Linux assigns it — a tool that recognises
+ * 8 as "SCSI/SATA disk" or 259 as "NVMe" reads b1nix's numbers correctly — and
+ * the minor is the device's registration index, which is stable for a boot.
+ * Returns 0 for a device that is not registered (no such dev_t exists). */
+u32 blk_devno(struct block_device *dev) {
+  if (!dev || !dev->name)
+    return 0;
+  usize index = 0;
+  int found = 0;
+  for (usize i = 0; i < blk_device_count; i++) {
+    if (blk_devices[i] == dev) {
+      index = i;
+      found = 1;
+      break;
+    }
+  }
+  if (!found)
+    return 0;
+
+  u32 major;
+  const char *n = dev->name;
+  if (n[0] == 'n' && n[1] == 'v' && n[2] == 'm')
+    major = 259; /* nvme */
+  else if (n[0] == 's' && n[1] == 'a' && n[2] == 't')
+    major = 8; /* sata — SCSI disk major */
+  else if (n[0] == 'v' && n[1] == 'i' && n[2] == 'r')
+    major = 254; /* virtio-blk */
+  else if (n[0] == 'r' && n[1] == 'a' && n[2] == 'm')
+    major = 1; /* ramdisk */
+  else if (n[0] == 'l' && n[1] == 'o' && n[2] == 'o')
+    major = 7; /* loop */
+  else
+    major = 240; /* local/experimental range for anything else */
+  return (major << 8) | (u32)(index & 0xFF);
+}
+
 struct block_device *blk_at(usize index) {
   if (index >= blk_device_count)
     return 0;

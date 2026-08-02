@@ -39,6 +39,9 @@ void blk_register(struct block_device *dev);
 struct block_device *blk_get(const char *name);
 usize blk_count(void);
 struct block_device *blk_at(usize index);
+/* dev_t (major << 8 | minor) of a registered block device — what st_dev and
+ * /proc/<pid>/maps report for a filesystem mounted from it. 0 = not registered. */
+u32 blk_devno(struct block_device *dev);
 const char *blk_probe_fstype(struct block_device *dev);
 
 /* Partition introspection (backs sysfs /sys/block). A registered device is a

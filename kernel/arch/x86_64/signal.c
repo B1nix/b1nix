@@ -109,6 +109,19 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
     /* Carry the queued payload so an SA_SIGINFO handler reads si_value —
      * required by sigqueue(3) and SIGEV_SIGNAL POSIX timers (M74). */
     si.si_value = (long)(usize)si_val.sival_ptr;
+    /* M80: for a signal a CPU fault produced, the handler wants the faulting
+     * address. In Linux's siginfo_t the _sigfault._addr member aliases
+     * si_pid/si_uid at offset 16 — a fault signal has no sending pid, so the
+     * union's fault arm is the correct one to fill here. This is what lets a
+     * crash reporter record the bad address from inside its own handler. */
+    {
+      int fsig = 0, fcode = 0;
+      u64 faddr = 0;
+      if (ptrace_fault_info(t, &fsig, &faddr, &fcode) && fsig == sig) {
+        si.si_code = fcode;
+        memcpy((u8 *)&si + 16, &faddr, sizeof(faddr));
+      }
+    }
 
     struct linux_ucontext uc;
     memset(&uc, 0, sizeof(uc));
@@ -150,6 +163,14 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
     si.si_signo = sig;
     si.si_code = si_code;
     si.si_value.sival_ptr = si_val.sival_ptr;
+    { /* M80: fault address for a CPU-fault signal (see the Linux branch). */
+      int fsig = 0, fcode = 0;
+      u64 faddr = 0;
+      if (ptrace_fault_info(t, &fsig, &faddr, &fcode) && fsig == sig) {
+        si.si_code = fcode;
+        si.si_addr = (void *)(usize)faddr;
+      }
+    }
     if (syscall_copyout((void *)(usize)si_addr, &si, sizeof(si)) < 0) {
       console_write("signal: failed to build native siginfo\n");
       scheduler_exit_current(-SIGSEGV);

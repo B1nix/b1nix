@@ -143,6 +143,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m46_smoke \
 	m57_smoke \
 	m73_smoke \
+	m80_smoke \
 	m63_smoke \
 	m71_aslr \
 	m47_smoke \

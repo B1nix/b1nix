@@ -52,3 +52,43 @@ arch_fpu_init_current:
 	.align 4
 mxcsr_default:
 	.long 0x00001F80      /* default MXCSR: all FP exceptions masked */
+
+	/* ── XSAVE variants (M80) ────────────────────────────────────────────
+	 * The FXSAVE area above holds x87+SSE only, so a task's AVX (YMM upper
+	 * halves) state was destroyed by every context switch. XSAVE/XRSTOR save
+	 * the components named by the feature mask in EDX:EAX; the kernel passes
+	 * the XCR0 value it enabled. Areas MUST be 64-byte aligned. */
+
+	/* void arch_xsave(void *area, u64 mask) */
+	.global arch_xsave
+	.type arch_xsave, @function
+arch_xsave:
+	movq %rsi, %rdx
+	movl %esi, %eax
+	shrq $32, %rdx
+	xsave64 (%rdi)
+	ret
+
+	/* void arch_xrstor(void *area, u64 mask) */
+	.global arch_xrstor
+	.type arch_xrstor, @function
+arch_xrstor:
+	movq %rsi, %rdx
+	movl %esi, %eax
+	shrq $32, %rdx
+	xrstor64 (%rdi)
+	ret
+
+	/* void arch_xsave_capture_clean(void *area, u64 mask) — reset the live
+	 * FPU to the ABI default and snapshot it, the XSAVE counterpart of
+	 * arch_fpu_capture_clean. */
+	.global arch_xsave_capture_clean
+	.type arch_xsave_capture_clean, @function
+arch_xsave_capture_clean:
+	fninit
+	ldmxcsr mxcsr_default(%rip)
+	movq %rsi, %rdx
+	movl %esi, %eax
+	shrq $32, %rdx
+	xsave64 (%rdi)
+	ret

@@ -9,6 +9,7 @@
 
 #define UNIX_RB_SIZE 4096
 #define UNIX_CONTROL_SLOTS 16
+#define UNIX_MSG_SLOTS 32
 
 struct unix_control {
   int used;
@@ -21,6 +22,12 @@ struct unix_control {
 
 struct unix_socket_data {
   struct vfs_socket_state *socket;
+  /* Credentials of the task that created this socket, captured once at
+   * creation. SO_PEERCRED reports the PEER's copy — an authentic identity the
+   * peer cannot forge, unlike anything it sends in the data stream. A crash
+   * handler uses it to decide whether the process on the other end of its
+   * socket is one it is responsible for. */
+  struct b1nix_ucred owner;
   struct unix_socket_data *peer;
   struct unix_socket_data *backlog[16];
   int backlog_count;
@@ -38,6 +45,12 @@ struct unix_socket_data {
   u64 read_seq;
   u64 write_seq;
   struct unix_control control[UNIX_CONTROL_SLOTS];
+
+  /* SOCK_SEQPACKET message boundaries: one length per datagram sitting in the
+   * ring buffer, in arrival order. A stream socket leaves this empty and reads
+   * the ring as an undivided byte stream. */
+  u32 msg_len[UNIX_MSG_SLOTS];
+  u8 msg_head, msg_tail, msg_count;
 
   volatile int lock;
   /* Lifetime: a unix_socket_data outlives its own socket as long as a PEER (or
@@ -77,6 +90,12 @@ int unix_init_state(struct vfs_socket_state *s) {
   if (!u) return -ENOMEM;
   u->socket = s;
   u->refcount = 1; /* the owning socket's reference */
+  u->owner.pid = (int)scheduler_get_pid();
+  {
+    const struct cred *c = scheduler_get_current_cred();
+    u->owner.uid = c ? c->uid : 0;
+    u->owner.gid = c ? c->gid : 0;
+  }
   u->rb_buffer = kmalloc(UNIX_RB_SIZE);
   if (!u->rb_buffer) { kfree(u); return -ENOMEM; }
   s->unix_data = u;
@@ -185,6 +204,23 @@ void unix_free_state(struct vfs_socket_state *s) {
   }
 
   unix_data_put(u);        /* drop the owning socket's reference */
+}
+
+/* SO_PEERCRED: the identity of the process that created the socket at the other
+ * end of this connection. Only a connected socket has one. */
+int unix_peer_cred(struct vfs_socket_state *s, struct b1nix_ucred *out) {
+  struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
+  if (!u || !out)
+    return -EINVAL;
+  unix_lock(u);
+  struct unix_socket_data *peer = u->peer;
+  if (!peer) {
+    unix_unlock(u);
+    return -ENOTCONN;
+  }
+  *out = peer->owner;
+  unix_unlock(u);
+  return 0;
 }
 
 int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr) {
@@ -419,6 +455,17 @@ retry:
     goto retry;
   }
 
+  /* SO_PASSCRED on the receiving end: attach this sender's credentials even
+   * though the sender did not ask to send any. */
+  struct b1nix_ucred auto_cred;
+  if (!cred && peer_u->socket && peer_u->socket->so_passcred) {
+    auto_cred.pid = (int)scheduler_get_pid();
+    const struct cred *c = scheduler_get_current_cred();
+    auto_cred.uid = c ? c->uid : 0;
+    auto_cred.gid = c ? c->gid : 0;
+    cred = &auto_cred;
+  }
+
   int control_slot = -1;
   if (nhandles || cred) {
     for (int i = 0; i < UNIX_CONTROL_SLOTS; i++)
@@ -430,6 +477,34 @@ retry:
       unix_unlock(peer_u);
       unix_data_put(peer_u);
       return -ENOBUFS;
+    }
+  }
+
+  int seqpacket = (s->type == B1NIX_SOCK_SEQPACKET);
+  if (seqpacket) {
+    /* A SOCK_SEQPACKET write is all-or-nothing: a message that cannot fit
+     * whole is either too large ever (EMSGSIZE) or has to wait for the reader
+     * to drain, exactly as it does on Linux. */
+    if (len > UNIX_RB_SIZE) {
+      unix_unlock(peer_u);
+      unix_data_put(peer_u);
+      return -EMSGSIZE;
+    }
+    if (len > free_space || peer_u->msg_count >= UNIX_MSG_SLOTS) {
+      struct vfs_socket_state *psock = peer_u->socket;
+      unix_unlock(peer_u);
+      if (nonblock) {
+        unix_data_put(peer_u);
+        return -EAGAIN;
+      }
+      scheduler_wait_prepare(psock);
+      unix_data_put(peer_u);
+      if (scheduler_signal_pending()) {
+        scheduler_wait_cancel();
+        return -ERESTARTSYS;
+      }
+      scheduler_wait_commit();
+      goto retry;
     }
   }
 
@@ -453,6 +528,11 @@ retry:
   }
   peer_u->rb_count += to_copy;
   peer_u->write_seq += to_copy;
+  if (seqpacket) {
+    peer_u->msg_len[peer_u->msg_tail] = (u32)to_copy;
+    peer_u->msg_tail = (u8)((peer_u->msg_tail + 1) % UNIX_MSG_SLOTS);
+    peer_u->msg_count++;
+  }
 
   struct vfs_socket_state *peer_sock = peer_u->socket;
   unix_unlock(peer_u);
@@ -480,7 +560,14 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
   while (1) {
     unix_lock(u);
     if (u->rb_count > 0) {
-      usize to_copy = (len < u->rb_count) ? len : u->rb_count;
+      int seqpacket = (s->type == B1NIX_SOCK_SEQPACKET);
+      usize avail = u->rb_count;
+      if (seqpacket) {
+        /* Exactly one message is visible to this call, and anything the caller
+         * has no room for is discarded with it (POSIX MSG_TRUNC semantics). */
+        avail = u->msg_count ? u->msg_len[u->msg_head] : u->rb_count;
+      }
+      usize to_copy = (len < avail) ? len : avail;
       struct unix_control *ctl = 0;
       for (int i = 0; i < UNIX_CONTROL_SLOTS; i++) {
         struct unix_control *candidate = &u->control[i];
@@ -496,11 +583,18 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
         usize idx = (u->rb_head + i) % UNIX_RB_SIZE;
         ((char *)buf)[i] = u->rb_buffer[idx];
       }
+      usize consume = to_copy;
+      if (seqpacket && !(flags & B1NIX_MSG_PEEK))
+        consume = avail; /* the rest of the message is dropped, not re-read */
       if (!(flags & B1NIX_MSG_PEEK))
-        u->rb_head = (u->rb_head + to_copy) % UNIX_RB_SIZE;
+        u->rb_head = (u->rb_head + consume) % UNIX_RB_SIZE;
       if (!(flags & B1NIX_MSG_PEEK)) {
-        u->rb_count -= to_copy;
-        u->read_seq += to_copy;
+        u->rb_count -= consume;
+        u->read_seq += consume;
+        if (seqpacket && u->msg_count) {
+          u->msg_head = (u8)((u->msg_head + 1) % UNIX_MSG_SLOTS);
+          u->msg_count--;
+        }
         if (ctl) {
           if (handles && nhandles) {
             for (usize i = 0; i < ctl->nhandles; i++) {
@@ -529,7 +623,9 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
       return (isize)to_copy;
     }
     unix_unlock(u);
-    if (s->type == B1NIX_SOCK_STREAM && !s->connected) return 0;
+    if ((s->type == B1NIX_SOCK_STREAM || s->type == B1NIX_SOCK_SEQPACKET) &&
+        !s->connected)
+      return 0;
     if (flags & B1NIX_MSG_DONTWAIT) return -EAGAIN;
     /* SMP-safe wait: publish BLOCKED on our socket, then re-test under the lock
      * so a sender's wake (scheduler_wake_all(u->socket) after a write/close)
@@ -537,7 +633,9 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
     scheduler_wait_prepare(s);
     unix_lock(u);
     int have_data = (u->rb_count > 0);
-    int disconnected = (s->type == B1NIX_SOCK_STREAM && !s->connected);
+    int disconnected =
+        ((s->type == B1NIX_SOCK_STREAM || s->type == B1NIX_SOCK_SEQPACKET) &&
+         !s->connected);
     unix_unlock(u);
     if (have_data || disconnected) {
       scheduler_wait_cancel();

@@ -20,11 +20,13 @@
  *    pids seen over a boot), which avoids freeing a node a reader still holds.
  */
 
+#include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+#include <b1nix/ptrace.h>
 #include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
 #include <b1nix/user.h>
@@ -265,6 +267,12 @@ static int r_cpuinfo(usize pid, struct sbuf *s) {
     sb_addf(s, "processor\t: %lu\n", (unsigned long)i);
     sb_puts(s, "vendor_id\t: B1NIX\n");
     sb_puts(s, "model name\t: b1nix virtual CPU\n");
+    {
+      u32 khz = arch_cpu_khz();
+      if (khz)
+        sb_addf(s, "cpu MHz\t\t: %lu.%03lu\n", (unsigned long)(khz / 1000),
+                (unsigned long)(khz % 1000));
+    }
     sb_puts(s, "\n");
   }
   return 0;
@@ -480,6 +488,24 @@ static int w_sys_shmmax(usize pid, const char *buf, usize len) {
   return (int)len;
 }
 
+/* M80: /proc/sys/kernel/yama/ptrace_scope — 0 lets any task trace another it
+ * owns; 1 additionally requires the tracer to be an ancestor of the target or
+ * the tracer the target declared with prctl(PR_SET_PTRACER), which is the mode
+ * a crash-handler process is designed around. */
+static int r_sys_ptrace_scope(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%d\n", ptrace_scope_get());
+  return 0;
+}
+
+static int w_sys_ptrace_scope(usize pid, const char *buf, usize len) {
+  (void)pid;
+  u64 v;
+  if (sysctl_parse_u64(buf, len, &v) < 0 || ptrace_scope_set((int)v) < 0)
+    return -EINVAL;
+  return (int)len;
+}
+
 static int w_sys_tcp_max(usize pid, const char *buf, usize len) {
   (void)pid;
   u64 v;
@@ -642,11 +668,37 @@ static int r_pid_status(usize pid, struct sbuf *s) {
   sb_addf(s, "State:\t%s\n", state_long(st));
   sb_addf(s, "Pid:\t%lu\n", (unsigned long)t->id);
   sb_addf(s, "PPid:\t%lu\n", (unsigned long)t->parent_id);
-  if (t->cred)
-    sb_addf(s, "Uid:\t%u\t%u\t%u\n", t->cred->uid, t->cred->euid,
-            t->cred->suid);
+  /* Thread-group identity and size. A crash reporter reads Tgid to map a thread
+   * back to its process and Threads to know how many /proc/<pid>/task entries
+   * it must dump; gdb reads TracerPid to refuse to attach twice. */
+  sb_addf(s, "Tgid:\t%lu\n", (unsigned long)task_tgid(t));
+  sb_addf(s, "TracerPid:\t%lu\n", (unsigned long)ptrace_tracer_pid(t));
+  /* Linux prints four ids per line — real, effective, saved and filesystem —
+   * and a Groups line, and every /proc parser (Crashpad's included) reads all
+   * of them. Three fields is not a shorter version of this format, it is an
+   * unparseable one. */
+  if (t->cred) {
+    sb_addf(s, "Uid:\t%u\t%u\t%u\t%u\n", t->cred->uid, t->cred->euid,
+            t->cred->suid, t->cred->fsuid);
+    sb_addf(s, "Gid:\t%u\t%u\t%u\t%u\n", t->cred->gid, t->cred->egid,
+            t->cred->sgid, t->cred->fsgid);
+    /* Linux terminates every entry on the Groups line with a space, including
+     * the last one; parsers rely on that trailing separator. */
+    sb_addf(s, "Groups:\t%u \n", t->cred->gid);
+  }
   sb_addf(s, "PGid:\t%lu\n", (unsigned long)t->process_group_id);
   sb_addf(s, "Sid:\t%lu\n", (unsigned long)t->session_id);
+  {
+    usize tgid = task_tgid(t);
+    usize nthreads = 0;
+    usize slots = scheduler_task_slots();
+    for (usize i = 0; i < slots; i++) {
+      struct task *o = scheduler_task_slot(i);
+      if (o && o->id && task_tgid(o) == tgid)
+        nthreads++;
+    }
+    sb_addf(s, "Threads:\t%lu\n", (unsigned long)(nthreads ? nthreads : 1));
+  }
   /* Heap span as a rough VmSize. */
   u64 vm = t->user_brk > t->heap_start ? t->user_brk - t->heap_start : 0;
   sb_addf(s, "VmData:\t%lu kB\n", (unsigned long)(vm / 1024));
@@ -773,27 +825,147 @@ static int r_pid_limits(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* One line of /proc/<pid>/maps, gathered from every source before printing so
+ * the file comes out in ascending address order. */
+struct procfs_map_ent {
+  u64 start;
+  u64 end;
+  u64 offset;
+  int prot;   /* PROT_READ/WRITE/EXEC bits */
+  int shared;
+  unsigned long ino;
+  unsigned long dev;  /* st_dev of the backing filesystem (0 = anonymous) */
+  const char *name; /* 0 = anonymous */
+};
+
+static void procfs_maps_add(struct procfs_map_ent *m, usize *n, usize max,
+                            u64 start, u64 end, int prot, int shared,
+                            u64 offset, unsigned long ino, unsigned long dev,
+                            const char *name) {
+  if (*n >= max || end <= start)
+    return;
+  m[*n].start = start;
+  m[*n].end = end;
+  m[*n].prot = prot;
+  m[*n].shared = shared;
+  m[*n].offset = offset;
+  m[*n].ino = ino;
+  m[*n].dev = dev;
+  m[*n].name = name;
+  (*n)++;
+}
+
 static int r_pid_maps(usize pid, struct sbuf *s) {
   struct task *t = scheduler_task_by_pid(pid);
   if (!t)
     return 0;
-  for (struct vm_area *v = t->vma_list; v; v = v->next) {
+#define PROCFS_MAPS_MAX 192
+  struct procfs_map_ent m[PROCFS_MAPS_MAX];
+  usize n = 0;
+
+  /* mmap'd regions (the only ones the VMA list tracks). */
+  for (struct vm_area *v = t->vma_list; v && n < PROCFS_MAPS_MAX; v = v->next)
+    procfs_maps_add(m, &n, PROCFS_MAPS_MAX, v->start, v->end, (int)v->prot,
+                    (v->flags & 0x1) != 0, v->offset,
+                    (v->node && v->node->inode) ? v->node->inode->ino : 0,
+                    v->node ? vfs_node_dev(v->node) : 0,
+                    (v->node && v->node->name[0]) ? v->node->name : 0);
+
+  /* Name the mappings that belong to the loaded image. The executable's and
+   * the interpreter's segments are mapped by the kernel loader, so they reach
+   * the VMA list without a backing vfs node and would otherwise print as
+   * anonymous memory — leaving a crash reporter with an address it cannot
+   * attribute to any module. */
+  struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
+  if (img) {
+    /* Real inode numbers for the file-backed mappings. A reader that sees
+     * dev 0 AND inode 0 concludes the mapping is anonymous — no file to find
+     * the start of — and never looks back for the ELF header at the module's
+     * first segment. */
+    unsigned long exe_ino = 0, interp_ino = 0, exe_dev = 0, interp_dev = 0;
+    if (img->path) {
+      struct vfs_node *nd = vfs_find_node(img->path);
+      if (nd && !IS_ERR(nd)) {
+        if (nd->inode) {
+          exe_ino = (unsigned long)nd->inode->ino;
+          exe_dev = (unsigned long)vfs_node_dev(nd);
+        }
+        vfs_node_put(nd);
+      }
+    }
+    if (img->interp_path[0]) {
+      struct vfs_node *nd = vfs_find_node(img->interp_path);
+      if (nd && !IS_ERR(nd)) {
+        if (nd->inode) {
+          interp_ino = (unsigned long)nd->inode->ino;
+          interp_dev = (unsigned long)vfs_node_dev(nd);
+        }
+        vfs_node_put(nd);
+      }
+    }
+    for (usize i = 0; i < n; i++) {
+      if (m[i].name)
+        continue;
+      for (usize k = 0; k < img->segment_count; k++) {
+        const struct user_image_segment *seg = &img->segments[k];
+        if (!seg->memsz)
+          continue;
+        u64 sstart = seg->vaddr & ~(u64)(PAGE_SIZE - 1);
+        u64 send =
+            (seg->vaddr + seg->memsz + PAGE_SIZE - 1) & ~(u64)(PAGE_SIZE - 1);
+        if (m[i].start >= sstart && m[i].start < send) {
+          int is_interp = (img->interp_base && seg->vaddr >= img->interp_base &&
+                           img->interp_path[0]);
+          m[i].name = is_interp ? img->interp_path : img->path;
+          m[i].ino = is_interp ? interp_ino : exe_ino;
+          m[i].dev = is_interp ? interp_dev : exe_dev;
+          /* The file offset matters as much as the name: a reader treats a
+           * mapping at offset 0 as the start of a module and looks for an ELF
+           * header there. Reporting 0 for every segment claims each one is a
+           * separate module beginning, which is how a crash reporter ends up
+           * reading a data segment as an ELF header. */
+          m[i].offset = seg->file_offset + (m[i].start - sstart);
+          break;
+        }
+      }
+    }
+  }
+
+  /* Ascending order, and no duplicate starts: Crashpad (and pmap, and glibc's
+   * backtrace) reject a maps file that is out of order or overlapping. */
+  for (usize i = 1; i < n; i++) {
+    struct procfs_map_ent key = m[i];
+    usize j = i;
+    while (j > 0 && m[j - 1].start > key.start) {
+      m[j] = m[j - 1];
+      j--;
+    }
+    m[j] = key;
+  }
+
+  u64 prev_end = 0;
+  for (usize i = 0; i < n; i++) {
+    u64 start = m[i].start;
+    if (start < prev_end)
+      start = prev_end; /* clip an overlap rather than emitting one */
+    if (m[i].end <= start)
+      continue;
     char perms[5];
-    perms[0] = (v->prot & 0x1) ? 'r' : '-'; /* PROT_READ  */
-    perms[1] = (v->prot & 0x2) ? 'w' : '-'; /* PROT_WRITE */
-    perms[2] = (v->prot & 0x4) ? 'x' : '-'; /* PROT_EXEC  */
-    perms[3] = (v->flags & 0x1) ? 's' : 'p'; /* MAP_SHARED/PRIVATE */
+    perms[0] = (m[i].prot & 0x1) ? 'r' : '-';
+    perms[1] = (m[i].prot & 0x2) ? 'w' : '-';
+    perms[2] = (m[i].prot & 0x4) ? 'x' : '-';
+    perms[3] = m[i].shared ? 's' : 'p';
     perms[4] = '\0';
-    /* Linux-format maps line: "start-end perms offset major:minor inode path".
-     * V8 (and pmap/lsof/glibc backtrace) parse the dev + inode columns
-     * strictly — emit them or the parse aborts. b1nix has no per-VMA block-dev,
-     * so dev is 00:00; inode is the real vfs inode for file-backed maps.
-     * ponytail: dev stays 00:00 until a tool needs real major:minor. */
-    unsigned long ino =
-        (v->node && v->node->inode) ? (unsigned long)v->node->inode->ino : 0;
-    sb_addf(s, "%lx-%lx %s %lx 00:00 %lu %s\n", (unsigned long)v->start,
-            (unsigned long)v->end, perms, (unsigned long)v->offset, ino,
-            v->node ? "[file]" : "[anon]");
+    /* "start-end perms offset major:minor inode path". The device is the
+     * st_dev of the filesystem the file lives on — a real disk's number for a
+     * block-backed mount, 00:xx for a RAM filesystem, 00:00 for anonymous
+     * memory. The inode column always ends with a space, as Linux's padding
+     * guarantees, even when there is no path. */
+    sb_addf(s, "%lx-%lx %s %lx %02lx:%02lx %lu %s\n", (unsigned long)start,
+            (unsigned long)m[i].end, perms, (unsigned long)m[i].offset,
+            (m[i].dev >> 8) & 0xfful, m[i].dev & 0xfful, m[i].ino,
+            m[i].name ? m[i].name : "");
+    prev_end = m[i].end;
   }
   return 0;
 }
@@ -1016,6 +1188,116 @@ static void procfs_make_exe_symlink(struct vfs_node *dir, usize pid) {
   vfs_attach_child(dir, n);
 }
 
+/* ── /proc/<pid>/auxv and /proc/<pid>/mem (M80) ──────────────────────────────
+ * Both read the target's own address space through its page tables
+ * (ptrace_copy_from_task), which is what makes them usable on a process other
+ * than the caller — the case a crash reporter is built around. Access is gated
+ * by the same ptrace_may_access() check that guards PTRACE_ATTACH: being able
+ * to read another process's memory is exactly the privilege ptrace grants. */
+static isize procfs_auxv_read(struct vfs_node *node, u64 offset, char *buf,
+                              usize size, int flags) {
+  (void)flags;
+  usize pid = pid_from_parent(node);
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -ESRCH;
+  if (!ptrace_may_access(t))
+    return -EACCES;
+  struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
+  if (!img || !img->auxv_vaddr || !img->auxv_size)
+    return 0; /* kernel task, or an image built before auxv was recorded */
+  u8 tmp[512];
+  usize len = img->auxv_size;
+  if (len > sizeof(tmp))
+    len = sizeof(tmp);
+  isize got = ptrace_copy_from_task(t, img->auxv_vaddr, tmp, len);
+  if (got < 0)
+    return got;
+  return procfs_emit((const char *)tmp, (usize)got, offset, buf, size);
+}
+
+/* /proc/<pid>/mem: the file offset IS the virtual address, so a reader pread()s
+ * at the address it wants. Reads stop at the first unmapped page (short count),
+ * matching Linux. */
+static isize procfs_mem_read(struct vfs_node *node, u64 offset, char *buf,
+                             usize size, int flags) {
+  (void)flags;
+  usize pid = pid_from_parent(node);
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -ESRCH;
+  if (!ptrace_may_access(t))
+    return -EACCES;
+  if (size == 0)
+    return 0;
+  return ptrace_copy_from_task(t, offset, buf, size);
+}
+
+static isize procfs_mem_write(struct vfs_node *node, u64 offset,
+                              const char *buf, usize size, int flags) {
+  (void)flags;
+  usize pid = pid_from_parent(node);
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -ESRCH;
+  if (!ptrace_may_access(t))
+    return -EACCES;
+  if (size == 0)
+    return 0;
+  return ptrace_copy_to_task(t, offset, buf, size);
+}
+
+/* ── /proc/<pid>/task/<tid> (M80) ───────────────────────────────────────────
+ * One directory per thread of the process. b1nix models a thread as a task of
+ * its own whose tgid is the thread-group leader's pid (task_tgid), so the
+ * per-thread files are the ordinary per-pid renderers pointed at the tid. */
+static void procfs_make_tiddir(struct vfs_node *taskdir, usize tid) {
+  char name[16];
+  snprintf(name, sizeof(name), "%lu", (unsigned long)tid);
+  if (find_child(taskdir, name))
+    return;
+  struct vfs_node *d = procfs_mkchild(taskdir, name, VFS_DIRECTORY, 0, 0);
+  if (!d)
+    return;
+  procfs_mkchild(d, "status", VFS_DEVICE, r_pid_status, tid);
+  procfs_mkchild(d, "stat", VFS_DEVICE, r_pid_stat, tid);
+  procfs_mkchild(d, "comm", VFS_DEVICE, r_pid_comm, tid);
+  procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, tid);
+  procfs_mkchild(d, "statm", VFS_DEVICE, r_pid_statm, tid);
+}
+
+static isize procfs_task_readdir(struct vfs_node *dir, usize offset,
+                                 struct dirent *buf, usize max_entries) {
+  usize pid = pid_from_parent(dir); /* dir->parent is the /proc/<pid> dir */
+  struct task *leader = scheduler_task_by_pid(pid);
+  if (leader) {
+    usize tgid = task_tgid(leader);
+    usize slots = scheduler_task_slots();
+    for (usize i = 0; i < slots; i++) {
+      struct task *t = scheduler_task_slot(i);
+      if (t && t->id && task_tgid(t) == tgid)
+        procfs_make_tiddir(dir, t->id);
+    }
+  }
+  return vfs_readdir_children(dir, offset, buf, max_entries);
+}
+
+static int procfs_task_lookup(struct vfs_node *dir, const char *name) {
+  usize tid = 0;
+  for (const char *q = name; *q; q++) {
+    if (*q < '0' || *q > '9')
+      return -1;
+    tid = tid * 10 + (usize)(*q - '0');
+  }
+  usize pid = pid_from_parent(dir);
+  struct task *leader = scheduler_task_by_pid(pid);
+  struct task *t = scheduler_task_by_pid(tid);
+  if (!leader || !t || task_tgid(t) != task_tgid(leader))
+    return -1;
+  procfs_make_tiddir(dir, tid); /* idempotent (find_child guard) */
+  return 0;
+}
+
 static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
                                            const char *name, usize pid) {
   struct vfs_node *d = procfs_mkchild(parent, name, VFS_DIRECTORY, 0, 0);
@@ -1038,6 +1320,24 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   if (fddir) {
     fddir->inode->readdir_cb = procfs_fd_readdir;
     fddir->inode->lookup_cb = procfs_fd_lookup;
+  }
+  /* M80: auxv/mem carry binary content, so they take a read_cb of their own
+   * instead of the text-rendering procfs_read_cb. */
+  struct vfs_node *auxv = procfs_mkchild(d, "auxv", VFS_DEVICE, 0, pid);
+  if (auxv) {
+    auxv->inode->read_cb = procfs_auxv_read;
+    auxv->inode->mode = 0444;
+  }
+  struct vfs_node *mem = procfs_mkchild(d, "mem", VFS_DEVICE, 0, pid);
+  if (mem) {
+    mem->inode->read_cb = procfs_mem_read;
+    mem->inode->write_cb = procfs_mem_write;
+    mem->inode->mode = 0600; /* ptrace_may_access still gates every access */
+  }
+  struct vfs_node *taskdir = procfs_mkchild(d, "task", VFS_DIRECTORY, 0, 0);
+  if (taskdir) {
+    taskdir->inode->readdir_cb = procfs_task_readdir;
+    taskdir->inode->lookup_cb = procfs_task_lookup;
   }
   return d;
 }
@@ -1069,6 +1369,23 @@ static isize procfs_root_readdir(struct vfs_node *dir, usize offset,
                                  struct dirent *buf, usize max_entries) {
   procfs_refresh();
   return vfs_readdir_children(dir, offset, buf, max_entries);
+}
+
+/* Resolve /proc/<pid> on a direct lookup. Without this, a pid directory exists
+ * only after somebody has listed /proc — a crash reporter that is handed a pid
+ * and opens /proc/<pid>/task straight away would get ENOENT. */
+static int procfs_root_lookup(struct vfs_node *dir, const char *name) {
+  usize pid = 0;
+  for (const char *q = name; *q; q++) {
+    if (*q < '0' || *q > '9')
+      return -1;
+    pid = pid * 10 + (usize)(*q - '0');
+  }
+  if (!pid || !scheduler_task_by_pid(pid))
+    return -1;
+  if (find_child(dir, name))
+    return 0;
+  return procfs_make_piddir(dir, name, 0 /* derive from name */) ? 0 : -1;
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -1222,6 +1539,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
     return ERR_PTR(-ENOMEM);
   root->inode->mode = 0555;
   root->inode->readdir_cb = procfs_root_readdir;
+  root->inode->lookup_cb = procfs_root_lookup;
   procfs_root = root;
 
   procfs_mkchild(root, "meminfo", VFS_DEVICE, r_meminfo, 0);
@@ -1252,6 +1570,12 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
       procfs_mkchild(kern, "osrelease", VFS_DEVICE, r_sys_osrelease, 0);
       procfs_mkchild(kern, "version", VFS_DEVICE, r_version, 0);
       procfs_mkchild(kern, "pid_max", VFS_DEVICE, r_sys_pid_max, 0);
+      /* M80: yama-style ptrace attach restriction. */
+      struct vfs_node *yama =
+          procfs_mkchild(kern, "yama", VFS_DIRECTORY, 0, 0);
+      if (yama)
+        procfs_mkchild_writable(yama, "ptrace_scope", r_sys_ptrace_scope,
+                                w_sys_ptrace_scope);
       /* M77: writable global resource caps. */
       procfs_mkchild_writable(kern, "shmmax", r_sys_shmmax, w_sys_shmmax);
       procfs_mkchild_writable(kern, "tcp-max-conns", r_sys_tcp_max,

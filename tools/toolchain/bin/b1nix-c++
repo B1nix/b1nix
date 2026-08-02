@@ -104,6 +104,13 @@ PRE_CRT="$CRT0"
 POST_CRT=""
 MUSL_SO="$MUSL_LIB_DIR/libc.so"
 IS_MUSL_LINK=0
+# PIE mode: requested with -pie on the command line (or B1NIX_LINK=pie). The
+# rootfs gate (tools/check-dynamic.sh) requires position-independent
+# executables, and a PIE needs musl's Scrt1.o rather than crt1.o.
+WANT_PIE=0
+if [ "${B1NIX_LINK:-}" = "pie" ]; then WANT_PIE=1; fi
+for _a in "$@"; do [ "$_a" = "-pie" ] && WANT_PIE=1; done
+MUSL_SCRT1="$MUSL_LIB_DIR/Scrt1.o"
 if [ "$IS_COMPILE_ONLY" -eq 1 ]; then
   DYN_EXTRA=""
   GROUP_LIBC=""
@@ -119,9 +126,14 @@ elif [ "${B1NIX_LINK:-dynamic}" != "static" ] && [ -f "$MUSL_CRT1" ] && [ -f "$M
   MUSL_LINK_DIR="${TMPDIR:-/tmp}/b1nix-cxx-musl-link.$$"
   mkdir -p "$MUSL_LINK_DIR"
   ln -sf "$MUSL_SO" "$MUSL_LINK_DIR/ld-musl-x86_64.so.1"
-  PRE_CRT="$MUSL_CRT1 $MUSL_CRTI"
+  if [ "$WANT_PIE" -eq 1 ] && [ -f "$MUSL_SCRT1" ]; then
+    PRE_CRT="$MUSL_SCRT1 $MUSL_CRTI"
+    DYN_EXTRA="-pie --dynamic-linker /lib/ld-musl-x86_64.so.1 -L$MUSL_LINK_DIR --eh-frame-hdr"
+  else
+    PRE_CRT="$MUSL_CRT1 $MUSL_CRTI"
+    DYN_EXTRA="--dynamic-linker /lib/ld-musl-x86_64.so.1 -L$MUSL_LINK_DIR --eh-frame-hdr"
+  fi
   POST_CRT="$MUSL_CRTN"
-  DYN_EXTRA="--dynamic-linker /lib/ld-musl-x86_64.so.1 -L$MUSL_LINK_DIR --eh-frame-hdr"
   GROUP_LIBC=""
   POST_GROUP="-l:ld-musl-x86_64.so.1"
 elif [ -f "$MUSL_CRT1" ] && [ -f "$MUSL_LIBA" ] && [ "${B1NIX_LINK:-dynamic}" = "static" ]; then
@@ -230,6 +242,15 @@ LIBCXX_HDR="$ROOT/build/x86_64/toolchain/llvm-runtimes-build/libcxx-install/incl
 SYSROOT="$ROOT/build/x86_64/toolchain/sysroot"
 CXXFLAGS="--target=$TRIPLET --sysroot=$SYSROOT -nostdinc++ -isystem $LIBCXX_HDR"
 CXXFLAGS="$CXXFLAGS -std=c++17 -O2 -ffunction-sections -fdata-sections -Db1nix"
+# Platform identity. b1nix implements the Linux ABI, but its triple is
+# x86_64-b1nix, so clang predefines none of the macros portable code keys off.
+# Declaring them here — in the toolchain, next to the sysroot they describe —
+# is what lets an unmodified upstream package build: __linux__/__linux/__unix__
+# select the Linux backend (linux-syscall-support tests the bare __linux),
+# _GNU_SOURCE and _LARGEFILE64_SOURCE open the POSIX-2008 and off64_t/pread64
+# spellings musl gates behind them. The C wrapper (b1nix-musl-cc) already does
+# the same; this keeps C and C++ seeing one platform.
+CXXFLAGS="$CXXFLAGS -D__linux__ -D__linux -D__unix__ -D_GNU_SOURCE -D_LARGEFILE64_SOURCE"
 
 run_cxx() {
   if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
@@ -251,10 +272,19 @@ compile_only=0
 output="a.out"
 inputs=()
 passthru=()
+# Library search paths and -l names seen on the command line. The exe-link path
+# below drives ld.lld directly, so these have to be carried across explicitly —
+# left in `passthru` they would be dropped, and a build that links a ported
+# library (GN's `libs = ["z"]`, autotools' -lcurl) would fail with undefined
+# symbols that are in fact present on disk.
+link_libs=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -c) compile_only=1 ;;
     -o) shift; output="$1" ;;
+    -L) link_libs+=("-L$2"); passthru+=("$1" "$2"); shift ;;
+    -L*) link_libs+=("$1"); passthru+=("$1") ;;
+    -l*) link_libs+=("$1"); passthru+=("$1") ;;
     # Flags that take a separate value argument: consume BOTH into passthru so the
     # value is never misclassified as an input. CMake/Ninja's C++ rule emits
     # `-MT <out>.o -MF <out>.o.d`, whose values end in .o/.d and would otherwise be
@@ -374,12 +404,12 @@ for f in $POST_CRT; do post_crt_args+=("$f"); done
 if [ -n "$UNWIND_RUNTIME" ]; then
   "$LD" -m "$LDEMU" "${dyn_extra_args[@]+${dyn_extra_args[@]}}" --gc-sections -o "$output" \
     "${pre_crt_args[@]+${pre_crt_args[@]}}" "${objs[@]}" \
-    --start-group "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "$UNWIND_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
+    --start-group "${link_libs[@]+${link_libs[@]}}" "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "$UNWIND_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
     "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}" "${post_crt_args[@]+${post_crt_args[@]}}"
 else
   "$LD" -m "$LDEMU" "${dyn_extra_args[@]+${dyn_extra_args[@]}}" --gc-sections -o "$output" \
     "${pre_crt_args[@]+${pre_crt_args[@]}}" "${objs[@]}" \
-    --start-group "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
+    --start-group "${link_libs[@]+${link_libs[@]}}" "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
     "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}" "${post_crt_args[@]+${post_crt_args[@]}}"
 fi
 rm -rf "$tmp"

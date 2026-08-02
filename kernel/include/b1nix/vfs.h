@@ -77,6 +77,13 @@ struct vfs_xattr {
 
 struct vfs_inode {
   u64 ino;
+  /* Device number (major << 8 | minor) of the filesystem this inode lives on —
+   * what stat reports in st_dev and /proc/<pid>/maps prints in its device
+   * column. Distinct from fs_id: fs_id identifies one MOUNT (it keys the inode
+   * cache, so it must differ between a mount and a later re-mount of the same
+   * disk), while dev identifies the DEVICE and is deliberately stable across
+   * mounts. 0 until the mount stamps it; vfs_node_dev resolves it. */
+  u32 dev;
   /* Inode generation: bumped every time the filesystem hands this inode number
    * to a NEW file. A stored file handle carries it, so reusing the number for a
    * different file makes the old handle report ESTALE instead of opening the
@@ -229,6 +236,9 @@ struct vfs_node *vfs_node_get(struct vfs_node *node);
 void vfs_node_put(struct vfs_node *node);
 struct vfs_node *vfs_create_node(enum vfs_node_type type);
 void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child);
+/* Device number of the filesystem a node belongs to, resolved through its
+ * ancestors when the node itself predates the mount stamp. */
+u32 vfs_node_dev(struct vfs_node *node);
 isize vfs_readdir_children(struct vfs_node *dir, usize offset,
                            struct dirent *buf, usize max_entries);
 
@@ -449,6 +459,12 @@ struct vfs_socket_state {
   /* M32b socket options + shutdown state (SHUT_RD/WR half-close flags). */
   int so_reuseaddr;
   int so_keepalive;
+  /* SO_PASSCRED: the receiver asked for the sender's credentials to be attached
+   * to every message it gets, instead of only to messages whose sender chose to
+   * send SCM_CREDENTIALS. Crashpad's handler relies on this to learn, from the
+   * kernel rather than from the message body, which process is asking it for a
+   * dump. AF_UNIX only. */
+  int so_passcred;
   int tcp_nodelay;
   int ipv6_v6only;
   int so_error;

@@ -874,11 +874,36 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
      * force the default terminate action (matching Linux force_sig()). This
      * also covers the case where the signal is re-raised inside its own handler
      * (where it is blocked): the second fault terminates instead of looping. */
+    /* M80 crash capture: record what faulted before anything else can run.
+     * A page fault's address is CR2 and its si_code says whether the page was
+     * absent (SEGV_MAPERR) or present but inaccessible (SEGV_ACCERR); every
+     * other fault reports the instruction pointer with SI_KERNEL. The record is
+     * what the task's own SA_SIGINFO handler and a tracer's PTRACE_GETSIGINFO
+     * both read back. */
+    if (frame->vector == 14)
+      ptrace_record_fault(current_task, sig, read_cr2(),
+                          (frame->error_code & 1) ? B1NIX_SEGV_ACCERR
+                                                  : B1NIX_SEGV_MAPERR);
+    else
+      ptrace_record_fault(current_task, sig, frame->rip, B1NIX_SI_KERNEL);
+
     usize pid = scheduler_get_pid();
     struct sigaction *sa = &current_task->sigactions[sig - 1];
     int is_blocked = (current_task->blocked_signals >> (sig - 1)) & 1ULL;
     int has_handler =
         (sa->sa_handler != SIG_DFL && sa->sa_handler != SIG_IGN);
+
+    /* A traced task's tracer gets first refusal on a fatal fault, exactly as
+     * Linux's force_sig does: delivery parks the task in ptrace_signal_stop
+     * with its register frame snapshotted, so a debugger or crash reporter sees
+     * the crash instead of a corpse. Without this a traced process that faults
+     * with no handler would be torn down before its tracer ever woke up. */
+    if (!has_handler && ptrace_is_traced(current_task)) {
+      scheduler_kill(pid, sig);
+      arch_check_and_deliver_signals(frame);
+      scheduler_yield();
+      return;
+    }
 
     if (has_handler && !is_blocked) {
       console_write("delivering signal ");

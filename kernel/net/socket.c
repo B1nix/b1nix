@@ -730,7 +730,11 @@ int vfs_socket(int domain, int type, int protocol) {
       domain != B1NIX_AF_UNIX && domain != B1NIX_AF_NETLINK)
     return -EAFNOSUPPORT;
   if (type != B1NIX_SOCK_DGRAM && type != B1NIX_SOCK_STREAM &&
-      type != B1NIX_SOCK_RAW) return -ESOCKTNOSUPPORT;
+      type != B1NIX_SOCK_RAW && type != B1NIX_SOCK_SEQPACKET)
+    return -ESOCKTNOSUPPORT;
+  /* SOCK_SEQPACKET exists only on the local (AF_UNIX) transport. */
+  if (type == B1NIX_SOCK_SEQPACKET && domain != B1NIX_AF_UNIX)
+    return -EPROTONOSUPPORT;
   /* Raw sockets are IPv4 (BusyBox ping/ICMP) or netlink (BusyBox ip). */
   if (type == B1NIX_SOCK_RAW && domain != B1NIX_AF_INET &&
       domain != B1NIX_AF_NETLINK)
@@ -776,7 +780,8 @@ int vfs_socketpair(int domain, int type, int protocol, int sv[2]) {
   type &= ~(SOCK_TYPE_CLOEXEC | SOCK_TYPE_NONBLOCK);
   if (domain != B1NIX_AF_UNIX)
     return -EAFNOSUPPORT;
-  if (type != B1NIX_SOCK_STREAM && type != B1NIX_SOCK_DGRAM)
+  if (type != B1NIX_SOCK_STREAM && type != B1NIX_SOCK_DGRAM &&
+      type != B1NIX_SOCK_SEQPACKET)
     return -ESOCKTNOSUPPORT;
 
   struct vfs_handle *ha = 0, *hb = 0;
@@ -1241,6 +1246,8 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
 #define SOCK_SO_RCVBUF    8
 #define SOCK_SO_KEEPALIVE 9
 #define SOCK_SO_REUSEPORT 15
+#define SOCK_SO_PASSCRED  16
+#define SOCK_SO_PEERCRED  17
 #define SOCK_SO_ACCEPTCONN 30
 #define SOCK_TCP_NODELAY  1
 #define SOCK_IPV6_V6ONLY  26
@@ -1271,6 +1278,10 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     case SOCK_SO_KEEPALIVE: s->so_keepalive = v ? 1 : 0; return 0;
     case SOCK_SO_SNDBUF:    s->so_sndbuf = v; return 0;
     case SOCK_SO_RCVBUF:    s->so_rcvbuf = v; return 0;
+    case SOCK_SO_PASSCRED:
+      if (s->domain != B1NIX_AF_UNIX) return -ENOPROTOOPT;
+      s->so_passcred = v ? 1 : 0;
+      return 0;
     case SOCK_SO_ERROR:     return -ENOPROTOOPT; /* read-only */
     default:                return -ENOPROTOOPT;
     }
@@ -1300,7 +1311,23 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
   int err;
   struct vfs_socket_state *s = socket_state_for_fd(fd, &err);
   if (!s) return err;
-  if (!optval || !optlen || *optlen < sizeof(int)) return -EINVAL;
+  if (!optval || !optlen) return -EINVAL;
+
+  /* SO_PEERCRED is the one option whose value is not an int: it returns a
+   * struct ucred {pid,uid,gid}. Handle it before the int-sized checks below. */
+  if (level == SOCK_SOL_SOCKET && optname == SOCK_SO_PEERCRED) {
+    if (s->domain != B1NIX_AF_UNIX) return -ENOPROTOOPT;
+    struct b1nix_ucred cred;
+    int rc = unix_peer_cred(s, &cred);
+    if (rc < 0) return rc;
+    usize need = sizeof(cred);
+    if (*optlen < need) return -EINVAL;
+    memcpy(optval, &cred, need);
+    *optlen = need;
+    return 0;
+  }
+
+  if (*optlen < sizeof(int)) return -EINVAL;
   int v = 0;
 
   if (level == SOCK_SOL_SOCKET) {
@@ -1313,6 +1340,7 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     case SOCK_SO_SNDBUF:    v = s->so_sndbuf; break;
     case SOCK_SO_RCVBUF:    v = s->so_rcvbuf; break;
     case SOCK_SO_ACCEPTCONN: v = s->listening; break;
+    case SOCK_SO_PASSCRED:  v = s->so_passcred; break;
     default:                return -ENOPROTOOPT;
     }
   } else if (level == SOCK_IPPROTO_TCP && optname == SOCK_TCP_NODELAY) {

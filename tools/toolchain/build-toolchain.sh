@@ -31,6 +31,26 @@ if [ -d "$MUSL_USR" ]; then
     cp -Rf "$MUSL_USR/lib/"* "$SYSROOT/lib/" 2>/dev/null || true
 fi
 
+# The kernel UAPI headers b1nix publishes (linux/, asm/, asm-generic/) plus the
+# b1nix-only extras and <sys/cdefs.h>. musl owns every libc header — copying the
+# native b1nix libc headers over it would swap the O_* constants out from under
+# the ABI — so only the trees musl does NOT provide are layered in, and never
+# over an existing file (-n). This is the linux-headers package a distribution
+# ships: without it, a port that includes <linux/...> only builds if its own
+# build script bolts on a private copy of the header, which is a patch by
+# another name.
+if [ -d "$PROJECT_DIR/userspace/include" ]; then
+    for _dir in "$SYSROOT/include" "$SYSROOT/usr/include"; do
+        mkdir -p "$_dir/sys"
+        for _tree in linux asm asm-generic b1nix; do
+            [ -d "$PROJECT_DIR/userspace/include/$_tree" ] &&
+                cp -Rn "$PROJECT_DIR/userspace/include/$_tree" "$_dir/" 2>/dev/null
+        done
+        [ -f "$PROJECT_DIR/userspace/include/sys/cdefs.h" ] &&
+            cp -n "$PROJECT_DIR/userspace/include/sys/cdefs.h" "$_dir/sys/" 2>/dev/null
+    done
+fi
+
 # 3. Create the LLVM/Clang compiler wrappers and tool symlinks in PREFIX/bin
 echo "Creating compiler shims and tool symlinks..."
 
