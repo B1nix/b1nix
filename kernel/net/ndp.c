@@ -12,6 +12,7 @@
  */
 
 #include <b1nix/net.h>
+#include <b1nix/netdev.h>
 #include <b1nix/console.h>
 #include <b1nix/sched.h>
 #include <string.h>
@@ -37,6 +38,9 @@ void ndp_init(void)
 {
 	for (int i = 0; i < NDP_CACHE_SIZE; i++)
 		ndp_cache[i].valid = 0;
+	/* The DHCPv6 client must exist before the first router advertisement can
+	 * ask for it (the M/O flags start it). */
+	dhcpv6_init();
 }
 
 static int in6_eq(const struct in6_addr_k *a, const struct in6_addr_k *b)
@@ -94,7 +98,7 @@ static int is_one_of_ours(const struct in6_addr_k *a)
 
 /* Send a Neighbor Solicitation for `target` (to its solicited-node group),
  * carrying our source link-layer address. */
-static void ndp_send_ns(struct in6_addr_k target)
+static void ndp_send_ns_dev(struct in6_addr_k target, struct netdev *dev)
 {
 	u8 ns[24 + 8];
 	memset(ns, 0, sizeof(ns));
@@ -102,10 +106,12 @@ static void ndp_send_ns(struct in6_addr_k target)
 	memcpy(ns + 8, target.bytes, 16);
 	ns[24] = ND_OPT_SLLA;
 	ns[25] = 1; /* length in units of 8 bytes */
-	struct mac_addr mac = net_get_mac();
+	/* M84: the solicitation must carry (and leave through) the interface the
+	 * route selected, not always the active one. */
+	struct mac_addr mac = dev ? dev->mac : net_get_mac();
 	memcpy(ns + 26, mac.bytes, 6);
 	struct in6_addr_k dst = solicited_node(&target);
-	ipv6_send(dst, IP6_NH_ICMPV6, ns, sizeof(ns));
+	ipv6_send_via(dev, dst, IP6_NH_ICMPV6, ns, sizeof(ns));
 }
 
 /* Reply to a Neighbor Solicitation with a Neighbor Advertisement. */
@@ -141,7 +147,8 @@ static void ndp_send_rs(void)
 	ipv6_send(all_routers, IP6_NH_ICMPV6, rs, sizeof(rs));
 }
 
-int ndp_resolve(struct in6_addr_k ip, struct mac_addr *mac)
+int ndp_resolve_dev(struct in6_addr_k ip, struct mac_addr *mac,
+                    struct netdev *dev)
 {
 	for (int i = 0; i < NDP_CACHE_SIZE; i++) {
 		if (ndp_cache[i].valid && in6_eq(&ndp_cache[i].ip, &ip)) {
@@ -149,8 +156,13 @@ int ndp_resolve(struct in6_addr_k ip, struct mac_addr *mac)
 			return 1;
 		}
 	}
-	ndp_send_ns(ip);
+	ndp_send_ns_dev(ip, dev);
 	return 0;
+}
+
+int ndp_resolve(struct in6_addr_k ip, struct mac_addr *mac)
+{
+	return ndp_resolve_dev(ip, mac, 0);
 }
 
 /* Walk ND options looking for a link-layer-address option (SLLA/TLLA); on a
@@ -298,15 +310,26 @@ void ndp_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
 	if (type == ICMP6_RA) {
 		if (size < 16)
 			return;
+		/* RFC 4861 flags byte: M (0x80) means addresses come from DHCPv6, O
+		 * (0x40) means other configuration (resolvers) does. Either one starts
+		 * the stateful client. */
+		u8 ra_flags = p[5];
+		if (ra_flags & 0xC0)
+			dhcpv6_start();
 		/* The router's link-local source becomes the default gateway. */
 		if (!in6_is_zero(&src))
 			net_set_gateway6(src);
+		int ra_prefix_valid = 0;
+		struct in6_addr_k ra_prefix;
+		memset(&ra_prefix, 0, sizeof(ra_prefix));
 		struct mac_addr rmac;
 		if (nd_find_lladdr(p + 16, size - 16, &rmac))
 			ndp_cache_put(src, rmac);
 		struct in6_addr_k prefix;
 		if (nd_find_prefix(p + 16, size - 16, &prefix)) {
 			net_set_prefix6(prefix);
+			ra_prefix_valid = 1;
+			ra_prefix = prefix;
 			/* SLAAC: global = prefix[0:8] || EUI-64 iid (from link-local). */
 			struct in6_addr_k ll = net_get_ip6_ll();
 			struct in6_addr_k global;
@@ -318,6 +341,19 @@ void ndp_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
 				slaac_configured = 1;
 				console_write("net: ipv6 SLAAC configured a global address\n");
 			}
+		}
+		/* M84: feed the advertisement into the IPv6 FIB — the on-link /64
+		 * prefix plus a default route via the advertising router. This is what
+		 * ipv6_link_output() now consults for every off-link destination. */
+		{
+			struct in6_addr_k router = in6_is_zero(&src) ? ra_prefix : src;
+			struct in6_addr_k zero;
+			memset(&zero, 0, sizeof(zero));
+			if (ra_prefix_valid)
+				route6_configure_interface(ra_prefix, 64,
+				                           in6_is_zero(&src) ? zero : router);
+			else if (!in6_is_zero(&src))
+				route6_configure_interface(zero, 0, router);
 		}
 		return;
 	}

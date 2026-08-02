@@ -178,6 +178,32 @@ void udp6_send(struct in6_addr_k dst, u16 src_port_net, u16 dst_port_net,
 	kfree(buffer);
 }
 
+/* M84: in-kernel consumers of well-known IPv6 UDP ports (DHCPv6 is the first
+ * one). Mirrors the IPv4 handler table, but the callback also gets the source
+ * address — a DHCPv6 client needs to know which server answered. */
+#define UDP6_MAX_HANDLERS 4
+static struct {
+	u16 port;
+	udp6_port_handler_t handler;
+} udp6_handlers[UDP6_MAX_HANDLERS];
+static usize udp6_handler_count;
+
+int udp6_register_handler(u16 port, udp6_port_handler_t handler)
+{
+	for (usize i = 0; i < udp6_handler_count; i++) {
+		if (udp6_handlers[i].port == port) {
+			udp6_handlers[i].handler = handler;
+			return 0;
+		}
+	}
+	if (udp6_handler_count >= UDP6_MAX_HANDLERS)
+		return -1;
+	udp6_handlers[udp6_handler_count].port = port;
+	udp6_handlers[udp6_handler_count].handler = handler;
+	udp6_handler_count++;
+	return 0;
+}
+
 void udp6_receive(struct in6_addr_k src, struct in6_addr_k dst,
                   const void *data, usize size)
 {
@@ -190,6 +216,14 @@ void udp6_receive(struct in6_addr_k src, struct in6_addr_k dst,
 
 	const void *payload = (const u8 *)data + sizeof(struct udp_header);
 	usize payload_size = length - sizeof(struct udp_header);
+
+	u16 dport = bswap16(hdr->dst_port);
+	for (usize i = 0; i < udp6_handler_count; i++) {
+		if (udp6_handlers[i].port == dport && udp6_handlers[i].handler) {
+			udp6_handlers[i].handler(src, payload, payload_size);
+			return;
+		}
+	}
 
 	if (!vfs_socket_push_udp(hdr->dst_port, payload, payload_size))
 		icmpv6_send_dest_unreachable(src, 4 /* port unreachable */, data,

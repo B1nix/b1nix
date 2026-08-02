@@ -31,7 +31,17 @@ void net_interrupt_handler(void);
 int net_get_irq(void);
 
 // Virtio Network Data Plane
+struct netdev;
 void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, usize size);
+/* Same, but transmitted out of a specific interface (NULL = the active one).
+ * Used by the per-interface FIB so a route's output device is honoured. */
+void net_send_ethernet_dev(struct netdev *nd, struct mac_addr dst, u16 ethertype,
+                           const void *payload, usize size);
+/* Interface indices: 1-based registration order, 0 = unspecified. */
+int netdev_index_of(struct netdev *nd);
+struct netdev *netdev_by_index(int idx);
+void netdev_ifname(int idx, char *out, usize cap);
+int netdev_index_by_name(const char *name);
 
 // Ethernet
 void ethernet_receive(const void *data, usize size);
@@ -40,6 +50,9 @@ void ethernet_receive(const void *data, usize size);
 void arp_init(void);
 void arp_receive(const void *data, usize size);
 int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac);
+/* Resolve, sending any request out of `dev` (NULL = the active interface). */
+int arp_resolve_dev(struct ipv4_addr ip, struct mac_addr *mac,
+                    struct netdev *dev);
 
 // IPv4
 void ipv4_receive(const void *data, usize size);
@@ -49,6 +62,9 @@ int ipv4_is_loopback(struct ipv4_addr ip);
 // IPv6 datapath (loopback + real-link via NDP)
 void ipv6_receive(const void *data, usize size);
 void ipv6_send(struct in6_addr_k dst, u8 next_header, const void *payload, usize size);
+/* Same, transmitted out of a specific interface (NULL = let the FIB decide). */
+void ipv6_send_via(struct netdev *dev, struct in6_addr_k dst, u8 next_header,
+                   const void *payload, usize size);
 u32 icmpv6_echo_reply_count(void);
 void icmpv6_send_dest_unreachable(struct in6_addr_k dst, u8 code,
                                   const void *quoted, usize quoted_len);
@@ -77,6 +93,9 @@ void ndp_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
 /* Resolve a link-local/on-link IPv6 address to a MAC. Returns 1 with *mac on a
  * cache hit, otherwise sends a Neighbor Solicitation and returns 0 (retry). */
 int ndp_resolve(struct in6_addr_k ip, struct mac_addr *mac);
+/* Resolve, soliciting out of `dev` (NULL = the active interface). */
+int ndp_resolve_dev(struct in6_addr_k ip, struct mac_addr *mac,
+                    struct netdev *dev);
 /* UDP over IPv6 (loopback ::1 datapath). */
 void udp6_send(struct in6_addr_k dst, u16 src_port_net, u16 dst_port_net,
                const void *payload, usize size);
@@ -99,6 +118,10 @@ void udp_receive(struct ipv4_addr src, const void *data, usize size);
 void udp_send_net(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net, const void *payload, usize size);
 void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload, usize size);
 int udp_register_handler(u16 port, udp_port_handler_t handler);
+/* IPv6 UDP handlers also receive the datagram's source address. */
+typedef void (*udp6_port_handler_t)(struct in6_addr_k src, const void *data,
+                                    usize size);
+int udp6_register_handler(u16 port, udp6_port_handler_t handler);
 
 // DHCP
 void dhcp_init(void);
@@ -130,6 +153,21 @@ int dns_last_result6(u8 out[16]);
  * /etc/resolv.conf lazily on first use). */
 void dns_set_server(struct ipv4_addr server);
 struct ipv4_addr dns_get_server(void);
+/* IPv6 nameserver learnt from DHCPv6 option 23. */
+void dns_set_server6(struct in6_addr_k s);
+struct in6_addr_k dns_get_server6(void);
+int dns_has_server6(void);
+
+// DHCPv6 (RFC 8415) — stateful address configuration
+void dhcpv6_init(void);
+void dhcpv6_start(void);
+void dhcpv6_stop(void);
+void dhcpv6_tick(u64 now_ticks);
+int dhcpv6_is_bound(void);
+struct in6_addr_k dhcpv6_get_address(void);
+/* Self-test: drives Solicit/Advertise/Request/Reply and Renew through the real
+ * receive path against a synthetic server. */
+void dhcpv6_smoke(void);
 /* Lazily parse /etc/resolv.conf for "nameserver <ip>"; returns 1 if a server
  * was parsed, 0 otherwise. Idempotent. */
 int dns_load_resolv_conf(void);
@@ -180,8 +218,129 @@ u32 tcp_debug_peek_iss(struct ipv4_addr remote_ip, u16 remote_port,
 struct mac_addr net_get_mac(void);
 struct ipv4_addr net_get_ip(void);
 struct ipv4_addr net_get_gateway(void);
+struct ipv4_addr net_get_netmask(void);
 void net_set_ip(struct ipv4_addr ip);
 void net_set_gateway(struct ipv4_addr gw);
+void net_set_netmask(struct ipv4_addr mask);
+
+/* ── M84: IPv4 FIB (kernel/net/route.c) ──────────────────────────────────
+ * Longest-prefix-match routing table. Addresses are host order (a.b.c.d ->
+ * 0xAABBCCDD); use route_ipv4_to_host()/route_host_to_ipv4() at the edges.
+ * Flag values match Linux's RTF_* so BusyBox `route` and /proc/net/route
+ * agree with the kernel. */
+#define RTF_UP      0x0001
+#define RTF_GATEWAY 0x0002
+#define RTF_HOST    0x0004
+
+struct route_info {
+	u32 dst;
+	u32 mask;
+	u32 gateway;
+	u16 flags;
+	u16 metric;
+	int oif;         /* output interface index, 0 = unspecified */
+	u32 table;
+	char iface[8];
+};
+
+struct route6_info {
+	u8 dst[16];
+	u8 gateway[16];
+	u8 plen;
+	u16 flags;
+	u16 metric;
+	int oif;
+	u32 table;
+	char iface[8];
+};
+
+/* Policy routing: routes live in numbered tables, rules pick the table. */
+#define RT_TABLE_MAIN 254
+
+struct route_rule_info {
+	u8 family;
+	u32 prio;
+	u32 src;
+	u32 src_mask;
+	u8 src6[16];
+	u8 src6_plen;
+	int iif;
+	u32 table;
+};
+
+u32 route_ipv4_to_host(struct ipv4_addr a);
+struct ipv4_addr route_host_to_ipv4(u32 v);
+int route_add(u32 dst, u32 mask, u32 gw, u16 flags, u16 metric,
+              const char *iface);
+/* Same, naming the output interface by index (0 = unspecified). */
+int route_add_oif(u32 dst, u32 mask, u32 gw, u16 flags, u16 metric, int oif);
+int route_add_table(u32 dst, u32 mask, u32 gw, u16 flags, u16 metric, int oif,
+                    u32 table);
+int route_del(u32 dst, u32 mask, u32 gw);
+int route_del_table(u32 dst, u32 mask, u32 gw, u32 table);
+/* Install the default policy (everything looks in the main table). */
+void route_init(void);
+void route_rules_reset(void);
+int route_rule_add(u8 family, u32 prio, struct ipv4_addr src4,
+                   struct ipv4_addr mask4, struct in6_addr_k src6, u8 plen6,
+                   int iif, u32 table);
+int route_rule_del(u8 family, u32 prio);
+usize route_rule_snapshot(struct route_rule_info *out, usize max);
+/* Text control planes behind /proc/net/rt_tables and /proc/net/rt_rules. */
+int route_control_write(const char *buf, usize len);
+int route_rule_control_write(const char *buf, usize len);
+/* Drop routes installed by DHCP/autoconf; manual routes survive. */
+void route_flush_dynamic(void);
+void route_flush_all(void);
+/* Install the on-link prefix for `ip`/`mask` plus a default route via `gw`,
+ * replacing any previous dynamic entries. Called on every DHCP bind. */
+void route_configure_interface(struct ipv4_addr ip, struct ipv4_addr mask,
+                               struct ipv4_addr gw);
+/* Longest-prefix-match, with equal-cost load sharing hashed on the
+ * destination. Returns 1 and fills *nexthop with the address to resolve at
+ * layer 2 (the destination for an on-link route, the gateway otherwise), the
+ * matched route's flags, and its output interface index. 0 when no route
+ * matches. Any out-parameter may be NULL. */
+int route_lookup(struct ipv4_addr dst, struct ipv4_addr *nexthop, u16 *flags,
+                 int *oif);
+/* Same, but the equal-cost hop is chosen by a flow hash (5-tuple) so distinct
+ * flows to one destination can use different next hops without reordering. */
+int route_lookup_flow(struct ipv4_addr dst, u32 flow, struct ipv4_addr *nexthop,
+                      u16 *flags, int *oif);
+/* Full policy lookup: source and input interface select the rule, the rule
+ * selects the table. */
+int route_lookup_ex(struct ipv4_addr src, struct ipv4_addr dst, u32 flow,
+                    int iif, struct ipv4_addr *nexthop, u16 *flags, int *oif);
+/* Flow hash over the 5-tuple, for the ECMP selector. */
+u32 route_flow_hash(const void *src_addr, const void *dst_addr, usize addr_len,
+                    u8 proto, u16 sport, u16 dport);
+usize route_snapshot(struct route_info *out, usize max);
+
+/* IPv6 FIB — same model, prefix lengths instead of masks. */
+void route6_init(void);
+int route6_add(struct in6_addr_k dst, u8 plen, struct in6_addr_k gw, u16 flags,
+               u16 metric, int oif);
+int route6_add_table(struct in6_addr_k dst, u8 plen, struct in6_addr_k gw,
+                     u16 flags, u16 metric, int oif, u32 table);
+int route6_del(struct in6_addr_k dst, u8 plen, struct in6_addr_k gw);
+int route6_del_table(struct in6_addr_k dst, u8 plen, struct in6_addr_k gw,
+                     u32 table);
+void route6_flush_dynamic(void);
+void route6_flush_all(void);
+/* SLAAC result: on-link prefix + default route via the advertising router. */
+void route6_configure_interface(struct in6_addr_k prefix, u8 plen,
+                                struct in6_addr_k router);
+int route6_lookup(struct in6_addr_k dst, struct in6_addr_k *nexthop,
+                  u16 *flags, int *oif);
+int route6_lookup_flow(struct in6_addr_k dst, u32 flow,
+                       struct in6_addr_k *nexthop, u16 *flags, int *oif);
+int route6_lookup_ex(struct in6_addr_k src, struct in6_addr_k dst, u32 flow,
+                     int iif, struct in6_addr_k *nexthop, u16 *flags, int *oif);
+usize route6_snapshot(struct route6_info *out, usize max);
+/* M84 self-test: LPM ordering, host routes, metric tie-break, deletion. */
+void route_smoke(void);
+/* M84 self-test: TCP option parsing, window scaling, out-of-order reassembly. */
+void tcp_robustness_smoke(void);
  
 struct vfs_socket_state;
 struct vfs_handle;

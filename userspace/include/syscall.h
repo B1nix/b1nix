@@ -224,6 +224,8 @@ enum {
   SYS_FLOCK             = 240, /* flock(fd, operation) */
   SYS_CLOCK_GETRES      = 241, /* clock_getres(clk_id, res) */
   SYS_SIGTIMEDWAIT      = 242, /* sigtimedwait(set, info, timeout) */
+  SYS_TKILL             = 243, /* tkill(tid, sig) */
+  SYS_TGKILL            = 244, /* tgkill(tgid, tid, sig) */
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the
@@ -1017,8 +1019,11 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
  * kernel_sigaction) differ from b1nix `struct sigaction` — the between-fork/exec
  * handler reset is therefore best-effort, not bit-exact. */
 #define SYS_rt_sigaction    SYS_SIGNAL
-#define SYS_tgkill          SYS_KILL   /* drops tgid; b1nix tids are unique */
 #define SYS_exit_group      SYS_EXIT_GROUP
+/* M86: real thread-directed signals — tgkill checks the thread group, so a tid
+ * recycled into another process is -ESRCH instead of a misdelivered signal. */
+#define SYS_tgkill          SYS_TGKILL
+#define SYS_tkill           SYS_TKILL
 #define SYS_clock_nanosleep 1024  /* -ENOSYS -> caller falls back to nanosleep */
 #define SYS_pkey_mprotect   1025  /* b1nix has no protection keys -> -ENOSYS */
 #define SYS_pkey_alloc      1026

@@ -32,6 +32,22 @@ static int g_dns_verbose = 1;
 
 void dns_receive(const void *data, usize size);
 
+/* M84: DHCPv6 hands out IPv6 resolvers (option 23). The resolver datapath is
+ * still IPv4 (dns_resolve_sync sends over UDP/IPv4), so the v6 nameserver is
+ * recorded and exposed rather than pretended to be used. */
+static struct in6_addr_k dns_server6;
+static int dns_server6_valid;
+
+void dns_set_server6(struct in6_addr_k s)
+{
+	dns_server6 = s;
+	dns_server6_valid = 1;
+}
+
+struct in6_addr_k dns_get_server6(void) { return dns_server6; }
+
+int dns_has_server6(void) { return dns_server6_valid; }
+
 void dns_set_server(struct ipv4_addr server)
 {
 	g_dns_server = server;

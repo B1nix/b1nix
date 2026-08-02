@@ -1,3 +1,4 @@
+#include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -256,10 +257,54 @@ static usize g_task_tgid[MAX_TASKS];
 static u8    g_task_exiting[MAX_TASKS];
 static int   g_task_ctty_type[MAX_TASKS];
 static int   g_task_ctty_index[MAX_TASKS];
-static u64   g_task_utime[MAX_TASKS];
-static u64   g_task_stime[MAX_TASKS];
-static u64   g_task_cutime[MAX_TASKS];
-static u64   g_task_cstime[MAX_TASKS];
+/* M86: per-thread CPU accounting, in NANOSECONDS. The counters are advanced by
+ * acct_flush() from the four boundaries where a CPU changes what it is running
+ * or which mode it runs in (ring-3 entry/exit and context switch), so they are
+ * exact TSC deltas rather than the 100 Hz sample the tick charger produced —
+ * a thread that always blocks before the tick used to account as 0. Per-task
+ * counters are only ever written by the CPU currently running that task, so
+ * plain adds are SMP-safe. */
+static u64   g_task_utime_ns[MAX_TASKS];
+static u64   g_task_stime_ns[MAX_TASKS];
+static u64   g_task_cutime_ns[MAX_TASKS];
+static u64   g_task_cstime_ns[MAX_TASKS];
+/* Scheduler tick at which the slot's current occupant was created — /proc's
+ * starttime field, and the base for a task's wall-clock age. */
+static u64   g_task_start_tick[MAX_TASKS];
+/* Context-switch counts: voluntary (the task blocked/slept/exited of its own
+ * accord) and involuntary (it was still runnable when preempted). getrusage's
+ * ru_nvcsw/ru_nivcsw. */
+static u64   g_task_nvcsw[MAX_TASKS];
+static u64   g_task_nivcsw[MAX_TASKS];
+/* CPU time of threads that have already exited, folded into their thread-group
+ * leader's slot. Without it a process's own CPU time would SHRINK as its
+ * threads finish — times(2), getrusage(RUSAGE_SELF) and
+ * CLOCK_PROCESS_CPUTIME_ID all have to keep counting work that is done. */
+static u64   g_task_gone_utime_ns[MAX_TASKS];
+static u64   g_task_gone_stime_ns[MAX_TASKS];
+/* M86: set while a thread-group leader that called exit(2) waits for its
+ * remaining threads (scheduler_exit_thread). Such a leader is already dead as
+ * far as userspace is concerned, so a group teardown must not SIGKILL it — it
+ * is handed the group's exit code through g_task_parked_code instead, and
+ * reports that as an ordinary exit, the way Linux reports the exit_group() of
+ * whichever thread ran it. */
+/* M86: peak resident set (ru_maxrss). The value itself is measured exactly, by
+ * walking the task's page tables — the same walk /proc/<pid>/statm does — so it
+ * cannot drift the way an incrementally maintained counter would (fork's COW
+ * table copy, exec teardown and swap-out all move pages without passing through
+ * a single choke point). What is maintained here is only the MAXIMUM of those
+ * measurements. Resident memory falls only at munmap, brk-shrink, exec teardown
+ * and swap-out, so sampling immediately before each of those, plus on every
+ * read, sees every peak; the sample is rate-limited to one per scheduler tick
+ * so a munmap-heavy process does not pay for a page-table walk per call. */
+static u64   g_task_maxrss_pages[MAX_TASKS];
+static u64   g_task_rss_sample_tick[MAX_TASKS];
+static u8    g_task_parked_leader[MAX_TASKS];
+static u8    g_task_parked_override[MAX_TASKS];
+static int   g_task_parked_code[MAX_TASKS];
+/* Set on a thread pulled into a group stop by a signal sent to its leader: it
+ * parks without posting its own SIGCHLD/stop report (see the delivery path). */
+static u8    g_task_stop_quiet[MAX_TASKS];
 static u64   g_task_pass[MAX_TASKS];
 static u64   g_min_pass = 0;
 /* Last userspace RIP of each task, captured by the LAPIC timer tick when it
@@ -519,10 +564,20 @@ static struct task *find_unused_task(void) {
       g_task_tgid[i] = 0;
       g_task_ctty_type[i] = 0;
       g_task_ctty_index[i] = 0;
-      g_task_utime[i] = 0;
-      g_task_stime[i] = 0;
-      g_task_cutime[i] = 0;
-      g_task_cstime[i] = 0;
+      g_task_utime_ns[i] = 0;
+      g_task_stime_ns[i] = 0;
+      g_task_cutime_ns[i] = 0;
+      g_task_cstime_ns[i] = 0;
+      g_task_start_tick[i] = scheduler_ticks;
+      g_task_nvcsw[i] = 0;
+      g_task_nivcsw[i] = 0;
+      g_task_gone_utime_ns[i] = 0;
+      g_task_gone_stime_ns[i] = 0;
+      g_task_maxrss_pages[i] = 0;
+      g_task_rss_sample_tick[i] = 0;
+      g_task_parked_leader[i] = 0;
+      g_task_parked_override[i] = 0;
+      g_task_stop_quiet[i] = 0;
       g_task_pass[i] = g_min_pass;
       g_task_vfork_pending[i] = 0;
       for (int r = 0; r < 16; r++) {
@@ -565,6 +620,20 @@ static struct task *find_unused_task(void) {
   rt_state_free(i); /* M74: drop any RT-signal state from the prior occupant */
   g_task_alarm_ticks[i] = 0;
       g_task_alarm_interval_ticks[i] = 0;
+  g_task_utime_ns[i] = 0;
+  g_task_stime_ns[i] = 0;
+  g_task_cutime_ns[i] = 0;
+  g_task_cstime_ns[i] = 0;
+  g_task_start_tick[i] = scheduler_ticks;
+  g_task_nvcsw[i] = 0;
+  g_task_nivcsw[i] = 0;
+  g_task_gone_utime_ns[i] = 0;
+  g_task_gone_stime_ns[i] = 0;
+  g_task_maxrss_pages[i] = 0;
+  g_task_rss_sample_tick[i] = 0;
+  g_task_parked_leader[i] = 0;
+  g_task_parked_override[i] = 0;
+  g_task_stop_quiet[i] = 0;
   for (int r = 0; r < 16; r++) {
     g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
     g_task_rlimits[i][r].rlim_max = RLIM_INFINITY;
@@ -958,10 +1027,20 @@ void scheduler_init(void) {
   g_task_tgid[0] = boot->id;
   g_task_ctty_type[0] = 1; /* 1 = console */
   g_task_ctty_index[0] = 0;
-  g_task_utime[0] = 0;
-  g_task_stime[0] = 0;
-  g_task_cutime[0] = 0;
-  g_task_cstime[0] = 0;
+  g_task_utime_ns[0] = 0;
+  g_task_stime_ns[0] = 0;
+  g_task_cutime_ns[0] = 0;
+  g_task_cstime_ns[0] = 0;
+  g_task_start_tick[0] = 0;
+  g_task_nvcsw[0] = 0;
+  g_task_nivcsw[0] = 0;
+  g_task_gone_utime_ns[0] = 0;
+  g_task_gone_stime_ns[0] = 0;
+  g_task_maxrss_pages[0] = 0;
+  g_task_rss_sample_tick[0] = 0;
+  g_task_parked_leader[0] = 0;
+  g_task_parked_override[0] = 0;
+  g_task_stop_quiet[0] = 0;
   g_task_pass[0] = 0;
   for (int r = 0; r < 16; r++) {
     g_task_rlimits[0][r].rlim_cur = RLIM_INFINITY;
@@ -1711,21 +1790,104 @@ void task_set_user_rip(struct task *t, u64 rip) {
   if (!t) return;
   g_task_user_rip[task_index(t)] = rip;
 }
-u64 task_utime(const struct task *t) {
+/* ── M86: per-thread CPU time ─────────────────────────────────────────────── */
+/* Nanosecond accessors are the primitives; the tick accessors (clock_t at the
+ * 100 Hz USER_HZ times(2)/procfs report in) are derived from them. */
+u64 task_utime_ns(const struct task *t) {
   if (!t) return 0;
-  return g_task_utime[task_index(t)];
+  return g_task_utime_ns[task_index(t)];
+}
+u64 task_stime_ns(const struct task *t) {
+  if (!t) return 0;
+  return g_task_stime_ns[task_index(t)];
+}
+u64 task_cutime_ns(const struct task *t) {
+  if (!t) return 0;
+  return g_task_cutime_ns[task_index(t)];
+}
+u64 task_cstime_ns(const struct task *t) {
+  if (!t) return 0;
+  return g_task_cstime_ns[task_index(t)];
+}
+/* Thread-group totals: POSIX times(2) and getrusage(RUSAGE_SELF) report the
+ * whole process, so a thread's own counters are not the answer for them — only
+ * getrusage(RUSAGE_THREAD) and CLOCK_THREAD_CPUTIME_ID use the per-task values.
+ * The walk is over live slots and takes no lock: each counter is a u64 read of
+ * a value only its own CPU writes, so a racing thread can make the sum a few
+ * hundred nanoseconds stale, never torn. */
+void task_group_cputime_ns(const struct task *t, u64 *utime_ns, u64 *stime_ns) {
+  u64 u = 0, s = 0;
+  if (t) {
+    usize tgid = g_task_tgid[task_index(t)];
+    if (tgid == 0) tgid = t->id;
+    for (usize i = 0; i < g_task_hwm; i++) {
+      if (T(i)->state == TASK_UNUSED)
+        continue;
+      if (g_task_tgid[i] != tgid && T(i)->id != tgid)
+        continue;
+      u += g_task_utime_ns[i];
+      s += g_task_stime_ns[i];
+      if (T(i)->id == tgid) {
+        u += g_task_gone_utime_ns[i];
+        s += g_task_gone_stime_ns[i];
+      }
+    }
+  }
+  if (utime_ns) *utime_ns = u;
+  if (stime_ns) *stime_ns = s;
+}
+u64 task_utime(const struct task *t) {
+  return task_utime_ns(t) / NS_PER_USER_TICK;
 }
 u64 task_stime(const struct task *t) {
-  if (!t) return 0;
-  return g_task_stime[task_index(t)];
+  return task_stime_ns(t) / NS_PER_USER_TICK;
 }
 u64 task_cutime(const struct task *t) {
-  if (!t) return 0;
-  return g_task_cutime[task_index(t)];
+  return task_cutime_ns(t) / NS_PER_USER_TICK;
 }
 u64 task_cstime(const struct task *t) {
+  return task_cstime_ns(t) / NS_PER_USER_TICK;
+}
+u64 task_start_ticks(const struct task *t) {
   if (!t) return 0;
-  return g_task_cstime[task_index(t)];
+  return g_task_start_tick[task_index(t)];
+}
+/* Measure this task's resident set and fold it into the peak. `force` skips the
+ * per-tick rate limit — used on the paths that are about to drop pages, where
+ * the sample IS the peak. Returns the peak in pages. */
+u64 task_rss_sample(struct task *t, int force) {
+  if (!t)
+    return 0;
+  usize idx = task_index(t);
+  u64 now = scheduler_ticks;
+  if (!force && g_task_rss_sample_tick[idx] == now)
+    return g_task_maxrss_pages[idx];
+  g_task_rss_sample_tick[idx] = now;
+  u64 resident = 0;
+  if (t->pml4_phys) {
+    for (struct vm_area *v = t->vma_list; v; v = v->next)
+      for (u64 va = v->start; va < v->end; va += PAGE_SIZE)
+        if (paging_user_frame(t->pml4_phys, va))
+          resident++;
+  }
+  if (resident > g_task_maxrss_pages[idx])
+    g_task_maxrss_pages[idx] = resident;
+  return g_task_maxrss_pages[idx];
+}
+
+u64 task_maxrss_pages(const struct task *t) {
+  if (!t)
+    return 0;
+  return g_task_maxrss_pages[task_index(t)];
+}
+
+u64 task_nvcsw(const struct task *t) {
+  if (!t) return 0;
+  return g_task_nvcsw[task_index(t)];
+}
+u64 task_nivcsw(const struct task *t) {
+  if (!t) return 0;
+  return g_task_nivcsw[task_index(t)];
 }
 usize scheduler_max_tasks(void) { return MAX_TASKS; }
 
@@ -1992,6 +2154,7 @@ static void clone_thread_kentry(void *arg) {
    * (user_arg) into %rdi = start_routine's void* argument. */
   u64 sp = ((u64)stack & ~0xFUL) - 8;
   *(volatile u64 *)(usize)sp = 0; /* return address: threads exit via SYS_EXIT_THREAD, never ret */
+  sched_acct_leave_kernel(); /* M86: kernel-time interval ends at the ring-3 jump */
   x86_user_jump((usize)entry, (usize)sp, (usize)user_arg, 0);
 #else
   /* SysV i386 passes arguments on the stack, not in registers, and the 32-bit
@@ -2653,6 +2816,11 @@ int scheduler_yield(void) {
     }
   }
 
+  /* M86: close the outgoing task's CPU-time interval before `current_task`
+   * moves on. Reads old_task->state, so it must run before the state of the
+   * outgoing task is touched any further. */
+  sched_acct_on_switch(old_task);
+
   new_task->state = TASK_RUNNING;
   current_task = new_task;
 
@@ -3062,15 +3230,89 @@ void scheduler_on_timer_tick(void) {
   }
 }
 
-void scheduler_charge_tick(int is_user) {
-  if (!scheduler_started || current_task == 0) {
+/* ── M86: CPU-time accounting boundaries ──────────────────────────────────────
+ *
+ * A CPU is always running exactly one task in exactly one mode, so the whole
+ * accounting problem is: stamp the TSC every time either of those two facts
+ * changes, and credit the elapsed interval to whoever was running. The three
+ * boundaries are ring-3 → ring-0 entry (syscall, IRQ, exception from user),
+ * ring-0 → ring-3 return, and a context switch. Everything in between is one
+ * homogeneous interval.
+ *
+ * The stamp is per-CPU (a task can only run on one CPU at a time, so its
+ * counters have a single writer), and the mode of each interval is known at
+ * the call site rather than tracked in a variable: an interval ended by a
+ * kernel entry from ring 3 was spent in user mode, and every other interval
+ * ended in the kernel. */
+static u64 g_acct_stamp[MAX_CPUS];
+
+static inline u64 acct_rdtsc(void) {
+  u32 lo, hi;
+  __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
+  return ((u64)hi << 32) | lo;
+}
+
+static inline u64 acct_cycles_to_ns(u64 cycles) {
+  u32 khz = arch_cpu_khz();
+  if (!khz)
+    return 0; /* TSC frequency unknown (calibration skipped) — no accounting */
+  /* Clamp so `cycles * 1000000` cannot overflow a u64. 2^43 cycles is ~48
+   * minutes of a 3 GHz core, far beyond any single accounting interval; the
+   * clamp only ever fires on a garbage delta (e.g. a TSC that went backwards
+   * across a suspend). */
+  if (cycles > (1ULL << 43))
+    cycles = 1ULL << 43;
+  return (cycles * 1000000ULL) / (u64)khz;
+}
+
+static void acct_flush(struct task *t, int as_user) {
+  struct percpu *pcpu = get_percpu();
+  if (!pcpu)
     return;
-  }
-  usize idx = task_index(current_task);
-  if (is_user) {
-    g_task_utime[idx]++;
-  } else {
-    g_task_stime[idx]++;
+  u32 cpu = pcpu->cpu_id;
+  if (cpu >= MAX_CPUS)
+    return;
+  u64 now = acct_rdtsc();
+  u64 prev = g_acct_stamp[cpu];
+  g_acct_stamp[cpu] = now;
+  if (!t || now <= prev)
+    return;
+  u64 ns = acct_cycles_to_ns(now - prev);
+  if (!ns)
+    return;
+  usize idx = task_index(t);
+  if (as_user)
+    g_task_utime_ns[idx] += ns;
+  else
+    g_task_stime_ns[idx] += ns;
+}
+
+void sched_acct_enter_kernel(void) {
+  if (!scheduler_started)
+    return;
+  acct_flush(current_task, 1);
+}
+
+void sched_acct_leave_kernel(void) {
+  if (!scheduler_started)
+    return;
+  acct_flush(current_task, 0);
+}
+
+void sched_acct_on_switch(struct task *prev) {
+  if (!scheduler_started)
+    return;
+  /* A switch always happens with the CPU in ring 0, so the interval that just
+   * ended is `prev`'s system time. */
+  acct_flush(prev, 0);
+  if (prev) {
+    usize idx = task_index(prev);
+    /* Still runnable at switch-out ⇒ it was preempted (involuntary); anything
+     * else means it gave the CPU up itself. */
+    if (prev->state == TASK_RUNNING || prev->state == TASK_READY)
+      g_task_nivcsw[idx]++;
+    else
+      g_task_nvcsw[idx]++;
   }
 }
 
@@ -3120,6 +3362,10 @@ static void terminate_group_siblings(struct task *t) {
        * its own signal-delivery pass overwrite that code with SIGNALED|SIGKILL,
        * so waitpid reports a spurious signalled death (M29 stress-exit-code). */
       if (g_task_exiting[i])
+        continue;
+      /* A parked leader that has been handed the group's exit status exits on
+       * its own; SIGKILLing it would report a signalled death instead (M86). */
+      if (g_task_parked_leader[i] && g_task_parked_override[i])
         continue;
       /* Post SIGKILL to sibling */
       __atomic_fetch_or(&sibling->pending_signals, (1ULL << (SIGKILL - 1)), __ATOMIC_RELEASE);
@@ -3189,8 +3435,97 @@ void scheduler_exit_group(int exit_code) {
    * skips tasks whose g_task_exiting flag is set. */
   g_task_exiting[task_index(current_task)] = 1;
   u64 flags = interrupts_save();
+  /* M86: if this group's leader already left through exit(2) and is waiting for
+   * us, give it this exit status — a parked leader must not be turned into a
+   * SIGKILL death by the teardown below. */
+  {
+    usize tgid = g_task_tgid[task_index(current_task)];
+    if (tgid && tgid != current_task->id) {
+      for (usize i = 0; i < g_task_hwm; i++) {
+        if (T(i)->id == tgid && g_task_parked_leader[i]) {
+          g_task_parked_code[i] = exit_code;
+          g_task_parked_override[i] = 1;
+          break;
+        }
+      }
+    }
+  }
   terminate_group_siblings(current_task);
   interrupts_restore(flags);
+  scheduler_exit_current(exit_code);
+}
+
+/* M86: exit(2) — as opposed to exit_group(2) — ends ONE thread, even when that
+ * thread is the group leader. musl's pthread_exit() from main relies on exactly
+ * this: it leaves the main thread and the process must keep running until the
+ * last remaining thread finishes. b1nix used to route both syscalls into
+ * scheduler_exit_current, whose leader branch calls terminate_group_siblings —
+ * so pthread_exit() in main killed the whole process.
+ *
+ * The leader cannot simply die either: b1nix reports a process's death (and
+ * frees the mm/fd table) when its task dies, and the parent's waitpid must see
+ * the process only once every thread is gone. So a leader with live siblings
+ * parks in the kernel until the group empties, then exits with its own code —
+ * the observable contract of a Linux group leader zombie, without a second
+ * task-lifecycle state to keep consistent across CPUs.
+ *
+ * The park is a 1-tick poll rather than a wait channel: the last thread out may
+ * be on another CPU, may die from a signal rather than a syscall, and may exit
+ * before this loop is even entered. Polling is correct for every one of those
+ * orders and costs a leader that is exiting anyway one tick per iteration. */
+static void thread_release_ctid(struct task *t);
+
+void scheduler_exit_thread(int exit_code) {
+  if (current_task == 0)
+    panic("scheduler_exit_thread without current task");
+  usize me = current_task->id;
+  usize idx = task_index(current_task);
+  usize tgid = g_task_tgid[idx];
+  if (tgid == me) {
+    /* Release the tid word (and wake its futex) BEFORE parking: the surviving
+     * threads need it to make progress, and progress is exactly what this loop
+     * is waiting for. */
+    thread_release_ctid(current_task);
+    g_task_parked_leader[idx] = 1;
+    for (;;) {
+      /* A sibling ran exit_group(): adopt its status and stop waiting. */
+      if (g_task_parked_override[idx]) {
+        exit_code = g_task_parked_code[idx];
+        break;
+      }
+      /* Killed outright (a sibling's fatal fault, or an outside SIGKILL): the
+       * process dies by signal, so report that rather than the exit code. */
+      if (__atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE) &
+          (1ULL << (SIGKILL - 1))) {
+        exit_code = TASK_EXIT_SIGNALED | SIGKILL;
+        break;
+      }
+      int live = 0;
+      u64 flags = interrupts_save();
+      for (usize i = 0; i < g_task_hwm; i++) {
+        struct task *o = T(i);
+        if (o->id == me || o->state == TASK_UNUSED || o->state == TASK_DEAD ||
+            o->state == TASK_REAPING)
+          continue;
+        /* A sibling that has committed to exiting no longer counts: it wakes
+         * us on its way out (see scheduler_exit_current), and waiting for its
+         * slot to actually reach DEAD would race that wake-up. */
+        if (g_task_tgid[i] == tgid && !g_task_exiting[i]) {
+          live = 1;
+          break;
+        }
+      }
+      interrupts_restore(flags);
+      if (!live)
+        break;
+      /* Sleep on the channel the last thread out signals, with a timeout as the
+       * backstop: a thread can die on a path that never reaches the wake (a
+       * fatal fault handled in the scheduler), and a lost wake-up here would
+       * wedge the process forever rather than merely delay it. */
+      scheduler_block_on_timeout(&g_task_parked_leader[idx], 20);
+    }
+    g_task_parked_leader[idx] = 0;
+  }
   scheduler_exit_current(exit_code);
 }
 
@@ -3245,7 +3580,12 @@ void scheduler_dump_thread_exits(void) {
  * thread's tid (the M29 stress wedge). Idempotent: the address is cleared as it
  * is consumed, so a second call does nothing. */
 static void thread_release_ctid(struct task *t) {
-  if (!t || !task_is_thread(t))
+  /* Not gated on task_is_thread: a MAIN thread leaving through pthread_exit()
+   * registers the very same word (musl points set_tid_address at its
+   * __thread_list_lock before calling exit(2)), and a leader that skipped this
+   * clear left that lock owned by a thread that no longer runs — every
+   * surviving thread then waits on it forever (M86). */
+  if (!t)
     return;
   u64 ctid = task_child_tid_clear(t);
   /* Trace every thread death into a ring the watchdog dumps. Printing here
@@ -3289,11 +3629,38 @@ static void thread_release_ctid(struct task *t) {
   scheduler_futex_wake_addr(ctid, 1);
 }
 
+/* M86: hand a dying thread's CPU time to its thread-group leader, so the
+ * process totals keep counting work whose thread has finished. The leader keeps
+ * its own counters (it IS the group's anchor), and a group whose leader has
+ * already gone simply drops the remainder — there is nothing left to report it
+ * to, since the parent's RUSAGE_CHILDREN was settled when the leader was
+ * reaped. */
+static void acct_release_to_group(struct task *t) {
+  usize idx = task_index(t);
+  usize tgid = g_task_tgid[idx];
+  if (!tgid || tgid == t->id)
+    return;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->id == tgid && T(i)->state != TASK_UNUSED) {
+      g_task_gone_utime_ns[i] += g_task_utime_ns[idx];
+      g_task_gone_stime_ns[i] += g_task_stime_ns[idx];
+      return;
+    }
+  }
+}
+
 void scheduler_exit_current(int exit_code) {
   /* A vfork parent waiting on this task must be released before teardown. */
   scheduler_vfork_release();
   if (current_task == 0) {
     panic("scheduler_exit_current without current task");
+  }
+  {
+    /* Close this thread's last CPU interval before handing its time over. */
+    sched_acct_leave_kernel();
+    u64 acct_flags = interrupts_save();
+    acct_release_to_group(current_task);
+    interrupts_restore(acct_flags);
   }
 
   /* M80: PTRACE_O_TRACEEXIT — hold the task here, still whole, so its tracer
@@ -3317,6 +3684,25 @@ void scheduler_exit_current(int exit_code) {
    * from later re-routing us through the SIGKILL path and clobbering exit_code
    * (M29 stress-exit-code — a sibling's SIGKILL-back races our exit_group(0)). */
   g_task_exiting[task_index(current_task)] = 1;
+
+  /* M86: a leader parked in scheduler_exit_thread is waiting for exactly this
+   * — the last of its threads leaving. Wake it now that we are committed to
+   * exiting, so it does not sit out the backstop timeout. */
+  {
+    usize my_tgid = g_task_tgid[task_index(current_task)];
+    if (my_tgid && my_tgid != current_task->id) {
+      u64 wflags = interrupts_save();
+      for (usize i = 0; i < g_task_hwm; i++) {
+        if (T(i)->id == my_tgid && g_task_parked_leader[i]) {
+          interrupts_restore(wflags);
+          scheduler_wake_all(&g_task_parked_leader[i]);
+          wflags = interrupts_save();
+          break;
+        }
+      }
+      interrupts_restore(wflags);
+    }
+  }
 
   /* If process leader exits, or crash/signal exit, terminate siblings first */
   if (g_task_tgid[task_index(current_task)] == current_task->id ||
@@ -3572,8 +3958,10 @@ int scheduler_waitpid(usize pid, int *status, int options) {
             int child_id = T(i)->id;
             /* Accumulate child times in parent */
             usize p_idx = task_index(current_task);
-            g_task_cutime[p_idx] += g_task_utime[i] + g_task_cutime[i];
-            g_task_cstime[p_idx] += g_task_stime[i] + g_task_cstime[i];
+            g_task_cutime_ns[p_idx] +=
+                g_task_utime_ns[i] + g_task_cutime_ns[i] + g_task_gone_utime_ns[i];
+            g_task_cstime_ns[p_idx] +=
+                g_task_stime_ns[i] + g_task_cstime_ns[i] + g_task_gone_stime_ns[i];
             if (T(i)->user_image) {
               user_image_free(T(i)->user_image);
               T(i)->user_image = 0;
@@ -3782,8 +4170,12 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
                 }
 
                 usize p_idx = task_index(current_task);
-                g_task_cutime[p_idx] += g_task_utime[i] + g_task_cutime[i];
-                g_task_cstime[p_idx] += g_task_stime[i] + g_task_cstime[i];
+                g_task_cutime_ns[p_idx] += g_task_utime_ns[i] +
+                                           g_task_cutime_ns[i] +
+                                           g_task_gone_utime_ns[i];
+                g_task_cstime_ns[p_idx] += g_task_stime_ns[i] +
+                                           g_task_cstime_ns[i] +
+                                           g_task_gone_stime_ns[i];
 
                 if (child->user_image) {
                   user_image_free(child->user_image);
@@ -4431,6 +4823,146 @@ int scheduler_kill(usize task_id, int sig) {
   }
   interrupts_restore(flags);
   return -ESRCH;
+}
+
+/* ── M86: thread-directed signal targeting ────────────────────────────────── */
+
+/* Resolve a task id to its live slot. Caller holds interrupts. */
+static struct task *find_live_task(usize id) {
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->id == id && T(i)->state != TASK_UNUSED &&
+        T(i)->state != TASK_DEAD && T(i)->state != TASK_REAPING)
+      return T(i);
+  }
+  return 0;
+}
+
+static inline usize task_tgid_of(const struct task *t) {
+  usize tgid = g_task_tgid[task_index(t)];
+  return tgid ? tgid : t->id;
+}
+
+/* tkill(2)/tgkill(2): deliver `sig` to exactly one thread, never to whichever
+ * sibling happens to have it unblocked. `tgid` of 0 means "don't check" (that
+ * is tkill; tgkill passes the caller's expected thread-group id, and a tid that
+ * has since been recycled into another process must NOT be signalled — which is
+ * the entire reason tgkill exists). */
+int scheduler_tkill(usize tgid, usize tid, int sig) {
+  if (tid == 0 || (isize)tid < 0 || (isize)tgid < 0)
+    return -EINVAL;
+  if (sig < 0 || sig > NSIG_MAX)
+    return -EINVAL;
+
+  u64 flags = interrupts_save();
+  struct task *t = find_live_task(tid);
+  usize found_tgid = t ? task_tgid_of(t) : 0;
+  interrupts_restore(flags);
+  if (!t)
+    return -ESRCH;
+  if (tgid && found_tgid != tgid)
+    return -ESRCH;
+  return scheduler_kill(tid, sig);
+}
+
+/* Stop/continue a thread-group sibling without the parent SIGCHLD report — the
+ * group leader's own scheduler_kill does that once for the whole group. Caller
+ * holds interrupts. */
+static void group_stop_sibling(struct task *t, int sig) {
+  if (sig == SIGCONT) {
+    __atomic_fetch_and(&t->pending_signals,
+                       ~((1ULL << (SIGSTOP - 1)) | (1ULL << (SIGTSTP - 1)) |
+                         (1ULL << (SIGTTIN - 1)) | (1ULL << (SIGTTOU - 1))),
+                       __ATOMIC_RELAXED);
+    enum task_state expected = TASK_STOPPED;
+    if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY, 0,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+      sched_rq_enqueue_current(t);
+    return;
+  }
+  /* Post the stop and let the sibling park itself on its next return to ring 3.
+   * Writing TASK_STOPPED into a task running on another CPU parks it before its
+   * context has been saved, and the next picker then resumes it from a
+   * half-written frame (the M40 lesson). */
+  g_task_stop_quiet[task_index(t)] = 1;
+  __atomic_fetch_or(&t->pending_signals, (1ULL << (sig - 1)), __ATOMIC_RELEASE);
+  /* A sibling asleep in an interruptible wait would otherwise ignore the group
+   * stop until its syscall happened to finish — a thread blocked on a read that
+   * never completes would keep the job "running" forever. Wake it so it takes
+   * the signal now; the interrupted syscall restarts (SA_RESTART) or returns
+   * EINTR through the usual path. Same per-state CAS scheduler_kill uses, so a
+   * task that is concurrently dying on another CPU cannot be resurrected. */
+  enum task_state expected = TASK_BLOCKED;
+  if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY, 0,
+                                  __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+    sched_rq_enqueue_current(t);
+}
+
+/* kill(2) with a positive pid targets a PROCESS, not a thread: POSIX lets the
+ * kernel pick any thread in the group that does not block the signal, and only
+ * if every thread blocks it does the signal stay pending on the group. b1nix
+ * used to post to the leader unconditionally, so a signal the leader had
+ * blocked (musl's own SIGCANCEL handling, or any thread that runs a handler on
+ * behalf of the process) was never delivered even though a sibling was ready to
+ * take it. Stop and continue signals act on the whole group, as on Linux. */
+int scheduler_kill_thread_group(usize pid, int sig) {
+  if (sig < 0 || sig > NSIG_MAX)
+    return -EINVAL;
+
+  u64 flags = interrupts_save();
+  struct task *leader = find_live_task(pid);
+  if (!leader) {
+    interrupts_restore(flags);
+    return -ESRCH;
+  }
+  usize tgid = task_tgid_of(leader);
+  /* Signalling a non-leader tid keeps the historical thread-directed meaning
+   * (b1nix tids and pids share one number space, and in-kernel callers rely on
+   * it); only a real thread-group leader gets process-wide semantics. */
+  if (tgid != pid || sig == 0) {
+    interrupts_restore(flags);
+    return scheduler_kill(pid, sig);
+  }
+
+  int is_stop = (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN ||
+                 sig == SIGTTOU || sig == SIGCONT);
+  if (is_stop) {
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *o = T(i);
+      if (o == leader || o->state == TASK_UNUSED || o->state == TASK_DEAD ||
+          o->state == TASK_REAPING)
+        continue;
+      if (task_tgid_of(o) != tgid)
+        continue;
+      group_stop_sibling(o, sig);
+    }
+    interrupts_restore(flags);
+    return scheduler_kill(pid, sig);
+  }
+
+  /* SIGKILL is never blockable and its delivery already tears the group down
+   * (terminate_group_siblings), so it goes to the leader. */
+  usize target = pid;
+  if (sig != SIGKILL) {
+    u64 bit = 1ULL << (sig - 1);
+    if (leader->blocked_signals & bit) {
+      for (usize i = 0; i < g_task_hwm; i++) {
+        struct task *o = T(i);
+        if (o == leader || o->state == TASK_UNUSED || o->state == TASK_DEAD ||
+            o->state == TASK_REAPING)
+          continue;
+        if (task_tgid_of(o) != tgid)
+          continue;
+        if (!(o->blocked_signals & bit)) {
+          target = o->id;
+          break;
+        }
+      }
+      /* Every thread blocks it: leave it pending on the leader, which is where
+       * the group's shared pending set lives. */
+    }
+  }
+  interrupts_restore(flags);
+  return scheduler_kill(target, sig);
 }
 
 /* M74: enqueue one RT-signal instance (with payload) to a task and wake it. The
@@ -5340,10 +5872,18 @@ void scheduler_deliver_pending_signals(void) {
           continue;
         current_task->state = TASK_STOPPED;
         current_task->last_stop_signal = sig;
-        current_task->stop_report_pending = 1;
+        /* M86: a group stop reports to the parent ONCE, from the thread-group
+         * leader. Siblings that were pulled into the same stop park silently —
+         * otherwise waitpid(WUNTRACED) reports the job stopped once per
+         * thread. */
+        if (g_task_stop_quiet[task_index(current_task)]) {
+          g_task_stop_quiet[task_index(current_task)] = 0;
+        } else {
+          current_task->stop_report_pending = 1;
+          scheduler_notify_wait_event(current_task->parent_id);
+        }
         __atomic_fetch_and(&current_task->pending_signals,
                            ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
-        scheduler_notify_wait_event(current_task->parent_id);
         continue;
       case SIGCHLD:
       case SIGURG:

@@ -144,6 +144,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m57_smoke \
 	m73_smoke \
 	m80_smoke \
+	m86_smoke \
 	m63_smoke \
 	m71_aslr \
 	m47_smoke \
@@ -482,12 +483,14 @@ KERNEL_SOURCES += \
 	kernel/net/arp.c \
 	kernel/net/ethernet.c \
 	kernel/net/ipv4.c \
+	kernel/net/route.c \
 	kernel/net/ipv6.c \
 	kernel/net/icmp.c \
 	kernel/net/ndp.c \
 	kernel/net/tcp.c \
 	kernel/net/udp.c \
 	kernel/net/dhcp.c \
+	kernel/net/dhcpv6.c \
 	kernel/net/dns.c \
 	kernel/net/ntp.c
 endif

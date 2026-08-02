@@ -683,6 +683,13 @@ void kernel_main(usize arg0, usize arg1)
 		ipv6_loopback_smoke();
 		ipv6_realink_smoke();
 
+		/* M84: IPv4 FIB (longest-prefix-match, host routes, metric
+		 * tie-break) and TCP robustness (option parsing, window
+		 * scaling, out-of-order reassembly). */
+		route_smoke();
+		tcp_robustness_smoke();
+		dhcpv6_smoke();
+
 		/* M94: init-path parsing self-test. Verify bootinfo_get_kv
 		 * correctly extracts the `init=` parameter (or falls back to
 		 * /sbin/openrc-init). */

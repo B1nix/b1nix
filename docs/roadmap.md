@@ -686,13 +686,64 @@ Status:
 
 ## M84: Real IP routing + TCP robustness
 
-- [ ] `planned` Add real FIB routing table and TCP out-of-order reassembly queue with window scaling.
+- [x] `done` IPv4 FIB (`kernel/net/route.c`): longest-prefix-match with host
+  routes, metric tie-break and coexisting gateways. `ipv4_send` routes through
+  it instead of assuming a /24 plus one gateway.
+- [x] `done` The FIB is the single source of truth: DHCP installs the lease's
+  prefix (option 1) and default route, `/proc/net/route` renders the real
+  table, and `SIOCADDRT`/`SIOCDELRT` mutate it (BusyBox `route add/del`).
+- [x] `done` TCP options: MSS and window scale are sent in SYN/SYN-ACK and
+  parsed on receipt; the peer's window is applied with the negotiated shift
+  and segments are capped at the peer's MSS.
+- [x] `done` TCP out-of-order reassembly queue (16 segs / 64 KiB): segments
+  past a hole are buffered and dup-ACKed instead of dropped, already-delivered
+  bytes are trimmed off retransmissions, and closing the hole drains
+  everything that became contiguous.
+- [x] `done` SACK (RFC 2018), both directions: ACKs carry up to three blocks
+  built from the reassembly queue (most-recent first), and incoming blocks mark
+  queued segments so neither the RTO nor fast retransmit resends them — fast
+  retransmit picks the first segment the peer has *not* selectively ACKed.
+- [x] `done` Per-connection heap receive buffer (64 KiB) replaces the 16 KiB
+  inline array, so the advertised window scale is genuinely non-zero and the
+  256-slot table costs ~50 KB of BSS instead of 4 MiB.
+- [x] `done` IPv6 FIB with the same model: prefix-length LPM, host routes,
+  metric, ECMP and per-interface routes. `ipv6_link_output` routes through it,
+  NDP router advertisements install the on-link prefix and default route,
+  fe80::/10 + ::1/128 + ff02::/16 are standing on-link routes, and
+  `/proc/net/ipv6_route` plus `SIOCADDRT` on an AF_INET6 socket (`struct
+  in6_rtmsg`) expose it.
+- [x] `done` Per-interface routing end to end: interfaces have stable 1-based
+  indices (`eth<N>`), routes carry an output interface, and ARP/NDP
+  solicitations plus the frame itself leave through that device
+  (`net_send_ethernet_dev`, `arp_resolve_dev`, `ndp_resolve_dev`).
+- [x] `done` D-SACK (RFC 2883) both ways: duplicates are reported back as a
+  leading D-SACK block, and a received one undoes the congestion reduction the
+  spurious retransmission caused.
+- [x] `done` RFC 6675 SACK scoreboard: per-segment lost marks (DUPTHRESH
+  above), a pipe estimate that governs transmission during recovery, and
+  recovery that keeps cwnd at ssthresh instead of Reno's +3 MSS inflation.
+- [x] `done` ECMP hashes the full 5-tuple and the group width is unbounded
+  (two-pass selection, no candidate array).
+- [x] `done` Policy routing: numbered tables plus priority-ordered rules
+  matching source prefix and input interface, for both families. Managed
+  through `/proc/net/rt_tables` and `/proc/net/rt_rules` (text command
+  grammar mirroring `ip route` / `ip rule`, since there is no rtnetlink).
+- [x] `done` DHCPv6 client (RFC 8415): DUID-LL, IA_NA,
+  Solicit/Advertise/Request/Reply with Renew and Rebind on T1/T2, DNS option
+  23, started by the M/O flags of a router advertisement. The assigned address
+  is installed with its on-link /128; routers still come from RAs.
+- [x] `done` Verified by `M84-ROUTE:`, `M84-ROUTE6:`, `M84-POLICY:`,
+  `M84-DHCP6:` and `M84-TCP:` in-kernel self-tests.
 
 ## M85: libc Tier-A correctness pass (musl-grade) - Retired
 
 ## M86: Per-thread CPU accounting + signal targeting
 
-- [ ] `planned` Per-task CPU-time accounting, kernel `tkill`/`tgkill`, and `pthread_exit` retval delivery.
+- [x] TSC-exact per-thread user/system CPU accounting (ring-3 entry/exit + context-switch boundaries); tick sampling removed.
+- [x] Real `CLOCK_THREAD_CPUTIME_ID` / `CLOCK_PROCESS_CPUTIME_ID` plus the dynamic per-task clock ids of `clock_getcpuclockid`/`pthread_getcpuclockid`.
+- [x] `times(2)`, `getrusage` (SELF = thread group, THREAD, CHILDREN, `ru_nvcsw`/`ru_nivcsw`, `ru_maxrss` as a true high-water mark sampled before every unmap) and `/proc/<pid>[/task/<tid>]/stat` report real CPU time.
+- [x] `tkill(2)`/`tgkill(2)` syscalls with thread-group validation; `kill(2)` is process-directed (picks a thread that does not block the signal, group-wide stop/continue that also wakes threads parked in a blocking syscall).
+- [x] `exit(2)` ends one thread: a leader that calls it (musl's `pthread_exit` from main) waits for its remaining threads instead of killing them, and hands them its tid futex first.
 
 ## M87: Dynamic-loader maturation + Rust proc-macros - Retired
 

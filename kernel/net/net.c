@@ -41,6 +41,52 @@ void netdev_register(struct netdev *nd)
 struct netdev *netdev_active(void) { return g_netdev; }
 struct netdev *netdev_receiving(void) { return g_receiving_netdev; }
 
+/* M84: interface indices. Registration order defines a stable 1-based index
+ * (0 means "unspecified" in the FIB — route out of whatever is active), and
+ * index N is presented to userspace as eth<N-1>, matching what ifconfig and
+ * /proc/net/route show. */
+int netdev_index_of(struct netdev *nd)
+{
+	if (!nd)
+		return 0;
+	for (usize i = 0; i < g_netdev_count; i++) {
+		if (g_netdevs[i] == nd)
+			return (int)i + 1;
+	}
+	return 0;
+}
+
+struct netdev *netdev_by_index(int idx)
+{
+	if (idx <= 0 || (usize)idx > g_netdev_count)
+		return 0;
+	return g_netdevs[idx - 1];
+}
+
+void netdev_ifname(int idx, char *out, usize cap)
+{
+	if (!out || cap < 6)
+		return;
+	int n = idx > 0 ? idx - 1 : 0;
+	if (n > 9)
+		n = 9;
+	out[0] = 'e';
+	out[1] = 't';
+	out[2] = 'h';
+	out[3] = (char)('0' + n);
+	out[4] = '\0';
+}
+
+int netdev_index_by_name(const char *name)
+{
+	if (!name || name[0] != 'e' || name[1] != 't' || name[2] != 'h')
+		return 0;
+	if (name[3] < '0' || name[3] > '9' || name[4] != '\0')
+		return 0;
+	int idx = (name[3] - '0') + 1;
+	return netdev_by_index(idx) ? idx : 0;
+}
+
 static int netdev_link_state(struct netdev *nd)
 {
 	if (!nd)
@@ -66,6 +112,10 @@ static int last_link_state = -2;
 static struct mac_addr local_mac;
 static struct ipv4_addr local_ip = { { 0, 0, 0, 0 } };
 static struct ipv4_addr gateway_ip = { { 0, 0, 0, 0 } };
+/* M84: the interface netmask is real state now (DHCP option 1), not a /24
+ * assumption baked into ipv4_send/procfs. It defines the on-link prefix the
+ * FIB installs. */
+static struct ipv4_addr netmask_ip = { { 0, 0, 0, 0 } };
 
 /* IPv6 interface state: link-local is derived from the MAC at probe time; the
  * global address / prefix / gateway are filled in by SLAAC (see ndp.c). */
@@ -88,8 +138,10 @@ static usize net_adapter_count;
 struct mac_addr net_get_mac(void) { return local_mac; }
 struct ipv4_addr net_get_ip(void) { return local_ip; }
 struct ipv4_addr net_get_gateway(void) { return gateway_ip; }
+struct ipv4_addr net_get_netmask(void) { return netmask_ip; }
 void net_set_ip(struct ipv4_addr ip) { local_ip = ip; }
 void net_set_gateway(struct ipv4_addr gw) { gateway_ip = gw; }
+void net_set_netmask(struct ipv4_addr mask) { netmask_ip = mask; }
 
 struct in6_addr_k net_get_ip6_ll(void) { return local_ip6_ll; }
 struct in6_addr_k net_get_ip6(void) { return local_ip6; }
@@ -109,6 +161,11 @@ static void net_reset_interface_state(struct netdev *nd)
 	local_mac = nd->mac;
 	local_ip = zero4;
 	gateway_ip = zero4;
+	netmask_ip = zero4;
+	/* The FIB describes the old interface's topology; a switch invalidates
+	 * every autoconfigured route. */
+	route_flush_dynamic();
+	route6_flush_dynamic();
 	memset(&local_ip6, 0, sizeof(local_ip6));
 	memset(&gateway_ip6, 0, sizeof(gateway_ip6));
 	memset(&prefix6, 0, sizeof(prefix6));
@@ -358,6 +415,7 @@ static void net_task(void *arg)
 		dhcp_tick(scheduler_get_uptime_ticks());
 		ntp_tick(scheduler_get_uptime_ticks());
 		ndp_tick(scheduler_get_uptime_ticks());
+		dhcpv6_tick(scheduler_get_uptime_ticks());
 		/* Sleep a tick between polls rather than busy-yielding. As a perpetually
 		 * runnable kernel daemon, busy-yielding would keep net_task READY and —
 		 * under the Big Kernel Lock — let it monopolise the lock across its
@@ -377,6 +435,13 @@ void net_init(void)
 	memset(&local_mac, 0, sizeof(local_mac));
 	local_ip = (struct ipv4_addr){{0, 0, 0, 0}};
 	gateway_ip = (struct ipv4_addr){{0, 0, 0, 0}};
+	netmask_ip = (struct ipv4_addr){{0, 0, 0, 0}};
+	/* Default policy (everything looks in the main table) plus the standing
+	 * on-link IPv6 routes: fe80::/10, ::1/128 and ff02::/16 exist by
+	 * definition, so NDP works before any router advertisement. */
+	route_init();
+	route6_flush_all();
+	route6_init();
 	net_scan_pci_adapters();
 
 	/* Probe every supported NIC, then prefer one whose PHY reports carrier. */
@@ -415,6 +480,26 @@ void net_init(void)
 	}
 
 	net_task_id = kthread_create("net_task", net_task, 0);
+}
+
+void net_send_ethernet_dev(struct netdev *nd, struct mac_addr dst,
+                           u16 ethertype, const void *payload, usize size)
+{
+	if (!nd)
+		nd = netdev_active();
+	if (!nd || !nd->transmit) {
+		return;
+	}
+
+	u8 hdr[14];
+	memcpy(hdr, dst.bytes, 6);
+	/* The source MAC must be the transmitting device's own address, which is
+	 * only the cached local_mac when that device is the active one. */
+	memcpy(hdr + 6, (nd == netdev_active()) ? local_mac.bytes : nd->mac.bytes, 6);
+	hdr[12] = (ethertype >> 8) & 0xFF;
+	hdr[13] = ethertype & 0xFF;
+
+	nd->transmit(nd, hdr, payload, size);
 }
 
 void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, usize size)

@@ -7,6 +7,7 @@
  */
 
 #include <b1nix/net.h>
+#include <b1nix/netdev.h>
 #include <b1nix/mm.h>
 #include <b1nix/console.h>
 #include <b1nix/sched.h>
@@ -245,9 +246,26 @@ static void ipv6_fix_l4_checksum(const struct in6_addr_k *src,
  * 33:33 MAC, otherwise resolve the next hop (on-link peer, or the default
  * router for off-link destinations) via NDP and emit an ethertype-0x86DD
  * frame. */
-static void ipv6_link_output(struct in6_addr_k dst, const u8 *frame,
-                             usize total)
+static void ipv6_link_output(struct netdev *dev, struct in6_addr_k dst,
+                             const u8 *frame, usize total)
 {
+	/* M84: the flow hash for ECMP comes from the finished frame — source and
+	 * destination addresses plus the transport ports that follow the fixed
+	 * header (TCP/UDP only). */
+	u32 flow = 0;
+	if (total >= sizeof(struct ipv6_header)) {
+		const struct ipv6_header *ih = (const struct ipv6_header *)frame;
+		u16 sport = 0, dport = 0;
+		if ((ih->next_header == 6 || ih->next_header == 17) &&
+		    total >= sizeof(struct ipv6_header) + 4) {
+			const u8 *l4 = frame + sizeof(struct ipv6_header);
+			sport = (u16)(((u16)l4[0] << 8) | l4[1]);
+			dport = (u16)(((u16)l4[2] << 8) | l4[3]);
+		}
+		flow = route_flow_hash(ih->src.bytes, ih->dst.bytes, 16,
+		                       ih->next_header, sport, dport);
+	}
+
 	struct mac_addr mac;
 	if (in6_is_multicast(&dst)) {
 		mac.bytes[0] = 0x33;
@@ -256,27 +274,24 @@ static void ipv6_link_output(struct in6_addr_k dst, const u8 *frame,
 		mac.bytes[3] = dst.bytes[13];
 		mac.bytes[4] = dst.bytes[14];
 		mac.bytes[5] = dst.bytes[15];
-		net_send_ethernet(mac, 0x86DD, frame, total);
+		net_send_ethernet_dev(dev, mac, 0x86DD, frame, total);
 		return;
 	}
 
-	struct in6_addr_k next_hop = dst;
-	if (!in6_is_link_local(&dst)) {
-		int on_link = 0;
-		if (net_get_prefix6_valid()) {
-			struct in6_addr_k p = net_get_prefix6();
-			on_link = memcmp(p.bytes, dst.bytes, 8) == 0;
-		}
-		if (!on_link) {
-			struct in6_addr_k gw = net_get_gateway6();
-			if (!in6_is_zero(&gw))
-				next_hop = gw;
-		}
-	}
+	/* M84: the IPv6 FIB decides the next hop and the output interface —
+	 * longest-prefix-match over the on-link prefixes (fe80::/10 and any
+	 * RA-advertised prefix) and the default route, instead of the previous
+	 * "compare the first 8 bytes, else use the single SLAAC router". */
+	struct in6_addr_k next_hop;
+	int oif = 0;
+	if (!route6_lookup_flow(dst, flow, &next_hop, 0, &oif))
+		return; /* unreachable: no route */
+	if (!dev && oif)
+		dev = netdev_by_index(oif);
 
 	for (int tries = 0; tries < 25; tries++) {
-		if (ndp_resolve(next_hop, &mac)) {
-			net_send_ethernet(mac, 0x86DD, frame, total);
+		if (ndp_resolve_dev(next_hop, &mac, dev)) {
+			net_send_ethernet_dev(dev, mac, 0x86DD, frame, total);
 			return;
 		}
 		net_poll();
@@ -284,8 +299,8 @@ static void ipv6_link_output(struct in6_addr_k dst, const u8 *frame,
 	}
 }
 
-void ipv6_send(struct in6_addr_k dst, u8 next_header, const void *payload,
-               usize size)
+void ipv6_send_via(struct netdev *dev, struct in6_addr_k dst, u8 next_header,
+                   const void *payload, usize size)
 {
 	usize total = sizeof(struct ipv6_header) + size;
 	u8 *buffer = kzalloc(total);
@@ -317,8 +332,14 @@ void ipv6_send(struct in6_addr_k dst, u8 next_header, const void *payload,
 		return;
 	}
 
-	ipv6_link_output(dst, buffer, total);
+	ipv6_link_output(dev, dst, buffer, total);
 	kfree(buffer);
+}
+
+void ipv6_send(struct in6_addr_k dst, u8 next_header, const void *payload,
+               usize size)
+{
+	ipv6_send_via(0, dst, next_header, payload, size);
 }
 
 /* Offline self-test: ping ::1 and confirm an ICMPv6 echo reply returns. */
