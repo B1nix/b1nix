@@ -5,6 +5,8 @@
 #include <b1nix/fb.h>
 #include <b1nix/io.h>
 #include <b1nix/klog.h>
+#include <b1nix/kmsg.h>
+#include <b1nix/vt.h>
 #include <b1nix/serial.h>
 #include <b1nix/spinlock.h>
 
@@ -92,6 +94,15 @@ void console_clear(void)
 void console_putc(char ch)
 {
 	klog_putc(ch);   /* capture every console char into the dmesg ring buffer */
+	kmsg_putc(ch);   /* and into the /dev/kmsg record ring */
+	/* M107 virtual terminals: the kernel console is VT 1. While another VT
+	 * owns the display the character is still recorded in VT 1's cell buffer
+	 * (so switching back repaints it) but must not be drawn. Serial is never
+	 * suppressed — it is the boot and test transcript. */
+	if (vt_console_putc(ch)) {
+		serial_putc(ch);
+		return;
+	}
 	if (bootinfo_get()->has_framebuffer && fb_console_ready() &&
 	    !fb_dev_claimed()) {
 		fb_console_putchar(ch);

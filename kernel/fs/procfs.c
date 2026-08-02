@@ -24,6 +24,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
+#include <b1nix/kmsg.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/module.h>
@@ -979,6 +980,25 @@ static int r_pid_maps(usize pid, struct sbuf *s) {
     }
   }
 
+  /* M107: name the two anonymous regions every reader asks about by name.
+   * pmap prints them as [heap]/[stack] and `lsof` uses them to tell a mapping
+   * of a file from the process's own memory; without the labels both showed
+   * up as unattributed anonymous ranges. */
+  if (img) {
+    for (usize i = 0; i < n; i++) {
+      if (m[i].name)
+        continue;
+      if (t->heap_start && t->user_brk > t->heap_start &&
+          m[i].start >= (t->heap_start & ~(u64)(PAGE_SIZE - 1)) &&
+          m[i].start < t->user_brk)
+        m[i].name = "[heap]";
+      else if (img->address_space.stack_base && img->address_space.stack_top &&
+               m[i].start >= img->address_space.stack_base &&
+               m[i].start < img->address_space.stack_top)
+        m[i].name = "[stack]";
+    }
+  }
+
   /* Ascending order, and no duplicate starts: Crashpad (and pmap, and glibc's
    * backtrace) reject a maps file that is out of order or overlapping. */
   for (usize i = 1; i < n; i++) {
@@ -1030,6 +1050,10 @@ static int r_pid_maps(usize pid, struct sbuf *s) {
 struct procfs_fd_snap {
   int fd;
   char target[80];
+  /* M107: a file-backed fd's full path cannot be rendered under fd_lock —
+   * vfs_get_node_path() walks the mount table, which yields. The node is
+   * referenced under the lock and resolved after it is dropped. */
+  struct vfs_node *node;
 };
 
 static void procfs_fd_symlink(struct vfs_node *dir, int fd, const char *target) {
@@ -1059,7 +1083,9 @@ static void procfs_fd_symlink(struct vfs_node *dir, int fd, const char *target) 
  * lookup_cb can stat), NOT the fd number: musl's ttyname() readlinks this and
  * then stat()s the result, so it has to be a genuine path. */
 static void procfs_fd_fill_target(struct vfs_handle *h, int fd, char *tg,
-                                  usize sz) {
+                                  usize sz, struct vfs_node **out_node) {
+  if (out_node)
+    *out_node = 0;
   switch (h->kind) {
   case VFS_HANDLE_PIPE_READ:
   case VFS_HANDLE_PIPE_WRITE:
@@ -1078,15 +1104,31 @@ static void procfs_fd_fill_target(struct vfs_handle *h, int fd, char *tg,
     break;
   }
   case VFS_HANDLE_NODE:
+    /* The caller resolves the full path after dropping fd_lock (see
+     * procfs_fd_resolve); the basename is the fallback when it cannot. */
     if (h->node && h->node->name[0])
       snprintf(tg, sz, "/%s", h->node->name);
     else
       snprintf(tg, sz, "anon_inode:[unknown]");
+    if (out_node)
+      *out_node = h->node ? vfs_node_get(h->node) : 0;
     break;
   default:
     snprintf(tg, sz, "anon_inode:[unknown]");
     break;
   }
+}
+
+/* Turn a referenced node into the absolute path lsof/fuser/pmap expect, then
+ * drop the reference. Must run with fd_lock released. */
+static void procfs_fd_resolve(struct procfs_fd_snap *snap) {
+  if (!snap->node)
+    return;
+  char path[80];
+  if (vfs_get_node_path(snap->node, path, sizeof(path)) == 0 && path[0])
+    snprintf(snap->target, sizeof(snap->target), "%s", path);
+  vfs_node_put(snap->node);
+  snap->node = 0;
 }
 
 static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
@@ -1105,12 +1147,14 @@ static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
         continue;
       snap[nsnap].fd = (int)i;
       procfs_fd_fill_target(h, (int)i, snap[nsnap].target,
-                            sizeof(snap[nsnap].target));
+                            sizeof(snap[nsnap].target), &snap[nsnap].node);
       nsnap++;
     }
     spin_unlock_irqrestore(&t->fd_lock, flags);
-    for (usize i = 0; i < nsnap; i++)
+    for (usize i = 0; i < nsnap; i++) {
+      procfs_fd_resolve(&snap[i]);
       procfs_fd_symlink(dir, snap[i].fd, snap[i].target);
+    }
   }
   return vfs_readdir_children(dir, offset, buf, max_entries);
 }
@@ -1129,20 +1173,23 @@ static int procfs_fd_lookup(struct vfs_node *dir, const char *name) {
   struct task *t = scheduler_task_by_pid(pid);
   if (!t)
     return -1;
-  char target[80];
+  struct procfs_fd_snap snap;
+  memset(&snap, 0, sizeof(snap));
+  snap.fd = fd;
   int ok = 0;
   u64 flags;
   spin_lock_irqsave(&t->fd_lock, &flags);
   struct vfs_handle *h =
       (t->fd_table && (usize)fd < t->fd_capacity) ? t->fd_table[fd] : 0;
   if (h && h->used) {
-    procfs_fd_fill_target(h, fd, target, sizeof(target));
+    procfs_fd_fill_target(h, fd, snap.target, sizeof(snap.target), &snap.node);
     ok = 1;
   }
   spin_unlock_irqrestore(&t->fd_lock, flags);
   if (!ok)
     return -1;
-  procfs_fd_symlink(dir, fd, target); /* idempotent (find_child guard) */
+  procfs_fd_resolve(&snap);
+  procfs_fd_symlink(dir, fd, snap.target); /* idempotent (find_child guard) */
   return 0;
 }
 
@@ -1737,6 +1784,16 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);
   procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
+  /* M107: /proc/kmsg — the same record stream as /dev/kmsg. klogd reads this
+   * one and expects it to block until a message arrives. */
+  {
+    struct vfs_node *km = procfs_mkchild(root, "kmsg", VFS_DEVICE, 0, 0);
+    if (km) {
+      km->inode->read_cb = kmsg_proc_read;
+      km->inode->poll_cb = kmsg_proc_poll;
+      km->inode->mode = 0400;
+    }
+  }
   procfs_mkchild(root, "kallsyms", VFS_DEVICE, r_kallsyms, 0);
   procfs_mkchild(root, "partitions", VFS_DEVICE, r_partitions, 0);
   procfs_mkchild(root, "swaps", VFS_DEVICE, r_swaps, 0);

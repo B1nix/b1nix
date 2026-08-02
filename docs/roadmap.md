@@ -908,14 +908,14 @@ BusyBox 1.38 ships 439 applets; 114 are compiled in and 137 are exposed. The
 rest are pure-userspace and free to enable — except the following, which need
 kernel work first. Each line is the subsystem, not the applet.
 
-- [ ] `planned` **netlink** — `ip`, `route`, `arp`, `tc`, `brctl`. Also what a modern `ifconfig`/`netstat` replacement wants.
-- [ ] `planned` **VT switching / console fonts** — `chvt`, `openvt`, `deallocvt`, `setfont`, `loadkmap`, `dumpkmap`.
-- [ ] `planned` **loop devices** — `losetup`, and `mount -o loop`.
-- [ ] `planned` **fuller `/proc`** — `lsof`, `fuser`, `pmap` need per-process fd/maps views.
-- [ ] `planned` **syslog / `/proc/kmsg`** — `syslogd`, `klogd`, `logread`.
-- [ ] `planned` **inotify** — `inotifyd`, and anything that watches the filesystem.
-- [ ] `planned` **RTC + watchdog ioctls** — `hwclock`, `rtcwake`, `watchdog`.
-- [ ] `planned` **i2c** — `i2cget`/`i2cset`/`i2cdump`/`i2cdetect`/`i2ctransfer`.
+- [x] `done` **netlink** — `AF_NETLINK`/`NETLINK_ROUTE` in `kernel/net/netlink.c`: RTM_GETLINK/GETADDR/GETROUTE/GETNEIGH dumps rendered from the netdev registry, the M84 FIB and the ARP cache, plus RTM_NEW/DEL for routes, neighbours and addresses. `ip`, `route`, `arp`, `netstat` enabled. IPv6 neighbours are deferred (the NDP cache has no enumeration API yet); an administrative link up/down returns EOPNOTSUPP because b1nix has no per-interface admin state to change.
+- [x] `done` **VT switching / console fonts** — `kernel/dev/vt.c`: six virtual terminals on `/dev/tty0../dev/tty6` with VT_ACTIVATE/WAITACTIVE/OPENQRY/DISALLOCATE/GETSTATE/SETMODE and KDSETMODE/KDGKBMODE, a replaceable console face behind PIO_FONT/GIO_FONT/KDFONTOP, and a real keysym table the PS/2 driver translates through so KDSKBENT/KDGKBENT (`loadkmap`/`dumpkmap`) change what keys produce. Alt+Fn switches.
+- [x] `done` **loop devices** — `loop_info64` with the backing file name, `lo_offset`/`lo_sizelimit`, a write path, read-only following the descriptor, and `/dev/`-prefixed mount sources, so `losetup` and `mount -o loop` both work.
+- [x] `done` **fuller `/proc`** — `/proc/<pid>/fd/N` readlinks to a file's full path instead of its basename, and `maps` labels `[heap]`/`[stack]`. `lsof`, `fuser`, `pmap` enabled.
+- [x] `done` **syslog / `/proc/kmsg`** — `kernel/dev/kmsg.c`: a structured record ring with sequence numbers, timestamps and priorities behind `/dev/kmsg`, `/proc/kmsg` and `syslog(2)`. `syslogd`, `klogd`, `logread`, `logger` enabled.
+- [x] `done` **inotify** — the M73 core plus IN_MOVED_FROM/IN_MOVED_TO with a shared cookie, IN_ATTRIB on chmod/chown/utimes, IN_DELETE_SELF, and the IN_MASK_ADD constant fixed. `inotifyd` enabled.
+- [x] `done` **RTC + watchdog ioctls** — `/dev/rtc0` reads and writes the CMOS clock (century register, BCD and 12-hour encodings) with RTC_RD_TIME/RTC_SET_TIME/RTC_ALM_*/RTC_WKALM_*/RTC_IRQP_*; `/dev/watchdog` is a software watchdog with the WDIOC_* interface and a deadline that really resets the machine. `hwclock`, `rtcwake`, `watchdog` enabled.
+- [x] `done` **i2c** — `/dev/i2c-0` on the PIIX4/ICH9 SMBus host controller, with I2C_SLAVE/I2C_FUNCS/I2C_SMBUS. The node exists only when a controller was probed, and I2C_FUNCS declines to claim raw-I2C support the silicon cannot deliver, so `i2ctransfer` reports the limit instead of misbehaving.
 - [ ] `planned` **MTD/UBI** — `flash*`, `nandwrite`, `ubi*`. Only worth it if b1nix ever targets flash storage.
 - [ ] `deferred` **loadable modules** — `insmod`, `rmmod`, `lsmod`, `modprobe`, `depmod`, `modinfo`. Not a gap to close: the kernel is monolithic by design, so these stay unavailable rather than unimplemented.
 

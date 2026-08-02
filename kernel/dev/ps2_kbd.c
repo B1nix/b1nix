@@ -4,6 +4,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/types.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/vt.h>
 
 #define KBD_BUFFER_SIZE 256
 
@@ -13,6 +14,8 @@ static usize kbd_tail = 0;
 static u8 shift_mask = 0;
 static int ctrl_pressed = 0;
 static int extended_scancode = 0;
+/* M107: Alt is tracked so the VT layer can claim Alt+Fn as a console switch. */
+static int alt_pressed = 0;
 static int num_lock_enabled = 1;
 static int kbd_debug_enabled;
 
@@ -88,6 +91,11 @@ static u8 kbd_dev_read(void)
 void ps2_kbd_init(void)
 {
 	kbd_debug_enabled = bootinfo_has_flag("b1nix.kbd-debug");
+
+	/* M107: hand the builtin layout to the VT keymap. From here on every
+	 * translation goes through that table, so KDSKBENT (loadkmap) can replace
+	 * any entry and KDGKBENT (dumpkmap) can read the live layout back. */
+	vt_keymap_seed(scancode_map, scancode_map_shift);
 
 	/* Disable the first port while we reconfigure, then drain stale bytes. */
 	kbd_ctrl_cmd(0xAD);
@@ -253,6 +261,8 @@ void ps2_kbd_handle_byte(u8 scancode)
 			shift_mask &= (u8)~2u;
 		} else if (key == 0x1D) {
 			ctrl_pressed = 0;
+		} else if (key == 0x38) {
+			alt_pressed = 0;
 		}
 		if (extended_scancode && (key == 0x5B || key == 0x5C)) {
 			ctrl_pressed = 0;
@@ -281,6 +291,9 @@ void ps2_kbd_handle_byte(u8 scancode)
 			case 0x5C: /* Right GUI (Mac Cmd) */
 				ctrl_pressed = 1;
 				break;
+			case 0x38: /* Right Alt (AltGr) */
+				alt_pressed = 1;
+				break;
 			default: break;
 			}
 			extended_scancode = 0;
@@ -294,6 +307,11 @@ void ps2_kbd_handle_byte(u8 scancode)
 			shift_mask |= 2u;
 		} else if (scancode == 0x1D) {
 			ctrl_pressed = 1;
+		} else if (scancode == 0x38) {
+			alt_pressed = 1;
+		} else if (vt_kbd_hotkey(scancode, alt_pressed)) {
+			/* Alt+Fn switched (or tried to switch) the virtual terminal; the
+			 * key must not also reach the foreground application. */
 		} else if (scancode == 0x45) {
 			num_lock_enabled = !num_lock_enabled;
 		} else if (scancode >= 0x3B && scancode <= 0x44) {
@@ -307,14 +325,24 @@ void ps2_kbd_handle_byte(u8 scancode)
 		           scancode != 0x4A && scancode != 0x4E) {
 			kbd_handle_keypad(scancode);
 		} else if (scancode < 128) {
-			char c = shift_mask ? scancode_map_shift[scancode] : scancode_map[scancode];
+			/* M107: translate through the loadable keymap (KDSKBENT) instead of
+			 * the builtin tables directly, so `loadkmap` really changes what a
+			 * key produces. The control fold lives in the ctrl tables. */
+			if (!vt_kbd_mode_is_xlate()) {
+				/* K_RAW / K_MEDIUMRAW: the VT's owner wants scancodes, which
+				 * it reads from /dev/input/event0 (mirrored above). */
+				extended_scancode = 0;
+				return;
+			}
+			char c = 0;
+			if (!vt_keymap_translate(scancode, shift_mask != 0, ctrl_pressed,
+			                         alt_pressed, &c))
+				c = 0;
 			if (c != 0) {
-				if (ctrl_pressed && c >= 'a' && c <= 'z') {
-					c = (char)(c - 'a' + 1);
-				} else if (ctrl_pressed && c >= 'A' && c <= 'Z') {
-					c = (char)(c - 'A' + 1);
-				} else if (ctrl_pressed && c == '\\') {
-					c = 28;
+				if (vt_kbd_char(c)) {
+					/* A non-console VT owns the keyboard right now. */
+					extended_scancode = 0;
+					return;
 				}
 				if ((console.termios.c_lflag & B1NIX_ISIG) && c == 3) {
 					if (console.fg_pgrp > 0) {

@@ -143,6 +143,7 @@ run_test /bin/m80_smoke posix
 run_test /bin/m86_smoke posix
 run_test /bin/m95_smoke posix
 run_test /bin/m96_smoke posix
+run_test /bin/m107_smoke posix
 run_test /bin/crashpad_smoke posix
 run_test /bin/m63_smoke posix
 run_test /bin/m71_aslr posix

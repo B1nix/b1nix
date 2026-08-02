@@ -1,6 +1,16 @@
 #include <b1nix/arch.h>
 #include <b1nix/blk.h>
 #include <b1nix/loop.h>
+#include <b1nix/vt.h>
+#include <b1nix/kmsg.h>
+#include <b1nix/rtc.h>
+#include <b1nix/watchdog.h>
+#include <b1nix/i2c.h>
+#include <b1nix/vt.h>
+#include <b1nix/kmsg.h>
+#include <b1nix/rtc.h>
+#include <b1nix/watchdog.h>
+#include <b1nix/i2c.h>
 #include <b1nix/console.h>
 #include <b1nix/drm.h>
 #include <b1nix/errno.h>
@@ -2225,6 +2235,12 @@ void vfs_init(void) {
   if (ptsdir)
     ptsdir->inode->lookup_cb = devpts_lookup;
   serial_tty_register_nodes();
+  /* M107: the VT, kmsg, RTC and watchdog nodes live on the old root too. */
+  vt_register_nodes();
+  kmsg_register_nodes();
+  rtc_dev_register_nodes();
+  watchdog_register_nodes();
+  i2c_register_nodes();
   vfs_create("/tmp/hello", 0644);
   vfs_mount("initramfs", "/", "initramfs", 0);
   tty_init_node();
@@ -3723,12 +3739,25 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
   if (IS_ERR(parent))
     return (int)PTR_ERR(parent);
 
+  /* Reference the entry before it is unlinked so IN_DELETE_SELF can name it
+   * after the removal has already dropped it from the tree. */
+  struct vfs_node *victim = 0;
   vfs_inode_lock(parent->inode);
+  victim = find_child(parent, name);
+  if (victim)
+    victim = vfs_node_get(victim);
   int res = vfs_remove_child_locked(parent, r_path, name, is_rmdir);
   vfs_inode_unlock(parent->inode);
-  /* M73 inotify: a removed entry is IN_DELETE on the parent directory. */
-  if (res == 0)
+  /* M73 inotify: a removed entry is IN_DELETE on the parent directory. M107:
+   * and IN_DELETE_SELF on the entry itself, which is what a watch placed
+   * directly on a file (rather than on its directory) is waiting for. */
+  if (res == 0) {
     vfs_inotify_notify(parent, IN_DELETE | (is_rmdir ? IN_ISDIR : 0), name);
+    if (victim)
+      vfs_inotify_notify(victim, IN_DELETE_SELF | (is_rmdir ? IN_ISDIR : 0), 0);
+  }
+  if (victim)
+    vfs_node_put(victim);
   vfs_node_put(parent);
   return res;
 }
@@ -4152,7 +4181,36 @@ out_put_parents:
 }
 
 int vfs_rename(const char *old_path, const char *new_path) {
-  return vfs_rename_internal(old_path, new_path);
+  int res = vfs_rename_internal(old_path, new_path);
+  /* M107 inotify: a rename is IN_MOVED_FROM on the source directory and
+   * IN_MOVED_TO on the destination, sharing a cookie. Resolved after the
+   * rename so the destination lookup finds the entry that now exists. */
+  if (res == 0) {
+    char oldbuf[VFS_MAX_PATH], newbuf[VFS_MAX_PATH];
+    vfs_resolve_path(old_path, oldbuf);
+    vfs_resolve_path(new_path, newbuf);
+    char *old_name = strrchr(oldbuf, '/');
+    char *new_name = strrchr(newbuf, '/');
+    if (old_name && new_name) {
+      *old_name = '\0';
+      *new_name = '\0';
+      const char *old_dir_path = oldbuf[0] ? oldbuf : "/";
+      const char *new_dir_path = newbuf[0] ? newbuf : "/";
+      struct vfs_node *od = vfs_find_node(old_dir_path);
+      struct vfs_node *nd = vfs_find_node(new_dir_path);
+      if (!IS_ERR(od) && !IS_ERR(nd)) {
+        struct vfs_node *moved = find_child(nd, new_name + 1);
+        int is_dir = moved && moved->inode &&
+                     moved->inode->type == VFS_DIRECTORY;
+        vfs_inotify_notify_move(od, old_name + 1, nd, new_name + 1, is_dir);
+      }
+      if (!IS_ERR(od))
+        vfs_node_put(od);
+      if (!IS_ERR(nd))
+        vfs_node_put(nd);
+    }
+  }
+  return res;
 }
 
 int vfs_rmdir(const char *path) {
@@ -4339,7 +4397,15 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   new_fs_id = next_fs_id++;
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   g_mounting_fs_id = new_fs_id;
-  struct vfs_node *root_node = fs->mount(source, flags, (void *)target);
+  /* M107: filesystems resolve their device with blk_get(), which matches the
+   * bare registration name ("sata0", "loop0"). Every userspace mounter passes
+   * a /dev path, so strip the directory here — this is what made
+   * `mount /dev/loop0 /mnt` (and therefore `mount -o loop`) fail with ENODEV
+   * while `mount loop0 /mnt` worked. */
+  const char *dev_source = source;
+  if (dev_source && strncmp(dev_source, "/dev/", 5) == 0)
+    dev_source += 5;
+  struct vfs_node *root_node = fs->mount(dev_source, flags, (void *)target);
   g_mounting_fs_id = 0;
   currently_mounting = NULL;
 
@@ -4363,7 +4429,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
      * anonymous number (major 0, unique minor) for a pseudo/RAM filesystem —
      * the same distinction Linux makes for tmpfs. */
     static u32 next_anon_minor = 1;
-    struct block_device *bdev = source ? blk_get(source) : 0;
+    struct block_device *bdev = dev_source ? blk_get(dev_source) : 0;
     u32 devno = bdev ? blk_devno(bdev) : 0;
     root_node->inode->dev = devno ? devno : (next_anon_minor++ & 0xFFu);
   }
@@ -5110,6 +5176,7 @@ int vfs_chmod(const char *path, u16 mode) {
 
   node->inode->mode = (node->inode->mode & ~07777) | (mode & 07777);
   vfs_update_times(node->inode, VFS_CTIME);
+  vfs_inotify_notify(node, IN_ATTRIB, 0); /* M107 */
   if (node->inode->setattr_cb) {
     res = node->inode->setattr_cb(node);
     goto out;
@@ -5143,6 +5210,7 @@ int vfs_utime(const char *path, u64 atime, u64 mtime) {
   node->inode->atime = atime;
   node->inode->mtime = mtime;
   node->inode->ctime = vfs_get_unix_time();
+  vfs_inotify_notify(node, IN_ATTRIB, 0); /* M107 */
   if (node->inode->setattr_cb) {
     res = node->inode->setattr_cb(node);
     goto out;
@@ -5203,6 +5271,7 @@ static int vfs_chown_common(const char *path, u16 uid, u16 gid, int nofollow) {
   if (gid != (u16)-1)
     node->inode->gid = gid;
   vfs_update_times(node->inode, VFS_CTIME);
+  vfs_inotify_notify(node, IN_ATTRIB, 0); /* M107 */
   if (node->inode->setattr_cb) {
     res = node->inode->setattr_cb(node);
     goto out;

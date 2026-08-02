@@ -57,8 +57,8 @@ static void inotify_release_by_ptr(struct inotify_instance *in);
 
 /* Enqueue an event into `in` (caller holds in->lock). Drops to IN_Q_OVERFLOW if
  * the ring is full (Linux behaviour). */
-static void inotify_enqueue(struct inotify_instance *in, int wd, u32 mask,
-                            const char *name) {
+static void inotify_enqueue_cookie(struct inotify_instance *in, int wd,
+                                   u32 mask, const char *name, u32 cookie) {
   if (in->count >= INOTIFY_QUEUE) {
     /* overwrite the tail-most with an overflow marker once */
     struct inotify_event_rec *o = &in->ev[(in->head + in->count - 1) % INOTIFY_QUEUE];
@@ -71,7 +71,7 @@ static void inotify_enqueue(struct inotify_instance *in, int wd, u32 mask,
   struct inotify_event_rec *r = &in->ev[in->tail];
   r->wd = wd;
   r->mask = mask;
-  r->cookie = 0;
+  r->cookie = cookie;
   if (name && name[0]) {
     usize nl = strlen(name);
     if (nl > INOTIFY_NAME_MAX)
@@ -87,6 +87,11 @@ static void inotify_enqueue(struct inotify_instance *in, int wd, u32 mask,
   }
   in->tail = (in->tail + 1) % INOTIFY_QUEUE;
   in->count++;
+}
+
+static void inotify_enqueue(struct inotify_instance *in, int wd, u32 mask,
+                            const char *name) {
+  inotify_enqueue_cookie(in, wd, mask, name, 0);
 }
 
 /* ── fd file-ops ────────────────────────────────────────────────────────── */
@@ -255,9 +260,12 @@ int vfs_inotify_add_watch(int fd, const char *user_path, u32 mask) {
   /* Existing watch on this node? Update the mask. */
   for (int i = 0; i < INOTIFY_MAX_WATCHES; i++) {
     if (in->watches[i].wd && in->watches[i].node == node) {
-      in->watches[i].mask = (mask & 0x80000000u /* IN_MASK_ADD */)
-                                ? (in->watches[i].mask | mask)
-                                : mask;
+      /* IN_MASK_ADD ORs into the existing mask instead of replacing it. The
+       * modifier bit itself is not an event and must not be stored. */
+      in->watches[i].mask =
+          (mask & IN_MASK_ADD)
+              ? (in->watches[i].mask | (mask & IN_ALL_EVENTS))
+              : (mask & IN_ALL_EVENTS);
       int wd = in->watches[i].wd;
       spin_unlock_irqrestore(&in->lock, flags);
       vfs_node_put(node); /* already hold a ref in the existing watch */
@@ -312,7 +320,30 @@ int vfs_inotify_rm_watch(int fd, int wd) {
 
 /* ── VFS hook ───────────────────────────────────────────────────────────── */
 
+static void inotify_notify_cookie(struct vfs_node *node, u32 mask,
+                                  const char *name, u32 cookie);
+
 void vfs_inotify_notify(struct vfs_node *node, u32 mask, const char *name) {
+  inotify_notify_cookie(node, mask, name, 0);
+}
+
+/* A rename is one event on the source directory and one on the destination,
+ * sharing a cookie so a watcher can pair them into a move rather than seeing
+ * an unrelated delete and create. */
+void vfs_inotify_notify_move(struct vfs_node *old_dir, const char *old_name,
+                             struct vfs_node *new_dir, const char *new_name,
+                             int is_dir) {
+  static u32 next_cookie = 1;
+  if (__atomic_load_n(&g_inotify_active, __ATOMIC_ACQUIRE) == 0)
+    return;
+  u32 cookie = __atomic_add_fetch(&next_cookie, 1, __ATOMIC_RELAXED);
+  u32 dirbit = is_dir ? IN_ISDIR : 0;
+  inotify_notify_cookie(old_dir, IN_MOVED_FROM | dirbit, old_name, cookie);
+  inotify_notify_cookie(new_dir, IN_MOVED_TO | dirbit, new_name, cookie);
+}
+
+static void inotify_notify_cookie(struct vfs_node *node, u32 mask,
+                                  const char *name, u32 cookie) {
   if (!node || __atomic_load_n(&g_inotify_active, __ATOMIC_ACQUIRE) == 0)
     return;
   int woke = 0;
@@ -330,7 +361,7 @@ void vfs_inotify_notify(struct vfs_node *node, u32 mask, const char *name) {
         /* Report the matched event bits plus the IN_ISDIR qualifier, which
          * Linux preserves even though it is not part of the watch mask. */
         u32 report = (mask & in->watches[w].mask) | (mask & IN_ISDIR);
-        inotify_enqueue(in, in->watches[w].wd, report, name);
+        inotify_enqueue_cookie(in, in->watches[w].wd, report, name, cookie);
         woke = 1;
       }
     }

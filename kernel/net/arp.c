@@ -2,6 +2,8 @@
 #include <b1nix/netdev.h>
 #include <b1nix/console.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/errno.h>
+#include <b1nix/posix.h>
 #include <string.h>
 
 #define ARP_HW_ETHERNET 1
@@ -31,6 +33,10 @@ struct arp_entry {
 	struct ipv4_addr ip;
 	struct mac_addr mac;
 	int valid;
+	/* M107: set for an entry installed administratively (`ip neigh add`). A
+	 * learned reply never overwrites one, and it reports NUD_PERMANENT. */
+	int permanent;
+	int oif; /* interface the mapping was learned on, 0 = unknown */
 };
 static struct arp_entry arp_table[ARP_TABLE_SIZE];
 static int arp_smoke_resolution_logged;
@@ -52,14 +58,30 @@ void arp_init(void)
 	arp_smoke_reply_logged = 0;
 	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
 		arp_table[i].valid = 0;
+		arp_table[i].permanent = 0;
+		arp_table[i].oif = 0;
 	}
+}
+
+/* The interface a mapping belongs to: the one currently delivering frames when
+ * we are inside a receive path, else the active NIC. */
+static int arp_current_oif(void)
+{
+	struct netdev *nd = netdev_receiving();
+	if (!nd)
+		nd = netdev_active();
+	return netdev_index_of(nd);
 }
 
 static void arp_cache_put(struct ipv4_addr ip, struct mac_addr mac)
 {
 	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
 		if (arp_table[i].valid && memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
+			/* An administratively pinned entry outranks the wire. */
+			if (arp_table[i].permanent)
+				return;
 			arp_table[i].mac = mac;
+			arp_table[i].oif = arp_current_oif();
 			return;
 		}
 	}
@@ -68,9 +90,70 @@ static void arp_cache_put(struct ipv4_addr ip, struct mac_addr mac)
 			arp_table[i].ip = ip;
 			arp_table[i].mac = mac;
 			arp_table[i].valid = 1;
+			arp_table[i].permanent = 0;
+			arp_table[i].oif = arp_current_oif();
 			return;
 		}
 	}
+}
+
+/* ── M107: neighbour-table administration (rtnetlink RTM_*NEIGH, `ip neigh`) ── */
+
+usize arp_snapshot(struct neigh_info *out, usize max)
+{
+	usize n = 0;
+	for (int i = 0; i < ARP_TABLE_SIZE && n < max; i++) {
+		if (!arp_table[i].valid)
+			continue;
+		out[n].family = B1NIX_AF_INET;
+		memset(out[n].addr, 0, sizeof(out[n].addr));
+		memcpy(out[n].addr, arp_table[i].ip.bytes, 4);
+		out[n].addr_len = 4;
+		out[n].permanent = (u8)(arp_table[i].permanent ? 1 : 0);
+		out[n].mac = arp_table[i].mac;
+		out[n].oif = arp_table[i].oif;
+		n++;
+	}
+	return n;
+}
+
+int arp_neigh_set(struct ipv4_addr ip, struct mac_addr mac, int permanent)
+{
+	int oif = arp_current_oif();
+	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+		if (arp_table[i].valid &&
+		    memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
+			arp_table[i].mac = mac;
+			arp_table[i].permanent = permanent ? 1 : 0;
+			arp_table[i].oif = oif;
+			return 0;
+		}
+	}
+	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+		if (!arp_table[i].valid) {
+			arp_table[i].ip = ip;
+			arp_table[i].mac = mac;
+			arp_table[i].valid = 1;
+			arp_table[i].permanent = permanent ? 1 : 0;
+			arp_table[i].oif = oif;
+			return 0;
+		}
+	}
+	return -ENOSPC;
+}
+
+int arp_neigh_del(struct ipv4_addr ip)
+{
+	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+		if (arp_table[i].valid &&
+		    memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
+			arp_table[i].valid = 0;
+			arp_table[i].permanent = 0;
+			arp_table[i].oif = 0;
+			return 0;
+		}
+	}
+	return -ESRCH;
 }
 
 int arp_resolve_dev(struct ipv4_addr ip, struct mac_addr *mac, struct netdev *dev)
