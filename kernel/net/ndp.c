@@ -409,6 +409,7 @@ static void ndp_icmp6_receive(struct in6_addr_k src, struct in6_addr_k dst,
 static struct net_proto ndp_proto = {
 	.name = "ndp",
 	.resolve6 = ndp_resolve_proto,
+	.mld_join = mld_join_solicited_node,
 	.icmp6 = ndp_icmp6_receive,
 	.tick = ndp_tick,
 	.reset = ndp_module_reset,

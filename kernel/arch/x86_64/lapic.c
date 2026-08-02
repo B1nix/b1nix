@@ -293,15 +293,16 @@ struct task *percpu_cur_task(int cpu) {
 extern u8 ap_trampoline_bin[];
 extern u32 ap_trampoline_bin_len;
 
-/* Data layout offsets within the trampoline page. These MUST match the data
- * block at the end of kernel/arch/x86_64/ap_trampoline.S (verify with `nm` after
- * changing the trampoline). */
-#define TRAMP_PML4_OFF    0xB8   /* pml4_phys */
-#define TRAMP_STACK_OFF   0xC0   /* stack_ptr */
-#define TRAMP_PCPU_OFF    0xC8   /* percpu_ptr */
-#define TRAMP_CPU_OFF     0xD0   /* cpu_id */
-#define TRAMP_READY_OFF   0xE2   /* ready_flag (4 bytes) */
-#define TRAMP_APMAIN_OFF  0xE6   /* ap_main_ptr (8 bytes) */
+/* Offsets of the trampoline's data block, GENERATED from the same object the
+ * blob is linked from (build/<arch>/inc/ap_trampoline_offsets.h, produced by
+ * `nm`). They were hand-written constants until the trampoline's code grew and
+ * pushed the block down: the BSP then wrote CR3, RSP and the ap_main pointer
+ * into the middle of the trampoline's own code, and every AP triple-faulted the
+ * machine on its first SIPI. Deriving them removes the duplicate knowledge that
+ * made that possible; the magic word below is the runtime witness that the blob
+ * and these offsets came from the same build. */
+#include "ap_trampoline_offsets.h"
+#define TRAMP_MAGIC       0x54524D50303031ULL /* "TRMP001" */
 
 static void smp_setup_trampoline(u64 pml4_phys, u64 stack_virt,
                                   u64 percpu_ptr, u32 cpu_id)
@@ -314,6 +315,11 @@ static void smp_setup_trampoline(u64 pml4_phys, u64 stack_virt,
     /* Copy trampoline code */
     for (usize i = 0; i < tramp_len; i++)
         *(volatile u8 *)(tv + i) = ap_trampoline_bin[i];
+
+    /* The blob must be the trampoline this file was built against. */
+    if (*(volatile u64 *)(tv + TRAMP_MAGIC_OFF) != TRAMP_MAGIC)
+        panic("AP trampoline layout mismatch: data block moved, see "
+              "TRAMP_*_OFF in lapic.c and the .org in ap_trampoline.S");
 
     /* Fill in data */
     *(volatile u64 *)(tv + TRAMP_PML4_OFF)  = pml4_phys;

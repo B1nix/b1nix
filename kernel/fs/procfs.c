@@ -87,6 +87,22 @@ __attribute__((format(printf, 2, 3))) static void sb_addf(struct sbuf *s,
   va_end(ap);
   if (n < 0)
     return;
+  /* A result longer than the scratch used to be truncated in silence — that is
+   * how /proc/modules lost the tail of its last line (an address cut to
+   * "0xffff") once the module list grew past 256 bytes. Retry through a buffer
+   * of the size vsnprintf just told us it needs. */
+  if (n >= (int)sizeof(scratch)) {
+    char *big = kmalloc((usize)n + 1);
+    if (!big)
+      return;
+    va_start(ap, fmt);
+    int n2 = vsnprintf(big, (usize)n + 1, fmt, ap);
+    va_end(ap);
+    if (n2 >= 0)
+      sb_puts(s, big);
+    kfree(big);
+    return;
+  }
   sb_puts(s, scratch);
 }
 
@@ -372,8 +388,8 @@ static int r_swaps(usize pid, struct sbuf *s) {
   return 0;
 }
 
-/* /proc/modules — b1nix is a monolithic kernel with no loadable modules, so
- * the list is genuinely empty (Linux prints nothing in that case too). */
+/* /proc/modules — rendered from the live module list (M95). Empty when nothing
+ * is loaded, exactly as Linux prints it. */
 static int r_modules(usize pid, struct sbuf *s) {
   (void)pid;
   char *buf = kmalloc(4096);
@@ -381,7 +397,7 @@ static int r_modules(usize pid, struct sbuf *s) {
     return -ENOMEM;
   int len = module_proc_render(buf, 4096);
   if (len > 0)
-    sb_addf(s, "%s", buf);
+    sb_puts(s, buf); /* verbatim: the text is already formatted */
   kfree(buf);
   return 0;
 }

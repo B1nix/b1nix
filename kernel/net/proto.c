@@ -176,6 +176,17 @@ void ndp_dispatch_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
   proto_dispatch_leave();
 }
 
+void ndp_dispatch_mld_join(struct in6_addr_k addr) {
+  proto_dispatch_enter();
+  for (struct net_proto *p = proto_list; p; p = p->next) {
+    if (p->mld_join) {
+      p->mld_join(addr);
+      break;
+    }
+  }
+  proto_dispatch_leave();
+}
+
 int ndp_dispatch_resolve(struct in6_addr_k ip, struct mac_addr *mac,
                          struct netdev *dev) {
   int rc = 0;

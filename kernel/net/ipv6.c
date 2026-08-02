@@ -500,3 +500,5 @@ module_exit(ipv6_module_exit);
  * that reference is what makes modules.dep record "ndp: ipv6". */
 EXPORT_SYMBOL(ipv6_send);
 EXPORT_SYMBOL(ipv6_receive);
+/* M84's per-interface transmit: ndp.ko solicits on the link the route chose. */
+EXPORT_SYMBOL(ipv6_send_via);

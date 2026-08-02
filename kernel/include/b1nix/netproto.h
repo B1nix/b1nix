@@ -37,6 +37,11 @@ struct net_proto {
    * that no socket claimed. */
   void (*icmp6_unreach)(struct in6_addr_k dst, u8 code, const void *quoted,
                         usize quoted_len);
+  /* Join the solicited-node multicast group for `addr`. Built-in code (DHCPv6)
+   * needs this the moment it takes an address, but the implementation lives in
+   * the NDP module — so it is reached through the registry, and is simply a
+   * no-op while that module is not loaded. */
+  void (*mld_join)(struct in6_addr_k addr);
   /* Periodic work, driven by the net daemon at ~100 Hz. */
   void (*tick)(u64 now_ticks);
   /* Interface reconfigured (address change / adapter switch). */
@@ -72,5 +77,6 @@ void ndp_dispatch_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
                           const void *data, usize size);
 int ndp_dispatch_resolve(struct in6_addr_k ip, struct mac_addr *mac,
                          struct netdev *dev);
+void ndp_dispatch_mld_join(struct in6_addr_k addr);
 
 #endif /* B1NIX_NETPROTO_H */

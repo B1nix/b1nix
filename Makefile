@@ -264,6 +264,11 @@ endif
 INITRAMFS_USER_PROGRAM_INCS := \
 	$(addprefix $(INC_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
 AP_TRAMPOLINE_INC := $(INC_DIR)/ap_trampoline.inc
+# Byte offsets of the trampoline's data block, generated from the very object
+# the blob is linked from. The BSP patches those fields by offset before SIPI;
+# keeping the numbers in C by hand meant that growing the trampoline's code
+# silently moved the block and every AP triple-faulted on a garbage CR3.
+AP_TRAMPOLINE_OFFSETS := $(INC_DIR)/ap_trampoline_offsets.h
 INITRAMFS_B1CC_INCS := $(INITRAMFS_B1CC_M34_INC)
 INITRAMFS_B1CC_SELFHOST_INC := $(INC_DIR)/initramfs_b1cc_selfhost.inc
 
@@ -281,7 +286,7 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_MODULES_INC) \
 	$(INITRAMFS_LD_MUSL_INC)
-GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
+GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(AP_TRAMPOLINE_OFFSETS) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/$(ARCH)/ports/curl/install/bin/curl
 DROPBEAR_VERSION := 2022.83
 DROPBEAR_ELF := build/$(ARCH)/ports/dropbear/dropbearmulti
@@ -617,7 +622,7 @@ $(INITRAMFS_MODULES_INC): $(MODULE_KOS) tools/kernel/gen_modules_initramfs.sh \
 # whole kernel).
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
-$(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC)
+$(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC) $(AP_TRAMPOLINE_OFFSETS)
 $(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC)
 
 # programs.c includes the generated applet registration .inc
@@ -1355,6 +1360,22 @@ $(AP_TRAMP_BIN): $(AP_TRAMP_OBJ)
 $(AP_TRAMPOLINE_INC): $(AP_TRAMP_BIN)
 	@mkdir -p $(dir $@)
 	xxd -i -n ap_trampoline_bin $< > $@
+
+# One #define per data field, straight out of the symbol table: the offsets can
+# no longer disagree with the assembly, because they ARE the assembly's.
+$(AP_TRAMPOLINE_OFFSETS): $(AP_TRAMP_OBJ)
+	@mkdir -p $(dir $@)
+	@printf '/* Generated from ap_trampoline.S — do not edit. */\n#ifndef B1NIX_AP_TRAMPOLINE_OFFSETS_H\n#define B1NIX_AP_TRAMPOLINE_OFFSETS_H\n' > $@
+	@$(NM) -n $< | awk '\
+		$$3 == "tramp_magic"  { printf "#define TRAMP_MAGIC_OFF   0x%s\n", $$1 } \
+		$$3 == "pml4_phys"    { printf "#define TRAMP_PML4_OFF    0x%s\n", $$1 } \
+		$$3 == "stack_ptr"    { printf "#define TRAMP_STACK_OFF   0x%s\n", $$1 } \
+		$$3 == "percpu_ptr"   { printf "#define TRAMP_PCPU_OFF    0x%s\n", $$1 } \
+		$$3 == "cpu_id"       { printf "#define TRAMP_CPU_OFF     0x%s\n", $$1 } \
+		$$3 == "ready_flag"   { printf "#define TRAMP_READY_OFF   0x%s\n", $$1 } \
+		$$3 == "ap_main_ptr"  { printf "#define TRAMP_APMAIN_OFF  0x%s\n", $$1 }' \
+		| sed 's/0x00*\([0-9a-f]\)/0x\1/' >> $@
+	@printf '#endif\n' >> $@
 
 $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)

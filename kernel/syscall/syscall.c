@@ -2158,19 +2158,42 @@ static isize sys_linux_getdents64(int fd, u64 user_buf, usize count) {
   return sys_linux_getdents_common(fd, user_buf, count, 0);
 }
 
+/* getdents(2)/getdents64(2).
+ *
+ * The directory cursor is OPAQUE: a filesystem is free to make it a byte
+ * position (ext2 does, because an unlink renumbers nothing that way), so this
+ * shim must never compute one. It used to read a batch of 32 and then set the
+ * cursor to `start + emitted` — index arithmetic that both destroyed the
+ * filesystem's cookie and reintroduced positional semantics, which is why a
+ * `rm -rf` of a directory larger than one batch skipped an entry per deletion
+ * and left the directory un-removable.
+ *
+ * So: fetch ONE entry at a time and let the handle's own cursor advance. An
+ * entry that does not fit is pushed back by seeking to the cursor saved before
+ * it was read, and each record's d_off is the cursor AFTER that entry — a real
+ * per-entry cookie, which is what seekdir(3) is supposed to receive. The cost
+ * is one VFS call per entry instead of per batch; for ext2 that is a block-cache
+ * hit, and correctness here outranks the saving. */
 static isize sys_linux_getdents_common(int fd, u64 user_buf, usize count,
                                        int legacy) {
   isize start = vfs_lseek(fd, 0, B1NIX_SEEK_CUR);
   if (start < 0)
     return start;
-  struct dirent kbuf[32];
-  isize n = vfs_getdents(fd, kbuf, 32);
-  if (n <= 0)
-    return n; /* 0 = end of directory, <0 = -errno */
 
   usize written = 0;
   isize emitted = 0;
-  for (isize i = 0; i < n; i++) {
+  for (;;) {
+    isize before = vfs_lseek(fd, 0, B1NIX_SEEK_CUR);
+    if (before < 0)
+      break;
+    struct dirent kbuf[1];
+    isize n = vfs_getdents(fd, kbuf, 1);
+    if (n < 0)
+      return emitted ? (isize)written : n;
+    if (n == 0)
+      break; /* end of directory */
+    isize after = vfs_lseek(fd, 0, B1NIX_SEEK_CUR);
+    isize i = 0;
     usize namelen = 0;
     while (namelen < sizeof(kbuf[i].name) && kbuf[i].name[namelen])
       namelen++;
@@ -2179,18 +2202,21 @@ static isize sys_linux_getdents_common(int fd, u64 user_buf, usize count,
      * padded to an 8-byte multiple. */
     usize reclen = legacy ? ((18 + namelen + 2 + 7) & ~(usize)7)
                           : ((19 + namelen + 1 + 7) & ~(usize)7);
-    if (written + reclen > count)
-      break; /* no room; leave this and the rest for the next call */
+    if (written + reclen > count) {
+      /* No room: push this entry back so the next call re-reads it. */
+      vfs_lseek(fd, before, B1NIX_SEEK_SET);
+      break;
+    }
 
     char rec[19 + sizeof(kbuf[0].name) + 2 + 7];
     for (usize z = 0; z < reclen; z++)
       rec[z] = 0;
     /* d_ino: the filesystem's inode number when it has one, otherwise the
      * entry's index — never 0, which some tools read as "deleted". */
-    u64 d_ino = kbuf[i].ino ? kbuf[i].ino : (u64)(start + i + 1);
+    u64 d_ino = kbuf[i].ino ? kbuf[i].ino : (u64)(after);
     if (legacy) {
       *(u64 *)&rec[0] = d_ino;                 /* d_ino  */
-      *(i64 *)&rec[8] = (i64)(start + i + 1);  /* d_off  */
+      *(i64 *)&rec[8] = (i64)after;            /* d_off: cursor after this entry */
       *(u16 *)&rec[16] = (u16)reclen;          /* d_reclen */
       for (usize z = 0; z < namelen; z++)
         rec[18 + z] = kbuf[i].name[z];
@@ -2199,7 +2225,7 @@ static isize sys_linux_getdents_common(int fd, u64 user_buf, usize count,
     } else {
       struct linux_dirent64 *de = (struct linux_dirent64 *)rec;
       de->d_ino = d_ino;
-      de->d_off = (i64)(start + i + 1); /* opaque cookie: index of the next entry */
+      de->d_off = (i64)after; /* opaque cookie: the cursor after this entry */
       de->d_reclen = (u16)reclen;
       de->d_type = lx_dirent_type(&kbuf[i]);
       for (usize z = 0; z < namelen; z++)
@@ -2213,10 +2239,12 @@ static isize sys_linux_getdents_common(int fd, u64 user_buf, usize count,
     emitted++;
   }
 
-  /* Consumed n from the handle but only emitted `emitted`; rewind the rest. */
-  vfs_lseek(fd, start + emitted, B1NIX_SEEK_SET);
-  if (emitted == 0)
-    return -EINVAL; /* buffer too small for even one entry */
+  if (emitted == 0) {
+    /* Either the directory ended (cursor did not move) or the caller's buffer
+     * cannot hold even one record. */
+    isize now = vfs_lseek(fd, 0, B1NIX_SEEK_CUR);
+    return (now == start) ? 0 : -EINVAL;
+  }
   return (isize)written;
 }
 

@@ -1647,10 +1647,16 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
   }
 }
 
+/* Monotonic source for vfs_node::dir_seq. Wrapping would take 2^64 node
+ * creations; the counter is deliberately global rather than per-directory so a
+ * node keeps its cursor position if it is ever moved between directories. */
+static u64 g_dir_seq_next = 1;
+
 struct vfs_node *vfs_create_node(enum vfs_node_type type) {
   struct vfs_node *n = alloc_node();
   if (!n)
     return NULL;
+  n->dir_seq = __atomic_fetch_add(&g_dir_seq_next, 1, __ATOMIC_RELAXED);
   n->inode = alloc_inode();
   if (!n->inode) {
     n->refcount = 0;
@@ -2921,6 +2927,13 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
       node->inode->setattr_cb(node);
     if (posp) *posp += size; else h->offset += size;
     res = (isize)size;
+  } else {
+    /* Nothing here can accept the bytes: a device/pipe-shaped node whose
+     * filesystem installed no write_cb. Falling through with res == 0 reported
+     * a successful zero-length write, so every read-only procfs/sysfs attribute
+     * silently swallowed writes — a 0444 module parameter "accepted" being set
+     * and simply kept its old value. Refuse instead. */
+    res = -EACCES;
   }
   vfs_inode_unlock(node->inode);
   /* M73 inotify: report a successful write as IN_MODIFY. Called after the inode
@@ -4449,6 +4462,73 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
   vfs_handle_retain(h);
   vfs_node_get(dir);
   usize offset = h->offset;
+
+  /* Cursor-based readdir wins when the filesystem offers it: the handle then
+   * carries an opaque resume cookie instead of a live-entry index, which is
+   * what keeps a delete-as-you-go walk (rm -rf) from skipping entries. */
+  if (!dir->inode->readdir_at_cb && !dir->inode->readdir_cb) {
+    /* In-memory tree (tmpfs/ramfs/devtmpfs and every synthetic dir): resume by
+     * vfs_node::dir_seq, which no unlink renumbers — unlike a positional index,
+     * which shifts every surviving entry down when one is removed and so makes
+     * a delete-as-you-go walk (rm -rf) skip one entry per deletion.
+     *
+     * Children are inserted at the HEAD of the sibling list, so the list runs
+     * from newest to oldest and dir_seq DESCENDS along it. The cursor is
+     * therefore an upper bound: emit children whose seq is below the last one
+     * emitted. Cookies 0 and 1 are "." and "..", and 2 means "children, no
+     * bound yet"; a child cookie is seq+2, which is always >= 3. */
+    u64 cookie = (u64)offset;
+    usize count = 0;
+    if (cookie == 0 && count < max_entries) {
+      copy_path(buf[count].name, 64, ".");
+      buf[count].type = (u32)VFS_DIRECTORY;
+      buf[count].is_dir = 1;
+      buf[count].is_exec = 1;
+      buf[count].size = 0;
+      count++;
+      cookie = 1;
+    }
+    if (cookie == 1 && count < max_entries) {
+      copy_path(buf[count].name, 64, "..");
+      buf[count].type = (u32)VFS_DIRECTORY;
+      buf[count].is_dir = 1;
+      buf[count].is_exec = 1;
+      buf[count].size = 0;
+      count++;
+      cookie = 2;
+    }
+    u64 seq_below = (cookie > 2) ? (cookie - 2) : 0; /* 0 = no bound */
+    u64 tflags;
+    vfs_tree_read_acquire(&tflags);
+    for (struct vfs_node *child = dir->first_child; child && count < max_entries;
+         child = child->next_sibling) {
+      if (child->deleted)
+        continue;
+      if (seq_below && child->dir_seq >= seq_below)
+        continue; /* already returned in an earlier batch */
+      copy_path(buf[count].name, 64, child->name);
+      buf[count].type = (u32)child->inode->type;
+      buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
+      buf[count].is_exec = 0;
+      buf[count].size = child->inode->size;
+      buf[count].ino = child->inode->ino;
+      count++;
+      cookie = child->dir_seq + 2;
+    }
+    vfs_tree_read_release(tflags);
+    if (count > 0)
+      h->offset = (usize)cookie;
+    res = (isize)count;
+    goto out;
+  }
+
+  if (dir->inode->readdir_at_cb) {
+    u64 next = (u64)offset;
+    res = dir->inode->readdir_at_cb(dir, (u64)offset, buf, max_entries, &next);
+    if (res > 0)
+      h->offset = (usize)next;
+    goto out;
+  }
 
   if (dir->inode->readdir_cb) {
     res = dir->inode->readdir_cb(dir, offset, buf, max_entries);

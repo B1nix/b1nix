@@ -124,6 +124,18 @@ EXPORT_SYMBOL(net_proto_ipv6_send);
 EXPORT_SYMBOL(net_is_ready);
 EXPORT_SYMBOL(net_poll);
 EXPORT_SYMBOL(net_send_ethernet);
+/* M84 routing: the IPv6 and NDP modules pick an egress interface and a
+   next hop through the FIB, so the routing entry points are part of the
+   module ABI too. */
+EXPORT_SYMBOL(net_send_ethernet_dev);
+EXPORT_SYMBOL(netdev_by_index);
+EXPORT_SYMBOL(route_flow_hash);
+EXPORT_SYMBOL(route6_lookup_flow);
+EXPORT_SYMBOL(route6_configure_interface);
+/* DHCPv6 stays built into the kernel; ndp.ko starts it once a router
+   advertisement asks for stateful configuration. */
+EXPORT_SYMBOL(dhcpv6_init);
+EXPORT_SYMBOL(dhcpv6_start);
 EXPORT_SYMBOL(net_loopback_enqueue);
 EXPORT_SYMBOL(net_loopback_drain);
 EXPORT_SYMBOL(net_get_mac);

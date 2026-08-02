@@ -138,6 +138,18 @@ struct vfs_inode {
                    int flags);
   isize (*readdir_cb)(struct vfs_node *node, usize offset, struct dirent *buf,
                       usize max_entries);
+  /* Cursor-based readdir, for filesystems whose on-disk directory has no stable
+   * "Nth live entry" numbering. `readdir_cb`'s offset is an index of live
+   * entries, and that index is destroyed by an unlink: the entries after the
+   * removed one all shift down by one, so a reader that resumes at its saved
+   * index (every `rm -rf`, which deletes as it walks) SKIPS exactly as many
+   * entries as it has deleted, and the final rmdir then fails ENOTEMPTY on a
+   * directory that only looks empty. This variant takes an opaque cookie and
+   * returns the one to resume from — for on-disk formats that is a byte
+   * position, which an unlink elsewhere in the directory does not move. When a
+   * filesystem provides it, the VFS uses it in preference. */
+  isize (*readdir_at_cb)(struct vfs_node *node, u64 cookie, struct dirent *buf,
+                         usize max_entries, u64 *next_cookie);
   /* On-demand child materialisation for synthetic dirs (procfs/sysfs) whose
    * children exist lazily. The path resolver calls this when find_child misses,
    * so a DIRECT lookup (e.g. musl ttyname's readlink("/proc/self/fd/N"), which
@@ -210,6 +222,13 @@ struct vfs_node {
   struct vfs_inode *inode;
   int refcount; /* References to this NAME (e.g. current directory) */
   int deleted;
+  /* Directory-cursor sequence number, handed out in creation order from a
+   * single global counter. readdir resumes at "the first child whose seq is
+   * greater than the cookie", which is what makes the cursor survive deletion:
+   * a positional index renumbers every surviving entry when one is removed, so
+   * a reader that deletes as it walks (rm -rf) skips one entry per deletion and
+   * the final rmdir fails ENOTEMPTY on a directory that only looks empty. */
+  u64 dir_seq;
 
   struct vfs_node *parent;
   struct vfs_node *first_child;

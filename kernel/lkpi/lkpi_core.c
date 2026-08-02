@@ -104,11 +104,20 @@ dma_addr_t dma_map_single(void *cpu_addr, usize size, int direction)
 {
 	if (!cpu_addr || size == 0)
 		return 0;
+	/* Translate through the page tables rather than by subtracting the
+	 * direct-map base: kernel heap allocations do not live in the direct map
+	 * (kmalloc hands out addresses from the kernel's own window), so the
+	 * subtraction produced a "physical" address that pointed nowhere — which is
+	 * exactly what a device would then have DMA'd into. The direct map stays as
+	 * the fallback for addresses the walk cannot resolve. */
 	u64 v = (u64)(usize)cpu_addr;
 	u64 dm = vmm_direct_map_base();
-	if (v < dm)
-		return 0; /* not direct-mapped: b1nix has no bounce buffers */
-	dma_addr_t handle = v - dm;
+	dma_addr_t handle = vmm_virt_to_phys(cpu_addr);
+	if (!handle) {
+		if (v < dm)
+			return 0; /* untranslatable: b1nix has no bounce buffers */
+		handle = v - dm;
+	}
 	dma_sync_single_for_device(handle, size, direction);
 	return handle;
 }

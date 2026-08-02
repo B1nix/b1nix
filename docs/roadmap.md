@@ -819,6 +819,8 @@ Status:
 - [x] `init_module(2)` / `finit_module(2)` / `delete_module(2)` — native 243/245/244 and the Linux ABI numbers 175/313/176 — all gated on `CAP_SYS_MODULE`. `/proc/modules` is real, `/proc/filesystems` now enumerates the live registry instead of a hardcoded list, and `/bin/kmod` is a multi-call `insmod`/`rmmod`/`lsmod`/`modinfo`/`modprobe`.
 - [x] `ntfs`, `btrfs`, `isofs` and the Intel HDA sound driver ship as `.ko` in the initramfs and the rootfs; the kernel loads them at boot through `request_module`, and boots and passes its tests with any of them absent. `tools/kernel/check-module-syms.sh` fails the build (not the insmod) on an unexported symbol.
 - [x] `M95-SMOKE` covers the framework end to end, including a vermagic-corrupted module being rejected and an unprivileged `delete_module` reporting `EPERM`.
+- [ ] `open` **Unloading a filesystem module while one of its filesystems is mounted is not refused.** `vfs_unregister_fs` has no mount refcount behind it, so `rmmod isofs` with an ISO mounted frees the code the mount is still using. The protocol modules are protected (the dispatch-drain guard in `proto.c`); the filesystems are not.
+- [ ] `open` `VFS_FS_NODEV` is set on six pseudo filesystems only, so `/proc/filesystems` mislabels the rest of them.
 
 ## M96: Loadable Kernel Modules — Network Protocols and Module Parameters
 
@@ -827,6 +829,7 @@ Status:
 - [x] In-kernel `request_module` (loads from `/lib/modules`, resolving aliases and dependencies) plus a userspace `modprobe` with `-r`, both reading the same index files.
 - [x] `modules.dep` and `modules.alias` are generated from the objects themselves (`tools/kernel/gen_modules_initramfs.sh`) — a dependency is an undefined symbol another module `EXPORT_SYMBOL`s, so `ndp: ipv6` falls out of the code rather than a hand-written list.
 - [x] `M96-SMOKE` covers protocol modules, sysfs parameters (read, write, read-only rejection, insmod-time), `modules.dep`, alias resolution and dependency-ordered `modprobe`.
+- [ ] `open` IPv6 neighbour enumeration for netlink (`ip -6 neigh`) — `ndp.ko` exposes no snapshot/add/delete API, so M107's `RTM_GETNEIGH` returns an empty AF_INET6 table and `RTM_NEWNEIGH` reports `EAFNOSUPPORT`. IPv4 is complete.
 
 ## M97: GNU-Free ISO (Limine bootloader + BSD build tools)
 
@@ -843,6 +846,9 @@ Status:
 - [x] PCI BAR enumeration and sizing (decode-disabled, register restored), bus-master and decode enables, standard capability walk, PCIe extended capabilities over ACPI-MCFG ECAM, and MSI / MSI-X programming.
 - [x] Intel stolen memory read from the **host bridge** GGC `0x50` / BDSM `0x5C` / BGSM `0x70`. Reports absence on the QEMU bridges, which is the correct answer there; the decode path is exercised for real only on Intel graphics hardware.
 - Markers: `M98-DRV-SMOKE: ok {netconsole-cmdline,netconsole-udp,pat-msr,pat-wc,clflush,bar-enum,bar-restore,cap-walk,bus-master,msi-config,msix-config,stolen}`. Details: `docs/driver-infrastructure.md`.
+- [ ] `open` **MSI/MSI-X delivery is unproven** — only the programming is checked, by reading the device's own config space and MSI-X table back. Firing an interrupt would mean reprogramming a device the suite is driving, so the probe also skips mass-storage functions (class 0x01) and byte-restores what it touched. Delivery gets proven by the first driver that consumes it (M101/M102).
+- [ ] `open` Intel stolen memory: the GMS/GGMS decode arithmetic runs only on real Intel graphics. The gate now requires the IGD at 00:02.0, because QEMU's Q35 emulates an Intel host bridge whose 0x5C/0x70 hold unrelated registers — reading them produced a plausible 1 MiB-aligned base for an aperture that does not exist.
+- [ ] `open` The `wbinvd` path is the CLFLUSH-less fallback and is unreachable on every CPU QEMU emulates.
 
 ## M99: linuxkpi Compatibility Layer (own MIT headers)
 
@@ -850,6 +856,7 @@ Status:
 - [x] `idr` (flat growable table with a rotating hint), `completion` over the scheduler's two-phase wait, workqueue over `kthread_create` with FIFO ordering and delayed items, `scatterlist` with run coalescing, `request_firmware` over the VFS.
 - [x] `ioremap`/`ioremap_wc`/`ioremap_wb` over `vmm_map_mmio`, dma-mapping (coherent alloc, single/sg map, cache sync for non-snooping devices), and spinlock/sleeping-mutex wrappers that keep b1nix's "never sleep under a spinlock" rule visible in the type.
 - Markers: `M99-SMOKE: ok {idr,completion,workqueue,workqueue-delayed,scatterlist,ioremap,dma-mapping,request-firmware,locks}`. Details: `docs/driver-infrastructure.md`.
+- [ ] `open` No IOMMU and no bounce buffers: `dma_map_single` refuses an address the page tables cannot translate rather than copying it into a reachable buffer, so a device with a narrow DMA window still has nowhere to fall back to.
 
 ## M100: DRM Core — dma-fence, scheduler, GEM (proven on virtio-gpu)
 
@@ -859,6 +866,8 @@ Status:
 - [x] GEM buffer objects are scatter-gather backed — pages allocated individually, described by an `sg_table`, mapped linearly into a per-object kernel window for scanout and one page at a time into userspace through the new `mmap_handle_page_phys_cb`. Handles moved onto an `idr`.
 - [x] `drm_ioctl` split into one handler per command (was cyclomatic 56 / cognitive 161 in a single switch), behaviour unchanged.
 - Markers: `M100-SMOKE: ok {fence-signal,fence-error,fence-refcount,sched-submit,sched-fairness,gem-sg,gem-create,gem-info,gem-map,gem-mmap-pages,gem-scanout,gem-destroy,gem-handle-reuse}`. Details: `docs/driver-infrastructure.md`.
+- [ ] `open` Discontiguous sg-backed buffers are not asserted (`gem-sg-discontig` is emitted as a skip): under QEMU the allocator hands back contiguous frames, so the path that matters — a BO whose pages are scattered — is exercised only incidentally.
+- [ ] `open` The GEM kernel vmap window needs its PML4 slot to exist before any process is created, so `drm_dev_init` touches one page there to install the path. A GEM mapping that faults in one process but not another points at this.
 
 ## M101: Intel i915 (Gen8/Gen9.5) + Mesa iris
 

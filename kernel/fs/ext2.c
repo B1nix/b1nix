@@ -1223,6 +1223,70 @@ static int ext2_vfs_rename(struct vfs_node *old_dir, const char *old_name,
   return 0;
 }
 
+/* Cursor-based readdir (M107 follow-up). The cookie is the byte position of the
+ * next directory record: block_index * block_size + offset_in_block. Unlinking
+ * an entry elsewhere in the directory extends the PREVIOUS record's rec_len
+ * over it and leaves every other record where it was, so a cookie stays valid
+ * across the deletions a `rm -rf` performs between batches. The swallowed
+ * record's own header is left intact by ext2_remove_dir_entry, so a cookie
+ * pointing at it still parses — it reads as inode == 0 and is skipped.
+ *
+ * The old live-entry-index readdir could not do this: deleting entry N shifted
+ * every later entry down one index, so a reader resuming at its saved index
+ * skipped one entry per deletion. With 34 files in /var/lib/bpkg/installed that
+ * left the directory non-empty after rm -rf, and bpkg's state directory could
+ * never be reset. */
+static isize ext2_vfs_readdir_at(struct vfs_node *dir, u64 cookie,
+                                 struct dirent *buf, usize max_entries,
+                                 u64 *next_cookie) {
+    u32 inode_num = get_ino(dir);
+    struct ext2_fs *fs = get_fs(dir);
+    struct ext2_inode inode;
+    if (next_cookie) *next_cookie = cookie;
+    if (ext2_read_inode(fs, inode_num, &inode) < 0) return -EIO;
+
+    u8 *dir_buf = kmalloc(fs->block_size);
+    if (!dir_buf) return -ENOMEM;
+    usize count = 0;
+    u32 blocks = (inode.i_size + fs->block_size - 1) / fs->block_size;
+    u64 pos = cookie;
+
+    while (pos < (u64)blocks * fs->block_size && count < max_entries) {
+        u32 b = (u32)(pos / fs->block_size);
+        usize off = (usize)(pos % fs->block_size);
+        u32 phys = ext2_get_inode_block(fs, &inode, b);
+        if (!phys) { /* sparse block: skip to the next one */
+            pos = (u64)(b + 1) * fs->block_size;
+            continue;
+        }
+        ext2_read_block(fs, phys, dir_buf);
+        while (off < fs->block_size && count < max_entries) {
+            struct ext2_dir_entry *e = (struct ext2_dir_entry *)(dir_buf + off);
+            if (e->rec_len < 8 || off + e->rec_len > fs->block_size) {
+                off = fs->block_size; /* corrupt tail: move to the next block */
+                break;
+            }
+            if (e->inode != 0) {
+                usize name_len = e->name_len > 63 ? 63 : e->name_len;
+                memcpy(buf[count].name, e->name, name_len);
+                buf[count].name[name_len] = '\0';
+                buf[count].type = (u32)VFS_FILE;
+                if (e->file_type == EXT2_FT_DIR) buf[count].type = (u32)VFS_DIRECTORY;
+                buf[count].is_dir = (e->file_type == EXT2_FT_DIR);
+                buf[count].size = 0;
+                buf[count].ino = e->inode;
+                count++;
+            }
+            off += e->rec_len;
+        }
+        pos = (u64)b * fs->block_size + off;
+    }
+
+    kfree(dir_buf);
+    if (next_cookie) *next_cookie = pos;
+    return (isize)count;
+}
+
 static isize ext2_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent *buf, usize max_entries) {
     u32 inode_num = get_ino(dir);
     struct ext2_fs *fs = get_fs(dir);
@@ -1313,6 +1377,7 @@ static int ext2_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
         node->inode->setattr_cb = ext2_vfs_setattr;
         node->inode->statfs_cb = ext2_vfs_statfs;
         node->inode->readdir_cb = ext2_vfs_readdir;
+        node->inode->readdir_at_cb = ext2_vfs_readdir_at;
         node->inode->fsync_cb = ext2_vfs_fsync;
         vfs_node_put(node);
     }
@@ -1391,6 +1456,7 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
               dir_node->inode->setattr_cb = ext2_vfs_setattr;
               dir_node->inode->statfs_cb = ext2_vfs_statfs;
               dir_node->inode->readdir_cb = ext2_vfs_readdir;
+              dir_node->inode->readdir_at_cb = ext2_vfs_readdir_at;
               dir_node->inode->fsync_cb = ext2_vfs_fsync;
               ext2_load_acls(fs, &child_inode, dir_node->inode);
             }
@@ -1487,6 +1553,7 @@ static struct vfs_node *ext2_vfs_mount_cb(const char *source, u64 flags, void *d
   root->inode->setattr_cb = ext2_vfs_setattr;
   root->inode->statfs_cb = ext2_vfs_statfs;
   root->inode->readdir_cb = ext2_vfs_readdir;
+  root->inode->readdir_at_cb = ext2_vfs_readdir_at;
   root->inode->fsync_cb = ext2_vfs_fsync;
   
   struct ext2_inode ri;

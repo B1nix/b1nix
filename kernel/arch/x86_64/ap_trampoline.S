@@ -84,8 +84,16 @@ ap_64:
     hlt
     jmp 2b
 
-/* Data filled by BSP before SIPI */
-.align 8
+/* Data filled by the BSP before SIPI.
+ *
+ * The BSP patches these fields by byte offset, and those offsets are GENERATED
+ * from this file's symbol table (ap_trampoline_offsets.h) rather than written
+ * out by hand in C — a hand-written copy is what broke when the code above grew
+ * an NX probe: the block slid down, the BSP wrote CR3 and RSP into the middle
+ * of this trampoline's own code, and every AP triple-faulted on its first SIPI.
+ * The magic word is the runtime check that the blob and the generated offsets
+ * came from the same build; adding or reordering fields here is now safe. */
+tramp_magic: .quad 0x54524D50303031   /* "TRMP001" */
 pml4_phys:  .quad 0
 stack_ptr:  .quad 0
 percpu_ptr: .quad 0

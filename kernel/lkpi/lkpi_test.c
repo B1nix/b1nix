@@ -407,7 +407,10 @@ static void test_ioremap(void)
 
 static void test_dma(void)
 {
-	int ok = 1;
+	/* One bit per check, so a failure names the check that fell over instead of
+	 * reporting a bare 0 (the M99 dma-mapping failure was un-triageable without
+	 * this). All bits set == everything passed. */
+	int ok = 0x1ff;
 	dma_addr_t handle = 0;
 	usize size = 3 * PAGE_SIZE;
 	void *cpu = dma_alloc_coherent(size, &handle);
@@ -418,29 +421,29 @@ static void test_dma(void)
 	/* The device address must be the physical address of the CPU pointer,
 	 * cross-checked with the VMM's own translation. */
 	if (vmm_virt_to_phys(cpu) != handle)
-		ok = 0;
+		ok &= ~(1 << 0);
 	if (handle & (PAGE_SIZE - 1))
-		ok = 0;
+		ok &= ~(1 << 1);
 	if (handle + size > dma_addressable_limit())
-		ok = 0;
+		ok &= ~(1 << 2);
 	/* dma_alloc_coherent promises zeroed memory. */
 	const u8 *bytes = cpu;
 	for (usize i = 0; i < size; i += 512)
 		if (bytes[i] != 0)
-			ok = 0;
+			ok &= ~(1 << 3);
 
 	/* Round-trip an existing kernel buffer. */
 	u32 *buf = kmalloc(256);
 	if (!buf) {
-		ok = 0;
+		ok &= ~(1 << 4);
 	} else {
 		buf[0] = 0x11223344u;
 		dma_addr_t h2 = dma_map_single(buf, 256, DMA_TO_DEVICE);
 		if (h2 != vmm_virt_to_phys(buf))
-			ok = 0;
+			ok &= ~(1 << 5);
 		/* The mapping must not have disturbed the data. */
 		if (buf[0] != 0x11223344u)
-			ok = 0;
+			ok &= ~(1 << 6);
 		dma_unmap_single(h2, 256, DMA_TO_DEVICE);
 		kfree(buf);
 	}
@@ -452,18 +455,18 @@ static void test_dma(void)
 	struct sg_table sgt;
 	if (sg_alloc_table_from_pages(&sgt, frames, 4) == 0) {
 		if (dma_map_sg(&sgt, DMA_BIDIRECTIONAL) != sgt.nents)
-			ok = 0;
+			ok &= ~(1 << 7);
 		dma_unmap_sg(&sgt, DMA_BIDIRECTIONAL);
 		sg_free_table(&sgt);
 	} else {
-		ok = 0;
+		ok &= ~(1 << 8);
 	}
 	for (int i = 0; i < 4; i++)
 		if (frames[i])
 			pmm_free_frame(frames[i]);
 
 	dma_free_coherent(size, cpu, handle);
-	lkpi_report("dma-mapping", ok, 0);
+	lkpi_report("dma-mapping", ok == 0x1ff, ok ^ 0x1ff);
 }
 
 /* ── request_firmware ───────────────────────────────────────────── */

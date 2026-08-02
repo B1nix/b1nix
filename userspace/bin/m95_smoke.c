@@ -66,6 +66,19 @@ struct modrow {
   unsigned long long addr;
 };
 
+/* Echo /proc/modules verbatim. A parsed field that looks wrong (a truncated
+ * address, a shifted column) is indistinguishable from a kernel that really
+ * reported it, and only the raw line tells the two apart. */
+static void dump_proc_modules(void) {
+  FILE *f = fopen("/proc/modules", "r");
+  if (!f)
+    return;
+  char line[512];
+  while (fgets(line, sizeof(line), f))
+    printf("M95-SMOKE: /proc/modules| %s", line);
+  fclose(f);
+}
+
 static int read_modules(struct modrow *rows, int max) {
   FILE *f = fopen("/proc/modules", "r");
   if (!f)
@@ -264,7 +277,14 @@ static void t_proc_modules(void) {
       return;
     }
     if (r->addr < MODULE_REGION_BASE) {
-      fail("proc-modules", "module is not mapped in the module region");
+      /* Name the module and its address: "not in the region" alone says
+       * nothing about which one, and the answer differs between a module that
+       * fell back to the general heap and one whose address was mis-parsed. */
+      char why[128];
+      snprintf(why, sizeof(why), "%s is at 0x%llx, outside the module region",
+               names[i], (unsigned long long)r->addr);
+      fail("proc-modules", why);
+      dump_proc_modules();
       return;
     }
   }

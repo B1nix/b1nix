@@ -14,6 +14,7 @@
  */
 
 #include <b1nix/net.h>
+#include <b1nix/netproto.h>
 #include <b1nix/netdev.h>
 #include <b1nix/console.h>
 #include <b1nix/sched.h>
@@ -290,7 +291,7 @@ static void dh6_apply_lease(const struct dh6_parsed *p)
 	dh6_t2 = p->t2 ? p->t2 : (dh6_valid_lifetime * 4) / 5;
 
 	net_set_ip6(dh6_addr);
-	mld_join_solicited_node(dh6_addr);
+	ndp_dispatch_mld_join(dh6_addr);
 
 	/* The assigned address is reachable on-link; routers still come from
 	 * router advertisements (RFC 8415 does not carry a default route). */

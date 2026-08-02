@@ -735,6 +735,19 @@ int pci_intel_stolen_read(struct pci_intel_stolen *out)
 	if (vendor != 0x8086)
 		return -1;
 
+	/* BDSM/BGSM only exist on a bridge that carries Intel integrated graphics;
+	 * on a chipset without one (QEMU's Q35 emulates an Intel bridge but no IGD)
+	 * those offsets belong to unrelated registers, and reading them produced a
+	 * plausible-looking 1 MiB-aligned base for an aperture that does not exist.
+	 * Require the IGD at 00:02.0 — it is the device the stolen memory belongs
+	 * to, so its absence means there is nothing to report. */
+	{
+		u16 igd_vendor = pci_config_read16(0, 0, 2, 0x00);
+		u32 igd_class = pci_config_read32(0, 0, 2, 0x08) >> 16; /* class/subclass */
+		if (igd_vendor != 0x8086 || (igd_class >> 8) != 0x03)
+			return -1;
+	}
+
 	u16 ggc = pci_config_read16(0, 0, 0, INTEL_HOST_BRIDGE_GGC);
 	if (ggc == 0xFFFF)
 		return -1;
