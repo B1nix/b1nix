@@ -79,6 +79,9 @@
 #define LX_sched_getaffinity 204
 #define LX_clock_getres    229
 #define LX_statx           332
+#define LX_init_module     175
+#define LX_delete_module   176
+#define LX_finit_module    313
 #define LX_mkdir           83
 #define LX_rmdir           84
 #define LX_unlink          87
@@ -420,6 +423,12 @@ static const struct lx_map lx_table[] = {
 	{LX_settimeofday,    SYS_SETTIMEOFDAY,  "settimeofday"},
 	{LX_syncfs,          SYS_SYNCFS,        "syncfs"},
 	{LX_rt_tgsigqueueinfo, SYS_RT_TGSIGQUEUEINFO, "rt_tgsigqueueinfo"},
+	/* M95 loadable kernel modules: identical argument layouts on both ABIs
+	 * (init_module(image, len, params), delete_module(name, flags),
+	 * finit_module(fd, params, flags)). */
+	{LX_init_module,     SYS_INIT_MODULE,   "init_module"},
+	{LX_delete_module,   SYS_DELETE_MODULE, "delete_module"},
+	{LX_finit_module,    SYS_FINIT_MODULE,  "finit_module"},
 };
 
 #define LX_TABLE_LEN (sizeof(lx_table) / sizeof(lx_table[0]))

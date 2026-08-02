@@ -25,6 +25,10 @@ static int ntp_registered = 0;
 static int ntp_pending_slew_sec = 0;
 static u32 ntp_last_client_tx_secs = 0;
 static u32 ntp_retry_ticks = NTP_INITIAL_RETRY_TICKS;
+/* M96 module parameter: the server the client resolves. Writable through
+ * /sys/module/ntp/parameters/ntp_server_name; a change clears the cached
+ * address so the next query re-resolves. */
+static char ntp_server_name[64] = "pool.ntp.org";
 static int ntp_server_cached = 0;
 static struct ipv4_addr ntp_server_ip = {{0, 0, 0, 0}};
 
@@ -83,7 +87,7 @@ static void ntp_receive(const void *data, usize size) {
 static int ntp_send_query(void) {
   if (!ntp_server_cached) {
     u8 ip[4];
-    if (dns_resolve_sync_quiet("pool.ntp.org", ip) != 0) return -1;
+    if (dns_resolve_sync_quiet(ntp_server_name, ip) != 0) return -1;
     ntp_server_ip.bytes[0] = ip[0];
     ntp_server_ip.bytes[1] = ip[1];
     ntp_server_ip.bytes[2] = ip[2];
@@ -148,3 +152,36 @@ void ntp_tick(u64 now_ticks) {
     }
   }
 }
+
+/* ── M96: the SNTP client is a loadable module ───────────────────────────── */
+#include <b1nix/module.h>
+#include <b1nix/netproto.h>
+
+MODULE_NAME("ntp");
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("b1nix");
+MODULE_DESCRIPTION("SNTP client: steps or slews the RTC from a time server");
+MODULE_ALIAS("net-time-sntp");
+
+/* The pool hostname the client resolves. Writable, so a boot on a network with
+ * its own time server can be pointed at it without a rebuild. */
+module_param_desc(ntp_server_name, MODULE_PARAM_STRING, 0644,
+                  "hostname of the SNTP server to query");
+
+static struct net_proto ntp_proto = {
+	.name = "ntp",
+	.tick = ntp_tick,
+};
+
+static int ntp_module_init(void) { return proto_register(&ntp_proto); }
+
+static void ntp_module_exit(void) {
+	proto_unregister(&ntp_proto);
+	if (ntp_registered) {
+		udp_unregister_handler(NTP_SRC_PORT);
+		ntp_registered = 0;
+	}
+}
+
+module_init(ntp_module_init);
+module_exit(ntp_module_exit);

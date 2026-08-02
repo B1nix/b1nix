@@ -165,6 +165,15 @@ int ndp_resolve(struct in6_addr_k ip, struct mac_addr *mac)
 	return ndp_resolve_dev(ip, mac, 0);
 }
 
+/* Registry hook (M96): same resolver, reached through struct net_proto so the
+ * IPv6 core does not name this module. The argument order matches
+ * ndp_resolve_dev; it exists only because the hook's signature is fixed. */
+static int ndp_resolve_proto(struct in6_addr_k ip, struct mac_addr *mac,
+                             struct netdev *dev)
+{
+	return ndp_resolve_dev(ip, mac, dev);
+}
+
 /* Walk ND options looking for a link-layer-address option (SLLA/TLLA); on a
  * match copy the 6-byte MAC out. Returns 1 if found. */
 static int nd_find_lladdr(const u8 *opts, usize len, struct mac_addr *out)
@@ -374,3 +383,44 @@ void ndp_tick(u64 now_ticks)
 		}
 	}
 }
+
+/* ── M96: Neighbour Discovery is a loadable module ───────────────────────── */
+#include <b1nix/module.h>
+#include <b1nix/netproto.h>
+
+MODULE_NAME("ndp");
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("b1nix");
+MODULE_DESCRIPTION("IPv6 Neighbour Discovery and SLAAC");
+MODULE_ALIAS("net-ipv6-nd");
+
+static void ndp_module_reset(void) { ndp_init(); }
+
+/* ipv6.ko hands every ICMPv6 control message here; sort it by type. */
+static void ndp_icmp6_receive(struct in6_addr_k src, struct in6_addr_k dst,
+                              u8 type, const void *data, usize size)
+{
+	if (type >= ICMP6_RS && type <= ICMP6_NA)
+		ndp_receive(src, dst, type, data, size);
+	else
+		mld_receive(src, dst, type, data, size);
+}
+
+static struct net_proto ndp_proto = {
+	.name = "ndp",
+	.resolve6 = ndp_resolve_proto,
+	.icmp6 = ndp_icmp6_receive,
+	.tick = ndp_tick,
+	.reset = ndp_module_reset,
+	.selftest = mld_smoke,
+};
+
+static int ndp_module_init(void) {
+	ndp_init();
+	return proto_register(&ndp_proto);
+}
+
+static void ndp_module_exit(void) { proto_unregister(&ndp_proto); }
+
+module_init(ndp_module_init);
+module_exit(ndp_module_exit);

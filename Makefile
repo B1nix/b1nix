@@ -66,6 +66,13 @@ $(LITEHTML_LIB) $(MBEDTLS_LIB) $(UNISTRING_LIB): $(USERSPACE_HDR_DEPS)
 
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 INITRAMFS_NATIVE_SMOKE_INC := $(INC_DIR)/initramfs_native_smoke.inc
+# M95/M96: loadable kernel modules. Each is a relocatable ELF (.ko) built from
+# the same kernel sources with -DMODULE and shipped in the initramfs under
+# /lib/modules, together with the generated modules.dep / modules.alias.
+MODULE_OUT_DIR := $(BUILD_DIR)/modules
+MODULE_NAMES := isofs ntfs btrfs hda ipv6 ndp ntp
+MODULE_KOS := $(patsubst %,$(MODULE_OUT_DIR)/%.ko,$(MODULE_NAMES))
+INITRAMFS_MODULES_INC := $(INC_DIR)/initramfs_modules.inc
 # b1cc (in-tree C compiler + its M5/M32-M34 smoke corpus)
 INITRAMFS_B1CC_M34_INC := $(INC_DIR)/initramfs_b1cc_m34.inc
 INITRAMFS_CURL_INC := $(INC_DIR)/initramfs_curl.inc
@@ -271,6 +278,7 @@ endif
 # are embedded; all other apps, libraries, and tests live on the ext4 rootfs.
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
+	$(INITRAMFS_MODULES_INC) \
 	$(INITRAMFS_LD_MUSL_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/$(ARCH)/ports/curl/install/bin/curl
@@ -400,6 +408,9 @@ KERNEL_SOURCES := \
 	kernel/lib/sha512.c \
 	kernel/lib/crypt.c \
 	kernel/mm/kheap.c \
+	kernel/mm/module_alloc.c \
+	kernel/module/module.c \
+	kernel/module/ksyms.c \
 	kernel/mm/pmm.c \
 	kernel/mm/page_cache.c \
 	kernel/mm/swap.c \
@@ -416,14 +427,11 @@ KERNEL_SOURCES := \
 	kernel/fs/eventpoll.c \
 	kernel/fs/inotify.c \
 	kernel/fs/fat32.c \
-	kernel/fs/isofs.c \
 	kernel/fs/exfat.c \
-	kernel/fs/ntfs.c \
 	kernel/fs/ext2.c \
 	kernel/fs/ext1.c \
 	kernel/fs/ext3.c \
 	kernel/fs/ext4.c \
-	kernel/fs/btrfs.c \
 	kernel/fs/procfs.c \
 	kernel/fs/tmpfs.c \
 	kernel/fs/sysfs.c \
@@ -467,7 +475,6 @@ KERNEL_SOURCES += \
 	kernel/dev/ps2_kbd.c \
 	kernel/dev/ps2_mouse.c \
 	kernel/dev/usb_xhci.c \
-	kernel/dev/hda.c \
 	kernel/dev/ac97.c \
 	kernel/dev/mixer.c \
 	kernel/dev/pty.c \
@@ -484,22 +491,20 @@ KERNEL_SOURCES += \
 	kernel/net/ethernet.c \
 	kernel/net/ipv4.c \
 	kernel/net/route.c \
-	kernel/net/ipv6.c \
 	kernel/net/icmp.c \
-	kernel/net/ndp.c \
 	kernel/net/tcp.c \
 	kernel/net/udp.c \
 	kernel/net/dhcp.c \
 	kernel/net/dhcpv6.c \
 	kernel/net/dns.c \
-	kernel/net/ntp.c
+	kernel/net/proto.c
 endif
 
 
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
-KERNEL_DEPS := $(OBJECTS:.o=.d)
+KERNEL_DEPS := $(OBJECTS:.o=.d) $(MODULE_KOS:.ko=.d)
 
 -include $(KERNEL_DEPS)
 
@@ -561,6 +566,39 @@ $(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT) tools/kernel/gen_kallsyms.sh
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) $(INSTRUMENT_FLAGS) -c $< -o $@
+
+# ── M95/M96: loadable kernel modules ──────────────────────────────────────
+# A .ko is the relocatable object itself: the loader allocates its sections in
+# the module region, resolves undefined symbols against the kernel's
+# EXPORT_SYMBOL table and applies the x86_64 relocations. -DMODULE turns on the
+# vermagic stamp in <b1nix/module.h>.
+MODULE_CFLAGS := $(COMMON_CFLAGS) $(ARCH_CFLAGS) -DMODULE
+
+define B1NIX_MODULE_RULE
+$$(MODULE_OUT_DIR)/$(1).ko: $(2)
+	@mkdir -p $$(dir $$@)
+	$$(CC) $$(MODULE_CFLAGS) -c $$< -o $$@
+endef
+
+$(eval $(call B1NIX_MODULE_RULE,isofs,kernel/fs/isofs.c))
+$(eval $(call B1NIX_MODULE_RULE,ntfs,kernel/fs/ntfs.c))
+$(eval $(call B1NIX_MODULE_RULE,btrfs,kernel/fs/btrfs.c))
+$(eval $(call B1NIX_MODULE_RULE,hda,kernel/dev/hda.c))
+$(eval $(call B1NIX_MODULE_RULE,ipv6,kernel/net/ipv6.c))
+$(eval $(call B1NIX_MODULE_RULE,ndp,kernel/net/ndp.c))
+$(eval $(call B1NIX_MODULE_RULE,ntp,kernel/net/ntp.c))
+
+.PHONY: modules
+modules: $(MODULE_KOS)
+	sh tools/kernel/check-module-syms.sh $(MODULE_KOS)
+
+# Packaging also runs the symbol gate: a module with a symbol neither the
+# kernel nor another module exports fails the build instead of failing insmod.
+$(INITRAMFS_MODULES_INC): $(MODULE_KOS) tools/kernel/gen_modules_initramfs.sh \
+                          kernel/module/ksyms.c
+	@mkdir -p $(dir $@)
+	sh tools/kernel/check-module-syms.sh $(MODULE_KOS)
+	NM='$(NM)' sh tools/kernel/gen_modules_initramfs.sh $@ $(MODULE_KOS)
 
 # M36: only the ftrace demo TU is instrumented, so __cyg_profile hooks fire
 # there and nowhere else (global instrumentation would recurse / slow the
@@ -1496,7 +1534,13 @@ run-root: iso userspace-install root-image
 		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
-root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAMP)
+root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAMP) $(INITRAMFS_MODULES_INC)
+	@# M95: the same .ko images the initramfs carries, plus the generated
+	@# modules.dep / modules.alias, so insmod/rmmod/modprobe keep working after
+	@# the real root is mounted (which hides the initramfs).
+	@mkdir -p $(BUILD_DIR)/rootfs/lib/modules
+	@cp -f $(MODULE_KOS) $(BUILD_DIR)/rootfs/lib/modules/
+	@cp -f $(INC_DIR)/.modules-stage/modules.dep $(INC_DIR)/.modules-stage/modules.alias $(BUILD_DIR)/rootfs/lib/modules/
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@mkdir -p $(BUILD_DIR)/rootfs/proc $(BUILD_DIR)/rootfs/sys $(BUILD_DIR)/rootfs/mnt
 	@mkdir -p $(BUILD_DIR)/rootfs/mnt/ext1 $(BUILD_DIR)/rootfs/mnt/ext2 $(BUILD_DIR)/rootfs/mnt/ext3 $(BUILD_DIR)/rootfs/mnt/ext4 $(BUILD_DIR)/rootfs/mnt/ext4nvme

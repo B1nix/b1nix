@@ -48,10 +48,13 @@ static struct vfs_node *tmpfs_mount_cb(const char *source, u64 flags,
   return root;
 }
 
-static struct vfs_fs tmpfs_fs = {.name = "tmpfs", .mount = tmpfs_mount_cb};
-static struct vfs_fs ramfs_fs = {.name = "ramfs", .mount = tmpfs_mount_cb};
+static struct vfs_fs tmpfs_fs = {.name = "tmpfs", .mount = tmpfs_mount_cb,
+                                 .flags = VFS_FS_NODEV};
+static struct vfs_fs ramfs_fs = {.name = "ramfs", .mount = tmpfs_mount_cb,
+                                 .flags = VFS_FS_NODEV};
 static struct vfs_fs devtmpfs_fs = {.name = "devtmpfs",
-                                    .mount = tmpfs_mount_cb};
+                                    .mount = tmpfs_mount_cb,
+                                    .flags = VFS_FS_NODEV};
 
 void tmpfs_init(void) {
   vfs_register_fs(&tmpfs_fs);

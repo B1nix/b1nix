@@ -226,6 +226,11 @@ enum {
   SYS_SIGTIMEDWAIT      = 242, /* sigtimedwait(set, info, timeout) */
   SYS_TKILL             = 243, /* tkill(tid, sig) */
   SYS_TGKILL            = 244, /* tgkill(tgid, tid, sig) */
+  /* --- M95: loadable kernel modules. 243/244 were already taken by M86's
+     thread-directed signals, so the module calls start at 245. --- */
+  SYS_INIT_MODULE       = 245, /* init_module(image, len, params) */
+  SYS_DELETE_MODULE     = 246, /* delete_module(name, flags) */
+  SYS_FINIT_MODULE      = 247, /* finit_module(fd, params, flags) */
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

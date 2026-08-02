@@ -31,9 +31,27 @@ ap_32:
     movl %cr4, %eax
     orl $(1 << 5) | (1 << 7), %eax
     movl %eax, %cr4
+    /* M95: probe NX support (CPUID.80000001H:EDX[20]) and enable EFER.NXE
+     * together with LME. Without it, an AP that touches a module data page —
+     * which carries PTE bit 63 — would take a reserved-bit page fault before
+     * x86_ap_arch_init gets a chance to set NXE from C. */
+    movl $0x80000000, %eax
+    cpuid
+    xorl %ebx, %ebx
+    cmpl $0x80000001, %eax
+    jb 1f
+    movl $0x80000001, %eax
+    cpuid
+    andl $(1 << 20), %edx
+    movl %edx, %ebx
+1:
     movl $0xC0000080, %ecx
     rdmsr
     orl $(1 << 8), %eax
+    testl %ebx, %ebx
+    jz 2f
+    orl $(1 << 11), %eax
+2:
     wrmsr
     movl %cr0, %eax
     orl $0x80000000, %eax

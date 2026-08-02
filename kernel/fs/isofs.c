@@ -329,3 +329,26 @@ void isofs_init(void) {
     vfs_register_fs(&isofs_vfs);
     vfs_register_fs(&isofs_vfs_alias);
 }
+
+/* ── M95: isofs is a loadable module ─────────────────────────────────────── */
+#include <b1nix/module.h>
+
+MODULE_NAME("isofs");
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("b1nix");
+MODULE_DESCRIPTION("ISO 9660 / Joliet read-only filesystem");
+MODULE_ALIAS("fs-iso9660");
+MODULE_ALIAS("fs-isofs");
+
+static int isofs_module_init(void) {
+    isofs_init();
+    return 0;
+}
+
+static void isofs_module_exit(void) {
+    vfs_unregister_fs(&isofs_vfs);
+    vfs_unregister_fs(&isofs_vfs_alias);
+}
+
+module_init(isofs_module_init);
+module_exit(isofs_module_exit);

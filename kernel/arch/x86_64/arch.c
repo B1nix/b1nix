@@ -104,9 +104,29 @@ void arch_set_fs_base(u64 base) {
 
 void x86_syscall_init(void) {
   u32 lo, hi;
-  /* Fix: Enable syscall/sysret by setting SCE bit in EFER MSR */
+  /* Enable syscall/sysret by setting the SCE bit in the EFER MSR. */
   __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080));
-  lo |= 1; // Установка бита SCE (System Call Enable)
+  lo |= 1; /* SCE (System Call Enable) */
+  /* M95: EFER.NXE (bit 11) — makes PTE bit 63 mean "no execute" instead of a
+   * reserved bit that must stay zero. The module loader relies on it to map a
+   * module's data pages non-executable while its text stays executable and
+   * read-only. Gated on CPUID.80000001H:EDX[20]; without NX support bit 63
+   * remains reserved and no mapping may set it. Runs per-CPU (the BSP through
+   * arch_init, every AP through x86_ap_arch_init) because EFER is a per-core
+   * MSR. */
+  {
+    u32 eax = 0, ebx = 0, ecx = 0, edx = 0;
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0x80000000u));
+    if (eax >= 0x80000001u) {
+      __asm__ volatile("cpuid"
+                       : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                       : "a"(0x80000001u));
+      if (edx & (1u << 20))
+        lo |= (1u << 11); /* NXE */
+    }
+  }
   __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000080));
 
   /* STAR: SYSCALL enters 0x08/0x10, SYSRET returns to 0x20/0x18. */

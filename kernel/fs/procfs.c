@@ -26,6 +26,7 @@
 #include <b1nix/klog.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+#include <b1nix/module.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
@@ -375,7 +376,13 @@ static int r_swaps(usize pid, struct sbuf *s) {
  * the list is genuinely empty (Linux prints nothing in that case too). */
 static int r_modules(usize pid, struct sbuf *s) {
   (void)pid;
-  (void)s;
+  char *buf = kmalloc(4096);
+  if (!buf)
+    return -ENOMEM;
+  int len = module_proc_render(buf, 4096);
+  if (len > 0)
+    sb_addf(s, "%s", buf);
+  kfree(buf);
   return 0;
 }
 
@@ -535,12 +542,14 @@ static int w_sys_coredump_max(usize pid, const char *buf, usize len) {
 
 static int r_filesystems(usize pid, struct sbuf *s) {
   (void)pid;
-  sb_puts(s, "nodev\tprocfs\n");
-  sb_puts(s, "nodev\tsysfs\n");
-  sb_puts(s, "nodev\tinitramfs\n");
-  sb_puts(s, "\text2\n");
-  sb_puts(s, "\text4\n");
-  sb_puts(s, "\tfat32\n");
+  /* The live registry, not a fixed list: a filesystem that arrives with a
+   * module (isofs.ko, ntfs.ko, btrfs.ko) has to show up here, and disappear
+   * again when the module is removed. */
+  struct vfs_fs_info fs[48];
+  usize n = vfs_list_filesystems(fs, sizeof(fs) / sizeof(fs[0]));
+  for (usize i = 0; i < n; i++)
+    sb_addf(s, "%s\t%s\n", (fs[i].flags & VFS_FS_NODEV) ? "nodev" : "",
+            fs[i].name);
   return 0;
 }
 
@@ -1773,6 +1782,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
 static struct vfs_fs procfs_fs = {
     .name = "procfs",
     .mount = procfs_mount_cb,
+    .flags = VFS_FS_NODEV,
 };
 
 /* Linux calls this filesystem "proc"; `mount -t proc proc /proc` from an init

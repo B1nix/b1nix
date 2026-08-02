@@ -245,6 +245,12 @@ enum {
 	 * makes signalling a thread safe against tid reuse. */
 	SYS_TKILL            = 243, /* tkill(tid, sig) */
 	SYS_TGKILL           = 244, /* tgkill(tgid, tid, sig) */
+
+	/* --- M95: loadable kernel modules. 243/244 belong to M86 above, so these
+	   start at 245. --- */
+	SYS_INIT_MODULE      = 245, /* init_module(image, len, params) */
+	SYS_DELETE_MODULE    = 246, /* delete_module(name, flags) */
+	SYS_FINIT_MODULE     = 247, /* finit_module(fd, params, flags) */
 };
 
 /* Aliases: linux_abi.c references these generic names; map to the versioned ones. */

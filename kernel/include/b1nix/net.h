@@ -122,6 +122,9 @@ int udp_register_handler(u16 port, udp_port_handler_t handler);
 typedef void (*udp6_port_handler_t)(struct in6_addr_k src, const void *data,
                                     usize size);
 int udp6_register_handler(u16 port, udp6_port_handler_t handler);
+/* Drop a port handler. A protocol module that registered one must call this
+ * from its exit path, or a later datagram jumps into freed module text. */
+void udp_unregister_handler(u16 port);
 
 // DHCP
 void dhcp_init(void);

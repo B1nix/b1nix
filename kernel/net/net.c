@@ -1,5 +1,6 @@
 #include <b1nix/console.h>
 #include <b1nix/net.h>
+#include <b1nix/netproto.h>
 #include <b1nix/netdev.h>
 #include <b1nix/pci.h>
 #include <b1nix/ipi.h>
@@ -172,7 +173,7 @@ static void net_reset_interface_state(struct netdev *nd)
 	prefix6_valid = 0;
 	net_compute_link_local();
 	arp_init();
-	ndp_init();
+	net_proto_reset();
 }
 
 static void net_switch_active(struct netdev *nd)
@@ -413,8 +414,10 @@ static void net_task(void *arg)
 		}
 		net_poll();
 		dhcp_tick(scheduler_get_uptime_ticks());
-		ntp_tick(scheduler_get_uptime_ticks());
-		ndp_tick(scheduler_get_uptime_ticks());
+		/* M96: NTP and NDP tick through the protocol registry — both live in
+		 * loadable modules and are simply absent when they are not loaded.
+		 * DHCPv6 is still built into the kernel, so it keeps its direct call. */
+		net_proto_tick(scheduler_get_uptime_ticks());
 		dhcpv6_tick(scheduler_get_uptime_ticks());
 		/* Sleep a tick between polls rather than busy-yielding. As a perpetually
 		 * runnable kernel daemon, busy-yielding would keep net_task READY and —
@@ -461,7 +464,7 @@ void net_init(void)
 		net_reset_interface_state(nd);
 	} else {
 		arp_init();
-		ndp_init();
+		net_proto_reset();
 	}
 
 	if (!nd) {
@@ -577,7 +580,7 @@ void net_loopback_drain(void)
 		__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
 
 		if (is_v6)
-			ipv6_receive(data, len);
+			proto_deliver_ether(0x86DD, data, len);
 		else
 			ipv4_receive(data, len);
 		kfree(data);

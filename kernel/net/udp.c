@@ -1,4 +1,5 @@
 #include <b1nix/net.h>
+#include <b1nix/netproto.h>
 #include <b1nix/vfs.h>
 #include <b1nix/mm.h>
 #include <string.h>
@@ -75,6 +76,17 @@ int udp_register_handler(u16 port, udp_port_handler_t handler)
 		}
 	}
 	return -1;
+}
+
+void udp_unregister_handler(u16 port)
+{
+	for (int i = 0; i < MAX_UDP_HANDLERS; i++) {
+		if (udp_handlers[i].handler && udp_handlers[i].port == port) {
+			udp_handlers[i].handler = 0;
+			udp_handlers[i].port = 0;
+			return;
+		}
+	}
 }
 
 void udp_receive(struct ipv4_addr src, const void *data, usize size)
@@ -174,7 +186,7 @@ void udp6_send(struct in6_addr_k dst, u16 src_port_net, u16 dst_port_net,
 	/* On the ::1 loopback path the source address equals the destination. */
 	hdr->checksum = bswap16(udp6_checksum(dst, dst, buffer, total_size));
 
-	ipv6_send(dst, 17 /* UDP */, buffer, total_size);
+	net_proto_ipv6_send(dst, 17 /* UDP */, buffer, total_size);
 	kfree(buffer);
 }
 
@@ -226,6 +238,5 @@ void udp6_receive(struct in6_addr_k src, struct in6_addr_k dst,
 	}
 
 	if (!vfs_socket_push_udp(hdr->dst_port, payload, payload_size))
-		icmpv6_send_dest_unreachable(src, 4 /* port unreachable */, data,
-		                             length);
+		net_proto_icmp6_unreach(src, 4 /* port unreachable */, data, length);
 }

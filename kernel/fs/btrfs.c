@@ -86,3 +86,22 @@ int btrfs_mount_root(const char *device_name, const char *mount_point) {
 void btrfs_init(void) {
     vfs_register_fs(&btrfs_vfs);
 }
+
+/* ── M95: btrfs is a loadable module ─────────────────────────────────────── */
+#include <b1nix/module.h>
+
+MODULE_NAME("btrfs");
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("b1nix");
+MODULE_DESCRIPTION("btrfs superblock probe and read-only mount");
+MODULE_ALIAS("fs-btrfs");
+
+static int btrfs_module_init(void) {
+    btrfs_init();
+    return 0;
+}
+
+static void btrfs_module_exit(void) { vfs_unregister_fs(&btrfs_vfs); }
+
+module_init(btrfs_module_init);
+module_exit(btrfs_module_exit);
