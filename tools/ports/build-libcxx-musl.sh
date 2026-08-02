@@ -165,6 +165,10 @@ cp -R "$LIBCXX_HDR_DIR/"* "$MUSL_SYSROOT/usr/include/c++/v1/"
 
 # ── Link shared libraries ──
 LD_BIN="$(command -v ld.lld 2>/dev/null || echo ld.lld)"
+# macOS ships no GNU readelf; Homebrew LLVM's llvm-readelf understands the
+# same -d/NEEDED output (see tools/build-native-clang.sh, which symlinks
+# llvm-readobj to llvm-readelf for the same reason).
+READELF="$(command -v readelf 2>/dev/null || command -v llvm-readelf 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-readelf)"
 if [ ! -f "$CRT_A" ]; then
     CRT_A="$(clang -print-resource-dir 2>/dev/null)/lib/linux/libclang_rt.builtins-x86_64.a"
 fi
@@ -222,7 +226,7 @@ rewrite_needed() {
 
 for so in "$ABI_SO" "$CXX_SO"; do
     # Collect current DT_NEEDED entries that look like absolute paths.
-    needed_list=$(readelf -d "$so" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p')
+    needed_list=$("$READELF" -d "$so" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p')
     for n in $needed_list; do
         case "$n" in
             */libc.so)
@@ -238,9 +242,9 @@ done
 # Verify: no absolute-path DT_NEEDED survived (a silent miss here breaks every
 # dynamically-linked C++ binary at load time — better to fail the build).
 for so in "$ABI_SO" "$CXX_SO"; do
-    if readelf -d "$so" 2>/dev/null | grep -q 'NEEDED.*\[/'; then
+    if "$READELF" -d "$so" 2>/dev/null | grep -q 'NEEDED.*\[/'; then
         echo "build-libcxx-musl.sh: ERROR — absolute-path DT_NEEDED remains in $so:" >&2
-        readelf -d "$so" 2>/dev/null | grep 'NEEDED.*\[/' >&2
+        "$READELF" -d "$so" 2>/dev/null | grep 'NEEDED.*\[/' >&2
         exit 1
     fi
 done

@@ -84,14 +84,27 @@ static void page_cache_process_deferred_free(void) {
   }
 }
 
-/* Hash on the vfs ino (monotonic, never recycled), NOT the inode pointer: the
- * inode slab pool reuses addresses, and pointer-keyed entries of a destroyed
- * inode would collide with a later inode landing at the same address (observed:
- * ld.so mapping libOSMesa got another file's cached page for offset 0). */
+/* Hash on (fs_id, ino), NOT the inode pointer: the inode slab pool reuses
+ * addresses, and pointer-keyed entries of a destroyed inode would collide with
+ * a later inode landing at the same address (observed: ld.so mapping libOSMesa
+ * got another file's cached page for offset 0). ino alone is not enough either
+ * — it is only unique within one filesystem, so with initramfs and the ext4
+ * root both mounted, two unrelated files sharing an ino number served each
+ * other's pages (observed: read() of libpam.so.2 returning another mapping's
+ * live pointers instead of its .plt bytes). */
 static u32 pc_hash(struct vfs_inode *inode, u64 offset) {
-  u64 val = (u64)(usize)inode ^ (offset >> 12);
+  u64 val = (inode ? inode->ino : 0) ^ ((u64)(inode ? inode->fs_id : 0) << 32) ^
+            (offset >> 12);
   val ^= val >> 16;
   return (u32)(val % PC_HASH_SIZE);
+}
+
+/* Full cache-key comparison: (fs_id, ino, offset). See the key_fsid comment in
+ * page_cache.h for why the filesystem id is part of the identity. */
+static int pc_key_eq(const struct page_cache_entry *e, struct vfs_inode *inode,
+                     u64 offset) {
+  return e->key_ino == inode->ino && e->key_fsid == inode->fs_id &&
+         e->offset == offset;
 }
 
 /* Unlink from whichever list (active or inactive) the page is currently on —
@@ -225,7 +238,13 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
   lock_pc();
   struct page_cache_entry *curr = hash_table[h];
   while (curr) {
-    if (curr->inode == inode && curr->offset == offset) {
+    /* Identity by (fs_id, ino), not the inode pointer — the inode slab pool
+     * reuses freed addresses, so a stale entry whose owning inode was already
+     * destroyed can still carry a pointer that numerically matches a brand-new,
+     * unrelated inode landing at the same address (the exact "ld.so mapping
+     * libOSMesa got another file's cached page" class of bug this struct's
+     * key_ino field exists to prevent — see page_cache_invalidate_inode). */
+    if (pc_key_eq(curr, inode, offset)) {
       curr->refcount++;
       /* A second reference (a re-fault, or another process sharing this file
        * page) promotes the page to the active working set; a page already
@@ -322,6 +341,7 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
 
   new_entry->inode = inode;
   new_entry->key_ino = inode->ino;
+  new_entry->key_fsid = inode->fs_id;
   new_entry->offset = offset;
   new_entry->frame = frame;
   new_entry->flags = PAGE_CACHE_UPTODATE;
@@ -331,7 +351,9 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   // Check if it was added concurrently
   struct page_cache_entry *curr = hash_table[h];
   while (curr) {
-    if (curr->inode == inode && curr->offset == offset) {
+    /* (fs_id, ino), not the inode pointer — see the matching comment in
+     * page_cache_get_page. */
+    if (pc_key_eq(curr, inode, offset)) {
       unlock_pc();
       kfree(new_entry);
       return -EEXIST;

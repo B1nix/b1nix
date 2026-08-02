@@ -143,10 +143,10 @@ int main(int argc, char **argv) {
         }
 
         /* install-all pulls every arch-matching package for this target, which
-         * includes the 'dev' sysroot (static libs + crt0 + headers
+         * includes the 'kernel' base package (static libs + crt0 + headers
          * runtime headers). With it on disk, the installed system can compile
          * and link programs with the on-target b1cc/make. */
-        printf("Installing packages from b1nix-pkgs (incl. dev sysroot)...\n");
+        printf("Installing packages from b1nix-pkgs (incl. kernel base)...\n");
         int rc = system("ROOT=/mnt/install bpkg update && ROOT=/mnt/install bpkg install-all");
         sync();
         umount("/mnt/install");

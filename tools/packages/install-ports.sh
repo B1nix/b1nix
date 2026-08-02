@@ -2,7 +2,7 @@
 # Populate a rootfs from published packages (default) or locally built ports.
 #
 # Download mode installs EVERY arch-matching entry from the index, which now
-# includes the 'dev' sysroot package (static libs + crt0 + headers), so the
+# includes the 'kernel' base package (static libs + crt0 + headers), so the
 # resulting rootfs is build-capable (b1cc/make can compile + link on-target).
 set -eu
 
@@ -49,7 +49,7 @@ download_ports() {
 
 	# Fields: name version arch sha url [deps]. The 6th 'deps' field is optional
 	# (comma-separated package names); we don't resolve deps here (download mode
-	# installs EVERY arch-matching entry anyway, incl. 'dev'), but we must accept
+	# installs EVERY arch-matching entry anyway, incl. 'kernel'), but we must accept
 	# it. 'extra' would catch a stray 7th+ field => malformed.
 	while read -r name version arch sha url deps extra; do
 		case "$name" in ''|'#'*) continue ;; esac

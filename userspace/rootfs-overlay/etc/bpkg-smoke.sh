@@ -1,21 +1,31 @@
 #!/bin/sh
-# bpkg-smoke.sh - deterministic, offline smoke test for the bpkg package manager.
-# Drives the REAL pipeline (curl file:// -> sha256sum -> tar -xzf -> metadata)
-# against fixtures pre-staged in the initramfs (/pkgs). Emits BPKG-SMOKE markers
-# the host smoke harness greps for. No fake passes: each marker is gated on the
-# actual operation having succeeded (or, for checksum-reject, on it FAILING).
+# bpkg-smoke.sh - deterministic, offline smoke test for /bin/bpkg, b1nix's
+# native (C, statically linked against musl like every other userspace ELF)
+# package manager. Drives the REAL pipeline -- its own hand-rolled gzip/
+# deflate + tar decoder + sha256, no shelling out to curl/tar/sha256sum --
+# against fixtures pre-staged in the rootfs (/pkgs and /apkrepo). Emits
+# BPKG-SMOKE markers the host smoke harness greps for. No fake passes: each
+# marker is gated on the actual operation having succeeded (or, for
+# checksum-reject, on it FAILING).
 echo "BPKG-SMOKE: start"
 
 # bpkg reads INDEX_URL from /etc/bpkg.conf; the test config points it at the
-# staged file:// index. Install into a scratch root so we don't touch the live
-# rootfs and can assert presence/absence cleanly.
+# staged file:// index. Install into a scratch root (via BPKG_ROOT, which
+# bpkg honors for file extraction/removal) so we don't touch the live rootfs
+# and can assert presence/absence cleanly.
 ROOT=/tmp/bpkgroot
 rm -rf "$ROOT"
 mkdir -p "$ROOT"
+# mkdir("/var/lib/bpkg") in ensure_state_dirs() only ever sees a symlink
+# already there (EEXIST, checked nowhere) -- it never dereferences the link
+# to create the TARGET directory, and bpkg.c's own mkdir calls are single-
+# level (no -p). Pre-create the real target tree here so the symlink below
+# actually resolves to something bpkg can write into.
+mkdir -p "$ROOT/var/lib/bpkg"
 rm -rf /var/lib/bpkg
 mkdir -p /var/lib
 ln -s "$ROOT/var/lib/bpkg" /var/lib/bpkg
-export ROOT
+export BPKG_ROOT="$ROOT"
 
 # update: fetch the index from file:///pkgs/index via curl.
 if bpkg update >/dev/null 2>&1 && [ -f "$ROOT/var/lib/bpkg/index" ]; then
@@ -76,6 +86,27 @@ if bpkg install needsdep >/dev/null 2>&1 \
 else
 	echo "BPKG-SMOKE: fail dep-resolution"
 fi
+
+# apk-format: a real Alpine-shaped repo staged at /apkrepo/<arch> --
+# APKINDEX.tar.gz (gzipped tar of one text index) + a genuine .apk (three
+# concatenated gzip members: signature, .PKGINFO control, data). Proves the
+# apk-container splitter and the P:/V:/A:/D: index parser both work against
+# byte-for-byte real Alpine tooling output, not just the house flat format.
+export BPKG_INDEX_URL="file:///apkrepo/x86_64/APKINDEX.tar.gz"
+rm -rf /var/lib/bpkg
+mkdir -p /var/lib
+ln -s "$ROOT/var/lib/bpkg" /var/lib/bpkg
+if bpkg update >/dev/null 2>&1 \
+	&& bpkg install apkhello >/dev/null 2>&1 \
+	&& [ -f "$ROOT/usr/bin/apkhello" ] \
+	&& grep -q "hello from real apk format" "$ROOT/usr/bin/apkhello" \
+	&& [ "$(cat "$ROOT/var/lib/bpkg/installed/apkhello.ver")" = "3.0-r0" ] \
+	&& [ ! -f "$ROOT/.PKGINFO" ]; then
+	echo "BPKG-SMOKE: ok apk-format"
+else
+	echo "BPKG-SMOKE: fail apk-format"
+fi
+unset BPKG_INDEX_URL
 
 rm -f /var/lib/bpkg
 rm -rf "$ROOT"

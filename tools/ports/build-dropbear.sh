@@ -14,7 +14,15 @@ AUTOTOOLS_NAME=dropbear
 AUTOTOOLS_VERSION="${DROPBEAR_VERSION:-2022.83}"
 AUTOTOOLS_URL="https://matt.ucc.asn.au/dropbear/releases/dropbear-${AUTOTOOLS_VERSION}.tar.bz2"
 AUTOTOOLS_TARBALL="dropbear-${AUTOTOOLS_VERSION}.tar.bz2"
-AUTOTOOLS_CONFIGURE="--enable-zlib --disable-pam --disable-syslog --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx --disable-loginfunc --disable-pututline --disable-pututxline --disable-harden"
+# M104: PAM support via OpenPAM (tools/ports/build-openpam.sh). Dropbear's own
+# --enable-pam just does an AC_CHECK_LIB(pam, pam_authenticate) link probe and
+# an AC_CHECK_HEADERS(security/pam_appl.h) compile probe — both are link/compile
+# -only (no execution), so they cross-compile fine once CPPFLAGS/LDFLAGS point
+# at OpenPAM's install dir via --with-pam. DROPBEAR_SVR_PASSWORD_AUTH and
+# DROPBEAR_SVR_PAM_AUTH are mutually exclusive per dropbear's own
+# default_options.h comment ("You can't enable both PASSWORD and PAM") — PAM
+# fully replaces the direct-crypt(3) path, it doesn't sit next to it.
+AUTOTOOLS_CONFIGURE="--enable-zlib --enable-pam --disable-syslog --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx --disable-loginfunc --disable-pututline --disable-pututxline --disable-harden"
 
 port_pre_configure() {
   # Stage zlib for compression
@@ -23,19 +31,34 @@ port_pre_configure() {
     echo "tools/ports/build-dropbear.sh: zlib build failed" >&2
     exit 1
   fi
-  export AUTOTOOLS_CONFIGURE="$AUTOTOOLS_CONFIGURE CPPFLAGS=-I$ZLIB_PREFIX/include LDFLAGS=-L$ZLIB_PREFIX/lib LIBS=-lz"
-  # Write b1nix local options
-  cat > "$SRC_DIR/localoptions.h" <<'EOF'
-/* b1nix Dropbear build options (overrides default_options.h). */
-#define DROPBEAR_SMALL_CODE 1
-#define DO_HOST_LOOKUP 1
-#define DROPBEAR_SYSLOG 0
-#define DEBUG_TRACE 0
-/* No utmp/wtmp/lastlog/PAM on b1nix. */
-#define DROPBEAR_PASSWORD_AUTH 1
-#define DROPBEAR_SVR_PASSWORD_AUTH 1
-#define DROPBEAR_SVR_PUBKEY_AUTH 1
-EOF
+  # Stage OpenPAM (libpam.so.2 + headers) — dropbear's --enable-pam probe and
+  # its final link both need -lpam / <security/pam_appl.h> to resolve.
+  OPENPAM_PREFIX="$("$ROOT_DIR/tools/ports/build-openpam.sh" 2>/dev/null | tail -n 1)"
+  if [ -z "$OPENPAM_PREFIX" ] || [ ! -f "$OPENPAM_PREFIX/lib/libpam.so.2" ]; then
+    echo "tools/ports/build-dropbear.sh: openpam build failed" >&2
+    exit 1
+  fi
+  # Two -I/-L pairs (zlib + OpenPAM) can't be embedded as unquoted words in
+  # AUTOTOOLS_CONFIGURE — port_configure below word-splits that string on
+  # spaces, which would break "CPPFLAGS=-Ia -Ib" into two separate (invalid)
+  # configure arguments. Export them as their own variables instead and have
+  # port_configure pass CPPFLAGS=/LDFLAGS=/LIBS= as single quoted argv words.
+  # Build options as plain -D, so nothing is written into the upstream source
+  # tree. dropbear runs default_options.h through default_options_guard.h,
+  # which wraps every default in #ifndef — so a -D on the command line wins,
+  # exactly like localoptions.h would, without editing anything.
+  #
+  # Only these two are actually needed: DROPBEAR_SVR_PAM_AUTH defaults to 0 and
+  # DROPBEAR_SVR_PASSWORD_AUTH to 1, and sysoptions.h #errors if both are on.
+  # (The rest of what used to be written here either matched the upstream
+  # default already — SMALL_CODE, DEBUG_TRACE, SVR_PUBKEY_AUTH — or named
+  # macros dropbear 2022.83 does not have at all: DROPBEAR_PASSWORD_AUTH and
+  # DROPBEAR_SYSLOG appear nowhere in its sources; syslog is switched off by
+  # the --disable-syslog we already pass to configure.)
+  DROPBEAR_OPTS="-DDROPBEAR_SVR_PASSWORD_AUTH=0 -DDROPBEAR_SVR_PAM_AUTH=1"
+  export DROPBEAR_CPPFLAGS="-I$ZLIB_PREFIX/include -I$OPENPAM_PREFIX/include $DROPBEAR_OPTS"
+  export DROPBEAR_LDFLAGS="-L$ZLIB_PREFIX/lib -L$OPENPAM_PREFIX/lib"
+  export DROPBEAR_LIBS="-lz -lpam"
 }
 
 port_configure() {
@@ -50,6 +73,7 @@ port_configure() {
         --build="$BUILD_TRIPLET" \
         $AUTOTOOLS_CONFIGURE \
         CC="$AUTOTOOLS_CC" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
+        "CPPFLAGS=${DROPBEAR_CPPFLAGS:-}" "LDFLAGS=${DROPBEAR_LDFLAGS:-}" "LIBS=${DROPBEAR_LIBS:-}" \
         1>&2
     )
   fi
@@ -66,12 +90,14 @@ port_build() {
     # userspace/Makefile's m32_nettool/m53_httpsd rules and build-curl.sh for
     # the same requirement).
     # A `make LIBS=...` command-line override replaces (not appends to) the
-    # Makefile's own `LIBS+=@LIBS@` (which configure filled with -lz), so
-    # keep -lz alongside the compiler-rt archive rather than dropping it.
+    # Makefile's own `LIBS+=@LIBS@` (which configure filled with -lz -lpam),
+    # so keep both alongside the compiler-rt archive rather than dropping
+    # them — -lpam is M104's OpenPAM link (svr-authpam.c).
     BUILTINS_LIB="$ROOT_DIR/build/${B1NIX_ARCH:-x86_64}/toolchain/llvm-runtimes-build/install/lib/libcompiler_rt.a"
+    OPENPAM_PREFIX="$("$ROOT_DIR/tools/ports/build-openpam.sh" 2>/dev/null | tail -n 1)"
     make -C "$BUILD_DIR" -j"${JOBS:-4}" \
       CC="$AUTOTOOLS_CC" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
-      LIBS="-lz $BUILTINS_LIB" \
+      LIBS="-L$OPENPAM_PREFIX/lib -lz -lpam $BUILTINS_LIB" \
       PROGRAMS="dropbear dbclient dropbearkey dropbearconvert" \
       MULTI=1 dropbearmulti 1>&2
   fi

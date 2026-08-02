@@ -444,8 +444,8 @@ else
 fi
 pass "kernel builds without errors"
 echo "  build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso} ready"
-if [ ! -x "$MKE2FS" ]; then
-    MKE2FS=$(command -v mke2fs 2>/dev/null || command echo "/sbin/mke2fs")
+if [ -z "$MKE2FS" ] || [ ! -x "$MKE2FS" ]; then
+    MKE2FS=$(command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || command printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
 fi
 if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
     echo "Error: mke2fs utility not found. Please install e2fsprogs."
@@ -1128,7 +1128,9 @@ check_output "$LOG" "M24-STRESS: start" "M24 scheduler stress starts"
 check_output "$LOG" "ok eloop" "circular symlink returns ELOOP"
 check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete"
 
-# bpkg minimal package manager: real pipeline (curl file:// + sha256sum -c + tar).
+# bpkg: b1nix's native package manager (own gzip/deflate + tar + sha256 in C,
+# no shelling to curl/tar/sha256sum). Flat house-index format plus a real
+# Alpine-shaped APKINDEX.tar.gz + triple-gzip .apk fixture.
 check_output "$LOG" "BPKG-SMOKE: start" "bpkg smoke starts"
 check_output "$LOG" "BPKG-SMOKE: ok update" "bpkg update fetches the index"
 check_output "$LOG" "BPKG-SMOKE: ok install" "bpkg install verifies sha256 and extracts"
@@ -1136,6 +1138,7 @@ check_output "$LOG" "BPKG-SMOKE: ok list" "bpkg list reports the installed packa
 check_output "$LOG" "BPKG-SMOKE: ok checksum-reject" "bpkg install rejects a wrong sha256"
 check_output "$LOG" "BPKG-SMOKE: ok remove" "bpkg remove deletes files and metadata"
 check_output "$LOG" "BPKG-SMOKE: ok dep-resolution" "bpkg install resolves dependencies transitively"
+check_output "$LOG" "BPKG-SMOKE: ok apk-format" "bpkg installs a real Alpine APKINDEX/.apk package"
 check_output "$LOG" "BPKG-SMOKE: done" "bpkg smoke completes"
 check_output "$LOG" "M22-POLISH: start" "M22 Polish starts"
 check_output "$LOG" "M22-POLISH: ok utility-flags" "M22 Polish utility flags verify"
@@ -1780,6 +1783,18 @@ check_output "$LOG" "M98-SMOKE: ok ninja-alias" "/bin/ninja is the samurai binar
 check_output "$LOG" "M98-SMOKE: ok samu-build" "samurai executes a build.ninja edge and produces the declared output"
 check_output "$LOG" "M98-SMOKE: ok samu-uptodate" "re-running a satisfied build graph is a no-op"
 check_output "$LOG" "M98-SMOKE: done" "M98 GNU-free build-tool suite completes"
+# ── M104: OpenPAM (real libpam.so.2 + pam_unix.so authenticating against
+# /etc/shadow via musl crypt(3)) — tools/ports/build-openpam.sh,
+# userspace/bin/m104_pam_smoke.c. dropbear is also rebuilt against this same
+# library (tools/ports/build-dropbear.sh, --enable-pam) but that is verified
+# at the binary/link level (DT_NEEDED libpam.so.2, real pam_authenticate/
+# pam_start/pam_end calls) rather than via an in-suite live SSH login.
+check_output "$LOG" "M104-PAM: ok libpam-linked" "libpam.so.2 loaded and its API is callable"
+check_output "$LOG" "M104-PAM: ok auth-correct-password" "pam_authenticate() succeeds for the real pamtest /etc/shadow entry with its correct password"
+check_output "$LOG" "M104-PAM: ok acct-mgmt" "pam_acct_mgmt() succeeds for the authenticated account"
+check_output "$LOG" "M104-PAM: ok auth-wrong-password-rejected" "pam_authenticate() rejects a wrong password for a real account (PAM_AUTH_ERR, not a fake pass)"
+check_output "$LOG" "M104-PAM: ok unknown-user-rejected" "pam_authenticate() returns PAM_USER_UNKNOWN (not PAM_AUTH_ERR) for a nonexistent user"
+check_output "$LOG" "M104-PAM: done" "M104 OpenPAM suite completes"
 # ── zsh: the interactive/login shell (replaced GNU bash in M98) ──
 check_output "$LOG" "ZSH-SMOKE: ok version" "zsh reports ZSH_VERSION"
 check_output "$LOG" "ZSH-SMOKE: ok arrays" "zsh indexed arrays work (1-based, no KSH_ARRAYS)"

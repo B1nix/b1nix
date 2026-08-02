@@ -94,6 +94,7 @@ done
 
 # --- parse args: split compile flags / sources / link inputs ---------------
 compile_only=0
+preprocess_only=0
 is_shared=0
 output=""
 cflags_extra=()   # compile-time flags (-D/-I/-O/-W/-f/...) — never sent to ld
@@ -103,6 +104,7 @@ linkline=()       # .o/.a/.so, -l, -L, translated -Wl,  (order preserved)
 while [ $# -gt 0 ]; do
   case "$1" in
     -c) compile_only=1 ;;
+    -E|-M|-MM) preprocess_only=1; cflags_extra+=("$1") ;;
     -shared) is_shared=1 ;;
     -o) output="$2"; shift ;;
     -o*) output="${1#-o}" ;;
@@ -124,6 +126,19 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# --- preprocess-only (-E/-M) ----------------------------------------------
+# Autoconf's AC_PROG_CPP falls back to a BARE `cpp` when $CPP is unset, which on
+# macOS is Apple's preprocessor reading the macOS SDK — the target's headers are
+# then never seen. zsh, for one, extracts the signal-name table by preprocessing
+# `#include <signal.h>`, so it got the HOST's signals (and choked on the SDK's
+# AvailabilityInternal.h). Handle -E here so `CPP="<this wrapper> -E"` yields
+# musl's headers; without it -E fell through to the link path below, which fed
+# preprocessed text to ld.lld.
+if [ "$preprocess_only" -eq 1 ]; then
+  # shellcheck disable=SC2086
+  exec $CLANG $CFLAGS_BASE "${cflags_extra[@]}" "${sources[@]}" ${output:+-o "$output"}
+fi
 
 # --- compile-only ----------------------------------------------------------
 if [ "$compile_only" -eq 1 ]; then

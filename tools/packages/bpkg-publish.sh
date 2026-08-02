@@ -21,7 +21,7 @@
 #                so paths are stored relative, e.g. bin/hello)
 #   name         package name (index key)
 #   version      package version
-#   arch         target arch, must match `uname -m` on b1nix: x86_64 or i686
+#   arch         target arch, must match `uname -m` on b1nix: x86_64
 #   user/repo@ref  GitHub <USER>/<REPO>@<REF> for the jsDelivr URL
 #                  (default: the GH_SLUG placeholder below)
 #   outdir       where pkgs/ lives (default: ./pkgs next to the repo root)
@@ -58,8 +58,8 @@ case "$DEPS" in
 esac
 
 case "$ARCH" in
-	x86_64|i686) ;;
-	*) echo "bpkg-publish: arch must be x86_64 or i686 (got '$ARCH')" >&2; exit 1 ;;
+	x86_64) ;;
+	*) echo "bpkg-publish: arch must be x86_64 (got '$ARCH')" >&2; exit 1 ;;
 esac
 
 if [ ! -d "$SRCDIR" ]; then

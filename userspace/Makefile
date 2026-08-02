@@ -236,6 +236,8 @@ BINARIES += $(BUILD)/bin/m64_clang_smoke
 BINARIES += $(BUILD)/bin/m57_smoke
 BINARIES += $(BUILD)/bin/m75_smoke
 BINARIES += $(BUILD)/bin/m73_smoke
+# M104: OpenPAM smoke — links libpam.so.2 (tools/ports/build-openpam.sh)
+BINARIES += $(BUILD)/bin/m104_pam_smoke
 # M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
 BINARIES += $(BUILD)/bin/m98_smoke
 BINARIES += $(BUILD)/bin/m63_smoke
@@ -268,6 +270,13 @@ BINARIES += $(BUILD)/bin/js
 BINARIES += $(BUILD)/bin/m58_smoke
 # POSIX memory/signal primitives: madvise, MAP_NORESERVE, sigaltstack
 BINARIES += $(BUILD)/bin/m_posixmm_smoke
+# M104: native package manager (Alpine APKINDEX/.apk + house flat-index repos).
+# Its smoke coverage is the shell-driven /etc/bpkg-smoke.sh (see rootfs-
+# overlay/etc/rc), matching the existing posix-smoke.sh/zsh-smoke.sh pattern,
+# not a dedicated ELF -- bpkg's CLI already speaks a stable, testable
+# interface (update/install/list/remove) so there's nothing an in-process
+# smoke binary would exercise that the shell script doesn't.
+BINARIES += $(BUILD)/bin/bpkg
 # M92: native ABI smoke test (raw b1nix syscalls, no libc)
 BINARIES += $(BUILD)/bin/m92_abi_smoke
 # M92: musl POSIX smoke test (built with LINK=musl)
@@ -281,7 +290,7 @@ endif
 
 # /bin/js has a custom multi-source rule (duktape.c + js.c) — exclude it from
 # the generic single-source BIN_OBJS pattern.
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m57_smoke $(BUILD)/bin/m53_httpsd,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m57_smoke $(BUILD)/bin/m53_httpsd $(BUILD)/bin/m104_pam_smoke,$(BINARIES)))
 DEPS := $(BIN_OBJS:.o=.d)
 
 .PHONY: all clean install install-headers-libs
@@ -522,6 +531,26 @@ $(BUILD)/bin/native_smoke: bin/native_smoke.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/native_smoke.o
 	$(LD) $(LDFLAGS) $(if $(LINKER),-T $(LINKER)) -o $@ $(BUILD)/bin/native_smoke.o
+
+# M104: OpenPAM smoke — the one binary in this tree that links a THIRD-PARTY
+# shared object (libpam.so.2, DT_NEEDED) rather than only musl's libc.so.
+# OPENPAM_DIR is tools/ports/build-openpam.sh's install dir; libpam.so.2 also
+# has to be present in the rootfs at runtime (see the Makefile's root-image
+# target) for ld-musl to resolve it.
+OPENPAM_DIR := ../build/$(B1NIX_ARCH)/ports/openpam/install
+$(BUILD)/bin/m104_pam_smoke: bin/m104_pam_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(OPENPAM_DIR)/lib/libpam.so.2
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(OPENPAM_DIR)/include -c $< -o $(BUILD)/bin/m104_pam_smoke.o
+	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -L $(OPENPAM_DIR)/lib -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m104_pam_smoke.o \
+	  -l:libpam.so.2 $(BESPOKE_LIBC)
+	$(if $(BESPOKE_MUSL_POSTLINK), \
+	  python3 -c "\
+	  import sys; f=sys.argv[1]; \
+	  d=open(f,'rb').read(); \
+	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
+	  open(f,'wb').write(d); \
+	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	)
 
 # m32_nettool gains an mbedTLS loopback HTTPS server when the static mbedTLS
 # archives are present (built by tools/ports/build-curl.sh with B1NIX_TLS=mbedtls).
@@ -1058,9 +1087,16 @@ endif
 		cp ../build/$(B1NIX_ARCH)/ports/musl/install/lib/Scrt1.o $(ROOTFS)/lib/b1cc/crt0-dynamic.o ; \
 	fi
 	@mkdir -p $(ROOTFS)/etc
-	@printf "root:x:0:0:root:/root:/bin/zsh\nuser:x:1000:1000:b1nix user:/home/user:/bin/zsh\n" > $(ROOTFS)/etc/passwd
+	@printf "root:x:0:0:root:/root:/bin/zsh\nuser:x:1000:1000:b1nix user:/home/user:/bin/zsh\npamtest:x:1001:1001:M104 PAM smoke test account:/home/pamtest:/bin/sh\n" > $(ROOTFS)/etc/passwd
 	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:0:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:0:0:99999:7:::\n' > $(ROOTFS)/etc/shadow
-	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\n" > $(ROOTFS)/etc/group
+	@# M104: dedicated /etc/shadow entry for the OpenPAM smoke test
+	@# (userspace/bin/m104_pam_smoke.c) — a real SHA-512 "$$6$$" hash of the
+	@# known plaintext "PamSmoke123!" (generated on the host with
+	@# `openssl passwd -6 -salt pamtestsalt 'PamSmoke123!'`), kept separate
+	@# from root/user so this test never depends on — or risks perturbing —
+	@# their credentials.
+	@printf 'pamtest:$$6$$pamtestsalt$$.8vbtO9GTrzzFPO1mFgs22hz1YDCsqQnz/AucCx/9DkM5GoSWTqA78BSIVE4IESMY2ZYdF7Ywln/2p2LVLdd20:0:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\npamtest:x:1001:pamtest\n" > $(ROOTFS)/etc/group
 	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
 	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/zsh/bpkg-smoke.sh,
 	@# sshd init.d, bb-w6/bb-w2b fixtures — real files (not embedded kernel C

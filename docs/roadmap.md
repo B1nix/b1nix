@@ -772,3 +772,48 @@ Status:
 - [ ] `planned` PSP (`psp_v11_0`) firmware loading, SMU 11 mailbox, GFX10.3 KIQ/MQD, GPUVM.
 - [ ] `planned` Visible/invisible VRAM windowing (8 GB behind a 256 MB BAR without ReBAR).
 - [ ] `planned` `libdrm_amdgpu` + `libLLVM.so` rebuilt with the AMDGPU target (currently X86 only).
+
+## M104: Native Package Manager (`bpkg`) + Ports-Out-Of-Tree Migration Plan
+
+- [x] `initial` `/bin/bpkg` — a real C userspace ELF (`userspace/bin/bpkg.c`), built/linked exactly like every other musl binary, no shell/curl/tar/sha256sum shelling. Own RFC 1951/1952 DEFLATE+gzip decoder, ustar+GNU-longname tar extractor, and FIPS 180-4 SHA-256 — zero third-party dependency.
+- [x] `initial` Speaks the house **flat** index format (`tools/packages/bpkg-publish.sh` output, sha256-verified) AND a **real Alpine repository**: `APKINDEX.tar.gz` (P:/V:/A:/D: records) + `.apk` (the real 3-gzip-member signature/control/data container). Verified against byte-for-byte real `tar`/`gzip`-produced fixtures (see `docs/bpkg-package-manager.md`).
+- [x] `initial` Transitive dependency resolution, `update`/`install`/`remove`/`list`/`search`/`info`, `/var/lib/bpkg` state compatible with the existing `tools/packages/install-ports.sh` "download" mode.
+- [ ] `planned` TLS (`https://`) — currently HTTP- and `file://`-only; no RSA signature or APKINDEX `C:` checksum verification.
+- [ ] `planned` Full mass migration of `tools/ports/*.sh` off the from-source build path — `docs/ports-migration-plan.md` is a concrete phased plan plus a one-port (`hello`-class fixture, standing in for `zlib`) proof of concept; no real port has been moved yet and no `tools/ports/*.sh` script has been deleted, per the project's own migration ground rules.
+- Details: `docs/bpkg-package-manager.md` (the tool), `docs/ports-migration-plan.md` (the migration plan + PoC + verification status).
+
+## M105: PAM (OpenPAM + pam_unix.so)
+
+- [x] `done` OpenPAM `libpam.so.2` + b1nix's `pam_unix.so` (`/etc/shadow` via musl `crypt(3)`); dropbear runs with `DROPBEAR_SVR_PAM_AUTH`.
+- [x] `done` Verified end to end: correct password authenticates, wrong one gives `PAM_AUTH_ERR`, unknown user gives `PAM_USER_UNKNOWN`.
+
+## M106: DNS resolver
+
+- [ ] `planned` Outbound name resolution does not work: `nslookup` and `curl` both fail with "can't resolve" against the QEMU forwarder in `/etc/resolv.conf` (10.0.2.3), while the same fetch by raw IP returns 200. This is the single thing standing between b1nix and installing packages straight from the Alpine mirror — `bpkg` itself already fetches, parses a real `APKINDEX.tar.gz` and resolves dependencies once it is handed an address.
+- [ ] `planned` Suspect the CNAME chain first (`dl-cdn.alpinelinux.org` is a CNAME onto Fastly) and confirm whether the resolver follows it, then whether `getaddrinfo`/`/etc/resolv.conf` are consulted at all.
+
+## M107: BusyBox applets blocked on missing kernel subsystems
+
+BusyBox 1.38 ships 439 applets; 114 are compiled in and 137 are exposed. The
+rest are pure-userspace and free to enable — except the following, which need
+kernel work first. Each line is the subsystem, not the applet.
+
+- [ ] `planned` **netlink** — `ip`, `route`, `arp`, `tc`, `brctl`. Also what a modern `ifconfig`/`netstat` replacement wants.
+- [ ] `planned` **VT switching / console fonts** — `chvt`, `openvt`, `deallocvt`, `setfont`, `loadkmap`, `dumpkmap`.
+- [ ] `planned` **loop devices** — `losetup`, and `mount -o loop`.
+- [ ] `planned` **fuller `/proc`** — `lsof`, `fuser`, `pmap` need per-process fd/maps views.
+- [ ] `planned` **syslog / `/proc/kmsg`** — `syslogd`, `klogd`, `logread`.
+- [ ] `planned` **inotify** — `inotifyd`, and anything that watches the filesystem.
+- [ ] `planned` **RTC + watchdog ioctls** — `hwclock`, `rtcwake`, `watchdog`.
+- [ ] `planned` **i2c** — `i2cget`/`i2cset`/`i2cdump`/`i2cdetect`/`i2ctransfer`.
+- [ ] `planned` **MTD/UBI** — `flash*`, `nandwrite`, `ubi*`. Only worth it if b1nix ever targets flash storage.
+- [ ] `deferred` **loadable modules** — `insmod`, `rmmod`, `lsmod`, `modprobe`, `depmod`, `modinfo`. Not a gap to close: the kernel is monolithic by design, so these stay unavailable rather than unimplemented.
+
+## M108: Hand ownership of base tools to BusyBox
+
+Alpine's own init is BusyBox, and once packages come from Alpine the b1nix-specific
+replacements become the odd ones out. Retire them in favour of the multicall ELF.
+
+- [ ] `planned` `su` and `passwd` — currently dedicated setuid ELFs in `/bin`, deliberately excluded from the applet manifest so the symlinks do not shadow them. BusyBox has both compiled in already; switching means moving the setuid bit and making sure `/etc/shadow` handling matches what `pam_unix.so` expects (M105).
+- [ ] `planned` `init` — PID 1 is `openrc-init` (M94). Moving to BusyBox init means an `/etc/inittab` path and reconciling it with the OpenRC runlevels already in the image.
+- [ ] `planned` Once the above land, drop the corresponding entries from the "deliberately NOT listed" block in `tools/configs/applet-manifest.conf`.

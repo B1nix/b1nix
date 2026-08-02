@@ -284,6 +284,10 @@ PACKAGE_INDEX_URL ?= https://cdn.jsdelivr.net/gh/B1nix/b1nix-pkgs@main/pkgs/inde
 # Kernel build toolchain selector (Clang/LLVM).
 TOOLCHAIN ?= clang
 MKE2FS := $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
+# Same resolution as MKE2FS: macOS ships neither, and a bare `debugfs` silently
+# resolved to nothing here — every `debugfs ... || true` below (the setuid bits,
+# /etc/shadow's mode, and the root-ownership pass) was quietly skipped.
+DEBUGFS := $(shell command -v debugfs 2>/dev/null || command -v /sbin/debugfs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/debugfs)
 # ISO builder. Limine (BSD-2-Clause) + xorriso replaced GRUB's grub-mkrescue
 # (GPLv3) — see tools/mkiso.sh and boot/limine/limine.conf.in.
 MKISO := tools/mkiso.sh
@@ -1549,6 +1553,39 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	@if [ -f userspace/build/$(ARCH)/bin/m69_plugin.so ]; then \
 		cp -f userspace/build/$(ARCH)/bin/m69_plugin.so $(BUILD_DIR)/rootfs/lib/m69_plugin.so; \
 	fi
+	@# M104: OpenPAM (tools/ports/build-openpam.sh) — libpam.so.2 is a real
+	@# dlopen-capable shared library, and pam_unix.so is itself dlopen'd BY
+	@# libpam.so.2 at pam_start() time, so both need real (non-symlink) files
+	@# in rootfs/lib the same way m69_plugin.so does above — the ext4 driver
+	@# does not follow symlinks, and ld-musl/OpenPAM's dlopen() need the
+	@# actual bytes at the path they ask for, not a dangling link.
+	@OPENPAM_DIR=build/$(ARCH)/ports/openpam/install; \
+	if [ -f "$$OPENPAM_DIR/lib/libpam.so.2" ]; then \
+		mkdir -p $(BUILD_DIR)/rootfs/lib/security $(BUILD_DIR)/rootfs/etc/pam.d $(BUILD_DIR)/rootfs/include/security; \
+		cp -f "$$OPENPAM_DIR/lib/libpam.so.2" $(BUILD_DIR)/rootfs/lib/libpam.so.2; \
+		cp -f "$$OPENPAM_DIR/lib/security/pam_unix.so" $(BUILD_DIR)/rootfs/lib/security/pam_unix.so; \
+		cp -f "$$OPENPAM_DIR"/etc/pam.d/* $(BUILD_DIR)/rootfs/etc/pam.d/; \
+		cp -f "$$OPENPAM_DIR"/include/security/*.h $(BUILD_DIR)/rootfs/include/security/; \
+	fi
+	@# M104: the OpenPAM smoke ELF (links libpam.so.2 as DT_NEEDED) — build
+	@# it if missing, same pattern as the Mesa/Skia demo staging below.
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m104_pam_smoke >/dev/null 2>&1 || true
+	@if [ -f userspace/build/$(ARCH)/bin/m104_pam_smoke ]; then \
+		cp -f userspace/build/$(ARCH)/bin/m104_pam_smoke $(BUILD_DIR)/rootfs/bin/m104_pam_smoke; \
+		chmod +x $(BUILD_DIR)/rootfs/bin/m104_pam_smoke; \
+	fi
+	@# M104/dropbear: dropbearmulti (server + dbclient + dropbearkey +
+	@# dropbearconvert, dispatched by argv[0]) was built by install-ports
+	@# ($(DROPBEAR_ELF)) but — like every binary here — needs a real copy in
+	@# rootfs/bin; nothing staged it before M104 added PAM support, so
+	@# userspace/rootfs-overlay/etc/init.d/sshd's /bin/dropbear* calls had no
+	@# binary to find. Real copies (not symlinks), same reasoning as above.
+	@if [ -f $(DROPBEAR_ELF) ]; then \
+		for name in dropbear dbclient dropbearkey dropbearconvert; do \
+			cp -f $(DROPBEAR_ELF) $(BUILD_DIR)/rootfs/bin/$$name; \
+			chmod +x $(BUILD_DIR)/rootfs/bin/$$name; \
+		done; \
+	fi
 	@# Stage sysroot C++ runtime .so (real, not stubs — EGL/GLESv2/fontconfig
 	@# come from userspace/build/ via build-skia-shared-deps.sh above)
 	@SYSROOT_LIB=$(CXX_RUNTIME_LIB); \
@@ -1669,16 +1706,27 @@ endif
 	@# Remove .so symlinks (kernel doesn't follow them)
 	@find $(BUILD_DIR)/rootfs/lib -type l -name '*.so' -delete 2>/dev/null || true
 	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext4 bs=1048576 count=$(ROOT_IMAGE_SIZE) 2>/dev/null
-	@$(MKE2FS) -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q -L b1nix-root -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4 2>/dev/null || \
-	 $(MKE2FS) -t ext4 -q -L b1nix-root -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4
-	@debugfs -w -R "sif /bin/m31_setuid uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
-	@debugfs -w -R "sif /bin/m31_setuid mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
-	@debugfs -w -R "sif /bin/su uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
-	@debugfs -w -R "sif /bin/su mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
-	@debugfs -w -R "sif /bin/passwd uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
-	@debugfs -w -R "sif /bin/passwd mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
-	@debugfs -w -R "sif /etc/shadow uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
-	@debugfs -w -R "sif /etc/shadow mode 0100400" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(MKE2FS) -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q -L b1nix-root -E root_owner=0:0 -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4 2>/dev/null || \
+	 $(MKE2FS) -t ext4 -q -L b1nix-root -E root_owner=0:0 -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4
+	@# Everything in a Unix root filesystem belongs to root. `mke2fs -d` instead
+	@# copies the BUILD HOST's uid/gid onto every file (501:20 on a macOS
+	@# checkout), so the guest saw a rootfs owned by a nonexistent user. That
+	@# breaks any in-guest ownership check: OpenPAM refuses to read a policy file
+	@# it does not see as root-owned and pam_start() failed with PAM_SYSTEM_ERR.
+	@# One batched debugfs pass over ~900 paths, not one process per file.
+	@cd $(BUILD_DIR)/rootfs && find . \( -type f -o -type d -o -type l \) -print | \
+	  sed -e 's|^\.||' -e '/^$$/d' | \
+	  awk '{ printf "sif \"%s\" uid 0\nsif \"%s\" gid 0\n", $$0, $$0 }' > ../root.ext4.own
+	@$(DEBUGFS) -w -f $(BUILD_DIR)/root.ext4.own $(BUILD_DIR)/root.ext4 >/dev/null 2>&1 || true
+	@rm -f $(BUILD_DIR)/root.ext4.own
+	@$(DEBUGFS) -w -R "sif /bin/m31_setuid uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /bin/m31_setuid mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /bin/su uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /bin/su mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /bin/passwd uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /bin/passwd mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /etc/shadow uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /etc/shadow mode 0100400" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@printf 'created %s (%s)\n' "$(BUILD_DIR)/root.ext4" "$$(du -sh $(BUILD_DIR)/root.ext4 | cut -f1)"
 
 # Everything in the rootfs links dynamically against /lib/libc.so. This gate

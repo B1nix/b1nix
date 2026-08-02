@@ -849,6 +849,23 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
               if (res >= 0) {
                 if (page_cache_add_page(vma->node->inode, file_page, frame) == 0) {
                   pmm_ref_frame(frame); // cache ref + VMA ref
+                  /* The frame now belongs to the page cache as well, so it is
+                   * shared exactly like the hit path above — every later mapper
+                   * of this file page, and every read()/pread(), is served from
+                   * it. Say so, or the COW downgrade below does not fire and a
+                   * writable MAP_PRIVATE mapping gets the cached frame mapped
+                   * WRITABLE: the process's private stores then land straight
+                   * in the page cache, silently rewriting the file's contents
+                   * for everyone else.
+                   *
+                   * This is what corrupted libpam.so.2: ELF pads its RX segment
+                   * out to the same file page its RW segment starts on, so
+                   * ld.so's relocation stores through the writable mapping
+                   * overwrote the cached copy of the page that also holds the
+                   * library's `.plt` tail. Later mappers executed the resulting
+                   * garbage and died on a #UD, and even a plain read() of the
+                   * file returned the runtime pointers instead of its code. */
+                  shared_cache_frame = 1;
                   if (mark_dirty) {
                     struct page_cache_entry *pe =
                         page_cache_get_page(vma->node->inode, file_page);

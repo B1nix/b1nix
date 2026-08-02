@@ -9,7 +9,7 @@
 #
 # Usage: tools/packages/bpkg-build-all.sh <rootfs> <arch> <outdir-pkgs> [user/repo@ref]
 #   rootfs       a built b1nix rootfs (e.g. build/x86_64/rootfs)
-#   arch         x86_64 | i686  (must match `uname -m` on the target)
+#   arch         x86_64  (must match `uname -m` on the target)
 #   outdir-pkgs  the pkgs/ dir to write into (e.g. ~/b1nix-pkgs/pkgs)
 set -eu
 
@@ -22,27 +22,14 @@ PUBLISH="$HERE/bpkg-publish.sh"
 # name | version | space-separated paths relative to the rootfs | optional deps
 # The 4th field (comma-separated dependency package names) is OPTIONAL.
 #
-# 'dev' is the compile-capable sysroot: static libs + crt0 + the full headers
-# tree. With it installed, an on-target b1cc/make can actually build and link
-# programs. b1cc and make therefore depend on 'dev', so `bpkg install b1cc`
-# pulls the sysroot transitively.
+# 'kernel' is the base system package: the compile-capable sysroot (static
+# libs + crt0 + the full headers tree). With it installed, an on-target b1cc
+# can actually build and link programs, so b1cc depends on it and
+# `bpkg install b1cc` pulls it in transitively. Everything beyond this pair is
+# meant to come from Alpine rather than be published here.
 MANIFEST='
-dev|1.0|lib/libc.a lib/libm.a lib/libb1nix.a lib/libb1gui.a lib/libunwind.a? lib/crt0.o lib/b1cc? include|
-zsh|5.9|bin/zsh|
-b1cc|1.0|bin/b1cc|dev
-js|1.0|bin/js|
-hello|1.0|bin/hello|
-gpaint|1.0|bin/gpaint|
-gclock|1.0|bin/gclock|
-gterm|1.0|bin/gterm|
-gdesktop|1.0|bin/gdesktop|
-gabout|1.0|bin/gabout|
-curl|8.20.0|bin/curl|
-wget|1.21.4|bin/wget|
-dropbear|2022.83|bin/dropbearmulti bin/dropbear bin/dbclient bin/dropbearkey|
-make|3.82|bin/make|dev
-openssl|1.1.1w|bin/openssl|
-netsurf|3.11|bin/netsurf-fb|
+kernel|1.0|lib/libc.a lib/libm.a lib/libb1nix.a lib/libb1gui.a lib/libunwind.a? lib/crt0.o lib/b1cc? include|
+b1cc|1.0|bin/b1cc|kernel
 '
 
 printf '%s\n' "$MANIFEST" | while IFS='|' read -r name version paths deps; do
@@ -61,7 +48,13 @@ printf '%s\n' "$MANIFEST" | while IFS='|' read -r name version paths deps; do
 		continue
 	fi
 	stage="$(mktemp -d)"
-	( cd "$ROOTFS" && cp -aL --parents $reqpaths "$stage/" )
+	# `cp --parents` is a GNU extension BSD/macOS cp does not have. Recreate the
+	# directory prefix by hand and copy each path into it, dereferencing symlinks
+	# (-L) exactly as before, so this stages identically on either host.
+	( cd "$ROOTFS" && for _p in $reqpaths; do
+		mkdir -p "$stage/$(dirname "$_p")"
+		cp -RL "$_p" "$stage/$_p"
+	done )
 	echo "PACK  $name $version  [$reqpaths]${deps:+  deps=$deps}"
 	"$PUBLISH" "$stage" "$name" "$version" "$ARCH" "$SLUG" "$OUT" "$deps" \
 		| grep -E 'sha256|url' | sed 's/^/      /'

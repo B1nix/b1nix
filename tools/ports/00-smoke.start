@@ -91,6 +91,7 @@ run_test /bin/cxx_smoke sys
 run_test /bin/m55_iostream sys
 run_test /bin/m64_clang_smoke sys
 run_test /bin/m98_smoke sys
+run_test /bin/m104_pam_smoke sys
 run_test /bin/net_smoke sys
 run_test /bin/m_posixmm_smoke sys
 run_test /bin/musl_posix_smoke sys

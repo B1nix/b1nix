@@ -6,10 +6,6 @@
 # (=dep1) so installing it must transitively install dep1 first - this proves
 # real dependency resolution (not a decorative field).
 hello 1.0 x86_64 c89698f1fefb1f6f38b0f6192f3fb5b86f0cafa5da9e92bef92bfee4891fcf6a file:///pkgs/hello-1.0-x86_64.tar.gz
-hello 1.0 i686 c89698f1fefb1f6f38b0f6192f3fb5b86f0cafa5da9e92bef92bfee4891fcf6a file:///pkgs/hello-1.0-i686.tar.gz
 badpkg 1.0 x86_64 deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00 file:///pkgs/hello-1.0-x86_64.tar.gz
-badpkg 1.0 i686 deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00 file:///pkgs/hello-1.0-i686.tar.gz
 dep1 1.0 x86_64 d64e9dff466789ba805b4559aed5da5950319d40bf7bbd2a207fa54db59faa80 file:///pkgs/dep1-1.0.tar.gz
-dep1 1.0 i686 d64e9dff466789ba805b4559aed5da5950319d40bf7bbd2a207fa54db59faa80 file:///pkgs/dep1-1.0.tar.gz
 needsdep 1.0 x86_64 c89698f1fefb1f6f38b0f6192f3fb5b86f0cafa5da9e92bef92bfee4891fcf6a file:///pkgs/hello-1.0-x86_64.tar.gz dep1
-needsdep 1.0 i686 c89698f1fefb1f6f38b0f6192f3fb5b86f0cafa5da9e92bef92bfee4891fcf6a file:///pkgs/hello-1.0-i686.tar.gz dep1

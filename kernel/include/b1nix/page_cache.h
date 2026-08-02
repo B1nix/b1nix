@@ -21,6 +21,13 @@ struct page_cache_entry {
   u64 key_ino; // Cache key: vfs inode->ino (unique, never recycled — unlike the
                // inode POINTER, which the slab pool reuses; keying by pointer
                // let a recycled inode inherit a previous file's cached pages)
+  u32 key_fsid; // ...and the filesystem instance it belongs to. ino is only
+                // unique WITHIN a filesystem — icache_get(fs_id, ino) keys the
+                // inode cache the same way. Without this an ext4 file and an
+                // initramfs/tmpfs file that happen to share an ino number
+                // silently serve each other's cached pages (observed: a read()
+                // of libpam.so.2 returning another mapping's live pointers
+                // instead of its .plt bytes).
   u64 offset; // Page-aligned offset
   u64 frame;  // Physical frame
   u32 flags;
