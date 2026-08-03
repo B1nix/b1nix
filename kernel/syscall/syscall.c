@@ -6347,12 +6347,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_SETUID: {
     klog_info("audit: setuid called");
     struct cred *c = scheduler_get_current_cred();
-    return c ? (u64)cred_set_uid(c, (u16)arg0) : (u64)-EACCES;
+    if (!c) return (u64)-EACCES;
+    int rc = cred_set_uid(c, (u16)arg0);
+    return rc == 0 ? 0 : (u64)-EPERM;
   }
   case SYS_SETGID: {
     klog_info("audit: setgid called");
     struct cred *c = scheduler_get_current_cred();
-    return c ? (u64)cred_set_gid(c, (u16)arg0) : (u64)-EACCES;
+    if (!c) return (u64)-EACCES;
+    int rc = cred_set_gid(c, (u16)arg0);
+    return rc == 0 ? 0 : (u64)-EPERM;
   }
   case SYS_SETEUID: {
     klog_info("audit: seteuid called");

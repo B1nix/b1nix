@@ -7,6 +7,7 @@
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/syscall.h>
+#include <b1nix/uidgid.h>
 #include <b1nix/netlink.h>
 
 struct udp_binding {
@@ -421,6 +422,7 @@ static void socket_release(struct vfs_handle *h) {
 #define SIOC_GIFNAME    0x8910
 #define SIOC_GIFCONF    0x8912
 #define SIOC_GIFFLAGS   0x8913
+#define SIOC_SIFFLAGS   0x8914
 #define SIOC_GIFADDR    0x8915
 #define SIOC_GIFBRDADDR 0x8919
 #define SIOC_GIFNETMASK 0x891B
@@ -434,8 +436,10 @@ static void socket_release(struct vfs_handle *h) {
 #define IFF_BROADCAST 0x2
 #define IFF_RUNNING   0x40
 #define IFF_MULTICAST 0x1000
+#define IFF_LOOPBACK  0x8
 
 #define ARPHRD_ETHER 1
+#define ARPHRD_LOOPBACK 772
 
 struct k_ifreq {
   char ifr_name[16];
@@ -590,7 +594,10 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     memset(&r, 0, sizeof(r));
     int n = 0;
     if (netdev_active()) {
-      strncpy(r.ifr_name, "eth0", sizeof(r.ifr_name) - 1);
+      /* The configured interface is whichever one holds the lease, not
+       * necessarily the one that happens to be called eth0. */
+      netdev_ifname(netdev_index_of(netdev_active()), r.ifr_name,
+                    sizeof(r.ifr_name));
       r.u.addr.sin_family = B1NIX_AF_INET;
       r.u.addr.sin_addr = net_ip_as_be(net_get_ip());
       n = 1;
@@ -612,18 +619,53 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   if (!netdev_active())
     return -ENODEV;
 
+  /* Answer for the interface the caller named, not for whichever one happens to
+   * be active. With two NICs registered, ignoring ifr_name made SIOCGIFADDR on
+   * "eth1" report eth0's lease, so an address and an ifindex fetched through
+   * these ioctls described different interfaces. */
+  r.ifr_name[sizeof(r.ifr_name) - 1] = '\0';
+  int if_idx;
+  struct netdev *nd;
+  int is_lo = strcmp(r.ifr_name, "lo") == 0;
+  if (is_lo) {
+    if_idx = NETLINK_LO_IFINDEX;
+    nd = 0;
+  } else if (r.ifr_name[0] == '\0') {
+    /* An empty name keeps the historical "whatever is active" behaviour, which
+     * SIOCGIFNAME (index -> name) and a few callers rely on. */
+    nd = netdev_active();
+    if_idx = netdev_index_of(nd);
+  } else {
+    if_idx = netdev_index_by_name(r.ifr_name);
+    if (if_idx == 0)
+      return -ENODEV;
+    nd = netdev_by_index(if_idx);
+  }
+  /* b1nix holds one L3 configuration, owned by the active interface: any other
+   * NIC is up but unaddressed. */
+  int has_l3 = is_lo || (nd && nd == netdev_active());
+
   switch (request) {
-  case SIOC_GIFADDR:
+  case SIOC_GIFADDR: {
+    if (!has_l3)
+      return -EADDRNOTAVAIL;
+    struct ipv4_addr ip =
+        is_lo ? (struct ipv4_addr){{127, 0, 0, 1}} : net_get_ip();
     memset(&r.u, 0, sizeof(r.u));
     r.u.addr.sin_family = B1NIX_AF_INET;
-    r.u.addr.sin_addr = net_ip_as_be(net_get_ip());
+    r.u.addr.sin_addr = net_ip_as_be(ip);
     break;
+  }
   case SIOC_GIFNETMASK: {
-    /* M84: report the lease's real mask; fall back to /24 only when DHCP
-     * never supplied option 1. */
-    struct ipv4_addr nm = net_get_netmask();
+    /* M84: report the lease's real mask. No /24 fallback — inventing a mask
+     * here disagreed with the prefix length RTM_GETADDR derives from the same
+     * lease, and "no mask configured" is a real answer. */
+    if (!has_l3)
+      return -EADDRNOTAVAIL;
+    struct ipv4_addr nm =
+        is_lo ? (struct ipv4_addr){{255, 0, 0, 0}} : net_get_netmask();
     if ((nm.bytes[0] | nm.bytes[1] | nm.bytes[2] | nm.bytes[3]) == 0)
-      nm = (struct ipv4_addr){{255, 255, 255, 0}};
+      return -EADDRNOTAVAIL;
     memset(&r.u, 0, sizeof(r.u));
     r.u.addr.sin_family = B1NIX_AF_INET;
     r.u.addr.sin_addr = net_ip_as_be(nm);
@@ -632,10 +674,12 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   case SIOC_GIFBRDADDR: {
     /* Broadcast = address | ~netmask, derived from the lease (M84) rather
      * than assuming the last octet is the host part. */
+    if (!has_l3 || is_lo)
+      return -EADDRNOTAVAIL;
     struct ipv4_addr ip = net_get_ip();
     struct ipv4_addr nm = net_get_netmask();
     if ((nm.bytes[0] | nm.bytes[1] | nm.bytes[2] | nm.bytes[3]) == 0)
-      nm = (struct ipv4_addr){{255, 255, 255, 0}};
+      return -EADDRNOTAVAIL;
     struct ipv4_addr bc;
     for (int i = 0; i < 4; i++)
       bc.bytes[i] = (u8)(ip.bytes[i] | (u8)~nm.bytes[i]);
@@ -645,22 +689,51 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     break;
   }
   case SIOC_GIFFLAGS:
-    r.u.flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
+    if (is_lo) {
+      r.u.flags = IFF_UP | IFF_RUNNING | IFF_LOOPBACK;
+      break;
+    }
+    /* IFF_UP reflects the administrative state `ifconfig <if> up/down` and
+     * `ip link set` maintain, not a constant. */
+    r.u.flags = IFF_BROADCAST | IFF_MULTICAST;
+    if (netdev_is_admin_up(nd))
+      r.u.flags |= IFF_UP | IFF_RUNNING;
+    break;
+  case SIOC_SIFFLAGS:
+    /* `ifconfig <if> up|down`. Only IFF_UP is something this kernel can act
+     * on; the rest of the flag word describes properties it does not have. */
+    if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+      return -EPERM;
+    if (is_lo)
+      return (r.u.flags & IFF_UP) ? 0 : -EOPNOTSUPP;
+    if (!nd)
+      return -ENODEV;
+    {
+      int rc = netdev_set_admin_up(nd, (r.u.flags & IFF_UP) ? 1 : 0);
+      if (rc < 0)
+        return rc;
+    }
     break;
   case SIOC_GIFHWADDR: {
-    struct mac_addr m = net_get_mac();
     memset(&r.u, 0, sizeof(r.u));
+    if (is_lo) {
+      r.u.sa.sa_family = ARPHRD_LOOPBACK;
+      break;
+    }
+    /* net_get_mac() is the active interface's address; every other NIC carries
+     * its own in the netdev. */
+    struct mac_addr m = (nd == netdev_active()) ? net_get_mac() : nd->mac;
     r.u.sa.sa_family = ARPHRD_ETHER;
     memcpy(r.u.sa.sa_data, m.bytes, 6);
     break;
   }
   case SIOC_GIFMTU:
-    r.u.ival = 1500;
+    r.u.ival = is_lo ? 65536 : 1500;
     break;
   case SIOC_GIFINDEX:
     /* M84: the real registration index, so a route bound to "eth0" and the
      * ifindex userspace sees agree. */
-    r.u.ival = netdev_index_of(netdev_active());
+    r.u.ival = if_idx;
     if (r.u.ival == 0)
       r.u.ival = 1;
     break;
@@ -671,7 +744,13 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     r.u.ival = 1000;
     break;
   case SIOC_GIFNAME:
-    strncpy(r.ifr_name, "eth0", sizeof(r.ifr_name) - 1);
+    /* Index -> name: the index arrives in the union, not the name field. */
+    if (r.u.ival == NETLINK_LO_IFINDEX)
+      strncpy(r.ifr_name, "lo", sizeof(r.ifr_name) - 1);
+    else if (netdev_by_index(r.u.ival))
+      netdev_ifname(r.u.ival, r.ifr_name, sizeof(r.ifr_name));
+    else
+      return -ENODEV;
     break;
   default:
     return -ENOTTY;

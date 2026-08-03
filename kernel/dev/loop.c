@@ -19,6 +19,11 @@ struct loop_device {
     u64 sizelimit;   /* 0 = to the end of the file */
     u32 flags;
     char file_name[64];
+    /* Re-entrancy guard: a write to the backing file goes through ext4, which
+     * may evict a dirty block cache entry, and the entry it picks can belong to
+     * this very loop device. Coming back in here would try to take the backing
+     * inode's (non-recursive) lock a second time on the same thread. */
+    int in_io;
 };
 
 /* Byte extent of the mapping inside the backing file. */
@@ -37,9 +42,8 @@ static int loop_read_blocks(struct block_device *dev, u64 lba, u32 count, void *
     }
 
     struct vfs_node *node = loop->backing_node;
-    if (!node->inode->read_cb) {
-        return -EINVAL;
-    }
+    if (loop->in_io)
+        return -EAGAIN;
 
     u64 offset = loop->offset + lba * 512;
     usize size = (usize)count * 512;
@@ -54,7 +58,12 @@ static int loop_read_blocks(struct block_device *dev, u64 lba, u32 count, void *
         size = (usize)(limit - offset);
     }
 
-    isize read_bytes = node->inode->read_cb(node, offset, buffer, size, 0);
+    /* Read the backing file the way read(2) does — through its page cache.
+     * Going straight to inode->read_cb would return whatever is on disk while
+     * the file's own cached pages held newer data. */
+    loop->in_io = 1;
+    isize read_bytes = vfs_node_pread(node, buffer, size, offset);
+    loop->in_io = 0;
     if (read_bytes < 0) {
         return (int)read_bytes;
     }
@@ -77,8 +86,8 @@ static int loop_write_blocks(struct block_device *dev, u64 lba, u32 count,
     if (loop->readonly)
         return -EROFS;
     struct vfs_node *node = loop->backing_node;
-    if (!node->inode->write_cb)
-        return -EROFS;
+    if (loop->in_io)
+        return -EAGAIN;
 
     u64 offset = loop->offset + lba * 512;
     usize size = (usize)count * 512;
@@ -88,11 +97,27 @@ static int loop_write_blocks(struct block_device *dev, u64 lba, u32 count,
     if (offset + size > limit)
         size = (usize)(limit - offset);
 
-    isize written = node->inode->write_cb(node, offset, (const char *)buffer,
-                                          size, 0);
+    /* Same page cache as write(2): a write that went straight to inode->write_cb
+     * landed on disk but left the file's cached pages stale, so reading the
+     * backing file back returned the pre-write bytes (and a later writeback of
+     * those clean-looking pages could undo the loop write entirely). */
+    loop->in_io = 1;
+    isize written = vfs_node_pwrite(node, (const char *)buffer, size, offset);
+    loop->in_io = 0;
     if (written < 0)
         return (int)written;
     return (usize)written == size ? 0 : -EIO;
+}
+
+/* fsync(/dev/loopN) has two stages: blk_cache_flush drains the block cache into
+ * the backing file's page cache, and this pushes that file out to storage. */
+static int loop_flush(struct block_device *dev) {
+    struct loop_device *loop = (struct loop_device *)dev->priv;
+    if (!loop || !loop->backing_node)
+        return 0;
+    if (loop->readonly)
+        return 0;
+    return vfs_node_fsync(loop->backing_node);
 }
 
 struct block_device *loop_register_file(const char *path, const char *name) {
@@ -113,6 +138,7 @@ struct block_device *loop_register_file(const char *path, const char *name) {
     loop->sizelimit = 0;
     loop->flags = 0;
     loop->file_name[0] = '\0';
+    loop->in_io = 0;
 
     char *persistent_name = kmalloc(strlen(name) + 1);
     if (!persistent_name) {
@@ -127,6 +153,7 @@ struct block_device *loop_register_file(const char *path, const char *name) {
     loop->bdev.block_count = (node->inode->size + 511) / 512;
     loop->bdev.read_blocks = loop_read_blocks;
     loop->bdev.write_blocks = NULL;
+    loop->bdev.flush = NULL; /* read-only association: nothing to push out */
     loop->bdev.priv = loop;
 
     blk_register(&loop->bdev);
@@ -176,8 +203,11 @@ struct loop_info32 {
 static void loop_set_name_from_fd(struct loop_device *lo, int fd) {
   char path[VFS_MAX_PATH];
   lo->file_name[0] = '\0';
+  /* vfs_fd_abspath returns the path LENGTH, not 0, on success — testing for 0
+   * here sent every association down the "unresolved" branch below, which is
+   * why losetup showed an unnamed device for a path it had just resolved. */
   int rc = vfs_fd_abspath(fd, path, sizeof(path));
-  if (rc == 0) {
+  if (rc > 0) {
     strncpy(lo->file_name, path, sizeof(lo->file_name) - 1);
     lo->file_name[sizeof(lo->file_name) - 1] = '\0';
     return;
@@ -232,6 +262,8 @@ void loop_init(void) {
     g_loops[i].bdev.block_count = 0;
     g_loops[i].bdev.read_blocks = loop_read_blocks;
     g_loops[i].bdev.write_blocks = loop_write_blocks;
+    g_loops[i].bdev.flush = loop_flush;
+    g_loops[i].in_io = 0;
     g_loops[i].bdev.priv = &g_loops[i];
     blk_register(&g_loops[i].bdev);
   }
@@ -299,6 +331,14 @@ int loop_ioctl(struct vfs_node *node, u64 request, void *arg) {
   }
   case 0x4C01: { /* LOOP_CLR_FD */
     struct vfs_node *old = lo->backing_node;
+    /* Drain first, tear down second. Clearing backing_node up front meant every
+     * dirty block the invalidate below wrote back re-entered loop_write_blocks
+     * with no association and was dropped on the floor — detaching a loop
+     * device silently lost whatever had not been flushed yet. */
+    if (old) {
+      blk_cache_flush(&lo->bdev);
+      loop_flush(&lo->bdev);
+    }
     lo->backing_node = 0;
     lo->bdev.block_count = 0;
     lo->offset = 0;

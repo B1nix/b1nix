@@ -2715,6 +2715,16 @@ int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
   h->flags = flags;
   h->offset = (flags & B1NIX_O_APPEND) ? node->inode->size : 0;
 
+  if (node->inode->open_cb) {
+    int orc = node->inode->open_cb(node, h);
+    if (orc < 0) {
+      vfs_handle_release(h);
+      node = NULL;
+      res = orc;
+      goto out;
+    }
+  }
+
   int fd = scheduler_fd_alloc(h);
   if (fd < 0) {
     /* vfs_handle_release() drops the node ref it now owns (node_file_ops has no
@@ -3028,6 +3038,50 @@ isize vfs_pwrite(int fd, const char *buf, usize size, u64 offset) {
     return -EROFS;
   u64 pos = offset;
   return node_write_impl(h, buf, size, &pos);
+}
+
+/* Positioned I/O on a node with no open-file description behind it. A
+ * kernel-internal user of a file (the loop driver) must see and dirty exactly
+ * the pages read()/write() would; reaching for inode->read_cb/write_cb instead
+ * skips the page cache and reads or writes past whatever it holds. The handle
+ * is a borrowed stack one: node_{read,write}_impl only touch ->node, ->flags
+ * and ->offset, and take their own reference on the node. */
+isize vfs_node_pread(struct vfs_node *node, char *buf, usize size, u64 offset) {
+  if (!node || !node->inode)
+    return -EBADF;
+  struct vfs_handle h;
+  memset(&h, 0, sizeof(h));
+  h.kind = VFS_HANDLE_NODE;
+  h.node = node;
+  h.flags = B1NIX_O_RDONLY;
+  u64 pos = offset;
+  return node_read_impl(&h, buf, size, &pos);
+}
+
+isize vfs_node_pwrite(struct vfs_node *node, const char *buf, usize size,
+                      u64 offset) {
+  if (!node || !node->inode)
+    return -EBADF;
+  struct vfs_handle h;
+  memset(&h, 0, sizeof(h));
+  h.kind = VFS_HANDLE_NODE;
+  h.node = node;
+  h.flags = B1NIX_O_RDWR;
+  u64 pos = offset;
+  return node_write_impl(&h, buf, size, &pos);
+}
+
+/* The fd-free half of vfs_fsync: flush a node's cached pages and let the
+ * filesystem push them out. */
+int vfs_node_fsync(struct vfs_node *node) {
+  if (!node || !node->inode)
+    return -EBADF;
+  vfs_inode_lock(node->inode);
+  page_cache_flush_inode(node->inode);
+  vfs_inode_unlock(node->inode);
+  if (node->inode->fsync_cb)
+    return node->inode->fsync_cb(node);
+  return 0;
 }
 
 isize vfs_write(int fd, const char *buf, usize size) {
@@ -3517,7 +3571,11 @@ static u32 vfs_node_type_mode(const struct vfs_node *node) {
   if (node->inode->type == VFS_DIRECTORY)
     return B1NIX_S_IFDIR;
   if (node->inode->type == VFS_DEVICE)
-    return B1NIX_S_IFCHR;
+    /* A device node backed by a block_device is a block device, and tools check
+     * that: BusyBox losetup refuses any target that is not S_ISBLK, so with
+     * every device reported as a character device `losetup <dev> <file>` died
+     * before it ever issued an ioctl. */
+    return node->inode->blk_dev ? B1NIX_S_IFBLK : B1NIX_S_IFCHR;
   if (node->inode->type == VFS_SYMLINK)
     return B1NIX_S_IFLNK;
   if (node->inode->type == VFS_FIFO)
@@ -4325,18 +4383,20 @@ int vfs_fsync(int fd) {
 
   /* Inode lock across the flush — see vfs_close_handle (flush vs a concurrent
    * truncate's in-place page zeroing). */
-  vfs_inode_lock(node->inode);
-  page_cache_flush_inode(node->inode);
-  vfs_inode_unlock(node->inode);
+  int err = vfs_node_fsync(node);
+  if (err < 0)
+    return err;
 
-  if (node->inode->fsync_cb) {
-    int err = node->inode->fsync_cb(node);
-    if (err < 0)
-      return err;
-  }
-
-  if (node->inode->blk_dev)
+  if (node->inode->blk_dev) {
     blk_cache_flush(node->inode->blk_dev);
+    /* A stacked device (loop) needs its own second stage: the cache flush above
+     * only got the bytes as far as its backing file. */
+    if (node->inode->blk_dev->flush) {
+      err = node->inode->blk_dev->flush(node->inode->blk_dev);
+      if (err < 0)
+        return err;
+    }
+  }
   return 0;
 }
 

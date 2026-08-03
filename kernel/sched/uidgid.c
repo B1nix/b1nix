@@ -1,5 +1,6 @@
 #include <string.h>
 #include <b1nix/console.h>
+#include <b1nix/errno.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/mm.h>
 
@@ -164,13 +165,13 @@ void cred_free(struct cred *cred)
 
 int cred_set_uid(struct cred *cred, u16 uid)
 {
-    if (!cred) return -1;
+    if (!cred) return -EINVAL;
     /* Only root can change real UID, or if we have CAP_SETUID */
     int is_privileged = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETUID));
     if (!is_privileged) {
         /* Non-root can only set uid to one of: euid, suid, or uid */
         if (uid != cred->euid && uid != cred->suid && uid != cred->uid) {
-            return -1;
+            return -EPERM;
         }
     }
     cred->uid = uid;
@@ -185,10 +186,10 @@ int cred_set_uid(struct cred *cred, u16 uid)
 
 int cred_set_euid(struct cred *cred, u16 euid)
 {
-    if (!cred) return -1;
+    if (!cred) return -EINVAL;
     if (!cred_has_cap(cred, CAP_SETUID)) {
         if (euid != cred->uid && euid != cred->suid && euid != cred->euid) {
-            return -1;
+            return -EPERM;
         }
     }
     cred->euid = euid;
@@ -199,11 +200,11 @@ int cred_set_euid(struct cred *cred, u16 euid)
 
 int cred_set_gid(struct cred *cred, u16 gid)
 {
-    if (!cred) return -1;
+    if (!cred) return -EINVAL;
     int is_privileged = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
     if (!is_privileged) {
         if (gid != cred->egid && gid != cred->sgid && gid != cred->gid) {
-            return -1;
+            return -EPERM;
         }
     }
     cred->gid = gid;
@@ -222,16 +223,16 @@ int cred_set_gid(struct cred *cred, u16 gid)
  * from the old real uid, the saved set-user-ID takes the new effective uid. */
 int cred_setreuid(struct cred *cred, int ruid, int euid)
 {
-    if (!cred) return -1;
+    if (!cred) return -EINVAL;
     int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETUID));
     u16 old_uid = cred->uid;
     if (ruid != -1 && !priv &&
         (u16)ruid != cred->uid && (u16)ruid != cred->euid)
-        return -1;
+        return -EPERM;
     if (euid != -1 && !priv &&
         (u16)euid != cred->uid && (u16)euid != cred->euid &&
         (u16)euid != cred->suid)
-        return -1;
+        return -EPERM;
     if (ruid != -1) cred->uid = (u16)ruid;
     if (euid != -1) cred->euid = (u16)euid;
     if (ruid != -1 || (euid != -1 && (u16)euid != old_uid))
@@ -244,16 +245,16 @@ int cred_setreuid(struct cred *cred, int ruid, int euid)
 /* POSIX setregid() — mirror of cred_setreuid for the group ids. */
 int cred_setregid(struct cred *cred, int rgid, int egid)
 {
-    if (!cred) return -1;
+    if (!cred) return -EINVAL;
     int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
     u16 old_gid = cred->gid;
     if (rgid != -1 && !priv &&
         (u16)rgid != cred->gid && (u16)rgid != cred->egid)
-        return -1;
+        return -EPERM;
     if (egid != -1 && !priv &&
         (u16)egid != cred->gid && (u16)egid != cred->egid &&
         (u16)egid != cred->sgid)
-        return -1;
+        return -EPERM;
     if (rgid != -1) cred->gid = (u16)rgid;
     if (egid != -1) cred->egid = (u16)egid;
     if (rgid != -1 || (egid != -1 && (u16)egid != old_gid))
@@ -265,15 +266,15 @@ int cred_setregid(struct cred *cred, int rgid, int egid)
 
 int cred_setresuid(struct cred *cred, int ruid, int euid, int suid)
 {
-    if (!cred) return -1;
+    if (!cred) return -EINVAL;
     int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETUID));
     if (!priv) {
         if (ruid != -1 && (u16)ruid != cred->uid && (u16)ruid != cred->euid && (u16)ruid != cred->suid)
-            return -1;
+            return -EPERM;
         if (euid != -1 && (u16)euid != cred->uid && (u16)euid != cred->euid && (u16)euid != cred->suid)
-            return -1;
+            return -EPERM;
         if (suid != -1 && (u16)suid != cred->uid && (u16)suid != cred->euid && (u16)suid != cred->suid)
-            return -1;
+            return -EPERM;
     }
     if (ruid != -1) cred->uid = (u16)ruid;
     if (euid != -1) cred->euid = (u16)euid;
@@ -285,15 +286,15 @@ int cred_setresuid(struct cred *cred, int ruid, int euid, int suid)
 
 int cred_setresgid(struct cred *cred, int rgid, int egid, int sgid)
 {
-    if (!cred) return -1;
+    if (!cred) return -EINVAL;
     int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
     if (!priv) {
         if (rgid != -1 && (u16)rgid != cred->gid && (u16)rgid != cred->egid && (u16)rgid != cred->sgid)
-            return -1;
+            return -EPERM;
         if (egid != -1 && (u16)egid != cred->gid && (u16)egid != cred->egid && (u16)egid != cred->sgid)
-            return -1;
+            return -EPERM;
         if (sgid != -1 && (u16)sgid != cred->gid && (u16)sgid != cred->egid && (u16)sgid != cred->sgid)
-            return -1;
+            return -EPERM;
     }
     if (rgid != -1) cred->gid = (u16)rgid;
     if (egid != -1) cred->egid = (u16)egid;
@@ -305,11 +306,11 @@ int cred_setresgid(struct cred *cred, int rgid, int egid, int sgid)
 
 int cred_set_egid(struct cred *cred, u16 egid)
 {
-    if (!cred) return -1;
+    if (!cred) return -EINVAL;
     int is_privileged = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
     if (!is_privileged) {
         if (egid != cred->gid && egid != cred->sgid && egid != cred->egid) {
-            return -1;
+            return -EPERM;
         }
     }
     cred->egid = egid;
@@ -416,12 +417,12 @@ u16 cred_set_fsgid(struct cred *cred, u16 fsgid)
 
 int cred_capset(struct cred *cred, u64 eff, u64 perm, u64 inh)
 {
-    if (!cred) return -1;
+    if (!cred) return -EINVAL;
     /* Capabilities can only be given up: the new permitted set must be a
      * subset of the old one, and effective a subset of permitted. */
-    if (perm & ~cred->cap_permitted) return -1;
-    if (eff & ~perm) return -1;
-    if (inh & ~(cred->cap_inheritable | cred->cap_permitted)) return -1;
+    if (perm & ~cred->cap_permitted) return -EPERM;
+    if (eff & ~perm) return -EPERM;
+    if (inh & ~(cred->cap_inheritable | cred->cap_permitted)) return -EPERM;
     cred->cap_permitted = perm;
     cred->cap_effective = eff;
     cred->cap_inheritable = inh;

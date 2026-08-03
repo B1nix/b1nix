@@ -9,6 +9,11 @@ struct block_device {
 	u64 block_count;
 	int (*read_blocks)(struct block_device *dev, u64 lba, u32 count, void *buffer);
 	int (*write_blocks)(struct block_device *dev, u64 lba, u32 count, const void *buffer);
+	/* Optional: push whatever sits below this device out to stable storage once
+	 * the block cache has been drained into it. A loop device's write_blocks
+	 * only reaches the backing file's page cache, so fsync() on /dev/loopN has
+	 * to continue down that second level. Real disks leave this NULL. */
+	int (*flush)(struct block_device *dev);
 	void *priv;
 };
 

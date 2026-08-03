@@ -8,6 +8,7 @@
 #include <b1nix/ptrace.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
+#include <b1nix/uidgid.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
 #include <stdio.h>
@@ -2171,6 +2172,15 @@ resolve:
     current_task->cred->egid = file_gid;
     current_task->cred->sgid = file_gid;
   }
+  /* The rest of the credential has to follow the effective ids, exactly as it
+   * does for every setuid()/setgid() path. Writing euid/egid on their own left
+   * a setuid-root binary with root's euid but the caller's capabilities and
+   * fsuid: /bin/su could neither setgroups() (no CAP_SETGID) nor read
+   * /etc/shadow (the VFS judges access by fsuid). Refresh unconditionally —
+   * fsuid and the capability set must track euid on every exec, not only when
+   * a suid bit is present. */
+  cred_refresh_caps(current_task->cred);
+  cred_sync_fsids(current_task->cred);
 
   // POSIX: Reset caught signals to default action across execve.
   // Ignored signals (SIG_IGN) remain ignored.

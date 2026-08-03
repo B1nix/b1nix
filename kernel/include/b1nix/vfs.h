@@ -181,6 +181,12 @@ struct vfs_inode {
   int (*statfs_cb)(struct vfs_node *node, struct b1nix_statfs *st);
   int (*fsync_cb)(struct vfs_node *node);
   int (*poll_cb)(struct vfs_node *node, struct b1nix_pollfd *pfd);
+  /* Called once per open(), after the handle exists, so a device can attach
+   * per-descriptor state (h->private_data) and take over h->ops. Without it a
+   * device node only ever sees `struct vfs_node *`, which is shared by every
+   * open of the path — two readers of /dev/kmsg then shared one cursor and
+   * each got half the log. A negative return fails the open. */
+  int (*open_cb)(struct vfs_node *node, struct vfs_handle *h);
   /* Device ioctl hook, dispatched by vfs_ioctl before the legacy name-based
    * special cases. The callee validates/copies its own user arg. */
   int (*ioctl_cb)(struct vfs_node *node, u64 request, void *arg);
@@ -298,6 +304,14 @@ isize vfs_write(int handle, const char *buffer, usize size);
  * (thread-safe pread/pwrite; non-seekable handles return ESPIPE). */
 isize vfs_pread(int handle, char *buffer, usize size, u64 offset);
 isize vfs_pwrite(int handle, const char *buffer, usize size, u64 offset);
+/* Same, for kernel-internal users that hold a node rather than a descriptor
+ * (the loop driver). They go through the page cache exactly as read()/write()
+ * do, which inode->read_cb/write_cb do not. */
+isize vfs_node_pread(struct vfs_node *node, char *buffer, usize size,
+                     u64 offset);
+isize vfs_node_pwrite(struct vfs_node *node, const char *buffer, usize size,
+                      u64 offset);
+int vfs_node_fsync(struct vfs_node *node);
 int vfs_poll(int handle_idx, struct b1nix_pollfd *pfd);
 void vfs_close(int handle);
 /* Close a handle not (or no longer) reachable through an fd table. */

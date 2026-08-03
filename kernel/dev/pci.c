@@ -1095,7 +1095,13 @@ void pci_selftest(void)
 
 	struct pci_device_info dev;
 	if (!pci_pick_test_device(&dev)) {
-		console_write("M98-DRV-SMOKE: FAIL bar-enum no-device\n");
+		/* A machine with no PCI function carrying a BAR (the SMP smoke instance
+		 * runs -nic none -vga none) has nothing to enumerate. That is an absent
+		 * subject, not a broken enumerator — reporting FAIL here put a failure
+		 * line in the log that no defect stands behind, which is exactly the
+		 * false trail this suite is supposed to avoid. The other instances,
+		 * which do have devices, are what prove the code. */
+		console_write("M98-DRV-SMOKE: skip bar-enum (no PCI device with a BAR)\n");
 		return;
 	}
 
