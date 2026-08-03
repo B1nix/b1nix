@@ -200,3 +200,58 @@ int ndp_dispatch_resolve(struct in6_addr_k ip, struct mac_addr *mac,
   proto_dispatch_leave();
   return rc;
 }
+
+int net_proto_neigh6_available(void) {
+  int ok = 0;
+  proto_dispatch_enter();
+  for (struct net_proto *p = proto_list; p; p = p->next) {
+    if (p->neigh_dump || p->neigh_set || p->neigh_del) {
+      ok = 1;
+      break;
+    }
+  }
+  proto_dispatch_leave();
+  return ok;
+}
+
+usize ndp_dispatch_neigh_dump(struct neigh_info *out, usize max) {
+  usize n = 0;
+  proto_dispatch_enter();
+  for (struct net_proto *p = proto_list; p; p = p->next) {
+    if (p->neigh_dump) {
+      n = p->neigh_dump(out, max);
+      break;
+    }
+  }
+  proto_dispatch_leave();
+  return n;
+}
+
+int ndp_dispatch_neigh_set(struct in6_addr_k ip, struct mac_addr mac,
+                           int permanent) {
+  /* No module to hold the entry means IPv6 neighbours genuinely cannot be
+   * administered — the same answer the kernel gave before this hook existed. */
+  int rc = -EAFNOSUPPORT;
+  proto_dispatch_enter();
+  for (struct net_proto *p = proto_list; p; p = p->next) {
+    if (p->neigh_set) {
+      rc = p->neigh_set(ip, mac, permanent);
+      break;
+    }
+  }
+  proto_dispatch_leave();
+  return rc;
+}
+
+int ndp_dispatch_neigh_del(struct in6_addr_k ip) {
+  int rc = -EAFNOSUPPORT;
+  proto_dispatch_enter();
+  for (struct net_proto *p = proto_list; p; p = p->next) {
+    if (p->neigh_del) {
+      rc = p->neigh_del(ip);
+      break;
+    }
+  }
+  proto_dispatch_leave();
+  return rc;
+}

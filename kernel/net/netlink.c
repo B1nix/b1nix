@@ -12,14 +12,15 @@
  *                    on the loopback index.
  *   RTM_GETROUTE  -> route_snapshot()/route6_snapshot(), the same FIB the
  *                    datapath looks up in.
- *   RTM_GETNEIGH  -> arp_snapshot()/ndp_snapshot(), the real caches.
+ *   RTM_GETNEIGH  -> arp_snapshot() and, through the protocol registry,
+ *                    ndp.ko's neighbour cache — the real caches.
  *   RTM_NEW/DELROUTE, RTM_NEW/DELNEIGH, RTM_NEW/DELADDR mutate that same
  *                    state through the ordinary kernel APIs.
  *
  * A request is serviced synchronously: the reply is encoded and pushed into
  * the socket's own datagram queue, so the recvmsg() that follows returns it.
- * Requests we cannot honestly satisfy (an administrative link up/down, which
- * b1nix has no per-interface admin state for) are answered with a real
+ * Requests we cannot honestly satisfy (creating or deleting an interface, or
+ * changing a link property other than IFF_UP) are answered with a real
  * NLMSG_ERROR carrying -EOPNOTSUPP rather than a silent success.
  */
 
@@ -28,8 +29,10 @@
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
+#include <b1nix/netproto.h>
 #include <b1nix/posix.h>
 #include <b1nix/sched.h>
+#include <b1nix/uidgid.h>
 #include <b1nix/vfs.h>
 #include <string.h>
 
@@ -248,11 +251,16 @@ static usize nl_iface_table(struct nl_iface *out, usize max) {
     netdev_ifname(idx, out[n].name, sizeof(out[n].name));
     out[n].arptype = ARPHRD_ETHER;
     out[n].mtu = 1500;
-    out[n].flags = NL_IFF_UP | NL_IFF_BROADCAST | NL_IFF_MULTICAST;
-    /* RUNNING means carrier, and that is a real question the driver answers.
-     * link_up() == -1 (no carrier indication, e.g. virtio) counts as up. */
-    if (!nd->link_up || nd->link_up(nd) != 0)
-      out[n].flags |= NL_IFF_RUNNING;
+    out[n].flags = NL_IFF_BROADCAST | NL_IFF_MULTICAST;
+    /* IFF_UP is the administrative state the operator set; RUNNING means
+     * carrier, and that is a real question the driver answers. link_up() == -1
+     * (no carrier indication, e.g. virtio) counts as up. A down interface has
+     * neither flag — `ip link` must show what `ip link set down` did. */
+    if (netdev_is_admin_up(nd)) {
+      out[n].flags |= NL_IFF_UP;
+      if (!nd->link_up || nd->link_up(nd) != 0)
+        out[n].flags |= NL_IFF_RUNNING;
+    }
     out[n].mac = netdev_index_of(nd) == netdev_index_of(netdev_active())
                      ? net_get_mac()
                      : nd->mac;
@@ -496,18 +504,23 @@ static void nl_emit_neigh(struct nl_buf *b, u32 seq, u32 pid,
   nl_msg_end(b, off);
 }
 
-/* IPv4 only. The IPv6 neighbour cache (kernel/net/ndp.c) has no enumeration
- * API and that file is owned by the concurrent M95/M96 module conversion, so
- * `ip -6 neigh` reports an empty table rather than a fabricated one. */
+/* Both families. IPv4 comes from the built-in ARP cache; IPv6 from ndp.ko
+ * through the protocol registry, which reports nothing while that module is
+ * not loaded. family == 0 (AF_UNSPEC) dumps everything, as `ip neigh` expects. */
 static void nl_dump_neigh(struct nl_buf *b, u32 seq, u32 pid, u8 family) {
-  if (family == B1NIX_AF_INET6)
-    return;
   struct neigh_info *e = kmalloc(sizeof(*e) * 64);
   if (!e)
     return;
-  usize n = arp_snapshot(e, 64);
-  for (usize i = 0; i < n; i++)
-    nl_emit_neigh(b, seq, pid, &e[i]);
+  if (family == 0 || family == B1NIX_AF_INET) {
+    usize n = arp_snapshot(e, 64);
+    for (usize i = 0; i < n; i++)
+      nl_emit_neigh(b, seq, pid, &e[i]);
+  }
+  if (family == 0 || family == B1NIX_AF_INET6) {
+    usize n = ndp_dispatch_neigh_dump(e, 64);
+    for (usize i = 0; i < n; i++)
+      nl_emit_neigh(b, seq, pid, &e[i]);
+  }
   kfree(e);
 }
 
@@ -631,8 +644,50 @@ static int nl_do_neigh(u16 type, const u8 *body, usize blen) {
     memcpy(mac.bytes, a.ptr[NDA_LLADDR], 6);
     return arp_neigh_set(ip, mac, (state & NUD_PERMANENT) ? 1 : 0);
   }
-  /* IPv6: see nl_dump_neigh — the NDP cache has no administrative API yet. */
+
+  if (family == B1NIX_AF_INET6) {
+    /* The IPv6 neighbour cache lives in ndp.ko and is reached through the
+     * protocol registry; with that module absent the dispatchers report
+     * EAFNOSUPPORT, which is the honest answer for a kernel that has no IPv6
+     * neighbour cache at all. */
+    if (a.len[NDA_DST] < 16)
+      return -EINVAL;
+    struct in6_addr_k ip;
+    memcpy(ip.bytes, a.ptr[NDA_DST], 16);
+    if (type == RTM_DELNEIGH)
+      return ndp_dispatch_neigh_del(ip);
+    if (!a.ptr[NDA_LLADDR] || a.len[NDA_LLADDR] < 6)
+      return -EINVAL;
+    struct mac_addr mac;
+    memcpy(mac.bytes, a.ptr[NDA_LLADDR], 6);
+    return ndp_dispatch_neigh_set(ip, mac, (state & NUD_PERMANENT) ? 1 : 0);
+  }
   return -EAFNOSUPPORT;
+}
+
+/* RTM_NEWLINK/RTM_SETLINK: `ip link set <if> up|down`. The ifinfomsg carries
+ * the wanted flags and a change mask; b1nix implements IFF_UP and refuses any
+ * other bit rather than silently ignoring it. */
+static int nl_do_setlink(const u8 *body, usize blen) {
+  if (blen < 16)
+    return -EINVAL;
+  int index = (int)nl_load_u32(body + 4);
+  u32 flags = nl_load_u32(body + 8);
+  u32 change = nl_load_u32(body + 12);
+  if (change == 0)
+    return -EINVAL; /* nothing asked for */
+  if (change & ~(u32)NL_IFF_UP)
+    return -EOPNOTSUPP;
+  if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+    return -EPERM;
+  if (index == NETLINK_LO_IFINDEX)
+    /* Loopback is up for as long as the kernel runs; taking it down would
+     * break every local socket and b1nix has no way to honour it. */
+    return -EOPNOTSUPP;
+  struct netdev *nd = netdev_by_index(index);
+  if (!nd)
+    return -ENODEV;
+  return netdev_set_admin_up(nd, (flags & NL_IFF_UP) ? 1 : 0);
 }
 
 static int nl_do_addr(u16 type, const u8 *body, usize blen) {
@@ -844,11 +899,14 @@ isize netlink_socket_send(struct vfs_socket_state *s, const void *buf,
         nl_put_error(&b, seq, rpid, err, p);
       break;
     case RTM_NEWLINK:
-    case RTM_DELLINK:
     case RTM_SETLINK:
-      /* b1nix has no per-interface administrative state: an interface exists
-       * and is up for exactly as long as its driver is registered. Report the
-       * truth rather than accepting a change that would not happen. */
+      /* IFF_UP is the one link property b1nix can really change; creating or
+       * renaming an interface is still not something this kernel does, and
+       * saying so beats accepting a change that would not happen. */
+      nl_put_error(&b, seq, rpid, nl_do_setlink(body, blen), p);
+      break;
+    case RTM_DELLINK:
+      /* Interfaces exist for exactly as long as their driver is registered. */
       nl_put_error(&b, seq, rpid, -EOPNOTSUPP, p);
       break;
     default:

@@ -1791,6 +1791,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
     if (km) {
       km->inode->read_cb = kmsg_proc_read;
       km->inode->poll_cb = kmsg_proc_poll;
+      km->inode->open_cb = kmsg_proc_open;
       km->inode->mode = 0400;
     }
   }

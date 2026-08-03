@@ -42,6 +42,12 @@ int netdev_index_of(struct netdev *nd);
 struct netdev *netdev_by_index(int idx);
 void netdev_ifname(int idx, char *out, usize cap);
 int netdev_index_by_name(const char *name);
+/* Administrative state. netdev_set_admin_up() takes the interface up or down
+ * the way `ip link set <if> up/down` does: down stops its transmit and receive
+ * paths and, if it was the active L3 interface, hands that role to another one
+ * (or leaves the stack with no active interface). Returns 0, or -ENODEV. */
+int netdev_set_admin_up(struct netdev *nd, int up);
+int netdev_is_admin_up(const struct netdev *nd);
 
 // Ethernet
 void ethernet_receive(const void *data, usize size);

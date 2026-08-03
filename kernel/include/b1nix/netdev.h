@@ -50,6 +50,14 @@ struct netdev {
 	 */
 	int (*link_up)(struct netdev *nd);
 
+	/*
+	 * Administrative state (`ip link set <if> up/down`, SIOCSIFFLAGS). Distinct
+	 * from carrier: a cable can be plugged in while the operator has taken the
+	 * interface down. An admin-down interface neither transmits nor accepts
+	 * frames and is never chosen as the active L3 interface.
+	 */
+	int admin_down;
+
 	void *priv;                /* driver-private state */
 };
 

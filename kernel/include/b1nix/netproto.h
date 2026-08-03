@@ -42,6 +42,14 @@ struct net_proto {
    * the NDP module — so it is reached through the registry, and is simply a
    * no-op while that module is not loaded. */
   void (*mld_join)(struct in6_addr_k addr);
+  /* Neighbour-cache administration, the IPv6 counterpart of arp_snapshot() /
+   * arp_neigh_set() / arp_neigh_del(). netlink's RTM_GETNEIGH/NEWNEIGH/DELNEIGH
+   * reach the NDP module's cache through these; without the module they are
+   * absent, and an AF_INET6 request reports EAFNOSUPPORT rather than an empty
+   * table that looks like "no neighbours". */
+  usize (*neigh_dump)(struct neigh_info *out, usize max);
+  int (*neigh_set)(struct in6_addr_k ip, struct mac_addr mac, int permanent);
+  int (*neigh_del)(struct in6_addr_k ip);
   /* Periodic work, driven by the net daemon at ~100 Hz. */
   void (*tick)(u64 now_ticks);
   /* Interface reconfigured (address change / adapter switch). */
@@ -78,5 +86,14 @@ void ndp_dispatch_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
 int ndp_dispatch_resolve(struct in6_addr_k ip, struct mac_addr *mac,
                          struct netdev *dev);
 void ndp_dispatch_mld_join(struct in6_addr_k addr);
+/* Neighbour administration. dump returns the number of entries written (0 when
+ * no module provides the hook); set/del return -EAFNOSUPPORT in that case, the
+ * same answer the kernel gave before an IPv6 neighbour cache was reachable. */
+usize ndp_dispatch_neigh_dump(struct neigh_info *out, usize max);
+int ndp_dispatch_neigh_set(struct in6_addr_k ip, struct mac_addr mac,
+                           int permanent);
+int ndp_dispatch_neigh_del(struct in6_addr_k ip);
+/* 1 when some protocol can administer IPv6 neighbours. */
+int net_proto_neigh6_available(void);
 
 #endif /* B1NIX_NETPROTO_H */

@@ -626,6 +626,80 @@ static int vt_gio_font(void *arg) {
   return rc;
 }
 
+/* PIO_FONTX/GIO_FONTX carry a small descriptor instead of a bare buffer:
+ * the glyph count and height travel with the data. There is no width field —
+ * the interface predates non-8-pixel faces — so this renderer can honour it
+ * exactly, which is why it is implemented rather than refused. */
+struct vt_consolefontdesc {
+  u16 charcount;
+  u16 charheight;
+  u64 chardata; /* userspace pointer to charcount * 32 bytes */
+};
+
+static int vt_pio_fontx(void *arg) {
+  struct vt_consolefontdesc d;
+  if (syscall_copyin(&d, arg, sizeof(d)) < 0)
+    return -EFAULT;
+  if (d.charcount == 0 || d.charcount > VT_FONT_GLYPHS)
+    return -EINVAL;
+  if (d.charheight == 0 || d.charheight > VT_FONT_MAX_H)
+    return -EINVAL;
+  if (!d.chardata)
+    return -EFAULT;
+  usize bytes = (usize)d.charcount * VT_PIO_FONT_STRIDE;
+  u8 *tmp = kzalloc(bytes);
+  if (!tmp)
+    return -ENOMEM;
+  if (syscall_copyin(tmp, (void *)(usize)d.chardata, bytes) < 0) {
+    kfree(tmp);
+    return -EFAULT;
+  }
+  /* Glyphs past charcount keep whatever the previous face had rather than
+   * turning into blanks — the same thing Linux's console does. */
+  for (u32 g = 0; g < d.charcount; g++) {
+    memcpy(g_font + g * VT_FONT_MAX_H, tmp + g * VT_PIO_FONT_STRIDE,
+           d.charheight);
+    if (d.charheight < VT_FONT_MAX_H)
+      memset(g_font + g * VT_FONT_MAX_H + d.charheight, 0,
+             VT_FONT_MAX_H - d.charheight);
+  }
+  kfree(tmp);
+  return vt_font_publish(d.charheight, d.charcount);
+}
+
+static int vt_gio_fontx(void *arg) {
+  struct vt_consolefontdesc d;
+  if (syscall_copyin(&d, arg, sizeof(d)) < 0)
+    return -EFAULT;
+  /* Linux reports the font's real size through the descriptor and fails with
+   * ENOMEM when the caller's buffer is too small, so a caller can size its
+   * buffer by asking twice. */
+  u16 want = (u16)g_font_count;
+  if (d.charcount < want) {
+    d.charcount = want;
+    d.charheight = (u16)g_font_h;
+    if (syscall_copyout(arg, &d, sizeof(d)) < 0)
+      return -EFAULT;
+    return -ENOMEM;
+  }
+  d.charcount = want;
+  d.charheight = (u16)g_font_h;
+  if (d.chardata) {
+    usize bytes = (usize)want * VT_PIO_FONT_STRIDE;
+    u8 *tmp = kzalloc(bytes);
+    if (!tmp)
+      return -ENOMEM;
+    for (u32 g = 0; g < want; g++)
+      memcpy(tmp + g * VT_PIO_FONT_STRIDE, g_font + g * VT_FONT_MAX_H, g_font_h);
+    int rc = syscall_copyout((void *)(usize)d.chardata, tmp, bytes) < 0 ? -EFAULT
+                                                                        : 0;
+    kfree(tmp);
+    if (rc < 0)
+      return rc;
+  }
+  return syscall_copyout(arg, &d, sizeof(d)) < 0 ? -EFAULT : 0;
+}
+
 /* struct console_font_op (KDFONTOP). */
 struct vt_console_font_op {
   u32 op;
@@ -892,11 +966,13 @@ static int vt_ioctl(struct vfs_node *node, u64 request, void *arg) {
       return -EFAULT;
     return vt_kdfontop(arg);
   case PIO_FONTX:
+    if (!arg)
+      return -EFAULT;
+    return vt_pio_fontx(arg);
   case GIO_FONTX:
-    /* The FONTX variants carry a width/height header this renderer cannot
-     * honour for anything but 8 pixels wide; KDFONTOP is the interface that
-     * expresses the same request precisely. */
-    return -EOPNOTSUPP;
+    if (!arg)
+      return -EFAULT;
+    return vt_gio_fontx(arg);
 
   case B1NIX_TCGETS:
     return syscall_copyout(arg, &v->termios, sizeof(v->termios)) < 0 ? -EFAULT

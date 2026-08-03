@@ -44,10 +44,12 @@ static spinlock_t kmsg_lock = SPINLOCK_INIT;
 static char g_line[KMSG_TEXT_MAX];
 static usize g_line_len;
 
-/* Read cursors. /dev/kmsg and /proc/kmsg are separate streams in Linux and are
- * kept separate here; each is a single shared cursor rather than a per-fd one,
- * which is exactly right for the one-reader case (klogd on /proc/kmsg,
- * syslogd on /dev/kmsg) and is documented as the limit it is. */
+/* Read cursors. Every open() of /dev/kmsg or /proc/kmsg gets its own (see
+ * kmsg_open_cb): reading a record must not consume it for the other readers,
+ * which is what a shared cursor did — two `dmesg -w`s each saw half the log.
+ * The two globals below survive only as the cursors syslog(2)/klogctl uses,
+ * which is a single stream by definition, and as the fallback for a descriptor
+ * that could not get its own. */
 static u64 g_dev_cursor = 1;
 static u64 g_proc_cursor = 1;
 
@@ -180,6 +182,106 @@ static isize kmsg_read_common(u64 *cursor, char *buf, usize size, int flags) {
     }
     scheduler_wait_commit();
   }
+}
+
+/* ── Per-descriptor cursors ──
+ * Both /dev/kmsg and /proc/kmsg hand every open its own position in the ring.
+ * A new reader starts at the oldest record still held, which is what Linux's
+ * /dev/kmsg does and what makes `dmesg` show the boot transcript. */
+static isize kmsg_handle_read(struct vfs_handle *h, char *buf, usize len) {
+  u64 *cursor = (u64 *)h->private_data;
+  return kmsg_read_common(cursor ? cursor : &g_dev_cursor, buf, len, h->flags);
+}
+
+static isize kmsg_dev_write(struct vfs_node *node, u64 offset, const char *buf,
+                            usize size, int flags);
+
+static isize kmsg_handle_write(struct vfs_handle *h, const char *buf,
+                               usize len) {
+  if (!h->node)
+    return -EBADF;
+  return kmsg_dev_write(h->node, 0, buf, len, h->flags);
+}
+
+static int kmsg_handle_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
+  u64 *cursor = (u64 *)h->private_data;
+  pfd->revents = B1NIX_POLLOUT;
+  if (kmsg_pending(cursor ? *cursor : g_dev_cursor))
+    pfd->revents |= B1NIX_POLLIN;
+  return 0;
+}
+
+/* SEEK_SET(0) rewinds to the oldest record, SEEK_END(2) skips to the newest —
+ * the two positions Linux defines for this file. The offset argument is a
+ * position selector, not a byte count. */
+static isize kmsg_handle_lseek(struct vfs_handle *h, isize offset, int whence) {
+  u64 *cursor = (u64 *)h->private_data;
+  if (!cursor)
+    return -ESPIPE;
+  u64 flags;
+  spin_lock_irqsave(&kmsg_lock, &flags);
+  if (whence == 0 || whence == 3 /* SEEK_DATA: first record, as on Linux */)
+    *cursor = g_first_seq;
+  else if (whence == 2)
+    *cursor = g_next_seq;
+  else {
+    spin_unlock_irqrestore(&kmsg_lock, flags);
+    return -EINVAL;
+  }
+  spin_unlock_irqrestore(&kmsg_lock, flags);
+  (void)offset;
+  return 0;
+}
+
+static void kmsg_handle_release(struct vfs_handle *h) {
+  if (h->private_data) {
+    kfree(h->private_data);
+    h->private_data = 0;
+  }
+  if (h->node) {
+    vfs_node_put(h->node);
+    h->node = 0;
+  }
+}
+
+static const struct vfs_file_ops kmsg_file_ops = {
+    .read = kmsg_handle_read,
+    .write = kmsg_handle_write,
+    .poll = kmsg_handle_poll,
+    .lseek = kmsg_handle_lseek,
+    .release = kmsg_handle_release,
+};
+
+/* /proc/kmsg is read-only in Linux; writing to it is not a thing klogd does. */
+static const struct vfs_file_ops kmsg_proc_file_ops = {
+    .read = kmsg_handle_read,
+    .poll = kmsg_handle_poll,
+    .lseek = kmsg_handle_lseek,
+    .release = kmsg_handle_release,
+};
+
+static int kmsg_open_common(struct vfs_handle *h,
+                            const struct vfs_file_ops *ops) {
+  u64 *cursor = kmalloc(sizeof(u64));
+  if (!cursor)
+    return -ENOMEM;
+  u64 flags;
+  spin_lock_irqsave(&kmsg_lock, &flags);
+  *cursor = g_first_seq;
+  spin_unlock_irqrestore(&kmsg_lock, flags);
+  h->private_data = cursor;
+  h->ops = ops;
+  return 0;
+}
+
+static int kmsg_dev_open(struct vfs_node *node, struct vfs_handle *h) {
+  (void)node;
+  return kmsg_open_common(h, &kmsg_file_ops);
+}
+
+int kmsg_proc_open(struct vfs_node *node, struct vfs_handle *h) {
+  (void)node;
+  return kmsg_open_common(h, &kmsg_proc_file_ops);
 }
 
 static isize kmsg_dev_read(struct vfs_node *node, u64 offset, char *buf,
@@ -387,6 +489,9 @@ void kmsg_register_nodes(void) {
   n->inode->read_cb = kmsg_dev_read;
   n->inode->write_cb = kmsg_dev_write;
   n->inode->poll_cb = kmsg_dev_poll;
+  /* Per-descriptor cursor; the node-level callbacks above stay as the fallback
+   * for a handle that never went through open_cb. */
+  n->inode->open_cb = kmsg_dev_open;
 }
 
 void kmsg_init(void) {

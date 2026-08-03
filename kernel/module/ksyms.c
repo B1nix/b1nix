@@ -16,6 +16,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/module.h>
 #include <b1nix/net.h>
+#include <b1nix/netdev.h>
 #include <b1nix/netproto.h>
 #include <b1nix/panic.h>
 #include <b1nix/pci.h>
@@ -129,6 +130,9 @@ EXPORT_SYMBOL(net_send_ethernet);
    module ABI too. */
 EXPORT_SYMBOL(net_send_ethernet_dev);
 EXPORT_SYMBOL(netdev_by_index);
+/* M107: ndp.ko's neighbour dump reports the interface each entry belongs to. */
+EXPORT_SYMBOL(netdev_active);
+EXPORT_SYMBOL(netdev_index_of);
 EXPORT_SYMBOL(route_flow_hash);
 EXPORT_SYMBOL(route6_lookup_flow);
 EXPORT_SYMBOL(route6_configure_interface);

@@ -1,4 +1,5 @@
 #include <b1nix/console.h>
+#include <b1nix/errno.h>
 #include <b1nix/net.h>
 #include <b1nix/netproto.h>
 #include <b1nix/netdev.h>
@@ -97,11 +98,23 @@ static int netdev_link_state(struct netdev *nd)
 
 static struct netdev *netdev_best(void)
 {
+	/* An administratively down interface is not a candidate, whatever its
+	 * carrier says — that is the whole point of taking it down. */
 	for (usize i = 0; i < g_netdev_count; i++) {
-		if (netdev_link_state(g_netdevs[i]) == 1)
+		if (!g_netdevs[i]->admin_down &&
+		    netdev_link_state(g_netdevs[i]) == 1)
 			return g_netdevs[i];
 	}
-	return g_netdev ? g_netdev : (g_netdev_count ? g_netdevs[0] : 0);
+	for (usize i = 0; i < g_netdev_count; i++) {
+		if (!g_netdevs[i]->admin_down)
+			return g_netdevs[i];
+	}
+	return 0;
+}
+
+int netdev_is_admin_up(const struct netdev *nd)
+{
+	return nd ? !nd->admin_down : 0;
 }
 
 /* ── Interface address state ────────────────────────────────────────────── */
@@ -159,7 +172,11 @@ static void net_reset_interface_state(struct netdev *nd)
 {
 	struct ipv4_addr zero4 = {{0, 0, 0, 0}};
 
-	local_mac = nd->mac;
+	/* nd == NULL: no interface is active any more (every one of them was taken
+	 * administratively down). Keep the last station address so /sys and ifconfig
+	 * still report the hardware, but drop every L3 fact. */
+	if (nd)
+		local_mac = nd->mac;
 	local_ip = zero4;
 	gateway_ip = zero4;
 	netmask_ip = zero4;
@@ -187,6 +204,52 @@ static void net_switch_active(struct netdev *nd)
 	console_write("net: switched active driver to ");
 	console_write(nd->name);
 	console_write("\n");
+}
+
+/* `ip link set <if> up/down` / SIOCSIFFLAGS. Down is a real state change, not a
+ * cosmetic flag: the interface stops transmitting and its received frames are
+ * dropped, and if it was carrying the L3 configuration that role moves to
+ * another interface (or the stack is left with none, which is what the operator
+ * asked for). */
+int netdev_set_admin_up(struct netdev *nd, int up)
+{
+	if (!nd)
+		return -ENODEV;
+	if (!nd->admin_down == !!up)
+		return 0; /* already in the requested state */
+	nd->admin_down = up ? 0 : 1;
+
+	console_write("net: ");
+	console_write(nd->name);
+	console_write(up ? " administratively up\n" : " administratively down\n");
+
+	if (!up && nd == g_netdev) {
+		dhcp_stop();
+		struct netdev *next = netdev_best();
+		g_netdev = next;
+		last_link_state = -2;
+		net_irq_pending = 0;
+		if (next) {
+			net_reset_interface_state(next);
+			if (networking_enabled)
+				dhcp_init();
+		} else {
+			/* No interface left to hold an address. Drop the L3 state
+			 * rather than keep answering for an address nothing can
+			 * reach. */
+			net_reset_interface_state(0);
+		}
+		return 0;
+	}
+
+	if (up && !g_netdev) {
+		g_netdev = nd;
+		last_link_state = -2;
+		net_reset_interface_state(nd);
+		if (networking_enabled)
+			dhcp_init();
+	}
+	return 0;
 }
 
 int net_dhcp_try_failover(void)
@@ -493,6 +556,9 @@ void net_send_ethernet_dev(struct netdev *nd, struct mac_addr dst,
 	if (!nd || !nd->transmit) {
 		return;
 	}
+	/* An administratively down interface does not transmit. */
+	if (nd->admin_down)
+		return;
 
 	u8 hdr[14];
 	memcpy(hdr, dst.bytes, 6);
@@ -511,6 +577,8 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 	if (!nd || !nd->transmit) {
 		return;
 	}
+	if (nd->admin_down)
+		return;
 
 	u8 hdr[14];
 	memcpy(hdr, dst.bytes, 6);

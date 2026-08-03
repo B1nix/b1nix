@@ -11,6 +11,7 @@
  * (it is the layer that picks the source address the checksum depends on).
  */
 
+#include <b1nix/errno.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/console.h>
@@ -31,6 +32,10 @@ struct ndp_entry {
 	struct in6_addr_k ip;
 	struct mac_addr mac;
 	int valid;
+	/* Installed administratively (`ip -6 neigh add`): a learned advertisement
+	 * never overwrites one, and it reports NUD_PERMANENT — the same rule the
+	 * ARP cache follows for IPv4. */
+	int permanent;
 };
 static struct ndp_entry ndp_cache[NDP_CACHE_SIZE];
 
@@ -60,7 +65,10 @@ static void ndp_cache_put(struct in6_addr_k ip, struct mac_addr mac)
 {
 	for (int i = 0; i < NDP_CACHE_SIZE; i++) {
 		if (ndp_cache[i].valid && in6_eq(&ndp_cache[i].ip, &ip)) {
-			ndp_cache[i].mac = mac;
+			/* A permanent entry is what the administrator asked for; a
+			 * neighbour advertisement does not get to move it. */
+			if (!ndp_cache[i].permanent)
+				ndp_cache[i].mac = mac;
 			return;
 		}
 	}
@@ -69,9 +77,67 @@ static void ndp_cache_put(struct in6_addr_k ip, struct mac_addr mac)
 			ndp_cache[i].ip = ip;
 			ndp_cache[i].mac = mac;
 			ndp_cache[i].valid = 1;
+			ndp_cache[i].permanent = 0;
 			return;
 		}
 	}
+}
+
+/* ── Neighbour-cache administration (netlink RTM_*NEIGH for AF_INET6) ──
+ * The IPv6 counterparts of arp_snapshot/arp_neigh_set/arp_neigh_del, published
+ * through struct net_proto so the in-tree netlink code can reach this module's
+ * cache without linking against it. */
+static usize ndp_neigh_dump(struct neigh_info *out, usize max)
+{
+	usize n = 0;
+	if (!out)
+		return 0;
+	for (int i = 0; i < NDP_CACHE_SIZE && n < max; i++) {
+		if (!ndp_cache[i].valid)
+			continue;
+		out[n].family = B1NIX_AF_INET6;
+		memcpy(out[n].addr, ndp_cache[i].ip.bytes, 16);
+		out[n].addr_len = 16;
+		out[n].permanent = (u8)(ndp_cache[i].permanent ? 1 : 0);
+		out[n].mac = ndp_cache[i].mac;
+		out[n].oif = netdev_index_of(netdev_active());
+		n++;
+	}
+	return n;
+}
+
+static int ndp_neigh_set(struct in6_addr_k ip, struct mac_addr mac,
+                         int permanent)
+{
+	for (int i = 0; i < NDP_CACHE_SIZE; i++) {
+		if (ndp_cache[i].valid && in6_eq(&ndp_cache[i].ip, &ip)) {
+			ndp_cache[i].mac = mac;
+			ndp_cache[i].permanent = permanent ? 1 : 0;
+			return 0;
+		}
+	}
+	for (int i = 0; i < NDP_CACHE_SIZE; i++) {
+		if (!ndp_cache[i].valid) {
+			ndp_cache[i].ip = ip;
+			ndp_cache[i].mac = mac;
+			ndp_cache[i].valid = 1;
+			ndp_cache[i].permanent = permanent ? 1 : 0;
+			return 0;
+		}
+	}
+	return -ENOSPC;
+}
+
+static int ndp_neigh_del(struct in6_addr_k ip)
+{
+	for (int i = 0; i < NDP_CACHE_SIZE; i++) {
+		if (ndp_cache[i].valid && in6_eq(&ndp_cache[i].ip, &ip)) {
+			ndp_cache[i].valid = 0;
+			ndp_cache[i].permanent = 0;
+			return 0;
+		}
+	}
+	return -ESRCH;
 }
 
 /* Solicited-node multicast address ff02::1:ffXX:XXXX for a target. */
@@ -410,6 +476,9 @@ static struct net_proto ndp_proto = {
 	.name = "ndp",
 	.resolve6 = ndp_resolve_proto,
 	.mld_join = mld_join_solicited_node,
+	.neigh_dump = ndp_neigh_dump,
+	.neigh_set = ndp_neigh_set,
+	.neigh_del = ndp_neigh_del,
 	.icmp6 = ndp_icmp6_receive,
 	.tick = ndp_tick,
 	.reset = ndp_module_reset,

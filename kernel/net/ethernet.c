@@ -15,6 +15,10 @@ void ethernet_receive(const void *data, usize size)
 	struct netdev *rx = netdev_receiving();
 	if (rx && rx != netdev_active())
 		return;
+	/* An administratively down interface accepts nothing, even though its ring
+	 * keeps being drained so the hardware does not wedge. */
+	if (rx && !netdev_is_admin_up(rx))
+		return;
 
 	if (size < 14) return;
 
