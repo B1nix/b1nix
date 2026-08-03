@@ -196,14 +196,6 @@ BINARIES := \
 	$(BUILD)/bin/m35_smoke \
 	$(BUILD)/bin/m36_smoke \
 	$(BUILD)/bin/diskbench \
-	$(BUILD)/bin/id \
-	$(BUILD)/bin/whoami \
-	$(BUILD)/bin/groups \
-	$(BUILD)/bin/useradd \
-	$(BUILD)/bin/userdel \
-	$(BUILD)/bin/groupadd \
-	$(BUILD)/bin/chown \
-	$(BUILD)/bin/chmod \
 	$(BUILD)/bin/telinit \
 	$(BUILD)/bin/m30_pie \
 	$(BUILD)/bin/m38_sound \
@@ -238,6 +230,9 @@ BINARIES += $(BUILD)/bin/m73_smoke
 BINARIES += $(BUILD)/bin/m104_pam_smoke
 # M108: BusyBox su/passwd/init smoke — also links libpam.so.2 (bespoke rule).
 BINARIES += $(BUILD)/bin/m108_smoke
+# M108: the login shell of the m108user account (an ELF, so su's login argv[0]
+# survives — see bin/helpers/m108shell.c).
+BINARIES += $(BUILD)/bin/m108shell
 # M80: ptrace register sets, /proc/<pid>/task|auxv|mem, crash capture.
 BINARIES += $(BUILD)/bin/m80_smoke
 # M86: per-thread CPU accounting, tkill/tgkill, pthread_exit return values.
@@ -270,11 +265,8 @@ BINARIES += $(BUILD)/bin/m53_httpd
 # M53 loopback HTTPS server + the driver that runs the NetSurf render tests.
 BINARIES += $(BUILD)/bin/m53_httpsd
 BINARIES += $(BUILD)/bin/m53_smoke
-BINARIES += $(BUILD)/bin/halt
-BINARIES += $(BUILD)/bin/setfattr
 BINARIES += $(BUILD)/bin/b1fetch
 BINARIES += $(BUILD)/bin/gpuinfo
-BINARIES += $(BUILD)/bin/meminfo
 BINARIES += $(BUILD)/bin/mc
 BINARIES += $(BUILD)/bin/ne
 # M16 driver: runs mc/ne out-of-process and covers the rest of the TUI surface.
@@ -357,9 +349,9 @@ $(B1CC): $(B1CC_DIR)/Makefile $(wildcard $(B1CC_DIR)/src/*.c)
 # the host build treats the variable's mere presence (any value, including 0) as
 # "use the internal b1nix-crt0/libb1nix.a linker", so leave it unset for musl.
 $(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(B1CC)
-$(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(BUILD)/bin/%: bin/%.c
+$(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(BUILD)/bin/%: bin/compiler/%.c
 	@mkdir -p $(dir $@)
-	B1NIX_CC=$(B1CC_BINS_CC) B1CC_SYSROOT_INCLUDE=$(B1CC_SYSROOT_INCLUDE) $(B1CC) --target=$(B1NIX_ARCH)-b1nix bin/$*.c -o $@
+	B1NIX_CC=$(B1CC_BINS_CC) B1CC_SYSROOT_INCLUDE=$(B1CC_SYSROOT_INCLUDE) $(B1CC) --target=$(B1NIX_ARCH)-b1nix $< -o $@
 
 # M32: /bin/b1cc — b1cc compiled to a B1NIX ELF by b1nix-cc. Custom multi-source
 # rule (all of b1cc/src except the token-lexer variant); C23 needs -std=gnu2x.
@@ -379,7 +371,7 @@ $(BUILD)/bin/b1cc: $(B1CC_SELF_SRCS)
 
 # M32: /bin/b1cc-selfsmoke — the on-device self-host driver, statically linked
 # against musl's libc.a (the minimal initramfs ships no shared libc.so).
-$(BUILD)/bin/b1cc_selfsmoke: bin/b1cc_selfsmoke.c $(MUSL_LIB)/libc.a $(MUSL_CRT1)
+$(BUILD)/bin/b1cc_selfsmoke: bin/compiler/b1cc_selfsmoke.c $(MUSL_LIB)/libc.a $(MUSL_CRT1)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/b1cc_selfsmoke.o
 	$(LD) $(LDFLAGS) -static -o $@ $(MUSL_CRT1) $(MUSL_CRTI) $(BUILD)/bin/b1cc_selfsmoke.o \
@@ -392,9 +384,9 @@ $(BUILD)/src/tui_common.o: src/tui_common.c include/tui.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $@
 
-$(BUILD)/bin/mc: bin/mc.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
+$(BUILD)/bin/mc: bin/tools/mc.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/mc.c -o $(BUILD)/bin/mc.o
+	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/tools/mc.c -o $(BUILD)/bin/mc.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/mc.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
 ifeq ($(GEN_MUSL_POSTLINK),1)
 	python3 -c "\
@@ -405,9 +397,9 @@ open(f,'wb').write(d); \
 fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
 endif
 
-$(BUILD)/bin/ne: bin/ne.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
+$(BUILD)/bin/ne: bin/tools/ne.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/ne.c -o $(BUILD)/bin/ne.o
+	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/tools/ne.c -o $(BUILD)/bin/ne.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/ne.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
 ifeq ($(GEN_MUSL_POSTLINK),1)
 	python3 -c "\
@@ -419,9 +411,9 @@ fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null |
 endif
 
 # M16 driver links tui_common.o for the shared key-sequence decoder it checks.
-$(BUILD)/bin/m16_smoke: bin/m16_smoke.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
+$(BUILD)/bin/m16_smoke: bin/smoke/m16_smoke.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/m16_smoke.c -o $(BUILD)/bin/m16_smoke.o
+	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/smoke/m16_smoke.c -o $(BUILD)/bin/m16_smoke.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/m16_smoke.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
 ifeq ($(GEN_MUSL_POSTLINK),1)
 	python3 -c "\
@@ -436,9 +428,9 @@ $(BUILD)/src/mojo_core.o: src/mojo_core.c include/mojo/mojo.h include/mojo.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $@
 
-$(BUILD)/bin/m57_smoke: bin/m57_smoke.c $(BUILD)/src/mojo_core.o $(GEN_LIBDEP) $(GEN_CRT0)
+$(BUILD)/bin/m57_smoke: bin/smoke/m57_smoke.c $(BUILD)/src/mojo_core.o $(GEN_LIBDEP) $(GEN_CRT0)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/m57_smoke.c -o $(BUILD)/bin/m57_smoke.o
+	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/smoke/m57_smoke.c -o $(BUILD)/bin/m57_smoke.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/m57_smoke.o $(BUILD)/src/mojo_core.o $(GEN_LINK_LIBS)
 ifeq ($(GEN_MUSL_POSTLINK),1)
 	python3 -c "\
@@ -450,7 +442,22 @@ fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null |
 endif
 
 
-$(BUILD)/bin/%: bin/%.c $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)
+# ── Source layout ──
+# bin/ is grouped by purpose so the directory can be navigated at a glance:
+#   bin/smoke/     kernel + POSIX smoke tests (mNN_smoke.c)
+#   bin/gfx/       graphics/browser-stack tests and their servers (M47-M53, M59, M91)
+#   bin/helpers/   programs a test drives rather than a test itself (fixtures,
+#                  target ELFs, tiny servers, the musl bring-up diagnostics)
+#   bin/tools/     b1nix-specific utilities that ship in the image
+#   bin/gui/       the GUI demo applications
+#   bin/compiler/  the b1cc corpus
+# Rules refer to a source through $(call bin_src,NAME) so a program can move
+# between categories without touching a build rule.
+BIN_CATS := smoke gfx helpers tools gui compiler
+bin_src = $(firstword $(wildcard $(addsuffix /$(1).c,$(addprefix bin/,$(BIN_CATS)))))
+.SECONDEXPANSION:
+
+$(BUILD)/bin/%: $$(call bin_src,$$*) $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(GEN_PIC) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) $(if $(GEN_LINKER),-T $(GEN_LINKER)) -o $@ $(GEN_CRT0) $(BUILD)/bin/$*.o $(GEN_LINK_LIBS)
@@ -488,7 +495,7 @@ $(BUILD)/bin/displayd: $(DISPLAYD_OBJS) $(GUI_LIB) $(BESPOKE_LIBDEP) $(if $(BESP
 	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
 	)
 
-$(filter-out $(BUILD)/bin/displayd,$(GUI_BINARIES)): $(BUILD)/bin/%: bin/%.c $(GUI_LIB) $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(filter-out $(BUILD)/bin/displayd,$(GUI_BINARIES)): $(BUILD)/bin/%: bin/gui/%.c $(GUI_LIB) $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/$*.o \
@@ -509,7 +516,7 @@ $(WAYLAND_DIR)/lib/libwayland-client.a: ../tools/ports/build-wayland.sh ../tools
 	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/ports/build-wayland.sh >/dev/null
 $(WAYLAND_DIR)/lib/libwayland-server.a: $(WAYLAND_DIR)/lib/libwayland-client.a
 
-$(BUILD)/bin/m49_libwayland: bin/m49_libwayland.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) \
+$(BUILD)/bin/m49_libwayland: bin/gfx/m49_libwayland.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) \
 		$(WAYLAND_DIR)/lib/libwayland-client.a
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(WAYLAND_DIR)/include -c $< -o $(BUILD)/bin/m49_libwayland.o
@@ -525,7 +532,7 @@ $(BUILD)/bin/m49_libwayland: bin/m49_libwayland.c $(BESPOKE_LIBDEP) $(if $(BESPO
 	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
 	)
 
-$(BUILD)/bin/m49_libwayland_server: bin/m49_libwayland_server.c $(BESPOKE_LIBDEP) \
+$(BUILD)/bin/m49_libwayland_server: bin/gfx/m49_libwayland_server.c $(BESPOKE_LIBDEP) \
 		$(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(WAYLAND_DIR)/lib/libwayland-server.a
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(WAYLAND_DIR)/include -c $< -o $(BUILD)/bin/m49_libwayland_server.o
@@ -541,7 +548,7 @@ $(BUILD)/bin/m49_libwayland_server: bin/m49_libwayland_server.c $(BESPOKE_LIBDEP
 	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
 	)
 
-$(BUILD)/bin/native_smoke: bin/native_smoke.S
+$(BUILD)/bin/native_smoke: bin/helpers/native_smoke.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/native_smoke.o
 	$(LD) $(LDFLAGS) $(if $(LINKER),-T $(LINKER)) -o $@ $(BUILD)/bin/native_smoke.o
@@ -552,7 +559,7 @@ $(BUILD)/bin/native_smoke: bin/native_smoke.S
 # has to be present in the rootfs at runtime (see the Makefile's root-image
 # target) for ld-musl to resolve it.
 OPENPAM_DIR := ../build/$(B1NIX_ARCH)/ports/openpam/install
-$(BUILD)/bin/m104_pam_smoke: bin/m104_pam_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(OPENPAM_DIR)/lib/libpam.so.2
+$(BUILD)/bin/m104_pam_smoke: bin/smoke/m104_pam_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(OPENPAM_DIR)/lib/libpam.so.2
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(OPENPAM_DIR)/include -c $< -o $(BUILD)/bin/m104_pam_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -L $(OPENPAM_DIR)/lib -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m104_pam_smoke.o \
@@ -570,7 +577,7 @@ $(BUILD)/bin/m104_pam_smoke: bin/m104_pam_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPO
 # m104_pam_smoke does — it has to ask the REAL pam_unix.so whether the password
 # BusyBox's passwd applet wrote is accepted — so it needs the same bespoke rule
 # rather than the generic single-source pattern.
-$(BUILD)/bin/m108_smoke: bin/m108_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(OPENPAM_DIR)/lib/libpam.so.2
+$(BUILD)/bin/m108_smoke: bin/smoke/m108_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(OPENPAM_DIR)/lib/libpam.so.2
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(OPENPAM_DIR)/include -c $< -o $(BUILD)/bin/m108_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -L $(OPENPAM_DIR)/lib -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m108_smoke.o \
@@ -588,7 +595,7 @@ $(BUILD)/bin/m108_smoke: bin/m108_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKE
 # archives are present (built by tools/ports/build-curl.sh with B1NIX_TLS=mbedtls).
 # Without them it builds HTTP-only so a `B1NIX_TLS=none` build still works.
 MBEDTLS_DIR := ../build/$(B1NIX_ARCH)/ports/mbedtls/install
-$(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
+$(BUILD)/bin/m32_nettool: bin/helpers/m32_nettool.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
 	@mkdir -p $(dir $@)
 	@if [ -f $(MBEDTLS_DIR)/lib/libmbedtls.a ]; then \
 	  echo "  CC+TLS  m32_nettool"; \
@@ -614,7 +621,7 @@ $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LIN
 	ln -sf m32_nettool $(BUILD)/bin/m32-nettool
 
 # m53_httpsd: loopback HTTPS server (mbedTLS) for the M53 NetSurf web-access smoke.
-$(BUILD)/bin/m53_httpsd: bin/m53_httpsd.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
+$(BUILD)/bin/m53_httpsd: bin/gfx/m53_httpsd.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(MBEDTLS_DIR)/include -c $< -o $(BUILD)/bin/m53_httpsd.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_httpsd.o \
@@ -644,7 +651,7 @@ $(BUILD)/duktape/duktape.o: $(DUK_DIR)/duktape.c $(DUK_DIR)/duktape.h $(DUK_DIR)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -Wno-unused-parameter -Wno-unused-but-set-variable \
 	  -Wno-tautological-constant-out-of-range-compare -I $(DUK_DIR) -c $< -o $@
 
-$(BUILD)/bin/js: bin/js.c $(BUILD)/duktape/duktape.o $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/js: bin/tools/js.c $(BUILD)/duktape/duktape.o $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(DUK_DIR) -c $< -o $(BUILD)/bin/js.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/js.o \
@@ -660,7 +667,7 @@ $(BUILD)/bin/js: bin/js.c $(BUILD)/duktape/duktape.o $(BESPOKE_LIBDEP) $(if $(BE
 	)
 
 # M51: m51_smoke links the ported static libm (openlibm).
-$(BUILD)/bin/m51_smoke: bin/m51_smoke.c $(BESPOKE_LIBDEP)
+$(BUILD)/bin/m51_smoke: bin/gfx/m51_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBM_DIR)/include -c $< -o $(BUILD)/bin/m51_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_smoke.o \
@@ -668,7 +675,7 @@ $(BUILD)/bin/m51_smoke: bin/m51_smoke.c $(BESPOKE_LIBDEP)
 
 # M51: m51_pixman_smoke links the ported static pixman (+libm).
 PIXMAN_DIR := ../build/$(B1NIX_ARCH)/ports/pixman/install
-$(BUILD)/bin/m51_pixman_smoke: bin/m51_pixman_smoke.c $(BESPOKE_LIBDEP)
+$(BUILD)/bin/m51_pixman_smoke: bin/gfx/m51_pixman_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(PIXMAN_DIR)/include/pixman-1 -c $< -o $(BUILD)/bin/m51_pixman_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_pixman_smoke.o \
@@ -677,7 +684,7 @@ $(BUILD)/bin/m51_pixman_smoke: bin/m51_pixman_smoke.c $(BESPOKE_LIBDEP)
 
 # M51: m51_freetype_smoke links the ported static FreeType (+libm).
 FT_DIR := ../build/$(B1NIX_ARCH)/ports/freetype/install
-$(BUILD)/bin/m51_freetype_smoke: bin/m51_freetype_smoke.c $(BESPOKE_LIBDEP)
+$(BUILD)/bin/m51_freetype_smoke: bin/gfx/m51_freetype_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(FT_DIR)/include -c $< -o $(BUILD)/bin/m51_freetype_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_freetype_smoke.o \
@@ -686,7 +693,7 @@ $(BUILD)/bin/m51_freetype_smoke: bin/m51_freetype_smoke.c $(BESPOKE_LIBDEP)
 
 # M51: m51_cairo_smoke links the full stack (Cairo + FreeType + pixman + libm).
 CAIRO_DIR := ../build/$(B1NIX_ARCH)/ports/cairo/install
-$(BUILD)/bin/m51_cairo_smoke: bin/m51_cairo_smoke.c $(BESPOKE_LIBDEP)
+$(BUILD)/bin/m51_cairo_smoke: bin/gfx/m51_cairo_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include \
 	  -c $< -o $(BUILD)/bin/m51_cairo_smoke.o
@@ -696,7 +703,7 @@ $(BUILD)/bin/m51_cairo_smoke: bin/m51_cairo_smoke.c $(BESPOKE_LIBDEP)
 	  $(BESPOKE_LIBC)
 
 # M51 end-to-end: Cairo + libb1gui (Wayland client) -> displayd.
-$(BUILD)/bin/m51_cairo_wayland: bin/m51_cairo_wayland.c $(GUI_LIB) $(BESPOKE_LIBDEP)
+$(BUILD)/bin/m51_cairo_wayland: bin/gfx/m51_cairo_wayland.c $(GUI_LIB) $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include \
 	  -c $< -o $(BUILD)/bin/m51_cairo_wayland.o
@@ -710,7 +717,7 @@ TINYGL_DIR := ../build/$(B1NIX_ARCH)/ports/tinygl/install
 $(TINYGL_DIR)/lib/libEGL.a: ../tools/ports/build-tinygl.sh libegl/b1egl.c \
 		include/EGL/egl.h
 	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/ports/build-tinygl.sh >/dev/null
-$(BUILD)/bin/m52_gl_smoke: bin/m52_gl_smoke.c $(GUI_LIB) $(BESPOKE_LIBDEP) \
+$(BUILD)/bin/m52_gl_smoke: bin/gfx/m52_gl_smoke.c $(GUI_LIB) $(BESPOKE_LIBDEP) \
 		$(TINYGL_DIR)/lib/libEGL.a
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -I $(TINYGL_DIR)/include -c $< -o $(BUILD)/bin/m52_gl_smoke.o
@@ -785,7 +792,7 @@ $(BUILD)/bin/m55_iostream: bin/m55_iostream.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBC
 # libc++.
 HB_DIR := ../build/$(B1NIX_ARCH)/ports/harfbuzz/install
 LLVM_RT := $(firstword $(wildcard ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/sysroot/usr/lib/libcompiler_rt.a ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/llvm-runtimes-build/install/lib/libcompiler_rt.a ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/cross/$(B1NIX_TRIPLET)/lib/libcompiler_rt.a))
-$(BUILD)/bin/m51_harfbuzz_smoke: bin/m51_harfbuzz_smoke.c $(BESPOKE_LIBDEP)
+$(BUILD)/bin/m51_harfbuzz_smoke: bin/gfx/m51_harfbuzz_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(HB_DIR)/include -c $< -o $(BUILD)/bin/m51_harfbuzz_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_harfbuzz_smoke.o \
@@ -795,7 +802,7 @@ $(BUILD)/bin/m51_harfbuzz_smoke: bin/m51_harfbuzz_smoke.c $(BESPOKE_LIBDEP)
 # M51: m51_fontconfig_smoke links Fontconfig + expat + FreeType + libm.
 FC_DIR := ../build/$(B1NIX_ARCH)/ports/fontconfig/install
 EXPAT_DIR := ../build/$(B1NIX_ARCH)/ports/expat/install
-$(BUILD)/bin/m51_fontconfig_smoke: bin/m51_fontconfig_smoke.c $(BESPOKE_LIBDEP)
+$(BUILD)/bin/m51_fontconfig_smoke: bin/gfx/m51_fontconfig_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(FC_DIR)/include -c $< -o $(BUILD)/bin/m51_fontconfig_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_fontconfig_smoke.o \
@@ -807,7 +814,7 @@ $(BUILD)/bin/m51_fontconfig_smoke: bin/m51_fontconfig_smoke.c $(BESPOKE_LIBDEP)
 XKB_DIR := ../build/$(B1NIX_ARCH)/ports/xkbcommon/install
 XKB_INC := $(wildcard $(XKB_DIR)/include/xkbcommon/xkbcommon.h)
 XKB_REAL := $(if $(XKB_INC),$(XKB_DIR)/include,$(XKB_DIR)/include/include)
-$(BUILD)/bin/m51_xkb_smoke: bin/m51_xkb_smoke.c $(BESPOKE_LIBDEP)
+$(BUILD)/bin/m51_xkb_smoke: bin/gfx/m51_xkb_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(XKB_REAL) -c $< -o $(BUILD)/bin/m51_xkb_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_xkb_smoke.o \
@@ -815,7 +822,7 @@ $(BUILD)/bin/m51_xkb_smoke: bin/m51_xkb_smoke.c $(BESPOKE_LIBDEP)
 
 # m32_pcre2_smoke links the ported static PCRE2 (8-bit) library.
 PCRE2_DIR := ../build/$(B1NIX_ARCH)/ports/pcre2/install
-$(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/m32_pcre2_smoke: bin/smoke/m32_pcre2_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -DPCRE2_STATIC -I $(PCRE2_DIR)/include -c $< -o $(BUILD)/bin/m32_pcre2_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m32_pcre2_smoke.o \
@@ -831,7 +838,7 @@ $(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(BESPOKE_LIBDEP) $(if $(BES
 
 # m53_zlib_smoke links the ported static zlib (image-codec dependency, M53).
 ZLIB_DIR := ../build/$(B1NIX_ARCH)/ports/zlib/install
-$(BUILD)/bin/m53_zlib_smoke: bin/m53_zlib_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/m53_zlib_smoke: bin/gfx/m53_zlib_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(ZLIB_DIR)/include -c $< -o $(BUILD)/bin/m53_zlib_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_zlib_smoke.o \
@@ -847,7 +854,7 @@ $(BUILD)/bin/m53_zlib_smoke: bin/m53_zlib_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPO
 
 # m53_libpng_smoke links the ported libpng over zlib (M53 image codec).
 LIBPNG_DIR := ../build/$(B1NIX_ARCH)/ports/libpng/install
-$(BUILD)/bin/m53_libpng_smoke: bin/m53_libpng_smoke.c $(GEN_LIBDEP) $(GEN_LINKER)
+$(BUILD)/bin/m53_libpng_smoke: bin/gfx/m53_libpng_smoke.c $(GEN_LIBDEP) $(GEN_LINKER)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(GEN_PIC) -I $(LIBPNG_DIR)/include -I $(ZLIB_DIR)/include -c $< -o $(BUILD)/bin/m53_libpng_smoke.o
 	# Dynamic PIE (default) like its m53 siblings. The old "must stay static"
@@ -862,7 +869,7 @@ $(BUILD)/bin/m53_libpng_smoke: bin/m53_libpng_smoke.c $(GEN_LIBDEP) $(GEN_LINKER
 
 # m53_libjpeg_smoke links the ported static IJG libjpeg (M53 image codec).
 LIBJPEG_DIR := ../build/$(B1NIX_ARCH)/ports/libjpeg/install
-$(BUILD)/bin/m53_libjpeg_smoke: bin/m53_libjpeg_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/m53_libjpeg_smoke: bin/gfx/m53_libjpeg_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBJPEG_DIR)/include -c $< -o $(BUILD)/bin/m53_libjpeg_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_libjpeg_smoke.o \
@@ -878,7 +885,7 @@ $(BUILD)/bin/m53_libjpeg_smoke: bin/m53_libjpeg_smoke.c $(BESPOKE_LIBDEP) $(if $
 
 # m53_libwebp_smoke links the ported static libwebp (M53 image/video codec).
 LIBWEBP_DIR := ../build/$(B1NIX_ARCH)/ports/libwebp/install
-$(BUILD)/bin/m53_libwebp_smoke: bin/m53_libwebp_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/m53_libwebp_smoke: bin/gfx/m53_libwebp_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBWEBP_DIR)/include -c $< -o $(BUILD)/bin/m53_libwebp_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_libwebp_smoke.o \
@@ -896,7 +903,7 @@ $(BUILD)/bin/m53_libwebp_smoke: bin/m53_libwebp_smoke.c $(BESPOKE_LIBDEP) $(if $
 # m53_libvpx_smoke links the ported libvpx (VP8 decode) + libwebp (VP8 keyframe
 # source) + libm. M53 full-motion video codec.
 LIBVPX_DIR := ../build/$(B1NIX_ARCH)/ports/libvpx/install
-$(BUILD)/bin/m53_libvpx_smoke: bin/m53_libvpx_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/m53_libvpx_smoke: bin/gfx/m53_libvpx_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBVPX_DIR)/include -I $(LIBWEBP_DIR)/include -c $< -o $(BUILD)/bin/m53_libvpx_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_libvpx_smoke.o \
@@ -914,7 +921,7 @@ $(BUILD)/bin/m53_libvpx_smoke: bin/m53_libvpx_smoke.c $(BESPOKE_LIBDEP) $(if $(B
 # m53_wapcaplet_smoke links the ported NetSurf libwapcaplet (string internment)
 # — the lowest layer of the NetSurf browser library chain (M53).
 LWC_DIR := ../build/$(B1NIX_ARCH)/ports/libwapcaplet/install
-$(BUILD)/bin/m53_wapcaplet_smoke: bin/m53_wapcaplet_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/m53_wapcaplet_smoke: bin/gfx/m53_wapcaplet_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LWC_DIR)/include -c $< -o $(BUILD)/bin/m53_wapcaplet_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_wapcaplet_smoke.o \
@@ -931,7 +938,7 @@ $(BUILD)/bin/m53_wapcaplet_smoke: bin/m53_wapcaplet_smoke.c $(BESPOKE_LIBDEP) $(
 # m53_parserutils_smoke links the ported NetSurf libparserutils (input streams +
 # bundled charset codecs) — browser lib chain step 2 (M53).
 PU_DIR := ../build/$(B1NIX_ARCH)/ports/libparserutils/install
-$(BUILD)/bin/m53_parserutils_smoke: bin/m53_parserutils_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/m53_parserutils_smoke: bin/gfx/m53_parserutils_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(PU_DIR)/include -c $< -o $(BUILD)/bin/m53_parserutils_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_parserutils_smoke.o \
@@ -948,7 +955,7 @@ $(BUILD)/bin/m53_parserutils_smoke: bin/m53_parserutils_smoke.c $(BESPOKE_LIBDEP
 # m53_hubbub_smoke links the ported NetSurf libhubbub (HTML5 tokeniser) over
 # libparserutils — browser lib chain step 3 (M53).
 HUBBUB_DIR := ../build/$(B1NIX_ARCH)/ports/libhubbub/install
-$(BUILD)/bin/m53_hubbub_smoke: bin/m53_hubbub_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/m53_hubbub_smoke: bin/gfx/m53_hubbub_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(HUBBUB_DIR)/include -I $(PU_DIR)/include -c $< -o $(BUILD)/bin/m53_hubbub_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_hubbub_smoke.o \
@@ -966,7 +973,7 @@ $(BUILD)/bin/m53_hubbub_smoke: bin/m53_hubbub_smoke.c $(BESPOKE_LIBDEP) $(if $(B
 # m53_libcss_smoke links the ported NetSurf libcss (CSS parser + selection) over
 # libwapcaplet + libparserutils — browser lib chain step 4 (M53).
 LIBCSS_DIR := ../build/$(B1NIX_ARCH)/ports/libcss/install
-$(BUILD)/bin/m53_libcss_smoke: bin/m53_libcss_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/m53_libcss_smoke: bin/gfx/m53_libcss_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBCSS_DIR)/include -I $(LWC_DIR)/include -I $(PU_DIR)/include -c $< -o $(BUILD)/bin/m53_libcss_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_libcss_smoke.o \
@@ -984,7 +991,7 @@ $(BUILD)/bin/m53_libcss_smoke: bin/m53_libcss_smoke.c $(BESPOKE_LIBDEP) $(if $(B
 # m53_libdom_smoke links the ported NetSurf libdom (DOM) + its hubbub binding
 # over libhubbub + libparserutils + libwapcaplet — browser lib chain step 5.
 LIBDOM_DIR := ../build/$(B1NIX_ARCH)/ports/libdom/install
-$(BUILD)/bin/m53_libdom_smoke: bin/m53_libdom_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/m53_libdom_smoke: bin/gfx/m53_libdom_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBDOM_DIR)/include -I $(HUBBUB_DIR)/include -I $(PU_DIR)/include -I $(LWC_DIR)/include -c $< -o $(BUILD)/bin/m53_libdom_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_libdom_smoke.o \
@@ -1006,7 +1013,7 @@ NSUTILS_DIR := ../build/$(B1NIX_ARCH)/ports/libnsutils/install
 NSGIF_DIR := ../build/$(B1NIX_ARCH)/ports/libnsgif/install
 NSBMP_DIR := ../build/$(B1NIX_ARCH)/ports/libnsbmp/install
 NSLOG_DIR := ../build/$(B1NIX_ARCH)/ports/libnslog/install
-$(BUILD)/bin/m53_nslibs_smoke: bin/m53_nslibs_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(BUILD)/bin/m53_nslibs_smoke: bin/gfx/m53_nslibs_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(NSUTILS_DIR)/include -I $(NSGIF_DIR)/include -I $(NSBMP_DIR)/include -I $(NSLOG_DIR)/include -c $< -o $(BUILD)/bin/m53_nslibs_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_nslibs_smoke.o \
@@ -1030,12 +1037,12 @@ $(BUILD)/bin/m53_nslibs_smoke: bin/m53_nslibs_smoke.c $(BESPOKE_LIBDEP) $(if $(B
 # and applies its R_X86_64_RELATIVE relocations. --no-dynamic-linker keeps it
 # interp-less; the linker's default layout puts the ELF header in the first
 # PT_LOAD (entry at a non-zero vaddr) with no custom script.
-$(BUILD)/bin/m30_pie: bin/m30_pie.c
+$(BUILD)/bin/m30_pie: bin/helpers/m30_pie.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $(BUILD)/bin/m30_pie.o
 	$(LD) $(LDFLAGS) -pie --no-dynamic-linker -z norelro -o $@ $(BUILD)/bin/m30_pie.o
 
-$(BUILD)/bin/m30_dynamic: bin/m30_dynamic.c $(MUSL_LIBSO) $(MUSL_CRT1)
+$(BUILD)/bin/m30_dynamic: bin/helpers/m30_dynamic.c $(MUSL_LIBSO) $(MUSL_CRT1)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $(BUILD)/bin/m30_dynamic.o
 	$(LD) $(LDFLAGS) -pie -z norelro --hash-style=sysv --dynamic-linker /lib/ld-musl-x86_64.so.1 \
@@ -1053,7 +1060,7 @@ $(BUILD)/bin/m30_dynamic: bin/m30_dynamic.c $(MUSL_LIBSO) $(MUSL_CRT1)
 # crucially, starts .text at a non-zero vaddr. A custom "= 0" script put the
 # first exported function at st_value 0, which musl's dlsym (find_sym2) rejects
 # as undefined — dlopen would succeed but dlsym("m69_plugin_add") return NULL.
-$(BUILD)/bin/m69_plugin.so: bin/m69_plugin.c $(MUSL_LIBSO)
+$(BUILD)/bin/m69_plugin.so: bin/helpers/m69_plugin.c $(MUSL_LIBSO)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $(BUILD)/bin/m69_plugin.o
 	$(LD) $(LDFLAGS) -shared -z norelro --hash-style=gnu -soname m69_plugin.so \
@@ -1133,19 +1140,19 @@ endif
 	@mkdir -p $(ROOTFS)/etc
 	@printf "root:x:0:0:root:/root:/bin/zsh\nuser:x:1000:1000:b1nix user:/home/user:/bin/zsh\npamtest:x:1001:1001:M104 PAM smoke test account:/home/pamtest:/bin/sh\n" > $(ROOTFS)/etc/passwd
 	@# M108: three accounts for the BusyBox su/passwd smoke
-	@# (userspace/bin/m108_smoke.c), kept apart from root/user/pamtest so the
+	@# (userspace/bin/smoke/m108_smoke.c), kept apart from root/user/pamtest so the
 	@# test never touches a credential another test depends on.
 	@#   m108user  the *caller* in the unprivileged su test. Its login shell is
-	@#             /bin/m108shell, a two-line script that announces itself — that
-	@#             is how the test proves su ran THE ACCOUNT'S shell rather than
-	@#             whatever shell it happened to inherit.
+	@#             /bin/m108shell, a small ELF that prints its own argv[0] — that
+	@#             is how the test proves su ran THE ACCOUNT'S shell, with the
+	@#             login '-' prefix, rather than whatever shell it inherited.
 	@#   m108peer  the su *target*.
 	@#   m108pw    the account whose password `passwd` rewrites.
 	@printf "m108user:x:1002:1002:M108 su caller:/home/m108user:/bin/m108shell\nm108peer:x:1003:1003:M108 su target:/home/m108peer:/bin/sh\nm108pw:x:1004:1004:M108 passwd target:/home/m108pw:/bin/sh\n" >> $(ROOTFS)/etc/passwd
 	@mkdir -p $(ROOTFS)/home/m108user $(ROOTFS)/home/m108peer $(ROOTFS)/home/m108pw
 	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:0:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:0:0:99999:7:::\n' > $(ROOTFS)/etc/shadow
 	@# M104: dedicated /etc/shadow entry for the OpenPAM smoke test
-	@# (userspace/bin/m104_pam_smoke.c) — a real SHA-512 "$$6$$" hash of the
+	@# (userspace/bin/smoke/m104_pam_smoke.c) — a real SHA-512 "$$6$$" hash of the
 	@# known plaintext "PamSmoke123!" (generated on the host with
 	@# `openssl passwd -6 -salt pamtestsalt 'PamSmoke123!'`), kept separate
 	@# from root/user so this test never depends on — or risks perturbing —
@@ -1169,16 +1176,22 @@ endif
 	@cp -R rootfs-overlay/. $(ROOTFS)/
 	@# BusyBox applet symlinks: every command in applet-manifest.conf (M42) is
 	@# "upstream" (native in-kernel dispatch was retired with the Ring 3 init
-	@# rewrite), so they become /bin/<cmd> -> /opt/busybox/bin/busybox — except
-	@# id/whoami/chown/chmod, which BINARIES already installs as dedicated real
-	@# ELFs; symlinking those too would race cp (dangling-symlink refusal) or,
-	@# worse, have cp write a real binary's bytes through the symlink into the
-	@# busybox ELF itself. 'sh'/'ash' aren't in the manifest (it only covers
-	@# coreutils) but every script here execve()s /bin/sh directly, so add them
-	@# explicitly.
+	@# rewrite), so they become /bin/<cmd> -> /opt/busybox/bin/busybox.
+	@# 'sh'/'ash' aren't in the manifest (it only covers coreutils) but every
+	@# script here execve()s /bin/sh directly, so add them explicitly.
+	@# M108: there is no exception list any more. Every name the manifest claims
+	@# for BusyBox really resolves to the multicall ELF — the dedicated ELFs that
+	@# used to shadow chmod/chown/id/whoami/groups/halt/setfattr are deleted, so
+	@# the symlink can no longer race cp or have cp write a binary's bytes
+	@# through it into the busybox ELF. The rm below clears any stale copy left
+	@# in an incrementally built rootfs.
+	@rm -f $(ROOTFS)/bin/id $(ROOTFS)/bin/whoami $(ROOTFS)/bin/groups \
+	       $(ROOTFS)/bin/chmod $(ROOTFS)/bin/chown $(ROOTFS)/bin/halt \
+	       $(ROOTFS)/bin/setfattr $(ROOTFS)/bin/meminfo \
+	       $(ROOTFS)/bin/useradd $(ROOTFS)/bin/userdel $(ROOTFS)/bin/groupadd
 	@mkdir -p $(ROOTFS)/bin
 	@awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$1); gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); if ($$2 == "upstream") print $$1; }' ../tools/configs/applet-manifest.conf | \
-		grep -vE '^(id|whoami|chown|chmod|su|passwd|login)$$' | \
+		grep -vE '^(su|passwd|login)$$' | \
 		while read -r cmd; do ln -sfn /opt/busybox/bin/busybox "$(ROOTFS)/bin/$$cmd"; done
 	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/bin/sh
 	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/bin/ash

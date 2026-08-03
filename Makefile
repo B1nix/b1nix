@@ -187,7 +187,7 @@ EMBEDDED_USER_PROGRAMS := \
 	gpaint \
 	gdesktop \
 	gabout \
-	su passwd groups useradd userdel groupadd halt setfattr telinit
+	telinit
 
 ifeq ($(ARCH),x86_64)
 # m64_clang_smoke is x86_64-only: the clang frontend links against LLVM libc++,
@@ -689,7 +689,8 @@ $(BUILD_DIR)/.userspace-headers-installed: \
 # freetype, cairo, xkbcommon, harfbuzz, fontconfig, expat, libjpeg, libpng,
 # libwebp, libvpx, all NetSurf platform libs, tinygl, libidn2).
 $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
-	$(wildcard userspace/bin/*.c) $(wildcard userspace/bin/*.S) \
+	$(wildcard userspace/bin/*/*.c) $(wildcard userspace/bin/*/*.cpp) \
+	$(wildcard userspace/bin/*/*.S) \
 	$(wildcard userspace/src/*.c) \
 	$(wildcard userspace/b1cc/src/*.c) \
 	$(wildcard userspace/displayd/*.c) \
@@ -724,12 +725,12 @@ $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 
 
 
-$(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S $(USERSPACE_DEPS)
+$(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/helpers/native_smoke.S $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/native_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_native_smoke_elf userspace/build/$(ARCH)/bin/native_smoke > $@
 
-$(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/b1cc_m34_corpus.c userspace/Makefile $(wildcard userspace/b1cc/tests/*.c) $(USERSPACE_DEPS)
+$(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/compiler/b1cc_m34_corpus.c userspace/Makefile $(wildcard userspace/b1cc/tests/*.c) $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(ARCH) sh tools/images/gen_b1cc_m34_initramfs.sh $@
 
@@ -740,7 +741,13 @@ $(INC_DIR)/initramfs_displayd.inc: $(DISPLAYD_SRCS) $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_displayd_elf userspace/build/$(ARCH)/bin/displayd > $@
 
-$(INC_DIR)/initramfs_%.inc: userspace/bin/%.c $(USERSPACE_DEPS)
+# userspace/bin is grouped by purpose (see userspace/Makefile's BIN_CATS), so a
+# program's source is looked up by name rather than assumed to sit at a fixed
+# path — moving one between categories does not touch this rule.
+USER_BIN_CATS := smoke gfx helpers tools gui compiler
+user_bin_src = $(firstword $(wildcard $(addsuffix /$(1).c,$(addprefix userspace/bin/,$(USER_BIN_CATS)))))
+.SECONDEXPANSION:
+$(INC_DIR)/initramfs_%.inc: $$(call user_bin_src,$$*) $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/$*
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_$*_elf userspace/build/$(ARCH)/bin/$* > $@
@@ -764,7 +771,7 @@ $(INC_DIR)/initramfs_b1cc_selfhost.inc: $(USERSPACE_DEPS) $(B1CC_SELFHOST_SRCS)
 # Depends on $(CURL_ELF): building curl (with B1NIX_TLS=mbedtls) produces the
 # static mbedTLS archives that m32_nettool's tls-server links against, so curl
 # must build first to guarantee the libs exist.
-$(INC_DIR)/initramfs_m32_nettool.inc: userspace/bin/m32_nettool.c $(USERSPACE_DEPS) $(CURL_ELF)
+$(INC_DIR)/initramfs_m32_nettool.inc: userspace/bin/helpers/m32_nettool.c $(USERSPACE_DEPS) $(CURL_ELF)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m32_nettool_elf userspace/build/$(ARCH)/bin/m32_nettool > $@
 
@@ -781,14 +788,14 @@ $(LIBM_LIB): tools/ports/build-openlibm.sh
 # M58: /bin/js embeds Duktape and links the ported openlibm — so libm must be
 # built before js. js.c links duktape.c (a vendored amalgamation under
 # userspace/duktape/), both compiled by the userspace Makefile's custom rule.
-$(INC_DIR)/initramfs_js.inc: userspace/bin/js.c userspace/duktape/duktape.c \
+$(INC_DIR)/initramfs_js.inc: userspace/bin/tools/js.c userspace/duktape/duktape.c \
 		userspace/duktape/duktape.h userspace/duktape/duk_config.h \
 		$(USERSPACE_DEPS) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/js
 	xxd -i -n vfs_js_elf userspace/build/$(ARCH)/bin/js > $@
 
-$(INC_DIR)/initramfs_m51_smoke.inc: userspace/bin/m51_smoke.c $(USERSPACE_DEPS) $(LIBM_LIB)
+$(INC_DIR)/initramfs_m51_smoke.inc: userspace/bin/gfx/m51_smoke.c $(USERSPACE_DEPS) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_smoke
 	xxd -i -n vfs_m51_smoke_elf userspace/build/$(ARCH)/bin/m51_smoke > $@
@@ -798,7 +805,7 @@ PIXMAN_LIB := build/$(ARCH)/ports/pixman/install/lib/libpixman-1.a
 $(PIXMAN_LIB): tools/ports/build-pixman.sh tools/ports/build-openlibm.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-pixman.sh >/dev/null
 
-$(INC_DIR)/initramfs_m51_pixman_smoke.inc: userspace/bin/m51_pixman_smoke.c $(USERSPACE_DEPS) $(PIXMAN_LIB) $(LIBM_LIB)
+$(INC_DIR)/initramfs_m51_pixman_smoke.inc: userspace/bin/gfx/m51_pixman_smoke.c $(USERSPACE_DEPS) $(PIXMAN_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_pixman_smoke
 	xxd -i -n vfs_m51_pixman_smoke_elf userspace/build/$(ARCH)/bin/m51_pixman_smoke > $@
@@ -808,7 +815,7 @@ FREETYPE_LIB := build/$(ARCH)/ports/freetype/install/lib/libfreetype.a
 $(FREETYPE_LIB): tools/ports/build-freetype.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-freetype.sh >/dev/null
 
-$(INC_DIR)/initramfs_m51_freetype_smoke.inc: userspace/bin/m51_freetype_smoke.c $(USERSPACE_DEPS) $(FREETYPE_LIB) $(LIBM_LIB)
+$(INC_DIR)/initramfs_m51_freetype_smoke.inc: userspace/bin/gfx/m51_freetype_smoke.c $(USERSPACE_DEPS) $(FREETYPE_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_freetype_smoke
 	xxd -i -n vfs_m51_freetype_smoke_elf userspace/build/$(ARCH)/bin/m51_freetype_smoke > $@
@@ -818,12 +825,12 @@ CAIRO_LIB := build/$(ARCH)/ports/cairo/install/lib/libcairo.a
 $(CAIRO_LIB): tools/ports/build-cairo.sh $(PIXMAN_LIB) $(FREETYPE_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-cairo.sh >/dev/null
 
-$(INC_DIR)/initramfs_m51_cairo_smoke.inc: userspace/bin/m51_cairo_smoke.c $(USERSPACE_DEPS) $(CAIRO_LIB) $(FREETYPE_LIB) $(PIXMAN_LIB) $(LIBM_LIB)
+$(INC_DIR)/initramfs_m51_cairo_smoke.inc: userspace/bin/gfx/m51_cairo_smoke.c $(USERSPACE_DEPS) $(CAIRO_LIB) $(FREETYPE_LIB) $(PIXMAN_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_cairo_smoke
 	xxd -i -n vfs_m51_cairo_smoke_elf userspace/build/$(ARCH)/bin/m51_cairo_smoke > $@
 
-$(INC_DIR)/initramfs_m51_cairo_wayland.inc: userspace/bin/m51_cairo_wayland.c $(USERSPACE_DEPS) $(CAIRO_LIB) $(FREETYPE_LIB) $(PIXMAN_LIB) $(LIBM_LIB)
+$(INC_DIR)/initramfs_m51_cairo_wayland.inc: userspace/bin/gfx/m51_cairo_wayland.c $(USERSPACE_DEPS) $(CAIRO_LIB) $(FREETYPE_LIB) $(PIXMAN_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_cairo_wayland
 	xxd -i -n vfs_m51_cairo_wayland_elf userspace/build/$(ARCH)/bin/m51_cairo_wayland > $@
@@ -833,7 +840,7 @@ XKB_LIB := build/$(ARCH)/ports/xkbcommon/install/lib/libxkbcommon.a
 $(XKB_LIB): tools/ports/build-xkbcommon.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-xkbcommon.sh >/dev/null
 
-$(INC_DIR)/initramfs_m51_xkb_smoke.inc: userspace/bin/m51_xkb_smoke.c $(USERSPACE_DEPS) $(XKB_LIB)
+$(INC_DIR)/initramfs_m51_xkb_smoke.inc: userspace/bin/gfx/m51_xkb_smoke.c $(USERSPACE_DEPS) $(XKB_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_xkb_smoke
 	xxd -i -n vfs_m51_xkb_smoke_elf userspace/build/$(ARCH)/bin/m51_xkb_smoke > $@
@@ -855,7 +862,7 @@ HB_LIB := build/$(ARCH)/ports/harfbuzz/install/lib/libharfbuzz.a
 $(HB_LIB): tools/ports/build-harfbuzz.sh $(MUSL_LIBCXX_STAMP)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-harfbuzz.sh >/dev/null
 
-$(INC_DIR)/initramfs_m51_harfbuzz_smoke.inc: userspace/bin/m51_harfbuzz_smoke.c $(USERSPACE_DEPS) $(HB_LIB) $(LIBM_LIB)
+$(INC_DIR)/initramfs_m51_harfbuzz_smoke.inc: userspace/bin/gfx/m51_harfbuzz_smoke.c $(USERSPACE_DEPS) $(HB_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_harfbuzz_smoke
 	xxd -i -n vfs_m51_harfbuzz_smoke_elf userspace/build/$(ARCH)/bin/m51_harfbuzz_smoke > $@
@@ -868,7 +875,7 @@ FONTCONFIG_LIB := build/$(ARCH)/ports/fontconfig/install/lib/libfontconfig.a
 $(FONTCONFIG_LIB): tools/ports/build-fontconfig.sh $(EXPAT_LIB) $(FREETYPE_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-fontconfig.sh >/dev/null
 
-$(INC_DIR)/initramfs_m51_fontconfig_smoke.inc: userspace/bin/m51_fontconfig_smoke.c $(USERSPACE_DEPS) $(FONTCONFIG_LIB) $(EXPAT_LIB) $(FREETYPE_LIB) $(LIBM_LIB)
+$(INC_DIR)/initramfs_m51_fontconfig_smoke.inc: userspace/bin/gfx/m51_fontconfig_smoke.c $(USERSPACE_DEPS) $(FONTCONFIG_LIB) $(EXPAT_LIB) $(FREETYPE_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_fontconfig_smoke
 	xxd -i -n vfs_m51_fontconfig_smoke_elf userspace/build/$(ARCH)/bin/m51_fontconfig_smoke > $@
@@ -881,7 +888,7 @@ $(TINYGL_LIB): tools/ports/build-tinygl.sh userspace/libegl/b1egl.c userspace/in
 # ── C++ / Mesa / Skia / Mesa-VirGL .inc rules ──
 # Skipped under musl: these need libc++/libstdc++ which has not been built
 # against musl yet. Placeholder .inc files are pre-created in the build dir.
-$(INC_DIR)/initramfs_m52_gl_smoke.inc: userspace/bin/m52_gl_smoke.c $(USERSPACE_DEPS) $(TINYGL_LIB) $(LIBM_LIB)
+$(INC_DIR)/initramfs_m52_gl_smoke.inc: userspace/bin/gfx/m52_gl_smoke.c $(USERSPACE_DEPS) $(TINYGL_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m52_gl_smoke
 	xxd -i -n vfs_m52_gl_smoke_elf userspace/build/$(ARCH)/bin/m52_gl_smoke > $@
@@ -921,7 +928,7 @@ $(BUILD_DIR)/.mesa-built: tools/ports/build-mesa.sh $(BUILD_DIR)/.userspace-head
 
 # M52: real Mesa OSMesa (software OpenGL) demo. The shared demo builder builds
 # the whole Mesa stack (build-mesa.sh) and links the demo against it.
-$(INC_DIR)/initramfs_m52_osmesa.inc: userspace/bin/m52_osmesa.c tools/demos/build-m52-mesa-demo.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
+$(INC_DIR)/initramfs_m52_osmesa.inc: userspace/bin/gfx/m52_osmesa.c tools/demos/build-m52-mesa-demo.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
 	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_osmesa userspace/build/$(ARCH)/bin/m52_osmesa
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_osmesa_elf userspace/build/$(ARCH)/bin/m52_osmesa > $@
@@ -929,14 +936,14 @@ $(INC_DIR)/initramfs_m52_osmesa.inc: userspace/bin/m52_osmesa.c tools/demos/buil
 # M53 variant B: Mesa's gallium virgl driver renders on the host GPU through the
 # b1nix /dev/virtio-gpu winsys. tools/demos/build-m53-mesa-virgl.sh builds the Mesa
 # stack (with the virgl driver) and links the pipe-API render test against it.
-$(INC_DIR)/initramfs_m53_mesa_virgl.inc: userspace/bin/m53_mesa_virgl.c tools/demos/build-m53-mesa-virgl.sh $(BUILD_DIR)/.mesa-built $(wildcard tools/patches/mesa/files/src/gallium/winsys/virgl/b1nix/*) $(USERSPACE_DEPS)
+$(INC_DIR)/initramfs_m53_mesa_virgl.inc: userspace/bin/gfx/m53_mesa_virgl.c tools/demos/build-m53-mesa-virgl.sh $(BUILD_DIR)/.mesa-built $(wildcard tools/patches/mesa/files/src/gallium/winsys/virgl/b1nix/*) $(USERSPACE_DEPS)
 	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m53-mesa-virgl.sh userspace/build/$(ARCH)/bin/m53_mesa_virgl
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m53_mesa_virgl_elf userspace/build/$(ARCH)/bin/m53_mesa_virgl > $@
 
 # M52: programmable GLSL shader demo, sharing the same Mesa build as the OSMesa
 # demo. Exercises the GL 2.x programmable pipeline (shaders, VBOs, varyings).
-$(INC_DIR)/initramfs_m52_glsl.inc: userspace/bin/m52_glsl.c tools/demos/build-m52-mesa-demo.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
+$(INC_DIR)/initramfs_m52_glsl.inc: userspace/bin/gfx/m52_glsl.c tools/demos/build-m52-mesa-demo.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
 	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_glsl userspace/build/$(ARCH)/bin/m52_glsl
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_glsl_elf userspace/build/$(ARCH)/bin/m52_glsl > $@
@@ -945,7 +952,7 @@ $(INC_DIR)/initramfs_m52_glsl.inc: userspace/bin/m52_glsl.c tools/demos/build-m5
 # the OSMesa-backed EGL implementation (userspace/libegl/b1egl_mesa.c) together
 # with the off-screen pbuffer smoke and links them against the same Mesa stack
 # as the M52 OSMesa demo. The smoke renders entirely off-screen (no displayd).
-$(INC_DIR)/initramfs_m59_smoke.inc: userspace/bin/m59_smoke.c userspace/libegl/b1egl_mesa.c userspace/include/EGL/egl.h tools/demos/build-m59-egl.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
+$(INC_DIR)/initramfs_m59_smoke.inc: userspace/bin/gfx/m59_smoke.c userspace/libegl/b1egl_mesa.c userspace/include/EGL/egl.h tools/demos/build-m59-egl.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) B1NIX_CXX_STDLIB=libc++ tools/demos/build-m59-egl.sh userspace/build/$(ARCH)/bin/m59_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m59_smoke_elf userspace/build/$(ARCH)/bin/m59_smoke > $@
@@ -1004,7 +1011,7 @@ $(INC_DIR)/initramfs_m55_litehtml.inc: userspace/bin/m55_litehtml.cpp tools/demo
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m55_litehtml_elf userspace/build/$(ARCH)/bin/m55_litehtml > $@
 
-$(INC_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
+$(INC_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/smoke/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke
 	xxd -i -n vfs_m32_pcre2_smoke_elf userspace/build/$(ARCH)/bin/m32_pcre2_smoke > $@
@@ -1014,7 +1021,7 @@ ZLIB_LIB := build/$(ARCH)/ports/zlib/install/lib/libz.a
 $(ZLIB_LIB): tools/ports/build-zlib.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-zlib.sh >/dev/null
 
-$(INC_DIR)/initramfs_m53_zlib_smoke.inc: userspace/bin/m53_zlib_smoke.c $(USERSPACE_DEPS) $(ZLIB_LIB)
+$(INC_DIR)/initramfs_m53_zlib_smoke.inc: userspace/bin/gfx/m53_zlib_smoke.c $(USERSPACE_DEPS) $(ZLIB_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_zlib_smoke
 	xxd -i -n vfs_m53_zlib_smoke_elf userspace/build/$(ARCH)/bin/m53_zlib_smoke > $@
@@ -1024,7 +1031,7 @@ LIBPNG_LIB := build/$(ARCH)/ports/libpng/install/lib/libpng16.a
 $(LIBPNG_LIB): tools/ports/build-libpng.sh $(ZLIB_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libpng.sh >/dev/null
 
-$(INC_DIR)/initramfs_m53_libpng_smoke.inc: userspace/bin/m53_libpng_smoke.c $(USERSPACE_DEPS) $(LIBPNG_LIB) $(ZLIB_LIB) $(LIBM_LIB)
+$(INC_DIR)/initramfs_m53_libpng_smoke.inc: userspace/bin/gfx/m53_libpng_smoke.c $(USERSPACE_DEPS) $(LIBPNG_LIB) $(ZLIB_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libpng_smoke
 	xxd -i -n vfs_m53_libpng_smoke_elf userspace/build/$(ARCH)/bin/m53_libpng_smoke > $@
@@ -1034,7 +1041,7 @@ LIBJPEG_LIB := build/$(ARCH)/ports/libjpeg/install/lib/libjpeg.a
 $(LIBJPEG_LIB): tools/ports/build-libjpeg.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libjpeg.sh >/dev/null
 
-$(INC_DIR)/initramfs_m53_libjpeg_smoke.inc: userspace/bin/m53_libjpeg_smoke.c $(USERSPACE_DEPS) $(LIBJPEG_LIB)
+$(INC_DIR)/initramfs_m53_libjpeg_smoke.inc: userspace/bin/gfx/m53_libjpeg_smoke.c $(USERSPACE_DEPS) $(LIBJPEG_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libjpeg_smoke
 	xxd -i -n vfs_m53_libjpeg_smoke_elf userspace/build/$(ARCH)/bin/m53_libjpeg_smoke > $@
@@ -1044,7 +1051,7 @@ LIBWEBP_LIB := build/$(ARCH)/ports/libwebp/install/lib/libwebp.a
 $(LIBWEBP_LIB): tools/ports/build-libwebp.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libwebp.sh >/dev/null
 
-$(INC_DIR)/initramfs_m53_libwebp_smoke.inc: userspace/bin/m53_libwebp_smoke.c $(USERSPACE_DEPS) $(LIBWEBP_LIB) $(LIBM_LIB)
+$(INC_DIR)/initramfs_m53_libwebp_smoke.inc: userspace/bin/gfx/m53_libwebp_smoke.c $(USERSPACE_DEPS) $(LIBWEBP_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libwebp_smoke
 	xxd -i -n vfs_m53_libwebp_smoke_elf userspace/build/$(ARCH)/bin/m53_libwebp_smoke > $@
@@ -1054,7 +1061,7 @@ LIBVPX_LIB := build/$(ARCH)/ports/libvpx/install/lib/libvpx.a
 $(LIBVPX_LIB): tools/ports/build-libvpx.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libvpx.sh >/dev/null
 
-$(INC_DIR)/initramfs_m53_libvpx_smoke.inc: userspace/bin/m53_libvpx_smoke.c $(USERSPACE_DEPS) $(LIBVPX_LIB) $(LIBWEBP_LIB) $(LIBM_LIB)
+$(INC_DIR)/initramfs_m53_libvpx_smoke.inc: userspace/bin/gfx/m53_libvpx_smoke.c $(USERSPACE_DEPS) $(LIBVPX_LIB) $(LIBWEBP_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libvpx_smoke
 	xxd -i -n vfs_m53_libvpx_smoke_elf userspace/build/$(ARCH)/bin/m53_libvpx_smoke > $@
@@ -1064,7 +1071,7 @@ LWC_LIB := build/$(ARCH)/ports/libwapcaplet/install/lib/liblwc.a
 $(LWC_LIB): tools/ports/build-libwapcaplet.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libwapcaplet.sh >/dev/null
 
-$(INC_DIR)/initramfs_m53_wapcaplet_smoke.inc: userspace/bin/m53_wapcaplet_smoke.c $(USERSPACE_DEPS) $(LWC_LIB)
+$(INC_DIR)/initramfs_m53_wapcaplet_smoke.inc: userspace/bin/gfx/m53_wapcaplet_smoke.c $(USERSPACE_DEPS) $(LWC_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_wapcaplet_smoke
 	xxd -i -n vfs_m53_wapcaplet_smoke_elf userspace/build/$(ARCH)/bin/m53_wapcaplet_smoke > $@
 
@@ -1073,7 +1080,7 @@ PU_LIB := build/$(ARCH)/ports/libparserutils/install/lib/libparserutils.a
 $(PU_LIB): tools/ports/build-libparserutils.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libparserutils.sh >/dev/null
 
-$(INC_DIR)/initramfs_m53_parserutils_smoke.inc: userspace/bin/m53_parserutils_smoke.c $(USERSPACE_DEPS) $(PU_LIB)
+$(INC_DIR)/initramfs_m53_parserutils_smoke.inc: userspace/bin/gfx/m53_parserutils_smoke.c $(USERSPACE_DEPS) $(PU_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_parserutils_smoke
 	xxd -i -n vfs_m53_parserutils_smoke_elf userspace/build/$(ARCH)/bin/m53_parserutils_smoke > $@
 
@@ -1082,7 +1089,7 @@ HUBBUB_LIB := build/$(ARCH)/ports/libhubbub/install/lib/libhubbub.a
 $(HUBBUB_LIB): tools/ports/build-libhubbub.sh $(PU_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libhubbub.sh >/dev/null
 
-$(INC_DIR)/initramfs_m53_hubbub_smoke.inc: userspace/bin/m53_hubbub_smoke.c $(USERSPACE_DEPS) $(HUBBUB_LIB) $(PU_LIB)
+$(INC_DIR)/initramfs_m53_hubbub_smoke.inc: userspace/bin/gfx/m53_hubbub_smoke.c $(USERSPACE_DEPS) $(HUBBUB_LIB) $(PU_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_hubbub_smoke
 	xxd -i -n vfs_m53_hubbub_smoke_elf userspace/build/$(ARCH)/bin/m53_hubbub_smoke > $@
 
@@ -1091,7 +1098,7 @@ LIBCSS_LIB := build/$(ARCH)/ports/libcss/install/lib/libcss.a
 $(LIBCSS_LIB): tools/ports/build-libcss.sh $(LWC_LIB) $(PU_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libcss.sh >/dev/null
 
-$(INC_DIR)/initramfs_m53_libcss_smoke.inc: userspace/bin/m53_libcss_smoke.c $(USERSPACE_DEPS) $(LIBCSS_LIB) $(LWC_LIB) $(PU_LIB)
+$(INC_DIR)/initramfs_m53_libcss_smoke.inc: userspace/bin/gfx/m53_libcss_smoke.c $(USERSPACE_DEPS) $(LIBCSS_LIB) $(LWC_LIB) $(PU_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libcss_smoke
 	xxd -i -n vfs_m53_libcss_smoke_elf userspace/build/$(ARCH)/bin/m53_libcss_smoke > $@
 
@@ -1100,7 +1107,7 @@ LIBDOM_LIB := build/$(ARCH)/ports/libdom/install/lib/libdom.a
 $(LIBDOM_LIB): tools/ports/build-libdom.sh $(HUBBUB_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libdom.sh >/dev/null
 
-$(INC_DIR)/initramfs_m53_libdom_smoke.inc: userspace/bin/m53_libdom_smoke.c $(USERSPACE_DEPS) $(LIBDOM_LIB) $(HUBBUB_LIB) $(PU_LIB) $(LWC_LIB)
+$(INC_DIR)/initramfs_m53_libdom_smoke.inc: userspace/bin/gfx/m53_libdom_smoke.c $(USERSPACE_DEPS) $(LIBDOM_LIB) $(HUBBUB_LIB) $(PU_LIB) $(LWC_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libdom_smoke
 	xxd -i -n vfs_m53_libdom_smoke_elf userspace/build/$(ARCH)/bin/m53_libdom_smoke > $@
 
@@ -1118,12 +1125,12 @@ $(NSBMP_LIB): tools/ports/build-libnsbmp.sh
 $(NSLOG_LIB): tools/ports/build-libnslog.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libnslog.sh >/dev/null
 
-$(INC_DIR)/initramfs_m53_nslibs_smoke.inc: userspace/bin/m53_nslibs_smoke.c $(USERSPACE_DEPS) $(NSUTILS_LIB) $(NSGIF_LIB) $(NSBMP_LIB) $(NSLOG_LIB)
+$(INC_DIR)/initramfs_m53_nslibs_smoke.inc: userspace/bin/gfx/m53_nslibs_smoke.c $(USERSPACE_DEPS) $(NSUTILS_LIB) $(NSGIF_LIB) $(NSBMP_LIB) $(NSLOG_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_nslibs_smoke
 	xxd -i -n vfs_m53_nslibs_smoke_elf userspace/build/$(ARCH)/bin/m53_nslibs_smoke > $@
 
 # M53: userspace VirGL smoke — drives /dev/virtio-gpu (host-GPU-accelerated 3D).
-$(INC_DIR)/initramfs_m53_virgl_smoke.inc: userspace/bin/m53_virgl_smoke.c $(USERSPACE_DEPS)
+$(INC_DIR)/initramfs_m53_virgl_smoke.inc: userspace/bin/gfx/m53_virgl_smoke.c $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_virgl_smoke
 	xxd -i -n vfs_m53_virgl_smoke_elf userspace/build/$(ARCH)/bin/m53_virgl_smoke > $@
@@ -1219,7 +1226,7 @@ $(INITRAMFS_M67_RUST_INC): tools/m67/hello_b1nix.elf
 
 # M53: the loopback HTTPS server links mbedTLS; depend on NSFB_ELF so curl ->
 # mbedTLS is built (its archives present) before this binary is embedded.
-$(INC_DIR)/initramfs_m53_httpsd.inc: userspace/bin/m53_httpsd.c $(USERSPACE_DEPS) $(NSFB_ELF)
+$(INC_DIR)/initramfs_m53_httpsd.inc: userspace/bin/gfx/m53_httpsd.c $(USERSPACE_DEPS) $(NSFB_ELF)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_httpsd
 	xxd -i -n vfs_m53_httpsd_elf userspace/build/$(ARCH)/bin/m53_httpsd > $@
 
@@ -1246,12 +1253,12 @@ $(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem
 	xxd -i -n vfs_tls_server_cert_pem $(TLS_TEST_DIR)/server-cert.pem >> $@
 	xxd -i -n vfs_tls_server_key_pem $(TLS_TEST_DIR)/server-key.pem >> $@
 
-$(INC_DIR)/initramfs_m30_pie.inc: userspace/bin/m30_pie.c $(USERSPACE_DEPS)
+$(INC_DIR)/initramfs_m30_pie.inc: userspace/bin/helpers/m30_pie.c $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m30_pie
 	xxd -i -n vfs_m30_pie_elf userspace/build/$(ARCH)/bin/m30_pie > $@
 
-$(INC_DIR)/initramfs_m30_dynamic.inc: userspace/bin/m30_dynamic.c $(USERSPACE_DEPS)
+$(INC_DIR)/initramfs_m30_dynamic.inc: userspace/bin/helpers/m30_dynamic.c $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m30_dynamic
 	xxd -i -n vfs_m30_dynamic_elf userspace/build/$(ARCH)/bin/m30_dynamic > $@
@@ -1266,32 +1273,32 @@ $(INITRAMFS_LD_MUSL_INC): $(LIBC_SO)
 	xxd -i -n $(LIBC_INC_SYM) $(LIBC_SO) > $@
 endif
 
-$(INC_DIR)/initramfs_m92_musl_dyn_smoke.inc: userspace/bin/m92_musl_dyn_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_m92_musl_dyn_smoke.inc: userspace/bin/helpers/m92_musl_dyn_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-dyn-smoke
 	xxd -i -n vfs_m92_musl_dyn_smoke_elf $(BUILD_DIR)/m92-musl-dyn-smoke > $@
 
-$(INC_DIR)/initramfs_m92_musl_ldso_smoke.inc: userspace/bin/m92_musl_ldso_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_m92_musl_ldso_smoke.inc: userspace/bin/helpers/m92_musl_ldso_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -ldso $< -o $(BUILD_DIR)/m92-musl-ldso-smoke
 	xxd -i -n vfs_m92_musl_ldso_smoke_elf $(BUILD_DIR)/m92-musl-ldso-smoke > $@
 
-$(INC_DIR)/initramfs_musl_posix_smoke.inc: userspace/bin/musl_posix_smoke.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_musl_posix_smoke.inc: userspace/bin/smoke/musl_posix_smoke.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/musl-posix-smoke
 	xxd -i -n vfs_musl_posix_smoke_elf $(BUILD_DIR)/musl-posix-smoke > $@
 
-$(INC_DIR)/initramfs_m92_musl_hello.inc: userspace/bin/m92_musl_hello.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_m92_musl_hello.inc: userspace/bin/helpers/m92_musl_hello.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-hello
 	xxd -i -n vfs_m92_musl_hello_elf $(BUILD_DIR)/m92-musl-hello > $@
 
-$(INC_DIR)/initramfs_m92_musl_step2.inc: userspace/bin/m92_musl_step2.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_m92_musl_step2.inc: userspace/bin/helpers/m92_musl_step2.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-step2
 	xxd -i -n vfs_m92_musl_step2_elf $(BUILD_DIR)/m92-musl-step2 > $@
 
-$(INC_DIR)/initramfs_m92_musl_raw_diag.inc: userspace/bin/m92_musl_raw_diag.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+$(INC_DIR)/initramfs_m92_musl_raw_diag.inc: userspace/bin/helpers/m92_musl_raw_diag.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-raw-diag
 	xxd -i -n vfs_m92_musl_raw_diag_elf $(BUILD_DIR)/m92-musl-raw-diag > $@
@@ -1667,7 +1674,7 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	@# lines as the sshd/m104 policies — the point of the test is that a password
 	@# BusyBox's `passwd` wrote is accepted by this very module.
 	@mkdir -p $(BUILD_DIR)/rootfs/etc/pam.d
-	@printf '# M108 smoke policy (userspace/bin/m108_smoke.c): pam_unix.so reads\n# the same /etc/shadow "$$6$$" hashes BusyBox su/passwd read and write.\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(BUILD_DIR)/rootfs/etc/pam.d/m108-smoke
+	@printf '# M108 smoke policy (userspace/bin/smoke/m108_smoke.c): pam_unix.so reads\n# the same /etc/shadow "$$6$$" hashes BusyBox su/passwd read and write.\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(BUILD_DIR)/rootfs/etc/pam.d/m108-smoke
 	@# M108: the su/passwd/init smoke ELF links libpam.so.2 as DT_NEEDED, same
 	@# bespoke rule as m104_pam_smoke, so build + stage it the same way.
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m108_smoke >/dev/null 2>&1 || true

@@ -356,7 +356,9 @@ static void check_su_uid_and_shell(void)
 	}
 	/* Only /bin/m108shell prints this, and only /etc/passwd's entry for
 	 * m108user points su at it — so seeing it means su execed the account's
-	 * own login shell (argv[0] carries the login '-' prefix). */
+	 * own login shell. m108shell is an ELF precisely so the login '-' prefix
+	 * in argv[0] survives the exec and can be asserted here; a #!/bin/sh
+	 * script's $0 is its own path on b1nix as on Linux. */
 	if (strstr(out, "m108shell-argv0=-m108shell") == NULL) {
 		fail("su-uid-and-shell", "account's login shell did not run");
 		return;

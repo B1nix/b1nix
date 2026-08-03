@@ -107,6 +107,8 @@
 #define KDSKBENT       0x4B47
 #define GIO_FONT       0x4B60
 #define PIO_FONT       0x4B61
+#define GIO_FONTX      0x4B6B
+#define PIO_FONTX      0x4B6C
 #define KD_TEXT        0
 #define KD_GRAPHICS    1
 #define K_RAW          0x00
@@ -357,14 +359,17 @@ static void test_netlink_link(void) {
       unsigned char *addr = nl_find_attr(attrs, blen, IFLA_ADDRESS, &alen);
       if (name && strcmp(name, "lo") == 0 && ifi->ifi_type == 772)
         saw_lo = 1;
-      if (name && strncmp(name, "eth", 3) == 0 && ifi->ifi_type == 1) {
+      /* Only eth0 — the interface every ioctl here names. Latching whichever
+       * eth* came last left g_eth_ifindex pointing at the second NIC while the
+       * ioctls described the first, so the addr cross-check below compared two
+       * different interfaces and could never agree. */
+      if (name && strcmp(name, "eth0") == 0 && ifi->ifi_type == 1) {
         saw_eth = 1;
         g_eth_ifindex = ifi->ifi_index;
         if (addr && alen == 6) {
           memcpy(g_eth_mac, addr, 6);
           g_have_eth = 1;
-          if (have_ioctl_mac && memcmp(addr, ioctl_mac, 6) == 0)
-            mac_match = 1;
+          mac_match = have_ioctl_mac && memcmp(addr, ioctl_mac, 6) == 0;
         }
       }
     }
@@ -689,6 +694,184 @@ static void test_netlink_neigh(void) {
                permanent * 100 + del_err * 10 + still_there));
 }
 
+/* The IPv6 half of the same contract, against ndp.ko's neighbour cache. */
+static void test_netlink_neigh6(void) {
+  struct nl_sock s;
+  if (nl_open(&s) < 0) {
+    fail("netlink-neigh6", -1);
+    return;
+  }
+  /* 2001:db8::1 — the documentation prefix, so nothing real is shadowed. */
+  unsigned char ip6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                           0,    0,    0,    0,    0, 0, 0, 1};
+  unsigned char mac[6] = {0x02, 0x00, 0xDE, 0xAD, 0xBE, 0xF6};
+
+  struct {
+    struct nlmsghdr h;
+    struct ndmsg n;
+    unsigned char attrs[64];
+  } req;
+  size_t alen;
+  memset(&req, 0, sizeof(req));
+  req.h.nlmsg_type = RTM_NEWNEIGH;
+  req.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK;
+  req.h.nlmsg_seq = ++s.seq;
+  req.n.ndm_family = AF_INET6;
+  req.n.ndm_ifindex = g_eth_ifindex ? g_eth_ifindex : 1;
+  req.n.ndm_state = NUD_PERMANENT;
+  {
+    struct rtattr *a = (struct rtattr *)req.attrs;
+    a->rta_type = NDA_DST;
+    a->rta_len = RTA_LENGTH(16);
+    memcpy(RTA_DATA(a), ip6, 16);
+    alen = RTA_ALIGN(a->rta_len);
+    a = (struct rtattr *)(req.attrs + alen);
+    a->rta_type = NDA_LLADDR;
+    a->rta_len = RTA_LENGTH(6);
+    memcpy(RTA_DATA(a), mac, 6);
+    alen += RTA_ALIGN(a->rta_len);
+  }
+  req.h.nlmsg_len = (unsigned)(NLMSG_LENGTH(sizeof(struct ndmsg)) + alen);
+  int add_err = nl_talk(&s, &req, req.h.nlmsg_len);
+
+  static unsigned char buf[32768];
+  nl_send_dump(&s, RTM_GETNEIGH, AF_INET6);
+  int total = nl_recv_dump(&s, buf, sizeof(buf));
+  int found = 0, mac_ok = 0, permanent = 0, family_ok = 0;
+  size_t off = 0;
+  while (total > 0 && off + sizeof(struct nlmsghdr) <= (size_t)total) {
+    struct nlmsghdr *h = (struct nlmsghdr *)(buf + off);
+    if (h->nlmsg_len < sizeof(*h) || off + h->nlmsg_len > (size_t)total)
+      break;
+    if (h->nlmsg_type == RTM_NEWNEIGH) {
+      struct ndmsg *nd = (struct ndmsg *)NLMSG_DATA(h);
+      int blen = (int)(h->nlmsg_len - NLMSG_LENGTH(sizeof(*nd)));
+      void *attrs = (char *)nd + NLMSG_ALIGN(sizeof(*nd));
+      int dl = 0, ll = 0;
+      unsigned char *d = nl_find_attr(attrs, blen, NDA_DST, &dl);
+      unsigned char *l = nl_find_attr(attrs, blen, NDA_LLADDR, &ll);
+      if (d && dl == 16 && memcmp(d, ip6, 16) == 0) {
+        found = 1;
+        family_ok = nd->ndm_family == AF_INET6;
+        if (l && ll == 6 && memcmp(l, mac, 6) == 0)
+          mac_ok = 1;
+        if (nd->ndm_state & NUD_PERMANENT)
+          permanent = 1;
+      }
+    }
+    off += NLMSG_ALIGN(h->nlmsg_len);
+  }
+
+  req.h.nlmsg_type = RTM_DELNEIGH;
+  req.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.h.nlmsg_seq = ++s.seq;
+  int del_err = nl_talk(&s, &req, req.h.nlmsg_len);
+
+  nl_send_dump(&s, RTM_GETNEIGH, AF_INET6);
+  total = nl_recv_dump(&s, buf, sizeof(buf));
+  int still_there = 0;
+  off = 0;
+  while (total > 0 && off + sizeof(struct nlmsghdr) <= (size_t)total) {
+    struct nlmsghdr *h = (struct nlmsghdr *)(buf + off);
+    if (h->nlmsg_len < sizeof(*h) || off + h->nlmsg_len > (size_t)total)
+      break;
+    if (h->nlmsg_type == RTM_NEWNEIGH) {
+      struct ndmsg *nd = (struct ndmsg *)NLMSG_DATA(h);
+      int blen = (int)(h->nlmsg_len - NLMSG_LENGTH(sizeof(*nd)));
+      void *attrs = (char *)nd + NLMSG_ALIGN(sizeof(*nd));
+      int dl = 0;
+      unsigned char *d = nl_find_attr(attrs, blen, NDA_DST, &dl);
+      if (d && dl == 16 && memcmp(d, ip6, 16) == 0)
+        still_there = 1;
+    }
+    off += NLMSG_ALIGN(h->nlmsg_len);
+  }
+  nl_close(&s);
+
+  check("netlink-neigh6",
+        add_err == 0 && found && family_ok && mac_ok && permanent &&
+            del_err == 0 && !still_there,
+        (long)(add_err * 1000000 + found * 100000 + family_ok * 10000 +
+               mac_ok * 1000 + permanent * 100 + del_err * 10 + still_there));
+}
+
+/* `ip link set <if> down/up`: the administrative state has to be real — the
+ * dump must report the interface as down, and taking it back up must restore
+ * IFF_UP. eth1 is used when a second NIC exists so the run does not cut the
+ * link it is being watched over; with one NIC the test brings it straight back
+ * up in the same call sequence. */
+static int nl_link_flags(struct nl_sock *s, int ifindex, unsigned *flags_out) {
+  static unsigned char buf[32768];
+  nl_send_dump(s, RTM_GETLINK, AF_UNSPEC);
+  int total = nl_recv_dump(s, buf, sizeof(buf));
+  size_t off = 0;
+  while (total > 0 && off + sizeof(struct nlmsghdr) <= (size_t)total) {
+    struct nlmsghdr *h = (struct nlmsghdr *)(buf + off);
+    if (h->nlmsg_len < sizeof(*h) || off + h->nlmsg_len > (size_t)total)
+      break;
+    if (h->nlmsg_type == RTM_NEWLINK) {
+      struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(h);
+      if (ifi->ifi_index == ifindex) {
+        *flags_out = ifi->ifi_flags;
+        return 0;
+      }
+    }
+    off += NLMSG_ALIGN(h->nlmsg_len);
+  }
+  return -1;
+}
+
+static int nl_link_set(struct nl_sock *s, int ifindex, int up) {
+  struct {
+    struct nlmsghdr h;
+    struct ifinfomsg i;
+  } req;
+  memset(&req, 0, sizeof(req));
+  req.h.nlmsg_len = (unsigned)NLMSG_LENGTH(sizeof(struct ifinfomsg));
+  req.h.nlmsg_type = RTM_NEWLINK;
+  req.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.h.nlmsg_seq = ++s->seq;
+  req.i.ifi_family = AF_UNSPEC;
+  req.i.ifi_index = ifindex;
+  req.i.ifi_flags = up ? IFF_UP : 0;
+  req.i.ifi_change = IFF_UP;
+  return nl_talk(s, &req, req.h.nlmsg_len);
+}
+
+static void test_link_admin_state(void) {
+  struct nl_sock s;
+  if (nl_open(&s) < 0) {
+    fail("link-admin-state", -1);
+    return;
+  }
+  /* Prefer a second NIC; fall back to the only one there is. */
+  int target = 2;
+  unsigned f = 0;
+  if (nl_link_flags(&s, target, &f) != 0) {
+    target = g_eth_ifindex ? g_eth_ifindex : 1;
+    if (nl_link_flags(&s, target, &f) != 0) {
+      nl_close(&s);
+      fail("link-admin-state", -2);
+      return;
+    }
+  }
+  int was_up = (f & IFF_UP) != 0;
+
+  int down_err = nl_link_set(&s, target, 0);
+  unsigned after_down = 0;
+  int got_down = nl_link_flags(&s, target, &after_down);
+  int up_err = nl_link_set(&s, target, 1);
+  unsigned after_up = 0;
+  int got_up = nl_link_flags(&s, target, &after_up);
+  nl_close(&s);
+
+  int down_ok = down_err == 0 && got_down == 0 && !(after_down & IFF_UP);
+  int up_ok = up_err == 0 && got_up == 0 && (after_up & IFF_UP);
+  check("link-admin-state", was_up && down_ok && up_ok,
+        (long)(was_up * 1000 + down_ok * 100 + up_ok * 10 +
+               (int)(after_down & IFF_UP ? 1 : 0)));
+}
+
 /* ═══════════════════════════════ VT tests ═══════════════════════════════ */
 
 static int open_tty0(void) {
@@ -830,6 +1013,73 @@ static void test_vt_kdmode(void) {
             r7 == 0 && kbtype != 0,
         (long)(text_default * 10000 + graphics_set * 1000 +
                xlate_default * 100 + raw_set * 10 + (kbtype != 0)));
+}
+
+/* PIO_FONTX/GIO_FONTX: the descriptor carries the glyph count and height with
+ * the data, and GIO_FONTX has to report the real size (and refuse with ENOMEM)
+ * when the caller's buffer is too small. */
+struct consolefontdesc_u {
+  unsigned short charcount;
+  unsigned short charheight;
+  char *chardata;
+};
+
+static void test_console_fontx(void) {
+  int fd = open_tty0();
+  if (fd < 0) {
+    fail("console-fontx", -1);
+    return;
+  }
+  static unsigned char orig[256 * 32];
+  static unsigned char mine[256 * 32];
+  static unsigned char back[256 * 32];
+  struct consolefontdesc_u d;
+
+  /* Save the current face through the same interface. */
+  memset(orig, 0, sizeof(orig));
+  d.charcount = 256;
+  d.charheight = 0;
+  d.chardata = (char *)orig;
+  int r_get = ioctl(fd, GIO_FONTX, &d);
+  int height_reported = d.charheight;
+
+  /* A too-small buffer must fail and report the real count. */
+  struct consolefontdesc_u small;
+  small.charcount = 1;
+  small.charheight = 0;
+  small.chardata = (char *)mine;
+  int r_small = ioctl(fd, GIO_FONTX, &small);
+  int small_reports = (r_small < 0 && errno == ENOMEM && small.charcount > 1);
+
+  /* Install a glyph for 'B' (0x42) and read it back. */
+  memcpy(mine, orig, sizeof(mine));
+  for (int row = 0; row < 8; row++)
+    mine[0x42 * 32 + row] = (row & 1) ? 0xAA : 0x55;
+  d.charcount = 256;
+  d.charheight = 8;
+  d.chardata = (char *)mine;
+  int r_put = ioctl(fd, PIO_FONTX, &d);
+
+  memset(back, 0, sizeof(back));
+  d.charcount = 256;
+  d.charheight = 0;
+  d.chardata = (char *)back;
+  int r_get2 = ioctl(fd, GIO_FONTX, &d);
+  int match = memcmp(back + 0x42 * 32, mine + 0x42 * 32, 8) == 0;
+
+  /* Restore so the rest of the boot console stays readable. */
+  d.charcount = 256;
+  d.charheight = (unsigned short)(height_reported ? height_reported : 8);
+  d.chardata = (char *)orig;
+  ioctl(fd, PIO_FONTX, &d);
+  close(fd);
+
+  check("console-fontx",
+        r_get == 0 && height_reported > 0 && small_reports && r_put == 0 &&
+            r_get2 == 0 && match,
+        (long)((r_get == 0) * 100000 + (height_reported > 0) * 10000 +
+               small_reports * 1000 + (r_put == 0) * 100 + (r_get2 == 0) * 10 +
+               match));
 }
 
 static void test_console_font(void) {
@@ -1213,6 +1463,61 @@ static void test_kmsg_proc(void) {
   }
   close(rfd);
   check("kmsg-proc", found && prio_ok, (long)(found * 10 + prio_ok));
+}
+
+/* Two readers of /dev/kmsg are two independent streams: each descriptor has its
+ * own cursor, so a record one reader consumes is still there for the other.
+ * With a single shared cursor the two split the log between them. */
+static void test_kmsg_per_fd(void) {
+  int a = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+  int b = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+  if (a < 0 || b < 0) {
+    if (a >= 0)
+      close(a);
+    if (b >= 0)
+      close(b);
+    fail("kmsg-per-fd", -1);
+    return;
+  }
+  char rec[512];
+  while (read(a, rec, sizeof(rec) - 1) > 0)
+    ;
+  while (read(b, rec, sizeof(rec) - 1) > 0)
+    ;
+
+  int wfd = open("/dev/kmsg", O_WRONLY);
+  if (wfd < 0) {
+    close(a);
+    close(b);
+    fail("kmsg-per-fd", -2);
+    return;
+  }
+  const char *tag = "M107-KMSG-PERFD-TAG";
+  char msg[64];
+  snprintf(msg, sizeof(msg), "<6>%s\n", tag);
+  write(wfd, msg, strlen(msg));
+  close(wfd);
+
+  int seen_a = 0, seen_b = 0;
+  for (int i = 0; i < 256; i++) {
+    ssize_t n = read(a, rec, sizeof(rec) - 1);
+    if (n <= 0)
+      break;
+    rec[n] = '\0';
+    if (strstr(rec, tag))
+      seen_a = 1;
+  }
+  for (int i = 0; i < 256; i++) {
+    ssize_t n = read(b, rec, sizeof(rec) - 1);
+    if (n <= 0)
+      break;
+    rec[n] = '\0';
+    if (strstr(rec, tag))
+      seen_b = 1;
+  }
+  close(a);
+  close(b);
+  check("kmsg-per-fd", seen_a && seen_b, (long)(seen_a * 10 + seen_b));
 }
 
 static void test_syslog_klogctl(void) {
@@ -1720,12 +2025,15 @@ int main(void) {
   test_netlink_route();
   test_netlink_route_rw();
   test_netlink_neigh();
+  test_netlink_neigh6();
+  test_link_admin_state();
 
   test_vt_state();
   test_vt_switch();
   test_vt_disallocate();
   test_vt_kdmode();
   test_console_font();
+  test_console_fontx();
   test_console_keymap();
 
   test_loop();
@@ -1735,6 +2043,7 @@ int main(void) {
 
   test_kmsg_dev();
   test_kmsg_proc();
+  test_kmsg_per_fd();
   test_syslog_klogctl();
 
   test_inotify_move();
