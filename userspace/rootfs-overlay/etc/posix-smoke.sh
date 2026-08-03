@@ -368,6 +368,11 @@ rm -rf /tmp/bb_dir/w7
 echo "BB-W8: start promote"
 /bin/id -u 2>/dev/null | grep -q '^0$' && echo "BB-W8: ok id"
 /bin/whoami 2>/dev/null | grep -q '^root$' && echo "BB-W8: ok whoami"
+# M108: /bin/{id,whoami,groups} are BusyBox symlinks now, not dedicated ELFs —
+# prove the name really resolves to the multicall ELF rather than to a leftover
+# binary that happens to print the same thing.
+readlink /bin/id 2>/dev/null | grep -q 'busybox' && echo "BB-W8: ok id-is-busybox"
+/bin/groups 2>/dev/null | grep -q 'root' && echo "BB-W8: ok groups"
 /bin/uuidgen 2>/dev/null | grep -qE '^[0-9a-f-]{36}$' && echo "BB-W8: ok uuidgen"
 /bin/sha384sum /proc/version 2>/dev/null | grep -qE '^[0-9a-f]{96}' && echo "BB-W8: ok sha384sum"
 /bin/vmstat 2>/dev/null | grep -qE '[0-9]+' && echo "BB-W8: ok vmstat"

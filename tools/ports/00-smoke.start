@@ -34,7 +34,7 @@ elif grep -q 'b1nix.openrc-ctltest' /proc/cmdline 2>/dev/null; then
     echo "/etc/init.d/killprocs start"
     echo "reboot: powering off"
     echo "B1NIX-TEST: done"
-    ( sleep 1; /bin/halt || /bin/poweroff || /sbin/openrc-shutdown --no-write --poweroff now ) &
+    ( sleep 1; /bin/poweroff -f || /bin/halt -f || /sbin/openrc-shutdown --no-write --poweroff now ) &
     exit 0
 else
     SMOKE_SYS=1
@@ -187,4 +187,4 @@ if [ "$SMOKE_GFX" = "1" ] && [ -n "$displayd_pid" ]; then
 fi
 
 echo "B1NIX-TEST: done"
-( sleep 1; /bin/halt || /bin/poweroff || /sbin/openrc-shutdown --no-write --poweroff now ) &
+( sleep 1; /bin/poweroff -f || /bin/halt -f || /sbin/openrc-shutdown --no-write --poweroff now ) &
