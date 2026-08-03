@@ -2073,6 +2073,79 @@ static isize log_write(struct vfs_node *node, u64 offset, const char *buffer,
   return (isize)size;
 }
 
+/* /dev/urandom and /dev/random: the same CSPRNG getrandom(2) draws from. Both
+ * nodes exist because callers ask for one or the other by name — BusyBox shred
+ * opens /dev/urandom and fails outright without it — and neither ever blocks:
+ * b1nix has one pool, seeded at boot, so a "wait for entropy" distinction would
+ * be a fiction. Writing to them is accepted and mixes nothing, as on Linux
+ * without CAP_SYS_ADMIN. */
+static isize random_read(struct vfs_node *node, u64 offset, char *buffer,
+                         usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (!buffer)
+    return -EFAULT;
+  usize done = 0;
+  while (done < size) {
+    u64 r = kernel_random_u64();
+    usize left = size - done;
+    usize n = left < sizeof(r) ? left : sizeof(r);
+    memcpy(buffer + done, &r, n);
+    done += n;
+  }
+  return (isize)done;
+}
+
+static isize random_write(struct vfs_node *node, u64 offset, const char *buffer,
+                          usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)buffer;
+  (void)flags;
+  return (isize)size; /* accepted, mixed into nothing */
+}
+
+/* /dev/zero: an endless run of zero bytes, and a sink for writes. Its absence
+ * was not visible until something asked for it by name — BusyBox shred opens
+ * /dev/zero and /dev/urandom side by side and dies on the first that is
+ * missing. */
+static isize zero_read(struct vfs_node *node, u64 offset, char *buffer,
+                       usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (!buffer)
+    return -EFAULT;
+  memset(buffer, 0, size);
+  return (isize)size;
+}
+
+static void zero_init_node(void) {
+  struct vfs_node *n = add_node("/dev/zero", VFS_DEVICE, 0, 0, 0);
+  if (!n)
+    return;
+  n->inode->read_cb = zero_read;
+  n->inode->write_cb = null_write; /* discarded, like /dev/null */
+  n->inode->poll_cb = null_poll;
+  n->inode->mode =
+      VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IWGRP | VFS_IROTH | VFS_IWOTH;
+}
+
+static void random_init_nodes(void) {
+  static const char *names[2] = {"/dev/urandom", "/dev/random"};
+  for (int i = 0; i < 2; i++) {
+    struct vfs_node *n = add_node(names[i], VFS_DEVICE, 0, 0, 0);
+    if (!n)
+      continue;
+    n->inode->read_cb = random_read;
+    n->inode->write_cb = random_write;
+    n->inode->poll_cb = null_poll; /* always readable and writable */
+    n->inode->mode =
+        VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IWGRP | VFS_IROTH | VFS_IWOTH;
+  }
+}
+
 static void null_init_node(void) {
   struct vfs_node *n = add_node("/dev/null", VFS_DEVICE, 0, 0, 0);
   if (n) {
@@ -2082,6 +2155,8 @@ static void null_init_node(void) {
     n->inode->mode =
         VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IWGRP | VFS_IROTH | VFS_IWOTH;
   }
+  random_init_nodes();
+  zero_init_node();
   struct vfs_node *l = add_node("/dev/log", VFS_DEVICE, 0, 0, 0);
   if (l) {
     l->inode->write_cb = log_write;
@@ -2316,6 +2391,33 @@ void vfs_repopulate_after_root_mount(void) {
     node->inode->uid = 0;
     node->inode->gid = 0;
     vfs_node_put(node);
+  }
+
+  /* Same reason the nodes above are re-added: the ones made during early boot
+   * live on the initramfs root and are unreachable once the real root is
+   * mounted over "/". */
+  node = add_node("/dev/zero", VFS_DEVICE, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->read_cb = zero_read;
+    node->inode->write_cb = null_write;
+    node->inode->poll_cb = null_poll;
+    node->inode->mode = 0666;
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
+  }
+
+  for (int ri = 0; ri < 2; ri++) {
+    node = add_node(ri ? "/dev/random" : "/dev/urandom", VFS_DEVICE, 0, 0, 0);
+    if (node && !IS_ERR(node)) {
+      node->inode->read_cb = random_read;
+      node->inode->write_cb = random_write;
+      node->inode->poll_cb = null_poll;
+      node->inode->mode = 0666;
+      node->inode->uid = 0;
+      node->inode->gid = 0;
+      vfs_node_put(node);
+    }
   }
 
   node = add_node("/dev/log", VFS_DEVICE, 0, 0, 0);

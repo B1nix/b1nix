@@ -403,9 +403,7 @@ echo "7 6 * p" | /bin/dc 2>/dev/null | grep -q '^42$' && echo "BB-W10: ok dc"
 /bin/hostname 2>/dev/null | grep -q . && echo "BB-W10: ok hostname"
 printf 'b1nix' | /bin/uuencode -m - 2>/dev/null | /bin/uudecode -o - 2>/dev/null | grep -q 'b1nix' && echo "BB-W10: ok uuencode-uudecode"
 /bin/mountpoint -q / && echo "BB-W10: ok mountpoint"
-W10_WHO=$(/bin/who 2>&1); W10_WHO_RC=$?
-echo "BB-W10: who rc=$W10_WHO_RC out=[$W10_WHO]"
-[ "$W10_WHO_RC" = "0" ] && echo "BB-W10: ok who"
+/bin/who >/dev/null 2>&1 && echo "BB-W10: ok who"
 /bin/nice -n 5 /opt/busybox/bin/busybox true && echo "BB-W10: ok nice"
 /bin/stty -a < /dev/console 2>/dev/null | grep -q 'speed\|rows' && echo "BB-W10: ok stty"
 /bin/blockdev --getsz /dev/sata0 2>/dev/null | grep -qE '^[0-9]+$' && echo "BB-W10: ok blockdev"
@@ -413,13 +411,12 @@ echo "BB-W10: who rc=$W10_WHO_RC out=[$W10_WHO]"
 /bin/fbset 2>/dev/null | grep -q 'geometry' && echo "BB-W10: ok fbset"
 mkdir -p /tmp/bb_dir/w10 && echo parity > /tmp/bb_dir/w10/f
 ( cd /tmp/bb_dir/w10 && /opt/busybox/bin/busybox find . -type f | /bin/cpio -o -H newc > /tmp/bb_dir/w10.cpio 2>/dev/null )
-W10_CPIO=$(/bin/cpio -t < /tmp/bb_dir/w10.cpio 2>&1)
-echo "BB-W10: cpio out=[$W10_CPIO]"
-echo "$W10_CPIO" | grep -q 'f' && echo "BB-W10: ok cpio"
+/bin/cpio -t < /tmp/bb_dir/w10.cpio 2>/dev/null | grep -qx 'f' && echo "BB-W10: ok cpio"
 /bin/lzop -c /tmp/bb_dir/w10/f 2>/dev/null | /bin/lzopcat 2>/dev/null | grep -q parity && echo "BB-W10: ok lzop"
-W10_SHRED=$(/bin/shred -n 1 -u /tmp/bb_dir/w10/f 2>&1); W10_SHRED_RC=$?
-echo "BB-W10: shred rc=$W10_SHRED_RC out=[$W10_SHRED]"
-[ ! -f /tmp/bb_dir/w10/f ] && echo "BB-W10: ok shred"
+/bin/shred -n 1 -u /tmp/bb_dir/w10/f 2>/dev/null && [ ! -f /tmp/bb_dir/w10/f ] && echo "BB-W10: ok shred"
+# /dev/zero and /dev/urandom are what shred draws from — assert both nodes.
+[ -c /dev/urandom ] && [ "$(/opt/busybox/bin/busybox dd if=/dev/urandom bs=32 count=1 2>/dev/null | /opt/busybox/bin/busybox wc -c)" = "32" ] && echo "BB-W10: ok urandom"
+[ -c /dev/zero ] && [ "$(/opt/busybox/bin/busybox dd if=/dev/zero bs=16 count=1 2>/dev/null | /opt/busybox/bin/busybox od -An -tx1 | /opt/busybox/bin/busybox tr -d ' \n')" = "00000000000000000000000000000000" ] && echo "BB-W10: ok zero"
 /bin/fallocate -l 4096 /tmp/bb_dir/w10/alloc 2>/dev/null && [ -s /tmp/bb_dir/w10/alloc ] && echo "BB-W10: ok fallocate"
 /bin/flock -n /tmp/bb_dir/w10/alloc /opt/busybox/bin/busybox true && echo "BB-W10: ok flock"
 /bin/fsync /tmp/bb_dir/w10/alloc 2>/dev/null && echo "BB-W10: ok fsync"

@@ -1304,11 +1304,13 @@ check_output "$LOG" "M22-POLISH: done" "M22 Polish completes successfully"
 	check_output "$LOG" "BB-W9: ok tsort" "/bin/tsort (promoted) topologically sorts"
 
 	# ── BB-W10: parity with Alpine's own busyboxconfig ──
-	# who/cpio/shred are built and their probes run (the wave prints their exit
-	# status and output), but none of the three has been proven green yet, so
-	# they are not asserted here — see M109 in docs/roadmap.md.
 	check_output "$LOG" "BB-W10: ok bc" "busybox bc evaluates an expression"
 	check_output "$LOG" "BB-W10: ok dc" "busybox dc evaluates RPN"
+	check_output "$LOG" "BB-W10: ok who" "who reads the utmp database"
+	check_output "$LOG" "BB-W10: ok cpio" "cpio writes and lists a newc archive"
+	check_output "$LOG" "BB-W10: ok shred" "shred overwrites a file and removes it"
+	check_output "$LOG" "BB-W10: ok urandom" "/dev/urandom delivers bytes from the kernel CSPRNG"
+	check_output "$LOG" "BB-W10: ok zero" "/dev/zero delivers an endless run of zero bytes"
 	check_output "$LOG" "BB-W10: ok nproc" "nproc reports the CPU count"
 	check_output "$LOG" "BB-W10: ok hostname" "hostname reads the system name"
 	check_output "$LOG" "BB-W10: ok uuencode-uudecode" "uuencode/uudecode round-trip a payload"
