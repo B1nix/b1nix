@@ -817,6 +817,7 @@ Status:
 - [x] Module region at `0xFFFFFFFFC0000000` (128 MiB, PML4 slot 511 so every address space shares its page tables) with real W^X: `module_alloc` hands out RW+NX pages, the loader re-protects the text span RX once relocation is done. Needed EFER.NXE, now enabled on the BSP (`boot.S`) and every AP (`ap_trampoline.S`, `x86_syscall_init`) behind a CPUID check.
 - [x] `ET_REL` (`.ko`) loader in `kernel/module/module.c`: section layout, symbol resolution against the kernel's `EXPORT_SYMBOL` table plus already-loaded modules, R_X86_64_{64,PC32,PLT32,32,32S,PC64,GOTPCRELX} relocations, `.modinfo` vermagic gate, `struct module` list with `try_module_get`/`module_put` (a referenced module cannot be removed).
 - [x] `init_module(2)` / `finit_module(2)` / `delete_module(2)` — native 243/245/244 and the Linux ABI numbers 175/313/176 — all gated on `CAP_SYS_MODULE`. `/proc/modules` is real, `/proc/filesystems` now enumerates the live registry instead of a hardcoded list, and `/bin/kmod` is a multi-call `insmod`/`rmmod`/`lsmod`/`modinfo`/`modprobe`.
+- [ ] `planned` Retire `/bin/kmod` in favour of BusyBox's own `insmod`/`rmmod`/`lsmod`/`modprobe`/`modinfo`/`depmod`. The syscalls they need already exist (native 243/245/244 and the Linux numbers 175/313/176), so what is left is proving BusyBox's expectations against ours — the `/proc/modules` line format, the `modules.dep`/`modules.alias` layout `tools/kernel/gen_modules_initramfs.sh` writes, and the vermagic string — then flipping `CONFIG_INSMOD`/`RMMOD`/`LSMOD`/`MODPROBE`/`MODINFO`/`DEPMOD` on and deleting `userspace/bin/tools/kmod.c`. Until that is verified the applets stay off: a `modprobe` that misreads `modules.dep` is worse than none.
 - [x] `ntfs`, `btrfs`, `isofs` and the Intel HDA sound driver ship as `.ko` in the initramfs and the rootfs; the kernel loads them at boot through `request_module`, and boots and passes its tests with any of them absent. `tools/kernel/check-module-syms.sh` fails the build (not the insmod) on an unexported symbol.
 - [x] `M95-SMOKE` covers the framework end to end, including a vermagic-corrupted module being rejected and an unprivileged `delete_module` reporting `EPERM`.
 - [ ] `open` **Unloading a filesystem module while one of its filesystems is mounted is not refused.** `vfs_unregister_fs` has no mount refcount behind it, so `rmmod isofs` with an ISO mounted frees the code the mount is still using. The protocol modules are protected (the dispatch-drain guard in `proto.c`); the filesystems are not.
@@ -945,3 +946,28 @@ replacements become the odd ones out. Retire them in favour of the multicall ELF
 - [x] `done` `userspace/bin` is grouped by purpose — `smoke/`, `gfx/`, `helpers/`, `tools/`, `gui/`, `compiler/` (see `userspace/bin/README.md`). Build rules look a source up by name, so a program can change category without touching a rule. Three committed build artefacts and an unused duplicate header were dropped in the same pass.
 - [ ] `open` BusyBox `passwd` locks `/etc/shadow` with `fcntl(F_SETLK)` + `link()`; whether b1nix's ext4 honours both is unconfirmed, so a concurrent password change is not known to be safe.
 - [ ] `open` The BusyBox-init instance's `getty` respawn is unexercised — the smoke's done-marker kills the VM before a respawn cycle.
+
+## M109: Alpine applet parity — the last 50
+
+`tools/configs/busybox-1.38.0.config` was compared against Alpine's own
+`busyboxconfig` for the same BusyBox 1.38.0 (`aports/main/busybox`). Alpine
+builds 321 applets, b1nix built 240; the parity pass took b1nix to 283 and
+proved each one through `/bin` in `BB-W10`. What follows is the remainder,
+grouped by the kernel subsystem each one is actually waiting on — every line is
+a piece of kernel work, not a config flag.
+
+- [ ] `planned` **AF_PACKET** — `udhcpc`, `udhcpc6`, `zcip`, `ether-wake`, `nameif`. A raw link-layer socket family; the DHCP client in the kernel covers the common case today, but nothing in userspace can send or receive a raw frame.
+- [ ] `planned` **Namespaces** — `unshare`, `nsenter`. User/PID/mount/net namespaces; also what the Chromium sandbox wants (see M62).
+- [ ] `planned` **`pivot_root(2)`** — `pivot_root`, `switch_root`. The initramfs-to-rootfs handover currently happens inside the kernel, so the syscall was never needed.
+- [ ] `planned` **Virtual and stacked network devices** — `brctl` (bridge), `vconfig` (VLAN), `ifenslave` (bonding), `tunctl` (tun/tap), `slattach` (SLIP), `ip tunnel`, `ip rule` (policy routing). Each is a device class the stack does not have; `ip rule` additionally needs multiple FIB tables.
+- [ ] `planned` **Inode attribute flags (`FS_IOC_GETFLAGS`/`SETFLAGS`)** — `chattr`, `lsattr`. ext4 has the on-disk field; nothing reads or writes it.
+- [ ] `planned` **Discard/TRIM** — `fstrim`, `blkdiscard`. Needs `FITRIM` and `BLKDISCARD` plus a discard path through the block layer to the driver.
+- [ ] `planned` **I/O priorities (`ioprio_set`/`ioprio_get`)** — `ionice`. The block layer has one queue and no per-task priority.
+- [ ] `planned` **uevent/hotplug channel** — `mdev`. `/dev` is populated by the kernel at registration time; there is no netlink uevent socket for a userspace device manager to listen on.
+- [ ] `planned` **blkid database** — `findfs`. Needs filesystem UUID/LABEL probing exposed to userspace.
+- [ ] `planned` **CD-ROM ioctls** — `eject`, `volname`. No ATAPI packet path.
+- [ ] `planned` **MTD** — `nanddump`, `nandwrite` (and the `flash*`/`ubi*` set from M107). Only worth it if b1nix ever targets flash storage.
+- [ ] `planned` **Assorted single-device gaps** — `rfkill` (no rfkill subsystem), `raidautorun` (no md), `nbd-client` (no network block device), `fdflush` (no floppy), `setserial` (serial port config ioctls), `setconsole` (`TIOCCONS`), `readahead(2)`, `rdev`, `fatattr`.
+- [ ] `open` Three applets from the parity wave are built and reachable but not yet proven: `who` (needs a populated utmp), `cpio` (the newc round-trip through a pipe) and `shred` (`-u` removing the file). `BB-W10` runs each and prints its exit status and output; `tests/smoke.sh` does not assert them until the probes are understood.
+- [ ] `open` `M52-GFX: fail glsl (present)` was seen once in the parity run — `b1gui_present` failing after a clean compile/link/render. Not reproduced since, and no change in this work touches the present path; if it returns, start at displayd's frame acknowledgement.
+- [ ] `planned` **SMTP** — `sendmail`. `makemime`/`reformime` are enabled (they are pure text tools); `sendmail` needs a server to talk to before shipping it means anything.

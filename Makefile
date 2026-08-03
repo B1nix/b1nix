@@ -660,10 +660,8 @@ $(BUILD_DIR)/.userspace-headers-installed: \
 	$(wildcard userspace/libc/*.c) \
 	$(wildcard userspace/libgui/*.c) \
 	$(wildcard userspace/include/*.h) \
-	$(wildcard userspace/include/b1nix/*.h) \
-	$(wildcard userspace/include/arpa/*.h) \
-	$(wildcard userspace/include/netinet/*.h) \
-	$(wildcard userspace/include/sys/*.h) \
+	$(wildcard userspace/include/*/*.h) \
+	$(wildcard userspace/include/*/*/*.h) \
 	$(wildcard userspace/crt/*.S) \
 	userspace/Makefile
 	# Build libs + headers into sysroot in one serialized pass, then mark done.
@@ -745,7 +743,7 @@ $(INC_DIR)/initramfs_displayd.inc: $(DISPLAYD_SRCS) $(USERSPACE_DEPS)
 # program's source is looked up by name rather than assumed to sit at a fixed
 # path — moving one between categories does not touch this rule.
 USER_BIN_CATS := smoke gfx helpers tools gui compiler
-user_bin_src = $(firstword $(wildcard $(addsuffix /$(1).c,$(addprefix userspace/bin/,$(USER_BIN_CATS)))))
+user_bin_src = $(firstword $(wildcard $(addsuffix /$(1).c,$(addprefix userspace/bin/,$(USER_BIN_CATS))) $(addsuffix /$(1).cpp,$(addprefix userspace/bin/,$(USER_BIN_CATS)))) userspace/bin/$(1).c)
 .SECONDEXPANSION:
 $(INC_DIR)/initramfs_%.inc: $$(call user_bin_src,$$*) $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/$*
@@ -895,20 +893,20 @@ $(INC_DIR)/initramfs_m52_gl_smoke.inc: userspace/bin/gfx/m52_gl_smoke.c $(USERSP
 # Hosted C++ runtime smoke. Enable LLVM libc++ against the b1nix libc first
 # (idempotent: stages headers + fixes mbstate_t config), then build via the
 # cross clang C++ wrapper.
-$(INC_DIR)/initramfs_cxx_smoke.inc: userspace/bin/cxx_smoke.cpp $(USERSPACE_DEPS) $(CXX_RUNTIME_READY) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
+$(INC_DIR)/initramfs_cxx_smoke.inc: userspace/bin/smoke/cxx_smoke.cpp $(USERSPACE_DEPS) $(CXX_RUNTIME_READY) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/cxx_smoke
 	xxd -i -n vfs_cxx_smoke_elf userspace/build/$(ARCH)/bin/cxx_smoke > $@
 
-$(INC_DIR)/initramfs_m64_clang_smoke.inc: userspace/bin/m64_clang_smoke.cpp $(USERSPACE_DEPS) $(CXX_RUNTIME_READY) tools/toolchain/bin/b1nix-clang++ tools/toolchain/bin/b1nix-c++
+$(INC_DIR)/initramfs_m64_clang_smoke.inc: userspace/bin/smoke/m64_clang_smoke.cpp $(USERSPACE_DEPS) $(CXX_RUNTIME_READY) tools/toolchain/bin/b1nix-clang++ tools/toolchain/bin/b1nix-c++
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m64_clang_smoke
 	xxd -i -n vfs_m64_clang_smoke_elf userspace/build/$(ARCH)/bin/m64_clang_smoke > $@
 
 # M55: std::iostream + std::filesystem acceptance test (hosted libc++).
-$(INC_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSPACE_DEPS) $(CXX_RUNTIME_READY) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
+$(INC_DIR)/initramfs_m55_iostream.inc: userspace/bin/smoke/m55_iostream.cpp $(USERSPACE_DEPS) $(CXX_RUNTIME_READY) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m55_iostream
@@ -963,7 +961,7 @@ $(BUILD_DIR)/.skia-built: tools/ports/build-skia.sh $(USERSPACE_DEPS)
 	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-skia.sh >/dev/null
 	@touch $@
 
-$(INC_DIR)/initramfs_m91_skia_smoke.inc: userspace/bin/m91_skia_smoke.cpp tools/demos/build-m91-skia-demo.sh $(BUILD_DIR)/.skia-built $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
+$(INC_DIR)/initramfs_m91_skia_smoke.inc: userspace/bin/gfx/m91_skia_smoke.cpp tools/demos/build-m91-skia-demo.sh $(BUILD_DIR)/.skia-built $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
 	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m91-skia-demo.sh m91_skia_smoke userspace/build/$(ARCH)/bin/m91_skia_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m91_skia_smoke_elf userspace/build/$(ARCH)/bin/m91_skia_smoke > $@
@@ -1006,7 +1004,7 @@ $(INC_DIR)/initramfs_lib%.inc: userspace/build/$(ARCH)/lib%.so $(M91_SHARED_DEPS
 # links the parse/layout/draw acceptance test against them. M89: litehtml is built
 # against the shared LLVM libc++ (B1NIX_CXX_STDLIB=libc++) — NetSurf's only C++
 # component, so this also moves the NetSurf C++ stack off GCC libstdc++.
-$(INC_DIR)/initramfs_m55_litehtml.inc: userspace/bin/m55_litehtml.cpp tools/demos/build-m55-litehtml.sh $(LITEHTML_LIB) $(LIBM_LIB) $(USERSPACE_DEPS)
+$(INC_DIR)/initramfs_m55_litehtml.inc: userspace/bin/smoke/m55_litehtml.cpp tools/demos/build-m55-litehtml.sh $(LITEHTML_LIB) $(LIBM_LIB) $(USERSPACE_DEPS)
 	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m55-litehtml.sh userspace/build/$(ARCH)/bin/m55_litehtml
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m55_litehtml_elf userspace/build/$(ARCH)/bin/m55_litehtml > $@

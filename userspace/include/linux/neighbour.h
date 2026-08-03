@@ -4,8 +4,8 @@
 #include <linux/types.h>
 #include <linux/netlink.h>
 
-/* Neighbour-table (ARP) netlink defs, enough for BusyBox `ip neigh` to compile.
- * b1nix does not implement RTM_*NEIGH dumps. */
+/* Neighbour-table netlink defs. b1nix implements RTM_GETNEIGH/NEWNEIGH/DELNEIGH
+ * for AF_INET (the ARP cache) and, with ndp.ko loaded, for AF_INET6. */
 struct ndmsg {
   __u8 ndm_family;
   __u8 ndm_pad1;
@@ -25,6 +25,16 @@ enum {
   __NDA_MAX
 };
 #define NDA_MAX (__NDA_MAX - 1)
+
+/* NDA_CACHEINFO's payload. b1nix reports no ageing timers, so the fields are
+ * zero, but `ip neigh` still dereferences the struct when the attribute is
+ * present in someone else's dump. */
+struct nda_cacheinfo {
+  __u32 ndm_confirmed;
+  __u32 ndm_used;
+  __u32 ndm_updated;
+  __u32 ndm_refcnt;
+};
 
 #define NDA_RTA(r)                                                             \
   ((struct rtattr *)(((char *)(r)) + NLMSG_ALIGN(sizeof(struct ndmsg))))

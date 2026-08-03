@@ -39,19 +39,27 @@ if [ "${1:-}" = "--clean" ]; then
   exit 0
 fi
 
+# Bump when any generated uapi header below changes: the fast path stores this
+# number in the sysroot and only skips the rebuild when it matches, so a tree
+# built before a header grew a constant refreshes instead of staying stale.
+UAPI_HEADERS_VERSION=2
+UAPI_STAMP="$INSTALL_DIR/include/.b1nix-uapi-version"
+
 LOCKFILE="$BUILD_DIR/locks/build.lock"
 mkdir -p "$(dirname "$LOCKFILE")"
 
 (
   flock -x 9
   # The uapi headers this script emits (linux/{kd,keyboard,rtc,watchdog,i2c,
-  # i2c-dev,vt}.h, M107) are written further down, AFTER this fast path — so a
-  # tree whose musl was built before they existed would never receive them, and
-  # the BusyBox applets that include them fail to compile with no hint that the
-  # libc is simply stale. Treat the newest header as part of what "already
-  # built" means: a tree missing it rebuilds once and is fast again after.
+  # i2c-dev,vt}.h) are written further down, AFTER this fast path, so "already
+  # built" has to account for them: a stamp carrying UAPI_HEADERS_VERSION.
+  # Checking for a header's mere existence was not enough — vt.h kept the text
+  # it was first written with (VT_RELDISP and VT_PROCESS missing) long after the
+  # generator gained them, and the BusyBox applets that include it failed to
+  # compile with no hint that the sysroot was simply stale.
   if [ -f "$INSTALL_DIR/lib/libc.a" ] && [ -f "$INSTALL_DIR/lib/libc.so" ] &&
-     [ -f "$INSTALL_DIR/include/linux/i2c-dev.h" ]; then
+     [ -f "$UAPI_STAMP" ] &&
+     [ "$(cat "$UAPI_STAMP" 2>/dev/null)" = "$UAPI_HEADERS_VERSION" ]; then
     echo "$INSTALL_DIR"
     exit 0
   fi
@@ -284,7 +292,10 @@ fi
 # same numeric ops via the Linux-ABI syscall layer, so only the header is
 # missing, not the kernel feature — provide the standard uapi values.
 mkdir -p "$INSTALL_DIR/include/linux"
-if [ ! -f "$INSTALL_DIR/include/linux/futex.h" ]; then
+# Regenerated every run: the guard that skipped an existing copy left a
+# sysroot stuck with whatever this script wrote the first time — /linux/vt.h
+# still said "b1nix has no virtual terminals" three milestones after it did.
+if true; then
   cat > "$INSTALL_DIR/include/linux/futex.h" <<'EOF'
 /* b1nix compat: standard Linux uapi/linux/futex.h FUTEX_* constants.
  * musl does not ship this header; b1nix's futex(2) implements the same
@@ -340,7 +351,7 @@ fi
 # linux/auxvec.h: same story as futex.h above — ported software (V8's
 # src/base/cpu.cc reads AT_HWCAP) expects the kernel-uapi AT_* constants that
 # musl does not ship as a public header.
-if [ ! -f "$INSTALL_DIR/include/linux/auxvec.h" ]; then
+if true; then
   cat > "$INSTALL_DIR/include/linux/auxvec.h" <<'EOF'
 #ifndef _LINUX_AUXVEC_H
 #define _LINUX_AUXVEC_H
@@ -376,7 +387,7 @@ fi
 # for __NR_mmap/__NR_mmap2 as an old-kernel fallback, always behind
 # `#if defined(__NR_mmap)` — so an empty header is a correct, complete answer
 # (musl's own sys/syscall.h already provides SYS_mmap unconditionally).
-if [ ! -f "$INSTALL_DIR/include/linux/unistd.h" ]; then
+if true; then
   echo "/* b1nix compat: empty — musl provides SYS_* via sys/syscall.h; callers guard with #if defined(__NR_*) */" \
     > "$INSTALL_DIR/include/linux/unistd.h"
 fi
@@ -386,7 +397,7 @@ fi
 # other console tools, hwclock, rtcwake, watchdog, the i2c-tools family) has
 # nothing to compile against. These are the real Linux numbers and structs —
 # kernel/dev/{vt,rtc_dev,watchdog,i2c}.c implement them.
-if [ ! -f "$INSTALL_DIR/include/linux/kd.h" ]; then
+if true; then
   mkdir -p "$INSTALL_DIR/include/linux"
   cat > "$INSTALL_DIR/include/linux/kd.h" <<'B1NIX_EOF'
 /* b1nix: uapi <linux/kd.h>. The console-tools applets (setfont, loadkmap,
@@ -554,7 +565,7 @@ struct console_font {
 B1NIX_EOF
 fi
 
-if [ ! -f "$INSTALL_DIR/include/linux/keyboard.h" ]; then
+if true; then
   mkdir -p "$INSTALL_DIR/include/linux"
   cat > "$INSTALL_DIR/include/linux/keyboard.h" <<'B1NIX_EOF'
 /* b1nix: uapi <linux/keyboard.h> — the keysym encoding the VT keymap uses. */
@@ -606,7 +617,7 @@ if [ ! -f "$INSTALL_DIR/include/linux/keyboard.h" ]; then
 B1NIX_EOF
 fi
 
-if [ ! -f "$INSTALL_DIR/include/linux/rtc.h" ]; then
+if true; then
   mkdir -p "$INSTALL_DIR/include/linux"
   cat > "$INSTALL_DIR/include/linux/rtc.h" <<'B1NIX_EOF'
 /* b1nix: uapi <linux/rtc.h> — /dev/rtc0, implemented in kernel/dev/rtc_dev.c. */
@@ -680,7 +691,7 @@ struct rtc_pll_info {
 B1NIX_EOF
 fi
 
-if [ ! -f "$INSTALL_DIR/include/linux/watchdog.h" ]; then
+if true; then
   mkdir -p "$INSTALL_DIR/include/linux"
   cat > "$INSTALL_DIR/include/linux/watchdog.h" <<'B1NIX_EOF'
 /* b1nix: uapi <linux/watchdog.h> — /dev/watchdog, kernel/dev/watchdog.c. */
@@ -734,7 +745,7 @@ struct watchdog_info {
 B1NIX_EOF
 fi
 
-if [ ! -f "$INSTALL_DIR/include/linux/i2c.h" ]; then
+if true; then
   mkdir -p "$INSTALL_DIR/include/linux"
   cat > "$INSTALL_DIR/include/linux/i2c.h" <<'B1NIX_EOF'
 /* b1nix: uapi <linux/i2c.h> — the SMBus transaction shapes /dev/i2c-N accepts
@@ -820,7 +831,7 @@ union i2c_smbus_data {
 B1NIX_EOF
 fi
 
-if [ ! -f "$INSTALL_DIR/include/linux/i2c-dev.h" ]; then
+if true; then
   mkdir -p "$INSTALL_DIR/include/linux"
   cat > "$INSTALL_DIR/include/linux/i2c-dev.h" <<'B1NIX_EOF'
 /* b1nix: uapi <linux/i2c-dev.h> — the /dev/i2c-N ioctl surface. */
@@ -858,7 +869,7 @@ struct i2c_rdwr_ioctl_data {
 B1NIX_EOF
 fi
 
-if [ ! -f "$INSTALL_DIR/include/linux/vt.h" ]; then
+if true; then
   mkdir -p "$INSTALL_DIR/include/linux"
   cat > "$INSTALL_DIR/include/linux/vt.h" <<'B1NIX_EOF'
 /* b1nix: uapi <linux/vt.h>. b1nix has six virtual terminals (M107,
@@ -923,6 +934,10 @@ struct vt_consize {
 #endif /* _B1NIX_LINUX_VT_H */
 B1NIX_EOF
 fi
+
+# Record which generation of the uapi headers this sysroot carries, so the fast
+# path above can tell a current tree from one that predates a header change.
+printf '%s\n' "$UAPI_HEADERS_VERSION" > "$UAPI_STAMP"
 
 # Expose as build/<arch>/libc/ — dedicated top-level alias for the system libc
 ln -sfn "$INSTALL_DIR" "$LIBC_DIR"

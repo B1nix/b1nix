@@ -391,6 +391,46 @@ echo 'b c' >> /tmp/bb_dir/w9t
 rm -f /tmp/bb_dir/w9t
 rm -f /tmp/bb_dir/w9f
 echo "BB-W9: done"
+
+# ── BB-W10: the Alpine-parity wave ──
+# Alpine's busyboxconfig builds 321 applets; b1nix built 240. These are the ones
+# that were simply never enabled — each is exercised through /bin so the symlink
+# and the applet are both proven, not just the presence of a name.
+echo "BB-W10: start parity"
+/bin/bc <<< "6*7" 2>/dev/null | grep -q '^42$' && echo "BB-W10: ok bc"
+echo "7 6 * p" | /bin/dc 2>/dev/null | grep -q '^42$' && echo "BB-W10: ok dc"
+/bin/nproc 2>/dev/null | grep -qE '^[0-9]+$' && echo "BB-W10: ok nproc"
+/bin/hostname 2>/dev/null | grep -q . && echo "BB-W10: ok hostname"
+printf 'b1nix' | /bin/uuencode -m - 2>/dev/null | /bin/uudecode -o - 2>/dev/null | grep -q 'b1nix' && echo "BB-W10: ok uuencode-uudecode"
+/bin/mountpoint -q / && echo "BB-W10: ok mountpoint"
+W10_WHO=$(/bin/who 2>&1); W10_WHO_RC=$?
+echo "BB-W10: who rc=$W10_WHO_RC out=[$W10_WHO]"
+[ "$W10_WHO_RC" = "0" ] && echo "BB-W10: ok who"
+/bin/nice -n 5 /opt/busybox/bin/busybox true && echo "BB-W10: ok nice"
+/bin/stty -a < /dev/console 2>/dev/null | grep -q 'speed\|rows' && echo "BB-W10: ok stty"
+/bin/blockdev --getsz /dev/sata0 2>/dev/null | grep -qE '^[0-9]+$' && echo "BB-W10: ok blockdev"
+/bin/blockdev --getro /dev/sata0 2>/dev/null | grep -qE '^[01]$' && echo "BB-W10: ok blockdev-getro"
+/bin/fbset 2>/dev/null | grep -q 'geometry' && echo "BB-W10: ok fbset"
+mkdir -p /tmp/bb_dir/w10 && echo parity > /tmp/bb_dir/w10/f
+( cd /tmp/bb_dir/w10 && /opt/busybox/bin/busybox find . -type f | /bin/cpio -o -H newc > /tmp/bb_dir/w10.cpio 2>/dev/null )
+W10_CPIO=$(/bin/cpio -t < /tmp/bb_dir/w10.cpio 2>&1)
+echo "BB-W10: cpio out=[$W10_CPIO]"
+echo "$W10_CPIO" | grep -q 'f' && echo "BB-W10: ok cpio"
+/bin/lzop -c /tmp/bb_dir/w10/f 2>/dev/null | /bin/lzopcat 2>/dev/null | grep -q parity && echo "BB-W10: ok lzop"
+W10_SHRED=$(/bin/shred -n 1 -u /tmp/bb_dir/w10/f 2>&1); W10_SHRED_RC=$?
+echo "BB-W10: shred rc=$W10_SHRED_RC out=[$W10_SHRED]"
+[ ! -f /tmp/bb_dir/w10/f ] && echo "BB-W10: ok shred"
+/bin/fallocate -l 4096 /tmp/bb_dir/w10/alloc 2>/dev/null && [ -s /tmp/bb_dir/w10/alloc ] && echo "BB-W10: ok fallocate"
+/bin/flock -n /tmp/bb_dir/w10/alloc /opt/busybox/bin/busybox true && echo "BB-W10: ok flock"
+/bin/fsync /tmp/bb_dir/w10/alloc 2>/dev/null && echo "BB-W10: ok fsync"
+/bin/mkpasswd -m sha512 b1nix -S abcdefgh 2>/dev/null | grep -q '^\$6\$' && echo "BB-W10: ok mkpasswd"
+/bin/setpriv --help 2>&1 | grep -qi 'setpriv\|Usage' && echo "BB-W10: ok setpriv"
+/opt/busybox/bin/busybox printf 'x' | /bin/sha3sum 2>/dev/null | grep -qE '^[0-9a-f]{56,}' && echo "BB-W10: ok sha3sum"
+/bin/ipcalc -n 10.0.2.15/24 2>/dev/null | grep -q '10.0.2.0' && echo "BB-W10: ok ipcalc"
+# Leave nothing behind: the BB-SMOKE wave ends with `rmdir /tmp/bb_dir`, which
+# only succeeds on an empty directory.
+rm -rf /tmp/bb_dir/w10 /tmp/bb_dir/w10.cpio
+echo "BB-W10: done"
 rm -rf /tmp/bb_dir/w2b
 rm -rf /tmp/bb_dir/w2
 /opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh /tmp/bb_dir/w5-loop.sh

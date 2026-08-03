@@ -5142,6 +5142,27 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
   if (!arg)
     return -EINVAL;
 
+  /* HDIO_GETGEO: mkfs.vfat and fdisk want a CHS geometry for the boot sector.
+   * No device b1nix drives addresses by cylinder, so the numbers are derived
+   * from the capacity with Linux's own convention (255 heads, 63 sectors) —
+   * the same synthesis Linux performs for every modern disk. */
+  if (node->inode->blk_dev && request == 0x0301) {
+    struct block_device *bd = node->inode->blk_dev;
+    u64 sectors = ((u64)bd->block_size * bd->block_count) / 512;
+    struct {
+      u8 heads;
+      u8 sectors;
+      u16 cylinders;
+      unsigned long start;
+    } geo;
+    geo.heads = 255;
+    geo.sectors = 63;
+    u64 cyl = sectors / (255ull * 63ull);
+    geo.cylinders = (u16)(cyl > 0xFFFF ? 0xFFFF : cyl);
+    geo.start = 0;
+    return syscall_copyout(arg, &geo, sizeof(geo)) < 0 ? -EFAULT : 0;
+  }
+
   /* Block-device size ioctls for BusyBox fdisk. Match on the Linux ioctl
    * "type 0x12" + command number, ignoring the size/dir bits that differ
    * between the 32- and 64-bit ABIs. */
@@ -5167,6 +5188,13 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
       return blk_rescan_partitions(bd) == 0 ? 0 : -EIO;
     case 0x61: /* BLKFLSBUF: flush buffers — accept */
       return 0;
+    case 0x5E: { /* BLKROGET: is the device read-only? */
+      /* Real information rather than a constant: a loop device associated
+       * through a read-only descriptor refuses writes, and blockdev --getro
+       * should say so. */
+      int ro = bd->write_blocks ? 0 : 1;
+      return syscall_copyout(arg, &ro, sizeof(ro)) < 0 ? -EFAULT : 0;
+    }
     default:
       return -ENOTTY;
     }

@@ -344,12 +344,30 @@ B1CC_HOST_CFLAGS ?= -std=c23 -D_DEFAULT_SOURCE -Wall -Wextra -O3 -flto -march=na
 $(B1CC): $(B1CC_DIR)/Makefile $(wildcard $(B1CC_DIR)/src/*.c)
 	$(MAKE) -C $(B1CC_DIR) CC="$(HOST_CC)" CFLAGS="$(B1CC_HOST_CFLAGS)"
 
+# ── Source layout ──
+# bin/ is grouped by purpose so the directory can be navigated at a glance:
+#   bin/smoke/     kernel + POSIX smoke tests (mNN_smoke.c)
+#   bin/gfx/       graphics/browser-stack tests and their servers (M47-M53, M59, M91)
+#   bin/helpers/   programs a test drives rather than a test itself (fixtures,
+#                  target ELFs, tiny servers, the musl bring-up diagnostics)
+#   bin/tools/     b1nix-specific utilities that ship in the image
+#   bin/gui/       the GUI demo applications
+#   bin/compiler/  the b1cc corpus
+# Rules refer to a source through $(call bin_src,NAME) so a program can move
+# between categories without touching a build rule.
+BIN_CATS := smoke gfx helpers tools gui compiler
+# The trailing literal matters: with no fallback an unknown stem yields an empty
+# prerequisite, and a pattern rule with no prerequisites matches ANY target —
+# make then tried to build the -MD dependency files through it (bin/foo.d.o).
+bin_src = $(firstword $(wildcard $(addsuffix /$(1).c,$(addprefix bin/,$(BIN_CATS))) $(addsuffix /$(1).cpp,$(addprefix bin/,$(BIN_CATS)))) bin/$(1).c)
+.SECONDEXPANSION:
+
 # The host b1cc links through the external musl driver (b1nix-musl-cc → musl
 # crt1.o + libc). B1CC_INTERNAL_LD must be UNSET to select the external linker:
 # the host build treats the variable's mere presence (any value, including 0) as
 # "use the internal b1nix-crt0/libb1nix.a linker", so leave it unset for musl.
 $(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(B1CC)
-$(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(BUILD)/bin/%: bin/compiler/%.c
+$(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(BUILD)/bin/%: $$(call bin_src,$$*)
 	@mkdir -p $(dir $@)
 	B1NIX_CC=$(B1CC_BINS_CC) B1CC_SYSROOT_INCLUDE=$(B1CC_SYSROOT_INCLUDE) $(B1CC) --target=$(B1NIX_ARCH)-b1nix $< -o $@
 
@@ -442,20 +460,6 @@ fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null |
 endif
 
 
-# ── Source layout ──
-# bin/ is grouped by purpose so the directory can be navigated at a glance:
-#   bin/smoke/     kernel + POSIX smoke tests (mNN_smoke.c)
-#   bin/gfx/       graphics/browser-stack tests and their servers (M47-M53, M59, M91)
-#   bin/helpers/   programs a test drives rather than a test itself (fixtures,
-#                  target ELFs, tiny servers, the musl bring-up diagnostics)
-#   bin/tools/     b1nix-specific utilities that ship in the image
-#   bin/gui/       the GUI demo applications
-#   bin/compiler/  the b1cc corpus
-# Rules refer to a source through $(call bin_src,NAME) so a program can move
-# between categories without touching a build rule.
-BIN_CATS := smoke gfx helpers tools gui compiler
-bin_src = $(firstword $(wildcard $(addsuffix /$(1).c,$(addprefix bin/,$(BIN_CATS)))))
-.SECONDEXPANSION:
 
 $(BUILD)/bin/%: $$(call bin_src,$$*) $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)
 	@mkdir -p $(dir $@)
@@ -495,7 +499,7 @@ $(BUILD)/bin/displayd: $(DISPLAYD_OBJS) $(GUI_LIB) $(BESPOKE_LIBDEP) $(if $(BESP
 	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
 	)
 
-$(filter-out $(BUILD)/bin/displayd,$(GUI_BINARIES)): $(BUILD)/bin/%: bin/gui/%.c $(GUI_LIB) $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
+$(filter-out $(BUILD)/bin/displayd,$(GUI_BINARIES)): $(BUILD)/bin/%: $$(call bin_src,$$*) $(GUI_LIB) $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/$*.o \
@@ -733,7 +737,7 @@ $(BUILD)/libcxx_compat.o: libcxx_compat.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -c $< -o $@
 
-$(BUILD)/bin/cxx_smoke: bin/cxx_smoke.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBCXX_EXTRA)
+$(BUILD)/bin/cxx_smoke: bin/smoke/cxx_smoke.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBCXX_EXTRA)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/bin/cxx_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(BESPOKE_CXX_EXTRA) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/cxx_smoke.o \
@@ -747,7 +751,7 @@ $(BUILD)/bin/cxx_smoke: bin/cxx_smoke.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBCXX_EXT
 	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
 	)
 
-$(BUILD)/bin/m64_clang_smoke: bin/m64_clang_smoke.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBCXX_EXTRA)
+$(BUILD)/bin/m64_clang_smoke: bin/smoke/m64_clang_smoke.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBCXX_EXTRA)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/bin/m64_clang_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(BESPOKE_CXX_EXTRA) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m64_clang_smoke.o \
@@ -773,7 +777,7 @@ $(BUILD)/bin/m64_clang_smoke: bin/m64_clang_smoke.cpp $(BESPOKE_LIBDEP) $(BESPOK
 # freestanding semantics, e.g. to avoid clang assuming a specific main()
 # signature/builtin behavior — this file specifically needs the hosted
 # standard-library facilities that flag suppresses).
-$(BUILD)/bin/m55_iostream: bin/m55_iostream.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBCXX_EXTRA)
+$(BUILD)/bin/m55_iostream: bin/smoke/m55_iostream.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBCXX_EXTRA)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -U__STDC_HOSTED__ -D__STDC_HOSTED__=1 -c $< -o $(BUILD)/bin/m55_iostream.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(BESPOKE_CXX_EXTRA) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m55_iostream.o \

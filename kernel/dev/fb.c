@@ -119,9 +119,75 @@ static int fb_flush_rect(struct b1nix_fb_rect *r) {
   return 0;
 }
 
+/* Linux's own framebuffer interface, so fbset and anything else written for
+ * /dev/fb0 works without a b1nix-specific code path. Only the two GET ioctls
+ * exist: the mode is fixed by whatever the bootloader handed us, so accepting
+ * FBIOPUT_VSCREENINFO would mean reporting a mode change that never happened. */
+#define FBIOGET_VSCREENINFO 0x4600
+#define FBIOGET_FSCREENINFO 0x4602
+
+struct fb_bitfield_u {
+  u32 offset;
+  u32 length;
+  u32 msb_right;
+};
+
+struct fb_var_screeninfo_u {
+  u32 xres, yres, xres_virtual, yres_virtual, xoffset, yoffset;
+  u32 bits_per_pixel, grayscale;
+  struct fb_bitfield_u red, green, blue, transp;
+  u32 nonstd, activate, height, width, accel_flags;
+  u32 pixclock, left_margin, right_margin, upper_margin, lower_margin;
+  u32 hsync_len, vsync_len, sync, vmode, rotate, colorspace;
+  u32 reserved[4];
+};
+
+struct fb_fix_screeninfo_u {
+  char id[16];
+  unsigned long smem_start;
+  u32 smem_len;
+  u32 type, type_aux, visual;
+  u16 xpanstep, ypanstep, ywrapstep;
+  u32 line_length;
+  unsigned long mmio_start;
+  u32 mmio_len;
+  u32 accel;
+  u16 capabilities;
+  u16 reserved[2];
+};
+
 static int fb_ioctl(struct vfs_node *node, u64 request, void *arg) {
   (void)node;
   switch (request) {
+  case FBIOGET_VSCREENINFO: {
+    struct fb_var_screeninfo_u v;
+    memset(&v, 0, sizeof(v));
+    v.xres = v.xres_virtual = fb_console_width();
+    v.yres = v.yres_virtual = fb_console_height();
+    v.bits_per_pixel = 32;
+    /* XRGB8888, which is what fb_console renders and what the shadow holds. */
+    v.red.offset = 16; v.red.length = 8;
+    v.green.offset = 8; v.green.length = 8;
+    v.blue.offset = 0; v.blue.length = 8;
+    v.transp.offset = 24; v.transp.length = 0;
+    if (!arg || syscall_copyout(arg, &v, sizeof(v)) < 0)
+      return -EFAULT;
+    return 0;
+  }
+  case FBIOGET_FSCREENINFO: {
+    struct fb_fix_screeninfo_u f;
+    memset(&f, 0, sizeof(f));
+    const char *id = "b1nix-fb";
+    for (int i = 0; id[i] && i < 15; i++)
+      f.id[i] = id[i];
+    f.smem_len = fb_console_width() * fb_console_height() * 4u;
+    f.type = 0;   /* FB_TYPE_PACKED_PIXELS */
+    f.visual = 2; /* FB_VISUAL_TRUECOLOR */
+    f.line_length = fb_console_width() * 4u;
+    if (!arg || syscall_copyout(arg, &f, sizeof(f)) < 0)
+      return -EFAULT;
+    return 0;
+  }
   case B1NIX_FBIOGET_INFO: {
     struct b1nix_fb_info info;
     info.width = fb_console_width();
