@@ -218,4 +218,8 @@ void nvme_init(void);
  * M98-DRV-SMOKE markers; no-op outside b1nix.test=1. */
 void nvme_msix_selftest(void);
 
+/* M100b: run the controller inside its own IOMMU domain with only its queues
+ * and the transfer's buffer mapped, and read a block through it. */
+void nvme_iommu_selftest(void);
+
 #endif // B1NIX_NVME_H

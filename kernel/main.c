@@ -30,6 +30,7 @@
 #include <b1nix/fuse.h>
 #include <b1nix/procfs.h>
 #include <b1nix/ahci.h>
+#include <b1nix/iommu.h>
 #include <b1nix/nvme.h>
 #include <lkpi/dma-mapping.h>
 #include <b1nix/filelock.h>
@@ -302,6 +303,11 @@ void kernel_main(usize arg0, usize arg1)
 	 * every other allocation did. Needs kheap (for the frame map) and nothing
 	 * else, and must precede every driver that could map for DMA. */
 	dma_bounce_pool_init();
+
+	/* M100b: bring up DMA remapping before any driver programs a device. Every
+	 * function starts in pass-through, so this changes nothing for a driver
+	 * that has not asked for translation. */
+	iommu_init();
 
 	vfs_init();
 	page_cache_init();
@@ -771,6 +777,7 @@ void kernel_main(usize arg0, usize arg1)
 		 * blocks) and a controller that has finished initialising, so it runs
 		 * here rather than in the early self-test block with the rest of M98. */
 		nvme_msix_selftest();
+		iommu_selftest();     /* M100b: VT-d DMA remapping */
 		lkpi_selftest();      /* M99: idr, completion, workqueue, sg, dma, fw */
 		dma_fence_selftest(); /* M100: dma-fence */
 		drm_sched_selftest(); /* M100: GPU scheduler + scatter-gather BOs */

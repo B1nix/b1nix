@@ -780,7 +780,7 @@ Status:
 - [x] Add bounce buffers for a device whose address window misses the memory it is handed.
 - [x] Bounce an sg table into one block when possible, so a device sees no extra segments.
 - [x] Wrap spinlocks and sleeping mutexes so the never-sleep rule shows in the type.
-- [ ] Add an IOMMU so a narrow mask means "map it low" instead of "copy it".
+- [x] Map through the IOMMU when one is present, so a narrow mask means "map it low" instead of "copy it".
 
 ## M100: DRM Core — dma-fence, scheduler, GEM (proven on virtio-gpu)
 
@@ -801,11 +801,16 @@ Status:
 
 ## M100b: IOMMU
 
-- [ ] Parse the ACPI DMAR table and program Intel VT-d root, context and page tables.
-- [ ] Map buffers into a device's own address space from `dma_map_single` and `dma_map_sg`.
-- [ ] Keep bouncing as the fallback for a device with no translation unit.
-- [ ] Isolate devices: a device reaches the buffer it was given and nothing else.
-- [ ] Add AMD-Vi with the same model.
+- [x] Parse the ACPI DMAR table and bring up the Intel VT-d unit.
+- [x] Program root and context tables, and enable translation without breaking any driver.
+- [x] Identity-map memory with 2 MiB pages when the unit offers no pass-through.
+- [x] Add second-level page tables with map, unmap and translate.
+- [x] Add a device address allocator with reuse.
+- [x] Route `dma_map_single` and `dma_map_sg` through translation for an attached device.
+- [x] Run NVMe in its own domain with only its queues and buffers mapped, and read through it.
+- [x] Record and report DMA faults, so "the device touched nothing else" is the unit's answer.
+- [x] Block a violation: the codec is given its descriptor list but not its audio buffer, and the read it was not granted is stopped and recorded.
+- [ ] Add AMD-Vi (no hardware to test it on).
 
 ## M101: Intel i915 (Gen8/Gen9.5) + Mesa iris
 

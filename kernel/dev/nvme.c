@@ -1,10 +1,12 @@
 #include <b1nix/blk.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
+#include <b1nix/iommu.h>
 #include <b1nix/irq.h>
 #include <b1nix/mm.h>
 #include <b1nix/nvme.h>
 #include <b1nix/pci.h>
+#include <lkpi/dma-mapping.h>
 #include <b1nix/sched.h>
 #include <string.h>
 
@@ -700,4 +702,120 @@ void nvme_msix_selftest(void)
     console_write(" hits=");
     console_write_dec((u64)(after - before));
     console_write("\n");
+}
+
+/* ── M100b: NVMe through the IOMMU ──────────────────────────────────
+ *
+ * The controller is moved out of the identity domain into one of its own, and
+ * exactly the pages it legitimately touches are mapped there: its queues, its
+ * PRP list and the buffer of the transfer under way. Everything else in memory
+ * stops existing as far as this device is concerned — which is the property an
+ * IOMMU is for, and the reason this is done with a device that really DMAs
+ * rather than with a bridge that does not.
+ *
+ * The mappings are identity (device address == physical address) so the driver
+ * keeps programming the addresses it always did; what changes is that those
+ * addresses now have to be *granted*.
+ */
+static int nvme_iommu_map_own_pages(void)
+{
+    usize sq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe);
+    usize cq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe);
+    if (iommu_map_identity(nvme.phys_admin_sq, sq_bytes, 1) != 0 ||
+        iommu_map_identity(nvme.phys_admin_cq, cq_bytes, 1) != 0 ||
+        iommu_map_identity(nvme.phys_io_sq, sq_bytes, 1) != 0 ||
+        iommu_map_identity(nvme.phys_io_cq, cq_bytes, 1) != 0 ||
+        iommu_map_identity(nvme.phys_identify_buf, NVME_PAGE_SIZE, 1) != 0)
+        return -1;
+    return 0;
+}
+
+static void nvme_iommu_unmap_own_pages(void)
+{
+    usize sq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe);
+    usize cq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe);
+    iommu_unmap(nvme.phys_admin_sq & ~(u64)(NVME_PAGE_SIZE - 1), sq_bytes);
+    iommu_unmap(nvme.phys_admin_cq & ~(u64)(NVME_PAGE_SIZE - 1), cq_bytes);
+    iommu_unmap(nvme.phys_io_sq & ~(u64)(NVME_PAGE_SIZE - 1), sq_bytes);
+    iommu_unmap(nvme.phys_io_cq & ~(u64)(NVME_PAGE_SIZE - 1), cq_bytes);
+    iommu_unmap(nvme.phys_identify_buf & ~(u64)(NVME_PAGE_SIZE - 1),
+                NVME_PAGE_SIZE);
+}
+
+void nvme_iommu_selftest(void)
+{
+    if (!bootinfo_has_flag("b1nix.test=1"))
+        return;
+    if (!iommu_active())
+        return; /* the M100B suite already reports the absence of a unit */
+    if (!nvme.regs) {
+        console_write("M100B-SMOKE: skip nvme-translated (no controller)\n");
+        return;
+    }
+
+    /* A reference read from the identity domain, so the comparison later is
+     * against data this machine really holds and not against a constant. */
+    u8 *ref = (u8 *)kmalloc(512);
+    u8 *buf = (u8 *)kmalloc(512);
+    if (!ref || !buf) {
+        if (ref) kfree(ref);
+        if (buf) kfree(buf);
+        console_write("M100B-SMOKE: FAIL nvme-translated detail=1\n");
+        return;
+    }
+    if (nvme_blk_read(&nvme.blk_dev, 0, 1, ref) != 1) {
+        kfree(ref); kfree(buf);
+        console_write("M100B-SMOKE: FAIL nvme-translated detail=2\n");
+        return;
+    }
+
+    struct dma_device dev;
+    if (dma_device_attach(&dev, nvme.pci_bus, nvme.pci_slot, nvme.pci_func,
+                          0xFFFFFFFFFFFFFFFFULL) != 0) {
+        kfree(ref); kfree(buf);
+        console_write("M100B-SMOKE: FAIL nvme-translated detail=3\n");
+        return;
+    }
+
+    int ok = 1;
+    u64 data_phys = vmm_virt_to_phys(buf);
+    if (nvme_iommu_map_own_pages() != 0 ||
+        iommu_map_identity(data_phys, 512, 1) != 0)
+        ok = 0;
+
+    /* Nothing else is mapped for this controller: an address it was not given
+     * does not translate. */
+    u64 stray = pmm_alloc_frame();
+    if (ok && stray && iommu_translate(stray) != 0)
+        ok = 0;
+
+    iommu_fault_clear();
+    memset(buf, 0, 512);
+    int rc = ok ? nvme_blk_read(&nvme.blk_dev, 0, 1, buf) : -1;
+    u32 faults = iommu_fault_count();
+
+    if (rc != 1 || memcmp(buf, ref, 512) != 0)
+        ok = 0;
+    /* Every address the controller emitted was one of the mapped ones, or the
+     * unit would have recorded a fault. */
+    if (faults != 0)
+        ok = 0;
+
+    iommu_unmap(data_phys & ~(u64)(NVME_PAGE_SIZE - 1), 512);
+    nvme_iommu_unmap_own_pages();
+    dma_device_detach(&dev);
+    if (stray)
+        pmm_free_frame(stray);
+
+    if (ok) {
+        console_write("M100B-SMOKE: ok nvme-translated (read through its own domain, no faults)\n");
+    } else {
+        console_write("M100B-SMOKE: FAIL nvme-translated rc=");
+        console_write_dec((u64)(i64)rc);
+        console_write(" faults=");
+        console_write_dec((u64)faults);
+        console_write("\n");
+    }
+    kfree(ref);
+    kfree(buf);
 }

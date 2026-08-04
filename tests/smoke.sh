@@ -469,7 +469,7 @@ _mkimg() {  # mkimg <instance-suffix>
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
-    _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg init
+    _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg init; _mkimg iommu
 }
 
 # Define logs
@@ -481,6 +481,7 @@ POSIX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-posix-$ARCH.log"
 GFX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-gfx-$ARCH.log"
 OPENRC_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-openrc-$ARCH.log"
 INIT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-init-$ARCH.log"
+IOMMU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-iommu-$ARCH.log"
 
 echo ""
 if [ "$SMOKE_PARALLEL" = "1" ]; then
@@ -622,6 +623,24 @@ launch_init() {
 	pid_init=$!
 }
 
+# M100b: the same OpenRC ISO, on a q35 machine with an Intel IOMMU in front of
+# every device. No new image is needed — the VT-d work is kernel-side and its
+# self-test runs on any test boot; what this instance supplies is the hardware.
+launch_iommu() {
+	(
+		SATA_IMG=$(disk_img sata iommu)
+		NVME_IMG=$(disk_img nvme iommu)
+		SWAP_IMG=$(disk_img swap iommu)
+		B1NIX_ISO_NAME=b1nix-openrc.iso
+		EXTRA_QEMU_ARGS="-machine q35,kernel-irqchip=split -device intel-iommu,intremap=off"
+		SMOKE_DONE_PATTERN="reboot: powering off|KERNEL PANIC|\[PANIC\]"
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[iommu]"
+		run_qemu "$IOMMU_LOG"
+	) &
+	pid_iommu=$!
+}
+
 launch_v8() {
 	(
 		SATA_IMG=$(disk_img sata v8)
@@ -696,7 +715,7 @@ run_slot_pool() {
 if [ "$SMOKE_PARALLEL" = "1" ]; then
 	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
-	_inst_list="sys blk posix gfx openrc init"
+	_inst_list="sys blk posix gfx openrc init iommu"
 	[ "$SMOKE_V8" = "1" ] && _inst_list="$_inst_list v8"
 	[ -n "${SMOKE_INSTANCES:-}" ] && _inst_list="$SMOKE_INSTANCES"
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
@@ -724,7 +743,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	for _i in sys blk posix gfx openrc init smp v8; do
+	for _i in sys blk posix gfx openrc init iommu smp v8; do
 	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
@@ -1942,6 +1961,16 @@ check_output "$INIT_LOG" "M108-SMOKE: ok init-openrc-runlevels" "OpenRC's defaul
 check_output "$INIT_LOG" "M108-SMOKE: ok init-shell" "the BusyBox-init boot reaches a usable shell"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-reaps-orphan" "BusyBox init reaps an orphaned grandchild re-parented to PID 1"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-respawns-getty" "killing the inittab getty makes PID 1 respawn it as a new process"
+# ── M100b: VT-d DMA remapping ──
+check_output "$IOMMU_LOG" "iommu: VT-d at" "M100b: the DMAR table is parsed and the remapping unit is brought up"
+check_output "$IOMMU_LOG" "M100B-SMOKE: ok vtd-enable" "M100b: the unit reports translation enabled and pointing at our root table"
+check_output "$IOMMU_LOG" "M100B-SMOKE: ok vtd-map" "M100b: a mapping installed through the API is what the hardware page tables say"
+check_output "$IOMMU_LOG" "M100B-SMOKE: ok vtd-unmap" "M100b: unmapping removes the translation"
+check_output "$IOMMU_LOG" "M100B-SMOKE: ok vtd-dma-map" "M100b: dma_map for a translated device returns an address from the IOMMU window that the page tables point at the caller's buffer — no copy"
+check_output "$IOMMU_LOG" "M100B-SMOKE: ok vtd-iova" "M100b: the device address allocator hands out distinct ranges and reuses freed ones"
+check_output "$IOMMU_LOG" "M100B-SMOKE: ok nvme-translated" "M100b: NVMe runs in its own domain with only its queues and the transfer buffer mapped, reads a block, and the unit records no fault"
+check_output "$IOMMU_LOG" "M100B-SMOKE: ok vtd-blocks-violation" "M100b: a device given its descriptor list but not its data buffer is stopped by the unit, and the fault is recorded"
+check_output "$IOMMU_LOG" "reboot: powering off" "M100b: the machine still boots and shuts down with translation on"
 check_output "$INIT_LOG" "M108-SMOKE: done-init" "M108 BusyBox-init instance completes"
 # ── M86: per-thread CPU accounting + thread-directed signals ──
 check_output "$LOG" "M86-SMOKE: ok thread-cputime" "CLOCK_THREAD_CPUTIME_ID tracks CPU actually burned and stays flat while the thread sleeps"
@@ -2377,7 +2406,7 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-for _i in sys blk posix gfx openrc init smp v8; do
+for _i in sys blk posix gfx openrc init iommu smp v8; do
     rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
 done
 echo ""

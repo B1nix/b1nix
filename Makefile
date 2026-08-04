@@ -474,6 +474,7 @@ ifneq ($(filter $(ARCH),x86_64),)
 KERNEL_SOURCES += \
 	kernel/bootinfo/multiboot2.c \
 	kernel/dev/pci.c \
+	kernel/dev/iommu.c \
 	kernel/dev/virtio.c \
 	kernel/dev/virtio_blk.c \
 	kernel/dev/virtio_net.c \

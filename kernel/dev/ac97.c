@@ -16,6 +16,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/io.h>
 #include <b1nix/mm.h>
+#include <b1nix/iommu.h>
 #include <b1nix/pci.h>
 #include <b1nix/sched.h>
 #include <b1nix/sound.h>
@@ -73,6 +74,7 @@ struct ac97_bd {
 static u16 ac97_nam_port;
 static u16 ac97_nabm_port;
 static int ac97_inited;
+static u8 ac97_pci_bus, ac97_pci_slot, ac97_pci_func;
 
 static u64 ac97_dma_buf_phys;
 static u8  *ac97_dma_buf;
@@ -292,6 +294,9 @@ void ac97_init(void) {
 	}
 	ac97_nam_port = (u16)(bar0 & 0xFFFC);
 	ac97_nabm_port = (u16)(bar1 & 0xFFFC);
+	ac97_pci_bus = pci.bus;
+	ac97_pci_slot = pci.slot;
+	ac97_pci_func = pci.func;
 
 	/* Read the codec vendor to confirm a codec is attached. */
 	u16 vid1 = inw(ac97_nam_port + AC97_NA_VENDOR_ID1);
@@ -404,4 +409,61 @@ void ac97_selftest(void) {
 	console_write("M79-AC97: ok play-tone\n");
 
 	console_write("M79-AC97: ok done\n");
+}
+
+/* ── M100b: the violation an IOMMU exists to block ──────────────────
+ *
+ * Every other check here shows the unit letting through what was granted. This
+ * one shows it refusing what was not: the codec is given its descriptor list
+ * and nothing else, then told to play — so the descriptor fetch succeeds and
+ * the audio-buffer read, which nobody mapped, is stopped by the unit and
+ * recorded as a fault.
+ *
+ * Audio is the right device to ask. A blocked transfer here loses a fraction of
+ * a second of silence and the channel is reset immediately afterwards, whereas
+ * doing the same to a storage or network device would strand a queue nothing
+ * retries.
+ *
+ * Returns 1 when the unit recorded the fault, 0 when it did not, -1 when there
+ * is no codec to ask.
+ */
+int ac97_iommu_violation_probe(void)
+{
+	if (!ac97_inited || !iommu_active())
+		return -1;
+
+	if (iommu_attach_device(ac97_pci_bus, ac97_pci_slot, ac97_pci_func) != 0)
+		return -1;
+
+	/* Grant the descriptor list. Deliberately not the audio buffer. */
+	int mapped = iommu_map_identity(ac97_bdl_phys, PAGE_SIZE, 1) == 0;
+	iommu_fault_clear();
+
+	u32 faults = 0;
+	if (mapped) {
+		struct ac97_bd *bdl =
+			(struct ac97_bd *)(usize)(ac97_bdl_phys + vmm_direct_map_base());
+		u32 idx = ac97_bd_idx & 31;
+		bdl[idx].addr = (u32)ac97_dma_buf_phys;
+		bdl[idx].ctl_len = (4096 / 2) | AC97_BD_IOC;
+		outw(ac97_nabm_port + AC97_PO_SR, AC97_SR_BCIS);
+		outb(ac97_nabm_port + AC97_PO_LVI, (u8)(idx & 0xFF));
+		outb(ac97_nabm_port + AC97_PO_CR, AC97_CR_RPBM);
+		ac97_bd_idx++;
+
+		u64 start = scheduler_get_ticks();
+		while (scheduler_get_ticks() - start < 50) { /* up to 0.5 s */
+			faults = iommu_fault_count();
+			if (faults)
+				break;
+			scheduler_yield();
+		}
+		outb(ac97_nabm_port + AC97_PO_CR, 0); /* stop the channel */
+		outw(ac97_nabm_port + AC97_PO_SR, AC97_SR_BCIS);
+	}
+
+	iommu_unmap(ac97_bdl_phys & ~(u64)(PAGE_SIZE - 1), PAGE_SIZE);
+	iommu_detach_device(ac97_pci_bus, ac97_pci_slot, ac97_pci_func);
+	iommu_fault_clear();
+	return faults ? 1 : 0;
 }

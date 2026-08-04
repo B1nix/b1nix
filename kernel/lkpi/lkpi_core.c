@@ -6,6 +6,7 @@
 
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
+#include <b1nix/iommu.h>
 #include <b1nix/memtype.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
@@ -726,6 +727,146 @@ void dma_unmap_sg(struct sg_table *sgt, int direction)
 		dma_cache_for_cpu(addr, sg->length, direction);
 		sg->dma_address = 0;
 	}
+}
+
+/* ── device-scoped mapping (IOMMU) ──────────────────────────────── */
+
+int dma_device_attach(struct dma_device *dev, u8 bus, u8 slot, u8 func,
+                      u64 dma_mask)
+{
+	if (!dev)
+		return -1;
+	dev->bus = bus;
+	dev->slot = slot;
+	dev->func = func;
+	dev->dma_mask = dma_mask ? dma_mask : dma_addressable_limit() - 1;
+	dev->translated = 0;
+	if (!iommu_active())
+		return -1;
+	if (iommu_attach_device(bus, slot, func) != 0)
+		return -1;
+	dev->translated = 1;
+	return 0;
+}
+
+void dma_device_detach(struct dma_device *dev)
+{
+	if (!dev || !dev->translated)
+		return;
+	iommu_detach_device(dev->bus, dev->slot, dev->func);
+	dev->translated = 0;
+}
+
+dma_addr_t dma_map_single_dev(struct dma_device *dev, void *cpu_addr,
+                              usize size, int direction)
+{
+	if (!dev || !dev->translated)
+		return dma_map_single_masked(cpu_addr, size,
+		                             direction,
+		                             dev ? dev->dma_mask
+		                                 : dma_addressable_limit() - 1);
+	if (!cpu_addr || size == 0)
+		return 0;
+
+	u64 phys = vmm_virt_to_phys(cpu_addr);
+	u64 dm = vmm_direct_map_base();
+	if (!phys && (u64)(usize)cpu_addr >= dm)
+		phys = (u64)(usize)cpu_addr - dm;
+	if (!phys)
+		return 0;
+
+	/* Map whole pages: the unit translates at page granularity, and the byte
+	 * offset rides along in the address handed back. */
+	u64 page = phys & ~(u64)(PAGE_SIZE - 1);
+	u64 offset = phys - page;
+	usize span = (usize)(offset + size);
+	u64 iova = iommu_iova_alloc(span);
+	if (!iova)
+		return 0;
+	if (iommu_map(iova, page, span, direction != DMA_TO_DEVICE) != 0) {
+		iommu_iova_free(iova, span);
+		return 0;
+	}
+	dma_cache_for_device(phys, size, direction);
+	return iova + offset;
+}
+
+void dma_unmap_single_dev(struct dma_device *dev, dma_addr_t handle,
+                          usize size, int direction)
+{
+	if (!dev || !dev->translated) {
+		dma_unmap_single(handle, size, direction);
+		return;
+	}
+	u64 iova = handle & ~(u64)(PAGE_SIZE - 1);
+	usize span = (usize)((handle - iova) + size);
+	u64 phys = iommu_translate(handle);
+	iommu_unmap(iova, span);
+	iommu_iova_free(iova, span);
+	if (phys)
+		dma_cache_for_cpu(phys, size, direction);
+}
+
+u32 dma_map_sg_dev(struct dma_device *dev, struct sg_table *sgt, int direction)
+{
+	if (!dev || !dev->translated)
+		return dma_map_sg_masked(sgt, direction,
+		                         dev ? dev->dma_mask
+		                             : dma_addressable_limit() - 1);
+	if (!sgt || !sgt->sgl || sgt->nents == 0)
+		return 0;
+
+	/* One IOVA range for the whole table: the runs are scattered in physical
+	 * memory, but the device sees them contiguous. That is the thing an IOMMU
+	 * can do and a bounce buffer can only imitate by copying. */
+	u64 total = 0;
+	for (u32 i = 0; i < sgt->nents; i++) {
+		if (sgt->sgl[i].length == 0)
+			return 0;
+		total += sgt->sgl[i].length;
+	}
+	u64 base = iommu_iova_alloc((usize)total);
+	if (!base)
+		return 0;
+
+	u64 off = 0;
+	for (u32 i = 0; i < sgt->nents; i++) {
+		struct scatterlist *sg = &sgt->sgl[i];
+		u64 phys = sg->phys + sg->offset;
+		if (iommu_map(base + off, phys & ~(u64)(PAGE_SIZE - 1),
+		              (usize)(sg->length + (phys & (PAGE_SIZE - 1))),
+		              direction != DMA_TO_DEVICE) != 0) {
+			iommu_unmap(base, (usize)total);
+			iommu_iova_free(base, (usize)total);
+			return 0;
+		}
+		sg->dma_address = base + off + (phys & (PAGE_SIZE - 1));
+		dma_cache_for_device(phys, sg->length, direction);
+		off += sg->length;
+	}
+	return sgt->nents;
+}
+
+void dma_unmap_sg_dev(struct dma_device *dev, struct sg_table *sgt,
+                      int direction)
+{
+	if (!dev || !dev->translated) {
+		dma_unmap_sg(sgt, direction);
+		return;
+	}
+	if (!sgt || !sgt->sgl || sgt->nents == 0)
+		return;
+	u64 total = 0;
+	for (u32 i = 0; i < sgt->nents; i++) {
+		dma_cache_for_cpu(sgt->sgl[i].phys + sgt->sgl[i].offset,
+		                  sgt->sgl[i].length, direction);
+		total += sgt->sgl[i].length;
+	}
+	u64 base = sgt->sgl[0].dma_address & ~(u64)(PAGE_SIZE - 1);
+	iommu_unmap(base, (usize)total);
+	iommu_iova_free(base, (usize)total);
+	for (u32 i = 0; i < sgt->nents; i++)
+		sgt->sgl[i].dma_address = 0;
 }
 
 /* ── sleeping mutex ─────────────────────────────────────────────── */

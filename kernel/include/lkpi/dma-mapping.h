@@ -104,6 +104,37 @@ void dma_unmap_sg(struct sg_table *sgt, int direction);
  * inside the window keep their own address. dma_unmap_sg undoes both kinds. */
 u32 dma_map_sg_masked(struct sg_table *sgt, int direction, u64 dma_mask);
 
+/*
+ * A device that has its own address space (M100b).
+ *
+ * With an IOMMU in front of it a device no longer sees physical addresses, so a
+ * narrow dma_mask stops meaning "copy the buffer somewhere it can reach" and
+ * starts meaning "give it an address it can reach" — which is what these calls
+ * do once dma_device_attach() has moved the function into a translated domain.
+ * Without an IOMMU (or before attaching) they behave exactly like the masked
+ * calls above, bounce buffers and all, so a driver can use one code path.
+ */
+struct dma_device {
+	u8 bus, slot, func;
+	u64 dma_mask;
+	int translated; /* 1 once the IOMMU is mapping for this function */
+};
+
+/* Take the function out of the identity/pass-through domain. Returns 0 when the
+ * device is now translated, -1 when there is no IOMMU (the struct is still
+ * usable — mappings just go through the ordinary path). */
+int dma_device_attach(struct dma_device *dev, u8 bus, u8 slot, u8 func,
+                      u64 dma_mask);
+void dma_device_detach(struct dma_device *dev);
+
+dma_addr_t dma_map_single_dev(struct dma_device *dev, void *cpu_addr,
+                              usize size, int direction);
+void dma_unmap_single_dev(struct dma_device *dev, dma_addr_t handle,
+                          usize size, int direction);
+u32 dma_map_sg_dev(struct dma_device *dev, struct sg_table *sgt, int direction);
+void dma_unmap_sg_dev(struct dma_device *dev, struct sg_table *sgt,
+                      int direction);
+
 /* Highest device address this kernel will hand out. Everything the frame
  * allocator returns lies inside the direct map, so this reports that ceiling
  * rather than a fixed 32/64-bit mask. */
