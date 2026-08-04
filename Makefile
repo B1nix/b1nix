@@ -550,7 +550,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@echo "Analysis results in $(ANALYZE_DIR)"
 	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
 
-.PHONY: all analyze objects FORCE iso iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-bbinit iso-live iso-test iso-full check-dynamic \
+.PHONY: all analyze objects FORCE iso iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-live iso-test iso-full check-dynamic \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source install-ports root-image disk-image \
@@ -1410,23 +1410,25 @@ iso: check-b1cc-sync root-image check-dynamic $(KERNEL_ELF)
 
 # Smoke-suite ISOs: single pattern rule for all categories.
 # Each suite gets its own cmdline; kernel ELF + root.ext4 are shared.
-SMOKE_CMDLINE_sys=init=/sbin/openrc-init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=sys
-SMOKE_CMDLINE_gfx=init=/sbin/openrc-init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=gfx
-SMOKE_CMDLINE_posix=init=/sbin/openrc-init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=posix
-SMOKE_CMDLINE_blk=init=/sbin/openrc-init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=blk
+# No `init=` on these: they boot the DEFAULT PID 1, /sbin/init (BusyBox init),
+# with /etc/inittab handing the runlevels to OpenRC — the configuration an
+# ordinary boot uses, so the whole suite runs on it rather than on a variant.
+SMOKE_CMDLINE_sys=b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=sys
+SMOKE_CMDLINE_gfx=b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=gfx
+SMOKE_CMDLINE_posix=b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=posix
+SMOKE_CMDLINE_blk=b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=blk
 # OpenRC ctltest: boots the real init system as PID 1 and drives sysinit/boot/default,
 # then a local.d hook asks PID 1 to power off through /run/openrc/init.ctl — the
 # control-FIFO path openrc-shutdown and telinit use. A clean poweroff proves the channel works.
 SMOKE_CMDLINE_openrc=init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest
-# M108 bbinit: BusyBox init as PID 1 instead of openrc-init. openrc-init stays
-# the DEFAULT PID 1 (kernel/main.c); BusyBox init is opt-in through the standard
-# M94 `init=` cmdline parameter, which is exactly the selection mechanism M94
-# built. /etc/inittab then drives the SAME OpenRC runlevels (Alpine's model:
-# BusyBox init supervises, OpenRC provides the services), so both inits reach
-# the same usable system. This instance proves the BusyBox side end to end.
-SMOKE_CMDLINE_bbinit=init=/opt/busybox/bin/init b1nix.test=1 b1nix.smoke=bbinit
+# M108 init: the default boot, checked as such. PID 1 is /sbin/init (BusyBox
+# init, no `init=` needed) and /etc/inittab drives OpenRC's runlevels under it.
+# This instance runs no part of the ordinary suite — it exists to prove the
+# things only PID 1 can be asked about: its own identity, orphan reaping, getty
+# respawn, and that OpenRC's default runlevel really ran underneath.
+SMOKE_CMDLINE_init=b1nix.test=1 b1nix.smoke=init
 
-iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-bbinit: root-image check-dynamic $(KERNEL_ELF)
+iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init: root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
@@ -1442,7 +1444,7 @@ iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-bbinit: root-image check-dynami
 iso-v8: $(KERNEL_ELF) root-image
 	@$(MKISO) --stage $(BUILD_DIR)/iso-v8 --out $(BUILD_DIR)/b1nix-v8.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "init=/sbin/openrc-init b1nix.test=1 b1nix.v8run b1nix.smoke=v8" \
+	    --cmdline "b1nix.test=1 b1nix.v8run b1nix.smoke=v8" \
 	    --module $(BUILD_DIR)/root.ext4:rootfs.img \
 	    --module $(BUILD_ROOT)/v8-out/v8-ext4.img:v8.img
 # NOTE: the smoke v8 instance runs JITLESS (no b1nix.v8jit) — that is the proven
@@ -1469,7 +1471,7 @@ disk-iso: disk-image iso-live
 iso-test: root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/iso-test --out $(BUILD_DIR)/b1nix-test.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "$(KERNEL_CMDLINE) init=/sbin/openrc-init b1nix.test=1" \
+	    --cmdline "$(KERNEL_CMDLINE) b1nix.test=1" \
 	    --module $(BUILD_DIR)/root.ext4:rootfs.img
 
 userspace: $(USERSPACE_DEPS)

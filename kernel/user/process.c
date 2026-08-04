@@ -770,6 +770,13 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
 
   image->kind = USER_IMAGE_ELF64;
   image->path = kernel_strdup(path);
+  {
+    /* ...and, separately, the file that was really loaded — see
+     * user_exec_realpath(). */
+    char real[VFS_MAX_PATH];
+    user_exec_realpath(path, real, sizeof(real));
+    image->real_path = kernel_strdup(real);
+  }
 
   /* M40: tag the binary personality. A Linux binary gets its syscall numbers
    * translated at dispatch time. */
@@ -1095,6 +1102,8 @@ void user_image_free(struct user_loaded_image *image) {
 
   if (image->path)
     kfree((void *)image->path);
+  if (image->real_path)
+    kfree((void *)image->real_path);
 
   if (image->argv) {
     for (int i = 0; i < image->argc; i++) {
@@ -1230,6 +1239,11 @@ static int user_load_elf32(struct user_loaded_image *image, const char *path) {
 
   image->kind = USER_IMAGE_ELF32;
   image->path = kernel_strdup(path);
+  {
+    char real[VFS_MAX_PATH];
+    user_exec_realpath(path, real, sizeof(real));
+    image->real_path = kernel_strdup(real);
+  }
 
   u64 load_base = (ehdr->e_type == ELF_TYPE_DYN) ? PIE_LOAD_BASE : 0;
 
@@ -2037,6 +2051,51 @@ int user_spawn_env(const char *path, int argc, const char **argv,
   return tid;
 }
 
+/* Canonical path of the file an exec actually loaded.
+ *
+ * /proc/<pid>/exe must name that file, not the name used to reach it: on Linux
+ * the symlink resolves to the executable's inode, so a PID 1 started as
+ * /sbin/init (a symlink onto the BusyBox multicall ELF) reads back as
+ * /opt/busybox/bin/busybox. Follow the final symlink chain — bounded, since a
+ * loop would otherwise spin here — and hand back the destination. Anything that
+ * is not a symlink (or a link we cannot resolve) is copied through unchanged.
+ */
+void user_exec_realpath(const char *path, char *out, usize outsz) {
+  char cur[VFS_MAX_PATH], target[VFS_MAX_PATH], joined[VFS_MAX_PATH];
+  int hops;
+
+  if (!path || !out || outsz == 0)
+    return;
+  strncpy(cur, path, sizeof(cur) - 1);
+  cur[sizeof(cur) - 1] = '\0';
+
+  for (hops = 0; hops < 8; hops++) {
+    isize n = vfs_readlink(cur, target, sizeof(target) - 1);
+    if (n <= 0)
+      break; /* not a symlink (-EINVAL) or unreadable: cur is the answer */
+    target[n] = '\0';
+    if (target[0] == '/') {
+      strncpy(joined, target, sizeof(joined) - 1);
+      joined[sizeof(joined) - 1] = '\0';
+    } else {
+      /* Relative target: resolve against the directory holding the link. */
+      char *slash;
+      strncpy(joined, cur, sizeof(joined) - 1);
+      joined[sizeof(joined) - 1] = '\0';
+      slash = strrchr(joined, '/');
+      if (slash)
+        slash[1] = '\0';
+      else
+        joined[0] = '\0';
+      strncat(joined, target, sizeof(joined) - strlen(joined) - 1);
+    }
+    vfs_resolve_path(joined, cur); /* normalises . and .. */
+  }
+
+  strncpy(out, cur, outsz - 1);
+  out[outsz - 1] = '\0';
+}
+
 /* Full executable path of a task, for /proc/<pid>/exe. user_spawn stores only
  * the comm basename in task->name (so ps/pidof/pkill match correctly), but the
  * loaded image keeps the full path — which tools like clang's getMainExecutable
@@ -2045,6 +2104,8 @@ const char *user_task_exe_path(struct task *t) {
   if (!t)
     return 0;
   struct user_loaded_image *img = t->user_image;
+  if (img && img->real_path && img->real_path[0])
+    return img->real_path;
   if (img && img->path && img->path[0])
     return img->path;
   return t->name; /* fallback: execve already stores the full path in name */

@@ -431,12 +431,12 @@ else
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
 		V8_ISO_TARGET=""
 		[ "$SMOKE_V8" = "1" ] && V8_ISO_TARGET="iso-v8"
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-bbinit $V8_ISO_TARGET >"$BUILD_LOG" 2>&1 || {
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init $V8_ISO_TARGET >"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
 		}
 	else
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="init=/sbin/openrc-init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >"$BUILD_LOG" 2>&1 || {
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
 		}
@@ -469,7 +469,7 @@ _mkimg() {  # mkimg <instance-suffix>
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
-    _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg bbinit
+    _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg init
 }
 
 # Define logs
@@ -480,7 +480,7 @@ BLK_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-blk-$ARCH.log"
 POSIX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-posix-$ARCH.log"
 GFX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-gfx-$ARCH.log"
 OPENRC_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-openrc-$ARCH.log"
-BBINIT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-bbinit-$ARCH.log"
+INIT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-init-$ARCH.log"
 
 echo ""
 if [ "$SMOKE_PARALLEL" = "1" ]; then
@@ -604,22 +604,22 @@ launch_openrc() {
 	pid_openrc=$!
 }
 
-# M108: BusyBox init as PID 1 (init=/opt/busybox/bin/init). openrc-init is
-# still the default PID 1 — this instance exists to prove the other, opt-in
-# configuration boots the same system: /etc/inittab drives OpenRC's runlevels,
-# then runs /etc/bbinit-smoke.sh, which is where the M108 init markers come from.
-launch_bbinit() {
+# M108: the default boot. PID 1 is /sbin/init — BusyBox init — with no `init=`
+# on the cmdline at all, and /etc/inittab drives OpenRC's runlevels underneath
+# it, then runs /etc/init-smoke.sh, which is where the M108 init markers come
+# from. openrc-init as PID 1 is the other, opt-in configuration (launch_openrc).
+launch_init() {
 	(
-		SATA_IMG=$(disk_img sata bbinit)
-		NVME_IMG=$(disk_img nvme bbinit)
-		SWAP_IMG=$(disk_img swap bbinit)
-		B1NIX_ISO_NAME=b1nix-bbinit.iso
+		SATA_IMG=$(disk_img sata init)
+		NVME_IMG=$(disk_img nvme init)
+		SWAP_IMG=$(disk_img swap init)
+		B1NIX_ISO_NAME=b1nix-init.iso
 		SMOKE_DONE_PATTERN="M108-SMOKE: done-init|KERNEL PANIC|\[PANIC\]"
 		SMOKE_PROGRESS_MODE=full
-		PROGRESS_PREFIX="[bbinit]"
-		run_qemu "$BBINIT_LOG"
+		PROGRESS_PREFIX="[init]  "
+		run_qemu "$INIT_LOG"
 	) &
-	pid_bbinit=$!
+	pid_init=$!
 }
 
 launch_v8() {
@@ -696,7 +696,7 @@ run_slot_pool() {
 if [ "$SMOKE_PARALLEL" = "1" ]; then
 	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
-	_inst_list="sys blk posix gfx openrc bbinit"
+	_inst_list="sys blk posix gfx openrc init"
 	[ "$SMOKE_V8" = "1" ] && _inst_list="$_inst_list v8"
 	[ -n "${SMOKE_INSTANCES:-}" ] && _inst_list="$SMOKE_INSTANCES"
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
@@ -724,7 +724,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	for _i in sys blk posix gfx openrc bbinit smp v8; do
+	for _i in sys blk posix gfx openrc init smp v8; do
 	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
@@ -760,7 +760,7 @@ fi
 
 # ── Test 3-7: Core boot path markers ──
 check_output "$LOG" "initramfs: files" "initramfs initializes"
-check_output "$LOG" "init: /sbin/openrc-init pid=" "openrc-init launches as PID 1"
+check_output "$LOG" "init: /sbin/init pid=" "the default PID 1 (/sbin/init, BusyBox init) launches"
 check_output "$LOG" "M94-INIT:" "M94 init-path parsing self-test runs"
 check_output "$LOG" "M94-INIT: ok \(default\|init=\|no-override-flags\)" "M94 init-path logic correct"
 # Linking policy: the rootfs must not carry a statically linked executable that
@@ -778,9 +778,13 @@ check_output "$LOG" "M94-CTL: ok fifo-on-tmpfs" "mkfifo works on a tmpfs mount"
 check_output "$LOG" "M94-CTL: ok fifo-command" "a command written by another process is read back from the control FIFO"
 # OpenRC instance: the real init system as PID 1, driving its own runlevels and
 # shutting the machine down through /run/openrc/init.ctl.
-# Note: "openrc-init runs as PID 1" is already checked in $LOG above.
+check_output "$OPENRC_LOG" "init: /sbin/openrc-init pid=" "openrc-init runs as PID 1 when init= selects it"
 check_output "$OPENRC_LOG" "Caching service dependencies" "OpenRC builds its dependency cache (popen/posix_spawn work)"
 check_output "$OPENRC_LOG" "/etc/init.d/local start" "OpenRC reaches the default runlevel and starts services"
+check_output "$OPENRC_LOG" "M94-OPENRC: ok pid1" "with init=/sbin/openrc-init, PID 1 is really the openrc-init ELF (/proc/1/exe)"
+check_output "$OPENRC_LOG" "M94-OPENRC: ok reaps-orphan" "openrc-init reaps an orphaned grandchild re-parented to PID 1"
+check_output "$OPENRC_LOG" "M94-OPENRC: ok shell" "the openrc-init boot reaches a usable shell"
+check_output "$OPENRC_LOG" "M94-OPENRC: done-init" "the openrc-init PID 1 suite completes"
 check_output "$OPENRC_LOG" "M94-OPENRC: ok init-fifo-present" "openrc-init creates its control FIFO once the boot finishes"
 check_output "$OPENRC_LOG" "/etc/init.d/killprocs start" "the shutdown runlevel runs when PID 1 gets the command"
 check_output "$OPENRC_LOG" "reboot: powering off" "openrc-shutdown powers the machine off through the control FIFO"
@@ -1920,9 +1924,9 @@ check_output "$LOG" "M107-SMOKE: ok applet-hwclock" "BusyBox hwclock -r reads th
 check_output "$LOG" "M107-SMOKE: ok applet-lsof" "BusyBox lsof lists an open file by its full path"
 check_output "$LOG" "M107-SMOKE: ok applet-chvt" "BusyBox chvt switches the active virtual terminal"
 check_output "$LOG" "M107-SMOKE: done" "M107 subsystem suite completes"
-# ── M108: BusyBox owns su, passwd and (optionally) init ──
-# su/passwd run on the posix instance under openrc-init; the init markers come
-# from the dedicated bbinit instance, where PID 1 is /opt/busybox/bin/init.
+# ── M108: BusyBox owns su, passwd and init ──
+# su/passwd run on the posix instance; the init markers come from the dedicated
+# init instance, where the checks are driven by PID 1 itself out of /etc/inittab.
 check_output "$LOG" "M108-SMOKE: ok setuid-layout" "/bin/su and /bin/passwd resolve to a setuid-root busybox-suid, and the plain multicall ELF is not setuid"
 check_output "$LOG" "M108-SMOKE: ok su-uid-and-shell" "BusyBox su becomes the target uid and execs that account's own login shell"
 check_output "$LOG" "M108-SMOKE: ok su-password-auth" "an unprivileged caller su's with the correct /etc/shadow password through the setuid bit"
@@ -1933,11 +1937,12 @@ check_output "$LOG" "M108-SMOKE: ok passwd-pam-accepts-new" "the PAM path accept
 check_output "$LOG" "M108-SMOKE: ok passwd-pam-rejects-old" "the PAM path rejects the password BusyBox passwd replaced"
 check_output "$LOG" "M108-SMOKE: ok su-accepts-passwd-hash" "BusyBox su authenticates the hash BusyBox passwd wrote"
 check_output "$LOG" "M108-SMOKE: done" "M108 su/passwd suite completes"
-check_output "$BBINIT_LOG" "M108-SMOKE: ok bbinit-pid1" "with init=/opt/busybox/bin/init, PID 1 is the BusyBox multicall ELF running as init"
-check_output "$BBINIT_LOG" "M108-SMOKE: ok bbinit-openrc-runlevels" "OpenRC's default runlevel and its local.d hooks run under BusyBox init"
-check_output "$BBINIT_LOG" "M108-SMOKE: ok bbinit-shell" "the BusyBox-init boot reaches a usable shell"
-check_output "$BBINIT_LOG" "M108-SMOKE: ok bbinit-reaps-orphan" "BusyBox init reaps an orphaned grandchild re-parented to PID 1"
-check_output "$BBINIT_LOG" "M108-SMOKE: done-init" "M108 BusyBox-init instance completes"
+check_output "$INIT_LOG" "M108-SMOKE: ok init-pid1" "the default PID 1 is the BusyBox multicall ELF running as init"
+check_output "$INIT_LOG" "M108-SMOKE: ok init-openrc-runlevels" "OpenRC's default runlevel and its local.d hooks run under BusyBox init"
+check_output "$INIT_LOG" "M108-SMOKE: ok init-shell" "the BusyBox-init boot reaches a usable shell"
+check_output "$INIT_LOG" "M108-SMOKE: ok init-reaps-orphan" "BusyBox init reaps an orphaned grandchild re-parented to PID 1"
+check_output "$INIT_LOG" "M108-SMOKE: ok init-respawns-getty" "killing the inittab getty makes PID 1 respawn it as a new process"
+check_output "$INIT_LOG" "M108-SMOKE: done-init" "M108 BusyBox-init instance completes"
 # ── M86: per-thread CPU accounting + thread-directed signals ──
 check_output "$LOG" "M86-SMOKE: ok thread-cputime" "CLOCK_THREAD_CPUTIME_ID tracks CPU actually burned and stays flat while the thread sleeps"
 check_output "$LOG" "M86-SMOKE: ok process-cputime" "CLOCK_PROCESS_CPUTIME_ID sums the whole thread group, not just the caller"
@@ -2361,7 +2366,7 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-for _i in sys blk posix gfx openrc bbinit smp v8; do
+for _i in sys blk posix gfx openrc init smp v8; do
     rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
 done
 echo ""

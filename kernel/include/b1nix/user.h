@@ -85,7 +85,12 @@ struct task;
 
 struct user_loaded_image {
 	enum user_image_kind kind;
+	/* The path exec was asked for — what AT_EXECFN reports, as on Linux. */
 	const char *path;
+	/* The file that was actually loaded: `path` with its final symlink chain
+	 * followed. This is what /proc/<pid>/exe names, so a PID 1 started as
+	 * /sbin/init reads back as the BusyBox multicall ELF it links to. */
+	const char *real_path;
 	u64 entry;
 	struct user_address_space address_space;
 	struct user_image_segment segments[USER_MAX_IMAGE_SEGMENTS];
@@ -183,6 +188,9 @@ void user_address_space_cleanup(struct task *t);
 /* Full executable path of a task (the loaded image's path), for /proc/<pid>/exe.
  * Falls back to task->name. */
 const char *user_task_exe_path(struct task *t);
+/* Follow the final symlink chain of an exec path, so /proc/<pid>/exe names the
+ * file that was loaded rather than the name used to reach it. */
+void user_exec_realpath(const char *path, char *out, usize outsz);
 void user_image_free(struct user_loaded_image *image);
 
 #endif

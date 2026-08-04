@@ -7,7 +7,7 @@
  * unconditional "ok" print anywhere below, and no marker is reachable without
  * the corresponding BusyBox applet actually doing the work.
  *
- * Default mode (runs on the posix instance, as root, under openrc-init):
+ * Default mode (runs on the posix instance, as root):
  *
  *   setuid-layout    /bin/su and /bin/passwd are symlinks onto
  *                    /opt/busybox/bin/busybox-suid; that file is mode 4755
@@ -35,25 +35,39 @@
  *   su-accepts-passwd-hash  and BusyBox `su` authenticates that same new
  *                    password — the round trip closes in both directions.
  *
- * `m108_smoke initcheck` mode (runs on the bbinit instance, from /etc/inittab,
- * where PID 1 is /opt/busybox/bin/init):
+ * `m108_smoke initcheck` mode (runs on the init instance, from /etc/inittab,
+ * where PID 1 is /sbin/init — the BusyBox multicall ELF, and the kernel's
+ * default init):
  *
- *   bbinit-pid1      PID 1 is the BusyBox multicall ELF running as `init`
+ *   init-pid1        PID 1 is the BusyBox multicall ELF running as `init`
  *                    (/proc/1/cmdline and /proc/1/exe, not a self-report).
- *   bbinit-openrc-runlevels  OpenRC's `default` runlevel ran under BusyBox
+ *   init-openrc-runlevels  OpenRC's `default` runlevel ran under BusyBox
  *                    init: its local.d hook left a file only that path writes.
- *   bbinit-shell     a shell starts and runs a command under BusyBox init.
- *   bbinit-reaps-orphan  a grandchild orphaned mid-flight is re-parented to
+ *   init-shell       a shell starts and runs a command under BusyBox init.
+ *   init-respawns-getty  the getty /etc/inittab marks `respawn` is running;
+ *                    killing it makes PID 1 start a NEW one (a different pid,
+ *                    still the getty binary) without anything else asking.
+ *   init-reaps-orphan  a grandchild orphaned mid-flight is re-parented to
  *                    PID 1 (it reports getppid()==1 itself) and then vanishes
  *                    from /proc — i.e. PID 1 waited on it. An init that does
  *                    not reap would leave the zombie there forever.
+ *
+ * `m108_smoke openrccheck` mode (M94 markers, runs on the openrc instance from
+ * /etc/local.d/00-smoke.start, where the kernel was given
+ * init=/sbin/openrc-init): the same PID 1 questions asked of OpenRC's own init
+ * — `pid1`, `shell`, `reaps-orphan` — so both inits are proved by the same
+ * evidence rather than one of them being taken on trust. The control-FIFO half
+ * of that instance's story is proved by /etc/openrc-ctltest.sh, which powers
+ * the machine off through /run/openrc/init.ctl.
  */
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <dirent.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,11 +96,17 @@
 
 static int failures;
 
+/* Marker group. The su/passwd and BusyBox-init checks belong to M108; the same
+ * PID 1 checks run again on the openrc instance, where they are M94's, so the
+ * group is a variable rather than a literal. */
+static const char *group = "M108-SMOKE";
+
 static void emit(const char *s) { (void)!write(1, s, strlen(s)); }
 
 static void ok(const char *name)
 {
-	emit("M108-SMOKE: ok ");
+	emit(group);
+	emit(": ok ");
 	emit(name);
 	emit("\n");
 }
@@ -96,7 +116,8 @@ static void ok(const char *name)
 static void fail(const char *name, const char *why)
 {
 	failures++;
-	emit("M108-SMOKE: FAIL ");
+	emit(group);
+	emit(": FAIL ");
 	emit(name);
 	emit(" (");
 	emit(why);
@@ -506,47 +527,57 @@ static int pid1_argv0(char *out, size_t outsz)
 	return 0;
 }
 
-static void check_bbinit_pid1(void)
+/* PID 1 identity. `want_exe` is a substring the file the kernel actually loaded
+ * must contain, so the same check proves either init: "busybox" for the
+ * multicall ELF, "openrc-init" for OpenRC's own. `marker` names it per suite. */
+static void check_pid1_is(const char *marker, const char *want_exe,
+                          const char *wrong_exe_msg)
 {
 	char argv0[256], exe[256];
 	ssize_t n;
 
 	if (pid1_argv0(argv0, sizeof(argv0)) != 0) {
-		fail("bbinit-pid1", "cannot read /proc/1/cmdline");
+		fail(marker, "cannot read /proc/1/cmdline");
 		return;
 	}
 	if (strstr(argv0, "init") == NULL) {
-		fail("bbinit-pid1", "PID 1 is not running as init");
+		fail(marker, "PID 1 is not running as init");
 		return;
 	}
 	/* argv[0] alone would be forgeable; /proc/1/exe is the file the kernel
-	 * actually loaded. It must be the BusyBox multicall ELF. */
+	 * actually loaded (symlinks followed), so it cannot be self-reported. */
 	n = readlink("/proc/1/exe", exe, sizeof(exe) - 1);
 	if (n <= 0) {
-		fail("bbinit-pid1", "cannot read /proc/1/exe");
+		fail(marker, "cannot read /proc/1/exe");
 		return;
 	}
 	exe[n] = '\0';
-	if (strstr(exe, "busybox") == NULL) {
-		fail("bbinit-pid1", "PID 1 is not the BusyBox multicall ELF");
+	if (strstr(exe, want_exe) == NULL) {
+		fail(marker, wrong_exe_msg);
 		return;
 	}
-	ok("bbinit-pid1");
+	ok(marker);
 }
 
-static void check_bbinit_openrc(void)
+static void check_init_pid1(void)
+{
+	check_pid1_is("init-pid1", "busybox",
+	              "PID 1 is not the BusyBox multicall ELF");
+}
+
+static void check_init_openrc(void)
 {
 	/* Written by /etc/local.d/00-smoke.start, which only runs as part of
 	 * OpenRC's `local` service in the default runlevel — so its presence
 	 * means /etc/inittab's `openrc default` really completed under BusyBox
 	 * init, not merely that inittab listed it. */
 	if (access("/tmp/m108-openrc-local-ran", F_OK) != 0)
-		fail("bbinit-openrc-runlevels", "openrc default did not run");
+		fail("init-openrc-runlevels", "openrc default did not run");
 	else
-		ok("bbinit-openrc-runlevels");
+		ok("init-openrc-runlevels");
 }
 
-static void check_bbinit_shell(void)
+static void check_shell_alive(const char *marker)
 {
 	char *argv[] = { (char *)"/bin/sh", (char *)"-c",
 	                 (char *)"echo m108-shell-alive-$((20 + 3))", NULL };
@@ -555,14 +586,99 @@ static void check_bbinit_shell(void)
 	                         out, sizeof(out));
 
 	if (!exited_zero(status))
-		fail("bbinit-shell", "shell exited non-zero");
+		fail(marker, "shell exited non-zero");
 	else if (strstr(out, "m108-shell-alive-23") == NULL)
-		fail("bbinit-shell", "shell did not evaluate the command");
+		fail(marker, "shell did not evaluate the command");
 	else
-		ok("bbinit-shell");
+		ok(marker);
 }
 
-static void check_bbinit_reaps_orphan(void)
+/* Scan /proc for a process whose argv[0] names the getty binary. Returns its
+ * pid, or 0 if none is running. PID 1 itself is skipped: it holds the inittab
+ * command lines, not a getty of its own. */
+static pid_t find_getty(void)
+{
+	DIR *d = opendir("/proc");
+	struct dirent *e;
+	pid_t found = 0;
+
+	if (!d)
+		return 0;
+	while ((e = readdir(d)) != NULL) {
+		char path[64], cmd[256];
+		long pid;
+		char *end;
+		int fd;
+		ssize_t n;
+
+		pid = strtol(e->d_name, &end, 10);
+		if (*end != '\0' || pid <= 1)
+			continue;
+		snprintf(path, sizeof(path), "/proc/%ld/cmdline", pid);
+		fd = open(path, O_RDONLY);
+		if (fd < 0)
+			continue;
+		n = read(fd, cmd, sizeof(cmd) - 1);
+		close(fd);
+		if (n <= 0)
+			continue;
+		cmd[n] = '\0';
+		/* argv[0] only — the arguments are NUL-separated after it, so a
+		 * process merely mentioning "getty" in an argument does not
+		 * count. */
+		if (strstr(cmd, "getty") != NULL) {
+			found = (pid_t)pid;
+			break;
+		}
+	}
+	closedir(d);
+	return found;
+}
+
+/* /etc/inittab marks the getty `respawn`, which is the one supervision duty
+ * BusyBox init has that OpenRC's runlevels do not cover. Prove it by killing
+ * the running getty and waiting for PID 1 — nothing else here starts one — to
+ * put a NEW one in its place. */
+static void check_init_respawns_getty(void)
+{
+	pid_t first = 0, again = 0;
+	int i;
+
+	/* Give init a moment to have started it at all: this runs from an
+	 * inittab `wait` action, and the respawn entry is set up alongside. */
+	for (i = 0; i < 250; i++) {
+		first = find_getty();
+		if (first > 0)
+			break;
+		usleep(20000);
+	}
+	if (first <= 0) {
+		fail("init-respawns-getty", "no getty is running at all");
+		return;
+	}
+
+	if (kill(first, SIGKILL) != 0) {
+		fail("init-respawns-getty", "cannot kill the running getty");
+		return;
+	}
+
+	/* BusyBox init throttles a respawn that dies immediately, so allow it
+	 * several seconds — but the new getty must be a DIFFERENT process, not
+	 * the corpse of the one just killed. */
+	for (i = 0; i < 500; i++) {
+		again = find_getty();
+		if (again > 0 && again != first)
+			break;
+		again = 0;
+		usleep(20000);
+	}
+	if (again <= 0)
+		fail("init-respawns-getty", "PID 1 never respawned the getty");
+	else
+		ok("init-respawns-getty");
+}
+
+static void check_reaps_orphan(const char *marker)
 {
 	int fds[2];
 	pid_t child, grandchild = -1;
@@ -571,14 +687,14 @@ static void check_bbinit_reaps_orphan(void)
 	ssize_t n;
 
 	if (pipe(fds) != 0) {
-		fail("bbinit-reaps-orphan", "pipe failed");
+		fail(marker, "pipe failed");
 		return;
 	}
 
 	child = fork();
 	if (child < 0) {
 		close(fds[0]); close(fds[1]);
-		fail("bbinit-reaps-orphan", "fork failed");
+		fail(marker, "fork failed");
 		return;
 	}
 	if (child == 0) {
@@ -604,7 +720,7 @@ static void check_bbinit_reaps_orphan(void)
 	n = read(fds[0], &grandchild, sizeof(grandchild));
 	close(fds[0]);
 	if (n != (ssize_t)sizeof(grandchild) || grandchild <= 1) {
-		fail("bbinit-reaps-orphan", "orphan was not re-parented to PID 1");
+		fail(marker, "orphan was not re-parented to PID 1");
 		return;
 	}
 
@@ -613,23 +729,53 @@ static void check_bbinit_reaps_orphan(void)
 	snprintf(path, sizeof(path), "/proc/%d", (int)grandchild);
 	for (i = 0; i < 250; i++) {
 		if (access(path, F_OK) != 0) {
-			ok("bbinit-reaps-orphan");
+			ok(marker);
 			return;
 		}
 		usleep(20000);
 	}
-	fail("bbinit-reaps-orphan", "orphan stayed a zombie; PID 1 never reaped it");
+	fail(marker, "orphan stayed a zombie; PID 1 never reaped it");
 }
 
 int main(int argc, char **argv)
 {
 	if (argc > 1 && strcmp(argv[1], "initcheck") == 0) {
 		emit("M108-SMOKE: start-init\n");
-		check_bbinit_pid1();
-		check_bbinit_openrc();
-		check_bbinit_shell();
-		check_bbinit_reaps_orphan();
+		check_init_pid1();
+		check_init_openrc();
+		check_shell_alive("init-shell");
+		check_reaps_orphan("init-reaps-orphan");
+		return failures != 0;
+	}
+
+	/* Separate mode because of how BusyBox init sequences /etc/inittab: every
+	 * `wait` action runs to completion BEFORE the `respawn` entries are
+	 * started, so a getty check made from the `wait` hook would look for a
+	 * process init has not spawned yet — and correctly report that none is
+	 * running. /etc/init-smoke.sh therefore backgrounds this mode, which
+	 * outlives the hook and runs once PID 1 has reached its respawn entries.
+	 * It emits the run's done marker. */
+	if (argc > 1 && strcmp(argv[1], "gettycheck") == 0) {
+		check_init_respawns_getty();
 		emit("M108-SMOKE: done-init\n");
+		return failures != 0;
+	}
+
+	/* M94: the other PID 1. Runs on the openrc instance, where the kernel was
+	 * given init=/sbin/openrc-init, and asks OpenRC's own init exactly what the
+	 * BusyBox one is asked: is PID 1 really that binary, does it reap an orphan
+	 * re-parented to it, does the system it brought up run a shell. The
+	 * control-FIFO half of the story is proved separately by
+	 * /etc/openrc-ctltest.sh, which shuts the machine down through it.
+	 * Two inits, the same evidence for each. */
+	if (argc > 1 && strcmp(argv[1], "openrccheck") == 0) {
+		group = "M94-OPENRC";
+		emit("M94-OPENRC: start-init\n");
+		check_pid1_is("pid1", "openrc-init",
+		              "PID 1 is not the openrc-init ELF");
+		check_shell_alive("shell");
+		check_reaps_orphan("reaps-orphan");
+		emit("M94-OPENRC: done-init\n");
 		return failures != 0;
 	}
 
