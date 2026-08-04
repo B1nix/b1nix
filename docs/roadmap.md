@@ -859,7 +859,7 @@ Status:
 - [x] `ioremap`/`ioremap_wc`/`ioremap_wb` over `vmm_map_mmio`, dma-mapping (coherent alloc, single/sg map, cache sync for non-snooping devices), and spinlock/sleeping-mutex wrappers that keep b1nix's "never sleep under a spinlock" rule visible in the type.
 - Markers: `M99-SMOKE: ok {idr,completion,workqueue,workqueue-delayed,scatterlist,ioremap,dma-mapping,request-firmware,locks}`. Details: `docs/driver-infrastructure.md`.
 - [x] **Bounce buffers.** There is still no IOMMU, but a device whose window does not cover the memory it was handed is no longer stuck: `dma_map_single_masked`/`dma_map_sg_masked` take the device's `dma_mask`, and a buffer outside it is copied through frames allocated below the mask (new `pmm_alloc_frames_below`, a bitmap scan under an address ceiling). The direction decides the copies, `dma_unmap_single`/`dma_sync_*` recognise a bounced handle, and `scatterlist` gained the `dma_address` Linux has so a bounced run can differ from its physical address. `M99-SMOKE: ok dma-bounce` maps a buffer with the window deliberately ending below it and checks both directions of the copy — and that a window which *does* cover the buffer bounces nothing.
-- [x] An sg table is bounced **as a whole**, into one block below the mask with the entries pointing into it in order, rather than one allocation per run: a device with a segment limit is not handed more segments than the caller built. The bookkeeping is allocated per mapping instead of living in a fixed 16-slot array, so the seventeenth concurrent mapping no longer fails for a reason no driver could act on. `M99-SMOKE: ok dma-bounce-sg`.
+- [x] An sg table is bounced **as a whole**, into one block below the mask with the entries pointing into it in order, rather than one allocation per run: a device with a segment limit is not handed more segments than the caller built. The bookkeeping is allocated per mapping instead of living in a fixed 16-slot array, so the seventeenth concurrent mapping no longer fails for a reason no driver could act on. `M99-SMOKE: ok dma-bounce-sg`. What is still open — the block comes from the general allocator, so a fragmented system with a narrow mask can refuse a mapping for a reason that is not the device's — is tracked in **M100a**; the IOMMU that would remove the need to copy at all is **M100b**.
 
 ## M100: DRM Core — dma-fence, scheduler, GEM (proven on virtio-gpu)
 
@@ -871,6 +871,58 @@ Status:
 - Markers: `M100-SMOKE: ok {fence-signal,fence-error,fence-refcount,sched-submit,sched-fairness,gem-sg,gem-create,gem-info,gem-map,gem-mmap-pages,gem-scanout,gem-destroy,gem-handle-reuse}`. Details: `docs/driver-infrastructure.md`.
 - [x] Discontiguous sg-backed buffers are asserted, not hoped for: the test holds 2N frames, sorts them and uses every other one, so no two chosen frames can be adjacent whatever order the allocator used, and the unchosen ones stay allocated so nothing can fill the gaps. `gem-sg-discontig` is now a verdict (one scatterlist entry per page) instead of a skip.
 - [x] The GEM vmap window's page-table path is installed explicitly (`paging_reserve_kernel_path`) instead of by mapping a page and unmapping it again — which worked only because unmap leaves the levels above the leaf in place, an invariant nothing stated. `M100-SMOKE: ok gem-vmap-shared` creates a fresh address space and requires it to carry the kernel's PML4 entry for both ends of the window, so "a GEM mapping that faults in one process but not another" would now fail a test rather than be a note in the roadmap. The check runs everywhere, including on instances with no GPU: it reserves a scratch window of its own and asserts the same property of it, so the mechanism is covered even where the DRM window does not exist.
+
+
+## M100a: DMA bounce — a reserved pool and a fallback that does not refuse (done)
+
+M99 gave b1nix bounce buffers, which is what a device that cannot reach memory
+needs when there is nothing to remap it with. What it did not give them is a
+failure mode that belongs to the DMA layer: a bounce block has to be physically
+contiguous (a device handed one address cannot be given several), and it is
+allocated from the general allocator at map time — so a fragmented system with a
+narrow mask can refuse a mapping that has nothing wrong with it.
+
+- [x] `done` **Reserved bounce pool (swiotlb-shaped).** Reserved from `main` before
+  userspace starts (`dma_bounce_pool_init`), below 4 GiB, sized by
+  `b1nix.bounce-pool=<KiB>` (default 4 MiB, 0 disables and sends every bounce to
+  the allocator). Slots are handed out first-fit over a frame map. "No bounce
+  buffer" now means "too many mappings in flight" instead of "somebody else
+  fragmented memory". A mask too narrow for the pool still falls back to asking
+  the allocator for frames below it — the pool is the common case, not the only
+  one. `M99-SMOKE: ok dma-bounce-pool` proves a servable mapping is served from
+  the pool and that the slot and its accounting come back on unmap.
+- [x] `done` **Per-run fallback for sg.** One block for the whole table when one
+  can be had, a block per run when it cannot: a mapping the system could still
+  serve is no longer refused. A mapping's record describes a set of blocks, and
+  the copies are driven off each entry's `dma_address`, so both shapes are the
+  same code. `M99-SMOKE: ok dma-bounce-sg-fallback` reaches it through
+  deliberate fault injection (`dma_bounce_force_single_page`) — under QEMU the
+  allocator always finds a contiguous run, so the path would otherwise never
+  execute — and requires the addresses to be genuinely non-contiguous and the
+  data to round-trip through all of them.
+- [x] `done` Exhaustion reports as itself: `dma_bounce_pool_stats` gives frames,
+  frames in use, the high-water mark and the number of mappings holding pool
+  frames.
+
+## M100b: IOMMU — address translation and device isolation
+
+With an IOMMU a narrow `dma_mask` stops meaning "copy" and starts meaning "map
+it low", and `dma_map_*` finally does what its name says. It is also the only
+way a device can be *prevented* from reaching memory nobody gave it.
+
+- [ ] `planned` **Intel VT-d (DMAR).** Parse the ACPI DMAR table, program the
+  root/context tables and a second-level page table per device, and map a
+  driver's buffers into that device's own address space. QEMU emulates it
+  (`-device intel-iommu`), so this is testable here and not only on hardware.
+- [ ] `planned` **dma-mapping over translation.** `dma_map_single`/`dma_map_sg`
+  install IOVA mappings instead of bouncing; the bounce path stays as the
+  fallback for a device with no translation unit behind it.
+- [ ] `planned` **Device isolation.** A device that is handed a buffer can reach
+  that buffer and nothing else — the property an IOMMU exists for. Prerequisite
+  for passing a real GPU through to a guest (M101's VFIO note) and for the
+  sandbox work M62 wants.
+- [ ] `planned` **AMD-Vi**, once VT-d works: the same shape with ACPI IVRS
+  instead of DMAR, needed for the RX 6600 path in M102.
 
 ## M101: Intel i915 (Gen8/Gen9.5) + Mesa iris
 

@@ -4,6 +4,7 @@
  * M99 linuxkpi: allocator shims, ioremap, dma-mapping, sleeping mutex.
  */
 
+#include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/memtype.h>
 #include <b1nix/mm.h>
@@ -12,6 +13,7 @@
 #include <lkpi/io.h>
 #include <lkpi/lock.h>
 #include <lkpi/types.h>
+#include <stdio.h>
 #include <string.h>
 
 /* ── allocation ─────────────────────────────────────────────────── */
@@ -111,29 +113,217 @@ static void dma_cache_for_cpu(dma_addr_t handle, usize size, int direction);
  * calls, which are handed only the device address, can find the caller's memory
  * again and copy in the right direction.
  *
- * Two shapes are recorded. A single-buffer mapping remembers the caller's
- * pointer. An sg mapping remembers the table: the whole table is bounced into
- * ONE block below the mask and each entry's dma_address points into it, so a
- * device that cannot reach the caller's pages sees one contiguous region rather
- * than one allocation per run — fewer allocations, and a device with a
- * segment-count limit is not handed more segments than it had before.
+ * Where the blocks come from (M100a). A bounce block must be physically
+ * contiguous — a device given one address cannot be handed several — and taking
+ * it from the general allocator at map time makes the mapping's success depend
+ * on what every other allocation did to the free lists. So a pool is reserved
+ * at boot, while nothing has fragmented them yet, and slots are handed out
+ * inside it. "No bounce buffer" then means "too many mappings in flight", which
+ * is a condition of this subsystem with a number attached. A mask too narrow
+ * for the pool still falls back to asking the allocator for frames below it —
+ * the pool is the common case, not the only one.
  *
- * The records are allocated as they are needed instead of living in a fixed
- * array: the earlier 16-slot table meant the seventeenth concurrent mapping
- * failed for no reason the driver could act on.
+ * An sg table is bounced into ONE block when it can be, so a device with a
+ * segment limit is not handed more segments than the caller built. When one
+ * block cannot be had, each run is bounced on its own rather than the mapping
+ * being refused: more segments is worse than one block and much better than an
+ * error. Either way each entry's dma_address says where its data went, and the
+ * copies are driven off that.
  */
+
+struct dma_block {
+	dma_addr_t addr;
+	usize frames;
+	int from_pool;
+};
+
 struct dma_bounce {
 	struct dma_bounce *next;
-	dma_addr_t handle; /* device address of the bounce block; the lookup key */
-	void *cpu;         /* single-buffer mapping: the caller's buffer */
+	dma_addr_t handle;    /* lookup key: the block, or the sg's first entry */
+	void *cpu;            /* single-buffer mapping: the caller's buffer */
 	struct sg_table *sgt; /* sg mapping: the table whose runs were copied */
-	usize size;        /* bytes bounced */
-	usize frames;
+	usize size;
 	int direction;
+	u32 nblocks;
+	struct dma_block *blocks;
 };
 
 static struct dma_bounce *g_bounce_list;
 static spinlock_t g_bounce_lock = SPINLOCK_INIT;
+
+/* ── the reserved pool ──────────────────────────────────────────── */
+
+#define DMA_POOL_DEFAULT_KIB 4096u
+
+static u64 g_pool_base;
+static usize g_pool_frames;
+static u8 *g_pool_used;        /* one byte per frame; 1 = handed out */
+static usize g_pool_in_use;    /* frames currently handed out */
+static usize g_pool_peak;      /* high-water mark, for the exhaustion report */
+static usize g_pool_mappings;  /* mappings currently holding pool frames */
+static spinlock_t g_pool_lock = SPINLOCK_INIT;
+
+/* Fault injection (test only): refuse any pool or allocator block larger than
+ * one page, which is what a fragmented system looks like from in here. It is
+ * the only way to reach the per-run sg fallback deliberately — under QEMU the
+ * allocator always finds a contiguous run. */
+static int g_bounce_no_contig;
+
+void dma_bounce_force_single_page(int on) { g_bounce_no_contig = on ? 1 : 0; }
+
+int dma_bounce_pool_range(u64 *base, u64 *end)
+{
+	if (!g_pool_base)
+		return -1;
+	if (base)
+		*base = g_pool_base;
+	if (end)
+		*end = g_pool_base + (u64)g_pool_frames * PAGE_SIZE;
+	return 0;
+}
+
+void dma_bounce_pool_stats(usize *frames, usize *in_use, usize *peak,
+                           usize *mappings)
+{
+	u64 flags;
+	spin_lock_irqsave(&g_pool_lock, &flags);
+	if (frames) *frames = g_pool_frames;
+	if (in_use) *in_use = g_pool_in_use;
+	if (peak) *peak = g_pool_peak;
+	if (mappings) *mappings = g_pool_mappings;
+	spin_unlock_irqrestore(&g_pool_lock, flags);
+}
+
+void dma_bounce_pool_init(void)
+{
+	if (g_pool_base)
+		return;
+
+	u32 kib = DMA_POOL_DEFAULT_KIB;
+	char buf[32];
+	if (bootinfo_get_kv("b1nix.bounce-pool", buf, sizeof(buf)) && buf[0]) {
+		u32 v = 0;
+		for (const char *p = buf; *p >= '0' && *p <= '9'; p++)
+			v = v * 10 + (u32)(*p - '0');
+		kib = v; /* 0 disables the pool: every bounce then asks the allocator */
+	}
+	if (kib == 0) {
+		console_write("dma: bounce pool disabled by cmdline\n");
+		return;
+	}
+
+	usize frames = ((usize)kib * 1024 + PAGE_SIZE - 1) / PAGE_SIZE;
+	/* Below 4 GiB: the window every 32-bit-capable device can reach, and the
+	 * one a narrower device is most likely to be a prefix of. */
+	u64 base = pmm_alloc_frames_below(frames, 0xFFFFFFFFULL);
+	if (!base) {
+		console_write("dma: bounce pool reservation failed\n");
+		return;
+	}
+	u8 *used = kmalloc(frames);
+	if (!used) {
+		for (usize i = 0; i < frames; i++)
+			pmm_free_frame(base + (u64)i * PAGE_SIZE);
+		console_write("dma: bounce pool bookkeeping allocation failed\n");
+		return;
+	}
+	memset(used, 0, frames);
+
+	g_pool_base = base;
+	g_pool_frames = frames;
+	g_pool_used = used;
+
+	char line[128];
+	snprintf(line, sizeof(line),
+	         "dma: bounce pool %lu KiB at 0x%lx\n",
+	         (unsigned long)((u64)frames * PAGE_SIZE / 1024),
+	         (unsigned long)base);
+	console_write(line);
+}
+
+/* First fit over the pool's frame map. Returns 0 when no run of `frames`
+ * contiguous pages is free, or when the pool does not reach under `dma_mask`. */
+static dma_addr_t pool_alloc(usize frames, u64 dma_mask)
+{
+	if (!g_pool_base || frames == 0)
+		return 0;
+	if (g_bounce_no_contig && frames > 1)
+		return 0;
+	u64 pool_end = g_pool_base + (u64)g_pool_frames * PAGE_SIZE - 1;
+	if (pool_end > dma_mask) {
+		/* Part of the pool may still be low enough; only use the prefix that
+		 * the device can address. */
+		if (g_pool_base > dma_mask)
+			return 0;
+	}
+
+	u64 flags;
+	dma_addr_t got = 0;
+	spin_lock_irqsave(&g_pool_lock, &flags);
+	usize run = 0;
+	for (usize i = 0; i < g_pool_frames; i++) {
+		u64 addr = g_pool_base + (u64)i * PAGE_SIZE;
+		if (g_pool_used[i] || addr + PAGE_SIZE - 1 > dma_mask) {
+			run = 0;
+			continue;
+		}
+		if (++run == frames) {
+			usize start = i + 1 - frames;
+			for (usize j = 0; j < frames; j++)
+				g_pool_used[start + j] = 1;
+			g_pool_in_use += frames;
+			if (g_pool_in_use > g_pool_peak)
+				g_pool_peak = g_pool_in_use;
+			got = g_pool_base + (u64)start * PAGE_SIZE;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_pool_lock, flags);
+	return got;
+}
+
+static void pool_free(dma_addr_t addr, usize frames)
+{
+	u64 flags;
+	spin_lock_irqsave(&g_pool_lock, &flags);
+	usize start = (usize)((addr - g_pool_base) / PAGE_SIZE);
+	for (usize j = 0; j < frames && start + j < g_pool_frames; j++)
+		g_pool_used[start + j] = 0;
+	g_pool_in_use -= frames <= g_pool_in_use ? frames : g_pool_in_use;
+	spin_unlock_irqrestore(&g_pool_lock, flags);
+}
+
+/* One block of `frames` contiguous pages under `dma_mask`: the pool first, then
+ * the general allocator for a mask the pool cannot satisfy. */
+static int block_alloc(usize frames, u64 dma_mask, struct dma_block *out)
+{
+	dma_addr_t addr = pool_alloc(frames, dma_mask);
+	if (addr) {
+		out->addr = addr;
+		out->frames = frames;
+		out->from_pool = 1;
+		return 0;
+	}
+	if (g_bounce_no_contig && frames > 1)
+		return -1;
+	addr = pmm_alloc_frames_below(frames, dma_mask);
+	if (!addr)
+		return -1;
+	out->addr = addr;
+	out->frames = frames;
+	out->from_pool = 0;
+	return 0;
+}
+
+static void block_free(const struct dma_block *b)
+{
+	if (b->from_pool) {
+		pool_free(b->addr, b->frames);
+		return;
+	}
+	for (usize i = 0; i < b->frames; i++)
+		pmm_free_frame(b->addr + (u64)i * PAGE_SIZE);
+}
 
 /* Caller holds g_bounce_lock. */
 static struct dma_bounce *bounce_lookup(dma_addr_t handle)
@@ -151,6 +341,20 @@ static void *bounce_kva(dma_addr_t handle)
 	return (void *)(usize)(handle + vmm_direct_map_base());
 }
 
+/* How many separate blocks a bounced mapping is made of: 1 when the whole
+ * table fitted in one, one per run when it did not. 0 when the handle names no
+ * bounce mapping. Lets a test observe which path ran instead of inferring it
+ * from addresses, which can land adjacent by chance. */
+u32 dma_bounce_mapping_blocks(dma_addr_t handle)
+{
+	u64 flags;
+	spin_lock_irqsave(&g_bounce_lock, &flags);
+	struct dma_bounce *b = bounce_lookup(handle);
+	u32 n = b ? b->nblocks : 0;
+	spin_unlock_irqrestore(&g_bounce_lock, flags);
+	return n;
+}
+
 int dma_mapping_is_bounced(dma_addr_t handle)
 {
 	u64 flags;
@@ -160,90 +364,166 @@ int dma_mapping_is_bounced(dma_addr_t handle)
 	return bounced;
 }
 
-/* Copy the caller's data into the bounce block (device is about to read it). */
+/* The copies are driven off each sg entry's dma_address, so one block and a
+ * block per run are the same code. */
 static void bounce_copy_in(const struct dma_bounce *b)
 {
 	if (b->direction == DMA_FROM_DEVICE)
 		return;
 	if (b->sgt) {
-		u64 off = 0;
 		for (u32 i = 0; i < b->sgt->nents; i++) {
 			struct scatterlist *sg = &b->sgt->sgl[i];
-			memcpy((u8 *)bounce_kva(b->handle) + off,
+			memcpy(bounce_kva(sg->dma_address),
 			       (const void *)(usize)(sg->phys + sg->offset +
 			                             vmm_direct_map_base()),
 			       sg->length);
-			off += sg->length;
 		}
 		return;
 	}
 	memcpy(bounce_kva(b->handle), b->cpu, b->size);
 }
 
-/* Copy back whatever the device wrote. */
 static void bounce_copy_out(const struct dma_bounce *b)
 {
 	if (b->direction == DMA_TO_DEVICE)
 		return;
 	if (b->sgt) {
-		u64 off = 0;
 		for (u32 i = 0; i < b->sgt->nents; i++) {
 			struct scatterlist *sg = &b->sgt->sgl[i];
 			memcpy((void *)(usize)(sg->phys + sg->offset +
 			                       vmm_direct_map_base()),
-			       (const u8 *)bounce_kva(b->handle) + off, sg->length);
-			off += sg->length;
+			       bounce_kva(sg->dma_address), sg->length);
 		}
 		return;
 	}
 	memcpy(b->cpu, bounce_kva(b->handle), b->size);
 }
 
-/* Allocate a block of `size` bytes below `dma_mask`, record it and copy the
- * caller's data in. Exactly one of cpu_addr / sgt describes the source.
- * Returns the device address, or 0. */
-static dma_addr_t bounce_map_common(void *cpu_addr, struct sg_table *sgt,
-                                    usize size, int direction, u64 dma_mask)
+static void bounce_publish(struct dma_bounce *b)
 {
-	if (size == 0)
-		return 0;
-	struct dma_bounce *b = kmalloc(sizeof(*b));
-	if (!b)
-		return 0;
-
-	usize frames = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-	u64 phys = pmm_alloc_frames_below(frames, dma_mask);
-	if (!phys) {
-		kfree(b);
-		return 0;
-	}
-
-	b->next = 0;
-	b->handle = phys;
-	b->cpu = cpu_addr;
-	b->sgt = sgt;
-	b->size = size;
-	b->frames = frames;
-	b->direction = direction;
-	bounce_copy_in(b);
-
 	u64 flags;
 	spin_lock_irqsave(&g_bounce_lock, &flags);
 	b->next = g_bounce_list;
 	g_bounce_list = b;
 	spin_unlock_irqrestore(&g_bounce_lock, flags);
 
-	dma_cache_for_device(phys, size, direction);
-	return phys;
+	int pooled = 0;
+	for (u32 i = 0; i < b->nblocks; i++)
+		pooled |= b->blocks[i].from_pool;
+	if (pooled) {
+		spin_lock_irqsave(&g_pool_lock, &flags);
+		g_pool_mappings++;
+		spin_unlock_irqrestore(&g_pool_lock, flags);
+	}
 }
 
+static struct dma_bounce *bounce_record_new(u32 nblocks)
+{
+	struct dma_bounce *b = kmalloc(sizeof(*b));
+	if (!b)
+		return 0;
+	b->blocks = kmalloc(sizeof(struct dma_block) * nblocks);
+	if (!b->blocks) {
+		kfree(b);
+		return 0;
+	}
+	b->next = 0;
+	b->handle = 0;
+	b->cpu = 0;
+	b->sgt = 0;
+	b->size = 0;
+	b->direction = 0;
+	b->nblocks = nblocks;
+	return b;
+}
+
+static void bounce_record_free(struct dma_bounce *b)
+{
+	kfree(b->blocks);
+	kfree(b);
+}
+
+/* Single-buffer bounce: one block, the caller's data copied in. */
 static dma_addr_t bounce_map(void *cpu_addr, usize size, int direction,
                              u64 dma_mask)
 {
-	return bounce_map_common(cpu_addr, 0, size, direction, dma_mask);
+	if (size == 0)
+		return 0;
+	struct dma_bounce *b = bounce_record_new(1);
+	if (!b)
+		return 0;
+	usize frames = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+	if (block_alloc(frames, dma_mask, &b->blocks[0]) != 0) {
+		bounce_record_free(b);
+		return 0;
+	}
+	b->handle = b->blocks[0].addr;
+	b->cpu = cpu_addr;
+	b->size = size;
+	b->direction = direction;
+	bounce_copy_in(b);
+	bounce_publish(b);
+	dma_cache_for_device(b->handle, size, direction);
+	return b->handle;
 }
 
-/* Copy back whatever the device wrote and release the block. Returns 1 if the
+/* Whole-table bounce, falling back to a block per run. Fills in every entry's
+ * dma_address. Returns the address of the first entry, or 0. */
+static dma_addr_t bounce_map_sg(struct sg_table *sgt, u64 total, int direction,
+                                u64 dma_mask)
+{
+	usize frames = ((usize)total + PAGE_SIZE - 1) / PAGE_SIZE;
+	struct dma_bounce *b = bounce_record_new(1);
+	if (!b)
+		return 0;
+
+	if (block_alloc(frames, dma_mask, &b->blocks[0]) == 0) {
+		u64 off = 0;
+		for (u32 i = 0; i < sgt->nents; i++) {
+			sgt->sgl[i].dma_address = b->blocks[0].addr + off;
+			off += sgt->sgl[i].length;
+		}
+		b->handle = b->blocks[0].addr;
+		b->sgt = sgt;
+		b->size = (usize)total;
+		b->direction = direction;
+		bounce_copy_in(b);
+		bounce_publish(b);
+		dma_cache_for_device(b->handle, (usize)total, direction);
+		return b->handle;
+	}
+	bounce_record_free(b);
+
+	/* No single block that large. Bounce each run on its own: the device gets
+	 * more segments than the caller built, which is the cost of not refusing a
+	 * mapping the system could still serve. */
+	b = bounce_record_new(sgt->nents);
+	if (!b)
+		return 0;
+	for (u32 i = 0; i < sgt->nents; i++) {
+		usize run_frames =
+		    ((usize)sgt->sgl[i].length + PAGE_SIZE - 1) / PAGE_SIZE;
+		if (block_alloc(run_frames, dma_mask, &b->blocks[i]) != 0) {
+			for (u32 j = 0; j < i; j++)
+				block_free(&b->blocks[j]);
+			bounce_record_free(b);
+			return 0;
+		}
+		sgt->sgl[i].dma_address = b->blocks[i].addr;
+	}
+	b->handle = b->blocks[0].addr;
+	b->sgt = sgt;
+	b->size = (usize)total;
+	b->direction = direction;
+	bounce_copy_in(b);
+	bounce_publish(b);
+	for (u32 i = 0; i < sgt->nents; i++)
+		dma_cache_for_device(sgt->sgl[i].dma_address, sgt->sgl[i].length,
+		                     direction);
+	return b->handle;
+}
+
+/* Copy back whatever the device wrote and release every block. Returns 1 if the
  * handle named a bounce mapping. */
 static int bounce_unmap(dma_addr_t handle, int direction)
 {
@@ -267,9 +547,19 @@ static int bounce_unmap(dma_addr_t handle, int direction)
 	 * skip a copy-out the caller is waiting for. */
 	(void)direction;
 	bounce_copy_out(b);
-	for (usize i = 0; i < b->frames; i++)
-		pmm_free_frame(b->handle + (u64)i * PAGE_SIZE);
-	kfree(b);
+
+	int pooled = 0;
+	for (u32 i = 0; i < b->nblocks; i++) {
+		pooled |= b->blocks[i].from_pool;
+		block_free(&b->blocks[i]);
+	}
+	if (pooled) {
+		spin_lock_irqsave(&g_pool_lock, &flags);
+		if (g_pool_mappings)
+			g_pool_mappings--;
+		spin_unlock_irqrestore(&g_pool_lock, flags);
+	}
+	bounce_record_free(b);
 	return 1;
 }
 
@@ -404,19 +694,12 @@ u32 dma_map_sg_masked(struct sg_table *sgt, int direction, u64 dma_mask)
 		return sgt->nents;
 	}
 
-	/* Out of the device's reach: copy the whole table into one block below the
-	 * mask. Entries keep their lengths and order, so the caller's view of the
-	 * buffer is unchanged; only the addresses the device is given move, and
-	 * they now describe one contiguous region. */
-	dma_addr_t base = bounce_map_common(0, sgt, (usize)total, direction, dma_mask);
-	if (!base)
+	/* Out of the device's reach: copy the table into memory it can address —
+	 * one block if one can be had (so a device with a segment limit sees no
+	 * more segments than the caller built), otherwise a block per run. Entries
+	 * keep their lengths and order either way; only the addresses move. */
+	if (!bounce_map_sg(sgt, total, direction, dma_mask))
 		return 0;
-	u64 off = 0;
-	for (u32 i = 0; i < sgt->nents; i++) {
-		struct scatterlist *sg = &sgt->sgl[i];
-		sg->dma_address = base + off;
-		off += sg->length;
-	}
 	return sgt->nents;
 }
 

@@ -31,6 +31,7 @@
 #include <b1nix/procfs.h>
 #include <b1nix/ahci.h>
 #include <b1nix/nvme.h>
+#include <lkpi/dma-mapping.h>
 #include <b1nix/filelock.h>
 #include <b1nix/errno.h>
 #include <b1nix/isofs.h>
@@ -295,6 +296,13 @@ void kernel_main(usize arg0, usize arg1)
 	console_write("Step 10: Initramfs & FUSE initialized\n");
 
 #ifndef __aarch64__
+	/* M100a: reserve the DMA bounce pool here — early, while nothing has
+	 * fragmented the free lists. A bounce block must be physically contiguous,
+	 * and taking it at map time would make a mapping's success depend on what
+	 * every other allocation did. Needs kheap (for the frame map) and nothing
+	 * else, and must precede every driver that could map for DMA. */
+	dma_bounce_pool_init();
+
 	vfs_init();
 	page_cache_init();
 	ext2_init();

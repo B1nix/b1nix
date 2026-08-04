@@ -648,6 +648,167 @@ static void test_dma_bounce_sg(void)
 	lkpi_report("dma-bounce-sg", ok == 0x1f, ok ^ 0x1f);
 }
 
+/* The pool exists to make "no bounce buffer" mean "too many mappings in
+ * flight" instead of "somebody else fragmented memory". Check that a mapping
+ * the pool can serve is served from it, that the accounting moves with the
+ * mapping, and that the frames come back. */
+static void test_dma_bounce_pool(void)
+{
+	int ok = 0x3f;
+	u64 pool_base = 0, pool_end = 0;
+	if (dma_bounce_pool_range(&pool_base, &pool_end) != 0) {
+		lkpi_report("dma-bounce-pool", 0, 1);
+		return;
+	}
+
+	usize frames = 0, in_use0 = 0, peak0 = 0, maps0 = 0;
+	dma_bounce_pool_stats(&frames, &in_use0, &peak0, &maps0);
+	if (frames == 0 || pool_end <= pool_base)
+		ok &= ~(1 << 0);
+
+	u32 *buf = kmalloc(PAGE_SIZE);
+	if (!buf) {
+		lkpi_report("dma-bounce-pool", 0, 2);
+		return;
+	}
+	buf[0] = 0xF00DF00Du;
+
+	/* A window that ends at the top of the pool: the pool is inside it, this
+	 * buffer (kmalloc'd, far above) is not — so the mapping must bounce, and
+	 * must bounce into the pool. */
+	dma_addr_t h = dma_map_single_masked(buf, PAGE_SIZE, DMA_BIDIRECTIONAL,
+	                                     pool_end - 1);
+	if (!h || !dma_mapping_is_bounced(h))
+		ok &= ~(1 << 1);
+	if (h && (h < pool_base || h >= pool_end))
+		ok &= ~(1 << 2); /* served from the allocator while the pool was free */
+
+	usize in_use1 = 0, peak1 = 0, maps1 = 0;
+	dma_bounce_pool_stats(0, &in_use1, &peak1, &maps1);
+	if (in_use1 != in_use0 + 1 || maps1 != maps0 + 1)
+		ok &= ~(1 << 3);
+	if (peak1 < in_use1)
+		ok &= ~(1 << 4);
+
+	if (h) {
+		const volatile u32 *dev = (const volatile u32 *)(usize)(h + vmm_direct_map_base());
+		if (dev[0] != 0xF00DF00Du)
+			ok &= ~(1 << 5);
+		dma_unmap_single(h, PAGE_SIZE, DMA_BIDIRECTIONAL);
+	}
+
+	usize in_use2 = 0, maps2 = 0;
+	dma_bounce_pool_stats(0, &in_use2, 0, &maps2);
+	if (in_use2 != in_use0 || maps2 != maps0)
+		ok &= ~(1 << 3); /* the slot did not come back */
+
+	kfree(buf);
+	lkpi_report("dma-bounce-pool", ok == 0x3f, ok ^ 0x3f);
+}
+
+/* When one block for the whole table cannot be had, the mapping must still
+ * happen — run by run. Fragmentation is injected rather than waited for: under
+ * QEMU the allocator always finds a contiguous run, so the fallback would
+ * otherwise never execute here. */
+static void test_dma_bounce_sg_fallback(void)
+{
+	int ok = 0xf;
+	const u32 pages = 3;
+	u64 pool[6];
+	u64 frames[3];
+	struct sg_table sgt;
+
+	/* The runs must not coalesce: a table that collapses to one entry has
+	 * nothing for a per-run fallback to fall back to. Hold 2N frames, sort
+	 * them and take every other one — sorted and distinct means no two chosen
+	 * frames are adjacent, whatever order the allocator used, and the unchosen
+	 * ones stay held so nothing can fill the gaps. */
+	for (u32 i = 0; i < pages * 2; i++) {
+		pool[i] = pmm_alloc_frame();
+		if (!pool[i]) {
+			lkpi_report("dma-bounce-sg-fallback", 0, 1);
+			return;
+		}
+	}
+	for (u32 i = 1; i < pages * 2; i++) {
+		u64 key = pool[i];
+		u32 j = i;
+		while (j > 0 && pool[j - 1] > key) {
+			pool[j] = pool[j - 1];
+			j--;
+		}
+		pool[j] = key;
+	}
+	for (u32 i = 0; i < pages; i++)
+		frames[i] = pool[i * 2];
+	if (sg_alloc_table_from_pages(&sgt, frames, pages) < 0) {
+		for (u32 i = 0; i < pages * 2; i++)
+			pmm_free_frame(pool[i]);
+		lkpi_report("dma-bounce-sg-fallback", 0, 2);
+		return;
+	}
+	if (sgt.nents != pages) {
+		/* Adjacent after all: the construction above is supposed to make this
+		 * impossible, so say so rather than testing something else. */
+		sg_free_table(&sgt);
+		for (u32 i = 0; i < pages * 2; i++)
+			pmm_free_frame(pool[i]);
+		lkpi_report("dma-bounce-sg-fallback", 0, 3);
+		return;
+	}
+	for (u32 i = 0; i < pages; i++) {
+		volatile u32 *p = (volatile u32 *)(usize)(frames[i] + vmm_direct_map_base());
+		p[0] = 0xFA000000u ^ i;
+		p[5] = 0xFB000000u ^ i;
+	}
+
+	u64 lowest = frames[0];
+	for (u32 i = 1; i < pages; i++)
+		if (frames[i] < lowest)
+			lowest = frames[i];
+
+	dma_bounce_force_single_page(1);
+	u32 mapped = dma_map_sg_masked(&sgt, DMA_BIDIRECTIONAL, lowest - 1);
+	dma_bounce_force_single_page(0);
+
+	if (mapped != sgt.nents)
+		ok &= ~(1 << 0);
+
+	/* Every run must have its own block. Addresses alone cannot show that —
+	 * separately allocated blocks can land adjacent by chance — so ask the
+	 * mapping how many blocks it is made of. */
+	u32 blocks = dma_bounce_mapping_blocks(sgt.sgl[0].dma_address);
+	if (blocks != sgt.nents)
+		ok &= ~(1 << 2);
+	for (u32 i = 0; i < sgt.nents; i++)
+		if (sgt.sgl[i].dma_address + sgt.sgl[i].length - 1 > lowest - 1)
+			ok &= ~(1 << 1);
+
+	/* Data still has to round-trip through the scattered blocks. */
+	for (u32 i = 0; i < sgt.nents; i++) {
+		volatile u32 *blk =
+		    (volatile u32 *)(usize)(sgt.sgl[i].dma_address + vmm_direct_map_base());
+		if (blk[0] != (0xFA000000u ^ i))
+			ok &= ~(1 << 3);
+		blk[0] = 0xFC000000u ^ i;
+	}
+	dma_unmap_sg(&sgt, DMA_BIDIRECTIONAL);
+	for (u32 i = 0; i < pages; i++) {
+		const volatile u32 *p =
+		    (const volatile u32 *)(usize)(frames[i] + vmm_direct_map_base());
+		if (p[0] != (0xFC000000u ^ i))
+			ok &= ~(1 << 3);
+	}
+
+	sg_free_table(&sgt);
+	for (u32 i = 0; i < pages * 2; i++)
+		pmm_free_frame(pool[i]);
+	/* Report what was seen, not only which bit fell over: the block count and
+	 * the entry count are the whole question here. */
+	lkpi_report("dma-bounce-sg-fallback", ok == 0xf,
+	            (u64)(ok ^ 0xf) | ((u64)blocks << 8) | ((u64)sgt.nents << 16));
+}
+
 /* ── request_firmware ───────────────────────────────────────────── */
 
 static void test_firmware(void)
@@ -774,6 +935,8 @@ void lkpi_selftest(void)
 	test_dma();
 	test_dma_bounce();
 	test_dma_bounce_sg();
+	test_dma_bounce_pool();
+	test_dma_bounce_sg_fallback();
 	test_firmware();
 	test_locks();
 	console_write("M99-SMOKE: done\n");

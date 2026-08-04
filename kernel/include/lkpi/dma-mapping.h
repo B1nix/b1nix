@@ -53,6 +53,36 @@ void dma_unmap_single(dma_addr_t handle, usize size, int direction);
 dma_addr_t dma_map_single_masked(void *cpu_addr, usize size, int direction,
                                  u64 dma_mask);
 
+/*
+ * The reserved bounce pool (M100a).
+ *
+ * Reserved at boot, before anything has fragmented the free lists, because a
+ * bounce block must be physically contiguous and asking the general allocator
+ * for one at map time makes a mapping's success depend on what every other
+ * allocation did. `b1nix.bounce-pool=<KiB>` sizes it; 0 disables it and sends
+ * every bounce to the allocator. A mask too narrow for the pool falls back to
+ * the allocator regardless — the pool is the common case, not the only one.
+ */
+void dma_bounce_pool_init(void);
+
+/* Pool extent, -1 when there is no pool. */
+int dma_bounce_pool_range(u64 *base, u64 *end);
+
+/* Frames in the pool, frames handed out, the high-water mark, and how many
+ * mappings currently hold pool frames — so exhaustion reports as itself. */
+void dma_bounce_pool_stats(usize *frames, usize *in_use, usize *peak,
+                           usize *mappings);
+
+/* Fault injection: refuse every block larger than one page, which is what a
+ * fragmented system looks like from inside the bounce allocator. The only way
+ * to reach the per-run sg fallback deliberately — under QEMU a contiguous run
+ * is always available. Test use only. */
+void dma_bounce_force_single_page(int on);
+
+/* Blocks a bounced mapping is made of: 1 for a whole-table bounce, one per run
+ * when no single block was available. 0 when the handle is not bounced. */
+u32 dma_bounce_mapping_blocks(dma_addr_t handle);
+
 /* 1 when `handle` came back from a mapping that had to bounce. Diagnostics and
  * tests; a driver has no reason to care. */
 int dma_mapping_is_bounced(dma_addr_t handle);
