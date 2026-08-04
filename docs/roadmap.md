@@ -835,19 +835,43 @@ Status:
 - [x] Read faults out of the event log.
 - [x] Move NVMe into a translated domain and read a block through it, with the event log staying empty — which is also what proves the page-table format is the one the unit walks.
 
-## M101: Intel i915 (Gen8/Gen9.5) + Mesa iris
+## M101: linuxkpi for DRM — run upstream drivers unmodified
 
-- [ ] `planned` GTT/PPGTT, execlists submission, contexts; no firmware needed on Gen8/Gen9.
+The vendor drivers are imported as they are written and never edited; everything
+they stand on is ours, written from scratch under MIT. One layer carries every
+vendor, so M102a and M102b are two consumers of it rather than two ports.
+
+- [ ] `planned` Decide once where the DRM core comes from, and write the answer down: upstream `drivers/gpu/drm` imported verbatim, with M100's own core kept for virtio-gpu. Two cores are allowed only because one of them is never edited.
+- [ ] `planned` Extend M99 with what a driver needs and M99 has not got: `wait_queue`, `kref`, `ERR_PTR`/`IS_ERR`, `xarray`, `rbtree`, `interval_tree`, `kthread_worker`, `delayed_work`.
+- [ ] `planned` Add `ww_mutex` with real wound-wait, including backoff, since execbuf deadlocks under load without it and nowhere else.
+- [ ] `planned` Add an RCU whose grace periods are honest, or state in the header which callers may not use it.
+- [ ] `planned` Give `struct page` a backing that our memory model can honour: page arrays, shmem-backed objects, `vmap`, and write-combining through the M98 PAT paths.
+- [ ] `planned` Add `pm_runtime`, `sysfs`/`debugfs` and `kobject` as far as the drivers actually reach into them, and no further.
+- [ ] `planned` Import the DRM core and build it unmodified. Every fix goes in the shim, never in imported source; a patch to imported code is a bug in this milestone.
+- [ ] `planned` Pin the upstream release the import came from, and record it the way the ports tree pins versions.
+- [ ] `planned` Prove the layer before any vendor driver: run the imported core against virtio-gpu and render through it.
+
+## M102a: Intel i915 (Gen8/Gen9.5) + Mesa iris
+
+- [ ] `planned` Import i915 unmodified and cut it to the Gen8/Gen9.5 paths; no firmware is needed on these parts.
+- [ ] `planned` Bring up GTT/PPGTT, contexts and execlists submission through the shim.
+- [ ] `planned` Serve `EXECBUFFER2` softpin-only, and keep the ioctl ABI exactly as the pinned Mesa expects it.
+- [ ] `planned` Run Mesa `iris` against it — its own NIR backend, so no LLVM rebuild.
 - [ ] `planned` Bare metal on the Pavilion's Gen8, logs over netconsole (the guaranteed path — no OS on the laptop, ISO boots from USB).
 - [ ] `planned` *If VT-d and BIOS ever allow it:* KVM + VFIO passthrough for a faster loop (keeps virtual COM1).
-- [ ] `planned` `EXECBUFFER2` softpin-only + Mesa `iris` (own NIR backend — no LLVM rebuild).
 
-## M102: amdgpu on RX 6600 (render-only) + radeonsi
+## M102b: amdgpu on RX 6600 (render-only) + radeonsi
 
 - [ ] `planned` Build without DC: scanout stays on the GOP framebuffer, render offscreen and blit.
 - [ ] `planned` PSP (`psp_v11_0`) firmware loading, SMU 11 mailbox, GFX10.3 KIQ/MQD, GPUVM.
 - [ ] `planned` Visible/invisible VRAM windowing (8 GB behind a 256 MB BAR without ReBAR).
 - [ ] `planned` `libdrm_amdgpu` + `libLLVM.so` rebuilt with the AMDGPU target (currently X86 only).
+- [ ] `planned` Take the shim as M102a left it: whatever amdgpu needs and i915 did not is a gap in M101, and is fixed there.
+
+## M102c: nouveau
+
+- [ ] `planned` Pick the generation first — pre-Turing runs without signed firmware; Turing and later need GSP, which moves most of the driver into a firmware mailbox.
+- [ ] `planned` Same rule as the others: import unmodified, fix the shim.
 
 ## M104: Native Package Manager (`bpkg`)
 

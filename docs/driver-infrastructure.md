@@ -107,7 +107,7 @@ Before this the file had config read/write and two find helpers.
   the device now holds and comparing against the LAPIC id and vector the code was
   asked for. **Interrupt *delivery* through MSI is not exercised**: doing so
   would mean reprogramming a device the smoke suite is actively driving. The
-  first consumer will be the i915/amdgpu bring-up in M101/M102, which is where
+  first consumer will be the i915/amdgpu bring-up in M102a/M102b, which is where
   delivery gets proven on hardware.
 - Intel stolen memory: QEMU's 440FX and Q35 host bridges implement neither BDSM
   nor BGSM, so under QEMU the function correctly reports *absence*, and that is

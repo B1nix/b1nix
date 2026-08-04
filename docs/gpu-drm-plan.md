@@ -3,7 +3,9 @@
 > **Numbering note.** This document was written before the milestones were
 > slotted into `docs/roadmap.md`, where they landed one number lower: the
 > roadmap's **M98/M99/M100** are this plan's M99/M100/M101, and its M102/M103
-> are the roadmap's M101/M102. The roadmap is authoritative; the marker names
+> are the roadmap's M102a/M102b — the roadmap since split the shim work out as
+> its own **M101** and added **M102c** (nouveau). The roadmap is authoritative;
+> the marker names
 > in the sections below were superseded during implementation (see
 > `docs/driver-infrastructure.md` for what actually ships).
 
