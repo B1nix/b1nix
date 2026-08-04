@@ -810,8 +810,6 @@ Status:
 - [x] Run NVMe in its own domain with only its queues and buffers mapped, and read through it.
 - [x] Record and report DMA faults, so "the device touched nothing else" is the unit's answer.
 - [x] Block a violation: the codec is given its descriptor list but not its audio buffer, and the read it was not granted is stopped and recorded.
-- [ ] Add AMD-Vi: QEMU emulates the unit, so it is buildable and testable here.
-
 
 ## M100c: IOMMU — per-device domains, groups, interrupt remapping
 
@@ -826,6 +824,16 @@ Status:
 - [x] Use ACS to split a group: walk up until a port can keep its children apart, and group everything under the topmost one that cannot.
 - [x] Handle ARI and SR-IOV: a device numbering functions across the bus owns the bus, so the group is the bus.
 - [x] Decide the ACS policy once at boot (`b1nix.acs=on|keep|off`) and keep grouping a read-only question.
+- [x] Spare named ports from the policy (`b1nix.acs-keep=<bdf>,...`), and report what each ACS port ended up doing.
+
+## M100d: AMD-Vi
+
+- [x] Parse ACPI IVRS and bring up the unit.
+- [x] Program the flat device table, every device passthrough until its driver asks.
+- [x] Add the command ring, and wait on completion rather than assuming.
+- [x] Add AMD's page-table format, with map, unmap and translate.
+- [x] Read faults out of the event log.
+- [x] Move NVMe into a translated domain and read a block through it, with the event log staying empty — which is also what proves the page-table format is the one the unit walks.
 
 ## M101: Intel i915 (Gen8/Gen9.5) + Mesa iris
 

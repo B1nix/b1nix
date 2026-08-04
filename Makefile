@@ -475,6 +475,7 @@ KERNEL_SOURCES += \
 	kernel/bootinfo/multiboot2.c \
 	kernel/dev/pci.c \
 	kernel/dev/iommu.c \
+	kernel/dev/amdvi.c \
 	kernel/dev/virtio.c \
 	kernel/dev/virtio_blk.c \
 	kernel/dev/virtio_net.c \
@@ -1421,7 +1422,7 @@ SMOKE_CMDLINE_blk=b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.as
 # OpenRC ctltest: boots the real init system as PID 1 and drives sysinit/boot/default,
 # then a local.d hook asks PID 1 to power off through /run/openrc/init.ctl — the
 # control-FIFO path openrc-shutdown and telinit use. A clean poweroff proves the channel works.
-SMOKE_CMDLINE_openrc=init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest
+SMOKE_CMDLINE_openrc=init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest b1nix.acs-keep=00:0e.0
 # M108 init: the default boot, checked as such. PID 1 is /sbin/init (BusyBox
 # init, no `init=` needed) and /etc/inittab drives OpenRC's runlevels under it.
 # This instance runs no part of the ordinary suite — it exists to prove the

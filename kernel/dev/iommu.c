@@ -852,6 +852,43 @@ u32 iommu_address_width(void) { return vtd_enabled ? vtd_address_width : 0; }
  *   b1nix.acs=keep  leave whatever the firmware set, and group accordingly
  *   b1nix.acs=off   turn them off, and accept the larger groups that follow
  */
+/* Is bus:slot.func named in a comma-separated list of bdfs? */
+static int acs_keep_lists(const char *list, u8 bus, u8 slot, u8 func)
+{
+	const char *p = list;
+	while (*p) {
+		u32 v[3] = {0, 0, 0};
+		int field = 0;
+		int digits = 0;
+		while (*p && *p != ',') {
+			char c = *p;
+			if (c == ':' || c == '.') {
+				field++;
+				digits = 0;
+				if (field > 2)
+					break;
+			} else {
+				u32 d;
+				if (c >= '0' && c <= '9') d = (u32)(c - '0');
+				else if (c >= 'a' && c <= 'f') d = (u32)(c - 'a' + 10);
+				else if (c >= 'A' && c <= 'F') d = (u32)(c - 'A' + 10);
+				else { field = 3; break; }
+				v[field] = v[field] * 16 + d;
+				digits++;
+			}
+			p++;
+		}
+		while (*p && *p != ',')
+			p++;
+		if (*p == ',')
+			p++;
+		if (field == 2 && digits > 0 && v[0] == bus && v[1] == slot &&
+		    v[2] == func)
+			return 1;
+	}
+	return 0;
+}
+
 static void acs_configure(void)
 {
 	char mode[16];
@@ -861,7 +898,15 @@ static void acs_configure(void)
 		else if (mode[0] == 'o' && mode[1] == 'f') { want_on = 0; want_off = 1; }
 	}
 
-	u32 capable = 0, isolating = 0;
+	/* A port may be listed for exception: b1nix.acs-keep=<bdf>[,<bdf>...],
+	 * each as bus:slot.func in hex. Those ports are left exactly as they were
+	 * found — which is what a machine whose firmware configured ACS on purpose
+	 * needs, and what a device that must keep peer-to-peer traffic needs. */
+	char keep_list[128];
+	int have_keep = bootinfo_get_kv("b1nix.acs-keep", keep_list,
+	                                sizeof(keep_list)) && keep_list[0];
+
+	u32 capable = 0, isolating = 0, kept = 0;
 	for (u32 bus = 0; bus < 256; bus++) {
 		for (u32 slot = 0; slot < 32; slot++) {
 			if (pci_config_read16((u8)bus, (u8)slot, 0, 0) == 0xFFFF)
@@ -879,22 +924,51 @@ static void acs_configure(void)
 				if (!pci_find_ext_capability((u8)bus, (u8)slot, f, 0x000D))
 					continue;
 				capable++;
-				if (want_on)
+				int excepted = have_keep &&
+				               acs_keep_lists(keep_list, (u8)bus, (u8)slot, f);
+				if (excepted) {
+					kept++;
+				} else if (want_on) {
 					pci_acs_enable((u8)bus, (u8)slot, f);
-				else if (want_off)
+				} else if (want_off) {
 					pci_acs_disable((u8)bus, (u8)slot, f);
+				}
 				if (pci_acs_isolating((u8)bus, (u8)slot, f))
 					isolating++;
 			}
 		}
 	}
 
-	char line[128];
+	char line[160];
 	snprintf(line, sizeof(line),
-	         "iommu: ACS %s — %u ports have it, %u isolating\n",
+	         "iommu: ACS %s — %u ports have it, %u isolating, %u left alone\n",
 	         want_on ? "on" : (want_off ? "off" : "kept"),
-	         (unsigned)capable, (unsigned)isolating);
+	         (unsigned)capable, (unsigned)isolating, (unsigned)kept);
 	console_write(line);
+
+	/* With a policy this specific, the ports it applies to are worth naming:
+	 * a wrong bdf in the list is otherwise invisible. */
+	for (u32 bus = 0; bus < 256; bus++) {
+		for (u32 slot = 0; slot < 32; slot++) {
+			if (pci_config_read16((u8)bus, (u8)slot, 0, 0) == 0xFFFF)
+				continue;
+			u8 htype = pci_config_read8((u8)bus, (u8)slot, 0,
+			                            PCI_CFG_HEADER_TYPE);
+			u8 nfunc = (htype & 0x80) ? 8 : 1;
+			for (u8 f = 0; f < nfunc; f++) {
+				if ((u8)(pci_config_read8((u8)bus, (u8)slot, f,
+				                          PCI_CFG_HEADER_TYPE) & 0x7F) != 1)
+					continue;
+				if (!pci_find_ext_capability((u8)bus, (u8)slot, f, 0x000D))
+					continue;
+				snprintf(line, sizeof(line), "iommu: acs port %02x:%02x.%u %s\n",
+				         (unsigned)bus, (unsigned)slot, (unsigned)f,
+				         pci_acs_isolating((u8)bus, (u8)slot, f) ? "isolating"
+				                                                 : "open");
+				console_write(line);
+			}
+		}
+	}
 }
 
 /* ── bring-up ───────────────────────────────────────────────────── */
@@ -1189,8 +1263,6 @@ void iommu_selftest(void)
 		iommu_report("vtd-dma-map", ok, detail);
 	}
 
-	nvme_iommu_selftest();
-
 	/* And the other half of the property: something that was not granted must
 	 * not get through. */
 	{
@@ -1424,6 +1496,49 @@ void iommu_selftest(void)
 					ok = 0;
 			}
 			iommu_report_c("group-query-is-read-only", ok, (u64)n);
+		}
+	}
+
+	/* The policy can spare a single port. A machine whose firmware configured
+	 * ACS deliberately, or a device that must keep peer-to-peer traffic, needs
+	 * that — and the exception is only worth anything if it is exact: the
+	 * named port must be untouched while every other one obeys the policy. */
+	{
+		char keep[128];
+		if (!bootinfo_get_kv("b1nix.acs-keep", keep, sizeof(keep)) || !keep[0]) {
+			console_write("M100C-SMOKE: skip acs-keeps-port (no exception asked for)\n");
+		} else {
+			int named = 0, named_open = 0, others = 0, others_isolating = 0;
+			for (u32 bus = 0; bus < 256; bus++) {
+				for (u32 slot = 0; slot < 32; slot++) {
+					if (pci_config_read16((u8)bus, (u8)slot, 0, 0) == 0xFFFF)
+						continue;
+					for (u8 f = 0; f < 8; f++) {
+						if ((u8)(pci_config_read8((u8)bus, (u8)slot, f,
+						                          PCI_CFG_HEADER_TYPE) & 0x7F) != 1)
+							continue;
+						if (!pci_find_ext_capability((u8)bus, (u8)slot, f, 0x000D))
+							continue;
+						int iso = pci_acs_isolating((u8)bus, (u8)slot, f);
+						if (acs_keep_lists(keep, (u8)bus, (u8)slot, f)) {
+							named++;
+							if (!iso)
+								named_open++;
+						} else {
+							others++;
+							if (iso)
+								others_isolating++;
+						}
+					}
+				}
+			}
+			/* The named port was left as the machine powers up (open), every
+			 * other one took the policy. */
+			int ok = named > 0 && named == named_open && others > 0 &&
+			         others == others_isolating;
+			iommu_report_c("acs-keeps-port", ok,
+			               ((u64)named << 24) | ((u64)named_open << 16) |
+			                   ((u64)others << 8) | (u64)others_isolating);
 		}
 	}
 

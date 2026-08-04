@@ -469,7 +469,7 @@ _mkimg() {  # mkimg <instance-suffix>
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
-    _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg init; _mkimg iommu
+    _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg init; _mkimg iommu; _mkimg amdvi
 }
 
 # Define logs
@@ -482,6 +482,7 @@ GFX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-gfx-$ARCH.log"
 OPENRC_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-openrc-$ARCH.log"
 INIT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-init-$ARCH.log"
 IOMMU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-iommu-$ARCH.log"
+AMDVI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-amdvi-$ARCH.log"
 
 echo ""
 if [ "$SMOKE_PARALLEL" = "1" ]; then
@@ -653,6 +654,23 @@ launch_iommu() {
 	pid_iommu=$!
 }
 
+# M100d: the same ISO on a machine whose IOMMU is AMD's. Nothing about the
+# image changes; what changes is which unit the kernel finds.
+launch_amdvi() {
+	(
+		SATA_IMG=$(disk_img sata amdvi)
+		NVME_IMG=$(disk_img nvme amdvi)
+		SWAP_IMG=$(disk_img swap amdvi)
+		B1NIX_ISO_NAME=b1nix-openrc.iso
+		EXTRA_QEMU_ARGS="-machine q35,kernel-irqchip=split -device amd-iommu,intremap=on"
+		SMOKE_DONE_PATTERN="reboot: powering off|KERNEL PANIC|\[PANIC\]"
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[amdvi]"
+		run_qemu "$AMDVI_LOG"
+	) &
+	pid_amdvi=$!
+}
+
 launch_v8() {
 	(
 		SATA_IMG=$(disk_img sata v8)
@@ -727,7 +745,7 @@ run_slot_pool() {
 if [ "$SMOKE_PARALLEL" = "1" ]; then
 	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
-	_inst_list="sys blk posix gfx openrc init iommu"
+	_inst_list="sys blk posix gfx openrc init iommu amdvi"
 	[ "$SMOKE_V8" = "1" ] && _inst_list="$_inst_list v8"
 	[ -n "${SMOKE_INSTANCES:-}" ] && _inst_list="$SMOKE_INSTANCES"
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
@@ -755,7 +773,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	for _i in sys blk posix gfx openrc init iommu smp v8; do
+	for _i in sys blk posix gfx openrc init iommu amdvi smp v8; do
 	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
@@ -1989,12 +2007,22 @@ check_output "$IOMMU_LOG" "M100C-SMOKE: ok domain-tables-freed" "M100c: destroyi
 check_output "$IOMMU_LOG" "M100C-SMOKE: ok group-behind-bridge" "M100c: devices behind a bridge are one group, and moving it rewrites the bridge's own context entry"
 check_output "$IOMMU_LOG" "M100C-SMOKE: ok acs-splits-group" "M100c: endpoints behind ports that enforce ACS are separate groups; without it they are one"
 check_output "$IOMMU_LOG" "M100C-SMOKE: ok group-query-is-read-only" "M100c: asking which group a device is in leaves the ACS controls exactly as they were"
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok acs-keeps-port" "M100c: a port named on the cmdline is left exactly as found while every other one takes the policy"
+check_output "$IOMMU_LOG" "iommu: acs port" "M100c: each ACS port is named with what it ended up doing"
 check_output "$IOMMU_LOG" "iommu: ACS on" "M100c: the ACS policy is decided once at init and reported"
 check_output "$IOMMU_LOG" "M100C-SMOKE: ok ari-owns-bus" "M100c: a device with ARI or SR-IOV owns the bus's function space, so the group is the bus"
 check_output "$IOMMU_LOG" "M100C-SMOKE: ok ir-enabled" "M100c: the interrupt remapping table is programmed and remapping is on"
 check_output "$IOMMU_LOG" "M100C-SMOKE: ok ir-entry" "M100c: an entry holds the vector and destination asked for, is bound to one requester, and stops being present when freed"
 check_output "$IOMMU_LOG" "M100C-SMOKE: ok ir-delivery" "M100c: NVMe's MSI-X goes through a remap entry and still reaches its vector"
 check_output "$IOMMU_LOG" "M100C-SMOKE: ok ir-rejects-unknown" "M100c: an interrupt claiming an entry that was taken away is refused and recorded, and works again once it is back"
+# ── M100d: AMD-Vi ──
+check_output "$AMDVI_LOG" "amdvi: unit at" "M100d: IVRS is parsed and the AMD-Vi unit is brought up"
+check_output "$AMDVI_LOG" "M100D-SMOKE: ok amdvi-enable" "M100d: the unit reports translation on and points at our device table"
+check_output "$AMDVI_LOG" "M100D-SMOKE: ok amdvi-map" "M100d: a mapping is what the AMD page tables say"
+check_output "$AMDVI_LOG" "M100D-SMOKE: ok amdvi-unmap" "M100d: unmapping removes the translation"
+check_output "$AMDVI_LOG" "M100D-SMOKE: ok nvme-translated" "M100d: NVMe runs in a domain AMD-Vi translates, reads a block, and the event log stays empty"
+check_output "$AMDVI_LOG" "M100D-SMOKE: ok amdvi-command-ring" "M100d: the unit consumes commands from the ring, so invalidation is real"
+check_output "$AMDVI_LOG" "reboot: powering off" "M100d: the machine boots and shuts down with AMD-Vi translating"
 check_output "$IOMMU_LOG" "reboot: powering off" "M100b: the machine still boots and shuts down with translation on"
 check_output "$INIT_LOG" "M108-SMOKE: done-init" "M108 BusyBox-init instance completes"
 # ── M86: per-thread CPU accounting + thread-directed signals ──
@@ -2431,7 +2459,7 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-for _i in sys blk posix gfx openrc init iommu smp v8; do
+for _i in sys blk posix gfx openrc init iommu amdvi smp v8; do
     rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
 done
 echo ""

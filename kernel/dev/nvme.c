@@ -1,6 +1,7 @@
 #include <b1nix/blk.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
+#include <b1nix/amdvi.h>
 #include <b1nix/iommu.h>
 #include <b1nix/irq.h>
 #include <b1nix/lapic.h>
@@ -763,15 +764,83 @@ void nvme_msix_selftest(void)
  * keeps programming the addresses it always did; what changes is that those
  * addresses now have to be *granted*.
  */
+/* ── whichever remapping unit this machine has ──────────────────────
+ *
+ * The two units answer the same questions in different registers and table
+ * formats, and exactly one of them exists on any given boot. The checks below
+ * are about the controller, not about whose silicon is translating, so they go
+ * through this thin indirection rather than being written twice — and the
+ * marker they print names the milestone the active unit belongs to.
+ */
+static int unit_active(void) { return iommu_active() || amdvi_active(); }
+
+static const char *unit_suite(void)
+{
+	return iommu_active() ? "M100B-SMOKE" : "M100D-SMOKE";
+}
+
+static int unit_map_identity(u64 phys, usize size, int writable)
+{
+	if (iommu_active())
+		return iommu_map_identity(phys, size, writable);
+	u64 base = phys & ~(u64)(NVME_PAGE_SIZE - 1);
+	return amdvi_map(base, base, (usize)((phys - base) + size), writable);
+}
+
+static int unit_unmap(u64 base, usize size)
+{
+	if (iommu_active())
+		return iommu_unmap(base, size);
+	return amdvi_unmap(base, size);
+}
+
+static u64 unit_translate(u64 iova)
+{
+	return iommu_active() ? iommu_translate(iova) : amdvi_translate(iova);
+}
+
+static u32 unit_fault_count(void)
+{
+	return iommu_active() ? iommu_fault_count() : amdvi_fault_count();
+}
+
+static void unit_fault_clear(void)
+{
+	if (iommu_active())
+		iommu_fault_clear();
+	else
+		amdvi_fault_clear();
+}
+
+static int unit_attach(void)
+{
+	if (iommu_active())
+		return iommu_attach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
+	u16 bdf = (u16)((nvme.pci_bus << 8) | ((nvme.pci_slot & 0x1F) << 3) |
+	                (nvme.pci_func & 7));
+	return amdvi_attach_device(bdf);
+}
+
+static void unit_detach(void)
+{
+	if (iommu_active()) {
+		iommu_detach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
+		return;
+	}
+	u16 bdf = (u16)((nvme.pci_bus << 8) | ((nvme.pci_slot & 0x1F) << 3) |
+	                (nvme.pci_func & 7));
+	amdvi_detach_device(bdf);
+}
+
 static int nvme_iommu_map_own_pages(void)
 {
     usize sq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe);
     usize cq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe);
-    if (iommu_map_identity(nvme.phys_admin_sq, sq_bytes, 1) != 0 ||
-        iommu_map_identity(nvme.phys_admin_cq, cq_bytes, 1) != 0 ||
-        iommu_map_identity(nvme.phys_io_sq, sq_bytes, 1) != 0 ||
-        iommu_map_identity(nvme.phys_io_cq, cq_bytes, 1) != 0 ||
-        iommu_map_identity(nvme.phys_identify_buf, NVME_PAGE_SIZE, 1) != 0)
+    if (unit_map_identity(nvme.phys_admin_sq, sq_bytes, 1) != 0 ||
+        unit_map_identity(nvme.phys_admin_cq, cq_bytes, 1) != 0 ||
+        unit_map_identity(nvme.phys_io_sq, sq_bytes, 1) != 0 ||
+        unit_map_identity(nvme.phys_io_cq, cq_bytes, 1) != 0 ||
+        unit_map_identity(nvme.phys_identify_buf, NVME_PAGE_SIZE, 1) != 0)
         return -1;
     return 0;
 }
@@ -780,11 +849,11 @@ static void nvme_iommu_unmap_own_pages(void)
 {
     usize sq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe);
     usize cq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe);
-    iommu_unmap(nvme.phys_admin_sq & ~(u64)(NVME_PAGE_SIZE - 1), sq_bytes);
-    iommu_unmap(nvme.phys_admin_cq & ~(u64)(NVME_PAGE_SIZE - 1), cq_bytes);
-    iommu_unmap(nvme.phys_io_sq & ~(u64)(NVME_PAGE_SIZE - 1), sq_bytes);
-    iommu_unmap(nvme.phys_io_cq & ~(u64)(NVME_PAGE_SIZE - 1), cq_bytes);
-    iommu_unmap(nvme.phys_identify_buf & ~(u64)(NVME_PAGE_SIZE - 1),
+    unit_unmap(nvme.phys_admin_sq & ~(u64)(NVME_PAGE_SIZE - 1), sq_bytes);
+    unit_unmap(nvme.phys_admin_cq & ~(u64)(NVME_PAGE_SIZE - 1), cq_bytes);
+    unit_unmap(nvme.phys_io_sq & ~(u64)(NVME_PAGE_SIZE - 1), sq_bytes);
+    unit_unmap(nvme.phys_io_cq & ~(u64)(NVME_PAGE_SIZE - 1), cq_bytes);
+    unit_unmap(nvme.phys_identify_buf & ~(u64)(NVME_PAGE_SIZE - 1),
                 NVME_PAGE_SIZE);
 }
 
@@ -792,10 +861,11 @@ void nvme_iommu_selftest(void)
 {
     if (!bootinfo_has_flag("b1nix.test=1"))
         return;
-    if (!iommu_active())
-        return; /* the M100B suite already reports the absence of a unit */
+    if (!unit_active())
+        return; /* the suite for the missing unit already says so */
     if (!nvme.regs) {
-        console_write("M100B-SMOKE: skip nvme-translated (no controller)\n");
+        console_write(unit_suite());
+        console_write(": skip nvme-translated (no controller)\n");
         return;
     }
 
@@ -806,12 +876,12 @@ void nvme_iommu_selftest(void)
     if (!ref || !buf) {
         if (ref) kfree(ref);
         if (buf) kfree(buf);
-        console_write("M100B-SMOKE: FAIL nvme-translated detail=1\n");
+        console_write(unit_suite()); console_write(": FAIL nvme-translated detail=1\n");
         return;
     }
     if (nvme_blk_read(&nvme.blk_dev, 0, 1, ref) != 1) {
         kfree(ref); kfree(buf);
-        console_write("M100B-SMOKE: FAIL nvme-translated detail=2\n");
+        console_write(unit_suite()); console_write(": FAIL nvme-translated detail=2\n");
         return;
     }
 
@@ -823,11 +893,10 @@ void nvme_iommu_selftest(void)
     for (int i = 0; i < 20; i++)
         scheduler_yield();
 
-    struct dma_device dev;
-    if (dma_device_attach(&dev, nvme.pci_bus, nvme.pci_slot, nvme.pci_func,
-                          0xFFFFFFFFFFFFFFFFULL) != 0) {
+    if (unit_attach() != 0) {
         kfree(ref); kfree(buf);
-        console_write("M100B-SMOKE: FAIL nvme-translated detail=3\n");
+        console_write(unit_suite());
+        console_write(": FAIL nvme-translated detail=3\n");
         return;
     }
 
@@ -846,8 +915,8 @@ void nvme_iommu_selftest(void)
         for (usize off = 0; off < 2 * NVME_PAGE_SIZE; off += NVME_PAGE_SIZE) {
             u64 p1 = vmm_virt_to_phys((u8 *)buf + off);
             u64 p2 = vmm_virt_to_phys((u8 *)ref + off);
-            if ((p1 && iommu_map_identity(p1, 1, 1) != 0) ||
-                (p2 && iommu_map_identity(p2, 1, 1) != 0)) {
+            if ((p1 && unit_map_identity(p1, 1, 1) != 0) ||
+                (p2 && unit_map_identity(p2, 1, 1) != 0)) {
                 ok = 0;
                 break;
             }
@@ -857,21 +926,21 @@ void nvme_iommu_selftest(void)
     /* Nothing else is mapped for this controller: an address it was not given
      * does not translate. */
     u64 stray = pmm_alloc_frame();
-    if (ok && stray && iommu_translate(stray) != 0)
+    if (ok && stray && unit_translate(stray) != 0)
         ok = 0;
 
     /* A quiescent window first: if the unit faults while this test issues
      * nothing, the traffic is somebody else's and the measurement below would
      * be blaming the wrong transfer. */
-    iommu_fault_clear();
+    unit_fault_clear();
     for (int i = 0; i < 40; i++)
         scheduler_yield();
-    u32 idle_faults = iommu_fault_count();
+    u32 idle_faults = unit_fault_count();
 
-    iommu_fault_clear();
+    unit_fault_clear();
     memset(buf, 0, 512);
     int rc = ok ? nvme_blk_read(&nvme.blk_dev, 0, 1, buf) : -1;
-    u32 faults = iommu_fault_count();
+    u32 faults = unit_fault_count();
 
     if (rc != 1 || memcmp(buf, ref, 512) != 0)
         ok = 0;
@@ -884,21 +953,21 @@ void nvme_iommu_selftest(void)
         u64 p1 = vmm_virt_to_phys((u8 *)buf + off);
         u64 p2 = vmm_virt_to_phys((u8 *)ref + off);
         if (p1)
-            iommu_unmap(p1 & ~(u64)(NVME_PAGE_SIZE - 1), 1);
+            unit_unmap(p1 & ~(u64)(NVME_PAGE_SIZE - 1), 1);
         if (p2)
-            iommu_unmap(p2 & ~(u64)(NVME_PAGE_SIZE - 1), 1);
+            unit_unmap(p2 & ~(u64)(NVME_PAGE_SIZE - 1), 1);
     }
     nvme_iommu_unmap_own_pages();
-    dma_device_detach(&dev);
+    unit_detach();
     if (stray)
         pmm_free_frame(stray);
 
     if (ok) {
-        console_write("M100B-SMOKE: ok nvme-translated (read through its own domain, no faults)\n");
+        console_write(unit_suite()); console_write(": ok nvme-translated (read through its own domain, no faults)\n");
     } else {
         u64 fa = 0; u16 fs = 0; u8 fr = 0;
         iommu_fault_last(&fa, &fs, &fr);
-        console_write("M100B-SMOKE: FAIL nvme-translated rc=");
+        console_write(unit_suite()); console_write(": FAIL nvme-translated rc=");
         console_write_dec((u64)(i64)rc);
         console_write(" faults=");
         console_write_dec((u64)faults);
