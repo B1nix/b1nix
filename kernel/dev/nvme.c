@@ -1,4 +1,5 @@
 #include <b1nix/blk.h>
+#include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/irq.h>
 #include <b1nix/mm.h>
@@ -47,6 +48,15 @@ struct nvme_device {
     struct block_device blk_dev;
     u16 cid_counter;
     volatile int io_busy; // yield-safe I/O-path mutex (see nvme_io_lock)
+
+    /* M98: message-signalled completions. use_msix is set once the controller's
+     * MSI-X table entry 0 is programmed with msix_vector; until then the driver
+     * is on the legacy INTx line. irq_hits counts handler entries so the
+     * self-test can tell a delivered interrupt from a watchdog re-poll. */
+    int use_msix;
+    int msix_vector;
+    u8 pci_bus, pci_slot, pci_func;
+    volatile u32 irq_hits;
 };
 
 static struct nvme_device nvme;
@@ -78,9 +88,25 @@ static void nvme_io_unlock(struct nvme_device *dev) {
  * completion is pending for this device (shared-line aware). */
 static int nvme_irq(void *ctx) {
     struct nvme_device *dev = (struct nvme_device *)ctx;
+    /* Count the message, not the work. On MSI-X the vector belongs to this
+     * controller alone, so reaching this handler IS a delivered message —
+     * including when the waiter's fast CQ spin already consumed the completion
+     * and reset the slot, which is the common case under KVM and would
+     * otherwise make a delivered interrupt look like no interrupt at all. On
+     * the shared INTx line the same cannot be said, so there the count happens
+     * only once the completion is confirmed to be ours. */
+    if (dev->use_msix)
+        __atomic_fetch_add(&dev->irq_hits, 1u, __ATOMIC_RELAXED);
     if (dev->io_cq[dev->io_cq_head].status == 0xFFFF)
-        return 0; /* no I/O completion posted — not ours, or admin-only */
-    dev->regs->intms = (1u << 0); /* mask vector 0 until the waiter consumes */
+        return dev->use_msix; /* our message; completion already consumed */
+    if (!dev->use_msix)
+        __atomic_fetch_add(&dev->irq_hits, 1u, __ATOMIC_RELAXED);
+    /* INTMS/INTMC are the pin-based and MSI mask registers; the NVMe spec says
+     * they are not used with MSI-X, whose masking lives in the vector table.
+     * The storm they guard against is a level-triggered one, which an MSI-X
+     * message — an edge, sent once per completion — cannot produce. */
+    if (!dev->use_msix)
+        dev->regs->intms = (1u << 0); /* mask vector 0 until the waiter consumes */
     scheduler_wake_all(&dev->io_cq);
     return 1;
 }
@@ -238,7 +264,8 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
             cq_head = (cq_head + 1) % NVME_MAX_QUEUE_SIZE;
             dev->io_cq_head = cq_head;
             *cq_hdb = cq_head;           // deasserts the controller's INTx line
-            dev->regs->intmc = (1u << 0); // re-enable vector 0 for the next I/O
+            if (!dev->use_msix)
+                dev->regs->intmc = (1u << 0); // re-enable vector 0 for the next I/O
 
             if ((status & 0xFFFE) != 0) {
                 console_write("nvme: io cmd error status=0x");
@@ -549,9 +576,35 @@ void nvme_init(void)
      * IEN set (vector 0); unmask that vector (intmc) and register the handler,
      * then unmask the controller's INTx line at the IOAPIC. Done after the IO
      * queues exist so the first delivered completion is serviceable. */
-    nvme.regs->intmc = (1u << 0);
-    irq_register_handler(nvme_irq_line, nvme_irq, &nvme);
-    irq_unmask(nvme_irq_line);
+    /* M98: prefer MSI-X. A message interrupt is written straight to the local
+     * APIC, so there is no shared line to arbitrate and no level to deassert —
+     * which is why the INTMS/INTMC dance above is skipped on this path. The
+     * vector comes from the dedicated MSI range and is owned by this driver
+     * alone. If anything fails, fall back to the legacy line: the completion
+     * wait re-polls the CQ on a watchdog deadline either way, so a controller
+     * that never delivers costs latency, not correctness. */
+    nvme.pci_bus = pci_info.bus;
+    nvme.pci_slot = pci_info.slot;
+    nvme.pci_func = pci_info.func;
+    if (pci_msix_table_size(pci_info.bus, pci_info.slot, pci_info.func) > 0) {
+        int vec = msi_alloc_vector(nvme_irq, &nvme);
+        if (vec > 0 &&
+            pci_msix_enable(pci_info.bus, pci_info.slot, pci_info.func, 0,
+                            (u8)vec) == 0) {
+            nvme.use_msix = 1;
+            nvme.msix_vector = vec;
+            console_write("nvme: MSI-X completions on vector ");
+            console_write_dec((u64)vec);
+            console_write("\n");
+        } else if (vec > 0) {
+            msi_free_vector(vec);
+        }
+    }
+    if (!nvme.use_msix) {
+        nvme.regs->intmc = (1u << 0);
+        irq_register_handler(nvme_irq_line, nvme_irq, &nvme);
+        irq_unmask(nvme_irq_line);
+    }
 
     // Register block device
     nvme.blk_dev.name = "nvme0";
@@ -565,4 +618,86 @@ void nvme_init(void)
     console_write("nvme: registered nvme0 with ");
     console_write_dec(nvme.blk_dev.block_count);
     console_write(" blocks\n");
+}
+
+/* ── M98: MSI-X delivery self-test ──────────────────────────────────
+ *
+ * The programming of an MSI/MSI-X capability is checked elsewhere by reading
+ * the device's own registers back. This checks the other half — that a message
+ * the *device* writes actually arrives — and it is the only way to check it:
+ * the interrupt has to be raised by hardware, so the test issues a real read
+ * command and looks at whether the handler ran.
+ *
+ * `irq_hits` is incremented only inside nvme_irq(), which the CPU reaches only
+ * by taking the vector this driver programmed into MSI-X table entry 0. The
+ * completion path deliberately does NOT depend on the interrupt (it re-polls
+ * the CQ on a watchdog deadline), so a passing read proves nothing on its own —
+ * the counter moving is what proves delivery.
+ */
+void nvme_msix_selftest(void)
+{
+    if (!bootinfo_has_flag("b1nix.test=1"))
+        return;
+    if (!nvme.regs) {
+        console_write("M98-DRV-SMOKE: skip msi-delivery (no NVMe controller)\n");
+        return;
+    }
+    if (!nvme.use_msix) {
+        console_write("M98-DRV-SMOKE: skip msi-delivery (controller has no MSI-X)\n");
+        return;
+    }
+
+    /* The vector the device was told to send, read back out of its own table,
+     * must be the one this driver owns — otherwise a hit would prove delivery
+     * of somebody else's message. */
+    u64 addr = 0;
+    u32 data = 0, vctrl = 0xFFFFFFFFu;
+    int rb = pci_msix_entry_readback(nvme.pci_bus, nvme.pci_slot, nvme.pci_func,
+                                     0, &addr, &data, &vctrl);
+    if (rb != 0 || data != (u32)nvme.msix_vector || (vctrl & 1u) != 0) {
+        console_write("M98-DRV-SMOKE: FAIL msi-delivery (entry 0 not armed for vector ");
+        console_write_dec((u64)nvme.msix_vector);
+        console_write(")\n");
+        return;
+    }
+
+    u8 *buf = (u8 *)kmalloc(512);
+    if (!buf) {
+        console_write("M98-DRV-SMOKE: FAIL msi-delivery (no buffer)\n");
+        return;
+    }
+
+    u32 before = __atomic_load_n(&nvme.irq_hits, __ATOMIC_RELAXED);
+    /* read_blocks returns the block count it transferred, not 0. */
+    int rc = nvme_blk_read(&nvme.blk_dev, 0, 1, buf);
+    /* The handler runs on this CPU in interrupt context; by the time the read
+     * returns it has either run or the wait fell back to its watchdog re-poll.
+     * Give the former a bounded chance to be observed rather than sampling the
+     * counter the instant the doorbell settles. */
+    u32 after = before;
+    for (int i = 0; i < 200; i++) {
+        after = __atomic_load_n(&nvme.irq_hits, __ATOMIC_RELAXED);
+        if (after != before)
+            break;
+        scheduler_yield();
+    }
+    kfree(buf);
+
+    if (rc != 1) {
+        console_write("M98-DRV-SMOKE: FAIL msi-delivery (read returned ");
+        console_write_dec((u64)(i64)rc);
+        console_write(")\n");
+        return;
+    }
+    if (after == before) {
+        console_write("M98-DRV-SMOKE: FAIL msi-delivery (no interrupt on vector ");
+        console_write_dec((u64)nvme.msix_vector);
+        console_write(")\n");
+        return;
+    }
+    console_write("M98-DRV-SMOKE: ok msi-delivery vector=");
+    console_write_dec((u64)nvme.msix_vector);
+    console_write(" hits=");
+    console_write_dec((u64)(after - before));
+    console_write("\n");
 }

@@ -213,4 +213,9 @@ struct nvme_identify_ns {
 
 void nvme_init(void);
 
+/* M98: prove an MSI-X message the controller sends is delivered to the vector
+ * this driver owns. Issues a real read and checks the handler ran. Emits
+ * M98-DRV-SMOKE markers; no-op outside b1nix.test=1. */
+void nvme_msix_selftest(void);
+
 #endif // B1NIX_NVME_H

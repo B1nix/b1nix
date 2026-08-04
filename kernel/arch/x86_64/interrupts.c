@@ -105,6 +105,22 @@ extern void isr44(void);
 extern void isr45(void);
 extern void isr46(void);
 extern void isr47(void);
+extern void isr48(void);   /* M98: MSI/MSI-X vectors 48..63 */
+extern void isr49(void);
+extern void isr50(void);
+extern void isr51(void);
+extern void isr52(void);
+extern void isr53(void);
+extern void isr54(void);
+extern void isr55(void);
+extern void isr56(void);
+extern void isr57(void);
+extern void isr58(void);
+extern void isr59(void);
+extern void isr60(void);
+extern void isr61(void);
+extern void isr62(void);
+extern void isr63(void);
 extern void isr64(void);   /* LAPIC timer — per-CPU scheduler tick */
 extern void isr65(void);   /* TLB shootdown IPI */
 extern void isr66(void);   /* Reschedule IPI — wake from sti;hlt */
@@ -213,6 +229,19 @@ void x86_idt_init(void) {
   idt_set_gate(46, isr46);
   idt_set_gate(47, isr47);
 
+  /* M98: the MSI/MSI-X vector range. Separate from 32..47 because a message
+   * interrupt carries no line: the device writes the vector straight to the
+   * local APIC, so there is no IOAPIC entry to mask and no line to share with
+   * a legacy device. */
+  {
+    void (*const msi_stubs[16])(void) = {
+        isr48, isr49, isr50, isr51, isr52, isr53, isr54, isr55,
+        isr56, isr57, isr58, isr59, isr60, isr61, isr62, isr63,
+    };
+    for (u8 i = 0; i < 16; i++)
+      idt_set_gate((u8)(MSI_VECTOR_BASE + i), msi_stubs[i]);
+  }
+
   /* LAPIC timer (per-CPU) and LAPIC spurious gates. Installed unconditionally:
    * the BSP arms the LAPIC timer from lapic_timer_start_periodic_ms after
    * calibration, and APs arm it as they enter the cooperative phase. */
@@ -304,6 +333,53 @@ int irq_register_handler(u8 irq, irq_handler_fn fn, void *ctx) {
   }
   spin_unlock_irqrestore(&g_irq_lock, flags);
   return -1;
+}
+
+/* M98: MSI/MSI-X vector table. One owner per vector — a message interrupt is
+ * point-to-point, so there is no sharing to arbitrate. Same publication order
+ * as the line table: ctx before fn, so a dispatch that races registration
+ * never sees a handler with a stale context. */
+static struct irq_action g_msi_actions[MSI_VECTOR_COUNT];
+
+int msi_alloc_vector(irq_handler_fn fn, void *ctx) {
+  if (fn == 0)
+    return -1;
+  u64 flags;
+  spin_lock_irqsave(&g_irq_lock, &flags);
+  for (u32 i = 0; i < MSI_VECTOR_COUNT; i++) {
+    if (g_msi_actions[i].fn == 0) {
+      g_msi_actions[i].ctx = ctx;
+      __atomic_store_n(&g_msi_actions[i].fn, fn, __ATOMIC_RELEASE);
+      spin_unlock_irqrestore(&g_irq_lock, flags);
+      return (int)(MSI_VECTOR_BASE + i);
+    }
+  }
+  spin_unlock_irqrestore(&g_irq_lock, flags);
+  return -1;
+}
+
+void msi_free_vector(int vector) {
+  if (vector < (int)MSI_VECTOR_BASE ||
+      vector >= (int)(MSI_VECTOR_BASE + MSI_VECTOR_COUNT))
+    return;
+  u64 flags;
+  spin_lock_irqsave(&g_irq_lock, &flags);
+  __atomic_store_n(&g_msi_actions[vector - (int)MSI_VECTOR_BASE].fn,
+                   (irq_handler_fn)0, __ATOMIC_RELEASE);
+  g_msi_actions[vector - (int)MSI_VECTOR_BASE].ctx = 0;
+  spin_unlock_irqrestore(&g_irq_lock, flags);
+}
+
+int msi_dispatch(int vector) {
+  if (vector < (int)MSI_VECTOR_BASE ||
+      vector >= (int)(MSI_VECTOR_BASE + MSI_VECTOR_COUNT))
+    return 0;
+  struct irq_action *a = &g_msi_actions[vector - (int)MSI_VECTOR_BASE];
+  irq_handler_fn fn = __atomic_load_n(&a->fn, __ATOMIC_ACQUIRE);
+  if (!fn)
+    return 0;
+  fn(a->ctx);
+  return 1;
 }
 
 /* Remove a previously-registered (fn, ctx) handler from `irq`. Returns 0 if a
@@ -501,6 +577,16 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
     irq_eoi(frame->vector);
     return;
   }
+  /* M98: MSI/MSI-X. One owner, no IOAPIC entry behind it, so EOI goes straight
+   * to the local APIC — irq_eoi's legacy-PIC branch would be wrong here (the
+   * 8259 never saw this interrupt). */
+  if (frame->vector >= MSI_VECTOR_BASE &&
+      frame->vector < MSI_VECTOR_BASE + MSI_VECTOR_COUNT) {
+    msi_dispatch((int)frame->vector);
+    lapic_eoi();
+    return;
+  }
+
   if (frame->vector >= 32 && frame->vector <= 47) {
     int irq = frame->vector - 32;
     int handled = 0;

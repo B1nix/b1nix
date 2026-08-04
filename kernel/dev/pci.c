@@ -1,3 +1,4 @@
+#include <b1nix/irq.h>
 #include <b1nix/pci.h>
 #include <b1nix/acpi.h>
 #include <b1nix/bootinfo.h>
@@ -513,17 +514,17 @@ static u64 msi_message_address(u32 apic_id)
 	return 0xFEE00000ULL | ((u64)(apic_id & 0xFF) << 12);
 }
 
-int pci_msi_enable(u8 bus, u8 slot, u8 func, u8 irq)
+int pci_msi_enable(u8 bus, u8 slot, u8 func, u8 vector)
 {
 	u8 cap = pci_find_capability(bus, slot, func, PCI_CAP_ID_MSI);
 	if (!cap)
 		return -1;
-	if (irq > 15)
-		return -1; /* only vectors 32..47 have IDT gates (see pci.h) */
+	if (vector < 32)
+		return -1; /* 0..31 are CPU exceptions — never a device vector */
 
 	u16 ctrl = pci_config_read16(bus, slot, func, (u8)(cap + PCI_MSI_CTRL));
 	u64 addr = msi_message_address(lapic_id());
-	u16 data = (u16)(32 + irq);
+	u16 data = vector;
 
 	pci_config_write32(bus, slot, func, (u8)(cap + PCI_MSI_ADDR_LO),
 	                   (u32)(addr & 0xFFFFFFFFu));
@@ -634,11 +635,11 @@ static volatile u32 *pci_msix_table(u8 bus, u8 slot, u8 func, u8 *out_cap,
 	return t;
 }
 
-int pci_msix_enable(u8 bus, u8 slot, u8 func, u32 entry, u8 irq)
+int pci_msix_enable(u8 bus, u8 slot, u8 func, u32 entry, u8 vector)
 {
 	u8 cap = 0;
 	u32 entries = 0;
-	if (irq > 15)
+	if (vector < 32)
 		return -1;
 	volatile u32 *t = pci_msix_table(bus, slot, func, &cap, &entries);
 	if (!t || entry >= entries)
@@ -650,7 +651,7 @@ int pci_msix_enable(u8 bus, u8 slot, u8 func, u32 entry, u8 irq)
 	e[3] = PCI_MSIX_VECTOR_CTRL_MASK;
 	e[0] = (u32)(addr & 0xFFFFFFFFu);
 	e[1] = (u32)(addr >> 32);
-	e[2] = (u32)(32 + irq);
+	e[2] = (u32)vector;
 	e[3] = 0;
 
 	pci_command_set(bus, slot, func,
@@ -724,6 +725,33 @@ static u64 intel_gms_bytes(u8 gms)
 	return 0;
 }
 
+/* The whole decode, with no hardware in it. GGC/BDSM/BGSM in, sizes and bases
+ * out — so the arithmetic that only real Intel graphics can supply values for
+ * is still testable against the encodings in the spec (pci_selftest_stolen).
+ * Returns 0 when the registers describe a stolen region, -1 when they describe
+ * none, which is what every chipset without an iGPU reports. */
+int pci_intel_stolen_decode(u16 ggc, u32 bdsm, u32 bgsm,
+                            struct pci_intel_stolen *out)
+{
+	if (!out)
+		return -1;
+	memset(out, 0, sizeof(*out));
+	if (ggc == 0xFFFF)
+		return -1;
+	out->ggc = ggc;
+	/* Both bases are 1 MiB aligned; the low bits are lock/reserved flags. */
+	out->dsm_base = (u64)(bdsm & 0xFFF00000u);
+	out->gsm_base = (u64)(bgsm & 0xFFF00000u);
+	out->dsm_size = intel_gms_bytes((u8)((ggc >> 8) & 0xFF));
+	out->gsm_size = (u64)((ggc >> 6) & 0x3) * 1024ULL * 1024ULL;
+
+	/* Chipsets that do not implement graphics stolen memory (every QEMU host
+	 * bridge) read these as zero. Report absence rather than a bogus window. */
+	if (out->dsm_base == 0 && out->gsm_base == 0 && out->dsm_size == 0)
+		return -1;
+	return 0;
+}
+
 int pci_intel_stolen_read(struct pci_intel_stolen *out)
 {
 	if (!out)
@@ -749,23 +777,9 @@ int pci_intel_stolen_read(struct pci_intel_stolen *out)
 	}
 
 	u16 ggc = pci_config_read16(0, 0, 0, INTEL_HOST_BRIDGE_GGC);
-	if (ggc == 0xFFFF)
-		return -1;
-	out->ggc = ggc;
-
 	u32 bdsm = pci_config_read32(0, 0, 0, INTEL_HOST_BRIDGE_BDSM);
 	u32 bgsm = pci_config_read32(0, 0, 0, INTEL_HOST_BRIDGE_BGSM);
-	/* Both are 1 MiB aligned bases with the low bit reserved as a lock flag. */
-	out->dsm_base = (u64)(bdsm & 0xFFF00000u);
-	out->gsm_base = (u64)(bgsm & 0xFFF00000u);
-	out->dsm_size = intel_gms_bytes((u8)((ggc >> 8) & 0xFF));
-	out->gsm_size = (u64)((ggc >> 6) & 0x3) * 1024ULL * 1024ULL;
-
-	/* Chipsets that do not implement graphics stolen memory (every QEMU host
-	 * bridge) read these as zero. Report absence rather than a bogus window. */
-	if (out->dsm_base == 0 && out->gsm_base == 0 && out->dsm_size == 0)
-		return -1;
-	return 0;
+	return pci_intel_stolen_decode(ggc, bdsm, bgsm, out);
 }
 
 /* ── M98 in-kernel self-test ────────────────────────────────────────
@@ -926,6 +940,16 @@ static void pci_selftest_busmaster(const struct pci_device_info *dev)
 /* Program MSI (or MSI-X) on a device that nothing is currently driving, verify
  * the device holds exactly what we wrote, then restore it. Picking an idle
  * function matters: reprogramming a live driver's interrupts would break it. */
+/* Owner for the vectors the programming test claims. It must never run: the
+ * test programs the capability and disables it again without arming anything.
+ * Having a real owner is what stops the allocator handing the same vector to a
+ * driver while a live device is pointed at it. */
+static int pci_selftest_msi_sink(void *ctx)
+{
+	(void)ctx;
+	return 1;
+}
+
 static void pci_selftest_msi(void)
 {
 	struct pci_device_info dev;
@@ -971,7 +995,11 @@ static void pci_selftest_msi(void)
 		u64 addr = 0;
 		u16 data = 0;
 		int en = 0;
-		u8 irq = 11;
+		/* A vector out of the MSI range, claimed for the duration so nothing
+		 * else can be handed the same number while it is programmed into a
+		 * live device. Nothing fires it — this checks the programming. */
+		int vec = msi_alloc_vector(pci_selftest_msi_sink, 0);
+		u8 vector = (u8)(vec > 0 ? vec : (int)MSI_VECTOR_BASE);
 		/* Snapshot everything this test touches. The function may be one a
 		 * b1nix driver is already using over INTx, and pci_msi_enable sets
 		 * INTX_DISABLE; leaving that bit set would silence the device for the
@@ -985,12 +1013,12 @@ static void pci_selftest_msi(void)
 			saved_cap[i] = pci_config_read32(msi_dev.bus, msi_dev.slot,
 			                                 msi_dev.func,
 			                                 (u8)(msi_cap + i * 4));
-		int rc = pci_msi_enable(msi_dev.bus, msi_dev.slot, msi_dev.func, irq);
+		int rc = pci_msi_enable(msi_dev.bus, msi_dev.slot, msi_dev.func, vector);
 		int rb = pci_msi_readback(msi_dev.bus, msi_dev.slot, msi_dev.func, &addr,
 		                          &data, &en);
 		u64 want_addr = 0xFEE00000ULL | ((u64)(lapic_id() & 0xFF) << 12);
 		if (rc == 0 && rb == 0 && en && addr == want_addr &&
-		    data == (u16)(32 + irq)) {
+		    data == (u16)vector) {
 			console_write("M98-DRV-SMOKE: ok msi-config\n");
 		} else {
 			console_write("M98-DRV-SMOKE: FAIL msi-config addr=0x");
@@ -1005,13 +1033,16 @@ static void pci_selftest_msi(void)
 			                   (u8)(msi_cap + i * 4), saved_cap[i]);
 		pci_config_write16(msi_dev.bus, msi_dev.slot, msi_dev.func,
 		                   PCI_CFG_COMMAND, saved_cmd);
+		if (vec > 0)
+			msi_free_vector(vec);
 	} else {
 		console_write("M98-DRV-SMOKE: skip msi-config (no MSI-capable function)\n");
 	}
 
 	if (have_msix) {
 		int n = pci_msix_table_size(msix_dev.bus, msix_dev.slot, msix_dev.func);
-		u8 irq = 10;
+		int vec = msi_alloc_vector(pci_selftest_msi_sink, 0);
+		u8 vector = (u8)(vec > 0 ? vec : (int)MSI_VECTOR_BASE + 1);
 		/* Same reasoning as MSI: snapshot the capability's control word, the
 		 * command register and the table entry, and put all three back. A
 		 * virtio function driven over INTx would otherwise be left with MSI-X
@@ -1028,14 +1059,15 @@ static void pci_selftest_msi(void)
 		int had_entry = pci_msix_entry_readback(msix_dev.bus, msix_dev.slot,
 		                                        msix_dev.func, 0, &saved_e_addr,
 		                                        &saved_e_data, &saved_e_ctrl) == 0;
-		int rc = pci_msix_enable(msix_dev.bus, msix_dev.slot, msix_dev.func, 0, irq);
+		int rc = pci_msix_enable(msix_dev.bus, msix_dev.slot, msix_dev.func, 0,
+		                         vector);
 		u64 addr = 0;
 		u32 data = 0, vctrl = 0xFFFFFFFFu;
 		int rb = pci_msix_entry_readback(msix_dev.bus, msix_dev.slot,
 		                                 msix_dev.func, 0, &addr, &data, &vctrl);
 		u64 want_addr = 0xFEE00000ULL | ((u64)(lapic_id() & 0xFF) << 12);
 		if (n > 0 && rc == 0 && rb == 0 && addr == want_addr &&
-		    data == (u32)(32 + irq) && (vctrl & 1u) == 0) {
+		    data == (u32)vector && (vctrl & 1u) == 0) {
 			console_write("M98-DRV-SMOKE: ok msix-config vectors=");
 			console_write_dec((u64)n);
 			console_write("\n");
@@ -1056,8 +1088,59 @@ static void pci_selftest_msi(void)
 		                   (u8)(msix_cap + 0x02), saved_ctrl);
 		pci_config_write16(msix_dev.bus, msix_dev.slot, msix_dev.func,
 		                   PCI_CFG_COMMAND, saved_cmd);
+		if (vec > 0)
+			msi_free_vector(vec);
 	} else {
 		console_write("M98-DRV-SMOKE: skip msix-config (no MSI-X-capable function)\n");
+	}
+}
+
+/* The GGC decode, checked against the encodings in the spec rather than against
+ * a machine. Every case below is a value only real Intel graphics would put in
+ * that register, which is why the hardware path (pci_intel_stolen_read) can
+ * never reach them under QEMU — but the arithmetic behind them is ordinary code
+ * and is tested as such. */
+static void pci_selftest_stolen_decode(void)
+{
+	struct pci_intel_stolen st;
+	int bad = 0;
+
+	/* GMS 0x02 = 2 * 32 MiB data stolen, GGMS 0x1 = 1 MiB GTT stolen, bases
+	 * 1 MiB aligned with the low lock bit set (which must be masked off). */
+	if (pci_intel_stolen_decode(0x0242, 0x7C000001u, 0x7B000001u, &st) != 0 ||
+	    st.dsm_size != 64ULL * 1024 * 1024 || st.gsm_size != 1ULL * 1024 * 1024 ||
+	    st.dsm_base != 0x7C000000ULL || st.gsm_base != 0x7B000000ULL)
+		bad = 1;
+
+	/* GMS 0x10 is the top of the 32 MiB-unit range: 512 MiB. */
+	if (pci_intel_stolen_decode(0x1082, 0x40000000u, 0x3F000000u, &st) != 0 ||
+	    st.dsm_size != 512ULL * 1024 * 1024)
+		bad = 2;
+
+	/* The 4 MiB-unit range starts at 0xF0 == 4 MiB, so 0xF1 is 8 MiB. */
+	if (pci_intel_stolen_decode(0xF102, 0x40000000u, 0x3F000000u, &st) != 0 ||
+	    st.dsm_size != 8ULL * 1024 * 1024)
+		bad = 3;
+
+	/* GGMS 0x3 = 3 MiB of GTT stolen, and a GMS of 0 with a real base is still
+	 * a described region. */
+	if (pci_intel_stolen_decode(0x00C2, 0x40000000u, 0x3F000000u, &st) != 0 ||
+	    st.dsm_size != 0 || st.gsm_size != 3ULL * 1024 * 1024)
+		bad = 4;
+
+	/* All zeroes describes no stolen memory, and 0xFFFF is an absent register:
+	 * both must be reported as absence, never as a zero-based window. */
+	if (pci_intel_stolen_decode(0x0000, 0, 0, &st) == 0)
+		bad = 5;
+	if (pci_intel_stolen_decode(0xFFFF, 0xFFFFFFFFu, 0xFFFFFFFFu, &st) == 0)
+		bad = 6;
+
+	if (!bad) {
+		console_write("M98-DRV-SMOKE: ok stolen-decode\n");
+	} else {
+		console_write("M98-DRV-SMOKE: FAIL stolen-decode case=");
+		console_write_dec((u64)bad);
+		console_write("\n");
 	}
 }
 
@@ -1110,4 +1193,5 @@ void pci_selftest(void)
 	pci_selftest_busmaster(&dev);
 	pci_selftest_msi();
 	pci_selftest_stolen();
+	pci_selftest_stolen_decode();
 }

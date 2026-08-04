@@ -2189,6 +2189,10 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M98-DRV-SMOKE: ok msi-config" "M98: MSI programming reads back the expected LAPIC address and vector"
 	check_output "$LOG" "M98-DRV-SMOKE: ok msix-config" "M98: MSI-X table entry programming reads back address, data and an unmasked vector control"
 	check_output "$LOG" "M98-DRV-SMOKE: ok stolen" "M98: Intel stolen memory (BDSM/BGSM) reports the host bridge's real state"
+	check_output "$LOG" "M98-DRV-SMOKE: ok stolen-decode" "M98: the GGC GMS/GGMS decode matches the spec encodings, including the 4 MiB-unit range and absence"
+	check_output "$LOG" "M98-DRV-SMOKE: ok wbinvd-fallback" "M98: the CLFLUSH-less wbinvd path runs and a completed store survives it"
+	check_output "$LOG" "M98-DRV-SMOKE: ok msi-delivery" "M98: an MSI-X message the NVMe controller raises is delivered to the vector the driver owns"
+	check_output "$LOG" "nvme: MSI-X completions on vector" "M98: NVMe drives its completions over MSI-X, not the legacy INTx line"
 
 	# ── M99: linuxkpi compatibility layer (in-kernel) ──
 	check_output "$LOG" "M99-SMOKE: ok idr" "M99: idr allocates unique ids, looks up the exact pointers, and reuses freed ids"

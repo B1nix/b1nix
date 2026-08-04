@@ -108,14 +108,15 @@ u16 pci_find_ext_capability(u8 bus, u8 slot, u8 func, u16 cap_id);
 /*
  * MSI / MSI-X.
  *
- * b1nix's IDT carries device gates for vectors 32..47 only, and the entry path
- * turns a vector into `irq = vector - 32` and runs irq_dispatch(irq). MSI is
- * therefore programmed to deliver vector (32 + irq) to the BSP's local APIC and
- * the driver registers its handler with the ordinary irq_register_handler(irq).
- * The line is a pure vector number here: nothing is routed through the IOAPIC,
- * so a driver on MSI should mask its legacy line.
+ * A message interrupt carries no line: the device writes the vector straight to
+ * the local APIC, so nothing is routed through the IOAPIC and there is no line
+ * to mask or to share. The driver claims a vector from the dedicated MSI range
+ * with msi_alloc_vector() (kernel/include/b1nix/irq.h), programs it here, and
+ * its handler is called by msi_dispatch from the IRQ entry path. Both functions
+ * take the vector itself, not a legacy line number, and set INTX_DISABLE —
+ * MSI and INTx are mutually exclusive by the spec.
  */
-int pci_msi_enable(u8 bus, u8 slot, u8 func, u8 irq);
+int pci_msi_enable(u8 bus, u8 slot, u8 func, u8 vector);
 void pci_msi_disable(u8 bus, u8 slot, u8 func);
 /* Read back the address/data pair actually programmed into the device. Returns
  * 0 on success, -1 when the function has no MSI capability. */
@@ -126,9 +127,9 @@ int pci_msi_readback(u8 bus, u8 slot, u8 func, u64 *out_addr, u16 *out_data,
  * capability. */
 int pci_msix_table_size(u8 bus, u8 slot, u8 func);
 /* Map the MSI-X vector table (from the BAR its capability points at), program
- * entry `entry` to deliver vector (32 + irq) to the BSP, unmask it and set the
+ * entry `entry` to deliver `vector` to the BSP, unmask it and set the
  * capability's global MSI-X enable. Returns 0 on success. */
-int pci_msix_enable(u8 bus, u8 slot, u8 func, u32 entry, u8 irq);
+int pci_msix_enable(u8 bus, u8 slot, u8 func, u32 entry, u8 vector);
 /* Read one programmed MSI-X table entry back out of the device's table. */
 int pci_msix_entry_readback(u8 bus, u8 slot, u8 func, u32 entry, u64 *out_addr,
                             u32 *out_data, u32 *out_vector_ctrl);
@@ -157,6 +158,14 @@ struct pci_intel_stolen {
 	u16 ggc;       /* raw GGC register, for diagnostics */
 };
 int pci_intel_stolen_read(struct pci_intel_stolen *out);
+
+/* The decode on its own: GGC/BDSM/BGSM in, bases and sizes out, no hardware
+ * touched. Returns 0 when the registers describe a stolen region and -1 when
+ * they describe none. Split out because the GMS/GGMS arithmetic can only be
+ * driven by values a real iGPU supplies, so it is tested directly instead of
+ * being unreachable everywhere except on Intel graphics. */
+int pci_intel_stolen_decode(u16 ggc, u32 bdsm, u32 bgsm,
+                            struct pci_intel_stolen *out);
 
 /* M98 in-kernel self-test (BAR sizing, capability walk, bus master, MSI/MSI-X
  * programming readback, stolen memory). No-op outside b1nix.test=1. */

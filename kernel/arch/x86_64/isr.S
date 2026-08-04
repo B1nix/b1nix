@@ -80,6 +80,27 @@ IRQ 45
 IRQ 46
 IRQ 47
 
+/* M98: MSI / MSI-X vectors 48..63. A message-signalled interrupt is not routed
+ * through the IOAPIC and has no legacy line behind it, so it gets its own
+ * vector range and its own dispatch table (msi_alloc_vector in interrupts.c)
+ * rather than borrowing one of the 16 legacy lines a real device also uses. */
+IRQ 48
+IRQ 49
+IRQ 50
+IRQ 51
+IRQ 52
+IRQ 53
+IRQ 54
+IRQ 55
+IRQ 56
+IRQ 57
+IRQ 58
+IRQ 59
+IRQ 60
+IRQ 61
+IRQ 62
+IRQ 63
+
 /* LAPIC timer (per-CPU scheduler tick) — vector 0x40 = 64.
  * Drives scheduler_on_timer_tick on the BSP; on APs it's a per-CPU EOI today
  * (cooperative scheduler — no preemption from ISR) and the mechanism through

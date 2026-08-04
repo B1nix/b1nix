@@ -759,6 +759,10 @@ void kernel_main(usize arg0, usize arg1)
 	 * cooperative scheduler (the earlier block runs while the APs are still
 	 * confined to the work-stealing-only loop). */
 	if (bootinfo_has_flag("b1nix.test=1")) {
+		/* M98: MSI-X delivery. Needs the full scheduler (the completion wait
+		 * blocks) and a controller that has finished initialising, so it runs
+		 * here rather than in the early self-test block with the rest of M98. */
+		nvme_msix_selftest();
 		lkpi_selftest();      /* M99: idr, completion, workqueue, sg, dma, fw */
 		dma_fence_selftest(); /* M100: dma-fence */
 		drm_sched_selftest(); /* M100: GPU scheduler + scatter-gather BOs */

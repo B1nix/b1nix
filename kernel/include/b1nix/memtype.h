@@ -85,6 +85,16 @@ u32 cache_line_size(void);
  * any mapping; a no-op when the CPU lacks CLFLUSH. */
 void cache_flush_range(const void *addr, usize size);
 
+/* Same, with the choice forced. force_wbinvd != 0 takes the CLFLUSH-less
+ * fallback (write back and invalidate the whole hierarchy) even on a CPU that
+ * has CLFLUSH — which is the only way that branch is reachable on hardware
+ * QEMU emulates, and how the M98 self-test exercises it. */
+void cache_flush_range_ex(const void *addr, usize size, int force_wbinvd);
+
+/* 1 when CPUID reported CLFLUSH, i.e. when cache_flush_range takes the
+ * line-at-a-time path rather than the wbinvd fallback. */
+int cache_have_clflush(void);
+
 /* M98 in-kernel self-test: verifies the PAT MSR readback, that a WC mapping
  * carries the expected PTE bits, and that data written through it is coherent.
  * Emits M98-DRV-SMOKE markers. No-op outside b1nix.test=1. */

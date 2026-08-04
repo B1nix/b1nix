@@ -58,12 +58,14 @@ u32 cache_line_size(void)
 	return g_clflush_size ? g_clflush_size : 64;
 }
 
-void cache_flush_range(const void *addr, usize size)
+void cache_flush_range_ex(const void *addr, usize size, int force_wbinvd)
 {
 	if (!addr || size == 0)
 		return;
-	if (!g_have_clflush) {
-		/* No CLFLUSH: the only architectural alternative is the big hammer. */
+	if (force_wbinvd || !g_have_clflush) {
+		/* No CLFLUSH (or a caller that wants the whole hierarchy back in
+		 * memory regardless): the only architectural alternative is the big
+		 * hammer. */
 		mem_wbinvd();
 		return;
 	}
@@ -74,6 +76,16 @@ void cache_flush_range(const void *addr, usize size)
 	for (u64 p = start; p < end; p += line)
 		mem_clflush((const void *)(usize)p);
 	mem_mfence();
+}
+
+void cache_flush_range(const void *addr, usize size)
+{
+	cache_flush_range_ex(addr, size, 0);
+}
+
+int cache_have_clflush(void)
+{
+	return g_have_clflush;
 }
 
 /* ── M98 self-test ──────────────────────────────────────────────────
@@ -164,6 +176,27 @@ void memtype_selftest(void)
 		console_write("M98-DRV-SMOKE: FAIL clflush line=");
 		console_write_dec((u64)cache_line_size());
 		console_write("\n");
+	}
+
+	/* The wbinvd fallback. It is the path a CPU without CLFLUSH would take,
+	 * and every CPU QEMU emulates reports CLFLUSH — so instead of leaving the
+	 * branch unreachable, take it deliberately. What is observable is that the
+	 * instruction executes on this CPU (it faults or #UDs if it does not, and
+	 * it is privileged, so a bug in the calling context shows up here) and
+	 * that a completed store survives writing the whole hierarchy back. What
+	 * is NOT observable from software is the cache state itself; that is why
+	 * this marker says the path runs, not that lines were evicted. */
+	cache_flush_range_ex((const void *)(usize)wb, 64, 1);
+	int wb_survived = 1;
+	for (int i = 0; i < 16; i++)
+		if (wb[i] != 0xC0FFEE00u + (u32)i)
+			wb_survived = 0;
+	if (wb_survived) {
+		console_write("M98-DRV-SMOKE: ok wbinvd-fallback clflush=");
+		console_write_dec((u64)cache_have_clflush());
+		console_write("\n");
+	} else {
+		console_write("M98-DRV-SMOKE: FAIL wbinvd-fallback (data lost)\n");
 	}
 
 	/* The MMIO window is never reclaimed, so the frame stays owned by the

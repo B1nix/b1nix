@@ -39,3 +39,32 @@ void irq_unmask(u8 irq);
 /* Dispatch every handler registered for `irq` (called from the arch IRQ entry).
  * Returns the OR of the handlers' return values (1 if any claimed it). */
 int irq_dispatch(int irq);
+
+/*
+ * M98: message-signalled interrupts (MSI / MSI-X).
+ *
+ * An MSI has no line. The device writes the vector straight to the local APIC,
+ * so there is nothing to route at the IOAPIC, nothing to mask there, and no
+ * line shared with a legacy device — which is exactly why these do not belong
+ * in the 16-entry table above. Vectors MSI_VECTOR_BASE..+MSI_VECTOR_COUNT-1
+ * have their own IDT gates and one owner each.
+ *
+ * A driver asks for a vector, programs it into the device's MSI or MSI-X
+ * capability (pci_msi_enable / pci_msix_enable), and its handler is called with
+ * the registered ctx when the device raises it. Unlike a shared line the return
+ * value is not a claim — the vector belongs to one device — but it is kept the
+ * same shape as irq_handler_fn so a driver can use one handler for both paths.
+ */
+#define MSI_VECTOR_BASE  48u
+#define MSI_VECTOR_COUNT 16u
+
+/* Claim a free MSI vector for (fn, ctx). Returns the vector number (48..63) to
+ * program into the device, or -1 when every vector is taken. */
+int msi_alloc_vector(irq_handler_fn fn, void *ctx);
+
+/* Release a vector claimed by msi_alloc_vector. The caller must have disabled
+ * the device's MSI/MSI-X capability first. */
+void msi_free_vector(int vector);
+
+/* Call the owner of `vector` (arch IRQ entry). Returns 1 if a handler ran. */
+int msi_dispatch(int vector);
