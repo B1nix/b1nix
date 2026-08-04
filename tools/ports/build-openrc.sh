@@ -444,10 +444,16 @@ else
     FAIL_COUNT=$((FAIL_COUNT+1))
 fi
 
-# Init symlink
+# No /sbin/init symlink here. /sbin/init is BusyBox's init applet (stamped by
+# tools/ports/build-busybox.sh) and is the kernel's default PID 1; OpenRC is the
+# high-level init driving the runlevels underneath it, exactly as on Alpine.
+# openrc-init keeps its own name and is selected with init=/sbin/openrc-init.
 if [ -f "$BIN_DIR/openrc-init" ]; then
-    ln -sf openrc-init "$BIN_DIR/init"
-    echo "  -> init -> openrc-init"
+    # Only drop the stale link an older tree left behind — never one pointing at
+    # BusyBox, which may already have been installed into this sysroot.
+    [ "$(readlink "$BIN_DIR/init" 2>/dev/null)" = "openrc-init" ] && \
+        rm -f "$BIN_DIR/init"
+    echo "  -> openrc-init (PID 1 only with init=/sbin/openrc-init)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -567,7 +573,10 @@ chmod +x "$PREFIX/etc/openrc-ctltest.sh"
 
 cat > "$PREFIX/etc/local.d/zz-ctltest.start" <<'CTLEOF'
 #!/bin/sh
-grep -q 'b1nix.test=1' /proc/cmdline 2>/dev/null || grep -q 'b1nix.openrc-ctltest' /proc/cmdline 2>/dev/null || exit 0
+# Only on the instance that asked for it. Arming this on every test boot left a
+# 30-second FIFO waiter running on instances whose PID 1 is not openrc-init,
+# which could only ever report a failure it was never meant to test.
+grep -q 'b1nix.openrc-ctltest' /proc/cmdline 2>/dev/null || exit 0
 # setsid: the waiter must outlive the `local` service, whose process group is
 # torn down when the service finishes.
 ( /etc/openrc-ctltest.sh ) &

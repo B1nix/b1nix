@@ -2,9 +2,11 @@
 grep -q 'b1nix.test=1' /proc/cmdline 2>/dev/null || exit 0
 trap '' USR2 HUP TERM INT ALRM
 
-echo "init: /sbin/openrc-init pid=1"
-echo "M94-INIT: ok default /sbin/openrc-init"
-echo "M94-INIT: ok no-override-flags"
+# NOTE: this script prints no boot marker of its own. It used to echo
+# "init: ... pid=1" and two "M94-INIT: ok ..." lines, which were forgeries — a
+# shell in the default runlevel cannot know what PID 1 is or how the kernel
+# parsed `init=`. Those lines come from the kernel itself (kernel/main.c), which
+# is the only thing that can report them truthfully.
 
 [ -x /etc/rc ] && /bin/sh /etc/rc
 
@@ -20,21 +22,36 @@ elif grep -q 'b1nix.smoke=posix' /proc/cmdline 2>/dev/null; then
     SMOKE_POSIX=1
 elif grep -q 'b1nix.smoke=blk' /proc/cmdline 2>/dev/null; then
     SMOKE_BLK=1
-elif grep -q 'b1nix.smoke=bbinit' /proc/cmdline 2>/dev/null; then
-    # M108: BusyBox init is PID 1 on this instance and drives the checks itself
-    # from /etc/inittab (see /etc/bbinit-smoke.sh). Nothing of the ordinary
-    # suite runs here — but leaving a breadcrumb proves something the test can
-    # not otherwise see from the outside: that OpenRC's `default` runlevel
-    # really executed, with its local.d hooks, under BusyBox init. m108_smoke
-    # checks for this file; it is never written on any other instance.
+elif grep -q 'b1nix.smoke=init' /proc/cmdline 2>/dev/null; then
+    # M108: the init instance. PID 1 drives the checks itself from /etc/inittab
+    # (see /etc/init-smoke.sh). Nothing of the ordinary suite runs here — but
+    # leaving a breadcrumb proves something the test cannot otherwise see from
+    # the outside: that OpenRC's `default` runlevel really executed, with its
+    # local.d hooks, under BusyBox init. m108_smoke checks for this file; it is
+    # never written on any other instance.
     : > /tmp/m108-openrc-local-ran
     exit 0
 elif grep -q 'b1nix.openrc-ctltest' /proc/cmdline 2>/dev/null; then
-    echo "M94-OPENRC: ok init-fifo-present"
-    echo "/etc/init.d/killprocs start"
-    echo "reboot: powering off"
-    echo "B1NIX-TEST: done"
-    ( sleep 1; /bin/poweroff -f || /bin/halt -f || /sbin/openrc-shutdown --no-write --poweroff now ) &
+    # The openrc instance: openrc-init is PID 1 and the control-FIFO test runs
+    # for real from /etc/local.d/zz-ctltest.start -> /etc/openrc-ctltest.sh,
+    # which waits for /run/openrc/init.ctl and asks PID 1 to power the machine
+    # off through it. Nothing to do here.
+    #
+    # This branch used to echo "M94-OPENRC: ok init-fifo-present",
+    # "/etc/init.d/killprocs start" and "reboot: powering off" and then call
+    # `poweroff -f` — it forged every marker of the test AND powered the machine
+    # off before the real path could run, so the check could not fail. The
+    # markers now come from the FIFO waiter, from OpenRC's shutdown runlevel and
+    # from the kernel's own poweroff path respectively.
+    #
+    # What does belong here: the PID 1 questions only a process running under
+    # this init can answer — is PID 1 really the openrc-init ELF, does it reap
+    # an orphan, does the system it brought up run a shell. They are the same
+    # checks the BusyBox-init instance makes, so both inits carry the same
+    # evidence. This runs to completion before zz-ctltest.start's waiter can
+    # power the machine off (local.d hooks run in name order, and the FIFO only
+    # appears once every runlevel is done).
+    [ -x /bin/m108_smoke ] && /bin/m108_smoke openrccheck
     exit 0
 else
     SMOKE_SYS=1

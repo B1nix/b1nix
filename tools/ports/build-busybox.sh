@@ -231,10 +231,17 @@ for applet in true false yes echo printf pwd basename dirname cat head tail wc \
 done
 rm -f "$SYSROOT/bin/busybox-real"
 
-# BusyBox's init applet, reachable as an alternative PID 1 (init=/opt/busybox/bin/init).
-# The multicall binary dispatches on argv[0], so the name of the symlink is what
-# selects the applet — /bin/init belongs to b1nix's own test orchestrator, so
-# this one lives next to the busybox binary.
+# BusyBox's init applet. The multicall binary dispatches on argv[0], so the name
+# of the symlink is what selects the applet — /bin/init belongs to b1nix's own
+# test orchestrator, so this one lives next to the busybox binary.
 ln -sf busybox "$INSTALL_DIR/init"
+
+# ...and /sbin/init, the kernel's default PID 1 (kernel/main.c), points at it —
+# Alpine's layout, where /sbin/init is a symlink onto the multicall ELF. BusyBox
+# init is the supervisor; /etc/inittab hands every runlevel to OpenRC, which
+# stays the high-level init system. OpenRC's own PID 1 is still reachable as
+# /sbin/openrc-init through the M94 `init=` cmdline parameter.
+mkdir -p "$SYSROOT/sbin"
+ln -sf /opt/busybox/bin/busybox "$SYSROOT/sbin/init"
 
 echo "BusyBox ${BUSYBOX_VER} installed to $INSTALL_DIR/busybox"

@@ -1,23 +1,22 @@
-# /etc/inittab — BusyBox init (M108).
+# /etc/inittab — BusyBox init, PID 1 on b1nix.
 #
-# PID 1 on b1nix is /sbin/openrc-init by DEFAULT (kernel/main.c, M94). This
-# file is read only when the kernel cmdline selects BusyBox init instead:
+# The kernel's default init is /sbin/init (kernel/main.c, M94), which is a
+# symlink onto the BusyBox multicall ELF — Alpine's layout. This file is what
+# PID 1 reads, so it describes every ordinary boot, not a special mode.
 #
-#     init=/opt/busybox/bin/init
+# The split is Alpine's too: BusyBox init is the *supervisor* — it reaps
+# orphans, runs the sysinit and shutdown phases and respawns getty — while
+# OpenRC stays the *high-level* init system that owns the service graph
+# (/etc/init.d + /etc/runlevels, M94) and drives every runlevel below it.
 #
-# That is a deliberate choice, not an accident of ordering. OpenRC owns the
-# service graph b1nix already ships (etc/init.d + etc/runlevels, M94), and
-# openrc-init additionally provides the /run/openrc/init.ctl control channel
-# that openrc-shutdown and telinit talk to. BusyBox init has no equivalent, so
-# demoting OpenRC to a plain runlevel driver would lose a working feature.
-# Keeping openrc-init as the default and reaching BusyBox init through `init=`
-# means both are real, bootable configurations and neither is a fork of the
-# other's service definitions.
+# OpenRC's own PID 1, /sbin/openrc-init, is still a real bootable
+# configuration, selected with the M94 cmdline parameter:
 #
-# The reconciliation below is Alpine's: BusyBox init is the supervisor (it
-# reaps orphans, runs the sysinit/shutdown phases and respawns getty), while
-# OpenRC still drives every runlevel, so the same /etc/init.d services and the
-# same /etc/local.d hooks run under either PID 1.
+#     init=/sbin/openrc-init
+#
+# It is worth keeping because it owns the /run/openrc/init.ctl control channel
+# that openrc-shutdown and telinit talk to, which BusyBox init has no
+# equivalent of. Both inits run the same services out of the same files.
 #
 # Format:  <id>:<runlevels>:<action>:<process>   (id/runlevels unused by BusyBox)
 
@@ -27,14 +26,16 @@
 ::wait:/sbin/openrc default
 
 # Test hook: only does anything when the kernel cmdline carries b1nix.test=1
-# AND b1nix.smoke=bbinit (see the script). On an ordinary boot it exits at once.
-::wait:/bin/sh /etc/bbinit-smoke.sh
+# AND b1nix.smoke=init (see the script). On an ordinary boot it exits at once.
+::wait:/bin/sh /etc/init-smoke.sh
 
-# Interactive login on the serial console. b1nix's console is COM1
-# (/dev/ttyS0); getty execs /bin/login, which is the setuid BusyBox copy.
-::respawn:/bin/getty -L 115200 ttyS0 vt100
+# Interactive login on the first virtual terminal. The serial line (/dev/ttyS0)
+# deliberately gets no getty: it is the kernel console, and a getty there would
+# claim it as its controlling terminal and take the foreground process group
+# away from whatever is already running on it.
+::respawn:/bin/getty -L 0 tty1 linux
 
 # Ctrl-Alt-Del and shutdown handling.
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/sbin/openrc shutdown
-::restart:/opt/busybox/bin/init
+::restart:/sbin/init

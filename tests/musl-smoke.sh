@@ -94,7 +94,7 @@ fi
 
 # --- Step 4: Rebuild kernel with embedded smoke test --------------------------
 echo "[M92-MUSL] Rebuilding kernel with embedded musl smoke test..."
-make ARCH=x86_64 KERNEL_CMDLINE="init=/sbin/openrc-init b1nix.test=1 b1nix.muslrun" iso 2>&1 | tail -5
+make ARCH=x86_64 KERNEL_CMDLINE="b1nix.test=1 b1nix.muslrun" iso 2>&1 | tail -5
 
 # --- Step 5: Run in QEMU -----------------------------------------------------
 echo "[M92-MUSL] Running smoke test in QEMU (timeout ${QEMU_TIMEOUT}s)..."

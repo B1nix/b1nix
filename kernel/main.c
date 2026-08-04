@@ -721,7 +721,7 @@ void kernel_main(usize arg0, usize arg1)
 
 		/* M94: init-path parsing self-test. Verify bootinfo_get_kv
 		 * correctly extracts the `init=` parameter (or falls back to
-		 * /sbin/openrc-init). */
+		 * /sbin/init). */
 		{
 			char m94_path[128];
 			int m94_got = bootinfo_get_kv("init", m94_path,
@@ -731,7 +731,7 @@ void kernel_main(usize arg0, usize arg1)
 				console_write(m94_path);
 				console_write("\n");
 			} else {
-				console_write("M94-INIT: ok default /sbin/openrc-init\n");
+				console_write("M94-INIT: ok default /sbin/init\n");
 			}
 			/* Verify flag detection (flags are absent in normal test boot). */
 			int m94_single = bootinfo_has_flag("b1nix.single");
@@ -767,11 +767,19 @@ void kernel_main(usize arg0, usize arg1)
 	userspace_init();
 
 	/* M94: Generic init path — honour `init=/path` from kernel cmdline.
-	 * Default PID 1 is now /sbin/openrc-init (OpenRC init system).
+	 * Default PID 1 is /sbin/init, which is BusyBox's `init` applet (the
+	 * symlink is stamped by tools/ports/build-busybox.sh) — Alpine's layout.
+	 * BusyBox init supervises (reaps orphans, respawns getty, runs the
+	 * sysinit/shutdown phases) and /etc/inittab hands the service graph to
+	 * OpenRC, which stays the high-level init: `openrc sysinit`, `openrc boot`,
+	 * `openrc default`. OpenRC's own PID 1, /sbin/openrc-init, remains a
+	 * bootable configuration through `init=/sbin/openrc-init` (it owns the
+	 * /run/openrc/init.ctl control channel that openrc-shutdown and telinit
+	 * talk to), and is exercised by the `openrc` smoke instance.
 	 * `b1nix.single` maps to `init=/bin/sh` (standard single-user mode).
 	 * The old test orchestrator `/bin/init` can be selected via `init=/bin/init`. */
 	char init_path_buf[128];
-	const char *init_path = "/sbin/openrc-init";
+	const char *init_path = "/sbin/init";
 	if (bootinfo_get_kv("init", init_path_buf, sizeof(init_path_buf)) &&
 	    init_path_buf[0] != '\0') {
 		init_path = init_path_buf;
