@@ -493,6 +493,151 @@ u16 pci_find_ext_capability(u8 bus, u8 slot, u8 func, u16 cap_id)
 	return 0;
 }
 
+/* ── bridges ────────────────────────────────────────────────────────
+ *
+ * A PCI-to-PCI bridge forwards the requests of everything behind it, and on the
+ * upstream side those requests can carry the bridge's own requester id rather
+ * than the device's. Anything behind one bridge is therefore indistinguishable
+ * to an IOMMU — which is what makes the bridge, not the device, the unit of
+ * isolation there.
+ */
+int pci_bridge_for_bus(u8 bus, u8 *out_bus, u8 *out_slot, u8 *out_func)
+{
+	if (bus == 0)
+		return -1; /* the root bus is behind no bridge */
+	int found = 0;
+	u8 best_secondary = 0, best_bus = 0, best_slot = 0, best_func = 0;
+	for (u16 b = 0; b < 256; b++) {
+		for (u8 slot = 0; slot < 32; slot++) {
+			if (pci_config_read16((u8)b, slot, 0, 0) == 0xFFFF)
+				continue;
+			u8 htype = pci_config_read8((u8)b, slot, 0, PCI_CFG_HEADER_TYPE);
+			u8 nfunc = (htype & 0x80) ? 8 : 1;
+			for (u8 f = 0; f < nfunc; f++) {
+				if (pci_config_read16((u8)b, slot, f, 0) == 0xFFFF)
+					continue;
+				u8 hf = (u8)(pci_config_read8((u8)b, slot, f,
+				                              PCI_CFG_HEADER_TYPE) & 0x7F);
+				if (hf != 1)
+					continue; /* not a bridge */
+				u32 buses = pci_config_read32((u8)b, slot, f, 0x18);
+				u8 secondary = (u8)((buses >> 8) & 0xFF);
+				u8 subordinate = (u8)((buses >> 16) & 0xFF);
+				if (bus >= secondary && bus <= subordinate) {
+					/* Keep the closest one. Every bridge above this bus also
+					 * covers it — a root port's range spans the whole switch
+					 * beneath it — and returning the outermost made every bus
+					 * of a switch look like it hung off the same port. */
+					if (!found || secondary > best_secondary) {
+						found = 1;
+						best_secondary = secondary;
+						best_bus = (u8)b;
+						best_slot = slot;
+						best_func = f;
+					}
+				}
+			}
+		}
+	}
+	if (found) {
+		if (out_bus) *out_bus = best_bus;
+		if (out_slot) *out_slot = best_slot;
+		if (out_func) *out_func = best_func;
+		return 0;
+	}
+	return -1;
+}
+
+/* ── ACS and ARI ────────────────────────────────────────────────────
+ *
+ * Both change who can be isolated from whom.
+ *
+ * ACS says whether a switch port forwards traffic between the devices below it.
+ * If it does, two such devices reach each other without the IOMMU ever seeing
+ * the transfer, and no amount of page tables separates them — they are one
+ * group. The controls that stop that forwarding are ours to set, so the port is
+ * asked to enforce them and then believed only if it reads back enforcing.
+ *
+ * ARI drops the "8 functions per device" limit: functions are numbered across
+ * the whole bus. A rule that groups by slot therefore stops meaning anything
+ * on such a device, and the bus is the group instead.
+ */
+#define PCI_EXT_CAP_ID_ACS 0x000D
+#define PCI_EXT_CAP_ID_ARI 0x000E
+#define PCI_EXT_CAP_ID_SRIOV 0x0010
+
+#define ACS_CAP_OFF  0x04 /* capability register */
+#define ACS_CTRL_OFF 0x06 /* control register */
+/* Source validation, translation blocking, P2P request redirect, P2P
+ * completion redirect, upstream forwarding: with these on, nothing crosses the
+ * port without going upstream past the IOMMU. */
+#define ACS_SV (1u << 0)
+#define ACS_TB (1u << 1)
+#define ACS_RR (1u << 2)
+#define ACS_CR (1u << 3)
+#define ACS_UF (1u << 4)
+#define ACS_ISOLATION (ACS_SV | ACS_RR | ACS_CR | ACS_UF)
+
+int pci_has_ari(u8 bus, u8 slot, u8 func)
+{
+	return pci_find_ext_capability(bus, slot, func, PCI_EXT_CAP_ID_ARI) != 0;
+}
+
+int pci_has_sriov(u8 bus, u8 slot, u8 func)
+{
+	return pci_find_ext_capability(bus, slot, func, PCI_EXT_CAP_ID_SRIOV) != 0;
+}
+
+/* Does this bridge currently keep its children apart? Read-only: deciding which
+ * devices share a group is a question, and a question must not reprogram the
+ * machine it is asked about. */
+int pci_acs_isolating(u8 bus, u8 slot, u8 func)
+{
+	u16 cap = pci_find_ext_capability(bus, slot, func, PCI_EXT_CAP_ID_ACS);
+	if (!cap)
+		return 0; /* no ACS: peer traffic may cross, so assume it does */
+	u32 val = pci_ecam_read32(bus, slot, func, (u16)(cap + ACS_CAP_OFF));
+	u16 ctrl = (u16)((val >> 16) & 0xFFFFu);
+	return (ctrl & ACS_ISOLATION) == ACS_ISOLATION;
+}
+
+/* Ask the bridge to stop forwarding peer traffic. Returns 1 when it now does.
+ *
+ * This is a policy decision, not a detail: turning the redirects on sends
+ * peer-to-peer traffic up through the root complex instead of across the
+ * switch, which is what makes the devices separable — and what makes direct
+ * device-to-device transfers slower or impossible. So it is done once,
+ * deliberately, and never as a side effect of asking a question.
+ */
+int pci_acs_enable(u8 bus, u8 slot, u8 func)
+{
+	u16 cap = pci_find_ext_capability(bus, slot, func, PCI_EXT_CAP_ID_ACS);
+	if (!cap)
+		return 0;
+
+	u32 val = pci_ecam_read32(bus, slot, func, (u16)(cap + ACS_CAP_OFF));
+	u16 supported = (u16)(val & 0xFFFFu);
+	if ((supported & ACS_ISOLATION) != ACS_ISOLATION)
+		return 0; /* it cannot enforce everything that matters */
+
+	val = (val & 0x0000FFFFu) | ((u32)ACS_ISOLATION << 16);
+	pci_ecam_write32(bus, slot, func, (u16)(cap + ACS_CAP_OFF), val);
+	return pci_acs_isolating(bus, slot, func);
+}
+
+/* Turn the peer-forwarding controls back off. Kept for the policy that wants
+ * larger groups and faster device-to-device traffic. */
+int pci_acs_disable(u8 bus, u8 slot, u8 func)
+{
+	u16 cap = pci_find_ext_capability(bus, slot, func, PCI_EXT_CAP_ID_ACS);
+	if (!cap)
+		return 0;
+	u32 val = pci_ecam_read32(bus, slot, func, (u16)(cap + ACS_CAP_OFF));
+	val &= 0x0000FFFFu;
+	pci_ecam_write32(bus, slot, func, (u16)(cap + ACS_CAP_OFF), val);
+	return !pci_acs_isolating(bus, slot, func);
+}
+
 /* ── MSI ────────────────────────────────────────────────────────── */
 
 /* MSI capability layout (offsets from the capability header):
@@ -633,6 +778,33 @@ static volatile u32 *pci_msix_table(u8 bus, u8 slot, u8 func, u8 *out_cap,
 	if (out_entries)
 		*out_entries = entries;
 	return t;
+}
+
+/* Program an MSI-X entry with an address/data pair the caller supplies. With
+ * interrupt remapping on, that pair names a table entry instead of carrying the
+ * vector itself, so the message the device sends has to be built by whoever
+ * owns that table — not here. */
+int pci_msix_enable_msg(u8 bus, u8 slot, u8 func, u32 entry, u64 addr, u32 data)
+{
+	u8 cap = 0;
+	u32 entries = 0;
+	volatile u32 *t = pci_msix_table(bus, slot, func, &cap, &entries);
+	if (!t || entry >= entries)
+		return -1;
+
+	volatile u32 *e = t + entry * 4;
+	e[3] = PCI_MSIX_VECTOR_CTRL_MASK;
+	e[0] = (u32)(addr & 0xFFFFFFFFu);
+	e[1] = (u32)(addr >> 32);
+	e[2] = data;
+	e[3] = 0;
+
+	pci_command_set(bus, slot, func,
+	                (u16)(PCI_CMD_MEM_SPACE | PCI_CMD_INTX_DISABLE));
+	u16 ctrl = pci_config_read16(bus, slot, func, (u8)(cap + PCI_MSIX_CTRL));
+	ctrl = (u16)((ctrl | PCI_MSIX_CTRL_ENABLE) & ~PCI_MSIX_CTRL_MASKALL);
+	pci_config_write16(bus, slot, func, (u8)(cap + PCI_MSIX_CTRL), ctrl);
+	return 0;
 }
 
 int pci_msix_enable(u8 bus, u8 slot, u8 func, u32 entry, u8 vector)

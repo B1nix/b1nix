@@ -3,6 +3,7 @@
 #include <b1nix/console.h>
 #include <b1nix/iommu.h>
 #include <b1nix/irq.h>
+#include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/nvme.h>
 #include <b1nix/pci.h>
@@ -57,6 +58,7 @@ struct nvme_device {
      * self-test can tell a delivered interrupt from a watchdog re-poll. */
     int use_msix;
     int msix_vector;
+    int ir_handle; /* M100c: interrupt remapping entry, -1 when not remapped */
     u8 pci_bus, pci_slot, pci_func;
     volatile u32 irq_hits;
 };
@@ -585,18 +587,45 @@ void nvme_init(void)
      * alone. If anything fails, fall back to the legacy line: the completion
      * wait re-polls the CQ on a watchdog deadline either way, so a controller
      * that never delivers costs latency, not correctness. */
+    nvme.ir_handle = -1;
     nvme.pci_bus = pci_info.bus;
     nvme.pci_slot = pci_info.slot;
     nvme.pci_func = pci_info.func;
     if (pci_msix_table_size(pci_info.bus, pci_info.slot, pci_info.func) > 0) {
         int vec = msi_alloc_vector(nvme_irq, &nvme);
-        if (vec > 0 &&
-            pci_msix_enable(pci_info.bus, pci_info.slot, pci_info.func, 0,
-                            (u8)vec) == 0) {
+        int programmed = -1;
+        if (vec > 0 && iommu_ir_active()) {
+            /* M100c: with remapping on, the message names an entry this kernel
+             * owns and the unit supplies the vector from it. The entry is bound
+             * to this controller's requester id, so the same message from
+             * anything else is refused. */
+            u16 source = (u16)((pci_info.bus << 8) |
+                               ((pci_info.slot & 0x1F) << 3) |
+                               (pci_info.func & 7));
+            int handle = iommu_ir_alloc((u8)vec, lapic_id(), source);
+            if (handle >= 0) {
+                programmed = pci_msix_enable_msg(pci_info.bus, pci_info.slot,
+                                                 pci_info.func, 0,
+                                                 iommu_ir_message_address(handle),
+                                                 iommu_ir_message_data(handle));
+                if (programmed == 0)
+                    nvme.ir_handle = handle;
+                else
+                    iommu_ir_free(handle);
+            }
+        }
+        if (vec > 0 && programmed != 0)
+            programmed = pci_msix_enable(pci_info.bus, pci_info.slot,
+                                         pci_info.func, 0, (u8)vec);
+        if (vec > 0 && programmed == 0) {
             nvme.use_msix = 1;
             nvme.msix_vector = vec;
             console_write("nvme: MSI-X completions on vector ");
             console_write_dec((u64)vec);
+            if (nvme.ir_handle >= 0) {
+                console_write(" through remap entry ");
+                console_write_dec((u64)nvme.ir_handle);
+            }
             console_write("\n");
         } else if (vec > 0) {
             msi_free_vector(vec);
@@ -656,7 +685,22 @@ void nvme_msix_selftest(void)
     u32 data = 0, vctrl = 0xFFFFFFFFu;
     int rb = pci_msix_entry_readback(nvme.pci_bus, nvme.pci_slot, nvme.pci_func,
                                      0, &addr, &data, &vctrl);
-    if (rb != 0 || data != (u32)nvme.msix_vector || (vctrl & 1u) != 0) {
+    int armed;
+    if (nvme.ir_handle >= 0) {
+        /* M100c: with interrupt remapping the message names a table entry and
+         * carries no vector; the vector lives in that entry, and the unit
+         * supplies it. Check the pair the device was given, and that the entry
+         * it names is the one holding our vector. */
+        u8 entry_vector = 0;
+        armed = rb == 0 && (vctrl & 1u) == 0 &&
+                addr == iommu_ir_message_address(nvme.ir_handle) &&
+                data == iommu_ir_message_data(nvme.ir_handle) &&
+                iommu_ir_entry_read(nvme.ir_handle, &entry_vector, 0, 0) == 0 &&
+                entry_vector == (u8)nvme.msix_vector;
+    } else {
+        armed = rb == 0 && data == (u32)nvme.msix_vector && (vctrl & 1u) == 0;
+    }
+    if (!armed) {
         console_write("M98-DRV-SMOKE: FAIL msi-delivery (entry 0 not armed for vector ");
         console_write_dec((u64)nvme.msix_vector);
         console_write(")\n");
@@ -697,6 +741,8 @@ void nvme_msix_selftest(void)
         console_write(")\n");
         return;
     }
+    if (nvme.ir_handle >= 0)
+        console_write("M100C-SMOKE: ok ir-delivery (a remapped MSI-X reached its vector)\n");
     console_write("M98-DRV-SMOKE: ok msi-delivery vector=");
     console_write_dec((u64)nvme.msix_vector);
     console_write(" hits=");
@@ -769,6 +815,14 @@ void nvme_iommu_selftest(void)
         return;
     }
 
+    /* Let the reference read settle before the domain changes under the
+     * controller. The command has completed, but a posted write from it can
+     * still be in flight, and it would land in the new domain and fault for a
+     * transfer nobody is testing. (That is what an intermittent fault here
+     * turned out to be.) */
+    for (int i = 0; i < 20; i++)
+        scheduler_yield();
+
     struct dma_device dev;
     if (dma_device_attach(&dev, nvme.pci_bus, nvme.pci_slot, nvme.pci_func,
                           0xFFFFFFFFFFFFFFFFULL) != 0) {
@@ -779,15 +833,40 @@ void nvme_iommu_selftest(void)
 
     int ok = 1;
     u64 data_phys = vmm_virt_to_phys(buf);
-    if (nvme_iommu_map_own_pages() != 0 ||
-        iommu_map_identity(data_phys, 512, 1) != 0)
+    /* Grant the buffer page by page, translating each one on its own. A
+     * kernel-heap buffer is contiguous in virtual addresses and need not be in
+     * physical ones, so a transfer that straddles a page boundary reaches a
+     * frame that has no relation to the first — including one *below* it. A
+     * mapping that assumed contiguity granted the wrong second page, and the
+     * controller's straddling read faulted intermittently, depending on where
+     * the allocator had put the buffer. */
+    if (nvme_iommu_map_own_pages() != 0)
         ok = 0;
+    if (ok) {
+        for (usize off = 0; off < 2 * NVME_PAGE_SIZE; off += NVME_PAGE_SIZE) {
+            u64 p1 = vmm_virt_to_phys((u8 *)buf + off);
+            u64 p2 = vmm_virt_to_phys((u8 *)ref + off);
+            if ((p1 && iommu_map_identity(p1, 1, 1) != 0) ||
+                (p2 && iommu_map_identity(p2, 1, 1) != 0)) {
+                ok = 0;
+                break;
+            }
+        }
+    }
 
     /* Nothing else is mapped for this controller: an address it was not given
      * does not translate. */
     u64 stray = pmm_alloc_frame();
     if (ok && stray && iommu_translate(stray) != 0)
         ok = 0;
+
+    /* A quiescent window first: if the unit faults while this test issues
+     * nothing, the traffic is somebody else's and the measurement below would
+     * be blaming the wrong transfer. */
+    iommu_fault_clear();
+    for (int i = 0; i < 40; i++)
+        scheduler_yield();
+    u32 idle_faults = iommu_fault_count();
 
     iommu_fault_clear();
     memset(buf, 0, 512);
@@ -798,10 +877,17 @@ void nvme_iommu_selftest(void)
         ok = 0;
     /* Every address the controller emitted was one of the mapped ones, or the
      * unit would have recorded a fault. */
-    if (faults != 0)
+    if (faults != 0 || idle_faults != 0)
         ok = 0;
 
-    iommu_unmap(data_phys & ~(u64)(NVME_PAGE_SIZE - 1), 512);
+    for (usize off = 0; off < 2 * NVME_PAGE_SIZE; off += NVME_PAGE_SIZE) {
+        u64 p1 = vmm_virt_to_phys((u8 *)buf + off);
+        u64 p2 = vmm_virt_to_phys((u8 *)ref + off);
+        if (p1)
+            iommu_unmap(p1 & ~(u64)(NVME_PAGE_SIZE - 1), 1);
+        if (p2)
+            iommu_unmap(p2 & ~(u64)(NVME_PAGE_SIZE - 1), 1);
+    }
     nvme_iommu_unmap_own_pages();
     dma_device_detach(&dev);
     if (stray)
@@ -810,12 +896,115 @@ void nvme_iommu_selftest(void)
     if (ok) {
         console_write("M100B-SMOKE: ok nvme-translated (read through its own domain, no faults)\n");
     } else {
+        u64 fa = 0; u16 fs = 0; u8 fr = 0;
+        iommu_fault_last(&fa, &fs, &fr);
         console_write("M100B-SMOKE: FAIL nvme-translated rc=");
         console_write_dec((u64)(i64)rc);
         console_write(" faults=");
         console_write_dec((u64)faults);
+        console_write(" src=0x");
+        console_write_hex32((u32)fs);
+        console_write(" addr=0x");
+        console_write_hex64(fa);
+        console_write(" reason=0x");
+        console_write_hex32((u32)fr);
+        console_write(" idle_faults=");
+        console_write_dec((u64)idle_faults);
+        console_write(" asq=0x");
+        console_write_hex64(nvme.phys_admin_sq);
+        console_write(" acq=0x");
+        console_write_hex64(nvme.phys_admin_cq);
+        console_write(" isq=0x");
+        console_write_hex64(nvme.phys_io_sq);
+        console_write(" icq=0x");
+        console_write_hex64(nvme.phys_io_cq);
+        console_write(" idbuf=0x");
+        console_write_hex64(nvme.phys_identify_buf);
+        console_write(" data=0x");
+        console_write_hex64(data_phys);
+        console_write(" ref=0x");
+        console_write_hex64(vmm_virt_to_phys(ref));
+        console_write(" srcdev=0x");
+        console_write_hex32(((u32)pci_config_read16((u8)(fs >> 8),
+                                                    (u8)((fs >> 3) & 0x1F),
+                                                    (u8)(fs & 7), 0) << 16) |
+                            pci_config_read16((u8)(fs >> 8),
+                                              (u8)((fs >> 3) & 0x1F),
+                                              (u8)(fs & 7), 2));
         console_write("\n");
     }
     kfree(ref);
     kfree(buf);
+}
+
+/* ── M100c: an interrupt nobody programmed an entry for ─────────────
+ *
+ * The device keeps the message it was given; the entry that message names is
+ * taken away. Its next completion therefore claims a handle the unit has no
+ * entry for, and the unit has to refuse it — the interrupt does not arrive and
+ * the refusal is recorded. The I/O itself still finishes, because the wait
+ * loop polls the completion queue in memory and never depended on the
+ * interrupt for correctness; that is what makes this safe to do to a live
+ * storage controller.
+ *
+ * Returns 1 when the interrupt was refused and recorded, 0 when it was not,
+ * -1 when there is nothing to ask.
+ */
+int nvme_ir_rejection_probe(void)
+{
+    if (!nvme.regs || !nvme.use_msix || nvme.ir_handle < 0 || !iommu_ir_active())
+        return -1;
+
+    u8 *buf = (u8 *)kmalloc(512);
+    if (!buf)
+        return -1;
+
+    int handle = nvme.ir_handle;
+    u16 source = (u16)((nvme.pci_bus << 8) | ((nvme.pci_slot & 0x1F) << 3) |
+                       (nvme.pci_func & 7));
+
+    /* Take the entry away, leaving the device pointing at it. */
+    iommu_ir_free(handle);
+    iommu_fault_clear();
+
+    u32 before = __atomic_load_n(&nvme.irq_hits, __ATOMIC_RELAXED);
+    int rc = nvme_blk_read(&nvme.blk_dev, 0, 1, buf);
+    u32 after = before;
+    for (int i = 0; i < 100; i++) {
+        after = __atomic_load_n(&nvme.irq_hits, __ATOMIC_RELAXED);
+        if (after != before)
+            break;
+        scheduler_yield();
+    }
+    u32 faults = iommu_fault_count();
+
+    /* Put it back and confirm the controller is interrupting again, so the
+     * rest of the boot is not left on the polling path. */
+    int restored = iommu_ir_alloc((u8)nvme.msix_vector, lapic_id(), source);
+    if (restored >= 0) {
+        nvme.ir_handle = restored;
+        pci_msix_enable_msg(nvme.pci_bus, nvme.pci_slot, nvme.pci_func, 0,
+                            iommu_ir_message_address(restored),
+                            iommu_ir_message_data(restored));
+    }
+    u32 again_before = __atomic_load_n(&nvme.irq_hits, __ATOMIC_RELAXED);
+    (void)nvme_blk_read(&nvme.blk_dev, 0, 1, buf);
+    u32 again_after = again_before;
+    for (int i = 0; i < 100; i++) {
+        again_after = __atomic_load_n(&nvme.irq_hits, __ATOMIC_RELAXED);
+        if (again_after != again_before)
+            break;
+        scheduler_yield();
+    }
+    kfree(buf);
+
+    if (rc != 1)
+        return 0; /* the read must still have completed, by polling */
+    if (after != before)
+        return 0; /* the interrupt got through anyway */
+    if (faults == 0)
+        return 0; /* refused silently is not refused */
+    if (again_after == again_before)
+        return 0; /* and it must work again once the entry is back */
+    return 1;
 }

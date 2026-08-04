@@ -810,7 +810,22 @@ Status:
 - [x] Run NVMe in its own domain with only its queues and buffers mapped, and read through it.
 - [x] Record and report DMA faults, so "the device touched nothing else" is the unit's answer.
 - [x] Block a violation: the codec is given its descriptor list but not its audio buffer, and the read it was not granted is stopped and recorded.
-- [ ] Add AMD-Vi (no hardware to test it on).
+- [ ] Add AMD-Vi: QEMU emulates the unit, so it is buildable and testable here.
+
+
+## M100c: IOMMU — per-device domains, groups, interrupt remapping
+
+- [x] Give each device its own domain instead of one shared translated domain.
+- [x] Group functions that cannot be isolated from each other, and move a group as a unit.
+- [x] Treat everything behind a bridge as one group, since the bridge can put its own requester id on their traffic.
+- [x] Take domain ids from the unit's own capability, and give a destroyed domain's page tables back.
+- [x] Prove isolation between domains: a page mapped for one device does not exist for another.
+- [x] Program the interrupt remapping table and enable it, keeping compatibility-format interrupts working.
+- [x] Route NVMe's MSI-X through a remapped entry, and keep delivery working.
+- [x] Reject an interrupt whose entry was taken away, and record the refusal.
+- [x] Use ACS to split a group: walk up until a port can keep its children apart, and group everything under the topmost one that cannot.
+- [x] Handle ARI and SR-IOV: a device numbering functions across the bus owns the bus, so the group is the bus.
+- [x] Decide the ACS policy once at boot (`b1nix.acs=on|keep|off`) and keep grouping a read-only question.
 
 ## M101: Intel i915 (Gen8/Gen9.5) + Mesa iris
 

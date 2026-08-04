@@ -116,6 +116,24 @@ u16 pci_find_ext_capability(u8 bus, u8 slot, u8 func, u16 cap_id);
  * take the vector itself, not a legacy line number, and set INTX_DISABLE —
  * MSI and INTx are mutually exclusive by the spec.
  */
+/* The PCI-to-PCI bridge `bus` sits behind, if any. Returns 0 and fills the
+ * bridge's location, or -1 when the bus is not behind a bridge. */
+int pci_bridge_for_bus(u8 bus, u8 *out_bus, u8 *out_slot, u8 *out_func);
+
+/* ACS: does this bridge currently keep the devices below it apart? Read-only —
+ * grouping asks this, and asking must not change the machine. */
+int pci_acs_isolating(u8 bus, u8 slot, u8 func);
+
+/* Turn the peer-forwarding controls off, so the devices below can be separated.
+ * A policy decision: it also pushes device-to-device traffic up through the
+ * root complex. Returns 1 when the bridge now isolates. */
+int pci_acs_enable(u8 bus, u8 slot, u8 func);
+int pci_acs_disable(u8 bus, u8 slot, u8 func);
+
+/* ARI: functions are numbered across the bus rather than 8 per device. */
+int pci_has_ari(u8 bus, u8 slot, u8 func);
+int pci_has_sriov(u8 bus, u8 slot, u8 func);
+
 int pci_msi_enable(u8 bus, u8 slot, u8 func, u8 vector);
 void pci_msi_disable(u8 bus, u8 slot, u8 func);
 /* Read back the address/data pair actually programmed into the device. Returns
@@ -130,6 +148,11 @@ int pci_msix_table_size(u8 bus, u8 slot, u8 func);
  * entry `entry` to deliver `vector` to the BSP, unmask it and set the
  * capability's global MSI-X enable. Returns 0 on success. */
 int pci_msix_enable(u8 bus, u8 slot, u8 func, u32 entry, u8 vector);
+/* Same, with the message supplied by the caller — what interrupt remapping
+ * needs, since there the address names a table entry and the data carries no
+ * vector. */
+int pci_msix_enable_msg(u8 bus, u8 slot, u8 func, u32 entry, u64 addr,
+                        u32 data);
 /* Read one programmed MSI-X table entry back out of the device's table. */
 int pci_msix_entry_readback(u8 bus, u8 slot, u8 func, u32 entry, u64 *out_addr,
                             u32 *out_data, u32 *out_vector_ctrl);

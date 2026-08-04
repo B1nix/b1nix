@@ -632,7 +632,19 @@ launch_iommu() {
 		NVME_IMG=$(disk_img nvme iommu)
 		SWAP_IMG=$(disk_img swap iommu)
 		B1NIX_ISO_NAME=b1nix-openrc.iso
-		EXTRA_QEMU_ARGS="-machine q35,kernel-irqchip=split -device intel-iommu,intremap=off"
+		EXTRA_QEMU_ARGS="-machine q35,kernel-irqchip=split -device intel-iommu,intremap=on \
+			-device pcie-root-port,id=iommurp,chassis=9 \
+			-device x3130-upstream,id=iommusw,bus=iommurp \
+			-device xio3130-downstream,id=iommudn0,bus=iommusw,chassis=10,slot=0 \
+			-device xio3130-downstream,id=iommudn1,bus=iommusw,chassis=11,slot=1 \
+			-device virtio-tablet-pci,id=iommudev0,bus=iommudn0 \
+			-device virtio-tablet-pci,id=iommudev1,bus=iommudn1 \
+			-device pci-bridge,id=iommulegacy,chassis_nr=3 \
+			-device virtio-tablet-pci,id=iommulegacy0,bus=iommulegacy,addr=1 \
+			-device virtio-tablet-pci,id=iommulegacy1,bus=iommulegacy,addr=2 \
+			-device pcie-root-port,id=iommurp2,chassis=12 \
+			-device nvme-subsys,id=iommusubsys,nqn=b1nix-iommu \
+			-device nvme,id=iommunvme,serial=deadbee2,subsys=iommusubsys,sriov_max_vfs=1,sriov_vq_flexible=2,sriov_vi_flexible=1,bus=iommurp2"
 		SMOKE_DONE_PATTERN="reboot: powering off|KERNEL PANIC|\[PANIC\]"
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[iommu]"
@@ -1970,6 +1982,19 @@ check_output "$IOMMU_LOG" "M100B-SMOKE: ok vtd-dma-map" "M100b: dma_map for a tr
 check_output "$IOMMU_LOG" "M100B-SMOKE: ok vtd-iova" "M100b: the device address allocator hands out distinct ranges and reuses freed ones"
 check_output "$IOMMU_LOG" "M100B-SMOKE: ok nvme-translated" "M100b: NVMe runs in its own domain with only its queues and the transfer buffer mapped, reads a block, and the unit records no fault"
 check_output "$IOMMU_LOG" "M100B-SMOKE: ok vtd-blocks-violation" "M100b: a device given its descriptor list but not its data buffer is stopped by the unit, and the fault is recorded"
+# ── M100c: domains, groups, interrupt remapping ──
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok domains-isolated" "M100c: a page mapped for one domain does not exist in another"
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok group-moves-together" "M100c: attaching one function moves every function of its group"
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok domain-tables-freed" "M100c: destroying a domain gives its page tables back, every level of them"
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok group-behind-bridge" "M100c: devices behind a bridge are one group, and moving it rewrites the bridge's own context entry"
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok acs-splits-group" "M100c: endpoints behind ports that enforce ACS are separate groups; without it they are one"
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok group-query-is-read-only" "M100c: asking which group a device is in leaves the ACS controls exactly as they were"
+check_output "$IOMMU_LOG" "iommu: ACS on" "M100c: the ACS policy is decided once at init and reported"
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok ari-owns-bus" "M100c: a device with ARI or SR-IOV owns the bus's function space, so the group is the bus"
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok ir-enabled" "M100c: the interrupt remapping table is programmed and remapping is on"
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok ir-entry" "M100c: an entry holds the vector and destination asked for, is bound to one requester, and stops being present when freed"
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok ir-delivery" "M100c: NVMe's MSI-X goes through a remap entry and still reaches its vector"
+check_output "$IOMMU_LOG" "M100C-SMOKE: ok ir-rejects-unknown" "M100c: an interrupt claiming an entry that was taken away is refused and recorded, and works again once it is back"
 check_output "$IOMMU_LOG" "reboot: powering off" "M100b: the machine still boots and shuts down with translation on"
 check_output "$INIT_LOG" "M108-SMOKE: done-init" "M108 BusyBox-init instance completes"
 # ── M86: per-thread CPU accounting + thread-directed signals ──

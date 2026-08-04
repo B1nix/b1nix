@@ -222,4 +222,8 @@ void nvme_msix_selftest(void);
  * and the transfer's buffer mapped, and read a block through it. */
 void nvme_iommu_selftest(void);
 
+/* M100c: take away the interrupt remapping entry the controller's message
+ * names, and see the unit refuse the interrupt that claims it. */
+int nvme_ir_rejection_probe(void);
+
 #endif // B1NIX_NVME_H
