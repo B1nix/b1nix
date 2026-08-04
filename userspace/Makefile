@@ -237,9 +237,8 @@ BINARIES += $(BUILD)/bin/m108shell
 BINARIES += $(BUILD)/bin/m80_smoke
 # M86: per-thread CPU accounting, tkill/tgkill, pthread_exit return values.
 BINARIES += $(BUILD)/bin/m86_smoke
-# M95/M96: the module utilities (multi-call: insmod/rmmod/lsmod/modinfo/modprobe)
-# and the two loadable-kernel-module smoke tests.
-BINARIES += $(BUILD)/bin/kmod
+# M95/M96: the two loadable-kernel-module smoke tests. The module utilities
+# themselves are BusyBox applets (insmod/rmmod/lsmod/modinfo/modprobe/depmod).
 BINARIES += $(BUILD)/bin/m95_smoke
 BINARIES += $(BUILD)/bin/m96_smoke
 # M107: netlink, VTs/console fonts, loop devices, /proc fd+maps, kmsg/syslog,
@@ -1108,14 +1107,15 @@ endif
 		src=$${b%%:*}; dst=$${b##*:}; \
 		ln -sfn $$src $(ROOTFS)/bin/$$dst; \
 	done
-	@# M95: kmod is a multi-call binary; each utility is a name for it.
+	@# M95: the module utilities are BusyBox applets (the /bin symlinks come
+	@# from the manifest loop above). /sbin carries the customary aliases, and
+	@# the old /bin/kmod multicall is cleared out of an incrementally built
+	@# rootfs so no stale copy shadows the applet.
+	@rm -f $(ROOTFS)/bin/kmod
 	@mkdir -p $(ROOTFS)/sbin
-	@for b in insmod rmmod lsmod modinfo modprobe; do \
-		ln -sfn kmod $(ROOTFS)/bin/$$b; \
+	@for b in insmod rmmod lsmod modprobe depmod; do \
+		ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/sbin/$$b; \
 	done
-	@ln -sfn /bin/kmod $(ROOTFS)/sbin/modprobe
-	@ln -sfn /bin/kmod $(ROOTFS)/sbin/insmod
-	@ln -sfn /bin/kmod $(ROOTFS)/sbin/rmmod
 	@mkdir -p $(ROOTFS)/home
 	cp hello_native.c $(ROOTFS)/home/
 	@if [ -f ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/Scrt1.o ]; then \

@@ -22,6 +22,7 @@
 #include <b1nix/inotify.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
+#include <b1nix/module.h>
 #include <b1nix/net.h>
 #include <b1nix/lockdep.h>
 #include <b1nix/page_cache.h>
@@ -114,6 +115,9 @@ struct vfs_mount_entry {
   u64 flags;
   struct vfs_node *root_node;
   struct vfs_node *mount_point;
+  /* Reference on the module providing this filesystem type, dropped at umount
+   * (NULL for a built-in type). */
+  struct module *owner;
 };
 static struct vfs_mount_entry mounts[MAX_MOUNTS];
 
@@ -176,6 +180,9 @@ static struct vfs_node *vfs_mount_point_of(const struct vfs_node *node) {
 }
 
 void vfs_register_fs(struct vfs_fs *fs) {
+  /* The descriptor lives in the registering module's data, so its address
+   * names the owner. A built-in filesystem gets NULL and no refcounting. */
+  fs->owner = module_owner_of(fs);
   fs->next = filesystems;
   filesystems = fs;
 }
@@ -4532,6 +4539,14 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
     return -ENODEV;
   }
 
+  /* Pin the module for as long as the mount lives: without this, rmmod frees
+   * the text every operation on the mount calls into. Fails only when the
+   * module is already on its way out. */
+  if (fs->owner && !try_module_get(fs->owner)) {
+    vfs_node_put(target_node);
+    return -ENODEV;
+  }
+
   /* Claim and initialize the slot under vfs_mount_lock — the unlocked scan
    * let two concurrent mounts pick the same index, and lookups walking
    * mounts[] could observe a half-written entry. The fs->mount() callback
@@ -4550,6 +4565,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   if (midx == -1) {
     __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
     vfs_node_put(target_node);
+    module_put(fs->owner);
     return -ENOMEM;
   }
 
@@ -4561,6 +4577,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   copy_path(mounts[midx].target, sizeof(mounts[midx].target), target);
   copy_path(mounts[midx].fstype, sizeof(mounts[midx].fstype), fstype);
   mounts[midx].flags = flags;
+  mounts[midx].owner = fs->owner;
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
   currently_mounting = &mounts[midx];
@@ -4584,7 +4601,9 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
 
   if (IS_ERR(root_node)) {
     mounts[midx].used = 0;
+    mounts[midx].owner = 0;
     vfs_node_put(target_node);
+    module_put(fs->owner);
     return (int)PTR_ERR(root_node);
   }
 
@@ -4650,8 +4669,11 @@ int vfs_umount(const char *target) {
         }
       }
 
+      struct module *owner = mounts[i].owner;
       mounts[i].used = 0;
+      mounts[i].owner = 0;
       __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+      module_put(owner);
 
       if (root && root->inode && root->inode->blk_dev) {
         blk_cache_flush(root->inode->blk_dev);

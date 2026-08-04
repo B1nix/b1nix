@@ -1966,6 +1966,8 @@ check_output "$LOG" "M95-SMOKE: ok dup-load" "loading an already-loaded module r
 check_output "$LOG" "M95-SMOKE: ok vermagic-reject" "a .ko whose vermagic was corrupted is refused with ENOEXEC while the intact one still loads"
 check_output "$LOG" "M95-SMOKE: ok init-module" "init_module(2) loads a module image straight out of process memory"
 check_output "$LOG" "M95-SMOKE: ok unpriv" "an unprivileged process cannot delete a module (EPERM) and the module survives"
+check_output "$LOG" "M95-SMOKE: ok fs-in-use" "a module providing a mounted filesystem cannot be unloaded (EBUSY), and can again once it is unmounted"
+check_output "$LOG" "M95-SMOKE: ok filesystems-nodev" "/proc/filesystems marks every pseudo filesystem nodev and no block-backed one"
 check_output "$LOG" "M95-SMOKE: done" "M95 loadable-kernel-module suite completes"
 # ── M96: network protocol modules, module parameters, modprobe ──
 check_output "$LOG" "M96-SMOKE: ok proto-modules" "ipv6, ndp and ntp are loaded as modules and the IPv6 stack is serving"

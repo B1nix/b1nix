@@ -82,6 +82,13 @@ struct kernel_symbol {
 #define MODULE_ALIAS(v) MODULE_INFO(alias, v)
 /* Mandatory: the loader takes the module's identity from this tag. */
 #define MODULE_NAME(v) MODULE_INFO(name, v)
+/* Comma-separated module names this one needs loaded first, exactly the tag
+ * depmod(8) reads to build modules.dep. It is declared rather than inferred so
+ * the applet can regenerate the index from the .ko files alone — but it is not
+ * trusted: tools/kernel/gen_modules_initramfs.sh recomputes the real
+ * dependencies from the symbol graph and fails the build when the two
+ * disagree, so a stale tag cannot ship. */
+#define MODULE_DEPENDS(v) MODULE_INFO(depends, v)
 
 /* Emitted by every module translation unit. The loader refuses any .ko whose
  * vermagic does not match the running kernel's, so a stale module can never be
@@ -189,6 +196,9 @@ int module_load_path(const char *path, const char *params);
 int module_unload(const char *name, u32 flags);
 
 struct module *module_find(const char *name);
+/* Owner of an address inside a loaded module image, or NULL when the address
+ * belongs to the kernel itself. */
+struct module *module_owner_of(const void *addr);
 /* Reference counting: try_module_get fails (returns 0) once a module has begun
  * unloading; a module with a non-zero refcnt cannot be removed. */
 int try_module_get(struct module *mod);

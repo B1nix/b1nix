@@ -227,6 +227,27 @@ struct module *module_find(const char *name) {
   return 0;
 }
 
+/* The module whose image contains `addr`, or NULL for a built-in address. Lets
+ * a registry (the VFS filesystem list) discover the owner of a structure that
+ * was handed to it, without every module having to name itself. */
+struct module *module_owner_of(const void *addr) {
+  if (!addr)
+    return 0;
+  usize a = (usize)addr;
+  u64 flags;
+  spin_lock_irqsave(&module_lock, &flags);
+  struct module *found = 0;
+  for (struct module *m = module_list; m; m = m->next) {
+    usize base = (usize)m->core;
+    if (a >= base && a < base + m->core_size) {
+      found = m;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&module_lock, flags);
+  return found;
+}
+
 int try_module_get(struct module *mod) {
   if (!mod)
     return 0;
@@ -1100,15 +1121,19 @@ void module_sysfs_attach_root(struct vfs_node *sys_root) {
 
 /* ── request_module / modules.dep ────────────────────────────────────────── */
 
-#define MODULE_DIR "/lib/modules"
+/* /lib/modules/<kernel release>, the layout every modutils implementation
+ * expects: BusyBox's modprobe chdir()s to $CONFIG_DEFAULT_MODULES_DIR/$(uname
+ * -r) and reads modules.dep/modules.alias from there, and uname's release is
+ * B1NIX_VERSION_STR. Keeping the kernel's own request_module() on the same
+ * files is what lets the applets replace /bin/kmod. */
+#define MODULE_DIR "/lib/modules/" B1NIX_VERSION_STR
 
 static void module_path_for(const char *name, char *out, usize cap) {
   snprintf(out, cap, MODULE_DIR "/%s.ko", name);
 }
 
-/* Look `key` up in a two-column file ("key: dep dep..." for modules.dep,
- * "alias <pattern> <module>" for modules.alias). Returns 0 on a hit and copies
- * the rest of the line into `out`. */
+/* Look `key` up in modules.dep ("<key>.ko: <dep>.ko <dep>.ko"). Returns 0 on a
+ * hit and copies the dependency list into `out`. */
 static int module_lookup_line(const char *file, const char *key, char *out,
                               usize cap) {
   char *data = 0;
@@ -1142,9 +1167,48 @@ static int module_lookup_line(const char *file, const char *key, char *out,
   return found;
 }
 
-/* Translate an alias to a module name via /lib/modules/modules.alias. */
+/* Translate an alias to a module name via modules.alias, whose lines are
+ * depmod's own "alias <pattern> <module>". */
 static int module_resolve_alias(const char *alias, char *out, usize cap) {
-  return module_lookup_line(MODULE_DIR "/modules.alias", alias, out, cap);
+  char *data = 0;
+  usize size = 0;
+  if (module_read_file(MODULE_DIR "/modules.alias", &data, &size) != 0)
+    return -ENOENT;
+  usize alen = strlen(alias);
+  int found = -ENOENT;
+  usize pos = 0;
+  while (pos < size) {
+    usize eol = pos;
+    while (eol < size && data[eol] != '\n')
+      eol++;
+    const char *p = data + pos;
+    const char *end = data + eol;
+    if ((usize)(end - p) > 6 && strncmp(p, "alias ", 6) == 0) {
+      p += 6;
+      while (p < end && mod_isspace(*p))
+        p++;
+      const char *pat = p;
+      while (p < end && !mod_isspace(*p))
+        p++;
+      if ((usize)(p - pat) == alen && strncmp(pat, alias, alen) == 0) {
+        while (p < end && mod_isspace(*p))
+          p++;
+        const char *mod = p;
+        while (p < end && !mod_isspace(*p))
+          p++;
+        usize n = (usize)(p - mod);
+        if (n > 0 && n < cap) {
+          memcpy(out, mod, n);
+          out[n] = '\0';
+          found = 0;
+          break;
+        }
+      }
+    }
+    pos = eol + 1;
+  }
+  kfree(data);
+  return found;
 }
 
 int request_module(const char *name) {
@@ -1173,9 +1237,13 @@ int request_module(const char *name) {
     vfs_node_put(probe);
   }
 
-  /* Dependencies first, in the order modules.dep lists them. */
+  /* Dependencies first, in the order modules.dep lists them. Both the key and
+   * every dependency are filenames there ("ndp.ko: ipv6.ko"), which is the
+   * format depmod writes and BusyBox's modprobe reads. */
   char deps[192];
-  if (module_lookup_line(MODULE_DIR "/modules.dep", real, deps,
+  char depkey[MODULE_NAME_MAX + 4];
+  snprintf(depkey, sizeof(depkey), "%s.ko", real);
+  if (module_lookup_line(MODULE_DIR "/modules.dep", depkey, deps,
                          sizeof(deps)) == 0) {
     char *p = deps;
     while (*p) {
@@ -1188,6 +1256,17 @@ int request_module(const char *name) {
       while (*p && !mod_isspace(*p) && n < sizeof(dep) - 1)
         dep[n++] = *p++;
       dep[n] = '\0';
+      /* "path/to/foo.ko" -> "foo": depmod may write a relative path, and the
+       * loader keys everything by module name. */
+      char *slash = dep;
+      for (usize i = 0; dep[i]; i++)
+        if (dep[i] == '/')
+          slash = &dep[i + 1];
+      if (slash != dep)
+        memmove(dep, slash, strlen(slash) + 1);
+      usize dlen = strlen(dep);
+      if (dlen > 3 && strcmp(dep + dlen - 3, ".ko") == 0)
+        dep[dlen - 3] = '\0';
       while (*p && !mod_isspace(*p))
         p++;
       if (dep[0] && !module_find(dep)) {

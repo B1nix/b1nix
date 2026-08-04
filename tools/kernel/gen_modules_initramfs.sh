@@ -17,6 +17,13 @@ set -eu
 
 OUT="$1"
 shift
+# Kernel release, i.e. what uname(2) reports — the modules live under
+# /lib/modules/<release>/ because that is where BusyBox's modprobe, modinfo and
+# depmod look ($CONFIG_DEFAULT_MODULES_DIR/$(uname -r)). Defaults to the
+# version header so a manual run needs no argument.
+RELEASE="${RELEASE:-$(sed -n 's/.*B1NIX_VERSION_STR "\([^"]*\)".*/\1/p' \
+    "$(dirname "$0")/../../kernel/include/b1nix/version.h")}"
+[ -n "$RELEASE" ] || { echo "gen_modules_initramfs.sh: no kernel release" >&2; exit 1; }
 [ $# -gt 0 ] || { echo "gen_modules_initramfs.sh: no modules given" >&2; exit 1; }
 
 NM="${NM:-$(command -v llvm-nm 2>/dev/null || command -v nm)}"
@@ -48,17 +55,31 @@ for name in $MODULES; do
         [ "$other" = "$name" ] && continue
         if [ -s "$WORK/$other.exports" ] && \
            comm -12 "$WORK/$name.undef" "$WORK/$other.exports" | grep -q .; then
-            deps="$deps $other"
+            deps="$deps $other.ko"
         fi
     done
-    printf '%s:%s\n' "$name" "$deps" >> "$WORK/modules.dep"
+    # depmod(8) — the BusyBox applet included — builds modules.dep from the
+    # module's own "depends=" tag, so the tag has to say what the symbol graph
+    # says. Compare the two and fail the build on a mismatch rather than ship an
+    # index that a later `depmod` run would silently rewrite into something
+    # else. (Order-insensitive: both sides are sorted names.)
+    declared="$(sed -n 's/^depends=//p' "$WORK/$name.modinfo.txt" | tr ',' ' ')"
+    want="$(printf '%s\n' $deps | sed 's/\.ko$//' | sort | tr '\n' ' ')"
+    have="$(printf '%s\n' $declared | sort | tr '\n' ' ')"
+    if [ "$want" != "$have" ]; then
+        echo "gen_modules_initramfs.sh: $name declares MODULE_DEPENDS(\"$declared\")" >&2
+        echo "  but its undefined symbols resolve to: $want" >&2
+        echo "  fix the MODULE_DEPENDS() tag in the module source." >&2
+        exit 1
+    fi
+    printf '%s.ko:%s\n' "$name" "$deps" >> "$WORK/modules.dep"
 done
 
 # ── modules.alias ──
 : > "$WORK/modules.alias"
 for name in $MODULES; do
     sed -n 's/^alias=//p' "$WORK/$name.modinfo.txt" | while read -r a; do
-        [ -n "$a" ] && printf '%s: %s\n' "$a" "$name" >> "$WORK/modules.alias"
+        [ -n "$a" ] && printf 'alias %s %s\n' "$a" "$name" >> "$WORK/modules.alias"
     done
 done
 
@@ -76,10 +97,10 @@ xxd -i -n vfs_modules_alias "$WORK/modules.alias" >> "$OUT"
 printf '%s\n' '#define B1NIX_MODULE_INITRAMFS_FILES \' >> "$OUT"
 for ko in "$@"; do
     name="$(basename "$ko" .ko)"
-    printf '    {"/lib/modules/%s.ko", (const char *)vfs_module_%s_ko, sizeof(vfs_module_%s_ko), 0},' \
-        "$name" "$name" "$name" >> "$OUT"
+    printf '    {"/lib/modules/%s/%s.ko", (const char *)vfs_module_%s_ko, sizeof(vfs_module_%s_ko), 0},' \
+        "$RELEASE" "$name" "$name" "$name" >> "$OUT"
     printf '\\\n' >> "$OUT"
 done
-printf '    {"/lib/modules/modules.dep", (const char *)vfs_modules_dep, sizeof(vfs_modules_dep), 0},' >> "$OUT"
+printf '    {"/lib/modules/%s/modules.dep", (const char *)vfs_modules_dep, sizeof(vfs_modules_dep), 0},' "$RELEASE" >> "$OUT"
 printf '\\\n' >> "$OUT"
-printf '    {"/lib/modules/modules.alias", (const char *)vfs_modules_alias, sizeof(vfs_modules_alias), 0},\n' >> "$OUT"
+printf '    {"/lib/modules/%s/modules.alias", (const char *)vfs_modules_alias, sizeof(vfs_modules_alias), 0},\n' "$RELEASE" >> "$OUT"

@@ -1795,9 +1795,22 @@ static void test_watchdog(void) {
   ssize_t w = write(fd, "V", 1);
   close(fd);
 
+  /* And prove the disarm happened rather than assuming it: a disarmed watchdog
+   * has no time left. Asserting only that the write succeeded is what let a
+   * magic close that reached nothing pass for a whole milestone — the device's
+   * inode->release_cb never runs for a /dev node, so the machine still reset
+   * one timeout after this test had finished. */
+  int after = -1, r_after = -1;
+  int fd2 = open("/dev/watchdog", O_WRONLY);
+  if (fd2 >= 0) {
+    r_after = ioctl(fd2, WDIOC_GETTIMELEFT, &after);
+    close(fd2);
+  }
+  int disarmed = (r_after == 0 && after == 0);
+
   check("watchdog-timeout",
         r_sup == 0 && ident_ok && r_set == 0 && r_get == 0 && timeout_ok &&
-            r_ping == 0 && r_left == 0 && left_ok && w == 1,
+            r_ping == 0 && r_left == 0 && left_ok && w == 1 && disarmed,
         (long)(ident_ok * 100000 + timeout_ok * 10000 + left * 10 + left_ok));
 }
 
