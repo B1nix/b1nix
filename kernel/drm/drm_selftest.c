@@ -19,6 +19,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/dma_fence.h>
+#include <b1nix/drm.h>
 #include <b1nix/errno.h>
 #include <b1nix/gpu_scheduler.h>
 #include <b1nix/mm.h>
@@ -294,9 +295,15 @@ static void test_gem_sg(void)
 	u64 pool[SG_TEST_PAGES * 2];
 	u64 frames[SG_TEST_PAGES];
 
-	/* Force discontiguity: take 2N frames, hand back every other one, then
-	 * take N. The allocator refills from the holes it was just given, so the
-	 * resulting list cannot be one run. */
+	/* Guaranteed discontiguity, by construction rather than by luck.
+	 *
+	 * Hold 2N frames, sort them, and use every other one. Sorted and distinct
+	 * means pool[k+2] is at least two pages above pool[k], so no two chosen
+	 * frames can be adjacent — whatever order the allocator handed them out in.
+	 * The unchosen frames stay allocated for the duration precisely so nothing
+	 * else can take the gaps and make the list contiguous again. The old
+	 * version freed every other frame and re-allocated, which only *usually*
+	 * fragmented and left the test reporting a skip when it did not. */
 	for (u32 i = 0; i < SG_TEST_PAGES * 2; i++) {
 		pool[i] = pmm_alloc_frame();
 		if (!pool[i])
@@ -306,13 +313,17 @@ static void test_gem_sg(void)
 		drm_report("gem-sg", 0, 1);
 		return;
 	}
-	for (u32 i = 0; i < SG_TEST_PAGES * 2; i += 2)
-		pmm_free_frame(pool[i]);
-	for (u32 i = 0; i < SG_TEST_PAGES; i++) {
-		frames[i] = pmm_alloc_frame();
-		if (!frames[i])
-			ok = 0;
+	for (u32 i = 1; i < SG_TEST_PAGES * 2; i++) {
+		u64 key = pool[i];
+		u32 j = i;
+		while (j > 0 && pool[j - 1] > key) {
+			pool[j] = pool[j - 1];
+			j--;
+		}
+		pool[j] = key;
 	}
+	for (u32 i = 0; i < SG_TEST_PAGES; i++)
+		frames[i] = pool[i * 2];
 
 	u32 adjacent_pairs = 0;
 	for (u32 i = 1; i < SG_TEST_PAGES; i++)
@@ -366,19 +377,69 @@ static void test_gem_sg(void)
 	for (u32 i = 0; i < SG_TEST_PAGES; i++)
 		vmm_unmap_page(SG_TEST_VA + (u64)i * PAGE_SIZE);
 	sg_free_table(&sgt);
-	for (u32 i = 0; i < SG_TEST_PAGES; i++)
-		pmm_free_frame(frames[i]);
-	for (u32 i = 1; i < SG_TEST_PAGES * 2; i += 2)
+	/* frames[] are a subset of pool[], so one pass frees everything. */
+	for (u32 i = 0; i < SG_TEST_PAGES * 2; i++)
 		pmm_free_frame(pool[i]);
 
 	drm_report("gem-sg", ok, reported_nents);
-	/* Report whether the forced fragmentation actually produced more than one
-	 * run. It normally does; when the allocator hands back a single run anyway
-	 * the mapping test above still ran, so this is information, not a verdict. */
-	console_write(adjacent_pairs + 1 < SG_TEST_PAGES
-	                  ? "M100-SMOKE: ok gem-sg-discontig\n"
-	                  : "M100-SMOKE: skip gem-sg-discontig (allocator returned "
-	                    "one run)\n");
+
+	/* Now an assertion, not a report: the construction above cannot produce an
+	 * adjacent pair, so every page must be its own scatterlist entry. A single
+	 * coalesced run here would mean either the frames were adjacent after all
+	 * (the allocator handed out duplicates) or sg_append coalesced runs that
+	 * are not adjacent — both real defects. */
+	int discontig = (adjacent_pairs == 0) && (reported_nents == SG_TEST_PAGES);
+	drm_report("gem-sg-discontig", discontig, reported_nents);
+}
+
+/* ── the GEM linear-view window is shared by every address space ──
+ *
+ * Buffer objects are created from an ioctl, i.e. while running on some
+ * process's address space. New address spaces copy the kernel-half PML4 entries
+ * *by value*, so a window whose PML4 entry appears only after a process exists
+ * would be mapped in one process and absent in every other — a GEM mapping that
+ * works for one client and faults for the next. drm_dev_init reserves the
+ * window's page-table path up front; this checks that it took, by creating a
+ * fresh address space and comparing its entry with the kernel's. */
+/* One window: reserved, then required to be present and identical in a freshly
+ * created address space. Returns 1 on success. */
+static int vmap_window_is_shared(u64 base, u64 size)
+{
+	u64 kernel_first = paging_pml4_entry_current(base);
+	u64 kernel_last = paging_pml4_entry_current(base + size - 1);
+	u64 space = paging_create_address_space();
+	if (!space)
+		return 0;
+	u64 fresh_first = paging_pml4_entry_in(space, base);
+	u64 fresh_last = paging_pml4_entry_in(space, base + size - 1);
+	paging_free_address_space(space);
+
+	return (kernel_first & VMM_PRESENT) && fresh_first == kernel_first &&
+	       (kernel_last & VMM_PRESENT) && fresh_last == kernel_last;
+}
+
+static void test_gem_vmap_shared(void)
+{
+	/* The property belongs to paging_reserve_kernel_path, not to the GPU, so
+	 * it is checked on a window this test reserves itself — which is why there
+	 * is no skip here any more. An instance with no DRM device used to report
+	 * nothing at all, leaving the mechanism untested exactly where the
+	 * scheduler and page tables differ most (the SMP instance). */
+	u64 scratch = SG_TEST_VA + (1ULL << 40);
+	if (paging_reserve_kernel_path(scratch, 2ULL << 30) != 0 ||
+	    !vmap_window_is_shared(scratch, 2ULL << 30)) {
+		drm_report("gem-vmap-shared", 0, 1);
+		return;
+	}
+
+	/* ...and, where the real window exists, on that too: drm_dev_init must
+	 * have reserved it before any process was created. */
+	u64 base = drm_vmap_window_base();
+	if (base && !vmap_window_is_shared(base, drm_vmap_window_size())) {
+		drm_report("gem-vmap-shared", 0, 2);
+		return;
+	}
+	drm_report("gem-vmap-shared", 1, base ? 2 : 1);
 }
 
 void dma_fence_selftest(void)
@@ -394,5 +455,6 @@ void drm_sched_selftest(void)
 		return;
 	test_scheduler();
 	test_gem_sg();
+	test_gem_vmap_shared();
 	console_write("M100-SMOKE: done\n");
 }

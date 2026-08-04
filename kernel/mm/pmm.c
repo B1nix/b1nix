@@ -1194,6 +1194,56 @@ static u64 pmm_clean_alloc_streak = 0; /* successful allocs without reclaim */
 static u64 pmm_warned_pressure = 0;    /* one-shot per pressure episode */
 static int pmm_oom_reported = 0;       /* one-shot OOM diag per pressure episode */
 
+/* M99: allocate `count` contiguous frames whose LAST byte is <= `limit`.
+ *
+ * This is the zone a bounce buffer comes from. A device whose address window is
+ * narrower than the memory a caller happens to hold cannot be handed that
+ * memory, and without an IOMMU the only remedy is to copy through a buffer the
+ * device *can* reach — which first requires being able to ask for one. The
+ * ordinary allocator has no notion of an address ceiling, so this walks the
+ * authoritative used-bitmap (as bitmap_scan_alloc does) over the frames below
+ * the ceiling and claims a run there, reseeding the buddy tree afterwards so it
+ * stays a faithful image of the bitmap.
+ *
+ * O(limit / PAGE_SIZE) and only on the bounce path, which is by definition the
+ * slow one. Returns 0 when no run below the ceiling is free. */
+u64 pmm_alloc_frames_below(usize count, u64 limit) {
+  if (count == 0 || limit < PAGE_SIZE)
+    return 0;
+
+  u64 flags;
+  pmm_acquire(&flags);
+
+  usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
+  /* A frame is usable only if its whole page fits under the ceiling. */
+  usize cap = (usize)((limit + 1) / PAGE_SIZE);
+  if (cap < frame_count)
+    frame_count = cap;
+
+  usize run = 0, run_start = 0;
+  u64 frame = 0;
+  for (usize idx = 0; idx < frame_count; idx++) {
+    if (bitmap_get(idx)) {
+      run = 0;
+      continue;
+    }
+    if (run == 0)
+      run_start = idx;
+    if (++run >= count) {
+      for (usize j = 0; j < count; j++)
+        claim_frame(run_start + j);
+      if (buddy_ready)
+        buddy_seed_from_bitmap();
+      frame = frame_from_index(run_start);
+      zero_frames(frame, count);
+      break;
+    }
+  }
+
+  pmm_release(flags);
+  return frame;
+}
+
 u64 pmm_alloc_frames(usize count) {
   u64 flags;
   u64 reclaim_attempts = 0;

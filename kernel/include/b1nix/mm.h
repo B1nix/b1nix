@@ -139,6 +139,12 @@ void pmm_init(const struct boot_info *boot_info);
 void kswapd_init(void);
 u64 pmm_alloc_frame(void);
 u64 pmm_alloc_frames(usize count);
+
+/* M99: `count` contiguous frames whose last byte is <= limit — the allocation a
+ * DMA bounce buffer needs when a device's address window is narrower than the
+ * memory it was asked to reach. Returns 0 when nothing under the ceiling is
+ * free. Walks the used-bitmap, so it is O(limit/PAGE_SIZE): a slow-path call. */
+u64 pmm_alloc_frames_below(usize count, u64 limit);
 /* Physical address of the single shared zero page (zero-page dedup). Reserved
  * for the kernel's lifetime; pmm_free_frame() ignores it. */
 u64 pmm_zero_page(void);
@@ -173,6 +179,17 @@ void paging_dump_entries(u64 virtual_address);
 /* Raw leaf page-table entry backing `vaddr` in the current address space, or 0
  * when nothing 4 KiB-mapped is there. Used to verify memory-type bits (M98). */
 u64 paging_leaf_pte(u64 virtual_address);
+
+/* M100: install the kernel-half page-table path for a range without mapping a
+ * page into it, so the window exists in every address space created later (new
+ * address spaces copy PML4 entries by value — an entry created afterwards is
+ * private to whichever process created it). */
+int paging_reserve_kernel_path(u64 virtual_address, u64 size);
+
+/* The PML4 entry `pml4_phys` holds for an address, 0 when absent. Lets a test
+ * assert that a kernel window is shared rather than assuming it. */
+u64 paging_pml4_entry_in(u64 pml4_phys, u64 virtual_address);
+u64 paging_pml4_entry_current(u64 virtual_address);
 
 // M2 Aliases / Helpers
 void paging_map_page(u64 virtual_address, u64 physical_address, u64 flags);

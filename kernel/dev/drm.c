@@ -42,6 +42,9 @@
  * 0xffffa000_00000000 and is 512 MiB long) with a terabyte of clearance. */
 #define DRM_VMAP_BASE 0xffffa10000000000ULL
 #define DRM_MAX_BO_PAGES (DRM_MAP_STRIDE / PAGE_SIZE)
+/* The whole window: one stride per object. Reserved as a unit at init so every
+ * slot's page-table path exists before any address space is created. */
+#define DRM_VMAP_WINDOW_TOTAL (DRM_MAP_STRIDE * DRM_MAX_OBJECTS)
 
 struct drm_client {
   struct idr handles;
@@ -614,6 +617,13 @@ int drm_dev_open(int flags) {
   return fd;
 }
 
+/* The GEM linear-view window, for the M100 self-test: it asserts that this
+ * range's page-table path is shared by every address space rather than taking
+ * the claim on trust. Returns 0 when there is no DRM device (no GPU), in which
+ * case there is no window and nothing to assert. */
+u64 drm_vmap_window_base(void) { return card_node ? DRM_VMAP_BASE : 0; }
+u64 drm_vmap_window_size(void) { return DRM_VMAP_WINDOW_TOTAL; }
+
 void drm_dev_init(void) {
   if (!virtio_gpu_ready())
     return;
@@ -635,13 +645,14 @@ void drm_dev_init(void) {
    * when a process is created never appears in that process. Buffer objects are
    * allocated from an ioctl, i.e. on a user address space, so the window's PML4
    * entry would be created in exactly one process and be missing everywhere
-   * else. Touching one page here installs PML4 -> PDPT -> PD once, in the
-   * kernel table, and every later PT allocation lands in that shared PD.
-   * (All DRM_MAX_OBJECTS windows fit in the single 1 GiB PD because
-   * DRM_VMAP_BASE is 1 GiB aligned and the windows span 512 MiB.) */
-  vmm_map_page(DRM_VMAP_BASE, pmm_zero_page(),
-               VMM_WRITABLE | VMM_NO_EXECUTE | VMM_PRESENT);
-  vmm_unmap_page(DRM_VMAP_BASE);
+   * else: a GEM mapping would then fault in one process and work in another.
+   *
+   * Reserve the path explicitly rather than mapping a page and unmapping it
+   * again, which only worked because unmap leaves the levels above the leaf in
+   * place — an invariant nothing stated and nothing checked. The M100 self-test
+   * now asserts the result: a freshly created address space must carry the same
+   * PML4 entry the kernel table holds for this window. */
+  paging_reserve_kernel_path(DRM_VMAP_BASE, DRM_VMAP_WINDOW_TOTAL);
 
   card_node->inode->mode = 0600;
   card_node->inode->mmap_handle_page_phys_cb = drm_mmap_page_phys;

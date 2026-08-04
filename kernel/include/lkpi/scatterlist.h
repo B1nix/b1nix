@@ -22,6 +22,11 @@ struct scatterlist {
 	u64 phys;   /* physical start of this run */
 	u32 offset; /* byte offset into the first page of the run */
 	u32 length; /* bytes in this run */
+	/* Address the DEVICE uses for this run, filled in by dma_map_sg. Equal to
+	 * phys + offset on a system without an IOMMU and a device that can reach
+	 * the run; different when the run had to be bounced (see
+	 * dma_map_sg_masked). Meaningless before the table is mapped. */
+	dma_addr_t dma_address;
 };
 
 struct sg_table {

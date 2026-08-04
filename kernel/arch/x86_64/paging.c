@@ -1351,6 +1351,54 @@ u64 paging_user_phys(u64 pml4_phys, u64 vaddr) {
  * mapped by a 4 KiB leaf (unmapped, or covered by a 1 GiB / 2 MiB page). The
  * memory-type bits (PAT/PCD/PWT) live in this entry, so M98's WC self-test
  * reads it back rather than trusting the flags it passed to vmm_map_page. */
+/* M100: build the kernel-half page-table path for [vaddr, vaddr+size) without
+ * mapping anything into it.
+ *
+ * paging_create_address_space() copies PML4 entries 256..511 by value into
+ * every new address space, so everything below the PML4 level is shared — but
+ * only for entries that already exist when the process is created. A window
+ * whose PML4 entry is first created later (from an ioctl, i.e. on a user
+ * address space) would exist in exactly that one process and be missing in
+ * every other. Installing the path up front, at boot, is what makes such a
+ * window genuinely global; the alternative previously used here — map one page
+ * and immediately unmap it — happened to work only because unmapping a page
+ * leaves the tables above it in place.
+ *
+ * Returns 0 on success. */
+int paging_reserve_kernel_path(u64 virtual_address, u64 size) {
+  if (size == 0)
+    return -1;
+  u64 flags;
+  vmm_write_acquire(&flags);
+  u64 *pml4 = get_current_pml4();
+  u64 start = virtual_address & ~(u64)(PAGE_SIZE - 1);
+  u64 end = virtual_address + size;
+  /* One PD covers 1 GiB; walking by that stride installs every level the range
+   * needs without touching a single leaf entry. */
+  for (u64 va = start; va < end; va += (1ULL << 30)) {
+    u64 *pdpt = ensure_child_table(pml4, pml4_index(va));
+    (void)ensure_child_table(pdpt, pdpt_index(va));
+  }
+  vmm_write_release(flags);
+  return 0;
+}
+
+/* The PML4 entry the CURRENT address space holds for `virtual_address`. */
+u64 paging_pml4_entry_current(u64 virtual_address) {
+  u64 *pml4 = get_current_pml4();
+  return pml4[pml4_index(virtual_address)];
+}
+
+/* The PML4 entry an address space holds for `virtual_address`. Used to assert
+ * that a kernel window really is shared: a fresh address space must carry the
+ * same entry the kernel table has. Returns 0 when absent. */
+u64 paging_pml4_entry_in(u64 pml4_phys, u64 virtual_address) {
+  if (!pml4_phys)
+    return 0;
+  u64 *pml4 = (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE);
+  return pml4[pml4_index(virtual_address)];
+}
+
 u64 paging_leaf_pte(u64 virtual_address) {
   u64 *pml4 = get_current_pml4();
   u64 pml4e = pml4[pml4_index(virtual_address)];

@@ -109,4 +109,10 @@ struct drm_b1nix_gem_info {
 void drm_dev_init(void);
 int drm_dev_open(int flags);
 
+/* M100: the GEM linear-view kernel window (0 when no DRM device exists). The
+ * self-test uses these to check the window's page-table path really is shared
+ * by every address space. */
+u64 drm_vmap_window_base(void);
+u64 drm_vmap_window_size(void);
+
 #endif

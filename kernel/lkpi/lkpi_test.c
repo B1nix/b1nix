@@ -469,6 +469,185 @@ static void test_dma(void)
 	lkpi_report("dma-mapping", ok == 0x1ff, ok ^ 0x1ff);
 }
 
+/* ── dma bounce buffers ─────────────────────────────────────────────
+ *
+ * A device whose address window does not cover the memory it is handed has, on
+ * a machine with no IOMMU, exactly one remedy: copy through memory it can
+ * reach. This drives that path with a mask deliberately set below the buffer's
+ * own physical address, and checks the two things the copy exists for — that
+ * the device sees what the CPU wrote, and that the CPU sees what the device
+ * wrote back.
+ */
+static void test_dma_bounce(void)
+{
+	int ok = 0x3f;
+	u32 *buf = kmalloc(PAGE_SIZE);
+	if (!buf) {
+		lkpi_report("dma-bounce", 0, 1);
+		return;
+	}
+	for (usize i = 0; i < PAGE_SIZE / sizeof(u32); i++)
+		buf[i] = 0xB0000000u ^ (u32)i;
+
+	u64 phys = vmm_virt_to_phys(buf);
+	if (!phys || phys < 2 * PAGE_SIZE) {
+		/* Nothing below the buffer to bounce into. */
+		kfree(buf);
+		lkpi_report("dma-bounce", 0, 2);
+		return;
+	}
+
+	/* A window that ends one page below this buffer: the buffer is out of
+	 * reach by construction, whatever the allocator happened to hand out. */
+	u64 mask = phys - 1;
+	dma_addr_t h = dma_map_single_masked(buf, PAGE_SIZE, DMA_BIDIRECTIONAL,
+	                                     mask);
+	if (!h)
+		ok &= ~(1 << 0);
+	if (h && !dma_mapping_is_bounced(h))
+		ok &= ~(1 << 1); /* it was NOT bounced — the mask was ignored */
+	if (h && (h + PAGE_SIZE - 1) > mask)
+		ok &= ~(1 << 2); /* bounced somewhere the device still cannot reach */
+
+	if (h) {
+		/* What the device would read must be what the CPU wrote. */
+		const volatile u32 *dev_view =
+		    (const volatile u32 *)(usize)(h + vmm_direct_map_base());
+		for (usize i = 0; i < PAGE_SIZE / sizeof(u32); i += 64)
+			if (dev_view[i] != (0xB0000000u ^ (u32)i)) {
+				ok &= ~(1 << 3);
+				break;
+			}
+
+		/* Now play the device: rewrite the bounce, then unmap. The caller's
+		 * buffer must come back holding what the device left. */
+		volatile u32 *dev_write = (volatile u32 *)(usize)(h + vmm_direct_map_base());
+		for (usize i = 0; i < PAGE_SIZE / sizeof(u32); i++)
+			dev_write[i] = 0xDE000000u ^ (u32)i;
+		dma_unmap_single(h, PAGE_SIZE, DMA_BIDIRECTIONAL);
+
+		for (usize i = 0; i < PAGE_SIZE / sizeof(u32); i += 64)
+			if (buf[i] != (0xDE000000u ^ (u32)i)) {
+				ok &= ~(1 << 4);
+				break;
+			}
+		/* The mapping is gone: the handle must no longer be known. */
+		if (dma_mapping_is_bounced(h))
+			ok &= ~(1 << 5);
+	}
+
+	/* The same buffer with a window that does cover it must NOT be copied —
+	 * bouncing when it is unnecessary is a bug of its own. */
+	dma_addr_t direct = dma_map_single(buf, PAGE_SIZE, DMA_TO_DEVICE);
+	if (direct != phys || dma_mapping_is_bounced(direct))
+		ok &= ~(1 << 2);
+	dma_unmap_single(direct, PAGE_SIZE, DMA_TO_DEVICE);
+
+	kfree(buf);
+	lkpi_report("dma-bounce", ok == 0x3f, ok ^ 0x3f);
+}
+
+/* An sg table whose runs are out of the device's reach is bounced as a whole:
+ * one block below the mask, entries pointing into it in order. That is what a
+ * device with a segment limit needs — the alternative, one allocation per run,
+ * hands it more segments than the caller built. */
+static void test_dma_bounce_sg(void)
+{
+	int ok = 0x1f;
+	const u32 pages = 4;
+	u64 frames[4];
+	struct sg_table sgt;
+
+	for (u32 i = 0; i < pages; i++) {
+		frames[i] = pmm_alloc_frame();
+		if (!frames[i]) {
+			lkpi_report("dma-bounce-sg", 0, 1);
+			return;
+		}
+	}
+	if (sg_alloc_table_from_pages(&sgt, frames, pages) < 0) {
+		for (u32 i = 0; i < pages; i++)
+			pmm_free_frame(frames[i]);
+		lkpi_report("dma-bounce-sg", 0, 2);
+		return;
+	}
+
+	/* Fill each page with a value only that page carries, so a copy that lands
+	 * at the wrong offset in the block is visible. */
+	for (u32 i = 0; i < pages; i++) {
+		volatile u32 *p = (volatile u32 *)(usize)(frames[i] + vmm_direct_map_base());
+		for (usize w = 0; w < PAGE_SIZE / sizeof(u32); w++)
+			p[w] = 0x51000000u ^ (i << 20) ^ (u32)w;
+	}
+
+	/* A window ending below the lowest run puts the whole table out of reach. */
+	u64 lowest = frames[0];
+	for (u32 i = 1; i < pages; i++)
+		if (frames[i] < lowest)
+			lowest = frames[i];
+	if (lowest < 2 * PAGE_SIZE) {
+		sg_free_table(&sgt);
+		for (u32 i = 0; i < pages; i++)
+			pmm_free_frame(frames[i]);
+		lkpi_report("dma-bounce-sg", 0, 3);
+		return;
+	}
+	u64 mask = lowest - 1;
+
+	if (dma_map_sg_masked(&sgt, DMA_BIDIRECTIONAL, mask) != sgt.nents)
+		ok &= ~(1 << 0);
+
+	/* Every entry must address the one block, in order and end to end. */
+	dma_addr_t base = sgt.sgl[0].dma_address;
+	if (!dma_mapping_is_bounced(base))
+		ok &= ~(1 << 1);
+	u64 off = 0;
+	for (u32 i = 0; i < sgt.nents; i++) {
+		if (sgt.sgl[i].dma_address != base + off)
+			ok &= ~(1 << 2);
+		if (sgt.sgl[i].dma_address + sgt.sgl[i].length - 1 > mask)
+			ok &= ~(1 << 2);
+		off += sgt.sgl[i].length;
+	}
+
+	/* The block must hold what the caller's pages held, at the right offsets. */
+	{
+		const volatile u32 *blk =
+		    (const volatile u32 *)(usize)(base + vmm_direct_map_base());
+		for (u32 i = 0; i < pages; i++) {
+			usize w0 = (usize)i * (PAGE_SIZE / sizeof(u32));
+			if (blk[w0] != (0x51000000u ^ (i << 20)) ||
+			    blk[w0 + 17] != (0x51000000u ^ (i << 20) ^ 17u)) {
+				ok &= ~(1 << 3);
+				break;
+			}
+		}
+
+		/* Play the device: rewrite the block, unmap, and require every page to
+		 * have received its own slice back. */
+		volatile u32 *w = (volatile u32 *)(usize)(base + vmm_direct_map_base());
+		for (usize i = 0; i < ((usize)pages * PAGE_SIZE) / sizeof(u32); i++)
+			w[i] = 0xD1000000u ^ (u32)i;
+	}
+	dma_unmap_sg(&sgt, DMA_BIDIRECTIONAL);
+
+	for (u32 i = 0; i < pages; i++) {
+		const volatile u32 *p =
+		    (const volatile u32 *)(usize)(frames[i] + vmm_direct_map_base());
+		usize base_word = (usize)i * (PAGE_SIZE / sizeof(u32));
+		if (p[0] != (0xD1000000u ^ (u32)base_word) ||
+		    p[9] != (0xD1000000u ^ (u32)(base_word + 9))) {
+			ok &= ~(1 << 4);
+			break;
+		}
+	}
+
+	sg_free_table(&sgt);
+	for (u32 i = 0; i < pages; i++)
+		pmm_free_frame(frames[i]);
+	lkpi_report("dma-bounce-sg", ok == 0x1f, ok ^ 0x1f);
+}
+
 /* ── request_firmware ───────────────────────────────────────────── */
 
 static void test_firmware(void)
@@ -593,6 +772,8 @@ void lkpi_selftest(void)
 	test_scatterlist();
 	test_ioremap();
 	test_dma();
+	test_dma_bounce();
+	test_dma_bounce_sg();
 	test_firmware();
 	test_locks();
 	console_write("M99-SMOKE: done\n");
