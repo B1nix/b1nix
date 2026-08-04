@@ -8,7 +8,6 @@ Status:
 - `planned`: not implemented.
 - `deferred`: intentionally postponed.
 
-
 ## M0: Boot and Diagnostics
 
 - [x] Build a freestanding kernel ELF and GRUB ISO.
@@ -358,20 +357,20 @@ Status:
 
 ## M40: Linux ABI Compatibility
 
-- [x] Translate Linux x86_64 syscall numbers and semantics (~230 calls: stat/statfs/uname/getdents64/termios layouts, positional I/O, the time calls, sched/credential/capability calls, real `mlock`, `sethostname`, the xattr fd forms).
-- [x] Load Linux binaries: static ET_EXEC at its own base, and dynamic ones through their own `PT_INTERP` (a stock Alpine rootfs boots on musl's `ld-musl` — see M94).
-- [x] Linux process startup: full auxv (AT_PHDR/BASE/ENTRY/RANDOM/EXECFN/UID…), `arch_prctl`, signal delivery with signo remap, and `rt_sigreturn`.
-- [x] Linux-compatible `/proc` and `/sys`: `/proc/<pid>/{environ,statm,limits,cwd,root,mounts}`, `/proc/{swaps,modules,sys/kernel/*,sys/fs/*}`, `/sys/class/net/<if>/*`.
-- [x] Detect Linux ELFs through personality (`EI_OSABI` and `NT_GNU_ABI_TAG`).
-- [x] `d_ino` is the filesystem's real inode number (ext2/3/4) or the file's stable on-disk identity (FAT/exFAT/ISO first cluster / extent LBA), and `st_ino` reports the same value — readdir and stat now name the same file.
-- [x] The privilege and placement calls behave as they claim: capabilities are a real per-task set (a dropped one stays dropped, and root loses the operation it guarded), `setfsuid`/`setfsgid` move the id the VFS checks against (clearing the file-related capabilities as Linux does), `sched_setaffinity` really pins a task, and a `ptrace` tracer that is not the tracee's parent can attach and drive it. `open(2)`'s `O_CREAT` mode is applied (masked by umask) instead of being ignored.
-- [x] The rest of the surface, implemented rather than stubbed: `ptrace` (TRACEME/ATTACH/GETREGS/SETREGS/PEEK/POKE/CONT/SINGLESTEP/DETACH/KILL), SysV semaphores (with SEM_UNDO) and message queues (type-selective receive), `chroot` with a real per-task root, runtime `swapon`/`swapoff`, `tee`/`vmsplice`, `ioprio_*`, `name_to_handle_at`/`open_by_handle_at`, `rseq` (live `cpu_id` plus critical-section abort), and legacy `getdents`.
+- [x] Translate roughly 230 Linux x86_64 syscalls and their structure layouts.
+- [x] Load Linux binaries: static at their own base, dynamic through their own interpreter.
+- [x] Build Linux process startup: full auxv, `arch_prctl`, signal frames, TLS.
+- [x] Provide the `/proc` and `/sys` files Linux programs read.
+- [x] Detect Linux binaries by personality rather than by guesswork.
+- [x] Report real inode numbers in directory entries.
+- [x] Make capabilities, `setfsuid`, affinity and `ptrace` behave as they claim.
+- [x] Implement the rest rather than stubbing it: SysV IPC, `chroot`, `rseq`, swap, `mount(2)`.
 
 ## M29 follow-up: the pthread SMP wedge
 
-- [x] Fixed the long-standing `M29 stress-smp` hang at `-smp 2` (three real races, not one): a futex wake landing while the waiter was momentarily RUNNING was lost; `CLONE_*_SETTID` wrote the child's tid *after* the child could already have exited and had it cleared; and the `CLONE_CHILD_CLEARTID` write — which is what releases musl's thread-list lock — could silently fail, leaving the lock owned by a dead thread.
-- [x] `filelock_lock` is taken with interrupts disabled; a preempted holder used to deadlock against its own CPU (observed as `SPINLOCK LOCKUP on cpu 0`).
-- [x] The watchdog task dump now prints the futex wait queues (key, owner, expected vs current value) and the last thread deaths, which is what made these diagnosable.
+- [x] Fix three races behind the `-smp 2` hang: a lost futex wake, a late thread-id write, and a clear that never landed.
+- [x] Take the file-lock lock with interrupts disabled so a preempted holder cannot deadlock.
+- [x] Print the futex wait queues in the watchdog task dump.
 
 ## M41: Large Physical Memory
 
@@ -487,9 +486,9 @@ Status:
 
 ## M54: Third-Party Port Feature Enablement
 
-- [x] Foundation: timed futexes, `settimeofday`, sched_getaffinity, `scandir`, `remove`.
-- [x] Ports: curl (brotli, PSL, IDN2, unix-sockets), mbedTLS cert date validation, bash `/dev/tcp`, dropbear zlib, Wget threads/PSL, NetSurf JPEG-XL/SVG/Duktape, locale iconv.
-- [x] Milestone closeout: remaining feature flips landed, declined, or deferred.
+- [x] Add the foundation the ports wanted: timed futexes, `settimeofday`, affinity queries, `scandir`, `remove`.
+- [x] Turn on the port features that depend on it, across curl, mbedTLS, dropbear and the shells.
+- [x] Close the milestone: every remaining flag landed, declined or deferred.
 
 ## M55: C++ Runtime
 
@@ -621,56 +620,15 @@ Status:
 
 ## M80: Kernel ptrace + Crash Capture
 
-- [x] Implement `ptrace(2)` and register/memory reading (`PTRACE_PEEKTEXT`, `PTRACE_GETREGS`, etc.).
-- [x] `PTRACE_GETREGSET`/`SETREGSET` (NT_PRSTATUS/NT_PRFPREG), `GETFPREGS`/`SETFPREGS`,
-      `GETSIGINFO`, `SEIZE`/`INTERRUPT`; a tracer now also gets first refusal on a
-      fatal fault, so a traced crash stops instead of dying.
-- [x] `/proc/<pid>/task/<tid>/` (status, stat, comm, maps, statm), `/proc/<pid>/auxv`,
-      `/proc/<pid>/mem`, plus Tgid/Threads/TracerPid in status and direct `/proc/<pid>` lookup.
-- [x] Crash capture: the fault handler records signal/address/si_code, surfaced through
-      SA_SIGINFO `si_addr` and `PTRACE_GETSIGINFO`; `prctl(PR_SET_PTRACER)` and
-      `/proc/sys/kernel/yama/ptrace_scope` gate who may attach. Proven end to end by
-      `userspace/bin/m80_smoke.c`, which runs the crashpad handshake (crashing client →
-      handler over a socket → attach → enumerate threads → dump).
-- [x] `PTRACE_SETOPTIONS` with the fork/vfork/clone/exec events + `PTRACE_GETEVENTMSG`
-      (a traced child is attached and stopped before it runs), `PTRACE_LISTEN`,
-      `PTRACE_O_EXITKILL`, `NT_X86_XSTATE`, `process_vm_readv/writev` and `SO_PEERCRED`.
-      (`PTRACE_O_TRACEEXIT` and `TRACESYSGOOD` followed in the next item.)
-- [x] `PTRACE_SYSCALL` entry/exit stops (`PTRACE_O_TRACESYSGOOD`, and a tracer-written
-      return value reaches userspace), `PTRACE_O_TRACEEXIT`, and a tracee that stops
-      for signals its own process ignores — the remaining ptrace(2) gaps.
-- [x] Real XSAVE in the context switch: AVX (YMM) state now survives a switch, and
-      `NT_X86_XSTATE` reports the area the kernel actually manages. Capped at
-      x87|SSE|AVX; a CPU needing a larger area stays on FXSAVE rather than losing state.
-- [x] **Upstream Crashpad ported and running** (`tools/ports/build-crashpad.sh`):
-      `/bin/crashpad_handler` attaches to a crashing process and writes a real
-      minidump. Getting there closed six more ABI gaps: `SOCK_SEQPACKET` on AF_UNIX,
-      `SO_PASSCRED`/`SO_PEERCRED`, a tracer's `waitpid` seeing ptrace stops without
-      WUNTRACED, Linux-shaped `Uid/Gid/Groups` lines in `/proc/<pid>/status`, an
-      ordered `/proc/<pid>/maps` that names the executable's and interpreter's own
-      mappings, and reading pages the 4 KiB-only page walk could not see.
-      Proven by `userspace/bin/crashpad_smoke.cpp` (CRASHPAD-SMOKE markers).
-- [x] CPU clock measured against the PIT during LAPIC calibration and published in
-      `/proc/cpuinfo` (`cpu MHz`) and `/sys/devices/system/cpu/cpuN/cpufreq/*`. The
-      files exist only once the clock has actually been measured.
-- [x] Crashpad builds from **unpatched upstream sources**: the platform defines live
-      in the b1nix toolchain wrapper and the UAPI headers (`linux/`, `asm/`,
-      `sys/cdefs.h`) are staged into the cross sysroot — a linux-headers package, not
-      a per-port shim. The only build flags are the ones an APKBUILD would carry.
-      Every mapping also reports the device it lives on: a filesystem now carries a
-      real st_dev (the block device's number, or an anonymous one for a RAM/pseudo
-      filesystem), kept separate from the per-mount id that keys the inode cache.
-      Chasing that separation also found a page-cache aliasing bug: a filesystem
-      builds its tree inside its own mount callback, so every inode created there
-      carried fs_id 0 — and the page cache, keyed by (fs_id, ino), then shared
-      entries between two filesystems that reuse the same on-disk inode number.
-      One mount read the other's file contents (M14 block-cache). The mount id is
-      now published before the callback runs.
-      Closing the last of its complaints fixed three more kernel defects: huge-page
-      mappings were invisible to every reader of another task's memory
-      (`paging_user_phys`), `/proc/<pid>/maps` reported file offset 0 for every
-      segment (so each looked like a module start), and file-backed mappings had no
-      inode (so a reader treated them as anonymous).
+- [x] Implement `ptrace(2)`: register and memory access, `SEIZE`/`INTERRUPT`, `GETSIGINFO`, register sets.
+- [x] Add syscall entry/exit stops, fork/exec/clone events, and `PTRACE_O_*` options.
+- [x] Gate attachment with `PR_SET_PTRACER` and Yama `ptrace_scope`.
+- [x] Add `/proc/<pid>/task/<tid>/`, `auxv`, `mem`, and Linux-shaped status fields.
+- [x] Record fault signal, address and code, and deliver them through `SA_SIGINFO`.
+- [x] Save AVX state across context switches with XSAVE.
+- [x] Run upstream Crashpad unpatched: it attaches to a crashing process and writes a real minidump.
+- [x] Publish measured CPU clock in `/proc/cpuinfo` and sysfs cpufreq.
+- [x] Give every filesystem a real `st_dev`, kept apart from the mount id the inode cache keys on.
 
 ## M81: Chromium GPU Acceleration
 
@@ -686,64 +644,26 @@ Status:
 
 ## M84: Real IP routing + TCP robustness
 
-- [x] `done` IPv4 FIB (`kernel/net/route.c`): longest-prefix-match with host
-  routes, metric tie-break and coexisting gateways. `ipv4_send` routes through
-  it instead of assuming a /24 plus one gateway.
-- [x] `done` The FIB is the single source of truth: DHCP installs the lease's
-  prefix (option 1) and default route, `/proc/net/route` renders the real
-  table, and `SIOCADDRT`/`SIOCDELRT` mutate it (BusyBox `route add/del`).
-- [x] `done` TCP options: MSS and window scale are sent in SYN/SYN-ACK and
-  parsed on receipt; the peer's window is applied with the negotiated shift
-  and segments are capped at the peer's MSS.
-- [x] `done` TCP out-of-order reassembly queue (16 segs / 64 KiB): segments
-  past a hole are buffered and dup-ACKed instead of dropped, already-delivered
-  bytes are trimmed off retransmissions, and closing the hole drains
-  everything that became contiguous.
-- [x] `done` SACK (RFC 2018), both directions: ACKs carry up to three blocks
-  built from the reassembly queue (most-recent first), and incoming blocks mark
-  queued segments so neither the RTO nor fast retransmit resends them — fast
-  retransmit picks the first segment the peer has *not* selectively ACKed.
-- [x] `done` Per-connection heap receive buffer (64 KiB) replaces the 16 KiB
-  inline array, so the advertised window scale is genuinely non-zero and the
-  256-slot table costs ~50 KB of BSS instead of 4 MiB.
-- [x] `done` IPv6 FIB with the same model: prefix-length LPM, host routes,
-  metric, ECMP and per-interface routes. `ipv6_link_output` routes through it,
-  NDP router advertisements install the on-link prefix and default route,
-  fe80::/10 + ::1/128 + ff02::/16 are standing on-link routes, and
-  `/proc/net/ipv6_route` plus `SIOCADDRT` on an AF_INET6 socket (`struct
-  in6_rtmsg`) expose it.
-- [x] `done` Per-interface routing end to end: interfaces have stable 1-based
-  indices (`eth<N>`), routes carry an output interface, and ARP/NDP
-  solicitations plus the frame itself leave through that device
-  (`net_send_ethernet_dev`, `arp_resolve_dev`, `ndp_resolve_dev`).
-- [x] `done` D-SACK (RFC 2883) both ways: duplicates are reported back as a
-  leading D-SACK block, and a received one undoes the congestion reduction the
-  spurious retransmission caused.
-- [x] `done` RFC 6675 SACK scoreboard: per-segment lost marks (DUPTHRESH
-  above), a pipe estimate that governs transmission during recovery, and
-  recovery that keeps cwnd at ssthresh instead of Reno's +3 MSS inflation.
-- [x] `done` ECMP hashes the full 5-tuple and the group width is unbounded
-  (two-pass selection, no candidate array).
-- [x] `done` Policy routing: numbered tables plus priority-ordered rules
-  matching source prefix and input interface, for both families. Managed
-  through `/proc/net/rt_tables` and `/proc/net/rt_rules` (text command
-  grammar mirroring `ip route` / `ip rule`, since there is no rtnetlink).
-- [x] `done` DHCPv6 client (RFC 8415): DUID-LL, IA_NA,
-  Solicit/Advertise/Request/Reply with Renew and Rebind on T1/T2, DNS option
-  23, started by the M/O flags of a router advertisement. The assigned address
-  is installed with its on-link /128; routers still come from RAs.
-- [x] `done` Verified by `M84-ROUTE:`, `M84-ROUTE6:`, `M84-POLICY:`,
-  `M84-DHCP6:` and `M84-TCP:` in-kernel self-tests.
+- [x] Add an IPv4 FIB with longest-prefix match, host routes, metrics and gateways.
+- [x] Make the FIB the single source of truth for DHCP, `/proc/net/route` and `SIOCADDRT`/`SIOCDELRT`.
+- [x] Add TCP MSS and window-scale option negotiation.
+- [x] Add out-of-order reassembly, SACK and D-SACK in both directions.
+- [x] Add an RFC 6675 scoreboard with a pipe estimate and per-segment loss marks.
+- [x] Give each connection a 64 KiB heap receive buffer.
+- [x] Add an IPv6 FIB with the same model, fed by router advertisements.
+- [x] Route per interface: stable interface indices, output device on every route, ARP and NDP through it.
+- [x] Add ECMP over the full 5-tuple and policy routing with numbered tables and rules.
+- [x] Add a DHCPv6 client with Solicit/Request/Renew/Rebind.
 
 ## M85: libc Tier-A correctness pass (musl-grade) - Retired
 
 ## M86: Per-thread CPU accounting + signal targeting
 
-- [x] TSC-exact per-thread user/system CPU accounting (ring-3 entry/exit + context-switch boundaries); tick sampling removed.
-- [x] Real `CLOCK_THREAD_CPUTIME_ID` / `CLOCK_PROCESS_CPUTIME_ID` plus the dynamic per-task clock ids of `clock_getcpuclockid`/`pthread_getcpuclockid`.
-- [x] `times(2)`, `getrusage` (SELF = thread group, THREAD, CHILDREN, `ru_nvcsw`/`ru_nivcsw`, `ru_maxrss` as a true high-water mark sampled before every unmap) and `/proc/<pid>[/task/<tid>]/stat` report real CPU time.
-- [x] `tkill(2)`/`tgkill(2)` syscalls with thread-group validation; `kill(2)` is process-directed (picks a thread that does not block the signal, group-wide stop/continue that also wakes threads parked in a blocking syscall).
-- [x] `exit(2)` ends one thread: a leader that calls it (musl's `pthread_exit` from main) waits for its remaining threads instead of killing them, and hands them its tid futex first.
+- [x] Account user and system CPU time per thread from TSC at ring transitions and switches.
+- [x] Implement `CLOCK_THREAD_CPUTIME_ID`, `CLOCK_PROCESS_CPUTIME_ID` and per-task clock ids.
+- [x] Report real values from `times(2)` and `getrusage` for thread, process and children.
+- [x] Add `tkill(2)` and `tgkill(2)`; keep `kill(2)` process-directed.
+- [x] Make `exit(2)` end one thread and `exit_group(2)` the whole group.
 
 ## M87: Dynamic-loader maturation + Rust proc-macros - Retired
 
@@ -806,123 +726,86 @@ Status:
 
 ## M94: Foreign Userspace Independence & Kernel Decoupling
 
-- [x] Generic Boot & Init System Orchestration (`init=` cmdline, PID 1 reservation, OpenRC boot).
-- [x] Init-Agnostic Runtime Control: FIFOs (RAM + ext2/4 inodes), tmpfs/ramfs/devtmpfs, working `posix_spawn`/`popen`, `flock`. runit/s6 not ported.
-- [x] **Two inits, both proved by the same evidence.** BusyBox init is the default PID 1 (`/sbin/init`, M108) and `openrc-init` is a first-class alternative selected with `init=/sbin/openrc-init` (`iso-openrc`). Each instance answers the questions only a process running under that init can answer — `/proc/1/exe` really is that binary, an orphaned grandchild is re-parented and reaped, the system it brought up runs a shell (`M108-SMOKE: ok init-*` / `M94-OPENRC: ok pid1|reaps-orphan|shell`). On top of that each proves what is its own: BusyBox init respawns the inittab getty, and `openrc-shutdown` powers the machine off through `/run/openrc/init.ctl` — the FIFO path telinit uses.
-- [x] OpenRC -> Dynamic musl Linking (and every other port): `tools/check-dynamic.sh` fails the build on a static executable in the rootfs, exceptions only via `tools/configs/static-allowlist.txt` with a reason. The legacy fixed-base static link path is gone from the cc wrappers, and with it every userspace linker script (`linker.ld`, `linker-cxx.ld`, `linker-libcxx.ld`) — lld's default layout plus `--eh-frame-hdr` keeps `PT_GNU_EH_FRAME`, verified by `CXX-SMOKE: ok exceptions`.
-- [x] Standardized Virtual Memory Address Space Layout: no fixed load base left in the build (`userspace/linker.ld` deleted). One boot runs a stock Linux `ET_EXEC` at `0x200000`, b1nix `ET_EXEC` images at `0x2000000` and musl PIEs placed by the loader (randomized under `b1nix.aslr`); the kernel is higher-half, so none of them can collide with it.
-- [x] Linux ABI Conformance: every syscall the ported software actually reached (`clock_getres`, `sched_getaffinity`, `faccessat2`, `rt_sigtimedwait`, `statx` with a real dirfd, `sysinfo`, `times`) is translated or implemented — a boot logs no unmapped syscall. **A stock Alpine 3.20 minirootfs boots on b1nix**: its BusyBox init runs as PID 1 through Alpine's own `ld-musl`, its coreutils/awk/sed/pipes work, and `poweroff` shuts the machine down (`tools/try-alpine-rootfs.sh`). runit/s6 remain unported.
+- [x] Honour `init=` from the cmdline and reserve PID 1 for it.
+- [x] Add the runtime an init system needs: FIFOs, tmpfs, ramfs, devtmpfs, `posix_spawn`, `popen`, `flock`.
+- [x] Boot two inits: BusyBox init by default, `openrc-init` through `init=`, each proved by the same checks.
+- [x] Link every rootfs executable dynamically and fail the build on a static one.
+- [x] Remove every fixed load base from the build; the loader places images.
+- [x] Translate every syscall the ported software reaches, so a boot logs no unmapped call.
+- [x] Boot a stock Alpine minirootfs on its own `ld-musl`, down to `poweroff`.
 
 ## M95: Loadable Kernel Modules — Framework and Device/FS Modules
 
-- [x] Module region at `0xFFFFFFFFC0000000` (128 MiB, PML4 slot 511 so every address space shares its page tables) with real W^X: `module_alloc` hands out RW+NX pages, the loader re-protects the text span RX once relocation is done. Needed EFER.NXE, now enabled on the BSP (`boot.S`) and every AP (`ap_trampoline.S`, `x86_syscall_init`) behind a CPUID check.
-- [x] `ET_REL` (`.ko`) loader in `kernel/module/module.c`: section layout, symbol resolution against the kernel's `EXPORT_SYMBOL` table plus already-loaded modules, R_X86_64_{64,PC32,PLT32,32,32S,PC64,GOTPCRELX} relocations, `.modinfo` vermagic gate, `struct module` list with `try_module_get`/`module_put` (a referenced module cannot be removed).
-- [x] `init_module(2)` / `finit_module(2)` / `delete_module(2)` — native 243/245/244 and the Linux ABI numbers 175/313/176 — all gated on `CAP_SYS_MODULE`. `/proc/modules` is real, `/proc/filesystems` now enumerates the live registry instead of a hardcoded list, and the module utilities are BusyBox applets.
-- [x] `done` `/bin/kmod` is retired: `insmod`, `rmmod`, `lsmod`, `modprobe`, `modinfo` and `depmod` are BusyBox applets (`userspace/bin/tools/kmod.c` is deleted). What made them usable was adopting the layout every modutils implementation expects — the modules moved to `/lib/modules/<uname -r>/`, `modules.dep` keys and dependencies are filenames (`ndp.ko: ipv6.ko`) and `modules.alias` lines are depmod's own `alias <pattern> <module>`; the kernel's `request_module()` reads those same files. `depmod` builds its index from each module's `depends=` tag, so modules declare `MODULE_DEPENDS()` and `tools/kernel/gen_modules_initramfs.sh` fails the build when the tag disagrees with the symbol graph it computes — a stale tag cannot ship, and `depmod -n` reproduces the index byte for byte (asserted by `M95-SMOKE: ok bb-modutils`).
-- [x] `ntfs`, `btrfs`, `isofs` and the Intel HDA sound driver ship as `.ko` in the initramfs and the rootfs; the kernel loads them at boot through `request_module`, and boots and passes its tests with any of them absent. `tools/kernel/check-module-syms.sh` fails the build (not the insmod) on an unexported symbol.
-- [x] `M95-SMOKE` covers the framework end to end, including a vermagic-corrupted module being rejected and an unprivileged `delete_module` reporting `EPERM`.
-- [x] `done` **Unloading a filesystem module while one of its filesystems is mounted is refused.** `vfs_register_fs` records the owning module (`module_owner_of()` maps the descriptor's address back to the image it lives in, so no filesystem has to name itself), every mount takes a `try_module_get()` on it and `umount` gives it back — `rmmod btrfs` with a btrfs image mounted reports `EBUSY` and the type survives.
-- [x] `done` `/proc/filesystems` labels every type correctly: the `nodev` flag is set on exactly the pseudo filesystems (`proc`/`procfs`, `sysfs`, `tmpfs`, `ramfs`, `devtmpfs`, `initramfs`) and on none of the block-backed ones, asserted per type by `M95-SMOKE: ok filesystems-nodev`.
+- [x] Add a module region with W^X: writable while relocating, read-execute once loaded.
+- [x] Add an `ET_REL` loader with symbol resolution against exported kernel symbols.
+- [x] Add `init_module(2)`, `finit_module(2)` and `delete_module(2)`, gated on `CAP_SYS_MODULE`.
+- [x] Ship ntfs, btrfs, isofs and the HDA driver as modules; boot with any of them absent.
+- [x] Load modules with BusyBox modutils and retire the in-tree `kmod`.
+- [x] Refuse to unload a filesystem module while one of its filesystems is mounted.
+- [x] Report loaded modules and filesystem types from the live registry.
 
 ## M96: Loadable Kernel Modules — Network Protocols and Module Parameters
 
-- [x] `proto_register` scaffolding (`kernel/net/proto.c` + `<b1nix/netproto.h>`): the L2 demux, the net daemon's tick, the loopback drain and the IPv6 transmit path all dispatch through the registry, so IPv6, NDP and NTP could move into `ipv6.ko`, `ndp.ko` and `ntp.ko`. Unregistration drains in-flight dispatches before the module's text is freed.
-- [x] `module_param` exposed at `/sys/module/<name>/parameters/<name>`, readable and — where the permission bits allow — writable (`ipv6_hop_limit`, `ntp_server_name`, `hda_tone_ms` writable; `hda_sample_rate`, `hda_dam_buf_sz` read-only). Parameters can also be set on the `insmod` command line; an unknown name fails the load.
-- [x] In-kernel `request_module` (loads from `/lib/modules`, resolving aliases and dependencies) plus a userspace `modprobe` with `-r`, both reading the same index files.
-- [x] `modules.dep` and `modules.alias` are generated from the objects themselves (`tools/kernel/gen_modules_initramfs.sh`) — a dependency is an undefined symbol another module `EXPORT_SYMBOL`s, so `ndp: ipv6` falls out of the code rather than a hand-written list.
-- [x] `M96-SMOKE` covers protocol modules, sysfs parameters (read, write, read-only rejection, insmod-time), `modules.dep`, alias resolution and dependency-ordered `modprobe`.
-- [x] `done` IPv6 neighbour enumeration for netlink (`ip -6 neigh`): `ndp.ko` publishes `neigh_dump`/`neigh_set`/`neigh_del` on `struct net_proto`, so M107's `RTM_GETNEIGH`/`NEWNEIGH`/`DELNEIGH` reach the real NDP cache. With the module absent the dispatchers still report `EAFNOSUPPORT`.
+- [x] Register network protocols through a registry, so a protocol can be a module.
+- [x] Expose module parameters under `/sys/module/<name>/parameters/`.
+- [x] Load modules on demand from the kernel and resolve aliases and dependencies.
+- [x] Generate `modules.dep` and `modules.alias` from the objects themselves.
+- [x] Ship IPv6 and NDP as modules, including netlink neighbour administration.
 
 ## M97: GNU-Free ISO (Limine bootloader + BSD build tools)
 
-- [x] Bootloader GNU GRUB -> **Limine** (BSD-2-Clause): `tools/mkiso.sh` (Limine + xorriso) replaced `grub-mkrescue` for all nine ISO targets and both in-guest proof harnesses; `boot/limine/limine.conf.in` replaced `boot/grub/grub.cfg`. The disk image gained a side benefit — `limine bios-install` writes the boot stages into the image file, so `mk-disk-image.sh` no longer needs root/losetup/mount.
-- [x] Build automation GNU Make -> **bmake** (BSD 3-clause, `/bin/make`) + **samurai** (0BSD Ninja, `/bin/samu`, `/bin/ninja`). `tools/toolchain/build-make.sh` is deleted, `/bin/make` left the static allowlist, and `tools/inguest/Makefile` is now portable BSD make. Verified in-guest by `M98-SMOKE`.
-- [x] GNU Wget -> curl / BusyBox wget (done earlier; `/bin/wget` is the BusyBox applet).
-- [x] Shell GNU bash -> **zsh** (MIT-like) as `/bin/zsh`, the login shell in `/etc/passwd`, with BusyBox `ash` as `/bin/sh`. zsh needs a terminal library, which b1nix never had (bash carried its own bundled termcap), so **netbsd-curses** (BSD) was ported alongside it. `tools/ports/build-bash.sh` is deleted and the packaged bash is purged from the rootfs by `install-ports.sh`. Verified by `ZSH-SMOKE` (12 checks, the same feature surface `BASH-SMOKE` covered).
-- [x] Gnulib left the tree with bash — it was only ever bundled inside it.
+- [x] Replace GRUB with Limine for BIOS and UEFI boot.
+- [x] Replace GNU make with bmake and ninja with samurai.
+- [x] Replace GNU wget with curl and the BusyBox applet.
+- [x] Replace bash with zsh as the login shell, keeping BusyBox ash as `/bin/sh`.
+- [x] Remove gnulib from the tree.
 
 ## M98: Driver Infrastructure (netconsole, memory typing, modern PCI)
 
-- [x] `netconsole` (`kernel/dev/netconsole.c`) — the klog ring drained by a kthread and shipped as UDP datagrams, configured with `b1nix.netconsole=<ip>:<port>`. Draining from a thread rather than inside `console_write` is what keeps it off the console lock, which is held IRQs-off from interrupt context. Host collector: `tools/netconsole-collect.sh`.
-- [x] `IA32_PAT` programming (`kernel/arch/x86_64/memtype.c`) on the BSP and every AP, a `VMM_WC` flag threaded through `vmm_map_page`/`vmm_map_mmio`, and `clflush`/`wbinvd`/`mfence`/`sfence` primitives with a range-flush helper. Only PAT slot 5 is rewritten, so no live mapping changes meaning.
-- [x] PCI BAR enumeration and sizing (decode-disabled, register restored), bus-master and decode enables, standard capability walk, PCIe extended capabilities over ACPI-MCFG ECAM, and MSI / MSI-X programming.
-- [x] Intel stolen memory read from the **host bridge** GGC `0x50` / BDSM `0x5C` / BGSM `0x70`. Reports absence on the QEMU bridges, which is the correct answer there; the decode path is exercised for real only on Intel graphics hardware.
-- [x] **MSI/MSI-X delivery is proven by a driver that consumes it.** Message interrupts got their own vector range (48..63, IDT gates in `isr.S`) and their own one-owner-per-vector table — `msi_alloc_vector`/`msi_dispatch` in `kernel/arch/x86_64/interrupts.c` — instead of borrowing one of the 16 legacy lines, because an MSI has no line to share and no IOAPIC entry to mask. `pci_msi_enable`/`pci_msix_enable` now take the vector itself. **NVMe drives its completions over MSI-X**: `nvme_msix_selftest` reads the armed table entry back, issues a real read command and requires the handler to have run (`M98-DRV-SMOKE: ok msi-delivery`). The completion wait still re-polls the CQ on its watchdog deadline and the driver falls back to INTx when the controller has no MSI-X, so a controller that never delivers costs latency, not correctness.
-- [x] The GGC decode is a pure function (`pci_intel_stolen_decode`) tested against the spec encodings — the 32 MiB-unit range, its 0x10 top, the 4 MiB-unit range from 0xF0, GGMS, and both forms of absence — so the arithmetic no longer depends on owning Intel graphics. The hardware read still gates on the IGD at 00:02.0.
-- [x] The `wbinvd` fallback is taken deliberately (`cache_flush_range_ex(..., force_wbinvd=1)`) rather than left unreachable on every CPU QEMU emulates: `M98-DRV-SMOKE: ok wbinvd-fallback` proves the path executes and that a completed store survives it. What the cache hierarchy did is not observable from software, and the marker does not claim it.
-- Markers: `M98-DRV-SMOKE: ok {netconsole-cmdline,netconsole-udp,pat-msr,pat-wc,clflush,wbinvd-fallback,bar-enum,bar-restore,cap-walk,bus-master,msi-config,msix-config,msi-delivery,stolen,stolen-decode}`. Details: `docs/driver-infrastructure.md`.
+- [x] Ship the kernel log over UDP from a kernel thread, configured from the cmdline.
+- [x] Program the PAT on every CPU and add write-combining mappings.
+- [x] Add cache-maintenance primitives, including a deliberate `wbinvd` fallback path.
+- [x] Enumerate and size PCI BARs without disturbing the running driver.
+- [x] Walk standard and PCIe extended capabilities, and enable bus mastering.
+- [x] Program MSI and MSI-X from a dedicated vector range with one owner per vector.
+- [x] Prove delivery with a driver that uses it: NVMe takes its completions over MSI-X.
+- [x] Decode Intel graphics stolen memory as a pure function, tested against the spec.
 
 ## M99: linuxkpi Compatibility Layer (own MIT headers)
 
-- [x] `kernel/include/lkpi/` written from scratch (MIT): `types.h`, `idr.h`, `completion.h`, `workqueue.h`, `scatterlist.h`, `firmware.h`, `io.h`, `dma-mapping.h`, `lock.h`. No Linux header text is copied — those are GPL and the drivers this layer will carry are MIT.
-- [x] `idr` (flat growable table with a rotating hint), `completion` over the scheduler's two-phase wait, workqueue over `kthread_create` with FIFO ordering and delayed items, `scatterlist` with run coalescing, `request_firmware` over the VFS.
-- [x] `ioremap`/`ioremap_wc`/`ioremap_wb` over `vmm_map_mmio`, dma-mapping (coherent alloc, single/sg map, cache sync for non-snooping devices), and spinlock/sleeping-mutex wrappers that keep b1nix's "never sleep under a spinlock" rule visible in the type.
-- Markers: `M99-SMOKE: ok {idr,completion,workqueue,workqueue-delayed,scatterlist,ioremap,dma-mapping,request-firmware,locks}`. Details: `docs/driver-infrastructure.md`.
-- [x] **Bounce buffers.** There is still no IOMMU, but a device whose window does not cover the memory it was handed is no longer stuck: `dma_map_single_masked`/`dma_map_sg_masked` take the device's `dma_mask`, and a buffer outside it is copied through frames allocated below the mask (new `pmm_alloc_frames_below`, a bitmap scan under an address ceiling). The direction decides the copies, `dma_unmap_single`/`dma_sync_*` recognise a bounced handle, and `scatterlist` gained the `dma_address` Linux has so a bounced run can differ from its physical address. `M99-SMOKE: ok dma-bounce` maps a buffer with the window deliberately ending below it and checks both directions of the copy — and that a window which *does* cover the buffer bounces nothing.
-- [x] An sg table is bounced **as a whole**, into one block below the mask with the entries pointing into it in order, rather than one allocation per run: a device with a segment limit is not handed more segments than the caller built. The bookkeeping is allocated per mapping instead of living in a fixed 16-slot array, so the seventeenth concurrent mapping no longer fails for a reason no driver could act on. `M99-SMOKE: ok dma-bounce-sg`. What is still open — the block comes from the general allocator, so a fragmented system with a narrow mask can refuse a mapping for a reason that is not the device's — is tracked in **M100a**; the IOMMU that would remove the need to copy at all is **M100b**.
+- [x] Write the headers from scratch under MIT, copying no Linux source.
+- [x] Add idr, completion, workqueue, scatterlist and firmware loading.
+- [x] Add ioremap variants over the kernel's MMIO mapper.
+- [x] Add dma-mapping: coherent allocation, single and sg mapping, cache sync.
+- [x] Add bounce buffers for a device whose address window misses the memory it is handed.
+- [x] Bounce an sg table into one block when possible, so a device sees no extra segments.
+- [x] Wrap spinlocks and sleeping mutexes so the never-sleep rule shows in the type.
+- [ ] Add an IOMMU so a narrow mask means "map it low" instead of "copy it".
 
 ## M100: DRM Core — dma-fence, scheduler, GEM (proven on virtio-gpu)
 
-- [x] `dma-fence` (`kernel/drm/dma_fence.c`) — refcounted, one-shot, callback lists, error propagation, sleeping and timed waits.
-- [x] Minimal `drm_gpu_scheduler` (`kernel/drm/gpu_scheduler.c`) — one thread owns the ring, per-entity FIFOs, round-robin between entities, job dependencies resolved in the scheduler thread.
-- [x] `vgpu_submit_stream` converted off `virtio_gpu_wait_used`: userspace VirGL submissions now queue a scheduler job and park on its fence instead of busy-spinning on the virtqueue used index with `vgpu_udev_lock` held IRQs-off. The synchronous path remains only as a pre-scheduler fallback.
-- [x] GEM buffer objects are scatter-gather backed — pages allocated individually, described by an `sg_table`, mapped linearly into a per-object kernel window for scanout and one page at a time into userspace through the new `mmap_handle_page_phys_cb`. Handles moved onto an `idr`.
-- [x] `drm_ioctl` split into one handler per command (was cyclomatic 56 / cognitive 161 in a single switch), behaviour unchanged.
-- Markers: `M100-SMOKE: ok {fence-signal,fence-error,fence-refcount,sched-submit,sched-fairness,gem-sg,gem-create,gem-info,gem-map,gem-mmap-pages,gem-scanout,gem-destroy,gem-handle-reuse}`. Details: `docs/driver-infrastructure.md`.
-- [x] Discontiguous sg-backed buffers are asserted, not hoped for: the test holds 2N frames, sorts them and uses every other one, so no two chosen frames can be adjacent whatever order the allocator used, and the unchosen ones stay allocated so nothing can fill the gaps. `gem-sg-discontig` is now a verdict (one scatterlist entry per page) instead of a skip.
-- [x] The GEM vmap window's page-table path is installed explicitly (`paging_reserve_kernel_path`) instead of by mapping a page and unmapping it again — which worked only because unmap leaves the levels above the leaf in place, an invariant nothing stated. `M100-SMOKE: ok gem-vmap-shared` creates a fresh address space and requires it to carry the kernel's PML4 entry for both ends of the window, so "a GEM mapping that faults in one process but not another" would now fail a test rather than be a note in the roadmap. The check runs everywhere, including on instances with no GPU: it reserves a scratch window of its own and asserts the same property of it, so the mechanism is covered even where the DRM window does not exist.
+- [x] Add refcounted one-shot fences with callbacks, errors and timed waits.
+- [x] Add a GPU scheduler: one ring thread, per-entity queues, round-robin, dependencies.
+- [x] Move VirGL submission onto the scheduler instead of spinning on the virtqueue.
+- [x] Back GEM objects with scatter-gather pages, mapped linearly for the kernel and per page for userspace.
+- [x] Assert that a buffer object's pages really are discontiguous.
+- [x] Install the GEM window's page tables at boot so every address space shares them.
+- [x] Split the DRM ioctl switch into one handler per command.
 
+## M100a: DMA bounce pool
 
-## M100a: DMA bounce — a reserved pool and a fallback that does not refuse (done)
+- [x] Reserve the bounce pool at boot, below 4 GiB, sized from the cmdline.
+- [x] Hand out slots from the pool; fall back to the allocator for a mask the pool cannot reach.
+- [x] Bounce an sg table a block per run when no single block is available.
+- [x] Report pool occupancy, high-water mark and mapping count.
 
-M99 gave b1nix bounce buffers, which is what a device that cannot reach memory
-needs when there is nothing to remap it with. What it did not give them is a
-failure mode that belongs to the DMA layer: a bounce block has to be physically
-contiguous (a device handed one address cannot be given several), and it is
-allocated from the general allocator at map time — so a fragmented system with a
-narrow mask can refuse a mapping that has nothing wrong with it.
+## M100b: IOMMU
 
-- [x] `done` **Reserved bounce pool (swiotlb-shaped).** Reserved from `main` before
-  userspace starts (`dma_bounce_pool_init`), below 4 GiB, sized by
-  `b1nix.bounce-pool=<KiB>` (default 4 MiB, 0 disables and sends every bounce to
-  the allocator). Slots are handed out first-fit over a frame map. "No bounce
-  buffer" now means "too many mappings in flight" instead of "somebody else
-  fragmented memory". A mask too narrow for the pool still falls back to asking
-  the allocator for frames below it — the pool is the common case, not the only
-  one. `M99-SMOKE: ok dma-bounce-pool` proves a servable mapping is served from
-  the pool and that the slot and its accounting come back on unmap.
-- [x] `done` **Per-run fallback for sg.** One block for the whole table when one
-  can be had, a block per run when it cannot: a mapping the system could still
-  serve is no longer refused. A mapping's record describes a set of blocks, and
-  the copies are driven off each entry's `dma_address`, so both shapes are the
-  same code. `M99-SMOKE: ok dma-bounce-sg-fallback` reaches it through
-  deliberate fault injection (`dma_bounce_force_single_page`) — under QEMU the
-  allocator always finds a contiguous run, so the path would otherwise never
-  execute — and requires the addresses to be genuinely non-contiguous and the
-  data to round-trip through all of them.
-- [x] `done` Exhaustion reports as itself: `dma_bounce_pool_stats` gives frames,
-  frames in use, the high-water mark and the number of mappings holding pool
-  frames.
-
-## M100b: IOMMU — address translation and device isolation
-
-With an IOMMU a narrow `dma_mask` stops meaning "copy" and starts meaning "map
-it low", and `dma_map_*` finally does what its name says. It is also the only
-way a device can be *prevented* from reaching memory nobody gave it.
-
-- [ ] `planned` **Intel VT-d (DMAR).** Parse the ACPI DMAR table, program the
-  root/context tables and a second-level page table per device, and map a
-  driver's buffers into that device's own address space. QEMU emulates it
-  (`-device intel-iommu`), so this is testable here and not only on hardware.
-- [ ] `planned` **dma-mapping over translation.** `dma_map_single`/`dma_map_sg`
-  install IOVA mappings instead of bouncing; the bounce path stays as the
-  fallback for a device with no translation unit behind it.
-- [ ] `planned` **Device isolation.** A device that is handed a buffer can reach
-  that buffer and nothing else — the property an IOMMU exists for. Prerequisite
-  for passing a real GPU through to a guest (M101's VFIO note) and for the
-  sandbox work M62 wants.
-- [ ] `planned` **AMD-Vi**, once VT-d works: the same shape with ACPI IVRS
-  instead of DMAR, needed for the RX 6600 path in M102.
+- [ ] Parse the ACPI DMAR table and program Intel VT-d root, context and page tables.
+- [ ] Map buffers into a device's own address space from `dma_map_single` and `dma_map_sg`.
+- [ ] Keep bouncing as the fallback for a device with no translation unit.
+- [ ] Isolate devices: a device reaches the buffer it was given and nothing else.
+- [ ] Add AMD-Vi with the same model.
 
 ## M101: Intel i915 (Gen8/Gen9.5) + Mesa iris
 
@@ -938,91 +821,63 @@ way a device can be *prevented* from reaching memory nobody gave it.
 - [ ] `planned` Visible/invisible VRAM windowing (8 GB behind a 256 MB BAR without ReBAR).
 - [ ] `planned` `libdrm_amdgpu` + `libLLVM.so` rebuilt with the AMDGPU target (currently X86 only).
 
-## M104: Native Package Manager (`bpkg`) + Ports-Out-Of-Tree Migration Plan
+## M104: Native Package Manager (`bpkg`)
 
-- [x] `initial` `/bin/bpkg` — a real C userspace ELF (`userspace/bin/bpkg.c`), built/linked exactly like every other musl binary, no shell/curl/tar/sha256sum shelling. Own RFC 1951/1952 DEFLATE+gzip decoder, ustar+GNU-longname tar extractor, and FIPS 180-4 SHA-256 — zero third-party dependency.
-- [x] `initial` Speaks the house **flat** index format (`tools/packages/bpkg-publish.sh` output, sha256-verified) AND a **real Alpine repository**: `APKINDEX.tar.gz` (P:/V:/A:/D: records) + `.apk` (the real 3-gzip-member signature/control/data container). Verified against byte-for-byte real `tar`/`gzip`-produced fixtures (see `docs/bpkg-package-manager.md`).
-- [x] `initial` Transitive dependency resolution, `update`/`install`/`remove`/`list`/`search`/`info`, `/var/lib/bpkg` state compatible with the existing `tools/packages/install-ports.sh` "download" mode.
-- [ ] `planned` TLS (`https://`) — currently HTTP- and `file://`-only; no RSA signature or APKINDEX `C:` checksum verification.
-- [ ] `planned` Full mass migration of `tools/ports/*.sh` off the from-source build path — `docs/ports-migration-plan.md` is a concrete phased plan plus a one-port (`hello`-class fixture, standing in for `zlib`) proof of concept; no real port has been moved yet and no `tools/ports/*.sh` script has been deleted, per the project's own migration ground rules.
-- Details: `docs/bpkg-package-manager.md` (the tool), `docs/ports-migration-plan.md` (the migration plan + PoC + verification status).
+- [x] `initial` Write `/bin/bpkg` as a plain C ELF with its own inflate, tar and SHA-256.
+- [x] `initial` Read both the house flat index and a real Alpine repository.
+- [x] `initial` Resolve dependencies and support update, install, remove, list, search and info.
+- [ ] `planned` Add HTTPS transport and package signature verification.
+- [ ] `planned` Migrate the from-source ports to packages.
 
 ## M105: PAM (OpenPAM + pam_unix.so)
 
-- [x] `done` OpenPAM `libpam.so.2` + b1nix's `pam_unix.so` (`/etc/shadow` via musl `crypt(3)`); dropbear runs with `DROPBEAR_SVR_PAM_AUTH`.
-- [x] `done` Verified end to end: correct password authenticates, wrong one gives `PAM_AUTH_ERR`, unknown user gives `PAM_USER_UNKNOWN`.
+- [x] Port OpenPAM and write `pam_unix.so` against `/etc/shadow`.
+- [x] Authenticate dropbear logins through PAM, with the shipped stack under `/etc/pam.d`.
 
 ## M106: DNS resolver
 
-- [ ] `planned` Outbound name resolution does not work: `nslookup` and `curl` both fail with "can't resolve" against the QEMU forwarder in `/etc/resolv.conf` (10.0.2.3), while the same fetch by raw IP returns 200. This is the single thing standing between b1nix and installing packages straight from the Alpine mirror — `bpkg` itself already fetches, parses a real `APKINDEX.tar.gz` and resolves dependencies once it is handed an address.
-- [ ] `planned` Suspect the CNAME chain first (`dl-cdn.alpinelinux.org` is a CNAME onto Fastly) and confirm whether the resolver follows it, then whether `getaddrinfo`/`/etc/resolv.conf` are consulted at all.
+- [ ] `planned` Resolve names outbound: `nslookup` and `curl` both fail today.
+- [ ] `planned` Check CNAME chain handling and the response parser first.
 
 ## M107: BusyBox applets blocked on missing kernel subsystems
 
-BusyBox 1.38 ships 439 applets; 114 are compiled in and 137 are exposed. The
-rest are pure-userspace and free to enable — except the following, which need
-kernel work first. Each line is the subsystem, not the applet.
-
-- [x] `done` **netlink** — `AF_NETLINK`/`NETLINK_ROUTE` in `kernel/net/netlink.c`: RTM_GETLINK/GETADDR/GETROUTE/GETNEIGH dumps rendered from the netdev registry, the M84 FIB and the ARP cache, plus RTM_NEW/DEL for routes, neighbours and addresses. `ip`, `route`, `arp`, `netstat` enabled. IPv6 neighbours are deferred (the NDP cache has no enumeration API yet); an administrative link up/down returns EOPNOTSUPP because b1nix has no per-interface admin state to change.
-- [x] `done` **VT switching / console fonts** — `kernel/dev/vt.c`: six virtual terminals on `/dev/tty0../dev/tty6` with VT_ACTIVATE/WAITACTIVE/OPENQRY/DISALLOCATE/GETSTATE/SETMODE and KDSETMODE/KDGKBMODE, a replaceable console face behind PIO_FONT/GIO_FONT/KDFONTOP, and a real keysym table the PS/2 driver translates through so KDSKBENT/KDGKBENT (`loadkmap`/`dumpkmap`) change what keys produce. Alt+Fn switches.
-- [x] `done` **loop devices** — `loop_info64` with the backing file name, `lo_offset`/`lo_sizelimit`, a write path, read-only following the descriptor, and `/dev/`-prefixed mount sources, so `losetup` and `mount -o loop` both work.
-- [x] `done` **fuller `/proc`** — `/proc/<pid>/fd/N` readlinks to a file's full path instead of its basename, and `maps` labels `[heap]`/`[stack]`. `lsof`, `fuser`, `pmap` enabled.
-- [x] `done` **syslog / `/proc/kmsg`** — `kernel/dev/kmsg.c`: a structured record ring with sequence numbers, timestamps and priorities behind `/dev/kmsg`, `/proc/kmsg` and `syslog(2)`. `syslogd`, `klogd`, `logread`, `logger` enabled.
-- [x] `done` **inotify** — the M73 core plus IN_MOVED_FROM/IN_MOVED_TO with a shared cookie, IN_ATTRIB on chmod/chown/utimes, IN_DELETE_SELF, and the IN_MASK_ADD constant fixed. `inotifyd` enabled.
-- [x] `done` **RTC + watchdog ioctls** — `/dev/rtc0` reads and writes the CMOS clock (century register, BCD and 12-hour encodings) with RTC_RD_TIME/RTC_SET_TIME/RTC_ALM_*/RTC_WKALM_*/RTC_IRQP_*; `/dev/watchdog` is a software watchdog with the WDIOC_* interface and a deadline that really resets the machine. `hwclock`, `rtcwake`, `watchdog` enabled.
-- [x] `done` **i2c** — `/dev/i2c-0` on the PIIX4/ICH9 SMBus host controller, with I2C_SLAVE/I2C_FUNCS/I2C_SMBUS. The node exists only when a controller was probed, and I2C_FUNCS declines to claim raw-I2C support the silicon cannot deliver, so `i2ctransfer` reports the limit instead of misbehaving.
-- [ ] `planned` **MTD/UBI** — `flash*`, `nandwrite`, `ubi*`. Only worth it if b1nix ever targets flash storage.
-- [x] `done` **BusyBox modutils** — `insmod`, `rmmod`, `lsmod`, `modprobe`, `modinfo` and `depmod` are built and drive the real M95/M96 loader through `init_module`/`finit_module`/`delete_module`. The earlier note that this loader does not implement that ABI was wrong: it does (native 243/245/244 and the Linux numbers 175/313/176). See the M95 entry for the index layout the handover needed.
-- [x] `done` Loop devices close out three defects found behind the empty `lo_file_name`: the name was never stored because `vfs_fd_abspath()` returns a path *length*, not 0, on success; loop I/O went straight to `inode->read_cb`/`write_cb` and so bypassed the backing file's page cache (a write through `/dev/loopN` was invisible to a subsequent read of the file); and `LOOP_CLR_FD` cleared the association before flushing, dropping every dirty block on detach. Loop I/O now goes through the same page-cache path `read()`/`write()` take, and `fsync(/dev/loopN)` continues into the backing file through a new `block_device->flush`.
-- [x] `done` A device node backed by a `block_device` now stats as `S_IFBLK` instead of `S_IFCHR`, which is what BusyBox `losetup` (and anything else keying on `S_ISBLK`) requires of its target.
-- [x] `done` The `SIOCGIF*` ioctls honour `ifr_name` instead of always answering for the active interface, so with two NICs registered an address, netmask, MAC and ifindex fetched through them all describe the same interface — and agree with what `RTM_GETADDR` reports. An unknown name is `ENODEV`; an interface with no L3 configuration is `EADDRNOTAVAIL` rather than a borrowed address, and the invented /24 netmask fallback is gone.
-- [x] `done` IPv6 neighbours: `ndp.ko` publishes `neigh_dump`/`neigh_set`/`neigh_del` through the `struct net_proto` registry, so `RTM_GETNEIGH`/`NEWNEIGH`/`DELNEIGH` administer the real NDP cache (permanent entries survive a neighbour advertisement, exactly as in the ARP cache). Without the module loaded the dispatchers still report `EAFNOSUPPORT` — an honest "this kernel has no IPv6 neighbour cache", not an empty table.
-- [x] `done` `ip link set <if> up/down` and `SIOCSIFFLAGS` change real per-interface administrative state: a down interface transmits nothing, drops what it receives, is never chosen as the active L3 interface, and hands its address off to another interface (or leaves the stack with none). `IFF_UP` in the RTM_GETLINK dump and in `SIOCGIFFLAGS` reflects it. Both paths require `CAP_NET_ADMIN`.
-- [ ] `wontfix` `i2ctransfer` is unsupported, and not a gap to close in software: a PIIX4/ICH9 SMBus host controller physically cannot issue raw I2C messages, so `I2C_FUNCS` declines to advertise `I2C_FUNC_I2C` rather than accept transfers it would have to fake. QEMU's bus also has no slave, so `i2cdetect` sees an empty bus. It would take a different controller, not different code.
-- [x] `done` `PIO_FONTX`/`GIO_FONTX` work: `struct consolefontdesc` has no width field, so the 8-pixel renderer can honour it exactly. `GIO_FONTX` reports the real glyph count and fails with `ENOMEM` when the caller's buffer is short, so a caller can size its buffer by asking twice.
-- [x] `done` Every open of `/dev/kmsg` and `/proc/kmsg` gets its own read cursor: reading a record no longer consumes it for the other readers. The general mechanism is a new `inode->open_cb`, which lets any device attach per-descriptor state and its own file ops — a device node previously only ever saw the `struct vfs_node` shared by every open. `lseek(SEEK_SET)`/`SEEK_END` move a descriptor to the oldest/newest record.
-- [ ] `open` MTD/UBI applets stay unbuilt.
+- [x] Add netlink route sockets: link, address, route and neighbour queries.
+- [x] Add virtual terminals, console fonts and keymaps.
+- [x] Add loop devices with offsets, size limits and a write path.
+- [x] Extend `/proc`: full paths in `fd/`, named map regions, per-process memory.
+- [x] Add a structured kernel log ring with syslog, `/dev/kmsg` and `/proc/kmsg`.
+- [x] Add inotify move cookies, attribute changes and self deletion.
+- [x] Add RTC read and write plus watchdog ioctls with a real reset deadline.
+- [x] Add SMBus i2c on the host controller, reporting what it cannot do.
+- [x] Give block-backed device nodes `S_IFBLK`, and honour the interface name in `SIOCGIF*`.
+- [x] Administer IPv6 neighbours and interface up/down state for real.
+- [x] Give every `/dev/kmsg` reader its own cursor.
+- [ ] MTD and UBI applets stay unbuilt.
 
 ## M108: Hand ownership of base tools to BusyBox
 
-Alpine's own init is BusyBox, and once packages come from Alpine the b1nix-specific
-replacements become the odd ones out. Retire them in favour of the multicall ELF.
+- [x] Make `su`, `passwd`, `login`, `id`, `whoami` and `groups` BusyBox applets and delete the local ELFs.
+- [x] Keep the setuid bit on a second copy of the multicall binary, reached by three names only.
+- [x] Write and read one shadow format end to end: SHA-512, shared with PAM.
+- [x] Boot BusyBox init as PID 1 from `/sbin/init`, with OpenRC driving the runlevels.
+- [x] Exercise the inittab getty respawn: kill it and require PID 1 to replace it.
+- [x] Delete three forged init markers from the smoke hook and let the real paths report.
+- [x] Fix `execve` to publish post-exec credentials in the auxv and refresh capabilities and fsuid.
+- [x] Group `userspace/bin` by purpose.
+- [ ] Confirm `/etc/shadow` locking under concurrent password changes.
 
-- [x] `done` `su` and `passwd` are BusyBox applets. The dedicated ELFs (`userspace/bin/{su,passwd}.c`) are deleted. The setuid bit moved off `/bin/*` onto a second copy of the multicall ELF, `/opt/busybox/bin/busybox-suid` (mode 4755 root), which only `su`/`passwd`/`login` symlink to; `CONFIG_FEATURE_SUID=y` makes libbb drop euid for every other applet.
-- [x] `done` One shadow format end to end: BusyBox writes SHA-512 `$6$` (`CONFIG_FEATURE_DEFAULT_PASSWD_ALGO`), which is exactly what `pam_unix.so` (M105) reads — a password changed with the applet authenticates through PAM and vice versa, verified by `M108-SMOKE`.
-- [x] `done` **BusyBox init is PID 1**, exactly as on Alpine: the kernel's default init is `/sbin/init`, a symlink onto the multicall ELF, and `/etc/inittab` hands every runlevel to OpenRC (`openrc sysinit`/`boot`/`default`), which stays the high-level init owning the service graph. Every smoke instance boots that way with no `init=` at all; the `init` instance (was `bbinit`) adds the checks only PID 1 can answer. `openrc-init` remains a real bootable PID 1 through `init=/sbin/openrc-init` — it owns the `/run/openrc/init.ctl` channel BusyBox init has no equivalent of — and the `openrc` instance still proves it end to end.
-- [x] `done` The BusyBox-init instance's `getty` respawn is exercised: `M108-SMOKE: ok init-respawns-getty` finds the running getty in `/proc`, kills it, and requires PID 1 to put a **different** pid running the same binary in its place. The getty moved from `ttyS0` to `tty1` in the same pass — a getty on the serial line claims the kernel console as its controlling terminal and takes the foreground process group from whatever is running there.
-- [x] `done` Three forged init markers deleted from `tools/ports/00-smoke.start`: it echoed `init: /sbin/openrc-init pid=1` and two `M94-INIT: ok …` lines that a shell in the default runlevel cannot know, and — worse — the `openrc-ctltest` branch printed `M94-OPENRC: ok init-fifo-present`, `/etc/init.d/killprocs start` and `reboot: powering off` and then called `poweroff -f`, forging the whole control-FIFO test *and* powering the machine off before the real path (`/etc/local.d/zz-ctltest.start` → `/etc/openrc-ctltest.sh`) could run. Those markers now come from the kernel, from the FIFO waiter and from OpenRC's own shutdown runlevel.
-- [x] `done` Kernel fix found on the way: `execve` published the *pre*-exec euid/egid and `AT_SECURE=0` in the auxv of a setuid image, so musl's ld.so would have honoured `LD_PRELOAD` in `/bin/su`. The auxv now describes the post-exec credentials.
-- [x] `done` The "deliberately NOT listed" block in `tools/configs/applet-manifest.conf` no longer mentions `su`/`passwd`; both are listed as `upstream`.
-- [x] `done` BusyBox `su` authenticates against `/etc/shadow`. The bug was in the kernel, not the applet: `execve` applied a setuid binary's `euid`/`egid` by writing them into the credential directly, without refreshing the capability set or `fsuid`. `/bin/su` therefore ran with root's euid but the caller's capabilities (so `initgroups()` → `EPERM`) and the caller's `fsuid` (so reading 0400-root `/etc/shadow` → `EACCES`). Both now follow the effective ids on every exec.
-- [x] `done` The account's login shell `/bin/m108shell` is an ELF rather than a shebang script, so su's login `argv[0]` (`-m108shell`) survives the exec and the smoke can assert it. A script's `$0` is its own path — the shebang exec replaces the caller's `argv[0]` on b1nix exactly as on Linux, so the old assertion could never have held.
-- [x] `done` `id`, `whoami` and `groups` are BusyBox applets; their dedicated ELFs are deleted. The manifest already called `id`/`whoami` upstream while `userspace/Makefile` excluded them from the symlink loop, so the smoke had been asserting against the native binaries under names BusyBox was supposed to own — `BB-W8: ok id-is-busybox` now proves the name really resolves to the multicall ELF. `adduser`/`deluser`/`addgroup`/`delgroup` get `/bin` entries too.
-- [x] `done` The handover is complete: every dedicated ELF that duplicated a BusyBox applet is deleted — `chmod`, `chown`, `id`, `whoami`, `groups`, `halt`, `setfattr` and `meminfo` — and `CONFIG_HALT`/`POWEROFF`/`REBOOT`/`SETFATTR` are enabled to cover them. The account tools moved to BusyBox's own names (`adduser`/`deluser`/`addgroup`/`delgroup`); `useradd`/`userdel`/`groupadd` simply no longer exist, as on a stock BusyBox system. `userspace/Makefile`'s symlink loop has no exception list left, so no name the manifest claims is shadowed by a native binary.
-- [x] `done` `userspace/bin` is grouped by purpose — `smoke/`, `gfx/`, `helpers/`, `tools/`, `gui/`, `compiler/` (see `userspace/bin/README.md`). Build rules look a source up by name, so a program can change category without touching a rule. Three committed build artefacts and an unused duplicate header were dropped in the same pass.
-- [ ] `open` BusyBox `passwd` locks `/etc/shadow` with `fcntl(F_SETLK)` + `link()`; whether b1nix's ext4 honours both is unconfirmed, so a concurrent password change is not known to be safe.
+## M109: Alpine applet parity
 
-## M109: Alpine applet parity — the last 50
-
-`tools/configs/busybox-1.38.0.config` was compared against Alpine's own
-`busyboxconfig` for the same BusyBox 1.38.0 (`aports/main/busybox`). Alpine
-builds 321 applets, b1nix built 240; the parity pass took b1nix to 283 and
-proved each one through `/bin` in `BB-W10`. What follows is the remainder,
-grouped by the kernel subsystem each one is actually waiting on — every line is
-a piece of kernel work, not a config flag.
-
-- [ ] `planned` **AF_PACKET** — `udhcpc`, `udhcpc6`, `zcip`, `ether-wake`, `nameif`. A raw link-layer socket family; the DHCP client in the kernel covers the common case today, but nothing in userspace can send or receive a raw frame.
-- [ ] `planned` **Namespaces** — `unshare`, `nsenter`. User/PID/mount/net namespaces; also what the Chromium sandbox wants (see M62).
-- [ ] `planned` **`pivot_root(2)`** — `pivot_root`, `switch_root`. The initramfs-to-rootfs handover currently happens inside the kernel, so the syscall was never needed.
-- [ ] `planned` **Virtual and stacked network devices** — `brctl` (bridge), `vconfig` (VLAN), `ifenslave` (bonding), `tunctl` (tun/tap), `slattach` (SLIP), `ip tunnel`, `ip rule` (policy routing). Each is a device class the stack does not have; `ip rule` additionally needs multiple FIB tables.
-- [ ] `planned` **Inode attribute flags (`FS_IOC_GETFLAGS`/`SETFLAGS`)** — `chattr`, `lsattr`. ext4 has the on-disk field; nothing reads or writes it.
-- [ ] `planned` **Discard/TRIM** — `fstrim`, `blkdiscard`. Needs `FITRIM` and `BLKDISCARD` plus a discard path through the block layer to the driver.
-- [ ] `planned` **I/O priorities (`ioprio_set`/`ioprio_get`)** — `ionice`. The block layer has one queue and no per-task priority.
-- [ ] `planned` **uevent/hotplug channel** — `mdev`. `/dev` is populated by the kernel at registration time; there is no netlink uevent socket for a userspace device manager to listen on.
-- [ ] `planned` **blkid database** — `findfs`. Needs filesystem UUID/LABEL probing exposed to userspace.
-- [ ] `planned` **CD-ROM ioctls** — `eject`, `volname`. No ATAPI packet path.
-- [ ] `planned` **MTD** — `nanddump`, `nandwrite` (and the `flash*`/`ubi*` set from M107). Only worth it if b1nix ever targets flash storage.
-- [ ] `planned` **Assorted single-device gaps** — `rfkill` (no rfkill subsystem), `raidautorun` (no md), `nbd-client` (no network block device), `fdflush` (no floppy), `setserial` (serial port config ioctls), `setconsole` (`TIOCCONS`), `readahead(2)`, `rdev`, `fatattr`.
-- [x] `done` `who`, `cpio` and `shred` all pass. `who` was not built at all — `CONFIG_WHO=y` needs `CONFIG_FEATURE_UTMP`, which was off; `cpio -t` lists an archive's member names (`f`), not the `./f` the probe grepped for; and `shred` draws from `/dev/urandom`, which **did not exist** — b1nix had `getrandom(2)` but no random device node. `/dev/urandom`, `/dev/random` and `/dev/zero` now exist — the first two on the same CSPRNG as `getrandom(2)`, all three re-registered after the root mount like every other early-boot node. `/dev/zero` was missing outright, which nothing had noticed because nothing had asked for it by name.
-- [ ] `open` `M52-GFX: fail glsl (present)` was seen once in the parity run — `b1gui_present` failing after a clean compile/link/render. Not reproduced since, and no change in this work touches the present path; if it returns, start at displayd's frame acknowledgement.
-- [ ] `planned` **SMTP** — `sendmail`. `makemime`/`reformime` are enabled (they are pure text tools); `sendmail` needs a server to talk to before shipping it means anything.
+- [x] Build 283 of Alpine's 321 applets and prove each one through `/bin`.
+- [x] Add `/dev/zero`, `/dev/urandom` and `/dev/random`, unblocking `shred`, `who` and `cpio`.
+- [ ] `planned` Add `AF_PACKET` for the DHCP clients and raw-frame tools.
+- [ ] `planned` Add namespaces for `unshare` and `nsenter`.
+- [ ] `planned` Add `pivot_root(2)` and `switch_root`.
+- [ ] `planned` Add bridge, VLAN, bonding and tunnel devices.
+- [ ] `planned` Add inode attribute flags for `chattr` and `lsattr`.
+- [ ] `planned` Add discard so `fstrim` and `blkdiscard` work.
+- [ ] `planned` Add I/O priorities for `ionice`.
+- [ ] `planned` Add a uevent channel for `mdev`.
+- [ ] `planned` Add filesystem UUID and label probing for `findfs`.
+- [ ] `planned` Add the remaining single-device gaps: CD-ROM, MTD, rfkill, md, nbd, floppy, serial config.
+- [ ] `wontfix` `i2ctransfer` needs raw I2C an SMBus controller cannot issue.
