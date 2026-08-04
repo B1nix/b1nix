@@ -34,12 +34,27 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define MODDIR "/lib/modules"
-
 static int failures;
+
+/* /lib/modules/<uname -r>/<file>: the release subdirectory is where BusyBox's
+ * modprobe, modinfo and depmod look, and where the kernel's own
+ * request_module() reads modules.dep/modules.alias from. */
+static const char *modpath(const char *file) {
+  static char buf[192];
+  struct utsname u;
+  if (uname(&u) != 0)
+    u.release[0] = '\0';
+  if (file)
+    snprintf(buf, sizeof(buf), "/lib/modules/%s/%s", u.release, file);
+  else
+    snprintf(buf, sizeof(buf), "/lib/modules/%s", u.release);
+  return buf;
+}
+
 static void ok(const char *n) { printf("M96-SMOKE: ok %s\n", n); }
 static void fail(const char *n, const char *why) {
   printf("M96-SMOKE: FAIL %s (%s)\n", n, why);
@@ -168,6 +183,29 @@ static int index_lookup(const char *file, const char *key, char *out,
   return found;
 }
 
+/* modules.alias is depmod's own "alias <pattern> <module>" — a different shape
+ * from modules.dep, so it gets its own reader. */
+static int alias_lookup(const char *file, const char *alias, char *out,
+                        size_t cap) {
+  FILE *f = fopen(file, "r");
+  if (!f)
+    return -1;
+  char line[512];
+  int found = -1;
+  while (fgets(line, sizeof(line), f)) {
+    char pat[128], mod[128];
+    if (sscanf(line, "alias %127s %127s", pat, mod) != 2)
+      continue;
+    if (strcmp(pat, alias) != 0)
+      continue;
+    snprintf(out, cap, "%s", mod);
+    found = 0;
+    break;
+  }
+  fclose(f);
+  return found;
+}
+
 /* ── tests ───────────────────────────────────────────────────────────────── */
 
 static void t_proto_modules(void) {
@@ -280,7 +318,7 @@ static void t_param_insmod(void) {
     fail("param-insmod", "could not unload ntp");
     return;
   }
-  if (insmod_path(MODDIR "/ntp.ko", "ntp_server_name=time.b1nix.test") != 0) {
+  if (insmod_path(modpath("ntp.ko"), "ntp_server_name=time.b1nix.test") != 0) {
     fail("param-insmod", "reload with a parameter failed");
     return;
   }
@@ -294,7 +332,7 @@ static void t_param_insmod(void) {
     return;
   }
   /* Put the module back the way it was. */
-  if (rmmod("ntp") != 0 || insmod_path(MODDIR "/ntp.ko", "") != 0) {
+  if (rmmod("ntp") != 0 || insmod_path(modpath("ntp.ko"), "") != 0) {
     fail("param-insmod", "could not restore ntp");
     return;
   }
@@ -311,7 +349,7 @@ static void t_param_reject(void) {
     return;
   }
   errno = 0;
-  if (insmod_path(MODDIR "/ntp.ko", "no_such_param=1") == 0) {
+  if (insmod_path(modpath("ntp.ko"), "no_such_param=1") == 0) {
     fail("param-reject", "an unknown parameter was accepted");
     return;
   }
@@ -323,7 +361,7 @@ static void t_param_reject(void) {
     fail("param-reject", "the module stayed loaded after a rejected parameter");
     return;
   }
-  if (insmod_path(MODDIR "/ntp.ko", "") != 0) {
+  if (insmod_path(modpath("ntp.ko"), "") != 0) {
     fail("param-reject", "could not reload ntp");
     return;
   }
@@ -332,7 +370,7 @@ static void t_param_reject(void) {
 
 static void t_modules_dep(void) {
   char deps[256];
-  if (index_lookup(MODDIR "/modules.dep", "ndp", deps, sizeof(deps)) != 0) {
+  if (index_lookup(modpath("modules.dep"), "ndp.ko", deps, sizeof(deps)) != 0) {
     fail("modules-dep", "ndp has no modules.dep entry");
     return;
   }
@@ -341,7 +379,7 @@ static void t_modules_dep(void) {
     return;
   }
   char none[256];
-  if (index_lookup(MODDIR "/modules.dep", "ipv6", none, sizeof(none)) != 0) {
+  if (index_lookup(modpath("modules.dep"), "ipv6.ko", none, sizeof(none)) != 0) {
     fail("modules-dep", "ipv6 has no modules.dep entry");
     return;
   }
@@ -362,7 +400,7 @@ static void t_modules_dep(void) {
 static void t_modprobe_alias(void) {
   /* "fs-ntfs3" is an alias, not a module name. */
   char target[64];
-  if (index_lookup(MODDIR "/modules.alias", "fs-ntfs3", target,
+  if (alias_lookup(modpath("modules.alias"), "fs-ntfs3", target,
                    sizeof(target)) != 0) {
     fail("modprobe-alias", "alias missing from modules.alias");
     return;

@@ -162,7 +162,10 @@ with open(f, 'r+b') as fh:
     MUSL_LINK_DIR="/tmp/b1nix-musl-link-$$"
     mkdir -p "$MUSL_LINK_DIR"
     if [ ! -f "$MUSL_LINK_DIR/$MUSL_LDSONAME" ]; then
-      ln -sf "$MUSL_SRC_BUILD/lib/libc.so" "$MUSL_LINK_DIR/$MUSL_LDSONAME"
+      # $MUSL_LIBSO, not the source build tree: that tree is deleted by a clean
+      # while the installed copy survives, and a dangling symlink here fails the
+      # link with "unable to find library -l:ld-musl-x86_64.so.1".
+      ln -sf "$MUSL_LIBSO" "$MUSL_LINK_DIR/$MUSL_LDSONAME"
     fi
     MUSL_SO="$MUSL_LINK_DIR/$MUSL_LDSONAME"
 

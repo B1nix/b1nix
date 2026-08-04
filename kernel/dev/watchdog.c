@@ -195,14 +195,32 @@ static int wd_ioctl(struct vfs_node *node, u64 request, void *arg) {
   }
 }
 
-/* Opening the device arms it; the VFS has no per-device open hook, so the arm
- * happens on the first write/ioctl instead — which is what every watchdog
- * daemon does immediately after opening. Closing with the magic 'V' pending
- * disarms. */
-static void wd_release(struct vfs_node *node) {
-  (void)node;
+/* Opening the device arms it; the arm happens on the first write/ioctl — which
+ * is what every watchdog daemon does immediately after opening. Closing with
+ * the magic 'V' pending disarms.
+ *
+ * The disarm hangs off the *handle*, not the inode: inode->release_cb only runs
+ * when a node is deleted and its last reference goes away, which never happens
+ * to a /dev node created at boot. So the magic close silently did nothing, and
+ * a process that opened the watchdog, set a timeout and closed it cleanly still
+ * reset the machine one timeout later — long after it had exited. It only went
+ * unnoticed because a fast host finished the rest of the test run inside that
+ * window. */
+static void wd_handle_release(struct vfs_handle *h) {
   if (g_expect_close)
     wd_disarm();
+  if (h->node) {
+    vfs_node_put(h->node);
+    h->node = 0;
+  }
+}
+
+static struct vfs_file_ops wd_file_ops;
+
+static int wd_open(struct vfs_node *node, struct vfs_handle *h) {
+  (void)node;
+  h->ops = &wd_file_ops;
+  return 0;
 }
 
 void watchdog_register_nodes(void) {
@@ -213,15 +231,21 @@ void watchdog_register_nodes(void) {
   n->inode->read_cb = wd_read;
   n->inode->write_cb = wd_write;
   n->inode->ioctl_cb = wd_ioctl;
-  n->inode->release_cb = wd_release;
+  n->inode->open_cb = wd_open;
   struct vfs_node *n0 = vfs_add_node("/dev/watchdog0", VFS_DEVICE, 0, 0, 0);
   if (n0 && !IS_ERR(n0)) {
     n0->inode->mode = 0600;
     n0->inode->read_cb = wd_read;
     n0->inode->write_cb = wd_write;
     n0->inode->ioctl_cb = wd_ioctl;
-    n0->inode->release_cb = wd_release;
+    n0->inode->open_cb = wd_open;
   }
 }
 
-void watchdog_init(void) { watchdog_register_nodes(); }
+void watchdog_init(void) {
+  /* The device keeps the generic node read/write/poll behaviour and adds only
+   * the per-descriptor release that honours the magic close. */
+  wd_file_ops = node_file_ops;
+  wd_file_ops.release = wd_handle_release;
+  watchdog_register_nodes();
+}

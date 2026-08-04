@@ -459,6 +459,7 @@ MODULE_LICENSE("MIT");
 MODULE_AUTHOR("b1nix");
 MODULE_DESCRIPTION("IPv6 Neighbour Discovery and SLAAC");
 MODULE_ALIAS("net-ipv6-nd");
+MODULE_DEPENDS("ipv6");
 
 static void ndp_module_reset(void) { ndp_init(); }
 

@@ -245,11 +245,18 @@ struct vfs_node {
  * affects how /proc/filesystems labels the entry, exactly as Linux does. */
 #define VFS_FS_NODEV 0x1
 
+struct module;
+
 struct vfs_fs {
   const char *name;
   struct vfs_node *(*mount)(const char *source, u64 flags, void *data);
   int (*umount)(struct vfs_node *root_node);
   u32 flags;
+  /* Module this type came from, filled in by vfs_register_fs from the address
+   * of the descriptor itself (NULL for a built-in filesystem). Every mount
+   * holds a reference on it, so `rmmod isofs` with an ISO mounted is refused
+   * instead of freeing code the mount is still calling into. */
+  struct module *owner;
   struct vfs_fs *next;
 };
 

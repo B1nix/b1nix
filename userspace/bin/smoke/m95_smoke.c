@@ -28,6 +28,14 @@
  *                    delete a module (EPERM) and the module stays loaded.
  *   init-module      the raw init_module(2) entry point loads an image read
  *                    into this process's own memory.
+ *   fs-in-use        with a btrfs image mounted through a loop device, rmmod
+ *                    btrfs reports EBUSY and the type survives; after the
+ *                    umount the very same unload succeeds.
+ *   filesystems-nodev  /proc/filesystems marks every pseudo filesystem nodev
+ *                    and no block-backed one.
+ *   bb-modutils      the module utilities are BusyBox applets: modinfo reads a
+ *                    .ko's metadata, rmmod/insmod round-trip a real module,
+ *                    and depmod -n reproduces the shipped modules.dep.
  */
 
 #define _GNU_SOURCE
@@ -38,16 +46,32 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define MODDIR "/lib/modules"
 #define MODULE_REGION_BASE 0xffffffffc0000000ULL
 
 static int failures;
+
+/* /lib/modules/<uname -r>/<file>: the release subdirectory is where BusyBox's
+ * modprobe, modinfo and depmod look, and where the kernel's own
+ * request_module() reads modules.dep/modules.alias from. */
+static const char *modpath(const char *file) {
+  static char buf[192];
+  struct utsname u;
+  if (uname(&u) != 0)
+    u.release[0] = '\0';
+  if (file)
+    snprintf(buf, sizeof(buf), "/lib/modules/%s/%s", u.release, file);
+  else
+    snprintf(buf, sizeof(buf), "/lib/modules/%s", u.release);
+  return buf;
+}
 
 static void ok(const char *name) { printf("M95-SMOKE: ok %s\n", name); }
 static void fail(const char *name, const char *why) {
@@ -150,7 +174,7 @@ static int read_first_line(const char *path, char *out, size_t cap) {
 
 /* Names of the .ko files in /lib/modules, sorted by directory order. */
 static int list_modules(char names[][64], int max) {
-  DIR *d = opendir(MODDIR);
+  DIR *d = opendir(modpath(0));
   if (!d)
     return -1;
   int n = 0;
@@ -249,7 +273,7 @@ static void t_proc_modules(void) {
   char names[32][64];
   int nfiles = list_modules(names, 32);
   if (nfiles <= 0) {
-    fail("proc-modules", "no .ko files in " MODDIR);
+    fail("proc-modules", "no .ko files in /lib/modules/<release>");
     return;
   }
   struct modrow rows[64];
@@ -293,7 +317,7 @@ static void t_proc_modules(void) {
 
 static void t_modinfo(void) {
   size_t size = 0;
-  char *buf = slurp(MODDIR "/isofs.ko", &size);
+  char *buf = slurp(modpath("isofs.ko"), &size);
   if (!buf) {
     fail("modinfo", "cannot read isofs.ko");
     return;
@@ -395,7 +419,7 @@ static void t_rmmod_insmod(void) {
     fail("rmmod-insmod", "ntfs filesystem type survived the unload");
     return;
   }
-  if (insmod_path(MODDIR "/ntfs.ko", "") != 0) {
+  if (insmod_path(modpath("ntfs.ko"), "") != 0) {
     fail("rmmod-insmod", "reload failed");
     return;
   }
@@ -451,7 +475,7 @@ static void t_refcount(void) {
 
 static void t_dup_load(void) {
   errno = 0;
-  if (insmod_path(MODDIR "/isofs.ko", "") == 0) {
+  if (insmod_path(modpath("isofs.ko"), "") == 0) {
     fail("dup-load", "loading an already-loaded module succeeded");
     return;
   }
@@ -464,7 +488,7 @@ static void t_dup_load(void) {
 
 static void t_vermagic_reject(void) {
   size_t size = 0;
-  char *buf = slurp(MODDIR "/btrfs.ko", &size);
+  char *buf = slurp(modpath("btrfs.ko"), &size);
   if (!buf) {
     fail("vermagic-reject", "cannot read btrfs.ko");
     return;
@@ -503,7 +527,7 @@ static void t_vermagic_reject(void) {
   free(buf);
   /* The intact original must still load, proving the rejection was about the
    * corrupted byte and not about the module. */
-  if (insmod_path(MODDIR "/btrfs.ko", "") != 0) {
+  if (insmod_path(modpath("btrfs.ko"), "") != 0) {
     fail("vermagic-reject", "the intact module no longer loads");
     return;
   }
@@ -519,7 +543,7 @@ static void t_init_module(void) {
    * not from a descriptor. Unload isofs, load it back this way, and check the
    * filesystem type reappears. */
   size_t size = 0;
-  char *buf = slurp(MODDIR "/isofs.ko", &size);
+  char *buf = slurp(modpath("isofs.ko"), &size);
   if (!buf) {
     fail("init-module", "cannot read isofs.ko");
     return;
@@ -590,6 +614,248 @@ static void t_unpriv(void) {
   ok("unpriv");
 }
 
+/* A mounted filesystem pins the module that provides it. Built by hand: the
+ * btrfs mount path only needs the superblock magic at BTRFS_SUPER_INFO_OFFSET,
+ * so a sparse file plus eight bytes is a mountable image. */
+#define BTRFS_IMG   "/tmp/m95-btrfs.img"
+#define BTRFS_MNT   "/tmp/m95-btrfs-mnt"
+#define BTRFS_SB_AT (65536 + 0x40)
+
+#define LOOP_SET_FD       0x4C00
+#define LOOP_CLR_FD       0x4C01
+#define LOOP_CTL_GET_FREE 0x4C82
+
+static void t_fs_in_use(void) {
+  int img = open(BTRFS_IMG, O_RDWR | O_CREAT | O_TRUNC, 0644);
+  if (img < 0) {
+    fail("fs-in-use", "cannot create the backing file");
+    return;
+  }
+  if (ftruncate(img, 256 * 1024) != 0 ||
+      pwrite(img, "_BHRfS_M", 8, BTRFS_SB_AT) != 8) {
+    fail("fs-in-use", "cannot write the superblock magic");
+    close(img);
+    return;
+  }
+
+  int ctl = open("/dev/loop-control", O_RDWR);
+  int idx = ctl >= 0 ? ioctl(ctl, LOOP_CTL_GET_FREE, 0) : -1;
+  if (ctl >= 0)
+    close(ctl);
+  if (idx < 0) {
+    fail("fs-in-use", "no free loop device");
+    close(img);
+    return;
+  }
+  char dev[32];
+  snprintf(dev, sizeof(dev), "/dev/loop%d", idx);
+  int loop = open(dev, O_RDWR);
+  if (loop < 0 || ioctl(loop, LOOP_SET_FD, img) != 0) {
+    fail("fs-in-use", "LOOP_SET_FD failed");
+    if (loop >= 0)
+      close(loop);
+    close(img);
+    return;
+  }
+  close(img);
+
+  mkdir(BTRFS_MNT, 0755);
+  if (mount(dev, BTRFS_MNT, "btrfs", 0, NULL) != 0) {
+    fail("fs-in-use", "mounting the loop image as btrfs failed");
+    goto out_loop;
+  }
+
+  /* The unload must be refused while the mount is live — the module's text is
+   * what every operation on that mount calls into. */
+  errno = 0;
+  if (rmmod("btrfs") == 0) {
+    fail("fs-in-use", "btrfs unloaded with one of its filesystems mounted");
+    umount(BTRFS_MNT);
+    goto out_loop;
+  }
+  if (errno != EBUSY) {
+    fail("fs-in-use", "unload of a mounted filesystem did not report EBUSY");
+    umount(BTRFS_MNT);
+    goto out_loop;
+  }
+  if (!file_contains_word("/proc/filesystems", "btrfs")) {
+    fail("fs-in-use", "the filesystem type went away anyway");
+    umount(BTRFS_MNT);
+    goto out_loop;
+  }
+
+  if (umount(BTRFS_MNT) != 0) {
+    fail("fs-in-use", "umount failed");
+    goto out_loop;
+  }
+  /* ... and the reference is given back, so the same unload now works. */
+  if (rmmod("btrfs") != 0) {
+    fail("fs-in-use", "btrfs still busy after umount");
+    goto out_loop;
+  }
+  if (insmod_path(modpath("btrfs.ko"), "") != 0) {
+    fail("fs-in-use", "reload failed");
+    goto out_loop;
+  }
+  ok("fs-in-use");
+
+out_loop:
+  ioctl(loop, LOOP_CLR_FD, 0);
+  close(loop);
+  rmdir(BTRFS_MNT);
+  unlink(BTRFS_IMG);
+}
+
+/* /proc/filesystems labels a type "nodev" exactly when it needs no block
+ * device. A pseudo filesystem that is not labelled would send anything reading
+ * this file (mount(8) picking a type for a source-less mount) down the wrong
+ * path, and a block filesystem that is labelled is the same mistake inverted. */
+static void t_filesystems_nodev(void) {
+  static const char *pseudo[] = {"proc", "procfs", "sysfs",
+                                 "tmpfs", "ramfs", "devtmpfs"};
+  static const char *blockfs[] = {"ext2", "ext4", "btrfs", "iso9660"};
+  FILE *f = fopen("/proc/filesystems", "r");
+  if (!f) {
+    fail("filesystems-nodev", "cannot read /proc/filesystems");
+    return;
+  }
+  char line[256];
+  int seen_pseudo = 0, seen_block = 0;
+  while (fgets(line, sizeof(line), f)) {
+    char name[128];
+    int nodev = (strncmp(line, "nodev", 5) == 0);
+    if (sscanf(line, nodev ? "nodev %127s" : "%127s", name) != 1)
+      continue;
+    for (unsigned i = 0; i < sizeof(pseudo) / sizeof(pseudo[0]); i++) {
+      if (strcmp(name, pseudo[i]) != 0)
+        continue;
+      seen_pseudo++;
+      if (!nodev) {
+        fclose(f);
+        fail("filesystems-nodev", "a pseudo filesystem is not marked nodev");
+        return;
+      }
+    }
+    for (unsigned i = 0; i < sizeof(blockfs) / sizeof(blockfs[0]); i++) {
+      if (strcmp(name, blockfs[i]) != 0)
+        continue;
+      seen_block++;
+      if (nodev) {
+        fclose(f);
+        fail("filesystems-nodev", "a block filesystem is marked nodev");
+        return;
+      }
+    }
+  }
+  fclose(f);
+  if (seen_pseudo < (int)(sizeof(pseudo) / sizeof(pseudo[0])) ||
+      seen_block < (int)(sizeof(blockfs) / sizeof(blockfs[0]))) {
+    fail("filesystems-nodev", "a known filesystem type is missing from the list");
+    return;
+  }
+  ok("filesystems-nodev");
+}
+
+/* Run a command, capture its stdout, return its exit status (or -1). */
+static int capture(const char *path, char *const argv[], char *out,
+                   size_t cap) {
+  int fds[2];
+  if (pipe(fds) != 0)
+    return -1;
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return -1;
+  }
+  if (pid == 0) {
+    close(fds[0]);
+    dup2(fds[1], 1);
+    dup2(fds[1], 2);
+    close(fds[1]);
+    execv(path, argv);
+    _exit(127);
+  }
+  close(fds[1]);
+  size_t got = 0;
+  ssize_t r;
+  while (got < cap - 1 && (r = read(fds[0], out + got, cap - 1 - got)) > 0)
+    got += (size_t)r;
+  out[got] = '\0';
+  close(fds[0]);
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status))
+    return -1;
+  return WEXITSTATUS(status);
+}
+
+/* The module utilities are BusyBox applets now, not a b1nix-specific /bin/kmod:
+ * they speak the real init_module(2)/delete_module(2) ABI and read the same
+ * /lib/modules/<release> index the kernel does. Proving that means running
+ * them, not just checking that the names exist. */
+static void t_bb_modutils(void) {
+  char link[128];
+  ssize_t n = readlink("/bin/insmod", link, sizeof(link) - 1);
+  if (n <= 0) {
+    fail("bb-modutils", "/bin/insmod is not a symlink to the multicall ELF");
+    return;
+  }
+  link[n] = '\0';
+  if (strstr(link, "busybox") == 0) {
+    fail("bb-modutils", "/bin/insmod does not resolve to BusyBox");
+    return;
+  }
+
+  char out[4096];
+  /* modinfo reads the .ko on disk — it must find it under the release
+   * directory and report the vermagic the running kernel stamped. */
+  char kopath[192];
+  snprintf(kopath, sizeof(kopath), "%s", modpath("btrfs.ko"));
+  char *const mi[] = {(char *)"modinfo", kopath, 0};
+  if (capture("/bin/modinfo", mi, out, sizeof(out)) != 0 ||
+      strstr(out, "btrfs") == 0 || strstr(out, "vermagic") == 0) {
+    fail("bb-modutils", "modinfo did not report the module's own metadata");
+    return;
+  }
+
+  /* rmmod / insmod round-trip through the applets. */
+  char *const rm[] = {(char *)"rmmod", (char *)"btrfs", 0};
+  if (capture("/bin/rmmod", rm, out, sizeof(out)) != 0) {
+    fail("bb-modutils", "rmmod failed");
+    return;
+  }
+  struct modrow rows[64];
+  int rn = read_modules(rows, 64);
+  if (rn > 0 && find_mod(rows, rn, "btrfs")) {
+    fail("bb-modutils", "the module survived rmmod");
+    return;
+  }
+  char *const in[] = {(char *)"insmod", kopath, 0};
+  if (capture("/bin/insmod", in, out, sizeof(out)) != 0) {
+    fail("bb-modutils", "insmod failed");
+    return;
+  }
+  rn = read_modules(rows, 64);
+  if (rn <= 0 || !find_mod(rows, rn, "btrfs")) {
+    fail("bb-modutils", "insmod did not load the module back");
+    return;
+  }
+
+  /* depmod -n prints the index it would generate. It must agree with the one
+   * that shipped — otherwise running depmod on the target would quietly
+   * rewrite modules.dep into something modprobe reads differently. */
+  char *const dm[] = {(char *)"depmod", (char *)"-n", 0};
+  if (capture("/sbin/depmod", dm, out, sizeof(out)) != 0) {
+    fail("bb-modutils", "depmod -n failed");
+    return;
+  }
+  if (strstr(out, "ndp.ko: ipv6.ko") == 0) {
+    fail("bb-modutils", "depmod disagrees with the shipped modules.dep");
+    return;
+  }
+  ok("bb-modutils");
+}
+
 int main(void) {
   t_proc_modules();
   t_modinfo();
@@ -601,6 +867,9 @@ int main(void) {
   t_vermagic_reject();
   t_init_module();
   t_unpriv();
+  t_fs_in_use();
+  t_filesystems_nodev();
+  t_bb_modutils();
 
   if (failures == 0)
     printf("M95-SMOKE: done\n");

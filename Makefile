@@ -68,7 +68,10 @@ KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 INITRAMFS_NATIVE_SMOKE_INC := $(INC_DIR)/initramfs_native_smoke.inc
 # M95/M96: loadable kernel modules. Each is a relocatable ELF (.ko) built from
 # the same kernel sources with -DMODULE and shipped in the initramfs under
-# /lib/modules, together with the generated modules.dep / modules.alias.
+# /lib/modules/$(B1NIX_RELEASE), together with the generated modules.dep /
+# modules.alias. The release subdirectory is what BusyBox's modprobe/modinfo/
+# depmod expect ($(uname -r), i.e. B1NIX_VERSION_STR).
+B1NIX_RELEASE := $(shell sed -n 's/.*B1NIX_VERSION_STR "\([^"]*\)".*/\1/p' kernel/include/b1nix/version.h)
 MODULE_OUT_DIR := $(BUILD_DIR)/modules
 MODULE_NAMES := isofs ntfs btrfs hda ipv6 ndp ntp
 MODULE_KOS := $(patsubst %,$(MODULE_OUT_DIR)/%.ko,$(MODULE_NAMES))
@@ -618,10 +621,10 @@ modules: $(MODULE_KOS)
 # Packaging also runs the symbol gate: a module with a symbol neither the
 # kernel nor another module exports fails the build instead of failing insmod.
 $(INITRAMFS_MODULES_INC): $(MODULE_KOS) tools/kernel/gen_modules_initramfs.sh \
-                          kernel/module/ksyms.c
+                          kernel/module/ksyms.c kernel/include/b1nix/version.h
 	@mkdir -p $(dir $@)
 	sh tools/kernel/check-module-syms.sh $(MODULE_KOS)
-	NM='$(NM)' sh tools/kernel/gen_modules_initramfs.sh $@ $(MODULE_KOS)
+	NM='$(NM)' RELEASE='$(B1NIX_RELEASE)' sh tools/kernel/gen_modules_initramfs.sh $@ $(MODULE_KOS)
 
 # M36: only the ftrace demo TU is instrumented, so __cyg_profile hooks fire
 # there and nowhere else (global instrumentation would recurse / slow the
@@ -1589,9 +1592,9 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	@# M95: the same .ko images the initramfs carries, plus the generated
 	@# modules.dep / modules.alias, so insmod/rmmod/modprobe keep working after
 	@# the real root is mounted (which hides the initramfs).
-	@mkdir -p $(BUILD_DIR)/rootfs/lib/modules
-	@cp -f $(MODULE_KOS) $(BUILD_DIR)/rootfs/lib/modules/
-	@cp -f $(INC_DIR)/.modules-stage/modules.dep $(INC_DIR)/.modules-stage/modules.alias $(BUILD_DIR)/rootfs/lib/modules/
+	@mkdir -p $(BUILD_DIR)/rootfs/lib/modules/$(B1NIX_RELEASE)
+	@cp -f $(MODULE_KOS) $(BUILD_DIR)/rootfs/lib/modules/$(B1NIX_RELEASE)/
+	@cp -f $(INC_DIR)/.modules-stage/modules.dep $(INC_DIR)/.modules-stage/modules.alias $(BUILD_DIR)/rootfs/lib/modules/$(B1NIX_RELEASE)/
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@mkdir -p $(BUILD_DIR)/rootfs/proc $(BUILD_DIR)/rootfs/sys $(BUILD_DIR)/rootfs/mnt
 	@mkdir -p $(BUILD_DIR)/rootfs/mnt/ext1 $(BUILD_DIR)/rootfs/mnt/ext2 $(BUILD_DIR)/rootfs/mnt/ext3 $(BUILD_DIR)/rootfs/mnt/ext4 $(BUILD_DIR)/rootfs/mnt/ext4nvme
