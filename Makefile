@@ -1626,6 +1626,23 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	@mkdir -p $(BUILD_DIR)/rootfs/etc/tls-test
 	@cp -f $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem \
 	       $(TLS_TEST_DIR)/server-key.pem $(BUILD_DIR)/rootfs/etc/tls-test/
+	@# M104: public trust anchors, for talking to real repositories over HTTPS
+	@# (bpkg and curl both read /etc/ssl/certs/ca-certificates.crt — the path
+	@# build-curl.sh already configured as --with-ca-bundle). Taken from the
+	@# build host's own store rather than vendored into git, so the image never
+	@# ships a CA list that silently goes stale. B1NIX_CA_BUNDLE overrides the
+	@# search. Absent on the host, https:// simply fails with a clear error
+	@# instead of falling back to an unverified connection.
+	@mkdir -p $(BUILD_DIR)/rootfs/etc/ssl/certs
+	@CA=""; for c in $(B1NIX_CA_BUNDLE) /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do \
+		if [ -n "$$c" ] && [ -f "$$c" ]; then CA="$$c"; break; fi; \
+	done; \
+	if [ -n "$$CA" ]; then \
+		cp -f "$$CA" $(BUILD_DIR)/rootfs/etc/ssl/certs/ca-certificates.crt; \
+		echo "  CA      $$CA -> /etc/ssl/certs/ca-certificates.crt"; \
+	else \
+		echo "  CA      no host trust store found — https:// will fail in the guest"; \
+	fi
 	@# M91: Stage Mesa/Skia shared libraries into rootfs/lib/ for the dynamic linker
 	@mkdir -p $(BUILD_DIR)/rootfs/lib
 	@# Mesa install dir (softpipe/virgl build) — copy .so files and create

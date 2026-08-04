@@ -220,7 +220,28 @@ static struct vfs_pipe *pipe_pool_claim(void) {
     }
   }
   spin_unlock_irqrestore(&pipe_pool_lock, flags);
+  if (!pipe)
+    return 0;
+  /* The 64 KiB data buffer is attached to the slot on its first use and then
+   * kept: a slot is only ever re-used as a pipe, so freeing and re-allocating
+   * it per pipe() would just churn the heap. Allocated outside the pool lock —
+   * kmalloc can grow the heap, which must not happen with a spinlock held. */
+  if (!pipe->buffer) {
+    pipe->buffer = kmalloc(PIPE_BUFFER_SIZE);
+    if (!pipe->buffer) {
+      pipe->used = 0;
+      return 0;
+    }
+  }
   return pipe;
+}
+
+/* memset() on a pool slot would drop the buffer pointer with it; this clears
+ * the per-episode state and keeps the slot's buffer. */
+static void pipe_slot_reset(struct vfs_pipe *p) {
+  char *buf = p->buffer;
+  memset(p, 0, sizeof(*p));
+  p->buffer = buf;
 }
 
 int vfs_pipe(int pipefd[2]) {
@@ -233,9 +254,9 @@ int vfs_pipe(int pipefd[2]) {
   struct vfs_handle *wh = alloc_raw_handle(VFS_HANDLE_PIPE_WRITE);
   if (!wh) { vfs_handle_release(rh); pipe->used = 0; return -EMFILE; }
 
-  /* memset() blows away `used=1` we just set; restore it. lock/refcount fields
+  /* The reset blows away `used=1` we just set; restore it. lock/refcount fields
    * are also re-zeroed which is correct — they start fresh for this episode. */
-  memset(pipe, 0, sizeof(*pipe));
+  pipe_slot_reset(pipe);
   pipe->used = 1;
   pipe->readers = 1;
   pipe->writers = 1;
@@ -335,7 +356,7 @@ int vfs_fifo_open(struct vfs_node *node, int flags) {
   spin_lock_irqsave(&fifo_attach_lock, &irq);
   struct vfs_pipe *fifo = node->inode->fifo;
   if (!fifo) {
-    memset(spare, 0, sizeof(*spare));
+    pipe_slot_reset(spare);
     spare->used = 1;
     fifo = spare;
     node->inode->fifo = fifo;

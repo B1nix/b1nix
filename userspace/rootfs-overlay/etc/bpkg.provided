@@ -1,0 +1,32 @@
+# Dependency names the base b1nix image already satisfies.
+#
+# Alpine states its dependencies as virtual tokens ("so:libc.musl-x86_64.so.1",
+# "/bin/sh"), and resolving those against the index would pull in Alpine's own
+# musl and BusyBox — packages whose files are the running system's libc, dynamic
+# loader and shell. Installing them would overwrite the machine underneath the
+# process doing the installing.
+#
+# Every entry here is a dependency that is genuinely met, not one being ignored:
+# b1nix builds musl 1.2.5 (the same release Alpine v3.20 ships) and BusyBox from
+# source. A token that does NOT appear here and is not in any index is reported
+# as an unresolved dependency, not skipped silently.
+#
+# One token per line, matched exactly.
+
+# libc + dynamic loader: build/x86_64/rootfs/lib/ld-musl-x86_64.so.1 (musl 1.2.5)
+musl
+so:libc.musl-x86_64.so.1
+musl-utils
+scanelf
+ld-linux
+
+# shell + coreutils: /opt/busybox/bin/busybox, linked from /bin/sh and /bin/ash
+busybox
+busybox-binsh
+/bin/sh
+/bin/ash
+alpine-baselayout
+alpine-baselayout-data
+
+# init: BusyBox init as PID 1 with OpenRC driving the runlevels (M108)
+openrc

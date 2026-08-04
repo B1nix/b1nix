@@ -221,6 +221,26 @@ static void test_dns_parse(void) {
     marker("DNS-SMOKE: fail parse-aaaa-record\n");
   }
 
+  /* A real name, resolved through musl's resolver end to end: query out over
+   * UDP, answer back, source address matched, address returned. Three kernel
+   * bugs used to make this impossible while every packet arrived correctly —
+   * a datagram socket sent with source port 0, recvfrom reported the last
+   * send target instead of the sender, and recvmsg zero-filled msg_name
+   * (which is the one musl actually uses). Needs the SLIRP DNS at 10.0.2.3,
+   * the same external dependency the BusyBox nslookup check already has. */
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  if (getaddrinfo("dl-cdn.alpinelinux.org", "80", &hints, &res) == 0 && res) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+    if (sin->sin_addr.s_addr != 0 && sin->sin_port == htons(80))
+      marker("DNS-SMOKE: ok resolve-name\n");
+    else
+      marker("DNS-SMOKE: fail resolve-name\n");
+    freeaddrinfo(res);
+  } else {
+    marker("DNS-SMOKE: fail resolve-name\n");
+  }
+
   /* /etc/resolv.conf check */
   FILE *f = fopen("/etc/resolv.conf", "r");
   if (f) {

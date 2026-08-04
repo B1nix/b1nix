@@ -604,8 +604,22 @@ static int tar_extract(const uint8_t *data, size_t len, const char *root, struct
 }
 
 /* ------------------------------------------------------------------ */
-/* HTTP/1.1 GET over a plain TCP socket (no TLS)                       */
+/* HTTP/1.1 GET over TCP, with TLS when mbedTLS is available           */
 /* ------------------------------------------------------------------ */
+
+#ifdef B1NIX_HAVE_MBEDTLS
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/net_sockets.h>
+#include <psa/crypto.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/x509_crt.h>
+
+/* Trust anchors. Alpine's mirrors and every other real repository are HTTPS,
+ * so this file decides whether bpkg can install anything at all -- if it is
+ * missing, an https:// fetch fails loudly instead of continuing unverified. */
+#define BPKG_CA_BUNDLE "/etc/ssl/certs/ca-certificates.crt"
+#endif
 
 static int connect_host(const char *host, const char *port) {
     struct addrinfo hints, *res = NULL;
@@ -619,16 +633,24 @@ static int connect_host(const char *host, const char *port) {
     return fd;
 }
 
-/* Parses http://host[:port]/path -- that's it. https:// is rejected with a
- * clear error rather than silently falling back to plaintext: this binary
- * has no TLS linked in, so pretending to fetch an https:// URL would be
- * exactly the kind of fake pass the project's testing rules forbid. */
-static int url_parse(const char *url, char *host, size_t hostcap, char *port, size_t portcap, char *path, size_t pathcap) {
+/* Parses http[s]://host[:port]/path. Without mbedTLS linked in, https:// is
+ * rejected with a clear error rather than silently downgraded to plaintext:
+ * pretending to fetch an https:// URL would be exactly the kind of fake pass
+ * the project's testing rules forbid. */
+static int url_parse(const char *url, char *host, size_t hostcap, char *port, size_t portcap, char *path, size_t pathcap, int *is_tls) {
     const char *p;
+    const char *defport = "80";
+    if (is_tls) *is_tls = 0;
     if (strncmp(url, "http://", 7) == 0) p = url + 7;
     else if (strncmp(url, "https://", 8) == 0) {
-        fprintf(stderr, "bpkg: https:// not supported (no TLS linked into bpkg) -- use an http mirror or a local file:// index\n");
+#ifdef B1NIX_HAVE_MBEDTLS
+        p = url + 8;
+        defport = "443";
+        if (is_tls) *is_tls = 1;
+#else
+        fprintf(stderr, "bpkg: https:// not supported (this bpkg was built without mbedTLS) -- use an http mirror or a local file:// index\n");
         return -1;
+#endif
     } else { fprintf(stderr, "bpkg: unsupported URL scheme in '%s'\n", url); return -1; }
 
     const char *slash = strchr(p, '/');
@@ -645,7 +667,7 @@ static int url_parse(const char *url, char *host, size_t hostcap, char *port, si
         size_t hl = (size_t)(hostend - p);
         if (hl >= hostcap) return -1;
         memcpy(host, p, hl); host[hl] = 0;
-        snprintf(port, portcap, "80");
+        snprintf(port, portcap, "%s", defport);
     }
     if (slash) snprintf(path, pathcap, "%s", slash);
     else snprintf(path, pathcap, "/");
@@ -663,28 +685,177 @@ static void *bpkg_memmem(const void *haystack, size_t hlen, const void *needle, 
     return NULL;
 }
 
+/* One HTTP connection: a plain fd, or the same fd underneath an mbedTLS
+ * session. Everything above this point in the file (gzip, tar, sha256, index
+ * parsing) stays dependency-free -- TLS is isolated to these three calls. */
+struct conn {
+    int fd;
+#ifdef B1NIX_HAVE_MBEDTLS
+    int tls;
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_x509_crt ca;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context drbg;
+#endif
+};
+
+#ifdef B1NIX_HAVE_MBEDTLS
+static int conn_bio_send(void *ctx, const unsigned char *b, size_t n) {
+    ssize_t r = write(*(int *)ctx, b, n);
+    return r < 0 ? MBEDTLS_ERR_NET_SEND_FAILED : (int)r;
+}
+static int conn_bio_recv(void *ctx, unsigned char *b, size_t n) {
+    ssize_t r = read(*(int *)ctx, b, n);
+    return r < 0 ? MBEDTLS_ERR_NET_RECV_FAILED : (int)r;
+}
+#endif
+
+static int conn_open(struct conn *c, const char *host, const char *port, int use_tls) {
+    memset(c, 0, sizeof(*c));
+    c->fd = connect_host(host, port);
+    if (c->fd < 0) { fprintf(stderr, "bpkg: cannot connect to %s:%s\n", host, port); return -1; }
+    if (!use_tls) return 0;
+
+#ifdef B1NIX_HAVE_MBEDTLS
+    c->tls = 1;
+    /* mbedTLS 3.6 runs TLS 1.3 through PSA, and without psa_crypto_init() the
+     * handshake dies with a bare MBEDTLS_ERR_SSL_INTERNAL_ERROR (-0x6c00)
+     * that names nothing. */
+    psa_crypto_init();
+    mbedtls_ssl_init(&c->ssl);
+    mbedtls_ssl_config_init(&c->conf);
+    mbedtls_x509_crt_init(&c->ca);
+    mbedtls_entropy_init(&c->entropy);
+    mbedtls_ctr_drbg_init(&c->drbg);
+
+    int rc = mbedtls_ctr_drbg_seed(&c->drbg, mbedtls_entropy_func, &c->entropy,
+                                   (const unsigned char *)"bpkg", 4);
+    if (rc != 0) { fprintf(stderr, "bpkg: TLS RNG seed failed (-0x%04x)\n", -rc); goto fail; }
+
+    rc = mbedtls_x509_crt_parse_file(&c->ca, BPKG_CA_BUNDLE);
+    if (rc < 0) {
+        fprintf(stderr, "bpkg: cannot load trust anchors from %s (-0x%04x) -- refusing to fetch over an unverified TLS connection\n",
+                BPKG_CA_BUNDLE, -rc);
+        goto fail;
+    }
+
+    rc = mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_CLIENT,
+                                     MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    if (rc != 0) { fprintf(stderr, "bpkg: TLS config failed (-0x%04x)\n", -rc); goto fail; }
+    /* Verification is REQUIRED: a package manager that accepts any
+     * certificate is a package manager that installs anything. */
+    mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca, NULL);
+    mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->drbg);
+
+    rc = mbedtls_ssl_setup(&c->ssl, &c->conf);
+    if (rc != 0) { fprintf(stderr, "bpkg: TLS setup failed (-0x%04x)\n", -rc); goto fail; }
+    /* SNI, and the name the certificate is checked against. */
+    rc = mbedtls_ssl_set_hostname(&c->ssl, host);
+    if (rc != 0) { fprintf(stderr, "bpkg: TLS hostname failed (-0x%04x)\n", -rc); goto fail; }
+    mbedtls_ssl_set_bio(&c->ssl, &c->fd, conn_bio_send, conn_bio_recv, NULL);
+
+    while ((rc = mbedtls_ssl_handshake(&c->ssl)) != 0) {
+        if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+        fprintf(stderr, "bpkg: TLS handshake with %s failed (-0x%04x)\n", host, -rc);
+        goto fail;
+    }
+    uint32_t flags = mbedtls_ssl_get_verify_result(&c->ssl);
+    if (flags != 0) {
+        char why[512];
+        mbedtls_x509_crt_verify_info(why, sizeof(why), "  ", flags);
+        fprintf(stderr, "bpkg: certificate for %s rejected:\n%s", host, why);
+        goto fail;
+    }
+    return 0;
+fail:
+    close(c->fd);
+    c->fd = -1;
+    return -1;
+#else
+    (void)use_tls;
+    return -1;
+#endif
+}
+
+static ssize_t conn_write(struct conn *c, const void *b, size_t n) {
+#ifdef B1NIX_HAVE_MBEDTLS
+    if (c->tls) {
+        size_t done = 0;
+        while (done < n) {
+            int r = mbedtls_ssl_write(&c->ssl, (const unsigned char *)b + done, n - done);
+            if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+            if (r <= 0) return -1;
+            done += (size_t)r;
+        }
+        return (ssize_t)done;
+    }
+#endif
+    return write(c->fd, b, n);
+}
+
+static ssize_t conn_read(struct conn *c, void *b, size_t n) {
+#ifdef B1NIX_HAVE_MBEDTLS
+    if (c->tls) {
+        for (;;) {
+            int r = mbedtls_ssl_read(&c->ssl, (unsigned char *)b, n);
+            if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+            /* TLS 1.3 servers send session tickets mid-stream; mbedTLS reports
+             * each one to the caller. It is not data and not an error -- keep
+             * reading, or the response looks empty and every fetch fails. */
+            if (r == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) continue;
+            if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
+            if (r < 0) {
+                fprintf(stderr, "bpkg: TLS read failed (-0x%04x)\n", -r);
+                return -1;
+            }
+            return r;
+        }
+    }
+#endif
+    return read(c->fd, b, n);
+}
+
+static void conn_close(struct conn *c) {
+#ifdef B1NIX_HAVE_MBEDTLS
+    if (c->tls) {
+        mbedtls_ssl_close_notify(&c->ssl);
+        mbedtls_ssl_free(&c->ssl);
+        mbedtls_ssl_config_free(&c->conf);
+        mbedtls_x509_crt_free(&c->ca);
+        mbedtls_ctr_drbg_free(&c->drbg);
+        mbedtls_entropy_free(&c->entropy);
+        c->tls = 0;
+    }
+#endif
+    if (c->fd >= 0) close(c->fd);
+    c->fd = -1;
+}
+
 /* Fetches url into *out. Follows simple 30x redirects (a handful of hops). */
 static int http_fetch(const char *url, struct buf *out) {
     char cur[2048];
     snprintf(cur, sizeof(cur), "%s", url);
     for (int hop = 0; hop < 5; hop++) {
         char host[256], port[16], path[1536];
-        if (url_parse(cur, host, sizeof(host), port, sizeof(port), path, sizeof(path)) < 0) return -1;
+        int use_tls = 0;
+        if (url_parse(cur, host, sizeof(host), port, sizeof(port), path, sizeof(path), &use_tls) < 0) return -1;
 
-        int fd = connect_host(host, port);
-        if (fd < 0) { fprintf(stderr, "bpkg: cannot connect to %s:%s\n", host, port); return -1; }
+        struct conn c;
+        if (conn_open(&c, host, port, use_tls) < 0) return -1;
 
         char req[1800];
         int n = snprintf(req, sizeof(req),
                           "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: bpkg/1.0 (b1nix)\r\nConnection: close\r\nAccept: */*\r\n\r\n",
                           path, host);
-        if (write(fd, req, (size_t)n) != n) { close(fd); return -1; }
+        if (conn_write(&c, req, (size_t)n) != n) { conn_close(&c); return -1; }
 
         struct buf resp; buf_init(&resp);
         char chunk[4096];
         ssize_t r;
-        while ((r = read(fd, chunk, sizeof(chunk))) > 0) buf_append(&resp, chunk, (size_t)r);
-        close(fd);
+        while ((r = conn_read(&c, chunk, sizeof(chunk))) > 0) buf_append(&resp, chunk, (size_t)r);
+        conn_close(&c);
 
         if (resp.len < 12 || memcmp(resp.p, "HTTP/1.", 7) != 0) {
             fprintf(stderr, "bpkg: bad HTTP response from %s\n", host);
@@ -781,6 +952,29 @@ static void read_conf_index_url(char *out, size_t cap) {
     fclose(f);
 }
 
+/* INDEX_URL may name several repositories, space-separated (Alpine splits
+ * its packages across main/ and community/, and a real install pulls from
+ * both). Each one is cached in its own file and all of them are parsed into
+ * one package set. Repo 0 keeps the historic /var/lib/bpkg/index path so a
+ * rootfs seeded by tools/packages/install-ports.sh still loads unchanged. */
+#define BPKG_MAX_REPOS 8
+
+static int read_conf_index_urls(char urls[][1536], int max) {
+    char all[1536];
+    read_conf_index_url(all, sizeof(all));
+    int n = 0;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(all, " \t", &saveptr); tok && n < max; tok = strtok_r(NULL, " \t", &saveptr))
+        snprintf(urls[n++], 1536, "%s", tok);
+    if (n == 0) snprintf(urls[n++], 1536, "%s", BPKG_DEFAULT_INDEX_URL);
+    return n;
+}
+
+static void repo_cache_path(int i, char *out, size_t cap) {
+    if (i == 0) snprintf(out, cap, "%s", BPKG_CACHED_INDEX);
+    else snprintf(out, cap, "%s.%d", BPKG_CACHED_INDEX, i);
+}
+
 static int is_apkindex_url(const char *url) {
     const char *b = strrchr(url, '/');
     b = b ? b + 1 : url;
@@ -797,16 +991,41 @@ static void ensure_state_dirs(void) {
 /* ------------------------------------------------------------------ */
 
 struct pkg {
-    char name[128], version[64], arch[32], sha[80], url[1536], deps[512];
+    /* Two full Alpine indexes are ~28k packages, so every byte here is
+     * multiplied by 28000: keep the per-package record small enough that
+     * `bpkg update` on a real mirror fits in a modest guest. */
+    char name[128], version[64], arch[32], sha[80], url[512], deps[1024];
     int is_apk; /* true => url points at a real Alpine .apk (triple-gzip) */
+};
+
+/* A "provides" token: the virtual names a package answers to besides its own
+ * -- "so:libreadline.so.8", "cmd:bash", "/bin/sh". Alpine's dependencies are
+ * mostly stated in these terms (bash depends on so:libreadline.so.8, not on
+ * "readline"), so without this table every real package looks unresolvable. */
+struct prov {
+    char token[160];
+    int idx; /* index into pkgset.v */
 };
 
 struct pkgset {
     struct pkg *v;
     int n, cap;
+    struct prov *p;
+    int pn, pcap;
 };
 
-static void pkgset_init(struct pkgset *s) { s->v = NULL; s->n = 0; s->cap = 0; }
+static void pkgset_init(struct pkgset *s) { memset(s, 0, sizeof(*s)); }
+
+static void pkgset_add_prov(struct pkgset *s, const char *token, int idx) {
+    if (!token[0]) return;
+    if (s->pn == s->pcap) {
+        s->pcap = s->pcap ? s->pcap * 2 : 256;
+        s->p = realloc(s->p, (size_t)s->pcap * sizeof(struct prov));
+    }
+    snprintf(s->p[s->pn].token, sizeof(s->p[s->pn].token), "%s", token);
+    s->p[s->pn].idx = idx;
+    s->pn++;
+}
 
 static struct pkg *pkgset_add(struct pkgset *s) {
     if (s->n == s->cap) {
@@ -834,6 +1053,55 @@ static struct pkg *pkgset_find(struct pkgset *s, const char *name) {
     return fallback;
 }
 
+/* Resolves a dependency token to a package: its own name first, then the
+ * provides table (so:/cmd:/pc:/path tokens). */
+static struct pkg *pkg_resolve(struct pkgset *s, const char *token) {
+    struct pkg *pk = pkgset_find(s, token);
+    if (pk) return pk;
+    for (int i = 0; i < s->pn; i++)
+        if (strcmp(s->p[i].token, token) == 0) return &s->v[s->p[i].idx];
+    return NULL;
+}
+
+/* Names the base image already supplies, one per line in /etc/bpkg.provided
+ * (comments with #). Without it, resolving a real Alpine package would drag
+ * in Alpine's own musl and busybox and overwrite the running system's libc
+ * and shell -- these are dependencies that are genuinely already satisfied,
+ * not ones being quietly ignored. */
+#define BPKG_PROVIDED_CONF "/etc/bpkg.provided"
+
+static char (*g_provided)[160];
+static int g_provided_n;
+
+static void load_base_provided(void) {
+    static int loaded = 0;
+    if (loaded) return;
+    loaded = 1;
+    FILE *f = fopen(BPKG_PROVIDED_CONF, "r");
+    if (!f) return;
+    char line[256];
+    int cap = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+        char *l = line;
+        while (*l == ' ' || *l == '\t') l++;
+        if (!*l || *l == '#') continue;
+        if (g_provided_n == cap) {
+            cap = cap ? cap * 2 : 32;
+            g_provided = realloc(g_provided, (size_t)cap * 160);
+        }
+        snprintf(g_provided[g_provided_n++], 160, "%s", l);
+    }
+    fclose(f);
+}
+
+static int base_provides(const char *token) {
+    load_base_provided();
+    for (int i = 0; i < g_provided_n; i++)
+        if (strcmp(g_provided[i], token) == 0) return 1;
+    return 0;
+}
+
 static void parse_flat_index(const char *text, size_t len, struct pkgset *out) {
     const char *p = text, *end = text + len;
     while (p < end) {
@@ -848,8 +1116,8 @@ static void parse_flat_index(const char *text, size_t len, struct pkgset *out) {
         while (*l == ' ' || *l == '\t') l++;
         if (!*l || *l == '#') continue;
 
-        char name[128] = "", version[64] = "", arch[32] = "", sha[80] = "", url[1536] = "", deps[512] = "";
-        int got = sscanf(l, "%127s %63s %31s %79s %1535s %511s", name, version, arch, sha, url, deps);
+        char name[128] = "", version[64] = "", arch[32] = "", sha[80] = "", url[512] = "", deps[512] = "";
+        int got = sscanf(l, "%127s %63s %31s %79s %511s %511s", name, version, arch, sha, url, deps);
         if (got < 5) continue;
         struct pkg *pk = pkgset_add(out);
         snprintf(pk->name, sizeof(pk->name), "%s", name);
@@ -898,18 +1166,18 @@ static void parse_apkindex(const char *text, size_t len, const char *base_url, s
             break;
         case 'D': /* space-separated deps, some with version constraints (name>=1.0) */
             if (cur) {
-                char tmp[512] = ""; size_t tl = 0;
-                char work[512];
+                char tmp[1024] = ""; size_t tl = 0;
+                char work[1024];
                 snprintf(work, sizeof(work), "%s", val);
                 char *saveptr = NULL;
                 for (char *tok = strtok_r(work, " ", &saveptr); tok; tok = strtok_r(NULL, " ", &saveptr)) {
-                    /* skip conflicts (!x), path-provides (/x) and virtual/
-                     * soname deps (so:, pc:, cmd:) -- none of those name an
-                     * installable package in our index, so treating them as
-                     * one would just produce an unresolvable dependency. */
-                    if (tok[0] == '!' || tok[0] == '/') continue;
-                    if (strncmp(tok, "so:", 3) == 0 || strncmp(tok, "pc:", 3) == 0 || strncmp(tok, "cmd:", 4) == 0) continue;
-                    char depname[128];
+                    /* Conflicts (!x) are not dependencies. Everything else is
+                     * kept verbatim -- so:/cmd:/pc:/path tokens resolve through
+                     * the provides table built from the index's p: lines, or
+                     * through /etc/bpkg.provided when the base image already
+                     * supplies them (musl, /bin/sh, ...). */
+                    if (tok[0] == '!') continue;
+                    char depname[160];
                     size_t i = 0;
                     while (tok[i] && tok[i] != '=' && tok[i] != '>' && tok[i] != '<' && tok[i] != '~' && i < sizeof(depname) - 1) {
                         depname[i] = tok[i]; i++;
@@ -923,6 +1191,18 @@ static void parse_apkindex(const char *text, size_t len, const char *base_url, s
                     tmp[tl] = 0;
                 }
                 snprintf(cur->deps, sizeof(cur->deps), "%s", tmp);
+            }
+            break;
+        case 'p': /* provides: "so:libreadline.so.8=8.2 cmd:bash=5.2.26-r0" */
+            if (cur) {
+                char work[1024];
+                snprintf(work, sizeof(work), "%s", val);
+                char *saveptr = NULL;
+                for (char *tok = strtok_r(work, " ", &saveptr); tok; tok = strtok_r(NULL, " ", &saveptr)) {
+                    char *eq = strchr(tok, '=');
+                    if (eq) *eq = 0;
+                    if (tok[0]) pkgset_add_prov(out, tok, (int)(cur - out->v));
+                }
             }
             break;
         default:
@@ -946,11 +1226,10 @@ static void apk_base_url(const char *index_url, char *out, size_t cap) {
 /* commands                                                             */
 /* ------------------------------------------------------------------ */
 
-static int load_cached_index(struct pkgset *out, char *index_url, size_t url_cap) {
-    read_conf_index_url(index_url, url_cap);
-    FILE *f = fopen(BPKG_CACHED_INDEX, "rb");
+static int load_one_index(struct pkgset *out, const char *index_url, const char *cache_path) {
+    FILE *f = fopen(cache_path, "rb");
     if (!f) {
-        fprintf(stderr, "bpkg: no cached index -- run 'bpkg update' first\n");
+        fprintf(stderr, "bpkg: no cached index for %s -- run 'bpkg update' first\n", index_url);
         return -1;
     }
     struct buf b; buf_init(&b);
@@ -958,7 +1237,6 @@ static int load_cached_index(struct pkgset *out, char *index_url, size_t url_cap
     while ((r = fread(chunk, 1, sizeof(chunk), f)) > 0) buf_append(&b, chunk, r);
     fclose(f);
 
-    pkgset_init(out);
     if (is_apkindex_url(index_url)) {
         struct buf tar; if (gunzip_all(b.p, b.len, &tar) < 0) { buf_free(&b); return -1; }
         /* find the APKINDEX member inside the tar */
@@ -987,20 +1265,41 @@ static int load_cached_index(struct pkgset *out, char *index_url, size_t url_cap
     return 0;
 }
 
+/* Loads every configured repository into one package set. index_url is
+ * filled with the first repo's URL (callers only use it for messages). */
+static int load_cached_index(struct pkgset *out, char *index_url, size_t url_cap) {
+    char urls[BPKG_MAX_REPOS][1536];
+    int nrepo = read_conf_index_urls(urls, BPKG_MAX_REPOS);
+    snprintf(index_url, url_cap, "%s", urls[0]);
+    pkgset_init(out);
+    int loaded = 0;
+    for (int i = 0; i < nrepo; i++) {
+        char cache[1600];
+        repo_cache_path(i, cache, sizeof(cache));
+        if (load_one_index(out, urls[i], cache) == 0) loaded++;
+    }
+    return loaded ? 0 : -1;
+}
+
 static int cmd_update(void) {
     ensure_state_dirs();
-    char index_url[1536];
-    read_conf_index_url(index_url, sizeof(index_url));
-    printf("bpkg: fetching index from %s\n", index_url);
-    struct buf b;
-    if (fetch_url(index_url, &b) < 0) return 1;
-    int fd = open(BPKG_CACHED_INDEX, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { fprintf(stderr, "bpkg: cannot write %s: %s\n", BPKG_CACHED_INDEX, strerror(errno)); buf_free(&b); return 1; }
-    write(fd, b.p, b.len);
-    close(fd);
-    printf("bpkg: cached %zu bytes\n", b.len);
-    buf_free(&b);
-    return 0;
+    char urls[BPKG_MAX_REPOS][1536];
+    int nrepo = read_conf_index_urls(urls, BPKG_MAX_REPOS);
+    int rc = 0;
+    for (int i = 0; i < nrepo; i++) {
+        printf("bpkg: fetching index from %s\n", urls[i]);
+        struct buf b;
+        if (fetch_url(urls[i], &b) < 0) { rc = 1; continue; }
+        char cache[1600];
+        repo_cache_path(i, cache, sizeof(cache));
+        int fd = open(cache, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) { fprintf(stderr, "bpkg: cannot write %s: %s\n", cache, strerror(errno)); buf_free(&b); rc = 1; continue; }
+        if (write(fd, b.p, b.len) != (ssize_t)b.len) { fprintf(stderr, "bpkg: short write to %s\n", cache); rc = 1; }
+        close(fd);
+        printf("bpkg: cached %zu bytes\n", b.len);
+        buf_free(&b);
+    }
+    return rc;
 }
 
 static int cmd_list(void) {
@@ -1059,6 +1358,137 @@ static const char *install_root(void) {
     const char *r = getenv("BPKG_ROOT");
     return (r && r[0]) ? r : "/";
 }
+
+/* ------------------------------------------------------------------ */
+/* .apk integrity: RSA signature + datahash chain                      */
+/* ------------------------------------------------------------------ */
+
+/* Returns the first regular file in a decompressed tar: its name, and a
+ * pointer into `tar` for its contents. */
+static int tar_first_file(const uint8_t *tar, size_t len, char *name, size_t namecap,
+                          const uint8_t **content, size_t *clen) {
+    size_t pos = 0;
+    while (pos + 512 <= len) {
+        const struct tar_hdr *h = (const struct tar_hdr *)(tar + pos);
+        int allzero = 1;
+        for (size_t i = 0; i < 512; i++) if (tar[pos + i]) { allzero = 0; break; }
+        if (allzero) { pos += 512; continue; }
+        long size = tar_octal(h->size, 12);
+        pos += 512;
+        if (size < 0 || pos + (size_t)size > len) return -1;
+        if (h->typeflag == '0' || h->typeflag == 0) {
+            snprintf(name, namecap, "%.100s", h->name);
+            *content = tar + pos;
+            *clen = (size_t)size;
+            return 0;
+        }
+        pos += ((size_t)size + 511) & ~(size_t)511;
+    }
+    return -1;
+}
+
+/* Finds "key = value" in a .PKGINFO-style text blob. */
+static int pkginfo_value(const uint8_t *text, size_t len, const char *key, char *out, size_t cap) {
+    size_t klen = strlen(key);
+    size_t i = 0;
+    while (i < len) {
+        size_t j = i;
+        while (j < len && text[j] != '\n') j++;
+        if (j - i > klen && memcmp(text + i, key, klen) == 0) {
+            size_t v = i + klen;
+            while (v < j && (text[v] == ' ' || text[v] == '=')) v++;
+            size_t n = j - v;
+            if (n >= cap) n = cap - 1;
+            memcpy(out, text + v, n); out[n] = 0;
+            return 0;
+        }
+        i = j + 1;
+    }
+    return -1;
+}
+
+#ifdef B1NIX_HAVE_MBEDTLS
+#include <mbedtls/md.h>
+#include <mbedtls/pk.h>
+
+/* Alpine's own signing keys, shipped with the image (public keys only). */
+#define APK_KEYS_DIR "/etc/apk/keys"
+
+/* An .apk carries its integrity in a chain, and this checks the whole chain:
+ *
+ *   gzip member 1  .SIGN.RSA.<key>  RSA PKCS#1 v1.5 / SHA-1 over the *stored
+ *                                   bytes* of member 2
+ *   gzip member 2  .PKGINFO         carries datahash = sha256 of the stored
+ *                                   bytes of member 3
+ *   gzip member 3  the files        what actually gets extracted
+ *
+ * Verifying only the signature would leave the payload unauthenticated, so
+ * both links are required. Returns 0 when the package is trusted. */
+static int apk_verify(const uint8_t *sig_tar, size_t sig_tar_len,
+                      const uint8_t *ctl_raw, size_t ctl_raw_len,
+                      const uint8_t *ctl_tar, size_t ctl_tar_len,
+                      const uint8_t *data_raw, size_t data_raw_len) {
+    char signame[128];
+    const uint8_t *sig = NULL;
+    size_t siglen = 0;
+    if (tar_first_file(sig_tar, sig_tar_len, signame, sizeof(signame), &sig, &siglen) < 0) {
+        fprintf(stderr, "bpkg: .apk signature member is not a readable tar\n");
+        return -1;
+    }
+    /* ".SIGN.RSA.<keyfile>" -- the suffix names the key that signed it. */
+    const char *keyname = NULL;
+    if (strncmp(signame, ".SIGN.RSA.", 10) == 0) keyname = signame + 10;
+    if (!keyname || !keyname[0]) {
+        fprintf(stderr, "bpkg: unsupported signature type '%s'\n", signame);
+        return -1;
+    }
+
+    char keypath[512];
+    snprintf(keypath, sizeof(keypath), "%s/%s", APK_KEYS_DIR, keyname);
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    int rc = mbedtls_pk_parse_public_keyfile(&pk, keypath);
+    if (rc != 0) {
+        fprintf(stderr, "bpkg: package is signed by '%s', which is not a trusted key in %s -- refusing to install\n",
+                keyname, APK_KEYS_DIR);
+        mbedtls_pk_free(&pk);
+        return -1;
+    }
+
+    unsigned char sha1[20];
+    rc = mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA1), ctl_raw, ctl_raw_len, sha1);
+    if (rc == 0)
+        rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA1, sha1, sizeof(sha1), sig, siglen);
+    mbedtls_pk_free(&pk);
+    if (rc != 0) {
+        fprintf(stderr, "bpkg: signature check FAILED (-0x%04x) -- refusing to install\n", -rc);
+        return -1;
+    }
+
+    /* The signature covers the control member; the control member commits to
+     * the data member through datahash. */
+    char pkginfo_name[128];
+    const uint8_t *pkginfo = NULL;
+    size_t pkginfo_len = 0;
+    if (tar_first_file(ctl_tar, ctl_tar_len, pkginfo_name, sizeof(pkginfo_name), &pkginfo, &pkginfo_len) < 0) {
+        fprintf(stderr, "bpkg: .apk control member has no .PKGINFO\n");
+        return -1;
+    }
+    char want[80];
+    if (pkginfo_value(pkginfo, pkginfo_len, "datahash", want, sizeof(want)) < 0) {
+        fprintf(stderr, "bpkg: .PKGINFO carries no datahash -- cannot authenticate the payload\n");
+        return -1;
+    }
+    char got[65];
+    sha256_hex(data_raw, data_raw_len, got);
+    if (strcasecmp(got, want) != 0) {
+        fprintf(stderr, "bpkg: payload does not match the signed datahash (want %s, got %s)\n", want, got);
+        return -1;
+    }
+    printf("bpkg: signature ok (%s), payload matches datahash\n", keyname);
+    return 0;
+}
+#endif /* B1NIX_HAVE_MBEDTLS */
 
 static int already_installed(const char *name, const char *version) {
     char verpath[512]; snprintf(verpath, sizeof(verpath), "%s/%s.ver", BPKG_INSTALLED_DIR, name);
@@ -1121,21 +1551,71 @@ static int install_one(struct pkgset *set, const char *name) {
         if (rc == 0) rc = tar_extract(tar.p, tar.len, install_root(), &filelist);
         buf_free(&tar);
     } else {
-        size_t pos = 0;
-        struct buf member;
+        /* Split the concatenated gzip members, keeping both the decompressed
+         * contents and the stored byte ranges -- the signature is computed
+         * over the stored bytes, not the decompressed ones. */
+        enum { APK_MAX_MEMBERS = 4 };
+        struct buf member[APK_MAX_MEMBERS];
+        size_t mstart[APK_MAX_MEMBERS], mend[APK_MAX_MEMBERS];
         int members = 0;
+        size_t pos = 0;
         rc = -1;
-        while (pos < raw.len) {
-            if (gunzip_one(raw.p, raw.len, &pos, &member) < 0) {
+        while (pos < raw.len && members < APK_MAX_MEMBERS) {
+            mstart[members] = pos;
+            if (gunzip_one(raw.p, raw.len, &pos, &member[members]) < 0) {
                 if (members == 0) fprintf(stderr, "bpkg: %s is not a valid .apk (bad first gzip member)\n", pk->name);
                 break;
             }
+            mend[members] = pos;
             members++;
-            if (pos >= raw.len) /* this was the last member: it's the data tarball */
-                rc = tar_extract(member.p, member.len, install_root(), &filelist);
-            buf_free(&member);
         }
-        if (members == 0) rc = -1;
+
+        /* Signed .apk files start with a member whose single file is named
+         * ".SIGN.<algo>.<key>". Deciding on that name rather than on the
+         * member count keeps unsigned local tarballs (the offline fixtures)
+         * distinguishable from a real package whose signature went missing. */
+        int signed_apk = 0;
+        if (members >= 1) {
+            char first[128];
+            const uint8_t *c = NULL; size_t cl = 0;
+            if (tar_first_file(member[0].p, member[0].len, first, sizeof(first), &c, &cl) == 0)
+                signed_apk = strncmp(first, ".SIGN.", 6) == 0;
+        }
+
+        if (signed_apk) {
+            /* signature, control, data — in that order. A signed package that
+             * did not decode into all three is corrupt, and must NOT fall back
+             * to the unsigned path (that would extract the control tarball and
+             * call it success). */
+            if (members < 3) {
+                fprintf(stderr, "bpkg: %s is signed but only %d of its 3 members decoded -- refusing to install\n",
+                        pk->name, members);
+                rc = -1;
+            } else {
+#ifdef B1NIX_HAVE_MBEDTLS
+                rc = apk_verify(member[0].p, member[0].len,
+                                raw.p + mstart[1], mend[1] - mstart[1],
+                                member[1].p, member[1].len,
+                                raw.p + mstart[2], mend[2] - mstart[2]);
+#else
+                fprintf(stderr, "bpkg: %s is signed, but this bpkg was built without mbedTLS and cannot check the signature -- refusing to install\n", pk->name);
+                rc = -1;
+#endif
+                if (rc == 0)
+                    rc = tar_extract(member[2].p, member[2].len, install_root(), &filelist);
+            }
+        } else if (members > 0) {
+            /* No signature member. Local (file://) packages are the offline
+             * fixtures the smoke test builds with the host's own tar/gzip;
+             * anything fetched over the network must be signed. */
+            if (strncmp(pk->url, "file://", 7) != 0) {
+                fprintf(stderr, "bpkg: %s carries no signature -- refusing to install an unsigned package fetched over the network\n", pk->name);
+                rc = -1;
+            } else {
+                rc = tar_extract(member[members - 1].p, member[members - 1].len, install_root(), &filelist);
+            }
+        }
+        for (int i = 0; i < members; i++) buf_free(&member[i]);
     }
     buf_free(&raw);
 
@@ -1149,26 +1629,29 @@ static int install_one(struct pkgset *set, const char *name) {
 }
 
 static int install_with_deps(struct pkgset *set, const char *name, char visited[][128], int *nvisited, int max_visited) {
-    for (int i = 0; i < *nvisited; i++) if (strcmp(visited[i], name) == 0) return 0; /* already handled or in progress */
-    if (*nvisited >= max_visited) { fprintf(stderr, "bpkg: dependency graph too deep\n"); return -1; }
-    snprintf(visited[*nvisited], 128, "%s", name);
-    (*nvisited)++;
-
-    struct pkg *pk = pkgset_find(set, name);
+    struct pkg *pk = pkg_resolve(set, name);
     if (!pk) { fprintf(stderr, "bpkg: unknown package '%s'\n", name); return -1; }
 
+    for (int i = 0; i < *nvisited; i++) if (strcmp(visited[i], pk->name) == 0) return 0; /* already handled or in progress */
+    if (*nvisited >= max_visited) { fprintf(stderr, "bpkg: dependency graph too deep\n"); return -1; }
+    snprintf(visited[*nvisited], 128, "%s", pk->name);
+    (*nvisited)++;
+
     if (pk->deps[0]) {
-        char deps[512]; snprintf(deps, sizeof(deps), "%s", pk->deps);
+        char deps[1024]; snprintf(deps, sizeof(deps), "%s", pk->deps);
         char *saveptr = NULL;
         for (char *tok = strtok_r(deps, ",", &saveptr); tok; tok = strtok_r(NULL, ",", &saveptr)) {
-            if (!pkgset_find(set, tok)) {
+            if (base_provides(tok)) continue; /* already in the base image */
+            struct pkg *dep = pkg_resolve(set, tok);
+            if (!dep) {
                 fprintf(stderr, "bpkg: warning: %s depends on unknown package '%s' (skipping dep)\n", name, tok);
                 continue;
             }
-            if (install_with_deps(set, tok, visited, nvisited, max_visited) < 0) return -1;
+            if (strcmp(dep->name, pk->name) == 0) continue;
+            if (install_with_deps(set, dep->name, visited, nvisited, max_visited) < 0) return -1;
         }
     }
-    return install_one(set, name);
+    return install_one(set, pk->name);
 }
 
 static int cmd_install(int argc, char **argv) {

@@ -2427,6 +2427,22 @@ void vfs_repopulate_after_root_mount(void) {
     }
   }
 
+  /* /dev/fd and the three standard-stream links. bash implements process
+   * substitution -- `cmd < <(other)` -- by handing the reader the path
+   * /dev/fd/<n> for the pipe it just created. Without these links the open
+   * fails with ENOENT, nobody ever reads that pipe, and the writing child
+   * blocks in pipe_write() forever: a whole pipeline wedged (neofetch did
+   * exactly this) with no error anywhere pointing at the missing node.
+   * /proc/self/fd is the real directory behind all four, same as Linux. */
+  vfs_unlink("/dev/fd");
+  vfs_symlink("/proc/self/fd", "/dev/fd");
+  vfs_unlink("/dev/stdin");
+  vfs_symlink("/proc/self/fd/0", "/dev/stdin");
+  vfs_unlink("/dev/stdout");
+  vfs_symlink("/proc/self/fd/1", "/dev/stdout");
+  vfs_unlink("/dev/stderr");
+  vfs_symlink("/proc/self/fd/2", "/dev/stderr");
+
   node = add_node("/dev/log", VFS_DEVICE, 0, 0, 0);
   if (node && !IS_ERR(node)) {
     node->inode->write_cb = log_write;
@@ -2588,6 +2604,40 @@ int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
       return fd;
     }
     /* type == 1 is console, fall through to normal /dev/tty open */
+  }
+
+  /* /proc/self/fd/<N> is a magic link on Linux: opening it does not follow the
+   * link text ("pipe:[7]" names no file) — it hands back another reference to
+   * the SAME open file description. Everything that opens a descriptor by path
+   * depends on this, most visibly bash's process substitution, which passes
+   * `/dev/fd/63` (-> /proc/self/fd/63) to the reader; following the text there
+   * gives ENOENT, nobody ever reads the pipe, and the writing child blocks in
+   * pipe_write() until the whole pipeline is wedged. Only the calling task's
+   * own descriptors are reachable this way, which is all any of this needs. */
+  {
+    const char *p = 0;
+    if (strncmp(resolved, "/proc/self/fd/", 14) == 0)
+      p = resolved + 14;
+    else if (strncmp(resolved, "/dev/fd/", 8) == 0)
+      p = resolved + 8;
+    if (p && *p) {
+      int n = 0, ok = 1;
+      for (const char *q = p; *q; q++) {
+        if (*q < '0' || *q > '9') { ok = 0; break; }
+        n = n * 10 + (*q - '0');
+      }
+      if (ok) {
+        kfree(resolved);
+        struct vfs_handle *h = scheduler_fd_get(n);
+        if (!h)
+          return -EBADF;
+        vfs_handle_retain(h);
+        int newfd = scheduler_fd_alloc(h);
+        if (newfd < 0)
+          vfs_handle_release(h);
+        return newfd;
+      }
+    }
   }
 
   /* M32b pseudo-terminals: /dev/ptmx allocates a fresh master; /dev/pts/<N>

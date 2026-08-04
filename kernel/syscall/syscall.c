@@ -3000,11 +3000,19 @@ static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
   }
   kfree(payload);
 
+  /* msg_name: the sender of this datagram. It used to be filled with zeros,
+   * which quietly broke every caller that checks who answered — musl's
+   * resolver discards a reply unless msg_name matches the nameserver it
+   * queried, so name resolution failed system-wide with the answer sitting
+   * in the buffer. Falls back to zeros only when the socket cannot say. */
   if (msg.msg_name && msg.msg_namelen) {
-    u8 zero[128] = {0};
-    usize n = msg.msg_namelen < sizeof(zero) ? msg.msg_namelen : sizeof(zero);
-    if (syscall_copyout(msg.msg_name, zero, n) < 0)
+    u8 src[128] = {0};
+    usize cap = msg.msg_namelen < sizeof(src) ? msg.msg_namelen : sizeof(src);
+    usize n = vfs_socket_last_srcaddr(fd, src, cap);
+    if (syscall_copyout(msg.msg_name, src, cap) < 0)
       return (u64)-EFAULT;
+    if (n)
+      msg.msg_namelen = (u32)n;
   }
 
   u8 control[512] = {0};

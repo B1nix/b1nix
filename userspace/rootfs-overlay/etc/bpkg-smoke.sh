@@ -3,7 +3,8 @@
 # native (C, statically linked against musl like every other userspace ELF)
 # package manager. Drives the REAL pipeline -- its own hand-rolled gzip/
 # deflate + tar decoder + sha256, no shelling out to curl/tar/sha256sum --
-# against fixtures pre-staged in the rootfs (/pkgs and /apkrepo). Emits
+# against fixtures pre-staged in the rootfs (/pkgs, /apkrepo-signed and
+# /apkrepo-tampered). Emits
 # BPKG-SMOKE markers the host smoke harness greps for. No fake passes: each
 # marker is gated on the actual operation having succeeded (or, for
 # checksum-reject, on it FAILING).
@@ -87,24 +88,61 @@ else
 	echo "BPKG-SMOKE: fail dep-resolution"
 fi
 
-# apk-format: a real Alpine-shaped repo staged at /apkrepo/<arch> --
-# APKINDEX.tar.gz (gzipped tar of one text index) + a genuine .apk (three
-# concatenated gzip members: signature, .PKGINFO control, data). Proves the
-# apk-container splitter and the P:/V:/A:/D: index parser both work against
-# byte-for-byte real Alpine tooling output, not just the house flat format.
-export BPKG_INDEX_URL="file:///apkrepo/x86_64/APKINDEX.tar.gz"
+# apk-format: the container itself. A real, signed Alpine .apk is three
+# concatenated gzip members (signature, .PKGINFO control, data); this proves
+# the splitter extracts the DATA member and nothing else -- the control
+# member's .PKGINFO must not land in the filesystem -- and that the
+# APKINDEX P:/V:/A:/D:/p: parser reads a real index. The bytes are the
+# mirror's own, so the format under test is Alpine's, not one bpkg invented.
+export BPKG_INDEX_URL="file:///apkrepo-signed/x86_64/APKINDEX.tar.gz"
 rm -rf /var/lib/bpkg
 mkdir -p /var/lib
 ln -s "$ROOT/var/lib/bpkg" /var/lib/bpkg
 if bpkg update >/dev/null 2>&1 \
-	&& bpkg install apkhello >/dev/null 2>&1 \
-	&& [ -f "$ROOT/usr/bin/apkhello" ] \
-	&& grep -q "hello from real apk format" "$ROOT/usr/bin/apkhello" \
-	&& [ "$(cat "$ROOT/var/lib/bpkg/installed/apkhello.ver")" = "3.0-r0" ] \
+	&& bpkg install ncurses-terminfo-base >/dev/null 2>&1 \
+	&& [ -f "$ROOT/etc/terminfo/x/xterm" ] \
+	&& [ "$(cat "$ROOT/var/lib/bpkg/installed/ncurses-terminfo-base.ver")" = "6.4_p20240420-r2" ] \
 	&& [ ! -f "$ROOT/.PKGINFO" ]; then
 	echo "BPKG-SMOKE: ok apk-format"
 else
 	echo "BPKG-SMOKE: fail apk-format"
+fi
+unset BPKG_INDEX_URL
+
+# apk-signature: a genuine, signed Alpine package (ncurses-terminfo-base, as
+# published on dl-cdn) staged locally. bpkg must verify the whole chain --
+# RSA/SHA-1 over the control member against the Alpine key in /etc/apk/keys,
+# then the control member's datahash against the payload -- before extracting
+# anything. Offline: the bytes are the mirror's, the check is real.
+export BPKG_INDEX_URL="file:///apkrepo-signed/x86_64/APKINDEX.tar.gz"
+rm -rf /var/lib/bpkg "$ROOT/var/lib/bpkg" "$ROOT/etc/terminfo"
+mkdir -p "$ROOT/var/lib/bpkg" /var/lib
+ln -s "$ROOT/var/lib/bpkg" /var/lib/bpkg
+if bpkg update >/dev/null 2>&1 \
+	&& bpkg install ncurses-terminfo-base 2>&1 | grep -q "signature ok" \
+	&& [ -f "$ROOT/var/lib/bpkg/installed/ncurses-terminfo-base.ver" ] \
+	&& [ -d "$ROOT/etc/terminfo" ]; then
+	echo "BPKG-SMOKE: ok apk-signature"
+else
+	echo "BPKG-SMOKE: fail apk-signature"
+fi
+
+# apk-signature-reject: the same package with one payload byte flipped. The
+# signature still verifies (it covers the control member), so this is exactly
+# the case a signature check alone would wave through: the datahash must catch
+# it, and NOTHING may be extracted or recorded.
+export BPKG_INDEX_URL="file:///apkrepo-tampered/x86_64/APKINDEX.tar.gz"
+rm -rf /var/lib/bpkg "$ROOT/var/lib/bpkg" "$ROOT/etc/terminfo"
+mkdir -p "$ROOT/var/lib/bpkg" /var/lib
+ln -s "$ROOT/var/lib/bpkg" /var/lib/bpkg
+bpkg update >/dev/null 2>&1
+if bpkg install ncurses-terminfo-base >/dev/null 2>&1; then
+	echo "BPKG-SMOKE: fail apk-signature-reject"
+elif [ ! -f "$ROOT/var/lib/bpkg/installed/ncurses-terminfo-base.ver" ] \
+	&& [ ! -d "$ROOT/etc/terminfo" ]; then
+	echo "BPKG-SMOKE: ok apk-signature-reject"
+else
+	echo "BPKG-SMOKE: fail apk-signature-reject"
 fi
 unset BPKG_INDEX_URL
 

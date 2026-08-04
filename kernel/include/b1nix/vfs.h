@@ -420,7 +420,9 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
 int vfs_getsockname(int fd, void *addr, usize *addrlen);
 int vfs_getpeername(int fd, void *addr, usize *addrlen);
 int vfs_shutdown(int fd, int how);
-int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len);
+int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len,
+                        const void *src_ip, int src_is_v6, u16 src_port_net);
+usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap);
 
 /* M32b pseudo-terminals (kernel/dev/pty.c). */
 void pty_init(void);
@@ -495,12 +497,18 @@ struct vfs_file_ops {
  * adjustable via /proc/sys/kernel/pipe-max-count without reallocating. */
 #define MAX_VFS_PIPES_CEIL 1024
 #define MAX_MOUNTS 32
-#define PIPE_BUFFER_SIZE 4096
+/* Pipe capacity. Linux's is 64 KiB and userspace is written against that: bash
+ * feeds a here-document through a pipe when it believes the document fits, and
+ * with a 4 KiB pipe here it simply blocked forever on `read -rd '' config`
+ * (neofetch's default config is bigger than that) — a hang with no error and no
+ * way to see the cause from userspace. The buffer is allocated per slot on
+ * first use, so the pool costs nothing until pipes are actually created. */
+#define PIPE_BUFFER_SIZE 65536
 #define TTY_INPUT_SIZE 256
 
 struct vfs_pipe {
   int used;
-  char buffer[PIPE_BUFFER_SIZE];
+  char *buffer; /* PIPE_BUFFER_SIZE bytes, allocated on this slot's first use */
   usize size;
   usize read_pos;
   usize write_pos;
@@ -548,6 +556,18 @@ struct vfs_socket_state {
   usize recv_len;
   char udp_q_buf[8][2048];
   usize udp_q_len[8];
+  /* Where each queued datagram came from. recvfrom() has to report the
+   * sender of the datagram it just handed back — musl's resolver drops any
+   * reply whose reported source does not match the nameserver it queried, so
+   * reporting the socket's last send target (which is what this used to do)
+   * made every DNS answer look forged. */
+  u8 udp_q_src_ip[8][16];
+  u16 udp_q_src_port[8];
+  u8 udp_q_src_is6[8];
+  u8 udp_last_src_ip[16];
+  u16 udp_last_src_port;
+  u8 udp_last_src_is6;
+  u8 udp_last_src_valid;
   u8 udp_q_head;
   u8 udp_q_tail;
   u8 udp_q_count;

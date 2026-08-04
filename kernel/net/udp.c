@@ -103,7 +103,8 @@ void udp_receive(struct ipv4_addr src, const void *data, usize size)
 	u16 dport = bswap16(hdr->dst_port);
 	u16 dport_net = hdr->dst_port;
 
-	if (!vfs_socket_push_udp(dport_net, payload, payload_size)) {
+	if (!vfs_socket_push_udp(dport_net, payload, payload_size, src.bytes, 0,
+	                         hdr->src_port)) {
 		for (int i = 0; i < MAX_UDP_HANDLERS; i++) {
 			if (udp_handlers[i].handler && udp_handlers[i].port == dport) {
 				udp_handlers[i].handler(payload, payload_size);
@@ -237,6 +238,7 @@ void udp6_receive(struct in6_addr_k src, struct in6_addr_k dst,
 		}
 	}
 
-	if (!vfs_socket_push_udp(hdr->dst_port, payload, payload_size))
+	if (!vfs_socket_push_udp(hdr->dst_port, payload, payload_size, src.bytes, 1,
+	                         hdr->src_port))
 		net_proto_icmp6_unreach(src, 4 /* port unreachable */, data, length);
 }

@@ -57,6 +57,62 @@ a vendored copy of zlib, never needs to track upstream.
    files. The other two members are decoded (to walk past their length) but
    never written to disk.
 
+## Transport: HTTPS, and what it verifies
+
+`bpkg` links mbedTLS (the same static archives `build-curl.sh` already
+produces) behind `B1NIX_HAVE_MBEDTLS`, so `https://` URLs work. The
+certificate chain is checked with `MBEDTLS_SSL_VERIFY_REQUIRED` against
+`/etc/ssl/certs/ca-certificates.crt`, and the hostname is passed through
+`mbedtls_ssl_set_hostname()` (SNI *and* the name the certificate must
+match). A missing trust store is a hard failure, not a downgrade.
+
+The bundle is copied into the image from the **build host's** own store
+(`/etc/ssl/cert.pem`, `/etc/ssl/certs/ca-certificates.crt`, or
+`$B1NIX_CA_BUNDLE`) rather than vendored into git, so the image never ships
+a CA list that quietly goes stale. Everything above the transport — gzip,
+tar, sha256, index parsing — stays dependency-free; TLS is confined to
+`conn_open`/`conn_read`/`conn_write`.
+
+## Package authenticity
+
+A real `.apk` carries a chain, and `bpkg` checks all of it:
+
+| gzip member | contents | checked how |
+|---|---|---|
+| 1 | `.SIGN.RSA.<key>` | RSA PKCS#1 v1.5 / SHA-1 over the **stored bytes** of member 2, against `/etc/apk/keys/<key>` |
+| 2 | `.PKGINFO` | carries `datahash` — sha256 of the stored bytes of member 3 |
+| 3 | the package's files | sha256 must equal that `datahash` before anything is extracted |
+
+Verifying only the signature would leave the payload unauthenticated, so
+both links are required. The trusted keys are Alpine's own public keys,
+shipped in the image at `/etc/apk/keys/` (public halves only, from the
+`alpine-keys` package).
+
+Policy, stated rather than implied:
+
+- signed package, signature verifies → install
+- signed package, bad signature, unknown signer, or `datahash` mismatch → refuse
+- unsigned package over `file://` → install (the offline smoke fixtures)
+- unsigned package over the network → refuse
+- signed package but a `bpkg` built without mbedTLS → refuse (it cannot check)
+
+## Multiple repositories, and virtual dependencies
+
+`INDEX_URL` takes a space-separated list; Alpine splits its packages across
+`main/` and `community/`, and dependency resolution needs both in one set.
+Each repository is cached separately (`/var/lib/bpkg/index`, `index.1`, …)
+and all of them parse into one package set.
+
+Alpine states most dependencies as virtual tokens — bash depends on
+`so:libreadline.so.8` and `/bin/sh`, not on "readline". `bpkg` builds a
+provides table from the index's `p:` lines and resolves through it, so the
+real dependency graph resolves (bash → readline → libncursesw → …). Tokens
+the base image already satisfies are listed in `/etc/bpkg.provided`
+(`musl`, `so:libc.musl-x86_64.so.1`, `busybox`, `/bin/sh`, …) — without it,
+installing anything real would pull Alpine's own musl and BusyBox over the
+running system's libc, loader and shell. A token that is in neither the
+provides table nor `bpkg.provided` is reported as unresolved.
+
 ## What's verified vs. what's an honest gap
 
 **Verified**: a project-standard offline smoke module,
@@ -86,27 +142,22 @@ was also built and linked through the real `userspace/Makefile` pipeline
 against musl (`x86_64-unknown-elf`, `ld.lld`, PT_INTERP
 `/lib/ld-musl-x86_64.so.1`) — zero warnings.
 
-**Not verified in this pass**: an actual QEMU boot of a rebuilt ISO. That
-requires a from-scratch musl+LLVM toolchain build in this environment, which
-was out of scope for the time available here. The `BPKG-SMOKE: ok
-apk-format` marker exists and is wired into `tests/smoke.sh`, but nobody has
-watched it print `ok` from inside a booted kernel yet — that is the next
-concrete step before this can be called `done` rather than `initial`.
-
 **Documented gaps, not silent shortcuts**:
 
-- **No TLS.** `bpkg` speaks plain HTTP and `file://` only; an `https://` URL
-  is rejected with an explicit error rather than silently downgraded or
-  faked. Real Alpine mirrors and jsDelivr are HTTPS-only, so as shipped
-  `bpkg` needs either an HTTP-capable mirror or a local/offline index. See
-  "Adding TLS" below for the concrete follow-up.
-- **No RSA signature verification.** `.apk`'s `.SIGN.RSA.*` member is
-  decoded (to walk past it) but never checked against a trusted key — no
-  public-key crypto is linked into this binary.
 - **No `APKINDEX` `C:` (Q1 base64-sha1) per-file checksum verification.**
-  Only the flat format's sha256 field is checked.
+  The signature chain (signature -> control -> `datahash` -> payload) covers
+  the package bytes, so this field adds nothing the chain does not already
+  prove; it stays unread.
 - **No chunked transfer-encoding.** Every target this ships against
   (jsDelivr, Alpine mirrors) sends `Content-Length` for static files.
+- **No `.post-install` / `.pre-install` scripts, no triggers, no
+  `/etc/apk/world`.** A real `.apk` may carry them; `bpkg` extracts the
+  payload and records the file list, nothing more. Packages that need a
+  post-install step are installed incompletely — that is a gap, not a
+  silent success, and it is the next thing to build before migrating the
+  from-source ports to packages.
+- **No file-conflict detection between packages.** Two packages owning the
+  same path both write it; last one wins.
 
 ## Usage
 
@@ -133,15 +184,54 @@ the smoke test (and any future sandboxed/offline install flow) can drive the
 real pipeline against a scratch directory instead of the live rootfs,
 without needing a second binary or a test-only code path.
 
-## Adding TLS (concrete follow-up, not done here)
+## Running real Alpine binaries
 
-The cleanest path is *not* linking mbedTLS into `bpkg` directly (that would
-reintroduce exactly the "ported C library baked into a boot-critical binary"
-problem M104 exists to get away from). Instead: fetch has one call site
-(`fetch_url` in `bpkg.c`) and mediates a request/response header/body split
-in `http_fetch`; add an HTTPS transport as an alternative to `connect_host`
-+ raw `read`/`write` gated on scheme, backed by mbedTLS's default in-tree
-build (as `m32_nettool.c` already does under `B1NIX_HAVE_MBEDTLS`). That
-keeps `bpkg`'s own logic (gzip/tar/sha256/index parsing) dependency-free and
-isolates the one genuinely necessary third-party dependency (a TLS stack) to
-a single, optional compile-time flag.
+b1nix builds musl 1.2.5, the same release Alpine v3.20 ships, and loads
+`/lib/ld-musl-x86_64.so.1` PIEs already — so Alpine's own x86_64 packages run
+unmodified, with no rebuild and no patched `EI_OSABI` byte (the loader treats
+any binary requesting the musl interpreter as Linux-personality, see
+`elf64_is_linux_binary` in `kernel/user/process.c`).
+
+Proving that took three kernel fixes, all of which were general defects rather
+than anything to do with packaging:
+
+1. **`/dev/fd`, `/dev/stdin|stdout|stderr` did not exist**, and
+   `/proc/self/fd/<N>` was an ordinary symlink to text like `pipe:[63]`. On
+   Linux it is a *magic link*: opening it returns another reference to the same
+   open file description. bash's process substitution (`cmd < <(other)`) hands
+   the reader `/dev/fd/63`, so without both pieces the open failed with ENOENT,
+   nothing ever read that pipe, and the writer blocked in `pipe_write()` until
+   the entire pipeline (and the boot behind it) wedged.
+2. **A datagram socket sent with source port 0** unless it had been explicitly
+   bound to a nonzero port, so every reply came back to a port no socket
+   claimed. `bind(port=0)` means "any port", not "port zero".
+3. **`recvfrom` reported the socket's last send target and `recvmsg`
+   zero-filled `msg_name`.** musl's resolver uses `recvmsg` and discards any
+   reply whose source does not match the nameserver it queried — so DNS failed
+   system-wide with the correct answer sitting in the buffer.
+4. **Pipes held 4 KiB, Linux's hold 64 KiB.** bash sends a here-document
+   through a pipe when it believes the document fits, so neofetch's
+   `read -rd '' config` (a ~10 KiB here-doc) filled the pipe and blocked
+   forever — no error, no output, just a wedged process that even SIGTERM
+   could not reach because it never returned from the write. The buffer is now
+   64 KiB, allocated per pool slot on first use.
+
+With those in place, `bpkg install neofetch figlet` against
+`dl-cdn.alpinelinux.org` resolves the name, fetches over HTTPS, pulls
+`bash`, `readline`, `libncursesw` and `ncurses-terminfo-base` through the
+`so:` provides graph, verifies every signature and datahash, and installs.
+`figlet` — a plain C binary from the same mirror — then runs and prints its
+banner.
+
+neofetch itself starts, reads its config, runs `uname -srm` and stops at its
+own OS table:
+
+```
+Unknown OS detected: 'B1NIX', aborting...
+Open an issue on GitHub to add support for your OS.
+```
+
+That is neofetch's whitelist, not a defect here — bash executes the whole
+script up to that `case`. Patching the package to recognise b1nix, or
+teaching neofetch's OS detection about it upstream, is the only way past it,
+and neither belongs in the package manager.

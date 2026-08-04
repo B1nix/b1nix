@@ -473,6 +473,37 @@ open(f,'wb').write(d); \
 fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
 endif
 
+MBEDTLS_DIR := ../build/$(B1NIX_ARCH)/ports/mbedtls/install
+
+# M104: bpkg gains HTTPS when the static mbedTLS archives are present. Every
+# real package repository is HTTPS-only, so without TLS the package manager can
+# only reach a local file:// index. The TLS code in bpkg.c is behind
+# B1NIX_HAVE_MBEDTLS; a B1NIX_TLS=none build still produces a working
+# HTTP/file-only bpkg that rejects https:// URLs with an explicit error.
+$(BUILD)/bin/bpkg: bin/tools/bpkg.c $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
+	@mkdir -p $(dir $@)
+	@if [ -f $(MBEDTLS_DIR)/lib/libmbedtls.a ]; then \
+	  echo "  CC+TLS  bpkg"; \
+	  $(CC) $(CFLAGS) $(GEN_PIC) -DB1NIX_HAVE_MBEDTLS -I $(MBEDTLS_DIR)/include -c $< -o $(BUILD)/bin/bpkg.o; \
+	  $(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) $(if $(GEN_LINKER),-T $(GEN_LINKER)) -o $@ $(GEN_CRT0) $(BUILD)/bin/bpkg.o \
+	    --start-group \
+	    $(MBEDTLS_DIR)/lib/libmbedtls.a $(MBEDTLS_DIR)/lib/libmbedx509.a $(MBEDTLS_DIR)/lib/libmbedcrypto.a \
+	    $(GEN_LINK_LIBS) \
+	    --end-group; \
+	else \
+	  echo "  CC      bpkg (HTTP/file only, no mbedTLS)"; \
+	  $(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $(BUILD)/bin/bpkg.o; \
+	  $(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) $(if $(GEN_LINKER),-T $(GEN_LINKER)) -o $@ $(GEN_CRT0) $(BUILD)/bin/bpkg.o $(GEN_LINK_LIBS); \
+	fi
+ifeq ($(GEN_MUSL_POSTLINK),1)
+	python3 -c "\
+import sys; f=sys.argv[1]; \
+d=open(f,'rb').read(); \
+d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
+open(f,'wb').write(d); \
+fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+endif
+
 DISPLAYD_DIR := displayd
 DISPLAYD_SRCS := $(DISPLAYD_DIR)/displayd_main.c $(DISPLAYD_DIR)/displayd_protocol.c \
 	$(DISPLAYD_DIR)/displayd_window.c $(DISPLAYD_DIR)/displayd_render.c \
@@ -597,7 +628,6 @@ $(BUILD)/bin/m108_smoke: bin/smoke/m108_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE
 # m32_nettool gains an mbedTLS loopback HTTPS server when the static mbedTLS
 # archives are present (built by tools/ports/build-curl.sh with B1NIX_TLS=mbedtls).
 # Without them it builds HTTP-only so a `B1NIX_TLS=none` build still works.
-MBEDTLS_DIR := ../build/$(B1NIX_ARCH)/ports/mbedtls/install
 $(BUILD)/bin/m32_nettool: bin/helpers/m32_nettool.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
 	@mkdir -p $(dir $@)
 	@if [ -f $(MBEDTLS_DIR)/lib/libmbedtls.a ]; then \
@@ -1199,6 +1229,12 @@ endif
 		while read -r cmd; do ln -sfn /opt/busybox/bin/busybox "$(ROOTFS)/bin/$$cmd"; done
 	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/bin/sh
 	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/bin/ash
+	@# /usr/bin/env: every third-party script starts "#!/usr/bin/env something",
+	@# and the kernel resolves that path literally — without this entry the
+	@# script fails with ENOENT and the shell reports "not found", which reads
+	@# like the script itself is missing. Alpine (and every distro) ships it.
+	@mkdir -p $(ROOTFS)/usr/bin
+	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/usr/bin/env
 	@# M108: su, passwd and login are BusyBox's three BB_SUID_REQUIRE applets —
 	@# they need euid 0 to read /etc/shadow and to change identity, so they get
 	@# the setuid copy of the multicall ELF (build-busybox.sh installs

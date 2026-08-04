@@ -877,8 +877,12 @@ vendor, so M102a and M102b are two consumers of it rather than two ports.
 
 - [x] `initial` Write `/bin/bpkg` as a plain C ELF with its own inflate, tar and SHA-256.
 - [x] `initial` Read both the house flat index and a real Alpine repository.
-- [x] `initial` Resolve dependencies and support update, install, remove, list, search and info.
-- [ ] `planned` Add HTTPS transport and package signature verification.
+- [x] Resolve dependencies and support update, install, remove, list, search and info.
+- [x] Speak HTTPS (mbedTLS, chain verified against the host-derived CA bundle) and read several repositories from one `INDEX_URL`.
+- [x] Resolve Alpine's virtual dependencies (`so:`/`cmd:`/path) through the index's `p:` provides, with `/etc/bpkg.provided` for what the base image already supplies.
+- [x] Verify a package end to end: RSA/SHA-1 signature against Alpine's keys, then `.PKGINFO`'s `datahash` against the payload. Unsigned over the network is refused.
+- [x] Install and run a real package from the real mirror: `bpkg install neofetch figlet` resolves and installs bash, readline, libncursesw and ncurses-terminfo-base, each signature-checked, and the unmodified Alpine binaries run. See [bpkg](bpkg-package-manager.md).
+- [ ] `planned` Run `.post-install`/`.pre-install` scripts and triggers, and track `/etc/apk/world`.
 - [ ] `planned` Migrate the from-source ports to packages.
 
 ## M105: PAM (OpenPAM + pam_unix.so)
@@ -888,8 +892,9 @@ vendor, so M102a and M102b are two consumers of it rather than two ports.
 
 ## M106: DNS resolver
 
-- [ ] `planned` Resolve names outbound: `nslookup` and `curl` both fail today.
-- [ ] `planned` Check CNAME chain handling and the response parser first.
+- [x] Resolve names outbound. The resolver was never the problem — three socket bugs were: a datagram socket sent with source port 0 (so replies matched no binding), `recvfrom` reported the last send target instead of the sender, and `recvmsg` zero-filled `msg_name` — which is the one musl's resolver actually reads, and it drops any reply whose source does not match the nameserver.
+- [x] `getaddrinfo`, `curl` and `bpkg` all resolve names; covered by `DNS-SMOKE: ok resolve-name`.
+- [x] Alongside it: `/dev/fd` + magic-link `/proc/self/fd/<N>` opens (bash process substitution) and 64 KiB pipes (bash here-documents). Both were silent hangs, not errors.
 
 ## M107: BusyBox applets blocked on missing kernel subsystems
 

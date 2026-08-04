@@ -22,6 +22,39 @@ static u16 ntoh16(u16 value) {
   return (u16)((value << 8) | (value >> 8));
 }
 
+/* A datagram socket that has never been given a local port still needs one:
+ * the reply to whatever it sends comes back addressed to that port, and
+ * vfs_socket_push_udp() only delivers to a registered binding. Sending with
+ * source port 0 (what an unbound socket, or bind(port=0), used to do) means
+ * every answer is dropped — this is exactly why musl's resolver, and so
+ * getaddrinfo()/curl/bpkg, could never resolve a name while BusyBox's own
+ * resolver (which binds a real port) could.
+ *
+ * Assigns an unused ephemeral port, registers the binding and returns it in
+ * network byte order. Returns 0 when the table is full. */
+static u16 udp_autobind(struct vfs_handle *h) {
+  static u16 next_ephemeral = 49152;
+  for (int attempt = 0; attempt < 16384; attempt++) {
+    u16 port_host = next_ephemeral;
+    next_ephemeral = (u16)(port_host >= 65535 ? 49152 : port_host + 1);
+    u16 port_net = ntoh16(port_host); /* a 16-bit swap is its own inverse */
+    int taken = 0;
+    for (int i = 0; i < MAX_UDP_BINDINGS; i++)
+      if (udp_bindings[i].used && udp_bindings[i].port == port_net) { taken = 1; break; }
+    if (taken) continue;
+    for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
+      if (!udp_bindings[i].used) {
+        udp_bindings[i].used = 1;
+        udp_bindings[i].port = port_net;
+        udp_bindings[i].handle = h;
+        return port_net;
+      }
+    }
+    return 0; /* binding table full */
+  }
+  return 0;
+}
+
 /* IPv4-mapped IPv6 address ::ffff:a.b.c.d (dual-stack): the first 10 bytes are
  * zero, then 0xffff, then the 4 IPv4 octets. */
 static int in6_is_v4mapped(const struct in6_addr_k *a) {
@@ -123,10 +156,14 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
         /* Dual-stack: ::ffff:a.b.c.d is delivered over the IPv4 path. */
         struct ipv4_addr v4 = {{dst.bytes[12], dst.bytes[13], dst.bytes[14],
                                 dst.bytes[15]}};
+        if (s->local.in6.sin6_port == 0)
+          s->local.in6.sin6_port = udp_autobind(h);
         udp_send_net(v4, s->local.in6.sin6_port, s->peer.in6.sin6_port, buf,
                      len);
         return (isize)len;
       }
+      if (s->local.in6.sin6_port == 0)
+        s->local.in6.sin6_port = udp_autobind(h);
       udp6_send(dst, s->local.in6.sin6_port, s->peer.in6.sin6_port, buf, len);
       return (isize)len;
     }
@@ -155,6 +192,8 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
   if (s->type == B1NIX_SOCK_DGRAM) {
     if (!s->connected && s->peer.in.sin_port == 0)
       return -ENOTCONN;
+    if (s->local.in.sin_port == 0)
+      s->local.in.sin_port = udp_autobind(h);
     udp_send_net(dst_ip, s->local.in.sin_port, s->peer.in.sin_port, buf, len);
     return (isize)len;
   }
@@ -203,6 +242,10 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     usize pkt_len = s->udp_q_len[slot];
     usize to_copy = len < pkt_len ? len : pkt_len;
     memcpy(buf, s->udp_q_buf[slot], to_copy);
+    memcpy(s->udp_last_src_ip, s->udp_q_src_ip[slot], sizeof(s->udp_last_src_ip));
+    s->udp_last_src_port = s->udp_q_src_port[slot];
+    s->udp_last_src_is6 = s->udp_q_src_is6[slot];
+    s->udp_last_src_valid = 1;
     if (!(flags & B1NIX_MSG_PEEK)) {
       s->udp_q_head = (u8)((s->udp_q_head + 1) % 8);
       s->udp_q_count--;
@@ -283,6 +326,40 @@ isize vfs_socket_sendto(int fd, const void *buf, usize len, int flags,
   return rc;
 }
 
+/* Builds a sockaddr describing the sender of the datagram most recently handed
+ * to userspace on this socket. Returns bytes written, 0 when unknown. */
+static usize sock_fill_last_src(struct vfs_socket_state *s, void *addr, usize cap) {
+  if (!s->udp_last_src_valid || !addr || !cap) return 0;
+  if (s->domain == B1NIX_AF_INET && !s->udp_last_src_is6) {
+    struct b1nix_sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = B1NIX_AF_INET;
+    sin.sin_port = s->udp_last_src_port;
+    memcpy(&sin.sin_addr, s->udp_last_src_ip, 4);
+    usize n = cap < sizeof(sin) ? cap : sizeof(sin);
+    memcpy(addr, &sin, n);
+    return n;
+  }
+  if (s->domain == B1NIX_AF_INET6) {
+    struct b1nix_sockaddr_in6 sin6;
+    memset(&sin6, 0, sizeof(sin6));
+    sin6.sin6_family = B1NIX_AF_INET6;
+    sin6.sin6_port = s->udp_last_src_port;
+    if (s->udp_last_src_is6) {
+      memcpy(sin6.sin6_addr.s6_addr, s->udp_last_src_ip, 16);
+    } else {
+      /* A v4 datagram on a dual-stack socket is reported v4-mapped. */
+      sin6.sin6_addr.s6_addr[10] = 0xff;
+      sin6.sin6_addr.s6_addr[11] = 0xff;
+      memcpy(sin6.sin6_addr.s6_addr + 12, s->udp_last_src_ip, 4);
+    }
+    usize n = cap < sizeof(sin6) ? cap : sizeof(sin6);
+    memcpy(addr, &sin6, n);
+    return n;
+  }
+  return 0;
+}
+
 isize vfs_socket_recvfrom(int fd, void *buf, usize len, int flags, void *addr,
                           usize *addrlen) {
   struct vfs_handle *h = scheduler_fd_get(fd);
@@ -323,11 +400,43 @@ isize vfs_socket_recvfrom(int fd, void *buf, usize len, int flags, void *addr,
     *addrlen = 0;
     return 0;
   }
+
+  /* Datagram socket: report the sender of THIS datagram, recorded when it was
+   * popped off the queue. Reporting s->peer instead (the last sendto target,
+   * which vfs_socket_sendto restores after every send anyway) meant an
+   * unconnected socket reported all zeros — and musl's resolver discards any
+   * reply whose source does not match the nameserver it asked, so DNS could
+   * never resolve even though the answer had arrived intact. */
   isize rc = vfs_socket_recv_h(h, buf, len, flags);
-  usize n = *addrlen < sizeof(s->peer) ? *addrlen : sizeof(s->peer);
+  if (rc < 0) {
+    *addrlen = 0;
+    return rc;
+  }
+
+  usize n = sock_fill_last_src(s, addr, *addrlen);
+  if (n) {
+    *addrlen = n;
+    return rc;
+  }
+
+  n = *addrlen < sizeof(s->peer) ? *addrlen : sizeof(s->peer);
   memcpy(addr, &s->peer, n);
   *addrlen = n;
   return rc;
+}
+
+/* The same source address, for recvmsg()'s msg_name. musl's resolver uses
+ * recvmsg(), not recvfrom(), and discards every reply whose msg_name does not
+ * match the nameserver it queried — so the zero-filled msg_name this used to
+ * hand back made DNS impossible even though every packet arrived intact.
+ * Returns the number of bytes written, 0 when there is nothing to report. */
+usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h || h->kind != VFS_HANDLE_SOCKET || !addr || !cap) return 0;
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  if (!s) return 0;
+  if (s->domain != B1NIX_AF_INET && s->domain != B1NIX_AF_INET6) return 0;
+  return sock_fill_last_src(s, addr, cap);
 }
 
 static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
@@ -932,6 +1041,10 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
     s->local.in6 = *(const struct b1nix_sockaddr_in6 *)addr;
     s->bound = 1;
     if (s->type == B1NIX_SOCK_DGRAM) {
+      if (s->local.in6.sin6_port == 0) { /* "any port" — see the IPv4 path */
+        s->local.in6.sin6_port = udp_autobind(h);
+        return s->local.in6.sin6_port ? 0 : -ENOBUFS;
+      }
       u16 port = s->local.in6.sin6_port;
       if (!s->so_reuseaddr) {
         for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
@@ -956,6 +1069,13 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
   s->local.in = *(const struct b1nix_sockaddr_in *)addr;
   s->bound = 1;
   if (s->type == B1NIX_SOCK_DGRAM) {
+    /* bind(port=0) means "any port", not "port zero" — musl's resolver does
+     * exactly this before sending its queries. Assign a real one, or the
+     * answers come back to a port nothing is listening on. */
+    if (s->local.in.sin_port == 0) {
+      s->local.in.sin_port = udp_autobind(h);
+      return s->local.in.sin_port ? 0 : -ENOBUFS;
+    }
     u16 port = s->local.in.sin_port;
     if (!s->so_reuseaddr) {
       for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
@@ -1471,7 +1591,8 @@ int vfs_shutdown(int fd, int how) {
   return 0;
 }
 
-int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len) {
+int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len,
+                        const void *src_ip, int src_is_v6, u16 src_port_net) {
   for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
     if (udp_bindings[i].used && udp_bindings[i].port == local_port_net) {
       struct vfs_handle *h = udp_bindings[i].handle;
@@ -1487,6 +1608,13 @@ int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len) {
       usize copy = (len > sizeof(s->udp_q_buf[slot])) ? sizeof(s->udp_q_buf[slot]) : len;
       memcpy(s->udp_q_buf[slot], data, copy);
       s->udp_q_len[slot] = copy;
+      /* Remember who sent it — recvfrom() must report this sender, not the
+       * socket's last send target. */
+      memset(s->udp_q_src_ip[slot], 0, sizeof(s->udp_q_src_ip[slot]));
+      if (src_ip)
+        memcpy(s->udp_q_src_ip[slot], src_ip, src_is_v6 ? 16 : 4);
+      s->udp_q_src_port[slot] = src_port_net;
+      s->udp_q_src_is6[slot] = (u8)(src_is_v6 ? 1 : 0);
       s->udp_q_tail = (u8)((s->udp_q_tail + 1) % 8);
       s->udp_q_count++;
       s->recv_len = s->udp_q_len[s->udp_q_head];
