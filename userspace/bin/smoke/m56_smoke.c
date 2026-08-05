@@ -185,6 +185,43 @@ static int test_seal(void) {
     return ok;
 }
 
+/* A repeating timerfd must wake epoll_wait on schedule. This is the shape of
+ * every real event loop (libwayland's among them): if timers do not drive
+ * epoll, everything socket-driven keeps working while everything time-driven —
+ * a compositor's frame clock, a retry backoff, a watchdog — silently never
+ * runs, which is the kind of failure that looks like a hang somewhere else. */
+static int test_timerfd_epoll_cadence(void) {
+    int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (tfd < 0)
+        return 0;
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_nsec = 50 * 1000 * 1000;
+    its.it_interval.tv_nsec = 50 * 1000 * 1000;
+    if (timerfd_settime(tfd, 0, &its, NULL) != 0) { close(tfd); return 0; }
+
+    int ep = epoll_create1(0);
+    if (ep < 0) { close(tfd); return 0; }
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = tfd };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, tfd, &ev) != 0) { close(ep); close(tfd); return 0; }
+
+    int wakeups = 0;
+    unsigned long long expirations = 0;
+    for (int i = 0; i < 10; i++) {
+        struct epoll_event out[2];
+        int n = epoll_wait(ep, out, 2, 2000); /* generous: 40x the period */
+        if (n <= 0)
+            break;
+        unsigned long long exp = 0;
+        if (read(tfd, &exp, sizeof(exp)) == (ssize_t)sizeof(exp))
+            expirations += exp;
+        wakeups++;
+    }
+    close(ep);
+    close(tfd);
+    return (wakeups == 10 && expirations >= 10);
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -192,6 +229,9 @@ int main(int argc, char **argv) {
 
     if (test_eventfd())  marker("M56-SMOKE: ok eventfd\n");
     else                 marker("M56-SMOKE: FAIL eventfd\n");
+
+    if (test_timerfd_epoll_cadence()) marker("M56-SMOKE: ok timerfd-epoll\n");
+    else                              marker("M56-SMOKE: FAIL timerfd-epoll\n");
 
     if (test_epoll())    marker("M56-SMOKE: ok epoll\n");
     else                 marker("M56-SMOKE: FAIL epoll\n");
