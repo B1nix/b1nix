@@ -621,9 +621,34 @@ static u32 net_ip_as_be(struct ipv4_addr a) {
          ((u32)a.bytes[3] << 24);
 }
 
+/* FIONREAD: how many bytes a read would return right now. Every event-driven
+ * server asks this — sway's IPC server calls it on each client and drops any
+ * client it fails for, which is exactly what it did here while the socket
+ * ioctl path answered ENODEV for anything that was not an ifreq command. */
+#define SOCK_FIONREAD 0x541B
+
 static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   if (!arg)
     return -EFAULT;
+
+  if (request == SOCK_FIONREAD) {
+    struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+    if (!s)
+      return -ENOTSOCK;
+    usize n = 0;
+    if (s->domain == B1NIX_AF_UNIX) {
+      n = unix_bytes_available(s);
+    } else if (s->type == B1NIX_SOCK_STREAM) {
+      n = tcp_bytes_available((struct tcp_conn *)s->tcp_conn);
+    } else if (s->udp_q_count > 0) {
+      /* Datagram sockets report the next datagram, not the whole queue. */
+      n = s->udp_q_len[s->udp_q_head];
+    }
+    int v = (int)n;
+    if (syscall_copyout(arg, &v, sizeof(v)) < 0)
+      return -EFAULT;
+    return 0;
+  }
 
   if (request == SIOC_ADDRT || request == SIOC_DELRT) {
     /* Linux dispatches on the socket's family: an AF_INET6 socket carries a
@@ -1278,7 +1303,8 @@ int vfs_connect(int fd, const void *addr, usize addrlen) {
   
   if (s->domain == B1NIX_AF_UNIX) {
     if (!addr || addrlen < sizeof(u16) + 1) return -EINVAL;
-    return unix_connect(s, (const struct b1nix_sockaddr_un *)addr);
+    return unix_connect(s, (const struct b1nix_sockaddr_un *)addr,
+                        (h->flags & B1NIX_O_NONBLOCK) ? 1 : 0);
   }
 
   if (s->domain == B1NIX_AF_INET6) {

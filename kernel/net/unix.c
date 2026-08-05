@@ -29,6 +29,11 @@ struct unix_socket_data {
    * socket is one it is responsible for. */
   struct b1nix_ucred owner;
   struct unix_socket_data *peer;
+  /* This socket has been connected at least once. It distinguishes "the peer
+   * hung up" (POLLHUP) from "never connected", which a listening socket is
+   * permanently in — reporting HUP on a listener tells an event loop its
+   * listening socket died. */
+  int had_peer;
   struct unix_socket_data *backlog[16];
   int backlog_count;
   int backlog_max;
@@ -118,6 +123,8 @@ void unix_link_pair(struct vfs_socket_state *a, struct vfs_socket_state *b) {
   unix_data_get(ua); /* b->peer holds a reference on a */
   a->connected = 1;
   b->connected = 1;
+  ua->had_peer = 1;
+  ub->had_peer = 1;
 }
 
 void unix_free_state(struct vfs_socket_state *s) {
@@ -208,6 +215,21 @@ void unix_free_state(struct vfs_socket_state *s) {
 
 /* SO_PEERCRED: the identity of the process that created the socket at the other
  * end of this connection. Only a connected socket has one. */
+/* Bytes a reader could take right now — what FIONREAD reports. A SEQPACKET
+ * socket answers with its next message's length, since that is all one read
+ * can return. */
+usize unix_bytes_available(struct vfs_socket_state *s) {
+  struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
+  if (!u)
+    return 0;
+  unix_lock(u);
+  usize n = u->rb_count;
+  if (s->type == B1NIX_SOCK_SEQPACKET && u->msg_count)
+    n = u->msg_len[u->msg_head];
+  unix_unlock(u);
+  return n;
+}
+
 int unix_peer_cred(struct vfs_socket_state *s, struct b1nix_ucred *out) {
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
   if (!u || !out)
@@ -244,7 +266,8 @@ int unix_listen(struct vfs_socket_state *s, int backlog) {
   return 0;
 }
 
-int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr) {
+int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr,
+                 int nonblock) {
   /* /dev/log: the kernel is the syslog sink (no userspace syslogd). musl's
    * syslog() connect()s a SOCK_DGRAM here; accept it and forward later sends to
    * the serial console instead of requiring a bound peer socket. */
@@ -286,6 +309,15 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
     scheduler_wake_all(peer_s);
     scheduler_wake_all(vfs_poll_chan);
 
+    /* O_NONBLOCK: the connection is queued in the listener's backlog, and
+     * POSIX says report EINPROGRESS now rather than waiting for accept().
+     * Blocking here regardless is how a non-blocking connect() to a listener
+     * that had not accepted yet wedged the caller for good. */
+    if (nonblock && !s->connected) {
+      vfs_node_put(peer_node);
+      return -EINPROGRESS;
+    }
+
     /* Block until connected (simplified: just wait for peer to link us) */
     while (!s->connected) {
       if (scheduler_signal_pending()) {
@@ -316,6 +348,7 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
     unix_data_get(peer_u); /* u->peer holds a reference on the peer */
     u->peer = peer_u;
     s->connected = 1;
+    u->had_peer = 1;
   }
 
   vfs_node_put(peer_node);
@@ -349,6 +382,8 @@ int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s,
       unix_data_get(new_u);
       client_u->peer = new_u;
       new_s->connected = 1;
+      new_u->had_peer = 1;
+      client_u->had_peer = 1;
       if (client_u->socket)
         client_u->socket->connected = 1;
 
@@ -657,7 +692,14 @@ int unix_poll(struct vfs_socket_state *s, struct b1nix_pollfd *pfd) {
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
   pfd->revents = 0;
   if (u->rb_count > 0) pfd->revents |= B1NIX_POLLIN;
-  if (s->type == B1NIX_SOCK_STREAM && !s->connected) pfd->revents |= B1NIX_POLLHUP;
+  /* POLLHUP means a peer that WAS there is gone. A listening socket has no
+   * peer by definition and a fresh socket has not had one yet; reporting HUP
+   * for either tells an event loop that its socket died, which is how sway's
+   * IPC listener ended up unusable — every dispatch saw HANGUP on the one fd
+   * it was waiting to accept connections on. */
+  if (s->type == B1NIX_SOCK_STREAM && !s->listening && !s->connected &&
+      u->had_peer)
+    pfd->revents |= B1NIX_POLLHUP;
   
   /* Check if peer has space for writing. Pin the peer while we read it so a
    * concurrent close cannot free it under us. */

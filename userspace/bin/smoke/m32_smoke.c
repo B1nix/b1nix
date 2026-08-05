@@ -857,9 +857,20 @@ static int test_getnameinfo(void) {
   s4.sin_port = htons(80);
   s4.sin_addr.s_addr = inet_addr("127.0.0.1");
   if (getnameinfo((struct sockaddr *)&s4, sizeof(s4), host, sizeof(host), serv,
-                  sizeof(serv), 0) != 0 ||
+                  sizeof(serv), NI_NUMERICHOST | NI_NUMERICSERV) != 0 ||
       strcmp(host, "127.0.0.1") != 0 || strcmp(serv, "80") != 0) {
     fail("getnameinfo4");
+    return -1;
+  }
+  /* Without NI_NUMERICHOST the resolver is allowed to name the address, and
+   * now that reverse lookups work it does: /etc/hosts maps 127.0.0.1 to
+   * localhost. Either answer is correct here — what must hold is that the
+   * call succeeds and returns something. (This assertion used to demand the
+   * numeric form, which only held while reverse resolution was broken.) */
+  if (getnameinfo((struct sockaddr *)&s4, sizeof(s4), host, sizeof(host), serv,
+                  sizeof(serv), 0) != 0 ||
+      host[0] == 0 || serv[0] == 0) {
+    fail("getnameinfo4-named");
     return -1;
   }
   ok("getnameinfo");

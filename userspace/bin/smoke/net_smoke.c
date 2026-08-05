@@ -11,7 +11,9 @@
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -261,7 +263,82 @@ static void test_dns_parse(void) {
   }
 }
 
+/* FIONREAD and the poll flags a real event-driven server depends on. Both were
+ * missing or wrong: the socket ioctl path answered ENODEV for FIONREAD, and a
+ * LISTENING unix socket reported POLLHUP because it has no peer — sway's IPC
+ * server hit both, dropping every client it accepted. */
+static void test_unix_socket_events(void) {
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0) {
+    marker("UNIX-SMOKE: fail socketpair\n");
+    return;
+  }
+  int avail = -1;
+  if (ioctl(sp[0], FIONREAD, &avail) == 0 && avail == 0) {
+    if (write(sp[1], "hello!", 6) == 6) {
+      avail = -1;
+      if (ioctl(sp[0], FIONREAD, &avail) == 0 && avail == 6)
+        marker("UNIX-SMOKE: ok fionread\n");
+      else
+        marker("UNIX-SMOKE: fail fionread\n");
+    } else {
+      marker("UNIX-SMOKE: fail fionread\n");
+    }
+  } else {
+    marker("UNIX-SMOKE: fail fionread\n");
+  }
+
+  /* A peer that closes IS a hangup, and must be reported as one. */
+  close(sp[1]);
+  struct pollfd pfd = {sp[0], POLLIN, 0};
+  poll(&pfd, 1, 0);
+  if (pfd.revents & POLLHUP)
+    marker("UNIX-SMOKE: ok peer-close-hup\n");
+  else
+    marker("UNIX-SMOKE: fail peer-close-hup\n");
+  close(sp[0]);
+
+  /* A listening socket has no peer by definition: reporting POLLHUP on it
+   * tells an event loop its listening socket died. */
+  int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (srv < 0) { marker("UNIX-SMOKE: fail listen-socket\n"); return; }
+  struct sockaddr_un sun;
+  memset(&sun, 0, sizeof(sun));
+  sun.sun_family = AF_UNIX;
+  strcpy(sun.sun_path, "/tmp/net_smoke_listen.sock");
+  unlink(sun.sun_path);
+  if (bind(srv, (struct sockaddr *)&sun, sizeof(sun)) < 0 || listen(srv, 4) < 0) {
+    marker("UNIX-SMOKE: fail listen-bind\n");
+    close(srv);
+    return;
+  }
+  struct pollfd lp = {srv, POLLIN, 0};
+  poll(&lp, 1, 0);
+  if (lp.revents & POLLHUP) {
+    marker("UNIX-SMOKE: fail listen-no-hup\n");
+  } else {
+    /* ...and once a client is queued it must report readability. */
+    int cli = socket(AF_UNIX, SOCK_STREAM, 0);
+    int connected = 0;
+    if (cli >= 0) {
+      fcntl(cli, F_SETFL, fcntl(cli, F_GETFL, 0) | O_NONBLOCK);
+      connect(cli, (struct sockaddr *)&sun, sizeof(sun));
+      connected = 1;
+    }
+    lp.revents = 0;
+    poll(&lp, 1, 100);
+    if (connected && (lp.revents & POLLIN) && !(lp.revents & POLLHUP))
+      marker("UNIX-SMOKE: ok listen-no-hup\n");
+    else
+      marker("UNIX-SMOKE: fail listen-no-hup\n");
+    if (cli >= 0) close(cli);
+  }
+  close(srv);
+  unlink(sun.sun_path);
+}
+
 int main(void) {
+  test_unix_socket_events();
   test_ping_gateway();
   test_udp_send_recv();
   test_tcp_path();

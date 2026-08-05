@@ -208,6 +208,7 @@ struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port);
 struct tcp_conn *tcp_connect_async(struct ipv4_addr dst_ip, u16 dst_port);
 int tcp_is_established(struct tcp_conn *conn);
 int tcp_is_readable(struct tcp_conn *conn);
+usize tcp_bytes_available(struct tcp_conn *conn);
 int tcp_is_close_wait(struct tcp_conn *conn);
 int tcp_is_closed(struct tcp_conn *conn);
 int tcp_send(struct tcp_conn *conn, const void *data, usize len);
@@ -385,7 +386,8 @@ void unix_free_state(struct vfs_socket_state *s);
 void unix_link_pair(struct vfs_socket_state *a, struct vfs_socket_state *b);
 int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr);
 int unix_listen(struct vfs_socket_state *s, int backlog);
-int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr);
+int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr,
+                 int nonblock);
 int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s,
                 int nonblock);
 isize unix_send(struct vfs_socket_state *s, const void *buf, usize len,
@@ -402,5 +404,6 @@ int unix_poll(struct vfs_socket_state *s, struct b1nix_pollfd *pfd);
 /* SO_PEERCRED — credentials of the peer socket's creator. -ENOTCONN if the
  * socket has no peer. */
 int unix_peer_cred(struct vfs_socket_state *s, struct b1nix_ucred *out);
+usize unix_bytes_available(struct vfs_socket_state *s);
 
 #endif

@@ -1035,6 +1035,20 @@ int tcp_is_established(struct tcp_conn *conn) {
   return res;
 }
 
+/* Bytes a reader could take right now — what FIONREAD reports. */
+usize tcp_bytes_available(struct tcp_conn *conn) {
+  if (!conn)
+    return 0;
+  u64 irq = irq_save();
+  tcp_lock();
+  usize n = 0;
+  if (conn->used && conn->recv_len > conn->recv_read)
+    n = (usize)(conn->recv_len - conn->recv_read);
+  tcp_unlock();
+  irq_restore(irq);
+  return n;
+}
+
 int tcp_is_readable(struct tcp_conn *conn) {
   if (!conn)
     return 1;
