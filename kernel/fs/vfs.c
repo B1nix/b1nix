@@ -1006,10 +1006,21 @@ void vfs_inode_put(struct vfs_inode *inode) {
   }
 }
 
+/* Forward declaration: dir_seq's counter lives with the readdir cursor logic
+ * further down, but every node must get a sequence number here — see below. */
+static u64 dir_seq_next(void);
+
 static struct vfs_node *alloc_node(void) {
   struct vfs_node *n = vfs_alloc_node();
   if (n) {
     n->refcount = 0;
+    /* Assign the readdir cursor sequence for EVERY node, not just the ones
+     * built through vfs_create_node. The in-memory readdir resumes from
+     * "children whose dir_seq is below the last one emitted", and a child left
+     * at 0 collapsed that bound to "no bound": the walk restarted from the head
+     * of the sibling list on every call, so readdir() on the directory repeated
+     * the same entry forever and `ls /run` never returned. */
+    n->dir_seq = dir_seq_next();
     __atomic_add_fetch(&node_count, 1, __ATOMIC_RELAXED);
   }
   return n;
@@ -1669,11 +1680,14 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
  * node keeps its cursor position if it is ever moved between directories. */
 static u64 g_dir_seq_next = 1;
 
+static u64 dir_seq_next(void) {
+  return __atomic_fetch_add(&g_dir_seq_next, 1, __ATOMIC_RELAXED);
+}
+
 struct vfs_node *vfs_create_node(enum vfs_node_type type) {
-  struct vfs_node *n = alloc_node();
+  struct vfs_node *n = alloc_node(); /* dir_seq assigned there */
   if (!n)
     return NULL;
-  n->dir_seq = __atomic_fetch_add(&g_dir_seq_next, 1, __ATOMIC_RELAXED);
   n->inode = alloc_inode();
   if (!n->inode) {
     n->refcount = 0;
@@ -4830,6 +4844,11 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
          child = child->next_sibling) {
       if (child->deleted)
         continue;
+      if (child->dir_seq == 0) {
+        /* Should not happen (alloc_node assigns one), but a zero here used to
+         * mean an endless walk; give it a number instead. */
+        child->dir_seq = dir_seq_next();
+      }
       if (seq_below && child->dir_seq >= seq_below)
         continue; /* already returned in an earlier batch */
       copy_path(buf[count].name, 64, child->name);

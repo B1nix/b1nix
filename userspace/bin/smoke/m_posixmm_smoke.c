@@ -15,8 +15,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <dirent.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static void marker(const char *s) { write(1, s, strlen(s)); }
@@ -205,8 +208,53 @@ static int test_shm_open(void) {
 	return ok ? 0 : 4;
 }
 
+/* readdir must terminate. The in-memory readdir resumes from "children whose
+ * dir_seq is below the last emitted", and a child left at dir_seq 0 collapsed
+ * that bound to "no bound" — the walk restarted from the head of the sibling
+ * list on every call and the directory repeated one entry forever, so `ls` on
+ * it never returned. Nodes not built through vfs_create_node (mkdir among
+ * them) were exactly that case. */
+static int test_readdir_terminates(void) {
+	const char *dir = "/tmp/mm_readdir";
+	char p[128];
+	mkdir(dir, 0755);
+	for (int i = 0; i < 3; i++) {
+		snprintf(p, sizeof(p), "%s/sub%d", dir, i);
+		mkdir(p, 0755);
+	}
+	snprintf(p, sizeof(p), "%s/file", dir);
+	int fd = open(p, O_CREAT | O_WRONLY, 0644);
+	if (fd >= 0)
+		close(fd);
+
+	DIR *d = opendir(dir);
+	if (!d)
+		return 1;
+	int n = 0, saw_file = 0, saw_sub = 0;
+	struct dirent *e;
+	/* A repeat-forever bug shows up as the count running away; cap it well
+	 * above the real entry count so a correct walk is never cut short. */
+	while ((e = readdir(d)) != NULL && n < 200) {
+		n++;
+		if (strcmp(e->d_name, "file") == 0)
+			saw_file++;
+		if (strncmp(e->d_name, "sub", 3) == 0)
+			saw_sub++;
+	}
+	closedir(d);
+	/* ".", "..", three subdirs and one file — and each exactly once. */
+	return (n <= 8 && saw_file == 1 && saw_sub == 3) ? 0 : 2;
+}
+
 int main(void) {
 	marker("MM-SMOKE: start\n");
+
+	int rdrc = test_readdir_terminates();
+	if (rdrc != 0) {
+		marker("MM-SMOKE: fail readdir-terminates\n");
+		return 50 + rdrc;
+	}
+	marker("MM-SMOKE: ok readdir-terminates\n");
 
 	int shmrc = test_shm_open();
 	if (shmrc != 0) {
