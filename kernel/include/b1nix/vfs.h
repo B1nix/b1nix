@@ -547,6 +547,11 @@ struct vfs_socket_state {
   int so_error;
   int so_rcvbuf;
   int so_sndbuf;
+  /* SO_RCVTIMEO / SO_SNDTIMEO, in milliseconds; 0 means "no timeout", which is
+   * what a socket starts with. A blocking recv/send that reaches the deadline
+   * with nothing transferred reports EAGAIN, as POSIX requires. */
+  u64 so_rcvtimeo_ms;
+  u64 so_sndtimeo_ms;
   int backlog;
   int shut_rd;
   int shut_wr;

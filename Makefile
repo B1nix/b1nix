@@ -1743,6 +1743,16 @@ ifdef LIBC_SO
 	       $(BUILD_DIR)/rootfs/lib/libdl.so $(BUILD_DIR)/rootfs/lib/libcrypt.so \
 	       $(BUILD_DIR)/rootfs/lib/libutil.so $(BUILD_DIR)/rootfs/lib/libresolv.so
 	@cp -f $(LIBC_SO) $(BUILD_DIR)/rootfs/lib/$(LIBC_LDSO_NAME)
+	@# EI_OSABI = ELFOSABI_LINUX on the loader itself. As PT_INTERP its
+	@# personality comes from the program it interprets, but run DIRECTLY
+	@# (`ld-musl-x86_64.so.1 --list prog`, which is what `ldd` is) it IS the
+	@# program — and with OSABI 0 and no PT_INTERP of its own, nothing marked it
+	@# as a Linux binary. Its arch_prctl(ARCH_SET_FS) then went untranslated,
+	@# __init_tp() failed, and musl did what it does on that path: executed
+	@# `hlt`, which #GPs in ring 3. Every other musl binary is stamped the same
+	@# way (tools/b1nix-musl-cc); the loader was the one that was not.
+	@python3 -c "import sys; f=open(sys.argv[1],'r+b'); f.seek(7); f.write(bytes([3])); f.close()" \
+		$(BUILD_DIR)/rootfs/lib/$(LIBC_LDSO_NAME)
 	@# The ext4 driver may not follow symlinks, so give every name a real
 	@# directory entry. Hard links share one inode: the image carries the bytes
 	@# once no matter how many names point at them.

@@ -128,6 +128,65 @@ void vfs_socket_push_raw_icmp(struct ipv4_addr src, const void *icmp,
   }
 }
 
+/* SO_RCVTIMEO/SO_SNDTIMEO plumbing. Timeouts are kept in milliseconds and
+ * converted to scheduler ticks (100 Hz) at the point of blocking; a deadline of
+ * 0 means "wait forever", which is a socket's default. */
+static u64 sock_deadline(u64 timeout_ms) {
+  if (!timeout_ms)
+    return 0;
+  u64 ticks = (timeout_ms + 9) / 10; /* round up: never wake early */
+  if (ticks == 0)
+    ticks = 1;
+  return scheduler_get_ticks() + ticks;
+}
+
+static int sock_deadline_passed(u64 deadline) {
+  return deadline != 0 && scheduler_get_ticks() >= deadline;
+}
+
+/* Ticks left until `deadline`, at least 1 so a blocking wait always sleeps. */
+static u64 sock_deadline_remaining(u64 deadline) {
+  u64 now = scheduler_get_ticks();
+  if (deadline <= now)
+    return 1;
+  return deadline - now;
+}
+
+/* A blocking send() must wait for the send window to open; tcp_send() reports
+ * -EAGAIN when the congestion/peer window is full, and handing that straight to
+ * a blocking caller made large writes fail outright — mbedTLS reads it as a
+ * fatal NET_SEND_FAILED, which is how a package download died mid-handshake.
+ * Waits with a short timeout rather than purely on a wake, so a wake that races
+ * the block costs one retry instead of a hang. SO_SNDTIMEO bounds the wait. */
+static isize tcp_send_blocking(struct vfs_handle *h, struct vfs_socket_state *s,
+                               struct tcp_conn *conn, const void *buf,
+                               usize len) {
+  u64 deadline = sock_deadline(s->so_sndtimeo_ms);
+  for (;;) {
+    if (!s->connected && tcp_is_established(conn))
+      s->connected = 1;
+    if (s->connected) {
+      isize n = tcp_send(conn, buf, len);
+      if (n != -EAGAIN)
+        return n;
+    }
+    if (h->flags & B1NIX_O_NONBLOCK)
+      return -EAGAIN;
+    if (sock_deadline_passed(deadline))
+      return -EAGAIN; /* SO_SNDTIMEO expired with nothing sent */
+    if (scheduler_signal_pending())
+      return -ERESTARTSYS;
+    u64 wait_ticks = 10; /* 100 ms */
+    if (deadline) {
+      u64 left = sock_deadline_remaining(deadline);
+      if (left < wait_ticks)
+        wait_ticks = left;
+    }
+    scheduler_wait_prepare_timeout(vfs_poll_chan, wait_ticks);
+    scheduler_wait_commit();
+  }
+}
+
 isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int flags) {
   (void)flags;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
@@ -168,11 +227,7 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
       return (isize)len;
     }
     if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
-      if (!s->connected && tcp_is_established((struct tcp_conn *)s->tcp_conn))
-        s->connected = 1;
-      if (!s->connected)
-        return -EAGAIN;
-      return tcp_send((struct tcp_conn *)s->tcp_conn, buf, len);
+      return tcp_send_blocking(h, s, (struct tcp_conn *)s->tcp_conn, buf, len);
     }
     return -ENOTCONN;
   }
@@ -198,13 +253,7 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
     return (isize)len;
   }
   if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
-    if (!s->connected && tcp_is_established((struct tcp_conn *)s->tcp_conn)) {
-      s->connected = 1;
-    }
-    if (!s->connected) {
-      return -EAGAIN;
-    }
-    return tcp_send((struct tcp_conn *)s->tcp_conn, buf, len);
+    return tcp_send_blocking(h, s, (struct tcp_conn *)s->tcp_conn, buf, len);
   }
   return -ENOTCONN;
 }
@@ -222,11 +271,17 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
 
   if (s->type == B1NIX_SOCK_DGRAM || s->type == B1NIX_SOCK_RAW ||
       s->domain == B1NIX_AF_NETLINK) {
+    u64 deadline = sock_deadline(s->so_rcvtimeo_ms);
     while (s->udp_q_count == 0) {
       if (h->flags & B1NIX_O_NONBLOCK)
         return -EAGAIN;
+      if (sock_deadline_passed(deadline))
+        return -EAGAIN; /* SO_RCVTIMEO expired with nothing received */
       /* SMP-safe wait — see the TCP recv path below. */
-      scheduler_wait_prepare(s);
+      if (deadline)
+        scheduler_wait_prepare_timeout(s, sock_deadline_remaining(deadline));
+      else
+        scheduler_wait_prepare(s);
       if (s->udp_q_count != 0) {
         scheduler_wait_cancel();
         break;
@@ -261,13 +316,20 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     if (!s->connected) {
       return -EAGAIN;
     }
+    u64 tcp_deadline = sock_deadline(s->so_rcvtimeo_ms);
     while (!tcp_is_readable(conn)) {
       if (h->flags & B1NIX_O_NONBLOCK) {
         return -EAGAIN;
       }
+      if (sock_deadline_passed(tcp_deadline))
+        return -EAGAIN; /* SO_RCVTIMEO expired with nothing received */
       /* SMP-safe wait: publish BLOCKED, then re-test so a wake_all(vfs_poll_chan)
        * racing in from tcp_input on another CPU can't be lost. */
-      scheduler_wait_prepare(vfs_poll_chan);
+      if (tcp_deadline)
+        scheduler_wait_prepare_timeout(vfs_poll_chan,
+                                       sock_deadline_remaining(tcp_deadline));
+      else
+        scheduler_wait_prepare(vfs_poll_chan);
       if (tcp_is_readable(conn)) {
         scheduler_wait_cancel();
         break;
@@ -1454,6 +1516,8 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
 #define SOCK_SO_SNDBUF    7
 #define SOCK_SO_RCVBUF    8
 #define SOCK_SO_KEEPALIVE 9
+#define SOCK_SO_RCVTIMEO  20
+#define SOCK_SO_SNDTIMEO  21
 #define SOCK_SO_REUSEPORT 15
 #define SOCK_SO_PASSCRED  16
 #define SOCK_SO_PEERCRED  17
@@ -1472,12 +1536,40 @@ static struct vfs_socket_state *socket_state_for_fd(int fd, int *err) {
   return (struct vfs_socket_state *)h->private_data;
 }
 
+/* struct timeval as userspace passes it (x86_64: two 64-bit fields). */
+struct sock_timeval {
+  i64 tv_sec;
+  i64 tv_usec;
+};
+
 int vfs_setsockopt(int fd, int level, int optname, const void *optval,
                    usize optlen) {
   int err;
   struct vfs_socket_state *s = socket_state_for_fd(fd, &err);
   if (!s) return err;
-  if (!optval || optlen < sizeof(int)) return -EINVAL;
+  if (!optval) return -EINVAL;
+
+  /* SO_RCVTIMEO/SO_SNDTIMEO carry a struct timeval, not an int. A zero
+   * timeval means "no timeout" (POSIX), which is also the default. */
+  if (level == SOCK_SOL_SOCKET &&
+      (optname == SOCK_SO_RCVTIMEO || optname == SOCK_SO_SNDTIMEO)) {
+    if (optlen < sizeof(struct sock_timeval)) return -EINVAL;
+    const struct sock_timeval *tv = (const struct sock_timeval *)optval;
+    if (tv->tv_sec < 0 || tv->tv_usec < 0 || tv->tv_usec >= 1000000)
+      return -EDOM;
+    u64 ms = (u64)tv->tv_sec * 1000 + (u64)tv->tv_usec / 1000;
+    /* Round a sub-millisecond, non-zero timeout up: it must not read as
+     * "wait forever". */
+    if (ms == 0 && tv->tv_usec > 0)
+      ms = 1;
+    if (optname == SOCK_SO_RCVTIMEO)
+      s->so_rcvtimeo_ms = ms;
+    else
+      s->so_sndtimeo_ms = ms;
+    return 0;
+  }
+
+  if (optlen < sizeof(int)) return -EINVAL;
   int v = *(const int *)optval;
 
   if (level == SOCK_SOL_SOCKET) {
@@ -1533,6 +1625,19 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     if (*optlen < need) return -EINVAL;
     memcpy(optval, &cred, need);
     *optlen = need;
+    return 0;
+  }
+
+  if (level == SOCK_SOL_SOCKET &&
+      (optname == SOCK_SO_RCVTIMEO || optname == SOCK_SO_SNDTIMEO)) {
+    u64 ms = (optname == SOCK_SO_RCVTIMEO) ? s->so_rcvtimeo_ms
+                                           : s->so_sndtimeo_ms;
+    struct sock_timeval tv;
+    tv.tv_sec = (i64)(ms / 1000);
+    tv.tv_usec = (i64)((ms % 1000) * 1000);
+    if (*optlen < sizeof(tv)) return -EINVAL;
+    memcpy(optval, &tv, sizeof(tv));
+    *optlen = sizeof(tv);
     return 0;
   }
 

@@ -416,9 +416,28 @@ int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s,
   }
 }
 
+/* SO_RCVTIMEO/SO_SNDTIMEO deadlines, in scheduler ticks (100 Hz). Shared shape
+ * with the INET paths in socket.c: 0 means wait forever. */
+static u64 unix_deadline(u64 timeout_ms) {
+  if (!timeout_ms)
+    return 0;
+  u64 ticks = (timeout_ms + 9) / 10;
+  return scheduler_get_ticks() + (ticks ? ticks : 1);
+}
+
+static int unix_deadline_passed(u64 deadline) {
+  return deadline != 0 && scheduler_get_ticks() >= deadline;
+}
+
+static u64 unix_deadline_remaining(u64 deadline) {
+  u64 now = scheduler_get_ticks();
+  return deadline <= now ? 1 : deadline - now;
+}
+
 isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
                         struct vfs_handle **handles, usize nhandles,
                         const struct b1nix_ucred *cred, int nonblock) {
+  u64 snd_deadline = unix_deadline(s->so_sndtimeo_ms);
   /* /dev/log syslog sink: forward the datagram to the serial console prefixed
    * with "/dev/log: " (matches the M54-LOG smoke expectation). No peer/ring. */
   if (s->syslog_sink) {
@@ -469,7 +488,14 @@ retry:
       unix_data_put(peer_u);
       return -EAGAIN;
     }
-    scheduler_wait_prepare(psock);
+    if (unix_deadline_passed(snd_deadline)) {
+      unix_data_put(peer_u);
+      return -EAGAIN; /* SO_SNDTIMEO expired with the buffer still full */
+    }
+    if (snd_deadline)
+      scheduler_wait_prepare_timeout(psock, unix_deadline_remaining(snd_deadline));
+    else
+      scheduler_wait_prepare(psock);
     unix_lock(peer_u);
     int still_full = (peer_u->rb_count >= UNIX_RB_SIZE);
     unix_unlock(peer_u);
@@ -591,7 +617,9 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
     *nhandles = 0;
   if (has_cred)
     *has_cred = 0;
-  
+
+  u64 rcv_deadline = unix_deadline(s->so_rcvtimeo_ms);
+
   while (1) {
     unix_lock(u);
     if (u->rb_count > 0) {
@@ -665,7 +693,12 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
     /* SMP-safe wait: publish BLOCKED on our socket, then re-test under the lock
      * so a sender's wake (scheduler_wake_all(u->socket) after a write/close)
      * racing between the check above and the block cannot be lost. */
-    scheduler_wait_prepare(s);
+    if (unix_deadline_passed(rcv_deadline))
+      return -EAGAIN; /* SO_RCVTIMEO expired with nothing received */
+    if (rcv_deadline)
+      scheduler_wait_prepare_timeout(s, unix_deadline_remaining(rcv_deadline));
+    else
+      scheduler_wait_prepare(s);
     unix_lock(u);
     int have_data = (u->rb_count > 0);
     int disconnected =

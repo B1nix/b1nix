@@ -11,7 +11,9 @@
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -337,8 +339,56 @@ static void test_unix_socket_events(void) {
   unlink(sun.sun_path);
 }
 
+/* SO_RCVTIMEO: a blocking recv with nothing to read must give up at the
+ * deadline and report EAGAIN, not wait forever. */
+static void test_socket_timeouts(void) {
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0) {
+    marker("UNIX-SMOKE: fail timeo-socketpair\n");
+    return;
+  }
+  struct timeval tv = {.tv_sec = 0, .tv_usec = 200000}; /* 200 ms */
+  if (setsockopt(sp[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+    marker("UNIX-SMOKE: fail rcvtimeo-set\n");
+    close(sp[0]); close(sp[1]);
+    return;
+  }
+  struct timeval got = {0, 0};
+  socklen_t glen = sizeof(got);
+  if (getsockopt(sp[0], SOL_SOCKET, SO_RCVTIMEO, &got, &glen) != 0 ||
+      got.tv_sec != 0 || got.tv_usec != 200000) {
+    marker("UNIX-SMOKE: fail rcvtimeo-get\n");
+    close(sp[0]); close(sp[1]);
+    return;
+  }
+
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  char c;
+  ssize_t r = recv(sp[0], &c, 1, 0);
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  long elapsed_ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 +
+                           (t1.tv_nsec - t0.tv_nsec) / 1000000);
+  /* Must fail with EAGAIN, and must actually have waited — returning
+   * immediately would pass the errno check while ignoring the timeout. */
+  if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && elapsed_ms >= 150)
+    marker("UNIX-SMOKE: ok rcvtimeo\n");
+  else
+    marker("UNIX-SMOKE: fail rcvtimeo\n");
+
+  /* With data waiting, the same socket returns it immediately. */
+  if (write(sp[1], "x", 1) == 1 && recv(sp[0], &c, 1, 0) == 1 && c == 'x')
+    marker("UNIX-SMOKE: ok rcvtimeo-data\n");
+  else
+    marker("UNIX-SMOKE: fail rcvtimeo-data\n");
+
+  close(sp[0]);
+  close(sp[1]);
+}
+
 int main(void) {
   test_unix_socket_events();
+  test_socket_timeouts();
   test_ping_gateway();
   test_udp_send_recv();
   test_tcp_path();

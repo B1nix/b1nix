@@ -1615,6 +1615,8 @@ check_output "$LOG" "M32-TCP: ok window-throttle" "tcp_send honours min(cwnd,snd
 check_output "$LOG" "DNS-SMOKE: ok parse-a-record" "DNS A-record parser extracts the resolved address"
 check_output "$LOG" "DNS-SMOKE: ok parse-aaaa-record" "DNS AAAA-record parser extracts a 128-bit IPv6 address"
 check_output "$LOG" "DNS-SMOKE: ok resolv-conf" "/etc/resolv.conf nameserver parsed by the kernel resolver"
+check_output "$LOG" "UNIX-SMOKE: ok rcvtimeo" "SO_RCVTIMEO makes a blocking recv give up at the deadline with EAGAIN (and it really waits)"
+check_output "$LOG" "UNIX-SMOKE: ok rcvtimeo-data" "a socket with SO_RCVTIMEO still returns data that is already there"
 check_output "$LOG" "UNIX-SMOKE: ok fionread" "FIONREAD reports the bytes queued on a unix socket (every event-driven server asks this)"
 check_output "$LOG" "UNIX-SMOKE: ok peer-close-hup" "poll reports POLLHUP once the peer of a connected unix socket closes"
 check_output "$LOG" "UNIX-SMOKE: ok listen-no-hup" "a LISTENING unix socket reports readability for a queued client and never POLLHUP"
