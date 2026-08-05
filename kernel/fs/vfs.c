@@ -2289,6 +2289,7 @@ void vfs_init(void) {
   add_node("/dev", VFS_DIRECTORY, 0, 0, 0);
   add_node("/home", VFS_DIRECTORY, 0, 0, 0);
   add_node("/tmp", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/dev/shm", VFS_DIRECTORY, 0, 0, 0);
   /* /run is the volatile runtime directory an init system expects (tmpfs on
    * Linux). It is a plain in-memory VFS directory here, which is exactly what
    * FIFOs need — /run/openrc/init.ctl and friends live in RAM and vanish on
@@ -2489,6 +2490,20 @@ void vfs_repopulate_after_root_mount(void) {
   node = add_node("/tmp", VFS_DIRECTORY, 0, 0, 0);
   if (node && !IS_ERR(node)) {
     node->inode->mode = 01777; // Sticky bit + rwxrwxrwx
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
+  }
+
+
+  /* /dev/shm — POSIX shared memory. musl's shm_open() opens
+   * /dev/shm/<name>, and without the directory every caller fails at the
+   * first step: wlroots allocates each output buffer through shm_open, so a
+   * compositor came up with no output at all and reported only "Failed to
+   * allocate buffer". Same permissions as /tmp (sticky, world-writable). */
+  node = add_node("/dev/shm", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->mode = 01777;
     node->inode->uid = 0;
     node->inode->gid = 0;
     vfs_node_put(node);

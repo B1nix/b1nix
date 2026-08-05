@@ -1007,6 +1007,7 @@ check_output "$LOG" "M56-SMOKE: done" "M56 smoke completes"
 # ── POSIX memory/signal primitives (madvise, MAP_NORESERVE, sigaltstack) ──
 section "POSIX memory/signal primitives"
 check_output "$LOG" "MM-SMOKE: start" "MM smoke starts"
+check_output "$LOG" "MM-SMOKE: ok shm-open" "POSIX shared memory works end to end (shm_open in /dev/shm, ftruncate, mmap, read back)"
 check_output "$LOG" "MM-SMOKE: ok madvise" "madvise(MADV_DONTNEED) zeroes a refaulted anonymous page"
 check_output "$LOG" "MM-SMOKE: ok noreserve" "MAP_NORESERVE large mapping commits lazily on touch"
 check_output "$LOG" "MM-SMOKE: ok sigaltstack" "sigaltstack get/set/disable + SA_ONSTACK handler runs on alt stack"

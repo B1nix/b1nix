@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -175,8 +176,44 @@ static int test_sigaltstack(void) {
 	return 0;
 }
 
+/* POSIX shared memory. musl's shm_open() opens /dev/shm/<name>, so this fails
+ * at the first call if that directory does not exist — which is exactly how a
+ * Wayland compositor ended up with no output at all: wlroots allocates every
+ * output buffer this way and reports only "Failed to allocate buffer". */
+static int test_shm_open(void) {
+	const char *name = "/mm_smoke_shm";
+	shm_unlink(name);
+	int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+	if (fd < 0)
+		return 1;
+	shm_unlink(name);
+	size_t size = 256 * 1024;
+	if (ftruncate(fd, (off_t)size) != 0) {
+		close(fd);
+		return 2;
+	}
+	unsigned char *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (p == MAP_FAILED) {
+		close(fd);
+		return 3;
+	}
+	p[0] = 0xA5;
+	p[size - 1] = 0x5A;
+	int ok = (p[0] == 0xA5 && p[size - 1] == 0x5A);
+	munmap(p, size);
+	close(fd);
+	return ok ? 0 : 4;
+}
+
 int main(void) {
 	marker("MM-SMOKE: start\n");
+
+	int shmrc = test_shm_open();
+	if (shmrc != 0) {
+		marker("MM-SMOKE: fail shm-open\n");
+		return 40 + shmrc;
+	}
+	marker("MM-SMOKE: ok shm-open\n");
 
 	int rc = test_madvise();
 	if (rc != 0) {
