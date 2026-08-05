@@ -1502,6 +1502,17 @@ static int user_run_elf_image(struct user_loaded_image *image) {
    * double-allocating. */
   if (current_task) {
     int replacing = (current_task->vma_list != NULL);
+    /* FD_CLOEXEC, applied here because this is the point of no return: the old
+     * image is about to go and nothing can fail back to it.
+     *
+     * scheduler_fd_close_on_exec() existed but was never called from anywhere,
+     * so close-on-exec descriptors survived every execve. That is not a
+     * cosmetic leak: a shell's command substitution pipe is O_CLOEXEC, and a
+     * background job exec'ing repeatedly (`while true; do sleep 5; done &`)
+     * kept inheriting the write end, so the substitution's reader never saw
+     * EOF and `X=$(cmd | cmd)` hung forever. */
+    if (replacing)
+      scheduler_fd_close_on_exec();
     /* M86: the old image's resident set is about to be released — record its
      * peak first, so getrusage after an execve still reports the largest
      * footprint this process ever had. */
