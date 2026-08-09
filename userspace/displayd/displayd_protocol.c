@@ -3,6 +3,15 @@
  */
 #include "displayd.h"
 
+/*
+ * Returns 0 on success, SEND_BUSY when the client simply is not draining, and
+ * SEND_DEAD when the connection itself failed. The distinction is the whole
+ * point: a client that is slow keeps its window, a client whose socket is gone
+ * is reaped. Collapsing the two is what makes a compositor kill live clients.
+ */
+#define SEND_BUSY (-1)
+#define SEND_DEAD (-2)
+
 static int send_all(int fd, const void *data, size_t len) {
 	const uint8_t *p = (const uint8_t *)data;
 	size_t off = 0;
@@ -16,8 +25,9 @@ static int send_all(int fd, const void *data, size_t len) {
 			struct pollfd waitfd = {fd, POLLOUT, 0};
 			if (poll(&waitfd, 1, 1000) > 0)
 				continue;
+			return SEND_BUSY; /* still not draining: drop this event only */
 		}
-		return -1;
+		return SEND_DEAD;
 	}
 	return 0;
 }
@@ -35,7 +45,8 @@ void send_msg(int client, uint32_t obj, uint16_t opcode,
 	memcpy(msg, &h, sizeof(h));
 	if (nwords)
 		memcpy(msg + sizeof(h), words, nwords * 4);
-	(void)send_all(clients[client].fd, msg, h.size);
+	if (send_all(clients[client].fd, msg, h.size) == SEND_DEAD)
+		clients[client].dead = 1; /* reaped by the main loop, see struct dclient */
 }
 
 void send_msg_fd(int client, uint32_t obj, uint16_t opcode,

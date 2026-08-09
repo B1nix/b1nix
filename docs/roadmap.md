@@ -841,15 +841,27 @@ The vendor drivers are imported as they are written and never edited; everything
 they stand on is ours, written from scratch under MIT. One layer carries every
 vendor, so M102a and M102b are two consumers of it rather than two ports.
 
-- [ ] `planned` Decide once where the DRM core comes from, and write the answer down: upstream `drivers/gpu/drm` imported verbatim, with M100's own core kept for virtio-gpu. Two cores are allowed only because one of them is never edited.
-- [ ] `planned` Extend M99 with what a driver needs and M99 has not got: `wait_queue`, `kref`, `ERR_PTR`/`IS_ERR`, `xarray`, `rbtree`, `interval_tree`, `kthread_worker`, `delayed_work`.
-- [ ] `planned` Add `ww_mutex` with real wound-wait, including backoff, since execbuf deadlocks under load without it and nowhere else.
-- [ ] `planned` Add an RCU whose grace periods are honest, or state in the header which callers may not use it.
-- [ ] `planned` Give `struct page` a backing that our memory model can honour: page arrays, shmem-backed objects, `vmap`, and write-combining through the M98 PAT paths.
-- [ ] `planned` Add `pm_runtime`, `sysfs`/`debugfs` and `kobject` as far as the drivers actually reach into them, and no further.
-- [ ] `planned` Import the DRM core and build it unmodified. Every fix goes in the shim, never in imported source; a patch to imported code is a bug in this milestone.
-- [ ] `planned` Pin the upstream release the import came from, and record it the way the ports tree pins versions.
-- [ ] `planned` Prove the layer before any vendor driver: run the imported core against virtio-gpu and render through it.
+- [x] Decide once where the DRM core comes from, and write the answer down: upstream `drivers/gpu/drm` imported verbatim, with M100's own core kept for virtio-gpu. Two cores are allowed only because one of them is never edited — recorded in [`docs/drm-import.md`](drm-import.md).
+- [x] Add `kref`, where only the last put releases and a weak reference on a dead object fails instead of resurrecting it.
+- [x] Add wait queues over the two-phase scheduler wait, with a timeout measured against the scheduler's own ticks.
+- [x] Add `ww_mutex` with real wound-wait: an older context wounds a younger holder, the younger is refused with `EDEADLK` and backs off, and the older is never wounded itself.
+- [x] Add red-black trees, balance verified rather than inferred — ascending inserts stay logarithmic instead of degenerating into a list.
+- [x] Give the rbtree an augmentation hook, so a field derived from a whole subtree survives rebalancing rather than going quietly stale.
+- [x] Add interval trees on top of it — the structure that answers "which ranges cover this address", checked against a brute-force scan.
+- [x] Add an xarray: sparse 64-bit index to pointer, ordered iteration, folding back to genuinely empty on erase.
+- [x] Add `kthread_worker`, a queue whose thread the caller owns, running its items in submission order.
+- [x] Add an RCU whose grace periods are honest: readers counted in two buckets, a writer flips which is current and waits for the old one to drain. Read sections disable interrupts, so they cannot sleep or migrate — stated in the header as the price.
+- [x] Prove the grace period rather than assume it: a reader on another CPU keeps re-reading an object the writer poisons the instant `synchronize_rcu` returns, so an early grace period is reported by the reader instead of corrupting memory quietly.
+- [x] Give `struct page` a backing our memory model can honour: page arrays, shmem-backed objects, `vmap`, and write-combining through the M98 PAT paths. No global mem_map — a page is allocated with its frame, so there is no physical-address-to-page lookup, and the header says so.
+- [x] Make the scatter real: a shmem array takes its frames one at a time, and the self-test asserts they are not one physical run, so a driver assuming `page[i+1]` follows `page[i]` breaks here rather than on hardware with the IOMMU off.
+- [x] Add `kobject` with the lifetime rule drivers depend on: release runs once, on the last put, and a child's release runs before its parent's reference is dropped.
+- [x] Add `pm_runtime`: usage-counted, suspends only on the last holder, refuses to claim a suspend the driver rejected, and leaves no reference behind on a failed resume.
+- [x] Add `sysfs`/`debugfs` attribute files: a registry that accepts registrations before `/sys` is mounted and materialises them when it is, so probe order and mount order need not agree. Classes, devices, attribute groups and links are real, removal takes one file without disturbing its siblings and releases the caller's context, a debugfs file gets the seq_file it is written against — `single_open`/`seq_read`, rendered once into a buffer that grows until the whole dump fits — so a read past the first buffer continues rather than restarting. Registering a device broadcasts a uevent on `NETLINK_KOBJECT_UEVENT` that a bound listener receives. Every part is proved by reading it back the way userspace would.
+- [x] Import the DRM core and build it unmodified: all 41 objects of upstream's `drm-y` compile, with nothing edited under the staged tree. Every fix went into the shim.
+- [x] Link the imported core into the kernel: 41 objects plus the MIT hdmi infoframe library, built from upstream's own `drm-y` list rather than a list chosen here.
+- [x] Wire it to a device and run it: a driver on the imported core registers a `drm_device`, a connector and a simple display pipe, and serves dumb buffers as GEM objects with handles.
+- [x] Pin the upstream release and record it the way the ports tree pins versions: Linux 6.6 with a SHA-256 verified *before* extraction, listed in `THIRD_PARTY_NOTICES.md` with its licence split.
+- [x] Prove the layer before any vendor driver: the in-kernel DRM client probes the connector, allocates a framebuffer and commits it through upstream's atomic helpers, and the pixels are then read back off virtio-gpu's scanout — corners and centre — so a commit that returns success without moving an image fails the test.
 
 ## M102a: Intel i915 (Gen8/Gen9.5) + Mesa iris
 

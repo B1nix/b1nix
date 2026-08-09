@@ -444,6 +444,7 @@ KERNEL_SOURCES := \
 	kernel/fs/procfs.c \
 	kernel/fs/tmpfs.c \
 	kernel/fs/sysfs.c \
+	kernel/fs/sysfs_attr.c \
 	kernel/fs/journal.c \
 	kernel/fs/filelock.c \
 	kernel/fs/fuse.c \
@@ -505,7 +506,28 @@ KERNEL_SOURCES += \
 	kernel/lkpi/workqueue.c \
 	kernel/lkpi/scatterlist.c \
 	kernel/lkpi/firmware.c \
+	kernel/lkpi/wait.c \
+	kernel/lkpi/ww_mutex.c \
+	kernel/lkpi/rbtree.c \
+	kernel/lkpi/interval_tree.c \
+	kernel/lkpi/xarray.c \
+	kernel/lkpi/kthread_worker.c \
+	kernel/lkpi/rcu.c \
+	kernel/lkpi/page.c \
+	kernel/lkpi/device.c \
+	kernel/lkpi/devres.c \
+	kernel/lkpi/ida.c \
+	kernel/lkpi/lock.c \
+	kernel/lkpi/env.c \
+	kernel/lkpi/dma_resv.c \
+	kernel/lkpi/linux_compat.c \
+	kernel/lkpi/linux_file.c \
+	kernel/lkpi/dma_buf.c \
+	kernel/lkpi/dma_fence_chain.c \
+	kernel/lkpi/timer.c \
+	kernel/lkpi/linux_misc.c \
 	kernel/lkpi/lkpi_test.c \
+	kernel/lkpi/lkpi_m101_test.c \
 	kernel/drm/dma_fence.c \
 	kernel/drm/gpu_scheduler.c \
 	kernel/drm/drm_selftest.c \
@@ -529,10 +551,88 @@ KERNEL_SOURCES += \
 endif
 
 
+# ── M101: imported DRM core ───────────────────────────────────────────────
+#
+# Upstream source, compiled exactly as written. It is a separate set because it
+# needs different flags, and every one of them is load-bearing:
+#
+#   -nostdinc          the kernel's own CFLAGS do not pass it, so the host's
+#                      /usr/include quietly satisfies <linux/types.h> and the
+#                      result is a mix of our shim and the host's kernel headers
+#                      that happens to link. Only clang's resource include is
+#                      allowed back in, for stddef/stdarg.
+#   -include ...       upstream compiles DRM with -include linux/compiler_types.h
+#                      in KBUILD_CFLAGS, so files that open with <drm/...> and
+#                      never reach a linux header still get __must_check. Without
+#                      it the error reads "expected ';'" and points at a function
+#                      name rather than a missing attribute.
+#   -D__linux__        the uapi headers pick the BSD branch otherwise.
+#   -w                 imported source is not ours to make warning-clean; a
+#                      warning here would be noise we cannot act on without
+#                      editing it, which the milestone forbids.
+#
+# The staged tree is produced by tools/drm/fetch-drm-core.sh and is not tracked.
+# Nothing under it is ever edited: a patch to imported source is a bug in the
+# shim.
+DRM_IMPORT_DIR := build/src/drm-core-6.6
+
+# Which files to build comes from the staged tree's own B1NIX-OBJECTS, which
+# fetch-drm-core.sh derived from upstream's drm-y. Choosing them here instead
+# would let the list drift from the pinned source — and picking every .c in the
+# directory is wrong for a different reason: Kconfig excludes some, and
+# drm_of.c collides with its own header's stub when built without CONFIG_OF.
+DRM_IMPORT_NAMES := $(shell cat $(DRM_IMPORT_DIR)/B1NIX-OBJECTS 2>/dev/null)
+DRM_IMPORT_SOURCES := \
+	$(foreach n,$(filter drm_%,$(DRM_IMPORT_NAMES)),$(DRM_IMPORT_DIR)/drivers/gpu/drm/$(n)) \
+	$(foreach n,$(filter-out drm_%,$(DRM_IMPORT_NAMES)),$(DRM_IMPORT_DIR)/drivers/video/$(n))
+DRM_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(DRM_IMPORT_SOURCES))
+
+CLANG_RESOURCE_INC := $(shell $(CC) -print-resource-dir)/include
+
+# -MMD -MP so a change to the shim rebuilds the imported objects that include
+# it. Without them make only ever saw the staged .c files, which never change —
+# so a shim fix left every drm object stale, and the kernel ran a mixture of old
+# and new headers that no source tree in the repo corresponds to.
+DRM_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
+	-fno-stack-protector -fno-pic -mno-red-zone -w -g -MMD -MP \
+	-D__KERNEL__ -D__linux__ -DKBUILD_MODNAME='"drm"' \
+	-isystem $(CLANG_RESOURCE_INC) \
+	-I kernel/include -I kernel/include/uapi \
+	-I $(DRM_IMPORT_DIR)/include -I $(DRM_IMPORT_DIR)/include/uapi \
+	-include linux/compiler_types.h -include linux/types.h
+
+$(BUILD_DIR)/$(DRM_IMPORT_DIR)/%.o: $(DRM_IMPORT_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(DRM_IMPORT_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+
+# Our own code that calls into the imported core needs the same include paths
+# and the same force-includes, so it is built with the imported flags — minus
+# -w, because this file IS ours and has to stay warning-clean.
+LKPI_IMPORT_SOURCES := \
+	kernel/lkpi/drm_import_test.c \
+	kernel/lkpi/seq_file.c \
+	kernel/lkpi/sysfs.c \
+	kernel/lkpi/drm_b1nix_kms.c
+
+LKPI_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(LKPI_IMPORT_SOURCES))
+
+# Named explicitly, not as a pattern over kernel/lkpi/: the rest of that
+# directory is b1nix-side code that must keep b1nix's own flags, and a pattern
+# rule here would outrank the general one and quietly rebuild all of it against
+# the Linux headers.
+$(LKPI_IMPORT_OBJECTS): $(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -w,$(DRM_IMPORT_CFLAGS)) -Wall -Wextra $(ARCH_CFLAGS) -c $< -o $@
+
+DRM_IMPORT_OBJECTS += $(LKPI_IMPORT_OBJECTS)
+
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
-	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
-KERNEL_DEPS := $(OBJECTS:.o=.d) $(MODULE_KOS:.ko=.d)
+	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES)) \
+	$(DRM_IMPORT_OBJECTS)
+KERNEL_DEPS := $(patsubst %.c,$(BUILD_DIR)/%.d,$(KERNEL_SOURCES)) \
+	$(patsubst %.S,$(BUILD_DIR)/%.d,$(ASM_SOURCES)) $(MODULE_KOS:.ko=.d) \
+	$(DRM_IMPORT_OBJECTS:.o=.d)
 
 -include $(KERNEL_DEPS)
 

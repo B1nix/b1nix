@@ -159,14 +159,27 @@ void ping_clients(void) {
 		if (!wm)
 			continue;
 		if (clients[i].ping_pending) {
-			/* A client that is alive but busy — e.g. running a long
-			 * synchronous software-GL (OSMesa/softpipe) render — cannot pump
-			 * its event queue to answer a ping. Disconnecting on the first
-			 * missed pong (a ~5s window) kills such clients mid-render and
-			 * makes their next request fail with EPIPE. Allow a few missed
-			 * pings (~15s total) before treating the client as hung. */
-			if (++clients[i].ping_misses >= 3)
-				client_disconnect(i);
+			/*
+			 * A missed pong means the client is busy, not that it is gone.
+			 * Anything running a long synchronous software-GL render — OSMesa
+			 * on softpipe is seconds per frame — cannot pump its event queue
+			 * while it renders, and there is no timeout that separates "slow"
+			 * from "dead": raising the allowance only moves the point at which
+			 * a slower machine kills a live client mid-render, which is how
+			 * this failed after every request the client made next returned
+			 * ENOTCONN.
+			 *
+			 * So the ping is a liveness *probe*, not a verdict. The connection
+			 * is closed by the paths that can actually tell it is gone — a
+			 * send that fails, or a read that reports EOF. A client that never
+			 * answers stays connected and is counted, which is visible in the
+			 * log without costing it its window.
+			 */
+			if (++clients[i].ping_misses == 8) {
+				out("displayd: client ");
+				out_dec((unsigned)i);
+				out(" unresponsive (still connected)\n");
+			}
 			continue;
 		}
 		clients[i].ping_misses = 0;
@@ -282,6 +295,13 @@ int main(int argc, char **argv) {
 			if (pfds[4 + i].fd >= 0 &&
 			    (pfds[4 + i].revents & (POLLIN | POLLHUP)))
 				client_data(i);
+
+		/* Reap connections that failed on a write, now that nothing is walking
+		 * their state. A client is closed here or by its own hangup — never
+		 * because it was slow to answer a ping. */
+		for (int i = 0; i < MAX_CLIENTS; i++)
+			if (clients[i].used && clients[i].dead)
+				client_disconnect(i);
 	}
 
 	for (int i = 0; i < MAX_CLIENTS; i++)

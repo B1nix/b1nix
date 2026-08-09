@@ -77,7 +77,7 @@ static void sched_thread(void *arg)
 		/* Dependencies are resolved here, in the scheduler thread, so the
 		 * submitter never blocks on another client's work. */
 		if (job->dependency) {
-			dma_fence_wait(job->dependency);
+			dma_fence_wait_uninterruptible(job->dependency);
 			dma_fence_put(job->dependency);
 			job->dependency = 0;
 		}
@@ -220,7 +220,7 @@ int drm_sched_job_init(struct drm_sched_job *job, struct drm_sched_entity *e)
 	job->next = 0;
 	job->dependency = 0;
 	job->id = 0;
-	dma_fence_init(&job->finished, e->context, e->next_seqno++, "sched-job");
+	dma_fence_init_named(&job->finished, e->context, e->next_seqno++, "sched-job");
 	return 0;
 }
 
@@ -233,7 +233,7 @@ void drm_sched_job_add_dependency(struct drm_sched_job *job,
 	 * with a second would silently lose the first, so wait the earlier one out
 	 * here rather than dropping it. */
 	if (job->dependency) {
-		dma_fence_wait(job->dependency);
+		dma_fence_wait_uninterruptible(job->dependency);
 		dma_fence_put(job->dependency);
 	}
 	job->dependency = dma_fence_get(dep);

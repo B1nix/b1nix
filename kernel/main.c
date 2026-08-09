@@ -14,6 +14,7 @@
 #include <b1nix/serial.h>
 #include <b1nix/serial_tty.h>
 #include <b1nix/user.h>
+#include <b1nix/sysfs_attr.h>
 #include <b1nix/vfs.h>
 #include <b1nix/syscall.h>
 #include <b1nix/blk.h>
@@ -666,6 +667,14 @@ void kernel_main(usize arg0, usize arg1)
 	 * because all APs have come up and have functional LAPICs to ACK IPIs. */
 	tlb_shootdown_set_enabled(1);
 
+	/* M101: reserve the lkpi vmap window's page-table path. Must happen before
+	 * any process is created, so every address space inherits the entry. */
+	lkpi_page_init();
+
+	/* M101: start RCU's deferred-callback thread. After the APs are up, since
+	 * it creates a worker thread, and before any driver can call call_rcu. */
+	rcu_init();
+
 	/* In-kernel SMP self-tests. These run BEFORE g_ap_userspace_enabled: they
 	 * need the APs still parked in the work-stealing-only loop (that loop is
 	 * the only path that knows how to execute a stealable worker). The init.c
@@ -676,6 +685,13 @@ void kernel_main(usize arg0, usize arg1)
 	smp_selftest_run();
 	m28_heapbench_run();
 	m28_ctxbench_run();
+	/* M101: the RCU grace-period proof belongs here for the same reason. It
+	 * needs a reader running on another CPU at the same moment as the writer,
+	 * and a stealable worker picked up by a parked AP is the only placement
+	 * this kernel guarantees. Later, once the APs run the ordinary scheduler,
+	 * the reader lands wherever it lands — in practice back on the BSP, where
+	 * it cannot overlap the writer at all. */
+	lkpi_rcu_smp_selftest();
 
 	/* M37 device self-tests. Their only caller used to be the in-kernel test
 	 * driver in kernel/user/programs.c, deleted with the ring-3 migration —
@@ -785,8 +801,13 @@ void kernel_main(usize arg0, usize arg1)
 		 * through its own domain. The check names the unit's milestone. */
 		nvme_iommu_selftest();
 		lkpi_selftest();      /* M99: idr, completion, workqueue, sg, dma, fw */
+		lkpi_selftest_m101(); /* M101: kref, waitqueue, ww_mutex, rbtree, RCU */
 		dma_fence_selftest(); /* M100: dma-fence */
 		drm_sched_selftest(); /* M100: GPU scheduler + scatter-gather BOs */
+		drm_import_selftest(); /* M101: the imported DRM core actually runs */
+		drm_core_bringup();    /* M101: the imported core's own initcall */
+		drm_kms_selftest();    /* M101: a device on it, rendering to the scanout */
+		sysfs_attr_selftest(); /* M101: its /sys and debugfs files, read back */
 	}
 
 	userspace_init();

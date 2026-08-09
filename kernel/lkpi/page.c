@@ -1,0 +1,287 @@
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * M101 linuxkpi: struct page, shmem page arrays, vmap.
+ *
+ * The vmap window is a bump-allocated range of slots, one page each, tracked by
+ * a bitmap. It is deliberately not a general VA allocator: a driver vmaps a
+ * handful of buffer objects and keeps them mapped, so the cost of a real
+ * allocator would buy nothing, and a bitmap makes "is this range still mapped"
+ * a question with an answer.
+ */
+
+#include <b1nix/klog.h>
+#include <b1nix/memtype.h>
+#include <b1nix/mm.h>
+#include <b1nix/spinlock.h>
+#include <lkpi/page.h>
+
+/* Above the DRM vmap window (0xffffa100_00000000), with a terabyte of
+ * clearance, so the two never grow into each other. */
+#define LKPI_VMAP_BASE  0xffffa20000000000ULL
+#define LKPI_VMAP_PAGES 8192u /* 32 MiB of window */
+
+static spinlock_t g_vmap_lock = SPINLOCK_INIT;
+static u64 g_vmap_used[LKPI_VMAP_PAGES / 64];
+static usize g_vmap_mapped;
+
+/* Length of each mapping, indexed by its first slot, so vunmap knows how much
+ * to tear down from the address alone. */
+static u32 g_vmap_len[LKPI_VMAP_PAGES];
+
+void lkpi_page_init(void)
+{
+	/* Establish the window's page-table path before any address space is
+	 * created, so every one of them inherits the same PML4 entry. Mapping and
+	 * unmapping a page here instead would happen to work — unmap leaves the
+	 * upper levels in place — but only by relying on an invariant nothing
+	 * states. */
+	paging_reserve_kernel_path(LKPI_VMAP_BASE,
+	                           (u64)LKPI_VMAP_PAGES * PAGE_SIZE);
+}
+
+/* ── struct page ────────────────────────────────────────────────── */
+
+struct page *alloc_pages(u32 order)
+{
+	if (order > 20)
+		return 0;
+	usize n = (usize)1 << order;
+
+	struct page *pages = (struct page *)lkpi_kcalloc(n, sizeof(struct page),
+	                                                 GFP_KERNEL);
+	if (!pages)
+		return 0;
+
+	u64 phys = pmm_alloc_frames(n);
+	if (!phys) {
+		lkpi_kfree(pages);
+		return 0;
+	}
+	for (usize i = 0; i < n; i++) {
+		pages[i].phys = phys + (u64)i * PAGE_SIZE;
+		pages[i].count = 1;
+		pages[i].order = 0;
+	}
+	pages[0].order = order;
+	return pages;
+}
+
+struct page *alloc_page(void)
+{
+	/* Its own frame, not a run of one, so a caller collecting several of these
+	 * gets scattered memory — which is what a page allocator is for. */
+	struct page *page = (struct page *)lkpi_kcalloc(1, sizeof(struct page),
+	                                                GFP_KERNEL);
+	if (!page)
+		return 0;
+	u64 phys = pmm_alloc_frame();
+	if (!phys) {
+		lkpi_kfree(page);
+		return 0;
+	}
+	page->phys = phys;
+	page->count = 1;
+	page->order = 0;
+	return page;
+}
+
+void __free_pages(struct page *page, u32 order)
+{
+	if (!page)
+		return;
+	usize n = (usize)1 << order;
+	for (usize i = 0; i < n; i++)
+		pmm_free_frame(page[i].phys);
+	lkpi_kfree(page);
+}
+
+void __free_page(struct page *page)
+{
+	if (!page)
+		return;
+	pmm_free_frame(page->phys);
+	lkpi_kfree(page);
+}
+
+void *page_address(const struct page *page)
+{
+	if (!page || !page->phys)
+		return 0;
+	return (void *)(usize)(page->phys + vmm_direct_map_base());
+}
+
+void get_page(struct page *page)
+{
+	if (page)
+		__atomic_fetch_add(&page->count, 1, __ATOMIC_RELAXED);
+}
+
+int put_page(struct page *page)
+{
+	if (!page)
+		return 0;
+	if (__atomic_fetch_sub(&page->count, 1, __ATOMIC_ACQ_REL) == 1) {
+		pmm_free_frame(page->phys);
+		page->phys = 0;
+		return 1;
+	}
+	return 0;
+}
+
+/* ── shmem-style page arrays ────────────────────────────────────── */
+
+struct page **shmem_alloc_pages(usize count)
+{
+	if (count == 0)
+		return 0;
+	struct page **pages = (struct page **)lkpi_kcalloc(
+		count, sizeof(struct page *), GFP_KERNEL);
+	if (!pages)
+		return 0;
+
+	for (usize i = 0; i < count; i++) {
+		pages[i] = alloc_page();
+		if (!pages[i]) {
+			for (usize j = 0; j < i; j++)
+				__free_page(pages[j]);
+			lkpi_kfree(pages);
+			return 0;
+		}
+	}
+	return pages;
+}
+
+void shmem_free_pages(struct page **pages, usize count)
+{
+	if (!pages)
+		return;
+	for (usize i = 0; i < count; i++)
+		__free_page(pages[i]);
+	lkpi_kfree(pages);
+}
+
+usize shmem_contiguous_runs(struct page **pages, usize count)
+{
+	if (!pages || count < 2)
+		return 0;
+	usize adjacent = 0;
+	for (usize i = 0; i + 1 < count; i++) {
+		if (pages[i] && pages[i + 1] &&
+		    pages[i + 1]->phys == pages[i]->phys + PAGE_SIZE)
+			adjacent++;
+	}
+	return adjacent;
+}
+
+/* ── vmap ───────────────────────────────────────────────────────── */
+
+static int vmap_slot_taken(u32 slot)
+{
+	return (g_vmap_used[slot / 64] >> (slot % 64)) & 1u;
+}
+
+static void vmap_slot_set(u32 slot, int taken)
+{
+	if (taken)
+		g_vmap_used[slot / 64] |= (u64)1 << (slot % 64);
+	else
+		g_vmap_used[slot / 64] &= ~((u64)1 << (slot % 64));
+}
+
+/* First run of `count` free slots. Caller holds the lock. */
+static int vmap_find_run(usize count, u32 *out)
+{
+	u32 run = 0;
+	for (u32 i = 0; i < LKPI_VMAP_PAGES; i++) {
+		if (vmap_slot_taken(i)) {
+			run = 0;
+			continue;
+		}
+		if (++run == count) {
+			*out = i + 1 - (u32)count;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+void *lkpi_vmap(struct page **pages, usize count, u32 prot)
+{
+	if (!pages || count == 0 || count > LKPI_VMAP_PAGES)
+		return 0;
+
+	u64 flags;
+	spin_lock_irqsave(&g_vmap_lock, &flags);
+	u32 start;
+	if (!vmap_find_run(count, &start)) {
+		spin_unlock_irqrestore(&g_vmap_lock, flags);
+		return 0;
+	}
+	for (usize i = 0; i < count; i++)
+		vmap_slot_set(start + (u32)i, 1);
+	g_vmap_len[start] = (u32)count;
+	g_vmap_mapped += count;
+	spin_unlock_irqrestore(&g_vmap_lock, flags);
+
+	/* Mapping outside the lock: vmm_map_page takes its own, and the slots are
+	 * already reserved so nothing else can be handed this range. */
+	u64 base = LKPI_VMAP_BASE + (u64)start * PAGE_SIZE;
+	u64 pte = VMM_WRITABLE | VMM_NO_EXECUTE;
+	if (prot == LKPI_PROT_WC)
+		pte |= VMM_WC;
+	for (usize i = 0; i < count; i++) {
+		if (!pages[i]) {
+			/* A hole would leave an unmapped page inside a range the caller
+			 * believes is linear. Refuse the whole mapping instead. */
+			spin_lock_irqsave(&g_vmap_lock, &flags);
+			for (usize j = 0; j < count; j++)
+				vmap_slot_set(start + (u32)j, 0);
+			g_vmap_len[start] = 0;
+			g_vmap_mapped -= count;
+			spin_unlock_irqrestore(&g_vmap_lock, flags);
+			for (usize j = 0; j < i; j++)
+				vmm_unmap_page(base + (u64)j * PAGE_SIZE);
+			return 0;
+		}
+		vmm_map_page(base + (u64)i * PAGE_SIZE, pages[i]->phys, pte);
+	}
+	return (void *)(usize)base;
+}
+
+void lkpi_vunmap(void *addr)
+{
+	u64 va = (u64)(usize)addr;
+	if (va < LKPI_VMAP_BASE ||
+	    va >= LKPI_VMAP_BASE + (u64)LKPI_VMAP_PAGES * PAGE_SIZE)
+		return;
+	if ((va - LKPI_VMAP_BASE) % PAGE_SIZE)
+		return;
+
+	u32 start = (u32)((va - LKPI_VMAP_BASE) / PAGE_SIZE);
+
+	u64 flags;
+	spin_lock_irqsave(&g_vmap_lock, &flags);
+	u32 count = g_vmap_len[start];
+	if (count == 0) {
+		spin_unlock_irqrestore(&g_vmap_lock, flags);
+		return; /* not the base of a live mapping */
+	}
+	for (u32 i = 0; i < count; i++)
+		vmap_slot_set(start + i, 0);
+	g_vmap_len[start] = 0;
+	g_vmap_mapped -= count;
+	spin_unlock_irqrestore(&g_vmap_lock, flags);
+
+	for (u32 i = 0; i < count; i++)
+		vmm_unmap_page(va + (u64)i * PAGE_SIZE);
+}
+
+usize lkpi_vmap_pages_mapped(void)
+{
+	u64 flags;
+	spin_lock_irqsave(&g_vmap_lock, &flags);
+	usize n = g_vmap_mapped;
+	spin_unlock_irqrestore(&g_vmap_lock, flags);
+	return n;
+}

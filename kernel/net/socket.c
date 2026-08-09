@@ -555,6 +555,8 @@ static int socket_teardown(struct vfs_handle *h) {
     return 0;
   if (s->type == B1NIX_SOCK_RAW)
     raw_sock_unregister(s);
+  if (s->domain == B1NIX_AF_NETLINK)
+    netlink_uevent_unregister(s);
   if ((s->domain == B1NIX_AF_INET || s->domain == B1NIX_AF_INET6) &&
       s->type == B1NIX_SOCK_DGRAM && s->bound) {
     for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
@@ -1115,6 +1117,10 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
       nl.nl_pid = (u32)scheduler_get_pid();
     memcpy(&s->local, &nl, sizeof(nl));
     s->bound = 1;
+    /* A non-zero group on NETLINK_KOBJECT_UEVENT is a listener asking for the
+     * hotplug broadcast — the only thing that group carries. */
+    if (s->protocol == NETLINK_KOBJECT_UEVENT && nl.nl_groups)
+      netlink_uevent_register(s);
     return 0;
   }
 

@@ -67,4 +67,25 @@ usize sg_copy_to_buffer(const struct sg_table *sgt, u64 offset, void *buf,
 usize sg_copy_from_buffer(const struct sg_table *sgt, u64 offset,
                           const void *buf, usize len);
 
+
+/*
+ * Page-granular iteration over a table. An entry may cover several pages after
+ * coalescing, so this walks pages rather than entries — which is what a caller
+ * filling a page array needs, and why it is not a loop over sgl.
+ */
+struct sg_page_iter {
+	struct sg_table *sgt;
+	unsigned int entry;
+	unsigned int page_in_entry;
+};
+
+struct sg_dma_page_iter {
+	struct sg_page_iter base;
+};
+
+void __sg_page_iter_start(struct sg_page_iter *iter, struct sg_table *sgt);
+_Bool __sg_page_iter_next(struct sg_page_iter *iter);
+dma_addr_t sg_page_iter_dma_address(struct sg_dma_page_iter *iter);
+struct page *sg_page_iter_page(struct sg_page_iter *iter);
+
 #endif

@@ -2,7 +2,6 @@
 #ifndef LKPI_WORKQUEUE_H
 #define LKPI_WORKQUEUE_H
 
-#include <b1nix/spinlock.h>
 #include <lkpi/completion.h>
 #include <lkpi/types.h>
 
@@ -77,10 +76,10 @@ void flush_workqueue(struct workqueue_struct *wq);
 
 /* The shared queue every driver may use for short, non-blocking work. Created
  * lazily on first use; NULL only if the kthread could not be created. */
-struct workqueue_struct *system_wq(void);
+struct workqueue_struct *lkpi_system_wq(void);
 static inline int schedule_work(struct work_struct *work)
 {
-	struct workqueue_struct *wq = system_wq();
+	struct workqueue_struct *wq = lkpi_system_wq();
 	return wq ? queue_work(wq, work) : 0;
 }
 

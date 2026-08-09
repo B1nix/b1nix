@@ -3015,11 +3015,35 @@ static isize node_read_impl(struct vfs_handle *h, char *buf, usize size,
   } else if (node->inode->type == VFS_FILE) {
     usize rem = node->inode->size > offset ? node->inode->size - offset : 0;
     usize to_r = size < rem ? size : rem;
-    if (to_r > 0) {
-      memcpy(buf, (const char *)node->inode->data + offset, to_r);
-      if (posp) *posp += to_r; else h->offset += to_r;
+    usize done = 0;
+    /* An in-memory file may also be mapped. A mapping is served from a
+     * page-cache frame seeded from inode->data, and stores through it never
+     * come back here — so a read that only looked at inode->data would report
+     * what the file held before anyone wrote to the mapping. Where a page is
+     * cached, it is the newer of the two, and it is what a reader must see. */
+    while (done < to_r) {
+      u64 cur = offset + done;
+      u64 page_aligned = cur & ~((u64)PAGE_SIZE - 1);
+      usize page_off = (usize)(cur & ((u64)PAGE_SIZE - 1));
+      usize chunk = PAGE_SIZE - page_off;
+      if (chunk > to_r - done)
+        chunk = to_r - done;
+      struct page_cache_entry *pe =
+          page_cache_get_page(node->inode, page_aligned);
+      if (pe) {
+        const char *src =
+            (const char *)(usize)(pe->frame + vmm_direct_map_base());
+        memcpy(buf + done, src + page_off, chunk);
+        page_cache_put_page(pe);
+      } else {
+        memcpy(buf + done, (const char *)node->inode->data + cur, chunk);
+      }
+      done += chunk;
     }
-    res = (isize)to_r;
+    if (done > 0) {
+      if (posp) *posp += done; else h->offset += done;
+    }
+    res = (isize)done;
   }
   vfs_inode_unlock(node->inode);
   vfs_node_put(node);
@@ -3145,6 +3169,26 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
       node->inode->flags |= VFS_NODE_OWNS_DATA;
     }
     memcpy((char *)node->inode->data + offset, buf, size);
+    /* Mirror the write into any cached page: a mapping of this file is served
+     * from the page cache, so a write that only touched inode->data would be
+     * invisible through the mapping — the same divergence, in the other
+     * direction, that the read path above closes. */
+    for (u64 cur = offset; cur < offset + size;) {
+      u64 page_aligned = cur & ~((u64)PAGE_SIZE - 1);
+      usize page_off = (usize)(cur & ((u64)PAGE_SIZE - 1));
+      usize chunk = PAGE_SIZE - page_off;
+      if (chunk > (usize)(offset + size - cur))
+        chunk = (usize)(offset + size - cur);
+      struct page_cache_entry *pe =
+          page_cache_get_page(node->inode, page_aligned);
+      if (pe) {
+        char *dst = (char *)(usize)(pe->frame + vmm_direct_map_base());
+        memcpy(dst + page_off, buf + (usize)(cur - offset), chunk);
+        page_cache_mark_dirty(pe);
+        page_cache_put_page(pe);
+      }
+      cur += chunk;
+    }
     if (offset + size > node->inode->size)
       node->inode->size = (usize)(offset + size);
     vfs_update_times(node->inode, VFS_MTIME | VFS_CTIME);

@@ -137,6 +137,7 @@ run_test /bin/m98_smoke sys
 run_test /bin/m104_pam_smoke sys
 run_test /bin/net_smoke sys
 run_test /bin/m_posixmm_smoke sys
+run_test /bin/shmshare_smoke sys
 run_test /bin/musl_posix_smoke sys
 run_test /bin/b1cc_selfsmoke sys
 run_test /bin/m30_dynamic sys

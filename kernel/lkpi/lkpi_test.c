@@ -13,6 +13,7 @@
 
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
+#include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/posix.h>
 #include <b1nix/sched.h>
@@ -33,7 +34,7 @@ static void lkpi_report(const char *name, int ok, u64 detail)
 
 /* ── idr ────────────────────────────────────────────────────────── */
 
-static int idr_walk_cb(u32 id, void *ptr, void *data)
+static int idr_walk_cb(int id, void *ptr, void *data)
 {
 	u32 *seen = data;
 	(void)id;

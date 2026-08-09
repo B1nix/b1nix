@@ -2,9 +2,16 @@
 #ifndef LKPI_TYPES_H
 #define LKPI_TYPES_H
 
-#include <b1nix/errno.h>
-#include <b1nix/mm.h>
 #include <b1nix/types.h>
+
+/*
+ * Only <b1nix/types.h> is included, and only because it is pure typedefs.
+ *
+ * Nothing here may pull in a b1nix header that declares functions or macros: a
+ * translation unit compiling imported DRM source includes this one, and every
+ * name b1nix and Linux share with different meanings — kmalloc, spin_lock,
+ * ERR_PTR — becomes a conflict resolved by include order if it does.
+ */
 
 /* Fixed-width aliases drivers spell the Linux way. b1nix's own u8/u32/... come
  * from <b1nix/types.h>; these are the __-prefixed and signed spellings. */

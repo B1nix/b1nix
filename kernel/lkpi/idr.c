@@ -4,6 +4,7 @@
  * M99 linuxkpi: id-to-pointer map. See kernel/include/lkpi/idr.h.
  */
 
+#include <b1nix/spinlock.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <lkpi/idr.h>
@@ -14,6 +15,23 @@
  * below this; the bound turns a runaway allocator into -ENOSPC rather than a
  * kernel that eats all of memory one doubling at a time. */
 #define IDR_MAX_SLOTS (1u << 20)
+
+/*
+ * An id may be allocated with no pointer behind it yet. Linux allows that and
+ * the DRM core depends on it: a device's minor number is reserved during init
+ * and the pointer filled in later, when the minor is registered. Occupancy here
+ * is "the slot is not empty", so a reserved id needs a value that is not NULL
+ * and is not a pointer anyone could have passed — an address no allocation can
+ * return. It never escapes: every read maps it back to NULL, which is exactly
+ * what Linux's idr_find reports for an id whose value is NULL.
+ */
+#define IDR_RESERVED ((void *)(usize)1)
+
+static inline void *idr_encode(void *ptr) { return ptr ? ptr : IDR_RESERVED; }
+static inline void *idr_decode(void *slot)
+{
+	return slot == IDR_RESERVED ? 0 : slot;
+}
 
 void idr_init_base(struct idr *idr, u32 base)
 {
@@ -32,13 +50,13 @@ void idr_destroy(struct idr *idr)
 	if (!idr)
 		return;
 	u64 flags;
-	spin_lock_irqsave(&idr->lock, &flags);
+	spin_lock_irqsave((spinlock_t *)&idr->lock, &flags);
 	void **old = idr->slots;
 	idr->slots = 0;
 	idr->capacity = 0;
 	idr->count = 0;
 	idr->hint = 0;
-	spin_unlock_irqrestore(&idr->lock, flags);
+	spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 	if (old)
 		kfree(old);
 }
@@ -85,7 +103,7 @@ static long idr_slot_of(const struct idr *idr, u32 id)
 
 int idr_alloc(struct idr *idr, void *ptr, u32 start, u32 end)
 {
-	if (!idr || !ptr)
+	if (!idr)
 		return -EINVAL;
 
 	u32 lo = start > idr->base ? start : idr->base;
@@ -93,7 +111,7 @@ int idr_alloc(struct idr *idr, void *ptr, u32 start, u32 end)
 		return -ENOSPC;
 
 	u64 flags;
-	spin_lock_irqsave(&idr->lock, &flags);
+	spin_lock_irqsave((spinlock_t *)&idr->lock, &flags);
 
 	u32 lo_slot = lo - idr->base;
 	u32 hi_slot = end ? (end - idr->base) : IDR_MAX_SLOTS;
@@ -109,47 +127,47 @@ int idr_alloc(struct idr *idr, void *ptr, u32 start, u32 end)
 		for (u32 i = from; i < to; i++) {
 			if (i >= idr->capacity) {
 				if (idr_grow_locked(idr, i + 1) < 0) {
-					spin_unlock_irqrestore(&idr->lock, flags);
+					spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 					return i + 1 > IDR_MAX_SLOTS ? -ENOSPC : -ENOMEM;
 				}
 			}
 			if (idr->slots[i])
 				continue;
-			idr->slots[i] = ptr;
+			idr->slots[i] = idr_encode(ptr);
 			idr->count++;
 			idr->hint = i + 1;
 			u32 id = idr->base + i;
-			spin_unlock_irqrestore(&idr->lock, flags);
+			spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 			return (int)id;
 		}
 	}
 
-	spin_unlock_irqrestore(&idr->lock, flags);
+	spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 	return -ENOSPC;
 }
 
 int idr_alloc_at(struct idr *idr, void *ptr, u32 id)
 {
-	if (!idr || !ptr)
+	if (!idr)
 		return -EINVAL;
 	long slot = idr_slot_of(idr, id);
 	if (slot < 0 || (u32)slot >= IDR_MAX_SLOTS)
 		return -EINVAL;
 
 	u64 flags;
-	spin_lock_irqsave(&idr->lock, &flags);
+	spin_lock_irqsave((spinlock_t *)&idr->lock, &flags);
 	int rc = idr_grow_locked(idr, (u32)slot + 1);
 	if (rc < 0) {
-		spin_unlock_irqrestore(&idr->lock, flags);
+		spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 		return rc;
 	}
 	if (idr->slots[slot]) {
-		spin_unlock_irqrestore(&idr->lock, flags);
+		spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 		return -EBUSY;
 	}
-	idr->slots[slot] = ptr;
+	idr->slots[slot] = idr_encode(ptr);
 	idr->count++;
-	spin_unlock_irqrestore(&idr->lock, flags);
+	spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 	return 0;
 }
 
@@ -161,9 +179,9 @@ void *idr_find(struct idr *idr, u32 id)
 	if (slot < 0)
 		return 0;
 	u64 flags;
-	spin_lock_irqsave(&idr->lock, &flags);
-	void *p = ((u32)slot < idr->capacity) ? idr->slots[slot] : 0;
-	spin_unlock_irqrestore(&idr->lock, flags);
+	spin_lock_irqsave((spinlock_t *)&idr->lock, &flags);
+	void *p = ((u32)slot < idr->capacity) ? idr_decode(idr->slots[slot]) : 0;
+	spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 	return p;
 }
 
@@ -175,17 +193,17 @@ void *idr_remove(struct idr *idr, u32 id)
 	if (slot < 0)
 		return 0;
 	u64 flags;
-	spin_lock_irqsave(&idr->lock, &flags);
+	spin_lock_irqsave((spinlock_t *)&idr->lock, &flags);
 	void *p = 0;
 	if ((u32)slot < idr->capacity && idr->slots[slot]) {
-		p = idr->slots[slot];
+		p = idr_decode(idr->slots[slot]);
 		idr->slots[slot] = 0;
 		idr->count--;
 		/* Reuse the freed slot next: keeps a churning handle table dense. */
 		if ((u32)slot < idr->hint)
 			idr->hint = (u32)slot;
 	}
-	spin_unlock_irqrestore(&idr->lock, flags);
+	spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 	return p;
 }
 
@@ -194,13 +212,13 @@ u32 idr_count(struct idr *idr)
 	if (!idr)
 		return 0;
 	u64 flags;
-	spin_lock_irqsave(&idr->lock, &flags);
+	spin_lock_irqsave((spinlock_t *)&idr->lock, &flags);
 	u32 n = idr->count;
-	spin_unlock_irqrestore(&idr->lock, flags);
+	spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 	return n;
 }
 
-int idr_for_each(struct idr *idr, int (*fn)(u32 id, void *ptr, void *data),
+int idr_for_each(struct idr *idr, int (*fn)(int id, void *ptr, void *data),
                  void *data)
 {
 	if (!idr || !fn)
@@ -211,13 +229,13 @@ int idr_for_each(struct idr *idr, int (*fn)(u32 id, void *ptr, void *data),
 	 * interrupts disabled. */
 	for (u32 i = 0;; i++) {
 		u64 flags;
-		spin_lock_irqsave(&idr->lock, &flags);
+		spin_lock_irqsave((spinlock_t *)&idr->lock, &flags);
 		if (i >= idr->capacity) {
-			spin_unlock_irqrestore(&idr->lock, flags);
+			spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 			break;
 		}
-		void *p = idr->slots[i];
-		spin_unlock_irqrestore(&idr->lock, flags);
+		void *p = idr_decode(idr->slots[i]);
+		spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
 		if (!p)
 			continue;
 		visited++;
@@ -225,4 +243,35 @@ int idr_for_each(struct idr *idr, int (*fn)(u32 id, void *ptr, void *data),
 			break;
 	}
 	return visited;
+}
+
+void *idr_replace(struct idr *idr, void *ptr, u32 id)
+{
+	if (!idr)
+		return 0;
+	u64 flags;
+	spin_lock_irqsave((spinlock_t *)&idr->lock, &flags);
+	void *old = 0;
+	if (id >= idr->base && (id - idr->base) < idr->capacity) {
+		void **slot = &idr->slots[id - idr->base];
+		old = idr_decode(*slot);
+		/* Only replace an allocated id — including one reserved with no value
+		 * yet, which is the case this exists for. Filling an empty slot would
+		 * hand out an id the allocator still believes is free. */
+		if (*slot)
+			*slot = idr_encode(ptr);
+	}
+	spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
+	return old;
+}
+
+u32 idr_max_allocated(struct idr *idr)
+{
+	if (!idr)
+		return 0;
+	u64 flags;
+	spin_lock_irqsave((spinlock_t *)&idr->lock, &flags);
+	u32 max = idr->capacity ? idr->base + idr->capacity - 1 : 0;
+	spin_unlock_irqrestore((spinlock_t *)&idr->lock, flags);
+	return max;
 }

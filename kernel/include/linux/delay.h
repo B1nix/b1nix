@@ -1,0 +1,19 @@
+/* SPDX-License-Identifier: MIT */
+#ifndef LKPI_LINUX_DELAY_H
+#define LKPI_LINUX_DELAY_H
+#include <lkpi/env.h>
+/* udelay busy-waits and may be called with interrupts off; msleep parks and may
+ * not. Keeping them different is the point — a driver that sleeps in an atomic
+ * section is a bug, and mapping both onto the same primitive would hide it. */
+static inline void udelay(unsigned long usecs)
+{
+	for (unsigned long i = 0; i < usecs * 50; i++) {
+		lkpi_cpu_relax();
+	}
+}
+static inline void ndelay(unsigned long ns) { udelay((ns + 999) / 1000); }
+static inline void mdelay(unsigned long ms) { udelay(ms * 1000); }
+static inline void msleep(unsigned int ms) { lkpi_sleep_ticks((ms + 9) / 10); }
+static inline void usleep_range(unsigned long lo, unsigned long hi)
+{ (void)hi; udelay(lo); }
+#endif

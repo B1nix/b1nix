@@ -880,9 +880,20 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
                 return -1;
               }
             } else if (vma->node->inode->data) {
-              /* Initramfs files are resident in inode->data and deliberately
-               * have no read callback. Populate mmap pages from that backing
-               * store instead of leaving the lazy frame zero-filled. */
+              /* A file that lives in inode->data and has no read callback:
+               * initramfs images, and every in-memory file created through the
+               * VFS — which is what a POSIX shared-memory object is, since
+               * shm_open() is open() under /dev/shm.
+               *
+               * Populating the frame is not enough. The frame must go into the
+               * page cache, because that is the only thing that makes two
+               * processes mapping the same file page share one frame. Without
+               * it each mapper faulted in a private copy and every write was
+               * invisible to the other side: descriptors passed, buffers were
+               * accepted, frame callbacks fired, and the screen stayed blank.
+               * memfd escaped this only because it happens to install a read
+               * callback, so the branch above claimed it — the presence of a
+               * callback silently decided whether a mapping was shared. */
               if (file_page < vma->node->inode->size) {
                 usize copy_size = vma->node->inode->size - file_page;
                 if (copy_size > PAGE_SIZE)
@@ -890,6 +901,18 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
                 memcpy(new_frame_virt,
                        (const char *)vma->node->inode->data + file_page,
                        copy_size);
+              }
+              if (page_cache_add_page(vma->node->inode, file_page, frame) == 0) {
+                pmm_ref_frame(frame); /* cache ref + VMA ref */
+                shared_cache_frame = 1;
+                if (mark_dirty) {
+                  struct page_cache_entry *pe =
+                      page_cache_get_page(vma->node->inode, file_page);
+                  if (pe) {
+                    page_cache_mark_dirty(pe);
+                    page_cache_put_page(pe);
+                  }
+                }
               }
             }
           } else if (vma->node->inode->read_cb) {

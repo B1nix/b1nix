@@ -46,7 +46,7 @@ void INIT_DELAYED_WORK(struct delayed_work *dwork, work_func_t func)
 static struct work_struct *wq_dequeue(struct workqueue_struct *wq)
 {
 	u64 flags;
-	spin_lock_irqsave(&wq->lock, &flags);
+	spin_lock_irqsave((spinlock_t *)&wq->lock, &flags);
 	struct work_struct *w = wq->head;
 	if (w) {
 		wq->head = w->next;
@@ -57,7 +57,7 @@ static struct work_struct *wq_dequeue(struct workqueue_struct *wq)
 		w->wq = 0;
 		w->running = 1;
 	}
-	spin_unlock_irqrestore(&wq->lock, flags);
+	spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 	return w;
 }
 
@@ -67,7 +67,7 @@ static void wq_arm_due(struct workqueue_struct *wq)
 	u64 now = scheduler_get_ticks();
 	for (;;) {
 		u64 flags;
-		spin_lock_irqsave(&wq->lock, &flags);
+		spin_lock_irqsave((spinlock_t *)&wq->lock, &flags);
 		struct delayed_work **pp = &wq->delayed;
 		struct delayed_work *found = 0;
 		while (*pp) {
@@ -81,7 +81,7 @@ static void wq_arm_due(struct workqueue_struct *wq)
 			pp = &(*pp)->next;
 		}
 		if (!found) {
-			spin_unlock_irqrestore(&wq->lock, flags);
+			spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 			return;
 		}
 		struct work_struct *w = &found->work;
@@ -96,7 +96,7 @@ static void wq_arm_due(struct workqueue_struct *wq)
 			wq->tail = w;
 			wq->queued++;
 		}
-		spin_unlock_irqrestore(&wq->lock, flags);
+		spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 	}
 }
 
@@ -120,11 +120,11 @@ static void workqueue_thread(void *arg)
 		if (w->func)
 			w->func(w);
 		u64 flags;
-		spin_lock_irqsave(&wq->lock, &flags);
+		spin_lock_irqsave((spinlock_t *)&wq->lock, &flags);
 		w->running = 0;
 		w->seq++;
 		wq->processed++;
-		spin_unlock_irqrestore(&wq->lock, flags);
+		spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 		/* Wake anyone in flush_work/flush_workqueue. */
 		scheduler_wake_all(w);
 		scheduler_wake_all((void *)(usize)&wq->processed);
@@ -160,9 +160,9 @@ int queue_work(struct workqueue_struct *wq, struct work_struct *work)
 	if (!wq || !work || !work->func)
 		return 0;
 	u64 flags;
-	spin_lock_irqsave(&wq->lock, &flags);
+	spin_lock_irqsave((spinlock_t *)&wq->lock, &flags);
 	if (work->pending) {
-		spin_unlock_irqrestore(&wq->lock, flags);
+		spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 		return 0;
 	}
 	work->pending = 1;
@@ -174,7 +174,7 @@ int queue_work(struct workqueue_struct *wq, struct work_struct *work)
 		wq->head = work;
 	wq->tail = work;
 	wq->queued++;
-	spin_unlock_irqrestore(&wq->lock, flags);
+	spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 	scheduler_wake_all(wq);
 	return 1;
 }
@@ -188,9 +188,9 @@ int queue_delayed_work(struct workqueue_struct *wq, struct delayed_work *dwork,
 		return queue_work(wq, &dwork->work);
 
 	u64 flags;
-	spin_lock_irqsave(&wq->lock, &flags);
+	spin_lock_irqsave((spinlock_t *)&wq->lock, &flags);
 	if (dwork->armed || dwork->work.pending) {
-		spin_unlock_irqrestore(&wq->lock, flags);
+		spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 		return 0;
 	}
 	dwork->due_tick = scheduler_get_ticks() + delay_ticks;
@@ -198,7 +198,7 @@ int queue_delayed_work(struct workqueue_struct *wq, struct delayed_work *dwork,
 	dwork->armed = 1;
 	dwork->next = wq->delayed;
 	wq->delayed = dwork;
-	spin_unlock_irqrestore(&wq->lock, flags);
+	spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 	scheduler_wake_all(wq);
 	return 1;
 }
@@ -210,7 +210,7 @@ int cancel_delayed_work(struct delayed_work *dwork)
 	struct workqueue_struct *wq = dwork->wq;
 	u64 flags;
 	int removed = 0;
-	spin_lock_irqsave(&wq->lock, &flags);
+	spin_lock_irqsave((spinlock_t *)&wq->lock, &flags);
 	struct delayed_work **pp = &wq->delayed;
 	while (*pp) {
 		if (*pp == dwork) {
@@ -222,7 +222,7 @@ int cancel_delayed_work(struct delayed_work *dwork)
 		}
 		pp = &(*pp)->next;
 	}
-	spin_unlock_irqrestore(&wq->lock, flags);
+	spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 	return removed;
 }
 
@@ -253,10 +253,10 @@ void flush_workqueue(struct workqueue_struct *wq)
 		return;
 	for (;;) {
 		u64 flags;
-		spin_lock_irqsave(&wq->lock, &flags);
+		spin_lock_irqsave((spinlock_t *)&wq->lock, &flags);
 		int idle = (wq->head == 0) && (wq->running == 0) &&
 		           (wq->processed >= wq->queued);
-		spin_unlock_irqrestore(&wq->lock, flags);
+		spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 		if (idle)
 			return;
 		if (!scheduler_can_block()) {
@@ -291,7 +291,7 @@ void destroy_workqueue(struct workqueue_struct *wq)
 
 static struct workqueue_struct *g_system_wq;
 
-struct workqueue_struct *system_wq(void)
+struct workqueue_struct *lkpi_system_wq(void)
 {
 	if (!g_system_wq)
 		g_system_wq = alloc_workqueue("lkpi-events");
