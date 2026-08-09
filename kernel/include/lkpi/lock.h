@@ -2,8 +2,6 @@
 #ifndef LKPI_LOCK_H
 #define LKPI_LOCK_H
 
-#include <b1nix/sched.h>
-#include <b1nix/spinlock.h>
 #include <lkpi/types.h>
 
 /*
@@ -20,32 +18,27 @@
  * index maps onto lkpi_spinlock.
  */
 
+/*
+ * The lock word is ours rather than b1nix's `spinlock_t`, and the operations
+ * are out of line, so this header pulls in no b1nix declarations. That is the
+ * boundary the import needs: a translation unit compiling imported DRM source
+ * includes this file, and if b1nix's spinlock.h came with it, `spinlock_t` and
+ * `spin_lock` would mean two different things in one translation unit.
+ *
+ * The layout matches what lock.c casts it to; both are `volatile int` plus the
+ * saved flags, and lock.c asserts the sizes agree so a change to either is a
+ * build error rather than a silent mismatch.
+ */
 struct lkpi_spinlock {
-	spinlock_t lock;
+	volatile int raw;
 	u64 flags;
 };
 
-static inline void lkpi_spin_lock_init(struct lkpi_spinlock *l)
-{
-	l->lock = SPINLOCK_INIT;
-	l->flags = 0;
-}
-
+void lkpi_spin_lock_init(struct lkpi_spinlock *l);
 /* Always the IRQ-saving variant: b1nix forbids a plain spin_lock on any lock an
  * interrupt handler can also take, and a driver lock generally is one. */
-static inline void lkpi_spin_lock(struct lkpi_spinlock *l)
-{
-	u64 f;
-	spin_lock_irqsave(&l->lock, &f);
-	l->flags = f;
-}
-
-static inline void lkpi_spin_unlock(struct lkpi_spinlock *l)
-{
-	u64 f = l->flags;
-	l->flags = 0;
-	spin_unlock_irqrestore(&l->lock, f);
-}
+void lkpi_spin_lock(struct lkpi_spinlock *l);
+void lkpi_spin_unlock(struct lkpi_spinlock *l);
 
 /*
  * Sleeping mutex.
@@ -58,7 +51,7 @@ static inline void lkpi_spin_unlock(struct lkpi_spinlock *l)
 struct lkpi_mutex {
 	volatile u32 locked;
 	volatile usize owner;
-	spinlock_t guard;
+	volatile int guard; /* a b1nix spinlock; see the note above */
 };
 
 void lkpi_mutex_init(struct lkpi_mutex *m);

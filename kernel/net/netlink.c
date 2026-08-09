@@ -755,6 +755,51 @@ static int nl_do_addr(u16 type, const u8 *body, usize blen) {
   return -EAFNOSUPPORT;
 }
 
+/* ── Uevent broadcast (NETLINK_KOBJECT_UEVENT) ──────────────────────────
+ *
+ * The one netlink protocol that is not request/response: the kernel announces
+ * a device appearing or leaving, and every listener bound to the group gets a
+ * copy. mdev, udev and every hotplug helper is written against exactly this,
+ * so an announcement that goes nowhere is a driver whose device userspace
+ * never learns about.
+ *
+ * A socket joins by binding with a non-zero nl_groups, which is what the
+ * listener already does; nothing else has to be configured.
+ */
+
+#define MAX_UEVENT_SOCKS 8
+static struct vfs_socket_state *uevent_socks[MAX_UEVENT_SOCKS];
+
+void netlink_uevent_register(struct vfs_socket_state *s) {
+  for (int i = 0; i < MAX_UEVENT_SOCKS; i++) {
+    if (uevent_socks[i] == s)
+      return;
+  }
+  for (int i = 0; i < MAX_UEVENT_SOCKS; i++) {
+    if (!uevent_socks[i]) {
+      uevent_socks[i] = s;
+      return;
+    }
+  }
+}
+
+void netlink_uevent_unregister(struct vfs_socket_state *s) {
+  for (int i = 0; i < MAX_UEVENT_SOCKS; i++) {
+    if (uevent_socks[i] == s)
+      uevent_socks[i] = 0;
+  }
+}
+
+static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
+                            usize len);
+
+void netlink_uevent_broadcast(const void *payload, usize len) {
+  for (int i = 0; i < MAX_UEVENT_SOCKS; i++) {
+    if (uevent_socks[i])
+      netlink_enqueue(uevent_socks[i], (const u8 *)payload, len);
+  }
+}
+
 /* ── Queue plumbing ─────────────────────────────────────────────────────── */
 
 static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,

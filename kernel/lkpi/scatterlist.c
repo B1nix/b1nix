@@ -4,6 +4,8 @@
  * M99 linuxkpi: scatterlists. See kernel/include/lkpi/scatterlist.h.
  */
 
+#include <lkpi/page.h>
+#include <linux/errno.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <lkpi/scatterlist.h>
@@ -145,4 +147,96 @@ usize sg_copy_from_buffer(const struct sg_table *sgt, u64 offset,
                           const void *buf, usize len)
 {
 	return sg_copy(sgt, offset, 0, buf, len, 0);
+}
+
+int lkpi_sg_alloc_table_from_page_array(struct sg_table *sgt,
+                                        struct page **pages,
+                                        unsigned int n_pages,
+                                        unsigned int offset,
+                                        unsigned long size, gfp_t gfp)
+{
+	if (!sgt || !pages || n_pages == 0)
+		return -EINVAL;
+
+	/* lkpi's builder takes frame addresses, because that is what an sg entry
+	 * holds; walking the page array once here keeps the conversion in one
+	 * place that can report a failure. */
+	u64 *frames = (u64 *)lkpi_kmalloc((usize)n_pages * sizeof(u64), gfp);
+	if (!frames)
+		return -ENOMEM;
+	for (unsigned int i = 0; i < n_pages; i++) {
+		if (!pages[i]) {
+			lkpi_kfree(frames);
+			return -EINVAL;
+		}
+		frames[i] = page_to_phys(pages[i]);
+	}
+
+	/* lkpi's builder takes the frame count only; the caller's offset and size
+	 * describe a window into the same pages, and the entries it produces
+	 * already carry per-entry offsets, so nothing is lost by dropping them
+	 * here — but a caller passing a non-zero offset would silently get the
+	 * whole array, so that case is refused instead. */
+	if (offset != 0) {
+		lkpi_kfree(frames);
+		return -EINVAL;
+	}
+	(void)size;
+
+	int err = sg_alloc_table_from_pages(sgt, frames, n_pages);
+	lkpi_kfree(frames);
+	return err;
+}
+
+void __sg_page_iter_start(struct sg_page_iter *iter, struct sg_table *sgt)
+{
+	if (!iter)
+		return;
+	iter->sgt = sgt;
+	iter->entry = 0;
+	/* Starts one before the first page so the first _next lands on it, which
+	 * is what lets the loop be a bare for(;next;). */
+	iter->page_in_entry = (unsigned int)-1;
+}
+
+_Bool __sg_page_iter_next(struct sg_page_iter *iter)
+{
+	if (!iter || !iter->sgt || !iter->sgt->sgl)
+		return 0;
+
+	for (;;) {
+		if (iter->entry >= iter->sgt->nents)
+			return 0;
+		struct scatterlist *sg = &iter->sgt->sgl[iter->entry];
+		unsigned int pages = (sg->length + PAGE_SIZE - 1) / PAGE_SIZE;
+
+		iter->page_in_entry++;
+		if (iter->page_in_entry < pages)
+			return 1;
+
+		/* An entry can cover several pages after coalescing, so moving to the
+		 * next entry is a separate step from moving to the next page. */
+		iter->entry++;
+		iter->page_in_entry = (unsigned int)-1;
+	}
+}
+
+dma_addr_t sg_page_iter_dma_address(struct sg_dma_page_iter *iter)
+{
+	if (!iter || !iter->base.sgt || iter->base.entry >= iter->base.sgt->nents)
+		return 0;
+	struct scatterlist *sg = &iter->base.sgt->sgl[iter->base.entry];
+	return sg->dma_address + (dma_addr_t)iter->base.page_in_entry * PAGE_SIZE;
+}
+
+struct page *sg_page_iter_page(struct sg_page_iter *iter)
+{
+	(void)iter;
+	/*
+	 * There is no global mem_map here, so a physical address cannot be turned
+	 * back into a struct page — see <lkpi/page.h>. Callers that need pages
+	 * must keep the array they allocated; returning a fabricated object would
+	 * hand them one with a refcount nobody owns.
+	 */
+	return 0;
 }

@@ -45,11 +45,12 @@ static volatile u32 g_cb_hits;
 static volatile u64 g_cb_seqno;
 static volatile int g_signaller_done;
 
-static void fence_cb(struct dma_fence *f, void *data)
+static void fence_cb(struct dma_fence *f, struct dma_fence_cb *cb)
 {
 	g_cb_hits++;
 	g_cb_seqno = f->seqno;
-	*(u32 *)data = 0xB0B0B0B0u;
+	/* The payload now travels in the cb, the way Linux's callers carry it. */
+	*(u32 *)cb->data = 0xB0B0B0B0u;
 }
 
 static void fence_signal_thread(void *arg)
@@ -74,14 +75,14 @@ static void test_dma_fence(void)
 	if (ctx_a == ctx_b || ctx_a == 0)
 		ok = 0;
 
-	dma_fence_init(&g_fence, ctx_a, 42, "m100-test");
+	dma_fence_init_named(&g_fence, ctx_a, 42, "m100-test");
 	g_cb_hits = 0;
 	g_cb_seqno = 0;
 	g_signaller_done = 0;
 
 	if (dma_fence_is_signaled(&g_fence))
 		ok = 0;
-	if (dma_fence_add_callback(&g_fence, &cb, fence_cb, &cb_payload) != 0)
+	if (dma_fence_add_callback_data(&g_fence, &cb, fence_cb, &cb_payload) != 0)
 		ok = 0;
 	/* Registering must not fire the callback early. */
 	if (g_cb_hits != 0)
@@ -95,7 +96,7 @@ static void test_dma_fence(void)
 		return;
 	}
 
-	if (dma_fence_wait(&g_fence) != 0)
+	if (dma_fence_wait_uninterruptible(&g_fence) != 0)
 		ok = 0;
 	if (!dma_fence_is_signaled(&g_fence))
 		ok = 0;
@@ -106,12 +107,12 @@ static void test_dma_fence(void)
 	if (dma_fence_signal(&g_fence) != -EINVAL)
 		ok = 0;
 	/* A wait on an already-signalled fence returns immediately. */
-	if (dma_fence_wait(&g_fence) != 0)
+	if (dma_fence_wait_uninterruptible(&g_fence) != 0)
 		ok = 0;
 	/* A callback added after the fact runs immediately and says so. */
 	struct dma_fence_cb late;
 	u32 late_payload = 0;
-	if (dma_fence_add_callback(&g_fence, &late, fence_cb, &late_payload) !=
+	if (dma_fence_add_callback_data(&g_fence, &late, fence_cb, &late_payload) !=
 	        -ENOENT ||
 	    late_payload != 0xB0B0B0B0u)
 		ok = 0;
@@ -121,10 +122,10 @@ static void test_dma_fence(void)
 	/* Error propagation. */
 	int eok = 1;
 	struct dma_fence errf;
-	dma_fence_init(&errf, ctx_b, 1, "m100-err");
+	dma_fence_init_named(&errf, ctx_b, 1, "m100-err");
 	if (dma_fence_signal_error(&errf, -EIO) != 0)
 		eok = 0;
-	if (dma_fence_wait(&errf) != -EIO)
+	if (dma_fence_wait_uninterruptible(&errf) != -EIO)
 		eok = 0;
 	if (dma_fence_error(&errf) != -EIO)
 		eok = 0;
@@ -134,7 +135,7 @@ static void test_dma_fence(void)
 	 * goes, not before. */
 	int rok = 1;
 	struct dma_fence rf;
-	dma_fence_init(&rf, dma_fence_context_alloc(1), 1, "m100-ref");
+	dma_fence_init_named(&rf, dma_fence_context_alloc(1), 1, "m100-ref");
 	rf.release = 0;
 	dma_fence_get(&rf);
 	dma_fence_get(&rf);
@@ -207,7 +208,7 @@ static void test_scheduler(void)
 	 * before any of them can run. Without the gate the first job could be
 	 * picked before the rest were submitted, and the interleaving below would
 	 * be a race rather than a property. */
-	dma_fence_init(&g_gate, dma_fence_context_alloc(1), 1, "m100-gate");
+	dma_fence_init_named(&g_gate, dma_fence_context_alloc(1), 1, "m100-gate");
 
 	u32 n = 0;
 	for (u32 i = 0; i < SCHED_JOBS_PER_ENTITY; i++) {

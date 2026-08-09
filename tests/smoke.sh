@@ -1009,6 +1009,13 @@ check_output "$LOG" "M56-SMOKE: done" "M56 smoke completes"
 section "POSIX memory/signal primitives"
 check_output "$LOG" "MM-SMOKE: start" "MM smoke starts"
 check_output "$LOG" "MM-SMOKE: ok readdir-terminates" "readdir returns every entry once and ends (a child with no cursor sequence used to restart the walk forever)"
+# Is a shared mapping actually shared? Every Wayland client depends on it, and
+# a failure here is invisible from every other angle: descriptors pass, buffers
+# are accepted, frame callbacks fire, and the screen stays blank.
+check_output "$LOG" "SHMSHARE: ok memfd-fork" "a memfd mapped MAP_SHARED in two processes is one memory: each side sees the other's writes"
+check_output "$LOG" "SHMSHARE: ok memfd-scm-rights" "a memfd passed over AF_UNIX SCM_RIGHTS maps to the same memory in the receiver — the path libwayland uses"
+check_output "$LOG" "SHMSHARE: ok shm-open-shared" "a POSIX shared-memory object opened by name in a second process maps to the same memory (an in-memory file page must come from the page cache, or each mapper gets a private copy)"
+check_output "$LOG" "SHMSHARE: done" "shared-mapping smoke completes"
 check_output "$LOG" "MM-SMOKE: ok shm-open" "POSIX shared memory works end to end (shm_open in /dev/shm, ftruncate, mmap, read back)"
 check_output "$LOG" "MM-SMOKE: ok madvise" "madvise(MADV_DONTNEED) zeroes a refaulted anonymous page"
 check_output "$LOG" "MM-SMOKE: ok noreserve" "MAP_NORESERVE large mapping commits lazily on touch"
@@ -2303,6 +2310,48 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M99-SMOKE: ok request-firmware" "M99: request_firmware loads a VFS blob byte-for-byte and reports ENOENT otherwise"
 	check_output "$LOG" "M99-SMOKE: ok locks" "M99: the sleeping mutex actually excludes two racing contexts"
 	check_output "$LOG" "M99-SMOKE: done" "M99 linuxkpi self-test suite completes"
+
+	# ── M101: linuxkpi primitives the DRM core needs ──
+	check_output "$LOG" "M101-SMOKE: ok kref" "M101: the last kref put, and only the last, runs release exactly once; a weak reference on a dead object fails instead of resurrecting it"
+	check_output "$LOG" "M101-SMOKE: ok waitqueue" "M101: a wait_event sleeper is woken by another context and leaves the queue's books clean"
+	check_output "$LOG" "M101-SMOKE: ok waitqueue-timeout" "M101: a wait that times out really parked for its full deadline, measured against the scheduler's ticks, and one already satisfied does not sleep"
+	check_output "$LOG" "M101-SMOKE: ok ww-mutex-basic" "M101: ww_mutex excludes, tracks its acquire count, and names a double-lock as EALREADY instead of deadlocking"
+	check_output "$LOG" "M101-SMOKE: ok ww-mutex-wound" "M101: an older context wounds a younger holder, the younger is refused with EDEADLK and backs off, and the older is never wounded itself"
+	check_output "$LOG" "M101-SMOKE: ok ww-mutex-stress" "M101: two tasks taking the same two locks in opposite orders both terminate with an exact shared counter"
+	check_output "$LOG" "M101-SMOKE: ok rbtree" "M101: ascending inserts stay balanced (invariants verified, depth bounded), ordered both ways, and erase leaves the tree consistent"
+	check_output "$LOG" "M101-SMOKE: ok rbtree-churn" "M101: the rbtree survives 4096 interleaved inserts and erases over heavily duplicated keys — the shape the DRM allocator builds — with the invariants and the cached leftmost checked after every operation"
+	check_output "$LOG" "M101-SMOKE: ok interval-tree" "M101: overlap queries agree with a brute-force scan, and every node's cached subtree maximum survives rebalancing"
+	check_output "$LOG" "M101-SMOKE: ok xarray" "M101: sparse indices across the full 64-bit range round-trip, iterate in order, and the tree folds back to genuinely empty on erase"
+	check_output "$LOG" "M101-SMOKE: ok kthread-worker" "M101: a caller-owned worker runs its items in submission order, coalesces a re-queue, and a flush waits for a sleeping handler"
+	check_output "$LOG" "M101-SMOKE: ok rcu" "M101: RCU read sections nest correctly, a grace period with no readers still completes, and deferred callbacks each run exactly once by the time rcu_barrier returns"
+	check_output "$LOG" "M101-SMOKE: ok rcu-grace-period" "M101: synchronize_rcu does not return while a reader that started before it is still inside — proved by poisoning the object the moment it returns and having the reader, running on another CPU, report whether it ever saw the poison"
+	check_output "$LOG" "M101-SMOKE: ok pages" "M101: a shmem page array is genuinely scattered, and a vmap of it is verified through each page's own direct-map address — a different mapping of the same memory — in both directions, plus write-combining"
+	check_output "$LOG" "M101-SMOKE: ok device-pm" "M101: a kobject releases child-before-parent on the last put, and runtime PM suspends only on the last holder, refuses to claim a suspend the driver rejected, and leaves no usage reference behind on a failed resume"
+	check_output "$LOG" "M101-SMOKE: done" "M101 linuxkpi self-test suite completes"
+
+	# ── M101: the imported DRM core runs, not merely links ──
+	check_output "$LOG" "M101-IMPORT: ok drm-mm" "M101: upstream's own GPU address allocator runs on our augmented rbtree and hands out non-overlapping ranges, reusing holes after a free"
+	check_output "$LOG" "M101-IMPORT: ok drm-rect" "M101: upstream's rectangle maths agrees with independently computed intersections and fixed-point scale factors"
+	check_output "$LOG" "M101-IMPORT: ok drm-fourcc" "M101: upstream's format table resolves through our const handling, including planar subsampling, and reports an unknown code as absent"
+	check_output "$LOG" "M101-IMPORT: done" "M101 imported-core proof completes"
+
+	# ── M101: a real device on the imported core, and the files it publishes ──
+	check_output "$LOG" "M101-KMS: ok device-register" "M101: a driver registers a drm_device with the imported core — minor allocation, the DRM sysfs class and mode configuration all run upstream's code"
+	check_output "$LOG" "M101-KMS: ok modeset-probe" "M101: the in-kernel DRM client probes the connector and picks a mode through upstream's probe helpers"
+	check_output "$LOG" "M101-KMS: ok framebuffer-create" "M101: a dumb buffer becomes a GEM object with a handle and a framebuffer, through drm_gem_fb_create"
+	check_output "$LOG" "M101-KMS: ok commit" "M101: upstream's atomic helpers commit the modeset and the plane"
+	check_output "$LOG" "M101-KMS: ok scanout-pixels" "M101: the committed framebuffer's pixels reach virtio-gpu's scanout — corners and centre match what was painted, so the commit moved an image rather than returning success"
+	check_output "$LOG" "M101-KMS: done" "M101 KMS proof completes"
+
+	check_output "$LOG" "M101-SYSFS: ok card-dev" "M101: /sys/class/drm/card0/dev reads the device number the imported core registered, so its class and device registration reached b1nix's /sys"
+	check_output "$LOG" "M101-SYSFS: ok attr-store" "M101: a writable sysfs attribute takes a write and the next read reflects it"
+	check_output "$LOG" "M101-SYSFS: ok attr-remove-one" "M101: removing one attribute takes that file and no other, releases the context the caller attached to it, and a second removal reports absence"
+	check_output "$LOG" "M101-SYSFS: ok attr-read-at" "M101: an offset-aware attribute is told where the reader stopped, so a value longer than one read is continued rather than truncated at the same place forever"
+	check_output "$LOG" "M101-SYSFS: ok uevent-delivered" "M101: registering a device broadcasts a uevent on NETLINK_KOBJECT_UEVENT that a bound listener receives, with the summary line, ACTION, DEVPATH, SUBSYSTEM and SEQNUM a hotplug helper needs"
+	check_output "$LOG" "M101-SYSFS: ok attr-remove" "M101: removing a registered directory unlinks its files rather than leaving a dangling callback"
+	check_output "$LOG" "M101-SYSFS: ok debugfs-seq-file" "M101: a seq_file-backed debugfs file — a driver's own single_open/seq_read shape — renders once into a buffer and is read to its end across many reads, so nothing past the first read is lost"
+	check_output "$LOG" "M101-SYSFS: ok debugfs-dri" "M101: the DRM core's own debugfs_create_dir(\"dri\") lands under /sys/kernel/debug"
+	check_output "$LOG" "M101-SYSFS: done" "M101 sysfs/debugfs proof completes"
 
 	# ── M100: DRM core ──
 	check_output "$LOG" "M100-SMOKE: ok fence-signal" "M100: a dma-fence wakes a parked waiter and runs its callback exactly once"

@@ -11,6 +11,19 @@ The MIT license described in `LICENSING.md` applies to original B1NIX material. 
 | **TinyCC** | `userspace/tcc/` | 0.9.28rc | GNU LGPL v2.1 or later | <https://repo.or.cz/tinycc.git> |
 | **Duktape** | `userspace/duktape/` | 2.7.0 | MIT License | <https://duktape.org/> |
 
+### Fetched at build time, never vendored
+
+| Component | Staged at | Version / Revision | License | Upstream / Reference |
+| --- | --- | --- | --- | --- |
+| **Linux DRM core** (`drivers/gpu/drm`, `include/drm`, `include/uapi/drm`, `drivers/video/{hdmi,nomodeset}.c`) | `build/src/drm-core-6.6/` | Linux 6.6, SHA-256 `d926a06c…8e56d0` | MIT (`drivers/gpu/drm`, `include/drm`); GPL-2.0 WITH Linux-syscall-note (`include/uapi/drm`) | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz> |
+
+The DRM core is **imported and never edited** — see [`docs/drm-import.md`](docs/drm-import.md).
+`tools/drm/fetch-drm-core.sh` pins the release and verifies the checksum before
+extracting, the same way the port scripts under `tools/ports/` pin theirs.
+Nothing under Linux's `include/linux` is staged: those headers are GPL-2.0
+without exception, and are exactly what b1nix reimplements from scratch under
+MIT in `kernel/include/linux` and `kernel/lkpi`.
+
 ---
 
 ## 2. Core OS Runtimes & C/C++ Libraries

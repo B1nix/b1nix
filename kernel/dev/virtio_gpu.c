@@ -1155,7 +1155,7 @@ static int vgpu_submit_stream(u32 ctx_id, const u32 *cmd, u32 cmd_bytes)
         dma_fence_put(&job->base.finished); /* runs the release, frees job */
         return -1;
     }
-    int err = dma_fence_wait(fence);
+    int err = dma_fence_wait_uninterruptible(fence);
     int result = job->result;
     dma_fence_put(fence);
     dma_fence_put(&job->base.finished); /* the creator's reference */

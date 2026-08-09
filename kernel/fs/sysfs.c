@@ -16,6 +16,7 @@
 #include <b1nix/posix.h>
 #include <b1nix/procfs.h>
 #include <b1nix/sched.h>
+#include <b1nix/sysfs_attr.h>
 #include <b1nix/arch.h>
 #include <b1nix/vfs.h>
 #include <b1nix/version.h>
@@ -424,6 +425,10 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
    * for whatever is loaded now; later loads and unloads maintain the tree
    * themselves. */
   module_sysfs_attach_root(root);
+  /* M101: whatever a driver registered before /sys was mounted — a DRM class,
+   * a device's attribute group — appears now. Registrations after this point
+   * materialise as they happen. */
+  sysfs_reg_attach_root(root);
   return root;
 }
 

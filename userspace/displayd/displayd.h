@@ -173,6 +173,11 @@ struct dclient {
 	int pending_fd;
 	int ping_pending;
 	int ping_misses;
+	/* The connection failed on a write. Reaped by the main loop rather than
+	 * where it was noticed: send_msg is called from inside code that is walking
+	 * this client's own surfaces and objects, and tearing them down under it is
+	 * a use-after-free — which is exactly how this crashed once. */
+	int dead;
 	uint32_t ping_serial;
 };
 

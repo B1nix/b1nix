@@ -29,4 +29,18 @@ isize netlink_socket_send(struct vfs_socket_state *s, const void *buf,
  * Real NICs occupy 1..NET_MAX_NETDEVS through netdev_index_of(). */
 #define NETLINK_LO_IFINDEX 9
 
+/*
+ * NETLINK_KOBJECT_UEVENT: the kernel's hotplug announcements.
+ *
+ * Unlike NETLINK_ROUTE this is a broadcast — no request precedes it. A socket
+ * joins the group by binding with a non-zero nl_groups, and every uevent the
+ * device model raises is then copied into its queue, in the "add@/devices/…"
+ * form with NUL-separated key=value properties that mdev and udev parse.
+ */
+#define NETLINK_KOBJECT_UEVENT 15
+
+void netlink_uevent_register(struct vfs_socket_state *s);
+void netlink_uevent_unregister(struct vfs_socket_state *s);
+void netlink_uevent_broadcast(const void *payload, usize len);
+
 #endif

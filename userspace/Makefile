@@ -275,6 +275,9 @@ BINARIES += $(BUILD)/bin/js
 BINARIES += $(BUILD)/bin/m58_smoke
 # POSIX memory/signal primitives: madvise, MAP_NORESERVE, sigaltstack
 BINARIES += $(BUILD)/bin/m_posixmm_smoke
+# Is a shared mapping actually shared between two processes? Every Wayland
+# client depends on it and nothing else asserts it.
+BINARIES += $(BUILD)/bin/shmshare_smoke
 # M104: native package manager (Alpine APKINDEX/.apk + house flat-index repos).
 # Its smoke coverage is the shell-driven /etc/bpkg-smoke.sh (see rootfs-
 # overlay/etc/rc), matching the existing posix-smoke.sh/zsh-smoke.sh pattern,
