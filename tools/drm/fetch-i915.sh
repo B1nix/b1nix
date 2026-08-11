@@ -108,6 +108,15 @@ sed -e :a -e '/\\$/N; s/\\\n//; ta' \
 # Without the tracepoint TUs, which are not staged.
 grep -vxE 'i915_trace_points\.c|display/intel_display_trace\.c' \
 	"$STAGE_DIR.tmp/B1NIX-OBJECTS.all" > "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
+# The OpRegion, which upstream builds only under CONFIG_ACPI and which is
+# therefore not in i915-y. It is MIT in its own right, and it is where the VBT
+# lives on a machine whose graphics BIOS left none in the PCI ROM — without it
+# i915 synthesises a default VBT and guesses every port. The other half of that
+# Kconfig option, display/intel_acpi.c, is plain GPL-2.0 and is NOT imported;
+# kernel/lkpi/i915_acpi.c supplies its entry points instead.
+echo 'display/intel_opregion.c' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+sort -u -o "$STAGE_DIR.tmp/B1NIX-OBJECTS" "$STAGE_DIR.tmp/B1NIX-OBJECTS"
 rm -f "$STAGE_DIR.tmp/B1NIX-OBJECTS.all"
 
 cat > "$STAGE_DIR.tmp/B1NIX-IMPORT" <<EOF

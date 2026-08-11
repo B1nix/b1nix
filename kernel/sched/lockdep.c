@@ -9,6 +9,7 @@
 #include <b1nix/lapic.h>
 #include <b1nix/lockdep.h>
 #include <b1nix/panic.h>
+#include <b1nix/arch_x86_64.h>
 #include <b1nix/klog.h>
 #include <b1nix/sched.h>
 #include <b1nix/types.h>
@@ -203,6 +204,14 @@ void spin_lock_stuck(volatile int *lock, u64 caller) {
     console_write("\n  caller: 0x");
     console_write_hex64(caller);
     ksym_print(caller);
+    /*
+     * The immediate caller is whichever inline wrapper took the lock, which
+     * names the locking helper and not the code that wanted the lock. Walk the
+     * frames so the site is in the report — a self-deadlock is only actionable
+     * once you can see who already held it.
+     */
+    console_write("\n  backtrace:");
+    arch_backtrace((u64)(usize)__builtin_frame_address(0), caller);
     if (current_task) {
         console_write("\n  task: pid=");
         console_write_dec((u64)current_task->id);

@@ -59,4 +59,10 @@ struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags
 struct file *shmem_file_setup_with_mnt(struct vfsmount *mnt, const char *name,
                                        loff_t size, unsigned long flags);
 
+
+/* One page of a shmem file, by index, allocated on first touch. */
+struct address_space;
+struct folio *shmem_read_folio_gfp(struct address_space *mapping,
+                                   unsigned long index, gfp_t gfp);
+
 #endif

@@ -993,7 +993,16 @@ const char power_group_name[] = "power";
 /* The boot CPU's identity, filled once from CPUID leaf 1. A driver keys a
  * workaround on family/model, so these are the real values — a zeroed struct
  * would silently match "family 0", which no quirk table expects. */
-struct cpuinfo_x86 boot_cpu_data;
+/*
+ * The clflush line size is pre-set rather than left zero until CPUID runs.
+ *
+ * drm_clflush_virt_range() advances a pointer by this value, so a zero is an
+ * infinite loop inside a cache flush — and whether it is still zero depends on
+ * whether a driver probed before lkpi_cpuinfo_init(), which is exactly the kind
+ * of ordering that changes underneath you. 64 bytes is the line size of every
+ * x86-64 part b1nix runs on; CPUID overwrites it with the real value.
+ */
+struct cpuinfo_x86 boot_cpu_data = { .x86_clflush_size = 64 };
 
 void lkpi_cpuinfo_init(void)
 {
@@ -1014,6 +1023,20 @@ void lkpi_cpuinfo_init(void)
   boot_cpu_data.x86_stepping = (u8)(eax & 0xf);
   boot_cpu_data.x86_capability[0] = edx;
   boot_cpu_data.x86_capability[1] = ecx;
+
+  /*
+   * CLFLUSH line size, from CPUID.1:EBX[15:8] in units of 8 bytes.
+   *
+   * Not optional bookkeeping: drm_clflush_virt_range() walks a range with
+   * `addr += boot_cpu_data.x86_clflush_size`, so leaving this zero is an
+   * infinite loop inside the flush, which is precisely how the driver hung
+   * once the x86 cache paths were switched on. A sane default if CPUID says
+   * nothing, because a wrong-but-plausible line size only costs extra flushes
+   * while zero costs the machine.
+   */
+  boot_cpu_data.x86_clflush_size = ((ebx >> 8) & 0xff) * 8u;
+  if (boot_cpu_data.x86_clflush_size == 0)
+    boot_cpu_data.x86_clflush_size = 64u;
 }
 
 /* ── PCI device state ───────────────────────────────────────────── */
@@ -1408,26 +1431,18 @@ void si_meminfo(struct sysinfo *val)
 }
 
 /*
- * Address back to its struct page.
+ * virt_to_page() is in page.c now, next to the registry that answers it.
  *
- * b1nix has no address-to-page map — see the note on pfn_to_page() in
- * <linux/mm.h>. The single caller is TTM's coherent-allocation path, which
- * upstream's own comment calls "an illegal abuse of the DMA API"; it runs only
- * when a device asks its pool for coherent pages, and i915 does not. Returning
- * NULL would be dereferenced one line later, so this stops instead: a loud
- * refusal at the call site rather than a fault somewhere further on.
+ * vmalloc_to_page() is not: a vmap address names a mapping built from pages
+ * that are already known to the caller, and lkpi's vmap keeps no reverse index
+ * from window address back to the page that was mapped there. The one caller is
+ * TTM's coherent pool, which i915 does not use, so it stops rather than
+ * returning a page that is not the one at that address.
  */
-struct page *virt_to_page(const void *addr)
-{
-	(void)addr;
-	lkpi_panic("virt_to_page: b1nix has no address-to-page map; "
-	           "TTM's use_dma_alloc pool is not available here");
-}
-
 struct page *vmalloc_to_page(const void *addr)
 {
 	(void)addr;
-	lkpi_panic("vmalloc_to_page: see virt_to_page");
+	lkpi_panic("vmalloc_to_page: lkpi's vmap window has no reverse index");
 }
 
 /*
@@ -1448,18 +1463,19 @@ vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr,
 }
 
 /*
- * Reading a page back out of a shmem file.
+ * Reading a page out of a shmem file, as a page rather than a folio.
  *
- * b1nix has no tmpfs a driver can swap to, so a buffer object that was swapped
- * out cannot be swapped back in. TTM's swap-in checks IS_ERR on every page, so
- * the refusal is reported through the path it already has rather than through a
- * page that does not hold the right bytes.
+ * The same object linux_file.c creates, so TTM's swap-in gets the page it
+ * stored — one page per folio here, so the two spellings are the same lookup.
+ * An index past the end, or an allocation failure, is reported as an error
+ * because that is what the caller checks for.
  */
 struct page *shmem_read_mapping_page_gfp(struct address_space *mapping,
                                          unsigned long index, gfp_t gfp)
 {
-	(void)mapping; (void)index; (void)gfp;
-	return ERR_PTR(-ENODEV);
+	struct folio *folio = shmem_read_folio_gfp(mapping, index, gfp);
+
+	return folio ? folio_page(folio, 0) : ERR_PTR(-ENOMEM);
 }
 
 struct page *shmem_read_mapping_page(struct address_space *mapping,
@@ -1663,22 +1679,13 @@ struct file *get_file_rcu(struct file *f)
 	return 0;
 }
 
-/* No tmpfs to allocate an inode from — see <linux/shmem_fs.h>. */
-struct file *shmem_file_setup_with_mnt(struct vfsmount *mnt, const char *name,
-                                       loff_t size, unsigned long flags)
-{
-	(void)mnt; (void)name; (void)size; (void)flags;
-	return ERR_PTR(-ENODEV);
-}
+/* shmem_file_setup_with_mnt() is in linux_file.c, with the rest of the shmem
+ * object it creates. */
 
 /* shmem_file_setup() itself is in linux_file.c, next to the rest of the file
  * interface; this is only the mount-taking variant. */
 
-/* Nothing is backed by shmem here (see above), so there is no cache to punch. */
-void shmem_truncate_range(struct inode *inode, loff_t start, loff_t end)
-{
-	(void)inode; (void)start; (void)end;
-}
+/* shmem_truncate_range() is in linux_file.c, next to the pages it frees. */
 
 void kern_unmount(struct vfsmount *mnt) { (void)mnt; }
 
@@ -1829,9 +1836,18 @@ void kernel_fpu_end(void) { }
 /* Machine-wide cache flush. b1nix has no cross-CPU call for drivers, and doing
  * it on this CPU alone leaves stale lines elsewhere — the exact failure this
  * call exists to prevent. */
-void wbinvd_on_all_cpus(void)
+int wbinvd_on_all_cpus(void)
 {
-	lkpi_panic("wbinvd_on_all_cpus: b1nix cannot flush other CPUs' caches");
+	/*
+	 * Reported as unavailable rather than done badly.
+	 *
+	 * Flushing this CPU alone is not the operation: the caller wants every
+	 * cache in the machine emptied before a device reads memory, and doing
+	 * half of it would look like success. Callers treat a non-zero return as
+	 * "could not", and every one of them has a clflush path to fall back on —
+	 * which is the path this machine takes, since CLFLUSH is present.
+	 */
+	return -ENXIO;
 }
 
 /* ── i2c bit-banging ──────────────────────────────────────────────── */
@@ -2011,6 +2027,7 @@ int pci_enable_msi(struct pci_dev *dev)
 	if (!dev)
 		return -EINVAL;
 	vec = lkpi_msi_claim();
+	lkpi_printk("lkpi: pci_enable_msi -> vector %d\n", vec);
 	if (vec < 0)
 		return vec;
 	if (pci_msi_enable(dev->bus_nr, dev->slot, dev->func, (u8)vec) != 0) {
@@ -2204,10 +2221,16 @@ static struct {
 	bool used;
 } lkpi_irqs[LKPI_IRQ_MAX];
 
+/* Counted so a driver that never receives an interrupt can be told apart from
+ * one whose handler declines them. Reported once, on the first arrival. */
+static u64 lkpi_irq_count;
+
 static int lkpi_irq_trampoline(void *ctx)
 {
 	unsigned i = (unsigned)(usize)ctx;
 
+	if (lkpi_irq_count++ == 0)
+		lkpi_printk("lkpi: first device interrupt delivered\n");
 	if (i >= LKPI_IRQ_MAX || !lkpi_irqs[i].used)
 		return 0;
 	return lkpi_irqs[i].handler((int)lkpi_irqs[i].irq, lkpi_irqs[i].dev)
@@ -2261,6 +2284,7 @@ int request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags,
 	for (i = 0; i < LKPI_IRQ_MAX; i++)
 		if (lkpi_irqs[i].used && lkpi_irqs[i].irq == irq &&
 		    !lkpi_irqs[i].handler) {
+			lkpi_printk("lkpi: request_irq bound MSI vector %u\n", irq);
 			lkpi_irqs[i].handler = handler;
 			lkpi_irqs[i].dev = dev;
 			return 0;
@@ -2273,6 +2297,7 @@ int request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags,
 			break;
 	if (i == LKPI_IRQ_MAX)
 		return -ENOSPC;
+	lkpi_printk("lkpi: request_irq on legacy line %u\n", irq);
 	lkpi_irqs[i].handler = handler;
 	lkpi_irqs[i].dev = dev;
 	lkpi_irqs[i].irq = irq;
@@ -2300,3 +2325,34 @@ void free_irq(unsigned int irq, void *dev)
 		return;
 	}
 }
+
+/* ── page cacheability ────────────────────────────────────────────── */
+
+/*
+ * Changing the caching attributes of the kernel's own mapping.
+ *
+ * b1nix has per-mapping attributes (M98's PAT work) but no way to change the
+ * direct map's after the fact, and reporting success would leave a write-back
+ * alias of memory a device is about to read uncached — the exact aliasing these
+ * calls exist to prevent. So they report failure, every caller has a path for
+ * it, and the pages stay write-back. That is safe here because nothing skips
+ * the cache without flushing first: see clflush_cache_range() in
+ * <asm/cacheflush.h>, which drm_cache now uses because this architecture
+ * finally admits to being x86.
+ */
+int set_memory_wc(unsigned long addr, int numpages)
+{ (void)addr; (void)numpages; return -EOPNOTSUPP; }
+int set_memory_wb(unsigned long addr, int numpages)
+{ (void)addr; (void)numpages; return -EOPNOTSUPP; }
+int set_memory_uc(unsigned long addr, int numpages)
+{ (void)addr; (void)numpages; return -EOPNOTSUPP; }
+int set_pages_wb(struct page *page, int numpages)
+{ (void)page; (void)numpages; return -EOPNOTSUPP; }
+int set_pages_uc(struct page *page, int numpages)
+{ (void)page; (void)numpages; return -EOPNOTSUPP; }
+int set_pages_array_uc(struct page **pages, int n)
+{ (void)pages; (void)n; return -EOPNOTSUPP; }
+int set_pages_array_wc(struct page **pages, int n)
+{ (void)pages; (void)n; return -EOPNOTSUPP; }
+int set_pages_array_wb(struct page **pages, int n)
+{ (void)pages; (void)n; return -EOPNOTSUPP; }

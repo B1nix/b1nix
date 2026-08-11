@@ -12,7 +12,11 @@
  * both a scatterlist element and a pointer to one. */
 #define sg_dma_address(sg) ((sg)->dma_address)
 #define sg_dma_len(sg)     ((sg)->length)
-#define sg_page(sg)        ((struct page *)0)
+/* The page a run starts on. Answerable now that pfn_to_page() exists — see the
+ * note there. NULL only if the frame did not come from b1nix's allocators, in
+ * which case there is no struct page to return and the caller must not walk it. */
+static inline struct page *sg_page(struct scatterlist *sg)
+{ return sg ? pfn_to_page((unsigned long)(sg->phys >> 12)) : 0; }
 #define for_each_sgtable_dma_sg(sgt, sg, i) \
 	for ((i) = 0, (sg) = (sgt)->sgl; (i) < (int)(sgt)->nents; (i)++, (sg)++)
 #define for_each_sgtable_sg(sgt, sg, i) for_each_sgtable_dma_sg(sgt, sg, i)

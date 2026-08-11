@@ -31,7 +31,9 @@ typedef struct lkpi_spinlock rwlock_t;
 static inline void spin_lock_init(spinlock_t *l) { lkpi_spin_lock_init(l); }
 static inline void spin_lock(spinlock_t *l) { lkpi_spin_lock(l); }
 static inline void spin_unlock(spinlock_t *l) { lkpi_spin_unlock(l); }
-static inline int spin_trylock(spinlock_t *l) { lkpi_spin_lock(l); return 1; }
+/* A real trylock: it reports failure instead of waiting. See the note in
+ * <lkpi/lock.h> for why that distinction is not optional. */
+static inline int spin_trylock(spinlock_t *l) { return lkpi_spin_trylock(l); }
 
 #define spin_lock_irq(l)             spin_lock(l)
 #define spin_unlock_irq(l)           spin_unlock(l)
@@ -86,10 +88,10 @@ static inline void local_irq_enable(void) { lkpi_irq_restore(1); }
 #define local_irq_restore(flags) lkpi_irq_restore(flags)
 
 
-/* Trylock flavours. b1nix's spinlock has no non-blocking acquire — see
- * spin_trylock() above, which acquires and reports success — so these acquire
- * too. A caller that used the failure path as a fast bail simply always takes
- * the slow path; it never proceeds believing it holds a lock it does not. */
+/* The trylock flavours. spin_trylock() already disables interrupts and saves
+ * the flags inside the lock — see <lkpi/lock.h> — so the _irq and _irqsave
+ * spellings are the same operation, and the caller's flags variable is unused
+ * for the same reason spin_lock_irqsave()'s is. */
 #define spin_trylock_irq(l)          spin_trylock(l)
 #define spin_trylock_irqsave(l, f)   ({ (f) = 0; spin_trylock(l); })
 #define spin_trylock_bh(l)           spin_trylock(l)

@@ -180,6 +180,13 @@ mkdir -p "$OUT_DIR"
 #
 # "q35" is the plain assignment, for looking at register access alone.
 #
+# rombar=0 in both, and it is load-bearing rather than tidy: QEMU exposes the
+# assigned card's video BIOS as an option ROM, the firmware runs it before the
+# bootloader, and on this card it spins forever reading 0xffff. b1nix does not
+# need it — i915 does its own modesetting and takes the VBT from the OpRegion,
+# which QEMU supplies separately. With the ROM left on, the guest never reaches
+# the bootloader at all: it sits in 16-bit real mode at CS=c000.
+#
 case "$MACHINE" in
 legacy)
 	# -vga none and -nic none are required, not cosmetic: QEMU's emulated VGA
@@ -187,17 +194,32 @@ legacy)
 	# is where legacy IGD mode has to place the real device. Neither is wanted
 	# here — this run is about the GPU.
 	MACHINE_ARGS="-machine pc,accel=kvm -vga none -nic none"
-	DEV_ARGS="-device vfio-pci,host=$IGD_BDF,addr=02.0,x-igd-opregion=on"
+	DEV_ARGS="-device vfio-pci,host=$IGD_BDF,addr=02.0,x-igd-opregion=on,rombar=0"
 	;;
 q35)
 	MACHINE_ARGS="-machine q35,accel=kvm -vga none -nic none"
-	DEV_ARGS="-device vfio-pci,host=$IGD_BDF"
+	DEV_ARGS="-device vfio-pci,host=$IGD_BDF,rombar=0"
 	;;
 *)
 	echo "MACHINE must be 'legacy' or 'q35'" >&2
 	exit 1
 	;;
 esac
+
+#
+# A virtio-gpu alongside the assigned card, and a monitor socket to capture it.
+#
+# The assigned GPU scans out to a connector that is not plugged into anything,
+# and QEMU cannot read an assigned device's framebuffer back — for a plain
+# vfio-pci device it reports "doesn't support any (known) display method",
+# because the gfx-plane query it wants exists only for mdev/vGPU. So the guest
+# mirrors the frame onto this second, emulated display, and screendump captures
+# that. See kernel/lkpi/drm_mirror.c.
+SHOT="$OUT_DIR/i915-screen.ppm"
+MON="$OUT_DIR/i915-monitor.sock"
+rm -f "$SHOT" "$MON"
+DEV_ARGS="$DEV_ARGS -device virtio-gpu-pci"
+MON_ARGS="-monitor unix:$MON,server,nowait"
 
 echo "b1nix + $IGD_BDF via VFIO ($MACHINE), ${MEM_MB}M, log: $LOG"
 
@@ -208,10 +230,48 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
 	-cdrom "$ISO" \
 	-boot d \
 	$DEV_ARGS \
+	$MON_ARGS \
 	-display none \
 	-serial stdio \
 	-no-reboot \
-	> "$LOG" 2>&1
+	> "$LOG" 2>&1 &
+qemu_pid=$!
+
+# Capture once the guest says it has mirrored a frame, or give up when QEMU
+# does. Polling the log rather than sleeping a fixed time: the modeset happens
+# whenever it happens, and a fixed wait either races it or wastes the run.
+captured=0
+waited=0
+while kill -0 "$qemu_pid" 2>/dev/null && [ "$waited" -lt "$TIMEOUT" ]; do
+	if grep -aq "mirror: frame presented" "$LOG" 2>/dev/null; then
+		if [ -S "$MON" ]; then
+			printf 'screendump %s\n' "$SHOT" | timeout 10 socat - "unix-connect:$MON" >/dev/null 2>&1
+			captured=1
+		fi
+		break
+	fi
+	sleep 2
+	waited=$((waited + 2))
+done
+
+# Done as soon as the frame is captured. Waiting for the timeout after that
+# costs the whole budget per iteration and tells us nothing new — the guest has
+# already reported what it did.
+if [ "$captured" = 1 ]; then
+	# A short grace period first: the modeset commit runs after the frame is
+	# presented, and killing the moment the capture lands would throw away its
+	# result — which is the half of this that says whether the display pipeline
+	# actually came up.
+	sleep "${CAPTURE_GRACE:-15}"
+	kill "$qemu_pid" 2>/dev/null
+fi
+# Stop as soon as the frame is captured. Waiting out the timeout after that
+# costs the whole budget on every iteration and tells us nothing new: the guest
+# has already reported what it did.
+if [ "$captured" = 1 ]; then
+	kill "$qemu_pid" 2>/dev/null
+fi
+wait "$qemu_pid" 2>/dev/null
 rc=$?
 set -e
 
@@ -221,6 +281,12 @@ if [ "$rc" = 124 ]; then
 	echo "ran to the ${TIMEOUT}s limit (still alive)"
 else
 	echo "qemu exited $rc"
+fi
+
+if [ "$captured" = 1 ] && [ -s "$SHOT" ]; then
+	echo "screen captured: $SHOT"
+else
+	echo "no screen captured (the guest never reported a mirrored frame)"
 fi
 
 echo

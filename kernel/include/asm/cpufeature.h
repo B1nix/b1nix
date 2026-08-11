@@ -38,4 +38,9 @@ static inline bool cpu_has(u32 feature)        { return lkpi_cpu_has(feature) !=
 /* CPUID leaf 1, ECX bit 31: set by every hypervisor, clear on bare metal. */
 #define X86_FEATURE_HYPERVISOR LKPI_X86_FEATURE(1, 2, 31)
 
+
+/* CPUID leaf 7 subleaf 0, EBX bit 23. The leaf is encoded in the same packed
+ * form as the others here; see LKPI_X86_FEATURE above. */
+#define X86_FEATURE_CLFLUSHOPT LKPI_X86_FEATURE(7, 1, 23)
+
 #endif

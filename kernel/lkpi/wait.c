@@ -179,3 +179,42 @@ void __wake_up(struct wait_queue_head *wq, unsigned mode, int nr, void *key)
 	}
 	lkpi_spin_unlock(&wq->lock);
 }
+
+/*
+ * The wake callbacks a queued entry carries.
+ *
+ * b1nix wakes by channel rather than by walking entries, so by the time one of
+ * these runs the waker has already published on the channel and there is
+ * nothing left to do for the task. They exist because imported code walks a
+ * wait queue and calls every entry's func directly — i915's sw-fence does
+ * exactly that when a fence completes — so every entry that can be on such a
+ * queue needs a callback that is safe to call.
+ *
+ * Returning 1 means "this waiter was woken", which is what a caller counts when
+ * it wakes a limited number of them.
+ */
+int default_wake_function(struct wait_queue_entry *entry, unsigned mode,
+                          int flags, void *key)
+{
+	(void)entry;
+	(void)mode;
+	(void)flags;
+	(void)key;
+	return 1;
+}
+
+int autoremove_wake_function(struct wait_queue_entry *entry, unsigned mode,
+                             int flags, void *key)
+{
+	int woken = default_wake_function(entry, mode, flags, key);
+
+	/*
+	 * Unlink on wake, which is what the name promises and what makes this
+	 * safe for an entry that lives on the waiter's stack: the walk that called
+	 * us is holding the queue's lock and using the _safe iterator, so removing
+	 * the current entry is allowed.
+	 */
+	if (woken)
+		list_del_init(&entry->entry);
+	return woken;
+}

@@ -81,10 +81,38 @@ static inline void wake_up_bit(void *word, int bit)
  * on the channel before the final test is what stops a wake landing in the gap
  * from being lost.
  */
+/*
+ * The wake callback an entry carries.
+ *
+ * b1nix wakes by channel — the queue itself is the channel — so there is
+ * nothing per-entry to do beyond what the waker already did. These exist
+ * because imported code calls entry->func() unconditionally while walking a
+ * queue: i915's sw-fence walks its wait list and calls every entry's func, so
+ * an entry with a null func is a jump to zero, and one whose list linkage was
+ * never initialised is a jump to whatever the stack held.
+ */
+int default_wake_function(struct wait_queue_entry *entry, unsigned mode,
+                          int flags, void *key);
+int autoremove_wake_function(struct wait_queue_entry *entry, unsigned mode,
+                             int flags, void *key);
+
+/*
+ * The linkage is initialised here, not left to prepare_to_wait().
+ *
+ * prepare_to_wait() decides whether the entry is already queued by looking at
+ * it, and an uninitialised list head on the stack makes that a coin toss — the
+ * entry either goes on a queue twice or, worse, is left linked into a queue
+ * that outlives the frame it lived in. That is how a wait entry from the boot
+ * task's stack ended up being called by a workqueue thread long after the
+ * frame was gone.
+ */
 #define DEFINE_WAIT(name)                                              \
-	struct wait_queue_entry name = { .flags = 0, .private = 0, .func = 0 }
+	struct wait_queue_entry name = { .flags = 0, .private = 0,         \
+	                                 .func = autoremove_wake_function, \
+	                                 .entry = LIST_HEAD_INIT((name).entry) }
 #define DEFINE_WAIT_FUNC(name, fn)                                     \
-	struct wait_queue_entry name = { .flags = 0, .private = 0, .func = (fn) }
+	struct wait_queue_entry name = { .flags = 0, .private = 0, .func = (fn), \
+	                                 .entry = LIST_HEAD_INIT((name).entry) }
 
 /* Add the entry if it is not already queued, then publish on the channel so a
  * wake between here and the caller's park is not lost. */
@@ -108,7 +136,7 @@ static inline void init_wait_entry(struct wait_queue_entry *entry, int flags)
 {
 	entry->flags = (unsigned int)flags;
 	entry->private = 0;
-	entry->func = 0;
+	entry->func = autoremove_wake_function;
 	INIT_LIST_HEAD(&entry->entry);
 }
 

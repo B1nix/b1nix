@@ -38,6 +38,11 @@ u32 lkpi_cpu_count(void);
 
 /* ── interrupts ─────────────────────────────────────────────────── */
 u64 lkpi_irq_save(void);
+
+/* Non-preemptible region. Nested; the outermost enable restores the interrupt
+ * state the outermost disable saw, rather than assuming it was enabled. */
+void lkpi_preempt_disable(void);
+void lkpi_preempt_enable(void);
 void lkpi_irq_restore(u64 flags);
 int lkpi_irqs_enabled(void);
 
@@ -204,5 +209,21 @@ int lkpi_need_resched(void);
 /* Is the calling thread b1nix's page-reclaim thread? A driver's shrinker asks
  * so it can avoid recursing into reclaim from inside reclaim. */
 int lkpi_is_kswapd(void);
+
+
+/* ── the host-visible display ───────────────────────────────────────
+ *
+ * b1nix's own scanout — the virtio-gpu framebuffer, which in a VM is the window
+ * on screen. A driver that renders into its own framebuffer can be mirrored
+ * there, which is the only way to see what a passed-through GPU produced when
+ * nothing is plugged into it.
+ *
+ * get_mode returns 0 when there is no such display.
+ */
+int lkpi_display_get_mode(u32 *width, u32 *height);
+int lkpi_display_present(const u32 *pixels, u32 width, u32 height);
+
+/* A kernel command-line flag, by name. 1 when present. */
+int lkpi_bootflag(const char *flag);
 
 #endif

@@ -34,6 +34,6 @@ static inline void on_each_cpu(void (*func)(void *), void *info, int wait)
  * mechanism for drivers, so a caller fails to link rather than getting a
  * partial flush that looks like a full one.
  */
-void wbinvd_on_all_cpus(void);
+int wbinvd_on_all_cpus(void);
 
 #endif

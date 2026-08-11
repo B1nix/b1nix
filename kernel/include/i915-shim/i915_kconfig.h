@@ -29,6 +29,19 @@
  * Off here: CONFIG_DRM_I915_CAPTURE_ERROR, CONFIG_DRM_I915_COMPRESS_ERROR, CONFIG_DRM_I915_DEBUG, CONFIG_DRM_I915_DEBUG_GEM, CONFIG_DRM_I915_DEBUG_GEM_ONCE, CONFIG_DRM_I915_DEBUG_GUC, CONFIG_DRM_I915_DEBUG_MMIO, CONFIG_DRM_I915_DEBUG_RUNTIME_PM, CONFIG_DRM_I915_DEBUG_VBLANK_EVADE, CONFIG_DRM_I915_ERRLOG_GEM, CONFIG_DRM_I915_GVT, CONFIG_DRM_I915_PXP, CONFIG_DRM_I915_SELFTEST, CONFIG_DRM_I915_SELFTESTS, CONFIG_DRM_I915_SELFTEST_BROKEN, CONFIG_DRM_I915_SW_FENCE_CHECK_DAG, CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS, CONFIG_DRM_I915_TRACE_GEM, CONFIG_DRM_I915_TRACE_GTT.
  */
 
+/*
+ * ACPI. On, and the reason is the OpRegion rather than ACPI itself:
+ * display/intel_opregion.c is gated on this option, and on a machine whose
+ * graphics BIOS left no VBT in the PCI ROM the OpRegion is the only place the
+ * port and panel description exists. With it off, i915 never looks, and
+ * synthesises a default VBT with every port guessed.
+ *
+ * The _DSM half of the option — display/intel_acpi.c — is plain GPL-2.0 and is
+ * not imported; kernel/lkpi/i915_acpi.c supplies those entry points instead,
+ * and says there what their absence costs.
+ */
+#define CONFIG_ACPI 1
+
 /* Timeouts, in milliseconds unless the comment says otherwise. Upstream's
  * Kconfig.profile defaults, unchanged. */
 #define CONFIG_DRM_I915_REQUEST_TIMEOUT        20000

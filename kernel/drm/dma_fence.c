@@ -97,14 +97,22 @@ int dma_fence_error(struct dma_fence *f)
 	return f ? f->error : 0;
 }
 
-static int fence_signal_common(struct dma_fence *f, int error)
+/*
+ * `held` says the caller already owns f->lock — dma_fence_signal_locked() is
+ * called from inside a section that took it, and taking it again is a
+ * self-deadlock, not a nesting. The state change happens under the lock either
+ * way; only the acquire is skipped.
+ */
+static int fence_signal_common(struct dma_fence *f, int error, int held)
 {
 	if (!f)
 		return -EINVAL;
 
-	lkpi_spin_lock(f->lock);
+	if (!held)
+		lkpi_spin_lock(f->lock);
 	if (f->signaled) {
-		lkpi_spin_unlock(f->lock);
+		if (!held)
+			lkpi_spin_unlock(f->lock);
 		return -EINVAL;
 	}
 	f->error = error;
@@ -122,8 +130,15 @@ static int fence_signal_common(struct dma_fence *f, int error)
 	 * itself. */
 	struct list_head cbs;
 	list_replace_init(&f->cb_list, &cbs);
-	lkpi_spin_unlock(f->lock);
+	if (!held)
+		lkpi_spin_unlock(f->lock);
 
+	/*
+	 * The callbacks run with the lock still held when the caller owned it,
+	 * which is what upstream does too: it is the caller's lock and its
+	 * business when to drop it. A callback that takes the same lock is a bug
+	 * in the callback either way.
+	 */
 	struct dma_fence_cb *cur, *tmp;
 	list_for_each_entry_safe(cur, tmp, &cbs, node) {
 		list_del_init(&cur->node);
@@ -137,12 +152,12 @@ static int fence_signal_common(struct dma_fence *f, int error)
 
 int dma_fence_signal(struct dma_fence *f)
 {
-	return fence_signal_common(f, 0);
+	return fence_signal_common(f, 0, 0);
 }
 
 int dma_fence_signal_error(struct dma_fence *f, int error)
 {
-	return fence_signal_common(f, error ? error : -EIO);
+	return fence_signal_common(f, error ? error : -EIO, 0);
 }
 
 int dma_fence_add_callback(struct dma_fence *f, struct dma_fence_cb *cb,
@@ -358,13 +373,12 @@ void dma_fence_free(struct dma_fence *fence)
 		kfree(fence);
 }
 
-/* Signal with the fence's lock already held by the caller. The signalling
- * itself takes no lock — it walks the callback list, which the caller is
- * holding the lock to protect — so this is the body of dma_fence_signal()
- * without the acquire. */
+/* Signal with the fence's lock already held by the caller: the same state
+ * change, without the acquire. Routing this through dma_fence_signal() was a
+ * self-deadlock — i915_request_retire() holds the lock across it. */
 int dma_fence_signal_locked(struct dma_fence *fence)
 {
-	return dma_fence_signal(fence);
+	return fence_signal_common(fence, 0, 1);
 }
 
 /*

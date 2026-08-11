@@ -360,3 +360,80 @@ int lkpi_is_kswapd(void)
 	struct task *t = current_task;
 	return t && strcmp(t->name, "kswapd") == 0;
 }
+
+/* ── preemption ─────────────────────────────────────────────────────
+ *
+ * b1nix has no preempt count: the timer ISR yields whenever the current task is
+ * RUNNING, so the only way to make a region non-preemptible is to disable
+ * interrupts. That is stronger than Linux's preempt_disable and never weaker,
+ * which is safe in that direction only.
+ *
+ * What it must NOT do is enable interrupts on the way out when the caller had
+ * them off. The earlier version restored a hardcoded IF, and i915 calls this
+ * pair inside _wait_for_atomic() while holding uncore->lock with interrupts
+ * disabled — so the GPU's own MSI arrived on that CPU, its handler took
+ * uncore->lock, and the boot CPU deadlocked against itself on real hardware.
+ *
+ * So the state is saved and nested: only the outermost enable restores, and it
+ * restores what the outermost disable actually saw.
+ */
+static struct {
+	u32 depth;
+	u64 flags;
+} lkpi_preempt_state[MAX_CPUS];
+
+void lkpi_preempt_disable(void)
+{
+	u64 f = interrupts_save();
+	u32 cpu = (u32)percpu_read(cpu_id);
+
+	if (cpu >= MAX_CPUS)
+		return; /* flags stay saved in f and are dropped: IRQs stay off */
+	if (lkpi_preempt_state[cpu].depth++ == 0)
+		lkpi_preempt_state[cpu].flags = f;
+}
+
+void lkpi_preempt_enable(void)
+{
+	u32 cpu = (u32)percpu_read(cpu_id);
+
+	if (cpu >= MAX_CPUS)
+		return;
+	if (lkpi_preempt_state[cpu].depth == 0)
+		return; /* unbalanced enable: leave interrupts as they are */
+	if (--lkpi_preempt_state[cpu].depth == 0)
+		interrupts_restore(lkpi_preempt_state[cpu].flags);
+}
+
+/* ── the host-visible display ───────────────────────────────────────
+ *
+ * b1nix's virtio-gpu scanout, which in a VM is the window the user actually
+ * sees. Imported code cannot reach b1nix's own drivers directly — see the note
+ * at the top of this file — so these are the bridge.
+ */
+
+int lkpi_display_get_mode(u32 *width, u32 *height)
+{
+	if (!virtio_gpu_ready())
+		return 0;
+	virtio_gpu_get_mode(width, height);
+	return 1;
+}
+
+int lkpi_display_present(const u32 *pixels, u32 width, u32 height)
+{
+	if (!pixels || !virtio_gpu_ready())
+		return 0;
+	/* Whole-frame update: this is a mirror, so there is no dirty tracking to
+	 * inherit from the source. No cursor either — the source framebuffer has
+	 * whatever cursor was composited into it. */
+	return virtio_gpu_present(pixels, width, height, 0, 0, width, height,
+	                          0, 0, 0) == 0;
+}
+
+/* A kernel command-line flag, for imported code that cannot reach b1nix's
+ * bootinfo directly. */
+int lkpi_bootflag(const char *flag)
+{
+	return bootinfo_has_flag(flag);
+}

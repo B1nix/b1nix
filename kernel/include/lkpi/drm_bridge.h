@@ -37,4 +37,18 @@ typedef int (*lkpi_drm_page_fn)(struct drm_gem_object *obj, u64 index,
  * driver would need the minor-to-device map this deliberately does without. */
 void lkpi_drm_register_device(struct drm_device *dev, lkpi_drm_page_fn resolver);
 
+
+/* Attach a synthetic sink to unconnected connectors, so the modeset path can
+ * run on a machine with nothing plugged in. `connector_type` is a
+ * DRM_MODE_CONNECTOR_* value, or 0 for any. Returns how many it attached to.
+ * See kernel/lkpi/drm_virtual_monitor.c for what this does and does not test. */
+int lkpi_drm_attach_virtual_monitor(int connector_type);
+
+/*
+ * DRM_MODE_CONNECTOR_HDMIA, repeated because callers on b1nix's side cannot
+ * include the DRM headers. drm_virtual_monitor.c asserts the two agree, so a
+ * change upstream is a build error rather than a connector nobody matches.
+ */
+#define LKPI_DRM_CONNECTOR_HDMIA 11
+
 #endif

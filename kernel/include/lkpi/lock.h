@@ -32,6 +32,17 @@
 struct lkpi_spinlock {
 	volatile int raw;
 	u64 flags;
+	/*
+	 * Where the current holder took it, and which CPU that is (-1 when free).
+	 *
+	 * Kept because a spinlock deadlock in imported code is otherwise
+	 * unreadable: the caller the lockup detector prints is whichever inline
+	 * wrapper did the acquire, the imported objects are built without frame
+	 * pointers so the stack cannot be walked past it, and the interesting
+	 * address — where the lock was ALREADY held from — is by then gone.
+	 */
+	u64 acquired_at;
+	int owner_cpu;
 };
 
 void lkpi_spin_lock_init(struct lkpi_spinlock *l);
@@ -39,6 +50,17 @@ void lkpi_spin_lock_init(struct lkpi_spinlock *l);
  * interrupt handler can also take, and a driver lock generally is one. */
 void lkpi_spin_lock(struct lkpi_spinlock *l);
 void lkpi_spin_unlock(struct lkpi_spinlock *l);
+
+/*
+ * Acquire only if the lock is free; 1 on success, 0 if it was held.
+ *
+ * It has to be able to fail. Imported code uses trylock two ways that both
+ * break if it always succeeds: to bail out of a path rather than wait, and —
+ * the fatal one — to take a lock it may already hold, where an unconditional
+ * acquire is a self-deadlock. i915's modeset bring-up does exactly that, and it
+ * wedged the boot CPU on real hardware.
+ */
+int lkpi_spin_trylock(struct lkpi_spinlock *l);
 
 /*
  * Sleeping mutex.

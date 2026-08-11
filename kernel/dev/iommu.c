@@ -1316,17 +1316,33 @@ void iommu_selftest(void)
 				pmm_free_frame(wf);
 		}
 
-		usize before = pmm_free_frame_count();
-		struct iommu_domain *d = iommu_domain_create();
-		int ok = d != 0 && iommu_domain_capacity() >= 16;
-		u64 frame = pmm_alloc_frame();
-		if (ok && frame)
-			ok = iommu_domain_map(d, 0x50000000ULL, frame, PAGE_SIZE, 1) == 0;
-		if (d)
-			iommu_domain_destroy(d);
-		if (frame)
-			pmm_free_frame(frame);
-		usize after = pmm_free_frame_count();
+		/*
+		 * Measured over two identical cycles, reporting the second.
+		 *
+		 * The counter is global, so it also moves when the kernel heap grows —
+		 * and the heap grows on the first allocation of a size, which is not
+		 * something this check is about. One warm-up cycle used to be enough;
+		 * it stopped being enough when an unrelated structure changed size and
+		 * shifted which allocation was the first of its bucket. Repeating the
+		 * measurement separates the two for good: a genuine leak repeats every
+		 * cycle, heap growth happens once.
+		 */
+		usize before = 0, after = 0;
+		int ok = 1;
+
+		for (int pass = 0; pass < 2 && ok; pass++) {
+			before = pmm_free_frame_count();
+			struct iommu_domain *d = iommu_domain_create();
+			ok = d != 0 && iommu_domain_capacity() >= 16;
+			u64 frame = pmm_alloc_frame();
+			if (ok && frame)
+				ok = iommu_domain_map(d, 0x50000000ULL, frame, PAGE_SIZE, 1) == 0;
+			if (d)
+				iommu_domain_destroy(d);
+			if (frame)
+				pmm_free_frame(frame);
+			after = pmm_free_frame_count();
+		}
 		/* Every page the domain took — root and each level of the walk — is
 		 * back. */
 		if (after != before)

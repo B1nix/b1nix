@@ -602,6 +602,7 @@ CLANG_RESOURCE_INC := $(shell $(CC) -print-resource-dir)/include
 DRM_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
 	-fno-stack-protector -fno-pic -mno-red-zone -w -g -MMD -MP \
 	-D__KERNEL__ -D__linux__ -DKBUILD_MODNAME='"drm"' \
+	-DCONFIG_X86=1 -DCONFIG_X86_64=1 \
 	-isystem $(CLANG_RESOURCE_INC) \
 	-I kernel/include -I kernel/include/uapi \
 	-I $(DRM_IMPORT_DIR)/include -I $(DRM_IMPORT_DIR)/include/uapi \
@@ -616,6 +617,8 @@ $(BUILD_DIR)/$(DRM_IMPORT_DIR)/%.o: $(DRM_IMPORT_DIR)/%.c
 # -w, because this file IS ours and has to stay warning-clean.
 LKPI_IMPORT_SOURCES := \
 	kernel/lkpi/drm_import_test.c \
+	kernel/lkpi/drm_virtual_monitor.c \
+	kernel/lkpi/drm_mirror.c \
 	kernel/lkpi/seq_file.c \
 	kernel/lkpi/sysfs.c \
 	kernel/lkpi/drm_b1nix_kms.c \
@@ -655,11 +658,25 @@ B1NIX_I915 ?= 0
 
 ifeq ($(B1NIX_I915),1)
 # main.c calls the driver's module init only when the driver is in the build.
-CFLAGS_EXTRA += -DB1NIX_I915=1
+#
+# A target-specific variable, not CFLAGS_EXTRA: COMMON_CFLAGS is assigned with
+# := hundreds of lines above this block, so it has already expanded
+# CFLAGS_EXTRA by the time we get here and appending would be silently lost —
+# which is exactly what happened, leaving a kernel with the whole driver linked
+# in and nothing calling its init. Target-specific variables expand when the
+# rule runs, so ordering cannot bite.
+$(BUILD_DIR)/kernel/main.o: COMMON_CFLAGS += -DB1NIX_I915=1
 I915_IMPORT_NAMES := $(shell cat $(I915_IMPORT_DIR)/B1NIX-OBJECTS 2>/dev/null)
 I915_IMPORT_SOURCES := \
 	$(addprefix $(I915_IMPORT_DIR)/drivers/gpu/drm/i915/,$(I915_IMPORT_NAMES))
 I915_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(I915_IMPORT_SOURCES))
+
+# Our own code that stands in for an i915 source we do not import. It needs the
+# driver's include roots, so it is built with the driver's flags — minus -w,
+# because this file is ours and stays warning-clean.
+I915_SHIM_SOURCES := kernel/lkpi/i915_acpi.c kernel/lkpi/i915_display_probe.c
+I915_SHIM_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(I915_SHIM_SOURCES))
+I915_IMPORT_OBJECTS += $(I915_SHIM_OBJECTS)
 
 # The core's flags plus i915's own include roots, and the same -MMD -MP: without
 # them a shim fix leaves every imported object stale, which is how M101 ended up
@@ -689,6 +706,13 @@ I915_IMPORT_CFLAGS := $(DRM_IMPORT_CFLAGS) \
 $(BUILD_DIR)/$(I915_IMPORT_DIR)/%.o: $(I915_IMPORT_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(I915_IMPORT_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+
+# Named explicitly rather than by pattern: the rest of kernel/lkpi is b1nix-side
+# code that must keep b1nix's flags, and a pattern rule here would outrank the
+# general one and rebuild all of it against the driver's headers.
+$(I915_SHIM_OBJECTS): $(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -w,$(I915_IMPORT_CFLAGS)) -Wall -Wextra $(ARCH_CFLAGS) -c $< -o $@
 else
 I915_IMPORT_OBJECTS :=
 endif
@@ -766,6 +790,18 @@ $(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT) tools/kernel/gen_kallsyms.sh
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) $(INSTRUMENT_FLAGS) -c $< -o $@
+
+# B1NIX_I915 is a compiler flag, and make does not watch compiler flags: main.c
+# reads it to decide whether to call the driver's module init, so toggling the
+# variable left a stale main.o that silently did not call it — the driver was
+# linked in, complete, and never started. The stamp file records the value and
+# is rewritten only when it changes, so main.o rebuilds exactly when it must.
+B1NIX_I915_STAMP := $(BUILD_DIR)/.b1nix-i915-$(B1NIX_I915)
+$(B1NIX_I915_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(BUILD_DIR)/.b1nix-i915-*
+	@touch $@
+$(BUILD_DIR)/kernel/main.o: $(B1NIX_I915_STAMP)
 
 # ── M95/M96: loadable kernel modules ──────────────────────────────────────
 # A .ko is the relocatable object itself: the loader allocates its sections in

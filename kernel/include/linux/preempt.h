@@ -11,10 +11,11 @@
  * imported code's assumptions still hold; it just costs more than it would
  * there. Written down because "stronger" is only safe in this direction.
  */
-/* Kept as a pair of saves rather than a bare disable/enable: a caller that
- * disabled interrupts before calling must not have them enabled underneath it. */
-static inline void preempt_disable(void) { (void)lkpi_irq_save(); }
-static inline void preempt_enable(void) { lkpi_irq_restore(0x200); }
+/* Nested, and it restores what it saved: a caller that had interrupts disabled
+ * before calling must not get them enabled underneath it. See the note in
+ * kernel/lkpi/env.c for the deadlock that taught us this. */
+static inline void preempt_disable(void) { lkpi_preempt_disable(); }
+static inline void preempt_enable(void) { lkpi_preempt_enable(); }
 #define preempt_enable_no_resched() preempt_enable()
 static inline int irqs_disabled(void) { return !lkpi_irqs_enabled(); }
 #define in_interrupt()  (!lkpi_irqs_enabled())

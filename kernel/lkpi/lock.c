@@ -13,6 +13,10 @@
  * build error instead of a silent layout mismatch.
  */
 
+#include <b1nix/console.h>
+#include <b1nix/klog.h>
+#include <b1nix/panic.h>
+#include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <lkpi/lock.h>
 
@@ -25,15 +29,100 @@ void lkpi_spin_lock_init(struct lkpi_spinlock *l)
 		return;
 	l->raw = SPINLOCK_INIT;
 	l->flags = 0;
+	l->acquired_at = 0;
+	l->owner_cpu = -1;
 }
 
 void lkpi_spin_lock(struct lkpi_spinlock *l)
 {
 	if (!l)
 		return;
+
+	/*
+	 * Catch the recursive acquire before spinning on it. Waiting would hang
+	 * this CPU forever with no way left to say why: the holder is us, and the
+	 * address that matters is where we took it the first time, which is
+	 * recorded below and would otherwise be overwritten.
+	 */
+	int cpu = (int)percpu_read(cpu_id);
+	if (l->raw != 0 && l->owner_cpu == cpu) {
+		console_write("\nLKPI SPINLOCK RECURSION on cpu ");
+		console_write_dec((u64)cpu);
+		console_write(": lock=0x");
+		console_write_hex64((u64)(usize)l);
+		console_write("\n  already held from: 0x");
+		console_write_hex64(l->acquired_at);
+		ksym_print(l->acquired_at);
+		console_write("\n  re-acquired from:  0x");
+		u64 here = (u64)(usize)__builtin_return_address(0);
+		console_write_hex64(here);
+		ksym_print(here);
+		/*
+		 * Scan the stack for anything that looks like a return address into
+		 * kernel text. The imported objects are built without frame pointers,
+		 * so there is no frame chain to walk — this over-reports (a stale
+		 * value left in a dead slot looks the same as a live return address)
+		 * but it is the only way to see who called the locking read, and a
+		 * plausible-but-dead frame is easy to discount by eye.
+		 */
+		extern char __kernel_text_start[], __kernel_text_end[];
+		u64 lo = (u64)(usize)__kernel_text_start;
+		u64 hi = (u64)(usize)__kernel_text_end;
+		const u64 *sp = (const u64 *)(usize)&here;
+		console_write("\n  stack (possible return addresses):");
+		for (int i = 0, shown = 0; i < 256 && shown < 12; i++) {
+			u64 v = sp[i];
+			if (v < lo || v >= hi)
+				continue;
+			console_write("\n    0x");
+			console_write_hex64(v);
+			ksym_print(v);
+			shown++;
+		}
+		console_write("\n");
+		panic("lkpi spinlock recursive acquire");
+	}
+
 	u64 f;
 	spin_lock_irqsave((spinlock_t *)&l->raw, &f);
 	l->flags = f;
+	l->acquired_at = (u64)(usize)__builtin_return_address(0);
+	l->owner_cpu = cpu;
+}
+
+int lkpi_spin_trylock(struct lkpi_spinlock *l)
+{
+	if (!l)
+		return 0;
+
+	/*
+	 * Interrupts go off before the attempt, not after: if they were left on
+	 * and an interrupt handler took the same lock on this CPU between the
+	 * exchange and the disable, the handler would spin on a lock this CPU
+	 * holds. On failure they are restored, because we are not returning as
+	 * the holder.
+	 */
+	u64 f;
+#ifdef __x86_64__
+	__asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
+#else
+	u32 f32;
+	__asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
+	f = f32;
+#endif
+	if (__atomic_exchange_n(&l->raw, 1, __ATOMIC_ACQUIRE) != 0) {
+#ifdef __x86_64__
+		__asm__ volatile("pushq %0; popfq" : : "r"(f) : "memory");
+#else
+		u32 r32 = (u32)f;
+		__asm__ volatile("pushl %0; popfd" : : "r"(r32) : "memory");
+#endif
+		return 0;
+	}
+	l->flags = f;
+	l->acquired_at = (u64)(usize)__builtin_return_address(0);
+	l->owner_cpu = (int)percpu_read(cpu_id);
+	return 1;
 }
 
 void lkpi_spin_unlock(struct lkpi_spinlock *l)
@@ -42,5 +131,7 @@ void lkpi_spin_unlock(struct lkpi_spinlock *l)
 		return;
 	u64 f = l->flags;
 	l->flags = 0;
+	l->owner_cpu = -1;
+	l->acquired_at = 0;
 	spin_unlock_irqrestore((spinlock_t *)&l->raw, f);
 }

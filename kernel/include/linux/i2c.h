@@ -9,6 +9,10 @@ struct i2c_lock_operations;
 struct i2c_algorithm;
 
 struct i2c_adapter {
+	/* Bus number. b1nix does not number i2c buses — nothing here registers
+	 * one — so this stays 0 and is only ever read back by the caller that
+	 * set it. */
+	int nr;
 	struct device dev;
 	const char *name;
 	void *algo_data;
@@ -128,5 +132,10 @@ int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num);
 
 /* The adapter and client name field width, as userspace sees it in sysfs. */
 #define I2C_NAME_SIZE 20
+
+
+/* Find an adapter by its ACPI handle. There are no ACPI-described adapters
+ * here — see <linux/acpi.h> — so the lookup finds none. */
+struct i2c_adapter *i2c_acpi_find_adapter_by_handle(void *handle);
 
 #endif

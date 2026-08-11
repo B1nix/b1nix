@@ -21,4 +21,15 @@ int set_pages_array_wb(struct page **pages, int addrinarray);
 
 static inline bool pat_enabled(void) { return lkpi_pat_enabled() != 0; }
 
+
+/* The same, in the spellings TTM's page pool uses. Same answer and the same
+ * reason: b1nix cannot change the direct map's caching after the fact, and
+ * reporting success would leave a write-back alias of memory a device is about
+ * to read uncached. TTM treats a failure as "this pool cannot hold non-WB
+ * pages" and keeps them write-back, which is coherent because nothing here
+ * bypasses the caches without flushing (see <asm/cacheflush.h>). */
+int set_pages_wb(struct page *page, int numpages);
+int set_pages_uc(struct page *page, int numpages);
+int set_pages_array_uc(struct page **pages, int addrinarray);
+
 #endif
