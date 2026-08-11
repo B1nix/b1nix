@@ -83,7 +83,18 @@ static inline int spin_trylock(spinlock_t *l) { return lkpi_spin_trylock(l); }
 /* Interrupt control, spelled the way imported code asks for it. b1nix's own
  * primitives are the crossing point — see <lkpi/env.h>. */
 static inline void local_irq_disable(void) { (void)lkpi_irq_save(); }
-static inline void local_irq_enable(void) { lkpi_irq_restore(1); }
+/*
+ * Enable, not restore.
+ *
+ * This was lkpi_irq_restore(1), and that is not "interrupts on": the flags word
+ * these take is the whole of RFLAGS, so the 1 was popped into it — leaving IF
+ * clear, which is interrupts OFF, and clobbering every other flag on the way.
+ * Imported display code disables interrupts around a vblank-evaded register
+ * update and re-enables them with this, so interrupts stayed off for the rest
+ * of the commit; the vblank the commit then waited for could not be delivered
+ * and every modeset ended in "flip_done timed out".
+ */
+static inline void local_irq_enable(void) { lkpi_irq_enable(); }
 #define local_irq_save(flags)    do { (flags) = lkpi_irq_save(); } while (0)
 #define local_irq_restore(flags) lkpi_irq_restore(flags)
 

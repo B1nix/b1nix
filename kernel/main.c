@@ -513,6 +513,27 @@ void kernel_main(usize arg0, usize arg1)
 	 * are tried before falling back to halting.
 	 */
 	if (bootinfo_has_flag("b1nix.gfx-only")) {
+		/*
+		 * Leave the picture on the wire for a while first.
+		 *
+		 * Powering off ends the scanout, and a monitor needs a few seconds to
+		 * lock onto a signal and show it. Without this the only witness to a
+		 * working modeset is the register dump — the screen goes dark before a
+		 * person can look at it. b1nix.gfx-hold=<seconds> is how long to wait.
+		 */
+		char hold[16];
+
+		if (bootinfo_get_kv("b1nix.gfx-hold", hold, sizeof(hold))) {
+			unsigned secs = 0;
+
+			for (const char *p = hold; *p >= '0' && *p <= '9'; p++)
+				secs = secs * 10u + (unsigned)(*p - '0');
+			if (secs > 600u)
+				secs = 600u;
+			console_write("B1NIX-GFX: holding the frame\n");
+			for (unsigned i = 0; i < secs; i++)
+				scheduler_sleep_ticks(100); /* HZ = 100 */
+		}
 		console_write("B1NIX-GFX: done\n");
 		outw(0x604, 0x2000);
 		outw(0xB004, 0x2000);

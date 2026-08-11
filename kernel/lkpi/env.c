@@ -57,6 +57,8 @@ u64 lkpi_irq_save(void) { return interrupts_save(); }
 
 void lkpi_irq_restore(u64 flags) { interrupts_restore(flags); }
 
+void lkpi_irq_enable(void) { interrupts_enable(); }
+
 int lkpi_irqs_enabled(void) { return interrupts_enabled(); }
 
 void lkpi_wait_prepare(void *chan) { scheduler_wait_prepare(chan); }

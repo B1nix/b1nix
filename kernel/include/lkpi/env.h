@@ -44,6 +44,16 @@ u64 lkpi_irq_save(void);
 void lkpi_preempt_disable(void);
 void lkpi_preempt_enable(void);
 void lkpi_irq_restore(u64 flags);
+
+/*
+ * Enable interrupts outright, rather than restoring a saved state.
+ *
+ * Imported code spells this local_irq_enable(), and it means exactly this: turn
+ * them on, no matter what was saved. It cannot be expressed as a restore — the
+ * flags word here is the whole of RFLAGS, so restoring an invented value both
+ * fails to set IF and overwrites every other flag with it.
+ */
+void lkpi_irq_enable(void);
 int lkpi_irqs_enabled(void);
 
 /* Monotonic nanoseconds from the TSC — real resolution, not tick-rounded.

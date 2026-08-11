@@ -37,6 +37,7 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_prime.h>
+#include <asm/cacheflush.h>
 #include <linux/delay.h>
 #include <linux/dma-buf.h>
 #include <linux/err.h>
@@ -64,6 +65,12 @@ extern unsigned long __drm_debug;
  */
 void lkpi_i915_dump_plane_surface(struct drm_device *dev) __attribute__((weak));
 void lkpi_i915_dump_pipe_state(struct drm_device *dev) __attribute__((weak));
+void lkpi_i915_dump_vblank_state(struct drm_device *dev) __attribute__((weak));
+void lkpi_i915_dump_infoframes(struct drm_device *dev) __attribute__((weak));
+void lkpi_i915_dump_port_state(struct drm_device *dev) __attribute__((weak));
+void lkpi_i915_crc_begin(struct drm_device *dev) __attribute__((weak));
+u32 lkpi_i915_crc_sample(struct drm_device *dev) __attribute__((weak));
+void lkpi_i915_crc_end(struct drm_device *dev) __attribute__((weak));
 #define MIRROR_DEBUG_KMS 0x04UL
 
 /* Kept for the life of the mirror: releasing the client would tear the modeset
@@ -464,8 +471,11 @@ int lkpi_drm_mirror_to_display(void)
 	{
 		unsigned long saved_debug = __drm_debug;
 
-		pr_info("drm: mirror: interrupts %s at commit\n",
-		        lkpi_irqs_enabled() ? "on" : "OFF");
+		u64 irqs_before = lkpi_device_irq_count();
+
+		pr_info("drm: mirror: interrupts %s at commit, %llu device IRQs\n",
+		        lkpi_irqs_enabled() ? "on" : "OFF",
+		        (unsigned long long)irqs_before);
 
 		/*
 		 * Only when asked for.
@@ -481,12 +491,78 @@ int lkpi_drm_mirror_to_display(void)
 			__drm_debug |= MIRROR_DEBUG_KMS;
 		rc = drm_client_modeset_commit(&g_client);
 		__drm_debug = saved_debug;
+		/*
+		 * How many interrupts arrived while the commit ran.
+		 *
+		 * The commit ends by waiting for flip_done, which is signalled from the
+		 * vblank interrupt. That wait timing out has two causes that look
+		 * identical from here: the pipe is not raising the interrupt, or it is
+		 * and nothing delivers it. A count of zero across a commit that spans
+		 * several frames settles which.
+		 */
+		pr_info("drm: mirror: %llu device IRQs during commit\n",
+		        (unsigned long long)(lkpi_device_irq_count() - irqs_before));
 		/* What the display engine was actually told to fetch — see
 		 * kernel/lkpi/i915_display_probe.c. Absent unless i915 is built. */
 		if (lkpi_i915_dump_plane_surface)
 			lkpi_i915_dump_plane_surface(dev);
 		if (lkpi_i915_dump_pipe_state)
 			lkpi_i915_dump_pipe_state(dev);
+		/* Whether the vblank the commit waited for is armed, raised and
+		 * counted — see lkpi_i915_dump_vblank_state(). */
+		if (lkpi_i915_dump_vblank_state)
+			lkpi_i915_dump_vblank_state(dev);
+		if (lkpi_i915_dump_infoframes)
+			lkpi_i915_dump_infoframes(dev);
+		if (lkpi_i915_dump_port_state)
+			lkpi_i915_dump_port_state(dev);
+
+		/*
+		 * Proving the picture without a witness.
+		 *
+		 * The pipe's own CRC is the only readback of what the port is being
+		 * fed. Two samples of the frame just committed must agree — a stable
+		 * image gives a stable CRC — and a third, taken after the framebuffer
+		 * has been overwritten with a different pattern, must differ. Together
+		 * those say the plane is fetching this buffer and the pipe is emitting
+		 * what is in it, which is everything up to the cable.
+		 *
+		 * The buffer is repainted afterwards, because the frame left on the
+		 * monitor should be the one worth looking at.
+		 */
+		if (lkpi_i915_crc_begin && lkpi_i915_crc_sample &&
+		    lkpi_i915_crc_end && rc == 0 && g_active) {
+			u32 pitch_px = (g_buffer->fb ? g_buffer->fb->pitches[0]
+			                             : g_fb_width * 4) / 4;
+			u32 same_a, same_b, changed;
+
+			lkpi_i915_crc_begin(dev);
+			same_a = lkpi_i915_crc_sample(dev);
+			same_b = lkpi_i915_crc_sample(dev);
+
+			/* A flat mid-grey: as different from a bordered gradient as a
+			 * frame can be, and cheap to write. */
+			for (u32 y = 0; y < g_fb_height; y++) {
+				u32 *row = (u32 *)map.vaddr + (usize)y * pitch_px;
+
+				for (u32 x = 0; x < g_fb_width; x++)
+					row[x] = 0x00404040;
+			}
+			clflush_cache_range(map.vaddr,
+			                    (usize)g_fb_height * pitch_px * 4);
+			changed = lkpi_i915_crc_sample(dev);
+
+			paint(map.vaddr, g_fb_width, g_fb_height, pitch_px);
+			clflush_cache_range(map.vaddr,
+			                    (usize)g_fb_height * pitch_px * 4);
+			lkpi_i915_crc_end(dev);
+
+			pr_info("drm: mirror: pipe CRC %08x %08x, after repaint %08x "
+			        "(stable %d, responds %d)\n",
+			        same_a, same_b, changed,
+			        (int)(same_a && same_a == same_b),
+			        (int)(changed && changed != same_a));
+		}
 	}
 
 	/*
