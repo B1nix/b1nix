@@ -6,4 +6,7 @@
  * scanner these could inform, so they compile away. */
 static inline void kmemleak_not_leak(const void *p) { (void)p; }
 static inline void kmemleak_ignore(const void *p) { (void)p; }
+
+static inline void kmemleak_update_trace(const void *p) { (void)p; }
+
 #endif

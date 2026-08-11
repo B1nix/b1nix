@@ -127,4 +127,58 @@ static inline bool dma_resv_is_locked(struct dma_resv *obj)
 	return obj->lock.locked != 0;
 }
 
+
+/*
+ * Walking the fences of a reservation object.
+ *
+ * The cursor exists so a caller can iterate without holding the object's lock
+ * across its own work: upstream restarts the walk when the fence list changed
+ * underneath it, and `is_restarted` is how the caller learns that what it
+ * accumulated so far must be thrown away. b1nix's fence array is copied under
+ * the lock at begin and iterated from that copy, so a change mid-walk is not
+ * observed at all — which is stronger than a restart, and means is_restarted is
+ * always false rather than being a field nobody maintains.
+ */
+struct dma_resv_iter {
+	struct dma_resv *obj;
+	enum dma_resv_usage usage;
+	struct dma_fence *fence;
+	enum dma_resv_usage fence_usage;
+	unsigned int index;
+	bool is_restarted;
+};
+
+void dma_resv_iter_begin(struct dma_resv_iter *cursor, struct dma_resv *obj,
+                         enum dma_resv_usage usage);
+void dma_resv_iter_end(struct dma_resv_iter *cursor);
+struct dma_fence *dma_resv_iter_first(struct dma_resv_iter *cursor);
+struct dma_fence *dma_resv_iter_next(struct dma_resv_iter *cursor);
+struct dma_fence *dma_resv_iter_first_unlocked(struct dma_resv_iter *cursor);
+struct dma_fence *dma_resv_iter_next_unlocked(struct dma_resv_iter *cursor);
+
+static inline bool dma_resv_iter_is_restarted(struct dma_resv_iter *cursor)
+{ return cursor && cursor->is_restarted; }
+static inline enum dma_resv_usage dma_resv_iter_usage(struct dma_resv_iter *cursor)
+{ return cursor->fence_usage; }
+
+#define dma_resv_for_each_fence_unlocked(cursor, fence)          \
+	for (fence = dma_resv_iter_first_unlocked(cursor); fence;    \
+	     fence = dma_resv_iter_next_unlocked(cursor))
+
+#define dma_resv_for_each_fence(cursor, obj, usage, fence)       \
+	for (dma_resv_iter_begin(cursor, obj, usage),                \
+	     fence = dma_resv_iter_first(cursor); fence;             \
+	     fence = dma_resv_iter_next(cursor))
+
+
+/* The ww_acquire_ctx a reservation object is currently locked under, or NULL.
+ * Used to tell "I hold this" from "someone else does" while evicting. */
+static inline struct ww_acquire_ctx *dma_resv_locking_ctx(struct dma_resv *obj)
+{ return obj->lock.ctx; }
+
+
+/* Copy every fence from one reservation object to another, so a move can carry
+ * the source's dependencies. */
+int dma_resv_copy_fences(struct dma_resv *dst, struct dma_resv *src);
+
 #endif

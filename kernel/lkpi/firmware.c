@@ -111,13 +111,17 @@ static int fw_request(const struct firmware **out_fw, const char *name, int warn
 	return 0;
 }
 
-int request_firmware(const struct firmware **fw, const char *name)
+int request_firmware(const struct firmware **fw, const char *name,
+                     struct device *dev)
 {
+	(void)dev; /* see the note in <lkpi/firmware.h> */
 	return fw_request(fw, name, 1);
 }
 
-int firmware_request_nowarn(const struct firmware **fw, const char *name)
+int firmware_request_nowarn(const struct firmware **fw, const char *name,
+                            struct device *dev)
 {
+	(void)dev; /* see the note in <lkpi/firmware.h> */
 	return fw_request(fw, name, 0);
 }
 

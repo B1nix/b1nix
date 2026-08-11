@@ -1,0 +1,307 @@
+#!/bin/sh
+# Run b1nix with a real Intel GPU handed to it through VFIO.
+#
+# This is how the imported i915 is proved against hardware rather than against
+# a model of it: QEMU maps the device's BARs and config space straight into the
+# guest, so the driver in b1nix talks to the same silicon the host driver would.
+#
+# What this script does NOT do is take the GPU away from the host. Unbinding a
+# device and binding it to vfio-pci needs root and is the one step that can
+# disturb a running desktop, so it is left to the operator — `--preflight`
+# prints exactly which commands to run, for this machine's GPU, and checks the
+# result. Everything after that is unprivileged.
+#
+# Usage:
+#   sh tools/run-i915-passthrough.sh --preflight     # what is missing, and how
+#   sh tools/run-i915-passthrough.sh                 # run, once bound
+#
+# Environment:
+#   IGD_BDF     PCI address of the GPU        (default: autodetected)
+#   MEM_MB      guest RAM                     (default: 2048)
+#   TIMEOUT     seconds before QEMU is killed (default: 120)
+#   MACHINE     legacy | q35                  (default: legacy)
+set -eu
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+ARCH="${B1NIX_ARCH:-x86_64}"
+ISO="${ISO:-$ROOT_DIR/build/$ARCH/b1nix.iso}"
+OUT_DIR="$ROOT_DIR/smoke_run"
+LOG="$OUT_DIR/i915-passthrough.log"
+MEM_MB="${MEM_MB:-2048}"
+TIMEOUT="${TIMEOUT:-120}"
+MACHINE="${MACHINE:-legacy}"
+
+# The Intel display controller, by class rather than by id: 0300 is a VGA
+# controller and 0380 is a secondary display controller, and an iGPU that is not
+# driving the console reports the latter.
+detect_igd() {
+	lspci -Dn | awk '$2 ~ /^03[08]0:/ && $3 ~ /^8086:/ { print $1; exit }'
+}
+
+IGD_BDF="${IGD_BDF:-$(detect_igd || true)}"
+if [ -z "$IGD_BDF" ]; then
+	echo "no Intel display controller found; set IGD_BDF=0000:00:02.0" >&2
+	exit 1
+fi
+
+SYS="/sys/bus/pci/devices/$IGD_BDF"
+[ -d "$SYS" ] || { echo "no such PCI device: $IGD_BDF" >&2; exit 1; }
+
+current_driver() {
+	if [ -e "$SYS/driver" ]; then
+		basename "$(readlink -f "$SYS/driver")"
+	else
+		echo "(none)"
+	fi
+}
+
+iommu_group() {
+	[ -e "$SYS/iommu_group" ] && basename "$(readlink -f "$SYS/iommu_group")" || echo ""
+}
+
+vendor_device() {
+	printf '%s %s\n' \
+		"$(cut -c3- < "$SYS/vendor")" "$(cut -c3- < "$SYS/device")"
+}
+
+preflight() {
+	group="$(iommu_group)"
+	drv="$(current_driver)"
+	echo "device      : $IGD_BDF  $(lspci -s "$IGD_BDF" | cut -d' ' -f2-)"
+	echo "driver      : $drv"
+	echo "iommu group : ${group:-none — is intel_iommu=on set?}"
+
+	if [ -z "$group" ]; then
+		echo
+		echo "The IOMMU is not on. Add intel_iommu=on to the host kernel cmdline"
+		echo "and reboot; without it VFIO cannot isolate the device and QEMU will"
+		echo "refuse to map it."
+		return 1
+	fi
+
+	# Every device in the group moves together — that is what a group means.
+	echo "group members:"
+	for d in /sys/kernel/iommu_groups/"$group"/devices/*; do
+		bdf="$(basename "$d")"
+		echo "  $bdf  $(lspci -s "$bdf" | cut -d' ' -f2- | cut -c1-60)"
+	done
+
+	# A display on this GPU means unbinding it blanks a screen.
+	attached=""
+	for st in /sys/class/drm/*/status; do
+		[ -e "$st" ] || continue
+		card="$(basename "$(dirname "$st")")"
+		case "$card" in *-*) ;; *) continue ;; esac
+		devlink="/sys/class/drm/${card%%-*}/device"
+		[ -e "$devlink" ] || continue
+		[ "$(basename "$(readlink -f "$devlink")")" = "$IGD_BDF" ] || continue
+		[ "$(cat "$st")" = "connected" ] && attached="$attached $card"
+	done
+	if [ -n "$attached" ]; then
+		echo
+		echo "WARNING: displays are connected to this GPU:$attached"
+		echo "Unbinding it will blank them. Move the console to another card first."
+	else
+		echo "displays    : none connected (safe to unbind)"
+	fi
+
+	# Anything holding the render node keeps the driver busy.
+	if command -v fuser >/dev/null 2>&1; then
+		holders="$(fuser /dev/dri/by-path/pci-$IGD_BDF-render 2>/dev/null || true)"
+		if [ -n "$holders" ]; then
+			echo
+			echo "In use by PID(s):$holders — close them, or the unbind fails:"
+			for p in $holders; do
+				echo "  $p  $(ps -o comm= -p "$p" 2>/dev/null || true)"
+			done
+		fi
+	fi
+
+	if [ "$drv" = "vfio-pci" ]; then
+		echo
+		echo "Already bound to vfio-pci."
+		node="/dev/vfio/$group"
+		if [ -r "$node" ] && [ -w "$node" ]; then
+			echo "$node is readable and writable. Ready."
+		else
+			echo "$node is not accessible to $(id -un). Run:"
+			echo "  sudo setfacl -m u:$(id -un):rw $node"
+		fi
+		lim="$(ulimit -l)"
+		if [ "$lim" != "unlimited" ] && [ "${lim:-0}" -lt $((MEM_MB * 1024)) ]; then
+			echo
+			echo "The locked-memory limit is ${lim} KiB, below the ${MEM_MB} MiB of guest"
+			echo "RAM that VFIO has to pin. Raise it for this shell:"
+			echo "  ulimit -l $((MEM_MB * 1024 + 65536))"
+			echo "or add a limits.d entry for $(id -un) (memlock)."
+		fi
+		return 0
+	fi
+
+	set -- $(vendor_device)
+	echo
+	echo "To hand the device to VFIO, run:"
+	echo "  sudo modprobe vfio-pci"
+	echo "  echo $IGD_BDF | sudo tee $SYS/driver/unbind"
+	echo "  echo $1 $2 | sudo tee /sys/bus/pci/drivers/vfio-pci/new_id"
+	echo "  sudo setfacl -m u:$(id -un):rw /dev/vfio/$group"
+	echo
+	echo "To give it back afterwards:"
+	echo "  echo $1 $2 | sudo tee /sys/bus/pci/drivers/vfio-pci/remove_id"
+	echo "  echo $IGD_BDF | sudo tee /sys/bus/pci/drivers/vfio-pci/unbind"
+	echo "  echo $IGD_BDF | sudo tee /sys/bus/pci/drivers/i915/bind"
+	return 1
+}
+
+if [ "${1:-}" = "--preflight" ]; then
+	preflight
+	exit $?
+fi
+
+drv="$(current_driver)"
+if [ "$drv" != "vfio-pci" ]; then
+	echo "$IGD_BDF is bound to '$drv', not vfio-pci." >&2
+	echo "Run: sh tools/run-i915-passthrough.sh --preflight" >&2
+	exit 1
+fi
+[ -f "$ISO" ] || { echo "no ISO at $ISO — run: make B1NIX_I915=1 iso" >&2; exit 1; }
+
+mkdir -p "$OUT_DIR"
+
+#
+# A NIC at an address of its own.
+#
+# QEMU assigns the default NIC to the first free slot, which is the one legacy
+# IGD mode needs — that collision is why the emulated devices were dropped
+# entirely at first. Dropping the network instead makes the guest's network
+# tests wait forever on a link that will never come up, which reads like a hang
+# in the graphics run and is nothing of the sort. So it gets slot 3.
+NET_ARGS="-netdev user,id=n0 -device e1000,netdev=n0,addr=03.0"
+
+#
+# Machine model.
+#
+# "legacy" is QEMU's IGD passthrough mode: the device must sit at guest 00:02.0
+# on an i440fx machine, and QEMU then also gives the guest the two things an
+# Intel driver reads that are not in the device itself — the OpRegion, which
+# carries the VBT describing how the panels and ports are wired, and the host
+# bridge and LPC device ids the driver identifies the chipset from. Without
+# those i915 probes and then has nothing to drive.
+#
+# "q35" is the plain assignment, for looking at register access alone.
+#
+# rombar=0 in both, and it is load-bearing rather than tidy: QEMU exposes the
+# assigned card's video BIOS as an option ROM, the firmware runs it before the
+# bootloader, and on this card it spins forever reading 0xffff. b1nix does not
+# need it — i915 does its own modesetting and takes the VBT from the OpRegion,
+# which QEMU supplies separately. With the ROM left on, the guest never reaches
+# the bootloader at all: it sits in 16-bit real mode at CS=c000.
+#
+case "$MACHINE" in
+legacy)
+	# -vga none and -nic none are required, not cosmetic: QEMU's emulated VGA
+	# takes guest slot 2 and its default NIC takes the next free one, and slot 2
+	# is where legacy IGD mode has to place the real device. Neither is wanted
+	# here — this run is about the GPU.
+	MACHINE_ARGS="-machine pc,accel=kvm -vga none $NET_ARGS"
+	DEV_ARGS="-device vfio-pci,host=$IGD_BDF,addr=02.0,x-igd-opregion=on,rombar=0"
+	;;
+q35)
+	MACHINE_ARGS="-machine q35,accel=kvm -vga none $NET_ARGS"
+	DEV_ARGS="-device vfio-pci,host=$IGD_BDF,rombar=0"
+	;;
+*)
+	echo "MACHINE must be 'legacy' or 'q35'" >&2
+	exit 1
+	;;
+esac
+
+#
+# A virtio-gpu alongside the assigned card, and a monitor socket to capture it.
+#
+# The assigned GPU scans out to a connector that is not plugged into anything,
+# and QEMU cannot read an assigned device's framebuffer back — for a plain
+# vfio-pci device it reports "doesn't support any (known) display method",
+# because the gfx-plane query it wants exists only for mdev/vGPU. So the guest
+# mirrors the frame onto this second, emulated display, and screendump captures
+# that. See kernel/lkpi/drm_mirror.c.
+SHOT="$OUT_DIR/i915-screen.ppm"
+MON="$OUT_DIR/i915-monitor.sock"
+rm -f "$SHOT" "$MON"
+DEV_ARGS="$DEV_ARGS -device virtio-gpu-pci"
+MON_ARGS="-monitor unix:$MON,server,nowait"
+
+echo "b1nix + $IGD_BDF via VFIO ($MACHINE), ${MEM_MB}M, log: $LOG"
+
+set +e
+timeout "$TIMEOUT" qemu-system-x86_64 \
+	$MACHINE_ARGS \
+	-m "$MEM_MB" \
+	-cdrom "$ISO" \
+	-boot d \
+	$DEV_ARGS \
+	$MON_ARGS \
+	-display none \
+	-serial stdio \
+	-no-reboot \
+	> "$LOG" 2>&1 &
+qemu_pid=$!
+
+# Capture once the guest says it has mirrored a frame, or give up when QEMU
+# does. Polling the log rather than sleeping a fixed time: the modeset happens
+# whenever it happens, and a fixed wait either races it or wastes the run.
+captured=0
+waited=0
+while kill -0 "$qemu_pid" 2>/dev/null && [ "$waited" -lt "$TIMEOUT" ]; do
+	if grep -aq "mirror: frame presented" "$LOG" 2>/dev/null; then
+		if [ -S "$MON" ]; then
+			printf 'screendump %s\n' "$SHOT" | timeout 10 socat - "unix-connect:$MON" >/dev/null 2>&1
+			captured=1
+		fi
+		break
+	fi
+	sleep 2
+	waited=$((waited + 2))
+done
+
+# Done as soon as the frame is captured. Waiting for the timeout after that
+# costs the whole budget per iteration and tells us nothing new — the guest has
+# already reported what it did.
+if [ "$captured" = 1 ]; then
+	# A short grace period first: the modeset commit runs after the frame is
+	# presented, and killing the moment the capture lands would throw away its
+	# result — which is the half of this that says whether the display pipeline
+	# actually came up.
+	sleep "${CAPTURE_GRACE:-15}"
+	kill "$qemu_pid" 2>/dev/null
+fi
+# Stop as soon as the frame is captured. Waiting out the timeout after that
+# costs the whole budget on every iteration and tells us nothing new: the guest
+# has already reported what it did.
+if [ "$captured" = 1 ]; then
+	kill "$qemu_pid" 2>/dev/null
+fi
+wait "$qemu_pid" 2>/dev/null
+rc=$?
+set -e
+
+# 124 is timeout's own code: the guest was still running, which for a driver
+# bring-up is a result rather than a failure.
+if [ "$rc" = 124 ]; then
+	echo "ran to the ${TIMEOUT}s limit (still alive)"
+else
+	echo "qemu exited $rc"
+fi
+
+if [ "$captured" = 1 ] && [ -s "$SHOT" ]; then
+	echo "screen captured: $SHOT"
+else
+	echo "no screen captured (the guest never reported a mirrored frame)"
+fi
+
+echo
+echo "── i915 and DRM lines from the guest ──"
+grep -aiE "i915|drm|GuC|HuC|GT[0-9]|vfio" "$LOG" | head -60 || true
+echo
+echo "── panics, if any ──"
+grep -aiE "PANIC|BUG|#GP|page fault" "$LOG" | head -20 || true

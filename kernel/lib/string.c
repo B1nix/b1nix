@@ -227,3 +227,28 @@ char *strstr(const char *haystack, const char *needle)
 	}
 	return 0;
 }
+
+size_t strnlen(const char *s, size_t maxlen)
+{
+	usize n = 0;
+	while (n < maxlen && s[n])
+		n++;
+	return n;
+}
+
+/* Append, never writing past `size` bytes total including the terminator.
+ * Returns the length the result would have had, so a caller can detect
+ * truncation — which is what distinguishes it from strncat. */
+size_t strlcat(char *dst, const char *src, size_t size)
+{
+	size_t dlen = strnlen(dst, size);
+	size_t slen = strlen(src);
+	size_t i;
+
+	if (dlen == size)
+		return size + slen;
+	for (i = 0; dlen + i < size - 1 && src[i]; i++)
+		dst[dlen + i] = src[i];
+	dst[dlen + i] = '\0';
+	return dlen + slen;
+}

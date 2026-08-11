@@ -109,10 +109,23 @@ struct drm_b1nix_gem_info {
 void drm_dev_init(void);
 int drm_dev_open(int flags);
 
+/* M101t: /dev/dri/card1, the imported DRM core's own node. Registered only when
+ * a device came up on that core, so `present` is the honest question to ask
+ * before routing an open at it. */
+void drm_card1_init(void);
+int drm_card1_open(int flags);
+int drm_card1_present(void);
+
 /* M100: the GEM linear-view kernel window (0 when no DRM device exists). The
  * self-test uses these to check the window's page-table path really is shared
  * by every address space. */
 u64 drm_vmap_window_base(void);
 u64 drm_vmap_window_size(void);
+
+
+/* The imported core's nodes, one per registered device. card0 is b1nix's own
+ * device and is not one of these. */
+int drm_imported_card_present(const char *path);
+int drm_imported_card_open(const char *path, int flags);
 
 #endif

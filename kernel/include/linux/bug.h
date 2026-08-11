@@ -28,4 +28,27 @@ extern int oops_in_progress;
 	})
 #define WARN_ONCE(cond, fmt, ...) WARN(cond, fmt, ##__VA_ARGS__)
 #define WARN_ON_ONCE(cond) WARN_ON(cond)
+
+/*
+ * Taint flags.
+ *
+ * Linux records that something happened which makes a later bug report less
+ * trustworthy — a warning fired, a driver forced a workaround — and prints the
+ * accumulated set with every subsequent oops. b1nix has one kernel log and no
+ * out-of-tree modules to blame, so the flags are recorded and reported through
+ * the same log rather than kept in a separate register.
+ */
+#define TAINT_WARN            9
+#define TAINT_MACHINE_CHECK   4
+#define TAINT_DIE             1
+#define LOCKDEP_STILL_OK      1
+#define LOCKDEP_NOW_UNRELIABLE 0
+
+void add_taint(unsigned flag, int lockdep_ok);
+
+
+#define TAINT_USER            6
+#define TAINT_FIRMWARE_WORKAROUND 11
+#define TAINT_CRAP            10
+
 #endif

@@ -109,4 +109,21 @@ static inline struct llist_node *llist_reverse_order(struct llist_node *head)
 	               true);                                                  \
 	     (pos) = (n))
 
+
+/* Push a whole already-linked batch onto the head at once. The batch's last
+ * node is given, so the splice is a single exchange rather than one per node. */
+static inline bool llist_add_batch(struct llist_node *new_first,
+                                   struct llist_node *new_last,
+                                   struct llist_head *head)
+{
+	struct llist_node *first;
+	do {
+		first = head->first;
+		new_last->next = first;
+	} while (!__atomic_compare_exchange_n(&head->first, &first, new_first,
+	                                      false, __ATOMIC_SEQ_CST,
+	                                      __ATOMIC_SEQ_CST));
+	return first == NULL;
+}
+
 #endif

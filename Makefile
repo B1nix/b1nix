@@ -499,6 +499,8 @@ KERNEL_SOURCES += \
  	kernel/dev/virtio_gpu.c \
  	kernel/dev/virtio_input.c \
 	kernel/dev/drm.c \
+	kernel/dev/drm_card1.c \
+	kernel/dev/fw_cfg.c \
 	kernel/dev/netconsole.c \
 	kernel/lkpi/lkpi_core.c \
 	kernel/lkpi/idr.c \
@@ -525,6 +527,7 @@ KERNEL_SOURCES += \
 	kernel/lkpi/dma_buf.c \
 	kernel/lkpi/dma_fence_chain.c \
 	kernel/lkpi/timer.c \
+	kernel/lkpi/i2c_bit.c \
 	kernel/lkpi/linux_misc.c \
 	kernel/lkpi/lkpi_test.c \
 	kernel/lkpi/lkpi_m101_test.c \
@@ -582,9 +585,14 @@ DRM_IMPORT_DIR := build/src/drm-core-6.6
 # directory is wrong for a different reason: Kconfig excludes some, and
 # drm_of.c collides with its own header's stub when built without CONFIG_OF.
 DRM_IMPORT_NAMES := $(shell cat $(DRM_IMPORT_DIR)/B1NIX-OBJECTS 2>/dev/null)
+# Everything in the list lives under drivers/gpu/drm, including the display/
+# and ttm/ subdirectories, except hdmi.c — which upstream keeps with the video
+# helpers and which is named here rather than pattern-matched, so that adding a
+# subdirectory to the list does not silently send it to the wrong tree.
+DRM_IMPORT_VIDEO_NAMES := hdmi.c
 DRM_IMPORT_SOURCES := \
-	$(foreach n,$(filter drm_%,$(DRM_IMPORT_NAMES)),$(DRM_IMPORT_DIR)/drivers/gpu/drm/$(n)) \
-	$(foreach n,$(filter-out drm_%,$(DRM_IMPORT_NAMES)),$(DRM_IMPORT_DIR)/drivers/video/$(n))
+	$(foreach n,$(filter-out $(DRM_IMPORT_VIDEO_NAMES),$(DRM_IMPORT_NAMES)),$(DRM_IMPORT_DIR)/drivers/gpu/drm/$(n)) \
+	$(foreach n,$(filter $(DRM_IMPORT_VIDEO_NAMES),$(DRM_IMPORT_NAMES)),$(DRM_IMPORT_DIR)/drivers/video/$(n))
 DRM_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(DRM_IMPORT_SOURCES))
 
 CLANG_RESOURCE_INC := $(shell $(CC) -print-resource-dir)/include
@@ -596,12 +604,37 @@ CLANG_RESOURCE_INC := $(shell $(CC) -print-resource-dir)/include
 DRM_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
 	-fno-stack-protector -fno-pic -mno-red-zone -w -g -MMD -MP \
 	-D__KERNEL__ -D__linux__ -DKBUILD_MODNAME='"drm"' \
+	-DCONFIG_X86=1 -DCONFIG_X86_64=1 \
 	-isystem $(CLANG_RESOURCE_INC) \
 	-I kernel/include -I kernel/include/uapi \
 	-I $(DRM_IMPORT_DIR)/include -I $(DRM_IMPORT_DIR)/include/uapi \
 	-include linux/compiler_types.h -include linux/types.h
 
-$(BUILD_DIR)/$(DRM_IMPORT_DIR)/%.o: $(DRM_IMPORT_DIR)/%.c
+#
+# A stamp that changes when the compiler flags change.
+#
+# make compares timestamps of files; it cannot see that a -D was added. That is
+# not a theoretical gap — it bit twice on this driver, and both times the
+# symptom pointed somewhere else entirely. Adding -DB1NIX_I915 left a stale
+# main.o whose init call had been compiled out, so the driver was linked into
+# the image and never started; adding -DCONFIG_X86 left a stale drm_cache.o,
+# which silently invalidated a bisect and sent the search down a wrong path.
+#
+# The stamp's *name* carries a hash of the flags, so a change makes a different
+# file, which does not exist, which rebuilds everything that depends on it.
+# Recorded per flag set, because the three sets change independently.
+#
+DRM_FLAGS_HASH := $(firstword $(shell printf '%s' \
+	'$(DRM_IMPORT_CFLAGS) $(I915_IMPORT_CFLAGS) $(ARCH_CFLAGS) $(COMMON_CFLAGS)' \
+	| cksum))
+DRM_FLAGS_STAMP := $(BUILD_DIR)/.import-flags-$(DRM_FLAGS_HASH)
+
+$(DRM_FLAGS_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(BUILD_DIR)/.import-flags-*
+	@touch $@
+
+$(BUILD_DIR)/$(DRM_IMPORT_DIR)/%.o: $(DRM_IMPORT_DIR)/%.c $(DRM_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(DRM_IMPORT_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
@@ -610,9 +643,13 @@ $(BUILD_DIR)/$(DRM_IMPORT_DIR)/%.o: $(DRM_IMPORT_DIR)/%.c
 # -w, because this file IS ours and has to stay warning-clean.
 LKPI_IMPORT_SOURCES := \
 	kernel/lkpi/drm_import_test.c \
+	kernel/lkpi/drm_virtual_monitor.c \
+	kernel/lkpi/drm_mirror.c \
 	kernel/lkpi/seq_file.c \
 	kernel/lkpi/sysfs.c \
-	kernel/lkpi/drm_b1nix_kms.c
+	kernel/lkpi/drm_b1nix_kms.c \
+	kernel/lkpi/drm_chardev.c \
+	kernel/lkpi/linux_support.c
 
 LKPI_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(LKPI_IMPORT_SOURCES))
 
@@ -620,19 +657,104 @@ LKPI_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(LKPI_IMPORT_SOURCES))
 # directory is b1nix-side code that must keep b1nix's own flags, and a pattern
 # rule here would outrank the general one and quietly rebuild all of it against
 # the Linux headers.
-$(LKPI_IMPORT_OBJECTS): $(BUILD_DIR)/%.o: %.c
+$(LKPI_IMPORT_OBJECTS): $(BUILD_DIR)/%.o: %.c $(DRM_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(filter-out -w,$(DRM_IMPORT_CFLAGS)) -Wall -Wextra $(ARCH_CFLAGS) -c $< -o $@
 
 DRM_IMPORT_OBJECTS += $(LKPI_IMPORT_OBJECTS)
 
+# ── M102a: Intel i915 — imported, and optional ────────────────────────────
+#
+# The DRM core is staged unconditionally because the kernel links it. i915 is
+# not: 13 MiB and 262 objects is a real cost for someone working on the
+# filesystem or the network stack, and they should not pay it to build a kernel
+# they are not putting a GPU in.
+#
+# So it is gated twice, and both gates are deliberate:
+#
+#   - the staged tree has to exist. `make i915-fetch` puts it there; without it
+#     I915_IMPORT_NAMES is empty and everything below evaluates to nothing.
+#   - B1NIX_I915=1 has to be asked for. While the driver does not yet compile
+#     against the shim, merely having staged the source must not break the build
+#     for someone who staged it to read it.
+#
+# When the driver builds, the second gate is the one to remove — not the first.
+I915_IMPORT_DIR := build/src/i915-6.6
+B1NIX_I915 ?= 0
+
+ifeq ($(B1NIX_I915),1)
+# main.c calls the driver's module init only when the driver is in the build.
+#
+# A target-specific variable, not CFLAGS_EXTRA: COMMON_CFLAGS is assigned with
+# := hundreds of lines above this block, so it has already expanded
+# CFLAGS_EXTRA by the time we get here and appending would be silently lost —
+# which is exactly what happened, leaving a kernel with the whole driver linked
+# in and nothing calling its init. Target-specific variables expand when the
+# rule runs, so ordering cannot bite.
+$(BUILD_DIR)/kernel/main.o: COMMON_CFLAGS += -DB1NIX_I915=1
+I915_IMPORT_NAMES := $(shell cat $(I915_IMPORT_DIR)/B1NIX-OBJECTS 2>/dev/null)
+I915_IMPORT_SOURCES := \
+	$(addprefix $(I915_IMPORT_DIR)/drivers/gpu/drm/i915/,$(I915_IMPORT_NAMES))
+I915_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(I915_IMPORT_SOURCES))
+
+# Our own code that stands in for an i915 source we do not import. It needs the
+# driver's include roots, so it is built with the driver's flags — minus -w,
+# because this file is ours and stays warning-clean.
+I915_SHIM_SOURCES := kernel/lkpi/i915_acpi.c kernel/lkpi/i915_display_probe.c
+I915_SHIM_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(I915_SHIM_SOURCES))
+I915_IMPORT_OBJECTS += $(I915_SHIM_OBJECTS)
+
+# The core's flags plus i915's own include roots, and the same -MMD -MP: without
+# them a shim fix leaves every imported object stale, which is how M101 ended up
+# running a mixture of old and new headers.
+# -O2 is not a performance choice, it is a correctness requirement: i915 writes
+# BUILD_BUG_ON(!__builtin_constant_p(x)) to assert that a register accessor was
+# handed a compile-time constant, and without optimisation the compiler does not
+# fold it, so the assertion fires on perfectly correct code. Upstream builds this
+# driver optimised and its static assertions are written against that.
+#
+# kernel/include/i915-shim carries the two tracepoint headers upstream keeps
+# under plain GPL-2.0, rewritten as MIT no-ops. It comes AFTER the driver's own
+# include roots on purpose: a quoted include resolves against the including
+# file's directory first, so if a future rebase ever brings a real i915_trace.h
+# back into the staged tree, that one wins and this stops being reachable —
+# which is a visible change rather than a silent one.
+I915_IMPORT_CFLAGS := $(DRM_IMPORT_CFLAGS) \
+	-I $(I915_IMPORT_DIR)/drivers/gpu/drm/i915 \
+	-I $(I915_IMPORT_DIR)/drivers/gpu/drm/i915/display \
+	-I $(DRM_IMPORT_DIR)/drivers/gpu/drm \
+	-I kernel/include/i915-shim \
+	-I kernel/include/i915-shim/display \
+	-I kernel/include/i915-shim/rel/drivers/gpu/drm/i915 \
+	-include i915_kconfig.h \
+	-O2
+
+$(BUILD_DIR)/$(I915_IMPORT_DIR)/%.o: $(I915_IMPORT_DIR)/%.c $(DRM_FLAGS_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(I915_IMPORT_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+
+# Named explicitly rather than by pattern: the rest of kernel/lkpi is b1nix-side
+# code that must keep b1nix's flags, and a pattern rule here would outrank the
+# general one and rebuild all of it against the driver's headers.
+$(I915_SHIM_OBJECTS): $(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -w,$(I915_IMPORT_CFLAGS)) -Wall -Wextra $(ARCH_CFLAGS) -c $< -o $@
+else
+I915_IMPORT_OBJECTS :=
+endif
+
+.PHONY: i915-fetch
+i915-fetch:
+	@sh tools/drm/fetch-i915.sh
+
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES)) \
-	$(DRM_IMPORT_OBJECTS)
+	$(DRM_IMPORT_OBJECTS) \
+	$(I915_IMPORT_OBJECTS)
 KERNEL_DEPS := $(patsubst %.c,$(BUILD_DIR)/%.d,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.d,$(ASM_SOURCES)) $(MODULE_KOS:.ko=.d) \
-	$(DRM_IMPORT_OBJECTS:.o=.d)
+	$(DRM_IMPORT_OBJECTS:.o=.d) $(I915_IMPORT_OBJECTS:.o=.d)
 
 -include $(KERNEL_DEPS)
 
@@ -694,6 +816,18 @@ $(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT) tools/kernel/gen_kallsyms.sh
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) $(INSTRUMENT_FLAGS) -c $< -o $@
+
+# B1NIX_I915 is a compiler flag, and make does not watch compiler flags: main.c
+# reads it to decide whether to call the driver's module init, so toggling the
+# variable left a stale main.o that silently did not call it — the driver was
+# linked in, complete, and never started. The stamp file records the value and
+# is rewritten only when it changes, so main.o rebuilds exactly when it must.
+B1NIX_I915_STAMP := $(BUILD_DIR)/.b1nix-i915-$(B1NIX_I915)
+$(B1NIX_I915_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(BUILD_DIR)/.b1nix-i915-*
+	@touch $@
+$(BUILD_DIR)/kernel/main.o: $(B1NIX_I915_STAMP)
 
 # ── M95/M96: loadable kernel modules ──────────────────────────────────────
 # A .ko is the relocatable object itself: the loader allocates its sections in
@@ -795,7 +929,7 @@ $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(wildcard userspace/bin/*/*.c) $(wildcard userspace/bin/*/*.cpp) \
 	$(wildcard userspace/bin/*/*.S) \
 	$(wildcard userspace/src/*.c) \
-	$(wildcard userspace/b1cc/src/*.c) \
+	$(wildcard userspace/b1cc/src/*.c userspace/b1cc/src/*/*.c) \
 	$(wildcard userspace/displayd/*.c) \
 	$(wildcard userspace/duktape/duktape.c) \
 	$(LIBM_LIB) \
@@ -862,7 +996,9 @@ $(INC_DIR)/initramfs_%.inc: $$(call user_bin_src,$$*) $(USERSPACE_DEPS)
 # Depend on the b1cc *sources* (same glob as userspace/Makefile's B1CC_SRCDIR) so
 # editing b1cc re-embeds it — otherwise the .inc looks up-to-date vs
 # USERSPACE_DEPS and the stale compiler binary gets shipped.
-B1CC_SELFHOST_SRCS := $(wildcard $(or $(B1CC_SRCDIR),userspace/b1cc/src)/*.c)
+# One directory deep as well — see the note in userspace/Makefile.
+B1CC_SELFHOST_SRCS := $(wildcard $(or $(B1CC_SRCDIR),userspace/b1cc/src)/*.c \
+                                 $(or $(B1CC_SRCDIR),userspace/b1cc/src)/*/*.c)
 $(INC_DIR)/initramfs_b1cc_selfhost.inc: $(USERSPACE_DEPS) $(B1CC_SELFHOST_SRCS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/b1cc
 	@mkdir -p $(dir $@)
@@ -1543,6 +1679,22 @@ iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init: root-image check-dynamic 
 # drops to an interactive getty/shell that starves d8 on a single CPU.) Reuses the
 # shared kernel.elf — no recompile, just a different boot cmdline. The d8 binary +
 # m58.js ride on build/v8-out/v8-ext4.img, attached as sata0 by tests/smoke.sh.
+# Display bring-up instance: the kernel and nothing else.
+#
+# Deliberately carries no rootfs module. The in-kernel DRM client is what drives
+# the display, so userspace contributes nothing here — and shipping it costs
+# 154 MB in the image plus a full rootfs build and an init that takes minutes to
+# reach a state this boot never uses. Paired with b1nix.gfx-only, which powers
+# the machine off as soon as the frame exists.
+#
+# Depends on the kernel alone, so an edit to a shim rebuilds one object and
+# relinks, instead of rebuilding userspace and repacking a filesystem image.
+iso-i915: $(KERNEL_ELF)
+	@$(MKISO) --stage $(BUILD_DIR)/iso-i915 --out $(BUILD_DIR)/b1nix-i915.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "b1nix.gfx-only b1nix.mirror-display $(I915_EXTRA_CMDLINE)" \
+	    $(if $(I915_EDID),--module $(I915_EDID):edid.bin)
+
 iso-v8: $(KERNEL_ELF) root-image
 	@$(MKISO) --stage $(BUILD_DIR)/iso-v8 --out $(BUILD_DIR)/b1nix-v8.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \

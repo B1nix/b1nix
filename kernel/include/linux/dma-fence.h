@@ -49,4 +49,44 @@ void dma_fence_set_error(struct dma_fence *fence, int error);
  * which the caller observed and this function did not. */
 int dma_fence_signal_timestamp(struct dma_fence *fence, ktime_t timestamp);
 
+
+/*
+ * Marking a critical section that must reach a signal.
+ *
+ * Upstream uses these to let lockdep prove that nothing inside the section can
+ * block on something that is itself waiting for this fence — the deadlock that
+ * takes a GPU down and is almost impossible to reproduce. There is no lockdep
+ * here, so nothing is proved; the section is still marked so the annotation
+ * survives a rebase and starts working the day lockdep does.
+ */
+static inline bool dma_fence_begin_signalling(void) { return true; }
+static inline void dma_fence_end_signalling(bool cookie) { (void)cookie; }
+
+
+/* Is fence f1 later in f2's timeline? Only meaningful for two fences on the
+ * same context; the wrap-safe comparison is on the seqno. */
+static inline bool dma_fence_is_later(struct dma_fence *f1, struct dma_fence *f2)
+{
+	if (f1->context != f2->context)
+		return false;
+	return (s64)(f1->seqno - f2->seqno) > 0;
+}
+
+/* Free a fence's memory directly, for a driver whose release does nothing else.
+ * The kfree upstream reaches through the rcu head; there is no deferred free
+ * here — a fence is not looked up under RCU in this port. */
+void dma_fence_free(struct dma_fence *fence);
+
+/* Signal with the fence's lock already held by the caller. */
+int dma_fence_signal_locked(struct dma_fence *fence);
+
+/* Ask a fence to start reporting completion in software. A driver that only
+ * arms its interrupt when someone is waiting needs this before a wait that does
+ * not go through dma_fence_wait(). */
+void dma_fence_enable_sw_signaling(struct dma_fence *fence);
+
+/* The default ->wait implementation, for a driver that wants the generic
+ * sleep-on-signal behaviour in its ops table. */
+i64 dma_fence_default_wait(struct dma_fence *fence, int intr, i64 timeout);
+
 #endif

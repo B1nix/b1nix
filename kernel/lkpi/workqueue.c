@@ -134,8 +134,11 @@ static void workqueue_thread(void *arg)
 	scheduler_exit_current(0);
 }
 
-struct workqueue_struct *alloc_workqueue(const char *name)
+struct workqueue_struct *alloc_workqueue(const char *name, unsigned int flags,
+                                         int max_active)
 {
+	(void)flags;
+	(void)max_active; /* see the note in <lkpi/workqueue.h> */
 	struct workqueue_struct *wq = kzalloc(sizeof(*wq));
 	if (!wq)
 		return 0;
@@ -294,6 +297,16 @@ static struct workqueue_struct *g_system_wq;
 struct workqueue_struct *lkpi_system_wq(void)
 {
 	if (!g_system_wq)
-		g_system_wq = alloc_workqueue("lkpi-events");
+		g_system_wq = alloc_workqueue("lkpi-events", 0, 1);
 	return g_system_wq;
+}
+
+int workqueue_pending(struct workqueue_struct *wq)
+{
+	if (!wq)
+		return 0;
+	/* Delayed items count: one that has not fired yet is work this queue still
+	 * owes, and a drain that ignored them would return with the queue about to
+	 * become busy again. */
+	return wq->head != 0 || wq->delayed != 0 || wq->running != 0;
 }

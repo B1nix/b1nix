@@ -80,4 +80,48 @@
 #define ENOIOCTLCMD    515
 #define EPROBE_DEFER   517
 
+
+/* The rarer codes imported drivers return. Values are Linux's, because they
+ * cross to userspace and a driver's errno must mean there what it means here. */
+#ifndef ECHRNG
+#define ECHRNG   44  /* channel number out of range */
+#define EBADSLT  57  /* invalid slot */
+#define EL3RST   47
+#define ENOTUNIQ 76
+#endif
+
+
+/* The rest of the codes imported drivers return. Values are Linux's, because a
+ * driver's errno crosses to userspace and has to mean there what it means
+ * here. */
+#ifndef ENOBUFS
+#define ENOBUFS  105
+#endif
+#ifndef ENOLINK
+#define ENOLINK  67
+#define EMULTIHOP 72
+#define EREMOTE  66
+#endif
+#ifndef ENOKEY
+#define ENOKEY   126
+#endif
+
+
+#ifndef EMSGSIZE
+#define EMSGSIZE 90
+#endif
+
+
+#ifndef EWOULDBLOCK
+#define EWOULDBLOCK EAGAIN
+#endif
+
+
+#ifndef EADDRINUSE
+#define EADDRINUSE 98
+#endif
+#ifndef ENOPKG
+#define ENOPKG 65
+#endif
+
 #endif

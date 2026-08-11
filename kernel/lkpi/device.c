@@ -30,7 +30,7 @@ static void kobject_release_chain(struct kref *ref)
 		kobject_put(parent);
 }
 
-void kobject_init_and_add(struct kobject *kobj, const char *name,
+void lkpi_kobject_init_and_add(struct kobject *kobj, const char *name,
                           struct kobject *parent, kobject_release_t release)
 {
 	if (!kobj)
@@ -73,7 +73,7 @@ void lkpi_device_init(struct lkpi_device *dev, const char *name,
 {
 	if (!dev)
 		return;
-	kobject_init_and_add(&dev->kobj, name, 0, 0);
+	lkpi_kobject_init_and_add(&dev->kobj, name, 0, 0);
 	lkpi_mutex_init(&dev->lock);
 	dev->pm = pm;
 	dev->usage = 0;
@@ -286,4 +286,79 @@ int kobject_uevent(struct kobject *kobj, enum kobject_action action)
 u64 kobject_uevents_raised(void)
 {
 	return __atomic_load_n(&g_uevents, __ATOMIC_ACQUIRE);
+}
+
+/*
+ * The Linux-named creation calls.
+ *
+ * Upstream splits creation into init (record the type) and add (make it appear
+ * in sysfs under a formatted name). b1nix's kobject carries a plain name and a
+ * release function, so init takes the release out of the type and add formats
+ * the name — which is allocated, because the caller's format arguments are on
+ * its stack.
+ */
+void kobject_init(struct kobject *kobj, const struct kobj_type *ktype)
+{
+	lkpi_kobject_init_and_add(kobj, 0, 0, ktype ? ktype->release : 0);
+}
+
+static const char *kobject_format_name(const char *fmt, va_list ap)
+{
+	char *name = lkpi_kmalloc(64, 0);
+
+	if (!name)
+		return 0;
+	vsnprintf(name, 64, fmt, ap);
+	return name;
+}
+
+int kobject_add(struct kobject *kobj, struct kobject *parent, const char *fmt, ...)
+{
+	va_list ap;
+
+	if (!kobj)
+		return -EINVAL;
+	va_start(ap, fmt);
+	kobj->name = kobject_format_name(fmt, ap);
+	va_end(ap);
+	if (!kobj->name)
+		return -ENOMEM;
+	kobj->parent = parent;
+	if (parent)
+		kobject_get(parent);
+	return 0;
+}
+
+int kobject_init_and_add(struct kobject *kobj, const struct kobj_type *ktype,
+                         struct kobject *parent, const char *fmt, ...)
+{
+	va_list ap;
+	const char *name;
+
+	if (!kobj)
+		return -EINVAL;
+	va_start(ap, fmt);
+	name = kobject_format_name(fmt, ap);
+	va_end(ap);
+	if (!name)
+		return -ENOMEM;
+	lkpi_kobject_init_and_add(kobj, name, parent, ktype ? ktype->release : 0);
+	return 0;
+}
+
+/* Allocate a kobject and add it. Freed by its own last put, through the release
+ * below — which is why the allocation is not the caller's to free. */
+static void kobject_dynamic_release(struct kobject *kobj)
+{
+	lkpi_kfree(kobj);
+}
+
+struct kobject *kobject_create_and_add(const char *name, struct kobject *parent)
+{
+	struct kobject *kobj = lkpi_kmalloc(sizeof(*kobj), 0);
+
+	if (!kobj)
+		return 0;
+	lkpi_kobject_init_and_add(kobj, name, parent, kobject_dynamic_release);
+	return kobj;
 }

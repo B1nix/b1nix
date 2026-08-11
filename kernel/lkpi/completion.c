@@ -4,6 +4,7 @@
  * M99 linuxkpi: completions. See kernel/include/lkpi/completion.h.
  */
 
+#include <b1nix/arch.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <lkpi/completion.h>
@@ -83,12 +84,48 @@ void wait_for_completion(struct completion *c)
 	}
 }
 
+/* Cycles the TSC advances in one scheduler tick, or 0 when the CPU clock was
+ * never calibrated. The TSC runs whether or not interrupts are enabled, which
+ * is the whole point of using it here. */
+static u64 tsc_per_tick(void)
+{
+	u32 khz = arch_cpu_khz();
+
+	/* A tick is 10 ms, so a tick is 10 * (cycles per ms). */
+	return khz ? (u64)khz * 10ull : 0;
+}
+
+static inline u64 read_tsc(void)
+{
+	u32 lo, hi;
+
+	__asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
+	return ((u64)hi << 32) | lo;
+}
+
 u64 wait_for_completion_timeout(struct completion *c, u64 timeout_ticks)
 {
 	if (!c)
 		return 0;
 	u64 start = scheduler_get_ticks();
 	u64 deadline = start + timeout_ticks;
+	/*
+	 * A second deadline on the CPU's own clock.
+	 *
+	 * The tick deadline is only reachable while the timer interrupt can run.
+	 * A caller that cannot block is a caller with interrupts disabled — that
+	 * is exactly what scheduler_can_block() reports — and the tick then never
+	 * advances, so a timeout expressed in ticks can never expire and the spin
+	 * below runs forever. That is not hypothetical: i915's atomic commit waits
+	 * for a page flip this way, and the machine stopped there.
+	 *
+	 * The TSC keeps counting regardless, so it is what bounds the spin.
+	 */
+	u64 tsc_deadline = 0;
+	u64 per_tick = tsc_per_tick();
+
+	if (per_tick)
+		tsc_deadline = read_tsc() + timeout_ticks * per_tick;
 
 	for (;;) {
 		if (try_wait_for_completion(c)) {
@@ -99,6 +136,11 @@ u64 wait_for_completion_timeout(struct completion *c, u64 timeout_ticks)
 		if (now >= deadline)
 			return 0;
 		if (!scheduler_can_block()) {
+			/* Uncalibrated CPU clock leaves nothing to bound this with, so
+			 * the tick deadline is all there is — see above for when that is
+			 * not enough. */
+			if (tsc_deadline && read_tsc() >= tsc_deadline)
+				return 0;
 			__asm__ volatile("pause");
 			tlb_shootdown_poll();
 			continue;

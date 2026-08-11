@@ -51,7 +51,11 @@ void INIT_DELAYED_WORK(struct delayed_work *dwork, work_func_t func);
 
 /* Create a queue with its own kthread. `name` is used for the thread name.
  * Returns NULL if the thread could not be created. */
-struct workqueue_struct *alloc_workqueue(const char *name);
+/* `flags` and `max_active` are upstream's; every queue here owns one thread and
+ * runs its items in order, so both describe a parallelism that does not exist.
+ * Kept in the signature because every imported caller passes them. */
+struct workqueue_struct *alloc_workqueue(const char *name, unsigned int flags,
+                                         int max_active);
 
 /* Stop the queue's thread once its backlog has drained, then free it. Sleeps. */
 void destroy_workqueue(struct workqueue_struct *wq);
@@ -83,4 +87,9 @@ static inline int schedule_work(struct work_struct *work)
 	return wq ? queue_work(wq, work) : 0;
 }
 
+
+/* 1 while anything is queued, armed or running on this queue. Read without the
+ * queue's lock, so it is a snapshot — the caller that needs certainty flushes;
+ * the one that needs to know whether flushing again is worthwhile uses this. */
+int workqueue_pending(struct workqueue_struct *wq);
 #endif

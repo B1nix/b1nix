@@ -1,9 +1,12 @@
 /* SPDX-License-Identifier: MIT */
 #ifndef B1NIX_DMA_FENCE_H
 #define B1NIX_DMA_FENCE_H
+#include <linux/list.h>
+#include <linux/ktime.h>
 
 #include <b1nix/types.h>
 #include <lkpi/lock.h>
+#include <lkpi/kref.h>
 
 /*
  * M100 — dma-fence.
@@ -44,11 +47,35 @@ struct dma_fence_cb;
 typedef void (*dma_fence_cb_fn)(struct dma_fence *fence,
                                 struct dma_fence_cb *cb);
 typedef void (*dma_fence_release_fn)(struct dma_fence *fence);
+/* The name imported code uses for the callback signature. */
+typedef dma_fence_cb_fn dma_fence_func_t;
+
+/*
+ * Fence state bits.
+ *
+ * b1nix's own fences answer "has it signalled" through the `signaled` field,
+ * and that is still what the code here reads. Imported drivers do not: they
+ * test and set bits in `flags` directly — i915 does it thousands of times, and
+ * it also allocates its own state above DMA_FENCE_FLAG_USER_BITS. So the word
+ * exists and the SIGNALED bit is kept in step with `signaled` at the one place
+ * that sets it, rather than being a second source of truth that could drift.
+ */
+enum dma_fence_flag_bits {
+	DMA_FENCE_FLAG_SIGNALED_BIT,
+	DMA_FENCE_FLAG_TIMESTAMP_BIT,
+	DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT,
+	DMA_FENCE_FLAG_USER_BITS, /* must stay last: drivers count from here */
+};
 
 struct dma_fence_cb {
 	dma_fence_cb_fn func;
 	void *data;
-	struct dma_fence_cb *next;
+	/* A list node, not a `next` pointer: imported code splices the whole
+	 * callback list onto a local head and then walks it with
+	 * list_for_each_entry_safe(..., node) — i915's breadcrumbs do exactly
+	 * that. A singly-linked chain cannot be spliced that way, so the shape
+	 * has to be upstream's. */
+	struct list_head node;
 };
 
 struct dma_fence_ops;
@@ -57,10 +84,25 @@ struct dma_fence {
 	u64 context;          /* timeline this fence belongs to */
 	u64 seqno;            /* position on that timeline */
 	volatile int signaled;
+	/* The bit form of the state above, plus whatever bits the owning driver
+	 * claims from DMA_FENCE_FLAG_USER_BITS upwards. */
+	unsigned long flags;
+	/* When it signalled, in nanoseconds on the same clock ktime_get uses.
+	 * Upstream records it so a driver can report completion latency without
+	 * keeping a clock of its own; set at signal time, meaningless before. */
+	ktime_t timestamp;
+	/* Freeing under RCU: a fence can be looked up without a reference held, so
+	 * the release has to wait for readers that were mid-lookup. Nothing here
+	 * populates it — the field exists because imported code initialises it. */
+	struct rcu_head rcu;
 	int error;            /* 0, or a negative errno set by signal_error */
-	volatile u32 refs;
+	/* The reference count, as a kref rather than a bare word: imported code
+	 * reads it with kref_read(&fence->refcount) rather than through the API. */
+	struct kref refcount;
 	const char *name;
-	struct dma_fence_cb *cbs;
+	/* Head of the registered callbacks. Named as upstream names it, because
+	 * imported code walks this list directly. */
+	struct list_head cb_list;
 	dma_fence_release_fn release;
 	/*
 	 * A *pointer* to the lock, not the lock itself — the shape imported DRM
@@ -95,7 +137,16 @@ struct dma_fence_ops {
 	/* bool, matching what imported drivers write. */
 	_Bool (*enable_signaling)(struct dma_fence *fence);
 	_Bool (*signaled)(struct dma_fence *fence);
+	/* A driver's own wait, replacing the generic one. i915 supplies it so a
+	 * waiter can spin briefly on the seqno before parking — the difference
+	 * shows up as latency on short waits. Nothing here calls it yet: the
+	 * generic wait is what runs, and a driver that needs its own gets it when
+	 * the wait path is routed through the ops. */
+	long (*wait)(struct dma_fence *fence, _Bool intr, long timeout);
 	void (*release)(struct dma_fence *fence);
+	/* How a diagnostic prints the fence's state. */
+	void (*fence_value_str)(struct dma_fence *fence, char *str, int size);
+	void (*timeline_value_str)(struct dma_fence *fence, char *str, int size);
 };
 
 /* Allocate `count` fresh timeline contexts. Contexts are never reused, so two
@@ -146,7 +197,11 @@ int dma_fence_wait(struct dma_fence *f, int intr);
 int dma_fence_wait_uninterruptible(struct dma_fence *f);
 /* Sleep until signalled or `timeout_ticks` scheduler ticks elapse. Returns the
  * remaining ticks (>0) on success, 0 on timeout, or the fence's negative error. */
-i64 dma_fence_wait_timeout(struct dma_fence *f, u64 timeout_ticks);
+/* `intr` asks for an interruptible wait. b1nix kernel threads are not signal
+ * targets, so nothing can interrupt one and the flag changes nothing — it is in
+ * the signature because every imported caller passes it, and a caller checking
+ * for -ERESTARTSYS will simply never see it. */
+i64 dma_fence_wait_timeout(struct dma_fence *f, int intr, u64 timeout_ticks);
 
 /* Register `cb` to run when the fence signals. If it is already signalled the
  * callback runs immediately and -ENOENT is returned; otherwise 0. The caller
@@ -166,5 +221,7 @@ int dma_fence_wait_all(struct dma_fence **fences, u32 count);
 /* M100 in-kernel self-test. Emits M100-SMOKE markers; no-op outside
  * b1nix.test=1. */
 void dma_fence_selftest(void);
+
+
 
 #endif

@@ -17,6 +17,22 @@ The MIT license described in `LICENSING.md` applies to original B1NIX material. 
 | --- | --- | --- | --- | --- |
 | **Linux DRM core** (`drivers/gpu/drm`, `include/drm`, `include/uapi/drm`, `drivers/video/{hdmi,nomodeset}.c`) | `build/src/drm-core-6.6/` | Linux 6.6, SHA-256 `d926a06c…8e56d0` | MIT (`drivers/gpu/drm`, `include/drm`); GPL-2.0 WITH Linux-syscall-note (`include/uapi/drm`) | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz> |
 
+| **Intel i915** (`drivers/gpu/drm/i915`) | `build/src/i915-6.6/` | Linux 6.6, SHA-256 `d926a06c…8e56d0` | MIT, and the historical X11-style permission grant on the untagged files | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz> |
+
+i915 is staged **only on request** (`make i915-fetch`), and built only when asked
+for (`B1NIX_I915=1`): it is 13 MiB and 262 objects, and a kernel built without a
+GPU should not pay for it. A tree that has not been staged changes nothing about
+the build.
+
+Five files are **not staged**, because they are plain `GPL-2.0` with no
+permissive alternative — unlike the DRM core, whose GPL-touched files are all
+`GPL-2.0 or MIT`. Four are pure ftrace plumbing (`i915_trace.h`,
+`i915_trace_points.c`, `display/intel_display_trace.{c,h}`) and are replaced by
+MIT tracepoint headers of our own; the fifth (`display/intel_acpi.c`) is
+`CONFIG_ACPI`-only and is not in `i915-y`. `tools/drm/fetch-i915.sh` refuses to
+finish if any other `GPL-2.0`-only file appears outside the selftests, so this
+stays a decision someone made rather than something discovered later.
+
 The DRM core is **imported and never edited** — see [`docs/drm-import.md`](docs/drm-import.md).
 `tools/drm/fetch-drm-core.sh` pins the release and verifies the checksum before
 extracting, the same way the port scripts under `tools/ports/` pin theirs.

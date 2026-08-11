@@ -47,9 +47,25 @@ void lkpi_kfree(void *ptr)
 
 /* ── ioremap ────────────────────────────────────────────────────── */
 
+/*
+ * Device registers: strongly uncached, PCD together with PWT.
+ *
+ * PCD alone is UC-, which is not the same thing. UC- defers to the MTRRs, so a
+ * range the firmware or the host marked write-combining stays write-combining —
+ * and then a register write may sit in a write-combining buffer instead of
+ * reaching the device. A driver that writes a command register and then polls a
+ * status register sees the poll time out while the command has not been issued
+ * yet, and any unrelated activity that happens to flush the buffer makes the
+ * same code work. Intermittent by construction.
+ *
+ * The pair PCD|PWT selects UC outright, which is what a register window has to
+ * be. Framebuffers and apertures still get write-combining, through ioremap_wc,
+ * where the reordering is the point.
+ */
 void *ioremap(u64 phys, usize size)
 {
-	return vmm_map_mmio(phys, size, VMM_WRITABLE | VMM_PCD | VMM_NO_EXECUTE);
+	return vmm_map_mmio(phys, size,
+	                    VMM_WRITABLE | VMM_PCD | VMM_PWT | VMM_NO_EXECUTE);
 }
 
 void *ioremap_wc(u64 phys, usize size)
@@ -79,8 +95,11 @@ u64 dma_addressable_limit(void)
 	return DIRECT_MAP_SIZE;
 }
 
-void *dma_alloc_coherent(usize size, dma_addr_t *dma_handle)
+void *dma_alloc_coherent(struct device *dev, usize size,
+                         dma_addr_t *dma_handle, u32 gfp)
 {
+	(void)dev;
+	(void)gfp; /* see the note in <lkpi/dma-mapping.h> */
 	if (size == 0)
 		return 0;
 	usize frames = (size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -94,8 +113,10 @@ void *dma_alloc_coherent(usize size, dma_addr_t *dma_handle)
 	return cpu;
 }
 
-void dma_free_coherent(usize size, void *cpu_addr, dma_addr_t dma_handle)
+void dma_free_coherent(struct device *dev, usize size, void *cpu_addr,
+                       dma_addr_t dma_handle)
 {
+	(void)dev;
 	if (!cpu_addr || size == 0)
 		return;
 	usize frames = (size + PAGE_SIZE - 1) / PAGE_SIZE;

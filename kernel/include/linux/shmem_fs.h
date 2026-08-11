@@ -19,4 +19,50 @@ struct folio *shmem_read_folio_gfp(struct address_space *mapping,
 struct page *shmem_read_mapping_page(struct address_space *mapping,
                                      unsigned long index);
 struct address_space;
+
+/*
+ * One page of a shmem-backed object, faulted in on demand.
+ *
+ * Declared and not defined. b1nix's shmem equivalent hands back the whole page
+ * array at allocation (see <lkpi/page.h>), so there is no mapping to fault a
+ * single page out of, and no address_space to index. A driver taking this path
+ * fails to link rather than receiving a page that belongs to nothing.
+ */
+struct page *shmem_read_mapping_page_gfp(struct address_space *mapping,
+                                         unsigned long index, gfp_t gfp);
+/* shmem_read_mapping_page is already declared above; only the _gfp form was
+ * missing. */
+
+
+/*
+ * Punching a hole in a shmem file's page cache.
+ *
+ * Declared and deliberately not defined, for the same reason as
+ * shmem_read_mapping_page_gfp(): b1nix's GEM objects are backed by anonymous
+ * pages, not by a shmem inode, so there is no page cache to punch and a stub
+ * would report that pages were discarded when they were not.
+ */
+struct inode;
+void shmem_truncate_range(struct inode *inode, loff_t start, loff_t end);
+
+
+/*
+ * Creating a shmem-backed file, optionally on a private mount.
+ *
+ * Declared and deliberately not defined, for the same reason as
+ * shmem_truncate_range() above: b1nix has no tmpfs a driver can allocate an
+ * inode from, and GEM objects here are backed by anonymous pages instead. A
+ * caller fails to link rather than being handed a file with no pages behind it.
+ */
+struct vfsmount;
+struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags);
+struct file *shmem_file_setup_with_mnt(struct vfsmount *mnt, const char *name,
+                                       loff_t size, unsigned long flags);
+
+
+/* One page of a shmem file, by index, allocated on first touch. */
+struct address_space;
+struct folio *shmem_read_folio_gfp(struct address_space *mapping,
+                                   unsigned long index, gfp_t gfp);
+
 #endif

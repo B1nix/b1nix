@@ -1,7 +1,19 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <b1nix/klog.h>
 #include <b1nix/syscall.h>
+
+/*
+ * A format string bundled with its arguments, for %pV. Declared here as well as
+ * in <linux/printk.h> — the two must agree on the layout, and this file is on
+ * b1nix's side of the shim boundary and cannot include that header. It is two
+ * pointers and has been since Linux introduced it.
+ */
+struct va_format {
+	const char *fmt;
+	va_list *va;
+};
 
 int putchar(int c)
 {
@@ -97,6 +109,10 @@ static int vsnprintf_impl(char *str, size_t size, const char *fmt, va_list args)
 		}
 
 		switch (fmt[i]) {
+		/* %i is %d. Missing it was not cosmetic: imported code uses it for
+		 * every "expected %i, found %i" mismatch report, so the values that
+		 * say what is wrong were the part that did not print. */
+		case 'i':
 		case 'd': {
 			int val = va_arg(args, int);
 			int negative = val < 0;
@@ -129,17 +145,122 @@ static int vsnprintf_impl(char *str, size_t size, const char *fmt, va_list args)
 			append_char(str, size, &pos, (char)va_arg(args, int));
 			break;
 		case 'p': {
-			void *p = va_arg(args, void *);
-			append_string(str, size, &pos, "0x");
-			char tmp[32];
-			int len = 0;
-			print_hex_to(tmp, &len, (u64)(usize)p);
-			append_number(str, size, &pos, tmp, len, 0, width, zero_pad);
+			/*
+			 * Linux's pointer extensions. Imported drivers use these heavily —
+			 * every drm_err() and drm_info() message is a %pV, and a lockdep or
+			 * WARN backtrace is %pS — so without them the diagnostics that say
+			 * what a driver is doing come out as a raw pointer followed by a
+			 * stray letter, which is how an i915 probe failure looked like
+			 * nothing at all.
+			 */
+			switch (fmt[i + 1]) {
+			case '4': {
+				/* %p4cc — a fourcc pixel format, printed as the four
+				 * characters it is spelled with. DRM reports every plane's
+				 * format this way. */
+				if (fmt[i + 2] == 'c' && fmt[i + 3] == 'c') {
+					i += 3;
+					const u32 *fourcc = va_arg(args, const u32 *);
+					if (fourcc) {
+						u32 v = *fourcc;
+						for (int c = 0; c < 4; c++) {
+							char ch = (char)((v >> (c * 8)) & 0xff);
+							append_char(str, size, &pos,
+							            (ch >= 0x20 && ch < 0x7f) ? ch : '.');
+						}
+					}
+					break;
+				}
+				/* Not a fourcc: fall through to the plain pointer. */
+				void *p4 = va_arg(args, void *);
+				append_string(str, size, &pos, "0x");
+				char t4[32];
+				int l4 = 0;
+				print_hex_to(t4, &l4, (u64)(usize)p4);
+				append_number(str, size, &pos, t4, l4, 0, width, zero_pad);
+				break;
+			}
+			case 'V': {
+				/* A nested format string and its arguments, as one argument.
+				 * The va_list is passed by pointer because the caller keeps
+				 * using it after we return. */
+				i++;
+				const struct va_format *vaf =
+					va_arg(args, const struct va_format *);
+				if (vaf && vaf->fmt && vaf->va) {
+					/*
+					 * Formatted straight into the remaining output rather than
+					 * through a scratch buffer: a nested buffer big enough to
+					 * be useful is hundreds of bytes of kernel stack, on a
+					 * path every driver message takes, and some of those run
+					 * on the short stacks.
+					 */
+					va_list copy;
+					va_copy(copy, *vaf->va);
+					if (pos < (int)size - 1) {
+						int n = vsnprintf_impl(str + pos, size - (size_t)pos,
+						                       vaf->fmt, copy);
+						pos += n;
+						if (pos > (int)size - 1)
+							pos = (int)size - 1;
+					}
+					va_end(copy);
+				}
+				break;
+			}
+			case 's':
+			case 'S':
+			case 'f':
+			case 'F': {
+				/* A code address as its symbol name, plus the offset into it.
+				 * kallsyms is what makes this readable; without a match it
+				 * falls back to the bare address rather than printing a name
+				 * that is not the right one. */
+				i++;
+				void *p = va_arg(args, void *);
+				u64 off = 0;
+				const char *sym = ksym_lookup((u64)(usize)p, &off);
+				if (sym) {
+					append_string(str, size, &pos, sym);
+					if (off) {
+						char tmp[32];
+						int len = 0;
+						append_string(str, size, &pos, "+0x");
+						print_hex_to(tmp, &len, off);
+						append_number(str, size, &pos, tmp, len, 0, 0, 0);
+					}
+				} else {
+					char tmp[32];
+					int len = 0;
+					append_string(str, size, &pos, "0x");
+					print_hex_to(tmp, &len, (u64)(usize)p);
+					append_number(str, size, &pos, tmp, len, 0, 0, 0);
+				}
+				break;
+			}
+			default: {
+				void *p = va_arg(args, void *);
+				append_string(str, size, &pos, "0x");
+				char tmp[32];
+				int len = 0;
+				print_hex_to(tmp, &len, (u64)(usize)p);
+				append_number(str, size, &pos, tmp, len, 0, width, zero_pad);
+				break;
+			}
+			}
 			break;
 		}
 		case 'l': {
 			if (!fmt[i + 1]) break;
 			i++;
+			/*
+			 * %ll is the same width as %l here — both are 64-bit — so the
+			 * second 'l' is consumed and the conversion handled once. Without
+			 * this the whole specifier fell through to the default and printed
+			 * itself, which is how a GGTT range came out as "[%llx, %llx]".
+			 */
+			if (fmt[i] == 'l' && fmt[i + 1])
+				i++;
 			switch (fmt[i]) {
 			case 'd': {
 				long val = va_arg(args, long);

@@ -306,6 +306,12 @@ int vfs_open_flags(const char *path, int flags);
 /* open(2) with O_CREAT: `mode` is the requested permission, masked by umask. */
 int vfs_open_flags_mode(const char *path, int flags, u16 mode);
 isize vfs_read(int handle, char *buffer, usize size);
+/* 1 when this descriptor's driver reads into userspace itself — see
+ * vfs_file_ops.read_user. Asked before the read so the caller knows whether to
+ * bounce; the answer cannot be inferred from a return value, because every
+ * errno a probing read could produce is also one a real read produces. */
+int vfs_read_is_direct(int handle);
+isize vfs_read_user(int handle, void *user_buffer, usize size);
 isize vfs_write(int handle, const char *buffer, usize size);
 /* Positioned I/O: read/write at `offset` without touching the fd's own offset
  * (thread-safe pread/pwrite; non-seekable handles return ESPIPE). */
@@ -482,6 +488,16 @@ enum vfs_handle_kind {
 
 struct vfs_file_ops {
   isize (*read)(struct vfs_handle *h, char *buf, usize len);
+  /* Reads straight into the caller's userspace buffer.
+   *
+   * The ordinary .read is handed a kernel bounce buffer and the syscall layer
+   * copies it out. That is the right default, but it is wrong for a driver
+   * whose implementation copies out itself — the imported DRM core's drm_read
+   * writes through copy_to_user, and handing it a kernel address makes every
+   * read fail with EFAULT, which is exactly how this was found. Set this
+   * instead of .read in that case: it takes precedence and the syscall layer
+   * does not bounce. The op owns the validation of the pointer it is given. */
+  isize (*read_user)(struct vfs_handle *h, void *user_buf, usize len);
   isize (*write)(struct vfs_handle *h, const char *buf, usize len);
   int (*poll)(struct vfs_handle *h, struct b1nix_pollfd *pfd);
   isize (*lseek)(struct vfs_handle *h, isize offset, int whence);

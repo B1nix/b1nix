@@ -54,4 +54,11 @@ static inline int idr_is_empty(struct idr *idr) { return idr_count(idr) == 0; }
 /* struct ida and its operations live in <lkpi/idr.h>, so implementation files
  * on our side of the boundary can use them without the macros below. */
 
+
+/* The pre-2019 ida spelling, still used by parts of i915. Same allocator; the
+ * end is exclusive here as it was there, and 0 means "no upper bound". */
+#define ida_simple_get(ida, start, end, gfp) \
+	ida_alloc_range(ida, start, (end) ? (end) - 1 : ~0u, gfp)
+#define ida_simple_remove(ida, id) ida_free(ida, id)
+
 #endif

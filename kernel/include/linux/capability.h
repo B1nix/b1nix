@@ -20,4 +20,15 @@
 #define CAP_SYS_RAWIO 17
 #endif
 static inline bool capable(int cap) { (void)cap; return false; }
+
+/* Permission to read performance counters. b1nix has no perf interface for a
+ * driver to expose (see <linux/perf_event.h>), so nothing is gated on this and
+ * the answer is the restrictive one. */
+static inline bool perfmon_capable(void) { return false; }
+
+
+#ifndef CAP_SYS_NICE
+#define CAP_SYS_NICE 23
+#endif
+
 #endif

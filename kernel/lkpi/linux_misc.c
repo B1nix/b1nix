@@ -8,11 +8,15 @@
  * it truncated to, a quirk table that deliberately finds nothing.
  */
 
+#include <b1nix/arch.h>
+#include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/i2c.h>
+#include <linux/ktime.h>
 #include <linux/list_sort.h>
+#include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <linux/string.h>
@@ -131,18 +135,65 @@ void list_sort(void *priv, struct list_head *head,
 
 /* ── i2c ────────────────────────────────────────────────────────── */
 
+/*
+ * DDC — reading an EDID off a monitor — goes through here.
+ *
+ * The adapter is not b1nix's. A display driver registers its own: i915's is
+ * GMBUS, the controller inside the GPU, and its algorithm drives the GPU's own
+ * registers. So the core's whole job is to call that algorithm, which is what
+ * i2c_add_adapter() already promises when it refuses an adapter without one.
+ *
+ * This used to refuse every transfer, on the reasoning that b1nix's i2c driver
+ * was not bound to the controller. That reasoning was about the wrong bus: no
+ * b1nix driver is involved at any point. The cost was not a missing extra —
+ * every connector reported disconnected, because a display is detected by
+ * reading its EDID, so a passed-through GPU with a monitor physically attached
+ * enumerated no modes and no modeset could run.
+ *
+ * Retries follow the adapter's own count: GMBUS reports -EAGAIN when the bus is
+ * busy, and one retry is normal rather than a fault.
+ */
+int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
+{
+	int tries, ret;
+
+	if (!adap || !adap->algo || !adap->algo->master_xfer)
+		return -ENODEV;
+	if (num <= 0)
+		return 0;
+
+	ret = -EAGAIN;
+	for (tries = 0; tries <= adap->retries && ret == -EAGAIN; tries++)
+		ret = adap->algo->master_xfer(adap, msgs, num);
+
+	return ret;
+}
+
 int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 {
-	(void)adap;
-	(void)msgs;
+	int ret;
+
+	if (!adap)
+		return -ENODEV;
+
 	/*
-	 * DDC — reading an EDID off a monitor — goes through here. b1nix's i2c
-	 * driver talks to a controller this adapter is not yet bound to, so the
-	 * transfer is refused rather than answered with zeros: a driver that reads
-	 * an all-zero EDID would conclude the monitor reported no modes, which is
-	 * a worse failure than being told the bus is not there.
+	 * The adapter's own bus lock when it has one, and nothing when it does
+	 * not.
+	 *
+	 * i915 publishes lock_ops for GMBUS so a full EDID read holds the bus
+	 * across its segments; taking a lock of b1nix's own instead would not
+	 * serialise against the driver's other users of the same controller,
+	 * which is the thing that actually needs excluding.
 	 */
-	return num > 0 ? -ENODEV : 0;
+	if (adap->lock_ops && adap->lock_ops->lock_bus)
+		adap->lock_ops->lock_bus(adap, I2C_LOCK_SEGMENT);
+
+	ret = __i2c_transfer(adap, msgs, num);
+
+	if (adap->lock_ops && adap->lock_ops->unlock_bus)
+		adap->lock_ops->unlock_bus(adap, I2C_LOCK_SEGMENT);
+
+	return ret;
 }
 
 /* ── quirks ─────────────────────────────────────────────────────── */

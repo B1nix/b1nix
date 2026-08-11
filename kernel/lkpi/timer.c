@@ -64,3 +64,17 @@ int del_timer_sync(struct timer_list *timer)
 	flush_work(&timer->dwork.work);
 	return was_armed;
 }
+
+/*
+ * Cancel without waiting for a callback already running.
+ *
+ * b1nix's timers are delayed work items, and cancelling one cannot leave a
+ * callback mid-flight on another CPU without waiting for it — there is no
+ * "cancel and do not wait" underneath. So this is the synchronous cancel: a
+ * caller that used the asynchronous form to avoid blocking blocks instead, and
+ * never returns believing a callback is still to come when it is not.
+ */
+int timer_delete(struct timer_list *timer)
+{
+	return del_timer_sync(timer);
+}

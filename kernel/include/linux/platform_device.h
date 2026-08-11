@@ -25,4 +25,25 @@ static inline void *platform_get_drvdata(const struct platform_device *pdev)
 { return dev_get_drvdata(&pdev->dev); }
 static inline void platform_set_drvdata(struct platform_device *pdev, void *d)
 { dev_set_drvdata(&pdev->dev, d); }
+
+/* Describing a platform device to be created. Nothing registers one here: a
+ * platform bus is how a SoC enumerates devices that cannot announce
+ * themselves, and everything b1nix drives is on PCI. */
+struct platform_device_info {
+	struct device *parent;
+	const char *name;
+	int id;
+	const struct resource *res;
+	unsigned int num_res;
+	const void *data;
+	size_t size_data;
+	u64 dma_mask;
+};
+
+struct platform_device *platform_device_register_full(
+	const struct platform_device_info *info);
+
+
+void platform_device_unregister(struct platform_device *pdev);
+
 #endif

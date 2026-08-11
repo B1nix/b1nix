@@ -2717,6 +2717,28 @@ int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
       return fd;
     }
   }
+  /* Both DRM nodes take the same route: check the node's permissions, then let
+   * the owning driver build the handle. They differ only in which driver that
+   * is — card0 is b1nix's own device, card1 the imported core's. */
+  if (drm_imported_card_present(resolved)) {
+    struct vfs_node *card = vfs_find_node(resolved);
+    if (!IS_ERR(card)) {
+      int access_mask = 0;
+      if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
+        access_mask |= W_OK;
+      if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
+        access_mask |= R_OK;
+      int access = vfs_check_access(card, access_mask);
+      vfs_node_put(card);
+      if (access < 0) {
+        kfree(resolved);
+        return access;
+      }
+    }
+    int fd = drm_imported_card_open(resolved, flags);
+    kfree(resolved);
+    return fd;
+  }
   if (strcmp(resolved, "/dev/dri/card0") == 0) {
     struct vfs_node *card = vfs_find_node(resolved);
     if (!IS_ERR(card)) {
@@ -3242,6 +3264,18 @@ isize vfs_read(int fd, char *buf, usize size) {
   if (!h || !h->ops || !h->ops->read)
     return -EBADF;
   return h->ops->read(h, buf, size);
+}
+
+int vfs_read_is_direct(int fd) {
+  struct vfs_handle *h = get_handle(fd);
+  return h && h->ops && h->ops->read_user ? 1 : 0;
+}
+
+isize vfs_read_user(int fd, void *user_buf, usize size) {
+  struct vfs_handle *h = get_handle(fd);
+  if (!h || !h->ops || !h->ops->read_user)
+    return -EBADF;
+  return h->ops->read_user(h, user_buf, size);
 }
 
 /* Positioned read/write: read/write at `offset` WITHOUT touching the descriptor's

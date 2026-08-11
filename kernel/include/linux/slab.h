@@ -104,4 +104,39 @@ static inline usize ksize(const void *p) { (void)p; return 0; }
 
 #define ARCH_KMALLOC_MINALIGN 8
 
+
+/*
+ * Slab caches: a pool of same-sized objects.
+ *
+ * b1nix's heap already serves a fixed size well, so a cache here is a named
+ * wrapper around kmalloc rather than a separate allocator. What is kept is the
+ * interface's guarantees the callers rely on — the size and the constructor —
+ * and what is lost is the locality a real slab buys, which costs cache misses
+ * rather than correctness.
+ */
+struct kmem_cache;
+
+struct kmem_cache *kmem_cache_create(const char *name, unsigned int size,
+                                     unsigned int align, unsigned long flags,
+                                     void (*ctor)(void *));
+void kmem_cache_destroy(struct kmem_cache *c);
+void *kmem_cache_alloc(struct kmem_cache *c, gfp_t flags);
+void *kmem_cache_zalloc(struct kmem_cache *c, gfp_t flags);
+void kmem_cache_free(struct kmem_cache *c, void *obj);
+void kmem_cache_shrink(struct kmem_cache *c);
+
+#define SLAB_HWCACHE_ALIGN 0x00002000u
+#define SLAB_RECLAIM_ACCOUNT 0x00020000u
+#define SLAB_TYPESAFE_BY_RCU 0x00080000u
+#define KMEM_CACHE(__struct, __flags) \
+	kmem_cache_create(#__struct, sizeof(struct __struct), \
+	                  __alignof__(struct __struct), (__flags), 0)
+
+
+/* The pointer a zero-sized allocation returns: not NULL, so a caller cannot
+ * mistake it for failure, and not dereferenceable, so using it faults rather
+ * than corrupting something. */
+#define ZERO_SIZE_PTR ((void *)16)
+#define ZERO_OR_NULL_PTR(x) ((unsigned long)(x) <= (unsigned long)ZERO_SIZE_PTR)
+
 #endif

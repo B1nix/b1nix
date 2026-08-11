@@ -88,7 +88,7 @@ static void test_dma_fence(void)
 	if (g_cb_hits != 0)
 		ok = 0;
 	/* A timeout on a fence nobody signals must expire. */
-	if (dma_fence_wait_timeout(&g_fence, 2) != 0)
+	if (dma_fence_wait_timeout(&g_fence, 0, 2) != 0)
 		ok = 0;
 
 	if (kthread_create("m100-fence", fence_signal_thread, 0) < 0) {
@@ -139,16 +139,16 @@ static void test_dma_fence(void)
 	rf.release = 0;
 	dma_fence_get(&rf);
 	dma_fence_get(&rf);
-	if (rf.refs != 3)
+	if (kref_read(&rf.refcount) != 3)
 		rok = 0;
 	dma_fence_put(&rf);
 	dma_fence_put(&rf);
-	if (rf.refs != 1)
+	if (kref_read(&rf.refcount) != 1)
 		rok = 0;
 	dma_fence_put(&rf);
-	if (rf.refs != 0)
+	if (kref_read(&rf.refcount) != 0)
 		rok = 0;
-	drm_report("fence-refcount", rok, rf.refs);
+	drm_report("fence-refcount", rok, kref_read(&rf.refcount));
 }
 
 /* ── GPU scheduler ──────────────────────────────────────────────── */
@@ -235,7 +235,7 @@ static void test_scheduler(void)
 	dma_fence_signal(&g_gate);
 
 	for (u32 i = 0; i < n && ok; i++) {
-		if (dma_fence_wait_timeout(fences[i], 1000) <= 0)
+		if (dma_fence_wait_timeout(fences[i], 0, 1000) <= 0)
 			ok = 0;
 	}
 	if (g_run_count != SCHED_TOTAL)

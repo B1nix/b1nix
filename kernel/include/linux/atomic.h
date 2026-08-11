@@ -192,4 +192,72 @@ static inline void atomic64_inc(atomic64_t *v)
 
 #define xchg(ptr, new_val) __atomic_exchange_n((ptr), (new_val), __ATOMIC_SEQ_CST)
 
+
+/* Release-ordered store. The paired acquire is on the reader's side; what this
+ * guarantees is that everything written before it is visible to anyone who then
+ * observes this value. */
+static inline void atomic_set_release(atomic_t *v, int i)
+{ __atomic_store_n(&v->counter, i, __ATOMIC_RELEASE); }
+static inline int atomic_read_acquire(const atomic_t *v)
+{ return __atomic_load_n(&v->counter, __ATOMIC_ACQUIRE); }
+
+
+/* A store followed by a full barrier: what a caller writes when a later reader
+ * must not see the store reordered past anything after it. */
+#define smp_store_mb(var, value) \
+	do { __atomic_store_n(&(var), (value), __ATOMIC_SEQ_CST); } while (0)
+
+
+/* Barriers around an atomic that does not already imply one. b1nix's atomics
+ * are all sequentially consistent, so the ordering these ask for is already
+ * there — but they are spelled out rather than left empty, because a compiler
+ * barrier is still needed to stop the surrounding accesses being reordered. */
+#define smp_mb__before_atomic() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define smp_mb__after_atomic()  __atomic_thread_fence(__ATOMIC_SEQ_CST)
+
+
+/* Bitwise updates. Upstream returns nothing from these and the value-returning
+ * forms are spelled atomic_fetch_*; keeping that split matters because a caller
+ * using the wrong one silently ignores the previous value. */
+static inline void atomic_and(int i, atomic_t *v)
+{ __atomic_fetch_and(&v->counter, i, __ATOMIC_ACQ_REL); }
+static inline void atomic_or(int i, atomic_t *v)
+{ __atomic_fetch_or(&v->counter, i, __ATOMIC_ACQ_REL); }
+static inline void atomic_andnot(int i, atomic_t *v)
+{ __atomic_fetch_and(&v->counter, ~i, __ATOMIC_ACQ_REL); }
+static inline int atomic_fetch_and(int i, atomic_t *v)
+{ return __atomic_fetch_and(&v->counter, i, __ATOMIC_ACQ_REL); }
+static inline int atomic_fetch_or(int i, atomic_t *v)
+{ return __atomic_fetch_or(&v->counter, i, __ATOMIC_ACQ_REL); }
+
+
+/* The long-width counters are aliases of the 64-bit ones above (see line ~181):
+ * b1nix is 64-bit, so `long` and the 64-bit counter are the same width and one
+ * implementation serves both. Only the operations the aliases did not cover are
+ * added here. */
+#define atomic_long_inc(v)      atomic64_add(1, v)
+#define atomic_long_dec(v)      atomic64_sub(1, v)
+#define atomic_long_add(i, v)   atomic64_add(i, v)
+#define atomic_long_sub(i, v)   atomic64_sub(i, v)
+#define ATOMIC_LONG_INIT(i)     { (i) }
+
+
+/*
+ * The try_cmpxchg family: compare-and-exchange that reports success as a bool
+ * and writes the observed value back through the old pointer, so a failing
+ * caller does not need a second load. Same operation as cmpxchg, different
+ * reporting.
+ */
+#define try_cmpxchg(ptr, oldp, new_val)                                  \
+	__atomic_compare_exchange_n((ptr), (oldp), (new_val), false,         \
+	                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+#define try_cmpxchg_acquire(ptr, oldp, new_val) try_cmpxchg(ptr, oldp, new_val)
+#define try_cmpxchg_relaxed(ptr, oldp, new_val) try_cmpxchg(ptr, oldp, new_val)
+#define atomic_try_cmpxchg(v, oldp, new_val) try_cmpxchg(&(v)->counter, (oldp), (new_val))
+#define cmpxchg64(ptr, old_val, new_val) cmpxchg(ptr, old_val, new_val)
+
+
+static inline long atomic64_sub_return(long i, atomic64_t *v)
+{ return __atomic_sub_fetch(&v->counter, i, __ATOMIC_ACQ_REL); }
+
 #endif

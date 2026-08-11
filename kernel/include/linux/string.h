@@ -88,4 +88,44 @@ int snprintf(char *buf, usize size, const char *fmt, ...);
 int scnprintf(char *buf, usize size, const char *fmt, ...);
 int sprintf(char *buf, const char *fmt, ...);
 int vsnprintf(char *buf, usize size, const char *fmt, __builtin_va_list ap);
+
+/* Fill a range with a repeating 64-bit pattern. Upstream has it because memset
+ * only takes a byte; callers use it to poison or to write a page of identical
+ * PTEs. */
+static inline void *memset64(u64 *s, u64 v, size_t count)
+{ for (size_t i = 0; i < count; i++) s[i] = v; return s; }
+static inline void *memset32(u32 *s, u32 v, size_t count)
+{ for (size_t i = 0; i < count; i++) s[i] = v; return s; }
+
+
+/* Split a string at the first character from `ct`, advancing the caller's
+ * pointer past it. Destructive, as upstream's is — the separator is replaced
+ * with a NUL, which is what makes the returned token usable without a copy. */
+static inline char *strsep(char **s, const char *ct)
+{
+	char *begin = *s;
+
+	if (!begin)
+		return 0;
+	for (char *p = begin; *p; p++) {
+		for (const char *c = ct; *c; c++) {
+			if (*p == *c) {
+				*p = '\0';
+				*s = p + 1;
+				return begin;
+			}
+		}
+	}
+	*s = 0;
+	return begin;
+}
+
+
+/* Length of a string, bounded. */
+usize strnlen(const char *s, usize maxlen);
+
+
+/* Append with a total-size bound, returning the length it tried to build. */
+usize strlcat(char *dst, const char *src, usize size);
+
 #endif

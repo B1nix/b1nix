@@ -52,7 +52,11 @@ struct inode *alloc_anon_inode(struct super_block *sb)
 
 void iput(struct inode *inode)
 {
-	lkpi_kfree(inode);
+	/* NULL is not an error: a file whose release owns the inode's storage
+	 * clears the pointer, precisely so this does not free into the middle of
+	 * someone else's allocation. */
+	if (inode)
+		lkpi_kfree(inode);
 }
 
 /* ── files ──────────────────────────────────────────────────────── */
@@ -79,7 +83,7 @@ struct file *anon_inode_getfile(const char *name,
 	f->private_data = priv;
 	f->f_flags = (unsigned int)flags;
 	f->f_mode = FMODE_READ | FMODE_WRITE;
-	f->f_count = 1;
+	atomic64_set(&f->f_count, 1);
 	return f;
 }
 
@@ -87,7 +91,7 @@ void fput(struct file *f)
 {
 	if (!f)
 		return;
-	if (__atomic_sub_fetch(&f->f_count, 1, __ATOMIC_ACQ_REL) != 0)
+	if (atomic64_sub_return(1, &f->f_count) != 0)
 		return;
 
 	/* Last reference: let the owner tear its object down before the file that
@@ -106,7 +110,7 @@ struct file *fget(unsigned int fd)
 	struct file *f = (struct file *)lkpi_handle_private(h);
 	if (!f)
 		return 0;
-	__atomic_fetch_add(&f->f_count, 1, __ATOMIC_ACQ_REL);
+	atomic64_inc(&f->f_count);
 	return f;
 }
 
@@ -132,7 +136,7 @@ struct file *file_clone_open(struct file *f)
 		return 0;
 	/* A second reference to the same object, not a copy: the two descriptors
 	 * must share the driver's private_data, which is the point of cloning. */
-	__atomic_fetch_add(&f->f_count, 1, __ATOMIC_ACQ_REL);
+	atomic64_inc(&f->f_count);
 	return f;
 }
 
@@ -228,28 +232,207 @@ void simple_release_fs(struct vfsmount **mount, int *count)
 
 /* ── shmem ──────────────────────────────────────────────────────── */
 
+/*
+ * A shmem file: anonymous pages addressed by index, with a struct file in front
+ * of them.
+ *
+ * This is what backs a GEM object. i915 does not want the pages directly — it
+ * wants obj->base.filp, and reaches the pages through filp->f_mapping one index
+ * at a time, so the file and its address_space have to be real objects even
+ * though nothing here is a filesystem.
+ *
+ * Pages are allocated on first touch rather than up front: an object is often
+ * created much larger than the part that is ever populated, and i915 asks for
+ * each index as it needs it. They are freed when the file's last reference goes
+ * or when the range is truncated.
+ *
+ * Not swappable, unlike the name. There is nothing to swap to — see
+ * shmem_read_mapping_page_gfp() in linux_support.c — so these pages stay
+ * resident for the life of the object.
+ */
+struct lkpi_shmem {
+	struct file file;
+	struct inode inode;
+	struct address_space mapping;
+	usize npages;
+	/*
+	 * One contiguous array of struct page, frames allocated per slot as it is
+	 * touched. Contiguous is the requirement, not a convenience: i915
+	 * coalesces physically adjacent pages into a single scatterlist entry and
+	 * then walks that entry with nth_page(), which is pointer arithmetic on
+	 * struct page. An array of pointers to individually allocated pages made
+	 * that walk dereference a wild pointer on the second page of every
+	 * coalesced run.
+	 */
+	struct page *pages;
+};
+
+struct folio *shmem_read_folio_gfp(struct address_space *mapping,
+                                   unsigned long index, gfp_t gfp);
+
+static struct lkpi_shmem *shmem_from_mapping(struct address_space *mapping)
+{
+	return mapping ? container_of(mapping, struct lkpi_shmem, mapping) : 0;
+}
+
+static void shmem_drop_range(struct lkpi_shmem *sh, usize first, usize last)
+{
+	if (!sh || !sh->pages)
+		return;
+	if (last >= sh->npages)
+		last = sh->npages ? sh->npages - 1 : 0;
+	for (usize i = first; i < sh->npages && i <= last; i++)
+		lkpi_pagevec_release(sh->pages, i);
+}
+
+static int shmem_file_release(struct inode *inode, struct file *file)
+{
+	struct lkpi_shmem *sh;
+
+	(void)inode;
+	if (!file)
+		return 0;
+	sh = container_of(file, struct lkpi_shmem, file);
+	lkpi_pagevec_free(sh->pages, sh->npages);
+	sh->pages = 0;
+	/*
+	 * The inode is embedded in this object, not separately allocated, so it
+	 * must not be freed on its own — clearing the pointer is what stops
+	 * fput()'s iput() from freeing into the middle of this allocation. The
+	 * object itself is freed by fput()'s kfree, which is correct because
+	 * struct file is its first member.
+	 */
+	file->f_inode = 0;
+	return 0;
+}
+
+/* Hand back the page for this offset so the caller can copy into it. The pair
+ * exists because the page cache normally has to be told a write is coming;
+ * here the page is simply allocated if it is not there yet. */
+static int shmem_write_begin(struct file *file, struct address_space *mapping,
+                             loff_t pos, unsigned len, struct page **pagep,
+                             void **fsdata)
+{
+	struct folio *folio;
+
+	(void)file;
+	(void)len;
+	(void)fsdata;
+	folio = shmem_read_folio_gfp(mapping, (unsigned long)(pos >> PAGE_SHIFT),
+	                             GFP_KERNEL);
+	if (!folio)
+		return -ENOMEM;
+	*pagep = folio_page(folio, 0);
+	return 0;
+}
+
+static int shmem_write_end(struct file *file, struct address_space *mapping,
+                           loff_t pos, unsigned len, unsigned copied,
+                           struct page *page, void *fsdata)
+{
+	(void)file; (void)mapping; (void)pos; (void)len; (void)page; (void)fsdata;
+	/* Nothing to mark: the page is the storage, not a cache of it. */
+	return (int)copied;
+}
+
+/* Writing a page back to its backing store. There is none — these pages are the
+ * store — so this reports success without doing anything, which is what leaves
+ * the data where it already is. */
+static int shmem_writepage(struct page *page, struct writeback_control *wbc)
+{
+	(void)page; (void)wbc;
+	return 0;
+}
+
+static const struct address_space_operations lkpi_shmem_aops = {
+	.writepage = shmem_writepage,
+	.write_begin = shmem_write_begin,
+	.write_end = shmem_write_end,
+};
+
+static const struct file_operations lkpi_shmem_fops = {
+	.release = shmem_file_release,
+};
+
 struct file *shmem_file_setup(const char *name, loff_t size,
                               unsigned long flags)
 {
+	struct lkpi_shmem *sh;
+	usize npages;
+
 	(void)name;
-	(void)size;
 	(void)flags;
-	/*
-	 * A file backing anonymous, swappable memory. b1nix's equivalent is
-	 * lkpi's shmem_alloc_pages, which hands back the page array directly —
-	 * so a driver that takes this path gets nothing, deliberately, rather
-	 * than a file whose pages nobody allocates. GEM objects here are backed
-	 * through the page array instead.
-	 */
-	return ERR_PTR(-ENOSYS);
+	if (size < 0)
+		return ERR_PTR(-EINVAL);
+
+	npages = (usize)((size + PAGE_SIZE - 1) >> PAGE_SHIFT);
+	sh = lkpi_kmalloc(sizeof(*sh), GFP_KERNEL | __GFP_ZERO);
+	if (!sh)
+		return ERR_PTR(-ENOMEM);
+	if (npages) {
+		sh->pages = lkpi_pagevec_alloc(npages);
+		if (!sh->pages) {
+			lkpi_kfree(sh);
+			return ERR_PTR(-ENOMEM);
+		}
+	}
+	sh->npages = npages;
+
+	sh->inode.i_size = size;
+	sh->inode.i_mapping = &sh->mapping;
+	sh->mapping.host = &sh->inode;
+	sh->mapping.a_ops = &lkpi_shmem_aops;
+	sh->mapping.gfp_mask = GFP_KERNEL;
+
+	sh->file.f_inode = &sh->inode;
+	sh->file.f_mapping = &sh->mapping;
+	sh->file.f_op = &lkpi_shmem_fops;
+	sh->file.f_mode = FMODE_READ | FMODE_WRITE;
+	atomic64_set(&sh->file.f_count, 1);
+	return &sh->file;
+}
+
+struct file *shmem_file_setup_with_mnt(struct vfsmount *mnt, const char *name,
+                                       loff_t size, unsigned long flags)
+{
+	/* The mount selects which tmpfs instance the inode comes from. There is
+	 * only one source of pages here, so it selects nothing. */
+	(void)mnt;
+	return shmem_file_setup(name, size, flags);
 }
 
 struct folio *shmem_read_folio_gfp(struct address_space *mapping,
                                    unsigned long index, gfp_t gfp)
 {
-	(void)mapping;
-	(void)index;
+	struct lkpi_shmem *sh = shmem_from_mapping(mapping);
+
 	(void)gfp;
-	/* Same reason: there is no file-backed mapping to fault a page out of. */
-	return 0;
+	if (!sh || index >= sh->npages)
+		return 0;
+	if (!sh->pages[index].phys) {
+		if (!lkpi_pagevec_populate(sh->pages, index))
+			return 0;
+		/* Zeroed on first use: a GEM object must not hand a process the
+		 * contents of whatever last owned the frame. */
+		__builtin_memset(page_address(&sh->pages[index]), 0, PAGE_SIZE);
+	}
+	/* struct folio starts with its struct page — see <linux/mm.h> — so one
+	 * page is its own folio. */
+	return page_folio(&sh->pages[index]);
+}
+
+void shmem_truncate_range(struct inode *inode, loff_t start, loff_t end)
+{
+	struct lkpi_shmem *sh;
+	usize first, last;
+
+	if (!inode || !inode->i_mapping)
+		return;
+	sh = shmem_from_mapping(inode->i_mapping);
+	if (!sh)
+		return;
+	first = (usize)(start >> PAGE_SHIFT);
+	last = (end < 0) ? (sh->npages ? sh->npages - 1 : 0)
+	                 : (usize)(end >> PAGE_SHIFT);
+	shmem_drop_range(sh, first, last);
 }

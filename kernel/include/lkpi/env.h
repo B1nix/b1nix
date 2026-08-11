@@ -38,8 +38,34 @@ u32 lkpi_cpu_count(void);
 
 /* ── interrupts ─────────────────────────────────────────────────── */
 u64 lkpi_irq_save(void);
+
+/* Non-preemptible region. Nested; the outermost enable restores the interrupt
+ * state the outermost disable saw, rather than assuming it was enabled. */
+void lkpi_preempt_disable(void);
+void lkpi_preempt_enable(void);
 void lkpi_irq_restore(u64 flags);
+
+/*
+ * Enable interrupts outright, rather than restoring a saved state.
+ *
+ * Imported code spells this local_irq_enable(), and it means exactly this: turn
+ * them on, no matter what was saved. It cannot be expressed as a restore — the
+ * flags word here is the whole of RFLAGS, so restoring an invented value both
+ * fails to set IF and overwrites every other flag with it.
+ */
+void lkpi_irq_enable(void);
 int lkpi_irqs_enabled(void);
+
+/* Monotonic nanoseconds from the TSC — real resolution, not tick-rounded.
+ * Imported drivers time hardware out with it; see the note in env.c. */
+u64 lkpi_monotonic_ns(void);
+
+/* Busy-wait for microseconds, timed against the TSC. See the note in env.c. */
+void lkpi_udelay(u64 usecs);
+
+/* Device interrupts taken so far. */
+u64 lkpi_device_irq_count(void);
+
 
 /* ── two-phase wait ─────────────────────────────────────────────
  *
@@ -60,10 +86,16 @@ void lkpi_wake_all(void *chan);
  * rather than placeholders — and the struct is deliberately small, because
  * anything more would be inventing a task model the DRM core does not need.
  */
+struct mm_struct;
 struct lkpi_task {
 	int pid;
 	int tgid;
 	char comm[16];
+	/* The calling process's address space. b1nix's is not a struct mm_struct
+	 * and nothing here can walk it from another task — see find_vma() in
+	 * <linux/mm.h> — so this is always NULL and exists because imported code
+	 * passes current->mm along to a function that must fail to link. */
+	struct mm_struct *mm;
 };
 
 struct lkpi_task *lkpi_current(void);
@@ -159,5 +191,60 @@ int lkpi_scanout_present(const u32 *pixels, u32 width, u32 height);
 
 /* ── diagnostics ────────────────────────────────────────────────── */
 void lkpi_panic(const char *message) __attribute__((noreturn));
+
+
+/* ── PCI windows ────────────────────────────────────────────────
+ *
+ * One decoded BAR, so imported code can be told where a device's registers and
+ * aperture actually are. b1nix sizes a BAR by writing all-ones and reading the
+ * mask back, restoring the original — the real geometry, not a guess, which
+ * matters because a driver maps exactly this range and a wrong length either
+ * truncates the aperture or maps memory that belongs to something else.
+ *
+ * Returns 1 when the BAR is implemented (and fills the outputs), 0 when it is
+ * not — including the upper half of a 64-bit BAR, which is not a window of its
+ * own and must not be counted as one.
+ */
+int lkpi_pci_bar(u32 bus, u32 slot, u32 func, u32 index, u64 *start, u64 *size,
+                 u32 *is_io);
+
+/* Whether the PAT is programmed and write-combining is available through it —
+ * M98's work. A driver asks before choosing WC for an aperture; if the answer
+ * were wrong in the optimistic direction it would map uncached memory as WC and
+ * see stale pixels. */
+int lkpi_pat_enabled(void);
+
+/* ── machine memory ─────────────────────────────────────────────────
+ *
+ * Totals from b1nix's physical allocator, in pages. Imported code sizes caches
+ * and shrinker targets against these, so they are real numbers rather than a
+ * constant: a driver told the machine has no memory shrinks to nothing.
+ */
+u64 lkpi_total_pages(void);
+u64 lkpi_free_pages(void);
+
+/* Is a reschedule pending on this CPU? Set by the timer tick; imported code
+ * checks it inside long loops to decide when to yield. */
+int lkpi_need_resched(void);
+
+/* Is the calling thread b1nix's page-reclaim thread? A driver's shrinker asks
+ * so it can avoid recursing into reclaim from inside reclaim. */
+int lkpi_is_kswapd(void);
+
+
+/* ── the host-visible display ───────────────────────────────────────
+ *
+ * b1nix's own scanout — the virtio-gpu framebuffer, which in a VM is the window
+ * on screen. A driver that renders into its own framebuffer can be mirrored
+ * there, which is the only way to see what a passed-through GPU produced when
+ * nothing is plugged into it.
+ *
+ * get_mode returns 0 when there is no such display.
+ */
+int lkpi_display_get_mode(u32 *width, u32 *height);
+int lkpi_display_present(const u32 *pixels, u32 width, u32 height);
+
+/* A kernel command-line flag, by name. 1 when present. */
+int lkpi_bootflag(const char *flag);
 
 #endif

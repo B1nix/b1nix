@@ -12,4 +12,14 @@
  * spells it. */
 #define DECLARE_FLEX_ARRAY(type, name) \
 	struct { struct { } __empty_##name; type name[]; }
+
+/* The offset just past a member — offsetof plus its size. Used for the
+ * compile-time layout assertions upstream puts next to structures two code
+ * paths share; getting it wrong there is exactly the "a cast is not a layout
+ * guarantee" failure those assertions exist to catch. */
+#ifndef offsetofend
+#define offsetofend(TYPE, MEMBER) \
+	(offsetof(TYPE, MEMBER) + sizeof(((TYPE *)0)->MEMBER))
+#endif
+
 #endif

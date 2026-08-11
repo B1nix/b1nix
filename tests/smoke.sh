@@ -2276,6 +2276,21 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M50-DRM: ok rmfb" "M50: framebuffer removal"
 	check_output "$LOG" "M50-DRM: ok cleanup" "M50: close/munmap cleanup"
 
+	# ── M101t: the imported DRM core's ioctl surface, from ring 3 ──
+	check_output "$LOG" "M101T-DRM: ok open" "M101t: /dev/dri/card1 opens through upstream's drm_open"
+	check_output "$LOG" "M101T-DRM: ok version" "M101t: DRM_IOCTL_VERSION names the driver on the imported core"
+	check_output "$LOG" "M101T-DRM: ok getresources" "M101t: two-pass GETRESOURCES fills the id arrays"
+	check_output "$LOG" "M101T-DRM: ok getconnector" "M101t: the connector reports connected with a usable mode"
+	check_output "$LOG" "M101T-DRM: ok create-dumb" "M101t: CREATE_DUMB allocates a GEM object with a handle"
+	check_output "$LOG" "M101T-DRM: ok map-dumb" "M101t: MAP_DUMB hands out a drm_vma_manager offset"
+	check_output "$LOG" "M101T-DRM: ok mmap" "M101t: the dumb buffer maps into the process and reads back what was written"
+	check_output "$LOG" "M101T-DRM: ok addfb" "M101t: ADDFB wraps the object in a framebuffer"
+	check_output "$LOG" "M101T-DRM: ok setcrtc" "M101t: SETCRTC drives upstream's atomic modeset from userspace"
+	check_output "$LOG" "M101T-DRM: ok scanout-pixels" "M101t: the pattern written in ring 3 reached the scanout"
+	check_output "$LOG" "M101T-DRM: ok flip-event" "M101t: PAGE_FLIP delivers its completion event through drm_read"
+	check_output "$LOG" "M101T-DRM: ok rmfb" "M101t: RMFB releases the framebuffer"
+	check_output "$LOG" "M101T-DRM: ok destroy-dumb" "M101t: DESTROY_DUMB releases the GEM handle"
+
 	# ── M98: driver infrastructure (in-kernel; no userspace surface) ──
 	check_output "$LOG" "M98-DRV-SMOKE: ok netconsole-cmdline" "M98: b1nix.netconsole=<ip>:<port> parses valid targets and rejects malformed ones"
 	check_output "$LOG" "M98-DRV-SMOKE: ok netconsole-udp" "M98: the klog ring reaches a UDP collector through the real network stack"

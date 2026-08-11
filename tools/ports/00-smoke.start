@@ -159,6 +159,7 @@ run_test /bin/m49_smoke gfx
 run_test /bin/m49_libwayland gfx
 run_test /bin/m49_libwayland_server gfx
 run_test /bin/m50_smoke gfx
+run_test /bin/m101t_smoke gfx
 run_test /bin/m100_smoke gfx
 run_test /bin/m51_smoke gfx
 run_test /bin/m51_pixman_smoke gfx

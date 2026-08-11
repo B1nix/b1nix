@@ -303,6 +303,10 @@ static isize sys_read(int fd, void *buf, usize count) {
   isize total_read = 0;
   char kbuf[4096];
 
+  /* A driver that copies out itself gets the caller's pointer, unbounced. */
+  if (vfs_read_is_direct(fd))
+    return vfs_read_user(fd, buf, count);
+
   while (count > 0) {
     usize chunk = count > 4096 ? 4096 : count;
     isize res = vfs_read(fd, kbuf, chunk);
@@ -403,6 +407,19 @@ static isize sys_readv(int fd, const struct b1nix_iovec *uiov, int iovcnt) {
     usize len = iov.iov_len;
     if (len == 0)
       continue;
+
+    /* Same rule as sys_read: the driver owns the copy, so the segment's own
+     * pointer goes straight through. Leaving this on the bounce path would
+     * have made readv the one call that still failed with EFAULT. */
+    if (vfs_read_is_direct(fd)) {
+      isize res = vfs_read_user(fd, base, len);
+      if (res < 0)
+        return total > 0 ? total : res;
+      total += res;
+      if (res < (isize)len)
+        return total;
+      continue;
+    }
 
     while (len > 0) {
       usize chunk = len > sizeof(kbuf) ? sizeof(kbuf) : len;
