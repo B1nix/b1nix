@@ -55,23 +55,33 @@
 #include <linux/iosys-map.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/vmalloc.h>
+#include <lkpi/drm_bridge.h>
 #include <lkpi/env.h>
+#include <lkpi/page.h>
 
 /* The DRM core's own init function is static and registered with module_init,
  * which the shim turns into a wrapper under a predictable name — the kernel
  * calls initcalls directly rather than a loader finding them. */
 int lkpi_initcall_drm_core_init(void);
 
-/* ── GEM: dumb buffers over plain kernel memory ─────────────────── */
+/* Defined at the bottom of this file; called from the bringup above it. */
+void drm_core_bringup(void);
+
+/* ── GEM: dumb buffers over a page array ────────────────────────── */
 
 /*
- * No shmem, no TTM: a dumb buffer here is one contiguous allocation. That is
- * enough for a scanout source, and it keeps this file about the DRM core rather
- * than about memory management the milestone has already proved elsewhere.
+ * Backed by individually allocated pages rather than one contiguous run, and
+ * deliberately so: userspace maps these a page at a time, and a buffer that
+ * happened to be physically linear would let a bug that assumes linearity pass
+ * here and fail on hardware. The CPU view is a vmap over the same pages, so the
+ * two never disagree about what the buffer contains.
  */
 struct b1nix_gem {
 	struct drm_gem_object base;
+	struct page **pages;
+	usize npages;
 	void *vaddr;
 	usize size;
 };
@@ -86,8 +96,25 @@ static void b1nix_gem_free(struct drm_gem_object *obj)
 	struct b1nix_gem *bo = to_b1nix_gem(obj);
 
 	drm_gem_private_object_fini(obj);
-	vfree(bo->vaddr);
+	if (bo->vaddr)
+		lkpi_vunmap(bo->vaddr);
+	if (bo->pages)
+		shmem_free_pages(bo->pages, bo->npages);
 	kfree(bo);
+}
+
+/* The driver's half of the mmap bridge: which frame backs page `index`. The
+ * bridge has already resolved the fake offset to this object and checked the
+ * caller is allowed it; all that is left is knowledge only the driver has. */
+static int b1nix_gem_page_phys(struct drm_gem_object *obj, u64 index,
+                               u64 *out_phys)
+{
+	struct b1nix_gem *bo = to_b1nix_gem(obj);
+
+	if (!bo->pages || index >= (u64)bo->npages)
+		return -EINVAL;
+	*out_phys = page_to_phys(bo->pages[(usize)index]);
+	return 0;
 }
 
 static int b1nix_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map)
@@ -129,15 +156,28 @@ static int b1nix_dumb_create(struct drm_file *file, struct drm_device *dev,
 	if (!args->size)
 		return -EINVAL;
 
+	/* Whole pages: userspace maps this, and a mapping is only ever handed out
+	 * a page at a time. Rounding here rather than at mmap keeps the object's
+	 * size and the number of frames behind it the same number. */
+	args->size = (args->size + PAGE_SIZE - 1) & ~(u64)(PAGE_SIZE - 1);
+
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
 	if (!bo)
 		return -ENOMEM;
 	bo->size = (usize)args->size;
-	bo->vaddr = vzalloc(bo->size);
-	if (!bo->vaddr) {
+	bo->npages = bo->size / PAGE_SIZE;
+	bo->pages = shmem_alloc_pages(bo->npages);
+	if (!bo->pages) {
 		kfree(bo);
 		return -ENOMEM;
 	}
+	bo->vaddr = lkpi_vmap(bo->pages, bo->npages, LKPI_PROT_RW);
+	if (!bo->vaddr) {
+		shmem_free_pages(bo->pages, bo->npages);
+		kfree(bo);
+		return -ENOMEM;
+	}
+	memset(bo->vaddr, 0, bo->size);
 
 	bo->base.funcs = &b1nix_gem_funcs;
 	drm_gem_private_object_init(dev, &bo->base, (usize)args->size);
@@ -177,6 +217,42 @@ struct b1nix_drm_scanout_record {
 };
 
 static struct b1nix_drm_scanout_record g_record;
+
+/*
+ * The record, published where userspace can read it.
+ *
+ * A test in ring 3 can drive the whole ioctl surface and still not know whether
+ * anything was displayed — every call can return 0 while the image never
+ * leaves the buffer it was drawn into. This file is the answer to that: it is
+ * written by the plane update, at the far end of the commit, from the
+ * framebuffer the atomic state actually installed. A test that reads its own
+ * pattern back out of here knows the pixels crossed the whole path.
+ */
+static isize b1nix_scanout_show(void *ctx, char *buf, usize cap)
+{
+	(void)ctx;
+	/* `key=value`, not `key value`: the values are hex, and a reader looking
+	 * for the key "c" finds one inside "ffa0b0c0" first. The '=' is not
+	 * decoration — it is what makes each key unfindable inside a value. */
+	return (isize)lkpi_snprintf(buf, cap,
+	                            "presented=%d\nwidth=%u\nheight=%u\n"
+	                            "tl=%08x\ntr=%08x\nbl=%08x\nbr=%08x\nc=%08x\n",
+	                            g_record.presented, g_record.width,
+	                            g_record.height, g_record.top_left,
+	                            g_record.top_right, g_record.bottom_left,
+	                            g_record.bottom_right, g_record.centre);
+}
+
+static void b1nix_scanout_debugfs_register(void)
+{
+	void *root = lkpi_sysfs_debug_root();
+	void *dir = root ? lkpi_sysfs_dir(root, "dri") : 0;
+
+	if (!dir)
+		return;
+	/* Read-only, and owner-only: the contents say what is on screen. */
+	lkpi_sysfs_attr(dir, "b1nix-scanout", 0400, b1nix_scanout_show, 0, 0, 0);
+}
 
 static void b1nix_pipe_enable(struct drm_simple_display_pipe *pipe,
                               struct drm_crtc_state *crtc_state,
@@ -305,6 +381,9 @@ static int b1nix_drm_bringup(struct b1nix_drm *b)
 	struct drm_device *drm;
 	int ret;
 
+	if (b->drm)
+		return 0; /* already up: the device outlives any one caller */
+
 	lkpi_scanout_mode(&b->width, &b->height);
 	if (!b->width || !b->height)
 		return -ENODEV;
@@ -352,7 +431,29 @@ static int b1nix_drm_bringup(struct b1nix_drm *b)
 	if (ret)
 		return ret;
 
+	/* From here the device is openable: the bridge knows which minor to hand
+	 * drm_open and how to turn one of this driver's objects into a frame. */
+	lkpi_drm_register_device(drm, b1nix_gem_page_phys);
+	b1nix_scanout_debugfs_register();
 	return 0;
+}
+
+/*
+ * Bring the imported core and this device up on every boot, not only under
+ * b1nix.test=1.
+ *
+ * The device is what userspace opens; gating it on test mode would mean the
+ * node exists exactly when nothing is there to use it. The self-test below is
+ * still test-only — it is a check, not a device.
+ */
+void drm_kms_device_init(void)
+{
+	drm_core_bringup();
+	if (!lkpi_scanout_ready())
+		return;
+	int rc = b1nix_drm_bringup(&g_b1nix_drm);
+	if (rc != 0)
+		lkpi_printk("drm: imported-core device bringup failed (%d)\n", rc);
 }
 
 /* ── the proof ──────────────────────────────────────────────────── */

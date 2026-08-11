@@ -499,6 +499,7 @@ KERNEL_SOURCES += \
  	kernel/dev/virtio_gpu.c \
  	kernel/dev/virtio_input.c \
 	kernel/dev/drm.c \
+	kernel/dev/drm_card1.c \
 	kernel/dev/netconsole.c \
 	kernel/lkpi/lkpi_core.c \
 	kernel/lkpi/idr.c \
@@ -612,7 +613,8 @@ LKPI_IMPORT_SOURCES := \
 	kernel/lkpi/drm_import_test.c \
 	kernel/lkpi/seq_file.c \
 	kernel/lkpi/sysfs.c \
-	kernel/lkpi/drm_b1nix_kms.c
+	kernel/lkpi/drm_b1nix_kms.c \
+	kernel/lkpi/drm_chardev.c
 
 LKPI_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(LKPI_IMPORT_SOURCES))
 

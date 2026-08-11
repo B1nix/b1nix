@@ -207,6 +207,15 @@ BINARIES += $(BUILD)/bin/m48_smoke
 BINARIES += $(BUILD)/bin/m49_libwayland
 BINARIES += $(BUILD)/bin/m49_libwayland_server
 BINARIES += $(BUILD)/bin/m50_smoke
+# M101t: driven against the *pinned* upstream uapi headers out of the staged
+# import tree, not a copy kept here. A copy is how a userspace ABI drifts from
+# the kernel it talks to without anything failing to build.
+BINARIES += $(BUILD)/bin/m101t_smoke
+# -D__user= is what `make headers_install` does when it sanitises a uapi header
+# for userspace: the annotation is a sparse marker with no meaning outside the
+# kernel, and the raw staged tree has not been through that step.
+$(BUILD)/bin/m101t_smoke: CFLAGS += -I ../build/src/drm-core-6.6/include/uapi \
+	-D__user=
 BINARIES += $(BUILD)/bin/m51_smoke
 # M51 ported-library smokes. These used to reach the guest only through the
 # xxd/.inc initramfs path, which became bootstrap-only after the ext4-root

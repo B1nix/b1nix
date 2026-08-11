@@ -70,6 +70,11 @@ void drm_import_selftest(void);
  * registers with it. */
 void drm_core_bringup(void);
 
+/* M101t: bring the core and the device on it up on every boot, so /dev/dri/card1
+ * has something behind it. Runs regardless of b1nix.test=1 — the device is not a
+ * test. */
+void drm_kms_device_init(void);
+
 /* M101: register a device with the imported core and render one frame through
  * it, all the way to the scanout. */
 void drm_kms_selftest(void);

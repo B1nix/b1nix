@@ -77,6 +77,7 @@ extern void input_gfxtest_start(void);
 extern void input_m47_inject_start(void);
 extern void fb_dev_init(void);
 extern void drm_dev_init(void);
+extern void drm_card1_init(void);
 #include <b1nix/dma_fence.h>
 #include <b1nix/gpu_scheduler.h>
 #include <b1nix/memtype.h>
@@ -350,6 +351,11 @@ void kernel_main(usize arg0, usize arg1)
 	virtio_input_init(); /* absolute pointer (virtio-tablet) — grab-free mouse */
 	fb_dev_init(); /* M47: /dev/fb0 mmap-able framebuffer (needs fb_console) */
 	drm_dev_init(); /* M50: minimal DRM/KMS dumb-buffer device over virtio-gpu */
+	/* M101t: the imported core comes up here rather than in the test block —
+	 * /dev/dri/card1 is a device userspace opens, not a self-test. The order
+	 * matters: the node is only registered once a device exists behind it. */
+	drm_kms_device_init();
+	drm_card1_init();
 	virtio_gpu_dev_init(); /* M53: /dev/virtio-gpu userspace VirGL 3D transport */
 	ramdisk_init();
 	loop_init();            /* loop block devices + /dev/loop-control */
@@ -805,7 +811,6 @@ void kernel_main(usize arg0, usize arg1)
 		dma_fence_selftest(); /* M100: dma-fence */
 		drm_sched_selftest(); /* M100: GPU scheduler + scatter-gather BOs */
 		drm_import_selftest(); /* M101: the imported DRM core actually runs */
-		drm_core_bringup();    /* M101: the imported core's own initcall */
 		drm_kms_selftest();    /* M101: a device on it, rendering to the scanout */
 		sysfs_attr_selftest(); /* M101: its /sys and debugfs files, read back */
 	}
