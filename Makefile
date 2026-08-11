@@ -867,7 +867,7 @@ $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(wildcard userspace/bin/*/*.c) $(wildcard userspace/bin/*/*.cpp) \
 	$(wildcard userspace/bin/*/*.S) \
 	$(wildcard userspace/src/*.c) \
-	$(wildcard userspace/b1cc/src/*.c) \
+	$(wildcard userspace/b1cc/src/*.c userspace/b1cc/src/*/*.c) \
 	$(wildcard userspace/displayd/*.c) \
 	$(wildcard userspace/duktape/duktape.c) \
 	$(LIBM_LIB) \
@@ -934,7 +934,9 @@ $(INC_DIR)/initramfs_%.inc: $$(call user_bin_src,$$*) $(USERSPACE_DEPS)
 # Depend on the b1cc *sources* (same glob as userspace/Makefile's B1CC_SRCDIR) so
 # editing b1cc re-embeds it — otherwise the .inc looks up-to-date vs
 # USERSPACE_DEPS and the stale compiler binary gets shipped.
-B1CC_SELFHOST_SRCS := $(wildcard $(or $(B1CC_SRCDIR),userspace/b1cc/src)/*.c)
+# One directory deep as well — see the note in userspace/Makefile.
+B1CC_SELFHOST_SRCS := $(wildcard $(or $(B1CC_SRCDIR),userspace/b1cc/src)/*.c \
+                                 $(or $(B1CC_SRCDIR),userspace/b1cc/src)/*/*.c)
 $(INC_DIR)/initramfs_b1cc_selfhost.inc: $(USERSPACE_DEPS) $(B1CC_SELFHOST_SRCS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/b1cc
 	@mkdir -p $(dir $@)

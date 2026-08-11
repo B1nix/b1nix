@@ -39,7 +39,17 @@ B1CC_BINS_CC := $(realpath ../tools/b1nix-musl-cc)
 B1CC_SYSROOT_INCLUDE := $(realpath include)
 B1CC_DIR := b1cc
 B1CC := $(B1CC_DIR)/build/b1cc
-B1CC_SELF_SRCS := $(filter-out b1cc/src/b1cc_token_lexer.c, $(wildcard b1cc/src/*.c))
+# b1cc's sources live one directory deep (frontend/, ir/, backend/, linker/,
+# utils/) since its M38 reorganisation, so the glob has to descend. A flat
+# b1cc/src/*.c matches only b1cc.c and would link a compiler with no parser.
+B1CC_SRC_GLOB := b1cc/src/*.c b1cc/src/*/*.c
+# ...and each of those directories carries its own headers, included by name
+# rather than by path. Same set b1cc's own Makefile passes — twice, because the
+# self-host compile runs from here and the host build runs from inside b1cc/.
+B1CC_INC_DIRS := src src/frontend src/ir src/backend src/linker src/utils
+B1CC_INCS := $(addprefix -Ib1cc/,$(B1CC_INC_DIRS))
+B1CC_INCS_HOST := $(addprefix -I,$(B1CC_INC_DIRS))
+B1CC_SELF_SRCS := $(filter-out b1cc/src/b1cc_token_lexer.c, $(wildcard $(B1CC_SRC_GLOB)))
 B1CC_BINS := b1cc_argv b1cc_better_c b1cc_file_write b1cc_hello b1cc_m34 b1cc_m34_corpus b1cc_stderr_exit
 LIBM_DIR := ../build/$(B1NIX_ARCH)/ports/openlibm/install
 LIBS_DIR := ../build/$(B1NIX_ARCH)/libs
@@ -350,9 +360,9 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 # rejects the resulting implicit declarations outright. Add _DEFAULT_SOURCE from
 # this side — b1cc is a submodule, so overriding its (`?=`-assigned) CFLAGS on
 # the sub-make command line keeps that checkout clean for check-b1cc-sync.
-B1CC_HOST_CFLAGS ?= -std=c23 -D_DEFAULT_SOURCE -Wall -Wextra -O3 -flto -march=native
+B1CC_HOST_CFLAGS ?= -std=c23 -D_DEFAULT_SOURCE -Wall -Wextra -O3 -flto -march=native $(B1CC_INCS_HOST)
 
-$(B1CC): $(B1CC_DIR)/Makefile $(wildcard $(B1CC_DIR)/src/*.c)
+$(B1CC): $(B1CC_DIR)/Makefile $(wildcard $(B1CC_SRC_GLOB))
 	$(MAKE) -C $(B1CC_DIR) CC="$(HOST_CC)" CFLAGS="$(B1CC_HOST_CFLAGS)"
 
 # ── Source layout ──
@@ -396,7 +406,7 @@ $(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(BUILD)/bin/%: $$(call bin_src,$$*)
 # (kernel/syscall/syscall.c) — do not reintroduce -DB1CC_SERIAL_EMIT here.
 $(BUILD)/bin/b1cc: $(B1CC_SELF_SRCS)
 	@mkdir -p $(dir $@)
-	B1NIX_ARCH=$(B1NIX_ARCH) $(MUSL_CC) -std=gnu2x -Db1nix $(B1CC_SELF_SRCS) -o $@
+	B1NIX_ARCH=$(B1NIX_ARCH) $(MUSL_CC) -std=gnu2x -Db1nix $(B1CC_INCS) $(B1CC_SELF_SRCS) -o $@
 
 # M32: /bin/b1cc-selfsmoke — the on-device self-host driver, statically linked
 # against musl's libc.a (the minimal initramfs ships no shared libc.so).
