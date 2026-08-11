@@ -20,6 +20,8 @@
  * could not be compiled at all. See the note in <lkpi/env.h>.
  */
 
+#include <string.h>
+#include <lkpi/drm_bridge.h>
 #include <b1nix/console.h>
 #include <b1nix/drm.h>
 #include <b1nix/errno.h>
@@ -138,6 +140,74 @@ int drm_card1_present(void) { return card1_node != 0; }
 
 /* ── registration ───────────────────────────────────────────────── */
 
+/*
+ * One node per device the imported core registered.
+ *
+ * card1 used to be the only one, pointed at whichever device registered last.
+ * With a vendor driver bound to real hardware there is more than one, and the
+ * offsets userspace maps are per-device — so each gets its own node and each
+ * node remembers the minor it opens, rather than all of them resolving through
+ * a single global.
+ *
+ * Numbering starts at 1: card0 is b1nix's own DRM device, not this core's.
+ */
+#define DRM_IMPORTED_MAX 4
+static struct {
+	struct vfs_node *node;
+	u32 minor;
+	char path[24];
+} g_cards[DRM_IMPORTED_MAX];
+static unsigned g_card_count;
+
+/* The card whose node matches this path, or NULL. */
+static int card_index_for_path(const char *path) {
+  for (unsigned i = 0; i < g_card_count; i++)
+    if (strcmp(g_cards[i].path, path) == 0)
+      return (int)i;
+  return -1;
+}
+
+int drm_imported_card_present(const char *path) {
+  return card_index_for_path(path) >= 0;
+}
+
+int drm_imported_card_open(const char *path, int flags) {
+  int idx = card_index_for_path(path);
+
+  if (idx < 0)
+    return -ENODEV;
+
+  u32 lkpi_flags = 0;
+  if (flags & B1NIX_O_NONBLOCK)
+    lkpi_flags |= LKPI_DRM_O_NONBLOCK;
+  if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
+    lkpi_flags |= LKPI_DRM_O_WRITE;
+
+  void *file = 0;
+  int rc = lkpi_drm_open(g_cards[idx].minor, lkpi_flags, &file);
+  if (rc != 0)
+    return rc;
+
+  struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_NODE);
+  if (!h) {
+    lkpi_drm_close(file);
+    return -ENFILE;
+  }
+  h->node = vfs_node_get(g_cards[idx].node);
+  h->private_data = file;
+  h->ops = &card1_ops;
+  h->flags = flags;
+
+  int fd = scheduler_fd_alloc(h);
+  if (fd < 0) {
+    vfs_handle_release(h);
+    return -EMFILE;
+  }
+  if (flags & B1NIX_O_CLOEXEC)
+    scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
+  return fd;
+}
+
 void drm_card1_init(void) {
   /* The device the imported core registered is what makes this node meaningful.
    * Without it the node would open and every ioctl would fail, which is a worse
@@ -149,13 +219,43 @@ void drm_card1_init(void) {
   if (dir && !IS_ERR(dir))
     vfs_node_put(dir);
 
-  card1_node = vfs_add_node("/dev/dri/card1", VFS_DEVICE, 0, 0, 0);
-  if (!card1_node || IS_ERR(card1_node)) {
-    card1_node = 0;
-    console_write("drm: failed to register /dev/dri/card1\n");
-    return;
+  unsigned devices = lkpi_drm_device_count();
+
+  for (unsigned i = 0; i < devices && g_card_count < DRM_IMPORTED_MAX; i++) {
+    u32 minor = 0;
+
+    if (lkpi_drm_minor_at(i, &minor) != 0)
+      continue;
+
+    char *p = g_cards[g_card_count].path;
+    const char *prefix = "/dev/dri/card";
+    usize n = 0;
+    while (prefix[n]) { p[n] = prefix[n]; n++; }
+    /* Numbered from 1 — card0 belongs to b1nix's own device. */
+    unsigned num = g_card_count + 1;
+    if (num >= 10)
+      p[n++] = (char)('0' + (num / 10));
+    p[n++] = (char)('0' + (num % 10));
+    p[n] = 0;
+
+    struct vfs_node *node = vfs_add_node(p, VFS_DEVICE, 0, 0, 0);
+    if (!node || IS_ERR(node)) {
+      console_write("drm: failed to register ");
+      console_write(p);
+      console_write("\n");
+      continue;
+    }
+    node->inode->mode = 0600;
+    node->inode->mmap_handle_page_phys_cb = card1_mmap_page_phys;
+    g_cards[g_card_count].node = node;
+    g_cards[g_card_count].minor = minor;
+    g_card_count++;
+    if (g_card_count == 1)
+      card1_node = node;
+    console_write("drm: ");
+    console_write(p);
+    console_write(" ready (imported DRM core)\n");
   }
-  card1_node->inode->mode = 0600;
-  card1_node->inode->mmap_handle_page_phys_cb = card1_mmap_page_phys;
-  console_write("drm: /dev/dri/card1 ready (imported DRM core)\n");
+  if (g_card_count == 0)
+    return;
 }

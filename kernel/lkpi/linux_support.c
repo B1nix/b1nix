@@ -1852,21 +1852,6 @@ int wbinvd_on_all_cpus(void)
 
 /* ── i2c bit-banging ──────────────────────────────────────────────── */
 
-/*
- * DDC over bit-banged i2c.
- *
- * i915 talks to displays through GMBUS, the hardware controller, and only falls
- * back to bit-banging when GMBUS fails. b1nix has no GPIO bit-bang layer, so
- * that fallback reports no device and the driver stays on GMBUS.
- */
-int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
-{
-	(void)adap; (void)msgs; (void)num;
-	return -ENODEV;
-}
-
-const struct i2c_algorithm i2c_bit_algo = { 0 };
-
 /* ── firmware-discovered graphics memory ──────────────────────────── */
 
 /*
@@ -2224,6 +2209,10 @@ static struct {
 /* Counted so a driver that never receives an interrupt can be told apart from
  * one whose handler declines them. Reported once, on the first arrival. */
 static u64 lkpi_irq_count;
+
+/* How many device interrupts have been taken, for callers that want to know
+ * whether a wait was starved by a storm rather than by slow hardware. */
+u64 lkpi_device_irq_count(void) { return lkpi_irq_count; }
 
 static int lkpi_irq_trampoline(void *ctx)
 {

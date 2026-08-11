@@ -1,4 +1,6 @@
 #include <b1nix/arch.h>
+#include <b1nix/fw_cfg.h>
+#include <b1nix/io.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/ftrace.h>
@@ -89,6 +91,9 @@ extern void drm_core_bringup(void);
 extern unsigned long __drm_debug;
 #include <lkpi/drm_bridge.h>
 int lkpi_drm_mirror_to_display(void);
+struct drm_device;
+struct drm_device *lkpi_drm_first_device(void);
+void lkpi_i915_register_card(struct drm_device *dev);
 /*
  * KMS only (DRM_UT_KMS). CORE and DRIVER together produce thousands of lines
  * per probe, and at 115200 baud the driver then does not finish inside a test's
@@ -100,6 +105,15 @@ extern int lkpi_initcall_drm_display_helper_module_init(void);
 extern int lkpi_initcall_i915_init(void);
 static void i915_module_init(void)
 {
+	/*
+	 * The OpRegion first, because the driver reads it during probe and there is
+	 * no second chance: the VBT inside is where the board's port wiring and
+	 * signal parameters come from, and a driver that starts without it commits
+	 * to defaults. QEMU offers one; nothing on this boot path has placed it.
+	 * See kernel/dev/fw_cfg.c. The device is the assigned display at 00:02.0.
+	 */
+	(void)fw_cfg_place_igd_opregion(0, 2, 0);
+
 	drm_core_bringup();
 	(void)lkpi_initcall_drm_buddy_module_init();
 	(void)lkpi_initcall_drm_display_helper_module_init();
@@ -413,6 +427,55 @@ void kernel_main(usize arg0, usize arg1)
 	 * created. See kernel/lkpi/drm_virtual_monitor.c for what it does and does
 	 * not prove.
 	 */
+	/*
+	 * Publish the driver's card to b1nix's DRM bridge, so userspace can open
+	 * and mmap its objects. Harmless when i915 did not bind: the lookup finds
+	 * no device and registers nothing.
+	 */
+	{
+		struct drm_device *card = lkpi_drm_first_device();
+
+		if (card)
+			lkpi_i915_register_card(card);
+	}
+	/*
+	 * A display that is physically there but did not answer on DDC. Forcing
+	 * the connector on is upstream's video=<connector>:e, and the modes come
+	 * from the driver rather than from an invented EDID — see
+	 * lkpi_drm_force_connector_on().
+	 */
+	{
+		char want[32];
+
+		if (bootinfo_get_kv("b1nix.force-connector", want, sizeof(want)) > 0) {
+			const struct boot_info *bi = bootinfo_get();
+
+			/*
+			 * A boot module that is an EDID, recognised by the eight-byte
+			 * header every EDID starts with rather than by a flag saying so.
+			 * Self-identifying because the same slot carries a root filesystem
+			 * on other boots, and mistaking one for the other would hand the
+			 * display driver a disk image.
+			 */
+			if (bi && bi->has_ramdisk && bi->ramdisk_size >= 128) {
+				static const u8 edid_magic[8] = {
+					0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00
+				};
+				const u8 *blob =
+				    (const u8 *)(usize)(bi->ramdisk_addr + DIRECT_MAP_BASE);
+
+				if (memcmp(blob, edid_magic, sizeof(edid_magic)) == 0)
+					console_write(lkpi_drm_set_connector_edid(
+					                  want, blob, (usize)bi->ramdisk_size)
+					                  ? "drm: supplied the display's own EDID\n"
+					                  : "drm: EDID not applied\n");
+			}
+
+			console_write(lkpi_drm_force_connector_on(want)
+			              ? "drm: connector forced on\n"
+			              : "drm: connector not forced\n");
+		}
+	}
 	if (bootinfo_has_flag("b1nix.fake-monitor")) {
 		/*
 		 * HDMI only. A DP connector forced on with nothing attached spends the
@@ -435,6 +498,27 @@ void kernel_main(usize arg0, usize arg1)
 		console_write(lkpi_drm_mirror_to_display()
 		              ? "drm: mirrored to local display\n"
 		              : "drm: mirror produced no frame\n");
+	/*
+	 * Stop here when the boot exists only to exercise the display.
+	 *
+	 * Everything past this point — filesystems, init, the test suite — takes
+	 * minutes and touches nothing the display path uses. Bringing a GPU up is
+	 * an edit-run loop, and a loop whose slowest step is unrelated to what is
+	 * being changed stops being one. This ends the boot the moment the picture
+	 * has been produced, so the answer arrives while the question is still in
+	 * hand.
+	 *
+	 * The same ports the reboot syscall writes, for the same reason: QEMU
+	 * versions disagree about which one shuts the machine down, so all three
+	 * are tried before falling back to halting.
+	 */
+	if (bootinfo_has_flag("b1nix.gfx-only")) {
+		console_write("B1NIX-GFX: done\n");
+		outw(0x604, 0x2000);
+		outw(0xB004, 0x2000);
+		outw(0x4004, 0x3400);
+		arch_halt();
+	}
 #endif
 	virtio_input_init(); /* absolute pointer (virtio-tablet) — grab-free mouse */
 	fb_dev_init(); /* M47: /dev/fb0 mmap-able framebuffer (needs fb_console) */

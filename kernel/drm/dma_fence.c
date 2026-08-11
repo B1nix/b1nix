@@ -4,6 +4,7 @@
  * M100 — dma-fence. See kernel/include/b1nix/dma_fence.h.
  */
 
+#include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/dma_fence.h>
@@ -220,12 +221,36 @@ int dma_fence_wait_uninterruptible(struct dma_fence *f)
 	return f->error;
 }
 
+/* The cycle counter, which advances whether or not interrupts are enabled. */
+static inline u64 lkpi_rdtsc(void)
+{
+	u32 lo, hi;
+
+	__asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
+	return ((u64)hi << 32) | lo;
+}
+
 i64 dma_fence_wait_timeout(struct dma_fence *f, int intr, u64 timeout_ticks)
 {
 	(void)intr; /* see the note in <b1nix/dma_fence.h> */
 	if (!f)
 		return -EINVAL;
 	u64 deadline = scheduler_get_ticks() + timeout_ticks;
+	/*
+	 * A second deadline on the CPU's own clock, for the same reason as in
+	 * wait_for_completion_timeout(): a caller that cannot block is a caller
+	 * with interrupts disabled, and the scheduler tick cannot advance there —
+	 * so a deadline counted in ticks is one this loop can never reach. The TSC
+	 * runs regardless. Without it a fence that never signals spins the CPU for
+	 * good, and one that signals late costs the whole timeout in a busy loop.
+	 */
+	u64 tsc_deadline = 0;
+	{
+		u32 khz = arch_cpu_khz();
+
+		if (khz)
+			tsc_deadline = lkpi_rdtsc() + timeout_ticks * (u64)khz * 10ull;
+	}
 	for (;;) {
 		if (f->signaled)
 			return f->error ? (i64)f->error : 1;
@@ -233,6 +258,8 @@ i64 dma_fence_wait_timeout(struct dma_fence *f, int intr, u64 timeout_ticks)
 		if (now >= deadline)
 			return 0;
 		if (!scheduler_can_block()) {
+			if (tsc_deadline && lkpi_rdtsc() >= tsc_deadline)
+				return 0;
 			__asm__ volatile("pause");
 			tlb_shootdown_poll();
 			continue;

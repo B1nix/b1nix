@@ -7,15 +7,17 @@
 /*
  * A monotonic nanosecond clock, cheap enough to read on a hot path.
  *
- * Backed by the scheduler's tick rather than the TSC: the tick is what b1nix
- * already keeps coherent across CPUs, and a driver reading this is timing its
- * own operations, not measuring the hardware. The resolution is therefore 10 ms
- * and it is stated here rather than implied, because code that timestamps two
- * events inside one tick will see them as simultaneous.
+ * From the TSC, for the same reason ktime is: this is not only used to
+ * timestamp events, it is used to bound busy-wait loops. i915's _wait_for_atomic
+ * takes its deadline from here, and its shortest deadlines are microseconds —
+ * on a clock that moves in 10 ms steps such a wait runs until the next tick,
+ * which is five thousand times longer than asked. That is not merely imprecise:
+ * a driver whose hardware happens to answer inside the accidental window works,
+ * and stops working the moment the clock is made accurate.
  */
 static inline u64 local_clock(void)
 {
-	return lkpi_ticks() * 10ull * 1000ull * 1000ull;
+	return lkpi_monotonic_ns();
 }
 
 static inline u64 sched_clock(void) { return local_clock(); }

@@ -31,11 +31,13 @@
  */
 
 #include <drm/drm_client.h>
+#include <drm/drm_connector.h>
 #include <drm/drm_device.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_prime.h>
+#include <linux/delay.h>
 #include <linux/dma-buf.h>
 #include <linux/err.h>
 #include <linux/iosys-map.h>
@@ -61,6 +63,7 @@ extern unsigned long __drm_debug;
  * kernel built without i915 links, and called only when it resolved.
  */
 void lkpi_i915_dump_plane_surface(struct drm_device *dev) __attribute__((weak));
+void lkpi_i915_dump_pipe_state(struct drm_device *dev) __attribute__((weak));
 #define MIRROR_DEBUG_KMS 0x04UL
 
 /* Kept for the life of the mirror: releasing the client would tear the modeset
@@ -156,6 +159,131 @@ static void present_to_local_display(const struct iosys_map *map, u32 out_w,
  *
  * Returns 1 when a frame reached the local scanout.
  */
+/*
+ * What every connector on this device says about itself.
+ *
+ * A modeset probe that picks nothing gives one line of output for what can be
+ * any of several unrelated failures: no connector at all, a connector that
+ * reports disconnected, or one that is connected and still offers no usable
+ * mode. Those need different fixes, and the DRM debug mask cannot be used to
+ * tell them apart here — it prints thousands of lines through a 115200 serial
+ * port and the probe stops finishing inside the timeout.
+ *
+ * fill_modes() is called rather than merely reading the list, because the list
+ * is only populated when something asks; normally that is userspace through the
+ * getconnector ioctl, and nothing has asked yet at this point in boot.
+ */
+/* Is any connector reporting a display right now? */
+static bool any_connected(struct drm_device *dev)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	bool found = false;
+
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		if (connector->funcs && connector->funcs->fill_modes)
+			connector->funcs->fill_modes(connector, 4096, 4096);
+		if (connector->status == connector_status_connected &&
+		    !list_empty(&connector->modes)) {
+			found = true;
+			break;
+		}
+	}
+	drm_connector_list_iter_end(&iter);
+	return found;
+}
+
+/*
+ * Poll for a display over a bounded window instead of trusting the first probe.
+ *
+ * A driver normally learns a display is there from a hotplug interrupt, and
+ * re-probes when it fires. A passed-through GPU has no working hotplug here —
+ * the interrupt originates in the PCH, which the VM does not own — so the first
+ * probe is the only answer the boot would ever get. That makes a display that
+ * needs a moment after the device reset indistinguishable from one that is not
+ * plugged in.
+ *
+ * Bounded, and it does not manufacture a result: a connector still has to
+ * report connected and produce modes from a real EDID read. If the window
+ * expires, detection has genuinely failed and the caller reports that.
+ */
+static void wait_for_a_display(struct drm_device *dev)
+{
+	const unsigned attempts = 10; /* about five seconds */
+	unsigned i;
+
+	for (i = 0; i < attempts; i++) {
+		if (any_connected(dev)) {
+			if (i)
+				pr_info("drm: mirror: a display answered after %u retries\n",
+				        i);
+			return;
+		}
+		msleep(500);
+	}
+	pr_info("drm: mirror: no display answered in %u attempts\n", attempts);
+}
+
+static void report_connectors(struct drm_device *dev)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	unsigned long saved_debug;
+
+	/*
+	 * Whether interrupts are on, reported alongside the detection results.
+	 *
+	 * Reading an EDID waits on the GMBUS completion interrupt, and the modeset
+	 * that follows waits on vblank. With interrupts off, neither wake can ever
+	 * be delivered on this CPU: both waits run to their full timeout and report
+	 * a fault that looks like the display's, not ours. It is worth one line to
+	 * know which of those two worlds the driver is running in.
+	 */
+	pr_info("drm: mirror: interrupts %s at detect, %llu device IRQs so far\n",
+	        lkpi_irqs_enabled() ? "on" : "OFF",
+	        (unsigned long long)lkpi_device_irq_count());
+
+	/*
+	 * The debug mask, on for detection only.
+	 *
+	 * Detection is where the driver says why a connector came back empty — a
+	 * GMBUS timeout, a fallback to bit-banging, a live-status read of zero —
+	 * and none of that is visible otherwise. Bounded to this loop because the
+	 * same mask left on for the whole boot floods a 115200 serial line badly
+	 * enough that the driver misses its own timeouts.
+	 */
+	saved_debug = __drm_debug;
+	if (lkpi_bootflag("b1nix.drm-debug"))
+		__drm_debug |= MIRROR_DEBUG_KMS;
+
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		struct drm_display_mode *mode;
+		int modes = 0;
+
+		if (connector->funcs && connector->funcs->fill_modes)
+			connector->funcs->fill_modes(connector, 4096, 4096);
+
+		list_for_each_entry(mode, &connector->modes, head)
+			modes++;
+
+		pr_info("drm: mirror: connector %s: status %d, %d mode(s)%s%s\n",
+		        connector->name ? connector->name : "(unnamed)",
+		        (int)connector->status, modes,
+		        modes ? ", preferred " : "",
+		        modes ? list_first_entry(&connector->modes,
+		                                 struct drm_display_mode, head)->name
+		              : "");
+	}
+	drm_connector_list_iter_end(&iter);
+
+	pr_info("drm: mirror: %llu device IRQs after detect\n",
+	        (unsigned long long)lkpi_device_irq_count());
+
+	__drm_debug = saved_debug;
+}
+
 int lkpi_drm_mirror_to_display(void)
 {
 	struct drm_device *dev = lkpi_drm_first_device();
@@ -182,6 +310,9 @@ int lkpi_drm_mirror_to_display(void)
 		return 0;
 	}
 
+	wait_for_a_display(dev);
+	report_connectors(dev);
+
 	/*
 	 * Probed without a size limit: the mode comes from the connector, and
 	 * constraining it to the local display's size would reject the only mode
@@ -196,13 +327,35 @@ int lkpi_drm_mirror_to_display(void)
 
 	/* The framebuffer is the size of the mode that was chosen, which is the
 	 * first modeset's mode. */
-	if (!g_client.modesets || !g_client.modesets[0].mode) {
-		pr_info("drm: mirror: probe chose no mode on any CRTC\n");
-		drm_client_release(&g_client);
-		return 0;
+	/*
+	 * The framebuffer is sized from the first CRTC the probe actually gave a
+	 * mode to, which is not necessarily the first CRTC.
+	 *
+	 * A modeset entry exists for every CRTC on the device and only the ones
+	 * driving a connected display carry a mode; which pipe that is depends on
+	 * which port the cable is in. Reading modesets[0] alone worked only as long
+	 * as the display was a synthetic one attached to the first free connector,
+	 * and reported "no mode on any CRTC" the moment a real monitor came up on a
+	 * later pipe.
+	 */
+	{
+		unsigned i;
+
+		for (i = 0; g_client.modesets && g_client.modesets[i].crtc; i++)
+			if (g_client.modesets[i].mode)
+				break;
+
+		if (!g_client.modesets || !g_client.modesets[i].crtc ||
+		    !g_client.modesets[i].mode) {
+			pr_info("drm: mirror: probe chose no mode on any CRTC\n");
+			drm_client_release(&g_client);
+			return 0;
+		}
+		g_fb_width = g_client.modesets[i].mode->hdisplay;
+		g_fb_height = g_client.modesets[i].mode->vdisplay;
+		pr_info("drm: mirror: CRTC %u drives %ux%u\n", i, g_fb_width,
+		        g_fb_height);
 	}
-	g_fb_width = g_client.modesets[0].mode->hdisplay;
-	g_fb_height = g_client.modesets[0].mode->vdisplay;
 
 	g_buffer = drm_client_framebuffer_create(&g_client, g_fb_width, g_fb_height,
 	                                         DRM_FORMAT_XRGB8888);
@@ -294,19 +447,46 @@ int lkpi_drm_mirror_to_display(void)
 	 * plane to fetch, the fault is not about the memory the plane reads.
 	 */
 	if (!lkpi_bootflag("b1nix.mirror-noplane"))
+		/*
+		 * Only the CRTCs that were given a mode.
+		 *
+		 * A modeset entry exists for every CRTC, and the ones without a mode
+		 * are the pipes the commit is about to turn off. Handing those a
+		 * framebuffer describes a disabled pipe that is nonetheless scanning
+		 * out of memory — the core says so itself with WARN_ON(set->fb) on the
+		 * disable path — and the commit then works from a state no hardware
+		 * configuration corresponds to.
+		 */
 		for (unsigned i = 0; g_client.modesets && g_client.modesets[i].crtc; i++)
-			g_client.modesets[i].fb = g_buffer->fb;
+			if (g_client.modesets[i].mode)
+				g_client.modesets[i].fb = g_buffer->fb;
 
 	{
 		unsigned long saved_debug = __drm_debug;
 
-		__drm_debug |= MIRROR_DEBUG_KMS;
+		pr_info("drm: mirror: interrupts %s at commit\n",
+		        lkpi_irqs_enabled() ? "on" : "OFF");
+
+		/*
+		 * Only when asked for.
+		 *
+		 * The commit prints a few hundred lines with this mask on, through a
+		 * 115200 serial port — about a second of output interleaved with the
+		 * steps of a modeset whose own waits are measured in tens of
+		 * milliseconds. Turning it on to watch the commit is what made the
+		 * commit miss flip_done, so the observation destroyed what it was
+		 * meant to observe.
+		 */
+		if (lkpi_bootflag("b1nix.drm-debug"))
+			__drm_debug |= MIRROR_DEBUG_KMS;
 		rc = drm_client_modeset_commit(&g_client);
 		__drm_debug = saved_debug;
 		/* What the display engine was actually told to fetch — see
 		 * kernel/lkpi/i915_display_probe.c. Absent unless i915 is built. */
 		if (lkpi_i915_dump_plane_surface)
 			lkpi_i915_dump_plane_surface(dev);
+		if (lkpi_i915_dump_pipe_state)
+			lkpi_i915_dump_pipe_state(dev);
 	}
 
 	/*

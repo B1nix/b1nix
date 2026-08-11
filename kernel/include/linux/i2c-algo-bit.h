@@ -4,11 +4,9 @@
 #include <linux/i2c.h>
 /*
  * Bit-banged I2C: the GMBUS fallback i915 uses to read EDID when the hardware
- * controller will not talk. The algorithm is upstream's and lives in
- * i2c-algo-bit.c, which is GPL-2.0 and therefore not imported; what is here is
- * the data the driver fills in. A driver that falls back to bit-banging will
- * fail to link rather than silently read no EDID — GMBUS is the path that has
- * to work.
+ * controller will not talk. This is the data the driver fills in; the protocol
+ * that drives it is kernel/lkpi/i2c_bit.c, written from the specification
+ * because upstream's i2c-algo-bit.c is GPL-2.0 and not imported.
  */
 struct i2c_algo_bit_data {
 	void *data;

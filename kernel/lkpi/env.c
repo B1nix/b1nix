@@ -437,3 +437,86 @@ int lkpi_bootflag(const char *flag)
 {
 	return bootinfo_has_flag(flag);
 }
+
+/*
+ * Monotonic nanoseconds, from the TSC.
+ *
+ * The obvious source is the scheduler tick, and that is what this used to be:
+ * ticks × 10 ms. It reads as a detail about resolution, but imported drivers do
+ * not use this clock to stamp events — they use it to time out hardware. i915
+ * polls a GMBUS transfer with a 2 µs deadline first and a 50 ms one after, and
+ * on a clock that only moves in 10 ms steps the short deadline is either zero
+ * or a whole step depending on where the tick boundary happened to fall. The
+ * result was a bus that worked being declared timed out, and a monitor that was
+ * plugged in being reported as absent — in some boots and not others, which is
+ * what a phase relationship looks like from the outside.
+ *
+ * The TSC is invariant on every CPU this kernel targets and its frequency is
+ * already calibrated, so this is a real nanosecond clock rather than a finer
+ * label on a coarse one.
+ *
+ * Counted from the first call so the values stay small, and computed as
+ * quotient-plus-remainder rather than tsc × 1000000 / khz, which overflows 64
+ * bits after roughly an hour and a half of uptime.
+ */
+static u64 lkpi_tsc(void)
+{
+	u32 lo, hi;
+
+	__asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
+	return ((u64)hi << 32) | lo;
+}
+
+static u64 lkpi_tsc_base;
+
+/*
+ * Busy-wait for a number of microseconds, measured rather than counted.
+ *
+ * This was a loop of usecs * 50 pause instructions — a guess at how many fit in
+ * a microsecond, with no calibration behind it and no relation to the machine
+ * it runs on. Drivers do not use udelay to be polite; they use it to satisfy
+ * hardware timing that is specified in microseconds, and i915 spends it on i2c
+ * rise/fall time, PLL settling and AUX bit periods. A count that is wrong by a
+ * factor of anything is a delay that does not happen.
+ *
+ * The TSC is the same clock the rest of this file measures with, so the delay
+ * is as accurate as the calibration is. Interrupts are left alone: callers rely
+ * on udelay being usable with them off, and shootdowns are still serviced
+ * through cpu_relax so a spinning CPU does not wedge one that is waiting on it.
+ */
+void lkpi_udelay(u64 usecs)
+{
+	u32 khz = arch_cpu_khz();
+	u64 start, cycles;
+
+	if (!khz) {
+		/* Uncalibrated: fall back to the old spin so a delay is at least
+		 * non-zero, and say nothing more precise than that. */
+		for (u64 i = 0; i < usecs * 50; i++)
+			lkpi_cpu_relax();
+		return;
+	}
+
+	start = lkpi_tsc();
+	cycles = (usecs * khz) / 1000;
+	while (lkpi_tsc() - start < cycles)
+		lkpi_cpu_relax();
+}
+
+u64 lkpi_monotonic_ns(void)
+{
+	u32 khz = arch_cpu_khz();
+	u64 now, delta;
+
+	/* No calibrated TSC: fall back to the tick, coarse but never wrong about
+	 * the direction time moves. */
+	if (!khz)
+		return lkpi_ticks() * 10000000ull;
+
+	now = lkpi_tsc();
+	if (!lkpi_tsc_base)
+		lkpi_tsc_base = now;
+	delta = now - lkpi_tsc_base;
+
+	return (delta / khz) * 1000000ull + ((delta % khz) * 1000000ull) / khz;
+}

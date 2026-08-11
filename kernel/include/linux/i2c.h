@@ -31,7 +31,8 @@ struct i2c_adapter {
 struct i2c_msg { u16 addr; u16 flags; u16 len; u8 *buf; };
 #define I2C_M_RD 0x0001
 /* An i2c client and its driver, for encoders that hang off the bus. Nothing
- * probes them here — see i2c_transfer, which reports the bus as absent — so
+ * enumerates a bus to probe them on — i2c_transfer drives adapters a driver
+ * registered itself, and does not walk them looking for devices — so
  * registration succeeds and binds nothing. */
 struct i2c_device_id { char name[20]; unsigned long driver_data; };
 struct i2c_client { struct device dev; struct i2c_adapter *adapter; u16 addr; };
@@ -94,10 +95,11 @@ struct i2c_lock_operations {
 #define I2C_LOCK_SEGMENT      1
 
 
-/* The transfer algorithm an adapter is driven by. GMBUS supplies its own;
- * i2c_bit_algo is the bit-banged fallback, which is GPL-2.0 upstream and
- * therefore not imported — see <linux/i2c-algo-bit.h>. Declared so an adapter
- * that names it fails to link rather than silently reading no EDID. */
+/* The transfer algorithm an adapter is driven by, and the whole of how a
+ * transfer actually happens: the core calls master_xfer and does nothing else.
+ * GMBUS supplies its own; i2c_bit_algo is the bit-banged fallback, which is
+ * GPL-2.0 upstream and therefore not imported, so it refuses rather than
+ * bit-bangs — a bus forced to it reads no EDID. */
 struct i2c_algorithm {
 	int (*master_xfer)(struct i2c_adapter *adap, struct i2c_msg *msgs, int num);
 	u32 (*functionality)(struct i2c_adapter *adap);
@@ -124,9 +126,8 @@ int i2c_check_functionality(struct i2c_adapter *adap, u32 func);
 #define I2C_FUNC_NOSTART                0x00000010
 
 
-/* The lock-free transfer: the caller already holds the bus. Same path as
- * i2c_transfer here, because b1nix's core takes no bus lock of its own — see
- * the note on i2c_lock_operations. */
+/* The lock-free transfer: the caller already holds the bus. i2c_transfer is
+ * this plus the adapter's own lock_ops, if it published any. */
 int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num);
 
 

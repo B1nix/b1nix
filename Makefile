@@ -500,6 +500,7 @@ KERNEL_SOURCES += \
  	kernel/dev/virtio_input.c \
 	kernel/dev/drm.c \
 	kernel/dev/drm_card1.c \
+	kernel/dev/fw_cfg.c \
 	kernel/dev/netconsole.c \
 	kernel/lkpi/lkpi_core.c \
 	kernel/lkpi/idr.c \
@@ -526,6 +527,7 @@ KERNEL_SOURCES += \
 	kernel/lkpi/dma_buf.c \
 	kernel/lkpi/dma_fence_chain.c \
 	kernel/lkpi/timer.c \
+	kernel/lkpi/i2c_bit.c \
 	kernel/lkpi/linux_misc.c \
 	kernel/lkpi/lkpi_test.c \
 	kernel/lkpi/lkpi_m101_test.c \
@@ -608,7 +610,31 @@ DRM_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
 	-I $(DRM_IMPORT_DIR)/include -I $(DRM_IMPORT_DIR)/include/uapi \
 	-include linux/compiler_types.h -include linux/types.h
 
-$(BUILD_DIR)/$(DRM_IMPORT_DIR)/%.o: $(DRM_IMPORT_DIR)/%.c
+#
+# A stamp that changes when the compiler flags change.
+#
+# make compares timestamps of files; it cannot see that a -D was added. That is
+# not a theoretical gap — it bit twice on this driver, and both times the
+# symptom pointed somewhere else entirely. Adding -DB1NIX_I915 left a stale
+# main.o whose init call had been compiled out, so the driver was linked into
+# the image and never started; adding -DCONFIG_X86 left a stale drm_cache.o,
+# which silently invalidated a bisect and sent the search down a wrong path.
+#
+# The stamp's *name* carries a hash of the flags, so a change makes a different
+# file, which does not exist, which rebuilds everything that depends on it.
+# Recorded per flag set, because the three sets change independently.
+#
+DRM_FLAGS_HASH := $(firstword $(shell printf '%s' \
+	'$(DRM_IMPORT_CFLAGS) $(I915_IMPORT_CFLAGS) $(ARCH_CFLAGS) $(COMMON_CFLAGS)' \
+	| cksum))
+DRM_FLAGS_STAMP := $(BUILD_DIR)/.import-flags-$(DRM_FLAGS_HASH)
+
+$(DRM_FLAGS_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(BUILD_DIR)/.import-flags-*
+	@touch $@
+
+$(BUILD_DIR)/$(DRM_IMPORT_DIR)/%.o: $(DRM_IMPORT_DIR)/%.c $(DRM_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(DRM_IMPORT_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
@@ -631,7 +657,7 @@ LKPI_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(LKPI_IMPORT_SOURCES))
 # directory is b1nix-side code that must keep b1nix's own flags, and a pattern
 # rule here would outrank the general one and quietly rebuild all of it against
 # the Linux headers.
-$(LKPI_IMPORT_OBJECTS): $(BUILD_DIR)/%.o: %.c
+$(LKPI_IMPORT_OBJECTS): $(BUILD_DIR)/%.o: %.c $(DRM_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(filter-out -w,$(DRM_IMPORT_CFLAGS)) -Wall -Wextra $(ARCH_CFLAGS) -c $< -o $@
 
@@ -703,7 +729,7 @@ I915_IMPORT_CFLAGS := $(DRM_IMPORT_CFLAGS) \
 	-include i915_kconfig.h \
 	-O2
 
-$(BUILD_DIR)/$(I915_IMPORT_DIR)/%.o: $(I915_IMPORT_DIR)/%.c
+$(BUILD_DIR)/$(I915_IMPORT_DIR)/%.o: $(I915_IMPORT_DIR)/%.c $(DRM_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(I915_IMPORT_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
@@ -1653,6 +1679,22 @@ iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init: root-image check-dynamic 
 # drops to an interactive getty/shell that starves d8 on a single CPU.) Reuses the
 # shared kernel.elf — no recompile, just a different boot cmdline. The d8 binary +
 # m58.js ride on build/v8-out/v8-ext4.img, attached as sata0 by tests/smoke.sh.
+# Display bring-up instance: the kernel and nothing else.
+#
+# Deliberately carries no rootfs module. The in-kernel DRM client is what drives
+# the display, so userspace contributes nothing here — and shipping it costs
+# 154 MB in the image plus a full rootfs build and an init that takes minutes to
+# reach a state this boot never uses. Paired with b1nix.gfx-only, which powers
+# the machine off as soon as the frame exists.
+#
+# Depends on the kernel alone, so an edit to a shim rebuilds one object and
+# relinks, instead of rebuilding userspace and repacking a filesystem image.
+iso-i915: $(KERNEL_ELF)
+	@$(MKISO) --stage $(BUILD_DIR)/iso-i915 --out $(BUILD_DIR)/b1nix-i915.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "b1nix.gfx-only b1nix.mirror-display $(I915_EXTRA_CMDLINE)" \
+	    $(if $(I915_EDID),--module $(I915_EDID):edid.bin)
+
 iso-v8: $(KERNEL_ELF) root-image
 	@$(MKISO) --stage $(BUILD_DIR)/iso-v8 --out $(BUILD_DIR)/b1nix-v8.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \

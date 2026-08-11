@@ -35,6 +35,7 @@
 #include <drm/drm_probe_helper.h>
 #include <linux/printk.h>
 #include <linux/err.h>
+#include <linux/string.h>
 #include <linux/types.h>
 
 /*
@@ -212,6 +213,119 @@ struct drm_device *lkpi_drm_first_device(void)
  */
 _Static_assert(LKPI_DRM_CONNECTOR_HDMIA == DRM_MODE_CONNECTOR_HDMIA,
                "the connector type b1nix asks for must be the one DRM means");
+
+/*
+ * Force a connector on and let the driver supply the modes.
+ *
+ * The counterpart to the synthetic sink below, for the case where a display is
+ * genuinely attached but its EDID cannot be read — which is what happens to a
+ * passed-through GPU whose DDC transfers time out. Upstream exposes exactly
+ * this as video=<connector>:e, and it works because a forced connector with no
+ * EDID falls back to the driver's standard mode list, which carries the common
+ * CEA and DMT modes a monitor of this era accepts.
+ *
+ * Preferred over the synthetic EDID when the display is real: that EDID
+ * describes a 1920x1080 at CVT reduced blanking, 138.5 MHz, and a monitor
+ * expecting the CEA timing of 148.5 MHz for the same size may refuse to sync.
+ * Inventing a sink is right when there is none, and wrong when there is one.
+ *
+ * Returns the number of connectors forced.
+ */
+/*
+ * Give a connector an EDID we obtained by other means.
+ *
+ * DDC on a passed-through GPU is unreliable here — GMBUS times out and the GPIO
+ * readback the bit-banged fallback needs is dead — so the display's own EDID can
+ * be read once from a machine that can reach it and handed to the driver at
+ * boot. This is not an invented sink: the bytes are the monitor's, and with them
+ * the driver picks the monitor's native timings and, seeing the CEA extension,
+ * drives HDMI rather than DVI.
+ *
+ * Returns 1 when it was applied.
+ */
+int lkpi_drm_set_connector_edid(const char *name, const void *edid, usize size)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	struct drm_device *dev = lkpi_drm_first_device();
+	int applied = 0;
+
+	if (!dev || !name || !edid || size < EDID_LEN)
+		return 0;
+
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		if (!connector->name || strcmp(connector->name, name) != 0)
+			continue;
+		if (drm_edid_override_set(connector, edid, size) == 0)
+			applied = 1;
+		break;
+	}
+	drm_connector_list_iter_end(&iter);
+
+	return applied;
+}
+
+int lkpi_drm_force_connector_on(const char *name)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	struct drm_device *dev = lkpi_drm_first_device();
+	int forced = 0;
+
+	if (!dev || !name || !name[0])
+		return 0;
+
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		/*
+		 * Matched by name, not by type or by position in the list.
+		 *
+		 * Which connector a cable is in is a fact about the machine, and the
+		 * first connector of a type is not it: this board's monitor is on the
+		 * third HDMI. A name is what the user can read off the same list the
+		 * kernel prints, and it is what upstream's video= takes.
+		 */
+		if (!connector->name || strcmp(connector->name, name) != 0)
+			continue;
+
+		connector->force = DRM_FORCE_ON;
+		forced++;
+		break;
+	}
+	drm_connector_list_iter_end(&iter);
+
+	if (!forced)
+		pr_info("drm: no connector named %s\n", name);
+
+	if (!forced)
+		return 0;
+
+	drm_helper_hpd_irq_event(dev);
+
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		struct drm_display_mode *mode;
+		int modes = 0;
+
+		if (connector->force != DRM_FORCE_ON)
+			continue;
+		if (connector->funcs && connector->funcs->fill_modes)
+			connector->funcs->fill_modes(connector, 4096, 4096);
+		list_for_each_entry(mode, &connector->modes, head)
+			modes++;
+		pr_info("drm: forced %s on: status %d, %d mode(s)%s%s\n",
+		        connector->name ? connector->name : "(unnamed)",
+		        (int)connector->status, modes,
+		        modes ? ", preferred " : "",
+		        modes ? list_first_entry(&connector->modes,
+		                                 struct drm_display_mode, head)->name
+		              : "");
+	}
+	drm_connector_list_iter_end(&iter);
+
+	return forced;
+}
 
 int lkpi_drm_attach_virtual_monitor(int connector_type)
 {

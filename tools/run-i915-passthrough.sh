@@ -24,7 +24,7 @@ set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ARCH="${B1NIX_ARCH:-x86_64}"
-ISO="$ROOT_DIR/build/$ARCH/b1nix.iso"
+ISO="${ISO:-$ROOT_DIR/build/$ARCH/b1nix.iso}"
 OUT_DIR="$ROOT_DIR/smoke_run"
 LOG="$OUT_DIR/i915-passthrough.log"
 MEM_MB="${MEM_MB:-2048}"
@@ -169,6 +169,16 @@ fi
 mkdir -p "$OUT_DIR"
 
 #
+# A NIC at an address of its own.
+#
+# QEMU assigns the default NIC to the first free slot, which is the one legacy
+# IGD mode needs — that collision is why the emulated devices were dropped
+# entirely at first. Dropping the network instead makes the guest's network
+# tests wait forever on a link that will never come up, which reads like a hang
+# in the graphics run and is nothing of the sort. So it gets slot 3.
+NET_ARGS="-netdev user,id=n0 -device e1000,netdev=n0,addr=03.0"
+
+#
 # Machine model.
 #
 # "legacy" is QEMU's IGD passthrough mode: the device must sit at guest 00:02.0
@@ -193,11 +203,11 @@ legacy)
 	# takes guest slot 2 and its default NIC takes the next free one, and slot 2
 	# is where legacy IGD mode has to place the real device. Neither is wanted
 	# here — this run is about the GPU.
-	MACHINE_ARGS="-machine pc,accel=kvm -vga none -nic none"
+	MACHINE_ARGS="-machine pc,accel=kvm -vga none $NET_ARGS"
 	DEV_ARGS="-device vfio-pci,host=$IGD_BDF,addr=02.0,x-igd-opregion=on,rombar=0"
 	;;
 q35)
-	MACHINE_ARGS="-machine q35,accel=kvm -vga none -nic none"
+	MACHINE_ARGS="-machine q35,accel=kvm -vga none $NET_ARGS"
 	DEV_ARGS="-device vfio-pci,host=$IGD_BDF,rombar=0"
 	;;
 *)

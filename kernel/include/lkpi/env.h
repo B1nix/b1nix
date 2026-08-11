@@ -46,6 +46,17 @@ void lkpi_preempt_enable(void);
 void lkpi_irq_restore(u64 flags);
 int lkpi_irqs_enabled(void);
 
+/* Monotonic nanoseconds from the TSC — real resolution, not tick-rounded.
+ * Imported drivers time hardware out with it; see the note in env.c. */
+u64 lkpi_monotonic_ns(void);
+
+/* Busy-wait for microseconds, timed against the TSC. See the note in env.c. */
+void lkpi_udelay(u64 usecs);
+
+/* Device interrupts taken so far. */
+u64 lkpi_device_irq_count(void);
+
+
 /* ── two-phase wait ─────────────────────────────────────────────
  *
  * Publish on the channel, re-test the condition, then park. Splitting it this

@@ -44,11 +44,25 @@ void lkpi_drm_register_device(struct drm_device *dev, lkpi_drm_page_fn resolver)
  * See kernel/lkpi/drm_virtual_monitor.c for what this does and does not test. */
 int lkpi_drm_attach_virtual_monitor(int connector_type);
 
+/* Force a real-but-undetected display on, modes from the driver's own list.
+ * For a display that is attached but whose EDID cannot be read. */
+int lkpi_drm_force_connector_on(const char *name);
+
+/* Hand a connector an EDID read elsewhere, for a display whose DDC will not
+ * answer. See the note in drm_virtual_monitor.c. */
+int lkpi_drm_set_connector_edid(const char *name, const void *edid, usize size);
+
 /*
  * DRM_MODE_CONNECTOR_HDMIA, repeated because callers on b1nix's side cannot
  * include the DRM headers. drm_virtual_monitor.c asserts the two agree, so a
  * change upstream is a build error rather than a connector nobody matches.
  */
 #define LKPI_DRM_CONNECTOR_HDMIA 11
+
+
+/* Every registered device, so b1nix can publish a node per card. Index is
+ * registration order, which is boot order. */
+unsigned lkpi_drm_device_count(void);
+int lkpi_drm_minor_at(unsigned index, u32 *out_minor);
 
 #endif

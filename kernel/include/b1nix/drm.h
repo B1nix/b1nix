@@ -122,4 +122,10 @@ int drm_card1_present(void);
 u64 drm_vmap_window_base(void);
 u64 drm_vmap_window_size(void);
 
+
+/* The imported core's nodes, one per registered device. card0 is b1nix's own
+ * device and is not one of these. */
+int drm_imported_card_present(const char *path);
+int drm_imported_card_open(const char *path, int flags);
+
 #endif

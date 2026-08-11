@@ -54,13 +54,60 @@ long drm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 
 /* ── the registered device ──────────────────────────────────────── */
 
+/*
+ * The registered devices, and how each one resolves its pages.
+ *
+ * A table rather than a single slot: with an imported vendor driver bound to
+ * real hardware there is more than one DRM device in the system, and each backs
+ * its objects differently — the KMS proof device owns a page array, i915 owns a
+ * GTT view. A single slot meant whichever registered last answered for both,
+ * and mapping one device's object through another's resolver is a wrong page,
+ * not an error.
+ *
+ * Small and fixed: nothing here creates devices dynamically.
+ */
+#define LKPI_DRM_MAX_DEVICES 4
+static struct {
+	struct drm_device *dev;
+	lkpi_drm_page_fn resolver;
+} g_drm[LKPI_DRM_MAX_DEVICES];
+static unsigned g_drm_count;
+
+/* The most recently registered device, which is what the node-level helpers
+ * below report. Registration order is boot order, and the last to register is
+ * the one a test that just brought a device up means. */
 static struct drm_device *g_dev;
-static lkpi_drm_page_fn g_page_resolver;
 
 void lkpi_drm_register_device(struct drm_device *dev, lkpi_drm_page_fn resolver)
 {
-	g_dev = dev;
-	g_page_resolver = resolver;
+	unsigned i;
+
+	if (!dev)
+		return;
+	for (i = 0; i < g_drm_count; i++) {
+		if (g_drm[i].dev == dev) {
+			g_drm[i].resolver = resolver;
+			g_dev = dev;
+			return;
+		}
+	}
+	if (g_drm_count < LKPI_DRM_MAX_DEVICES) {
+		g_drm[g_drm_count].dev = dev;
+		g_drm[g_drm_count].resolver = resolver;
+		g_drm_count++;
+		g_dev = dev;
+	}
+}
+
+/* The resolver registered for a device, or NULL if it is not one of ours. */
+static lkpi_drm_page_fn lkpi_drm_resolver_for(struct drm_device *dev)
+{
+	unsigned i;
+
+	for (i = 0; i < g_drm_count; i++)
+		if (g_drm[i].dev == dev)
+			return g_drm[i].resolver;
+	return 0;
 }
 
 int lkpi_drm_have_device(void)
@@ -71,6 +118,23 @@ int lkpi_drm_have_device(void)
 u32 lkpi_drm_primary_minor(void)
 {
 	return (g_dev && g_dev->primary) ? (u32)g_dev->primary->index : 0;
+}
+
+/* How many devices registered, and the primary minor of each — so userspace
+ * gets a node per card rather than one node for whichever registered last. */
+unsigned lkpi_drm_device_count(void)
+{
+	return g_drm_count;
+}
+
+int lkpi_drm_minor_at(unsigned index, u32 *out_minor)
+{
+	if (index >= g_drm_count || !out_minor)
+		return -EINVAL;
+	if (!g_drm[index].dev || !g_drm[index].dev->primary)
+		return -ENODEV;
+	*out_minor = (u32)g_drm[index].dev->primary->index;
+	return 0;
 }
 
 /* ── open and close ─────────────────────────────────────────────── */
@@ -171,14 +235,26 @@ int lkpi_drm_mmap_page_phys(void *file, u64 offset, u64 *out_phys)
 	u64 index;
 	int ret;
 
-	if (!filp || !out_phys || !g_dev || !g_page_resolver)
+	if (!filp || !out_phys)
 		return -EINVAL;
 	priv = filp->private_data;
 	if (!priv)
 		return -EBADF;
 
-	drm_vma_offset_lock_lookup(g_dev->vma_offset_manager);
-	node = drm_vma_offset_lookup_locked(g_dev->vma_offset_manager, pgoff, 1);
+	/*
+	 * The device comes from the open file, not from a global: the offset being
+	 * mapped is meaningful only within the device whose node userspace opened,
+	 * and the same offset names a different object on another device.
+	 */
+	struct drm_device *dev = (priv->minor && priv->minor->dev) ? priv->minor->dev
+	                                                           : g_dev;
+	lkpi_drm_page_fn resolver = lkpi_drm_resolver_for(dev);
+
+	if (!dev || !resolver)
+		return -EINVAL;
+
+	drm_vma_offset_lock_lookup(dev->vma_offset_manager);
+	node = drm_vma_offset_lookup_locked(dev->vma_offset_manager, pgoff, 1);
 	if (node && !drm_vma_node_is_allowed(node, priv))
 		node = 0;
 	if (node) {
@@ -189,13 +265,13 @@ int lkpi_drm_mmap_page_phys(void *file, u64 offset, u64 *out_phys)
 	} else {
 		obj = 0;
 	}
-	drm_vma_offset_unlock_lookup(g_dev->vma_offset_manager);
+	drm_vma_offset_unlock_lookup(dev->vma_offset_manager);
 
 	if (!obj)
 		return -EACCES;
 
 	index = (u64)(pgoff - node->vm_node.start);
-	ret = g_page_resolver(obj, index, out_phys);
+	ret = resolver(obj, index, out_phys);
 	drm_gem_object_put(obj);
 	return ret;
 }

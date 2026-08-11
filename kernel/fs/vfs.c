@@ -2720,7 +2720,7 @@ int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
   /* Both DRM nodes take the same route: check the node's permissions, then let
    * the owning driver build the handle. They differ only in which driver that
    * is — card0 is b1nix's own device, card1 the imported core's. */
-  if (strcmp(resolved, "/dev/dri/card1") == 0 && drm_card1_present()) {
+  if (drm_imported_card_present(resolved)) {
     struct vfs_node *card = vfs_find_node(resolved);
     if (!IS_ERR(card)) {
       int access_mask = 0;
@@ -2735,7 +2735,7 @@ int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
         return access;
       }
     }
-    int fd = drm_card1_open(flags);
+    int fd = drm_imported_card_open(resolved, flags);
     kfree(resolved);
     return fd;
   }

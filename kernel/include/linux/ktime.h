@@ -3,10 +3,10 @@
 #define LKPI_LINUX_KTIME_H
 #include <lkpi/env.h>
 #include <b1nix/types.h>
-/* Monotonic time in nanoseconds, derived from the scheduler's tick. The
- * resolution is therefore 10 ms, not a nanosecond — imported code that
- * timestamps a vblank gets tick granularity and the header says so rather than
- * letting the units imply a precision that is not there. */
+/* Monotonic time in nanoseconds, from the TSC — genuine nanosecond resolution.
+ * It was the scheduler tick, 10 ms per step, which is fine for a timestamp and
+ * wrong for a timeout: drivers poll hardware with microsecond deadlines on this
+ * clock. See lkpi_monotonic_ns() in kernel/lkpi/env.c. */
 typedef i64 ktime_t; /* i64, not s64: this header is reached before
                       * <linux/types.h> defines the Linux spellings. */
 #define NSEC_PER_USEC 1000LL
@@ -14,8 +14,7 @@ typedef i64 ktime_t; /* i64, not s64: this header is reached before
 #define NSEC_PER_SEC  1000000000LL
 #define USEC_PER_SEC  1000000LL
 #define MSEC_PER_SEC  1000LL
-static inline ktime_t ktime_get(void)
-{ return (ktime_t)lkpi_ticks() * 10 * NSEC_PER_MSEC; }
+static inline ktime_t ktime_get(void) { return (ktime_t)lkpi_monotonic_ns(); }
 static inline ktime_t ktime_get_raw(void) { return ktime_get(); }
 static inline i64 ktime_to_ns(ktime_t k) { return k; }
 static inline i64 ktime_to_us(ktime_t k) { return k / NSEC_PER_USEC; }
@@ -46,11 +45,12 @@ static inline i64 ktime_compare(ktime_t a, ktime_t b)
  * warns about, which surfaced as `spinlock_t` being redefined as `volatile int`
  * three files away.
  *
- * Same clock as everything else here: the scheduler tick, 10 ms. A single word
- * read, so the NMI-safety upstream's name promises is real rather than assumed.
+ * Same clock as everything else here. A TSC read plus arithmetic on locals,
+ * taking no lock, so the NMI-safety upstream's name promises is real rather
+ * than assumed.
  */
 u64 lkpi_ticks(void);
-static inline u64 ktime_get_raw_fast_ns(void) { return lkpi_ticks() * 10000000ull; }
+static inline u64 ktime_get_raw_fast_ns(void) { return lkpi_monotonic_ns(); }
 
 
 /* Time since boot, including any time the machine was suspended. b1nix never
