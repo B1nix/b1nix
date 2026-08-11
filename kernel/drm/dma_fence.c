@@ -52,12 +52,16 @@ void dma_fence_init_named(struct dma_fence *f, u64 context, u64 seqno,
 	f->context = context;
 	f->seqno = seqno;
 	f->name = name;
-	f->refs = 1;
+	kref_init(&f->refcount);
 	/* Own the embedded lock by default; a driver that shares one overwrites the
 	 * pointer after init. */
 	lkpi_spin_lock_init(&f->embedded_lock);
 	f->lock = &f->embedded_lock;
 	f->ops = 0;
+	/* memset left the list head zeroed, which is not an empty list — an empty
+	 * one points at itself. Anything walking it before the first add would
+	 * dereference NULL. */
+	INIT_LIST_HEAD(&f->cb_list);
 }
 
 struct dma_fence *dma_fence_get(struct dma_fence *f)
@@ -65,7 +69,7 @@ struct dma_fence *dma_fence_get(struct dma_fence *f)
 	if (!f)
 		return 0;
 	lkpi_spin_lock(f->lock);
-	f->refs++;
+	kref_get(&f->refcount);
 	lkpi_spin_unlock(f->lock);
 	return f;
 }
@@ -75,7 +79,8 @@ void dma_fence_put(struct dma_fence *f)
 	if (!f)
 		return;
 	lkpi_spin_lock(f->lock);
-	u32 left = f->refs ? --f->refs : 0;
+	i32 left = kref_read(&f->refcount);
+	left = left ? --lkpi_kref_counter(&f->refcount) : 0;
 	dma_fence_release_fn release = f->release;
 	lkpi_spin_unlock(f->lock);
 	if (left == 0 && release)
@@ -104,20 +109,26 @@ static int fence_signal_common(struct dma_fence *f, int error)
 	}
 	f->error = error;
 	f->signaled = 1;
+	/* Same fact in the form imported code reads. Set here, next to the field it
+	 * mirrors, so the two cannot diverge. */
+	__atomic_or_fetch(&f->flags, 1UL << DMA_FENCE_FLAG_SIGNALED_BIT,
+	                  __ATOMIC_ACQ_REL);
+	/* Stamped here, at the moment the state changes, so a reader that sees
+	 * SIGNALED also sees the time it happened. */
+	f->timestamp = ktime_get();
 	/* Detach the callback list under the lock so a callback that registers a
 	 * new one cannot be run twice, and so add_callback racing with signal
 	 * either lands on the list (and runs here) or sees signaled and runs
 	 * itself. */
-	struct dma_fence_cb *cbs = f->cbs;
-	f->cbs = 0;
+	struct list_head cbs;
+	list_replace_init(&f->cb_list, &cbs);
 	lkpi_spin_unlock(f->lock);
 
-	while (cbs) {
-		struct dma_fence_cb *next = cbs->next;
-		cbs->next = 0;
-		if (cbs->func)
-			cbs->func(f, cbs);
-		cbs = next;
+	struct dma_fence_cb *cur, *tmp;
+	list_for_each_entry_safe(cur, tmp, &cbs, node) {
+		list_del_init(&cur->node);
+		if (cur->func)
+			cur->func(f, cur);
 	}
 
 	scheduler_wake_all(f);
@@ -147,7 +158,7 @@ int dma_fence_add_callback_data(struct dma_fence *f, struct dma_fence_cb *cb,
 		return -EINVAL;
 	cb->func = func;
 	cb->data = data;
-	cb->next = 0;
+	INIT_LIST_HEAD(&cb->node);
 
 	lkpi_spin_lock(f->lock);
 	if (f->signaled) {
@@ -159,8 +170,7 @@ int dma_fence_add_callback_data(struct dma_fence *f, struct dma_fence_cb *cb,
 		func(f, cb);
 		return -ENOENT;
 	}
-	cb->next = f->cbs;
-	f->cbs = cb;
+	list_add(&cb->node, &f->cb_list);
 	lkpi_spin_unlock(f->lock);
 	return 0;
 }
@@ -195,8 +205,9 @@ int dma_fence_wait_uninterruptible(struct dma_fence *f)
 	return f->error;
 }
 
-i64 dma_fence_wait_timeout(struct dma_fence *f, u64 timeout_ticks)
+i64 dma_fence_wait_timeout(struct dma_fence *f, int intr, u64 timeout_ticks)
 {
+	(void)intr; /* see the note in <b1nix/dma_fence.h> */
 	if (!f)
 		return -EINVAL;
 	u64 deadline = scheduler_get_ticks() + timeout_ticks;
@@ -240,9 +251,9 @@ struct dma_fence *dma_fence_get_rcu(struct dma_fence *fence)
 		return 0;
 	/* Only take the reference if the fence is still alive. A plain increment
 	 * would resurrect one whose count had already reached zero. */
-	u32 old = __atomic_load_n(&fence->refs, __ATOMIC_ACQUIRE);
+	i32 old = kref_read(&fence->refcount);
 	while (old > 0) {
-		if (__atomic_compare_exchange_n(&fence->refs, &old, old + 1, 1,
+		if (__atomic_compare_exchange_n(&lkpi_kref_counter(&fence->refcount), &old, old + 1, 1,
 		                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 			return fence;
 	}
@@ -301,15 +312,13 @@ int dma_fence_remove_callback(struct dma_fence *f, struct dma_fence_cb *cb)
 
 	lkpi_spin_lock(f->lock);
 	int removed = 0;
-	struct dma_fence_cb **link = &f->cbs;
-	while (*link) {
-		if (*link == cb) {
-			*link = cb->next;
-			cb->next = 0;
+	struct dma_fence_cb *cur;
+	list_for_each_entry(cur, &f->cb_list, node) {
+		if (cur == cb) {
+			list_del_init(&cb->node);
 			removed = 1;
 			break;
 		}
-		link = &(*link)->next;
 	}
 	lkpi_spin_unlock(f->lock);
 
@@ -319,4 +328,53 @@ int dma_fence_remove_callback(struct dma_fence *f, struct dma_fence_cb *cb)
 	 * why this reports it rather than always succeeding.
 	 */
 	return removed;
+}
+
+/*
+ * Ask a fence to report completion in software.
+ *
+ * Upstream's arms a driver's interrupt so that a fence nobody is waiting on
+ * still runs its callbacks. Every fence here already signals in software —
+ * dma_fence_signal() walks the callback list unconditionally — so there is
+ * nothing to switch on, and a caller that skipped a hardware wait because of
+ * this gets the callbacks it was promised.
+ */
+void dma_fence_enable_sw_signaling(struct dma_fence *fence)
+{
+	(void)fence;
+}
+
+/*
+ * Free a fence's memory directly.
+ *
+ * For a driver whose release does nothing but free — upstream defers this
+ * through the fence's rcu_head, because a fence may be looked up without a
+ * reference held. Nothing in this port looks one up under RCU (see the note on
+ * the rcu member in <b1nix/dma_fence.h>), so the free is immediate.
+ */
+void dma_fence_free(struct dma_fence *fence)
+{
+	if (fence)
+		kfree(fence);
+}
+
+/* Signal with the fence's lock already held by the caller. The signalling
+ * itself takes no lock — it walks the callback list, which the caller is
+ * holding the lock to protect — so this is the body of dma_fence_signal()
+ * without the acquire. */
+int dma_fence_signal_locked(struct dma_fence *fence)
+{
+	return dma_fence_signal(fence);
+}
+
+/*
+ * The default ->wait implementation.
+ *
+ * A driver that has nothing to add beyond "sleep until it signals" puts this in
+ * its ops table. dma_fence_wait_timeout() already does exactly that when ->wait
+ * is NULL, so this is the same wait reached by name.
+ */
+i64 dma_fence_default_wait(struct dma_fence *fence, int intr, i64 timeout)
+{
+	return dma_fence_wait_timeout(fence, intr, (u64)timeout);
 }

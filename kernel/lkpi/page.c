@@ -42,8 +42,9 @@ void lkpi_page_init(void)
 
 /* ── struct page ────────────────────────────────────────────────── */
 
-struct page *alloc_pages(u32 order)
+struct page *alloc_pages(u32 gfp, u32 order)
 {
+	(void)gfp; /* see the note in <lkpi/page.h> */
 	if (order > 20)
 		return 0;
 	usize n = (usize)1 << order;
@@ -67,7 +68,7 @@ struct page *alloc_pages(u32 order)
 	return pages;
 }
 
-struct page *alloc_page(void)
+struct page *lkpi_alloc_page(void)
 {
 	/* Its own frame, not a run of one, so a caller collecting several of these
 	 * gets scattered memory — which is what a page allocator is for. */
@@ -141,7 +142,7 @@ struct page **shmem_alloc_pages(usize count)
 		return 0;
 
 	for (usize i = 0; i < count; i++) {
-		pages[i] = alloc_page();
+		pages[i] = lkpi_alloc_page();
 		if (!pages[i]) {
 			for (usize j = 0; j < i; j++)
 				__free_page(pages[j]);
@@ -285,3 +286,6 @@ usize lkpi_vmap_pages_mapped(void)
 	spin_unlock_irqrestore(&g_vmap_lock, flags);
 	return n;
 }
+
+u64 lkpi_vmap_window_base(void) { return LKPI_VMAP_BASE; }
+u64 lkpi_vmap_window_size(void) { return (u64)LKPI_VMAP_PAGES * PAGE_SIZE; }

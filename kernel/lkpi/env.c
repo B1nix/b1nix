@@ -13,6 +13,11 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/klog.h>
 #include <b1nix/lapic.h>
+#include <b1nix/memtype.h>
+#include <b1nix/mm.h>
+#include <string.h>
+
+#include <b1nix/pci.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/sysfs_attr.h>
@@ -245,4 +250,113 @@ int lkpi_scanout_present(const u32 *pixels, u32 width, u32 height)
    * arguments say "leave it as it is" rather than moving or hiding it. */
   return virtio_gpu_present(pixels, width, height, 0, 0, width, height, -1, -1,
                             0);
+}
+
+/* ── randomness ─────────────────────────────────────────────────── */
+
+/* Imported drivers ask for randomness through <linux/random.h>, which declares
+ * this rather than including b1nix's own header: the two sides spell the same
+ * names differently, and a translation unit that saw both would not compile.
+ * The source is the kernel's, not a second generator. */
+u32 lkpi_random_u32(void) { return (u32)kernel_random_u64(); }
+
+/* ── context assertions ─────────────────────────────────────────── */
+
+/*
+ * "This function may sleep — is the caller somewhere it can?"
+ *
+ * Reported rather than fatal: reaching a sleeping call from an atomic context
+ * is a bug, but panicking on it would turn a diagnosable problem into a dead
+ * machine, and the callers that trip it are usually imported code taking a path
+ * b1nix's context rules did not anticipate. The message names the function so
+ * the path is identifiable without a debugger.
+ */
+void lkpi_might_sleep(const char *where)
+{
+  if (lkpi_can_block())
+    return;
+  char line[96];
+  lkpi_snprintf(line, sizeof(line),
+                "lkpi: might_sleep() in a context that cannot block: %s",
+                where ? where : "<unknown>");
+  klog_warn(line);
+}
+
+/* ── PCI windows ────────────────────────────────────────────────── */
+
+int lkpi_pci_bar(u32 bus, u32 slot, u32 func, u32 index, u64 *start, u64 *size,
+                 u32 *is_io)
+{
+  struct pci_bar bar;
+
+  if (!start || !size || index >= PCI_MAX_BARS)
+    return 0;
+  if (pci_bar_read((u8)bus, (u8)slot, (u8)func, (u8)index, &bar) != 0)
+    return 0;
+  if (!bar.valid)
+    return 0;
+
+  *start = bar.base;
+  *size = bar.size;
+  if (is_io)
+    *is_io = bar.is_io;
+  return 1;
+}
+
+/* ── memory types ───────────────────────────────────────────────── */
+
+/* Whether write-combining is really available through the PAT (M98). Answered
+ * from the CPU's own capability rather than assumed: a driver that maps an
+ * aperture WC when the PAT is not programmed gets uncached memory and blames
+ * the GPU for the frame rate. */
+int lkpi_pat_enabled(void) { return pat_available(); }
+
+/* One CPUID query per call, the encoding described in <asm/cpufeature.h>.
+ * Upstream patches the branch away at boot; this does not, and the cost is a
+ * cpuid on a path that upstream made free — measurable, never wrong. */
+int lkpi_cpu_has(u32 feature)
+{
+  u32 leaf = feature >> 8;
+  u32 reg = (feature >> 5) & 7;
+  u32 bit = feature & 31;
+  u32 eax = 0, ebx = 0, ecx = 0, edx = 0;
+
+  __asm__ volatile("cpuid"
+                   : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                   : "a"(leaf), "c"(0));
+
+  u32 value = reg == 0 ? eax : reg == 1 ? ebx : reg == 2 ? ecx : edx;
+  return (value >> bit) & 1u;
+}
+
+/* ── machine memory ─────────────────────────────────────────────────── */
+
+u64 lkpi_total_pages(void)
+{
+	return pmm_total_usable_memory() / PAGE_SIZE;
+}
+
+u64 lkpi_free_pages(void)
+{
+	return (u64)pmm_free_frame_count();
+}
+
+/*
+ * Is a reschedule pending?
+ *
+ * b1nix exposes no such flag, and the two possible constants are not
+ * equivalent: answering "no" means a driver's long loop never yields
+ * voluntarily, which on a kernel that does not preempt ring 0 cooperatively is
+ * a hang. So this answers "yes", and every caller yields once per iteration —
+ * slower than upstream, and it cannot wedge.
+ */
+int lkpi_need_resched(void) { return 1; }
+
+/* The reclaim thread identifies itself by name: kswapd is created with it in
+ * pmm.c, and a driver's shrinker only needs to know whether it is being called
+ * from inside reclaim. */
+int lkpi_is_kswapd(void)
+{
+	struct task *t = current_task;
+	return t && strcmp(t->name, "kswapd") == 0;
 }

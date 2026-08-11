@@ -11,8 +11,9 @@
 #include <lkpi/scatterlist.h>
 #include <string.h>
 
-int sg_alloc_table(struct sg_table *sgt, u32 max_ents)
+int sg_alloc_table(struct sg_table *sgt, u32 max_ents, u32 gfp)
 {
+	(void)gfp; /* see the note in <lkpi/scatterlist.h> */
 	if (!sgt || max_ents == 0)
 		return -EINVAL;
 	memset(sgt, 0, sizeof(*sgt));
@@ -59,6 +60,13 @@ int sg_append(struct sg_table *sgt, u64 phys, u32 offset, u32 length)
 	sg->phys = phys;
 	sg->offset = offset;
 	sg->length = length;
+	/* This entry ends the table until another is appended after it. Moving the
+	 * marker rather than setting it once at the end keeps the table walkable at
+	 * every point during construction, which is what a caller that appends and
+	 * then fails partway leaves behind. */
+	sg->end = 1;
+	if (sgt->nents > 1)
+		sgt->sgl[sgt->nents - 2].end = 0;
 	sgt->total_bytes += length;
 	return 0;
 }
@@ -68,7 +76,7 @@ int sg_alloc_table_from_pages(struct sg_table *sgt, const u64 *frames,
 {
 	if (!sgt || !frames || nframes == 0)
 		return -EINVAL;
-	int rc = sg_alloc_table(sgt, nframes);
+	int rc = sg_alloc_table(sgt, nframes, 0);
 	if (rc < 0)
 		return rc;
 	for (u32 i = 0; i < nframes; i++) {

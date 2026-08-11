@@ -46,16 +46,36 @@ struct xarray {
 	u32 height;   /* levels below the root; 0 means the array is empty */
 	usize count;  /* entries stored */
 	volatile int lock; /* a b1nix spinlock; opaque here, see <lkpi/lock.h> */
+	/* Lowest index xa_alloc() will hand out. 0, or 1 for an array created
+	 * with XA_FLAGS_ALLOC1 — some callers treat 0 as "no id". */
+	u32 alloc_base;
 };
 
+/*
+ * Creation flags and the allocating range, declared here rather than in
+ * <linux/xarray.h> because xa_init_flags() and xa_alloc() below take them and
+ * this is the header that declares those. The lock flavours are inert: this
+ * array locks internally and the caller does not choose.
+ */
+#define XA_FLAGS_LOCK_IRQ  (1u << 0)
+#define XA_FLAGS_LOCK_BH   (1u << 1)
+#define XA_FLAGS_ALLOC     (1u << 2)
+#define XA_FLAGS_ALLOC1    (1u << 3)
+
+struct xa_limit { u32 min; u32 max; };
+
 void xa_init(struct xarray *xa);
+void xa_init_flags(struct xarray *xa, unsigned int flags);
 
 /* Free every node. Stored pointers belong to the caller and are not touched. */
 void xa_destroy(struct xarray *xa);
 
 /* Returns 0, or -ENOMEM if a node could not be allocated. Storing NULL erases.
  * Replacing an existing entry is not an error. */
-int xa_store(struct xarray *xa, u64 index, void *entry);
+int lkpi_xa_store(struct xarray *xa, u64 index, void *entry);
+/* The name b1nix's own code uses. <linux/xarray.h> redefines it as a macro
+ * that also accepts upstream's gfp argument. */
+#define xa_store lkpi_xa_store
 
 /* The stored pointer, or NULL. */
 void *xa_load(struct xarray *xa, u64 index);
@@ -67,6 +87,9 @@ void *xa_erase(struct xarray *xa, u64 index);
 int xa_empty(struct xarray *xa);
 
 usize xa_count(struct xarray *xa);
+
+/* Largest index the tree can currently address. */
+u64 lkpi_xa_max_index(struct xarray *xa);
 
 /*
  * Walk every entry in ascending index order. The callback returns 0 to keep

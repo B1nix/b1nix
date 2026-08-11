@@ -13,4 +13,12 @@ static inline void *kmap_atomic(struct page *p) { return page_address(p); }
 static inline void kunmap_atomic(const void *addr) { (void)addr; }
 static inline void *kmap(struct page *p) { return page_address(p); }
 static inline void kunmap(struct page *p) { (void)p; }
+
+
+/* Map a page with a chosen protection. Every page is in the direct map here, so
+ * the mapping already exists and the protection is the direct map's — a caller
+ * asking for write-combining on a temporary mapping gets cached instead, which
+ * is slower for a bulk copy and not wrong. */
+#define kmap_local_page_prot(page, prot) ({ (void)(prot); kmap_local_page(page); })
+
 #endif

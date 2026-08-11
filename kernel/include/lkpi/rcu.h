@@ -103,7 +103,43 @@ void rcu_init(void);
 #define rcu_dereference_protected(slot, cond) \
 	((void)(cond), __atomic_load_n(&(slot), __ATOMIC_RELAXED))
 #define rcu_dereference_raw(slot) rcu_dereference(slot)
-#define rcu_replace_pointer(slot, ptr, cond) \
-	((void)(cond), rcu_assign_pointer(slot, ptr))
+#define rcu_replace_pointer(slot, ptr, cond)                        \
+	({                                                              \
+		typeof(slot) __old = (slot);                                \
+		(void)(cond);                                               \
+		rcu_assign_pointer(slot, ptr);                              \
+		__old;                                                      \
+	})
+
+
+/*
+ * Publishing and reading a pointer under RCU.
+ *
+ * The barriers are the whole content: the writer must not let the store of the
+ * pointer be seen before the stores that initialised what it points at, and the
+ * reader must not let the load of the target be hoisted above the load of the
+ * pointer. Both are real here, not decoration — b1nix runs SMP with a weakly
+ * ordered compiler even where x86 gives ordering for free.
+ */
+#define rcu_dereference(p)        __atomic_load_n(&(p), __ATOMIC_CONSUME)
+#define rcu_dereference_raw(p)    rcu_dereference(p)
+#define rcu_dereference_protected(p, c) ({ (void)(c); (p); })
+/* Reading only to compare or to test for NULL: no dereference follows, so no
+ * ordering is needed, and saying so keeps the distinction upstream draws. */
+#define rcu_access_pointer(p)     __atomic_load_n(&(p), __ATOMIC_RELAXED)
+#define rcu_assign_pointer(p, v)  __atomic_store_n(&(p), (v), __ATOMIC_RELEASE)
+/* Initialising a pointer nobody can be reading yet — no release needed, and
+ * upstream keeps the separate name so that claim stays visible at the call. */
+#define RCU_INIT_POINTER(p, v)    do { (p) = (v); } while (0)
+
+
+/* Free after a grace period. b1nix's synchronize_rcu is a real wait (see the
+ * proof in the M101 self-test), so this frees synchronously after it rather
+ * than queueing a callback — which is slower for the caller and identical in
+ * effect. It must therefore not be called from a context that cannot sleep,
+ * and neither may the queueing form upstream, so the constraint is not new. */
+#define kfree_rcu(ptr, rcu_member) \
+	do { synchronize_rcu(); lkpi_kfree(ptr); } while (0)
+#define kvfree_rcu(ptr, rcu_member) kfree_rcu(ptr, rcu_member)
 
 #endif

@@ -25,4 +25,11 @@
 #define PATH_MAX  4096
 #define NAME_MAX  255
 #define PAGE_SIZE_LINUX 4096
+
+#define USHRT_MAX U16_MAX
+#define SHRT_MAX  S16_MAX
+#define SHRT_MIN  S16_MIN
+#define UCHAR_MAX U8_MAX
+#define CHAR_MAX  S8_MAX
+
 #endif

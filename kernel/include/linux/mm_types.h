@@ -28,6 +28,11 @@ struct vm_fault {
 	unsigned long address;
 	unsigned long pgoff;
 	struct page *page;
+	/* Why the fault was taken and what the handler may do about it. b1nix's
+	 * fault path takes no fault under a lock it might have to drop, so the
+	 * retry flags are never set — a handler that tests them sees the
+	 * blocking case, which is the one it is allowed to take. */
+	unsigned int flags;
 };
 
 struct vm_operations_struct {

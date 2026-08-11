@@ -324,3 +324,83 @@ int xa_for_each(struct xarray *xa, xa_iter_fn fn, void *data)
 	 * caller error, as the header says. */
 	return xa_walk(xa->root, xa->height, 0, fn, data);
 }
+
+/*
+ * xa_init() with creation flags.
+ *
+ * The lock flavours are inert — the array locks internally — and the
+ * allocating flavours only change where xa_alloc() starts looking, which is
+ * recorded so it does. Everything else about the array is the same.
+ */
+void xa_init_flags(struct xarray *xa, unsigned int flags)
+{
+	xa_init(xa);
+	if (xa)
+		xa->alloc_base = (flags & XA_FLAGS_ALLOC1) ? 1u : 0u;
+}
+
+/*
+ * The next present entry at or above *index.
+ *
+ * Re-descends from the root on every call rather than holding a cursor, which
+ * is what makes erasing inside a walk safe here where upstream's batched cursor
+ * would be left pointing into a freed node. The cost is a lookup per step
+ * instead of an increment.
+ */
+void *xa_find_next(struct xarray *xa, u64 *index)
+{
+	if (!xa || !index)
+		return 0;
+	for (;;) {
+		void *e = xa_load(xa, *index);
+		if (e)
+			return e;
+		if (*index == (u64)-1)
+			return 0;
+		/* Nothing here; the array is sparse, so step and retry. The bound is
+		 * the largest index the tree can hold at its current height — beyond
+		 * that there is nothing to find. */
+		if (*index >= lkpi_xa_max_index(xa))
+			return 0;
+		(*index)++;
+	}
+}
+
+/* Largest index the tree can currently address. Above it every load misses, so
+ * a walk that has passed it is finished. */
+u64 lkpi_xa_max_index(struct xarray *xa)
+{
+	if (!xa || xa->height == 0)
+		return 0;
+	return (xa->height * XA_SHIFT >= 64)
+	       ? (u64)-1
+	       : (1ull << (xa->height * XA_SHIFT)) - 1;
+}
+
+/*
+ * Store at the first free index in [limit.min, limit.max], reporting it.
+ *
+ * A linear search from the allocating base. That is O(n) in the number of
+ * entries where upstream's marks free space in the tree — acceptable because
+ * the callers here allocate context and engine ids, which number in the tens.
+ */
+int xa_alloc(struct xarray *xa, u32 *id, void *entry, struct xa_limit limit,
+             gfp_t gfp)
+{
+	u64 i;
+
+	(void)gfp;
+	if (!xa || !id)
+		return -EINVAL;
+	for (i = limit.min > xa->alloc_base ? limit.min : xa->alloc_base;
+	     i <= limit.max; i++) {
+		if (xa_load(xa, i))
+			continue;
+		int err = xa_store(xa, i, entry);
+		if (err)
+			return err;
+		*id = (u32)i;
+		return 0;
+	}
+	return -ENOSPC;
+}

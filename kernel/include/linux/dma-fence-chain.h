@@ -34,4 +34,9 @@ void dma_fence_chain_init(struct dma_fence_chain *chain, struct dma_fence *prev,
 /* Find the fence in a chain that covers `seqno`. Declared with the rest of the
  * timeline syncobj surface; walked when the ioctls that build chains land. */
 int dma_fence_chain_find_seqno(struct dma_fence **pfence, u64 seqno);
+
+/* The ops a chain node carries. Named because imported code compares a fence's
+ * ops against them to recognise a chain. */
+extern const struct dma_fence_ops dma_fence_chain_ops;
+
 #endif

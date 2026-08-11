@@ -12,4 +12,5 @@ typedef u32 acpi_status;
 #define AE_NOT_FOUND 5
 static inline bool acpi_disabled_stub(void) { return true; }
 #define ACPI_HANDLE(dev) ((acpi_handle)0)
+
 #endif

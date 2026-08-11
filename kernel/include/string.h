@@ -22,4 +22,8 @@ char *strdup(const char *s);
 char *strtok(char *str, const char *delim);
 char *strstr(const char *haystack, const char *needle);
 
+
+size_t strnlen(const char *s, size_t maxlen);
+size_t strlcat(char *dst, const char *src, size_t size);
+
 #endif

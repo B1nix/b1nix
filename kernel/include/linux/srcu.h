@@ -27,4 +27,9 @@ static inline void srcu_read_unlock(struct srcu_struct *s, int idx)
 
 static inline void synchronize_srcu(struct srcu_struct *s)
 { (void)s; synchronize_rcu(); }
+
+/* Same reasoning as synchronize_rcu_expedited(): there is no slower path here
+ * for the expedited form to be faster than. */
+#define synchronize_srcu_expedited(sp) synchronize_srcu(sp)
+
 #endif

@@ -79,8 +79,11 @@ u64 dma_addressable_limit(void)
 	return DIRECT_MAP_SIZE;
 }
 
-void *dma_alloc_coherent(usize size, dma_addr_t *dma_handle)
+void *dma_alloc_coherent(struct device *dev, usize size,
+                         dma_addr_t *dma_handle, u32 gfp)
 {
+	(void)dev;
+	(void)gfp; /* see the note in <lkpi/dma-mapping.h> */
 	if (size == 0)
 		return 0;
 	usize frames = (size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -94,8 +97,10 @@ void *dma_alloc_coherent(usize size, dma_addr_t *dma_handle)
 	return cpu;
 }
 
-void dma_free_coherent(usize size, void *cpu_addr, dma_addr_t dma_handle)
+void dma_free_coherent(struct device *dev, usize size, void *cpu_addr,
+                       dma_addr_t dma_handle)
 {
+	(void)dev;
 	if (!cpu_addr || size == 0)
 		return;
 	usize frames = (size + PAGE_SIZE - 1) / PAGE_SIZE;

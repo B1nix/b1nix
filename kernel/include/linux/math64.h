@@ -80,4 +80,12 @@ static inline u64 DIV_ROUND_UP_ULL(u64 n, u32 d)
 	return d ? (n + d - 1) / d : 0;
 }
 
+
+/* Rounding division on 64-bit operands. Written with the divisor subtracted
+ * first so the numerator cannot overflow on the way up, which is the whole
+ * reason upstream has a macro rather than the obvious expression. */
+#define DIV64_U64_ROUND_UP(ll, d)     ({ u64 _d = (d); div64_u64((ll) + _d - 1, _d); })
+#define DIV64_U64_ROUND_CLOSEST(ll, d) ({ u64 _d = (d); div64_u64((ll) + _d / 2, _d); })
+#define DIV_ROUND_UP_ULL(ll, d)       DIV64_U64_ROUND_UP(ll, d)
+
 #endif

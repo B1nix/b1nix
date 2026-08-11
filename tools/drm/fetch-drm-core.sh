@@ -76,6 +76,15 @@ tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
 	"linux-${LINUX_VERSION}/drivers/gpu/drm/*.c" \
 	"linux-${LINUX_VERSION}/drivers/gpu/drm/*.h"
 
+# The display helpers (DisplayPort, DSC, HDCP, SCDC, HDMI) and TTM. Both are
+# separate modules upstream — drm_display_helper.ko and ttm.ko — and both are
+# MIT in their own right, so they are imported rather than reimplemented. i915
+# does not build without either: every DP link is trained through the first and
+# every memory region is managed by the second.
+tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
+	"linux-${LINUX_VERSION}/drivers/gpu/drm/display" \
+	"linux-${LINUX_VERSION}/drivers/gpu/drm/ttm"
+
 # Two more pieces the core needs that are MIT in their own right and therefore
 # imported rather than reimplemented: the HDMI infoframe library (linux/hdmi.h +
 # drivers/video/hdmi.c, "Permission is hereby granted, free of charge...") and
@@ -117,6 +126,32 @@ tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/Makefile" |
 	grep -oE 'drm_[a-z0-9_]+\.o' |
 	sed 's/\.o$/.c/' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
 
+# drm_display_helper-y and ttm-y, from the same Makefiles, for the same reason.
+tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/display/Makefile" |
+	sed -e :a -e '/\\$/N; s/\\\n//; ta' |
+	grep -E '^drm_display_helper-(y|\$\(CONFIG_DRM_DISPLAY_(DP|HDCP|HDMI)_HELPER\))' |
+	grep -oE 'drm_[a-z0-9_]+\.o' |
+	sed -e 's/\.o$/.c/' -e 's|^|display/|' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
+tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/ttm/Makefile" |
+	sed -e :a -e '/\\$/N; s/\\\n//; ta' |
+	grep -E '^ttm-y' |
+	grep -oE 'ttm_[a-z0-9_]+\.o' |
+	sed -e 's/\.o$/.c/' -e 's|^|ttm/|' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
+# Two files upstream builds only under a CONFIG that i915 selects: the buddy
+# allocator its memory regions are built on, and the DSI host interface its
+# panel code speaks. They are staged already — they sit in drivers/gpu/drm —
+# but they are not in drm-y, so they are named here rather than discovered at
+# link time.
+#
+# drm_panel.c is deliberately NOT here. It is the CONFIG_DRM_PANEL abstraction
+# for panels described by device tree, and <drm/drm_panel.h> defines its own
+# entry points as inline stubs when that option is off — so building the .c file
+# too is a redefinition, not a missing symbol. i915 drives its panels natively
+# and references none of it.
+printf '%s\n' drm_buddy.c drm_mipi_dsi.c >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
 # hdmi.c is not in either list — upstream builds it alongside the video helpers —
 # but the core links against its infoframe helpers, so it is part of what has to
 # be built here.
@@ -129,7 +164,8 @@ cat > "$STAGE_DIR.tmp/B1NIX-IMPORT" <<EOF
 source: linux-${LINUX_VERSION}
 sha256: ${LINUX_SHA256}
 url:    ${URL}
-staged: drivers/gpu/drm/*.[ch], include/drm, include/uapi/drm,
+staged: drivers/gpu/drm/*.[ch], drivers/gpu/drm/{display,ttm},
+        include/drm, include/uapi/drm,
         include/linux/hdmi.h, include/video/nomodeset.h,
         drivers/video/{hdmi,nomodeset}.c  (all MIT)
 rule:   imported source is never edited; fixes belong in kernel/lkpi.

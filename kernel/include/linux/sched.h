@@ -36,4 +36,79 @@ static inline int wake_up_process(void *task) { (void)task; return 0; }
 
 static inline int sched_set_fifo(void *task) { (void)task; return -EINVAL; }
 static inline int sched_set_fifo_low(void *task) { (void)task; return -EINVAL; }
+
+/* Sleeping for a fixed time with no wakeup to wait for. Uninterruptible here is
+ * not a weaker promise than upstream's: b1nix kernel threads are not signal
+ * targets, so no sleep in this file can be cut short. */
+static inline long schedule_timeout_uninterruptible(long timeout)
+{ return schedule_timeout(timeout); }
+static inline long schedule_timeout_interruptible(long timeout)
+{ return schedule_timeout(timeout); }
+static inline long schedule_timeout_killable(long timeout)
+{ return schedule_timeout(timeout); }
+
+
+/*
+ * An assertion that the caller is somewhere it may sleep.
+ *
+ * Upstream's checks the current context and complains loudly when a sleeping
+ * function is reached from an atomic one — the class of bug that otherwise
+ * shows up as a deadlock under load. b1nix knows the same fact
+ * (lkpi_can_block), so this is a real check rather than a no-op: it reports
+ * through the same log a caller would look at.
+ */
+void lkpi_might_sleep(const char *where);
+#define might_sleep() lkpi_might_sleep(__func__)
+#define might_sleep_if(cond) do { if (cond) might_sleep(); } while (0)
+
+
+/* Whether a sleep should be cut short by a pending signal. b1nix kernel threads
+ * are not signal targets, so nothing interrupts one and the answer is always
+ * no — which is why every wait_event_interruptible here returns 0. */
+static inline int signal_pending_state(unsigned int state, void *task)
+{ (void)state; (void)task; return 0; }
+/* signal_pending is already defined above. */
+
+
+/* An assertion that this context may allocate. GFP_ATOMIC never sleeps, so it
+ * is always allowed; anything else may, and is checked the same way a sleeping
+ * call is. */
+#define might_alloc(gfp) do { if (!((gfp) & __GFP_ATOMIC)) might_sleep(); } while (0)
+
+
+/* Yield if something else is waiting. b1nix's scheduler is preemptive, so a
+ * long loop is not starving anyone — but the yield is real rather than empty,
+ * because these sit in loops that walk thousands of pages and letting a higher
+ * priority task in is the whole point. */
+/* cond_resched is defined above. This is the form that drops a lock across the
+ * yield — the lock is what makes it necessary, since yielding while holding one
+ * is how a long walk blocks everything else on the same object. */
+#define cond_resched_lock(lock) \
+	({ spin_unlock(lock); cond_resched(); spin_lock(lock); 0; })
+
+
+/* Is a reschedule pending on this CPU? b1nix sets the flag from the timer tick;
+ * this reads it. */
+bool need_resched(void);
+
+#define TASK_NORMAL (TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE)
+
+/* Sleep with the "this task is waiting on I/O" accounting. b1nix's scheduler
+ * keeps no iowait accounting, so this is the plain timed sleep — the wait is
+ * the same length, it is simply not attributed. */
+long io_schedule_timeout(long timeout);
+
+/*
+ * A reference to a task's pid object.
+ *
+ * Declared and deliberately not defined. b1nix identifies tasks by their struct
+ * task pointer and pid number; there is no separate refcounted pid object that
+ * outlives the task, which is the whole point of upstream's — it lets a driver
+ * hold a task identity safely after the task exits. Returning the raw pid would
+ * hand back something that can be recycled under the holder.
+ */
+enum pid_type { PIDTYPE_PID, PIDTYPE_TGID, PIDTYPE_PGID, PIDTYPE_SID, PIDTYPE_MAX };
+struct pid;
+struct pid *get_task_pid(struct lkpi_task *task, enum pid_type type);
+
 #endif

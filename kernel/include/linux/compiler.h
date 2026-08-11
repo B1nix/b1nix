@@ -51,4 +51,46 @@
 #define READ_ONCE(x)      (*(const volatile __typeof__(x) *)&(x))
 #define WRITE_ONCE(x, val) (*(volatile __typeof__(x) *)&(x) = (val))
 
+
+/* One iteration of a spin loop. Not just a pause instruction here: b1nix
+ * services TLB shootdowns from this path, so a CPU spinning without it can
+ * leave the CPU that sent one waiting forever. Declared rather than inlined
+ * because the servicing lives on b1nix's side of the boundary. */
+void lkpi_cpu_relax(void);
+static inline void cpu_relax(void) { lkpi_cpu_relax(); }
+
+
+/*
+ * Sparse's lock annotations.
+ *
+ * Upstream writes `__acquires(lock)` on a function that returns holding a lock
+ * and `__releases(lock)` on one that returns having dropped it, so a static
+ * checker can find the paths that do neither. Nothing here runs sparse, so they
+ * carry no meaning — but they sit between the declarator and the body, so
+ * leaving them undefined is a syntax error rather than a missing check.
+ */
+#ifndef __acquires
+#define __acquires(x)
+#define __releases(x)
+#define __acquire(x)   (void)0
+#define __release(x)   (void)0
+#define __must_hold(x)
+#define __cond_lock(x, c) (c)
+#endif
+
+
+/* The attribute that makes a surviving call a build error, naming the failed
+ * assertion. Clang and GCC both spell it this way. */
+#ifndef __compiletime_error
+#define __compiletime_error(msg) __attribute__((__error__(msg)))
+#endif
+
+
+/* Do two expressions have the same type? Used by the container_of family and by
+ * the array-size guard, where the point is to reject a pointer that decayed
+ * from an array. */
+#ifndef __same_type
+#define __same_type(a, b) __builtin_types_compatible_p(__typeof__(a), __typeof__(b))
+#endif
+
 #endif

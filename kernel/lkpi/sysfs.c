@@ -628,3 +628,71 @@ void lkpi_selftest_uevent_device_del(void)
 		g_probe_class = 0;
 	}
 }
+
+/*
+ * The value-backed debugfs creators.
+ *
+ * Each publishes a file whose contents are one variable. b1nix's debugfs serves
+ * an attribute through a show callback, and the variable is what that callback
+ * would render — so the entry is created against the same registry as the rest
+ * and reads the live value.
+ */
+struct dentry *debugfs_create_bool(const char *name, umode_t mode,
+                                   struct dentry *parent, bool *value)
+{
+	return debugfs_create_file(name, mode, parent, value, 0);
+}
+
+struct dentry *debugfs_create_u32(const char *name, umode_t mode,
+                                  struct dentry *parent, u32 *value)
+{
+	return debugfs_create_file(name, mode, parent, value, 0);
+}
+
+struct dentry *debugfs_create_atomic_t(const char *name, umode_t mode,
+                                       struct dentry *parent, atomic_t *value)
+{
+	return debugfs_create_file(name, mode, parent, value, 0);
+}
+
+/*
+ * A single attribute, outside any group.
+ *
+ * b1nix's sysfs publishes attributes through a directory, which is what a group
+ * already is — so this builds a one-entry group on the stack and publishes that.
+ * The attribute is the caller's, so the array is a temporary and the publish
+ * copies what it needs.
+ */
+int sysfs_create_file(struct kobject *kobj, const struct attribute *attr)
+{
+	const struct attribute *attrs[2] = { attr, 0 };
+	struct attribute_group grp = { 0 };
+
+	if (!kobj || !attr)
+		return -EINVAL;
+	grp.attrs = (struct attribute **)(void *)attrs;
+	return sysfs_create_group(kobj, &grp);
+}
+
+int sysfs_create_files(struct kobject *kobj, const struct attribute * const *ptr)
+{
+	usize i;
+
+	if (!ptr)
+		return 0;
+	for (i = 0; ptr[i]; i++) {
+		int rc = sysfs_create_file(kobj, ptr[i]);
+
+		if (rc)
+			return rc;
+	}
+	return 0;
+}
+
+void sysfs_remove_file(struct kobject *kobj, const struct attribute *attr)
+{
+	/* b1nix's sysfs removes a directory as a unit — there is no per-attribute
+	 * removal — so a single attribute stays until its kobject goes. It is
+	 * inert either way: reading it calls the same show(). */
+	(void)kobj; (void)attr;
+}

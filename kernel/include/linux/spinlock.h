@@ -58,4 +58,60 @@ static inline int spin_trylock(spinlock_t *l) { lkpi_spin_lock(l); return 1; }
 
 #define assert_spin_locked(l)        do { (void)(l); } while (0)
 
+
+/* Decrement, and take the lock only if the count reached zero. The point is
+ * that the lock is not taken on the common path — the caller only needs it to
+ * tear the object down, and taking it every time would serialise every put. */
+#define atomic_dec_and_lock_irqsave(atom, lock, flags)        \
+	({                                                        \
+		int __z = atomic_dec_and_test(atom);                  \
+		(void)(flags);                                        \
+		if (__z)                                              \
+			spin_lock(lock);                                  \
+		__z;                                                  \
+	})
+#define atomic_dec_and_lock(atom, lock)                       \
+	({                                                        \
+		int __z = atomic_dec_and_test(atom);                  \
+		if (__z)                                              \
+			spin_lock(lock);                                  \
+		__z;                                                  \
+	})
+
+/* Interrupt control, spelled the way imported code asks for it. b1nix's own
+ * primitives are the crossing point — see <lkpi/env.h>. */
+static inline void local_irq_disable(void) { (void)lkpi_irq_save(); }
+static inline void local_irq_enable(void) { lkpi_irq_restore(1); }
+#define local_irq_save(flags)    do { (flags) = lkpi_irq_save(); } while (0)
+#define local_irq_restore(flags) lkpi_irq_restore(flags)
+
+
+/* Trylock flavours. b1nix's spinlock has no non-blocking acquire — see
+ * spin_trylock() above, which acquires and reports success — so these acquire
+ * too. A caller that used the failure path as a fast bail simply always takes
+ * the slow path; it never proceeds believing it holds a lock it does not. */
+#define spin_trylock_irq(l)          spin_trylock(l)
+#define spin_trylock_irqsave(l, f)   ({ (f) = 0; spin_trylock(l); })
+#define spin_trylock_bh(l)           spin_trylock(l)
+
+/* Lockdep nesting subclasses. There is no lockdep here, so the subclass is
+ * inert and the lock is taken exactly as the unsuffixed form would. */
+#define spin_lock_nested(l, sub)             do { (void)(sub); spin_lock(l); } while (0)
+#define spin_lock_irqsave_nested(l, f, sub)  do { (void)(sub); spin_lock_irqsave(l, f); } while (0)
+
+#include <linux/refcount.h>
+/* Drop a reference and, if it was the last, return holding the lock — so the
+ * caller can tear down under it without a window where the count is zero and
+ * the lock is not held. b1nix's spinlock has no non-blocking acquire, so the
+ * lock is taken first and released again when the count did not reach zero. */
+static inline bool refcount_dec_and_lock_irqsave(refcount_t *r, spinlock_t *lock,
+                                                 unsigned long *flags)
+{
+	spin_lock_irqsave(lock, *flags);
+	if (refcount_dec_and_test(r))
+		return true;
+	spin_unlock_irqrestore(lock, *flags);
+	return false;
+}
+
 #endif

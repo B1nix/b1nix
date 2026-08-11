@@ -27,6 +27,15 @@ struct scatterlist {
 	 * the run; different when the run had to be bounced (see
 	 * dma_map_sg_masked). Meaningless before the table is mapped. */
 	dma_addr_t dma_address;
+	/* 1 on the entry that ends the table.
+	 *
+	 * b1nix builds tables whole and walks them by index, so nothing here needs
+	 * it. Imported drivers do: i915 iterates with `sg_is_last(sg) ? NULL :
+	 * sg + 1` and never sees the table, so the entry itself has to know. The
+	 * flag is maintained by sg_append rather than left to callers — a table
+	 * whose last entry did not say so would be walked one entry past its end,
+	 * which is a use-after-free, not a wrong answer. */
+	u32 end;
 };
 
 struct sg_table {
@@ -37,7 +46,11 @@ struct sg_table {
 };
 
 /* Allocate a table able to hold `max_ents` entries. Returns 0 or -ENOMEM. */
-int sg_alloc_table(struct sg_table *sgt, u32 max_ents);
+/* `gfp` is the allocation flags upstream callers pass. b1nix's heap has one
+ * behaviour and no flag changes it, so it is accepted and ignored — recorded
+ * here rather than dropped from the signature, because every imported caller
+ * passes it. */
+int sg_alloc_table(struct sg_table *sgt, u32 max_ents, u32 gfp);
 void sg_free_table(struct sg_table *sgt);
 
 /* Append one physical run, coalescing with the previous entry when the two are

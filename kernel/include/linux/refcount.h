@@ -25,4 +25,9 @@ static inline bool refcount_inc_not_zero(refcount_t *r)
 static inline bool refcount_dec_and_test(refcount_t *r)
 { return __atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL) == 0; }
 static inline void refcount_dec(refcount_t *r) { __atomic_fetch_sub(&r->refs, 1, __ATOMIC_RELAXED); }
+
+/* refcount_dec_and_lock_irqsave() needs both a refcount and a spinlock; it
+ * lives in <linux/spinlock.h>, which is the one of the two that may include the
+ * other without a cycle. */
+
 #endif

@@ -58,6 +58,25 @@ void dma_fence_chain_free(struct dma_fence_chain *chain)
 	lkpi_kfree(chain);
 }
 
+/*
+ * The ops a chain link carries.
+ *
+ * Their only job here is identity: imported code recognises a chain by
+ * comparing fence->ops against this table, which is why the table has to exist
+ * and has to be the one every link points at. The names are what a diagnostic
+ * prints.
+ */
+static const char *chain_driver_name(struct dma_fence *fence)
+{ (void)fence; return "dma_fence_chain"; }
+
+static const char *chain_timeline_name(struct dma_fence *fence)
+{ (void)fence; return "unbound"; }
+
+const struct dma_fence_ops dma_fence_chain_ops = {
+	.get_driver_name = chain_driver_name,
+	.get_timeline_name = chain_timeline_name,
+};
+
 void dma_fence_chain_init(struct dma_fence_chain *chain, struct dma_fence *prev,
                           struct dma_fence *fence, u64 seqno)
 {
@@ -72,6 +91,9 @@ void dma_fence_chain_init(struct dma_fence_chain *chain, struct dma_fence *prev,
 	 * meaningless against each other. */
 	u64 context = prev ? prev->context : dma_fence_context_alloc(1);
 	dma_fence_init_named(&chain->base, context, seqno, "chain");
+	/* Set after init, which zeroes the fence: this is what to_dma_fence_chain's
+	 * callers test to tell a chain link from any other fence. */
+	chain->base.ops = &dma_fence_chain_ops;
 }
 
 struct dma_fence *dma_fence_chain_walk(struct dma_fence *fence)

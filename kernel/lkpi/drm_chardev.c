@@ -102,7 +102,7 @@ int lkpi_drm_open(u32 minor, u32 flags, void **out_file)
 	filp->f_inode = inode;
 	filp->f_flags = (flags & LKPI_DRM_O_NONBLOCK) ? O_NONBLOCK : 0;
 	filp->f_mode = FMODE_READ | ((flags & LKPI_DRM_O_WRITE) ? FMODE_WRITE : 0);
-	filp->f_count = 1;
+	atomic64_set(&filp->f_count, 1);
 
 	ret = drm_open(inode, filp);
 	if (ret) {

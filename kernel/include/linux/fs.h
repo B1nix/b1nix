@@ -35,7 +35,7 @@ struct file {
 	 * records it — distinct from f_flags, which carries the open mode. */
 	fmode_t f_mode;
 	/* References to this file. The last put runs the driver's release. */
-	volatile int f_count;
+	atomic_long_t f_count;
 	/* The b1nix handle this file is installed behind, once a descriptor has
 	 * been assigned. NULL before fd_install. */
 	void *f_handle;
@@ -63,6 +63,7 @@ struct inode {
 	umode_t i_mode;
 	void *i_private;
 	struct address_space *i_mapping;
+	loff_t i_size;
 };
 
 /* Duplicate an open file with new flags. Needs the VFS bridge; declared so the
@@ -147,4 +148,75 @@ static inline unsigned int imajor(const struct inode *inode)
 
 #define no_llseek NULL
 #define noop_llseek NULL
+
+/* Descriptor and file reference helpers travel with the VFS interface; drivers
+ * call fput without including <linux/file.h> themselves. */
+#include <linux/file.h>
+
+
+/* Calling a file's mmap through its operations table. */
+static inline int call_mmap(struct file *file, struct vm_area_struct *vma)
+{ return (file && file->f_op && file->f_op->mmap) ? file->f_op->mmap(file, vma) : -ENODEV; }
+
+
+#define SB_KERNMOUNT (1 << 22)
+
+/*
+ * Mounting a filesystem from kernel context, for a driver that wants a private
+ * tmpfs instance to back its objects.
+ *
+ * Declared and deliberately not defined. b1nix mounts through its own VFS by
+ * path and has no kernel-internal mount that produces a vfsmount a driver can
+ * hold. i915's gemfs is the only caller and falls back to anonymous pages when
+ * this path is unavailable — but that fallback is chosen at link time here, not
+ * at run time, so the object is left out of the build instead.
+ */
+struct file_system_type;
+struct vfsmount;
+struct file_system_type *get_fs_type(const char *name);
+struct vfsmount *vfs_kern_mount(struct file_system_type *type, int flags,
+                                const char *name, void *data);
+void kern_unmount(struct vfsmount *mnt);
+
+/*
+ * Take a reference to a file read from an RCU-protected pointer.
+ *
+ * Declared and deliberately not defined. The whole point upstream is that the
+ * pointer may be freed concurrently and the refcount bump must fail rather than
+ * resurrect it. b1nix's file table is not RCU-protected — a struct file is freed
+ * as soon as its last descriptor closes — so there is no safe way to implement
+ * this, and a stub that just bumped the count would be a use-after-free wearing
+ * the name of the thing that prevents one.
+ */
+struct file *get_file_rcu(struct file *f);
+
+
+/* The page-cache side of an inode. b1nix's page cache is not reachable from
+ * here — see <linux/pagemap.h> — so this exists for the fields imported code
+ * reads off it, not as a live mapping. */
+struct writeback_control;
+/* What a page cache dispatches through. Nothing here installs one — see the
+ * note on struct address_space — so a driver that calls through it must first
+ * have obtained a mapping, which it cannot. */
+struct folio;
+struct address_space_operations {
+	int (*writepage)(struct page *page, struct writeback_control *wbc);
+	int (*write_begin)(struct file *, struct address_space *mapping,
+	                   loff_t pos, unsigned len, struct page **pagep,
+	                   void **fsdata);
+	int (*write_end)(struct file *, struct address_space *mapping,
+	                 loff_t pos, unsigned len, unsigned copied,
+	                 struct page *page, void *fsdata);
+};
+
+/* The largest offset a file can address. 64-bit only here, so it is the signed
+ * maximum the page-index arithmetic stays inside. */
+#define MAX_LFS_FILESIZE ((loff_t)LLONG_MAX)
+struct address_space {
+	struct inode *host;
+	const struct address_space_operations *a_ops;
+	unsigned long nrpages;
+	gfp_t gfp_mask;
+};
+
 #endif

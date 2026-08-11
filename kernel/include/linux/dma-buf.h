@@ -39,6 +39,12 @@ struct dma_buf_ops {
 	int (*mmap)(struct dma_buf *, struct vm_area_struct *);
 	int (*vmap)(struct dma_buf *, struct iosys_map *);
 	void (*vunmap)(struct dma_buf *, struct iosys_map *);
+	/* Bracketing CPU access to a buffer the GPU also touches. The exporter
+	 * uses them to flush or invalidate caches around the window — which is why
+	 * an importer that skips them reads stale pixels on a non-coherent path,
+	 * and why they belong in the ops table rather than being optional. */
+	int (*begin_cpu_access)(struct dma_buf *, enum dma_data_direction);
+	int (*end_cpu_access)(struct dma_buf *, enum dma_data_direction);
 };
 
 struct dma_buf {

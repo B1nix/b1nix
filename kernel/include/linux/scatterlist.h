@@ -55,4 +55,67 @@ int lkpi_sg_alloc_table_from_page_array(struct sg_table *sgt,
  * types is a conflict, not a convenience. */
 /* Onto lkpi's scatterlists (M99), which already coalesce adjacent runs and
  * carry both the physical address and the device address per entry. */
+
+/*
+ * Chained scatter tables.
+ *
+ * Upstream stores a table longer than one allocation as a chain: the last entry
+ * of a block points at the next block instead of at a page, with the low bits
+ * of `page_link` saying which it is. b1nix's tables carry no such link — they
+ * are allocated whole, and `struct scatterlist` here has no page_link field at
+ * all — so a table built by this kernel is never chained and the last entry is
+ * the one at index nents-1.
+ *
+ * That is what these answer. They are not upstream's bit tests with a field
+ * renamed: there is no encoded bit to test, and inventing one would be claiming
+ * a representation b1nix does not use. A table that genuinely needed chaining
+ * would have to change <lkpi/scatterlist.h> first, and these with it.
+ */
+static inline bool sg_is_chain(struct scatterlist *sg)
+{ (void)sg; return false; }
+static inline struct scatterlist *sg_chain_ptr(struct scatterlist *sg)
+{ (void)sg; return 0; }
+/* The end marker lives in the entry — see <lkpi/scatterlist.h> for why it has
+ * to, and who maintains it. */
+static inline bool sg_is_last(struct scatterlist *sg)
+{ return sg && sg->end; }
+
+
+/* Building a table entry from a page. b1nix's entries carry the frame rather
+ * than a page pointer, so this records the same fact in the form the table
+ * uses; sg_page above is the direction that cannot be answered, and says so. */
+static inline void sg_set_page(struct scatterlist *sg, struct page *page,
+                               unsigned int len, unsigned int offset)
+{
+	sg->phys = page_to_phys(page);
+	sg->offset = offset;
+	sg->length = len;
+	sg->end = 0;
+}
+
+static inline void sg_mark_end(struct scatterlist *sg)
+{ if (sg) sg->end = 1; }
+
+static inline void sg_unmark_end(struct scatterlist *sg)
+{ if (sg) sg->end = 0; }
+
+/* The next entry, or NULL at the end. Entries are contiguous in b1nix's tables
+ * — there is no chaining — so "next" is the neighbouring element. */
+static inline struct scatterlist *sg_next(struct scatterlist *sg)
+{ return (!sg || sg_is_last(sg)) ? 0 : sg + 1; }
+
+
+/* Point an entry at a page without touching its length. Used when a table is
+ * built in two passes — the geometry first, the pages after. */
+static inline void sg_assign_page(struct scatterlist *sg, struct page *page)
+{ if (sg) sg->phys = page_to_phys(page); }
+
+
+/* Point an entry at a folio. One page per folio here — see <linux/mm.h> — so
+ * this is sg_set_page on that page. */
+struct folio;
+static inline void sg_set_folio(struct scatterlist *sg, struct folio *folio,
+                                usize len, usize offset)
+{ sg_set_page(sg, (struct page *)folio, len, offset); }
+
 #endif

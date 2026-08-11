@@ -27,11 +27,24 @@ struct firmware {
 /* Load `name`. On success *fw points at a heap copy owned by the caller until
  * release_firmware(). Returns 0, -ENOENT when no path matched, -ENOMEM, or
  * -EIO on a short read. */
-int request_firmware(const struct firmware **fw, const char *name);
+/* `dev` is the device the blob belongs to. Upstream uses it to build the search
+ * path and to log against the right device; b1nix loads from a fixed path and
+ * logs to the kernel log, so it is recorded and not otherwise used — but it is
+ * in the signature because every caller passes it, and a two-argument version
+ * meant every imported call site was a compile error. */
+struct device;
+int request_firmware(const struct firmware **fw, const char *name,
+                     struct device *dev);
 
 /* Same, but does not log when the blob is missing — for optional firmware. */
-int firmware_request_nowarn(const struct firmware **fw, const char *name);
+int firmware_request_nowarn(const struct firmware **fw, const char *name,
+                            struct device *dev);
 
 void release_firmware(const struct firmware *fw);
+
+
+/* Load without falling back to the userspace helper. There is no helper here —
+ * b1nix loads from the filesystem directly — so this is the ordinary request. */
+#define request_firmware_direct(fw, name, dev) firmware_request_nowarn(fw, name, dev)
 
 #endif

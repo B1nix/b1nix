@@ -49,10 +49,30 @@ struct kobject {
 	const char *subsystem;
 };
 
+/*
+ * The type a kobject is created with. Defined here rather than in
+ * <linux/kobject.h> because kobject_init_and_add() below takes one and this is
+ * the header that declares it; the Linux-named header includes this one.
+ */
+struct sysfs_ops;
+struct attribute_group;
+struct kobj_type {
+	void (*release)(struct kobject *kobj);
+	const struct sysfs_ops *sysfs_ops;
+	const struct attribute_group **default_groups;
+};
+
 /* Initialise with one reference and take one on the parent, so a child cannot
  * outlive its parent's memory. */
-void kobject_init_and_add(struct kobject *kobj, const char *name,
+void lkpi_kobject_init_and_add(struct kobject *kobj, const char *name,
                           struct kobject *parent, kobject_release_t release);
+
+/* Upstream's spelling: the release comes from the type, and the name from a
+ * format string. The formatted name is allocated and owned by the kobject. */
+int kobject_init_and_add(struct kobject *kobj, const struct kobj_type *ktype,
+                         struct kobject *parent, const char *fmt, ...);
+void kobject_init(struct kobject *kobj, const struct kobj_type *ktype);
+int kobject_add(struct kobject *kobj, struct kobject *parent, const char *fmt, ...);
 
 struct kobject *kobject_get(struct kobject *kobj);
 /* Returns 1 if this put released the object. */
@@ -136,5 +156,6 @@ int lkpi_pm_runtime_put_sync(struct lkpi_device *dev);
 /* Current usage count and state, for diagnostics and the self-test. */
 i32 lkpi_pm_runtime_usage(struct lkpi_device *dev);
 int lkpi_pm_runtime_suspended(struct lkpi_device *dev);
+
 
 #endif

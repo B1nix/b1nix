@@ -32,4 +32,31 @@ static inline void write_sequnlock(seqlock_t *sl)
 #define read_seqcount_retry(s, st)  (((st) & 1) || (s)->sequence != (st))
 #define write_seqcount_begin(s)     __atomic_fetch_add(&(s)->sequence, 1, __ATOMIC_ACQ_REL)
 #define write_seqcount_end(s)       __atomic_fetch_add(&(s)->sequence, 1, __ATOMIC_ACQ_REL)
+
+
+/*
+ * A sequence counter whose writers are serialised by a named mutex.
+ *
+ * Upstream's variant exists so lockdep can check that every writer really does
+ * hold the mutex it claims. There is no lockdep here, so the association is not
+ * verified and the counter behaves exactly like the plain one — which is why it
+ * is a typedef of it rather than a copy: two structs that must stay in step is
+ * a way for them not to.
+ */
+typedef seqcount_t seqcount_mutex_t;
+#define seqcount_mutex_init(s, m) do { (void)(m); seqcount_init(s); } while (0)
+#define seqcount_mutex_t_init(s, m) seqcount_mutex_init(s, m)
+
+
+/* The sequence a seqcount currently holds, whatever flavour of seqcount it is.
+ * Upstream needs the indirection because its variants wrap the counter in
+ * different structures; here they are all the same type, so this is a field
+ * read — but the name has to exist because the macros call it. */
+#define seqprop_sequence(s) __atomic_load_n(&(s)->sequence, __ATOMIC_ACQUIRE)
+
+
+/* Force every concurrent reader to retry, without a matching write section:
+ * upstream bumps the sequence by two so the count stays even. Same here. */
+#define write_seqcount_invalidate(s) do { (s)->sequence += 2; } while (0)
+
 #endif

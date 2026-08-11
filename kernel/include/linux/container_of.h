@@ -19,4 +19,9 @@
 
 #define container_of_const(ptr, type, member) container_of(ptr, type, member)
 
+
+/* The type of a struct member, without an instance of the struct. Used where a
+ * macro has to declare a temporary of the same type as the field it moves. */
+#define typeof_member(T, m) __typeof__(((T *)0)->m)
+
 #endif

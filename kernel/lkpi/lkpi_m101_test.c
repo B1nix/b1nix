@@ -1260,7 +1260,7 @@ static void test_pages(void)
 	int ok = 1;
 
 	/* A single page, written through the direct map and read back through it. */
-	struct page *p = alloc_page();
+	struct page *p = lkpi_alloc_page();
 	if (!p || !page_to_phys(p)) {
 		m101_report("pages", 0, 0);
 		return;
@@ -1283,7 +1283,7 @@ static void test_pages(void)
 		ok = 0; /* last put did not free */
 
 	/* A contiguous run really is contiguous — the property alloc_pages sells. */
-	struct page *run = alloc_pages(2);
+	struct page *run = alloc_pages(0, 2);
 	if (!run) {
 		ok = 0;
 	} else {
@@ -1433,8 +1433,8 @@ static void test_device_pm(void)
 	static struct kobject child;
 
 	g_kobj_released_mask = 0;
-	kobject_init_and_add(&parent, "parent", 0, kobj_parent_release);
-	kobject_init_and_add(&child, "child", &parent, kobj_child_release);
+	lkpi_kobject_init_and_add(&parent, "parent", 0, kobj_parent_release);
+	lkpi_kobject_init_and_add(&child, "child", &parent, kobj_child_release);
 
 	if (kobject_depth(&child) != 2 || kobject_depth(&parent) != 1)
 		ok = 0;

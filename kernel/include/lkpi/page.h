@@ -3,6 +3,8 @@
 #define LKPI_PAGE_H
 
 #include <lkpi/types.h>
+/* struct page carries a list head, so the list type has to be complete. */
+#include <linux/list.h>
 
 /* The page size, defined on this side of the boundary so <linux/mm.h> does not
  * have to reach into <b1nix/mm.h> for it. */
@@ -40,14 +42,27 @@ struct page {
 	u64 phys;            /* physical address of the frame */
 	volatile i32 count;  /* references; the frame is freed when it hits 0 */
 	u32 order;           /* set on the head page of an alloc_pages run */
+	/* A word the owner may use for its own bookkeeping. Upstream overloads
+	 * it heavily; here nothing but the owner reads it. */
+	unsigned long private;
+	/* Linkage for whatever list currently owns the page. Upstream's reclaim
+	 * uses it for the LRU; b1nix has no page LRU, so it belongs entirely to
+	 * the allocator or driver holding the page. */
+	struct list_head lru;
 };
 
-/* One page. NULL if no frame was available. */
-struct page *alloc_page(void);
+/* One page. NULL if no frame was available. `gfp` is accepted and ignored for
+ * the same reason as in alloc_pages below. */
+struct page *lkpi_alloc_page(void);
+#define alloc_page(gfp) ({ (void)(gfp); lkpi_alloc_page(); })
 
 /* 2^order physically contiguous pages; returns the head. The array of struct
  * page is contiguous too, so head[i] describes the i-th frame. */
-struct page *alloc_pages(u32 order);
+/* `gfp` is the allocation flags upstream callers pass first. b1nix's allocator
+ * has one behaviour and no flag changes it, so it is accepted and ignored —
+ * kept in the signature because every imported caller passes it, and a
+ * one-argument version made each of those a compile error. */
+struct page *alloc_pages(u32 gfp, u32 order);
 
 void __free_page(struct page *page);
 void __free_pages(struct page *page, u32 order);
@@ -97,4 +112,10 @@ void lkpi_page_init(void);
 /* Pages currently mapped through the vmap window. Diagnostics and self-test. */
 usize lkpi_vmap_pages_mapped(void);
 
+
+/* The window vmap allocates from. Exposed so a caller can tell a vmapped
+ * address from a heap one — the test decides between vfree and kfree, so a
+ * heuristic would free the wrong way round. */
+u64 lkpi_vmap_window_base(void);
+u64 lkpi_vmap_window_size(void);
 #endif

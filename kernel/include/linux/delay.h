@@ -16,4 +16,11 @@ static inline void mdelay(unsigned long ms) { udelay(ms * 1000); }
 static inline void msleep(unsigned int ms) { lkpi_sleep_ticks((ms + 9) / 10); }
 static inline void usleep_range(unsigned long lo, unsigned long hi)
 { (void)hi; udelay(lo); }
+
+/* Sleeping for a number of milliseconds, interruptibly. b1nix kernel threads
+ * are not signal targets, so nothing cuts it short and the return is always 0 —
+ * the "slept the whole time" answer, which is the one callers act on. */
+static inline unsigned long msleep_interruptible(unsigned int msecs)
+{ msleep(msecs); return 0; }
+
 #endif

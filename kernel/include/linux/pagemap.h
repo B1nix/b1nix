@@ -24,4 +24,31 @@ static inline void mapping_clear_unevictable(struct address_space *m) { (void)m;
 
 static inline void mapping_set_gfp_mask(struct address_space *m, gfp_t mask)
 { (void)m; (void)mask; }
+
+/* Flags on a file's page cache that say how its pages may be reclaimed.
+ * b1nix's GEM pages have no address_space behind them — see
+ * <linux/shmem_fs.h> — so there is nothing to mark. */
+#define mapping_set_unevictable(m)   do { (void)(m); } while (0)
+#define mapping_clear_unevictable(m) do { (void)(m); } while (0)
+#define mapping_set_gfp_mask(m, g)   do { (void)(m); (void)(g); } while (0)
+#define mapping_gfp_mask(m)          ({ (void)(m); (gfp_t)0; })
+#define mapping_gfp_constraint(m, g) ({ (void)(m); (g); })
+
+
+/* Find a page-cache page and return it locked. b1nix's page cache is keyed by
+ * (fs_id, ino) and is not reachable from an address_space pointer — see the
+ * note at the top of this header — so this is declared and not defined; a
+ * caller fails to link rather than being told the page is absent when it is
+ * not. */
+struct page *find_lock_page(struct address_space *mapping, unsigned long index);
+
+
+/* Page-cache page locking. b1nix's driver pages are not in a page cache and are
+ * never looked up by index behind the driver's back, so there is no window a
+ * lock would close — these are the operation upstream's callers bracket their
+ * work with, and here the bracket is empty. */
+static inline void lock_page(struct page *page) { (void)page; }
+static inline void unlock_page(struct page *page) { (void)page; }
+static inline int trylock_page(struct page *page) { (void)page; return 1; }
+
 #endif

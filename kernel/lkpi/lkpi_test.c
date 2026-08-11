@@ -214,7 +214,7 @@ static void wq_delayed_handler(struct work_struct *w)
 static void test_workqueue(void)
 {
 	int ok = 1;
-	struct workqueue_struct *wq = alloc_workqueue("lkpi-test");
+	struct workqueue_struct *wq = alloc_workqueue("lkpi-test", 0, 1);
 	if (!wq) {
 		lkpi_report("workqueue", 0, 1);
 		return;
@@ -414,7 +414,7 @@ static void test_dma(void)
 	int ok = 0x1ff;
 	dma_addr_t handle = 0;
 	usize size = 3 * PAGE_SIZE;
-	void *cpu = dma_alloc_coherent(size, &handle);
+	void *cpu = dma_alloc_coherent(0, size, &handle, 0);
 	if (!cpu || !handle) {
 		lkpi_report("dma-mapping", 0, 1);
 		return;
@@ -466,7 +466,7 @@ static void test_dma(void)
 		if (frames[i])
 			pmm_free_frame(frames[i]);
 
-	dma_free_coherent(size, cpu, handle);
+	dma_free_coherent(0, size, cpu, handle);
 	lkpi_report("dma-mapping", ok == 0x1ff, ok ^ 0x1ff);
 }
 
@@ -836,7 +836,7 @@ static void test_firmware(void)
 	}
 
 	const struct firmware *fw = 0;
-	if (request_firmware(&fw, "lkpi-test.bin") != 0 || !fw) {
+	if (request_firmware(&fw, "lkpi-test.bin", 0) != 0 || !fw) {
 		lkpi_report("request-firmware", 0, 3);
 		return;
 	}
@@ -850,7 +850,7 @@ static void test_firmware(void)
 
 	/* A missing blob must report ENOENT rather than an empty success. */
 	const struct firmware *missing = (const struct firmware *)1;
-	if (firmware_request_nowarn(&missing, "definitely-not-here.bin") != -ENOENT ||
+	if (firmware_request_nowarn(&missing, "definitely-not-here.bin", 0) != -ENOENT ||
 	    missing != 0)
 		ok = 0;
 

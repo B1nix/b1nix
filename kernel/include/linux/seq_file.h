@@ -80,4 +80,17 @@ int seq_release(struct inode *inode, struct file *file);
 ssize_t seq_read(struct file *file, char __user *buf, size_t size, loff_t *ppos);
 loff_t seq_lseek(struct file *file, loff_t offset, int whence);
 
+
+/* Did the last write run out of room in the seq buffer? b1nix's seq_file grows
+ * its buffer rather than truncating, so a write never overflows and this is
+ * always false — callers use it to decide to retry with a bigger buffer, which
+ * is a retry that is not needed here. */
+static inline bool seq_has_overflowed(struct seq_file *m) { (void)m; return false; }
+
+/* single_open() with a caller-chosen initial buffer size. b1nix's seq_file
+ * grows on demand, so the size is a hint that changes nothing but the number of
+ * growth steps. */
+int single_open_size(struct file *file, int (*show)(struct seq_file *, void *),
+                     void *data, usize size);
+
 #endif

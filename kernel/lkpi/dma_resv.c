@@ -217,3 +217,4 @@ int dma_resv_get_singleton(struct dma_resv *obj, enum dma_resv_usage usage,
 	*fence = found ? dma_fence_get(found) : 0;
 	return 0;
 }
+

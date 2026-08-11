@@ -57,4 +57,18 @@ void print_hex_dump(const char *level, const char *prefix, int prefix_type,
 
 #define no_printk(fmt, ...) ((void)0)
 
+
+/* Print once and never again, however many times the call is reached. The flag
+ * is per call site, which is what makes it useful for a message a driver would
+ * otherwise emit per device or per frame. */
+#define printk_once(fmt, ...)                                    \
+	do {                                                         \
+		static bool __printed;                                   \
+		if (!__printed) { __printed = true; printk(fmt, ##__VA_ARGS__); } \
+	} while (0)
+#define pr_info_once(fmt, ...)  printk_once(fmt, ##__VA_ARGS__)
+#define pr_warn_once(fmt, ...)  printk_once(fmt, ##__VA_ARGS__)
+#define pr_err_once(fmt, ...)   printk_once(fmt, ##__VA_ARGS__)
+#define pr_notice_once(fmt, ...) printk_once(fmt, ##__VA_ARGS__)
+
 #endif

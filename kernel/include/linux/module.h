@@ -34,4 +34,22 @@ static inline int request_module(const char *fmt, ...) { (void)fmt; return -1; }
 
 #define try_module_get(m) (1)
 #define module_put(m) do { } while (0)
+
+/* The parameter macros travel with the module interface: imported source
+ * includes <linux/module.h> and expects module_param_named_unsafe() and the
+ * rest to come with it. Included last, after this header's own definitions. */
+#include <linux/moduleparam.h>
+
+
+/*
+ * Taking a reference on a symbol exported by another module.
+ *
+ * b1nix links every driver into the kernel; there is no module to hold a
+ * reference on and no symbol table to look one up in. The lookup therefore
+ * reports absence, which is the same answer upstream gives when the other
+ * module is not loaded — and every caller here handles that.
+ */
+#define symbol_get(x) ((typeof(&x))NULL)
+#define symbol_put(x) do { } while (0)
+
 #endif

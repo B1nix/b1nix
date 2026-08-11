@@ -3,7 +3,13 @@
 #define LKPI_WAIT_H
 
 #include <lkpi/env.h>
+#include <linux/list.h>
+#include <lkpi/lock.h>
 #include <lkpi/types.h>
+
+/* <linux/list.h> and <lkpi/lock.h> rather than b1nix's own: this header is
+ * included by imported translation units, which must never see a b1nix header.
+ * Both are ours and MIT — see the boundary note in <lkpi/env.h>. */
 
 /*
  * wait queues — "sleep until this condition holds".
@@ -30,9 +36,50 @@
  * sleep and is safe from an interrupt handler.
  */
 
+/*
+ * Per-waiter entries.
+ *
+ * The queue above wakes every parked task and lets each re-test its predicate,
+ * which is all b1nix's own code has ever needed. Imported drivers need the other
+ * half of Linux's interface: a waiter that is a *callback* rather than a parked
+ * task, linked on the queue, invoked with the wake's key. i915's software fences
+ * are built on it — a fence signals by walking its queue and calling each
+ * entry's function, and the entries are what chain one fence to the next.
+ *
+ * So the shapes are upstream's, down to the member names: imported code walks
+ * `wq->head` with list_for_each_entry and reads `entry`, `flags`, `private` and
+ * `func` directly. Renaming any of them would mean editing that code, which is
+ * the one thing this layer exists not to do.
+ */
+struct wait_queue_entry;
+typedef int (*wait_queue_func_t)(struct wait_queue_entry *wq, unsigned mode,
+                                 int flags, void *key);
+
+struct wait_queue_entry {
+	unsigned int flags;
+	void *private;
+	wait_queue_func_t func;
+	struct list_head entry;
+};
+
+#ifndef LKPI_WAIT_QUEUE_ENTRY_T_DEFINED
+#define LKPI_WAIT_QUEUE_ENTRY_T_DEFINED
+typedef struct wait_queue_entry wait_queue_entry_t;
+#endif
+
+#define WQ_FLAG_EXCLUSIVE 0x01
+#define WQ_FLAG_WOKEN     0x02
+
 struct wait_queue_head {
 	volatile u64 wakeups; /* wake_up calls; diagnostics and self-test */
 	volatile u32 waiters; /* tasks currently parked or about to park */
+	/* Guards `head`. Named `lock` because imported code takes it directly —
+	 * i915's fence code holds it across a walk of the entry list. Spelled as
+	 * the underlying struct rather than `spinlock_t`, which is the name
+	 * <linux/spinlock.h> gives this same type — that header must not be a
+	 * prerequisite of this one. */
+	struct lkpi_spinlock lock;
+	struct list_head head;
 };
 
 #ifndef LKPI_WAIT_QUEUE_HEAD_T_DEFINED
@@ -134,5 +181,27 @@ void lkpi_wait_relax(void);
 			}                                                                  \
 		}                                                                      \
 	} while (0)
+
+
+/* Entry management. add/remove take the queue's lock; the __-prefixed forms
+ * expect the caller to hold it already, which is what imported code does when
+ * it is walking the list at the same time. */
+void add_wait_queue(struct wait_queue_head *wq, struct wait_queue_entry *e);
+void remove_wait_queue(struct wait_queue_head *wq, struct wait_queue_entry *e);
+void __add_wait_queue(struct wait_queue_head *wq, struct wait_queue_entry *e);
+void __add_wait_queue_entry_tail(struct wait_queue_head *wq,
+                                 struct wait_queue_entry *e);
+void __remove_wait_queue(struct wait_queue_head *wq, struct wait_queue_entry *e);
+
+/* Wake the callback entries with a key, as well as the parked tasks. A NULL key
+ * is what plain wake_up passes. */
+void __wake_up(struct wait_queue_head *wq, unsigned mode, int nr, void *key);
+
+static inline void init_waitqueue_entry(struct wait_queue_entry *e, void *task)
+{ e->flags = 0; e->private = task; e->func = 0; INIT_LIST_HEAD(&e->entry); }
+
+static inline void init_waitqueue_func_entry(struct wait_queue_entry *e,
+                                             wait_queue_func_t func)
+{ e->flags = 0; e->private = 0; e->func = func; INIT_LIST_HEAD(&e->entry); }
 
 #endif

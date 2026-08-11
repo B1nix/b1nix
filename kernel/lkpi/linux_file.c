@@ -79,7 +79,7 @@ struct file *anon_inode_getfile(const char *name,
 	f->private_data = priv;
 	f->f_flags = (unsigned int)flags;
 	f->f_mode = FMODE_READ | FMODE_WRITE;
-	f->f_count = 1;
+	atomic64_set(&f->f_count, 1);
 	return f;
 }
 
@@ -87,7 +87,7 @@ void fput(struct file *f)
 {
 	if (!f)
 		return;
-	if (__atomic_sub_fetch(&f->f_count, 1, __ATOMIC_ACQ_REL) != 0)
+	if (atomic64_sub_return(1, &f->f_count) != 0)
 		return;
 
 	/* Last reference: let the owner tear its object down before the file that
@@ -106,7 +106,7 @@ struct file *fget(unsigned int fd)
 	struct file *f = (struct file *)lkpi_handle_private(h);
 	if (!f)
 		return 0;
-	__atomic_fetch_add(&f->f_count, 1, __ATOMIC_ACQ_REL);
+	atomic64_inc(&f->f_count);
 	return f;
 }
 
@@ -132,7 +132,7 @@ struct file *file_clone_open(struct file *f)
 		return 0;
 	/* A second reference to the same object, not a copy: the two descriptors
 	 * must share the driver's private_data, which is the point of cloning. */
-	__atomic_fetch_add(&f->f_count, 1, __ATOMIC_ACQ_REL);
+	atomic64_inc(&f->f_count);
 	return f;
 }
 

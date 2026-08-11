@@ -31,4 +31,14 @@ static inline int component_master_add_with_match(struct device *d,
 static inline void component_master_del(struct device *d,
                                         const struct component_master_ops *o)
 { (void)d; (void)o; }
+
+/* Binding a driver into an aggregate device — i915 uses it to attach the audio
+ * codec on the same package. b1nix has no component framework, so the
+ * registration is recorded as failed rather than pretended: a driver told its
+ * component was added would then wait for a bind that never comes. */
+struct component_ops;
+static inline int component_add_typed(struct device *dev,
+                                      const struct component_ops *ops, int subcomponent)
+{ (void)dev; (void)ops; (void)subcomponent; return -ENODEV; }
+
 #endif

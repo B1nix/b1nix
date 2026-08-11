@@ -583,9 +583,14 @@ DRM_IMPORT_DIR := build/src/drm-core-6.6
 # directory is wrong for a different reason: Kconfig excludes some, and
 # drm_of.c collides with its own header's stub when built without CONFIG_OF.
 DRM_IMPORT_NAMES := $(shell cat $(DRM_IMPORT_DIR)/B1NIX-OBJECTS 2>/dev/null)
+# Everything in the list lives under drivers/gpu/drm, including the display/
+# and ttm/ subdirectories, except hdmi.c — which upstream keeps with the video
+# helpers and which is named here rather than pattern-matched, so that adding a
+# subdirectory to the list does not silently send it to the wrong tree.
+DRM_IMPORT_VIDEO_NAMES := hdmi.c
 DRM_IMPORT_SOURCES := \
-	$(foreach n,$(filter drm_%,$(DRM_IMPORT_NAMES)),$(DRM_IMPORT_DIR)/drivers/gpu/drm/$(n)) \
-	$(foreach n,$(filter-out drm_%,$(DRM_IMPORT_NAMES)),$(DRM_IMPORT_DIR)/drivers/video/$(n))
+	$(foreach n,$(filter-out $(DRM_IMPORT_VIDEO_NAMES),$(DRM_IMPORT_NAMES)),$(DRM_IMPORT_DIR)/drivers/gpu/drm/$(n)) \
+	$(foreach n,$(filter $(DRM_IMPORT_VIDEO_NAMES),$(DRM_IMPORT_NAMES)),$(DRM_IMPORT_DIR)/drivers/video/$(n))
 DRM_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(DRM_IMPORT_SOURCES))
 
 CLANG_RESOURCE_INC := $(shell $(CC) -print-resource-dir)/include
@@ -614,7 +619,8 @@ LKPI_IMPORT_SOURCES := \
 	kernel/lkpi/seq_file.c \
 	kernel/lkpi/sysfs.c \
 	kernel/lkpi/drm_b1nix_kms.c \
-	kernel/lkpi/drm_chardev.c
+	kernel/lkpi/drm_chardev.c \
+	kernel/lkpi/linux_support.c
 
 LKPI_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(LKPI_IMPORT_SOURCES))
 
@@ -628,13 +634,77 @@ $(LKPI_IMPORT_OBJECTS): $(BUILD_DIR)/%.o: %.c
 
 DRM_IMPORT_OBJECTS += $(LKPI_IMPORT_OBJECTS)
 
+# ── M102a: Intel i915 — imported, and optional ────────────────────────────
+#
+# The DRM core is staged unconditionally because the kernel links it. i915 is
+# not: 13 MiB and 262 objects is a real cost for someone working on the
+# filesystem or the network stack, and they should not pay it to build a kernel
+# they are not putting a GPU in.
+#
+# So it is gated twice, and both gates are deliberate:
+#
+#   - the staged tree has to exist. `make i915-fetch` puts it there; without it
+#     I915_IMPORT_NAMES is empty and everything below evaluates to nothing.
+#   - B1NIX_I915=1 has to be asked for. While the driver does not yet compile
+#     against the shim, merely having staged the source must not break the build
+#     for someone who staged it to read it.
+#
+# When the driver builds, the second gate is the one to remove — not the first.
+I915_IMPORT_DIR := build/src/i915-6.6
+B1NIX_I915 ?= 0
+
+ifeq ($(B1NIX_I915),1)
+# main.c calls the driver's module init only when the driver is in the build.
+CFLAGS_EXTRA += -DB1NIX_I915=1
+I915_IMPORT_NAMES := $(shell cat $(I915_IMPORT_DIR)/B1NIX-OBJECTS 2>/dev/null)
+I915_IMPORT_SOURCES := \
+	$(addprefix $(I915_IMPORT_DIR)/drivers/gpu/drm/i915/,$(I915_IMPORT_NAMES))
+I915_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(I915_IMPORT_SOURCES))
+
+# The core's flags plus i915's own include roots, and the same -MMD -MP: without
+# them a shim fix leaves every imported object stale, which is how M101 ended up
+# running a mixture of old and new headers.
+# -O2 is not a performance choice, it is a correctness requirement: i915 writes
+# BUILD_BUG_ON(!__builtin_constant_p(x)) to assert that a register accessor was
+# handed a compile-time constant, and without optimisation the compiler does not
+# fold it, so the assertion fires on perfectly correct code. Upstream builds this
+# driver optimised and its static assertions are written against that.
+#
+# kernel/include/i915-shim carries the two tracepoint headers upstream keeps
+# under plain GPL-2.0, rewritten as MIT no-ops. It comes AFTER the driver's own
+# include roots on purpose: a quoted include resolves against the including
+# file's directory first, so if a future rebase ever brings a real i915_trace.h
+# back into the staged tree, that one wins and this stops being reachable —
+# which is a visible change rather than a silent one.
+I915_IMPORT_CFLAGS := $(DRM_IMPORT_CFLAGS) \
+	-I $(I915_IMPORT_DIR)/drivers/gpu/drm/i915 \
+	-I $(I915_IMPORT_DIR)/drivers/gpu/drm/i915/display \
+	-I $(DRM_IMPORT_DIR)/drivers/gpu/drm \
+	-I kernel/include/i915-shim \
+	-I kernel/include/i915-shim/display \
+	-I kernel/include/i915-shim/rel/drivers/gpu/drm/i915 \
+	-include i915_kconfig.h \
+	-O2
+
+$(BUILD_DIR)/$(I915_IMPORT_DIR)/%.o: $(I915_IMPORT_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(I915_IMPORT_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+else
+I915_IMPORT_OBJECTS :=
+endif
+
+.PHONY: i915-fetch
+i915-fetch:
+	@sh tools/drm/fetch-i915.sh
+
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES)) \
-	$(DRM_IMPORT_OBJECTS)
+	$(DRM_IMPORT_OBJECTS) \
+	$(I915_IMPORT_OBJECTS)
 KERNEL_DEPS := $(patsubst %.c,$(BUILD_DIR)/%.d,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.d,$(ASM_SOURCES)) $(MODULE_KOS:.ko=.d) \
-	$(DRM_IMPORT_OBJECTS:.o=.d)
+	$(DRM_IMPORT_OBJECTS:.o=.d) $(I915_IMPORT_OBJECTS:.o=.d)
 
 -include $(KERNEL_DEPS)
 

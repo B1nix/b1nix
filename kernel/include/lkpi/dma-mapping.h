@@ -24,8 +24,15 @@
 
 /* Allocate `size` bytes of DMA-able memory. Returns the CPU pointer and stores
  * the device address in *dma_handle, or NULL on failure. Zeroed. */
-void *dma_alloc_coherent(usize size, dma_addr_t *dma_handle);
-void dma_free_coherent(usize size, void *cpu_addr, dma_addr_t dma_handle);
+/* `dev` and `gfp` are upstream's. b1nix has one coherent pool and one
+ * allocator behaviour, so neither selects anything — both are in the signature
+ * because every imported caller passes them. */
+struct device;
+void *dma_alloc_coherent(struct device *dev, usize size,
+                         dma_addr_t *dma_handle, u32 gfp);
+/* Same shape as the allocation: the device leads, as upstream has it. */
+void dma_free_coherent(struct device *dev, usize size, void *cpu_addr,
+                       dma_addr_t dma_handle);
 
 /* Make an existing kernel buffer visible to the device. Returns the device
  * address, or 0 when the buffer is not backed by direct-mapped physical memory
@@ -96,8 +103,12 @@ void dma_sync_single_for_cpu(dma_addr_t handle, usize size, int direction);
 /* Map every run of an sg table. Since device address == physical address, this
  * validates the runs and returns the entry count; it never coalesces further.
  * Returns the number of mapped entries, or 0 on failure. */
-u32 dma_map_sg(struct sg_table *sgt, int direction);
-void dma_unmap_sg(struct sg_table *sgt, int direction);
+u32 lkpi_dma_map_sg(struct sg_table *sgt, int direction);
+void lkpi_dma_unmap_sg(struct sg_table *sgt, int direction);
+/* The names b1nix's own code uses. <linux/dma-mapping.h> redefines them as
+ * macros in upstream's four-argument shape. */
+#define dma_map_sg lkpi_dma_map_sg
+#define dma_unmap_sg lkpi_dma_unmap_sg
 
 /* sg mapping for a device with a narrow window. Each run that falls outside the
  * mask is bounced individually and its `dma_address` points at the bounce; runs

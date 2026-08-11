@@ -80,4 +80,57 @@ static inline void iosys_map_memset(struct iosys_map *dst, usize offset,
 	memset((char *)dst->vaddr + offset, value, len);
 }
 
+
+/*
+ * A single typed access through the map.
+ *
+ * `is_iomem` decides which side is taken: system memory is a plain
+ * dereference, device memory goes through the MMIO accessors. Reading device
+ * memory with a dereference happens to work on x86 and is wrong the moment the
+ * mapping is write-combining or the compiler splits the access — which is
+ * exactly what the type exists to prevent.
+ */
+#define iosys_map_rd(map__, offset__, type__)                                \
+	({                                                                       \
+		type__ __v;                                                          \
+		iosys_map_memcpy_from(&__v, (map__), (offset__), sizeof(__v));        \
+		__v;                                                                 \
+	})
+
+#define iosys_map_wr(map__, offset__, type__, val__)                         \
+	({                                                                       \
+		type__ __v = (type__)(val__);                                        \
+		iosys_map_memcpy_to((map__), (offset__), &__v, sizeof(__v));          \
+	})
+
+/*
+ * Reading and writing one field of a structure that lives behind an iosys_map.
+ *
+ * The map may be device memory, so the access has to go through the map's own
+ * accessors rather than a dereference — that is the whole reason the type
+ * exists. The offset is computed with offsetof on the *struct type*, which is
+ * why the macro takes the type as an argument rather than deducing it.
+ */
+#define iosys_map_rd_field(map__, struct_offset__, struct_type__, field__)   \
+	({                                                                       \
+		struct_type__ *__t = 0;                                              \
+		iosys_map_rd(map__, (struct_offset__) + offsetof(struct_type__, field__), \
+		             __typeof__(__t->field__));                              \
+	})
+
+#define iosys_map_wr_field(map__, struct_offset__, struct_type__, field__, val__) \
+	({                                                                       \
+		struct_type__ *__t = 0;                                              \
+		iosys_map_wr(map__, (struct_offset__) + offsetof(struct_type__, field__), \
+		             __typeof__(__t->field__), val__);                       \
+	})
+
+
+/* A map that starts a fixed distance into another. */
+#define IOSYS_MAP_INIT_OFFSET(map_, offset_) ({                            \
+	struct iosys_map copy_ = *(map_);                                      \
+	iosys_map_incr(&copy_, offset_);                                       \
+	copy_;                                                                 \
+})
+
 #endif
