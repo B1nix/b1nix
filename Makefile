@@ -20,24 +20,24 @@ B1NIX_TRIPLET := x86_64-b1nix
 # Port library targets. Defined here at the top so they can be referenced in
 # dependency lists of targets further down (e.g. .userspace-bins-built).
 # Layout: build/$(ARCH)/ports/<port>/install/lib/lib<name>.a
-PCRE2_LIB := build/$(ARCH)/ports/pcre2/install/lib/libpcre2-8.a
+PCRE2_LIB := build/$(ARCH)/pkg/pcre2/lib/libpcre2-8.a
 LIBM_LIB := build/$(ARCH)/ports/openlibm/install/lib/libm.a
-PIXMAN_LIB := build/$(ARCH)/ports/pixman/install/lib/libpixman-1.a
-FREETYPE_LIB := build/$(ARCH)/ports/freetype/install/lib/libfreetype.a
+PIXMAN_LIB := build/$(ARCH)/pkg/pixman/lib/libpixman-1.a
+FREETYPE_LIB := build/$(ARCH)/pkg/freetype/lib/libfreetype.a
 CAIRO_LIB := build/$(ARCH)/ports/cairo/install/lib/libcairo.a
-XKB_LIB := build/$(ARCH)/ports/xkbcommon/install/lib/libxkbcommon.a
-FFI_LIB := build/$(ARCH)/ports/libffi/install/lib/libffi.a
-WAYLAND_CLIENT_LIB := build/$(ARCH)/ports/wayland/install/lib/libwayland-client.a
-WAYLAND_SERVER_LIB := build/$(ARCH)/ports/wayland/install/lib/libwayland-server.a
-HB_LIB := build/$(ARCH)/ports/harfbuzz/install/lib/libharfbuzz.a
-EXPAT_LIB := build/$(ARCH)/ports/expat/install/lib/libexpat.a
-FONTCONFIG_LIB := build/$(ARCH)/ports/fontconfig/install/lib/libfontconfig.a
+XKB_LIB := build/$(ARCH)/pkg/xkbcommon/lib/libxkbcommon.a
+FFI_LIB := build/$(ARCH)/pkg/libffi/lib/libffi.so.8
+WAYLAND_CLIENT_LIB := build/$(ARCH)/pkg/wayland/lib/libwayland-client.so.0
+WAYLAND_SERVER_LIB := build/$(ARCH)/pkg/wayland/lib/libwayland-server.so.0
+HB_LIB := build/$(ARCH)/pkg/harfbuzz/lib/libharfbuzz.a
+EXPAT_LIB := build/$(ARCH)/pkg/expat/lib/libexpat.a
+FONTCONFIG_LIB := build/$(ARCH)/pkg/fontconfig/lib/libfontconfig.a
 TINYGL_LIB := build/$(ARCH)/ports/tinygl/install/lib/libEGL.a
-ZLIB_LIB := build/$(ARCH)/ports/zlib/install/lib/libz.a
-LIBPNG_LIB := build/$(ARCH)/ports/libpng/install/lib/libpng16.a
-LIBJPEG_LIB := build/$(ARCH)/ports/libjpeg/install/lib/libjpeg.a
-LIBWEBP_LIB := build/$(ARCH)/ports/libwebp/install/lib/libwebp.a
-LIBVPX_LIB := build/$(ARCH)/ports/libvpx/install/lib/libvpx.a
+ZLIB_LIB := build/$(ARCH)/pkg/zlib/lib/libz.a
+LIBPNG_LIB := build/$(ARCH)/pkg/libpng/lib/libpng16.a
+LIBJPEG_LIB := build/$(ARCH)/pkg/libjpeg/lib/libjpeg.a
+LIBWEBP_LIB := build/$(ARCH)/pkg/libwebp/lib/libwebp.a
+LIBVPX_LIB := build/$(ARCH)/pkg/libvpx/lib/libvpx.a
 LWC_LIB := build/$(ARCH)/ports/libwapcaplet/install/lib/liblwc.a
 PU_LIB := build/$(ARCH)/ports/libparserutils/install/lib/libparserutils.a
 HUBBUB_LIB := build/$(ARCH)/ports/libhubbub/install/lib/libhubbub.a
@@ -47,12 +47,12 @@ NSUTILS_LIB := build/$(ARCH)/ports/libnsutils/install/lib/libnsutils.a
 NSGIF_LIB := build/$(ARCH)/ports/libnsgif/install/lib/libnsgif.a
 NSBMP_LIB := build/$(ARCH)/ports/libnsbmp/install/lib/libnsbmp.a
 NSLOG_LIB := build/$(ARCH)/ports/libnslog/install/lib/libnslog.a
-OPENSSL_LIB := build/$(ARCH)/ports/openssl/install/lib/libssl.a
-IDN2_LIB := build/$(ARCH)/ports/libidn2/install/lib/libidn2.a
-LIBPSL_LIB := build/$(ARCH)/ports/libpsl/install/lib/libpsl.a
+OPENSSL_LIB := build/$(ARCH)/pkg/openssl/lib/libssl.a
+IDN2_LIB := build/$(ARCH)/pkg/libidn2/lib/libidn2.a
+LIBPSL_LIB := build/$(ARCH)/pkg/libpsl/lib/libpsl.a
 LITEHTML_LIB := build/$(ARCH)/ports/litehtml/install/lib/liblitehtml.a
-MBEDTLS_LIB := build/$(ARCH)/ports/mbedtls/install/lib/libmbedtls.a
-UNISTRING_LIB := build/$(ARCH)/ports/libunistring/install/lib/libunistring.a
+MBEDTLS_LIB := build/$(ARCH)/pkg/mbedtls/lib/libmbedtls.a
+UNISTRING_LIB := build/$(ARCH)/pkg/libunistring/lib/libunistring.a
 
 # Ensure all port libraries depend on headers stamp so that they are compiled
 # only after libc.so.1 and headers are fully built and installed.
@@ -290,12 +290,15 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_MODULES_INC) \
 	$(INITRAMFS_LD_MUSL_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(AP_TRAMPOLINE_OFFSETS) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
-CURL_ELF := build/$(ARCH)/ports/curl/install/bin/curl
 DROPBEAR_VERSION := 2022.83
-DROPBEAR_ELF := build/$(ARCH)/ports/dropbear/dropbearmulti
-ZSH_ELF := build/$(ARCH)/ports/zsh/install/bin/zsh
-BMAKE_ELF := build/$(ARCH)/ports/bmake/install/bin/bmake
-SAMU_ELF := build/$(ARCH)/ports/samurai/install/bin/samu
+# The programs on the image are Alpine packages, unpacked with their own paths
+# into one staging root that the root-image rule copies over the image. These
+# name individual binaries in it, for the rules that embed or copy one.
+PKGROOT := build/$(ARCH)/pkgroot
+CURL_ELF := $(PKGROOT)/usr/bin/curl
+DROPBEAR_ELF := $(PKGROOT)/usr/sbin/dropbear
+BMAKE_ELF := $(PKGROOT)/usr/bin/bmake
+SAMU_ELF := $(PKGROOT)/usr/bin/samu
 B1NIX_TLS ?= mbedtls
 PORTS_SOURCE ?= download
 PACKAGE_INDEX_URL ?= https://cdn.jsdelivr.net/gh/B1nix/b1nix-pkgs@main/pkgs/index
@@ -1015,9 +1018,9 @@ $(INC_DIR)/initramfs_m32_nettool.inc: userspace/bin/helpers/m32_nettool.c $(USER
 	xxd -i -n vfs_m32_nettool_elf userspace/build/$(ARCH)/bin/m32_nettool > $@
 
 # PCRE2: cross-build the static 8-bit library, then link the smoke against it.
-PCRE2_LIB := build/$(ARCH)/ports/pcre2/install/lib/libpcre2-8.a
-$(PCRE2_LIB): tools/ports/build-pcre2.sh tools/toolchain/bin/b1nix-autotools-cc
-	tools/ports/build-pcre2.sh >/dev/null
+PCRE2_LIB := build/$(ARCH)/pkg/pcre2/lib/libpcre2-8.a
+$(PCRE2_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh pcre2 >/dev/null
 
 # M51: libm (openlibm), cross-built static, linked into m51_smoke.
 LIBM_LIB := build/$(ARCH)/ports/openlibm/install/lib/libm.a
@@ -1040,9 +1043,9 @@ $(INC_DIR)/initramfs_m51_smoke.inc: userspace/bin/gfx/m51_smoke.c $(USERSPACE_DE
 	xxd -i -n vfs_m51_smoke_elf userspace/build/$(ARCH)/bin/m51_smoke > $@
 
 # M51: pixman (generic C), cross-built static, linked into m51_pixman_smoke.
-PIXMAN_LIB := build/$(ARCH)/ports/pixman/install/lib/libpixman-1.a
-$(PIXMAN_LIB): tools/ports/build-pixman.sh tools/ports/build-openlibm.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-pixman.sh >/dev/null
+PIXMAN_LIB := build/$(ARCH)/pkg/pixman/lib/libpixman-1.a
+$(PIXMAN_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh pixman >/dev/null
 
 $(INC_DIR)/initramfs_m51_pixman_smoke.inc: userspace/bin/gfx/m51_pixman_smoke.c $(USERSPACE_DEPS) $(PIXMAN_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
@@ -1050,9 +1053,9 @@ $(INC_DIR)/initramfs_m51_pixman_smoke.inc: userspace/bin/gfx/m51_pixman_smoke.c 
 	xxd -i -n vfs_m51_pixman_smoke_elf userspace/build/$(ARCH)/bin/m51_pixman_smoke > $@
 
 # M51: FreeType (TrueType + smooth rasterizer), cross-built static.
-FREETYPE_LIB := build/$(ARCH)/ports/freetype/install/lib/libfreetype.a
-$(FREETYPE_LIB): tools/ports/build-freetype.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-freetype.sh >/dev/null
+FREETYPE_LIB := build/$(ARCH)/pkg/freetype/lib/libfreetype.a
+$(FREETYPE_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh freetype >/dev/null
 
 $(INC_DIR)/initramfs_m51_freetype_smoke.inc: userspace/bin/gfx/m51_freetype_smoke.c $(USERSPACE_DEPS) $(FREETYPE_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
@@ -1075,9 +1078,9 @@ $(INC_DIR)/initramfs_m51_cairo_wayland.inc: userspace/bin/gfx/m51_cairo_wayland.
 	xxd -i -n vfs_m51_cairo_wayland_elf userspace/build/$(ARCH)/bin/m51_cairo_wayland > $@
 
 # M51: xkbcommon (keymap compile + keysym translation), cross-built static.
-XKB_LIB := build/$(ARCH)/ports/xkbcommon/install/lib/libxkbcommon.a
-$(XKB_LIB): tools/ports/build-xkbcommon.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-xkbcommon.sh >/dev/null
+XKB_LIB := build/$(ARCH)/pkg/xkbcommon/lib/libxkbcommon.a
+$(XKB_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh xkbcommon >/dev/null
 
 $(INC_DIR)/initramfs_m51_xkb_smoke.inc: userspace/bin/gfx/m51_xkb_smoke.c $(USERSPACE_DEPS) $(XKB_LIB)
 	@mkdir -p $(dir $@)
@@ -1086,20 +1089,20 @@ $(INC_DIR)/initramfs_m51_xkb_smoke.inc: userspace/bin/gfx/m51_xkb_smoke.c $(USER
 
 # M49: libwayland-client/server share one generated source/build tree. Build it
 # once at the top level so parallel initramfs packaging cannot race two nested
-# userspace make invocations through tools/ports/build-wayland.sh.
-WAYLAND_CLIENT_LIB := build/$(ARCH)/ports/wayland/install/lib/libwayland-client.a
-WAYLAND_SERVER_LIB := build/$(ARCH)/ports/wayland/install/lib/libwayland-server.a
-$(WAYLAND_CLIENT_LIB): tools/ports/build-wayland.sh $(LIBFFI_LIB)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-wayland.sh >/dev/null
+# userspace make invocations through tools/packages/pkg-prefix.sh.
+WAYLAND_CLIENT_LIB := build/$(ARCH)/pkg/wayland/lib/libwayland-client.so.0
+WAYLAND_SERVER_LIB := build/$(ARCH)/pkg/wayland/lib/libwayland-server.so.0
+$(WAYLAND_CLIENT_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh wayland >/dev/null
 $(WAYLAND_SERVER_LIB): $(WAYLAND_CLIENT_LIB)
 
 $(INC_DIR)/initramfs_m49_libwayland.inc: $(WAYLAND_CLIENT_LIB)
 $(INC_DIR)/initramfs_m49_libwayland_server.inc: $(WAYLAND_SERVER_LIB)
 
 # M51: HarfBuzz (HB_TINY, unified C++ build via cross g++), cross-built static.
-HB_LIB := build/$(ARCH)/ports/harfbuzz/install/lib/libharfbuzz.a
-$(HB_LIB): tools/ports/build-harfbuzz.sh $(MUSL_LIBCXX_STAMP)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-harfbuzz.sh >/dev/null
+HB_LIB := build/$(ARCH)/pkg/harfbuzz/lib/libharfbuzz.a
+$(HB_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh harfbuzz >/dev/null
 
 $(INC_DIR)/initramfs_m51_harfbuzz_smoke.inc: userspace/bin/gfx/m51_harfbuzz_smoke.c $(USERSPACE_DEPS) $(HB_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
@@ -1107,12 +1110,12 @@ $(INC_DIR)/initramfs_m51_harfbuzz_smoke.inc: userspace/bin/gfx/m51_harfbuzz_smok
 	xxd -i -n vfs_m51_harfbuzz_smoke_elf userspace/build/$(ARCH)/bin/m51_harfbuzz_smoke > $@
 
 # M51: expat (XML) + Fontconfig (font discovery), cross-built static.
-EXPAT_LIB := build/$(ARCH)/ports/expat/install/lib/libexpat.a
-$(EXPAT_LIB): tools/ports/build-expat.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-expat.sh >/dev/null
-FONTCONFIG_LIB := build/$(ARCH)/ports/fontconfig/install/lib/libfontconfig.a
-$(FONTCONFIG_LIB): tools/ports/build-fontconfig.sh $(EXPAT_LIB) $(FREETYPE_LIB)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-fontconfig.sh >/dev/null
+EXPAT_LIB := build/$(ARCH)/pkg/expat/lib/libexpat.a
+$(EXPAT_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh expat >/dev/null
+FONTCONFIG_LIB := build/$(ARCH)/pkg/fontconfig/lib/libfontconfig.a
+$(FONTCONFIG_LIB): $(PKG_DEPS) $(EXPAT_LIB) $(FREETYPE_LIB)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh fontconfig >/dev/null
 
 $(INC_DIR)/initramfs_m51_fontconfig_smoke.inc: userspace/bin/gfx/m51_fontconfig_smoke.c $(USERSPACE_DEPS) $(FONTCONFIG_LIB) $(EXPAT_LIB) $(FREETYPE_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
@@ -1256,9 +1259,26 @@ $(INC_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/smoke/m32_pcre2_smoke.c 
 	xxd -i -n vfs_m32_pcre2_smoke_elf userspace/build/$(ARCH)/bin/m32_pcre2_smoke > $@
 
 # M53: zlib (image-codec dependency for the NetSurf browser platform).
-ZLIB_LIB := build/$(ARCH)/ports/zlib/install/lib/libz.a
-$(ZLIB_LIB): tools/ports/build-zlib.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-zlib.sh >/dev/null
+#
+# Alpine's package, not a from-source port: it is the same zlib, built for the
+# same musl and the same architecture, and taking it deletes a build script
+# along with the duty to keep it building. tools/packages/alpine-fetch.sh pins
+# every package's sha256 in tools/packages/alpine.lock. First of the migration
+# described in docs/ports-migration-plan.md.
+#
+# Both shapes come down: libz.so.1 is what binaries link and what the image
+# carries, and libz.a is still wanted by the ports that have not moved yet
+# (libpng, NetSurf) and link it statically.
+# What a package-backed port depends on: the fetcher, the pinned hashes, and the
+# port-to-package table. Any of the three changing re-runs the install.
+PKG_DEPS := tools/packages/pkg-prefix.sh tools/packages/alpine-fetch.sh \
+            tools/packages/alpine.lock tools/packages/alpine-ports.map
+
+ZLIB_PREFIX := build/$(ARCH)/pkg/zlib
+ZLIB_LIB := $(ZLIB_PREFIX)/lib/libz.a
+ZLIB_SO := $(ZLIB_PREFIX)/lib/libz.so.1
+$(ZLIB_LIB) $(ZLIB_SO): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh zlib >/dev/null
 
 $(INC_DIR)/initramfs_m53_zlib_smoke.inc: userspace/bin/gfx/m53_zlib_smoke.c $(USERSPACE_DEPS) $(ZLIB_LIB)
 	@mkdir -p $(dir $@)
@@ -1266,9 +1286,9 @@ $(INC_DIR)/initramfs_m53_zlib_smoke.inc: userspace/bin/gfx/m53_zlib_smoke.c $(US
 	xxd -i -n vfs_m53_zlib_smoke_elf userspace/build/$(ARCH)/bin/m53_zlib_smoke > $@
 
 # M53: libpng (over zlib + libm) — NetSurf image-codec dependency.
-LIBPNG_LIB := build/$(ARCH)/ports/libpng/install/lib/libpng16.a
-$(LIBPNG_LIB): tools/ports/build-libpng.sh $(ZLIB_LIB)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libpng.sh >/dev/null
+LIBPNG_LIB := build/$(ARCH)/pkg/libpng/lib/libpng16.a
+$(LIBPNG_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libpng >/dev/null
 
 $(INC_DIR)/initramfs_m53_libpng_smoke.inc: userspace/bin/gfx/m53_libpng_smoke.c $(USERSPACE_DEPS) $(LIBPNG_LIB) $(ZLIB_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
@@ -1276,9 +1296,9 @@ $(INC_DIR)/initramfs_m53_libpng_smoke.inc: userspace/bin/gfx/m53_libpng_smoke.c 
 	xxd -i -n vfs_m53_libpng_smoke_elf userspace/build/$(ARCH)/bin/m53_libpng_smoke > $@
 
 # M53: libjpeg (IJG) — NetSurf image-codec dependency.
-LIBJPEG_LIB := build/$(ARCH)/ports/libjpeg/install/lib/libjpeg.a
-$(LIBJPEG_LIB): tools/ports/build-libjpeg.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libjpeg.sh >/dev/null
+LIBJPEG_LIB := build/$(ARCH)/pkg/libjpeg/lib/libjpeg.a
+$(LIBJPEG_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libjpeg >/dev/null
 
 $(INC_DIR)/initramfs_m53_libjpeg_smoke.inc: userspace/bin/gfx/m53_libjpeg_smoke.c $(USERSPACE_DEPS) $(LIBJPEG_LIB)
 	@mkdir -p $(dir $@)
@@ -1286,9 +1306,9 @@ $(INC_DIR)/initramfs_m53_libjpeg_smoke.inc: userspace/bin/gfx/m53_libjpeg_smoke.
 	xxd -i -n vfs_m53_libjpeg_smoke_elf userspace/build/$(ARCH)/bin/m53_libjpeg_smoke > $@
 
 # M53: libwebp (image + VP8 video-keyframe codec) — NetSurf codec dependency.
-LIBWEBP_LIB := build/$(ARCH)/ports/libwebp/install/lib/libwebp.a
-$(LIBWEBP_LIB): tools/ports/build-libwebp.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libwebp.sh >/dev/null
+LIBWEBP_LIB := build/$(ARCH)/pkg/libwebp/lib/libwebp.a
+$(LIBWEBP_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libwebp >/dev/null
 
 $(INC_DIR)/initramfs_m53_libwebp_smoke.inc: userspace/bin/gfx/m53_libwebp_smoke.c $(USERSPACE_DEPS) $(LIBWEBP_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
@@ -1296,9 +1316,9 @@ $(INC_DIR)/initramfs_m53_libwebp_smoke.inc: userspace/bin/gfx/m53_libwebp_smoke.
 	xxd -i -n vfs_m53_libwebp_smoke_elf userspace/build/$(ARCH)/bin/m53_libwebp_smoke > $@
 
 # M53: libvpx (VP8 full-motion video decode) — NetSurf/WebM video codec.
-LIBVPX_LIB := build/$(ARCH)/ports/libvpx/install/lib/libvpx.a
-$(LIBVPX_LIB): tools/ports/build-libvpx.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libvpx.sh >/dev/null
+LIBVPX_LIB := build/$(ARCH)/pkg/libvpx/lib/libvpx.a
+$(LIBVPX_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libvpx >/dev/null
 
 $(INC_DIR)/initramfs_m53_libvpx_smoke.inc: userspace/bin/gfx/m53_libvpx_smoke.c $(USERSPACE_DEPS) $(LIBVPX_LIB) $(LIBWEBP_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
@@ -1374,8 +1394,17 @@ $(INC_DIR)/initramfs_m53_virgl_smoke.inc: userspace/bin/gfx/m53_virgl_smoke.c $(
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_virgl_smoke
 	xxd -i -n vfs_m53_virgl_smoke_elf userspace/build/$(ARCH)/bin/m53_virgl_smoke > $@
 
-$(CURL_ELF): tools/ports/build-curl.sh tools/toolchain/bin/b1nix-autotools-cc $(USERSPACE_DEPS) $(MBEDTLS_LIB)
-	B1NIX_TLS="$(B1NIX_TLS)" tools/ports/build-curl.sh
+CURLBUILD_STAMP := build/$(ARCH)/pkg/curlbuild/lib/libcurl.a
+$(CURLBUILD_STAMP): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh curlbuild >/dev/null
+
+PKGROOT_STAMP := $(PKGROOT)/.installed
+$(PKGROOT_STAMP): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) ALPINE_LAYOUT=native \
+		tools/packages/pkg-prefix.sh --into $(PKGROOT) programs >/dev/null
+	@touch $@
+$(CURL_ELF) $(DROPBEAR_ELF) $(BMAKE_ELF) $(SAMU_ELF): $(PKGROOT_STAMP)
+
 
 $(INITRAMFS_CURL_INC): $(CURL_ELF)
 	@mkdir -p $(dir $@)
@@ -1383,51 +1412,40 @@ $(INITRAMFS_CURL_INC): $(CURL_ELF)
 
 # Dropbear SSH server (dropbearmulti: server + dropbearkey + dropbearconvert,
 # dispatched by argv[0]). Built static against the b1nix userspace libc.
-$(DROPBEAR_ELF): tools/ports/build-dropbear.sh tools/toolchain/bin/b1nix-autotools-cc $(USERSPACE_DEPS)
-	tools/ports/build-dropbear.sh all >/dev/null
 
 $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_dropbear_elf $(DROPBEAR_ELF) > $@
 
-# zsh — the default interactive shell and login shell (M98). It replaced GNU
-# bash, whose GPLv3 licence was the last one in the shipped userland. Needs the
-# netbsd-curses port for terminal handling, which build-zsh.sh resolves itself.
-$(ZSH_ELF): tools/ports/build-zsh.sh tools/ports/build-netbsd-curses.sh tools/toolchain/bin/b1nix-musl-autotools-cc $(USERSPACE_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-zsh.sh >/dev/null
-
 # In-guest build tools, both GNU-free (M98): bmake (BSD 3-clause NetBSD make)
 # ships as /bin/make and samurai (0BSD Ninja reimplementation) as /bin/samu with
 # a /bin/ninja alias. Together they replace the retired GNU Make port.
-$(BMAKE_ELF): tools/ports/build-bmake.sh tools/toolchain/bin/b1nix-musl-autotools-cc $(USERSPACE_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-bmake.sh >/dev/null
 
-$(SAMU_ELF): tools/ports/build-samurai.sh tools/toolchain/bin/b1nix-musl-autotools-cc $(USERSPACE_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-samurai.sh >/dev/null
 
-OPENSSL_LIB := build/$(ARCH)/ports/openssl/install/lib/libssl.a
-$(OPENSSL_LIB): tools/ports/build-openssl.sh tools/toolchain/bin/b1nix-autotools-cc
-	tools/ports/build-openssl.sh >/dev/null
+OPENSSL_LIB := build/$(ARCH)/pkg/openssl/lib/libssl.a
+$(OPENSSL_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh openssl >/dev/null
 
-LIBIDN2_LIB := build/$(ARCH)/ports/libidn2/install/lib/libidn2.a
-$(LIBIDN2_LIB): tools/ports/build-libidn2.sh $(LIBUNISTRING_LIB) tools/toolchain/bin/b1nix-autotools-cc
-	tools/ports/build-libidn2.sh >/dev/null
+LIBIDN2_LIB := build/$(ARCH)/pkg/libidn2/lib/libidn2.a
+$(LIBIDN2_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libidn2 >/dev/null
 
-LIBPSL_LIB := build/$(ARCH)/ports/libpsl/install/lib/libpsl.a
-$(LIBPSL_LIB): tools/ports/build-libpsl.sh tools/toolchain/bin/b1nix-autotools-cc
-	tools/ports/build-libpsl.sh >/dev/null
+LIBPSL_LIB := build/$(ARCH)/pkg/libpsl/lib/libpsl.a
+$(LIBPSL_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libpsl >/dev/null
 
-$(LIBFFI_LIB): tools/ports/build-libffi.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libffi.sh >/dev/null
+LIBFFI_LIB := $(FFI_LIB)
+$(LIBFFI_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libffi >/dev/null
 
 $(LITEHTML_LIB): tools/ports/build-litehtml.sh
 	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-litehtml.sh >/dev/null
 
-$(MBEDTLS_LIB): tools/ports/build-mbedtls.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-mbedtls.sh >/dev/null
+$(MBEDTLS_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh mbedtls >/dev/null
 
-$(LIBUNISTRING_LIB): tools/ports/build-libunistring.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libunistring.sh >/dev/null
+$(LIBUNISTRING_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libunistring >/dev/null
 
 
 CACERT_PEM := build/cacert.pem
@@ -1471,7 +1489,7 @@ $(INC_DIR)/initramfs_m53_httpsd.inc: userspace/bin/gfx/m53_httpsd.c $(USERSPACE_
 
 # M53: build the NetSurf framebuffer browser (the real nsfb binary) and package
 # it + its runtime resources + a test page into the initramfs.
-$(NSFB_ELF): tools/ports/build-netsurf-fb.sh tools/ports/build-libnsfb.sh $(ZLIB_LIB) $(LIBPNG_LIB) $(LIBJPEG_LIB) $(FREETYPE_LIB) $(CURL_ELF)
+$(NSFB_ELF): tools/ports/build-netsurf-fb.sh tools/ports/build-libnsfb.sh $(ZLIB_LIB) $(LIBPNG_LIB) $(LIBJPEG_LIB) $(FREETYPE_LIB) $(CURLBUILD_STAMP)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-netsurf-fb.sh >/dev/null
 
 $(INITRAMFS_NETSURF_INC): $(NSFB_ELF) tools/images/gen_netsurf_initramfs.sh tools/netsurf-assets/test.html tools/netsurf-assets/test.png tools/netsurf-assets/test.svg tools/netsurf-assets/test.jxl
@@ -1776,7 +1794,7 @@ install-native-toolchain:
 		echo "      Run tools/build-native-clang.sh --b1nix-elf."; \
 	fi
 
-install-ports: userspace-install busybox-package install-native-toolchain $(ZSH_ELF) $(CURL_ELF) $(DROPBEAR_ELF) $(NSFB_ELF) $(BMAKE_ELF) $(SAMU_ELF)
+install-ports: userspace-install busybox-package install-native-toolchain $(PKGROOT_STAMP) $(NSFB_ELF)
 	tools/packages/install-ports.sh $(BUILD_DIR)/rootfs $(ARCH) $(PORTS_SOURCE) $(PACKAGE_INDEX_URL)
 	@# The published dev package may carry older libc headers than this checkout.
 	@# Restore the current userspace ABI after package extraction so cross C++
@@ -1897,6 +1915,18 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	fi
 	@# M91: Stage Mesa/Skia shared libraries into rootfs/lib/ for the dynamic linker
 	@mkdir -p $(BUILD_DIR)/rootfs/lib
+	@# Shared libraries that come from Alpine packages rather than from a port.
+	@# Copied by real name and by SONAME, not symlinked: the ext4 driver is not
+	@# asked to follow a link during early loader work.
+	@for so in build/$(ARCH)/pkg/*/lib/lib*.so.*; do \
+		if [ -f "$$so" ] && ! [ -L "$$so" ]; then \
+			cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; \
+			soname=$$($(READELF) -d "$$so" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//'); \
+			if [ -n "$$soname" ] && [ "$$soname" != "$$(basename $$so)" ]; then \
+				cp -f "$$so" "$(BUILD_DIR)/rootfs/lib/$$soname"; \
+			fi; \
+		fi; \
+	done
 	@# Mesa install dir (softpipe/virgl build) — copy .so files and create
 	@# SONAME copies (not symlinks: b1nix ext4 driver may not follow them).
 	@MESA_LIB_DIR=build/$(ARCH)/ports/mesa/install/lib; \
@@ -1969,12 +1999,7 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	@# rootfs/bin; nothing staged it before M104 added PAM support, so
 	@# userspace/rootfs-overlay/etc/init.d/sshd's /bin/dropbear* calls had no
 	@# binary to find. Real copies (not symlinks), same reasoning as above.
-	@if [ -f $(DROPBEAR_ELF) ]; then \
-		for name in dropbear dbclient dropbearkey dropbearconvert; do \
-			cp -f $(DROPBEAR_ELF) $(BUILD_DIR)/rootfs/bin/$$name; \
-			chmod +x $(BUILD_DIR)/rootfs/bin/$$name; \
-		done; \
-	fi
+
 	@# Stage sysroot C++ runtime .so (real, not stubs — EGL/GLESv2/fontconfig
 	@# come from userspace/build/ via build-skia-shared-deps.sh above)
 	@SYSROOT_LIB=$(CXX_RUNTIME_LIB); \
@@ -2008,7 +2033,13 @@ ifdef LIBC_SO
 	@# The ext4 driver may not follow symlinks, so give every name a real
 	@# directory entry. Hard links share one inode: the image carries the bytes
 	@# once no matter how many names point at them.
-	@for name in libc.so libm.so libm.so.1 libpthread.so librt.so libdl.so \
+	@# libc.musl-x86_64.so.1 is the name Alpine's own binaries and libraries
+	@# record as DT_NEEDED — it is their libc's SONAME. Anything installed from
+	@# their repository asks for it, so the loader has to be reachable under it
+	@# too, or every Alpine library fails to load for want of a libc that is
+	@# already there under three other names.
+	@for name in libc.so libc.musl-x86_64.so.1 libm.so libm.so.1 libpthread.so \
+	             librt.so libdl.so \
 	             libcrypt.so libutil.so libresolv.so; do \
 		ln -f $(BUILD_DIR)/rootfs/lib/$(LIBC_LDSO_NAME) $(BUILD_DIR)/rootfs/lib/$$name 2>/dev/null || \
 			cp -f $(LIBC_SO) $(BUILD_DIR)/rootfs/lib/$$name; \
@@ -2028,33 +2059,50 @@ endif
 		cp "$$SKIA_DM" $(BUILD_DIR)/rootfs/bin/skia-dm; \
 		chmod +x $(BUILD_DIR)/rootfs/bin/skia-dm; \
 	fi
-	@# M98: zsh is the interactive/login shell in place of GNU bash. Its shell
-	@# functions (completion, prompts) are read from $$fpath at runtime, so they
-	@# ship alongside the binary.
-	@if [ -f $(ZSH_ELF) ]; then \
-		cp -f $(ZSH_ELF) $(BUILD_DIR)/rootfs/bin/zsh; \
-		chmod +x $(BUILD_DIR)/rootfs/bin/zsh; \
-		mkdir -p $(BUILD_DIR)/rootfs/usr/share/zsh; \
-		cp -R build/$(ARCH)/ports/zsh/install/share/zsh/. \
-			$(BUILD_DIR)/rootfs/usr/share/zsh/ 2>/dev/null || true; \
-	fi
+	@# Every program on the image that is not ours and not part of how it boots:
+	@# zsh, curl, dropbear, bmake and samurai, all Alpine packages. Unpacked with
+	@# their own paths — a program looks for its files where it was compiled to
+	@# look, zsh's modules under /usr/lib/zsh, bmake's makefiles under
+	@# /usr/share/mk — into one staging root, which is merged over the image
+	@# here. Directories are created rather than replaced, because /usr/lib in
+	@# the image is a link to /lib.
+	@$(MAKE) --no-print-directory $(PKGROOT_STAMP)
+	@(cd $(PKGROOT) && find . -type d -exec mkdir -p $(CURDIR)/$(BUILD_DIR)/rootfs/{} \;)
+	@(cd $(PKGROOT) && find . ! -type d ! -name .installed \
+		-exec cp -a --remove-destination {} $(CURDIR)/$(BUILD_DIR)/rootfs/{} \;)
+	@# Names the rest of the tree asks for by path. Real copies, not symlinks:
+	@# the ext4 driver is not asked to follow one. bmake answers to /bin/make
+	@# because nothing on the target should have to know it is not GNU Make;
+	@# samurai answers to /bin/ninja for the same reason; and the init script
+	@# for sshd calls /bin/dropbear*, while Alpine puts those in /usr/*bin.
+	@# --remove-destination on every one of these, and the retired multi-call
+	@# binary removed first: the staging rootfs keeps whatever earlier builds
+	@# left, and dropbear used to be one binary with a symlink per tool. Copying
+	@# onto such a symlink writes THROUGH it, so each tool in turn overwrote the
+	@# single file all the names pointed at, and the guest got dropbearkey when
+	@# it asked for dbclient.
+	@rm -f $(BUILD_DIR)/rootfs/bin/dropbearmulti \
+		$(BUILD_DIR)/rootfs/bin/dropbear $(BUILD_DIR)/rootfs/bin/dbclient \
+		$(BUILD_DIR)/rootfs/bin/dropbearkey $(BUILD_DIR)/rootfs/bin/dropbearconvert
+	@cp -f --remove-destination $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/make
+	@cp -f --remove-destination $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/bmake
+	@cp -f --remove-destination $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/samu
+	@cp -f --remove-destination $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/ninja
+	@cp -f --remove-destination $(CURL_ELF) $(BUILD_DIR)/rootfs/bin/curl
+	@cp -f --remove-destination $(DROPBEAR_ELF) $(BUILD_DIR)/rootfs/bin/dropbear
+	@for n in dbclient dropbearkey scp ssh; do \
+		[ -f $(PKGROOT)/usr/bin/$$n ] && \
+			cp -f --remove-destination $(PKGROOT)/usr/bin/$$n \
+				$(BUILD_DIR)/rootfs/bin/$$n; \
+	done; true
+	@chmod +x $(BUILD_DIR)/rootfs/bin/make $(BUILD_DIR)/rootfs/bin/bmake \
+		$(BUILD_DIR)/rootfs/bin/samu $(BUILD_DIR)/rootfs/bin/ninja \
+		$(BUILD_DIR)/rootfs/bin/curl $(BUILD_DIR)/rootfs/bin/dropbear
 	@# M98: the GNU-free in-guest build tools. bmake is /bin/make (nothing on the
 	@# target should have to know it is not GNU Make) and samurai is /bin/samu
 	@# plus a /bin/ninja alias. Real copies, not symlinks — the ext4 driver does
 	@# not follow them. bmake reads its system makefiles from /usr/share/mk.
-	@if [ -f $(BMAKE_ELF) ]; then \
-		cp -f $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/make; \
-		cp -f $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/bmake; \
-		chmod +x $(BUILD_DIR)/rootfs/bin/make $(BUILD_DIR)/rootfs/bin/bmake; \
-		mkdir -p $(BUILD_DIR)/rootfs/usr/share/mk; \
-		cp -f build/$(ARCH)/ports/bmake/install/share/mk/*.mk \
-			$(BUILD_DIR)/rootfs/usr/share/mk/ 2>/dev/null || true; \
-	fi
-	@if [ -f $(SAMU_ELF) ]; then \
-		cp -f $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/samu; \
-		cp -f $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/ninja; \
-		chmod +x $(BUILD_DIR)/rootfs/bin/samu $(BUILD_DIR)/rootfs/bin/ninja; \
-	fi
+
 	@# M40/M67: committed static ELF blobs (Linux ABI compat + Rust std smoke).
 	@# Only ever wired into the legacy xxd/.inc initramfs path (kernel/fs/
 	@# initramfs.c never gained a #include for them after the ext4-root
@@ -2094,11 +2142,18 @@ endif
 	@# Trim rootfs: remove LLVM static archives and shared lib (200+ MB) that
 	@# are only needed for self-hosting, not for smoke.  Keep Mesa .so files.
 	@rm -f $(BUILD_DIR)/rootfs/lib/libLLVM*.a $(BUILD_DIR)/rootfs/lib/libLLVM.so
-	@# Remove .so.N.M files whose SONAME copy already exists (avoid duplicates)
+	@# Remove .so.N.M files whose SONAME copy already exists (avoid duplicates).
+	@# Only when that SONAME entry is a real file: a package names its library
+	@# by SONAME through a symlink to exactly this versioned file, and deleting
+	@# the file then leaves the link pointing at nothing — which the loader
+	@# reports as a library full of missing symbols rather than as an absent
+	@# file, and cost an afternoon on Alpine's libcurl.
 	@for f in $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.*; do \
 		[ -f "$$f" ] || continue; \
 		soname=$$($(READELF) -d "$$f" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//'); \
-		if [ -n "$$soname" ] && [ "$$soname" != "$$(basename $$f)" ] && [ -e "$(BUILD_DIR)/rootfs/lib/$$soname" ]; then \
+		if [ -n "$$soname" ] && [ "$$soname" != "$$(basename $$f)" ] && \
+		   [ -f "$(BUILD_DIR)/rootfs/lib/$$soname" ] && \
+		   ! [ -L "$(BUILD_DIR)/rootfs/lib/$$soname" ]; then \
 			rm -f "$$f"; \
 		fi; \
 	done

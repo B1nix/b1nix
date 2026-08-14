@@ -1,0 +1,69 @@
+# Ports that are Alpine packages rather than from-source builds.
+#
+#   <port> <alpine package>...
+#
+# <port> is the name the rest of the tree already uses — the directory under
+# build/$ARCH/pkg and the name in every -I/-L path. The packages after it are
+# what Alpine actually splits that library into, which is finer than the ports
+# were: the runtime shared library, the -dev headers and .so symlink, and the
+# -static archive are three packages, and a library with several archives (webp,
+# pcre2) has one per archive. Ask for too few and a -dev symlink points at
+# nothing — tools/packages/alpine-fetch.sh fails on exactly that rather than
+# letting the linker fall back to the static archive.
+#
+# Read by tools/packages/pkg-prefix.sh. See docs/ports-migration-plan.md.
+
+zlib          zlib zlib-dev zlib-static
+expat         libexpat expat-dev expat-static
+pcre2         pcre2 libpcre2-16 libpcre2-32 pcre2-dev
+brotli        brotli-libs brotli-dev brotli-static
+libunistring  libunistring libunistring-dev libunistring-static
+libidn2       libidn2 libidn2-dev libidn2-static
+libpsl        libpsl libpsl-dev libpsl-static
+libpng        libpng libpng-dev libpng-static
+libjpeg       libjpeg-turbo libturbojpeg libjpeg-turbo-dev libjpeg-turbo-static
+libwebp       libwebp libsharpyuv libwebpdecoder libwebpdemux libwebpmux libwebp-dev libwebp-static
+
+# M49. Upstream libwayland, shared — the port built it into a static archive
+# together with a static libffi, and Alpine's libffi.a is not built -fPIC, so a
+# PIE cannot link it. Both are shared here, which is what they are meant to be.
+# wayland-dev also carries the generated protocol headers the port's own
+# wayland-scanner run used to produce.
+wayland       wayland-libs-client wayland-libs-server wayland-libs-cursor wayland-libs-egl wayland-dev
+libffi        libffi libffi-dev
+
+# M51 desktop/text stack. Alpine's harfbuzz archive carries no C++ runtime
+# references, so it links into these C binaries the way the HB_TINY port did.
+freetype      freetype freetype-dev freetype-static
+fontconfig    fontconfig fontconfig-dev fontconfig-static
+harfbuzz      harfbuzz harfbuzz-dev harfbuzz-static
+pixman        pixman pixman-dev pixman-static
+xkbcommon     libxkbcommon libxkbcommon-dev libxkbcommon-static
+
+# M53 codecs and TLS. libvpx is in community.
+#
+# cairo and libjxl are deliberately NOT here. Alpine's cairo is built with the
+# X11 backend and drags libX11, libxcb and their dependencies onto an image with
+# no X server; and their libjxl is C++ built against libstdc++, while everything
+# C++ here is libc++ — mixing the two ABIs in one link does not work. Both keep
+# their from-source ports.
+libvpx        repo:community libvpx libvpx-dev
+mbedtls       mbedtls mbedtls-dev mbedtls-static
+openssl       openssl libssl3 libcrypto3 openssl-dev openssl-libs-static
+
+# Programs installed onto the image rather than linked against. Used with
+# ALPINE_LAYOUT=native, so they keep their own paths, into one staging root that
+# the root-image rule copies over the image.
+#
+# dropbear is four packages because Alpine ships each tool separately rather
+# than as one multi-call binary; busybox-binsh is the /bin/sh symlink.
+# openrc and runit are deliberately absent. Alpine's openrc brings its own
+# /lib/rc, /etc/init.d and runlevels, which replaced this image's and took the
+# boot straight to poweroff; and their runit is statically linked, which the
+# rootfs gate rejects outright (tools/check-dynamic.sh). Both keep their ports:
+# what they do is the running system's behaviour, not a build artefact.
+programs      zsh curl libcurl samurai bmake dropbear dropbear-ssh \
+              dropbear-scp dropbear-dbclient
+
+# The curl library, for what links against it rather than runs it (NetSurf).
+curlbuild     libcurl curl-dev curl-static

@@ -103,8 +103,17 @@ stage() {
   cp -R "$inst/lib/." "$SYSROOT/lib/" 2>/dev/null || true
 }
 
-stage build-zlib.sh
-stage build-libpng.sh
+# Same, for the libraries that are Alpine packages rather than ports. They print
+# the same kind of prefix, so the copying is identical — only the producer
+# differs. See docs/ports-migration-plan.md.
+stage_pkg() {
+  inst="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/packages/pkg-prefix.sh" "$1")"
+  cp -R "$inst/include/." "$SYSROOT/include/" 2>/dev/null || true
+  cp -R "$inst/lib/." "$SYSROOT/lib/" 2>/dev/null || true
+}
+
+stage_pkg zlib
+stage_pkg libpng
 stage build-libwapcaplet.sh
 stage build-libparserutils.sh
 stage build-libhubbub.sh
@@ -115,10 +124,10 @@ stage build-libnsgif.sh
 stage build-libnsbmp.sh
 stage build-libnslog.sh
 stage build-libnsfb.sh
-stage build-libjpeg.sh   # libjpeg.a — JPEG image decoding
-stage build-libwebp.sh   # libwebp.a — WebP image decoding
+stage_pkg libjpeg   # libjpeg.a — JPEG image decoding
+stage_pkg libwebp   # libwebp.a — WebP image decoding
 stage build-openlibm.sh   # libm.a (NetSurf + libpng need cos/sin/floor/pow/modf)
-stage build-expat.sh    # libexpat.a — XML parsing (SVG/Fontconfig dependency)
+stage_pkg expat    # libexpat.a — XML parsing (SVG/Fontconfig dependency)
 stage build-libsvgtiny.sh # libsvgtiny.a — SVG image decoding (needs libdom + expat + math)
 stage build-libnspsl.sh   # libnspsl.a — public suffix list (cookie/domain scoping)
 stage build-librosprite.sh # librosprite.a — RISC-OS sprite image decoding
@@ -191,28 +200,41 @@ fi
 # ── Stage libcurl + mbedTLS so NetSurf's HTTP(S) fetcher can be enabled. The
 #    b1nix curl port is built static against mbedTLS; we expose libcurl.a, the
 #    curl headers and the mbedTLS archives through a libcurl.pc. ──
-CURL_SRC="$(ls -d "$ROOT_DIR"/build/src/curl/curl-*/ "$ROOT_DIR"/build/curl-src/$B1NIX_TRIPLET/curl-*/ 2>/dev/null | head -1)"
-CURL_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/curl/lib/.libs/libcurl.a"
-MBED_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/mbedtls/install"
+CURL_SRC="$ROOT_DIR/build/$B1NIX_ARCH/pkg/curlbuild"
+# curl is an Alpine package now: the archive and the headers come from the
+# curlbuild prefix (curl-static + curl-dev), not from a build tree of ours.
+CURL_A="$ROOT_DIR/build/$B1NIX_ARCH/pkg/curlbuild/lib/libcurl.a"
+MBED_DIR="$ROOT_DIR/build/$B1NIX_ARCH/pkg/mbedtls"
 # The b1nix curl port enables libpsl (Public Suffix List) and libidn2 (IDN),
 # which in turn pulls libunistring. libcurl.a therefore references psl_*/idn2_*
 # /u8_*/u32_* symbols. Stage those archives and list them in libcurl.pc in
 # dependency order (psl → idn2 → unistring), otherwise the static nsfb link
 # fails with undefined references on a clean rebuild. All optional: only wired
 # in when the archives are present.
-PSL_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/libpsl/install/lib/libpsl.a"
-IDN2_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/libidn2/install/lib/libidn2.a"
-UNISTRING_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/libunistring/install/lib/libunistring.a"
+# psl and brotli are shared-only: Alpine builds their archives with slim LTO,
+# which ld.lld cannot link, so alpine-fetch.sh removes them (see the note
+# there). They are staged as shared objects and nsfb links them that way.
+PSL_LIB_DIR="$ROOT_DIR/build/$B1NIX_ARCH/pkg/libpsl/lib"
+BROTLI_LIB_DIR="$ROOT_DIR/build/$B1NIX_ARCH/pkg/brotli/lib"
+IDN2_A="$ROOT_DIR/build/$B1NIX_ARCH/pkg/libidn2/lib/libidn2.a"
+UNISTRING_A="$ROOT_DIR/build/$B1NIX_ARCH/pkg/libunistring/lib/libunistring.a"
 CURL_EXTRA_LIBS=""
 HAVE_CURL=no
 if [ -f "$CURL_A" ] && [ -n "$CURL_SRC" ] && [ -d "$MBED_DIR/lib" ]; then
   cp -R "$CURL_SRC/include/curl" "$SYSROOT/include/"
+  # Alpine's libcurl needs these at link time; the port used to fold them in.
+  cp -f "$ROOT_DIR/build/$B1NIX_ARCH/pkg/curlbuild"/lib/libcurl.so* \
+        "$SYSROOT/lib/" 2>/dev/null || true
   cp "$CURL_A" "$SYSROOT/lib/libcurl.a"
   cp "$MBED_DIR"/lib/libmbed*.a "$SYSROOT/lib/"
-  if [ -f "$PSL_A" ]; then
-    cp "$PSL_A" "$SYSROOT/lib/libpsl.a"
-    CURL_EXTRA_LIBS="$CURL_EXTRA_LIBS -lpsl"
-  fi
+  # Not optional any more: this libcurl was configured --with-libpsl and
+  # --with-brotli, so its objects reference psl_* and Brotli* unconditionally.
+  # Skipping them quietly, as this used to when the archive was missing, only
+  # moves the failure to the final nsfb link.
+  cp "$PSL_LIB_DIR"/libpsl.so* "$SYSROOT/lib/"
+  cp "$BROTLI_LIB_DIR"/libbrotlidec.so* "$BROTLI_LIB_DIR"/libbrotlicommon.so* \
+     "$SYSROOT/lib/"
+  CURL_EXTRA_LIBS="$CURL_EXTRA_LIBS -lpsl -lbrotlidec -lbrotlicommon"
   if [ -f "$IDN2_A" ]; then
     cp "$IDN2_A" "$SYSROOT/lib/libidn2.a"
     CURL_EXTRA_LIBS="$CURL_EXTRA_LIBS -lidn2"

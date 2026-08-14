@@ -90,8 +90,8 @@ EOF
 chmod +x "$SHIM/bin/clang" "$SHIM/bin/clang++" "$SHIM/bin/llvm-ar"
 
 # ── 4. configure + build ─────────────────────────────────────────────────────
-ZLIB_INC="$ROOT/build/$ARCH/ports/zlib/install/include"
-ZLIB_LIB="$ROOT/build/$ARCH/ports/zlib/install/lib"
+ZLIB_INC="$ROOT/build/$ARCH/pkg/zlib/include"
+ZLIB_LIB="$ROOT/build/$ARCH/pkg/zlib/lib"
 CURL_INC="$ROOT/build/$ARCH/ports/curl/install/include"
 CURL_LIB="$ROOT/build/$ARCH/ports/curl/install/lib"
 STUB_LIB="$ROOT/build/$ARCH/toolchain/sysroot/usr/lib"
@@ -140,7 +140,7 @@ done
 # A real Crashpad client: it starts the handler through the upstream API, then
 # crashes. Built here (not in userspace/Makefile) because it needs Crashpad's
 # own include paths and static libraries.
-SMOKE_SRC="$ROOT/userspace/bin/crashpad_smoke.cpp"
+SMOKE_SRC="$ROOT/userspace/bin/smoke/crashpad_smoke.cpp"
 if [ -f "$SMOKE_SRC" ]; then
     log "building crashpad_smoke"
     MC="$CRASHPAD_SRC/third_party/mini_chromium/mini_chromium"

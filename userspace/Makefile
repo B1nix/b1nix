@@ -495,7 +495,7 @@ open(f,'wb').write(d); \
 fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
 endif
 
-MBEDTLS_DIR := ../build/$(B1NIX_ARCH)/ports/mbedtls/install
+MBEDTLS_DIR := ../build/$(B1NIX_ARCH)/pkg/mbedtls
 
 # M104: bpkg gains HTTPS when the static mbedTLS archives are present. Every
 # real package repository is HTTPS-only, so without TLS the package manager can
@@ -565,19 +565,26 @@ $(filter-out $(BUILD)/bin/displayd,$(GUI_BINARIES)): $(BUILD)/bin/%: $$(call bin
 	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
 	)
 
-# M49: upstream libwayland-client, with libffi for protocol dispatch.
-WAYLAND_DIR := ../build/$(B1NIX_ARCH)/ports/wayland/install
-$(WAYLAND_DIR)/lib/libwayland-client.a: ../tools/ports/build-wayland.sh ../tools/ports/build-libffi.sh \
-		../tools/wayland/os.c ../tools/wayland/compat.c ../tools/wayland/compat.h
-	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/ports/build-wayland.sh >/dev/null
-$(WAYLAND_DIR)/lib/libwayland-server.a: $(WAYLAND_DIR)/lib/libwayland-client.a
+# M49: upstream libwayland, Alpine's shared build, with libffi for protocol
+# dispatch. Shared rather than static on both counts: Alpine's libffi.a is not
+# built -fPIC and a PIE cannot link it, and a library this size has no business
+# being copied into every binary that speaks the protocol. The port also carried
+# b1nix shims for eventfd and open_memstream that musl now provides outright,
+# which is what makes the upstream binary usable unmodified.
+WAYLAND_DIR := ../build/$(B1NIX_ARCH)/pkg/wayland
+FFI_DIR := ../build/$(B1NIX_ARCH)/pkg/libffi
+WAYLAND_LINK := -L$(WAYLAND_DIR)/lib -L$(FFI_DIR)/lib -rpath /lib
+$(WAYLAND_DIR)/lib/libwayland-client.so: ../tools/packages/pkg-prefix.sh ../tools/packages/alpine-ports.map
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/packages/pkg-prefix.sh wayland >/dev/null
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/packages/pkg-prefix.sh libffi >/dev/null
+$(WAYLAND_DIR)/lib/libwayland-server.so: $(WAYLAND_DIR)/lib/libwayland-client.so
 
 $(BUILD)/bin/m49_libwayland: bin/gfx/m49_libwayland.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) \
-		$(WAYLAND_DIR)/lib/libwayland-client.a
+		$(WAYLAND_DIR)/lib/libwayland-client.so
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(WAYLAND_DIR)/include -c $< -o $(BUILD)/bin/m49_libwayland.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m49_libwayland.o \
-		$(WAYLAND_DIR)/lib/libwayland-client.a $(WAYLAND_DIR)/lib/libffi.a \
+		$(WAYLAND_LINK) -lwayland-client -lffi \
 		$(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  python3 -c "\
@@ -589,11 +596,11 @@ $(BUILD)/bin/m49_libwayland: bin/gfx/m49_libwayland.c $(BESPOKE_LIBDEP) $(if $(B
 	)
 
 $(BUILD)/bin/m49_libwayland_server: bin/gfx/m49_libwayland_server.c $(BESPOKE_LIBDEP) \
-		$(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(WAYLAND_DIR)/lib/libwayland-server.a
+		$(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(WAYLAND_DIR)/lib/libwayland-server.so
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(WAYLAND_DIR)/include -c $< -o $(BUILD)/bin/m49_libwayland_server.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m49_libwayland_server.o \
-		$(WAYLAND_DIR)/lib/libwayland-server.a $(WAYLAND_DIR)/lib/libffi.a \
+		$(WAYLAND_LINK) -lwayland-server -lffi \
 		$(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  python3 -c "\
@@ -728,43 +735,51 @@ $(BUILD)/bin/m51_smoke: bin/gfx/m51_smoke.c $(BESPOKE_LIBDEP)
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_smoke.o \
 	  $(LIBM_DIR)/lib/libm.a $(BESPOKE_LIBC)
 
-# M51: m51_pixman_smoke links the ported static pixman (+libm).
-PIXMAN_DIR := ../build/$(B1NIX_ARCH)/ports/pixman/install
+# M51: the desktop/text libraries are Alpine packages, linked shared.
+#
+# Shared and not static because Alpine builds several of them with GCC's slim
+# LTO: the .a holds intermediate representation and no machine code, so ld.lld
+# reports every symbol undefined with the archive right there on the command
+# line. tools/packages/alpine-fetch.sh deletes those archives so the shared
+# library is the only thing left to find. Their headers also sit one directory
+# down (freetype2, harfbuzz, pixman-1), which is upstream's layout.
+PKG_RPATH := -rpath /lib
+PIXMAN_DIR := ../build/$(B1NIX_ARCH)/pkg/pixman
 $(BUILD)/bin/m51_pixman_smoke: bin/gfx/m51_pixman_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(PIXMAN_DIR)/include/pixman-1 -c $< -o $(BUILD)/bin/m51_pixman_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_pixman_smoke.o \
-	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
+	  -L$(PIXMAN_DIR)/lib -lpixman-1 $(PKG_RPATH) $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC)
 
 # M51: m51_freetype_smoke links the ported static FreeType (+libm).
-FT_DIR := ../build/$(B1NIX_ARCH)/ports/freetype/install
+FT_DIR := ../build/$(B1NIX_ARCH)/pkg/freetype
 $(BUILD)/bin/m51_freetype_smoke: bin/gfx/m51_freetype_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(FT_DIR)/include -c $< -o $(BUILD)/bin/m51_freetype_smoke.o
+	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(FT_DIR)/include/freetype2 -c $< -o $(BUILD)/bin/m51_freetype_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_freetype_smoke.o \
-	  $(FT_DIR)/lib/libfreetype.a $(LIBM_DIR)/lib/libm.a \
+	  -L$(FT_DIR)/lib -lfreetype $(PKG_RPATH) $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC)
 
 # M51: m51_cairo_smoke links the full stack (Cairo + FreeType + pixman + libm).
 CAIRO_DIR := ../build/$(B1NIX_ARCH)/ports/cairo/install
 $(BUILD)/bin/m51_cairo_smoke: bin/gfx/m51_cairo_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include \
+	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include/freetype2 \
 	  -c $< -o $(BUILD)/bin/m51_cairo_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_cairo_smoke.o \
-	  $(CAIRO_DIR)/lib/libcairo.a $(FT_DIR)/lib/libfreetype.a \
-	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
+	  $(CAIRO_DIR)/lib/libcairo.a -L$(FT_DIR)/lib -lfreetype \
+	  -L$(PIXMAN_DIR)/lib -lpixman-1 $(PKG_RPATH) $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC)
 
 # M51 end-to-end: Cairo + libb1gui (Wayland client) -> displayd.
 $(BUILD)/bin/m51_cairo_wayland: bin/gfx/m51_cairo_wayland.c $(GUI_LIB) $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include \
+	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include/freetype2 \
 	  -c $< -o $(BUILD)/bin/m51_cairo_wayland.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_cairo_wayland.o \
-	  $(CAIRO_DIR)/lib/libcairo.a $(FT_DIR)/lib/libfreetype.a \
-	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
+	  $(CAIRO_DIR)/lib/libcairo.a -L$(FT_DIR)/lib -lfreetype \
+	  -L$(PIXMAN_DIR)/lib -lpixman-1 $(PKG_RPATH) $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(GUI_LIB) --no-whole-archive $(BESPOKE_LIBC)
 
 # M52 end-to-end: EGL + TinyGL (software GL) + libb1gui (Wayland client) -> displayd.
@@ -845,28 +860,28 @@ $(BUILD)/bin/m55_iostream: bin/smoke/m55_iostream.cpp $(BESPOKE_LIBDEP) $(BESPOK
 # M51: m51_harfbuzz_smoke links the ported static HarfBuzz (+libm +compiler-rt
 # for integer builtins). HarfBuzz is C++ but -fno-exceptions/-rtti keep it off
 # libc++.
-HB_DIR := ../build/$(B1NIX_ARCH)/ports/harfbuzz/install
+HB_DIR := ../build/$(B1NIX_ARCH)/pkg/harfbuzz
 LLVM_RT := $(firstword $(wildcard ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/sysroot/usr/lib/libcompiler_rt.a ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/llvm-runtimes-build/install/lib/libcompiler_rt.a ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/cross/$(B1NIX_TRIPLET)/lib/libcompiler_rt.a))
 $(BUILD)/bin/m51_harfbuzz_smoke: bin/gfx/m51_harfbuzz_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(HB_DIR)/include -c $< -o $(BUILD)/bin/m51_harfbuzz_smoke.o
+	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(HB_DIR)/include/harfbuzz -c $< -o $(BUILD)/bin/m51_harfbuzz_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_harfbuzz_smoke.o \
-	  $(HB_DIR)/lib/libharfbuzz.a $(LIBM_DIR)/lib/libm.a \
+	  -L$(HB_DIR)/lib -lharfbuzz $(PKG_RPATH) $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC) $(LLVM_RT)
 
 # M51: m51_fontconfig_smoke links Fontconfig + expat + FreeType + libm.
-FC_DIR := ../build/$(B1NIX_ARCH)/ports/fontconfig/install
-EXPAT_DIR := ../build/$(B1NIX_ARCH)/ports/expat/install
+FC_DIR := ../build/$(B1NIX_ARCH)/pkg/fontconfig
+EXPAT_DIR := ../build/$(B1NIX_ARCH)/pkg/expat
 $(BUILD)/bin/m51_fontconfig_smoke: bin/gfx/m51_fontconfig_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(FC_DIR)/include -c $< -o $(BUILD)/bin/m51_fontconfig_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_fontconfig_smoke.o \
-	  $(FC_DIR)/lib/libfontconfig.a $(EXPAT_DIR)/lib/libexpat.a \
-	  $(FT_DIR)/lib/libfreetype.a $(LIBM_DIR)/lib/libm.a \
+	  -L$(FC_DIR)/lib -lfontconfig -L$(EXPAT_DIR)/lib -lexpat \
+	  -L$(FT_DIR)/lib -lfreetype $(PKG_RPATH) $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC)
 
 # M51: m51_xkb_smoke links the ported static xkbcommon.
-XKB_DIR := ../build/$(B1NIX_ARCH)/ports/xkbcommon/install
+XKB_DIR := ../build/$(B1NIX_ARCH)/pkg/xkbcommon
 XKB_INC := $(wildcard $(XKB_DIR)/include/xkbcommon/xkbcommon.h)
 XKB_REAL := $(if $(XKB_INC),$(XKB_DIR)/include,$(XKB_DIR)/include/include)
 $(BUILD)/bin/m51_xkb_smoke: bin/gfx/m51_xkb_smoke.c $(BESPOKE_LIBDEP)
@@ -876,7 +891,7 @@ $(BUILD)/bin/m51_xkb_smoke: bin/gfx/m51_xkb_smoke.c $(BESPOKE_LIBDEP)
 	  $(XKB_DIR)/lib/libxkbcommon.a $(BESPOKE_LIBC)
 
 # m32_pcre2_smoke links the ported static PCRE2 (8-bit) library.
-PCRE2_DIR := ../build/$(B1NIX_ARCH)/ports/pcre2/install
+PCRE2_DIR := ../build/$(B1NIX_ARCH)/pkg/pcre2
 $(BUILD)/bin/m32_pcre2_smoke: bin/smoke/m32_pcre2_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -DPCRE2_STATIC -I $(PCRE2_DIR)/include -c $< -o $(BUILD)/bin/m32_pcre2_smoke.o
@@ -891,13 +906,17 @@ $(BUILD)/bin/m32_pcre2_smoke: bin/smoke/m32_pcre2_smoke.c $(BESPOKE_LIBDEP) $(if
 	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
 	)
 
-# m53_zlib_smoke links the ported static zlib (image-codec dependency, M53).
-ZLIB_DIR := ../build/$(B1NIX_ARCH)/ports/zlib/install
+# m53_zlib_smoke links zlib, which is Alpine's package rather than a port —
+# same musl, same arch, built by people who do it for a living. Dynamically,
+# against their libz.so.1: the archive in the same package is not -fPIC and a
+# PIE cannot link it, and a shared library is what the image should carry
+# anyway (see "Dynamic Linking Is Mandatory" in CLAUDE.md).
+ZLIB_DIR := ../build/$(B1NIX_ARCH)/pkg/zlib
 $(BUILD)/bin/m53_zlib_smoke: bin/gfx/m53_zlib_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(ZLIB_DIR)/include -c $< -o $(BUILD)/bin/m53_zlib_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_zlib_smoke.o \
-	  $(ZLIB_DIR)/lib/libz.a $(BESPOKE_LIBC)
+	  -L$(ZLIB_DIR)/lib -lz -rpath /lib $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  python3 -c "\
 	  import sys; f=sys.argv[1]; \
@@ -908,7 +927,7 @@ $(BUILD)/bin/m53_zlib_smoke: bin/gfx/m53_zlib_smoke.c $(BESPOKE_LIBDEP) $(if $(B
 	)
 
 # m53_libpng_smoke links the ported libpng over zlib (M53 image codec).
-LIBPNG_DIR := ../build/$(B1NIX_ARCH)/ports/libpng/install
+LIBPNG_DIR := ../build/$(B1NIX_ARCH)/pkg/libpng
 $(BUILD)/bin/m53_libpng_smoke: bin/gfx/m53_libpng_smoke.c $(GEN_LIBDEP) $(GEN_LINKER)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(GEN_PIC) -I $(LIBPNG_DIR)/include -I $(ZLIB_DIR)/include -c $< -o $(BUILD)/bin/m53_libpng_smoke.o
@@ -923,7 +942,7 @@ $(BUILD)/bin/m53_libpng_smoke: bin/gfx/m53_libpng_smoke.c $(GEN_LIBDEP) $(GEN_LI
 	  $(GEN_LINK_LIBS)
 
 # m53_libjpeg_smoke links the ported static IJG libjpeg (M53 image codec).
-LIBJPEG_DIR := ../build/$(B1NIX_ARCH)/ports/libjpeg/install
+LIBJPEG_DIR := ../build/$(B1NIX_ARCH)/pkg/libjpeg
 $(BUILD)/bin/m53_libjpeg_smoke: bin/gfx/m53_libjpeg_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBJPEG_DIR)/include -c $< -o $(BUILD)/bin/m53_libjpeg_smoke.o
@@ -938,13 +957,16 @@ $(BUILD)/bin/m53_libjpeg_smoke: bin/gfx/m53_libjpeg_smoke.c $(BESPOKE_LIBDEP) $(
 	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
 	)
 
-# m53_libwebp_smoke links the ported static libwebp (M53 image/video codec).
-LIBWEBP_DIR := ../build/$(B1NIX_ARCH)/ports/libwebp/install
+# m53_libwebp_smoke links libwebp (M53 image/video codec), Alpine's package.
+# Upstream splits the sharp YUV conversion into its own archive and Alpine ships
+# that split, so libsharpyuv is named here; the port built one archive.
+LIBWEBP_DIR := ../build/$(B1NIX_ARCH)/pkg/libwebp
 $(BUILD)/bin/m53_libwebp_smoke: bin/gfx/m53_libwebp_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBWEBP_DIR)/include -c $< -o $(BUILD)/bin/m53_libwebp_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_libwebp_smoke.o \
-	  $(LIBWEBP_DIR)/lib/libwebp.a $(LIBM_DIR)/lib/libm.a \
+	  $(LIBWEBP_DIR)/lib/libwebp.a $(LIBWEBP_DIR)/lib/libsharpyuv.a \
+	  $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  python3 -c "\
@@ -957,7 +979,7 @@ $(BUILD)/bin/m53_libwebp_smoke: bin/gfx/m53_libwebp_smoke.c $(BESPOKE_LIBDEP) $(
 
 # m53_libvpx_smoke links the ported libvpx (VP8 decode) + libwebp (VP8 keyframe
 # source) + libm. M53 full-motion video codec.
-LIBVPX_DIR := ../build/$(B1NIX_ARCH)/ports/libvpx/install
+LIBVPX_DIR := ../build/$(B1NIX_ARCH)/pkg/libvpx
 $(BUILD)/bin/m53_libvpx_smoke: bin/gfx/m53_libvpx_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBVPX_DIR)/include -I $(LIBWEBP_DIR)/include -c $< -o $(BUILD)/bin/m53_libvpx_smoke.o

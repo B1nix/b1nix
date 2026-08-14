@@ -76,6 +76,210 @@ rebuilt against the bpkg-installed `libz.a` to confirm it links/runs
 correctly from that location. `tools/ports/build-zlib.sh` has **not** been
 deleted or modified — nothing here is destructive.
 
+## The cheaper path found later: take Alpine's package, don't publish our own
+
+The PoC above packages *our* build output. For most of `tools/ports/` that is
+more work than it needs to be: Alpine already builds the same software for the
+same libc and the same architecture, signs it, and serves it. `bpkg` proved the
+guest side of that — it installs and runs unmodified Alpine `bash`, `readline`
+and `libncursesw`. What was missing was the *host* side, at image-build time,
+and that is `tools/packages/alpine-fetch.sh`.
+
+It resolves a package's current version from `APKINDEX`, downloads the `.apk`
+over HTTPS, checks its sha256 against `tools/packages/alpine.lock`, unpacks the
+data segment and lays it out as `<prefix>/{include,lib}` — the same shape the
+from-source ports produce, so a consumer's `-I`/`-L` do not change. A package
+absent from the lock file stops the build and prints the hash to record, so
+adding one is a reviewable diff rather than something a mirror can do quietly.
+
+**Done for ten ports.** `zlib`, `expat`, `pcre2`, `brotli`, `libunistring`,
+`libidn2`, `libpsl`, `libpng`, `libjpeg` and `libwebp` are Alpine packages;
+their ten `tools/ports/build-*.sh` scripts are deleted. What replaced them is
+one table and one script: `tools/packages/alpine-ports.map` maps a port name to
+the packages Alpine splits it into, and `tools/packages/pkg-prefix.sh <port>`
+installs it and prints the prefix — the same contract the port scripts had, so
+the callers that read a prefix off stdout (curl, NetSurf, dropbear, libsvgtiny,
+the Mesa demo) needed only the producer changed. `m53_zlib_smoke` also moved
+from a static archive to `libz.so.1`, the shared library the image should have
+been carrying all along. Fetching costs 0.4 s cold and 0.26 s cached against
+2.4 s to build zlib, and the ratio only grows with the size of the port.
+
+Two things were learned the hard way, and both are now guarded:
+
+- **Alpine splits more finely than the ports did.** `expat` is the `xmlwf`
+  binary; the library is `libexpat`. Asking for the wrong one leaves the -dev
+  package's `libexpat.so` symlink dangling, and the linker does not complain —
+  it silently falls back to the static archive in the same directory, and the
+  failure surfaces much later, somewhere else. `alpine-fetch.sh` now fails on a
+  dangling symlink. The same split applies to `libpcre2-16`/`-32`,
+  `libturbojpeg` and libwebp's four extra archives.
+- **A static archive is not automatically fit for a shared link.** Alpine's
+  `libexpat.a` refers to libc's `stderr` with a `R_X86_64_PC32` relocation,
+  which an executable resolves through a copy relocation and a shared object
+  cannot resolve at all. That is why the Skia dependency fold links
+  `-lexpat` instead of the archive. Checking for `R_X86_64_32` alone is not
+  enough — the question is whether an archive references *imported data*.
+
+This changes the waves below in one way: for anything Alpine ships, the step is
+"fetch and delete the script", with no packaging or publishing of ours at all.
+That covers most of waves 1–4 — `brotli`, `pcre2`, `libffi`, `libpsl`,
+`libidn2`, `libunistring`, `libutf8proc`, `expat`, `libpng`, `libjpeg`,
+`libwebp`, `libvpx`, `libjxl`, `freetype`, `fontconfig`, `harfbuzz`, `pixman`,
+`cairo`, `wayland`, `libxkbcommon`, `openssl`, `mbedtls`, `curl`, `zsh`,
+`dropbear`, `busybox`, `samurai`, `openrc`, `runit`. What stays ours to publish
+is what Alpine does not package: the NetSurf library stack (`libcss`, `libdom`,
+`libhubbub`, `libwapcaplet`, `libparserutils`, `libns*`, `librosprite`,
+`libsvgtiny`), `litehtml`, `skia`, `tinygl`, `openlibm`, `crashpad`, `libharu`.
+What must keep building from source is what is tied to this kernel: `musl` (the
+ABI base, whose loader behaviour and `EI_OSABI` stamping we depend on), `mesa`
+(our GL configuration), and the in-tree `b1cc`/`libb1gui`/`displayd`.
+
+## Second pass: wayland, libffi and the desktop stack — and what shared linking cost
+
+`wayland`, `libffi`, `freetype`, `fontconfig`, `harfbuzz`, `pixman` and
+`xkbcommon` followed, which deletes seven more scripts (seventeen in total, from
+57 to 40). Wayland is the interesting one: the port carried b1nix shims for
+eventfd and `open_memstream` that musl now provides outright, so Alpine's
+unmodified `libwayland-client.so.0` runs as it is — and with it and libffi
+shared, the M49 binaries stopped carrying a copy of a protocol library each.
+
+Three things had to be understood before any of it worked, and each is now
+handled in `tools/packages/alpine-fetch.sh` rather than left to be rediscovered:
+
+- **Some Alpine archives contain no code.** They are GCC slim-LTO objects: the
+  `.a` holds intermediate representation, and ld.lld reports every symbol as
+  undefined while `nm` cheerfully lists them from the archive index. pixman,
+  libpsl and brotli are like this; harfbuzz and libwebp use *fat* LTO, which has
+  both IR and machine code and links fine. Slim archives are deleted on install,
+  so the shared library is the only candidate left.
+- **A static archive fit for an executable need not be fit for a shared
+  object.** Alpine's `libfontconfig.a` and `libexpat.a` reach their own data and
+  libc's `stderr` through PC32 relocations, which an executable resolves with a
+  copy relocation and a `.so` cannot resolve at all. The Skia dependency fold
+  therefore stopped building `libfontconfig.so` by hand and simply uses the one
+  Alpine ships.
+- **Dependencies have to be closed automatically.** freetype wants libbz2,
+  harfbuzz wants glib and graphite2, glib wants pcre2, libintl, libmount, xml2,
+  blkid, econf and lzma. Discovering that from a guest that fails to start, one
+  boot at a time, is not a method: `alpine-fetch.sh` now reads each installed
+  library's `DT_NEEDED`, resolves every missing SONAME through the index's
+  `p:so:` provides — the same lookup bpkg does in the guest — and installs until
+  the set closes.
+
+One image-side change came with it: `/lib/libc.musl-x86_64.so.1` is now a name
+for the loader, because that is the SONAME every Alpine binary records for its
+libc. Without it each of their libraries fails to load for want of a libc that
+was already present under three other names.
+
+## Third pass, and where the line actually falls
+
+`libvpx`, `mbedtls` and `openssl` followed, leaving 37 of the original 57
+scripts. Two mechanical things came with them: a `repo:` token in
+`alpine-ports.map`, because libvpx lives in community while its dependencies do
+not, and every index lookup now walks both repositories; and a fix to the
+flattening, because openssl ships `/usr/lib/libcrypto.so.3` as a symlink to
+`../../lib/`, which after flattening pointed outside the prefix and had replaced
+the real file.
+
+What is left divides into three groups, and only the first is worth more
+migration work.
+
+**Not packaged by Alpine at all** — the NetSurf library stack (`libcss`,
+`libdom`, `libhubbub`, `libwapcaplet`, `libparserutils`, `libns*`,
+`librosprite`, `libsvgtiny`), `litehtml`, `skia`, `crashpad`, `tinygl`,
+`openpam`, `netbsd-curses`, `libutf8proc`. These are ours to publish through
+`bpkg-publish.sh` if they are to leave the tree; nothing to fetch.
+
+**Packaged, but not usable here** — and this is the more interesting boundary:
+
+- `cairo`: Alpine builds it with the X11 backend, so it drags libX11, libxcb and
+  their dependencies onto an image with no X server.
+- `libjxl`: C++ built against libstdc++, while everything C++ here is libc++.
+  Two C++ ABIs in one link do not mix.
+- `mesa`: built for Linux DRM with libdrm and LLVM, not for the softpipe/OSMesa
+  configuration this uses.
+- `openlibm`: consumers name `libm.a`; Alpine's package is `libopenlibm`, and
+  musl already provides libm inside libc.so — a decision about which libm the
+  image uses, not a packaging question.
+
+**Deliberately still ours** — `musl`, because it is the ABI base whose loader
+behaviour and `EI_OSABI` stamping the whole image depends on, and `libcxx-musl`,
+which is built to match it.
+
+**A different kind of migration** — `busybox`, `openrc`, `curl`, `dropbear`,
+`bmake`, `samurai`, `runit` are rootfs *binaries*, not build-time libraries.
+Alpine ships all of them and bpkg already runs their binaries unmodified, but
+swapping them changes what the running system does — init scripts, key paths,
+applet sets — rather than only how it was built. Each wants its own
+verification, not a batch.
+
+`zsh` went first and proves the pattern. It needed a second install mode:
+`ALPINE_LAYOUT=native` keeps the package's own paths instead of flattening them
+into `{include,lib}`, because a program looks for its own files where it was
+compiled to look — zsh's modules under `/usr/lib/zsh`, its functions under
+`/usr/share/zsh` — and `pkg-prefix.sh --into <dir>` puts them in the image root
+rather than a build prefix. The dependency closure brought libncursesw and
+libcap along. Alpine's zsh 5.9 then passes the whole ZSH-SMOKE set unmodified.
+
+Three mistakes are worth recording, because they will recur for the next
+program:
+
+- The destination must be made absolute. The native copy runs from inside the
+  unpacked package so it can walk relative paths, and a relative destination is
+  resolved against *that* directory — which builds the destination path inside
+  the temporary tree, once per file.
+- A recursive copy cannot be used on an image root: `/usr/lib` there is a
+  symlink to `/lib`, and `cp -a` replaces directories rather than merging into
+  them. Directories are created with `mkdir -p`, which follows the link, and
+  files are copied one at a time.
+- The dependency closure must look only at the files this run installed. An
+  image root already holds libraries of its own, and asking the index for
+  `libskia.so` or `libb1gui.so` gets nothing, which is not an error.
+
+## The programs, and what an image root does not tolerate
+
+`curl`, `dropbear`, `bmake` and `samurai` joined `zsh`: 31 of the original 57
+scripts remain. They install through one `programs` entry into a staging root
+(`build/$ARCH/pkgroot`) that the root-image rule merges over the image, plus a
+`curlbuild` prefix for what links against libcurl rather than runs it (NetSurf).
+
+`openrc` and `runit` were tried and taken back out, which is the useful result:
+
+- Alpine's openrc brings its own `/lib/rc`, `/etc/init.d` and runlevels. They
+  replaced this image's, and the boot went straight to poweroff — 1100 checks
+  blocked behind a system that had stopped. What a package *is* and what it
+  *does to the running system* are different questions, and init is all of the
+  second.
+- Their runit is statically linked, which `tools/check-dynamic.sh` rejects
+  outright, as it should.
+
+Four failures on the way, all of them things the tree had been getting away
+with:
+
+- **`build/$ARCH/rootfs` is not reproducible.** Deleting it lost `/sbin/openrc*`
+  and `/bin/crashpad_handler`, neither of which any rule rebuilds — they had
+  been staged once, by hand, and lived there ever since. Both had to be rebuilt
+  from their ports by hand. Anything that only exists in that directory is one
+  `rm -rf` from gone.
+- **`build-crashpad.sh` had been broken for as long.** It looked for
+  `userspace/bin/crashpad_smoke.cpp`, which moved to `userspace/bin/smoke/`;
+  nobody noticed, because the binary it failed to build was already on the
+  image.
+- **The duplicate-trim removed a package's real library.** root-image deletes
+  `lib*.so.N.M.P` when the SONAME copy exists — sound when both are real files,
+  wrong when the SONAME is a *symlink to exactly that file*, which is how every
+  package names its library. The loader then reports the library as a pile of
+  missing symbols rather than as a missing file.
+- **Copying onto a symlink writes through it.** The old dropbear was one binary
+  with a name per tool; those symlinks survived in the staging root, so each
+  packaged tool in turn overwrote the single file they all pointed at, and the
+  guest got `dropbearkey` when it asked for `dbclient`. Every one of these
+  copies is `--remove-destination` now.
+
+One behavioural difference remained: Alpine's dropbear logs to syslog, so the
+service test's log file stayed empty. `-E` puts it back on stderr, where the
+init script redirects it.
+
 ## Migration waves — concrete, ordered by blast radius
 
 Grouped by dependency depth and risk, not just source size. Each wave should

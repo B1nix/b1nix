@@ -896,7 +896,7 @@ vendor, so M102a and M102b are two consumers of it rather than two ports.
 - [x] Verify a package end to end: RSA/SHA-1 signature against Alpine's keys, then `.PKGINFO`'s `datahash` against the payload. Unsigned over the network is refused.
 - [x] Install and run a real package from the real mirror: `bpkg install neofetch figlet` resolves and installs bash, readline, libncursesw and ncurses-terminfo-base, each signature-checked, and the unmodified Alpine binaries run. See [bpkg](bpkg-package-manager.md).
 - [ ] `planned` Run `.post-install`/`.pre-install` scripts and triggers, and track `/etc/apk/world`.
-- [ ] `planned` Migrate the from-source ports to packages.
+- [ ] `partial` Migrate the from-source ports to packages. `tools/packages/alpine-fetch.sh` installs an Alpine package into a build prefix at image-build time, pinned by sha256 in `tools/packages/alpine.lock`. Proven on `zlib`: the port no longer builds anything, and `m53_zlib_smoke` links Alpine's `libz.so.1` dynamically. See [ports migration](ports-migration-plan.md).
 
 ## M105: PAM (OpenPAM + pam_unix.so)
 

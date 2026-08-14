@@ -90,7 +90,7 @@ if [ -d "$MUSL_RUNTIME/libcxx-install/include/c++/v1" ]; then
 else
   LIBCXX_HDR="$MUSL_SYSROOT/include/c++/v1"
 fi
-FONTCONFIG_INC="$ARCH_DIR/ports/fontconfig/install/include"
+FONTCONFIG_INC="$ARCH_DIR/pkg/fontconfig/include"
 FREETYPE_INC="$SKIA_DIR/third_party/externals/freetype/include"
 EXPAT_INC="$SKIA_DIR/third_party/externals/expat/lib"
 if [ -d "$FONTCONFIG_INC" ]; then GL_FLAGS="$GL_FLAGS -isystem $FONTCONFIG_INC"; fi
@@ -117,10 +117,10 @@ if [ "$IS_LINK" = "1" ]; then
 
   # Mesa GL/EGL shared libs (OSMesa softpipe backend for b1nix).
   MESA_LIB_DIR="$ARCH_DIR/ports/mesa/install/lib"
-  FONTCONFIG_LIB_DIR="$ARCH_DIR/ports/fontconfig/install/lib"
-  FREETYPE_LIB_DIR="$ARCH_DIR/ports/freetype/install/lib"
-  EXPAT_LIB_DIR="$ARCH_DIR/ports/expat/install/lib"
-  ZLIB_LIB_DIR="$ARCH_DIR/ports/zlib/install/lib"
+  FONTCONFIG_LIB_DIR="$ARCH_DIR/pkg/fontconfig/lib"
+  FREETYPE_LIB_DIR="$ARCH_DIR/pkg/freetype/lib"
+  EXPAT_LIB_DIR="$ARCH_DIR/pkg/expat/lib"
+  ZLIB_LIB_DIR="$ARCH_DIR/pkg/zlib/lib"
 
   exec "$REAL" \
     --target=${B1NIX_TRIPLET:-x86_64-b1nix} \

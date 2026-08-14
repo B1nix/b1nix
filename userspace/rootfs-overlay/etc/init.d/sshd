@@ -31,7 +31,7 @@ case $1 in
     [ -f /proc/cmdline ] && grep -q "b1nix.ssh-pubkey-only" /proc/cmdline && export HARDEN="$HARDEN -s"
 
     echo "sshd: starting daemon (bind: ${BIND_ADDR}22)..."
-    /bin/dropbear -r $HOSTKEY -p ${BIND_ADDR}22 $HARDEN -F >$LOGFILE 2>&1 &
+    /bin/dropbear -r $HOSTKEY -p ${BIND_ADDR}22 $HARDEN -E -F >$LOGFILE 2>&1 &
     sleep 1
     $PIDOF pidof dropbear > $PIDFILE
     read pid < $PIDFILE

@@ -81,22 +81,13 @@ download_ports() {
 
 local_ports() {
 	export B1NIX_ARCH="$ARCH"
-	echo "BUILD zsh curl dropbear netsurf [$PKG_ARCH]"
-	curl_dir="$(B1NIX_TLS="${B1NIX_TLS:-mbedtls}" "$ROOT_DIR/tools/ports/build-curl.sh")"
-	dropbear_src="$("$ROOT_DIR/tools/ports/build-dropbear.sh" all)"
+	# zsh, curl and dropbear are Alpine packages, installed by the root-image
+	# rule from the staging root; NetSurf is not packaged anywhere and is still
+	# built here. See docs/ports-migration-plan.md.
+	echo "BUILD netsurf [$PKG_ARCH]"
 	netsurf_bin="$("$ROOT_DIR/tools/ports/build-netsurf-fb.sh")"
 
-	zsh_dir="$("$ROOT_DIR/tools/ports/build-zsh.sh")"
-
 	mkdir -p "$ROOTFS/bin"
-	cp "$zsh_dir/bin/zsh" "$ROOTFS/bin/zsh"
-	if [ -f "$curl_dir/bin/curl" ]; then
-		cp "$curl_dir/bin/curl" "$ROOTFS/bin/curl"
-	else
-		cp "$ROOT_DIR/build/$ARCH/ports/curl/src/curl" "$ROOTFS/bin/curl"
-	fi
-	cp "$dropbear_src/dropbearmulti" "$ROOTFS/bin/dropbearmulti"
-	for name in dropbear dbclient dropbearkey; do ln -sfn dropbearmulti "$ROOTFS/bin/$name"; done
 	cp "$netsurf_bin" "$ROOTFS/bin/netsurf-fb"
 }
 
@@ -131,7 +122,11 @@ stage_netsurf_assets() {
 # M32B-SSH handshake/pty failures. The Makefile builds dropbearmulti locally as
 # a dependency of install-ports either way, so prefer that fresher binary over
 # the packaged one instead of shipping a knowingly broken SSH server.
+# Dropbear is an Alpine package now, installed by the root-image rule. This
+# overlay only ever applied to a locally built multi-call binary; leaving it
+# would let a stale build tree shadow the packaged tools with symlinks.
 overlay_local_dropbear() {
+	return 0
 	local_db="$ROOT_DIR/build/$ARCH/ports/dropbear/dropbearmulti"
 	[ -f "$local_db" ] || return 0
 	mkdir -p "$ROOTFS/bin"
@@ -154,11 +149,7 @@ overlay_local_ports() {
 	nsfb="$ROOT_DIR/build/$ARCH/ports/netsurf-fb/install/bin/nsfb"
 	[ -f "$nsfb" ] && { cp "$nsfb" "$ROOTFS/bin/netsurf-fb"; echo "OVERLAY netsurf (locally built) [$PKG_ARCH]"; }
 
-	local_curl="$ROOT_DIR/build/$ARCH/ports/curl/install/bin/curl"
-	[ -f "$local_curl" ] && { cp "$local_curl" "$ROOTFS/bin/curl"; echo "OVERLAY curl (locally built) [$PKG_ARCH]"; }
-
-	local_zsh="$ROOT_DIR/build/$ARCH/ports/zsh/install/bin/zsh"
-	[ -f "$local_zsh" ] && { cp "$local_zsh" "$ROOTFS/bin/zsh"; echo "OVERLAY zsh (locally built) [$PKG_ARCH]"; }
+	# zsh comes from Alpine's package, installed by the root-image rule.
 	return 0
 }
 

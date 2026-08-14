@@ -57,7 +57,7 @@ fi
 # so link statically against the .a archives.
 MESA_BUILD="$ROOT_DIR/build/$B1NIX_ARCH/ports/mesa/meson"
 MESA_A_LIST="$(find "$MESA_BUILD" -name "*.a" 2>/dev/null | grep -v libexpat.a | tr '\n' ' ')"
-ZLIB_A="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-zlib.sh")/lib/libz.a"
+ZLIB_A="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/packages/pkg-prefix.sh" zlib)/lib/libz.a"
 [ -f "$ZLIB_A" ] || ZLIB_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/mesa/install/lib/libz.a"
 # shellcheck disable=SC2086
 "$LD" -m "$LDEMU" $LINKER_ARGS --gc-sections \

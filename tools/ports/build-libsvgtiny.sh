@@ -38,7 +38,7 @@ port_pre_build() {
     exit 1
   fi
   # expat (M51 port) — XML parser backing libdom's XML binding.
-  SVG_EXPAT_INST="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-expat.sh" | tail -1)"
+  SVG_EXPAT_INST="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/packages/pkg-prefix.sh" expat | tail -1)"
   # Sysroot from build-netsurf-fb.sh holds libdom/libwapcaplet headers + openlibm.
   SVG_SYSROOT="$ROOT_DIR/build/$B1NIX_ARCH/ports/netsurf-fb/sysroot"
   # Stage the libdom XML binding public headers under the install <dom/...>

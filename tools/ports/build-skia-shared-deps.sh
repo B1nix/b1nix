@@ -49,23 +49,23 @@ else
     clang -shared -x c - -o "$UB/libraw_ptr.so" 2>/dev/null || true
 fi
 
-# --- 2) libfontconfig.so (b1nix ports; SysV+GNU hash) ------------------------
-# Skia links -lfontconfig for its Fc* symbols. We fold the b1nix fontconfig
-# port plus its freetype/zlib/expat dependencies into one .so exporting Fc*.
-# The b1nix freetype has no libpng/Chromium-zlib deps, so the graph stays clean.
-FC_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/fontconfig/install/lib/libfontconfig.a"
-FT_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/freetype/install/lib/libfreetype.a"
-Z_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/zlib/install/lib/libz.a"
-EX_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/expat/install/lib/libexpat.a"
-for a in "$FC_A" "$FT_A" "$Z_A" "$EX_A"; do
-  [ -f "$a" ] || { echo "build-skia-shared-deps: missing archive $a" >&2; exit 1; }
-done
-"$LLD" -shared -m elf_x86_64 --hash-style=both -soname libfontconfig.so \
-  --whole-archive "$FC_A" --no-whole-archive \
-  "$FT_A" "$Z_A" "$EX_A" \
-  -L "$CROSSL" -lc \
-  --allow-shlib-undefined \
-  -o "$UB/libfontconfig.so"
+# --- 2) libfontconfig.so (Alpine's, copied) ----------------------------------
+# Skia links -lfontconfig for its Fc* symbols. This used to fold the fontconfig
+# port and its freetype/zlib/expat dependencies into one shared object by hand;
+# fontconfig is an Alpine package now and already ships that shared library, so
+# it is copied rather than rebuilt. Folding its archive is no longer even
+# possible: Alpine's static libfontconfig refers to its own data and to libc's
+# stderr with PC32 relocations, which a shared object cannot resolve.
+#
+# The copy keeps the name Skia's -lfontconfig expects; its SONAME is
+# libfontconfig.so.1, which is what consumers record and what the root-image
+# rule stages, along with the libfreetype.so.6 and libexpat.so.1 it needs.
+FC_SO="$(ls "$ROOT_DIR/build/$B1NIX_ARCH/pkg/fontconfig/lib/libfontconfig.so."[0-9]* 2>/dev/null | head -1)"
+[ -n "$FC_SO" ] || {
+  echo "build-skia-shared-deps: no libfontconfig.so.* — run tools/packages/pkg-prefix.sh fontconfig" >&2
+  exit 1
+}
+cp -f "$FC_SO" "$UB/libfontconfig.so"
 
 # --- 3) libb1gui.so (from libb1gui.a; SysV+GNU hash) -------------------------
 B1GUI_A="$UB/libb1gui.a"

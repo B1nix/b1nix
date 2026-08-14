@@ -137,7 +137,7 @@ MUSL_LIB="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib"
 # llvm-runtimes libc++.a and the cross-sysroot libz.a reference `errno` as a
 # data symbol (old b1nix libc headers) — linking them into libOSMesa.so left
 # an unresolvable UND errno that killed every Mesa consumer at load time.
-ZLIB_PORT_LIB="$ROOT_DIR/build/$B1NIX_ARCH/ports/zlib/install/lib"
+ZLIB_PORT_LIB="$ROOT_DIR/build/$B1NIX_ARCH/pkg/zlib/lib"
 if [ -f "$MUSL_LIB/libc++.a" ]; then
   LIBCXX_SO_DIR="$MUSL_LIB"
 fi
