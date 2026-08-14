@@ -562,6 +562,16 @@ void scheduler_fd_close_on_exec(void);
 
 /* ── Signal API ── */
 int scheduler_kill(usize task_id, int sig);
+/* Syscall-side signal delivery: same targets as the routines above, but each
+ * one gated by the POSIX kill(2) credential check. Kernel-internal callers use
+ * the unchecked forms. */
+int scheduler_kill_thread_group_user(usize pid, int sig);
+int scheduler_kill_process_group_user(usize pgrp, int sig);
+int scheduler_kill_all_user(int sig);
+/* prctl(PR_SET_PDEATHSIG): signo 0 clears. Delivered when the caller's parent
+ * exits, just before the caller is reparented to init. */
+int scheduler_set_pdeathsig(usize pid, int signo);
+void scheduler_clear_pdeathsig(usize pid);
 /* M86: kill(2) semantics for a positive pid — the signal targets the PROCESS,
  * so a thread that does not block it is chosen, and stop/continue signals act
  * on the whole thread group. A tid that is not a group leader keeps the plain

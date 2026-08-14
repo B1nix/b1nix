@@ -79,7 +79,34 @@ struct tcp_pseudo {
  * only for live connections, and it is what makes a receive window larger than
  * the unscaled 16-bit maximum — and therefore a non-zero advertised window
  * scale — affordable at all. */
-#define TCP_RECV_BUF_SIZE 65536
+/*
+ * A window that grows, the way Linux's does.
+ *
+ * The window is the ceiling on throughput over any link with latency: a
+ * receiver that advertises 64 KiB cannot have more than that in flight, so at
+ * 25 ms to a mirror the transfer stops at about 2.5 MB/s however wide the pipe
+ * is. Downloading a few hundred megabytes of packages into the guest is now a
+ * normal thing to do here, and it was taking half an hour.
+ *
+ * The window is the ceiling on throughput over a link with latency: a receiver
+ * advertising 64 KiB cannot have more than that in flight, which at 25 ms to a
+ * mirror stops the transfer at about 2.5 MB/s however wide the pipe is. But a
+ * fixed large buffer is paid by every connection that exists, and a browser
+ * opens them by the dozen.
+ *
+ * So the buffer starts at 64 KiB and doubles, up to a megabyte, each time it
+ * is filled — a connection that is actually moving bulk data earns its window,
+ * an idle one keeps the small buffer. The window *scale* cannot follow: it is
+ * negotiated once in the SYN and never changes, so it is chosen for the
+ * ceiling from the start, exactly as Linux does with tcp_rmem's maximum.
+ *
+ * Heap-allocated per connection, so the cost is paid by connections that
+ * exist rather than by the image; and it is what makes the advertised window
+ * scale below non-zero, which is the only way to express more than 64 KiB.
+ */
+#define TCP_RECV_BUF_INIT 65536
+#define TCP_RECV_BUF_MAX 1048576
+#define TCP_RECV_BUF_SIZE TCP_RECV_BUF_MAX
 /* The window field of a SYN is never scaled, so it cannot express more than
  * 65535 no matter how large the buffer is. */
 #define TCP_SYN_WINDOW                                                         \
@@ -214,7 +241,8 @@ struct tcp_conn {
   u32 cwnd;
   u32 ssthresh;
   int dup_acks;
-  u8 *recv_buf; /* TCP_RECV_BUF_SIZE bytes, allocated on connection setup */
+  u8 *recv_buf; /* recv_cap bytes, grown on demand — see tcp_recv_grow() */
+  u32 recv_cap; /* current size of recv_buf */
   u32 recv_len;
   u32 recv_read;
   u8 wnd_closed; /* last advertised receive window was < 1 MSS (peer throttled) */
@@ -389,7 +417,7 @@ static void tcp_build_syn_options(u8 *opt) {
 
 /* The window we advertise, already shifted by our own scale factor. */
 static u16 tcp_adv_window(const struct tcp_conn *conn) {
-  u32 free_wnd = TCP_RECV_BUF_SIZE - conn->recv_len;
+  u32 free_wnd = conn->recv_cap - conn->recv_len;
   u32 scaled = free_wnd >> conn->rcv_wscale;
   if (scaled > 65535)
     scaled = 65535;
@@ -399,7 +427,7 @@ static u16 tcp_adv_window(const struct tcp_conn *conn) {
 /* The per-connection receive buffer is heap-allocated (see TCP_RECV_BUF_SIZE).
  * Allocation always happens outside the TCP lock — kmalloc takes the heap lock,
  * and that nesting is what every other send path here avoids. */
-static u8 *tcp_alloc_recv_buf(void) { return kmalloc(TCP_RECV_BUF_SIZE); }
+static u8 *tcp_alloc_recv_buf(void) { return kmalloc(TCP_RECV_BUF_INIT); }
 
 static void tcp_free_recv_buf(struct tcp_conn *conn) {
   u8 *buf;
@@ -407,6 +435,7 @@ static void tcp_free_recv_buf(struct tcp_conn *conn) {
   tcp_lock();
   buf = conn->recv_buf;
   conn->recv_buf = 0;
+  conn->recv_cap = 0;
   conn->recv_len = 0;
   conn->recv_read = 0;
   tcp_unlock();
@@ -426,12 +455,41 @@ static void tcp_free_ooo_list(struct tcp_ooo_seg *head) {
   }
 }
 
+/*
+ * Give a connection a bigger receive buffer, up to the ceiling.
+ *
+ * Called when the buffer filled: that is the sender proving it can use more
+ * than we offered. Doubling keeps the number of reallocations logarithmic, and
+ * the data already in the buffer moves with it — the receive queue is a plain
+ * linear buffer, so a copy is all it takes.
+ *
+ * Failure is not an error: the connection keeps the buffer it has and the
+ * window stays where it was.
+ */
+static void tcp_recv_grow(struct tcp_conn *conn) {
+  u32 want;
+  u8 *bigger;
+
+  if (!conn->recv_buf || conn->recv_cap >= TCP_RECV_BUF_MAX)
+    return;
+  want = conn->recv_cap * 2;
+  if (want > TCP_RECV_BUF_MAX)
+    want = TCP_RECV_BUF_MAX;
+  bigger = kmalloc(want);
+  if (!bigger)
+    return;
+  memcpy(bigger, conn->recv_buf, conn->recv_len);
+  kfree(conn->recv_buf);
+  conn->recv_buf = bigger;
+  conn->recv_cap = want;
+}
+
 /* Append in-order bytes to the receive buffer, clamped to the free space, and
  * advance rcv_nxt by exactly what was accepted. Returns the accepted count. */
 static u32 tcp_recv_append(struct tcp_conn *conn, const u8 *data, u32 len) {
   if (!conn->recv_buf)
     return 0; /* buffer allocation failed — behave as a zero window */
-  u32 space = TCP_RECV_BUF_SIZE - conn->recv_len;
+  u32 space = conn->recv_cap - conn->recv_len;
   if (len > space)
     len = space;
   if (len == 0)
@@ -439,6 +497,9 @@ static u32 tcp_recv_append(struct tcp_conn *conn, const u8 *data, u32 len) {
   memcpy(conn->recv_buf + conn->recv_len, data, len);
   conn->recv_len += len;
   conn->rcv_nxt += len;
+  /* Filled it: this connection can use more than it was given. */
+  if (conn->recv_len == conn->recv_cap)
+    tcp_recv_grow(conn);
   return len;
 }
 
@@ -903,6 +964,7 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   memset(conn, 0, sizeof(*conn));
   conn->used = 1;
   conn->recv_buf = rcvbuf;
+  conn->recv_cap = TCP_RECV_BUF_INIT;
   conn->state = TCP_CLOSED;
   conn->family = family;
   conn->remote_ip = v4;
@@ -915,7 +977,7 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   conn->snd_una = conn->iss;
   conn->snd_nxt = conn->iss;
   /* M32: initial flow/congestion-control state. */
-  conn->snd_wnd = TCP_RECV_BUF_SIZE;  /* assume peer advertises >=1 segment */
+  conn->snd_wnd = TCP_RECV_BUF_INIT;  /* assume peer advertises >=1 segment */
   conn->cwnd = TCP_MSS;                /* slow start: 1 MSS */
   conn->ssthresh = 65535;
   conn->dup_acks = 0;
@@ -1378,7 +1440,12 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
      * this the peer waits out its zero-window persist timer (exponential
      * backoff, ~5 s) before probing — the dominant cost of a fresh HTTPS
      * connection whose cert flight overflowed the receive buffer. */
-    u32 free_wnd = TCP_RECV_BUF_SIZE - conn->recv_len;
+    /* Against the buffer this connection actually has, not the ceiling it
+     * may grow to: measuring free space against the maximum meant a full
+     * 64 KiB buffer still looked like it had ~1 MiB free, so wnd_closed was
+     * never set and this window update — the whole point of which is to keep
+     * the peer off its zero-window persist timer — never fired. */
+    u32 free_wnd = conn->recv_cap - conn->recv_len;
     if (conn->wnd_closed && free_wnd >= TCP_MSS) {
       conn->wnd_closed = 0;
       memset(wnd_update_pkt, 0, sizeof(wnd_update_pkt));
@@ -1776,8 +1843,13 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           tcp_lock();
 
           u8 *stale_buf = 0;
-          if (acc_buf && new_conn->used && !new_conn->recv_buf)
+          if (acc_buf && new_conn->used && !new_conn->recv_buf) {
             new_conn->recv_buf = acc_buf;
+            /* Capacity travels with the buffer. Assigning one without the
+             * other left an accepted connection advertising a zero window and
+             * refusing every out-of-order segment. */
+            new_conn->recv_cap = TCP_RECV_BUF_INIT;
+          }
           else
             stale_buf = acc_buf; /* freed below, outside the lock */
 
@@ -1969,7 +2041,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
       } else if (seg_len > 0 && (i32)(seg_seq - conn->rcv_nxt) > 0) {
         /* Past a hole. Only buffer what fits inside the window we advertised;
          * anything beyond it the peer should not have sent. */
-        u32 wnd = TCP_RECV_BUF_SIZE - conn->recv_len;
+        u32 wnd = conn->recv_cap - conn->recv_len;
         if ((u32)(seg_seq - conn->rcv_nxt) + seg_len <= wnd &&
             conn->ooo_segs < TCP_OOO_MAX_SEGS &&
             conn->ooo_bytes + seg_len <= TCP_OOO_MAX_BYTES) {
@@ -2020,7 +2092,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
          * arrived and retransmits only the hole. */
         u8 ack_pkt[TCP_ACK_MAX_LEN];
         usize ack_len = tcp_build_ack(conn, ack_pkt, 1, ooo_recent);
-        u32 adv_wnd = TCP_RECV_BUF_SIZE - conn->recv_len;
+        u32 adv_wnd = conn->recv_cap - conn->recv_len;
         /* Remember if we just throttled the peer below 1 MSS so tcp_recv() knows
          * to send an unsolicited window-update once the app drains the buffer,
          * instead of leaving the peer parked on its zero-window persist timer. */
@@ -2376,11 +2448,15 @@ void tcp_robustness_smoke(void) {
     console_write("M84-TCP: FAIL mss-negotiated\n");
 
   /* The advertised window is our real buffer, shifted by the scale we
-   * negotiated — a receive window past the unscaled 16-bit ceiling. */
+   * negotiated — a receive window past the unscaled 16-bit ceiling. The
+   * buffer starts at TCP_RECV_BUF_INIT and doubles under load, so the
+   * advertisement is checked against this connection's current capacity; the
+   * scale is fixed at handshake time from the ceiling the buffer may reach,
+   * because the shift cannot be renegotiated later. */
   {
     u32 advertised = (u32)tcp_adv_window(acc) << acc->rcv_wscale;
-    if (acc->rcv_wscale > 0 && advertised == TCP_RECV_BUF_SIZE &&
-        TCP_RECV_BUF_SIZE > 65535)
+    if (acc->rcv_wscale > 0 && acc->recv_cap > 0 &&
+        advertised == acc->recv_cap && TCP_RECV_BUF_MAX > 65535)
       console_write("M84-TCP: ok rcv-wscale\n");
     else
       console_write("M84-TCP: FAIL rcv-wscale\n");

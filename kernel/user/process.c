@@ -920,7 +920,14 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * segments get relocated. initramfs (no read_cb) stays eager. Guards: every
    * PT_LOAD page-congruent; no RO/RW page sharing; the reloc pass clears
    * demand_ok for any segment it writes into. */
-  int demand_page = (load_base == 0);
+  /* A PIE with a PT_INTERP is included too: the exclusion above exists because
+   * the kernel relocates a PIE's read-only segments, and the reloc pass below
+   * is itself gated on there being no interpreter — when ld.so is present the
+   * kernel writes nothing into the segments, so nothing forces private frames.
+   * Without this, a 220 MB dynamic PIE was staged with one kzalloc of its whole
+   * text and then copied page by page into private frames, per process, shared
+   * with nobody. */
+  int demand_page = (load_base == 0 || image->interp_base != 0);
   for (u16 i = 0; demand_page && i < ehdr->e_phnum; i++) {
     struct elf64_phdr *a = &phdrs[i];
     if (a->p_type != PT_LOAD)
@@ -2126,17 +2133,32 @@ int user_execve_current(const char *path, const char **argv,
                         const char **envp) {
   int interp_level = 0;
   struct vfs_node *node;
+  /* The caller's argv belongs to the caller: sys_execve frees it on every
+   * error return. A "#!" line replaces argv with an array of our own, and
+   * freeing the caller's here meant sys_execve freed it a second time when the
+   * interpreter turned out to be missing — heap corruption on any script with
+   * a bad shebang. We free only what we allocated, and only on the paths the
+   * caller cannot reach. */
+  char **our_argv = 0;
+  const char **caller_argv = argv;
 
 resolve:
   node = vfs_find_node(path);
-  if (!node || IS_ERR(node))
+  if (!node || IS_ERR(node)) {
+    if (our_argv)
+      free_kernel_array(our_argv);
     return node ? (int)PTR_ERR(node) : -ENOENT;
+  }
 
   /* POSIX: Check execute permission */
   const struct cred *cred = scheduler_get_current_cred();
   if (vfs_get_node_perm(node, cred, 1) != 1) {
     vfs_node_put(node);
-    return -EACCES;
+    {
+      if (our_argv)
+        free_kernel_array(our_argv);
+      return -EACCES;
+    }
   }
 
   u16 file_mode = node->inode->mode;
@@ -2160,8 +2182,11 @@ resolve:
     }
     if (hn >= 2 && head[0] == '#' && head[1] == '!') {
       vfs_node_put(node);
-      if (interp_level++ > 0)
+      if (interp_level++ > 0) {
+        if (our_argv)
+          free_kernel_array(our_argv);
         return -ENOEXEC;
+      }
       head[hn] = '\0';
       char *line = head + 2;
       while (*line == ' ' || *line == '\t')
@@ -2170,8 +2195,11 @@ resolve:
       while (*nl && *nl != '\n' && *nl != '\r')
         nl++;
       *nl = '\0';
-      if (*line == '\0')
+      if (*line == '\0') {
+        if (our_argv)
+          free_kernel_array(our_argv);
         return -ENOEXEC;
+      }
       char *opt = 0;
       char *sp = line;
       while (*sp && *sp != ' ' && *sp != '\t')
@@ -2191,8 +2219,11 @@ resolve:
       usize tail = argc_old > 0 ? argc_old - 1 : 0;
       usize extra = opt ? 3 : 2;
       char **nargv = kmalloc((extra + tail + 1) * sizeof(char *));
-      if (!nargv)
+      if (!nargv) {
+        if (our_argv)
+          free_kernel_array(our_argv);
         return -ENOMEM;
+      }
       usize k = 0;
       nargv[k++] = strdup(line);
       if (opt)
@@ -2201,7 +2232,9 @@ resolve:
       for (usize a = 1; a < argc_old; a++)
         nargv[k++] = strdup(argv[a]);
       nargv[k] = 0;
-      free_kernel_array((char **)argv);
+      if (our_argv)
+        free_kernel_array(our_argv); /* a previous interpreter hop's array */
+      our_argv = nargv;
       argv = (const char **)nargv;
       path = nargv[0];
       goto resolve;
@@ -2224,13 +2257,24 @@ resolve:
 
   struct user_loaded_image *image =
       user_load_image(path, 0, argv, envp, 0, 0, 1, new_euid, new_egid);
-  if (!image)
+  if (!image) {
     /* -1 here reached userspace as -errno, i.e. EPERM ("operation not
      * permitted") for what is really "this image could not be loaded" — the
      * error every failed exec reported, no matter the cause. */
-    return -ENOEXEC;
+    if (our_argv)
+      free_kernel_array(our_argv);
+    {
+      if (our_argv)
+        free_kernel_array(our_argv);
+      return -ENOEXEC;
+    }
+  }
 
-  free_kernel_array((char **)argv);
+  /* Past the point of no return: nothing below returns to sys_execve, so the
+   * caller's array is ours to release too. */
+  if (our_argv)
+    free_kernel_array(our_argv);
+  free_kernel_array((char **)caller_argv);
   free_kernel_array((char **)envp);
 
   vfs_close_on_exec();

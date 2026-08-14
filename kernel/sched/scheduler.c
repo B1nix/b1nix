@@ -682,6 +682,9 @@ static void free_task_slot(struct task *t) {
     extern void seccomp_release(struct task * t);
     seccomp_release(t);
   }
+  /* Same reason: the slot is about to be claimable by a new task that may
+   * reuse this pid, and it must not inherit a parent-death signal. */
+  scheduler_clear_pdeathsig(t->id);
   u64 flags;
   tasks_lock(&flags);
   t->state = TASK_UNUSED;
@@ -3436,6 +3439,56 @@ static int is_pgrp_orphaned(usize pgid, const struct task *exiting);
  * that thereby becomes orphaned and still has stopped members, deliver the
  * POSIX SIGHUP+SIGCONT. Shared by normal exit and the in-scheduler signal-death
  * paths so both reparent consistently (M46-3). Caller holds interrupts. */
+/* prctl(PR_SET_PDEATHSIG): the signal a task asked to receive when its parent
+ * dies. Kept in a side table rather than a struct task field, the same way the
+ * declared ptracer is — struct task is deliberately not grown. A pid holds at
+ * most one entry; signo 0 clears it. */
+#define PDEATHSIG_MAX 64
+static struct {
+  usize pid;
+  int signo;
+} g_pdeathsig[PDEATHSIG_MAX];
+
+int scheduler_set_pdeathsig(usize pid, int signo) {
+  if (signo < 0 || signo > NSIG_MAX)
+    return -EINVAL;
+  int free_slot = -1;
+  for (int i = 0; i < PDEATHSIG_MAX; i++) {
+    if (g_pdeathsig[i].pid == pid) {
+      g_pdeathsig[i].signo = signo;
+      if (signo == 0)
+        g_pdeathsig[i].pid = 0;
+      return 0;
+    }
+    if (free_slot < 0 && g_pdeathsig[i].pid == 0)
+      free_slot = i;
+  }
+  if (signo == 0)
+    return 0; /* nothing registered; clearing is a no-op */
+  if (free_slot < 0)
+    return -ENOMEM;
+  g_pdeathsig[free_slot].pid = pid;
+  g_pdeathsig[free_slot].signo = signo;
+  return 0;
+}
+
+void scheduler_clear_pdeathsig(usize pid) {
+  for (int i = 0; i < PDEATHSIG_MAX; i++) {
+    if (g_pdeathsig[i].pid == pid) {
+      g_pdeathsig[i].pid = 0;
+      g_pdeathsig[i].signo = 0;
+      return;
+    }
+  }
+}
+
+static int pdeathsig_of(usize pid) {
+  for (int i = 0; i < PDEATHSIG_MAX; i++)
+    if (g_pdeathsig[i].pid == pid)
+      return g_pdeathsig[i].signo;
+  return 0;
+}
+
 static void reparent_children_and_signal_orphans(struct task *exiting) {
   /* is_pgrp_orphaned ignores `exiting` as a parent, so a group with several of
    * our children is judged orphaned even though some have not been reparented
@@ -3444,6 +3497,12 @@ static void reparent_children_and_signal_orphans(struct task *exiting) {
     struct task *child = T(i);
     if (child->state != TASK_UNUSED && child->parent_id == exiting->id) {
       child->parent_id = 1;
+      /* Deliver the parent-death signal before the child is reparented to
+       * init, which is the only moment at which "my parent died" is still a
+       * fact rather than history. */
+      int pds = pdeathsig_of(child->id);
+      if (pds > 0)
+        scheduler_kill(child->id, pds);
       usize pgid = child->process_group_id;
       if (is_pgrp_orphaned(pgid, exiting)) {
         int has_stopped = 0;
@@ -5396,6 +5455,88 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
 /* POSIX kill(-1, sig): signal every process the caller may signal, except
  * the caller itself and init (pid 1). Kernel threads (no user address
  * space) are never targeted. */
+/* POSIX 1003.1 kill(2) permission: the sender may signal a target if its real
+ * or effective uid matches the target's real or saved uid, or it holds
+ * CAP_KILL. SIGCONT to a process in the same session is always allowed.
+ *
+ * This was missing entirely: sys_kill dispatched straight into the delivery
+ * routines, so any uid could signal any process, PID 1 included, and CAP_KILL
+ * was defined but never read. The check lives on the syscall path only —
+ * kernel-internal signalling (orphaned-group SIGHUP, parent-death signals)
+ * must not be subject to the current task's credentials. */
+static int signal_permitted(const struct task *target, int sig) {
+  const struct cred *me = scheduler_get_current_cred();
+  const struct cred *them = target ? target->cred : 0;
+  if (!me || !them)
+    return 1; /* kernel context, or a task with no credentials */
+  if (cred_has_cap(me, CAP_KILL))
+    return 1;
+  if (me->euid == them->uid || me->euid == them->suid ||
+      me->uid == them->uid || me->uid == them->suid)
+    return 1;
+  if (sig == SIGCONT && current_task &&
+      target->session_id == current_task->session_id)
+    return 1;
+  return 0;
+}
+
+/* Signal one process from a syscall, enforcing the check above. */
+int scheduler_kill_thread_group_user(usize pid, int sig) {
+  u64 flags = interrupts_save();
+  struct task *t = find_live_task(pid);
+  int allowed = t ? signal_permitted(t, sig) : -1;
+  interrupts_restore(flags);
+  if (allowed < 0)
+    return -ESRCH;
+  if (!allowed)
+    return -EPERM;
+  return scheduler_kill_thread_group(pid, sig);
+}
+
+/* Signal a process group or (pgrp == 0) every process the caller may signal,
+ * skipping members it may not. POSIX: success if the signal reached at least
+ * one; EPERM if members existed but none were permitted. */
+static int kill_many_user(usize pgrp, int sig, int all) {
+  if (sig < 0 || sig > NSIG_MAX)
+    return -EINVAL;
+  int found = 0, sent = 0;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    u64 flags = interrupts_save();
+    struct task *t = T(i);
+    int eligible = t->state != TASK_UNUSED && t->state != TASK_DEAD &&
+                   t->state != TASK_REAPING && !task_is_thread(t) &&
+                   t->pml4_phys != 0;
+    if (eligible && all)
+      eligible = (t != current_task && t->id != 1);
+    if (eligible && !all)
+      eligible = (t->process_group_id == pgrp);
+    usize id = t->id;
+    int allowed = eligible ? signal_permitted(t, sig) : 0;
+    interrupts_restore(flags);
+    if (!eligible)
+      continue;
+    found++;
+    if (!allowed)
+      continue;
+    if (sig != 0)
+      scheduler_kill(id, sig);
+    sent++;
+  }
+  if (!found)
+    return -ESRCH;
+  if (!sent)
+    return -EPERM;
+  return 0;
+}
+
+int scheduler_kill_process_group_user(usize pgrp, int sig) {
+  if (pgrp == 0)
+    return -ESRCH;
+  return kill_many_user(pgrp, sig, 0);
+}
+
+int scheduler_kill_all_user(int sig) { return kill_many_user(0, sig, 1); }
+
 int scheduler_kill_all(int sig) {
   if (sig < 0 || sig >= NSIG)
     return -EINVAL;
@@ -5408,8 +5549,6 @@ int scheduler_kill_all(int sig) {
     if (t == current_task)
       continue;
     if (t->id == 1)
-      continue;
-    if (t->name && strcmp(t->name, "displayd") == 0)
       continue;
     if (t->pml4_phys == 0)
       continue; /* kernel thread */

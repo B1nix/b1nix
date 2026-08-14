@@ -179,20 +179,34 @@ static u32 ext4_alloc_block_tx(struct ext4_fs *fs, struct journal_handle *h) {
    * files (silent cross-file data corruption under parallel writes). */
   vfs_meta_lock_acquire(&fs->alloc_lock);
   u32 groups = (fs->sb.s_blocks_count + fs->sb.s_blocks_per_group - 1) / fs->sb.s_blocks_per_group;
-  for (u32 g = 0; g < groups; g++) {
+  /* Resume where the last allocation stopped and wrap once, so a filled
+   * prefix is not rescanned bit by bit on every call. Only the group we
+   * resume into starts at a non-zero bit; the wrap still covers everything,
+   * so a free block anywhere is still found. */
+  for (u32 n = 0; n < groups; n++) {
+    u32 g = (fs->alloc_hint_group + n) % groups;
     struct ext4_bgd_64 bgd; ext4_read_bgd(fs, g, &bgd); if (bgd.bg_free_blocks_count_lo == 0) continue;
     u8 *bitmap = kmalloc(fs->block_size); ext4_read_block(fs, ext4_bgd_block_bitmap(fs, &bgd), bitmap);
-    for (u32 i = 0; i < fs->sb.s_blocks_per_group; i++) {
-      if (!(bitmap[i / 8] & (1 << (i % 8)))) {
-        bitmap[i / 8] |= (1 << (i % 8)); ext4_journal_write_tx(fs, h, ext4_bgd_block_bitmap(fs, &bgd), bitmap);
-        kfree(bitmap); bgd.bg_free_blocks_count_lo--; ext4_write_bgd_tx(fs, g, &bgd, h);
-        fs->sb.s_free_blocks_count--; ext4_write_superblock(fs);
-        u32 block_num = g * fs->sb.s_blocks_per_group + i + (fs->sb.s_log_block_size == 0 ? 1 : 0);
-        u8 *zero = kzalloc(fs->block_size); ext4_journal_write_tx(fs, h, block_num, zero);
-        kfree(zero);
-        vfs_meta_lock_release(&fs->alloc_lock);
-        return block_num;
+    u32 start = (n == 0 && fs->alloc_hint_bit < fs->sb.s_blocks_per_group)
+                    ? fs->alloc_hint_bit : 0;
+    for (u32 pass = 0; pass < 2; pass++) {
+      u32 from = pass == 0 ? start : 0;
+      u32 to = pass == 0 ? fs->sb.s_blocks_per_group : start;
+      for (u32 i = from; i < to; i++) {
+        if (!(bitmap[i / 8] & (1 << (i % 8)))) {
+          bitmap[i / 8] |= (1 << (i % 8)); ext4_journal_write_tx(fs, h, ext4_bgd_block_bitmap(fs, &bgd), bitmap);
+          kfree(bitmap); bgd.bg_free_blocks_count_lo--; ext4_write_bgd_tx(fs, g, &bgd, h);
+          fs->sb.s_free_blocks_count--; ext4_write_superblock(fs);
+          fs->alloc_hint_group = g;
+          fs->alloc_hint_bit = i + 1;
+          u32 block_num = g * fs->sb.s_blocks_per_group + i + (fs->sb.s_log_block_size == 0 ? 1 : 0);
+          u8 *zero = kzalloc(fs->block_size); ext4_journal_write_tx(fs, h, block_num, zero);
+          kfree(zero);
+          vfs_meta_lock_release(&fs->alloc_lock);
+          return block_num;
+        }
       }
+      if (start == 0) break; /* pass 0 already covered the whole group */
     }
     kfree(bitmap);
   }
@@ -381,11 +395,19 @@ static isize ext4_vfs_read(struct vfs_node *node, u64 offset, char *buffer, usiz
     }
     kfree(block_buf);
     if (done > 0) {
-        node->inode->atime = vfs_get_unix_time();
-        struct ext2_inode inode_to_update;
-        if (ext4_read_inode(fs, info->inode_num, &inode_to_update) == 0) {
-            inode_to_update.i_atime = node->inode->atime;
-            ext4_write_inode(fs, info->inode_num, &inode_to_update);
+        /* relatime: only push the access time to disk when it is older than
+         * the file's own mtime/ctime, or a day stale. The VFS keeps the live
+         * value in node->inode->atime either way. Stamping unconditionally
+         * turned a cold read of a large file into one inode-table read and one
+         * dirtied inode block per 4 KiB — a pure-read workload emitting a
+         * write stream. */
+        u64 now = vfs_get_unix_time();
+        u64 prev = node->inode->atime;
+        node->inode->atime = now;
+        if (prev <= inode.i_mtime || prev <= inode.i_ctime ||
+            now >= prev + 86400) {
+            inode.i_atime = (u32)now;
+            ext4_write_inode(fs, info->inode_num, &inode);
         }
     }
     return (isize)done;
@@ -417,14 +439,22 @@ static isize ext4_vfs_write(struct vfs_node *node, u64 offset, const char *buffe
         }
     }
     usize done = 0; u8 *block_buf = kmalloc(fs->block_size);
+    /* One transaction for the whole call, not one per block. A committed
+     * transaction costs descriptor + data + commit + the filesystem block +
+     * the journal superblock, so per-block commits wrote five blocks for every
+     * one of user data and serialized every journaled mount behind
+     * journal_tx_lock for the duration. */
+    struct journal_handle *wh = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
     while (done < size) {
         u32 b_idx = (u32)((offset + done) / fs->block_size); u32 b_off = (u32)((offset + done) % fs->block_size);
         u32 phys = ext4_get_block(fs, &inode, b_idx); if (!phys) break;
         usize chunk = fs->block_size - b_off; if (chunk > size - done) chunk = size - done;
         if (chunk < fs->block_size) ext4_read_block(fs, phys, block_buf);
-        memcpy(block_buf + b_off, buffer + done, chunk); ext4_journal_write(fs, phys, block_buf);
+        memcpy(block_buf + b_off, buffer + done, chunk);
+        ext4_journal_write_tx(fs, wh, phys, block_buf);
         done += chunk;
     }
+    if (wh) journal_commit_transaction(wh);
     kfree(block_buf);
     if (done > 0) {
         node->inode->mtime = vfs_get_unix_time();

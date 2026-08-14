@@ -244,13 +244,21 @@ static struct dcache_entry *dcache_lru_tail = 0;
 static int dcache_count = 0;
 static volatile int dcache_lock = 0;
 
-static void dcache_acquire(void) {
+/* Spin, never yield. This lock is taken from find_child while the vfs_tree
+ * read lock is held; yielding there would drop us into the scheduler with a
+ * tree lock in hand, which is exactly the race the old comment above
+ * find_child described. Every section under it is a bounded bucket walk plus
+ * an LRU splice, so a plain spin with interrupts masked is cheaper than the
+ * yield ever was. */
+static void dcache_acquire(u64 *flags) {
+  *flags = interrupts_save();
   while (__atomic_test_and_set(&dcache_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
+    __asm__ volatile("pause" ::: "memory");
 }
 
-static void dcache_release(void) {
+static void dcache_release(u64 flags) {
   __atomic_clear(&dcache_lock, __ATOMIC_RELEASE);
+  interrupts_restore(flags);
 }
 
 /* Slab-like pool for dcache entries to avoid fragmentation and kmalloc overhead
@@ -312,15 +320,36 @@ static u32 dcache_hash(struct vfs_node *parent, const char *name) {
   return h % g_dcache_size;
 }
 
-/* Dentry-cache lookup/insert: a complete LRU path-resolution cache, not yet
- * wired into the lookup path. Kept (marked unused) for future use. */
-__attribute__((unused)) static struct vfs_node *dcache_lookup(struct vfs_node *parent,
+/* Dentry cache: name→node, hashed on (parent, name), LRU-evicted.
+ *
+ * Returns the node with a reference already taken, because the reference has
+ * to be acquired under the dcache lock: a node is only freed once it is both
+ * unreferenced and marked deleted, and the free path purges the cache under
+ * this same lock, so taking the ref here is what closes the window between
+ * reading the pointer and the node's memory going back to the pool. A hit on
+ * a node already marked deleted is treated as a miss — the caller must see
+ * the unlink even if the invalidation has not reached this bucket yet. */
+static void dcache_unlink_locked(struct dcache_entry **prev_ptr,
+                                 struct dcache_entry *curr);
+
+static struct vfs_node *dcache_lookup(struct vfs_node *parent,
                                       const char *name) {
-  dcache_acquire();
+  if (!dcache || !g_dcache_size)
+    return 0;
+  u64 dcflags;
+  dcache_acquire(&dcflags);
   u32 h = dcache_hash(parent, name);
+  struct dcache_entry **prev_ptr = &dcache[h];
   struct dcache_entry *e = dcache[h];
   while (e) {
     if (e->parent == parent && strcmp(e->name, name) == 0) {
+      /* Stale entry for a node that has since been unlinked: drop it here so
+       * the caller's walk repopulates the bucket with one entry, not two. */
+      if (!e->node || e->node->deleted) {
+        dcache_unlink_locked(prev_ptr, e);
+        dcache_release(dcflags);
+        return 0;
+      }
       /* Move to LRU head */
       if (e != dcache_lru_head) {
         if (e == dcache_lru_tail)
@@ -338,18 +367,23 @@ __attribute__((unused)) static struct vfs_node *dcache_lookup(struct vfs_node *p
           dcache_lru_tail = e;
       }
       struct vfs_node *res = e->node;
-      dcache_release();
+      vfs_node_get(res); /* REFCOUNT RULE: caller owns the returned ref */
+      dcache_release(dcflags);
       return res;
     }
+    prev_ptr = &e->next;
     e = e->next;
   }
-  dcache_release();
+  dcache_release(dcflags);
   return 0;
 }
 
-__attribute__((unused)) static void dcache_insert(struct vfs_node *parent, const char *name,
+static void dcache_insert(struct vfs_node *parent, const char *name,
                           struct vfs_node *node) {
-  dcache_acquire();
+  if (!dcache || !g_dcache_size || !g_dcache_pool_size)
+    return;
+  u64 dcflags;
+  dcache_acquire(&dcflags);
   if ((u32)dcache_count >= g_dcache_pool_size) {
     /* Evict LRU tail */
     struct dcache_entry *victim = dcache_lru_tail;
@@ -384,7 +418,7 @@ __attribute__((unused)) static void dcache_insert(struct vfs_node *parent, const
   u32 h = dcache_hash(parent, name);
   struct dcache_entry *e = dcache_alloc();
   if (!e) {
-    dcache_release();
+    dcache_release(dcflags);
     return;
   }
   e->parent = parent;
@@ -405,7 +439,7 @@ __attribute__((unused)) static void dcache_insert(struct vfs_node *parent, const
     dcache_lru_tail = e;
 
   dcache_count++;
-  dcache_release();
+  dcache_release(dcflags);
 }
 
 static void dcache_unlink_locked(struct dcache_entry **prev_ptr,
@@ -424,20 +458,23 @@ static void dcache_unlink_locked(struct dcache_entry **prev_ptr,
 }
 
 static void dcache_invalidate(struct vfs_node *parent, const char *name) {
-  dcache_acquire();
+  if (!dcache || !g_dcache_size)
+    return;
+  u64 dcflags;
+  dcache_acquire(&dcflags);
   u32 h = dcache_hash(parent, name);
   struct dcache_entry **prev_ptr = &dcache[h];
   struct dcache_entry *curr = *prev_ptr;
   while (curr) {
     if (curr->parent == parent && strcmp(curr->name, name) == 0) {
       dcache_unlink_locked(prev_ptr, curr);
-      dcache_release();
+      dcache_release(dcflags);
       return;
     }
     prev_ptr = &curr->next;
     curr = *prev_ptr;
   }
-  dcache_release();
+  dcache_release(dcflags);
 }
 
 /* Purge every dcache entry that references `node` either as parent or as the
@@ -446,9 +483,10 @@ static void dcache_invalidate(struct vfs_node *parent, const char *name) {
  * dcache_lookup(reused_node, name) can return a dangling child pointer from
  * the previous owner's subtree and crash find_child's sibling walk. */
 static void dcache_invalidate_node(struct vfs_node *node) {
-  if (!node)
+  if (!node || !dcache || !g_dcache_size)
     return;
-  dcache_acquire();
+  u64 dcflags;
+  dcache_acquire(&dcflags);
   for (u32 h = 0; h < g_dcache_size; h++) {
     struct dcache_entry **prev_ptr = &dcache[h];
     struct dcache_entry *curr = *prev_ptr;
@@ -462,7 +500,7 @@ static void dcache_invalidate_node(struct vfs_node *node) {
       }
     }
   }
-  dcache_release();
+  dcache_release(dcflags);
 }
 
 /* Icache sizing (B2 audit): same RAM-scaled treatment as dcache, smaller
@@ -1083,24 +1121,40 @@ struct vfs_node *find_child(struct vfs_node *parent, const char *name) {
    * leave us dereferencing a freed node mid-walk. The IRQ-save variant keeps
    * the pre-rwlock cli/sti semantics so a same-CPU writer entered from a
    * (future) preemptive timer ISR can't race either; vfs_node_get is atomic
-   * and safe with IRQs disabled.
-   *
-   * Note: dcache is intentionally bypassed here because dcache_acquire yields
-   * on contention, which reintroduces the same race window. dcache_insert
-   * after-the-fact is the right place to repopulate when we add a similarly
-   * safe lookup path. */
+   * and safe with IRQs disabled. */
   struct vfs_node *result = 0;
   u64 flags;
   vfs_tree_read_acquire(&flags);
+
+  /* Ask the dentry cache before walking. The sibling list is a plain linked
+   * list, so a directory with N entries costs N comparisons per lookup, and a
+   * package extract does several lookups per file it creates — the /usr/lib of
+   * a desktop install turns that into hundreds of millions of comparisons.
+   * The cache is invalidated on unlink, rename, create-over and node free, so
+   * a hit is as authoritative as the walk. */
+  result = dcache_lookup(parent, name);
+  if (result) {
+    vfs_tree_read_release(flags);
+    return result;
+  }
+
+  /* The first character before the call: a directory with a few thousand
+   * entries is walked once per lookup, and an entry whose name starts with a
+   * different letter cannot match. Comparing that byte inline skips the call
+   * for almost all of them. */
+  const char first = name[0];
   struct vfs_node *child = parent->first_child;
   while (child) {
-    if (!child->deleted && strcmp(child->name, name) == 0) {
+    if (!child->deleted && child->name[0] == first &&
+        strcmp(child->name, name) == 0) {
       result = child;
       vfs_node_get(result); /* REFCOUNT RULE: caller owns the returned ref */
       break;
     }
     child = child->next_sibling;
   }
+  if (result && strlen(name) < 64)
+    dcache_insert(parent, name, result);
   vfs_tree_read_release(flags);
   return result;
 }

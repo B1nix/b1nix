@@ -862,6 +862,25 @@ static int blk_dev_write(struct block_device *dev, u64 lba, u32 count,
   return rc;
 }
 
+/* Partitions are cached under their parent, at the parent's LBA. A partition
+ * read used to re-enter the cache one level down, so every sector held two
+ * entries — one keyed by the partition, one by the disk — and each eviction
+ * and read-ahead ran twice. Worse, blk_cache_flush(partition) matched only the
+ * partition-keyed copies, and writing those back merely re-dirtied the
+ * parent-keyed layer, so fsync() on a partition-mounted root reported success
+ * without anything reaching the platter. Resolving here gives one keying. */
+static struct block_device *blk_cache_target(struct block_device *dev,
+                                             u64 *lba) {
+  if (blk_is_partition(dev)) {
+    struct partition_device *part = (struct partition_device *)dev->priv;
+    if (part && part->parent) {
+      *lba += part->start_lba;
+      return part->parent;
+    }
+  }
+  return dev;
+}
+
 int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
                     void *buffer) {
   if (!dev || !dev->read_blocks) {
@@ -880,6 +899,9 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
   if (dev->block_size != CACHE_BLOCK_SIZE) {
     return blk_dev_read(dev, lba, count, buffer);
   }
+  /* Bounds were checked against the partition above; from here the request is
+   * the parent's. */
+  dev = blk_cache_target(dev, &lba);
 
   u8 *buf8 = (u8 *)buffer;
   for (u32 i = 0; i < count; i++) {
@@ -1097,6 +1119,7 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
   if (dev->block_size != CACHE_BLOCK_SIZE) {
     return blk_dev_write(dev, lba, count, buffer);
   }
+  dev = blk_cache_target(dev, &lba);
 
   const u8 *buf8 = (const u8 *)buffer;
   for (u32 i = 0; i < count; i++) {
@@ -1202,9 +1225,24 @@ void blk_cache_flush(struct block_device *dev) {
   if (!dev->write_blocks)
     return;
 
+  /* Entries are keyed by the parent (see blk_cache_target), so flushing a
+   * partition means flushing the parent's entries that fall inside it. */
+  u64 first = 0;
+  u64 last = ~0ULL;
+  if (blk_is_partition(dev)) {
+    struct partition_device *part = (struct partition_device *)dev->priv;
+    if (!part || !part->parent)
+      return;
+    first = part->start_lba;
+    last = part->start_lba + dev->block_count;
+    dev = part->parent;
+  }
+
   for (usize i = 0; i < block_cache_n; i++) {
     u64 flags = bcache_acquire();
-    if ((block_cache[i].flags & BLK_CACHE_VALID) && block_cache[i].bdev == dev && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
+    if ((block_cache[i].flags & BLK_CACHE_VALID) && block_cache[i].bdev == dev &&
+        block_cache[i].block_no >= first && block_cache[i].block_no < last &&
+        (block_cache[i].flags & BLK_CACHE_DIRTY)) {
       struct block_buffer *buf = &block_cache[i];
       bcache_release(flags);
       blk_flush_buffer(buf);
@@ -1216,9 +1254,20 @@ void blk_cache_flush(struct block_device *dev) {
 
 void blk_cache_invalidate(struct block_device *dev) {
   if (!dev) return;
+  u64 first = 0;
+  u64 last = ~0ULL;
+  if (blk_is_partition(dev)) {
+    struct partition_device *part = (struct partition_device *)dev->priv;
+    if (!part || !part->parent)
+      return;
+    first = part->start_lba;
+    last = part->start_lba + dev->block_count;
+    dev = part->parent;
+  }
   for (usize i = 0; i < block_cache_n; i++) {
     u64 flags = bcache_acquire();
-    if (block_cache[i].bdev == dev) {
+    if (block_cache[i].bdev == dev && block_cache[i].block_no >= first &&
+        block_cache[i].block_no < last) {
       if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
         struct block_buffer *buf = &block_cache[i];
         bcache_release(flags);

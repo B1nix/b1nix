@@ -6990,17 +6990,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     isize target = (isize)arg0;
     u64 kill_ret;
     if (target == 0) {
-      kill_ret = (u64)scheduler_kill_process_group(scheduler_getpgrp(),
-                                                   (int)arg1);
+      kill_ret = (u64)scheduler_kill_process_group_user(scheduler_getpgrp(),
+                                                        (int)arg1);
     } else if (target == -1) {
-      kill_ret = (u64)scheduler_kill_all((int)arg1);
+      kill_ret = (u64)scheduler_kill_all_user((int)arg1);
     } else if (target < 0) {
-      kill_ret = (u64)scheduler_kill_process_group((usize)(-target), (int)arg1);
+      kill_ret =
+          (u64)scheduler_kill_process_group_user((usize)(-target), (int)arg1);
     } else {
       /* M86: a positive pid names a PROCESS. The signal goes to a thread in
        * that group that does not block it, and stop/continue act on the whole
        * group — kill(pid) used to hit the leader alone. */
-      kill_ret = (u64)scheduler_kill_thread_group((usize)target, (int)arg1);
+      kill_ret =
+          (u64)scheduler_kill_thread_group_user((usize)target, (int)arg1);
     }
     /* Signal delivery handled by the wrapper. */
     return kill_ret;
@@ -7283,6 +7285,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return (u64)-EINVAL;
       return (u64)ptrace_set_declared_tracer(current_task, tracer);
     }
+    /* PR_SET_PDEATHSIG (1) / PR_GET_PDEATHSIG (2): Chromium sets this on every
+     * child it forks and treats the failure as fatal to that child, so
+     * returning -EINVAL here killed every subprocess it started. */
+    if (option == 1)
+      return (u64)scheduler_set_pdeathsig(current_task->id, (int)arg1);
+    /* PR_SET_NAME (15) / PR_GET_NAME (16): the comm name is the task's own
+     * string, which we do not rewrite; accept and ignore rather than fail, as
+     * callers use it purely for diagnostics. */
+    if (option == 15)
+      return 0;
     return (u64)-EINVAL; /* other prctl options unsupported */
   }
   case SYS_MEM:

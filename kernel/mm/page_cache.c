@@ -424,19 +424,20 @@ static void writeback_page_locked(struct page_cache_entry *page) {
 
 int page_cache_flush_inode(struct vfs_inode *inode) {
   if (!inode) return -1;
-  u64 curr_offset = 0;
-  while (curr_offset < inode->size) {
-    struct page_cache_entry *page = page_cache_get_page(inode, curr_offset);
-    if (page) {
-      if (page->flags & PAGE_CACHE_DIRTY) {
-        lock_pc();
-        writeback_page_locked(page);
-        unlock_pc();
-      }
-      page_cache_put_page(page);
+  /* Walk the inode's cached pages, not its offsets. Probing offset by offset
+   * asked the cache for pages that were never resident, and every miss
+   * advanced the sequential cursor and armed read-ahead — so closing a large
+   * file read most of it back from disk in order to write a few dirty pages
+   * out. page_cache_invalidate_inode already walks the LRU lists this way. */
+  lock_pc();
+  struct page_cache_entry *heads[2] = { lru_head, active_head };
+  for (int li = 0; li < 2; li++) {
+    for (struct page_cache_entry *curr = heads[li]; curr; curr = curr->lru_next) {
+      if (curr->inode == inode && (curr->flags & PAGE_CACHE_DIRTY))
+        writeback_page_locked(curr);
     }
-    curr_offset += PAGE_SIZE;
   }
+  unlock_pc();
   return 0;
 }
 

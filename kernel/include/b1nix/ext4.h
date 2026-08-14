@@ -156,6 +156,11 @@ struct ext4_fs {
     /* Serializes the block/inode allocator bitmaps + superblock counters.
      * Sleeping lock (vfs_meta_lock_*): the holder does block I/O. */
     int alloc_lock;
+    /* Where the last allocation stopped. Without it every allocation restarts
+     * at group 0, bit 0 and rescans the whole filled prefix, so writing one
+     * large file costs O(blocks²) bit tests. Guarded by alloc_lock. */
+    u32 alloc_hint_group;
+    u32 alloc_hint_bit;
 };
 
 struct ext4_inode_info {
