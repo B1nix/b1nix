@@ -79,7 +79,7 @@ enable_one() {
     # 4. The toolchain was configured against an empty sysroot, so libstdc++
     #    recorded "libc has no C99 math/stdint/fenv" and #if's std::log2,
     #    std::isfinite, std::mt19937 (needs <stdint> fast types), etc. out of
-    #    <cmath>/<cstdint>. b1nix's libc/libm (openlibm) now provide them, so
+    #    <cmath>/<cstdint>. b1nix's libc/libm (musl) now provide them, so
     #    enable the TR1 feature macros (b1nix's math.h is C99-complete, and its
     #    classification macros are C++-guarded so std::isfinite resolves). Needed
     #    by C++ ports like libjxl; harmless for others (a declared-but-unused fn

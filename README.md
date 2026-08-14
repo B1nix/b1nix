@@ -29,7 +29,7 @@ active restoration and development on the `feature/aarch64` branch.
   `select`/`poll`, and passive TCP services.
 - Framebuffer console, Mesa 3D graphics renderer, NetSurf FB web browser, a small compositor, a text editor, and a two-panel file manager.
 - A shell (`zsh` interactive, `ash` `/bin/sh`) with pipelines, redirection, scripts, globbing, command and arithmetic substitution, here-documents, functions, loops, `case`, arrays, traps, and foreground/background job control.
-- Native utilities plus musl libc, LLVM libc++, zsh, curl, Dropbear SSH, TinyCC, Duktape, bmake, samurai, Mesa 3D, openlibm, and BusyBox 1.38.0.
+- Native utilities plus musl libc, LLVM libc++, zsh, curl, Dropbear SSH, TinyCC, Duktape, bmake, samurai, Mesa 3D, and BusyBox 1.38.0.
 - Ported LLVM/Clang toolchain, bmake, samurai, b1cc, and native build environment. The x86_64 kernel can be compiled and linked from inside B1NIX.
 - Automated QEMU coverage for boot, SMP, memory, storage, filesystems,
   networking, SSH, graphics, libc, shell, and userspace behavior.
@@ -267,11 +267,11 @@ SMOKE_VERBOSE=1 make smoke
 Build the cross and in-guest toolchains:
 
 ```sh
-tools/toolchain/build-toolchain.sh
-tools/toolchain/build-native-toolchain.sh
+tools/toolchain/build-toolchain.sh          # cross toolchain (LLVM + musl sysroot)
+tools/build-native-clang.sh --b1nix-elf     # the clang that runs inside b1nix
 ```
 
-The toolchain build is large and is cached under `build/toolchain_build/`;
+The toolchain build is large and is cached under `build/<arch>/toolchain/`;
 `make clean` preserves it, while `make distclean` removes it.
 
 The root-image workflow installs the matching native toolchain when available
@@ -302,12 +302,11 @@ still limited and some controller-specific quirks remain unverified.
 
 ```text
 kernel/             kernel core, architecture code, drivers, VFS, networking
-userspace/          libc, headers, crt, native programs, and TinyCC
+userspace/          headers, rootfs overlay, b1cc, and the native programs
 boot/               Limine bootloader configuration
 tools/              build, porting, packaging, and self-hosting tools
 tests/              QEMU smoke and persistence tests
 docs/               roadmap, ABI, porting notes, and subsystem documentation
-archive/            inactive architecture experiments
 build/              generated artifacts and downloaded upstream sources
 smoke_run/          generated test logs, captures, and temporary images
 ```

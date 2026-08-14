@@ -1,9 +1,9 @@
 #!/bin/sh
-# M40 — assemble + link tools/m40/linux_hello.S into a static Linux x86_64 ELF
+# M40 — assemble + link tools/blobs/linux_hello.S into a static Linux x86_64 ELF
 # blob, then set EI_OSABI = ELFOSABI_LINUX (3) so the binary advertises a Linux
 # personality two ways (EI_OSABI and the embedded .note.ABI-tag).
 #
-# Output: tools/m40/linux_hello.bin (committed; consumed by the initramfs build).
+# Output: tools/blobs/linux_hello.bin (committed; consumed by the initramfs build).
 # The blob is regenerated only when this script is run by hand — the kernel build
 # does not depend on a Linux assembler being present on the build host.
 set -e

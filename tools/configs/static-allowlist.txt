@@ -12,7 +12,7 @@
 # every mainstream distribution ships.
 
 /bin/m40-linux-hello  # M40: a stock static Linux binary is the subject of the test — linking it dynamically would test our own loader instead of the Linux ABI
-/bin/m40-linux-abi    # M40: freestanding Linux-ABI conformance blob (tools/m40/linux_abi_test.c) — raw Linux syscalls, no libc, so the translation layer is what gets tested rather than a b1nix libc
+/bin/m40-linux-abi    # M40: freestanding Linux-ABI conformance blob (tools/blobs/linux_abi_test.c) — raw Linux syscalls, no libc, so the translation layer is what gets tested rather than a b1nix libc
 /bin/native_smoke     # M26: built inside the guest by the native toolchain, whose default output is what is being proven
-/bin/m67-rust         # M67: committed prebuilt blob (tools/m67/hello_b1nix.elf); rustc's x86_64-unknown-b1nix target spec is crt-static, so converting it means changing the target JSON and rebuilding with the Rust toolchain present
+/bin/m67-rust         # M67: committed prebuilt blob (tools/blobs/hello_b1nix.elf); rustc's x86_64-unknown-b1nix target spec is crt-static, so converting it means changing the target JSON and rebuilding with the Rust toolchain present
 /bin/b1cc_selfsmoke   # M32: the on-device b1cc self-host driver also runs from the minimal initramfs, which ships no shared libc.so — userspace/Makefile links it against musl's libc.a on purpose (see the rule's comment)

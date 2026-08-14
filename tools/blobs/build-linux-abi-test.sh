@@ -1,9 +1,9 @@
 #!/bin/sh
-# M40 — build tools/m40/linux_abi_test.c into a static Linux x86_64 ELF blob and
+# M40 — build tools/blobs/linux_abi_test.c into a static Linux x86_64 ELF blob and
 # stamp EI_OSABI = ELFOSABI_LINUX (3), so b1nix's loader tags it with the Linux
 # personality exactly as it does for a stock Linux binary.
 #
-# Output: tools/m40/linux_abi_test.bin (committed; staged into the rootfs as
+# Output: tools/blobs/linux_abi_test.bin (committed; staged into the rootfs as
 # /bin/m40-linux-abi). Regenerated only when this script is run by hand — the
 # kernel build does not depend on a Linux-targeting compiler being installed.
 set -e

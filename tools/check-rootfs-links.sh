@@ -38,6 +38,7 @@ import os, struct, sys
 rootfs = sys.argv[1]
 
 DT_NEEDED, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_HASH, DT_GNU_HASH = 1, 5, 6, 10, 11, 4, 0x6ffffef5
+DT_RPATH, DT_RUNPATH = 15, 29
 PT_DYNAMIC, PT_LOAD = 2, 1
 STB_WEAK, SHN_UNDEF = 2, 0
 
@@ -79,6 +80,7 @@ class Elf:
     def __init__(self, path):
         self.path = path
         self.needed = []
+        self.runpath = []
         self.defined = set()
         self.undefined = set()
         self.ok = False
@@ -114,6 +116,7 @@ class Elf:
         hash_off = gnu_hash_off = None
         syment = 24
         needed_off = []
+        runpath_off = []
         pos = dyn_off
         while pos + 16 <= min(dyn_off + dyn_sz, len(data)):
             tag, val = struct.unpack_from('<qQ', data, pos)
@@ -122,6 +125,8 @@ class Elf:
                 break
             if tag == DT_NEEDED:
                 needed_off.append(val)
+            elif tag in (DT_RPATH, DT_RUNPATH):
+                runpath_off.append(val)
             elif tag == DT_STRTAB:
                 strtab = v2o(val)
             elif tag == DT_SYMTAB:
@@ -142,6 +147,15 @@ class Elf:
             return data[strtab + idx:end].decode('utf-8', 'replace')
 
         self.needed = [s(o) for o in needed_off]
+        # DT_RUNPATH/DT_RPATH are part of how the loader finds a DT_NEEDED, so
+        # they are part of how this gate must look for one. Alpine puts
+        # pulseaudio's and pipewire's private libraries in their own
+        # directories and points at them from the libraries that need them;
+        # ignoring that reported an image that runs as an image that cannot.
+        for o in runpath_off:
+            for entry in s(o).split(':'):
+                if entry:
+                    self.runpath.append(entry)
 
         if symtab is not None:
             # The symbol count comes from the hash table, never from guessing
@@ -179,6 +193,27 @@ for d in libdirs:
             libindex[name] = p
 
 cache = {}
+dircache = {}
+
+
+def runpath_lookup(elf, want):
+    """Find `want` in `elf`'s DT_RUNPATH/DT_RPATH, mapped into the rootfs.
+
+    $ORIGIN is the directory of the object holding the entry, exactly as the
+    loader expands it; an absolute entry is a guest path, so it is taken
+    relative to the rootfs rather than the host filesystem."""
+    for entry in elf.runpath:
+        entry = entry.replace('$ORIGIN', os.path.dirname(elf.path)).replace('${ORIGIN}',
+                                                                            os.path.dirname(elf.path))
+        d = entry if entry.startswith(rootfs) else os.path.join(rootfs, entry.lstrip('/'))
+        if d not in dircache:
+            try:
+                dircache[d] = set(os.listdir(d))
+            except OSError:
+                dircache[d] = set()
+        if want in dircache[d]:
+            return os.path.join(d, want)
+    return None
 
 
 def load(path):
@@ -220,15 +255,17 @@ for p in sorted(targets):
     if not e.ok:
         continue
     closure = {}
-    queue = list(e.needed)
+    # Each entry is (name, the object that named it) — a DT_RUNPATH belongs to
+    # the object carrying it, so who asked decides where to look.
+    queue = [(n, e) for n in e.needed]
     seen = set()
     unresolved = []
     while queue:
-        want = queue.pop(0)
+        want, asker = queue.pop(0)
         if want in seen:
             continue
         seen.add(want)
-        lp = libindex.get(want)
+        lp = runpath_lookup(asker, want) or libindex.get(want)
         if lp is None:
             unresolved.append(want)
             continue
@@ -236,7 +273,7 @@ for p in sorted(targets):
         if not dep.ok:
             continue
         closure[want] = dep
-        queue.extend(dep.needed)
+        queue.extend((n, dep) for n in dep.needed)
     rel = os.path.relpath(p, rootfs)
     for want in unresolved:
         missing_libs.append((rel, want))

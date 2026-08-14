@@ -51,12 +51,14 @@ B1CC_INCS := $(addprefix -Ib1cc/,$(B1CC_INC_DIRS))
 B1CC_INCS_HOST := $(addprefix -I,$(B1CC_INC_DIRS))
 B1CC_SELF_SRCS := $(filter-out b1cc/src/b1cc_token_lexer.c, $(wildcard $(B1CC_SRC_GLOB)))
 B1CC_BINS := b1cc_argv b1cc_better_c b1cc_file_write b1cc_hello b1cc_m34 b1cc_m34_corpus b1cc_stderr_exit
-LIBM_DIR := ../build/$(B1NIX_ARCH)/ports/openlibm/install
 LIBS_DIR := ../build/$(B1NIX_ARCH)/libs
 # ── musl paths (must be before CFLAGS so $(MUSL_INCLUDE) expands) ───────
 MUSL_INSTALL := ../build/$(B1NIX_ARCH)/ports/musl/install
 MUSL_INCLUDE := $(MUSL_INSTALL)/include
 MUSL_LIB     := $(MUSL_INSTALL)/lib
+# libm is musl's built-in stub: all math symbols live in libc.so; the .a is an
+# empty compatibility archive produced by build-musl.sh. openlibm is gone.
+LIBM_DIR := $(MUSL_INSTALL)
 # The blob that -lc below actually resolves against, so the dependency edge and
 # the link input name the same file.
 MUSL_LIBSO   := $(MUSL_LIB)/libc.so
@@ -581,10 +583,10 @@ $(BUILD)/bin/m32_nettool: bin/helpers/m32_nettool.c $(BESPOKE_LIBDEP) $(if $(BES
 	ln -sf m32_nettool $(BUILD)/bin/m32-nettool
 
 
-# M51: m51_smoke links the ported static libm (openlibm).
+# M51: m51_smoke links against musl's libm stub (math symbols are in libc.so).
 $(BUILD)/bin/m51_smoke: bin/gfx/m51_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBM_DIR)/include -c $< -o $(BUILD)/bin/m51_smoke.o
+	$(CC) $(CFLAGS) $(BESPOKE_PIC) -c $< -o $(BUILD)/bin/m51_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_smoke.o \
 	  $(LIBM_DIR)/lib/libm.a $(BESPOKE_LIBC)
 

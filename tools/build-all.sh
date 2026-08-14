@@ -18,22 +18,19 @@
 #     2. Userspace        — make ARCH=x86_64 userspace  (libc, crt0, ELF binaries)
 #     3. Kernel + ISO     — make ARCH=x86_64 KERNEL_CMDLINE=... iso
 #        (the default iso already embeds the shipping ports: curl, zsh,
-#         dropbear, busybox, netsurf, the M40 Linux + M67 rust artifacts, etc.)
+#         dropbear, busybox, the M40 Linux + M67 rust artifacts, etc.)
 #
 # OPT-IN heavy/optional components (each just calls its existing script):
 #     --with-cross            force-rebuild the cross toolchain even if present
 #                             (tools/toolchain/build-toolchain.sh)
-#     --with-native-toolchain native GCC/binutils that run inside b1nix (M26)
-#                             (tools/toolchain/build-native-toolchain.sh
-#                              + make install-native-toolchain)
 #     --with-native-clang     native Clang/LLVM that runs inside b1nix (M64)
 #                             (tools/build-native-clang.sh --b1nix-elf)
 #     --with-dynamic-clang    dynamic (libLLVM.so) form of the native clang
 #                             (tools/build-native-clang-dynamic.sh)
 #     --with-rust             Rust cross build for x86_64-unknown-b1nix (M67)
-#                             (tools/build-rust-toolchain.sh)
+#                             (tools/ports/build-rust.sh --toolchain)
 #     --with-v8               full V8 d8 pipeline: gen -> build -> link -> ISO
-#                             (tools/v8/v8-build-run.sh)
+#                             (tools/ports/build-v8.sh --build)
 #     --with-ports            install the userspace port packages into the rootfs
 #                             (make ARCH=x86_64 install-ports)
 #     --all                   enable every --with-* above
@@ -66,7 +63,6 @@ CROSS_CC="$(ls "$ROOT_DIR/build/${ARCH}/toolchain/llvm/cross/bin/${ARCH}-b1nix-c
 
 # ── Flags (CLI flag OR WITH_* env var) ───────────────────────────────────────
 FORCE_CROSS="${WITH_CROSS:-0}"
-WITH_NATIVE_TOOLCHAIN="${WITH_NATIVE_TOOLCHAIN:-0}"
 WITH_NATIVE_CLANG="${WITH_NATIVE_CLANG:-0}"
 WITH_DYNAMIC_CLANG="${WITH_DYNAMIC_CLANG:-0}"
 WITH_RUST="${WITH_RUST:-0}"
@@ -78,14 +74,13 @@ usage() { sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 for arg in "$@"; do
 	case "$arg" in
 		--with-cross)            FORCE_CROSS=1 ;;
-		--with-native-toolchain) WITH_NATIVE_TOOLCHAIN=1 ;;
 		--with-native-clang)     WITH_NATIVE_CLANG=1 ;;
 		--with-dynamic-clang)    WITH_DYNAMIC_CLANG=1 ;;
 		--with-rust)             WITH_RUST=1 ;;
 		--with-v8)               WITH_V8=1 ;;
 		--with-ports)            WITH_PORTS=1 ;;
 		--all)
-			WITH_NATIVE_TOOLCHAIN=1; WITH_NATIVE_CLANG=1; WITH_DYNAMIC_CLANG=1
+			WITH_NATIVE_CLANG=1; WITH_DYNAMIC_CLANG=1
 			WITH_RUST=1; WITH_V8=1; WITH_PORTS=1 ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "build-all: unknown argument '$arg' (try --help)" >&2; exit 2 ;;
@@ -115,11 +110,6 @@ stage_userspace() {
 	make ARCH="$ARCH" userspace
 }
 
-stage_native_toolchain() {
-	tools/toolchain/build-native-toolchain.sh
-	make ARCH="$ARCH" install-native-toolchain
-}
-
 stage_native_clang() {
 	tools/build-native-clang.sh --b1nix-elf
 	make ARCH="$ARCH" install-native-toolchain
@@ -130,16 +120,16 @@ stage_dynamic_clang() {
 }
 
 stage_rust() {
-	tools/build-rust-toolchain.sh
+	sh tools/ports/build-rust.sh --toolchain
 }
 
 stage_v8() {
 	if [ ! -d "$ROOT_DIR/build/x86_64/toolchain/v8-skeleton/v8" ]; then
 		echo "  V8 source tree missing (build/x86_64/toolchain/v8-skeleton/v8)." >&2
-		echo "  Run tools/v8/sync-v8.sh first (multi-GB checkout)." >&2
+		echo "  Run tools/ports/build-v8.sh --sync first (multi-GB checkout)." >&2
 		return 1
 	fi
-	sh tools/v8/v8-build-run.sh
+	sh tools/ports/build-v8.sh --build
 }
 
 stage_ports() {
@@ -158,8 +148,8 @@ add "cross toolchain"      "tools/toolchain/build-toolchain.sh"          stage_c
 add "userspace"            "make ARCH=$ARCH userspace"                   stage_userspace
 [ "$WITH_NATIVE_CLANG" = "1" ]     && add "native Clang"         "tools/build-native-clang.sh --b1nix-elf"   stage_native_clang
 [ "$WITH_DYNAMIC_CLANG" = "1" ]    && add "dynamic Clang"        "tools/build-native-clang-dynamic.sh"       stage_dynamic_clang
-[ "$WITH_RUST" = "1" ]             && add "rust cross"           "tools/rust/build-rust.sh --toolchain"      stage_rust
-[ "$WITH_V8" = "1" ]               && add "V8 (d8)"              "tools/v8/build-v8.sh --build"              stage_v8
+[ "$WITH_RUST" = "1" ]             && add "rust cross"           "tools/ports/build-rust.sh --toolchain"      stage_rust
+[ "$WITH_V8" = "1" ]               && add "V8 (d8)"              "tools/ports/build-v8.sh --build"              stage_v8
 [ "$WITH_PORTS" = "1" ]            && add "userspace ports"      "make ARCH=$ARCH install-ports"             stage_ports
 add "kernel + ISO"         "make ARCH=$ARCH KERNEL_CMDLINE='$KERNEL_CMDLINE' $ISO_TARGET" stage_kernel_iso
 

@@ -12,8 +12,8 @@
  * freestanding userspace never emits. The in-kernel ELF loader keys the "linux"
  * personality off this note (or off EI_OSABI==ELFOSABI_LINUX).
  *
- * Assembled and linked by tools/m40/build-linux-hello.sh into a committed blob
- * (tools/m40/linux_hello.bin) embedded into the initramfs as
+ * Assembled and linked by tools/blobs/build-linux-hello.sh into a committed blob
+ * (tools/blobs/linux_hello.bin) embedded into the initramfs as
  * /bin/m40-linux-hello. No b1nix toolchain or libc is involved.
  */
 

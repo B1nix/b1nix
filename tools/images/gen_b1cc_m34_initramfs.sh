@@ -28,8 +28,8 @@ for h in $HEADERS; do
     xxd -i -n "$var_name" "$h" >> "$OUT"
 done
 
-# Package real libm.a
-LIBM_A="$(ls "$ROOT/build/$ARCH/ports/openlibm/install/lib/libm.a" "$ROOT/build/openlibm-b1nix/$ARCH-b1nix/install/lib/libm.a" 2>/dev/null | head -1)"
+# Package libm.a — musl's built-in stub (all math symbols live in libc.so)
+LIBM_A="$ROOT/build/$ARCH/ports/musl/install/lib/libm.a"
 xxd -i -n vfs_b1cc_libm "$LIBM_A" >> "$OUT"
 
 # Generate B1CC_M34_INITRAMFS_FILES macro.

@@ -9,10 +9,9 @@ change.
 | Directory | What lives here |
 |---|---|
 | `smoke/` | Kernel and POSIX smoke tests — the `mNN_smoke.c` programs whose markers `tests/smoke.sh` greps for. |
-| `gfx/` | The graphics and browser stack: M47–M53, M59, M91. Tests plus the loopback servers (`m53_httpd`, `m53_httpsd`) and renderers they drive. |
+| `gfx/` | The graphics and browser stack: M47–M53, M59, M91, M101. Tests and the renderers they drive. |
 | `helpers/` | Programs a test *drives* rather than a test itself: fixtures (`hello`, `return_42`), target ELFs (`m30_pie`, `m31_setuid`, `m108shell`), stress drivers, and the musl bring-up diagnostics (`m92_*`). |
-| `tools/` | b1nix-specific utilities that ship in the image: `bpkg`, `b1nix_install`, `telinit`, `b1fetch`, `gpuinfo`, `diskbench`, `js`, `mc`, `ne`, `selfhost_build`. |
-| `gui/` | The GUI demo applications (`gclock`, `gterm`, `gpaint`, `gdesktop`, `gabout`). |
+| `tools/` | b1nix-specific utilities that ship in the image: `bpkg`, `b1nix_install`, `telinit`, `b1fetch`, `gpuinfo`, `diskbench`, `mc`, `ne`, `selfhost_build`. |
 | `compiler/` | The b1cc corpus (`b1cc_*`) — small programs the in-tree C compiler must build and run. |
 
 ## What is *not* here

@@ -158,7 +158,7 @@ account    required     pam_unix.so
 session    required     pam_unix.so
 EOF
   cat > "$INSTALL_DIR/etc/pam.d/m104-pam-smoke" <<'EOF'
-# M104 smoke test policy (userspace/bin/m104_pam_smoke.c) — same policy as
+# M104 smoke test policy (userspace/bin/smoke/m104_pam_smoke.c) — same policy as
 # sshd, kept as its own file rather than relying on the "other" fallback so
 # the test still runs unchanged if sshd's policy is edited later.
 auth       required     pam_unix.so

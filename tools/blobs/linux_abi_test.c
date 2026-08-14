@@ -1,6 +1,6 @@
 /* M40 — Linux-ABI conformance test, built as a static Linux x86_64 ELF.
  *
- * Companion to tools/m40/linux_hello.S: that blob proves a Linux binary boots
+ * Companion to tools/blobs/linux_hello.S: that blob proves a Linux binary boots
  * and reaches the console at all; this one exercises the *rest* of the Linux
  * syscall surface b1nix translates — positional I/O, the time calls, the
  * credential/scheduler/capability calls, mlock, sethostname, the xattr fd
@@ -11,7 +11,7 @@
  * below goes through the kernel's Linux translation layer, not through a b1nix
  * libc that could paper over a gap.
  *
- * Build: sh tools/m40/build-linux-abi-test.sh  (writes linux_abi_test.bin,
+ * Build: sh tools/blobs/build-linux-abi-test.sh  (writes linux_abi_test.bin,
  * committed, staged into the rootfs as /bin/m40-linux-abi).
  */
 

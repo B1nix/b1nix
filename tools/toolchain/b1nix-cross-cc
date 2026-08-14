@@ -1,2 +1,0 @@
-#!/bin/sh
-exec clang --target=x86_64-b1nix "$@"

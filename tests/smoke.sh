@@ -1058,7 +1058,7 @@ if [ "$ARCH" = "x86_64" ]; then
 	check_output "$LOG" "M40-LINUX: done" "M40 Linux ABI smoke completes"
 
 	# M40 closeout: the rest of the translated Linux surface, exercised by a
-	# second static Linux ELF (tools/m40/linux_abi_test.c).
+	# second static Linux ELF (tools/blobs/linux_abi_test.c).
 	check_output "$LOG" "M40-ABI: start" "M40 Linux ABI conformance blob starts"
 	check_output "$LOG" "M40-ABI: ok pread64" "Linux pread64 reads at an explicit offset and leaves the fd offset untouched"
 	check_output "$LOG" "M40-ABI: ok pwrite64" "Linux pwrite64 writes at an explicit offset"
@@ -2040,7 +2040,7 @@ check_output "$LOG" "M98-SMOKE: ok samu-uptodate" "re-running a satisfied build 
 check_output "$LOG" "M98-SMOKE: done" "M98 GNU-free build-tool suite completes"
 # ── M104: OpenPAM (real libpam.so.2 + pam_unix.so authenticating against
 # /etc/shadow via musl crypt(3)) — tools/ports/build-openpam.sh,
-# userspace/bin/m104_pam_smoke.c. dropbear is also rebuilt against this same
+# userspace/bin/smoke/m104_pam_smoke.c. dropbear is also rebuilt against this same
 # library (tools/ports/build-dropbear.sh, --enable-pam) but that is verified
 # at the binary/link level (DT_NEEDED libpam.so.2, real pam_authenticate/
 # pam_start/pam_end calls) rather than via an in-suite live SSH login.
@@ -2347,7 +2347,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M55-IOSTREAM: ok sstream" "M55 C++: std::ostringstream/istringstream round-trip"
 	check_output "$LOG" "M55-IOSTREAM: ok cin" "M55 C++: std::cin extraction from a real fd 0 (piped stdin)"
 	check_output "$LOG" "M55-IOSTREAM: ok filesystem" "M55 C++: std::filesystem create/iterate/stat/remove over VFS"
-	check_output "$LOG" "M51-GFX: ok libm" "M51: ported libm (openlibm) runtime math"
+	check_output "$LOG" "M51-GFX: ok libm" "M51: musl libm runtime math"
 	check_output "$LOG" "M51-GFX: ok pixman" "M51: ported pixman compositing"
 	check_output "$LOG" "M51-GFX: ok freetype" "M51: ported FreeType glyph rasterization"
 	check_output "$LOG" "M51-GFX: ok cairo" "M51: ported Cairo text rendering (full stack)"

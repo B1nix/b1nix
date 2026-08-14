@@ -75,7 +75,7 @@ ctors, calls `main`). The crate `main` is the C-ABI entry Rust generates.
 # one command (stages sysroot + builds the demo):
 sh tools/build-rust-toolchain.sh
 # regenerate the committed runtime-test blob after changing the .rs or shims:
-sh tools/m67/build-hello.sh
+sh tools/blobs/build-rust-hello.sh
 ```
 Env it relies on (all under build/, gitignored): build/rust/{rustup,cargo}
 (nightly + rust-src), build/rust/targets/*.json, the x86_64-b1nix cross gcc.
@@ -83,7 +83,7 @@ Env it relies on (all under build/, gitignored): build/rust/{rustup,cargo}
 ## Runtime smoke (wired, gated)
 
 x86_64-only, mirrors the M40 prebuilt-blob pattern:
-- `tools/m67/hello_b1nix.elf` committed; Makefile `initramfs_m67_rust.inc` xxd's it.
+- `tools/blobs/hello_b1nix.elf` committed; Makefile `initramfs_m67_rust.inc` xxd's it.
 - `initramfs.c` registers `/bin/m67-rust` (inside `#ifdef __x86_64__`).
 - `programs.c` spawns it, waits, emits `M67-RUST: ok run-std` on exit 0.
 - `smoke.sh` asserts the printed `squares=[0, 1, 4, 9, 16] sum=30` + `thread

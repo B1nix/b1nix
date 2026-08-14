@@ -3,7 +3,7 @@
 #
 # The b1nix-native clang-22 (~94MB; statically links LLVM + libstdc++, so its
 # only DT_NEEDED is libc.so.1) is far too big for the xxd-embedded initramfs, so
-# — exactly like rustc (tools/rust/rust-proof.sh) and d8 — it ships inside a
+# — exactly like rustc and d8 — it ships inside a
 # single self-contained ISO as a Multiboot2 module (ext4), which b1nix
 # exposes as the ram0 block device. With b1nix.clangrun (handled in
 # kernel/main.c) the kernel mounts ram0 -> /mnt/clang and:

@@ -6,7 +6,7 @@
 # busybox/getty/login/make), this is driven SHELL-FREE by a kernel handler
 # (b1nix.selfhostbuild in kernel/main.c): the kernel mounts this module as
 # /mnt/build, spawns `clang -c` once per kernel TU, then links with `ld.lld @rsp`
-# and checks the produced kernel.elf — mirroring the proven tools/clang/clang-proof.sh.
+# and checks the produced kernel.elf — mirroring the proven tools/inguest/clang-proof.sh.
 #
 # The module carries: /bin/clang (+ resource headers), /bin/ld.lld, /lib/libc.so.1,
 # the kernel source tree + the generated .inc inputs, a flat TU list (srcs.txt:
