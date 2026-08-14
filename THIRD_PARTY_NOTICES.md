@@ -4,7 +4,7 @@ The GNU General Public License, version 2 only (`GPL-2.0-only`, see [LICENSE](LI
 
 ---
 
-### Fetched at build time, never vendored
+## 1. Imported into the kernel — fetched at build time, never vendored
 
 | Component | Staged at | Version / Revision | License | Upstream / Reference |
 | --- | --- | --- | --- | --- |
@@ -30,90 +30,84 @@ The DRM core is **imported and never edited** — see [`docs/drm-import.md`](doc
 `tools/drm/fetch-drm-core.sh` pins the release and verifies the checksum before
 extracting, the same way the port scripts under `tools/ports/` pin theirs.
 Nothing under Linux's `include/linux` is staged: those headers are GPL-2.0
-without exception, and are exactly what b1nix reimplements from scratch under
-MIT in `kernel/include/linux` and `kernel/lkpi`.
+without exception, and are exactly what b1nix reimplements from scratch in
+`kernel/include/linux` and `kernel/lkpi` — our own code, under b1nix's licence,
+not Linux's.
 
 ---
 
-## 2. Core OS Runtimes & C/C++ Libraries
+## 2. What b1nix still builds from source
 
-| Component | Version | License Summary | Description & Purpose |
-| --- | ---: | --- | --- |
-| **musl libc** | 1.2.5 | MIT License | Primary C standard library (`libc.so`, `ld-musl-x86_64.so.1`, `libc.a`) |
-| **LLVM libc++ / libc++abi / libunwind** | 22.1.8 | Apache-2.0 WITH LLVM-exception | Modern C++ standard library, ABI & unwinder for b1nix |
-| **openlibm** | 0.8.3 | BSD-2-Clause / Freely redistributable | High-performance standalone C math library (`libopenlibm.a`) |
-| **Brotli** | 1.1.0 | MIT License | Generic lossless data compression library (`libbrotli`) |
-| **libffi** | 3.5.2 | MIT License | Portable Foreign Function Interface library (`libffi.a`) |
-| **libutf8proc** | 2.9.0 | MIT License | Clean C library for processing UTF-8 Unicode data |
-| **libharu** | 2.4.4 | Zlib / libpng License | Cross-platform C library for generating PDF files |
+These are the ports whose build we still own, because Alpine cannot give us the
+same thing: they target b1nix specifically, or nothing equivalent is packaged.
+Everything else on the image comes from Alpine as a binary package (section 3).
 
----
+| Component | License Summary | Why we build it |
+| --- | --- | --- |
+| **musl libc** | MIT License | The C library, built as one blob (libc.so is also the dynamic loader) with b1nix's target and soname |
+| **BusyBox** | GPL-2.0-only | Built against our musl with our applet manifest |
+| **OpenRC** | BSD-2-Clause | init and service manager, built against our musl |
+| **libc++ / libc++abi** | Apache-2.0 WITH LLVM-exception | The C++ runtime, cross-built for the b1nix target |
+| **OpenPAM** | BSD-3-Clause | Authentication stack |
+| **OpenLibm** | MIT / ISC / freely-distributable | libm for the freestanding userspace |
+| **Skia** | BSD-3-Clause | 2D graphics library, cross-built (its own toolchain patches live in `tools/patches/skia`) |
+| **Crashpad** | Apache-2.0 | Crash capture |
+| **Cairo** | LGPL-2.1 OR MPL-1.1 | Static build for the M51 acceptance test |
+| **litehtml** | MIT License | HTML/CSS layout engine |
+| **libjxl** | BSD-3-Clause | JPEG XL |
+| **libharu** | Zlib / libpng License | PDF generation |
+| **libutf8proc** | MIT License | UTF-8 processing |
 
-## 3. ISO Bootloader, Shells, Service Managers & System Build Tools (Milestone M98 GNU-Free Environment)
-
-Following Milestone M98 (GNU-free ISO), GNU GRUB, GNU bash, GNU Wget, and GNU Make were replaced in the default ISO distribution by permissively-licensed tools:
-
-| Component | Version | License Summary | Description & Role in B1NIX |
-| --- | ---: | --- | --- |
-| **Limine Bootloader** | 8.x | BSD-2-Clause | Modern BIOS+UEFI Multiboot2 ISO bootloader (`boot/limine/`) |
-| **zsh (Z Shell)** | 5.9 | Zsh License / MIT-style | Primary interactive login shell (`/bin/zsh`) |
-| **netbsd-curses** | 9.0 | BSD-3-Clause | Lightweight NetBSD curses/terminfo library for zsh |
-| **BusyBox** | 1.38.0 | GNU GPL version 2 | POSIX core utilities & default `/bin/sh` (`ash`) |
-| **OpenRC** | 0.54 | BSD-2-Clause | Dependency-based init & service management system |
-| **runit** | 2.1.2 | BSD-3-Clause / Public Domain | UNIX init scheme with service supervision |
-| **bmake** | current | BSD-3-Clause | NetBSD Make build automation tool (`/bin/make`) |
-| **samurai** | 1.2 | 0BSD | C reimplementation of the Ninja build system (`/bin/samu`, `/bin/ninja`) |
+Local modifications to any of these are in `tools/patches/<name>/`, and each one
+is there to teach a build about a target that does not exist upstream. Patches
+that existed because b1nix itself was wrong have been removed and the defects
+fixed; that is a standing rule, not a one-off cleanup.
 
 ---
 
-## 4. Networking, Security & Communication Stack
+## 3. Alpine packages shipped in the image
 
-| Component | Version | License Summary | Role in B1NIX |
-| --- | ---: | --- | --- |
-| **curl** | 8.20.0 | curl License (MIT-style) | Command line HTTP/HTTPS/FTP transfer tool |
-| **Dropbear** | 2022.83 | Dropbear License (MIT-style) | Lightweight SSH server & client (`dropbear`, `dbclient`) |
-| **Mbed TLS** | 3.6.0 | Apache-2.0 OR GPL-2.0-or-later | Cryptography and TLS/SSL protocol support |
-| **OpenSSL** | 1.1.1w | OpenSSL & SSLeay Licenses | Cryptographic routines and SSL/TLS engine |
-| **PCRE2** | 10.44 | BSD-3-Clause | Perl-compatible regular expressions library |
-| **GNU libidn2** | 2.3.7 | GNU LGPL-3.0-or-later OR GPL-2.0+ | Internationalized Domain Names library |
-| **GNU libunistring** | 1.2 | GNU LGPL-3.0-or-later OR GPL-2.0+ | Unicode string handling library |
-| **libpsl** | 0.21.5 | MIT License | Public Suffix List cookie/domain checking library |
-| **Mozilla CA Certificate Bundle** | build-time | Mozilla MPL 2.0 / CA Extract | Root TLS certificates for secure network connections |
+The image ships the binary packages pinned in
+[`tools/packages/alpine.lock`](tools/packages/alpine.lock) — currently 255 of
+them, verified by SHA-256 before installation. Each carries its own upstream
+licence, recorded in Alpine's package index.
+
+That list is **not duplicated here by hand**, because a hand-kept copy of a
+machine-chosen set is exactly what drifted before: this document listed Mesa,
+TinyGL and NetSurf long after they left the tree. Instead:
+
+```sh
+sh tools/packages/licenses.sh           # package, version, licence, description
+sh tools/packages/licenses.sh --check   # fails if any package has no licence
+```
+
+reads the licence straight out of the package index that the fetch already
+downloads, so it cannot fall behind the lock file.
+
+The bulk of what a user sees — sway, wlroots, foot, seatd, the Wayland
+libraries, GTK, Mesa's GL/EGL/GBM libraries, OpenSSL, curl, zsh, Dropbear,
+FreeType, Fontconfig, HarfBuzz, Pixman, the image and video codecs — is in that
+set.
 
 ---
 
-## 5. Graphics, Display, Fonts & Multimedia Porting Stack
+## 4. Binary Distribution & Compliance Requirements
 
-| Component | Version | License Summary | Description |
-| --- | ---: | --- | --- |
-| **Mesa 3D** | 24.1.0 | MIT License | OpenGL / Gallium software & hardware graphics renderer |
-| **Skia** | m124 | BSD-3-Clause | Complete 2D graphic library for drawing text, geometries, and images |
-| **TinyGL** | 0.4 | Zlib / MIT License | Small software implementation of a subset of OpenGL |
-| **NetSurf FB** | 3.11 | GPL-2.0-only / MIT (libraries) | Framebuffer web browser for b1nix |
-| **NetSurf Libraries** | 0.9 / 0.4 | MIT License | Support libraries (`libcss`, `libdom`, `libhubbub`, `libparserutils`, `libwapcaplet`, `libnsbmp`, `libnsgif`, `libnslog`, `libnsutils`, `librosprite`, `libsvgtiny`) |
-| **litehtml** | 0.9 | MIT License | Fast and lightweight HTML rendering engine |
-| **zlib** | 1.3.1 | zlib License | Data compression library |
-| **libpng** | 1.6.43 | libpng License | PNG image decoding/encoding |
-| **libjpeg-turbo** | 3.0.3 | IJG / BSD-3-Clause | Accelerated JPEG image decoding/encoding |
-| **libwebp** | 1.4.0 | BSD-3-Clause | WebP image format decoding and encoding library |
-| **libvpx** | 1.14.1 | BSD-3-Clause | VP8/VP9 video codec library |
-| **libjxl** | 0.11.1 | BSD-3-Clause | JPEG XL reference implementation |
-| **FreeType** | 2.13.2 | FTL (BSD-style) / GPL-2.0 | Font rendering engine |
-| **Fontconfig** | 2.15.0 | MIT License | Font configuration and discovery |
-| **Pixman** | 0.43.4 | MIT License | Low-level pixel manipulation library |
-| **Cairo** | 1.18.0 | LGPL-2.1 OR MPL-1.1 | 2D vector graphics library |
-| **Expat** | 2.6.2 | MIT License | Stream-oriented XML parser |
-| **libwayland** | 1.23.0 | MIT License | Display server protocol support |
-| **libxkbcommon** | 1.7.0 | MIT License | Keyboard keymap handling library |
-| **HarfBuzz** | 8.5.0 | MIT License | Text shaping engine |
+b1nix's own code is GPL-2.0-only (see [LICENSE](LICENSE)), which already
+requires the source to travel with any binary you distribute. The components
+above add their own requirements on top. Anyone redistributing a b1nix image
+must:
 
-## 6. Binary Distribution & Compliance Requirements
+1. Preserve every component's copyright and licence notices.
+2. Ship the full text of each applicable licence.
+3. Ship the complete corresponding source, and the scripts used to build it,
+   for b1nix itself and for every GPL/LGPL component.
+4. Meet the relinking or source obligations for any statically linked LGPL
+   library.
 
-Placing downloaded source under `build/` or embedding compiled objects into initramfs/rootfs image does not by itself satisfy distribution requirements. Anyone redistributing B1NIX binary images or releases must:
-
-1. Preserve copyright and license notices for all components.
-2. Provide the full text of applicable licenses (GPL, LGPL, MIT, BSD, Apache).
-3. Provide complete corresponding source code and build scripts for GPL/LGPL covered components.
-4. Comply with relinking or source requirements for statically linked LGPL libraries.
+Note for whoever assembles a release: the imported Linux DRM and i915 sources
+are taken under their MIT option, and `tools/drm/fetch-*.sh` refuses to stage a
+file that is GPL-2.0-only with no permissive alternative. That keeps the import
+narrow; it is not a licence constraint now that b1nix is GPL-2.0-only itself.
 
 *This document is an inventory of third-party licenses and does not constitute legal advice.*
