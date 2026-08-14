@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_XEN_XEN_H
 #define LKPI_XEN_XEN_H
 /* Xen paravirtualisation. b1nix runs on bare metal and under KVM, never as a

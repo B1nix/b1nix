@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_FCNTL_H
 #define LKPI_LINUX_FCNTL_H
 /* Open flags. ABI values, reproduced rather than chosen: userspace passes them

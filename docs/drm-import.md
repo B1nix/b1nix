@@ -7,8 +7,8 @@ makes the arrangement affordable.
 
 **Upstream `drivers/gpu/drm` is imported verbatim and never edited.** Everything
 it stands on — the `linux/*` headers it includes, the primitives behind them — is
-b1nix's own, written from scratch under MIT in `kernel/include/linux` and
-`kernel/lkpi`.
+b1nix's own, written from scratch in `kernel/include/linux` and `kernel/lkpi`,
+under b1nix's own license rather than Linux's.
 
 **M100's own DRM core stays, for virtio-gpu.** That is two cores in one kernel,
 which is normally a smell. It is allowed here for exactly one reason: one of them

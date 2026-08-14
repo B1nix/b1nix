@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_HRTIMER_H
 #define LKPI_LINUX_HRTIMER_H
 #include <linux/ktime.h>

@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-2.0-only
  *
  * The ACPI integration i915 expects, for a system that has ACPI but does not
  * expose the graphics _DSM methods to a driver.

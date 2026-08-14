@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: GPL-2.0-only
  *
  * M101t: /dev/dri/card1 — the imported DRM core, exposed to userspace.
  *

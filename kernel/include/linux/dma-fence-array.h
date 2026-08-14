@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_DMA_FENCE_ARRAY_H
 #define LKPI_LINUX_DMA_FENCE_ARRAY_H
 #include <linux/dma-fence.h>

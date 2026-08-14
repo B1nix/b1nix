@@ -19,7 +19,7 @@ reordered or dropped independently.
 | milestone | scope | est. |
 |---|---|---|
 | M99 | Driver infrastructure: netconsole, PAT/WC, PCI BARs/caps/MSI | ~1 month |
-| M100 | linuxkpi compatibility layer (own MIT headers) | ~1 month |
+| M100 | linuxkpi compatibility layer (our own headers) | ~1 month |
 | M101 | DRM core: `dma-fence`, scheduler, GEM — proven on virtio-gpu | ~2 months |
 | M102 | Intel `i915` (Gen8/Gen9.5) + Mesa `iris` | ~3 months |
 | M103 | `amdgpu` on RX 6600, render-only + radeonsi | ~6–9 months |

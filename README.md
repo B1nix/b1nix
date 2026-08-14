@@ -132,8 +132,23 @@ Build and boot the installer ISO, then install to a whole target disk:
 
 ```sh
 make disk-iso
-b1nix_install /dev/sata0
+b1nix_install /dev/sda
 ```
+
+Disks carry the names the rest of Unix uses, so the target above is the one you
+would type on any other system:
+
+| Class | Disk | First partition |
+| --- | --- | --- |
+| SATA/AHCI and USB storage | `sda`, `sdb`, … | `sda1` |
+| virtio-blk | `vda`, `vdb`, … | `vda1` |
+| NVMe | `nvme0n1`, `nvme1n1`, … | `nvme0n1p1` |
+| Ramdisk / loop | `ram0`, `loop0`, … | — |
+
+SATA and USB disks share one `sd` sequence, as they do on Linux — both are SCSI
+disks — so the letter follows the order the disks were registered, not the bus
+they arrived on. A fifth disk is `sde` whichever bus delivered it. Boot entries should still name the root filesystem by what it is
+(`root=LABEL=…` or `root=UUID=…`) rather than by which port it sits on.
 
 The installer writes the bootable base, mounts its root partition, and installs
 all matching packages from `b1nix-pkgs`. Use `--no-packages` for an offline
@@ -324,9 +339,23 @@ smoke_run/          generated test logs, captures, and temporary images
 
 ## License
 
-Original B1NIX code is licensed under the
-[MIT License](LICENSE).
+Original b1nix code — the kernel, the userspace, the linuxkpi layer, the build
+tooling and b1cc — is licensed under the
+[GNU General Public License, version 2 only](LICENSE) (`GPL-2.0-only`).
 
-See [licenses/LICENSING.md](licenses/LICENSING.md) for the exact scope. TinyCC and all other
-third-party components retain their own licenses; see
-[licenses/THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md).
+Version 2 *only*, not "or later": the terms cannot be widened by a future
+publication, and in exchange nothing here reaches past distribution — running
+b1nix to serve others over a network obliges you to publish nothing. Note what
+version 2 does not carry: the installation-information (anti-tivoization) terms
+are a version 3 addition, so this license does not require a device shipping
+b1nix to let its owner install a modified copy.
+
+This is also the license Linux itself uses, which makes the imported DRM and
+i915 sources a straightforward fit rather than a compatibility question.
+
+Third-party components keep their own licenses. The imported Linux DRM and i915
+sources are still taken under their MIT option and the fetch scripts still
+refuse anything `GPL-2.0`-only — that is now a scoping decision about what we
+import rather than a licence requirement, and it stays because a narrow import
+is easier to carry. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
+each component and its terms.

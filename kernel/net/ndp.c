@@ -455,7 +455,7 @@ void ndp_tick(u64 now_ticks)
 #include <b1nix/netproto.h>
 
 MODULE_NAME("ndp");
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("b1nix");
 MODULE_DESCRIPTION("IPv6 Neighbour Discovery and SLAAC");
 MODULE_ALIAS("net-ipv6-nd");

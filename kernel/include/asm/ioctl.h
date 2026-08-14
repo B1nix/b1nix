@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_ASM_IOCTL_H
 #define LKPI_ASM_IOCTL_H
 /* The uapi DRM headers build their ioctl numbers with these. The encoding is

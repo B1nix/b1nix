@@ -16,7 +16,7 @@
 # heritage), and include/uapi/drm is GPL-2.0 WITH Linux-syscall-note, whose
 # exception explicitly permits non-GPL use. Nothing under include/linux is
 # staged — those are GPL-2.0 without exception, and are exactly what the shim
-# reimplements from scratch. See LICENSING.md and THIRD_PARTY_NOTICES.md.
+# reimplements from scratch. See LICENSE and THIRD_PARTY_NOTICES.md.
 
 set -eu
 

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_CIRC_BUF_H
 #define LKPI_LINUX_CIRC_BUF_H
 /* A ring described by head, tail and a power-of-two size. One producer and one

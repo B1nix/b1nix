@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_PAGEVEC_H
 #define LKPI_LINUX_PAGEVEC_H
 #include <linux/mm.h>

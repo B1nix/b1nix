@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_PCI_IDS_H
 #define LKPI_LINUX_PCI_IDS_H
 /* The vendor and subsystem ids drivers match on. Only the ones imported code

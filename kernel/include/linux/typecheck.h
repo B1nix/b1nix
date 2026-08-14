@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_TYPECHECK_H
 #define LKPI_LINUX_TYPECHECK_H
 /* Assert that `x` has the given type, yielding 1. Upstream uses it to catch a

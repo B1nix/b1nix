@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_STRINGIFY_H
 #define LKPI_LINUX_STRINGIFY_H
 #define __stringify_1(x) #x

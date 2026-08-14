@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_IO_64_NONATOMIC_LO_HI_H
 #define LKPI_LINUX_IO_64_NONATOMIC_LO_HI_H
 #include <linux/io.h>

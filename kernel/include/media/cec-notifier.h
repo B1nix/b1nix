@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_MEDIA_CEC_NOTIFIER_H
 #define LKPI_MEDIA_CEC_NOTIFIER_H
 #include <linux/err.h>

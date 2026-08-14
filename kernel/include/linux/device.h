@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_DEVICE_H
 #define LKPI_LINUX_DEVICE_H
 #include <linux/ratelimit.h> /* upstream reaches it through dev_printk */

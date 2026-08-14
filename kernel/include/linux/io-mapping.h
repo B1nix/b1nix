@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_IO_MAPPING_H
 #define LKPI_LINUX_IO_MAPPING_H
 #include <linux/io.h>

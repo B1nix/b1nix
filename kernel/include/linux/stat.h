@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_STAT_H
 #define LKPI_LINUX_STAT_H
 /* The mode bits, for the attribute files a driver registers. Octal, as they are

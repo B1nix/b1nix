@@ -470,6 +470,11 @@ Status:
 - [x] VirGL 3D acceleration over VirtIO-GPU with host GPU pixel verification.
 - [x] Upstream Mesa OSMesa + Gallium softpipe via meson cross-build.
 - [x] GLSL programmable shader pipeline through Mesa compiler.
+- Superseded: the OSMesa port (`tools/ports/build-mesa.sh`, a 477 MB build tree)
+  is gone. Mesa is Alpine's `mesa-egl`/`-gles`/`-gbm`/`-gl`/`-glapi` now, which is
+  what `libwlroots` links and therefore what sway needs; the demos that used
+  OSMesa went with the rest of the old GUI stack. See
+  [ports migration](ports-migration-plan.md).
 
 ## M53: Browser Platform
 
@@ -526,6 +531,8 @@ Status:
 
 - [x] Real EGL 1.4/1.5 over Mesa OSMesa softpipe (off-screen pbuffer and displayd window path).
 - [x] Software Skia (Ganesh) raster fallback.
+- Superseded with M52: the EGL smoke and the OSMesa it ran on are gone, along
+  with the displayd window path they drew into.
 
 ## M60: Ozone Platform
 
@@ -561,7 +568,7 @@ Status:
 - [x] Standalone install to real disk with bootable MBR/ext4 image.
 - [x] `tools/images/mk-disk-image.sh` host script for bootable disk images.
 - [x] `/bin/b1nix_install` in-guest whole-disk installer.
-- [x] Block I/O fixes for raw `/dev/sataN` and bulk DMA fast path.
+- [x] Block I/O fixes for raw `/dev/sdX` and bulk DMA fast path.
 
 ## Frozen - M66: Chromium Browser Frontend (planned)
 
@@ -697,9 +704,11 @@ Status:
 - [x] Skia Graphite CPU backend (`M91-SKIA: ok graphite-cpu`).
 - [x] Skia Graphite GPU backend via Dawn/OpenGL ES (`M91-SKIA: ok graphite-dawn`).
 - [x] fontconfig integration with Skia (`M91-SKIA: ok text-draw`).
-- [x] Dynamic Mesa linking for M91/M52/M59 demos (`libOSMesa.so.8`).
 - [x] Skottie (Lottie animation) support verified (`M91-SKIA: ok skottie`).
-- [x] Real shared `.so` for EGL/GL/fontconfig (`libEGL.so`, `libGLESv2.so`, `libfontconfig.so`).
+- [x] Real shared `.so` for fontconfig (`libfontconfig.so`).
+- Superseded with M52: the `m91_skia_smoke` demo and the hand-built
+  `libEGL.so`/`libGLESv2.so` it linked are gone; no check exercised them. GL on
+  the image is Alpine's Mesa.
 
 ## M92: musl libc Port
 
@@ -772,9 +781,9 @@ Status:
 - [x] Prove delivery with a driver that uses it: NVMe takes its completions over MSI-X.
 - [x] Decode Intel graphics stolen memory as a pure function, tested against the spec.
 
-## M99: linuxkpi Compatibility Layer (own MIT headers)
+## M99: linuxkpi Compatibility Layer (our own headers)
 
-- [x] Write the headers from scratch under MIT, copying no Linux source.
+- [x] Write the headers from scratch, copying no Linux source.
 - [x] Add idr, completion, workqueue, scatterlist and firmware loading.
 - [x] Add ioremap variants over the kernel's MMIO mapper.
 - [x] Add dma-mapping: coherent allocation, single and sg mapping, cache sync.
@@ -839,8 +848,8 @@ Status:
 ## M101: linuxkpi for DRM — run upstream drivers unmodified
 
 The vendor drivers are imported as they are written and never edited; everything
-they stand on is ours, written from scratch under MIT. One layer carries every
-vendor, so M102a and M102b are two consumers of it rather than two ports.
+they stand on is ours, written from scratch. One layer carries every vendor, so
+M102a and M102b are two consumers of it rather than two ports.
 
 - [x] Decide once where the DRM core comes from, and write the answer down: upstream `drivers/gpu/drm` imported verbatim, with M100's own core kept for virtio-gpu. Two cores are allowed only because one of them is never edited — recorded in [`docs/drm-import.md`](drm-import.md).
 - [x] Add `kref`, where only the last put releases and a weak reference on a dead object fails instead of resurrecting it.
@@ -975,3 +984,27 @@ vendor, so M102a and M102b are two consumers of it rather than two ports.
 - [ ] `planned` Add filesystem UUID and label probing for `findfs`.
 - [ ] `planned` Add the remaining single-device gaps: CD-ROM, MTD, rfkill, md, nbd, floppy, serial config.
 - [ ] `wontfix` `i2ctransfer` needs raw I2C an SMBus controller cannot issue.
+
+## M110: Unix block-device names
+
+- [x] Name disks the way the rest of Unix does: `sda`/`sdb` for SATA, `vda`/`vdb`
+      for virtio-blk, `nvme0n1` for NVMe. Partitions follow (`sda1`, `vda1`,
+      `nvme0n1p1`).
+- [x] Derive the suffix from the driver's enumeration index in `blk_disk_name()`
+      / `blk_nvme_name()` (`kernel/dev/blk.c`) — no per-device table, so a fifth
+      SATA disk is `sde` on its own.
+- [x] Clean break: the old `sata0`/`nvme0`/`virtio-blk0` names are gone, with no
+      aliases. Every consumer in the tree (root/swap selection, mounts, procfs,
+      sysfs, tests, guest scripts, docs) moved with them.
+- [x] Fold USB mass storage into the same `sd` sequence: it is a SCSI disk, so
+      it is an `sd*` like AHCI's. The block layer owns the sequence
+      (`blk_register_disk`), so registration order decides the letter whichever
+      bus delivered the disk.
+- [x] Stop identifying devices by name prefix where a fact will do: block
+      devices carry a bus, the live-ISO path finds the boot medium by mounting
+      candidates and looking for the boot image, and swap asks for "the second
+      ATA disk" rather than for `sdb`.
+- [ ] `planned` Fix the live-USB root switch: `loop_register_file()` registers a
+      second block device named `loop0` beside the empty one `loop_init()`
+      already made, so the mount picks up the empty one and the boot falls back
+      to `ram0`. Medium selection is covered by `tests/liveusb.sh`.

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_WAIT_H
 #define LKPI_LINUX_WAIT_H
 #include <lkpi/wait.h>

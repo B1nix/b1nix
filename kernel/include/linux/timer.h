@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_TIMER_H
 #define LKPI_LINUX_TIMER_H
 /* seqcount_t reaches i915 transitively upstream, through the time headers

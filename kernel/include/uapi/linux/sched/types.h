@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_UAPI_LINUX_SCHED_TYPES_H
 #define LKPI_UAPI_LINUX_SCHED_TYPES_H
 #include <linux/types.h>

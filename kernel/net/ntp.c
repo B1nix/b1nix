@@ -158,7 +158,7 @@ void ntp_tick(u64 now_ticks) {
 #include <b1nix/netproto.h>
 
 MODULE_NAME("ntp");
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("b1nix");
 MODULE_DESCRIPTION("SNTP client: steps or slews the RTC from a time server");
 MODULE_ALIAS("net-time-sntp");

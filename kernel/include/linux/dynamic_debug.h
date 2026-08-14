@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_DYNAMIC_DEBUG_H
 #define LKPI_LINUX_DYNAMIC_DEBUG_H
 /* Linux's runtime-switchable debug printing. b1nix has no control file to

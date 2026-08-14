@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_MM_H
 #define LKPI_LINUX_MM_H
 /* Upstream's <linux/mm.h> pulls the shrinker interface in, and drivers embed

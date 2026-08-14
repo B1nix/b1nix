@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_PREFETCH_H
 #define LKPI_LINUX_PREFETCH_H
 /* A hint, and nothing observable depends on it — but a real one: clang lowers

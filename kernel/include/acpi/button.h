@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_ACPI_BUTTON_H
 #define LKPI_ACPI_BUTTON_H
 #include <linux/notifier.h>

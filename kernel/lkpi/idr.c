@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-2.0-only
  *
  * M99 linuxkpi: id-to-pointer map. See kernel/include/lkpi/idr.h.
  */

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef B1NIX_GPU_SCHEDULER_H
 #define B1NIX_GPU_SCHEDULER_H
 

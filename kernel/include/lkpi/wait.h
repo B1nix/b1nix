@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_WAIT_H
 #define LKPI_WAIT_H
 
@@ -9,7 +9,7 @@
 
 /* <linux/list.h> and <lkpi/lock.h> rather than b1nix's own: this header is
  * included by imported translation units, which must never see a b1nix header.
- * Both are ours and MIT — see the boundary note in <lkpi/env.h>. */
+ * Both are ours and GPL-2.0-only — see the boundary note in <lkpi/env.h>. */
 
 /*
  * wait queues — "sleep until this condition holds".

@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-2.0-only
  *
  * M99 linuxkpi: scatterlists. See kernel/include/lkpi/scatterlist.h.
  */

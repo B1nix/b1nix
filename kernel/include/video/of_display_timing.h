@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_VIDEO_OF_DISPLAY_TIMING_H
 #define LKPI_VIDEO_OF_DISPLAY_TIMING_H
 #include <linux/of.h>

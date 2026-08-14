@@ -558,7 +558,7 @@ void ntfs_init(void) { vfs_register_fs(&ntfs_vfs); }
 #include <b1nix/module.h>
 
 MODULE_NAME("ntfs");
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("b1nix");
 MODULE_DESCRIPTION("NTFS read-only filesystem");
 MODULE_ALIAS("fs-ntfs");

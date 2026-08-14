@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-2.0-only
  *
  * M99 — linuxkpi: a Linux-shaped driver API implemented on b1nix primitives.
  *

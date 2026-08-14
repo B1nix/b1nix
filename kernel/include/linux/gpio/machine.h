@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_GPIO_MACHINE_H
 #define LKPI_LINUX_GPIO_MACHINE_H
 /* Board-level GPIO lookup tables, for the SoC panel wiring described in

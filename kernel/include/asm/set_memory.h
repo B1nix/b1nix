@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_ASM_SET_MEMORY_H
 #define LKPI_ASM_SET_MEMORY_H
 #include <lkpi/env.h>

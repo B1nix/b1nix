@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_CTYPE_H
 #define LKPI_LINUX_CTYPE_H
 /* ASCII only, and deliberately so: these classify bytes of a kernel string,

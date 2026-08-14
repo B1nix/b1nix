@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_KOBJECT_H
 #define LKPI_LINUX_KOBJECT_H
 /* kobject is declared alongside the device it is embedded in — the lifetime

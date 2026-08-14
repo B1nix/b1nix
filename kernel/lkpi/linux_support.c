@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: GPL-2.0-only
  *
  * M102a linuxkpi: the facilities i915 needs that had no home yet.
  *

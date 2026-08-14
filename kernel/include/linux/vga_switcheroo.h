@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_VGA_SWITCHEROO_H
 #define LKPI_LINUX_VGA_SWITCHEROO_H
 #include <linux/types.h>

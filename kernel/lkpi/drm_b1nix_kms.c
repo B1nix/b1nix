@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: GPL-2.0-only
  *
  * M101: a real driver on the imported DRM core, scanning out through virtio-gpu.
  *

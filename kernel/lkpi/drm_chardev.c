@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: GPL-2.0-only
  *
  * M101t: the imported DRM core's character device, reached from b1nix's VFS.
  *

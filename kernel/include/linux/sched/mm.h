@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_SCHED_MM_H
 #define LKPI_LINUX_SCHED_MM_H
 #include <linux/gfp.h>

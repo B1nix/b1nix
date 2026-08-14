@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-2.0-only
  *
  * M100 — dma-fence. See kernel/include/b1nix/dma_fence.h.
  */

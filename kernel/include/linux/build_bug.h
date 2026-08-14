@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_BUILD_BUG_H
 #define LKPI_LINUX_BUILD_BUG_H
 /* Upstream splits the compile-time assertions out of <linux/kernel.h>; here they

@@ -1,6 +1,6 @@
 # Third-Party Software Notices & License Inventory
 
-The MIT license described in `LICENSING.md` applies to original B1NIX material. It does not replace or override third-party software licenses. This document provides a complete inventory of all third-party libraries, toolchains, runtimes, and applications integrated or ported for B1NIX.
+The GNU General Public License, version 2 only (`GPL-2.0-only`, see [LICENSE](LICENSE)) applies to original b1nix material. It does not replace or override third-party software licenses, and every component below is conveyed under its own terms. This document is the complete inventory of the third-party libraries, toolchains, runtimes and applications integrated or ported for b1nix.
 
 ---
 

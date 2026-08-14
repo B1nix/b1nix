@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_MEM_ENCRYPT_H
 #define LKPI_LINUX_MEM_ENCRYPT_H
 #include <linux/types.h>

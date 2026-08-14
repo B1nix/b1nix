@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-2.0-only
  *
  * M100 in-kernel self-tests: dma-fence, the GPU scheduler, and scatter-gather
  * buffer-object backing.

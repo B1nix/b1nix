@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_VIDEO_VGA_H
 #define LKPI_VIDEO_VGA_H
 /* The legacy VGA register window. b1nix's own video code owns it; imported

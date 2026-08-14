@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_TRACE_EVENTS_DMA_FENCE_H
 #define LKPI_TRACE_EVENTS_DMA_FENCE_H
 #include <linux/tracepoint.h>

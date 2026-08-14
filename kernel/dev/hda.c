@@ -889,7 +889,7 @@ void hda_selftest(void) {
 #include <b1nix/module.h>
 
 MODULE_NAME("hda");
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("b1nix");
 MODULE_DESCRIPTION("Intel High Definition Audio controller (/dev/dsp)");
 MODULE_ALIAS("sound-hda");

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_I915_KCONFIG_H
 #define LKPI_I915_KCONFIG_H
 

@@ -91,7 +91,7 @@ void btrfs_init(void) {
 #include <b1nix/module.h>
 
 MODULE_NAME("btrfs");
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("b1nix");
 MODULE_DESCRIPTION("btrfs superblock probe and read-only mount");
 MODULE_ALIAS("fs-btrfs");

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_MEDIA_BUS_FORMAT_H
 #define LKPI_LINUX_MEDIA_BUS_FORMAT_H
 /* Pixel formats on a display bus, as the V4L2/DRM bridge layer names them.

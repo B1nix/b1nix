@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_VIDEO_VIDEOMODE_H
 #define LKPI_VIDEO_VIDEOMODE_H
 #include <linux/types.h>

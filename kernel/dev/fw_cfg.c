@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-2.0-only
  *
  * QEMU's fw_cfg channel, and the one thing b1nix needs from it: the graphics
  * OpRegion of a passed-through Intel display.

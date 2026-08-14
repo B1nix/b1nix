@@ -334,7 +334,7 @@ void isofs_init(void) {
 #include <b1nix/module.h>
 
 MODULE_NAME("isofs");
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("b1nix");
 MODULE_DESCRIPTION("ISO 9660 / Joliet read-only filesystem");
 MODULE_ALIAS("fs-iso9660");

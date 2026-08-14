@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_CACHE_H
 #define LKPI_LINUX_CACHE_H
 /* 64 bytes on every x86_64 part b1nix runs on. Used for alignment attributes,

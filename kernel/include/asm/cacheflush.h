@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_ASM_CACHEFLUSH_H
 #define LKPI_ASM_CACHEFLUSH_H
 #include <linux/io.h>

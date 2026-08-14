@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_LOCKDEP_H
 #define LKPI_LINUX_LOCKDEP_H
 /* Nothing from b1nix: its lock checker tracks b1nix locks by their own

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_PFN_H
 #define LKPI_LINUX_PFN_H
 #include <linux/kernel.h> /* PAGE_SHIFT */

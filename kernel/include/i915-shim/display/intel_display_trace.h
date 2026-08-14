@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_INTEL_DISPLAY_TRACE_H
 #define LKPI_INTEL_DISPLAY_TRACE_H
 /* The display half of i915's tracepoints. Same reasoning as <i915_trace.h>:

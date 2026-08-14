@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_DMA_MAPPING_H
 #define LKPI_DMA_MAPPING_H
 

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_STDARG_H
 #define LKPI_LINUX_STDARG_H
 /* The compiler's own, not the C library's: the kernel is freestanding and has

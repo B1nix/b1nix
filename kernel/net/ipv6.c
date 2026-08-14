@@ -464,7 +464,7 @@ void ipv6_realink_smoke(void)
 #include <b1nix/module.h>
 
 MODULE_NAME("ipv6");
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("b1nix");
 MODULE_DESCRIPTION("IPv6 datapath: loopback, ICMPv6 echo, real-link send");
 MODULE_ALIAS("net-pf-10");

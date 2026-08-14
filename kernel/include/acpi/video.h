@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_ACPI_VIDEO_H
 #define LKPI_ACPI_VIDEO_H
 #include <linux/types.h>

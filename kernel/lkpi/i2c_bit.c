@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-2.0-only
  *
  * Bit-banged I2C, for reading an EDID when the hardware controller will not.
  *

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_SYSRQ_H
 #define LKPI_LINUX_SYSRQ_H
 /* The magic-key handler DRM registers so a wedged machine can be forced back to
