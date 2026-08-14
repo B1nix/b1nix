@@ -980,14 +980,22 @@ $(BUILD)/bin/m53_libwebp_smoke: bin/gfx/m53_libwebp_smoke.c $(BESPOKE_LIBDEP) $(
 	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
 	)
 
-# m53_libvpx_smoke links the ported libvpx (VP8 decode) + libwebp (VP8 keyframe
-# source) + libm. M53 full-motion video codec.
+# m53_libvpx_smoke links libvpx (VP8 decode) + libwebp (VP8 keyframe source) +
+# libm. M53 full-motion video codec.
+#
+# libvpx comes from Alpine and Alpine ships no static libvpx: the archive this
+# used to name survived on disk from the days the port was built from source,
+# and vanished the first time its prefix was re-extracted — a link that had been
+# broken for some time without anything saying so. The shared library is what
+# the package actually provides, and what every other consumer already uses.
 LIBVPX_DIR := ../build/$(B1NIX_ARCH)/pkg/libvpx
 $(BUILD)/bin/m53_libvpx_smoke: bin/gfx/m53_libvpx_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBVPX_DIR)/include -I $(LIBWEBP_DIR)/include -c $< -o $(BUILD)/bin/m53_libvpx_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_libvpx_smoke.o \
-	  $(LIBVPX_DIR)/lib/libvpx.a $(LIBWEBP_DIR)/lib/libwebp.a $(LIBM_DIR)/lib/libm.a \
+	  -L$(LIBVPX_DIR)/lib -l:libvpx.so.9 -rpath /lib \
+	  $(LIBWEBP_DIR)/lib/libwebp.a $(LIBWEBP_DIR)/lib/libsharpyuv.a \
+	  $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  python3 -c "\

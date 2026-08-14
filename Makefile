@@ -661,7 +661,7 @@ else
 I915_IMPORT_OBJECTS :=
 endif
 
-.PHONY: i915-fetch
+.PHONY: kernel-dist i915-fetch
 i915-fetch:
 	@sh tools/drm/fetch-i915.sh
 
@@ -999,7 +999,8 @@ $(TINYGL_LIB): tools/ports/build-tinygl.sh userspace/libegl/b1egl.c userspace/in
 # link against a momentarily-absent libOSMesa.so. Depend on the headers stamp.
 $(BUILD_DIR)/.mesa-built: tools/ports/build-mesa.sh $(BUILD_DIR)/.userspace-headers-installed
 	@mkdir -p $(dir $@)
-	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-mesa.sh >/dev/null
+	@B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/prebuilt.sh fetch mesa || \
+		B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-mesa.sh >/dev/null
 	@touch $@
 
 # M52: real Mesa OSMesa (software OpenGL) demo. The shared demo builder builds
@@ -1016,7 +1017,8 @@ $(BUILD_DIR)/.mesa-built: tools/ports/build-mesa.sh $(BUILD_DIR)/.userspace-head
 # M91: Skia 2D graphics library (standalone build with Ganesh GPU backend).
 $(BUILD_DIR)/.skia-built: tools/ports/build-skia.sh $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
-	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-skia.sh >/dev/null
+	@B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/prebuilt.sh fetch skia || \
+		B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-skia.sh >/dev/null
 	@touch $@
 
 # M91: shared-library deps for Skia (libskia.so, libraw_ptr.so, libfontconfig.so,
@@ -1270,8 +1272,12 @@ $(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem
 
 ifeq ($(ARCH),x86_64)
 ifdef LIBC_SO
+# Fetched if somebody already built this exact recipe, built if not. The key
+# covers the port script and the toolchain, so a change to either falls back to
+# compiling — see tools/prebuilt.sh.
 $(LIBC_SO):
-	@B1NIX_ARCH=$(ARCH) tools/ports/build-musl.sh
+	@B1NIX_ARCH=$(ARCH) tools/prebuilt.sh fetch musl || \
+		B1NIX_ARCH=$(ARCH) tools/ports/build-musl.sh
 
 $(INITRAMFS_LD_MUSL_INC): $(LIBC_SO)
 	@mkdir -p $(dir $@)
@@ -1398,6 +1404,21 @@ $(AP_TRAMPOLINE_OFFSETS): $(AP_TRAMP_OBJ)
 $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+
+# What a release carries instead of the build tree's kernel.
+#
+# The linked kernel is 33 MB, of which 28 MB is debug information: useful when
+# a fault report needs symbolising, dead weight on a machine that is only going
+# to boot it. Distributions split those into two packages and so do we — see
+# tools/packages/b1nix-packages.list.
+KERNEL_DIST := $(BUILD_DIR)/dist/kernel.elf
+KERNEL_DIST_DEBUG := $(BUILD_DIR)/dist/kernel.elf.debug
+
+kernel-dist: $(KERNEL_ELF)
+	@mkdir -p $(BUILD_DIR)/dist
+	@llvm-objcopy --only-keep-debug $(KERNEL_ELF) $(KERNEL_DIST_DEBUG)
+	@llvm-strip -o $(KERNEL_DIST) $(KERNEL_ELF)
+	@ls -l $(KERNEL_DIST) $(KERNEL_DIST_DEBUG) | awk '{printf "  %-40s %6.1f MB\n", $$9, $$5/1048576}'
 
 iso: check-b1cc-sync root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/iso --out $(BUILD_DIR)/b1nix.iso \
@@ -1809,9 +1830,18 @@ ifdef LIBC_SO
 	@# their repository asks for it, so the loader has to be reachable under it
 	@# too, or every Alpine library fails to load for want of a libc that is
 	@# already there under three other names.
-	@for name in libc.so libc.musl-x86_64.so.1 libm.so libm.so.1 libpthread.so \
-	             librt.so libdl.so \
-	             libcrypt.so libutil.so libresolv.so; do \
+	@# Two names, plus one that is on its way out.
+	@#
+	@# musl is a single blob and this used to give it eleven names, on the
+	@# theory that anything might ask for any of them. Nothing does: across
+	@# every binary and library on the image, 459 record libc.musl-x86_64.so.1
+	@# (musl's own SONAME, and what Alpine's binaries ask for), the loader is
+	@# reached through PT_INTERP as ld-musl-x86_64.so.1, and libm, libpthread,
+	@# librt, libdl, libcrypt, libutil and libresolv are recorded by nobody at
+	@# all — they were folded into libc before any of this was built. libc.so
+	@# is the name our own toolchain used to stamp, and it stays until the last
+	@# binaries carrying it are relinked.
+	@for name in libc.musl-x86_64.so.1 libc.so; do \
 		ln -f $(BUILD_DIR)/rootfs/lib/$(LIBC_LDSO_NAME) $(BUILD_DIR)/rootfs/lib/$$name 2>/dev/null || \
 			cp -f $(LIBC_SO) $(BUILD_DIR)/rootfs/lib/$$name; \
 	done

@@ -17,7 +17,7 @@ int main(void) {
 
   /* Phase 1 — resolve and call a symbol from the startup-loaded libc.so.1. */
 #ifdef __linux__
-  void *libc = dlopen("libc.so", RTLD_NOW);
+  void *libc = dlopen("libc.musl-x86_64.so.1", RTLD_NOW);
 #else
   void *libc = dlopen("libc.so.1", RTLD_NOW);
 #endif

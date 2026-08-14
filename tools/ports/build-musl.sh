@@ -186,8 +186,15 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
   # --forward skips already-applied hunks but then exits non-zero, which under
   # `set -e` would abort an incremental rebuild of an already-patched tree — so
   # tolerate that (idempotent re-apply).
-  patch -d "$SRC_DIR" -p1 --forward --batch \
-    < "$ROOT_DIR/tools/patches/musl/b1nix-dynamic-loader.patch" || true
+  # B1NIX_MUSL_PATCH=1 re-applies the old local patch. It should not be needed:
+  # both of its hunks worked around musl failing to recognise itself, which it
+  # did because this build gave the shared libc a SONAME of its own invention.
+  # With musl's own name back, the loader is its own dependency again and its
+  # symbols are in scope without help.
+  if [ "${B1NIX_MUSL_PATCH:-0}" = 1 ]; then
+    patch -d "$SRC_DIR" -p1 --forward --batch \
+      < "$ROOT_DIR/tools/patches/musl/b1nix-dynamic-loader.patch" || true
+  fi
 
   # --- post-configure fixups for freestanding LLVM cross-toolchain ---
   if [ -f "$SRC_DIR/config.mak" ]; then
@@ -216,15 +223,23 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
     #    musl Makefile: $(CC) $(CFLAGS_ALL) $(LDFLAGS_ALL) -nostdlib -shared ...
     #    -fuse-ld=lld must be in LDFLAGS_ALL so it reaches the link step.
     #    clang + lld auto-links compiler-rt for __mulxc3/__muldc3/__mulsc3.
-    #    Also set a DT_SONAME on libc.so: without it, consumers (libc++abi.so.1,
+    #    Also set a DT_SONAME: without one, consumers (libc++abi.so.1,
     #    libc++.so.1) linked with `-l:libc.so` record the *absolute* install path
     #    as their DT_NEEDED, which breaks load-time resolution under b1nix's
     #    musl ld.so (it tries the host path verbatim -> ENOENT). A soname makes
     #    lld emit the bare basename instead.
+    #
+    #    The name is musl's own, not one of ours. Everything Alpine builds
+    #    records libc.musl-x86_64.so.1, and a program that records anything else
+    #    is a program only this image can run: the whole point of speaking their
+    #    package format is that a package works either way round. The loader is
+    #    reachable under both names anyway — root-image hard-links them onto one
+    #    inode — so binaries built before this change keep working.
     LLD_PATH="$(command -v ld.lld || echo /opt/homebrew/bin/ld.lld)"
-    sed -i.bak "s|^LDFLAGS_AUTO = |LDFLAGS_AUTO = -Wl,-z,now -fuse-ld=$LLD_PATH -Wl,-soname,libc.so |" "$SRC_DIR/config.mak"
+    MUSL_SONAME="libc.musl-x86_64.so.1"
+    sed -i.bak "s|^LDFLAGS_AUTO = |LDFLAGS_AUTO = -Wl,-z,now -fuse-ld=$LLD_PATH -Wl,-soname,$MUSL_SONAME |" "$SRC_DIR/config.mak"
 
-    echo "build-musl.sh: patched config.mak (LIBCC cleared, noexecstack removed, lld linker, eager PLT, libc.so soname)" >&2
+    echo "build-musl.sh: patched config.mak (LIBCC cleared, noexecstack removed, lld linker, eager PLT, $MUSL_SONAME soname)" >&2
   fi
 fi
 

@@ -235,3 +235,34 @@ That is neofetch's whitelist, not a defect here — bash executes the whole
 script up to that `case`. Patching the package to recognise b1nix, or
 teaching neofetch's OS detection about it upstream, is the only way past it,
 and neither belongs in the package manager.
+
+## Publishing b1nix's own packages
+
+`tools/packages/bpkg-release.sh` builds a signed repository in Alpine's format —
+`APKINDEX.tar.gz` plus one `.apk` per package, each a signature member, a control
+member whose `.PKGINFO` carries the payload's `datahash`, and the payload. bpkg
+verifies that chain against `/etc/apk/keys/b1nix-packages.rsa.pub`, so a package
+this project did not sign does not install.
+
+The assets go to a **release**, not into a git repository. A release asset may be
+2 GB and there may be any number of them, while a file committed to a repository
+is capped and lives in the history forever — the kernel's debug symbols alone are
+29 MB per revision. Release URLs are flat:
+
+    https://github.com/<owner>/<repo>/releases/download/<tag>/<file>
+
+which is the shape apk already expects, because it derives a package's URL from
+the index's own location. Nothing in the client needed changing.
+
+What goes in is decided by `tools/packages/b1nix-packages.list`, and it is split
+so that a download is small: the kernel (2 MB) apart from its debug symbols
+(14 MB), the base userspace apart from software OpenGL (22 MB), the test
+binaries apart from everything. Alpine's own packages are *not* re-hosted — sway,
+foot and the rest come from Alpine's mirror, which is better replicated than
+anything this project would run.
+
+    tools/packages/bpkg-release.sh              # build the repository
+    tools/packages/bpkg-release.sh --max-mb 50  # complain about bigger packages
+
+The script prints the `gh release` commands that upload the result. It does not
+upload: that needs credentials, and publishing is a decision rather than a step.
