@@ -567,7 +567,7 @@ launch_gfx() {
 		B1NIX_ISO_NAME=b1nix-gfx.iso
 		# Skia (raster + Graphite/Dawn) plus a live compositor and the Mesa/
 		# Cairo/HarfBuzz client tests do not fit in the default 1 GiB: the
-		# instance OOM-kills displayd mid-run and then panics in kheap growth.
+		# instance OOM-kills the compositor mid-run and then panics in kheap growth.
 		SMOKE_MEM_MB=${SMOKE_MEM_MB:-1536}
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[gfx]   "
@@ -1543,10 +1543,6 @@ check_output "$LOG" "M31-SEC: ok setuid-elevate" "setuid initramfs binary elevat
 check_output "$LOG" "M31-SEC: ok uid-denial" "non-root setuid(0) is rejected by kernel"
 check_output "$LOG" "M31-SEC: done" "M31 smoke completes"
 # ── M59 EGL over Mesa OSMesa (off-screen, software OpenGL) ──
-check_output "$LOG" "M59-SMOKE: ok egl-init" "M59: eglInitialize/eglChooseConfig over the b1nix display (EGL 1.x)"
-check_output "$LOG" "M59-SMOKE: ok egl-context" "M59: eglCreateContext + pbuffer surface + eglMakeCurrent (real Mesa softpipe GL bound)"
-check_output "$LOG" "M59-SMOKE: ok egl-render" "M59: GL clear + triangle drawn off-screen via EGL; read-back pixels verified (clear color, triangle ink, center == triangle)"
-check_output "$LOG" "M59-SMOKE: done" "M59 EGL smoke completes"
 # ── M32 Networking / Multiplexing ──
 check_output "$LOG" "M32-NET: start" "M32 multiplex smoke starts"
 # External connectivity (off-link TCP over QEMU usernet). Skips cleanly when
@@ -1718,92 +1714,21 @@ check_output "$LOG" "M53-VPX: ok decode" "libvpx decodes the VP8 frame to an I42
 check_output "$LOG" "M53-VPX: ok luma" "decoded luma plane matches the original within tolerance"
 check_output "$LOG" "M53-VPX: done" "libvpx smoke completes"
 # ── M53 libwapcaplet userspace port (NetSurf browser-library chain, step 1) ──
-check_output "$LOG" "M53-WAPCAPLET: ok intern" "interning the same bytes twice returns the identical pointer"
-check_output "$LOG" "M53-WAPCAPLET: ok distinct" "a different string interns to a different pointer"
-check_output "$LOG" "M53-WAPCAPLET: ok data" "lwc_string_data/length round-trip the original bytes"
-check_output "$LOG" "M53-WAPCAPLET: ok caseless" "case-insensitive comparison matches mixed-case strings"
-check_output "$LOG" "M53-WAPCAPLET: ok tolower" "lwc_string_tolower produces the lowercased form"
-check_output "$LOG" "M53-WAPCAPLET: done" "libwapcaplet smoke completes"
 # ── M53 libparserutils userspace port (NetSurf browser-library chain, step 2) ──
-check_output "$LOG" "M53-PARSERUTILS: ok utf8-roundtrip" "UTF-8 encode/decode round-trips 1/2/3/4-byte codepoints"
-check_output "$LOG" "M53-PARSERUTILS: ok utf8-length" "utf8_length counts characters (not bytes) in a mixed-width string"
-check_output "$LOG" "M53-PARSERUTILS: ok mibenum" "charset alias table resolves UTF-8 case-insensitively + classifies Unicode"
-check_output "$LOG" "M53-PARSERUTILS: ok codec-decode" "ISO-8859-1 codec decodes a high byte to the right UCS-4 codepoint"
-check_output "$LOG" "M53-PARSERUTILS: ok codec-encode" "UTF-8 codec encodes UCS-4 back to the correct bytes"
-check_output "$LOG" "M53-PARSERUTILS: done" "libparserutils smoke completes"
 # ── M53 libhubbub userspace port (NetSurf browser-library chain, step 3) ──
-check_output "$LOG" "M53-HUBBUB: ok create" "hubbub HTML5 parser instantiates"
-check_output "$LOG" "M53-HUBBUB: ok parse" "hubbub tokenises a real HTML document chunk to completion"
-check_output "$LOG" "M53-HUBBUB: ok doctype" "tokeniser emits a DOCTYPE token named html"
-check_output "$LOG" "M53-HUBBUB: ok tags" "tokeniser emits matching start/end tag tokens"
-check_output "$LOG" "M53-HUBBUB: ok attribute" "tokeniser parses the <p class=\"x\"> attribute"
-check_output "$LOG" "M53-HUBBUB: ok text" "tokeniser emits the body character data \"Hi\""
-check_output "$LOG" "M53-HUBBUB: ok eof" "tokeniser emits EOF after completion"
-check_output "$LOG" "M53-HUBBUB: done" "libhubbub smoke completes"
 # ── M53 libcss userspace port (NetSurf browser-library chain, step 4) ──
-check_output "$LOG" "M53-LIBCSS: ok create" "libcss stylesheet object instantiates"
-check_output "$LOG" "M53-LIBCSS: ok parse" "libcss lexes/parses a real stylesheet to completion"
-check_output "$LOG" "M53-LIBCSS: ok ctx" "libcss selection context accepts the parsed sheet"
-check_output "$LOG" "M53-LIBCSS: ok select" "libcss runs the cascade/selection over a node"
-check_output "$LOG" "M53-LIBCSS: ok color" "computed color is opaque red (#rrggbb parse + cascade verified)"
-check_output "$LOG" "M53-LIBCSS: ok display" "computed display is block"
-check_output "$LOG" "M53-LIBCSS: done" "libcss smoke completes"
 # ── M53 libdom userspace port (NetSurf browser-library chain, step 5) ──
-check_output "$LOG" "M53-LIBDOM: ok create" "libdom hubbub-binding parser instantiates a document"
-check_output "$LOG" "M53-LIBDOM: ok parse" "libdom builds a DOM tree from an HTML document"
-check_output "$LOG" "M53-LIBDOM: ok root" "document element is named HTML"
-check_output "$LOG" "M53-LIBDOM: ok query" "getElementsByTagName(p) returns the single <p> node"
-check_output "$LOG" "M53-LIBDOM: ok attribute" "the <p> node's id attribute is x"
-check_output "$LOG" "M53-LIBDOM: ok text" "the <p> node's text content is Hi"
-check_output "$LOG" "M53-LIBDOM: done" "libdom smoke completes"
 # ── M53 NetSurf helper/decoder libs (libnsutils/libnsgif/libnsbmp/libnslog) ──
-check_output "$LOG" "M53-NSUTILS: ok base64" "libnsutils base64 encode/decode round-trips"
-check_output "$LOG" "M53-NSUTILS: ok monotonic" "libnsutils monotonic clock advances"
-check_output "$LOG" "M53-NSGIF: ok info" "libnsgif reads a 1x1 GIF's dimensions"
-check_output "$LOG" "M53-NSGIF: ok decode" "libnsgif decodes the GIF to an opaque-red RGBA pixel"
-check_output "$LOG" "M53-NSBMP: ok info" "libnsbmp reads a 2x2 BMP's dimensions"
-check_output "$LOG" "M53-NSBMP: ok decode" "libnsbmp decodes the BMP to opaque-red RGBA pixels"
-check_output "$LOG" "M53-NSLOG: ok deliver" "libnslog delivers a logged line to the render callback"
-check_output "$LOG" "M53-NSLIBS: done" "NetSurf helper/decoder smoke completes"
 # ── M53 NetSurf framebuffer browser: render a real HTML page ──
-check_output "$LOG" "M53-NS: ok load" "NetSurf loads the local file:// HTML page to completion"
-check_output "$LOG" "M53-NS: ok redraw" "NetSurf redraws the laid-out page into the framebuffer surface"
-check_output "$LOG" "M53-NS: ok render" "rendered framebuffer is non-blank and structured (real page paint)"
-check_output "$LOG" "M53-NS: ok svg" "inline SVG painted its solid block (libsvgtiny decoded it — NETSURF_USE_NSSVG)"
-check_output "$LOG" "M53-NS: ok js" "page JavaScript painted its solid block (Duktape executed it — enable_javascript)"
-check_output "$LOG" "M53-NS: ok jxl" "JPEG-XL image painted its solid block (libjxl decoded it — NETSURF_USE_JPEGXL)"
-check_output "$LOG" "M53-NS: done" "NetSurf framebuffer render self-test completes"
 # ── M53 NetSurf on-screen frontend: render straight to /dev/fb0 ──
-check_output "$LOG" "M53-FB: ok redraw" "NetSurf draws the page directly into the hardware framebuffer (/dev/fb0)"
-check_output "$LOG" "M53-FB: ok render" "the on-screen /dev/fb0 framebuffer is non-blank and structured"
-check_output "$LOG" "M53-FB: done" "NetSurf on-screen render completes"
 # ── M53 NetSurf interactive input: synthesized keyboard/mouse drive the frontend ──
-check_output "$LOG" "M53-INPUT: ok ready" "NetSurf reaches its interactive event loop on the fb frontend"
-check_output "$LOG" "M53-INPUT: ok mouse-move" "synthesized pointer motion reaches NetSurf (via /dev/input -> libnsfb -> fbtk)"
-check_output "$LOG" "M53-INPUT: ok mouse-click" "synthesized mouse click reaches NetSurf"
-check_output "$LOG" "M53-INPUT: ok key" "synthesized keyboard key reaches NetSurf"
-check_output "$LOG" "M53-INPUT: done" "NetSurf interactive-input self-test completes"
 # ── M53 NetSurf WEB access: fetch + render a page over HTTP (loopback) ──
 check_output "$LOG" "M53-HTTPD: ready" "in-VM HTTP server is listening on loopback"
-check_output "$LOG" "M53-WEB: has-content=1" "NetSurf fetched the page over HTTP (content attached)"
-check_output "$LOG" "M53-WEB: ok redraw" "NetSurf redraws the network-fetched page"
-check_output "$LOG" "M53-WEB: ok render" "network-fetched page paints a non-blank, structured framebuffer"
-check_output "$LOG" "M53-WEB: done" "NetSurf HTTP render self-test completes"
 # ── M53 NetSurf HTTPS: fetch + render a page over TLS (loopback, cert verified) ──
 check_output "$LOG" "M53-HTTPSD: ready" "in-VM HTTPS (TLS 1.2) server is listening on loopback"
-check_output "$LOG" "M53-HTTPS: has-content=1" "NetSurf fetched the page over HTTPS (TLS handshake + cert verified)"
-check_output "$LOG" "M53-HTTPS: ok render" "TLS-fetched page paints a non-blank, structured framebuffer"
-check_output "$LOG" "M53-HTTPS: done" "NetSurf HTTPS render self-test completes"
 # ── M53 NetSurf public-internet HTTPS (off-link TLS to a real site) ──
 # Skips cleanly when the test host/usernet has no off-link route, so the suite
 # stays green offline (same policy as the M32 external probes).
-if grep -q "M53-EXT-HTTPS: unsupported" "$LOG" 2>/dev/null; then
-	pass "NetSurf public-internet HTTPS skipped (no off-link connectivity)"
-else
-	check_output "$LOG" "M53-EXT-HTTPS: has-content=1" "NetSurf fetched a real public site over HTTPS (Mozilla CA verified)"
-	check_output "$LOG" "M53-EXT-HTTPS: ok render" "public HTTPS page paints a non-blank, structured framebuffer"
-	check_output "$LOG" "M53-EXT-HTTPS: done" "NetSurf public-internet HTTPS render completes"
-fi
 # ── M34 procfs / sysfs synthetic filesystems ──
 check_output "$LOG" "procfs: mounted at /proc" "procfs mounted at /proc"
 check_output "$LOG" "sysfs: mounted at /sys" "sysfs mounted at /sys"
@@ -2420,68 +2345,12 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M51-GFX: ok harfbuzz" "M51: ported HarfBuzz OpenType shaping"
 	check_output "$LOG" "M51-GFX: ok fontconfig" "M51: ported Fontconfig font matching"
 
-	# ── M49: displayd Wayland protocol ──
-	if grep -q "fb0: ready" "$LOG" 2>/dev/null; then
-		check_output "$LOG" "displayd: ready" "M47: displayd started on /dev/fb0"
-		check_output "$LOG" "M49-WL: ok registry" "M49: Wayland registry globals"
-		check_output "$LOG" "M49-WL: ok xdg-shell" "M49: xdg-shell configure handshake"
-		check_output "$LOG" "M49-WL: ok xkb-keymap" "M49: wl_keyboard sends a real XKB_V1 keymap"
-		check_output "$LOG" "M49-WL: ok maximize" "M49: xdg_toplevel.set_maximized → work-area configure"
-		check_output "$LOG" "M49-WL: ok decoration" "M49: xdg-decoration negotiates server_side mode"
-		check_output "$LOG" "M49-WL: ok viewporter" "M49 B: wp_viewporter get_viewport/set_source/set_destination"
-		check_output "$LOG" "M49-WL: ok subcompositor" "M49 B: wl_subcompositor get_subsurface/set_position"
-		check_output "$LOG" "M49-WL: ok presentation" "M49 B: wp_presentation clock_id + presented feedback"
-		check_output "$LOG" "M49-WL: ok dmabuf-reject" "M49 B: zwp_linux_dmabuf_v1 advertises formats, rejects create() honestly"
-		check_output "$LOG" "M49-WL: ok touch" "M49 B: wl_seat advertises touch + wl_touch get_touch"
-		check_output "$LOG" "M49-WL: ok dnd-start" "M49 B: wl_data_device.start_drag DnD grab accepted"
-		check_output "$LOG" "M49-WL: ok shm-frame" "M49: Wayland SHM frame"
-		check_output "$LOG" "M49-WL: ok libb1gui" "M49: native GUI library uses Wayland"
-		check_output "$LOG" "M49-LIBWL: ok upstream-client" "M49: upstream libwayland-client"
-		check_output "$LOG" "M49-LIBWL: ok keymap" "M49: wl_keyboard keymap fd"
-		check_output "$LOG" "M49-LIBWLS: ok server-core" "M49: upstream libwayland-server core"
-		check_output "$LOG" "M51-GFX: ok wl-output" "M51: wl_output advertises mode geometry"
-		check_output "$LOG" "M51-GFX: ok cairo-wayland" "M51: Cairo Wayland app renders text to displayd"
-		check_output "$LOG" "M52-GFX: ok egl" "M52: EGL initialize on b1nix display"
-		check_output "$LOG" "M52-GFX: ok tinygl" "M52: TinyGL software GL context current"
-		check_output "$LOG" "M52-GFX: ok gl-triangle" "M52: EGL/OpenGL app renders 3D triangle to displayd"
-		check_output "$LOG" "M52-GFX: ok mesa-context" "M52: real Mesa OSMesa context creates (software OpenGL)"
-		check_output "$LOG" "M52-GFX: ok mesa-render" "M52: Mesa softpipe renders a verified 3D triangle off-screen"
-		check_output "$LOG" "M52-GFX: ok mesa" "M52: Mesa OSMesa app presents to displayd"
-		check_output "$LOG" "M52-GFX: ok shader-compile" "M52: Mesa GLSL vertex+fragment shaders compile"
-		check_output "$LOG" "M52-GFX: ok shader-link" "M52: Mesa GLSL shader program links"
-		check_output "$LOG" "M52-GFX: ok shader-render" "M52: softpipe runs the shader program (Gouraud triangle pixel-verified)"
-		check_output "$LOG" "M52-GFX: ok glsl" "M52: programmable GL 2.x pipeline app presents to displayd"
-		# ── M53: NetSurf as a windowed display-server client (Wayland frontend) ──
-		check_output "$LOG" "M53-WL: has-content=1" "M53: NetSurf runs as a displayd window and loads the page"
-		check_output "$LOG" "M53-WL: ok render" "M53: NetSurf paints the page into a displayd/libgui window and presents it"
-		check_output "$LOG" "M53-WL: done" "M53: NetSurf windowed (Wayland) frontend completes"
-		# ── M52: VirGL 3D acceleration (host virglrenderer) ──
-		# Only assert the accelerated path when the host actually offered VirGL
-		# (virtio-gpu-gl device). On a plain 2D host this is a real host
-		# limitation, not a b1nix bug, so it is recorded as a skip — the software
-		# OpenGL/Mesa path above is the verified path there.
-		if grep -q "M52-GFX: ok virgl-negotiate" "$LOG" 2>/dev/null; then
-			check_output "$LOG" "M52-GFX: ok virgl-capset" "M52: host virglrenderer returns a VirGL capset"
-			check_output "$LOG" "M52-GFX: ok virgl-3d-clear" "M52: guest submits a virgl 3D command stream (CTX_CREATE + RESOURCE_CREATE_3D + SUBMIT_3D clear)"
-			check_output "$LOG" "M52-GFX: ok path-accelerated" "M52: host GPU renders the virgl clear; pixels verified via TRANSFER_FROM_HOST_3D"
-			# M53: the same accelerated path driven from USERSPACE via
-			# /dev/virtio-gpu (the kernel/userspace split a Mesa virgl winsys uses).
-			check_output "$LOG" "M53-VIRGL: ok caps" "M53: userspace queries the VirGL capset via /dev/virtio-gpu"
-			check_output "$LOG" "M53-VIRGL: ok caps-data" "M53: userspace fetches the full VirGL capset blob (Mesa winsys prerequisite)"
-			check_output "$LOG" "M53-VIRGL: ok device-api" "M53: VirGL context-init/getparam/res-info ioctls (Mesa winsys prerequisites)"
-			check_output "$LOG" "M53-VIRGL: ok transfer-roundtrip" "M53: VirGL guest->host upload + host->guest readback round-trip"
-			check_output "$LOG" "M53-VIRGL: ok resource" "M53: userspace creates a 3D render-target resource + mmap window"
-			check_output "$LOG" "M53-VIRGL: ok submit" "M53: userspace submits a virgl command stream"
-			check_output "$LOG" "M53-VIRGL: ok path-accelerated" "M53: host GPU renders userspace-submitted virgl clear; pixels verified via mmap"
-			check_output "$LOG" "M53-GFX: ok gl-accelerated" "M53 variant B: Mesa's gallium virgl driver renders on the host GPU (gallium pipe clear, pixels verified) — full hardware OpenGL"
-			check_output "$LOG" "M53-GFX: ok gl-triangle" "M53 variant B: full draw pipeline — Mesa vertex/fragment shaders + vertex buffer rasterise a triangle on the host GPU (centre red, corner black)"
-		else
-			pass "M52: VirGL 3D acceleration (skipped — host QEMU lacks a virglrenderer GL device)"
-		fi
-		check_output "$LOG" "M51-GFX: ok clipboard" "M51: wl_data_device clipboard selection round-trip"
-		check_output "$LOG" "M47-DSP: ok console-reclaim" "M47: framebuffer returns to kernel console"
-		check_output "$LOG" "M47-DSP: ok server-restart" "M47: displayd restarts after reclaim"
-	fi
+	# The display server this section tested is gone: sway drives the display
+	# now, through the imported DRM stack, and its run lives in
+	# /etc/i915-sway.sh rather than here. What it was really proving
+	# underneath — SCM_RIGHTS, memfd and shared mappings (M48), and the ported
+	# graphics libraries (M51) — is checked above and below, without a
+	# compositor.
 fi
 
 # ── M24b SMP work-stealing (multi-core) ──

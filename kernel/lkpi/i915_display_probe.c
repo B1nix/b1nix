@@ -228,43 +228,6 @@ void lkpi_i915_dump_vblank_state(struct drm_device *dev)
 	        enabled, refcount,
 	        (unsigned long long)seq1, (unsigned long long)seq2);
 
-	/*
-	 * Asking for the interrupt directly.
-	 *
-	 * If the count did not move, the core either never turned the interrupt on
-	 * or turned it on and got nothing. Taking a reference of our own drives
-	 * enable_vblank() from here, with the pipe already running, so a count that
-	 * moves afterwards puts the fault in whoever should have taken that
-	 * reference during the commit, and a count that still does not move puts it
-	 * in the interrupt path itself.
-	 *
-	 * Behind a flag because it drives the hardware rather than reading it, and
-	 * a diagnostic that changes state has to be asked for.
-	 */
-	if (lkpi_bootflag("b1nix.vblank-force") && dev->num_crtcs > 0) {
-		struct drm_crtc *crtc = drm_crtc_from_index(dev, 0);
-		int ret;
-
-		if (!crtc) {
-			pr_info("i915-probe: vblank-force: no crtc 0\n");
-			return;
-		}
-		ret = drm_crtc_vblank_get(crtc);
-		if (ret) {
-			pr_info("i915-probe: vblank-force: get failed %d\n", ret);
-			return;
-		}
-		seq1 = (u64)atomic64_read(&dev->vblank[0].count);
-		udelay(50000);
-		seq2 = (u64)atomic64_read(&dev->vblank[0].count);
-		iir2 = intel_uncore_read(&dev_priv->uncore, GEN8_DE_PIPE_IIR(PIPE_A));
-		pr_info("i915-probe: vblank-force: IMR %08x IER %08x IIR %08x "
-		        "count %llu->%llu\n",
-		        intel_uncore_read(&dev_priv->uncore, GEN8_DE_PIPE_IMR(PIPE_A)),
-		        intel_uncore_read(&dev_priv->uncore, GEN8_DE_PIPE_IER(PIPE_A)),
-		        iir2, (unsigned long long)seq1, (unsigned long long)seq2);
-		drm_crtc_vblank_put(crtc);
-	}
 }
 
 /*
@@ -1012,10 +975,9 @@ void lkpi_i915_register_card(struct drm_device *dev)
 				pr_info("i915: GMBUS has no reference clock — PCH_RAWCLK_FREQ "
 				        "reads 0 and does not accept writes, so the controller "
 				        "can never complete a transfer. Reading a display's "
-				        "EDID over the wire will not work here; supply one with "
-				        "b1nix.builtin-edid=<connector>. Seen under QEMU's "
-				        "legacy IGD passthrough, where part of the PCH register "
-				        "block is not forwarded to the guest.\n");
+				        "EDID over the wire will not work here. Seen under "
+				        "QEMU's legacy IGD passthrough, where part of the PCH "
+				        "register block is not forwarded to the guest.\n");
 		}
 	}
 

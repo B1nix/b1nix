@@ -31,7 +31,6 @@ mkdir -p "$(dirname "$OUTPUT_ABS")"
 # Skia itself is an application library, but the executable uses the real
 # dynamic musl runtime like the other C++ smoke binaries.
 make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
-  "build/$B1NIX_ARCH/libb1gui.a" 1>&2
 
 # Dawn headers (for graphite-dawn compile check only). Dawn is optional: the
 # CMake build may fail (WARNING in build-skia.sh) — only define HAVE_DAWN when
@@ -132,7 +131,6 @@ C11_A=""
   $C11_A \
   "$FONTCONFIG_A" "$FREETYPE_A" \
   "$ZLIB_A" "$EXPAT_A" \
-  "$USER_LIB/libb1gui.a" \
   -lOSMesa \
   -Bstatic -lc++ -lc++abi -lunwind -lcompiler_rt -Bdynamic \
   -L "$MUSL_LIB" -lc -lpthread -ldl "$MUSL_LIB/crtn.o" \

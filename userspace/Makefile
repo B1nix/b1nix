@@ -100,7 +100,6 @@ BUILD    := build/$(B1NIX_ARCH)
 ROOTFS   := ../build/$(B1NIX_ARCH)/rootfs
 # Strong utmp/utmpx overrides for musl's weak no-op stubs (real login accounting).
 UTMP_OBJ := $(BUILD)/compat/utmp.o
-GUI_LIB  := $(BUILD)/libb1gui.a
 # No link script for the smoke binaries: they are musl PIEs, so the loader picks
 # the base (randomized under b1nix.aslr) instead of a fixed address baked into a
 # script — GEN_LINKER/BESPOKE_LINKER stay empty, see the -T guards below.
@@ -161,10 +160,6 @@ CXXFLAGS       := --target=x86_64-unknown-elf -ffreestanding -nostdinc++ \
                   -isystem $(CLANG_RES_DIR)/include -idirafter include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix \
                   -fPIC -MD -MP -D__linux__ -D__b1nix__ -D_GNU_SOURCE
 
-GUI_OBJS := $(BUILD)/libgui/gui.o
-GUI_BINARIES := $(BUILD)/bin/gclock $(BUILD)/bin/gterm $(BUILD)/bin/gpaint \
-	$(BUILD)/bin/gdesktop $(BUILD)/bin/gabout $(BUILD)/bin/m49_smoke \
-	$(BUILD)/bin/displayd
 
 
 BINARIES := \
@@ -234,14 +229,12 @@ BINARIES += $(BUILD)/bin/m51_smoke
 BINARIES += $(BUILD)/bin/m51_pixman_smoke
 BINARIES += $(BUILD)/bin/m51_freetype_smoke
 BINARIES += $(BUILD)/bin/m51_cairo_smoke
-BINARIES += $(BUILD)/bin/m51_cairo_wayland
 BINARIES += $(BUILD)/bin/m51_xkb_smoke
 BINARIES += $(BUILD)/bin/m51_harfbuzz_smoke
 BINARIES += $(BUILD)/bin/m51_fontconfig_smoke
 # Reaches its libraries through dlopen, so it needs no headers and links like
 # any other program — see the note at the top of bin/gfx/font_probe.c.
 BINARIES += $(BUILD)/bin/font_probe
-BINARIES += $(BUILD)/bin/m52_gl_smoke
 BINARIES += $(BUILD)/bin/cxx_smoke
 BINARIES += $(BUILD)/bin/m55_iostream
 BINARIES += $(BUILD)/bin/m64_clang_smoke
@@ -285,7 +278,6 @@ BINARIES += $(BUILD)/bin/m51_clipboard_smoke
 BINARIES += $(BUILD)/bin/m53_httpd
 # M53 loopback HTTPS server + the driver that runs the NetSurf render tests.
 BINARIES += $(BUILD)/bin/m53_httpsd
-BINARIES += $(BUILD)/bin/m53_smoke
 BINARIES += $(BUILD)/bin/b1fetch
 BINARIES += $(BUILD)/bin/gpuinfo
 BINARIES += $(BUILD)/bin/mc
@@ -328,26 +320,12 @@ DEPS := $(BIN_OBJS:.o=.d)
 
 # musl provides its own libc/crt; the b1nix-native libc/gui archives are not
 # linked into the ELFs, so `all` just builds the binaries.
-all: $(BINARIES) $(GUI_BINARIES)
+all: $(BINARIES)
 
 # utmp/utmpx overrides for musl's weak stubs (real login accounting).
 $(UTMP_OBJ): compat/utmp.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $@
-
-$(BUILD)/libgui/%.o: libgui/%.c
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -fPIC -c $< -o $@
-
-# ── GUI library ──
-# Always available: built on-demand by ports (e.g. netsurf-fb, displayd) even
-# under LINK=musl, since the source uses only POSIX + <b1nix/gui.h>.
-$(GUI_LIB): $(GUI_OBJS)
-	@mkdir -p $(dir $@)
-	rm -f $@
-	$(AR) rcs $@ $(GUI_OBJS)
-	@mkdir -p ../build/$(B1NIX_ARCH)/libs
-	cp -f $@ ../build/$(B1NIX_ARCH)/libs/libb1gui.a
 
 build/bin/%: build/$(B1NIX_ARCH)/bin/%
 	@mkdir -p build/bin
@@ -528,45 +506,6 @@ d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
 open(f,'wb').write(d); \
 fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
 endif
-
-DISPLAYD_DIR := displayd
-DISPLAYD_SRCS := $(DISPLAYD_DIR)/displayd_main.c $(DISPLAYD_DIR)/displayd_protocol.c \
-	$(DISPLAYD_DIR)/displayd_window.c $(DISPLAYD_DIR)/displayd_render.c \
-	$(DISPLAYD_DIR)/displayd_menu.c $(DISPLAYD_DIR)/displayd_input.c \
-	$(DISPLAYD_DIR)/displayd_dispatch.c
-DISPLAYD_HDRS := $(DISPLAYD_DIR)/displayd.h $(DISPLAYD_DIR)/font8x8.h $(DISPLAYD_DIR)/xkb_keymap_us.h
-DISPLAYD_OBJS := $(patsubst $(DISPLAYD_DIR)/%.c,$(BUILD)/displayd/%.o,$(DISPLAYD_SRCS))
-
-$(BUILD)/displayd/%.o: $(DISPLAYD_DIR)/%.c $(DISPLAYD_HDRS)
-	@mkdir -p $(BUILD)/displayd
-	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I$(DISPLAYD_DIR) -I ../kernel/arch/x86_64 -c $< -o $@
-
-$(BUILD)/bin/displayd: $(DISPLAYD_OBJS) $(GUI_LIB) $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
-	@mkdir -p $(dir $@)
-	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(DISPLAYD_OBJS) \
-		--whole-archive $(GUI_LIB) --no-whole-archive $(BESPOKE_LIBC)
-	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
-	)
-
-$(filter-out $(BUILD)/bin/displayd,$(GUI_BINARIES)): $(BUILD)/bin/%: $$(call bin_src,$$*) $(GUI_LIB) $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
-	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/$*.o \
-		--whole-archive $(GUI_LIB) --no-whole-archive $(BESPOKE_LIBC)
-	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
-	)
 
 # M49: upstream libwayland, Alpine's shared build, with libffi for protocol
 # dispatch. Shared rather than static on both counts: Alpine's libffi.a is not
@@ -774,30 +713,6 @@ $(BUILD)/bin/m51_cairo_smoke: bin/gfx/m51_cairo_smoke.c $(BESPOKE_LIBDEP)
 	  $(CAIRO_DIR)/lib/libcairo.a -L$(FT_DIR)/lib -lfreetype \
 	  -L$(PIXMAN_DIR)/lib -lpixman-1 $(PKG_RPATH) $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC)
-
-# M51 end-to-end: Cairo + libb1gui (Wayland client) -> displayd.
-$(BUILD)/bin/m51_cairo_wayland: bin/gfx/m51_cairo_wayland.c $(GUI_LIB) $(BESPOKE_LIBDEP)
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include/freetype2 \
-	  -c $< -o $(BUILD)/bin/m51_cairo_wayland.o
-	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_cairo_wayland.o \
-	  $(CAIRO_DIR)/lib/libcairo.a -L$(FT_DIR)/lib -lfreetype \
-	  -L$(PIXMAN_DIR)/lib -lpixman-1 $(PKG_RPATH) $(LIBM_DIR)/lib/libm.a \
-	  --whole-archive $(GUI_LIB) --no-whole-archive $(BESPOKE_LIBC)
-
-# M52 end-to-end: EGL + TinyGL (software GL) + libb1gui (Wayland client) -> displayd.
-TINYGL_DIR := ../build/$(B1NIX_ARCH)/ports/tinygl/install
-$(TINYGL_DIR)/lib/libEGL.a: ../tools/ports/build-tinygl.sh libegl/b1egl.c \
-		include/EGL/egl.h
-	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/ports/build-tinygl.sh >/dev/null
-$(BUILD)/bin/m52_gl_smoke: bin/gfx/m52_gl_smoke.c $(GUI_LIB) $(BESPOKE_LIBDEP) \
-		$(TINYGL_DIR)/lib/libEGL.a
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I $(TINYGL_DIR)/include -c $< -o $(BUILD)/bin/m52_gl_smoke.o
-	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m52_gl_smoke.o \
-	  $(TINYGL_DIR)/lib/libEGL.a $(TINYGL_DIR)/lib/libTinyGL.a \
-	  $(LIBM_DIR)/lib/libm.a \
-	  --whole-archive $(GUI_LIB) --no-whole-archive $(BESPOKE_LIBC)
 
 # Hosted C++ smoke: built against LLVM libc++ (musl-linked shared objects). The
 # triplet-named cross compiler is only a compatibility shim; GCC/libstdc++ are
@@ -1178,8 +1093,7 @@ install: all install-headers-libs
 	@echo "Installing userspace binaries..."
 	@mkdir -p $(ROOTFS)/bin
 	cp $(BINARIES) $(ROOTFS)/bin/
-ifneq ($(GUI_BINARIES),)
-	cp $(GUI_BINARIES) $(ROOTFS)/bin/
+ifneq (,)
 endif
 	@chmod 4755 $(ROOTFS)/bin/m31_setuid 2>/dev/null || true
 	@# M108: /bin/su and /bin/passwd are no longer ELFs of their own — they are
@@ -1188,7 +1102,7 @@ endif
 	@# stale copies an older tree installed here, otherwise `cp` would keep an
 	@# unmaintained setuid-root binary alive in the image forever.
 	@rm -f $(ROOTFS)/bin/su $(ROOTFS)/bin/passwd
-	@for b in m12_smoke:m12-smoke m13_smoke:m13-smoke m13_job_control:m13-job-control m14_smoke:m14-smoke m15_smoke:m15-smoke m17_smoke:m17-smoke m24b_smoke:m24b-smoke m25_smoke:m25-smoke m26_smoke:m26-smoke m27_smoke:m27-smoke m29_smoke:m29-smoke m31_smoke:m31-smoke m31_setuid:m31-setuid m32_smoke:m32-smoke m34_smoke:m34-smoke m35_smoke:m35-smoke m36_smoke:m36-smoke m47_smoke:m47-smoke m48_smoke:m48-smoke m49_smoke:m49-smoke m50_smoke:m50-smoke m51_smoke:m51-smoke m52_gl_smoke:m52-gl-smoke m57_smoke:m57-smoke m75_smoke:m75-smoke; do \
+	@for b in m12_smoke:m12-smoke m13_smoke:m13-smoke m13_job_control:m13-job-control m14_smoke:m14-smoke m15_smoke:m15-smoke m17_smoke:m17-smoke m24b_smoke:m24b-smoke m25_smoke:m25-smoke m26_smoke:m26-smoke m27_smoke:m27-smoke m29_smoke:m29-smoke m31_smoke:m31-smoke m31_setuid:m31-setuid m32_smoke:m32-smoke m34_smoke:m34-smoke m35_smoke:m35-smoke m36_smoke:m36-smoke m47_smoke:m47-smoke m48_smoke:m48-smoke  m50_smoke:m50-smoke m51_smoke:m51-smoke  m57_smoke:m57-smoke m75_smoke:m75-smoke; do \
 		src=$${b%%:*}; dst=$${b##*:}; \
 		ln -sfn $$src $(ROOTFS)/bin/$$dst; \
 	done
@@ -1308,4 +1222,4 @@ clean:
 	rm -rf $(BUILD)
 	-$(MAKE) -C $(B1CC_DIR) clean
 
--include $(DEPS) $(GUI_OBJS:.o=.d)
+-include $(DEPS)

@@ -72,29 +72,11 @@ run_test() {
     esac
 }
 
-# ---- spawn displayd for graphics tests ----
-displayd_pid=""
-# m47_smoke owns /dev/fb0 for the duration of its fb-persist check: it writes
-# pixels, unmaps, remaps and expects them back. Anything else drawing to the
-# same framebuffer invalidates that, so it runs BEFORE the compositor exists —
-# it used to pass only because displayd took longer than the `sleep 1` below to
-# come up, and started failing the moment that wait became correct.
+# m47_smoke owns /dev/fb0 for its fb-persist check: it writes pixels, unmaps,
+# remaps and expects them back, so nothing else may draw to the framebuffer
+# while it runs.
 if [ "$SMOKE_GFX" = "1" ]; then
     run_test /bin/m47_smoke gfx
-fi
-
-if [ "$SMOKE_GFX" = "1" ] && [ -x /bin/displayd ]; then
-    /bin/displayd &
-    displayd_pid=$!
-    # Wait for the compositor to be reachable rather than guessing. A flat
-    # `sleep 1` was enough on an idle host and not on a busy one: m52_glsl got
-    # as far as presenting a frame before /run/wayland-0 existed and reported
-    # "fail glsl (present)" for a compositor that simply had not started yet.
-    i=0
-    while [ ! -e /run/wayland-0 ] && [ "$i" -lt 100 ]; do
-        usleep 100000 2>/dev/null || sleep 1
-        i=$((i + 1))
-    done
 fi
 
 # ---- sys (kernel, ipc, elf, selftest, diag, misc) ----
@@ -155,7 +137,6 @@ run_test /bin/m53_virgl_smoke gfx
 run_test /bin/m38_sound gfx
 run_test /bin/m79_sound gfx
 run_test /bin/m48_smoke gfx
-run_test /bin/m49_smoke gfx
 run_test /bin/m49_libwayland gfx
 run_test /bin/m49_libwayland_server gfx
 run_test /bin/m50_smoke gfx
@@ -165,18 +146,12 @@ run_test /bin/m51_smoke gfx
 run_test /bin/m51_pixman_smoke gfx
 run_test /bin/m51_freetype_smoke gfx
 run_test /bin/m51_cairo_smoke gfx
-run_test /bin/m51_cairo_wayland gfx
 run_test /bin/m51_xkb_smoke gfx
 run_test /bin/m51_harfbuzz_smoke gfx
 run_test /bin/m51_fontconfig_smoke gfx
-run_test /bin/m52_gl_smoke gfx
-run_test /bin/m52_osmesa gfx
-run_test /bin/m52_glsl gfx
 run_test /bin/m53_mesa_virgl gfx
 run_test /bin/m55_litehtml gfx
-run_test /bin/m59_smoke gfx
 run_test /bin/m51_clipboard_smoke gfx
-run_test /bin/m53_smoke gfx
 
 # ---- posix (shell, coreutils, job control) ----
 run_test /bin/m13_job_control posix
@@ -211,19 +186,6 @@ if [ "$SMOKE_SYS" = "1" ]; then
             *) /bin/sh "$s" ;;
         esac
     done
-fi
-
-if [ "$SMOKE_GFX" = "1" ] && [ -n "$displayd_pid" ]; then
-    kill -9 "$displayd_pid" 2>/dev/null || true
-    echo "M47-DSP: ok console-reclaim"
-    rm -f /run/wayland-0
-    /bin/displayd &
-    i=0
-    while [ ! -e /run/wayland-0 ] && [ "$i" -lt 100 ]; do
-        usleep 100000 2>/dev/null || sleep 1
-        i=$((i + 1))
-    done
-    [ -e /run/wayland-0 ] && echo "M47-DSP: ok server-restart"
 fi
 
 echo "B1NIX-TEST: done"

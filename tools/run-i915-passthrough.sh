@@ -176,7 +176,17 @@ mkdir -p "$OUT_DIR"
 # entirely at first. Dropping the network instead makes the guest's network
 # tests wait forever on a link that will never come up, which reads like a hang
 # in the graphics run and is nothing of the sort. So it gets slot 3.
-NET_ARGS="-netdev user,id=n0 -device e1000,netdev=n0,addr=03.0"
+#
+# virtio-net, not e1000.
+#
+# The emulated Intel card traps to the host for every packet; virtio-net hands
+# it a ring and gets out of the way. On a run whose slowest part is downloading
+# a couple of hundred megabytes of packages into the guest, that is the
+# difference between minutes and tens of minutes — and this system has had a
+# working virtio-net driver all along, the smoke suite uses it as its primary
+# interface. B1NIX_NIC=e1000 restores the old card for a run that wants to
+# exercise it.
+NET_ARGS="-netdev user,id=n0 -device ${B1NIX_NIC:-virtio-net-pci},netdev=n0,addr=03.0"
 
 #
 # Machine model.
@@ -254,9 +264,13 @@ DEV_ARGS="$DEV_ARGS -drive file=$CACHE_IMG,format=raw,if=virtio"
 echo "b1nix + $IGD_BDF via VFIO ($MACHINE), ${MEM_MB}M, log: $LOG"
 
 set +e
+# More than one CPU, because the guest is not only waiting on the network: bpkg
+# does TLS, signature checking and sha256 in software, and on a single core
+# those queue behind the packets they are decrypting.
 timeout "$TIMEOUT" qemu-system-x86_64 \
 	$MACHINE_ARGS \
 	-m "$MEM_MB" \
+	-smp "${SMP:-4}" \
 	-cdrom "$ISO" \
 	-boot d \
 	$DEV_ARGS \

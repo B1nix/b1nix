@@ -96,9 +96,6 @@ if [ ! -f "$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib/libc.so" ]; then
   echo "build-mesa: musl not built — run tools/ports/build-musl.sh first" >&2
   exit 1
 fi
-make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
-  "build/$B1NIX_ARCH/libb1gui.a" 1>&2
-
 if [ ! -d "$SRC_DIR" ]; then
   tmp="$SRC_PARENT/$TARBALL"
   [ -f "$tmp" ] || curl -L "$URL" -o "$tmp" 1>&2

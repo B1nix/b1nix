@@ -2,7 +2,6 @@
 #include <b1nix/fw_cfg.h>
 #include <b1nix/io.h>
 #include <b1nix/bootinfo.h>
-#include <b1nix/edid_builtin.h>
 #include <b1nix/console.h>
 #include <b1nix/ftrace.h>
 #include <b1nix/gdbstub.h>
@@ -91,7 +90,6 @@ extern void drm_core_bringup(void);
  */
 extern unsigned long __drm_debug;
 #include <lkpi/drm_bridge.h>
-int lkpi_drm_mirror_to_display(void);
 struct drm_device;
 struct drm_device *lkpi_drm_first_device(void);
 void lkpi_i915_register_card(struct drm_device *dev);
@@ -469,12 +467,6 @@ void kernel_main(usize arg0, usize arg1)
 		__drm_debug |= 0x04UL | 0x10UL | 0x40UL;
 	i915_module_init();
 	/*
-	 * A synthetic sink, for a machine with nothing plugged in. Attached after
-	 * the driver has probed, because it works on the connectors the driver
-	 * created. See kernel/lkpi/drm_virtual_monitor.c for what it does and does
-	 * not prove.
-	 */
-	/*
 	 * Publish the driver's card to b1nix's DRM bridge, so userspace can open
 	 * and mmap its objects. Harmless when i915 did not bind: the lookup finds
 	 * no device and registers nothing.
@@ -485,66 +477,6 @@ void kernel_main(usize arg0, usize arg1)
 		if (card)
 			lkpi_i915_register_card(card);
 	}
-	/*
-	 * A display that is physically there but did not answer on DDC. Forcing
-	 * the connector on is upstream's video=<connector>:e, and the modes come
-	 * from the driver rather than from an invented EDID — see
-	 * lkpi_drm_force_connector_on().
-	 */
-	{
-		char want[32];
-
-		if (bootinfo_get_kv("b1nix.force-connector", want, sizeof(want)) > 0) {
-			const struct boot_info *bi = bootinfo_get();
-
-			/*
-			 * A boot module that is an EDID, recognised by the eight-byte
-			 * header every EDID starts with rather than by a flag saying so.
-			 * Self-identifying because the same slot carries a root filesystem
-			 * on other boots, and mistaking one for the other would hand the
-			 * display driver a disk image.
-			 */
-			if (bi && bi->has_ramdisk && bi->ramdisk_size >= 128) {
-				static const u8 edid_magic[8] = {
-					0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00
-				};
-				const u8 *blob =
-				    (const u8 *)(usize)(bi->ramdisk_addr + DIRECT_MAP_BASE);
-
-				if (memcmp(blob, edid_magic, sizeof(edid_magic)) == 0)
-					console_write(lkpi_drm_set_connector_edid(
-					                  want, blob, (usize)bi->ramdisk_size)
-					                  ? "drm: supplied the display's own EDID\n"
-					                  : "drm: EDID not applied\n");
-			}
-
-			console_write(lkpi_drm_force_connector_on(want)
-			              ? "drm: connector forced on\n"
-			              : "drm: connector not forced\n");
-		}
-	}
-	if (bootinfo_has_flag("b1nix.fake-monitor")) {
-		/*
-		 * HDMI only. A DP connector forced on with nothing attached spends the
-		 * modeset retrying AUX reads that can never answer — link training
-		 * needs a sink — and the commit never finishes. HDMI has no such
-		 * handshake, so the pipe simply runs.
-		 */
-		int n = lkpi_drm_attach_virtual_monitor(LKPI_DRM_CONNECTOR_HDMIA);
-
-		console_write(n ? "drm: virtual monitor attached\n"
-		                : "drm: virtual monitor found no free connector\n");
-	}
-	/*
-	 * Mirror what the assigned GPU composited onto b1nix's own scanout, which
-	 * in a VM is the window QEMU draws. See kernel/lkpi/drm_mirror.c: a plain
-	 * assigned device gives QEMU no way to read its framebuffer back, so the
-	 * picture has to be fetched from this side.
-	 */
-	if (bootinfo_has_flag("b1nix.mirror-display"))
-		console_write(lkpi_drm_mirror_to_display()
-		              ? "drm: mirrored to local display\n"
-		              : "drm: mirror produced no frame\n");
 	/*
 	 * Stop here when the boot exists only to exercise the display.
 	 *
@@ -561,31 +493,6 @@ void kernel_main(usize arg0, usize arg1)
 	 */
 	/* Defined by the DRM mirror when the imported stack is built in. */
 	extern void lkpi_i915_dump_port_state_pub(void) __attribute__((weak));
-
-	/*
-	 * Stop the CPU with the picture up, and touch nothing further.
-	 *
-	 * The overnight hunt found the monitor lighting in four runs out of 220 —
-	 * and every one of those had panicked during the modeset, leaving the
-	 * machine halted with the display still scanning out. That is the whole
-	 * difference: a kernel that keeps running afterwards has timers, workers
-	 * and connector polling, and the sink never locks. Halting deliberately
-	 * turns that accident into an experiment.
-	 */
-	/* Whether the frame the display is scanning stays as it was written. */
-	{
-		extern void lkpi_i915_crc_watch_pub(unsigned seconds) __attribute__((weak));
-		char cw[8];
-
-		if (lkpi_i915_crc_watch_pub &&
-		    bootinfo_get_kv("b1nix.crc-watch", cw, sizeof(cw))) {
-			unsigned n = 0;
-
-			for (const char *p = cw; *p >= '0' && *p <= '9'; p++)
-				n = n * 10u + (unsigned)(*p - '0');
-			lkpi_i915_crc_watch_pub(n ? n : 60);
-		}
-	}
 
 	/*
 	 * Watch the port while userspace runs.
@@ -617,100 +524,16 @@ void kernel_main(usize arg0, usize arg1)
 		}
 	}
 
-	{
-		extern void lkpi_i915_dump_edid_pub(void) __attribute__((weak));
-
-		if (bootinfo_has_flag("b1nix.dump-edid") && lkpi_i915_dump_edid_pub)
-			lkpi_i915_dump_edid_pub();
-	}
-
-	/*
-	 * A compiled-in EDID for one connector, when the wire cannot deliver it.
-	 *
-	 * b1nix.builtin-edid=<connector> installs it and marks the connector
-	 * connected. See <b1nix/edid_builtin.h> for why this machine needs it: the
-	 * bytes are real, read from this monitor, and supplying them costs nothing
-	 * where reading them costs minutes.
-	 */
-	{
-		char want[32];
-
-		if (bootinfo_get_kv("b1nix.builtin-edid", want, sizeof(want)) > 0) {
-			console_write(lkpi_drm_set_connector_edid(want,
-			                                          b1nix_builtin_edid,
-			                                          sizeof(b1nix_builtin_edid))
-			                  ? "drm: built-in EDID applied\n"
-			                  : "drm: built-in EDID not applied\n");
-			console_write(lkpi_drm_force_connector_on(want)
-			              ? "drm: connector forced on\n"
-			              : "drm: connector not forced\n");
-		}
-	}
-
-	if (bootinfo_has_flag("b1nix.gfx-halt")) {
-		console_write("B1NIX-GFX: halting with the frame up\n");
-		for (;;) {
-			interrupts_disable();
-			__asm__ volatile("hlt");
-		}
-	}
-
-	/*
-	 * The same stop, but with interrupts left on.
-	 *
-	 * Halting outright makes the picture appear; a kernel that keeps running
-	 * does not. Between those two lies everything the system does after a
-	 * modeset — timer ticks, the scheduler, and the driver's own workers, of
-	 * which connector polling is the one that touches the display. This idles
-	 * the boot thread while leaving all of that alive, so the two runs differ
-	 * by exactly that and the question can be answered instead of guessed.
-	 */
-	if (bootinfo_has_flag("b1nix.gfx-idle")) {
-		console_write("B1NIX-GFX: idling with the frame up (interrupts on)\n");
-		for (;;) {
-			interrupts_enable();
-			__asm__ volatile("hlt");
-		}
-	}
-
 	if (bootinfo_has_flag("b1nix.gfx-only")) {
 		/*
-		 * Leave the picture on the wire for a while first.
+		 * The boot exists only to bring the display up: stop before init.
 		 *
-		 * Powering off ends the scanout, and a monitor needs a few seconds to
-		 * lock onto a signal and show it. Without this the only witness to a
-		 * working modeset is the register dump — the screen goes dark before a
-		 * person can look at it. b1nix.gfx-hold=<seconds> is how long to wait.
+		 * It used to hold the frame on the wire for a while first, because the
+		 * only witness to a modeset was a person watching the screen and the
+		 * picture vanished at power-off. It is not the witness any more — the
+		 * compositor's own run photographs the panel and reads the registers
+		 * back — so the hold, and the flags that tuned it, are gone.
 		 */
-		char hold[16];
-
-		if (bootinfo_get_kv("b1nix.gfx-hold", hold, sizeof(hold))) {
-			unsigned secs = 0;
-
-			for (const char *p = hold; *p >= '0' && *p <= '9'; p++)
-				secs = secs * 10u + (unsigned)(*p - '0');
-			if (secs > 600u)
-				secs = 600u;
-			console_write("B1NIX-GFX: holding the frame\n");
-			for (unsigned i = 0; i < secs; i++) {
-				scheduler_sleep_ticks(100); /* HZ = 100 */
-				/* Every five seconds, so the log shows the hold really
-				 * lasting rather than the loop returning at once — and so a
-				 * person watching the screen knows how long is left. */
-				if ((i % 5u) == 4u) {
-					console_write("B1NIX-GFX: held ");
-					console_write_dec((u64)(i + 1));
-					console_write("s of ");
-					console_write_dec((u64)secs);
-					console_write("s\n");
-				}
-			}
-			/* What the port was doing at the END of the hold, not only at the
-			 * moment of the commit: a link that comes up and then drops looks
-			 * identical to one that never came up, from the commit alone. */
-			if (lkpi_i915_dump_port_state_pub)
-				lkpi_i915_dump_port_state_pub();
-		}
 		console_write("B1NIX-GFX: done\n");
 		outw(0x604, 0x2000);
 		outw(0xB004, 0x2000);

@@ -108,6 +108,16 @@ NEED=""
 for pkg in seatd sway swaybg grim foot cage; do
 	command -v "$pkg" >/dev/null 2>&1 || NEED="$NEED $pkg"
 done
+# A real browser, when asked for one.
+#
+# 113 MB to download and 248 MB installed, so it is never in the image and
+# never fetched unless b1nix.chromium says so. It is the hardest userspace
+# this system has been asked to run — threads, futexes, shared memory,
+# sandboxing and a Wayland client all at once — which is exactly why it is
+# worth running.
+if grep -q "b1nix.chromium" /proc/cmdline 2>/dev/null; then
+	command -v chromium >/dev/null 2>&1 || NEED="$NEED chromium"
+fi
 [ -d /usr/share/fonts/dejavu ] || NEED="$NEED font-dejavu"
 
 if [ -n "$NEED" ]; then
@@ -186,16 +196,25 @@ fi
 [ -x /usr/bin/sway ] || { echo "I915-SWAY: fail no-sway-binary"; echo "I915-SWAY: done"; exit 0; }
 
 mkdir -p /etc/sway
-# Clients for the desktop. Our own gclock and gpaint speak b1gui, this system's
-# native display protocol, and cannot talk to a Wayland compositor at all — so
-# the ones that go on screen are the Wayland programs we do have, plus Alpine's
-# terminal. What matters is that something other than the compositor renders.
+# Clients for the desktop. What matters is that something other than the
+# compositor renders — the terminal is Alpine's, like the compositor itself.
 # Clients are launched only when the cmdline asks for them. sway spawns every
 # one of these through posix_spawn, and a compositor that dies while starting a
 # client tells us nothing about whether it can drive a display — the two
 # questions get separated by b1nix.sway-clients.
 : > /etc/sway/config
-if grep -q "b1nix.sway-clients" /proc/cmdline 2>/dev/null; then
+if grep -q "b1nix.chromium" /proc/cmdline 2>/dev/null && [ -x /usr/bin/chromium ]; then
+	# The browser as sway's client.
+	#
+	# --no-sandbox because chromium's sandbox wants namespaces this kernel does
+	# not have; --disable-gpu because there is no GL driver for this hardware
+	# yet, so it composites in software and hands sway a shared-memory buffer —
+	# which is the same path every other client here uses.
+	{
+		echo 'output * bg #202020 solid_color'
+		echo 'exec /usr/bin/chromium --ozone-platform=wayland --no-sandbox --disable-gpu --disable-dev-shm-usage --user-data-dir=/tmp/chromium --window-size=1280,800 about:blank'
+	} > /etc/sway/config
+elif grep -q "b1nix.sway-clients" /proc/cmdline 2>/dev/null; then
 	{
 		# Saturated colour and large text, for the same reason cage's run
 		# uses them: the proof that the picture is on the panel is a
@@ -206,9 +225,7 @@ if grep -q "b1nix.sway-clients" /proc/cmdline 2>/dev/null; then
 			echo 'exec /usr/bin/foot -o colors.background=00cc44 -o colors.foreground=101010 -o main.font=monospace:size=28 top'
 		else
 			echo 'output * bg #2060c0 solid_color'
-			for client in /bin/m51_cairo_wayland /bin/m49_libwayland /usr/bin/foot; do
-				[ -x "$client" ] && echo "exec $client"
-			done
+			echo 'exec /usr/bin/foot'
 		fi
 	} > /etc/sway/config
 fi

@@ -255,6 +255,28 @@ void lkpi_drm_file_set_handle(void *file, void *handle)
 		f->f_handle = handle;
 }
 
+/* drm_internal.h is not on the include path for this file — it is the core's
+ * private header — and this is the one thing needed out of it. */
+struct drm_minor *drm_minor_acquire(unsigned int minor_id);
+
+/* The first registered DRM device. Found through the minor registry rather than
+ * through a driver's drvdata, so this works for any driver and needs no
+ * assumption about what that pointer points at. */
+struct drm_device *lkpi_drm_first_device(void)
+{
+	unsigned int id;
+
+	for (id = 0; id < 64; id++) {
+		struct drm_minor *minor = drm_minor_acquire(id);
+
+		if (IS_ERR_OR_NULL(minor))
+			continue;
+		if (minor->dev)
+			return minor->dev;
+	}
+	return NULL;
+}
+
 /* The connector as userspace receives it.
  *
  * A compositor picks the mode flagged preferred and falls back to the last one

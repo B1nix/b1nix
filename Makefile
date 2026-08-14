@@ -32,21 +32,11 @@ WAYLAND_SERVER_LIB := build/$(ARCH)/pkg/wayland/lib/libwayland-server.so.0
 HB_LIB := build/$(ARCH)/pkg/harfbuzz/lib/libharfbuzz.a
 EXPAT_LIB := build/$(ARCH)/pkg/expat/lib/libexpat.a
 FONTCONFIG_LIB := build/$(ARCH)/pkg/fontconfig/lib/libfontconfig.a
-TINYGL_LIB := build/$(ARCH)/ports/tinygl/install/lib/libEGL.a
 ZLIB_LIB := build/$(ARCH)/pkg/zlib/lib/libz.a
 LIBPNG_LIB := build/$(ARCH)/pkg/libpng/lib/libpng16.a
 LIBJPEG_LIB := build/$(ARCH)/pkg/libjpeg/lib/libjpeg.a
 LIBWEBP_LIB := build/$(ARCH)/pkg/libwebp/lib/libwebp.a
 LIBVPX_LIB := build/$(ARCH)/pkg/libvpx/lib/libvpx.a
-LWC_LIB := build/$(ARCH)/ports/libwapcaplet/install/lib/liblwc.a
-PU_LIB := build/$(ARCH)/ports/libparserutils/install/lib/libparserutils.a
-HUBBUB_LIB := build/$(ARCH)/ports/libhubbub/install/lib/libhubbub.a
-LIBCSS_LIB := build/$(ARCH)/ports/libcss/install/lib/libcss.a
-LIBDOM_LIB := build/$(ARCH)/ports/libdom/install/lib/libdom.a
-NSUTILS_LIB := build/$(ARCH)/ports/libnsutils/install/lib/libnsutils.a
-NSGIF_LIB := build/$(ARCH)/ports/libnsgif/install/lib/libnsgif.a
-NSBMP_LIB := build/$(ARCH)/ports/libnsbmp/install/lib/libnsbmp.a
-NSLOG_LIB := build/$(ARCH)/ports/libnslog/install/lib/libnslog.a
 OPENSSL_LIB := build/$(ARCH)/pkg/openssl/lib/libssl.a
 IDN2_LIB := build/$(ARCH)/pkg/libidn2/lib/libidn2.a
 LIBPSL_LIB := build/$(ARCH)/pkg/libpsl/lib/libpsl.a
@@ -57,10 +47,8 @@ UNISTRING_LIB := build/$(ARCH)/pkg/libunistring/lib/libunistring.a
 # Ensure all port libraries depend on headers stamp so that they are compiled
 # only after libc.so.1 and headers are fully built and installed.
 $(LIBM_LIB) $(PCRE2_LIB) $(PIXMAN_LIB) $(FREETYPE_LIB) $(CAIRO_LIB) $(XKB_LIB) \
-$(WAYLAND_CLIENT_LIB) $(HB_LIB) $(EXPAT_LIB) $(FONTCONFIG_LIB) $(TINYGL_LIB) \
-$(ZLIB_LIB) $(LIBPNG_LIB) $(LIBJPEG_LIB) $(LIBWEBP_LIB) $(LIBVPX_LIB) \
-$(LWC_LIB) $(PU_LIB) $(HUBBUB_LIB) $(LIBCSS_LIB) $(LIBDOM_LIB) \
-$(NSUTILS_LIB) $(NSGIF_LIB) $(NSBMP_LIB) $(NSLOG_LIB) $(IDN2_LIB) \
+$(WAYLAND_CLIENT_LIB) $(HB_LIB) $(EXPAT_LIB) $(FONTCONFIG_LIB) $(ZLIB_LIB) $(LIBPNG_LIB) $(LIBJPEG_LIB) $(LIBWEBP_LIB) $(LIBVPX_LIB) \
+$(LWC_LIB) $(IDN2_LIB) \
 $(OPENSSL_LIB) $(LIBPSL_LIB) $(FFI_LIB) \
 $(LITEHTML_LIB) $(MBEDTLS_LIB) $(UNISTRING_LIB): $(USERSPACE_HDR_DEPS)
 
@@ -93,14 +81,6 @@ INITRAMFS_M40_LINUX_INC := $(INC_DIR)/initramfs_m40_linux.inc
 # /bin/m67-rust to validate the Rust std cross-toolchain at runtime. x86_64-only.
 INITRAMFS_M67_RUST_INC := $(INC_DIR)/initramfs_m67_rust.inc
 # M53: NetSurf framebuffer browser + resources + test page.
-INITRAMFS_NETSURF_INC := $(INC_DIR)/initramfs_netsurf_files.inc
-# Canonical output of tools/ports/build-netsurf-fb.sh. Must NOT be a
-# $(wildcard ...) lookup: on a clean build no candidate exists yet at
-# Makefile-parse time, wildcard would evaluate empty, and every rule keyed off
-# NSFB_ELF ($(NSFB_ELF): ..., initramfs_m53_httpsd.inc, INITRAMFS_NETSURF_INC,
-# install-ports) would silently drop nsfb as a prerequisite — nsfb then never
-# gets built and the M53 NetSurf smoke tests never start.
-NSFB_ELF := build/$(ARCH)/ports/netsurf-fb/install/bin/nsfb
 
 # Applet manifest for /bin replacement (M42 items 3 and 4).
 APPLET_MANIFEST := tools/configs/applet-manifest.conf
@@ -175,9 +155,7 @@ INITRAMFS_M91_SO_INCS := \
 	$(INC_DIR)/initramfs_libskia.inc \
 	$(INC_DIR)/initramfs_libraw_ptr.inc \
 	$(INC_DIR)/initramfs_libfontconfig.inc \
-	$(INC_DIR)/initramfs_libGLESv2.inc \
-	$(INC_DIR)/initramfs_libEGL.inc \
-	$(INC_DIR)/initramfs_libb1gui.inc
+	$(INC_DIR)/initramfs_libGLESv2.inc
 endif
 endif
 
@@ -561,8 +539,6 @@ $(BUILD_DIR)/$(DRM_IMPORT_DIR)/%.o: $(DRM_IMPORT_DIR)/%.c $(DRM_FLAGS_STAMP)
 # -w, because this file IS ours and has to stay warning-clean.
 LKPI_IMPORT_SOURCES := \
 	kernel/lkpi/drm_import_test.c \
-	kernel/lkpi/drm_virtual_monitor.c \
-	kernel/lkpi/drm_mirror.c \
 	kernel/lkpi/seq_file.c \
 	kernel/lkpi/sysfs.c \
 	kernel/lkpi/drm_b1nix_kms.c \
@@ -598,7 +574,7 @@ DRM_IMPORT_OBJECTS += $(LKPI_IMPORT_OBJECTS)
 #
 # When the driver builds, the second gate is the one to remove — not the first.
 I915_IMPORT_DIR := build/src/i915-6.6
-B1NIX_I915 ?= 0
+B1NIX_I915 ?= 1
 
 ifeq ($(B1NIX_I915),1)
 # main.c calls the driver's module init only when the driver is in the build.
@@ -815,7 +791,6 @@ $(APPLET_REGISTRATION_INC): $(APPLET_MANIFEST)
 # otherwise initramfs ships with stale userspace and the kernel sees old libc.
 $(BUILD_DIR)/.userspace-headers-installed: \
 	$(wildcard userspace/libc/*.c) \
-	$(wildcard userspace/libgui/*.c) \
 	$(wildcard userspace/include/*.h) \
 	$(wildcard userspace/include/*/*.h) \
 	$(wildcard userspace/include/*/*/*.h) \
@@ -842,13 +817,12 @@ $(BUILD_DIR)/.userspace-headers-installed: \
 # targets) do NOT need to be listed here. Only list libs that userspace/Makefile
 # pulls in transitively (openlibm, wayland, libffi, pcre2, zlib, pixman,
 # freetype, cairo, xkbcommon, harfbuzz, fontconfig, expat, libjpeg, libpng,
-# libwebp, libvpx, all NetSurf platform libs, tinygl, libidn2).
+# libwebp, libvpx, all NetSurf platform libs, libidn2).
 $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(wildcard userspace/bin/*/*.c) $(wildcard userspace/bin/*/*.cpp) \
 	$(wildcard userspace/bin/*/*.S) \
 	$(wildcard userspace/src/*.c) \
 	$(wildcard userspace/b1cc/src/*.c userspace/b1cc/src/*/*.c) \
-	$(wildcard userspace/displayd/*.c) \
 	$(wildcard userspace/duktape/duktape.c) \
 	$(LIBM_LIB) \
 	$(PCRE2_LIB) \
@@ -860,19 +834,12 @@ $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(HB_LIB) \
 	$(EXPAT_LIB) \
 	$(FONTCONFIG_LIB) \
-	$(TINYGL_LIB) \
-	$(ZLIB_LIB) \
+		$(ZLIB_LIB) \
 	$(LIBPNG_LIB) \
 	$(LIBJPEG_LIB) \
 	$(LIBWEBP_LIB) \
 	$(LIBVPX_LIB) \
-	$(LWC_LIB) \
-	$(PU_LIB) \
-	$(HUBBUB_LIB) \
-	$(LIBCSS_LIB) \
-	$(LIBDOM_LIB) \
-	$(NSUTILS_LIB) $(NSGIF_LIB) $(NSBMP_LIB) $(NSLOG_LIB) \
-	$(LIBIDN2_LIB) \
+						$(NSUTILS_LIB) 	$(LIBIDN2_LIB) \
 	$(MBEDTLS_LIB)
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
 	@touch $@
@@ -889,8 +856,6 @@ $(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(ARCH) sh tools/images/gen_b1cc_m34_initramfs.sh $@
 
-# displayd is multi-source, not a single bin/*.c
-DISPLAYD_SRCS := $(wildcard userspace/displayd/*.c) $(wildcard userspace/displayd/*.h)
 # userspace/bin is grouped by purpose (see userspace/Makefile's BIN_CATS), so a
 # program's source is looked up by name rather than assumed to sit at a fixed
 # path — moving one between categories does not touch this rule.
@@ -978,11 +943,6 @@ FONTCONFIG_LIB := build/$(ARCH)/pkg/fontconfig/lib/libfontconfig.a
 $(FONTCONFIG_LIB): $(PKG_DEPS) $(EXPAT_LIB) $(FREETYPE_LIB)
 	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh fontconfig >/dev/null
 
-# M52: TinyGL (software OpenGL) + b1nix EGL shim, cross-built static.
-TINYGL_LIB := build/$(ARCH)/ports/tinygl/install/lib/libEGL.a
-$(TINYGL_LIB): tools/ports/build-tinygl.sh userspace/libegl/b1egl.c userspace/include/EGL/egl.h
-	B1NIX_ARCH=$(ARCH) tools/ports/build-tinygl.sh >/dev/null
-
 # ── C++ / Mesa / Skia / Mesa-VirGL .inc rules ──
 # Skipped under musl: these need libc++/libstdc++ which has not been built
 # against musl yet. Placeholder .inc files are pre-created in the build dir.
@@ -1011,9 +971,8 @@ $(BUILD_DIR)/.mesa-built: tools/ports/build-mesa.sh $(BUILD_DIR)/.userspace-head
 # M52: programmable GLSL shader demo, sharing the same Mesa build as the OSMesa
 # demo. Exercises the GL 2.x programmable pipeline (shaders, VBOs, varyings).
 # M59: EGL over the real Mesa OSMesa softpipe. tools/demos/build-m59-egl.sh compiles
-# the OSMesa-backed EGL implementation (userspace/libegl/b1egl_mesa.c) together
 # with the off-screen pbuffer smoke and links them against the same Mesa stack
-# as the M52 OSMesa demo. The smoke renders entirely off-screen (no displayd).
+# as the M52 OSMesa demo. The smoke renders entirely off-screen.
 # M91: Skia 2D graphics library (standalone build with Ganesh GPU backend).
 $(BUILD_DIR)/.skia-built: tools/ports/build-skia.sh $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
@@ -1022,7 +981,7 @@ $(BUILD_DIR)/.skia-built: tools/ports/build-skia.sh $(USERSPACE_DEPS)
 	@touch $@
 
 # M91: shared-library deps for Skia (libskia.so, libraw_ptr.so, libfontconfig.so,
-# libb1gui.so, libGLESv2.so, libEGL.so). build-skia-shared-deps.sh builds all .so
+# libGLESv2.so). build-skia-shared-deps.sh builds them
 # from the port trees; xxd converts each to an initramfs .inc.
 
 # M91: Skia dm testing tool — too large for initramfs (400MB+).
@@ -1039,7 +998,7 @@ $(M91_SHARED_DEPS_STAMP): tools/ports/build-skia-shared-deps.sh $(BUILD_DIR)/.sk
 	B1NIX_ARCH=$(ARCH) sh tools/ports/build-skia-shared-deps.sh
 	@# Replace sysroot stubs with real .so so cross-cc link step finds them
 	@SYSROOT_LIB=$(CXX_RUNTIME_LIB); \
-	for so in libEGL.so libGLESv2.so libfontconfig.so; do \
+	for so in libGLESv2.so libfontconfig.so; do \
 		if [ -f userspace/build/$(ARCH)/$$so ]; then \
 			cp -f userspace/build/$(ARCH)/$$so "$$SYSROOT_LIB/$$so"; \
 		fi; \
@@ -1101,44 +1060,11 @@ LIBVPX_LIB := build/$(ARCH)/pkg/libvpx/lib/libvpx.a
 $(LIBVPX_LIB): $(PKG_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libvpx >/dev/null
 
-# M53: libwapcaplet (string internment) — first NetSurf browser-library dep.
-LWC_LIB := build/$(ARCH)/ports/libwapcaplet/install/lib/liblwc.a
-$(LWC_LIB): tools/ports/build-libwapcaplet.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libwapcaplet.sh >/dev/null
 
-# M53: libparserutils (input streams + bundled charset codecs) — NetSurf dep.
-PU_LIB := build/$(ARCH)/ports/libparserutils/install/lib/libparserutils.a
-$(PU_LIB): tools/ports/build-libparserutils.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libparserutils.sh >/dev/null
 
-# M53: libhubbub (HTML5 tokeniser + tree builder) over libparserutils — NetSurf.
-HUBBUB_LIB := build/$(ARCH)/ports/libhubbub/install/lib/libhubbub.a
-$(HUBBUB_LIB): tools/ports/build-libhubbub.sh $(PU_LIB)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libhubbub.sh >/dev/null
 
-# M53: libcss (CSS parser + selection) over libwapcaplet + libparserutils.
-LIBCSS_LIB := build/$(ARCH)/ports/libcss/install/lib/libcss.a
-$(LIBCSS_LIB): tools/ports/build-libcss.sh $(LWC_LIB) $(PU_LIB)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libcss.sh >/dev/null
 
-# M53: libdom (DOM) + hubbub binding over libhubbub + libparserutils + lwc.
-LIBDOM_LIB := build/$(ARCH)/ports/libdom/install/lib/libdom.a
-$(LIBDOM_LIB): tools/ports/build-libdom.sh $(HUBBUB_LIB)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libdom.sh >/dev/null
 
-# M53: NetSurf helper/decoder libs — libnsutils, libnsgif, libnsbmp, libnslog.
-NSUTILS_LIB := build/$(ARCH)/ports/libnsutils/install/lib/libnsutils.a
-NSGIF_LIB := build/$(ARCH)/ports/libnsgif/install/lib/libnsgif.a
-NSBMP_LIB := build/$(ARCH)/ports/libnsbmp/install/lib/libnsbmp.a
-NSLOG_LIB := build/$(ARCH)/ports/libnslog/install/lib/libnslog.a
-$(NSUTILS_LIB): tools/ports/build-libnsutils.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libnsutils.sh >/dev/null
-$(NSGIF_LIB): tools/ports/build-libnsgif.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libnsgif.sh >/dev/null
-$(NSBMP_LIB): tools/ports/build-libnsbmp.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libnsbmp.sh >/dev/null
-$(NSLOG_LIB): tools/ports/build-libnslog.sh
-	B1NIX_ARCH=$(ARCH) tools/ports/build-libnslog.sh >/dev/null
 
 # M53: userspace VirGL smoke — drives /dev/virtio-gpu (host-GPU-accelerated 3D).
 # OpenRC and Crashpad install straight into the staging rootfs, and until now
@@ -1244,17 +1170,6 @@ $(INITRAMFS_M40_LINUX_INC): tools/m40/linux_hello.bin
 $(INITRAMFS_M67_RUST_INC): tools/m67/hello_b1nix.elf
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m67_rust_elf tools/m67/hello_b1nix.elf > $@
-
-# M53: the loopback HTTPS server links mbedTLS; depend on NSFB_ELF so curl ->
-# mbedTLS is built (its archives present) before this binary is embedded.
-# M53: build the NetSurf framebuffer browser (the real nsfb binary) and package
-# it + its runtime resources + a test page into the initramfs.
-$(NSFB_ELF): tools/ports/build-netsurf-fb.sh tools/ports/build-libnsfb.sh $(ZLIB_LIB) $(LIBPNG_LIB) $(LIBJPEG_LIB) $(FREETYPE_LIB) $(CURLBUILD_STAMP)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-netsurf-fb.sh >/dev/null
-
-$(INITRAMFS_NETSURF_INC): $(NSFB_ELF) tools/images/gen_netsurf_initramfs.sh tools/netsurf-assets/test.html tools/netsurf-assets/test.png tools/netsurf-assets/test.svg tools/netsurf-assets/test.jxl
-	@mkdir -p $(dir $@)
-	B1NIX_ARCH=$(ARCH) tools/images/gen_netsurf_initramfs.sh $@
 
 # Self-contained TLS test PKI (CA + server cert/key) embedded under
 # /etc/tls-test for the M32 loopback HTTPS smoke. No network dependency.
@@ -1471,12 +1386,16 @@ SMOKE_CMDLINE_pass=b1nix.i915sway b1nix.use-cage b1nix.drm-debug b1nix.drm-debug
 SMOKE_CMDLINE_pass-probe=b1nix.i915sway b1nix.drm-probe-only b1nix.drm-enumerate b1nix.drm-debug
 SMOKE_CMDLINE_pass-sway=b1nix.i915sway b1nix.sway-clients b1nix.bright b1nix.drm-debug b1nix.vma-check
 SMOKE_CMDLINE_pass-headless=b1nix.i915sway b1nix.sway-headless b1nix.vma-check
+# The browser, under cage on the passed-through GPU. Its packages are fetched at
+# run time — 248 MB installed is not something to carry in an image for a test
+# that is run occasionally.
+SMOKE_CMDLINE_pass-chromium=b1nix.i915sway b1nix.chromium b1nix.drm-debug
 # The same cage run with a frame built to be photographed: saturated colour
 # across the whole screen and a client whose output changes, so a camera shot
 # says whether the panel is showing our picture rather than merely being lit.
 SMOKE_CMDLINE_pass-bright=b1nix.i915sway b1nix.use-cage b1nix.bright b1nix.drm-debug
 
-iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless: root-image check-dynamic $(KERNEL_ELF)
+iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
@@ -1502,7 +1421,7 @@ iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-pass iso-pass-sway iso
 iso-i915: $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/iso-i915 --out $(BUILD_DIR)/b1nix-i915.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "b1nix.gfx-only b1nix.mirror-display $(I915_EXTRA_CMDLINE)" \
+	    --cmdline "b1nix.gfx-only $(I915_EXTRA_CMDLINE)" \
 	    $(if $(I915_EDID),--module $(I915_EDID):edid.bin)
 
 iso-v8: $(KERNEL_ELF) root-image
@@ -1586,7 +1505,7 @@ install-native-toolchain:
 		echo "      Run tools/build-native-clang.sh --b1nix-elf."; \
 	fi
 
-install-ports: userspace-install busybox-package install-native-toolchain $(PKGROOT_STAMP) $(NSFB_ELF) $(OPENRC_INIT) $(CRASHPAD_HANDLER)
+install-ports: userspace-install busybox-package install-native-toolchain $(PKGROOT_STAMP) $(OPENRC_INIT) $(CRASHPAD_HANDLER)
 	tools/packages/install-ports.sh $(BUILD_DIR)/rootfs $(ARCH) $(PORTS_SOURCE) $(PACKAGE_INDEX_URL)
 	@# The published dev package may carry older libc headers than this checkout.
 	@# Restore the current userspace ABI after package extraction so cross C++
@@ -1928,13 +1847,10 @@ endif
 	@# userspace-install never copies them. Build (if missing) then stage into
 	@# rootfs/bin here, same as skia-dm above.
 	@UD=userspace/build/$(ARCH)/bin; \
-	[ -f "$$UD/m52_osmesa" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_osmesa "$$UD/m52_osmesa" || true; \
-	[ -f "$$UD/m52_glsl" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_glsl "$$UD/m52_glsl" || true; \
 	[ -f "$$UD/m53_mesa_virgl" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m53-mesa-virgl.sh "$$UD/m53_mesa_virgl" || true; \
-	[ -f "$$UD/m59_smoke" ] || B1NIX_ARCH=$(ARCH) B1NIX_CXX_STDLIB=libc++ tools/demos/build-m59-egl.sh "$$UD/m59_smoke" || true; \
 	[ -f "$$UD/m91_skia_smoke" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m91-skia-demo.sh m91_skia_smoke "$$UD/m91_skia_smoke" || true; \
 	[ -f "$$UD/m55_litehtml" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m55-litehtml.sh "$$UD/m55_litehtml" || true; \
-	for b in m52_osmesa m52_glsl m53_mesa_virgl m59_smoke m91_skia_smoke m55_litehtml; do \
+	for b in m53_mesa_virgl m91_skia_smoke m55_litehtml; do \
 		if [ -f "$$UD/$$b" ]; then \
 			cp -f "$$UD/$$b" $(BUILD_DIR)/rootfs/bin/$$b; \
 			chmod +x $(BUILD_DIR)/rootfs/bin/$$b; \
@@ -2008,7 +1924,7 @@ check-dynamic:
 
 check-ports:
 	@leaked=0; \
-	for pc in $$(find -L build -path '*/install/lib/pkgconfig/*.pc' -o -path '*/netsurf-sysroot/*/lib/pkgconfig/*.pc' 2>/dev/null); do \
+	for pc in $$(find -L build -path '*/install/lib/pkgconfig/*.pc' 2>/dev/null); do \
 		hit=$$(grep -lE '(^|[=: ])(/usr(/local)?|/opt/(homebrew|local)|'"$${HOME}"')(/|$$)' "$$pc" 2>/dev/null || true); \
 		if [ -n "$$hit" ]; then \
 			echo "check-ports: host path leak in $$pc:"; \

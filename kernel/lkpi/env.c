@@ -717,44 +717,10 @@ static u64 lkpi_tsc_base;
  * on udelay being usable with them off, and shootdowns are still serviced
  * through cpu_relax so a spinning CPU does not wedge one that is waiting on it.
  */
-/*
- * Stretching every delay, for finding a race by its symptom.
- *
- * The display comes up on this hardware occasionally rather than never, with
- * every register in the finished modeset matching a working one bit for bit.
- * That is the shape of a step whose wait is too short: it usually loses and
- * sometimes wins. Multiplying every delay is not a fix and is not meant to be —
- * it is the measurement that says whether waiting longer changes the odds, and
- * so whether the fault is in timing at all.
- *
- * b1nix.slow-phy=<n> multiplies; absent, nothing changes.
- */
-static u64 lkpi_delay_scale;
-
-static u64 lkpi_delay_factor(void)
-{
-	char buf[8];
-
-	if (lkpi_delay_scale)
-		return lkpi_delay_scale;
-	lkpi_delay_scale = 1;
-	if (bootinfo_get_kv("b1nix.slow-phy", buf, sizeof(buf))) {
-		u64 n = 0;
-
-		for (const char *p = buf; *p >= '0' && *p <= '9'; p++)
-			n = n * 10u + (u64)(*p - '0');
-		if (n >= 2 && n <= 64)
-			lkpi_delay_scale = n;
-	}
-	return lkpi_delay_scale;
-}
-
 void lkpi_udelay(u64 usecs)
 {
 	u32 khz = arch_cpu_khz();
 	u64 start, cycles;
-
-	usecs *= lkpi_delay_factor();
 
 	if (!khz) {
 		/* Uncalibrated: fall back to the old spin so a delay is at least

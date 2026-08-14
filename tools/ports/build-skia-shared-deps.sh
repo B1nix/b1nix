@@ -8,7 +8,6 @@
 #   libraw_ptr.so    — Skia's raw_ptr component, from ninja
 #   libfontconfig.so — b1nix fontconfig + freetype + zlib + expat, relinked here
 #                      (libskia.so DT_NEEDEDs it for its Fc* symbols)
-#   libb1gui.so      — b1nix GUI client library, relinked from libb1gui.a
 #   libGLESv2.so     — thin GL stub (real GL entrypoints are folded into the
 #   libEGL.so          Skia demo exe over Mesa OSMesa; see build-m91-skia-demo.sh)
 #
@@ -67,15 +66,6 @@ FC_SO="$(ls "$ROOT_DIR/build/$B1NIX_ARCH/pkg/fontconfig/lib/libfontconfig.so."[0
 }
 cp -f "$FC_SO" "$UB/libfontconfig.so"
 
-# --- 3) libb1gui.so (from libb1gui.a; SysV+GNU hash) -------------------------
-B1GUI_A="$UB/libb1gui.a"
-[ -f "$B1GUI_A" ] || { echo "build-skia-shared-deps: missing $B1GUI_A (run make -C userspace)" >&2; exit 1; }
-"$LLD" -shared -m elf_x86_64 --hash-style=both -soname libb1gui.so \
-  --whole-archive "$B1GUI_A" --no-whole-archive \
-  -L "$CROSSL" -lc \
-  --allow-shlib-undefined \
-  -o "$UB/libb1gui.so"
-
 # --- 4) libGLESv2.so — real Mesa GL entry points (for Dawn dlopen) -----------
 # Dawn's OpenGL ES backend loads libGLESv2.so via dlopen at runtime.
 # We fold Mesa's libglapi_static.a (1971 GL entry points) into a shared lib.
@@ -88,33 +78,3 @@ GLAPI_A="$MESA_DIR/libglapi_static.a"
   --allow-shlib-undefined \
   -o "$UB/libGLESv2.so"
 
-# --- 5) libEGL.so — b1nix EGL impl over Mesa OSMesa (for Dawn dlopen) -------
-# Contains b1egl_mesa.c (full EGL 1.4) + egl_proc_resolver.c (eglGetProcAddress
-# via dlsym, resolves GL functions from libGLESv2.so / libglapi).
-EGL_MESA_C="$ROOT_DIR/userspace/libegl/b1egl_mesa.c"
-EGL_RESOLVER_C="$ROOT_DIR/userspace/libegl/egl_proc_resolver.c"
-[ -f "$EGL_MESA_C" ] || { echo "build-skia-shared-deps: missing $EGL_MESA_C" >&2; exit 1; }
-[ -f "$EGL_RESOLVER_C" ] || { echo "build-skia-shared-deps: missing $EGL_RESOLVER_C" >&2; exit 1; }
-
-WRAPPER="$ROOT_DIR/tools/ports/b1nix-cross-cc.sh"
-EGL_OBJ="/tmp/b1egl_mesa_$$.o"
-EGL_RES_OBJ="/tmp/b1egl_resolver_$$.o"
-MESA_INC="$ROOT_DIR/build/$B1NIX_ARCH/ports/mesa/install/include"
-B1GUI_INC="$ROOT_DIR/userspace/include"
-
-"$WRAPPER" -O2 -I "$MESA_INC" -I "$B1GUI_INC" -c "$EGL_MESA_C" -o "$EGL_OBJ"
-"$WRAPPER" -O2 -c "$EGL_RESOLVER_C" -o "$EGL_RES_OBJ"
-
-# Link libEGL.so: just EGL entry points + OSMesa stubs.
-# GL functions come from libGLESv2.so (loaded separately by Dawn).
-# Mesa OSMesa functions (OSMesaCreateContext etc.) are needed at runtime
-# but we provide them as weak stubs — the real Mesa stack is in the smoke binary.
-"$LLD" -shared -m elf_x86_64 --hash-style=both -soname libEGL.so \
-  "$EGL_OBJ" "$EGL_RES_OBJ" \
-  -L "$UB" -L "$CROSSL" -lGLESv2 -lc -lm -ldl \
-  --allow-shlib-undefined \
-  -o "$UB/libEGL.so"
-
-rm -f "$EGL_OBJ" "$EGL_RES_OBJ"
-
-echo "build-skia-shared-deps: staged libskia/libraw_ptr/libfontconfig/libb1gui/libGLESv2/libEGL in $UB" >&2

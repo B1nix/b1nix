@@ -2823,6 +2823,50 @@ int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
       u16 create_mode = (u16)(mode & 07777);
       if (ocred)
         create_mode &= (u16)~ocred->umask;
+      /*
+       * A symlink pointing at nothing is still a path to create through.
+       *
+       * open(O_CREAT) creates what the link names, not the link: the lookup
+       * above already followed it and said ENOENT, and creating at the link's
+       * own path would find the link sitting there and report EEXIST — which
+       * is what happened to a package manager whose index was a symlink onto a
+       * disk that had not been written yet. Followed here, bounded, and only
+       * when the last component really is a link.
+       */
+      {
+        char *link = kmalloc(VFS_MAX_PATH);
+
+        if (link) {
+          for (int hop = 0; hop < 8; hop++) {
+            struct vfs_node *ln = vfs_find_node_internal(resolved, 0, 0);
+            int is_link = !IS_ERR(ln) && ln->inode &&
+                          ln->inode->type == VFS_SYMLINK;
+
+            if (!IS_ERR(ln))
+              vfs_node_put(ln);
+            if (!is_link)
+              break;
+            isize n = vfs_readlink(resolved, link, VFS_MAX_PATH - 1);
+            if (n <= 0)
+              break;
+            link[n] = 0;
+            if (link[0] == '/') {
+              strncpy(resolved, link, VFS_MAX_PATH - 1);
+            } else {
+              char *dir = kmalloc(VFS_MAX_PATH);
+              char base[64];
+
+              if (!dir)
+                break;
+              if (split_parent_path(resolved, dir, base) == 0)
+                snprintf(resolved, VFS_MAX_PATH, "%s/%s", dir, link);
+              kfree(dir);
+            }
+            resolved[VFS_MAX_PATH - 1] = 0;
+          }
+          kfree(link);
+        }
+      }
       int err = vfs_create_at_internal(resolved, create_mode);
       if (err != 0) {
         res = err;
