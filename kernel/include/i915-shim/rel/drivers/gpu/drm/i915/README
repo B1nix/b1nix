@@ -1,0 +1,22 @@
+This directory is empty on purpose, and it must not be deleted.
+
+gt/intel_rps.c includes the Ironlake power controller's header by a path that
+climbs out of the driver tree:
+
+	#include "../../../platform/x86/intel_ips.h"
+
+We stage only drivers/gpu/drm/i915, so that header is not in the source tree,
+and imported source is never edited to change the spelling of an include. The
+substitute lives at ../../../platform/x86/intel_ips.h relative to THIS
+directory, and the Makefile puts this directory on the include path
+(I915_IMPORT_CFLAGS) so the climb lands on it.
+
+The climb is resolved by the filesystem, not lexically by the preprocessor:
+clang concatenates the -I directory with the quoted path and asks the kernel to
+open it, so every component of this path has to exist as a real directory. Git
+does not track empty directories, so without a file here the path disappears on
+a fresh clone and `make B1NIX_I915=1` fails with
+
+	fatal error: '../../../platform/x86/intel_ips.h' file not found
+
+on a checkout where the header is plainly present. This file is that anchor.

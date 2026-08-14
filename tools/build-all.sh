@@ -34,8 +34,6 @@
 #                             (tools/build-rust-toolchain.sh)
 #     --with-v8               full V8 d8 pipeline: gen -> build -> link -> ISO
 #                             (tools/v8/v8-build-run.sh)
-#     --with-mesa-llvmpipe    Mesa llvmpipe software-GL stack (M75)
-#                             (MESA_LLVMPIPE=1 tools/ports/build-mesa.sh)
 #     --with-ports            install the userspace port packages into the rootfs
 #                             (make ARCH=x86_64 install-ports)
 #     --all                   enable every --with-* above
@@ -73,7 +71,6 @@ WITH_NATIVE_CLANG="${WITH_NATIVE_CLANG:-0}"
 WITH_DYNAMIC_CLANG="${WITH_DYNAMIC_CLANG:-0}"
 WITH_RUST="${WITH_RUST:-0}"
 WITH_V8="${WITH_V8:-0}"
-WITH_MESA_LLVMPIPE="${WITH_MESA_LLVMPIPE:-0}"
 WITH_PORTS="${WITH_PORTS:-0}"
 
 usage() { sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
@@ -86,11 +83,10 @@ for arg in "$@"; do
 		--with-dynamic-clang)    WITH_DYNAMIC_CLANG=1 ;;
 		--with-rust)             WITH_RUST=1 ;;
 		--with-v8)               WITH_V8=1 ;;
-		--with-mesa-llvmpipe)    WITH_MESA_LLVMPIPE=1 ;;
 		--with-ports)            WITH_PORTS=1 ;;
 		--all)
 			WITH_NATIVE_TOOLCHAIN=1; WITH_NATIVE_CLANG=1; WITH_DYNAMIC_CLANG=1
-			WITH_RUST=1; WITH_V8=1; WITH_MESA_LLVMPIPE=1; WITH_PORTS=1 ;;
+			WITH_RUST=1; WITH_V8=1; WITH_PORTS=1 ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "build-all: unknown argument '$arg' (try --help)" >&2; exit 2 ;;
 	esac
@@ -146,13 +142,6 @@ stage_v8() {
 	sh tools/v8/v8-build-run.sh
 }
 
-stage_mesa_llvmpipe() {
-	# build-mesa.sh prints ONLY its install dir on stdout (progress -> stderr).
-	local mesa_dir
-	mesa_dir="$(MESA_LLVMPIPE=1 B1NIX_ARCH="$ARCH" tools/ports/build-mesa.sh)"
-	echo "  Mesa (llvmpipe) installed at: $mesa_dir"
-}
-
 stage_ports() {
 	make ARCH="$ARCH" install-ports
 }
@@ -171,7 +160,6 @@ add "userspace"            "make ARCH=$ARCH userspace"                   stage_u
 [ "$WITH_DYNAMIC_CLANG" = "1" ]    && add "dynamic Clang"        "tools/build-native-clang-dynamic.sh"       stage_dynamic_clang
 [ "$WITH_RUST" = "1" ]             && add "rust cross"           "tools/rust/build-rust.sh --toolchain"      stage_rust
 [ "$WITH_V8" = "1" ]               && add "V8 (d8)"              "tools/v8/build-v8.sh --build"              stage_v8
-[ "$WITH_MESA_LLVMPIPE" = "1" ]    && add "Mesa llvmpipe"        "MESA_LLVMPIPE=1 tools/ports/build-mesa.sh" stage_mesa_llvmpipe
 [ "$WITH_PORTS" = "1" ]            && add "userspace ports"      "make ARCH=$ARCH install-ports"             stage_ports
 add "kernel + ISO"         "make ARCH=$ARCH KERNEL_CMDLINE='$KERNEL_CMDLINE' $ISO_TARGET" stage_kernel_iso
 

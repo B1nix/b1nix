@@ -93,7 +93,7 @@ fi
 # ── Static vs dynamic link (default dynamic, like the rest of userspace) ─────
 # B1NIX_LINK=dynamic links as a NON-PIE dynamic ET_EXEC: libc++ and the
 # bundled archives stay statically folded (they are non-PIC), only libc becomes
-# the shared libc.so.1 loaded via /lib/ld-b1nix.so (the proven d8 / Mesa-port
+# the shared libc.so.1 loaded via /lib/ld-b1nix.so (the proven d8 port
 # model). B1NIX_LINK=static keeps the historical whole-archive static link.
 SHARED_LIBC="$USR/build/$ARCH/libc.so.1"
 DYN_CRT0="$USR/build/$ARCH/crt/crt0-dynamic.o"

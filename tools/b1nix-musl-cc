@@ -246,43 +246,14 @@ with open(f, 'r+b') as fh:
     fh.write(bytes([3]))  # ELFOSABI_LINUX = 3
 " "$OUTPUT" 2>/dev/null || true
 
-    # DT_NEEDED for this .so is taken from ITS OWN embedded DT_SONAME
-    # (ld-musl-x86_64.so.1), not from the symlink name we linked through —
-    # but musl's ld.so only recognizes a self-referential DT_NEEDED via a
-    # short hardcoded prefix list ("libc.", "libpthread.", ...) or an exact
-    # match against ldso.name (which is overwritten to the app's own
-    # PT_INTERP string, not the SONAME, once a real interpreter is in play).
-    # Neither matches "ld-musl-x86_64.so.1", so ld.so falls through to
-    # actually re-open/re-map itself as a "new" library — where it crashes
-    # deduping against itself. Real musl-gcc avoids this because it links
-    # via `-lc` against a system "libc.so", which DOES hit the reserved-name
-    # fast path. We reproduce that exact upstream convention post-link by
-    # renaming the DT_NEEDED string in .dynstr from the SONAME to "libc.so"
-    # (same byte length, zero-padded) — this is not a test hack, it is
-    # restoring the standard musl toolchain's own self-recognition contract.
-    # When linking via -L -lc, ld.lld records the SONAME (ld-musl-x86_64.so.1)
-    # as NEEDED, which is correct. No post-link patch needed for -ldso mode.
-    # The patch below is only needed if DT_NEEDED still contains the old name
-    # (e.g. when linking directly against the .so file instead of via -lc).
-    python3 -c "
-import sys
-f = sys.argv[1]
-old = b'\x00ld-musl-x86_64.so.1\x00'
-new_name = b'libc.so' + b'\x00' * (19 - len(b'libc.so'))
-new = b'\x00' + new_name + b'\x00'
-assert len(old) == len(new)
-with open(f, 'rb') as fh:
-    data = fh.read()
-idx = data.find(old)
-if idx < 0:
-    # Already correct (e.g. -lc linked against SONAME)
-    sys.exit(0)
-if data.find(old, idx+1) >= 0:
-    sys.exit('b1nix-musl-cc: DT_NEEDED string ld-musl-x86_64.so.1 appears more than once')
-data = data[:idx] + new + data[idx+len(old):]
-with open(f, 'wb') as fh:
-    fh.write(data)
-" "$OUTPUT"
+    # DT_NEEDED comes out as "libc.so" straight from the linker, because that
+    # is libc.so's DT_SONAME (set in tools/ports/build-musl.sh). It has to be
+    # that exact name: musl's ld.so recognises a self-referential DT_NEEDED
+    # only through a short reserved-prefix list ("libc.", "libpthread.", ...),
+    # and anything else sends it off to re-open and re-map itself as a "new"
+    # library, where it crashes deduping against itself. This used to be
+    # repaired after the fact by rewriting the string in .dynstr; giving musl
+    # its own soname fixes it at the source, so nothing is rewritten here.
 
     rm -f $TMPOBJS
     rm -rf "$MUSL_LINK_DIR"

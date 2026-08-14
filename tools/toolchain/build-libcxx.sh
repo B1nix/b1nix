@@ -226,7 +226,7 @@ echo "  headers → $LIBCXX_SYSROOT_HDR"
 # compiles the register save/restore assembly (UnwindRegisters{Save,Restore}.S),
 # which the standalone build in build-llvm-runtimes.sh omits. Install it over the
 # LLVM_RT copy so every consumer that resolves -lunwind from there (b1nix-c++,
-# build-mesa.sh, the M52 OSMesa demo) gets the COMPLETE archive, not one missing
+# the C++ ports) gets the COMPLETE archive, not one missing
 # __unw_getcontext / __libunwind_Registers_*_jumpto.
 LLVM_RT_LIB="$BUILD_HOME/install/lib"
 if [ -d "$LLVM_RT_LIB" ]; then

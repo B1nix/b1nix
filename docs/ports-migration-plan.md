@@ -196,11 +196,22 @@ migration work.
   their dependencies onto an image with no X server.
 - `libjxl`: C++ built against libstdc++, while everything C++ here is libc++.
   Two C++ ABIs in one link do not mix.
-- `mesa`: built for Linux DRM with libdrm and LLVM, not for the softpipe/OSMesa
-  configuration this uses.
 - `openlibm`: consumers name `libm.a`; Alpine's package is `libopenlibm`, and
   musl already provides libm inside libc.so — a decision about which libm the
   image uses, not a packaging question.
+
+`mesa` was on that list, for the reason that Alpine builds it for Linux DRM
+rather than for the softpipe/OSMesa configuration the port was written around.
+That turned out to be an argument about a configuration nothing wanted. The
+OSMesa demos it existed for had already been deleted with the rest of the old
+GUI stack, and the one live consumer of GL on this image is Alpine's own
+`libwlroots`, which records `libEGL.so.1`, `libgbm.so.1` and `libGLESv2.so.2` —
+Alpine's build, exactly. So the port went: 365 lines of meson cross-build and a
+477 MB build tree, replaced by five names in `alpine-ports.map`
+(`mesa-egl mesa-gles mesa-gbm mesa-gl mesa-glapi`, ~1.5 MB installed).
+`mesa-dri-gallium` is deliberately not among them — 34 MB dragging llvm17-libs
+(150 MB) behind it, for hardware drivers an image that composes in software and
+runs its browser with `--disable-gpu` has no use for.
 
 **Deliberately still ours** — `musl`, because it is the ABI base whose loader
 behaviour and `EI_OSABI` stamping the whole image depends on, and `libcxx-musl`,
@@ -340,9 +351,10 @@ wrong).
 `netsurf-fb` (834-line build script, the single biggest port script and
 already flagged in `install-ports.sh`'s own comments as needing a "fresher"
 local build over the published one due to past musl-migration staleness),
-`mesa` (355 lines, GPU-facing, already has documented render-verification
-gaps per the M52 project memory — "render unverified, too slow under
-TCG"), `skia` + `skia-shared-deps` (355 combined, heaviest C++ dependency),
+`mesa` (**done** — the whole port deleted, see the third-pass section above;
+it turned out to be the easiest of this wave, not the hardest, because the
+only thing left that wanted GL wanted precisely Alpine's build of it),
+`skia` + `skia-shared-deps` (355 combined, heaviest C++ dependency),
 `runit`/`openrc` (init systems — getting these wrong means the image
 doesn't boot, not just "a feature is missing"), `busybox` is listed in Wave
 2 but note `openrc`/`runit` specifically must be smoke-tested with `-smp 4`

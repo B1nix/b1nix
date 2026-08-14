@@ -1,0 +1,9 @@
+This directory is empty on purpose, and it has to exist.
+
+It is the -I anchor the Makefile points at (I915_IMPORT_CFLAGS) so that the
+`#include "../../../platform/x86/intel_ips.h"` in the imported
+gt/intel_rps.c resolves to the shim two levels up, at
+kernel/include/i915-shim/rel/drivers/platform/x86/intel_ips.h.
+
+Git does not track empty directories, so without this file a fresh clone or
+worktree has no anchor, and every i915 build fails on that one include.

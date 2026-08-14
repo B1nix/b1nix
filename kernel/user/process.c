@@ -927,7 +927,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * Without this, a 220 MB dynamic PIE was staged with one kzalloc of its whole
    * text and then copied page by page into private frames, per process, shared
    * with nobody. */
-  int demand_page = (load_base == 0 || image->interp_base != 0);
+  int demand_page = (load_base == 0);
   for (u16 i = 0; demand_page && i < ehdr->e_phnum; i++) {
     struct elf64_phdr *a = &phdrs[i];
     if (a->p_type != PT_LOAD)

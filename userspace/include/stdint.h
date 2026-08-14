@@ -1,21 +1,30 @@
 #ifndef B1NIX_U_STDINT_H
 #define B1NIX_U_STDINT_H
 
+/* x86_64 is LP64, so the 64-bit exact-width types are `long`, the same choice
+ * musl makes (bits/alltypes.h: #define _Int64 long) and the same one the rest
+ * of the LP64 world makes. This header said `long long` for years. It is
+ * normally shadowed — every build puts musl's headers ahead of this directory —
+ * but where it is not, the mismatch is invisible until something reasons about
+ * the spelling rather than the width: Skia's dng_sdk picks
+ * __builtin_smull_overflow off `LONG_MAX == INT64_MAX` and takes a `long *`,
+ * which does not accept `long long *`, and that disagreement is why a b1nix
+ * carve-out was patched into dng_safe_arithmetic.h. */
 typedef signed char int8_t;
 typedef short int16_t;
 typedef int int32_t;
-typedef long long int64_t;
+typedef long int64_t;
 
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
-typedef unsigned long long uint64_t;
+typedef unsigned long uint64_t;
 
 typedef long intptr_t;
 typedef unsigned long uintptr_t;
 
-typedef long long intmax_t;
-typedef unsigned long long uintmax_t;
+typedef long intmax_t;
+typedef unsigned long uintmax_t;
 
 /* least/fast-width types (exact-width for least; int-or-wider for fast). */
 typedef int8_t   int_least8_t;
@@ -42,8 +51,8 @@ typedef uint64_t uint_fast64_t;
 #define UINT16_C(c) c
 #define INT32_C(c)  c
 #define UINT32_C(c) c
-#define INT64_C(c)  c ## LL
-#define UINT64_C(c) c ## ULL
+#define INT64_C(c)  c ## L
+#define UINT64_C(c) c ## UL
 
 #define INT8_MIN   (-128)
 #define INT8_MAX   127
@@ -57,9 +66,9 @@ typedef uint64_t uint_fast64_t;
 #define INT32_MAX  2147483647
 #define UINT32_MAX 4294967295U
 
-#define INT64_MIN  (-9223372036854775807LL - 1)
-#define INT64_MAX  9223372036854775807LL
-#define UINT64_MAX 18446744073709551615ULL
+#define INT64_MIN  (-9223372036854775807L - 1)
+#define INT64_MAX  9223372036854775807L
+#define UINT64_MAX 18446744073709551615UL
 
 #define INTMAX_MIN  INT64_MIN
 #define INTMAX_MAX  INT64_MAX

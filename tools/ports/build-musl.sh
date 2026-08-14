@@ -180,21 +180,14 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
       2>&1
   )
 
-  # Apply the b1nix-specific dynamic-loader fixes to the clean musl source.
-  # Keeping them as a repository patch makes rebuilds reproducible and avoids
-  # leaving edits in the generated build/src/musl tree as the source of truth.
-  # --forward skips already-applied hunks but then exits non-zero, which under
-  # `set -e` would abort an incremental rebuild of an already-patched tree — so
-  # tolerate that (idempotent re-apply).
-  # B1NIX_MUSL_PATCH=1 re-applies the old local patch. It should not be needed:
-  # both of its hunks worked around musl failing to recognise itself, which it
-  # did because this build gave the shared libc a SONAME of its own invention.
-  # With musl's own name back, the loader is its own dependency again and its
-  # symbols are in scope without help.
-  if [ "${B1NIX_MUSL_PATCH:-0}" = 1 ]; then
-    patch -d "$SRC_DIR" -p1 --forward --batch \
-      < "$ROOT_DIR/tools/patches/musl/b1nix-dynamic-loader.patch" || true
-  fi
+  # musl is built from pristine upstream source: no b1nix patch is applied.
+  # The two hunks that used to live here (a forced add_syms(&ldso) in
+  # ldso/dynlink.c, and a strong sigaction() in place of the weak_alias) were
+  # both symptoms of one build defect: we gave libc.so a DT_SONAME of our own
+  # invention, so musl's ld.so could not recognise its own DT_NEEDED entry and
+  # never merged its symbol table into the global scope. LDFLAGS_AUTO below now
+  # sets the soname musl itself uses (libc.so), which is on ld.so's reserved
+  # self-reference prefix list, so both hunks became dead weight.
 
   # --- post-configure fixups for freestanding LLVM cross-toolchain ---
   if [ -f "$SRC_DIR/config.mak" ]; then

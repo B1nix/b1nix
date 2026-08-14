@@ -15,14 +15,12 @@
 # Sizes are the reason for each line, not an accident of it:
 #   the kernel with debug information is 33 MB and without it 5 MB, so the
 #   symbols are their own package and nobody downloads them by mistake;
-#   the smoke binaries are 439 files nobody runs on a real machine;
-#   OSMesa alone is 55 MB, and only a machine doing software GL wants it.
+#   the smoke binaries are 439 files nobody runs on a real machine.
 
 b1nix-kernel      | boot/kernel.elf                                    |             | The b1nix kernel, stripped
 b1nix-kernel-dbg  | boot/kernel.elf.debug                              | b1nix-kernel | Debug symbols for the kernel
 b1nix-base        | lib/libc.so lib/ld-musl-x86_64.so.1 sbin/init bin/sh bin/busybox etc/inittab | b1nix-kernel | Minimum userspace to reach a shell
 b1nix-drm         | lib/modules                                         | b1nix-kernel | Loadable driver modules
 b1nix-tools       | bin/bpkg bin/mountinfo sbin/mountinfo               | b1nix-base  | b1nix's own utilities
-b1nix-mesa        | lib/libOSMesa.so.8 lib/libEGL.so.1 lib/libGLESv2.so.2 | b1nix-base | Software OpenGL built for b1nix
 b1nix-netsurf     | bin/netsurf-fb                                      | b1nix-base  | NetSurf, framebuffer frontend
 b1nix-tests       | bin/m101t_smoke bin/font_probe bin/m51_freetype_smoke | b1nix-base | Smoke and probe binaries

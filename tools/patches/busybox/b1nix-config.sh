@@ -3,26 +3,18 @@
 set -eu
 
 SRC_DIR="${1:?usage: b1nix-config.sh <busybox-src-dir>}"
-PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-if sed --version >/dev/null 2>&1; then sed_inplace() { sed -i "$@"; }
-else sed_inplace() { sed -i '' "$@"; }; fi
-
-# procps applets can use b1nix's sysinfo(2), but BusyBox gates the code on
-# __linux__.
-for bb_src in procps/free.c procps/uptime.c procps/ps.c procps/vmstat.c; do
-  if [ -f "$SRC_DIR/$bb_src" ] && ! grep -q "__b1nix__" "$SRC_DIR/$bb_src"; then
-    sed_inplace 's/#ifdef __linux__/#if defined(__linux__) || defined(__b1nix__)/' \
-      "$SRC_DIR/$bb_src"
-  fi
-done
-
-# BusyBox tree uses scandir/alphasort, which b1nix libc does not provide.
-# Keep the metadata comments in the replacement source: BusyBox scans them to
-# register the applet and generate Config.in/applets.h/kbuild rules.
-if [ -f "$SRC_DIR/miscutils/tree.c" ] && ! grep -q "__b1nix__" "$SRC_DIR/miscutils/tree.c"; then
-  cp "$PATCH_DIR/tree.c" "$SRC_DIR/miscutils/tree.c"
-fi
+# Two edits used to live here and no longer do:
+#
+#   * procps/{free,uptime,ps,vmstat}.c had every `#ifdef __linux__` widened to
+#     also accept __b1nix__. The wrapper that compiles BusyBox already passes
+#     -D__linux__ (tools/toolchain/bin/b1nix-musl-autotools-cc), so the rewrite
+#     never selected a single line the compiler was not already taking.
+#
+#   * miscutils/tree.c was replaced wholesale with a scandir-free rewrite,
+#     because the old hand-written b1nix libc had no scandir/alphasort. musl
+#     has both (src/dirent/{scandir,alphasort}.c, declared in <dirent.h>), so
+#     upstream's tree.c builds as shipped.
 
 # /etc/shadow is SHA-512 crypt ("$6$"), which BusyBox hashes itself
 # (USE_BB_CRYPT_SHA) and which musl's crypt(3) — the PAM path, M105 — accepts

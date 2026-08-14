@@ -16,7 +16,7 @@
 #   build/native-clang/b1nix-dyn/usr/lib/libLLVM-22.so
 #   build/native-clang/b1nix-dyn/usr/lib/clang/<v>/include/...
 #
-# Prints the prefix path on stdout (like build-mesa.sh) so callers can `$( )` it.
+# Prints the prefix path on stdout (like the port scripts) so callers can `$( )` it.
 # Idempotent. patchelf rewrites each binary's relative NEEDED 'lib/libLLVM.so'
 # to the resolvable soname 'libLLVM-22.so'.
 set -eu

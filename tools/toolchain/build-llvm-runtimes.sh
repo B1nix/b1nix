@@ -197,7 +197,7 @@ fi
 # crtbeginS.o/crtendS.o that nothing in this toolchain produces yet. Compile
 # the known source list directly instead, the same way the builtins fallback
 # a few lines up does for the base archive — deterministic, no CMake probe
-# to go wrong, no link step. Autotools/meson build files (e.g. Mesa's
+# to go wrong, no link step. Autotools/meson build files (e.g. a port's
 # meson.build, and third-party packages generally) commonly probe for a
 # library literally named "atomic" via find_library()/-latomic and treat its
 # absence as fatal, independent of whether the platform actually needs it —

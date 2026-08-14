@@ -240,10 +240,10 @@ run_qemu() {
 		fi
 
 		# RAM: the historical default (no -m → 128 MiB) was enough until the real
-		# Mesa softpipe demo (m52-osmesa) actually ran — it exhausts 127 MiB and
-		# OOMs, starving later graphics tests (setcrtc, console-reclaim) and Mesa
-		# context creation. Give the VM headroom. x86_64 only: the 32-bit port
-		# caps usable RAM at 1 GiB, so keep it modest there.
+		# software-GL demo actually ran — it exhausts 127 MiB and OOMs, starving
+		# the later graphics tests (setcrtc, console-reclaim). The demo is gone,
+		# the graphics stack it starved is not, so the headroom stays. x86_64
+		# only: the 32-bit port caps usable RAM at 1 GiB, so keep it modest there.
 		local mem_args="-m ${SMOKE_MEM_MB:-1024}"
 		if [ "$ARCH" = "x86" ]; then
 			mem_args="-m ${SMOKE_MEM_MB:-768}"
@@ -1554,7 +1554,6 @@ check_output "$LOG" "M31-SEC: ok getspnam-root" "getspnam(3) returns root's \$6\
 check_output "$LOG" "M31-SEC: ok setuid-elevate" "setuid initramfs binary elevates euid to root"
 check_output "$LOG" "M31-SEC: ok uid-denial" "non-root setuid(0) is rejected by kernel"
 check_output "$LOG" "M31-SEC: done" "M31 smoke completes"
-# ── M59 EGL over Mesa OSMesa (off-screen, software OpenGL) ──
 # ── M32 Networking / Multiplexing ──
 check_output "$LOG" "M32-NET: start" "M32 multiplex smoke starts"
 # External connectivity (off-link TCP over QEMU usernet). Skips cleanly when

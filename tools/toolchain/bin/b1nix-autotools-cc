@@ -91,7 +91,7 @@ fi
 # into an object that has none). Pass the command straight through to clang,
 # preserving the caller's EXACT argument order. --target keeps the ELF arch
 # correct. Cases:
-#   -nostdlib         Mesa's meson build supplies its own crt0.o/libc++/libb1nix.a/-T.
+#   -nostdlib         a port's build may supply its own crt0.o/libc++/libb1nix.a/-T.
 #   -r / --relocatable / -Wl,-r
 #                     Partial (relocatable) link, e.g. busybox's applets/built-in.o
 #                     — no startup files and no `main` expected.

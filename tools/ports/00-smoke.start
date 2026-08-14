@@ -149,7 +149,6 @@ run_test /bin/m51_cairo_smoke gfx
 run_test /bin/m51_xkb_smoke gfx
 run_test /bin/m51_harfbuzz_smoke gfx
 run_test /bin/m51_fontconfig_smoke gfx
-run_test /bin/m53_mesa_virgl gfx
 run_test /bin/m55_litehtml gfx
 run_test /bin/m51_clipboard_smoke gfx
 

@@ -5,8 +5,8 @@
  * library provides it (glibc does). musl 1.2.5 deliberately does NOT — it is a
  * glibc-internal symbol — so a libc++/libc++abi shared object built with the
  * symbol assumed present is left with an unresolvable UND __cxa_thread_atexit_impl
- * and fails to load ("Error relocating: symbol not found"), killing every Mesa /
- * libc++ consumer (m52-osmesa, m52-glsl).
+ * and fails to load ("Error relocating: symbol not found"), killing every
+ * libc++ consumer.
  *
  * This shim provides a correct implementation over musl's pthread TSD: each
  * registered destructor is pushed onto a per-thread list, and the list is run in

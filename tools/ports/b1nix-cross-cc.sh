@@ -115,8 +115,6 @@ if [ "$IS_LINK" = "1" ]; then
   LIBCXX_L=""
   [ -d "$LIBCXX_RT" ] && LIBCXX_L="-L $LIBCXX_RT"
 
-  # Mesa GL/EGL shared libs (OSMesa softpipe backend for b1nix).
-  MESA_LIB_DIR="$ARCH_DIR/ports/mesa/install/lib"
   FONTCONFIG_LIB_DIR="$ARCH_DIR/pkg/fontconfig/lib"
   FREETYPE_LIB_DIR="$ARCH_DIR/pkg/freetype/lib"
   EXPAT_LIB_DIR="$ARCH_DIR/pkg/expat/lib"
@@ -133,7 +131,6 @@ if [ "$IS_LINK" = "1" ]; then
     -L "$FREETYPE_LIB_DIR" \
     -L "$EXPAT_LIB_DIR" \
     -L "$ZLIB_LIB_DIR" \
-    -L "$MESA_LIB_DIR" \
     -L "$ROOT_DIR/userspace/build/${B1NIX_ARCH:-x86_64}" \
     $LIBCXX_L \
     -D__b1nix__ -D__linux__ -Db1nix \
@@ -150,7 +147,6 @@ if [ "$IS_LINK" = "1" ]; then
     $PLATFORM_LIBS \
     -Wl,-Bstatic -lfontconfig -lfreetype -lexpat -lz -lm -Wl,-Bdynamic \
     -lc++ -lc++abi -lunwind \
-    $MESA_LIBS \
     -Wl,--end-group
 else
   # Compile step: add include paths

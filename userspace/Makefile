@@ -138,6 +138,26 @@ GEN_LINK_EXTRA := -pie -z norelro --hash-style=sysv \
 GEN_LINK_LIBS  := $(MUSL_CRTI) $(UTMP_OBJ) -lc $(MUSL_CRTN) $(BUILTINS_LIB)
 GEN_MUSL_POSTLINK := 1
 
+# ── Post-link: EI_OSABI = ELFOSABI_LINUX (3) ─────────────────────────────
+# The kernel decides which syscall ABI a program gets from EI_OSABI, and every
+# binary here talks the Linux ABI (musl's arch_prctl, set_tid_address, clone3).
+# ld.lld has no flag for the byte, so we stamp it. Same thing the loader itself
+# gets in the top-level Makefile and the same thing tools/b1nix-musl-cc does.
+#
+# Each call site used to carry a copy of this that ALSO rewrote the DT_NEEDED
+# string in .dynstr from "ld-musl-x86_64.so.1" to "libc.so". That rewrite was a
+# workaround for libc.so having no DT_SONAME, which made lld record the file
+# name we happened to link through. musl's real soname is set at build time now
+# (tools/ports/build-musl.sh), so the linker writes "libc.so" itself and there
+# is nothing left to rewrite — patching the bytes of a produced ELF should be
+# the last resort it sounds like, not the routine step it had become.
+#
+# No `|| true`: if the stamp cannot be written, the binary that ships is one the
+# kernel will run under the wrong ABI, which is not something to pass over.
+define stamp_linux_osabi
+python3 -c "import sys; fh=open(sys.argv[1],'r+b'); fh.seek(7); fh.write(bytes([3]))" $(1)
+endef
+
 # Bespoke ported-library / GUI binaries: non-PIE dynamic ET_EXEC against musl.
 # Same shape as the generic musl link (PIC/PIE, no linker script) so the program
 # headers stay inside the first PT_LOAD where AT_PHDR can find them.
@@ -342,7 +362,7 @@ $(B1CC): $(B1CC_DIR)/Makefile $(wildcard $(B1CC_SRC_GLOB))
 # ── Source layout ──
 # bin/ is grouped by purpose so the directory can be navigated at a glance:
 #   bin/smoke/     kernel + POSIX smoke tests (mNN_smoke.c)
-#   bin/gfx/       graphics/browser-stack tests and their servers (M47-M53, M59, M91)
+#   bin/gfx/       graphics/browser-stack tests and their servers (M47-M53)
 #   bin/helpers/   programs a test drives rather than a test itself (fixtures,
 #                  target ELFs, tiny servers, the musl bring-up diagnostics)
 #   bin/tools/     b1nix-specific utilities that ship in the image
@@ -389,9 +409,7 @@ $(BUILD)/bin/b1cc_selfsmoke: bin/compiler/b1cc_selfsmoke.c $(MUSL_LIB)/libc.a $(
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/b1cc_selfsmoke.o
 	$(LD) $(LDFLAGS) -static -o $@ $(MUSL_CRT1) $(MUSL_CRTI) $(BUILD)/bin/b1cc_selfsmoke.o \
 	  $(MUSL_LIB)/libc.a $(MUSL_CRTN) $(BUILTINS_LIB)
-	python3 -c " \
-	import sys; f=sys.argv[1]; \
-	fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+	$(call stamp_linux_osabi,$@)
 
 $(BUILD)/src/tui_common.o: src/tui_common.c include/tui.h
 	@mkdir -p $(dir $@)
@@ -402,12 +420,7 @@ $(BUILD)/bin/mc: bin/tools/mc.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CR
 	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/tools/mc.c -o $(BUILD)/bin/mc.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/mc.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
 ifeq ($(GEN_MUSL_POSTLINK),1)
-	python3 -c "\
-import sys; f=sys.argv[1]; \
-d=open(f,'rb').read(); \
-d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-open(f,'wb').write(d); \
-fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+	$(call stamp_linux_osabi,$@)
 endif
 
 $(BUILD)/bin/ne: bin/tools/ne.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
@@ -415,12 +428,7 @@ $(BUILD)/bin/ne: bin/tools/ne.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CR
 	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/tools/ne.c -o $(BUILD)/bin/ne.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/ne.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
 ifeq ($(GEN_MUSL_POSTLINK),1)
-	python3 -c "\
-import sys; f=sys.argv[1]; \
-d=open(f,'rb').read(); \
-d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-open(f,'wb').write(d); \
-fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+	$(call stamp_linux_osabi,$@)
 endif
 
 # M16 driver links tui_common.o for the shared key-sequence decoder it checks.
@@ -429,12 +437,7 @@ $(BUILD)/bin/m16_smoke: bin/smoke/m16_smoke.c $(BUILD)/src/tui_common.o $(GEN_LI
 	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/smoke/m16_smoke.c -o $(BUILD)/bin/m16_smoke.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/m16_smoke.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
 ifeq ($(GEN_MUSL_POSTLINK),1)
-	python3 -c "\
-import sys; f=sys.argv[1]; \
-d=open(f,'rb').read(); \
-d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-open(f,'wb').write(d); \
-fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+	$(call stamp_linux_osabi,$@)
 endif
 
 $(BUILD)/src/mojo_core.o: src/mojo_core.c include/mojo/mojo.h include/mojo.h
@@ -446,12 +449,7 @@ $(BUILD)/bin/m57_smoke: bin/smoke/m57_smoke.c $(BUILD)/src/mojo_core.o $(GEN_LIB
 	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/smoke/m57_smoke.c -o $(BUILD)/bin/m57_smoke.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/m57_smoke.o $(BUILD)/src/mojo_core.o $(GEN_LINK_LIBS)
 ifeq ($(GEN_MUSL_POSTLINK),1)
-	python3 -c "\
-import sys; f=sys.argv[1]; \
-d=open(f,'rb').read(); \
-d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-open(f,'wb').write(d); \
-fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+	$(call stamp_linux_osabi,$@)
 endif
 
 
@@ -461,12 +459,7 @@ $(BUILD)/bin/%: $$(call bin_src,$$*) $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)
 	$(CC) $(CFLAGS) $(GEN_PIC) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) $(if $(GEN_LINKER),-T $(GEN_LINKER)) -o $@ $(GEN_CRT0) $(BUILD)/bin/$*.o $(GEN_LINK_LIBS)
 ifeq ($(GEN_MUSL_POSTLINK),1)
-	python3 -c "\
-import sys; f=sys.argv[1]; \
-d=open(f,'rb').read(); \
-d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-open(f,'wb').write(d); \
-fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+	$(call stamp_linux_osabi,$@)
 endif
 
 MBEDTLS_DIR := ../build/$(B1NIX_ARCH)/pkg/mbedtls
@@ -492,12 +485,7 @@ $(BUILD)/bin/bpkg: bin/tools/bpkg.c $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER) $(wi
 	  $(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) $(if $(GEN_LINKER),-T $(GEN_LINKER)) -o $@ $(GEN_CRT0) $(BUILD)/bin/bpkg.o $(GEN_LINK_LIBS); \
 	fi
 ifeq ($(GEN_MUSL_POSTLINK),1)
-	python3 -c "\
-import sys; f=sys.argv[1]; \
-d=open(f,'rb').read(); \
-d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-open(f,'wb').write(d); \
-fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+	$(call stamp_linux_osabi,$@)
 endif
 
 # M49: upstream libwayland, Alpine's shared build, with libffi for protocol
@@ -522,12 +510,7 @@ $(BUILD)/bin/m49_libwayland: bin/gfx/m49_libwayland.c $(BESPOKE_LIBDEP) $(if $(B
 		$(WAYLAND_LINK) -lwayland-client -lffi \
 		$(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 $(BUILD)/bin/m49_libwayland_server: bin/gfx/m49_libwayland_server.c $(BESPOKE_LIBDEP) \
@@ -538,12 +521,7 @@ $(BUILD)/bin/m49_libwayland_server: bin/gfx/m49_libwayland_server.c $(BESPOKE_LI
 		$(WAYLAND_LINK) -lwayland-server -lffi \
 		$(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 $(BUILD)/bin/native_smoke: bin/helpers/native_smoke.S
@@ -563,12 +541,7 @@ $(BUILD)/bin/m104_pam_smoke: bin/smoke/m104_pam_smoke.c $(BESPOKE_LIBDEP) $(if $
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -L $(OPENPAM_DIR)/lib -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m104_pam_smoke.o \
 	  -l:libpam.so.2 $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # M108: BusyBox su/passwd/init smoke. Links libpam.so.2 for the same reason
@@ -581,12 +554,7 @@ $(BUILD)/bin/m108_smoke: bin/smoke/m108_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -L $(OPENPAM_DIR)/lib -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m108_smoke.o \
 	  -l:libpam.so.2 $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # m32_nettool gains an mbedTLS loopback HTTPS server when the static mbedTLS
@@ -608,12 +576,7 @@ $(BUILD)/bin/m32_nettool: bin/helpers/m32_nettool.c $(BESPOKE_LIBDEP) $(if $(BES
 	  $(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m32_nettool.o $(BESPOKE_LIBC); \
 	fi
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 	ln -sf m32_nettool $(BUILD)/bin/m32-nettool
 
@@ -675,12 +638,7 @@ $(BUILD)/bin/cxx_smoke: bin/smoke/cxx_smoke.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBC
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(BESPOKE_CXX_EXTRA) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/cxx_smoke.o \
 	  -l:libc++.so.1 -l:libc++abi.so.1 $(BESPOKE_LIBCXX_EXTRA) $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 $(BUILD)/bin/m64_clang_smoke: bin/smoke/m64_clang_smoke.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBCXX_EXTRA)
@@ -689,12 +647,7 @@ $(BUILD)/bin/m64_clang_smoke: bin/smoke/m64_clang_smoke.cpp $(BESPOKE_LIBDEP) $(
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(BESPOKE_CXX_EXTRA) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m64_clang_smoke.o \
 	  -l:libc++.so.1 -l:libc++abi.so.1 $(BESPOKE_LIBCXX_EXTRA) $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # M55: std::iostream (std::cout/cerr + locale facets) + std::filesystem over the
@@ -715,12 +668,7 @@ $(BUILD)/bin/m55_iostream: bin/smoke/m55_iostream.cpp $(BESPOKE_LIBDEP) $(BESPOK
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(BESPOKE_CXX_EXTRA) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m55_iostream.o \
 	  -l:libc++.so.1 -l:libc++abi.so.1 $(BESPOKE_LIBCXX_EXTRA) $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # M51: m51_harfbuzz_smoke links the ported static HarfBuzz (+libm +compiler-rt
@@ -764,12 +712,7 @@ $(BUILD)/bin/m32_pcre2_smoke: bin/smoke/m32_pcre2_smoke.c $(BESPOKE_LIBDEP) $(if
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m32_pcre2_smoke.o \
 	  $(PCRE2_DIR)/lib/libpcre2-8.a $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # m53_zlib_smoke links zlib, which is Alpine's package rather than a port —
@@ -784,12 +727,7 @@ $(BUILD)/bin/m53_zlib_smoke: bin/gfx/m53_zlib_smoke.c $(BESPOKE_LIBDEP) $(if $(B
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_zlib_smoke.o \
 	  -L$(ZLIB_DIR)/lib -lz -rpath /lib $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # m53_libpng_smoke links the ported libpng over zlib (M53 image codec).
@@ -815,12 +753,7 @@ $(BUILD)/bin/m53_libjpeg_smoke: bin/gfx/m53_libjpeg_smoke.c $(BESPOKE_LIBDEP) $(
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_libjpeg_smoke.o \
 	  $(LIBJPEG_DIR)/lib/libjpeg.a $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # m53_libwebp_smoke links libwebp (M53 image/video codec), Alpine's package.
@@ -835,12 +768,7 @@ $(BUILD)/bin/m53_libwebp_smoke: bin/gfx/m53_libwebp_smoke.c $(BESPOKE_LIBDEP) $(
 	  $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # m53_libvpx_smoke links libvpx (VP8 decode) + libwebp (VP8 keyframe source) +
@@ -861,12 +789,7 @@ $(BUILD)/bin/m53_libvpx_smoke: bin/gfx/m53_libvpx_smoke.c $(BESPOKE_LIBDEP) $(if
 	  $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # m53_wapcaplet_smoke links the ported NetSurf libwapcaplet (string internment)
@@ -878,12 +801,7 @@ $(BUILD)/bin/m53_wapcaplet_smoke: bin/gfx/m53_wapcaplet_smoke.c $(BESPOKE_LIBDEP
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_wapcaplet_smoke.o \
 	  $(LWC_DIR)/lib/liblwc.a $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # m53_parserutils_smoke links the ported NetSurf libparserutils (input streams +
@@ -895,12 +813,7 @@ $(BUILD)/bin/m53_parserutils_smoke: bin/gfx/m53_parserutils_smoke.c $(BESPOKE_LI
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_parserutils_smoke.o \
 	  $(PU_DIR)/lib/libparserutils.a $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # m53_hubbub_smoke links the ported NetSurf libhubbub (HTML5 tokeniser) over
@@ -913,12 +826,7 @@ $(BUILD)/bin/m53_hubbub_smoke: bin/gfx/m53_hubbub_smoke.c $(BESPOKE_LIBDEP) $(if
 	  $(HUBBUB_DIR)/lib/libhubbub.a $(PU_DIR)/lib/libparserutils.a \
 	  $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # m53_libcss_smoke links the ported NetSurf libcss (CSS parser + selection) over
@@ -931,12 +839,7 @@ $(BUILD)/bin/m53_libcss_smoke: bin/gfx/m53_libcss_smoke.c $(BESPOKE_LIBDEP) $(if
 	  $(LIBCSS_DIR)/lib/libcss.a $(LWC_DIR)/lib/liblwc.a $(PU_DIR)/lib/libparserutils.a \
 	  $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # m53_libdom_smoke links the ported NetSurf libdom (DOM) + its hubbub binding
@@ -950,12 +853,7 @@ $(BUILD)/bin/m53_libdom_smoke: bin/gfx/m53_libdom_smoke.c $(BESPOKE_LIBDEP) $(if
 	  $(PU_DIR)/lib/libparserutils.a $(LWC_DIR)/lib/liblwc.a \
 	  $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # m53_nslibs_smoke links the ported NetSurf helper/decoder libraries: libnsutils
@@ -972,12 +870,7 @@ $(BUILD)/bin/m53_nslibs_smoke: bin/gfx/m53_nslibs_smoke.c $(BESPOKE_LIBDEP) $(if
 	  $(NSBMP_DIR)/lib/libnsbmp.a $(NSLOG_DIR)/lib/libnslog.a \
 	  $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
+	  $(call stamp_linux_osabi,$@) \
 	)
 
 # M30: PIE smoke binary. Compiled with -fPIC and linked with -pie so the
@@ -998,12 +891,7 @@ $(BUILD)/bin/m30_dynamic: bin/helpers/m30_dynamic.c $(MUSL_LIBSO) $(MUSL_CRT1)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $(BUILD)/bin/m30_dynamic.o
 	$(LD) $(LDFLAGS) -pie -z norelro --hash-style=sysv --dynamic-linker /lib/ld-musl-x86_64.so.1 \
 		-o $@ $(MUSL_CRT1) $(MUSL_CRTI) $(BUILD)/bin/m30_dynamic.o -L$(MUSL_LIB) -l:libc.so $(BUILTINS_LIB) $(MUSL_CRTN)
-	python3 -c "\
-	import sys; f=sys.argv[1]; \
-	d=open(f,'rb').read(); \
-	d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	open(f,'wb').write(d); \
-	fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+	$(call stamp_linux_osabi,$@)
 
 # M69: a runtime-dlopen'd shared object, linked against musl's libc.so. Uses the
 # linker's default shared-object layout (no custom script): that keeps the ELF

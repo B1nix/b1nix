@@ -42,7 +42,10 @@ CMAKE_ARGS="-DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DJPEGXL_STATIC=ON \
 # Build only the decode libraries (and their deps: hwy, brotlidec/common). Do NOT
 # build "all" — the brotli CLI exe needs log2 from a libm we don't link here.
 CMAKE_TARGETS="jxl_dec jxl_cms"
-PATCHES="libjxl/no-mt19937.sh"
+# No patches. highway's nanobenchmark.cc used to have its std::mt19937 shuffle
+# cut out, from the era when C++ ports were built against a libstdc++ whose
+# <random> we could not satisfy. This port builds against LLVM libc++
+# (B1NIX_CXX_STDLIB above), which has <random>.
 port_pre_configure() {
   # skcms (bundled Skia CMS) compiles an AVX2+F16C variant via a per-function
   # `#pragma clang attribute target("avx2,f16c")`. b1nix userspace is built

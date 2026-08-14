@@ -141,7 +141,6 @@ sh "$ROOT_DIR/tools/patches/skia/apply.sh" "$SKIA_DIR"
 #   (b) Shared libskia.so created from the static archive
 # Skia disables tools when is_component_build=true, so static-first is required.
 SKIA_OUT="$SKIA_DIR/out/b1nix"
-MESA_LIB_DIR="$ROOT_DIR/build/x86_64/ports/mesa/install/lib"
 mkdir -p "$SKIA_OUT"
 
 CC_WRAPPER=""
@@ -168,6 +167,17 @@ skia_use_vulkan = false
 skia_use_metal = false
 skia_use_direct3d = false
 skia_use_x11 = false
+# Everything third-party comes from the b1nix ports, never from the host: a
+# "system" library here would be the build machine's own .so, which is not the
+# libc these objects link against.
+skia_use_system_freetype2 = false
+skia_use_system_expat = false
+skia_use_system_harfbuzz = false
+skia_use_system_icu = false
+skia_use_system_libjpeg_turbo = false
+skia_use_system_libpng = false
+skia_use_system_libwebp = false
+skia_use_system_zlib = false
 skia_use_fontconfig = true
 skia_enable_graphite = true
 # Dawn is built separately as libdawn_combined.a (CMake) and linked into

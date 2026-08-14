@@ -54,7 +54,6 @@ port_inputs() {
 	case "$1" in
 	musl)       echo "tools/ports/build-musl.sh tools/toolchain/build-toolchain.sh" ;;
 	skia)       echo "tools/ports/build-skia.sh tools/b1nix-clang++ tools/b1nix-musl-cc" ;;
-	mesa)       echo "tools/ports/build-mesa.sh tools/b1nix-mesa-cc tools/b1nix-musl-cc" ;;
 	netsurf-fb) echo "tools/ports/build-netsurf-fb.sh tools/b1nix-musl-cc" ;;
 	libcxx-musl) echo "tools/ports/build-libcxx-musl.sh tools/toolchain/build-toolchain.sh" ;;
 	*)          echo "" ;;
@@ -65,14 +64,13 @@ port_outputs() {
 	case "$1" in
 	musl)       echo "ports/musl/install" ;;
 	skia)       echo "ports/skia/install" ;;
-	mesa)       echo "ports/mesa/install" ;;
 	netsurf-fb) echo "ports/netsurf-fb/install" ;;
 	libcxx-musl) echo "toolchain/llvm-runtimes-build-musl/install" ;;
 	*)          echo "" ;;
 	esac
 }
 
-known_ports() { echo "musl skia mesa netsurf-fb libcxx-musl"; }
+known_ports() { echo "musl skia netsurf-fb libcxx-musl"; }
 
 usage() {
 	echo "usage: $0 {key|fetch|pack|list} [port]" >&2

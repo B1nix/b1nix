@@ -470,6 +470,11 @@ Status:
 - [x] VirGL 3D acceleration over VirtIO-GPU with host GPU pixel verification.
 - [x] Upstream Mesa OSMesa + Gallium softpipe via meson cross-build.
 - [x] GLSL programmable shader pipeline through Mesa compiler.
+- Superseded: the OSMesa port (`tools/ports/build-mesa.sh`, a 477 MB build tree)
+  is gone. Mesa is Alpine's `mesa-egl`/`-gles`/`-gbm`/`-gl`/`-glapi` now, which is
+  what `libwlroots` links and therefore what sway needs; the demos that used
+  OSMesa went with the rest of the old GUI stack. See
+  [ports migration](ports-migration-plan.md).
 
 ## M53: Browser Platform
 
@@ -526,6 +531,8 @@ Status:
 
 - [x] Real EGL 1.4/1.5 over Mesa OSMesa softpipe (off-screen pbuffer and displayd window path).
 - [x] Software Skia (Ganesh) raster fallback.
+- Superseded with M52: the EGL smoke and the OSMesa it ran on are gone, along
+  with the displayd window path they drew into.
 
 ## M60: Ozone Platform
 
@@ -697,9 +704,11 @@ Status:
 - [x] Skia Graphite CPU backend (`M91-SKIA: ok graphite-cpu`).
 - [x] Skia Graphite GPU backend via Dawn/OpenGL ES (`M91-SKIA: ok graphite-dawn`).
 - [x] fontconfig integration with Skia (`M91-SKIA: ok text-draw`).
-- [x] Dynamic Mesa linking for M91/M52/M59 demos (`libOSMesa.so.8`).
 - [x] Skottie (Lottie animation) support verified (`M91-SKIA: ok skottie`).
-- [x] Real shared `.so` for EGL/GL/fontconfig (`libEGL.so`, `libGLESv2.so`, `libfontconfig.so`).
+- [x] Real shared `.so` for fontconfig (`libfontconfig.so`).
+- Superseded with M52: the `m91_skia_smoke` demo and the hand-built
+  `libEGL.so`/`libGLESv2.so` it linked are gone; no check exercised them. GL on
+  the image is Alpine's Mesa.
 
 ## M92: musl libc Port
 

@@ -15,8 +15,12 @@ VER="${OPENLIBM_VERSION:-0.8.1}"
 CPORT_SRCNAME="openlibm-${VER}"
 CPORT_TARBALL="openlibm-${VER}.tar.gz"
 CPORT_URL="https://github.com/JuliaMath/openlibm/archive/refs/tags/v${VER}.tar.gz"
-# b1nix libc already defines ldexp/frexp; make openlibm's collide weakly.
-PATCHES="openlibm/b1nix-weak-aliases.sh"
+# No patches. openlibm's ldexp (a strong alias of scalbn) and frexp used to be
+# rewritten weak, because the old hand-written b1nix libc defined both in the
+# same object as symbols its other routines needed, so pulling that object in
+# collided. musl gives each of them a translation unit of its own, and the
+# linker only pulls an archive member it still needs a symbol from, so
+# openlibm's definitions simply win where libm.a comes first.
 
 port_pre_build() {
   if [ "$B1NIX_ARCH" = "x86" ]; then OLM_ARCH="i387"; else OLM_ARCH="amd64"; fi

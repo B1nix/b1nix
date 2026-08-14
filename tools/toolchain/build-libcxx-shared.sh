@@ -105,7 +105,7 @@ SHIM_O="$(mktemp).o"
 MUSL_INC="$ROOT/build/x86_64/ports/musl/install/include"
 CLANG_RES="$(clang -print-resource-dir 2>/dev/null || true)"
 # The shim is MANDATORY: without __cxa_thread_atexit_impl defined here, every
-# libc++/Mesa consumer fails to relocate at load ("symbol not found", exit 127).
+# libc++ consumer fails to relocate at load ("symbol not found", exit 127).
 # Fail loudly if it does not compile rather than silently shipping a broken .so.
 if [ ! -f "$SHIM_C" ]; then
     echo "build-libcxx-shared: FATAL: shim source missing: $SHIM_C" >&2; exit 1

@@ -26,7 +26,7 @@ enable_one() {
   [ -x "$gxx" ] || { echo "enable-cxx: $triplet: no cross g++, skipping" >&2; return 0; }
 
   # copy_if_changed: only copy when content differs, so unchanged headers keep
-  # their mtime. This script runs on every Mesa/port build (build-mesa.sh calls
+  # their mtime. This script runs on every port build (each port calls
   # it); an unconditional cp would bump header mtimes each time and force ninja
   # to recompile the whole port. ponytail: cmp -s is cheap vs a full rebuild.
   copy_if_changed() {

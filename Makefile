@@ -147,15 +147,6 @@ INITRAMFS_M69_PLUGIN_INC := $(INC_DIR)/initramfs_m69_plugin.inc
 # the libc++-default b1nix-c++; libc++abi.so.1 folds the libunwind DWARF unwinder.
 INITRAMFS_LIBCXX_INC := $(INC_DIR)/initramfs_libcxx.inc
 INITRAMFS_LIBCXXABI_INC := $(INC_DIR)/initramfs_libcxxabi.inc
-# M91: Mesa shared libraries are stored in rootfs.img (Multiboot2 module), not in
-# the kernel initramfs (too large for clang source location limit).
-# See root-image target which copies .so files into $(BUILD_DIR)/rootfs/lib/.
-INITRAMFS_M91_SO_INCS := \
-	$(INC_DIR)/initramfs_m91_skia_dm.inc \
-	$(INC_DIR)/initramfs_libskia.inc \
-	$(INC_DIR)/initramfs_libraw_ptr.inc \
-	$(INC_DIR)/initramfs_libfontconfig.inc \
-	$(INC_DIR)/initramfs_libGLESv2.inc
 endif
 endif
 
@@ -939,36 +930,13 @@ FONTCONFIG_LIB := build/$(ARCH)/pkg/fontconfig/lib/libfontconfig.a
 $(FONTCONFIG_LIB): $(PKG_DEPS) $(EXPAT_LIB) $(FREETYPE_LIB)
 	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh fontconfig >/dev/null
 
-# ── C++ / Mesa / Skia / Mesa-VirGL .inc rules ──
+# ── C++ / Skia .inc rules ──
 # Skipped under musl: these need libc++/libstdc++ which has not been built
 # against musl yet. Placeholder .inc files are pre-created in the build dir.
 # Hosted C++ runtime smoke. Enable LLVM libc++ against the b1nix libc first
 # (idempotent: stages headers + fixes mbstate_t config), then build via the
 # cross clang C++ wrapper.
 # M55: std::iostream + std::filesystem acceptance test (hosted libc++).
-# Serialize the Mesa build to prevent race conditions during parallel builds.
-# M89: Mesa C++ is built against the shared LLVM libc++ (the static Mesa archives
-# fold libc++/libc++abi; the demos link them — see build-m52-mesa-demo.sh).
-# Mesa links against musl + the shared libc++ (toolchain), needing only the musl
-# headers — NOT the userspace binaries. Depending on $(USERSPACE_DEPS) re-ran the
-# whole Mesa build on every userspace-bin change and raced the demos' `-lOSMesa`
-# link against a momentarily-absent libOSMesa.so. Depend on the headers stamp.
-$(BUILD_DIR)/.mesa-built: tools/ports/build-mesa.sh $(BUILD_DIR)/.userspace-headers-installed
-	@mkdir -p $(dir $@)
-	@B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/prebuilt.sh fetch mesa || \
-		B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-mesa.sh >/dev/null
-	@touch $@
-
-# M52: real Mesa OSMesa (software OpenGL) demo. The shared demo builder builds
-# the whole Mesa stack (build-mesa.sh) and links the demo against it.
-# M53 variant B: Mesa's gallium virgl driver renders on the host GPU through the
-# b1nix /dev/virtio-gpu winsys. tools/demos/build-m53-mesa-virgl.sh builds the Mesa
-# stack (with the virgl driver) and links the pipe-API render test against it.
-# M52: programmable GLSL shader demo, sharing the same Mesa build as the OSMesa
-# demo. Exercises the GL 2.x programmable pipeline (shaders, VBOs, varyings).
-# M59: EGL over the real Mesa OSMesa softpipe. tools/demos/build-m59-egl.sh compiles
-# with the off-screen pbuffer smoke and links them against the same Mesa stack
-# as the M52 OSMesa demo. The smoke renders entirely off-screen.
 # M91: Skia 2D graphics library (standalone build with Ganesh GPU backend).
 $(BUILD_DIR)/.skia-built: tools/ports/build-skia.sh $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
@@ -976,38 +944,21 @@ $(BUILD_DIR)/.skia-built: tools/ports/build-skia.sh $(USERSPACE_DEPS)
 		B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-skia.sh >/dev/null
 	@touch $@
 
-# M91: shared-library deps for Skia (libskia.so, libraw_ptr.so, libfontconfig.so,
-# libGLESv2.so). build-skia-shared-deps.sh builds them
-# from the port trees; xxd converts each to an initramfs .inc.
-
-# M91: Skia dm testing tool — too large for initramfs (400MB+).
-# Ships in rootfs.img as /bin/skia-dm via root-image target.
-# initramfs gets a 1-byte placeholder.
-$(INC_DIR)/initramfs_m91_skia_dm.inc: $(BUILD_DIR)/.skia-built
-	@mkdir -p $(dir $@)
-	@echo '/* dm not built — ships in rootfs.img */' > $@
-	@echo 'static const unsigned char vfs_m91_skia_dm_elf[1] = {0};' >> $@
-	@echo 'static const unsigned int vfs_m91_skia_dm_elf_len = 0;' >> $@
+# M91: shared-library deps for Skia (libskia.so, libraw_ptr.so, libfontconfig.so).
+# build-skia-shared-deps.sh stages them from the port trees into
+# userspace/build/$(ARCH)/, from where the root-image rule copies them into
+# rootfs/lib.
 M91_SHARED_DEPS_STAMP := $(BUILD_DIR)/.m91-shared-deps-stamp
-$(M91_SHARED_DEPS_STAMP): tools/ports/build-skia-shared-deps.sh $(BUILD_DIR)/.skia-built $(BUILD_DIR)/.mesa-built $(FONTCONFIG_LIB)
+$(M91_SHARED_DEPS_STAMP): tools/ports/build-skia-shared-deps.sh $(BUILD_DIR)/.skia-built $(FONTCONFIG_LIB)
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(ARCH) sh tools/ports/build-skia-shared-deps.sh
-	@# Replace sysroot stubs with real .so so cross-cc link step finds them
+	@# Replace the sysroot stub with the real .so so the cross-cc link step
+	@# finds it.
 	@SYSROOT_LIB=$(CXX_RUNTIME_LIB); \
-	for so in libGLESv2.so libfontconfig.so; do \
-		if [ -f userspace/build/$(ARCH)/$$so ]; then \
-			cp -f userspace/build/$(ARCH)/$$so "$$SYSROOT_LIB/$$so"; \
-		fi; \
-	done
+	if [ -f userspace/build/$(ARCH)/libfontconfig.so ]; then \
+		cp -f userspace/build/$(ARCH)/libfontconfig.so "$$SYSROOT_LIB/libfontconfig.so"; \
+	fi
 	@touch $@
-
-# Generic .so -> .inc rule for M91 shared libs. The pattern matches
-# userspace/build/$(ARCH)/lib<name>.so -> $(INC_DIR)/initramfs_lib<name>.inc.
-# The initramfs_lib<name>.inc target must match one of the $(INITRAMFS_M91_SO_INCS)
-# entries so the dependency chain from kernel/fs/initramfs.o pulls it in.
-$(INC_DIR)/initramfs_lib%.inc: userspace/build/$(ARCH)/lib%.so $(M91_SHARED_DEPS_STAMP)
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_lib$*_so $< > $@
 
 # M55: validate the C++ runtime with litehtml (real HTML/CSS layout engine).
 # tools/demos/build-m55-litehtml.sh builds litehtml+gumbo (build-litehtml.sh) and
@@ -1506,7 +1457,7 @@ install-ports: userspace-install busybox-package install-native-toolchain $(PKGR
 	tools/packages/install-ports.sh $(BUILD_DIR)/rootfs $(ARCH) $(PORTS_SOURCE) $(PACKAGE_INDEX_URL)
 	@# The published dev package may carry older libc headers than this checkout.
 	@# Restore the current userspace ABI after package extraction so cross C++
-	@# ports (notably libc++/Mesa) see the same wchar/locale surface as the build.
+	@# ports (notably libc++) see the same wchar/locale surface as the build.
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
 
 # Stage kernel + userspace + build harness source into the rootfs so the
@@ -1529,7 +1480,7 @@ install-kernel-source:
 	@# which #include generated artifacts from build/$(ARCH) (ap_trampoline.inc and
 	@# the initramfs_*.inc byte arrays). build/ is rsync-excluded above as it is
 	@# host output, so stage just these generated *.inc inputs the compile needs.
-	@# Exclude large Mesa/Skia/NetSurf .inc files (not needed for self-host).
+	@# Exclude large Skia/NetSurf .inc files (not needed for self-host).
 	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix/build/$(ARCH)
 	@for f in $(BUILD_DIR)/*.inc; do \
 		case "$$(basename "$$f")" in \
@@ -1621,7 +1572,7 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	else \
 		echo "  CA      no host trust store found — https:// will fail in the guest"; \
 	fi
-	@# M91: Stage Mesa/Skia shared libraries into rootfs/lib/ for the dynamic linker
+	@# M91: Stage the Skia shared libraries into rootfs/lib/ for the dynamic linker
 	@mkdir -p $(BUILD_DIR)/rootfs/lib
 	@# Shared libraries that come from Alpine packages rather than from a port.
 	@# Copied by real name and by SONAME, not symlinked: the ext4 driver is not
@@ -1635,24 +1586,9 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 			fi; \
 		fi; \
 	done
-	@# Mesa install dir (softpipe/virgl build) — copy .so files and create
-	@# SONAME copies (not symlinks: b1nix ext4 driver may not follow them).
-	@MESA_LIB_DIR=build/$(ARCH)/ports/mesa/install/lib; \
-	for so in "$$MESA_LIB_DIR"/libOSMesa.so.8.0.0 "$$MESA_LIB_DIR"/libglapi.so.8.0.0 "$$MESA_LIB_DIR"/libglapi.so.0.0.0; do \
-		if [ -f "$$so" ]; then \
-			base=$$(basename "$$so"); soname=$$($(READELF) -d "$$so" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//' ); \
-			cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; \
-			if [ -n "$$soname" ] && [ "$$soname" != "$$base" ]; then \
-				cp -f "$$so" "$(BUILD_DIR)/rootfs/lib/$$soname"; \
-			fi; \
-		fi; \
-	done
-	@# Copy any other Mesa install .so files (libEGL, libGLESv2, etc.)
-	@# An unmatched glob expands to itself, so skip non-files rather than
-	@# letting the final [ -f ] decide the loop's (and the recipe's) status.
-	@for so in build/$(ARCH)/ports/mesa/install/lib/lib*.so.*; do \
-		if [ -f "$$so" ] && ! [ -L "$$so" ]; then cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; fi; \
-	done
+	@# Mesa is Alpine's (mesa-egl/-gles/-gbm/-gl/-glapi, tools/packages/
+	@# alpine-ports.map), so it arrives through $(PKGROOT) with everything else
+	@# on the image — there is no Mesa staging of its own here any more.
 	@# Also stage from userspace build dir
 	@for so in userspace/build/$(ARCH)/lib*.so userspace/build/$(ARCH)/lib*.so.*; do \
 		if [ -f "$$so" ] && ! [ -L "$$so" ]; then cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; fi; \
@@ -1695,7 +1631,7 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 		chmod +x $(BUILD_DIR)/rootfs/bin/m108_smoke; \
 	fi
 	@# M104: the OpenPAM smoke ELF (links libpam.so.2 as DT_NEEDED) — build
-	@# it if missing, same pattern as the Mesa/Skia demo staging below.
+	@# it if missing, same pattern as the other bespoke smoke ELFs here.
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m104_pam_smoke >/dev/null 2>&1 || true
 	@if [ -f userspace/build/$(ARCH)/bin/m104_pam_smoke ]; then \
 		cp -f userspace/build/$(ARCH)/bin/m104_pam_smoke $(BUILD_DIR)/rootfs/bin/m104_pam_smoke; \
@@ -1708,8 +1644,8 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	@# userspace/rootfs-overlay/etc/init.d/sshd's /bin/dropbear* calls had no
 	@# binary to find. Real copies (not symlinks), same reasoning as above.
 
-	@# Stage sysroot C++ runtime .so (real, not stubs — EGL/GLESv2/fontconfig
-	@# come from userspace/build/ via build-skia-shared-deps.sh above)
+	@# Stage sysroot C++ runtime .so (real, not stubs — fontconfig comes from
+	@# userspace/build/ via build-skia-shared-deps.sh above)
 	@SYSROOT_LIB=$(CXX_RUNTIME_LIB); \
 	for so in "$$SYSROOT_LIB"/libc++.so.1 \
 	          "$$SYSROOT_LIB"/libc++abi.so.1 "$$SYSROOT_LIB"/libunwind.so.1; do \
@@ -1838,21 +1774,8 @@ endif
 		cp -f tools/m67/hello_b1nix.elf $(BUILD_DIR)/rootfs/bin/m67-rust; \
 		chmod +x $(BUILD_DIR)/rootfs/bin/m67-rust; \
 	fi
-	@# M52/M53/M55/M59/M91 Mesa/Skia/litehtml demo smoke ELFs: built via their own
-	@# tools/demos/build-*.sh scripts (against the ported Mesa/Skia/litehtml
-	@# static libs), NOT the plain userspace/Makefile BINARIES pattern — so
-	@# userspace-install never copies them. Build (if missing) then stage into
-	@# rootfs/bin here, same as skia-dm above.
-	@UD=userspace/build/$(ARCH)/bin; \
-	[ -f "$$UD/m91_skia_smoke" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m91-skia-demo.sh m91_skia_smoke "$$UD/m91_skia_smoke" || true; \
-	for b in m91_skia_smoke; do \
-		if [ -f "$$UD/$$b" ]; then \
-			cp -f "$$UD/$$b" $(BUILD_DIR)/rootfs/bin/$$b; \
-			chmod +x $(BUILD_DIR)/rootfs/bin/$$b; \
-		fi; \
-	done
 	@# Trim rootfs: remove LLVM static archives and shared lib (200+ MB) that
-	@# are only needed for self-hosting, not for smoke.  Keep Mesa .so files.
+	@# are only needed for self-hosting, not for smoke.
 	@rm -f $(BUILD_DIR)/rootfs/lib/libLLVM*.a $(BUILD_DIR)/rootfs/lib/libLLVM.so
 	@# Remove .so.N.M files whose SONAME copy already exists (avoid duplicates).
 	@# Only when that SONAME entry is a real file: a package names its library

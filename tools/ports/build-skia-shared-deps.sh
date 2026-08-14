@@ -8,8 +8,6 @@
 #   libraw_ptr.so    — Skia's raw_ptr component, from ninja
 #   libfontconfig.so — b1nix fontconfig + freetype + zlib + expat, relinked here
 #                      (libskia.so DT_NEEDEDs it for its Fc* symbols)
-#   libGLESv2.so     — thin GL stub (real GL entrypoints are folded into the
-#   libEGL.so          Skia demo exe over Mesa OSMesa; see build-m91-skia-demo.sh)
 #
 # x86_64 only. build-skia.sh (.skia-built) must have run first.
 set -eu
@@ -25,9 +23,6 @@ fi
 TRIPLET="$B1NIX_TRIPLET"
 SKIA_OUT="$(ls -d "$ROOT_DIR/build/$B1NIX_ARCH/ports/skia/build/out/b1nix" "$ROOT_DIR/build/src/skia/out/b1nix" 2>/dev/null | head -1)"
 UB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
-CROSSL="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib"
-[ -d "$CROSSL" ] || CROSSL="$TOOLCHAIN_BUILD_HOME/cross/lib"
-LLD="${B1NIX_LLD:-$(command -v ld.lld 2>/dev/null || echo /usr/bin/ld.lld)}"
 STRIP="$(command -v llvm-strip 2>/dev/null || command -v strip 2>/dev/null || echo strip)"
 
 # With static linking, libskia.a is built instead of libskia.so.
@@ -78,15 +73,9 @@ FC_SO="$(ls "$ROOT_DIR/build/$B1NIX_ARCH/pkg/fontconfig/lib/libfontconfig.so."[0
 }
 cp -f "$FC_SO" "$UB/libfontconfig.so"
 
-# --- 4) libGLESv2.so — real Mesa GL entry points (for Dawn dlopen) -----------
-# Dawn's OpenGL ES backend loads libGLESv2.so via dlopen at runtime.
-# We fold Mesa's libglapi_static.a (1971 GL entry points) into a shared lib.
-MESA_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/mesa/install/lib"
-GLAPI_A="$MESA_DIR/libglapi_static.a"
-[ -f "$GLAPI_A" ] || { echo "build-skia-shared-deps: missing $GLAPI_A (run build-mesa.sh)" >&2; exit 1; }
-"$LLD" -shared -m elf_x86_64 --hash-style=both -soname libGLESv2.so \
-  --whole-archive "$GLAPI_A" --no-whole-archive \
-  -L "$CROSSL" -lc -lm \
-  --allow-shlib-undefined \
-  -o "$UB/libGLESv2.so"
+# A libGLESv2.so used to be manufactured here, by folding the Mesa port's
+# libglapi_static.a into a shared object for Dawn to dlopen. Mesa comes from
+# Alpine now (tools/packages/alpine-ports.map), and mesa-gles ships the real
+# libGLESv2.so.2 — a shared library with those entry points in it, already on
+# the image — so there is nothing left to fabricate.
 

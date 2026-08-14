@@ -62,10 +62,25 @@ openssl       openssl libssl3 libcrypto3 openssl-dev openssl-libs-static
 # boot straight to poweroff; and their runit is statically linked, which the
 # rootfs gate rejects outright (tools/check-dynamic.sh). Both keep their ports:
 # what they do is the running system's behaviour, not a build artefact.
+#
+# Mesa's userspace is named here rather than left to the SONAME closure, which
+# is what used to drag it in: wlroots records libEGL.so.1, libgbm.so.1 and
+# libGLESv2.so.2, and Xwayland records libgbm.so.1 and libGL.so.1, so without
+# them sway does not start. It replaced tools/ports/build-mesa.sh — the same
+# 24.0.9, built for the same musl and the same architecture, minus a 477 MB
+# build tree and the duty to keep a meson cross-build working.
+#
+# mesa-dri-gallium is deliberately absent, and its absence is enforced by
+# alpine.lock having no entry for it: it is 34 MB and pulls llvm17-libs (150 MB)
+# behind it, for hardware drivers this image has no use for — composition is
+# software (WLR_RENDERER=pixman) and the browser runs with --disable-gpu. When
+# M102a gets to running the iris driver on a real Intel GPU, that is the point
+# at which it earns its place.
 programs      zsh curl libcurl samurai bmake dropbear dropbear-ssh \
               dropbear-scp dropbear-dbclient \
               seatd sway swaybg grim foot foot-extra-terminfo cage \
-              font-dejavu xkeyboard-config xwayland
+              font-dejavu xkeyboard-config xwayland \
+              mesa-egl mesa-gles mesa-gbm mesa-gl mesa-glapi
 
 # The curl library, for what links against it rather than runs it (NetSurf).
 curlbuild     libcurl curl-dev curl-static

@@ -48,36 +48,18 @@ if [ -f "$F" ]; then
   echo "Patch S3 skipped: __linux__ already routes to SK_BUILD_FOR_UNIX"
 else echo "Patch S3 skipped: file not found"; fi
 
-# --- Patch S4: BUILD.gn — force-disable unavailable backends -------------------
-F="$SKIA/BUILD.gn"
-if [ -f "$F" ] && not_grep 'b1nix_skia_disable_vulkan' "$F"; then
-  # Append a b1nix-specific block at the end of the file to override defaults
-  cat >> "$F" << 'GNBLOCK'
-
-# b1nix overrides: disable GPU backends not available on b1nix
-if (target_os == "b1nix") {
-  skia_use_vulkan = false
-  skia_use_metal = false
-  skia_use_direct3d = false
-  skia_use_x11 = false
-  skia_use_wayland = false
-  skia_use_egl = true
-  skia_use_gl = true
-  skia_use_piex = false
-  skia_use_dng_sdk = false
-  skia_use_system_freetype = false
-  skia_use_system_expat = false
-  skia_use_system_harfbuzz = false
-  skia_use_system_icu = false
-  skia_use_system_libjpeg_turbo = false
-  skia_use_system_libpng = false
-  skia_use_system_zlib = false
-  skia_use_system_expat = false
-}
-GNBLOCK
-  grep -q 'target_os == "b1nix"' "$F" || die "Patch S4 write failed"
-  echo "Patch S4 applied: BUILD.gn (backend overrides)"
-else echo "Patch S4 already present or file not found"; fi
+# --- Patch S4: removed -------------------------------------------------------
+# An `if (target_os == "b1nix") { skia_use_* = false ... }` block used to be
+# appended to the end of BUILD.gn. Two things were wrong with it. It ran at the
+# bottom of the file, after every one of those variables had already been read,
+# so GN failed the generate outright with
+#
+#   ERROR at //BUILD.gn:4179:26: Assignment had no effect.
+#     skia_use_system_zlib = false
+#
+# and its idempotence guard looked for "b1nix_skia_disable_vulkan", a string the
+# block does not contain, so a second run appended a second copy. Build settings
+# are what args.gn is for, and build-skia.sh writes them there instead.
 
 # --- Patch S5: src/gpu/ganesh/gl/GrGLMakeNativeInterface.cpp ------------------
 # Route GL proc resolution to the b1nix EGL/OSMesa path
@@ -150,15 +132,13 @@ if [ -f "$F" ] && not_grep '#include <cstring>' "$F"; then
   echo "Patch S9 applied: piex cstring include"
 else echo "Patch S9 already present or file not found"; fi
 
-# --- Patch S10: dng_sdk — fix int64_t vs long type mismatch ------------------
-# b1nix defines int64_t as long long, but __builtin_smull_overflow expects long*.
-# Force the long long path on b1nix by patching both #if guards.
-F="$SKIA/third_party/externals/dng_sdk/source/dng_safe_arithmetic.h"
-if [ -f "$F" ] && not_grep 'b1nix' "$F"; then
-  sed -i 's/#if __has_builtin(__builtin_smull_overflow)/#if __has_builtin(__builtin_smull_overflow) \&\& !defined(__b1nix__)/g' "$F"
-  sed -i 's/#if (LONG_MAX == INT64_MAX) && !defined(__APPLE__)/#if (LONG_MAX == INT64_MAX) \&\& !defined(__APPLE__) \&\& !defined(__b1nix__)/g' "$F"
-  grep -q 'b1nix' "$F" 2>/dev/null && echo "Patch S10 applied: dng_sdk int64_t fix" || echo "Patch S10 skipped: pattern not found"
-else echo "Patch S10 already present or file not found"; fi
+# --- Patch S10: removed ------------------------------------------------------
+# dng_sdk's dng_safe_arithmetic.h used to carry a !defined(__b1nix__) carve-out
+# on both overflow-builtin guards, because our own <stdint.h> spelled int64_t
+# `long long` while __builtin_smull_overflow takes a `long *`. Skia compiles
+# against the musl sysroot, where int64_t is `long` like everywhere else in
+# LP64, and userspace/include/stdint.h now agrees, so the guards upstream wrote
+# select the right builtin unaided.
 
 # --- Patch S11: third_party/piex/BUILD.gn — compile piex_cr3.cc ---------------
 # The pinned piex checkout ships piex_cr3.cc (defines piex::Cr3GetPreviewData /
