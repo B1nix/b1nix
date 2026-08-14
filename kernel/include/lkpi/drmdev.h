@@ -51,6 +51,14 @@ void lkpi_drm_close(void *file);
  * the core copies it in and out through the uaccess shim, which validates it
  * against the calling process's address space. */
 isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg);
+/* Record the handle a DRM file was opened through, so a clone of that file
+ * (a lease) can inherit the device node. */
+void lkpi_drm_file_set_handle(void *file, void *handle);
+/* An independent second file on the same DRM device, for a lease. NULL on
+ * failure. */
+void *lkpi_drm_clone_file(void *file);
+/* The minor a DRM file belongs to; 0 when the file is not a DRM file. */
+int lkpi_drm_file_minor(void *file, u32 *out);
 
 /* Read pending events into a userspace buffer. Returns bytes read, 0 when
  * nothing was ready on a non-blocking file, or a negative errno. */

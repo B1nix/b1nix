@@ -29,6 +29,15 @@ struct unix_socket_data {
    * socket is one it is responsible for. */
   struct b1nix_ucred owner;
   struct unix_socket_data *peer;
+  /* The peer's credentials as they were when the connection was made.
+   *
+   * SO_PEERCRED answers "who is on the other end", and the answer must survive
+   * the other end closing — Linux snapshots it at connect time for exactly that
+   * reason. Reading the live peer instead returned ENOTCONN the moment a client
+   * that had already been served exited, which a server asking who it just
+   * served hits routinely. */
+  struct b1nix_ucred peer_cred;
+  int has_peer_cred;
   /* This socket has been connected at least once. It distinguishes "the peer
    * hung up" (POLLHUP) from "never connected", which a listening socket is
    * permanently in — reporting HUP on a listener tells an event loop its
@@ -125,6 +134,10 @@ void unix_link_pair(struct vfs_socket_state *a, struct vfs_socket_state *b) {
   b->connected = 1;
   ua->had_peer = 1;
   ub->had_peer = 1;
+  ua->peer_cred = ub->owner;
+  ua->has_peer_cred = 1;
+  ub->peer_cred = ua->owner;
+  ub->has_peer_cred = 1;
 }
 
 void unix_free_state(struct vfs_socket_state *s) {
@@ -182,8 +195,35 @@ void unix_free_state(struct vfs_socket_state *s) {
     unix_data_put(peer);   /* drop our reference on the peer */
   }
 
-  for (int i = 0; i < npending; i++)
-    unix_data_put(pending[i]); /* backlog slot references */
+  /* Endpoints built by connectors that were never accepted. Releasing the slot
+   * reference is not enough: each one is the live peer of a connected client,
+   * which would otherwise sit writing into a socket nobody will ever read.
+   * Detach and wake, so the client sees the hangup — the listener going away
+   * before accept is a reset, not silence. */
+  for (int i = 0; i < npending; i++) {
+    struct unix_socket_data *srv = pending[i];
+
+    unix_lock(srv);
+    struct unix_socket_data *cli = srv->peer;
+    srv->peer = 0;
+    unix_unlock(srv);
+    if (cli) {
+      unix_lock(cli);
+      int linked = (cli->peer == srv);
+      if (linked) {
+        cli->peer = 0;
+        if (cli->socket) cli->socket->connected = 0;
+      }
+      unix_unlock(cli);
+      if (linked) {
+        if (cli->socket) scheduler_wake_all(cli->socket);
+        scheduler_wake_all(vfs_poll_chan);
+        unix_data_put(srv); /* the client's reference on the endpoint */
+      }
+      unix_data_put(cli);   /* the endpoint's reference on the client */
+    }
+    unix_data_put(srv);     /* the backlog slot's reference */
+  }
 
   /* If we are ourselves a still-pending connector (unix_connect enqueued us
    * into a listener's backlog and nobody has accept()ed us yet), splice
@@ -235,6 +275,11 @@ int unix_peer_cred(struct vfs_socket_state *s, struct b1nix_ucred *out) {
   if (!u || !out)
     return -EINVAL;
   unix_lock(u);
+  if (u->has_peer_cred) {
+    *out = u->peer_cred;
+    unix_unlock(u);
+    return 0;
+  }
   struct unix_socket_data *peer = u->peer;
   if (!peer) {
     unix_unlock(u);
@@ -268,6 +313,9 @@ int unix_listen(struct vfs_socket_state *s, int backlog) {
 
 int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr,
                  int nonblock) {
+  /* Kept for the caller's shape, and deliberately unused: a local connection
+   * completes within this call whether or not the socket blocks. */
+  (void)nonblock;
   /* /dev/log: the kernel is the syslog sink (no userspace syslogd). musl's
    * syslog() connect()s a SOCK_DGRAM here; accept it and forward later sends to
    * the serial console instead of requiring a bound peer socket. */
@@ -291,58 +339,78 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
 
   if (s->type == B1NIX_SOCK_STREAM) {
     if (!peer_s->listening) { vfs_node_put(peer_node); return -ECONNREFUSED; }
+
+    /*
+     * The far endpoint is built here, by the connector, and the pair is linked
+     * before connect() returns. accept() then adopts the endpoint rather than
+     * creating it.
+     *
+     * This is what makes a local connection complete the moment it is made:
+     * there is no handshake to wait for, so a client may write immediately, and
+     * on Linux it does. Linking at accept() instead left a window in which the
+     * socket was connected and had nowhere to write — libseat sends its first
+     * request straight after connecting and treats the resulting EAGAIN as
+     * fatal, so no compositor could reach seatd.
+     *
+     * Allocated before the listener's lock is taken: nothing else may run
+     * inside it, and a failure here has to be reportable without unwinding a
+     * half-queued connection.
+     */
+    struct unix_socket_data *srv = kzalloc(sizeof(struct unix_socket_data));
+    if (!srv) { vfs_node_put(peer_node); return -ENOMEM; }
+    srv->rb_buffer = kmalloc(UNIX_RB_SIZE);
+    if (!srv->rb_buffer) { kfree(srv); vfs_node_put(peer_node); return -ENOMEM; }
+    /* SO_PEERCRED on the accepted socket must report the server's identity, so
+     * the endpoint inherits it from the listening socket rather than from the
+     * process that happens to be connecting. */
+    srv->owner = peer_u->owner;
+    srv->refcount = 1; /* the backlog slot's reference */
+
+    /* Linked before it is published. accept() takes whatever is in the backlog
+     * the instant it appears, and an endpoint published first can be adopted
+     * with no peer yet — the accepted socket is then permanently unconnected,
+     * which is how a server came to see no credentials for a client that was
+     * plainly there. */
+    srv->peer = u;
+    unix_data_get(u);   /* srv->peer holds a reference on the connector */
+    unix_lock(u);
+    u->peer = srv;
+    unix_data_get(srv); /* u->peer holds a reference on the endpoint */
+    u->had_peer = 1;
+    srv->had_peer = 1;
+    u->peer_cred = srv->owner;
+    u->has_peer_cred = 1;
+    srv->peer_cred = u->owner;
+    srv->has_peer_cred = 1;
+    s->connected = 1;
+    unix_unlock(u);
+
     unix_lock(peer_u);
     if (peer_u->backlog_count >= peer_u->backlog_max) {
       unix_unlock(peer_u);
+      /* Unlink again — the connection is refused, so neither side may keep a
+       * pointer to the other. */
+      unix_lock(u);
+      u->peer = 0;
+      s->connected = 0;
+      unix_unlock(u);
+      unix_data_put(srv); /* the connector's reference */
+      unix_data_put(u);   /* the endpoint's reference on the connector */
+      kfree(srv->rb_buffer);
+      kfree(srv);
       vfs_node_put(peer_node);
       return -ECONNREFUSED;
     }
-    unix_data_get(u); /* the backlog slot holds a reference on us */
-    peer_u->backlog[peer_u->backlog_count++] = u;
-    unix_data_get(peer_u); /* pending_listener back-reference: lets a close()
-                             * while still pending splice us out instead of
-                             * leaving a dangling backlog entry */
-    u->pending_listener = peer_u;
+    peer_u->backlog[peer_u->backlog_count++] = srv;
     unix_unlock(peer_u);
 
     /* Wake up peer for accept() */
     scheduler_wake_all(peer_s);
     scheduler_wake_all(vfs_poll_chan);
 
-    /* O_NONBLOCK: the connection is queued in the listener's backlog, and
-     * POSIX says report EINPROGRESS now rather than waiting for accept().
-     * Blocking here regardless is how a non-blocking connect() to a listener
-     * that had not accepted yet wedged the caller for good. */
-    if (nonblock && !s->connected) {
-      vfs_node_put(peer_node);
-      return -EINPROGRESS;
-    }
-
-    /* Block until connected (simplified: just wait for peer to link us) */
-    while (!s->connected) {
-      if (scheduler_signal_pending()) {
-        /* Splice ourselves out of the peer's backlog so a later accept does
-         * not hand out a connector that has bailed (stale/UAF entry). */
-        unix_lock(peer_u);
-        for (int i = 0; i < peer_u->backlog_count; i++) {
-          if (peer_u->backlog[i] == u) {
-            for (int j = i; j < peer_u->backlog_count - 1; j++)
-              peer_u->backlog[j] = peer_u->backlog[j + 1];
-            peer_u->backlog_count--;
-            unix_data_put(u); /* drop the backlog slot's reference */
-            u->pending_listener = 0;
-            unix_data_put(peer_u); /* drop the pending_listener backref (self-spliced) */
-            break;
-          }
-        }
-        int still_connected = s->connected;
-        unix_unlock(peer_u);
-        vfs_node_put(peer_node);
-        /* If accept linked us between the check and the splice, honor it. */
-        return still_connected ? 0 : -ERESTARTSYS;
-      }
-      scheduler_yield();
-    }
+    /* Connected, blocking or not: nothing is pending, so there is nothing to
+     * wait for. accept() on the other side turns the queued endpoint into a
+     * socket; it does not decide whether this call succeeded. */
   } else {
     /* DGRAM */
     unix_data_get(peer_u); /* u->peer holds a reference on the peer */
@@ -370,29 +438,31 @@ int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s,
       return -EAGAIN;
     }
     if (u->backlog_count > 0) {
-      struct unix_socket_data *client_u = u->backlog[0];
+      struct unix_socket_data *srv = u->backlog[0];
       for (int i = 0; i < u->backlog_count - 1; i++) u->backlog[i] = u->backlog[i+1];
       u->backlog_count--;
       unix_unlock(u);
 
-      /* Link them. The backlog slot's reference on client_u transfers to
-       * new_u->peer (no extra get); client_u->peer takes a fresh reference on
-       * new_u. */
-      new_u->peer = client_u;
-      unix_data_get(new_u);
-      client_u->peer = new_u;
-      new_s->connected = 1;
-      new_u->had_peer = 1;
-      client_u->had_peer = 1;
-      if (client_u->socket)
-        client_u->socket->connected = 1;
+      /*
+       * Adopt the endpoint the connector built (see unix_connect), rather than
+       * linking a fresh one: it is already the peer of the connecting socket,
+       * and anything written since connect() returned is already in its buffer.
+       * The state the socket layer pre-allocated for this accept is discarded —
+       * it has never been visible to anyone.
+       *
+       * The backlog slot's reference becomes the new socket's, so neither side
+       * changes count here.
+       */
+      unix_data_put(new_u);
+      new_s->unix_data = srv;
+      srv->socket = new_s;
+      /* A connector that closed while still queued leaves the endpoint with no
+       * peer: the accepted socket is then already at end of stream, which is
+       * exactly what happened and what the reader should see. */
+      new_s->connected = (srv->peer != 0);
 
-      /* Accepted: drop the pending_listener backref (client_u is no longer
-       * sitting in our backlog, so a close() racing in now takes the normal
-       * peer-detach path in unix_free_state instead of the backlog-splice
-       * one). */
-      client_u->pending_listener = 0;
-      unix_data_put(u);
+      if (srv->peer && srv->peer->socket)
+        scheduler_wake_all(srv->peer->socket);
 
       return 0;
     }

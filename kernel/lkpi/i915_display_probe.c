@@ -16,11 +16,15 @@
  */
 
 #include "i915_drv.h"
+#include "display/intel_gmbus_regs.h"
+#include "display/intel_cdclk.h"
 #include "i915_reg.h"
 #include "intel_uncore.h"
 #include "gt/intel_gtt.h"
 
 #include <drm/drm_device.h>
+#include <drm/drm_edid.h>
+#include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_vblank.h>
 #include <linux/printk.h>
@@ -369,15 +373,196 @@ void lkpi_i915_dump_infoframes(struct drm_device *dev)
  * Hotplug live state comes along too: the sink asserting HPD throughout the
  * scanout is the one thing the far end of the cable does say.
  */
+/*
+ * The GMBUS controller's own registers.
+ *
+ * Every EDID read on this machine times out and falls back to bit-banging,
+ * which takes minutes — long enough that a compositor gives up and drives the
+ * monitor with a fallback mode. The first question is whether the controller is
+ * being addressed at all: a wrong MMIO base reads as a bus that never becomes
+ * ready, which is exactly what a timeout looks like from inside the driver.
+ */
+/*
+ * The EDID a connector managed to read, as hex.
+ *
+ * Reading it over the wire costs minutes on this machine — GMBUS never
+ * completes and the bit-banging fallback cannot see the lines — so the bytes
+ * are worth capturing once and supplying from the kernel afterwards, the way
+ * Linux's edid_firmware option does. This prints them in a form that can be
+ * pasted back into a build.
+ */
+void lkpi_i915_dump_edid(struct drm_device *dev)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+
+	if (!dev)
+		return;
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		const struct drm_edid *edid;
+		const struct edid *raw;
+		usize len, i;
+		char line[80];
+		unsigned col = 0;
+
+		if (connector->status != connector_status_connected)
+			continue;
+		edid = drm_edid_read(connector);
+		if (!edid)
+			continue;
+		raw = drm_edid_raw(edid);
+		len = raw ? (usize)(128 * (1 + raw->extensions)) : 0;
+		pr_info("i915-probe: EDID for %s, %u bytes:\n", connector->name,
+		        (unsigned)len);
+		for (i = 0; i < len; i++) {
+			static const char hex[] = "0123456789abcdef";
+			const u8 *b = (const u8 *)raw;
+
+			line[col++] = hex[b[i] >> 4];
+			line[col++] = hex[b[i] & 0xf];
+			if (col >= 64 || i + 1 == len) {
+				line[col] = 0;
+				pr_info("EDID %s\n", line);
+				col = 0;
+			}
+		}
+		drm_edid_free(edid);
+	}
+	drm_connector_list_iter_end(&iter);
+}
+
+/*
+ * Release a GMBUS left mid-transfer by whoever ran before us.
+ *
+ * The controller carries a hardware semaphore (INUSE) and a cycle in progress
+ * (ACTIVE, with a byte count still outstanding). Firmware — or a previous
+ * owner of a passed-through card — can hand the device over in that state, and
+ * nothing in the driver clears it: every transfer then waits for a bus that is
+ * already busy, times out, and falls back to bit-banging the I2C lines, which
+ * takes minutes per EDID. On this machine the card arrives exactly so, with
+ * ACTIVE set and thirty-odd bytes outstanding.
+ *
+ * Abandoning the cycle and writing 1 to INUSE — the documented way to release
+ * the semaphore — puts the controller back where a driver expects to find it.
+ */
+void lkpi_i915_gmbus_recover(struct drm_device *dev)
+{
+	struct drm_i915_private *i915 = to_i915_checked(dev);
+	u32 stat;
+
+	if (!i915)
+		return;
+	stat = intel_uncore_read(&i915->uncore, GMBUS2(i915));
+	if (!(stat & (GMBUS_INUSE | GMBUS_ACTIVE)))
+		return;
+
+	pr_info("i915-probe: GMBUS held on handover (GMBUS2 %x), releasing\n",
+	        (unsigned)stat);
+	/* Abandon the cycle: clear the software-ready bit and any pending
+	 * interrupt, deselect the pin, then drop the semaphore. */
+	intel_uncore_write(&i915->uncore, GMBUS1(i915), GMBUS_SW_CLR_INT);
+	intel_uncore_write(&i915->uncore, GMBUS1(i915), 0);
+	intel_uncore_write(&i915->uncore, GMBUS0(i915), 0);
+	intel_uncore_write(&i915->uncore, GMBUS4(i915), 0);
+	intel_uncore_write(&i915->uncore, GMBUS2(i915), GMBUS_INUSE);
+	intel_uncore_posting_read(&i915->uncore, GMBUS2(i915));
+	pr_info("i915-probe: GMBUS after release: %x\n",
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS2(i915)));
+}
+
+void lkpi_i915_dump_gmbus(struct drm_device *dev)
+{
+	struct drm_i915_private *i915 = to_i915_checked(dev);
+	u32 saved, probe;
+
+	if (!i915)
+		return;
+
+	/*
+	 * Does a write to this block land at all?
+	 *
+	 * Reads plainly work — the status register holds sensible values — but a
+	 * transfer that never starts looks the same whether the controller ignored
+	 * the command or answered it. Writing the port-select register and reading
+	 * it back separates those two, and it is safe: the value is restored, and
+	 * this runs before anything else drives the bus.
+	 */
+	saved = intel_uncore_read(&i915->uncore, GMBUS0(i915));
+	intel_uncore_write(&i915->uncore, GMBUS0(i915), 0x4);
+	probe = intel_uncore_read(&i915->uncore, GMBUS0(i915));
+	intel_uncore_write(&i915->uncore, GMBUS0(i915), saved);
+	pr_info("i915-probe: gmbus write test: wrote 4, read back %x (saved %x)\n",
+	        (unsigned)probe, (unsigned)saved);
+	/* The clock the GMBUS engine runs on. A controller with no reference clock
+	 * accepts commands and never completes them, which is what a timeout looks
+	 * like from the driver's side. */
+	pr_info("i915-probe: rawclk reg %x, rawclk_freq %u kHz\n",
+	        (unsigned)intel_uncore_read(&i915->uncore, PCH_RAWCLK_FREQ),
+	        (unsigned)i915->display.cdclk.hw.ref);
+	pr_info("i915-probe: gmbus base %x GMBUS0 %x GMBUS1 %x GMBUS2 %x GMBUS4 %x GMBUS5 %x\n",
+	        (unsigned)GMBUS_MMIO_BASE(i915),
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS0(i915)),
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS1(i915)),
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS2(i915)),
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS4(i915)),
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS5(i915)));
+}
+
 void lkpi_i915_dump_port_state(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = to_i915_checked(dev);
+	/*
+	 * A display power reference for the duration of the dump.
+	 *
+	 * Registers in an unpowered domain read as zero rather than faulting, so a
+	 * dump taken without one reports a display that is entirely switched off —
+	 * which is indistinguishable from a modeset that never happened, and sent
+	 * this investigation after the wrong thing twice.
+	 */
+	intel_wakeref_t dump_wakeref =
+		intel_display_power_get(dev_priv, POWER_DOMAIN_DISPLAY_CORE);
 	u32 func, ctrl1, ctrl2, status, sdeisr, buf1, buf2, iir;
+	enum transcoder dump_transcoder;
 	enum port port;
 	unsigned id;
 
+	/*
+	 * Whichever transcoder is actually driving something.
+	 *
+	 * Reading transcoder A alone reported a dead pipe while a compositor was
+	 * configuring pipe C — the numbers looked like "no modeset happened" when
+	 * one plainly had. The enable bit picks the live one; A remains the
+	 * fallback so the dump still says something on an idle machine.
+	 */
+	{
+		static const enum transcoder candidates[] = {
+			TRANSCODER_A, TRANSCODER_B, TRANSCODER_C
+		};
+		enum transcoder chosen = TRANSCODER_A;
+
+		for (unsigned i = 0; i < 3; i++) {
+			u32 conf = intel_uncore_read(&dev_priv->uncore,
+			                             TRANSCONF(candidates[i]));
+
+			if (conf & TRANSCONF_ENABLE) {
+				chosen = candidates[i];
+				break;
+			}
+		}
+		dump_transcoder = chosen;
+		pr_info("i915-probe: TRANSCONF A %x B %x C %x, dumping %d\n",
+		        (unsigned)intel_uncore_read(&dev_priv->uncore,
+		                                    TRANSCONF(TRANSCODER_A)),
+		        (unsigned)intel_uncore_read(&dev_priv->uncore,
+		                                    TRANSCONF(TRANSCODER_B)),
+		        (unsigned)intel_uncore_read(&dev_priv->uncore,
+		                                    TRANSCONF(TRANSCODER_C)),
+		        (int)chosen);
+	}
+
 	func = intel_uncore_read(&dev_priv->uncore,
-	                         TRANS_DDI_FUNC_CTL(TRANSCODER_A));
+	                         TRANS_DDI_FUNC_CTL(dump_transcoder));
 	/* Bits 30:28 name the port the transcoder feeds; 1 is DDI B. */
 	port = (enum port)(((func >> 28) & 0x7) ? ((func >> 28) & 0x7) : 0);
 
@@ -411,11 +596,333 @@ void lkpi_i915_dump_port_state(struct drm_device *dev)
 	 * Mode 0 is HDMI, 1 is DVI, 2 is DP SST. The BPC field is 0 for 8 bits
 	 * per colour, which is the only format every HDMI sink must accept.
 	 */
+	/*
+	 * The electrical half of the port: the buffer translation table.
+	 *
+	 * Everything read so far is the digital side — clock, timings, format,
+	 * enables — and all of it can be right while the PHY drives no usable
+	 * signal, because the voltage swing and de-emphasis for HDMI come from a
+	 * table the driver writes here, taken from the VBT. Entries left at zero
+	 * mean a port that is enabled, not idle, and electrically silent: the sink
+	 * sees no clock and never wakes, which is exactly what the camera shows.
+	 *
+	 * The last entry (index 9 on this generation) is the HDMI one.
+	 */
+	{
+		u32 lo0 = intel_uncore_read(&dev_priv->uncore, DDI_BUF_TRANS_LO(port, 0));
+		u32 hi0 = intel_uncore_read(&dev_priv->uncore, DDI_BUF_TRANS_HI(port, 0));
+		u32 lo9 = intel_uncore_read(&dev_priv->uncore, DDI_BUF_TRANS_LO(port, 9));
+		u32 hi9 = intel_uncore_read(&dev_priv->uncore, DDI_BUF_TRANS_HI(port, 9));
+		unsigned i, nonzero = 0;
+
+		for (i = 0; i < 10; i++)
+			if (intel_uncore_read(&dev_priv->uncore,
+			                      DDI_BUF_TRANS_LO(port, i)) != 0)
+				nonzero++;
+
+		pr_info("i915-probe: DDI_BUF_TRANS[0] %08x/%08x [9=HDMI] %08x/%08x, "
+		        "%u of 10 entries programmed\n",
+		        lo0, hi0, lo9, hi9, nonzero);
+	}
+
+	/*
+	 * The timings actually programmed, and the PLL that clocks them.
+	 *
+	 * A locked PLL is not a correct PLL: lock says the loop closed on whatever
+	 * it was configured for, not that the frequency matches the mode. A sink
+	 * fed a clock far from what the timings imply cannot lock a frame, and a
+	 * sink that never locks can stay dark rather than complain.
+	 *
+	 * 1920x1080 at 60 Hz is HTOTAL 2200 and VTOTAL 1125 (the registers hold
+	 * value-1), which is 148.5 MHz of pixel clock.
+	 */
+	{
+		u32 ht = intel_uncore_read(&dev_priv->uncore, TRANS_HTOTAL(dump_transcoder));
+		u32 vt = intel_uncore_read(&dev_priv->uncore, TRANS_VTOTAL(dump_transcoder));
+		u32 c1 = intel_uncore_read(&dev_priv->uncore, DPLL_CFGCR1(SKL_DPLL1));
+		u32 c2 = intel_uncore_read(&dev_priv->uncore, DPLL_CFGCR2(SKL_DPLL1));
+
+		pr_info("i915-probe: HTOTAL %08x (active %u, total %u) "
+		        "VTOTAL %08x (active %u, total %u)\n",
+		        ht, (ht & 0xffff) + 1, ((ht >> 16) & 0xffff) + 1,
+		        vt, (vt & 0xffff) + 1, ((vt >> 16) & 0xffff) + 1);
+		pr_info("i915-probe: DPLL1_CFGCR1 %08x (enable %d, dco int %u, frac %u) "
+		        "CFGCR2 %08x\n",
+		        c1, (int)((c1 & DPLL_CFGCR1_FREQ_ENABLE) ? 1 : 0),
+		        (unsigned)(c1 & DPLL_CFGCR1_DCO_INTEGER_MASK),
+		        (unsigned)((c1 & DPLL_CFGCR1_DCO_FRACTION_MASK) >> 9), c2);
+	}
+
+	/*
+	 * Which port clock the transcoder is fed.
+	 *
+	 * The pipe's timing generator runs off CDCLK, so scanline and frame count
+	 * advance whether or not this is set — but what leaves the DDI is clocked
+	 * from here, and TRANS_CLK_SEL_DISABLED means the transcoder is attached to
+	 * no port clock at all. A sink then sees no TMDS clock and stays asleep,
+	 * which is precisely the case a live pipe and an enabled port buffer cannot
+	 * distinguish.
+	 */
+	{
+		u32 cs = intel_uncore_read(&dev_priv->uncore,
+		                           TRANS_CLK_SEL(dump_transcoder));
+
+		pr_info("i915-probe: TRANS_CLK_SEL(A) %08x (port sel %u, %s)\n",
+		        cs, (unsigned)(cs >> 29),
+		        (cs >> 29) == 0 ? "DISABLED" : "attached");
+	}
+
+	/*
+	 * The AVI InfoFrame the port is actually sending, byte for byte.
+	 *
+	 * Its enable bit was compared with the host's and matches; its contents
+	 * never were. A sink is entitled to ignore a signal whose InfoFrame is
+	 * malformed, and the way it ignores it is by staying asleep — the symptom
+	 * here exactly. The packet carries its own checksum, defined so that the
+	 * sum of every byte including the header is zero, so its validity can be
+	 * decided without anything to compare against.
+	 *
+	 * The DIP data registers hold the packet little-endian, four bytes each,
+	 * starting with the three header bytes.
+	 */
+	{
+		u32 w[4];
+		unsigned i, sum = 0;
+		unsigned char b[16];
+
+		for (i = 0; i < 4; i++)
+			w[i] = intel_uncore_read(&dev_priv->uncore,
+			                         HSW_TVIDEO_DIP_AVI_DATA(TRANSCODER_A, i));
+		for (i = 0; i < 16; i++)
+			b[i] = (unsigned char)((w[i / 4] >> ((i % 4) * 8)) & 0xff);
+		/* Header (3 bytes) plus the 13 payload bytes an AVI InfoFrame has. */
+		for (i = 0; i < 16; i++)
+			sum += b[i];
+
+		pr_info("i915-probe: AVI DIP %08x %08x %08x %08x\n",
+		        w[0], w[1], w[2], w[3]);
+		pr_info("i915-probe: AVI type %02x ver %02x len %02x checksum %02x, "
+		        "byte sum %02x (0 = valid)\n",
+		        b[0], b[1], b[2], b[3], sum & 0xff);
+	}
+
+	/*
+	 * The AVI InfoFrame the port is actually sending, byte for byte.
+	 *
+	 * Its enable bit matches the host's; its contents were never read. A sink
+	 * may lock onto a signal, find the InfoFrame malformed and drop it again —
+	 * which is exactly what this monitor does, showing the frame for two or
+	 * three seconds before going dark. The packet carries a checksum defined so
+	 * that all its bytes sum to zero, so it can be judged on its own.
+	 */
+	{
+		u32 w[8];
+		unsigned i, sum = 0;
+		unsigned char b[32];
+
+		for (i = 0; i < 8; i++)
+			w[i] = intel_uncore_read(&dev_priv->uncore,
+			                         HSW_TVIDEO_DIP_AVI_DATA(TRANSCODER_A, i));
+		for (i = 0; i < 32; i++)
+			b[i] = (unsigned char)((w[i / 4] >> ((i % 4) * 8)) & 0xff);
+		/* Header is three bytes; an AVI InfoFrame's body is thirteen. */
+		for (i = 0; i < 17; i++)
+			sum += b[i];
+
+		pr_info("i915-probe: AVI DIP %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+		pr_info("i915-probe: AVI type %02x ver %02x len %02x sum %02x "
+		        "(0 = valid)\n", b[0], b[1], b[2], sum & 0xff);
+	}
+
+	/*
+	 * The General Control Packet, and the mute bit inside it.
+	 *
+	 * VIDEO_DIP_CTL says GCP is being sent. GCP carries AV_MUTE, which is a
+	 * direct instruction to the sink to blank — a source sets it while changing
+	 * something and clears it afterwards, and one that never clears it leaves a
+	 * monitor that locks onto a perfectly good signal and shows nothing. That
+	 * is close enough to what this monitor does to be worth reading rather than
+	 * assuming.
+	 */
+	{
+		u32 gcp = intel_uncore_read(&dev_priv->uncore,
+		                            HSW_TVIDEO_DIP_GCP(TRANSCODER_A));
+
+		pr_info("i915-probe: GCP %08x (av_mute %d, default_phase %d, "
+		        "color_indication %d)\n", gcp,
+		        (int)((gcp & GCP_AV_MUTE) ? 1 : 0),
+		        (int)((gcp & GCP_DEFAULT_PHASE_ENABLE) ? 1 : 0),
+		        (int)((gcp & GCP_COLOR_INDICATION) ? 1 : 0));
+	}
+
+	/*
+	 * What the hardware says about itself, rather than what the driver set.
+	 *
+	 * SFUSE_STRAP is the PCH's straps: which DDIs the board reports as present.
+	 * It is not written by any driver, so after the reset vfio performs on
+	 * handover it answers the one question no configuration register can — does
+	 * this device still believe port C exists. SKL_DFSM is the display fuse: it
+	 * says which pipes and how much of the display engine are enabled at all.
+	 */
+	{
+		u32 strap = intel_uncore_read(&dev_priv->uncore, SFUSE_STRAP);
+		u32 dfsm = intel_uncore_read(&dev_priv->uncore, SKL_DFSM);
+
+		pr_info("i915-probe: SFUSE_STRAP %08x (DDI B %d, C %d, D %d) DFSM %08x\n",
+		        strap,
+		        (int)((strap & SFUSE_STRAP_DDIB_DETECTED) ? 1 : 0),
+		        (int)((strap & SFUSE_STRAP_DDIC_DETECTED) ? 1 : 0),
+		        (int)((strap & SFUSE_STRAP_DDID_DETECTED) ? 1 : 0),
+		        dfsm);
+	}
+
+	/*
+	 * The pipe's colour pipeline.
+	 *
+	 * A sink that locks onto the signal and shows black is a different fault from
+	 * one that sees no signal, and this is where the first kind lives: gamma and
+	 * CSC sit between the plane and the transcoder, and a lookup table left at
+	 * zero maps every colour to black while every other register still says the
+	 * picture is being scanned out. The plane's own gamma-enable bit is the one
+	 * place our modeset differed from the host's.
+	 *
+	 * The palette is read through an index/data pair: writing the index with
+	 * auto-increment set and reading the data register walks the table.
+	 */
+	{
+		u32 gm = intel_uncore_read(&dev_priv->uncore, GAMMA_MODE(PIPE_A));
+		u32 csc = intel_uncore_read(&dev_priv->uncore, PIPE_CSC_MODE(PIPE_A));
+		u32 pc = intel_uncore_read(&dev_priv->uncore,
+		                           PLANE_CTL(PIPE_A, PLANE_PRIMARY));
+		u32 e0, emid, elast;
+
+		/* Bit 15 of the index register is the auto-increment enable. */
+		intel_uncore_write(&dev_priv->uncore, PREC_PAL_INDEX(PIPE_A),
+		                   (1u << 15) | 0);
+		e0 = intel_uncore_read(&dev_priv->uncore, PREC_PAL_DATA(PIPE_A));
+		intel_uncore_write(&dev_priv->uncore, PREC_PAL_INDEX(PIPE_A),
+		                   (1u << 15) | 128);
+		emid = intel_uncore_read(&dev_priv->uncore, PREC_PAL_DATA(PIPE_A));
+		intel_uncore_write(&dev_priv->uncore, PREC_PAL_INDEX(PIPE_A),
+		                   (1u << 15) | 255);
+		elast = intel_uncore_read(&dev_priv->uncore, PREC_PAL_DATA(PIPE_A));
+
+		pr_info("i915-probe: GAMMA_MODE %08x CSC_MODE %08x PLANE_CTL %08x "
+		        "(plane gamma %d)\n",
+		        gm, csc, pc, (int)((pc & PLANE_CTL_PIPE_GAMMA_ENABLE) ? 1 : 0));
+		pr_info("i915-probe: palette[0] %08x [128] %08x [255] %08x\n",
+		        e0, emid, elast);
+	}
+
+	/*
+	 * The power wells, which are the last thing between a configured port and
+	 * a dark cable.
+	 *
+	 * A well that is down does not stop the registers from reading back what
+	 * was written to them, and does not stop the pipe from running: the port
+	 * looks configured and enabled from every register above, and the PHY it
+	 * drives is simply unpowered, so nothing reaches the connector. That is
+	 * indistinguishable from a working link until these two are read.
+	 *
+	 * Each well has a request bit the driver sets and a state bit the hardware
+	 * answers with; they differ exactly when the hardware refused. PW_2 covers
+	 * the DDIs on this generation, and each DDI's IO has a well of its own.
+	 */
+	{
+		u32 wc1 = intel_uncore_read(&dev_priv->uncore, HSW_PWR_WELL_CTL1);
+		u32 wc2 = intel_uncore_read(&dev_priv->uncore, HSW_PWR_WELL_CTL2);
+
+		pr_info("i915-probe: PWR_WELL_CTL1 %08x CTL2 %08x\n", wc1, wc2);
+		pr_info("i915-probe: PW_2 req %d state %d; DDI_C io req %d state %d\n",
+		        (int)((wc2 & HSW_PWR_WELL_CTL_REQ(SKL_PW_CTL_IDX_PW_2)) ? 1 : 0),
+		        (int)((wc2 & HSW_PWR_WELL_CTL_STATE(SKL_PW_CTL_IDX_PW_2)) ? 1 : 0),
+		        (int)((wc2 & HSW_PWR_WELL_CTL_REQ(SKL_PW_CTL_IDX_DDI_C)) ? 1 : 0),
+		        (int)((wc2 & HSW_PWR_WELL_CTL_STATE(SKL_PW_CTL_IDX_DDI_C)) ? 1 : 0));
+	}
+
 	pr_info("i915-probe: TRANS_DDI mode %u bpc %u, pipe underrun %d, "
 	        "SDEISR %08x\n",
 	        (unsigned)((func & TRANS_DDI_MODE_SELECT_MASK) >> 24),
 	        (unsigned)((func & TRANS_DDI_BPC_MASK) >> 20),
 	        (int)((iir & GEN8_PIPE_FIFO_UNDERRUN) ? 1 : 0), sdeisr);
+	lkpi_i915_dump_gmbus(dev);
+	intel_display_power_put(dev_priv, POWER_DOMAIN_DISPLAY_CORE, dump_wakeref);
+}
+
+/*
+ * Watch the pipe's CRC while the frame is supposed to be standing still.
+ *
+ * The picture reaches the monitor when the CPU is halted and never when the
+ * kernel keeps running, which points at the frame itself rather than at the
+ * link: a scanout whose memory is reused underneath it stays perfectly
+ * configured while the pixels turn to noise, and a sink that has locked onto it
+ * gives up. The pipe computes a CRC over what it emits, once per frame, so a
+ * static frame must produce a constant value. One that drifts says the
+ * framebuffer is being written by something other than us.
+ */
+void lkpi_i915_crc_watch(struct drm_device *dev, unsigned seconds)
+{
+	struct drm_i915_private *dev_priv = to_i915_checked(dev);
+	u32 first = 0, first_w2 = 0, first_buf = 0;
+	enum port port = PORT_C;
+	unsigned i;
+
+	intel_uncore_write(&dev_priv->uncore, PIPE_CRC_CTL(PIPE_A),
+	                   PIPE_CRC_ENABLE | PIPE_CRC_SOURCE_DMUX_SKL);
+	intel_uncore_posting_read(&dev_priv->uncore, PIPE_CRC_CTL(PIPE_A));
+
+	for (i = 0; i < seconds; i++) {
+		u32 crc, start;
+		unsigned spins;
+
+		msleep(1000);
+		/*
+		 * Tied to a frame boundary, or the read returns whatever was latched
+		 * last — including a value from a previous session, which is what made
+		 * the first version of this report a constant while the picture on the
+		 * monitor was plainly something else.
+		 */
+		start = intel_uncore_read(&dev_priv->uncore,
+		                          PIPE_FRMCOUNT_G4X(PIPE_A));
+		for (spins = 0; spins < 200; spins++) {
+			if (intel_uncore_read(&dev_priv->uncore,
+			                      PIPE_FRMCOUNT_G4X(PIPE_A)) != start)
+				break;
+			udelay(1000);
+		}
+		if (spins == 200) {
+			pr_info("i915-probe: crc-watch t=%us pipe stopped advancing\n", i);
+			break;
+		}
+		crc = intel_uncore_read(&dev_priv->uncore,
+		                        PIPE_CRC_RES_1_IVB(PIPE_A));
+		/*
+		 * The power wells and the port buffer alongside the CRC, so a report
+		 * that the picture changed says which half moved: the pixels being
+		 * scanned, or the output carrying them. A deferred power-domain release
+		 * — intel_display_power_put_async_work — would leave the frame intact
+		 * and take the port down, and the CRC alone cannot tell that from a
+		 * link that never came up.
+		 */
+		{
+			u32 w2 = intel_uncore_read(&dev_priv->uncore, HSW_PWR_WELL_CTL2);
+			u32 buf = intel_uncore_read(&dev_priv->uncore, DDI_BUF_CTL(port));
+
+			if (i == 0) {
+				first = crc;
+				first_w2 = w2;
+				first_buf = buf;
+			}
+			if ((i % 10) == 0 || crc != first || w2 != first_w2 ||
+			    buf != first_buf)
+				pr_info("i915-probe: crc-watch t=%us crc %08x wells %08x "
+				        "buf %08x%s\n", i, crc, w2, buf,
+				        (crc != first || w2 != first_w2 ||
+				         buf != first_buf) ? "  CHANGED" : "");
+		}
+	}
+	intel_uncore_write(&dev_priv->uncore, PIPE_CRC_CTL(PIPE_A), 0);
 }
 
 /* ── mapping i915 objects into userspace ──────────────────────────── */
@@ -441,18 +948,25 @@ void lkpi_i915_dump_port_state(struct drm_device *dev)
  * longer owns, and nothing here can revoke a mapping to tell it otherwise (see
  * zap_vma_ptes() in <linux/mm.h>).
  */
-static int i915_gem_page_phys(struct drm_gem_object *obj, u64 index,
+static int i915_gem_page_phys(struct drm_vma_offset_node *node, u64 index,
                               u64 *out_phys)
 {
+	/* The node belongs to a struct i915_mmap_offset — one per object per
+	 * mapping type — and only points at the object. Treating it as the object
+	 * itself reads whatever happens to follow it in memory. */
+	struct i915_mmap_offset *mmo;
 	struct drm_i915_gem_object *bo;
 	dma_addr_t addr;
 	int ret;
 
-	if (!obj || !out_phys)
+	if (!node || !out_phys)
 		return -EINVAL;
-	bo = to_intel_bo(obj);
+	mmo = container_of(node, struct i915_mmap_offset, vma_node);
+	bo = mmo->obj;
+	if (!bo)
+		return -EINVAL;
 
-	if (index >= (u64)(obj->size >> PAGE_SHIFT))
+	if (index >= (u64)(bo->base.size >> PAGE_SHIFT))
 		return -EINVAL;
 
 	ret = i915_gem_object_pin_pages_unlocked(bo);
@@ -472,6 +986,40 @@ void lkpi_i915_register_card(struct drm_device *dev)
 {
 	if (!dev)
 		return;
+
+	/*
+	 * Re-run the raw-clock setup before anything uses the bus.
+	 *
+	 * PCH_RAWCLK_FREQ reads zero on this machine although the driver believes
+	 * the reference is 24 MHz: the value was computed during device-info init
+	 * and did not reach the register. GMBUS derives its timing from that clock,
+	 * so with the register at zero the controller accepts a transfer, never
+	 * completes it, and every EDID read falls back to bit-banging. Running the
+	 * driver's own routine again programs it from the strap, exactly as it
+	 * would have been.
+	 */
+	{
+		struct drm_i915_private *i915 = to_i915_checked(dev);
+
+		if (i915) {
+			u32 before = intel_uncore_read(&i915->uncore, PCH_RAWCLK_FREQ);
+			u32 freq = intel_read_rawclk(i915);
+			u32 after = intel_uncore_read(&i915->uncore, PCH_RAWCLK_FREQ);
+
+			pr_info("i915-probe: rawclk %u kHz, PCH_RAWCLK_FREQ %x -> %x\n",
+			        (unsigned)freq, (unsigned)before, (unsigned)after);
+			if (after == 0)
+				pr_info("i915: GMBUS has no reference clock — PCH_RAWCLK_FREQ "
+				        "reads 0 and does not accept writes, so the controller "
+				        "can never complete a transfer. Reading a display's "
+				        "EDID over the wire will not work here; supply one with "
+				        "b1nix.builtin-edid=<connector>. Seen under QEMU's "
+				        "legacy IGD passthrough, where part of the PCH register "
+				        "block is not forwarded to the guest.\n");
+		}
+	}
+
+	lkpi_i915_gmbus_recover(dev);
 
 	/*
 	 * Which south bridge the driver decided it is sitting next to.

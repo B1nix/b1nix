@@ -40,6 +40,7 @@
 #include <lkpi/drm_bridge.h>
 #include <lkpi/drmdev.h>
 #include <lkpi/env.h>
+#include <drm/drm_mode.h>
 
 /* Upstream's file operations, as drm_drv.c builds them for a driver that uses
  * DEFINE_DRM_GEM_FOPS. Called directly rather than through a table: b1nix's VFS
@@ -169,6 +170,18 @@ int lkpi_drm_open(u32 minor, u32 flags, void **out_file)
 	atomic64_set(&filp->f_count, 1);
 
 	ret = drm_open(inode, filp);
+	if (ret == 0 && lkpi_bootflag("b1nix.drm-debug")) {
+		struct drm_file *pv = filp->private_data;
+
+		/* Whether this file is a master, and whether the core thinks it is a
+		 * lessee. A file wrongly marked as one has every object filtered out of
+		 * GETRESOURCES — the card then reports no connectors at all, and a
+		 * compositor has nothing to light. */
+		pr_info("drm: open minor %u: master %p lessor %p is_master %d\n",
+		        minor, (void *)(pv ? pv->master : 0),
+		        (void *)(pv && pv->master ? pv->master->lessor : 0),
+		        pv ? pv->is_master : -1);
+	}
 	if (ret) {
 		kfree(inode);
 		kfree(filp);
@@ -192,8 +205,133 @@ void lkpi_drm_close(void *file)
 
 /* ── ioctl, read, poll ──────────────────────────────────────────── */
 
+/* Remember which descriptor a DRM file was opened through.
+ *
+ * Cloning a file (a lease) produces a second descriptor for the same device,
+ * and the clone has to look like that device to a program that stats it. The
+ * clone gets there through this: fd_install finds the original handle here and
+ * copies its node.
+ */
+/*
+ * A second, independent file on the same device — what dentry_open gives the
+ * lease path upstream.
+ *
+ * Handing back the same file instead was wrong in a way that took the kernel
+ * down: the caller treats the clone's private_data as the lessee's own state
+ * and reassigns its master, so a shared file left the LESSOR pointing at a
+ * master that had been put. The next walk up the lease chain dereferenced it.
+ */
+/* The device minor a DRM file belongs to. 0 and a false return when the file is
+ * not one of ours. */
+int lkpi_drm_file_minor(void *file, u32 *out)
+{
+	struct file *f = (struct file *)file;
+	struct drm_file *priv = f ? f->private_data : 0;
+
+	if (!priv || !priv->minor || !out)
+		return 0;
+	*out = (u32)priv->minor->index;
+	return 1;
+}
+
+void *lkpi_drm_clone_file(void *file)
+{
+	struct file *f = (struct file *)file;
+	struct drm_file *priv = f ? f->private_data : 0;
+	void *clone = 0;
+
+	if (!priv || !priv->minor)
+		return 0;
+	if (lkpi_drm_open((u32)priv->minor->index, 0, &clone) != 0)
+		return 0;
+	return clone;
+}
+
+void lkpi_drm_file_set_handle(void *file, void *handle)
+{
+	struct file *f = (struct file *)file;
+
+	if (f && !f->f_handle)
+		f->f_handle = handle;
+}
+
+/* The connector as userspace receives it.
+ *
+ * A compositor picks the mode flagged preferred and falls back to the last one
+ * in the list when none is; reading 720x400 on a monitor whose EDID asks for
+ * 1920x1080 is the shape of a preferred flag that did not survive the trip. The
+ * kernel's own list is not the evidence — what the ioctl copied out is. */
+static void debug_dump_connector_modes(void *user_arg)
+{
+	struct drm_mode_get_connector conn;
+	struct drm_mode_modeinfo mode;
+	u32 i;
+
+	if (lkpi_copy_from_user(&conn, user_arg, sizeof(conn)) != 0)
+		return;
+	pr_info("drm: connector %u: %u mode(s) copied out (buffer %s)\n",
+	        (unsigned)conn.connector_id, (unsigned)conn.count_modes,
+	        conn.modes_ptr ? "supplied" : "absent — count only");
+	if (!conn.modes_ptr)
+		return;
+	for (i = 0; i < conn.count_modes && i < 48; i++) {
+		const void *src = (const void *)(usize)(conn.modes_ptr +
+		                                        (u64)i * sizeof(mode));
+
+		if (lkpi_copy_from_user(&mode, src, sizeof(mode)) != 0)
+			return;
+		mode.name[sizeof(mode.name) - 1] = 0;
+		pr_info("drm:   mode %u %s %ux%u type 0x%x%s\n", (unsigned)i, mode.name,
+		        (unsigned)mode.hdisplay, (unsigned)mode.vdisplay,
+		        (unsigned)mode.type,
+		        (mode.type & (1 << 3)) ? " PREFERRED" : "");
+	}
+}
+
 isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 {
+	/* 0xc05064a7: DRM_IOCTL_MODE_GETCONNECTOR. */
+	if (lkpi_bootflag("b1nix.drm-debug") &&
+	    (request & 0xffffffffu) == 0xc05064a7u) {
+		isize r = drm_ioctl((struct file *)file, (unsigned int)request,
+		                    (unsigned long)(usize)user_arg);
+
+		if (r == 0)
+			debug_dump_connector_modes(user_arg);
+		return r;
+	}
+
+	/* Atomic commits, with the flag that decides whether they touch hardware.
+	 *
+	 * A compositor validates a configuration with TEST_ONLY before applying it,
+	 * and both calls look identical from outside: same command, same success.
+	 * If only the tests ever arrive, the screen stays dark while every ioctl
+	 * reports success — which is exactly the shape of the problem here. */
+	if (lkpi_bootflag("b1nix.drm-debug") && (request & 0xffffffffu) == 0xc03864bcu) {
+		u32 flags = 0;
+
+		if (lkpi_copy_from_user(&flags, user_arg, sizeof(flags)) == 0)
+			pr_info("drm: atomic ioctl flags %x%s\n", (unsigned)flags,
+			        (flags & 0x100) ? " (test only)" : " (apply)");
+		if (!(flags & 0x100)) {
+			/* The registers immediately after a commit that was applied, not
+			 * fifteen seconds later: a pipe that is enabled and then torn down
+			 * again looks identical to one that was never enabled if the only
+			 * evidence is a periodic dump. */
+			extern void lkpi_i915_dump_port_state_pub(void) __attribute__((weak));
+
+			if (lkpi_i915_dump_port_state_pub) {
+				isize r = drm_ioctl((struct file *)file, (unsigned int)request,
+				                    (unsigned long)(usize)user_arg);
+
+				pr_info("drm: applied commit -> %d, port state:\n", (int)r);
+				lkpi_i915_dump_port_state_pub();
+				return r;
+			}
+		}
+	}
+
+
 	struct file *filp = file;
 
 	if (!filp)
@@ -206,18 +344,32 @@ isize lkpi_drm_read(void *file, void *user_buf, usize len)
 {
 	struct file *filp = file;
 	loff_t pos = 0;
+	isize ret;
 
 	if (!filp)
 		return -EBADF;
-	return (isize)drm_read(filp, (char __user *)user_buf, (size_t)len, &pos);
+	ret = (isize)drm_read(filp, (char __user *)user_buf, (size_t)len, &pos);
+	/* What a compositor's event loop actually receives. A page-flip completion
+	 * that is queued but never read leaves it waiting for a frame that, as far
+	 * as it can tell, never landed — and it tears the output down again. */
+	if (lkpi_bootflag("b1nix.drm-debug"))
+		pr_info("drm: read %d bytes\n", (int)ret);
+	return ret;
 }
 
 int lkpi_drm_readable(void *file)
 {
 	struct file *filp = file;
+	static unsigned reported;
 
 	if (!filp)
 		return 0;
+	if (lkpi_bootflag("b1nix.drm-debug") && reported < 40) {
+		reported++;
+		pr_info("drm: poll -> %s\n",
+		        (drm_poll(filp, 0) & (EPOLLIN | EPOLLRDNORM)) ? "readable"
+		                                                      : "empty");
+	}
 	/* poll_wait is a no-op here — b1nix parks the caller on its own poll
 	 * channel — so what comes back is purely the readiness mask. */
 	return (drm_poll(filp, 0) & (EPOLLIN | EPOLLRDNORM)) ? 1 : 0;
@@ -230,7 +382,6 @@ int lkpi_drm_mmap_page_phys(void *file, u64 offset, u64 *out_phys)
 	struct file *filp = file;
 	struct drm_file *priv;
 	struct drm_vma_offset_node *node;
-	struct drm_gem_object *obj;
 	unsigned long pgoff = (unsigned long)(offset / PAGE_SIZE);
 	u64 index;
 	int ret;
@@ -250,28 +401,30 @@ int lkpi_drm_mmap_page_phys(void *file, u64 offset, u64 *out_phys)
 	                                                           : g_dev;
 	lkpi_drm_page_fn resolver = lkpi_drm_resolver_for(dev);
 
-	if (!dev || !resolver)
+	if (!dev || !resolver) {
+		pr_info("drm: mmap offset %llx: no %s for this device\n",
+		        (unsigned long long)offset, dev ? "resolver" : "device");
 		return -EINVAL;
+	}
 
 	drm_vma_offset_lock_lookup(dev->vma_offset_manager);
 	node = drm_vma_offset_lookup_locked(dev->vma_offset_manager, pgoff, 1);
 	if (node && !drm_vma_node_is_allowed(node, priv))
 		node = 0;
-	if (node) {
-		obj = container_of(node, struct drm_gem_object, vma_node);
-		/* Taken under the lookup lock: the object could otherwise be freed
-		 * between finding it and using it. */
-		drm_gem_object_get(obj);
-	} else {
-		obj = 0;
-	}
+	/* The reference across the resolve is the driver's to take: it is the one
+	 * that knows what this node is part of. The bridge only finds it. */
 	drm_vma_offset_unlock_lookup(dev->vma_offset_manager);
 
-	if (!obj)
+	if (!node) {
+		pr_info("drm: mmap offset %llx (page %lx): nothing mapped there\n",
+		        (unsigned long long)offset, pgoff);
 		return -EACCES;
+	}
 
 	index = (u64)(pgoff - node->vm_node.start);
-	ret = resolver(obj, index, out_phys);
-	drm_gem_object_put(obj);
+	ret = resolver(node, index, out_phys);
+	if (ret)
+		pr_info("drm: mmap offset %llx page %llu: resolver says %d\n",
+		        (unsigned long long)offset, (unsigned long long)index, ret);
 	return ret;
 }

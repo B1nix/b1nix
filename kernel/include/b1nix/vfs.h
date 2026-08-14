@@ -84,6 +84,13 @@ struct vfs_inode {
    * disk), while dev identifies the DEVICE and is deliberately stable across
    * mounts. 0 until the mount stamps it; vfs_node_dev resolves it. */
   u32 dev;
+  /* The device this node IS, for a character or block special file — major << 8
+   * | minor, reported as st_rdev. Programs identify a device by these numbers
+   * rather than by its path: seatd refuses to open a card whose major does not
+   * say "DRM". Kept in its own field because inode->data already means "the
+   * file's contents live in memory here", and the page-fault path copies from
+   * it — a device number parked there is read as an address. */
+  u64 rdev;
   /* Inode generation: bumped every time the filesystem hands this inode number
    * to a NEW file. A stored file handle carries it, so reusing the number for a
    * different file makes the old handle report ESTALE instead of opening the

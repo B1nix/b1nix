@@ -18,11 +18,14 @@
 #include <string.h>
 
 #include <b1nix/pci.h>
+#include <b1nix/arch_x86_64.h>
+#include <b1nix/console.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/sysfs_attr.h>
 #include <b1nix/virtio_gpu.h>
 #include <b1nix/tlb.h>
+#include <b1nix/drm.h>
 #include <b1nix/vfs.h>
 #include <lkpi/env.h>
 #include <stdarg.h>
@@ -30,9 +33,103 @@
 
 u64 lkpi_ticks(void) { return scheduler_get_ticks(); }
 
-void lkpi_sleep_ticks(u64 ticks) { scheduler_sleep_ticks(ticks); }
+/* ── stuck-call watchdog ────────────────────────────────────────
+ *
+ * The watched call, and the last place it went to sleep. Both are written by
+ * the watched task itself and read by a watchdog thread on another CPU, so
+ * everything here is volatile and nothing is a pointer the reader dereferences:
+ * the reader only compares the task pointer and prints numbers.
+ */
+static void *volatile g_watch_task;
+static const char *volatile g_watch_what;
+static volatile u64 g_watch_detail;
+static volatile u64 g_watch_start_ns;
+static volatile u64 g_watch_site;
+static volatile u64 g_watch_frame;
+static volatile u64 g_watch_parks;
 
-void lkpi_yield(void) { scheduler_yield(); }
+static void watch_note_park(u64 site, u64 frame)
+{
+  if (!g_watch_task || g_watch_task != (void *)current_task)
+    return;
+  g_watch_site = site;
+  g_watch_frame = frame;
+  g_watch_parks++;
+}
+
+void lkpi_diag_watch_begin(const char *what, u64 detail)
+{
+  g_watch_what = what;
+  g_watch_detail = detail;
+  g_watch_start_ns = lkpi_monotonic_ns();
+  g_watch_site = 0;
+  g_watch_frame = 0;
+  g_watch_parks = 0;
+  /* Last, so a reader that sees a task also sees the rest of the record. */
+  g_watch_task = (void *)current_task;
+}
+
+void lkpi_diag_watch_end(void) { g_watch_task = 0; }
+
+int lkpi_diag_watch_report(u64 min_ms)
+{
+  void *task = g_watch_task;
+  u64 ms;
+
+  if (!task)
+    return 0;
+  ms = (lkpi_monotonic_ns() - g_watch_start_ns) / 1000000ull;
+  if (ms < min_ms)
+    return 0;
+
+  console_write("lkpi: ");
+  console_write(g_watch_what ? g_watch_what : "call");
+  console_write(" 0x");
+  console_write_hex64(g_watch_detail);
+  console_write(" still running after ");
+  console_write_dec(ms);
+  console_write(" ms, ");
+  console_write_dec(g_watch_parks);
+  console_write(" park(s)");
+  if (!g_watch_parks) {
+    /* Never parked: it is spinning, not waiting, and the frame recorded below
+     * would be from an older call. Say so rather than print a stale trace. */
+    console_write(" — spinning, not parked\n");
+    return 1;
+  }
+  console_write(", last parked at 0x");
+  console_write_hex64(g_watch_site);
+  ksym_print(g_watch_site);
+  console_write("\n");
+  arch_backtrace(g_watch_frame, g_watch_site);
+  return 1;
+}
+
+void lkpi_sleep_ticks(u64 ticks)
+{
+  watch_note_park((u64)(usize)__builtin_return_address(0),
+                  (u64)(usize)__builtin_frame_address(0));
+  /*
+   * A sleep abandons a park that was armed and never committed.
+   *
+   * Imported code publishes itself on a wait queue with prepare_to_wait() and
+   * then, on some paths, sleeps for a fixed time instead of calling schedule()
+   * — a delay in the middle of a modeset, for instance. b1nix's sleep refuses
+   * to run on a task that is marked blocked, and rightly: the two states are
+   * different things. Dropping the arm here is what the caller meant, and it
+   * also puts the interrupt state back the way prepare_to_wait found it.
+   */
+  if (scheduler_wait_armed())
+    scheduler_wait_cancel();
+  scheduler_sleep_ticks(ticks);
+}
+
+void lkpi_yield(void)
+{
+  watch_note_park((u64)(usize)__builtin_return_address(0),
+                  (u64)(usize)__builtin_frame_address(0));
+  scheduler_yield();
+}
 
 int lkpi_can_block(void) { return scheduler_can_block(); }
 
@@ -53,11 +150,61 @@ u32 lkpi_cpu_id(void)
 
 u32 lkpi_cpu_count(void) { return (u32)g_max_cpus; }
 
-u64 lkpi_irq_save(void) { return interrupts_save(); }
+/* Where interrupts were last turned off on this CPU.
+ *
+ * "Cannot block because interrupts are off" is useless without the site that
+ * turned them off — the code that trips over it is usually several frames away
+ * and imported, so a backtrace from the complaint names the wrong function. */
+static u64 g_irq_off_site[MAX_CPUS];
 
-void lkpi_irq_restore(u64 flags) { interrupts_restore(flags); }
+u64 lkpi_irq_off_site(void)
+{
+	struct percpu *pc = get_percpu();
+	u32 cpu = pc && pc->cpu_id < MAX_CPUS ? pc->cpu_id : 0;
 
-void lkpi_irq_enable(void) { interrupts_enable(); }
+	return g_irq_off_site[cpu];
+}
+
+/* Cleared when they come back on, so a non-zero site means "still off, from
+ * here" rather than "was off at some point". */
+void lkpi_note_irq_on(void)
+{
+	struct percpu *pc = get_percpu();
+	u32 cpu = pc && pc->cpu_id < MAX_CPUS ? pc->cpu_id : 0;
+
+	g_irq_off_site[cpu] = 0;
+}
+
+void lkpi_note_irq_off(u64 site)
+{
+	struct percpu *pc = get_percpu();
+	u32 cpu = pc && pc->cpu_id < MAX_CPUS ? pc->cpu_id : 0;
+
+	g_irq_off_site[cpu] = site;
+}
+
+u64 lkpi_irq_save(void)
+{
+	int was_on = interrupts_enabled();
+	u64 flags = interrupts_save();
+
+	if (was_on)
+		lkpi_note_irq_off((u64)(usize)__builtin_return_address(0));
+	return flags;
+}
+
+void lkpi_irq_restore(u64 flags)
+{
+	interrupts_restore(flags);
+	if (interrupts_enabled())
+		lkpi_note_irq_on();
+}
+
+void lkpi_irq_enable(void)
+{
+	interrupts_enable();
+	lkpi_note_irq_on();
+}
 
 int lkpi_irqs_enabled(void) { return interrupts_enabled(); }
 
@@ -68,11 +215,42 @@ void lkpi_wait_prepare_timeout(void *chan, u64 timeout_ticks)
 	scheduler_wait_prepare_timeout(chan, timeout_ticks);
 }
 
-void lkpi_wait_commit(void) { scheduler_wait_commit(); }
+void lkpi_wait_commit(void)
+{
+  watch_note_park((u64)(usize)__builtin_return_address(0),
+                  (u64)(usize)__builtin_frame_address(0));
+  scheduler_wait_commit();
+}
 
 void lkpi_wait_cancel(void) { scheduler_wait_cancel(); }
 
-void lkpi_wake_all(void *chan) { scheduler_wake_all(chan); }
+void lkpi_schedule(void)
+{
+  watch_note_park((u64)(usize)__builtin_return_address(0),
+                  (u64)(usize)__builtin_frame_address(0));
+  /* The second phase of a park, when one was armed; otherwise what a bare
+   * schedule() asks for. See the note on schedule() in <linux/sched.h>. */
+  if (scheduler_wait_armed())
+    scheduler_wait_commit();
+  else
+    scheduler_yield();
+}
+
+void lkpi_wake_all(void *chan)
+{
+	scheduler_wake_all(chan);
+	/*
+	 * And the pollers.
+	 *
+	 * Imported code wakes its own wait queue; b1nix's poll() sleeps on one
+	 * shared channel and re-tests readiness when woken, so a queue it has never
+	 * heard of leaves it asleep with the event already waiting. That is what
+	 * kept a compositor blocked in poll() on the card: the page-flip completion
+	 * was queued, readable, and nobody told the sleeper. Waking the poll channel
+	 * costs a re-test that finds nothing when the wake was for something else.
+	 */
+	scheduler_wake_all(vfs_poll_chan);
+}
 
 /*
  * A per-CPU snapshot rather than a pointer into b1nix's task: the caller may
@@ -129,6 +307,29 @@ void *lkpi_handle_alloc(void)
 	if (h)
 		h->private_data = 0;
 	return h;
+}
+
+void lkpi_handle_inherit_node(void *handle, void *source)
+{
+	struct vfs_handle *h = (struct vfs_handle *)handle;
+	struct vfs_handle *src = (struct vfs_handle *)source;
+
+	if (!h || !src || !src->node || h->node)
+		return;
+	h->node = vfs_node_get(src->node);
+	h->ops = src->ops;
+	h->flags = src->flags;
+}
+
+void lkpi_handle_attach_drm_minor(void *handle, u32 minor)
+{
+	struct vfs_handle *h = (struct vfs_handle *)handle;
+	struct vfs_node *node;
+
+	(void)node;
+	if (!h)
+		return;
+	drm_card_attach_handle(h, minor);
 }
 
 void lkpi_handle_release(void *handle)
@@ -277,6 +478,36 @@ void lkpi_might_sleep(const char *where)
 {
   if (lkpi_can_block())
     return;
+
+  /* The first few get a backtrace and the reason.
+   *
+   * "Cannot block" has three quite different causes — no scheduler yet, no
+   * current task, or interrupts already off — and only the last one points at a
+   * caller that disabled them and did not put them back. The trace names that
+   * caller; without it the warning says only that something, somewhere, is
+   * wrong. */
+  {
+    static int traced;
+
+    if (traced < 3) {
+      traced++;
+      console_write("lkpi: cannot block (");
+      console_write(current_task ? "" : "no task, ");
+      console_write(interrupts_enabled() ? "irqs on" : "irqs off");
+      console_write(") in ");
+      console_write(where ? where : "?");
+      console_write(", task=");
+      console_write(current_task && current_task->name ? current_task->name
+                                                       : "?");
+      console_write(", last irq-off at 0x");
+      console_write_hex64(lkpi_irq_off_site());
+      ksym_print(lkpi_irq_off_site());
+      console_write("\n");
+      arch_backtrace((u64)(usize)__builtin_frame_address(0),
+                     (u64)(usize)__builtin_return_address(0));
+    }
+  }
+
   char line[96];
   lkpi_snprintf(line, sizeof(line),
                 "lkpi: might_sleep() in a context that cannot block: %s",
@@ -384,27 +615,27 @@ static struct {
 	u64 flags;
 } lkpi_preempt_state[MAX_CPUS];
 
+/*
+ * Preemption off, interrupts ON — which is what Linux means by this.
+ *
+ * Disabling interrupts as well looks like the safer reading and is not: inside
+ * such a region no timer tick arrives, so jiffies stand still and any wait with
+ * a timeout runs forever. i915 enters one for a two-microsecond poll of the
+ * GMBUS status and then falls back to a fifty-millisecond wait — with the clock
+ * stopped, that second wait never ends, and connector probing hung there with a
+ * compositor waiting on it.
+ *
+ * The scheduler honours the count instead: the timer still fires, still
+ * accounts, and simply does not take the CPU away until the region ends.
+ */
 void lkpi_preempt_disable(void)
 {
-	u64 f = interrupts_save();
-	u32 cpu = (u32)percpu_read(cpu_id);
-
-	if (cpu >= MAX_CPUS)
-		return; /* flags stay saved in f and are dropped: IRQs stay off */
-	if (lkpi_preempt_state[cpu].depth++ == 0)
-		lkpi_preempt_state[cpu].flags = f;
+	scheduler_preempt_disable();
 }
 
 void lkpi_preempt_enable(void)
 {
-	u32 cpu = (u32)percpu_read(cpu_id);
-
-	if (cpu >= MAX_CPUS)
-		return;
-	if (lkpi_preempt_state[cpu].depth == 0)
-		return; /* unbalanced enable: leave interrupts as they are */
-	if (--lkpi_preempt_state[cpu].depth == 0)
-		interrupts_restore(lkpi_preempt_state[cpu].flags);
+	scheduler_preempt_enable();
 }
 
 /* ── the host-visible display ───────────────────────────────────────
@@ -486,10 +717,44 @@ static u64 lkpi_tsc_base;
  * on udelay being usable with them off, and shootdowns are still serviced
  * through cpu_relax so a spinning CPU does not wedge one that is waiting on it.
  */
+/*
+ * Stretching every delay, for finding a race by its symptom.
+ *
+ * The display comes up on this hardware occasionally rather than never, with
+ * every register in the finished modeset matching a working one bit for bit.
+ * That is the shape of a step whose wait is too short: it usually loses and
+ * sometimes wins. Multiplying every delay is not a fix and is not meant to be —
+ * it is the measurement that says whether waiting longer changes the odds, and
+ * so whether the fault is in timing at all.
+ *
+ * b1nix.slow-phy=<n> multiplies; absent, nothing changes.
+ */
+static u64 lkpi_delay_scale;
+
+static u64 lkpi_delay_factor(void)
+{
+	char buf[8];
+
+	if (lkpi_delay_scale)
+		return lkpi_delay_scale;
+	lkpi_delay_scale = 1;
+	if (bootinfo_get_kv("b1nix.slow-phy", buf, sizeof(buf))) {
+		u64 n = 0;
+
+		for (const char *p = buf; *p >= '0' && *p <= '9'; p++)
+			n = n * 10u + (u64)(*p - '0');
+		if (n >= 2 && n <= 64)
+			lkpi_delay_scale = n;
+	}
+	return lkpi_delay_scale;
+}
+
 void lkpi_udelay(u64 usecs)
 {
 	u32 khz = arch_cpu_khz();
 	u64 start, cycles;
+
+	usecs *= lkpi_delay_factor();
 
 	if (!khz) {
 		/* Uncalibrated: fall back to the old spin so a delay is at least

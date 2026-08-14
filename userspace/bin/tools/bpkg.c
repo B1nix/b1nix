@@ -890,7 +890,28 @@ static int http_fetch(const char *url, struct buf *out) {
         }
 
         /* chunked transfer-encoding is not handled; every server we target
-         * (jsDelivr, Alpine mirrors) sends Content-Length for static files. */
+         * (jsDelivr, Alpine mirrors) sends Content-Length for static files.
+         *
+         * That length is checked rather than trusted-by-omission: the body is
+         * read until the connection closes, so a transfer cut short arrives as
+         * a valid-looking short file. It then fails much later as "not a valid
+         * .apk", which sends the reader hunting for a decompression bug that is
+         * not there. A truncated download is a download error and says so. */
+        {
+            uint8_t *lp = bpkg_memmem(resp.p, header_len, "Content-Length:", 15);
+            if (!lp) lp = bpkg_memmem(resp.p, header_len, "content-length:", 15);
+            if (lp) {
+                size_t want = (size_t)strtoul((char *)lp + 15, NULL, 10);
+                if (want && body_len < want) {
+                    fprintf(stderr,
+                            "bpkg: truncated download of %s: %zu of %zu bytes\n",
+                            cur, body_len, want);
+                    buf_free(&resp);
+                    return -1;
+                }
+            }
+        }
+
         buf_init(out);
         buf_append(out, resp.p + header_len, body_len);
         buf_free(&resp);
@@ -914,7 +935,16 @@ static int fetch_url(const char *url, struct buf *out) {
         fclose(f);
         return 0;
     }
-    return http_fetch(url, out);
+    /* Retried, because a dropped transfer is worth a second ask: the failure
+     * this guards against is a connection cut mid-body, and the next attempt
+     * usually completes. Three tries, then the error stands. */
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        if (http_fetch(url, out) == 0)
+            return 0;
+        if (attempt < 3)
+            fprintf(stderr, "bpkg: retrying %s (attempt %d of 3)\n", url, attempt + 1);
+    }
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -924,7 +954,91 @@ static int fetch_url(const char *url, struct buf *out) {
 #define BPKG_CONF "/etc/bpkg.conf"
 #define BPKG_STATE_DIR "/var/lib/bpkg"
 #define BPKG_INSTALLED_DIR "/var/lib/bpkg/installed"
-#define BPKG_CACHED_INDEX "/var/lib/bpkg/index"
+/*
+ * In the state directory, where the rest of bpkg's state lives.
+ *
+ * Making it persist is a question about the machine, not about bpkg: a caller
+ * that has somewhere durable to keep it can point this path there — see the
+ * symlink in /etc/i915-sway.sh. Moving it into the package cache instead would
+ * put one kind of state in two places, and the installed-package metadata,
+ * which must NOT survive a boot that starts from a fresh ramdisk, sits beside
+ * it.
+ */
+#define BPKG_CACHED_INDEX BPKG_STATE_DIR "/index"
+/* Downloaded packages, kept between runs when something is mounted here. */
+#define BPKG_CACHE_DIR "/var/cache/bpkg"
+
+/* Read a whole file into `out`. Returns 0 when it existed and was read. */
+static int read_whole_file(const char *path, struct buf *out)
+{
+    FILE *f = fopen(path, "rb");
+    char chunk[8192];
+    size_t r;
+
+    if (!f)
+        return -1;
+    buf_init(out);
+    while ((r = fread(chunk, 1, sizeof(chunk), f)) > 0)
+        buf_append(out, chunk, r);
+    fclose(f);
+    if (out->len == 0) {
+        buf_free(out);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Best-effort: a cache that cannot be written is not an error — but a cache
+ * that half-wrote is worse than none, and one that says nothing about it is
+ * how a run came to download eighty-six packages into a cache that had kept
+ * eight empty names.
+ *
+ * Written to a temporary name, forced out, then renamed: a reader either finds
+ * the whole file or does not find it, and an entry can never be a truncated
+ * package that every later run happily reuses.
+ */
+static void write_whole_file(const char *path, const void *data, size_t len)
+{
+    char tmp[512];
+    FILE *f;
+    int fd;
+
+    mkdir("/var/cache", 0755);
+    mkdir(BPKG_CACHE_DIR, 0755);
+    if ((size_t)snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= sizeof(tmp))
+        return;
+    f = fopen(tmp, "wb");
+    if (!f) {
+        fprintf(stderr, "bpkg: cache: cannot create %s: %s\n", tmp,
+                strerror(errno));
+        return;
+    }
+    if (len && fwrite(data, 1, len, f) != len) {
+        fprintf(stderr, "bpkg: cache: short write to %s\n", tmp);
+        fclose(f);
+        unlink(tmp);
+        return;
+    }
+    if (fflush(f) != 0 || (fd = fileno(f)) < 0 || fsync(fd) != 0) {
+        fprintf(stderr, "bpkg: cache: cannot flush %s: %s\n", tmp,
+                strerror(errno));
+        fclose(f);
+        unlink(tmp);
+        return;
+    }
+    if (fclose(f) != 0) {
+        fprintf(stderr, "bpkg: cache: cannot close %s: %s\n", tmp,
+                strerror(errno));
+        unlink(tmp);
+        return;
+    }
+    if (rename(tmp, path) != 0) {
+        fprintf(stderr, "bpkg: cache: cannot rename %s: %s\n", tmp,
+                strerror(errno));
+        unlink(tmp);
+    }
+}
 
 /* b1nix is x86_64-only; the 32-bit port is retired. */
 #define BPKG_ARCH "x86_64"
@@ -984,6 +1098,11 @@ static int is_apkindex_url(const char *url) {
 static void ensure_state_dirs(void) {
     mkdir(BPKG_STATE_DIR, 0755);
     mkdir(BPKG_INSTALLED_DIR, 0755);
+    /* The cache directory as well: the index lives there now, beside the
+     * packages, and `update` writes it with open() rather than through
+     * write_whole_file — so nothing else would create it. */
+    mkdir("/var/cache", 0755);
+    mkdir(BPKG_CACHE_DIR, 0755);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1528,9 +1647,36 @@ static int install_one(struct pkgset *set, const char *name) {
         return 0;
     }
 
-    printf("bpkg: fetching %s %s from %s\n", pk->name, pk->version, pk->url);
+    /*
+     * A downloaded package is kept.
+     *
+     * Fetching one costs a TLS handshake and a megabyte over the network, and
+     * the same handful gets installed over and over while a system is being
+     * brought up — several minutes of every test boot spent re-downloading
+     * bytes that have not changed. The cache is keyed by the file name the
+     * index gives, which already carries the version, so a new release simply
+     * misses and is fetched.
+     */
+    char cached[512];
     struct buf raw;
-    if (fetch_url(pk->url, &raw) < 0) return -1;
+    const char *base = strrchr(pk->url, '/');
+
+    snprintf(cached, sizeof(cached), "%s/%s", BPKG_CACHE_DIR,
+             base ? base + 1 : pk->name);
+
+    /* Local packages are never cached: they cost nothing to read, and they are
+     * how the tamper tests hand bpkg a deliberately corrupted payload — serving
+     * an older good copy of the same file name would defeat the check the test
+     * exists to make. */
+    int cacheable = strncmp(pk->url, "file://", 7) != 0;
+
+    if (cacheable && read_whole_file(cached, &raw) == 0) {
+        printf("bpkg: using cached %s %s\n", pk->name, pk->version);
+        cacheable = 0; /* already there; nothing to write back */
+    } else {
+        printf("bpkg: fetching %s %s from %s\n", pk->name, pk->version, pk->url);
+        if (fetch_url(pk->url, &raw) < 0) return -1;
+    }
 
     if (!pk->is_apk && pk->sha[0]) {
         char got[65];
@@ -1617,6 +1763,11 @@ static int install_one(struct pkgset *set, const char *name) {
         }
         for (int i = 0; i < members; i++) buf_free(&member[i]);
     }
+    /* Cached only now: everything above — signature, datahash, extraction — has
+     * accepted these bytes, so what lands there is a package that installed
+     * cleanly rather than merely one that downloaded. */
+    if (cacheable && rc == 0)
+        write_whole_file(cached, raw.p, raw.len);
     buf_free(&raw);
 
     if (rc < 0) { fprintf(stderr, "bpkg: failed to extract %s\n", pk->name); buf_free(&filelist); return -1; }

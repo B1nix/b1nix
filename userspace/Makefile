@@ -238,6 +238,9 @@ BINARIES += $(BUILD)/bin/m51_cairo_wayland
 BINARIES += $(BUILD)/bin/m51_xkb_smoke
 BINARIES += $(BUILD)/bin/m51_harfbuzz_smoke
 BINARIES += $(BUILD)/bin/m51_fontconfig_smoke
+# Reaches its libraries through dlopen, so it needs no headers and links like
+# any other program — see the note at the top of bin/gfx/font_probe.c.
+BINARIES += $(BUILD)/bin/font_probe
 BINARIES += $(BUILD)/bin/m52_gl_smoke
 BINARIES += $(BUILD)/bin/cxx_smoke
 BINARIES += $(BUILD)/bin/m55_iostream

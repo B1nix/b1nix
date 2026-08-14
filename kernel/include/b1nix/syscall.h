@@ -251,6 +251,10 @@ enum {
 	SYS_INIT_MODULE      = 245, /* init_module(image, len, params) */
 	SYS_DELETE_MODULE    = 246, /* delete_module(name, flags) */
 	SYS_FINIT_MODULE     = 247, /* finit_module(fd, params, flags) */
+
+	/* --- M104: growing a mapping in place. musl's realloc reaches for this on
+	   every large block, so a libc without it cannot grow one. --- */
+	SYS_MREMAP           = 248, /* mremap(old, old_len, new_len, flags, new_addr) */
 };
 
 /* Aliases: linux_abi.c references these generic names; map to the versioned ones. */

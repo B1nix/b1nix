@@ -20,7 +20,21 @@ static inline long schedule_timeout(long timeout)
 		lkpi_sleep_ticks((u64)timeout);
 	return 0;
 }
-static inline void schedule(void) { lkpi_yield(); }
+/*
+ * schedule(), as the caller of prepare_to_wait() means it.
+ *
+ * Upstream splits a park into two statements: prepare_to_wait() publishes the
+ * waiter and marks the task not-runnable, and schedule() is what actually gives
+ * up the CPU. b1nix's park is the same two phases, so schedule() must be the
+ * second one — not a yield. A yield here left the task marked blocked and
+ * simply switched away from it: it was never on a run queue again and never on
+ * any channel a wake could reach, which is how a compositor's modeset commit
+ * came to sit inside intel_atomic_commit_tail() forever.
+ *
+ * Still a yield when nothing armed a wait, because that is what a plain
+ * schedule() means in imported code that only wants to be preempted.
+ */
+static inline void schedule(void) { lkpi_schedule(); }
 static inline int signal_pending(void *t) { (void)t; return 0; }
 
 /* `current` and struct task_struct come from <linux/types.h>, which every

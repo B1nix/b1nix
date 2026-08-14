@@ -122,7 +122,23 @@ static inline void prepare_to_wait(struct wait_queue_head *wq,
 	(void)state;
 	if (!entry->entry.next || entry->entry.next == &entry->entry)
 		add_wait_queue(wq, entry);
-	lkpi_wait_prepare(wq);
+	/*
+	 * Armed with a deadline, always.
+	 *
+	 * Upstream lets a task sit on several queues at once and wake from any of
+	 * them; b1nix parks on exactly one channel, so a second prepare_to_wait()
+	 * replaces the first — and a queue that hashes to no channel at all, which
+	 * is what bit_waitqueue() hands back here, replaces it with nothing. Either
+	 * way the wake the caller is waiting for can arrive somewhere this task is
+	 * no longer listening. i915 does exactly that while waiting for a commit's
+	 * fence: two prepare_to_wait() calls, the second on a bit queue.
+	 *
+	 * The deadline is what makes that safe rather than fatal. Every caller of
+	 * prepare_to_wait() re-tests its condition after schedule() returns — the
+	 * pattern permits spurious wakeups — so waking each tick costs a re-test
+	 * and turns an unreachable wake into at most 10 ms of latency.
+	 */
+	lkpi_wait_prepare_timeout(wq, 1);
 }
 
 static inline void finish_wait(struct wait_queue_head *wq,

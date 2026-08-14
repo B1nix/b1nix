@@ -37,6 +37,7 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_prime.h>
+#include <drm/drm_probe_helper.h>
 #include <asm/cacheflush.h>
 #include <linux/delay.h>
 #include <linux/dma-buf.h>
@@ -82,6 +83,44 @@ static struct drm_client_buffer *g_buffer;
 static struct dma_buf *g_dmabuf;
 static u32 g_fb_width, g_fb_height;
 static bool g_active;
+
+/*
+ * The port state again, later, for a caller that has no drm_device.
+ *
+ * The mirror keeps the device it committed on; the frame-hold in kernel/main.c
+ * only wants to know whether the link is still being driven a minute after the
+ * modeset, which is the difference between a signal the sink refused and a
+ * signal that stopped.
+ */
+void lkpi_i915_crc_watch(struct drm_device *dev, unsigned seconds) __attribute__((weak));
+
+void lkpi_i915_crc_watch_pub(unsigned seconds)
+{
+	if (g_client.dev && lkpi_i915_crc_watch)
+		lkpi_i915_crc_watch(g_client.dev, seconds);
+}
+
+void lkpi_i915_dump_edid_pub(void)
+{
+	extern void lkpi_i915_dump_edid(struct drm_device *dev) __attribute__((weak));
+	struct drm_device *dev = g_client.dev ? g_client.dev : lkpi_drm_first_device();
+
+	if (dev && lkpi_i915_dump_edid)
+		lkpi_i915_dump_edid(dev);
+}
+
+void lkpi_i915_dump_port_state_pub(void)
+{
+	/* The mirror client's device when there is one, and otherwise whatever the
+	 * core registered. The dump is just as useful — more so — when the modeset
+	 * under examination came from a compositor rather than from us, and in that
+	 * case no in-kernel client exists to own the device. */
+	struct drm_device *dev = g_client.dev ? g_client.dev : lkpi_drm_first_device();
+
+	if (dev && lkpi_i915_dump_port_state)
+		lkpi_i915_dump_port_state(dev);
+}
+
 
 static void mirror_unregister(struct drm_client_dev *client)
 {
@@ -490,6 +529,59 @@ int lkpi_drm_mirror_to_display(void)
 		if (lkpi_bootflag("b1nix.drm-debug"))
 			__drm_debug |= MIRROR_DEBUG_KMS;
 		rc = drm_client_modeset_commit(&g_client);
+
+		/*
+		 * Once more, off and on.
+		 *
+		 * Every register this modeset programs matches the host's working one
+		 * bit for bit, and the sink still sees nothing — which is what a PHY
+		 * that did not latch its enable looks like, since the state it failed
+		 * to adopt is still the state it reports. A port that comes up on the
+		 * second try says exactly that; one that stays dark rules it out.
+		 *
+		 * The mode is cleared and restored around the middle commit because
+		 * that is how this client turns a CRTC off: a modeset entry without a
+		 * mode is the disable request.
+		 */
+		if (rc == 0 && lkpi_bootflag("b1nix.remodeset")) {
+			const struct drm_display_mode *saved[8];
+			unsigned n = 0;
+
+			for (unsigned i = 0; g_client.modesets &&
+			                     g_client.modesets[i].crtc && n < 8; i++) {
+				saved[n++] = g_client.modesets[i].mode;
+				g_client.modesets[i].mode = NULL;
+				g_client.modesets[i].fb = NULL;
+			}
+			pr_info("drm: mirror: re-modeset: turning the output off\n");
+			(void)drm_client_modeset_commit(&g_client);
+			msleep(1500);
+
+			for (unsigned i = 0, k = 0; g_client.modesets &&
+			                            g_client.modesets[i].crtc && k < n; i++, k++) {
+				g_client.modesets[i].mode = saved[k];
+				if (saved[k])
+					g_client.modesets[i].fb = g_buffer->fb;
+			}
+			pr_info("drm: mirror: re-modeset: turning it back on\n");
+			rc = drm_client_modeset_commit(&g_client);
+			pr_info("drm: mirror: re-modeset: commit %d\n", rc);
+		}
+		/*
+		 * Stop the driver polling its connectors, when asked.
+		 *
+		 * With the CPU halted the monitor lights; with the kernel running it
+		 * never does, and the difference between those two is whether the
+		 * driver's workers get scheduled at all. Connector polling is the one
+		 * that touches this port every few seconds — it re-detects, which means
+		 * driving the DDC lines of a link the sink is still trying to lock.
+		 * Turning it off leaves everything else running, so a picture appearing
+		 * now names the culprit exactly.
+		 */
+		if (lkpi_bootflag("b1nix.no-poll")) {
+			pr_info("drm: mirror: disabling connector polling\n");
+			drm_kms_helper_poll_disable(dev);
+		}
 		__drm_debug = saved_debug;
 		/*
 		 * How many interrupts arrived while the commit ran.

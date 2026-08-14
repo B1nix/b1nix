@@ -60,7 +60,22 @@ PREFIX="$(cd "$1" && pwd)"; shift
 CACHE_ROOT="$ROOT_DIR/build/$ARCH/pkgcache"
 # The files this run installed, for the dependency closure below.
 INSTALLED="$(mktemp)"
-trap 'rm -f "$INSTALLED"' EXIT
+# The package names installed by this run, for the dependency passes below.
+PKGS_SEEN="$(mktemp)"
+trap 'rm -f "$INSTALLED" "$PKGS_SEEN"' EXIT
+
+#
+# Dependencies that must not be followed into this image.
+#
+# Alpine packages depend on Alpine's base system, and it is not this one: its
+# busybox owns /bin, alpine-baselayout owns /etc, and musl would be a second
+# libc beside the one built here. Following those turns installing a compositor
+# into replacing the operating system underneath it. openrc and runit are named
+# for the reasons in alpine-ports.map. Extendable per invocation.
+#
+ALPINE_SKIP_DEPS="${ALPINE_SKIP_DEPS:-busybox busybox-binsh alpine-baselayout \
+alpine-baselayout-data alpine-keys alpine-release musl musl-utils musl-locales \
+libc6-compat scanelf ssl_client openrc runit}"
 mkdir -p "$PREFIX"
 
 fetch() {
@@ -154,6 +169,55 @@ pkg_for_soname() {
 	done
 }
 
+#
+# What a package says it depends on, in its own words.
+#
+# The SONAME closure below finds libraries, and only libraries. A dependency on
+# another *program* is invisible to it: cage links nothing against Xwayland, it
+# execs it, so cage arrived complete by every measure this script had and then
+# refused to start with "Cannot create XWayland server". The index says so
+# plainly in the record's D: line, which is read here.
+#
+pkg_deps_in() {
+	awk -v want="$2" -v RS= '
+		{
+			name = ""; deps = ""
+			n = split($0, lines, "\n")
+			for (i = 1; i <= n; i++) {
+				if (lines[i] ~ /^P:/) name = substr(lines[i], 3)
+				if (lines[i] ~ /^D:/) deps = substr(lines[i], 3)
+			}
+			if (name == want) { print deps; exit }
+		}' "$(index "$1")"
+}
+
+# Which package provides a command, for the `cmd:` form of a dependency.
+pkg_for_cmd_in() {
+	awk -v want="$2" -v RS= '
+		{
+			name = ""; found = 0
+			n = split($0, lines, "\n")
+			for (i = 1; i <= n; i++) {
+				if (lines[i] ~ /^P:/) name = substr(lines[i], 3)
+				if (lines[i] ~ /^p:/) {
+					split(substr(lines[i], 3), provs, " ")
+					for (j in provs) {
+						split(provs[j], kv, "=")
+						if (kv[1] == "cmd:" want) found = 1
+					}
+				}
+			}
+			if (found) { print name; exit }
+		}' "$(index "$1")"
+}
+
+pkg_for_cmd() {
+	for r in $REPOS; do
+		n="$(pkg_for_cmd_in "$r" "$1")"
+		[ -n "$n" ] && { echo "$n"; return; }
+	done
+}
+
 install_one() {
 	name="$1"
 	set -- $(pkg_locate "$name")
@@ -236,6 +300,7 @@ install_one() {
 			"{}" "$PREFIX/{}" \;)
 		(cd "$tmp" && find . ! -type d) | sed "s|^\.|$PREFIX|" >> "$INSTALLED"
 		rm -rf "$tmp"
+		echo "$name" >> "$PKGS_SEEN"
 		echo "ALPINE $name-$ver [$ARCH] -> $PREFIX (native layout)"
 		return
 	fi
@@ -273,11 +338,63 @@ install_one() {
 		esac
 	done
 
+	echo "$name" >> "$PKGS_SEEN"
 	echo "ALPINE $name-$ver [$ARCH] -> $PREFIX"
 }
 
 for name in "$@"; do
 	install_one "$name"
+done
+
+#
+# What the packages themselves say they need, beyond libraries.
+#
+# A D: entry can be a library (`so:`), a build-time name (`pc:`), a file, or a
+# package — and only the first of those is reachable from an ELF. The package
+# and `cmd:` forms are what put a *program* on the image: cage execs Xwayland
+# and links nothing against it, so nothing else in this script could have known.
+#
+#
+# Native layout only, and never a -dev package.
+#
+# This closure answers "what else must be on the image for this program to
+# run". A flat prefix is the other question — what a link line needs — and
+# there the same walk drags in the -dev package of every dependency and the
+# -dev packages of those, which is both useless to a linker that already has
+# the libraries and a large addition to alpine.lock.
+#
+round=0
+while [ "${ALPINE_LAYOUT:-flat}" = native ] && [ "$round" -lt 8 ]; do
+	round=$((round + 1))
+	added=0
+	for pkg in $(sort -u "$PKGS_SEEN"); do
+		set -- $(pkg_locate "$pkg")
+		[ -n "${1:-}" ] || continue
+		for dep in $(pkg_deps_in "$1" "$pkg"); do
+			# Version constraints and conflicts are not selections.
+			case "$dep" in
+			!*) continue ;;
+			so:*|pc:*|/*) continue ;;
+			esac
+			dep="${dep%%[<>=~]*}"
+			case "$dep" in
+			cmd:*) dep="$(pkg_for_cmd "${dep#cmd:}")" ;;
+			esac
+			[ -n "$dep" ] || continue
+			# Headers and .pc files are a build-time concern; nothing on the
+			# image runs them.
+			case "$dep" in *-dev) continue ;; esac
+			case " $ALPINE_SKIP_DEPS " in *" $dep "*) continue ;; esac
+			grep -qx "$dep" "$PKGS_SEEN" && continue
+			[ -n "$(pkg_locate "$dep")" ] || {
+				echo "alpine-fetch: $pkg needs $dep, which is in none of ($REPOS)" >&2
+				continue
+			}
+			install_one "$dep"
+			added=1
+		done
+	done
+	[ "$added" = 1 ] || break
 done
 
 #
@@ -314,7 +431,21 @@ while [ "$round" -lt 16 ]; do
 	missing=""
 	while IFS= read -r so; do
 		[ -f "$so" ] || continue
-		case "$so" in *.so|*.so.*) ;; *) continue ;; esac
+		#
+		# Programs name their libraries the same way libraries do.
+		#
+		# Only files called *.so* used to be examined, so a package whose whole
+		# point is an executable brought none of what it links against: sway
+		# arrived without wlroots, wayland, pixman or libinput, and the first
+		# sign of it was a compositor that could not start. An ELF is an ELF —
+		# what matters is DT_NEEDED, not the suffix.
+		case "$so" in
+		*.so|*.so.*) ;;
+		*)
+			readelf -hW "$so" 2>/dev/null |
+				grep -qE 'Type:[[:space:]]+(EXEC|DYN)' || continue
+			;;
+		esac
 		for need in $(readelf -dW "$so" 2>/dev/null |
 		              sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
 			case "$need" in libc.musl-*|ld-musl-*) continue ;; esac

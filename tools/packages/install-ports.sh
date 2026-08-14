@@ -122,20 +122,6 @@ stage_netsurf_assets() {
 # M32B-SSH handshake/pty failures. The Makefile builds dropbearmulti locally as
 # a dependency of install-ports either way, so prefer that fresher binary over
 # the packaged one instead of shipping a knowingly broken SSH server.
-# Dropbear is an Alpine package now, installed by the root-image rule. This
-# overlay only ever applied to a locally built multi-call binary; leaving it
-# would let a stale build tree shadow the packaged tools with symlinks.
-overlay_local_dropbear() {
-	return 0
-	local_db="$ROOT_DIR/build/$ARCH/ports/dropbear/dropbearmulti"
-	[ -f "$local_db" ] || return 0
-	mkdir -p "$ROOTFS/bin"
-	cp "$local_db" "$ROOTFS/bin/dropbearmulti"
-	for name in dropbear dbclient dropbearkey; do
-		ln -sfn dropbearmulti "$ROOTFS/bin/$name"
-	done
-	echo "OVERLAY dropbear (locally built) [$PKG_ARCH]"
-}
 
 # The rest of the published set predates the musl migration: those packages are
 # ET_EXEC binaries linked against the retired b1nix libc, while everything else
@@ -177,7 +163,7 @@ purge_retired_components() {
 
 mkdir -p "$ROOTFS"
 case "$MODE" in
-	download) download_ports; overlay_local_dropbear; overlay_local_ports ;;
+	download) download_ports; overlay_local_ports ;;
 	local) local_ports ;;
 	*) echo "install-ports: mode must be 'download' or 'local'" >&2; exit 2 ;;
 esac

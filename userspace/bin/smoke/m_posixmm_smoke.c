@@ -246,8 +246,71 @@ static int test_readdir_terminates(void) {
 	return (n <= 8 && saw_file == 1 && saw_sub == 3) ? 0 : 2;
 }
 
+/*
+ * Does mmap ever hand out an address it has already given away?
+ *
+ * Every region gets a pattern of its own, and every pattern is re-read after
+ * all of them exist. Two regions that overlap cannot both keep their pattern,
+ * so a single mismatch proves the reuse — which is otherwise invisible until
+ * something else's data is quietly destroyed. It reached us as a compositor
+ * crashing inside malloc(), because musl keeps allocator metadata in mmap'd
+ * pages and one of them had been handed out twice.
+ *
+ * The sizes vary and the regions are not unmapped in order, so the holes the
+ * allocator has to search are not a simple ascending run.
+ */
+#define MM_REGIONS 96
+static int test_mmap_no_overlap(void) {
+	unsigned char *p[MM_REGIONS];
+	size_t len[MM_REGIONS];
+	int i;
+
+	for (i = 0; i < MM_REGIONS; i++) {
+		len[i] = (size_t)(1 + (i % 5)) * 4096;
+		p[i] = mmap(0, len[i], PROT_READ | PROT_WRITE,
+		            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (p[i] == MAP_FAILED)
+			return 1;
+		memset(p[i], (unsigned char)(i + 1), len[i]);
+	}
+
+	/* Free every third one, so the next round has to place regions into holes
+	 * rather than at the end. */
+	for (i = 0; i < MM_REGIONS; i += 3) {
+		munmap(p[i], len[i]);
+		p[i] = 0;
+	}
+	for (i = 0; i < MM_REGIONS; i += 3) {
+		len[i] = (size_t)(1 + (i % 3)) * 4096;
+		p[i] = mmap(0, len[i], PROT_READ | PROT_WRITE,
+		            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (p[i] == MAP_FAILED)
+			return 2;
+		memset(p[i], (unsigned char)(i + 1), len[i]);
+	}
+
+	for (i = 0; i < MM_REGIONS; i++) {
+		size_t j;
+
+		for (j = 0; j < len[i]; j++) {
+			if (p[i][j] != (unsigned char)(i + 1))
+				return 3;
+		}
+	}
+	for (i = 0; i < MM_REGIONS; i++)
+		munmap(p[i], len[i]);
+	return 0;
+}
+
 int main(void) {
 	marker("MM-SMOKE: start\n");
+
+	int overlaprc = test_mmap_no_overlap();
+	if (overlaprc != 0) {
+		marker("MM-SMOKE: fail mmap-no-overlap\n");
+		return 60 + overlaprc;
+	}
+	marker("MM-SMOKE: ok mmap-no-overlap\n");
 
 	int rdrc = test_readdir_terminates();
 	if (rdrc != 0) {

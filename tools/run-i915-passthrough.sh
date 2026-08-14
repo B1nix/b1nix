@@ -228,8 +228,28 @@ esac
 SHOT="$OUT_DIR/i915-screen.ppm"
 MON="$OUT_DIR/i915-monitor.sock"
 rm -f "$SHOT" "$MON"
-DEV_ARGS="$DEV_ARGS -device virtio-gpu-pci"
+# NO_VIRTIO_GPU=1 leaves it out. A compositor enumerating two cards takes its
+# multi-GPU path and asks the renderer for DMA-BUF formats, which software
+# rendering does not have — so an emulated card meant only as a mirror stops the
+# assigned one from being used at all.
+[ "${NO_VIRTIO_GPU:-0}" = "1" ] ||
+	DEV_ARGS="$DEV_ARGS -device virtio-gpu-pci"
 MON_ARGS="-monitor unix:$MON,server,nowait"
+
+# A disk that survives the run, holding downloaded Alpine packages.
+#
+# Every boot that installs a compositor spends minutes fetching the same
+# megabytes again; bpkg keeps what it downloads under /var/cache/bpkg, and this
+# is where that directory lives between runs. Created once, empty, and never
+# read by anything but the guest.
+CACHE_IMG="$OUT_DIR/pkgcache.img"
+if [ ! -f "$CACHE_IMG" ]; then
+	dd if=/dev/zero of="$CACHE_IMG" bs=1M count=512 2>/dev/null
+	mke2fs -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q \
+		-L b1nix-pkgcache "$CACHE_IMG" 2>/dev/null ||
+		mke2fs -t ext4 -q -L b1nix-pkgcache "$CACHE_IMG"
+fi
+DEV_ARGS="$DEV_ARGS -drive file=$CACHE_IMG,format=raw,if=virtio"
 
 echo "b1nix + $IGD_BDF via VFIO ($MACHINE), ${MEM_MB}M, log: $LOG"
 
@@ -251,6 +271,7 @@ qemu_pid=$!
 # does. Polling the log rather than sleeping a fixed time: the modeset happens
 # whenever it happens, and a fixed wait either races it or wastes the run.
 captured=0
+finished=0
 waited=0
 while kill -0 "$qemu_pid" 2>/dev/null && [ "$waited" -lt "$TIMEOUT" ]; do
 	if grep -aq "mirror: frame presented" "$LOG" 2>/dev/null; then
@@ -260,9 +281,33 @@ while kill -0 "$qemu_pid" 2>/dev/null && [ "$waited" -lt "$TIMEOUT" ]; do
 		fi
 		break
 	fi
+	# The compositor run says when it is finished, and there is nothing to be
+	# gained by holding the machine to the timeout after that — see the
+	# shutdown below for why it matters that this exit is a clean one.
+	if grep -aq "I915-SWAY: done" "$LOG" 2>/dev/null; then
+		finished=1
+		break
+	fi
 	sleep 2
 	waited=$((waited + 2))
 done
+
+# Ask the guest to power down rather than shooting it.
+#
+# b1nix's block cache is write-back, so a SIGTERM to QEMU discards whatever has
+# not been flushed — which is how a run that downloaded thirty packages into the
+# package-cache disk left it holding none of them and a corrupt filesystem
+# besides. The monitor socket is already open for screendump; this is the same
+# channel.
+if [ "$finished" = 1 ] && [ -S "$MON" ]; then
+	printf 'system_powerdown\n' | timeout 10 socat - "unix-connect:$MON" >/dev/null 2>&1
+	i=0
+	while kill -0 "$qemu_pid" 2>/dev/null && [ "$i" -lt 30 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	kill "$qemu_pid" 2>/dev/null
+fi
 
 # Done as soon as the frame is captured. Waiting for the timeout after that
 # costs the whole budget per iteration and tells us nothing new — the guest has
@@ -273,12 +318,6 @@ if [ "$captured" = 1 ]; then
 	# result — which is the half of this that says whether the display pipeline
 	# actually came up.
 	sleep "${CAPTURE_GRACE:-15}"
-	kill "$qemu_pid" 2>/dev/null
-fi
-# Stop as soon as the frame is captured. Waiting out the timeout after that
-# costs the whole budget on every iteration and tells us nothing new: the guest
-# has already reported what it did.
-if [ "$captured" = 1 ]; then
 	kill "$qemu_pid" 2>/dev/null
 fi
 wait "$qemu_pid" 2>/dev/null

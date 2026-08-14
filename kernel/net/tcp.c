@@ -182,6 +182,15 @@ struct tcp_conn {
   u32 snd_una; /* oldest unacked sequence number */
   u32 snd_nxt; /* next sequence number to send */
   u32 rcv_nxt; /* next expected receive sequence number */
+  /* A FIN that arrived ahead of data still missing from the stream.
+   *
+   * The flag rides on a segment, and that segment can overtake a lost one.
+   * Acting on it then declares the stream finished with a hole still in it,
+   * which is how large downloads came back a few tens of kilobytes short and
+   * looked like corrupt files. Remembered here and honoured once the sequence
+   * it sits at is the one being waited for. */
+  u32 fin_seq;
+  u8 fin_pending;
   u32 iss;     /* initial send sequence number */
   u32 irs;     /* initial receive sequence number */
   /* M32: sliding-window flow control + Reno-shaped congestion control.
@@ -1342,9 +1351,25 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
   if (!(flags & B1NIX_MSG_PEEK)) {
     conn->recv_read += (u32)avail;
 
-    /* Compact buffer if all read */
+    /*
+     * Compact what has been read out of the buffer, not merely when it happens
+     * to empty.
+     *
+     * The free space the receive window advertises is measured from recv_len,
+     * so bytes already handed to the application still counted against it until
+     * the buffer drained completely. A reader that keeps up but never quite
+     * empties the buffer — which is every streaming download — therefore drove
+     * the window to zero at 64 KiB and left it there: transfers died a little
+     * past that point, and the failure looked like a corrupt package rather
+     * than a stalled connection.
+     */
     if (conn->recv_read >= conn->recv_len) {
       conn->recv_len = 0;
+      conn->recv_read = 0;
+    } else if (conn->recv_read > 0) {
+      memmove(conn->recv_buf, conn->recv_buf + conn->recv_read,
+              conn->recv_len - conn->recv_read);
+      conn->recv_len -= conn->recv_read;
       conn->recv_read = 0;
     }
 
@@ -2020,8 +2045,23 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
       }
     }
 
-    /* Handle FIN */
+    /* Handle FIN — but only when the stream has actually reached it. */
+    int accept_fin = 0;
+
     if (flags & TCP_FIN) {
+      u32 fin_at = seq + (u32)payload_size;
+
+      if (fin_at == conn->rcv_nxt) {
+        accept_fin = 1;
+      } else {
+        conn->fin_seq = fin_at;
+        conn->fin_pending = 1;
+      }
+    }
+    if (!accept_fin && conn->fin_pending && conn->rcv_nxt == conn->fin_seq)
+      accept_fin = 1;
+    if (accept_fin) {
+      conn->fin_pending = 0;
       conn->rcv_nxt++;
 
       /* Send ACK for FIN */

@@ -1,3 +1,5 @@
+/* mremap and MREMAP_MAYMOVE are GNU extensions in musl's headers. */
+#define _GNU_SOURCE
 /*
  * m12_smoke — POSIX-process and signal smoke test.
  * Verifies: fork, execve, waitpid, exit status, dup2, fcntl, brk,
@@ -276,6 +278,52 @@ int main(int argc, char **argv) {
       }
     } else {
       marker("M12-SMOKE: fail mmap\n");
+    }
+  }
+
+  /* 10b. mremap: growing a mapping keeps what was in it.
+   *
+   * musl's realloc calls this for every block big enough to have been mmap'd,
+   * so a kernel without it cannot grow a large buffer — which is how a package
+   * manager came to fail on exactly the packages over a megabyte. The check is
+   * that the bytes survive the move, not merely that the call returns. */
+  {
+    size_t small = 64 * 1024, big = 512 * 1024;
+    char *p = mmap(NULL, small, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (p == MAP_FAILED) {
+      marker("M12-SMOKE: fail mremap-setup\n");
+    } else {
+      for (size_t i = 0; i < small; i++)
+        p[i] = (char)(i & 0x7f);
+      char *grown = mremap(p, small, big, MREMAP_MAYMOVE);
+      if (grown == MAP_FAILED) {
+        marker("M12-SMOKE: fail mremap-grow\n");
+        munmap(p, small);
+      } else {
+        int intact = 1;
+        for (size_t i = 0; i < small; i++)
+          if (grown[i] != (char)(i & 0x7f))
+            intact = 0;
+        grown[big - 1] = 'Z';
+        if (!intact)
+          marker("M12-SMOKE: fail mremap-contents\n");
+        else if (grown[big - 1] != 'Z')
+          marker("M12-SMOKE: fail mremap-tail\n");
+        else {
+          char *shrunk = mremap(grown, big, small, 0);
+          if (shrunk == MAP_FAILED || shrunk[0] != 0) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "M12-SMOKE: fail mremap-shrink (%d)\n",
+                     shrunk == MAP_FAILED ? errno : -1);
+            marker(msg);
+          }
+          else
+            marker("M12-SMOKE: ok mremap\n");
+          munmap(shrunk == MAP_FAILED ? grown : shrunk, small);
+        }
+      }
     }
   }
 

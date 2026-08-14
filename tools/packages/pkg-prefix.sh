@@ -51,4 +51,14 @@ esac
 # shellcheck disable=SC2086 — the package list is deliberately word-split.
 ARCH="$ARCH" "$ROOT_DIR/tools/packages/alpine-fetch.sh" "$PREFIX" $PKGS >&2
 
+# Dated now, not when the package was built.
+#
+# tar restores the archive's timestamps, and an Alpine package built in 2023
+# unpacks a library older than every prerequisite make compares it against. The
+# rule is then out of date the moment it finishes, on every build, forever —
+# which is how twenty-three package rules came to re-extract themselves each
+# time and, through the stamp they feed, drag a five-minute Skia/Dawn rebuild
+# along with them.
+find "$PREFIX" -exec touch {} + 2>/dev/null || true
+
 echo "$PREFIX"

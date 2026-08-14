@@ -4,6 +4,7 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -14,7 +15,42 @@ static int fail(const char *s) {
   return 1;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  /*
+   * The path FreeType opens for itself, which nothing here had ever exercised.
+   *
+   * This test reads the file and hands FreeType the bytes; cairo does not — it
+   * calls FT_New_Face with a file name and lets FreeType open and map it. That
+   * is a different path through the OS, and it is the one that failed: pango
+   * reported "file not found" for a font that fc-match resolved and the shell
+   * could read. Given a path, this checks that path and says what FreeType
+   * made of it.
+   */
+  if (argc > 1) {
+    FT_Library l;
+    FT_Face f;
+    int err;
+
+    if (FT_Init_FreeType(&l))
+      return fail("M51-GFX: fail freetype-path (init)\n");
+    err = FT_New_Face(l, argv[1], 0, &f);
+    if (err) {
+      char line[128];
+
+      snprintf(line, sizeof(line),
+               "M51-GFX: fail freetype-path (FT_New_Face=%d) %s\n", err,
+               argv[1]);
+      mark(line);
+      return 1;
+    }
+    if (FT_Set_Pixel_Sizes(f, 0, 24) || FT_Load_Char(f, 'A', FT_LOAD_RENDER))
+      return fail("M51-GFX: fail freetype-path (render)\n");
+    FT_Done_Face(f);
+    FT_Done_FreeType(l);
+    mark("M51-GFX: ok freetype-path\n");
+    return 0;
+  }
+
   int fd = open("/share/fonts/B1nixMono-Regular.ttf", O_RDONLY);
   if (fd < 0)
     return fail("M51-GFX: fail freetype (open)\n");

@@ -20,6 +20,7 @@
  * could not be compiled at all. See the note in <lkpi/env.h>.
  */
 
+#include <stdio.h>
 #include <string.h>
 #include <lkpi/drm_bridge.h>
 #include <b1nix/console.h>
@@ -30,6 +31,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/vfs.h>
 #include <lkpi/drmdev.h>
+#include <lkpi/env.h>
 
 static struct vfs_node *card1_node;
 
@@ -57,7 +59,48 @@ static int card1_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
 static int card1_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   if (!h || !h->private_data)
     return -EBADF;
+  int watch_commit = ((request & 0xffffffffu) == 0xc03864bcu &&
+                      bootinfo_has_flag("b1nix.drm-debug"));
+  extern void lkpi_i915_dump_port_state_pub(void) __attribute__((weak));
+
+  if (watch_commit && lkpi_i915_dump_port_state_pub) {
+    console_write("drm: before atomic commit:\n");
+    lkpi_i915_dump_port_state_pub();
+  }
+
+  u64 t0 = lkpi_monotonic_ns();
+  /* An ioctl that never returns prints nothing at all, and "the compositor is
+   * idle" and "the compositor is stuck inside the driver" look identical from
+   * the log. The watchdog thread reports the difference. */
+  lkpi_diag_watch_begin("drm ioctl", request & 0xffffffffu);
   isize rc = lkpi_drm_ioctl(h->private_data, request, arg);
+  lkpi_diag_watch_end();
+  /* Name any call that takes longer than a person would wait for a keypress.
+   * Connector probing on this machine costs minutes somewhere, and knowing
+   * which command spends them is the whole question. */
+  {
+    u64 ms = (lkpi_monotonic_ns() - t0) / 1000000ull;
+
+    if (ms >= 200) {
+      char line[96];
+
+      snprintf(line, sizeof(line), "drm: ioctl %x took %llu ms\n",
+               (unsigned)(request & 0xffffffffu), (unsigned long long)ms);
+      console_write(line);
+    }
+  }
+  /* The display's registers at the instant an atomic commit returns.
+   *
+   * A commit that reports success and leaves every transcoder disabled is the
+   * whole question here, and a periodic dump cannot answer it: the pipe may be
+   * enabled and torn down again between two samples. */
+  if (watch_commit) {
+    console_write("drm: after atomic commit:\n");
+    if (lkpi_i915_dump_port_state_pub)
+      lkpi_i915_dump_port_state_pub();
+    else
+      console_write("drm: (no i915 dump in this build)\n");
+  }
   /* The core returns a long; b1nix's ioctl is an int. Every DRM ioctl returns
    * 0 or a negative errno, so nothing is lost — but clamp rather than truncate,
    * so a value that did not fit could never arrive as a plausible success. */
@@ -123,6 +166,7 @@ int drm_card1_open(int flags) {
   }
   h->node = vfs_node_get(card1_node);
   h->private_data = file;
+  lkpi_drm_file_set_handle(file, h);
   h->ops = &card1_ops;
   h->flags = flags;
 
@@ -158,6 +202,28 @@ static struct {
 	char path[24];
 } g_cards[DRM_IMPORTED_MAX];
 static unsigned g_card_count;
+
+/* The node published for an imported device's minor, or NULL. */
+struct vfs_node *drm_card_node_for_minor(u32 minor) {
+  for (unsigned i = 0; i < g_card_count; i++)
+    if (g_cards[i].minor == minor)
+      return g_cards[i].node;
+  return 0;
+}
+
+/* Make a descriptor the DRM core created for itself behave as the card it came
+ * from: same node, so it stats as that device, and the same file operations, so
+ * ioctls reach the driver. With the node alone it identified correctly and then
+ * failed every ioctl, which reads as a device with no capabilities. */
+void drm_card_attach_handle(struct vfs_handle *h, u32 minor) {
+  struct vfs_node *node = drm_card_node_for_minor(minor);
+
+  if (!h || !node || h->node)
+    return;
+  h->node = vfs_node_get(node);
+  h->ops = &card1_ops;
+}
+
 
 /* The card whose node matches this path, or NULL. */
 static int card_index_for_path(const char *path) {
@@ -195,6 +261,7 @@ int drm_imported_card_open(const char *path, int flags) {
   }
   h->node = vfs_node_get(g_cards[idx].node);
   h->private_data = file;
+  lkpi_drm_file_set_handle(file, h);
   h->ops = &card1_ops;
   h->flags = flags;
 
@@ -218,6 +285,17 @@ void drm_card1_init(void) {
   struct vfs_node *dir = vfs_add_node("/dev/dri", VFS_DIRECTORY, 0, 0, 0);
   if (dir && !IS_ERR(dir))
     vfs_node_put(dir);
+
+  /*
+   * Called a second time once the real root is mounted, for the same reason
+   * fb_dev_init and input_init are: nodes created during early boot live on the
+   * initramfs root, which stops being reachable when "/" redirects to the ext4
+   * filesystem. Start the registry over so the cards keep the names they had —
+   * appending instead would publish the same devices again as card3 and card4,
+   * and leave nothing at all where userspace looks for them.
+   */
+  g_card_count = 0;
+  card1_node = 0;
 
   unsigned devices = lkpi_drm_device_count();
 
@@ -246,6 +324,12 @@ void drm_card1_init(void) {
       continue;
     }
     node->inode->mode = 0600;
+    /* DRM's device numbers, which is how a program tells a card from anything
+     * else: seatd classifies a device by major before agreeing to open it, and
+     * card0 above carries the same. inode->rdev is what fstat reports as
+     * st_rdev. */
+    node->inode->rdev = ((u64)226 << 8) | (u64)num;
+    drm_sysfs_publish_card(num);
     node->inode->mmap_handle_page_phys_cb = card1_mmap_page_phys;
     g_cards[g_card_count].node = node;
     g_cards[g_card_count].minor = minor;

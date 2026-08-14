@@ -2266,7 +2266,7 @@ static int devpts_lookup(struct vfs_node *dir, const char *name) {
   n->inode->fs_id = DEVPTS_FSID;
   n->inode->dev = DEVPTS_FSID; /* stat() and ttyname() must agree on st_dev */
   n->inode->ino = devpts_ino(idx);
-  n->inode->data = (void *)(usize)(((u64)136 << 8) | (u64)idx); /* pts rdev */
+  n->inode->rdev = ((u64)136 << 8) | (u64)idx;
   n->parent = dir;
   n->refcount++;
   vfs_attach_child(dir, n);
@@ -2369,6 +2369,7 @@ void vfs_init(void) {
 extern void fb_dev_init(void);
 extern void input_init(void);
 extern void drm_dev_init(void);
+extern void drm_card1_init(void);
 extern void virtio_gpu_dev_init(void);
 extern void sound_module_dev_init(void);
 extern void ac97_dev_init(void);
@@ -2480,6 +2481,7 @@ void vfs_repopulate_after_root_mount(void) {
   fb_dev_init();
   input_init();
   drm_dev_init();
+  drm_card1_init(); /* /dev/dri/card1.. — the imported core's devices */
   virtio_gpu_dev_init();
 
   /* Sound device nodes (/dev/dsp, /dev/dsp1) created by hda_init/ac97_init
@@ -3667,6 +3669,15 @@ struct vfs_node *vfs_find_node_by_fd(int fd) {
   struct vfs_handle *h = get_handle(fd);
   if (!h || h->kind != VFS_HANDLE_NODE)
     return ERR_PTR(-EBADF);
+  /* A node-kind handle need not have a node: the imported DRM core hands out
+   * descriptors that carry their object in private_data and nothing else (see
+   * lkpi_handle_alloc). Returning the NULL walked straight into a dereference —
+   * and because the low physical memory is mapped, reading through it did not
+   * even fault where it happened: it read the BIOS interrupt table and used
+   * that as a pointer, which is how an fstat on a compositor's descriptor
+   * became a general-protection fault. */
+  if (!h->node)
+    return ERR_PTR(-EBADF);
   return h->node;
 }
 
@@ -3882,7 +3893,7 @@ static int vfs_stat_node(struct vfs_node *node, struct b1nix_stat *st) {
    * inside its own mount callback left these nodes unstamped. */
   st->st_dev = vfs_node_dev(node);
   if (inode->type == VFS_DEVICE) {
-    st->st_rdev = (u64)inode->data;
+    st->st_rdev = inode->rdev;
   }
   vfs_inode_unlock_read(inode);
   return 0;
@@ -4574,6 +4585,18 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
     st->st_blksize = 512;
     return 0;
   }
+  /* Descriptors with no node of their own — the imported DRM core's objects,
+   * which Linux backs with an anonymous inode. fstat on one has to work: a
+   * compositor stats every descriptor it is handed, and an error here reads as
+   * a broken device rather than as an object that simply has no name. */
+  if (ph && ph->kind == VFS_HANDLE_NODE && !ph->node) {
+    memset(st, 0, sizeof(*st));
+    st->st_mode = B1NIX_S_IFREG | 0600;
+    st->st_nlink = 1;
+    st->st_blksize = 512;
+    return 0;
+  }
+
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);

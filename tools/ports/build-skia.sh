@@ -191,7 +191,64 @@ echo "Building libskia.a and modules (cross-compilation, static)..." >&2
   libskia.a skottie sksg skresources jsonreader skshaper skunicode_core skunicode_icu icu icu_bidi 2>&1
 
 # Build Dawn separately if patches exist (CMake → libdawn_combined.a)
-if [ -d "$SKIA_DIR/third_party/externals/dawn" ]; then
+#
+# Once, not on every build.
+#
+# The rebuild below throws away CMake's cache and reconfigures from scratch,
+# which costs five minutes — and it was being paid by every invocation of make,
+# including ones with nothing to do, because a stale-forever package rule kept
+# bumping this script's prerequisites. That is 78% of the edit-build-run loop
+# spent on a WebGPU implementation that neither the smoke suite nor the display
+# work links against (skia_use_dawn is false above).
+#
+# Rebuilt when the artifact is missing, when this script is newer than it — the
+# flags that need the cache thrown away live here — or on request.
+dawn_needs_build() {
+  [ -n "${B1NIX_REBUILD_DAWN:-}" ] && return 0
+  [ -f "$SKIA_OUT/libdawn_combined.a" ] || return 0
+  [ "$0" -nt "$SKIA_OUT/libdawn_combined.a" ] && return 0
+  return 1
+}
+if [ -d "$SKIA_DIR/third_party/externals/dawn" ] && ! dawn_needs_build; then
+  echo "Dawn: up to date ($SKIA_OUT/libdawn_combined.a); B1NIX_REBUILD_DAWN=1 forces a rebuild" >&2
+elif [ -d "$SKIA_DIR/third_party/externals/dawn" ]; then
+  #
+  # The externals have to match what DEPS pins, or Dawn does not compile.
+  #
+  # Skia and Dawn pin SPIRV-Headers and SPIRV-Tools as a matching pair — both
+  # name 29981f65 and 0d6fd73c — and this checkout had drifted from both: older
+  # headers, and tools from somewhere else entirely. Tint's SPIR-V writer then
+  # failed on nine identifiers the older headers predate (SPV_KHR_cooperative_matrix
+  # and SPV_KHR_maximal_reconvergence), and `|| echo WARNING` hid it for as long
+  # as it has been there.
+  #
+  # Patching the headers is not the fix and updating only one of the two is
+  # worse: the pair is coupled through the grammar the tools generate their
+  # tables from, so newer headers alone break SPIRV-Tools on an enumerant that
+  # was renamed (LongConstantCompositeINTEL). Both are checked out at the
+  # revision DEPS names, and nothing is disabled — the SPIR-V writer builds,
+  # which is what Vulkan will need.
+  #
+  sync_external() {
+    _dir="$SKIA_DIR/third_party/externals/$1"
+    _rev="$2"
+    [ -d "$_dir/.git" ] || return 0
+    [ "$(git -C "$_dir" rev-parse HEAD 2>/dev/null)" = "$_rev" ] && return 0
+    echo "Syncing $1 to the revision DEPS pins ($2)..." >&2
+    git -C "$_dir" fetch --depth=50 origin "$_rev" >/dev/null 2>&1 || true
+    git -C "$_dir" checkout -q "$_rev" || {
+      echo "ERROR: cannot check out $1 at $_rev" >&2
+      exit 1
+    }
+  }
+  sync_external spirv-headers 29981f65241605e08b0ede4cfeb999fe3b723c6a
+  sync_external spirv-tools   0d6fd73ca73830ccab5fa1f00ed5ed40124e2c55
+
+  # The build directory keeps CMake's cache, and option() defaults never
+  # override a cached value — which is how a configuration nobody asked for
+  # survives a flag change. Configured from scratch so the flags below decide.
+  rm -rf "$SKIA_OUT/cmake_dawn"
+
   echo "Building Dawn (CMake → libdawn_combined.a)..." >&2
   python3 "$SKIA_DIR/third_party/dawn/build_dawn.py" \
     --cc="$CROSS_CC" --cxx="$CROSS_CC" \
@@ -202,7 +259,7 @@ if [ -d "$SKIA_DIR/third_party/externals/dawn" ]; then
     --build_dir="$SKIA_OUT/cmake_dawn" \
     --is_clang --build_type=Release \
     --dawn_enable_opengles=true --dawn_enable_vulkan=false \
-    2>&1 || echo "WARNING: Dawn build failed" >&2
+    2>&1
 fi
 
 if [ ! -f "$SKIA_OUT/libskia.a" ]; then

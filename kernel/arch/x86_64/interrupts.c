@@ -18,6 +18,7 @@ void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/ptrace.h>
 #include <b1nix/rseq.h>
 #include <b1nix/sched.h>
+#include <b1nix/vfs.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/serial_tty.h>
 #include <b1nix/watchdog.h>
@@ -740,12 +741,23 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
    * instead of looping forever. Cleared right after the dump, before the
    * (fault-safe) signal logic, so sequential faults from different processes
    * don't trip it. */
-  static volatile int in_fault_dump;
-  if (in_fault_dump) {
+  /* Per-CPU, because a fault on another CPU is not a nested one.
+   *
+   * With one flag for the whole machine, an ordinary ring-3 fault taken on a
+   * second CPU while this one was printing counted as a recursion and brought
+   * the kernel down — two userspace programs crashing at the same time is not a
+   * kernel fault, and on an SMP boot with several processes it happens easily.
+   */
+  static volatile int in_fault_dump[MAX_CPUS];
+  u32 dump_cpu = get_percpu()->cpu_id;
+
+  if (dump_cpu >= MAX_CPUS)
+    dump_cpu = 0;
+  if (in_fault_dump[dump_cpu]) {
     console_write("\n[nested fault while dumping exception — aborting]\n");
     panic("nested exception in fault handler");
   }
-  in_fault_dump = 1;
+  in_fault_dump[dump_cpu] = 1;
   console_write(name);
   console_write("\nvector: 0x");
   console_write_hex64(frame->vector);
@@ -846,6 +858,110 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   arch_backtrace(frame->rbp, frame->rip);
 
   if (frame->cs == 0x1B || frame->cs == 0x23) {
+    /* Which mapping the faulting address is in, by name and offset.
+     *
+     * Everything a dynamic program runs lives above 0x700000000000, so a raw
+     * user rip identifies nothing: the loader, libc and every library share the
+     * same neighbourhood. The mapping knows which file it came from, and the
+     * offset is what a symbol table on the host can be asked about. */
+    struct task *ft = current_task;
+
+    for (struct vm_area *v = ft ? ft->vma_list : 0; v; v = v->next) {
+      if (frame->rip < v->start || frame->rip >= v->end)
+        continue;
+      console_write("\nrip in mapping ");
+      console_write(v->node && v->node->name[0] ? v->node->name : "<anonymous>");
+      console_write(" + 0x");
+      console_write_hex64(frame->rip - v->start + (u64)v->offset);
+      console_write(" (base 0x");
+      console_write_hex64(v->start);
+      console_write(")\n");
+      break;
+    }
+
+    /*
+     * What the registers were pointing at.
+     *
+     * A fault on a null pointer says which field was read, not why it was null.
+     * The structure it came from is still there, in a register, and its bytes
+     * are the evidence: all-zero says the memory was replaced wholesale — a
+     * page that lost its contents — while plausible-looking values with one
+     * field wrong says something wrote through it. The mapping name says which
+     * of the two the kernel could be responsible for.
+     */
+    {
+      static const char *const names[] = {"rax", "rbx", "rcx", "rdx",
+                                          "rsi", "rdi", "r8",  "r9"};
+      const u64 vals[] = {frame->rax, frame->rbx, frame->rcx, frame->rdx,
+                          frame->rsi, frame->rdi, frame->r8,  frame->r9};
+
+      for (unsigned i = 0; i < sizeof(vals) / sizeof(vals[0]); i++) {
+        u64 a = vals[i] & ~7ULL;
+        struct vm_area *hit = 0;
+
+        if (a < 0x1000)
+          continue;
+        for (struct vm_area *v = ft ? ft->vma_list : 0; v; v = v->next) {
+          if (a >= v->start && a + 32 <= v->end) {
+            hit = v;
+            break;
+          }
+        }
+        if (!hit || !(paging_leaf_pte(a) & 1))
+          continue;
+        console_write(names[i]);
+        console_write(" -> ");
+        console_write(hit->node && hit->node->name[0] ? hit->node->name
+                                                      : "<anonymous>");
+        console_write(":");
+        for (unsigned k = 0; k < 4; k++) {
+          console_write(" 0x");
+          console_write_hex64(((const u64 *)(usize)a)[k]);
+        }
+        console_write("\n");
+      }
+    }
+
+    /*
+     * The whole map, once, when a user program dies.
+     *
+     * A single mapping names the code that faulted only when it is file-backed,
+     * and a dynamic loader leaves plenty that is not. The neighbours identify it
+     * instead: the library above and below are named, and the offset into the
+     * region is what a symbol table on the other side resolves.
+     */
+    {
+      unsigned shown = 0;
+
+      console_write("brk heap: 0x");
+      console_write_hex64(ft ? ft->heap_start : 0);
+      console_write("-0x");
+      console_write_hex64(ft ? ft->user_brk : 0);
+      console_write("\nmappings:\n");
+      /* All of them, and with their protection.
+       *
+       * Forty-eight was enough to name a faulting library and not enough to
+       * show the heap: a dynamic program has well over a hundred mappings and
+       * the interesting ones — the brk heap, the guard page musl puts in front
+       * of its allocator metadata — sit at the end of the list. The prot bits
+       * are here because two VMAs covering one address is a bug this list is
+       * the only witness to. */
+      for (struct vm_area *v = ft ? ft->vma_list : 0; v && shown < 600;
+           v = v->next, shown++) {
+        console_write("  0x");
+        console_write_hex64(v->start);
+        console_write("-0x");
+        console_write_hex64(v->end);
+        console_write(v->prot & PROT_READ ? " r" : " -");
+        console_write(v->prot & PROT_WRITE ? "w" : "-");
+        console_write(v->prot & PROT_EXEC ? "x" : "-");
+        console_write(v->flags & MAP_SHARED ? "s " : "p ");
+        console_write(v->node && v->node->name[0] ? v->node->name
+                                                  : "<anonymous>");
+        console_write("\n");
+      }
+    }
+
     console_write("\nuserspace stack dump (rsp=0x");
     console_write_hex64(frame->rsp);
     console_write("):");
@@ -932,7 +1048,7 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
 
   /* Diagnostic dump done (it's the only fault-prone part) — clear the guard so
    * the next independent fault dumps normally. */
-  in_fault_dump = 0;
+  in_fault_dump[dump_cpu] = 0;
 
   /* If exception happened in userspace (CS == 0x1B), send signal instead of
    * panic */

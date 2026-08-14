@@ -106,9 +106,13 @@ static void b1nix_gem_free(struct drm_gem_object *obj)
 /* The driver's half of the mmap bridge: which frame backs page `index`. The
  * bridge has already resolved the fake offset to this object and checked the
  * caller is allowed it; all that is left is knowledge only the driver has. */
-static int b1nix_gem_page_phys(struct drm_gem_object *obj, u64 index,
+static int b1nix_gem_page_phys(struct drm_vma_offset_node *node, u64 index,
                                u64 *out_phys)
 {
+	/* This driver embeds the offset node in the object itself, so the node is
+	 * the object. i915 does not — see the note on lkpi_drm_page_fn. */
+	struct drm_gem_object *obj =
+		container_of(node, struct drm_gem_object, vma_node);
 	struct b1nix_gem *bo = to_b1nix_gem(obj);
 
 	if (!bo->pages || index >= (u64)bo->npages)

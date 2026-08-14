@@ -84,6 +84,22 @@ x86_syscall_entry:
     pushq %rbp            /* 8th arg: frame pointer */
     pushq 64(%rbp)        /* 7th arg: arg5 (saved r9) */
 
+    /*
+     * Interrupts on for the body of the call.
+     *
+     * SYSCALL clears IF through IA32_FMASK, and nothing turned it back on — so
+     * every system call ran to completion with interrupts disabled. The kernel
+     * tolerated that because its own blocking paths enable them by hand, but a
+     * driver does not: imported code asks "may I sleep here?", is told no
+     * because interrupts are off, and falls back to polling a timeout that can
+     * never expire, since the timer that advances it is masked. i915 probing a
+     * connector over GMBUS hung exactly there.
+     *
+     * Enabled here, after every register is saved and the kernel stack is
+     * established, and cleared again before SYSRETQ below.
+     */
+    sti
+
     call syscall_dispatch_impl
 
 .global x86_syscall_return

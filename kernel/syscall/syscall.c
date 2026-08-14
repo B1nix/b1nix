@@ -192,6 +192,22 @@ int syscall_copyout(void *user_dst, const void *src, usize size) {
     return -EFAULT;
   }
 
+  /* Every write the kernel makes into a traced process, with its size.
+   *
+   * A heap that fails its own consistency check has had something written
+   * before the block, and the kernel is one of the few writers that can do that
+   * without the program noticing. b1nix.trace-copyout turns this on; it is
+   * paired with the syscall trace, so each write sits under the call that made
+   * it. */
+  extern int syscall_trace_active(void);
+  if (syscall_trace_active()) {
+    char cl[96];
+
+    snprintf(cl, sizeof(cl), "  copyout %p +%llu", user_dst,
+             (unsigned long long)size);
+    klog_debug_category("syscall", cl);
+  }
+
   memcpy(user_dst, src, size);
   return 0;
 }
@@ -3230,6 +3246,48 @@ static u64 sys_getsockaddr(int fd, void *user_addr, usize *user_addrlen,
   return 0;
 }
 
+/*
+ * Do this process's mappings still describe a partition of its address space?
+ *
+ * Two VMAs covering one address is not a cosmetic bookkeeping error: every
+ * lookup takes the first match, so from that moment the kernel answers
+ * questions about that address using whichever mapping happens to be earlier in
+ * the list — the wrong protection, the wrong backing, the wrong lifetime. It
+ * has cost this project a compositor's heap, and it leaves no trace at the
+ * moment it happens.
+ *
+ * Enabled by b1nix.vma-check because it is quadratic in the number of
+ * mappings; a process with a hundred of them pays it on every mmap.
+ */
+static void vma_audit(const char *where) {
+  static int reported;
+  struct task *t = current_task;
+
+  if (reported >= 8 || !t || !bootinfo_has_flag("b1nix.vma-check"))
+    return;
+  for (struct vm_area *a = t->vma_list; a; a = a->next) {
+    for (struct vm_area *b = a->next; b; b = b->next) {
+      if (a->end <= b->start || b->end <= a->start)
+        continue;
+      reported++;
+      console_write("vma-check: ");
+      console_write(where);
+      console_write(" left 0x");
+      console_write_hex64(a->start);
+      console_write("-0x");
+      console_write_hex64(a->end);
+      console_write(" overlaps 0x");
+      console_write_hex64(b->start);
+      console_write("-0x");
+      console_write_hex64(b->end);
+      console_write(" in ");
+      console_write(t->name ? t->name : "?");
+      console_write("\n");
+      return;
+    }
+  }
+}
+
 static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
                     isize offset) {
   if (length == 0)
@@ -3264,6 +3322,23 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
     if (vaddr >= 0x00007FFFFFFFFFFFULL || vaddr + length > 0x00007FFFFFFFFFFFULL)
       return (u64)-EINVAL;
 
+    /* A fixed mapping placed inside the break replaces pages somebody is
+     * using; it is legal, and it is also how live data disappears when the
+     * caller did not mean to hit the heap. */
+    if (bootinfo_has_flag("b1nix.vma-check") && t->heap_start &&
+        vaddr < t->user_brk && vaddr + length > t->heap_start) {
+      console_write("mmap-fixed inside brk: 0x");
+      console_write_hex64(vaddr);
+      console_write("+0x");
+      console_write_hex64((u64)length);
+      console_write(" heap 0x");
+      console_write_hex64(t->heap_start);
+      console_write("-0x");
+      console_write_hex64(t->user_brk);
+      console_write(" ");
+      console_write(t->name ? t->name : "?");
+      console_write("\n");
+    }
     // Unmap existing mapping range
     for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
       vmm_unmap_page(v);
@@ -3452,6 +3527,8 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   if (vma->node && vma->node->inode && vma->node->inode->mmap_range_open_cb)
     vma->node->inode->mmap_range_open_cb(vma->node, (u64)offset, length);
 
+  scheduler_sync_vma_head(t->pml4_phys, t->vma_list);
+  vma_audit("mmap");
   return vaddr;
 }
 
@@ -3482,7 +3559,122 @@ static isize sys_munmap(void *addr, usize length) {
   // 2. Update VMA list using the new robust helper
   vma_delete_range(t, start, end);
 
+  scheduler_sync_vma_head(t->pml4_phys, t->vma_list);
+  vma_audit("munmap");
   return 0;
+}
+
+/* An mmap return that is really an errno: the last page of the address space
+ * is not a mapping any caller could have asked for. */
+static int mmap_failed(u64 r) { return r >= (u64)-4095; }
+
+/* Linux mremap flags, as musl passes them. */
+#define MREMAP_MAYMOVE 1
+#define MREMAP_FIXED   2
+
+/*
+ * mremap(old, old_len, new_len, flags, new_addr) — resize a mapping.
+ *
+ * musl's realloc reaches for this on every block large enough to have been
+ * mmap'd rather than taken from a bin, and returns failure when the call does:
+ * without it, no program can grow a large buffer. That is not an abstract gap —
+ * it is why bpkg could unpack a small package and not a two-megabyte one, and
+ * why the failure looked like a corrupt download rather than a missing syscall.
+ *
+ * Shrinking releases the tail in place. Growing — with MREMAP_MAYMOVE, which is
+ * what a libc asks for — takes a fresh mapping, copies the contents over and
+ * releases the original. The copy goes through the user-access helpers rather
+ * than a bare memcpy: the source pages may still be lazily unmapped, and this is
+ * the path that knows how to fault them in.
+ *
+ * MREMAP_FIXED is refused. It moves a mapping onto an address of the caller's
+ * choosing, unmapping whatever was there, and nothing here needs it — better a
+ * clear EINVAL than a half-implementation that silently loses a mapping.
+ */
+static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
+                      void *new_addr) {
+  (void)new_addr;
+  struct task *t = current_task;
+  u64 old_start = (u64)(usize)old_addr;
+
+  if (!t)
+    return (u64)-ESRCH;
+  /* Diagnostic: refuse the call entirely. A libc that cannot resize a mapping
+   * copies through malloc instead, which is slower and completely independent
+   * of this code — so a fault that survives the flag is not this syscall's. */
+  if (bootinfo_has_flag("b1nix.no-mremap"))
+    return (u64)-ENOSYS;
+  if ((old_start & (PAGE_SIZE - 1)) != 0 || new_len == 0)
+    return (u64)-EINVAL;
+  if (flags & ~(MREMAP_MAYMOVE))
+    return (u64)-EINVAL;
+
+  old_len = (old_len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  new_len = (new_len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  if (old_len == 0)
+    return (u64)-EINVAL;
+
+  /* The range has to be one mapping of this process, whole. A request spanning
+   * two mappings, or part of none, is a caller error rather than something to
+   * guess at. */
+  struct vm_area *vma = t->vma_list;
+  while (vma && !(vma->start <= old_start && vma->end >= old_start + old_len))
+    vma = vma->next;
+  if (!vma)
+    return (u64)-EFAULT;
+
+  if (new_len == old_len)
+    return old_start;
+
+  if (new_len < old_len) {
+    isize rc = sys_munmap((void *)(usize)(old_start + new_len),
+                          old_len - new_len);
+    return rc < 0 ? (u64)rc : old_start;
+  }
+
+  /*
+   * Growing always moves.
+   *
+   * Extending in place looks cheaper, and it is — but the extension is a second
+   * mapping abutting the first, and every later call that names the whole range
+   * (mremap again, or munmap) has to find one mapping covering it. Shrinking a
+   * grown buffer failed with EFAULT for exactly that reason. One mapping per
+   * allocation is the invariant worth keeping; the copy is the price.
+   */
+  if (!(flags & MREMAP_MAYMOVE))
+    return (u64)-ENOMEM;
+
+  u64 fresh = sys_mmap(0, new_len, (int)vma->prot,
+                       MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  if (mmap_failed(fresh))
+    return fresh;
+
+  /* Copied in chunks through a kernel bounce buffer. Both ends are user
+   * addresses of the running process, so this is two halves of one copy rather
+   * than a single memcpy — the helpers are what validate the pages and fault in
+   * the ones that were never touched. */
+  usize chunk = 64 * 1024;
+  void *tmp = kmalloc(chunk);
+  if (!tmp) {
+    (void)sys_munmap((void *)(usize)fresh, new_len);
+    return (u64)-ENOMEM;
+  }
+  for (usize off = 0; off < old_len;) {
+    usize n = old_len - off;
+    if (n > chunk)
+      n = chunk;
+    if (syscall_copyin(tmp, (const void *)(usize)(old_start + off), n) != 0 ||
+        syscall_copyout((void *)(usize)(fresh + off), tmp, n) != 0) {
+      kfree(tmp);
+      (void)sys_munmap((void *)(usize)fresh, new_len);
+      return (u64)-EFAULT;
+    }
+    off += n;
+  }
+  kfree(tmp);
+
+  (void)sys_munmap((void *)(usize)old_start, old_len);
+  return fresh;
 }
 
 /* Serialize the address-space mutators (mmap / munmap / mprotect) across all
@@ -3554,6 +3746,8 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
     vma = vma->next;
   }
 
+  scheduler_sync_vma_head(t->pml4_phys, t->vma_list);
+  vma_audit("mprotect");
   return 0;
 }
 
@@ -3587,8 +3781,24 @@ static isize sys_madvise(void *addr, usize length, int advice) {
     /* Accepted hints b1nix does not act on (no prefetch, no fork-inherit
      * control, no transparent hugepages) — legal POSIX no-op. */
     return 0;
-  case MADV_DONTNEED:
   case MADV_FREE:
+    /*
+     * A hint, and only a hint.
+     *
+     * MADV_FREE says the caller no longer needs the contents *and will not be
+     * surprised if they survive*: the kernel may reclaim the pages when it is
+     * short of memory, and any write before that cancels the offer. Discarding
+     * them immediately — which is what this used to do, by falling through to
+     * MADV_DONTNEED — is a different promise, and a caller that reads back what
+     * it just told us it might not need gets zeros instead of its data.
+     *
+     * b1nix has no lazy-reclaim queue, so the honest implementation of the hint
+     * is to keep the pages. The memory is still accounted to the process and
+     * still freed by munmap; only the opportunistic reclaim is missing, which
+     * costs footprint rather than correctness.
+     */
+    return 0;
+  case MADV_DONTNEED:
     break;
   default:
     return -EINVAL;
@@ -3797,6 +4007,15 @@ static u64 sys_brk(u64 addr) {
     u64 new_brk_page_end = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
     for (u64 v = old_brk_page_end; v < new_brk_page_end; v += PAGE_SIZE) {
+      /* Never over a page that is already there.
+       *
+       * A fresh frame here destroys whatever the page held, and "already
+       * mapped" is not a hypothetical: the break is shared by every thread of
+       * the process, so two of them growing it can each believe the range is
+       * new. Mapping only what is genuinely absent makes the race harmless
+       * instead of silently fatal. */
+      if (paging_leaf_pte(v) & 1)
+        continue;
       u64 frame = pmm_alloc_frame();
       if (!frame) {
         return t->user_brk; // ENOMEM
@@ -3817,18 +4036,99 @@ static u64 sys_brk(u64 addr) {
     }
   }
 
+  u64 old_brk = t->user_brk;
+
   t->user_brk = addr;
 
-  // Update heap VMA
-  struct vm_area *vma = t->vma_list;
-  while (vma) {
-    if (vma->start == t->heap_start) {
-      vma->end = t->user_brk;
-      break;
+  /*
+   * Describe the break as mappings, without assuming it is one of them.
+   *
+   * It used to find "the heap VMA" by its start address and stretch that to the
+   * new break. musl puts a guard page at the very front of the break — an
+   * mmap(PROT_NONE, MAP_FIXED) at exactly heap_start — and from then on the VMA
+   * starting there is the guard. Growing the break then stretched *that* over
+   * the whole heap: a PROT_NONE mapping covering live data, overlapping the
+   * real heap mapping still inside it.
+   *
+   * Everything downstream reads a range's properties off the first VMA that
+   * covers it, so from that moment the heap was, to the rest of the kernel, an
+   * inaccessible lazy anonymous region — and a fault in it was answered with a
+   * fresh zero page. That is how a compositor's allocator metadata came to be
+   * zeroed while it was still in use.
+   *
+   * So: on growth, cover only what is not already covered by somebody else; on
+   * shrink, remove exactly what was given back. Several VMAs describing one
+   * break is not a problem — nothing requires it to be a single mapping.
+   */
+  if (addr > old_brk) {
+    u64 from = (old_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    u64 to = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    while (from < to) {
+      u64 chunk_end = to;
+
+      /* The first mapping that stands in the way bounds this piece. */
+      for (struct vm_area *v = t->vma_list; v; v = v->next) {
+        if (v->end <= from || v->start >= chunk_end)
+          continue;
+        if (v->start <= from) {
+          /* Already described by someone else — skip past it. */
+          from = v->end;
+          chunk_end = from;
+          break;
+        }
+        chunk_end = v->start;
+      }
+      if (from >= chunk_end) {
+        if (from >= to)
+          break;
+        continue;
+      }
+
+      struct vm_area *heap = kzalloc(sizeof(struct vm_area));
+
+      if (!heap)
+        break;
+      heap->start = from;
+      heap->end = chunk_end;
+      heap->prot = PROT_READ | PROT_WRITE;
+      heap->flags = MAP_PRIVATE | MAP_ANONYMOUS;
+      /* In address order, like every other insertion: the list is walked by
+       * address in several places and a front-inserted node breaks them. */
+      {
+        struct vm_area **link = &t->vma_list;
+
+        while (*link && (*link)->start < heap->start)
+          link = &(*link)->next;
+        heap->next = *link;
+        *link = heap;
+      }
+      from = chunk_end;
     }
-    vma = vma->next;
+  } else if (addr < old_brk) {
+    u64 from = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    u64 to = (old_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    if (from < to)
+      vma_delete_range(t, from, to);
   }
 
+  /* Every change to the break, when asked. A shrink followed by a growth
+   * hands back pages whose contents are gone, and that is indistinguishable
+   * from corruption to whoever was using them. */
+  if (bootinfo_has_flag("b1nix.vma-check")) {
+    console_write("brk: 0x");
+    console_write_hex64(old_brk);
+    console_write(" -> 0x");
+    console_write_hex64(addr);
+    console_write(addr < old_brk ? " SHRINK " : " grow ");
+    console_write(t->name ? t->name : "?");
+    console_write("\n");
+  }
+  /* And the break belongs to the address space, so every thread sharing it
+   * must see the new value. */
+  scheduler_sync_brk(t->pml4_phys, t->heap_start, t->user_brk);
+  vma_audit("brk");
   return t->user_brk;
 }
 
@@ -3882,6 +4182,12 @@ u32 sched_user_cpu_mask(void) { return g_user_cpu_mask; }
 static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                      u64 arg4, u64 arg5, struct interrupt_frame *frame);
 
+/* Set while a traced task is inside a system call, so the copy helpers can
+ * report what they wrote without each of them re-reading the command line. */
+static int g_trace_in_call;
+
+int syscall_trace_active(void) { return g_trace_in_call; }
+
 static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
                                    u64 arg3, u64 arg4, u64 arg5,
                                    struct interrupt_frame *frame);
@@ -3921,7 +4227,105 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
     arg5 = frame->r9;
   }
 
+  /*
+   * Every call one process makes, when asked.
+   *
+   * b1nix.debug=syscall turns it on and b1nix.trace-task=<substring> chooses
+   * whose calls to print — tracing everything drowns the serial line and
+   * changes the timing of what is being investigated. Written for hunting a
+   * corrupted heap: the interesting evidence is the call that wrote to user
+   * memory just before a libc's own consistency check fired.
+   */
+  int trace_this = 0;
+  /* Resolved once. The gate is on the hot path of every system call, and both
+   * the category check and the filter parse the kernel command line. */
+  static int trace_enabled = -1;
+  static char want[32];
+
+  if (trace_enabled < 0) {
+    trace_enabled = klog_debug_enabled("syscall") &&
+                    bootinfo_get_kv("b1nix.trace-task", want, sizeof(want));
+  }
+
+  if (frame && current_task && trace_enabled) {
+    {
+      const char *nm = current_task->name ? current_task->name : "";
+
+      /* A comma-separated list, because a process and the threads it creates
+       * carry different names and the interesting sequence spans both. */
+      for (usize p = 0; want[p] && !trace_this;) {
+        usize e = p;
+
+        while (want[e] && want[e] != ',')
+          e++;
+        for (usize i = 0; nm[i] && !trace_this; i++)
+          if (strncmp(nm + i, want + p, e - p) == 0)
+            trace_this = 1;
+        p = want[e] ? e + 1 : e;
+      }
+    }
+  }
+
+  /*
+   * A watch on one user address, checked either side of the call.
+   *
+   * b1nix.watch-user=<hex> names it. Written to catch the syscall that damages
+   * a libc global — the corruption shows up much later, inside the allocator,
+   * and by then nothing says who wrote it. Only traced tasks pay for this.
+   */
+  u64 watch_addr = 0, watch_before = 0;
+
+  if (trace_this) {
+    char w[24];
+
+    if (bootinfo_get_kv("b1nix.watch-user", w, sizeof(w))) {
+      for (const char *c = w; *c; c++) {
+        u64 d;
+
+        if (*c >= '0' && *c <= '9') d = (u64)(*c - '0');
+        else if (*c >= 'a' && *c <= 'f') d = (u64)(*c - 'a' + 10);
+        else if (*c >= 'A' && *c <= 'F') d = (u64)(*c - 'A' + 10);
+        else break;
+        watch_addr = watch_addr * 16 + d;
+      }
+      if (watch_addr &&
+          syscall_copyin(&watch_before, (void *)(usize)watch_addr, 8) != 0)
+        watch_addr = 0;
+    }
+  }
+
+  g_trace_in_call = trace_this && bootinfo_has_flag("b1nix.trace-copyout");
   u64 ret = syscall_dispatch_impl_inner(number, arg0, arg1, arg2, arg3, arg4, arg5, frame);
+  g_trace_in_call = 0;
+
+  if (watch_addr) {
+    u64 after = 0;
+
+    if (syscall_copyin(&after, (void *)(usize)watch_addr, 8) == 0 &&
+        after != watch_before) {
+      char wl[160];
+
+      snprintf(wl, sizeof(wl),
+               "WATCH pid=%u nr=%llu changed 0x%llx: %llx -> %llx",
+               (unsigned)current_task->id, (unsigned long long)number,
+               (unsigned long long)watch_addr,
+               (unsigned long long)watch_before, (unsigned long long)after);
+      klog_debug_category("syscall", wl);
+    }
+  }
+
+  if (trace_this) {
+    char line[192];
+
+    snprintf(line, sizeof(line),
+             "pid=%u nr=%llu (%llx, %llx, %llx, %llx, %llx, %llx) = %llx",
+             (unsigned)current_task->id, (unsigned long long)number,
+             (unsigned long long)arg0, (unsigned long long)arg1,
+             (unsigned long long)arg2, (unsigned long long)arg3,
+             (unsigned long long)arg4, (unsigned long long)arg5,
+             (unsigned long long)ret);
+    klog_debug_category("syscall", line);
+  }
 
   if (frame) {
     if (klog_debug_enabled("signal") && current_task &&
@@ -4864,12 +5268,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
          * CLONE_CHILD_CLEARTID.
          * The "entry" is the user_stack itself (musl sets up the stack to
          * return to pthread_start), arg is 0 (already on the stack). */
+        /*
+         * The caller's flags, exactly as given.
+         *
+         * A pointer argument is not a request to write through it: Linux writes
+         * the new thread's id into child_tidptr only for CLONE_CHILD_SETTID,
+         * and musl asks for CLONE_CHILD_CLEARTID instead — passing
+         * &__thread_list_lock, one of libc's own globals, as that pointer. So
+         * inferring SETTID from "the pointer is non-NULL" stamped a thread id
+         * over musl's thread-list lock on every pthread_create. The damage
+         * surfaced far away, as a heap consistency check firing inside free(),
+         * because that is where the wreckage was next touched.
+         */
         u64 b1nix_flags = flags;
-        /* Add CLONE_PARENT_SETTID and CLONE_CHILD_SETTID if not already set. */
-        if (parent_tid)
-          b1nix_flags |= 0x100000; /* CLONE_PARENT_SETTID */
-        if (child_tid)
-          b1nix_flags |= 0x1000000; /* CLONE_CHILD_SETTID */
         /* M92: musl's __clone stores the start_routine pointer in r9 before
          * calling syscall. The child expects to resume at the parent's RIP
          * (right after the syscall instruction in musl __clone), with rax=0
@@ -6772,6 +7183,14 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     task_rss_sample(current_task, 0);
     vma_mutator_lock();
     u64 r = (u64)sys_munmap((void *)(usize)arg0, (usize)arg1);
+    vma_mutator_unlock();
+    return r;
+  }
+  case SYS_MREMAP: {
+    task_rss_sample(current_task, 0);
+    vma_mutator_lock();
+    u64 r = sys_mremap((void *)(usize)arg0, (usize)arg1, (usize)arg2, (int)arg3,
+                       (void *)(usize)arg4);
     vma_mutator_unlock();
     return r;
   }

@@ -2,6 +2,7 @@
 #include <b1nix/fw_cfg.h>
 #include <b1nix/io.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/edid_builtin.h>
 #include <b1nix/console.h>
 #include <b1nix/ftrace.h>
 #include <b1nix/gdbstub.h>
@@ -257,6 +258,36 @@ static struct block_device *find_root_device(const char *root_val) {
  * (/bin/selfhost-build). The kernel just mounts the toolchain ext4 and
  * spawns the userspace builder. See userspace/bin/selfhost_build.c. */
 
+/* Repeats the i915 port dump for as long as the machine runs. See the note at
+ * its only caller. */
+static unsigned g_port_watch_period;
+
+static void port_watch_thread(void *arg)
+{
+	extern void lkpi_i915_dump_port_state_pub(void) __attribute__((weak));
+
+	(void)arg;
+	for (;;) {
+		scheduler_sleep_ticks((u64)g_port_watch_period * 100);
+		if (lkpi_i915_dump_port_state_pub)
+			lkpi_i915_dump_port_state_pub();
+	}
+}
+
+/* Names a call into the imported DRM core that has not come back. Its only
+ * caller is the DRM debug path below; see lkpi_diag_watch_report(). */
+static void drm_stuck_watch_thread(void *arg)
+{
+	extern int lkpi_diag_watch_report(u64 min_ms) __attribute__((weak));
+
+	(void)arg;
+	for (;;) {
+		scheduler_sleep_ticks(200); /* two seconds */
+		if (lkpi_diag_watch_report)
+			lkpi_diag_watch_report(4000);
+	}
+}
+
 void kernel_main(usize arg0, usize arg1)
 {
 	serial_init();
@@ -282,6 +313,13 @@ void kernel_main(usize arg0, usize arg1)
 #endif
 
 	console_write("Step 1: Bootinfo parsed\n");
+	/* The command line as the kernel actually received it. Every flag in this
+	 * file is read from it, and a run that behaves as though a flag were absent
+	 * is indistinguishable from a bug in what the flag controls until this is
+	 * on the record. */
+	console_write("cmdline: ");
+	console_write(bootinfo_cmdline() ? bootinfo_cmdline() : "(none)");
+	console_write("\n");
 
 	/* Initialize the BSP per-CPU area (sets the GS base) FIRST: current_task is
 	 * now a per-CPU accessor (get_percpu()->cur_task), and pmm/kheap diagnostics
@@ -418,8 +456,17 @@ void kernel_main(usize arg0, usize arg1)
 	 * that came up first keeps card0, and virtio-gpu is the one M101 is
 	 * proved against.
 	 */
-	if (bootinfo_has_flag("b1nix.drm-debug"))
+	if (bootinfo_has_flag("b1nix.drm-debug")) {
 		__drm_debug = B1NIX_DRM_DEBUG_MASK;
+		if (kthread_create("drm-stuck-watch", drm_stuck_watch_thread, 0) < 0)
+			console_write("drm-stuck-watch: thread refused\n");
+	}
+	/* The atomic and state categories as well, when asked. KMS alone shows what
+	 * a modeset was computed to be; these show what the commit then did with
+	 * it, which is the difference between "the driver planned to enable a pipe"
+	 * and "the driver enabled it". */
+	if (bootinfo_has_flag("b1nix.drm-debug-atomic"))
+		__drm_debug |= 0x04UL | 0x10UL | 0x40UL;
 	i915_module_init();
 	/*
 	 * A synthetic sink, for a machine with nothing plugged in. Attached after
@@ -512,6 +559,120 @@ void kernel_main(usize arg0, usize arg1)
 	 * versions disagree about which one shuts the machine down, so all three
 	 * are tried before falling back to halting.
 	 */
+	/* Defined by the DRM mirror when the imported stack is built in. */
+	extern void lkpi_i915_dump_port_state_pub(void) __attribute__((weak));
+
+	/*
+	 * Stop the CPU with the picture up, and touch nothing further.
+	 *
+	 * The overnight hunt found the monitor lighting in four runs out of 220 —
+	 * and every one of those had panicked during the modeset, leaving the
+	 * machine halted with the display still scanning out. That is the whole
+	 * difference: a kernel that keeps running afterwards has timers, workers
+	 * and connector polling, and the sink never locks. Halting deliberately
+	 * turns that accident into an experiment.
+	 */
+	/* Whether the frame the display is scanning stays as it was written. */
+	{
+		extern void lkpi_i915_crc_watch_pub(unsigned seconds) __attribute__((weak));
+		char cw[8];
+
+		if (lkpi_i915_crc_watch_pub &&
+		    bootinfo_get_kv("b1nix.crc-watch", cw, sizeof(cw))) {
+			unsigned n = 0;
+
+			for (const char *p = cw; *p >= '0' && *p <= '9'; p++)
+				n = n * 10u + (unsigned)(*p - '0');
+			lkpi_i915_crc_watch_pub(n ? n : 60);
+		}
+	}
+
+	/*
+	 * Watch the port while userspace runs.
+	 *
+	 * The display probes above all run before init, which answers what the
+	 * kernel's own client did and nothing about what a compositor does later.
+	 * b1nix.port-watch=<seconds> repeats the port dump from a thread, so a
+	 * modeset issued from userspace — or the absence of one — is visible in the
+	 * same log as the compositor's own messages.
+	 */
+	{
+		char pw[8];
+
+		if (bootinfo_get_kv("b1nix.port-watch", pw, sizeof(pw)) &&
+		    !lkpi_i915_dump_port_state_pub)
+			console_write("port-watch: no i915 dump in this build\n");
+		if (lkpi_i915_dump_port_state_pub &&
+		    bootinfo_get_kv("b1nix.port-watch", pw, sizeof(pw))) {
+			unsigned n = 0;
+
+			for (const char *p = pw; *p >= '0' && *p <= '9'; p++)
+				n = n * 10u + (unsigned)(*p - '0');
+			g_port_watch_period = n ? n : 10;
+			console_write("port-watch: every ");
+			console_write_dec((u64)g_port_watch_period);
+			console_write("s\n");
+			if (kthread_create("port-watch", port_watch_thread, 0) < 0)
+				console_write("port-watch: thread refused\n");
+		}
+	}
+
+	{
+		extern void lkpi_i915_dump_edid_pub(void) __attribute__((weak));
+
+		if (bootinfo_has_flag("b1nix.dump-edid") && lkpi_i915_dump_edid_pub)
+			lkpi_i915_dump_edid_pub();
+	}
+
+	/*
+	 * A compiled-in EDID for one connector, when the wire cannot deliver it.
+	 *
+	 * b1nix.builtin-edid=<connector> installs it and marks the connector
+	 * connected. See <b1nix/edid_builtin.h> for why this machine needs it: the
+	 * bytes are real, read from this monitor, and supplying them costs nothing
+	 * where reading them costs minutes.
+	 */
+	{
+		char want[32];
+
+		if (bootinfo_get_kv("b1nix.builtin-edid", want, sizeof(want)) > 0) {
+			console_write(lkpi_drm_set_connector_edid(want,
+			                                          b1nix_builtin_edid,
+			                                          sizeof(b1nix_builtin_edid))
+			                  ? "drm: built-in EDID applied\n"
+			                  : "drm: built-in EDID not applied\n");
+			console_write(lkpi_drm_force_connector_on(want)
+			              ? "drm: connector forced on\n"
+			              : "drm: connector not forced\n");
+		}
+	}
+
+	if (bootinfo_has_flag("b1nix.gfx-halt")) {
+		console_write("B1NIX-GFX: halting with the frame up\n");
+		for (;;) {
+			interrupts_disable();
+			__asm__ volatile("hlt");
+		}
+	}
+
+	/*
+	 * The same stop, but with interrupts left on.
+	 *
+	 * Halting outright makes the picture appear; a kernel that keeps running
+	 * does not. Between those two lies everything the system does after a
+	 * modeset — timer ticks, the scheduler, and the driver's own workers, of
+	 * which connector polling is the one that touches the display. This idles
+	 * the boot thread while leaving all of that alive, so the two runs differ
+	 * by exactly that and the question can be answered instead of guessed.
+	 */
+	if (bootinfo_has_flag("b1nix.gfx-idle")) {
+		console_write("B1NIX-GFX: idling with the frame up (interrupts on)\n");
+		for (;;) {
+			interrupts_enable();
+			__asm__ volatile("hlt");
+		}
+	}
+
 	if (bootinfo_has_flag("b1nix.gfx-only")) {
 		/*
 		 * Leave the picture on the wire for a while first.
@@ -531,8 +692,24 @@ void kernel_main(usize arg0, usize arg1)
 			if (secs > 600u)
 				secs = 600u;
 			console_write("B1NIX-GFX: holding the frame\n");
-			for (unsigned i = 0; i < secs; i++)
+			for (unsigned i = 0; i < secs; i++) {
 				scheduler_sleep_ticks(100); /* HZ = 100 */
+				/* Every five seconds, so the log shows the hold really
+				 * lasting rather than the loop returning at once — and so a
+				 * person watching the screen knows how long is left. */
+				if ((i % 5u) == 4u) {
+					console_write("B1NIX-GFX: held ");
+					console_write_dec((u64)(i + 1));
+					console_write("s of ");
+					console_write_dec((u64)secs);
+					console_write("s\n");
+				}
+			}
+			/* What the port was doing at the END of the hold, not only at the
+			 * moment of the commit: a link that comes up and then drops looks
+			 * identical to one that never came up, from the commit alone. */
+			if (lkpi_i915_dump_port_state_pub)
+				lkpi_i915_dump_port_state_pub();
 		}
 		console_write("B1NIX-GFX: done\n");
 		outw(0x604, 0x2000);
@@ -806,8 +983,46 @@ void kernel_main(usize arg0, usize arg1)
 				}
 			}
 		} else {
-			rc = vfs_mount("virtio-blk0", "/", "ext4", 0);
+			/*
+			 * No root= on the command line: choose by what the filesystem says
+			 * it is, not by where it happens to be plugged in.
+			 *
+			 * Taking virtio-blk0 unconditionally meant any disk attached for
+			 * any other purpose became the root — a package cache handed to the
+			 * guest for speed was mounted at / and the real filesystem never
+			 * appeared. The label comes first, then the image the boot loader
+			 * handed us, and only then a bare disk.
+			 */
+			rc = -1;
+			{
+				struct block_device *labelled = find_device_by_label("b1nix-root");
+
+				if (labelled) {
+					const char *fs_types[] = {"ext4", "ext3", "ext2"};
+
+					for (int i = 0; i < 3 && rc != 0; i++)
+						rc = vfs_mount(labelled->name, "/", fs_types[i], 0);
+					if (rc == 0) {
+						char buf[96];
+
+						snprintf(buf, sizeof(buf),
+						         "rootfs: %s (label b1nix-root) mounted at /\n",
+						         labelled->name);
+						console_write(buf);
+						vfs_repopulate_after_root_mount();
+					}
+				}
+			}
+			if (rc != 0) {
+				rc = vfs_mount("ram0", "/", "ext4", 0);
+				if (rc == 0) {
+					console_write("rootfs: ram0 mounted at / as ext4\n");
+					vfs_repopulate_after_root_mount();
+				}
+			}
 			if (rc == 0) {
+				/* mounted above */
+			} else if ((rc = vfs_mount("virtio-blk0", "/", "ext4", 0)) == 0) {
 				console_write("rootfs: virtio-blk0 mounted at /\n");
 				vfs_repopulate_after_root_mount();
 			} else {

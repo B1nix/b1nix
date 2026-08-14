@@ -13,6 +13,7 @@
  * build error instead of a silent layout mismatch.
  */
 
+#include <lkpi/env.h>
 #include <b1nix/console.h>
 #include <b1nix/klog.h>
 #include <b1nix/panic.h>
@@ -84,8 +85,14 @@ void lkpi_spin_lock(struct lkpi_spinlock *l)
 	}
 
 	u64 f;
+	/* Note only the transition. A lock taken while interrupts are already off
+	 * did not turn them off, and recording it there buries the site that did. */
+	int was_on = lkpi_irqs_enabled();
+
 	spin_lock_irqsave((spinlock_t *)&l->raw, &f);
 	l->flags = f;
+	if (was_on)
+		lkpi_note_irq_off((u64)(usize)__builtin_return_address(0));
 	l->acquired_at = (u64)(usize)__builtin_return_address(0);
 	l->owner_cpu = cpu;
 }
@@ -134,4 +141,6 @@ void lkpi_spin_unlock(struct lkpi_spinlock *l)
 	l->owner_cpu = -1;
 	l->acquired_at = 0;
 	spin_unlock_irqrestore((spinlock_t *)&l->raw, f);
+	if (lkpi_irqs_enabled())
+		lkpi_note_irq_on();
 }

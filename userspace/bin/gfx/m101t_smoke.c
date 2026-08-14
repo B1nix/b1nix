@@ -150,6 +150,22 @@ int main(void)
 		}
 		crtc_id = crtcs[0];
 		connector_id = connectors[0];
+		/* B1NIX_CONNECTOR names one connector to look at.
+		 *
+		 * Probing every connector costs an EDID read each, and on hardware
+		 * where that falls back to bit-banging the whole sweep takes minutes —
+		 * long enough that the test was killed before it printed anything. */
+		{
+			const char *want = getenv("B1NIX_CONNECTOR");
+
+			if (want && want[0]) {
+				uint32_t id = (uint32_t)strtoul(want, NULL, 10);
+
+				for (uint32_t ci = 0; ci < res.count_connectors; ci++)
+					if (connectors[ci] == id)
+						connector_id = id;
+			}
+		}
 		report("getresources", crtc_id != 0 && connector_id != 0,
 		       (long)res.count_connectors);
 	}
@@ -159,7 +175,7 @@ int main(void)
 	memset(&mode, 0, sizeof(mode));
 	{
 		struct drm_mode_get_connector conn;
-		struct drm_mode_modeinfo modes[16];
+		struct drm_mode_modeinfo modes[64];
 		uint32_t encoders[8];
 		uint32_t props[32];
 		uint64_t prop_values[32];
@@ -178,8 +194,12 @@ int main(void)
 		conn.encoders_ptr = (uint64_t)(uintptr_t)encoders;
 		conn.props_ptr = (uint64_t)(uintptr_t)props;
 		conn.prop_values_ptr = (uint64_t)(uintptr_t)prop_values;
-		if (conn.count_modes > 16)
-			conn.count_modes = 16;
+		/* The kernel copies the mode list only when the caller's buffer can
+		 * hold all of it — asking for fewer returns the count and nothing
+		 * else, which reads as "the modes are all zero" if the caller does not
+		 * notice. */
+		if (conn.count_modes > 64)
+			conn.count_modes = 64;
 		if (conn.count_encoders > 8)
 			conn.count_encoders = 8;
 		if (conn.count_props > 32)
@@ -188,10 +208,200 @@ int main(void)
 			fail("getconnector", errno);
 			goto out;
 		}
+		/* The first few modes as userspace receives them, with the type bits.
+		 * A compositor picks its mode by the PREFERRED bit (0x08); if that bit
+		 * does not survive the trip out of the kernel, it falls back to the
+		 * last mode in the list — 720x400 on a monitor that offers 1920x1080,
+		 * which is exactly what a compositor was seen to commit here. */
+		for (uint32_t mi = 0; mi < conn.count_modes && mi < 3; mi++) {
+			printf("M101T-DRM: mode[%u] %ux%u type %x flags %x\n", mi,
+			       modes[mi].hdisplay, modes[mi].vdisplay, modes[mi].type,
+			       modes[mi].flags);
+		}
+		printf("M101T-DRM: modes total %u\n", conn.count_modes);
+
 		mode = modes[0];
 		report("getconnector",
 		       conn.connection == 1 && mode.hdisplay > 0 && mode.vdisplay > 0,
 		       (long)mode.hdisplay);
+
+		/*
+		 * Does the kernel stay inside the buffer it was given?
+		 *
+		 * The arrays above are on the stack and generously sized, so an
+		 * overrun there damages this program's own frame and may never be
+		 * noticed. A compositor sizes its arrays to the counts the first ioctl
+		 * reported and puts them on the heap, where one byte too many corrupts
+		 * the allocator's metadata — which is what a crash inside malloc()
+		 * immediately after reading a connector looks like.
+		 *
+		 * So: heap buffers of exactly the size asked for, fenced on both sides,
+		 * and the fences checked afterwards.
+		 */
+		{
+			const uint64_t FENCE = 0xFEEDFACEDEADBEEFULL;
+			uint32_t n = conn.count_modes;
+			size_t bytes = (size_t)n * sizeof(struct drm_mode_modeinfo);
+			unsigned char *blk = malloc(bytes + 2 * sizeof(FENCE));
+			struct drm_mode_get_connector probe;
+			int intact = 0;
+
+			if (blk) {
+				uint64_t head = FENCE, tail = FENCE;
+
+				memcpy(blk, &head, sizeof(head));
+				memcpy(blk + sizeof(head) + bytes, &tail, sizeof(tail));
+				memset(&probe, 0, sizeof(probe));
+				probe.connector_id = connector_id;
+				probe.count_modes = n;
+				probe.modes_ptr = (uint64_t)(uintptr_t)(blk + sizeof(head));
+				if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &probe) == 0) {
+					memcpy(&head, blk, sizeof(head));
+					memcpy(&tail, blk + sizeof(FENCE) + bytes, sizeof(tail));
+					intact = (head == FENCE && tail == FENCE);
+				}
+				free(blk);
+			}
+			report("getconnector-bounds", intact, (long)n);
+		}
+	}
+
+	/*
+	 * The same question for every other ioctl that fills a counted array.
+	 *
+	 * GETCONNECTOR is only the one a compositor calls first. Resources,
+	 * properties and planes are all two-pass in the same way, and one of them
+	 * writing a single element too many damages the heap of whoever asked —
+	 * which surfaces later, inside malloc(), with nothing to connect it to the
+	 * driver. Every buffer here is exactly the size the count asked for, with a
+	 * fence on each side.
+	 */
+	{
+		const uint64_t FENCE = 0xFEEDFACEDEADBEEFULL;
+		unsigned char *blocks[8];
+		int nblk = 0, intact = 1, ran = 0;
+		size_t sizes[8];
+
+		/* A fenced block of `bytes`, returning the payload pointer. */
+#define FENCED(bytes)                                                          \
+	({                                                                         \
+		size_t _b = (bytes);                                                   \
+		unsigned char *_p = malloc(_b + 2 * sizeof(FENCE));                    \
+		if (_p) {                                                              \
+			memcpy(_p, &FENCE, sizeof(FENCE));                                 \
+			memcpy(_p + sizeof(FENCE) + _b, &FENCE, sizeof(FENCE));            \
+			blocks[nblk] = _p;                                                 \
+			sizes[nblk] = _b;                                                  \
+			nblk++;                                                            \
+		}                                                                      \
+		_p ? _p + sizeof(FENCE) : NULL;                                        \
+	})
+
+		/* Resources: four arrays, each exactly as long as its count. */
+		struct drm_mode_card_res r;
+
+		memset(&r, 0, sizeof(r));
+		if (nblk == 0 && ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &r) == 0) {
+			void *c = FENCED((size_t)r.count_crtcs * 4);
+			void *n = FENCED((size_t)r.count_connectors * 4);
+			void *e = FENCED((size_t)r.count_encoders * 4);
+			void *f = FENCED((size_t)r.count_fbs * 4);
+
+			r.crtc_id_ptr = (uint64_t)(uintptr_t)c;
+			r.connector_id_ptr = (uint64_t)(uintptr_t)n;
+			r.encoder_id_ptr = (uint64_t)(uintptr_t)e;
+			r.fb_id_ptr = (uint64_t)(uintptr_t)f;
+			if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &r) == 0)
+				ran = 1;
+		}
+
+		/* The connector's properties: ids and values, two arrays of one count. */
+		struct drm_mode_obj_get_properties op;
+
+		memset(&op, 0, sizeof(op));
+		op.obj_id = connector_id;
+		op.obj_type = DRM_MODE_OBJECT_CONNECTOR;
+		if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &op) == 0 &&
+		    op.count_props) {
+			void *ids = FENCED((size_t)op.count_props * 4);
+			void *vals = FENCED((size_t)op.count_props * 8);
+
+			op.props_ptr = (uint64_t)(uintptr_t)ids;
+			op.prop_values_ptr = (uint64_t)(uintptr_t)vals;
+			if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &op) == 0)
+				ran = 1;
+		}
+
+		for (int i = 0; i < nblk; i++) {
+			uint64_t head, tail;
+
+			memcpy(&head, blocks[i], sizeof(head));
+			memcpy(&tail, blocks[i] + sizeof(FENCE) + sizes[i], sizeof(tail));
+			if (head != FENCE || tail != FENCE)
+				intact = 0;
+			free(blocks[i]);
+		}
+#undef FENCED
+		report("ioctl-bounds", ran && intact, (long)nblk);
+	}
+
+	/*
+	 * What libdrm does, done often enough to matter.
+	 *
+	 * A compositor calls drmModeGetConnector for every connector, twice each —
+	 * once for the counts, once for the data — and frees the buffers in
+	 * between. sway crashed inside malloc() immediately after that sequence,
+	 * deterministically, on allocator metadata that had been zeroed. Whatever
+	 * does that is reachable from these calls and nothing else, so this repeats
+	 * them and then exercises the allocator hard enough to trip over the
+	 * damage.
+	 */
+	{
+		int ok = 1;
+
+		for (int round = 0; round < 20 && ok; round++) {
+			struct drm_mode_get_connector c;
+
+			memset(&c, 0, sizeof(c));
+			c.connector_id = connector_id;
+			if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &c) != 0) {
+				ok = 0;
+				break;
+			}
+			void *m = malloc((size_t)c.count_modes * sizeof(struct drm_mode_modeinfo));
+			void *e = malloc((size_t)c.count_encoders * 4);
+			void *pi = malloc((size_t)c.count_props * 4);
+			void *pv = malloc((size_t)c.count_props * 8);
+
+			if (!m || !e || !pi || !pv) {
+				ok = 0;
+			} else {
+				c.modes_ptr = (uint64_t)(uintptr_t)m;
+				c.encoders_ptr = (uint64_t)(uintptr_t)e;
+				c.props_ptr = (uint64_t)(uintptr_t)pi;
+				c.prop_values_ptr = (uint64_t)(uintptr_t)pv;
+				if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &c) != 0)
+					ok = 0;
+			}
+			free(m);
+			free(e);
+			free(pi);
+			free(pv);
+
+			/* Allocator churn across the size classes the calls above use, so
+			 * damaged metadata is walked rather than left sitting. */
+			for (int i = 0; i < 64 && ok; i++) {
+				void *a = malloc(64 + i * 37);
+				void *b = malloc(1024 + i * 13);
+
+				if (!a || !b)
+					ok = 0;
+				memset(a, i, 64 + i * 37);
+				free(a);
+				free(b);
+			}
+		}
+		report("getconnector-churn", ok, 20);
 	}
 
 	/* ── a dumb buffer, mapped ──────────────────────────────────── */

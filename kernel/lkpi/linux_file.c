@@ -22,6 +22,9 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
+#include <linux/printk.h>
+#include <lkpi/env.h>
+#include <lkpi/drmdev.h>
 #include <lkpi/env.h>
 
 /*
@@ -134,10 +137,14 @@ struct file *file_clone_open(struct file *f)
 {
 	if (!f)
 		return 0;
-	/* A second reference to the same object, not a copy: the two descriptors
-	 * must share the driver's private_data, which is the point of cloning. */
-	atomic64_inc(&f->f_count);
-	return f;
+	/* A genuinely separate file, with its own driver state. The lease path
+	 * rewrites the clone's master, so sharing one object would have rewritten
+	 * the original's — see lkpi_drm_clone_file. */
+	struct file *clone = (struct file *)lkpi_drm_clone_file(f);
+
+	if (!clone)
+		return (struct file *)ERR_PTR(-EOPNOTSUPP);
+	return clone;
 }
 
 /* ── descriptors ────────────────────────────────────────────────── */
@@ -168,8 +175,24 @@ void fd_install(unsigned int fd, struct file *f)
 	void *h = lkpi_fd_lookup((int)fd);
 	if (!h || !f)
 		return;
+	/* A cloned file already knows the descriptor it was first opened through;
+	 * the new one takes that file's device node so the two are the same device
+	 * as far as anything that stats them is concerned. */
+	if (f->f_handle && f->f_handle != h) {
+		lkpi_handle_inherit_node(h, f->f_handle);
+	} else {
+		/* A file the core opened for itself carries no handle to copy from, so
+		 * the identity comes from the device it belongs to. Without it the
+		 * descriptor stats as an anonymous file and wlroots rejects the card as
+		 * "not a primary DRM node". */
+		u32 minor = 0;
+
+		if (lkpi_drm_file_minor(f, &minor))
+			lkpi_handle_attach_drm_minor(h, minor);
+	}
 	lkpi_handle_set_private(h, f);
-	f->f_handle = h;
+	if (!f->f_handle)
+		f->f_handle = h;
 }
 
 void put_unused_fd(unsigned int fd)

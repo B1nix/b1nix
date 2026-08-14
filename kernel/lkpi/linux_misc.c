@@ -169,12 +169,64 @@ int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 	return ret;
 }
 
+/*
+ * The last EDID read from each adapter, kept so a re-probe costs nothing.
+ *
+ * On this hardware GMBUS times out and the driver falls back to bit-banging the
+ * I2C lines, which takes minutes for one 128-byte block. Userspace re-probes a
+ * connector whenever it enumerates it, so a compositor's startup spent those
+ * minutes before it had a mode list — and used a fallback list in the meantime,
+ * committing 720x400 to a monitor offering 1920x1080. The bytes do not change
+ * while the cable stays in; a fresh read still happens whenever the cached one
+ * fails to answer, which is what a hotplug looks like from here.
+ */
+struct lkpi_edid_cache {
+	struct i2c_adapter *adap;
+	u8 addr;
+	u8 data[256];
+	unsigned len;
+};
+
+static struct lkpi_edid_cache g_edid_cache[8];
+
+/* An EDID read is a one-byte offset write followed by a read from 0x50. */
+static int i2c_edid_shape(struct i2c_msg *msgs, int num, u8 *offset)
+{
+	if (num != 2 || msgs[0].addr != 0x50 || msgs[1].addr != 0x50)
+		return 0;
+	if ((msgs[0].flags & I2C_M_RD) || !(msgs[1].flags & I2C_M_RD))
+		return 0;
+	if (msgs[0].len != 1 || !msgs[0].buf || !msgs[1].buf)
+		return 0;
+	*offset = msgs[0].buf[0];
+	return 1;
+}
+
 int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 {
 	int ret;
+	u8 offset = 0;
+	int is_edid = msgs && i2c_edid_shape(msgs, num, &offset);
+	struct lkpi_edid_cache *slot = 0;
 
 	if (!adap)
 		return -ENODEV;
+
+	if (is_edid) {
+		for (unsigned i = 0; i < 8; i++) {
+			if (g_edid_cache[i].adap == adap) {
+				slot = &g_edid_cache[i];
+				break;
+			}
+			if (!g_edid_cache[i].adap && !slot)
+				slot = &g_edid_cache[i];
+		}
+		if (slot && slot->adap == adap && slot->len &&
+		    (unsigned)offset + msgs[1].len <= slot->len) {
+			memcpy(msgs[1].buf, slot->data + offset, msgs[1].len);
+			return num;
+		}
+	}
 
 	/*
 	 * The adapter's own bus lock when it has one, and nothing when it does
@@ -188,10 +240,34 @@ int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 	if (adap->lock_ops && adap->lock_ops->lock_bus)
 		adap->lock_ops->lock_bus(adap, I2C_LOCK_SEGMENT);
 
-	ret = __i2c_transfer(adap, msgs, num);
+	{
+		u64 t0 = lkpi_monotonic_ns();
+
+		ret = __i2c_transfer(adap, msgs, num);
+		/* Anything on this bus that takes longer than a frame is worth naming:
+		 * an EDID read is milliseconds when the controller works and minutes
+		 * when it does not, and the difference decides whether a compositor
+		 * sees a display's real modes or a fallback list. */
+		{
+			u64 ms = (lkpi_monotonic_ns() - t0) / 1000000ull;
+
+			if (ms >= 20)
+				pr_info("lkpi: i2c transfer %d msgs took %llu ms (ret %d)\n",
+				        num, (unsigned long long)ms, ret);
+		}
+	}
 
 	if (adap->lock_ops && adap->lock_ops->unlock_bus)
 		adap->lock_ops->unlock_bus(adap, I2C_LOCK_SEGMENT);
+
+	if (is_edid && slot && ret == num &&
+	    (unsigned)offset + msgs[1].len <= sizeof(slot->data)) {
+		slot->adap = adap;
+		slot->addr = 0x50;
+		memcpy(slot->data + offset, msgs[1].buf, msgs[1].len);
+		if ((unsigned)offset + msgs[1].len > slot->len)
+			slot->len = (unsigned)offset + msgs[1].len;
+	}
 
 	return ret;
 }

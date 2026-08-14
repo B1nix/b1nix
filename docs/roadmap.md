@@ -866,7 +866,20 @@ vendor, so M102a and M102b are two consumers of it rather than two ports.
 
 ## M102a: Intel i915 (Gen8/Gen9.5) + Mesa iris
 
-- [ ] `planned` Import i915 unmodified and cut it to the Gen8/Gen9.5 paths; no firmware is needed on these parts.
+- [x] `done` Import i915 unmodified and cut it to the Gen8/Gen9.5 paths; no firmware is needed on these parts.
+- [x] `done` Display: a Wayland compositor (cage/sway on wlroots, pixman) drives a
+      physical HDMI monitor through the passed-through UHD 630 — atomic modeset,
+      page flips, and a photograph of the panel matching the guest's own
+      screenshot (`smoke_run/monitor-cage-top-green.jpg`). The last blocker was
+      `schedule()` in the shim: mapped to a yield, it left every blocking atomic
+      commit parked with nothing able to wake it.
+- [x] `done` sway drives the monitor at the EDID's preferred 1920x1080, with
+      swaybg and a foot terminal on it — photographed off the panel in
+      [docs/images/m102a-sway-on-monitor.jpg](images/m102a-sway-on-monitor.jpg),
+      and matching the guest's own screenshot from the same run. The fallback
+      720x400 and the crashes behind it were one bug: threads carried private
+      copies of the break and of the mapping-list head, so one thread mapped
+      fresh zero pages over another thread's live heap.
 - [ ] `planned` Bring up GTT/PPGTT, contexts and execlists submission through the shim.
 - [ ] `planned` Serve `EXECBUFFER2` softpin-only, and keep the ioctl ABI exactly as the pinned Mesa expects it.
 - [ ] `planned` Run Mesa `iris` against it — its own NIR backend, so no LLVM rebuild.

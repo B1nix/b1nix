@@ -498,9 +498,23 @@ void scheduler_wait_prepare(void *chan);
 void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks);
 void scheduler_wait_commit(void);
 void scheduler_wait_cancel(void);
+/* True between scheduler_wait_prepare() and the commit or cancel that ends it:
+ * the task is marked blocked and giving up the CPU now would park it rather
+ * than reschedule it. Imported code needs to tell those two apart — see
+ * schedule() in <linux/sched.h>. */
+int scheduler_wait_armed(void);
+/* Publish a process's break to every thread sharing its address space. The
+ * break is a property of the mappings, and threads share those. */
+void scheduler_sync_brk(u64 pml4_phys, u64 heap_start, u64 brk);
+/* Publish the head of the mapping list to every thread sharing the address
+ * space; they share the list, not the pointer to it. */
+void scheduler_sync_vma_head(u64 pml4_phys, struct vm_area *head);
 /* True when the current context may park on a wait channel (scheduler live, real
  * task context, interrupts enabled). Drivers fall back to polling when false. */
 int scheduler_can_block(void);
+/* Keep the CPU across timer ticks without disabling interrupts. Nested. */
+void scheduler_preempt_disable(void);
+void scheduler_preempt_enable(void);
 /* Kernel CSPRNG-ish entropy source (rdrand, xorshift64* fallback). Shared by
  * SYS_GETRANDOM and the M71 ASLR load-base randomizer. */
 u64 kernel_random_u64(void);

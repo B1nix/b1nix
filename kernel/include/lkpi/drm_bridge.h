@@ -18,18 +18,21 @@ struct drm_device;
 struct drm_gem_object;
 
 /*
- * Resolve one page of a buffer object to a physical frame. `index` counts pages
- * from the start of the object.
+ * Resolve one page of a mappable offset to a physical frame. `index` counts
+ * pages from the start of whatever that offset names.
  *
- * The driver supplies this because only the driver knows how its objects are
- * backed — a page array here, stolen memory or a GTT view on real hardware.
- * Upstream has no callback of this shape because Linux fills a VMA and faults;
- * b1nix asks page by page, so the shape is ours and the knowledge stays with
- * the driver rather than being guessed at in the bridge.
+ * The callback is handed the offset NODE, not an object, because the two are
+ * not the same thing and only the driver knows which. Our own driver embeds the
+ * node in its buffer object; i915 embeds it in a struct i915_mmap_offset, one
+ * per mapping type, which merely points at the object. Casting the node to a
+ * buffer object works for the first and lands in unrelated memory for the
+ * second — where it read a size of 4503582447522665 pages and refused every
+ * mapping a compositor asked for.
  *
  * Returns 0 with the frame in `*out_phys`, or a negative errno.
  */
-typedef int (*lkpi_drm_page_fn)(struct drm_gem_object *obj, u64 index,
+struct drm_vma_offset_node;
+typedef int (*lkpi_drm_page_fn)(struct drm_vma_offset_node *node, u64 index,
                                 u64 *out_phys);
 
 /* Publish the device userspace may open, and how to resolve its pages. One

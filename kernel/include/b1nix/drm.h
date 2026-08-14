@@ -115,6 +115,12 @@ int drm_dev_open(int flags);
 void drm_card1_init(void);
 int drm_card1_open(int flags);
 int drm_card1_present(void);
+/* Publish /sys/dev/char/226:<num> and /sys/class/drm/card<num>, which is how
+ * libdrm decides a descriptor is a DRM primary node. */
+void drm_sysfs_publish_card(unsigned num);
+struct vfs_node *drm_card_node_for_minor(u32 minor);
+struct vfs_handle;
+void drm_card_attach_handle(struct vfs_handle *h, u32 minor);
 
 /* M100: the GEM linear-view kernel window (0 when no DRM device exists). The
  * self-test uses these to check the window's page-table path really is shared

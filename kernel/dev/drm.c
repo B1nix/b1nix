@@ -19,7 +19,9 @@
  */
 
 #include <b1nix/console.h>
+#include <stdio.h>
 #include <b1nix/drm.h>
+#include <b1nix/sysfs_attr.h>
 #include <b1nix/errno.h>
 #include <b1nix/fb.h>
 #include <b1nix/mm.h>
@@ -624,6 +626,99 @@ int drm_dev_open(int flags) {
 u64 drm_vmap_window_base(void) { return card_node ? DRM_VMAP_BASE : 0; }
 u64 drm_vmap_window_size(void) { return DRM_VMAP_WINDOW_TOTAL; }
 
+/* An attribute whose value is a string owned by the registry. */
+static isize drm_sysfs_text_show(void *ctx, char *buf, usize cap) {
+  const char *text = (const char *)ctx;
+  usize n = 0;
+
+  while (text[n] && n + 1 < cap) { buf[n] = text[n]; n++; }
+  buf[n] = 0;
+  return (isize)n;
+}
+
+static void drm_sysfs_text_free(void *ctx) { kfree(ctx); }
+
+/*
+ * The sysfs a graphics stack discovers a card through.
+ *
+ * Nothing that drives a display is told where the device is: libudev enumerates
+ * /sys/class/drm, reads each entry's uevent for the device node, and follows
+ * `subsystem` and `device` to decide what it found. libdrm separately stats
+ * /sys/dev/char/<major>:<minor>/device/drm before it will call a descriptor a
+ * primary node. Publish that shape and every compositor built on those two
+ * libraries — wlroots, and the ones that are not — finds the card by itself,
+ * with no environment variable naming it.
+ *
+ * The layout mirrors Linux's:
+ *
+ *   /sys/devices/gpu<n>/                  the device
+ *              /drm/card<n>/              its DRM minor
+ *                   uevent, dev
+ *                   subsystem -> /sys/class/drm
+ *                   device    -> /sys/devices/gpu<n>
+ *   /sys/class/drm/card<n>   -> the minor
+ *   /sys/dev/char/226:<n>    -> the minor
+ */
+void drm_sysfs_publish_card(unsigned num) {
+	char card[16], node[24], minordir[64], *uevent, *devtext;
+
+	snprintf(card, sizeof(card), "card%u", num);
+	snprintf(node, sizeof(node), "226:%u", num);
+
+	struct sysfs_dir *devices = sysfs_reg_dir(0, "devices");
+	char devname[16];
+	snprintf(devname, sizeof(devname), "gpu%u", num);
+	struct sysfs_dir *dev = sysfs_reg_dir(devices, devname);
+	struct sysfs_dir *drm = sysfs_reg_dir(dev, "drm");
+	struct sysfs_dir *minor = sysfs_reg_dir(drm, card);
+
+	if (!minor)
+		return;
+
+	/* uevent is where udev reads the device node's name and numbers from. A
+	 * card with no uevent is enumerated and then discarded as having no node. */
+	uevent = kmalloc(96);
+	if (uevent) {
+		snprintf(uevent, 96,
+		         "MAJOR=226\nMINOR=%u\nDEVNAME=dri/card%u\nDEVTYPE=drm_minor\n",
+		         num, num);
+		if (sysfs_reg_attr(minor, "uevent", 0444, drm_sysfs_text_show, 0, uevent,
+		                   drm_sysfs_text_free) != 0)
+			kfree(uevent);
+	}
+	devtext = kmalloc(16);
+	if (devtext) {
+		snprintf(devtext, 16, "226:%u\n", num);
+		if (sysfs_reg_attr(minor, "dev", 0444, drm_sysfs_text_show, 0, devtext,
+		                   drm_sysfs_text_free) != 0)
+			kfree(devtext);
+	}
+
+	/*
+	 * Relative targets, because that is what a sysfs link is.
+	 *
+	 * libudev resolves these by hand rather than with realpath: it counts the
+	 * leading "../" and splices the remainder onto the directory the link lives
+	 * in. An absolute target survives that as nonsense — "/sys/class/drm" with
+	 * "/sys/devices/..." glued to the end — and the device is silently dropped,
+	 * which is how a card that was plainly in /sys came back as "Found 0 GPUs".
+	 */
+	(void)sysfs_reg_link(minor, "subsystem", "../../../../class/drm");
+	(void)sysfs_reg_link(minor, "device", "../..");
+
+	snprintf(minordir, sizeof(minordir), "../../devices/gpu%u/drm/card%u", num,
+	         num);
+
+	struct sysfs_dir *cls = sysfs_reg_dir(sysfs_reg_dir(0, "class"), "drm");
+	if (cls)
+		(void)sysfs_reg_link(cls, card, minordir);
+
+	struct sysfs_dir *chr =
+		sysfs_reg_dir(sysfs_reg_dir(0, "dev"), "char");
+	if (chr)
+		(void)sysfs_reg_link(chr, node, minordir);
+}
+
 void drm_dev_init(void) {
   if (!virtio_gpu_ready())
     return;
@@ -655,6 +750,17 @@ void drm_dev_init(void) {
   paging_reserve_kernel_path(DRM_VMAP_BASE, DRM_VMAP_WINDOW_TOTAL);
 
   card_node->inode->mode = 0600;
+  /* The real DRM device numbers, because programs identify a card by them
+   * rather than by its name: seatd decides whether it may open a device by
+   * major, and refuses one it cannot classify. Carried in inode->rdev, which is
+   * what fstat reports as st_rdev. */
+  card_node->inode->rdev = ((u64)226 << 8) | 0;
+  /* Deliberately not published to /sys/class/drm.
+   *
+   * This node is b1nix's own small DRM device, kept for the tests written
+   * against it. The imported core drives the same hardware through card1, so
+   * advertising both would offer a compositor two devices for one GPU — and the
+   * one it must not choose is this one. Discovery sees the real cards only. */
   card_node->inode->mmap_handle_page_phys_cb = drm_mmap_page_phys;
   card_node->inode->mmap_range_open_cb = drm_mmap_open;
   card_node->inode->mmap_range_close_cb = drm_mmap_close;

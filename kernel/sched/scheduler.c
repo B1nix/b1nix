@@ -170,6 +170,29 @@ static usize        g_task_hwm = 0;  /* one past highest slot ever used */
  * via task_index(). */
 static int  g_task_is_thread[MAX_TASKS];
 static u64  g_task_tls_base[MAX_TASKS];
+
+/* Non-preemptible depth, per CPU. Imported drivers ask for this around short
+ * register polls; see lkpi_preempt_disable. Interrupts stay on, so the only
+ * effect is that the timer tick does not yield here. */
+static volatile u32 g_preempt_depth[MAX_CPUS];
+
+void scheduler_preempt_disable(void) {
+  u64 flags = interrupts_save();
+  u32 cpu = (u32)percpu_read(cpu_id);
+
+  if (cpu < MAX_CPUS)
+    g_preempt_depth[cpu]++;
+  interrupts_restore(flags);
+}
+
+void scheduler_preempt_enable(void) {
+  u64 flags = interrupts_save();
+  u32 cpu = (u32)percpu_read(cpu_id);
+
+  if (cpu < MAX_CPUS && g_preempt_depth[cpu] > 0)
+    g_preempt_depth[cpu]--;
+  interrupts_restore(flags);
+}
 static u64  g_task_child_tid_clear[MAX_TASKS];
 static u64  g_task_saved_sigmask[MAX_TASKS];
 static int  g_task_has_saved_sigmask[MAX_TASKS];
@@ -3035,6 +3058,65 @@ void scheduler_wait_commit(void) {
   interrupts_enable();
 }
 
+/*
+ * One break per address space, not one per thread.
+ *
+ * Threads share their mappings — the page tables and the VMA list are the same
+ * objects — but each carried its own copy of where the break ended. libc keeps
+ * its own idea of the break in memory all the threads share, so a thread that
+ * had not itself grown the heap asked to extend it from a value the kernel
+ * believed was still current, and the kernel dutifully mapped fresh zeroed
+ * frames over pages another thread was already using. That is how a
+ * multithreaded program's allocator metadata came to be full of zeros while
+ * every mapping looked correct.
+ */
+/*
+ * The head of the mapping list, likewise.
+ *
+ * Threads share the VMA list itself, but each holds its own pointer to its
+ * first element. A thread that inserts or removes at the front leaves its
+ * siblings pointing at a node that is no longer first — or, after a removal, at
+ * freed memory. They then place new mappings on top of live ones and walk a
+ * list that no longer exists.
+ */
+void scheduler_sync_vma_head(u64 pml4_phys, struct vm_area *head) {
+  u64 flags;
+
+  if (!pml4_phys)
+    return;
+  tasks_lock(&flags);
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+
+    if (t->state == TASK_UNUSED || t->pml4_phys != pml4_phys)
+      continue;
+    t->vma_list = head;
+  }
+  tasks_unlock(flags);
+}
+
+void scheduler_sync_brk(u64 pml4_phys, u64 heap_start, u64 brk) {
+  u64 flags;
+
+  if (!pml4_phys)
+    return;
+  tasks_lock(&flags);
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+
+    if (t->state == TASK_UNUSED || t->pml4_phys != pml4_phys)
+      continue;
+    t->heap_start = heap_start;
+    t->user_brk = brk;
+  }
+  tasks_unlock(flags);
+}
+
+int scheduler_wait_armed(void) {
+  return current_task &&
+         __atomic_load_n(&current_task->state, __ATOMIC_SEQ_CST) == TASK_BLOCKED;
+}
+
 void scheduler_wait_cancel(void) {
   current_task->wait_chan = 0;
   current_task->wake_tick = 0;
@@ -3128,7 +3210,12 @@ void scheduler_sleep_ticks(u64 ticks) {
   if (current_task->state == TASK_SLEEPING) {
     current_task->state = TASK_RUNNING;
   } else if (current_task->state != TASK_RUNNING) {
-    panic("scheduler_sleep_ticks without running task");
+    /* A different fault from "no task at all", and it used to say the same
+     * thing: this one is a task that is on a wait channel or already dying and
+     * asked to sleep anyway. Naming the state is the difference between one
+     * look at the log and a rebuild with printf. */
+    klog_warn("scheduler_sleep_ticks: task is not running");
+    panic("scheduler_sleep_ticks with a task that is not running");
   }
 
   current_task->wake_tick = scheduler_ticks + ticks;
@@ -3139,6 +3226,27 @@ void scheduler_sleep_ticks(u64 ticks) {
   current_task->state = TASK_SLEEPING;
   scheduler_yield();
   interrupts_enable();
+
+  /*
+   * Finish the sleep even when nothing else wanted the CPU.
+   *
+   * scheduler_yield returns without switching when no other task is ready, and
+   * the sleep above is then over the moment it began — a caller asking for a
+   * second gets no delay at all. That is invisible in a busy system and total
+   * in an idle one: a boot that ends in a timed hold ran through the whole hold
+   * in a few microseconds and powered the machine off, which cost a night of
+   * display measurements before the loop was found to be the thing at fault.
+   *
+   * So wait out the remainder against the timer here. The scheduler check keeps
+   * this honest before the timer runs — there the tick can never arrive, and
+   * spinning for it would hang the boot rather than shorten a sleep.
+   */
+  if (scheduler_started) {
+    while ((i64)(current_task->wake_tick - scheduler_ticks) > 0) {
+      __asm__ volatile("sti; hlt");
+    }
+  }
+  current_task->state = TASK_RUNNING;
 }
 
 /* Silence watchdog (test mode only). A wedged instance prints nothing, so the
@@ -3225,7 +3333,10 @@ void scheduler_on_timer_tick(void) {
    * userspace → exit path (M25 TCC-compiled binaries hang after their last
    * printf because the timer-acquired BKL is never observed released by
    * the next syscall on the resumed task). */
-  if (current_task->state == TASK_RUNNING) {
+  /* A task inside a non-preemptible region keeps the CPU. The tick still ran:
+   * time advances, accounting is done, and a driver polling a register with a
+   * timeout can still observe that timeout expire. */
+  if (current_task->state == TASK_RUNNING && g_preempt_depth[(u32)percpu_read(cpu_id) % MAX_CPUS] == 0) {
     scheduler_yield();
   }
 }
@@ -5451,29 +5562,48 @@ u64 vm_find_free_area(struct task *t, usize length) {
   u64 end = 0x80000000ULL;
 #endif
 
-  // Simple first-fit hole finding.
-  // The VMA list is in reverse-insertion order (not sorted by address),
-  // so skip any VMA that ends at or before current_addr.
-  u64 current_addr = start;
-  struct vm_area *vma = t->vma_list;
+  /*
+   * First fit, over a list that is not sorted by address.
+   *
+   * The obvious single pass is wrong here, and was: it accepted a candidate as
+   * soon as one VMA started above it, which says nothing about the VMAs still
+   * ahead in a list held in reverse-insertion order. A mapping placed early and
+   * linked late was invisible, so mmap handed back an address already in use —
+   * and the caller's write went straight through someone else's memory.
+   *
+   * What that looked like from userspace: a compositor with a hundred mappings
+   * crashing inside malloc(), deterministically, on a pointer that had been
+   * zeroed. musl keeps its allocator metadata in mmap'd pages, and one of them
+   * had been handed out twice.
+   *
+   * So a candidate is only accepted once a whole pass has found nothing
+   * overlapping it. Each conflict pushes the candidate past the offending VMA,
+   * so it strictly increases and the search terminates; the cost is quadratic
+   * in the number of mappings, which for the few hundred a process has is far
+   * cheaper than keeping the list sorted everywhere else.
+   */
+  u64 candidate = start;
 
-  while (vma) {
-    if (vma->end <= current_addr) {
-      vma = vma->next;
-      continue;
+  for (;;) {
+    struct vm_area *conflict = 0;
+
+    if (candidate + length > end || candidate + length < candidate)
+      return (u64)-1;
+
+    for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
+      if (vma->end <= candidate || vma->start >= candidate + length)
+        continue;
+      /* Overlaps. Take the furthest end among the conflicts so a pass makes as
+       * much progress as it can. */
+      if (!conflict || vma->end > conflict->end)
+        conflict = vma;
     }
-    if (vma->start >= current_addr + length) {
-      return current_addr;
-    }
-    current_addr = vma->end;
-    vma = vma->next;
-  }
 
-  if (current_addr + length <= end) {
-    return current_addr;
-  }
+    if (!conflict)
+      return candidate;
 
-  return (u64)-1;
+    candidate = conflict->end;
+  }
 }
 
 struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr) {

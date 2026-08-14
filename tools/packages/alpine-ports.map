@@ -63,7 +63,9 @@ openssl       openssl libssl3 libcrypto3 openssl-dev openssl-libs-static
 # rootfs gate rejects outright (tools/check-dynamic.sh). Both keep their ports:
 # what they do is the running system's behaviour, not a build artefact.
 programs      zsh curl libcurl samurai bmake dropbear dropbear-ssh \
-              dropbear-scp dropbear-dbclient
+              dropbear-scp dropbear-dbclient \
+              seatd sway swaybg grim foot foot-extra-terminfo cage \
+              font-dejavu xkeyboard-config xwayland
 
 # The curl library, for what links against it rather than runs it (NetSurf).
 curlbuild     libcurl curl-dev curl-static

@@ -30,6 +30,7 @@
 #define LX_mmap            9
 #define LX_mprotect        10
 #define LX_munmap          11
+#define LX_mremap          25
 #define LX_brk             12
 #define LX_rt_sigaction    13
 #define LX_rt_sigprocmask  14
@@ -233,6 +234,7 @@ static const struct lx_map lx_table[] = {
 	{LX_mmap,           SYS_MMAP,          "mmap"},
 	{LX_mprotect,       SYS_MPROTECT,      "mprotect"},
 	{LX_munmap,         SYS_MUNMAP,        "munmap"},
+	{LX_mremap,         SYS_MREMAP,        "mremap"},
 	{LX_brk,            SYS_BRK,           "brk"},
 	{LX_rt_sigaction,   SYS_SIGNAL,        "rt_sigaction"},
 	{LX_rt_sigprocmask, SYS_SIGPROCMASK,   "rt_sigprocmask"},

@@ -38,6 +38,10 @@ u32 lkpi_cpu_count(void);
 
 /* ── interrupts ─────────────────────────────────────────────────── */
 u64 lkpi_irq_save(void);
+/* Diagnostics: where interrupts were last turned off on this CPU. */
+u64 lkpi_irq_off_site(void);
+void lkpi_note_irq_off(u64 site);
+void lkpi_note_irq_on(void);
 
 /* Non-preemptible region. Nested; the outermost enable restores the interrupt
  * state the outermost disable saw, rather than assuming it was enabled. */
@@ -77,7 +81,26 @@ void lkpi_wait_prepare(void *chan);
 void lkpi_wait_prepare_timeout(void *chan, u64 timeout_ticks);
 void lkpi_wait_commit(void);
 void lkpi_wait_cancel(void);
+/* Give up the CPU: commits an armed park, or reschedules when none is armed.
+ * This is what imported code's schedule() means. */
+void lkpi_schedule(void);
 void lkpi_wake_all(void *chan);
+
+/* ── stuck-call watchdog ────────────────────────────────────────
+ *
+ * A call into imported code that never returns leaves no evidence at all: the
+ * caller is parked inside it, so the log simply stops. Bracket such a call with
+ * begin/end and another thread can say, from outside, how long it has been in
+ * there and where it last parked — which is the difference between "the commit
+ * did nothing" and "the commit is still waiting for something".
+ *
+ * One call is watched at a time; a second begin replaces the first.
+ */
+void lkpi_diag_watch_begin(const char *what, u64 detail);
+void lkpi_diag_watch_end(void);
+/* Reports the watched call when it has been running for at least min_ms.
+ * Returns 1 when it printed. */
+int lkpi_diag_watch_report(u64 min_ms);
 
 /* ── the calling task ───────────────────────────────────────────
  *
@@ -118,6 +141,17 @@ int lkpi_copy_to_user(void *user_dst, const void *src, usize n);
 void *lkpi_handle_alloc(void);
 void lkpi_handle_release(void *handle);
 void *lkpi_handle_private(void *handle);
+/* Give `handle` the same device node `source` has, with its own reference.
+ *
+ * A DRM lease is a clone of the leasing file, and on Linux the descriptor it
+ * produces is the same character device as the original — programs check that
+ * before they will use it. Without this the clone is a descriptor with no
+ * identity, and a compositor refuses it as "not a primary DRM node". */
+void lkpi_handle_inherit_node(void *handle, void *source);
+/* Give `handle` the device node of the imported card with this minor. A
+ * descriptor the DRM core creates for itself has no node otherwise, and a
+ * program that stats it sees an anonymous file rather than the card. */
+void lkpi_handle_attach_drm_minor(void *handle, u32 minor);
 void lkpi_handle_set_private(void *handle, void *priv);
 
 /* Install a handle in the calling process's table. Returns the descriptor, or

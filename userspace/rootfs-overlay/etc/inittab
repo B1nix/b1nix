@@ -34,6 +34,10 @@
 # this costs a fork and nothing else.
 ::wait:/bin/sh /etc/sway-probe.sh
 
+# Diagnostic hook: only does anything when the kernel cmdline carries
+# b1nix.i915sway — sway on the passed-through GPU's real output.
+::wait:/bin/sh /etc/i915-sway.sh
+
 # Interactive login on the first virtual terminal. The serial line (/dev/ttyS0)
 # deliberately gets no getty: it is the kernel console, and a getty there would
 # claim it as its controlling terminal and take the foreground process group
