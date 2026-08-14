@@ -8,7 +8,7 @@
 #include <unistd.h>
 
 int main(int argc, char **argv) {
-  const char *devpath = "/dev/sata0";
+  const char *devpath = "/dev/sda";
   if (argc > 1) devpath = argv[1];
 
   int fd = open(devpath, O_RDONLY);

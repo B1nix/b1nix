@@ -38,7 +38,7 @@ done
 # whole heavy smoke sequence alongside the build. Set SELFHOST_TESTMODE=1 to fall
 # back to the old b1nix.test=1 behaviour for comparison.
 # SELFHOST_DISK=1 sources the toolchain from a real SATA disk (b1nix.selfhostdisk
-# -> mount sata0) instead of the ram0 Multiboot2 module. The module is a ramdisk whose
+# -> mount sda) instead of the ram0 Multiboot2 module. The module is a ramdisk whose
 # ~217 MB stay pinned in RAM the whole build; a disk leaves that free and streams
 # the toolchain off AHCI through the (read-ahead) block cache, so the self-host
 # fits in less RAM.
@@ -75,12 +75,12 @@ set -- qemu-system-x86_64 $accel -m "${SELFHOST_MEM_MB:-16384}" \
 	-cdrom "$ISO" -serial stdio -display none -monitor none -no-reboot \
 	-device isa-debug-exit,iobase=0xf4,iosize=0x04
 if [ -n "$DISK_IMG" ]; then
-	# Toolchain on a SATA/AHCI disk (sata0) — the kernel mounts it instead of ram0.
+	# Toolchain on a SATA/AHCI disk (sda) — the kernel mounts it instead of ram0.
 	set -- "$@" -device ich9-ahci,id=ahci \
 		-drive file="$DISK_IMG",if=none,id=shdisk,format=raw \
 		-device ide-hd,drive=shdisk,bus=ahci.0
-	# SELFHOST_SWAP_MB>0 attaches a blank swap disk on the next AHCI port (sata1).
-	# swap_init() auto-detects "sata1" and activates swap, so when clang's per-TU
+	# SELFHOST_SWAP_MB>0 attaches a blank swap disk on the next AHCI port (sdb).
+	# swap_init() auto-detects "sdb" and activates swap, so when clang's per-TU
 	# compile heap exceeds the (small) RAM the kernel spills cold pages to swap
 	# instead of OOM-killing it — this is what lets the self-host link its kernel
 	# at 512 MiB and below (slower, but it completes). Default 2048 MiB of swap.

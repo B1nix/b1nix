@@ -78,9 +78,9 @@ fi
 # Downloading a compositor and its dependencies is the slowest part of a test
 # boot by a wide margin, and none of those bytes change between runs. bpkg keeps
 # what it fetches here; mounting the disk makes that survive a reboot.
-if [ -e /dev/virtio-blk0 ]; then
+if [ -e /dev/vda ]; then
 	mkdir -p /var/cache/bpkg
-	if mount -t ext4 /dev/virtio-blk0 /var/cache/bpkg 2>/dev/null; then
+	if mount -t ext4 /dev/vda /var/cache/bpkg 2>/dev/null; then
 		echo "I915-SWAY: package cache mounted ($(ls /var/cache/bpkg | wc -l) files)"
 		# The package index too — 2.3 MB of it, downloaded on every boot
 		# otherwise. Only the index: the installed-package metadata beside it

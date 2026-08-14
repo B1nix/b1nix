@@ -32,6 +32,7 @@ static int ramdisk_write_blocks(struct block_device *dev, u64 lba, u32 count, co
 
 static struct block_device ramdisk_dev = {
 	.name = "ram0",
+	.bus = BLK_BUS_MEMORY,
 	.block_size = 512,
 	.block_count = 0,
 	.read_blocks = ramdisk_read_blocks,

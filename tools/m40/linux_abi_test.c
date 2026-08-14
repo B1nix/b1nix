@@ -824,7 +824,7 @@ static void test_rseq(void) {
 static void test_swap_cycle(void) {
   /* Detach and re-attach the swap device. swapoff must page everything back
    * in first, so a successful round trip proves both halves. */
-  long off = sys1(SYS_swapoff, "/dev/sata1");
+  long off = sys1(SYS_swapoff, "/dev/sdb");
   if (off < 0) {
     /* No swap device on this instance: the wiring is still checked by the
      * error path (a device that does not exist reports ENODEV). */
@@ -832,7 +832,7 @@ static void test_swap_cycle(void) {
     check("swapon-swapoff", bogus == -19 /* ENODEV */, bogus);
     return;
   }
-  long on = sys2(SYS_swapon, "/dev/sata1", 0);
+  long on = sys2(SYS_swapon, "/dev/sdb", 0);
   check("swapon-swapoff", on == 0, on);
 }
 

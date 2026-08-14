@@ -206,6 +206,56 @@ static struct block_device *find_device_by_uuid(const u8 *expected_uuid) {
 	return found;
 }
 
+/* The live medium is whichever block device actually carries the boot image —
+ * decided by mounting it and looking, never by what the device is called. USB
+ * storage is an ordinary sd* disk now, so a name prefix could not identify it
+ * even in principle. Returns the device and the filesystem that mounted it,
+ * leaving it mounted at /mnt/iso; NULL if no device carries the image. */
+static struct block_device *find_live_medium(const char **fstype_out) {
+	static const char *const fs_types[] = {"iso9660", "exfat"};
+
+	/* Removable media first — a live USB is the common case and trying it
+	 * first keeps the boot quick — then everything else, because a live
+	 * image on an internal disk or an emulated CD is just as valid. */
+	for (int removable_first = 1; removable_first >= 0; removable_first--) {
+		for (usize i = 0; i < blk_count(); i++) {
+			struct block_device *dev = blk_at(i);
+
+			if (!dev || !dev->name)
+				continue;
+			if (blk_is_removable(dev) != removable_first)
+				continue;
+			for (usize f = 0; f < sizeof(fs_types) / sizeof(fs_types[0]); f++) {
+				struct vfs_node *image;
+
+				if (vfs_mount(dev->name, "/mnt/iso", fs_types[f], 0) != 0)
+					continue;
+				image = vfs_find_node("/mnt/iso/boot/rootfs.img");
+				if (!IS_ERR(image)) {
+					vfs_node_put(image);
+					if (fstype_out)
+						*fstype_out = fs_types[f];
+					return dev;
+				}
+				vfs_umount("/mnt/iso");
+			}
+		}
+	}
+	return 0;
+}
+
+/* Has any removable medium been enumerated yet? Bounds how long the live-ISO
+ * search waits for a USB stick that is still coming up. */
+static struct block_device *blk_first_removable(void) {
+	for (usize i = 0; i < blk_count(); i++) {
+		struct block_device *dev = blk_at(i);
+
+		if (blk_is_removable(dev))
+			return dev;
+	}
+	return 0;
+}
+
 static struct block_device *find_device_by_label(const char *expected_label) {
 	u8 *sb_buf = kmalloc(1024);
 	if (!sb_buf) return 0;
@@ -642,77 +692,39 @@ void kernel_main(usize arg0, usize arg1)
 
 #ifndef __aarch64__
 	/* Prefer a real ext4 root over the bootstrap initramfs.  Native runs use
-	 * virtio-blk0; Live CD boots use the multiboot ramdisk block device ram0.
+	 * vda; Live CD boots use the multiboot ramdisk block device ram0.
 	 * In test mode the smoke suite owns the drives, so keep initramfs as /. */
 	{
 		int rc = -1;
 		char root_val[64];
 		if (bootinfo_get_kv("root", root_val, sizeof(root_val))) {
 			if (strcmp(root_val, "liveiso") == 0) {
-				console_write("rootfs: liveiso mount requested, searching for USB storage...\n");
-				struct block_device *iso_dev = NULL;
+				console_write("rootfs: liveiso mount requested, searching for the boot medium...\n");
+				const char *iso_fstype = 0;
 				char mounted_iso_name[64];
 				mounted_iso_name[0] = '\0';
-				int retries = 0;
-				while (retries < 50) {
-					for (usize i = 0; i < blk_count(); i++) {
-						struct block_device *dev = blk_at(i);
-						if (dev && strncmp(dev->name, "usb", 3) == 0) {
-							iso_dev = dev;
-							break;
-						}
-					}
-					if (iso_dev) break;
+				/* USB enumeration is asynchronous, so the medium may not be
+				 * registered yet. Retry while no removable device has shown up
+				 * at all; once one has, one search over every device settles
+				 * it — waiting longer would not change the answer. */
+				struct block_device *iso_dev = 0;
+				for (int retries = 0; retries < 50; retries++) {
+					iso_dev = find_live_medium(&iso_fstype);
+					if (iso_dev)
+						break;
+					if (blk_first_removable())
+						break;
 					scheduler_sleep_ticks(10);
-					retries++;
 				}
 
 				int is_exfat = 0;
 				if (iso_dev) {
-					/* Try each USB block device (whole disk + partitions) in order with iso9660 */
-					for (usize i = 0; i < blk_count(); i++) {
-						struct block_device *dev = blk_at(i);
-						if (dev && strncmp(dev->name, "usb", 3) == 0) {
-							rc = vfs_mount(dev->name, "/mnt/iso", "iso9660", 0);
-							if (rc == 0) {
-								struct vfs_node *check = vfs_find_node("/mnt/iso/boot/rootfs.img");
-								if (!IS_ERR(check)) {
-									vfs_node_put(check);
-									snprintf(mounted_iso_name, sizeof(mounted_iso_name), "%s", dev->name);
-									console_write("isofs: mounted ");
-									console_write(dev->name);
-									console_write(" at /mnt/iso\n");
-									break;
-								}
-								vfs_umount("/mnt/iso");
-								rc = -1;
-							}
-						}
-					}
-
-					/* If not found on iso9660, try exfat */
-					if (rc != 0) {
-						for (usize i = 0; i < blk_count(); i++) {
-							struct block_device *dev = blk_at(i);
-							if (dev && strncmp(dev->name, "usb", 3) == 0) {
-								rc = vfs_mount(dev->name, "/mnt/iso", "exfat", 0);
-								if (rc == 0) {
-									struct vfs_node *check = vfs_find_node("/mnt/iso/boot/rootfs.img");
-									if (!IS_ERR(check)) {
-										vfs_node_put(check);
-										is_exfat = 1;
-										snprintf(mounted_iso_name, sizeof(mounted_iso_name), "%s", dev->name);
-										console_write("exfat: mounted ");
-										console_write(dev->name);
-										console_write(" at /mnt/iso\n");
-										break;
-									}
-									vfs_umount("/mnt/iso");
-									rc = -1;
-								}
-							}
-						}
-					}
+					rc = 0;
+					is_exfat = strcmp(iso_fstype, "exfat") == 0;
+					snprintf(mounted_iso_name, sizeof(mounted_iso_name), "%s", iso_dev->name);
+					console_write(is_exfat ? "exfat: mounted " : "isofs: mounted ");
+					console_write(iso_dev->name);
+					console_write(" at /mnt/iso\n");
 				}
 
 				if (rc == 0) {
@@ -810,7 +822,7 @@ void kernel_main(usize arg0, usize arg1)
 			 * No root= on the command line: choose by what the filesystem says
 			 * it is, not by where it happens to be plugged in.
 			 *
-			 * Taking virtio-blk0 unconditionally meant any disk attached for
+			 * Taking the first virtio disk unconditionally meant any disk attached for
 			 * any other purpose became the root — a package cache handed to the
 			 * guest for speed was mounted at / and the real filesystem never
 			 * appeared. The label comes first, then the image the boot loader
@@ -845,8 +857,8 @@ void kernel_main(usize arg0, usize arg1)
 			}
 			if (rc == 0) {
 				/* mounted above */
-			} else if ((rc = vfs_mount("virtio-blk0", "/", "ext4", 0)) == 0) {
-				console_write("rootfs: virtio-blk0 mounted at /\n");
+			} else if ((rc = vfs_mount("vda", "/", "ext4", 0)) == 0) {
+				console_write("rootfs: vda mounted at /\n");
 				vfs_repopulate_after_root_mount();
 			} else {
 				/* Try finding a block device by default label 'b1nix-root' (e.g. USB flash drive) */
@@ -1256,13 +1268,13 @@ void kernel_main(usize arg0, usize arg1)
 	 * ordinary smoke suite. */
 	if (bootinfo_has_flag("b1nix.selfhostbuild")) {
 		vfs_mkdir("/mnt/build", 0755);
-		/* b1nix.selfhostdisk sources the toolchain from a real SATA disk (sata0)
+		/* b1nix.selfhostdisk sources the toolchain from a real SATA disk (sda)
 		 * instead of the ram0 Multiboot2 module. The module is a ramdisk: its ~217 MB
 		 * stay pinned in RAM for the whole build. A disk leaves that 217 MB free
 		 * — the toolchain streams off AHCI through the (now read-ahead) block
 		 * cache — so the self-host fits in far less RAM. */
 		const char *sh_src =
-		    bootinfo_has_flag("b1nix.selfhostdisk") ? "sata0" : "ram0";
+		    bootinfo_has_flag("b1nix.selfhostdisk") ? "sda" : "ram0";
 		int sh_mrc = vfs_mount(sh_src, "/mnt/build", "ext4", 0);
 		char sh_buf[80];
 		snprintf(sh_buf, sizeof(sh_buf), "selfhost: mount %s -> /mnt/build: %d\n",

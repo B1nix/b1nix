@@ -175,18 +175,118 @@ static void blk_register_internal(struct block_device *dev,
   }
 }
 
+/* ── Device naming ──────────────────────────────────────────────────
+ *
+ * b1nix uses the names every other Unix uses, so ported tools, documentation
+ * and habit all land on the right node: SCSI/SATA disks are sdX, virtio disks
+ * are vdX, NVMe namespaces are nvme<ctrl>n<nsid>. Nothing here is a table —
+ * the suffix is computed from the driver's enumeration index, so the fifth
+ * SATA disk comes out sde without anyone editing a list.
+ */
+
+/* Bijective base-26 suffix: 0 -> a, 25 -> z, 26 -> aa, 701 -> zz, 702 -> aaa.
+ * Same sequence Linux's disk_name() produces. */
+void blk_disk_name(const char *prefix, usize index, char *out, usize out_size) {
+  if (!out || out_size == 0)
+    return;
+  char suffix[8];
+  usize n = 0;
+  long i = (long)index;
+  do {
+    if (n < sizeof(suffix))
+      suffix[n++] = (char)('a' + (i % 26));
+    i = i / 26 - 1;
+  } while (i >= 0);
+
+  usize w = 0;
+  if (prefix) {
+    for (const char *p = prefix; *p && w + 1 < out_size; p++)
+      out[w++] = *p;
+  }
+  while (n > 0 && w + 1 < out_size)
+    out[w++] = suffix[--n];
+  out[w] = '\0';
+}
+
+/* NVMe carries the controller index and the namespace id, not a letter:
+ * controller 0 namespace 1 is nvme0n1. */
+void blk_nvme_name(usize controller, u32 nsid, char *out, usize out_size) {
+  if (!out || out_size == 0)
+    return;
+  snprintf(out, out_size, "nvme%un%u", (unsigned)controller, (unsigned)nsid);
+}
+
+/* How many whole disks already answer to <prefix><letters>. This is the next
+ * free index in that sequence, read out of the registry rather than kept in a
+ * per-driver counter — which is the whole point: AHCI and USB mass storage are
+ * both SCSI disks, both named sd*, and two private counters would each hand out
+ * sda. Names are never released (a device stays registered for the boot), so a
+ * count is exactly the next position. */
+static usize blk_next_disk_index(const char *prefix) {
+  usize plen = strlen(prefix);
+  usize used = 0;
+  for (usize i = 0; i < blk_device_count; i++) {
+    struct block_device *dev = blk_devices[i];
+    if (!dev || !dev->name || blk_is_partition(dev))
+      continue;
+    if (strncmp(dev->name, prefix, plen) != 0)
+      continue;
+    const char *suffix = dev->name + plen;
+    if (*suffix == '\0')
+      continue;
+    while (*suffix >= 'a' && *suffix <= 'z')
+      suffix++;
+    if (*suffix != '\0')
+      continue; /* e.g. "sd"-prefixed but not a letter name — not in sequence */
+    used++;
+  }
+  return used;
+}
+
+void blk_register_disk(struct block_device *dev, const char *prefix, u8 bus) {
+  if (!dev || !prefix)
+    return;
+  char name[24];
+  blk_disk_name(prefix, blk_next_disk_index(prefix), name, sizeof(name));
+
+  usize len = strlen(name) + 1;
+  char *persistent = kmalloc(len);
+  if (!persistent)
+    return;
+  memcpy(persistent, name, len);
+
+  dev->name = persistent;
+  dev->bus = bus;
+  blk_register(dev);
+}
+
+struct block_device *blk_nth_on_bus(u8 bus, usize n) {
+  usize seen = 0;
+  for (usize i = 0; i < blk_device_count; i++) {
+    struct block_device *dev = blk_devices[i];
+    if (!dev || dev->bus != bus || blk_is_partition(dev))
+      continue;
+    if (seen == n)
+      return dev;
+    seen++;
+  }
+  return 0;
+}
+
+int blk_is_removable(struct block_device *dev) {
+  return dev && dev->bus == BLK_BUS_USB;
+}
+
+/* Partition suffix follows the same rule Linux uses: a bare number appended to
+ * the disk name, unless the disk name already ends in a digit — then a 'p'
+ * separates them, so nvme0n1's first partition is nvme0n1p1 while sda's is
+ * sda1 and there is no ambiguity either way. */
 static void make_partition_name(const char *parent, usize number, char *out,
                                 usize out_size) {
-  usize len = strlen(parent);
-  if (len > out_size - 4)
-    len = out_size - 4;
-  memcpy(out, parent, len);
-  out[len++] = 'p';
-  if (number >= 10) {
-    out[len++] = '0' + (char)(number / 10);
-  }
-  out[len++] = '0' + (char)(number % 10);
-  out[len] = '\0';
+  usize plen = strlen(parent);
+  int ends_in_digit = plen > 0 && parent[plen - 1] >= '0' && parent[plen - 1] <= '9';
+  snprintf(out, out_size, "%s%s%u", parent, ends_in_digit ? "p" : "",
+           (unsigned)number);
 }
 
 static void register_partition(struct block_device *parent, usize number,
@@ -217,6 +317,7 @@ static void register_partition(struct block_device *parent, usize number,
   memcpy(persistent_name, name, strlen(name) + 1);
 
   part->blk.name = persistent_name;
+  part->blk.bus = parent->bus;
   part->blk.block_size = parent->block_size;
   part->blk.block_count = block_count;
   part->blk.read_blocks = partition_read;
@@ -245,22 +346,22 @@ struct block_device *blk_partition_parent(struct block_device *dev) {
   return ((struct partition_device *)dev->priv)->parent;
 }
 
-/* Partition number parsed from the "<parent>pN" name suffix (1-based), or -1. */
+/* Partition number is the trailing decimal run of the name (1-based), or -1.
+ * make_partition_name appends it last in both spellings — sda1 and nvme0n1p1 —
+ * so reading the tail back covers each of them. */
 int blk_partition_number(struct block_device *dev) {
   if (!blk_is_partition(dev) || !dev->name)
     return -1;
-  const char *last_p = 0;
-  for (const char *c = dev->name; *c; c++)
-    if (*c == 'p')
-      last_p = c;
-  if (!last_p)
+  const char *end = dev->name + strlen(dev->name);
+  const char *start = end;
+  while (start > dev->name && start[-1] >= '0' && start[-1] <= '9')
+    start--;
+  if (start == end)
     return -1;
-  int num = 0, any = 0;
-  for (const char *c = last_p + 1; *c >= '0' && *c <= '9'; c++) {
+  int num = 0;
+  for (const char *c = start; c < end; c++)
     num = num * 10 + (*c - '0');
-    any = 1;
-  }
-  return any ? num : -1;
+  return num;
 }
 
 /* ── GPT / MBR Scanning ── */
@@ -414,15 +515,15 @@ u32 blk_devno(struct block_device *dev) {
 
   u32 major;
   const char *n = dev->name;
-  if (n[0] == 'n' && n[1] == 'v' && n[2] == 'm')
+  if (strncmp(n, "nvme", 4) == 0)
     major = 259; /* nvme */
-  else if (n[0] == 's' && n[1] == 'a' && n[2] == 't')
-    major = 8; /* sata — SCSI disk major */
-  else if (n[0] == 'v' && n[1] == 'i' && n[2] == 'r')
+  else if (strncmp(n, "sd", 2) == 0)
+    major = 8; /* SCSI/SATA disk */
+  else if (strncmp(n, "vd", 2) == 0)
     major = 254; /* virtio-blk */
-  else if (n[0] == 'r' && n[1] == 'a' && n[2] == 'm')
+  else if (strncmp(n, "ram", 3) == 0)
     major = 1; /* ramdisk */
-  else if (n[0] == 'l' && n[1] == 'o' && n[2] == 'o')
+  else if (strncmp(n, "loop", 4) == 0)
     major = 7; /* loop */
   else
     major = 240; /* local/experimental range for anything else */
@@ -1314,7 +1415,7 @@ static isize blkdev_node_read(struct vfs_node *node, u64 offset, char *buffer,
   u64 last = (offset + size - 1) / bs;
   u32 nblk = (u32)(last - first + 1);
   /* Fast path: a block-aligned bulk read (e.g. a disk imager's 1 MiB reads of
-   * /dev/sataN) goes straight to the driver as one DMA, skipping the per-512B
+   * /dev/sdX) goes straight to the driver as one DMA, skipping the per-512B
    * blk_read_cached loop (lock+tiny-DMA+memcpy per block ~ 100x slower for
    * large raw reads). Raw whole-disk reads bypass the page cache as on Unix. */
   if (dev->read_blocks && (offset % bs) == 0 && (size % bs) == 0) {

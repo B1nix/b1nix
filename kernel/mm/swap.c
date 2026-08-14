@@ -309,11 +309,34 @@ static void zswap_pool_free(u32 slot) {
     spin_unlock_irqrestore(&zswap_pool_lock, flags);
 }
 
+/* The second disk of a storage class is the swap disk by convention: the first
+ * carries a filesystem, the second is handed over whole. Asked for by bus and
+ * position rather than by name — "sdb" stopped meaning "the second ATA disk"
+ * once USB mass storage joined the same sd* sequence, and whether a USB stick
+ * is plugged in must not decide which disk gets overwritten with swap. */
+#define SWAP_DISK_INDEX 1
+
+static struct block_device *swap_find_dedicated_disk(void)
+{
+    struct block_device *dev = blk_nth_on_bus(BLK_BUS_ATA, SWAP_DISK_INDEX);
+    if (!dev)
+        dev = blk_nth_on_bus(BLK_BUS_NVME, SWAP_DISK_INDEX);
+    return dev;
+}
+
+static int swap_is_dedicated_disk(struct block_device *dev)
+{
+    if (!dev)
+        return 0;
+    return dev == blk_nth_on_bus(BLK_BUS_ATA, SWAP_DISK_INDEX) ||
+           dev == blk_nth_on_bus(BLK_BUS_NVME, SWAP_DISK_INDEX);
+}
+
 void vmm_set_swap_device(struct block_device *dev)
 {
     swap_dev = dev;
     if (dev) {
-        if (strcmp(dev->name, "sata1") == 0 || strcmp(dev->name, "nvme1") == 0) {
+        if (swap_is_dedicated_disk(dev)) {
             swap_start_lba = 0;
             swap_sector_count = dev->block_count;
         } else {
@@ -366,10 +389,7 @@ int swap_init(void)
 
     zswap_init();
 
-    struct block_device *dev = blk_get("sata1");
-    if (!dev) {
-        dev = blk_get("nvme1");
-    }
+    struct block_device *dev = swap_find_dedicated_disk();
     if (dev) {
         vmm_set_swap_device(dev);
     }

@@ -7,6 +7,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/types.h>
 #include <b1nix/virtio.h>
+#include <string.h>
 
 /* M70: watchdog deadline (in 10 ms scheduler ticks) for a blocked I/O wait. The
  * completion IRQ wakes the waiter on the common path; this only bounds the stall
@@ -289,22 +290,6 @@ void virtio_blk_init(void) {
     virtio_set_status(&inst->dev,
                       virtio_get_status(&inst->dev) | VIRTIO_STATUS_DRIVER_OK);
 
-    /* Build device name: virtio-blk0, virtio-blk1, ... */
-    char *name = kmalloc(16);
-    name[0] = 'v';
-    name[1] = 'i';
-    name[2] = 'r';
-    name[3] = 't';
-    name[4] = 'i';
-    name[5] = 'o';
-    name[6] = '-';
-    name[7] = 'b';
-    name[8] = 'l';
-    name[9] = 'k';
-    name[10] = '0' + (char)instance_count;
-    name[11] = '\0';
-
-    inst->blk.name = name;
     inst->blk.block_size = 512;
     inst->blk.block_count =
         (u64)inl((u16)(inst->dev.port_base + VIRTIO_BLK_CONFIG_CAPACITY)) |
@@ -314,10 +299,16 @@ void virtio_blk_init(void) {
     inst->blk.read_blocks = virtio_blk_read;
     inst->blk.write_blocks = virtio_blk_write;
     inst->blk.priv = inst;
-    blk_register(&inst->blk);
+    /* Virtio disks are named the way every other Unix names them: vda, vdb, ...
+     * out of the block layer's "vd" sequence. */
+    blk_register_disk(&inst->blk, "vd", BLK_BUS_VIRTIO);
+    if (!inst->blk.name) {
+      dev_idx++;
+      continue;
+    }
 
     console_write("virtio-blk: registered ");
-    console_write(name);
+    console_write(inst->blk.name);
     console_write(" (PCI ");
     console_write_dec(pci_info.bus);
     console_write(":");

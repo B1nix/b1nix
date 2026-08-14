@@ -46,7 +46,7 @@ echo "staging /boot into rootfs..."
 mkdir -p "$ROOTFS/boot/limine"
 cp -f "$KERNEL" "$ROOTFS/boot/kernel.elf"
 cp -f "$LIMINE_DATADIR/limine-bios.sys" "$ROOTFS/boot/limine/limine-bios.sys"
-# root=LABEL= is device-name-agnostic: b1nix names AHCI disks sata0/sata0p1
+# root=LABEL= is device-name-agnostic: b1nix names AHCI disks sda/sda1
 # (not sda1), and the partition's ext4 is labeled b1nix-root by mke2fs below.
 DISK_CMDLINE="${DISK_CMDLINE:-root=LABEL=b1nix-root}"
 sed -e "s|@ARCH@|$ARCH|g" -e "s|@TIMEOUT@|5|g" \

@@ -439,5 +439,5 @@ static struct vfs_fs ext1_vfs = { .name = "ext1", .mount = ext1_vfs_mount_cb };
 
 void ext1_init(void) {
     vfs_register_fs(&ext1_vfs);
-    vfs_mount("virtio-blk0", "/mnt/ext1", "ext1", 0);
+    vfs_mount("vda", "/mnt/ext1", "ext1", 0);
 }

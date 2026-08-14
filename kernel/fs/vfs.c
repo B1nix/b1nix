@@ -2376,7 +2376,7 @@ void vfs_init(void) {
   vfs_symlink("/", "/persist");
 
   add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
-  add_node("/dev/virtio-blk0", VFS_DEVICE, 0, 0, 0);
+  add_node("/dev/vda", VFS_DEVICE, 0, 0, 0);
   /* M32b pseudo-terminals: /dev/ptmx + the /dev/pts mountpoint directory. Both
    * opens are intercepted in vfs_open_flags; the nodes exist so stat()/ls and
    * ptsname() paths resolve. */
@@ -2411,7 +2411,7 @@ void vfs_init(void) {
   }
 
 #ifndef __aarch64__
-  struct block_device *blk = blk_get("virtio-blk0");
+  struct block_device *blk = blk_get("vda");
   if (blk)
     fat32_mount(blk, "/mnt");
 #endif
@@ -2618,7 +2618,7 @@ void vfs_repopulate_after_root_mount(void) {
   vfs_rmdir("/persist");
   vfs_symlink("/", "/persist");
 
-  /* Re-bind block-device nodes (/dev/sataN, /dev/loopN, ...) WITH their
+  /* Re-bind block-device nodes (/dev/sdX, /dev/loopN, ...) WITH their
    * blk_dev + read_cb/write_cb + size, so userspace can read/write raw disks
    * after the root switch. The previous open-coded loop created unbound
    * VFS_DEVICE placeholders (no read_cb/size → read() returned 0), which broke
@@ -4866,7 +4866,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   g_mounting_fs_id = new_fs_id;
   /* M107: filesystems resolve their device with blk_get(), which matches the
-   * bare registration name ("sata0", "loop0"). Every userspace mounter passes
+   * bare registration name ("sda", "loop0"). Every userspace mounter passes
    * a /dev path, so strip the directory here — this is what made
    * `mount /dev/loop0 /mnt` (and therefore `mount -o loop`) fail with ENODEV
    * while `mount loop0 /mnt` worked. */

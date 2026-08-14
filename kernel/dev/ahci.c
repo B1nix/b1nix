@@ -621,20 +621,6 @@ void ahci_init(void) {
         // Register as block device
         struct block_device *dev = &ahci_devices[ahci_device_count];
 
-        char name_buf[16];
-        // Build name like "sata0", "sata1", etc.
-        name_buf[0] = 's';
-        name_buf[1] = 'a';
-        name_buf[2] = 't';
-        name_buf[3] = 'a';
-        name_buf[4] = '0' + (char)ahci_device_count;
-        name_buf[5] = '\0';
-
-        // Need persistent name storage
-        char *persistent_name = kmalloc(8);
-        memcpy(persistent_name, name_buf, 6);
-
-        dev->name = persistent_name;
         dev->block_size = 512;
         dev->block_count = 0;
 
@@ -660,10 +646,14 @@ void ahci_init(void) {
         dev->read_blocks = ahci_blk_read;
         dev->write_blocks = ahci_blk_write;
         dev->priv = &ports[i];
-        blk_register(dev);
+        /* The block layer names it: the next free sd* in the one SCSI-disk
+         * sequence AHCI shares with USB mass storage. */
+        blk_register_disk(dev, "sd", BLK_BUS_ATA);
+        if (!dev->name)
+          continue;
 
         console_write("ahci: registered ");
-        console_write(name_buf);
+        console_write(dev->name);
         console_write("\n");
         ahci_device_count++;
       }

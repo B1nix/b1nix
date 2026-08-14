@@ -177,7 +177,7 @@ static void sysfs_build_block(struct vfs_node *root) {
     if (bd) {
       sysfs_mkstr(bd, "dev", "8:%lu\n", (unsigned long)i);
       sysfs_mk_live_size(bd, (int)i);
-      sysfs_mkstr(bd, "removable", "0\n");
+      sysfs_mkstr(bd, "removable", "%d\n", blk_is_removable(d));
       sysfs_mkstr(bd, "ro", "0\n");
     }
     if (dbd)

@@ -273,10 +273,10 @@ QEMU/x86_64. Serial log: `ELF load: /mnt/v8/d8 entry=0x2000000` →
 
 **Reproduce:**
 1. `make ARCH=x86_64 KERNEL_CMDLINE="b1nix.test=1 b1nix.v8run" iso`
-2. `sh tools/v8/v8-run-qemu.sh` — attaches `build/v8-out/v8-ext4.img` as AHCI sata0,
+2. `sh tools/v8/v8-run-qemu.sh` — attaches `build/v8-out/v8-ext4.img` as AHCI sda,
    greps the serial log for `M58-V8: ok hello`.
 
-The kernel hook (`kernel/main.c`, guarded by `b1nix.v8run`) mounts sata0 →
+The kernel hook (`kernel/main.c`, guarded by `b1nix.v8run`) mounts sda →
 /mnt/v8 then `user_spawn("/mnt/v8/d8", {"d8","--jitless","-e",
 "print('M58-V8: ok hello')"})`. d8 ships on the ext4 disk (13 MB, too big for the
 xxd initramfs). Relink: `tools/v8/v8-link-d8.sh`; restage into image:

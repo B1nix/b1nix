@@ -64,7 +64,7 @@ SMOKE_PROGRESS_MODE=full
 # artifacts that `make` cannot reproduce from source (they need a multi-GB V8
 # checkout + manual build), so the v8 instance auto-enables ONLY when those
 # artifacts are present and ARCH=x86_64 — and skips honestly otherwise. It boots
-# a dedicated b1nix-v8.iso (b1nix.v8run, no test rc) with the d8 disk as sata0 and
+# a dedicated b1nix-v8.iso (b1nix.v8run, no test rc) with the d8 disk as sda and
 # checks the result-gated M58-V8 markers. Force-off with SMOKE_V8=0.
 V8_DISK_SRC="$PROJECT_DIR/build/v8-out/v8-ext4.img"
 SMOKE_V8=${SMOKE_V8:-auto}
@@ -263,7 +263,7 @@ run_qemu() {
 
 		if [ "${SMOKE_V8_MODE:-0}" = "1" ]; then
 			# V8/d8 instance: the d8 binary is now embedded in the ISO as
-			# Multiboot2 module (ram0), no separate sata0 disk needed.
+			# Multiboot2 module (ram0), no separate sda disk needed.
 			set -- "$@" -nic none -vga none \
 				${EXTRA_QEMU_ARGS:-}
 		elif [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
@@ -453,9 +453,13 @@ if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
 fi
 _mkimg() {  # mkimg <instance-suffix>
     _sata=$(disk_img sata "$1"); _nvme=$(disk_img nvme "$1"); _swap=$(disk_img swap "$1")
+    _usb=$(disk_img usb "$1")
     dd if=/dev/zero of="$_sata" bs=1M count=4 2>/dev/null
     dd if=/dev/zero of="$_nvme" bs=1M count=4 2>/dev/null
     dd if=/dev/zero of="$_swap" bs=1M count=2 2>/dev/null
+    # USB mass storage: only its identity is under test (which sd* letter it
+    # lands on, and that it reports itself removable), so it stays unformatted.
+    dd if=/dev/zero of="$_usb" bs=1M count=2 2>/dev/null
     "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_sata" 2>/dev/null || {
         "$MKE2FS" -F -t ext4 -q "$_sata" 2>/dev/null || {
             echo "Error: Failed to format sata $1 image as ext4."; exit 1
@@ -539,6 +543,13 @@ launch_blk() {
 		NVME_IMG=$(disk_img nvme blk)
 		SWAP_IMG=$(disk_img swap blk)
 		B1NIX_ISO_NAME=b1nix-blk.iso
+		# A USB stick behind the xHCI controller every instance already has.
+		# It is here to prove that USB mass storage draws from the same sd*
+		# sequence as AHCI (so it must come up as the third sd disk, after the
+		# SATA pair) and that swap still takes the second ATA disk with a USB
+		# disk in the namespace.
+		EXTRA_QEMU_ARGS="-drive file=$(disk_img usb blk),if=none,id=usbdisk,format=raw -device usb-storage,bus=xhci.0,drive=usbdisk"
+		export EXTRA_QEMU_ARGS
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[blk]   "
 		run_qemu "$BLK_LOG"
@@ -774,7 +785,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
 	for _i in sys blk posix gfx openrc init iommu amdvi smp v8; do
-	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
+	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" "$(disk_img usb "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
 	exit
@@ -960,8 +971,9 @@ check_output "$LOG" "M8-AIO-SMOKE: done" "M8 AIO smoke completes"
 # ── M14 Advanced Storage, Swap & File Systems ──
 section "M14 Storage, Swap & File Systems"
 check_output "$LOG" "M14-SMOKE: ok swap-smoke" "swap page swap-out and swap-in verified"
-check_output "$LOG" "M14-SMOKE: ok mount-ext4-sata" "mount sata0 as ext4 successful"
-check_output "$LOG" "M14-SMOKE: ok mount-ext4-nvme" "mount nvme0 as ext4 successful"
+check_output "$LOG" "swap: device=sdb" "swap attaches the second SATA disk under its Unix name sdb"
+check_output "$LOG" "M14-SMOKE: ok mount-ext4-sata" "mount sda as ext4 successful"
+check_output "$LOG" "M14-SMOKE: ok mount-ext4-nvme" "mount nvme0n1 as ext4 successful"
 check_output "$LOG" "M14-SMOKE: ok ext4-persistence" "ext4 read, write, and remount persistence verified"
 check_output "$LOG" "M14-SMOKE: ok ext4-fifo-persistence" "a FIFO created with mkfifo is a real ext4 inode and survives umount/mount"
 check_output "$LOG" "M14-SMOKE: ok block-cache" "cached read and dirty write verified"
@@ -1722,6 +1734,9 @@ check_output "$LOG" "M53-VPX: done" "libvpx smoke completes"
 # ── M53 NetSurf framebuffer browser: render a real HTML page ──
 # ── M53 NetSurf on-screen frontend: render straight to /dev/fb0 ──
 # ── M53 NetSurf interactive input: synthesized keyboard/mouse drive the frontend ──
+# The loopback HTTP/HTTPS checks that stood here guarded NetSurf's web access.
+# Nothing starts m53_httpd/m53_httpsd since the browser was removed, so the
+# markers can no longer appear and the checks went with the feature.
 # ── M53 NetSurf public-internet HTTPS (off-link TLS to a real site) ──
 # Skips cleanly when the test host/usernet has no off-link route, so the suite
 # stays green offline (same policy as the M32 external probes).
@@ -2094,8 +2109,15 @@ if [ "$ARCH" = "x86_64" ]; then
 fi
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
 check_output "$LOG" "reboot: restarting" "SYS_REBOOT performs a real machine restart"
-check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"
-check_output "$LOG" "nvme: registered nvme0" "NVMe block device registered"
+check_output "$LOG" "ahci: registered sda" "AHCI disk registered under its Unix name sda"
+check_output "$LOG" "nvme: registered nvme0n1" "NVMe namespace registered as nvme0n1"
+# USB mass storage is a SCSI disk and shares the sd* sequence with AHCI. The blk
+# instance carries two SATA disks and one USB stick, so the stick must be the
+# THIRD sd disk — sdc. A per-driver counter would have made it sda, and the old
+# scheme would have made it usb0; both are what this pins down.
+check_output "$BLK_LOG" "usb: registered sdc" "USB storage takes the next name in the sd sequence AHCI already used (sdc, after sda and sdb)"
+check_output "$BLK_LOG" "M14-SMOKE: ok removable-is-a-fact" "/sys/block reports exactly one removable disk, it is the USB stick, and it is named sd* like any other SCSI disk"
+check_output "$BLK_LOG" "swap: device=sdb" "swap still takes the second ATA disk, not whichever disk happens to be second in the sd sequence"
 
 # Network tests are only wired for the current x86_64/x86 QEMU path.
 if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
@@ -2398,7 +2420,7 @@ if [ "$BLOCKED" -gt 0 ]; then
 fi
 
 for _i in sys blk posix gfx openrc init iommu amdvi smp v8; do
-    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
+    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")"
 done
 echo ""
 

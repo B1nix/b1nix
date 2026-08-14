@@ -15,6 +15,10 @@
 #define NVME_MAX_QUEUE_SIZE 64
 #define NVME_PAGE_SIZE 4096
 
+/* The one namespace this driver drives. It is also the "n<N>" half of the
+ * block-device name (nvme0n1). */
+#define NVME_NSID 1
+
 /* M70: watchdog deadline (10 ms scheduler ticks) for a blocked NVMe I/O wait.
  * The completion IRQ wakes the waiter on the common path; this only bounds a
  * lost interrupt to a re-poll. Never reached on a healthy controller. */
@@ -50,6 +54,7 @@ struct nvme_device {
     u32 block_size;
     
     struct block_device blk_dev;
+    char blk_name[16];
     u16 cid_counter;
     volatile int io_busy; // yield-safe I/O-path mutex (see nvme_io_lock)
 
@@ -65,6 +70,9 @@ struct nvme_device {
 };
 
 static struct nvme_device nvme;
+
+/* Controllers bound so far — the "nvme<N>" half of the block-device name. */
+static usize nvme_controller_count;
 
 /* Yield-safe per-device I/O mutex. nvme_io_submit() rings the SQ doorbell then
  * spins on the CQ calling scheduler_yield(); the submission/completion queues,
@@ -321,7 +329,7 @@ static int nvme_io_transfer(struct nvme_device *nd, u64 lba, u32 count, void *bu
     memset(&sqe, 0, sizeof(sqe));
     
     sqe.cdw0 = (is_write ? NVME_CMD_IO_WRITE : NVME_CMD_IO_READ) | (0 << 16);
-    sqe.nsid = 1;
+    sqe.nsid = NVME_NSID;
     
     u64 phys_addr = vmm_virt_to_phys(buffer);
     sqe.prp1 = phys_addr;
@@ -544,8 +552,8 @@ void nvme_init(void)
         return;
     }
     
-    // Identify namespace 1
-    if (nvme_identify(&nvme, NVME_IDENTIFY_CNS_NS, 1, nvme.phys_identify_buf + NVME_PAGE_SIZE) < 0) {
+    // Identify the namespace this driver drives
+    if (nvme_identify(&nvme, NVME_IDENTIFY_CNS_NS, NVME_NSID, nvme.phys_identify_buf + NVME_PAGE_SIZE) < 0) {
         console_write("nvme: identify namespace 1 failed\n");
         return;
     }
@@ -638,8 +646,15 @@ void nvme_init(void)
         irq_unmask(nvme_irq_line);
     }
 
-    // Register block device
-    nvme.blk_dev.name = "nvme0";
+    // Register block device under its Linux name: controller index, namespace
+    // id. This driver drives namespace 1 of the controller it bound to, and the
+    // controller index comes from the enumeration counter, so a second one
+    // would register as nvme1n1 with nothing here to edit.
+    blk_nvme_name(nvme_controller_count, NVME_NSID, nvme.blk_name,
+                  sizeof(nvme.blk_name));
+    nvme_controller_count++;
+    nvme.blk_dev.name = nvme.blk_name;
+    nvme.blk_dev.bus = BLK_BUS_NVME;
     nvme.blk_dev.block_size = 512; // Use 512-byte blocks for compatibility with blk cache
     nvme.blk_dev.block_count = nvme.namespace_size * (nvme.block_size / 512);
     nvme.blk_dev.read_blocks = nvme_blk_read;
@@ -647,7 +662,9 @@ void nvme_init(void)
     nvme.blk_dev.priv = &nvme;
     blk_register(&nvme.blk_dev);
     
-    console_write("nvme: registered nvme0 with ");
+    console_write("nvme: registered ");
+    console_write(nvme.blk_dev.name);
+    console_write(" with ");
     console_write_dec(nvme.blk_dev.block_count);
     console_write(" blocks\n");
 }

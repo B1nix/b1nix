@@ -308,7 +308,7 @@ echo "BB-W3: start procps"
 echo "BB-W3: done"
 echo "BB-W4: start"
 /opt/busybox/bin/busybox mkdir -p /mnt/w4
-/opt/busybox/bin/busybox mount -t ext4 sata0 /mnt/w4
+/opt/busybox/bin/busybox mount -t ext4 sda /mnt/w4
 /opt/busybox/bin/busybox mount | /opt/busybox/bin/busybox grep -q "/mnt/w4" && echo "BB-W4: ok mount"
 echo m43data > /mnt/w4/m43_create.txt
 /opt/busybox/bin/busybox mkdir /mnt/w4/m43_dir
@@ -330,8 +330,8 @@ fi
 /opt/busybox/bin/busybox netstat -tln | /opt/busybox/bin/busybox grep -q ":22" && echo "BB-W4: ok netstat"
 /opt/busybox/bin/busybox route -n | /opt/busybox/bin/busybox grep -q "10.0.2" && echo "BB-W4: ok route"
 /opt/busybox/bin/busybox ifconfig eth0 | /opt/busybox/bin/busybox grep -q "10.0.2.15" && echo "BB-W4: ok ifconfig"
-/opt/busybox/bin/busybox blkid /dev/sata0 2>/dev/null | /opt/busybox/bin/busybox grep -qi "ext" && echo "BB-W4: ok blkid"
-/opt/busybox/bin/busybox fdisk -l /dev/sata0 2>/dev/null | /opt/busybox/bin/busybox grep -q "Disk /dev/sata0" && echo "BB-W4: ok fdisk"
+/opt/busybox/bin/busybox blkid /dev/sda 2>/dev/null | /opt/busybox/bin/busybox grep -qi "ext" && echo "BB-W4: ok blkid"
+/opt/busybox/bin/busybox fdisk -l /dev/sda 2>/dev/null | /opt/busybox/bin/busybox grep -q "Disk /dev/sda" && echo "BB-W4: ok fdisk"
 /opt/busybox/bin/busybox ping -c 1 -W 3 10.0.2.2 2>&1 | /opt/busybox/bin/busybox grep -q "0% packet loss" && echo "BB-W4B: ok ping"
 /opt/busybox/bin/busybox losetup -f 2>/dev/null | /opt/busybox/bin/busybox grep -q "/dev/loop" && echo "BB-W4B: ok losetup"
 /opt/busybox/bin/busybox ip link show 2>&1 | /opt/busybox/bin/busybox grep -q "eth0" && echo "BB-W4B: ok ip"
@@ -362,7 +362,7 @@ ln -sf leaf.txt /tmp/bb_dir/w7/link.txt 2>/dev/null || :
 /opt/busybox/bin/busybox tree /tmp/bb_dir/w7 2>/dev/null | grep -qE 'leaf' && echo "BB-W7: ok tree-upstream"
 /bin/setfattr -n user.b1nix -v wave7 /tmp/bb_dir/w7/leaf.txt
 /opt/busybox/bin/busybox getfattr -n user.b1nix /tmp/bb_dir/w7/leaf.txt 2>/dev/null | grep -q 'user.b1nix="wave7"' && echo "BB-W7: ok getfattr"
-/bin/lsblk 2>/dev/null | grep -qw sata0 && echo "BB-W7: ok lsblk"
+/bin/lsblk 2>/dev/null | grep -qw sda && echo "BB-W7: ok lsblk"
 rm -rf /tmp/bb_dir/w7
 /opt/busybox/bin/busybox --version 2>/dev/null | grep -qF "1.38.0" && echo "BB-W7: ok version"
 echo "BB-W8: start promote"
@@ -406,8 +406,8 @@ printf 'b1nix' | /bin/uuencode -m - 2>/dev/null | /bin/uudecode -o - 2>/dev/null
 /bin/who >/dev/null 2>&1 && echo "BB-W10: ok who"
 /bin/nice -n 5 /opt/busybox/bin/busybox true && echo "BB-W10: ok nice"
 /bin/stty -a < /dev/console 2>/dev/null | grep -q 'speed\|rows' && echo "BB-W10: ok stty"
-/bin/blockdev --getsz /dev/sata0 2>/dev/null | grep -qE '^[0-9]+$' && echo "BB-W10: ok blockdev"
-/bin/blockdev --getro /dev/sata0 2>/dev/null | grep -qE '^[01]$' && echo "BB-W10: ok blockdev-getro"
+/bin/blockdev --getsz /dev/sda 2>/dev/null | grep -qE '^[0-9]+$' && echo "BB-W10: ok blockdev"
+/bin/blockdev --getro /dev/sda 2>/dev/null | grep -qE '^[01]$' && echo "BB-W10: ok blockdev-getro"
 /bin/fbset 2>/dev/null | grep -q 'geometry' && echo "BB-W10: ok fbset"
 mkdir -p /tmp/bb_dir/w10 && echo parity > /tmp/bb_dir/w10/f
 ( cd /tmp/bb_dir/w10 && /opt/busybox/bin/busybox find . -type f | /bin/cpio -o -H newc > /tmp/bb_dir/w10.cpio 2>/dev/null )

@@ -1361,14 +1361,21 @@ static void usb_probe_port(u32 port, u32 speed)
 				console_write("msc: single-block I/O mode enabled\n");
 
 			/* Register Block Device */
-		msc_dev.bdev.name = "usb0";
 		msc_dev.bdev.block_size = msc_dev.block_size;
 		msc_dev.bdev.block_count = msc_dev.block_count;
 		msc_dev.bdev.read_blocks = msc_read_blocks;
 		msc_dev.bdev.write_blocks = msc_write_blocks;
 		msc_dev.bdev.priv = &msc_dev;
 
-		blk_register(&msc_dev.bdev);
+		/* USB mass storage is a SCSI disk, so it is an sd* like any other —
+		 * out of the same sequence AHCI draws from, which is why the block
+		 * layer owns the sequence instead of each driver counting its own. */
+		blk_register_disk(&msc_dev.bdev, "sd", BLK_BUS_USB);
+		if (!msc_dev.bdev.name)
+			return;
+		console_write("usb: registered ");
+		console_write(msc_dev.bdev.name);
+		console_write("\n");
 	}
 }
 
@@ -1405,9 +1412,20 @@ int xhci_probe(void)
 	if (bootinfo_get_kv("root", root_val, sizeof(root_val))) {
 		if (strcmp(root_val, "liveiso") == 0 ||
 		    strncmp(root_val, "LABEL=", 6) == 0 ||
-		    strncmp(root_val, "UUID=", 5) == 0 ||
-		    strstr(root_val, "usb0") != NULL) {
+		    strncmp(root_val, "UUID=", 5) == 0) {
 			usb_root_requested = 1;
+		} else {
+			/* root= names a device. USB mass storage is an ordinary sd*
+			 * disk now, so the name no longer says which bus it is on —
+			 * what does say something is whether the named device exists
+			 * yet. If it does not, the disk may be one this controller
+			 * has still to enumerate, so bring the controller up. */
+			const char *dev_name = root_val;
+
+			if (strncmp(dev_name, "/dev/", 5) == 0)
+				dev_name += 5;
+			if (dev_name[0] != '\0' && !blk_get(dev_name))
+				usb_root_requested = 1;
 		}
 	}
 	xhci_msc_single_block_requested = bootinfo_has_flag("b1nix.usb.msc.single") ||

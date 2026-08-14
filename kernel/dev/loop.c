@@ -149,6 +149,7 @@ struct block_device *loop_register_file(const char *path, const char *name) {
     strcpy(persistent_name, name);
 
     loop->bdev.name = persistent_name;
+    loop->bdev.bus = BLK_BUS_LOOP;
     loop->bdev.block_size = 512;
     loop->bdev.block_count = (node->inode->size + 511) / 512;
     loop->bdev.read_blocks = loop_read_blocks;
@@ -258,6 +259,7 @@ void loop_init(void) {
     g_loops[i].flags = 0;
     g_loops[i].file_name[0] = '\0';
     g_loops[i].bdev.name = nm;
+    g_loops[i].bdev.bus = BLK_BUS_LOOP;
     g_loops[i].bdev.block_size = 512;
     g_loops[i].bdev.block_count = 0;
     g_loops[i].bdev.read_blocks = loop_read_blocks;

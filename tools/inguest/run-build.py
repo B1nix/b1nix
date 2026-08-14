@@ -4,7 +4,7 @@
 Portable across hosts: QEMU accel falls back kvm -> hvf -> tcg, so it runs fast
 on a Linux/KVM bench, on macOS (HVF), or anywhere (TCG). Boots the interactive
 ISO with build/x86_64/root.ext4 as virtio-blk (mounts /persist), optionally attaches
-a swap disk as AHCI sata1, waits for the shell, runs the in-guest build, copies
+a swap disk as AHCI sdb, waits for the shell, runs the in-guest build, copies
 the resulting kernel.elf to /persist, and watches for a completion marker.
 
 Prereqs (build once on the bench):
@@ -63,10 +63,10 @@ qemu = [
     "-device", "virtio-blk-pci,drive=vblk0",
 ]
 if SWAP_MB > 0:
-    # swap_init() looks for sata1/nvme1, so put a dummy on ahci.0 and swap on ahci.1
+    # swap_init() looks for sdb/nvme1n1, so put a dummy on ahci.0 and swap on ahci.1
     qemu += [
         "-device", "ich9-ahci,id=ahci",
-        "-drive", f"file={img('dummy-sata0.img', 8)},if=none,id=sd0,format=raw",
+        "-drive", f"file={img('dummy-sda.img', 8)},if=none,id=sd0,format=raw",
         "-device", "ide-hd,drive=sd0,bus=ahci.0",
         "-drive", f"file={img(f'swap{SWAP_MB}.img', SWAP_MB)},if=none,id=sd1,format=raw",
         "-device", "ide-hd,drive=sd1,bus=ahci.1",

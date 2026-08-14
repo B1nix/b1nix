@@ -1397,13 +1397,14 @@ iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-pass iso-pass-sway iso
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
 	    --module $(BUILD_DIR)/root.ext4:rootfs.img
 
-# V8 run instance: the kernel hook (gated by b1nix.v8run) mounts sata0 -> /mnt/v8
+# V8 run instance: the kernel hook (gated by b1nix.v8run) mounts ram0 -> /mnt/v8
 # and runs d8 on m58.js. It boots in test mode (b1nix.test=1) on purpose: the hook
-# loads d8 off the disk early — before the rc's M14 test touches sata0 — and the
+# loads d8 off the disk early — before the rc's M14 test touches sda — and the
 # active rc keeps the scheduler busy so d8's thread runs. (Without test mode, init
 # drops to an interactive getty/shell that starves d8 on a single CPU.) Reuses the
 # shared kernel.elf — no recompile, just a different boot cmdline. The d8 binary +
-# m58.js ride on build/v8-out/v8-ext4.img, attached as sata0 by tests/smoke.sh.
+# m58.js ride on build/v8-out/v8-ext4.img, handed to the kernel as the ram0
+# Multiboot2 module by tests/smoke.sh.
 # Display bring-up instance: the kernel and nothing else.
 #
 # Deliberately carries no rootfs module. The in-kernel DRM client is what drives
@@ -1915,6 +1916,7 @@ endif
 # port script breaks the ISO instead of quietly shipping a second copy of libc.
 check-dynamic:
 	@sh tools/check-dynamic.sh $(BUILD_DIR)/rootfs
+	@sh tools/check-rootfs-links.sh $(BUILD_DIR)/rootfs
 
 check-ports:
 	@leaked=0; \

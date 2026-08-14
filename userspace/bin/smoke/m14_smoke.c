@@ -2,6 +2,7 @@
  * m14_smoke — storage, ext4, swap, block-cache, persistence tests.
  * Rewritten to use POSIX API (no b1nix raw syscalls).
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -31,14 +32,14 @@ int main(int argc, char **argv) {
   }
 
   /* 2. Test invalid filesystem type mount */
-  if (mount("sata0", "/mnt/ext3", "invalid_fs_type", 0, NULL) < 0) {
+  if (mount("sda", "/mnt/ext3", "invalid_fs_type", 0, NULL) < 0) {
     marker("M14-SMOKE: ok invalid-fs\n");
   } else {
     marker("M14-SMOKE: fail invalid-fs\n");
   }
 
-  /* 3. Mount sata0 as ext4 (primary) */
-  if (mount("sata0", "/mnt/ext4", "ext4", 0, NULL) == 0) {
+  /* 3. Mount sda as ext4 (primary) */
+  if (mount("sda", "/mnt/ext4", "ext4", 0, NULL) == 0) {
     marker("M14-SMOKE: ok mount-ext4-sata\n");
   } else {
     char err[64];
@@ -47,8 +48,8 @@ int main(int argc, char **argv) {
     marker(err);
   }
 
-  /* 4. Mount nvme0 as ext4 and test read/write persistence */
-  if (mount("nvme0", "/mnt/ext4nvme", "ext4", 0, NULL) == 0) {
+  /* 4. Mount nvme0n1 as ext4 and test read/write persistence */
+  if (mount("nvme0n1", "/mnt/ext4nvme", "ext4", 0, NULL) == 0) {
     int fd_ext4 = open("/mnt/ext4nvme/persist_ext4.txt",
                        O_CREAT | O_RDWR | O_TRUNC, 0666);
     if (fd_ext4 >= 0) {
@@ -60,7 +61,7 @@ int main(int argc, char **argv) {
 
       int um_ok = (umount("/mnt/ext4nvme") == 0);
       int m_ok =
-          (mount("nvme0", "/mnt/ext4nvme", "ext4", 0, NULL) == 0);
+          (mount("nvme0n1", "/mnt/ext4nvme", "ext4", 0, NULL) == 0);
 
       int fd_read = open("/mnt/ext4nvme/persist_ext4.txt", O_RDONLY);
       char buf[64];
@@ -99,7 +100,7 @@ int main(int argc, char **argv) {
       int st1 = stat(fifo, &before);
       sync();
       int um_ok = (umount("/mnt/ext4nvme") == 0);
-      int m_ok = (mount("nvme0", "/mnt/ext4nvme", "ext4", 0, NULL) == 0);
+      int m_ok = (mount("nvme0n1", "/mnt/ext4nvme", "ext4", 0, NULL) == 0);
       int st2 = stat(fifo, &after);
       if (mk == 0 && st1 == 0 && S_ISFIFO(before.st_mode) && um_ok && m_ok &&
           st2 == 0 && S_ISFIFO(after.st_mode)) {
@@ -133,7 +134,7 @@ int main(int argc, char **argv) {
       close(fd_cache);
 
       int um_ok = (umount("/mnt/ext4") == 0);
-      int m_ok = (mount("sata0", "/mnt/ext4", "ext4", 0, NULL) == 0);
+      int m_ok = (mount("sda", "/mnt/ext4", "ext4", 0, NULL) == 0);
 
       int fd_read = open("/mnt/ext4/cache_test.txt", O_RDONLY);
       char buf[64];
@@ -172,7 +173,7 @@ int main(int argc, char **argv) {
       close(fd_persist);
 
       int um_ok = (umount("/mnt/ext4") == 0);
-      int m_ok = (mount("sata0", "/mnt/ext4", "ext4", 0, NULL) == 0);
+      int m_ok = (mount("sda", "/mnt/ext4", "ext4", 0, NULL) == 0);
 
       int fd_read = open("/mnt/ext4/persist.txt", O_RDONLY);
       char buf[128];
@@ -352,6 +353,75 @@ int main(int argc, char **argv) {
     marker(ok ? "M14-SMOKE: ok mmap-durable\n"
               : "M14-SMOKE: fail mmap-durable\n");
     unlink(dp);
+  }
+
+  /* Removable media are identified by what they are, not by what they are
+   * called: USB mass storage is a SCSI disk and so shares the sd* sequence with
+   * AHCI, which means the name can no longer tell the two apart and
+   * /sys/block/<disk>/removable has to carry the fact instead.
+   *
+   * Only emitted where a removable disk is actually attached (the blk instance
+   * has a USB stick behind xHCI); the other instances have none and stay quiet
+   * rather than reporting a pass they did not earn. */
+  {
+    DIR *sysblk = opendir("/sys/block");
+
+    if (sysblk) {
+      char removable_name[64];
+      int removable_count = 0, fixed_count = 0, read_failures = 0;
+      struct dirent *ent;
+
+      removable_name[0] = '\0';
+      while ((ent = readdir(sysblk)) != NULL) {
+        char path[128];
+        char value[8];
+        int vfd, n;
+
+        if (ent->d_name[0] == '.')
+          continue;
+        snprintf(path, sizeof(path), "/sys/block/%s/removable", ent->d_name);
+        vfd = open(path, O_RDONLY);
+        if (vfd < 0) {
+          read_failures++;
+          continue;
+        }
+        n = (int)read(vfd, value, sizeof(value) - 1);
+        close(vfd);
+        if (n <= 0) {
+          read_failures++;
+          continue;
+        }
+        value[n] = '\0';
+        if (value[0] == '1') {
+          removable_count++;
+          snprintf(removable_name, sizeof(removable_name), "%s", ent->d_name);
+        } else if (value[0] == '0') {
+          fixed_count++;
+        } else {
+          read_failures++;
+        }
+      }
+      closedir(sysblk);
+
+      if (removable_count > 0) {
+        /* The stick must be the only removable disk, must sit beside fixed
+         * disks that say so, and must be named sd* — i.e. it joined the SCSI
+         * sequence rather than getting a bus-specific name of its own. */
+        int ok = removable_count == 1 && fixed_count > 0 && read_failures == 0 &&
+                 removable_name[0] == 's' && removable_name[1] == 'd' &&
+                 removable_name[2] != '\0';
+
+        if (ok) {
+          marker("M14-SMOKE: ok removable-is-a-fact\n");
+        } else {
+          char err[128];
+          snprintf(err, sizeof(err),
+                   "M14-SMOKE: fail removable-is-a-fact name=%s rm=%d fixed=%d bad=%d\n",
+                   removable_name, removable_count, fixed_count, read_failures);
+          marker(err);
+        }
+      }
+    }
   }
 
   /* Clean up */

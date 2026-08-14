@@ -3,8 +3,25 @@
 
 #include <b1nix/types.h>
 
+/* What kind of transport a block device sits on. Callers that need to pick a
+ * device by what it *is* — the live-ISO boot medium, the dedicated swap disk —
+ * ask for a bus, never for a name prefix: a name is a label the block layer
+ * hands out, and USB storage answers to sdb or sdc depending only on the order
+ * the buses probed. */
+enum blk_bus {
+	BLK_BUS_UNKNOWN = 0,
+	BLK_BUS_ATA,     /* SATA/AHCI — named sd* */
+	BLK_BUS_USB,     /* USB mass storage — also SCSI, so also named sd* */
+	BLK_BUS_NVME,
+	BLK_BUS_VIRTIO,
+	BLK_BUS_MEMORY,  /* ramdisk */
+	BLK_BUS_LOOP,
+};
+
 struct block_device {
 	const char *name;
+	/* enum blk_bus. A partition inherits its parent's bus. */
+	u8 bus;
 	usize block_size;
 	u64 block_count;
 	int (*read_blocks)(struct block_device *dev, u64 lba, u32 count, void *buffer);
@@ -40,7 +57,31 @@ struct block_buffer {
     i32 hash_next;
 };
 
+/* Device naming. b1nix uses the names the rest of Unix uses; the suffix comes
+ * from the position in the sequence, so no driver carries a table.
+ *   blk_disk_name("sd", 0/1/4, ...)  -> "sda" / "sdb" / "sde"
+ *   blk_disk_name("vd", 0, ...)      -> "vda"
+ *   blk_nvme_name(0, 1, ...)         -> "nvme0n1"
+ * Partitions are named by the block layer itself: sda1, vda1, nvme0n1p1. */
+void blk_disk_name(const char *prefix, usize index, char *out, usize out_size);
+void blk_nvme_name(usize controller, u32 nsid, char *out, usize out_size);
+
+/* Register a whole disk under the next free name in `prefix`'s sequence and
+ * record which bus it came from. The sequence is owned here, not by the driver,
+ * so every SCSI-class disk — AHCI and USB mass storage alike — draws from ONE
+ * "sd" sequence and the fifth disk is sde whichever bus delivered it. The
+ * driver fills in sizes and callbacks first; this assigns ->name (kmalloc'd),
+ * ->bus, and registers. Registration order decides the letter, as on Linux. */
+void blk_register_disk(struct block_device *dev, const char *prefix, u8 bus);
+
 void blk_register(struct block_device *dev);
+
+/* The nth (0-based) whole disk on a given bus, or NULL. Lets a caller say
+ * "the second ATA disk" without spelling a name that only happens to match. */
+struct block_device *blk_nth_on_bus(u8 bus, usize n);
+/* Removable medium (USB mass storage today) — what /sys/block/<d>/removable
+ * reports, and how the live-ISO boot path finds candidate media. */
+int blk_is_removable(struct block_device *dev);
 struct block_device *blk_get(const char *name);
 usize blk_count(void);
 struct block_device *blk_at(usize index);
@@ -51,7 +92,7 @@ const char *blk_probe_fstype(struct block_device *dev);
 
 /* Partition introspection (backs sysfs /sys/block). A registered device is a
  * partition if it was created by the MBR/GPT scanner; otherwise it is a whole
- * disk. blk_partition_number parses the trailing "pN" of the name (1-based). */
+ * disk. blk_partition_number reads the trailing number of the name (1-based). */
 int blk_is_partition(struct block_device *dev);
 struct block_device *blk_partition_parent(struct block_device *dev);
 int blk_partition_number(struct block_device *dev);
