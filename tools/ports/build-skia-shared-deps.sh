@@ -40,12 +40,24 @@ if [ -f "$SKIA_OUT/libskia.so" ]; then
   "$STRIP" --strip-unneeded "$UB/libskia.so" 2>/dev/null || true
   [ -f "$SKIA_OUT/libraw_ptr.so" ] && cp -f "$SKIA_OUT/libraw_ptr.so" "$UB/libraw_ptr.so"
 else
-  # Static build — create empty placeholders
+  # Static build — create empty placeholders.
+  #
+  # With the host clang, as this used to do: the stub came out linked against
+  # the host's glibc (DT_NEEDED libc.so.6) and shipped into the rootfs, where
+  # nothing can load it. Placeholders are still b1nix binaries. The failure is
+  # not swallowed either — a stub we cannot build is a build error, not a
+  # silently missing file.
   echo "build-skia-shared-deps: no libskia.so (static build), creating placeholders" >&2
-  echo "void __skia_placeholder(void) {}" | \
-    clang -shared -x c - -o "$UB/libskia.so" 2>/dev/null || true
-  echo "void __raw_ptr_placeholder(void) {}" | \
-    clang -shared -x c - -o "$UB/libraw_ptr.so" 2>/dev/null || true
+  # -nostdlib: a placeholder has nothing to import, so it needs no libc at all
+  # and records no DT_NEEDED. Built for the b1nix target, not the host.
+  _stub_dir=$(mktemp -d)
+  echo "void __skia_placeholder(void) {}" > "$_stub_dir/skia_stub.c"
+  echo "void __raw_ptr_placeholder(void) {}" > "$_stub_dir/raw_ptr_stub.c"
+  clang --target=x86_64-b1nix -shared -nostdlib -fPIC \
+    "$_stub_dir/skia_stub.c" -o "$UB/libskia.so"
+  clang --target=x86_64-b1nix -shared -nostdlib -fPIC \
+    "$_stub_dir/raw_ptr_stub.c" -o "$UB/libraw_ptr.so"
+  rm -rf "$_stub_dir"
 fi
 
 # --- 2) libfontconfig.so (Alpine's, copied) ----------------------------------

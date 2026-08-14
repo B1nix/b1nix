@@ -501,8 +501,32 @@ static long tar_octal(const char *field, int n) {
     return v;
 }
 
+/*
+ * Create the directories an entry needs, without doing it again for the next
+ * entry in the same directory.
+ *
+ * This runs once per archive member, and it used to issue an mkdir for every
+ * component of every path: a package with a thousand files five levels deep
+ * asked the kernel to create directories five thousand times, and each of
+ * those resolved the path from the root. Archives are written directory by
+ * directory, so remembering the last one collapses nearly all of it — the
+ * mkdirs that remain are the ones that genuinely name a new directory.
+ */
 static void safe_mkdirs(const char *root, const char *rel) {
+    static char last[1024];
     char path[1024];
+    const char *slash = strrchr(rel, '/');
+    size_t dirlen;
+
+    if (!slash)
+        return; /* no directory part: nothing to create */
+    dirlen = (size_t)(slash - rel);
+    if (snprintf(path, sizeof(path), "%.*s", (int)dirlen, rel) >= (int)sizeof(path))
+        return;
+    if (strcmp(path, last) == 0)
+        return; /* same directory as the previous entry */
+    snprintf(last, sizeof(last), "%s", path);
+
     snprintf(path, sizeof(path), "%s/%s", root, rel);
     for (char *p = path + strlen(root) + 1; *p; p++) {
         if (*p == '/') {
@@ -1670,9 +1694,17 @@ static int install_one(struct pkgset *set, const char *name) {
      * exists to make. */
     int cacheable = strncmp(pk->url, "file://", 7) != 0;
 
+    /* Whether these bytes came from the cache decides what a decode failure
+     * means: a package that will not decode is either genuinely broken — in
+     * which case the mirror will say so too — or a cache entry that was
+     * written by a run somebody interrupted. The second is recoverable, and
+     * telling them apart costs one re-download. */
+    int from_cache = 0;
+
     if (cacheable && read_whole_file(cached, &raw) == 0) {
         printf("bpkg: using cached %s %s\n", pk->name, pk->version);
         cacheable = 0; /* already there; nothing to write back */
+        from_cache = 1;
     } else {
         printf("bpkg: fetching %s %s from %s\n", pk->name, pk->version, pk->url);
         if (fetch_url(pk->url, &raw) < 0) return -1;
@@ -1736,6 +1768,19 @@ static int install_one(struct pkgset *set, const char *name) {
             if (members < 3) {
                 fprintf(stderr, "bpkg: %s is signed but only %d of its 3 members decoded -- refusing to install\n",
                         pk->name, members);
+                if (from_cache) {
+                    /* Almost certainly a truncated cache entry: drop it and
+                     * fetch the package again rather than failing the install
+                     * over bytes that were never complete. */
+                    fprintf(stderr, "bpkg: %s came from the cache; discarding it and refetching\n",
+                            pk->name);
+                    unlink(cached);
+                    for (int mi = 0; mi < members; mi++)
+                        buf_free(&member[mi]);
+                    buf_free(&raw);
+                    buf_free(&filelist);
+                    return install_one(set, name);
+                }
                 rc = -1;
             } else {
 #ifdef B1NIX_HAVE_MBEDTLS

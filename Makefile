@@ -143,7 +143,7 @@ ifndef MUSL_INSTALLED
 INITRAMFS_M69_PLUGIN_INC := $(INC_DIR)/initramfs_m69_plugin.inc
 # /lib/libc++.so.1 + /lib/libc++abi.so.1 — shared LLVM C++ stdlib (M89), linked
 # from the PIC libc++.a/libc++abi.a by build-libcxx-shared.sh. The hosted C++
-# smoke binaries (cxx_smoke/m55_iostream/m55_litehtml/m64_clang) link these via
+# smoke binaries (cxx_smoke/m55_iostream/m64_clang) link these via
 # the libc++-default b1nix-c++; libc++abi.so.1 folds the libunwind DWARF unwinder.
 INITRAMFS_LIBCXX_INC := $(INC_DIR)/initramfs_libcxx.inc
 INITRAMFS_LIBCXXABI_INC := $(INC_DIR)/initramfs_libcxxabi.inc
@@ -823,7 +823,6 @@ $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(wildcard userspace/bin/*/*.S) \
 	$(wildcard userspace/src/*.c) \
 	$(wildcard userspace/b1cc/src/*.c userspace/b1cc/src/*/*.c) \
-	$(wildcard userspace/duktape/duktape.c) \
 	$(LIBM_LIB) \
 	$(PCRE2_LIB) \
 	$(PIXMAN_LIB) \
@@ -898,9 +897,6 @@ LIBM_LIB := build/$(ARCH)/ports/openlibm/install/lib/libm.a
 $(LIBM_LIB): tools/ports/build-openlibm.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-openlibm.sh >/dev/null
 
-# M58: /bin/js embeds Duktape and links the ported openlibm — so libm must be
-# built before js. js.c links duktape.c (a vendored amalgamation under
-# userspace/duktape/), both compiled by the userspace Makefile's custom rule.
 # M51: pixman (generic C), cross-built static, linked into m51_pixman_smoke.
 PIXMAN_LIB := build/$(ARCH)/pkg/pixman/lib/libpixman-1.a
 $(PIXMAN_LIB): $(PKG_DEPS)
@@ -1847,10 +1843,8 @@ endif
 	@# userspace-install never copies them. Build (if missing) then stage into
 	@# rootfs/bin here, same as skia-dm above.
 	@UD=userspace/build/$(ARCH)/bin; \
-	[ -f "$$UD/m53_mesa_virgl" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m53-mesa-virgl.sh "$$UD/m53_mesa_virgl" || true; \
 	[ -f "$$UD/m91_skia_smoke" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m91-skia-demo.sh m91_skia_smoke "$$UD/m91_skia_smoke" || true; \
-	[ -f "$$UD/m55_litehtml" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m55-litehtml.sh "$$UD/m55_litehtml" || true; \
-	for b in m53_mesa_virgl m91_skia_smoke m55_litehtml; do \
+	for b in m91_skia_smoke; do \
 		if [ -f "$$UD/$$b" ]; then \
 			cp -f "$$UD/$$b" $(BUILD_DIR)/rootfs/bin/$$b; \
 			chmod +x $(BUILD_DIR)/rootfs/bin/$$b; \

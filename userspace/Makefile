@@ -275,18 +275,12 @@ BINARIES += $(BUILD)/bin/m11_pipe_smoke
 BINARIES += $(BUILD)/bin/m22_smoke
 BINARIES += $(BUILD)/bin/net_smoke
 BINARIES += $(BUILD)/bin/m51_clipboard_smoke
-BINARIES += $(BUILD)/bin/m53_httpd
-# M53 loopback HTTPS server + the driver that runs the NetSurf render tests.
-BINARIES += $(BUILD)/bin/m53_httpsd
 BINARIES += $(BUILD)/bin/b1fetch
 BINARIES += $(BUILD)/bin/gpuinfo
 BINARIES += $(BUILD)/bin/mc
 BINARIES += $(BUILD)/bin/ne
 # M16 driver: runs mc/ne out-of-process and covers the rest of the TUI surface.
 BINARIES += $(BUILD)/bin/m16_smoke
-# M58: standalone JavaScript interpreter (embeds Duktape) + its smoke test.
-BINARIES += $(BUILD)/bin/js
-BINARIES += $(BUILD)/bin/m58_smoke
 # POSIX memory/signal primitives: madvise, MAP_NORESERVE, sigaltstack
 BINARIES += $(BUILD)/bin/m_posixmm_smoke
 # Is a shared mapping actually shared between two processes? Every Wayland
@@ -310,9 +304,8 @@ ifeq ($(B1NIX_ARCH),x86_64)
 BINARIES += $(BUILD)/bin/m30_dynamic
 endif
 
-# /bin/js has a custom multi-source rule (duktape.c + js.c) — exclude it from
 # the generic single-source BIN_OBJS pattern.
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m57_smoke $(BUILD)/bin/m53_httpsd $(BUILD)/bin/m104_pam_smoke $(BUILD)/bin/m108_smoke,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m57_smoke $(BUILD)/bin/m104_pam_smoke $(BUILD)/bin/m108_smoke,$(BINARIES)))
 DEPS := $(BIN_OBJS:.o=.d)
 
 .PHONY: all clean install install-headers-libs
@@ -624,51 +617,6 @@ $(BUILD)/bin/m32_nettool: bin/helpers/m32_nettool.c $(BESPOKE_LIBDEP) $(if $(BES
 	)
 	ln -sf m32_nettool $(BUILD)/bin/m32-nettool
 
-# m53_httpsd: loopback HTTPS server (mbedTLS) for the M53 NetSurf web-access smoke.
-$(BUILD)/bin/m53_httpsd: bin/gfx/m53_httpsd.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(MBEDTLS_DIR)/include -c $< -o $(BUILD)/bin/m53_httpsd.o
-	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_httpsd.o \
-	  --start-group \
-	  $(MBEDTLS_DIR)/lib/libmbedtls.a $(MBEDTLS_DIR)/lib/libmbedx509.a $(MBEDTLS_DIR)/lib/libmbedcrypto.a \
-	  $(BESPOKE_LIBC) \
-	  --end-group
-	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
-	)
-
-
-# M58: /bin/js — standalone JavaScript interpreter embedding Duktape 2.7.0.
-# Duktape is a single-file ANSI C amalgamation; it compiles fine with the same
-# freestanding clang path as the rest of userspace. It needs a handful of libm
-# functions (pow/floor/ceil/fmod/...), supplied by the ported openlibm. The
-# duktape.c object is large (~600KB) and slow-ish to build, so it is compiled
-# once into its own .o and linked into js.
-DUK_DIR := duktape
-$(BUILD)/duktape/duktape.o: $(DUK_DIR)/duktape.c $(DUK_DIR)/duktape.h $(DUK_DIR)/duk_config.h
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(BESPOKE_PIC) -Wno-unused-parameter -Wno-unused-but-set-variable \
-	  -Wno-tautological-constant-out-of-range-compare -I $(DUK_DIR) -c $< -o $@
-
-$(BUILD)/bin/js: bin/tools/js.c $(BUILD)/duktape/duktape.o $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(DUK_DIR) -c $< -o $(BUILD)/bin/js.o
-	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/js.o \
-	  $(BUILD)/duktape/duktape.o $(LIBM_DIR)/lib/libm.a \
-	  $(BESPOKE_LIBC)
-	$(if $(BESPOKE_MUSL_POSTLINK), \
-	  python3 -c "\
-	  import sys; f=sys.argv[1]; \
-	  d=open(f,'rb').read(); \
-	  d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
-	  open(f,'wb').write(d); \
-	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
-	)
 
 # M51: m51_smoke links the ported static libm (openlibm).
 $(BUILD)/bin/m51_smoke: bin/gfx/m51_smoke.c $(BESPOKE_LIBDEP)

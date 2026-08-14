@@ -518,7 +518,8 @@ Status:
 - [x] WebAssembly (`v8_enable_webassembly`) without trap handler.
 - [x] Sandbox (`v8_enable_sandbox`, TrustedSpace, sandboxed pointers).
 - [x] i18n (`v8_enable_i18n_support`) with embedded ICU data.
-- [x] on-tree Duktape as lightweight `/bin/js` runner.
+- Duktape `/bin/js` removed: V8/d8 is the JavaScript engine on b1nix, and a second
+  vendored interpreter earned nothing.
 - [x] POSIX memory wins: `madvise`, `MAP_NORESERVE`, and `sigaltstack` with `SA_ONSTACK`.
 
 ## M59: EGL and GL for the Browser
@@ -863,6 +864,16 @@ vendor, so M102a and M102b are two consumers of it rather than two ports.
 - [x] Pin the upstream release and record it the way the ports tree pins versions: Linux 6.6 with a SHA-256 verified *before* extraction, listed in `THIRD_PARTY_NOTICES.md` with its licence split.
 - [x] Prove the layer before any vendor driver: the in-kernel DRM client probes the connector, allocates a framebuffer and commits it through upstream's atomic helpers, and the pixels are then read back off virtio-gpu's scanout — corners and centre — so a commit that returns success without moving an image fails the test.
 - [x] Give the core a character device and drive it from ring 3: `/dev/dri/card1` beside the existing `card0`, served by upstream's own `drm_open`/`drm_ioctl`/`drm_read`/`drm_poll`, with dumb buffers mapped through `drm_vma_manager` — offsets resolved a page at a time and refused when `drm_vma_node_is_allowed` says the client does not own the object. A userspace test runs the sequence libdrm runs, against the *pinned* uapi headers rather than a copy, and checks the pattern it painted came out the far end of the commit. Two nodes on purpose: the new surface is proved on its own before anything moves onto it.
+
+- [ ] `planned` Hardware rendering as a second path, never as a replacement.
+      Composition today is software (`WLR_RENDERER=pixman`) and must stay a
+      supported, tested path: it is the only one that works on a machine whose
+      GPU we do not drive, and it is what proves the display pipeline in
+      isolation when acceleration breaks. The accelerated path — a real GL/GLES
+      driver in the guest on top of the imported DRM core, which wlroots picks
+      through EGL and gbm — is added beside it, chosen at run time and falling
+      back to software rather than failing. Both paths get their own smoke
+      coverage, so a regression in one cannot hide behind the other.
 
 ## M102a: Intel i915 (Gen8/Gen9.5) + Mesa iris
 

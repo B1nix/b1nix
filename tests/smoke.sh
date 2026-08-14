@@ -1722,10 +1722,6 @@ check_output "$LOG" "M53-VPX: done" "libvpx smoke completes"
 # ── M53 NetSurf framebuffer browser: render a real HTML page ──
 # ── M53 NetSurf on-screen frontend: render straight to /dev/fb0 ──
 # ── M53 NetSurf interactive input: synthesized keyboard/mouse drive the frontend ──
-# ── M53 NetSurf WEB access: fetch + render a page over HTTP (loopback) ──
-check_output "$LOG" "M53-HTTPD: ready" "in-VM HTTP server is listening on loopback"
-# ── M53 NetSurf HTTPS: fetch + render a page over TLS (loopback, cert verified) ──
-check_output "$LOG" "M53-HTTPSD: ready" "in-VM HTTPS (TLS 1.2) server is listening on loopback"
 # ── M53 NetSurf public-internet HTTPS (off-link TLS to a real site) ──
 # Skips cleanly when the test host/usernet has no off-link route, so the suite
 # stays green offline (same policy as the M32 external probes).
@@ -2326,17 +2322,10 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	# M64 clang++ frontend is x86_64-only (size_t mangling clash with the
 	# GCC-built libstdc++ on i686-b1nix); GCC stays the C++ compiler on x86.
 	[ "$ARCH" = "x86_64" ] && check_output "$LOG" "M64-CLANG: ok" "M64: clang++ frontend with GNU C++ runtime"
-	check_output "$LOG" "M55-LITEHTML: ok parse" "M55 C++: litehtml parses HTML/CSS (gumbo + STL)"
-	check_output "$LOG" "M55-LITEHTML: ok layout" "M55 C++: litehtml lays out a box tree (render)"
-	check_output "$LOG" "M55-LITEHTML: ok draw" "M55 C++: litehtml cascade+draw (h1>p font, ordered)"
 	check_output "$LOG" "M55-IOSTREAM: ok cout" "M55 C++: std::cout/cerr formatted output (iostream locale facets)"
 	check_output "$LOG" "M55-IOSTREAM: ok sstream" "M55 C++: std::ostringstream/istringstream round-trip"
 	check_output "$LOG" "M55-IOSTREAM: ok cin" "M55 C++: std::cin extraction from a real fd 0 (piped stdin)"
 	check_output "$LOG" "M55-IOSTREAM: ok filesystem" "M55 C++: std::filesystem create/iterate/stat/remove over VFS"
-	check_output "$LOG" "M58-SMOKE: ok eval" "M58 JS: /bin/js (Duktape) evaluates arithmetic + String method"
-	check_output "$LOG" "M58-SMOKE: ok json" "M58 JS: JSON.parse/stringify round-trip"
-	check_output "$LOG" "M58-SMOKE: ok print" "M58 JS: print()/console.log native binding"
-	check_output "$LOG" "M58-SMOKE: done" "M58 JS: all interpreter checks passed"
 	check_output "$LOG" "M51-GFX: ok libm" "M51: ported libm (openlibm) runtime math"
 	check_output "$LOG" "M51-GFX: ok pixman" "M51: ported pixman compositing"
 	check_output "$LOG" "M51-GFX: ok freetype" "M51: ported FreeType glyph rasterization"

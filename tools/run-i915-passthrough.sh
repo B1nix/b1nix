@@ -261,16 +261,25 @@ if [ ! -f "$CACHE_IMG" ]; then
 fi
 DEV_ARGS="$DEV_ARGS -drive file=$CACHE_IMG,format=raw,if=virtio"
 
+
 echo "b1nix + $IGD_BDF via VFIO ($MACHINE), ${MEM_MB}M, log: $LOG"
 
 set +e
-# More than one CPU, because the guest is not only waiting on the network: bpkg
-# does TLS, signature checking and sha256 in software, and on a single core
-# those queue behind the packets they are decrypting.
+# One CPU by default, for now.
+#
+# More would help — the guest is not only waiting on the network — but with
+# four it panicked walking a kernel page directory whose entry pointed at a
+# non-canonical address. The faulting address was the block cache's read-ahead
+# buffer in the kernel arena, which every address space shares by pointer, so
+# this is not a stale userspace translation: a frame that was live as a page
+# table had been handed to a second owner, and the block layer was merely the
+# first code to walk it. The same signature also appears in mprotect, in a run
+# with no GPU at all. The writer is not identified yet, so SMP=<n> asks for
+# more cores deliberately rather than getting the fault by surprise.
 timeout "$TIMEOUT" qemu-system-x86_64 \
 	$MACHINE_ARGS \
 	-m "$MEM_MB" \
-	-smp "${SMP:-4}" \
+	-smp "${SMP:-1}" \
 	-cdrom "$ISO" \
 	-boot d \
 	$DEV_ARGS \

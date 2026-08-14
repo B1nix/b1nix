@@ -4,13 +4,6 @@ The MIT license described in `LICENSING.md` applies to original B1NIX material. 
 
 ---
 
-## 1. Source Included directly in Repository
-
-| Component | Location | Version / Revision | License | Upstream / Reference |
-| --- | --- | --- | --- | --- |
-| **TinyCC** | `userspace/tcc/` | 0.9.28rc | GNU LGPL v2.1 or later | <https://repo.or.cz/tinycc.git> |
-| **Duktape** | `userspace/duktape/` | 2.7.0 | MIT License | <https://duktape.org/> |
-
 ### Fetched at build time, never vendored
 
 | Component | Staged at | Version / Revision | License | Upstream / Reference |

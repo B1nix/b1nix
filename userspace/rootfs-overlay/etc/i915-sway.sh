@@ -93,8 +93,15 @@ if [ -e /dev/virtio-blk0 ]; then
 	fi
 fi
 
+# http, not https — the same choice apk makes.
+#
+# Every package carries an RSA signature over a control block that carries the
+# payload's sha256, and bpkg refuses to install one whose chain does not check
+# out. Transport encryption adds nothing to that and costs a great deal here:
+# the cipher runs in software on one core, in front of every byte of a
+# quarter-gigabyte download.
 cat > /etc/bpkg.conf <<'EOF'
-INDEX_URL=https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz https://dl-cdn.alpinelinux.org/alpine/v3.20/community/x86_64/APKINDEX.tar.gz
+INDEX_URL=http://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz http://dl-cdn.alpinelinux.org/alpine/v3.20/community/x86_64/APKINDEX.tar.gz
 EOF
 
 # What the image is missing, if anything.
@@ -147,11 +154,16 @@ for pkg in $NEED; do
 	else
 		echo "I915-SWAY: fail install-$pkg"
 	fi
-	# After each package, not once at the end: a run that is cut off part-way
-	# through the list — which is what happens when the download budget runs
-	# out — would otherwise leave every byte it fetched dirty in the block
-	# cache, and the next run starts from nothing again.
-	sync
+	# Every few packages, not every one.
+	#
+	# A run that is cut off part-way through the list must not lose everything
+	# it fetched, so the cache is flushed as it goes — but flushing after each
+	# package writes the whole dirty block cache each time, including for
+	# packages that came from the cache and wrote nothing. Every eighth is
+	# often enough to bound the loss and rare enough not to dominate the
+	# install.
+	pkg_n=$((${pkg_n:-0} + 1))
+	[ $((pkg_n % 8)) -eq 0 ] && sync
 done
 
 # Push the cache to the disk while there is still something to push it with.
