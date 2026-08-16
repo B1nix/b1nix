@@ -28,20 +28,17 @@
 #include <stdint.h>
 
 #include <security/pam_appl.h>
-#include <security/pam_constants.h>
 
 static void emit(const char *s) { write(1, s, strlen(s)); }
 
-#define PAM_SERVICE  "m104-pam-smoke"
+#define SMOKE_PAM_SERVICE  "m104-pam-smoke"
 #define TEST_USER    "pamtest"
 #define TEST_PASS_OK "PamSmoke123!"
 #define TEST_PASS_BAD "not the password"
 
 /* Non-interactive PAM conversation function: PAM_PROMPT_ECHO_OFF is answered
  * with the password baked into appdata_ptr by main() below — this is the
- * standard OpenPAM pattern for a scripted/non-tty caller (see
- * openpam_ttyconv.c's real interactive version, which this deliberately
- * does NOT reuse, for the same reason a test harness doesn't want a tty). */
+ * standard PAM pattern for a scripted/non-tty caller. */
 static int
 smoke_conv(int n, const struct pam_message **msg,
     struct pam_response **resp, void *data)
@@ -84,7 +81,7 @@ run_pam_cycle(const char *user, const char *password, int *acct_out)
 	conv.conv = smoke_conv;
 	conv.appdata_ptr = (void *)(uintptr_t)password;
 
-	r = pam_start(PAM_SERVICE, user, &conv, &pamh);
+	r = pam_start(SMOKE_PAM_SERVICE, user, &conv, &pamh);
 	if (r != PAM_SUCCESS) {
 		emit("M104-PAM: fail pam_start\n");
 		return (r);

@@ -18,7 +18,18 @@
 #   tools/build-native-clang.sh --b1nix-elf
 set -eu
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT=""
+cur="$SCRIPT_DIR"
+while [ "$cur" != "/" ]; do
+  if [ -f "$cur/Makefile" ] && [ -d "$cur/kernel" ]; then
+    ROOT="$cur"
+    break
+  fi
+  cur="$(dirname "$cur")"
+done
+[ -n "$ROOT" ] || ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 export PROJECT_DIR="$ROOT"
 . "$ROOT/tools/toolchain/env.sh" 2>/dev/null || true
 B1NIX_TRIPLET="${B1NIX_TRIPLET:-x86_64-b1nix}"

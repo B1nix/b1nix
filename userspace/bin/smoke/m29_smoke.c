@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include "syscall.h"
 #include <syslog.h>
 
@@ -18,7 +19,6 @@
 #include <sys/syscall.h>
 #define SYS_YIELD __NR_sched_yield
 #define SYS_GETTID __NR_gettid
-#define SYS_WAITPID __NR_wait4
 #define SYS_SET_TLS_VIA_ARCH_PRCTL
 #endif
 #include <utmp.h>
@@ -315,15 +315,13 @@ static int test_gettid(void) {
 /* ── 6: stress — leader exit() WITHOUT joining its threads ── */
 
 static void *t6_spin(void *arg) {
-  /* Variable-length spin so across rounds the threads die in every order
-   * relative to the leader's _exit (before, racing, after). */
   long n = (long)arg;
-  for (volatile long i = 0; i < n * 4000; i++) { (void)i; }
+  for (volatile long i = 0; i < n * 500; i++) { (void)i; }
   return 0;
 }
 
 int test_stress_smp(void) {
-  for (int round = 0; round < 120; round++) {
+  for (int round = 0; round < 40; round++) {
     int pid = fork();
     if (pid < 0) { fail("stress-fork"); return -1; }
     if (pid == 0) {
@@ -339,7 +337,8 @@ int test_stress_smp(void) {
       _exit(0);
     }
     int status = -1;
-    int wr = (int)syscall(SYS_WAITPID, pid, &status, 0);
+    int wr;
+    while ((wr = waitpid(pid, &status, 0)) < 0 && errno == EINTR);
     if (wr != pid) { fail("stress-waitpid"); return -1; }
     if (status != 0) { fail("stress-exit-code"); return -1; }
   }

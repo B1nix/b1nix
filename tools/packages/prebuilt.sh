@@ -33,7 +33,18 @@
 #   B1NIX_PREBUILT_OFF   set to 1 to ignore artifacts entirely and always build
 set -eu
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR=""
+cur="$SCRIPT_DIR"
+while [ "$cur" != "/" ]; do
+  if [ -f "$cur/Makefile" ] && [ -d "$cur/kernel" ]; then
+    ROOT_DIR="$cur"
+    break
+  fi
+  cur="$(dirname "$cur")"
+done
+[ -n "$ROOT_DIR" ] || ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ARCH="${B1NIX_ARCH:-${ARCH:-x86_64}}"
 BUILD_DIR="$ROOT_DIR/build/$ARCH"
 LOCK="$ROOT_DIR/tools/packages/prebuilt.lock"

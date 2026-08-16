@@ -321,7 +321,11 @@ install_one() {
 	# and refuse.
 	[ -d "$tmp/usr/lib" ] && cp -a --remove-destination "$tmp/usr/lib/." "$PREFIX/lib/"
 	[ -d "$tmp/lib" ] && cp -a --remove-destination "$tmp/lib/." "$PREFIX/lib/"
-	find "$PREFIX/lib" "$PREFIX/include" -type f -o -type l 2>/dev/null >> "$INSTALLED"
+	[ -d "$tmp/usr/sbin" ] && { mkdir -p "$PREFIX/sbin"; cp -a --remove-destination "$tmp/usr/sbin/." "$PREFIX/sbin/"; }
+	[ -d "$tmp/sbin" ] && { mkdir -p "$PREFIX/sbin"; cp -a --remove-destination "$tmp/sbin/." "$PREFIX/sbin/"; }
+	[ -d "$tmp/usr/bin" ] && { mkdir -p "$PREFIX/bin"; cp -a --remove-destination "$tmp/usr/bin/." "$PREFIX/bin/"; }
+	[ -d "$tmp/bin" ] && { mkdir -p "$PREFIX/bin"; cp -a --remove-destination "$tmp/bin/." "$PREFIX/bin/"; }
+	find "$PREFIX" -type f -o -type l 2>/dev/null >> "$INSTALLED"
 	rm -rf "$tmp"
 
 	# Symlinks that named another directory now name a sibling, since there is

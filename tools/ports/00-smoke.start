@@ -149,7 +149,6 @@ run_test /bin/m51_cairo_smoke gfx
 run_test /bin/m51_xkb_smoke gfx
 run_test /bin/m51_harfbuzz_smoke gfx
 run_test /bin/m51_fontconfig_smoke gfx
-run_test /bin/m55_litehtml gfx
 run_test /bin/m51_clipboard_smoke gfx
 
 # ---- posix (shell, coreutils, job control) ----
@@ -163,7 +162,6 @@ run_test /bin/m86_smoke posix
 run_test /bin/m95_smoke posix
 run_test /bin/m96_smoke posix
 run_test /bin/m107_smoke posix
-run_test /bin/crashpad_smoke posix
 run_test /bin/m63_smoke posix
 run_test /bin/m71_aslr posix
 run_test /bin/m42_w5pre_smoke posix

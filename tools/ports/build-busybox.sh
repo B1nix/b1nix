@@ -102,40 +102,10 @@ sh "$PROJECT_DIR/tools/patches/busybox/b1nix-config.sh" "$SRC_DIR"
 mkdir -p "$BUILD_DIR"
 
 echo "Generating BusyBox configuration from $CONFIG_FRAGMENT..."
-make -C "$SRC_DIR" O="$BUILD_DIR" allnoconfig < /dev/null
-while IFS= read -r setting; do
-    case "$setting" in
-        CONFIG_*=*)
-            key="${setting%%=*}"
-            grep -v -e "^${key}=" -e "^# ${key} is not set$" \
-                "$BUILD_DIR/.config" > "$BUILD_DIR/.config.tmp" || true
-            echo "$setting" >> "$BUILD_DIR/.config.tmp"
-            mv "$BUILD_DIR/.config.tmp" "$BUILD_DIR/.config"
-            ;;
-        "# CONFIG_"*" is not set")
-            key="${setting#\# }"
-            key="${key% is not set}"
-            grep -v -e "^${key}=" -e "^# ${key} is not set$" \
-                "$BUILD_DIR/.config" > "$BUILD_DIR/.config.tmp" || true
-            echo "$setting" >> "$BUILD_DIR/.config.tmp"
-            mv "$BUILD_DIR/.config.tmp" "$BUILD_DIR/.config"
-            ;;
-    esac
-done < "$CONFIG_FRAGMENT"
-# Feed newlines rather than EOF: enabling an applet in the manifest config can
-# introduce sub-options the stored .config has no value for, and oldconfig
-# prompts for each one. An empty line accepts the shown default; </dev/null
-# made the first such prompt a hard error instead.
-# Answer with blank lines rather than EOF: enabling an applet in the manifest
-# config can pull in sub-options the stored .config has no value for, and
-# oldconfig prompts for each one. A blank line accepts the shown default,
-# whereas </dev/null turned the first such prompt into a hard error. The
-# answers are generated without a pipe so `set -o pipefail` never sees the
-# SIGPIPE a `yes | head` would produce.
-awk 'BEGIN { for (i = 0; i < 20000; i++) print "" }' \
-    > "$BUILD_DIR/.oldconfig-answers"
-make -C "$SRC_DIR" O="$BUILD_DIR" oldconfig < "$BUILD_DIR/.oldconfig-answers"
-rm -f "$BUILD_DIR/.oldconfig-answers"
+cp -f "$CONFIG_FRAGMENT" "$BUILD_DIR/.config"
+set +o pipefail
+yes "" | make -C "$SRC_DIR" O="$BUILD_DIR" oldconfig
+set -o pipefail
 
 # Force a clean rebuild when the b1nix sysroot changed since the last BusyBox
 # build. BusyBox's make does not track the sysroot headers / libb1nix.a as

@@ -78,12 +78,11 @@
 #include <unistd.h>
 
 #include <security/pam_appl.h>
-#include <security/pam_constants.h>
 
 #define BB_PLAIN "/opt/busybox/bin/busybox"
 #define BB_SUID  "/opt/busybox/bin/busybox-suid"
 
-#define PAM_SERVICE "m108-smoke"
+#define M108_PAM_SERVICE "m108-smoke"
 
 #define USER_CALLER "m108user"
 #define UID_CALLER  1002
@@ -193,7 +192,7 @@ static int pam_check(const char *user, const char *password)
 	conv.conv = m108_conv;
 	conv.appdata_ptr = (void *)(uintptr_t)password;
 
-	r = pam_start(PAM_SERVICE, user, &conv, &pamh);
+	r = pam_start(M108_PAM_SERVICE, user, &conv, &pamh);
 	if (r != PAM_SUCCESS)
 		return r;
 	auth_r = pam_authenticate(pamh, 0);

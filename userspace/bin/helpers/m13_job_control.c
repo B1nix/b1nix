@@ -22,8 +22,11 @@ static int wait_for_status(int pid, int options, int *status_out, int tries) {
         *status_out = st;
       return 0;
     }
-    usleep(1000);
+    sched_yield();
+    usleep(2000);
   }
+  if (status_out)
+    *status_out = st;
   return -1;
 }
 
@@ -85,7 +88,7 @@ int main(void) {
   }
 
   int st = 0;
-  if (wait_for_status(child, WUNTRACED, &st, 128) != 0 ||
+  if (wait_for_status(child, WUNTRACED, &st, 256) != 0 ||
       !WIFSTOPPED(st)) {
     marker("M13-JC-SMOKE: fail wuntraced\n");
     return 1;

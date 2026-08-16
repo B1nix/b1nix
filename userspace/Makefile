@@ -532,29 +532,26 @@ $(BUILD)/bin/native_smoke: bin/helpers/native_smoke.S
 	$(LD) $(LDFLAGS) $(if $(LINKER),-T $(LINKER)) -o $@ $(BUILD)/bin/native_smoke.o
 
 # M104: OpenPAM smoke — the one binary in this tree that links a THIRD-PARTY
-# shared object (libpam.so.2, DT_NEEDED) rather than only musl's libc.so.
-# OPENPAM_DIR is tools/ports/build-openpam.sh's install dir; libpam.so.2 also
-# has to be present in the rootfs at runtime (see the Makefile's root-image
-# target) for ld-musl to resolve it.
-OPENPAM_DIR := ../build/$(B1NIX_ARCH)/ports/openpam/install
-$(BUILD)/bin/m104_pam_smoke: bin/smoke/m104_pam_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(OPENPAM_DIR)/lib/libpam.so.2
+# M104: Linux-PAM smoke. Links libpam.so.0 as DT_NEEDED.
+PAM_DIR := ../build/$(B1NIX_ARCH)/pkg/pam
+$(BUILD)/bin/m104_pam_smoke: bin/smoke/m104_pam_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(PAM_DIR)/lib/libpam.so
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(OPENPAM_DIR)/include -c $< -o $(BUILD)/bin/m104_pam_smoke.o
-	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -L $(OPENPAM_DIR)/lib -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m104_pam_smoke.o \
-	  -l:libpam.so.2 $(BESPOKE_LIBC)
+	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(PAM_DIR)/include -c $< -o $(BUILD)/bin/m104_pam_smoke.o
+	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -L $(PAM_DIR)/lib -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m104_pam_smoke.o \
+	  -lpam $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  $(call stamp_linux_osabi,$@) \
 	)
 
-# M108: BusyBox su/passwd/init smoke. Links libpam.so.2 for the same reason
+# M108: BusyBox su/passwd/init smoke. Links libpam.so for the same reason
 # m104_pam_smoke does — it has to ask the REAL pam_unix.so whether the password
 # BusyBox's passwd applet wrote is accepted — so it needs the same bespoke rule
 # rather than the generic single-source pattern.
-$(BUILD)/bin/m108_smoke: bin/smoke/m108_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(OPENPAM_DIR)/lib/libpam.so.2
+$(BUILD)/bin/m108_smoke: bin/smoke/m108_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(PAM_DIR)/lib/libpam.so
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(OPENPAM_DIR)/include -c $< -o $(BUILD)/bin/m108_smoke.o
-	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -L $(OPENPAM_DIR)/lib -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m108_smoke.o \
-	  -l:libpam.so.2 $(BESPOKE_LIBC)
+	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(PAM_DIR)/include -c $< -o $(BUILD)/bin/m108_smoke.o
+	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -L $(PAM_DIR)/lib -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m108_smoke.o \
+	  -lpam $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  $(call stamp_linux_osabi,$@) \
 	)
@@ -617,13 +614,14 @@ $(BUILD)/bin/m51_freetype_smoke: bin/gfx/m51_freetype_smoke.c $(BESPOKE_LIBDEP)
 	  $(BESPOKE_LIBC)
 
 # M51: m51_cairo_smoke links the full stack (Cairo + FreeType + pixman + libm).
-CAIRO_DIR := ../build/$(B1NIX_ARCH)/ports/cairo/install
+CAIRO_DIR := ../build/$(B1NIX_ARCH)/pkg/cairo
+FC_DIR := ../build/$(B1NIX_ARCH)/pkg/fontconfig
 $(BUILD)/bin/m51_cairo_smoke: bin/gfx/m51_cairo_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include/freetype2 \
+	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include/freetype2 -I $(FC_DIR)/include \
 	  -c $< -o $(BUILD)/bin/m51_cairo_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_cairo_smoke.o \
-	  $(CAIRO_DIR)/lib/libcairo.a -L$(FT_DIR)/lib -lfreetype \
+	  -L$(CAIRO_DIR)/lib -lcairo -L$(FT_DIR)/lib -lfreetype \
 	  -L$(PIXMAN_DIR)/lib -lpixman-1 $(PKG_RPATH) $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC)
 
@@ -991,23 +989,23 @@ endif
 	@#   m108pw    the account whose password `passwd` rewrites.
 	@printf "m108user:x:1002:1002:M108 su caller:/home/m108user:/bin/m108shell\nm108peer:x:1003:1003:M108 su target:/home/m108peer:/bin/sh\nm108pw:x:1004:1004:M108 passwd target:/home/m108pw:/bin/sh\n" >> $(ROOTFS)/etc/passwd
 	@mkdir -p $(ROOTFS)/home/m108user $(ROOTFS)/home/m108peer $(ROOTFS)/home/m108pw
-	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:0:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:0:0:99999:7:::\n' > $(ROOTFS)/etc/shadow
-	@# M104: dedicated /etc/shadow entry for the OpenPAM smoke test
+	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:20000:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:20000:0:99999:7:::\n' > $(ROOTFS)/etc/shadow
+	@# M104: dedicated /etc/shadow entry for the PAM smoke test
 	@# (userspace/bin/smoke/m104_pam_smoke.c) — a real SHA-512 "$$6$$" hash of the
 	@# known plaintext "PamSmoke123!" (generated on the host with
 	@# `openssl passwd -6 -salt pamtestsalt 'PamSmoke123!'`), kept separate
 	@# from root/user so this test never depends on — or risks perturbing —
 	@# their credentials.
-	@printf 'pamtest:$$6$$pamtestsalt$$.8vbtO9GTrzzFPO1mFgs22hz1YDCsqQnz/AucCx/9DkM5GoSWTqA78BSIVE4IESMY2ZYdF7Ywln/2p2LVLdd20:0:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf 'pamtest:$$6$$pamtestsalt$$.8vbtO9GTrzzFPO1mFgs22hz1YDCsqQnz/AucCx/9DkM5GoSWTqA78BSIVE4IESMY2ZYdF7Ywln/2p2LVLdd20:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
 	@# M108: SHA-512 "$$6$$" hashes for the BusyBox su/passwd accounts. Same
 	@# scheme, same file and same crypt(3) comparison pam_unix.so uses, which is
 	@# the whole point of the milestone: one shadow format for the applet and
 	@# the PAM path. Plaintexts (host: `openssl passwd -6 -salt <salt> <pw>`):
 	@#   m108user = M108user!   m108peer = M108peer!   m108pw = M108old!
 	@# m108pw's password is the one m108_smoke rewrites with `passwd`.
-	@printf 'm108user:$$6$$m108usersalt$$U7uuAPJyfx58AT26qAudu8PvVKsmO6jTB5EiK/pag6OV8oGNxzS9DPtQlEhTAc4URuN2oMFLgarPW2Utx3DGA1:0:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
-	@printf 'm108peer:$$6$$m108peersalt$$TCl.o4K5Iw7SlNXrk9dNp4NHfvT0JPCUmyk9otIuGpjRuq8d0trvLR6DDBava0iQY5MBTlU6kRnSNF4XOZXPF/:0:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
-	@printf 'm108pw:$$6$$m108pwsalt$$YvQPFIRKzF9l53ejsICs/u66sJBq6NfeOai7reDJDsOGog0q.k7t7bHAfGgVrOs3Ni0rrwKmaEwEWvZv3Tl9V1:0:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf 'm108user:$$6$$m108usersalt$$U7uuAPJyfx58AT26qAudu8PvVKsmO6jTB5EiK/pag6OV8oGNxzS9DPtQlEhTAc4URuN2oMFLgarPW2Utx3DGA1:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf 'm108peer:$$6$$m108peersalt$$TCl.o4K5Iw7SlNXrk9dNp4NHfvT0JPCUmyk9otIuGpjRuq8d0trvLR6DDBava0iQY5MBTlU6kRnSNF4XOZXPF/:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf 'm108pw:$$6$$m108pwsalt$$YvQPFIRKzF9l53ejsICs/u66sJBq6NfeOai7reDJDsOGog0q.k7t7bHAfGgVrOs3Ni0rrwKmaEwEWvZv3Tl9V1:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
 	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\npamtest:x:1001:pamtest\nm108user:x:1002:\nm108peer:x:1003:\nm108pw:x:1004:\n" > $(ROOTFS)/etc/group
 	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/bin/m108shell\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
 	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/zsh/bpkg-smoke.sh,

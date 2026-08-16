@@ -17,7 +17,18 @@
 
 set -eu
 
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PROJECT_DIR=""
+cur="$SCRIPT_DIR"
+while [ "$cur" != "/" ]; do
+  if [ -f "$cur/Makefile" ] && [ -d "$cur/kernel" ]; then
+    PROJECT_DIR="$cur"
+    break
+  fi
+  cur="$(dirname "$cur")"
+done
+[ -n "$PROJECT_DIR" ] || PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ARCH=x86_64
 ALPINE_VER="${1:-3.20.3}"
 ALPINE_BRANCH="v$(echo "$ALPINE_VER" | cut -d. -f1,2)"

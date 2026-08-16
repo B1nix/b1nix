@@ -22,7 +22,18 @@
 #   MACHINE     legacy | q35                  (default: legacy)
 set -eu
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR=""
+cur="$SCRIPT_DIR"
+while [ "$cur" != "/" ]; do
+  if [ -f "$cur/Makefile" ] && [ -d "$cur/kernel" ]; then
+    ROOT_DIR="$cur"
+    break
+  fi
+  cur="$(dirname "$cur")"
+done
+[ -n "$ROOT_DIR" ] || ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ARCH="${B1NIX_ARCH:-x86_64}"
 ISO="${ISO:-$ROOT_DIR/build/$ARCH/b1nix.iso}"
 OUT_DIR="$ROOT_DIR/smoke_run"

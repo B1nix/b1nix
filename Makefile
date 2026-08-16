@@ -25,7 +25,7 @@ PCRE2_LIB := build/$(ARCH)/pkg/pcre2/lib/libpcre2-8.a
 LIBM_LIB := build/$(ARCH)/ports/musl/install/lib/libm.a
 PIXMAN_LIB := build/$(ARCH)/pkg/pixman/lib/libpixman-1.a
 FREETYPE_LIB := build/$(ARCH)/pkg/freetype/lib/libfreetype.a
-CAIRO_LIB := build/$(ARCH)/ports/cairo/install/lib/libcairo.a
+CAIRO_LIB := build/$(ARCH)/pkg/cairo/lib/libcairo.so
 XKB_LIB := build/$(ARCH)/pkg/xkbcommon/lib/libxkbcommon.a
 FFI_LIB := build/$(ARCH)/pkg/libffi/lib/libffi.so.8
 WAYLAND_CLIENT_LIB := build/$(ARCH)/pkg/wayland/lib/libwayland-client.so.0
@@ -41,9 +41,9 @@ LIBVPX_LIB := build/$(ARCH)/pkg/libvpx/lib/libvpx.a
 OPENSSL_LIB := build/$(ARCH)/pkg/openssl/lib/libssl.a
 IDN2_LIB := build/$(ARCH)/pkg/libidn2/lib/libidn2.a
 LIBPSL_LIB := build/$(ARCH)/pkg/libpsl/lib/libpsl.a
-LITEHTML_LIB := build/$(ARCH)/ports/litehtml/install/lib/liblitehtml.a
 MBEDTLS_LIB := build/$(ARCH)/pkg/mbedtls/lib/libmbedtls.a
 UNISTRING_LIB := build/$(ARCH)/pkg/libunistring/lib/libunistring.a
+PAM_LIB := build/$(ARCH)/pkg/pam/lib/libpam.so
 
 # Ensure all port libraries depend on headers stamp so that they are compiled
 # only after libc.so.1 and headers are fully built and installed.
@@ -51,7 +51,7 @@ $(PCRE2_LIB) $(PIXMAN_LIB) $(FREETYPE_LIB) $(CAIRO_LIB) $(XKB_LIB) \
 $(WAYLAND_CLIENT_LIB) $(HB_LIB) $(EXPAT_LIB) $(FONTCONFIG_LIB) $(ZLIB_LIB) $(LIBPNG_LIB) $(LIBJPEG_LIB) $(LIBWEBP_LIB) $(LIBVPX_LIB) \
 $(LWC_LIB) $(IDN2_LIB) \
 $(OPENSSL_LIB) $(LIBPSL_LIB) $(FFI_LIB) \
-$(LITEHTML_LIB) $(MBEDTLS_LIB) $(UNISTRING_LIB): $(USERSPACE_HDR_DEPS)
+$(MBEDTLS_LIB) $(UNISTRING_LIB) $(PAM_LIB): $(USERSPACE_HDR_DEPS)
 
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 INITRAMFS_NATIVE_SMOKE_INC := $(INC_DIR)/initramfs_native_smoke.inc
@@ -106,7 +106,7 @@ ifeq ($(ARCH),x86_64)
 # variables, so adding an implementation stays a self-contained block here.
 LIBC_FLAVOR ?= musl
 ifeq ($(LIBC_FLAVOR),musl)
-LIBC_ROOT := build/$(ARCH)/ports/musl/install
+LIBC_ROOT := build/$(ARCH)/pkg/musl
 # musl's libc.so is one file that is BOTH the C library and the dynamic loader
 # (entry _dlstart). It also carries math, threads, timers, dlopen, crypt and the
 # resolver, so -lm/-lpthread/-lrt/-ldl resolve against empty archives at link
@@ -831,7 +831,8 @@ $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(LIBWEBP_LIB) \
 	$(LIBVPX_LIB) \
 						$(NSUTILS_LIB) 	$(LIBIDN2_LIB) \
-	$(MBEDTLS_LIB)
+	$(MBEDTLS_LIB) \
+	$(PAM_LIB)
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
 	@touch $@
 
@@ -894,10 +895,14 @@ FREETYPE_LIB := build/$(ARCH)/pkg/freetype/lib/libfreetype.a
 $(FREETYPE_LIB): $(PKG_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh freetype >/dev/null
 
-# M51: Cairo (image surface + FreeType backend), cross-built static.
-CAIRO_LIB := build/$(ARCH)/ports/cairo/install/lib/libcairo.a
-$(CAIRO_LIB): tools/ports/build-cairo.sh $(PIXMAN_LIB) $(FREETYPE_LIB)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-cairo.sh >/dev/null
+# M51: Cairo — Alpine package (shared library, X11 backend accepted).
+CAIRO_LIB := build/$(ARCH)/pkg/cairo/lib/libcairo.so
+$(CAIRO_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh cairo > /dev/null
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libx11 > /dev/null
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libxext > /dev/null
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libxrender > /dev/null
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libxcb > /dev/null
 
 # M51: xkbcommon (keymap compile + keysym translation), cross-built static.
 XKB_LIB := build/$(ARCH)/pkg/xkbcommon/lib/libxkbcommon.a
@@ -926,35 +931,10 @@ FONTCONFIG_LIB := build/$(ARCH)/pkg/fontconfig/lib/libfontconfig.a
 $(FONTCONFIG_LIB): $(PKG_DEPS) $(EXPAT_LIB) $(FREETYPE_LIB)
 	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh fontconfig >/dev/null
 
-# ── C++ / Skia .inc rules ──
-# Skipped under musl: these need libc++/libstdc++ which has not been built
-# against musl yet. Placeholder .inc files are pre-created in the build dir.
-# Hosted C++ runtime smoke. Enable LLVM libc++ against the b1nix libc first
-# (idempotent: stages headers + fixes mbstate_t config), then build via the
-# cross clang C++ wrapper.
-# M55: std::iostream + std::filesystem acceptance test (hosted libc++).
-# M91: Skia 2D graphics library (standalone build with Ganesh GPU backend).
-$(BUILD_DIR)/.skia-built: tools/ports/build-skia.sh $(USERSPACE_DEPS)
-	@mkdir -p $(dir $@)
-	@B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/prebuilt.sh fetch skia || \
-		B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-skia.sh >/dev/null
-	@touch $@
-
-# M91: shared-library deps for Skia (libskia.so, libraw_ptr.so, libfontconfig.so).
-# build-skia-shared-deps.sh stages them from the port trees into
-# userspace/build/$(ARCH)/, from where the root-image rule copies them into
-# rootfs/lib.
-M91_SHARED_DEPS_STAMP := $(BUILD_DIR)/.m91-shared-deps-stamp
-$(M91_SHARED_DEPS_STAMP): tools/ports/build-skia-shared-deps.sh $(BUILD_DIR)/.skia-built $(FONTCONFIG_LIB)
-	@mkdir -p $(dir $@)
-	B1NIX_ARCH=$(ARCH) sh tools/ports/build-skia-shared-deps.sh
-	@# Replace the sysroot stub with the real .so so the cross-cc link step
-	@# finds it.
-	@SYSROOT_LIB=$(CXX_RUNTIME_LIB); \
-	if [ -f userspace/build/$(ARCH)/libfontconfig.so ]; then \
-		cp -f userspace/build/$(ARCH)/libfontconfig.so "$$SYSROOT_LIB/libfontconfig.so"; \
-	fi
-	@touch $@
+# M104: Linux-PAM (authentication stack + pam_unix.so), Alpine package.
+PAM_LIB := build/$(ARCH)/pkg/pam/lib/libpam.so
+$(PAM_LIB): $(PKG_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh pam >/dev/null
 
 # M55: validate the C++ runtime with litehtml (real HTML/CSS layout engine).
 # tools/ports/build-litehtml.sh builds litehtml+gumbo, and userspace/Makefile
@@ -1022,11 +1002,6 @@ OPENRC_INIT := $(BUILD_DIR)/rootfs/sbin/openrc-init
 $(OPENRC_INIT): tools/ports/build-openrc.sh $(LIBC_SO)
 	B1NIX_ARCH=$(ARCH) sh tools/ports/build-openrc.sh >/dev/null
 
-CRASHPAD_HANDLER := $(BUILD_DIR)/rootfs/bin/crashpad_handler
-$(CRASHPAD_HANDLER): tools/ports/build-crashpad.sh \
-		userspace/bin/smoke/crashpad_smoke.cpp $(CXX_RUNTIME_READY)
-	B1NIX_ARCH=$(ARCH) sh tools/ports/build-crashpad.sh >/dev/null
-
 CURLBUILD_STAMP := build/$(ARCH)/pkg/curlbuild/lib/libcurl.a
 $(CURLBUILD_STAMP): $(PKG_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh curlbuild >/dev/null
@@ -1070,9 +1045,6 @@ $(LIBPSL_LIB): $(PKG_DEPS)
 LIBFFI_LIB := $(FFI_LIB)
 $(LIBFFI_LIB): $(PKG_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh libffi >/dev/null
-
-$(LITEHTML_LIB): tools/ports/build-litehtml.sh
-	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-litehtml.sh >/dev/null
 
 $(MBEDTLS_LIB): $(PKG_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh mbedtls >/dev/null
@@ -1130,12 +1102,11 @@ $(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem
 
 ifeq ($(ARCH),x86_64)
 ifdef LIBC_SO
-# Fetched if somebody already built this exact recipe, built if not. The key
-# covers the port script and the toolchain, so a change to either falls back to
-# compiling — see tools/prebuilt.sh.
-$(LIBC_SO):
-	@B1NIX_ARCH=$(ARCH) tools/prebuilt.sh fetch musl || \
-		B1NIX_ARCH=$(ARCH) tools/ports/build-musl.sh
+# Musl libc + dev + linux-headers from Alpine packages.
+$(LIBC_SO): $(PKG_DEPS)
+	@B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh musl >/dev/null
+	@mkdir -p build/$(ARCH)/ports/musl
+	@ln -sfn ../../pkg/musl build/$(ARCH)/ports/musl/install
 
 $(INITRAMFS_LD_MUSL_INC): $(LIBC_SO)
 	@mkdir -p $(dir $@)
@@ -1449,7 +1420,7 @@ install-native-toolchain:
 		echo "      Run tools/build-native-clang.sh --b1nix-elf."; \
 	fi
 
-install-ports: userspace-install busybox-package install-native-toolchain $(PKGROOT_STAMP) $(OPENRC_INIT) $(CRASHPAD_HANDLER)
+install-ports: userspace-install busybox-package install-native-toolchain $(PKGROOT_STAMP) $(OPENRC_INIT)
 	tools/packages/install-ports.sh $(BUILD_DIR)/rootfs $(ARCH) $(PORTS_SOURCE) $(PACKAGE_INDEX_URL)
 	@# The published dev package may carry older libc headers than this checkout.
 	@# Restore the current userspace ABI after package extraction so cross C++
@@ -1517,7 +1488,7 @@ run-root: iso userspace-install root-image
 		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
-root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAMP) $(INITRAMFS_MODULES_INC)
+root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_INC)
 	@# M95: the same .ko images the initramfs carries, plus the generated
 	@# modules.dep / modules.alias, so insmod/rmmod/modprobe keep working after
 	@# the real root is mounted (which hides the initramfs).
@@ -1568,7 +1539,6 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	else \
 		echo "  CA      no host trust store found — https:// will fail in the guest"; \
 	fi
-	@# M91: Stage the Skia shared libraries into rootfs/lib/ for the dynamic linker
 	@mkdir -p $(BUILD_DIR)/rootfs/lib
 	@# Shared libraries that come from Alpine packages rather than from a port.
 	@# Copied by real name and by SONAME, not symlinked: the ext4 driver is not
@@ -1598,36 +1568,34 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	@if [ -f userspace/build/$(ARCH)/bin/m69_plugin.so ]; then \
 		cp -f userspace/build/$(ARCH)/bin/m69_plugin.so $(BUILD_DIR)/rootfs/lib/m69_plugin.so; \
 	fi
-	@# M104: OpenPAM (tools/ports/build-openpam.sh) — libpam.so.2 is a real
-	@# dlopen-capable shared library, and pam_unix.so is itself dlopen'd BY
-	@# libpam.so.2 at pam_start() time, so both need real (non-symlink) files
-	@# in rootfs/lib the same way m69_plugin.so does above — the ext4 driver
-	@# does not follow symlinks, and ld-musl/OpenPAM's dlopen() need the
-	@# actual bytes at the path they ask for, not a dangling link.
-	@OPENPAM_DIR=build/$(ARCH)/ports/openpam/install; \
-	if [ -f "$$OPENPAM_DIR/lib/libpam.so.2" ]; then \
-		mkdir -p $(BUILD_DIR)/rootfs/lib/security $(BUILD_DIR)/rootfs/etc/pam.d $(BUILD_DIR)/rootfs/include/security; \
-		cp -f "$$OPENPAM_DIR/lib/libpam.so.2" $(BUILD_DIR)/rootfs/lib/libpam.so.2; \
-		cp -f "$$OPENPAM_DIR/lib/security/pam_unix.so" $(BUILD_DIR)/rootfs/lib/security/pam_unix.so; \
-		cp -f "$$OPENPAM_DIR"/etc/pam.d/* $(BUILD_DIR)/rootfs/etc/pam.d/; \
-		cp -f "$$OPENPAM_DIR"/include/security/*.h $(BUILD_DIR)/rootfs/include/security/; \
+	@# M104: Linux-PAM (from Alpine packages) — libpam.so.0 is staged by the
+	@# generic pkg loop above. Stage security/*.so modules into rootfs/lib/security
+	@# and write PAM policy files.
+	@mkdir -p $(BUILD_DIR)/rootfs/lib/security $(BUILD_DIR)/rootfs/etc/pam.d $(BUILD_DIR)/rootfs/include/security
+	@if [ -d build/$(ARCH)/pkg/pam/lib/security ]; then \
+		cp -f build/$(ARCH)/pkg/pam/lib/security/*.so $(BUILD_DIR)/rootfs/lib/security/; \
 	fi
-	@# M108: PAM policy for the BusyBox su/passwd smoke. Written here rather than
-	@# in build-openpam.sh because that script short-circuits on its build stamp,
-	@# so an incremental tree would never regenerate its etc/pam.d. Same three
-	@# lines as the sshd/m104 policies — the point of the test is that a password
-	@# BusyBox's `passwd` wrote is accepted by this very module.
-	@mkdir -p $(BUILD_DIR)/rootfs/etc/pam.d
+	@if [ -d build/$(ARCH)/pkg/pam/include/security ]; then \
+		cp -f build/$(ARCH)/pkg/pam/include/security/*.h $(BUILD_DIR)/rootfs/include/security/; \
+	fi
+	@if [ -d build/$(ARCH)/pkg/pam/sbin ]; then \
+		mkdir -p $(BUILD_DIR)/rootfs/sbin; \
+		cp -f build/$(ARCH)/pkg/pam/sbin/* $(BUILD_DIR)/rootfs/sbin/; \
+		if [ -f $(BUILD_DIR)/rootfs/sbin/unix_chkpwd ]; then \
+			python3 -c "import sys; f=open(sys.argv[1],'r+b'); f.seek(7); f.write(bytes([3])); f.close()" $(BUILD_DIR)/rootfs/sbin/unix_chkpwd; \
+		fi; \
+	fi
+	@printf '# M104 smoke policy (userspace/bin/smoke/m104_pam_smoke.c)\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(BUILD_DIR)/rootfs/etc/pam.d/m104-pam-smoke
+	@printf '# Default policy for services without a specific /etc/pam.d/<service> file.\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(BUILD_DIR)/rootfs/etc/pam.d/other
+	@printf '# b1nix PAM policy for dropbear sshd\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(BUILD_DIR)/rootfs/etc/pam.d/sshd
 	@printf '# M108 smoke policy (userspace/bin/smoke/m108_smoke.c): pam_unix.so reads\n# the same /etc/shadow "$$6$$" hashes BusyBox su/passwd read and write.\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(BUILD_DIR)/rootfs/etc/pam.d/m108-smoke
-	@# M108: the su/passwd/init smoke ELF links libpam.so.2 as DT_NEEDED, same
-	@# bespoke rule as m104_pam_smoke, so build + stage it the same way.
+	@# M108: the su/passwd/init smoke ELF links libpam.so as DT_NEEDED.
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m108_smoke >/dev/null 2>&1 || true
 	@if [ -f userspace/build/$(ARCH)/bin/m108_smoke ]; then \
 		cp -f userspace/build/$(ARCH)/bin/m108_smoke $(BUILD_DIR)/rootfs/bin/m108_smoke; \
 		chmod +x $(BUILD_DIR)/rootfs/bin/m108_smoke; \
 	fi
-	@# M104: the OpenPAM smoke ELF (links libpam.so.2 as DT_NEEDED) — build
-	@# it if missing, same pattern as the other bespoke smoke ELFs here.
+	@# M104: the PAM smoke ELF (links libpam.so as DT_NEEDED).
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m104_pam_smoke >/dev/null 2>&1 || true
 	@if [ -f userspace/build/$(ARCH)/bin/m104_pam_smoke ]; then \
 		cp -f userspace/build/$(ARCH)/bin/m104_pam_smoke $(BUILD_DIR)/rootfs/bin/m104_pam_smoke; \
@@ -1640,8 +1608,7 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	@# userspace/rootfs-overlay/etc/init.d/sshd's /bin/dropbear* calls had no
 	@# binary to find. Real copies (not symlinks), same reasoning as above.
 
-	@# Stage sysroot C++ runtime .so (real, not stubs — fontconfig comes from
-	@# userspace/build/ via build-skia-shared-deps.sh above)
+	@# Stage sysroot C++ runtime .so.
 	@SYSROOT_LIB=$(CXX_RUNTIME_LIB); \
 	for so in "$$SYSROOT_LIB"/libc++.so.1 \
 	          "$$SYSROOT_LIB"/libc++abi.so.1 "$$SYSROOT_LIB"/libunwind.so.1; do \
@@ -1702,12 +1669,6 @@ endif
 			cp -f "$$f" "$(BUILD_DIR)/rootfs/lib/$$soname"; \
 		fi; \
 	done
-	@SKIA_DM="$$(ls build/$(ARCH)/ports/skia/build/out/b1nix/dm build/src/skia/out/b1nix/dm 2>/dev/null | head -1)"; \
-	if [ -n "$$SKIA_DM" ] && [ -f "$$SKIA_DM" ]; then \
-		llvm-strip --strip-debug "$$SKIA_DM" -o $(BUILD_DIR)/rootfs/bin/skia-dm 2>/dev/null || \
-		cp "$$SKIA_DM" $(BUILD_DIR)/rootfs/bin/skia-dm; \
-		chmod +x $(BUILD_DIR)/rootfs/bin/skia-dm; \
-	fi
 	@# Every program on the image that is not ours and not part of how it boots:
 	@# zsh, curl, dropbear, bmake and samurai, all Alpine packages. Unpacked with
 	@# their own paths — a program looks for its files where it was compiled to
@@ -1756,7 +1717,7 @@ endif
 	@# Only ever wired into the legacy xxd/.inc initramfs path (kernel/fs/
 	@# initramfs.c never gained a #include for them after the ext4-root
 	@# migration made that path bootstrap-only) — stage them into rootfs/bin
-	@# directly, same as skia-dm above, so /bin/init's discovery loop picks
+	@# directly, so /bin/init's discovery loop picks
 	@# them up.
 	@if [ -f tools/blobs/linux_hello.bin ]; then \
 		cp -f tools/blobs/linux_hello.bin $(BUILD_DIR)/rootfs/bin/m40-linux-hello; \
@@ -1838,6 +1799,9 @@ endif
 	@$(DEBUGFS) -w -R "sif /opt/busybox/bin/busybox-suid uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@$(DEBUGFS) -w -R "sif /opt/busybox/bin/busybox-suid gid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@$(DEBUGFS) -w -R "sif /opt/busybox/bin/busybox-suid mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /sbin/unix_chkpwd uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /sbin/unix_chkpwd gid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@$(DEBUGFS) -w -R "sif /sbin/unix_chkpwd mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@$(DEBUGFS) -w -R "sif /etc/shadow uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@$(DEBUGFS) -w -R "sif /etc/shadow mode 0100400" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@printf 'created %s (%s)\n' "$(BUILD_DIR)/root.ext4" "$$(du -sh $(BUILD_DIR)/root.ext4 | cut -f1)"

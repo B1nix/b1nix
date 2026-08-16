@@ -13,6 +13,7 @@
 #
 # Read by tools/packages/pkg-prefix.sh. See docs/ports-migration-plan.md.
 
+musl          musl musl-dev linux-headers
 zlib          zlib zlib-dev zlib-static
 expat         libexpat expat-dev expat-static
 pcre2         pcre2 libpcre2-16 libpcre2-32 pcre2-dev
@@ -40,16 +41,23 @@ harfbuzz      harfbuzz harfbuzz-dev harfbuzz-static
 pixman        pixman pixman-dev pixman-static
 xkbcommon     libxkbcommon libxkbcommon-dev libxkbcommon-static
 
+# M51 cairo. Alpine's cairo is built with the X11 backend; those .so files are
+# staged into rootfs/lib the same way every other pkg .so is, and the image is
+# large enough to carry them. libx11/libxcb/libxrender entries below ensure the
+# transitive deps are present both at link time and at runtime.
+cairo         cairo cairo-dev
+libx11        libx11 libx11-dev
+libxext       libxext libxext-dev
+libxrender    libxrender libxrender-dev
+libxcb        libxcb libxcb-dev
+
 # M53 codecs and TLS. libvpx is in community.
-#
-# cairo and libjxl are deliberately NOT here. Alpine's cairo is built with the
-# X11 backend and drags libX11, libxcb and their dependencies onto an image with
-# no X server; and their libjxl is C++ built against libstdc++, while everything
-# C++ here is libc++ — mixing the two ABIs in one link does not work. Both keep
-# their from-source ports.
 libvpx        repo:community libvpx libvpx-dev
 mbedtls       mbedtls mbedtls-dev mbedtls-static
 openssl       openssl libssl3 libcrypto3 openssl-dev openssl-libs-static
+
+# M104 PAM (Linux-PAM + pam_unix.so).
+pam           linux-pam linux-pam-dev
 
 # Programs installed onto the image rather than linked against. Used with
 # ALPINE_LAYOUT=native, so they keep their own paths, into one staging root that

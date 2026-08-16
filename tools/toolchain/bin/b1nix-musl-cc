@@ -1,0 +1,277 @@
+#!/bin/sh
+# b1nix-musl-cc — Cross-compile C programs against the musl libc.
+#
+# Usage:
+#   tools/b1nix-musl-cc source.c -o output              # link dynamically (default)
+#   tools/b1nix-musl-cc -static source.c -o output     # link statically
+#   tools/b1nix-musl-cc -c source.c -o source.o         # compile only
+#
+# Dynamic mode (default): produces a PIE ET_DYN that imports from ld-musl-x86_64.so.1
+#   via the kernel's in-kernel eager dynamic linker.
+# Static mode: links musl + crt1.o into a self-contained ET_EXEC.
+set -eu
+
+SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR=""
+cur="$SCRIPT_DIR"
+while [ "$cur" != "/" ]; do
+  if [ -f "$cur/Makefile" ] && [ -d "$cur/kernel" ]; then
+    ROOT_DIR="$cur"
+    break
+  fi
+  cur="$(dirname "$cur")"
+done
+if [ -z "$ROOT_DIR" ]; then
+  echo "b1nix-musl-cc: cannot find project root" >&2
+  exit 1
+fi
+. "$ROOT_DIR/tools/toolchain/env.sh"
+
+# Find musl install directory
+MUSL_INSTALL="$ROOT_DIR/build/$B1NIX_ARCH/pkg/musl"
+[ -d "$MUSL_INSTALL" ] || MUSL_INSTALL="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install"
+[ -d "$MUSL_INSTALL/usr" ] && MUSL_INSTALL="$MUSL_INSTALL/usr"
+
+if [ ! -d "$MUSL_INSTALL" ]; then
+  echo "b1nix-musl-cc: musl not installed yet. Run: tools/packages/pkg-prefix.sh musl" >&2
+  exit 1
+fi
+
+MUSL_INCLUDE="$MUSL_INSTALL/include"
+MUSL_LIB="$MUSL_INSTALL/lib"
+MUSL_LIBA="$MUSL_LIB/libc.a"
+
+# musl .so is in the install dir or source build dir
+MUSL_SRC_BUILD="$ROOT_DIR/build/src/musl/$B1NIX_TRIPLET/musl-1.2.5"
+MUSL_LIBSO="$MUSL_LIB/libc.so"
+[ -f "$MUSL_LIBSO" ] || MUSL_LIBSO="$MUSL_SRC_BUILD/lib/libc.so"
+
+# musl crt files (from musl build) — use musl's own startup, not b1nix's crt0
+MUSL_CRT1="$MUSL_LIB/crt1.o"
+MUSL_CRTI="$MUSL_LIB/crti.o"
+MUSL_CRTN="$MUSL_LIB/crtn.o"
+
+# Compiler flags for musl targets
+# Clang resource-dir headers (stdatomic.h etc.) — -nostdinc drops them.
+CLANG_RES_DIR="$(clang -print-resource-dir 2>/dev/null || true)"
+MUSL_RES_INC=""
+[ -n "$CLANG_RES_DIR" ] && MUSL_RES_INC="-isystem $CLANG_RES_DIR/include"
+
+MUSL_CFLAGS="--target=$B1NIX_TRIPLET -ffreestanding -nostdinc -fno-builtin -fno-stack-protector -msoft-float -mno-implicit-float -O2 -Wall -I$MUSL_INCLUDE $MUSL_RES_INC -D__linux__ -D__linux -D__unix__ -D_GNU_SOURCE -D_LARGEFILE64_SOURCE -D__b1nix__ -Db1nix"
+
+AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
+RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
+
+LD_BIN="${LD:-$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/lld/bin/ld.lld)}"
+BUILTINS_LIB="$(find "$CLANG_RES_DIR/lib" -name "libclang_rt.builtins-x86_64.a" 2>/dev/null | head -1 || true)"
+
+# Parse arguments
+OUTPUT=""
+LINK_MODE="dynamic"  # static, dynamic, compile-only
+INPUT_FILES=""
+EXTRA_CFLAGS=""
+EXTRA_LDFLAGS=""
+
+SKIP_NEXT=0
+for arg in "$@"; do
+  if [ "$SKIP_NEXT" = "1" ]; then
+    OUTPUT="$arg"
+    SKIP_NEXT=0
+    continue
+  fi
+  case "$arg" in
+    -c)
+      LINK_MODE="compile-only"
+      ;;
+    -S|-E)
+      LINK_MODE="compile-only"
+      ;;
+    -dynamic|--dynamic)
+      LINK_MODE="dynamic"
+      ;;
+    -ldso|--ldso)
+      LINK_MODE="ldso"
+      ;;
+    -static)
+      LINK_MODE="static"
+      ;;
+    -o)
+      SKIP_NEXT=1
+      ;;
+    -O*|-g|-Wall|-W*|-f*|-m*|-D*|-U*|-I*|-std=*|-pedantic|-Werror)
+      EXTRA_CFLAGS="$EXTRA_CFLAGS $arg"
+      ;;
+    -lm)
+      # musl folds libm into libc; do not ask the host linker for glibc's libm.
+      ;;
+    -L*|-l*|-T*)
+      EXTRA_LDFLAGS="$EXTRA_LDFLAGS $arg"
+      ;;
+    *.c|*.S|*.s|*.o|*.a)
+      INPUT_FILES="$INPUT_FILES $arg"
+      ;;
+    *)
+      EXTRA_CFLAGS="$EXTRA_CFLAGS $arg"
+      ;;
+  esac
+done
+
+if [ -z "$INPUT_FILES" ]; then
+  echo "b1nix-musl-cc: no input files" >&2
+  exit 1
+fi
+
+CCACHE=""
+if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
+  CCACHE="ccache"
+fi
+
+case "$LINK_MODE" in
+  compile)
+    if [ -n "$OUTPUT" ] && [ "$OUTPUT" != "a.out" ]; then
+      exec $CCACHE clang $MUSL_CFLAGS $EXTRA_CFLAGS -c $INPUT_FILES -o "$OUTPUT"
+    fi
+    exec $CCACHE clang $MUSL_CFLAGS $EXTRA_CFLAGS -c $INPUT_FILES
+    ;;
+  static)
+    # Compile each source to object
+    TMPOBJS=""
+    for src in $INPUT_FILES; do
+      OBJ="${src%.*}_musl.o"
+      $CCACHE clang $MUSL_CFLAGS $EXTRA_CFLAGS -c "$src" -o "$OBJ"
+      TMPOBJS="$TMPOBJS $OBJ"
+    done
+
+    # Link statically: musl crt1 + crti + musl libc.a + crtn
+    $LD_BIN -m elf_x86_64 -static \
+      $EXTRA_LDFLAGS \
+      $MUSL_CRT1 $MUSL_CRTI \
+      $TMPOBJS \
+      $MUSL_LIBA \
+      $MUSL_CRTN \
+      -o "$OUTPUT"
+    # Patch ELF header: set EI_OSABI to ELFOSABI_LINUX (3) so b1nix
+    # detects this as a Linux binary and routes syscalls through the
+    # Linux ABI translation layer (arch_prctl, set_tid_address, etc.).
+    python3 -c "
+import struct, sys
+f = sys.argv[1]
+with open(f, 'r+b') as fh:
+    fh.seek(7)  # EI_OSABI offset
+    fh.write(bytes([3]))  # ELFOSABI_LINUX = 3
+" "$OUTPUT" 2>/dev/null || true
+
+    rm -f $TMPOBJS
+    echo "b1nix-musl-cc: linked (static) $OUTPUT" >&2
+    ;;
+  dynamic)
+    # Dynamic linking: produce a PIE/ET_DYN that imports from musl's libc.so
+    # via the kernel's in-kernel eager dynamic linker.
+    MUSL_LDSONAME="ld-musl-x86_64.so.1"
+    MUSL_SCRT1="$MUSL_LIB/Scrt1.o"
+
+    # We need the .so to be in a directory where we can reference it by just
+    # the filename, so DT_NEEDED = "ld-musl-x86_64.so.1" (not the full path).
+    # Use a temp directory with a symlink.
+    MUSL_LINK_DIR="/tmp/b1nix-musl-link-$$"
+    mkdir -p "$MUSL_LINK_DIR"
+    if [ ! -f "$MUSL_LINK_DIR/$MUSL_LDSONAME" ]; then
+      # $MUSL_LIBSO, not the source build tree: that tree is deleted by a clean
+      # while the installed copy survives, and a dangling symlink here fails the
+      # link with "unable to find library -l:ld-musl-x86_64.so.1".
+      ln -sf "$MUSL_LIBSO" "$MUSL_LINK_DIR/$MUSL_LDSONAME"
+    fi
+    MUSL_SO="$MUSL_LINK_DIR/$MUSL_LDSONAME"
+
+    TMPOBJS=""
+    for src in $INPUT_FILES; do
+      case "$src" in
+        *.o|*.a)
+          TMPOBJS="$TMPOBJS $src"
+          continue
+          ;;
+      esac
+      OBJ="${src%.*}_musl_dyn.o"
+      $CCACHE clang $MUSL_CFLAGS -fPIC $EXTRA_CFLAGS -c "$src" -o "$OBJ"
+      TMPOBJS="$TMPOBJS $OBJ"
+    done
+
+    # Link as PIE/ET_DYN against musl's shared library.
+    # -pie produces ET_DYN (required for b1nix's in-kernel dynamic linker).
+    # The .so is passed directly (not via -l) so DT_NEEDED = "ld-musl-x86_64.so.1".
+    $LD_BIN -m elf_x86_64 -pie --allow-shlib-undefined \
+      -dynamic-linker /lib/ld-musl-x86_64.so.1 \
+      $EXTRA_LDFLAGS \
+      $MUSL_SCRT1 $MUSL_CRTI \
+      $TMPOBJS \
+      -L"$MUSL_LINK_DIR" -l:ld-musl-x86_64.so.1 \
+      $MUSL_CRTN \
+      ${BUILTINS_LIB:+"$BUILTINS_LIB"} \
+      -o "$OUTPUT"
+
+    # Patch ELF header: set EI_OSABI to ELFOSABI_LINUX (3) so b1nix
+    # detects this as a Linux binary and routes syscalls through the
+    # Linux ABI translation layer (arch_prctl, set_tid_address, etc.).
+    python3 -c "
+import struct, sys
+f = sys.argv[1]
+with open(f, 'r+b') as fh:
+    fh.seek(7)  # EI_OSABI offset
+    fh.write(bytes([3]))  # ELFOSABI_LINUX = 3
+" "$OUTPUT" 2>/dev/null || true
+
+    rm -f $TMPOBJS
+    rm -rf "$MUSL_LINK_DIR"
+    echo "b1nix-musl-cc: linked (dynamic) $OUTPUT" >&2
+    ;;
+  ldso)
+    # Real userspace ld.so mode (musl-port.md).
+    MUSL_LDSONAME="ld-musl-x86_64.so.1"
+    MUSL_SCRT1="$MUSL_LIB/Scrt1.o"
+
+    MUSL_LINK_DIR="/tmp/b1nix-musl-link-$$"
+    mkdir -p "$MUSL_LINK_DIR"
+    ln -sf "$MUSL_SRC_BUILD/lib/libc.so" "$MUSL_LINK_DIR/$MUSL_LDSONAME"
+    MUSL_SO="$MUSL_LINK_DIR/$MUSL_LDSONAME"
+
+    TMPOBJS=""
+    for src in $INPUT_FILES; do
+      OBJ="${src%.*}_musl_ldso.o"
+      $CCACHE clang $MUSL_CFLAGS -fPIC $EXTRA_CFLAGS -c "$src" -o "$OBJ"
+      TMPOBJS="$TMPOBJS $OBJ"
+    done
+
+    $LD_BIN -m elf_x86_64 -pie --allow-shlib-undefined \
+      -dynamic-linker /lib/ld-musl-x86_64.so.1 \
+      -L"$MUSL_SRC_BUILD/lib" \
+      $EXTRA_LDFLAGS \
+      $MUSL_SCRT1 $MUSL_CRTI \
+      $TMPOBJS \
+      -lc \
+      $MUSL_CRTN \
+      ${BUILTINS_LIB:+"$BUILTINS_LIB"} \
+      -o "$OUTPUT"
+
+    python3 -c "
+import struct, sys
+f = sys.argv[1]
+with open(f, 'r+b') as fh:
+    fh.seek(7)  # EI_OSABI offset
+    fh.write(bytes([3]))  # ELFOSABI_LINUX = 3
+" "$OUTPUT" 2>/dev/null || true
+
+    # DT_NEEDED comes out as "libc.so" straight from the linker, because that
+    # is libc.so's DT_SONAME (set in tools/ports/build-musl.sh). It has to be
+    # that exact name: musl's ld.so recognises a self-referential DT_NEEDED
+    # only through a short reserved-prefix list ("libc.", "libpthread.", ...),
+    # and anything else sends it off to re-open and re-map itself as a "new"
+    # library, where it crashes deduping against itself. This used to be
+    # repaired after the fact by rewriting the string in .dynstr; giving musl
+    # its own soname fixes it at the source, so nothing is rewritten here.
+
+    rm -f $TMPOBJS
+    rm -rf "$MUSL_LINK_DIR"
+    echo "b1nix-musl-cc: linked (ldso) $OUTPUT" >&2
+    ;;
+esac

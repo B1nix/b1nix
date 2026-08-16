@@ -21,10 +21,9 @@ mkdir -p "$BUILD_HOME" "$PREFIX" "$PREFIX/bin" "$PREFIX/$B1NIX_TRIPLET/bin" "$PR
 mkdir -p "$B1NIX_ROOTFS/lib" "$B1NIX_ROOTFS/usr/lib"
 ln -sfn "$B1NIX_ROOTFS" "$SYSROOT" 2>/dev/null || true
 
-# 2. Build musl libc headers/libs and stage into sysroot
-echo "Building musl libc and staging headers/libs..."
-B1NIX_ARCH="$B1NIX_ARCH" sh "$PROJECT_DIR/tools/ports/build-musl.sh" 1>&2
-MUSL_USR="$PROJECT_DIR/build/$B1NIX_ARCH/ports/musl/install"
+# 2. Fetch musl libc headers/libs from Alpine packages and stage into sysroot
+echo "Fetching musl libc (Alpine packages) and staging headers/libs..."
+MUSL_USR="$(B1NIX_ARCH="$B1NIX_ARCH" "$PROJECT_DIR/tools/packages/pkg-prefix.sh" musl | tail -1)"
 if [ -d "$MUSL_USR" ]; then
     mkdir -p "$SYSROOT/usr/include" "$SYSROOT/usr/lib" "$SYSROOT/include" "$SYSROOT/lib"
     cp -Rf "$MUSL_USR/include/"* "$SYSROOT/include/" 2>/dev/null || true

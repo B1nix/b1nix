@@ -18,7 +18,18 @@ ARCH="${ARCH:-x86_64}"
 TRIPLET="${B1NIX_TRIPLET:-x86_64-b1nix}"
 LLVM_VER="${LLVM_VER:-22.1.8}"
 JOBS="${JOBS:-6}"
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT=""
+cur="$SCRIPT_DIR"
+while [ "$cur" != "/" ]; do
+  if [ -f "$cur/Makefile" ] && [ -d "$cur/kernel" ]; then
+    ROOT="$cur"
+    break
+  fi
+  cur="$(dirname "$cur")"
+done
+[ -n "$ROOT" ] || ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 NC="$ROOT/build/native-clang"
 SRC="$NC/llvm-project-${LLVM_VER}.src/llvm"

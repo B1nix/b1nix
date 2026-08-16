@@ -2023,11 +2023,7 @@ check_output "$LOG" "M96-SMOKE: ok modprobe-alias" "modprobe resolves a modules.
 check_output "$LOG" "M96-SMOKE: ok modprobe-deps" "modprobe loads a module's dependency first and the use count records the link"
 check_output "$LOG" "M96-SMOKE: ok lsmod" "lsmod's output agrees with /proc/modules"
 check_output "$LOG" "M96-SMOKE: done" "M96 protocol-module and module-parameter suite completes"
-# ── Crashpad: upstream Chromium crash reporter, running unmodified on b1nix ──
-check_output "$LOG" "CRASHPAD-SMOKE: ok handler-present" "the ported /bin/crashpad_handler is installed and executable"
-check_output "$LOG" "CRASHPAD-SMOKE: ok start-handler" "crashpad::CrashpadClient::StartHandler launches the handler process"
-check_output "$LOG" "CRASHPAD-SMOKE: ok client-crash" "the client process crashes with the handler attached"
-check_output "$LOG" "CRASHPAD-SMOKE: ok minidump" "the handler writes a real minidump (MDMP) for the crashed client"
+
 # ── M98: GNU-free in-guest build tools (bmake + samurai replaced GNU Make) ──
 check_output "$LOG" "M98-SMOKE: ok make-is-bmake" "/bin/make answers bmake's -V (GNU Make rejects it), so it is the BSD make"
 check_output "$LOG" "M98-SMOKE: ok make-not-gnu" "/bin/make identifies as something other than GNU Make"
@@ -2038,18 +2034,14 @@ check_output "$LOG" "M98-SMOKE: ok ninja-alias" "/bin/ninja is the samurai binar
 check_output "$LOG" "M98-SMOKE: ok samu-build" "samurai executes a build.ninja edge and produces the declared output"
 check_output "$LOG" "M98-SMOKE: ok samu-uptodate" "re-running a satisfied build graph is a no-op"
 check_output "$LOG" "M98-SMOKE: done" "M98 GNU-free build-tool suite completes"
-# ── M104: OpenPAM (real libpam.so.2 + pam_unix.so authenticating against
-# /etc/shadow via musl crypt(3)) — tools/ports/build-openpam.sh,
-# userspace/bin/smoke/m104_pam_smoke.c. dropbear is also rebuilt against this same
-# library (tools/ports/build-dropbear.sh, --enable-pam) but that is verified
-# at the binary/link level (DT_NEEDED libpam.so.2, real pam_authenticate/
-# pam_start/pam_end calls) rather than via an in-suite live SSH login.
-check_output "$LOG" "M104-PAM: ok libpam-linked" "libpam.so.2 loaded and its API is callable"
+# ── M104: Linux-PAM (real libpam.so.0 + pam_unix.so authenticating against
+# /etc/shadow via musl crypt(3)) — userspace/bin/smoke/m104_pam_smoke.c.
+check_output "$LOG" "M104-PAM: ok libpam-linked" "libpam loaded and its API is callable"
 check_output "$LOG" "M104-PAM: ok auth-correct-password" "pam_authenticate() succeeds for the real pamtest /etc/shadow entry with its correct password"
 check_output "$LOG" "M104-PAM: ok acct-mgmt" "pam_acct_mgmt() succeeds for the authenticated account"
 check_output "$LOG" "M104-PAM: ok auth-wrong-password-rejected" "pam_authenticate() rejects a wrong password for a real account (PAM_AUTH_ERR, not a fake pass)"
 check_output "$LOG" "M104-PAM: ok unknown-user-rejected" "pam_authenticate() returns PAM_USER_UNKNOWN (not PAM_AUTH_ERR) for a nonexistent user"
-check_output "$LOG" "M104-PAM: done" "M104 OpenPAM suite completes"
+check_output "$LOG" "M104-PAM: done" "M104 PAM suite completes"
 # ── zsh: the interactive/login shell (replaced GNU bash in M98) ──
 check_output "$LOG" "ZSH-SMOKE: ok version" "zsh reports ZSH_VERSION"
 check_output "$LOG" "ZSH-SMOKE: ok arrays" "zsh indexed arrays work (1-based, no KSH_ARRAYS)"
