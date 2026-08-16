@@ -704,6 +704,14 @@ static void klarge_free(void *ptr) {
   usize npages = h->npages;
   h->magic = 0;
   track_free(p, npages * PAGE_SIZE);
+  /* Phase 2 runs with the lock RELEASED, for the reason klarge_alloc's rollback
+   * path spells out: vmm_unmap_page issues a cross-CPU TLB shootdown and spins
+   * with IRQs off until every other CPU ACKs the IPI, and a CPU spinning for
+   * heap_lock with IRQs off can never send that ACK. Clearing the magic above
+   * already retired the block, and its address span is not published in
+   * klarge_free_spans until phase 3, so no other allocator can reach these
+   * pages while they are unmapped. */
+  heap_release(flags);
 
   for (usize i = 0; i < npages; i++) {
     u64 vaddr = base + i * PAGE_SIZE;
@@ -714,6 +722,7 @@ static void klarge_free(void *ptr) {
     }
   }
 
+  heap_acquire(&flags);
   if (klarge_free_count < KLARGE_MAX_SPANS) {
     klarge_free_spans[klarge_free_count].vaddr = base;
     klarge_free_spans[klarge_free_count].npages = npages;

@@ -214,7 +214,16 @@ BOOT_TIMEOUT ?= $(GRUB_TIMEOUT)
 
 # Persistent root image size in MB. 512MB fits native gcc + binutils + kernel
 # source for self-host (M26). Override with: make ROOT_IMAGE_SIZE=256 root-image
+# The image is a Multiboot2 module loaded whole into RAM, so this is both the
+# filesystem size and the memory it occupies at boot. 512 MiB fits the base
+# system with room to install into; a browser needs more than the whole of it,
+# which is why B1NIX_BROWSER=1 raises it rather than the default carrying the
+# cost for every build.
+ifeq ($(B1NIX_BROWSER),1)
+ROOT_IMAGE_SIZE ?= 1536
+else
 ROOT_IMAGE_SIZE ?= 512
+endif
 
 # Locate the native toolchain that tools/build-native-clang.sh --b1nix-elf produced.
 # Per-triplet: build/<arch>/toolchain/<triplet>/native_root by default, or
@@ -1010,6 +1019,16 @@ PKGROOT_STAMP := $(PKGROOT)/.installed
 $(PKGROOT_STAMP): $(PKG_DEPS)
 	B1NIX_ARCH=$(ARCH) ALPINE_LAYOUT=native \
 		tools/packages/pkg-prefix.sh --into $(PKGROOT) programs >/dev/null
+	@# B1NIX_BROWSER=1 bakes chromium and its closure into the image. Installing
+	@# it inside the guest instead does not fit: 175 packages and 618 MB, which
+	@# outlasted the hour a passthrough run gets and ran the root filesystem out
+	@# of space partway through. mesa-dri-gallium stays out (see
+	@# alpine-ports.map), so the closure is the browser, not the driver stack.
+	@if [ "$(B1NIX_BROWSER)" = "1" ]; then \
+		B1NIX_ARCH=$(ARCH) ALPINE_LAYOUT=native \
+		ALPINE_SKIP_DEPS="busybox busybox-binsh alpine-baselayout alpine-baselayout-data alpine-keys alpine-release musl musl-utils musl-locales libc6-compat scanelf ssl_client openrc runit mesa-dri-gallium" \
+			tools/packages/pkg-prefix.sh --into $(PKGROOT) browser >/dev/null; \
+	fi
 	@touch $@
 $(CURL_ELF) $(DROPBEAR_ELF) $(BMAKE_ELF) $(SAMU_ELF): $(PKGROOT_STAMP)
 
@@ -1303,11 +1322,30 @@ SMOKE_CMDLINE_pass-headless=b1nix.i915sway b1nix.sway-headless b1nix.vma-check
 # The browser, under cage on the passed-through GPU. Its packages are fetched at
 # run time — 248 MB installed is not something to carry in an image for a test
 # that is run occasionally.
-SMOKE_CMDLINE_pass-chromium=b1nix.i915sway b1nix.chromium b1nix.drm-debug
+# b1nix.wlr-card: name the card instead of letting wlroots discover it.
+# The runner attaches a virtio-gpu beside the assigned Intel for
+# screendumps, and wlroots then builds a backend spanning both — the
+# second one fails at "query renderer texture formats" and takes the whole
+# DRM backend down with it, leaving the compositor without wl_shm and the
+# browser with no way to hand over a buffer.
+SMOKE_CMDLINE_pass-chromium=b1nix.i915sway b1nix.chromium b1nix.task-watch b1nix.wlr-card b1nix.trace-sysfs
 # The same cage run with a frame built to be photographed: saturated colour
 # across the whole screen and a client whose output changes, so a camera shot
 # says whether the panel is showing our picture rather than merely being lit.
 SMOKE_CMDLINE_pass-bright=b1nix.i915sway b1nix.use-cage b1nix.bright b1nix.drm-debug
+
+# The browser image without the root filesystem inside it.
+#
+# Carried as a boot module, root.ext4 is read off the emulated drive and copied
+# into memory in full before the kernel even starts — 1.5 GB of it for the
+# browser build, which is the single largest part of a run's start-up. The
+# kernel already looks for a disk labelled b1nix-root before it considers the
+# module, so handing the same image to QEMU as a disk lets it be read on demand
+# instead. Same image, same kernel; only the delivery changes.
+iso-pass-chromium-disk: root-image check-dynamic $(KERNEL_ELF)
+	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-pass-chromium-disk.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "$(SMOKE_CMDLINE_pass-chromium)"
 
 iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \

@@ -18,6 +18,16 @@ int virtio_init_device(struct virtio_device *dev, u16 vendor, u16 device)
 	cmd |= 0x0001; /* I/O space */
 	cmd |= 0x0002; /* memory space (harmless for IO transport) */
 	cmd |= 0x0004; /* bus master */
+	/* And clear INTx Disable (bit 10), which nothing here ever cleared.
+	 *
+	 * Every other bit above is set with |=, so a bit the firmware left on stayed
+	 * on — and this one suppresses the device's legacy interrupt entirely. The
+	 * completion IRQ then never arrived, leaving the I/O watchdog as the only
+	 * thing that ever woke a waiter: measured on a browser start, 39970 of 40000
+	 * requests had to wait, each for about one tick, so the disk served roughly
+	 * 76 operations a second. Clearing it is the difference between a device
+	 * that reports completions and one that has to be polled. */
+	cmd &= (u16)~PCI_CMD_INTX_DISABLE;
 	pci_config_write16(pci_info.bus, pci_info.slot, pci_info.func, 0x04, cmd);
 
 	// Read BAR0 to get I/O port base (legacy virtio)

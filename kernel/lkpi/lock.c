@@ -46,9 +46,30 @@ void lkpi_spin_lock(struct lkpi_spinlock *l)
 	 * recorded below and would otherwise be overwritten.
 	 */
 	int cpu = (int)percpu_read(cpu_id);
-	if (l->raw != 0 && l->owner_cpu == cpu) {
+	u64 asker = current_task ? (u64)current_task->id : 0;
+	/*
+	 * A matching CPU id is not evidence of recursion, and treating it as such
+	 * cost several runs to a panic that described something that cannot happen:
+	 * the holder took the lock with interrupts already off, so it can be neither
+	 * preempted nor migrated, and no other task can be running on its CPU. What
+	 * the report showed instead was holder-task 0 (taken from a context with no
+	 * current task) and a different asking task — one of the two CPU ids was
+	 * simply not the CPU the code was on.
+	 *
+	 * Recursion means the same THREAD asks twice, so that is what is tested. A
+	 * genuine deadlock between two tasks still gets reported, by the acquire
+	 * loop's own stuck detector, with the same detail and without inventing a
+	 * cause.
+	 */
+	if (l->raw != 0 && l->owner_cpu == cpu && asker != 0 &&
+	    l->owner_task == asker) {
+
 		console_write("\nLKPI SPINLOCK RECURSION on cpu ");
 		console_write_dec((u64)cpu);
+		console_write(" holder-task ");
+		console_write_dec(l->owner_task);
+		console_write(" asking-task ");
+		console_write_dec(asker);
 		console_write(": lock=0x");
 		console_write_hex64((u64)(usize)l);
 		console_write("\n  already held from: 0x");
@@ -95,6 +116,7 @@ void lkpi_spin_lock(struct lkpi_spinlock *l)
 		lkpi_note_irq_off((u64)(usize)__builtin_return_address(0));
 	l->acquired_at = (u64)(usize)__builtin_return_address(0);
 	l->owner_cpu = cpu;
+	l->owner_task = current_task ? (u64)current_task->id : 0;
 }
 
 int lkpi_spin_trylock(struct lkpi_spinlock *l)
@@ -139,6 +161,7 @@ void lkpi_spin_unlock(struct lkpi_spinlock *l)
 	u64 f = l->flags;
 	l->flags = 0;
 	l->owner_cpu = -1;
+	l->owner_task = 0;
 	l->acquired_at = 0;
 	spin_unlock_irqrestore((spinlock_t *)&l->raw, f);
 	if (lkpi_irqs_enabled())

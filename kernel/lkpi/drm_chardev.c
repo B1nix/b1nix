@@ -226,21 +226,48 @@ void lkpi_drm_close(void *file)
 int lkpi_drm_file_minor(void *file, u32 *out)
 {
 	struct file *f = (struct file *)file;
-	struct drm_file *priv = f ? f->private_data : 0;
 
-	if (!priv || !priv->minor || !out)
+	if (!out || !lkpi_drm_file_is_drm(f))
+		return 0;
+
+	struct drm_file *priv = f->private_data;
+
+	if (!priv->minor)
 		return 0;
 	*out = (u32)priv->minor->index;
 	return 1;
 }
 
+/*
+ * Is this file one of ours — a file opened on a DRM minor?
+ *
+ * The test cannot look at private_data, because deciding whether that pointer
+ * is a struct drm_file is the entire question: on a dma-buf's file it points at
+ * a struct dma_buf, and reading ->minor out of it faults on an address made of
+ * the neighbouring bytes. What separates the two without dereferencing anything
+ * is f_op. lkpi_drm_open leaves it null — the DRM char device dispatches on its
+ * own ops and never needs one — while every anon-inode file, dma-buf above all,
+ * is created with the ops that define it. A null f_op is therefore the mark of
+ * a file this layer opened itself.
+ */
+int lkpi_drm_file_is_drm(void *file)
+{
+	struct file *f = (struct file *)file;
+
+	return f && !f->f_op && f->private_data;
+}
+
 void *lkpi_drm_clone_file(void *file)
 {
 	struct file *f = (struct file *)file;
-	struct drm_file *priv = f ? f->private_data : 0;
 	void *clone = 0;
 
-	if (!priv || !priv->minor)
+	if (!lkpi_drm_file_is_drm(f))
+		return 0;
+
+	struct drm_file *priv = f->private_data;
+
+	if (!priv->minor)
 		return 0;
 	if (lkpi_drm_open((u32)priv->minor->index, 0, &clone) != 0)
 		return 0;
@@ -410,9 +437,12 @@ int lkpi_drm_mmap_page_phys(void *file, u64 offset, u64 *out_phys)
 
 	if (!filp || !out_phys)
 		return -EINVAL;
-	priv = filp->private_data;
-	if (!priv)
+	/* Only a DRM file has a private_data to read here. A dma-buf's file is
+	 * mapped through its own ops, and reinterpreting it would walk a struct
+	 * dma_buf as a struct drm_file. */
+	if (!lkpi_drm_file_is_drm(filp))
 		return -EBADF;
+	priv = filp->private_data;
 
 	/*
 	 * The device comes from the open file, not from a global: the offset being

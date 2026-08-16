@@ -287,15 +287,8 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     vma->node = 0;
     vma->offset = 0;
 
-    /* Insert VMA into current_task */
-    struct vm_area **prev = &current_task->vma_list;
-    struct vm_area *curr = current_task->vma_list;
-    while (curr && curr->start < vaddr) {
-        prev = &curr->next;
-        curr = curr->next;
-    }
-    vma->next = curr;
-    *prev = vma;
+    /* Insert VMA into current_task, in address order. */
+    vma_insert(current_task, vma);
 
     /* Finalize the attach record under the lock. */
     spin_lock_irqsave(&shm_lock, &flags);

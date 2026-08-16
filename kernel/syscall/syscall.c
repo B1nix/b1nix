@@ -2853,7 +2853,9 @@ static int copyin_message(const struct syscall_msghdr *user_msg,
                           usize *payload_len) {
   if (!user_msg || syscall_copyin(msg, user_msg, sizeof(*msg)) < 0)
     return -EFAULT;
-  if (msg->msg_iovlen < 1 || msg->msg_iovlen > 16 || !msg->msg_iov)
+  /* IOV_MAX is 1024 on Linux; sixteen was our own invention and chromium's
+   * Mojo channel writes more than that in one message. */
+  if (msg->msg_iovlen < 1 || msg->msg_iovlen > 64 || !msg->msg_iov)
     return -EINVAL;
   if (syscall_copyin(iov, msg->msg_iov,
                      (usize)msg->msg_iovlen * sizeof(*iov)) < 0)
@@ -2861,7 +2863,10 @@ static int copyin_message(const struct syscall_msghdr *user_msg,
 
   usize total = 0;
   for (int i = 0; i < msg->msg_iovlen; i++) {
-    if (iov[i].iov_len > 65536 || total > 65536 - iov[i].iov_len)
+    /* A message the size of a frame's metadata or a font list passes here
+     * routinely; 64 KiB turned those into EMSGSIZE, which Mojo reads as a dead
+     * channel rather than something to split. */
+    if (iov[i].iov_len > (1u << 20) || total > (1u << 20) - iov[i].iov_len)
       return -EMSGSIZE;
     total += iov[i].iov_len;
   }
@@ -2899,11 +2904,13 @@ static u64 sys_sendmsg(int fd, const struct syscall_msghdr *user_msg,
   usize nhandles = 0;
   int wants_cred = 0;
   if (msg.msg_control && msg.msg_controllen) {
-    if (msg.msg_controllen > 512) {
+    /* Room for the descriptor arrays real senders attach — see
+     * VFS_SCM_MAX_FDS. */
+    if (msg.msg_controllen > 1024) {
       kfree(payload);
       return (u64)-EINVAL;
     }
-    u8 control[512];
+    u8 control[1024];
     if (syscall_copyin(control, msg.msg_control, msg.msg_controllen) < 0) {
       kfree(payload);
       return (u64)-EFAULT;
@@ -3018,6 +3025,10 @@ static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
     return (u64)rc;
   }
 
+  if (flags & B1NIX_MSG_CMSG_CLOEXEC)
+    for (usize i = 0; i < received_count; i++)
+      scheduler_fd_flags_set(received_fds[i], B1NIX_FD_CLOEXEC);
+
   usize copied = 0;
   for (int i = 0; i < msg.msg_iovlen && copied < (usize)rc; i++) {
     usize chunk = iov[i].iov_len;
@@ -3048,7 +3059,7 @@ static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
       msg.msg_namelen = (u32)n;
   }
 
-  u8 control[512] = {0};
+  u8 control[1024] = {0};
   usize control_len = 0;
   if (received_count) {
     usize data_len = received_count * sizeof(int);
@@ -3512,16 +3523,7 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   vma->node = node ? vfs_node_get(node) : 0;
   vma->offset = offset;
   vma->next = 0;
-
-  // Insert into sorted list
-  struct vm_area **prev = &t->vma_list;
-  struct vm_area *curr = t->vma_list;
-  while (curr && curr->start < vaddr) {
-    prev = &curr->next;
-    curr = curr->next;
-  }
-  vma->next = curr;
-  *prev = vma;
+  vma_insert(t, vma);
   if (vma->node && vma->node->inode && vma->node->inode->mmap_open_cb)
     vma->node->inode->mmap_open_cb(vma->node);
   if (vma->node && vma->node->inode && vma->node->inode->mmap_range_open_cb)
@@ -3591,6 +3593,24 @@ static int mmap_failed(u64 r) { return r >= (u64)-4095; }
  * choosing, unmapping whatever was there, and nothing here needs it — better a
  * clear EINVAL than a half-implementation that silently loses a mapping.
  */
+/* One line per mremap for the first calls of a boot: how it was served and
+ * the sizes involved. Off after 32 lines — the point is the pattern, and the
+ * console is a serial line. */
+static void mremap_note(const char *how, u64 from_len, u64 to_len) {
+  static unsigned seen;
+
+  if (seen >= 32)
+    return;
+  seen++;
+  console_write("mremap: ");
+  console_write(how);
+  console_write(" 0x");
+  console_write_hex64(from_len);
+  console_write(" -> 0x");
+  console_write_hex64(to_len);
+  console_write("\n");
+}
+
 static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
                       void *new_addr) {
   (void)new_addr;
@@ -3633,14 +3653,45 @@ static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
   }
 
   /*
-   * Growing always moves.
+   * Grow in place when the space above the mapping is free.
    *
-   * Extending in place looks cheaper, and it is — but the extension is a second
-   * mapping abutting the first, and every later call that names the whole range
-   * (mremap again, or munmap) has to find one mapping covering it. Shrinking a
-   * grown buffer failed with EFAULT for exactly that reason. One mapping per
-   * allocation is the invariant worth keeping; the copy is the price.
+   * The invariant that matters is one mapping per allocation, not a fresh
+   * address: a second VMA abutting the first is what broke shrinking (a later
+   * call naming the whole range found no single mapping covering it). Growing
+   * this VMA's end keeps it one mapping, and the new pages arrive the way
+   * every other anonymous page does — on the fault that first touches them.
+   *
+   * Without this every growth copied the whole allocation through a 64 KiB
+   * kernel bounce buffer, faulting in each page on the way, while holding the
+   * address-space mutex every other thread needs. Chromium's allocator grows
+   * its arenas this way over and over: one such call took minutes, and the
+   * rest of the browser waited on the mutex for all of it.
    */
+  if (!vma->node && vma->end >= old_start + new_len) {
+    /* The mapping is already big enough — the caller asked to grow a range
+     * that sits inside a larger one. Nothing to do but say where it is. */
+    mremap_note("fits", old_len, new_len);
+    return old_start;
+  }
+  if (vma->end == old_start + old_len && !vma->node) {
+    u64 want_end = old_start + new_len;
+    int clear = want_end <= USER_SPACE_LIMIT && want_end > old_start;
+
+    for (struct vm_area *v = t->vma_list; v && clear; v = v->next) {
+      if (v == vma)
+        continue;
+      if (v->start < want_end && v->end > vma->end)
+        clear = 0;
+    }
+    if (clear) {
+      vma->end = want_end;
+      scheduler_sync_vma_head(t->pml4_phys, t->vma_list);
+      mremap_note("grow", old_len, new_len);
+      return old_start;
+    }
+  }
+  mremap_note("move", old_len, new_len);
+
   if (!(flags & MREMAP_MAYMOVE))
     return (u64)-ENOMEM;
 
@@ -3649,29 +3700,15 @@ static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
   if (mmap_failed(fresh))
     return fresh;
 
-  /* Copied in chunks through a kernel bounce buffer. Both ends are user
-   * addresses of the running process, so this is two halves of one copy rather
-   * than a single memcpy — the helpers are what validate the pages and fault in
-   * the ones that were never touched. */
-  usize chunk = 64 * 1024;
-  void *tmp = kmalloc(chunk);
-  if (!tmp) {
-    (void)sys_munmap((void *)(usize)fresh, new_len);
-    return (u64)-ENOMEM;
-  }
-  for (usize off = 0; off < old_len;) {
-    usize n = old_len - off;
-    if (n > chunk)
-      n = chunk;
-    if (syscall_copyin(tmp, (const void *)(usize)(old_start + off), n) != 0 ||
-        syscall_copyout((void *)(usize)(fresh + off), tmp, n) != 0) {
-      kfree(tmp);
-      (void)sys_munmap((void *)(usize)fresh, new_len);
-      return (u64)-EFAULT;
-    }
-    off += n;
-  }
-  kfree(tmp);
+  /* The pages move by having their page-table entries moved, not by being
+   * copied. Copying them read every byte through a 64 KiB kernel buffer and
+   * faulted in every page that had never been touched — for an allocation
+   * grown repeatedly, as chromium's allocator grows its arenas, that is the
+   * whole allocation re-read on every call, with the address-space mutex held
+   * throughout. Moving the entries also preserves what a copy could not: a
+   * lazy or swapped page stays lazy or swapped instead of being materialised.
+   */
+  paging_move_range(old_start, fresh, old_len);
 
   (void)sys_munmap((void *)(usize)old_start, old_len);
   return fresh;
@@ -3689,13 +3726,41 @@ static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
  * correctness beats the lost parallelism. The page-fault handler intentionally
  * does NOT take it — it only reads the list, the pre-existing read/write race is
  * unchanged, and taking a yielding lock in the fault path is unsafe. */
-static volatile int g_vma_mutex;
-static void vma_mutator_lock(void) {
-  while (__sync_lock_test_and_set(&g_vma_mutex, 1))
-    scheduler_yield();
+/* One lock per address space, not one for the machine.
+ *
+ * A single global flag meant an mmap anywhere stalled an mmap everywhere: a
+ * browser process starting threads blocked the compositor's next allocation,
+ * on a completely unrelated list. Threads of one process share their VMA list
+ * — that list is what needs serialising — and processes share nothing here.
+ *
+ * The address space is named by its PML4 frame, which is exactly what the
+ * CLONE_VM threads have in common. A small table of slots is enough: it is
+ * indexed by hashing that frame, so unrelated spaces almost never collide, and
+ * when they do the cost is the old behaviour for those two alone. */
+#define VMA_LOCK_SLOTS 16
+static volatile int g_vma_mutex[VMA_LOCK_SLOTS];
+
+static unsigned vma_lock_slot(void) {
+  u64 space = current_task ? current_task->pml4_phys : 0;
+
+  /* The frame number, folded — consecutive PML4 frames must not land in one
+   * slot, and the low twelve bits are always zero. */
+  space >>= 12;
+  space ^= space >> 8;
+  return (unsigned)(space % VMA_LOCK_SLOTS);
 }
-static void vma_mutator_unlock(void) {
-  __sync_lock_release(&g_vma_mutex);
+
+/* The slot is returned rather than recomputed on release: execve replaces the
+ * address space mid-call, and recomputing would then unlock a different one. */
+static unsigned vma_mutator_lock(void) {
+  unsigned slot = vma_lock_slot();
+
+  while (__sync_lock_test_and_set(&g_vma_mutex[slot], 1))
+    scheduler_yield();
+  return slot;
+}
+static void vma_mutator_unlock(unsigned slot) {
+  __sync_lock_release(&g_vma_mutex[slot]);
 }
 
 static isize sys_mprotect(void *addr, usize length, int prot) {
@@ -4387,6 +4452,11 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
 static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                      u64 arg4, u64 arg5, struct interrupt_frame *frame) {
   u64 ret = 0;
+
+  /* Which call this task is in, for the task dump. A thread that sits at the
+   * same user RIP for minutes is either looping inside one call or repeating
+   * it, and only the number tells those apart. */
+  task_note_syscall(number);
 
   /* Record which CPU this userspace syscall came in on (ELF tasks only — kernel
    * builtins make in-kernel syscalls that do not prove ring-3 execution). */
@@ -5339,14 +5409,26 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         }
         if (base_op == 1 || base_op == 10)
           return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAKE, (int)arg2, 0);
-        /* FUTEX_REQUEUE(4): wake val waiters on uaddr, requeue val2 to uaddr2. */
-        if (base_op == 4) {
+        /* FUTEX_REQUEUE(3): wake val waiters on uaddr, requeue val2 to
+         * uaddr2. FUTEX_CMP_REQUEUE(4) does the same after checking that
+         * *uaddr still holds val3. These numbers were swapped here — 4 was
+         * treated as REQUEUE and 8, which is TRYLOCK_PI, as CMP_REQUEUE. */
+        if (base_op == 3 || base_op == 4) {
+          if (base_op == 4) {
+            int cur = 0;
+
+            if (syscall_copyin(&cur, (void *)(usize)arg0, sizeof(int)) < 0)
+              return (u64)-EFAULT;
+            if (cur != (int)arg5)
+              return (u64)-EAGAIN;
+          }
           int woken = (int)scheduler_futex(arg0, B1NIX_FUTEX_WAKE, (int)arg2, 0);
           if (woken < 0)
             return (u64)woken;
-          /* Requeue remaining from arg2 count: wake min(val2, remaining) on
-           * uaddr2. For now, do a simple wake on uaddr2. */
-          int extra = (int)arg3 > woken ? (int)arg3 - woken : 0;
+          /* Requeue is served as a wake on the second address: this kernel has
+           * no way to move a waiter between queues, and waking it early costs
+           * a re-check rather than correctness. */
+          int extra = (int)arg3;
           if (extra > 0) {
             int rq = (int)scheduler_futex(arg4, B1NIX_FUTEX_WAKE, extra, 0);
             if (rq > 0)
@@ -5354,17 +5436,81 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           }
           return (u64)woken;
         }
-        /* FUTEX_CMP_REQUEUE(8): same as REQUEUE but check *uaddr == val3 first. */
-        if (base_op == 8) {
-          int cur = 0;
-          if (syscall_copyin(&cur, (void *)(usize)arg0, sizeof(int)) < 0)
+        /* The priority-inheritance family: FUTEX_LOCK_PI(6),
+         * FUTEX_UNLOCK_PI(7), FUTEX_TRYLOCK_PI(8).
+         *
+         * A PI futex holds the owner's thread id in its low bits, with
+         * FUTEX_WAITERS (bit 31) set while anyone is queued. There is no
+         * priority inheritance behind this — the scheduler has no priority to
+         * donate — but the locking protocol is the real one, and that is what
+         * callers depend on. musl probes for the whole family by taking such a
+         * lock on a throwaway word, and returns whatever the kernel said to
+         * pthread_mutexattr_setprotocol: pulseaudio, which chromium loads,
+         * asserts that the answer is either success or ENOTSUP and aborts the
+         * process on anything else.
+         *
+         * The compare-and-set is not atomic against userspace — it copies in,
+         * decides, and copies out — but every path that changes a PI word goes
+         * through this call, so two threads racing here are serialised by the
+         * syscall itself. */
+        if (base_op == 6 || base_op == 7 || base_op == 8) {
+          const u32 waiters_bit = 0x80000000u;
+          u32 self = current_task ? (u32)current_task->id : 0;
+          u32 cur = 0;
+
+          if (syscall_copyin(&cur, (void *)(usize)arg0, sizeof(u32)) < 0)
             return (u64)-EFAULT;
-          if (cur != (int)arg5)
-            return (u64)-EAGAIN;
-          return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAKE, (int)arg2, 0);
+
+          if (base_op == 7) { /* UNLOCK_PI */
+            if ((cur & ~waiters_bit) != self)
+              return (u64)-EPERM;
+            u32 zero = 0;
+
+            if (syscall_copyout((void *)(usize)arg0, &zero, sizeof(zero)) < 0)
+              return (u64)-EFAULT;
+            (void)scheduler_futex(arg0, B1NIX_FUTEX_WAKE, 1, 0);
+            return 0;
+          }
+
+          for (;;) {
+            if ((cur & ~waiters_bit) == 0) { /* free — take it */
+              u32 taken = self | (cur & waiters_bit);
+
+              if (syscall_copyout((void *)(usize)arg0, &taken, sizeof(taken)) < 0)
+                return (u64)-EFAULT;
+              return 0;
+            }
+            if ((cur & ~waiters_bit) == self)
+              return (u64)-EDEADLK;
+            if (base_op == 8) /* TRYLOCK_PI: held by someone else */
+              return (u64)-EAGAIN;
+
+            /* Held: mark it contended and wait for the owner to release. */
+            u32 contended = cur | waiters_bit;
+
+            if (contended != cur &&
+                syscall_copyout((void *)(usize)arg0, &contended, sizeof(contended)) < 0)
+              return (u64)-EFAULT;
+            isize rc = scheduler_futex(arg0, B1NIX_FUTEX_WAIT, (int)contended, 0);
+
+            if (rc < 0 && rc != -EAGAIN)
+              return (u64)rc;
+            if (syscall_copyin(&cur, (void *)(usize)arg0, sizeof(cur)) < 0)
+              return (u64)-EFAULT;
+          }
         }
-        /* Default: pass through to native futex handler. */
-        return (u64)scheduler_futex(arg0, op, (int)arg2, arg3);
+        /* Anything else is an operation this kernel does not implement, and
+         * that is what it must say. The priority-inheritance family
+         * (FUTEX_LOCK_PI and friends) is the one that matters: musl probes for
+         * it with a real call and reads ENOSYS as "no PI here", turning it into
+         * ENOTSUP for pthread_mutexattr_setprotocol. Any other error is passed
+         * straight through to the caller instead — which is how pulseaudio,
+         * pulled in by chromium, came to abort on
+         * "Assertion 'r == 0 || r == 95' failed" and take the browser with it.
+         *
+         * The native handler knows WAIT and WAKE only, so passing an unknown
+         * op down to it could never have done anything useful. */
+        return (u64)-ENOSYS;
       }
 
       /* Signal-number remap: b1nix signo values differ from Linux. rt_sigaction
@@ -7173,33 +7319,33 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     task_rss_sample(current_task, 0);
     return sys_brk(arg0);
   case SYS_MMAP: {
-    vma_mutator_lock();
+    unsigned vma_slot = vma_mutator_lock();
     u64 r = sys_mmap((void *)(usize)arg0, (usize)arg1, (int)arg2, (int)arg3,
                      (int)arg4, (isize)arg5);
-    vma_mutator_unlock();
+    vma_mutator_unlock(vma_slot);
     return r;
   }
   case SYS_MUNMAP: {
     /* Sample before the pages go: this is where the resident set falls, so it
      * is where an unrecorded peak would be lost (M86). */
     task_rss_sample(current_task, 0);
-    vma_mutator_lock();
+    unsigned vma_slot = vma_mutator_lock();
     u64 r = (u64)sys_munmap((void *)(usize)arg0, (usize)arg1);
-    vma_mutator_unlock();
+    vma_mutator_unlock(vma_slot);
     return r;
   }
   case SYS_MREMAP: {
     task_rss_sample(current_task, 0);
-    vma_mutator_lock();
+    unsigned vma_slot = vma_mutator_lock();
     u64 r = sys_mremap((void *)(usize)arg0, (usize)arg1, (usize)arg2, (int)arg3,
                        (void *)(usize)arg4);
-    vma_mutator_unlock();
+    vma_mutator_unlock(vma_slot);
     return r;
   }
   case SYS_MPROTECT: {
-    vma_mutator_lock();
+    unsigned vma_slot = vma_mutator_lock();
     u64 r = (u64)sys_mprotect((void *)(usize)arg0, (usize)arg1, (int)arg2);
-    vma_mutator_unlock();
+    vma_mutator_unlock(vma_slot);
     return r;
   }
   case SYS_MADVISE:
@@ -7810,7 +7956,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)rc;
   }
   case SYS_GETTID:
-    return (u64)scheduler_get_pid();
+    /* The THREAD's id, which is not the process's.
+     *
+     * scheduler_get_pid answers with the thread-group id — correct for
+     * getpid(), and wrong here. With every thread reporting the same number,
+     * anything that identifies a thread by it sees one thread: libc++abi's
+     * static-initialisation guard concluded that a second thread entering an
+     * initialiser was the same thread re-entering it, called that recursive
+     * initialisation, and aborted the process. Chromium died that way before
+     * it could open a window. */
+    return current_task ? (u64)current_task->id : 0;
   case SYS_EXIT_THREAD:
     /* SYS_EXIT_THREAD(code) — thread-only exit. For an is_thread task
      * scheduler_exit_current already handles the CLONE_CHILD_CLEARTID
@@ -8038,7 +8193,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* set_tid_address(tidptr): store the clear-child-tid pointer and return
      * the calling thread's TID.  musl calls this during __init_tls. */
     task_set_child_tid_clear(current_task, (u64)arg0);
-    ret = (u64)scheduler_get_pid();
+    /* Returns the caller's THREAD id, like gettid — musl stores it as the
+     * thread's own tid during __init_tls, and a process-wide value there makes
+     * every thread believe it is the group leader. */
+    ret = current_task ? (u64)current_task->id : 0;
     break;
 
   case SYS_WRITEV:

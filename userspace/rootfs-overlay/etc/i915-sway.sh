@@ -14,13 +14,52 @@
 #
 # Run from /etc/inittab, and only when the kernel cmdline carries
 # b1nix.i915sway: it fetches packages over the network and takes minutes.
-grep -q "b1nix.i915sway" /proc/cmdline 2>/dev/null || exit 0
+if ! grep -q "b1nix.i915sway" /proc/cmdline 2>/dev/null; then
+	# Silence here is indistinguishable from "the flag was not passed", and a
+	# boot where the kernel printed the flag but this read did not see it looks
+	# exactly the same as a boot that was never asked to run sway. Say which of
+	# the two happened, and show what the read actually returned.
+	echo "I915-SWAY: not requested; /proc/cmdline = [$(cat /proc/cmdline 2>&1)]"
+	exit 0
+fi
 
-echo "I915-SWAY: start"
+# Every milestone carries the guest's uptime, so a slow boot can be split
+# into its parts instead of guessed at.
+up() { cut -d" " -f1 /proc/uptime 2>/dev/null || echo "?"; }
+echo "I915-SWAY: start t=$(up)"
 
 export HOME=/root
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 mkdir -p /run /tmp /root /run/user/0
+
+# Does the guest read back what the image actually holds?
+#
+# The loader has twice reported missing symbols whose names were themselves
+# damaged ("erTMCloneTable" for "_ITM_registerTMCloneTable"), which is not a
+# linking problem but a file whose contents arrive wrong. Checksumming the two
+# binaries involved settles it in one run: matching sums mean the reads are
+# faithful and the fault is above the filesystem; differing sums mean the read
+# path corrupts data, and that is a kernel bug worth everything else waiting.
+echo "I915-SWAY: md5 libpipewire $(md5sum /lib/libpipewire-0.3.so.0 2>&1 | cut -d' ' -f1) (expect 8519bd11f2693a79a0b5038dc553d23e)"
+echo "I915-SWAY: md5 avcodec-16M $(md5sum /lib/libavcodec.so.60.31.102 2>&1 | cut -d' ' -f1) (expect 8255cd2b529e80e4363ccfa0efecd33c)"
+echo "I915-SWAY: md5 icudata-30M $(md5sum /usr/share/icu/74.2/icudt74l.dat 2>&1 | cut -d' ' -f1) (expect 3637714fbde5e57185223d4a8aa254e6)"
+# Read the big one twice. Two different wrong sums mean each read is corrupted
+# afresh — the data is damaged in transit; one repeated wrong sum means a bad
+# copy settled in the cache and is served consistently. The two have different
+# causes and there is no way to tell them apart from a single reading.
+echo "I915-SWAY: md5 chromium#1  $(md5sum /lib/chromium/chromium 2>&1 | cut -d' ' -f1) (expect 1f8f49c00bf53053df1fb3e2e54fae67)"
+echo "I915-SWAY: md5 chromium#2  $(md5sum /lib/chromium/chromium 2>&1 | cut -d' ' -f1) (expect 1f8f49c00bf53053df1fb3e2e54fae67)"
+
+# Where a graphics stack looks for a render node, checked rather than assumed.
+# The node exists in /dev and is published under /sys, and Chromium still says
+# it cannot find one — so print every path it could be enumerating.
+echo "--- render node visibility ---"
+echo "/sys/class/drm:      $(ls /sys/class/drm 2>&1 | tr '\n' ' ')"
+echo "/sys/dev/char/226:128: $(ls -l /sys/dev/char/226:128 2>&1 | head -1)"
+echo "renderD128 dev attr: $(cat /sys/class/drm/renderD128/dev 2>&1)"
+echo "renderD128 uevent:   $(cat /sys/class/drm/renderD128/uevent 2>&1 | tr '\n' ' ')"
+echo "open test:           $(dd if=/dev/dri/renderD128 bs=1 count=0 2>&1 | tail -1)"
+echo "--- end render node visibility ---"
 
 echo "--- /dev/dri ---"
 ls -l /dev/dri 2>&1
@@ -33,7 +72,7 @@ if [ ! -e "$CARD" ]; then
 	echo "I915-SWAY: done"
 	exit 0
 fi
-echo "I915-SWAY: ok card $CARD"
+echo "I915-SWAY: ok card $CARD t=$(up)"
 
 # What libdrm looks at before it will call this a primary node: the device
 # numbers on the node itself, and the sysfs entry that says the numbers belong
@@ -138,7 +177,7 @@ if [ -n "$NEED" ]; then
 		exit 0
 	fi
 else
-	echo "I915-SWAY: ok update (nothing to fetch)"
+	echo "I915-SWAY: ok update (nothing to fetch) t=$(up)"
 fi
 
 # cage is the control: a kiosk compositor on the same wlroots, a fraction of
@@ -222,9 +261,23 @@ if grep -q "b1nix.chromium" /proc/cmdline 2>/dev/null && [ -x /usr/bin/chromium 
 	# not have; --disable-gpu because there is no GL driver for this hardware
 	# yet, so it composites in software and hands sway a shared-memory buffer —
 	# which is the same path every other client here uses.
+	#
+	# --no-zygote because the zygote forks with clone(SIGCHLD, ...) and this
+	# kernel only implements clone with CLONE_VM; chromium supports the flag
+	# alongside --no-sandbox and forks its children directly instead.
 	{
 		echo 'output * bg #202020 solid_color'
-		echo 'exec /usr/bin/chromium --ozone-platform=wayland --no-sandbox --disable-gpu --disable-dev-shm-usage --user-data-dir=/tmp/chromium --window-size=1280,800 about:blank'
+		# Window appearance, taken from a working desktop's sway config
+		# (bla1r1/DotsFiles) and cut down to what plain sway understands —
+		# no swayFX blur or shadows, no bar, no launcher, nothing that would
+		# need a program this image does not carry. A visible border and a
+		# named colour make a photograph of the panel say which window is
+		# which, which a plain grey field does not.
+		echo 'default_border pixel 2'
+		echo 'client.focused          #7aa2f7 #1a1b26 #c0caf5 #bb9af7 #7aa2f7'
+		echo 'client.unfocused        #101014 #16161e #a9b1d6 #101014 #101014'
+		echo 'gaps inner 5'
+		: # the browser is started below, by this script, so its output is ours
 	} > /etc/sway/config
 elif grep -q "b1nix.sway-clients" /proc/cmdline 2>/dev/null; then
 	{
@@ -288,12 +341,22 @@ SEATD_VTBOUND=0 seatd -g root > /tmp/seatd.log 2>&1 &
 i=0
 while [ $i -lt 20 ] && [ ! -S /run/seatd.sock ]; do i=$((i + 1)); sleep 1; done
 if [ -S /run/seatd.sock ]; then
-	echo "I915-SWAY: ok seatd"
+	echo "I915-SWAY: ok seatd t=$(up)"
 else
 	echo "I915-SWAY: fail seatd"
 	tail -20 /tmp/seatd.log
 fi
 export XDG_SESSION_TYPE=wayland
+# What a desktop session tells its clients about itself.
+#
+# Chromium reads XDG_CURRENT_DESKTOP when it decides how to behave on Wayland,
+# and a session that names none is not a case it is written for. A real sway
+# session exports these (see bla1r1/DotsFiles, which imports exactly this set
+# into the user environment); this one exported only the session type.
+export XDG_CURRENT_DESKTOP=sway
+export XDG_SESSION_DESKTOP=sway
+export GDK_BACKEND=wayland
+export QT_QPA_PLATFORM=wayland
 
 # Straight to the console, and through no pipe: when the compositor takes the
 # machine down with it a log printed afterwards never appears, and a pipe holds
@@ -334,7 +397,7 @@ else
 		export WLR_BACKENDS=headless
 		echo "I915-SWAY: headless isolation run"
 	fi
-	echo "I915-SWAY: starting sway on $CARD"
+	echo "I915-SWAY: starting sway on $CARD t=$(up)"
 	sway -d -c /etc/sway/config > /tmp/sway.log 2>&1 &
 fi
 SWAY_PID=$!
@@ -371,7 +434,7 @@ if [ -z "$WAYLAND_DISPLAY" ] || [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; th
 	echo "I915-SWAY: done"
 	exit 0
 fi
-echo "I915-SWAY: ok socket"
+echo "I915-SWAY: ok socket t=$(up)"
 
 if [ -z "$SWAYSOCK" ]; then
 	SWAYSOCK=$(ls -1 "$XDG_RUNTIME_DIR"/sway-ipc.*.sock 2>/dev/null | head -1)
@@ -385,6 +448,252 @@ echo "--- end runtime dir ---"
 echo "--- outputs ---"
 swaymsg -t get_outputs 2>&1
 echo "--- end outputs ---"
+
+# When a browser was asked for, say whether it actually put a window on the
+# screen, and say it as a marker rather than leaving the run to be read by eye.
+# A run that ends without either marker is a run that told us nothing.
+if grep -q "b1nix.chromium" /proc/cmdline 2>/dev/null; then
+	# Start the browser here rather than from sway's config. sway's exec
+	# detaches its children and their stdout and stderr go nowhere we can read:
+	# three runs in a row produced neither chromium's own errors nor the exit
+	# code we appended to the command. Started from this script it is our
+	# child, and this script's output is the serial console.
+	# --in-process-gpu: the separate GPU process died here before any window
+	# existed — it looks for a DRM render node (this card exposes none yet) and
+	# then for VA-API on it, and the browser waits for a process that never
+	# comes back. In-process there is one less child to lose, and the software
+	# path this run uses does not need a process of its own. VaapiVideoDecoder
+	# is switched off for the same reason: it has no device to open.
+	#
+	# A page built to be photographed, for the same reason the compositor runs
+	# a green terminal: about:blank on a panel across a dark room is
+	# indistinguishable from a monitor showing nothing. Saturated colour fills
+	# the screen, the text says which machine drew it, and a counter driven by
+	# the page's own script changes between frames — so a photograph shows the
+	# browser rendering rather than a still image left over from something else.
+	cat > /root/browser-proof.html <<'PROOF'
+<!doctype html>
+<meta charset="utf-8">
+<title>b1nix</title>
+<style>
+  html,body{margin:0;height:100%;background:#00b04a;color:#0b0b0b;
+            font-family:monospace;display:flex;flex-direction:column;
+            align-items:center;justify-content:center}
+  h1{font-size:6vw;margin:0}
+  p{font-size:3vw;margin:2vh 0 0}
+  #t{font-size:8vw;margin:3vh 0 0}
+</style>
+<h1>chromium on b1nix</h1>
+<p id="ua"></p>
+<div id="t">0</div>
+<script>
+  document.getElementById('ua').textContent = navigator.platform;
+  let n = 0;
+  setInterval(() => { document.getElementById('t').textContent = ++n; }, 1000);
+</script>
+PROOF
+	# The control client (foot) has served its purpose: on this same socket it
+	# binds fifteen globals and creates a toplevel, which is what established
+	# that the compositor path works and the browser's silence is its own. It is
+	# not run every time — it costs a fifth of the boot and has twice hung and
+	# taken the run with it. b1nix.wayland-control brings it back.
+	if grep -q "b1nix.wayland-control" /proc/cmdline 2>/dev/null; then
+		echo "I915-SWAY: control client (foot) t=$(up)"
+		( WAYLAND_DEBUG=1 timeout -k 5 20 /usr/bin/foot true > /var/foot.log 2>&1
+		  echo "FOOT-RUN-EXIT rc=$?" >> /var/foot.log )
+		echo "--- control client protocol ---"
+		for req in "\.bind(" "create_surface" "get_toplevel"; do
+			echo "  $req: $(grep -ac "$req" /var/foot.log 2>/dev/null)"
+		done
+		echo "--- end control client protocol ---"
+	fi
+
+	# Shared memory, checked before the browser needs it.
+	#
+	# A Wayland client shows nothing without it: every frame is a wl_shm buffer
+	# over a file both sides map. The browser binds wl_shm and then creates no
+	# surface at all, and "it cannot make a buffer" and "it decided not to draw"
+	# look identical from outside. This says which.
+	mkdir -p /dev/shm
+	if : > /dev/shm/probe 2>/dev/null && dd if=/dev/zero of=/dev/shm/probe bs=4096 count=1 2>/dev/null; then
+		echo "I915-SWAY: shm ok ($(ls -l /dev/shm/probe 2>&1 | awk '{print $5}') bytes)"
+		rm -f /dev/shm/probe
+	else
+		echo "I915-SWAY: shm FAIL — a client cannot allocate a frame buffer"
+	fi
+
+	# Does the browser work at all, with no window in the way?
+	#
+	# It initialises Wayland completely — binds two dozen globals, answers the
+	# compositor — and then creates no surface and says nothing about a window
+	# even at --v=1. Headless removes the window layer from the question: a
+	# screenshot means the engine, the processes and the IPC are all fine and
+	# only the Ozone path is not; no screenshot means it never gets that far.
+	if grep -q "b1nix.headless-probe" /proc/cmdline 2>/dev/null; then
+	echo "I915-SWAY: headless probe t=$(up)"
+	( timeout -k 5 90 /usr/bin/chromium --headless --no-sandbox --no-zygote \
+	      --disable-gpu --user-data-dir=/tmp/chromium-headless \
+	      --screenshot=/tmp/shot.png --window-size=800,600 \
+	      file:///root/browser-proof.html > /var/headless.log 2>&1
+	  echo "HEADLESS-EXIT rc=$?" >> /var/headless.log )
+	if [ -s /tmp/shot.png ]; then
+		echo "I915-SWAY: headless ok — $(ls -l /tmp/shot.png | awk '{print $5}') byte screenshot"
+	else
+		echo "I915-SWAY: headless FAIL — no screenshot"
+		# The abort's own words, not the tail. A Chromium CHECK prints the file
+		# and condition that failed and then everything after it is unwinding
+		# noise, so pick the failure out rather than showing the last lines.
+		grep -aiE "FATAL|CHECK failed|DCHECK|Aborted|assert|NOTREACHED|out of memory|bad_alloc" \
+			/var/headless.log 2>/dev/null | head -10
+		echo "  --- last lines ---"
+		grep -av "bus\.cc" /var/headless.log 2>/dev/null | tail -14
+	fi
+	fi
+
+	echo "I915-SWAY: starting chromium on $WAYLAND_DISPLAY t=$(up)"
+	# The display name is the one discovered above, not a guess: sway names its
+	# socket wayland-0 or wayland-1 depending on what else asked for one first,
+	# and a browser pointed at the wrong name reports no Wayland server at all.
+	# Into a file, not onto the console. The console is a 115200-baud serial
+	# line, and at --v=1 the browser writes thousands of lines through it — the
+	# machine spends its startup inside the UART instead of laying out a page.
+	# The verdict below dumps the tail of this file, which is the part anyone
+	# reads anyway.
+	(
+		# Every Wayland request and event the browser exchanges with the
+		# compositor, into the same file. When a client stops without a word,
+		# the protocol trace is what says whether it ever asked for a surface
+		# — the difference between "the compositor ignored it" and "it never
+		# got that far".
+		WAYLAND_DEBUG=1 \
+		/usr/bin/chromium \
+			--ozone-platform=wayland --no-sandbox --no-zygote \
+			--single-process \
+			--use-gl=angle --use-angle=swiftshader \
+			--disable-gpu-compositing \
+			--disable-dev-shm-usage --user-data-dir=/tmp/chromium-profile \
+			--in-process-gpu \
+			--disable-features=VaapiVideoDecoder,VaapiVideoEncoder,VaapiIgnoreDriverChecks \
+			--disable-accelerated-video-decode --disable-accelerated-video-encode \
+			--ozone-platform-hint=wayland \
+			--window-size=1280,800 --enable-logging=stderr \
+			--disable-features=WaylandFractionalScaleV1 \
+			--v=1 \
+			file:///root/browser-proof.html > /var/chromium.log 2>&1
+		echo "CHROMIUM-EXIT rc=$?"
+	) &
+
+	# Wait on the clock, not on a loop count: every iteration here spawns
+	# swaymsg, and on one vCPU with an eagerly-loaded 220 MB binary next door
+	# a "180 iteration" loop ran far longer than 180 seconds and the run died
+	# inside it, before it could report anything. Poll rarely, say we are alive,
+	# and stop at a deadline we can state.
+	win=""
+	t0=$(date +%s)
+	# Shorter than the run's own timeout, or the summaries below never print:
+	# at 1500s the VM was always killed mid-wait and the protocol counters — the
+	# whole point of the wait — went with it. 90s because a browser that is going
+	# to create a surface does so within seconds of binding the compositor's
+	# globals; waiting minutes past that only makes each experiment slower.
+	# 180s, measured rather than guessed. The GPU thread spends about 77 of them
+	# in one stretch before it says anything again — it tries VA-API, which this
+	# machine has no driver for, and only then carries on. At 90s the wait ended
+	# inside that gap and reported no window for a browser that had not finished
+	# starting; the flags above remove the detour, and this leaves room for what
+	# is left of it.
+	deadline=$((t0 + 180))
+	# Give it a moment to exist before asking whether it died: the first check
+	# used to run before the process had even exec'd and reported it gone at 0s,
+	# which stopped the watch while the browser was in fact starting fine.
+	sleep 20
+	while [ "$(date +%s)" -lt "$deadline" ]; do
+		if swaymsg -t get_tree 2>/dev/null | grep -qi chromium; then
+			win=1
+			break
+		fi
+		# -f: match the whole command line. The binary is /usr/lib/chromium/chromium
+		# behind a launcher, so a bare name match is not reliable.
+		if ! pgrep -f "chromium" >/dev/null 2>&1; then
+			echo "I915-SWAY: FAIL chromium-window (process exited after $(($(date +%s) - t0))s)"
+			break
+		fi
+		echo "I915-SWAY: waiting for the window, $(($(date +%s) - t0))s, rss=$(cat /proc/meminfo 2>/dev/null | grep -i memfree | head -1)"
+		# What the browser has said since the last check. A run that ends on
+		# the runner's timeout never reaches the dump below, and then a
+		# forty-minute wait produces no evidence at all — this way the log
+		# arrives as it is written.
+		wait_n=$((${wait_n:-0} + 1))
+		if [ $((wait_n % 4)) -eq 0 ]; then
+			echo "--- browser so far ($(wc -l < /var/chromium.log 2>/dev/null) lines) ---"
+			# The browser's own words, then the last of the protocol
+			# traffic: with WAYLAND_DEBUG on, the trace would otherwise
+			# bury everything else.
+			grep -av "^\[[0-9]* " /var/chromium.log 2>/dev/null | tail -4
+			# What the compositor offers and what the browser took: a client
+			# that never asks for a window shell is a client that did not
+			# find one, and the registry is where that shows.
+			# No sort, no tail: sorting is by text, so global(10..13) lands
+			# ahead of global(2) and a tail cut exactly the entries in
+			# question — which is how a filter artefact came to look like
+			# lost protocol messages.
+			grep -aE "\.global\(|xdg_wm_base|xdg_surface|xdg_toplevel" \
+				/var/chromium.log 2>/dev/null | sed 's/.*] //' | uniq
+			echo "--- end browser so far ---"
+		fi
+		sleep 15
+	done
+	if [ -n "$win" ]; then
+		echo "I915-SWAY: ok chromium-window after $(($(date +%s) - t0))s"
+	elif pgrep chromium >/dev/null 2>&1; then
+		echo "I915-SWAY: FAIL chromium-window (alive, no window after $(($(date +%s) - t0))s)"
+	fi
+	echo "--- chromium tree ---"
+	swaymsg -t get_tree 2>&1 | grep -iE "app_id|name|pid" | head -40
+	echo "--- end chromium tree ---"
+	# Chromium's output goes to sway's stderr, which is this console — the two
+	# attempts to put it in a file failed because neither /tmp nor /var was
+	# writable at this point in boot, and an unwritable redirect kills the
+	# launch outright rather than just losing the log.
+	# Chromium inherits sway's stdout/stderr, and sway's go to /tmp/sway.log —
+	# so its own words are in there, not on the console. The head -120 dump
+	# earlier in this script runs before the browser has said anything.
+	# sway runs with -d, so a plain tail is 60 lines of its own debug. Pick out
+	# what the browser and the compositor said about the browser.
+	# How far the browser got in the Wayland protocol, counted rather than
+	# guessed from a tail. A client that binds the globals and stops has a
+	# different problem from one that creates surfaces but never gives them a
+	# toplevel, and the tail of a 100k-line trace shows neither.
+	echo "--- wayland protocol summary ---"
+	for req in wl_registry.bind create_surface xdg_surface get_toplevel \
+	           set_title commit attach; do
+		echo "  $req: $(grep -ac "$req" /var/chromium.log 2>/dev/null)"
+	done
+	echo "  last protocol line: $(grep -aE '@[0-9]+\.' /var/chromium.log 2>/dev/null | tail -1)"
+	# Which globals it actually took. The control client binds fifteen; this one
+	# binds one, and the difference between "did not want it" and "could not get
+	# it" is the whole question.
+	echo "  bound: $(grep -aE 'bind\(' /var/chromium.log 2>/dev/null | sed 's/.*bind(//' | cut -d, -f2 | sort -u | tr '\n' ' ')"
+	echo "  wayland errors: $(grep -acE 'error|Error|refused|protocol' /var/chromium.log 2>/dev/null)"
+	# What it says about windows. At --v=1 the window and widget layers narrate
+	# their own decisions, and the question here is which decision it makes
+	# instead of creating a surface.
+	echo "  window lines:"
+	grep -aiE "window|widget|surface|toplevel" /var/chromium.log 2>/dev/null |
+		grep -av '@[0-9]*\.' | tail -12
+	grep -aE 'error|Error' /var/chromium.log 2>/dev/null | grep -av '@[0-9]*\.' | tail -5
+	echo "--- end wayland protocol summary ---"
+	echo "--- browser log tail ($(wc -l < /var/chromium.log 2>/dev/null) lines) ---"
+	grep -av '@[0-9]*\.' /var/chromium.log 2>/dev/null | tail -30
+	echo "--- end browser log ---"
+	echo "--- browser lines from the compositor log ---"
+	grep -aiE "chromium|chrome|CHROMIUM-EXIT|ERROR|FATAL|Check failed|xdg_toplevel|new toplevel" /tmp/sway.log 2>&1 | tail -40
+	echo "--- end browser lines ---"
+	echo "--- writable check ---"
+	for d in /tmp /var /run /root; do
+		( : > "$d/.wtest" ) 2>/dev/null && { echo "$d writable"; rm -f "$d/.wtest"; } || echo "$d NOT writable"
+	done
+	echo "--- end writable check ---"
+fi
 
 # The monitor is watched by a camera on the host, so hold the picture long
 # enough to be photographed rather than only screenshotted.

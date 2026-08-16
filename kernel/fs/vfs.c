@@ -2663,6 +2663,27 @@ int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
   int res = 0;
   if (!path)
     return -EINVAL;
+  /* What a graphics client actually looks at while deciding a device exists.
+   *
+   * Chromium enumerates GPUs through sysfs and reports finding none, while the
+   * node it should find answers correctly when asked directly. Guessing which
+   * path it reads has cost several rebuilds; this says so outright. Gated on a
+   * cmdline flag, and only for /sys, so it costs nothing in a normal boot. */
+  if (bootinfo_has_flag("b1nix.trace-sysfs") && current_task &&
+      ((path[0] == '/' && path[1] == 's' && path[2] == 'y' && path[3] == 's' &&
+        (path[4] == '/' || path[4] == 0)) ||
+       /* And /dev/dri, which is where the browser actually looks: it opens
+        * every renderD* in turn. Whether it opens ours at all, and when
+        * relative to its verdict, cannot be read off the console — its own
+        * messages go to a file and are printed later. */
+       (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' &&
+        path[4] == '/' && path[5] == 'd' && path[6] == 'r' && path[7] == 'i'))) {
+    console_write("sysfs-open: ");
+    console_write(path);
+    console_write(" by ");
+    console_write(current_task->name);
+    console_write("\n");
+  }
   if (strlen(path) >= VFS_MAX_PATH)
     return -ENAMETOOLONG;
   char *resolved = kmalloc(VFS_MAX_PATH);
@@ -5503,9 +5524,17 @@ int vfs_fcntl(int fd, int cmd, u64 arg) {
     return scheduler_fd_flags_set(fd, (int)arg);
   case B1NIX_F_GETFL:
     return h->flags;
-  case B1NIX_F_SETFL:
-    h->flags = (int)arg;
+  case B1NIX_F_SETFL: {
+    /* F_SETFL sets only the status flags. The access mode and the flags that
+     * only mean something at open() time (O_CREAT, O_EXCL, O_TRUNC, O_CLOEXEC,
+     * O_DIRECTORY) are fixed for the life of the description and are ignored
+     * here — POSIX says so, and assigning the argument wholesale instead turned
+     * the routine fcntl(fd, F_SETFL, O_NONBLOCK) that every event loop performs
+     * into a silent downgrade of a read-write descriptor to O_RDONLY. */
+    const int settable = B1NIX_O_APPEND | B1NIX_O_NONBLOCK;
+    h->flags = (h->flags & ~settable) | ((int)arg & settable);
     return 0;
+  }
   case B1NIX_F_ADD_SEALS:
     return vfs_fcntl_add_seals(fd, (u32)arg);
   case B1NIX_F_GET_SEALS:

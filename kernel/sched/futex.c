@@ -50,6 +50,8 @@ struct futex_bucket {
 };
 
 static struct futex_bucket g_futex[FUTEX_BUCKETS];
+static u64 g_futex_wake_hit;
+static u64 g_futex_wake_missed;
 
 /* Hash (pml4, uaddr) → bucket index. uaddr is at least 4-byte aligned for
  * futex; shift away the low bits to spread keys across buckets. */
@@ -67,8 +69,29 @@ static int futex_read_word(u64 uaddr, int *out) {
   return syscall_copyin(out, (const void *)(usize)uaddr, sizeof(int));
 }
 
-static u64 futex_key_pml4(void) {
+/* The address space a futex belongs to — or, for one in shared memory, the
+ * page itself.
+ *
+ * Keying purely on the address space is right for a private futex and wrong
+ * for a shared one: the same object mapped into two processes has two address
+ * spaces, so a waiter queued by one and a wake issued by the other never meet.
+ * Chromium puts mutexes in memory shared between its processes, and the result
+ * was measurable — 230 wakes finding nobody against 68 that did, with every
+ * thread parked on a lock nobody could release.
+ *
+ * For a shared page the frame number is the identity both sides agree on, so
+ * it takes the place of the address space. It is stable for as long as the
+ * mapping is: a shared page is never copied on write, which is exactly what
+ * makes it shared. */
+static u64 futex_key_pml4_for(u64 uaddr) {
+  extern u64 vmm_query_leaf_pte(u64 vaddr);
   struct task *t = current_task;
+  u64 pte = vmm_query_leaf_pte(uaddr & ~(u64)(PAGE_SIZE - 1));
+
+  if ((pte & VMM_PRESENT) && (pte & VMM_SHARED)) {
+    /* Marked so a frame number can never collide with a pml4 address. */
+    return (pte & 0x000ffffffffff000ULL) | 1ull; /* frame, tagged */
+  }
   return t ? t->pml4_phys : 0;
 }
 
@@ -85,7 +108,7 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
     if (futex_read_word(uaddr, &cur) != 0) return -EFAULT;
     if (cur != val) return -EAGAIN;
 
-    u64 key_pml4 = futex_key_pml4();
+    u64 key_pml4 = futex_key_pml4_for(uaddr);
     unsigned h = futex_hash(key_pml4, uaddr);
     struct futex_bucket *b = &g_futex[h];
 
@@ -169,7 +192,7 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
     if (val < 0) return -EINVAL;
     if (val == 0) return 0;
 
-    u64 key_pml4 = futex_key_pml4();
+    u64 key_pml4 = futex_key_pml4_for(uaddr);
     unsigned h = futex_hash(key_pml4, uaddr);
     struct futex_bucket *b = &g_futex[h];
 
@@ -199,6 +222,16 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
       pp = &w->next;
     }
     spin_unlock_irqrestore(&b->lock, flags);
+
+    /* A wake that finds nobody is the signature of a lost wake-up: the waiter
+     * queued under a key this caller did not compute, or queued after the
+     * value changed. Counted rather than printed — a busy process wakes
+     * thousands of times a second — and reported beside the parked waiters in
+     * the watchdog dump, where the two numbers can be compared. */
+    if (woken == 0)
+      g_futex_wake_missed++;
+    else
+      g_futex_wake_hit++;
     return woken;
   }
 
@@ -219,7 +252,11 @@ void scheduler_futex_wake_addr(u64 uaddr, int val) {
  * task still blocked" (a wake that was lost), and the two need different
  * fixes — this tells them apart without a rebuild. */
 void futex_dump_waiters(void) {
-  console_write("futex waiters:\n");
+  console_write("futex wakes: hit ");
+  console_write_dec(g_futex_wake_hit);
+  console_write(" missed ");
+  console_write_dec(g_futex_wake_missed);
+  console_write("\nfutex waiters:\n");
   for (unsigned h = 0; h < FUTEX_BUCKETS; h++) {
     struct futex_bucket *b = &g_futex[h];
     u64 flags;

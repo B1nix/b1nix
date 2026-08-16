@@ -137,9 +137,20 @@ struct file *file_clone_open(struct file *f)
 {
 	if (!f)
 		return 0;
-	/* A genuinely separate file, with its own driver state. The lease path
-	 * rewrites the clone's master, so sharing one object would have rewritten
-	 * the original's — see lkpi_drm_clone_file. */
+	/*
+	 * Only a DRM file can be cloned by re-opening the device: the clone needs
+	 * its own driver state because the lease path rewrites the clone's master,
+	 * and sharing one object would rewrite the original's (see
+	 * lkpi_drm_clone_file). Every other file reaching here — an anon-inode file
+	 * such as a dma-buf, above all — carries a private_data belonging to some
+	 * other subsystem, and reading it as a struct drm_file is how a PRIME export
+	 * turned into a #GP on a pointer made of ASCII. Those are handed back with
+	 * an added reference, which is what their callers mean by cloning.
+	 */
+	if (!lkpi_drm_file_is_drm(f)) {
+		atomic64_inc(&f->f_count);
+		return f;
+	}
 	struct file *clone = (struct file *)lkpi_drm_clone_file(f);
 
 	if (!clone)

@@ -243,6 +243,11 @@ struct b1nix_statfs {
 
 #define B1NIX_MSG_PEEK 0x02
 #define B1NIX_MSG_DONTWAIT 0x40
+/* recvmsg: set FD_CLOEXEC on descriptors arriving as SCM_RIGHTS. A process that
+ * receives a descriptor and then execs a helper is the normal case in an IPC
+ * system (a browser's broker does it for every renderer it starts), and without
+ * this the descriptor leaks into that helper. */
+#define B1NIX_MSG_CMSG_CLOEXEC 0x40000000
 
 struct b1nix_pollfd {
   int fd;

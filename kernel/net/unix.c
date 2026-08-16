@@ -7,9 +7,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define UNIX_RB_SIZE 4096
-#define UNIX_CONTROL_SLOTS 16
-#define UNIX_MSG_SLOTS 32
+/* Linux gives an AF_UNIX socket about 200 KiB of buffer. Four kilobytes here
+ * meant chromium's sandbox IPC — SOCK_SEQPACKET, whose messages must fit whole
+ * — got EMSGSIZE on anything larger, and its Mojo channels lived in permanent
+ * partial-write and EAGAIN cycles. */
+#define UNIX_RB_SIZE (64 * 1024)
+/* In-flight messages carrying descriptors. A slot frees only once the reader
+ * reaches it, and chromium sends them in bursts, so sixteen ran out and the
+ * sender saw ENOBUFS — an error Linux never returns here, and one that Mojo
+ * treats as a dead channel rather than a retry. */
+#define UNIX_CONTROL_SLOTS 32
+#define UNIX_MSG_SLOTS 64
 
 struct unix_control {
   int used;
@@ -336,9 +344,18 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
   struct unix_socket_data *peer_u = (struct unix_socket_data *)peer_s->unix_data;
   if (!peer_u) { vfs_node_put(peer_node); return -ECONNREFUSED; }
+  /* Hold the listener's endpoint for as long as this connect uses it.
+   *
+   * Finding it and using it are not one step: the checks below, the allocation
+   * of the far endpoint, and the copy of the listener's credentials all happen
+   * afterwards, and nothing kept it alive across them. A server closing its
+   * socket in that window — swaymsg connects in a loop while sway comes and
+   * goes — freed the structure under a connector that had already tested it
+   * for NULL, and the credential copy read freed memory. */
+  unix_data_get(peer_u);
 
   if (s->type == B1NIX_SOCK_STREAM) {
-    if (!peer_s->listening) { vfs_node_put(peer_node); return -ECONNREFUSED; }
+    if (!peer_s->listening) { vfs_node_put(peer_node); unix_data_put(peer_u); return -ECONNREFUSED; }
 
     /*
      * The far endpoint is built here, by the connector, and the pair is linked
@@ -357,9 +374,9 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
      * half-queued connection.
      */
     struct unix_socket_data *srv = kzalloc(sizeof(struct unix_socket_data));
-    if (!srv) { vfs_node_put(peer_node); return -ENOMEM; }
+    if (!srv) { vfs_node_put(peer_node); unix_data_put(peer_u); return -ENOMEM; }
     srv->rb_buffer = kmalloc(UNIX_RB_SIZE);
-    if (!srv->rb_buffer) { kfree(srv); vfs_node_put(peer_node); return -ENOMEM; }
+    if (!srv->rb_buffer) { kfree(srv); vfs_node_put(peer_node); unix_data_put(peer_u); return -ENOMEM; }
     /* SO_PEERCRED on the accepted socket must report the server's identity, so
      * the endpoint inherits it from the listening socket rather than from the
      * process that happens to be connecting. */
@@ -399,7 +416,7 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
       kfree(srv->rb_buffer);
       kfree(srv);
       vfs_node_put(peer_node);
-      return -ECONNREFUSED;
+      unix_data_put(peer_u); return -ECONNREFUSED;
     }
     peer_u->backlog[peer_u->backlog_count++] = srv;
     unix_unlock(peer_u);
@@ -420,6 +437,7 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
   }
 
   vfs_node_put(peer_node);
+  unix_data_put(peer_u); /* the reference taken at lookup */
   return 0;
 }
 

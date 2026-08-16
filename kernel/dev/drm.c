@@ -659,18 +659,20 @@ static void drm_sysfs_text_free(void *ctx) { kfree(ctx); }
  *   /sys/class/drm/card<n>   -> the minor
  *   /sys/dev/char/226:<n>    -> the minor
  */
+static struct sysfs_dir *drm_sysfs_pci_device(void);
+
 void drm_sysfs_publish_card(unsigned num) {
 	char card[16], node[24], minordir[64], *uevent, *devtext;
 
 	snprintf(card, sizeof(card), "card%u", num);
 	snprintf(node, sizeof(node), "226:%u", num);
 
-	struct sysfs_dir *devices = sysfs_reg_dir(0, "devices");
-	char devname[16];
-	snprintf(devname, sizeof(devname), "gpu%u", num);
-	struct sysfs_dir *dev = sysfs_reg_dir(devices, devname);
-	struct sysfs_dir *drm = sysfs_reg_dir(dev, "drm");
-	struct sysfs_dir *minor = sysfs_reg_dir(drm, card);
+	/* Under the PCI device, for the same reason the render node is: libdrm
+	 * reads a minor's identity from its parent, and a parent with no PCI
+	 * attributes leaves the device undescribable and therefore invisible. */
+	struct sysfs_dir *dev = drm_sysfs_pci_device();
+	struct sysfs_dir *drm = dev ? sysfs_reg_dir(dev, "drm") : 0;
+	struct sysfs_dir *minor = drm ? sysfs_reg_dir(drm, card) : 0;
 
 	if (!minor)
 		return;
@@ -703,11 +705,11 @@ void drm_sysfs_publish_card(unsigned num) {
 	 * "/sys/devices/..." glued to the end — and the device is silently dropped,
 	 * which is how a card that was plainly in /sys came back as "Found 0 GPUs".
 	 */
-	(void)sysfs_reg_link(minor, "subsystem", "../../../../class/drm");
+	(void)sysfs_reg_link(minor, "subsystem", "../../../../../../class/drm");
 	(void)sysfs_reg_link(minor, "device", "../..");
 
-	snprintf(minordir, sizeof(minordir), "../../devices/gpu%u/drm/card%u", num,
-	         num);
+	snprintf(minordir, sizeof(minordir),
+	         "../../devices/pci0000:00/0000:00:02.0/drm/card%u", num);
 
 	struct sysfs_dir *cls = sysfs_reg_dir(sysfs_reg_dir(0, "class"), "drm");
 	if (cls)
@@ -715,6 +717,132 @@ void drm_sysfs_publish_card(unsigned num) {
 
 	struct sysfs_dir *chr =
 		sysfs_reg_dir(sysfs_reg_dir(0, "dev"), "char");
+	if (chr)
+		(void)sysfs_reg_link(chr, node, minordir);
+}
+
+/*
+ * The PCI device the DRM minors belong to.
+ *
+ * libdrm does not enumerate devices by walking /dev: drmGetDevices2 starts from
+ * the minor's sysfs entry, follows its "device" link, and reads the PCI
+ * identity there — vendor, device, revision, and the slot name in uevent. A
+ * minor whose parent has none of that is not a device it can describe, so it is
+ * dropped, and a caller that asked for the list gets nothing. That is why
+ * Chromium reported no render node while answering its version query correctly:
+ * it never enumerated ours at all.
+ *
+ * The values are the passed-through GPU's own (Intel 8086:3e98, slot
+ * 0000:00:02.0) — the same ones the guest's PCI config space reports.
+ */
+static struct sysfs_dir *drm_sysfs_pci_device(void)
+{
+	static struct sysfs_dir *cached;
+
+	if (cached)
+		return cached;
+
+	struct sysfs_dir *devices = sysfs_reg_dir(0, "devices");
+	struct sysfs_dir *root = sysfs_reg_dir(devices, "pci0000:00");
+	struct sysfs_dir *dev = sysfs_reg_dir(root, "0000:00:02.0");
+
+	if (!dev)
+		return 0;
+
+	static const struct { const char *name; const char *value; } attrs[] = {
+		{ "vendor",            "0x8086\n" },
+		{ "device",            "0x3e98\n" },
+		{ "subsystem_vendor",  "0x8086\n" },
+		{ "subsystem_device",  "0x2212\n" },
+		{ "revision",          "0x00\n" },
+		{ "class",             "0x030000\n" },
+		{ "uevent",
+		  "DRIVER=i915\nPCI_CLASS=30000\nPCI_ID=8086:3E98\n"
+		  "PCI_SUBSYS_ID=8086:2212\nPCI_SLOT_NAME=0000:00:02.0\n" },
+	};
+
+	for (unsigned i = 0; i < sizeof(attrs) / sizeof(attrs[0]); i++) {
+		usize len = strlen(attrs[i].value) + 1;
+		char *text = kmalloc(len);
+
+		if (!text)
+			continue;
+		memcpy(text, attrs[i].value, len);
+		if (sysfs_reg_attr(dev, attrs[i].name, 0444, drm_sysfs_text_show, 0,
+		                   text, drm_sysfs_text_free) != 0)
+			kfree(text);
+	}
+
+	(void)sysfs_reg_link(dev, "subsystem", "../../../bus/pci");
+
+	struct sysfs_dir *bus = sysfs_reg_dir(sysfs_reg_dir(0, "bus"), "pci");
+	struct sysfs_dir *busdev = sysfs_reg_dir(bus, "devices");
+
+	if (busdev)
+		(void)sysfs_reg_link(busdev, "0000:00:02.0",
+		                     "../../../devices/pci0000:00/0000:00:02.0");
+
+	cached = dev;
+	return cached;
+}
+
+/*
+ * The same publication for a render node.
+ *
+ * A device node in /dev is only half of what a graphics stack looks for: Mesa
+ * and Chromium enumerate through sysfs (libudev, or by hand through
+ * /sys/dev/char) and take the node's path from the uevent found there. A
+ * renderD128 that exists in /dev but nowhere in /sys is therefore invisible to
+ * them — which is what "Failed to initialize drm render node handle" meant even
+ * after the device node itself was created.
+ *
+ * It hangs off the same gpu directory as its card: they are two minors of one
+ * device, and that is what the "device" link says.
+ */
+void drm_sysfs_publish_render(unsigned gpu_num, unsigned minor_num) {
+	char name[16], node[24], minordir[72], *uevent, *devtext;
+
+	snprintf(name, sizeof(name), "renderD%u", minor_num);
+	snprintf(node, sizeof(node), "226:%u", minor_num);
+
+	(void)gpu_num;
+	struct sysfs_dir *dev = drm_sysfs_pci_device();
+	struct sysfs_dir *drm = dev ? sysfs_reg_dir(dev, "drm") : 0;
+	struct sysfs_dir *minor = drm ? sysfs_reg_dir(drm, name) : 0;
+
+	if (!minor)
+		return;
+
+	uevent = kmalloc(96);
+	if (uevent) {
+		snprintf(uevent, 96,
+		         "MAJOR=226\nMINOR=%u\nDEVNAME=dri/renderD%u\nDEVTYPE=drm_minor\n",
+		         minor_num, minor_num);
+		if (sysfs_reg_attr(minor, "uevent", 0444, drm_sysfs_text_show, 0, uevent,
+		                   drm_sysfs_text_free) != 0)
+			kfree(uevent);
+	}
+	devtext = kmalloc(16);
+	if (devtext) {
+		snprintf(devtext, 16, "226:%u\n", minor_num);
+		if (sysfs_reg_attr(minor, "dev", 0444, drm_sysfs_text_show, 0, devtext,
+		                   drm_sysfs_text_free) != 0)
+			kfree(devtext);
+	}
+
+	/* Up to the PCI device, which is what drmGetDevices2 reads the identity
+	 * from; and out to the class, which is how it finds minors at all. */
+	(void)sysfs_reg_link(minor, "subsystem", "../../../../../../class/drm");
+	(void)sysfs_reg_link(minor, "device", "../..");
+
+	snprintf(minordir, sizeof(minordir),
+	         "../../devices/pci0000:00/0000:00:02.0/drm/renderD%u", minor_num);
+
+	struct sysfs_dir *cls = sysfs_reg_dir(sysfs_reg_dir(0, "class"), "drm");
+	if (cls)
+		(void)sysfs_reg_link(cls, name, minordir);
+
+	struct sysfs_dir *chr = sysfs_reg_dir(sysfs_reg_dir(0, "dev"), "char");
 	if (chr)
 		(void)sysfs_reg_link(chr, node, minordir);
 }

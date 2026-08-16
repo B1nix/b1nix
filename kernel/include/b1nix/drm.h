@@ -118,6 +118,8 @@ int drm_card1_present(void);
 /* Publish /sys/dev/char/226:<num> and /sys/class/drm/card<num>, which is how
  * libdrm decides a descriptor is a DRM primary node. */
 void drm_sysfs_publish_card(unsigned num);
+/* Same, for a render minor (renderD<minor>) belonging to gpu<gpu_num>. */
+void drm_sysfs_publish_render(unsigned gpu_num, unsigned minor_num);
 struct vfs_node *drm_card_node_for_minor(u32 minor);
 struct vfs_handle;
 void drm_card_attach_handle(struct vfs_handle *h, u32 minor);

@@ -418,7 +418,12 @@ struct b1nix_ucred {
   u32 uid;
   u32 gid;
 };
-#define VFS_SCM_MAX_FDS 8
+/* Descriptors carried by one control message. Eight was below what real
+ * senders use: chromium's sandbox IPC passes up to sixteen, and Mojo attaches
+ * many more to a single message — each of those became EINVAL, and the
+ * descriptors being passed are the shared-memory regions the GPU process needs
+ * before anything can be drawn. */
+#define VFS_SCM_MAX_FDS 32
 isize vfs_socket_sendmsg(int fd, const void *buf, usize len, int flags,
                          struct vfs_handle **handles, usize nhandles,
                          const struct b1nix_ucred *cred);

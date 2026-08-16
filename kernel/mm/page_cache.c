@@ -58,6 +58,34 @@ static void m26_diag_task(void) {
   }
 }
 
+/* Per-bucket locks, in front of the one cache-wide lock.
+ *
+ * Everything used to serialise on pc_lock, including the lookup — the hottest
+ * path in the kernel, taken by every mapped page of every executable, by every
+ * read(), and by the fault handler's read-ahead. Two CPUs faulting on
+ * unrelated files queued behind each other for no reason: their entries live
+ * in different hash chains and share nothing.
+ *
+ * The rule that keeps this deadlock-free is one-directional: a reader takes
+ * only its bucket, never pc_lock. A mutator takes pc_lock first and the bucket
+ * second, and holds the bucket only across the chain edit itself — never
+ * across writeback, which drops pc_lock and blocks on I/O.
+ */
+static volatile int pc_bucket[PC_HASH_SIZE];
+
+static void lock_bucket(u32 h) {
+  extern void tlb_shootdown_poll(void);
+
+  while (__sync_lock_test_and_set(&pc_bucket[h], 1)) {
+    while (pc_bucket[h]) {
+      __asm__ volatile("pause");
+      tlb_shootdown_poll();
+    }
+  }
+}
+
+static void unlock_bucket(u32 h) { __sync_lock_release(&pc_bucket[h]); }
+
 static void lock_pc(void) {
   extern void tlb_shootdown_poll(void);
   while (__sync_lock_test_and_set(&pc_lock, 1)) {
@@ -205,7 +233,16 @@ static void pc_readahead(struct vfs_inode *inode, u64 offset) {
   struct vfs_node dummy;
   memset(&dummy, 0, sizeof(dummy));
   dummy.inode = inode;
-  for (u64 po = offset + 1; po <= offset + RA_PREFETCH; po++) {
+  /* offset is a byte offset; the burst walks PAGE NUMBERS.
+   *
+   * Multiplying the byte offset by PAGE_SIZE again aimed every prefetch at a
+   * position PAGE_SIZE times too far into the file: reading page 1 of a binary
+   * fetched somewhere past 16 MB. Each page came back under its own correct
+   * key, so nothing was corrupted — it simply never prefetched the pages the
+   * reader was about to want, and spent a disk command per page to fill the
+   * cache with parts of the file nobody asked for. */
+  u64 base = offset / PAGE_SIZE;
+  for (u64 po = base + 1; po <= base + RA_PREFETCH; po++) {
     u64 poff = po * PAGE_SIZE;
     if (poff >= inode->size)
       break; /* don't read past EOF */
@@ -235,7 +272,10 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
   }
   u32 h = pc_hash(inode, offset);
 
-  lock_pc();
+  /* The lookup needs its chain, nothing else: the hit path no longer touches
+   * the LRU lists (it sets PAGE_CACHE_REFERENCED instead), so the cache-wide
+   * lock is not involved at all. */
+  lock_bucket(h);
   struct page_cache_entry *curr = hash_table[h];
   while (curr) {
     /* Identity by (fs_id, ino), not the inode pointer — the inode slab pool
@@ -246,47 +286,51 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
      * key_ino field exists to prevent — see page_cache_invalidate_inode). */
     if (pc_key_eq(curr, inode, offset)) {
       curr->refcount++;
-      /* A second reference (a re-fault, or another process sharing this file
-       * page) promotes the page to the active working set; a page already
-       * active just moves to the MRU end. This is what keeps clang's text —
-       * touched by every TU — out of the eviction path while one-shot reads age
-       * off the inactive list. */
-      lru_remove(curr);
-      active_append(curr);
+      /* Mark it touched and leave the lists alone.
+       *
+       * Promoting on every hit meant unlinking and re-linking the entry — four
+       * pointer writes under the cache's one lock, on the path every mapped
+       * page of every executable takes. The bit says the same thing to
+       * eviction, which is the only code that needs to know, and it costs one
+       * store. Entries still reach the active list: eviction promotes the ones
+       * it finds referenced instead of taking them. */
+      curr->flags |= PAGE_CACHE_REFERENCED;
       /* Hit: a sequential reader landing on an already-prefetched page advances
        * the cursor (so the next burst fires at the right place) without
        * scheduling — the earlier burst already filled this window. */
       if (!ra_in_prefetch && inode->read_cb && inode->type == VFS_FILE) {
         struct ra_stream *r = &ra_streams[ra_hash(inode)];
         if (r->ino == inode->ino && r->fsid == inode->fs_id &&
-            offset == r->next)
-          r->next = offset + 1;
+            offset / PAGE_SIZE == r->next)
+          r->next = offset / PAGE_SIZE + 1;
       }
-      unlock_pc();
+      unlock_bucket(h);
       return curr;
     }
     curr = curr->hash_next;
   }
 
-  /* Miss: sequential-stream bookkeeping under the lock; the actual prefetch
-   * (blocking I/O) runs after it is released. */
+  /* Miss: sequential-stream bookkeeping under the bucket lock; the actual
+   * prefetch (blocking I/O) runs after it is released. The read-ahead cursors
+   * are a heuristic — a rare race between two buckets costs one mispredicted
+   * burst, never correctness. */
   int do_ra = 0;
   if (!ra_in_prefetch && inode->read_cb && inode->type == VFS_FILE) {
     struct ra_stream *r = &ra_streams[ra_hash(inode)];
     if (r->ino == inode->ino && r->fsid == inode->fs_id &&
-        offset == r->next) {
-      r->next = offset + 1;
+        offset / PAGE_SIZE == r->next) {
+      r->next = offset / PAGE_SIZE + 1;
       if (++r->seq >= RA_WARMUP)
         do_ra = 1;
     } else {
       /* New stream or a jump — restart the cursor, no burst yet (warm-up). */
       r->ino = inode->ino;
       r->fsid = inode->fs_id;
-      r->next = offset + 1;
+      r->next = offset / PAGE_SIZE + 1;
       r->seq = 0;
     }
   }
-  unlock_pc();
+  unlock_bucket(h);
 
   if (do_ra)
     pc_readahead(inode, offset);
@@ -347,13 +391,17 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   new_entry->flags = PAGE_CACHE_UPTODATE;
   new_entry->refcount = 0; // Starts at 0, incremented by get_page if needed
   
+  /* Mutator order: the cache-wide lock first (the LRU lists below need it),
+   * the bucket second, and the bucket only across the chain edit. */
   lock_pc();
+  lock_bucket(h);
   // Check if it was added concurrently
   struct page_cache_entry *curr = hash_table[h];
   while (curr) {
     /* (fs_id, ino), not the inode pointer — see the matching comment in
      * page_cache_get_page. */
     if (pc_key_eq(curr, inode, offset)) {
+      unlock_bucket(h);
       unlock_pc();
       kfree(new_entry);
       return -EEXIST;
@@ -364,6 +412,7 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   pmm_ref_frame(new_entry->frame);
   new_entry->hash_next = hash_table[h];
   hash_table[h] = new_entry;
+  unlock_bucket(h);
 
   /* Refault: this page was evicted recently and is already back — the working
    * set is bigger than the inactive list, so seed it straight onto the active
@@ -456,6 +505,7 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
       struct page_cache_entry *next = curr->lru_next;
       if (curr->inode == inode) {
         u32 h = pc_hash(curr->inode, curr->offset);
+        lock_bucket(h);
         struct page_cache_entry **prev = &hash_table[h];
         struct page_cache_entry *hcurr = *prev;
         while (hcurr) {
@@ -466,7 +516,7 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
           prev = &hcurr->hash_next;
           hcurr = hcurr->hash_next;
         }
-
+        unlock_bucket(h);
         lru_remove(curr);
         curr->inode = 0;
         if (curr->refcount == 0) {
@@ -517,6 +567,7 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
          * reader still holds a reference, neutralize in place instead. */
         if (curr->refcount == 0) {
           u32 h = pc_hash(curr->inode, curr->offset);
+          lock_bucket(h);
           struct page_cache_entry **prev = &hash_table[h];
           struct page_cache_entry *hcurr = *prev;
           while (hcurr) {
@@ -527,6 +578,7 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
             prev = &hcurr->hash_next;
             hcurr = hcurr->hash_next;
           }
+          unlock_bucket(h);
           lru_remove(curr);
           pmm_free_frame(curr->frame);
           curr->inode = 0;
@@ -599,6 +651,7 @@ usize page_cache_evict_clean(usize target_pages) {
       continue;
     }
     u32 h = pc_hash(victim->inode, victim->offset);
+    lock_bucket(h);
     struct page_cache_entry **prev = &hash_table[h];
     struct page_cache_entry *hcurr = *prev;
     while (hcurr) {
@@ -609,6 +662,7 @@ usize page_cache_evict_clean(usize target_pages) {
       prev = &hcurr->hash_next;
       hcurr = hcurr->hash_next;
     }
+    unlock_bucket(h);
     lru_remove(victim);
     pc_refault_record(victim->key_ino, victim->offset);
     pmm_free_frame(victim->frame);
@@ -646,18 +700,33 @@ usize page_cache_evict(usize target_pages) {
     struct page_cache_entry *victim = 0;
     struct page_cache_entry *flush = 0;
     dirty_skipped = 0;
-    for (struct page_cache_entry *curr = lru_head; curr; curr = curr->lru_next) {
-      if (curr->refcount != 0)
+    for (struct page_cache_entry *curr = lru_head; curr;) {
+      struct page_cache_entry *next = curr->lru_next;
+
+      if (curr->refcount != 0) {
+        curr = next;
         continue;
+      }
+      /* Touched since the last sweep: clear the bit and promote it instead of
+       * taking it. This is where a hit's single store becomes the working-set
+       * decision that the hit path used to make by relinking the entry. */
+      if (curr->flags & PAGE_CACHE_REFERENCED) {
+        curr->flags &= ~PAGE_CACHE_REFERENCED;
+        lru_remove(curr);
+        active_append(curr);
+        curr = next;
+        continue;
+      }
       if (curr->flags & PAGE_CACHE_DIRTY) {
         if (curr->inode && curr->inode->write_cb) {
           flush = curr; /* oldest flushable dirty page */
           break;
         }
         dirty_skipped++; /* no write_cb — cannot reclaim, leave it in place */
+        curr = next;
         continue;
       }
-      victim = curr; /* oldest clean, unreferenced page */
+      victim = curr; /* oldest clean, untouched page */
       break;
     }
 
@@ -678,6 +747,7 @@ usize page_cache_evict(usize target_pages) {
     /* Evict the clean victim: unlink from the hash chain + LRU, free its frame,
      * and defer the entry's kfree. */
     u32 h = pc_hash(victim->inode, victim->offset);
+    lock_bucket(h);
     struct page_cache_entry **prev = &hash_table[h];
     struct page_cache_entry *hcurr = *prev;
     while (hcurr) {
@@ -688,6 +758,7 @@ usize page_cache_evict(usize target_pages) {
       prev = &hcurr->hash_next;
       hcurr = hcurr->hash_next;
     }
+    unlock_bucket(h);
     lru_remove(victim);
     pc_refault_record(victim->key_ino, victim->offset);
     pmm_free_frame(victim->frame);

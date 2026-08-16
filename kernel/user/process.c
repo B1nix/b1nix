@@ -1480,6 +1480,7 @@ void user_address_space_cleanup(struct task *t) {
         vma->node->inode->mmap_close_cb(vma->node);
       vfs_node_put(vma->node);
     }
+    vma_cache_forget(t);
     kfree(vma);
     vma = next;
   }
@@ -1600,8 +1601,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
         fvma->flags = MAP_PRIVATE;
         fvma->node = vfs_node_get(image->exe_node);
         fvma->offset = (isize)seg_file_base;
-        fvma->next = current_task->vma_list;
-        current_task->vma_list = fvma;
+        vma_insert(current_task, fvma);
       }
       kfree(segment->data);
       segment->data = 0;
@@ -1656,8 +1656,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       vma->end = vaddr_end;
       vma->prot = PROT_READ | PROT_WRITE | PROT_EXEC; // Simplify for now
       vma->flags = MAP_PRIVATE;
-      vma->next = current_task->vma_list;
-      current_task->vma_list = vma;
+      vma_insert(current_task, vma);
     }
 
     /* The segment is now resident in the user address space. Its staging
@@ -1693,8 +1692,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       vma->end = current_task->heap_start;
       vma->prot = PROT_READ | PROT_WRITE;
       vma->flags = MAP_PRIVATE | MAP_ANONYMOUS;
-      vma->next = current_task->vma_list;
-      current_task->vma_list = vma;
+      vma_insert(current_task, vma);
     }
   }
 
@@ -1735,8 +1733,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     stack_vma->end = image->address_space.stack_top;
     stack_vma->prot = PROT_READ | PROT_WRITE;
     stack_vma->flags = MAP_PRIVATE | MAP_ANONYMOUS;
-    stack_vma->next = current_task->vma_list;
-    current_task->vma_list = stack_vma;
+    vma_insert(current_task, stack_vma);
   }
 
   /* Lowest high-VA region reserved so far (bottom of the stack growth window);
@@ -1804,8 +1801,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       tls_vma->end = region + block_size;
       tls_vma->prot = PROT_READ | PROT_WRITE;
       tls_vma->flags = MAP_PRIVATE | MAP_ANONYMOUS;
-      tls_vma->next = current_task->vma_list;
-      current_task->vma_list = tls_vma;
+      vma_insert(current_task, tls_vma);
     }
 
     task_set_tls_base(current_task, tp);
@@ -1841,8 +1837,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       tls_vma->end = region + tcb_size;
       tls_vma->prot = PROT_READ | PROT_WRITE;
       tls_vma->flags = MAP_PRIVATE | MAP_ANONYMOUS;
-      tls_vma->next = current_task->vma_list;
-      current_task->vma_list = tls_vma;
+      vma_insert(current_task, tls_vma);
     }
 
     task_set_tls_base(current_task, tp);
@@ -1891,8 +1886,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
         tvma->end = tva + PAGE_SIZE;
         tvma->prot = PROT_READ | PROT_EXEC;
         tvma->flags = MAP_PRIVATE | MAP_ANONYMOUS;
-        tvma->next = current_task->vma_list;
-        current_task->vma_list = tvma;
+        vma_insert(current_task, tvma);
       }
       image->sigreturn_trampoline = tva;
     }
@@ -1960,8 +1954,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
         sv->end = stack_top;
         sv->prot = PROT_READ | PROT_WRITE;
         sv->flags = MAP_PRIVATE | MAP_ANONYMOUS;
-        sv->next = current_task->vma_list;
-        current_task->vma_list = sv;
+        vma_insert(current_task, sv);
       }
     }
   }

@@ -272,6 +272,18 @@ if [ ! -f "$CACHE_IMG" ]; then
 fi
 DEV_ARGS="$DEV_ARGS -drive file=$CACHE_IMG,format=raw,if=virtio"
 
+# The root filesystem as a disk, when asked for it.
+#
+# An ISO that carries root.ext4 as a boot module makes the loader read the whole
+# image — 1.5 GB for the browser build — off the emulated drive and copy it into
+# memory before the kernel starts. The kernel prefers a disk labelled
+# b1nix-root over the module, so the same file attached here is read on demand
+# instead, and start-up stops paying for the parts no one touches.
+if [ -n "${ROOT_IMG:-}" ]; then
+	[ -f "$ROOT_IMG" ] || { echo "no such root image: $ROOT_IMG" >&2; exit 1; }
+	DEV_ARGS="$DEV_ARGS -drive file=$ROOT_IMG,format=raw,if=virtio"
+fi
+
 
 echo "b1nix + $IGD_BDF via VFIO ($MACHINE), ${MEM_MB}M, log: $LOG"
 
@@ -319,6 +331,14 @@ while kill -0 "$qemu_pid" 2>/dev/null && [ "$waited" -lt "$TIMEOUT" ]; do
 	# gained by holding the machine to the timeout after that — see the
 	# shutdown below for why it matters that this exit is a clean one.
 	if grep -aq "I915-SWAY: done" "$LOG" 2>/dev/null; then
+		finished=1
+		break
+	fi
+	# A named failure ends the run immediately. Waiting out the timeout after
+	# the guest has already said what went wrong costs the whole budget and
+	# adds nothing to the log.
+	if grep -aq "I915-SWAY: FAIL" "$LOG" 2>/dev/null; then
+		echo "guest reported: $(grep -a 'I915-SWAY: FAIL' "$LOG" | tail -1)"
 		finished=1
 		break
 	fi

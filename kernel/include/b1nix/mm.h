@@ -151,6 +151,11 @@ u64 pmm_zero_page(void);
 void pmm_ref_frame(u64 frame);
 void pmm_unref_frame(u64 frame);
 void pmm_free_frame(u64 frame);
+/* Page-table frame ownership (see kernel/mm/pmm.c). The paging code claims a
+ * frame while it is live as a page table; the allocator refuses to hand a
+ * claimed frame to anyone else. */
+void pmm_note_page_table(u64 frame, int owned);
+int pmm_frame_is_page_table(u64 frame);
 u16 pmm_get_refcount(u64 frame);
 u64 pmm_total_usable_memory(void);
 u64 pmm_phys_total_memory(void);
@@ -171,6 +176,10 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags);
 void *vmm_map_mmio(u64 physical_address, usize size, u64 flags);
 void vmm_unmap_page(u64 virtual_address);
 void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address);
+/* Move a range's leaf page-table entries to another address in the current
+ * address space, leaving the pages themselves where they are. The destination
+ * must already be mapped (lazily is enough) so no table has to be allocated. */
+void paging_move_range(u64 old_start, u64 new_start, u64 len);
 void vmm_remap_page(u64 virtual_address, u64 physical_address, u64 flags);
 u64 vmm_direct_map_base(void);
 u64 vmm_virt_to_phys(void *ptr);

@@ -109,6 +109,18 @@ static u64 *table_from_entry(u64 entry) {
   if (direct_map_ready && phys < DIRECT_MAP_SIZE) {
     return (u64 *)(usize)(phys + DIRECT_MAP_BASE);
   }
+  if (direct_map_ready) {
+    /* Once the direct map exists, every real table is inside it. An entry
+     * pointing outside is corruption, and the raw physical address returned
+     * below is usually non-canonical — so the caller's very next load is a #GP
+     * with no indication of where it came from. Say what the entry was
+     * instead; the walk cannot continue either way. */
+    console_write("paging: page-table entry out of range: 0x");
+    console_write_hex64(entry);
+    console_write("\n");
+    panic("paging: corrupted page-table entry");
+  }
+  /* Before the direct map, tables live in the low identity window. */
   return (u64 *)(usize)phys;
 }
 
@@ -139,8 +151,28 @@ static u64 *alloc_page_table(void) {
     table = (u64 *)(usize)(frame + DIRECT_MAP_BASE);
   }
 
+  /* Claim the frame as a page table for as long as it is one, so the pmm can
+   * refuse to hand it to a second owner (see pmm_note_page_table). */
+  pmm_note_page_table(frame, 1);
+
   memset(table, 0, PAGE_SIZE);
   return table;
+}
+
+/* Turn a 2 MiB entry into a page table the caller already allocated. Splitting
+ * inside a lock cannot allocate: alloc_page_table can reclaim, and reclaim
+ * writes dirty pages back, which blocks with interrupts off — the CPU then
+ * never answers a TLB shootdown and the initiator panics on the timeout. The
+ * fault path allocates first and commits here. */
+static void split_huge_page_into(u64 *pd, usize index, u64 *pt) {
+  u64 entry = pd[index];
+  u64 base = entry & PAGE_ENTRY_ADDRESS_MASK;
+  u64 flags = (entry & ~PAGE_ENTRY_ADDRESS_MASK) & ~HUGE_PAGE_FLAG;
+  u64 leaf_flags = flags & ~VMM_USER; /* see split_huge_page */
+
+  for (usize i = 0; i < 512; i++)
+    pt[i] = (base + i * PAGE_SIZE) | leaf_flags;
+  pd[index] = table_to_phys(pt) | flags;
 }
 
 static u64 *split_huge_page(u64 *pd, usize index) {
@@ -166,7 +198,49 @@ static u64 *split_huge_page(u64 *pd, usize index) {
   return pt;
 }
 
+/* A child table we can actually dereference, or NULL.
+ *
+ * table_from_entry() hands back the raw physical address when the entry points
+ * outside the direct map, and dereferencing that from the higher half is a #GP
+ * — not a page fault — so one corrupted entry crashes inside whichever
+ * subsystem happened to walk it. (It did: a kernel PD holding file data made
+ * vmm_virt_to_phys #GP inside the virtio-blk submit path, which reads as a
+ * block-layer bug and is not one.) Read-only walkers use this and report a
+ * failed translation instead of taking the fault. */
+static u64 *reachable_table(u64 entry) {
+  u64 phys = entry & PAGE_ENTRY_ADDRESS_MASK;
+  if (direct_map_ready && phys >= DIRECT_MAP_SIZE) {
+    return 0;
+  }
+  return table_from_entry(entry);
+}
+
 static u64 *ensure_child_table(u64 *parent, usize index) {
+  /* Physical address zero is never a page table — it is the bottom of memory,
+   * where the BIOS data area and early kernel structures live. A parent that
+   * lands exactly on the start of the direct map means the caller followed an
+   * entry whose address bits were zero, and continuing reads those bytes as
+   * entries (the "AUX A/D" i915 strings a walk has reported more than once).
+   * Refuse it here, one level before the damage, and name the caller. */
+  if (direct_map_ready && (u64)parent == DIRECT_MAP_BASE) {
+    console_write("ensure_child_table: parent is physical 0 (parent=0x");
+    console_write_hex64((u64)(usize)parent);
+    console_write(" task pml4=0x");
+    console_write_hex64(current_task ? current_task->pml4_phys : 0);
+    console_write(" kernel pml4 virt=0x");
+    console_write_hex64((u64)(usize)kernel_pml4_virt);
+    console_write("), called from 0x");
+    console_write_hex64((u64)(usize)__builtin_return_address(0));
+    ksym_print((u64)(usize)__builtin_return_address(0));
+    if (current_task) {
+      console_write("\n  task ");
+      console_write_dec(current_task->id);
+      console_write(" ");
+      console_write(current_task->name);
+    }
+    console_write("\n");
+    panic("paging: walked into physical address 0 as a page table");
+  }
   if (!parent || (direct_map_ready && (u64)parent < DIRECT_MAP_BASE) || !is_canonical((u64)parent)) {
     console_write("ensure_child_table: INVALID parent: 0x");
     console_write_hex64((u64)parent);
@@ -189,11 +263,109 @@ static u64 *ensure_child_table(u64 *parent, usize index) {
   u64 *result;
   if ((parent[index] & VMM_PRESENT) == 0) {
     u64 *child = alloc_page_table();
-    parent[index] = table_to_phys(child) | VMM_PRESENT | VMM_WRITABLE;
-    result = child;
+    u64 want = table_to_phys(child) | VMM_PRESENT | VMM_WRITABLE;
+    /* A present entry addressing frame 0 is the bug we keep arriving at from
+     * the far end — a later walk follows it into the bottom of memory and reads
+     * BIOS bytes as page-table entries. alloc_page_table never returns frame 0,
+     * so if this is ever about to be published, say so here rather than three
+     * subsystems away. */
+    if ((want & PAGE_ENTRY_ADDRESS_MASK) == 0) {
+      console_write("ensure_child_table: about to publish a null table at index ");
+      console_write_dec(index);
+      console_write(" (child=0x");
+      console_write_hex64((u64)(usize)child);
+      console_write(") from 0x");
+      console_write_hex64((u64)(usize)__builtin_return_address(0));
+      ksym_print((u64)(usize)__builtin_return_address(0));
+      console_write("\n");
+      panic("paging: page-table entry would address frame 0");
+    }
+    /* Whatever is in the slot now — which is NOT necessarily zero. The branch
+     * we are in only established that PRESENT is clear, and a slot can hold a
+     * non-present value with meaning: VMM_LAZY marks a reserved page, and the
+     * USER bit is set on intermediate levels independently. Comparing against a
+     * hard-coded 0 made the exchange fail on exactly those slots, and the loser
+     * path then read that non-present value as a table pointer — address zero,
+     * i.e. the bottom of physical memory — while also handing its own frame
+     * back, which is where "page table freed while still mapped" and the double
+     * frees came from. */
+    u64 expected = __atomic_load_n(&parent[index], __ATOMIC_ACQUIRE);
+
+    /*
+     * Publish the new table only if the slot is still empty, and take the
+     * winner's table if it is not.
+     *
+     * A plain store loses races that a multithreaded process reaches easily:
+     * two threads calling mmap at once both find the entry absent, both
+     * allocate, and the second store overwrites the first — leaving one table
+     * unreachable while threads already walk through the other. Worse, the
+     * `|= VMM_USER` updates around the callers are read-modify-write, so a
+     * store that lands between another thread's read and write is simply
+     * discarded, and the surviving entry can name neither table. A later walk
+     * follows it into an unrelated physical page and reads those bytes as
+     * page-table entries — which is exactly what a walk reported when it found
+     * entries made of ASCII and a parent table at physical address 0.
+     *
+     * The compare-exchange keeps this correct without holding the VMM write
+     * lock across the allocation: taking that lock here re-introduced the
+     * huge-page split under the lock, which has its own history of shootdown
+     * timeouts.
+     */
+    if (__atomic_compare_exchange_n(&parent[index], &expected, want, 0,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+      result = child;
+    } else {
+      /* Someone else won. Their entry is the live one; give ours back — and
+       * drop its page-table claim first, or the allocator refuses a frame that
+       * still says it is a live table. */
+      u64 loser = table_to_phys(child);
+      pmm_note_page_table(loser, 0);
+      pmm_free_frame(loser);
+      /* The exchange failed because the slot changed under us. It is only a
+       * table if the value that beat us says PRESENT; a non-present value means
+       * another writer put something else there (a lazy marker, a flag bit), and
+       * the slot still needs a table — so start over rather than treat that
+       * value as a pointer. */
+      if (expected & VMM_PRESENT)
+        result = (expected & HUGE_PAGE_FLAG) ? split_huge_page(parent, index)
+                                             : table_from_entry(expected);
+      else
+        result = ensure_child_table(parent, index);
+    }
   } else if ((parent[index] & HUGE_PAGE_FLAG) != 0) {
     result = split_huge_page(parent, index);
   } else {
+    /*
+     * A present entry whose address is outside the direct map is not a table at
+     * all — the parent's page has been reused for something else and we are
+     * reading that other owner's bytes. Which owner, and when it took the page,
+     * is the whole question, and only the parent's own frame can answer it: name
+     * it and print its allocation history before the walk gives up.
+     */
+    extern void pmm_report_page_table_history_pub(u64 frame);
+    u64 child_phys = parent[index] & PAGE_ENTRY_ADDRESS_MASK;
+    if (direct_map_ready && child_phys >= DIRECT_MAP_SIZE) {
+      u64 parent_phys = (u64)(usize)parent - DIRECT_MAP_BASE;
+
+      console_write("ensure_child_table: called from 0x");
+      console_write_hex64((u64)(usize)__builtin_return_address(0));
+      ksym_print((u64)(usize)__builtin_return_address(0));
+      console_write("\n  parent table 0x");
+      console_write_hex64(parent_phys);
+      console_write(" index ");
+      console_write_dec(index);
+      console_write(" holds a non-table entry 0x");
+      console_write_hex64(parent[index]);
+      console_write("\n  history of the parent frame:\n");
+      pmm_report_page_table_history_pub(parent_phys);
+      if (current_task) {
+        console_write("  task: ");
+        console_write(current_task->name);
+        console_write(" id ");
+        console_write_dec(current_task->id);
+        console_write("\n");
+      }
+    }
     result = table_from_entry(parent[index]);
   }
 
@@ -215,21 +387,14 @@ void vmm_map_page_in_table(u64 *pml4, u64 virtual_address, u64 physical_address,
   u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
 
-  /* DIAG: first time we map into the low-4GB on a user address space, dump
-   * the PD entry to see if it's a 2MB identity-map huge page or already split. */
-  {
-    static int diag_done = 0;
-    if (!diag_done && virtual_address >= 0x2000000ULL && virtual_address < 0x2100000ULL) {
-      u64 pde_val = pd[pd_index(virtual_address)];
-      console_write("MAP_IN_TABLE va=0x"); console_write_hex64(virtual_address);
-      console_write(" pd["); console_write_dec((u32)pd_index(virtual_address));
-      console_write("]=0x"); console_write_hex64(pde_val);
-      console_write(pde_val & HUGE_PAGE_FLAG ? " HUGE" : " 4k");
-      console_write(" flags=0x"); console_write_hex64(flags);
-      console_write(" pml4="); console_write_hex64((u64)pml4);
-      console_write("\n");
-      diag_done = 1;
-    }
+  /* Every level above a user leaf has to permit user access, or the CPU
+   * refuses the access at the first supervisor entry it meets and reports a
+   * protection violation on a page that looks perfectly mapped. The
+   * current-space mapper does this; this one, which maps into another
+   * process's tables, did not. */
+  if ((flags & VMM_USER) != 0) {
+    __atomic_or_fetch(&pml4[pml4_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
+    __atomic_or_fetch(&pdpt[pdpt_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
   }
 
   u64 *pt;
@@ -238,6 +403,8 @@ void vmm_map_page_in_table(u64 *pml4, u64 virtual_address, u64 physical_address,
   } else {
     pt = ensure_child_table(pd, pd_index(virtual_address));
   }
+  if ((flags & VMM_USER) != 0)
+    __atomic_or_fetch(&pd[pd_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
 
   pt[pt_index(virtual_address)] =
       (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
@@ -310,8 +477,8 @@ static void vmm_map_page_locked(u64 virtual_address, u64 physical_address,
   u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
   if ((flags & VMM_USER) != 0) {
-    pml4[pml4_index(virtual_address)] |= VMM_USER;
-    pdpt[pdpt_index(virtual_address)] |= VMM_USER;
+    __atomic_or_fetch(&pml4[pml4_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
+    __atomic_or_fetch(&pdpt[pdpt_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
   }
 
   u64 *pt;
@@ -321,7 +488,7 @@ static void vmm_map_page_locked(u64 virtual_address, u64 physical_address,
     pt = ensure_child_table(pd, pd_index(virtual_address));
   }
   if ((flags & VMM_USER) != 0) {
-    pd[pd_index(virtual_address)] |= VMM_USER;
+    __atomic_or_fetch(&pd[pd_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
   }
   pt[pt_index(virtual_address)] =
       (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
@@ -460,19 +627,77 @@ void paging_mprotect_page(u64 virtual_address, u64 flags) {
   }
 
   u64 *pml4 = get_current_pml4();
+  /* The top-level frame must still be claimed as a page table. When it is not,
+   * this address space has already been released and its frames re-issued —
+   * the entries below are whatever the new owner wrote. Reading on yields a
+   * corrupt entry with nothing to attribute it to; stop while the task that
+   * owns the walk is still named. */
+  {
+    u64 pml4_phys = table_to_phys(pml4);
+
+    /* Zero means the kernel's own space (the convention the unmap helpers use),
+     * and the kernel PML4 is never claimed through the page-table allocator.
+     * Neither is a released space, and treating them as one turned this guard
+     * into a false panic on the first such call. */
+    if (pml4_phys && pml4_phys != kernel_pml4_phys &&
+        !pmm_frame_is_page_table(pml4_phys)) {
+      console_write("paging: mprotect on a released address space, pml4 0x");
+      console_write_hex64(pml4_phys);
+      console_write(" va 0x");
+      console_write_hex64(virtual_address);
+      console_write("\n");
+      panic("paging: address space used after free");
+    }
+  }
+  /* Every level is checked before it is followed. A present entry addressing
+   * something outside the direct map is not a table, and following it reads an
+   * unrelated page as one — the walk then panics on a value ("AUX A/D" and
+   * friends) that says nothing about who wrote it. Report the level, the table
+   * that held the entry, and that frame's history instead. */
+  extern void pmm_report_page_table_history_pub(u64 frame);
+#define MPROTECT_CHECK_ENTRY(entry, level, parent_ptr)                          \
+  do {                                                                          \
+    u64 _child = (entry) & PAGE_ENTRY_ADDRESS_MASK;                             \
+    if (direct_map_ready && _child >= DIRECT_MAP_SIZE) {                        \
+      u64 _pp = (u64)(usize)(parent_ptr) - DIRECT_MAP_BASE;                     \
+      console_write("paging_mprotect_page: level ");                            \
+      console_write_dec(level);                                                 \
+      console_write(" of table 0x");                                            \
+      console_write_hex64(_pp);                                                 \
+      console_write(" holds a non-table entry 0x");                             \
+      console_write_hex64(entry);                                               \
+      console_write(" for va 0x");                                              \
+      console_write_hex64(virtual_address);                                     \
+      console_write("\n  history of that table's frame:\n");                   \
+      pmm_report_page_table_history_pub(_pp);                                   \
+      if (current_task) {                                                       \
+        console_write("  task ");                                               \
+        console_write_dec(current_task->id);                                    \
+        console_write(" ");                                                     \
+        console_write(current_task->name);                                      \
+        console_write("\n");                                                    \
+      }                                                                         \
+      return;                                                                   \
+    }                                                                           \
+  } while (0)
+
   u64 pml4e = pml4[pml4_index(virtual_address)];
   if ((pml4e & VMM_PRESENT) == 0)
     return;
+  MPROTECT_CHECK_ENTRY(pml4e, 4, pml4);
 
   u64 *pdpt = table_from_entry(pml4e);
   u64 pdpte = pdpt[pdpt_index(virtual_address)];
   if ((pdpte & VMM_PRESENT) == 0)
     return;
+  MPROTECT_CHECK_ENTRY(pdpte, 3, pdpt);
 
   u64 *pd = table_from_entry(pdpte);
   u64 pde = pd[pd_index(virtual_address)];
   if ((pde & VMM_PRESENT) == 0)
     return;
+  if ((pde & HUGE_PAGE_FLAG) == 0)
+    MPROTECT_CHECK_ENTRY(pde, 2, pd);
 
   if ((pde & HUGE_PAGE_FLAG) != 0)
     return;
@@ -555,21 +780,24 @@ u64 vmm_virt_to_phys(void *ptr) {
   u64 pml4e = pml4[pml4_index(virtual_address)];
   if ((pml4e & VMM_PRESENT) == 0) return 0;
 
-  u64 *pdpt = table_from_entry(pml4e);
+  u64 *pdpt = reachable_table(pml4e);
+  if (!pdpt) return 0;
   u64 pdpte = pdpt[pdpt_index(virtual_address)];
   if ((pdpte & VMM_PRESENT) == 0) return 0;
   if (pdpte & HUGE_PAGE_FLAG) {
     return (pdpte & PAGE_ENTRY_ADDRESS_MASK) + (virtual_address & 0x3FFFFFFF);
   }
 
-  u64 *pd = table_from_entry(pdpte);
+  u64 *pd = reachable_table(pdpte);
+  if (!pd) return 0;
   u64 pde = pd[pd_index(virtual_address)];
   if ((pde & VMM_PRESENT) == 0) return 0;
   if (pde & HUGE_PAGE_FLAG) {
     return (pde & PAGE_ENTRY_ADDRESS_MASK) + (virtual_address & 0x1FFFFF);
   }
 
-  u64 *pt = table_from_entry(pde);
+  u64 *pt = reachable_table(pde);
+  if (!pt) return 0;
   u64 pte = pt[pt_index(virtual_address)];
   if ((pte & VMM_PRESENT) == 0) return 0;
 
@@ -583,9 +811,9 @@ void vmm_set_lazy(u64 virtual_address) {
 
   u64 *pml4 = get_current_pml4();
   u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
-  pml4[pml4_index(virtual_address)] |= VMM_USER;
+  __atomic_or_fetch(&pml4[pml4_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
-  pdpt[pdpt_index(virtual_address)] |= VMM_USER;
+  __atomic_or_fetch(&pdpt[pdpt_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
 
   /* The low 4 GiB is identity-mapped with 2 MiB SUPERVISOR huge pages in every
    * address space (cloned per-space). The userspace load base 0x2000000 lives
@@ -601,11 +829,31 @@ void vmm_set_lazy(u64 virtual_address) {
   } else {
     pt = ensure_child_table(pd, pd_index(virtual_address));
   }
-  pd[pd_index(virtual_address)] |= VMM_USER;
+  __atomic_or_fetch(&pd[pd_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
 
   // Set a non-present entry with LAZY flag so we know it's a lazy page
   pt[pt_index(virtual_address)] = VMM_LAZY;
   invalidate_page(virtual_address);
+}
+
+static u64 *pf_leaf_pte_ptr(u64 va);
+
+/* The live leaf entry for an address, or 0 when no page table describes it.
+ * Read-only, takes the read lock, and is meant for reporting a fault — the
+ * entry is what separates "no mapping" from "mapped but not writable". */
+u64 vmm_query_leaf_pte(u64 vaddr) {
+  u64 flags;
+  u64 value = 0;
+
+  vmm_read_acquire(&flags);
+  {
+    u64 *slot = pf_leaf_pte_ptr(vaddr);
+
+    if (slot)
+      value = *slot;
+  }
+  vmm_read_release(flags);
+  return value;
 }
 
 // Handle page faults for demand paging and swap
@@ -626,6 +874,82 @@ static u64 *pf_leaf_pte_ptr(u64 va) {
   if ((pde & VMM_PRESENT) == 0 || (pde & HUGE_PAGE_FLAG)) return 0;
   u64 *pt = table_from_entry(pde);
   return &pt[pt_index(va)];
+}
+
+/* Move a range's leaf entries to another address, without touching the pages.
+ *
+ * mremap used to grow a mapping by allocating a second one and copying every
+ * byte through a kernel bounce buffer — faulting each page in on the way, and
+ * holding the address-space mutex for all of it. The pages themselves never
+ * need to move: only the entries that name them do, and that includes the lazy
+ * and swapped leaves, which have no page behind them at all and would have been
+ * materialised by a copy.
+ *
+ * An anonymous mmap installs no leaf at all, so the destination page tables do
+ * not exist yet. They are built one page ahead of the move, outside the lock —
+ * vmm_set_lazy allocates, and allocation can reclaim, which must never happen
+ * with the VMM write lock held. The move itself is then a pair of stores.
+ */
+void paging_move_range(u64 old_start, u64 new_start, u64 len) {
+  extern void tlb_shootdown_all(void);
+  u64 flags;
+
+  /* A block at a time: the tables for a whole block are built first, outside
+   * the lock, then one critical section moves its entries. Taking the write
+   * lock per page turned a large move into hundreds of thousands of lock
+   * round trips; holding it for the whole range would stall every fault on
+   * every CPU for as long as the move takes. The caller owns both ranges
+   * throughout, so no other thread can map into them meanwhile. */
+  /* One page table covers this much address space, and it is also the block
+   * size: a span this size shares one destination table. */
+  const u64 block = 512 * PAGE_SIZE;
+
+  for (u64 base = 0; base < len; base += block) {
+    u64 span = len - base;
+
+    if (span > block)
+      span = block;
+
+    /* One call per destination page table, not per page: every page of a
+     * 2 MiB-aligned span shares the same table, so building it once is enough
+     * and the other 511 walks are wasted work. */
+    for (u64 off = base; off < base + span;) {
+      u64 to = new_start + off;
+      u64 next = (to + block) & ~(block - 1);
+
+      vmm_set_lazy(to);
+      off += next - to;
+    }
+
+    vmm_write_acquire(&flags);
+    for (u64 off = base; off < base + span; off += PAGE_SIZE) {
+      u64 *src = pf_leaf_pte_ptr(old_start + off);
+      u64 *dst = pf_leaf_pte_ptr(new_start + off);
+
+      if (src && dst && *src) {
+        *dst = *src;
+        *src = 0;
+        invalidate_page(old_start + off);
+        invalidate_page(new_start + off);
+      }
+    }
+    vmm_write_release(flags);
+  }
+  /* One flush for the whole move rather than two IPI round trips per page —
+   * a large range has hundreds of thousands of pages, and per-page shootdowns
+   * alone cost more than the copy this replaces. A small move is the opposite
+   * case: broadcasting a full flush for two pages throws away every other
+   * CPU's TLB, so name the pages instead. */
+  if (len > 64 * PAGE_SIZE) {
+    tlb_shootdown_all();
+  } else {
+    extern void tlb_shootdown_page(u64);
+
+    for (u64 off = 0; off < len; off += PAGE_SIZE) {
+      tlb_shootdown_page(old_start + off);
+      tlb_shootdown_page(new_start + off);
+    }
+  }
 }
 
 /* SMP page-fault handler (M28 #7 — make the fault path self-locking so the
@@ -653,8 +977,183 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
   extern void eviction_unregister_page(u64 frame);
 
+  /* A user mapping that landed on the kernel's identity window.
+   *
+   * The low 4 GiB is identity-mapped with 2 MiB SUPERVISOR huge pages in every
+   * address space. A lazily-backed user page inside that range therefore does
+   * not fault as absent — the huge page underneath is present, so the CPU
+   * reports a protection violation (present + user) and the demand-paging path
+   * below, which only runs when the page is absent, never sees it. mmap is
+   * free to place an anonymous region there, and chromium's allocator does:
+   * every thread touching one died with a write fault whose PTE read as
+   * instruction bytes, because there was no page table under the huge entry at
+   * all.
+   *
+   * Split the huge page and mark this one leaf lazy, so the fault repeats as
+   * the absent-page fault it should have been. Only for an address a VMA of
+   * this task actually covers — outside one, a supervisor page must keep
+   * refusing user access. */
+  if (error_code & PF_PRESENT) {
+    /* Cheap test first, under the read lock. An ordinary copy-on-write fault
+     * arrives here too, and it must not pay for a page-table allocation. */
+    int on_huge = 0;
+    int leaf_seen = 0;
+    u64 leaf_val = 0;
+    u64 probe_flags;
+
+    /* One walk answers both questions a protection fault raises: whether it
+     * landed on the identity window's supervisor huge page, and what the live
+     * leaf says. Each of those used to take the lock and walk the tables again,
+     * on every such fault. */
+    vmm_read_acquire(&probe_flags);
+    {
+      u64 *pml4 = get_current_pml4();
+      u64 pml4e = pml4[pml4_index(page_aligned)];
+
+      if (pml4e & VMM_PRESENT) {
+        u64 pdpte = table_from_entry(pml4e)[pdpt_index(page_aligned)];
+
+        if ((pdpte & VMM_PRESENT) && !(pdpte & HUGE_PAGE_FLAG)) {
+          u64 pde = table_from_entry(pdpte)[pd_index(page_aligned)];
+
+          on_huge = (pde & VMM_PRESENT) && (pde & HUGE_PAGE_FLAG) &&
+                    !(pde & VMM_USER);
+          if ((pde & VMM_PRESENT) && !(pde & HUGE_PAGE_FLAG)) {
+            leaf_seen = 1;
+            leaf_val = table_from_entry(pde)[pt_index(page_aligned)];
+          }
+        }
+      }
+    }
+    vmm_read_release(probe_flags);
+
+    int covered = 0;
+    int found_vma = 0;
+    u32 found_prot = 0;
+
+    if (!(error_code & PF_USER) || !current_task)
+      on_huge = 0; /* the remedy below is for user mappings only */
+    for (struct vm_area *v = on_huge ? current_task->vma_list : 0;
+         v && v->start <= page_aligned; v = v->next) {
+      if (page_aligned < v->end) {
+        found_vma = 1;
+        found_prot = v->prot;
+        covered = v->prot != PROT_NONE;
+        break;
+      }
+    }
+    /* Say why a fault over the identity window was refused. "No VMA" is a wild
+     * access and belongs to SIGSEGV; a VMA with no access is the same; but a
+     * VMA that grants access and still lands here means the split above did not
+     * happen, and that is a kernel bug rather than a program's. */
+    if (on_huge && !covered) {
+      static unsigned refused;
+
+      if (refused < 8) {
+        refused++;
+        console_write("pf: identity-window fault refused, va 0x");
+        console_write_hex64(page_aligned);
+        console_write(found_vma ? " vma prot " : " no vma");
+        if (found_vma)
+          console_write_hex64(found_prot);
+        console_write("\n");
+      }
+    }
+    if (covered) {
+      u64 huge_flags;
+      /* Allocated before the lock: see split_huge_page_into. Freed again below
+       * when the split turns out to be unnecessary. */
+      u64 *spare = alloc_page_table();
+
+      vmm_write_acquire(&huge_flags);
+      u64 *pml4 = get_current_pml4();
+      u64 pml4e = pml4[pml4_index(page_aligned)];
+      if (pml4e & VMM_PRESENT) {
+        u64 *pdpt = table_from_entry(pml4e);
+        u64 pdpte = pdpt[pdpt_index(page_aligned)];
+        if ((pdpte & VMM_PRESENT) && !(pdpte & HUGE_PAGE_FLAG)) {
+          u64 *pd = table_from_entry(pdpte);
+          usize pdi = pd_index(page_aligned);
+          if (spare && (pd[pdi] & VMM_PRESENT) && (pd[pdi] & HUGE_PAGE_FLAG) &&
+              !(pd[pdi] & VMM_USER)) {
+            split_huge_page_into(pd, pdi, spare);
+            spare = 0;
+
+            __atomic_or_fetch(&pml4[pml4_index(page_aligned)], VMM_USER, __ATOMIC_SEQ_CST);
+            __atomic_or_fetch(&pdpt[pdpt_index(page_aligned)], VMM_USER, __ATOMIC_SEQ_CST);
+            __atomic_or_fetch(&pd[pdi], VMM_USER, __ATOMIC_SEQ_CST);
+            {
+              u64 *pt = table_from_entry(pd[pdi]);
+
+              pt[pt_index(page_aligned)] = VMM_LAZY;
+            }
+            invalidate_page(page_aligned);
+            vmm_write_release(huge_flags);
+            return 0;
+          }
+        }
+      }
+      vmm_write_release(huge_flags);
+      if (spare) {
+        u64 frame = table_to_phys(spare);
+
+        pmm_note_page_table(frame, 0);
+        pmm_free_frame(frame);
+      }
+    }
+
+    /* A fault the tables disagree with is a stale TLB entry, not an access
+     * error. The CPU reports PF_PRESENT from what it had cached; when the live
+     * leaf says otherwise, the entry was changed by another CPU (or by this one
+     * before an invalidation landed) and this CPU has not seen it yet. Flush
+     * the one page and let the instruction run again: if the mapping really is
+     * gone, the next fault arrives with PF_PRESENT clear and takes the ordinary
+     * path. Observed under chromium as a write fault at error 0x7 whose PTE
+     * read 0x0000000000000000. */
+    int stale;
+    /* Either the entry is gone, or it already permits exactly what faulted.
+     * The second case is the same disagreement seen from the other side: a
+     * write fault on a page whose live entry is present and writable, because
+     * another CPU granted the write (a copy-on-write break, an mprotect) and
+     * this CPU is still acting on the entry it had cached. A genuine
+     * copy-on-write fault does not match — that entry is present and read-only
+     * — so it still goes down the path that breaks the sharing. */
+    stale = !leaf_seen || ((leaf_val & VMM_PRESENT) == 0) ||
+            (((error_code & PF_WRITE) != 0) && (leaf_val & VMM_WRITABLE) != 0) ||
+            (((error_code & PF_WRITE) == 0) && (leaf_val & VMM_PRESENT) != 0);
+
+    /* Retry the same address a bounded number of times. A flush that does not
+     * take would otherwise loop here forever with nothing on the console;
+     * after a few attempts the fault goes down the ordinary path, which either
+     * services it or reports it. */
+    static u64 spurious_va;
+    static unsigned spurious_repeat;
+    static u64 spurious_count;
+
+    if (stale) {
+      if (page_aligned == spurious_va && ++spurious_repeat > 4) {
+        stale = 0;
+      } else if (page_aligned != spurious_va) {
+        spurious_va = page_aligned;
+        spurious_repeat = 1;
+      }
+    }
+    if (stale) {
+      u64 n = ++spurious_count;
+
+      __asm__ volatile("invlpg (%0)" : : "r"(page_aligned) : "memory");
+      if (n <= 8)
+        klog_warn("page fault on an entry this CPU no longer has: retrying");
+      return 0;
+    }
+  }
+
   /* A non-present leaf can be an explicit lazy/swap entry. Do not let the
-   * heap growth fast path overwrite that metadata with a zero page. */
+   * heap growth fast path overwrite that metadata with a zero page.
+   *
+   * A protection fault has already read this leaf above and does not reach
+   * here; only an absent-page fault does, so this walk happens once per fault
+   * rather than beside another one. */
   int has_deferred_leaf = 0;
   u64 deferred_flags;
   vmm_read_acquire(&deferred_flags);
@@ -677,15 +1176,12 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
      * have no covering VMA. mprotect splits the VMA and updates ->prot, so a
      * region later made accessible (e.g. V8 committing part of a reservation)
      * has prot != PROT_NONE here and falls through to the normal zero-fill. */
+    struct vm_area *anon_vma = 0;
+
     if ((error_code & PF_USER) && current_task) {
-      for (struct vm_area *v = current_task->vma_list;
-           v && v->start <= page_aligned; v = v->next) {
-        if (page_aligned < v->end) {
-          if (v->prot == PROT_NONE)
-            return -1; /* no access -> SIGSEGV */
-          break;       /* covering VMA grants access; service normally */
-        }
-      }
+      anon_vma = vma_lookup(current_task, page_aligned);
+      if (anon_vma && anon_vma->prot == PROT_NONE)
+        return -1; /* no access -> SIGSEGV */
     }
     /* Zero-page dedup: a fresh anonymous heap page has no content, so point
      * the mapping at the single shared read-only zero page instead of
@@ -703,6 +1199,32 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       }
       vmm_map_page_locked(page_aligned, zero_pg,
                           VMM_PRESENT | VMM_COW | VMM_USER);
+      /* Point the neighbours at the same shared zero page while the tables are
+       * open. Anonymous memory is touched in runs — a heap grows, a thread
+       * stack is written down — and each of those pages otherwise costs a
+       * fault that ends in exactly this store. Nothing is allocated and no
+       * content is invented: the frame is the one read-only zero page every
+       * fresh anonymous page already gets, and the first write to any of them
+       * still takes the copy-on-write path. Bounded by the page table and by
+       * the mapping. */
+      if (anon_vma) {
+        const u64 table_span = 512 * PAGE_SIZE;
+        u64 stop = (page_aligned + table_span) & ~(table_span - 1);
+
+        if (stop > anon_vma->end)
+          stop = anon_vma->end;
+        if (stop > page_aligned + 16 * PAGE_SIZE)
+          stop = page_aligned + 16 * PAGE_SIZE;
+
+        for (u64 va = page_aligned + PAGE_SIZE; va < stop; va += PAGE_SIZE) {
+          u64 *nslot = pf_leaf_pte_ptr(va);
+
+          if (!nslot || (*nslot & VMM_PRESENT) ||
+              (*nslot & (VMM_LAZY | VMM_SWAPPED)))
+            break;
+          vmm_map_page_locked(va, zero_pg, VMM_PRESENT | VMM_COW | VMM_USER);
+        }
+      }
       vmm_write_release(cflags);
       /* Not registered in the eviction ring: one shared frame, read-only, and
        * swap must never evict a frame mapped in many address spaces. */
@@ -791,6 +1313,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       u64 zflags = VMM_PRESENT;
       if (*slot & VMM_WRITABLE) zflags |= VMM_COW; /* first store COWs */
       if (*slot & VMM_USER) zflags |= VMM_USER;
+      if (error_code & PF_USER) zflags |= VMM_USER; /* see the note below */
       if (*slot & VMM_NO_EXECUTE) zflags |= VMM_NO_EXECUTE;
       *slot = pmm_zero_page() | zflags;
       invalidate_page(page_aligned);
@@ -814,7 +1337,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     // File-backed fill happens OUTSIDE vmm_lock (read_cb / blk_*_cached block).
     int shared_cache_frame = 0;
     int vma_shared = 0;
-    struct vm_area *vma = current_task->vma_list;
+    struct vm_area *vma = vma_lookup(current_task, page_aligned);
     while (vma) {
       if (page_aligned >= vma->start && page_aligned < vma->end) {
         /* MAP_SHARED file pages must stay shared across fork: the page-cache
@@ -946,6 +1469,15 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     u64 flags = VMM_PRESENT;
     if (*slot & VMM_WRITABLE) flags |= VMM_WRITABLE;
     if (*slot & VMM_USER) flags |= VMM_USER;
+    /* A fault raised in ring 3 must produce a page ring 3 can use.
+     *
+     * The user bit was recovered from the previous entry alone, so an entry
+     * that had lost it — a lazy marker installed without one, a slot cleared
+     * and refilled — materialised a SUPERVISOR page under a user mapping. The
+     * process then took a protection fault on its own code with the entry
+     * reading present-and-supervisor, which is a SIGSEGV at the instruction
+     * pointer itself and looks nothing like a missing page. */
+    if (error_code & PF_USER) flags |= VMM_USER;
     if (vma_shared) flags |= VMM_SHARED;
     /* A writable MAP_PRIVATE file page must NOT map the shared page-cache
      * frame writable: the first store (e.g. ld.so applying relocations to a
@@ -967,6 +1499,53 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
      * shm, which never registers either). */
     if (!vma_shared)
       eviction_register_page(current_task, page_aligned, frame);
+    /* Map the neighbours that are already cached, while we are here.
+     *
+     * A 210 MB executable demand-paged one page per fault is fifty thousand
+     * faults, each walking the tables and taking the page-cache lock, and the
+     * read-ahead has usually put the next pages in the cache already — they
+     * cost a lookup and a store here, versus a full fault apiece later. Only
+     * cache hits are mapped: a miss would mean disk I/O, which belongs on the
+     * fault that actually needs the page, not on this one.
+     *
+     * Bounded to the rest of this page table so no new table is allocated, and
+     * to the mapping's own extent. */
+    if (vma && vma->node && vma->node->inode && !(error_code & PF_WRITE)) {
+      const u64 table_span = 512 * PAGE_SIZE;
+      u64 stop = (page_aligned + table_span) & ~(table_span - 1);
+
+      if (stop > vma->end)
+        stop = vma->end;
+      if (stop > page_aligned + 16 * PAGE_SIZE)
+        stop = page_aligned + 16 * PAGE_SIZE;
+
+      for (u64 va = page_aligned + PAGE_SIZE; va < stop; va += PAGE_SIZE) {
+        u64 off = vma->offset + (va - vma->start);
+        struct page_cache_entry *near =
+            page_cache_get_page(vma->node->inode, off & ~(PAGE_SIZE - 1));
+
+        if (!near)
+          break; /* not cached: leave it to its own fault */
+
+        u64 nflags;
+        vmm_write_acquire(&nflags);
+        u64 *nslot = pf_leaf_pte_ptr(va);
+        int installed = 0;
+
+        if (nslot && !(*nslot & VMM_PRESENT) && !(*nslot & VMM_SWAPPED)) {
+          u64 f = flags;
+
+          pmm_ref_frame(near->frame);
+          *nslot = near->frame | f;
+          invalidate_page(va);
+          installed = 1;
+        }
+        vmm_write_release(nflags);
+        page_cache_put_page(near);
+        if (!installed)
+          break;
+      }
+    }
     return 0;
   }
 
@@ -1491,9 +2070,30 @@ static void free_table(u64 *table, int level) {
   for (usize i = 0; i < 512; i++) {
     u64 entry = table[i];
     if ((entry & VMM_PRESENT) && !(entry & HUGE_PAGE_FLAG)) {
-      u64 *child = table_from_entry(entry);
       u64 child_phys = entry & PAGE_ENTRY_ADDRESS_MASK;
+
+      /* The entry has to name a frame the allocator still knows as a page
+       * table. When it does not, that frame was handed to someone else while
+       * this space still pointed at it, and following the pointer reads their
+       * data as page-table entries — which is how this surfaces: a "corrupted
+       * page-table entry" holding ASCII, one level deeper and with the frame
+       * number already lost. Report it here, where the frame and its history
+       * are still known. */
+      if (!pmm_frame_is_page_table(child_phys)) {
+        extern void pmm_report_page_table_history_pub(u64 frame);
+
+        console_write("paging: address space holds a frame the allocator no "
+                      "longer calls a page table: 0x");
+        console_write_hex64(child_phys);
+        console_write(" at level ");
+        console_write_dec((u64)level);
+        console_write("\n");
+        pmm_report_page_table_history_pub(child_phys);
+        panic("paging: page table freed while still mapped");
+      }
+      u64 *child = table_from_entry(entry);
       free_table(child, level + 1);
+      pmm_note_page_table(child_phys, 0); /* no longer a table */
       pmm_free_frame(child_phys);
       freed_tables_count++;
     }
@@ -1505,6 +2105,50 @@ void paging_free_address_space(u64 pml4_phys) {
     return;
   }
 
+  /* Exactly one caller may release this space.
+   *
+   * The check below finds OTHER live users, and two exiting threads of one
+   * process each found none — the sibling was already past TASK_DEAD, so each
+   * excluded the other and both went on to free the same tables. Claiming the
+   * PML4's page-table bit settles it atomically: the thread that takes the bit
+   * does the release, the other returns. Without this the frames went back to
+   * the allocator twice ("double free ... already parked in a bucket") and were
+   * reissued between the two, which is how a live address space came to hold
+   * entries made of somebody else's data. */
+  {
+    extern int pmm_claim_page_table_release(u64 frame);
+
+    if (!pmm_claim_page_table_release(pml4_phys))
+      return; /* another thread is already tearing this space down */
+  }
+
+  /* Nobody may still be running here. A space released under a live thread
+   * does not fault: the frames go back to the allocator, the heap writes text
+   * into what is still that thread's PML4, and the corruption surfaces much
+   * later as a page-table entry holding ASCII — which is how this check came
+   * to exist. Name the survivor here, where the caller doing the release is
+   * still on the stack. */
+  {
+    usize other_id = 0;
+    const char *other_name = 0;
+    usize users = scheduler_address_space_users(pml4_phys, &other_id, &other_name);
+
+    if (users != 0) {
+      console_write("paging: address space 0x");
+      console_write_hex64(pml4_phys);
+      console_write(" freed while ");
+      console_write_dec(users);
+      console_write(" task(s) still run in it, first id ");
+      console_write_dec(other_id);
+      console_write(" (");
+      console_write(other_name ? other_name : "?");
+      console_write(") caller 0x");
+      console_write_hex64((u64)(usize)__builtin_return_address(0));
+      console_write("\n");
+      panic("paging: address space freed under a running task");
+    }
+  }
+
   freed_tables_count = 0;
   u64 *pml4 = (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE);
 
@@ -1512,15 +2156,41 @@ void paging_free_address_space(u64 pml4_phys) {
   for (usize i = 0; i < 256; i++) {
     u64 entry = pml4[i];
     if ((entry & VMM_PRESENT) && !(entry & HUGE_PAGE_FLAG)) {
+      /* An entry that does not address the direct map is not a table, and
+       * following it here reads an unrelated page as one. Say which slot of
+       * which space held it, and what the frame was last used for, instead of
+       * panicking on the value alone — the value is the only thing the walk can
+       * report, and it never names the writer. */
+      u64 child_phys = entry & PAGE_ENTRY_ADDRESS_MASK;
+      if (child_phys >= DIRECT_MAP_SIZE) {
+        extern void pmm_report_page_table_history_pub(u64 frame);
+        console_write("paging_free_address_space: pml4 0x");
+        console_write_hex64(pml4_phys);
+        console_write(" slot ");
+        console_write_dec(i);
+        console_write(" holds a non-table entry 0x");
+        console_write_hex64(entry);
+        console_write("\n  history of the pml4 frame:\n");
+        pmm_report_page_table_history_pub(pml4_phys);
+        if (current_task) {
+          console_write("  releasing task ");
+          console_write_dec(current_task->id);
+          console_write(" ");
+          console_write(current_task->name);
+          console_write("\n");
+        }
+      }
       u64 *pdpt = table_from_entry(entry);
       u64 pdpt_phys = entry & PAGE_ENTRY_ADDRESS_MASK;
       free_table(pdpt, 1);
+      pmm_note_page_table(pdpt_phys, 0); /* no longer a table */
       pmm_free_frame(pdpt_phys);
       freed_tables_count++;
     }
   }
 
   // Free the PML4 itself
+  pmm_note_page_table(pml4_phys, 0); /* no longer a table */
   pmm_free_frame(pml4_phys);
   freed_tables_count++;
 }

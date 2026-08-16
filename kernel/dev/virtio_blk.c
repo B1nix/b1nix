@@ -2,6 +2,7 @@
 #include <b1nix/console.h>
 #include <b1nix/io.h>
 #include <b1nix/irq.h>
+#include <b1nix/klog.h>
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
 #include <b1nix/sched.h>
@@ -13,7 +14,16 @@
  * completion IRQ wakes the waiter on the common path; this only bounds the stall
  * if an interrupt is ever lost, degrading to a periodic re-poll instead of a
  * wedge. Never reached on a healthy device. */
-#define VIRTIO_BLK_IO_WATCHDOG_TICKS 50
+/* One tick, not fifty.
+ *
+ * The comment above calls this "never reached on a healthy device", and that
+ * assumption set it to half a second. It is reached: under a browser's write
+ * load a request regularly finishes without the waiter being woken, and every
+ * one of those cost 500 ms — while holding this instance's lock, so the whole
+ * system queued behind it. The bound belongs at the scale of the device's own
+ * latency (microseconds), where a missed wake-up costs one tick instead of
+ * stalling every task that wants the disk. */
+#define VIRTIO_BLK_IO_WATCHDOG_TICKS 1
 
 #define VIRTIO_VENDOR_ID 0x1AF4
 #define VIRTIO_BLK_DEVICE_ID 0x1001
@@ -46,25 +56,48 @@ struct virtio_blk_dma_req {
   volatile u8 status;
 } __attribute__((packed));
 
+/* Holding this lock is a kernel critical section in the strict sense: a task
+ * killed while it holds the device never releases it, and every other task then
+ * spins here forever. Tell the scheduler to keep a fatal signal pending until
+ * the request is done — that is the whole reason the counter exists. */
 static void virtio_blk_lock(struct virtio_blk_instance *inst) {
+  /* The guard goes up AFTER the lock is held, not before.
+   *
+   * Waiting for the lock is not a critical section — nothing is held yet, and
+   * a task killed here leaves nothing behind. Raising the guard around the wait
+   * instead made a task that merely wanted the disk unkillable for as long as
+   * somebody else had it: the fatal signal stayed pending, the loop kept
+   * yielding, and `timeout` could not end the process it was watching. */
   while (__sync_lock_test_and_set(&inst->busy, 1)) {
     scheduler_yield();
   }
+  scheduler_kcrit_enter();
 }
 
 static void virtio_blk_unlock(struct virtio_blk_instance *inst) {
   __sync_lock_release(&inst->busy);
+  scheduler_kcrit_leave();
 }
 
 /* M70: completion interrupt handler. Runs in IRQ context — read the device ISR
  * (which deasserts the level-triggered line), and if this device posted a used
  * buffer, wake the task blocked in do_virtio_blk_req(). The instance pointer is
  * the wait channel. Returns 1 if the interrupt was ours (shared-line aware). */
+/* Completion interrupts actually seen, and calls into this handler that were
+ * not ours. A request that only ever finishes when the watchdog re-polls looks
+ * identical to a slow device; these two counters are what tell the difference,
+ * so the stall report prints them. */
+static volatile u64 vblk_irq_completions;
+static volatile u64 vblk_irq_foreign;
+
 static int virtio_blk_irq(void *ctx) {
   struct virtio_blk_instance *inst = (struct virtio_blk_instance *)ctx;
   u8 isr = virtio_read_isr(&inst->dev); /* read clears the ISR status */
-  if (!(isr & 0x1))
+  if (!(isr & 0x1)) {
+    vblk_irq_foreign++;
     return 0; /* not a used-buffer notification from this device */
+  }
+  vblk_irq_completions++;
   scheduler_wake_all(inst);
   return 1;
 }
@@ -94,8 +127,40 @@ static int vblk_add_region(struct virtqueue *vq, u16 *next_desc, u16 *prev,
   while (rem > 0) {
     if (*next_desc >= vq->queue_size)
       return -1;
-    u16 idx = (*next_desc)++;
     u64 phys = vmm_virt_to_phys((void *)(usize)vaddr);
+    /* No translation means no descriptor. Physical 0 is the real-mode IVT, not
+     * a buffer: publishing it would aim the device's DMA engine at the bottom
+     * of memory and corrupt the machine rather than fail the I/O. A kernel
+     * buffer that cannot be translated is a page-table problem upstream of this
+     * driver — fail the request so the caller sees an error. */
+    if (phys == 0) {
+      static unsigned reported;
+      if (reported < 8) {
+        console_write("virtio-blk: untranslatable buffer at 0x");
+        console_write_hex64(vaddr);
+        console_write(" len ");
+        console_write_dec(len);
+        console_write(" — request failed\n");
+        /* Whose buffer it was decides what this is. An address that was mapped
+         * when the request was submitted and is not mapped now means the buffer
+         * was freed under I/O still in flight; a buffer that was never mapped
+         * means the caller passed an address it does not own. Name the caller
+         * and the task so the two can be told apart. */
+        console_write("  submitted by 0x");
+        console_write_hex64((u64)(usize)__builtin_return_address(0));
+        ksym_print((u64)(usize)__builtin_return_address(0));
+        if (current_task) {
+          console_write("\n  task ");
+          console_write_dec(current_task->id);
+          console_write(" ");
+          console_write(current_task->name);
+        }
+        console_write("\n");
+        reported++;
+      }
+      return -1;
+    }
+    u16 idx = (*next_desc)++;
     u32 chunk = (u32)(4096 - (vaddr & 4095));
     if (chunk > rem)
       chunk = rem;
@@ -165,10 +230,57 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
       break;
     __asm__ volatile("pause");
   }
+  /* What a request actually costs, summarised rather than sampled.
+   *
+   * The stall reports name individual slow requests but say nothing about the
+   * common case, and the common case is what a browser's thousands of small
+   * synchronous writes are made of. Count every request, how many were still
+   * unfinished after the in-RAM spin, and how many scheduler ticks were spent
+   * waiting for those — printed periodically so the cost of the disk can be
+   * compared between runs instead of guessed at. */
+  static volatile u64 vblk_reqs, vblk_slow, vblk_wait_ticks, vblk_sectors;
+  u64 wait_start = scheduler_get_ticks();
+
+  vblk_reqs++;
+  vblk_sectors += count;
+  if (inst->vq.used->idx == inst->vq.last_used_idx)
+    vblk_slow++;
+
+  unsigned waits = 0;
   while (inst->vq.used->idx == inst->vq.last_used_idx) {
     if (!scheduler_can_block()) {
       scheduler_yield();
       continue;
+    }
+    /* A request the device never completes holds this instance's lock for as
+     * long as it waits, and every other task then spins in virtio_blk_lock —
+     * the whole system stops on one descriptor chain. The watchdog re-poll
+     * alone cannot say why, so once the wait is clearly not ordinary latency,
+     * describe the request and the queue indices that should have moved. */
+    if (++waits == 32) {
+      console_write("virtio-blk: request not completing: type ");
+      console_write_dec(type);
+      console_write(" lba ");
+      console_write_dec(lba);
+      console_write(" count ");
+      console_write_dec(count);
+      console_write(" descs ");
+      console_write_dec(next_desc);
+      console_write("\n  avail->idx ");
+      console_write_dec(inst->vq.avail->idx);
+      console_write(" used->idx ");
+      console_write_dec(inst->vq.used->idx);
+      console_write(" last_used ");
+      console_write_dec(inst->vq.last_used_idx);
+      console_write(" queue_size ");
+      console_write_dec(inst->vq.queue_size);
+      console_write("\n  irq ");
+      console_write_dec(inst->dev.irq);
+      console_write(" completions ");
+      console_write_dec(vblk_irq_completions);
+      console_write(" foreign ");
+      console_write_dec(vblk_irq_foreign);
+      console_write("\n");
     }
     scheduler_wait_prepare_timeout(inst, VIRTIO_BLK_IO_WATCHDOG_TICKS);
     if (inst->vq.used->idx != inst->vq.last_used_idx) {
@@ -180,6 +292,21 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
 
   __sync_synchronize();
   inst->vq.last_used_idx++;
+
+  vblk_wait_ticks += scheduler_get_ticks() - wait_start;
+  if ((vblk_reqs % 20000) == 0) {
+    console_write("virtio-blk: ");
+    console_write_dec(vblk_reqs);
+    console_write(" requests, ");
+    console_write_dec(vblk_slow);
+    console_write(" needed a wait, ");
+    console_write_dec(vblk_wait_ticks);
+    console_write(" ticks spent waiting (10 ms each), ");
+    console_write_dec(vblk_sectors / 2048);
+    console_write(" MiB moved, ");
+    console_write_dec(vblk_irq_completions);
+    console_write(" completion interrupts\n");
+  }
 
   int ret = (dma->status == 0) ? (int)count : -1;
   virtio_blk_unlock(inst);

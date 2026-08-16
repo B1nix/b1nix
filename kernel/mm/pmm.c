@@ -1,6 +1,7 @@
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/page_cache.h>
+#include <b1nix/klog.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
@@ -31,6 +32,14 @@ struct pmm_state {
    * head of a block currently linked into free_area[] — it makes "is this a
    * live free block?" an O(1) test instead of a per-page bitmap walk. */
   u8 *buddy_heads;
+  /* One bit per frame, set exactly while that frame is live as a page table.
+   * Page tables are the one kind of allocation whose corruption is not
+   * contained: every other subsystem walks them, so a frame that is both a
+   * page table and something else crashes somewhere unrelated to the mistake
+   * (a #GP inside a block driver, in the case this was added for). Checking
+   * the bit where a frame is handed out turns that into a report naming the
+   * frame, at the moment the second owner is created. */
+  u8 *pt_frames;
 };
 
 static struct pmm_state pmm;
@@ -341,7 +350,30 @@ static int buddy_release(u64 frame, int order) {
  * put the frame back on the tree — buddy_merge_insert is idempotent, so a
  * frame that is already linked is left alone instead of cycling the list.
  * Caller holds pmm_lock. */
+/* Defined further down, beside the ring it prints. Declared here because the
+ * allocator's own consistency checks — which come first in this file — report
+ * through it. */
+int pmm_frame_is_page_table(u64 frame);
+void pmm_report_page_table_history_pub(u64 frame);
+
 static void pmm_return_frame(u64 frame) {
+  /* Every path back into the allocator goes through here, including the ones
+   * that bypass pmm_free_frame (the per-CPU zero bucket and quarantine
+   * drains). A frame still claimed as a page table must not reach any of them:
+   * once it is free, it will be handed to a second owner and the corruption
+   * surfaces wherever that owner's first write lands. Name the frame and its
+   * history here, at the return, rather than at the later hand-out. */
+  {
+    if (pmm_frame_is_page_table(frame)) {
+      console_write("pmm: returning a live page-table frame 0x");
+      console_write_hex64(frame);
+      console_write(" from 0x");
+      console_write_hex64((u64)(usize)__builtin_return_address(0));
+      console_write("\n");
+      pmm_report_page_table_history_pub(frame);
+      panic("pmm: page-table frame returned to the allocator");
+    }
+  }
   if (buddy_release(frame, 0) == 0) return;
   usize idx = frame_index(frame);
   if (bitmap_get(idx)) {
@@ -611,13 +643,15 @@ void pmm_init(const struct boot_info *boot_info) {
   buddy_ready = 0;
 
   u64 early_mem =
-      find_early_mem(boot_info, pmm.bitmap_bytes * 2 + refcounts_bytes);
+      find_early_mem(boot_info, pmm.bitmap_bytes * 3 + refcounts_bytes);
   pmm.bitmap = (u8 *)(usize)early_mem;
   pmm.buddy_heads = (u8 *)(usize)(early_mem + pmm.bitmap_bytes);
-  pmm.frame_refcounts = (u16 *)(usize)(early_mem + pmm.bitmap_bytes * 2);
+  pmm.pt_frames = (u8 *)(usize)(early_mem + pmm.bitmap_bytes * 2);
+  pmm.frame_refcounts = (u16 *)(usize)(early_mem + pmm.bitmap_bytes * 3);
 
   memset(pmm.bitmap, 0xff, pmm.bitmap_bytes);
   memset(pmm.buddy_heads, 0, pmm.bitmap_bytes);
+  memset(pmm.pt_frames, 0, pmm.bitmap_bytes);
   memset(pmm.frame_refcounts, 0, refcounts_bytes);
 
   console_write("pmm: kernel 0x");
@@ -675,6 +709,12 @@ void pmm_init(const struct boot_info *boot_info) {
 
   for (u64 frame = (u64)(usize)pmm.buddy_heads;
        frame < (u64)(usize)pmm.buddy_heads + pmm.bitmap_bytes;
+       frame += PAGE_SIZE) {
+    mark_frame_used(frame);
+  }
+
+  for (u64 frame = (u64)(usize)pmm.pt_frames;
+       frame < (u64)(usize)pmm.pt_frames + pmm.bitmap_bytes;
        frame += PAGE_SIZE) {
     mark_frame_used(frame);
   }
@@ -764,6 +804,17 @@ void pmm_ref_frame(u64 frame) {
  * aging "N allocs" is implemented by only promoting the head once Q_AGE more
  * frames have piled up behind it. */
 struct pmm_pcp {
+  /* "Per-CPU" describes who uses this bucket in steady state, not who may ever
+   * touch it: pmm_pcp_drain_all() walks EVERY CPU's buckets from whichever CPU
+   * hit OOM, so IRQs-off is not enough to own one. Without this lock a drainer
+   * could pop a frame off another CPU's list and hand it back to the global
+   * pool while that CPU was popping the same frame for a caller — the frame
+   * then has two owners, and the second allocation writes over the first. When
+   * one of the two owners is the paging code, the loser is a live page table:
+   * a kernel PD full of file data, and a #GP on the next walk of it (seen in
+   * vmm_virt_to_phys from the virtio-blk submit path). Uncontended on the
+   * common path, which is the only path a CPU takes for its own bucket. */
+  spinlock_t lock;
   u64 head;       /* intrusive stack head, same on-frame link layout as global */
   u32 count;      /* number of frames currently parked */
   u32 _pad;
@@ -852,7 +903,25 @@ static void pmm_pcp_zero_drain(struct pmm_pcp *pcp) {
  * marker at offset 16 are never overwritten by these. Caller must hold IRQs
  * off (per-CPU ownership). */
 static void q_push(struct pmm_pcp *pcp, u64 frame) {
+  u64 *qmarker = (u64 *)(usize)(frame + DIRECT_MAP_BASE);
+
+  if (qmarker[PMM_POISON_CANARY_OFF / 8] == PMM_POISON_CANARY ||
+      qmarker[PMM_ZERO_MAGIC_OFF / 8] == PMM_ZERO_MAGIC) {
+    static unsigned reported;
+
+    if (reported < 8) {
+      reported++;
+      console_write("pmm: frame 0x");
+      console_write_hex64(frame);
+      console_write(" quarantined while already parked, from 0x");
+      console_write_hex64((u64)(usize)__builtin_return_address(0));
+      console_write("\n");
+      pmm_report_page_table_history_pub(frame);
+    }
+    return; /* see zero_push */
+  }
   *(u64 *)(usize)(frame + DIRECT_MAP_BASE) = 0;
+  qmarker[PMM_POISON_CANARY_OFF / 8] = PMM_POISON_CANARY;
   if (pcp->q_tail) {
     *(u64 *)(usize)(pcp->q_tail + DIRECT_MAP_BASE) = frame;
   } else {
@@ -872,16 +941,52 @@ static u64 q_pop(struct pmm_pcp *pcp) {
 }
 
 /* LIFO push onto the pre-zeroed stack (frame must already be all-zeros). */
+/* The bucket lists are threaded through the pages themselves, so a page pushed
+ * twice does not corrupt a separate structure — it closes a loop, and the
+ * bucket then hands the same frame out again and again with no free in sight.
+ * That is exactly the shape of the "page-table frame allocated twice" report:
+ * a frame claimed once, never freed, issued twice. Each push therefore checks
+ * the marker that says the page is already parked, and refuses. */
 static void zero_push(struct pmm_pcp *pcp, u64 frame) {
-  *(u64 *)(usize)(frame + DIRECT_MAP_BASE) = pcp->zero_head;
+  u64 *marker = (u64 *)(usize)(frame + DIRECT_MAP_BASE);
+
+  if (marker[PMM_ZERO_MAGIC_OFF / 8] == PMM_ZERO_MAGIC) {
+    static unsigned reported;
+
+    if (reported < 8) {
+      reported++;
+      console_write("pmm: frame 0x");
+      console_write_hex64(frame);
+      console_write(" pushed to the zero bucket while already in it, from 0x");
+      console_write_hex64((u64)(usize)__builtin_return_address(0));
+      console_write("\n");
+      pmm_report_page_table_history_pub(frame);
+    }
+    return; /* already parked — pushing again would loop the list */
+  }
+  marker[0] = pcp->zero_head;
+  marker[PMM_ZERO_MAGIC_OFF / 8] = PMM_ZERO_MAGIC;
   pcp->zero_head = frame;
   pcp->zero_count++;
 }
 
 static void pmm_pcp_drain_all(void) {
+  /* One line, once: this only runs when the global pool is empty and reclaim
+   * has already failed, so knowing whether a boot ever got here is the
+   * difference between "the machine was under real pressure" and "it was
+   * not" when reading a corruption report afterwards. */
+  static int announced;
+  if (!announced) {
+    announced = 1;
+    klog_warn("pmm: draining per-CPU frame caches (global pool empty)");
+  }
   for (int c = 0; c < MAX_CPUS; c++) {
     struct pmm_pcp *pcp = &pmm_pcp[c];
     if (pcp->count == 0 && pcp->zero_count == 0 && pcp->q_count == 0) continue;
+    /* Lock order is bucket then global, the same order the owning CPU takes
+     * them in (pmm_pcp_refill acquires the global lock with the bucket held). */
+    u64 ifl = irq_save_cli();
+    spin_lock(&pcp->lock);
     u64 flags;
     pmm_acquire(&flags);
     while (pcp->count > 0) {
@@ -905,6 +1010,8 @@ static void pmm_pcp_drain_all(void) {
       pmm_return_frame(frame);
     }
     pmm_release(flags);
+    spin_unlock(&pcp->lock);
+    irq_restore(ifl);
   }
 }
 
@@ -928,6 +1035,7 @@ static void pmm_scrub_quarantine(void) {
   u64 flags = irq_save_cli();
   struct percpu *p = get_percpu();
   struct pmm_pcp *pcp = &pmm_pcp[p->cpu_id];
+  spin_lock(&pcp->lock);
   int done = 0;
   while (pcp->q_count > PMM_PCP_Q_AGE && done < PMM_PCP_Q_SCRUB) {
     u64 frame = q_pop(pcp);
@@ -945,17 +1053,144 @@ static void pmm_scrub_quarantine(void) {
     /* The zeroing the pre-zeroed pool is built around — deliberately here, on
      * an idle CPU, and not in the free path. */
     memset((void *)(usize)(frame + DIRECT_MAP_BASE), 0, PAGE_SIZE);
-    marker[PMM_ZERO_MAGIC_OFF / 8] = PMM_ZERO_MAGIC;
+    /* The marker is stamped by zero_push, which needs to see the page
+     * unmarked to tell a fresh park from a second one. */
     if (pcp->zero_count >= PMM_PCP_ZERO_LIMIT) {
       pmm_pcp_zero_drain(pcp);
     }
     zero_push(pcp, frame);
     done++;
   }
+  spin_unlock(&pcp->lock);
   irq_restore(flags);
 }
 
+/* Page-table frame ownership. The paging code claims a frame here the moment it
+ * installs it as a table and releases it when the table is torn down; every
+ * other allocation checks the claim. See struct pmm_state::pt_frames. */
+/* The last few claims and releases, so a frame found in the wrong state can be
+ * traced to whoever put it there. A ring rather than a per-frame record: the
+ * question is always about one frame that has just gone wrong, and its history
+ * is a handful of entries old. */
+#define PT_TRACE_N 256
+static struct {
+  u64 frame;
+  u64 caller;
+  int owned; /* 1 claimed as a table, 0 released, -1 freed to the allocator */
+} pt_trace[PT_TRACE_N];
+static u32 pt_trace_w;
+
+/* Atomically clear a frame's page-table claim, reporting whether this caller is
+ * the one that held it.
+ *
+ * Releasing an address space is a one-time act, but nothing enforced that: two
+ * threads of one process exiting together each looked for OTHER live users of
+ * the address space, each saw none (the sibling was already marked dead), and
+ * both freed the same tables. The frames went back twice, were handed to a new
+ * owner in between, and the next walk found data where a table should be. The
+ * claim bit is the natural token — exactly one clearer can win it. */
+int pmm_claim_page_table_release(u64 frame) {
+  if (!pmm.pt_frames || frame >= pmm.max_address)
+    return 0;
+  usize idx = frame / PAGE_SIZE;
+  u8 bit = (u8)(1u << (idx % 8));
+  u8 prev = __atomic_fetch_and(&pmm.pt_frames[idx / 8], (u8)~bit,
+                               __ATOMIC_SEQ_CST);
+
+  pt_trace[pt_trace_w].frame = frame;
+  pt_trace[pt_trace_w].caller = (u64)(usize)__builtin_return_address(0);
+  pt_trace[pt_trace_w].owned = 0;
+  pt_trace_w = (pt_trace_w + 1) % PT_TRACE_N;
+
+  return (prev & bit) != 0;
+}
+
+void pmm_note_page_table(u64 frame, int owned) {
+  if (!pmm.pt_frames || frame >= pmm.max_address)
+    return;
+  usize idx = frame / PAGE_SIZE;
+  if (owned)
+    pmm.pt_frames[idx / 8] |= (u8)(1u << (idx % 8));
+  else
+    pmm.pt_frames[idx / 8] &= (u8)~(1u << (idx % 8));
+
+  pt_trace[pt_trace_w].frame = frame;
+  pt_trace[pt_trace_w].caller = (u64)(usize)__builtin_return_address(0);
+  pt_trace[pt_trace_w].owned = owned;
+  pt_trace_w = (pt_trace_w + 1) % PT_TRACE_N;
+}
+
+/* Record a free as well, so the history reads as the whole life of a frame:
+ * who claimed it as a table, who released that claim, and who freed it. A
+ * frame that turns up free with no free in its history never went through the
+ * ordinary path at all, which is a different bug from freeing it too early. */
+void pmm_note_free(u64 frame, u64 caller) {
+  pt_trace[pt_trace_w].frame = frame;
+  pt_trace[pt_trace_w].caller = caller;
+  pt_trace[pt_trace_w].owned = -1;
+  pt_trace_w = (pt_trace_w + 1) % PT_TRACE_N;
+}
+
+/* Print what happened to one frame, newest first. */
+void pmm_report_page_table_history_pub(u64 frame);
+static void pmm_report_page_table_history(u64 frame) {
+  console_write("pmm: history for 0x");
+  console_write_hex64(frame);
+  console_write(":\n");
+  for (u32 i = 0; i < PT_TRACE_N; i++) {
+    u32 at = (pt_trace_w + PT_TRACE_N - 1 - i) % PT_TRACE_N;
+
+    if (pt_trace[at].frame != frame)
+      continue;
+    console_write("pmm:   ");
+    console_write(pt_trace[at].owned == 1   ? "claimed"
+                  : pt_trace[at].owned == 0 ? "released"
+                                            : "freed");
+    console_write(" by 0x");
+    console_write_hex64(pt_trace[at].caller);
+    console_write("\n");
+  }
+}
+
+void pmm_report_page_table_history_pub(u64 frame) {
+  pmm_report_page_table_history(frame);
+}
+
+int pmm_frame_is_page_table(u64 frame) {
+  if (!pmm.pt_frames || frame >= pmm.max_address)
+    return 0;
+  usize idx = frame / PAGE_SIZE;
+  return (pmm.pt_frames[idx / 8] >> (idx % 8)) & 1;
+}
+
+/* Hand-out gate. A frame that is still live as a page table must never reach a
+ * second owner: the second owner's first write lands in a table some other CPU
+ * is walking. Report it here, where the allocator that would have created the
+ * second owner is still on the stack, instead of wherever the corrupted table
+ * is next read. */
+static void pmm_check_handout(u64 frame) {
+  if (!pmm_frame_is_page_table(frame))
+    return;
+  static unsigned reported;
+  if (reported < 8) {
+    reported++;
+    console_write("pmm: frame 0x");
+    console_write_hex64(frame);
+    console_write(" is a live page table and was about to be handed out again"
+                  " (caller 0x");
+    console_write_hex64((u64)(usize)__builtin_return_address(0));
+    console_write(")\n");
+    pmm_report_page_table_history(frame);
+  }
+  panic("pmm: page-table frame allocated twice");
+}
+
 void pmm_free_frame(u64 frame) {
+  {
+    extern void pmm_note_free(u64 frame, u64 caller);
+
+    pmm_note_free(frame, (u64)(usize)__builtin_return_address(0));
+  }
   if (zero_page_frame && frame == zero_page_frame) {
     /* Shared zero page: reserved for the kernel's whole lifetime (its single
      * allocation refcount is never released). Unmaps of read-only+COW
@@ -975,6 +1210,23 @@ void pmm_free_frame(u64 frame) {
     warned++;
     return;
   }
+  /* A frame still claimed as a page table is being freed by something that does
+   * not own it — the paging code releases its claim before freeing. Report the
+   * culprit here rather than let the frame be recycled under a live table. */
+  if (pmm_frame_is_page_table(frame)) {
+    static unsigned reported;
+    if (reported < 8) {
+      reported++;
+      console_write("pmm: free of live page-table frame 0x");
+      console_write_hex64(frame);
+      console_write(" from 0x");
+      console_write_hex64((u64)(usize)__builtin_return_address(0));
+      console_write("\n");
+    }
+    klog_warn("pmm_free_frame: refused free of a live page-table frame");
+    return;
+  }
+
   usize idx = frame / PAGE_SIZE;
 
   /* Refcount step still goes through the global lock — it's a tiny
@@ -999,6 +1251,7 @@ void pmm_free_frame(u64 frame) {
     u64 ifl = irq_save_cli();
     struct percpu *p = get_percpu();
     struct pmm_pcp *pcp = &pmm_pcp[p->cpu_id];
+    spin_lock(&pcp->lock);
 
     /* Double-free check: a page that is still parked somewhere (quarantine or
      * zero bucket) carries its poison/zero marker. It is bitmap-USED and owned
@@ -1008,12 +1261,23 @@ void pmm_free_frame(u64 frame) {
     u64 *marker = (u64 *)(usize)(frame + DIRECT_MAP_BASE);
     if (marker[PMM_POISON_CANARY_OFF / 8] == PMM_POISON_CANARY ||
         marker[PMM_ZERO_MAGIC_OFF / 8] == PMM_ZERO_MAGIC) {
+      spin_unlock(&pcp->lock);
       irq_restore(ifl);
       static unsigned df_reported;
       if (df_reported < 8) {
         console_write("pmm: double free detected at 0x");
         console_write_hex64(frame);
+        console_write(" from 0x");
+        console_write_hex64((u64)(usize)__builtin_return_address(0));
+        ksym_print((u64)(usize)__builtin_return_address(0));
+        if (current_task) {
+          console_write(" task ");
+          console_write_dec(current_task->id);
+          console_write(" ");
+          console_write(current_task->name);
+        }
         console_write("\n");
+        pmm_report_page_table_history_pub(frame);
         klog_warn("pmm_free_frame: double free (page already parked in a bucket)");
         df_reported++;
       }
@@ -1028,7 +1292,8 @@ void pmm_free_frame(u64 frame) {
      * page writes per page where one is enough. */
     if (pmm_poison_enabled)
       memset((void *)(usize)(frame + DIRECT_MAP_BASE), PMM_POISON_BYTE, PAGE_SIZE);
-    marker[PMM_POISON_CANARY_OFF / 8] = PMM_POISON_CANARY;
+    /* The canary is stamped by q_push, which needs to see the page unmarked to
+     * tell a fresh park from a second one. */
     q_push(pcp, frame);
     if (pcp->q_count > PMM_PCP_Q_LIMIT) {
       /* Bucket full — promote the OLDEST victim (the head) to the zero bucket
@@ -1036,13 +1301,12 @@ void pmm_free_frame(u64 frame) {
        * only its parking spot changes. */
       u64 oldest = q_pop(pcp);
       memset((void *)(usize)(oldest + DIRECT_MAP_BASE), 0, PAGE_SIZE);
-      *(u64 *)(usize)(oldest + DIRECT_MAP_BASE + PMM_ZERO_MAGIC_OFF) =
-          PMM_ZERO_MAGIC;
       if (pcp->zero_count >= PMM_PCP_ZERO_LIMIT) {
         pmm_pcp_zero_drain(pcp);
       }
       zero_push(pcp, oldest);
     }
+    spin_unlock(&pcp->lock);
     irq_restore(ifl);
     return;
   }
@@ -1077,18 +1341,35 @@ u64 pmm_alloc_frame(void) {
   u64 flags = irq_save_cli();
   struct percpu *p = get_percpu();
   struct pmm_pcp *pcp = &pmm_pcp[p->cpu_id];
+  spin_lock(&pcp->lock);
 
   /* Pre-zeroed bucket first: frames parked here were memset at free time, so
    * this fast path skips the per-allocation memset entirely — the zero-page
    * COW write path, calloc, and fresh anonymous pages all benefit. */
   if (pcp->zero_count > 0) {
     u64 frame = pcp->zero_head;
-    pcp->zero_head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
+    u64 *marker = (u64 *)(usize)(frame + DIRECT_MAP_BASE);
+
+    /* A page taken off this list must carry the mark that put it there. If it
+     * does not, the list is threaded through a page that no longer belongs to
+     * it — the frame ahead was handed out already, and following its first
+     * eight bytes leads anywhere. Stop here, where the frame and its history
+     * are still known, rather than in whoever writes to it next. */
+    if (marker[PMM_ZERO_MAGIC_OFF / 8] != PMM_ZERO_MAGIC) {
+      console_write("pmm: zero bucket holds an unmarked frame 0x");
+      console_write_hex64(frame);
+      console_write("\n");
+      pmm_report_page_table_history_pub(frame);
+      panic("pmm: per-CPU zero bucket corrupt");
+    }
+    pcp->zero_head = marker[0];
     pcp->zero_count--;
     /* Clear the "parked in zero bucket" marker so a later free of this page
      * is not mistaken for a double free. One store vs a full memset. */
     *(u64 *)(usize)(frame + DIRECT_MAP_BASE + PMM_ZERO_MAGIC_OFF) = 0;
     if (pmm.frame_refcounts) pmm.frame_refcounts[frame_index(frame)] = 1;
+    pmm_check_handout(frame);
+    spin_unlock(&pcp->lock);
     irq_restore(flags);
     return frame;  /* already zeroed by the scrubber / overflow promotion */
   }
@@ -1106,12 +1387,15 @@ u64 pmm_alloc_frame(void) {
     /* Set refcount=1 (transfer ownership from cache to caller). The frame is
      * already bitmap-USED from refill time, so no bitmap touch needed. */
     if (pmm.frame_refcounts) pmm.frame_refcounts[frame_index(frame)] = 1;
+    pmm_check_handout(frame);
+    spin_unlock(&pcp->lock);
     irq_restore(flags);
     /* Zero outside the cli window — memset can take a while and we don't
      * want to mask IRQs longer than necessary. */
     memset((void *)(usize)(frame + DIRECT_MAP_BASE), 0, PAGE_SIZE);
     return frame;
   }
+  spin_unlock(&pcp->lock);
   irq_restore(flags);
 
   /* Cache still empty after refill — global is truly out. Fall back to the
@@ -1170,7 +1454,8 @@ static u64 bitmap_scan_alloc(usize count) {
          * not a new complexity class. */
         if (buddy_ready) buddy_seed_from_bitmap();
         u64 frame = frame_from_index(run_start);
-        zero_frames(frame, count);
+        pmm_check_handout(frame);
+      zero_frames(frame, count);
         return frame;
       }
     } else {
@@ -1235,6 +1520,7 @@ u64 pmm_alloc_frames_below(usize count, u64 limit) {
       if (buddy_ready)
         buddy_seed_from_bitmap();
       frame = frame_from_index(run_start);
+      pmm_check_handout(frame);
       zero_frames(frame, count);
       break;
     }
@@ -1263,6 +1549,7 @@ u64 pmm_alloc_frames(usize count) {
     if (count == 1 && buddy_ready) {
       u64 frame = buddy_alloc(0);
       if (frame != 0) {
+        pmm_check_handout(frame);
         zero_frames(frame, 1);
         pmm_release(flags);
         if (reclaim_attempts == 0) {
@@ -1316,7 +1603,8 @@ u64 pmm_alloc_frames(usize count) {
             buddy_merge_insert(frame + e * PAGE_SIZE, 0);
           }
         }
-        zero_frames(frame, count);
+        pmm_check_handout(frame);
+      zero_frames(frame, count);
         pmm_release(flags);
         if (reclaim_attempts == 0) {
           /* Healthy fast-path success. After a stretch of these, the
@@ -1508,6 +1796,9 @@ void pmm_switch_to_direct_map(void) {
   }
   if (pmm.buddy_heads) {
     pmm.buddy_heads = (u8 *)((u64)(usize)pmm.buddy_heads + DIRECT_MAP_BASE);
+  }
+  if (pmm.pt_frames) {
+    pmm.pt_frames = (u8 *)((u64)(usize)pmm.pt_frames + DIRECT_MAP_BASE);
   }
   if (pmm.frame_refcounts) {
     pmm.frame_refcounts = (u16 *)((u64)(usize)pmm.frame_refcounts + DIRECT_MAP_BASE);

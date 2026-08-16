@@ -479,6 +479,14 @@ void scheduler_reap_dead_threads(void);
  * switched (and has since been resumed), 0 if nothing was runnable. An idle
  * loop uses the 0 return to drop the Big Kernel Lock before parking. */
 int scheduler_yield(void);
+
+/* Mark a kernel critical section that a fatal signal must not cut short.
+ *
+ * SIGKILL is acted on wherever the task happens to be, without unwinding, so a
+ * task killed while holding a device leaves it locked for good. Bracket such a
+ * section with these and the kill stays pending until it ends. */
+void scheduler_kcrit_enter(void);
+void scheduler_kcrit_leave(void);
 /* The shared runqueue of READY non-stealable tasks (scheduler.c). */
 struct runqueue *sched_global_rq(void);
 /* Initialise (and return) the dedicated idle task for AP `cpu` running on the
@@ -509,6 +517,18 @@ void scheduler_sync_brk(u64 pml4_phys, u64 heap_start, u64 brk);
 /* Publish the head of the mapping list to every thread sharing the address
  * space; they share the list, not the pointer to it. */
 void scheduler_sync_vma_head(u64 pml4_phys, struct vm_area *head);
+/* How many tasks other than the caller still run on this address space, and who
+ * the first of them is. Asked before the frames are recycled: a space freed
+ * while a thread is still executing in it turns into unrelated corruption much
+ * later, wherever the stale tables are walked next. */
+usize scheduler_address_space_users(u64 pml4_phys, usize *first_id,
+                                    const char **first_name);
+/* Print every task with its state, wait channel and the kernel return
+ * addresses still on its stack. For a run that stalls with nothing to read:
+ * started as a thread by b1nix.task-watch. */
+void scheduler_dump_tasks(void);
+/* Record the system call this task just entered, for that dump. */
+void task_note_syscall(u64 number);
 /* True when the current context may park on a wait channel (scheduler live, real
  * task context, interrupts enabled). Drivers fall back to polling when false. */
 int scheduler_can_block(void);
@@ -642,6 +662,15 @@ isize scheduler_getpgid(usize pid);
 void scheduler_mark_execed_current(void);
 int scheduler_is_pgrp_in_session(usize pgrp, usize session_id);
 u64 vm_find_free_area(struct task *t, usize length);
+/* Link a mapping into the task's list in address order. Every insertion goes
+ * through this: the order is what lets the free-area search run in one pass and
+ * lets a lookup stop early. */
+void vma_insert(struct task *t, struct vm_area *vma);
+/* The mapping covering an address, or NULL. Caches the last hit, so repeated
+ * faults in one mapping cost a comparison. */
+struct vm_area *vma_lookup(struct task *t, u64 addr);
+/* Drop that cache — required by anything that unlinks or frees a mapping. */
+void vma_cache_forget(struct task *t);
 struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr);
 void vma_delete_range(struct task *t, u64 start, u64 end);
 

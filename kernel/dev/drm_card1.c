@@ -25,6 +25,7 @@
 #include <lkpi/drm_bridge.h>
 #include <b1nix/console.h>
 #include <b1nix/drm.h>
+#include <b1nix/syscall.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/posix.h>
@@ -68,6 +69,16 @@ static int card1_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     lkpi_i915_dump_port_state_pub();
   }
 
+  /* Every ioctl on a render node, and what it answered.
+   *
+   * A client looking for a GPU opens renderD128 and asks for the driver version
+   * (DRM_IOCTL_VERSION, 0xc0406400); if that fails it moves on and reports it
+   * found no render node — which is what Chromium says here, with the node
+   * plainly present and openable. Only the ioctl's own result can say whether
+   * the request never arrived, was refused, or returned something unusable. */
+  int is_render = (h->node && h->node->inode &&
+                   h->node->inode->rdev == (((u64)226 << 8) | 128));
+
   u64 t0 = lkpi_monotonic_ns();
   /* An ioctl that never returns prints nothing at all, and "the compositor is
    * idle" and "the compositor is stuck inside the driver" look identical from
@@ -75,6 +86,46 @@ static int card1_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   lkpi_diag_watch_begin("drm ioctl", request & 0xffffffffu);
   isize rc = lkpi_drm_ioctl(h->private_data, request, arg);
   lkpi_diag_watch_end();
+  if (is_render && bootinfo_has_flag("b1nix.trace-sysfs")) {
+    char line[160];
+
+    /* Whose ioctl it is decides everything here. The node answers the version
+     * query correctly, and the browser still reports no render node — so either
+     * it is asking and rejecting the answer, or it never asks and something
+     * else (the compositor) is what we see. */
+    snprintf(line, sizeof(line), "drm: renderD128 ioctl %x -> %lld by %s\n",
+             (unsigned)(request & 0xffffffffu), (long long)rc,
+             current_task ? current_task->name : "?");
+    console_write(line);
+
+    /* DRM_IOCTL_VERSION succeeding is not the same as answering usefully.
+     * libdrm calls it twice — once to learn the string lengths, once to fill
+     * them — and a client drops the device when the driver name comes back
+     * empty. Print what we actually handed back. */
+    if ((request & 0xffffffffu) == 0xc0406400u && arg) {
+      struct {
+        int version_major, version_minor, version_patchlevel;
+        u64 name_len; char *name;
+        u64 date_len; char *date;
+        u64 desc_len; char *desc;
+      } v;
+
+      if (syscall_copyin(&v, arg, sizeof(v)) == 0) {
+        char nm[24] = {0};
+
+        if (v.name && v.name_len)
+          (void)syscall_copyin(nm, v.name,
+                               v.name_len < sizeof(nm) - 1 ? v.name_len
+                                                           : sizeof(nm) - 1);
+        snprintf(line, sizeof(line),
+                 "  version %d.%d.%d name_len %llu name \"%s\" desc_len %llu\n",
+                 v.version_major, v.version_minor, v.version_patchlevel,
+                 (unsigned long long)v.name_len, nm,
+                 (unsigned long long)v.desc_len);
+        console_write(line);
+      }
+    }
+  }
   /* Name any call that takes longer than a person would wait for a keypress.
    * Connector probing on this machine costs minutes somewhere, and knowing
    * which command spends them is the whole question. */
@@ -251,6 +302,20 @@ int drm_imported_card_open(const char *path, int flags) {
 
   void *file = 0;
   int rc = lkpi_drm_open(g_cards[idx].minor, lkpi_flags, &file);
+  /* Whether an open succeeded, and with which access mode.
+   *
+   * A client scanning for a GPU opens each node and moves on quietly when the
+   * open fails — so a node that opens read-only and refuses read-write is
+   * indistinguishable, from the outside, from a node that is not there. That is
+   * exactly the shape of "no render node found" beside a node that answers when
+   * asked directly. */
+  if (bootinfo_has_flag("b1nix.trace-sysfs")) {
+    char line[112];
+
+    snprintf(line, sizeof(line), "drm: open %s flags %x -> %d by %s\n", path,
+             (unsigned)flags, rc, current_task ? current_task->name : "?");
+    console_write(line);
+  }
   if (rc != 0)
     return rc;
 
@@ -342,4 +407,48 @@ void drm_card1_init(void) {
   }
   if (g_card_count == 0)
     return;
+
+  /*
+   * A render node for the first imported device.
+   *
+   * Userspace does not use a card node for drawing. Mesa and anything built on
+   * it open /dev/dri/renderD128 — the unprivileged half of a DRM device, with
+   * no modesetting and no authentication dance — and a program that cannot find
+   * one concludes there is no GPU to render with. Chromium says so plainly
+   * ("Failed to find drm render node path") and falls back to a path that never
+   * produces a window here.
+   *
+   * The node addresses the same device as card1; what a render node withholds
+   * is KMS, and the ioctls that matter for rendering are the ones it allows.
+   * Its device number is the render range's first minor (128), which is how
+   * libdrm recognises it as one — drmGetNodeTypeFromFd() reads exactly that.
+   */
+  if (g_card_count < DRM_IMPORTED_MAX) {
+    struct vfs_node *node =
+        vfs_add_node("/dev/dri/renderD128", VFS_DEVICE, 0, 0, 0);
+
+    if (node && !IS_ERR(node)) {
+      const char *path = "/dev/dri/renderD128";
+      char *p = g_cards[g_card_count].path;
+      usize n = 0;
+
+      while (path[n] && n + 1 < sizeof(g_cards[0].path)) {
+        p[n] = path[n];
+        n++;
+      }
+      p[n] = 0;
+
+      /* Rendering is what every graphical client does, so this one is not
+       * root-only the way a card node is. */
+      node->inode->mode = 0666;
+      node->inode->rdev = ((u64)226 << 8) | (u64)128;
+      node->inode->mmap_handle_page_phys_cb = card1_mmap_page_phys;
+      /* And in sysfs, where a graphics stack actually looks for it. */
+      drm_sysfs_publish_render(1, 128);
+      g_cards[g_card_count].node = node;
+      g_cards[g_card_count].minor = g_cards[0].minor;
+      g_card_count++;
+      console_write("drm: /dev/dri/renderD128 ready (render node for card1)\n");
+    }
+  }
 }

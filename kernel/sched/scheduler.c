@@ -278,6 +278,46 @@ static usize g_task_tgid[MAX_TASKS];
  * and overwrite its exit_group(0) code with SIGNALED|SIGKILL, so waitpid reports
  * a spurious signalled death (M29 stress-exit-code). */
 static u8    g_task_exiting[MAX_TASKS];
+
+/*
+ * Depth of kernel critical sections a task is inside — sections it must be
+ * allowed to finish even when a fatal signal arrives.
+ *
+ * A SIGKILL is acted on wherever the task happens to be, and the handler below
+ * marks it dead and returns rather than unwinding. That is fine in most places
+ * and catastrophic in a few: a task killed between virtio_blk_lock and
+ * virtio_blk_unlock never releases the device, and every later request — from
+ * every process — spins on a lock whose owner no longer exists. A browser that
+ * routinely kills its own helpers hits this window often enough that the whole
+ * system stops with the disk held by a dead thread.
+ *
+ * Linux avoids the problem by acting on fatal signals only at well-defined
+ * points (the return to user mode). This is the same idea, expressed as a
+ * counter: while it is non-zero the kill is left pending, and the section's own
+ * exit path delivers it.
+ */
+static u8    g_task_kcrit[MAX_TASKS];
+
+void scheduler_kcrit_enter(void) {
+  if (!current_task)
+    return;
+  usize idx = task_index(current_task);
+  if (idx < MAX_TASKS && g_task_kcrit[idx] < 255)
+    g_task_kcrit[idx]++;
+}
+
+void scheduler_kcrit_leave(void) {
+  if (!current_task)
+    return;
+  usize idx = task_index(current_task);
+  if (idx < MAX_TASKS && g_task_kcrit[idx])
+    g_task_kcrit[idx]--;
+}
+
+static int task_in_kcrit(struct task *t) {
+  usize idx = task_index(t);
+  return idx < MAX_TASKS && g_task_kcrit[idx] != 0;
+}
 static int   g_task_ctty_type[MAX_TASKS];
 static int   g_task_ctty_index[MAX_TASKS];
 /* M86: per-thread CPU accounting, in NANOSECONDS. The counters are advanced by
@@ -1816,6 +1856,15 @@ void task_set_user_rip(struct task *t, u64 rip) {
   if (!t) return;
   g_task_user_rip[task_index(t)] = rip;
 }
+/* The system call a task entered last, kept beside its user RIP and for the
+ * same reason: a thread that is RUNNING with an unchanging RIP is either
+ * looping in one call or making the same call over and over, and the dump
+ * cannot tell those apart without the number. */
+static u64 g_task_syscall[MAX_TASKS];
+void task_note_syscall(u64 number) {
+  if (current_task)
+    g_task_syscall[task_index(current_task)] = number;
+}
 /* ── M86: per-thread CPU time ─────────────────────────────────────────────── */
 /* Nanosecond accessors are the primitives; the tick accessors (clock_t at the
  * 100 Hz USER_HZ times(2)/procfs report in) are derived from them. */
@@ -1881,12 +1930,23 @@ u64 task_start_ticks(const struct task *t) {
 /* Measure this task's resident set and fold it into the peak. `force` skips the
  * per-tick rate limit — used on the paths that are about to drop pages, where
  * the sample IS the peak. Returns the peak in pages. */
+/* How often an unforced sample may walk the address space, in ticks.
+ *
+ * The walk visits every page of every mapping and asks the tables about each
+ * one. For a browser that is millions of lookups, and the unforced callers are
+ * mmap/munmap/mremap — so a program allocating steadily paid that walk up to a
+ * hundred times a second, to maintain a peak figure nobody reads until
+ * getrusage asks. Once a second is plenty for a high-water mark; getrusage and
+ * the procfs reader still force an exact one. */
+#define RSS_SAMPLE_INTERVAL_TICKS 100
+
 u64 task_rss_sample(struct task *t, int force) {
   if (!t)
     return 0;
   usize idx = task_index(t);
   u64 now = scheduler_ticks;
-  if (!force && g_task_rss_sample_tick[idx] == now)
+  if (!force && g_task_rss_sample_tick[idx] &&
+      now - g_task_rss_sample_tick[idx] < RSS_SAMPLE_INTERVAL_TICKS)
     return g_task_maxrss_pages[idx];
   g_task_rss_sample_tick[idx] = now;
   u64 resident = 0;
@@ -3113,6 +3173,37 @@ void scheduler_sync_brk(u64 pml4_phys, u64 heap_start, u64 brk) {
     t->user_brk = brk;
   }
   tasks_unlock(flags);
+}
+
+usize scheduler_address_space_users(u64 pml4_phys, usize *first_id,
+                                    const char **first_name) {
+  u64 flags;
+  usize count = 0;
+
+  if (!pml4_phys)
+    return 0;
+  tasks_lock(&flags);
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+
+    if (t == current_task || t->pml4_phys != pml4_phys)
+      continue;
+    /* A task past TASK_DEAD no longer executes: its address space is exactly
+     * what the caller is here to release. Only a task that can still be
+     * scheduled counts as a user. */
+    if (t->state == TASK_UNUSED || t->state == TASK_DEAD ||
+        t->state == TASK_REAPING)
+      continue;
+    if (count == 0) {
+      if (first_id)
+        *first_id = t->id;
+      if (first_name)
+        *first_name = t->name;
+    }
+    count++;
+  }
+  tasks_unlock(flags);
+  return count;
 }
 
 int scheduler_wait_armed(void) {
@@ -4622,8 +4713,53 @@ void scheduler_dump_tasks(void) {
       console_write(g_task_lease_site[i] ? g_task_lease_site[i] : "-");
       /* User RIP at last timer-tick preemption: names the user function a
        * wedged (spinning) thread group is stuck in. 0 for kernel tasks. */
+      /* Peak resident pages, as already sampled — printed, never recomputed:
+       * the walk behind it is expensive and this dump runs on a timer. It is
+       * what says whether a run that fills memory is filling it inside one
+       * process or spreading it across many. */
+      console_write(" rsskb=");
+      console_write_dec(g_task_maxrss_pages[i] * 4);
+      console_write(" sys=");
+      console_write_dec(g_task_syscall[i]);
       console_write(" user_rip=0x");
       console_write_hex64(g_task_user_rip[i]);
+      /* Which mapping that address is in, and how far into it. A bare address
+       * says nothing when everything is loaded above 0x700000000000 — the same
+       * number could be the loader, the C library or a 30 MB renderer. */
+      if (g_task_user_rip[i]) {
+        for (struct vm_area *v = T(i)->vma_list; v; v = v->next) {
+          if (g_task_user_rip[i] >= v->start && g_task_user_rip[i] < v->end) {
+            console_write(" in=");
+            console_write(v->node && v->node->name[0] ? v->node->name
+                                                      : "<anonymous>");
+            console_write("+0x");
+            console_write_hex64(g_task_user_rip[i] - v->start);
+            break;
+          }
+        }
+      }
+      /* The kernel return addresses still on the task's stack. A blocked task
+       * left them there, so they name the path that put it to sleep — which is
+       * the one thing state and wait channel together still do not say. */
+      if (T(i) != current_task && T(i)->context.rsp) {
+        extern char __kernel_text_start[], __kernel_text_end[];
+        u64 lo = (u64)(usize)__kernel_text_start;
+        u64 hi = (u64)(usize)__kernel_text_end;
+        const u64 *stack = (const u64 *)(usize)T(i)->context.rsp;
+        unsigned printed = 0;
+
+        console_write(" callers=");
+        for (unsigned w = 0; w < 96 && printed < 5; w++) {
+          u64 v = stack[w];
+
+          if (v >= lo && v < hi) {
+            console_write("0x");
+            console_write_hex64(v);
+            console_write(",");
+            printed++;
+          }
+        }
+      }
       console_write("\t");
       console_write(T(i)->name);
       console_write("\n");
@@ -5646,7 +5782,20 @@ sighandler_t scheduler_get_sighandler(int sig) {
 usize scheduler_get_pid(void) {
   if (!current_task)
     return 0;
-  return current_task->id;
+  /* getpid() is the process, not the thread.
+   *
+   * Returning the caller's own id gave every thread a different "pid", which
+   * is what made tgkill fail: the sender passes getpid() as the thread group
+   * and the kernel compares it against the target's real group, so from any
+   * thread but the first they never matched and the signal came back ESRCH —
+   * seen as a stream of "tgkill: No such process" from chromium's crash
+   * handler. Programs also cache this value and check it after forking, and
+   * name their IPC endpoints with it.
+   *
+   * gettid() remains the thread's own id; the two are separate calls. */
+  usize tgid = task_tgid(current_task);
+
+  return tgid ? tgid : current_task->id;
 }
 
 struct cred *scheduler_get_current_cred(void) {
@@ -5687,6 +5836,67 @@ u64 scheduler_brk_get(void) {
   return current_task->user_brk;
 }
 
+/* Link a mapping into the list, in address order.
+ *
+ * The list used to be in reverse-insertion order, and everything that walks it
+ * paid for that: the free-area search could not trust a single pass and went
+ * quadratic (see below), and every fault's lookup had to walk to the end. One
+ * insertion point keeps the order, and then a walk can stop at the first
+ * mapping that starts past the address it wants.
+ */
+void vma_insert(struct task *t, struct vm_area *vma) {
+  if (!t || !vma)
+    return;
+
+  struct vm_area **link = &t->vma_list;
+
+  while (*link && (*link)->start < vma->start)
+    link = &(*link)->next;
+  vma->next = *link;
+  *link = vma;
+  /* Only a new head has to be published to the threads sharing this address
+   * space — they hold the head pointer, not the list. Publishing on every
+   * insertion would walk the whole task table per mmap. */
+  if (link == &t->vma_list)
+    scheduler_sync_vma_head(t->pml4_phys, t->vma_list);
+}
+
+/* The mapping covering an address, or NULL.
+ *
+ * Sorted order means the walk stops at the first mapping that starts past the
+ * address, and a one-entry cache turns the common case — repeated faults in
+ * the mapping just used — into a pointer comparison. chromium runs with
+ * thousands of mappings, and every fault used to walk them.
+ */
+static struct vm_area *g_vma_cache[MAX_TASKS];
+
+struct vm_area *vma_lookup(struct task *t, u64 addr) {
+  if (!t)
+    return 0;
+
+  usize slot = task_index(t);
+  struct vm_area *hit = g_vma_cache[slot];
+
+  /* The cached mapping is only trusted while it is still in this task's list;
+   * a freed one would be a use-after-free, so the cache is cleared by every
+   * path that unlinks (vma_cache_forget). */
+  if (hit && addr >= hit->start && addr < hit->end)
+    return hit;
+
+  for (struct vm_area *v = t->vma_list; v && v->start <= addr; v = v->next) {
+    if (addr < v->end) {
+      g_vma_cache[slot] = v;
+      return v;
+    }
+  }
+  return 0;
+}
+
+void vma_cache_forget(struct task *t) {
+  if (t)
+    g_vma_cache[task_index(t)] = 0;
+}
+
 u64 vm_find_free_area(struct task *t, usize length) {
 #ifdef __x86_64__
   /* The bootstrap identity map occupies the low 4 GiB with huge pages.
@@ -5702,47 +5912,32 @@ u64 vm_find_free_area(struct task *t, usize length) {
 #endif
 
   /*
-   * First fit, over a list that is not sorted by address.
+   * First fit over a list kept in address order: walk the mappings once and
+   * take the first gap that is big enough.
    *
-   * The obvious single pass is wrong here, and was: it accepted a candidate as
-   * soon as one VMA started above it, which says nothing about the VMAs still
-   * ahead in a list held in reverse-insertion order. A mapping placed early and
-   * linked late was invisible, so mmap handed back an address already in use —
-   * and the caller's write went straight through someone else's memory.
-   *
-   * What that looked like from userspace: a compositor with a hundred mappings
-   * crashing inside malloc(), deterministically, on a pointer that had been
-   * zeroed. musl keeps its allocator metadata in mmap'd pages, and one of them
-   * had been handed out twice.
-   *
-   * So a candidate is only accepted once a whole pass has found nothing
-   * overlapping it. Each conflict pushes the candidate past the offending VMA,
-   * so it strictly increases and the search terminates; the cost is quadratic
-   * in the number of mappings, which for the few hundred a process has is far
-   * cheaper than keeping the list sorted everywhere else.
+   * This used to be quadratic, and deliberately so — the list was in
+   * reverse-insertion order, where a single pass proves nothing (a mapping
+   * placed early and linked late is invisible ahead of the candidate), and
+   * accepting a candidate too early handed out an address already in use. What
+   * that looked like from userspace was a compositor crashing inside malloc()
+   * on metadata that had been given to someone else. With vma_insert keeping
+   * the order, one pass is sound: every mapping that could overlap has already
+   * been seen when the walk passes it.
    */
   u64 candidate = start;
 
-  for (;;) {
-    struct vm_area *conflict = 0;
-
+  for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
+    if (vma->end <= candidate)
+      continue; /* entirely below the candidate */
+    if (vma->start >= candidate + length)
+      break;    /* the gap before this mapping is big enough */
+    candidate = vma->end;
     if (candidate + length > end || candidate + length < candidate)
       return (u64)-1;
-
-    for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
-      if (vma->end <= candidate || vma->start >= candidate + length)
-        continue;
-      /* Overlaps. Take the furthest end among the conflicts so a pass makes as
-       * much progress as it can. */
-      if (!conflict || vma->end > conflict->end)
-        conflict = vma;
-    }
-
-    if (!conflict)
-      return candidate;
-
-    candidate = conflict->end;
   }
+  if (candidate + length > end || candidate + length < candidate)
+    return (u64)-1;
+  return candidate;
 }
 
 struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr) {
@@ -5793,6 +5988,8 @@ void vma_delete_range(struct task *task, u64 start, u64 end) {
 
     /* Now vma is entirely within [start, end] */
     *curr = vma->next;
+    /* The lookup cache may be pointing at what is about to be freed. */
+    vma_cache_forget(task);
     if (vma->node) {
       if (vma->node->inode && vma->node->inode->mmap_close_cb)
         vma->node->inode->mmap_close_cb(vma->node);
@@ -6051,6 +6248,10 @@ void scheduler_deliver_pending_signals(void) {
     }
 
     if (sig == SIGKILL) {
+      /* Not while the task holds a driver's critical section — see g_task_kcrit.
+       * The signal stays pending and is acted on once the section is left. */
+      if (task_in_kcrit(current_task))
+        return;
       current_task->exit_code = TASK_EXIT_SIGNALED | SIGKILL;
       terminate_group_siblings(current_task);
       /* Reparent children + signal newly-orphaned stopped pgrps and drop our

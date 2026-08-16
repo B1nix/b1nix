@@ -102,8 +102,13 @@ void dma_buf_put(struct dma_buf *dmabuf)
 
 void get_dma_buf(struct dma_buf *dmabuf)
 {
+	/* Takes a reference to the buffer's file. It does NOT open a second one:
+	 * dma_buf_put drops a reference, and the two have to be the same file for
+	 * the buffer to ever reach a refcount of zero. Cloning here also handed the
+	 * clone path an anon-inode file to reinterpret as a DRM file, which is what
+	 * faulted the first time a compositor exported a buffer through PRIME. */
 	if (dmabuf && dmabuf->file)
-		file_clone_open(dmabuf->file);
+		atomic64_inc(&dmabuf->file->f_count);
 }
 
 struct dma_buf_attachment *dma_buf_attach(struct dma_buf *dmabuf,

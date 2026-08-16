@@ -16,7 +16,18 @@
  * entry pool and big machines aren't starved. ~1 entry per 512 KiB of usable
  * RAM, clamped to [MIN, MAX]. */
 #define CACHE_ENTRIES_MIN 64
-#define CACHE_ENTRIES_MAX 8192
+/* The ceiling, not the scaling rule, is what decided this pool's size.
+ *
+ * Entries scale with RAM, but 8192 of them is 4 MiB of cache — on an 8 GiB
+ * machine, 0.05% of memory — and everything above that ceiling went to the
+ * disk every time. Measured on a browser start: 20000 requests, 96% of which
+ * had to wait, 34 seconds spent waiting. A working set of a few hundred MiB
+ * (one Chromium binary is 220 MiB) cannot even begin to stay resident.
+ *
+ * 65536 entries is 32 MiB — still well under 1% of an 8 GiB guest, and the
+ * per-RAM rule below keeps small guests small: it reaches this ceiling only at
+ * 8 GiB, and a 512 MiB self-host guest still gets the same 4 MiB it had. */
+#define CACHE_ENTRIES_MAX 65536
 #define CACHE_BLOCK_SIZE 512
 
 /* Read-ahead window (sectors) pulled in ONE device command on a cache miss.
@@ -64,7 +75,11 @@ static spinlock_t bcache_lock = SPINLOCK_INIT;
  * per cache lookup, and dominated gcc execve wall-clock (turning a 5 s
  * binary load into a 30 s one). Hash sized so average chain length stays
  * below ~8 even at CACHE_ENTRIES_MAX. */
-#define BCACHE_HASH_BITS 10
+/* Sized against CACHE_ENTRIES_MAX so the average chain stays short: 16384
+ * buckets for at most 65536 entries is ~4 per chain. At 10 bits the enlarged
+ * pool would have averaged 64 comparisons per lookup and given back in search
+ * time what the extra cache saved in I/O. */
+#define BCACHE_HASH_BITS 14
 #define BCACHE_HASH_SIZE (1u << BCACHE_HASH_BITS)
 #define BCACHE_HASH_MASK (BCACHE_HASH_SIZE - 1u)
 static i32 bcache_hash[BCACHE_HASH_SIZE];
@@ -618,7 +633,10 @@ const char *blk_probe_fstype(struct block_device *dev) {
 void blk_cache_init(void) {
   /* Scale pool to RAM: ~1 entry per 512 KiB of usable memory, clamped. */
   u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
-  usize want = (usize)(ram_mb * 2);  /* 1 entry per 512 KiB = 2 per MiB */
+  /* 8 entries per MiB of RAM — 4 KiB of cache per MiB, i.e. 0.4% of memory.
+   * At 2 per MiB the pool stayed at 4 MiB on any machine large enough for the
+   * ceiling to matter, which is where the 96%-miss measurement came from. */
+  usize want = (usize)(ram_mb * 8);
   if (want < CACHE_ENTRIES_MIN) want = CACHE_ENTRIES_MIN;
   if (want > CACHE_ENTRIES_MAX) want = CACHE_ENTRIES_MAX;
   block_cache_n = want;
@@ -1135,7 +1153,13 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
  * blocks never pile up unbounded (the writer is throttled by doing some of the
  * writeback itself, like Linux balance_dirty_pages). */
 #define BCACHE_FLUSH_RUN     512  /* max sectors coalesced into one command (256 KiB) */
-#define BCACHE_DIRTY_THROTTLE 256 /* dirty writes between proactive drains */
+/* Dirty writes between proactive drains — a FRACTION of the pool, not a fixed
+ * count. 256 was chosen against an 8192-entry cache (3% of it); left constant
+ * after the pool grew to 65536 it throttles the writer eight times more often
+ * than intended, and the writer pays that cost inline. Measured on a browser
+ * start, the main thread sat in bcache_flush_some issuing device commands
+ * instead of making progress. */
+#define BCACHE_DIRTY_THROTTLE (block_cache_n / 32u)
 
 static volatile int bcache_flushing; /* re-entrancy guard (kmalloc may reclaim) */
 
@@ -1283,10 +1307,13 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
    * eviction). The writer pays some writeback cost here — that IS the throttle.
    * Counter is a heuristic; an SMP race only shifts the drain cadence. */
   static u32 dirty_writes;
+  u32 throttle = BCACHE_DIRTY_THROTTLE;
+  if (throttle < 256u)
+    throttle = 256u; /* tiny guests keep the original cadence */
   dirty_writes += count;
-  if (dirty_writes >= BCACHE_DIRTY_THROTTLE) {
+  if (dirty_writes >= throttle) {
     dirty_writes = 0;
-    bcache_flush_some(BCACHE_DIRTY_THROTTLE * 2);
+    bcache_flush_some(throttle * 2u);
   }
   return 0;
 }

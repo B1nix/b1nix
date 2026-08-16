@@ -57,6 +57,9 @@ void lkpi_drm_file_set_handle(void *file, void *handle);
 /* An independent second file on the same DRM device, for a lease. NULL on
  * failure. */
 void *lkpi_drm_clone_file(void *file);
+/* True only for a file opened on a DRM minor. Ask before treating a file's
+ * private_data as a struct drm_file. */
+int lkpi_drm_file_is_drm(void *file);
 /* The minor a DRM file belongs to; 0 when the file is not a DRM file. */
 int lkpi_drm_file_minor(void *file, u32 *out);
 

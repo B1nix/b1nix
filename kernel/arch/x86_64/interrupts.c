@@ -205,6 +205,14 @@ void x86_idt_init(void) {
   for (u8 i = 0; i < 32; i++) {
     idt_set_gate(i, handlers[i]);
   }
+  /* #BP and #OF are the two exceptions a program raises on purpose, with int3
+   * and into. Their gates need DPL=3 or the instruction faults as #GP with the
+   * IDT index in the error code instead of trapping — which is what chromium's
+   * BreakDebugger looked like here: a general protection fault at error 0x1a,
+   * naming IDT vector 3, with no hint that the program had asked for a
+   * breakpoint. Linux gives these two gates DPL=3 for the same reason. */
+  idt[3].type_attr = IDT_INTERRUPT_GATE | 0x60;
+  idt[4].type_attr = IDT_INTERRUPT_GATE | 0x60;
   /* #DF runs on IST1, a per-CPU stack the TSS points at (x86_tss_init_cpu).
    * Without it, a fault that hit BECAUSE the kernel stack was unusable (stack
    * overflow, corrupted RSP) re-faults while pushing the #DF frame onto that
@@ -698,8 +706,31 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   if (frame->vector == 14) {
     u64 fault_addr = read_cr2();
     u64 error_code = frame->error_code;
+    /* Handle the fault with interrupts as the faulting code had them.
+     *
+     * The gate clears IF, and demand paging is not a short handler: it takes
+     * the page-cache lock and can wait on a disk read. Spinning for that lock
+     * with IF clear on every CPU is a deadlock with no way out — the CPU that
+     * holds it is blocked on I/O and can never be rescheduled, because no CPU
+     * can take a timer tick. Observed with two vCPUs both stopped in
+     * page_cache_get_page, RFLAGS=0x2.
+     *
+     * CR2 is already read, so nothing here depends on the fault registers
+     * staying untouched. A fault taken with IF already clear came from code
+     * holding an irqsave lock, and that state is left exactly as it was.
+     * Interrupts go back off before the return so the iretq below restores
+     * the frame's own flags rather than ours. */
+    int restore_irqs = (frame->rflags & (1ull << 9)) != 0;
 
-    if (vmm_handle_page_fault(fault_addr, error_code) == 0) {
+    if (restore_irqs)
+      __asm__ volatile("sti");
+
+    int handled = vmm_handle_page_fault(fault_addr, error_code) == 0;
+
+    if (restore_irqs)
+      __asm__ volatile("cli");
+
+    if (handled) {
       if (frame->cs == 0x1B || frame->cs == 0x23) {
         arch_check_and_deliver_signals(frame);
       }
@@ -1061,6 +1092,9 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     case 4:
       sig = SIGILL;
       break; /* #OF overflow */
+    case 3:
+      sig = SIGTRAP;
+      break; /* #BP int3 — a debugger trap, not a fault */
     case 5:
       sig = SIGSEGV;
       break; /* #BR bound range */
@@ -1167,6 +1201,20 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     console_write_dec(sig);
     console_write(") at rip=0x");
     console_write_hex64(frame->rip);
+    /* For a fault signal, the address is the whole story: rip says which
+     * instruction, and only the faulting address and its page-table entry say
+     * why it was refused. A write to a page that is present but read-only and
+     * a write to nothing at all are the same signal and different bugs. */
+    if (sig == SIGSEGV || sig == SIGBUS) {
+      extern u64 vmm_query_leaf_pte(u64 vaddr);
+      u64 cr2;
+
+      __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
+      console_write(" addr=0x");
+      console_write_hex64(cr2);
+      console_write(" pte=0x");
+      console_write_hex64(vmm_query_leaf_pte(cr2 & ~(u64)0xfff));
+    }
     console_write(" — terminating\n");
     /* M35: dump an ELF core for the fault-generating signals before the task
      * is torn down (its address space is still live here). */

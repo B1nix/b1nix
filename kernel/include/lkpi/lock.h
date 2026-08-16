@@ -43,6 +43,9 @@ struct lkpi_spinlock {
 	 */
 	u64 acquired_at;
 	int owner_cpu;
+	/* Task that took it, so a report can tell a driver nesting the lock from
+	 * a holder that lost the CPU while holding it. */
+	u64 owner_task;
 };
 
 void lkpi_spin_lock_init(struct lkpi_spinlock *l);

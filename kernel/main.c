@@ -324,6 +324,19 @@ static void port_watch_thread(void *arg)
 
 /* Names a call into the imported DRM core that has not come back. Its only
  * caller is the DRM debug path below; see lkpi_diag_watch_report(). */
+/* Everything the scheduler knows, every half minute. For a run where a
+ * userspace program stops making progress and says nothing: the task list with
+ * each task's wait channel and kernel callers is usually enough to name what
+ * it is waiting for. */
+static void task_watch_thread(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		scheduler_sleep_ticks(3000); /* thirty seconds */
+		scheduler_dump_tasks();
+	}
+}
+
 static void drm_stuck_watch_thread(void *arg)
 {
 	extern int lkpi_diag_watch_report(u64 min_ms) __attribute__((weak));
@@ -904,6 +917,9 @@ void kernel_main(usize arg0, usize arg1)
 	 * files live (kernel.osrelease → /sys/kernel/osrelease). */
 	vfs_symlink("/sys", "/proc/sys");
 #endif
+	if (bootinfo_has_flag("b1nix.task-watch") &&
+	    kthread_create("task-watch", task_watch_thread, 0) < 0)
+		console_write("task-watch: thread refused\n");
 	console_write("Step 11: Drivers initialized\n");
 
 	/* Bring up Application Processors */

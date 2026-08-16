@@ -90,5 +90,18 @@ programs      zsh curl libcurl samurai bmake dropbear dropbear-ssh \
               font-dejavu xkeyboard-config xwayland \
               mesa-egl mesa-gles mesa-gbm mesa-gl mesa-glapi
 
+# The browser. Baked into the image at build time rather than installed in the
+# guest: the closure is ~175 packages and installing it over the network inside
+# b1nix took longer than the hour a passthrough run gets. Off by default
+# (B1NIX_BROWSER=1) because it is half a gigabyte that only the browser runs
+# need. mesa-dri-gallium is skipped deliberately — see the note above; chromium
+# runs with --disable-gpu, and pulling it would add 184 MB of driver and LLVM
+# for hardware rendering this image cannot do yet. chromium-swiftshader is the
+# 4 MB answer instead: --disable-gpu does not stop chromium starting a GPU
+# process, that process needs a working EGL, and with no driver under libEGL it
+# died with "Initialization of all EGL display types failed" and no window ever
+# appeared.
+browser       chromium chromium-swiftshader
+
 # The curl library, for what links against it rather than runs it (NetSurf).
 curlbuild     libcurl curl-dev curl-static

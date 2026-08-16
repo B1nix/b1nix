@@ -15,6 +15,16 @@ struct vfs_inode;
  * is already unlinked from the hash and LRU; the last page_cache_put_page frees
  * its frame and defers the entry itself. */
 #define PAGE_CACHE_ORPHAN   8
+/* Touched since eviction last looked at it.
+ *
+ * A hit used to unlink the entry and re-link it at the MRU end of a list —
+ * four pointer writes plus the LRU's lock, on the hottest path there is (every
+ * mapped page of every executable passes through it). Instead a hit sets this
+ * bit and nothing else; eviction reads it, clears it, and gives that entry a
+ * second chance rather than taking it. The order degrades from exact LRU to
+ * "not used since the last sweep", which is the trade every real page cache
+ * makes for the same reason. */
+#define PAGE_CACHE_REFERENCED 16
 
 struct page_cache_entry {
   struct vfs_inode *inode;
