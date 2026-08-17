@@ -314,7 +314,53 @@ static void dh6_apply_lease(const struct dh6_parsed *p)
 }
 
 /* Inbound datagram on UDP port 546. */
+/* Mutual exclusion for the client state below.
+ *
+ * Three paths reach this state and two of them run on different CPUs at the
+ * same time: net_task calls dhcpv6_tick() out of the poll loop and delivers
+ * received datagrams, while the boot-time self-test drives the same state
+ * machine directly from the init task. Nothing serialised them, so a tick
+ * could read dh6_state while the other side was writing it. The switch in
+ * dhcpv6_tick compiles to a jump table, and an out-of-range state index there
+ * is not a wrong branch — it is a jump to an address that is not code. That is
+ * what wedged the sys smoke instance, reporting a different exception each run
+ * depending on where the wild jump landed.
+ *
+ * A plain flag rather than a spinlock, because these paths transmit: dh6_send
+ * goes down through UDP to the driver, and holding a lock across that would
+ * put a sleep under a spinlock. Nothing here has to wait, either — a tick that
+ * finds the state busy skips this round, and this is a retransmit timer whose
+ * whole job is to come back. A datagram dropped the same way is one DHCP will
+ * send again. */
+static volatile int dh6_busy;
+
+static int dh6_enter(void)
+{
+	return __atomic_exchange_n(&dh6_busy, 1, __ATOMIC_ACQUIRE) == 0;
+}
+
+static void dh6_leave(void)
+{
+	__atomic_store_n(&dh6_busy, 0, __ATOMIC_RELEASE);
+}
+
+static void dh6_receive_locked(struct in6_addr_k src, const void *data,
+                               usize size);
+static void dhcpv6_tick_locked(u64 now_ticks);
+static void dhcpv6_start_locked(void);
+static void dhcpv6_init_locked(void);
+
+/* The UDP handler entry: takes the guard, then runs the state machine. */
 static void dh6_receive(struct in6_addr_k src, const void *data, usize size)
+{
+	if (!dh6_enter())
+		return;
+	dh6_receive_locked(src, data, size);
+	dh6_leave();
+}
+
+static void dh6_receive_locked(struct in6_addr_k src, const void *data,
+                               usize size)
 {
 	(void)src;
 	if (!dh6_enabled || dh6_state == DH6_ST_IDLE)
@@ -362,7 +408,18 @@ static void dh6_receive(struct in6_addr_k src, const void *data, usize size)
 	}
 }
 
+/* Public entry, guarded like the others. Waits rather than skips: unlike a
+ * Solicit, initialisation is not something a later packet will trigger again —
+ * if it is skipped the client never comes up at all. */
 void dhcpv6_init(void)
+{
+	while (!dh6_enter())
+		scheduler_yield();
+	dhcpv6_init_locked();
+	dh6_leave();
+}
+
+static void dhcpv6_init_locked(void)
 {
 	dh6_state = DH6_ST_IDLE;
 	dh6_have_addr = 0;
@@ -381,12 +438,24 @@ void dhcpv6_stop(void)
 	dh6_have_addr = 0;
 }
 
-/* Start (or restart) a Solicit exchange. Called when a router advertisement
- * sets the Managed flag, or on demand. */
+/* Public entry: a router advertisement with the Managed flag reaches this from
+ * net_task, so it needs the guard like any other outside caller. Skipping when
+ * the state is busy is safe — an RA that means to start the client is repeated,
+ * and the internal callers below already hold the guard and use the unlocked
+ * form. */
 void dhcpv6_start(void)
 {
+	if (!dh6_enter())
+		return;
+	dhcpv6_start_locked();
+	dh6_leave();
+}
+
+/* Start (or restart) a Solicit exchange. Caller holds the guard. */
+static void dhcpv6_start_locked(void)
+{
 	if (!dh6_enabled)
-		dhcpv6_init();
+		dhcpv6_init_locked();
 	if (dh6_state == DH6_ST_BOUND)
 		return;
 	dh6_new_xid();
@@ -396,6 +465,14 @@ void dhcpv6_start(void)
 }
 
 void dhcpv6_tick(u64 now_ticks)
+{
+	if (!dh6_enter())
+		return; /* another path owns the state — retry next tick */
+	dhcpv6_tick_locked(now_ticks);
+	dh6_leave();
+}
+
+static void dhcpv6_tick_locked(u64 now_ticks)
 {
 	if (!dh6_enabled || dh6_state == DH6_ST_IDLE)
 		return;
@@ -439,7 +516,7 @@ void dhcpv6_tick(u64 now_ticks)
 			route6_del(dh6_addr, 128, zero);
 			dh6_have_addr = 0;
 			net_set_ip6(zero);
-			dhcpv6_start();
+			dhcpv6_start_locked();
 		} else if (now_ticks - dh6_last_tx_ticks >= 1000) {
 			dh6_send(DH6_REBIND, 0, 1);
 		}
@@ -477,12 +554,21 @@ void dhcpv6_smoke(void)
 	from.bytes[1] = 0x80;
 	from.bytes[15] = 0x02;
 
+	/* Hold the state for the whole test. Every step below reads a value the
+	 * previous one set, so a tick from net_task landing in the middle would
+	 * not just perturb a check — it would be writing the state this thread is
+	 * walking. Spin rather than skip: the test runs once, at boot, and has to
+	 * run. */
+	while (!dh6_enter())
+		scheduler_yield();
+
 	int was_enabled = dh6_enabled;
-	dhcpv6_init();
-	dhcpv6_start();
+	dhcpv6_init_locked();
+	dhcpv6_start_locked();
 
 	if (dh6_state != DH6_ST_SOLICIT) {
 		console_write("M84-DHCP6: FAIL solicit\n");
+		dh6_leave();
 		return;
 	}
 	console_write("M84-DHCP6: ok solicit\n");
@@ -528,7 +614,7 @@ void dhcpv6_smoke(void)
 	len = dh6_test_put_opt(adv, len, DH6_OPT_SERVERID, srv_duid,
 	                       sizeof(srv_duid));
 	len = dh6_test_put_opt(adv, len, DH6_OPT_IA_NA, ia, sizeof(ia));
-	dh6_receive(from, adv, len);
+	dh6_receive_locked(from, adv, len);
 
 	if (dh6_state == DH6_ST_REQUEST && dh6_serverid_len == sizeof(srv_duid) &&
 	    memcmp(dh6_serverid, srv_duid, sizeof(srv_duid)) == 0)
@@ -548,7 +634,7 @@ void dhcpv6_smoke(void)
 	                       sizeof(srv_duid));
 	len = dh6_test_put_opt(rep, len, DH6_OPT_IA_NA, ia, sizeof(ia));
 	len = dh6_test_put_opt(rep, len, DH6_OPT_DNS, dns6.bytes, 16);
-	dh6_receive(from, rep, len);
+	dh6_receive_locked(from, rep, len);
 
 	struct in6_addr_k nh;
 	u16 fl = 0;
@@ -570,7 +656,7 @@ void dhcpv6_smoke(void)
 
 	/* T1 expiry must move the client into RENEW. */
 	dh6_t1_ticks = scheduler_get_uptime_ticks();
-	dhcpv6_tick(scheduler_get_uptime_ticks() + 1);
+	dhcpv6_tick_locked(scheduler_get_uptime_ticks() + 1);
 	if (dh6_state == DH6_ST_RENEW)
 		console_write("M84-DHCP6: ok renew\n");
 	else
@@ -586,7 +672,7 @@ void dhcpv6_smoke(void)
 	put16(bad + 4, DH6_OPT_IA_NA);
 	put16(bad + 6, 200); /* length past the end of the buffer */
 	u32 before = dh6_replies_seen;
-	dh6_receive(from, bad, 8);
+	dh6_receive_locked(from, bad, 8);
 	if (dh6_replies_seen == before)
 		console_write("M84-DHCP6: ok malformed-rejected\n");
 	else
@@ -600,4 +686,6 @@ void dhcpv6_smoke(void)
 	dhcpv6_stop();
 	if (!was_enabled)
 		dh6_enabled = 0;
+
+	dh6_leave();
 }

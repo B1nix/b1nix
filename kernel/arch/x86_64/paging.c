@@ -1,4 +1,5 @@
 #include <b1nix/console.h>
+#include <b1nix/user.h>
 #include <b1nix/lockdep.h>
 #include <b1nix/sched.h>
 #include <b1nix/mm.h>
@@ -81,6 +82,16 @@ static void write_cr3(u64 value) {
 
 void paging_switch_address_space(u64 pml4_phys) {
   u64 target_phys = pml4_phys ? pml4_phys : kernel_pml4_phys;
+
+  /* Always write CR3, even when it already holds this value.
+   *
+   * Skipping the write when the PML4 address matches looks safe and is not:
+   * a physical frame that held one process's PML4 can be freed and handed to
+   * the next process for its own PML4. The address then matches while the
+   * table behind it is a different address space entirely, and skipping the
+   * write leaves the TLB full of the dead process's translations. Tried, and
+   * it panicked with a page-table entry out of range. The flush is the price
+   * of the guarantee. */
   __asm__ volatile("mov %0, %%cr3" : : "r"(target_phys) : "memory");
 }
 
@@ -869,11 +880,33 @@ void vmm_set_lazy(u64 virtual_address) {
     return;
   u64 *pt = table_from_entry(pde);
 
-  /* Only mark an entry that is still empty. Another CPU may have mapped this
-   * page for real while we walked, and LAZY over a live mapping loses it. */
-  u64 zero = 0;
-  __atomic_compare_exchange_n(&pt[pt_index(virtual_address)], &zero, VMM_LAZY, 0,
-                              __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+  /* Only mark an entry that is empty, or that is the kernel's own identity
+   * mapping of this very address.
+   *
+   * "Empty" alone was wrong for every load base inside the low 4 GiB. The split
+   * above does not leave holes: it fills all 512 leaves with the identity
+   * mapping the 2 MiB entry used to describe, so the leaf is present, not zero,
+   * and the marker was never installed. The caller then set the user bit on
+   * that leaf — handing the process a writable mapping of the kernel's own
+   * physical memory. A static binary loaded at 0x200000 was given the frames
+   * the kernel image occupies: its output arrived as garbage because the loader
+   * had overwritten kernel .text, and its exit handed those frames back to the
+   * allocator ("pmm: double free detected at 0x0000000000200000").
+   *
+   * The extra value accepted is deliberately exact — present, supervisor, and
+   * mapping this address to itself, which is what the identity window is and
+   * what nothing else looks like. A real mapping of this page carries the user
+   * bit and is still never overwritten. */
+  u64 expect = __atomic_load_n(&pt[pt_index(virtual_address)], __ATOMIC_ACQUIRE);
+  int identity_leaf = virtual_address < DIRECT_MAP_SIZE &&
+                      (expect & VMM_PRESENT) && !(expect & VMM_USER) &&
+                      (expect & PAGE_ENTRY_ADDRESS_MASK) ==
+                          (virtual_address & PAGE_ENTRY_ADDRESS_MASK);
+
+  if (expect == 0 || identity_leaf)
+    __atomic_compare_exchange_n(&pt[pt_index(virtual_address)], &expect,
+                                VMM_LAZY, 0, __ATOMIC_RELEASE,
+                                __ATOMIC_RELAXED);
   invalidate_page(virtual_address);
 }
 
@@ -1393,7 +1426,19 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   u64 *leaf0 = pf_leaf_pte_ptr(page_aligned);
   if (!leaf0) {
     vmm_read_release(rflags);
-    fault_note(0, 0, "no leaf PTE for this address");
+    /* No leaf means the address sits under a huge page (the identity window
+     * uses 2 MiB supervisor pages for the low 4 GiB) or under nothing at all,
+     * and those are opposite problems: the first is ours to split and hand to
+     * userspace, the second is a genuine wild access. Whether a VMA covers it
+     * is what separates them, and the report never said. */
+    if ((error_code & PF_USER) && current_task) {
+      struct vm_area *cover = vma_lookup(current_task, page_aligned);
+
+      fault_note(0, 0, cover ? "no leaf PTE, but a VMA covers this address"
+                             : "no leaf PTE and no VMA covers this address");
+    } else {
+      fault_note(0, 0, "no leaf PTE for this address");
+    }
     return -1;
   }
   u64 pte = *leaf0;
@@ -1431,7 +1476,14 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       u64 zflags = VMM_PRESENT;
       if (*slot & VMM_WRITABLE) zflags |= VMM_COW; /* first store COWs */
       if (*slot & VMM_USER) zflags |= VMM_USER;
-      if (error_code & PF_USER) zflags |= VMM_USER; /* see the note below */
+      /* By the mapping, not by who faulted — see the note on the same test in
+       * the file-backed path below. A zero page brought in by a syscall
+       * writing through a lazy user mapping must still belong to userspace.
+       * The lazy marker's own user bit is inherited just above and is the
+       * usual answer; the VMA is the fallback for a marker that lost it. */
+      if ((error_code & PF_USER) ||
+          (current_task && vma_lookup(current_task, page_aligned)))
+        zflags |= VMM_USER;
       if (*slot & VMM_NO_EXECUTE) zflags |= VMM_NO_EXECUTE;
       *slot = pmm_zero_page() | zflags;
       invalidate_page(page_aligned);
@@ -1595,7 +1647,27 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
      * process then took a protection fault on its own code with the entry
      * reading present-and-supervisor, which is a SIGSEGV at the instruction
      * pointer itself and looks nothing like a missing page. */
-    if (error_code & PF_USER) flags |= VMM_USER;
+    /* The mapping decides this, not who faulted.
+     *
+     * Gating on PF_USER alone meant a page first touched by the KERNEL — a
+     * copyout into a user buffer, a read(2) filling it, any syscall writing
+     * through a lazy mapping — was materialised without the user bit and
+     * stayed that way. The process then took a protection fault reading its
+     * own memory, with the entry present-and-supervisor: observed as a SIGSEGV
+     * inside PartitionRoot::FreeInUnknownRoot.
+     *
+     * The fix for that was first written as "any address below the user/kernel
+     * split", which is a different claim and a wrong one. Low addresses also
+     * hold mappings the kernel made and owns, and the user bit is what
+     * address-space teardown uses to decide a frame is the process's to free —
+     * so marking them user handed the allocator frames that were never the
+     * process's. It showed up as nine double frees of the 2 MiB frame when a
+     * static binary loaded there exited.
+     *
+     * We are here because a VMA covers this address: the page belongs to this
+     * process's address space by construction, whoever faulted it in. */
+    if ((error_code & PF_USER) || vma)
+      flags |= VMM_USER;
     if (vma_shared) flags |= VMM_SHARED;
     /* A writable MAP_PRIVATE file page must NOT map the shared page-cache
      * frame writable: the first store (e.g. ld.so applying relocations to a

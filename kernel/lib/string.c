@@ -1,11 +1,40 @@
 #include <string.h>
 #include <b1nix/mm.h>
 
+/* Above this many bytes, hand the copy to the CPU's own string move.
+ *
+ * `rep movsb` carries a fixed setup cost, so for short runs the plain loop
+ * below still wins; past a few hundred bytes the microcode moves far wider
+ * chunks per step than eight bytes at a time (Enhanced REP MOVSB, on every
+ * CPU this kernel targets) and pulls ahead by a wide margin. The sizes that
+ * matter here are not small: zeroing a 4 KiB page, copying a disk block,
+ * moving a user buffer in or out of a syscall.
+ *
+ * No CPUID gate is needed — `rep movsb`/`rep stosb` are correct on any x86,
+ * only their speed varies, and the threshold is what selects for that. They
+ * are string instructions, not vector ones, so the kernel's ban on SSE/AVX is
+ * untouched. Not used for device memory: MMIO wants explicit accesses of a
+ * known width, and driver code does not reach these below the threshold. */
+#define STRING_INSN_THRESHOLD 256u
+
 void *memcpy(void *dest, const void *src, size_t count)
 {
 	unsigned char *d = dest;
 	const unsigned char *s = src;
-	
+
+#ifdef __x86_64__
+	if (count >= STRING_INSN_THRESHOLD) {
+		/* cld: the copy must run forward. The ABI hands every function DF
+		 * clear and this kernel never sets it, so this is belt-and-braces
+		 * against an interrupt frame that arrives with it set. */
+		__asm__ volatile("cld; rep movsb"
+		                 : "+D"(d), "+S"(s), "+c"(count)
+		                 :
+		                 : "memory");
+		return dest;
+	}
+#endif
+
 	while (count >= 8) {
 		*(unsigned long long *)d = *(const unsigned long long *)s;
 		d += 8;
@@ -25,6 +54,16 @@ void *memset(void *dest, int value, size_t count)
 	unsigned char v = (unsigned char)value;
 	unsigned long long v64 = ((unsigned long long)v << 56) | ((unsigned long long)v << 48) | ((unsigned long long)v << 40) | ((unsigned long long)v << 32) | 
 	             ((unsigned long long)v << 24) | ((unsigned long long)v << 16) | ((unsigned long long)v << 8) | (unsigned long long)v;
+
+#ifdef __x86_64__
+	if (count >= STRING_INSN_THRESHOLD) {
+		__asm__ volatile("cld; rep stosb"
+		                 : "+D"(d), "+c"(count)
+		                 : "a"(v)
+		                 : "memory");
+		return dest;
+	}
+#endif
 
 	while (count >= 8) {
 		*(unsigned long long *)d = v64;

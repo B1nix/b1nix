@@ -167,6 +167,11 @@ run_test /bin/m71_aslr posix
 run_test /bin/m42_w5pre_smoke posix
 run_test /bin/m46_smoke posix
 run_test /bin/lock_smoke posix
+run_test /bin/futex_stress posix
+run_test /bin/invite_stress posix
+run_test /bin/pipe_eof posix
+run_test /bin/fd_visibility posix
+run_test /bin/clock_sanity posix
 run_test /bin/m27_cmdline posix
 run_test /bin/m11_pipe_smoke posix
 run_test /bin/m22_smoke posix

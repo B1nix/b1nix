@@ -1363,12 +1363,56 @@ u64 pmm_alloc_frame(void) {
       panic("pmm: per-CPU zero bucket corrupt");
     }
     pcp->zero_head = marker[0];
+    /* Erase the link now that it has been read.
+     *
+     * The free list is threaded THROUGH the pages it holds: the first word of
+     * each parked frame is the address of the next one. Handing the page out
+     * with that word still in place gives the caller a "zero" page whose first
+     * eight bytes are a physical frame address — a low value, well under 4 GiB,
+     * which is what a program then treats as a pointer. That is exactly the
+     * stray pointer the browser's allocator died on, and every process taking
+     * a fresh page was getting one. */
+    marker[0] = 0;
     pcp->zero_count--;
     /* Clear the "parked in zero bucket" marker so a later free of this page
      * is not mistaken for a double free. One store vs a full memset. */
     *(u64 *)(usize)(frame + DIRECT_MAP_BASE + PMM_ZERO_MAGIC_OFF) = 0;
     if (pmm.frame_refcounts) pmm.frame_refcounts[frame_index(frame)] = 1;
     pmm_check_handout(frame);
+    /* And it must actually BE zero.
+     *
+     * The magic above proves the frame was parked here; it does not prove the
+     * memset that was supposed to accompany it ever ran, or that nothing wrote
+     * to the page afterwards. A frame handed out with someone else's data in
+     * it gives the next process a stale pointer out of "fresh" memory — a
+     * correctness bug, and a disclosure of whatever the previous owner held.
+     * Sampling is cheap next to the memset it replaces; a mismatch is repaired
+     * so the caller still gets a zero page, and reported so it can be traced. */
+    {
+      const volatile u64 *chk =
+          (const volatile u64 *)(usize)(frame + DIRECT_MAP_BASE);
+      int dirty = 0;
+
+      for (unsigned i = 0; i < 32; i++) {
+        if (i * 8 == PMM_ZERO_MAGIC_OFF)
+          continue; /* the marker slot just cleared */
+        if (chk[i]) {
+          dirty = 1;
+          break;
+        }
+      }
+      if (dirty) {
+        static u64 reported;
+        if (++reported <= 8) {
+          console_write("pmm: zero-bucket frame 0x");
+          console_write_hex64(frame);
+          console_write(" was NOT zero (first word 0x");
+          console_write_hex64(chk[0]);
+          console_write(") — zeroing before handout\n");
+        }
+        memset((void *)(usize)(frame + DIRECT_MAP_BASE), 0, PAGE_SIZE);
+      }
+    }
     spin_unlock(&pcp->lock);
     irq_restore(flags);
     return frame;  /* already zeroed by the scrubber / overflow promotion */
@@ -1437,6 +1481,23 @@ static u64 bitmap_scan_alloc(usize count) {
       run = 0;
       idx += 64;
       continue;
+    }
+    /* Nothing free in the rest of this word: skip to the next word boundary
+     * rather than testing the remaining bits one at a time. Inverting the word
+     * and asking the CPU for the first set bit (__builtin_ctzll -> BSF/TZCNT)
+     * also names the next free frame directly, but only the skip is worth
+     * taking here — the run-tracking below has to see each free frame in turn
+     * to know when they are contiguous. */
+    if (run == 0) {
+      usize word_idx = idx / 64;
+      if (word_idx * 64 + 64 <= frame_count) {
+        u64 free_bits = ~words[word_idx] & (~0ULL << (idx % 64));
+        if (!free_bits) {
+          idx = (word_idx + 1) * 64;
+          continue;
+        }
+        idx = word_idx * 64 + (usize)__builtin_ctzll(free_bits);
+      }
     }
     if (!bitmap_get(idx)) {
       if (run == 0) {

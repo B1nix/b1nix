@@ -375,6 +375,22 @@ static u64   g_min_pass = 0;
  * watchdog task dump to name the user function a wedged thread group spins
  * in. */
 static u64   g_task_user_rip[MAX_TASKS];
+/* Scratch: which address the dump above decided to show for the current
+ * thread — the sampled one or the syscall entry — so the mapping lookup that
+ * follows describes the address actually printed. */
+static u64   g_task_user_rip_shown;
+
+/* The full argument vector a task was exec'd with, NUL-separated, as
+ * /proc/<pid>/cmdline is defined to present it.
+ *
+ * Side table for the usual reason (struct task cannot grow — see the M29
+ * LAPIC-PT note). Until this existed, cmdline reported the executable path and
+ * nothing else, so every process looked like it had been started with no
+ * arguments at all: `ps` showed a column of identical paths, and a browser's
+ * helper processes — which are the same binary as the browser and differ only
+ * in their flags — were indistinguishable from it and from each other. */
+static char *g_task_cmdline[MAX_TASKS];
+static usize g_task_cmdline_len[MAX_TASKS];
 /* M63: seccomp-bpf per-task state (side-tables — struct task cannot grow, see
  * the M29 LAPIC-PT note). g_task_seccomp holds the installed filter chain
  * (opaque to the scheduler; defined in seccomp.c); g_task_nnp is no_new_privs. */
@@ -625,6 +641,11 @@ static struct task *find_unused_task(void) {
       g_task_fdlock_owner[i] = 0;
       g_task_exiting[i] = 0;
       g_task_tgid[i] = 0;
+      if (g_task_cmdline[i]) {
+        kfree(g_task_cmdline[i]);
+        g_task_cmdline[i] = 0;
+      }
+      g_task_cmdline_len[i] = 0;
       g_task_ctty_type[i] = 0;
       g_task_ctty_index[i] = 0;
       g_task_utime_ns[i] = 0;
@@ -1852,9 +1873,107 @@ u64 task_user_rip(const struct task *t) {
   if (!t) return 0;
   return g_task_user_rip[task_index(t)];
 }
+
+/* Record the argument vector for /proc/<pid>/cmdline. Called from execve once
+ * the new image is committed; replaces whatever the previous image left. */
+void task_set_cmdline(struct task *t, const char *const *argv) {
+  if (!t)
+    return;
+
+  usize idx = task_index(t);
+  usize need = 0;
+  int argc = 0;
+
+  for (; argv && argv[argc]; argc++)
+    need += strlen(argv[argc]) + 1;
+
+  char *buf = need ? (char *)kmalloc(need) : 0;
+  if (need && !buf)
+    return; /* keep the old vector rather than losing it for a short alloc */
+
+  usize off = 0;
+  for (int i = 0; i < argc; i++) {
+    usize n = strlen(argv[i]) + 1;
+    memcpy(buf + off, argv[i], n);
+    off += n;
+  }
+
+  char *old = g_task_cmdline[idx];
+  g_task_cmdline[idx] = buf;
+  g_task_cmdline_len[idx] = off;
+  if (old)
+    kfree(old);
+}
+
+/* The recorded vector and its length in bytes, or NULL. The bytes include the
+ * terminating NUL of every argument, which is what a reader expects to split
+ * on. */
+const char *task_cmdline(const struct task *t, usize *len_out) {
+  if (!t) {
+    if (len_out) *len_out = 0;
+    return 0;
+  }
+  usize idx = task_index(t);
+  if (len_out) *len_out = g_task_cmdline_len[idx];
+  return g_task_cmdline[idx];
+}
+
+/* Release a slot's vector when the task is reaped. */
+void task_clear_cmdline(struct task *t) {
+  if (!t)
+    return;
+  usize idx = task_index(t);
+  char *old = g_task_cmdline[idx];
+  g_task_cmdline[idx] = 0;
+  g_task_cmdline_len[idx] = 0;
+  if (old)
+    kfree(old);
+}
 void task_set_user_rip(struct task *t, u64 rip) {
   if (!t) return;
   g_task_user_rip[task_index(t)] = rip;
+}
+
+/* Where a task was in userspace when it entered the kernel, and the frame
+ * pointer it left behind.
+ *
+ * A thread parked in a syscall has no fault to report and no timer tick to be
+ * caught by, so the only record of what it was doing is the frame it came in
+ * on. Keeping the caller's rip and rbp here makes a blocked thread's user
+ * stack walkable from the watchdog dump — which is the difference between
+ * "everything is waiting" and knowing what it waits for. */
+static u64 g_task_entry_rip[MAX_TASKS];
+static u64 g_task_entry_rbp[MAX_TASKS];
+
+void task_set_syscall_entry(struct task *t, u64 rip, u64 rbp) {
+  if (!t) return;
+  usize i = task_index(t);
+  g_task_entry_rip[i] = rip;
+  g_task_entry_rbp[i] = rbp;
+}
+u64 task_syscall_entry_rip(const struct task *t) {
+  return t ? g_task_entry_rip[task_index(t)] : 0;
+}
+u64 task_syscall_entry_rbp(const struct task *t) {
+  return t ? g_task_entry_rbp[task_index(t)] : 0;
+}
+
+/* Print " (module+offset)" for a userspace address, or nothing when it falls
+ * outside every mapping. A bare address says little when everything is loaded
+ * above 0x500000000000; the module name is the part that identifies a layer. */
+static void sched_name_user_addr(struct task *t, u64 addr) {
+  if (!t || !addr)
+    return;
+  for (struct vm_area *v = t->vma_list; v; v = v->next) {
+    if (addr >= v->start && addr < v->end) {
+      console_write(" (");
+      console_write(v->node && v->node->name[0] ? v->node->name : "anon");
+      console_write("+0x");
+      console_write_hex64(addr - v->start);
+      console_write(")");
+      return;
+    }
+  }
 }
 /* The system call a task entered last, kept beside its user RIP and for the
  * same reason: a thread that is RUNNING with an unchanging RIP is either
@@ -3337,6 +3456,34 @@ void scheduler_sleep_ticks(u64 ticks) {
    */
   if (scheduler_started) {
     while ((i64)(current_task->wake_tick - scheduler_ticks) > 0) {
+      /* A sleep ends when a signal arrives, not only when the clock says so.
+       *
+       * Programs sleep "forever" on purpose — a thread parks with a timeout of
+       * years and expects a signal to be what wakes it. Without this check the
+       * sleep really did last years: a thread that had been sent SIGKILL sat
+       * here with the bit set and never died, and the process it belonged to
+       * waited for it in exit_group and never finished. From outside, the
+       * process looked alive; it was unable to die. */
+      if (__atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE) &
+          ~current_task->blocked_signals)
+        break;
+      /* Someone woke us, or the task is being torn down. terminate_group_
+       * siblings and the ordinary wake paths promote a SLEEPING task to READY;
+       * this loop used to keep spinning on the clock regardless, so being woken
+       * changed nothing.
+       *
+       * Named states, not "anything but SLEEPING". The obvious form of this
+       * test is wrong in a way that is easy to miss: scheduler_yield above
+       * returns with the task switched back in and its state already RUNNING,
+       * so "not SLEEPING" is true on the very first pass and the remaining
+       * ticks are never waited out at all. That silently restores the no-op
+       * sleep this whole loop exists to prevent — an idle machine runs a timed
+       * hold to completion in microseconds. */
+      {
+        int st = __atomic_load_n(&current_task->state, __ATOMIC_ACQUIRE);
+        if (st == TASK_READY || st == TASK_DEAD || st == TASK_REAPING)
+          break;
+      }
       __asm__ volatile("sti; hlt");
     }
   }
@@ -4641,6 +4788,11 @@ void scheduler_lease_clear_here(const char *site) {
 void scheduler_dump_tasks(void) {
   extern void futex_dump_waiters(void);
   futex_dump_waiters();
+  {
+    /* Which fcntl a spinning thread repeats. See vfs_fcntl_dump_counts. */
+    extern void vfs_fcntl_dump_counts(void);
+    vfs_fcntl_dump_counts();
+  }
   scheduler_dump_thread_exits();
   console_write("tick=");
   console_write_dec(scheduler_ticks);
@@ -4682,6 +4834,13 @@ void scheduler_dump_tasks(void) {
       console_write_hex64(T(i)->parent_id);
       console_write(" chan=0x");
       console_write_hex64((u64)(usize)T(i)->wait_chan);
+      /* What that address actually is. A wait channel is whatever object the
+       * sleeper picked — an inode, a pipe, a socket — and a bare heap address
+       * names none of them. The heap knows the block it falls in and whether
+       * it is still live, which is the difference between "waiting on
+       * something" and "waiting on something that was freed". */
+      if (T(i)->wait_chan)
+        kheap_describe((u64)(usize)T(i)->wait_chan, " chan->");
       console_write(" rel=");
       console_write_dec(T(i)->stack_released);
       console_write(" ap=");
@@ -4717,27 +4876,108 @@ void scheduler_dump_tasks(void) {
        * the walk behind it is expensive and this dump runs on a timer. It is
        * what says whether a run that fills memory is filling it inside one
        * process or spreading it across many. */
+      /* What is waiting to be delivered to this task.
+       *
+       * A thread that will not die during exit_group is either not being
+       * signalled at all or is being signalled and not acting on it, and those
+       * need opposite fixes. The pending mask says which. */
+      if (T(i)->pending_signals) {
+        console_write(" pending=0x");
+        console_write_hex64(T(i)->pending_signals);
+      }
+      /* Thread group and exit state.
+       *
+       * A leader in exit_group waits for every sibling that is not already
+       * exiting, and the kill it sends goes to exactly the same set. When a
+       * process will not die, the question is which thread is in that set and
+       * why it is still there — and neither the group nor the flag was
+       * printed, so the set could not be reconstructed from the dump. */
+      console_write(" tgid=");
+      console_write_dec(g_task_tgid[i]);
+      if (g_task_exiting[i])
+        console_write(" exiting");
+      if (g_task_parked_leader[i])
+        console_write(" parked-leader");
       console_write(" rsskb=");
       console_write_dec(g_task_maxrss_pages[i] * 4);
       console_write(" sys=");
       console_write_dec(g_task_syscall[i]);
-      console_write(" user_rip=0x");
-      console_write_hex64(g_task_user_rip[i]);
+      /* The last user address seen for this thread.
+       *
+       * g_task_user_rip is only written when the timer tick catches a thread
+       * running in userspace, so a thread that blocked in a syscall has none —
+       * and a dump of a stalled process is almost entirely such threads, which
+       * is why most entries read user_rip=0 and said nothing. The syscall entry
+       * records where the call was made from; fall back to that, and mark which
+       * of the two is being shown. */
+      {
+        u64 rip = g_task_user_rip[i];
+        const char *what = " user_rip=0x";
+        if (!rip) {
+          rip = task_syscall_entry_rip(T(i));
+          what = " call_rip=0x";
+        }
+        console_write(what);
+        console_write_hex64(rip);
+        g_task_user_rip_shown = rip;
+      }
       /* Which mapping that address is in, and how far into it. A bare address
        * says nothing when everything is loaded above 0x700000000000 — the same
        * number could be the loader, the C library or a 30 MB renderer. */
-      if (g_task_user_rip[i]) {
+      if (g_task_user_rip_shown) {
         for (struct vm_area *v = T(i)->vma_list; v; v = v->next) {
-          if (g_task_user_rip[i] >= v->start && g_task_user_rip[i] < v->end) {
+          if (g_task_user_rip_shown >= v->start && g_task_user_rip_shown < v->end) {
             console_write(" in=");
             console_write(v->node && v->node->name[0] ? v->node->name
                                                       : "<anonymous>");
             console_write("+0x");
-            console_write_hex64(g_task_user_rip[i] - v->start);
+            console_write_hex64(g_task_user_rip_shown - v->start);
             break;
           }
         }
       }
+      /* The call chain a blocked thread came in on, followed rather than
+       * scanned.
+       *
+       * The scan below prints every stack slot that looks like code, which
+       * over-reports by design. This walks the frame pointer chain from the
+       * rbp userspace entered the kernel with, so each line is a real return
+       * address — and for a thread parked in a syscall that is the only exact
+       * account of what it is waiting for. Read through the task's own page
+       * tables: this is not the running address space. */
+      {
+        u64 erip = task_syscall_entry_rip(T(i));
+        u64 fp = task_syscall_entry_rbp(T(i));
+
+        if (erip && fp && T(i)->pml4_phys && T(i)->vma_list) {
+          console_write("\n    called from 0x");
+          console_write_hex64(erip);
+          sched_name_user_addr(T(i), erip);
+          console_write(" chain:");
+          for (unsigned depth = 0; depth < 10 && fp; depth++) {
+            u64 page = fp & ~(u64)(PAGE_SIZE - 1);
+            u64 pf = paging_user_frame(T(i)->pml4_phys, page);
+
+            if (!pf || (fp & 7) || (fp & (PAGE_SIZE - 1)) > PAGE_SIZE - 16)
+              break;
+            const volatile u64 *f =
+                (const volatile u64 *)(usize)(pf + vmm_direct_map_base() +
+                                              (fp & (PAGE_SIZE - 1)));
+            u64 next = f[0];
+            u64 ret = f[1];
+
+            if (!ret)
+              break;
+            console_write(" 0x");
+            console_write_hex64(ret);
+            sched_name_user_addr(T(i), ret);
+            if (next <= fp) /* frames grow upward; anything else is broken */
+              break;
+            fp = next;
+          }
+        }
+      }
+
       /* The USER stack of a wedged thread, when asked for.
        *
        * Everything above says where a thread is in the kernel; none of it says
@@ -5976,6 +6216,18 @@ struct vm_area *vma_lookup(struct task *t, u64 addr) {
   if (hit && addr >= hit->start && addr < hit->end)
     return hit;
 
+  /* Deliberately NOT under the list lock.
+   *
+   * Taking it here looked right — this walk does race the mutators — and it
+   * wedged the machine: the lock is held with interrupts off, this runs in the
+   * page-fault path, and a process with thousands of mappings walks a long
+   * list. Every other CPU spun behind a fault, and the guest went silent.
+   *
+   * What makes the lockless read safe enough is that a node is published only
+   * after its own next pointer is set (see vma_insert/vma_split), so a walker
+   * never lands mid-splice. The remaining exposure is a mapping freed while
+   * this walk holds it — pre-existing, and not something a spinlock in the
+   * fault path can pay for. */
   for (struct vm_area *v = t->vma_list; v && v->start <= addr; v = v->next) {
     if (addr < v->end) {
       g_vma_cache[slot] = v;
@@ -6022,14 +6274,17 @@ u64 vm_find_free_area(struct task *t, usize length) {
 
   /* Under the list lock: this walk is the one that hung when the list was a
    * ring, and it must not run while another thread is relinking it. */
-  vma_list_lock(&vflags);
+  /* No lock across this walk either: it is the longest one in the kernel (a
+   * browser has thousands of mappings) and it runs with mmap's own mutex
+   * already held, so the mutators cannot be relinking underneath it. Holding
+   * a spinlock with interrupts off for that long stalls every other CPU. */
+  (void)vflags;
   /* Bounded, so a list that is somehow still circular reports itself instead
    * of hanging the caller in the kernel where nothing can kill it. No process
    * legitimately holds anywhere near this many mappings. */
   unsigned steps = 0;
   for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
     if (++steps > 1000000u) {
-      vma_list_unlock(vflags);
       console_write("vma: walk did not terminate — list is circular, pid ");
       console_write_dec(t->id);
       console_write("\n");
@@ -6040,12 +6295,9 @@ u64 vm_find_free_area(struct task *t, usize length) {
     if (vma->start >= candidate + length)
       break;    /* the gap before this mapping is big enough */
     candidate = vma->end;
-    if (candidate + length > end || candidate + length < candidate) {
-      vma_list_unlock(vflags);
+    if (candidate + length > end || candidate + length < candidate)
       return (u64)-1;
-    }
   }
-  vma_list_unlock(vflags);
   if (candidate + length > end || candidate + length < candidate)
     return (u64)-1;
   return candidate;
@@ -6496,6 +6748,19 @@ void scheduler_deliver_pending_signals(void) {
      * syscall/interrupt return path instead of consuming the signal here. */
     return;
   }
+}
+
+/* Any deliverable signal at all, including the ones with no handler.
+ *
+ * scheduler_signal_pending() deliberately answers only for signals a handler
+ * will run, because that is what an interruptible wait needs to decide whether
+ * userspace has something to do. A sleep cut short by SIGKILL has no handler
+ * to run and still ended early, and the caller has to report that. */
+int scheduler_signal_pending_any(void) {
+  if (!current_task)
+    return 0;
+  return (__atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE) &
+          ~current_task->blocked_signals) != 0;
 }
 
 int scheduler_signal_pending(void) {

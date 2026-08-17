@@ -97,11 +97,28 @@ void arch_set_kernel_stack(u64 stack_top) {
  * (see kernel/arch/x86_64/user_jump.S), so userspace `%fs:N` reads land at
  * (fs_base + N) — exactly the pthread TLS pattern. Called from the
  * scheduler on every context switch and from SYS_SET_TLS for live updates. */
+/* Set when CR4.FSGSBASE is on, i.e. WRFSBASE may be used instead of WRMSR. */
+static int g_fsgsbase_ready;
+
 void arch_set_fs_base(u64 base) {
+  /* WRFSBASE writes the same register WRMSR does, in a fraction of the time,
+   * and this runs on every context switch — the scheduler restores the
+   * outgoing thread's TLS pointer each time it swaps tasks. WRMSR is a heavy,
+   * partially serialising instruction; WRFSBASE is an ordinary one.
+   *
+   * Only available once CR4.FSGSBASE is enabled, which x86_enable_fsgsbase
+   * does after checking CPUID — hence the flag rather than a bare instruction.
+   * Without it, the MSR write below is still correct, just slower. */
+  if (g_fsgsbase_ready) {
+    __asm__ volatile("wrfsbase %0" : : "r"(base));
+    return;
+  }
+
   u32 lo = (u32)base;
   u32 hi = (u32)(base >> 32);
   __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000100));
 }
+
 
 void x86_syscall_init(void) {
   u32 lo, hi;
@@ -182,6 +199,91 @@ void arch_set_cpu_khz(u32 khz) {
 
 u32 arch_cpu_khz(void) { return g_cpu_khz; }
 
+/* ── A clock with better than 10 ms resolution ──────────────────────────────
+ *
+ * clock_gettime was derived from the 100 Hz tick, so every reading landed on a
+ * 10 ms boundary. That is coarse enough that a program scheduling work in
+ * milliseconds — which is what a browser's task queue is — cannot tell two
+ * events apart, and measured durations come out as 0 or 10 ms and nothing
+ * between. The cycle counter is already calibrated for CPU-time accounting;
+ * this exposes it as the monotonic clock.
+ *
+ * Only when the CPU says the counter is fit for it: an invariant TSC ticks at
+ * a constant rate regardless of core frequency or C-states (CPUID
+ * 0x80000007:EDX bit 8). Without that guarantee the tick stays authoritative —
+ * a clock that speeds up and slows down with the core is worse than a coarse
+ * one. */
+static u64 g_tsc_base;      /* counter value the monotonic clock starts from */
+static int g_tsc_usable;    /* invariant TSC + a calibrated frequency */
+static u64 g_tsc_last_ns;   /* last value handed out, for monotonicity */
+
+static inline u64 arch_rdtsc_ordered(void) {
+  u32 lo, hi;
+  __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
+  return ((u64)hi << 32) | lo;
+}
+
+void arch_tsc_clock_init(void) {
+  u32 a, b, c, d;
+
+  cpuid_count(0x80000000u, 0, &a, &b, &c, &d);
+  u32 max_ext = a;
+  u32 pm = 0;
+
+  if (max_ext >= 0x80000007u) {
+    cpuid_count(0x80000007u, 0, &a, &b, &c, &d);
+    pm = d;
+  }
+  /* Say what the CPU answered. "no invariant TSC" is a conclusion, and when it
+   * is wrong the only way to tell is to see the numbers it was drawn from —
+   * a guest can be told it has the feature and still report otherwise. */
+  console_write("tsc: max_ext=0x");
+  console_write_hex64(max_ext);
+  console_write(" leaf7_edx=0x");
+  console_write_hex64(pm);
+  console_write(" khz=");
+  console_write_dec(g_cpu_khz);
+  console_write("\n");
+
+  if (max_ext < 0x80000007u)
+    return;
+  if (!(pm & (1u << 8)))
+    return; /* not invariant — leave the tick clock in charge */
+  if (!g_cpu_khz)
+    return; /* never calibrated */
+  g_tsc_base = arch_rdtsc_ordered();
+  g_tsc_usable = 1;
+}
+
+int arch_tsc_clock_ready(void) { return g_tsc_usable; }
+
+/* Nanoseconds since arch_tsc_clock_init(), or 0 when the counter is not fit to
+ * be a clock (the caller then falls back to the tick). */
+u64 arch_tsc_monotonic_ns(void) {
+  if (!g_tsc_usable)
+    return 0;
+
+  u64 cycles = arch_rdtsc_ordered() - g_tsc_base;
+  u32 khz = g_cpu_khz;
+
+  /* cycles * 1000000 / khz without overflowing: split the division so the
+   * multiply only ever sees the remainder. A bare multiply overflows a u64
+   * after about five hours at 3 GHz. */
+  u64 ns = (cycles / khz) * 1000000ull + ((cycles % khz) * 1000000ull) / khz;
+
+  /* Never go backwards. Cores can start their counters at slightly different
+   * values, and a thread that migrates mid-read would otherwise see time
+   * reverse — which breaks every duration a program computes from it. */
+  u64 last = __atomic_load_n(&g_tsc_last_ns, __ATOMIC_RELAXED);
+  while (ns < last) {
+    if (__atomic_compare_exchange_n(&g_tsc_last_ns, &last, last, 0,
+                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+      return last;
+  }
+  __atomic_store_n(&g_tsc_last_ns, ns, __ATOMIC_RELAXED);
+  return ns;
+}
+
 /* The processor's nominal maximum, from CPUID leaf 16h when the CPU publishes
  * it (EBX = max frequency in MHz). Falls back to the measured rate. */
 u32 arch_cpu_max_khz(void) {
@@ -194,6 +296,66 @@ u32 arch_cpu_max_khz(void) {
   }
   return g_cpu_khz;
 }
+
+/* The TSC frequency as the processor states it, in kHz, or 0 if it does not.
+ *
+ * CPUID leaf 15h gives the ratio of the TSC to the core crystal clock —
+ * EBX/EAX — and, on parts that fill it in, the crystal frequency itself in ECX.
+ * Multiply them out and the result is the exact TSC rate, with none of the
+ * error a timed measurement carries. Every field can be zero (older CPUs, and
+ * hypervisors that leave ECX empty even while publishing the ratio), so all
+ * three are checked before the multiply; a zero return means "ask the PIT". */
+u32 arch_tsc_khz_from_cpuid(void) {
+  u32 a, b, c, d;
+  cpuid_count(0, 0, &a, &b, &c, &d);
+  if (a < 0x15)
+    return 0;
+
+  cpuid_count(0x15, 0, &a, &b, &c, &d);
+  if (!a || !b || !c)
+    return 0;
+
+  /* crystal_hz * ratio / 1000, in 64-bit so a 100 MHz crystal times a ratio of
+   * a few dozen cannot wrap on the way to kHz. */
+  return (u32)(((u64)c * (u64)b) / ((u64)a * 1000ull));
+}
+
+/* Turn on CR4.FSGSBASE (bit 16) when the CPU has it (CPUID.7.0:EBX[0]).
+ *
+ * This unlocks the RD/WRFSBASE instructions, which arch_set_fs_base uses in
+ * place of a WRMSR on every context switch. Enabling the bit also makes them
+ * available to userspace — that is what the bit means, and what every other
+ * x86_64 kernel does with it. */
+static void x86_enable_fsgsbase(void) {
+  u32 a, b, c, d;
+  cpuid_count(0, 0, &a, &b, &c, &d);
+  if (a < 7)
+    return;
+
+  cpuid_count(7, 0, &a, &b, &c, &d);
+  if (!(b & (1u << 0)))
+    return;
+
+  u64 cr4;
+  __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+  cr4 |= (1ull << 16); /* FSGSBASE */
+  __asm__ volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
+
+  g_fsgsbase_ready = 1;
+}
+
+/* CR4.SMEP is NOT enabled, deliberately.
+ *
+ * SMEP makes the CPU refuse to execute a page marked user-accessible while
+ * running in ring 0, which is a good thing to want. It cannot be switched on
+ * as this kernel currently maps memory: the identity map of low memory carries
+ * the user bit (paging.c sets VMM_USER for anything below USER_SPACE_LIMIT),
+ * and the AP startup trampoline lives down there and is executed by the kernel
+ * itself. Turning SMEP on faults on the trampoline — tried, and the smoke run
+ * died in long_mode_low with a garbage instruction pointer.
+ *
+ * Enabling it needs the low identity map to stop being user-accessible first.
+ * That is a separate piece of work, not a line in CR4. */
 
 static void x86_enable_xsave(void) {
   u32 a, b, c, d;
@@ -255,6 +417,11 @@ static void x86_enable_sse(void) {
   /* Per-CPU: every core must have OSXSAVE and the same XCR0, or a task moved
    * to another core would xrstor a state that core does not manage. */
   x86_enable_xsave();
+
+  /* Also per-CPU, and for the same reason: CR4 is not shared between cores.
+   * A thread that set its TLS pointer on one core and then ran on another
+   * would fault on WRFSBASE if only the first core had the bit. */
+  x86_enable_fsgsbase();
 }
 
 void arch_init(void) {

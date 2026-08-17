@@ -234,7 +234,15 @@ run_qemu() {
 			# -cpu host exposes the full host instruction set to the guest and
 			# cuts KVM exits (vs the conservative default model) — a free speedup
 			# with hardware virt, no extra VMs. Only with KVM/HVF, never TCG.
-			accel_args="-accel kvm -cpu host"
+			# +invtsc by name, because -cpu host does not include it: QEMU
+			# leaves the invariant-TSC bit clear even on a host that has one,
+			# since an invariant TSC blocks live migration. Without it the
+			# guest cannot trust the counter and falls back to the 100 Hz
+			# tick — so the TSC clock path, which is what real runs use, was
+			# never exercised by the smoke suite at all. Measured: the
+			# monotonic clock moved in 10 ms steps here and in nanoseconds in
+			# a passthrough run, on the same kernel.
+			accel_args="-accel kvm -cpu host,+invtsc"
 		elif [ "$(uname)" = "Darwin" ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw hvf; then
 			accel_args="-accel hvf -cpu host"
 		fi

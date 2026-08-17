@@ -255,6 +255,25 @@ enum {
 	/* --- M104: growing a mapping in place. musl's realloc reaches for this on
 	   every large block, so a libc without it cannot grow one. --- */
 	SYS_MREMAP           = 248, /* mremap(old, old_len, new_len, flags, new_addr) */
+	/* set_robust_list/get_robust_list. Accepted and remembered, but nothing
+	 * walks the list at thread death yet — a robust mutex held by a thread
+	 * that dies is still not released. Kept as its own number because the
+	 * alternative was worse: these were mapped onto SYS_SYNC, so musl's
+	 * registration on every pthread_create flushed the whole filesystem to
+	 * disk. A browser starting a hundred threads did a hundred full syncs. */
+	SYS_SET_ROBUST_LIST  = 249,
+	SYS_GET_ROBUST_LIST  = 250,
+	/* The scheduling-policy family. b1nix runs one policy for everyone, so
+	 * these report SCHED_OTHER with priority 0 and accept nothing else —
+	 * which is a truthful answer, unlike ENOSYS. A crash reporter walking
+	 * threads calls sched_getscheduler on each and logs a failure per thread
+	 * when it is missing. */
+	SYS_SCHED_GETSCHEDULER = 251,
+	SYS_SCHED_SETSCHEDULER = 252,
+	SYS_SCHED_GETPARAM     = 253,
+	SYS_SCHED_SETPARAM     = 254,
+	SYS_SCHED_GET_PRIORITY_MAX = 255,
+	SYS_SCHED_GET_PRIORITY_MIN = 256,
 };
 
 /* Aliases: linux_abi.c references these generic names; map to the versioned ones. */

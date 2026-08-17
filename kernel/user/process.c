@@ -2303,6 +2303,10 @@ resolve:
     kfree((void *)current_task->name);
   }
   current_task->name = strdup(path);
+  /* Record the whole vector, not just the path: /proc/<pid>/cmdline is defined
+   * as the arguments a process was started with, and helper processes of a
+   * multi-process program differ from it only in those arguments. */
+  task_set_cmdline(current_task, (const char *const *)image->argv);
 
   if (current_task->user_image) {
     user_image_free(current_task->user_image);

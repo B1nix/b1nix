@@ -41,6 +41,14 @@ struct futex_waiter {
    * simply lost, and the thread slept forever (the M29 stress-smp wedge). */
   volatile int woken;
   int expect; /* the value the waiter was told to sleep on (diagnostics) */
+  /* Wakes that arrived for this address while this waiter was parked on it.
+   *
+   * "woken=0 after thirteen minutes" has two opposite explanations — nobody
+   * ever called FUTEX_WAKE on that address, or somebody did and it failed to
+   * reach this waiter — and they need opposite fixes. The global hit/missed
+   * counters cannot tell them apart because they say nothing about WHICH
+   * address. This one does. */
+  volatile u64 wakes_seen;
   struct futex_waiter *next;
 };
 
@@ -199,6 +207,12 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
     int woken = 0;
     u64 flags;
     spin_lock_irqsave(&b->lock, &flags);
+    /* Note the attempt on every waiter parked on this address, whatever key it
+     * was queued under — that mismatch is exactly what we are hunting. */
+    for (struct futex_waiter *w = b->head; w; w = w->next)
+      if (w->key_uaddr == uaddr)
+        w->wakes_seen++;
+
     struct futex_waiter **pp = &b->head;
     while (*pp && woken < val) {
       struct futex_waiter *w = *pp;
@@ -228,10 +242,35 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
      * value changed. Counted rather than printed — a busy process wakes
      * thousands of times a second — and reported beside the parked waiters in
      * the watchdog dump, where the two numbers can be compared. */
-    if (woken == 0)
+    if (woken == 0) {
       g_futex_wake_missed++;
-    else
+      /* A wake that finds nobody is ordinary — an uncontended unlock wakes
+       * unconditionally. A wake that finds nobody while somebody IS parked on
+       * that very address is not: it means the two sides computed different
+       * keys for the same futex, and the sleeper is never coming back. Report
+       * only that case, and only a few times. */
+      static u64 reported;
+      u64 f2;
+      int same_addr = 0;
+      spin_lock_irqsave(&b->lock, &f2);
+      for (struct futex_waiter *w = b->head; w; w = w->next) {
+        if (w->key_uaddr == uaddr && w->key_pml4 != key_pml4) {
+          same_addr = 1;
+          break;
+        }
+      }
+      spin_unlock_irqrestore(&b->lock, f2);
+      if (same_addr && ++reported <= 8) {
+        console_write("futex: wake missed a waiter on the same address —"
+                      " uaddr=0x");
+        console_write_hex64(uaddr);
+        console_write(" wake key=0x");
+        console_write_hex64(key_pml4);
+        console_write(" (waiter queued under a different key)\n");
+      }
+    } else {
       g_futex_wake_hit++;
+    }
     return woken;
   }
 
@@ -268,6 +307,8 @@ void futex_dump_waiters(void) {
       console_write_hex64(w->key_pml4);
       console_write(" task=");
       console_write_dec(w->task_id);
+      console_write(" wakes_seen=");
+      console_write_dec(w->wakes_seen);
       console_write(" woken=");
       console_write_dec((u64)w->woken);
       console_write(" expect=");

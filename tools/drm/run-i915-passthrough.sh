@@ -299,8 +299,18 @@ set +e
 # first code to walk it. The same signature also appears in mprotect, in a run
 # with no GPU at all. The writer is not identified yet, so SMP=<n> asks for
 # more cores deliberately rather than getting the fault by surprise.
+# -cpu host,+invtsc: the processor we are actually on, including the promise
+# that its cycle counter runs at a constant rate.
+#
+# +invtsc has to be asked for by name. QEMU leaves CPUID 0x80000007:EDX[8]
+# clear even under -cpu host because an invariant TSC blocks live migration —
+# measured here as leaf7_edx=0x0 while the host itself reports constant_tsc.
+# Without it the guest kernel cannot trust the counter and falls back to the
+# 100 Hz tick, which gives clock_gettime a 10 ms resolution on hardware whose
+# counter is perfectly good. These runs never migrate.
 timeout "$TIMEOUT" qemu-system-x86_64 \
 	$MACHINE_ARGS \
+	-cpu host,+invtsc \
 	-m "$MEM_MB" \
 	-smp "${SMP:-1}" \
 	-cdrom "$ISO" \

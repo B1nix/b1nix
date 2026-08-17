@@ -440,9 +440,36 @@ int swap_init(void)
 
 static u32 swap_alloc_slot(void)
 {
-    for (usize i = 0; i < swap_slot_count; i++) {
+    /* Skip whole full bytes at a stride, then let the CPU find the free bit.
+     *
+     * The scan below walked one bit at a time over every slot in the device —
+     * on a full swap area that is the entire bitmap, per allocation, and swap
+     * allocation happens exactly when the machine is already short of memory
+     * and least able to spare the cycles. A byte with no free bit is 0xFF and
+     * can be stepped over whole; within the first byte that has one,
+     * __builtin_ctz names it in a single instruction (BSF/TZCNT).
+     *
+     * The wrap-around start point is kept, so allocation still walks forward
+     * from the last slot handed out rather than always refilling the front. */
+    for (usize i = 0; i < swap_slot_count; ) {
         usize idx = (swap_next_slot + i) % swap_slot_count;
-        if (!swap_bit_get(idx)) {
+
+        /* Byte-aligned and a whole byte left before the wrap: test all eight
+         * at once and step over the byte if none of them is free. */
+        if ((idx & 7) == 0 && i + 8 <= swap_slot_count &&
+            idx + 8 <= swap_slot_count) {
+            u8 byte = swap_bitmap[idx >> 3];
+            if (byte == 0xFFu) {
+                i += 8;
+                continue;
+            }
+            idx += (usize)__builtin_ctz((unsigned)(u8)~byte);
+        } else if (swap_bit_get(idx)) {
+            i++;
+            continue;
+        }
+
+        {
             swap_bit_set(idx);
             swap_used++;
             swap_next_slot = (idx + 1) % swap_slot_count;

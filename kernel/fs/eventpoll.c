@@ -500,10 +500,48 @@ static void epoll_release(struct vfs_handle *h) {
   }
 }
 
-/* epoll instances are not themselves pollable for nesting in b1nix. */
+/* An epoll instance is ready when anything it watches is ready.
+ *
+ * This used to answer "never ready" unconditionally, which makes an epoll
+ * descriptor useless anywhere except epoll_wait: nesting one inside poll(),
+ * select() or another epoll — the ordinary way to aggregate two event loops
+ * into one — left the outer wait sleeping forever while the inner set had work
+ * to do. Every library that composes loops does this.
+ *
+ * Depth is bounded because an epoll may watch an epoll: a cycle would recurse
+ * until the kernel stack ran out, and userspace is free to build one. Linux
+ * caps nesting at 5; the same number here, after which an instance reports
+ * itself not ready rather than following the loop. */
+static u32 epoll_match(struct epoll_watch *w, u32 revents);
+
 static int epoll_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
-  (void)h;
+  static __thread int depth; /* per-CPU in practice: the walk never sleeps */
+  struct epoll_state *ep = h ? (struct epoll_state *)h->private_data : 0;
+
   pfd->revents = 0;
+  if (!ep || depth >= 5)
+    return 0;
+
+  depth++;
+  for (int i = 0; i < EPOLL_MAX_WATCH; i++) {
+    if (!ep->watch[i].used)
+      continue;
+    struct epoll_watch *w = &ep->watch[i];
+    struct vfs_handle *th = scheduler_fd_get(w->fd);
+    struct b1nix_pollfd inner;
+
+    if (!th || !th->ops || !th->ops->poll)
+      continue;
+    inner.fd = w->fd;
+    inner.events = (short)(w->events & 0xffff);
+    inner.revents = 0;
+    th->ops->poll(th, &inner);
+    if (epoll_match(w, (u32)(unsigned short)inner.revents)) {
+      pfd->revents = B1NIX_POLLIN;
+      break;
+    }
+  }
+  depth--;
   return 0;
 }
 

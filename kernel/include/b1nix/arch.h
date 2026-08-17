@@ -94,7 +94,17 @@ void arch_xsave_capture_clean(void *area, u64 mask);
  * it was never measured (nothing is reported rather than guessed). */
 void arch_set_cpu_khz(u32 khz);
 u32 arch_cpu_khz(void);
+
+/* The cycle-counter clock behind clock_gettime's monotonic family. Available
+ * only on an invariant TSC with a calibrated frequency; callers must fall back
+ * to the 100 Hz tick when arch_tsc_clock_ready() is false. */
+void arch_tsc_clock_init(void);
+int  arch_tsc_clock_ready(void);
+u64  arch_tsc_monotonic_ns(void);
 u32 arch_cpu_max_khz(void);
+/* Exact TSC rate in kHz from CPUID leaf 15h, or 0 when the CPU does not
+ * publish one and it has to be measured instead. */
+u32 arch_tsc_khz_from_cpuid(void);
 
 int arch_xsave_enabled(void);
 u64 arch_xsave_mask(void);

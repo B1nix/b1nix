@@ -531,7 +531,8 @@ PROOF
 		win_seen=""
 		wt=0
 		while [ "$wt" -lt 60 ]; do
-			if swaymsg -t get_tree 2>/dev/null | grep -q '"app_id": *"foot"'; then
+			if timeout -k 2 5 swaymsg -t get_tree 2>/dev/null |
+					grep -q '"app_id": *"foot"'; then
 				win_seen="yes"
 				break
 			fi
@@ -565,6 +566,47 @@ PROOF
 	else
 		echo "I915-SWAY: shm FAIL — a client cannot allocate a frame buffer"
 	fi
+
+	# Is /proc/<pid>/task readable, and does it agree with itself?
+	#
+	# The browser's main thread was found parked in the code that reads this
+	# directory: its sandbox counts the entries to decide whether the process is
+	# single-threaded. Read it the same way twice from a process whose thread
+	# count is known, and compare with what the kernel reports elsewhere. A
+	# listing that disagrees with itself between reads, or with Threads:, is the
+	# fault; one that is stable and correct clears the directory entirely.
+	echo "I915-SWAY: task dir — self=$(ls /proc/self/task 2>&1 | wc -l) again=$(ls /proc/self/task 2>&1 | wc -l) Threads=$(grep -a '^Threads:' /proc/self/status 2>/dev/null | tr -d '\t ' | sed 's/Threads://')"
+	# And for a process that genuinely has many: sway is running by now.
+	swp=$(pidof sway 2>/dev/null | cut -d' ' -f1)
+	if [ -n "$swp" ]; then
+		echo "I915-SWAY: task dir — sway=$(ls /proc/$swp/task 2>&1 | wc -l) again=$(ls /proc/$swp/task 2>&1 | wc -l) Threads=$(grep -a '^Threads:' /proc/$swp/status 2>/dev/null | tr -d '\t ' | sed 's/Threads://')"
+	fi
+
+	# Does time pass correctly here?
+	#
+	# The browser is a queue of delayed tasks: almost nothing it does runs
+	# immediately, and a clock that jumps, stalls or runs at the wrong rate
+	# stops it dead while every other subsystem looks healthy — which is the
+	# shape of what we are left with. Two readings around a known sleep say
+	# whether a second in here is a second.
+	t_a=$(date +%s)
+	u_a=$(cut -d" " -f1 /proc/uptime)
+	sleep 5
+	t_b=$(date +%s)
+	u_b=$(cut -d" " -f1 /proc/uptime)
+	echo "I915-SWAY: clock check — wall $((t_b - t_a))s, uptime $u_a -> $u_b (expect 5s each)"
+	# And the monotonic clock the browser actually schedules on, read twice in
+	# a row: it must never go backwards and must not stand still.
+	m_a=$(date +%s%N 2>/dev/null)
+	m_b=$(date +%s%N 2>/dev/null)
+	echo "I915-SWAY: monotonic pair $m_a $m_b"
+	# Resolution, from the kernel rather than from `date`: busybox's date has
+	# no %N, so ten readings of it measure seconds and say nothing about the
+	# clock underneath — the first version of this check "measured" 10 ms
+	# resolution as 2 distinct values and meant nothing. /proc/timer_list
+	# reports what the monotonic clock actually is.
+	echo "I915-SWAY: clock source: $(grep -a -m1 'monotonic' /proc/timer_list 2>/dev/null ||
+		echo '(no /proc/timer_list)')"
 
 	# The size the browser actually asks for.
 	#
@@ -622,7 +664,7 @@ PROOF
 	# run that has a window to wait for.
 	if grep -q "b1nix.headless-browser" /proc/cmdline 2>/dev/null; then
 	echo "I915-SWAY: headless check t=$(up)"
-	timeout -k 5 240 /usr/bin/chromium --headless --no-sandbox --no-zygote \
+	timeout -k 5 600 /usr/bin/chromium --headless --no-sandbox --no-zygote \
 		--disable-gpu --disable-dev-shm-usage \
 		--user-data-dir=/tmp/chromium-headless \
 		--virtual-time-budget=5000 --dump-dom \
@@ -632,6 +674,116 @@ PROOF
 	head -6 /var/chromium-headless.log 2>/dev/null | sed 's/^/    /'
 	echo "  headless bytes: $(wc -c < /var/chromium-headless.log 2>/dev/null)"
 	fi
+
+	# How long does merely starting this binary take?
+	#
+	# The helper process the browser launches gives itself fifteen seconds to
+	# connect, and every syscall traced from it was the loader reading another
+	# shared object's header. If loading alone costs more than that deadline,
+	# nothing about the channel matters — the helper is killed before it ever
+	# looks at it. `--version` loads the same libraries and then exits, which
+	# makes the cost measurable on its own.
+	# Does the browser work at all without a window system?
+	#
+	# Everything so far says the browser starts, initialises and then sits
+	# idle — every thread parked — without ever asking for a window. That has
+	# two very different explanations: its own machinery is stuck somewhere
+	# before it would create one, or the machinery is fine and only the path
+	# that talks to a compositor is not. Headless mode uses neither Wayland nor
+	# a compositor and renders straight to a file, so it separates the two in
+	# one attempt.
+	# Two attempts, because they need different amounts of the browser.
+	#
+	# Printing the page's contents needs a renderer that loaded and parsed the
+	# document, and nothing else. A screenshot needs that AND a composited
+	# frame. Running both says which half is missing rather than only that a
+	# picture failed to appear.
+	echo "I915-SWAY: dom start t=$(up)"
+	timeout -k 5 90 /usr/bin/chromium --headless=new --no-sandbox \
+		--disable-gpu --disable-dev-shm-usage \
+		--user-data-dir=/tmp/chromium-dom \
+		--virtual-time-budget=4000 \
+		--dump-dom file:///root/browser-proof.html > /var/dom.log 2>&1
+	echo "I915-SWAY: dom exit=$? t=$(up) bytes=$(wc -c < /var/dom.log 2>/dev/null)"
+	echo "--- dom output (first 5 lines) ---"
+	head -5 /var/dom.log 2>/dev/null
+	echo "--- end dom output ---"
+
+	# The emptiest possible page, in the simplest possible arrangement.
+	#
+	# The document above never rendered, so the next question is whether
+	# anything renders at all. about:blank removes the file system from the
+	# path; --single-process removes the separate renderer process and the
+	# channel to it. Between them, a failure here means the rendering engine
+	# itself does not run, and a success means the missing piece is whichever
+	# of the two was removed.
+	echo "I915-SWAY: blank start t=$(up)"
+	timeout -k 5 60 /usr/bin/chromium --headless=new --no-sandbox \
+		--disable-gpu --disable-dev-shm-usage \
+		--user-data-dir=/tmp/chromium-blank \
+		--virtual-time-budget=2000 \
+		--dump-dom about:blank > /var/blank.log 2>&1
+	echo "I915-SWAY: blank exit=$? t=$(up) dom=$(grep -ac '<html' /var/blank.log 2>/dev/null)"
+
+	# Without the virtual-time budget.
+	#
+	# Every attempt so far asked the browser to finish after a fixed amount of
+	# its own internal time, and that mechanism advances on the browser's clock
+	# rather than the wall. If that clock does not advance the way it expects,
+	# the finish never arrives and the page is never printed — which looks
+	# exactly like a page that never loaded. Ask without a budget and let it
+	# finish on its own.
+	echo "I915-SWAY: novt start t=$(up)"
+	# Left running in silence, so the kernel's watchdog takes its snapshot.
+	#
+	# This is now the smallest case that still fails — one process, a blank
+	# page, no window system — so a task dump of it is readable rather than a
+	# wall of threads from three processes. The dump only fires after a minute
+	# with nothing on the console, hence the quiet wait rather than a loop that
+	# reports progress.
+	( timeout -k 5 150 /usr/bin/chromium --headless=new --no-sandbox \
+		--single-process --disable-gpu --disable-dev-shm-usage \
+		--user-data-dir=/tmp/chromium-novt \
+		--enable-logging=stderr --v=1 \
+		--dump-dom about:blank > /var/novt.log 2>&1 & ) 
+	sleep 100
+	echo "I915-SWAY: novt after-quiet t=$(up) dom=$(grep -ac '<html' /var/novt.log 2>/dev/null)"
+	pkill -f "chromium-novt" 2>/dev/null
+	echo "--- novt: last 30 lines (minimal case: blank page, one process) ---"
+	tail -30 /var/novt.log 2>/dev/null
+	echo "--- end novt ---"
+
+	echo "I915-SWAY: single start t=$(up)"
+	timeout -k 5 60 /usr/bin/chromium --headless=new --no-sandbox \
+		--single-process --disable-gpu --disable-dev-shm-usage \
+		--user-data-dir=/tmp/chromium-single \
+		--virtual-time-budget=2000 \
+		--dump-dom about:blank > /var/single.log 2>&1
+	echo "I915-SWAY: single exit=$? t=$(up) dom=$(grep -ac '<html' /var/single.log 2>/dev/null)"
+
+	echo "I915-SWAY: headless start t=$(up)"
+	rm -f /tmp/headless.png
+	# With its own log turned on: without --enable-logging the browser writes
+	# nothing at all, and an empty file then says only that it was not asked to
+	# speak, not that it had nothing to say.
+	timeout -k 5 120 /usr/bin/chromium --headless=new --no-sandbox \
+		--disable-gpu --disable-dev-shm-usage \
+		--user-data-dir=/tmp/chromium-headless \
+		--enable-logging=stderr --v=1 \
+		--virtual-time-budget=4000 \
+		--screenshot=/tmp/headless.png \
+		file:///root/browser-proof.html > /var/headless.log 2>&1
+	echo "I915-SWAY: headless exit=$? t=$(up) png=$(ls -l /tmp/headless.png 2>/dev/null | awk '{print $5}')"
+	echo "--- headless: errors and warnings ---"
+	grep -aE "ERROR|WARNING|FATAL|NOTREACHED|Check failed" /var/headless.log 2>/dev/null |
+		head -20
+	echo "--- headless: last 25 lines ---"
+	tail -25 /var/headless.log 2>/dev/null
+	echo "--- end headless log ---"
+
+	echo "I915-SWAY: load-cost start t=$(up)"
+	/usr/bin/chromium --version 2>&1 | head -1
+	echo "I915-SWAY: load-cost end   t=$(up)"
 
 	echo "I915-SWAY: starting chromium on $WAYLAND_DISPLAY t=$(up)"
 	# The display name is the one discovered above, not a guess: sway names its
@@ -658,6 +810,7 @@ PROOF
 			--disable-gpu --use-gl=swiftshader \
 			--disable-gpu-compositing \
 			--in-process-gpu \
+			--single-process \
 			--disable-dev-shm-usage --user-data-dir=/tmp/chromium-profile \
 			--disable-accelerated-video-decode --disable-accelerated-video-encode \
 			--ozone-platform-hint=wayland \
@@ -665,9 +818,33 @@ PROOF
 			--vmodule=*wayland*=3,*ozone*=3,*platform_window*=3 \
 			--disable-features=VaapiVideoDecoder,VaapiVideoEncoder,VaapiIgnoreDriverChecks,WaylandFractionalScaleV1 \
 			--v=1 \
-			file:///root/browser-proof.html > /var/chromium.log 2>&1
+			--app=file:///root/browser-proof.html > /var/chromium.log 2>&1
 		echo "CHROMIUM-EXIT rc=$?"
 	) &
+
+	# Who the browser's children are, while they are still alive.
+	#
+	# The one child it starts dies after fifteen seconds — its IPC channel never
+	# connects — and by the time anything looks, it is a zombie with an empty
+	# cmdline. Which process it was decides the diagnosis: a network service
+	# means the profile is waiting on it, a renderer means the window already
+	# existed. Sample often and briefly; the interesting window is the first
+	# half minute.
+	(
+		n=0
+		while [ "$n" -lt 30 ]; do
+			for p in /proc/[0-9]*; do
+				c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+				case "$c" in
+					*--type=*) echo "CHILD ${p#/proc/}: $(echo "$c" |
+						grep -oE '\-\-type=[a-z-]+|--utility-sub-type=[a-zA-Z.]+' |
+						tr '\n' ' ')" ;;
+				esac
+			done
+			n=$((n + 1))
+			sleep 1
+		done
+	) > /var/children.log 2>&1 &
 
 	# Wait on the clock, not on a loop count: every iteration here spawns
 	# swaymsg, and on one vCPU with an eagerly-loaded 220 MB binary next door
@@ -697,9 +874,28 @@ PROOF
 	# Give it a moment to exist before asking whether it died: the first check
 	# used to run before the process had even exec'd and reported it gone at 0s,
 	# which stopped the watch while the browser was in fact starting fine.
+	# A deliberate silence, so the kernel's watchdog will speak.
+	#
+	# The task dump that names what a parked thread is waiting on only fires
+	# after sixty seconds with nothing on the console — and this loop prints
+	# every fifteen, so it never fired while the browser was stalled. The stall
+	# happens within ten seconds of the browser starting, so hold quiet across
+	# it and let the watchdog take its snapshot.
+	sleep 100
+
 	sleep 20
 	while [ "$(date +%s)" -lt "$deadline" ]; do
-		if swaymsg -t get_tree 2>/dev/null | grep -qi chromium; then
+		# Bounded, because this is also a probe of the compositor.
+		#
+		# An unbounded swaymsg blocks this whole watch when sway stops
+		# answering its socket, and a watch that never comes round again looks
+		# exactly like a run in which nothing happened: no verdict, no browser
+		# log, just a timeout. Several runs were lost that way. Ask with a
+		# deadline, and say so when it is not met.
+		tree=$(timeout -k 2 5 swaymsg -t get_tree 2>/dev/null)
+		if [ -z "$tree" ]; then
+			echo "I915-SWAY: compositor did not answer get_tree within 5s"
+		elif echo "$tree" | grep -qi chromium; then
 			win=1
 			break
 		fi
@@ -740,7 +936,7 @@ PROOF
 		echo "I915-SWAY: FAIL chromium-window (alive, no window after $(($(date +%s) - t0))s)"
 	fi
 	echo "--- chromium tree ---"
-	swaymsg -t get_tree 2>&1 | grep -iE "app_id|name|pid" | head -40
+	timeout -k 2 10 swaymsg -t get_tree 2>&1 | grep -iE "app_id|name|pid" | head -40
 	echo "--- end chromium tree ---"
 	# Chromium's output goes to sway's stderr, which is this console — the two
 	# attempts to put it in a file failed because neither /tmp nor /var was
@@ -755,6 +951,10 @@ PROOF
 	# guessed from a tail. A client that binds the globals and stops has a
 	# different problem from one that creates surfaces but never gives them a
 	# toplevel, and the tail of a 100k-line trace shows neither.
+	echo "--- child processes seen alive ---"
+	sort -u /var/children.log 2>/dev/null | head -12 | sed 's/^/  /'
+	echo "  (none seen)" | head -$([ -s /var/children.log ] && echo 0 || echo 1)
+
 	echo "--- wayland protocol summary ---"
 	for req in wl_registry.bind create_surface xdg_surface get_toplevel \
 	           set_title commit attach; do

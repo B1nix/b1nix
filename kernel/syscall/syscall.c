@@ -1559,7 +1559,16 @@ static isize sys_clock_getres(int clk_id, struct timespec *user_res) {
     return 0; /* Linux allows a NULL res: the call then only validates clk_id */
   struct timespec res;
   res.tv_sec = 0;
-  res.tv_nsec = is_cpu_clock ? 1 : 10000000; /* 1 tick at 100 Hz */
+  /* Report what the clock actually does. A program that reads 10 ms here and
+   * then measures in microseconds concludes its own measurements are noise —
+   * and one told 1 ns by a clock that moves in 10 ms steps is misled the other
+   * way. COARSE clocks stay on the tick and say so. */
+  if (is_cpu_clock)
+    res.tv_nsec = 1;
+  else if (clk_id == 5 || clk_id == 6) /* the *_COARSE pair */
+    res.tv_nsec = 10000000;
+  else
+    res.tv_nsec = arch_tsc_clock_ready() ? 1 : 10000000;
   if (syscall_copyout(user_res, &res, sizeof(res)) != 0)
     return -EFAULT;
   return 0;
@@ -2598,15 +2607,33 @@ static int select_poll_signal_pending(void) {
   return scheduler_signal_pending();
 }
 
+#define POLL_STACK_FDS 64
+
 static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
-  /* 64: displayd alone polls 4 + MAX_CLIENTS(32) = 36 fds; the old cap of 16
-   * silently dropped the tail of the array (those fds were never polled and
-   * their revents never written back). */
-  struct b1nix_pollfd fds[64];
-  if (nfds > 64)
-    nfds = 64;
-  if (syscall_copyin(fds, user_fds, nfds * sizeof(struct b1nix_pollfd)) < 0)
+  /* As many descriptors as the caller actually passed.
+   *
+   * The array used to be a fixed 64 on the kernel stack and anything past it
+   * was dropped — silently, without EINVAL: those descriptors were never
+   * polled and their revents never written back, so an event loop watching
+   * more than 64 things simply never heard about the rest and waited forever.
+   * An event loop with hundreds of descriptors is ordinary (a browser's is),
+   * so the common case stays on the stack and a larger set is allocated. */
+  struct b1nix_pollfd stack_fds[POLL_STACK_FDS];
+  struct b1nix_pollfd *fds = stack_fds;
+  struct b1nix_pollfd *heap_fds = 0;
+
+  if (nfds > SCHED_MAX_FD_LIMIT)
+    return -EINVAL; /* more than a process can even have open */
+  if (nfds > POLL_STACK_FDS) {
+    heap_fds = kmalloc(nfds * sizeof(struct b1nix_pollfd));
+    if (!heap_fds)
+      return -ENOMEM;
+    fds = heap_fds;
+  }
+  if (syscall_copyin(fds, user_fds, nfds * sizeof(struct b1nix_pollfd)) < 0) {
+    kfree(heap_fds);
     return -EFAULT;
+  }
 
   u64 start_ticks = scheduler_get_uptime_ticks();
   u64 timeout_ticks = timeout == (u64)-1 ? (u64)-1 : timeout / 10;
@@ -2651,6 +2678,7 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
       syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
+      kfree(heap_fds);
       return (u64)ready;
     }
 
@@ -2661,6 +2689,7 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
     if (select_poll_signal_pending()) {
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
+      kfree(heap_fds);
       return (u64)-ERESTARTSYS;
     }
 
@@ -2847,6 +2876,17 @@ struct syscall_cmsghdr {
 #define K_MSG_CTRUNC 0x08
 #define K_CMSG_ALIGN(n) (((n) + sizeof(usize) - 1) & ~(sizeof(usize) - 1))
 
+/* How many iovecs one sendmsg/recvmsg may carry.
+ *
+ * This is the size of the arrays the callers put on the KERNEL STACK, and the
+ * bound copyin_message validates against — the two must be the same number.
+ * They were not: the limit was raised to 64 (chromium's Mojo channel writes
+ * more than sixteen in one message) while the buffers stayed at 16, so a
+ * message with seventeen iovecs copied 1 KiB of caller-controlled data over a
+ * 256-byte stack array. That is a kernel stack overflow reachable from any
+ * process that sends a large message. */
+#define SYSCALL_IOV_MAX 64
+
 static int copyin_message(const struct syscall_msghdr *user_msg,
                           struct syscall_msghdr *msg,
                           struct syscall_iovec *iov, char **payload,
@@ -2855,7 +2895,8 @@ static int copyin_message(const struct syscall_msghdr *user_msg,
     return -EFAULT;
   /* IOV_MAX is 1024 on Linux; sixteen was our own invention and chromium's
    * Mojo channel writes more than that in one message. */
-  if (msg->msg_iovlen < 1 || msg->msg_iovlen > 64 || !msg->msg_iov)
+  if (msg->msg_iovlen < 1 || msg->msg_iovlen > SYSCALL_IOV_MAX ||
+      !msg->msg_iov)
     return -EINVAL;
   if (syscall_copyin(iov, msg->msg_iov,
                      (usize)msg->msg_iovlen * sizeof(*iov)) < 0)
@@ -2883,7 +2924,7 @@ static int copyin_message(const struct syscall_msghdr *user_msg,
 static u64 sys_sendmsg(int fd, const struct syscall_msghdr *user_msg,
                        int flags) {
   struct syscall_msghdr msg;
-  struct syscall_iovec iov[16];
+  struct syscall_iovec iov[SYSCALL_IOV_MAX];
   char *payload = 0;
   usize payload_len = 0;
   int err = copyin_message(user_msg, &msg, iov, &payload, &payload_len);
@@ -2998,7 +3039,7 @@ sendmsg_fail:
 
 static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
   struct syscall_msghdr msg;
-  struct syscall_iovec iov[16];
+  struct syscall_iovec iov[SYSCALL_IOV_MAX];
   char *payload = 0;
   usize payload_len = 0;
   int err = copyin_message(user_msg, &msg, iov, &payload, &payload_len);
@@ -3544,6 +3585,24 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
    * the range it requires, and treats a hint it did not get as a failure to
    * allocate — reporting "out of memory" while every mmap in the log returned
    * success. Printing both halves is what distinguishes the two. */
+  /* Any mapping placed below 4 GiB, whatever its size.
+   *
+   * That range is the kernel's identity window — 2 MiB supervisor pages — and
+   * userspace has no business being handed an address inside it. A pointer
+   * from there reached the browser's allocator and faulted on a page that is
+   * present but not user-accessible; whether the kernel handed it out is the
+   * question this answers. */
+  if (vaddr < 0x100000000ull) {
+    console_write("mmap: LOW address handed out: 0x");
+    console_write_hex64(vaddr);
+    console_write(" len 0x");
+    console_write_hex64((u64)length);
+    console_write(" want 0x");
+    console_write_hex64((u64)(usize)addr);
+    console_write(" task=");
+    console_write_dec(t->id);
+    console_write("\n");
+  }
   if (length >= (1u << 20) && bootinfo_has_flag("b1nix.trace-mmap")) {
     console_write("mmap: want 0x");
     console_write_hex64((u64)(usize)addr);
@@ -4316,6 +4375,11 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   if (!frame)
     return syscall_dispatch_traced(number, arg0, arg1, arg2, arg3, arg4, arg5,
                                    frame);
+  /* Remember where userspace called from. A thread that blocks in here is
+   * invisible to both the fault reporter and the tick sampler, so this is what
+   * makes its user stack walkable while it is still parked. Two stores. */
+  if (current_task)
+    task_set_syscall_entry(current_task, frame->rip, frame->rbp);
   sched_acct_enter_kernel();
   u64 r = syscall_dispatch_traced(number, arg0, arg1, arg2, arg3, arg4, arg5,
                                   frame);
@@ -7184,13 +7248,24 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)-EINVAL;
     u64 ticks = (u64)ts.tv_sec * 100 + (u64)ts.tv_nsec / 10000000;
     if (ticks == 0) ticks = 1;
+    u64 sleep_start = scheduler_get_uptime_ticks();
     scheduler_sleep_ticks(ticks);
+    /* Interrupted, not finished. A sleep cut short by a signal must say so,
+     * with the time left in `rem` — a caller told the sleep completed simply
+     * carries on, and one told nothing about the remainder cannot resume it.
+     * Programs park here with timeouts of years precisely because a signal is
+     * what they expect to end the wait. */
+    u64 slept = scheduler_get_uptime_ticks() - sleep_start;
+    int interrupted = slept < ticks && scheduler_signal_pending_any();
     if (arg1) {
-      struct timespec rem = {0, 0};
+      u64 left = interrupted ? (ticks - slept) : 0;
+      struct timespec rem;
+      rem.tv_sec = (i64)(left / 100);
+      rem.tv_nsec = (i64)((left % 100) * 10000000);
       if (syscall_copyout((void *)(usize)arg1, &rem, sizeof(rem)) != 0)
         return (u64)-EFAULT;
     }
-    return 0;
+    return interrupted ? (u64)-EINTR : 0;
   }
   case SYS_KILL: {
     /* POSIX kill(2) pid decoding: 0 = caller's process group, -1 = every
@@ -7888,14 +7963,30 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
      * CLOCK_MONOTONIC_COARSE(6), CLOCK_BOOTTIME(7) -> uptime monotonic clock.
      * b1nix has no separate boot/raw clocks. CLOCK_REALTIME(0) and
      * CLOCK_REALTIME_COARSE(5) -> wall clock. */
+    /* Resolution: the cycle counter where the CPU guarantees it runs at a
+     * constant rate, the 100 Hz tick otherwise. A tick-derived reading lands
+     * on a 10 ms boundary, which is too coarse for a program that schedules
+     * work in milliseconds — durations come back as 0 or 10 ms and nothing in
+     * between. COARSE clocks keep the tick on purpose: their whole contract is
+     * to be cheap and approximate. */
+    u64 mono_ns = (clk_id == 6 || clk_id == 5) ? 0 : arch_tsc_monotonic_ns();
+
     if (clk_id == 1 || clk_id == 4 ||
         clk_id == 6 || clk_id == 7) {
-      ktp.tv_sec = (i64)(ticks / 100);
-      ktp.tv_nsec = (i64)((ticks % 100) * 10000000);
+      if (mono_ns) {
+        ktp.tv_sec = (i64)(mono_ns / 1000000000ull);
+        ktp.tv_nsec = (i64)(mono_ns % 1000000000ull);
+      } else {
+        ktp.tv_sec = (i64)(ticks / 100);
+        ktp.tv_nsec = (i64)((ticks % 100) * 10000000);
+      }
     } else {
-      /* CLOCK_REALTIME / CLOCK_REALTIME_COARSE: epoch-based wall clock. */
+      /* CLOCK_REALTIME / CLOCK_REALTIME_COARSE: epoch-based wall clock. The
+       * seconds come from the wall clock; the sub-second part comes from the
+       * same fine source, so two readings a microsecond apart differ. */
       ktp.tv_sec = (i64)vfs_get_unix_time();
-      ktp.tv_nsec = (i64)((ticks % 100) * 10000000);
+      ktp.tv_nsec = mono_ns ? (i64)(mono_ns % 1000000000ull)
+                            : (i64)((ticks % 100) * 10000000);
     }
     if (syscall_copyout((void *)(usize)arg1, &ktp, sizeof(struct timespec)) != 0) {
       return (u64)-EFAULT;
@@ -8271,6 +8362,49 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_EXIT_GROUP:
     scheduler_exit_group((int)arg0);
     ret = 0;
+    break;
+
+  case SYS_SCHED_GETSCHEDULER:
+    /* One policy for every task here, so the honest answer is SCHED_OTHER (0)
+     * rather than ENOSYS. A crash reporter asks this per thread while walking
+     * a process and logs a failure for each one when it is missing. */
+    ret = 0;
+    break;
+  case SYS_SCHED_SETSCHEDULER:
+    /* Accept a request for the policy we already run, refuse the rest — a
+     * silent "yes" to SCHED_FIFO would promise real-time scheduling that this
+     * kernel does not provide. */
+    ret = ((int)arg1 == 0) ? 0 : (u64)-EINVAL;
+    break;
+  case SYS_SCHED_GETPARAM: {
+    /* sched_param is one int, and under SCHED_OTHER it is always zero. */
+    int prio = 0;
+    if (arg1 && syscall_copyout((void *)(usize)arg1, &prio, sizeof(prio)) != 0)
+      return (u64)-EFAULT;
+    ret = 0;
+    break;
+  }
+  case SYS_SCHED_SETPARAM:
+    ret = 0;
+    break;
+  case SYS_SCHED_GET_PRIORITY_MAX:
+  case SYS_SCHED_GET_PRIORITY_MIN:
+    /* SCHED_OTHER's range is [0, 0] on Linux too. */
+    ret = ((int)arg0 == 0) ? 0 : (u64)-EINVAL;
+    break;
+
+  case SYS_SET_ROBUST_LIST:
+    /* Remembered, not acted on. A robust mutex held by a thread that dies is
+     * still not released — that needs the list walked at exit, which is not
+     * implemented. Accepting the registration is what libc expects, and it
+     * costs nothing; the previous mapping onto sync(2) cost a full filesystem
+     * flush per thread created. */
+    ret = 0;
+    break;
+  case SYS_GET_ROBUST_LIST:
+    /* Nothing is stored, so report an empty registration rather than claim a
+     * list exists. */
+    ret = (u64)-ENOSYS;
     break;
 
   case SYS_SET_TID_ADDRESS:

@@ -531,13 +531,34 @@ static void apic_timer_calibrate_against_pit(void) {
      * was to publish nothing at all. */
     {
         u64 tsc_elapsed = (tsc_end > tsc_start) ? (tsc_end - tsc_start) : 0;
-        if (tsc_elapsed)
+        u32 exact_khz = arch_tsc_khz_from_cpuid();
+
+        /* Prefer the figure the CPU states outright.
+         *
+         * CPUID leaf 15h publishes the TSC-to-core-crystal ratio and the
+         * crystal's frequency, which is the TSC rate exactly — no measurement,
+         * no window, no error. The PIT loop above can only ever estimate it,
+         * and whatever it gets wrong is carried straight into
+         * arch_tsc_monotonic_ns, i.e. into every clock_gettime the system
+         * answers. An error of a few hundred parts per million is invisible in
+         * a boot message and obvious over an hour of uptime.
+         *
+         * The measurement stays as the fallback: leaf 15h is absent on older
+         * parts and reports a zero crystal frequency on some hypervisors. */
+        if (exact_khz)
+            arch_set_cpu_khz(exact_khz);
+        else if (tsc_elapsed)
             arch_set_cpu_khz(tsc_elapsed / 10U); /* ticks per 10 ms -> kHz */
     }
 
+    /* The frequency is known now, so the cycle counter can serve as a clock —
+     * it is what gives clock_gettime a resolution better than one tick. */
+    arch_tsc_clock_init();
+
     console_write("lapic: calibrated against PIT: ");
     console_write_dec(g_lapic_ticks_per_ms);
-    console_write(" ticks/ms (div=16)\n");
+    console_write(" ticks/ms (div=16), monotonic clock: ");
+    console_write(arch_tsc_clock_ready() ? "TSC\n" : "tick (no invariant TSC)\n");
 }
 
 /* Bring up Application Processors.

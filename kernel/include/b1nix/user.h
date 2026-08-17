@@ -3,8 +3,17 @@
 
 #include <b1nix/types.h>
 
-#define USER_MAX_ARGS 32
-#define USER_MAX_ENVS 32
+/* Arguments and environment an exec may carry.
+ *
+ * Thirty-two of each, and the copy simply stopped there — no error, no
+ * indication. A browser's child process is started with forty to sixty
+ * arguments (--type=, --field-trial-handle=, feature lists) and an
+ * environment of comparable size, so it came up missing the flags that tell
+ * it what it is and which channel to use, and then behaved like a process
+ * that could not find its parent. sys_execve already copies up to 256 of
+ * each; this is the limit that was throwing them away. */
+#define USER_MAX_ARGS 256
+#define USER_MAX_ENVS 256
 /* Total PT_LOAD segments across the executable and every DT_NEEDED object in the
  * eager-linked graph. Deep C++ chains reach many objects × ~4 segments each
  * (the Skia demo: 11 objects × 4 = 44), so 32 is too small — 64 leaves room. */

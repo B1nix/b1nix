@@ -1,4 +1,5 @@
 #include <b1nix/filelock.h>
+#include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/errno.h>
 #include <b1nix/vfs.h>
@@ -194,10 +195,32 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
         return -EAGAIN;
       }
     }
+    unsigned long waited = 0;
     while (filelock_conflict_exists(inode, my_pid, start, fl->l_len, fl->l_type)) {
       if (scheduler_signal_pending()) {
         spin_unlock_irqrestore(&filelock_lock, fl_flags);
         return -ERESTARTSYS;
+      }
+      /* Name the holder once a wait stops looking like contention.
+       *
+       * A blocking lock that never returns is indistinguishable from a
+       * process that simply has nothing to do, and from the outside both are
+       * "everything is waiting". Say which pid holds the range, so a wait that
+       * will never end can be told from one that is merely slow. */
+      if (++waited == 2000) {
+        int holder = 0;
+        for (int i = 0; i < MAX_FILE_LOCKS; i++) {
+          if (file_locks[i].active && file_locks[i].inode == inode &&
+              file_locks[i].pid != my_pid) {
+            holder = file_locks[i].pid;
+            break;
+          }
+        }
+        console_write("filelock: pid ");
+        console_write_dec((u64)my_pid);
+        console_write(" still waiting for a lock held by pid ");
+        console_write_dec((u64)holder);
+        console_write("\n");
       }
       /* SMP-safe blocking acquire (F_SETLKW). Publish BLOCKED, re-test the
        * conflict under the lock, then drop the lock before sleeping so a

@@ -2685,6 +2685,17 @@ int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
    * node it should find answers correctly when asked directly. Guessing which
    * path it reads has cost several rebuilds; this says so outright. Gated on a
    * cmdline flag, and only for /sys, so it costs nothing in a normal boot. */
+  /* Every open, when asked for. The browser's threads all wait on one
+   * initialiser inside libnss3 and nothing finishes it; what that initialiser
+   * touches — a device, a database, a directory that does not exist — is the
+   * question, and it is answered by the last file it managed to open. */
+  if (bootinfo_has_flag("b1nix.trace-open") && current_task) {
+    console_write("open: ");
+    console_write(path);
+    console_write(" by ");
+    console_write(current_task->name);
+    console_write("\n");
+  }
   if (bootinfo_has_flag("b1nix.trace-sysfs") && current_task &&
       ((path[0] == '/' && path[1] == 's' && path[2] == 'y' && path[3] == 's' &&
         (path[4] == '/' || path[4] == 0)) ||
@@ -5567,7 +5578,31 @@ int vfs_memfd_create(const char *name, u32 flags) {
   return fd;
 }
 
+/* How often each fcntl command is asked for.
+ *
+ * A thread was found spinning here — 72 million context switches deep, its
+ * process unable to finish exit_group because that thread never dies. The
+ * command is supported (nothing reports EINVAL), so the question is which one
+ * it repeats: a call that returns the same unhelpful answer forever looks
+ * exactly like a working call from inside the kernel. */
+static u64 g_fcntl_calls[64];
+
+void vfs_fcntl_dump_counts(void) {
+  console_write("fcntl calls:");
+  for (unsigned i = 0; i < 64; i++) {
+    if (!g_fcntl_calls[i])
+      continue;
+    console_write(" cmd");
+    console_write_dec(i);
+    console_write("=");
+    console_write_dec(g_fcntl_calls[i]);
+  }
+  console_write("\n");
+}
+
 int vfs_fcntl(int fd, int cmd, u64 arg) {
+  if (cmd >= 0 && cmd < 64)
+    g_fcntl_calls[cmd]++;
   struct vfs_handle *h = get_handle(fd);
   if (!h)
     return -EBADF; /* POSIX: a closed fd is EBADF, not the bare -1 that
@@ -5617,6 +5652,26 @@ int vfs_fcntl(int fd, int cmd, u64 arg) {
       return -EBADF;
     return filelock_set_lock(fd, cmd, (struct flock *)(usize)arg);
   default:
+    /* Name the command we are refusing.
+     *
+     * A caller that does not expect EINVAL here retries, and a retry loop is
+     * indistinguishable from a hang: a thread was found spinning on fcntl 72
+     * million context switches deep, which kept its process from ever
+     * finishing exit_group. Say which command, once per distinct value. */
+    {
+      static u32 seen[16];
+      static unsigned nseen;
+      unsigned i;
+      for (i = 0; i < nseen; i++)
+        if (seen[i] == (u32)cmd)
+          break;
+      if (i == nseen && nseen < 16) {
+        seen[nseen++] = (u32)cmd;
+        console_write("fcntl: unsupported command ");
+        console_write_dec((u64)(u32)cmd);
+        console_write(" -> EINVAL\n");
+      }
+    }
     return -EINVAL;
   }
 }

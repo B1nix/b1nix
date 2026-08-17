@@ -78,6 +78,12 @@
 #define LX_flock           73
 #define LX_mknod           133
 #define LX_sched_getaffinity 204
+#define LX_sched_setparam       142
+#define LX_sched_getparam       143
+#define LX_sched_setscheduler   144
+#define LX_sched_getscheduler   145
+#define LX_sched_get_priority_max 146
+#define LX_sched_get_priority_min 147
 #define LX_clock_getres    229
 #define LX_statx           332
 #define LX_init_module     175
@@ -246,6 +252,14 @@ static const struct lx_map lx_table[] = {
 	{LX_pipe,           SYS_PIPE,          "pipe"},
 	{LX_select,         SYS_SELECT,        "select"},
 	{LX_sched_yield,    SYS_YIELD,         "sched_yield"},
+	/* One scheduling policy for everyone, reported honestly rather than as
+	 * ENOSYS — a crash reporter asks per thread and logs a failure each time. */
+	{LX_sched_getscheduler, SYS_SCHED_GETSCHEDULER, "sched_getscheduler"},
+	{LX_sched_setscheduler, SYS_SCHED_SETSCHEDULER, "sched_setscheduler"},
+	{LX_sched_getparam,     SYS_SCHED_GETPARAM,     "sched_getparam"},
+	{LX_sched_setparam,     SYS_SCHED_SETPARAM,     "sched_setparam"},
+	{LX_sched_get_priority_max, SYS_SCHED_GET_PRIORITY_MAX, "sched_get_priority_max"},
+	{LX_sched_get_priority_min, SYS_SCHED_GET_PRIORITY_MIN, "sched_get_priority_min"},
 	{LX_madvise,        SYS_MADVISE,       "madvise"},
 	{LX_dup,            SYS_DUP,           "dup"},
 	{LX_dup2,           SYS_DUP2,          "dup2"},
@@ -358,8 +372,12 @@ static const struct lx_map lx_table[] = {
 	{LX_removexattr,    SYS_REMOVEXATTR,   "removexattr"},
 	{LX_lremovexattr,   SYS_REMOVEXATTR,   "lremovexattr"},
 	/* prlimit64 is a dispatcher special case (get+set in one call). */
-	{LX_set_robust_list, SYS_SYNC,         "set_robust_list"},
-	{LX_get_robust_list, SYS_SYNC,         "get_robust_list"},
+	/* NOT SYS_SYNC. These were mapped onto sync(2), and musl registers a
+	 * robust list from every pthread_create — so each new thread flushed the
+	 * entire filesystem to disk. A process starting a hundred threads paid a
+	 * hundred full syncs before it did any work of its own. */
+	{LX_set_robust_list, SYS_SET_ROBUST_LIST, "set_robust_list"},
+	{LX_get_robust_list, SYS_GET_ROBUST_LIST, "get_robust_list"},
 	{LX_io_setup,        SYS_IO_SETUP,     "io_setup"},
 	{LX_io_submit,       SYS_IO_SUBMIT,    "io_submit"},
 	{LX_io_getevents,    SYS_IO_GETEVENTS, "io_getevents"},

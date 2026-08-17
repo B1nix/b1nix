@@ -179,7 +179,19 @@ DROPBEAR_VERSION := 2022.83
 # The programs on the image are Alpine packages, unpacked with their own paths
 # into one staging root that the root-image rule copies over the image. These
 # name individual binaries in it, for the rules that embed or copy one.
+# Two staging roots, not one.
+#
+# B1NIX_BROWSER=1 adds Chromium and its closure — 241 MB — and both builds used
+# to unpack into the same directory. The browser packages then stayed there for
+# every later build, so an ordinary image carried a browser it never asked for
+# and stopped fitting in its 512 MB: `mke2fs: could not allocate block` on a
+# tree that had built fine an hour earlier, with nothing in the diff to explain
+# it. Keeping the two apart costs a directory and removes the interference.
+ifeq ($(B1NIX_BROWSER),1)
+PKGROOT := build/$(ARCH)/pkgroot-browser
+else
 PKGROOT := build/$(ARCH)/pkgroot
+endif
 CURL_ELF := $(PKGROOT)/usr/bin/curl
 DROPBEAR_ELF := $(PKGROOT)/usr/sbin/dropbear
 BMAKE_ELF := $(PKGROOT)/usr/bin/bmake
@@ -669,7 +681,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@echo "Analysis results in $(ANALYZE_DIR)"
 	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
 
-.PHONY: all analyze objects FORCE iso iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-live iso-test iso-full check-dynamic \
+.PHONY: all analyze objects FORCE iso iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-live iso-test iso-full check-dynamic iso-pass-chromium-disk iso-pass-chromium-disk-impl \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source install-ports root-image disk-image \
@@ -1328,7 +1340,7 @@ SMOKE_CMDLINE_pass-headless=b1nix.i915sway b1nix.sway-headless b1nix.vma-check
 # second one fails at "query renderer texture formats" and takes the whole
 # DRM backend down with it, leaving the compositor without wl_shm and the
 # browser with no way to hand over a buffer.
-SMOKE_CMDLINE_pass-chromium=b1nix.i915sway b1nix.chromium b1nix.task-watch b1nix.wlr-card b1nix.user-stack b1nix.sway-headless b1nix.window-wait=780 b1nix.trace-mmap b1nix.wayland-control
+SMOKE_CMDLINE_pass-chromium=b1nix.i915sway b1nix.chromium b1nix.task-watch b1nix.wlr-card b1nix.user-stack b1nix.sway-headless b1nix.window-wait=200 b1nix.wayland-control
 # The same cage run with a frame built to be photographed: saturated colour
 # across the whole screen and a client whose output changes, so a camera shot
 # says whether the panel is showing our picture rather than merely being lit.
@@ -1342,8 +1354,19 @@ SMOKE_CMDLINE_pass-bright=b1nix.i915sway b1nix.use-cage b1nix.bright b1nix.drm-d
 # kernel already looks for a disk labelled b1nix-root before it considers the
 # module, so handing the same image to QEMU as a disk lets it be read on demand
 # instead. Same image, same kernel; only the delivery changes.
-iso-pass-chromium-disk: root-image check-dynamic $(KERNEL_ELF)
-	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-pass-chromium-disk.iso \
+# The browser image asks for the browser itself rather than relying on a
+# previous build having left it in the staging root — which is how an ordinary
+# image came to carry one and stopped fitting.
+#
+# A second make rather than a target-specific variable: B1NIX_BROWSER selects
+# the staging root and the image size through conditionals that are evaluated
+# when this file is read, so it has to be set before make starts, not while it
+# runs.
+iso-pass-chromium-disk:
+	@$(MAKE) --no-print-directory B1NIX_BROWSER=1 iso-pass-chromium-disk-impl
+
+iso-pass-chromium-disk-impl: root-image check-dynamic $(KERNEL_ELF)
+	@$(MKISO) --stage $(BUILD_DIR)/iso-pass-chromium-disk --out $(BUILD_DIR)/b1nix-pass-chromium-disk.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_pass-chromium)"
 
@@ -1715,6 +1738,23 @@ endif
 	@# here. Directories are created rather than replaced, because /usr/lib in
 	@# the image is a link to /lib.
 	@$(MAKE) --no-print-directory $(PKGROOT_STAMP)
+	@# Separate staging roots are not enough on their own: this rootfs is
+	@# merged into, never rebuilt, so whatever a browser build copied here once
+	@# stays for every ordinary image afterwards — and 241 MB of browser is the
+	@# difference between fitting in 512 MB and mke2fs refusing to allocate a
+	@# block. Before an ordinary image, take back out whatever belongs only to
+	@# the browser root, derived by comparing the two rather than by naming
+	@# paths that would drift.
+	@if [ "$(B1NIX_BROWSER)" != "1" ] && [ -d $(BUILD_DIR)/pkgroot-browser ]; then \
+		(cd $(BUILD_DIR)/pkgroot-browser && find . ! -type d ! -name .installed -print) \
+			| while read -r f; do \
+				[ -e "$(BUILD_DIR)/pkgroot/$$f" ] || rm -f "$(BUILD_DIR)/rootfs/$$f"; \
+			done; \
+		(cd $(BUILD_DIR)/pkgroot-browser && find . -type d -print) \
+			| while read -r d; do \
+				[ -e "$(BUILD_DIR)/pkgroot/$$d" ] || rmdir "$(BUILD_DIR)/rootfs/$$d" 2>/dev/null || true; \
+			done; \
+	fi
 	@(cd $(PKGROOT) && find . -type d -exec mkdir -p $(CURDIR)/$(BUILD_DIR)/rootfs/{} \;)
 	@(cd $(PKGROOT) && find . ! -type d ! -name .installed \
 		-exec cp -a --remove-destination {} $(CURDIR)/$(BUILD_DIR)/rootfs/{} \;)

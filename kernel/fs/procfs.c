@@ -113,6 +113,7 @@ static void sb_puts(struct sbuf *s, const char *str) {
 /* Append one raw byte, including '\0' — /proc/<pid>/environ and cmdline are
  * NUL-separated, which sb_puts (string-terminated) cannot express. */
 static void sb_putc(struct sbuf *s, char c) {
+  sb_grow(s, 1);
   if (s->len + 1 >= s->cap)
     return;
   s->p[s->len++] = c;
@@ -827,7 +828,11 @@ static int r_pid_status(usize pid, struct sbuf *s) {
     usize slots = scheduler_task_slots();
     for (usize i = 0; i < slots; i++) {
       struct task *o = scheduler_task_slot(i);
-      if (o && o->id && task_tgid(o) == tgid)
+      /* Living threads only — same reason as /proc/<pid>/task: a count that
+       * still includes threads which have exited never drops to one, and a
+       * sandbox waits for exactly that before it will initialise. */
+      if (o && o->id && task_tgid(o) == tgid && o->state != TASK_DEAD &&
+          o->state != TASK_REAPING && o->state != TASK_UNUSED)
         nthreads++;
     }
     sb_addf(s, "Threads:\t%lu\n", (unsigned long)(nthreads ? nthreads : 1));
@@ -840,7 +845,22 @@ static int r_pid_status(usize pid, struct sbuf *s) {
 
 static int r_pid_cmdline(usize pid, struct sbuf *s) {
   struct task *t = scheduler_task_by_pid(pid);
-  if (t && t->name)
+  if (!t)
+    return 0;
+
+  /* The recorded argument vector, NUL separators and all — that is the format
+   * every reader of this file expects, and the separators are what let it be
+   * split back into arguments. Falls back to the executable path for a task
+   * that has none (a kernel thread, or one that never exec'd). */
+  usize len = 0;
+  const char *argv = task_cmdline(t, &len);
+  if (argv && len) {
+    for (usize i = 0; i < len; i++)
+      sb_putc(s, argv[i]);
+    return 0;
+  }
+
+  if (t->name)
     sb_puts(s, t->name);
   return 0;
 }
@@ -874,7 +894,11 @@ static int r_pid_stat(usize pid, struct sbuf *s) {
     usize slots = scheduler_task_slots();
     for (usize i = 0; i < slots; i++) {
       struct task *o = scheduler_task_slot(i);
-      if (o && o->id && task_tgid(o) == tgid)
+      /* Living threads only — same reason as /proc/<pid>/task: a count that
+       * still includes threads which have exited never drops to one, and a
+       * sandbox waits for exactly that before it will initialise. */
+      if (o && o->id && task_tgid(o) == tgid && o->state != TASK_DEAD &&
+          o->state != TASK_REAPING && o->state != TASK_UNUSED)
         nthreads++;
     }
     if (!nthreads)
@@ -1260,7 +1284,9 @@ static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
                                struct dirent *buf, usize max_entries) {
   usize pid = pid_from_parent(dir); /* dir->parent is the /proc/<pid> dir */
   struct task *t = scheduler_task_by_pid(pid);
-  if (t) {
+  /* Only at the start of a read, for the same reason as task/ above: a listing
+   * that changes between chunks has no stable end for the reader to reach. */
+  if (t && offset == 0) {
     /* Sized from the task's fd table rather than capped at a constant.
      *
      * The snapshot used to be 64 entries on the kernel stack while the limit
@@ -1291,6 +1317,55 @@ static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
       nsnap++;
     }
     spin_unlock_irqrestore(&t->fd_lock, flags);
+    /* Take out what is no longer open before putting in what is.
+     *
+     * This directory was only ever added to: an entry created for a descriptor
+     * stayed after the descriptor was closed, and /proc/self is a single node
+     * shared by every process, so entries also accumulated across processes
+     * that had nothing to do with each other. A reader therefore saw
+     * descriptors it did not hold — its own closed ones, and other processes'.
+     *
+     * That is not a cosmetic error. A program that launches helpers decides
+     * which descriptors to close by enumerating exactly this directory, so a
+     * listing with strangers in it makes it close numbers that mean something
+     * else in this process. Chromium's zygote does this and then failed to
+     * answer its parent, which is the shape that led here.
+     *
+     * Rebuilt from the calling task's table on every fresh read, which also
+     * settles the shared-node problem: whatever the previous reader left is
+     * removed before this reader's own descriptors are added. */
+    {
+      struct vfs_node *child = dir->first_child;
+      while (child) {
+        struct vfs_node *next = child->next_sibling;
+        int numeric = child->name[0] != '\0';
+        int fd = 0;
+
+        for (const char *q = child->name; *q; q++) {
+          if (*q < '0' || *q > '9') {
+            numeric = 0;
+            break;
+          }
+          fd = fd * 10 + (*q - '0');
+        }
+
+        if (numeric) {
+          int still_open = 0;
+          for (usize i = 0; i < nsnap; i++) {
+            if (snap[i].fd == fd) {
+              still_open = 1;
+              break;
+            }
+          }
+          if (!still_open) {
+            vfs_detach_child(dir, child);
+            vfs_node_put(child);
+          }
+        }
+        child = next;
+      }
+    }
+
     for (usize i = 0; i < nsnap; i++) {
       procfs_fd_resolve(&snap[i]);
       procfs_fd_symlink(dir, snap[i].fd, snap[i].target);
@@ -1506,7 +1581,16 @@ static isize procfs_task_readdir(struct vfs_node *dir, usize offset,
                                  struct dirent *buf, usize max_entries) {
   usize pid = pid_from_parent(dir); /* dir->parent is the /proc/<pid> dir */
   struct task *leader = scheduler_task_by_pid(pid);
-  if (leader) {
+  /* Rebuild the listing only when a read starts.
+   *
+   * This directory is read in chunks: the caller asks from offset 0, then from
+   * where it left off. Re-synchronising on every one of those calls means the
+   * entries move underneath the reader — threads appear, exit and are removed
+   * between chunks — and a reader that never sees a stable end keeps asking.
+   * That is what a browser hangs on here: its sandbox counts the entries in
+   * /proc/self/task to decide whether it is single-threaded, and it counted
+   * forever. Snapshot at the start, then serve the walk from it. */
+  if (leader && offset == 0) {
     usize tgid = task_tgid(leader);
     usize slots = scheduler_task_slots();
 
@@ -1535,7 +1619,10 @@ static isize procfs_task_readdir(struct vfs_node *dir, usize offset,
       }
       if (numeric) {
         struct task *t = scheduler_task_by_pid(tid);
-        if (!t || !t->id || task_tgid(t) != tgid) {
+        /* Gone, or dead and merely not reaped yet — both must leave the
+         * listing, or a caller counting threads never sees the count drop. */
+        if (!t || !t->id || task_tgid(t) != tgid || t->state == TASK_DEAD ||
+            t->state == TASK_REAPING || t->state == TASK_UNUSED) {
           vfs_detach_child(dir, child);
           vfs_node_put(child);
         }
@@ -1545,8 +1632,24 @@ static isize procfs_task_readdir(struct vfs_node *dir, usize offset,
 
     for (usize i = 0; i < slots; i++) {
       struct task *t = scheduler_task_slot(i);
-      if (t && t->id && task_tgid(t) == tgid)
-        procfs_make_tiddir(dir, t->id);
+
+      /* Living threads only.
+       *
+       * A thread that has exited keeps its slot until the reaper gets to it,
+       * and listing those made the directory report threads that are gone.
+       * That is not cosmetic: a sandbox stops every thread of a process and
+       * then waits for /proc/self/task to show exactly one entry before it
+       * will initialise. The corpses never left the listing, the count never
+       * reached one, and the wait never ended — which is precisely where the
+       * browser's GPU process was parked
+       * (sandbox::ThreadHelpers::IsSingleThreaded, reached from
+       * SandboxLinux::InitializeSandbox). */
+      if (!t || !t->id || task_tgid(t) != tgid)
+        continue;
+      if (t->state == TASK_DEAD || t->state == TASK_REAPING ||
+          t->state == TASK_UNUSED)
+        continue;
+      procfs_make_tiddir(dir, t->id);
     }
   }
   return vfs_readdir_children(dir, offset, buf, max_entries);

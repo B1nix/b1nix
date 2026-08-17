@@ -330,6 +330,10 @@ void task_set_alarm_ticks(struct task *t, u64 ticks);
 u64  task_alarm_interval_ticks(const struct task *t);
 void task_set_alarm_interval_ticks(struct task *t, u64 ticks);
 usize task_tgid(const struct task *t);
+/* The exec'd argument vector, NUL-separated, for /proc/<pid>/cmdline. */
+void task_set_cmdline(struct task *t, const char *const *argv);
+const char *task_cmdline(const struct task *t, usize *len_out);
+void task_clear_cmdline(struct task *t);
 /* M80: per-task XSAVE area (0 when the task keeps to the FXSAVE image in
  * struct task). task_fpu_alloc ensures one exists before a task runs userspace
  * code; it returns 0 when XSAVE is unavailable or memory is short, and the task
@@ -376,6 +380,13 @@ void sched_acct_on_switch(struct task *prev);
  * function a wedged thread group is spinning in. */
 u64  task_user_rip(const struct task *t);
 void task_set_user_rip(struct task *t, u64 rip);
+
+/* The userspace rip/rbp a task entered the kernel with. A thread blocked in a
+ * syscall is caught by neither the fault reporter nor the timer tick, so this
+ * is the only handle on what it was doing when it stopped. */
+void task_set_syscall_entry(struct task *t, u64 rip, u64 rbp);
+u64  task_syscall_entry_rip(const struct task *t);
+u64  task_syscall_entry_rbp(const struct task *t);
 int  scheduler_getrlimit(int resource, struct rlimit *rlim);
 int  scheduler_getrlimit_task(const struct task *t, int resource,
                               struct rlimit *rlim);
@@ -406,8 +417,31 @@ int  scheduler_setrlimit(int resource, const struct rlimit *rlim);
  * core has its own slot in struct percpu (cur_task), so APs and the BSP never
  * share one "current". Expands to an lvalue, so existing reads/writes
  * (current_task = t, current_task->field, current_task == 0) all work
- * unchanged. Requires GS to be initialized (percpu_init) before first use. */
+ * unchanged. Requires GS to be initialized (percpu_init) before first use.
+ *
+ * Reached through the GS segment rather than by asking the CPU for the GS base
+ * first. Both forms name the same slot; the difference is what it costs to get
+ * there. `get_percpu()` reads IA32_GS_BASE with RDMSR — a partially
+ * serialising instruction, and one the compiler cannot hoist or reuse because
+ * the read is volatile. `current_task` appears in nearly eight hundred places,
+ * including the syscall path, the scheduler and signal delivery, so that MSR
+ * read sat in every hot path in the kernel; signal dispatch alone did up to
+ * sixty-four of them per call, one per iteration of its loop over the signal
+ * table. A segment-relative access is a single MOV.
+ *
+ * This is what the syscall entry stub has always done — it reads the same slot
+ * as %gs:0x10 (kernel/arch/x86_64/syscall_entry.S). The C side now agrees with
+ * the assembly instead of taking the long way round.
+ *
+ * Still an lvalue, so `current_task = t` compiles as before, and `&current_task
+ * ->field` is an ordinary pointer: only the task pointer itself lives behind
+ * the segment, the task it names is in normal memory. */
+#ifdef __x86_64__
+#define percpu_this ((__seg_gs struct percpu *)0)
+#define current_task (percpu_this->cur_task)
+#else
 #define current_task (get_percpu()->cur_task)
+#endif
 
 /* ── Scheduler ── */
 
@@ -636,6 +670,9 @@ int scheduler_timer_delete(int id);
 void scheduler_timer_cleanup_task(usize task_id);
 void scheduler_deliver_pending_signals(void);
 int  scheduler_signal_pending(void);
+/* Any deliverable signal, handler or not — what a sleep must check to know it
+ * was cut short (SIGKILL has no handler and still ends the wait). */
+int  scheduler_signal_pending_any(void);
 /* M56 signalfd helpers. */
 u64  scheduler_peek_pending_signals(u64 mask);
 int  scheduler_consume_pending_signal(int sig);
