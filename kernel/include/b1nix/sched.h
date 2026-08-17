@@ -662,6 +662,13 @@ isize scheduler_getpgid(usize pid);
 void scheduler_mark_execed_current(void);
 int scheduler_is_pgrp_in_session(usize pgrp, usize session_id);
 u64 vm_find_free_area(struct task *t, usize length);
+
+/* Held across any walk or edit of a VMA list. Threads of one address space
+ * share the list, and an unsynchronised insert can join it into a ring — after
+ * which the next walk never returns. Sections must stay short: this is taken
+ * with interrupts disabled. */
+void vma_list_lock(u64 *flags);
+void vma_list_unlock(u64 flags);
 /* Link a mapping into the task's list in address order. Every insertion goes
  * through this: the order is what lets the free-area search run in one pass and
  * lets a lookup stop early. */

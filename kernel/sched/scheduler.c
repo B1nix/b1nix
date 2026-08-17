@@ -4738,6 +4738,75 @@ void scheduler_dump_tasks(void) {
           }
         }
       }
+      /* The USER stack of a wedged thread, when asked for.
+       *
+       * Everything above says where a thread is in the kernel; none of it says
+       * what the program was doing when it stopped. Chromium parks every thread
+       * on a mutex and creates no window, and from the kernel side the two
+       * cases — "waiting for work" and "waiting for a lock nobody will release"
+       * — are identical. The user stack tells them apart.
+       *
+       * The stack is read through the task's own page tables (it is not the
+       * running address space) and every value that lands inside one of its
+       * mappings is printed with that mapping's name and offset. Without frame
+       * pointers this over-reports — a dead slot looks like a return address —
+       * but a plausible-but-dead frame is easy to discount, and the module
+       * names alone say which layer is stuck. */
+      if (bootinfo_has_flag("b1nix.user-stack") && T(i)->saved_user_rsp &&
+          T(i)->pml4_phys && T(i)->vma_list) {
+        u64 sp = T(i)->saved_user_rsp;
+        unsigned shown = 0;
+
+        console_write("\n    user stack (rsp=0x");
+        console_write_hex64(sp);
+        console_write("):");
+        for (unsigned k = 0; k < 1024 && shown < 24; k++) {
+          u64 addr = sp + (u64)k * 8;
+          u64 page = addr & ~(u64)(PAGE_SIZE - 1);
+          u64 frame = paging_user_frame(T(i)->pml4_phys, page);
+          u64 value;
+
+          /* Skip, do not stop: a thread's stack is lazily backed, so the
+           * first slots above rsp are often not mapped yet and stopping there
+           * printed nothing at all. */
+          if (!frame)
+            continue;
+          value = *(volatile u64 *)(usize)(frame + vmm_direct_map_base() +
+                                           (addr & (PAGE_SIZE - 1)));
+          for (struct vm_area *v = T(i)->vma_list; v; v = v->next) {
+            /* In a mapping AND on an executable page. The VMA's prot cannot
+             * be trusted for this — the loader maps a library's text and the
+             * flag is not mirrored back, so every VMA reads non-executable —
+             * but the page table knows. Without this the walk printed pointers
+             * to data structures at tiny offsets and called them frames. */
+            /* A file mapping, and a page that is actually there.
+             *
+             * Executable code always comes from a file; anonymous memory is
+             * heap, thread stacks and JIT, and printing values that land there
+             * filled the walk with pointers to data. The page table cannot help
+             * — this kernel does not mark data pages non-executable — so the
+             * mapping's origin is the best available test. */
+            if (value >= v->start && value < v->end && v->node &&
+                v->node->name[0] &&
+                ({ u64 _pte = paging_user_pte(T(i)->pml4_phys,
+                                              value & ~(u64)(PAGE_SIZE - 1));
+                   (_pte & VMM_PRESENT) != 0; })) {
+              console_write("\n      0x");
+              console_write_hex64(value);
+              console_write(" ");
+              console_write(v->node && v->node->name[0] ? v->node->name
+                                                        : "<anonymous>");
+              console_write("+0x");
+              console_write_hex64(value - v->start);
+              console_write((v->prot & PROT_EXEC) ? " x" : " -");
+              shown++;
+              break;
+            }
+          }
+        }
+        console_write("\n");
+      }
+
       /* The kernel return addresses still on the task's stack. A blocked task
        * left them there, so they name the path that put it to sleep — which is
        * the one thing state and wait channel together still do not say. */
@@ -5844,16 +5913,40 @@ u64 scheduler_brk_get(void) {
  * insertion point keeps the order, and then a walk can stop at the first
  * mapping that starts past the address it wants.
  */
+/* Serialises every edit to a VMA list.
+ *
+ * The list is shared by all threads of an address space, and it was edited
+ * with no lock at all: two threads calling mmap at once each walked to the
+ * same insertion point and each wrote its own node's next pointer there, which
+ * either loses a mapping or joins the list into a ring. A ring is not a subtle
+ * failure — the next walk of it never ends, so a thread disappeared inside
+ * mmap with its state left RUNNING and its switch count frozen, unkillable,
+ * while the process it belonged to waited on it forever. chromium, which maps
+ * from many threads at once, hit this every run.
+ *
+ * One lock for all address spaces: mmap is not a hot path, the sections here
+ * are a few pointer writes long, and a per-space lock needs a home that
+ * struct task deliberately does not have. */
+static spinlock_t g_vma_lock = SPINLOCK_INIT;
+
+void vma_list_lock(u64 *flags) { spin_lock_irqsave(&g_vma_lock, flags); }
+void vma_list_unlock(u64 flags) { spin_unlock_irqrestore(&g_vma_lock, flags); }
+
 void vma_insert(struct task *t, struct vm_area *vma) {
   if (!t || !vma)
     return;
 
+  u64 vflags;
+  vma_list_lock(&vflags);
   struct vm_area **link = &t->vma_list;
 
   while (*link && (*link)->start < vma->start)
     link = &(*link)->next;
   vma->next = *link;
-  *link = vma;
+  /* Publish the node only after its own next pointer is set, so a walker
+   * that is not holding the lock never sees a half-linked entry. */
+  __atomic_store_n(link, vma, __ATOMIC_RELEASE);
+  vma_list_unlock(vflags);
   /* Only a new head has to be published to the threads sharing this address
    * space — they hold the head pointer, not the list. Publishing on every
    * insertion would walk the whole task table per mmap. */
@@ -5925,16 +6018,34 @@ u64 vm_find_free_area(struct task *t, usize length) {
    * been seen when the walk passes it.
    */
   u64 candidate = start;
+  u64 vflags;
 
+  /* Under the list lock: this walk is the one that hung when the list was a
+   * ring, and it must not run while another thread is relinking it. */
+  vma_list_lock(&vflags);
+  /* Bounded, so a list that is somehow still circular reports itself instead
+   * of hanging the caller in the kernel where nothing can kill it. No process
+   * legitimately holds anywhere near this many mappings. */
+  unsigned steps = 0;
   for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
+    if (++steps > 1000000u) {
+      vma_list_unlock(vflags);
+      console_write("vma: walk did not terminate — list is circular, pid ");
+      console_write_dec(t->id);
+      console_write("\n");
+      return (u64)-1;
+    }
     if (vma->end <= candidate)
       continue; /* entirely below the candidate */
     if (vma->start >= candidate + length)
       break;    /* the gap before this mapping is big enough */
     candidate = vma->end;
-    if (candidate + length > end || candidate + length < candidate)
+    if (candidate + length > end || candidate + length < candidate) {
+      vma_list_unlock(vflags);
       return (u64)-1;
+    }
   }
+  vma_list_unlock(vflags);
   if (candidate + length > end || candidate + length < candidate)
     return (u64)-1;
   return candidate;
@@ -5961,8 +6072,14 @@ struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr) {
           (usize)(new_vma->end - new_vma->start));
   }
 
+  /* Link under the list lock, and only after the new node is fully built:
+   * a splice done in the open is how two concurrent edits lose a mapping or
+   * close the list into a ring. */
+  u64 svflags;
+  vma_list_lock(&svflags);
   new_vma->next = vma->next;
-  vma->next = new_vma;
+  __atomic_store_n(&vma->next, new_vma, __ATOMIC_RELEASE);
+  vma_list_unlock(svflags);
 
   return new_vma;
 }
@@ -5986,8 +6103,17 @@ void vma_delete_range(struct task *task, u64 start, u64 end) {
       vma_split(task, vma, end);
     }
 
-    /* Now vma is entirely within [start, end] */
-    *curr = vma->next;
+    /* Now vma is entirely within [start, end].
+     *
+     * Only the unlink is under the lock — vma_split takes it itself, and the
+     * teardown below can call into the VFS, neither of which may run with
+     * interrupts disabled. */
+    {
+      u64 dvflags;
+      vma_list_lock(&dvflags);
+      __atomic_store_n(curr, vma->next, __ATOMIC_RELEASE);
+      vma_list_unlock(dvflags);
+    }
     /* The lookup cache may be pointing at what is about to be freed. */
     vma_cache_forget(task);
     if (vma->node) {

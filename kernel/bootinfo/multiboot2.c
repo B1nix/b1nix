@@ -85,6 +85,13 @@ static void copy_cmdline(const struct multiboot2_tag *tag)
 		i++;
 	}
 	current_boot_info.command_line[i] = '\0';
+
+	/* Say so when the line did not fit. A truncated boot line makes the kernel
+	 * ignore whatever was asked for last, and it looks exactly like a flag
+	 * that was never implemented. */
+	if (i < max && src[i] != '\0')
+		console_write("bootinfo: command line truncated — options past the "
+		              "buffer were dropped\n");
 }
 
 static void parse_mmap_tag(const struct multiboot2_mmap_tag *tag)

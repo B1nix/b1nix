@@ -809,11 +809,44 @@ void vmm_set_lazy(u64 virtual_address) {
   if ((virtual_address & (PAGE_SIZE - 1)) != 0)
     return;
 
+  /* Tolerate a branch that moves under this walk instead of trusting it.
+   *
+   * Four levels are walked here while holding pointers into them, and a second
+   * thread building the same branch publishes its own table and frees the
+   * loser — so a pointer taken a moment ago can name a freed frame, and the
+   * level below reads as zeroes. Following that is the "walked into physical
+   * address 0" panic.
+   *
+   * Holding the page-table write lock across the whole walk fixes the race and
+   * introduces a worse one: the section runs with interrupts off, and the work
+   * inside it waits for other CPUs to acknowledge a TLB shootdown that they
+   * cannot answer while blocked on this very lock (observed directly — "tlb:
+   * STUCK cpu 2", then a lockup). So re-read each level instead, and give up
+   * quietly if one is gone: a lazy marker is an optimisation, and the page it
+   * would have marked is still faulted in correctly by the ordinary path. */
   u64 *pml4 = get_current_pml4();
-  u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
+  /* The root can be missing too. A task whose address space is being built or
+   * replaced has pml4_phys briefly zero, and get_current_pml4 then hands back
+   * the base of the direct map — physical address zero wearing the shape of a
+   * table. Walking into it panics one level down. */
+  if (!pml4 || (u64)(usize)pml4 == DIRECT_MAP_BASE)
+    return;
+  (void)ensure_child_table(pml4, pml4_index(virtual_address));
   __atomic_or_fetch(&pml4[pml4_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
-  u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
+  /* Re-read rather than reuse what ensure_child_table just returned: the entry
+   * is the authority, and it may name a different table by now. */
+  u64 pml4e = __atomic_load_n(&pml4[pml4_index(virtual_address)], __ATOMIC_ACQUIRE);
+  if (!(pml4e & VMM_PRESENT) || (pml4e & PAGE_ENTRY_ADDRESS_MASK) == 0)
+    return;
+  u64 *pdpt = table_from_entry(pml4e);
+
+  (void)ensure_child_table(pdpt, pdpt_index(virtual_address));
   __atomic_or_fetch(&pdpt[pdpt_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
+  u64 pdpte = __atomic_load_n(&pdpt[pdpt_index(virtual_address)], __ATOMIC_ACQUIRE);
+  if (!(pdpte & VMM_PRESENT) || (pdpte & PAGE_ENTRY_ADDRESS_MASK) == 0 ||
+      (pdpte & HUGE_PAGE_FLAG))
+    return;
+  u64 *pd = table_from_entry(pdpte);
 
   /* The low 4 GiB is identity-mapped with 2 MiB SUPERVISOR huge pages in every
    * address space (cloned per-space). The userspace load base 0x2000000 lives
@@ -823,20 +856,62 @@ void vmm_set_lazy(u64 virtual_address) {
    * physical base as a page-table pointer and scribble VMM_LAZY into arbitrary
    * physical memory (the deterministic clang-entry corruption behind the
    * demand-paged-loader SIGILL). */
-  u64 *pt;
   if ((pd[pd_index(virtual_address)] & HUGE_PAGE_FLAG) != 0) {
-    pt = split_huge_page(pd, pd_index(virtual_address));
+    (void)split_huge_page(pd, pd_index(virtual_address));
   } else {
-    pt = ensure_child_table(pd, pd_index(virtual_address));
+    (void)ensure_child_table(pd, pd_index(virtual_address));
   }
   __atomic_or_fetch(&pd[pd_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
 
-  // Set a non-present entry with LAZY flag so we know it's a lazy page
-  pt[pt_index(virtual_address)] = VMM_LAZY;
+  u64 pde = __atomic_load_n(&pd[pd_index(virtual_address)], __ATOMIC_ACQUIRE);
+  if (!(pde & VMM_PRESENT) || (pde & PAGE_ENTRY_ADDRESS_MASK) == 0 ||
+      (pde & HUGE_PAGE_FLAG))
+    return;
+  u64 *pt = table_from_entry(pde);
+
+  /* Only mark an entry that is still empty. Another CPU may have mapped this
+   * page for real while we walked, and LAZY over a live mapping loses it. */
+  u64 zero = 0;
+  __atomic_compare_exchange_n(&pt[pt_index(virtual_address)], &zero, VMM_LAZY, 0,
+                              __ATOMIC_RELEASE, __ATOMIC_RELAXED);
   invalidate_page(virtual_address);
 }
 
 static u64 *pf_leaf_pte_ptr(u64 va);
+
+/* The same, but for another task's address space — the caller supplies the
+ * PML4 rather than borrowing the running one. Used to tell code from data on a
+ * stopped thread's stack: a return address lives on an executable page, and a
+ * stray pointer to a structure does not. */
+u64 paging_user_pte(u64 pml4_phys, u64 vaddr) {
+  if (!pml4_phys)
+    return 0;
+
+  u64 *pml4 = (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE);
+  u64 pml4e = pml4[pml4_index(vaddr)];
+
+  if ((pml4e & VMM_PRESENT) == 0)
+    return 0;
+
+  u64 *pdpt = reachable_table(pml4e);
+  if (!pdpt)
+    return 0;
+  u64 pdpte = pdpt[pdpt_index(vaddr)];
+  if ((pdpte & VMM_PRESENT) == 0 || (pdpte & HUGE_PAGE_FLAG))
+    return 0;
+
+  u64 *pd = reachable_table(pdpte);
+  if (!pd)
+    return 0;
+  u64 pde = pd[pd_index(vaddr)];
+  if ((pde & VMM_PRESENT) == 0 || (pde & HUGE_PAGE_FLAG))
+    return 0;
+
+  u64 *pt = reachable_table(pde);
+  if (!pt)
+    return 0;
+  return pt[pt_index(vaddr)];
+}
 
 /* The live leaf entry for an address, or 0 when no page table describes it.
  * Read-only, takes the read lock, and is meant for reporting a fault — the
@@ -965,9 +1040,45 @@ void paging_move_range(u64 old_start, u64 new_start, u64 len) {
  * (LAZY / SWAPPED / COW with the same old frame) still holds — otherwise
  * another CPU already serviced this address, so we discard our spare frame and
  * report success. */
+/* What the fault handler saw, for the report that runs after it.
+ *
+ * The exception report walks the tables itself, but it runs after the handler
+ * has returned and after other CPUs have had their turn — it printed a leaf
+ * that permitted the very access that had just been refused, which describes
+ * the state at print time and not at fault time. These record the decision as
+ * it was made. Per-CPU: two faults on two CPUs must not overwrite each other's
+ * evidence. */
+static u64 fault_leaf_seen[MAX_CPUS];
+static u64 fault_leaf_val[MAX_CPUS];
+static const char *fault_reason[MAX_CPUS];
+
+void paging_last_fault_leaf(int *seen, u64 *val, const char **why) {
+  int cpu = (int)percpu_read(cpu_id);
+  if (cpu < 0 || cpu >= MAX_CPUS) {
+    *seen = 0;
+    *val = 0;
+    *why = "(no cpu)";
+    return;
+  }
+  *seen = (int)fault_leaf_seen[cpu];
+  *val = fault_leaf_val[cpu];
+  *why = fault_reason[cpu] ? fault_reason[cpu] : "(unset)";
+}
+
+static void fault_note(int seen, u64 val, const char *why) {
+  int cpu = (int)percpu_read(cpu_id);
+  if (cpu < 0 || cpu >= MAX_CPUS)
+    return;
+  fault_leaf_seen[cpu] = (u64)seen;
+  fault_leaf_val[cpu] = val;
+  fault_reason[cpu] = why;
+}
+
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
   u64 page_aligned = fault_addr & ~(PAGE_SIZE - 1);
+
+  fault_note(0, 0, "(entered)");
 
   if (!is_canonical(fault_addr)) {
     panic("Non-canonical address fault!");
@@ -1122,6 +1233,10 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
             (((error_code & PF_WRITE) != 0) && (leaf_val & VMM_WRITABLE) != 0) ||
             (((error_code & PF_WRITE) == 0) && (leaf_val & VMM_PRESENT) != 0);
 
+    fault_note(leaf_seen, leaf_val,
+               stale ? "protection fault, leaf disagrees (stale)"
+                     : "protection fault, leaf agrees with refusal");
+
     /* Retry the same address a bounded number of times. A flush that does not
      * take would otherwise loop here forever with nothing on the console;
      * after a few attempts the fault goes down the ordinary path, which either
@@ -1180,8 +1295,10 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
     if ((error_code & PF_USER) && current_task) {
       anon_vma = vma_lookup(current_task, page_aligned);
-      if (anon_vma && anon_vma->prot == PROT_NONE)
+      if (anon_vma && anon_vma->prot == PROT_NONE) {
+        fault_note(0, 0, "address is inside a PROT_NONE reservation");
         return -1; /* no access -> SIGSEGV */
+      }
     }
     /* Zero-page dedup: a fresh anonymous heap page has no content, so point
      * the mapping at the single shared read-only zero page instead of
@@ -1276,6 +1393,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   u64 *leaf0 = pf_leaf_pte_ptr(page_aligned);
   if (!leaf0) {
     vmm_read_release(rflags);
+    fault_note(0, 0, "no leaf PTE for this address");
     return -1;
   }
   u64 pte = *leaf0;

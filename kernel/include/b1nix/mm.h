@@ -213,6 +213,9 @@ void paging_switch_address_space(u64 pml4_phys);
  * or 0 if the page is not present. Used to measure a task's real resident set
  * (/proc/<pid>/statm) without touching the current address space. */
 u64 paging_user_frame(u64 pml4_phys, u64 vaddr);
+/* The leaf entry itself, for telling an executable page from a data one in
+ * another task's space (see the stack walk in the task watchdog). */
+u64 paging_user_pte(u64 pml4_phys, u64 vaddr);
 /* Physical address backing a user VA, resolving huge (1 GiB / 2 MiB) mappings
  * too. Readers of another task's memory must use this rather than
  * paging_user_frame, which reports a huge-mapped address as absent. */
@@ -221,6 +224,11 @@ u64 paging_user_phys(u64 pml4_phys, u64 vaddr);
 // Demand Paging / Swap
 void vmm_set_lazy(u64 virtual_address);
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code);
+
+/* What the last page fault on THIS CPU decided, recorded as it was decided.
+ * The exception report re-walks the tables, but by then other CPUs have run;
+ * this is the evidence from fault time. */
+void paging_last_fault_leaf(int *seen, u64 *val, const char **why);
 void vmm_set_swap_device(struct block_device *dev);
 
 // Swap. Slot-bitmap design: swap_out writes a frame to a freshly allocated slot

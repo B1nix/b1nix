@@ -33,7 +33,11 @@ struct boot_info {
 	usize memory_region_count;
 	struct boot_framebuffer framebuffer;
 	int has_framebuffer;
-	char command_line[128];
+	/* 128 bytes silently truncated the boot line: a passthrough run passes
+	 * eight b1nix.* options and the last of them fell off the end, so the
+	 * kernel behaved as if it had never been asked. Linux allows 2048 here;
+	 * this is the same order, and the copy now says when it has to cut. */
+	char command_line[1024];
 	u64 ramdisk_addr;
 	u64 ramdisk_size;
 	int has_ramdisk;

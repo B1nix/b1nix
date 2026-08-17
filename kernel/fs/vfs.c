@@ -1790,8 +1790,24 @@ void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child) {
     child->inode->dev = parent->inode->dev;
   u64 flags;
   vfs_tree_write_acquire(&flags);
-  child->next_sibling = parent->first_child;
-  parent->first_child = child;
+  /* Appended, not prepended.
+   *
+   * readdir walks children by position and resumes from an offset, so a name
+   * inserted at the head shifts everything the caller has not read yet — and
+   * /proc adds a directory per live task on every listing. `ls /proc` returned
+   * seven entries on a system running dozens of processes, and the browser's
+   * were among the ones that vanished. Appending keeps the positions of the
+   * entries already handed out. */
+  child->next_sibling = 0;
+  if (!parent->first_child) {
+    parent->first_child = child;
+  } else {
+    struct vfs_node *tail = parent->first_child;
+
+    while (tail->next_sibling)
+      tail = tail->next_sibling;
+    tail->next_sibling = child;
+  }
   vfs_tree_write_release(flags);
 }
 
@@ -5347,7 +5363,14 @@ int vfs_ftruncate(int fd, u64 length) {
                                                       : (u64)inode->size);
 
   if (inode->truncate_cb || inode->setattr_cb) {
-    if (length > inode->size && inode->write_cb) {
+    /* Zero-fill by writing only when the filesystem has no truncate of its
+     * own. Growing a file through its write path asks it to write past its own
+     * end, which a backing store that refuses exactly that (an in-memory file
+     * knows nothing beyond its size) answers with an error — so ftruncate
+     * failed for the one case it was meant to serve: making a fresh anonymous
+     * region big enough to use. A truncate_cb sets the size itself, and the
+     * new bytes read as zeroes because that is what growing a file means. */
+    if (length > inode->size && inode->write_cb && !inode->truncate_cb) {
       char *zeroes = kzalloc(4096);
       if (!zeroes) {
         vfs_inode_unlock(inode);
@@ -5442,16 +5465,63 @@ static isize memfd_read(struct vfs_node *node, u64 offset, char *buffer,
   return (isize)count;
 }
 
+static int memfd_truncate(struct vfs_node *node, u64 length);
+
 static isize memfd_write(struct vfs_node *node, u64 offset,
                          const char *buffer, usize size, int flags) {
   (void)flags;
-  if (!node || !node->inode || offset >= node->inode->size)
+  if (!node || !node->inode)
     return 0;
+  /* A write past the end extends the file, as it does on any other file.
+   * Refusing it made an in-memory file the only one that could not be
+   * appended to, and left it stuck at whatever size it was created with. */
+  if (offset + size > (u64)node->inode->size) {
+    int rc = memfd_truncate(node, offset + size);
+    if (rc < 0)
+      return rc;
+  }
   usize available = node->inode->size - (usize)offset;
   usize count = size < available ? size : available;
   if (count > 0 && node->inode->data)
     memcpy((char *)node->inode->data + offset, buffer, count);
   return (isize)count;
+}
+
+/* Resize an in-memory file.
+ *
+ * ftruncate on a memfd is not an edge case: it is how every anonymous shared
+ * region gets its size, right after creation and before anyone maps it. The
+ * buffer grows to hold the new length and the bytes added read as zeroes. */
+static int memfd_truncate(struct vfs_node *node, u64 length) {
+  if (!node || !node->inode)
+    return -EINVAL;
+  struct vfs_inode *inode = node->inode;
+
+  if (length > inode->capacity) {
+    usize new_cap = inode->capacity ? inode->capacity : 1024;
+    while (new_cap < length) {
+      if (new_cap > (usize)1 << 40)
+        return -EFBIG;
+      new_cap *= 2;
+    }
+    void *new_data = kzalloc(new_cap);
+    if (!new_data)
+      return -ENOMEM;
+    if (inode->data) {
+      memcpy(new_data, inode->data, inode->size);
+      if (inode->flags & VFS_NODE_OWNS_DATA)
+        kfree(inode->data);
+    }
+    inode->data = new_data;
+    inode->capacity = new_cap;
+    inode->flags |= VFS_NODE_OWNS_DATA;
+  } else if (length > inode->size && inode->data) {
+    memset((char *)inode->data + inode->size, 0,
+           (usize)(length - inode->size));
+  }
+
+  inode->size = (usize)length;
+  return 0;
 }
 
 int vfs_memfd_create(const char *name, u32 flags) {
@@ -5474,6 +5544,7 @@ int vfs_memfd_create(const char *name, u32 flags) {
   node->inode->gid = cred ? cred->egid : ROOT_GID;
   node->inode->read_cb = memfd_read;
   node->inode->write_cb = memfd_write;
+  node->inode->truncate_cb = memfd_truncate;
   node->inode->atime = node->inode->mtime = node->inode->ctime =
       vfs_get_unix_time();
 

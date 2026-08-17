@@ -850,6 +850,65 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
       }
       console_write("\n");
     }
+    /* What the fault handler itself saw. The table walk above runs after the
+     * handler returned, so it can report a leaf that permits the access that
+     * was just refused — the tables moved on. This is the decision as made. */
+    if (frame->vector == 14) {
+      int seen = 0;
+      u64 val = 0;
+      const char *why = 0;
+
+      paging_last_fault_leaf(&seen, &val, &why);
+      console_write("at fault time: leaf ");
+      if (seen) {
+        console_write("0x");
+        console_write_hex64(val);
+      } else {
+        console_write("(not read)");
+      }
+      console_write(" — ");
+      console_write(why ? why : "?");
+      console_write("\n");
+    }
+
+    /* Ring 3: the call chain, followed rather than guessed.
+     *
+     * Scanning the stack for values that look like code finds data that
+     * happens to lie in a mapped range and reports it as a frame — every such
+     * walk here produced library names that were never on the stack. A frame
+     * pointer chain has no such ambiguity: rbp points at the saved rbp, and
+     * the return address is the word above it. Abort paths keep their frame
+     * pointer (they push rbp before the call that never returns), which is
+     * exactly the case that needs naming. Each link is read only after its
+     * page is confirmed present, so a broken chain stops the walk instead of
+     * faulting inside the fault handler. */
+    if ((frame->cs & 3) == 3 && ft && ft->pml4_phys) {
+      u64 fp = frame->rbp;
+      console_write("user call chain (rbp):");
+      for (int depth = 0; depth < 12 && fp; depth++) {
+        if (fp & 7)
+          break;
+        u64 pte = paging_user_pte(ft->pml4_phys, fp & ~(u64)(PAGE_SIZE - 1));
+        if (!(pte & VMM_PRESENT))
+          break;
+        /* Both words of the frame must be on the same present page for this
+         * read to be safe without a second lookup. */
+        if ((fp & (PAGE_SIZE - 1)) > PAGE_SIZE - 16)
+          break;
+        const u64 *f = (const u64 *)(usize)fp;
+        u64 ret = f[1];
+        if (!ret)
+          break;
+        console_write(" 0x");
+        console_write_hex64(ret);
+        u64 next = f[0];
+        if (next <= fp) /* frames grow upward; anything else is a broken chain */
+          break;
+        fp = next;
+      }
+      console_write("\n");
+    }
+
     /* Raw kernel stack around rsp: shows what overwrote a return address. */
     if (frame->cs == 0x08 && frame->rsp >= 0xffff800000000000ULL) {
       const u64 *sp = (const u64 *)(usize)frame->rsp;
@@ -964,6 +1023,17 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     {
       unsigned shown = 0;
 
+      /* Only the first few faults get the whole map.
+       *
+       * A process that faults in a loop produced 1566 reports, and at 600
+       * mappings each that is most of a million lines onto a serial console —
+       * printed with locks held, which stalled the CPUs holding them until a
+       * spinlock lockup was declared. The diagnostic became the outage. The
+       * early reports carry the same information, so print those in full and
+       * cap the rest. */
+      static u64 full_reports;
+      unsigned cap = (++full_reports <= 4) ? 600 : 12;
+
       console_write("brk heap: 0x");
       console_write_hex64(ft ? ft->heap_start : 0);
       console_write("-0x");
@@ -977,7 +1047,7 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
        * of its allocator metadata — sit at the end of the list. The prot bits
        * are here because two VMAs covering one address is a bug this list is
        * the only witness to. */
-      for (struct vm_area *v = ft ? ft->vma_list : 0; v && shown < 600;
+      for (struct vm_area *v = ft ? ft->vma_list : 0; v && shown < cap;
            v = v->next, shown++) {
         console_write("  0x");
         console_write_hex64(v->start);

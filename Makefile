@@ -1328,7 +1328,7 @@ SMOKE_CMDLINE_pass-headless=b1nix.i915sway b1nix.sway-headless b1nix.vma-check
 # second one fails at "query renderer texture formats" and takes the whole
 # DRM backend down with it, leaving the compositor without wl_shm and the
 # browser with no way to hand over a buffer.
-SMOKE_CMDLINE_pass-chromium=b1nix.i915sway b1nix.chromium b1nix.task-watch b1nix.wlr-card b1nix.trace-sysfs
+SMOKE_CMDLINE_pass-chromium=b1nix.i915sway b1nix.chromium b1nix.task-watch b1nix.wlr-card b1nix.user-stack b1nix.sway-headless b1nix.window-wait=780 b1nix.trace-mmap b1nix.wayland-control
 # The same cage run with a frame built to be photographed: saturated colour
 # across the whole screen and a client whose output changes, so a camera shot
 # says whether the panel is showing our picture rather than merely being lit.

@@ -3374,16 +3374,19 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
       if (vaddr == 0 || (vaddr & (PAGE_SIZE - 1)) != 0) {
         vaddr = vm_find_free_area(t, length);
       } else {
-        /* Verify hint doesn't overlap existing VMAs */
-        struct vm_area *curr_vma = t->vma_list;
+        /* Verify hint doesn't overlap existing VMAs. Under the list lock: a
+         * walk racing an insert can follow a pointer being rewritten. */
+        u64 ovflags;
         int overlap = 0;
-        while (curr_vma) {
+        vma_list_lock(&ovflags);
+        for (struct vm_area *curr_vma = t->vma_list; curr_vma;
+             curr_vma = curr_vma->next) {
           if (!(curr_vma->start >= vaddr + length || curr_vma->end <= vaddr)) {
             overlap = 1;
             break;
           }
-          curr_vma = curr_vma->next;
         }
+        vma_list_unlock(ovflags);
         if (overlap) {
           vaddr = vm_find_free_area(t, length);
         }
@@ -3391,8 +3394,20 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
     }
   }
 
-  if (vaddr == (u64)-1)
+  if (vaddr == (u64)-1) {
+    /* An mmap that fails is the one event a large allocator does not survive:
+     * it maps its arenas up front and treats a refusal as unrecoverable, so
+     * the process aborts with no message of its own. Say which request could
+     * not be placed — silence here reads as a crash with no cause. */
+    console_write("mmap: no free area for 0x");
+    console_write_hex64((u64)length);
+    console_write(" bytes (flags=0x");
+    console_write_hex64((u64)(unsigned)flags);
+    console_write(") task=");
+    console_write_dec(t->id);
+    console_write("\n");
     return (u64)-ENOMEM;
+  }
 
   // Allocate and map physical frames
   u64 vmm_flags = VMM_USER;
@@ -3450,6 +3465,11 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
           vmm_unmap_page(u);
         }
         if (node) vfs_node_put(node);
+        console_write("mmap: out of physical frames at 0x");
+        console_write_hex64(v);
+        console_write(" of 0x");
+        console_write_hex64((u64)length);
+        console_write(" bytes\n");
         return (u64)-ENOMEM;
       }
 
@@ -3514,8 +3534,32 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
     for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
       vmm_unmap_page(v);
     }
+    console_write("mmap: kmalloc(vma) failed\n");
     return (u64)-ENOMEM;
   }
+  /* Large mappings, with the address asked for beside the address given.
+   *
+   * An allocator that places its own pools cares where a mapping lands, not
+   * only that it succeeded: it asks for a region, checks the result against
+   * the range it requires, and treats a hint it did not get as a failure to
+   * allocate — reporting "out of memory" while every mmap in the log returned
+   * success. Printing both halves is what distinguishes the two. */
+  if (length >= (1u << 20) && bootinfo_has_flag("b1nix.trace-mmap")) {
+    console_write("mmap: want 0x");
+    console_write_hex64((u64)(usize)addr);
+    console_write(" got 0x");
+    console_write_hex64(vaddr);
+    console_write(" len 0x");
+    console_write_hex64((u64)length);
+    console_write(" flags 0x");
+    console_write_hex64((u64)(unsigned)flags);
+    console_write(" prot 0x");
+    console_write_hex64((u64)(unsigned)prot);
+    console_write(" task=");
+    console_write_dec(t->id);
+    console_write("\n");
+  }
+
   vma->start = vaddr;
   vma->end = vaddr + length;
   vma->prot = (u32)prot;
@@ -3637,9 +3681,12 @@ static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
   /* The range has to be one mapping of this process, whole. A request spanning
    * two mappings, or part of none, is a caller error rather than something to
    * guess at. */
+  u64 lvflags;
+  vma_list_lock(&lvflags);
   struct vm_area *vma = t->vma_list;
   while (vma && !(vma->start <= old_start && vma->end >= old_start + old_len))
     vma = vma->next;
+  vma_list_unlock(lvflags);
   if (!vma)
     return (u64)-EFAULT;
 
@@ -3677,12 +3724,15 @@ static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
     u64 want_end = old_start + new_len;
     int clear = want_end <= USER_SPACE_LIMIT && want_end > old_start;
 
+    u64 gvflags;
+    vma_list_lock(&gvflags);
     for (struct vm_area *v = t->vma_list; v && clear; v = v->next) {
       if (v == vma)
         continue;
       if (v->start < want_end && v->end > vma->end)
         clear = 0;
     }
+    vma_list_unlock(gvflags);
     if (clear) {
       vma->end = want_end;
       scheduler_sync_vma_head(t->pml4_phys, t->vma_list);
@@ -6879,7 +6929,21 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)sys_access((const char *)(usize)arg0, (int)arg1);
   case SYS_FTRUNCATE: {
 #ifdef __x86_64__
-    return (u64)vfs_ftruncate((int)arg0, arg1);
+    {
+      isize frc = vfs_ftruncate((int)arg0, arg1);
+      /* Sizing an anonymous region is the step right after creating it, and a
+       * refusal here reads to the caller exactly like being out of memory. */
+      if (frc < 0 && bootinfo_has_flag("b1nix.trace-mmap")) {
+        console_write("ftruncate(fd ");
+        console_write_dec((u64)(int)arg0);
+        console_write(", 0x");
+        console_write_hex64(arg1);
+        console_write(") -> error ");
+        console_write_dec((u64)(-frc));
+        console_write("\n");
+      }
+      return (u64)frc;
+    }
 #else
     u64 len = ((u64)arg2 << 32) | (u32)arg1;
     return (u64)vfs_ftruncate((int)arg0, len);
@@ -7541,7 +7605,27 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     char name[64];
     if (syscall_copyinstr(name, sizeof(name), (const char *)(usize)arg0) < 0)
       return (u64)-EFAULT;
-    return (u64)vfs_memfd_create(name, (u32)arg1);
+    int mrc = vfs_memfd_create(name, (u32)arg1);
+    /* An anonymous shared region is how one process hands state to another,
+     * and a caller that cannot get one has nowhere to put that state — the
+     * browser treats the failure as fatal and aborts before it opens a
+     * window, naming only the size it wanted. Say whether we gave it one. */
+    if (bootinfo_has_flag("b1nix.trace-mmap") || mrc < 0) {
+      console_write("memfd_create(\"");
+      console_write(name);
+      console_write("\", flags=0x");
+      console_write_hex64((u64)(u32)arg1);
+      console_write(") -> ");
+      if (mrc < 0) {
+        console_write("error ");
+        console_write_dec((u64)(-mrc));
+      } else {
+        console_write("fd ");
+        console_write_dec((u64)mrc);
+      }
+      console_write("\n");
+    }
+    return (u64)mrc;
   }
   case SYS_LISTEN:
     return sys_listen((int)arg0, (int)arg1);

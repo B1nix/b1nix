@@ -395,7 +395,12 @@ else
 	# a passthrough boot.
 	if grep -q "b1nix.sway-headless" /proc/cmdline 2>/dev/null; then
 		export WLR_BACKENDS=headless
-		echo "I915-SWAY: headless isolation run"
+		# One virtual output, at the panel's size. A headless compositor with
+		# no output has nowhere to put a window, and a client that asks for one
+		# is told there is no screen — which would look exactly like the
+		# failure being investigated.
+		export WLR_HEADLESS_OUTPUTS=1
+		echo "I915-SWAY: headless isolation run (virtual output 1920x1080)"
 	fi
 	echo "I915-SWAY: starting sway on $CARD t=$(up)"
 	sway -d -c /etc/sway/config > /tmp/sway.log 2>&1 &
@@ -505,7 +510,46 @@ PROOF
 		for req in "\.bind(" "create_surface" "get_toplevel"; do
 			echo "  $req: $(grep -ac "$req" /var/foot.log 2>/dev/null)"
 		done
+		# The globals it took, by NAME NUMBER, which is the whole comparison:
+		# the browser binds everything numbered 10 and up and nothing below it,
+		# a boundary in arrival order rather than in the interfaces themselves.
+		# A client that takes number 1 and 2 here proves the early events are
+		# delivered, and puts the loss on the browser's side of the socket.
+		echo "  bound by number: $(grep -ao 'bind([0-9]*, "[a-z_0-9]*"' /var/foot.log 2>/dev/null |
+			sed 's/bind(//; s/, "/:/; s/"//' | sort -n | tr '\n' ' ')"
 		echo "--- end control client protocol ---"
+
+		# A real window, held open, and a picture of it.
+		#
+		# Everything above says the compositor and the socket are sound and the
+		# browser stops on its own side. That claim is worth proving rather
+		# than asserting: a terminal kept open is a window on the same output
+		# the browser was asked to draw on, and grim reads back what was
+		# actually composited. If this produces a PNG with content, the display
+		# path end to end — client, compositor, output — works.
+		( WAYLAND_DEBUG=0 /usr/bin/foot -- /bin/sleep 300 > /var/foot-win.log 2>&1 & )
+		win_seen=""
+		wt=0
+		while [ "$wt" -lt 60 ]; do
+			if swaymsg -t get_tree 2>/dev/null | grep -q '"app_id": *"foot"'; then
+				win_seen="yes"
+				break
+			fi
+			sleep 3
+			wt=$((wt + 3))
+		done
+		if [ -n "$win_seen" ]; then
+			echo "I915-SWAY: ok control-window (foot mapped after ${wt}s)"
+			if grim /var/window.png 2>/var/grim.log; then
+				echo "I915-SWAY: ok screenshot ($(wc -c < /var/window.png) bytes)"
+				echo "  non-black check: $(od -An -tx1 -N 4096 /var/window.png 2>/dev/null |
+					tr -d ' \n' | tr -s '0' '0' | wc -c) bytes of header entropy"
+			else
+				echo "I915-SWAY: FAIL screenshot — $(head -1 /var/grim.log 2>/dev/null)"
+			fi
+		else
+			echo "I915-SWAY: FAIL control-window — no foot window after ${wt}s"
+		fi
 	fi
 
 	# Shared memory, checked before the browser needs it.
@@ -520,6 +564,19 @@ PROOF
 		rm -f /dev/shm/probe
 	else
 		echo "I915-SWAY: shm FAIL — a client cannot allocate a frame buffer"
+	fi
+
+	# The size the browser actually asks for.
+	#
+	# Its field-trial state is one 256 KiB shared region, created before any
+	# window exists, and the code that creates it treats failure as fatal — the
+	# abort the browser dies in names that allocator and that size. A 4 KiB
+	# probe passing says nothing about it, so ask for the real one.
+	if dd if=/dev/zero of=/dev/shm/probe256 bs=1024 count=256 2>/dev/null; then
+		echo "I915-SWAY: shm 256K ok ($(ls -l /dev/shm/probe256 2>&1 | awk '{print $5}') bytes)"
+		rm -f /dev/shm/probe256
+	else
+		echo "I915-SWAY: shm 256K FAIL — the size the field-trial allocator needs"
 	fi
 
 	# Does the browser work at all, with no window in the way?
@@ -550,6 +607,32 @@ PROOF
 	fi
 	fi
 
+	# Does the browser work at all here, with no compositor in the picture?
+	#
+	# Everything so far says the Wayland side is healthy — the compositor
+	# answers, the globals arrive — and that the browser stops before binding
+	# any of them, in its own code. Headless renders the same page through the
+	# same engine with no display server at all: if it prints the document, the
+	# fault is in the display path; if it dies the same way, the display path is
+	# innocent and the problem is under it. Either answer halves the search.
+	# Answered: the browser hangs identically with no compositor in the picture,
+	# which is what sent the search into mmap and found the VMA-list race. Kept
+	# behind a flag rather than deleted — it is the cheapest way to ask the same
+	# question again — but off by default, because it costs four minutes of a
+	# run that has a window to wait for.
+	if grep -q "b1nix.headless-browser" /proc/cmdline 2>/dev/null; then
+	echo "I915-SWAY: headless check t=$(up)"
+	timeout -k 5 240 /usr/bin/chromium --headless --no-sandbox --no-zygote \
+		--disable-gpu --disable-dev-shm-usage \
+		--user-data-dir=/tmp/chromium-headless \
+		--virtual-time-budget=5000 --dump-dom \
+		file:///root/browser-proof.html > /var/chromium-headless.log 2>&1
+	echo "I915-SWAY: headless rc=$? t=$(up)"
+	echo "  headless output (first 6 lines):"
+	head -6 /var/chromium-headless.log 2>/dev/null | sed 's/^/    /'
+	echo "  headless bytes: $(wc -c < /var/chromium-headless.log 2>/dev/null)"
+	fi
+
 	echo "I915-SWAY: starting chromium on $WAYLAND_DISPLAY t=$(up)"
 	# The display name is the one discovered above, not a guess: sway names its
 	# socket wayland-0 or wayland-1 depending on what else asked for one first,
@@ -568,16 +651,19 @@ PROOF
 		WAYLAND_DEBUG=1 \
 		/usr/bin/chromium \
 			--ozone-platform=wayland --no-sandbox --no-zygote \
-			--single-process \
-			--use-gl=angle --use-angle=swiftshader \
+			--no-first-run --no-default-browser-check \
+			--disable-sync --disable-background-networking \
+			--disable-component-update --disable-domain-reliability \
+			--metrics-recording-only --disable-breakpad \
+			--disable-gpu --use-gl=swiftshader \
 			--disable-gpu-compositing \
-			--disable-dev-shm-usage --user-data-dir=/tmp/chromium-profile \
 			--in-process-gpu \
-			--disable-features=VaapiVideoDecoder,VaapiVideoEncoder,VaapiIgnoreDriverChecks \
+			--disable-dev-shm-usage --user-data-dir=/tmp/chromium-profile \
 			--disable-accelerated-video-decode --disable-accelerated-video-encode \
 			--ozone-platform-hint=wayland \
 			--window-size=1280,800 --enable-logging=stderr \
-			--disable-features=WaylandFractionalScaleV1 \
+			--vmodule=*wayland*=3,*ozone*=3,*platform_window*=3 \
+			--disable-features=VaapiVideoDecoder,VaapiVideoEncoder,VaapiIgnoreDriverChecks,WaylandFractionalScaleV1 \
 			--v=1 \
 			file:///root/browser-proof.html > /var/chromium.log 2>&1
 		echo "CHROMIUM-EXIT rc=$?"
@@ -601,7 +687,13 @@ PROOF
 	# inside that gap and reported no window for a browser that had not finished
 	# starting; the flags above remove the detour, and this leaves room for what
 	# is left of it.
-	deadline=$((t0 + 180))
+	# Overridable, because "does it need longer?" is a question about this
+	# machine and not a property of the browser. Every gap in its own log here
+	# is tens of seconds — a start-up that takes a few seconds on hardware is
+	# running under emulation with software rendering — so a fixed 180 cannot
+	# distinguish "stuck" from "not finished".
+	window_wait=$(sed -n 's/.*b1nix\.window-wait=\([0-9]*\).*/\1/p' /proc/cmdline 2>/dev/null)
+	deadline=$((t0 + ${window_wait:-180}))
 	# Give it a moment to exist before asking whether it died: the first check
 	# used to run before the process had even exec'd and reported it gone at 0s,
 	# which stopped the watch while the browser was in fact starting fine.
@@ -669,6 +761,40 @@ PROOF
 		echo "  $req: $(grep -ac "$req" /var/chromium.log 2>/dev/null)"
 	done
 	echo "  last protocol line: $(grep -aE '@[0-9]+\.' /var/chromium.log 2>/dev/null | tail -1)"
+	# The requests it sent, not the events it received. A client that stops
+	# mid-handshake and one that never starts look identical in the event
+	# stream — the compositor announces the same globals either way. What it
+	# ASKED for is the half that says where it stopped.
+	echo "  --- last requests sent by the browser ---"
+	grep -aE '^\[[0-9. ]*\] +-> ' /var/chromium.log 2>/dev/null |
+		sed 's/^\[[0-9. ]*\] *//' | tail -20 | sed 's/^/    /'
+	echo "  request types: $(grep -aoE '\-> [a-z_]+@[0-9]+\.[a-z_]+' /var/chromium.log 2>/dev/null |
+		sed 's/-> //; s/@[0-9]*//' | sort -u | tr '\n' ' ')"
+	# The exchange in order, from the browser's own trace. Counting request
+	# types says what it sent but not what it had been told first; a client
+	# that receives no globals and one that receives them and declines to bind
+	# produce the same empty bind count.
+	echo "  globals received by the browser: $(grep -ac 'wl_registry.*global' /var/chromium.log 2>/dev/null)"
+	# Which globals it took, and what its own Wayland layer said about the ones
+	# it did not. It binds sixteen extensions and skips wl_compositor — without
+	# which there is no surface to create — so its reasoning is the question.
+	echo "  bound interfaces: $(grep -ao 'bind([0-9]*, "[a-z_0-9]*"' /var/chromium.log 2>/dev/null |
+		sed 's/.*"//' | sort -u | tr '\n' ' ')"
+	# How far up the browser got. Its Wayland layer initialises (it reports the
+	# display it found), so the surface it never creates is not missing because
+	# the platform failed — something above it never asked for a window.
+	echo "  --- startup stage ---"
+	grep -aiE "startup|browser_creator|BrowserWindow|CreateBrowser|profile_manager|session_restore|first_run" \
+		/var/chromium.log 2>/dev/null | grep -av '@[0-9]*\.' | tail -10 | sed 's/^/    /'
+	echo "  --- what its wayland layer said ---"
+	grep -aiE "wayland_connection|compositor|wl_shm|Failed to bind|not available|unsupported" \
+		/var/chromium.log 2>/dev/null | grep -av '@[0-9]*\.' | grep -av '#[0-9]*\.' |
+		tail -12 | sed 's/^/    /'
+	echo "  --- first 40 protocol lines (browser's own trace) ---"
+	grep -aE '@[0-9]+\.' /var/chromium.log 2>/dev/null | head -40 |
+		sed -E 's/^\[[0-9. ]*\] *//' | sed 's/^/    /'
+	echo "  --- last 25 lines of the browser log ---"
+	tail -25 /var/chromium.log 2>/dev/null | sed 's/^/    /'
 	# Which globals it actually took. The control client binds fifteen; this one
 	# binds one, and the difference between "did not want it" and "could not get
 	# it" is the whole question.
@@ -677,6 +803,27 @@ PROOF
 	# What it says about windows. At --v=1 the window and widget layers narrate
 	# their own decisions, and the question here is which decision it makes
 	# instead of creating a surface.
+	# The browser's own map, so a stack walk can be filtered against it: the
+	# kernel cannot tell code from data here (pages are not marked
+	# non-executable), and every candidate frame has to be checked against the
+	# ranges that really are executable.
+	echo "  chromium maps:"
+	# By cmdline, not by pgrep: the browser's threads are named "pthread" and
+	# its processes run as /proc/self/exe, so a name match finds the wrong
+	# process — the last attempt printed the compositor's map instead.
+	# Every process and what it is, first: two attempts to find the browser by
+	# name found the compositor and then only its crash handler, because its
+	# threads are named "pthread" and its children run as /proc/self/exe.
+	echo "   all processes:"
+	for pid in $(ls -d /proc/[0-9]* 2>/dev/null | sed 's|/proc/||'); do
+		echo "     $pid: $(head -c 50 /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ')"
+	done
+	for pid in $(ls -d /proc/[0-9]* 2>/dev/null | sed 's|/proc/||'); do
+		if grep -aq chromium /proc/$pid/cmdline 2>/dev/null; then
+			echo "   pid $pid ($(head -c 60 /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ')):"
+			grep -aE " r-xp " /proc/$pid/maps 2>/dev/null | head -24
+		fi
+	done
 	echo "  window lines:"
 	grep -aiE "window|widget|surface|toplevel" /var/chromium.log 2>/dev/null |
 		grep -av '@[0-9]*\.' | tail -12

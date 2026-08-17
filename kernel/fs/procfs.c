@@ -50,17 +50,61 @@ struct sbuf {
   char *p;
   usize cap;
   usize len;
+  int owned; /* p was allocated by sb_grow and must be freed */
 };
 
 static void sb_init(struct sbuf *s, char *buf, usize cap) {
   s->p = buf;
   s->cap = cap;
   s->len = 0;
+  s->owned = 0;
   if (cap)
     buf[0] = '\0';
 }
 
+/* Release anything sb_grow allocated. The caller still owns the buffer it
+ * passed to sb_init. */
+static void sb_free(struct sbuf *s) {
+  if (s->owned)
+    kfree(s->p);
+  s->p = 0;
+  s->cap = 0;
+  s->len = 0;
+  s->owned = 0;
+}
+
+/* Grow to fit `need` more bytes.
+ *
+ * The builder used to stop at a fixed 8 KiB, which is a hundred-odd lines —
+ * enough for a shell, not for a process that maps its binary and a hundred
+ * libraries. /proc/<pid>/maps was cut off mid-file with no indication, and a
+ * reader that parses it saw a memory map that simply ended. */
+static void sb_grow(struct sbuf *s, usize need) {
+  if (s->len + need + 1 <= s->cap)
+    return;
+  usize ncap = s->cap ? s->cap : 8192;
+  while (ncap < s->len + need + 1) {
+    if (ncap > (usize)1 << 28) /* refuse to grow without bound */
+      return;
+    ncap *= 2;
+  }
+  char *n = kmalloc(ncap);
+  if (!n)
+    return; /* keep what we have; the content truncates rather than faults */
+  memcpy(n, s->p, s->len);
+  n[s->len] = '\0';
+  if (s->owned)
+    kfree(s->p);
+  s->p = n;
+  s->cap = ncap;
+  s->owned = 1;
+}
+
 static void sb_puts(struct sbuf *s, const char *str) {
+  usize n = 0;
+  while (str[n])
+    n++;
+  sb_grow(s, n);
   while (*str && s->len + 1 < s->cap)
     s->p[s->len++] = *str++;
   s->p[s->len] = '\0';
@@ -79,8 +123,6 @@ static void sb_putc(struct sbuf *s, char c) {
 __attribute__((format(printf, 2, 3))) static void sb_addf(struct sbuf *s,
                                                           const char *fmt,
                                                           ...) {
-  if (s->len + 1 >= s->cap)
-    return;
   va_list ap;
   va_start(ap, fmt);
   char scratch[256];
@@ -129,9 +171,28 @@ struct procfs_node {
   procfs_render render; /* content generator */
   procfs_writer write;  /* optional sysctl setter (M77) */
   usize pid;            /* 0 = system file / derive from parent for pid files */
+  /* The snapshot a sequential read continues from.
+   *
+   * Content here is generated on demand, and it used to be regenerated on
+   * every read(): a file longer than one read returned its first part from
+   * one moment and its next part from another, so a reader assembling the
+   * whole thing got lines that had moved, repeated or been cut in half. That
+   * is precisely what a crash reporter re-reads /proc/<pid>/maps to detect,
+   * and why it kept reporting that its retries never agreed.
+   *
+   * The first read of a file (offset 0) takes the snapshot; the reads that
+   * continue it are served from that copy. Keyed by reader, so two tasks
+   * walking the same node do not consume each other's. */
+  char *snap;
+  usize snap_len;
+  usize snap_owner; /* tid of the reader the snapshot belongs to */
 };
 
 #define PROCFS_BUF 8192
+
+/* Guards the per-node read snapshots. Held only for pointer swaps and one
+ * memcpy into a kernel buffer — no allocation, no sleeping. */
+static spinlock_t procfs_snap_lock = SPINLOCK_INIT;
 
 static struct procfs_node *pn_of(struct vfs_node *node) {
   return (struct procfs_node *)node->inode->data;
@@ -159,15 +220,61 @@ static isize procfs_read_cb(struct vfs_node *node, u64 offset, char *buffer,
   char *tmp = kmalloc(PROCFS_BUF);
   if (!tmp)
     return -ENOMEM;
+  usize me = current_task ? (usize)current_task->id : 0;
+
+  /* Continuing a read this reader already started: serve the snapshot it
+   * began with, so the file it assembles is one consistent state. */
+  if (offset > 0) {
+    u64 sflags;
+    usize got = 0;
+    /* Copy out of the snapshot into our own buffer while holding the lock,
+     * and hand it to the caller after dropping it: the caller's buffer can
+     * fault, and faulting with interrupts disabled inside a spinlock wedges
+     * the CPU (it did — a lockup and a thousand fault reports). */
+    spin_lock_irqsave(&procfs_snap_lock, &sflags);
+    if (pn->snap && pn->snap_owner == me && offset < (u64)pn->snap_len) {
+      usize avail = pn->snap_len - (usize)offset;
+      got = avail < size ? avail : size;
+      if (got > PROCFS_BUF)
+        got = PROCFS_BUF;
+      memcpy(tmp, pn->snap + offset, got);
+    }
+    spin_unlock_irqrestore(&procfs_snap_lock, sflags);
+    if (got) {
+      memcpy(buffer, tmp, got);
+      kfree(tmp);
+      return (isize)got;
+    }
+  }
+
   struct sbuf s;
   sb_init(&s, tmp, PROCFS_BUF);
   usize pid = pn->pid ? pn->pid : pid_from_parent(node);
   int rc = pn->render(pid, &s);
   isize res;
-  if (rc < 0)
+  if (rc < 0) {
     res = rc;
-  else
-    res = procfs_emit(tmp, s.len, offset, buffer, size);
+  } else {
+    res = procfs_emit(s.p, s.len, offset, buffer, size);
+
+    /* Publish this as the snapshot the rest of the read continues from. */
+    if (offset == 0 && s.len) {
+      char *copy = kmalloc(s.len);
+      if (copy) {
+        memcpy(copy, s.p, s.len);
+        u64 sflags;
+        char *old;
+        spin_lock_irqsave(&procfs_snap_lock, &sflags);
+        old = pn->snap;
+        pn->snap = copy;
+        pn->snap_len = s.len;
+        pn->snap_owner = me;
+        spin_unlock_irqrestore(&procfs_snap_lock, sflags);
+        kfree(old); /* freed outside the lock */
+      }
+    }
+  }
+  sb_free(&s);
   kfree(tmp);
   return res;
 }
@@ -908,13 +1015,31 @@ static int r_pid_maps(usize pid, struct sbuf *s) {
   struct task *t = scheduler_task_by_pid(pid);
   if (!t)
     return 0;
-#define PROCFS_MAPS_MAX 192
-  struct procfs_map_ent m[PROCFS_MAPS_MAX];
+  /* Sized from the task, not from a guess.
+   *
+   * This was a 192-entry array on the kernel stack, which is two bugs at once:
+   * ~9 KB of stack for a routine anyone can call, and a hard ceiling on how
+   * much of an address space /proc/<pid>/maps will admit to. A browser maps
+   * its binary, a hundred shared objects and an allocator's arenas — many
+   * hundreds of regions — so the file it read back described someone else's
+   * process. Crashpad, which re-reads maps until two passes agree, never got
+   * two agreeing passes out of a truncated one and gave up with "retry count
+   * exceeded"; anything else parsing it simply believed the short answer. */
+  usize cap = 0;
+  for (struct vm_area *v = t->vma_list; v; v = v->next)
+    cap++;
+  if (!cap)
+    return 0;
+  /* Room for the regions the loop below appends beyond the VMA list. */
+  cap += 8;
+  struct procfs_map_ent *m = kmalloc(cap * sizeof(*m));
+  if (!m)
+    return 0;
   usize n = 0;
 
   /* mmap'd regions (the only ones the VMA list tracks). */
-  for (struct vm_area *v = t->vma_list; v && n < PROCFS_MAPS_MAX; v = v->next)
-    procfs_maps_add(m, &n, PROCFS_MAPS_MAX, v->start, v->end, (int)v->prot,
+  for (struct vm_area *v = t->vma_list; v && n < cap; v = v->next)
+    procfs_maps_add(m, &n, cap, v->start, v->end, (int)v->prot,
                     (v->flags & 0x1) != 0, v->offset,
                     (v->node && v->node->inode) ? v->node->inode->ino : 0,
                     v->node ? vfs_node_dev(v->node) : 0,
@@ -1035,6 +1160,7 @@ static int r_pid_maps(usize pid, struct sbuf *s) {
             m[i].name ? m[i].name : "");
     prev_end = m[i].end;
   }
+  kfree(m);
   return 0;
 }
 
@@ -1046,7 +1172,6 @@ static int r_pid_maps(usize pid, struct sbuf *s) {
  * fd_lock (no allocation while locked), then materialise the symlink children
  * outside the lock. Children are created on demand and left in place — procfs
  * nodes are permanent, so a closed fd's stale symlink is harmless. */
-#define PROCFS_FD_SNAP_MAX 64
 struct procfs_fd_snap {
   int fd;
   char target[80];
@@ -1136,12 +1261,27 @@ static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
   usize pid = pid_from_parent(dir); /* dir->parent is the /proc/<pid> dir */
   struct task *t = scheduler_task_by_pid(pid);
   if (t) {
-    struct procfs_fd_snap snap[PROCFS_FD_SNAP_MAX];
+    /* Sized from the task's fd table rather than capped at a constant.
+     *
+     * The snapshot used to be 64 entries on the kernel stack while the limit
+     * on open descriptors is 1024, so a process past its 64th fd had the rest
+     * of /proc/<pid>/fd silently omitted — and the readers that matter here
+     * enumerate this directory to decide which descriptors to close before
+     * exec. Allocation cannot happen under fd_lock, so the buffer is taken
+     * first and the capacity re-checked once the lock is held. */
+    usize want = t->fd_capacity; /* unlocked: a size hint, verified below */
+    if (want < 8)
+      want = 8;
+    struct procfs_fd_snap *snap = kmalloc(want * sizeof(*snap));
+    if (!snap)
+      return vfs_readdir_children(dir, offset, buf, max_entries);
     usize nsnap = 0;
     u64 flags;
     spin_lock_irqsave(&t->fd_lock, &flags);
     usize cap = t->fd_capacity;
-    for (usize i = 0; i < cap && nsnap < PROCFS_FD_SNAP_MAX; i++) {
+    if (cap > want)
+      cap = want; /* the table grew after sizing; the next readdir catches up */
+    for (usize i = 0; i < cap && nsnap < want; i++) {
       struct vfs_handle *h = t->fd_table ? t->fd_table[i] : 0;
       if (!h || !h->used)
         continue;
@@ -1155,6 +1295,7 @@ static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
       procfs_fd_resolve(&snap[i]);
       procfs_fd_symlink(dir, snap[i].fd, snap[i].target);
     }
+    kfree(snap);
   }
   return vfs_readdir_children(dir, offset, buf, max_entries);
 }
@@ -1368,6 +1509,40 @@ static isize procfs_task_readdir(struct vfs_node *dir, usize offset,
   if (leader) {
     usize tgid = task_tgid(leader);
     usize slots = scheduler_task_slots();
+
+    /* Retire the threads that have exited.
+     *
+     * procfs nodes are created once and left in place, which is harmless for
+     * a directory whose contents only grow. This one shrinks: a thread that
+     * exits must leave /proc/<pid>/task, because the count of entries here is
+     * a process's answer to "am I single-threaded?" — and a sandbox that must
+     * not be entered with other threads running asks exactly that before it
+     * starts. Keeping the corpses made every process look permanently
+     * multi-threaded, and the check fired in a child that had in fact reduced
+     * itself to one thread. */
+    struct vfs_node *child = dir->first_child;
+    while (child) {
+      struct vfs_node *next = child->next_sibling;
+      usize tid = 0;
+      int numeric = child->name[0] != '\0';
+
+      for (const char *q = child->name; *q; q++) {
+        if (*q < '0' || *q > '9') {
+          numeric = 0;
+          break;
+        }
+        tid = tid * 10 + (usize)(*q - '0');
+      }
+      if (numeric) {
+        struct task *t = scheduler_task_by_pid(tid);
+        if (!t || !t->id || task_tgid(t) != tgid) {
+          vfs_detach_child(dir, child);
+          vfs_node_put(child);
+        }
+      }
+      child = next;
+    }
+
     for (usize i = 0; i < slots; i++) {
       struct task *t = scheduler_task_slot(i);
       if (t && t->id && task_tgid(t) == tgid)
