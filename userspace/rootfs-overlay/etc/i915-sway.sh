@@ -675,115 +675,50 @@ PROOF
 	echo "  headless bytes: $(wc -c < /var/chromium-headless.log 2>/dev/null)"
 	fi
 
-	# How long does merely starting this binary take?
+	# One question before the real one: does the smallest possible page render?
 	#
-	# The helper process the browser launches gives itself fifteen seconds to
-	# connect, and every syscall traced from it was the loader reading another
-	# shared object's header. If loading alone costs more than that deadline,
-	# nothing about the channel matters — the helper is killed before it ever
-	# looks at it. `--version` loads the same libraries and then exits, which
-	# makes the cost measurable on its own.
-	# Does the browser work at all without a window system?
-	#
-	# Everything so far says the browser starts, initialises and then sits
-	# idle — every thread parked — without ever asking for a window. That has
-	# two very different explanations: its own machinery is stuck somewhere
-	# before it would create one, or the machinery is fine and only the path
-	# that talks to a compositor is not. Headless mode uses neither Wayland nor
-	# a compositor and renders straight to a file, so it separates the two in
-	# one attempt.
-	# Two attempts, because they need different amounts of the browser.
-	#
-	# Printing the page's contents needs a renderer that loaded and parsed the
-	# document, and nothing else. A screenshot needs that AND a composited
-	# frame. Running both says which half is missing rather than only that a
-	# picture failed to appear.
-	echo "I915-SWAY: dom start t=$(up)"
-	timeout -k 5 90 /usr/bin/chromium --headless=new --no-sandbox \
-		--disable-gpu --disable-dev-shm-usage \
-		--user-data-dir=/tmp/chromium-dom \
-		--virtual-time-budget=4000 \
-		--dump-dom file:///root/browser-proof.html > /var/dom.log 2>&1
-	echo "I915-SWAY: dom exit=$? t=$(up) bytes=$(wc -c < /var/dom.log 2>/dev/null)"
-	echo "--- dom output (first 5 lines) ---"
-	head -5 /var/dom.log 2>/dev/null
-	echo "--- end dom output ---"
-
-	# The emptiest possible page, in the simplest possible arrangement.
-	#
-	# The document above never rendered, so the next question is whether
-	# anything renders at all. about:blank removes the file system from the
-	# path; --single-process removes the separate renderer process and the
-	# channel to it. Between them, a failure here means the rendering engine
-	# itself does not run, and a success means the missing piece is whichever
-	# of the two was removed.
-	echo "I915-SWAY: blank start t=$(up)"
-	timeout -k 5 60 /usr/bin/chromium --headless=new --no-sandbox \
-		--disable-gpu --disable-dev-shm-usage \
-		--user-data-dir=/tmp/chromium-blank \
-		--virtual-time-budget=2000 \
-		--dump-dom about:blank > /var/blank.log 2>&1
-	echo "I915-SWAY: blank exit=$? t=$(up) dom=$(grep -ac '<html' /var/blank.log 2>/dev/null)"
-
-	# Without the virtual-time budget.
-	#
-	# Every attempt so far asked the browser to finish after a fixed amount of
-	# its own internal time, and that mechanism advances on the browser's clock
-	# rather than the wall. If that clock does not advance the way it expects,
-	# the finish never arrives and the page is never printed — which looks
-	# exactly like a page that never loaded. Ask without a budget and let it
-	# finish on its own.
-	echo "I915-SWAY: novt start t=$(up)"
-	# Left running in silence, so the kernel's watchdog takes its snapshot.
-	#
-	# This is now the smallest case that still fails — one process, a blank
-	# page, no window system — so a task dump of it is readable rather than a
-	# wall of threads from three processes. The dump only fires after a minute
-	# with nothing on the console, hence the quiet wait rather than a loop that
-	# reports progress.
+	# Blank page, one process, no window system — the case that isolates the
+	# browser's own machinery from everything around it. Kept short, because the
+	# run's budget has to reach the window test that follows; the earlier
+	# version asked six questions in sequence and spent the whole run before
+	# reaching the one that matters.
+	echo "I915-SWAY: minimal start t=$(up)"
 	( timeout -k 5 150 /usr/bin/chromium --headless=new --no-sandbox \
 		--single-process --disable-gpu --disable-dev-shm-usage \
-		--user-data-dir=/tmp/chromium-novt \
-		--enable-logging=stderr --v=1 \
-		--dump-dom about:blank > /var/novt.log 2>&1 & ) 
-	sleep 100
-	echo "I915-SWAY: novt after-quiet t=$(up) dom=$(grep -ac '<html' /var/novt.log 2>/dev/null)"
-	pkill -f "chromium-novt" 2>/dev/null
-	echo "--- novt: last 30 lines (minimal case: blank page, one process) ---"
-	tail -30 /var/novt.log 2>/dev/null
-	echo "--- end novt ---"
+		--user-data-dir=/tmp/chromium-min \
+		--dump-dom about:blank > /var/min.log 2>&1 & )
 
-	echo "I915-SWAY: single start t=$(up)"
-	timeout -k 5 60 /usr/bin/chromium --headless=new --no-sandbox \
-		--single-process --disable-gpu --disable-dev-shm-usage \
-		--user-data-dir=/tmp/chromium-single \
-		--virtual-time-budget=2000 \
-		--dump-dom about:blank > /var/single.log 2>&1
-	echo "I915-SWAY: single exit=$? t=$(up) dom=$(grep -ac '<html' /var/single.log 2>/dev/null)"
+	# Left alone in silence while it is stuck, so the kernel's watchdog takes a
+	# snapshot of its threads. The dump only fires after a minute with nothing
+	# on the console, and this is now the smallest case that still fails — one
+	# process, a blank page, no window system — so the snapshot is readable
+	# rather than a wall of threads from three processes.
+	sleep 95
 
-	echo "I915-SWAY: headless start t=$(up)"
-	rm -f /tmp/headless.png
-	# With its own log turned on: without --enable-logging the browser writes
-	# nothing at all, and an empty file then says only that it was not asked to
-	# speak, not that it had nothing to say.
-	timeout -k 5 120 /usr/bin/chromium --headless=new --no-sandbox \
-		--disable-gpu --disable-dev-shm-usage \
-		--user-data-dir=/tmp/chromium-headless \
-		--enable-logging=stderr --v=1 \
-		--virtual-time-budget=4000 \
-		--screenshot=/tmp/headless.png \
-		file:///root/browser-proof.html > /var/headless.log 2>&1
-	echo "I915-SWAY: headless exit=$? t=$(up) png=$(ls -l /tmp/headless.png 2>/dev/null | awk '{print $5}')"
-	echo "--- headless: errors and warnings ---"
-	grep -aE "ERROR|WARNING|FATAL|NOTREACHED|Check failed" /var/headless.log 2>/dev/null |
-		head -20
-	echo "--- headless: last 25 lines ---"
-	tail -25 /var/headless.log 2>/dev/null
-	echo "--- end headless log ---"
+	# Is it burning the processor, or waiting?
+	#
+	# The task dump showed its scheduler counter advancing, which suggested a
+	# thread spinning — but that counter is a scheduler-internal value and a
+	# poor thing to conclude from. Consumed processor time is the direct
+	# measure: sampled twice, the difference over a known interval says plainly
+	# whether the process is running or parked.
+	pid=$(ls -d /proc/[0-9]* 2>/dev/null | while read -r d; do
+		case "$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" in
+		*chromium-min*) echo "${d#/proc/}"; break ;;
+		esac
+	done)
+	if [ -n "$pid" ]; then
+		u1=$(awk '{print $14, $15}' /proc/$pid/stat 2>/dev/null)
+		sleep 10
+		u2=$(awk '{print $14, $15}' /proc/$pid/stat 2>/dev/null)
+		echo "I915-SWAY: minimal cpu pid=$pid over 10s: [$u1] -> [$u2]"
+		echo "I915-SWAY: minimal threads=$(ls /proc/$pid/task 2>/dev/null | wc -l)"
+	else
+		echo "I915-SWAY: minimal cpu — process not found in /proc"
+	fi
 
-	echo "I915-SWAY: load-cost start t=$(up)"
-	/usr/bin/chromium --version 2>&1 | head -1
-	echo "I915-SWAY: load-cost end   t=$(up)"
+	echo "I915-SWAY: minimal after-quiet t=$(up) dom=$(grep -ac '<html' /var/min.log 2>/dev/null)"
+	pkill -f "chromium-min" 2>/dev/null
 
 	echo "I915-SWAY: starting chromium on $WAYLAND_DISPLAY t=$(up)"
 	# The display name is the one discovered above, not a guess: sway names its

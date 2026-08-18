@@ -65,11 +65,40 @@ static void test_getenv(void) {
  * musl, i.e. the exact path every ported program takes. */
 
 static void test_clock_getres(void) {
-    struct timespec res;
+    struct timespec res, a, b;
     int rc = clock_getres(CLOCK_MONOTONIC, &res);
-    /* b1nix drives its clocks off the 100 Hz tick, so the resolution is 10 ms —
-     * a caller sizing a poll loop from it must get the real number. */
-    marker(rc == 0 && res.tv_sec == 0 && res.tv_nsec == 10000000
+    long long claimed, observed = -1;
+
+    /* What it reports must be what it does.
+     *
+     * This used to assert a hard 10 ms, which was true only while every clock
+     * was driven off the 100 Hz tick. On a machine with an invariant TSC the
+     * kernel uses the counter and the real resolution is nanoseconds — the
+     * assertion then failed on a kernel that had become more accurate, not less.
+     * A caller sizing a poll loop needs the true figure, so check the claim
+     * against measurement instead of against a constant: read the clock until
+     * it changes, and require the reported resolution to be no coarser than the
+     * step actually seen. */
+    if (rc != 0 || res.tv_sec != 0 || res.tv_nsec <= 0) {
+        marker("MUSL-POSIX: fail clock-getres\n");
+        return;
+    }
+    claimed = res.tv_nsec;
+
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    for (int i = 0; i < 2000000; i++) {
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        if (b.tv_sec != a.tv_sec || b.tv_nsec != a.tv_nsec) {
+            observed = (long long)(b.tv_sec - a.tv_sec) * 1000000000LL +
+                       (b.tv_nsec - a.tv_nsec);
+            break;
+        }
+    }
+
+    /* Observed steps can exceed the resolution (the reader gets descheduled),
+     * so only the other direction is a lie: claiming a resolution finer than
+     * the clock can actually distinguish. Allow the claim to equal the step. */
+    marker(observed > 0 && claimed <= observed
            ? "MUSL-POSIX: ok clock-getres\n" : "MUSL-POSIX: fail clock-getres\n");
 }
 

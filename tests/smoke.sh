@@ -1162,7 +1162,7 @@ section "M94 Linux ABI conformance (through musl)"
 # Each of these reached the kernel as "unmapped syscall -> -ENOSYS" before the
 # translation table gained them, so a regression shows up here rather than as a
 # port that mysteriously degrades.
-check_output "$LOG" "MUSL-POSIX: ok clock-getres" "clock_getres reports the real 10 ms tick resolution (Linux nr 229)"
+check_output "$LOG" "MUSL-POSIX: ok clock-getres" "clock_getres reports a resolution the clock can actually deliver (Linux nr 229)"
 check_output "$LOG" "MUSL-POSIX: ok times" "times() returns process CPU accounting (Linux nr 100)"
 check_output "$LOG" "MUSL-POSIX: ok sysinfo" "sysinfo() reports total RAM (Linux nr 99)"
 check_output "$LOG" "MUSL-POSIX: ok sched-getaffinity" "sched_getaffinity returns a non-empty CPU mask (Linux nr 204)"

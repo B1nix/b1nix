@@ -295,6 +295,7 @@ BINARIES += $(BUILD)/bin/invite_stress
 BINARIES += $(BUILD)/bin/pipe_eof
 BINARIES += $(BUILD)/bin/fd_visibility
 BINARIES += $(BUILD)/bin/clock_sanity
+BINARIES += $(BUILD)/bin/yield_fairness
 BINARIES += $(BUILD)/bin/ext_stress
 BINARIES += $(BUILD)/bin/m24_stress
 BINARIES += $(BUILD)/bin/m27_cmdline
