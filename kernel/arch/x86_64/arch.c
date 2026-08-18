@@ -344,18 +344,91 @@ static void x86_enable_fsgsbase(void) {
   g_fsgsbase_ready = 1;
 }
 
-/* CR4.SMEP is NOT enabled, deliberately.
+/* Turn on CR4.SMEP (bit 20) when the CPU has it (CPUID.7.0:EBX[7]).
  *
- * SMEP makes the CPU refuse to execute a page marked user-accessible while
- * running in ring 0, which is a good thing to want. It cannot be switched on
- * as this kernel currently maps memory: the identity map of low memory carries
- * the user bit (paging.c sets VMM_USER for anything below USER_SPACE_LIMIT),
- * and the AP startup trampoline lives down there and is executed by the kernel
- * itself. Turning SMEP on faults on the trampoline — tried, and the smoke run
- * died in long_mode_low with a garbage instruction pointer.
+ * SMEP makes the processor refuse to execute a page marked user-accessible
+ * while it is in ring 0. The kernel never intends to do that, so the feature
+ * costs nothing and turns a whole class of attacks — get the kernel to jump
+ * into a page userspace controls — into an immediate fault.
  *
- * Enabling it needs the low identity map to stop being user-accessible first.
- * That is a separate piece of work, not a line in CR4. */
+ * What blocked it before was the low identity map. Every address space carries
+ * one, the code the kernel runs down there (the boot stub, and the trampoline
+ * each AP starts on at 0x8000) lives inside it, and a page in that window that
+ * userspace owns must be user-accessible. The two are separated by ownership,
+ * not by address: the identity window is mapped with supervisor 2 MiB pages,
+ * and where a process takes a page inside it the huge page is split and only
+ * that one leaf becomes the process's. The 511 neighbours — the trampoline
+ * among them — stay supervisor, so SMEP has nothing to complain about.
+ *
+ * Enabling is also late by design. This runs from arch_init, long after the
+ * boot stub has jumped to the high half, and from x86_ap_arch_init, which an
+ * AP reaches only once it is executing high-half C code — neither trampoline
+ * ever runs with the bit set.
+ *
+ * The CR4 read-back is not decoration: it is the only evidence the bit is
+ * really on. The BSP prints its own; every CPU that succeeds also records
+ * itself in g_smep_cpus, which arch_smep_cpu_count reports once the APs are
+ * up. An AP must not print here — its line lands in the middle of the one
+ * smp_boot_aps is writing and eats the marker the smoke suite greps for. */
+static volatile u32 g_smep_cpus;
+
+static void x86_enable_smep(int announce) {
+  u32 a, b, c, d;
+  cpuid_count(0, 0, &a, &b, &c, &d);
+  if (a < 7) {
+    if (announce)
+      console_write("smep: unavailable (no CPUID leaf 7)\n");
+    return;
+  }
+
+  cpuid_count(7, 0, &a, &b, &c, &d);
+  if (!(b & (1u << 7))) {
+    if (announce)
+      console_write("smep: unavailable (not reported by CPUID.7.0:EBX[7])\n");
+    return;
+  }
+
+  u64 cr4;
+  __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+  cr4 |= (1ull << 20); /* SMEP */
+  __asm__ volatile("movq %0, %%cr4" : : "r"(cr4) : "memory");
+
+  __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+  if (!(cr4 & (1ull << 20))) {
+    if (announce) {
+      console_write("smep: refused, cr4=0x");
+      console_write_hex64(cr4);
+      console_write("\n");
+    }
+    return;
+  }
+
+  {
+    struct percpu *pc = get_percpu();
+    int cpu = pc ? (int)pc->cpu_id : 0;
+
+    if (cpu >= 0 && cpu < 32)
+      __atomic_or_fetch(&g_smep_cpus, 1u << cpu, __ATOMIC_RELEASE);
+  }
+
+  if (announce) {
+    console_write("smep: enabled, cr4=0x");
+    console_write_hex64(cr4);
+    console_write("\n");
+  }
+}
+
+/* How many CPUs are running with CR4.SMEP set. Read after AP bring-up. */
+int arch_smep_cpu_count(void) {
+  u32 mask = __atomic_load_n(&g_smep_cpus, __ATOMIC_ACQUIRE);
+  int n = 0;
+
+  while (mask) {
+    n += (int)(mask & 1u);
+    mask >>= 1;
+  }
+  return n;
+}
 
 static void x86_enable_xsave(void) {
   u32 a, b, c, d;
@@ -432,6 +505,7 @@ void arch_init(void) {
   rtc_init();
   x86_syscall_init();
   x86_enable_write_protect();
+  x86_enable_smep(1);
   x86_enable_sse();
   /* M98: program this CPU's IA32_PAT so VMM_WC means write-combining. */
   pat_init_cpu();
@@ -470,6 +544,7 @@ void x86_ap_arch_init(int cpu) {
   x86_enable_sse();       /* per-CPU CR0/CR4 for fxsave/fxrstor in ctx switch */
   pat_init_cpu();         /* per-CPU IA32_PAT: WC PTEs mean WC on this core too */
   x86_enable_write_protect();
+  x86_enable_smep(0);     /* per-CPU CR4 bit; the AP is past its trampoline here */
   /* Software-enable this AP's LAPIC + TPR/LVT setup. Without this the AP's
    * LAPIC stays in its reset (software-disabled) state and every locally-
    * delivered vector — including the LAPIC timer we arm later in ap_main

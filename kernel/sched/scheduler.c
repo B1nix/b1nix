@@ -1628,10 +1628,11 @@ int scheduler_fork_current(void) {
    * straight into the now-shared frame — scribbling the child's copy of the
    * stack, so the child later `ret`s through a corrupted (often 0) return
    * address and SIGSEGVs. The page tables were edited in place, so reloading
-   * CR3 (parent == current task) flushes the stale entries. */
+   * CR3 (parent == current task) flushes the stale entries. Reload explicitly:
+   * switching to the address space already loaded no longer writes CR3. */
   if (parent == current_task) {
-    extern void paging_switch_address_space(u64 pml4_phys);
-    paging_switch_address_space(parent->pml4_phys);
+    extern void paging_reload_cr3(void);
+    paging_reload_cr3();
   }
 
   // 4. Clone VMAs
@@ -2554,13 +2555,13 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
      * CLONE_VFORK still suspends the parent until exec/exit, so the ordering
      * userspace relies on is preserved. */
     extern u64 paging_clone_address_space(u64 pml4_phys);
-    extern void paging_switch_address_space(u64 pml4_phys);
+    extern void paging_reload_cr3(void);
     child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
     /* The clone flipped the parent's writable user pages to COW in place; the
      * parent keeps running on the same CR3, so reload it to drop the stale
      * writable TLB entries (see the identical note in scheduler_fork_current). */
     if (parent == current_task)
-      paging_switch_address_space(parent->pml4_phys);
+      paging_reload_cr3();
 
     child->vma_list = 0;
     struct vm_area *src_vma = parent->vma_list;

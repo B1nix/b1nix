@@ -808,6 +808,24 @@ echo "[RUN] Boot smoke checks..."
 check_output "$LOG" "b1nix kernel" "kernel banner appears"
 check_output "$LOG" "pmm:" "physical memory manager initializes"
 check_output "$LOG" "kheap:" "kernel heap initializes"
+# SMEP: the kernel prints its CR4 read-back, so this checks the bit is really
+# set and not merely that the code ran. A processor that does not offer the
+# feature says so on the same line and is accepted — silence is not.
+check_output "$LOG" "smep: \(enabled, cr4=0x[0-9a-f]*\|unavailable\)" \
+	"CR4.SMEP is enabled (or the CPU reports it absent)"
+# ... and on every core, not just the one that printed. The APs enable it
+# silently (their line would corrupt the bring-up marker), so the kernel counts
+# them; this compares the two numbers on that line.
+_smep_line=$(grep -a "smep: active on" "$LOG" 2>/dev/null | tail -1)
+_smep_have=$(echo "$_smep_line" | sed -n 's/.*active on \([0-9]*\) of \([0-9]*\) CPUs.*/\1/p')
+_smep_want=$(echo "$_smep_line" | sed -n 's/.*active on \([0-9]*\) of \([0-9]*\) CPUs.*/\2/p')
+if [ -n "$_smep_want" ] && [ "$_smep_have" = "$_smep_want" ]; then
+	pass "CR4.SMEP is set on every online CPU ($_smep_have)"
+elif grep -aq "smep: unavailable" "$LOG" 2>/dev/null; then
+	pass "CR4.SMEP unavailable on this CPU — reported, not silently skipped"
+else
+	fail "CR4.SMEP is set on every online CPU" "${_smep_line:-no smep tally in log}"
+fi
 # b1cc temporarily cut from the build (B1NIX_NO_B1CC) — restored as a separate
 # change. These checks are disabled until b1cc is re-added.
 # check_output "$LOG" "B1CC-R42-SMOKE: ok" "b1cc return_42 runs and exits with 42"

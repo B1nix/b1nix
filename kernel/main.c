@@ -925,6 +925,21 @@ void kernel_main(usize arg0, usize arg1)
 	/* Bring up Application Processors */
 	smp_boot_aps();
 
+	/* Each AP turns CR4.SMEP on for itself and stays quiet about it (its line
+	 * would land inside the one smp_boot_aps is writing). Report the tally here
+	 * instead, so the bit is accounted for on every core and not just the one
+	 * that printed at arch_init. */
+	{
+		extern int arch_smep_cpu_count(void);
+		int smep_cpus = arch_smep_cpu_count();
+
+		console_write("smep: active on ");
+		console_write_dec((u32)smep_cpus);
+		console_write(" of ");
+		console_write_dec((u32)get_online_cpu_count());
+		console_write(" CPUs\n");
+	}
+
 	/* M28 T4: enable cross-CPU TLB shootdown. With BKL out of syscall_entry.S
 	 * (T4), two CPUs can simultaneously execute vmm_unmap_page on different
 	 * pml4s; without shootdown, the stale TLB entry on another CPU lets a

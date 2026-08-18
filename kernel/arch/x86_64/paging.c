@@ -80,19 +80,97 @@ static void write_cr3(u64 value) {
   __asm__ volatile("movq %0, %%cr3" : : "r"(value) : "memory");
 }
 
+/* Address-space epoch.
+ *
+ * Bumped every time an address space is created or destroyed. A CPU records
+ * the epoch it saw when it loaded CR3; a later switch skips the CR3 write only
+ * when both the PML4 frame AND the epoch still match what it recorded.
+ *
+ * Comparing the PML4 frame address alone — the obvious form of this
+ * optimisation — is wrong: the frame that held one process's PML4 is freed and
+ * handed to the next process for its own PML4. The address then matches while
+ * the table behind it is a different address space entirely, and the skipped
+ * write leaves the TLB full of the dead process's translations. That panicked
+ * with a page-table entry out of range. The epoch closes exactly that hole: an
+ * address space created or destroyed anywhere, on any CPU, makes every
+ * recorded value stale, and the next switch writes CR3.
+ *
+ * Read with acquire AFTER the target PML4 has been read, so a CPU that obtains
+ * a newly created space's PML4 cannot also observe the pre-creation epoch. */
+static volatile u64 g_addrspace_epoch = 1;
+
+static inline void addrspace_epoch_bump(void) {
+  __atomic_add_fetch(&g_addrspace_epoch, 1, __ATOMIC_SEQ_CST);
+}
+
+/* A live translation is being taken away or pointed somewhere else.
+ *
+ * Writing CR3 on every context switch used to flush the whole TLB, and that
+ * flush silently stood in for cross-CPU invalidation everywhere the kernel
+ * edits page tables: unmap, swap-out, the copy-on-write flip, a protection
+ * downgrade. invlpg only reaches the CPU running it, so once the switch stops
+ * flushing, another core keeps using the old translation until something makes
+ * it reload. Bumping the epoch is that something — every CPU's recorded load
+ * becomes stale and its next switch writes CR3 again.
+ *
+ * Only replacements and removals need this. x86 does not cache non-present
+ * entries, so filling a lazy or absent page in — the overwhelmingly common
+ * page-fault case — needs no announcement, which is what keeps the skip
+ * worthwhile. */
+static inline void addrspace_note_replaced(u64 old_entry) {
+  if (old_entry & VMM_PRESENT)
+    addrspace_epoch_bump();
+}
+
+/* Drop every cached translation for the address space this CPU already runs
+ * on. The fork paths need it: they edit the live page tables in place (the
+ * parent's writable user pages become COW) and the stale writable entries have
+ * to go. Those call sites used to get the flush by "switching" to the address
+ * space that was already loaded, which the skip below now elides. */
+void paging_reload_cr3(void) {
+  u64 cr3;
+
+  __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+  __asm__ volatile("movq %0, %%cr3" : : "r"(cr3) : "memory");
+}
+
 void paging_switch_address_space(u64 pml4_phys) {
   u64 target_phys = pml4_phys ? pml4_phys : kernel_pml4_phys;
 
-  /* Always write CR3, even when it already holds this value.
-   *
-   * Skipping the write when the PML4 address matches looks safe and is not:
-   * a physical frame that held one process's PML4 can be freed and handed to
-   * the next process for its own PML4. The address then matches while the
-   * table behind it is a different address space entirely, and skipping the
-   * write leaves the TLB full of the dead process's translations. Tried, and
-   * it panicked with a page-table entry out of range. The flush is the price
-   * of the guarantee. */
-  __asm__ volatile("mov %0, %%cr3" : : "r"(target_phys) : "memory");
+  /* The per-CPU record has to be read, tested and written on the CPU whose CR3
+   * this is. The scheduler calls in with interrupts already masked, but the
+   * ELF loader and vmm_init do not, and a preemption between get_percpu() and
+   * the store would file this CPU's CR3 under another CPU's record. Masking
+   * locally costs a few cycles against a whole TLB. */
+  u64 rflags;
+  __asm__ volatile("pushfq; popq %0; cli" : "=r"(rflags) : : "memory");
+
+  struct percpu *pc = get_percpu();
+
+  if (pc) {
+    u64 epoch = __atomic_load_n(&g_addrspace_epoch, __ATOMIC_ACQUIRE);
+
+    if (pc->loaded_pml4_phys == target_phys &&
+        pc->loaded_addrspace_epoch == epoch) {
+      /* Same address space, and none has been created or destroyed since it
+       * was loaded: CR3 already holds it and every translation cached under it
+       * is still this space's. Writing it again would throw the whole TLB away
+       * for nothing — which is what a switch between two threads of one
+       * process used to do, every time. */
+      __asm__ volatile("pushq %0; popfq" : : "r"(rflags) : "memory", "cc");
+      return;
+    }
+
+    __asm__ volatile("mov %0, %%cr3" : : "r"(target_phys) : "memory");
+    pc->loaded_pml4_phys = target_phys;
+    pc->loaded_addrspace_epoch = epoch;
+  } else {
+    /* Before per-CPU data exists (vmm_init on the BSP) there is nowhere to
+     * record the load, so never skip. */
+    __asm__ volatile("mov %0, %%cr3" : : "r"(target_phys) : "memory");
+  }
+
+  __asm__ volatile("pushq %0; popfq" : : "r"(rflags) : "memory", "cc");
 }
 
 static void invalidate_page(u64 virtual_address) {
@@ -184,6 +262,9 @@ static void split_huge_page_into(u64 *pd, usize index, u64 *pt) {
   for (usize i = 0; i < 512; i++)
     pt[i] = (base + i * PAGE_SIZE) | leaf_flags;
   pd[index] = table_to_phys(pt) | flags;
+  /* The 2 MiB entry other CPUs may have cached no longer describes this
+   * range on its own — and the leaves lose the user bit. */
+  addrspace_note_replaced(entry);
 }
 
 static u64 *split_huge_page(u64 *pd, usize index) {
@@ -206,6 +287,7 @@ static u64 *split_huge_page(u64 *pd, usize index) {
   }
 
   pd[index] = table_to_phys(pt) | flags;
+  addrspace_note_replaced(entry); /* see split_huge_page_into */
   return pt;
 }
 
@@ -417,6 +499,7 @@ void vmm_map_page_in_table(u64 *pml4, u64 virtual_address, u64 physical_address,
   if ((flags & VMM_USER) != 0)
     __atomic_or_fetch(&pd[pd_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
 
+  addrspace_note_replaced(pt[pt_index(virtual_address)]);
   pt[pt_index(virtual_address)] =
       (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
   invalidate_page(virtual_address);
@@ -501,6 +584,7 @@ static void vmm_map_page_locked(u64 virtual_address, u64 physical_address,
   if ((flags & VMM_USER) != 0) {
     __atomic_or_fetch(&pd[pd_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
   }
+  addrspace_note_replaced(pt[pt_index(virtual_address)]);
   pt[pt_index(virtual_address)] =
       (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
   invalidate_page(virtual_address);
@@ -575,6 +659,7 @@ static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address) {
 
   if ((pde & HUGE_PAGE_FLAG) != 0) {
     pd[pd_index(virtual_address)] = 0;
+    addrspace_note_replaced(pde);
     invalidate_page(virtual_address);
     return;
   }
@@ -599,6 +684,7 @@ static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address) {
     swap_free_slot_index((u32)((pte & PAGE_ENTRY_ADDRESS_MASK) >> 12));
   }
   pt[pt_index(virtual_address)] = 0;
+  addrspace_note_replaced(pte);
   invalidate_page(virtual_address);
 }
 
@@ -741,6 +827,7 @@ void paging_mprotect_page(u64 virtual_address, u64 flags) {
     }
     pt[pt_index(virtual_address)] =
         (pte & PAGE_ENTRY_ADDRESS_MASK) | nf | VMM_PRESENT;
+    addrspace_note_replaced(pte); /* a protection change is a downgrade */
   } else if (pte & (VMM_LAZY | VMM_SWAPPED)) {
     // For non-present pages, update the saved flags
     pt[pt_index(virtual_address)] =
@@ -903,10 +990,13 @@ void vmm_set_lazy(u64 virtual_address) {
                       (expect & PAGE_ENTRY_ADDRESS_MASK) ==
                           (virtual_address & PAGE_ENTRY_ADDRESS_MASK);
 
-  if (expect == 0 || identity_leaf)
-    __atomic_compare_exchange_n(&pt[pt_index(virtual_address)], &expect,
-                                VMM_LAZY, 0, __ATOMIC_RELEASE,
-                                __ATOMIC_RELAXED);
+  if (expect == 0 || identity_leaf) {
+    if (__atomic_compare_exchange_n(&pt[pt_index(virtual_address)], &expect,
+                                    VMM_LAZY, 0, __ATOMIC_RELEASE,
+                                    __ATOMIC_RELAXED) &&
+        identity_leaf)
+      addrspace_note_replaced(expect);
+  }
   invalidate_page(virtual_address);
 }
 
@@ -1035,8 +1125,11 @@ void paging_move_range(u64 old_start, u64 new_start, u64 len) {
       u64 *dst = pf_leaf_pte_ptr(new_start + off);
 
       if (src && dst && *src) {
-        *dst = *src;
+        u64 moved = *src;
+
+        *dst = moved;
         *src = 0;
+        addrspace_note_replaced(moved);
         invalidate_page(old_start + off);
         invalidate_page(new_start + off);
       }
@@ -1229,6 +1322,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
             {
               u64 *pt = table_from_entry(pd[pdi]);
 
+              addrspace_note_replaced(pt[pt_index(page_aligned)]);
               pt[pt_index(page_aligned)] = VMM_LAZY;
             }
             invalidate_page(page_aligned);
@@ -1803,6 +1897,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
        * is already zero-filled, so there is nothing to copy, and the zero page
        * must never be unreferenced or eviction-unregistered (it is shared and
        * has a permanent reservation). */
+      addrspace_note_replaced(*slot);
       *slot = new_frame | new_flags;
       invalidate_page(page_aligned);
       vmm_write_release(cflags);
@@ -1812,6 +1907,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
     if (pmm_get_refcount(old_frame) == 1) {
       // Sole owner now — just flip to writable in place, no copy needed.
+      addrspace_note_replaced(*slot);
       *slot = old_frame | new_flags;
       invalidate_page(page_aligned);
       vmm_write_release(cflags);
@@ -1824,6 +1920,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     // va), so it is safe under the lock.
     memcpy((void *)(usize)(new_frame + DIRECT_MAP_BASE),
            (void *)(usize)(old_frame + DIRECT_MAP_BASE), PAGE_SIZE);
+    addrspace_note_replaced(*slot);
     *slot = new_frame | new_flags;
     pmm_unref_frame(old_frame);
     invalidate_page(page_aligned);
@@ -1878,6 +1975,10 @@ u64 paging_create_address_space(void) {
   }
 
   vmm_read_release(_vmflags);
+
+  /* A brand-new address space now exists, possibly on a frame that a dead one
+   * used to occupy. Invalidate every CPU's "already loaded" record. */
+  addrspace_epoch_bump();
   return pml4_phys;
 }
 
@@ -1979,6 +2080,13 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
 
   vmm_write_release(_vmflags);
 
+  /* Two reasons to bump here. The child is a new address space on a frame that
+   * may have belonged to a dead one; and this clone just flipped the parent's
+   * writable user pages to COW in place, so any OTHER CPU running a sibling
+   * thread of the parent has to drop its stale writable translations too. The
+   * CR3 reload above only covers this one. */
+  addrspace_epoch_bump();
+
   return dst_pml4_phys;
 }
 
@@ -2010,6 +2118,7 @@ void paging_mark_swapped(u64 pml4_phys, u64 vaddr, u64 slot) {
     flags &= ~VMM_PRESENT;
     flags |= VMM_SWAPPED;
     pt[pt_index(vaddr)] = ((slot << 12) & PAGE_ENTRY_ADDRESS_MASK) | flags;
+    addrspace_note_replaced(pte);
     invalidate_page(vaddr);
   }
 }
@@ -2050,6 +2159,8 @@ int paging_test_and_clear_accessed(u64 pml4_phys, u64 vaddr) {
   u64 old = __atomic_fetch_and((u64 *)&pt[pt_index(vaddr)], ~VMM_ACCESSED,
                                __ATOMIC_SEQ_CST);
   if (old & VMM_ACCESSED) {
+    /* Every CPU has to reload before it will set the bit again. */
+    addrspace_note_replaced(old);
     invalidate_page(vaddr);
     return 1;
   }
@@ -2083,6 +2194,8 @@ int paging_test_and_clear_dirty(u64 pml4_phys, u64 vaddr) {
   u64 old = __atomic_fetch_and((u64 *)&pt[pt_index(vaddr)], ~VMM_DIRTY,
                                __ATOMIC_SEQ_CST);
   if (old & VMM_DIRTY) {
+    /* See paging_test_and_clear_accessed. */
+    addrspace_note_replaced(old);
     invalidate_page(vaddr);
     return 1;
   }
@@ -2310,6 +2423,11 @@ void paging_free_address_space(u64 pml4_phys) {
 
     if (!pmm_claim_page_table_release(pml4_phys))
       return; /* another thread is already tearing this space down */
+
+    /* This space is going away and its PML4 frame is about to go back to the
+     * allocator. Any CPU still recording it as "loaded" must be made to write
+     * CR3 again rather than trust that record. */
+    addrspace_epoch_bump();
   }
 
   /* Nobody may still be running here. A space released under a live thread

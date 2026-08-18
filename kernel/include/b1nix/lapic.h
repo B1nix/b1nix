@@ -156,7 +156,16 @@ struct percpu {
      * a single global scratch races before the BKL can be acquired. */
     u64 syscall_scratch_rax;
 
-    u8 __pad[3816];  /* pad to 4KB total */
+    /* Which address space this CPU's CR3 currently holds, and the global
+     * address-space epoch at the moment it was loaded. Together they let
+     * paging_switch_address_space skip a redundant CR3 write (and the full TLB
+     * flush it implies) when the very same address space is being reloaded.
+     * The PML4 frame address alone is NOT an identity: a freed frame comes
+     * back as the next process's PML4. See paging_switch_address_space. */
+    u64 loaded_pml4_phys;
+    u64 loaded_addrspace_epoch;
+
+    u8 __pad[3800];  /* pad to 4KB total */
 } __attribute__((aligned(4096)));
 
 /* Segment base management */

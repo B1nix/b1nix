@@ -208,6 +208,10 @@ u64 paging_create_address_space(void);
 u64 paging_clone_address_space(u64 src_pml4_phys);
 void paging_free_address_space(u64 pml4_phys);
 void paging_switch_address_space(u64 pml4_phys);
+/* Flush this CPU's TLB for the address space it is already running on. Use
+ * this — not a switch to the current PML4 — after editing live page tables of
+ * the running space; the switch skips the CR3 write when nothing changed. */
+void paging_reload_cr3(void);
 
 /* Physical frame backing `vaddr` in the address space rooted at `pml4_phys`,
  * or 0 if the page is not present. Used to measure a task's real resident set
