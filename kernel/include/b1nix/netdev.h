@@ -27,9 +27,14 @@ struct netdev {
 	 * device-specific header such as the virtio_net_hdr). Returns 0 on
 	 * success, <0 on error/drop. Passing the header and payload separately
 	 * avoids a large intermediate frame buffer on a deep send stack.
+	 *
+	 * tx_flags carries per-packet transmit requests (NETDEV_TX_F_*). A driver
+	 * that does not implement one simply ignores it — the packet is already
+	 * complete without it, with the single exception of PARTIAL_CSUM, which the
+	 * stack only ever sets when every interface advertised NETDEV_F_TX_CSUM.
 	 */
 	int (*transmit)(struct netdev *nd, const u8 hdr[14],
-	                const void *payload, usize payload_len);
+	                const void *payload, usize payload_len, u32 tx_flags);
 
 	/*
 	 * Service the device: deliver each received ethernet frame to
@@ -58,8 +63,29 @@ struct netdev {
 	 */
 	int admin_down;
 
+	/*
+	 * Negotiated hardware offloads (NETDEV_F_*). Set by the driver before
+	 * netdev_register(), and only ever from what the device actually offered:
+	 * an offload that was assumed rather than negotiated corrupts every packet
+	 * it touches.
+	 */
+	u32 features;
+
 	void *priv;                /* driver-private state */
 };
+
+/* The device computes the TCP/UDP checksum on transmit, so a sender may leave
+ * only the pseudo-header sum in the checksum field. */
+#define NETDEV_F_TX_CSUM 0x1u
+/* Per-packet: the L4 checksum field holds only the pseudo-header sum and the
+ * device is expected to finish it. Never set unless the interface set was
+ * latched as offload-capable (net_tx_csum_offload_enabled()). */
+#define NETDEV_TX_F_PARTIAL_CSUM 0x1u
+/* The device validates the TCP/UDP checksum on receive and reports the verdict
+ * per packet; the driver passes NET_RX_F_CSUM_OK up for validated frames. */
+#define NETDEV_F_RX_CSUM 0x2u
+
+
 
 /* Register a NIC. All registered devices remain serviced by net_poll(). */
 void netdev_register(struct netdev *nd);

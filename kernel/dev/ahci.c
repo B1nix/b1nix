@@ -333,29 +333,92 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
 
   ahci_wait_ci_clear(port, p, (1 << 1), "write", port->port_num);
 
-  // Flush cache
-  memset(cmd_table->cfis, 0, 64);
-  struct fis_reg_h2d *flush_fis = (struct fis_reg_h2d *)cmd_table->cfis;
-  flush_fis->fis_type = FIS_TYPE_REG_H2D;
-  flush_fis->c = 1;
-  flush_fis->command = ATA_CMD_FLUSH_CACHE;
-  flush_fis->device = (1 << 6);
-
-  cmd_hdr->write = 1;
-  cmd_hdr->prdtl = 0; // No data for flush
-  memset(&cmd_table->prdt[0], 0, sizeof(struct ahci_prdt_entry));
-
-  p->ci = (1 << 1);
-  ahci_wait_ci_clear(port, p, (1 << 1), "flush", port->port_num);
-
   u32 tfd = p->tfd;
-  if (tfd & 0x01) {
+  if (tfd & 0x01) { // ERR bit
+    console_write("ahci: port ");
+    console_write_dec(port->port_num);
+    console_write(" write error tfd=0x");
+    console_write_hex32(tfd);
+    console_write("\n");
     ahci_port_unlock(port);
     return -1;
   }
 
   ahci_port_unlock(port);
   return (int)count;
+}
+
+/* Push the disk's write-back cache out to the platters.
+ *
+ * This is now the ONLY place b1nix issues a cache flush to a SATA disk. It used
+ * to follow every single WRITE DMA EXT, which is not a barrier — it is the
+ * absence of a write-back cache: the disk could neither merge nor reorder
+ * anything, and every write cost two full command round-trips instead of one.
+ * It bought the filesystems no ordering either, because every ext2/3/4 write
+ * (journal blocks included) lands in the block cache first and reaches the disk
+ * only when that cache is drained, in whatever order the drain picks.
+ *
+ * The barrier belongs where a caller actually asks for durability: fsync(2),
+ * sync(2) and umount all funnel through blk_cache_flush()/blk_sync_all(), which
+ * drain the dirty block-cache entries into the driver and then call this. */
+static int ahci_port_flush(struct ahci_port_state *port) {
+  if (!port->present)
+    return -1;
+
+  ahci_port_lock(port);
+
+  volatile struct ahci_port *p = &port->abar->ports[port->port_num];
+  struct ahci_cmd_header *cmd_hdr = &port->cmd_list[1]; /* slot 1, as writes */
+  struct ahci_cmd_table *cmd_table =
+      (struct ahci_cmd_table *)((u8 *)port->cmd_table + 4096);
+
+  int timeout = 1000000;
+  while ((p->tfd & 0x88) && timeout > 0) {
+    __asm__ volatile("pause");
+    timeout--;
+  }
+  if (timeout == 0) {
+    ahci_port_unlock(port);
+    return -1;
+  }
+
+  u32 ctba = cmd_hdr->ctba;
+  u32 ctbau = cmd_hdr->ctbau;
+  memset(cmd_hdr, 0, sizeof(struct ahci_cmd_header));
+  cmd_hdr->ctba = ctba;
+  cmd_hdr->ctbau = ctbau;
+  cmd_hdr->cfis_len = sizeof(struct fis_reg_h2d) / 4;
+  cmd_hdr->write = 1;
+  cmd_hdr->prdtl = 0; /* no data transfer */
+  memset(&cmd_table->prdt[0], 0, sizeof(struct ahci_prdt_entry));
+
+  memset(cmd_table->cfis, 0, 64);
+  struct fis_reg_h2d *fis = (struct fis_reg_h2d *)cmd_table->cfis;
+  fis->fis_type = FIS_TYPE_REG_H2D;
+  fis->c = 1;
+  /* FLUSH CACHE EXT is the 48-bit-addressing form of the same command; every
+   * device that accepts READ/WRITE DMA EXT — which is all we ever issue —
+   * supports it. */
+  fis->command = ATA_CMD_FLUSH_CACHE_EXT;
+  fis->device = (1 << 6);
+
+  p->serr = p->serr;
+  p->ci = (1 << 1);
+  ahci_wait_ci_clear(port, p, (1 << 1), "flush", port->port_num);
+
+  u32 tfd = p->tfd;
+  if (tfd & 0x01) {
+    console_write("ahci: port ");
+    console_write_dec(port->port_num);
+    console_write(" flush error tfd=0x");
+    console_write_hex32(tfd);
+    console_write("\n");
+    ahci_port_unlock(port);
+    return -1;
+  }
+
+  ahci_port_unlock(port);
+  return 0;
 }
 
 static int ahci_blk_read(struct block_device *dev, u64 lba, u32 count,
@@ -368,6 +431,11 @@ static int ahci_blk_write(struct block_device *dev, u64 lba, u32 count,
                           const void *buffer) {
   struct ahci_port_state *port = (struct ahci_port_state *)dev->priv;
   return ahci_port_write(port, lba, count, buffer);
+}
+
+static int ahci_blk_flush(struct block_device *dev) {
+  struct ahci_port_state *port = (struct ahci_port_state *)dev->priv;
+  return ahci_port_flush(port);
 }
 
 static void ahci_port_init(struct ahci_port_state *port,
@@ -645,6 +713,7 @@ void ahci_init(void) {
 
         dev->read_blocks = ahci_blk_read;
         dev->write_blocks = ahci_blk_write;
+        dev->flush = ahci_blk_flush;
         dev->priv = &ports[i];
         /* The block layer names it: the next free sd* in the one SCSI-disk
          * sequence AHCI shares with USB mass storage. */

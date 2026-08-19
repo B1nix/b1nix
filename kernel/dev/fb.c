@@ -218,6 +218,37 @@ static int fb_ioctl(struct vfs_node *node, u64 request, void *arg) {
      * lock: a concurrent userspace draw only tears pixels, never memory. */
     return fb_flush_rect(&rect);
   }
+  case B1NIX_FBIOCURSOR: {
+    struct b1nix_fb_cursor cur;
+    if (!arg || syscall_copyin(&cur, arg, sizeof(cur)) < 0)
+      return -EFAULT;
+    if (!virtio_gpu_cursor_ready())
+      return -EOPNOTSUPP;
+    if (cur.image_w || cur.image_h) {
+      if (cur.image_w == 0 || cur.image_h == 0 || cur.image_w > 64 ||
+          cur.image_h > 64 || cur.image == 0)
+        return -EINVAL;
+      /* Per call, not one buffer shared by every caller: two processes setting
+       * a cursor at the same moment would otherwise upload halves of each
+       * other's image. Bounded by the 64x64 the device's resource is. */
+      usize bytes = (usize)cur.image_w * cur.image_h * sizeof(u32);
+      u32 *image = kmalloc(bytes);
+      if (!image)
+        return -ENOMEM;
+      if (syscall_copyin(image, (const void *)(usize)cur.image, bytes) < 0) {
+        kfree(image);
+        return -EFAULT;
+      }
+      int set = virtio_gpu_set_cursor_image(image, cur.image_w, cur.image_h,
+                                            cur.hot_x, cur.hot_y);
+      kfree(image);
+      if (set < 0)
+        return -EIO;
+    }
+    int rc = cur.visible ? virtio_gpu_show_cursor(cur.x, cur.y)
+                         : virtio_gpu_hide_cursor();
+    return rc < 0 ? -EIO : 0;
+  }
   default:
     return -ENOTTY;
   }

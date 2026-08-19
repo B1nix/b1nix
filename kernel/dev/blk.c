@@ -1332,7 +1332,69 @@ void blk_flush_buffer(struct block_buffer *buf) {
   }
 }
 
-void blk_sync_all(void) {
+/* One page of zeroes, shared by every fallback in blk_zero_blocks(). Zeroing a
+ * block used to mean a kmalloc + memset per allocated filesystem block. */
+static const u8 blk_zero_page[4096];
+
+int blk_zero_blocks(struct block_device *dev, u64 lba, u32 count) {
+  if (!dev || count == 0)
+    return -1;
+  if (dev->block_count > 0 &&
+      ((u64)count > dev->block_count || lba > dev->block_count - count))
+    return -1;
+
+  if (dev->block_size == CACHE_BLOCK_SIZE) {
+    u64 tlba = lba;
+    struct block_device *target = blk_cache_target(dev, &tlba);
+    if (target->write_zeroes) {
+      /* The device is about to change the medium behind the cache's back, so
+       * every cached copy of the range has to go first: a stale entry that is
+       * still dirty would otherwise be written back over the zeroes later, and
+       * a stale clean one would keep answering reads with the old contents. */
+      for (usize i = 0; i < block_cache_n; i++) {
+        for (;;) {
+          u64 flags = bcache_acquire();
+          struct block_buffer *e = &block_cache[i];
+          if (!(e->flags & BLK_CACHE_VALID) || e->bdev != target ||
+              e->block_no < tlba || e->block_no >= tlba + count) {
+            bcache_release(flags);
+            break;
+          }
+          if (e->flags & BLK_CACHE_BUSY) {
+            /* Another CPU is DMA-ing into this slot; let it finish. */
+            bcache_release(flags);
+            scheduler_yield();
+            continue;
+          }
+          bcache_hash_remove((i32)i);
+          e->flags = 0;
+          e->bdev = 0;
+          e->block_no = 0;
+          bcache_release(flags);
+          break;
+        }
+      }
+      if (target->write_zeroes(target, tlba, count) == 0)
+        return 0;
+      /* The device refused it — write the zeroes ourselves rather than leave
+       * the caller believing the range was cleared. */
+    }
+  }
+
+  u32 done = 0;
+  while (done < count) {
+    u32 chunk = count - done;
+    if (chunk > sizeof(blk_zero_page) / CACHE_BLOCK_SIZE)
+      chunk = sizeof(blk_zero_page) / CACHE_BLOCK_SIZE;
+    if (blk_write_cached(dev, lba + done, chunk, blk_zero_page) < 0)
+      return -1;
+    done += chunk;
+  }
+  return 0;
+}
+
+/* Write every dirty cache entry back into whatever device owns it. */
+static void bcache_drain_all(void) {
   for (usize i = 0; i < block_cache_n; i++) {
     u64 flags = bcache_acquire();
     if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
@@ -1343,6 +1405,31 @@ void blk_sync_all(void) {
     }
     bcache_release(flags);
   }
+}
+
+/* Flush every whole disk we know of. Partitions are skipped: they share their
+ * parent's medium, and the parent is registered too, so flushing both would
+ * only cost a second command. */
+static void blk_flush_all_devices(void) {
+  for (usize i = 0; i < blk_device_count; i++) {
+    struct block_device *dev = blk_devices[i];
+    if (dev && dev->flush && !blk_is_partition(dev))
+      dev->flush(dev);
+  }
+}
+
+void blk_sync_all(void) {
+  /* Two rounds, because one device can sit on top of another. A loop device's
+   * flush writes its backing file, and those writes land in the block cache of
+   * the disk that file lives on — after the first drain has already passed it.
+   * The second round is what actually gets those bytes onto that disk. Nothing
+   * stacks on a loop device in turn, so two rounds are enough; on a system with
+   * no stacked device the second round finds nothing dirty and costs one extra
+   * (cheap) flush command per disk. */
+  bcache_drain_all();
+  blk_flush_all_devices();
+  bcache_drain_all();
+  blk_flush_all_devices();
 }
 
 void blk_cache_flush(struct block_device *dev) {
@@ -1378,6 +1465,98 @@ void blk_cache_flush(struct block_device *dev) {
     }
     bcache_release(flags);
   }
+
+  /* `dev` is the parent by now; the drain above only got the bytes as far as
+   * the medium's own write-back cache, so finish the job. */
+  if (dev->flush)
+    dev->flush(dev);
+}
+
+/* M14: prove that the durability path is real.
+ *
+ * Two things are checked, and neither of them can pass by accident:
+ *  1. Every whole disk that claims a cache-flush command accepts one. This is
+ *     the ATA FLUSH CACHE EXT / NVMe FLUSH / virtio FLUSH that used to be
+ *     absent from fsync(2) altogether (AHCI issued one after every write
+ *     instead, which is a different thing entirely, and NVMe issued none).
+ *  2. On a scratch virtio disk — the only device here that nothing else owns —
+ *     a written pattern survives a flush plus a full cache drop, and
+ *     blk_zero_blocks() really leaves zeroes behind, whether the device did
+ *     the zeroing itself or the block layer wrote them.
+ * Reads go through blk_cache_invalidate() first, so a pass means the bytes came
+ * back from the medium, not from the cache entry the write left behind. */
+#define BLK_SELFTEST_LBA 2048
+#define BLK_SELFTEST_BLOCKS 8
+
+void blk_durability_selftest(void) {
+  for (usize i = 0; i < blk_device_count; i++) {
+    struct block_device *dev = blk_devices[i];
+    if (!dev || !dev->flush || blk_is_partition(dev))
+      continue;
+    int rc = dev->flush(dev);
+    console_write(rc == 0 ? "M14-BLK: ok flush-op dev=" : "M14-BLK: FAIL flush-op dev=");
+    console_write(dev->name ? dev->name : "?");
+    console_write("\n");
+  }
+
+  struct block_device *dev = blk_nth_on_bus(BLK_BUS_VIRTIO, 0);
+  if (!dev || !dev->write_blocks) {
+    console_write("M14-BLK: no virtio-blk scratch device\n");
+    return;
+  }
+
+  const u32 nbytes = BLK_SELFTEST_BLOCKS * CACHE_BLOCK_SIZE;
+  u8 *out = kmalloc(nbytes);
+  u8 *in = kmalloc(nbytes);
+  if (!out || !in) {
+    if (out) kfree(out);
+    if (in) kfree(in);
+    console_write("M14-BLK: FAIL durable-roundtrip out-of-memory\n");
+    return;
+  }
+  for (u32 b = 0; b < nbytes; b++)
+    out[b] = (u8)(0xA5 ^ (b * 7));
+
+  int ok = blk_write_cached(dev, BLK_SELFTEST_LBA, BLK_SELFTEST_BLOCKS, out) >= 0;
+  if (ok) {
+    /* Drains the dirty entries into the driver, then flushes the device. */
+    blk_cache_flush(dev);
+    blk_cache_invalidate(dev);
+    ok = blk_read_cached(dev, BLK_SELFTEST_LBA, BLK_SELFTEST_BLOCKS, in) >= 0;
+  }
+  if (ok) {
+    for (u32 b = 0; b < nbytes; b++) {
+      if (in[b] != out[b]) {
+        ok = 0;
+        break;
+      }
+    }
+  }
+  console_write(ok ? "M14-BLK: ok durable-roundtrip dev=" : "M14-BLK: FAIL durable-roundtrip dev=");
+  console_write(dev->name ? dev->name : "?");
+  console_write("\n");
+
+  int used_device_op = dev->write_zeroes != 0;
+  int zok = blk_zero_blocks(dev, BLK_SELFTEST_LBA, BLK_SELFTEST_BLOCKS) == 0;
+  if (zok) {
+    blk_cache_invalidate(dev);
+    memset(in, 0xFF, nbytes);
+    zok = blk_read_cached(dev, BLK_SELFTEST_LBA, BLK_SELFTEST_BLOCKS, in) >= 0;
+  }
+  if (zok) {
+    for (u32 b = 0; b < nbytes; b++) {
+      if (in[b] != 0) {
+        zok = 0;
+        break;
+      }
+    }
+  }
+  console_write(zok ? "M14-BLK: ok zero-blocks by=" : "M14-BLK: FAIL zero-blocks by=");
+  console_write(used_device_op ? "device" : "blocklayer");
+  console_write("\n");
+
+  kfree(out);
+  kfree(in);
 }
 
 void blk_cache_invalidate(struct block_device *dev) {

@@ -53,6 +53,7 @@
 #define ATA_CMD_WRITE_DMA_EXT   0x35
 #define ATA_CMD_IDENTIFY        0xEC
 #define ATA_CMD_FLUSH_CACHE     0xE7
+#define ATA_CMD_FLUSH_CACHE_EXT 0xEA
 
 #define HBA_PORT_CPD  (1 << 31)
 #define HBA_PORT_IPM  (3 << 8)

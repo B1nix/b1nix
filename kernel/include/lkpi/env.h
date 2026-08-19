@@ -219,9 +219,12 @@ int lkpi_vsnprintf(char *buf, usize cap, const char *fmt, __builtin_va_list ap);
  */
 int lkpi_scanout_ready(void);
 void lkpi_scanout_mode(u32 *width, u32 *height);
-/* A full frame of 32-bit XRGB pixels, `width` * `height`, presented as the
- * whole visible area. Returns 0 on success. */
-int lkpi_scanout_present(const u32 *pixels, u32 width, u32 height);
+/* A frame of 32-bit XRGB pixels, `width` * `height`, of which only the
+ * rectangle (dirty_x, dirty_y, dirty_w, dirty_h) is copied and flushed to the
+ * host. Pass the whole frame when the caller has no damage to report.
+ * Returns 0 on success. */
+int lkpi_scanout_present(const u32 *pixels, u32 width, u32 height, u32 dirty_x,
+                         u32 dirty_y, u32 dirty_w, u32 dirty_h);
 
 /* ── diagnostics ────────────────────────────────────────────────── */
 void lkpi_panic(const char *message) __attribute__((noreturn));

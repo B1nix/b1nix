@@ -28,6 +28,9 @@ void net_loopback_drain(void);
 int net_is_ready(void);
 void net_dump_info(void);
 void net_interrupt_handler(void);
+/* Acknowledge every registered interface sitting on `irq` and wake net_task if
+ * any of them claimed the interrupt. Returns 1 when claimed. */
+int net_handle_irq(int irq);
 int net_get_irq(void);
 
 // Virtio Network Data Plane
@@ -37,6 +40,9 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
  * Used by the per-interface FIB so a route's output device is honoured. */
 void net_send_ethernet_dev(struct netdev *nd, struct mac_addr dst, u16 ethertype,
                            const void *payload, usize size);
+/* Same, carrying per-packet driver requests (NETDEV_TX_F_*). */
+void net_send_ethernet_tx(struct netdev *nd, struct mac_addr dst, u16 ethertype,
+                          const void *payload, usize size, u32 tx_flags);
 /* Interface indices: 1-based registration order, 0 = unspecified. */
 int netdev_index_of(struct netdev *nd);
 struct netdev *netdev_by_index(int idx);
@@ -49,8 +55,20 @@ int netdev_index_by_name(const char *name);
 int netdev_set_admin_up(struct netdev *nd, int up);
 int netdev_is_admin_up(const struct netdev *nd);
 
+/*
+ * Per-packet receive-path flags.
+ *
+ * NET_RX_F_CSUM_OK says the L4 (TCP/UDP) checksum needs no software check:
+ * either the NIC validated it (VIRTIO_NET_F_GUEST_CSUM and friends), or the
+ * packet never crossed a wire at all (loopback, or a segment injected straight
+ * into the state machine by a self-test). Everything without this flag is
+ * verified in software by ipv4_receive_flags() and dropped when it is wrong.
+ */
+#define NET_RX_F_CSUM_OK 0x1u
+
 // Ethernet
 void ethernet_receive(const void *data, usize size);
+void ethernet_receive_flags(const void *data, usize size, u32 rx_flags);
 
 // ARP
 void arp_init(void);
@@ -82,7 +100,24 @@ int arp_neigh_del(struct ipv4_addr ip);
 
 // IPv4
 void ipv4_receive(const void *data, usize size);
+void ipv4_receive_flags(const void *data, usize size, u32 rx_flags);
+/* Number of datagrams dropped because their TCP/UDP checksum did not verify. */
+u64 ipv4_rx_csum_errors(void);
 void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize size);
+
+/*
+ * The datagram's TCP/UDP checksum field is left zero and the IP layer fills it
+ * in. Only the IP layer knows the final source address (it rewrites it for
+ * loopback) and which interface the FIB picked, and only there can the choice
+ * between "compute it here" and "hand the NIC a partial sum to finish" be made
+ * per packet. A sender that builds its own complete L4 checksum — a raw socket,
+ * ICMP — simply does not pass this flag.
+ */
+#define IPV4_TX_F_CSUM_L4 0x1u
+
+/* ipv4_send() plus the per-packet flags above. */
+void ipv4_send_tx(struct ipv4_addr dst, u8 protocol, const void *payload,
+                  usize size, u32 ip_tx_flags);
 int ipv4_is_loopback(struct ipv4_addr ip);
 
 // IPv6 datapath (loopback + real-link via NDP)

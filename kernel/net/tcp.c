@@ -3,6 +3,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
 #include <b1nix/netproto.h>
+#include <b1nix/netdev.h>
 #include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
 #include <b1nix/posix.h>
@@ -43,15 +44,6 @@ struct tcp_header {
   u16 window;
   u16 checksum;
   u16 urgent;
-} __attribute__((packed));
-
-/* TCP pseudo-header for checksum calculation */
-struct tcp_pseudo {
-  struct ipv4_addr src;
-  struct ipv4_addr dst;
-  u8 zero;
-  u8 protocol;
-  u16 tcp_length;
 } __attribute__((packed));
 
 /* Compile-time ceiling of the tcp_conns[] array. The number of slots actually
@@ -805,33 +797,6 @@ static u32 bswap32(u32 v) {
                ((v >> 24) & 0xFF));
 }
 
-static u16 tcp_checksum(struct ipv4_addr src, struct ipv4_addr dst,
-                        const void *tcp_data, usize tcp_len) {
-  struct tcp_pseudo pseudo;
-  pseudo.src = src;
-  pseudo.dst = dst;
-  pseudo.zero = 0;
-  pseudo.protocol = 6; /* TCP */
-  pseudo.tcp_length = bswap16((u16)tcp_len);
-
-  u32 sum = 0;
-  const u8 *p = (const u8 *)&pseudo;
-  for (usize i = 0; i + 1 < sizeof(pseudo); i += 2)
-    sum += ((u16)p[i] << 8) | p[i + 1];
-
-  p = (const u8 *)tcp_data;
-  for (usize i = 0; i + 1 < tcp_len; i += 2)
-    sum += ((u16)p[i] << 8) | p[i + 1];
-
-  if ((tcp_len & 1) != 0)
-    sum += (u16)p[tcp_len - 1] << 8;
-
-  while ((sum >> 16) != 0)
-    sum = (sum & 0xffff) + (sum >> 16);
-
-  return (u16)~sum;
-}
-
 /* TCP-over-IPv6 checksum: ones'-complement sum over the IPv6 pseudo-header
  * (src, dst, 32-bit TCP length, next header 6) and the segment. */
 static u16 tcp6_checksum(struct in6_addr_k src, struct in6_addr_k dst,
@@ -858,33 +823,40 @@ static u16 tcp6_checksum(struct in6_addr_k src, struct in6_addr_k dst,
  * by address family. Does not touch the checksum (used for retransmits). */
 static void tcp_l3_send(u8 family, struct ipv4_addr v4,
                         const struct in6_addr_k *v6, const void *pkt,
-                        usize len) {
+                        usize len, u32 tx_flags) {
   if (family == B1NIX_AF_INET6)
     net_proto_ipv6_send(*v6, IP_PROTO_TCP, pkt, len);
   else
-    ipv4_send(v4, IP_PROTO_TCP, pkt, len);
+    ipv4_send_tx(v4, IP_PROTO_TCP, pkt, len, tx_flags);
 }
 
-/* Fill in the TCP checksum for the given address family. For the IPv6 ::1
- * loopback path the source address equals the destination. */
-static void tcp_set_checksum(u8 family, struct ipv4_addr v4,
-                             const struct in6_addr_k *v6, u8 *pkt, usize len) {
+/*
+ * Prepare a segment's checksum and report the IPV4_TX_F_* flags it must be
+ * handed to the IP layer with.
+ *
+ * IPv4 segments leave the field zero: only the IP layer knows the source
+ * address that will actually be on the wire (it rewrites it for loopback, which
+ * is what used to make a loopback segment's checksum wrong) and which interface
+ * the FIB picked, so only there can it choose between computing the sum and
+ * leaving a partial one for the NIC. IPv6 still computes its own.
+ */
+static u32 tcp_set_checksum(u8 family, struct ipv4_addr v4,
+                            const struct in6_addr_k *v6, u8 *pkt, usize len) {
   struct tcp_header *t = (struct tcp_header *)pkt;
+  (void)v4;
   t->checksum = 0;
-  /* The checksum field is network byte order, like every other on-wire field.
-   * Loopback RX does not verify it, but QEMU slirp/NAT and real peers drop a
-   * segment with a wrong checksum — which is why external TCP timed out while
-   * UDP (which already byte-swaps) worked. */
-  if (family == B1NIX_AF_INET6)
+  if (family == B1NIX_AF_INET6) {
     t->checksum = bswap16(tcp6_checksum(*v6, *v6, pkt, len));
-  else
-    t->checksum = bswap16(tcp_checksum(net_get_ip(), v4, pkt, len));
+    return 0;
+  }
+  return IPV4_TX_F_CSUM_L4;
 }
 
 /* Checksum + transmit a segment to a connection's peer. */
 static void tcp_conn_emit(struct tcp_conn *conn, u8 *pkt, usize len) {
-  tcp_set_checksum(conn->family, conn->remote_ip, &conn->remote_ip6, pkt, len);
-  tcp_l3_send(conn->family, conn->remote_ip, &conn->remote_ip6, pkt, len);
+  u32 tx = tcp_set_checksum(conn->family, conn->remote_ip, &conn->remote_ip6,
+                            pkt, len);
+  tcp_l3_send(conn->family, conn->remote_ip, &conn->remote_ip6, pkt, len, tx);
 }
 
 /* ── Allocate local port ── */
@@ -1686,8 +1658,13 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         tcp_unlock();
         irq_restore(irq);
         if (resend_data && resend_len) {
+          /* Re-stamp the checksum on the stored copy: it decides, and reports,
+           * whether this transmit is a partial-checksum one. The computation is
+           * idempotent, so a retransmit gets exactly what the original sent. */
+          u32 tx = tcp_set_checksum(conn->family, conn->remote_ip,
+                                    &conn->remote_ip6, resend_data, resend_len);
           tcp_l3_send(conn->family, conn->remote_ip, &conn->remote_ip6,
-                      resend_data, resend_len);
+                      resend_data, resend_len, tx);
         }
         irq = irq_save();
         tcp_lock();
@@ -1895,8 +1872,8 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
       tcp_unlock();
       irq_restore(irq);
 
-      tcp_set_checksum(family, v4src, &v6src, rst, sizeof(rst));
-      tcp_l3_send(family, v4src, &v6src, rst, sizeof(rst));
+      u32 tx = tcp_set_checksum(family, v4src, &v6src, rst, sizeof(rst));
+      tcp_l3_send(family, v4src, &v6src, rst, sizeof(rst), tx);
       return;
     }
     tcp_unlock();
@@ -2302,7 +2279,9 @@ void tcp_timer_tick(void) {
         tcp_unlock();
         irq_restore(irq);
         
-        tcp_l3_send(family, remote_ip, &remote_ip6, stack_buf, pkt_len);
+        u32 tx = tcp_set_checksum(family, remote_ip, &remote_ip6, stack_buf,
+                                  pkt_len);
+        tcp_l3_send(family, remote_ip, &remote_ip6, stack_buf, pkt_len, tx);
         
         irq = irq_save();
         tcp_lock();

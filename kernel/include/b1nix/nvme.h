@@ -89,6 +89,7 @@ struct nvme_cqe {
 
 #define NVME_CMD_IO_READ            0x02
 #define NVME_CMD_IO_WRITE           0x01
+#define NVME_CMD_IO_FLUSH           0x00
 
 // Identify CNS values
 #define NVME_IDENTIFY_CNS_NS        0x00  // Namespace

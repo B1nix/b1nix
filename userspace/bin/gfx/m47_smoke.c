@@ -7,6 +7,9 @@
  *    mappings alias the same pixels, and the contents survive munmap+remap
  *    (proves the kernel maps device frames, not lazy anonymous pages)
  *  - FBIOFLUSH pushes a dirty rect to the display path
+ *  - FBIOCURSOR drives the device's own cursor: an image is uploaded, shown,
+ *    moved and hidden, and the framebuffer contents are unchanged by all of it
+ *    (the pointer is composed by the device, not painted over the frame)
  *  - /dev/input/event0 (kbd) and event1 (mouse) open; O_NONBLOCK read with
  *    no events returns EAGAIN
  *  - a blocking read on event1 receives the event sequence injected by the
@@ -24,11 +27,20 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <stdint.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 static void marker(const char *text) {
 	write(1, text, strlen(text));
+}
+
+/* A failure marker that says why. "fail fb-cursor" on its own costs a whole
+ * twenty-minute run to turn into a number. */
+static void fail_errno(const char *what, int err) {
+	char line[128];
+	snprintf(line, sizeof(line), "M47-GFX: fail %s errno=%d\n", what, err);
+	marker(line);
 }
 
 static int test_fb(void) {
@@ -121,6 +133,100 @@ static int test_fb(void) {
 	return 0;
 }
 
+/*
+ * The hardware cursor. What is being checked is that the pointer is the
+ * device's to compose: uploading an image, showing it, moving it and hiding it
+ * all succeed, and none of them requires the framebuffer to be redrawn — the
+ * pixels written above are still there afterwards, which a cursor painted into
+ * the frame would have destroyed.
+ */
+static int test_fb_cursor(void) {
+	int fd = open("/dev/fb0", O_RDWR);
+	if (fd < 0) {
+		marker("M47-GFX: skip no-fb-cursor\n");
+		return 0;
+	}
+
+	struct b1nix_fb_info info;
+	if (ioctl(fd, B1NIX_FBIOGET_INFO, &info) != 0) {
+		marker("M47-GFX: fail fb-cursor\n");
+		close(fd);
+		return -1;
+	}
+
+	static uint32_t image[32 * 32];
+	for (int i = 0; i < 32 * 32; i++)
+		image[i] = 0xFF20C0FF;
+
+	struct b1nix_fb_cursor cur;
+	memset(&cur, 0, sizeof(cur));
+	cur.visible = 1;
+	cur.x = 40;
+	cur.y = 40;
+	cur.image_w = 32;
+	cur.image_h = 32;
+	cur.image = (uint64_t)(uintptr_t)image;
+	if (ioctl(fd, B1NIX_FBIOCURSOR, &cur) != 0) {
+		if (errno == EOPNOTSUPP) {
+			/* No hardware cursor on this display device — a fact, not a
+			 * failure, and better than a pointer burned into the frame. */
+			marker("M47-GFX: skip no-hw-cursor\n");
+			close(fd);
+			return 0;
+		}
+		fail_errno("fb-cursor-show", errno);
+		close(fd);
+		return -1;
+	}
+
+	/* Move it, with no image and no flush: the position is the only thing
+	 * that changes hands. */
+	memset(&cur, 0, sizeof(cur));
+	cur.visible = 1;
+	cur.x = 120;
+	cur.y = 90;
+	if (ioctl(fd, B1NIX_FBIOCURSOR, &cur) != 0) {
+		fail_errno("fb-cursor-move", errno);
+		close(fd);
+		return -1;
+	}
+
+	/* The frame the earlier test wrote must be untouched by all of that. */
+	size_t map_len = (size_t)info.pitch * info.height;
+	uint32_t *view = mmap(0, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (view == MAP_FAILED) {
+		marker("M47-GFX: fail fb-cursor-nondestructive\n");
+		close(fd);
+		return -1;
+	}
+	int intact = 1;
+	for (uint32_t y = 8; y < 72 && intact; y++) {
+		for (uint32_t x = 8; x < 72; x++) {
+			if (view[y * info.width + x] != (0x00AA55CC ^ (x + y))) {
+				intact = 0;
+				break;
+			}
+		}
+	}
+	munmap(view, map_len);
+	if (!intact) {
+		marker("M47-GFX: fail fb-cursor-nondestructive\n");
+		close(fd);
+		return -1;
+	}
+
+	memset(&cur, 0, sizeof(cur));
+	cur.visible = 0;
+	if (ioctl(fd, B1NIX_FBIOCURSOR, &cur) != 0) {
+		fail_errno("fb-cursor-hide", errno);
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	marker("M47-GFX: ok fb-cursor\n");
+	return 0;
+}
+
 static int test_input_open(void) {
 	int kfd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
 	int mfd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
@@ -205,6 +311,8 @@ int main(int argc, char **argv) {
 
 	int rc = 0;
 	if (test_fb() != 0)
+		rc = 1;
+	if (test_fb_cursor() != 0)
 		rc = 1;
 	if (test_input_open() != 0)
 		rc = 1;

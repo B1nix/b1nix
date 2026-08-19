@@ -35,6 +35,26 @@ struct b1nix_fb_rect {
  * kernel-internal fb_dev_claimed() reports. */
 #define B1NIX_FBIOGET_CLAIM 0xFB03
 
+/* The hardware cursor, when the display device composes one (virtio-gpu does).
+ * The pointer moves without the frame being redrawn and without anything being
+ * painted over: a cursor drawn into the framebuffer cannot be moved away again,
+ * because the pixels it covered were not kept. `image` is optional — 0 keeps
+ * whatever image is loaded — and points at `image_w` * `image_h` BGRA pixels,
+ * at most 64x64. -EOPNOTSUPP says the device has no hardware cursor rather than
+ * quietly substituting a destructive one. */
+struct b1nix_fb_cursor {
+  u32 visible;  /* 0 hides the cursor; the position is still remembered */
+  i32 x;
+  i32 y;
+  u32 hot_x;
+  u32 hot_y;
+  u32 image_w; /* 0 in both: keep the current image */
+  u32 image_h;
+  u64 image; /* userspace address of the BGRA pixels, or 0 */
+};
+
+#define B1NIX_FBIOCURSOR 0xFB04 /* arg: struct b1nix_fb_cursor * */
+
 void fb_dev_init(void);
 
 /* True once userspace has mapped the framebuffer: the kernel-side

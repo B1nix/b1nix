@@ -9,6 +9,11 @@
 
 void ethernet_receive(const void *data, usize size)
 {
+	ethernet_receive_flags(data, size, 0);
+}
+
+void ethernet_receive_flags(const void *data, usize size, u32 rx_flags)
+{
 	/* Drivers are all polled so their RX/TX rings keep moving, but the current
 	 * stack has one L3 address context. Do not let traffic from a standby NIC
 	 * poison ARP/DHCP state or produce replies on the active NIC. */
@@ -31,7 +36,7 @@ void ethernet_receive(const void *data, usize size)
 	if (ethertype == ETHERTYPE_ARP) {
 		arp_receive(payload, payload_size);
 	} else if (ethertype == ETHERTYPE_IPV4) {
-		ipv4_receive(payload, payload_size);
+		ipv4_receive_flags(payload, payload_size, rx_flags);
 	} else if (ethertype == ETHERTYPE_IPV6) {
 		/* M96: served by ipv6.ko when it is loaded. */
 		proto_deliver_ether(ETHERTYPE_IPV6, payload, payload_size);

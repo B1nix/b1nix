@@ -31,6 +31,12 @@ struct block_device {
 	 * only reaches the backing file's page cache, so fsync() on /dev/loopN has
 	 * to continue down that second level. Real disks leave this NULL. */
 	int (*flush)(struct block_device *dev);
+	/* Optional: make a range of blocks read back as zeroes without the caller
+	 * having to DMA a zero-filled buffer at the device. Only set by a driver
+	 * whose device negotiated the capability (virtio-blk's WRITE ZEROES today).
+	 * Never call this directly — it writes behind the block cache's back; go
+	 * through blk_zero_blocks(), which drops the stale cached copies first. */
+	int (*write_zeroes)(struct block_device *dev, u64 lba, u32 count);
 	void *priv;
 };
 
@@ -107,11 +113,20 @@ void blk_create_dev_nodes(void);
 void blk_cache_init(void);
 int blk_read_cached(struct block_device *dev, u64 lba, u32 count, void *buffer);
 int blk_write_cached(struct block_device *dev, u64 lba, u32 count, const void *buffer);
+/* Make `count` blocks starting at `lba` read back as zeroes. Uses the device's
+ * own WRITE ZEROES when it has one (keeping the block cache coherent), and
+ * otherwise writes the zeroes through the cache exactly as before. */
+int blk_zero_blocks(struct block_device *dev, u64 lba, u32 count);
 void blk_cache_flush(struct block_device *dev);
 void blk_flush_buffer(struct block_buffer *buf);
 void blk_sync_all(void);
 void blk_cache_invalidate(struct block_device *dev);
 int blk_cache_lock_is_held(void);
+
+/* M14 self-test (b1nix.test=1 only): every disk that claims a cache-flush
+ * command accepts one, and on a scratch virtio disk a pattern survives
+ * flush + cache-drop and blk_zero_blocks() really zeroes. */
+void blk_durability_selftest(void);
 
 /* M107 loop devices: (re)register /dev/loop-control after a root mount. */
 void loop_register_nodes(void);

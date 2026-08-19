@@ -41,6 +41,12 @@
 #define   TXPOLL_NPQ 0x40
 #define R_IMR       0x3C   /* Interrupt mask (16-bit)                       */
 #define R_ISR       0x3E   /* Interrupt status (16-bit, write-1-clear)      */
+#define   INT_ROK       0x0001   /* Receive OK                              */
+#define   INT_RER       0x0002   /* Receive error                           */
+#define   INT_RXDU      0x0010   /* RX descriptor unavailable               */
+#define   INT_LINKCHG   0x0020   /* Link status change                      */
+#define   INT_FIFOOVW   0x0040   /* RX FIFO overflow                        */
+#define R8169_INTR_MASK (INT_ROK | INT_RER | INT_RXDU | INT_LINKCHG | INT_FIFOOVW)
 #define R_TXCFG     0x40   /* Tx config (32-bit)                            */
 #define R_RXCFG     0x44   /* Rx config (32-bit)                            */
 #define R_CFG9346   0x50   /* EEPROM/lock register (8-bit)                  */
@@ -117,6 +123,14 @@ static inline void r_w16(u32 o, u16 v){ *(volatile u16 *)(r_regs + o) = v; }
 static inline void r_w32(u32 o, u32 v){ *(volatile u32 *)(r_regs + o) = v; }
 
 static void r_udelay(int loops) { for (int i = 0; i < loops; i++) (void)inb(0x80); }
+
+/* Hint the CPU (and the hypervisor) that this is a spin-wait. A bare
+ * `while (test_and_set()) ;` loop pegs the core and, under virtualisation,
+ * keeps the vCPU from being descheduled in favour of the lock holder. */
+static inline void r8169_relax(void) { __asm__ volatile("pause" ::: "memory"); }
+
+/* ~10 ms budget: one iteration is a pause plus a single ~1 us port access. */
+#define R8169_TX_WAIT_LOOPS 10000
 
 /* Force the device into PCI power state D0 before any MMIO (a D3-parked NIC
  * hangs the CPU on the first register access — see dev/e1000.c). Pure config
@@ -217,12 +231,16 @@ static int r8169_xmit(const u8 hdr[14], const void *payload, usize plen)
 		return -1;
 
 	while (__atomic_test_and_set(&r8169_tx_lock, __ATOMIC_ACQUIRE))
-		;
+		r8169_relax();
 
-	/* Wait (bounded) for the current descriptor to be free (OWN clear). */
+	/* Wait (bounded) for the current descriptor to be free (OWN clear).
+	 * The bound is a real time budget (~10 ms), not an arbitrary iteration
+	 * count: the old 500000 x inb(0x80) loop could burn most of a second of
+	 * CPU on a hypervisor, where every I/O-port access is a VM exit. */
 	int ok = 0;
-	for (int spins = 0; spins < 500000; spins++) {
+	for (int spins = 0; spins < R8169_TX_WAIT_LOOPS; spins++) {
 		if (!(tx_ring[tx_cur].opts1 & DESC_OWN)) { ok = 1; break; }
+		r8169_relax();
 		r_udelay(1);
 	}
 	if (!ok) {
@@ -250,9 +268,12 @@ static int r8169_xmit(const u8 hdr[14], const void *payload, usize plen)
 }
 
 static int r8169_transmit(struct netdev *nd, const u8 hdr[14],
-                          const void *payload, usize payload_len)
+                          const void *payload, usize payload_len, u32 tx_flags)
 {
 	(void)nd;
+	/* No checksum offload on this device: the stack never sets
+	 * NETDEV_TX_F_PARTIAL_CSUM unless every interface advertised it. */
+	(void)tx_flags;
 	return r8169_xmit(hdr, payload, payload_len);
 }
 
@@ -325,9 +346,11 @@ int r8169_probe(void)
 	if (!found)
 		return 0;
 
-	/* Enable memory space + bus-master. */
+	/* Enable memory space + bus-master, and clear PCI command bit 10 so INTx
+	 * delivery is not disabled behind our back by firmware. */
 	u16 cmd = pci_config_read16(pci.bus, pci.slot, pci.func, 0x04);
 	cmd |= 0x0006;
+	cmd &= (u16)~0x0400u;
 	pci_config_write16(pci.bus, pci.slot, pci.func, 0x04, cmd);
 
 	r8169_pci_set_d0(&pci);
@@ -387,7 +410,15 @@ int r8169_probe(void)
 	r_w8(R_CMD, CMD_RXE | CMD_TXE);       /* enable Rx + Tx */
 	r_w32(R_RXCFG, RXCFG_VAL);            /* some chips want this after enable */
 
-	r_w16(R_IMR, 0x0000);                 /* polling: mask all interrupts */
+	/* Arm receive interrupts instead of leaving the device purely polled.
+	 * Without this the only thing that ever looked at the ring was net_task on
+	 * its ~100 Hz tick, so every inbound frame paid up to 10 ms of latency.
+	 * ROK/RER deliver packets, RxDU and RxFIFOOver report a ring that ran dry
+	 * or overran, and LinkChg reports carrier. The cause register is
+	 * write-1-clear and r8169_irq_ack() clears it on every interrupt, which is
+	 * what keeps a level-triggered INTx line from re-asserting forever. */
+	r_w16(R_ISR, 0xFFFF);
+	r_w16(R_IMR, R8169_INTR_MASK);
 	r_w8(R_CFG9346, CFG9346_LOCK);        /* re-lock config registers */
 
 	r8169_inited = 1;
@@ -405,5 +436,8 @@ int r8169_probe(void)
 	console_write("r8169: initialized with MAC ");
 	r8169_print_mac(r8169_mac);
 	console_write("\n");
+
+	if (r8169_netdev.irq >= 0)
+		x86_pic_unmask((u16)r8169_netdev.irq);
 	return 1;
 }

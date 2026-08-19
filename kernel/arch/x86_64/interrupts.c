@@ -599,10 +599,9 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
   if (frame->vector >= 32 && frame->vector <= 47) {
     int irq = frame->vector - 32;
     int handled = 0;
-    if (irq == net_get_irq()) {
-      net_interrupt_handler();
-      handled = 1;
-    }
+    /* NICs first: every registered interface on this line gets its cause
+     * register read, which is what releases a shared level-triggered INTx. */
+    handled |= net_handle_irq(irq);
     /* M70: registered block/DMA device handlers (AHCI, virtio-blk, NVMe).
      * Lines are shared, so always consult the table even after net claimed it. */
     handled |= irq_dispatch(irq);

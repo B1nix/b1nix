@@ -87,6 +87,13 @@
 
 #define RAH_AV        (1u << 31)   /* Address Valid           */
 
+/* Interrupt cause/mask bits (ICR, IMS and IMC share the layout). */
+#define E1000_INT_TXDW   (1u << 0)   /* Transmit descriptor written back */
+#define E1000_INT_LSC    (1u << 2)   /* Link status change              */
+#define E1000_INT_RXDMT0 (1u << 4)   /* RX descriptor minimum threshold */
+#define E1000_INT_RXO    (1u << 6)   /* Receiver FIFO overrun           */
+#define E1000_INT_RXT0   (1u << 7)   /* RX timer (a packet arrived)     */
+
 #define FEXTNVM11_DISABLE_MULR_FIX (1u << 13)
 
 /* Legacy descriptors (16 bytes). DMA-coherent on x86 — accessed volatile. */
@@ -362,9 +369,12 @@ static int e1000_xmit(const u8 hdr[14], const void *payload, usize plen)
 
 /* ── netdev ops ─────────────────────────────────────────────────────────── */
 static int e1000_transmit(struct netdev *nd, const u8 hdr[14],
-                          const void *payload, usize payload_len)
+                          const void *payload, usize payload_len, u32 tx_flags)
 {
 	(void)nd;
+	/* No checksum offload on this device: the stack never sets
+	 * NETDEV_TX_F_PARTIAL_CSUM unless every interface advertised it. */
+	(void)tx_flags;
 	return e1000_xmit(hdr, payload, payload_len);
 }
 
@@ -390,13 +400,20 @@ static void e1000_poll(struct netdev *nd)
 	__atomic_clear(&e1000_rx_lock, __ATOMIC_RELEASE);
 }
 
+/* Interrupts this device has actually raised. Proves at runtime that RX is
+ * interrupt-driven rather than falling back on the 100 Hz poll. */
+static volatile u64 e1000_irq_count;
+
 static int e1000_irq_ack(struct netdev *nd)
 {
 	(void)nd;
 	if (!e1000_inited)
 		return 0;
 	u32 icr = e1000_read(E1000_ICR); /* reading clears the cause bits */
-	return icr ? 1 : 0;
+	if (!icr)
+		return 0;
+	__atomic_fetch_add(&e1000_irq_count, 1, __ATOMIC_RELAXED);
+	return 1;
 }
 
 static int e1000_link_up(struct netdev *nd)
@@ -466,9 +483,13 @@ int e1000_probe(void)
 	if (!found)
 		return 0;
 
-	/* Enable memory space + bus-master. */
+	/* Enable memory space + bus-master, and make sure INTx delivery is not
+	 * disabled: firmware can leave PCI command bit 10 set, and then the device
+	 * would raise its RX interrupt internally while the bridge never forwards
+	 * it — which looks exactly like "interrupts do not work". */
 	u16 cmd = pci_config_read16(pci.bus, pci.slot, pci.func, 0x04);
 	cmd |= 0x0006;
+	cmd &= (u16)~0x0400u;
 	pci_config_write16(pci.bus, pci.slot, pci.func, 0x04, cmd);
 
 	/* Power the device up to D0 BEFORE any MMIO — a D3-parked I219 would hang
@@ -536,8 +557,24 @@ int e1000_probe(void)
 	e1000_print_mac(e1000_mac);
 	console_write("\n");
 
-	if (e1000_netdev.irq >= 0)
+	if (e1000_netdev.irq >= 0) {
+		/* Arm receive interrupts. Until this write the driver was purely
+		 * polled: net_task woke on the ~100 Hz tick, so every inbound frame
+		 * waited up to a full tick before it was even looked at. RXT0 fires per
+		 * packet (RDTR defaults to 0, so the receive timer expires
+		 * immediately), RXDMT0 and RXO cover a ring that is running dry or has
+		 * overrun, and LSC reports carrier changes.
+		 *
+		 * The line is level-triggered INTx, so it stays asserted until the
+		 * cause is cleared: e1000_irq_ack() reads ICR on every interrupt, and
+		 * net_handle_irq() consults EVERY registered device on the line — a
+		 * standby e1000 sharing an IRQ must be acknowledged too, or its
+		 * unserviced level would livelock the CPU. */
+		e1000_write(E1000_IMS, E1000_INT_RXT0 | E1000_INT_RXDMT0 |
+		                       E1000_INT_RXO | E1000_INT_LSC);
+		(void)e1000_read(E1000_ICR);
 		x86_pic_unmask((u16)e1000_netdev.irq);
+	}
 
 	return 1;
 }
@@ -631,6 +668,18 @@ void e1000_selftest(void)
 	}
 	console_write(got ? "M37-E1000: ok rx-arp\n"
 	                  : "M37-E1000: FAIL rx-arp (no reply)\n");
+
+	/* The ARP exchange above is the traffic; if IMS is armed and the PCI line
+	 * is delivered, servicing it must have bumped this counter. A zero here
+	 * means the driver is back to being purely polled. */
+	u64 irqs = __atomic_load_n(&e1000_irq_count, __ATOMIC_RELAXED);
+	if (irqs > 0) {
+		console_write("M37-E1000: ok rx-irq count 0x");
+		console_write_hex64(irqs);
+		console_write("\n");
+	} else {
+		console_write("M37-E1000: FAIL rx-irq (no interrupt serviced)\n");
+	}
 
 	__atomic_clear(&e1000_rx_lock, __ATOMIC_RELEASE);
 }

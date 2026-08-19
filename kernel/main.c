@@ -61,6 +61,7 @@
 #include <b1nix/ioapic.h>
 #include <b1nix/ramdisk.h>
 #include <b1nix/sound.h>
+#include <b1nix/virtio_gpu.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -1075,6 +1076,11 @@ void kernel_main(usize arg0, usize arg1)
 		 * blocks) and a controller that has finished initialising, so it runs
 		 * here rather than in the early self-test block with the rest of M98. */
 		nvme_msix_selftest();
+		/* M14: the fsync/sync durability path — the device cache-flush
+		 * command each disk claims, and a write that survives a flush plus
+		 * a full block-cache drop. Needs the full scheduler because the
+		 * flush command blocks on its completion. */
+		blk_durability_selftest();
 		iommu_selftest();     /* M100b/M100c: VT-d, domains, groups, IR */
 		amdvi_selftest();     /* M100d: AMD-Vi */
 		/* Whichever unit came up, put a real device behind it and move data
@@ -1084,6 +1090,7 @@ void kernel_main(usize arg0, usize arg1)
 		lkpi_selftest_m101(); /* M101: kref, waitqueue, ww_mutex, rbtree, RCU */
 		dma_fence_selftest(); /* M100: dma-fence */
 		drm_sched_selftest(); /* M100: GPU scheduler + scatter-gather BOs */
+		virtio_gpu_irq_selftest(); /* the scanout's completion interrupt */
 		drm_import_selftest(); /* M101: the imported DRM core actually runs */
 		drm_kms_selftest();    /* M101: a device on it, rendering to the scanout */
 		sysfs_attr_selftest(); /* M101: its /sys and debugfs files, read back */

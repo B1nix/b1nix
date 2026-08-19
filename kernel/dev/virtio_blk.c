@@ -28,9 +28,28 @@
 #define VIRTIO_VENDOR_ID 0x1AF4
 #define VIRTIO_BLK_DEVICE_ID 0x1001
 
+/* Request types (the `type` field of the request header). */
 #define VIRTIO_BLK_T_IN 0
 #define VIRTIO_BLK_T_OUT 1
+#define VIRTIO_BLK_T_FLUSH 4
+#define VIRTIO_BLK_T_WRITE_ZEROES 13
+
+/* Feature bits, legacy (32-bit) feature word. Note these are NOT the request
+ * type numbers above — VIRTIO_BLK_T_FLUSH is request type 4 but is gated on
+ * feature bit 9. */
+#define VIRTIO_BLK_F_SEG_MAX (1u << 2)
+#define VIRTIO_BLK_F_GEOMETRY (1u << 4)
+#define VIRTIO_BLK_F_RO (1u << 5)
+#define VIRTIO_BLK_F_BLK_SIZE (1u << 6)
+#define VIRTIO_BLK_F_FLUSH (1u << 9)
+#define VIRTIO_BLK_F_WRITE_ZEROES (1u << 14)
+
+/* Device configuration space. On a legacy virtio-PCI device without MSI-X it
+ * starts at BAR0 + 0x14; every offset below is relative to that. */
 #define VIRTIO_BLK_CONFIG_CAPACITY 0x14
+#define VIRTIO_BLK_CONFIG_SEG_MAX (VIRTIO_BLK_CONFIG_CAPACITY + 12)
+#define VIRTIO_BLK_CONFIG_BLK_SIZE (VIRTIO_BLK_CONFIG_CAPACITY + 20)
+#define VIRTIO_BLK_CONFIG_MAX_WZ_SECTORS (VIRTIO_BLK_CONFIG_CAPACITY + 48)
 
 /* Support multiple virtio-blk devices */
 #define MAX_VIRTIO_BLK 16
@@ -40,6 +59,15 @@ struct virtio_blk_instance {
   struct virtqueue vq;
   struct block_device blk;
   volatile int busy;
+  /* What the device and the driver both agreed to, not what either wished for. */
+  u32 features;
+  /* Largest number of 512-byte blocks one request may carry. Derived from the
+   * queue size and, when the device states one, its seg_max: a descriptor chain
+   * longer than the device advertises is outside the contract even if QEMU
+   * happens to tolerate it. */
+  u32 max_blocks_per_req;
+  /* 0 when the device did not offer WRITE ZEROES or stated no limit. */
+  u32 max_write_zeroes_sectors;
 };
 
 static struct virtio_blk_instance instances[MAX_VIRTIO_BLK];
@@ -51,8 +79,17 @@ struct virtio_blk_req {
   u64 sector;
 } __attribute__((packed));
 
+/* Payload of a DISCARD / WRITE ZEROES request — the device reads this the way
+ * it reads the data of an ordinary write. */
+struct virtio_blk_zero_range {
+  u64 sector;
+  u32 num_sectors;
+  u32 flags;
+} __attribute__((packed));
+
 struct virtio_blk_dma_req {
   struct virtio_blk_req req;
+  struct virtio_blk_zero_range zero;
   volatile u8 status;
 } __attribute__((packed));
 
@@ -188,8 +225,30 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
   virtio_blk_lock(inst);
   dma->req.type = type;
   dma->req.reserved = 0;
-  dma->req.sector = lba;
+  /* FLUSH and WRITE ZEROES carry no sector in the header — the range of a
+   * WRITE ZEROES lives in its payload, and a FLUSH covers the whole device. */
+  dma->req.sector = (type == VIRTIO_BLK_T_IN || type == VIRTIO_BLK_T_OUT) ? lba : 0;
   dma->status = 0xFF;
+
+  /* What the middle (data) region of the chain describes, per request type:
+   *   IN            — the caller's buffer, written by the device
+   *   OUT           — the caller's buffer, read by the device
+   *   FLUSH         — nothing at all
+   *   WRITE_ZEROES  — the range descriptor, read by the device */
+  void *data = buffer;
+  u64 data_len = (u64)count * 512;
+  u16 data_flags = (type == VIRTIO_BLK_T_IN) ? VRING_DESC_F_WRITE : 0;
+  if (type == VIRTIO_BLK_T_FLUSH) {
+    data = 0;
+    data_len = 0;
+  } else if (type == VIRTIO_BLK_T_WRITE_ZEROES) {
+    dma->zero.sector = lba;
+    dma->zero.num_sectors = count;
+    dma->zero.flags = 0; /* do not unmap: the blocks must read back as zeroes */
+    data = &dma->zero;
+    data_len = sizeof(dma->zero);
+    data_flags = 0;
+  }
 
   /* Build the descriptor chain: header (device reads), data (device writes for
    * reads / reads for writes), status (device writes). Each region is split at
@@ -199,9 +258,9 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
   u16 prev = 0xFFFF;
   if (vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)&dma->req,
                       sizeof(struct virtio_blk_req), 0) < 0 ||
-      vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)buffer,
-                      (u64)count * 512,
-                      type == VIRTIO_BLK_T_IN ? VRING_DESC_F_WRITE : 0) < 0 ||
+      (data_len &&
+       vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)data,
+                       (u32)data_len, data_flags) < 0) ||
       vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)&dma->status, 1,
                       VRING_DESC_F_WRITE) < 0) {
     virtio_blk_unlock(inst);
@@ -308,23 +367,72 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
     console_write(" completion interrupts\n");
   }
 
-  int ret = (dma->status == 0) ? (int)count : -1;
+  int ret = (dma->status != 0) ? -1
+            : (type == VIRTIO_BLK_T_IN || type == VIRTIO_BLK_T_OUT) ? (int)count
+                                                                    : 0;
   virtio_blk_unlock(inst);
   kfree(dma);
   return ret;
 }
 
+/* Split a transfer into requests no longer than the descriptor chain the device
+ * agreed to accept, and run them in order. The block layer's bulk path asks for
+ * up to 1536 blocks at once, which needs ~193 descriptors — more than the 128
+ * segments QEMU states in seg_max. */
+static int virtio_blk_rw(struct virtio_blk_instance *inst, u64 lba, u32 count,
+                         void *buffer, u32 type) {
+  u32 done = 0;
+  while (done < count) {
+    u32 chunk = count - done;
+    if (chunk > inst->max_blocks_per_req)
+      chunk = inst->max_blocks_per_req;
+    if (do_virtio_blk_req(inst, lba + done, chunk,
+                          (void *)((u8 *)buffer + (u64)done * 512), type) < 0)
+      return -1;
+    done += chunk;
+  }
+  return (int)count;
+}
+
 static int virtio_blk_read(struct block_device *dev, u64 lba, u32 count,
                            void *buffer) {
   struct virtio_blk_instance *inst = (struct virtio_blk_instance *)dev->priv;
-  return do_virtio_blk_req(inst, lba, count, buffer, VIRTIO_BLK_T_IN);
+  return virtio_blk_rw(inst, lba, count, buffer, VIRTIO_BLK_T_IN);
 }
 
 static int virtio_blk_write(struct block_device *dev, u64 lba, u32 count,
                             const void *buffer) {
   struct virtio_blk_instance *inst = (struct virtio_blk_instance *)dev->priv;
-  return do_virtio_blk_req(inst, lba, count, (void *)(usize)buffer,
-                           VIRTIO_BLK_T_OUT);
+  return virtio_blk_rw(inst, lba, count, (void *)(usize)buffer,
+                       VIRTIO_BLK_T_OUT);
+}
+
+/* Only installed when the device offered VIRTIO_BLK_F_FLUSH — a device without
+ * it has no volatile write cache to empty, so its writes are already durable
+ * once acknowledged. Called from the block layer's fsync/sync/umount path. */
+static int virtio_blk_flush_op(struct block_device *dev) {
+  struct virtio_blk_instance *inst = (struct virtio_blk_instance *)dev->priv;
+  return do_virtio_blk_req(inst, 0, 0, 0, VIRTIO_BLK_T_FLUSH);
+}
+
+/* Only installed when the device offered VIRTIO_BLK_F_WRITE_ZEROES. Lets the
+ * device zero a range itself instead of us DMA-ing a zero-filled buffer at it.
+ * Callers must go through blk_zero_blocks(), which keeps the block cache
+ * coherent with a write the cache never saw. */
+static int virtio_blk_write_zeroes_op(struct block_device *dev, u64 lba,
+                                      u32 count) {
+  struct virtio_blk_instance *inst = (struct virtio_blk_instance *)dev->priv;
+  u32 done = 0;
+  while (done < count) {
+    u32 chunk = count - done;
+    if (inst->max_write_zeroes_sectors && chunk > inst->max_write_zeroes_sectors)
+      chunk = inst->max_write_zeroes_sectors;
+    if (do_virtio_blk_req(inst, lba + done, chunk, 0,
+                          VIRTIO_BLK_T_WRITE_ZEROES) < 0)
+      return -1;
+    done += chunk;
+  }
+  return 0;
 }
 
 /* Find nth virtio-blk device on PCI bus */
@@ -394,7 +502,17 @@ void virtio_blk_init(void) {
     virtio_set_status(&inst->dev, 0);
     virtio_set_status(&inst->dev,
                       VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
-    virtio_set_guest_features(&inst->dev, 0);
+    /* Negotiate: take what the device offers, out of what this driver actually
+     * implements. Writing 0 here — which is what we used to do — is not a
+     * neutral choice: it declines the write cache flush the device is offering,
+     * so there is no way to make a write durable, and it declines seg_max, so
+     * we never learn how long a descriptor chain the device will accept. */
+    u32 host_features = virtio_get_host_features(&inst->dev);
+    u32 wanted = VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_BLK_SIZE |
+                 VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH |
+                 VIRTIO_BLK_F_WRITE_ZEROES;
+    inst->features = host_features & wanted;
+    virtio_set_guest_features(&inst->dev, inst->features);
     virtio_set_status(&inst->dev, VIRTIO_STATUS_ACKNOWLEDGE |
                                       VIRTIO_STATUS_DRIVER |
                                       VIRTIO_STATUS_FEATURES_OK);
@@ -417,14 +535,39 @@ void virtio_blk_init(void) {
     virtio_set_status(&inst->dev,
                       virtio_get_status(&inst->dev) | VIRTIO_STATUS_DRIVER_OK);
 
+    /* Capacity is always counted in 512-byte sectors, whatever blk_size says,
+     * and the sector number in a request always is too — so the block layer
+     * keeps addressing this device in 512-byte units. */
     inst->blk.block_size = 512;
     inst->blk.block_count =
         (u64)inl((u16)(inst->dev.port_base + VIRTIO_BLK_CONFIG_CAPACITY)) |
         ((u64)inl((u16)(inst->dev.port_base +
                         VIRTIO_BLK_CONFIG_CAPACITY + 4))
          << 32);
+
+    /* How long a chain may get. Every request spends one descriptor on the
+     * header and one on the status byte; a data region of N bytes needs at most
+     * N/4096 + 1 descriptors because it is split at physical page boundaries. */
+    u32 max_data_desc = inst->vq.queue_size > 2 ? inst->vq.queue_size - 2u : 1u;
+    if (inst->features & VIRTIO_BLK_F_SEG_MAX) {
+      u32 seg_max =
+          inl((u16)(inst->dev.port_base + VIRTIO_BLK_CONFIG_SEG_MAX));
+      if (seg_max > 2 && seg_max - 2u < max_data_desc)
+        max_data_desc = seg_max - 2u;
+    }
+    inst->max_blocks_per_req = max_data_desc > 1 ? (max_data_desc - 1u) * 8u : 1u;
+
     inst->blk.read_blocks = virtio_blk_read;
     inst->blk.write_blocks = virtio_blk_write;
+    if (inst->features & VIRTIO_BLK_F_RO)
+      inst->blk.write_blocks = 0; /* the device would reject every write */
+    if (inst->features & VIRTIO_BLK_F_FLUSH)
+      inst->blk.flush = virtio_blk_flush_op;
+    if (inst->features & VIRTIO_BLK_F_WRITE_ZEROES) {
+      inst->max_write_zeroes_sectors =
+          inl((u16)(inst->dev.port_base + VIRTIO_BLK_CONFIG_MAX_WZ_SECTORS));
+      inst->blk.write_zeroes = virtio_blk_write_zeroes_op;
+    }
     inst->blk.priv = inst;
     /* Virtio disks are named the way every other Unix names them: vda, vdb, ...
      * out of the block layer's "vd" sequence. */
@@ -443,6 +586,24 @@ void virtio_blk_init(void) {
     console_write(".");
     console_write_dec(pci_info.func);
     console_write(")\n");
+
+    /* Say what was actually agreed, not what was asked for — a device that
+     * withholds FLUSH is a device whose fsync cannot be trusted, and that has
+     * to be visible in the log. */
+    console_write("virtio-blk: features host=0x");
+    console_write_hex32(host_features);
+    console_write(" negotiated=0x");
+    console_write_hex32(inst->features);
+    console_write(inst->features & VIRTIO_BLK_F_FLUSH ? " flush=yes" : " flush=no");
+    console_write(inst->features & VIRTIO_BLK_F_WRITE_ZEROES ? " write-zeroes=yes"
+                                                             : " write-zeroes=no");
+    console_write(" max-blocks=");
+    console_write_dec(inst->max_blocks_per_req);
+    if (inst->features & VIRTIO_BLK_F_BLK_SIZE) {
+      console_write(" blk-size=");
+      console_write_dec(inl((u16)(inst->dev.port_base + VIRTIO_BLK_CONFIG_BLK_SIZE)));
+    }
+    console_write("\n");
 
     instance_count++;
     dev_idx++;

@@ -140,10 +140,13 @@ static u32 ext2_alloc_block(struct ext2_fs *fs) {
 					u32 block_num = g * fs->sb.s_blocks_per_group + i +
 					              (fs->sb.s_log_block_size == 0 ? 1 : 0);
 					
-					u8 *zero_block = kmalloc(fs->block_size);
-					memset(zero_block, 0, fs->block_size);
-					ext2_write_block(fs, block_num, zero_block);
-					kfree(zero_block);
+					/* A freshly allocated block must not hand back whatever the
+					 * previous owner left in it. blk_zero_blocks lets the device
+					 * do the zeroing itself where it can, and otherwise writes
+					 * the zeroes through the block cache exactly as before. */
+					blk_zero_blocks(fs->bdev,
+					                (u64)block_num * (fs->block_size / 512),
+					                fs->block_size / 512);
 
 					vfs_meta_lock_release(&fs->alloc_lock);
 					return block_num;

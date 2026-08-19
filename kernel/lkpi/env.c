@@ -446,13 +446,14 @@ void lkpi_scanout_mode(u32 *width, u32 *height)
   virtio_gpu_get_mode(width, height);
 }
 
-int lkpi_scanout_present(const u32 *pixels, u32 width, u32 height)
+int lkpi_scanout_present(const u32 *pixels, u32 width, u32 height, u32 dirty_x,
+                         u32 dirty_y, u32 dirty_w, u32 dirty_h)
 {
-  /* The whole frame is dirty: a plane update carries no damage rectangle here,
-   * and claiming a smaller one would leave stale pixels on screen. The cursor
-   * arguments say "leave it as it is" rather than moving or hiding it. */
-  return virtio_gpu_present(pixels, width, height, 0, 0, width, height, -1, -1,
-                            0);
+  /* The damage rectangle comes from the atomic commit that produced this
+   * frame — a caller with nothing better to say passes the whole frame. The
+   * cursor arguments say "leave it as it is" rather than moving or hiding it. */
+  return virtio_gpu_present(pixels, width, height, dirty_x, dirty_y, dirty_w,
+                            dirty_h, -1, -1, 0);
 }
 
 /* ── randomness ─────────────────────────────────────────────────── */

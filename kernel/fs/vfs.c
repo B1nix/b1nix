@@ -4823,14 +4823,11 @@ int vfs_fsync(int fd) {
     return err;
 
   if (node->inode->blk_dev) {
+    /* blk_cache_flush drains the dirty block-cache entries into the driver and
+     * then flushes the device itself — for a real disk that is the ATA/NVMe/
+     * virtio cache-flush command, for a stacked device (loop) it is the second
+     * stage that pushes the backing file out. */
     blk_cache_flush(node->inode->blk_dev);
-    /* A stacked device (loop) needs its own second stage: the cache flush above
-     * only got the bytes as far as its backing file. */
-    if (node->inode->blk_dev->flush) {
-      err = node->inode->blk_dev->flush(node->inode->blk_dev);
-      if (err < 0)
-        return err;
-    }
   }
   return 0;
 }

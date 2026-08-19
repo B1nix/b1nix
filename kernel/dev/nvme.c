@@ -383,6 +383,25 @@ static int nvme_blk_write(struct block_device *dev, u64 lba, u32 count, const vo
     return nvme_io_transfer(nd, lba, count, (void *)buffer, 1);
 }
 
+/* Commit the namespace's volatile write cache. Writes are acknowledged as soon
+ * as the controller has them, so without this an fsync(2) that returned success
+ * could still lose data on a power cut. Issued only from the block layer's
+ * fsync/sync/umount path — never per write. */
+static int nvme_blk_flush(struct block_device *dev)
+{
+    struct nvme_device *nd = (struct nvme_device *)dev->priv;
+    if (!nd) return -1;
+
+    nvme_io_lock(nd);
+    struct nvme_sqe sqe;
+    memset(&sqe, 0, sizeof(sqe));
+    sqe.cdw0 = NVME_CMD_IO_FLUSH | (0 << 16);
+    sqe.nsid = NVME_NSID;
+    int ret = nvme_io_submit(nd, &sqe);
+    nvme_io_unlock(nd);
+    return ret == 0 ? 0 : -1;
+}
+
 void nvme_init(void)
 {
     struct pci_device_info pci_info;
@@ -659,6 +678,7 @@ void nvme_init(void)
     nvme.blk_dev.block_count = nvme.namespace_size * (nvme.block_size / 512);
     nvme.blk_dev.read_blocks = nvme_blk_read;
     nvme.blk_dev.write_blocks = nvme_blk_write;
+    nvme.blk_dev.flush = nvme_blk_flush;
     nvme.blk_dev.priv = &nvme;
     blk_register(&nvme.blk_dev);
     

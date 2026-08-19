@@ -20,10 +20,38 @@
 #define VIRTIO_VENDOR_ID     0x1AF4
 #define VIRTIO_NET_DEVICE_ID 0x1000
 
+/* virtio-net feature bits (legacy PCI, low 32 bits). */
+#define VIRTIO_NET_F_CSUM        (1u << 0)   /* device checksums on transmit */
+#define VIRTIO_NET_F_GUEST_CSUM  (1u << 1)   /* device validates on receive  */
+#define VIRTIO_NET_F_MAC         (1u << 5)   /* config space carries the MAC */
+#define VIRTIO_NET_F_MRG_RXBUF   (1u << 15)  /* 12-byte header, merged bufs  */
+
+/* virtio_net_hdr.flags */
+#define VIRTIO_NET_HDR_F_NEEDS_CSUM 0x1
+#define VIRTIO_NET_HDR_F_DATA_VALID 0x2
+
+/*
+ * Everything this driver knows how to honour. Only the intersection with what
+ * the host offers is ever written back, and each accepted bit changes the data
+ * path in a way the code below actually implements:
+ *
+ *   CSUM        transmit may hand the device a partial checksum
+ *   GUEST_CSUM  a received frame may be reported as already validated
+ *   MAC         the MAC in config space is meaningful
+ *
+ * MRG_RXBUF is deliberately NOT requested: it widens the header to 12 bytes and
+ * hands back multi-buffer frames, and this driver's RX path is single-buffer.
+ */
+#define VNET_SUPPORTED_FEATURES \
+	(VIRTIO_NET_F_CSUM | VIRTIO_NET_F_GUEST_CSUM | VIRTIO_NET_F_MAC)
+
 static struct virtio_device net_dev;
 static struct virtqueue net_rx_vq;
 static struct virtqueue net_tx_vq;
 static volatile int vnet_ready;
+
+static u32 vnet_features;             /* what the host and driver agreed on */
+static usize vnet_hdr_size = sizeof(struct virtio_net_hdr);
 
 static volatile int net_tx_lock = 0;
 static volatile int net_rx_lock = 0;
@@ -77,10 +105,58 @@ static void fill_rx_buffer(u16 idx)
 	__asm__ volatile("" ::: "memory");
 }
 
+/*
+ * Ask the device to finish the TCP/UDP checksum of an outgoing IPv4 frame.
+ *
+ * Only legal when VIRTIO_NET_F_CSUM was negotiated AND the stack agreed to emit
+ * partial checksums (net_tx_csum_offload_enabled()): under NEEDS_CSUM the
+ * checksum field must hold the pseudo-header sum, so if the sender had computed
+ * a full checksum instead, the device would fold it in a second time and put a
+ * wrong value on the wire. Anything not recognised here (IPv6, ICMP, a
+ * fragment, a truncated header) is left exactly as the stack built it, which is
+ * a complete software checksum.
+ */
+static void vnet_tx_offload(struct virtio_net_hdr *vhdr, const u8 *frame,
+                            usize frame_len, u32 tx_flags)
+{
+	if (!(tx_flags & NETDEV_TX_F_PARTIAL_CSUM))
+		return;
+	if (!(vnet_features & VIRTIO_NET_F_CSUM))
+		return;
+	if (frame_len < 14 + 20)
+		return;
+	if ((((u16)frame[12] << 8) | frame[13]) != 0x0800)
+		return;
+
+	const u8 *ip = frame + 14;
+	if ((ip[0] >> 4) != 4)
+		return;
+	usize ihl = (usize)(ip[0] & 0x0F) * 4;
+	if (ihl < 20 || 14 + ihl > frame_len)
+		return;
+	if ((((u16)ip[6] << 8 | ip[7]) & 0x3FFF) != 0)
+		return;              /* a fragment carries no complete L4 header */
+
+	u16 csum_offset;
+	if (ip[9] == 6)
+		csum_offset = 16;    /* TCP checksum field */
+	else if (ip[9] == 17)
+		csum_offset = 6;     /* UDP checksum field */
+	else
+		return;
+
+	if (14 + ihl + csum_offset + 2 > frame_len)
+		return;
+
+	vhdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+	vhdr->csum_start = (u16)(14 + ihl);
+	vhdr->csum_offset = csum_offset;
+}
+
 /* ── netdev ops ─────────────────────────────────────────────────────────── */
 
 static int vnet_transmit(struct netdev *nd, const u8 hdr[14],
-                         const void *payload, usize payload_len)
+                         const void *payload, usize payload_len, u32 tx_flags)
 {
 	(void)nd;
 	if (!vnet_ready || net_tx_vq.queue_size == 0 || !net_tx_vq.desc ||
@@ -88,7 +164,7 @@ static int vnet_transmit(struct netdev *nd, const u8 hdr[14],
 		return -1;
 	}
 
-	usize packet_size = sizeof(struct virtio_net_hdr) + 14 + payload_len;
+	usize packet_size = vnet_hdr_size + 14 + payload_len;
 	if (packet_size > PAGE_SIZE) return -1;
 
 	/* Grab a pre-allocated TX buffer from the pool (no IRQ-time allocation). */
@@ -107,15 +183,20 @@ static int vnet_transmit(struct netdev *nd, const u8 hdr[14],
 		vnet_netdev.poll(&vnet_netdev);
 	}
 	if (!buffer) return -1;
-	memset(buffer, 0, PAGE_SIZE);
+
+	/* Only the virtio header has to be cleared: the frame that follows it is
+	 * fully overwritten by the two memcpy()s below, and the descriptor length
+	 * stops the device from ever looking past it. Zeroing the whole 4 KiB page
+	 * for a 42-byte ARP request was pure waste. vnet_hdr_size covers the
+	 * 12-byte MRG_RXBUF layout as well as the plain 10-byte one. */
+	memset(buffer, 0, vnet_hdr_size);
 
 	struct virtio_net_hdr *vhdr = (struct virtio_net_hdr *)buffer;
-	vhdr->flags = 0;
-	vhdr->gso_type = 0;
 
-	u8 *eth_hdr = buffer + sizeof(struct virtio_net_hdr);
+	u8 *eth_hdr = buffer + vnet_hdr_size;
 	memcpy(eth_hdr, hdr, 14);
 	memcpy(eth_hdr + 14, payload, payload_len);
+	vnet_tx_offload(vhdr, eth_hdr, 14 + payload_len, tx_flags);
 
 	for (int tries = 0; tries < 2; tries++) {
 		while (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
@@ -204,12 +285,25 @@ static void vnet_poll(struct netdev *nd)
 
 		if (id < rx_buffer_count) {
 			struct rx_buffer *buf = rx_buffers[id];
-			if (len > sizeof(struct virtio_net_hdr)) {
-				usize payload_len = len - sizeof(struct virtio_net_hdr);
+			if (len > vnet_hdr_size) {
+				usize payload_len = len - vnet_hdr_size;
 				if (payload_len > sizeof(buf->data)) {
 					payload_len = sizeof(buf->data);
 				}
-				ethernet_receive(buf->data, payload_len);
+				/* With GUEST_CSUM the device tells us, per frame, what state
+				 * the L4 checksum is in. DATA_VALID means it verified the sum
+				 * itself. NEEDS_CSUM means the opposite of what its name
+				 * suggests on this side: the sum in the field is only partial,
+				 * because the sender is on this host and never finished it — so
+				 * there is nothing to verify and verifying anyway would drop
+				 * every such frame. Everything else is checked in software by
+				 * ipv4_receive_flags(). */
+				u32 rx_flags = 0;
+				if ((vnet_features & VIRTIO_NET_F_GUEST_CSUM) &&
+				    (buf->hdr.flags & (VIRTIO_NET_HDR_F_DATA_VALID |
+				                       VIRTIO_NET_HDR_F_NEEDS_CSUM)))
+					rx_flags |= NET_RX_F_CSUM_OK;
+				ethernet_receive_flags(buf->data, payload_len, rx_flags);
 			}
 
 			/* Re-arm. */
@@ -247,9 +341,21 @@ int virtio_net_probe(void)
 		return 0;
 	}
 
-	virtio_set_guest_features(&net_dev, 0);
+	/* Honest feature negotiation: take what the host offers, keep only the
+	 * bits this driver implements, and write that intersection back. Writing a
+	 * bit the host never offered is a protocol violation; writing zero (what
+	 * this driver used to do) throws away every offload the host had on the
+	 * table. */
+	u32 host_features = virtio_get_host_features(&net_dev);
+	vnet_features = host_features & VNET_SUPPORTED_FEATURES;
+	virtio_set_guest_features(&net_dev, vnet_features);
 	virtio_set_status(&net_dev, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER |
 	                            VIRTIO_STATUS_FEATURES_OK);
+	/* MRG_RXBUF is never requested, so the header stays at its 10-byte legacy
+	 * size; the assignment keeps the dependency explicit. */
+	vnet_hdr_size = (vnet_features & VIRTIO_NET_F_MRG_RXBUF)
+	                        ? sizeof(struct virtio_net_hdr) + 2
+	                        : sizeof(struct virtio_net_hdr);
 
 	if (!virtq_init(&net_dev, 0, &net_rx_vq)) {
 		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
@@ -320,12 +426,21 @@ int virtio_net_probe(void)
 	vnet_netdev.poll = vnet_poll;
 	vnet_netdev.irq_ack = vnet_irq_ack;
 	vnet_netdev.link_up = vnet_link_up;
+	vnet_netdev.features = 0;
+	if (vnet_features & VIRTIO_NET_F_CSUM)
+		vnet_netdev.features |= NETDEV_F_TX_CSUM;
+	if (vnet_features & VIRTIO_NET_F_GUEST_CSUM)
+		vnet_netdev.features |= NETDEV_F_RX_CSUM;
 	vnet_netdev.priv = 0;
 	netdev_register(&vnet_netdev);
 
 	console_write("virtio-net: initialized with MAC ");
 	print_mac(mac);
-	console_write("\n");
+	console_write(" features 0x");
+	console_write_hex64(vnet_features);
+	console_write(" (host 0x");
+	console_write_hex64(host_features);
+	console_write(")\n");
 
 	if (net_dev.irq != 0xFF) {
 		x86_pic_unmask(net_dev.irq);

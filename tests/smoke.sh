@@ -468,6 +468,9 @@ _mkimg() {  # mkimg <instance-suffix>
     # USB mass storage: only its identity is under test (which sd* letter it
     # lands on, and that it reports itself removable), so it stays unformatted.
     dd if=/dev/zero of="$_usb" bs=1M count=2 2>/dev/null
+    # virtio-blk scratch disk: the one block device nothing else on the system
+    # owns, so the durability self-test may write to it. Unformatted on purpose.
+    dd if=/dev/zero of="$(disk_img vblk "$1")" bs=1M count=4 2>/dev/null
     "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_sata" 2>/dev/null || {
         "$MKE2FS" -F -t ext4 -q "$_sata" 2>/dev/null || {
             echo "Error: Failed to format sata $1 image as ext4."; exit 1
@@ -556,7 +559,11 @@ launch_blk() {
 		# sequence as AHCI (so it must come up as the third sd disk, after the
 		# SATA pair) and that swap still takes the second ATA disk with a USB
 		# disk in the namespace.
-		EXTRA_QEMU_ARGS="-drive file=$(disk_img usb blk),if=none,id=usbdisk,format=raw -device usb-storage,bus=xhci.0,drive=usbdisk"
+		# The USB stick, plus a virtio-blk disk. virtio-blk was not attached
+		# to any instance before, so nothing exercised its feature
+		# negotiation, its FLUSH or its WRITE ZEROES.
+		EXTRA_QEMU_ARGS="-drive file=$(disk_img usb blk),if=none,id=usbdisk,format=raw -device usb-storage,bus=xhci.0,drive=usbdisk \
+			-drive file=$(disk_img vblk blk),if=none,id=vblkdisk,format=raw -device virtio-blk-pci,drive=vblkdisk"
 		export EXTRA_QEMU_ARGS
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[blk]   "
@@ -793,7 +800,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
 	for _i in sys blk posix gfx openrc init iommu amdvi smp v8; do
-	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" "$(disk_img usb "$_i")"
+	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" "$(disk_img vblk "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
 	exit
@@ -2136,6 +2143,17 @@ check_output "$BLK_LOG" "usb: registered sdc" "USB storage takes the next name i
 check_output "$BLK_LOG" "M14-SMOKE: ok removable-is-a-fact" "/sys/block reports exactly one removable disk, it is the USB stick, and it is named sd* like any other SCSI disk"
 check_output "$BLK_LOG" "swap: device=sdb" "swap still takes the second ATA disk, not whichever disk happens to be second in the sd sequence"
 
+# Durability: fsync(2)/sync(2)/umount now issue the device's own cache-flush
+# command, which AHCI used to fire after every single write (where it is not a
+# barrier, just a disabled write cache) and NVMe never fired at all.
+check_output "$BLK_LOG" "M14-BLK: ok flush-op dev=sda" "the SATA disk accepts an ATA FLUSH CACHE EXT from the fsync path"
+check_output "$BLK_LOG" "M14-BLK: ok flush-op dev=nvme0n1" "the NVMe namespace accepts a FLUSH command from the fsync path"
+check_output "$BLK_LOG" "M14-BLK: ok flush-op dev=vda" "the virtio disk accepts a VIRTIO_BLK_T_FLUSH from the fsync path"
+check_output "$BLK_LOG" "virtio-blk: registered vda" "virtio-blk probes and registers under the vd sequence"
+check_output "$BLK_LOG" "flush=yes" "virtio-blk negotiates VIRTIO_BLK_F_FLUSH instead of declining every feature the host offers"
+check_output "$BLK_LOG" "M14-BLK: ok durable-roundtrip dev=vda" "a pattern written to vda survives a device flush and a full block-cache drop"
+check_output "$BLK_LOG" "M14-BLK: ok zero-blocks" "blk_zero_blocks leaves a range reading back as zeroes"
+
 # Network tests are only wired for the current x86_64/x86 QEMU path.
 if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	echo ""
@@ -2160,6 +2178,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		check_output "$LOG" "M37-E1000: ok mac" "M37: e1000 MAC read"
 		check_output "$LOG" "M37-E1000: ok tx" "M37: e1000 transmit"
 		check_output "$LOG" "M37-E1000: ok rx-arp" "M37: e1000 receive (ARP reply over SLIRP)"
+		check_output "$LOG" "M37-E1000: ok rx-irq" "M37: e1000 receive is interrupt-driven (IMS armed, INTx serviced)"
 	else
 		fail "e1000 driver initialized" "e1000 init message not found"
 	fi
@@ -2220,6 +2239,14 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		# No 32bpp boot framebuffer in this config — device legitimately absent
 		check_output "$LOG" "M47-GFX: skip no-fb" "M47: fb skipped (no framebuffer)"
 	fi
+	# ── the hardware cursor: the device composes it, nothing is painted over ──
+	if grep -q "M47-GFX: skip no-hw-cursor" "$LOG" 2>/dev/null ||
+	   grep -q "M47-GFX: skip no-fb-cursor" "$LOG" 2>/dev/null; then
+		pass "hardware cursor skipped (display device composes none)"
+	else
+		check_output "$LOG" "M47-GFX: ok fb-cursor" "the device's own cursor is uploaded, shown, moved and hidden, and the framebuffer is unchanged by all of it"
+	fi
+
 	check_output "$LOG" "M47-GFX: ok input-open" "M47: input devices open + EAGAIN"
 	check_output "$LOG" "M47-GFX: ok input-event" "M47: injected mouse events received"
 	check_output "$LOG" "M47-GFX: done" "M47 smoke completed"
@@ -2229,6 +2256,20 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M48-FDPASS: ok memfd" "M48: anonymous mmap-able memfd"
 	check_output "$LOG" "M48-FDPASS: ok shared-fork-cow" "M48: MAP_SHARED pages shared across fork"
 	check_output "$LOG" "M48-FDPASS: ok unix-blocking-send" "M48: blocking AF_UNIX send blocks on a full buffer instead of EAGAIN"
+
+	# ── the scanout's completion interrupt ──
+	# The frame path used to spin on the virtqueue with a spinlock held and
+	# interrupts off. This marker is only emitted when a command really parked
+	# and a real interrupt really ended the park.
+	# MSI-X where the device offers it, the legacy pin where it does not —
+	# either is a registered completion interrupt, which is the claim.
+	if grep -q "virtio-gpu: completion MSI-X on vector" "$LOG" 2>/dev/null ||
+	   grep -q "virtio-gpu: completion IRQ on line" "$LOG" 2>/dev/null; then
+		pass "virtio-gpu takes its completions on an interrupt instead of polling its queues"
+	else
+		fail "virtio-gpu takes its completions on an interrupt instead of polling its queues" "neither an MSI-X vector nor an INTx line was registered"
+	fi
+	check_output "$LOG" "M52-GFX: ok gpu-irq" "the virtio-gpu queues raise one interrupt per completion and the wait parks instead of spinning on the ring"
 
 	check_output "$LOG" "M50-DRM: ok card0" "M50: /dev/dri/card0"
 	check_output "$LOG" "M50-DRM: ok mode" "M50: KMS mode discovery"

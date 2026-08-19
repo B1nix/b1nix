@@ -304,10 +304,36 @@ static void net_compute_link_local(void)
 
 int net_is_ready(void) { return netdev_active() != 0; }
 
+
 int net_get_irq(void)
 {
 	struct netdev *nd = netdev_active();
 	return nd ? nd->irq : -1;
+}
+
+/* Service a device interrupt on `irq`. Every registered interface on that line
+ * is acknowledged, not just the active one: PCI INTx lines are shared and
+ * level-triggered, so a standby NIC whose cause register is never read would
+ * hold the line asserted and livelock the CPU. Returns 1 if any interface
+ * claimed the interrupt. */
+int net_handle_irq(int irq)
+{
+	int claimed = 0;
+	for (usize i = 0; i < g_netdev_count; i++) {
+		struct netdev *nd = g_netdevs[i];
+		if (!nd || !nd->irq_ack || nd->irq != irq)
+			continue;
+		if (nd->irq_ack(nd))
+			claimed = 1;
+	}
+	if (claimed) {
+		net_irq_pending = 1;
+		/* M70: wake net_task immediately so RX is drained on packet arrival
+		 * instead of waiting up to a full ~100Hz poll tick. */
+		if (net_task_id >= 0)
+			scheduler_wake_task((usize)net_task_id);
+	}
+	return claimed;
 }
 
 void net_interrupt_handler(void)
@@ -551,6 +577,13 @@ void net_init(void)
 void net_send_ethernet_dev(struct netdev *nd, struct mac_addr dst,
                            u16 ethertype, const void *payload, usize size)
 {
+	net_send_ethernet_tx(nd, dst, ethertype, payload, size, 0);
+}
+
+void net_send_ethernet_tx(struct netdev *nd, struct mac_addr dst,
+                          u16 ethertype, const void *payload, usize size,
+                          u32 tx_flags)
+{
 	if (!nd)
 		nd = netdev_active();
 	if (!nd || !nd->transmit) {
@@ -568,25 +601,12 @@ void net_send_ethernet_dev(struct netdev *nd, struct mac_addr dst,
 	hdr[12] = (ethertype >> 8) & 0xFF;
 	hdr[13] = ethertype & 0xFF;
 
-	nd->transmit(nd, hdr, payload, size);
+	nd->transmit(nd, hdr, payload, size, tx_flags);
 }
 
 void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, usize size)
 {
-	struct netdev *nd = netdev_active();
-	if (!nd || !nd->transmit) {
-		return;
-	}
-	if (nd->admin_down)
-		return;
-
-	u8 hdr[14];
-	memcpy(hdr, dst.bytes, 6);
-	memcpy(hdr + 6, local_mac.bytes, 6);
-	hdr[12] = (ethertype >> 8) & 0xFF;
-	hdr[13] = ethertype & 0xFF;
-
-	nd->transmit(nd, hdr, payload, size);
+	net_send_ethernet_tx(netdev_active(), dst, ethertype, payload, size, 0);
 }
 
 /* ── Loopback deferral queue (see net.h) ── */
@@ -650,6 +670,10 @@ void net_loopback_drain(void)
 		if (is_v6)
 			proto_deliver_ether(0x86DD, data, len);
 		else
+			/* Verified like anything else: the IP layer checksums a loopback
+			 * datagram against the same source address it stamped into the
+			 * header, so every packet the stack sends to itself also proves the
+			 * software checksum path on the way back in. */
 			ipv4_receive(data, len);
 		kfree(data);
 	}

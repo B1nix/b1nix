@@ -37,6 +37,7 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_client.h>
 #include <drm/drm_connector.h>
+#include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
@@ -286,7 +287,6 @@ static void b1nix_pipe_update(struct drm_simple_display_pipe *pipe,
 	struct iosys_map map;
 	struct drm_gem_object *obj;
 
-	(void)old_state;
 	if (!fb)
 		return;
 
@@ -298,6 +298,34 @@ static void b1nix_pipe_update(struct drm_simple_display_pipe *pipe,
 
 	const u32 *src = map.vaddr;
 	u32 w = fb->width, h = fb->height;
+	struct drm_rect damage;
+	u32 dx = 0, dy = 0, dw = w, dh = h;
+
+	/*
+	 * What actually changed. A compositor that redraws a cursor and one
+	 * widget attaches damage clips to the plane; forwarding them turns a
+	 * frame from a whole-screen transfer into a few kilobytes. A commit that
+	 * carries no clips is reported by the helper as the whole plane, so the
+	 * conservative answer is what arrives here by itself — and the full frame
+	 * stays the fallback for a state the helper declines to iterate, because
+	 * presenting too much is a cost and presenting too little is a bug.
+	 */
+	if (drm_atomic_helper_damage_merged(old_state, state, &damage)) {
+		if (damage.x1 < 0)
+			damage.x1 = 0;
+		if (damage.y1 < 0)
+			damage.y1 = 0;
+		if (damage.x2 > (int)w)
+			damage.x2 = (int)w;
+		if (damage.y2 > (int)h)
+			damage.y2 = (int)h;
+		if (damage.x2 > damage.x1 && damage.y2 > damage.y1) {
+			dx = (u32)damage.x1;
+			dy = (u32)damage.y1;
+			dw = (u32)(damage.x2 - damage.x1);
+			dh = (u32)(damage.y2 - damage.y1);
+		}
+	}
 
 	g_record.presented = 1;
 	g_record.width = w;
@@ -309,7 +337,7 @@ static void b1nix_pipe_update(struct drm_simple_display_pipe *pipe,
 		src[(usize)(h - 1) * (fb->pitches[0] / 4) + (w - 1)];
 	g_record.centre = src[(usize)(h / 2) * (fb->pitches[0] / 4) + (w / 2)];
 
-	lkpi_scanout_present(src, w, h);
+	lkpi_scanout_present(src, w, h, dx, dy, dw, dh);
 	drm_gem_vunmap_unlocked(obj, &map);
 }
 
@@ -428,6 +456,10 @@ static int b1nix_drm_bringup(struct b1nix_drm *b)
 	                                   &b->connector);
 	if (ret)
 		return ret;
+
+	/* Advertise FB_DAMAGE_CLIPS, so a compositor can say which part of the
+	 * frame it redrew instead of every commit meaning "all of it". */
+	drm_plane_enable_fb_damage_clips(&b->pipe.plane);
 
 	drm_mode_config_reset(drm);
 
