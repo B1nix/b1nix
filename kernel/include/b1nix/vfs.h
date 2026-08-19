@@ -75,6 +75,9 @@ struct vfs_xattr {
 #define XATTR_NAME_MAX 255
 #define XATTR_VALUE_MAX 4096
 
+/* Name the holder of an inode rwlock a task is parked on (watchdog dump). */
+void vfs_inode_chan_report(u64 chan, u64 payload_base, usize block_size);
+
 struct vfs_inode {
   u64 ino;
   /* Device number (major << 8 | minor) of the filesystem this inode lives on —
@@ -100,6 +103,12 @@ struct vfs_inode {
   enum vfs_node_type type;
   u32 flags;
   volatile int rw_lock; /* >0: readers, -1: writer, 0: free */
+  /* Who last took rw_lock, and from where. A leaked inode lock is otherwise
+   * anonymous: the watchdog can see a task parked on &inode->rw_lock but not
+   * which caller took the lock and failed to drop it, and the holder is by
+   * then usually gone. Two stores per acquire buys that name. */
+  volatile u64 rw_owner;
+  const void *rw_site;
   int refcount;         /* Internal references (e.g. open handles) */
   int nlink; /* Number of hard links (names pointing to this inode) */
   usize size;

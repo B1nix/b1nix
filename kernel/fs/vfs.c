@@ -740,6 +740,18 @@ void icache_invalidate_fs(u32 fs_id) {
   icache_release();
 }
 
+/* Record who holds an inode's rwlock, for the watchdog's chan report. */
+static void vfs_inode_lock_note(struct vfs_inode *inode, const void *site) {
+  struct task *t = current_task;
+  __atomic_store_n(&inode->rw_owner, t ? (u64)t->id : 0, __ATOMIC_RELAXED);
+  inode->rw_site = site;
+}
+
+static void vfs_inode_lock_clear_note(struct vfs_inode *inode) {
+  __atomic_store_n(&inode->rw_owner, 0, __ATOMIC_RELAXED);
+  inode->rw_site = 0;
+}
+
 static void vfs_inode_lock_read(struct vfs_inode *inode) {
   if (blk_cache_lock_is_held()) {
     /* Walking the frame pointer chain into panic() shows just the
@@ -776,12 +788,14 @@ static void vfs_inode_lock_read(struct vfs_inode *inode) {
    * caller on a different CPU than it slept on, so the release-CPU and
    * acquire-CPU may differ. Track via the global-singleton lockdep
    * entry (M28 #2 Variant A) instead of the per-CPU acquisition stack. */
+  vfs_inode_lock_note(inode, __builtin_return_address(0));
   LOCKDEP_ACQUIRE_GLOBAL(LOCKDEP_LVL_INODE);
 }
 
 static void vfs_inode_unlock_read(struct vfs_inode *inode) {
   LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_INODE);
   if (__atomic_add_fetch(&inode->rw_lock, -1, __ATOMIC_RELEASE) == 0) {
+    vfs_inode_lock_clear_note(inode);
     scheduler_wake_all((void *)&inode->rw_lock);
   }
 }
@@ -809,14 +823,37 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
     }
     scheduler_wait_commit();
   }
+  vfs_inode_lock_note(inode, __builtin_return_address(0));
   /* Sleeping lock — see read-lock variant for why this uses _GLOBAL. */
   LOCKDEP_ACQUIRE_GLOBAL(LOCKDEP_LVL_INODE);
 }
 
 static void vfs_inode_unlock_write(struct vfs_inode *inode) {
   LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_INODE);
+  vfs_inode_lock_clear_note(inode);
   __atomic_store_n(&inode->rw_lock, 0, __ATOMIC_RELEASE);
   scheduler_wake_all((void *)&inode->rw_lock);
+}
+
+/* The watchdog resolves a blocked task's wait channel to a heap block. When
+ * that block is exactly an inode and the channel sits on its rwlock, this names
+ * the holder — the difference between "parked on some kernel object" and "task
+ * N took this inode's lock in <caller> and never dropped it". */
+void vfs_inode_chan_report(u64 chan, u64 payload_base, usize block_size) {
+  if (block_size != sizeof(struct vfs_inode))
+    return;
+  if (chan - payload_base != __builtin_offsetof(struct vfs_inode, rw_lock))
+    return;
+  struct vfs_inode *inode = (struct vfs_inode *)(usize)payload_base;
+  console_write("    inode ino=");
+  console_write_dec((u64)inode->ino);
+  console_write(" rw_lock=");
+  console_write_dec((u64)(int)inode->rw_lock);
+  console_write(" holder=");
+  console_write_dec(__atomic_load_n(&inode->rw_owner, __ATOMIC_RELAXED));
+  console_write(" taken-at=0x");
+  console_write_hex64((u64)(usize)inode->rw_site);
+  console_write("\n");
 }
 
 /* Compatibility wrappers */
@@ -5056,11 +5093,16 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
      * which shifts every surviving entry down when one is removed and so makes
      * a delete-as-you-go walk (rm -rf) skip one entry per deletion.
      *
-     * Children are inserted at the HEAD of the sibling list, so the list runs
-     * from newest to oldest and dir_seq DESCENDS along it. The cursor is
-     * therefore an upper bound: emit children whose seq is below the last one
+     * Children are APPENDED to the sibling list (vfs_attach_child), so the list
+     * runs from oldest to newest and dir_seq ASCENDS along it. The cursor is
+     * therefore a lower bound: emit children whose seq is above the last one
      * emitted. Cookies 0 and 1 are "." and "..", and 2 means "children, no
-     * bound yet"; a child cookie is seq+2, which is always >= 3. */
+     * bound yet"; a child cookie is seq+2, which is always >= 3.
+     *
+     * This used to read the bound the other way round, from when children were
+     * prepended. Against an appending list the very first child raised the
+     * bound past every later sibling, so each such directory listed exactly one
+     * entry no matter how many it held. */
     u64 cookie = (u64)offset;
     usize count = 0;
     if (cookie == 0 && count < max_entries) {
@@ -5081,7 +5123,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
       count++;
       cookie = 2;
     }
-    u64 seq_below = (cookie > 2) ? (cookie - 2) : 0; /* 0 = no bound */
+    u64 seq_above = (cookie > 2) ? (cookie - 2) : 0; /* 0 = no bound */
     u64 tflags;
     vfs_tree_read_acquire(&tflags);
     for (struct vfs_node *child = dir->first_child; child && count < max_entries;
@@ -5093,7 +5135,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
          * mean an endless walk; give it a number instead. */
         child->dir_seq = dir_seq_next();
       }
-      if (seq_below && child->dir_seq >= seq_below)
+      if (seq_above && child->dir_seq <= seq_above)
         continue; /* already returned in an earlier batch */
       copy_path(buf[count].name, 64, child->name);
       buf[count].type = (u32)child->inode->type;

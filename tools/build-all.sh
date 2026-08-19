@@ -29,14 +29,12 @@
 #                             (tools/build-native-clang-dynamic.sh)
 #     --with-rust             Rust cross build for x86_64-unknown-b1nix (M67)
 #                             (tools/ports/build-rust.sh --toolchain)
-#     --with-v8               full V8 d8 pipeline: gen -> build -> link -> ISO
-#                             (tools/ports/build-v8.sh --build)
 #     --with-ports            install the userspace port packages into the rootfs
 #                             (make ARCH=x86_64 install-ports)
 #     --all                   enable every --with-* above
 #     -h | --help             show this help and exit
 #
-# Each flag has an env equivalent (WITH_NATIVE_CLANG=1, WITH_V8=1, ...).
+# Each flag has an env equivalent (WITH_NATIVE_CLANG=1, WITH_RUST=1, ...).
 # Other passthrough env:
 #     ARCH=x86_64             target arch (do not change; x86 is frozen)
 #     KERNEL_CMDLINE          kernel cmdline for the final ISO (default b1nix.test=1)
@@ -59,14 +57,30 @@ export ARCH
 export B1NIX_ARCH="$ARCH"
 KERNEL_CMDLINE="${KERNEL_CMDLINE:-b1nix.test=1}"
 ISO_TARGET="${ISO_TARGET:-iso}"
-CROSS_CC="$(ls "$ROOT_DIR/build/${ARCH}/toolchain/llvm/cross/bin/${ARCH}-b1nix-cc" "$ROOT_DIR/build/${ARCH}/toolchain/${ARCH}-b1nix/cross/bin/${ARCH}-b1nix-cc" 2>/dev/null | head -1)"
+# Where build-toolchain.sh actually puts the wrapper, plus the two older
+# layouts. `|| true` because ls exits non-zero when ANY operand is missing —
+# which is the normal case here, since only one layout exists at a time — and
+# under `set -e` with pipefail that killed the script even though the wrapper
+# had been found and assigned. The list had drifted: the toolchain script installs into
+# toolchain/cross/, and neither path here matched it any more. Nothing noticed
+# while a wrapper from an earlier layout still sat on disk — the first clean
+# rebuild found the list empty, and this script exits on that without a word
+# (set -u on an empty CROSS_CC).
+CROSS_CC="$(ls \
+	"$ROOT_DIR/build/${ARCH}/toolchain/cross/bin/${ARCH}-b1nix-cc" \
+	"$ROOT_DIR/build/${ARCH}/toolchain/llvm/cross/bin/${ARCH}-b1nix-cc" \
+	"$ROOT_DIR/build/${ARCH}/toolchain/${ARCH}-b1nix/cross/bin/${ARCH}-b1nix-cc" \
+	2>/dev/null | head -1 || true)"
+if [ -z "$CROSS_CC" ]; then
+	echo "build-all: no cross compiler wrapper found — run tools/toolchain/build-toolchain.sh" >&2
+	exit 1
+fi
 
 # ── Flags (CLI flag OR WITH_* env var) ───────────────────────────────────────
 FORCE_CROSS="${WITH_CROSS:-0}"
 WITH_NATIVE_CLANG="${WITH_NATIVE_CLANG:-0}"
 WITH_DYNAMIC_CLANG="${WITH_DYNAMIC_CLANG:-0}"
 WITH_RUST="${WITH_RUST:-0}"
-WITH_V8="${WITH_V8:-0}"
 WITH_PORTS="${WITH_PORTS:-0}"
 
 usage() { sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
@@ -77,11 +91,10 @@ for arg in "$@"; do
 		--with-native-clang)     WITH_NATIVE_CLANG=1 ;;
 		--with-dynamic-clang)    WITH_DYNAMIC_CLANG=1 ;;
 		--with-rust)             WITH_RUST=1 ;;
-		--with-v8)               WITH_V8=1 ;;
 		--with-ports)            WITH_PORTS=1 ;;
 		--all)
 			WITH_NATIVE_CLANG=1; WITH_DYNAMIC_CLANG=1
-			WITH_RUST=1; WITH_V8=1; WITH_PORTS=1 ;;
+			WITH_RUST=1; WITH_PORTS=1 ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "build-all: unknown argument '$arg' (try --help)" >&2; exit 2 ;;
 	esac
@@ -99,8 +112,12 @@ trap on_fail ERR
 
 # ── Stage implementations (pure orchestration — no inlined logic) ────────────
 stage_cross() {
-	if [ -x "$CROSS_GCC" ] && [ "$FORCE_CROSS" != "1" ]; then
-		echo "  cross compiler already present ($CROSS_GCC) — skipping (use --with-cross to force)"
+	# CROSS_CC, not CROSS_GCC: the variable was renamed when the toolchain went
+	# GCC-free and this reference was left behind. It cost nothing while the
+	# stage was never reached with an empty toolchain, and aborted the whole
+	# orchestrator the first time it was ("unbound variable" under set -u).
+	if [ -x "$CROSS_CC" ] && [ "$FORCE_CROSS" != "1" ]; then
+		echo "  cross compiler already present ($CROSS_CC) — skipping (use --with-cross to force)"
 		return 0
 	fi
 	tools/toolchain/build-toolchain.sh
@@ -123,15 +140,6 @@ stage_rust() {
 	sh tools/ports/build-rust.sh --toolchain
 }
 
-stage_v8() {
-	if [ ! -d "$ROOT_DIR/build/x86_64/toolchain/v8-skeleton/v8" ]; then
-		echo "  V8 source tree missing (build/x86_64/toolchain/v8-skeleton/v8)." >&2
-		echo "  Run tools/ports/build-v8.sh --sync first (multi-GB checkout)." >&2
-		return 1
-	fi
-	sh tools/ports/build-v8.sh --build
-}
-
 stage_ports() {
 	make ARCH="$ARCH" install-ports
 }
@@ -149,7 +157,6 @@ add "userspace"            "make ARCH=$ARCH userspace"                   stage_u
 [ "$WITH_NATIVE_CLANG" = "1" ]     && add "native Clang"         "tools/build-native-clang.sh --b1nix-elf"   stage_native_clang
 [ "$WITH_DYNAMIC_CLANG" = "1" ]    && add "dynamic Clang"        "tools/build-native-clang-dynamic.sh"       stage_dynamic_clang
 [ "$WITH_RUST" = "1" ]             && add "rust cross"           "tools/ports/build-rust.sh --toolchain"      stage_rust
-[ "$WITH_V8" = "1" ]               && add "V8 (d8)"              "tools/ports/build-v8.sh --build"              stage_v8
 [ "$WITH_PORTS" = "1" ]            && add "userspace ports"      "make ARCH=$ARCH install-ports"             stage_ports
 add "kernel + ISO"         "make ARCH=$ARCH KERNEL_CMDLINE='$KERNEL_CMDLINE' $ISO_TARGET" stage_kernel_iso
 

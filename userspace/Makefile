@@ -184,6 +184,37 @@ CXXFLAGS       := --target=x86_64-unknown-elf -ffreestanding -nostdinc++ \
 
 
 
+# The M53 checks link ported third-party libraries, and those libraries are
+# built by a separate stage that itself needs a working userspace — so a tree
+# whose ports have not been built yet cannot build these, and a hard reference
+# deadlocks the two stages against each other. That is not hypothetical: after
+# the build directory was cleaned, `make` could not produce a userspace because
+# the ports were missing, and the ports could not be produced because they need
+# a userspace.
+#
+# Build each one only when the library it links is actually present. A missing
+# port then means one fewer check rather than a build that cannot start, and
+# once the ports stage has run the full set comes back on its own.
+PORTS_ROOT := ../build/$(B1NIX_ARCH)/ports
+M53_PORT_SMOKES := $(BUILD)/bin/m53_zlib_smoke $(BUILD)/bin/m53_libpng_smoke \
+	$(BUILD)/bin/m53_libjpeg_smoke $(BUILD)/bin/m53_libwebp_smoke \
+	$(BUILD)/bin/m53_libvpx_smoke $(BUILD)/bin/m53_virgl_smoke
+ifneq ($(wildcard $(PORTS_ROOT)/libwapcaplet/install/include),)
+M53_PORT_SMOKES += $(BUILD)/bin/m53_wapcaplet_smoke
+endif
+ifneq ($(wildcard $(PORTS_ROOT)/libparserutils/install/include),)
+M53_PORT_SMOKES += $(BUILD)/bin/m53_parserutils_smoke
+endif
+ifneq ($(wildcard $(PORTS_ROOT)/libhubbub/install/include),)
+M53_PORT_SMOKES += $(BUILD)/bin/m53_hubbub_smoke
+endif
+ifneq ($(wildcard $(PORTS_ROOT)/libcss/install/include),)
+M53_PORT_SMOKES += $(BUILD)/bin/m53_libcss_smoke
+endif
+ifneq ($(wildcard $(PORTS_ROOT)/libdom/install/include),)
+M53_PORT_SMOKES += $(BUILD)/bin/m53_libdom_smoke $(BUILD)/bin/m53_nslibs_smoke
+endif
+
 BINARIES := \
 	$(BUILD)/bin/hello \
 	$(BUILD)/bin/native_smoke \
@@ -207,18 +238,7 @@ BINARIES := \
 	$(BUILD)/bin/m32_smoke \
 	$(BUILD)/bin/m32_nettool \
 	$(BUILD)/bin/m32_pcre2_smoke \
-	$(BUILD)/bin/m53_zlib_smoke \
-	$(BUILD)/bin/m53_libpng_smoke \
-	$(BUILD)/bin/m53_libjpeg_smoke \
-	$(BUILD)/bin/m53_libwebp_smoke \
-	$(BUILD)/bin/m53_libvpx_smoke \
-	$(BUILD)/bin/m53_wapcaplet_smoke \
-	$(BUILD)/bin/m53_parserutils_smoke \
-	$(BUILD)/bin/m53_hubbub_smoke \
-	$(BUILD)/bin/m53_libcss_smoke \
-	$(BUILD)/bin/m53_libdom_smoke \
-	$(BUILD)/bin/m53_nslibs_smoke \
-	$(BUILD)/bin/m53_virgl_smoke \
+	$(M53_PORT_SMOKES) \
 	$(BUILD)/bin/m34_smoke \
 	$(BUILD)/bin/m35_smoke \
 	$(BUILD)/bin/m36_smoke \
@@ -231,8 +251,14 @@ BINARIES := \
 	$(BUILD)/bin/m77_smoke \
 	$(BUILD)/bin/m47_smoke
 BINARIES += $(BUILD)/bin/m48_smoke
+# Same reasoning as M53_PORT_SMOKES above: these link ported libraries (wayland
+# and libffi) that a cleaned tree has not built yet, and a hard reference makes
+# the userspace unbuildable until the ports stage has run — which cannot run
+# without a userspace.
+ifneq ($(wildcard ../build/$(B1NIX_ARCH)/pkg/libffi/lib),)
 BINARIES += $(BUILD)/bin/m49_libwayland
 BINARIES += $(BUILD)/bin/m49_libwayland_server
+endif
 BINARIES += $(BUILD)/bin/m50_smoke
 # M101t: driven against the *pinned* upstream uapi headers out of the staged
 # import tree, not a copy kept here. A copy is how a userspace ABI drifts from

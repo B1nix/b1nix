@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build OpenRC for b1nix — static build against musl libc.
+# Build OpenRC for b1nix — dynamic, against the shared musl libc.
 # Usage: sh tools/ports/build-openrc.sh
 set -eu
 
@@ -9,7 +9,16 @@ BUILD_DIR="$ROOT_DIR/build/$ARCH"
 SRC_DIR="$ROOT_DIR/build/src/openrc"
 PREFIX="$BUILD_DIR/rootfs"
 
-MUSL_INSTALL="$BUILD_DIR/ports/musl/install/usr"
+# The sysroot has no "usr" level: build-toolchain.sh installs musl straight
+# into ports/musl/install. This script was the only one still expecting the
+# older prefix, and it failed with "musl libc not built" pointing at a script
+# that had in fact just run — the library was there, one directory up. Accept
+# whichever layout is on disk so neither reading is wrong.
+if [ -f "$BUILD_DIR/ports/musl/install/lib/libc.so" ]; then
+	MUSL_INSTALL="$BUILD_DIR/ports/musl/install"
+else
+	MUSL_INSTALL="$BUILD_DIR/ports/musl/install/usr"
+fi
 MUSL_INCLUDE="$MUSL_INSTALL/include"
 MUSL_LIB="$MUSL_INSTALL/lib"
 
@@ -37,7 +46,16 @@ echo "  PREFIX:   $PREFIX"
 if [ ! -d "$SRC_DIR" ]; then
     echo "OpenRC source not found at $SRC_DIR" >&2; exit 1
 fi
-if [ ! -f "$MUSL_LIB/libc.a" ]; then
+# Check for what this script actually links against.
+#
+# It required libc.a — the static library — while linking -pie against the
+# shared libc.so a few lines below, and the header above still called this a
+# static build. Both are leftovers from before the userspace went dynamic;
+# project policy now treats -static in a port as a build failure. The wrong
+# check cost a whole build: with a freshly built toolchain that installs no
+# static archive, this aborted with "musl libc not built", naming a script that
+# had in fact just run successfully.
+if [ ! -f "$MUSL_LIB/libc.so" ]; then
     echo "musl libc not built. Run: tools/ports/build-musl.sh" >&2; exit 1
 fi
 
@@ -217,6 +235,7 @@ sed -e 's|@SYSCONFDIR@|/etc|g' \
     -e 's|@RC_LIBEXECDIR@|/libexec/openrc|g' \
     -e 's|@RC_PLUGINDIR@|/libexec/openrc/plugins|g' \
     -e 's|@LOCAL_PREFIX@|/usr/local|g' \
+    -e 's|@PKG_PREFIX@||g' \
     "$SRC_DIR/src/librc/rc.h.in" > "$RC_H"
 echo "  Generated rc.h"
 
@@ -236,7 +255,7 @@ llvm-ar rcs "$LIB_DIR/librc.a" $LIBRC_OBJS
 echo "  -> librc.a"
 
 # Generate version.h
-sed 's|@VCS_TAG@|0.63.0-b1nix|g' "$SRC_DIR/src/shared/version.h.in" > "$SRC_DIR/src/shared/version.h"
+sed 's|@VCS_TAG@|0.63.1-b1nix|g' "$SRC_DIR/src/shared/version.h.in" > "$SRC_DIR/src/shared/version.h"
 for d in "$SRC_DIR/src/openrc" "$SRC_DIR/src/openrc-init" "$SRC_DIR/src/openrc-run"; do
     cp "$SRC_DIR/src/shared/version.h" "$d/version.h" 2>/dev/null || true
 done
@@ -475,6 +494,7 @@ sh_configure() {
         -e 's|@LIBEXECDIR@|/libexec/openrc|g' \
         -e 's|@SYSCONFDIR@|/etc|g' \
         -e 's|@LOCAL_PREFIX@|/usr/local|g' \
+        -e 's|@PKG_PREFIX@||g' \
         -e 's|@SHELL@|/bin/sh|g' \
         -e 's|@UUCP_GROUP@|uucp|g' "$1" > "$2"
 }

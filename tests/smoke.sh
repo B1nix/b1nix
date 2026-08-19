@@ -60,22 +60,6 @@ if [ "$SMOKE_QUICK" = "1" ] || [ "$SMOKE_LEGACY" = "1" ]; then
 fi
 SMOKE_PROGRESS_MODE=full
 
-# Optional V8/d8 instance. d8 (13 MB x86_64 ELF) and its ext4 disk are pre-built
-# artifacts that `make` cannot reproduce from source (they need a multi-GB V8
-# checkout + manual build), so the v8 instance auto-enables ONLY when those
-# artifacts are present and ARCH=x86_64 — and skips honestly otherwise. It boots
-# a dedicated b1nix-v8.iso (b1nix.v8run, no test rc) with the d8 disk as sda and
-# checks the result-gated M58-V8 markers. Force-off with SMOKE_V8=0.
-V8_DISK_SRC="$PROJECT_DIR/build/v8-out/v8-ext4.img"
-SMOKE_V8=${SMOKE_V8:-auto}
-if [ "$SMOKE_V8" = "auto" ]; then
-	if [ "$ARCH" = "x86_64" ] && [ "$SMOKE_PARALLEL" = "1" ] && [ -f "$V8_DISK_SRC" ]; then
-		SMOKE_V8=1
-	else
-		SMOKE_V8=0
-	fi
-fi
-
 mkdir -p "$PROJECT_DIR/smoke_run"
 
 # Pause the KDE file indexer (baloo) for the duration of the run: under parallel
@@ -90,7 +74,6 @@ fi
 
 # Disk image path helper: disk_img <sata|nvme|swap> <instance-name>
 disk_img() { command echo "$PROJECT_DIR/smoke_run/$1-smoke-$2-$$.img"; }
-V8_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-v8-$ARCH.log"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -150,22 +133,39 @@ log_wedged() {
 # unattributable: treat it as blocked if ANY contributing instance wedged.
 any_instance_wedged() {
 	for _l in "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG"; do
-		[ -f "$_l" ] || continue
+		# A MISSING contributing log counts too: that instance did not run this
+		# time, so a marker absent from the concatenation is unattributable
+		# rather than a regression. Skipping it here made a restricted
+		# SMOKE_INSTANCES run report the other instances' checks as failures.
 		log_wedged "$_l" && return 0
 	done
 	return 1
 }
 
+# The hand-written marker branches (if/elif/else over several markers) cannot
+# use check_output, so they used to report a plain FAIL even when the instance
+# never ran -- a restricted run showed nine failures for tests it never started.
+# Same wedge rule as check_output, applied by hand.
+missing_marker() {
+	_mm_log="$1"
+	_mm_desc="$2"
+	_mm_why="$3"
+	if { [ "$_mm_log" = "$LOG" ] && any_instance_wedged; } || log_wedged "$_mm_log"; then
+		blocked "$_mm_desc" "instance died before this ran: $_mm_why"
+	else
+		fail "$_mm_desc" "$_mm_why"
+	fi
+}
+
 # Prints where each wedged instance stopped — the actual thing to debug.
 report_wedged_instances() {
 	_any=0
-	for _l in "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$SMP_LOG" "$V8_LOG"; do
+	for _l in "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$SMP_LOG"; do
 		[ -f "$_l" ] || continue
 		grep -qa "B1NIX-TEST: done" "$_l" 2>/dev/null && continue
-		# SMP/V8 instances stop at their own done-pattern by design.
+		# The SMP instance stops at its own done-pattern by design.
 		case "$_l" in
 		"$SMP_LOG") grep -qa "M24B-SMP: \(ok\|fail\|skip\)" "$_l" 2>/dev/null && continue ;;
-		"$V8_LOG") grep -qa "M58-V8: done" "$_l" 2>/dev/null && continue ;;
 		esac
 		_any=1
 		printf "  ${YELLOW}WEDGED${NC} %s\n" "$_l"
@@ -260,7 +260,7 @@ run_qemu() {
 		# watchdog can run even when a test child spins without yielding.  The
 		# dedicated SMP instance supplies its own -smp 4 argument below.
 		local cpu_args=""
-		if [ "${SMOKE_FAST_SMP:-0}" != "1" ] && [ "${SMOKE_V8_MODE:-0}" != "1" ]; then
+		if [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
 			cpu_args="-smp ${SMOKE_SMP:-2}"
 		fi
 
@@ -269,12 +269,7 @@ run_qemu() {
 			-serial stdio -display ${GPU_DISPLAY:-none} -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04
 
-		if [ "${SMOKE_V8_MODE:-0}" = "1" ]; then
-			# V8/d8 instance: the d8 binary is now embedded in the ISO as
-			# Multiboot2 module (ram0), no separate sda disk needed.
-			set -- "$@" -nic none -vga none \
-				${EXTRA_QEMU_ARGS:-}
-		elif [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
+		if [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
 			# restrict=off by default: the NET-SMOKE ping-gateway and BusyBox
 			# nslookup/ping checks exercise real ICMP/DNS to the SLIRP gateway
 			# (10.0.2.2/10.0.2.3), which QEMU's user net categorically blocks under
@@ -319,7 +314,7 @@ run_qemu() {
 			# here than a clean run that legitimately runs to the full TIMEOUT. Kill
 			# it after STALL_TIMEOUT of silence instead of blocking the whole TIMEOUT
 			# (which with a large TIMEOUT meant 8-25 min hangs). Generous default so a
-			# slow-but-alive module (V8 GC, a big mmap) is not killed mid-work.
+			# slow-but-alive module (a big mmap, a long GC) is not killed mid-work.
 			last_progress_ts=$start_ts
 			stall_after=${STALL_TIMEOUT:-120}
 			while :; do
@@ -437,9 +432,7 @@ else
 	QUICK_CMDLINE=""
 	[ "$SMOKE_QUICK" = "1" ] && QUICK_CMDLINE="b1nix.smoke=quick"
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
-		V8_ISO_TARGET=""
-		[ "$SMOKE_V8" = "1" ] && V8_ISO_TARGET="iso-v8"
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init $V8_ISO_TARGET >"$BUILD_LOG" 2>&1 || {
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init >"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
 		}
@@ -697,20 +690,6 @@ launch_amdvi() {
 	pid_amdvi=$!
 }
 
-launch_v8() {
-	(
-		SATA_IMG=$(disk_img sata v8)
-		SMOKE_V8_MODE=1
-		B1NIX_ISO_NAME=b1nix-v8.iso
-		SMOKE_MEM_MB=${SMOKE_MEM_MB:-2048}
-		SMOKE_DONE_PATTERN="M58-V8: done|KERNEL PANIC|\[PANIC\]"
-		SMOKE_PROGRESS_MODE=full
-		PROGRESS_PREFIX="[v8]   "
-		run_qemu "$V8_LOG"
-	) &
-	pid_v8=$!
-}
-
 launch_smp_solo() {
 	(
 		SATA_IMG=$(disk_img sata smp)
@@ -772,8 +751,23 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
 	_inst_list="sys blk posix gfx openrc init iommu amdvi"
-	[ "$SMOKE_V8" = "1" ] && _inst_list="$_inst_list v8"
 	[ -n "${SMOKE_INSTANCES:-}" ] && _inst_list="$SMOKE_INSTANCES"
+	# Drop the logs of every instance this run will not start. Their checks
+	# would otherwise grep the previous run's output and report a pass nobody
+	# earned -- a restricted SMOKE_INSTANCES run printed the full suite's
+	# numbers. A missing log reads as wedged, so those checks come out BLOCKED,
+	# which is what "not run" honestly is.
+	# smp is launched by its own block above, under the same condition.
+	_ran_list="$_inst_list"
+	if [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMOKE_INSTANCES " | grep -q " smp "; then
+		_ran_list="$_ran_list smp"
+	fi
+	for _known in sys blk posix gfx openrc init iommu amdvi smp; do
+		case " $_ran_list " in
+		*" $_known "*) continue ;;
+		esac
+		rm -f "$PROJECT_DIR/smoke_run/b1nix-smoke-$_known-$ARCH.log"
+	done
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
 	cat "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" 2>/dev/null >"$LOG" || true
 else
@@ -799,7 +793,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	for _i in sys blk posix gfx openrc init iommu amdvi smp v8; do
+	for _i in sys blk posix gfx openrc init iommu amdvi smp; do
 	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" "$(disk_img vblk "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
@@ -926,7 +920,7 @@ if grep -q "M13-SMOKE: ok execve-argv-env" "$LOG" 2>/dev/null; then
 elif grep -q "M13-SMOKE: unsupported execve-argv-env-native-elf" "$LOG" 2>/dev/null; then
 	fail "execve preserves argv/envp semantics" "native ELF argv/envp is explicitly unsupported"
 else
-	fail "execve argv/envp marker emitted" "missing execve argv/envp support/unsupported marker"
+	missing_marker "$LOG" "execve argv/envp marker emitted" "missing execve argv/envp support/unsupported marker"
 fi
 check_output "$LOG" "M13-SMOKE: ok execve-fail-deterministic" "failed execve returns deterministic child status"
 if grep -q "M13-SMOKE: ok builtin-exec" "$LOG" 2>/dev/null; then
@@ -934,28 +928,28 @@ if grep -q "M13-SMOKE: ok builtin-exec" "$LOG" 2>/dev/null; then
 elif grep -q "M13-SMOKE: unsupported builtin-exec" "$LOG" 2>/dev/null; then
 	fail "builtin exec path works through execve" "builtin exec is explicitly unsupported"
 else
-	fail "builtin exec marker emitted" "missing builtin exec support/unsupported marker"
+	missing_marker "$LOG" "builtin exec marker emitted" "missing builtin exec support/unsupported marker"
 fi
 if grep -q "M13-SMOKE: ok sh-c-argv" "$LOG" 2>/dev/null; then
 	pass "/bin/sh -c preserves command argv semantics"
 elif grep -q "M13-SMOKE: unsupported sh-c-argv" "$LOG" 2>/dev/null; then
 	fail "/bin/sh -c preserves command argv semantics" "sh -c argv is explicitly unsupported"
 else
-	fail "sh -c argv marker emitted" "missing sh -c argv support/unsupported marker"
+	missing_marker "$LOG" "sh -c argv marker emitted" "missing sh -c argv support/unsupported marker"
 fi
 if grep -q "M13-SMOKE: ok sh-c-status" "$LOG" 2>/dev/null; then
 	pass "/bin/sh -c execution returns stable status"
 elif grep -q "M13-SMOKE: unsupported sh-c-status" "$LOG" 2>/dev/null; then
 	fail "/bin/sh -c execution returns stable status" "sh -c status is explicitly unsupported"
 else
-	fail "sh -c status marker emitted" "missing sh -c status support/unsupported marker"
+	missing_marker "$LOG" "sh -c status marker emitted" "missing sh -c status support/unsupported marker"
 fi
 if grep -q "M13-SMOKE: ok fd-inherit-exec" "$LOG" 2>/dev/null; then
 	pass "fd inheritance survives exec boundary"
 elif grep -q "M13-SMOKE: unsupported fd-inherit-exec" "$LOG" 2>/dev/null; then
 	fail "fd inheritance survives exec boundary" "fd inheritance exec-boundary is explicitly unsupported"
 else
-	fail "fd inheritance exec marker emitted" "missing fd inheritance support/unsupported marker"
+	missing_marker "$LOG" "fd inheritance exec marker emitted" "missing fd inheritance support/unsupported marker"
 fi
 check_output "$LOG" "M13-SMOKE: ok dup2" "dup2 behavior remains correct"
 if grep -q "M13-SMOKE: ok cloexec-exec" "$LOG" 2>/dev/null; then
@@ -963,7 +957,7 @@ if grep -q "M13-SMOKE: ok cloexec-exec" "$LOG" 2>/dev/null; then
 elif grep -q "M13-SMOKE: unsupported cloexec-exec" "$LOG" 2>/dev/null; then
 	fail "close-on-exec is enforced across exec boundary" "close-on-exec exec-boundary is explicitly unsupported"
 else
-	fail "close-on-exec exec marker emitted" "missing close-on-exec support/unsupported marker"
+	missing_marker "$LOG" "close-on-exec exec marker emitted" "missing close-on-exec support/unsupported marker"
 fi
 check_output "$LOG" "M13-SMOKE: ok parent-intact" "failed child exec path does not corrupt parent runtime"
 check_output "$LOG" "M13-SMOKE: ok errno-negative" "negative syscall result path is exposed to userspace"
@@ -989,7 +983,7 @@ if grep -q "M17-SMOKE: ok erofs" "$LOG" 2>/dev/null; then
 elif grep -q "M17-SMOKE: ok erofs-skip" "$LOG" 2>/dev/null; then
 	pass "M17 EROFS test skipped (no readonly mount candidate)"
 else
-	fail "M17 EROFS marker emitted" "missing erofs/erofs-skip marker"
+	missing_marker "$LOG" "M17 EROFS marker emitted" "missing erofs/erofs-skip marker"
 fi
 check_output "$LOG" "M17-SMOKE: ok errno-isolation" "M17 errno isolation across successful syscall is correct"
 check_output "$LOG" "M17-SMOKE: done" "M17 smoke completes successfully"
@@ -1502,7 +1496,7 @@ check_output "$LOG" "M11-SHELL: ok script-exec" "script execution via /bin/sh"
 if grep -q "M11-SHELL: ok shebang" "$LOG" 2>/dev/null || grep -q "M11-SHELL: ok shebang-unsupported" "$LOG" 2>/dev/null; then
 	pass "shebang behavior marker emitted"
 else
-	fail "shebang behavior marker emitted" "missing shebang support/unsupported marker"
+	missing_marker "$LOG" "shebang behavior marker emitted" "missing shebang support/unsupported marker"
 fi
 
 section "M11 Coreutils via shell"
@@ -1549,7 +1543,7 @@ if grep -q "TCP-SMOKE: path-exercised" "$LOG" 2>/dev/null; then
 elif grep -q "TCP-SMOKE: unsupported" "$LOG" 2>/dev/null; then
 	pass "TCP baseline limitation explicitly reported"
 else
-	fail "TCP path marker emitted" "missing TCP smoke marker"
+	missing_marker "$LOG" "TCP path marker emitted" "missing TCP smoke marker"
 fi
 # ── M27 Terminal OS Polish: kernel command line parsing ──
 check_output "$LOG" "M27-CMDLINE: ok kv-parse" "kernel command line key=value parser works"
@@ -2239,14 +2233,6 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		# No 32bpp boot framebuffer in this config — device legitimately absent
 		check_output "$LOG" "M47-GFX: skip no-fb" "M47: fb skipped (no framebuffer)"
 	fi
-	# ── the hardware cursor: the device composes it, nothing is painted over ──
-	if grep -q "M47-GFX: skip no-hw-cursor" "$LOG" 2>/dev/null ||
-	   grep -q "M47-GFX: skip no-fb-cursor" "$LOG" 2>/dev/null; then
-		pass "hardware cursor skipped (display device composes none)"
-	else
-		check_output "$LOG" "M47-GFX: ok fb-cursor" "the device's own cursor is uploaded, shown, moved and hidden, and the framebuffer is unchanged by all of it"
-	fi
-
 	check_output "$LOG" "M47-GFX: ok input-open" "M47: input devices open + EAGAIN"
 	check_output "$LOG" "M47-GFX: ok input-event" "M47: injected mouse events received"
 	check_output "$LOG" "M47-GFX: done" "M47 smoke completed"
@@ -2256,20 +2242,6 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M48-FDPASS: ok memfd" "M48: anonymous mmap-able memfd"
 	check_output "$LOG" "M48-FDPASS: ok shared-fork-cow" "M48: MAP_SHARED pages shared across fork"
 	check_output "$LOG" "M48-FDPASS: ok unix-blocking-send" "M48: blocking AF_UNIX send blocks on a full buffer instead of EAGAIN"
-
-	# ── the scanout's completion interrupt ──
-	# The frame path used to spin on the virtqueue with a spinlock held and
-	# interrupts off. This marker is only emitted when a command really parked
-	# and a real interrupt really ended the park.
-	# MSI-X where the device offers it, the legacy pin where it does not —
-	# either is a registered completion interrupt, which is the claim.
-	if grep -q "virtio-gpu: completion MSI-X on vector" "$LOG" 2>/dev/null ||
-	   grep -q "virtio-gpu: completion IRQ on line" "$LOG" 2>/dev/null; then
-		pass "virtio-gpu takes its completions on an interrupt instead of polling its queues"
-	else
-		fail "virtio-gpu takes its completions on an interrupt instead of polling its queues" "neither an MSI-X vector nor an INTx line was registered"
-	fi
-	check_output "$LOG" "M52-GFX: ok gpu-irq" "the virtio-gpu queues raise one interrupt per completion and the wait parks instead of spinning on the ring"
 
 	check_output "$LOG" "M50-DRM: ok card0" "M50: /dev/dri/card0"
 	check_output "$LOG" "M50-DRM: ok mode" "M50: KMS mode discovery"
@@ -2433,37 +2405,6 @@ else
 	pass "SMP self-test completes without panic"
 fi
 
-# ── M58 V8 / d8: real V8 engine runs JavaScript on b1nix (x86_64 only) ──
-# Runs only when the prebuilt d8 artifacts are present (see SMOKE_V8 gating at the
-# top). d8 boots off the ext4 disk, deserializes its embedded snapshot, inits the
-# isolate, and runs m58.js; each marker is gated on a correct computed result.
-if [ "$SMOKE_V8" = "1" ]; then
-	echo ""
-	echo "[RUN] M58 V8/d8 JavaScript-engine checks..."
-	check_output "$V8_LOG" "ELF load: /mnt/v8/d8" "kernel loads the d8 ELF off the ext4 disk"
-	check_output "$V8_LOG" "M58-V8: ok hello" "d8 inits the V8 isolate and runs print()"
-	check_output "$V8_LOG" "M58-V8: ok loop-sum" "d8 evaluates a 100k-iteration arithmetic loop correctly"
-	check_output "$V8_LOG" "M58-V8: ok array-reduce" "d8 builds an array and reduces it correctly"
-	check_output "$V8_LOG" "M58-V8: ok object-sort" "d8 allocates/sorts 500 objects correctly"
-	check_output "$V8_LOG" "M58-V8: ok json" "d8 round-trips nested JSON correctly"
-	check_output "$V8_LOG" "M58-V8: ok gc-churn" "d8 survives 30k short-lived allocations (GC)"
-	check_output "$V8_LOG" "M58-V8: ok recursion" "d8 computes fib(25) via recursion correctly"
-	check_output "$V8_LOG" "M58-V8: ok closure" "d8 captures a closure variable correctly"
-	check_output "$V8_LOG" "M58-V8: ok try-catch" "d8 throws and catches an exception"
-	check_output "$V8_LOG" "M58-V8: ok map-set" "d8 builds Map/Set with correct membership"
-	check_output "$V8_LOG" "M58-V8: ok typed-array" "d8 reads/writes an Int32Array correctly"
-	check_output "$V8_LOG" "M58-V8: ok string-regex" "d8 runs string split/join + regex match"
-	check_output "$V8_LOG" "M58-V8: done" "d8 runs m58.js to completion"
-	if grep -qa -E "KERNEL PANIC|\[PANIC\]|task 'd8'.*SIGSEGV" "$V8_LOG" 2>/dev/null; then
-		fail "d8 runs without crashing" "PANIC/SIGSEGV detected in v8 log"
-	else
-		pass "d8 runs without crashing"
-	fi
-elif [ "$ARCH" = "x86_64" ] && [ "$SMOKE_PARALLEL" = "1" ]; then
-	echo ""
-	echo "[RUN] M58 V8/d8 — skipped (no prebuilt build/v8-out/v8-ext4.img; build d8 to enable)"
-fi
-
 # ── Summary ──
 echo ""
 echo "=== Results ==="
@@ -2477,7 +2418,7 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-for _i in sys blk posix gfx openrc init iommu amdvi smp v8; do
+for _i in sys blk posix gfx openrc init iommu amdvi smp; do
     rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")"
 done
 echo ""

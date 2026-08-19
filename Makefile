@@ -188,6 +188,13 @@ DROPBEAR_VERSION := 2022.83
 # tree that had built fine an hour earlier, with nothing in the diff to explain
 # it. Keeping the two apart costs a directory and removes the interference.
 ifeq ($(B1NIX_BROWSER),1)
+# What "the toolchain is present" and "the imported sources are present" mean,
+# concretely. Named files rather than directories: a directory can exist and be
+# empty, and an interrupted fetch leaves exactly that.
+MUSL_SYSROOT_MARKER := $(BUILD_DIR)/ports/musl/install/include/stdio.h
+I915_SOURCE_MARKER := $(BUILD_DIR)/../src/i915-6.6/B1NIX-OBJECTS
+DRM_CORE_MARKER := $(BUILD_DIR)/../src/drm-core-6.6/include/drm/drm_device.h
+
 PKGROOT := build/$(ARCH)/pkgroot-browser
 else
 PKGROOT := build/$(ARCH)/pkgroot
@@ -650,7 +657,7 @@ else
 I915_IMPORT_OBJECTS :=
 endif
 
-.PHONY: kernel-dist i915-fetch
+.PHONY: kernel-dist i915-fetch bootstrap
 i915-fetch:
 	@sh tools/drm/fetch-i915.sh
 
@@ -688,7 +695,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	run run-graphics run-x86_64 run-root check-tools clean distclean \
 	smoke smoke-quick graphics-smoke memory-smoke build-all test-b1cc
 
-all: check-b1cc-sync $(KERNEL_ELF)
+all: check-b1cc-sync $(I915_SOURCE_MARKER) $(DRM_CORE_MARKER) $(KERNEL_ELF)
 
 # build-all — one orchestrator that builds the whole working system in dependency
 # order by reusing the existing build scripts (see tools/build-all.sh). Forwards
@@ -802,7 +809,33 @@ $(APPLET_REGISTRATION_INC): $(APPLET_MANIFEST)
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
 # otherwise initramfs ships with stale userspace and the kernel sees old libc.
+# One-time preparation, done by make rather than by hand.
+#
+# The cross toolchain and musl sysroot, and the imported Linux sources the DRM
+# core is built from, are not products of this makefile — they are fetched and
+# built by scripts. That was fine while they existed, and useless the first time
+# someone cleaned the build directory: `make` then failed copying libc headers
+# that had never been built, with nothing saying what to run. Both are cheap to
+# detect and expensive to reproduce by guesswork, so detect them here.
+#
+# Marked by the artefacts themselves rather than by a stamp file, so removing
+# either one is enough to trigger the rebuild.
+$(MUSL_SYSROOT_MARKER):
+	@echo "  BOOTSTRAP cross toolchain + musl sysroot (one-time, several minutes)"
+	@sh tools/toolchain/build-toolchain.sh
+
+$(I915_SOURCE_MARKER):
+	@echo "  BOOTSTRAP imported i915 sources (one-time)"
+	@sh tools/drm/fetch-i915.sh
+
+$(DRM_CORE_MARKER):
+	@echo "  BOOTSTRAP imported DRM core sources (one-time)"
+	@sh tools/drm/fetch-drm-core.sh
+
+bootstrap: $(MUSL_SYSROOT_MARKER) $(I915_SOURCE_MARKER) $(DRM_CORE_MARKER) $(OPENRC_SOURCE_MARKER)
+
 $(BUILD_DIR)/.userspace-headers-installed: \
+	$(MUSL_SYSROOT_MARKER) \
 	$(wildcard userspace/libc/*.c) \
 	$(wildcard userspace/include/*.h) \
 	$(wildcard userspace/include/*/*.h) \
@@ -1020,7 +1053,11 @@ $(LIBVPX_LIB): $(PKG_DEPS)
 # The targets are the installed files rather than a stamp under build/, so a
 # wiped rootfs is a missing target and the port runs again.
 OPENRC_INIT := $(BUILD_DIR)/rootfs/sbin/openrc-init
-$(OPENRC_INIT): tools/ports/build-openrc.sh $(LIBC_SO)
+OPENRC_SOURCE_MARKER := build/src/openrc/src/openrc-init/openrc-init.c
+$(OPENRC_SOURCE_MARKER):
+	@sh tools/ports/fetch-openrc.sh
+
+$(OPENRC_INIT): tools/ports/build-openrc.sh $(LIBC_SO) $(OPENRC_SOURCE_MARKER)
 	B1NIX_ARCH=$(ARCH) sh tools/ports/build-openrc.sh >/dev/null
 
 CURLBUILD_STAMP := build/$(ARCH)/pkg/curlbuild/lib/libcurl.a
@@ -1376,14 +1413,6 @@ iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-pass iso-pass-sway iso
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
 	    --module $(BUILD_DIR)/root.ext4:rootfs.img
 
-# V8 run instance: the kernel hook (gated by b1nix.v8run) mounts ram0 -> /mnt/v8
-# and runs d8 on m58.js. It boots in test mode (b1nix.test=1) on purpose: the hook
-# loads d8 off the disk early — before the rc's M14 test touches sda — and the
-# active rc keeps the scheduler busy so d8's thread runs. (Without test mode, init
-# drops to an interactive getty/shell that starves d8 on a single CPU.) Reuses the
-# shared kernel.elf — no recompile, just a different boot cmdline. The d8 binary +
-# m58.js ride on build/v8-out/v8-ext4.img, handed to the kernel as the ram0
-# Multiboot2 module by tests/smoke.sh.
 # Display bring-up instance: the kernel and nothing else.
 #
 # Deliberately carries no rootfs module. The in-kernel DRM client is what drives
@@ -1399,16 +1428,6 @@ iso-i915: $(KERNEL_ELF)
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "b1nix.gfx-only $(I915_EXTRA_CMDLINE)" \
 	    $(if $(I915_EDID),--module $(I915_EDID):edid.bin)
-
-iso-v8: $(KERNEL_ELF) root-image
-	@$(MKISO) --stage $(BUILD_DIR)/iso-v8 --out $(BUILD_DIR)/b1nix-v8.iso \
-	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "b1nix.test=1 b1nix.v8run b1nix.smoke=v8" \
-	    --module $(BUILD_DIR)/root.ext4:rootfs.img \
-	    --module $(BUILD_ROOT)/v8-out/v8-ext4.img:v8.img
-# NOTE: the smoke v8 instance runs JITLESS (no b1nix.v8jit) — that is the proven
-# config and matches the jitless d8 on v8-ext4.img. The JIT d8 is exercised
-# manually (build the default ISO with b1nix.v8jit + the v8-jit-ext4.img disk).
 
 iso-live: root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/iso-live --out $(BUILD_DIR)/b1nix-live.iso \

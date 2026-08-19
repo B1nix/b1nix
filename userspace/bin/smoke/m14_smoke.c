@@ -368,10 +368,13 @@ int main(int argc, char **argv) {
 
     if (sysblk) {
       char removable_name[64];
+      char seen[256];
+      int seen_len = 0;
       int removable_count = 0, fixed_count = 0, read_failures = 0;
       struct dirent *ent;
 
       removable_name[0] = '\0';
+      seen[0] = '\0';
       while ((ent = readdir(sysblk)) != NULL) {
         char path[128];
         char value[8];
@@ -379,6 +382,9 @@ int main(int argc, char **argv) {
 
         if (ent->d_name[0] == '.')
           continue;
+        if (seen_len < (int)sizeof(seen) - 1)
+          seen_len += snprintf(seen + seen_len, sizeof(seen) - (size_t)seen_len,
+                               "%s%s", seen_len ? "," : "", ent->d_name);
         snprintf(path, sizeof(path), "/sys/block/%s/removable", ent->d_name);
         vfd = open(path, O_RDONLY);
         if (vfd < 0) {
@@ -402,6 +408,18 @@ int main(int argc, char **argv) {
         }
       }
       closedir(sysblk);
+
+      /* Always report the scan itself. The pass marker below is conditional on
+       * a removable disk being present, so without this line an instance that
+       * sees none is indistinguishable from one where /sys/block could not be
+       * read at all. */
+      {
+        char scan[384];
+        snprintf(scan, sizeof(scan),
+                 "M14-SMOKE: removable-scan rm=%d fixed=%d bad=%d seen=%s\n",
+                 removable_count, fixed_count, read_failures, seen);
+        marker(scan);
+      }
 
       if (removable_count > 0) {
         /* The stick must be the only removable disk, must sit beside fixed

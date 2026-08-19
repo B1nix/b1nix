@@ -526,6 +526,10 @@ Status:
 - Duktape `/bin/js` removed: V8/d8 is the JavaScript engine on b1nix, and a second
   vendored interpreter earned nothing.
 - [x] POSIX memory wins: `madvise`, `MAP_NORESERVE`, and `sigaltstack` with `SA_ONSTACK`.
+- **Cancelled.** V8 now arrives inside Alpine's Chromium package, linked in
+  alongside Skia, so b1nix no longer carries a standalone engine: the d8 port,
+  its smoke instance, the `b1nix.v8run` kernel hook and the `iso-v8` target are
+  removed. Chromium is where JavaScript is proven from here on.
 
 ## M59: EGL and GL for the Browser
 

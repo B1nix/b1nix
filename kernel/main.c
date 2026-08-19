@@ -1131,50 +1131,6 @@ void kernel_main(usize arg0, usize arg1)
 	         init_path, init_pid);
 	console_write(init_log);
 
-	/* M58 V8 run phase: d8 (x86_64) is too big for the xxd-embedded initramfs,
-	 * so it ships inside the SAME ISO as a Multiboot2 module (limine.conf
-	 * `module2 /boot/v8.img`), which the kernel exposes as the ram0 block device
-	 * (kernel/dev/ramdisk.c). When booted with b1nix.v8run, mount ram0 and launch
-	 * d8 to prove the V8 engine runs on b1nix — no separate QEMU -drive needed,
-	 * the whole thing is one self-contained ISO. Gated by a cmdline flag so it
-	 * never fires in the ordinary (32-bit) smoke suite. */
-	if (bootinfo_has_flag("b1nix.v8run")) {
-		vfs_mkdir("/mnt/v8", 0755);
-		int v8_mrc = vfs_mount("ram0", "/mnt/v8", "ext4", 0);
-		char v8_buf[96];
-		snprintf(v8_buf, sizeof(v8_buf), "v8: mount ram0 -> /mnt/v8: %d\n", v8_mrc);
-		console_write(v8_buf);
-		if (v8_mrc == 0) {
-			/* Run a real script off the disk (exercises V8's file reader, the
-			 * parser, loops/arrays/objects/JSON/GC/recursion) rather than a bare
-			 * -e print. m58.js gates each "ok" marker on a correct computed
-			 * result and ends with "M58-V8: done". With b1nix.v8jit, drop
-			 * --jitless so the Sparkplug/TurboFan JIT runs instead of the
-			 * interpreter (the disk must carry the JIT-enabled d8). */
-			int v8_jit = bootinfo_has_flag("b1nix.v8jit");
-			/* b1nix.v8opt selects the optimizing tier (TurboFan): drop --no-opt so
-			 * hot functions tier up past Sparkplug. Default (no flag) keeps
-			 * --no-opt = baseline Sparkplug, which is the stable shipping config. */
-			int v8_opt = bootinfo_has_flag("b1nix.v8opt");
-			const char *v8_argv_jitless[] = {"d8", "--jitless", "--harmony-temporal", "/mnt/v8/m58.js", 0};
-			/* JIT: --single-threaded keeps codegen/GC on the main thread while the
-			 * JIT bring-up stabilises (isolates the engine from b1nix's background
-			 * thread + cross-thread memory paths). */
-			const char *v8_argv_sparkplug[] = {"d8", "--single-threaded", "--no-opt", "--harmony-temporal", "/mnt/v8/m58.js", 0};
-			const char *v8_argv_turbofan[] = {"d8", "--single-threaded", "--harmony-temporal", "/mnt/v8/m58.js", 0};
-			int v8_pid;
-			if (!v8_jit)
-				v8_pid = user_spawn("/mnt/v8/d8", 4, v8_argv_jitless);
-			else if (v8_opt)
-				v8_pid = user_spawn("/mnt/v8/d8", 4, v8_argv_turbofan);
-			else
-				v8_pid = user_spawn("/mnt/v8/d8", 5, v8_argv_sparkplug);
-			snprintf(v8_buf, sizeof(v8_buf), "v8: d8 spawn result: %d (%s)\n",
-				v8_pid, v8_jit ? (v8_opt ? "turbofan" : "sparkplug") : "jitless");
-			console_write(v8_buf);
-		}
-	}
-
 	/* M68 native-Rust proof: the rustc ELF + librustc_driver.so (LLVM folded in) +
 	 * the std sysroot (~hundreds of MB) are far too big for the
 	 * xxd-embedded initramfs, so — like d8 above — they ship as a

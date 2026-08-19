@@ -1,4 +1,5 @@
 #include <b1nix/console.h>
+#include <b1nix/vfs.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
@@ -505,6 +506,8 @@ void kheap_describe(u64 addr, const char *label) {
                     : block->magic == KHEAP_FREED_MAGIC ? " FREED"
                                                         : " BAD-MAGIC");
       console_write("\n");
+      if (block->magic == KHEAP_MAGIC)
+        vfs_inode_chan_report(addr, payload, block->size);
       return;
     }
     cur = next;
