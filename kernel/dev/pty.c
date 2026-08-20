@@ -23,7 +23,28 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define PTY_MAX   16
+/* How many pseudo-terminals can exist at once — a capacity derived at init,
+ * with the slots themselves allocated only as they are opened.
+ *
+ * Sixteen was a hard wall reached by ordinary use, not by a stress test: a
+ * tmux session with a dozen panes, or a build fanning out shells, exhausts it
+ * and every further openpty() returns ENFILE. Linux's equivalent (pty.max)
+ * defaults to 4096.
+ *
+ * A `struct pty` is ~17 KiB — two 8 KiB rings plus a line buffer — so 4096 of
+ * them statically would be 71 MiB of BSS on a machine that may never open a
+ * second terminal. Hence the two-level shape: a small pointer table sized once
+ * from RAM, and a slot kmalloc'd on first use of that index and kept for reuse.
+ * Idle capacity therefore costs one pointer, not 17 KiB.
+ *
+ * FLOOR   16 slots — the previous fixed count, so a 256 MiB guest is unchanged
+ *         in both capacity and behaviour.
+ * CEILING 4096 slots (32 KiB of pointers, and 71 MiB only if every one is
+ *         actually opened) — Linux's default, and past it the pts namespace is
+ *         not the thing under strain.
+ * `b1nix.pty-max=N` states the capacity directly. */
+#define PTY_SLOTS_MIN 16u
+#define PTY_SLOTS_MAX 4096u
 #define PTY_BUF   8192
 #define PTY_LINE  1024
 
@@ -54,7 +75,19 @@ struct pty {
   u16 gid;
 };
 
-static struct pty ptys[PTY_MAX];
+static struct pty **ptys;
+static u32 pty_slots = PTY_SLOTS_MIN;
+/* Guards the free-slot scan and the lazy allocation behind it. The scan used to
+ * run unlocked, so two concurrent openpty() calls could pick the same index and
+ * one would hand back a master already owned by the other. */
+static spinlock_t pty_lock = SPINLOCK_INIT;
+
+/* The pty at `idx`, or NULL if the index is out of range or never allocated. */
+static struct pty *pty_slot(int idx) {
+  if (idx < 0 || (u32)idx >= pty_slots || !ptys)
+    return 0;
+  return ptys[idx];
+}
 
 /* ── ring-buffer helpers ── */
 static int rb_putc(u8 *buf, usize *tail, usize *count, u8 c) {
@@ -380,26 +413,59 @@ static void pty_reset_termios(struct pty *p) {
 }
 
 void pty_init(void) {
-  memset(ptys, 0, sizeof(ptys));
-  for (int i = 0; i < PTY_MAX; i++)
-    ptys[i].index = i;
+  u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
+  /* One slot per 4 MiB of RAM: a machine with room for the sessions gets the
+   * capacity for them, and a small one keeps the floor. */
+  u32 want = bootinfo_get_u32("b1nix.pty-max",
+                              (u32)(ram_mb > 0x100000ULL ? 0x100000ULL : ram_mb) / 4u);
+
+  if (want < PTY_SLOTS_MIN)
+    want = PTY_SLOTS_MIN;
+  if (want > PTY_SLOTS_MAX)
+    want = PTY_SLOTS_MAX;
+  pty_slots = want;
+
+  ptys = kzalloc((usize)pty_slots * sizeof(*ptys));
+  if (!ptys) {
+    pty_slots = PTY_SLOTS_MIN;
+    ptys = kzalloc((usize)pty_slots * sizeof(*ptys));
+  }
 }
 
 int pty_open_master(int flags) {
+  u64 lock_flags;
   int idx = -1;
-  for (int i = 0; i < PTY_MAX; i++) {
-    if (!ptys[i].used) {
-      idx = i;
-      break;
+
+  /* Claim a slot under the lock, allocating one if this index has never been
+   * used. kmalloc does not block, so it is safe here; the alternative — drop
+   * the lock to allocate and retake it — reopens the double-claim race the
+   * lock exists to close. */
+  spin_lock_irqsave(&pty_lock, &lock_flags);
+  for (u32 i = 0; i < pty_slots && ptys; i++) {
+    if (ptys[i] && ptys[i]->used)
+      continue;
+    if (!ptys[i]) {
+      ptys[i] = kzalloc(sizeof(struct pty));
+      if (!ptys[i])
+        break; /* out of memory — report it as a full table */
+    } else {
+      /* Reused slot: wipe the previous session's state. This has to happen
+       * before the lock is dropped — clearing the struct outside it would
+       * momentarily zero `used` again and let another CPU claim the same
+       * slot. */
+      memset(ptys[i], 0, sizeof(struct pty));
     }
+    idx = (int)i;
+    ptys[i]->used = 1; /* claimed before the lock is dropped */
+    ptys[i]->index = idx;
+    break;
   }
+  spin_unlock_irqrestore(&pty_lock, lock_flags);
+
   if (idx < 0)
     return -ENFILE;
 
-  struct pty *p = &ptys[idx];
-  memset(p, 0, sizeof(*p));
-  p->used = 1;
-  p->index = idx;
+  struct pty *p = ptys[idx];
   p->master_open = 1;
   p->slave_open = 0;
   pty_reset_termios(p);
@@ -429,9 +495,10 @@ int pty_open_master(int flags) {
 }
 
 int pty_open_slave(int index, int flags) {
-  if (index < 0 || index >= PTY_MAX)
+  struct pty *p = pty_slot(index);
+
+  if (!p)
     return -ENXIO;
-  struct pty *p = &ptys[index];
   if (!p->used || !p->master_open)
     return -ENXIO;
 
@@ -473,9 +540,9 @@ int pty_open_slave(int index, int flags) {
 }
 
 usize pty_fg_pgrp(int idx) {
-  if (idx < 0 || idx >= PTY_MAX)
-    return 0;
-  return ptys[idx].fg_pgrp;
+  struct pty *p = pty_slot(idx);
+
+  return p ? p->fg_pgrp : 0;
 }
 
 /* Pts index behind an open pty master/slave handle (for /proc/<pid>/fd names),
@@ -491,7 +558,7 @@ int pty_index_of(struct vfs_handle *h) {
 /* Is pty slot `idx` currently allocated? Used by the /dev/pts lookup_cb to
  * materialise a stat()-able /dev/pts/<idx> node only for live slaves. */
 int pty_allocated(int idx) {
-  if (idx < 0 || idx >= PTY_MAX)
-    return 0;
-  return ptys[idx].used;
+  struct pty *p = pty_slot(idx);
+
+  return p ? p->used : 0;
 }

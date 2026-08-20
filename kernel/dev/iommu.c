@@ -1331,7 +1331,7 @@ void iommu_selftest(void)
 		int ok = 1;
 
 		for (int pass = 0; pass < 2 && ok; pass++) {
-			before = pmm_free_frame_count();
+			before = pmm_owned_free_frames();
 			struct iommu_domain *d = iommu_domain_create();
 			ok = d != 0 && iommu_domain_capacity() >= 16;
 			u64 frame = pmm_alloc_frame();
@@ -1341,7 +1341,7 @@ void iommu_selftest(void)
 				iommu_domain_destroy(d);
 			if (frame)
 				pmm_free_frame(frame);
-			after = pmm_free_frame_count();
+			after = pmm_owned_free_frames();
 		}
 		/* Every page the domain took — root and each level of the walk — is
 		 * back. */

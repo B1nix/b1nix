@@ -117,10 +117,16 @@ struct e1000_tx_desc {
 } __attribute__((packed));
 
 /* Ring depth and per-descriptor buffer size are fixed device-DMA parameters
- * (not policy caps): 32 descriptors × 2048 B = one 64 KiB contiguous region
- * each for RX and TX, and 2048 matches RCTL's BSIZE encoding. */
-#define E1000_NUM_RX  32
-#define E1000_NUM_TX  32
+ * (not policy caps). Linux's e1000 defaults to 256 descriptors per ring
+ * (E1000_DEFAULT_RXD); at 32, a burst of frames arriving between two polls
+ * overran the ring and the surplus was dropped on the floor. 128 is that same
+ * order while keeping the buffer region's *contiguous* frame demand modest:
+ * the descriptors themselves are 16 bytes, so a ring still fits in the single
+ * page allocated for it (256 would too), but the buffers must be one physically
+ * contiguous run — 128 × 2048 B is 256 KiB, or 64 frames. 2048 matches RCTL's
+ * BSIZE encoding and must change with it. */
+#define E1000_NUM_RX  128
+#define E1000_NUM_TX  128
 #define E1000_BUF_SZ  2048
 
 static volatile u8 *e1000_regs;

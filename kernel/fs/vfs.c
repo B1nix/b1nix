@@ -23,6 +23,7 @@
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
 #include <b1nix/module.h>
+#include <b1nix/namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/lockdep.h>
 #include <b1nix/page_cache.h>
@@ -101,7 +102,9 @@ char serial_getc(void);
 int serial_has_data(void);
 void serial_write(const char *text);
 static void copy_path(char *dst, usize dst_size, const char *src);
-static int split_parent_path(const char *path, char *parent_path, char *name);
+static int split_parent_path(const char *path, char *parent_path,
+                             usize parent_size, char *name,
+                             usize name_size);
 static int vfs_create_at_internal(const char *resolved_path, u32 mode);
 static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode);
 
@@ -118,8 +121,68 @@ struct vfs_mount_entry {
   /* Reference on the module providing this filesystem type, dropped at umount
    * (NULL for a built-in type). */
   struct module *owner;
+  /* M109: the mount namespace this entry belongs to (0 = the initial one).
+   * Every scan below skips entries from another namespace, which is what makes
+   * a mount made under `unshare -m` invisible outside it. */
+  u32 mnt_ns;
 };
-static struct vfs_mount_entry mounts[MAX_MOUNTS];
+/* Sized at vfs_init() from RAM, never reallocated — see MAX_MOUNTS in vfs.h for
+ * the floor, the ceiling, and why this one is sized rather than grown. Until
+ * then the capacity reads as zero, so the scans below are no-ops rather than
+ * walks off a null pointer. */
+static struct vfs_mount_entry *mounts;
+static usize mount_slots;
+
+usize vfs_mount_capacity(void) { return mount_slots; }
+
+/* Allocate the mount table. Called from vfs_init() before any mount happens. */
+static void mounts_init_table(void) {
+  u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
+  /* One slot per MiB of RAM: a 64 MiB floor for small guests, and a machine
+   * big enough to run containers gets room for their namespaces. */
+  u32 want = bootinfo_get_u32("b1nix.max-mounts",
+                              (u32)(ram_mb > MAX_MOUNTS ? MAX_MOUNTS : ram_mb));
+
+  if (want < MIN_MOUNTS)
+    want = MIN_MOUNTS;
+  if (want > MAX_MOUNTS)
+    want = MAX_MOUNTS;
+  mounts = kzalloc((usize)want * sizeof(*mounts));
+  if (!mounts) {
+    want = MIN_MOUNTS;
+    mounts = kzalloc((usize)want * sizeof(*mounts));
+  }
+  mount_slots = mounts ? want : 0;
+}
+
+/* The caller's mount namespace. namespace_active() is a plain global read and
+ * is zero on any boot where nothing has unshared, so the whole namespace
+ * lookup drops out of the path-resolution fast path. */
+static u32 vfs_current_mnt_ns(void) {
+  if (!namespace_active())
+    return 0;
+  return namespace_current_id(NS_MNT);
+}
+
+/* Is mounts[i] a live entry the caller can see? */
+static int mount_visible(usize i) {
+  if (!mounts[i].used)
+    return 0;
+  if (!namespace_active())
+    return 1;
+  return mounts[i].mnt_ns == vfs_current_mnt_ns();
+}
+
+/* How many mount entries (in any namespace) point at this root node? A cloned
+ * namespace holds its own reference per entry, so "busy" has to be measured
+ * against that count rather than against 1. */
+static usize mount_root_refs(struct vfs_node *root) {
+  usize n = 0;
+  for (usize i = 0; i < mount_slots; i++)
+    if (mounts[i].used && mounts[i].root_node == root)
+      n++;
+  return n;
+}
 
 static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   if (!node)
@@ -139,16 +202,16 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   struct vfs_node *curr = node;
   struct vfs_mount_entry *res = 0;
   while (curr) {
-    for (int i = 0; i < MAX_MOUNTS; i++) {
-      if (mounts[i].used && curr == mounts[i].root_node) {
+    for (int i = 0; i < (int)mount_slots; i++) {
+      if (mount_visible(i) && curr == mounts[i].root_node) {
         res = &mounts[i];
         goto out;
       }
     }
     curr = curr->parent;
   }
-  for (int i = 0; i < MAX_MOUNTS; i++) {
-    if (mounts[i].used && strcmp(mounts[i].target, "/") == 0) {
+  for (int i = 0; i < (int)mount_slots; i++) {
+    if (mount_visible(i) && strcmp(mounts[i].target, "/") == 0) {
       res = &mounts[i];
       goto out;
     }
@@ -172,8 +235,8 @@ out:
 static struct vfs_node *vfs_mount_point_of(const struct vfs_node *node) {
   if (!node)
     return 0;
-  for (int i = 0; i < MAX_MOUNTS; i++) {
-    if (mounts[i].used && mounts[i].root_node == node)
+  for (int i = 0; i < (int)mount_slots; i++) {
+    if (mount_visible(i) && mounts[i].root_node == node)
       return mounts[i].mount_point;
   }
   return 0;
@@ -223,15 +286,27 @@ static struct vfs_fs *find_fs(const char *name) {
 
 /* Dcache sizing (B2 audit): pool + hash table are sized to RAM at
  * dcache_init_pool() and lazy-allocated from the kernel heap, instead of
- * burning ~50 KiB of static memory regardless of machine size. */
+ * burning ~50 KiB of static memory regardless of machine size.
+ *
+ * The pool and its hash are already derived from RAM (see dcache_init_pool);
+ * these are the clamps on that formula. The ceilings, not the formula, were
+ * what bound a large machine: at ~1 entry per 256 KiB of RAM an 8 GiB guest
+ * asks for 32768 entries and got 8192, and asks for 16384 buckets and got 4096
+ * — a load factor of 8, on the cache that every path lookup consults.
+ *
+ * FLOOR   256 entries / 64 buckets — unchanged, so a small guest is unchanged.
+ * CEILING 131072 entries (~13 MiB at 104 bytes an entry) and 65536 buckets
+ *         (512 KiB). The RAM rule reaches those only at 32 GiB, which is the
+ *         point: the machine decides, not the constant.
+ * `b1nix.dcache-entries=N` states the pool size directly. */
 #define DCACHE_SIZE_MIN          64
-#define DCACHE_SIZE_MAX          4096
+#define DCACHE_SIZE_MAX          65536
 #define DCACHE_POOL_MIN          256
-#define DCACHE_POOL_MAX          8192
+#define DCACHE_POOL_MAX          131072
 
 struct dcache_entry {
   struct vfs_node *parent;
-  char name[64];
+  char name[VFS_NAME_MAX];
   struct vfs_node *node;
   struct dcache_entry *next;
   struct dcache_entry *lru_next;
@@ -270,7 +345,9 @@ static struct dcache_entry *dcache_free_list = 0;
 static void dcache_init_pool(void) {
   /* Scale to RAM: ~1 entry per 256 KiB usable RAM, clamped. */
   u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
-  u32 pool = (u32)(ram_mb * 4);
+  u32 pool = bootinfo_get_u32(
+      "b1nix.dcache-entries",
+      (u32)(ram_mb > 0x100000ULL ? 0x100000ULL : ram_mb) * 4u);
   if (pool < DCACHE_POOL_MIN) pool = DCACHE_POOL_MIN;
   if (pool > DCACHE_POOL_MAX) pool = DCACHE_POOL_MAX;
   g_dcache_pool_size = pool;
@@ -504,11 +581,19 @@ static void dcache_invalidate_node(struct vfs_node *node) {
 }
 
 /* Icache sizing (B2 audit): same RAM-scaled treatment as dcache, smaller
- * per-entry footprint so we use a tighter ratio (1 entry per 512 KiB). */
+ * per-entry footprint so we use a tighter ratio (1 entry per 512 KiB).
+ *
+ * Clamps on the RAM-derived sizing in icache_init, raised for the same reason
+ * as the dcache above: at ~1 entry per 512 KiB an 8 GiB guest asks for 16384
+ * inodes and was given 4096.
+ *
+ * FLOOR   128 entries / 32 buckets — unchanged for a small guest.
+ * CEILING 65536 entries and 32768 buckets, reached at 32 GiB.
+ * `b1nix.icache-entries=N` states the pool size directly. */
 #define ICACHE_SIZE_MIN          32
-#define ICACHE_SIZE_MAX          2048
+#define ICACHE_SIZE_MAX          32768
 #define ICACHE_POOL_MIN          128
-#define ICACHE_POOL_MAX          4096
+#define ICACHE_POOL_MAX          65536
 
 struct icache_entry {
   u32 fs_id;
@@ -545,7 +630,9 @@ static u32 icache_hash(u32 fs_id, u64 ino) {
 void icache_init(void) {
   /* Scale to RAM: ~1 entry per 512 KiB usable RAM, clamped. */
   u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
-  u32 pool = (u32)(ram_mb * 2);
+  u32 pool = bootinfo_get_u32(
+      "b1nix.icache-entries",
+      (u32)(ram_mb > 0x100000ULL ? 0x100000ULL : ram_mb) * 2u);
   if (pool < ICACHE_POOL_MIN) pool = ICACHE_POOL_MIN;
   if (pool > ICACHE_POOL_MAX) pool = ICACHE_POOL_MAX;
   g_icache_pool_size = pool;
@@ -800,6 +887,46 @@ static void vfs_inode_unlock_read(struct vfs_inode *inode) {
   }
 }
 
+
+/* Time spent waiting for an inode lock, and who was holding it.
+ *
+ * The profile showed unlink at nearly half a second a call on a cold start and
+ * absent on a warm one, which is the shape of waiting rather than working. The
+ * inode lock is the plausible suspect, so it is measured: total cycles waited,
+ * how many waits, and the worst single wait with the site that held the lock.
+ * Read through /proc/b1nix-prof. */
+static u64 g_inode_wait_cycles, g_inode_waits, g_inode_wait_worst;
+static const void *g_inode_wait_worst_site;
+
+static inline u64 vfs_lock_tsc(void) {
+  unsigned lo, hi;
+  __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+  return ((u64)hi << 32) | lo;
+}
+
+static void vfs_inode_wait_note(u64 cycles, const void *holder_site) {
+  __atomic_fetch_add(&g_inode_wait_cycles, cycles, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_inode_waits, 1, __ATOMIC_RELAXED);
+  if (cycles > __atomic_load_n(&g_inode_wait_worst, __ATOMIC_RELAXED)) {
+    __atomic_store_n(&g_inode_wait_worst, cycles, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_inode_wait_worst_site, holder_site, __ATOMIC_RELAXED);
+  }
+}
+
+void vfs_inode_wait_stats(u64 *cycles, u64 *waits, u64 *worst,
+                          const void **site) {
+  if (cycles) *cycles = __atomic_load_n(&g_inode_wait_cycles, __ATOMIC_RELAXED);
+  if (waits) *waits = __atomic_load_n(&g_inode_waits, __ATOMIC_RELAXED);
+  if (worst) *worst = __atomic_load_n(&g_inode_wait_worst, __ATOMIC_RELAXED);
+  if (site) *site = __atomic_load_n(&g_inode_wait_worst_site, __ATOMIC_RELAXED);
+}
+
+void vfs_inode_wait_reset(void) {
+  __atomic_store_n(&g_inode_wait_cycles, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&g_inode_waits, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&g_inode_wait_worst, 0, __ATOMIC_RELAXED);
+}
+
 static void vfs_inode_lock_write(struct vfs_inode *inode) {
   if (blk_cache_lock_is_held()) {
     console_write("[LOCK ORDER] vfs_inode_lock_write called by 0x");
@@ -807,18 +934,24 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
     console_write(" while bcache lock held\n");
     panic("vfs: inode write-lock under block-cache lock");
   }
+  u64 wait_start = 0;
   while (1) {
     int val = 0;
     if (__atomic_compare_exchange_n(&inode->rw_lock, &val, -1, 0,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      if (wait_start)
+        vfs_inode_wait_note(vfs_lock_tsc() - wait_start, inode->rw_site);
       break;
     }
+    if (!wait_start)
+      wait_start = vfs_lock_tsc();
     /* SMP-safe block — see vfs_inode_lock_read for the lost-wakeup rationale. */
     scheduler_wait_prepare((void *)&inode->rw_lock);
     val = 0;
     if (__atomic_compare_exchange_n(&inode->rw_lock, &val, -1, 0,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
       scheduler_wait_cancel();
+      vfs_inode_wait_note(vfs_lock_tsc() - wait_start, inode->rw_site);
       break;
     }
     scheduler_wait_commit();
@@ -926,8 +1059,8 @@ static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node) {
     return node;
 
   struct vfs_node *mounted_root = 0;
-  for (int i = 0; i < MAX_MOUNTS; i++) {
-    if (mounts[i].used && mounts[i].root_node &&
+  for (int i = 0; i < (int)mount_slots; i++) {
+    if (mount_visible(i) && mounts[i].root_node &&
         strcmp(mounts[i].target, "/") == 0) {
       mounted_root = mounts[i].root_node;
     }
@@ -1254,11 +1387,23 @@ void vfs_resolve_path(const char *path, char *out) {
   if (!path || !out)
     return;
   char combined[VFS_MAX_PATH];
+  /* strncpy writes no terminator when the source fills the buffer.
+   *
+   * These three copies passed the full buffer size, so a path exactly
+   * VFS_MAX_PATH long (or longer) left `combined` unterminated, and the
+   * strlen/strncat/loop below then ran off the end of a stack array — into the
+   * caller's own locals. It surfaced as a general-protection fault inside
+   * strncpy with a "pointer" made of filename bytes: the path pointer of the
+   * frame above had been overwritten by the overrun. A browser reaches these
+   * lengths routinely; nothing shorter ever did, which is why it took a
+   * 200 MB program to find. */
   if (path[0] == '/') {
-    strncpy(combined, path, VFS_MAX_PATH);
+    strncpy(combined, path, VFS_MAX_PATH - 1);
+    combined[VFS_MAX_PATH - 1] = '\0';
   } else {
     const char *cwd = scheduler_get_cwd();
-    strncpy(combined, cwd, VFS_MAX_PATH);
+    strncpy(combined, cwd, VFS_MAX_PATH - 1);
+    combined[VFS_MAX_PATH - 1] = '\0';
     usize len = strlen(combined);
     if (len > 0 && combined[len - 1] != '/' && len < VFS_MAX_PATH - 1) {
       combined[len++] = '/';
@@ -1270,7 +1415,8 @@ void vfs_resolve_path(const char *path, char *out) {
   char *parts[64];
   int part_count = 0;
   char tmp[VFS_MAX_PATH];
-  strncpy(tmp, combined, VFS_MAX_PATH);
+  strncpy(tmp, combined, VFS_MAX_PATH - 1);
+  tmp[VFS_MAX_PATH - 1] = '\0';
   char *curr = tmp;
   while (*curr && part_count < 64) {
     while (*curr == '/')
@@ -1392,8 +1538,8 @@ restart_traversal:
     if (strcmp(part, "..") == 0) {
       while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
         scheduler_yield();
-      for (int i = 0; i < MAX_MOUNTS; i++) {
-        if (mounts[i].used && current == mounts[i].root_node) {
+      for (int i = 0; i < (int)mount_slots; i++) {
+        if (mount_visible(i) && current == mounts[i].root_node) {
           struct vfs_node *mp = vfs_node_get(mounts[i].mount_point);
           __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
           vfs_inode_unlock_read(current->inode);
@@ -1461,8 +1607,8 @@ restart_traversal:
 
     /* find_child() already returns with refcount incremented */
     /* DOWNWARD MOUNT CROSSING */
-    for (int i = 0; i < MAX_MOUNTS; i++) {
-      if (mounts[i].used && child == mounts[i].mount_point) {
+    for (int i = 0; i < (int)mount_slots; i++) {
+      if (mount_visible(i) && child == mounts[i].mount_point) {
         struct vfs_node *root = vfs_node_get(mounts[i].root_node);
         vfs_node_put(child);
         child = root;
@@ -1637,8 +1783,8 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
     }
     int child_was_found = (child != NULL);
     if (child) {
-      for (int i = 0; i < MAX_MOUNTS; i++) {
-        if (mounts[i].used && child == mounts[i].mount_point) {
+      for (int i = 0; i < (int)mount_slots; i++) {
+        if (mount_visible(i) && child == mounts[i].mount_point) {
           vfs_node_put(child); /* Drop ref from find_child */
           child = vfs_node_get(mounts[i].root_node);
           break;
@@ -1929,6 +2075,7 @@ struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind) {
   h->used = 1;
   h->refcount = 1;
   h->kind = kind;
+  h->ns_pin = 0; /* M109: only a /proc/<pid>/ns/<kind> open sets this */
   return h;
 }
 
@@ -2394,7 +2541,7 @@ void vfs_init(void) {
   dcache_init_pool();
   icache_init();
   node_count = 0;
-  memset(mounts, 0, sizeof(mounts));
+  mounts_init_table(); /* kzalloc'd, so already zeroed */
 
   root_node = alloc_node();
   root_node->inode = alloc_inode();
@@ -2457,6 +2604,9 @@ void vfs_init(void) {
 
   for (usize i = 0; i < blk_count(); i++) {
     struct block_device *dev = blk_at(i);
+    /* The registry can have holes since devices became removable. */
+    if (!dev || !dev->name)
+      continue;
     char dev_path[64];
     strcpy(dev_path, "/dev/");
     strcat(dev_path, dev->name);
@@ -2993,11 +3143,11 @@ int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
               strncpy(resolved, link, VFS_MAX_PATH - 1);
             } else {
               char *dir = kmalloc(VFS_MAX_PATH);
-              char base[64];
+              char base[VFS_NAME_MAX];
 
               if (!dir)
                 break;
-              if (split_parent_path(resolved, dir, base) == 0)
+              if (split_parent_path(resolved, dir, VFS_MAX_PATH, base, sizeof(base)) == 0)
                 snprintf(resolved, VFS_MAX_PATH, "%s/%s", dir, link);
               kfree(dir);
             }
@@ -3078,6 +3228,13 @@ int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
     /* O_TRUNC requires write permission regardless of open mode */
     res = vfs_check_access(node, W_OK);
     if (res != 0) {
+      vfs_node_put(node);
+      goto out;
+    }
+    /* M109 chattr: same rule as ftruncate — neither an immutable nor an
+     * append-only file may be emptied by an open(). */
+    if (node->inode->attr & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND)) {
+      res = -EPERM;
       vfs_node_put(node);
       goto out;
     }
@@ -3274,6 +3431,18 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
     vfs_node_put(node);
     return -EPERM;
   }
+  /* M109 chattr: an immutable file takes no writes at all, and an append-only
+   * one takes only writes that extend it — which means a descriptor opened
+   * O_APPEND, whose offset the branch below pins to the current end of file.
+   * A positioned write (pwrite, posp != NULL) ignores O_APPEND, so it can
+   * never be an append and is refused too. */
+  if (node->inode->attr & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND)) {
+    int is_append = !posp && (h->flags & B1NIX_O_APPEND);
+    if ((node->inode->attr & VFS_ATTR_IMMUTABLE) || !is_append) {
+      vfs_node_put(node);
+      return -EPERM;
+    }
+  }
   vfs_inode_lock(node->inode);
   /* O_APPEND: sample the size under the exclusive inode lock. Reading it
    * before the lock loses concurrent appends — a writer blocked on the lock
@@ -3344,7 +3513,11 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
       vfs_update_times(node->inode, VFS_MTIME | VFS_CTIME);
     }
   } else if (node->inode->write_cb) {
+    /* Tell the block layer whose blocks these are, so a later fsync can
+     * write back this file instead of every dirty block on the device. */
+    blk_set_dirty_owner(node->inode->fs_id, node->inode->ino);
     res = node->inode->write_cb(node, offset, buf, size, h->flags);
+    blk_clear_dirty_owner();
     if (res > 0) {
       vfs_update_times(node->inode, VFS_MTIME | VFS_CTIME);
       if (posp) *posp += (usize)res; else h->offset += (usize)res;
@@ -3600,10 +3773,10 @@ void vfs_close(int fd) {
 static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
   int res = 0;
   char *p_path = kmalloc(VFS_MAX_PATH);
-  char name[64];
+  char name[VFS_NAME_MAX];
   if (!p_path)
     return -ENOMEM;
-  if (split_parent_path(resolved_path, p_path, name) < 0) {
+  if (split_parent_path(resolved_path, p_path, VFS_MAX_PATH, name, sizeof(name)) < 0) {
     kfree(p_path);
     return -EINVAL;
   }
@@ -3648,7 +3821,7 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
 
   node->inode->blk_dev = parent->inode->blk_dev;
   node->inode->fs_id   = parent->inode->fs_id;
-  copy_path(node->name, 64, name);
+  copy_path(node->name, VFS_NAME_MAX, name);
   node->inode->type = VFS_FILE;
   node->parent = parent;
 
@@ -3723,17 +3896,26 @@ int vfs_create(const char *path, u32 mode) {
  * in-memory nodes; on a real filesystem the driver's mknod_cb creates a genuine
  * on-disk FIFO inode, so the node survives a remount. A filesystem without a
  * mknod_cb reports -EOPNOTSUPP rather than silently creating a regular file.
- * Character and block special files are not creatable at all (-EPERM, as for an
- * unprivileged Linux process); S_IFREG is forwarded to the ordinary create
- * path. */
+ * S_IFREG is forwarded to the ordinary create path.
+ *
+ * M109: character and block special files are creatable too, because that is
+ * the whole of what a hot-plug helper does — mdev reads a uevent and mknod()s
+ * the node it names, and refusing it left /dev frozen at whatever boot had
+ * created. Such a node is always an in-memory one, never written to the
+ * underlying filesystem: a device number is a property of the running kernel
+ * (Linux keeps them on devtmpfs for exactly this reason), and the on-disk
+ * mknod_cb of every filesystem here writes a FIFO inode, which is not what was
+ * asked for. A block node is bound to the device its number names, so it reads
+ * and writes like the one the block layer created at boot; an unknown number
+ * yields ENODEV rather than a node that looks like a disk and is not one. */
 int vfs_mknod(const char *path, u32 mode, u64 dev) {
-  (void)dev;
   if (!path)
     return -EINVAL;
   u32 fmt = mode & B1NIX_S_IFMT;
   if (fmt == 0 || fmt == B1NIX_S_IFREG)
     return vfs_create(path, mode & 07777);
-  if (fmt != B1NIX_S_IFIFO)
+  int is_dev = (fmt == B1NIX_S_IFBLK || fmt == B1NIX_S_IFCHR);
+  if (fmt != B1NIX_S_IFIFO && !is_dev)
     return -EPERM;
 
   char *resolved = kmalloc(VFS_MAX_PATH);
@@ -3742,12 +3924,12 @@ int vfs_mknod(const char *path, u32 mode, u64 dev) {
   vfs_resolve_path(path, resolved);
 
   char *p_path = kmalloc(VFS_MAX_PATH);
-  char name[64];
+  char name[VFS_NAME_MAX];
   if (!p_path) {
     kfree(resolved);
     return -ENOMEM;
   }
-  if (split_parent_path(resolved, p_path, name) < 0) {
+  if (split_parent_path(resolved, p_path, VFS_MAX_PATH, name, sizeof(name)) < 0) {
     kfree(p_path);
     kfree(resolved);
     return -EINVAL;
@@ -3781,7 +3963,16 @@ int vfs_mknod(const char *path, u32 mode, u64 dev) {
     res = -EACCES;
     goto out_unlock;
   }
-  if (parent->inode->create_cb && !parent->inode->mknod_cb) {
+  /* Creating a device node is creating an alias for the hardware itself: with
+   * no check, any process could mknod a block node for the root disk somewhere
+   * it can write and read the filesystem straight out from under its
+   * permissions. Linux gates it on CAP_MKNOD and so does this. */
+  if (is_dev && cred && cred->euid != ROOT_UID &&
+      !cred_has_cap(cred, CAP_MKNOD)) {
+    res = -EPERM;
+    goto out_unlock;
+  }
+  if (!is_dev && parent->inode->create_cb && !parent->inode->mknod_cb) {
     res = -EOPNOTSUPP;
     goto out_unlock;
   }
@@ -3801,8 +3992,8 @@ int vfs_mknod(const char *path, u32 mode, u64 dev) {
     res = -ENOMEM;
     goto out_unlock;
   }
-  copy_path(node->name, 64, name);
-  node->inode->type = VFS_FIFO;
+  copy_path(node->name, VFS_NAME_MAX, name);
+  node->inode->type = is_dev ? VFS_DEVICE : VFS_FIFO;
   node->inode->fs_id = parent->inode->fs_id;
   node->parent = parent;
   node->inode->mode = (mode & 07777) & ~scheduler_get_current_umask();
@@ -3812,6 +4003,19 @@ int vfs_mknod(const char *path, u32 mode, u64 dev) {
   node->inode->atime = node->inode->mtime = node->inode->ctime =
       vfs_get_unix_time();
   node->inode->blk_dev = parent->inode->blk_dev;
+  if (is_dev) {
+    /* A special file IS a device; it does not live on the parent's. */
+    node->inode->blk_dev = 0;
+    node->inode->rdev = dev;
+    if (fmt == B1NIX_S_IFBLK && blk_bind_dev_node(node, dev) < 0) {
+      node->deleted = 1;
+      __atomic_store_n(&node->refcount, 1, __ATOMIC_RELAXED);
+      vfs_node_put(node);
+      node = 0;
+      res = -ENODEV;
+      goto out_unlock;
+    }
+  }
   {
     u64 _tlflags;
     vfs_tree_write_acquire(&_tlflags);
@@ -3820,7 +4024,7 @@ int vfs_mknod(const char *path, u32 mode, u64 dev) {
     vfs_tree_write_release(_tlflags);
   }
 
-  if (parent->inode->mknod_cb) {
+  if (!is_dev && parent->inode->mknod_cb) {
     int err = parent->inode->mknod_cb(parent, name, node->inode->mode);
     if (err < 0) {
       u64 _tlflags;
@@ -3870,10 +4074,10 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
   }
   int res = 0;
   char *p_path = kmalloc(VFS_MAX_PATH);
-  char name[64];
+  char name[VFS_NAME_MAX];
   if (!p_path)
     return -ENOMEM;
-  if (split_parent_path(resolved_path, p_path, name) < 0) {
+  if (split_parent_path(resolved_path, p_path, VFS_MAX_PATH, name, sizeof(name)) < 0) {
     kfree(p_path);
     return -EINVAL;
   }
@@ -3918,7 +4122,7 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
 
   node->inode->blk_dev = parent->inode->blk_dev;
   node->inode->fs_id   = parent->inode->fs_id;
-  copy_path(node->name, 64, name);
+  copy_path(node->name, VFS_NAME_MAX, name);
   node->inode->type = VFS_DIRECTORY;
   node->parent = parent;
 
@@ -4051,6 +4255,10 @@ static int vfs_stat_node(struct vfs_node *node, struct b1nix_stat *st) {
     return -EINVAL;
 
   struct vfs_inode *inode = node->inode;
+  /* Let a synthetic filesystem bring its computed fields up to date first —
+   * before the read lock, because refreshing them takes the write side. */
+  if (inode->getattr_cb)
+    inode->getattr_cb(node);
   if (inode && inode->ino && inode->fs_id) {
     struct vfs_inode *cached = icache_get(inode->fs_id, inode->ino);
     if (!cached) {
@@ -4140,12 +4348,23 @@ isize vfs_lseek(int handle, isize offset, int whence) {
   return next;
 }
 
-static int split_parent_path(const char *path, char *parent_path, char *name) {
-  if (!path || path[0] == '\0')
+/* Split "/a/b/c" into "/a/b" and "c".
+ *
+ * Both destinations are bounded now. They were not: `name` was copied with a
+ * memcpy sized from the path, into buffers every caller declares as 64 bytes.
+ * A final component longer than that — a browser's cache files are — wrote
+ * past the end of a caller's stack array and over whatever followed it, which
+ * showed up as a general-protection fault inside strncpy on a "pointer" made
+ * of filename characters. A name that does not fit is now ENAMETOOLONG, which
+ * is also the truth: a b1nix directory entry holds 63 characters. */
+static int split_parent_path(const char *path, char *parent_path,
+                             usize parent_size, char *name, usize name_size) {
+  if (!path || path[0] == '\0' || !parent_path || !name || parent_size < 2 ||
+      name_size < 2)
     return -1;
 
   char local_path[VFS_MAX_PATH];
-  strncpy(local_path, path, VFS_MAX_PATH);
+  strncpy(local_path, path, VFS_MAX_PATH - 1);
   local_path[VFS_MAX_PATH - 1] = '\0';
 
   usize len = strlen(local_path);
@@ -4165,6 +4384,8 @@ static int split_parent_path(const char *path, char *parent_path, char *name) {
   }
 
   if (last_slash < 0) {
+    if (len + 1 > name_size)
+      return -ENAMETOOLONG;
     parent_path[0] = '/';
     parent_path[1] = '\0';
     memcpy(name, local_path, len + 1);
@@ -4173,14 +4394,19 @@ static int split_parent_path(const char *path, char *parent_path, char *name) {
 
   if ((usize)last_slash == len - 1)
     return -1;
+  usize name_len = len - (usize)last_slash - 1;
+  if (name_len + 1 > name_size)
+    return -ENAMETOOLONG;
   if (last_slash == 0) {
     parent_path[0] = '/';
     parent_path[1] = '\0';
   } else {
+    if ((usize)last_slash + 1 > parent_size)
+      return -ENAMETOOLONG;
     memcpy(parent_path, local_path, (usize)last_slash);
     parent_path[last_slash] = '\0';
   }
-  memcpy(name, local_path + last_slash + 1, len - (usize)last_slash);
+  memcpy(name, local_path + last_slash + 1, name_len + 1);
   return 0;
 }
 
@@ -4201,8 +4427,8 @@ static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
     return -EACCES;
 
   /* Защита точек монтирования */
-  for (int i = 0; i < MAX_MOUNTS; i++) {
-    if (mounts[i].used && strcmp(mounts[i].target, r_path) == 0)
+  for (int i = 0; i < (int)mount_slots; i++) {
+    if (mount_visible(i) && strcmp(mounts[i].target, r_path) == 0)
       return -EBUSY;
   }
 
@@ -4213,6 +4439,10 @@ static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
         if (cred->euid != ROOT_UID && cred->euid != child->inode->uid && cred->euid != parent->inode->uid)
           return -EACCES;
       }
+      /* M109 chattr: an immutable or append-only file keeps its name — Linux
+       * refuses to unlink either one, and so does this. */
+      if (child->inode->attr & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND))
+        return -EPERM;
       if (is_rmdir) {
         if (child->inode->type != VFS_DIRECTORY)
           return -ENOTDIR;
@@ -4224,7 +4454,17 @@ static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
       }
       if (parent->inode->unlink_cb && !is_rmdir) {
         int err = parent->inode->unlink_cb(parent, name);
-        if (err < 0)
+        /* -ENOENT means the filesystem has no directory entry of this name,
+         * which is not a failure to remove: the entry exists ONLY in memory.
+         * Device nodes are exactly that — mknod(2) keeps a character or block
+         * special file in memory (a device number is a property of the running
+         * kernel, never of the image), and the kernel plants /dev/<disk> the
+         * same way at boot. With the filesystem's ENOENT vetoing the removal,
+         * nothing could ever unlink one of those: `rm /dev/loop0` failed, and
+         * so did mdev removing the node for a device that had gone away, which
+         * is half of what a hot-plug helper does. Every other error still
+         * stops the unlink. */
+        if (err < 0 && err != -ENOENT)
           return err;
       } else if (parent->inode->rmdir_cb && is_rmdir) {
         int err = parent->inode->rmdir_cb(parent, name);
@@ -4259,8 +4499,8 @@ static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
 static int vfs_remove_node(const char *path, int is_rmdir) {
   char r_path[VFS_MAX_PATH];
   vfs_resolve_path(path, r_path);
-  char p_path[VFS_MAX_PATH], name[64];
-  split_parent_path(r_path, p_path, name);
+  char p_path[VFS_MAX_PATH], name[VFS_NAME_MAX];
+  split_parent_path(r_path, p_path, sizeof(p_path), name, sizeof(name));
   if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
     return -EINVAL;
 
@@ -4315,8 +4555,8 @@ int vfs_link(const char *target, const char *link_path) {
     goto out;
   }
 
-  char parent_path[VFS_MAX_PATH], name[64];
-  if (split_parent_path(link_path, parent_path, name) < 0) {
+  char parent_path[VFS_MAX_PATH], name[VFS_NAME_MAX];
+  if (split_parent_path(link_path, parent_path, sizeof(parent_path), name, sizeof(name)) < 0) {
     res = -EINVAL;
     goto out;
   }
@@ -4345,7 +4585,7 @@ int vfs_link(const char *target, const char *link_path) {
     goto out;
   }
 
-  copy_path(new_node->name, 64, name);
+  copy_path(new_node->name, VFS_NAME_MAX, name);
   new_node->inode = target_node->inode;
   new_node->inode->nlink++;
   new_node->parent = parent;
@@ -4389,8 +4629,8 @@ int vfs_symlink(const char *target, const char *link_path) {
   if (!target || target[0] == '\0')
     return -EINVAL;
 
-  char parent_path[VFS_MAX_PATH], name[64];
-  if (split_parent_path(link_path, parent_path, name) < 0)
+  char parent_path[VFS_MAX_PATH], name[VFS_NAME_MAX];
+  if (split_parent_path(link_path, parent_path, sizeof(parent_path), name, sizeof(name)) < 0)
     return -EINVAL;
 
   struct vfs_node *parent = vfs_find_node(parent_path);
@@ -4442,7 +4682,7 @@ int vfs_symlink(const char *target, const char *link_path) {
     goto out_unlock;
   }
 
-  copy_path(node->name, 64, name);
+  copy_path(node->name, VFS_NAME_MAX, name);
   node->inode->type = VFS_SYMLINK;
   node->inode->data = target_copy;
   node->inode->size = len;
@@ -4540,9 +4780,9 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
   if (strcmp(old_res, new_res) == 0)
     return 0;
 
-  char old_p[VFS_MAX_PATH], old_n[64], new_p[VFS_MAX_PATH], new_n[64];
-  split_parent_path(old_res, old_p, old_n);
-  split_parent_path(new_res, new_p, new_n);
+  char old_p[VFS_MAX_PATH], old_n[VFS_NAME_MAX], new_p[VFS_MAX_PATH], new_n[VFS_NAME_MAX];
+  split_parent_path(old_res, old_p, sizeof(old_p), old_n, sizeof(old_n));
+  split_parent_path(new_res, new_p, sizeof(new_p), new_n, sizeof(new_n));
 
   struct vfs_node *old_parent = vfs_find_node(old_p);
   if (IS_ERR(old_parent))
@@ -4559,6 +4799,13 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
   node = find_child(old_parent, old_n);
   if (!node) {
     res = -ENOENT;
+    goto out_put_parents;
+  }
+
+  /* M109 chattr: renaming an immutable or append-only file changes its name,
+   * which is exactly what those two flags pin down. */
+  if (node->inode && (node->inode->attr & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND))) {
+    res = -EPERM;
     goto out_put_parents;
   }
 
@@ -4792,6 +5039,20 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
   return vfs_stat_node(node, st);
 }
 
+/* M109: the namespace a /proc/<pid>/ns/<kind> descriptor pinned when it was
+ * opened. setns(2) reads it here rather than re-deriving it from the path,
+ * which would follow the task instead of the namespace. */
+int vfs_fd_ns_pin(int fd, u32 *pin_out) {
+  struct vfs_handle *h = get_handle(fd);
+  if (!h || h->kind != VFS_HANDLE_NODE)
+    return -EBADF;
+  if (!(h->ns_pin & VFS_NS_PIN_VALID))
+    return -EINVAL;
+  if (pin_out)
+    *pin_out = h->ns_pin;
+  return 0;
+}
+
 /* Absolute path of an open fd, written NUL-terminated into buf. Backs the libc
  * *at() emulation (openat/unlinkat with a real dirfd + relative name): b1nix has
  * no per-fd-base path resolver, so libc resolves the dirfd to its path here and
@@ -4860,11 +5121,12 @@ int vfs_fsync(int fd) {
     return err;
 
   if (node->inode->blk_dev) {
-    /* blk_cache_flush drains the dirty block-cache entries into the driver and
-     * then flushes the device itself — for a real disk that is the ATA/NVMe/
-     * virtio cache-flush command, for a stacked device (loop) it is the second
-     * stage that pushes the backing file out. */
-    blk_cache_flush(node->inode->blk_dev);
+    /* Persist THIS file, then flush the device — fsync is about one file, and
+     * draining every dirty block in a RAM-sized cache is what made a single
+     * call cost seconds. Blocks carry the inode that dirtied them, so the rest
+     * stays for the background drain. */
+    blk_cache_flush_inode(node->inode->blk_dev, node->inode->fs_id,
+                          node->inode->ino);
   }
   return 0;
 }
@@ -4915,7 +5177,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
     scheduler_yield();
 
   int midx = -1;
-  for (usize i = 0; i < MAX_MOUNTS; i++) {
+  for (usize i = 0; i < mount_slots; i++) {
     if (!mounts[i].used) {
       midx = (int)i;
       break;
@@ -4938,6 +5200,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   copy_path(mounts[midx].fstype, sizeof(mounts[midx].fstype), fstype);
   mounts[midx].flags = flags;
   mounts[midx].owner = fs->owner;
+  mounts[midx].mnt_ns = vfs_current_mnt_ns();
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
   currently_mounting = &mounts[midx];
@@ -4990,6 +5253,119 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   return 0;
 }
 
+/* Rewrite a mount's target when the directory it hangs under moves: "/old" and
+ * everything below it become "/new..." . Returns 0 when `path` is not inside
+ * `from`, so the caller can leave that entry alone. */
+static int retarget_under(char *path, usize path_size, const char *from,
+                          const char *to) {
+  usize flen = strlen(from);
+
+  if (strcmp(path, from) == 0) {
+    copy_path(path, path_size, to);
+    return 1;
+  }
+  if (strncmp(path, from, flen) != 0 || path[flen] != '/')
+    return 0;
+
+  const char *tail = path + flen; /* starts with '/' */
+  char rebuilt[VFS_MAX_PATH];
+
+  if (to[0] == '/' && to[1] == '\0')
+    copy_path(rebuilt, sizeof(rebuilt), tail);
+  else {
+    copy_path(rebuilt, sizeof(rebuilt), to);
+    strncat(rebuilt, tail, sizeof(rebuilt) - strlen(rebuilt) - 1);
+  }
+  copy_path(path, path_size, rebuilt);
+  return 1;
+}
+
+int vfs_move_mount(const char *source, const char *target) {
+  if (!source || !source[0] || !target || !target[0])
+    return -EINVAL;
+
+  char src[VFS_MAX_PATH];
+  char dst[VFS_MAX_PATH];
+  vfs_resolve_path(source, src);
+  vfs_resolve_path(target, dst);
+
+  if (strcmp(src, "/") == 0)
+    return -EBUSY; /* the root mount has nowhere above it to move to */
+  if (strcmp(src, dst) == 0)
+    return -EINVAL;
+  {
+    /* Moving a mount underneath itself would make its own path unreachable. */
+    usize slen = strlen(src);
+    if (strncmp(dst, src, slen) == 0 && dst[slen] == '/')
+      return -EINVAL;
+  }
+
+  struct vfs_node *src_node = vfs_find_node(src);
+  if (IS_ERR(src_node))
+    return (int)PTR_ERR(src_node);
+  struct vfs_node *dst_node = vfs_find_node(dst);
+  if (IS_ERR(dst_node)) {
+    vfs_node_put(src_node);
+    return (int)PTR_ERR(dst_node);
+  }
+  if (dst_node->inode->type != VFS_DIRECTORY) {
+    vfs_node_put(dst_node);
+    vfs_node_put(src_node);
+    return -ENOTDIR;
+  }
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+
+  int midx = -1;
+  for (usize i = 0; i < mount_slots; i++) {
+    if (mounts[i].used && mounts[i].root_node == src_node) {
+      midx = (int)i;
+      break;
+    }
+  }
+  if (midx < 0) {
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    vfs_node_put(dst_node);
+    vfs_node_put(src_node);
+    return -EINVAL; /* not a mountpoint: nothing to move */
+  }
+
+  struct vfs_node *old_mp = mounts[midx].mount_point;
+
+  /* A move is a retarget, not a remount: the filesystem, its root node and
+   * every open file on it stay exactly as they are. Only where the tree
+   * crosses into it changes — this entry's mountpoint, and the recorded target
+   * of every mount nested inside it, whose own mountpoint nodes travel with
+   * the subtree and so need no fixing. */
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mounts[i].used || (int)i == midx)
+      continue;
+    retarget_under(mounts[i].target, sizeof(mounts[i].target), src, dst);
+  }
+  mounts[midx].mount_point = dst_node; /* takes over the lookup reference */
+  copy_path(mounts[midx].target, sizeof(mounts[midx].target), dst);
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+
+  /* A working directory is a directory, not a path, so a process standing
+   * inside the moved subtree moves with it. Here the directory is remembered
+   * by name, so the name is what has to be rewritten — and switch_root depends
+   * on it: the chroot(".") it issues immediately after the move would
+   * otherwise resolve a path that no longer exists. */
+  for (usize i = 0; i < scheduler_task_slots(); i++) {
+    struct task *t = scheduler_task_slot(i);
+    if (t)
+      retarget_under(t->cwd, sizeof(t->cwd), src, dst);
+  }
+
+  /* Cached name→node answers still point through the old mountpoint. */
+  dcache_invalidate_node(old_mp);
+  dcache_invalidate_node(dst_node);
+  vfs_node_put(old_mp);
+  vfs_node_put(src_node);
+  return 0;
+}
+
 int vfs_umount(const char *target) {
   if (!target)
     return -EINVAL;
@@ -4997,8 +5373,8 @@ int vfs_umount(const char *target) {
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 
-  for (usize i = 0; i < MAX_MOUNTS; i++) {
-    if (mounts[i].used && strcmp(mounts[i].target, target) == 0) {
+  for (usize i = 0; i < mount_slots; i++) {
+    if (mount_visible(i) && strcmp(mounts[i].target, target) == 0) {
       if (strcmp(target, "/") == 0) {
         __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
         return -EBUSY;
@@ -5007,7 +5383,8 @@ int vfs_umount(const char *target) {
       /* Basic busy check: if root_node has other refs than our mount entry.
        * Acquire-load: pairs with the atomic refcount updates so a ref taken
        * on another CPU just before umount is observed. */
-      if (__atomic_load_n(&mounts[i].root_node->refcount, __ATOMIC_ACQUIRE) > 1) {
+      if (__atomic_load_n(&mounts[i].root_node->refcount, __ATOMIC_ACQUIRE) >
+          (int)mount_root_refs(mounts[i].root_node)) {
         __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
         return -EBUSY;
       }
@@ -5015,9 +5392,14 @@ int vfs_umount(const char *target) {
       struct vfs_node *root = mounts[i].root_node;
       struct vfs_node *mp = mounts[i].mount_point;
       u32 fs_id = (root && root->inode) ? root->inode->fs_id : 0;
+      /* The filesystem is only really going away when this was its last mount
+       * entry across every namespace — another namespace's copy still uses it,
+       * so tearing the superblock down here would pull it out from under the
+       * tasks in that namespace. */
+      int last_ref = (mount_root_refs(root) <= 1);
 
       /* Call filesystem umount callback if available (e.g. JBD RECOVER flag) */
-      if (mounts[i].fstype[0]) {
+      if (last_ref && mounts[i].fstype[0]) {
         struct vfs_fs *fs = filesystems;
         while (fs) {
           if (strcmp(fs->name, mounts[i].fstype) == 0) {
@@ -5035,14 +5417,15 @@ int vfs_umount(const char *target) {
       __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
       module_put(owner);
 
-      if (root && root->inode && root->inode->blk_dev) {
+      if (last_ref && root && root->inode && root->inode->blk_dev) {
         blk_cache_flush(root->inode->blk_dev);
         blk_cache_invalidate(root->inode->blk_dev);
       }
 
       vfs_node_put(root);
       vfs_node_put(mp);
-      icache_invalidate_fs(fs_id);
+      if (last_ref)
+        icache_invalidate_fs(fs_id);
       return 0;
     }
   }
@@ -5050,13 +5433,327 @@ int vfs_umount(const char *target) {
   return -EINVAL;
 }
 
+/* pivot_root(2) — make new_root the root and park the old one at put_old.
+ *
+ * What an initramfs does last: it has mounted the real filesystem somewhere
+ * under itself, and now wants that filesystem to be "/" without rebooting.
+ * That is what busybox switch_root drives, and the reason M109 wanted it.
+ *
+ * b1nix does not replace root_node on a root mount — it records a mounts[]
+ * entry whose target is "/", and every lookup that starts at root_node calls
+ * vfs_cross_root_mount() to step onto it. So a pivot is a retarget of two
+ * entries rather than a rebuild of the tree: the new root's entry becomes "/",
+ * and the old root becomes an ordinary mount at put_old, reached through the
+ * put_old directory node exactly like any other mount point.
+ *
+ * The old root is not always an entry already: booted on the initramfs there
+ * is no "/" mount at all, only the synthetic root_node. In that case an entry
+ * is created for it, so the old root really is still reachable at put_old
+ * afterwards (and can be umounted there) rather than merely being orphaned.
+ */
+/* A mount at "/" is attached to the global root node — that is the node a path
+ * walk arrives at, and the one vfs_mount records when the target is "/". An
+ * entry that becomes the root through a pivot has to be re-pointed at it, or
+ * it keeps naming the directory it used to be mounted on and every path built
+ * by walking up out of that filesystem (getcwd, /proc/<pid>/cwd) is prefixed
+ * with a place the root is no longer at. */
+static void vfs_pivot_reroot_mp(struct vfs_mount_entry *m) {
+  struct vfs_node *prev = m->mount_point;
+  m->mount_point = vfs_node_get(root_node);
+  if (prev)
+    vfs_node_put(prev);
+}
+
+int vfs_pivot_root(const char *new_root, const char *put_old) {
+  if (!new_root || !put_old || !new_root[0] || !put_old[0])
+    return -EINVAL;
+
+  char *new_abs = kmalloc(VFS_MAX_PATH);
+  char *old_abs = kmalloc(VFS_MAX_PATH);
+  if (!new_abs || !old_abs) {
+    kfree(new_abs);
+    kfree(old_abs);
+    return -ENOMEM;
+  }
+  vfs_resolve_path(new_root, new_abs);
+  vfs_resolve_path(put_old, old_abs);
+
+  int rc = 0;
+  if (strcmp(new_abs, "/") == 0)
+    rc = -EBUSY; /* the new root must not be the current one */
+  /* put_old has to live under new_root, or unmounting the old root later
+   * would have to reach through the old root to find it. */
+  usize nlen = strlen(new_abs);
+  if (!rc && (strncmp(old_abs, new_abs, nlen) != 0 || old_abs[nlen] != '/'))
+    rc = -EINVAL;
+  if (rc) {
+    kfree(new_abs);
+    kfree(old_abs);
+    return rc;
+  }
+
+  struct vfs_node *old_mp = vfs_find_node(old_abs);
+  if (IS_ERR(old_mp) || !old_mp) {
+    kfree(new_abs);
+    kfree(old_abs);
+    return IS_ERR(old_mp) ? (int)PTR_ERR(old_mp) : -ENOENT;
+  }
+  if (old_mp->inode->type != VFS_DIRECTORY) {
+    vfs_node_put(old_mp);
+    kfree(new_abs);
+    kfree(old_abs);
+    return -ENOTDIR;
+  }
+  /* If something is already mounted at put_old, the lookup above crossed into
+   * it and returned that filesystem's root. What the old root has to be
+   * attached to is the DIRECTORY put_old names, not the root of whatever is
+   * covering it — attaching to the covering root would leave the directory
+   * with no mount pointing at it, and the path would stop resolving. */
+  for (struct vfs_node *mp = vfs_mount_point_of(old_mp); mp;
+       mp = vfs_mount_point_of(old_mp)) {
+    vfs_node_get(mp);
+    vfs_node_put(old_mp);
+    old_mp = mp;
+  }
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+
+  int nidx = -1, oidx = -1, freeidx = -1;
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mounts[i].used) {
+      if (freeidx < 0)
+        freeidx = (int)i;
+      continue;
+    }
+    if (strcmp(mounts[i].target, new_abs) == 0 && mounts[i].root_node)
+      nidx = (int)i;
+    else if (strcmp(mounts[i].target, "/") == 0)
+      oidx = (int)i;
+  }
+
+  if (nidx < 0) {
+    /* Linux says EINVAL when new_root is not a mount point, and it means it:
+     * pivoting onto a plain directory would leave "/" naming a subtree of the
+     * filesystem it is supposed to be replacing. */
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    vfs_node_put(old_mp);
+    kfree(new_abs);
+    kfree(old_abs);
+    return -EINVAL;
+  }
+
+  /* Every target string is a path in the OLD root's namespace, and the pivot
+   * renames the whole tree: what was <new_root>/x is about to be /x, and what
+   * was /y is about to be <put_old>/y. A target that keeps its old spelling
+   * is not cosmetic — umount() matches on it, and /proc/mounts is read from
+   * it — so they are all rewritten. `put_old_new` is what put_old is called
+   * once the pivot has happened. */
+  const char *put_old_new = old_abs + nlen; /* begins with '/' by the check above */
+
+  char *tmp = kmalloc(VFS_MAX_PATH);
+  if (!tmp) {
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    vfs_node_put(old_mp);
+    kfree(new_abs);
+    kfree(old_abs);
+    return -ENOMEM;
+  }
+
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mounts[i].used || (int)i == nidx || (int)i == oidx)
+      continue;
+    if (strcmp(mounts[i].target, new_abs) == 0) {
+      /* Another entry naming the new root itself — the same doubling as
+       * below, on the other side of the pivot. */
+      tmp[0] = '/';
+      tmp[1] = '\0';
+      vfs_pivot_reroot_mp(&mounts[i]);
+    } else if (strncmp(mounts[i].target, new_abs, nlen) == 0 &&
+               mounts[i].target[nlen] == '/') {
+      /* Was under the new root: drop the prefix. */
+      strncpy(tmp, mounts[i].target + nlen, VFS_MAX_PATH - 1);
+    } else if (strcmp(mounts[i].target, "/") == 0) {
+      /* Another entry claiming the old root — b1nix can have two, the
+       * initramfs and the filesystem mounted over it. Concatenating would
+       * spell it "<put_old>/", which is not a path anything matches. */
+      strncpy(tmp, put_old_new, VFS_MAX_PATH - 1);
+    } else {
+      /* Was on the old root: it moves with it. */
+      snprintf(tmp, VFS_MAX_PATH, "%s%s", put_old_new, mounts[i].target);
+    }
+    tmp[VFS_MAX_PATH - 1] = '\0';
+    strncpy(mounts[i].target, tmp, VFS_MAX_PATH - 1);
+    mounts[i].target[VFS_MAX_PATH - 1] = '\0';
+  }
+  kfree(tmp);
+
+  if (oidx >= 0) {
+    /* The old root was a real mount: it keeps its filesystem, its source and
+     * its module reference, and only changes where it is attached. */
+    struct vfs_node *prev_mp = mounts[oidx].mount_point;
+    strncpy(mounts[oidx].target, put_old_new, VFS_MAX_PATH - 1);
+    mounts[oidx].target[VFS_MAX_PATH - 1] = '\0';
+    mounts[oidx].mount_point = vfs_node_get(old_mp);
+    if (prev_mp)
+      vfs_node_put(prev_mp);
+  } else if (freeidx >= 0) {
+    /* Booted on the initramfs: the old root is the synthetic root_node and has
+     * no entry. Give it one so it stays reachable at put_old. */
+    mounts[freeidx].used = 1;
+    strncpy(mounts[freeidx].source, "rootfs", sizeof(mounts[freeidx].source) - 1);
+    mounts[freeidx].source[sizeof(mounts[freeidx].source) - 1] = '\0';
+    strncpy(mounts[freeidx].target, put_old_new, VFS_MAX_PATH - 1);
+    mounts[freeidx].target[VFS_MAX_PATH - 1] = '\0';
+    strncpy(mounts[freeidx].fstype, "rootfs", sizeof(mounts[freeidx].fstype) - 1);
+    mounts[freeidx].fstype[sizeof(mounts[freeidx].fstype) - 1] = '\0';
+    mounts[freeidx].flags = 0;
+    mounts[freeidx].root_node = vfs_node_get(root_node);
+    mounts[freeidx].mount_point = vfs_node_get(old_mp);
+    mounts[freeidx].owner = 0;
+  } else {
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    vfs_node_put(old_mp);
+    kfree(new_abs);
+    kfree(old_abs);
+    return -ENOMEM;
+  }
+
+  /* Last, so no lookup ever sees two entries claiming "/". */
+  mounts[nidx].target[0] = '/';
+  mounts[nidx].target[1] = '\0';
+  vfs_pivot_reroot_mp(&mounts[nidx]);
+
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  vfs_node_put(old_mp);
+  kfree(new_abs);
+  kfree(old_abs);
+
+  /* Same duty a root mount has: the device nodes made during early boot lived
+   * on the old root and are not reachable from the new one. */
+  vfs_repopulate_after_root_mount();
+  return 0;
+}
+
+/* ── M109: mount namespaces ───────────────────────────────────────────────
+ * A mount namespace is a private copy of this table. Cloning one duplicates
+ * every entry of the source namespace, taking a reference on both nodes (and
+ * on the module providing the filesystem) so the copy keeps the mount alive on
+ * its own; destroying one drops exactly those references again. The underlying
+ * superblock is shared, which is what Linux does too: unshare(CLONE_NEWNS)
+ * copies the mount tree, it does not re-mount the filesystems. */
+int vfs_mnt_ns_clone(u32 from_ns, u32 to_ns) {
+  if (to_ns == from_ns)
+    return -EINVAL;
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+
+  /* Count first: a partially copied namespace would be a namespace missing its
+   * root, so the copy is all-or-nothing. */
+  usize need = 0, have = 0;
+  for (usize i = 0; i < mount_slots; i++) {
+    if (mounts[i].used && mounts[i].mnt_ns == from_ns)
+      need++;
+    else if (!mounts[i].used)
+      have++;
+  }
+  if (need > have) {
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    return -ENOMEM;
+  }
+
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mounts[i].used || mounts[i].mnt_ns != from_ns)
+      continue;
+    for (usize j = 0; j < mount_slots; j++) {
+      if (mounts[j].used)
+        continue;
+      mounts[j] = mounts[i];
+      mounts[j].mnt_ns = to_ns;
+      if (mounts[j].root_node)
+        vfs_node_get(mounts[j].root_node);
+      if (mounts[j].mount_point)
+        vfs_node_get(mounts[j].mount_point);
+      if (mounts[j].owner && !try_module_get(mounts[j].owner))
+        mounts[j].owner = 0;
+      break;
+    }
+  }
+
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  return 0;
+}
+
+/* Entries detached per pass in vfs_mnt_ns_destroy.
+ *
+ * The references cannot be dropped under the mount lock, so detached entries
+ * are carried out of the locked scan and released after it. That buffer used to
+ * be three MAX_MOUNTS arrays on the stack, which was survivable only while
+ * MAX_MOUNTS was 64 — at the current ceiling it would be 96 KiB on a 32 KiB
+ * kernel stack. Draining in fixed batches keeps the stack cost constant (under
+ * a kilobyte) whatever the table capacity, and needs no allocation on a
+ * teardown path that must not fail. */
+#define MNT_RELEASE_BATCH 32
+
+void vfs_mnt_ns_destroy(u32 ns) {
+  if (ns == 0)
+    return; /* the initial namespace outlives everything */
+
+  for (;;) {
+    struct vfs_node *roots[MNT_RELEASE_BATCH];
+    struct vfs_node *mps[MNT_RELEASE_BATCH];
+    struct module *owners[MNT_RELEASE_BATCH];
+    usize n = 0;
+
+    while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+      scheduler_yield();
+
+    for (usize i = 0; i < mount_slots && n < MNT_RELEASE_BATCH; i++) {
+      if (!mounts[i].used || mounts[i].mnt_ns != ns)
+        continue;
+      /* Last entry anywhere for this filesystem: let it shut down properly, the
+       * same way vfs_umount() does. A filesystem another namespace still mounts
+       * is left alone. */
+      if (mount_root_refs(mounts[i].root_node) <= 1 && mounts[i].fstype[0]) {
+        for (struct vfs_fs *fs = filesystems; fs; fs = fs->next) {
+          if (strcmp(fs->name, mounts[i].fstype) != 0)
+            continue;
+          if (fs->umount && mounts[i].root_node)
+            fs->umount(mounts[i].root_node);
+          break;
+        }
+      }
+      roots[n] = mounts[i].root_node;
+      mps[n] = mounts[i].mount_point;
+      owners[n] = mounts[i].owner;
+      n++;
+      mounts[i].used = 0;
+      mounts[i].owner = 0;
+      mounts[i].root_node = 0;
+      mounts[i].mount_point = 0;
+    }
+
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+
+    if (n == 0)
+      return; /* nothing left in this namespace */
+
+    for (usize i = 0; i < n; i++) {
+      module_put(owners[i]);
+      vfs_node_put(roots[i]);
+      vfs_node_put(mps[i]);
+    }
+  }
+}
+
 isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries) {
   if (!out && max_entries > 0)
     return -EFAULT;
 
   usize count = 0;
-  for (usize i = 0; i < MAX_MOUNTS; i++) {
-    if (!mounts[i].used)
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mount_visible(i))
       continue;
     if (count < max_entries) {
       copy_path(out[count].source, sizeof(out[count].source), mounts[i].source);
@@ -5067,6 +5764,67 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries) {
     count++;
   }
   return (isize)count;
+}
+
+/* Directory cursor, high bit: the filesystem's half of a merged listing is
+ * done and the rest of the cursor is the dir_seq of the last in-memory child
+ * handed out. Below it the cursor is whatever the filesystem made it. */
+#define VFS_DIR_MEM_CURSOR ((usize)1 << (sizeof(usize) * 8 - 2))
+
+/* The live child of `dir` with the smallest dir_seq above `bound`, or NULL when
+ * there is none left.
+ *
+ * The sibling list is NOT ordered by dir_seq: vfs_attach_child appends to it
+ * while add_node (initramfs, and every filesystem that builds its tree through
+ * it) prepends. A cursor that means "every child up to this sequence has been
+ * handed out" therefore cannot resume at the next list position — against a
+ * prepending directory the first child returned carries the HIGHEST sequence
+ * and every remaining sibling is then below the bound, which is why such a
+ * directory listed exactly one entry. Picking the next sequence each time is
+ * independent of the order the list happens to be in. */
+static struct vfs_node *next_child_by_seq(struct vfs_node *dir, u64 bound) {
+  struct vfs_node *best = 0;
+
+  for (struct vfs_node *c = dir->first_child; c; c = c->next_sibling) {
+    if (c->deleted || !c->inode)
+      continue;
+    if (c->dir_seq == 0)
+      c->dir_seq = dir_seq_next(); /* alloc_node assigns one; belt and braces */
+    if (bound && c->dir_seq <= bound)
+      continue;
+    if (!best || c->dir_seq < best->dir_seq)
+      best = c;
+  }
+  return best;
+}
+
+/* Remove from a filesystem's batch every name that an in-memory child of `dir`
+ * already owns, so a merged listing reports each name once and the in-memory
+ * node is the one it reports. Returns how many entries are left. */
+static isize vfs_drop_shadowed_entries(struct vfs_node *dir, struct dirent *buf,
+                                       isize count) {
+  isize kept = 0;
+  u64 tflags;
+
+  vfs_tree_read_acquire(&tflags);
+  for (isize i = 0; i < count; i++) {
+    int shadowed = 0;
+    for (struct vfs_node *c = dir->first_child; c; c = c->next_sibling) {
+      if (c->deleted || !c->inode)
+        continue;
+      if (strcmp(c->name, buf[i].name) == 0) {
+        shadowed = 1;
+        break;
+      }
+    }
+    if (shadowed)
+      continue;
+    if (kept != i)
+      buf[kept] = buf[i];
+    kept++;
+  }
+  vfs_tree_read_release(tflags);
+  return kept;
 }
 
 isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
@@ -5093,16 +5851,18 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
      * which shifts every surviving entry down when one is removed and so makes
      * a delete-as-you-go walk (rm -rf) skip one entry per deletion.
      *
-     * Children are APPENDED to the sibling list (vfs_attach_child), so the list
-     * runs from oldest to newest and dir_seq ASCENDS along it. The cursor is
-     * therefore a lower bound: emit children whose seq is above the last one
-     * emitted. Cookies 0 and 1 are "." and "..", and 2 means "children, no
+     * The cursor is a lower bound: emit children whose seq is above the last
+     * one emitted. Cookies 0 and 1 are "." and "..", and 2 means "children, no
      * bound yet"; a child cookie is seq+2, which is always >= 3.
      *
-     * This used to read the bound the other way round, from when children were
-     * prepended. Against an appending list the very first child raised the
-     * bound past every later sibling, so each such directory listed exactly one
-     * entry no matter how many it held. */
+     * The walk does NOT assume the sibling list is in dir_seq order. Most
+     * children are appended (vfs_attach_child) and so ascend, but several
+     * paths — vfs_add_node's intermediate directories, rename, and the
+     * mkdir/create helpers — PREPEND, which puts a high seq at the head. Read
+     * as "skip anything at or below the bound", such a list stopped dead after
+     * its newest child: `ls /dev` listed the four entries created last and none
+     * of the device nodes. So each step picks the smallest seq still above the
+     * bound, which is the same order regardless of how the list is linked. */
     u64 cookie = (u64)offset;
     usize count = 0;
     if (cookie == 0 && count < max_entries) {
@@ -5126,17 +5886,9 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     u64 seq_above = (cookie > 2) ? (cookie - 2) : 0; /* 0 = no bound */
     u64 tflags;
     vfs_tree_read_acquire(&tflags);
-    for (struct vfs_node *child = dir->first_child; child && count < max_entries;
-         child = child->next_sibling) {
-      if (child->deleted)
-        continue;
-      if (child->dir_seq == 0) {
-        /* Should not happen (alloc_node assigns one), but a zero here used to
-         * mean an endless walk; give it a number instead. */
-        child->dir_seq = dir_seq_next();
-      }
-      if (seq_above && child->dir_seq <= seq_above)
-        continue; /* already returned in an earlier batch */
+    for (struct vfs_node *child = next_child_by_seq(dir, seq_above);
+         child && count < max_entries;
+         child = next_child_by_seq(dir, seq_above)) {
       copy_path(buf[count].name, 64, child->name);
       buf[count].type = (u32)child->inode->type;
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
@@ -5144,6 +5896,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
       buf[count].size = child->inode->size;
       buf[count].ino = child->inode->ino;
       count++;
+      seq_above = child->dir_seq;
       cookie = child->dir_seq + 2;
     }
     vfs_tree_read_release(tflags);
@@ -5153,19 +5906,76 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     goto out;
   }
 
-  if (dir->inode->readdir_at_cb) {
-    u64 next = (u64)offset;
-    res = dir->inode->readdir_at_cb(dir, (u64)offset, buf, max_entries, &next);
-    if (res > 0)
-      h->offset = (usize)next;
-    goto out;
-  }
+  if (dir->inode->readdir_at_cb || dir->inode->readdir_cb) {
+    /* A directory on a real filesystem can still carry in-memory children:
+     * that is what /dev is after the root switch — the block-device nodes are
+     * attached to the directory in RAM while the names on the image come off
+     * the disk. Listing only one of the two halves loses the other, and it was
+     * the device nodes that were lost, so `blkid` and `findfs` found nothing
+     * to scan.
+     *
+     * Both halves are handed out, the in-memory one last, with a name that
+     * exists in both served from memory only — the devtmpfs-over-disk layout.
+     *
+     * The two halves share ONE cursor, h->offset, because that is the only
+     * thing a caller can save and restore: the getdents shim pushes an entry
+     * that does not fit back with an lseek to the cursor it read before it, and
+     * a second cursor kept beside it would not come back with it. Below
+     * VFS_DIR_MEM_CURSOR the cursor is the filesystem's own opaque cookie;
+     * above it, the dir_seq of the last in-memory child handed out. */
+    int merge = !dir->inode->readdir_lists_children;
 
-  if (dir->inode->readdir_cb) {
-    res = dir->inode->readdir_cb(dir, offset, buf, max_entries);
-    if (res > 0) {
-      h->offset += (usize)res;
+    while (!(h->offset & VFS_DIR_MEM_CURSOR)) {
+      if (dir->inode->readdir_at_cb) {
+        u64 next = (u64)h->offset;
+        res = dir->inode->readdir_at_cb(dir, (u64)h->offset, buf, max_entries,
+                                        &next);
+        if (res > 0)
+          h->offset = (usize)next;
+      } else {
+        res = dir->inode->readdir_cb(dir, h->offset, buf, max_entries);
+        if (res > 0)
+          h->offset += (usize)res;
+      }
+      if (res < 0)
+        goto out;
+      if (res == 0) {
+        h->offset = VFS_DIR_MEM_CURSOR; /* filesystem exhausted */
+        break;
+      }
+      if (!merge)
+        goto out;
+      res = vfs_drop_shadowed_entries(dir, buf, res);
+      if (res > 0)
+        goto out;
+      /* Every name in this batch was shadowed by an in-memory child. Returning
+       * zero here would read as end-of-directory, so fetch the next batch. */
     }
+
+    if (!merge) {
+      res = 0;
+      goto out;
+    }
+
+    u64 seq_above = (u64)(h->offset & ~VFS_DIR_MEM_CURSOR); /* 0 = no bound */
+    usize count = 0;
+    u64 tflags;
+    vfs_tree_read_acquire(&tflags);
+    for (struct vfs_node *child = next_child_by_seq(dir, seq_above);
+         child && count < max_entries;
+         child = next_child_by_seq(dir, seq_above)) {
+      copy_path(buf[count].name, 64, child->name);
+      buf[count].type = (u32)child->inode->type;
+      buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
+      buf[count].is_exec = 0;
+      buf[count].size = child->inode->size;
+      buf[count].ino = child->inode->ino;
+      count++;
+      seq_above = child->dir_seq;
+      h->offset = VFS_DIR_MEM_CURSOR | (usize)seq_above;
+    }
+    vfs_tree_read_release(tflags);
+    res = (isize)count;
     goto out;
   }
 
@@ -5271,10 +6081,10 @@ static int vfs_dup_min(int oldfd, int minfd) {
   struct vfs_handle *old_handle = scheduler_fd_get(oldfd);
   if (!old_handle)
     return -EBADF;
-  if (minfd < 0 || (usize)minfd >= SCHED_MAX_FD_LIMIT)
+  if (minfd < 0 || (usize)minfd >= sched_fd_limit())
     return -EINVAL;
 
-  usize limit = SCHED_MAX_FD_LIMIT;
+  usize limit = sched_fd_limit();
   struct rlimit rlim;
   if (scheduler_getrlimit(RLIMIT_NOFILE, &rlim) == 0 && rlim.rlim_cur < limit)
     limit = rlim.rlim_cur;
@@ -5296,7 +6106,7 @@ int vfs_dup2(int oldfd, int newfd) {
   struct vfs_handle *old_handle = scheduler_fd_get(oldfd);
   if (!old_handle)
     return -EBADF;
-  if (newfd < 0 || (usize)newfd >= SCHED_MAX_FD_LIMIT)
+  if (newfd < 0 || (usize)newfd >= sched_fd_limit())
     return -EBADF;
 
   struct rlimit rlim;
@@ -5362,7 +6172,19 @@ int vfs_get_node_path(struct vfs_node *node, char *buf, usize buf_len) {
   return 0;
 }
 
+/* Where an ftruncate spends itself: the filesystem's own truncate, the page
+ * cache work around it, or the zero-filling fallback. The browser calls this
+ * for every shared-memory region it creates, so the split matters.
+ * `b1nix.trace-ftruncate`. */
+static inline u64 ftr_now(void) {
+  u32 lo, hi;
+
+  __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+  return ((u64)hi << 32) | lo;
+}
+
 int vfs_ftruncate(int fd, u64 length) {
+  u64 ftr_t0 = ftr_now();
   struct vfs_handle *h = get_handle(fd);
   if (!h || !h->used)
     return -EBADF;
@@ -5379,6 +6201,11 @@ int vfs_ftruncate(int fd, u64 length) {
 
   if ((h->flags & 3) == B1NIX_O_RDONLY)
     return -EINVAL;
+
+  /* M109 chattr: truncation changes the contents and shortens the file, which
+   * both immutable and append-only forbid. */
+  if (inode->attr & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND))
+    return -EPERM;
 
   vfs_inode_lock(inode);
 
@@ -5421,7 +6248,16 @@ int vfs_ftruncate(int fd, u64 length) {
      * region big enough to use. A truncate_cb sets the size itself, and the
      * new bytes read as zeroes because that is what growing a file means. */
     if (length > inode->size && inode->write_cb && !inode->truncate_cb) {
-      char *zeroes = kzalloc(4096);
+      /* One page per write_cb call made growing a file a page-at-a-time walk
+       * through the whole filesystem write path; the buffer is on the heap, so
+       * it may as well be the 64 KiB Linux moves per iteration in its own
+       * zero-filling loops. A page is the fallback when the heap is tight. */
+      usize zsize = 64 * 1024;
+      char *zeroes = kzalloc(zsize);
+      if (!zeroes) {
+        zsize = 4096;
+        zeroes = kzalloc(zsize);
+      }
       if (!zeroes) {
         vfs_inode_unlock(inode);
         return -ENOMEM;
@@ -5429,8 +6265,8 @@ int vfs_ftruncate(int fd, u64 length) {
       u64 off = inode->size;
       while (off < length) {
         usize chunk = (usize)(length - off);
-        if (chunk > 4096)
-          chunk = 4096;
+        if (chunk > zsize)
+          chunk = zsize;
         isize written = inode->write_cb(node, off, zeroes, chunk, h->flags);
         if (written < 0) {
           kfree(zeroes);
@@ -5452,7 +6288,20 @@ int vfs_ftruncate(int fd, u64 length) {
     }
 
     if (inode->truncate_cb) {
+      u64 t_cb0 = ftr_now();
       int res = inode->truncate_cb(node, length);
+      u64 t_cb1 = ftr_now();
+
+      if (bootinfo_has_flag("b1nix.trace-ftruncate") &&
+          (t_cb1 - ftr_t0) > 10000000ULL) {
+        console_write("ftruncate: len=");
+        console_write_dec(length / 1024);
+        console_write("K total=");
+        console_write_dec((t_cb1 - ftr_t0) / 1000000);
+        console_write("M cb=");
+        console_write_dec((t_cb1 - t_cb0) / 1000000);
+        console_write("M\n");
+      }
       vfs_inode_unlock(inode);
       if (res < 0) {
         char b[80];
@@ -5554,9 +6403,27 @@ static int memfd_truncate(struct vfs_node *node, u64 length) {
         return -EFBIG;
       new_cap *= 2;
     }
+    /* How long a large region takes to materialise, and how large it was.
+     * Chromium creates shared-memory regions on the browser's UI thread, so
+     * this allocation is on the critical path of every mojo data pipe.
+     * `b1nix.trace-memfd`. */
+    u32 t_lo, t_hi;
+
+    __asm__ volatile("rdtsc" : "=a"(t_lo), "=d"(t_hi));
+    u64 t0 = ((u64)t_hi << 32) | t_lo;
     void *new_data = kzalloc(new_cap);
     if (!new_data)
       return -ENOMEM;
+    if (new_cap >= (1u << 20) && bootinfo_has_flag("b1nix.trace-memfd")) {
+      u32 e_lo, e_hi;
+
+      __asm__ volatile("rdtsc" : "=a"(e_lo), "=d"(e_hi));
+      console_write("memfd: grew to ");
+      console_write_dec(new_cap / 1024);
+      console_write(" KiB in ");
+      console_write_dec(((((u64)e_hi << 32) | e_lo) - t0) / 1000000);
+      console_write(" Mcycles\n");
+    }
     if (inode->data) {
       memcpy(new_data, inode->data, inode->size);
       if (inode->flags & VFS_NODE_OWNS_DATA)
@@ -5715,6 +6582,88 @@ int vfs_fcntl(int fd, int cmd, u64 arg) {
   }
 }
 
+/* ── M109: FS_IOC_GETFLAGS / FS_IOC_SETFLAGS (chattr, lsattr) ──────────────
+ * Linux spells the argument `long` in the ioctl number but its own handlers
+ * copy an `int`, and both e2fsprogs and BusyBox pass an int — so this copies
+ * four bytes, matching what the callers actually hand over. */
+static int vfs_ioctl_fsflags(struct vfs_node *node, int nr, void *arg) {
+  struct vfs_inode *inode = node->inode;
+  if (!arg)
+    return -EFAULT;
+  /* Attributes belong to files and directories. A device node has none. */
+  if (inode->type != VFS_FILE && inode->type != VFS_DIRECTORY)
+    return -ENOTTY;
+
+  if (nr == 1) { /* FS_IOC_GETFLAGS */
+    int flags = (int)(inode->attr & VFS_ATTR_USER_MASK);
+    return syscall_copyout(arg, &flags, sizeof(flags)) < 0 ? -EFAULT : 0;
+  }
+
+  int want = 0;
+  if (syscall_copyin(&want, arg, sizeof(want)) < 0)
+    return -EFAULT;
+  u32 attr = (u32)want;
+  /* Everything above the low byte is the filesystem's own business (extents,
+   * inline data, ...). Refuse to pretend we stored a flag we cannot. */
+  if (attr & ~VFS_ATTR_USER_MASK)
+    return -EOPNOTSUPP;
+
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(node);
+  if (mnt && (mnt->flags & MS_RDONLY))
+    return -EROFS;
+
+  const struct cred *cred = get_current_cred();
+  if (cred && cred->euid != ROOT_UID && cred->euid != inode->uid)
+    return -EPERM;
+  /* Only root may raise or lower immutable/append-only. Letting the owner do
+   * it would make both flags decorative: the owner would simply take the flag
+   * off and then do whatever it was meant to prevent. */
+  if (cred && cred->euid != ROOT_UID &&
+      ((attr ^ inode->attr) & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND)))
+    return -EPERM;
+
+  /* A filesystem that cannot store the flags says so rather than accepting
+   * them and forgetting at umount: a chattr that silently does not stick is
+   * worse than one that fails. GETFLAGS above still answers for everyone. */
+  if (!inode->setflags_cb)
+    return -EOPNOTSUPP;
+
+  u32 old = inode->attr;
+  inode->attr = attr;
+  int err = inode->setflags_cb(node, attr);
+  if (err < 0) {
+    inode->attr = old;
+    return err;
+  }
+  return 0;
+}
+
+/* FITRIM (fstrim): hand every free range of the filesystem this node lives on
+ * back to the device. Issued on the mount point, which is a directory — hence
+ * handled before vfs_ioctl's "device nodes only" rule. */
+static int vfs_ioctl_fitrim(struct vfs_node *node, void *arg) {
+  struct fstrim_range_k {
+    u64 start;
+    u64 len;
+    u64 minlen;
+  } range;
+  if (!arg || syscall_copyin(&range, arg, sizeof(range)) < 0)
+    return -EFAULT;
+  const struct cred *cred = get_current_cred();
+  if (cred && cred->euid != ROOT_UID)
+    return -EPERM;
+  if (!node->inode->fitrim_cb)
+    return -EOPNOTSUPP;
+  u64 trimmed = 0;
+  int err = node->inode->fitrim_cb(node, range.start, range.len, range.minlen,
+                                   &trimmed);
+  if (err < 0)
+    return err;
+  /* fstrim prints the returned len as "N bytes were trimmed". */
+  range.len = trimmed;
+  return syscall_copyout(arg, &range, sizeof(range)) < 0 ? -EFAULT : 0;
+}
+
 int vfs_ioctl(int fd, u64 request, void *arg) {
   /* Handles with their own ioctl op (pty master/slave) take priority — they
    * are raw handles with no backing VFS node. */
@@ -5725,8 +6674,21 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
-  if (node->inode->type != VFS_DEVICE)
+  if (node->inode->type != VFS_DEVICE) {
+    /* M109: the two ioctl families that are issued on ordinary files and
+     * directories rather than on device nodes — inode attributes
+     * (chattr/lsattr) and FITRIM (fstrim). Matched on ioctl type + command
+     * number, ignoring the size/direction bits, as the block ioctls below are.
+     * Kept inside the non-device branch so no device's own ioctl hook can be
+     * shadowed by a type byte that happens to collide. */
+    u8 type = (u8)((request >> 8) & 0xFF);
+    u8 nr = (u8)(request & 0xFF);
+    if (type == 'f' && (nr == 1 || nr == 2))
+      return vfs_ioctl_fsflags(node, nr, arg);
+    if (type == 'X' && nr == 121)
+      return vfs_ioctl_fitrim(node, arg);
     return -EINVAL;
+  }
 
   /* Devices with their own ioctl hook (M47 /dev/fb0) dispatch before the
    * legacy name-based special cases below. */
@@ -5789,6 +6751,51 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
       return blk_rescan_partitions(bd) == 0 ? 0 : -EIO;
     case 0x61: /* BLKFLSBUF: flush buffers — accept */
       return 0;
+    case 0x77: { /* BLKDISCARD: byte range {start, len} */
+      u64 r[2];
+      if (syscall_copyin(r, arg, sizeof(r)) < 0)
+        return -EFAULT;
+      if ((r[0] % 512) || (r[1] % 512) || r[1] == 0)
+        return -EINVAL;
+      if (r[0] + r[1] > bytes || r[0] + r[1] < r[0])
+        return -EINVAL;
+      return blk_discard_blocks(bd, r[0] / 512, (u32)(r[1] / 512));
+    }
+    case 0x7D: /* BLKSECDISCARD: a secure erase b1nix cannot promise. */
+      return -EOPNOTSUPP;
+    case 0x7F: { /* BLKZEROOUT: byte range {start, len} */
+      u64 r[2];
+      if (syscall_copyin(r, arg, sizeof(r)) < 0)
+        return -EFAULT;
+      if ((r[0] % 512) || (r[1] % 512) || r[1] == 0)
+        return -EINVAL;
+      if (r[0] + r[1] > bytes || r[0] + r[1] < r[0])
+        return -EINVAL;
+      return blk_zero_blocks(bd, r[0] / 512, (u32)(r[1] / 512)) == 0 ? 0 : -EIO;
+    }
+    case 0x7C: { /* BLKDISCARDZEROES: does a discard leave zeroes behind? */
+      /* No: nothing here promises the content of a discarded range, which is
+       * exactly why blk_discard_blocks has no zero-writing fallback. */
+      int z = 0;
+      return syscall_copyout(arg, &z, sizeof(z)) < 0 ? -EFAULT : 0;
+    }
+    case 0x7E: { /* BLKROTATIONAL */
+      int rot = bd->rotational ? 1 : 0;
+      return syscall_copyout(arg, &rot, sizeof(rot)) < 0 ? -EFAULT : 0;
+    }
+    case 0x78:   /* BLKIOMIN */
+    case 0x79:   /* BLKIOOPT */
+    case 0x7B: { /* BLKPBSZGET: physical block size */
+      /* One 512-byte block in, one out: no device here reports a physical
+       * block larger than its logical one, and inventing a number would make
+       * mkfs align to a boundary that does not exist. */
+      unsigned int v = (unsigned int)(bd->block_size ? bd->block_size : 512);
+      return syscall_copyout(arg, &v, sizeof(v)) < 0 ? -EFAULT : 0;
+    }
+    case 0x7A: { /* BLKALIGNOFF: alignment offset */
+      int off = 0;
+      return syscall_copyout(arg, &off, sizeof(off)) < 0 ? -EFAULT : 0;
+    }
     case 0x5E: { /* BLKROGET: is the device read-only? */
       /* Real information rather than a constant: a loop device associated
        * through a read-only descriptor refuses writes, and blockdev --getro

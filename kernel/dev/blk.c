@@ -1,9 +1,13 @@
+#include <b1nix/lapic.h>
 #include <b1nix/blk.h>
+#include <b1nix/bootinfo.h>
+#include <b1nix/acpi.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/vfs.h>
+#include <b1nix/uevent.h>
 #include <b1nix/errno.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -27,7 +31,7 @@
  * 65536 entries is 32 MiB — still well under 1% of an 8 GiB guest, and the
  * per-RAM rule below keeps small guests small: it reaches this ceiling only at
  * 8 GiB, and a 512 MiB self-host guest still gets the same 4 MiB it had. */
-#define CACHE_ENTRIES_MAX 65536
+#define CACHE_ENTRIES_MAX 262144
 #define CACHE_BLOCK_SIZE 512
 
 /* Read-ahead window (sectors) pulled in ONE device command on a cache miss.
@@ -38,13 +42,66 @@
  * populating the neighbouring cache slots from the data already in hand turns
  * a sequential stream into ~1 command per RA sectors. Under KVM the per-command
  * cost is the polled-completion VM-exits (roughly constant), so a bigger window
- * means fewer commands and higher throughput. 512 * 512 = 256 KiB per command —
- * a robust kmalloc size even under the low-RAM self-host, and well under
- * ahci_build_prdt's 248 PRD-entry cap. */
-#define BCACHE_READAHEAD 512
+ * means fewer commands and higher throughput.
+ *
+ * The window is a system-wide default in kilobytes, exactly as Linux expresses
+ * read_ahead_kb (its default is 128 KiB; ours is 256 KiB because the polled
+ * completion path makes a command dearer here than it is there), clamped per
+ * device to what one command to THAT device can carry — the AHCI PRDT, the
+ * virtio descriptor chain and the NVMe PRP list all differ, and a constant that
+ * fits the smallest of them wastes the others. `b1nix.read-ahead-kb=N`
+ * overrides the default; 0 disables read-ahead entirely.
+ *
+ * The 256 KiB default is measured, not chosen: at 64 KiB a demand-paging fault
+ * cost 17.6 ms and at 256 KiB it cost 0.157 ms — a hundredfold, on the same
+ * kernel and the same workload. The reason is not the transfer but the request:
+ * a virtio request that does not complete promptly stalls until its watchdog
+ * re-poll, and a large read amortises that stall over five hundred sectors
+ * instead of sixty-four. */
+#define BCACHE_READAHEAD_KB_DEF 256u
+#define BCACHE_READAHEAD_DEF (BCACHE_READAHEAD_KB_DEF * 1024u / CACHE_BLOCK_SIZE)
+static u32 bcache_ra_sectors = BCACHE_READAHEAD_DEF;
+
+/* Who the writes happening on this CPU belong to. The filesystem sets it
+ * around a file's write so the block cache can record an owner for each block
+ * it dirties, and fsync can then write back that file instead of the whole
+ * device. Per-CPU because two CPUs write different files at the same time. */
+#define BLK_OWNER_CPUS 64
+static struct { u32 fsid; u64 ino; } blk_dirty_owner[BLK_OWNER_CPUS];
+
+static unsigned blk_owner_slot(void) {
+  struct percpu *pc = get_percpu();
+
+  return pc ? (unsigned)(pc->cpu_id % BLK_OWNER_CPUS) : 0;
+}
+
+void blk_set_dirty_owner(u32 fsid, u64 ino) {
+  unsigned s = blk_owner_slot();
+
+  blk_dirty_owner[s].fsid = fsid;
+  blk_dirty_owner[s].ino = ino;
+}
+
+void blk_clear_dirty_owner(void) {
+  unsigned s = blk_owner_slot();
+
+  blk_dirty_owner[s].fsid = 0;
+  blk_dirty_owner[s].ino = 0;
+}
 
 static struct block_device *blk_devices[MAX_BLK_DEVICES];
 static usize blk_device_count = 0;
+
+/* Bumped every time a device joins or leaves the registry. Anything that
+ * caches a view of the registry — /sys/block and its two mirrors — compares
+ * this against what it built from and rebuilds only when it differs, so a
+ * readdir of /sys costs one integer load in the common case where nothing has
+ * been plugged in since. */
+static volatile u32 blk_gen = 1;
+
+u32 blk_generation(void) {
+  return __atomic_load_n(&blk_gen, __ATOMIC_ACQUIRE);
+}
 
 struct partition_device {
   struct block_device blk;
@@ -75,21 +132,30 @@ static spinlock_t bcache_lock = SPINLOCK_INIT;
  * per cache lookup, and dominated gcc execve wall-clock (turning a 5 s
  * binary load into a 30 s one). Hash sized so average chain length stays
  * below ~8 even at CACHE_ENTRIES_MAX. */
-/* Sized against CACHE_ENTRIES_MAX so the average chain stays short: 16384
- * buckets for at most 65536 entries is ~4 per chain. At 10 bits the enlarged
- * pool would have averaged 64 comparisons per lookup and given back in search
- * time what the extra cache saved in I/O. */
-#define BCACHE_HASH_BITS 14
-#define BCACHE_HASH_SIZE (1u << BCACHE_HASH_BITS)
-#define BCACHE_HASH_MASK (BCACHE_HASH_SIZE - 1u)
-static i32 bcache_hash[BCACHE_HASH_SIZE];
+/* Sized from the pool it actually indexes, not from the pool's ceiling. The
+ * pool scales with RAM; a fixed 16384-bucket table was 64 KiB of BSS a 256 MiB
+ * guest never needed and, had the ceiling ever risen, the one cache dimension
+ * that would not have followed. Linux builds its dentry and inode hashes the
+ * same way in alloc_large_system_hash(): a power of two derived from how many
+ * objects there will be. One bucket per four entries keeps the average chain at
+ * four, which is what the measurement above wanted. */
+/* The ceiling is derived from the pool it indexes rather than written down: at
+ * one bucket per four entries, CACHE_ENTRIES_MAX entries want
+ * CACHE_ENTRIES_MAX/4 buckets, and a constant here would silently break that
+ * invariant the next time the pool ceiling is raised — the table would stop
+ * growing and the chains would lengthen instead, which is exactly the failure
+ * this sizing exists to prevent. */
+#define BCACHE_HASH_MIN_BITS 10
+#define BCACHE_HASH_MAX_ENTRIES (CACHE_ENTRIES_MAX / 4u)
+static i32 *bcache_hash;
+static u32 bcache_hash_mask;
 
 static inline u32 bcache_bucket(struct block_device *dev, u64 lba) {
   /* Spread bdev pointer bits across the lba — both are dense in low bits,
    * a plain XOR would collide for sequential reads from the same device. */
   u64 m = (u64)(usize)dev * 0x9E3779B97F4A7C15ULL;
   m ^= lba * 0xC6BC279692B5C323ULL;
-  return (u32)((m ^ (m >> 32)) & BCACHE_HASH_MASK);
+  return (u32)((m ^ (m >> 32)) & bcache_hash_mask);
 }
 
 /* Caller must hold bcache_lock. Unlinks block_cache[idx] from its hash chain
@@ -180,14 +246,209 @@ static int partition_write(struct block_device *dev, u64 lba, u32 count,
   return blk_write_cached(part->parent, part->start_lba + lba, count, buffer);
 }
 
+u32 blk_max_sectors(struct block_device *dev) {
+  if (!dev || dev->limits.max_sectors == 0)
+    return BLK_DEF_MAX_SECTORS;
+  return dev->limits.max_sectors;
+}
+
+/* How many filesystem blocks of `block_size` a filesystem may fold into ONE
+ * device request. Derived from the device, not compiled in.
+ *
+ * A filesystem that finds a run of adjacent blocks issues it as a single
+ * blk_read_cached()/blk_write_cached() straight into the caller's buffer, so
+ * the real limit is what one command to THIS device can carry: the AHCI PRDT,
+ * the virtio descriptor chain and the NVMe PRP list all differ, and a constant
+ * that fits the smallest of them wastes the others. A flat 64 blocks made a
+ * 1 MiB read of a contiguous file four commands where one would have done.
+ *
+ * FLOOR   BLK_RUN_BLOCKS_MIN (16 blocks — 64 KiB at a 4 KiB block size). Below
+ *         this the per-request cost the coalescing exists to amortise comes
+ *         back, and a device reporting an implausibly small limit should not
+ *         disable the optimisation altogether.
+ * CEILING BLK_RUN_BLOCKS_MAX (512 blocks — 2 MiB at a 4 KiB block size).
+ *         Nothing is allocated per run, so this bounds only the request size,
+ *         and past 2 MiB one command stops getting cheaper per byte.
+ * `b1nix.fs-run-max=N` states the run directly, in filesystem blocks. */
+#define BLK_RUN_BLOCKS_MIN 16u
+#define BLK_RUN_BLOCKS_MAX 512u
+
+usize blk_run_blocks(struct block_device *dev, u32 block_size) {
+  u32 spb = block_size / 512; /* 512-byte sectors per filesystem block */
+  u32 blocks = spb ? blk_max_sectors(dev) / spb : 0;
+
+  blocks = bootinfo_get_u32("b1nix.fs-run-max", blocks);
+  if (blocks < BLK_RUN_BLOCKS_MIN)
+    blocks = BLK_RUN_BLOCKS_MIN;
+  if (blocks > BLK_RUN_BLOCKS_MAX)
+    blocks = BLK_RUN_BLOCKS_MAX;
+  return (usize)blocks;
+}
+
+/* Floor and ceiling for the adaptive window, both derived rather than fixed.
+ *
+ * The floor is what a single random touch is allowed to drag in — small enough
+ * that a scattered access pattern pays almost nothing for guessing wrong. The
+ * ceiling is the configured window (itself `b1nix.read-ahead-kb`) scaled by how
+ * much memory there is to hold what it reads, and clamped to what one command
+ * to this device can carry: read-ahead that cannot be cached is read twice. */
+#define BCACHE_RA_MIN_SECTORS 16u /* 8 KiB */
+
+static u32 blk_readahead_ceiling(struct block_device *dev) {
+  u32 want = blk_readahead_sectors(dev);
+  u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
+
+  /* A machine with room to spare reads further ahead; a small one would only
+   * evict what it just read. The steps are deliberately coarse — this decides
+   * an I/O size, not an allocation. */
+  if (ram_mb >= 2048)
+    want *= 4;
+  else if (ram_mb >= 1024)
+    want *= 2;
+  else if (ram_mb < 256)
+    want /= 2;
+
+  u32 dev_max = blk_max_sectors(dev);
+  if (want > dev_max)
+    want = dev_max;
+  if (want < BCACHE_RA_MIN_SECTORS)
+    want = BCACHE_RA_MIN_SECTORS;
+  return want;
+}
+
+u32 blk_readahead_for(struct block_device *dev, u64 lba) {
+  if (!dev)
+    return 1;
+  u32 ceiling = blk_readahead_ceiling(dev);
+  if (bcache_ra_sectors == 0)
+    return 1; /* read-ahead switched off on the command line */
+
+  u32 run = dev->ra_run;
+  if (dev->ra_run && lba == dev->ra_next) {
+    /* Continuing where the last window ended: this is a stream, so double it
+     * until the ceiling. */
+    run = run < ceiling / 2 ? run * 2 : ceiling;
+  } else {
+    /* A jump. Reading a quarter of a megabyte around a single random block is
+     * how a cold start read half a gigabyte for a working set a third that
+     * size, so start over from the floor and let a real stream earn the
+     * window back. */
+    run = BCACHE_RA_MIN_SECTORS;
+  }
+  if (run > ceiling)
+    run = ceiling;
+  dev->ra_run = run;
+  dev->ra_next = lba + run;
+  return run;
+}
+
+u32 blk_readahead_sectors(struct block_device *dev) {
+  u32 want = bcache_ra_sectors;
+  if (want == 0)
+    return 1; /* read-ahead switched off on the command line */
+  u32 dev_max = blk_max_sectors(dev);
+  return want < dev_max ? want : dev_max;
+}
+
+/* The /sys path this device is published at, with the /sys prefix stripped —
+ * what a uevent carries as DEVPATH and what mdev turns back into
+ * /sys/block/<name> to read the device's `dev` and `uevent` files. */
+static void blk_devpath(struct block_device *dev, char *out, usize cap) {
+  struct block_device *parent = blk_partition_parent(dev);
+  if (parent && parent->name)
+    snprintf(out, cap, "/block/%s/%s", parent->name, dev->name);
+  else
+    snprintf(out, cap, "/block/%s", dev->name);
+}
+
+/* Announce a device appearing or leaving. Harmless with nothing listening, so
+ * the drivers that register during early boot need no special case. */
+static void blk_announce(struct block_device *dev, usize index,
+                         const char *action) {
+  if (!dev || !dev->name)
+    return;
+  char devpath[96];
+  blk_devpath(dev, devpath, sizeof(devpath));
+  uevent_post(action, devpath, "block", dev->name, BLK_SYSFS_MAJOR,
+              (int)index);
+}
+
 static void blk_register_internal(struct block_device *dev,
                                   int scan_partitions) {
-  if (blk_device_count < MAX_BLK_DEVICES) {
-    blk_devices[blk_device_count++] = dev;
+  /* Normalise whatever the driver reported. Linux does the same in
+   * blk_validate_limits(): a queue that names no limit gets the generic
+   * defaults rather than a zero that every caller would have to test. */
+  if (dev) {
+    if (dev->limits.max_sectors == 0)
+      dev->limits.max_sectors = BLK_DEF_MAX_SECTORS;
+    if (dev->limits.max_segments == 0)
+      dev->limits.max_segments = BLK_DEF_MAX_SEGMENTS;
+    if (dev->limits.queue_depth == 0)
+      dev->limits.queue_depth = BLK_DEF_QUEUE_DEPTH;
   }
+  /* Reuse a hole left by an unregistered device before growing the array, so
+   * repeated LOOP_CTL_ADD/REMOVE cycles cannot exhaust it. The index is the
+   * minor number userspace sees, so it must stay put for everything else. */
+  usize index = MAX_BLK_DEVICES;
+  for (usize i = 0; i < blk_device_count; i++) {
+    if (!blk_devices[i]) {
+      index = i;
+      break;
+    }
+  }
+  if (index == MAX_BLK_DEVICES && blk_device_count < MAX_BLK_DEVICES)
+    index = blk_device_count++;
+  if (index == MAX_BLK_DEVICES)
+    return; /* registry full */
+  blk_devices[index] = dev;
+  __atomic_add_fetch(&blk_gen, 1u, __ATOMIC_ACQ_REL);
+  /* Publish in /sys BEFORE announcing it: mdev turns the event's DEVPATH
+   * straight back into /sys/block/<name>/dev, so the other order leaves a
+   * window on SMP where the helper looks the device up before it is there. */
+  sysfs_block_changed();
+  blk_announce(dev, index, "add");
   if (scan_partitions) {
     blk_scan_partitions(dev);
   }
+}
+
+/* Take a device out of the registry: a loop device destroyed through
+ * LOOP_CTL_REMOVE, and whatever else grows a removal path later.
+ *
+ * The slot is left empty rather than compacted, because the index IS the minor
+ * number that /sys/dev/block, /proc/partitions and every node userspace has
+ * already created name the device by — closing the gap would silently
+ * renumber every device above it. The node under /dev is deliberately not
+ * touched: on Linux that is udev's (here mdev's) job, and it acts on the
+ * remove uevent this raises. */
+int blk_unregister(struct block_device *dev) {
+  if (!dev)
+    return -EINVAL;
+  usize index = MAX_BLK_DEVICES;
+  for (usize i = 0; i < blk_device_count; i++) {
+    if (blk_devices[i] == dev) {
+      index = i;
+      break;
+    }
+  }
+  if (index == MAX_BLK_DEVICES)
+    return -ENODEV;
+
+  /* Nothing may be left referring to this device's blocks. */
+  blk_cache_flush(dev);
+  blk_cache_invalidate(dev);
+
+  blk_devices[index] = 0;
+  /* Trailing holes are not indexes anybody can still be holding, so give them
+   * back — that keeps blk_count() honest about the highest live minor. */
+  while (blk_device_count > 0 && !blk_devices[blk_device_count - 1])
+    blk_device_count--;
+  __atomic_add_fetch(&blk_gen, 1u, __ATOMIC_ACQ_REL);
+  /* Retire it from /sys first, for the same reason the add publishes first:
+   * by the time anything hears about the removal, the tree must agree. */
+  sysfs_block_changed();
+  blk_announce(dev, index, "remove");
+  return 0;
 }
 
 /* ── Device naming ──────────────────────────────────────────────────
@@ -337,6 +598,9 @@ static void register_partition(struct block_device *parent, usize number,
   part->blk.block_count = block_count;
   part->blk.read_blocks = partition_read;
   part->blk.write_blocks = parent->write_blocks ? partition_write : 0;
+  /* A partition is the same hardware as its disk — it inherits the disk's
+   * per-command limits rather than falling back to the generic defaults. */
+  part->blk.limits = parent->limits;
   part->blk.priv = part;
   blk_register_internal(&part->blk, 0);
 
@@ -488,6 +752,11 @@ int blk_rescan_partitions(struct block_device *dev) {
     blk_devices[out++] = candidate;
   }
   blk_device_count = out;
+  /* The compaction above removed devices without going through
+   * blk_unregister(), so nothing has told sysfs yet — and it also shifts the
+   * index (the minor) of everything that followed them. */
+  __atomic_add_fetch(&blk_gen, 1u, __ATOMIC_ACQ_REL);
+  sysfs_block_changed();
   blk_cache_invalidate(dev);
   blk_scan_partitions(dev);
   blk_create_dev_nodes();
@@ -498,7 +767,10 @@ void blk_register(struct block_device *dev) { blk_register_internal(dev, 1); }
 
 struct block_device *blk_get(const char *name) {
   for (usize i = 0; i < blk_device_count; i++) {
-    if (strcmp(blk_devices[i]->name, name) == 0) {
+    /* A slot emptied by blk_unregister() reads back NULL — the registry has
+     * holes now, and every walk of it has to expect one. */
+    if (blk_devices[i] && blk_devices[i]->name &&
+        strcmp(blk_devices[i]->name, name) == 0) {
       return blk_devices[i];
     }
   }
@@ -628,18 +900,140 @@ const char *blk_probe_fstype(struct block_device *dev) {
   return "-";
 }
 
+/* ── Volume identity: UUID and label ──
+ *
+ * What `findfs UUID=…`, `root=LABEL=…` and `lsblk -o UUID` are asking for. The
+ * ext lookup used to live twice in kernel/main.c, once for UUID and once for
+ * label, each opening the superblock itself and each understanding ext only.
+ * It belongs beside blk_probe_fstype: same read, same question — what is on
+ * this device — and one implementation covers FAT and exFAT as well.
+ *
+ * Both return 0 on success and fill a NUL-terminated string; -1 when the
+ * device carries nothing that has the field.
+ */
+static void hex2(char *out, u8 v) {
+  static const char digits[] = "0123456789abcdef";
+  out[0] = digits[(v >> 4) & 0xF];
+  out[1] = digits[v & 0xF];
+}
+
+/* Trim the trailing padding a fixed-width on-disk label field carries. */
+static void label_copy(char *out, usize cap, const char *raw, usize raw_len) {
+  usize n = raw_len < cap - 1 ? raw_len : cap - 1;
+  while (n > 0 && (raw[n - 1] == ' ' || raw[n - 1] == '\0'))
+    n--;
+  memcpy(out, raw, n);
+  out[n] = '\0';
+}
+
+int blk_probe_uuid(struct block_device *dev, char *out, usize cap) {
+  if (!dev || !out || cap < 37)
+    return -1;
+  out[0] = '\0';
+
+  /* Big enough to reach s_volume_name at 0x78+16: a 104-byte read (which is
+     all blk_probe_fstype needs) stops short of s_uuid at 0x68 entirely. */
+  u8 ext_sb[152];
+  if (blk_read_bytes(dev, 1024, ext_sb, sizeof(ext_sb)) == 0 &&
+      le16(ext_sb + 0x38) == 0xef53) {
+    /* s_uuid is at offset 0x68 of the ext superblock, printed in the canonical
+     * 8-4-4-4-12 form findfs and blkid compare against. */
+    const u8 *u = ext_sb + 0x68;
+    int p = 0;
+    for (int i = 0; i < 16; i++) {
+      if (i == 4 || i == 6 || i == 8 || i == 10)
+        out[p++] = '-';
+      hex2(out + p, u[i]);
+      p += 2;
+    }
+    out[p] = '\0';
+    return 0;
+  }
+
+  u8 boot[512];
+  if (blk_read_bytes(dev, 0, boot, sizeof(boot)) < 0)
+    return -1;
+
+  /* exFAT's volume serial is 32 bits at offset 100, FAT32's at 67 and
+   * FAT12/16's at 39 — all printed the way blkid prints them, XXXX-XXXX. */
+  const u8 *serial = 0;
+  if (memcmp(boot + 3, "EXFAT   ", 8) == 0)
+    serial = boot + 100;
+  else if (memcmp(boot + 82, "FAT32   ", 8) == 0)
+    serial = boot + 67;
+  else if (memcmp(boot + 54, "FAT16   ", 8) == 0 ||
+           memcmp(boot + 54, "FAT12   ", 8) == 0)
+    serial = boot + 39;
+  if (!serial)
+    return -1;
+
+  hex2(out + 0, serial[3]);
+  hex2(out + 2, serial[2]);
+  out[4] = '-';
+  hex2(out + 5, serial[1]);
+  hex2(out + 7, serial[0]);
+  out[9] = '\0';
+  return 0;
+}
+
+int blk_probe_label(struct block_device *dev, char *out, usize cap) {
+  if (!dev || !out || cap < 2)
+    return -1;
+  out[0] = '\0';
+
+  u8 ext_sb[152];
+  if (blk_read_bytes(dev, 1024, ext_sb, sizeof(ext_sb)) == 0 &&
+      le16(ext_sb + 0x38) == 0xef53) {
+    /* s_volume_name: 16 bytes at 0x78. */
+    label_copy(out, cap, (const char *)(ext_sb + 0x78), 16);
+    return out[0] ? 0 : -1;
+  }
+
+  u8 boot[512];
+  if (blk_read_bytes(dev, 0, boot, sizeof(boot)) < 0)
+    return -1;
+  const char *raw = 0;
+  if (memcmp(boot + 82, "FAT32   ", 8) == 0)
+    raw = (const char *)(boot + 71);
+  else if (memcmp(boot + 54, "FAT16   ", 8) == 0 ||
+           memcmp(boot + 54, "FAT12   ", 8) == 0)
+    raw = (const char *)(boot + 43);
+  if (!raw)
+    return -1;
+  label_copy(out, cap, raw, 11);
+  return out[0] ? 0 : -1;
+}
+
 /* ── Write-Back Cache Implementation ── */
 
+static void blk_io_gate_init(void);
+
 void blk_cache_init(void) {
+  blk_io_gate_init();
   /* Scale pool to RAM: ~1 entry per 512 KiB of usable memory, clamped. */
   u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
   /* 8 entries per MiB of RAM — 4 KiB of cache per MiB, i.e. 0.4% of memory.
    * At 2 per MiB the pool stayed at 4 MiB on any machine large enough for the
    * ceiling to matter, which is where the 96%-miss measurement came from. */
-  usize want = (usize)(ram_mb * 8);
+  /* 32 entries per MiB — 16 KiB of cache per MiB, i.e. 1.6% of memory.
+   *
+   * read(2) on a regular file does not go through the file page cache at all;
+   * it reads blocks, so this pool IS the read cache for every program that uses
+   * read rather than mmap. At 8 entries per MiB it was 16 MB against a browser
+   * whose working set is hundreds, and every read(2) cost a disk round trip. */
+  usize want = (usize)(ram_mb * 32);
+  /* `b1nix.bcache-mb=N` states the cache size directly, in mebibytes, for the
+   * cases where the RAM fraction is the wrong answer — a memory-starved run
+   * that still wants a big cache, or the reverse. */
+  u32 cache_mb = bootinfo_get_u32("b1nix.bcache-mb", 0);
+  if (cache_mb)
+    want = (usize)((u64)cache_mb * 1024ULL * 1024ULL / sizeof(struct block_buffer));
   if (want < CACHE_ENTRIES_MIN) want = CACHE_ENTRIES_MIN;
   if (want > CACHE_ENTRIES_MAX) want = CACHE_ENTRIES_MAX;
   block_cache_n = want;
+  /* Read-ahead default in kilobytes, the unit Linux uses for read_ahead_kb. */
+  u32 ra_kb = bootinfo_get_u32("b1nix.read-ahead-kb", BCACHE_READAHEAD_KB_DEF);
+  bcache_ra_sectors = ra_kb * 1024u / CACHE_BLOCK_SIZE;
   block_cache = kzalloc(block_cache_n * sizeof(struct block_buffer));
   if (!block_cache) {
     /* Fall back to floor — kzalloc still failed? then we have bigger problems
@@ -647,15 +1041,33 @@ void blk_cache_init(void) {
     block_cache_n = CACHE_ENTRIES_MIN;
     block_cache = kzalloc(block_cache_n * sizeof(struct block_buffer));
   }
+  /* One bucket per four entries, rounded up to a power of two and bounded so
+   * the table is never smaller than a kilobyte's worth of buckets nor larger
+   * than 256 KiB. */
+  u32 bits = BCACHE_HASH_MIN_BITS;
+  while (((usize)1u << bits) < BCACHE_HASH_MAX_ENTRIES &&
+         ((usize)1u << bits) < block_cache_n / 4u)
+    bits++;
+  u32 buckets = 1u << bits;
+  bcache_hash = (i32 *)kzalloc((usize)buckets * sizeof(i32));
+  if (!bcache_hash) {
+    buckets = 1u << BCACHE_HASH_MIN_BITS;
+    bcache_hash = (i32 *)kzalloc((usize)buckets * sizeof(i32));
+  }
+  bcache_hash_mask = buckets - 1u;
   /* kzalloc zeroes the buffer, but hash_next must start at -1 (empty), not 0
    * (which is a valid index). Likewise prime the hash buckets to -1. */
   for (usize i = 0; i < block_cache_n; i++) block_cache[i].hash_next = -1;
-  for (u32 b = 0; b < BCACHE_HASH_SIZE; b++) bcache_hash[b] = -1;
+  for (u32 b = 0; b < buckets; b++) bcache_hash[b] = -1;
   console_write("blk-cache: ");
   console_write_dec(block_cache_n);
   console_write(" entries (");
   console_write_dec((block_cache_n * sizeof(struct block_buffer)) / 1024);
-  console_write(" KiB)\n");
+  console_write(" KiB), ");
+  console_write_dec(buckets);
+  console_write(" hash buckets, read-ahead ");
+  console_write_dec(bcache_ra_sectors * CACHE_BLOCK_SIZE / 1024);
+  console_write(" KiB\n");
 }
 
 static struct block_buffer *bcache_find(struct block_device *dev, u64 lba) {
@@ -767,7 +1179,33 @@ static struct block_buffer *bcache_evict(u64 *flags_inout) {
  * 2 = best-effort, 3 = idle) and level in bits 0..12, lower is better. A task
  * that never called ioprio_set has value 0, which sorts as best-effort level 0
  * — exactly how Linux treats an unset priority. */
-#define BLK_IO_WAITERS 16
+/* How many tasks can queue on one device's priority gate.
+ *
+ * Overflowing this is not a correctness failure — the extra waiters fall back
+ * to spinning on the gate — but it silently discards the I/O priority ordering
+ * the gate exists to provide, which is a wall you cannot see from userspace.
+ * Sixteen was fewer slots than a threaded program keeps requests in flight.
+ *
+ * FLOOR   16 waiters, the previous fixed depth: a uniprocessor guest is
+ *         unchanged.
+ * CEILING 256 waiters — 4 KiB per gate, and past that the linear scan
+ *         blk_io_end() does to pick the best waiter costs more than the
+ *         ordering is worth.
+ * Scaled by CPU count because that is what bounds how many tasks can be inside
+ * blk_io_begin at once. `b1nix.io-waiters=N` overrides. */
+#define BLK_IO_WAITERS_MIN 16u
+#define BLK_IO_WAITERS 256u /* ceiling; the live depth is blk_io_waiters */
+static u32 blk_io_waiters = BLK_IO_WAITERS_MIN;
+
+/* Deepest the queue on any one gate has ever been, and how often it filled.
+ * Measured rather than assumed: the report at the end of a run is what says
+ * whether the old fixed depth was a real limit on this workload or not. */
+static u32 blk_gate_peak;
+static u32 blk_gate_full;
+/* Report those two on the serial log in test mode. A peak can only rise
+ * blk_io_waiters times, and the table-full line is printed once, so this is a
+ * handful of lines per boot at most. */
+static int blk_limits_verbose;
 
 struct blk_io_waiter {
   struct task *task;
@@ -780,8 +1218,27 @@ struct blk_io_waiter {
 struct blk_io_gate {
   struct block_device *dev;
   int busy;
+  u32 depth; /* waiters currently queued — see blk_gate_peak */
   struct blk_io_waiter waiters[BLK_IO_WAITERS];
 };
+
+/* Pick the gate depth for this machine. Called once from blk_cache_init. */
+static void blk_io_gate_init(void) {
+  /* Four waiters per CPU: enough that the tasks a CPU can have parked on one
+   * device all keep their place in the priority order. ACPI has enumerated the
+   * CPUs by the time the block layer initialises, even though the APs are not
+   * running yet, so this counts every CPU that will ever exist. */
+  int cpus = acpi_cpu_count();
+  u32 want = bootinfo_get_u32("b1nix.io-waiters",
+                              (u32)(cpus > 0 ? cpus : 1) * 4u);
+
+  if (want < BLK_IO_WAITERS_MIN)
+    want = BLK_IO_WAITERS_MIN;
+  if (want > BLK_IO_WAITERS)
+    want = BLK_IO_WAITERS;
+  blk_io_waiters = want;
+  blk_limits_verbose = bootinfo_has_flag("b1nix.test=1");
+}
 
 static struct blk_io_gate blk_gates[MAX_BLK_DEVICES];
 static spinlock_t blk_gate_lock = SPINLOCK_INIT;
@@ -846,18 +1303,45 @@ static void blk_io_begin(struct block_device *dev) {
     return;
   }
   int slot = -1;
-  for (int i = 0; i < BLK_IO_WAITERS; i++) {
+  for (u32 i = 0; i < blk_io_waiters; i++) {
     if (!g->waiters[i].used) {
       g->waiters[i].used = 1;
       g->waiters[i].task = current_task;
       g->waiters[i].prio = blk_io_prio_of_current();
       g->waiters[i].queued_at = scheduler_get_uptime_ticks();
       g->waiters[i].admitted = 0;
-      slot = i;
+      slot = (int)i;
       break;
     }
   }
+  /* Queue depth, kept as a counter rather than recomputed: this is the hot
+   * path, and the point of the scan above is to stop at the first free slot.
+   * Everything here runs under blk_gate_lock, so plain arithmetic is safe. */
+  int report_peak = 0, report_full = 0;
+
+  if (slot >= 0) {
+    if (++g->depth > blk_gate_peak) {
+      blk_gate_peak = g->depth;
+      report_peak = 1;
+    }
+  } else if (++blk_gate_full == 1) {
+    report_full = 1;
+  }
+  u32 peak = blk_gate_peak;
   spin_unlock_irqrestore(&blk_gate_lock, flags);
+
+  if (blk_limits_verbose && report_peak) {
+    console_write("blk: io-gate depth ");
+    console_write_dec(peak);
+    console_write(" of ");
+    console_write_dec(blk_io_waiters);
+    console_write("\n");
+  }
+  if (blk_limits_verbose && report_full) {
+    console_write("blk: io-gate full at ");
+    console_write_dec(blk_io_waiters);
+    console_write(" waiters - priority order dropped\n");
+  }
   if (slot < 0) {
     /* More concurrent requests than the wait table holds: fall back to
      * spinning on the gate rather than losing the ordering guarantee. */
@@ -876,6 +1360,8 @@ static void blk_io_begin(struct block_device *dev) {
     spin_lock_irqsave(&blk_gate_lock, &flags);
     if (g->waiters[slot].admitted) {
       g->waiters[slot].used = 0;
+      if (g->depth)
+        g->depth--;
       g->waiters[slot].admitted = 0;
       spin_unlock_irqrestore(&blk_gate_lock, flags);
       return; /* the gate was handed to us, still held */
@@ -897,7 +1383,7 @@ static void blk_io_end(struct block_device *dev) {
   }
   u64 now = scheduler_get_uptime_ticks();
   int best = -1, best_prio = 0;
-  for (int i = 0; i < BLK_IO_WAITERS; i++) {
+  for (u32 i = 0; i < blk_io_waiters; i++) {
     if (!g->waiters[i].used || g->waiters[i].admitted)
       continue;
     int p = blk_io_effective_prio(&g->waiters[i], now);
@@ -1073,7 +1559,7 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
        * covers current_lba; the remaining sectors of the run are inserted into
        * the cache below from the buffer we already have — no extra DMA. Falls
        * back to a single-sector read if the run buffer can't be allocated. */
-      u32 run = BCACHE_READAHEAD;
+      u32 run = blk_readahead_for(dev, current_lba);
       if (dev->block_count > 0 && current_lba + run > dev->block_count)
         run = (u32)(dev->block_count - current_lba);
       if (run == 0)
@@ -1152,14 +1638,27 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
  * per-command cost — and blk_write_cached calls it every N dirty writes so dirty
  * blocks never pile up unbounded (the writer is throttled by doing some of the
  * writeback itself, like Linux balance_dirty_pages). */
-#define BCACHE_FLUSH_RUN     512  /* max sectors coalesced into one command (256 KiB) */
+/* Ceiling on the sectors coalesced into one writeback command (512 = 256 KiB,
+ * the same order as a Linux writeback chunk). The actual run is this clamped to
+ * the device's own max_sectors, so a device that cannot describe 256 KiB in one
+ * command never gets asked to. The ceiling itself stays here because the index
+ * array below lives on the kernel stack: 512 entries is 2 KiB, and a stack
+ * buffer is the one thing that must not grow with a device's appetite. */
+#define BCACHE_FLUSH_RUN     512
 /* Dirty writes between proactive drains — a FRACTION of the pool, not a fixed
  * count. 256 was chosen against an 8192-entry cache (3% of it); left constant
  * after the pool grew to 65536 it throttles the writer eight times more often
  * than intended, and the writer pays that cost inline. Measured on a browser
  * start, the main thread sat in bcache_flush_some issuing device commands
  * instead of making progress. */
-#define BCACHE_DIRTY_THROTTLE (block_cache_n / 32u)
+/* Dirty blocks written between proactive drains.
+ *
+ * A thirty-second of the pool was fine while every fsync drained the whole
+ * cache. Now that fsync only persists its own file, nothing else pushes the
+ * rest out — and once the pool is entirely dirty, every read miss has to write
+ * a block back before it can take a slot, so reads start paying for writes. A
+ * finer slice keeps the background drain ahead of that. */
+#define BCACHE_DIRTY_THROTTLE (block_cache_n / 128u)
 
 static volatile int bcache_flushing; /* re-entrancy guard (kmalloc may reclaim) */
 
@@ -1191,8 +1690,11 @@ static usize bcache_flush_some(usize target) {
     /* Extend a contiguous run [base, base+run) of dirty, non-busy blocks on the
      * same device; claim each BUSY so a concurrent write to those LBAs waits. */
     i32 idxs[BCACHE_FLUSH_RUN];
+    usize run_max = blk_max_sectors(wdev);
+    if (run_max > BCACHE_FLUSH_RUN)
+      run_max = BCACHE_FLUSH_RUN;
     usize run = 0;
-    for (u64 l = base; run < BCACHE_FLUSH_RUN; l++) {
+    for (u64 l = base; run < run_max; l++) {
       struct block_buffer *e = bcache_find(wdev, l);
       if (!e || !(e->flags & BLK_CACHE_DIRTY) || (e->flags & BLK_CACHE_BUSY))
         break;
@@ -1297,6 +1799,12 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
        * claim is needed here — unlike the read path. */
       memcpy(entry->data, buf8 + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE);
       entry->flags |= BLK_CACHE_DIRTY; /* write-back: flush later */
+      {
+        unsigned os = blk_owner_slot();
+
+        entry->dirty_fsid = blk_dirty_owner[os].fsid;
+        entry->dirty_ino = blk_dirty_owner[os].ino;
+      }
       bcache_release(flags);
       break;
     }
@@ -1332,6 +1840,37 @@ void blk_flush_buffer(struct block_buffer *buf) {
   }
 }
 
+/* Forget every cached copy of [lba, lba+count) on `target`. Used before a
+ * command that changes the medium behind the cache's back (WRITE ZEROES,
+ * DISCARD): a stale entry that is still dirty would otherwise be written back
+ * over the new contents later, and a stale clean one would keep answering
+ * reads with the old contents. Entries mid-DMA are waited out, not stolen. */
+static void bcache_drop_range(struct block_device *target, u64 lba, u32 count) {
+  for (usize i = 0; i < block_cache_n; i++) {
+    for (;;) {
+      u64 flags = bcache_acquire();
+      struct block_buffer *e = &block_cache[i];
+      if (!(e->flags & BLK_CACHE_VALID) || e->bdev != target ||
+          e->block_no < lba || e->block_no >= lba + count) {
+        bcache_release(flags);
+        break;
+      }
+      if (e->flags & BLK_CACHE_BUSY) {
+        /* Another CPU is DMA-ing into this slot; let it finish. */
+        bcache_release(flags);
+        scheduler_yield();
+        continue;
+      }
+      bcache_hash_remove((i32)i);
+      e->flags = 0;
+      e->bdev = 0;
+      e->block_no = 0;
+      bcache_release(flags);
+      break;
+    }
+  }
+}
+
 /* One page of zeroes, shared by every fallback in blk_zero_blocks(). Zeroing a
  * block used to mean a kmalloc + memset per allocated filesystem block. */
 static const u8 blk_zero_page[4096];
@@ -1347,33 +1886,7 @@ int blk_zero_blocks(struct block_device *dev, u64 lba, u32 count) {
     u64 tlba = lba;
     struct block_device *target = blk_cache_target(dev, &tlba);
     if (target->write_zeroes) {
-      /* The device is about to change the medium behind the cache's back, so
-       * every cached copy of the range has to go first: a stale entry that is
-       * still dirty would otherwise be written back over the zeroes later, and
-       * a stale clean one would keep answering reads with the old contents. */
-      for (usize i = 0; i < block_cache_n; i++) {
-        for (;;) {
-          u64 flags = bcache_acquire();
-          struct block_buffer *e = &block_cache[i];
-          if (!(e->flags & BLK_CACHE_VALID) || e->bdev != target ||
-              e->block_no < tlba || e->block_no >= tlba + count) {
-            bcache_release(flags);
-            break;
-          }
-          if (e->flags & BLK_CACHE_BUSY) {
-            /* Another CPU is DMA-ing into this slot; let it finish. */
-            bcache_release(flags);
-            scheduler_yield();
-            continue;
-          }
-          bcache_hash_remove((i32)i);
-          e->flags = 0;
-          e->bdev = 0;
-          e->block_no = 0;
-          bcache_release(flags);
-          break;
-        }
-      }
+      bcache_drop_range(target, tlba, count);
       if (target->write_zeroes(target, tlba, count) == 0)
         return 0;
       /* The device refused it — write the zeroes ourselves rather than leave
@@ -1391,6 +1904,39 @@ int blk_zero_blocks(struct block_device *dev, u64 lba, u32 count) {
     done += chunk;
   }
   return 0;
+}
+
+/* M109 discard (blkdiscard, fstrim). Tell the device the range no longer holds
+ * anything worth keeping. Unlike blk_zero_blocks() there is NO fallback: a
+ * discard is a hint, and emulating it by writing zeroes would turn a hint into
+ * the very I/O it exists to avoid — and would lie about the resulting content,
+ * which after a real discard is whatever the device chooses to return. A
+ * device with no discard command therefore reports -EOPNOTSUPP and the caller
+ * says so, exactly as Linux does on a disk that cannot trim. */
+int blk_discard_blocks(struct block_device *dev, u64 lba, u32 count) {
+  if (!dev || count == 0)
+    return -EINVAL;
+  if (dev->block_count > 0 &&
+      ((u64)count > dev->block_count || lba > dev->block_count - count))
+    return -EINVAL;
+  if (dev->block_size != CACHE_BLOCK_SIZE)
+    return -EOPNOTSUPP;
+
+  u64 tlba = lba;
+  struct block_device *target = blk_cache_target(dev, &tlba);
+  if (!target->discard)
+    return -EOPNOTSUPP;
+
+  bcache_drop_range(target, tlba, count);
+  return target->discard(target, tlba, count) == 0 ? 0 : -EIO;
+}
+
+int blk_discard_supported(struct block_device *dev) {
+  if (!dev || dev->block_size != CACHE_BLOCK_SIZE)
+    return 0;
+  u64 tlba = 0;
+  struct block_device *target = blk_cache_target(dev, &tlba);
+  return target->discard != 0;
 }
 
 /* Write every dirty cache entry back into whatever device owns it. */
@@ -1430,6 +1976,53 @@ void blk_sync_all(void) {
   blk_flush_all_devices();
   bcache_drain_all();
   blk_flush_all_devices();
+}
+
+/* Write back the dirty blocks this file owns, then flush the device.
+ *
+ * fsync on Linux persists one file, not the disk. Here it drained every dirty
+ * block in a cache sized at a fraction of RAM, which on a browser's profile
+ * cost seconds per call — 38 calls, 4.6 s apiece, most of it other files'
+ * data. Blocks carry the owner that dirtied them now, so this writes those and
+ * leaves the rest to the background drain. Unstamped blocks are written too:
+ * they predate the stamping or came from a path that does not set an owner,
+ * and it is better to write a stranger's block than to lose this one's. */
+int blk_cache_flush_inode(struct block_device *dev, u32 fsid, u64 ino) {
+  if (!dev)
+    return -1;
+  if (!dev->write_blocks)
+    return 0;
+
+  u64 first = 0;
+  u64 last = ~0ULL;
+
+  if (blk_is_partition(dev)) {
+    struct partition_device *part = (struct partition_device *)dev->priv;
+
+    if (!part || !part->parent)
+      return -1;
+    first = part->start_lba;
+    last = part->start_lba + dev->block_count;
+    dev = part->parent;
+  }
+
+  for (usize i = 0; i < block_cache_n; i++) {
+    u64 flags = bcache_acquire();
+    struct block_buffer *b = &block_cache[i];
+    int mine = (b->flags & BLK_CACHE_VALID) && b->bdev == dev &&
+               b->block_no >= first && b->block_no < last &&
+               (b->flags & BLK_CACHE_DIRTY) &&
+               (b->dirty_ino == 0 ||
+                (b->dirty_ino == ino && b->dirty_fsid == fsid));
+
+    bcache_release(flags);
+    if (mine)
+      blk_flush_buffer(b);
+  }
+
+  if (dev->flush)
+    dev->flush(dev);
+  return 0;
 }
 
 void blk_cache_flush(struct block_device *dev) {
@@ -1597,11 +2190,12 @@ void blk_cache_invalidate(struct block_device *dev) {
  * Each registered block device gets a /dev/<name> node whose byte-addressed
  * reads/writes translate to cached block I/O. Sub-block writes do a
  * read-modify-write so fdisk can rewrite just the MBR. */
-/* Max blocks per driver command on the raw-device bulk fast path. 1536 × 512B =
- * 768 KiB → at most ~193 page-segments, still inside the AHCI per-page PRDT
- * (248 entries) and NVMe/virtio descriptor limits. Larger = fewer commands =
- * fewer per-command completion waits, which dominate raw-disk throughput. */
-#define BLK_BULK_MAX_BLOCKS 1536u
+/* Blocks per driver command on the raw-device bulk fast path. This used to be
+ * one constant (1536, chosen to stay inside AHCI's 248-entry PRDT) applied to
+ * every device; it is now the device's own max_sectors, so an NVMe namespace
+ * whose MDTS allows 2 MiB is no longer chopped to the size an AHCI port can
+ * describe. Larger = fewer commands = fewer per-command completion waits, which
+ * dominate raw-disk throughput. */
 
 static isize blkdev_node_read(struct vfs_node *node, u64 offset, char *buffer,
                               usize size, int flags) {
@@ -1629,13 +2223,14 @@ static isize blkdev_node_read(struct vfs_node *node, u64 offset, char *buffer,
     if (bulk) {
       /* Issue the bulk DMA in driver-safe sub-chunks: a single AHCI command's
        * PRDT (NVMe PRP / virtio SG likewise) is bounded, so one giant transfer
-       * would overflow the per-page descriptor table. BLK_BULK_MAX_BLOCKS keeps
-       * each command well within that, while still being ~hundreds× fewer, far
-       * larger transfers than the per-512B cache loop. */
+       * would overflow the per-page descriptor table. The device's own
+       * max_sectors keeps each command well within that, while still being
+       * ~hundreds× fewer, far larger transfers than the per-512B cache loop. */
       int ok = 1;
+      const u32 bulk_max = blk_max_sectors(dev);
       for (u32 done = 0; done < nblk; ) {
         u32 chunk = nblk - done;
-        if (chunk > BLK_BULK_MAX_BLOCKS) chunk = BLK_BULK_MAX_BLOCKS;
+        if (chunk > bulk_max) chunk = bulk_max;
         /* read_blocks returns the sector count (>=0) on success, <0 on error. */
         if (blk_dev_read(dev, first + done, chunk,
                              bulk + (usize)done * bs) < 0) { ok = 0; break; }
@@ -1691,9 +2286,10 @@ static isize blkdev_node_write(struct vfs_node *node, u64 offset,
        * header on an auto-claimed disk) over the data we just wrote. */
       blk_cache_invalidate(dev);
       int ok = 1;
+      const u32 bulk_max = blk_max_sectors(dev);
       for (u32 done = 0; done < nblk; ) {   /* driver-safe sub-chunks (PRDT) */
         u32 chunk = nblk - done;
-        if (chunk > BLK_BULK_MAX_BLOCKS) chunk = BLK_BULK_MAX_BLOCKS;
+        if (chunk > bulk_max) chunk = bulk_max;
         /* write_blocks returns the sector count (>=0) on success, <0 on error. */
         if (blk_dev_write(dev, first + done, chunk,
                               bulk + (usize)done * bs) < 0) { ok = 0; break; }
@@ -1721,6 +2317,41 @@ static isize blkdev_node_write(struct vfs_node *node, u64 offset,
   return (isize)size;
 }
 
+/* Make one VFS node behave as this block device: byte reads and writes routed
+ * through the cached block layer, the size stat() reports, and the device
+ * number userspace identifies it by. Shared by the boot-time node creation
+ * below and by mknod(2), so a node mdev creates from a uevent is wired exactly
+ * like one the kernel made itself. */
+static void blk_wire_dev_node(struct vfs_node *node, struct block_device *dev,
+                              usize index) {
+  node->inode->blk_dev = dev;
+  node->inode->read_cb = blkdev_node_read;
+  node->inode->write_cb = blkdev_node_write;
+  node->inode->size = (usize)(dev->block_size * dev->block_count);
+  /* The same major:minor /sys/dev/block and /proc/partitions publish. Without
+   * it st_rdev was 0 on every block node, so a tool that identifies a device
+   * by its number rather than its path — mdev deciding whether the node it
+   * finds is the one the event named — had nothing to compare. */
+  node->inode->rdev = ((u64)BLK_SYSFS_MAJOR << 8) | (u64)index;
+}
+
+struct block_device *blk_from_devno(u64 rdev) {
+  if ((rdev >> 8) != BLK_SYSFS_MAJOR)
+    return 0;
+  return blk_at((usize)(rdev & 0xFF));
+}
+
+int blk_bind_dev_node(struct vfs_node *node, u64 rdev) {
+  if (!node || !node->inode)
+    return -EINVAL;
+  usize index = (usize)(rdev & 0xFF);
+  struct block_device *dev = blk_from_devno(rdev);
+  if (!dev)
+    return -ENODEV;
+  blk_wire_dev_node(node, dev, index);
+  return 0;
+}
+
 void blk_create_dev_nodes(void) {
   usize n = blk_count();
   for (usize i = 0; i < n; i++) {
@@ -1730,12 +2361,9 @@ void blk_create_dev_nodes(void) {
     char path[64];
     snprintf(path, sizeof(path), "/dev/%s", dev->name);
     struct vfs_node *node = vfs_add_node(path, VFS_DEVICE, 0, 0, 0);
-    if (!node)
+    if (!node || IS_ERR(node))
       continue;
-    node->inode->blk_dev = dev;
-    node->inode->read_cb = blkdev_node_read;
-    node->inode->write_cb = blkdev_node_write;
-    node->inode->size = (usize)(dev->block_size * dev->block_count);
+    blk_wire_dev_node(node, dev, i);
     node->inode->mode = 0660;
   }
 }

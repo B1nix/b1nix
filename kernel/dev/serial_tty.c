@@ -146,6 +146,9 @@ static void stty_input_char(struct serial_tty *t, u8 c) {
   }
 }
 
+/* Defined with the rest of the line-configuration helpers further down. */
+static void stty_cflag_from_hw(struct serial_tty *t);
+
 static void stty_reset(struct serial_tty *t) {
   t->in_head = t->in_tail = 0;
   t->in_eof = 0;
@@ -156,6 +159,10 @@ static void stty_reset(struct serial_tty *t) {
   t->termios.c_iflag = B1NIX_ICRNL;
   t->termios.c_oflag = B1NIX_OPOST | B1NIX_ONLCR;
   t->termios.c_lflag = B1NIX_ICANON | B1NIX_ECHO | B1NIX_ISIG;
+  /* c_cflag starts out describing the line as the boot code left it, so a
+   * get/modify/set round trip preserves the hardware settings instead of
+   * asking for baud code 0. */
+  stty_cflag_from_hw(t);
   t->termios.c_cc[B1NIX_VINTR] = 3;    /* ^C */
   t->termios.c_cc[B1NIX_VQUIT] = 28;   /* ^\ */
   t->termios.c_cc[B1NIX_VERASE] = 127; /* DEL */
@@ -257,6 +264,140 @@ static int stty_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   return 0;
 }
 
+/* ── M109 line configuration ──────────────────────────────────────────────
+ * c_cflag used to be a value the tty stored and nothing read, so tcsetattr on
+ * a serial line changed the line discipline and left the wire at the 38400 8N1
+ * the boot code hardcoded — while tcgetattr cheerfully reported whatever had
+ * been written. These map c_cflag onto the UART's divisor latch and LCR, and
+ * read the chip back afterwards, so the two agree. */
+#define STTY_CBAUD  0x100fu
+#define STTY_CSIZE  0x0030u
+#define STTY_CSTOPB 0x0040u
+#define STTY_PARENB 0x0100u
+#define STTY_PARODD 0x0200u
+#define STTY_CREAD  0x0080u
+#define STTY_CLOCAL 0x0800u
+
+/* Linux CBAUD codes, in the order the constants run. Index is the code for
+ * 0x00..0x0f; the 0x100x block is handled separately. */
+static const u32 stty_baud_table[16] = {
+    0,   50,   75,   110,  134,  150,  200,   300,
+    600, 1200, 1800, 2400, 4800, 9600, 19200, 38400,
+};
+
+static u32 stty_cbaud_to_rate(u32 cflag) {
+  u32 code = cflag & STTY_CBAUD;
+  if (code == 0x1001) return 57600;
+  if (code == 0x1002) return 115200;
+  if (code == 0x1003) return 230400;  /* beyond a 115200 clock: rejected below */
+  if (code < 16) return stty_baud_table[code];
+  return 0;
+}
+
+static u32 stty_rate_to_cbaud(u32 rate) {
+  if (rate == 57600) return 0x1001;
+  if (rate == 115200) return 0x1002;
+  for (u32 i = 1; i < 16; i++)
+    if (stty_baud_table[i] == rate)
+      return i;
+  return 0;
+}
+
+/* Rewrite c_cflag from what the UART registers actually hold, so a subsequent
+ * TCGETS reports the line as it is rather than as it was asked to be. */
+static void stty_cflag_from_hw(struct serial_tty *t) {
+  u32 baud = 0;
+  u8 bits = 8, parity = 0, stop = 1;
+  if (serial_port_get_line(t->com, &baud, &bits, &parity, &stop) < 0)
+    return;
+  u32 cflag = t->termios.c_cflag & ~(STTY_CBAUD | STTY_CSIZE | STTY_CSTOPB |
+                                     STTY_PARENB | STTY_PARODD);
+  cflag |= stty_rate_to_cbaud(baud);
+  cflag |= ((u32)(bits - 5) << 4) & STTY_CSIZE;
+  if (stop == 2) cflag |= STTY_CSTOPB;
+  if (parity == 1) cflag |= STTY_PARENB | STTY_PARODD;
+  else if (parity == 2) cflag |= STTY_PARENB;
+  t->termios.c_cflag = cflag | STTY_CREAD | STTY_CLOCAL;
+}
+
+/* Apply the hardware half of a termios. Returns 0, or -EINVAL for a line
+ * setting this UART cannot produce. A c_cflag with no baud bits (B0) leaves
+ * the line alone, which is what a caller that never looked at c_cflag means. */
+static int stty_apply_cflag(struct serial_tty *t, u32 cflag) {
+  u32 rate = stty_cbaud_to_rate(cflag);
+  if (rate == 0)
+    return 0;
+  u8 bits = (u8)(5 + ((cflag & STTY_CSIZE) >> 4));
+  u8 stop = (cflag & STTY_CSTOPB) ? 2 : 1;
+  u8 parity = 0;
+  if (cflag & STTY_PARENB)
+    parity = (cflag & STTY_PARODD) ? 1 : 2;
+  if (serial_port_set_line(t->com, rate, bits, parity, stop) < 0)
+    return -EINVAL;
+  return 0;
+}
+
+/* Linux TIOCM_* bits, and where each one lives in the 16550. */
+#define TIOCM_LE   0x001
+#define TIOCM_DTR  0x002
+#define TIOCM_RTS  0x004
+#define TIOCM_CTS  0x020
+#define TIOCM_CAR  0x040
+#define TIOCM_RNG  0x080
+#define TIOCM_DSR  0x100
+
+static int stty_modem_get(struct serial_tty *t) {
+  u8 mcr = serial_port_get_mcr(t->com);
+  u8 msr = serial_port_get_msr(t->com);
+  int bits = 0;
+  if (mcr & 0x01) bits |= TIOCM_DTR;
+  if (mcr & 0x02) bits |= TIOCM_RTS;
+  if (msr & 0x10) bits |= TIOCM_CTS;
+  if (msr & 0x20) bits |= TIOCM_DSR;
+  if (msr & 0x40) bits |= TIOCM_RNG;
+  if (msr & 0x80) bits |= TIOCM_CAR;
+  return bits;
+}
+
+static void stty_modem_set(struct serial_tty *t, int bits) {
+  u8 mcr = (u8)(serial_port_get_mcr(t->com) & ~0x03);
+  if (bits & TIOCM_DTR) mcr |= 0x01;
+  if (bits & TIOCM_RTS) mcr |= 0x02;
+  serial_port_set_mcr(t->com, mcr);
+}
+
+/* struct serial_struct, as setserial reads it. Only the fields setserial
+ * prints are filled; the rest are zero, which is what "not configured" looks
+ * like on Linux too. */
+struct stty_serial_struct {
+  int type;
+  int line;
+  unsigned int port;
+  int irq;
+  int flags;
+  int xmit_fifo_size;
+  int custom_divisor;
+  int baud_base;
+  unsigned short close_delay;
+  char io_type;
+  char reserved_char;
+  int hub6;
+  unsigned short closing_wait;
+  unsigned short closing_wait2;
+  unsigned char *iomem_base;
+  unsigned short iomem_reg_shift;
+  unsigned int port_high;
+  unsigned long iomap_base;
+};
+
+#define STTY_PORT_16550A 3
+#define STTY_TIOCMGET 0x5415
+#define STTY_TIOCMBIS 0x5416
+#define STTY_TIOCMBIC 0x5417
+#define STTY_TIOCMSET 0x5418
+#define STTY_TIOCGSERIAL 0x541E
+#define STTY_TIOCSSERIAL 0x541F
+
 static int stty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   struct serial_tty *t = (struct serial_tty *)h->private_data;
   if (!t)
@@ -270,9 +411,22 @@ static int stty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   case B1NIX_TCSETS:
   case B1NIX_TCSETSW: /* TCSADRAIN — no output buffering, so same as TCSETS */
   case B1NIX_TCSETSF: /* TCSAFLUSH — no input queue to flush here either */
-    if (!arg || syscall_copyin(&t->termios, arg, sizeof(t->termios)) < 0)
+  {
+    struct b1nix_termios want;
+    if (!arg || syscall_copyin(&want, arg, sizeof(want)) < 0)
       return -EFAULT;
+    struct b1nix_termios saved = t->termios;
+    t->termios = want;
+    int rc = stty_apply_cflag(t, want.c_cflag);
+    if (rc < 0) {
+      t->termios = saved;
+      return rc;
+    }
+    /* Report the line as the chip now holds it — a rate the divisor rounded
+     * or a field this UART ignores must not come back as if it had stuck. */
+    stty_cflag_from_hw(t);
     return 0;
+  }
   case B1NIX_TIOCGWINSZ:
     if (!arg || syscall_copyout(arg, &t->winsize, sizeof(t->winsize)) < 0)
       return -EFAULT;
@@ -310,6 +464,50 @@ static int stty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     return 0;
   case B1NIX_TIOCNOTTY:
     return 0;
+  case STTY_TIOCMGET: { /* modem lines, read from MCR + MSR */
+    int bits = stty_modem_get(t);
+    if (!arg || syscall_copyout(arg, &bits, sizeof(bits)) < 0)
+      return -EFAULT;
+    return 0;
+  }
+  case STTY_TIOCMSET:
+  case STTY_TIOCMBIS:
+  case STTY_TIOCMBIC: {
+    int bits;
+    if (!arg || syscall_copyin(&bits, arg, sizeof(bits)) < 0)
+      return -EFAULT;
+    int cur = stty_modem_get(t);
+    if (request == STTY_TIOCMBIS)
+      bits = cur | bits;
+    else if (request == STTY_TIOCMBIC)
+      bits = cur & ~bits;
+    stty_modem_set(t, bits);
+    return 0;
+  }
+  case STTY_TIOCGSERIAL: { /* setserial -g */
+    struct stty_serial_struct ss;
+    memset(&ss, 0, sizeof(ss));
+    ss.type = STTY_PORT_16550A;
+    ss.line = t->com;
+    ss.port = serial_port_base(t->com);
+    ss.irq = (t->com == 0) ? 4 : 3; /* the PC's fixed COM1/COM2 lines */
+    ss.xmit_fifo_size = 16;
+    ss.baud_base = 115200;
+    {
+      u32 baud = 0;
+      serial_port_get_line(t->com, &baud, 0, 0, 0);
+      ss.custom_divisor = baud ? (int)(115200u / baud) : 0;
+    }
+    ss.io_type = 0; /* SERIAL_IO_PORT */
+    if (!arg || syscall_copyout(arg, &ss, sizeof(ss)) < 0)
+      return -EFAULT;
+    return 0;
+  }
+  case STTY_TIOCSSERIAL:
+    /* The port address, IRQ and clock of a legacy COM line are fixed by the
+     * platform, so there is nothing here for setserial to change. Accepting
+     * the call and quietly keeping the old values would be a lie. */
+    return -EPERM;
   case B1NIX_TIOCSTI: {
     /* Linux TIOCSTI: inject one byte into the input queue as if typed —
      * travels the full line discipline (canon/ISIG/VEOF) like UART input. */

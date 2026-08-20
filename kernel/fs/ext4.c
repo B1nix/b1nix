@@ -385,10 +385,39 @@ static isize ext4_vfs_read(struct vfs_node *node, u64 offset, char *buffer, usiz
     u64 inode_sz = ext4_get_inode_size(fs, &inode); if (offset >= inode_sz) return 0;
     usize remaining = (usize)(inode_sz - offset); usize to_read = size < remaining ? size : remaining;
     usize done = 0; u8 *block_buf = kmalloc(fs->block_size);
+    usize run_max = blk_run_blocks(fs->bdev, fs->block_size);
     while (done < to_read) {
         u32 b_idx = (u32)((offset + done) / fs->block_size); u32 b_off = (u32)((offset + done) % fs->block_size);
         u32 phys = ext4_get_block(fs, &inode, b_idx); usize chunk = fs->block_size - b_off;
         if (chunk > to_read - done) chunk = to_read - done;
+
+        /* Whole blocks that lie next to each other on the disk go in ONE
+         * request, straight into the caller's buffer — the same coalescing the
+         * ext2 driver does, and ext4 is the root filesystem, so this is the
+         * path that matters. Without it every read(2) was one device request
+         * and one memcpy through a bounce buffer per block, whatever the file
+         * layout: a 512 KiB read of a contiguous file cost 128 round trips.
+         * Files laid out by extents are very nearly always contiguous, so the
+         * run is usually the whole request.
+         *
+         * The aligned middle only: a partial first or last block, or a hole,
+         * falls through to the one-block path below. */
+        if (phys && b_off == 0 && to_read - done >= fs->block_size) {
+            u32 spb = fs->block_size / 512;
+            usize max_run = (to_read - done) / fs->block_size;
+            usize run = 1;
+
+            if (max_run > run_max) max_run = run_max;
+            while (run < max_run &&
+                   ext4_get_block(fs, &inode, b_idx + (u32)run) == phys + (u32)run)
+                run++;
+            if (run > 1 &&
+                blk_read_cached(fs->bdev, (u64)phys * spb, (u32)(run * spb),
+                                buffer + done) >= 0) {
+                done += run * fs->block_size;
+                continue;
+            }
+        }
         if (phys) { ext4_read_block(fs, phys, block_buf); memcpy(buffer + done, block_buf + b_off, chunk); }
         else memset(buffer + done, 0, chunk);
         done += chunk;
@@ -1099,6 +1128,111 @@ static int ext4_vfs_setattr(struct vfs_node *node) {
   return ext4_write_inode(fs, info->inode_num, &inode);
 }
 
+/* M109 chattr: persist the inode attribute flags. Only the low byte is the
+ * user's — everything above it (extents, inline data, ...) describes how the
+ * file is stored, and clobbering it would make the file unreadable. */
+static int ext4_vfs_setflags(struct vfs_node *node, u32 attr) {
+  struct ext4_inode_info *info = (struct ext4_inode_info *)node->inode->data;
+  struct ext4_fs *fs = info->fs;
+  struct ext2_inode inode;
+  if (ext4_read_inode(fs, info->inode_num, &inode) < 0)
+    return -EIO;
+  inode.i_flags = (inode.i_flags & ~(u32)EXT2_FL_USER_MODIFIABLE) |
+                  (attr & EXT2_FL_USER_MODIFIABLE);
+  node->inode->ctime = vfs_get_unix_time();
+  inode.i_ctime = (u32)node->inode->ctime;
+  return ext4_write_inode(fs, info->inode_num, &inode);
+}
+
+/* M109 FITRIM: walk the block bitmaps and offer every free run to the device.
+ *
+ * The bitmap is the only place that knows which blocks hold nothing, so this
+ * has to be a filesystem operation rather than a block-layer one — a discard
+ * of the whole partition would throw away the filesystem. Each group is walked
+ * under the allocator lock, so a block cannot be handed to a file between the
+ * moment its bit is read as free and the moment it is discarded.
+ *
+ * `start`/`len` bound the byte range to consider and `minlen` is the shortest
+ * run worth offering, exactly as fstrim's -o/-l/-m spell them. */
+static int ext4_vfs_fitrim(struct vfs_node *node, u64 start, u64 len,
+                           u64 minlen, u64 *trimmed) {
+  struct ext4_inode_info *info = (struct ext4_inode_info *)node->inode->data;
+  struct ext4_fs *fs = info->fs;
+  u32 bs = fs->block_size;
+  u32 sectors_per_block = bs / 512;
+  if (sectors_per_block == 0)
+    return -EOPNOTSUPP;
+  if (!blk_discard_supported(fs->bdev))
+    return -EOPNOTSUPP;
+
+  u64 fs_bytes = (u64)fs->sb.s_blocks_count * bs;
+  if (start >= fs_bytes)
+    return -EINVAL;
+  u64 end = (len == 0 || len > fs_bytes - start) ? fs_bytes : start + len;
+  u32 first_block = (u32)(start / bs);
+  u32 last_block = (u32)((end + bs - 1) / bs); /* exclusive */
+  u32 min_blocks = (u32)((minlen + bs - 1) / bs);
+  if (min_blocks == 0)
+    min_blocks = 1;
+
+  u32 groups = (fs->sb.s_blocks_count + fs->sb.s_blocks_per_group - 1) /
+               fs->sb.s_blocks_per_group;
+  /* Bit i of group g's bitmap is this physical block — the same arithmetic the
+   * allocator uses, so the two agree about which bit means which block. */
+  u32 base_adjust = (fs->sb.s_log_block_size == 0) ? 1 : 0;
+
+  u8 *bitmap = kmalloc(bs);
+  if (!bitmap)
+    return -ENOMEM;
+  u64 total = 0;
+  int rc = 0;
+
+  for (u32 g = 0; g < groups && rc == 0; g++) {
+    vfs_meta_lock_acquire(&fs->alloc_lock);
+    struct ext4_bgd_64 bgd;
+    ext4_read_bgd(fs, g, &bgd);
+    if (bgd.bg_free_blocks_count_lo == 0) {
+      vfs_meta_lock_release(&fs->alloc_lock);
+      continue;
+    }
+    if (ext4_read_block(fs, ext4_bgd_block_bitmap(fs, &bgd), bitmap) < 0) {
+      vfs_meta_lock_release(&fs->alloc_lock);
+      rc = -EIO;
+      break;
+    }
+
+    u32 run_start = 0, run_len = 0;
+    for (u32 i = 0; i <= fs->sb.s_blocks_per_group; i++) {
+      int free_here = 0;
+      if (i < fs->sb.s_blocks_per_group) {
+        u32 block = g * fs->sb.s_blocks_per_group + i + base_adjust;
+        free_here = block < fs->sb.s_blocks_count && block >= first_block &&
+                    block < last_block &&
+                    !(bitmap[i / 8] & (1 << (i % 8)));
+      }
+      if (free_here) {
+        if (run_len == 0)
+          run_start = g * fs->sb.s_blocks_per_group + i + base_adjust;
+        run_len++;
+        continue;
+      }
+      if (run_len >= min_blocks) {
+        if (blk_discard_blocks(fs->bdev, (u64)run_start * sectors_per_block,
+                               run_len * sectors_per_block) == 0)
+          total += (u64)run_len * bs;
+      }
+      run_len = 0;
+    }
+    vfs_meta_lock_release(&fs->alloc_lock);
+  }
+
+  kfree(bitmap);
+  if (rc < 0)
+    return rc;
+  *trimmed = total;
+  return 0;
+}
+
 static int ext4_vfs_statfs(struct vfs_node *node, struct b1nix_statfs *st) {
   struct ext4_inode_info *info = (struct ext4_inode_info *)node->inode->data;
   struct ext4_fs *fs = info->fs; memset(st, 0, sizeof(*st));
@@ -1145,8 +1279,12 @@ static void ext4_setup_node(struct vfs_node *n, struct ext4_fs *fs, u32 ino, u32
     /* Carry the on-disk generation so a stored file handle can tell this file
      * apart from a later one that reuses the inode number. */
     struct ext2_inode gi;
-    if (ext4_read_inode(fs, ino, &gi) == 0)
+    if (ext4_read_inode(fs, ino, &gi) == 0) {
       n->inode->generation = gi.i_generation;
+      /* M109: the attribute flags lsattr prints. Only the low byte is the
+       * user's; the rest of i_flags is the storage layout. */
+      n->inode->attr = gi.i_flags & EXT2_FL_USER_MODIFIABLE;
+    }
   }
   n->inode->data = ni; n->inode->blk_dev = fs->bdev;
   n->inode->read_cb = ext4_vfs_read; n->inode->write_cb = ext4_vfs_write;
@@ -1154,6 +1292,8 @@ static void ext4_setup_node(struct vfs_node *n, struct ext4_fs *fs, u32 ino, u32
   n->inode->setattr_cb = ext4_vfs_setattr; n->inode->statfs_cb = ext4_vfs_statfs;
   n->inode->unlink_cb = ext4_vfs_unlink; n->inode->release_cb = ext4_vfs_release;
   n->inode->fsync_cb = ext4_vfs_fsync;
+  n->inode->setflags_cb = ext4_vfs_setflags;
+  n->inode->fitrim_cb = ext4_vfs_fitrim;
   if ((mode & EXT2_S_IFMT) == EXT2_S_IFDIR) {
     n->inode->create_cb = ext4_vfs_create; n->inode->mkdir_cb = ext4_vfs_mkdir;
     n->inode->mknod_cb = ext4_vfs_mknod;

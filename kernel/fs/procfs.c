@@ -1,3 +1,4 @@
+#include <b1nix/console.h>
 /* procfs — synthetic /proc filesystem (M34).
  *
  * Exposes kernel and per-process state as read-on-demand pseudo-files. Unlike
@@ -28,6 +29,7 @@
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/module.h>
+#include <b1nix/namespace.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
@@ -35,6 +37,7 @@
 #include <b1nix/vfs.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
+#include <b1nix/vnet.h>
 #include <b1nix/blk.h>
 #include <b1nix/pci.h>
 #include <b1nix/version.h>
@@ -204,6 +207,11 @@ static usize pid_from_parent(struct vfs_node *node) {
   if (!node->parent)
     return 0;
   const char *name = node->parent->name;
+  /* M109: /proc/<pid>/ns/<kind> sits one level deeper than the rest of the
+   * per-process files, and "ns" carries no pid of its own — the name that does
+   * is the directory above it. */
+  if (strcmp(name, "ns") == 0 && node->parent->parent)
+    return pid_from_parent(node->parent);
   if (name[0] == 's') /* "self" */
     return scheduler_get_pid();
   usize v = 0;
@@ -678,10 +686,16 @@ static int r_filesystems(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* The mount table is sized from RAM now, so a buffer for it belongs on the heap
+ * — MAX_MOUNTS entries is ~2 MiB, and this used to be a stack array. */
 static int r_mounts(usize pid, struct sbuf *s) {
   (void)pid;
-  struct b1nix_mount_entry ents[MAX_MOUNTS];
-  isize n = vfs_mounts(ents, MAX_MOUNTS);
+  usize cap = vfs_mount_capacity();
+  struct b1nix_mount_entry *ents = kmalloc(cap * sizeof(*ents));
+
+  if (!ents)
+    return 0;
+  isize n = vfs_mounts(ents, cap);
   for (isize i = 0; i < n; i++) {
     const char *src = ents[i].source[0] ? ents[i].source : "none";
     const char *tgt = ents[i].target[0] ? ents[i].target : "/";
@@ -690,6 +704,7 @@ static int r_mounts(usize pid, struct sbuf *s) {
     /* device mountpoint fstype options dump pass */
     sb_addf(s, "%s %s %s %s 0 0\n", src, tgt, fstype, opts);
   }
+  kfree(ents);
   return 0;
 }
 
@@ -700,8 +715,12 @@ static int r_mounts(usize pid, struct sbuf *s) {
  *   id parent maj:min root mountpoint opts - fstype source superopts */
 static int r_mountinfo(usize pid, struct sbuf *s) {
   (void)pid;
-  struct b1nix_mount_entry ents[MAX_MOUNTS];
-  isize n = vfs_mounts(ents, MAX_MOUNTS);
+  usize cap = vfs_mount_capacity();
+  struct b1nix_mount_entry *ents = kmalloc(cap * sizeof(*ents));
+
+  if (!ents)
+    return 0;
+  isize n = vfs_mounts(ents, cap);
   for (isize i = 0; i < n; i++) {
     const char *src = ents[i].source[0] ? ents[i].source : "none";
     const char *tgt = ents[i].target[0] ? ents[i].target : "/";
@@ -723,6 +742,48 @@ static int r_mountinfo(usize pid, struct sbuf *s) {
     sb_addf(s, "%ld 1 %d:%d / %s %s - %s %s %s\n", (long)(i + 1), maj, min,
             tgt, opts, fstype, src, opts);
   }
+  kfree(ents);
+  return 0;
+}
+
+
+/* /proc/b1nix-prof — reading it prints the syscall and page-fault profiles to
+ * the console and starts a fresh interval.
+ *
+ * The profiles were only printed by the periodic task dump, and that dump is
+ * far too expensive to leave running while measuring: it writes thousands of
+ * lines through the console lock and changes the very timings it is supposed
+ * to report (a browser start-up that takes 95 s took 337 s with it on). A
+ * reader that asks for the numbers when it wants them costs nothing in
+ * between, so a script can take one sample per run and compare runs. */
+static int r_b1nix_prof(usize pid, struct sbuf *s) {
+  (void)pid;
+  extern void syscall_prof_dump(void);
+  extern void pf_prof_dump(void);
+  extern void syscall_prof_reset(void);
+  syscall_prof_dump();
+  pf_prof_dump();
+  {
+    extern void vfs_inode_wait_stats(u64 *, u64 *, u64 *, const void **);
+    extern void vfs_inode_wait_reset(void);
+    extern void ksym_print(u64 addr);
+    u64 cyc = 0, n = 0, worst = 0;
+    const void *site = 0;
+    vfs_inode_wait_stats(&cyc, &n, &worst, &site);
+    console_write("inode-wait: waits=");
+    console_write_dec(n);
+    console_write(" Mcycles=");
+    console_write_dec(cyc / 1000000);
+    console_write(" worst_Mcycles=");
+    console_write_dec(worst / 1000000);
+    console_write(" holder=0x");
+    console_write_hex64((u64)(usize)site);
+    ksym_print((u64)(usize)site);
+    console_write("\n");
+    vfs_inode_wait_reset();
+  }
+  syscall_prof_reset();
+  sb_puts(s, "profile written to console\n");
   return 0;
 }
 
@@ -880,7 +941,16 @@ static int r_pid_comm(usize pid, struct sbuf *s) {
 static int r_pid_stat(usize pid, struct sbuf *s) {
   struct task *t = scheduler_task_by_pid(pid);
   if (!t) {
-    sb_addf(s, "%lu (gone) Z 0\n", (unsigned long)pid);
+    /* A task that exited between being listed and being read still owes the
+     * reader a well-formed line. Four fields is not a shorter version of this
+     * format: a reader that asks for field 23 of a 4-field line by index is
+     * the crash that brought the browser down — Chromium walks every thread of
+     * a process, and a thread that dies mid-walk landed here. Zombie state,
+     * everything else zero, all 52 fields. */
+    sb_addf(s,
+            "%lu (gone) Z 0 0 0 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 "
+            "0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+            (unsigned long)pid);
     return 0;
   }
   u64 vsz = t->user_brk > t->heap_start ? t->user_brk - t->heap_start : 0;
@@ -909,16 +979,47 @@ static int r_pid_stat(usize pid, struct sbuf *s) {
    * num_threads itrealvalue starttime vsize rss. M86 fills 14-17 (the CPU
    * times, in USER_HZ ticks — they were hard-coded zeros, so every `top`/`ps`
    * in the tree reported 0 % for every process), 20 and 22. */
+  /* All 52 fields, because a reader counts them.
+   *
+   * This used to stop at 24. Chromium's /proc parser (ParseProcStats, then
+   * ReadProcStatsAndGetFieldAsSizeT) reads a field by index and traps on a
+   * line that is short — an illegal instruction, caught by its own crash
+   * handler, re-entered on return, four hundred times in one run. A short
+   * line is not a smaller version of this format; it is a different format.
+   *
+   * Fields b1nix does not track are zero, which is what Linux itself reports
+   * for several of them, and the ones it does know (the CPU times, the thread
+   * count, the memory bounds, the CPU last run on) carry real values. */
   sb_addf(s,
-          "%lu (%s) %s %lu %lu %lu 0 -1 0 0 0 0 0 %lu %lu %lu %lu %d 0 %lu 0 "
-          "%lu %lu %lu\n",
+          /*  1- 4 */ "%lu (%s) %s %lu "
+          /*  5- 9 */ "%lu %lu 0 -1 0 "
+          /* 10-13 */ "0 0 0 0 "
+          /* 14-17 */ "%lu %lu %lu %lu "
+          /* 18-20 */ "%d 0 %lu "
+          /* 21-24 */ "0 %lu %lu %lu "
+          /* 25-27 */ "%lu %lu %lu "
+          /* 28-31 */ "%lu 0 0 0 "
+          /* 32-35 */ "0 0 0 0 "
+          /* 36-38 */ "0 0 17 "
+          /* 39-41 */ "%d 0 0 "
+          /* 42-44 */ "0 0 0 "
+          /* 45-48 */ "%lu %lu %lu 0 "
+          /* 49-52 */ "0 0 0 0\n",
           (unsigned long)t->id, comm,
           scheduler_state_name((int)t->state), (unsigned long)t->parent_id,
           (unsigned long)t->process_group_id, (unsigned long)t->session_id,
           (unsigned long)task_utime(t), (unsigned long)task_stime(t),
           (unsigned long)task_cutime(t), (unsigned long)task_cstime(t),
           t->priority, nthreads, (unsigned long)task_start_ticks(t),
-          (unsigned long)vsz, (unsigned long)(vsz / 4096));
+          (unsigned long)vsz, (unsigned long)(vsz / 4096),
+          (unsigned long)~0UL,                    /* 25 rsslim: unlimited */
+          (unsigned long)t->heap_start,           /* 26 startcode */
+          (unsigned long)t->user_brk,             /* 27 endcode */
+          0UL,                                    /* 28 startstack: unknown */
+          0,                                      /* 39 processor: unknown */
+          (unsigned long)t->heap_start,           /* 45 start_data */
+          (unsigned long)t->user_brk,             /* 46 end_data */
+          (unsigned long)t->user_brk);            /* 47 start_brk */
   return 0;
 }
 
@@ -1655,6 +1756,41 @@ static isize procfs_task_readdir(struct vfs_node *dir, usize offset,
   return vfs_readdir_children(dir, offset, buf, max_entries);
 }
 
+/* The link count of /proc/<pid>/task: "." plus ".." plus one per live thread.
+ *
+ * Chromium's sandbox does not count the entries here — it stats the directory
+ * and reads st_nlink, refusing to go on with fewer than three
+ * (sandbox/linux/services/thread_helpers.cc). A synthetic directory that
+ * reports a stored 2 therefore claims to hold no threads at all, and the check
+ * fires: the zygote takes an int3 the moment it is forked, and the browser it
+ * left behind waits for a process that is already gone. Computed at stat time
+ * because it changes with every clone and every thread exit. */
+static void procfs_task_getattr(struct vfs_node *node) {
+  usize pid = pid_from_parent(node);
+  struct task *leader = scheduler_task_by_pid(pid);
+
+  if (!leader) return;
+
+  usize tgid = task_tgid(leader);
+  usize slots = scheduler_task_slots();
+  usize live = 0;
+
+  for (usize i = 0; i < slots; i++) {
+    struct task *t = scheduler_task_slot(i);
+
+    if (!t || !t->id || task_tgid(t) != tgid)
+      continue;
+    /* Same rule the listing uses: a thread that has exited must not be
+     * counted, whether or not anyone has reaped it yet. */
+    if (t->state == TASK_DEAD || t->state == TASK_REAPING ||
+        t->state == TASK_UNUSED)
+      continue;
+    live++;
+  }
+  if (live == 0) live = 1; /* the caller doing the stat is itself alive */
+  node->inode->nlink = (int)(2 + live);
+}
+
 static int procfs_task_lookup(struct vfs_node *dir, const char *name) {
   usize tid = 0;
   for (const char *q = name; *q; q++) {
@@ -1669,6 +1805,49 @@ static int procfs_task_lookup(struct vfs_node *dir, const char *name) {
     return -1;
   procfs_make_tiddir(dir, tid); /* idempotent (find_child guard) */
   return 0;
+}
+
+/* ── /proc/<pid>/ns/{uts,mnt,pid,net} (M109) ────────────────────────────────
+ * The handles nsenter(1) opens and hands to setns(2). Linux makes these magic
+ * symlinks whose text is "<kind>:[<inode>]"; b1nix makes them plain files with
+ * the same text, so open() works without a target that has to exist, and
+ * `readlink`-style comparison of two tasks' handles still tells you whether
+ * they share a namespace. Kinds b1nix has only one of (pid, net) are here too
+ * and always name the initial namespace — that is the truth, and nsenter needs
+ * the file to exist to say so. */
+static int r_pid_ns(usize pid, struct sbuf *s, int kind) {
+  u32 id = namespace_id_of(pid, kind);
+  /* Same shape as Linux's nsfs inode numbers, one range per kind. */
+  u32 ino = 4026531835u + (u32)kind * 64u + id;
+  sb_addf(s, "%s:[%u]\n", namespace_kind_name(kind), ino);
+  return 0;
+}
+
+/* Pin the namespace the handle names at open(), the way Linux's nsfs does.
+ * Resolving it again when setns(2) runs would follow the TASK, so a caller
+ * could never hold a handle on the namespace it is about to leave — and
+ * "join a namespace, then come back" is the whole of what nsenter does. */
+static int procfs_ns_open_cb(struct vfs_node *node, struct vfs_handle *h) {
+  struct procfs_node *pn = pn_of(node);
+  usize pid = (pn && pn->pid) ? pn->pid : pid_from_parent(node);
+  int kind = namespace_kind_from_name(node->name);
+  if (kind < 0)
+    return 0;
+  h->ns_pin = VFS_NS_PIN_MAKE(kind, namespace_id_of(pid, kind));
+  return 0;
+}
+
+static int r_pid_ns_uts(usize pid, struct sbuf *s) {
+  return r_pid_ns(pid, s, NS_UTS);
+}
+static int r_pid_ns_mnt(usize pid, struct sbuf *s) {
+  return r_pid_ns(pid, s, NS_MNT);
+}
+static int r_pid_ns_pid(usize pid, struct sbuf *s) {
+  return r_pid_ns(pid, s, NS_PID);
+}
+static int r_pid_ns_net(usize pid, struct sbuf *s) {
+  return r_pid_ns(pid, s, NS_NET);
 }
 
 static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
@@ -1689,10 +1868,24 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_mkchild(d, "limits", VFS_DEVICE, r_pid_limits, pid);
   procfs_make_symlink(d, "cwd", procfs_cwd_readlink);
   procfs_make_symlink(d, "root", procfs_root_readlink);
+  struct vfs_node *nsdir = procfs_mkchild(d, "ns", VFS_DIRECTORY, 0, pid);
+  if (nsdir) {
+    static const procfs_render ns_render[NS_KIND_COUNT] = {
+        r_pid_ns_uts, r_pid_ns_mnt, r_pid_ns_pid, r_pid_ns_net};
+    for (int k = 0; k < NS_KIND_COUNT; k++) {
+      struct vfs_node *n = procfs_mkchild(nsdir, namespace_kind_name(k),
+                                          VFS_DEVICE, ns_render[k], pid);
+      if (n)
+        n->inode->open_cb = procfs_ns_open_cb;
+    }
+  }
   struct vfs_node *fddir = procfs_mkchild(d, "fd", VFS_DIRECTORY, 0, 0);
   if (fddir) {
     fddir->inode->readdir_cb = procfs_fd_readdir;
     fddir->inode->lookup_cb = procfs_fd_lookup;
+    /* procfs_fd_readdir ends in vfs_readdir_children, so the VFS must not
+     * append the in-memory children a second time. */
+    fddir->inode->readdir_lists_children = 1;
   }
   /* M80: auxv/mem carry binary content, so they take a read_cb of their own
    * instead of the text-rendering procfs_read_cb. */
@@ -1711,6 +1904,8 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   if (taskdir) {
     taskdir->inode->readdir_cb = procfs_task_readdir;
     taskdir->inode->lookup_cb = procfs_task_lookup;
+    taskdir->inode->getattr_cb = procfs_task_getattr;
+    taskdir->inode->readdir_lists_children = 1;
   }
   return d;
 }
@@ -1846,6 +2041,55 @@ static int r_net_unix(usize pid, struct sbuf *s) {
  * digits in little-endian byte order. BusyBox `route` parses this. M84: the
  * rows are the real FIB (kernel/net/route.c), not a synthesised /24 + default
  * pair, so a manually added or non-/24 route shows up here. */
+/* /proc/net/vlan/config — the file Linux's 802.1Q layer publishes, in the same
+ * shape: a two-line header, then one line per VLAN device naming its VID and
+ * the interface it is stacked on. */
+static int r_net_vlan_config(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "VLAN Dev name\t | VLAN ID\nName-Type: VLAN_NAME_TYPE_RAW_PLUS_VID"
+             "_NO_PAD\n");
+  struct vlan_info v[8];
+  usize n = vlan_snapshot(v, 8);
+  for (usize i = 0; i < n; i++)
+    sb_addf(s, "%s       | %u  | %s\n", v[i].name, (unsigned)v[i].vid,
+            v[i].lower);
+  return 0;
+}
+
+/* /proc/net/bridge — Linux keeps this in sysfs and in binary; here it is one
+ * text table: a "port" row per member interface, then one row per learned
+ * address with the port it was learned on and its age in seconds. */
+static int r_net_bridge(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "bridge\tport\t\tmac\t\t\tage\n");
+  /* 32 rows, like the route table's snapshot: this runs on a kernel stack. */
+  struct bridge_fdb_info e[32];
+  usize n = bridge_snapshot(e, 32);
+  for (usize i = 0; i < n; i++) {
+    if (e[i].is_port_row) {
+      sb_addf(s, "%s\t%s\t\tport\t\t\t-\n", e[i].bridge, e[i].port);
+      continue;
+    }
+    sb_addf(s, "%s\t%s\t\t%02x:%02x:%02x:%02x:%02x:%02x\t%u\n", e[i].bridge,
+            e[i].port, e[i].mac[0], e[i].mac[1], e[i].mac[2], e[i].mac[3],
+            e[i].mac[4], e[i].mac[5], (unsigned)(e[i].age_ticks / 100));
+  }
+  return 0;
+}
+
+/* /proc/net/bonding — one row per slave, with the active one marked. */
+static int r_net_bonding(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "bond\tslave\t\tstate\n");
+  struct bond_info b[8];
+  usize n = bond_snapshot(b, 8);
+  for (usize i = 0; i < n; i++)
+    sb_addf(s, "%s\t%s\t\t%s\n", b[i].name,
+            b[i].slave[0] ? b[i].slave : "-",
+            b[i].slave[0] ? (b[i].active ? "active" : "backup") : "empty");
+  return 0;
+}
+
 static int r_net_route(usize pid, struct sbuf *s) {
   (void)pid;
   sb_puts(s, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask"
@@ -2015,9 +2259,20 @@ static int r_net_dev(usize pid, struct sbuf *s) {
              "|bytes    packets errs drop fifo colls carrier compressed\n");
   sb_puts(s, "    lo:       0       0    0    0    0     0          0         0"
              "       0       0    0    0    0     0       0          0\n");
-  if (netdev_active())
-    sb_puts(s, "  eth0:       0       0    0    0    0     0          0       "
-               "  0       0       0    0    0    0     0       0          0\n");
+  /* Walk the registry rather than printing a hardcoded eth0: a bridge, a VLAN
+   * or a veth is as much an interface as the NIC is, and netdev_by_index
+   * answers only for the caller's network namespace, so this listing is
+   * namespaced for free. */
+  for (int idx = 1; idx <= (int)netdev_slot_count(); idx++) {
+    struct netdev *nd = netdev_by_index(idx);
+    if (!nd)
+      continue;
+    char name[16];
+    netdev_ifname(idx, name, sizeof(name));
+    sb_addf(s, "%6s:       0       0    0    0    0     0          0         0"
+               "       0       0    0    0    0     0       0          0\n",
+            name);
+  }
   return 0;
 }
 
@@ -2049,6 +2304,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   root->inode->mode = 0555;
   root->inode->readdir_cb = procfs_root_readdir;
   root->inode->lookup_cb = procfs_root_lookup;
+  root->inode->readdir_lists_children = 1;
   procfs_root = root;
 
   procfs_mkchild(root, "meminfo", VFS_DEVICE, r_meminfo, 0);
@@ -2062,6 +2318,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);
   procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
+  procfs_mkchild(root, "b1nix-prof", VFS_DEVICE, r_b1nix_prof, 0);
   /* M107: /proc/kmsg — the same record stream as /dev/kmsg. klogd reads this
    * one and expects it to block until a message arrives. */
   {
@@ -2123,6 +2380,11 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
                             w_net_rt_tables);
     procfs_mkchild_writable(netd, "rt_rules", r_net_rt_rules, w_net_rt_rules);
     procfs_mkchild(netd, "dev", VFS_DEVICE, r_net_dev, 0);
+    procfs_mkchild(netd, "bridge", VFS_DEVICE, r_net_bridge, 0);
+    procfs_mkchild(netd, "bonding", VFS_DEVICE, r_net_bonding, 0);
+    struct vfs_node *vland = procfs_mkchild(netd, "vlan", VFS_DIRECTORY, 0, 0);
+    if (vland)
+      procfs_mkchild(vland, "config", VFS_DEVICE, r_net_vlan_config, 0);
   }
 
   /* /proc/self — per-process view of the *calling* task (pid resolved at read

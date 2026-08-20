@@ -120,48 +120,6 @@ static int loop_flush(struct block_device *dev) {
     return vfs_node_fsync(loop->backing_node);
 }
 
-struct block_device *loop_register_file(const char *path, const char *name) {
-    struct vfs_node *node = vfs_find_node(path);
-    if (IS_ERR(node)) {
-        return (struct block_device *)node;
-    }
-
-    struct loop_device *loop = kmalloc(sizeof(struct loop_device));
-    if (!loop) {
-        vfs_node_put(node);
-        return ERR_PTR(-ENOMEM);
-    }
-
-    loop->backing_node = node;
-    loop->readonly = 1;
-    loop->offset = 0;
-    loop->sizelimit = 0;
-    loop->flags = 0;
-    loop->file_name[0] = '\0';
-    loop->in_io = 0;
-
-    char *persistent_name = kmalloc(strlen(name) + 1);
-    if (!persistent_name) {
-        kfree(loop);
-        vfs_node_put(node);
-        return ERR_PTR(-ENOMEM);
-    }
-    strcpy(persistent_name, name);
-
-    loop->bdev.name = persistent_name;
-    loop->bdev.bus = BLK_BUS_LOOP;
-    loop->bdev.block_size = 512;
-    loop->bdev.block_count = (node->inode->size + 511) / 512;
-    loop->bdev.read_blocks = loop_read_blocks;
-    loop->bdev.write_blocks = NULL;
-    loop->bdev.flush = NULL; /* read-only association: nothing to push out */
-    loop->bdev.priv = loop;
-
-    blk_register(&loop->bdev);
-    return &loop->bdev;
-}
-
-
 /* Linux's two loop status structures, byte-for-byte. losetup reads the 64-bit
  * one to print the backing file and offset; without it every association
  * printed as an unnamed device. */
@@ -235,39 +193,62 @@ static void loop_refresh_node_size(int idx, struct loop_device *lo) {
 }
 
 /* ── Loop-device control surface for BusyBox losetup ──
- * Eight pre-registered loop block devices (/dev/loop0../dev/loop7, created by
- * blk_create_dev_nodes) plus /dev/loop-control. LOOP_SET_FD associates an open
- * file's backing node; the device's byte reads then route through
- * loop_read_blocks. */
-#define NUM_LOOPS 8
+ * Eight loop block devices exist from boot (/dev/loop0../dev/loop7, whose
+ * nodes blk_create_dev_nodes makes) plus /dev/loop-control. LOOP_SET_FD
+ * associates an open file's backing node; the device's byte reads then route
+ * through loop_read_blocks.
+ *
+ * The array is larger than the number registered at boot on purpose:
+ * LOOP_CTL_ADD registers one of the spare slots at runtime, which is how a
+ * block device can genuinely appear on a running system — the hot-plug event
+ * that follows is what mdev turns into a node in /dev. */
+#define NUM_LOOPS 16
+#define LOOPS_AT_BOOT 8
 static struct loop_device g_loops[NUM_LOOPS];
 static int g_loops_inited;
+
+/* Whether slot i is currently in the block registry. A slot that is not
+ * registered has no device and no minor number: it is not "a free loop
+ * device", it is one that does not exist yet. */
+static int g_loop_registered[NUM_LOOPS];
+
+/* Bring one slot to its unassociated resting state. Called for every slot at
+ * boot and again whenever a slot is registered afresh by LOOP_CTL_ADD. */
+static void loop_slot_reset(int i) {
+  g_loops[i].backing_node = 0;
+  g_loops[i].readonly = 0;
+  g_loops[i].offset = 0;
+  g_loops[i].sizelimit = 0;
+  g_loops[i].flags = 0;
+  g_loops[i].file_name[0] = '\0';
+  g_loops[i].bdev.bus = BLK_BUS_LOOP;
+  g_loops[i].bdev.block_size = 512;
+  g_loops[i].bdev.block_count = 0;
+  g_loops[i].bdev.read_blocks = loop_read_blocks;
+  g_loops[i].bdev.write_blocks = loop_write_blocks;
+  g_loops[i].bdev.flush = loop_flush;
+  g_loops[i].in_io = 0;
+  g_loops[i].bdev.priv = &g_loops[i];
+}
 
 void loop_init(void) {
   if (g_loops_inited)
     return;
   g_loops_inited = 1;
   for (int i = 0; i < NUM_LOOPS; i++) {
+    /* Every slot is named up front, registered or not: the name is what the
+     * device is called the moment it is added, and allocating it later would
+     * put a kmalloc failure in the middle of an ioctl. */
     char *nm = kmalloc(8);
     if (!nm)
       return;
     snprintf(nm, 8, "loop%d", i);
-    g_loops[i].backing_node = 0;
-    g_loops[i].readonly = 0;
-    g_loops[i].offset = 0;
-    g_loops[i].sizelimit = 0;
-    g_loops[i].flags = 0;
-    g_loops[i].file_name[0] = '\0';
     g_loops[i].bdev.name = nm;
-    g_loops[i].bdev.bus = BLK_BUS_LOOP;
-    g_loops[i].bdev.block_size = 512;
-    g_loops[i].bdev.block_count = 0;
-    g_loops[i].bdev.read_blocks = loop_read_blocks;
-    g_loops[i].bdev.write_blocks = loop_write_blocks;
-    g_loops[i].bdev.flush = loop_flush;
-    g_loops[i].in_io = 0;
-    g_loops[i].bdev.priv = &g_loops[i];
-    blk_register(&g_loops[i].bdev);
+    loop_slot_reset(i);
+    if (i < LOOPS_AT_BOOT) {
+      blk_register(&g_loops[i].bdev);
+      g_loop_registered[i] = 1;
+    }
   }
   loop_register_nodes();
 }
@@ -282,13 +263,93 @@ void loop_register_nodes(void) {
     ctl->inode->mode = 0660;
 }
 
+/* Attach a backing file to one of the pre-registered loop devices — the
+ * in-kernel equivalent of `losetup -f`. This used to kmalloc a fresh
+ * block_device and register it under the caller's name, which produced a
+ * SECOND device called "loop0" beside the empty one loop_init() had already
+ * registered. blk_get("loop0") returns the first match, i.e. the unassociated
+ * device, so the live-USB root switch mounted a device with no backing file
+ * and fell back to ram0. Binding into the existing slot means the device the
+ * mount finds is the one that carries the file. */
+struct block_device *loop_register_file(const char *path) {
+  if (!g_loops_inited)
+    loop_init();
+
+  int idx = -1;
+  for (int i = 0; i < NUM_LOOPS; i++) {
+    if (g_loop_registered[i] && !g_loops[i].backing_node) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx < 0)
+    return ERR_PTR(-ENOSPC);
+
+  struct vfs_node *node = vfs_find_node(path);
+  if (IS_ERR(node))
+    return (struct block_device *)node;
+  if (!node || !node->inode) {
+    if (node)
+      vfs_node_put(node);
+    return ERR_PTR(-ENOENT);
+  }
+  if (node->inode->type != VFS_FILE) {
+    vfs_node_put(node);
+    return ERR_PTR(-EINVAL);
+  }
+
+  struct loop_device *lo = &g_loops[idx];
+  lo->backing_node = node; /* the reference from vfs_find_node is ours to keep */
+  lo->readonly = 1;        /* boot images are attached read-only */
+  lo->offset = 0;
+  lo->sizelimit = 0;
+  lo->flags = 0;
+  lo->in_io = 0;
+  strncpy(lo->file_name, path, sizeof(lo->file_name) - 1);
+  lo->file_name[sizeof(lo->file_name) - 1] = '\0';
+  lo->bdev.block_count = (node->inode->size + 511) / 512;
+  blk_cache_invalidate(&lo->bdev);
+  loop_refresh_node_size(idx, lo);
+  return &lo->bdev;
+}
+
 int loop_ioctl(struct vfs_node *node, u64 request, void *arg) {
   if (strcmp(node->name, "loop-control") == 0) {
     if (request == 0x4C82) { /* LOOP_CTL_GET_FREE */
       for (int i = 0; i < NUM_LOOPS; i++)
-        if (!g_loops[i].backing_node)
+        if (g_loop_registered[i] && !g_loops[i].backing_node)
           return i;
       return -ENOSPC;
+    }
+    /* LOOP_CTL_ADD / LOOP_CTL_REMOVE: the device model's own add and remove,
+     * with `arg` carrying the loop number (Linux passes it as the ioctl
+     * argument itself, not as a pointer). Adding one really puts a new block
+     * device in the registry and raises the `add` uevent; removing one takes
+     * it out and raises `remove`. Neither touches /dev — creating and
+     * unlinking the node is what the hot-plug helper does with those events,
+     * exactly as on Linux. Both return the loop number on success. */
+    if (request == 0x4C80 || request == 0x4C81) {
+      int n = (int)(usize)arg;
+      if (n < 0 || n >= NUM_LOOPS)
+        return -EINVAL;
+      if (request == 0x4C80) { /* LOOP_CTL_ADD */
+        if (g_loop_registered[n])
+          return -EEXIST;
+        loop_slot_reset(n);
+        blk_register(&g_loops[n].bdev);
+        g_loop_registered[n] = 1;
+        return n;
+      }
+      /* LOOP_CTL_REMOVE */
+      if (!g_loop_registered[n])
+        return -ENXIO;
+      if (g_loops[n].backing_node)
+        return -EBUSY; /* still carrying a file — CLR_FD first */
+      int rc = blk_unregister(&g_loops[n].bdev);
+      if (rc < 0)
+        return rc;
+      g_loop_registered[n] = 0;
+      return n;
     }
     return -ENOTTY;
   }
@@ -298,6 +359,9 @@ int loop_ioctl(struct vfs_node *node, u64 request, void *arg) {
   for (const char *c = node->name + 4; *c >= '0' && *c <= '9'; c++)
     idx = idx * 10 + (*c - '0');
   if (idx < 0 || idx >= NUM_LOOPS)
+    return -ENXIO;
+  /* A node left behind for a device that has been removed is not a device. */
+  if (!g_loop_registered[idx])
     return -ENXIO;
   struct loop_device *lo = &g_loops[idx];
   switch (request) {

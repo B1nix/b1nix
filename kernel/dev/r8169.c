@@ -73,8 +73,14 @@
 /* Tx config: unlimited DMA burst + standard IFG. */
 #define TXCFG_VAL  ((6u << 8) | (3u << 24))
 
-#define R8169_NUM_RX 32
-#define R8169_NUM_TX 32
+/* Ring depth, in descriptors. Linux's r8169 uses 256 per ring; 32 was shallow
+ * enough that a burst between two polls overran it. The descriptors are 16
+ * bytes, so 128 of them still fit in the one page allocated for the ring, and
+ * the buffer region they point at — 128 × 2048 B = 256 KiB — is the part that
+ * has to be physically contiguous, which is what keeps this at 128 rather than
+ * at Linux's 256. */
+#define R8169_NUM_RX 128
+#define R8169_NUM_TX 128
 #define R8169_BUF_SZ 2048
 
 struct r8169_desc {

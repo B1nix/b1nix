@@ -20,8 +20,15 @@
  * nor the modules and simply runs without them. */
 #ifndef MINIMAL_INITRAMFS
 #include "initramfs_modules.inc"
+/* M109: /init for a boot that keeps the initramfs as / (root=initramfs) — it
+ * mounts the real root below / and hands over to BusyBox's switch_root. */
+#include "initramfs_m109_switchroot.inc"
+#define B1NIX_SWITCHROOT_INIT_FILE                                             \
+  {"/init", (const char *)vfs_m109_switchroot_elf,                             \
+   sizeof(vfs_m109_switchroot_elf), INITRAMFS_EXECUTABLE},
 #else
 #define B1NIX_MODULE_INITRAMFS_FILES
+#define B1NIX_SWITCHROOT_INIT_FILE
 #endif
 #ifdef B1NIX_MUSL
 #include "initramfs_ld_musl_x86_64_so_1.inc"
@@ -36,6 +43,7 @@ static const struct initramfs_file files[] = {
     {"/lib/libc.so", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
 #endif
     B1NIX_MODULE_INITRAMFS_FILES
+    B1NIX_SWITCHROOT_INIT_FILE
     {"/sbin/.keep", "", 0, 0},
     {"/etc/init.d/.keep", "", 0, 0},
     {"/etc/conf.d/.keep", "", 0, 0},

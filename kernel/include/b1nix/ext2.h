@@ -71,6 +71,23 @@ struct ext2_block_group_desc {
 #define EXT2_S_IFCHR 0x2000
 #define EXT2_S_IFIFO 0x1000
 
+/* ── Inode attribute flags (ext2/3/4 on-disk i_flags low byte) ──
+ * These are the bits `chattr` sets and `lsattr` prints. The names are the
+ * ones the format itself defines. The VFS mirrors them into inode->attr as
+ * VFS_ATTR_* and enforces IMMUTABLE and APPEND in its write, truncate, rename
+ * and unlink paths; the rest are stored verbatim. */
+#define EXT2_SECRM_FL     0x00000001 /* s: secure deletion */
+#define EXT2_UNRM_FL      0x00000002 /* u: undelete */
+#define EXT2_COMPR_FL     0x00000004 /* c: compress */
+#define EXT2_SYNC_FL      0x00000008 /* S: synchronous updates */
+#define EXT2_IMMUTABLE_FL 0x00000010 /* i: immutable */
+#define EXT2_APPEND_FL    0x00000020 /* a: append only */
+#define EXT2_NODUMP_FL    0x00000040 /* d: do not dump */
+#define EXT2_NOATIME_FL   0x00000080 /* A: do not update atime */
+/* The bits FS_IOC_SETFLAGS may change. Everything above this byte (extents,
+ * inline data, ...) belongs to the filesystem and is preserved untouched. */
+#define EXT2_FL_USER_MODIFIABLE 0x000000FF
+
 struct ext2_inode {
 	u16 i_mode;
 	u16 i_uid;

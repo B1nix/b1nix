@@ -12,7 +12,12 @@
 #include <b1nix/sched.h>
 #include <string.h>
 
-#define NVME_MAX_QUEUE_SIZE 64
+/* Ceiling on the queue depth this driver will ask a controller for. Linux uses
+ * 1024 entries per NVMe queue by default and clamps that to CAP.MQES; the depth
+ * actually used here is min(MQES, this, `b1nix.nvme-queue-depth=N`). 1024 SQ
+ * entries is 64 KiB and 1024 CQ entries 16 KiB of physically contiguous memory,
+ * both claimed once at probe time when memory is still unfragmented. */
+#define NVME_MAX_QUEUE_SIZE 1024
 #define NVME_PAGE_SIZE 4096
 
 /* The one namespace this driver drives. It is also the "n<N>" half of the
@@ -52,6 +57,13 @@ struct nvme_device {
     u32 namespace_count;
     u64 namespace_size; // In blocks
     u32 block_size;
+
+    /* Queue geometry as the controller reports it, not as this file guesses
+     * it: depth from CAP.MQES, doorbell spacing from CAP.DSTRD, largest single
+     * transfer from the identify data's MDTS. */
+    u32 queue_size;
+    u32 db_stride;   /* bytes between consecutive doorbell registers */
+    u32 max_sectors; /* largest single command, in 512-byte sectors */
     
     struct block_device blk_dev;
     char blk_name[16];
@@ -146,22 +158,35 @@ static int nvme_wait_ready(volatile struct nvme_registers *regs, int ready)
     return -1; // Timeout
 }
 
+/* Doorbell for queue `qid` — submission tail when is_cq is 0, completion head
+ * when it is 1. The spacing between doorbells is 4 << CAP.DSTRD bytes; the
+ * fixed +4/+8/+12 offsets this used to hardcode are only correct for the
+ * DSTRD == 0 controllers QEMU emulates, and mis-address every other one. */
+static inline volatile u32 *nvme_doorbell(struct nvme_device *dev, u32 qid,
+                                          int is_cq)
+{
+    u64 base = (u64)(usize)dev->regs + 0x1000;
+    return (volatile u32 *)(usize)(base +
+                                   (u64)(2u * qid + (u32)(is_cq ? 1 : 0)) *
+                                       dev->db_stride);
+}
+
 static int nvme_admin_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
 {
     u16 tail = dev->admin_sq_tail;
     memcpy(&dev->admin_sq[tail], sqe, sizeof(struct nvme_sqe));
-    tail = (tail + 1) % NVME_MAX_QUEUE_SIZE;
+    tail = (u16)((tail + 1) % dev->queue_size);
     dev->admin_sq_tail = tail;
     
     // Ring the doorbell
-    volatile u32 *sq_tdb = (volatile u32 *)((u64)(usize)dev->regs + 0x1000);
+    volatile u32 *sq_tdb = nvme_doorbell(dev, 0, 0);
     *sq_tdb = tail;
     
     // Wait for completion. Once the command is submitted, do not return while
     // the controller may still DMA into command buffers owned by the caller.
     u64 spins = 0;
     for (;;) {
-        volatile u32 *cq_hdb = (volatile u32 *)((u64)(usize)dev->regs + 0x1000 + 4); // CQ0 head doorbell
+        volatile u32 *cq_hdb = nvme_doorbell(dev, 0, 1); // CQ0 head doorbell
         u16 cq_head = dev->admin_cq_head;
         
         // Check if there's a completion
@@ -171,7 +196,7 @@ static int nvme_admin_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
             cqe->status = 0xFFFF; // Reset status on consume
             
             // Update head
-            cq_head = (cq_head + 1) % NVME_MAX_QUEUE_SIZE;
+            cq_head = (u16)((cq_head + 1) % dev->queue_size);
             dev->admin_cq_head = cq_head;
             *cq_hdb = cq_head;
             
@@ -213,7 +238,7 @@ static int nvme_create_io_cq(struct nvme_device *dev)
     sqe.prp1 = dev->phys_io_cq;
     
     // CDW10: QSIZE (bits 31:16) | QID (bits 15:0)
-    sqe.cdw10 = ((NVME_MAX_QUEUE_SIZE - 1) << 16) | 1;
+    sqe.cdw10 = ((dev->queue_size - 1u) << 16) | 1;
     // CDW11: IV (bits 31:16, vector 0) | IEN (bit 1) | PC (bit 0)
     // M70: IEN=1 so a completion on this CQ raises interrupt vector 0.
     sqe.cdw11 = (1 << 1) | (1 << 0);
@@ -230,7 +255,7 @@ static int nvme_create_io_sq(struct nvme_device *dev)
     sqe.prp1 = dev->phys_io_sq;
     
     // CDW10: QSIZE (bits 31:16) | QID (bits 15:0)
-    sqe.cdw10 = ((NVME_MAX_QUEUE_SIZE - 1) << 16) | 1;
+    sqe.cdw10 = ((dev->queue_size - 1u) << 16) | 1;
     // CDW11: CQID (bits 31:16) | PC (bit 0)
     sqe.cdw11 = (1 << 16) | (1 << 0); // CQID = 1, PC = 1
     
@@ -241,11 +266,11 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
 {
     u16 tail = dev->io_sq_tail;
     memcpy(&dev->io_sq[tail], sqe, sizeof(struct nvme_sqe));
-    tail = (tail + 1) % NVME_MAX_QUEUE_SIZE;
+    tail = (u16)((tail + 1) % dev->queue_size);
     dev->io_sq_tail = tail;
     
     // Ring SQ1 doorbell
-    volatile u32 *sq_tdb = (volatile u32 *)((u64)(usize)dev->regs + 0x1000 + 8); // SQ1
+    volatile u32 *sq_tdb = nvme_doorbell(dev, 1, 0); // SQ1
     *sq_tdb = tail;
     
     // Wait for completion on CQ1. Returning early would let the caller free or
@@ -258,7 +283,7 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     // io_cq channel with a watchdog deadline. nvme_irq() masks our vector to
     // avoid a level-triggered storm; we unmask it (intmc) right after ringing
     // the head doorbell on consume. Early boot / IRQs-off callers yield-poll.
-    volatile u32 *cq_hdb = (volatile u32 *)((u64)(usize)dev->regs + 0x1000 + 12); // CQ1
+    volatile u32 *cq_hdb = nvme_doorbell(dev, 1, 1); // CQ1
     u64 spins = 0;
     for (;;) {
         u16 cq_head = dev->io_cq_head;
@@ -274,7 +299,7 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
             u16 status = cqe->status;
             cqe->status = 0xFFFF; // Reset status on consume
 
-            cq_head = (cq_head + 1) % NVME_MAX_QUEUE_SIZE;
+            cq_head = (u16)((cq_head + 1) % dev->queue_size);
             dev->io_cq_head = cq_head;
             *cq_hdb = cq_head;           // deasserts the controller's INTx line
             if (!dev->use_msix)
@@ -322,7 +347,7 @@ static int nvme_io_transfer(struct nvme_device *nd, u64 lba, u32 count, void *bu
      * reject transfers larger than it can describe (R4-9). */
     if (count == 0)
         return -1;
-    if ((u64)count * 512 > NVME_PAGE_SIZE * (NVME_PAGE_SIZE / sizeof(u64)))
+    if (count > nd->max_sectors)
         return -1;
     nvme_io_lock(nd);
     struct nvme_sqe sqe;
@@ -399,6 +424,40 @@ static int nvme_blk_flush(struct block_device *dev)
     sqe.nsid = NVME_NSID;
     int ret = nvme_io_submit(nd, &sqe);
     nvme_io_unlock(nd);
+    return ret == 0 ? 0 : -1;
+}
+
+/* M109 discard: Dataset Management with the Deallocate bit — the NVMe spelling
+ * of TRIM. One range covers any length the block layer can ask for (the range's
+ * block count is a full 32 bits and is not zero-based), so the list is always a
+ * single entry and always fits in prp1's one page. Only installed when the
+ * controller's ONCS says DSM exists. */
+static int nvme_blk_discard(struct block_device *dev, u64 lba, u32 count)
+{
+    struct nvme_device *nd = (struct nvme_device *)dev->priv;
+    if (!nd || count == 0) return -1;
+
+    u64 list_phys = pmm_alloc_frames(1);
+    if (!list_phys) return -1;
+    struct nvme_dsm_range *range =
+        (struct nvme_dsm_range *)(usize)(list_phys + vmm_direct_map_base());
+    memset(range, 0, NVME_PAGE_SIZE);
+    range->cattr = 0;
+    range->nlb = count;
+    range->slba = lba;
+
+    nvme_io_lock(nd);
+    struct nvme_sqe sqe;
+    memset(&sqe, 0, sizeof(sqe));
+    sqe.cdw0 = NVME_CMD_IO_DSM | (0 << 16);
+    sqe.nsid = NVME_NSID;
+    sqe.prp1 = list_phys;
+    sqe.cdw10 = 0;        /* number of ranges, zero-based: one range */
+    sqe.cdw11 = 1u << 2;  /* AD: deallocate */
+    int ret = nvme_io_submit(nd, &sqe);
+    nvme_io_unlock(nd);
+
+    pmm_free_frame(list_phys);
     return ret == 0 ? 0 : -1;
 }
 
@@ -482,11 +541,34 @@ void nvme_init(void)
     // Read capabilities
     u64 cap = regs->cap;
     u32 to = (u32)((cap >> NVME_CAP_TO_SHIFT) & 0xFF);
+    /* CAP.MQES is zero-based and names the deepest queue this controller
+     * accepts; CAP.DSTRD names the spacing of the doorbell registers. Both were
+     * previously assumed. `b1nix.nvme-queue-depth=N` overrides the depth. */
+    u32 mqes = (u32)(cap & 0xFFFFu) + 1u;
+    nvme.db_stride = 4u << ((u32)(cap >> NVME_CAP_DSTRD_SHIFT) & 0xFu);
+    u32 depth = mqes < NVME_MAX_QUEUE_SIZE ? mqes : NVME_MAX_QUEUE_SIZE;
+    char qbuf[16];
+    if (bootinfo_get_kv("b1nix.nvme-queue-depth", qbuf, sizeof(qbuf)) && qbuf[0]) {
+        u32 v = 0;
+        for (const char *cp = qbuf; *cp >= '0' && *cp <= '9'; cp++)
+            v = v * 10u + (u32)(*cp - '0');
+        if (v >= 2u && v <= mqes)
+            depth = v;
+    }
+    if (depth < 2u)
+        depth = 2u; /* a queue of one entry can never be non-full */
+    nvme.queue_size = depth;
     
     console_write("nvme: cap=0x");
     console_write_hex64(cap);
     console_write(" timeout=");
     console_write_dec(to);
+    console_write(" mqes=");
+    console_write_dec(mqes);
+    console_write(" queue_depth=");
+    console_write_dec(nvme.queue_size);
+    console_write(" dstrd_bytes=");
+    console_write_dec(nvme.db_stride);
     console_write("\n");
     
     // Disable controller if enabled
@@ -500,25 +582,55 @@ void nvme_init(void)
         }
     }
     
-    // Allocate admin submission queue (phys contiguous)
-    nvme.phys_admin_sq = pmm_alloc_frames((NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe) + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE);
+    /* Allocate the four queues (phys contiguous). A deep queue asks for a
+     * physically contiguous run — 1024 SQ entries is sixteen frames — and a
+     * machine that cannot spare one must still get a working controller, so a
+     * failed reservation halves the depth and tries again rather than leaving a
+     * null queue behind, which is what the old single-page allocation could
+     * never hit and therefore never checked for. */
+    for (;;) {
+        usize sq_frames = (nvme.queue_size * sizeof(struct nvme_sqe) + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE;
+        usize cq_frames = (nvme.queue_size * sizeof(struct nvme_cqe) + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE;
+        nvme.phys_admin_sq = pmm_alloc_frames(sq_frames);
+        nvme.phys_admin_cq = pmm_alloc_frames(cq_frames);
+        nvme.phys_io_sq = pmm_alloc_frames(sq_frames);
+        nvme.phys_io_cq = pmm_alloc_frames(cq_frames);
+        if (nvme.phys_admin_sq && nvme.phys_admin_cq && nvme.phys_io_sq &&
+            nvme.phys_io_cq)
+            break;
+        /* The allocator frees one frame at a time; give back whatever the
+         * partial round did reserve. */
+        for (usize f = 0; f < sq_frames; f++) {
+            if (nvme.phys_admin_sq)
+                pmm_free_frame(nvme.phys_admin_sq + (u64)f * NVME_PAGE_SIZE);
+            if (nvme.phys_io_sq)
+                pmm_free_frame(nvme.phys_io_sq + (u64)f * NVME_PAGE_SIZE);
+        }
+        for (usize f = 0; f < cq_frames; f++) {
+            if (nvme.phys_admin_cq)
+                pmm_free_frame(nvme.phys_admin_cq + (u64)f * NVME_PAGE_SIZE);
+            if (nvme.phys_io_cq)
+                pmm_free_frame(nvme.phys_io_cq + (u64)f * NVME_PAGE_SIZE);
+        }
+        nvme.phys_admin_sq = nvme.phys_admin_cq = 0;
+        nvme.phys_io_sq = nvme.phys_io_cq = 0;
+        if (nvme.queue_size <= 2u) {
+            console_write("nvme: cannot reserve queues\n");
+            return;
+        }
+        nvme.queue_size /= 2u;
+        console_write("nvme: queue reservation failed, retrying at depth ");
+        console_write_dec(nvme.queue_size);
+        console_write("\n");
+    }
     nvme.admin_sq = (struct nvme_sqe *)(usize)(nvme.phys_admin_sq + vmm_direct_map_base());
-    memset(nvme.admin_sq, 0, NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe));
-    
-    // Allocate admin completion queue
-    nvme.phys_admin_cq = pmm_alloc_frames((NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe) + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE);
+    memset(nvme.admin_sq, 0, nvme.queue_size * sizeof(struct nvme_sqe));
     nvme.admin_cq = (struct nvme_cqe *)(usize)(nvme.phys_admin_cq + vmm_direct_map_base());
-    memset(nvme.admin_cq, 0, NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe));
-    
-    // Allocate I/O submission queue
-    nvme.phys_io_sq = pmm_alloc_frames((NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe) + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE);
+    memset(nvme.admin_cq, 0, nvme.queue_size * sizeof(struct nvme_cqe));
     nvme.io_sq = (struct nvme_sqe *)(usize)(nvme.phys_io_sq + vmm_direct_map_base());
-    memset(nvme.io_sq, 0, NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe));
-    
-    // Allocate I/O completion queue
-    nvme.phys_io_cq = pmm_alloc_frames((NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe) + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE);
+    memset(nvme.io_sq, 0, nvme.queue_size * sizeof(struct nvme_sqe));
     nvme.io_cq = (struct nvme_cqe *)(usize)(nvme.phys_io_cq + vmm_direct_map_base());
-    memset(nvme.io_cq, 0, NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe));
+    memset(nvme.io_cq, 0, nvme.queue_size * sizeof(struct nvme_cqe));
     
     // Allocate identify buffer (phys contiguous, page aligned)
     // Need 2 pages: one for controller, one for namespace
@@ -527,13 +639,13 @@ void nvme_init(void)
     nvme.identify_ns = (struct nvme_identify_ns *)(usize)(nvme.phys_identify_buf + NVME_PAGE_SIZE + vmm_direct_map_base());
     memset((void *)(usize)(nvme.phys_identify_buf + vmm_direct_map_base()), 0, 2 * NVME_PAGE_SIZE);
     
-    for (int i = 0; i < NVME_MAX_QUEUE_SIZE; i++) {
+    for (u32 i = 0; i < nvme.queue_size; i++) {
         nvme.admin_cq[i].status = 0xFFFF;
         nvme.io_cq[i].status = 0xFFFF;
     }
     
     // Configure admin queue attributes
-    u32 aqa = (NVME_MAX_QUEUE_SIZE - 1) | ((NVME_MAX_QUEUE_SIZE - 1) << 16);
+    u32 aqa = (nvme.queue_size - 1u) | ((nvme.queue_size - 1u) << 16);
     regs->aqa = aqa;
     regs->asq = nvme.phys_admin_sq;
     regs->acq = nvme.phys_admin_cq;
@@ -561,6 +673,30 @@ void nvme_init(void)
     console_write(nvme.identify_ctrl->sn);
     console_write("\n");
     
+    /* MDTS is the largest transfer the controller accepts, expressed as a
+     * power-of-two multiple of the minimum page size (4 KiB here, since CC.MPS
+     * is programmed to 0); 0 means the controller states no limit. Whatever it
+     * says, this driver can only describe one PRP list page — 512 entries of
+     * 4 KiB, i.e. 2 MiB — because it never chains a second list, so the smaller
+     * of the two is the honest ceiling. Linux does the same min() in
+     * nvme_set_queue_limits(). */
+    {
+        u64 prp_limit = (u64)NVME_PAGE_SIZE * (NVME_PAGE_SIZE / sizeof(u64));
+        u64 limit = prp_limit;
+        u8 mdts = nvme.identify_ctrl->mdts;
+        if (mdts && mdts < 32) {
+            u64 dev_limit = (u64)NVME_PAGE_SIZE << mdts;
+            if (dev_limit < limit)
+                limit = dev_limit;
+        }
+        nvme.max_sectors = (u32)(limit / 512);
+        console_write("nvme: mdts=");
+        console_write_dec(mdts);
+        console_write(" max_transfer=");
+        console_write_dec(limit / 1024);
+        console_write(" KiB\n");
+    }
+
     nvme.namespace_count = nvme.identify_ctrl->nn;
     console_write("nvme: namespaces=");
     console_write_dec(nvme.namespace_count);
@@ -679,9 +815,27 @@ void nvme_init(void)
     nvme.blk_dev.read_blocks = nvme_blk_read;
     nvme.blk_dev.write_blocks = nvme_blk_write;
     nvme.blk_dev.flush = nvme_blk_flush;
+    /* Deallocate only if the controller says it has the command. A DSM sent to
+     * a controller that never claimed it comes back as an invalid opcode, and
+     * blkdiscard would then report an I/O error instead of the truth, which is
+     * that this device does not do discard. */
+    if (nvme.identify_ctrl && (nvme.identify_ctrl->oncs & NVME_ONCS_DSM))
+        nvme.blk_dev.discard = nvme_blk_discard;
     nvme.blk_dev.priv = &nvme;
+    /* Publish the controller's own limits so the block layer's read-ahead and
+     * bulk transfers are cut to this device's MDTS rather than to a constant
+     * chosen for the smallest controller in the tree. The segment count is the
+     * PRP list's capacity. The depth is 1: the queue is `queue_size` deep, but
+     * nvme_io_lock() serialises submit-and-wait, so one command is in flight. */
+    nvme.blk_dev.limits.max_sectors = nvme.max_sectors;
+    nvme.blk_dev.limits.max_segments = NVME_PAGE_SIZE / sizeof(u64);
+    nvme.blk_dev.limits.queue_depth = 1;
     blk_register(&nvme.blk_dev);
     
+    console_write("nvme: dataset-management=");
+    console_write(nvme.blk_dev.discard ? "yes" : "no");
+    console_write("\n");
+
     console_write("nvme: registered ");
     console_write(nvme.blk_dev.name);
     console_write(" with ");
@@ -871,8 +1025,8 @@ static void unit_detach(void)
 
 static int nvme_iommu_map_own_pages(void)
 {
-    usize sq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe);
-    usize cq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe);
+    usize sq_bytes = nvme.queue_size * sizeof(struct nvme_sqe);
+    usize cq_bytes = nvme.queue_size * sizeof(struct nvme_cqe);
     if (unit_map_identity(nvme.phys_admin_sq, sq_bytes, 1) != 0 ||
         unit_map_identity(nvme.phys_admin_cq, cq_bytes, 1) != 0 ||
         unit_map_identity(nvme.phys_io_sq, sq_bytes, 1) != 0 ||
@@ -884,8 +1038,8 @@ static int nvme_iommu_map_own_pages(void)
 
 static void nvme_iommu_unmap_own_pages(void)
 {
-    usize sq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe);
-    usize cq_bytes = NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe);
+    usize sq_bytes = nvme.queue_size * sizeof(struct nvme_sqe);
+    usize cq_bytes = nvme.queue_size * sizeof(struct nvme_cqe);
     unit_unmap(nvme.phys_admin_sq & ~(u64)(NVME_PAGE_SIZE - 1), sq_bytes);
     unit_unmap(nvme.phys_admin_cq & ~(u64)(NVME_PAGE_SIZE - 1), cq_bytes);
     unit_unmap(nvme.phys_io_sq & ~(u64)(NVME_PAGE_SIZE - 1), sq_bytes);

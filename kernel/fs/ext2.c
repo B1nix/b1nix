@@ -1,4 +1,5 @@
 #include <b1nix/ext2.h>
+#include <b1nix/bootinfo.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -8,6 +9,12 @@
 #include <b1nix/klog.h>
 
 static struct ext2_fs *ext2_fs_list = NULL;
+
+/* Longest run of adjacent blocks folded into ONE device request. Derived from
+ * what a single command to this device can carry — see blk_run_blocks(). */
+static usize ext2_run_max(const struct ext2_fs *fs) {
+	return blk_run_blocks(fs->bdev, fs->block_size);
+}
 
 static int ext2_read_block(struct ext2_fs *fs, u32 block, void *buffer) {
 	if (!fs || !fs->bdev) return -1;
@@ -480,6 +487,40 @@ static isize ext2_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
 		u32 block_offset = current_offset % fs->block_size;
 		
 		u32 phys_block = ext2_get_inode_block(fs, &inode, block_idx);
+
+		/* Whole blocks that lie next to each other on the disk go in ONE
+		 * request, straight into the caller's buffer.
+		 *
+		 * A 64 KiB read used to be sixteen block reads through a bounce buffer
+		 * and sixteen memcpys — and a file laid out by ext4's extents is very
+		 * nearly always contiguous, so the sixteen were adjacent sectors of one
+		 * run. Measured at ~2 ms a read(2) with the loop, which was the last
+		 * per-page cost left in the browser's start-up after the page cache and
+		 * the unmapping were batched.
+		 *
+		 * Only for the aligned middle of a request: a partial first or last
+		 * block, or a hole, falls through to the one-block path below. */
+		if (phys_block != 0 && block_offset == 0 &&
+		    to_read - bytes_read >= fs->block_size) {
+			u32 spb = fs->block_size / 512;
+			usize max_run = (to_read - bytes_read) / fs->block_size;
+			usize run = 1;
+
+			usize run_max = ext2_run_max(fs);
+
+			if (max_run > run_max)
+				max_run = run_max;
+			while (run < max_run &&
+			       ext2_get_inode_block(fs, &inode, block_idx + (u32)run) ==
+			           phys_block + (u32)run)
+				run++;
+			if (run > 1 &&
+			    blk_read_cached(fs->bdev, (u64)phys_block * spb,
+			                    (u32)(run * spb), buffer + bytes_read) >= 0) {
+				bytes_read += run * fs->block_size;
+				continue;
+			}
+		}
 		if (phys_block == 0) {
 			/* Clamp the hole zero-fill to the bytes actually requested — an
 			 * unclamped block_size-block_offset overruns the caller buffer on a
@@ -504,11 +545,27 @@ static isize ext2_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
 	
 	kfree(block_buf);
 	if (bytes_read > 0) {
-		node->inode->atime = vfs_get_unix_time();
-		struct ext2_inode inode_to_update;
-		if (ext2_read_inode(fs, inode_num, &inode_to_update) == 0) {
-			inode_to_update.i_atime = node->inode->atime;
-			ext2_write_inode(fs, inode_num, &inode_to_update);
+		/* Access time, the way Linux has recorded it since 2.6.30: relatime.
+		 *
+		 * Writing the inode back on EVERY read turns a read-only workload into
+		 * a write-mostly one — an inode read, an inode write and a dirtied
+		 * cache block per read(2), which is most of the two milliseconds a read
+		 * cost here. Nothing but `ls -u` looks at atime, and relatime keeps
+		 * even that useful: refresh it when it is older than the file's own
+		 * mtime or ctime (so "has it been read since it was written" still
+		 * answers), or when it is more than a day stale. */
+		u64 now = vfs_get_unix_time();
+		u64 was = node->inode->atime;
+
+		node->inode->atime = now;
+		if (was < inode.i_mtime || was < inode.i_ctime ||
+		    now > was + 24 * 60 * 60) {
+			struct ext2_inode inode_to_update;
+
+			if (ext2_read_inode(fs, inode_num, &inode_to_update) == 0) {
+				inode_to_update.i_atime = (u32)now;
+				ext2_write_inode(fs, inode_num, &inode_to_update);
+			}
 		}
 	}
 	return bytes_read;
@@ -542,6 +599,40 @@ static isize ext2_vfs_write(struct vfs_node *node, u64 offset,
         break; /* Out of space. */
     }
 		
+		/* Whole blocks that already lie next to each other on the disk go out
+		 * in ONE request, straight from the caller's buffer — the same economy
+		 * the read path gets. A 1 MiB write used to be 256 separate block
+		 * writes, each of them eight 512-byte cache operations, and the browser
+		 * writes its profile and caches in exactly this shape.
+		 *
+		 * Only for the aligned middle of a request: a partial first or last
+		 * block still goes through the read-modify-write below, and a hole is
+		 * allocated one block at a time (allocation may not be contiguous). */
+		if (block_offset == 0 && size - bytes_written >= fs->block_size) {
+			u32 spb = fs->block_size / 512;
+			usize max_run = (size - bytes_written) / fs->block_size;
+			usize run = 1;
+
+			usize run_max = ext2_run_max(fs);
+
+			if (max_run > run_max)
+				max_run = run_max;
+			while (run < max_run) {
+				u32 next = ext2_get_inode_block(fs, &inode, block_idx + (u32)run);
+
+				if (next != phys_block + (u32)run)
+					break;
+				run++;
+			}
+			if (run > 1 &&
+			    blk_write_cached(fs->bdev, (u64)phys_block * spb,
+			                     (u32)(run * spb),
+			                     (void *)(buffer + bytes_written)) >= 0) {
+				bytes_written += run * fs->block_size;
+				continue;
+			}
+		}
+
 		usize chunk = fs->block_size - block_offset;
     if (chunk > size - bytes_written)
       chunk = size - bytes_written;
@@ -1414,16 +1505,40 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
     if (entry->rec_len < 8 || offset + entry->rec_len > inode.i_size)
       break;
 		
-		if (entry->inode != 0) {
+		/* A used entry with a name. An entry whose name is empty — padding, or
+		 * a record this walk should not have believed — produced the path "/"
+		 * from the root directory, which resolves to the root node itself: a
+		 * node with no parent, and the mount then faulted reading the parent it
+		 * assumed was there. Skip it where it is created rather than cope with
+		 * it downstream. */
+		if (entry->inode != 0 && entry->name_len != 0 &&
+		    entry->name_len <= entry->rec_len - 8) {
 			char name[256];
 			memcpy(name, entry->name, entry->name_len);
 			name[entry->name_len] = '\0';
 			
 			if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
+				/* base + '/' + name + NUL, checked.
+				 *
+				 * This concatenation had no bound: a deep enough tree — which a
+				 * browser's installation directory is — walked past the end of the
+				 * 256-byte buffer and over the stack behind it, and the crash
+				 * surfaced later as a garbage parent pointer while filling in the
+				 * node. A path that does not fit is skipped and said out loud
+				 * rather than written past the end. */
 				char full_path[256];
 				usize len = strlen(base_path);
+				usize need = len + 1 + entry->name_len + 1;
+
+				if (need > sizeof(full_path)) {
+					console_write("ext2: path too long, skipping ");
+					console_write(name);
+					console_write("\n");
+					offset += entry->rec_len;
+					continue;
+				}
 				memcpy(full_path, base_path, len);
-        if (full_path[len - 1] != '/')
+				if (len == 0 || full_path[len - 1] != '/')
 					full_path[len++] = '/';
 				memcpy(full_path + len, name, entry->name_len + 1);
 				
@@ -1446,7 +1561,18 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
               dir_node->inode->mtime = child_inode.i_mtime;
               dir_node->inode->ctime = child_inode.i_ctime;
               dir_node->inode->nlink = child_inode.i_links_count;
-              dir_node->inode->fs_id = dir_node->parent->inode->fs_id;
+              /* Inherit the filesystem id from the parent — but only if there
+               * is one. A node published without a parent (a path whose
+               * intermediate directory is not in the tree) is a real bug worth
+               * naming, and dereferencing it turns that bug into a
+               * general-protection fault during mount instead. */
+              if (dir_node->parent && dir_node->parent->inode) {
+                dir_node->inode->fs_id = dir_node->parent->inode->fs_id;
+              } else {
+                console_write("ext2: no parent for ");
+                console_write(full_path);
+                console_write("\n");
+              }
               dir_node->inode->create_cb = ext2_vfs_create;
               dir_node->inode->mknod_cb = ext2_vfs_mknod;
               dir_node->inode->mkdir_cb = ext2_vfs_mkdir;
@@ -1489,7 +1615,13 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
               node->inode->mtime = child_inode.i_mtime;
               node->inode->ctime = child_inode.i_ctime;
               node->inode->nlink = child_inode.i_links_count;
-              node->inode->fs_id = node->parent->inode->fs_id;
+              if (node->parent && node->parent->inode) {
+                node->inode->fs_id = node->parent->inode->fs_id;
+              } else {
+                console_write("ext2: no parent for ");
+                console_write(full_path);
+                console_write("\n");
+              }
               node->inode->release_cb = ext2_vfs_release;
               node->inode->setattr_cb = ext2_vfs_setattr;
               node->inode->fsync_cb = ext2_vfs_fsync;

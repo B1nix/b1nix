@@ -8,7 +8,6 @@
 #include <string.h>
 
 #define AHCI_MAX_PORTS 32
-#define AHCI_COMMAND_SLOTS 32
 
 /* M70: watchdog deadline (10 ms scheduler ticks) for a blocked AHCI I/O wait.
  * The completion IRQ wakes the waiter on the common path; this only bounds a
@@ -174,7 +173,8 @@ static int ahci_build_prdt(struct ahci_cmd_table *cmd_table, void *buffer,
     /* The command table is page-sized; prdt[] starts at offset 128, so it holds
      * (4096-128)/16 = 248 entries. Refuse rather than overflow into adjacent
      * memory if a caller ever asks for a transfer with more page-segments.
-     * (blk.c's raw-device fast path chunks to 256 KiB to stay well under this.) */
+     * (blk.c chunks every transfer to this port's published max_sectors, which
+     * is derived from this very limit, so it never gets here.) */
     if (n >= AHCI_PRDT_MAX_ENTRIES)
       return -1;
     u64 page_off = vaddr & (PAGE_SIZE - 1);
@@ -421,6 +421,112 @@ static int ahci_port_flush(struct ahci_port_state *port) {
   return 0;
 }
 
+/* M109 TRIM: ATA DATA SET MANAGEMENT with the TRIM feature. The payload is a
+ * list of 8-byte entries — 48-bit LBA in the low bits, a 16-bit sector count
+ * above it — padded out to whole 512-byte blocks, sent to the device as an
+ * ordinary DMA write. Only installed for a disk whose IDENTIFY says word 169
+ * bit 0, so a drive that cannot trim reports "not supported" rather than
+ * failing a command it never claimed.
+ *
+ * The entry count per block is 64, and each entry covers up to 65535 sectors,
+ * so one 512-byte block describes 4 M sectors — more than any single call from
+ * the block layer, but the loop is written for the general case anyway. */
+#define AHCI_TRIM_ENTRIES_PER_BLOCK 64
+#define AHCI_TRIM_MAX_SECTORS_PER_ENTRY 65535u
+
+static int ahci_port_trim(struct ahci_port_state *port, u64 lba, u32 count) {
+  if (!port->present || count == 0)
+    return -1;
+
+  u64 *ranges = kzalloc(512);
+  if (!ranges)
+    return -1;
+
+  int rc = 0;
+  u32 done = 0;
+  while (done < count && rc == 0) {
+    memset(ranges, 0, 512);
+    int n = 0;
+    while (n < AHCI_TRIM_ENTRIES_PER_BLOCK && done < count) {
+      u32 chunk = count - done;
+      if (chunk > AHCI_TRIM_MAX_SECTORS_PER_ENTRY)
+        chunk = AHCI_TRIM_MAX_SECTORS_PER_ENTRY;
+      ranges[n++] = ((lba + done) & 0x0000FFFFFFFFFFFFull) |
+                    ((u64)chunk << 48);
+      done += chunk;
+    }
+
+    ahci_port_lock(port);
+    volatile struct ahci_port *p = &port->abar->ports[port->port_num];
+    struct ahci_cmd_header *cmd_hdr = &port->cmd_list[1];
+    struct ahci_cmd_table *cmd_table =
+        (struct ahci_cmd_table *)((u8 *)port->cmd_table + 4096);
+
+    int timeout = 1000000;
+    while ((p->tfd & 0x88) && timeout > 0) {
+      __asm__ volatile("pause");
+      timeout--;
+    }
+    if (timeout == 0) {
+      ahci_port_unlock(port);
+      rc = -1;
+      break;
+    }
+
+    u32 ctba = cmd_hdr->ctba;
+    u32 ctbau = cmd_hdr->ctbau;
+    memset(cmd_hdr, 0, sizeof(struct ahci_cmd_header));
+    cmd_hdr->ctba = ctba;
+    cmd_hdr->ctbau = ctbau;
+    cmd_hdr->cfis_len = sizeof(struct fis_reg_h2d) / 4;
+    cmd_hdr->write = 1; /* host to device */
+
+    int prdt_nw = ahci_build_prdt(cmd_table, ranges, 512);
+    if (prdt_nw < 0) {
+      ahci_port_unlock(port);
+      rc = -1;
+      break;
+    }
+    cmd_hdr->prdtl = (u16)prdt_nw;
+
+    memset(cmd_table->cfis, 0, 64);
+    struct fis_reg_h2d *fis = (struct fis_reg_h2d *)cmd_table->cfis;
+    fis->fis_type = FIS_TYPE_REG_H2D;
+    fis->c = 1;
+    fis->command = ATA_CMD_DATA_SET_MANAGEMENT;
+    fis->feature_low = ATA_DSM_FEATURE_TRIM;
+    fis->device = (1 << 6);
+    /* COUNT is the number of 512-byte range blocks, not sectors. */
+    fis->count_low = 1;
+    fis->count_high = 0;
+
+    p->serr = p->serr;
+    p->ci = (1 << 1);
+    ahci_wait_ci_clear(port, p, (1 << 1), "trim", port->port_num);
+
+    u32 tfd = p->tfd;
+    ahci_port_unlock(port);
+    if (tfd & 0x01) {
+      console_write("ahci: port ");
+      console_write_dec(port->port_num);
+      console_write(" trim error tfd=0x");
+      console_write_hex32(tfd);
+      console_write("\n");
+      rc = -1;
+    }
+  }
+
+  kfree(ranges);
+  return rc;
+}
+
+static int ahci_blk_discard(struct block_device *dev, u64 lba, u32 count) {
+  struct ahci_port_state *port = (struct ahci_port_state *)dev->priv;
+  if (!port)
+    return -1;
+  return ahci_port_trim(port, lba, count);
+}
+
 static int ahci_blk_read(struct block_device *dev, u64 lba, u32 count,
                          void *buffer) {
   struct ahci_port_state *port = (struct ahci_port_state *)dev->priv;
@@ -657,12 +763,19 @@ void ahci_init(void) {
   // Check capabilities
   u32 cap = ahci_bar->cap;
   u32 n_ports = (cap & 0x1F) + 1;
+  /* CAP.NCS (bits 12:8) is the command-slot count this controller supports —
+   * 32 on QEMU. The driver issues one command at a time, so it uses two of
+   * them; reading it is what lets the log say what the hardware offered rather
+   * than repeat a constant that was never checked against anything. */
+  u32 n_cmd_slots = ((cap >> 8) & 0x1F) + 1;
   u32 pi = ahci_bar->pi; // Ports Implemented
 
   console_write("ahci: cap=0x");
   console_write_hex32(cap);
   console_write(" n_ports=");
   console_write_dec(n_ports);
+  console_write(" n_cmd_slots=");
+  console_write_dec(n_cmd_slots);
   console_write(" pi=0x");
   console_write_hex32(pi);
   console_write("\n");
@@ -707,6 +820,13 @@ void ahci_init(void) {
                         ((u64)identify_buf[61] << 16);
             }
             dev->block_count = sectors;
+            /* Word 169 bit 0: the drive has DATA SET MANAGEMENT with TRIM.
+             * Word 217: 1 means non-rotating media; anything else is either a
+             * rotation rate or "not reported", and Linux treats both as
+             * rotating, so BLKROTATIONAL says the same here. */
+            if (identify_buf[169] & 0x0001)
+              dev->discard = ahci_blk_discard;
+            dev->rotational = (identify_buf[217] == 0x0001) ? 0 : 1;
           }
           kfree(identify_buf);
         }
@@ -715,11 +835,26 @@ void ahci_init(void) {
         dev->write_blocks = ahci_blk_write;
         dev->flush = ahci_blk_flush;
         dev->priv = &ports[i];
+        /* What one command to this port can carry, published for the block
+         * layer to clamp its read-ahead and its bulk transfers against. The
+         * segment count is the PRDT the page-sized command table holds; the
+         * sector count is one page-segment fewer, because a buffer that does
+         * not start on a page boundary spends its first entry on the head of a
+         * page. The controller reports NCS command slots (CAP bits 12:8, so
+         * QEMU's 32) but this driver serialises on port->busy and uses two of
+         * them, so the depth it can honestly claim is 1. */
+        dev->limits.max_segments = AHCI_PRDT_MAX_ENTRIES;
+        dev->limits.max_sectors = (AHCI_PRDT_MAX_ENTRIES - 1) * (PAGE_SIZE / 512);
+        dev->limits.queue_depth = 1;
         /* The block layer names it: the next free sd* in the one SCSI-disk
          * sequence AHCI shares with USB mass storage. */
         blk_register_disk(dev, "sd", BLK_BUS_ATA);
         if (!dev->name)
           continue;
+
+        console_write("ahci: trim=");
+        console_write(dev->discard ? "yes" : "no");
+        console_write(dev->rotational ? " rotational=yes\n" : " rotational=no\n");
 
         console_write("ahci: registered ");
         console_write(dev->name);

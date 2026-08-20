@@ -32,6 +32,7 @@
 #define VIRTIO_BLK_T_IN 0
 #define VIRTIO_BLK_T_OUT 1
 #define VIRTIO_BLK_T_FLUSH 4
+#define VIRTIO_BLK_T_DISCARD 11
 #define VIRTIO_BLK_T_WRITE_ZEROES 13
 
 /* Feature bits, legacy (32-bit) feature word. Note these are NOT the request
@@ -42,6 +43,7 @@
 #define VIRTIO_BLK_F_RO (1u << 5)
 #define VIRTIO_BLK_F_BLK_SIZE (1u << 6)
 #define VIRTIO_BLK_F_FLUSH (1u << 9)
+#define VIRTIO_BLK_F_DISCARD (1u << 13)
 #define VIRTIO_BLK_F_WRITE_ZEROES (1u << 14)
 
 /* Device configuration space. On a legacy virtio-PCI device without MSI-X it
@@ -49,6 +51,7 @@
 #define VIRTIO_BLK_CONFIG_CAPACITY 0x14
 #define VIRTIO_BLK_CONFIG_SEG_MAX (VIRTIO_BLK_CONFIG_CAPACITY + 12)
 #define VIRTIO_BLK_CONFIG_BLK_SIZE (VIRTIO_BLK_CONFIG_CAPACITY + 20)
+#define VIRTIO_BLK_CONFIG_MAX_DISCARD_SECTORS (VIRTIO_BLK_CONFIG_CAPACITY + 36)
 #define VIRTIO_BLK_CONFIG_MAX_WZ_SECTORS (VIRTIO_BLK_CONFIG_CAPACITY + 48)
 
 /* Support multiple virtio-blk devices */
@@ -68,6 +71,8 @@ struct virtio_blk_instance {
   u32 max_blocks_per_req;
   /* 0 when the device did not offer WRITE ZEROES or stated no limit. */
   u32 max_write_zeroes_sectors;
+  /* Same, for DISCARD. */
+  u32 max_discard_sectors;
 };
 
 static struct virtio_blk_instance instances[MAX_VIRTIO_BLK];
@@ -241,10 +246,14 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
   if (type == VIRTIO_BLK_T_FLUSH) {
     data = 0;
     data_len = 0;
-  } else if (type == VIRTIO_BLK_T_WRITE_ZEROES) {
+  } else if (type == VIRTIO_BLK_T_WRITE_ZEROES ||
+             type == VIRTIO_BLK_T_DISCARD) {
     dma->zero.sector = lba;
     dma->zero.num_sectors = count;
-    dma->zero.flags = 0; /* do not unmap: the blocks must read back as zeroes */
+    /* flags: bit 0 (unmap) is defined for WRITE ZEROES only, and asking for it
+     * would let the blocks read back as something other than zeroes. DISCARD
+     * defines no flags at all, so 0 is right for both. */
+    dma->zero.flags = 0;
     data = &dma->zero;
     data_len = sizeof(dma->zero);
     data_flags = 0;
@@ -284,7 +293,30 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
    * BLOCKED so a completion racing the block is never lost, and the watchdog
    * deadline bounds a genuinely-lost interrupt to a re-poll. Before the
    * scheduler is live (early-boot root mount) we cooperatively yield-poll. */
-  for (int i = 0; i < 4000; i++) {
+  /* Spin for about a millisecond before giving up on the fast path.
+   *
+   * Four thousand pauses is roughly thirty microseconds, and the device does
+   * not answer that quickly: the request then blocks, and the shortest sleep
+   * this kernel can take is one 10 ms tick. Two per cent of requests took that
+   * sleep, and the ones whose completion interrupt went astray took thirty-two
+   * of them — a third of a second each, which is what made a demand-paged fault
+   * cost milliseconds instead of microseconds and made two runs of the same
+   * workload differ a hundredfold.
+   *
+   * A busy wait of a millisecond is worth trading for a sleep of ten: it costs
+   * at most a millisecond of one core, and it catches a completion that a lost
+   * interrupt would otherwise leave for the watchdog. */
+  /* Reads wait; writes and flushes do not.
+   *
+   * A read is a page the faulting thread cannot continue without, and the
+   * measurement says spinning for it is right: the stalls went to zero and a
+   * demand-paging fault went from milliseconds to 0.16 ms. A write or a flush
+   * is nobody's critical path in the same way, and spinning a millisecond on
+   * every one of them made fdatasync and ftruncate markedly worse — so those
+   * keep the short spin and take the sleep. */
+  int spin = (type == VIRTIO_BLK_T_IN) ? 300000 : 4000;
+
+  for (int i = 0; i < spin; i++) {
     if (inst->vq.used->idx != inst->vq.last_used_idx)
       break;
     __asm__ volatile("pause");
@@ -419,6 +451,23 @@ static int virtio_blk_flush_op(struct block_device *dev) {
  * device zero a range itself instead of us DMA-ing a zero-filled buffer at it.
  * Callers must go through blk_zero_blocks(), which keeps the block cache
  * coherent with a write the cache never saw. */
+/* M109 DISCARD. Same payload and the same one-command-at-a-time path as WRITE
+ * ZEROES; the difference is only that the device is told the range is free
+ * rather than told to make it read as zeroes. */
+static int virtio_blk_discard_op(struct block_device *dev, u64 lba, u32 count) {
+  struct virtio_blk_instance *inst = (struct virtio_blk_instance *)dev->priv;
+  u32 done = 0;
+  while (done < count) {
+    u32 chunk = count - done;
+    if (inst->max_discard_sectors && chunk > inst->max_discard_sectors)
+      chunk = inst->max_discard_sectors;
+    if (do_virtio_blk_req(inst, lba + done, chunk, 0, VIRTIO_BLK_T_DISCARD) < 0)
+      return -1;
+    done += chunk;
+  }
+  return 0;
+}
+
 static int virtio_blk_write_zeroes_op(struct block_device *dev, u64 lba,
                                       u32 count) {
   struct virtio_blk_instance *inst = (struct virtio_blk_instance *)dev->priv;
@@ -510,7 +559,7 @@ void virtio_blk_init(void) {
     u32 host_features = virtio_get_host_features(&inst->dev);
     u32 wanted = VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_BLK_SIZE |
                  VIRTIO_BLK_F_RO | VIRTIO_BLK_F_FLUSH |
-                 VIRTIO_BLK_F_WRITE_ZEROES;
+                 VIRTIO_BLK_F_DISCARD | VIRTIO_BLK_F_WRITE_ZEROES;
     inst->features = host_features & wanted;
     virtio_set_guest_features(&inst->dev, inst->features);
     virtio_set_status(&inst->dev, VIRTIO_STATUS_ACKNOWLEDGE |
@@ -557,12 +606,27 @@ void virtio_blk_init(void) {
     }
     inst->max_blocks_per_req = max_data_desc > 1 ? (max_data_desc - 1u) * 8u : 1u;
 
+    /* Publish what this queue can do so the block layer sizes its read-ahead
+     * and its bulk transfers against this device instead of against a constant
+     * picked for the smallest controller in the tree. The depth is 1 because
+     * virtio_blk_lock() serialises the instance and every request reuses
+     * descriptor 0 as its chain head — the virtqueue is deeper than that, the
+     * driver is not, and saying so is what keeps the layers above honest. */
+    inst->blk.limits.max_sectors = inst->max_blocks_per_req;
+    inst->blk.limits.max_segments = max_data_desc;
+    inst->blk.limits.queue_depth = 1;
+
     inst->blk.read_blocks = virtio_blk_read;
     inst->blk.write_blocks = virtio_blk_write;
     if (inst->features & VIRTIO_BLK_F_RO)
       inst->blk.write_blocks = 0; /* the device would reject every write */
     if (inst->features & VIRTIO_BLK_F_FLUSH)
       inst->blk.flush = virtio_blk_flush_op;
+    if (inst->features & VIRTIO_BLK_F_DISCARD) {
+      inst->max_discard_sectors =
+          inl((u16)(inst->dev.port_base + VIRTIO_BLK_CONFIG_MAX_DISCARD_SECTORS));
+      inst->blk.discard = virtio_blk_discard_op;
+    }
     if (inst->features & VIRTIO_BLK_F_WRITE_ZEROES) {
       inst->max_write_zeroes_sectors =
           inl((u16)(inst->dev.port_base + VIRTIO_BLK_CONFIG_MAX_WZ_SECTORS));
@@ -597,6 +661,8 @@ void virtio_blk_init(void) {
     console_write(inst->features & VIRTIO_BLK_F_FLUSH ? " flush=yes" : " flush=no");
     console_write(inst->features & VIRTIO_BLK_F_WRITE_ZEROES ? " write-zeroes=yes"
                                                              : " write-zeroes=no");
+    console_write(inst->features & VIRTIO_BLK_F_DISCARD ? " discard=yes"
+                                                        : " discard=no");
     console_write(" max-blocks=");
     console_write_dec(inst->max_blocks_per_req);
     if (inst->features & VIRTIO_BLK_F_BLK_SIZE) {

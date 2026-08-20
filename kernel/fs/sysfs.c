@@ -31,7 +31,16 @@ struct sysfs_node {
   const char *content; /* if set: emitted verbatim (kmalloc'd, never freed) */
   int live_blk;        /* >=0: emit the live 512-sector count of blk_at(live_blk)
                         * (so e.g. losetup size changes are reflected); else -1 */
+  /* Volume identity, read from the device on each read for the same reason
+   * `size` is: a loop device's superblock only exists once something is
+   * attached, and the sysfs tree is built long before that. */
+  int ident_blk;       /* >=0: index into the block registry, else -1 */
+  int ident_kind;      /* SYSFS_IDENT_* */
 };
+
+#define SYSFS_IDENT_UUID   1
+#define SYSFS_IDENT_LABEL  2
+#define SYSFS_IDENT_FSTYPE 3
 
 /* Whole-device size in 512-byte sectors, regardless of the device block size. */
 static u64 blk_sectors(struct block_device *d) {
@@ -60,6 +69,25 @@ static isize sysfs_read_cb(struct vfs_node *node, u64 offset, char *buffer,
     char tmp[32];
     int len = snprintf(tmp, sizeof(tmp), "%lu\n",
                        d ? (unsigned long)blk_sectors(d) : 0UL);
+    return sysfs_emit(tmp, (usize)len, offset, buffer, size);
+  }
+  if (sn->ident_kind) {
+    struct block_device *d = blk_at((usize)sn->ident_blk);
+    char val[64];
+    val[0] = '\0';
+    if (d) {
+      if (sn->ident_kind == SYSFS_IDENT_UUID)
+        (void)blk_probe_uuid(d, val, sizeof(val));
+      else if (sn->ident_kind == SYSFS_IDENT_LABEL)
+        (void)blk_probe_label(d, val, sizeof(val));
+      else {
+        const char *t = blk_probe_fstype(d);
+        strncpy(val, t ? t : "", sizeof(val) - 1);
+        val[sizeof(val) - 1] = '\0';
+      }
+    }
+    char tmp[72];
+    int len = snprintf(tmp, sizeof(tmp), "%s\n", val);
     return sysfs_emit(tmp, (usize)len, offset, buffer, size);
   }
   if (sn->content)
@@ -106,7 +134,10 @@ static struct vfs_node *sysfs_mkchild(struct vfs_node *parent,
  * The string is kmalloc'd and lives for the lifetime of the mount. */
 static void sysfs_mkstr(struct vfs_node *parent, const char *name,
                         const char *fmt, ...) {
-  char tmp[64];
+  /* Big enough for the whole of a `uevent` file: four properties, one of them
+   * a device name. A truncated uevent is not a smaller uevent — mdev reads
+   * DEVNAME out of it and names the node it creates after what it finds. */
+  char tmp[192];
   va_list ap;
   va_start(ap, fmt);
   int len = vsnprintf(tmp, sizeof(tmp), fmt, ap);
@@ -145,77 +176,347 @@ static void sysfs_mk_live_size(struct vfs_node *parent, int blk_index) {
   n->inode->read_cb = sysfs_read_cb;
 }
 
-/* Build the Linux-style block topology from the block registry: a
- * /sys/block/<disk>/{dev,size,removable,ro} dir with partition subdirs, a
- * /sys/dev/block/<maj:min>/{size,partition} mirror, and a flat /sys/class/block.
- * Major is a synthetic 8 (sd-like); minor is the registry index, matching
- * /proc/partitions and /proc/self/mountinfo. The *structure* is built once at
- * mount — every storage driver (incl. the eight loopN) has registered by the
- * time /sys mounts (kernel/main.c), so no readdir-time refresh (and its
- * cross-CPU locking) is needed. `size` is still a **live** read of the device's
- * current block_count, so a `losetup` attach is reflected without a rebuild. */
+/* uuid/label/fstype for one device, each read live from its superblock. This
+ * is where `lsblk -o UUID` and udev-style by-uuid rules look, and it is the
+ * same answer `findfs UUID=…` gets from reading the device itself. */
+static void sysfs_mk_ident(struct vfs_node *parent, int blk_index) {
+  static const struct {
+    const char *name;
+    int kind;
+  } attrs[] = {{"uuid", SYSFS_IDENT_UUID},
+               {"label", SYSFS_IDENT_LABEL},
+               {"fstype", SYSFS_IDENT_FSTYPE}};
+  for (usize i = 0; i < sizeof(attrs) / sizeof(attrs[0]); i++) {
+    struct vfs_node *n = sysfs_mkchild(parent, attrs[i].name, VFS_DEVICE, 0);
+    if (!n)
+      continue;
+    struct sysfs_node *sn = kzalloc(sizeof(*sn));
+    if (!sn)
+      continue;
+    sn->live_blk = -1;
+    sn->ident_blk = blk_index;
+    sn->ident_kind = attrs[i].kind;
+    n->inode->data = sn;
+    n->inode->read_cb = sysfs_read_cb;
+  }
+}
+
+/* ── Block topology (/sys/block, /sys/dev/block, /sys/class/block) ──────────
+ *
+ * The Linux-style block hierarchy, built from the block registry: a
+ * /sys/block/<disk>/ directory with partition subdirectories, a
+ * /sys/dev/block/<major:minor>/ mirror keyed by device number, and a flat
+ * /sys/class/block. The major is BLK_SYSFS_MAJOR and the minor is the registry
+ * index, which is exactly what /proc/partitions and /proc/self/mountinfo
+ * print, so the three agree about which device is which.
+ *
+ * Every device directory carries the two files a hot-plug helper reads:
+ * `dev` ("major:minor") and `uevent` (MAJOR/MINOR/DEVNAME/DEVTYPE). `mdev -s`
+ * walks /sys/dev, and without DEVNAME it would name the node it creates after
+ * the containing directory — "8:0", which is no use to anyone.
+ *
+ * The tree is no longer frozen at mount. A device registered after boot (a
+ * loop device created through LOOP_CTL_ADD) has to appear, and one that is
+ * removed has to disappear, so the three directories refresh themselves from
+ * the registry on readdir and on lookup. The refresh is a single atomic load
+ * unless something has actually been plugged or unplugged.
+ *
+ * `size` is a live read of the device's current block_count for the same
+ * reason it always was: a losetup attach changes it without changing the
+ * registry at all.
+ */
+
+#define SYSFS_MAX_BLK 64
+
+static struct vfs_node *g_sysfs_block;
+static struct vfs_node *g_sysfs_devblock;
+static struct vfs_node *g_sysfs_classblock;
+/* The registry generation the tree below was built from. */
+static u32 g_sysfs_blk_gen;
+static volatile int g_sysfs_blk_lock;
+
+/* What is currently published for registry index i. The name is kept here so a
+ * device that has gone away can be unpublished under the name it HAD, rather
+ * than under whatever name now occupies that slot. */
+static struct {
+  char name[32];
+  u8 used;
+} g_sysfs_blkent[SYSFS_MAX_BLK];
+
+/* Child lookup by name. find_child takes the VFS tree's read lock, which is
+ * what makes this safe against a readdir running on another CPU; the reference
+ * it returns is dropped immediately because the parent's own link keeps the
+ * node alive, and every removal here happens under g_sysfs_blk_lock with this
+ * caller holding it. */
+static struct vfs_node *sysfs_child(struct vfs_node *parent, const char *name) {
+  if (!parent)
+    return 0;
+  struct vfs_node *c = find_child(parent, name);
+  if (!c)
+    return 0;
+  vfs_node_put(c);
+  return c;
+}
+
+/* Release the per-file state behind one node. The nodes themselves go with the
+ * subtree's refcount; this is the kmalloc'd content and descriptor that
+ * sysfs_mkstr and friends attached, which nothing else would ever free. */
+static void sysfs_free_payload(struct vfs_node *n) {
+  if (!n || !n->inode || n->inode->read_cb != sysfs_read_cb)
+    return;
+  struct sysfs_node *sn = (struct sysfs_node *)n->inode->data;
+  n->inode->data = 0;
+  n->inode->read_cb = 0;
+  if (!sn)
+    return;
+  if (sn->content)
+    kfree((void *)sn->content);
+  kfree(sn);
+}
+
+static void sysfs_free_subtree(struct vfs_node *n) {
+  if (!n)
+    return;
+  for (struct vfs_node *c = n->first_child; c; c = c->next_sibling)
+    sysfs_free_subtree(c);
+  sysfs_free_payload(n);
+}
+
+/* Unlink one named child and free everything under it. 1 if it was there. */
+static int sysfs_drop(struct vfs_node *parent, const char *name) {
+  struct vfs_node *n = sysfs_child(parent, name);
+  if (!n)
+    return 0;
+  vfs_detach_child(parent, n);
+  sysfs_free_subtree(n);
+  vfs_node_put(n);
+  return 1;
+}
+
+/* Registry index of a device, or -1. */
+static int sysfs_blk_index(struct block_device *dev) {
+  usize n = blk_count();
+  for (usize i = 0; i < n; i++) {
+    if (blk_at(i) == dev)
+      return (int)i;
+  }
+  return -1;
+}
+
+/* The `uevent` file, in the shape Linux writes it: the properties a helper
+ * reads for a device it did not learn about from a netlink message. */
+static void sysfs_mk_uevent(struct vfs_node *dir, usize index, const char *name,
+                            const char *devtype) {
+  sysfs_mkstr(dir, "uevent", "MAJOR=%d\nMINOR=%lu\nDEVNAME=%s\nDEVTYPE=%s\n",
+              BLK_SYSFS_MAJOR, (unsigned long)index, name, devtype);
+}
+
+/* Publish one registry entry in all three directories. */
+static void sysfs_block_publish(usize index, struct block_device *d) {
+  if (!d || !d->name || index >= SYSFS_MAX_BLK)
+    return;
+
+  int part = blk_is_partition(d);
+  struct block_device *parent = part ? blk_partition_parent(d) : 0;
+  const char *devtype = part ? "partition" : "disk";
+  int partno = 0;
+  if (part) {
+    partno = blk_partition_number(d);
+    if (partno < 0)
+      partno = (int)(index + 1);
+  }
+
+  char majmin[24];
+  snprintf(majmin, sizeof(majmin), "%d:%lu", BLK_SYSFS_MAJOR,
+           (unsigned long)index);
+
+  /* /sys/block/<disk>/ — a partition is a subdirectory of its disk, which the
+   * ascending walk over the registry has already published (a partition is
+   * only ever registered by the scan that follows its disk). */
+  struct vfs_node *bparent =
+      part ? ((parent && parent->name)
+                  ? sysfs_child(g_sysfs_block, parent->name)
+                  : 0)
+           : g_sysfs_block;
+  if (bparent && !sysfs_child(bparent, d->name)) {
+    struct vfs_node *bd = sysfs_mkchild(bparent, d->name, VFS_DIRECTORY, 0);
+    if (bd) {
+      sysfs_mkstr(bd, "dev", "%s\n", majmin);
+      sysfs_mk_live_size(bd, (int)index);
+      if (part) {
+        sysfs_mkstr(bd, "partition", "%d\n", partno);
+      } else {
+        sysfs_mkstr(bd, "removable", "%d\n", blk_is_removable(d));
+        sysfs_mkstr(bd, "ro", "0\n");
+      }
+      sysfs_mk_ident(bd, (int)index);
+      sysfs_mk_uevent(bd, index, d->name, devtype);
+    }
+  }
+
+  /* /sys/dev/block/<major:minor>/ */
+  if (!sysfs_child(g_sysfs_devblock, majmin)) {
+    struct vfs_node *dbd =
+        sysfs_mkchild(g_sysfs_devblock, majmin, VFS_DIRECTORY, 0);
+    if (dbd) {
+      sysfs_mkstr(dbd, "dev", "%s\n", majmin);
+      sysfs_mk_live_size(dbd, (int)index);
+      if (part)
+        sysfs_mkstr(dbd, "partition", "%d\n", partno);
+      sysfs_mk_uevent(dbd, index, d->name, devtype);
+    }
+  }
+
+  /* An entry for the partition under its disk's /sys/dev/block directory, so
+   * that directory's getdents enumerates it (lsblk reads only the name). */
+  if (part && parent) {
+    int pidx = sysfs_blk_index(parent);
+    if (pidx >= 0) {
+      char pmajmin[24];
+      snprintf(pmajmin, sizeof(pmajmin), "%d:%d", BLK_SYSFS_MAJOR, pidx);
+      struct vfs_node *pdir = sysfs_child(g_sysfs_devblock, pmajmin);
+      if (pdir && !sysfs_child(pdir, d->name))
+        sysfs_mkchild(pdir, d->name, VFS_DIRECTORY, 0);
+    }
+  }
+
+  /* /sys/class/block/<name>/ — flat, disks and partitions alike. */
+  if (!sysfs_child(g_sysfs_classblock, d->name)) {
+    struct vfs_node *cb =
+        sysfs_mkchild(g_sysfs_classblock, d->name, VFS_DIRECTORY, 0);
+    if (cb) {
+      sysfs_mkstr(cb, "dev", "%s\n", majmin);
+      sysfs_mk_uevent(cb, index, d->name, devtype);
+    }
+  }
+
+  strncpy(g_sysfs_blkent[index].name, d->name,
+          sizeof(g_sysfs_blkent[index].name) - 1);
+  g_sysfs_blkent[index].name[sizeof(g_sysfs_blkent[index].name) - 1] = '\0';
+  g_sysfs_blkent[index].used = 1;
+}
+
+/* Take one registry entry back out of all three directories. */
+static void sysfs_block_unpublish(usize index) {
+  if (index >= SYSFS_MAX_BLK || !g_sysfs_blkent[index].used)
+    return;
+  const char *name = g_sysfs_blkent[index].name;
+
+  char majmin[24];
+  snprintf(majmin, sizeof(majmin), "%d:%lu", BLK_SYSFS_MAJOR,
+           (unsigned long)index);
+  sysfs_drop(g_sysfs_devblock, majmin);
+  sysfs_drop(g_sysfs_classblock, name);
+
+  /* Under /sys/block the device is either a disk at the top or a partition
+   * inside one; try the top first, then each disk. */
+  if (!sysfs_drop(g_sysfs_block, name)) {
+    for (struct vfs_node *c = g_sysfs_block->first_child; c;
+         c = c->next_sibling) {
+      if (sysfs_drop(c, name))
+        break;
+    }
+  }
+  /* And the enumeration stub inside its disk's /sys/dev/block directory. */
+  for (struct vfs_node *c = g_sysfs_devblock->first_child; c;
+       c = c->next_sibling) {
+    if (sysfs_drop(c, name))
+      break;
+  }
+
+  g_sysfs_blkent[index].used = 0;
+  g_sysfs_blkent[index].name[0] = '\0';
+}
+
+/* Bring the three directories in line with the registry. Cheap by design: the
+ * generation only moves when a device is registered or unregistered, so the
+ * readdir of /sys that every `ls` performs costs one atomic load. */
+static void sysfs_block_refresh(void) {
+  if (!g_sysfs_block || !g_sysfs_devblock || !g_sysfs_classblock)
+    return;
+  u32 gen = blk_generation();
+  if (gen == __atomic_load_n(&g_sysfs_blk_gen, __ATOMIC_ACQUIRE))
+    return;
+
+  while (__sync_lock_test_and_set(&g_sysfs_blk_lock, 1))
+    ;
+  if (gen != g_sysfs_blk_gen) {
+    __atomic_store_n(&g_sysfs_blk_gen, gen, __ATOMIC_RELEASE);
+    usize n = blk_count();
+    for (usize i = 0; i < SYSFS_MAX_BLK; i++) {
+      struct block_device *d = (i < n) ? blk_at(i) : 0;
+      const char *nm = (d && d->name) ? d->name : 0;
+      /* Gone, or the slot now holds a different device. */
+      if (g_sysfs_blkent[i].used &&
+          (!nm || strcmp(nm, g_sysfs_blkent[i].name) != 0))
+        sysfs_block_unpublish(i);
+      if (nm && !g_sysfs_blkent[i].used)
+        sysfs_block_publish(i, d);
+    }
+  }
+  __sync_lock_release(&g_sysfs_blk_lock);
+}
+
+/* The block layer telling sysfs that the registry moved.
+ *
+ * The readdir and lookup hooks below are not enough on their own, and a device
+ * that went away is where that shows: the path resolver only calls lookup_cb
+ * when find_child MISSES, so as long as the stale directory is still in the
+ * child list every lookup of it succeeds and the refresh is never reached —
+ * /sys/block/<gone device>/dev went on being readable forever. Registration
+ * and unregistration therefore push, and the pull below stays as the cheap
+ * safety net for a listing.
+ *
+ * Called before the uevent is broadcast, so a listener that reads /sys the
+ * instant it sees the announcement finds the device already published (or
+ * already gone). No-op until /sys is mounted. */
+void sysfs_block_changed(void) { sysfs_block_refresh(); }
+
+static isize sysfs_block_readdir(struct vfs_node *dir, usize offset,
+                                 struct dirent *buf, usize max_entries) {
+  sysfs_block_refresh();
+  return vfs_readdir_children(dir, offset, buf, max_entries);
+}
+
+/* A direct open of /sys/block/<new device>/dev must work without anything
+ * having listed the directory first — that is exactly what mdev does when it
+ * turns a uevent's DEVPATH into a path. */
+static int sysfs_block_lookup(struct vfs_node *dir, const char *name) {
+  sysfs_block_refresh();
+  return sysfs_child(dir, name) ? 0 : -1;
+}
+
+static void sysfs_block_hook(struct vfs_node *dir) {
+  if (!dir || !dir->inode)
+    return;
+  dir->inode->readdir_cb = sysfs_block_readdir;
+  dir->inode->lookup_cb = sysfs_block_lookup;
+  dir->inode->readdir_lists_children = 1;
+}
+
 static void sysfs_build_block(struct vfs_node *root) {
   struct vfs_node *block = sysfs_mkchild(root, "block", VFS_DIRECTORY, 0);
   struct vfs_node *devp = sysfs_mkchild(root, "dev", VFS_DIRECTORY, 0);
-  struct vfs_node *devblock = devp ? sysfs_mkchild(devp, "block", VFS_DIRECTORY, 0) : 0;
+  struct vfs_node *devblock =
+      devp ? sysfs_mkchild(devp, "block", VFS_DIRECTORY, 0) : 0;
   struct vfs_node *classp = sysfs_mkchild(root, "class", VFS_DIRECTORY, 0);
   struct vfs_node *classblock =
       classp ? sysfs_mkchild(classp, "block", VFS_DIRECTORY, 0) : 0;
   if (!block || !devblock || !classblock)
     return;
 
-  usize n = blk_count();
-  for (usize i = 0; i < n; i++) {
-    struct block_device *d = blk_at(i);
-    if (!d || !d->name || blk_is_partition(d))
-      continue;
+  g_sysfs_block = block;
+  g_sysfs_devblock = devblock;
+  g_sysfs_classblock = classblock;
+  /* A remount starts from an empty tree, so nothing may be remembered from the
+   * previous one. */
+  memset(g_sysfs_blkent, 0, sizeof(g_sysfs_blkent));
+  g_sysfs_blk_gen = 0; /* blk_generation() is never 0 — forces the first build */
 
-    char majmin[24];
-    snprintf(majmin, sizeof(majmin), "8:%lu", (unsigned long)i);
-    struct vfs_node *bd = sysfs_mkchild(block, d->name, VFS_DIRECTORY, 0);
-    struct vfs_node *dbd = sysfs_mkchild(devblock, majmin, VFS_DIRECTORY, 0);
-    if (bd) {
-      sysfs_mkstr(bd, "dev", "8:%lu\n", (unsigned long)i);
-      sysfs_mk_live_size(bd, (int)i);
-      sysfs_mkstr(bd, "removable", "%d\n", blk_is_removable(d));
-      sysfs_mkstr(bd, "ro", "0\n");
-    }
-    if (dbd)
-      sysfs_mk_live_size(dbd, (int)i);
-    struct vfs_node *cb = sysfs_mkchild(classblock, d->name, VFS_DIRECTORY, 0);
-    if (cb)
-      sysfs_mkstr(cb, "dev", "8:%lu\n", (unsigned long)i);
-
-    /* Partitions whose parent is this disk. */
-    for (usize j = 0; j < n; j++) {
-      struct block_device *p = blk_at(j);
-      if (!p || !p->name || blk_partition_parent(p) != d)
-        continue;
-      int num = blk_partition_number(p);
-      if (num < 0)
-        num = (int)(j + 1);
-
-      struct vfs_node *pd = bd ? sysfs_mkchild(bd, p->name, VFS_DIRECTORY, 0) : 0;
-      if (pd)
-        sysfs_mkstr(pd, "dev", "8:%lu\n", (unsigned long)j);
-      /* Entry under the disk's /sys/dev/block dir so its getdents enumerates
-       * the partition (lsblk only reads the entry name here). */
-      if (dbd)
-        sysfs_mkchild(dbd, p->name, VFS_DIRECTORY, 0);
-
-      char pmajmin[24];
-      snprintf(pmajmin, sizeof(pmajmin), "8:%lu", (unsigned long)j);
-      struct vfs_node *dpd = sysfs_mkchild(devblock, pmajmin, VFS_DIRECTORY, 0);
-      if (dpd) {
-        sysfs_mk_live_size(dpd, (int)j);
-        sysfs_mkstr(dpd, "partition", "%d\n", num);
-      }
-      struct vfs_node *cbp =
-          sysfs_mkchild(classblock, p->name, VFS_DIRECTORY, 0);
-      if (cbp)
-        sysfs_mkstr(cbp, "dev", "8:%lu\n", (unsigned long)j);
-    }
-  }
+  sysfs_block_hook(block);
+  sysfs_block_hook(devblock);
+  sysfs_block_hook(classblock);
+  sysfs_block_refresh();
 }
 
 /* ── content generators ── */
