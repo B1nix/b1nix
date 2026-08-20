@@ -5,6 +5,7 @@
 #include <b1nix/ipi.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+#include <b1nix/namespace.h>
 #include <b1nix/panic.h>
 #include <b1nix/posix.h>
 #include <b1nix/runqueue.h>
@@ -98,6 +99,19 @@ extern void arch_fpu_capture_clean(void *area);
  * area a context switch is still using. Kernel threads never touch the FPU and
  * so never get one — they keep using the 512-byte FXSAVE area in struct task. */
 static void *g_task_xsave[MAX_TASKS];
+
+/* The last calls each thread made.
+ *
+ * A parked thread's register state says only that it is inside futex; what it
+ * did on the way in is the part that can be compared against the same program
+ * traced on a working kernel. A tracer in the guest cannot supply that (ptrace
+ * has no group-stop, so strace dies on PTRACE_LISTEN) and console tracing
+ * changes the timing it is meant to measure. Sixteen numbers per thread costs
+ * two stores per system call and 128 KB, and the watchdog prints them beside
+ * the thread that stopped. */
+#define SYSRING_DEPTH 64
+static u16 g_sysring[MAX_TASKS][SYSRING_DEPTH];
+static u8 g_sysring_pos[MAX_TASKS];
 static void *g_task_xsave_raw[MAX_TASKS];
 
 static usize task_index(const struct task *task);
@@ -271,6 +285,18 @@ static int  g_task_execed[MAX_TASKS];
 static int  g_task_nice[MAX_TASKS];
 static struct rlimit g_task_rlimits[MAX_TASKS][16];
 static usize g_task_tgid[MAX_TASKS];
+/* How far into exit a task has got.
+ *
+ * A task observed READY with its exiting flag set is looping somewhere in the
+ * teardown, and the teardown is long: fd tables that write back, address-space
+ * release, reparenting, the leader's wait for its threads. A single number per
+ * task, printed beside it in the watchdog dump, turns "stuck in exit" into a
+ * line of code. */
+static u8 g_task_exit_stage[MAX_TASKS];
+#define EXIT_STAGE(n) do { \
+    if (current_task) g_task_exit_stage[task_index(current_task)] = (n); \
+  } while (0)
+
 /* Set once a task has committed to scheduler_exit_current() with a chosen exit
  * code. A sibling that processes its own SIGKILL re-posts SIGKILL to the whole
  * thread group (terminate_group_siblings); without this guard the already-exiting
@@ -641,6 +667,7 @@ static struct task *find_unused_task(void) {
       g_task_fdlock_owner[i] = 0;
       g_task_exiting[i] = 0;
       g_task_tgid[i] = 0;
+      g_task_exit_stage[i] = 0; /* a recycled slot must not inherit a stage */
       if (g_task_cmdline[i]) {
         kfree(g_task_cmdline[i]);
         g_task_cmdline[i] = 0;
@@ -736,6 +763,11 @@ static struct task *find_unused_task(void) {
  * find_unused_task). The store also publishes any prior writes (e.g. the
  * kfree of the task's resources) before the slot becomes claimable again. */
 static void free_task_slot(struct task *t) {
+  /* The slot is about to become claimable by a new task, so this is the last
+   * moment the id means anything: release the pid-namespace number here rather
+   * than at exit, where the task is still a zombie its parent must be able to
+   * name. */
+  namespace_task_reaped(t->id);
   /* M63: drop the task's seccomp filter chain (unref; frees at zero) BEFORE
    * taking tasks_lock — filter_unref calls kfree and tasks_lock is a leaf lock
    * that must not nest the heap lock. Idempotent: clears the side-table slot. */
@@ -1666,6 +1698,8 @@ int scheduler_fork_current(void) {
     extern void shm_fork_inherit(usize parent_pid, usize child_pid);
     shm_fork_inherit(parent->id, child->id);
   }
+  /* M109: a fork inherits the parent's namespaces. */
+  namespace_fork_inherit(parent->id, child->id);
 
   // 5. Clone credentials and file descriptors
   task_init_cred(child);
@@ -2721,6 +2755,10 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   /* M80: a new thread runs userspace code too, so give it its own XSAVE area
    * before it can be scheduled. */
   task_fpu_alloc(child);
+  /* M109: the child starts in the parent's namespaces, threads included — a
+   * thread of a process that unshared is in that process's namespaces. */
+  namespace_fork_inherit(parent->id, child->id);
+
   /* M80: PTRACE_O_TRACECLONE / TRACEVFORK — same as fork, with the event that
    * matches how this child was created. */
   ptrace_event_child(parent, child,
@@ -3557,6 +3595,26 @@ void scheduler_on_timer_tick(void) {
     eventpoll_timer_tick();
   }
 
+  /* Diagnostic poke, off unless asked for.
+   *
+   * A stall that ends the moment anything unrelated happens — a signal, a task
+   * dump — is a lost wake-up, and the question is which side lost it. Waking
+   * every poller ten times a second answers it: if the run then proceeds, the
+   * wake that went missing was one that should have reached a poll/epoll
+   * sleeper, and the hunt belongs in the code that fails to announce readiness
+   * rather than in the futex path. `b1nix.poll-poke`. */
+  {
+    static int poke = -1;
+
+    if (poke < 0)
+      poke = bootinfo_has_flag("b1nix.poll-poke") ? 1 : 0;
+    if (poke && (scheduler_ticks % 10) == 0) {
+      extern void *vfs_poll_chan;
+
+      scheduler_wake_all(vfs_poll_chan);
+    }
+  }
+
   /* T8 (M28 #8): preemptive yield from the timer ISR. The historical concern
    * that motivated the cooperative model — VFS chain walks (find_child /
    * vfs_get_mount_for_node / add_node) traversing parent/sibling chains
@@ -3843,6 +3901,7 @@ void scheduler_exit_group(int exit_code) {
    * spurious SIGNALED status (M29 stress-exit-code). terminate_group_siblings
    * skips tasks whose g_task_exiting flag is set. */
   g_task_exiting[task_index(current_task)] = 1;
+  EXIT_STAGE(10);
   u64 flags = interrupts_save();
   /* M86: if this group's leader already left through exit(2) and is waiting for
    * us, give it this exit status — a parked leader must not be turned into a
@@ -3890,6 +3949,7 @@ void scheduler_exit_thread(int exit_code) {
   usize me = current_task->id;
   usize idx = task_index(current_task);
   usize tgid = g_task_tgid[idx];
+  EXIT_STAGE(1);
   if (tgid == me) {
     /* Release the tid word (and wake its futex) BEFORE parking: the surviving
      * threads need it to make progress, and progress is exactly what this loop
@@ -3931,10 +3991,12 @@ void scheduler_exit_thread(int exit_code) {
        * backstop: a thread can die on a path that never reaches the wake (a
        * fatal fault handled in the scheduler), and a lost wake-up here would
        * wedge the process forever rather than merely delay it. */
+      EXIT_STAGE(2);
       scheduler_block_on_timeout(&g_task_parked_leader[idx], 20);
     }
     g_task_parked_leader[idx] = 0;
   }
+  EXIT_STAGE(3);
   scheduler_exit_current(exit_code);
 }
 
@@ -4064,6 +4126,10 @@ void scheduler_exit_current(int exit_code) {
   if (current_task == 0) {
     panic("scheduler_exit_current without current task");
   }
+  /* M109: drop this task's namespace row. The namespaces themselves are
+   * reclaimed later, from unshare/setns — releasing a mount namespace means
+   * dropping VFS references, which has no business running here. */
+  namespace_task_exit(current_task->id);
   {
     /* Close this thread's last CPU interval before handing its time over. */
     sched_acct_leave_kernel();
@@ -4086,6 +4152,26 @@ void scheduler_exit_current(int exit_code) {
     console_write_dec(current_task->id);
     console_write(" code=0x");
     console_write_hex64((u64)(unsigned)exit_code);
+    console_write("\n");
+  }
+
+  /* Who left, when, and with what.
+   *
+   * A browser that stalls because a process it depends on quietly went away
+   * gives no sign of it: the survivors simply wait. One line per exiting
+   * thread is a handful of lines a run and says immediately whether a
+   * disappearance preceded the stall. b1nix.trace-exit turns it on. */
+  if (bootinfo_has_flag("b1nix.trace-exit") && current_task->pml4_phys) {
+    console_write("EXIT: pid=");
+    console_write_dec(current_task->id);
+    console_write(" tgid=");
+    console_write_dec(g_task_tgid[task_index(current_task)]);
+    console_write(" ppid=");
+    console_write_dec(current_task->parent_id);
+    console_write(" code=0x");
+    console_write_hex64((u64)(unsigned)exit_code);
+    console_write(" name=");
+    console_write(current_task->name ? current_task->name : "?");
     console_write("\n");
   }
 
@@ -4178,6 +4264,7 @@ void scheduler_exit_current(int exit_code) {
     panic("dead thread resumed");
   }
 
+  EXIT_STAGE(20);
   /* fd-table teardown, with interrupts enabled so writebacks can sleep.
    * Drop our reference first: with CLONE_FILES threads still alive the table
    * must survive — only the LAST user closes the handles and frees the
@@ -4199,6 +4286,7 @@ void scheduler_exit_current(int exit_code) {
 
   interrupts_disable();
 
+  EXIT_STAGE(30);
   reparent_children_and_signal_orphans(current_task);
 
   /* Free credentials */
@@ -4226,6 +4314,7 @@ void scheduler_exit_current(int exit_code) {
   current_task->state = TASK_DEAD;
   g_have_proc_zombies = 1; /* arm the orphan sweep in scheduler_yield */
 
+  EXIT_STAGE(40);
   post_sigchld_to_parent(current_task->parent_id, 0);
 
   /* F6 (M28 #7): kick the BSP (or whichever CPU runs the parent kthread)
@@ -4235,6 +4324,7 @@ void scheduler_exit_current(int exit_code) {
    * userspace test runs. */
   scheduler_notify_wait_event(current_task->parent_id);
 
+  EXIT_STAGE(50);
   scheduler_yield();
   panic("dead task resumed");
 }
@@ -4786,8 +4876,54 @@ void scheduler_lease_clear_here(const char *site) {
     task_lease_clear(current_task, site);
 }
 
+void scheduler_note_syscall(u32 nr) {
+  struct task *t = current_task;
+
+  if (!t || !t->pml4_phys)
+    return; /* kernel threads make no interesting sequence */
+  usize idx = task_index(t);
+
+  if (idx >= MAX_TASKS)
+    return;
+  u8 pos = g_sysring_pos[idx];
+
+  g_sysring[idx][pos] = (u16)nr;
+  g_sysring_pos[idx] = (u8)((pos + 1) % SYSRING_DEPTH);
+}
+
+/* Oldest first, so the line reads in the order the calls happened. */
+static void scheduler_dump_sysring(usize idx) {
+  if (idx >= MAX_TASKS)
+    return;
+  int any = 0;
+
+  for (int k = 0; k < SYSRING_DEPTH; k++) {
+    u8 pos = (u8)((g_sysring_pos[idx] + k) % SYSRING_DEPTH);
+
+    if (!g_sysring[idx][pos] && !any)
+      continue; /* ring not yet full — skip the empty prefix */
+    if (!any) {
+      console_write(" calls=");
+      any = 1;
+    }
+    console_write_dec(g_sysring[idx][pos]);
+    console_write(",");
+  }
+  if (any)
+    console_write("\n");
+}
+
 void scheduler_dump_tasks(void) {
   extern void futex_dump_waiters(void);
+  {
+    /* Where the run spends itself, printed first because it is the line most
+     * often wanted and the dump below is long. */
+    extern void syscall_prof_dump(void);
+    extern void pf_prof_dump(void);
+
+    syscall_prof_dump();
+    pf_prof_dump();
+  }
   futex_dump_waiters();
   {
     /* Which fcntl a spinning thread repeats. See vfs_fcntl_dump_counts. */
@@ -4903,6 +5039,10 @@ void scheduler_dump_tasks(void) {
       console_write_dec(g_task_maxrss_pages[i] * 4);
       console_write(" sys=");
       console_write_dec(g_task_syscall[i]);
+      if (g_task_exiting[i] && g_task_exit_stage[i]) {
+        console_write(" xstage=");
+        console_write_dec(g_task_exit_stage[i]);
+      }
       /* The last user address seen for this thread.
        *
        * g_task_user_rip is only written when the timer tick catches a thread
@@ -5001,7 +5141,23 @@ void scheduler_dump_tasks(void) {
         console_write("\n    user stack (rsp=0x");
         console_write_hex64(sp);
         console_write("):");
-        for (unsigned k = 0; k < 1024 && shown < 24; k++) {
+        /* Deeper for the process under investigation.
+         *
+         * Twenty-four words is enough to see that a thread is in a library and
+         * not enough to say which call chain put it there. With the debug
+         * symbols for the same binary on the host, a few hundred words resolve
+         * into a readable trace — the walk cannot tell a return address from a
+         * pointer that happens to look like one, but a symbol table can. Only
+         * for the group leader, and only when asked, because it is a hundred
+         * lines a thread. */
+        unsigned deep_words = 24, deep_scan = 1024;
+
+        if (bootinfo_has_flag("b1nix.deep-stack") &&
+            g_task_tgid[i] == T(i)->id) {
+          deep_words = 220;
+          deep_scan = 8192;
+        }
+        for (unsigned k = 0; k < deep_scan && shown < deep_words; k++) {
           u64 addr = sp + (u64)k * 8;
           u64 page = addr & ~(u64)(PAGE_SIZE - 1);
           u64 frame = paging_user_frame(T(i)->pml4_phys, page);
@@ -5027,16 +5183,24 @@ void scheduler_dump_tasks(void) {
              * filled the walk with pointers to data. The page table cannot help
              * — this kernel does not mark data pages non-executable — so the
              * mapping's origin is the best available test. */
-            if (value >= v->start && value < v->end && v->node &&
-                v->node->name[0] &&
+            /* The main executable has no file behind its mappings — the ELF
+             * loader builds them itself — so requiring a name threw away every
+             * return address into the program under investigation and left only
+             * the libraries. A deep walk therefore accepts any present mapping
+             * and reports the name when there is one; telling code from data is
+             * the symbol table's job, on the host, where there is one to
+             * consult. */
+            int named = v->node && v->node->name[0];
+
+            if (value >= v->start && value < v->end &&
+                (named || deep_words > 24) &&
                 ({ u64 _pte = paging_user_pte(T(i)->pml4_phys,
                                               value & ~(u64)(PAGE_SIZE - 1));
                    (_pte & VMM_PRESENT) != 0; })) {
               console_write("\n      0x");
               console_write_hex64(value);
               console_write(" ");
-              console_write(v->node && v->node->name[0] ? v->node->name
-                                                        : "<anonymous>");
+              console_write(named ? v->node->name : "exe");
               console_write("+0x");
               console_write_hex64(value - v->start);
               console_write((v->prot & PROT_EXEC) ? " x" : " -");
@@ -5073,6 +5237,7 @@ void scheduler_dump_tasks(void) {
       console_write("\t");
       console_write(T(i)->name);
       console_write("\n");
+      scheduler_dump_sysring(i);
     }
   }
 }
@@ -5139,6 +5304,30 @@ static void fdtable_publish_grown(struct vfs_handle **new_table, int *new_flags,
   kfree(old_flags);
 }
 
+/* The fd-table ceiling in force on this machine. Computed once on first use —
+ * PMM is up long before any fd is opened — and cached. Two CPUs racing here
+ * compute the same value from the same inputs, so the race is benign. */
+usize sched_fd_limit(void) {
+  static usize cached;
+
+  if (cached)
+    return cached;
+
+  u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
+  /* Four descriptors per MiB of RAM: 1024 at 256 MiB (the old fixed value, so
+   * nothing changes on a small guest) and 32768 on an 8 GiB machine. */
+  u32 want = bootinfo_get_u32(
+      "b1nix.max-fds",
+      (u32)(ram_mb > 0x100000ULL ? 0x100000ULL : ram_mb) * 4u);
+
+  if (want < SCHED_MIN_FD_LIMIT)
+    want = SCHED_MIN_FD_LIMIT;
+  if (want > SCHED_MAX_FD_LIMIT)
+    want = SCHED_MAX_FD_LIMIT;
+  cached = want;
+  return cached;
+}
+
 int scheduler_fd_alloc(struct vfs_handle *handle) {
   if (!current_task || !handle)
     return -1;
@@ -5161,14 +5350,14 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
     }
   }
 
-  if (current_task->fd_capacity >= SCHED_MAX_FD_LIMIT || current_task->fd_capacity >= nofile_limit) {
+  if (current_task->fd_capacity >= sched_fd_limit() || current_task->fd_capacity >= nofile_limit) {
     fd_lock_release();
     return -EMFILE;
   }
 
   usize new_capacity = current_task->fd_capacity * 2;
-  if (new_capacity > SCHED_MAX_FD_LIMIT)
-    new_capacity = SCHED_MAX_FD_LIMIT;
+  if (new_capacity > sched_fd_limit())
+    new_capacity = sched_fd_limit();
   if (new_capacity > nofile_limit)
     new_capacity = nofile_limit;
   if (new_capacity <= current_task->fd_capacity) {
@@ -5227,7 +5416,7 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
   fd_lock_acquire();
 
   if ((usize)fd >= current_task->fd_capacity) {
-    if ((usize)fd >= SCHED_MAX_FD_LIMIT) {
+    if ((usize)fd >= sched_fd_limit()) {
       fd_lock_release();
       return -1;
     }
@@ -5235,8 +5424,8 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
     while (new_capacity <= (usize)fd) {
       new_capacity *= 2;
     }
-    if (new_capacity > SCHED_MAX_FD_LIMIT)
-      new_capacity = SCHED_MAX_FD_LIMIT;
+    if (new_capacity > sched_fd_limit())
+      new_capacity = sched_fd_limit();
 
     struct vfs_handle **new_table = kzalloc(new_capacity * sizeof(struct vfs_handle *));
     if (!new_table) {

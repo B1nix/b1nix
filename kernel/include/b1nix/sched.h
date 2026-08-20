@@ -115,7 +115,26 @@ struct cpu_context {
 #define NSIG_MAX 63
 #define SIG_IS_RT(s) ((s) >= SIGRTMIN && (s) <= SIGRTMAX)
 #define SCHED_MAX_FDS 64
-#define SCHED_MAX_FD_LIMIT 1024
+
+/* Largest a process's fd table may grow to.
+ *
+ * The table itself already grows by doubling from SCHED_MAX_FDS, so this is
+ * purely the ceiling on that doubling — and at a flat 1024 it was a ceiling
+ * setrlimit(RLIMIT_NOFILE) could not raise. 1024 is Linux's SOFT default; its
+ * hard limit is 1048576, and any fd-hungry program (a browser, a server with
+ * many sockets, a build fanning out pipes) asks for more and gets EMFILE here
+ * no matter what it set its own rlimit to.
+ *
+ * SCHED_MIN_FD_LIMIT is the FLOOR (1024 — the previous fixed value, so a small
+ * guest is unchanged) and SCHED_MAX_FD_LIMIT the CEILING (65536, which is 512
+ * KiB of table plus 256 KiB of flags for one process, and only if it actually
+ * opens that many). The value in force is sched_fd_limit(), derived from RAM
+ * and overridable with `b1nix.max-fds=N`. RLIMIT_NOFILE still applies on top —
+ * this is the ceiling a process may raise its own limit TO, not a grant. */
+#define SCHED_MIN_FD_LIMIT 1024
+#define SCHED_MAX_FD_LIMIT 65536
+
+usize sched_fd_limit(void);
 
 /* task->exit_code encoding: low 8 bits carry the exit status or the signal
  * number; this bit marks death-by-signal. Numeric overloading (the old
@@ -503,6 +522,10 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
  * (10 ms granularity); the call returns -ETIMEDOUT if it elapses before a wake.
  * timeout_ms == 0 means block indefinitely. */
 int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms);
+/* FUTEX_REQUEUE: wake nr_wake waiters on uaddr1, move nr_requeue of the rest
+ * to uaddr2's queue. Returns the number woken. */
+int scheduler_futex_requeue(u64 uaddr1, u64 uaddr2, int nr_wake, int nr_requeue,
+                            int priv);
 void scheduler_futex_wake_addr(u64 uaddr, int val);
 void scheduler_futex_cleanup_task(usize task_id);
 

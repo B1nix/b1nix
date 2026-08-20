@@ -8,7 +8,11 @@
 #include <b1nix/kmsg.h>
 #include <b1nix/linux_abi.h>
 #include <b1nix/mm.h>
+
+/* arch/x86_64/tlb.c; a no-op on a single-CPU boot. */
+void tlb_shootdown_all(void);
 #include <b1nix/mqueue.h>
+#include <b1nix/namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/inotify.h>
@@ -278,6 +282,33 @@ static int is_user_range_valid(const void *src, usize size, int write) {
   if (end < start) return 0; // Overflow
   if (end > USER_SPACE_LIMIT) return 0; // Not in userspace
 
+  /* Fast path: ask the page tables, not the VMA list.
+   *
+   * The list walk below is O(number of mappings), and it ran on every copy in
+   * or out of userspace. A browser holds thousands of mappings and makes
+   * hundreds of thousands of copying calls in a start-up, which put a plain
+   * clock_gettime at about a hundred microseconds — the syscall did almost
+   * nothing and spent all of it walking a list. A page that is present, marked
+   * user, and (for a write) writable is by construction covered by a mapping
+   * with those permissions, so the tables answer the same question in four
+   * loads. Anything else — a lazy page, a COW page, a hole — falls through to
+   * the walk, which stays the authority. */
+  {
+    extern u64 vmm_query_leaf_pte(u64 vaddr);
+    u64 need = VMM_PRESENT | VMM_USER | (write ? VMM_WRITABLE : 0);
+    u64 v = start & ~(u64)(PAGE_SIZE - 1);
+    int resident = 1;
+
+    for (; v < end; v += PAGE_SIZE) {
+      if ((vmm_query_leaf_pte(v) & need) != need) {
+        resident = 0;
+        break;
+      }
+    }
+    if (resident)
+      return 1;
+  }
+
   // Verify that the entire range is covered by VMAs with correct permissions
   for (u64 v = start; v < end; ) {
     struct vm_area *vma = t->vma_list;
@@ -456,6 +487,10 @@ static isize sys_readv(int fd, const struct b1nix_iovec *uiov, int iovcnt) {
   return total;
 }
 
+/* Bytes moved per iteration of the fd→fd pump below. Linux's splice moves a
+ * full pipe — 16 pages — in one go, and this is that same 64 KiB. */
+#define FILE_COPY_CHUNK (64 * 1024)
+
 /* M73: shared fd→fd byte pump backing sendfile/copy_file_range/splice. Reads up
  * to `count` bytes from in_fd and writes them to out_fd through a kernel bounce
  * buffer. When *in_off / *out_off is provided the transfer starts there and the
@@ -469,13 +504,28 @@ static isize file_copy_range(int in_fd, u64 *in_off, int out_fd, u64 *out_off,
    * shared descriptor's own file offset is never disturbed — thread-safe, unlike
    * an lseek-save-restore that another thread sharing the fd could observe
    * mid-transfer. A NULL offset uses and advances the fd's own offset. */
-  char kbuf[4096];
+  /* The bounce buffer is a heap allocation, not a stack array: this loop is
+   * the whole of sendfile/copy_file_range/splice, and at one 4 KiB round trip
+   * per iteration a large copy pays a read and a write syscall's worth of VFS
+   * work per page. Linux moves a pipeful — 16 pages, 64 KiB — per iteration,
+   * which is the size asked for here; the 4 KiB stack buffer stays as the
+   * fallback for when the heap cannot spare it, so the path never fails for
+   * want of the larger buffer. */
+  char stack_buf[4096];
+  usize bufsz = count < FILE_COPY_CHUNK ? count : FILE_COPY_CHUNK;
+  if (bufsz < sizeof(stack_buf))
+    bufsz = sizeof(stack_buf);
+  char *kbuf = (bufsz > sizeof(stack_buf)) ? (char *)kmalloc(bufsz) : 0;
+  if (!kbuf) {
+    kbuf = stack_buf;
+    bufsz = sizeof(stack_buf);
+  }
   isize total = 0;
   isize err = 0;
   u64 ipos = in_off ? *in_off : 0;
   u64 opos = out_off ? *out_off : 0;
   while (count > 0) {
-    usize chunk = count > sizeof(kbuf) ? sizeof(kbuf) : count;
+    usize chunk = count > bufsz ? bufsz : count;
     isize r = in_off ? vfs_pread(in_fd, kbuf, chunk, ipos)
                      : vfs_read(in_fd, kbuf, chunk);
     if (r < 0) {
@@ -509,6 +559,8 @@ static isize file_copy_range(int in_fd, u64 *in_off, int out_fd, u64 *out_off,
       break; /* short read = EOF */
   }
 
+  if (kbuf != stack_buf)
+    kfree(kbuf);
   if (in_off)
     *in_off = ipos;
   if (out_off)
@@ -2017,13 +2069,26 @@ static isize sys_mount(const char *user_src, const char *user_target,
     return -EFAULT;
   }
 
+  /* MS_MOVE moves a mount that already exists, so there is no filesystem type
+   * to name and userspace passes NULL — switch_root calls
+   * mount(".", "/", NULL, MS_MOVE, NULL). Paths go through the resolver
+   * because that "." is relative to the caller's cwd. */
+  if (flags & MS_MOVE) {
+    int mres = vfs_move_mount(ksrc, ktarget);
+    kfree(ksrc);
+    kfree(ktarget);
+    return (isize)mres;
+  }
+
   char *ktype = kmalloc(64);
   if (!ktype) {
     kfree(ksrc);
     kfree(ktarget);
     return -ENOMEM;
   }
-  if (strncpy_from_user(ktype, user_type, 64) < 0) {
+  if (!user_type)
+    ktype[0] = '\0';
+  else if (strncpy_from_user(ktype, user_type, 64) < 0) {
     kfree(ksrc);
     kfree(ktarget);
     kfree(ktype);
@@ -2049,6 +2114,35 @@ static isize sys_umount(const char *user_target) {
 
   int res = vfs_umount(ktarget);
   kfree(ktarget);
+  return (isize)res;
+}
+
+static isize sys_pivot_root(const char *user_new, const char *user_old) {
+  /* Replacing the root of every process is CAP_SYS_ADMIN territory, and Linux
+   * gates it there too. */
+  struct cred *c = scheduler_get_current_cred();
+  if (c && c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_ADMIN))
+    return -EPERM;
+
+  char *knew = kmalloc(VFS_MAX_PATH);
+  char *kold = kmalloc(VFS_MAX_PATH);
+  if (!knew || !kold) {
+    kfree(knew);
+    kfree(kold);
+    return -ENOMEM;
+  }
+  if (strncpy_from_user(knew, user_new, VFS_MAX_PATH) < 0 ||
+      strncpy_from_user(kold, user_old, VFS_MAX_PATH) < 0) {
+    kfree(knew);
+    kfree(kold);
+    return -EFAULT;
+  }
+  knew[VFS_MAX_PATH - 1] = '\0';
+  kold[VFS_MAX_PATH - 1] = '\0';
+
+  int res = vfs_pivot_root(knew, kold);
+  kfree(knew);
+  kfree(kold);
   return (isize)res;
 }
 
@@ -2113,40 +2207,98 @@ static isize sys_linux_stat_family(u64 lnr, u64 arg0, u64 arg1) {
 /* System node/domain name. sethostname(2)/setdomainname(2) update these, and
  * uname(2), /proc/sys/kernel/{hostname,domainname} and /sys/kernel/hostname all
  * read them, so a hostname set at boot (OpenRC's `hostname` service) is visible
- * everywhere a Linux program looks for it. */
-static char g_kernel_hostname[65] = "b1nix";
-static char g_kernel_domainname[65] = "(none)";
-
+ * everywhere a Linux program looks for it.
+ *
+ * M109: the pair lives in the caller's UTS namespace
+ * (kernel/sched/namespace.c). Because every reader in the tree comes through
+ * these two functions, routing them through the namespace is what makes
+ * `unshare -u` change the name for the caller and for nobody else. */
 void kernel_hostname_get(char *buf, usize len) {
-  if (!buf || len == 0)
-    return;
-  copy_cstr(buf, len, g_kernel_hostname);
+  namespace_uts_get_host(buf, len);
 }
 
 void kernel_domainname_get(char *buf, usize len) {
-  if (!buf || len == 0)
-    return;
-  copy_cstr(buf, len, g_kernel_domainname);
+  namespace_uts_get_domain(buf, len);
 }
 
 int kernel_hostname_set(const char *name) {
-  if (!name)
-    return -EFAULT;
-  copy_cstr(g_kernel_hostname, sizeof(g_kernel_hostname), name);
-  return 0;
+  return namespace_uts_set_host(name);
 }
 
 int kernel_domainname_set(const char *name) {
-  if (!name)
-    return -EFAULT;
-  copy_cstr(g_kernel_domainname, sizeof(g_kernel_domainname), name);
-  return 0;
+  return namespace_uts_set_domain(name);
+}
+
+/* ── M109: PID-namespace translation at the syscall boundary ──────────────
+ *
+ * Inside the kernel a task has exactly one id. A PID namespace is a view of
+ * those ids, so the translation belongs here, where a number crosses between
+ * the kernel and a task that may be looking at a private numbering — not in
+ * the scheduler, which would then have to carry a namespace with every id.
+ *
+ * With no namespace in play both helpers return their argument, so the normal
+ * path costs one predictable branch (namespace_active() is a plain load). */
+
+/* A pid arriving FROM userspace. Returns 0 for "no task of that number in the
+ * caller's namespace", which every caller turns into ESRCH. */
+static usize ns_pid_in(u64 user_pid) {
+  return namespace_pid_from_user((usize)user_pid);
+}
+
+/* A pid on its way OUT to userspace. Errors (<= 0) pass through untouched. */
+static u64 ns_pid_out(u64 kernel_pid) {
+  if ((isize)kernel_pid <= 0)
+    return kernel_pid;
+  usize v = namespace_pid_to_user((usize)kernel_pid);
+  /* A task the caller cannot name should never reach here — it can only be a
+   * descendant, and every descendant is numbered in every ancestor namespace.
+   * Report 0 rather than leaking the kernel's own id if it ever does. */
+  return (u64)v;
+}
+
+/* ── M109: unshare(2) / setns(2) ────────────────────────────────────────── */
+static isize sys_unshare(u64 flags) {
+  struct cred *c = scheduler_get_current_cred();
+  if (!c || !cred_has_cap(c, CAP_SYS_ADMIN))
+    return -EPERM;
+  return namespace_unshare(flags);
+}
+
+static isize sys_setns(int fd, int nstype) {
+  struct cred *c = scheduler_get_current_cred();
+  if (!c || !cred_has_cap(c, CAP_SYS_ADMIN))
+    return -EPERM;
+
+  /* The descriptor is a /proc/<pid>/ns/<kind> handle, which is what nsenter(1)
+   * opens; it carries the namespace it named at open() time. */
+  u32 pin = 0;
+  int rc = vfs_fd_ns_pin(fd, &pin);
+  if (rc != 0)
+    return rc;
+  int kind = VFS_NS_PIN_KIND(pin);
+  u32 id = VFS_NS_PIN_ID(pin);
+
+  /* A non-zero nstype is the caller telling us what it believes the handle is;
+   * disagreeing with it is an error, not something to paper over. */
+  if (nstype != 0) {
+    int want = -1;
+    switch ((unsigned)nstype) {
+    case B1NIX_CLONE_NEWUTS: want = NS_UTS; break;
+    case B1NIX_CLONE_NEWNS:  want = NS_MNT; break;
+    case B1NIX_CLONE_NEWPID: want = NS_PID; break;
+    case B1NIX_CLONE_NEWNET: want = NS_NET; break;
+    default: return -EINVAL;
+    }
+    if (want != kind)
+      return -EINVAL;
+  }
+  return namespace_setns(kind, id);
 }
 
 static void fill_b1nix_utsname(struct b1nix_utsname *uts) {
   memset(uts, 0, sizeof(*uts));
   copy_cstr(uts->sysname, sizeof(uts->sysname), "B1NIX");
-  copy_cstr(uts->nodename, sizeof(uts->nodename), g_kernel_hostname);
+  kernel_hostname_get(uts->nodename, sizeof(uts->nodename));
   copy_cstr(uts->release, sizeof(uts->release), B1NIX_VERSION_STR);
   copy_cstr(uts->version, sizeof(uts->version), "#1 SMP");
 #if defined(__aarch64__)
@@ -2622,7 +2774,7 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
   struct b1nix_pollfd *fds = stack_fds;
   struct b1nix_pollfd *heap_fds = 0;
 
-  if (nfds > SCHED_MAX_FD_LIMIT)
+  if (nfds > sched_fd_limit())
     return -EINVAL; /* more than a process can even have open */
   if (nfds > POLL_STACK_FDS) {
     heap_fds = kmalloc(nfds * sizeof(struct b1nix_pollfd));
@@ -3391,9 +3543,22 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
       console_write(t->name ? t->name : "?");
       console_write("\n");
     }
-    // Unmap existing mapping range
-    for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
-      vmm_unmap_page(v);
+    /* Unmap the range this MAP_FIXED replaces, batched: same reason as
+     * munmap's loop — one flush per batch instead of one per page. */
+    {
+      enum { FIXED_BATCH = 64 };
+      u64 frames[FIXED_BATCH];
+      u64 stop = vaddr + length;
+
+      for (u64 v = vaddr; v < stop;) {
+        usize n = (usize)((stop - v) / PAGE_SIZE);
+
+        if (n > FIXED_BATCH)
+          n = FIXED_BATCH;
+        vmm_unmap_range_nosync(v, n, frames);
+        tlb_shootdown_all();
+        v += (u64)n * PAGE_SIZE;
+      }
     }
     vma_delete_range(t, vaddr, vaddr + length);
   } else {
@@ -3656,9 +3821,58 @@ static isize sys_munmap(void *addr, usize length) {
   if (end < start || end > 0x00007FFFFFFFFFFFULL)
     return -EINVAL;
 
-  // 1. Unmap pages from hardware page tables and free physical frames
-  for (u64 v = start; v < end; v += PAGE_SIZE) {
-    vmm_unmap_page(v);
+  /* Unmap in batches, one cross-CPU flush each.
+   *
+   * vmm_unmap_page tells every other core about ONE page: a global lock, an
+   * inter-processor interrupt, and a spin until all of them answer. A browser
+   * unmapping tens of megabytes at a time paid that per 4 KiB — measured at
+   * 69 ms a call, the single largest system-call cost of its start-up. The
+   * pages are retired exactly as before; only the flush is shared. */
+  {
+    /* One broadcast TLB shootdown per large chunk, not per sixty-four pages.
+     *
+     * The shootdown is an IPI to every other CPU taken under a global lock and
+     * waited for; at a batch of sixty-four pages a browser tearing down a
+     * gigabyte of arena paid four thousand of them, and one such munmap was
+     * measured at ~1.8 s — a hundred seconds of a two-minute start-up spent in
+     * this loop alone. The frames cannot be returned to the allocator before
+     * the shootdown (a stale entry on another CPU would then name a reused
+     * page), so they are collected first, released after, and the chunk is
+     * sized by the array that holds them: 16 MiB of address space per round,
+     * from a 32 KiB heap allocation, with the old stack-sized batch as the
+     * fallback when the heap has nothing to spare. */
+    /* 4096 pages per round meant one broadcast shootdown per 16 MiB, and a
+     * browser releasing a gigabyte still paid sixty-four of them — measured at
+     * ~109 ms for such a call. A round of 65536 pages covers 256 MiB for one
+     * shootdown, at the cost of a 512 KiB frame array that is only allocated
+     * when the range is actually that large. */
+    enum { MUNMAP_BATCH_MAX = 65536, MUNMAP_BATCH_MIN = 64 };
+    u64 stack_frames[MUNMAP_BATCH_MIN];
+    usize batch = (usize)((end - start) / PAGE_SIZE);
+
+    if (batch > MUNMAP_BATCH_MAX)
+      batch = MUNMAP_BATCH_MAX;
+    u64 *frames = (batch > MUNMAP_BATCH_MIN)
+                      ? (u64 *)kmalloc(batch * sizeof(u64))
+                      : 0;
+    if (!frames) {
+      frames = stack_frames;
+      batch = MUNMAP_BATCH_MIN;
+    }
+
+    for (u64 v = start; v < end;) {
+      usize n = (usize)((end - v) / PAGE_SIZE);
+
+      if (n > batch)
+        n = batch;
+      usize nframes = vmm_unmap_range_collect(v, n, frames);
+      tlb_shootdown_all();
+      for (usize i = 0; i < nframes; i++)
+        pmm_free_frame(frames[i]);
+      v += (u64)n * PAGE_SIZE;
+    }
+    if (frames != stack_frames)
+      kfree(frames);
   }
 
   // 2. Update VMA list using the new robust helper
@@ -3892,8 +4106,10 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
     flags |= VMM_WRITABLE;
 
   // 1. Update hardware page tables
-  for (u64 vaddr = start; vaddr < end; vaddr += PAGE_SIZE) {
-    paging_mprotect_page(vaddr, flags);
+  {
+    extern void paging_mprotect_range(u64 start, u64 end, u64 flags);
+
+    paging_mprotect_range(start, end, flags);
   }
 
   // 2. Update VMAs (handle splitting if necessary)
@@ -3989,9 +4205,22 @@ static isize sys_madvise(void *addr, usize length, int advice) {
    * MAP_PRIVATE pages MADV_FREE is treated as MADV_DONTNEED: the page content is
    * discarded and the next access yields a zeroed page (documented simplification
    * — b1nix has no lazy-reclaim queue to keep the old contents on a read). */
-  for (u64 v = start; v < end; v += PAGE_SIZE) {
+  /* Walk the range one mapping at a time, not one page at a time.
+   *
+   * The old loop searched the whole VMA list for every page and then unmapped
+   * that page on its own, which meant a broadcast TLB shootdown per 4 KiB: a
+   * discard of a few megabytes cost tens of milliseconds, all of it IPI. The
+   * pages of one mapping share its flags, so the lookup belongs outside the
+   * loop, and the shootdown belongs once per run — with the frames released
+   * only after it, since a frame handed back early can be reused while another
+   * CPU still has a stale translation to it. */
+  enum { MADV_BATCH = 512 };
+  u64 frames[MADV_BATCH];
+
+  for (u64 v = start; v < end;) {
     struct vm_area *vma = t->vma_list;
     struct vm_area *cover = 0;
+
     while (vma) {
       if (v >= vma->start && v < vma->end) {
         cover = vma;
@@ -4002,21 +4231,39 @@ static isize sys_madvise(void *addr, usize length, int advice) {
     if (!cover)
       return -ENOMEM; /* unmapped page in range */
 
+    u64 seg_end = cover->end < end ? cover->end : end;
     int anon = (cover->flags & MAP_ANONYMOUS) != 0 || cover->node == 0;
     int shared = (cover->flags & MAP_SHARED) != 0;
-    if (!anon || shared)
-      continue; /* never discard file/shared data */
+
+    if (!anon || shared) {
+      v = seg_end; /* never discard file/shared data */
+      continue;
+    }
 
     u64 vmm_flags = VMM_USER;
     if (cover->prot & PROT_WRITE)
       vmm_flags |= VMM_WRITABLE;
 
-    /* Drop the present frame (vmm_unmap_page frees it + unregisters from the
-     * eviction list), then re-arm the page as lazy so the next touch refaults
-     * to a fresh zeroed anonymous page (page-fault Case 1). */
-    vmm_unmap_page(v);
-    vmm_set_lazy(v);
-    paging_mprotect_page(v, vmm_flags);
+    while (v < seg_end) {
+      usize n = (usize)((seg_end - v) / PAGE_SIZE);
+
+      if (n > MADV_BATCH)
+        n = MADV_BATCH;
+      usize nframes = vmm_unmap_range_collect(v, n, frames);
+      tlb_shootdown_all();
+      for (usize i = 0; i < nframes; i++)
+        pmm_free_frame(frames[i]);
+      /* Re-arm each page as lazy so the next touch refaults to a fresh zeroed
+       * anonymous page (page-fault Case 1).
+       *
+       * One call per page, not two: vmm_set_lazy and paging_mprotect_page each
+       * walk four levels, and this runs while the caller — PartitionAlloc,
+       * returning memory to the system — holds its global lock, so every other
+       * thread in the browser waits behind the second walk for nothing. */
+      for (usize i = 0; i < n; i++)
+        vmm_set_lazy_flags(v + (u64)i * PAGE_SIZE, vmm_flags);
+      v += (u64)n * PAGE_SIZE;
+    }
   }
 
   return 0;
@@ -4370,6 +4617,78 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
  * so the interval that ends here is user time and everything until the return
  * is system time. Kernel-internal callers pass frame == 0 and are already
  * inside a system-time interval. */
+/* ── System-call profile ────────────────────────────────────────────────────
+ * Counts and cycles per call number, printed by the watchdog. Off unless
+ * b1nix.sysprof is on the command line. */
+#define SYSPROF_SLOTS 512
+static u64 g_sysprof_count[SYSPROF_SLOTS];
+static u64 g_sysprof_cycles[SYSPROF_SLOTS];
+
+static inline u64 syscall_prof_now(void) {
+  u32 lo, hi;
+
+  __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+  return ((u64)hi << 32) | lo;
+}
+
+static int syscall_prof_enabled(void) {
+  static int on = -1;
+
+  if (on < 0)
+    on = bootinfo_has_flag("b1nix.sysprof") ? 1 : 0;
+  return on;
+}
+
+static void syscall_prof_account(u32 nr, u64 cycles) {
+  if (nr >= SYSPROF_SLOTS)
+    return;
+  __atomic_fetch_add(&g_sysprof_count[nr], 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_sysprof_cycles[nr], cycles, __ATOMIC_RELAXED);
+}
+
+/* The ten call numbers that have cost the most, newest totals each time. A
+ * running total rather than an interval: the question is what the start-up
+ * spends its life in, not what it did in the last thirty seconds. */
+/* Start a fresh interval, so two reads bracket one run. */
+void syscall_prof_reset(void) {
+  for (int n = 0; n < SYSPROF_SLOTS; n++) {
+    __atomic_store_n(&g_sysprof_count[n], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_sysprof_cycles[n], 0, __ATOMIC_RELAXED);
+  }
+}
+
+void syscall_prof_dump(void) {
+  if (!syscall_prof_enabled())
+    return;
+  console_write("sysprof (nr count Mcycles):");
+  for (int rank = 0; rank < 12; rank++) {
+    u32 best = 0;
+    u64 bestc = 0;
+
+    for (u32 n = 0; n < SYSPROF_SLOTS; n++) {
+      u64 c = __atomic_load_n(&g_sysprof_cycles[n], __ATOMIC_RELAXED);
+
+      if (c > bestc && !(g_sysprof_count[n] & (1ull << 63))) {
+        bestc = c;
+        best = n;
+      }
+    }
+    if (!bestc)
+      break;
+    console_write(" ");
+    console_write_dec(best);
+    console_write(":");
+    console_write_dec(__atomic_load_n(&g_sysprof_count[best], __ATOMIC_RELAXED));
+    console_write(":");
+    console_write_dec(bestc / 1000000);
+    /* Mark it consumed for this pass, then restore below. */
+    __atomic_fetch_or(&g_sysprof_count[best], 1ull << 63, __ATOMIC_RELAXED);
+  }
+  for (u32 n = 0; n < SYSPROF_SLOTS; n++)
+    __atomic_fetch_and(&g_sysprof_count[n], ~(1ull << 63), __ATOMIC_RELAXED);
+  console_write("\n");
+}
+
 u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                           u64 arg4, u64 arg5, struct interrupt_frame *frame) {
   if (!frame)
@@ -4415,6 +4734,15 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
    * corrupted heap: the interesting evidence is the call that wrote to user
    * memory just before a libc's own consistency check fired.
    */
+  /* Record it before anything else can fail: the sequence a thread made on the
+   * way into a wait is the part comparable with the same program traced on a
+   * working kernel. */
+  {
+    extern void scheduler_note_syscall(u32 nr);
+
+    scheduler_note_syscall((u32)number);
+  }
+
   int trace_this = 0;
   /* Resolved once. The gate is on the hot path of every system call, and both
    * the category check and the filter parse the kernel command line. */
@@ -4474,7 +4802,17 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
   }
 
   g_trace_in_call = trace_this && bootinfo_has_flag("b1nix.trace-copyout");
+  /* Where the time actually goes.
+   *
+   * A start-up that takes minutes where it takes a second on Linux is not
+   * explained by reading the code; the profile says which call to look at.
+   * Two counters per call number, a rdtsc either side, and the watchdog prints
+   * the worst offenders. The cost is one serialising read per system call, paid
+   * only when b1nix.sysprof asked for it. */
+  u64 prof_t0 = syscall_prof_enabled() ? syscall_prof_now() : 0;
   u64 ret = syscall_dispatch_impl_inner(number, arg0, arg1, arg2, arg3, arg4, arg5, frame);
+  if (prof_t0)
+    syscall_prof_account((u32)number, syscall_prof_now() - prof_t0);
   g_trace_in_call = 0;
 
   if (watch_addr) {
@@ -4788,19 +5126,31 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * the tid targets a thread directly. tgkill also verifies the thread
        * group, so a tid recycled into another process is rejected rather than
        * signalled (M86). Remap the signo. */
-      if (number == LINUX_NR_TKILL)
-        return (u64)scheduler_tkill(0, (usize)arg0,
-                                    linux_signo_to_b1nix((int)arg1));
-      if (number == LINUX_NR_TGKILL)
-        return (u64)scheduler_tkill((usize)arg0, (usize)arg1,
+      if (number == LINUX_NR_TKILL) {
+        usize tid = namespace_pid_from_user((usize)arg0);
+        if (!tid)
+          return (u64)-ESRCH;
+        return (u64)scheduler_tkill(0, tid, linux_signo_to_b1nix((int)arg1));
+      }
+      if (number == LINUX_NR_TGKILL) {
+        usize tgid = namespace_pid_from_user((usize)arg0);
+        usize tid = namespace_pid_from_user((usize)arg1);
+        if (!tgid || !tid)
+          return (u64)-ESRCH;
+        return (u64)scheduler_tkill(tgid, tid,
                                     linux_signo_to_b1nix((int)arg2));
+      }
       /* waitid(247): idtype/id/options values match b1nix, but the siginfo
        * layouts differ (b1nix packs 6 ints; Linux is a 128-byte struct with
        * si_errno/si_code swapped and the CLD fields at offset 16). Let
        * scheduler_waitid write its b1nix siginfo into the user's (larger)
        * buffer, read it back, and rewrite it in the Linux layout. */
       if (number == 247) {
-        int wr = scheduler_waitid((idtype_t)arg0, (usize)arg1,
+        usize wid = (usize)arg1;
+        if ((arg0 == P_PID || arg0 == P_PGID) && arg1 != 0 &&
+            !(wid = namespace_pid_from_user((usize)arg1)))
+          return (u64)-ECHILD;
+        int wr = scheduler_waitid((idtype_t)arg0, wid,
                                   (siginfo_t *)(usize)arg2, (int)arg3);
         if (wr < 0)
           return (u64)wr;
@@ -4813,7 +5163,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           *(i32 *)&lx[0] = b1nix_signo_to_linux(ki.si_signo);
           *(i32 *)&lx[4] = ki.si_errno;
           *(i32 *)&lx[8] = ki.si_code;
-          *(i32 *)&lx[16] = ki.si_pid;
+          *(i32 *)&lx[16] = (i32)namespace_pid_to_user((usize)ki.si_pid);
           *(i32 *)&lx[20] = ki.si_uid;
           *(i32 *)&lx[24] = ki.si_status;
           if (syscall_copyout((void *)(usize)arg2, lx, sizeof(lx)) < 0)
@@ -4825,7 +5175,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * numbers and struct rlimit {u64 cur, max} match Linux. musl routes
        * both getrlimit and setrlimit through here. */
       if (number == 302) {
-        if (arg0 != 0 && arg0 != (u64)scheduler_get_pid())
+        if (arg0 != 0 && namespace_pid_from_user((usize)arg0) !=
+                             scheduler_get_pid())
           return (u64)-EPERM;
         if (arg3) {
           isize gr = sys_getrlimit((int)arg1, (struct rlimit *)(usize)arg3);
@@ -5408,7 +5759,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         /* set_tid_address(tidptr): store the clear_child_tid pointer, return
          * the current TID. musl uses this for pthread thread management. */
         task_set_child_tid_clear(current_task, (u64)arg0);
-        return (u64)scheduler_get_pid();
+        return (u64)namespace_pid_to_user(scheduler_get_pid());
       }
       /* M92: set_thread_area (Linux NR 205) — legacy GDT-based TLS for x86.
        * musl's __set_thread_area calls this during __init_tls on x86_64.
@@ -5484,6 +5835,35 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       if (number == LX_FUTEX) {
         int op = (int)arg1;
         int base_op = op & 0x7F; /* strip PRIVATE_FLAG (0x80) */
+        /* ...but keep it: a PRIVATE futex is one nobody outside this address
+         * space can name, and it is keyed accordingly. Dropping the flag here
+         * merged two processes' private locks on the same shared file offset
+         * into one key, so a wake in one released a waiter in the other. */
+        int futex_priv = (op & 0x80) ? B1NIX_FUTEX_PRIVATE : 0;
+        /* Which futex operations this kernel refuses, and how often.
+         *
+         * A wake that never reaches the futex code is indistinguishable, from
+         * the waiter's side, from a wake that was never sent — and both look
+         * like the process simply stopping. Counting the refusals says which
+         * one is happening, and for which operation. */
+        {
+          extern void futex_note_op(int base_op, int served);
+          int served = (base_op == 0 || base_op == 1 || base_op == 3 ||
+                        base_op == 4 || base_op == 9 || base_op == 10);
+
+          futex_note_op(base_op, served);
+        }
+
+        /* Record which futex operation, not merely "futex".
+         * A ring full of 202s cannot tell a thread that is waiting from one
+         * that is waking somebody, and that difference is the whole question
+         * when everything is parked. 900 + op stays clear of every real call
+         * number. */
+        {
+          extern void scheduler_note_syscall(u32 nr);
+
+          scheduler_note_syscall(900u + (u32)base_op);
+        }
         /* Plain FUTEX_WAIT(0)/FUTEX_WAKE(1), including the PRIVATE_FLAG
          * forms (0x80/0x81) that musl always uses for its internal
          * synchronization. These must be routed with the PRIVATE flag
@@ -5498,8 +5878,21 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           u64 timeout_ms = 0;
           if (arg3) {
             u64 tv_sec = 0, tv_nsec = 0;
-            if (syscall_copyin(&tv_sec, (void *)(usize)arg3, sizeof(tv_sec)) == 0 &&
-                syscall_copyin(&tv_nsec, (void *)(usize)(arg3 + 8), sizeof(tv_nsec)) == 0) {
+            /* A timespec this kernel cannot read is not "no timeout".
+             *
+             * Falling through with timeout_ms still zero turned a bounded wait
+             * into an unbounded one: the caller asked to be woken in a
+             * millisecond and slept until something unrelated happened to
+             * disturb it. Report the fault instead, the way Linux does. */
+            if (syscall_copyin(&tv_sec, (void *)(usize)arg3, sizeof(tv_sec)) != 0 ||
+                syscall_copyin(&tv_nsec, (void *)(usize)(arg3 + 8),
+                               sizeof(tv_nsec)) != 0) {
+              extern void futex_note_bad_timespec(void);
+
+              futex_note_bad_timespec();
+              return (u64)-EFAULT;
+            }
+            {
               if (base_op == 9) {
                 u64 req_ms = tv_sec * 1000 + tv_nsec / 1000000;
                 u64 now_ms = 0;
@@ -5519,10 +5912,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
               }
             }
           }
-          return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAIT, (int)arg2, timeout_ms);
+          return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAIT | futex_priv, (int)arg2, timeout_ms);
         }
         if (base_op == 1 || base_op == 10)
-          return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAKE, (int)arg2, 0);
+          return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAKE | futex_priv, (int)arg2, 0);
         /* FUTEX_REQUEUE(3): wake val waiters on uaddr, requeue val2 to
          * uaddr2. FUTEX_CMP_REQUEUE(4) does the same after checking that
          * *uaddr still holds val3. These numbers were swapped here — 4 was
@@ -5536,18 +5929,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
             if (cur != (int)arg5)
               return (u64)-EAGAIN;
           }
-          int woken = (int)scheduler_futex(arg0, B1NIX_FUTEX_WAKE, (int)arg2, 0);
-          if (woken < 0)
-            return (u64)woken;
-          /* Requeue is served as a wake on the second address: this kernel has
-           * no way to move a waiter between queues, and waking it early costs
-           * a re-check rather than correctness. */
-          int extra = (int)arg3;
-          if (extra > 0) {
-            int rq = (int)scheduler_futex(arg4, B1NIX_FUTEX_WAKE, extra, 0);
-            if (rq > 0)
-              woken += rq;
-          }
+          /* A real requeue: the waiters move, they are not woken where they
+           * are and hoped to be woken again somewhere else. */
+          int woken = scheduler_futex_requeue(arg0, arg4, (int)arg2, (int)arg3,
+                                              futex_priv ? 1 : 0);
+
           return (u64)woken;
         }
         /* The priority-inheritance family: FUTEX_LOCK_PI(6),
@@ -5582,7 +5968,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 
             if (syscall_copyout((void *)(usize)arg0, &zero, sizeof(zero)) < 0)
               return (u64)-EFAULT;
-            (void)scheduler_futex(arg0, B1NIX_FUTEX_WAKE, 1, 0);
+            (void)scheduler_futex(arg0, B1NIX_FUTEX_WAKE | futex_priv, 1, 0);
             return 0;
           }
 
@@ -5605,7 +5991,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
             if (contended != cur &&
                 syscall_copyout((void *)(usize)arg0, &contended, sizeof(contended)) < 0)
               return (u64)-EFAULT;
-            isize rc = scheduler_futex(arg0, B1NIX_FUTEX_WAIT, (int)contended, 0);
+            isize rc = scheduler_futex(arg0, B1NIX_FUTEX_WAIT | futex_priv, (int)contended, 0);
 
             if (rc < 0 && rc != -EAGAIN)
               return (u64)rc;
@@ -5969,9 +6355,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       if (number == 135)
         return (arg0 == 0 || arg0 == 0xffffffffULL) ? 0 : (u64)-EINVAL;
 
-      /* unshare(272): no namespaces — an empty flag set is a valid no-op. */
+      /* M109 — unshare(272) / setns(308). UTS and mount namespaces are real;
+       * the kinds b1nix has only one of are refused rather than faked. */
       if (number == 272)
-        return arg0 == 0 ? 0 : (u64)-EINVAL;
+        return (u64)sys_unshare(arg0);
+      if (number == 308)
+        return (u64)sys_setns((int)arg0, (int)arg1);
 
       /* getresuid(118) / getresgid(120). */
       if (number == 118 || number == 120) {
@@ -6758,11 +7147,25 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       }
       u32 native = linux_syscall_to_b1nix(number);
       if (native == LINUX_SYS_UNMAPPED) {
-        console_write("linux-abi: unmapped syscall ");
-        console_write(linux_syscall_name(number));
-        console_write(" (nr=");
-        console_write_dec(number);
-        console_write(") -> -ENOSYS\n");
+        /* Report each missing call once, not once per call.
+         *
+         * A program that asks for something b1nix does not implement usually
+         * asks repeatedly — Chromium calls get_mempolicy per allocation arena.
+         * Printing every one turned a gap into a flood: several CPUs writing
+         * the same line, the console lock hot enough for the spinlock watchdog
+         * to call it a lockup, and a panic on a machine that was merely
+         * missing a syscall. The first line is what a bring-up needs; the rest
+         * is noise that changes the timing of what it is reporting on. */
+        enum { UNMAPPED_SEEN_MAX = 512 };
+        static u8 reported[UNMAPPED_SEEN_MAX];
+        u32 slot = number < UNMAPPED_SEEN_MAX ? (u32)number : 0;
+        if (!__atomic_exchange_n(&reported[slot], 1, __ATOMIC_RELAXED)) {
+          console_write("linux-abi: unmapped syscall ");
+          console_write(linux_syscall_name(number));
+          console_write(" (nr=");
+          console_write_dec(number);
+          console_write(") -> -ENOSYS\n");
+        }
         return (u64)-ENOSYS;
       }
       number = native;
@@ -6939,7 +7342,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)sys_fchown((int)arg0, (u16)arg1, (u16)arg2);
 
   case SYS_FORK:
-    return (u64)scheduler_fork_current();
+    return ns_pid_out((u64)scheduler_fork_current());
   case SYS_EXEC: {
     return (u64)sys_execve((const char *)(usize)arg0,
                            (const char **)(usize)arg1, NULL);
@@ -6955,18 +7358,26 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                         (const char **)(usize)arg3, (int)arg4);
   case SYS_WAIT: {
     int kstatus = 0;
-    u64 wr = (u64)scheduler_wait((usize)arg0, &kstatus);
+    usize wpid = (usize)arg0;
+    if ((isize)wpid > 0 && !(wpid = ns_pid_in(arg0)))
+      return (u64)-ECHILD;
+    u64 wr = (u64)scheduler_wait(wpid, &kstatus);
     if ((isize)wr >= 0 && current_task && current_task->user_image &&
         ((struct user_loaded_image *)current_task->user_image)->personality == PERSONALITY_LINUX)
       kstatus = wait_status_to_linux(kstatus);
     if ((isize)wr >= 0 && arg1 && syscall_copyout((void *)(usize)arg1, &kstatus, sizeof(kstatus)) != 0) {
       return (u64)-EFAULT;
     }
-    return wr;
+    return ns_pid_out(wr);
   }
   case SYS_WAITPID: {
     int kstatus = 0;
-    u64 wr = (u64)scheduler_waitpid((usize)arg0, &kstatus, (int)arg2);
+    /* Only a positive argument names a task; 0, -1 and the < -1 process-group
+     * forms are relative to the caller and need no translation. */
+    usize wpid = (usize)arg0;
+    if ((isize)wpid > 0 && !(wpid = ns_pid_in(arg0)))
+      return (u64)-ECHILD;
+    u64 wr = (u64)scheduler_waitpid(wpid, &kstatus, (int)arg2);
     if ((isize)wr >= 0 && current_task && current_task->user_image &&
         ((struct user_loaded_image *)current_task->user_image)->personality == PERSONALITY_LINUX)
       kstatus = wait_status_to_linux(kstatus);
@@ -6974,12 +7385,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)-EFAULT;
     }
     /* ERESTARTSYS conversion and signal delivery handled by the wrapper. */
-    return wr;
+    return ns_pid_out(wr);
   }
   case SYS_GETPID:
-    return (u64)scheduler_get_pid();
+    return ns_pid_out((u64)scheduler_get_pid());
   case SYS_GETPPID:
-    return (u64)(current_task ? current_task->parent_id : 0);
+    /* A namespace's own pid 1 has a parent outside it. Linux reports 0 there,
+     * because there is no number in this namespace that names it. */
+    return (u64)(current_task
+                     ? namespace_pid_to_user(current_task->parent_id)
+                     : 0);
   case SYS_SIGSUSPEND: {
     /* Signal delivery handled by the wrapper after we return. */
     u64 r = sys_sigsuspend((const u64 *)(usize)arg0);
@@ -7124,9 +7539,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                ? 0
                : (u64)-EPERM;
   }
-  case SYS_WAITID:
-    return (u64)scheduler_waitid((idtype_t)arg0, (usize)arg1,
+  case SYS_WAITID: {
+    usize wid = (usize)arg1;
+    if ((arg0 == P_PID || arg0 == P_PGID) && arg1 != 0 && !(wid = ns_pid_in(arg1)))
+      return (u64)-ECHILD;
+    return (u64)scheduler_waitid((idtype_t)arg0, wid,
                                  (siginfo_t *)(usize)arg2, (int)arg3);
+  }
   case SYS_TIMES: {
     struct tms *user_tms = (struct tms *)(usize)arg0;
     if (user_tms) {
@@ -7189,8 +7608,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     }
     return 0;
   }
-  case SYS_GETPGID:
-    return (u64)scheduler_getpgid((usize)arg0);
+  case SYS_GETPGID: {
+    usize t = ns_pid_in(arg0);
+    if (arg0 != 0 && !t)
+      return (u64)-ESRCH;
+    return ns_pid_out((u64)scheduler_getpgid(t));
+  }
   case SYS_GETGROUPS: {
     struct cred *c = scheduler_get_current_cred();
     if (!c) return (u64)-EACCES;
@@ -7274,6 +7697,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
      * pid -1 to process group 1. */
     isize target = (isize)arg0;
     u64 kill_ret;
+    /* Translate before decoding: a namespaced caller names both a process and
+     * a process group by the numbers its namespace uses. */
+    if (target > 0) {
+      usize t = ns_pid_in((u64)target);
+      if (!t)
+        return (u64)-ESRCH;
+      target = (isize)t;
+    } else if (target < -1) {
+      usize t = ns_pid_in((u64)(-target));
+      if (!t)
+        return (u64)-ESRCH;
+      target = -(isize)t;
+    }
     if (target == 0) {
       kill_ret = (u64)scheduler_kill_process_group_user(scheduler_getpgrp(),
                                                         (int)arg1);
@@ -7292,11 +7728,20 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* Signal delivery handled by the wrapper. */
     return kill_ret;
   }
-  case SYS_TKILL:
+  case SYS_TKILL: {
     /* tkill(tid, sig): no thread-group check (that is what tgkill adds). */
-    return (u64)scheduler_tkill(0, (usize)arg0, (int)arg1);
-  case SYS_TGKILL:
-    return (u64)scheduler_tkill((usize)arg0, (usize)arg1, (int)arg2);
+    usize tid = ns_pid_in(arg0);
+    if (!tid)
+      return (u64)-ESRCH;
+    return (u64)scheduler_tkill(0, tid, (int)arg1);
+  }
+  case SYS_TGKILL: {
+    usize tgid = ns_pid_in(arg0);
+    usize tid = ns_pid_in(arg1);
+    if (!tgid || !tid)
+      return (u64)-ESRCH;
+    return (u64)scheduler_tkill(tgid, tid, (int)arg2);
+  }
   case SYS_RT_TGSIGQUEUEINFO: {
     /* rt_tgsigqueueinfo(tgid, tid, sig, siginfo): send a signal to one thread
      * of a thread group. M86 targets the named tid for real (it used to
@@ -7307,7 +7752,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     int rsig = (int)arg2;
     if (rsig <= 0 || rsig >= 64)
       return (u64)-EINVAL;
-    return (u64)scheduler_tkill((usize)arg0, (usize)arg1, rsig);
+    usize rtgid = ns_pid_in(arg0);
+    usize rtid = ns_pid_in(arg1);
+    if (!rtgid || !rtid)
+      return (u64)-ESRCH;
+    return (u64)scheduler_tkill(rtgid, rtid, rsig);
   }
   case SYS_SIGNAL: {
     int sig = (int)arg0;
@@ -7330,9 +7779,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     int sig = (int)arg1;
     union sigval v;
     v.sival_ptr = (void *)(usize)arg2;
+    usize qpid = ns_pid_in(arg0);
+    if (!qpid)
+      return (u64)-ESRCH;
     if (SIG_IS_RT(sig))
-      return (u64)scheduler_sigqueue((usize)arg0, sig, v, B1NIX_SI_QUEUE);
-    return (u64)scheduler_kill((usize)arg0, sig);
+      return (u64)scheduler_sigqueue(qpid, sig, v, B1NIX_SI_QUEUE);
+    return (u64)scheduler_kill(qpid, sig);
   }
   case SYS_TIMER_CREATE: {
     /* timer_create(clockid, struct sigevent*, timer_t*). Only SIGEV_SIGNAL is
@@ -7428,12 +7880,21 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   }
   case SYS_SETSID:
     return (u64)scheduler_setsid();
-  case SYS_GETSID:
-    return (u64)scheduler_getsid((usize)arg0);
+  case SYS_GETSID: {
+    usize t = ns_pid_in(arg0);
+    if (arg0 != 0 && !t)
+      return (u64)-ESRCH;
+    return ns_pid_out((u64)scheduler_getsid(t));
+  }
   case SYS_GETPGRP:
-    return (u64)scheduler_getpgrp();
-  case SYS_SETPGRP:
-    return (u64)scheduler_setpgrp((usize)arg0, (usize)arg1);
+    return ns_pid_out((u64)scheduler_getpgrp());
+  case SYS_SETPGRP: {
+    usize who = ns_pid_in(arg0);
+    usize grp = ns_pid_in(arg1);
+    if ((arg0 != 0 && !who) || (arg1 != 0 && !grp))
+      return (u64)-ESRCH;
+    return (u64)scheduler_setpgrp(who, grp);
+  }
   case SYS_SETPRIORITY: {
     /* Linux setpriority(int which, id_t who, int prio): args are
      * arg0=which, arg1=who, arg2=prio. Only PRIO_PROCESS is supported; who==0
@@ -7441,14 +7902,18 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
      * the value, so it stored `who` (0) as the nice value and ignored the real
      * prio in arg2 — every nice()/setpriority() collapsed to nice 0, breaking
      * nice biasing (M46 nice-biasing). */
-    usize who = (usize)arg1;
+    usize who = ns_pid_in(arg1);
     int prio = (int)arg2;
+    if (arg1 != 0 && !who)
+      return (u64)-ESRCH;
     usize pid = who == 0 ? scheduler_get_pid() : who;
     return (u64)scheduler_set_priority(pid, prio);
   }
   case SYS_GETPRIORITY: {
     /* Linux getpriority(int which, id_t who): arg0=which, arg1=who. */
-    usize who = (usize)arg1;
+    usize who = ns_pid_in(arg1);
+    if (arg1 != 0 && !who)
+      return (u64)-ESRCH;
     usize pid = who == 0 ? scheduler_get_pid() : who;
     /* scheduler_get_priority already returns the Linux 20-nice encoding. */
     return (u64)(isize)scheduler_get_priority(pid);
@@ -7473,6 +7938,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     vma_mutator_unlock(vma_slot);
     return r;
   }
+  case SYS_UNSHARE:
+    return (u64)sys_unshare(arg0);
+  case SYS_SETNS:
+    return (u64)sys_setns((int)arg0, (int)arg1);
   case SYS_MREMAP: {
     task_rss_sample(current_task, 0);
     unsigned vma_slot = vma_mutator_lock();
@@ -7908,6 +8377,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_UMOUNT:
     return (u64)sys_umount((const char *)(usize)arg0);
 
+  case SYS_PIVOT_ROOT:
+    return (u64)sys_pivot_root((const char *)(usize)arg0,
+                               (const char *)(usize)arg1);
+
   case SYS_MOUNTS:
     return (u64)vfs_mounts((struct b1nix_mount_entry *)(usize)arg0,
                            (usize)arg1);
@@ -8140,7 +8613,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
      * initialiser was the same thread re-entering it, called that recursive
      * initialisation, and aborted the process. Chromium died that way before
      * it could open a window. */
-    return current_task ? (u64)current_task->id : 0;
+    return current_task ? ns_pid_out((u64)current_task->id) : 0;
   case SYS_EXIT_THREAD:
     /* SYS_EXIT_THREAD(code) — thread-only exit. For an is_thread task
      * scheduler_exit_current already handles the CLONE_CHILD_CLEARTID

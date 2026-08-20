@@ -274,6 +274,15 @@ enum {
 	SYS_SCHED_SETPARAM     = 254,
 	SYS_SCHED_GET_PRIORITY_MAX = 255,
 	SYS_SCHED_GET_PRIORITY_MIN = 256,
+
+	/* --- M109: what an initramfs does last. switch_root drives this. --- */
+	SYS_PIVOT_ROOT       = 257, /* pivot_root(new_root, put_old) */
+	/* M109: namespaces. unshare(flags) puts the caller in fresh namespaces of
+	 * the kinds it asks for; setns(fd, nstype) joins the namespace a
+	 * /proc/<pid>/ns/<kind> handle names. Together they are what unshare(1)
+	 * and nsenter(1) run on. */
+	SYS_UNSHARE          = 258, /* unshare(flags) */
+	SYS_SETNS            = 259, /* setns(fd, nstype) */
 };
 
 /* Aliases: linux_abi.c references these generic names; map to the versioned ones. */
@@ -296,6 +305,10 @@ enum {
 #define B1NIX_CLONE_CHILD_SETTID   0x01000000
 
 /* Linux-compatible FUTEX_* op codes (subset). */
+/* OR'd into the op to say the futex is private to one address space (Linux's
+ * FUTEX_PRIVATE_FLAG). A private futex is keyed by the address space and the
+ * virtual address; a shared one by the object it lives in and the offset. */
+#define B1NIX_FUTEX_PRIVATE 0x80
 #define B1NIX_FUTEX_WAIT 0
 #define B1NIX_FUTEX_WAKE 1
 

@@ -195,6 +195,7 @@
 #define LX_setresuid       117
 #define LX_setresgid       119
 #define LX_setrlimit       160
+#define LX_pivot_root      155
 #define LX_mount           165
 #define LX_umount2         166
 #define LX_getcpu          309
@@ -425,6 +426,7 @@ static const struct lx_map lx_table[] = {
 	{LX_setresgid,       SYS_SETRESGID,     "setresgid"},
 	/* mount takes (source, target, fstype, flags[, data-ignored]);
 	 * umount2's flags argument is ignored by sys_umount. */
+	{LX_pivot_root,      SYS_PIVOT_ROOT,    "pivot_root"},
 	{LX_mount,           SYS_MOUNT,         "mount"},
 	{LX_umount2,         SYS_UMOUNT,        "umount2"},
 	/* M40 closeout: same argument layout on both ABIs.
