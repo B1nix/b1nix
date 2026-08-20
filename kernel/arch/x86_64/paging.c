@@ -117,6 +117,13 @@ static inline void addrspace_epoch_bump(void) {
  * entries, so filling a lazy or absent page in — the overwhelmingly common
  * page-fault case — needs no announcement, which is what keeps the skip
  * worthwhile. */
+static inline int irqs_are_enabled(void) {
+  u64 rflags;
+
+  __asm__ volatile("pushfq; popq %0" : "=r"(rflags));
+  return (rflags & (1ull << 9)) != 0;
+}
+
 static inline void addrspace_note_replaced(u64 old_entry) {
   if (old_entry & VMM_PRESENT)
     addrspace_epoch_bump();
@@ -611,6 +618,24 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
   }
 }
 
+/* Map a run of frames under ONE lock acquisition.
+ *
+ * vmm_map_page takes the VMM write lock per page. A large kernel allocation —
+ * the buffer behind a browser's shared-memory segment, say — is tens of
+ * thousands of pages, so it was tens of thousands of irqsave round trips
+ * against CPUs that are handling faults meanwhile. The mapping work per page
+ * is unchanged; only the locking leaves the loop. */
+void vmm_map_range(u64 base, const u64 *frames, usize n, u64 flags) {
+  u64 _vmflags;
+
+  if (!frames || n == 0)
+    return;
+  vmm_write_acquire(&_vmflags);
+  for (usize i = 0; i < n; i++)
+    vmm_map_page_locked(base + i * PAGE_SIZE, frames[i], flags);
+  vmm_write_release(_vmflags);
+}
+
 void *vmm_map_mmio(u64 physical_address, usize size, u64 flags) {
   if (size == 0) {
     return 0;
@@ -703,6 +728,13 @@ void vmm_unmap_page(u64 virtual_address) {
   tlb_shootdown_page(virtual_address);
 }
 
+void vmm_unmap_page_nosync(u64 virtual_address) {
+  u64 _vmflags;
+  vmm_write_acquire(&_vmflags);
+  unmap_page_from_pml4(get_current_pml4(), virtual_address);
+  vmm_write_release(_vmflags);
+}
+
 void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address) {
   u64 _vmflags;
   vmm_write_acquire(&_vmflags);
@@ -712,11 +744,222 @@ void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address) {
   vmm_write_release(_vmflags);
 }
 
+/* Unmap a whole run from another address space under ONE lock acquisition.
+ *
+ * Teardown walks every page of every mapping, and taking the VMM write lock per
+ * page turned a browser's exit into hundreds of thousands of lock round trips
+ * against CPUs that are still faulting — minutes of wall clock, most of it
+ * spent handing the lock back and forth. The work per page is the same; only
+ * the locking moves out of the loop. The caller still issues one shootdown for
+ * the whole teardown, as before. */
+void paging_unmap_range_from_space(u64 pml4_phys, u64 base, usize npages) {
+  u64 _vmflags;
+  u64 *pml4 = pml4_phys ? (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE)
+                        : kernel_pml4_virt;
+  u64 end = base + (u64)npages * PAGE_SIZE;
+
+  /* Skip the holes instead of walking them.
+   *
+   * A mapping is not the same thing as memory: a browser reserves address
+   * space in terabytes and touches a fraction of it, and one of its processes
+   * asked to release 302 million pages of which almost none were present.
+   * Visiting each of those in turn is a walk down four levels per page for
+   * nothing. When a level is absent, everything below it is absent too, so the
+   * scan jumps the whole 512 GiB, 1 GiB or 2 MiB that entry covers. */
+  vmm_write_acquire(&_vmflags);
+  for (u64 va = base; va < end;) {
+    u64 pml4e = pml4[pml4_index(va)];
+
+    if (!(pml4e & VMM_PRESENT)) {
+      va = (va + (1ULL << 39)) & ~((1ULL << 39) - 1);
+      continue;
+    }
+
+    u64 *pdpt = table_from_entry(pml4e);
+    u64 pdpte = pdpt[pdpt_index(va)];
+
+    if (!(pdpte & VMM_PRESENT)) {
+      va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+      continue;
+    }
+    if (pdpte & HUGE_PAGE_FLAG) {
+      unmap_page_from_pml4(pml4, va);
+      va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+      continue;
+    }
+
+    u64 *pd = table_from_entry(pdpte);
+    u64 pde = pd[pd_index(va)];
+
+    if (!(pde & VMM_PRESENT)) {
+      va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+      continue;
+    }
+    if (pde & HUGE_PAGE_FLAG) {
+      unmap_page_from_pml4(pml4, va);
+      va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+      continue;
+    }
+
+    /* A present page table: clear the entries this range covers inside it,
+     * then move to the next table. */
+    u64 *pt = table_from_entry(pde);
+    u64 tab_end = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+
+    if (tab_end > end)
+      tab_end = end;
+    for (; va < tab_end; va += PAGE_SIZE) {
+      if (pt[pt_index(va)])
+        unmap_page_from_pml4(pml4, va);
+    }
+  }
+  vmm_write_release(_vmflags);
+}
+
+/* Change one page's protection in ANOTHER address space (the current one
+ * included). paging_mprotect_page only ever touches the loaded space; the
+ * futex watchpoint needs to name the space explicitly. */
+void paging_mprotect_page_in_space(u64 pml4_phys, u64 vaddr, u64 flags) {
+  u64 _vmflags;
+  u64 *pml4 = pml4_phys ? (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE)
+                        : kernel_pml4_virt;
+
+  vmm_write_acquire(&_vmflags);
+  u64 pml4e = pml4[pml4_index(vaddr)];
+
+  if (pml4e & VMM_PRESENT) {
+    u64 *pdpt = table_from_entry(pml4e);
+    u64 pdpte = pdpt[pdpt_index(vaddr)];
+
+    if ((pdpte & VMM_PRESENT) && !(pdpte & HUGE_PAGE_FLAG)) {
+      u64 *pd = table_from_entry(pdpte);
+      u64 pde = pd[pd_index(vaddr)];
+
+      if ((pde & VMM_PRESENT) && !(pde & HUGE_PAGE_FLAG)) {
+        u64 *pt = table_from_entry(pde);
+        u64 pte = pt[pt_index(vaddr)];
+
+        if (pte & VMM_PRESENT) {
+          u64 keep = pte & (PAGE_ENTRY_ADDRESS_MASK | VMM_PRESENT | VMM_COW);
+
+          pt[pt_index(vaddr)] = keep | (flags & ~PAGE_ENTRY_ADDRESS_MASK);
+          invalidate_page(vaddr);
+        }
+      }
+    }
+  }
+  vmm_write_release(_vmflags);
+}
+
 void paging_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
   vmm_map_page(virtual_address, physical_address, flags);
 }
 
 void paging_unmap_page(u64 virtual_address) { vmm_unmap_page(virtual_address); }
+
+/* Change protection over a whole range in one walk.
+ *
+ * Doing it a page at a time meant a four-level descent per page, an epoch bump
+ * per page — each of which makes every other CPU reload CR3 at its next switch
+ * — and an invlpg per page. Chromium's allocator protects and unprotects large
+ * spans constantly: measured at 181 ms per mprotect call. This walks the tables
+ * once, skips whole 512 GiB / 1 GiB / 2 MiB spans that have nothing mapped in
+ * them, and announces the change once at the end. */
+void paging_mprotect_range(u64 start, u64 end, u64 flags) {
+  extern void tlb_shootdown_all(void);
+  u64 _vmflags;
+  u64 *pml4 = get_current_pml4();
+  int touched = 0;
+
+  /* The lock is taken per page table, not for the whole range.
+   *
+   * Holding the write lock across a multi-gigabyte mprotect blocks every page
+   * fault on every other CPU for as long as it takes — four browser threads
+   * were seen queued behind one such call. A 2 MiB table is a short enough
+   * critical section, and the walk still costs one descent per table. */
+  for (u64 va = start; va < end;) {
+    vmm_write_acquire(&_vmflags);
+    u64 pml4e = pml4[pml4_index(va)];
+
+    if (!(pml4e & VMM_PRESENT)) {
+      vmm_write_release(_vmflags);
+      va = (va + (1ULL << 39)) & ~((1ULL << 39) - 1);
+      continue;
+    }
+
+    u64 *pdpt = table_from_entry(pml4e);
+    u64 pdpte = pdpt[pdpt_index(va)];
+
+    if (!(pdpte & VMM_PRESENT) || (pdpte & HUGE_PAGE_FLAG)) {
+      vmm_write_release(_vmflags);
+      va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+      continue;
+    }
+
+    u64 *pd = table_from_entry(pdpte);
+    u64 pde = pd[pd_index(va)];
+
+    if (!(pde & VMM_PRESENT) || (pde & HUGE_PAGE_FLAG)) {
+      vmm_write_release(_vmflags);
+      va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+      continue;
+    }
+
+    u64 *pt = table_from_entry(pde);
+    u64 tab_end = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+
+    if (tab_end > end)
+      tab_end = end;
+    for (; va < tab_end; va += PAGE_SIZE) {
+      u64 pte = pt[pt_index(va)];
+
+      if (!(pte & VMM_PRESENT)) {
+        /* A lazy or swapped leaf carries the protection the fault handler will
+         * use when it materialises the page, so the new flags have to be
+         * written there too — skipping it left the page to come back with the
+         * protection mprotect had just replaced. */
+        if (pte & (VMM_LAZY | VMM_SWAPPED)) {
+          pt[pt_index(va)] =
+              (pte & (PAGE_ENTRY_ADDRESS_MASK | VMM_LAZY | VMM_SWAPPED)) | flags;
+          invalidate_page(va);
+          touched = 1;
+        }
+        continue;
+      }
+
+      u64 nf = flags;
+
+      /* The shared zero page never becomes directly writable, and neither does
+       * a copy-on-write page: the first store makes the private copy. Same two
+       * rules paging_mprotect_page applies. */
+      if ((nf & VMM_WRITABLE) &&
+          (pte & PAGE_ENTRY_ADDRESS_MASK) == pmm_zero_page()) {
+        nf &= ~VMM_WRITABLE;
+        nf |= VMM_COW;
+      }
+      if ((pte & VMM_COW) && (nf & VMM_WRITABLE)) {
+        nf &= ~VMM_WRITABLE;
+        nf |= VMM_COW;
+      }
+
+      u64 entry = (pte & PAGE_ENTRY_ADDRESS_MASK) | nf | VMM_PRESENT;
+
+      if (entry == pte)
+        continue;
+      pt[pt_index(va)] = entry;
+      invalidate_page(va);
+      touched = 1;
+    }
+    vmm_write_release(_vmflags);
+  }
+
+  if (touched) {
+    /* One announcement for the range, not one per page. */
+    addrspace_note_replaced(VMM_PRESENT);
+    if (irqs_are_enabled())
+      tlb_shootdown_all();
+  }
+}
 
 void paging_mprotect_page(u64 virtual_address, u64 flags) {
   if ((virtual_address & (PAGE_SIZE - 1)) != 0) {
@@ -903,7 +1146,22 @@ u64 vmm_virt_to_phys(void *ptr) {
 }
 
 // Mark a page as lazy (will allocate on first access)
-void vmm_set_lazy(u64 virtual_address) {
+/* Mark a page lazy AND give the marker the protection the fault handler should
+ * use when it materialises the page. vmm_set_lazy followed by
+ * paging_mprotect_page did the same thing in two four-level walks. */
+static void vmm_set_lazy_common(u64 virtual_address, u64 leaf_extra);
+
+void vmm_set_lazy_flags(u64 virtual_address, u64 flags) {
+  /* The protection goes into the marker itself: the fault handler reads it
+   * back when it materialises the page, so writing it here saves the second
+   * four-level walk paging_mprotect_page would have done. */
+  vmm_set_lazy_common(virtual_address,
+                      flags & ~(PAGE_ENTRY_ADDRESS_MASK | VMM_PRESENT));
+}
+
+void vmm_set_lazy(u64 virtual_address) { vmm_set_lazy_common(virtual_address, 0); }
+
+static void vmm_set_lazy_common(u64 virtual_address, u64 leaf_extra) {
   if ((virtual_address & (PAGE_SIZE - 1)) != 0)
     return;
 
@@ -992,7 +1250,7 @@ void vmm_set_lazy(u64 virtual_address) {
 
   if (expect == 0 || identity_leaf) {
     if (__atomic_compare_exchange_n(&pt[pt_index(virtual_address)], &expect,
-                                    VMM_LAZY, 0, __ATOMIC_RELEASE,
+                                    VMM_LAZY | leaf_extra, 0, __ATOMIC_RELEASE,
                                     __ATOMIC_RELAXED) &&
         identity_leaf)
       addrspace_note_replaced(expect);
@@ -1073,6 +1331,131 @@ static u64 *pf_leaf_pte_ptr(u64 va) {
   u64 *pt = table_from_entry(pde);
   return &pt[pt_index(va)];
 }
+
+/* Unmap a run of pages under ONE acquisition of the page-table lock.
+ *
+ * Freeing a quarter-gigabyte image a page at a time takes this lock sixty-five
+ * thousand times, and it is the lock every page fault on every CPU needs; the
+ * teardown of a browser that has run for ten minutes took minutes of its own.
+ * The frame each entry held is reported so the caller can release the frames
+ * after its flush — never before, or another core's stale translation would
+ * reach a reallocated frame. */
+/* Clear a run of leaf entries and REPORT the frames instead of freeing them.
+ *
+ * The freeing is the caller's, and it must not happen until every other CPU has
+ * dropped its cached translation: a frame handed back to the allocator while a
+ * stale TLB entry still names it is a write into somebody else's page. The
+ * unmap path below frees inline, which is why it needs a shootdown every few
+ * dozen pages; a caller that tears down a large mapping can instead clear a
+ * long run, shoot down once, and only then return the frames. On a four-CPU
+ * guest that is the difference between one broadcast IPI per sixty-four pages
+ * and one per range — measured at ~1.8 s for a single large munmap, which was
+ * the largest remaining cost in the browser's start-up.
+ *
+ * Swap slots and eviction bookkeeping are released here, since neither is
+ * reachable through a stale TLB entry. Huge leaves fall back to the inline
+ * path: they are kernel mappings, whose frames this never frees anyway. */
+usize vmm_unmap_range_collect(u64 base, usize npages, u64 *frames_out) {
+  u64 _vmflags;
+  usize nframes = 0;
+  int any_present = 0;
+  u64 end = base + (u64)npages * PAGE_SIZE;
+  u64 *pml4 = get_current_pml4();
+
+  vmm_write_acquire(&_vmflags);
+  for (u64 va = base; va < end;) {
+    /* One walk per table, not per page, and no walk at all through the holes.
+     * Chromium unmaps out of an address space it reserved in terabytes: the
+     * pages are mostly absent, and descending four levels for each of them was
+     * 30 ms a call. */
+    u64 pml4e = pml4[pml4_index(va)];
+
+    if (!(pml4e & VMM_PRESENT)) {
+      va = (va + (1ULL << 39)) & ~((1ULL << 39) - 1);
+      continue;
+    }
+
+    u64 *pdpt = table_from_entry(pml4e);
+    u64 pdpte = pdpt[pdpt_index(va)];
+
+    if (!(pdpte & VMM_PRESENT)) {
+      va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+      continue;
+    }
+    if (pdpte & HUGE_PAGE_FLAG) {
+      unmap_page_from_pml4(pml4, va);
+      va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
+      continue;
+    }
+
+    u64 *pd = table_from_entry(pdpte);
+    u64 pde = pd[pd_index(va)];
+
+    if (!(pde & VMM_PRESENT)) {
+      va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+      continue;
+    }
+    if (pde & HUGE_PAGE_FLAG) {
+      unmap_page_from_pml4(pml4, va);
+      va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+      continue;
+    }
+
+    u64 *pt = table_from_entry(pde);
+    u64 tab_end = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
+
+    if (tab_end > end)
+      tab_end = end;
+    for (; va < tab_end; va += PAGE_SIZE) {
+      u64 e = pt[pt_index(va)];
+
+      if (!e)
+        continue;
+      if (e & VMM_PRESENT) {
+        u64 frame = e & PAGE_ENTRY_ADDRESS_MASK;
+
+        if (frame && (e & VMM_USER)) {
+          extern void eviction_unregister_page(u64 frame);
+
+          eviction_unregister_page(frame);
+          frames_out[nframes++] = frame;
+        }
+      } else if (e & VMM_SWAPPED) {
+        extern void swap_free_slot_index(u32 slot);
+
+        swap_free_slot_index((u32)((e & PAGE_ENTRY_ADDRESS_MASK) >> 12));
+      }
+      pt[pt_index(va)] = 0;
+      any_present = 1;
+      invalidate_page(va);
+    }
+  }
+  /* One announcement for the whole range. The per-page bump was a global
+   * atomic per page and a CR3 reload on every other CPU at its next switch —
+   * the same cost that made mprotect expensive. */
+  if (any_present)
+    addrspace_note_replaced(VMM_PRESENT);
+  vmm_write_release(_vmflags);
+  return nframes;
+}
+
+usize vmm_unmap_range_nosync(u64 base, usize npages, u64 *frames_out) {
+  u64 _vmflags;
+
+  vmm_write_acquire(&_vmflags);
+  for (usize i = 0; i < npages; i++) {
+    u64 va = base + i * PAGE_SIZE;
+    u64 *pte = pf_leaf_pte_ptr(va);
+
+    frames_out[i] = (pte && (*pte & VMM_PRESENT))
+                        ? (*pte & 0x000ffffffffff000ULL)
+                        : 0;
+    unmap_page_from_pml4(get_current_pml4(), va);
+  }
+  vmm_write_release(_vmflags);
+  return npages;
+}
+
 
 /* Move a range's leaf entries to another address, without touching the pages.
  *
@@ -1198,6 +1581,37 @@ static void fault_note(int seen, u64 val, const char *why) {
   fault_leaf_seen[cpu] = (u64)seen;
   fault_leaf_val[cpu] = val;
   fault_reason[cpu] = why;
+}
+
+/* A cross-CPU shootdown waits for every other CPU to acknowledge, so it can
+ * only be issued with interrupts enabled: a fault taken from kernel code that
+ * already held an irqsave lock cannot wait for CPUs that may in turn be waiting
+ * for that lock. Those faults are rare (a copy to user memory under a lock) and
+ * the mapping they resolve is this CPU's own, so the local invalidate stands
+ * and the count below says how often it happened. */
+static u64 g_cow_shootdown_skipped;
+static u64 g_cow_shootdowns;
+
+/* How many copy-on-write resolutions published their new frame to the other
+ * CPUs, and how many could not because the fault arrived with interrupts off.
+ * A skip leaves a sibling thread reading the pre-copy page until something
+ * else flushes it, so the count is the size of the hole. */
+void cow_shootdown_stats(u64 *done, u64 *skipped) {
+  if (done)
+    *done = g_cow_shootdowns;
+  if (skipped)
+    *skipped = g_cow_shootdown_skipped;
+}
+
+static void cow_publish_page(u64 va) {
+  extern void tlb_shootdown_page(u64 vaddr);
+
+  if (!irqs_are_enabled()) {
+    g_cow_shootdown_skipped++;
+    return;
+  }
+  g_cow_shootdowns++;
+  tlb_shootdown_page(va);
 }
 
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
@@ -1623,6 +2037,26 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
              * Read-only or MAP_PRIVATE mappings are untouched. */
             int mark_dirty = vma_shared && (vma->prot & PROT_WRITE);
             struct page_cache_entry *page = page_cache_get_page(vma->node->inode, file_page);
+
+            /* Miss: ask for the neighbourhood, not just this page.
+             *
+             * Each miss costs a disk round trip — 2.6 ms measured — and a
+             * demand-paged browser takes tens of thousands of them. One cluster
+             * read fills a whole window of cache entries, so the faults that
+             * follow in this neighbourhood find their page resident, and the
+             * fault-around below maps them without faulting at all.
+             *
+             * The size is asked for, not stated: page_cache_cluster_pages()
+             * derives it from RAM (16 pages on a small guest, up to 64 on a
+             * large one) so this path is not pinned to a constant that a bigger
+             * machine has long outgrown. A read-only mapping only: a private
+             * writable page must not be filled from a shared cache entry it
+             * would then copy. */
+            if (!page && !mark_dirty && vma->node->inode->read_cb) {
+              page_cache_read_cluster(vma->node->inode, file_page,
+                                      page_cache_cluster_pages());
+              page = page_cache_get_page(vma->node->inode, file_page);
+            }
             if (page) {
               pmm_free_frame(frame); // drop the freshly allocated frame
               frame = page->frame;
@@ -1892,6 +2326,20 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     new_flags &= ~VMM_COW;
     new_flags |= VMM_PRESENT | VMM_WRITABLE;
 
+    /* A COW that changes the frame must be published to every CPU, not just
+     * this one.
+     *
+     * Threads share an address space: while this CPU resolves the fault, a
+     * sibling on another CPU may still have the old, read-only translation in
+     * its TLB, and x86 keeps serving reads from it. That sibling then reads the
+     * pre-copy contents of the page indefinitely — two threads disagreeing
+     * about the same word. It cost the browser about four minutes of every
+     * start-up: a mutex on the main thread's stack, freshly COWed after a
+     * zygote fork, read as still-contended on one CPU and as free on the other,
+     * so the unlocker saw no waiter to wake and the waiter slept until a signal
+     * happened to release it. invalidate_page below only flushes the CPU
+     * taking the fault; the shootdown goes out after the lock is dropped, the
+     * same order vmm_unmap_page uses. */
     if (old_frame == pmm_zero_page()) {
       /* First write to the shared zero page (zero-page dedup): the spare frame
        * is already zero-filled, so there is nothing to copy, and the zero page
@@ -1901,6 +2349,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       *slot = new_frame | new_flags;
       invalidate_page(page_aligned);
       vmm_write_release(cflags);
+      cow_publish_page(page_aligned);
       eviction_register_page(current_task, page_aligned, new_frame);
       return 0;
     }
@@ -1925,6 +2374,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     pmm_unref_frame(old_frame);
     invalidate_page(page_aligned);
     vmm_write_release(cflags);
+    cow_publish_page(page_aligned);
 
     eviction_unregister_page(old_frame);
     eviction_register_page(current_task, page_aligned, new_frame);
@@ -2080,12 +2530,28 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
 
   vmm_write_release(_vmflags);
 
-  /* Two reasons to bump here. The child is a new address space on a frame that
-   * may have belonged to a dead one; and this clone just flipped the parent's
-   * writable user pages to COW in place, so any OTHER CPU running a sibling
-   * thread of the parent has to drop its stale writable translations too. The
-   * CR3 reload above only covers this one. */
+  /* Two reasons to announce here. The child is a new address space on a frame
+   * that may have belonged to a dead one; and this clone just flipped the
+   * parent's writable user pages to COW in place, so any OTHER CPU running a
+   * sibling thread of the parent has to drop its stale writable translations
+   * too. The CR3 reload above only covers this one.
+   *
+   * The epoch bump alone is not enough for the second reason. It is collected
+   * at the next context switch, and a sibling thread busy in user code does not
+   * switch: until it happens to, it keeps writing through a stale WRITABLE
+   * entry to the pre-fork frame while this address space has already moved on.
+   * Two threads then disagree about the same word — which is how the browser's
+   * main thread came to sleep on a mutex that the rest of the process saw as
+   * free, with nobody left to wake it. A fork is rare enough to pay for a real
+   * shootdown; the epoch stays as the record for CPUs that are not running
+   * this space at all. */
   addrspace_epoch_bump();
+  {
+    extern void tlb_shootdown_all(void);
+
+    if (irqs_are_enabled())
+      tlb_shootdown_all();
+  }
 
   return dst_pml4_phys;
 }

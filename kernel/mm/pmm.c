@@ -886,13 +886,95 @@ static void pmm_pcp_refill(struct pmm_pcp *pcp) {
   pmm_release(flags);
 }
 
+
+/* Who freed this frame last.
+ *
+ * A double free names the caller that tripped over it; what is wanted is the
+ * caller that freed it the first time, and the two are never in the same
+ * stack. A small ring of the most recent frees answers that without a
+ * per-frame table: one store per free, and a linear scan only when something
+ * has already gone wrong. */
+#define PMM_FREE_NOTES 1024
+static struct {
+  u64 frame;
+  u64 pc;
+  u32 tid;
+} pmm_free_notes[PMM_FREE_NOTES];
+static u32 pmm_free_note_next;
+
+static void pmm_note_free_site(u64 frame, u64 pc) {
+  u32 i = __atomic_fetch_add(&pmm_free_note_next, 1, __ATOMIC_RELAXED) %
+          PMM_FREE_NOTES;
+  pmm_free_notes[i].frame = frame;
+  pmm_free_notes[i].pc = pc;
+  pmm_free_notes[i].tid = current_task ? (u32)current_task->id : 0;
+}
+
+void pmm_report_frame_free_site(u64 frame) {
+  for (u32 i = 0; i < PMM_FREE_NOTES; i++) {
+    if (pmm_free_notes[i].frame != frame)
+      continue;
+    console_write("  freed earlier from 0x");
+    console_write_hex64(pmm_free_notes[i].pc);
+    ksym_print(pmm_free_notes[i].pc);
+    console_write(" by task ");
+    console_write_dec(pmm_free_notes[i].tid);
+    console_write("\n");
+  }
+  pmm_report_page_table_history_pub(frame);
+}
+
+/* Taking a frame off the pre-zeroed list.
+ *
+ * The list is threaded THROUGH the pages it holds: word 0 of each parked frame
+ * names the next one. That only holds while nobody else owns the page, so a
+ * frame handed out (or freed prematurely) while still linked here turns the
+ * next hop into whatever its owner wrote — the drain then followed that value
+ * and took a #GP with the allocator lock held, which stopped the machine on a
+ * second CPU rather than at the fault. Every walk therefore checks the mark
+ * zero_push stamped, not just the allocation path that used to.
+ *
+ * Returns 0 when the list cannot be trusted; the caller drops the rest of it,
+ * which leaks those frames and keeps the corruption from spreading. */
+static u64 zero_pop_checked(struct pmm_pcp *pcp, const char *where) {
+  u64 frame = pcp->zero_head;
+  u64 *marker = (u64 *)(usize)(frame + DIRECT_MAP_BASE);
+
+  if (marker[PMM_ZERO_MAGIC_OFF / 8] != PMM_ZERO_MAGIC) {
+    static unsigned reported;
+    if (reported < 8) {
+      u64 cflags;
+      reported++;
+      /* One report, one block: two CPUs printing a fault at once produced a
+       * log where every second character belonged to the other one, and the
+       * frame history — the part worth having — was unreadable. */
+      console_lock_acquire_irqsave(&cflags);
+      console_write("pmm: zero bucket link broken at 0x");
+      console_write_hex64(frame);
+      console_write(" in ");
+      console_write(where);
+      console_write("\n");
+      pmm_report_frame_free_site(frame);
+      console_lock_release_irqrestore(cflags);
+    }
+    pcp->zero_head = 0;
+    pcp->zero_count = 0;
+    return 0;
+  }
+  pcp->zero_head = marker[0];
+  pcp->zero_count--;
+  marker[0] = 0;
+  marker[PMM_ZERO_MAGIC_OFF / 8] = 0;
+  return frame;
+}
+
 static void pmm_pcp_zero_drain(struct pmm_pcp *pcp) {
   u64 flags;
   pmm_acquire(&flags);
   for (int i = 0; i < PMM_PCP_ZERO_DRAIN && pcp->zero_count > 0; i++) {
-    u64 frame = pcp->zero_head;
-    pcp->zero_head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
-    pcp->zero_count--;
+    u64 frame = zero_pop_checked(pcp, "zero drain");
+    if (!frame)
+      break;
     pmm_return_frame(frame);
   }
   pmm_release(flags);
@@ -1004,9 +1086,9 @@ static void pmm_pcp_drain_all(void) {
       pmm_return_frame(frame);
     }
     while (pcp->zero_count > 0) {
-      u64 frame = pcp->zero_head;
-      pcp->zero_head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
-      pcp->zero_count--;
+      u64 frame = zero_pop_checked(pcp, "cache drain");
+      if (!frame)
+        break;
       pmm_return_frame(frame);
     }
     pmm_release(flags);
@@ -1244,6 +1326,8 @@ void pmm_free_frame(u64 frame) {
 
   if (!now_zero) return;  /* still referenced elsewhere (CoW sibling) */
 
+  pmm_note_free_site(frame, (u64)(usize)__builtin_return_address(0));
+
   /* Refcount hit 0 — park the frame in our per-CPU cache rather than
    * touching the global free list. Drain a batch back if the cache is
    * full so memory doesn't pile up on one CPU. */
@@ -1265,6 +1349,9 @@ void pmm_free_frame(u64 frame) {
       irq_restore(ifl);
       static unsigned df_reported;
       if (df_reported < 8) {
+        u64 cflags;
+        df_reported++;
+        console_lock_acquire_irqsave(&cflags);
         console_write("pmm: double free detected at 0x");
         console_write_hex64(frame);
         console_write(" from 0x");
@@ -1277,9 +1364,9 @@ void pmm_free_frame(u64 frame) {
           console_write(current_task->name);
         }
         console_write("\n");
-        pmm_report_page_table_history_pub(frame);
+        pmm_report_frame_free_site(frame);
+        console_lock_release_irqrestore(cflags);
         klog_warn("pmm_free_frame: double free (page already parked in a bucket)");
-        df_reported++;
       }
       return;
     }
@@ -1359,7 +1446,7 @@ u64 pmm_alloc_frame(void) {
       console_write("pmm: zero bucket holds an unmarked frame 0x");
       console_write_hex64(frame);
       console_write("\n");
-      pmm_report_page_table_history_pub(frame);
+      pmm_report_frame_free_site(frame);
       panic("pmm: per-CPU zero bucket corrupt");
     }
     pcp->zero_head = marker[0];
@@ -1848,6 +1935,25 @@ u64 pmm_phys_total_memory(void) { return pmm.phys_total; }
 u64 pmm_free_memory_estimate(void) { return pmm.free_frames * PAGE_SIZE; }
 
 usize pmm_free_frame_count(void) { return (usize)pmm.free_frames; }
+
+/* Every frame the allocator owns, wherever it is parked.
+ *
+ * A freed frame does not go straight back to the global list: it waits in the
+ * freeing CPU's quarantine, then in its pre-zeroed bucket. Counting only the
+ * global list therefore reports a leak whenever a caller frees fewer frames
+ * than a bucket holds — which is exactly what the IOMMU self-test saw, a
+ * difference of 32 against a 32-frame quarantine. Ownership is the question a
+ * leak check is asking; location is not. */
+usize pmm_owned_free_frames(void) {
+  usize total = (usize)pmm.free_frames;
+  if (!pmm_pcp_ready())
+    return total;
+  for (int c = 0; c < MAX_CPUS; c++) {
+    struct pmm_pcp *pcp = &pmm_pcp[c];
+    total += pcp->count + pcp->q_count + pcp->zero_count;
+  }
+  return total;
+}
 
 u64 pmm_zero_page(void) { return zero_page_frame; }
 

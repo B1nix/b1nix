@@ -2,6 +2,9 @@
 #include <b1nix/vfs.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
+
+/* Defined in arch/x86_64/tlb.c; a no-op on a single-CPU boot. */
+void tlb_shootdown_all(void);
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
@@ -643,6 +646,10 @@ static void *klarge_alloc(usize size, u64 caller) {
    * the uniprocessor build/smoke path vmm_map_page is atomic w.r.t. other
    * tasks; on true SMP this shares the single-writer assumption already made
    * by general-heap growth. */
+  enum { KLARGE_MAP_BATCH = 256 };
+  u64 map_batch[KLARGE_MAP_BATCH];
+  usize batch_n = 0;
+
   for (usize i = 0; i < npages; i++) {
     u64 frame = pmm_alloc_frame();
     if (!frame) {
@@ -677,8 +684,19 @@ static void *klarge_alloc(usize size, u64 caller) {
       klog_warn("klarge: large allocation denied (low memory) — returning NULL");
       return 0;
     }
-    vmm_map_page(base + i * PAGE_SIZE, frame, VMM_PRESENT | VMM_WRITABLE);
+    /* Batch the mapping: one page-table lock acquisition per run of frames
+     * rather than one per page. A tens-of-megabytes allocation was tens of
+     * thousands of irqsave round trips against CPUs taking faults meanwhile. */
+    map_batch[batch_n++] = frame;
+    if (batch_n == KLARGE_MAP_BATCH) {
+      vmm_map_range(base + (i + 1 - batch_n) * PAGE_SIZE, map_batch, batch_n,
+                    VMM_PRESENT | VMM_WRITABLE);
+      batch_n = 0;
+    }
   }
+  if (batch_n)
+    vmm_map_range(base + (npages - batch_n) * PAGE_SIZE, map_batch, batch_n,
+                  VMM_PRESENT | VMM_WRITABLE);
 
   struct klarge_header *h = (struct klarge_header *)(usize)base;
   h->magic = KLARGE_MAGIC;
@@ -716,13 +734,35 @@ static void klarge_free(void *ptr) {
    * pages while they are unmapped. */
   heap_release(flags);
 
-  for (usize i = 0; i < npages; i++) {
-    u64 vaddr = base + i * PAGE_SIZE;
-    u64 frame = vmm_virt_to_phys((void *)(usize)vaddr);
-    vmm_unmap_page(vaddr);
-    if (frame) {
-      pmm_free_frame(frame);
+  /* Retire the pages in batches, with ONE cross-CPU flush per batch.
+   *
+   * vmm_unmap_page tells every other core about a single page: a global lock,
+   * an inter-processor interrupt, and a spin until all of them answer. A
+   * browser process image is a quarter of a gigabyte, so freeing it one page at
+   * a time is tens of thousands of those rounds — and when two cores reap a
+   * child at the same moment they starve each other on that lock until the
+   * watchdog declares a deadlock and panics (seen as "spinlock lockup" with
+   * both backtraces in tlb_shootdown_page).
+   *
+   * The frames cannot be released before the flush: another core could still
+   * hold the old translation and write into a frame that has been handed out
+   * again. So each batch is unmapped, then flushed once, then freed — which is
+   * why the batch is a fixed on-stack array rather than the whole span. */
+  enum { KLARGE_UNMAP_BATCH = 64 };
+  u64 frames[KLARGE_UNMAP_BATCH];
+
+  for (usize i = 0; i < npages;) {
+    usize n = npages - i;
+
+    if (n > KLARGE_UNMAP_BATCH)
+      n = KLARGE_UNMAP_BATCH;
+    vmm_unmap_range_nosync(base + i * PAGE_SIZE, n, frames);
+    tlb_shootdown_all();
+    for (usize k = 0; k < n; k++) {
+      if (frames[k])
+        pmm_free_frame(frames[k]);
     }
+    i += n;
   }
 
   heap_acquire(&flags);

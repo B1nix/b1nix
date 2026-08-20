@@ -7,9 +7,31 @@
 #include <string.h>
 #include <b1nix/bootinfo.h>
 
-#define PC_HASH_SIZE 1024
+/* Hash width, derived at init rather than compiled in.
+ *
+ * The page cache has no capacity ceiling of its own — eviction is target-
+ * driven, not size-capped — so the number of resident pages is bounded only by
+ * memory. A fixed 1024 buckets meant that on anything but a small guest the
+ * chains grew without limit: a machine holding 200k cached pages ran chains
+ * roughly two hundred long, and every lookup, insert and evict walked one.
+ *
+ * Linux sizes its page-cache and dentry hashes the same way, from the memory
+ * present at boot (alloc_large_system_hash). One bucket per 16 pages of RAM
+ * keeps the average chain short whatever the machine.
+ *
+ * FLOOR   1024 buckets — exactly the previous fixed size, so a 256 MiB guest
+ *         allocates what it always had and nothing about it changes.
+ * CEILING 262144 buckets — 2 MiB of pointers plus 1 MiB of bucket locks, i.e.
+ *         0.04% of the 8 GiB machine that first reaches it. Beyond that the
+ *         table costs more than the chain walk it saves.
+ * `b1nix.pagecache-buckets=N` overrides; N is rounded up to a power of two and
+ * still clamped to the range above. */
+#define PC_HASH_MIN 1024u
+#define PC_HASH_MAX 262144u
 
-static struct page_cache_entry *hash_table[PC_HASH_SIZE];
+static struct page_cache_entry **hash_table;
+static u32 pc_hash_size = PC_HASH_MIN; /* always a power of two */
+static u32 pc_hash_mask = PC_HASH_MIN - 1;
 /* Variant E — two LRU lists. lru_head/lru_tail is the INACTIVE list (pages seen
  * once); active_head/active_tail is the ACTIVE list (the protected working set:
  * pages referenced again or refaulted). New pages land on inactive; a second
@@ -71,7 +93,7 @@ static void m26_diag_task(void) {
  * second, and holds the bucket only across the chain edit itself — never
  * across writeback, which drops pc_lock and blocks on I/O.
  */
-static volatile int pc_bucket[PC_HASH_SIZE];
+static volatile int *pc_bucket;
 
 static void lock_bucket(u32 h) {
   extern void tlb_shootdown_poll(void);
@@ -124,7 +146,7 @@ static u32 pc_hash(struct vfs_inode *inode, u64 offset) {
   u64 val = (inode ? inode->ino : 0) ^ ((u64)(inode ? inode->fs_id : 0) << 32) ^
             (offset >> 12);
   val ^= val >> 16;
-  return (u32)(val % PC_HASH_SIZE);
+  return (u32)val & pc_hash_mask;
 }
 
 /* Full cache-key comparison: (fs_id, ino, offset). See the key_fsid comment in
@@ -184,8 +206,45 @@ static usize demote_active(usize n) {
   return moved;
 }
 
+static void ra_init(void); /* readahead sizing, defined with the RA machinery */
+
+/* Round up to a power of two, saturating at `max` (itself a power of two). */
+static u32 pc_pow2_ceil(u32 v, u32 max) {
+  u32 p = 1;
+
+  while (p < v && p < max)
+    p <<= 1;
+  return p;
+}
+
 void page_cache_init(void) {
-  memset(hash_table, 0, sizeof(hash_table));
+  u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
+  /* One bucket per 16 pages of RAM: ram_mb * (256 pages/MiB) / 16. */
+  u32 want = bootinfo_get_u32("b1nix.pagecache-buckets",
+                            (u32)(ram_mb > 0x10000ULL ? 0x10000ULL : ram_mb) * 16u);
+
+  if (want < PC_HASH_MIN)
+    want = PC_HASH_MIN;
+  if (want > PC_HASH_MAX)
+    want = PC_HASH_MAX;
+  pc_hash_size = pc_pow2_ceil(want, PC_HASH_MAX);
+
+  hash_table = kzalloc((usize)pc_hash_size * sizeof(*hash_table));
+  pc_bucket = kzalloc((usize)pc_hash_size * sizeof(*pc_bucket));
+  if (!hash_table || !pc_bucket) {
+    /* Fall back to the floor rather than run without a hash at all. */
+    if (hash_table)
+      kfree(hash_table);
+    if (pc_bucket)
+      kfree((void *)pc_bucket);
+    pc_hash_size = PC_HASH_MIN;
+    hash_table = kzalloc((usize)pc_hash_size * sizeof(*hash_table));
+    pc_bucket = kzalloc((usize)pc_hash_size * sizeof(*pc_bucket));
+  }
+  pc_hash_mask = pc_hash_size - 1;
+
+  ra_init();
+
   lru_head = lru_tail = 0;
   active_head = active_tail = 0;
   pc_refault_w = 0;
@@ -193,15 +252,58 @@ void page_cache_init(void) {
   pc_lock = 0;
 }
 
+/* How many cached pages are dirty right now. See page_cache_flush_inode. */
+static volatile u64 g_pc_dirty_pages;
+
+u64 page_cache_dirty_pages(void) { return g_pc_dirty_pages; }
+
 /* ── File-level sequential readahead ────────────────────────────────────────
  * A small per-inode cursor table detects a sequential access pattern in
  * page_cache_get_page. On a sequential cache MISS it prefetches the next
- * RA_PREFETCH pages so a file read sequentially (the in-guest self-host build
+ * earned window of pages (see ra_init) so a file read sequentially — the
  * reading sources/headers, or a sequential mmap scan) stops paying one
  * blocking block read per page. Best-effort by design: a cold table, a
  * non-file inode, no read_cb, or memory pressure simply skips the burst. */
-#define RA_STREAMS   256
-#define RA_PREFETCH    4
+/* Stream table width, derived at init.
+ *
+ * The table is direct-mapped with no chaining, so a collision does not merely
+ * slow a lookup — the two files reset each other's cursor (see the fsid/ino
+ * mismatch path below) and NEITHER ever earns a window. 256 slots is fewer hot
+ * files than a build or a browser keeps open, so the detector quietly stopped
+ * working on exactly the workloads it was written for.
+ *
+ * FLOOR   256 entries (8 KiB) — the previous fixed size; a 256 MiB guest is
+ *         unchanged.
+ * CEILING 16384 entries (512 KiB), reached at 16 GiB. Past that the table is
+ *         larger than the set of files anything realistically keeps hot.
+ * `b1nix.ra-streams=N` overrides, rounded up to a power of two and clamped. */
+#define RA_STREAMS_MIN 256u
+#define RA_STREAMS_MAX 16384u
+
+/* Read-ahead window ceiling, in pages, derived at init.
+ *
+ * This is the largest burst a stream can earn; `win` still starts at RA_MIN and
+ * doubles, so a random reader never pays it. It is a memory decision as much as
+ * an I/O one — read-ahead that gets evicted before it is used was read twice —
+ * so it scales with RAM in coarse steps, exactly as the block layer's
+ * blk_readahead_ceiling() does.
+ *
+ * FLOOR   RA_MIN (4 pages, 16 KiB) — a window can never be smaller than the
+ *         smallest burst.
+ * CEILING RA_WIN_MAX_PAGES (64 pages, 256 KiB), which is also the hard clamp on
+ *         the kmalloc inside page_cache_read_cluster. It matches the block
+ *         layer's 256 KiB default read-ahead, so one cluster is one device
+ *         command rather than four.
+ * A machine of 256 MiB or less keeps the previous 16 pages exactly.
+ * `b1nix.readahead-pages=N` overrides, clamped to [RA_MIN, RA_WIN_MAX_PAGES]. */
+#define RA_WIN_MAX_PAGES 64u
+
+/* Staging buffer for page_cache_read_cluster, in pages. Deliberately a
+ * constant and deliberately small: it is a contiguous kmalloc taken inside the
+ * page-fault handler, so it must not grow with the window. See the comment at
+ * the allocation itself. */
+#define PC_CLUSTER_CHUNK_PAGES 16u
+
 #define RA_WARMUP      1  /* sequential misses seen before the first burst */
 
 struct ra_stream {
@@ -209,9 +311,19 @@ struct ra_stream {
   u32 fsid;
   u64 next; /* next file page expected for this stream (in PAGE_SIZE units) */
   u32 seq;  /* consecutive sequential misses observed */
+  /* Current burst size in pages. Starts at RA_MIN, doubles on each further
+   * sequential miss up to ra_win_max, and collapses to nothing the moment the
+   * stream jumps. Linux's ondemand read-ahead has the same shape: a window that
+   * earns its size from the access pattern instead of always reading the
+   * maximum, so a random reader pays for the pages it asked for and a long
+   * sequential reader still reaches the full window within a few faults. */
+  u32 win;
 };
 
-static struct ra_stream ra_streams[RA_STREAMS];
+static struct ra_stream *ra_streams;
+static u32 ra_streams_n = RA_STREAMS_MIN; /* always a power of two */
+static u32 ra_streams_mask = RA_STREAMS_MIN - 1;
+static u32 ra_win_max = 16; /* pages; the pre-scaling value, see ra_init */
 static int ra_in_prefetch; /* re-entrancy guard (best-effort, mirrors the
                               proactive-evict guard) */
 
@@ -219,15 +331,60 @@ static u32 ra_hash(const struct vfs_inode *inode) {
   u32 h = (u32)(inode->ino ^ (inode->ino >> 32));
   h ^= (u32)inode->fs_id;
   h ^= h >> 10;
-  return h % RA_STREAMS;
+  return h & ra_streams_mask;
 }
 
-/* Prefetch RA_PREFETCH pages starting at (offset+1). Must be called with
+/* Smallest burst, in pages. Linux starts its ondemand window at 16 KiB too. */
+#define RA_MIN 4
+
+/* The largest cluster any caller may ask page_cache_read_cluster for, in pages.
+ * It is the same number as the read-ahead ceiling because the cluster reader
+ * kmallocs `pages * PAGE_SIZE` in one go: an unclamped `pages` would turn a
+ * tunable into an arbitrary contiguous allocation. */
+unsigned page_cache_cluster_pages(void) { return ra_win_max; }
+
+static void ra_init(void) {
+  u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
+
+  /* One stream slot per 4 MiB of RAM: enough that the hot set of a build or a
+   * browser fits without the direct-mapped table thrashing. */
+  u32 want = bootinfo_get_u32("b1nix.ra-streams",
+                            (u32)(ram_mb > 0x100000ULL ? 0x100000ULL : ram_mb) / 4u);
+
+  if (want < RA_STREAMS_MIN)
+    want = RA_STREAMS_MIN;
+  if (want > RA_STREAMS_MAX)
+    want = RA_STREAMS_MAX;
+  ra_streams_n = pc_pow2_ceil(want, RA_STREAMS_MAX);
+  ra_streams = kzalloc((usize)ra_streams_n * sizeof(*ra_streams));
+  if (!ra_streams) {
+    ra_streams_n = RA_STREAMS_MIN;
+    ra_streams = kzalloc((usize)ra_streams_n * sizeof(*ra_streams));
+  }
+  ra_streams_mask = ra_streams_n - 1;
+
+  /* Coarse steps, because this picks an I/O size, not an allocation. A small
+   * machine keeps the 16 pages it always had. */
+  u32 win = 16;
+
+  if (ram_mb >= 2048)
+    win = RA_WIN_MAX_PAGES; /* 256 KiB */
+  else if (ram_mb >= 1024)
+    win = 32; /* 128 KiB */
+  win = bootinfo_get_u32("b1nix.readahead-pages", win);
+  if (win < RA_MIN)
+    win = RA_MIN;
+  if (win > RA_WIN_MAX_PAGES)
+    win = RA_WIN_MAX_PAGES;
+  ra_win_max = win;
+}
+
+/* Prefetch `pages` pages starting at (offset+1). Must be called with
  * pc_lock RELEASED: it allocates frames and issues blocking read_cb I/O. It
  * re-enters page_cache_get_page/page_cache_add_page; those re-entries observe
  * ra_in_prefetch and never schedule a nested burst. */
-static void pc_readahead(struct vfs_inode *inode, u64 offset) {
-  if (ra_in_prefetch || !inode->read_cb)
+static void pc_readahead(struct vfs_inode *inode, u64 offset, u32 pages) {
+  if (ra_in_prefetch || !inode->read_cb || pages == 0)
     return;
   ra_in_prefetch = 1;
   struct vfs_node dummy;
@@ -242,7 +399,14 @@ static void pc_readahead(struct vfs_inode *inode, u64 offset) {
    * reader was about to want, and spent a disk command per page to fill the
    * cache with parts of the file nobody asked for. */
   u64 base = offset / PAGE_SIZE;
-  for (u64 po = base + 1; po <= base + RA_PREFETCH; po++) {
+
+  /* One filesystem read for the whole burst, not one per page: the same
+   * economy the page-fault path gets from page_cache_read_cluster. A burst of
+   * separate 4 KiB reads is one disk round trip per page; this is one. */
+  ra_in_prefetch = 0; /* the cluster reader has its own guard */
+  page_cache_read_cluster(inode, (base + 1) * PAGE_SIZE, pages);
+  ra_in_prefetch = 1;
+  for (u64 po = base + 1; po <= base + pages; po++) {
     u64 poff = po * PAGE_SIZE;
     if (poff >= inode->size)
       break; /* don't read past EOF */
@@ -264,6 +428,107 @@ static void pc_readahead(struct vfs_inode *inode, u64 offset) {
       pmm_free_frame(frame); /* raced with another reader — keep their page */
   }
   ra_in_prefetch = 0;
+}
+
+/* Read a run of pages in ONE call to the filesystem.
+ *
+ * Demand-paging a quarter-gigabyte executable one page at a time costs a disk
+ * round trip per 4 KiB: measured at 2.6 ms a fault, seventeen thousand faults
+ * in ninety seconds of start-up, ten seconds of pure waiting. A cluster asks
+ * for the whole window at once — up to a quarter of a megabyte, filling sixty-
+ * four cache entries — so the fault that follows finds its page already there.
+ * That is what the fault-around in the page-fault handler was built to exploit,
+ * and until now there was rarely anything cached for it to map.
+ *
+ * `pages` is clamped to page_cache_cluster_pages() below, so callers ask for a
+ * window rather than naming a constant of their own.
+ *
+ * Best effort throughout: no buffer, no read_cb, a short read or memory
+ * pressure simply stops the burst. Must be called with pc_lock RELEASED — it
+ * both allocates and does blocking I/O. */
+void page_cache_read_cluster(struct vfs_inode *inode, u64 offset,
+                             unsigned pages) {
+  if (ra_in_prefetch || !inode || !inode->read_cb || pages < 2)
+    return;
+  /* Hard clamp: `pages` reaches the kmalloc below unchanged, so an unbounded
+   * caller would turn a tuning knob into an arbitrary contiguous allocation.
+   * The ceiling is the configured window — nothing may ask for more in one
+   * cluster than the machine was sized to read ahead. */
+  if (pages > ra_win_max)
+    pages = ra_win_max;
+  u64 base = offset & ~(u64)(PAGE_SIZE - 1);
+
+  if (base >= inode->size)
+    return;
+  u64 want = (u64)pages * PAGE_SIZE;
+
+  if (base + want > inode->size)
+    want = inode->size - base;
+  unsigned n = (unsigned)((want + PAGE_SIZE - 1) / PAGE_SIZE);
+
+  if (n < 2)
+    return;
+
+  /* The staging buffer is a CONSTANT 64 KiB, not the whole window.
+   *
+   * This runs in the page-fault handler. Sizing the allocation from the window
+   * would put a growing contiguous kmalloc on that path — a quarter of a
+   * megabyte on a large machine — and a big contiguous allocation taken during
+   * a fault is exactly the wrong thing to depend on: it is the most
+   * fragmentation-sensitive request in the kernel, made at the least
+   * convenient moment. A window larger than the buffer is read in successive
+   * chunks instead. That costs nothing at the device: the filesystems coalesce
+   * adjacent blocks into one command (see blk_run_blocks), so a 64 KiB read of
+   * a contiguous file is a single request either way. */
+  char *buf = kmalloc((usize)PC_CLUSTER_CHUNK_PAGES * PAGE_SIZE);
+
+  if (!buf)
+    return;
+  ra_in_prefetch = 1;
+  struct vfs_node dummy;
+
+  memset(&dummy, 0, sizeof(dummy));
+  dummy.inode = inode;
+
+  for (unsigned done = 0; done < n;) {
+    unsigned chunk = n - done;
+
+    if (chunk > PC_CLUSTER_CHUNK_PAGES)
+      chunk = PC_CLUSTER_CHUNK_PAGES;
+
+    u64 cbase = base + (u64)done * PAGE_SIZE;
+    isize got = inode->read_cb(&dummy, cbase, buf, (usize)chunk * PAGE_SIZE, 0);
+
+    if (got <= 0)
+      break;
+
+    unsigned full = (unsigned)(got / PAGE_SIZE);
+
+    for (unsigned i = 0; i < full; i++) {
+      u64 poff = cbase + (u64)i * PAGE_SIZE;
+      struct page_cache_entry *pe = page_cache_get_page(inode, poff);
+
+      if (pe) {
+        page_cache_put_page(pe); /* already resident */
+        continue;
+      }
+      u64 frame = pmm_alloc_frame();
+
+      if (!frame) {
+        full = 0; /* memory pressure — stop, the rest faults in on its own */
+        break;
+      }
+      memcpy((void *)(usize)(frame + vmm_direct_map_base()),
+             buf + (usize)i * PAGE_SIZE, PAGE_SIZE);
+      if (page_cache_add_page(inode, poff, frame) < 0)
+        pmm_free_frame(frame); /* another reader won the race */
+    }
+    if (full < chunk)
+      break; /* short read, EOF or pressure — nothing more to stage */
+    done += chunk;
+  }
+  ra_in_prefetch = 0;
+  kfree(buf);
 }
 
 struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset) {
@@ -314,26 +579,37 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
    * prefetch (blocking I/O) runs after it is released. The read-ahead cursors
    * are a heuristic — a rare race between two buckets costs one mispredicted
    * burst, never correctness. */
-  int do_ra = 0;
+  u32 ra_pages = 0;
   if (!ra_in_prefetch && inode->read_cb && inode->type == VFS_FILE) {
     struct ra_stream *r = &ra_streams[ra_hash(inode)];
     if (r->ino == inode->ino && r->fsid == inode->fs_id &&
         offset / PAGE_SIZE == r->next) {
       r->next = offset / PAGE_SIZE + 1;
-      if (++r->seq >= RA_WARMUP)
-        do_ra = 1;
+      if (++r->seq >= RA_WARMUP) {
+        /* Grow the window one doubling per sequential miss, never past the
+         * ceiling. The first burst after warm-up is deliberately small: a file
+         * read once, briefly, in order pays for four pages, not for the whole
+         * maximum window it will never touch. */
+        u32 next_win = r->win ? r->win * 2u : RA_MIN;
+        if (next_win > ra_win_max)
+          next_win = ra_win_max;
+        r->win = next_win;
+        ra_pages = next_win;
+      }
     } else {
-      /* New stream or a jump — restart the cursor, no burst yet (warm-up). */
+      /* New stream or a jump — restart the cursor, no burst yet (warm-up), and
+       * throw away whatever window the previous pattern had earned. */
       r->ino = inode->ino;
       r->fsid = inode->fs_id;
       r->next = offset / PAGE_SIZE + 1;
       r->seq = 0;
+      r->win = 0;
     }
   }
   unlock_bucket(h);
 
-  if (do_ra)
-    pc_readahead(inode, offset);
+  if (ra_pages)
+    pc_readahead(inode, offset, ra_pages);
   return 0;
 }
 
@@ -412,6 +688,8 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   pmm_ref_frame(new_entry->frame);
   new_entry->hash_next = hash_table[h];
   hash_table[h] = new_entry;
+  if (inode)
+    __atomic_add_fetch(&inode->cached_pages, 1, __ATOMIC_RELEASE);
   unlock_bucket(h);
 
   /* Refault: this page was evicted recently and is already back — the working
@@ -429,6 +707,11 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
 
 void page_cache_mark_dirty(struct page_cache_entry *page) {
   lock_pc();
+  if (!(page->flags & PAGE_CACHE_DIRTY)) {
+    __atomic_add_fetch(&g_pc_dirty_pages, 1, __ATOMIC_RELEASE);
+    if (page->inode)
+      __atomic_add_fetch(&page->inode->dirty_pages, 1, __ATOMIC_RELEASE);
+  }
   page->flags |= PAGE_CACHE_DIRTY;
   unlock_pc();
 }
@@ -461,29 +744,67 @@ static void writeback_page_locked(struct page_cache_entry *page) {
       if (page->refcount == 0 && (page->flags & PAGE_CACHE_ORPHAN)) {
         /* Invalidated while we were writing: finish its teardown here. */
         pmm_free_frame(page->frame);
+        if (page->inode && page->inode->cached_pages)
+          __atomic_sub_fetch(&page->inode->cached_pages, 1, __ATOMIC_RELEASE);
         page->hash_next = to_free_list;
         to_free_list = page;
         return;
       }
     }
 
+    if (page->flags & PAGE_CACHE_DIRTY) {
+      __atomic_sub_fetch(&g_pc_dirty_pages, 1, __ATOMIC_RELEASE);
+      if (page->inode && page->inode->dirty_pages)
+        __atomic_sub_fetch(&page->inode->dirty_pages, 1, __ATOMIC_RELEASE);
+    }
     page->flags &= ~PAGE_CACHE_DIRTY;
   }
 }
 
+/* How many cached pages are dirty right now.
+ *
+ * Flushing one inode means walking both LRU lists, which hold every cached
+ * page in the machine — a hundred thousand of them on a 4 GiB guest. close(2)
+ * does that walk, and at 1900 closes in a browser start-up it was 132 ms a
+ * call for, usually, nothing: the file being closed had no dirty page at all.
+ * The counter turns the common case into a load and a branch. */
 int page_cache_flush_inode(struct vfs_inode *inode) {
-  if (!inode) return -1;
+  if (!inode)
+    return -1;
+  if (__atomic_load_n(&g_pc_dirty_pages, __ATOMIC_ACQUIRE) == 0)
+    return 0; /* nothing anywhere is dirty — the walk cannot find anything */
+  if (__atomic_load_n(&inode->cached_pages, __ATOMIC_ACQUIRE) == 0)
+    return 0;
+  if (__atomic_load_n(&inode->dirty_pages, __ATOMIC_ACQUIRE) == 0)
+    return 0; /* this file has nothing dirty, whatever the rest of the cache
+                 is doing — and the walk is over every cached page */
+
   /* Walk the inode's cached pages, not its offsets. Probing offset by offset
    * asked the cache for pages that were never resident, and every miss
    * advanced the sequential cursor and armed read-ahead — so closing a large
    * file read most of it back from disk in order to write a few dirty pages
    * out. page_cache_invalidate_inode already walks the LRU lists this way. */
+  /* Stop once this inode's dirty pages have been written.
+   *
+   * The walk is over every cached page in the machine, and the cache is sized
+   * from RAM — a 4 GiB guest holds over a hundred thousand entries, so an
+   * fsync of a two-page file paid for all of them, with the inode's own lock
+   * held throughout. A run doing that per file stalled long enough for the
+   * test harness to call the instance hung. The counter says how many there
+   * are to find; past that there is nothing left to write. */
+  u64 want = __atomic_load_n(&inode->dirty_pages, __ATOMIC_ACQUIRE);
+  u64 written = 0;
+
   lock_pc();
   struct page_cache_entry *heads[2] = { lru_head, active_head };
-  for (int li = 0; li < 2; li++) {
-    for (struct page_cache_entry *curr = heads[li]; curr; curr = curr->lru_next) {
-      if (curr->inode == inode && (curr->flags & PAGE_CACHE_DIRTY))
+  for (int li = 0; li < 2 && written < want; li++) {
+    for (struct page_cache_entry *curr = heads[li]; curr;
+         curr = curr->lru_next) {
+      if (curr->inode == inode && (curr->flags & PAGE_CACHE_DIRTY)) {
         writeback_page_locked(curr);
+        if (++written >= want)
+          break;
+      }
     }
   }
   unlock_pc();
@@ -492,6 +813,8 @@ int page_cache_flush_inode(struct vfs_inode *inode) {
 
 void page_cache_invalidate_inode(struct vfs_inode *inode) {
   if (!inode)
+    return;
+  if (__atomic_load_n(&inode->cached_pages, __ATOMIC_ACQUIRE) == 0)
     return;
 
   int invalidated = 0;
@@ -518,9 +841,13 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
         }
         unlock_bucket(h);
         lru_remove(curr);
+        if (curr->inode && curr->inode->cached_pages)
+          __atomic_sub_fetch(&curr->inode->cached_pages, 1, __ATOMIC_RELEASE);
         curr->inode = 0;
         if (curr->refcount == 0) {
           pmm_free_frame(curr->frame);
+          if (curr->inode && curr->inode->cached_pages)
+            __atomic_sub_fetch(&curr->inode->cached_pages, 1, __ATOMIC_RELEASE);
           curr->hash_next = to_free_list;
           to_free_list = curr;
         } else {
@@ -549,6 +876,11 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
 }
 
 void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
+  /* Nothing of this file is cached, so there is nothing for the walk over
+   * every cached page in the machine to find. A browser sizing its shared
+   * memory regions hits this hundreds of times per start-up. */
+  if (inode && __atomic_load_n(&inode->cached_pages, __ATOMIC_ACQUIRE) == 0)
+    return;
   if (!inode)
     return;
 
@@ -582,10 +914,17 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
           lru_remove(curr);
           pmm_free_frame(curr->frame);
           curr->inode = 0;
+          if (curr->inode && curr->inode->cached_pages)
+            __atomic_sub_fetch(&curr->inode->cached_pages, 1, __ATOMIC_RELEASE);
           curr->hash_next = to_free_list;
           to_free_list = curr;
         } else {
           memset(virt, 0, PAGE_SIZE);
+          if (curr->flags & PAGE_CACHE_DIRTY) {
+            __atomic_sub_fetch(&g_pc_dirty_pages, 1, __ATOMIC_RELEASE);
+            if (curr->inode && curr->inode->dirty_pages)
+              __atomic_sub_fetch(&curr->inode->dirty_pages, 1, __ATOMIC_RELEASE);
+          }
           curr->flags &= ~PAGE_CACHE_DIRTY;
         }
       } else {
@@ -609,6 +948,8 @@ void page_cache_put_page(struct page_cache_entry *page) {
     /* Inode was destroyed while we held the reference; the entry is already
      * off the hash and LRU — finish its teardown now. */
     pmm_free_frame(page->frame);
+    if (page->inode && page->inode->cached_pages)
+      __atomic_sub_fetch(&page->inode->cached_pages, 1, __ATOMIC_RELEASE);
     page->hash_next = to_free_list;
     to_free_list = page;
   }
@@ -666,6 +1007,8 @@ usize page_cache_evict_clean(usize target_pages) {
     lru_remove(victim);
     pc_refault_record(victim->key_ino, victim->offset);
     pmm_free_frame(victim->frame);
+    if (victim->inode && victim->inode->cached_pages)
+      __atomic_sub_fetch(&victim->inode->cached_pages, 1, __ATOMIC_RELEASE);
     victim->hash_next = to_free_list;
     to_free_list = victim;
     evicted++;
@@ -762,6 +1105,8 @@ usize page_cache_evict(usize target_pages) {
     lru_remove(victim);
     pc_refault_record(victim->key_ino, victim->offset);
     pmm_free_frame(victim->frame);
+    if (victim->inode && victim->inode->cached_pages)
+      __atomic_sub_fetch(&victim->inode->cached_pages, 1, __ATOMIC_RELEASE);
     victim->hash_next = to_free_list;
     to_free_list = victim;
     evicted++;

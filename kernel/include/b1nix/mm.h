@@ -161,6 +161,8 @@ u64 pmm_total_usable_memory(void);
 u64 pmm_phys_total_memory(void);
 u64 pmm_free_memory_estimate(void);
 usize pmm_free_frame_count(void);
+/* Free frames plus those parked in per-CPU buckets — what a leak check wants. */
+usize pmm_owned_free_frames(void);
 
 void kheap_init(void);
 void kheap_use_direct_map(void);
@@ -175,6 +177,30 @@ void vmm_init(void);
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags);
 void *vmm_map_mmio(u64 physical_address, usize size, u64 flags);
 void vmm_unmap_page(u64 virtual_address);
+/* Unmap without telling the other CPUs.
+ *
+ * For a caller retiring many pages at once. One page at a time, each unmap
+ * takes a global lock, sends an inter-processor interrupt and spins until every
+ * other core answers it; freeing a 260 MB process image that way is sixty-five
+ * thousand of those rounds, and two cores doing it at the same time starve each
+ * other long enough for the lock watchdog to call it a deadlock. The caller
+ * MUST issue tlb_shootdown_all() before any of the frames is reused — a stale
+ * translation on another core would otherwise write into a reallocated frame. */
+void vmm_unmap_page_nosync(u64 virtual_address);
+/* Unmap a run of pages with ONE acquisition of the page-table lock, reporting
+ * the frame each one held so the caller can free them after its flush. Freeing
+ * a quarter-gigabyte image takes that lock sixty-five thousand times when it is
+ * done a page at a time, and the lock is the one every fault on every CPU
+ * needs. Returns the number of entries filled. */
+usize vmm_unmap_range_nosync(u64 base, usize npages, u64 *frames_out);
+/* Clears the leaves and returns the frames WITHOUT freeing them: the caller
+ * frees only after tlb_shootdown_all(). Returns how many frames were filled
+ * in; frames_out must hold npages entries. */
+usize vmm_unmap_range_collect(u64 base, usize npages, u64 *frames_out);
+/* Map n frames starting at base, taking the page-table lock once. */
+void vmm_map_range(u64 base, const u64 *frames, usize n, u64 flags);
+/* Lazy marker plus the protection its page will get when it faults in. */
+void vmm_set_lazy_flags(u64 virtual_address, u64 flags);
 void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address);
 /* Move a range's leaf page-table entries to another address in the current
  * address space, leaving the pages themselves where they are. The destination

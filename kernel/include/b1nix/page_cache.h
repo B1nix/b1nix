@@ -56,6 +56,14 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
 // Adds a new page cache entry. Takes ownership of the frame if successful.
 // Returns 0 on success, < 0 on error.
 int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame);
+/* Fill a run of pages from one filesystem read. See page_cache.c. */
+void page_cache_read_cluster(struct vfs_inode *inode, u64 offset,
+                             unsigned pages);
+/* How many pages one cluster read may cover on this machine — derived from RAM
+ * at init and overridable with `b1nix.readahead-pages=N`. Callers that want
+ * "as much as is worth reading at once" should ask for this rather than name a
+ * constant; page_cache_read_cluster clamps to it either way. */
+unsigned page_cache_cluster_pages(void);
 
 // Marks the page as dirty, meaning it needs to be written to disk.
 void page_cache_mark_dirty(struct page_cache_entry *page);
