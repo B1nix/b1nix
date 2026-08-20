@@ -38,23 +38,50 @@ void tlb_shootdown_poll(void);
  * Does not return. */
 void spin_lock_stuck(volatile int *lock, u64 caller) __attribute__((noreturn));
 
-/* Iterations before a contended acquire is declared a lockup. Generous enough
- * that a legitimately busy lock (block-cache, runqueue under -smp) never trips
- * it, small enough that a real deadlock reports within a second or so. */
-#define SPIN_LOCK_STUCK_LIMIT 400000000ULL
+/* How long a contended acquire may take before it is called a lockup.
+ *
+ * This used to count iterations, which is not a measure of time on a machine
+ * whose CPUs are themselves virtual: a vCPU spinning here can be descheduled
+ * by the host mid-loop, and on a busy host that is routine. The counter then
+ * reached its limit while the lock was in fact free — the reports said
+ * `value=0`, a lockup on a lock nobody held — and panicked a healthy kernel.
+ * A cycle deadline measures the thing the check is actually about. Ten seconds
+ * is far beyond any legitimate hold and still reports a real deadlock long
+ * before a human gives up on the machine. */
+#define SPIN_LOCK_STUCK_CYCLES 30000000000ULL /* ~10 s at 3 GHz */
+
+static inline u64 spin_rdtsc(void) {
+    unsigned lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
 
 static inline void spin_lock(spinlock_t *lock) {
     /* Spin until we successfully exchange 1 (locked) with the old value.
      * xchg is implicitly locked on x86 when used with a memory operand. */
-    u64 spins = 0;
+    u64 deadline = 0;
     while (spin_xchg(lock, 1) != 0) {
         /* Pause to hint to the CPU that we're in a spin-wait loop.
          * Improves performance and power consumption on SMP. */
         __asm__ volatile("pause");
         tlb_shootdown_poll();
         /* A spin that never ends is a deadlock, not contention: turn the silent
-         * hang into a named panic (which lock, which CPU, which task). */
-        if (++spins > SPIN_LOCK_STUCK_LIMIT)
+         * hang into a named panic (which lock, which CPU, which task).
+         *
+         * "Never ends" has to mean the lock is never released. Seeing it free
+         * — even though someone else won the race for it — proves the holder
+         * is making progress, so the clock starts again. Without that rule the
+         * check fired on a busy lock: the deadline is wall time, and a vCPU
+         * descheduled by the host comes back with the whole deadline elapsed
+         * and the lock long since free. Those reports all read `value=0`, a
+         * lockup on a lock nobody held. */
+        if (*lock == 0) {
+            deadline = 0;
+            continue;
+        }
+        if (deadline == 0)
+            deadline = spin_rdtsc() + SPIN_LOCK_STUCK_CYCLES;
+        else if (spin_rdtsc() > deadline)
             spin_lock_stuck(lock, (u64)(usize)__builtin_return_address(0));
     }
 }

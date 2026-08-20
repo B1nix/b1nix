@@ -54,6 +54,11 @@
 #define ATA_CMD_IDENTIFY        0xEC
 #define ATA_CMD_FLUSH_CACHE     0xE7
 #define ATA_CMD_FLUSH_CACHE_EXT 0xEA
+/* DATA SET MANAGEMENT. The command itself only says "here is a list of ranges
+ * and something to say about them"; the TRIM feature bit is what says the
+ * something is "these are free". */
+#define ATA_CMD_DATA_SET_MANAGEMENT 0x06
+#define ATA_DSM_FEATURE_TRIM 0x01
 
 #define HBA_PORT_CPD  (1 << 31)
 #define HBA_PORT_IPM  (3 << 8)

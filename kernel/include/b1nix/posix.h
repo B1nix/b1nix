@@ -54,6 +54,9 @@
 #define B1NIX_AF_INET 2
 #define B1NIX_AF_INET6 10
 #define B1NIX_AF_NETLINK 16
+/* AF_PACKET: raw ethernet frames — the family udhcpc, arping and tcpdump open
+ * when they need the wire rather than a socket's worth of payload. */
+#define B1NIX_AF_PACKET 17
 
 #define B1NIX_SOCK_STREAM 1
 #define B1NIX_SOCK_DGRAM 2
@@ -191,6 +194,31 @@ struct b1nix_sockaddr_nl {
   u32 nl_pid;
   u32 nl_groups;
 };
+
+/* AF_PACKET address, Linux's struct sockaddr_ll byte for byte (20 bytes).
+ * sll_protocol is in NETWORK byte order, exactly as it is on Linux. */
+struct b1nix_sockaddr_ll {
+  u16 sll_family;
+  u16 sll_protocol;
+  i32 sll_ifindex;
+  u16 sll_hatype;
+  u8 sll_pkttype;
+  u8 sll_halen;
+  u8 sll_addr[8];
+};
+
+/* sll_pkttype: who the frame was addressed to. */
+#define B1NIX_PACKET_HOST      0
+#define B1NIX_PACKET_BROADCAST 1
+#define B1NIX_PACKET_MULTICAST 2
+#define B1NIX_PACKET_OTHERHOST 3
+#define B1NIX_PACKET_OUTGOING  4
+
+/* ARPHRD_ETHER — the only link type b1nix has. */
+#define B1NIX_ARPHRD_ETHER 1
+
+/* ETH_P_ALL in host byte order; userspace passes htons() of it. */
+#define B1NIX_ETH_P_ALL 0x0003
 
 struct b1nix_utsname {
   char sysname[32];

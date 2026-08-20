@@ -90,6 +90,19 @@ struct nvme_cqe {
 #define NVME_CMD_IO_READ            0x02
 #define NVME_CMD_IO_WRITE           0x01
 #define NVME_CMD_IO_FLUSH           0x00
+#define NVME_CMD_IO_DSM             0x09  /* Dataset Management (deallocate) */
+
+/* Optional NVM Command Support (identify-controller ONCS). Bit 2 is the one
+ * that says Dataset Management — i.e. whether Deallocate is a command this
+ * controller has, rather than one we may only hope it has. */
+#define NVME_ONCS_DSM               0x0004
+
+/* One entry of a Dataset Management range list (NVMe 1.4 figure 208). */
+struct nvme_dsm_range {
+    u32 cattr;
+    u32 nlb;
+    u64 slba;
+} __attribute__((packed));
 
 // Identify CNS values
 #define NVME_IDENTIFY_CNS_NS        0x00  // Namespace

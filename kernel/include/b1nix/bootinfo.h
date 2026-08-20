@@ -57,4 +57,11 @@ int bootinfo_has_flag(const char *flag);
  */
 int bootinfo_get_kv(const char *key, char *out, usize out_size);
 
+/*
+ * Decimal "key=N" from the command line, or fallback when the key is absent,
+ * empty, or not a number. The single parser behind every `b1nix.*=N` tunable,
+ * so an explicit override has the same precedence everywhere.
+ */
+u32 bootinfo_get_u32(const char *key, u32 fallback);
+
 #endif

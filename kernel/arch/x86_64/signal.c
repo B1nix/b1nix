@@ -315,9 +315,15 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                         console_write_hex64(frame->rip);
                         console_write("\n");
                     }
-                    /* Encode "killed by signal i" as 128+i so waitpid reports
-                     * WIFSIGNALED with WTERMSIG == i (see scheduler_waitpid). */
-                    scheduler_exit_current(128 + i);
+                    /* "Killed by signal i" is a FLAG BIT, not a value range:
+                     * scheduler_waitpid reads TASK_EXIT_SIGNALED, because a
+                     * program that calls exit(137) must not be mistaken for one
+                     * killed by signal 9. This site still passed 128+i long
+                     * after the encoding changed, so every default-action kill
+                     * reported a normal exit — WIFSIGNALED was false for a
+                     * process the kernel had just killed. The RT branch below
+                     * has always had it right. */
+                    scheduler_exit_current(TASK_EXIT_SIGNALED | i);
                 }
             } else {
                 /* SIG_IGN: discard the signal so its pending bit doesn't

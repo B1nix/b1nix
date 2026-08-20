@@ -28,6 +28,43 @@ void coredump_write(struct interrupt_frame *frame, int sig);
 #include <stdio.h>
 #include <string.h>
 
+/* ── Page-fault profile ─────────────────────────────────────────────────────
+ * How many demand-paging faults a run takes and what they cost, printed beside
+ * the system-call profile. Off unless b1nix.sysprof asked for it. */
+static u64 g_pf_count;
+static u64 g_pf_cycles;
+
+static inline u64 pf_prof_now(void) {
+  u32 lo, hi;
+
+  __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+  return ((u64)hi << 32) | lo;
+}
+
+static int pf_prof_enabled(void) {
+  static int on = -1;
+
+  if (on < 0)
+    on = bootinfo_has_flag("b1nix.sysprof") ? 1 : 0;
+  return on;
+}
+
+static void pf_prof_account(u64 cycles) {
+  __atomic_fetch_add(&g_pf_count, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_pf_cycles, cycles, __ATOMIC_RELAXED);
+}
+
+void pf_prof_dump(void) {
+  if (!pf_prof_enabled())
+    return;
+  console_write("pfprof: faults=");
+  console_write_dec(__atomic_load_n(&g_pf_count, __ATOMIC_RELAXED));
+  console_write(" Mcycles=");
+  console_write_dec(__atomic_load_n(&g_pf_cycles, __ATOMIC_RELAXED) / 1000000);
+  console_write("\n");
+}
+
+
 #define IDT_ENTRY_COUNT 256
 #define KERNEL_CODE_SELECTOR 0x08
 #define IDT_INTERRUPT_GATE 0x8e
@@ -724,7 +761,24 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     if (restore_irqs)
       __asm__ volatile("sti");
 
+    /* Demand paging is the other half of the start-up bill. Counted beside
+     * the system calls so the two can be compared rather than guessed at. */
+    /* The futex watchpoint reports the write it was armed for, then steps
+     * aside: the fault is resolved by the normal path below. */
+    if (error_code & PF_WRITE) {
+      extern int futex_watch_hit(u64 fault_addr, u64 pml4_phys, u64 rip,
+                                 usize task_id);
+
+      if (current_task)
+        (void)futex_watch_hit(fault_addr, current_task->pml4_phys, frame->rip,
+                              current_task->id);
+    }
+
+    u64 pf_t0 = pf_prof_enabled() ? pf_prof_now() : 0;
     int handled = vmm_handle_page_fault(fault_addr, error_code) == 0;
+
+    if (pf_t0)
+      pf_prof_account(pf_prof_now() - pf_t0);
 
     if (restore_irqs)
       __asm__ volatile("cli");
