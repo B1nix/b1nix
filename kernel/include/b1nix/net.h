@@ -72,6 +72,8 @@ void ethernet_receive_flags(const void *data, usize size, u32 rx_flags);
 
 // ARP
 void arp_init(void);
+/* Drop every neighbour a departing network namespace had learned. */
+void arp_flush_ns(u32 ns);
 void arp_receive(const void *data, usize size);
 int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac);
 /* Resolve, sending any request out of `dev` (NULL = the active interface). */
@@ -247,6 +249,15 @@ usize tcp_bytes_available(struct tcp_conn *conn);
 int tcp_is_close_wait(struct tcp_conn *conn);
 int tcp_is_closed(struct tcp_conn *conn);
 int tcp_send(struct tcp_conn *conn, const void *data, usize len);
+/* SO_RCVBUF for an established connection: caps the receive buffer and the
+ * window advertised from it, and stops the buffer auto-tuning past that. */
+void tcp_set_rcvbuf(struct tcp_conn *conn, u32 bytes);
+/* Keepalive. `which` selects the parameter: 0 = idle, 1 = interval, 2 = count,
+ * matching TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT. Seconds, as
+ * setsockopt(2) takes them. */
+void tcp_set_keepalive(struct tcp_conn *conn, int on);
+int tcp_set_keepalive_param(struct tcp_conn *conn, int which, u32 seconds);
+u32 tcp_get_keepalive_param(struct tcp_conn *conn, int which);
 int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags);
 int tcp_close(struct tcp_conn *conn);
 /* Claim a connection slot for a listener (or 0 when the pool is exhausted). The
@@ -357,6 +368,8 @@ int route_rule_control_write(const char *buf, usize len);
 /* Drop routes installed by DHCP/autoconf; manual routes survive. */
 void route_flush_dynamic(void);
 void route_flush_all(void);
+/* Drop every route (v4 and v6) of a departing network namespace. */
+void route_flush_ns(u32 ns);
 /* Install the on-link prefix for `ip`/`mask` plus a default route via `gw`,
  * replacing any previous dynamic entries. Called on every DHCP bind. */
 void route_configure_interface(struct ipv4_addr ip, struct ipv4_addr mask,

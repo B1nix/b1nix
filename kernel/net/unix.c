@@ -1,23 +1,63 @@
 #include <b1nix/vfs.h>
+#include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/serial.h>
 #include <b1nix/syscall.h>
+#include <b1nix/bootinfo.h>
+#include <b1nix/console.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Linux gives an AF_UNIX socket about 200 KiB of buffer. Four kilobytes here
- * meant chromium's sandbox IPC — SOCK_SEQPACKET, whose messages must fit whole
- * — got EMSGSIZE on anything larger, and its Mojo channels lived in permanent
- * partial-write and EAGAIN cycles. */
-#define UNIX_RB_SIZE (64 * 1024)
+/* Linux gives an AF_UNIX socket about 200 KiB of buffer (net.core.wmem_default,
+ * 212992). Four kilobytes here meant chromium's sandbox IPC — SOCK_SEQPACKET,
+ * whose messages must fit whole — got EMSGSIZE on anything larger, and its Mojo
+ * channels lived in permanent partial-write and EAGAIN cycles.
+ *
+ * The buffer is per socket and kmalloc'd, so the right size depends on how much
+ * memory the machine has: a desktop session holds hundreds of these at once,
+ * and 208 KiB apiece is a different proposition on a 512 MiB self-host guest
+ * than on a 4 GiB one. It is therefore derived from RAM between a floor of the
+ * old 64 KiB and Linux's own figure, and `b1nix.unix-buf-kb=N` overrides it. */
+#define UNIX_RB_MIN (64 * 1024)
+#define UNIX_RB_MAX 212992
+static usize unix_rb_size_v;
+
+static usize unix_rb_size(void) {
+  if (unix_rb_size_v)
+    return unix_rb_size_v;
+  char buf[24];
+  usize want = 0;
+  if (bootinfo_get_kv("b1nix.unix-buf-kb", buf, sizeof(buf)) && buf[0] >= '0' &&
+      buf[0] <= '9') {
+    usize kb = 0;
+    for (const char *p = buf; *p >= '0' && *p <= '9'; p++)
+      kb = kb * 10u + (usize)(*p - '0');
+    want = kb * 1024u;
+  } else {
+    /* One eight-thousandth of RAM: the floor up to 512 MiB, Linux's figure
+     * from 1.7 GiB up. */
+    want = (usize)(pmm_total_usable_memory() / 8192ULL);
+  }
+  if (want < UNIX_RB_MIN)
+    want = UNIX_RB_MIN;
+  if (want > UNIX_RB_MAX)
+    want = UNIX_RB_MAX;
+  unix_rb_size_v = want;
+  return unix_rb_size_v;
+}
 /* In-flight messages carrying descriptors. A slot frees only once the reader
  * reaches it, and chromium sends them in bursts, so sixteen ran out and the
  * sender saw ENOBUFS — an error Linux never returns here, and one that Mojo
  * treats as a dead channel rather than a retry. */
 #define UNIX_CONTROL_SLOTS 32
 #define UNIX_MSG_SLOTS 64
+/* Accept-queue depth. Linux's somaxconn is 4096, but that queue is allocated;
+ * ours is an array inside every AF_UNIX socket and is also snapshotted onto the
+ * stack when a listener closes, so the depth is bounded by what both can carry
+ * cheaply — 64 pointers is 512 bytes in either place. */
+#define UNIX_BACKLOG_MAX 64
 
 struct unix_control {
   int used;
@@ -51,7 +91,12 @@ struct unix_socket_data {
    * permanently in — reporting HUP on a listener tells an event loop its
    * listening socket died. */
   int had_peer;
-  struct unix_socket_data *backlog[16];
+  /* Accept queue. Linux's somaxconn is 4096 and a listener's queue is
+   * allocated from it; this array is inline in every AF_UNIX socket, so the
+   * depth is what a desktop session's busiest listener needs rather than that.
+   * At sixteen, a compositor being connected to by a burst of clients refused
+   * connections a Linux kernel would have queued. */
+  struct unix_socket_data *backlog[UNIX_BACKLOG_MAX];
   int backlog_count;
   int backlog_max;
   /* Set while this socket sits, not-yet-accepted, in a listener's backlog[]
@@ -61,6 +106,7 @@ struct unix_socket_data {
   struct unix_socket_data *pending_listener;
   
   char *rb_buffer;
+  usize rb_size; /* bytes in rb_buffer — unix_rb_size() at creation time */
   usize rb_head;
   usize rb_tail;
   usize rb_count;
@@ -118,7 +164,8 @@ int unix_init_state(struct vfs_socket_state *s) {
     u->owner.uid = c ? c->uid : 0;
     u->owner.gid = c ? c->gid : 0;
   }
-  u->rb_buffer = kmalloc(UNIX_RB_SIZE);
+  u->rb_size = unix_rb_size();
+  u->rb_buffer = kmalloc(u->rb_size);
   if (!u->rb_buffer) { kfree(u); return -ENOMEM; }
   s->unix_data = u;
   return 0;
@@ -172,13 +219,18 @@ void unix_free_state(struct vfs_socket_state *s) {
   /* Detach from a connected peer: clear OUR forward pointer and the peer's
    * back pointer, mark the peer disconnected, and wake it so its blocked
    * recv/send/poll observes the hangup. Each direction was a counted ref. */
+  if (bootinfo_has_flag("b1nix.trace-exit") && u->peer) {
+    console_write("UNIX-HUP: last reference to a connected socket released by pid=");
+    console_write_dec(current_task ? current_task->id : 0);
+    console_write("\n");
+  }
   unix_lock(u);
   struct unix_socket_data *peer = u->peer;
   u->peer = 0;
   /* Snapshot still-pending backlog connectors (never accepted) to drop. */
-  struct unix_socket_data *pending[16];
+  struct unix_socket_data *pending[UNIX_BACKLOG_MAX];
   int npending = 0;
-  for (int i = 0; i < u->backlog_count && npending < 16; i++)
+  for (int i = 0; i < u->backlog_count && npending < UNIX_BACKLOG_MAX; i++)
     pending[npending++] = u->backlog[i];
   u->backlog_count = 0;
   unix_unlock(u);
@@ -313,7 +365,7 @@ int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr) 
 int unix_listen(struct vfs_socket_state *s, int backlog) {
   if (!s->bound || s->domain != B1NIX_AF_UNIX) return -EINVAL;
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
-  u->backlog_max = (backlog > 16) ? 16 : backlog;
+  u->backlog_max = (backlog > UNIX_BACKLOG_MAX) ? UNIX_BACKLOG_MAX : backlog;
   if (u->backlog_max <= 0) u->backlog_max = 1;
   s->listening = 1;
   return 0;
@@ -375,7 +427,8 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
      */
     struct unix_socket_data *srv = kzalloc(sizeof(struct unix_socket_data));
     if (!srv) { vfs_node_put(peer_node); unix_data_put(peer_u); return -ENOMEM; }
-    srv->rb_buffer = kmalloc(UNIX_RB_SIZE);
+    srv->rb_size = unix_rb_size();
+    srv->rb_buffer = kmalloc(srv->rb_size);
     if (!srv->rb_buffer) { kfree(srv); vfs_node_put(peer_node); unix_data_put(peer_u); return -ENOMEM; }
     /* SO_PEERCRED on the accepted socket must report the server's identity, so
      * the endpoint inherits it from the listening socket rather than from the
@@ -563,7 +616,7 @@ retry:
   unix_unlock(u);
 
   unix_lock(peer_u);
-  usize free_space = UNIX_RB_SIZE - peer_u->rb_count;
+  usize free_space = peer_u->rb_size - peer_u->rb_count;
   if (free_space == 0) {
     /* Buffer full. POSIX: a blocking socket waits for the reader to drain;
      * only O_NONBLOCK returns EAGAIN. Block on the peer (buffer-owner) socket:
@@ -585,7 +638,7 @@ retry:
     else
       scheduler_wait_prepare(psock);
     unix_lock(peer_u);
-    int still_full = (peer_u->rb_count >= UNIX_RB_SIZE);
+    int still_full = (peer_u->rb_count >= peer_u->rb_size);
     unix_unlock(peer_u);
     unix_data_put(peer_u);
     if (!s->connected) {            /* peer hung up → retry reports ENOTCONN */
@@ -634,7 +687,7 @@ retry:
     /* A SOCK_SEQPACKET write is all-or-nothing: a message that cannot fit
      * whole is either too large ever (EMSGSIZE) or has to wait for the reader
      * to drain, exactly as it does on Linux. */
-    if (len > UNIX_RB_SIZE) {
+    if (len > peer_u->rb_size) {
       unix_unlock(peer_u);
       unix_data_put(peer_u);
       return -EMSGSIZE;
@@ -673,7 +726,7 @@ retry:
   }
   for (usize i = 0; i < to_copy; i++) {
     peer_u->rb_buffer[peer_u->rb_tail] = ((const char *)buf)[i];
-    peer_u->rb_tail = (peer_u->rb_tail + 1) % UNIX_RB_SIZE;
+    peer_u->rb_tail = (peer_u->rb_tail + 1) % peer_u->rb_size;
   }
   peer_u->rb_count += to_copy;
   peer_u->write_seq += to_copy;
@@ -731,14 +784,14 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
           ctl = candidate;
       }
       for (usize i = 0; i < to_copy; i++) {
-        usize idx = (u->rb_head + i) % UNIX_RB_SIZE;
+        usize idx = (u->rb_head + i) % u->rb_size;
         ((char *)buf)[i] = u->rb_buffer[idx];
       }
       usize consume = to_copy;
       if (seqpacket && !(flags & B1NIX_MSG_PEEK))
         consume = avail; /* the rest of the message is dropped, not re-read */
       if (!(flags & B1NIX_MSG_PEEK))
-        u->rb_head = (u->rb_head + consume) % UNIX_RB_SIZE;
+        u->rb_head = (u->rb_head + consume) % u->rb_size;
       if (!(flags & B1NIX_MSG_PEEK)) {
         u->rb_count -= consume;
         u->read_seq += consume;
@@ -775,8 +828,21 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
     }
     unix_unlock(u);
     if ((s->type == B1NIX_SOCK_STREAM || s->type == B1NIX_SOCK_SEQPACKET) &&
-        !s->connected)
+        !s->connected) {
+      /* End of file on a stream socket is how a child decides its parent has
+       * finished with it — Chromium's zygote exits on exactly this. When one
+       * arrives that nobody asked for, the reader's identity and the moment it
+       * happened are the whole of the evidence. b1nix.trace-exit turns it on;
+       * an EOF ends the read, so this cannot repeat in a loop. */
+      if (bootinfo_has_flag("b1nix.trace-exit")) {
+        console_write("UNIX-EOF: reader pid=");
+        console_write_dec(current_task ? current_task->id : 0);
+        console_write(" had_peer=");
+        console_write_dec((u64)u->had_peer);
+        console_write("\n");
+      }
       return 0;
+    }
     if (flags & B1NIX_MSG_DONTWAIT) return -EAGAIN;
     /* SMP-safe wait: publish BLOCKED on our socket, then re-test under the lock
      * so a sender's wake (scheduler_wake_all(u->socket) after a write/close)
@@ -830,7 +896,7 @@ int unix_poll(struct vfs_socket_state *s, struct b1nix_pollfd *pfd) {
     if (peer_u) unix_data_get(peer_u);
     unix_unlock(u);
     if (peer_u) {
-      if (peer_u->rb_count < UNIX_RB_SIZE) pfd->revents |= B1NIX_POLLOUT;
+      if (peer_u->rb_count < peer_u->rb_size) pfd->revents |= B1NIX_POLLOUT;
       unix_data_put(peer_u);
     }
   } else if (s->type == B1NIX_SOCK_DGRAM) {

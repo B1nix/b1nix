@@ -21,6 +21,7 @@
  */
 
 #include <b1nix/net.h>
+#include <b1nix/namespace.h>
 #include <b1nix/netdev.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/console.h>
@@ -46,6 +47,10 @@ struct route_entry {
 	int oif;      /* output interface index, 0 = unspecified */
 	u32 table;    /* routing table id (RT_TABLE_MAIN unless policy says else) */
 	u8 dynamic;   /* installed by DHCP/autoconf — dropped on lease loss */
+	/* The network namespace this route belongs to. Every lookup, listing and
+	 * deletion filters on it, so a route added inside a namespace is not
+	 * merely invisible outside it — it never carries a packet out there. */
+	u32 ns;
 };
 
 struct route6_entry {
@@ -58,6 +63,7 @@ struct route6_entry {
 	int oif;
 	u32 table;
 	u8 dynamic;
+	u32 ns;
 };
 
 /* One policy rule. Rules are consulted in ascending priority; the first whose
@@ -77,6 +83,11 @@ struct route_rule {
 };
 
 static struct route_rule rules[ROUTE_MAX_RULES];
+
+/* Which namespace is asking. Read before route_lock is taken — the namespace
+ * table has a lock of its own, and nesting the two would invent a lock order
+ * nothing else in the tree observes. */
+static u32 route_ns(void) { return namespace_net_context(); }
 
 static struct route_entry routes[ROUTE_MAX_ENTRIES];
 static struct route6_entry routes6[ROUTE6_MAX_ENTRIES];
@@ -148,11 +159,11 @@ static int route_iface_index(const char *iface)
 
 /* ── IPv4 table ──────────────────────────────────────────────────────────── */
 
-static struct route_entry *route_find_locked(u32 dst, u32 mask, u32 gw, int oif,
+static struct route_entry *route_find_locked(u32 ns, u32 dst, u32 mask, u32 gw, int oif,
                                              u32 table, int match_gw)
 {
 	for (int i = 0; i < ROUTE_MAX_ENTRIES; i++) {
-		if (!routes[i].used)
+		if (!routes[i].used || routes[i].ns != ns)
 			continue;
 		if (routes[i].table != table)
 			continue;
@@ -165,8 +176,8 @@ static struct route_entry *route_find_locked(u32 dst, u32 mask, u32 gw, int oif,
 	return 0;
 }
 
-static int route_add_locked(u32 dst, u32 mask, u32 gw, u16 flags, u16 metric,
-                            int oif, u32 table, int dynamic)
+static int route_add_locked(u32 ns, u32 dst, u32 mask, u32 gw, u16 flags,
+                            u16 metric, int oif, u32 table, int dynamic)
 {
 	dst &= mask;
 
@@ -176,7 +187,7 @@ static int route_add_locked(u32 dst, u32 mask, u32 gw, u16 flags, u16 metric,
 	 * gateways, and what makes ECMP possible. A DHCP renew that changes the
 	 * gateway does not leave the old one behind because
 	 * route_configure_interface() drops the dynamic entries first. */
-	struct route_entry *e = route_find_locked(dst, mask, gw, oif, table, 1);
+	struct route_entry *e = route_find_locked(ns, dst, mask, gw, oif, table, 1);
 	if (!e) {
 		for (int i = 0; i < ROUTE_MAX_ENTRIES; i++) {
 			if (!routes[i].used) {
@@ -202,6 +213,7 @@ static int route_add_locked(u32 dst, u32 mask, u32 gw, u16 flags, u16 metric,
 	e->oif = oif;
 	e->table = table;
 	e->dynamic = (u8)(dynamic ? 1 : 0);
+	e->ns = ns;
 	return 0;
 }
 
@@ -209,8 +221,9 @@ int route_add_table(u32 dst, u32 mask, u32 gw, u16 flags, u16 metric, int oif,
                     u32 table)
 {
 	u64 f;
+	u32 ns = route_ns();
 	spin_lock_irqsave(&route_lock, &f);
-	int rc = route_add_locked(dst, mask, gw, flags, metric, oif, table, 0);
+	int rc = route_add_locked(ns, dst, mask, gw, flags, metric, oif, table, 0);
 	spin_unlock_irqrestore(&route_lock, f);
 	return rc;
 }
@@ -229,6 +242,7 @@ int route_add(u32 dst, u32 mask, u32 gw, u16 flags, u16 metric,
 int route_del_table(u32 dst, u32 mask, u32 gw, u32 table)
 {
 	u64 f;
+	u32 ns = route_ns();
 	spin_lock_irqsave(&route_lock, &f);
 	/* Match on gateway first (delete the exact route the caller named); fall
 	 * back to prefix-only so `route del -net X` works without repeating the
@@ -236,14 +250,14 @@ int route_del_table(u32 dst, u32 mask, u32 gw, u32 table)
 	struct route_entry *e = 0;
 	if (gw != 0) {
 		for (int i = 0; i < ROUTE_MAX_ENTRIES && !e; i++) {
-			if (routes[i].used && routes[i].table == table &&
-			    routes[i].mask == mask &&
+			if (routes[i].used && routes[i].ns == ns &&
+			    routes[i].table == table && routes[i].mask == mask &&
 			    routes[i].dst == (dst & mask) && routes[i].gateway == gw)
 				e = &routes[i];
 		}
 	}
 	if (!e)
-		e = route_find_locked(dst, mask, 0, 0, table, 0);
+		e = route_find_locked(ns, dst, mask, 0, 0, table, 0);
 	if (!e) {
 		spin_unlock_irqrestore(&route_lock, f);
 		return -1;
@@ -261,9 +275,10 @@ int route_del(u32 dst, u32 mask, u32 gw)
 void route_flush_dynamic(void)
 {
 	u64 f;
+	u32 ns = route_ns();
 	spin_lock_irqsave(&route_lock, &f);
 	for (int i = 0; i < ROUTE_MAX_ENTRIES; i++) {
-		if (routes[i].used && routes[i].dynamic)
+		if (routes[i].used && routes[i].ns == ns && routes[i].dynamic)
 			memset(&routes[i], 0, sizeof(routes[i]));
 	}
 	spin_unlock_irqrestore(&route_lock, f);
@@ -272,8 +287,26 @@ void route_flush_dynamic(void)
 void route_flush_all(void)
 {
 	u64 f;
+	u32 ns = route_ns();
 	spin_lock_irqsave(&route_lock, &f);
-	memset(routes, 0, sizeof(routes));
+	for (int i = 0; i < ROUTE_MAX_ENTRIES; i++)
+		if (routes[i].used && routes[i].ns == ns)
+			memset(&routes[i], 0, sizeof(routes[i]));
+	spin_unlock_irqrestore(&route_lock, f);
+}
+
+/* Everything belonging to a namespace that is going away. Unlike the flushes
+ * above this is not "the caller's" namespace — the caller has already left. */
+void route_flush_ns(u32 ns)
+{
+	u64 f;
+	spin_lock_irqsave(&route_lock, &f);
+	for (int i = 0; i < ROUTE_MAX_ENTRIES; i++)
+		if (routes[i].used && routes[i].ns == ns)
+			memset(&routes[i], 0, sizeof(routes[i]));
+	for (int i = 0; i < ROUTE6_MAX_ENTRIES; i++)
+		if (routes6[i].used && routes6[i].ns == ns)
+			memset(&routes6[i], 0, sizeof(routes6[i]));
 	spin_unlock_irqrestore(&route_lock, f);
 }
 
@@ -288,6 +321,7 @@ void route_configure_interface(struct ipv4_addr ip, struct ipv4_addr mask,
 	u32 h_mask = route_ipv4_to_host(mask);
 	u32 h_gw = route_ipv4_to_host(gw);
 	int oif = netdev_index_of(netdev_active());
+	u32 ns = route_ns();
 
 	if (h_mask == 0 && h_ip != 0) {
 		u8 first = ip.bytes[0];
@@ -306,10 +340,10 @@ void route_configure_interface(struct ipv4_addr ip, struct ipv4_addr mask,
 			memset(&routes[i], 0, sizeof(routes[i]));
 	}
 	if (h_ip != 0)
-		route_add_locked(h_ip & h_mask, h_mask, 0, RTF_UP, 0, oif,
+		route_add_locked(ns, h_ip & h_mask, h_mask, 0, RTF_UP, 0, oif,
 		                 RT_TABLE_MAIN, 1);
 	if (h_gw != 0)
-		route_add_locked(0, 0, h_gw, RTF_UP | RTF_GATEWAY, 0, oif,
+		route_add_locked(ns, 0, 0, h_gw, RTF_UP | RTF_GATEWAY, 0, oif,
 		                 RT_TABLE_MAIN, 1);
 	spin_unlock_irqrestore(&route_lock, f);
 }
@@ -319,7 +353,7 @@ void route_configure_interface(struct ipv4_addr ip, struct ipv4_addr mask,
  * next hops share it, the second picks the flow's hop out of that set. Two
  * passes instead of a candidate array means there is no cap on the width of an
  * ECMP group — it is bounded only by the table itself. */
-static int route_lookup_table_locked(u32 table, u32 d, u32 flow,
+static int route_lookup_table_locked(u32 ns, u32 table, u32 d, u32 flow,
                                      struct ipv4_addr dst,
                                      struct ipv4_addr *nexthop, u16 *flags,
                                      int *oif)
@@ -329,7 +363,7 @@ static int route_lookup_table_locked(u32 table, u32 d, u32 flow,
 	u32 count = 0;
 
 	for (int i = 0; i < ROUTE_MAX_ENTRIES; i++) {
-		if (!routes[i].used || routes[i].table != table)
+		if (!routes[i].used || routes[i].ns != ns || routes[i].table != table)
 			continue;
 		if (!(routes[i].flags & RTF_UP))
 			continue;
@@ -351,7 +385,7 @@ static int route_lookup_table_locked(u32 table, u32 d, u32 flow,
 	u32 pick = count == 1 ? 0 : route_hash32(flow ? flow : d) % count;
 	u32 seen = 0;
 	for (int i = 0; i < ROUTE_MAX_ENTRIES; i++) {
-		if (!routes[i].used || routes[i].table != table)
+		if (!routes[i].used || routes[i].ns != ns || routes[i].table != table)
 			continue;
 		if (!(routes[i].flags & RTF_UP))
 			continue;
@@ -393,6 +427,7 @@ int route_lookup_ex(struct ipv4_addr src, struct ipv4_addr dst, u32 flow,
 	int found = 0;
 
 	u64 f;
+	u32 ns = route_ns();
 	spin_lock_irqsave(&route_lock, &f);
 
 	u32 last_prio = 0;
@@ -418,7 +453,7 @@ int route_lookup_ex(struct ipv4_addr src, struct ipv4_addr dst, u32 flow,
 
 		if (!rule_matches_v4(&rules[idx], s4, iif))
 			continue;
-		if (route_lookup_table_locked(rules[idx].table, d, flow, dst, nexthop,
+		if (route_lookup_table_locked(ns, rules[idx].table, d, flow, dst, nexthop,
 		                              flags, oif)) {
 			found = 1;
 			break;
@@ -445,9 +480,10 @@ usize route_snapshot(struct route_info *out, usize max)
 {
 	usize n = 0;
 	u64 f;
+	u32 ns = route_ns();
 	spin_lock_irqsave(&route_lock, &f);
 	for (int i = 0; i < ROUTE_MAX_ENTRIES && n < max; i++) {
-		if (!routes[i].used)
+		if (!routes[i].used || routes[i].ns != ns)
 			continue;
 		out[n].dst = routes[i].dst;
 		out[n].mask = routes[i].mask;
@@ -505,7 +541,7 @@ static int in6_is_zero_bytes(const u8 *a)
 	return 1;
 }
 
-static struct route6_entry *route6_find_locked(const u8 *dst, u8 plen,
+static struct route6_entry *route6_find_locked(u32 ns, const u8 *dst, u8 plen,
                                                const u8 *gw, int oif,
                                                u32 table, int match_gw)
 {
@@ -513,7 +549,7 @@ static struct route6_entry *route6_find_locked(const u8 *dst, u8 plen,
 	memcpy(net, dst, 16);
 	in6_apply_prefix(net, plen);
 	for (int i = 0; i < ROUTE6_MAX_ENTRIES; i++) {
-		if (!routes6[i].used || routes6[i].table != table)
+		if (!routes6[i].used || routes6[i].ns != ns || routes6[i].table != table)
 			continue;
 		if (routes6[i].plen != plen || memcmp(routes6[i].dst, net, 16) != 0)
 			continue;
@@ -525,10 +561,10 @@ static struct route6_entry *route6_find_locked(const u8 *dst, u8 plen,
 	return 0;
 }
 
-static int route6_add_locked(const u8 *dst, u8 plen, const u8 *gw, u16 flags,
+static int route6_add_locked(u32 ns, const u8 *dst, u8 plen, const u8 *gw, u16 flags,
                              u16 metric, int oif, u32 table, int dynamic)
 {
-	struct route6_entry *e = route6_find_locked(dst, plen, gw, oif, table, 1);
+	struct route6_entry *e = route6_find_locked(ns, dst, plen, gw, oif, table, 1);
 	if (!e) {
 		for (int i = 0; i < ROUTE6_MAX_ENTRIES; i++) {
 			if (!routes6[i].used) {
@@ -555,6 +591,7 @@ static int route6_add_locked(const u8 *dst, u8 plen, const u8 *gw, u16 flags,
 	e->oif = oif;
 	e->table = table;
 	e->dynamic = (u8)(dynamic ? 1 : 0);
+	e->ns = ns;
 	return 0;
 }
 
@@ -562,8 +599,9 @@ int route6_add_table(struct in6_addr_k dst, u8 plen, struct in6_addr_k gw,
                      u16 flags, u16 metric, int oif, u32 table)
 {
 	u64 f;
+	u32 ns = route_ns();
 	spin_lock_irqsave(&route_lock, &f);
-	int rc = route6_add_locked(dst.bytes, plen, gw.bytes, flags, metric, oif,
+	int rc = route6_add_locked(ns, dst.bytes, plen, gw.bytes, flags, metric, oif,
 	                           table, 0);
 	spin_unlock_irqrestore(&route_lock, f);
 	return rc;
@@ -579,6 +617,7 @@ int route6_del_table(struct in6_addr_k dst, u8 plen, struct in6_addr_k gw,
                      u32 table)
 {
 	u64 f;
+	u32 ns = route_ns();
 	spin_lock_irqsave(&route_lock, &f);
 	struct route6_entry *e = 0;
 	if (!in6_is_zero_bytes(gw.bytes)) {
@@ -586,7 +625,8 @@ int route6_del_table(struct in6_addr_k dst, u8 plen, struct in6_addr_k gw,
 		memcpy(net, dst.bytes, 16);
 		in6_apply_prefix(net, plen);
 		for (int i = 0; i < ROUTE6_MAX_ENTRIES && !e; i++) {
-			if (routes6[i].used && routes6[i].table == table &&
+			if (routes6[i].used && routes6[i].ns == ns &&
+			    routes6[i].table == table &&
 			    routes6[i].plen == plen &&
 			    memcmp(routes6[i].dst, net, 16) == 0 &&
 			    memcmp(routes6[i].gateway, gw.bytes, 16) == 0)
@@ -596,7 +636,7 @@ int route6_del_table(struct in6_addr_k dst, u8 plen, struct in6_addr_k gw,
 	if (!e) {
 		struct in6_addr_k zero;
 		memset(&zero, 0, sizeof(zero));
-		e = route6_find_locked(dst.bytes, plen, zero.bytes, 0, table, 0);
+		e = route6_find_locked(ns, dst.bytes, plen, zero.bytes, 0, table, 0);
 	}
 	if (!e) {
 		spin_unlock_irqrestore(&route_lock, f);
@@ -766,6 +806,7 @@ void route6_configure_interface(struct in6_addr_k prefix, u8 plen,
                                 struct in6_addr_k router)
 {
 	int oif = netdev_index_of(netdev_active());
+	u32 ns = route_ns();
 	struct in6_addr_k zero, any;
 	memset(&zero, 0, sizeof(zero));
 	memset(&any, 0, sizeof(any));
@@ -777,15 +818,15 @@ void route6_configure_interface(struct in6_addr_k prefix, u8 plen,
 			memset(&routes6[i], 0, sizeof(routes6[i]));
 	}
 	if (!in6_is_zero_bytes(prefix.bytes))
-		route6_add_locked(prefix.bytes, plen, zero.bytes, RTF_UP, 0, oif,
+		route6_add_locked(ns, prefix.bytes, plen, zero.bytes, RTF_UP, 0, oif,
 		                  RT_TABLE_MAIN, 1);
 	if (!in6_is_zero_bytes(router.bytes))
-		route6_add_locked(any.bytes, 0, router.bytes, RTF_UP | RTF_GATEWAY, 0,
+		route6_add_locked(ns, any.bytes, 0, router.bytes, RTF_UP | RTF_GATEWAY, 0,
 		                  oif, RT_TABLE_MAIN, 1);
 	spin_unlock_irqrestore(&route_lock, f);
 }
 
-static int route6_lookup_table_locked(u32 table, struct in6_addr_k dst,
+static int route6_lookup_table_locked(u32 ns, u32 table, struct in6_addr_k dst,
                                       u32 flow, struct in6_addr_k *nexthop,
                                       u16 *flags, int *oif)
 {
@@ -794,7 +835,7 @@ static int route6_lookup_table_locked(u32 table, struct in6_addr_k dst,
 	u32 count = 0;
 
 	for (int i = 0; i < ROUTE6_MAX_ENTRIES; i++) {
-		if (!routes6[i].used || routes6[i].table != table)
+		if (!routes6[i].used || routes6[i].ns != ns || routes6[i].table != table)
 			continue;
 		if (!(routes6[i].flags & RTF_UP))
 			continue;
@@ -820,7 +861,7 @@ static int route6_lookup_table_locked(u32 table, struct in6_addr_k dst,
 	u32 pick = count == 1 ? 0 : route_hash32(h) % count;
 	u32 seen = 0;
 	for (int i = 0; i < ROUTE6_MAX_ENTRIES; i++) {
-		if (!routes6[i].used || routes6[i].table != table)
+		if (!routes6[i].used || routes6[i].ns != ns || routes6[i].table != table)
 			continue;
 		if (!(routes6[i].flags & RTF_UP))
 			continue;
@@ -851,6 +892,7 @@ int route6_lookup_ex(struct in6_addr_k src, struct in6_addr_k dst, u32 flow,
 {
 	int found = 0;
 	u64 f;
+	u32 ns = route_ns();
 	spin_lock_irqsave(&route_lock, &f);
 
 	u32 last_prio = 0;
@@ -878,7 +920,7 @@ int route6_lookup_ex(struct in6_addr_k src, struct in6_addr_k dst, u32 flow,
 		if (rules[idx].src6_plen &&
 		    !in6_prefix_eq(rules[idx].src6, src.bytes, rules[idx].src6_plen))
 			continue;
-		if (route6_lookup_table_locked(rules[idx].table, dst, flow, nexthop,
+		if (route6_lookup_table_locked(ns, rules[idx].table, dst, flow, nexthop,
 		                               flags, oif)) {
 			found = 1;
 			break;
@@ -905,9 +947,10 @@ usize route6_snapshot(struct route6_info *out, usize max)
 {
 	usize n = 0;
 	u64 f;
+	u32 ns = route_ns();
 	spin_lock_irqsave(&route_lock, &f);
 	for (int i = 0; i < ROUTE6_MAX_ENTRIES && n < max; i++) {
-		if (!routes6[i].used)
+		if (!routes6[i].used || routes6[i].ns != ns)
 			continue;
 		memcpy(out[n].dst, routes6[i].dst, 16);
 		memcpy(out[n].gateway, routes6[i].gateway, 16);

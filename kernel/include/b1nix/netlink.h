@@ -27,7 +27,7 @@ isize netlink_socket_send(struct vfs_socket_state *s, const void *buf,
 
 /* The kernel-side ifindex the synthetic loopback interface is presented under.
  * Real NICs occupy 1..NET_MAX_NETDEVS through netdev_index_of(). */
-#define NETLINK_LO_IFINDEX 9
+#define NETLINK_LO_IFINDEX 32
 
 /*
  * NETLINK_KOBJECT_UEVENT: the kernel's hotplug announcements.

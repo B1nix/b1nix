@@ -1,5 +1,6 @@
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
+#include <b1nix/vnet.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <string.h>
@@ -7,6 +8,7 @@
 #define IP_PROTO_ICMP 1
 #define IP_PROTO_TCP  6
 #define IP_PROTO_UDP  17
+#define IP_PROTO_GRE  47
 
 struct ipv4_header {
 	u8 ihl_version;
@@ -181,6 +183,9 @@ void ipv4_receive_flags(const void *data, usize size, u32 rx_flags)
 		udp_receive(hdr->src, payload, payload_size);
 	} else if (hdr->protocol == IP_PROTO_TCP) {
 		tcp_receive(hdr->src, payload, payload_size);
+	} else if (hdr->protocol == IP_PROTO_GRE) {
+		/* An encapsulated ethernet frame for one of the gretap devices. */
+		gre_input(hdr->src, payload, payload_size);
 	}
 }
 

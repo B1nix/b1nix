@@ -1,4 +1,6 @@
 #include <b1nix/vfs.h>
+#include <b1nix/namespace.h>
+#include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
@@ -9,13 +11,91 @@
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/netlink.h>
+#include <b1nix/packet.h>
+
+/* Defined below, next to the option code it mirrors. */
+static void sock_apply_tcp_opts(struct vfs_socket_state *s);
+
+/* ── Socket buffer sizing ───────────────────────────────────────────────────
+ *
+ * Linux keeps four numbers here: net.core.{r,w}mem_default, which every new
+ * socket starts with, and net.core.{r,w}mem_max, which bounds what SO_RCVBUF /
+ * SO_SNDBUF may raise them to. The defaults are the constant 212992 on every
+ * machine; the maxima are what a tuned system raises, and the kernel itself
+ * scales the TCP window ceiling with installed memory (tcp_init()). We do the
+ * same: a fixed default, and a maximum that is a fraction of RAM inside a floor
+ * and a ceiling. `b1nix.rmem-max=N` / `b1nix.wmem-max=N` (bytes) override it.
+ *
+ * Until this, both fields were stored and read back but bounded nothing, and a
+ * fresh socket reported a buffer of zero — a value no Linux socket ever has. */
+#define SOCK_MEM_DEFAULT 212992
+#define SOCK_MEM_MAX_FLOOR 212992
+#define SOCK_MEM_MAX_CEIL (4 * 1024 * 1024)
+/* A window under a couple of segments cannot make progress; Linux's
+ * SOCK_MIN_RCVBUF is the same idea. */
+#define SOCK_MEM_MIN 4096
+
+static u32 sock_rmem_max_v;
+static u32 sock_wmem_max_v;
+
+static u32 sock_cmdline_u32(const char *key, u32 fallback) {
+  char buf[24];
+  if (!bootinfo_get_kv(key, buf, sizeof(buf)) || !buf[0])
+    return fallback;
+  const char *p = buf;
+  if (*p < '0' || *p > '9')
+    return fallback;
+  u32 v = 0;
+  for (; *p >= '0' && *p <= '9'; p++)
+    v = v * 10u + (u32)(*p - '0');
+  return v;
+}
+
+/* One thirty-second of usable RAM, clamped — 208 KiB on a small machine, the
+ * 4 MiB ceiling from 128 MiB upwards. Computed once, on first use, because a
+ * socket can be created before any net init would have run. */
+static void sock_mem_limits_init(void) {
+  if (sock_rmem_max_v)
+    return;
+  u64 ram = pmm_total_usable_memory();
+  u64 share = ram / 32;
+  if (share < SOCK_MEM_MAX_FLOOR)
+    share = SOCK_MEM_MAX_FLOOR;
+  if (share > SOCK_MEM_MAX_CEIL)
+    share = SOCK_MEM_MAX_CEIL;
+  sock_rmem_max_v = sock_cmdline_u32("b1nix.rmem-max", (u32)share);
+  sock_wmem_max_v = sock_cmdline_u32("b1nix.wmem-max", (u32)share);
+  if (sock_rmem_max_v < SOCK_MEM_MIN)
+    sock_rmem_max_v = SOCK_MEM_MIN;
+  if (sock_wmem_max_v < SOCK_MEM_MIN)
+    sock_wmem_max_v = SOCK_MEM_MIN;
+}
+
+static u32 sock_rmem_max(void) { sock_mem_limits_init(); return sock_rmem_max_v; }
+static u32 sock_wmem_max(void) { sock_mem_limits_init(); return sock_wmem_max_v; }
+
+/* Clamp a requested buffer size into [SOCK_MEM_MIN, max]. */
+static int sock_clamp_mem(int want, u32 max) {
+  if (want < 0)
+    return SOCK_MEM_MIN;
+  u32 v = (u32)want;
+  if (v < SOCK_MEM_MIN)
+    v = SOCK_MEM_MIN;
+  if (v > max)
+    v = max;
+  return (int)v;
+}
 
 struct udp_binding {
   int used;
   u16 port;
   struct vfs_handle *handle;
 };
-#define MAX_UDP_BINDINGS 128
+/* Bound UDP sockets, system-wide. The table is 16 bytes an entry, and running
+ * out is silent: udp_autobind hands back port 0 and every reply to that socket
+ * is then dropped. 512 is the same order as the file-descriptor budget a busy
+ * desktop session holds. */
+#define MAX_UDP_BINDINGS 512
 struct udp_binding udp_bindings[MAX_UDP_BINDINGS];
 
 static u16 ntoh16(u16 value) {
@@ -70,7 +150,10 @@ static int in6_is_v4mapped(const struct in6_addr_k *a) {
  * each ICMP packet to every raw socket, wrapped in a synthetic IPv4 header
  * (SOCK_RAW readers expect the IP header included). Recv/poll reuse the
  * datagram queue. */
-#define MAX_RAW_SOCKS 8
+/* Concurrent SOCK_RAW/ICMP sockets. A pointer apiece, and overflow is a silent
+ * no-op — the socket exists but never receives — so the table is sized for more
+ * than the handful of pings a diagnostic session runs at once. */
+#define MAX_RAW_SOCKS 32
 static struct vfs_socket_state *raw_socks[MAX_RAW_SOCKS];
 
 static void raw_sock_register(struct vfs_socket_state *s) {
@@ -113,14 +196,14 @@ void vfs_socket_push_raw_icmp(struct ipv4_addr src, const void *icmp,
   usize total = iphl + len;
   for (int i = 0; i < MAX_RAW_SOCKS; i++) {
     struct vfs_socket_state *s = raw_socks[i];
-    if (!s || s->udp_q_count >= 8)
+    if (!s || s->udp_q_count >= SOCK_DGRAM_Q_SLOTS)
       continue;
     u8 slot = s->udp_q_tail;
     usize copy =
         total > sizeof(s->udp_q_buf[slot]) ? sizeof(s->udp_q_buf[slot]) : total;
     memcpy(s->udp_q_buf[slot], pkt, copy);
     s->udp_q_len[slot] = copy;
-    s->udp_q_tail = (u8)((s->udp_q_tail + 1) % 8);
+    s->udp_q_tail = (u8)((s->udp_q_tail + 1) % SOCK_DGRAM_Q_SLOTS);
     s->udp_q_count++;
     s->recv_len = s->udp_q_len[s->udp_q_head];
     scheduler_wake_all(s);
@@ -198,6 +281,9 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
   if (s->domain == B1NIX_AF_NETLINK)
     return netlink_socket_send(s, buf, len);
 
+  if (s->domain == B1NIX_AF_PACKET)
+    return packet_send(s, buf, len);
+
   if (s->domain == B1NIX_AF_UNIX) {
     return unix_send(s, buf, len, (h->flags & B1NIX_O_NONBLOCK) ||
                                       (flags & B1NIX_MSG_DONTWAIT));
@@ -269,11 +355,25 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     return unix_recv(s, buf, len);
   }
 
+  /* MSG_DONTWAIT asks for this ONE call not to block, whatever the descriptor
+   * says. Only the AF_UNIX path honoured it; every other family read the
+   * descriptor flag alone and blocked anyway.
+   *
+   * A reader that drains a socket until EAGAIN never gets its EAGAIN, and it
+   * is a common shape: Chromium's netlink address tracker reads the interface
+   * dump that way, so its second recv never returned, the initial connection
+   * type was never established, and the browser's main thread sat in
+   * AddressTrackerLinux::GetCurrentConnectionType() for the rest of the run. */
+  int nonblock = (h->flags & B1NIX_O_NONBLOCK) ||
+                 (flags & B1NIX_MSG_DONTWAIT);
+
   if (s->type == B1NIX_SOCK_DGRAM || s->type == B1NIX_SOCK_RAW ||
       s->domain == B1NIX_AF_NETLINK) {
     u64 deadline = sock_deadline(s->so_rcvtimeo_ms);
     while (s->udp_q_count == 0) {
-      if (h->flags & B1NIX_O_NONBLOCK)
+      /* MSG_DONTWAIT is a per-call O_NONBLOCK: `nonblock` above already folds
+       * the two together, for this path and for the TCP one below. */
+      if (nonblock)
         return -EAGAIN;
       if (sock_deadline_passed(deadline))
         return -EAGAIN; /* SO_RCVTIMEO expired with nothing received */
@@ -302,7 +402,7 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     s->udp_last_src_is6 = s->udp_q_src_is6[slot];
     s->udp_last_src_valid = 1;
     if (!(flags & B1NIX_MSG_PEEK)) {
-      s->udp_q_head = (u8)((s->udp_q_head + 1) % 8);
+      s->udp_q_head = (u8)((s->udp_q_head + 1) % SOCK_DGRAM_Q_SLOTS);
       s->udp_q_count--;
       s->recv_len = (s->udp_q_count > 0) ? s->udp_q_len[s->udp_q_head] : 0;
     }
@@ -318,7 +418,7 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     }
     u64 tcp_deadline = sock_deadline(s->so_rcvtimeo_ms);
     while (!tcp_is_readable(conn)) {
-      if (h->flags & B1NIX_O_NONBLOCK) {
+      if (nonblock) {
         return -EAGAIN;
       }
       if (sock_deadline_passed(tcp_deadline))
@@ -365,6 +465,24 @@ isize vfs_socket_sendto(int fd, const void *buf, usize len, int flags,
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (!addr || !addrlen)
     return vfs_socket_send_h(h, buf, len, flags);
+  /* AF_PACKET: the sockaddr_ll names the interface and, for SOCK_DGRAM, the
+   * destination MAC. Falling through to send_h (as every non-INET family used
+   * to) threw that address away, so a sendto() to a specific NIC left by
+   * whichever one happened to be active. */
+  if (s->domain == B1NIX_AF_PACKET) {
+    if (addrlen < 8)
+      return -EINVAL;
+    if (s->shut_wr)
+      return -EPIPE;
+    struct b1nix_sockaddr_ll saved_ll = s->peer.ll;
+    memset(&s->peer.ll, 0, sizeof(s->peer.ll));
+    memcpy(&s->peer.ll, addr,
+           addrlen < sizeof(s->peer.ll) ? addrlen : sizeof(s->peer.ll));
+    s->peer.ll.sll_family = B1NIX_AF_PACKET;
+    isize rc = packet_send(s, buf, len);
+    s->peer.ll = saved_ll;
+    return rc;
+  }
   if (s->domain != B1NIX_AF_INET && s->domain != B1NIX_AF_INET6)
     return vfs_socket_send_h(h, buf, len, flags);
   /* A connected stream socket ignores the address (Linux allows it). */
@@ -430,6 +548,13 @@ isize vfs_socket_recvfrom(int fd, void *buf, usize len, int flags, void *addr,
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (!addr || !addrlen)
     return vfs_socket_recv_h(h, buf, len, flags);
+
+  /* AF_PACKET reports the link-layer source of the frame just dequeued. */
+  if (s->domain == B1NIX_AF_PACKET) {
+    isize rc = vfs_socket_recv_h(h, buf, len, flags);
+    *addrlen = rc >= 0 ? packet_fill_src(s, addr, *addrlen) : 0;
+    return rc;
+  }
 
   /* SOCK_RAW/AF_NETLINK served from the in-kernel queue; source is the ip hdr */
   if (s->domain != B1NIX_AF_INET && s->domain != B1NIX_AF_INET6) {
@@ -555,6 +680,8 @@ static int socket_teardown(struct vfs_handle *h) {
     return 0;
   if (s->type == B1NIX_SOCK_RAW)
     raw_sock_unregister(s);
+  if (s->domain == B1NIX_AF_PACKET)
+    packet_sock_unregister(s);
   if (s->domain == B1NIX_AF_NETLINK)
     netlink_uevent_unregister(s);
   if ((s->domain == B1NIX_AF_INET || s->domain == B1NIX_AF_INET6) &&
@@ -814,8 +941,13 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   struct k_ifreq r;
   if (syscall_copyin(&r, arg, sizeof(r)) != 0)
     return -EFAULT;
-  if (!netdev_active())
-    return -ENODEV;
+  /* There used to be a blanket `if (!netdev_active()) return -ENODEV;` here.
+   * It read as "is there any networking at all", which was true while the
+   * machine had exactly one interface set — but inside a network namespace
+   * there is no active interface by design, and the guard then refused even to
+   * translate a name this namespace's own veth answers to. Each command below
+   * says for itself what it needs: an unknown name is ENODEV where it is
+   * looked up, and the address commands already gate on has_l3. */
 
   /* Answer for the interface the caller named, not for whichever one happens to
    * be active. With two NICs registered, ignoring ifr_name made SIOCGIFADDR on
@@ -832,6 +964,8 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     /* An empty name keeps the historical "whatever is active" behaviour, which
      * SIOCGIFNAME (index -> name) and a few callers rely on. */
     nd = netdev_active();
+    if (!nd && request != SIOC_GIFNAME)
+      return -ENODEV;
     if_idx = netdev_index_of(nd);
   } else {
     if_idx = netdev_index_by_name(r.ifr_name);
@@ -918,6 +1052,8 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
       r.u.sa.sa_family = ARPHRD_LOOPBACK;
       break;
     }
+    if (!nd)
+      return -ENODEV;
     /* net_get_mac() is the active interface's address; every other NIC carries
      * its own in the netdev. */
     struct mac_addr m = (nd == netdev_active()) ? net_get_mac() : nd->mac;
@@ -979,7 +1115,8 @@ int vfs_socket(int domain, int type, int protocol) {
   int sock_flags = type & (SOCK_TYPE_CLOEXEC | SOCK_TYPE_NONBLOCK);
   type &= ~(SOCK_TYPE_CLOEXEC | SOCK_TYPE_NONBLOCK);
   if (domain != B1NIX_AF_INET && domain != B1NIX_AF_INET6 &&
-      domain != B1NIX_AF_UNIX && domain != B1NIX_AF_NETLINK)
+      domain != B1NIX_AF_UNIX && domain != B1NIX_AF_NETLINK &&
+      domain != B1NIX_AF_PACKET)
     return -EAFNOSUPPORT;
   if (type != B1NIX_SOCK_DGRAM && type != B1NIX_SOCK_STREAM &&
       type != B1NIX_SOCK_RAW && type != B1NIX_SOCK_SEQPACKET)
@@ -987,10 +1124,23 @@ int vfs_socket(int domain, int type, int protocol) {
   /* SOCK_SEQPACKET exists only on the local (AF_UNIX) transport. */
   if (type == B1NIX_SOCK_SEQPACKET && domain != B1NIX_AF_UNIX)
     return -EPROTONOSUPPORT;
-  /* Raw sockets are IPv4 (BusyBox ping/ICMP) or netlink (BusyBox ip). */
+  /* Raw sockets are IPv4 (BusyBox ping/ICMP), netlink (BusyBox ip), or
+   * ethernet (AF_PACKET: udhcpc, arping, tcpdump). */
   if (type == B1NIX_SOCK_RAW && domain != B1NIX_AF_INET &&
-      domain != B1NIX_AF_NETLINK)
+      domain != B1NIX_AF_NETLINK && domain != B1NIX_AF_PACKET)
     return -EAFNOSUPPORT;
+  /* AF_PACKET is frames, not streams. */
+  if (domain == B1NIX_AF_PACKET && type != B1NIX_SOCK_RAW &&
+      type != B1NIX_SOCK_DGRAM)
+    return -ESOCKTNOSUPPORT;
+  /* Reading and writing the wire directly is a privileged operation: it sees
+   * every neighbour's traffic and can forge any frame. Linux gates it on
+   * CAP_NET_RAW and so does this. */
+  if (domain == B1NIX_AF_PACKET) {
+    struct cred *c = scheduler_get_current_cred();
+    if (c && c->euid != ROOT_UID && !cred_has_cap(c, CAP_NET_RAW))
+      return -EPERM;
+  }
 
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_SOCKET);
   if (!h) return -ENFILE;
@@ -1000,6 +1150,18 @@ int vfs_socket(int domain, int type, int protocol) {
   socket->domain = domain;
   socket->type = type;
   socket->protocol = protocol;
+  /* Stamped once, here: the socket belongs to the namespace it was made in
+   * for the rest of its life. */
+  socket->netns = namespace_net_current();
+  /* Every socket starts at the system default, as on Linux — getsockopt on a
+   * fresh socket has to answer with a real size, and the transports below read
+   * these as their starting budget. */
+  socket->so_rcvbuf = sock_clamp_mem(SOCK_MEM_DEFAULT, sock_rmem_max());
+  socket->so_sndbuf = sock_clamp_mem(SOCK_MEM_DEFAULT, sock_wmem_max());
+  /* Linux's keepalive defaults, so getsockopt answers before connect(2) too. */
+  socket->tcp_keepalive_param[0] = 7200;
+  socket->tcp_keepalive_param[1] = 75;
+  socket->tcp_keepalive_param[2] = 9;
 
   if (domain == B1NIX_AF_UNIX) {
     int res = unix_init_state(socket);
@@ -1007,6 +1169,8 @@ int vfs_socket(int domain, int type, int protocol) {
   }
   if (type == B1NIX_SOCK_RAW && domain == B1NIX_AF_INET)
     raw_sock_register(socket);
+  if (domain == B1NIX_AF_PACKET)
+    packet_sock_register(socket);
   
   vfs_socket_init_handle(h, socket);
   
@@ -1124,6 +1288,9 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
     return 0;
   }
 
+  if (s->domain == B1NIX_AF_PACKET)
+    return packet_bind(s, (const struct b1nix_sockaddr_ll *)addr, addrlen);
+
   if (s->domain == B1NIX_AF_UNIX) {
     if (!addr || addrlen < sizeof(u16) + 1) return -EINVAL;
     return unix_bind(s, (const struct b1nix_sockaddr_un *)addr);
@@ -1238,6 +1405,15 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
   if (!new_s) { vfs_handle_release(new_vh); return -ENOMEM; }
   new_s->domain = s->domain;
   new_s->type = s->type;
+  /* An accepted socket inherits the listener's buffer sizes, as on Linux. */
+  new_s->so_rcvbuf = s->so_rcvbuf;
+  new_s->so_sndbuf = s->so_sndbuf;
+  /* An accepted connection inherits the listener's keepalive settings, as on
+   * Linux — a server that asks for keepalive means the connections it serves,
+   * not the socket it listens on. */
+  new_s->so_keepalive = s->so_keepalive;
+  for (int i = 0; i < 3; i++)
+    new_s->tcp_keepalive_param[i] = s->tcp_keepalive_param[i];
   /* The accepted socket's local address is the listener's bound address. Copy
    * it so getsockname() on the connection returns a valid family/addr (sshd
    * calls getsockname right after accept; a zeroed family fails getnameinfo). */
@@ -1283,6 +1459,7 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
     }
     new_s->tcp_conn = conn;
     new_s->connected = 1;
+    sock_apply_tcp_opts(new_s);
     new_s->peer.in.sin_family = B1NIX_AF_INET;
     new_s->peer.in.sin_port = (client_port << 8) | (client_port >> 8);
     new_s->peer.in.sin_addr = (u32)client_ip.bytes[0] | ((u32)client_ip.bytes[1] << 8) |
@@ -1323,6 +1500,7 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
     }
     new_s->tcp_conn = conn;
     new_s->connected = 1;
+    sock_apply_tcp_opts(new_s);
     new_s->peer.in6.sin6_family = B1NIX_AF_INET6;
     new_s->peer.in6.sin6_port = (client_port << 8) | (client_port >> 8);
     memcpy(new_s->peer.in6.sin6_addr.s6_addr, client_ip6.bytes, 16);
@@ -1385,6 +1563,7 @@ int vfs_connect(int fd, const void *addr, usize addrlen) {
       return -EAFNOSUPPORT;
     if (s->type == B1NIX_SOCK_STREAM) {
       s->tcp_conn = tcp_connect6(dst, ntoh16(s->peer.in6.sin6_port));
+      sock_apply_tcp_opts(s);
       if (!s->tcp_conn)
         return -ECONNREFUSED;
       s->connected = 1;
@@ -1404,6 +1583,7 @@ int vfs_connect(int fd, const void *addr, usize addrlen) {
     dst_ip.bytes[3] = (s->peer.in.sin_addr >> 24) & 0xFF;
     if (h->flags & B1NIX_O_NONBLOCK) {
       s->tcp_conn = tcp_connect_async(dst_ip, ntoh16(s->peer.in.sin_port));
+      sock_apply_tcp_opts(s);
       if (!s->tcp_conn) {
         return -ECONNREFUSED;
       }
@@ -1415,8 +1595,27 @@ int vfs_connect(int fd, const void *addr, usize addrlen) {
       return -ECONNREFUSED;
     }
     s->connected = 1;
+    sock_apply_tcp_opts(s);
   }
   return 0;
+}
+
+
+/* Push what setsockopt recorded before connect(2) onto the connection it just
+ * got: the options are set on a socket, but they live on the connection, and
+ * a program that configures keepalive and then connects expects the settings
+ * to survive that order. */
+static void sock_apply_tcp_opts(struct vfs_socket_state *s) {
+  if (!s || !s->tcp_conn || s->type != B1NIX_SOCK_STREAM)
+    return;
+  for (int i = 0; i < 3; i++)
+    if (s->tcp_keepalive_param[i] > 0)
+      tcp_set_keepalive_param((struct tcp_conn *)s->tcp_conn, i,
+                              (u32)s->tcp_keepalive_param[i]);
+  if (s->so_keepalive)
+    tcp_set_keepalive((struct tcp_conn *)s->tcp_conn, 1);
+  if (s->so_rcvbuf > 0)
+    tcp_set_rcvbuf((struct tcp_conn *)s->tcp_conn, (u32)s->so_rcvbuf);
 }
 
 isize vfs_socket_send(int fd, const void *buf, usize len, int flags) {
@@ -1529,6 +1728,9 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
 #define SOCK_SO_PEERCRED  17
 #define SOCK_SO_ACCEPTCONN 30
 #define SOCK_TCP_NODELAY  1
+#define SOCK_TCP_KEEPIDLE  4
+#define SOCK_TCP_KEEPINTVL 5
+#define SOCK_TCP_KEEPCNT   6
 #define SOCK_IPV6_V6ONLY  26
 #define SOCK_SHUT_RD      0
 #define SOCK_SHUT_WR      1
@@ -1582,9 +1784,24 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     switch (optname) {
     case SOCK_SO_REUSEADDR:
     case SOCK_SO_REUSEPORT: s->so_reuseaddr = v ? 1 : 0; return 0;
-    case SOCK_SO_KEEPALIVE: s->so_keepalive = v ? 1 : 0; return 0;
-    case SOCK_SO_SNDBUF:    s->so_sndbuf = v; return 0;
-    case SOCK_SO_RCVBUF:    s->so_rcvbuf = v; return 0;
+    case SOCK_SO_KEEPALIVE:
+      s->so_keepalive = v ? 1 : 0;
+      /* On a connected TCP socket this is not a stored flag: it starts (or
+       * stops) the probes the connection will send once it goes quiet. */
+      if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn)
+        tcp_set_keepalive((struct tcp_conn *)s->tcp_conn, s->so_keepalive);
+      return 0;
+    case SOCK_SO_SNDBUF:
+      s->so_sndbuf = sock_clamp_mem(v, sock_wmem_max());
+      return 0;
+    case SOCK_SO_RCVBUF:
+      s->so_rcvbuf = sock_clamp_mem(v, sock_rmem_max());
+      /* On a TCP socket the value is not just recorded: it is the ceiling the
+       * receive buffer may auto-tune to, and therefore the window we invite the
+       * peer to fill. */
+      if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn)
+        tcp_set_rcvbuf((struct tcp_conn *)s->tcp_conn, (u32)s->so_rcvbuf);
+      return 0;
     case SOCK_SO_PASSCRED:
       if (s->domain != B1NIX_AF_UNIX) return -ENOPROTOOPT;
       s->so_passcred = v ? 1 : 0;
@@ -1594,6 +1811,22 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     }
   }
   if (level == SOCK_IPPROTO_TCP) {
+    if (optname == SOCK_TCP_KEEPIDLE || optname == SOCK_TCP_KEEPINTVL ||
+        optname == SOCK_TCP_KEEPCNT) {
+      int which = optname == SOCK_TCP_KEEPIDLE    ? 0
+                  : optname == SOCK_TCP_KEEPINTVL ? 1
+                                                  : 2;
+      if (v <= 0)
+        return -EINVAL;
+      if (s->type != B1NIX_SOCK_STREAM)
+        return -ENOPROTOOPT;
+      s->tcp_keepalive_param[which] = v;
+      if (s->tcp_conn &&
+          tcp_set_keepalive_param((struct tcp_conn *)s->tcp_conn, which,
+                                  (u32)v) < 0)
+        return -EINVAL;
+      return 0;
+    }
     if (optname == SOCK_TCP_NODELAY) {
       /* b1nix TCP already sends each segment promptly (no Nagle), so this is
        * a stored, honoured-by-construction flag. */
@@ -1665,6 +1898,19 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     }
   } else if (level == SOCK_IPPROTO_TCP && optname == SOCK_TCP_NODELAY) {
     v = s->tcp_nodelay;
+  } else if (level == SOCK_IPPROTO_TCP &&
+             (optname == SOCK_TCP_KEEPIDLE || optname == SOCK_TCP_KEEPINTVL ||
+              optname == SOCK_TCP_KEEPCNT)) {
+    int which = optname == SOCK_TCP_KEEPIDLE    ? 0
+                : optname == SOCK_TCP_KEEPINTVL ? 1
+                                                : 2;
+    if (s->type != B1NIX_SOCK_STREAM)
+      return -ENOPROTOOPT;
+    /* An unconnected socket has no connection to ask, so it answers with what
+     * it would set once it has one. */
+    v = s->tcp_conn ? (int)tcp_get_keepalive_param((struct tcp_conn *)s->tcp_conn,
+                                                   which)
+                    : s->tcp_keepalive_param[which];
   } else if (level == SOCK_IPPROTO_IPV6 && optname == SOCK_IPV6_V6ONLY &&
              s->domain == B1NIX_AF_INET6) {
     v = s->ipv6_v6only;
@@ -1691,6 +1937,8 @@ static int sock_copy_local_peer(struct vfs_socket_state *s, int want_peer,
   /* AF_NETLINK is 12 bytes; reporting the 110-byte sockaddr_un default made
    * libnetlink's rtnl_open() reject every socket it had just bound. */
   else if (s->domain == B1NIX_AF_NETLINK) need = sizeof(struct b1nix_sockaddr_nl);
+  /* AF_PACKET is 20 bytes; udhcpc checks the length it gets back. */
+  else if (s->domain == B1NIX_AF_PACKET) need = sizeof(struct b1nix_sockaddr_ll);
   else need = sizeof(struct b1nix_sockaddr_un);
 
   usize copy = *addrlen < need ? *addrlen : need;
@@ -1730,6 +1978,10 @@ int vfs_shutdown(int fd, int how) {
 
 int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len,
                         const void *src_ip, int src_is_v6, u16 src_port_net) {
+  /* The namespace the datagram arrived in — the receiving interface's, since
+   * this runs inside the receive path. Two namespaces may hold the same port
+   * for different sockets, so the port alone does not identify a binding. */
+  u32 rx_ns = namespace_net_context();
   for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
     if (udp_bindings[i].used && udp_bindings[i].port == local_port_net) {
       struct vfs_handle *h = udp_bindings[i].handle;
@@ -1738,7 +1990,9 @@ int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len,
         continue;
       }
       struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
-      if (s->udp_q_count >= 8) {
+      if (s->netns != rx_ns)
+        continue;
+      if (s->udp_q_count >= SOCK_DGRAM_Q_SLOTS) {
         return 0;
       }
       u8 slot = s->udp_q_tail;
@@ -1752,7 +2006,7 @@ int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len,
         memcpy(s->udp_q_src_ip[slot], src_ip, src_is_v6 ? 16 : 4);
       s->udp_q_src_port[slot] = src_port_net;
       s->udp_q_src_is6[slot] = (u8)(src_is_v6 ? 1 : 0);
-      s->udp_q_tail = (u8)((s->udp_q_tail + 1) % 8);
+      s->udp_q_tail = (u8)((s->udp_q_tail + 1) % SOCK_DGRAM_Q_SLOTS);
       s->udp_q_count++;
       s->recv_len = s->udp_q_len[s->udp_q_head];
       

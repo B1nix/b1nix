@@ -24,6 +24,7 @@
  * NLMSG_ERROR carrying -EOPNOTSUPP rather than a silent success.
  */
 
+#include <b1nix/namespace.h>
 #include <b1nix/netlink.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
@@ -33,6 +34,7 @@
 #include <b1nix/posix.h>
 #include <b1nix/sched.h>
 #include <b1nix/uidgid.h>
+#include <b1nix/vnet.h>
 #include <b1nix/vfs.h>
 #include <string.h>
 
@@ -69,11 +71,31 @@
 #define IFLA_BROADCAST 2
 #define IFLA_IFNAME    3
 #define IFLA_MTU       4
+#define IFLA_LINK      5
+#define IFLA_MASTER    10
+#define IFLA_LINKINFO  18
 #define IFLA_QDISC     6
 #define IFLA_STATS     7
 #define IFLA_TXQLEN    13
 #define IFLA_OPERSTATE 16
 #define IFLA_LINKMODE  17
+/* `ip link set <dev> netns <pid>` and `... netns <name>`: the first names the
+ * namespace by a task in it, the second by an open /proc/<pid>/ns/net handle. */
+#define IFLA_NET_NS_PID 19
+#define IFLA_NET_NS_FD  28
+
+/* IFLA_LINKINFO nests the device kind and its per-kind parameters — the
+ * `type bridge` / `type vlan id 10` half of an `ip link add`. */
+#define IFLA_INFO_KIND 1
+#define IFLA_INFO_DATA 2
+#define IFLA_VLAN_ID   1
+#define IFLA_GRE_IKEY  4
+#define IFLA_GRE_OKEY  5
+#define IFLA_GRE_LOCAL 6
+#define IFLA_GRE_REMOTE 7
+/* veth's IFLA_INFO_DATA nests one attribute holding the peer's own
+ * ifinfomsg + attributes — that is where `peer name veth1` arrives. */
+#define VETH_INFO_PEER 1
 
 #define IFA_ADDRESS   1
 #define IFA_LOCAL     2
@@ -127,11 +149,14 @@ static u32 nl_sock_pid(const struct vfs_socket_state *s) {
 
 /* One dump is assembled here before being chopped into datagrams. Sized for
  * the worst case this kernel can produce: 8 interfaces + their addresses, 64
- * IPv4 and 64 IPv6 routes, 64 ARP and 16 NDP neighbours. */
-#define NL_DUMP_MAX 16384
-/* A socket queue slot holds 2048 bytes (struct vfs_socket_state), and the
- * queue is 8 deep. */
-#define NL_SLOT_MAX 2048
+ * IPv4 and 64 IPv6 routes, 64 ARP and 16 NDP neighbours.
+ *
+ * It is also pointless for it to exceed what the socket queue can then deliver:
+ * a dump larger than SLOTS × SLOT bytes was assembled in full and then dropped
+ * on the floor a datagram at a time, with no error to the reader. The buffer is
+ * a single kmalloc, so it now simply follows the queue's capacity. */
+#define NL_SLOT_MAX SOCK_DGRAM_SLOT_MAX
+#define NL_DUMP_MAX (SOCK_DGRAM_Q_SLOTS * NL_SLOT_MAX)
 
 /* ── Little-endian encoders (x86_64 is LE; be explicit anyway) ───────────── */
 
@@ -229,7 +254,7 @@ static void nl_put_attr_u32(struct nl_buf *b, u16 type, u32 v) {
 
 struct nl_iface {
   int index;
-  char name[8];
+  char name[16];
   int loopback;
   u16 arptype;
   u32 mtu;
@@ -237,15 +262,21 @@ struct nl_iface {
   struct mac_addr mac;
 };
 
+/* Interfaces netlink can describe in one dump: every registered netdev plus
+ * loopback. */
+#define NL_MAX_IFACES 16
+
 /* Fill `out` with every interface. Real NICs occupy the netdev registry's own
  * 1-based indices so a route's oif and /proc/net/route agree with what `ip`
  * prints; loopback gets NETLINK_LO_IFINDEX because it is not a netdev. */
 static usize nl_iface_table(struct nl_iface *out, usize max) {
   usize n = 0;
-  for (int idx = 1; n < max; idx++) {
+  for (int idx = 1; n < max && idx <= NL_MAX_IFACES; idx++) {
     struct netdev *nd = netdev_by_index(idx);
+    /* An index whose device has been deleted is a hole, not the end of the
+     * table: the interfaces created after it are still there. */
     if (!nd)
-      break;
+      continue;
     memset(&out[n], 0, sizeof(out[n]));
     out[n].index = idx;
     netdev_ifname(idx, out[n].name, sizeof(out[n].name));
@@ -280,8 +311,6 @@ static usize nl_iface_table(struct nl_iface *out, usize max) {
   }
   return n;
 }
-
-#define NL_MAX_IFACES 12
 
 static int nl_iface_by_index(int index, struct nl_iface *out) {
   struct nl_iface tab[NL_MAX_IFACES];
@@ -690,6 +719,171 @@ static int nl_do_setlink(const u8 *body, usize blen) {
   return netdev_set_admin_up(nd, (flags & NL_IFF_UP) ? 1 : 0);
 }
 
+/* `ip link set <dev> netns <pid|fd>`: move an interface into another network
+ * namespace. This is the operation a veth pair exists for — one end stays
+ * here, the other goes there, and that link is the only way across. */
+static int nl_do_netns(const u8 *body, const struct nl_attrs *a) {
+  if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+    return -EPERM;
+  int index = (int)nl_load_u32(body + 4);
+  struct netdev *dev = netdev_by_index(index);
+  if (!dev && a->ptr[IFLA_IFNAME])
+    dev = netdev_by_index(netdev_index_by_name((const char *)a->ptr[IFLA_IFNAME]));
+  if (!dev)
+    return -ENODEV;
+
+  u32 target;
+  if (a->ptr[IFLA_NET_NS_FD]) {
+    u32 pin = 0;
+    int rc = vfs_fd_ns_pin((int)nl_attr_u32(a, IFLA_NET_NS_FD, 0), &pin);
+    if (rc != 0)
+      return rc;
+    if (VFS_NS_PIN_KIND(pin) != NS_NET)
+      return -EINVAL;
+    target = VFS_NS_PIN_ID(pin);
+  } else {
+    /* The pid is the caller's number for a task, so it goes through the pid
+     * namespace before it names anything. */
+    usize pid = namespace_pid_from_user(nl_attr_u32(a, IFLA_NET_NS_PID, 0));
+    if (!pid)
+      return -ESRCH;
+    target = namespace_id_of(pid, NS_NET);
+  }
+  return netdev_set_netns(dev, target);
+}
+
+/* `ip link set <dev> master <br>` / `nomaster`: RTM_NEWLINK carrying an
+ * IFLA_MASTER and no flag change. */
+static int nl_do_master(const u8 *body, usize blen, const struct nl_attrs *a) {
+  (void)blen;
+  if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+    return -EPERM;
+  int index = (int)nl_load_u32(body + 4);
+  struct netdev *dev = netdev_by_index(index);
+  if (!dev && a->ptr[IFLA_IFNAME])
+    dev = netdev_by_index(netdev_index_by_name((const char *)a->ptr[IFLA_IFNAME]));
+  if (!dev)
+    return -ENODEV;
+  u32 master_idx = nl_attr_u32(a, IFLA_MASTER, 0);
+  if (master_idx == 0)
+    return vnet_set_master(dev, 0);
+  struct netdev *master = netdev_by_index((int)master_idx);
+  if (!master)
+    return -ENODEV;
+  return vnet_set_master(dev, master);
+}
+
+/* `ip link add`: RTM_NEWLINK | NLM_F_CREATE with IFLA_LINKINFO naming the
+ * kind. Everything this kernel can make lives in kernel/net/{vlan,bridge,bond,
+ * gre}.c; a kind it does not implement is refused rather than half-built. */
+static int nl_do_newlink_create(const u8 *body, usize blen,
+                                const struct nl_attrs *a) {
+  (void)body;
+  (void)blen;
+  if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+    return -EPERM;
+  if (!a->ptr[IFLA_IFNAME] || a->len[IFLA_IFNAME] < 2)
+    return -EINVAL; /* an unnamed interface is not something to create */
+  char name[16];
+  usize nlen = a->len[IFLA_IFNAME];
+  if (nlen > sizeof(name))
+    nlen = sizeof(name);
+  memcpy(name, a->ptr[IFLA_IFNAME], nlen);
+  name[nlen - 1] = '\0';
+
+  struct nl_attrs info;
+  nl_parse_attrs(a->ptr[IFLA_LINKINFO], a->len[IFLA_LINKINFO], &info);
+  if (!info.ptr[IFLA_INFO_KIND] || info.len[IFLA_INFO_KIND] < 2)
+    return -EINVAL;
+  char kind[16];
+  usize klen = info.len[IFLA_INFO_KIND];
+  if (klen > sizeof(kind))
+    klen = sizeof(kind);
+  memcpy(kind, info.ptr[IFLA_INFO_KIND], klen);
+  kind[klen - 1] = '\0';
+
+  struct nl_attrs data;
+  nl_parse_attrs(info.ptr[IFLA_INFO_DATA], info.len[IFLA_INFO_DATA], &data);
+
+  if (strcmp(kind, "bridge") == 0)
+    return bridge_create(name);
+  if (strcmp(kind, "bond") == 0)
+    return bond_create(name);
+  if (strcmp(kind, "vlan") == 0) {
+    u32 link = nl_attr_u32(a, IFLA_LINK, 0);
+    struct netdev *lower = netdev_by_index((int)link);
+    if (!lower)
+      return -ENODEV;
+    if (!data.ptr[IFLA_VLAN_ID] || data.len[IFLA_VLAN_ID] < 2)
+      return -EINVAL;
+    return vlan_create(name, lower, nl_load_u16(data.ptr[IFLA_VLAN_ID]));
+  }
+  if (strcmp(kind, "veth") == 0) {
+    /* VETH_INFO_PEER carries a whole ifinfomsg (16 bytes) followed by the
+     * peer's attributes, so the nested attributes start past that header —
+     * parsing from offset 0 would read the ifinfomsg as an rtattr. */
+    char peer[16];
+    peer[0] = '\0';
+    if (data.ptr[VETH_INFO_PEER] && data.len[VETH_INFO_PEER] > 16) {
+      struct nl_attrs pa;
+      nl_parse_attrs(data.ptr[VETH_INFO_PEER] + 16,
+                     (usize)data.len[VETH_INFO_PEER] - 16, &pa);
+      if (pa.ptr[IFLA_IFNAME] && pa.len[IFLA_IFNAME] >= 2) {
+        usize plen = pa.len[IFLA_IFNAME];
+        if (plen > sizeof(peer))
+          plen = sizeof(peer);
+        memcpy(peer, pa.ptr[IFLA_IFNAME], plen);
+        peer[plen - 1] = '\0';
+      }
+    }
+    if (!peer[0]) {
+      /* `ip link add veth0 type veth` with no peer name: Linux invents
+       * veth<N>. Deriving it from the given name keeps both ends nameable
+       * without a second counter. */
+      usize l = strlen(name);
+      if (l + 2 >= sizeof(peer))
+        return -EINVAL;
+      memcpy(peer, name, l);
+      peer[l] = 'p';
+      peer[l + 1] = '\0';
+    }
+    return veth_create(name, peer);
+  }
+  if (strcmp(kind, "gretap") == 0) {
+    struct ipv4_addr local = {{0, 0, 0, 0}}, remote = {{0, 0, 0, 0}};
+    if (data.ptr[IFLA_GRE_LOCAL] && data.len[IFLA_GRE_LOCAL] >= 4)
+      memcpy(local.bytes, data.ptr[IFLA_GRE_LOCAL], 4);
+    if (data.ptr[IFLA_GRE_REMOTE] && data.len[IFLA_GRE_REMOTE] >= 4)
+      memcpy(remote.bytes, data.ptr[IFLA_GRE_REMOTE], 4);
+    int has_key = data.ptr[IFLA_GRE_IKEY] || data.ptr[IFLA_GRE_OKEY];
+    u32 ikey = nl_attr_u32(&data, IFLA_GRE_IKEY, 0);
+    u32 okey = nl_attr_u32(&data, IFLA_GRE_OKEY, ikey);
+    /* The keys travel in network order; the tunnel compares them as the
+     * 32-bit values they are, so both ends only have to agree with each
+     * other. */
+    return gretap_create(name, local, remote, ikey, okey, has_key);
+  }
+  return -EOPNOTSUPP;
+}
+
+/* `ip link del <dev>`: only for a device the stack made. A driver's NIC exists
+ * for exactly as long as its hardware does. */
+static int nl_do_dellink(const u8 *body, usize blen) {
+  if (blen < 16)
+    return -EINVAL;
+  if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+    return -EPERM;
+  int index = (int)nl_load_u32(body + 4);
+  struct nl_attrs a;
+  nl_parse_attrs(body + 16, blen - 16, &a);
+  struct netdev *nd = netdev_by_index(index);
+  if (!nd && a.ptr[IFLA_IFNAME])
+    nd = netdev_by_index(netdev_index_by_name((const char *)a.ptr[IFLA_IFNAME]));
+  if (!nd)
+    return -ENODEV;
+  return vnet_destroy(nd);
+}
+
 static int nl_do_addr(u16 type, const u8 *body, usize blen) {
   if (blen < 8)
     return -EINVAL;
@@ -767,7 +961,10 @@ static int nl_do_addr(u16 type, const u8 *body, usize blen) {
  * listener already does; nothing else has to be configured.
  */
 
-#define MAX_UEVENT_SOCKS 8
+/* Listeners on the kernel uevent multicast group. One pointer apiece, and the
+ * ninth listener was silently not registered — a udev-style consumer would then
+ * simply never see a hotplug event. */
+#define MAX_UEVENT_SOCKS 32
 static struct vfs_socket_state *uevent_socks[MAX_UEVENT_SOCKS];
 
 void netlink_uevent_register(struct vfs_socket_state *s) {
@@ -804,13 +1001,13 @@ void netlink_uevent_broadcast(const void *payload, usize len) {
 
 static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
                             usize len) {
-  if (s->udp_q_count >= 8)
+  if (s->udp_q_count >= SOCK_DGRAM_Q_SLOTS)
     return;
   u8 slot = s->udp_q_tail;
   usize copy = len > NL_SLOT_MAX ? NL_SLOT_MAX : len;
   memcpy(s->udp_q_buf[slot], data, copy);
   s->udp_q_len[slot] = copy;
-  s->udp_q_tail = (u8)((s->udp_q_tail + 1) % 8);
+  s->udp_q_tail = (u8)((s->udp_q_tail + 1) % SOCK_DGRAM_Q_SLOTS);
   s->udp_q_count++;
   s->recv_len = s->udp_q_len[s->udp_q_head];
   scheduler_wake_all(s);
@@ -944,15 +1141,31 @@ isize netlink_socket_send(struct vfs_socket_state *s, const void *buf,
         nl_put_error(&b, seq, rpid, err, p);
       break;
     case RTM_NEWLINK:
-    case RTM_SETLINK:
-      /* IFF_UP is the one link property b1nix can really change; creating or
-       * renaming an interface is still not something this kernel does, and
-       * saying so beats accepting a change that would not happen. */
-      nl_put_error(&b, seq, rpid, nl_do_setlink(body, blen), p);
+    case RTM_SETLINK: {
+      /* One message type, three requests: create a virtual device
+       * (NLM_F_CREATE with a kind), move a device under a master, or change
+       * IFF_UP — which remains the only link property of a real NIC this
+       * kernel can act on. */
+      struct nl_attrs la;
+      if (blen >= 16)
+        nl_parse_attrs(body + 16, blen - 16, &la);
+      else
+        memset(&la, 0, sizeof(la));
+      if (blen < 16)
+        err = -EINVAL;
+      else if ((flags & NLM_F_CREATE) && la.ptr[IFLA_LINKINFO])
+        err = nl_do_newlink_create(body, blen, &la);
+      else if (la.ptr[IFLA_NET_NS_PID] || la.ptr[IFLA_NET_NS_FD])
+        err = nl_do_netns(body, &la);
+      else if (la.ptr[IFLA_MASTER])
+        err = nl_do_master(body, blen, &la);
+      else
+        err = nl_do_setlink(body, blen);
+      nl_put_error(&b, seq, rpid, err, p);
       break;
+    }
     case RTM_DELLINK:
-      /* Interfaces exist for exactly as long as their driver is registered. */
-      nl_put_error(&b, seq, rpid, -EOPNOTSUPP, p);
+      nl_put_error(&b, seq, rpid, nl_do_dellink(body, blen), p);
       break;
     default:
       nl_put_error(&b, seq, rpid, -EOPNOTSUPP, p);

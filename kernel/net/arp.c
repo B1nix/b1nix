@@ -1,3 +1,4 @@
+#include <b1nix/namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/console.h>
@@ -37,11 +38,19 @@ struct arp_entry {
 	 * learned reply never overwrites one, and it reports NUD_PERMANENT. */
 	int permanent;
 	int oif; /* interface the mapping was learned on, 0 = unknown */
+	/* The network namespace the mapping belongs to. Two namespaces may use the
+	 * same address for different machines, so an entry learned in one must
+	 * never answer a lookup made in another. */
+	u32 ns;
 };
 static struct arp_entry arp_table[ARP_TABLE_SIZE];
 static int arp_smoke_resolution_logged;
 static int arp_smoke_request_logged;
 static int arp_smoke_reply_logged;
+
+/* Which namespace is asking: the arriving interface's inside a receive path,
+ * the caller's otherwise — the same rule the FIB uses. */
+static u32 arp_ns(void) { return namespace_net_context(); }
 
 static void arp_smoke_mark_resolution(void)
 {
@@ -60,6 +69,20 @@ void arp_init(void)
 		arp_table[i].valid = 0;
 		arp_table[i].permanent = 0;
 		arp_table[i].oif = 0;
+		arp_table[i].ns = 0;
+	}
+}
+
+/* Everything a namespace that is going away had learned. */
+void arp_flush_ns(u32 ns)
+{
+	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+		if (arp_table[i].ns != ns)
+			continue;
+		arp_table[i].valid = 0;
+		arp_table[i].permanent = 0;
+		arp_table[i].oif = 0;
+		arp_table[i].ns = 0;
 	}
 }
 
@@ -75,8 +98,10 @@ static int arp_current_oif(void)
 
 static void arp_cache_put(struct ipv4_addr ip, struct mac_addr mac)
 {
+	u32 ns = arp_ns();
 	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (arp_table[i].valid && memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
+		if (arp_table[i].valid && arp_table[i].ns == ns &&
+		    memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
 			/* An administratively pinned entry outranks the wire. */
 			if (arp_table[i].permanent)
 				return;
@@ -92,6 +117,7 @@ static void arp_cache_put(struct ipv4_addr ip, struct mac_addr mac)
 			arp_table[i].valid = 1;
 			arp_table[i].permanent = 0;
 			arp_table[i].oif = arp_current_oif();
+			arp_table[i].ns = ns;
 			return;
 		}
 	}
@@ -102,8 +128,9 @@ static void arp_cache_put(struct ipv4_addr ip, struct mac_addr mac)
 usize arp_snapshot(struct neigh_info *out, usize max)
 {
 	usize n = 0;
+	u32 ns = arp_ns();
 	for (int i = 0; i < ARP_TABLE_SIZE && n < max; i++) {
-		if (!arp_table[i].valid)
+		if (!arp_table[i].valid || arp_table[i].ns != ns)
 			continue;
 		out[n].family = B1NIX_AF_INET;
 		memset(out[n].addr, 0, sizeof(out[n].addr));
@@ -120,8 +147,9 @@ usize arp_snapshot(struct neigh_info *out, usize max)
 int arp_neigh_set(struct ipv4_addr ip, struct mac_addr mac, int permanent)
 {
 	int oif = arp_current_oif();
+	u32 ns = arp_ns();
 	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (arp_table[i].valid &&
+		if (arp_table[i].valid && arp_table[i].ns == ns &&
 		    memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
 			arp_table[i].mac = mac;
 			arp_table[i].permanent = permanent ? 1 : 0;
@@ -136,6 +164,7 @@ int arp_neigh_set(struct ipv4_addr ip, struct mac_addr mac, int permanent)
 			arp_table[i].valid = 1;
 			arp_table[i].permanent = permanent ? 1 : 0;
 			arp_table[i].oif = oif;
+			arp_table[i].ns = ns;
 			return 0;
 		}
 	}
@@ -144,12 +173,14 @@ int arp_neigh_set(struct ipv4_addr ip, struct mac_addr mac, int permanent)
 
 int arp_neigh_del(struct ipv4_addr ip)
 {
+	u32 ns = arp_ns();
 	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (arp_table[i].valid &&
+		if (arp_table[i].valid && arp_table[i].ns == ns &&
 		    memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
 			arp_table[i].valid = 0;
 			arp_table[i].permanent = 0;
 			arp_table[i].oif = 0;
+			arp_table[i].ns = 0;
 			return 0;
 		}
 	}
@@ -159,8 +190,10 @@ int arp_neigh_del(struct ipv4_addr ip)
 int arp_resolve_dev(struct ipv4_addr ip, struct mac_addr *mac, struct netdev *dev)
 {
 	int found = 0;
+	u32 ns = arp_ns();
 	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (arp_table[i].valid && memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
+		if (arp_table[i].valid && arp_table[i].ns == ns &&
+		    memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
 			*mac = arp_table[i].mac;
 			found = 1;
 			break;

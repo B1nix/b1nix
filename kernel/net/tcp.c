@@ -105,6 +105,22 @@ struct tcp_header {
   (TCP_RECV_BUF_SIZE > 65535 ? 65535 : TCP_RECV_BUF_SIZE)
 #define TCP_SEND_BUF_SIZE 4096
 #define TCP_MSS 1460
+/* Initial congestion window. RFC 6928 raised it to 10 segments and Linux has
+ * shipped that as TCP_INIT_CWND for a decade: one segment per RTT of ramp made
+ * every short transfer — a page fetch, an HTTP request — pay several round
+ * trips before the link was used at all. */
+#define TCP_INIT_CWND (10u * TCP_MSS)
+/* Ceiling on the congestion window. The old 65535 was a 64 KiB cap on the data
+ * in flight, which pinned throughput to 64 KiB per round trip however large the
+ * receiver's window was — it silently undid the 1 MiB receive buffer. Linux has
+ * no byte cap of this kind: the window is bounded by the peer's advertised
+ * window (already applied at the send site) and by the send buffer. This is
+ * that send-buffer bound, matched to the receive buffer we ourselves offer. */
+#define TCP_CWND_MAX TCP_RECV_BUF_MAX
+/* Smallest receive buffer SO_RCVBUF may set. Linux's SOCK_MIN_RCVBUF is a
+ * little over 2 KiB for the same reason: a window below one full segment plus
+ * its bookkeeping cannot make forward progress. */
+#define TCP_RCVBUF_MIN (2u * TCP_MSS)
 #define TCP_TIME_WAIT_TICKS 200
 
 /* ── M84: TCP options ──────────────────────────────────────────────────────
@@ -137,16 +153,32 @@ struct tcp_header {
  * expressed in the 16-bit window field. At 16 KiB that is 0 — we still send
  * the option, because a window-scale option in our SYN is what permits the
  * *peer* to scale its own (potentially much larger) window. */
+/* The ladder stopped at 3, which expresses 65535 << 3 = 512 KiB — half of
+ * TCP_RECV_BUF_MAX. The top half of a grown buffer could therefore never be
+ * advertised, so the peer throttled to a window the receiver had already left
+ * behind. It now runs to 7 (8 MiB), the same range Linux covers, and stays
+ * within RFC 7323's maximum of 14. */
 #define TCP_RCV_WSCALE                                                         \
   (TCP_RECV_BUF_SIZE <= 65535 ? 0                                              \
    : TCP_RECV_BUF_SIZE <= 131071 ? 1                                           \
    : TCP_RECV_BUF_SIZE <= 262143 ? 2                                           \
-                                 : 3)
+   : TCP_RECV_BUF_SIZE <= 524287 ? 3                                           \
+   : TCP_RECV_BUF_SIZE <= 1048575 ? 4                                          \
+   : TCP_RECV_BUF_SIZE <= 2097151 ? 5                                          \
+   : TCP_RECV_BUF_SIZE <= 4194303 ? 6                                          \
+                                  : 7)
 
 /* Out-of-order reassembly budget. A segment arriving past a hole is buffered
  * here instead of being dropped (which forced the peer into a retransmit
  * timeout for every reordered or single-lost packet). */
-#define TCP_OOO_MAX_SEGS 16
+/* 16 segments is ~23 KiB of MSS-sized data — a reassembly budget an order of
+ * magnitude below the 1 MiB receive buffer it is meant to protect, so the 17th
+ * reordered segment on a fast link was dropped and cost the peer a retransmit
+ * timeout. The queue is a kmalloc'd linked list, and the byte budget below is
+ * the real bound; the segment count only has to be large enough not to be the
+ * thing that binds first. Linux bounds its own out-of-order queue by the
+ * receive buffer for the same reason. */
+#define TCP_OOO_MAX_SEGS 256
 #define TCP_OOO_MAX_BYTES TCP_RECV_BUF_SIZE
 
 struct tcp_opts {
@@ -190,9 +222,25 @@ struct tcp_retransmit_pkt {
   struct tcp_retransmit_pkt *next;
 };
 
+/* Keepalive, as Linux spells it: after `keepidle` seconds with nothing on the
+ * connection, probe every `keepintvl` seconds, and give up after `keepcnt`
+ * unanswered probes. The defaults are Linux's (2 hours / 75 s / 9). A probe is
+ * an ACK carrying one byte less than the next sequence number, which the peer
+ * is obliged to answer and which carries no data. */
+#define TCP_KEEPIDLE_DEFAULT  7200
+#define TCP_KEEPINTVL_DEFAULT 75
+#define TCP_KEEPCNT_DEFAULT   9
+#define TCP_TICKS_PER_SEC     100
+
 struct tcp_conn {
   int used;
   int state;
+  u8 keepalive;         /* SO_KEEPALIVE */
+  u8 keepalive_probes;  /* unanswered probes since the last activity */
+  u32 keepidle;
+  u32 keepintvl;
+  u32 keepcnt;
+  u64 last_activity;    /* uptime ticks of the last segment either way */
   u8 family; /* B1NIX_AF_INET or B1NIX_AF_INET6 */
   struct ipv4_addr remote_ip;
   struct in6_addr_k remote_ip6;
@@ -235,6 +283,11 @@ struct tcp_conn {
   int dup_acks;
   u8 *recv_buf; /* recv_cap bytes, grown on demand — see tcp_recv_grow() */
   u32 recv_cap; /* current size of recv_buf */
+  /* Ceiling on recv_cap. TCP_RECV_BUF_MAX by default, which is what lets the
+   * buffer auto-tune; SO_RCVBUF lowers it, and as on Linux setting it is what
+   * turns auto-tuning off for that socket. Zero means "not set yet" and is
+   * read as the default. */
+  u32 recv_cap_max;
   u32 recv_len;
   u32 recv_read;
   u8 wnd_closed; /* last advertised receive window was < 1 MSS (peer throttled) */
@@ -407,9 +460,21 @@ static void tcp_build_syn_options(u8 *opt) {
   opt[11] = TCP_OPT_EOL_PAD;
 }
 
+/* The ceiling this connection's receive buffer may grow to: whatever SO_RCVBUF
+ * asked for, or the auto-tuning maximum when nothing asked. */
+static u32 tcp_recv_cap_max(const struct tcp_conn *conn) {
+  return conn->recv_cap_max ? conn->recv_cap_max : TCP_RECV_BUF_MAX;
+}
+
 /* The window we advertise, already shifted by our own scale factor. */
 static u16 tcp_adv_window(const struct tcp_conn *conn) {
-  u32 free_wnd = conn->recv_cap - conn->recv_len;
+  u32 cap = conn->recv_cap;
+  u32 limit = tcp_recv_cap_max(conn);
+  /* SO_RCVBUF set below the buffer we already hold still bounds what we invite
+   * the peer to send; the buffer itself is not shrunk under live data. */
+  if (cap > limit)
+    cap = limit;
+  u32 free_wnd = cap > conn->recv_len ? cap - conn->recv_len : 0;
   u32 scaled = free_wnd >> conn->rcv_wscale;
   if (scaled > 65535)
     scaled = 65535;
@@ -462,11 +527,12 @@ static void tcp_recv_grow(struct tcp_conn *conn) {
   u32 want;
   u8 *bigger;
 
-  if (!conn->recv_buf || conn->recv_cap >= TCP_RECV_BUF_MAX)
+  u32 cap_max = tcp_recv_cap_max(conn);
+  if (!conn->recv_buf || conn->recv_cap >= cap_max)
     return;
   want = conn->recv_cap * 2;
-  if (want > TCP_RECV_BUF_MAX)
-    want = TCP_RECV_BUF_MAX;
+  if (want > cap_max)
+    want = cap_max;
   bigger = kmalloc(want);
   if (!bigger)
     return;
@@ -935,6 +1001,10 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
 
   memset(conn, 0, sizeof(*conn));
   conn->used = 1;
+  conn->keepidle = TCP_KEEPIDLE_DEFAULT;
+  conn->keepintvl = TCP_KEEPINTVL_DEFAULT;
+  conn->keepcnt = TCP_KEEPCNT_DEFAULT;
+  conn->last_activity = scheduler_get_uptime_ticks();
   conn->recv_buf = rcvbuf;
   conn->recv_cap = TCP_RECV_BUF_INIT;
   conn->state = TCP_CLOSED;
@@ -950,8 +1020,12 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   conn->snd_nxt = conn->iss;
   /* M32: initial flow/congestion-control state. */
   conn->snd_wnd = TCP_RECV_BUF_INIT;  /* assume peer advertises >=1 segment */
-  conn->cwnd = TCP_MSS;                /* slow start: 1 MSS */
-  conn->ssthresh = 65535;
+  conn->cwnd = TCP_INIT_CWND;          /* slow start: RFC 6928 IW10 */
+  /* Slow start runs until a loss says otherwise. Starting the threshold at
+   * 65535 ended it at 64 KiB in flight even on a clean link; Linux starts at
+   * TCP_INFINITE_SSTHRESH for exactly that reason, and our equivalent of
+   * "infinite" is the largest window we would ever allow. */
+  conn->ssthresh = TCP_CWND_MAX;
   conn->dup_acks = 0;
   /* M84: option state. Until the SYN-ACK is parsed we assume no scaling and
    * the RFC 1122 default MSS. */
@@ -1034,7 +1108,19 @@ static struct tcp_conn *tcp_connect_wait(struct tcp_conn *conn) {
   u64 irq = irq_save();
   tcp_lock();
   if (conn->state != TCP_ESTABLISHED) {
-    console_write("tcp: connect failed\n");
+    /* A refused or unanswered connection is an ordinary result handed back to
+     * the caller, not an event the kernel should narrate. Printing it per
+     * attempt flooded the console: a browser start-up makes hundreds, every
+     * line takes the console lock and goes out the serial port, and a second
+     * CPU waiting on that lock long enough declares a spinlock lockup and
+     * panics. Rate-limited to the first few, which is all a bring-up needs. */
+    {
+      static unsigned reported;
+      if (reported < 8) {
+        reported++;
+        console_write("tcp: connect failed\n");
+      }
+    }
     conn->used = 0;
     tcp_unlock();
     irq_restore(irq);
@@ -1042,7 +1128,7 @@ static struct tcp_conn *tcp_connect_wait(struct tcp_conn *conn) {
   }
   tcp_unlock();
   irq_restore(irq);
-  console_write("tcp: connected\n");
+  /* Success is not news either; it was one line per connection. */
   return conn;
 }
 
@@ -1076,6 +1162,89 @@ int tcp_is_established(struct tcp_conn *conn) {
   tcp_unlock();
   irq_restore(irq);
   return res;
+}
+
+/* SO_RCVBUF: cap this connection's receive buffer, and with it the window it
+ * advertises. Linux's setsockopt(SO_RCVBUF) does the same two things — it sets
+ * the ceiling and it stops the auto-tuner from moving it — and it also refuses
+ * to go below a floor, because a window under one segment cannot make progress.
+ * `bytes` is the value the caller asked for, already clamped by the socket
+ * layer to the system maximum. */
+
+/* SO_KEEPALIVE and the three TCP_KEEP* knobs.
+ *
+ * Values arrive in seconds, which is what setsockopt(2) takes; the timer works
+ * in ticks. Zero is refused rather than stored: Linux rejects it, and a zero
+ * interval would turn the probe into a busy loop. */
+void tcp_set_keepalive(struct tcp_conn *conn, int on) {
+  if (!conn)
+    return;
+  u64 irq = irq_save();
+  tcp_lock();
+  if (conn->used) {
+    conn->keepalive = on ? 1 : 0;
+    conn->keepalive_probes = 0;
+    conn->last_activity = scheduler_get_uptime_ticks();
+  }
+  tcp_unlock();
+  irq_restore(irq);
+}
+
+int tcp_set_keepalive_param(struct tcp_conn *conn, int which, u32 seconds) {
+  if (!conn)
+    return -1;
+  if (seconds == 0)
+    return -1;
+  u64 irq = irq_save();
+  tcp_lock();
+  if (conn->used) {
+    if (which == 0)
+      conn->keepidle = seconds;
+    else if (which == 1)
+      conn->keepintvl = seconds;
+    else
+      conn->keepcnt = seconds;
+  }
+  tcp_unlock();
+  irq_restore(irq);
+  return 0;
+}
+
+u32 tcp_get_keepalive_param(struct tcp_conn *conn, int which) {
+  if (!conn)
+    return 0;
+  if (which == 0)
+    return conn->keepidle;
+  if (which == 1)
+    return conn->keepintvl;
+  return conn->keepcnt;
+}
+
+/* Send one keepalive probe: an ACK whose sequence number is one behind the
+ * next byte we would send. The peer sees a segment it has already
+ * acknowledged, so it answers with an ACK and discards nothing — which is
+ * exactly the point, an answer without touching the data stream. Caller holds
+ * the TCP lock; the emit happens after it is dropped. */
+static usize tcp_build_keepalive(struct tcp_conn *conn, u8 *pkt) {
+  usize len = tcp_build_ack(conn, pkt, 0, 0);
+  struct tcp_header *h = (struct tcp_header *)pkt;
+  h->seq_num = bswap32(conn->snd_nxt - 1);
+  return len;
+}
+
+void tcp_set_rcvbuf(struct tcp_conn *conn, u32 bytes) {
+  if (!conn)
+    return;
+  if (bytes < TCP_RCVBUF_MIN)
+    bytes = TCP_RCVBUF_MIN;
+  if (bytes > TCP_RECV_BUF_MAX)
+    bytes = TCP_RECV_BUF_MAX;
+  u64 irq = irq_save();
+  tcp_lock();
+  if (conn->used)
+    conn->recv_cap_max = bytes;
+  tcp_unlock();
+  irq_restore(irq);
 }
 
 /* Bytes a reader could take right now — what FIONREAD reports. */
@@ -1242,6 +1411,11 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
     return -1;
   if (len == 0)
     return 0;
+
+  /* Sending is activity too: a connection carrying a steady stream one way
+   * is not idle, and probing it would be noise. Only the probe path itself
+   * leaves last_activity alone, so an unanswered probe still ages. */
+  conn->last_activity = scheduler_get_uptime_ticks();
 
   /* Pre-allocate packet and retransmit packet buffers BEFORE taking the lock
    * to avoid heap_lock deadlock. */
@@ -1595,6 +1769,14 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
   struct tcp_conn *conn =
       tcp_find_conn_af(family, v4src, &v6src, src_port, dst_port);
 
+  /* Anything arriving on the connection — data, an ACK, or the answer to a
+   * keepalive probe — means the peer is still there, which is the whole
+   * question keepalive asks. */
+  if (conn) {
+    conn->last_activity = scheduler_get_uptime_ticks();
+    conn->keepalive_probes = 0;
+  }
+
   /* M32: refresh the peer's advertised window (snd_wnd) on every
    * segment seen on this connection. Sliding-window flow control
    * uses this to throttle sends; without the update we'd keep
@@ -1701,7 +1883,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         if (inc < 1) inc = 1;
         conn->cwnd += inc;
       }
-      if (conn->cwnd > 65535) conn->cwnd = 65535;
+      if (conn->cwnd > TCP_CWND_MAX) conn->cwnd = TCP_CWND_MAX;
     }
   }
 
@@ -1721,6 +1903,10 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         if (new_conn) {
           memset(new_conn, 0, sizeof(*new_conn));
           new_conn->used = 1;
+          new_conn->keepidle = TCP_KEEPIDLE_DEFAULT;
+          new_conn->keepintvl = TCP_KEEPINTVL_DEFAULT;
+          new_conn->keepcnt = TCP_KEEPCNT_DEFAULT;
+          new_conn->last_activity = scheduler_get_uptime_ticks();
           new_conn->state = TCP_SYN_RECEIVED;
           new_conn->family = family;
           new_conn->remote_ip = v4src;
@@ -1736,8 +1922,8 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           new_conn->irs = seq;
           /* M32: initialise flow/congestion state on the accepted side too. */
           new_conn->snd_wnd = bswap16(tcp->window);
-          new_conn->cwnd = TCP_MSS;
-          new_conn->ssthresh = 65535;
+          new_conn->cwnd = TCP_INIT_CWND;
+          new_conn->ssthresh = TCP_CWND_MAX;
           new_conn->dup_acks = 0;
 
           /* M84: negotiate options from the client's SYN. Window scaling is
@@ -1888,6 +2074,37 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         conn->snd_una = ack;
         conn->snd_nxt = ack;
         conn->state = TCP_ESTABLISHED;
+
+        /* The SYN-ACK acknowledges our SYN, so drop it from the retransmit
+         * queue.
+         *
+         * Nothing did that before: the queue is only drained by the ACK
+         * handling in the ESTABLISHED state, which needs a later ACK to
+         * arrive. A connection that goes quiet the moment it is established —
+         * a browser holding a socket open between requests, a client waiting
+         * for the server to speak first — never produced one, so its own SYN
+         * sat in the queue, was retransmitted five times half a second apart,
+         * and at the fifth the timer declared the peer dead and closed a
+         * connection that was fine. Every idle connection died about two and a
+         * half seconds after connect(2). */
+        {
+          struct tcp_retransmit_pkt *acked = 0;
+          while (conn->retransmit_queue &&
+                 (isize)(conn->snd_una - conn->retransmit_queue->seq) > 0) {
+            struct tcp_retransmit_pkt *rp = conn->retransmit_queue;
+            conn->retransmit_queue = rp->next;
+            rp->next = acked;
+            acked = rp;
+          }
+          if (acked) {
+            tcp_unlock();
+            irq_restore(irq);
+            tcp_free_retransmit_list(acked);
+            irq = irq_save();
+            tcp_lock();
+          }
+        }
+
         extern void *vfs_poll_chan;
         scheduler_wake_all(vfs_poll_chan);
       }
@@ -1942,6 +2159,27 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         tcp_lock();
 
         conn->state = TCP_ESTABLISHED;
+
+        /* Same as the passive side above: the SYN-ACK acknowledges our SYN,
+         * so it leaves the retransmit queue here rather than waiting for an
+         * ACK that an idle connection never sends. */
+        {
+          struct tcp_retransmit_pkt *acked = 0;
+          while (conn->retransmit_queue &&
+                 (isize)(conn->snd_una - conn->retransmit_queue->seq) > 0) {
+            struct tcp_retransmit_pkt *rp = conn->retransmit_queue;
+            conn->retransmit_queue = rp->next;
+            rp->next = acked;
+            acked = rp;
+          }
+          if (acked) {
+            tcp_unlock();
+            irq_restore(irq);
+            tcp_free_retransmit_list(acked);
+            irq = irq_save();
+            tcp_lock();
+          }
+        }
         extern void *vfs_poll_chan;
         scheduler_wake_all(vfs_poll_chan);
       }
@@ -2060,6 +2298,14 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           }
         }
         /* Dup-ACK for rcv_nxt: tells the peer exactly which byte is missing. */
+        send_ack = 1;
+      } else if (seg_len == 0 && (i32)(seg_seq - conn->rcv_nxt) < 0) {
+        /* An empty segment from behind the window: that is what a keepalive
+         * probe is (RFC 1122 4.2.3.6 — sequence number one below the next
+         * byte, deliberately unacceptable so the peer has to say something).
+         * Answering it is the whole mechanism; staying quiet makes every
+         * probe look unanswered and the sender eventually tears down a
+         * connection that was fine. */
         send_ack = 1;
       }
 
@@ -2238,6 +2484,47 @@ void tcp_timer_tick(void) {
       tcp_unlock();
       irq_restore(irq);
       continue;
+    }
+
+    /* Keepalive. Only an established connection with nothing queued is
+     * probed: while data is in flight the retransmit timer is already asking
+     * the same question, and a probe on top of it would just add a segment. */
+    if (conn->keepalive && conn->state == TCP_ESTABLISHED &&
+        !conn->retransmit_queue) {
+      u64 idle = now - conn->last_activity;
+      u64 first = (u64)conn->keepidle * TCP_TICKS_PER_SEC;
+      u64 again = (u64)conn->keepintvl * TCP_TICKS_PER_SEC;
+      u64 due = conn->keepalive_probes ? first + (u64)conn->keepalive_probes * again
+                                       : first;
+
+      if (idle >= due) {
+        if (conn->keepalive_probes >= conn->keepcnt) {
+          /* The peer has stopped answering: the connection is dead, and a
+           * reader parked on it must be told rather than left waiting. */
+          conn->state = TCP_CLOSED;
+          conn->keepalive_probes = 0;
+          console_write("tcp: keepalive found a dead peer, connection closed\n");
+          tcp_unlock();
+          irq_restore(irq);
+          tcp_clear_retransmit_queue(conn);
+          tcp_clear_ooo_queue(conn);
+          tcp_free_recv_buf(conn);
+          irq = irq_save();
+          tcp_lock();
+          conn->used = 0;
+          tcp_unlock();
+          irq_restore(irq);
+          continue;
+        }
+        u8 probe[TCP_ACK_MAX_LEN];
+        usize probe_len = tcp_build_keepalive(conn, probe);
+        conn->keepalive_probes++;
+        tcp_unlock();
+        irq_restore(irq);
+        tcp_conn_emit(conn, probe, probe_len);
+        irq = irq_save();
+        tcp_lock();
+      }
     }
 
     struct tcp_retransmit_pkt *rp = conn->retransmit_queue;

@@ -1,8 +1,10 @@
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
+#include <b1nix/namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/netproto.h>
 #include <b1nix/netdev.h>
+#include <b1nix/packet.h>
 #include <b1nix/pci.h>
 #include <b1nix/ipi.h>
 #include <b1nix/mm.h>
@@ -19,12 +21,36 @@
  */
 
 /* ── Active NIC registry ────────────────────────────────────────────────── */
-#define NET_MAX_NETDEVS 8
+/* Sixteen, not eight: a veth pair costs two slots and a namespace usually gets
+ * one pair on top of whatever the initial namespace already holds. */
+#define NET_MAX_NETDEVS 16
+
+static struct netdev *netdev_best(void);
+static void net_reset_interface_state(struct netdev *nd);
 
 static struct netdev *g_netdev;
 static struct netdev *g_receiving_netdev;
 static struct netdev *g_netdevs[NET_MAX_NETDEVS];
 static usize g_netdev_count;
+
+/* Next free eth<N> for a driver that did not name its device. Virtual devices
+ * arrive with a name of their own and never take one of these. */
+static void netdev_assign_ethname(struct netdev *nd)
+{
+	for (int n = 0; n < 10; n++) {
+		char candidate[8] = { 'e', 't', 'h', (char)('0' + n), '\0', 0, 0, 0 };
+		int taken = 0;
+		for (usize i = 0; i < g_netdev_count; i++) {
+			if (g_netdevs[i] && strcmp(g_netdevs[i]->ifname, candidate) == 0)
+				taken = 1;
+		}
+		if (!taken) {
+			memcpy(nd->ifname, candidate, sizeof(candidate));
+			return;
+		}
+	}
+	nd->ifname[0] = '\0';
+}
 
 void netdev_register(struct netdev *nd)
 {
@@ -34,13 +60,131 @@ void netdev_register(struct netdev *nd)
 		if (g_netdevs[i] == nd)
 			return;
 	}
+	if (nd->ifname[0] == '\0')
+		netdev_assign_ethname(nd);
+	/* An interface is born in the namespace of whoever created it. A driver
+	 * probing at boot is in the initial namespace, so this is 0 for every NIC;
+	 * a device created by `ip link add` inside a namespace belongs to it. */
+	nd->netns = namespace_net_current();
 	if (g_netdev_count < NET_MAX_NETDEVS)
 		g_netdevs[g_netdev_count++] = nd;
-	if (!g_netdev)
+	if (!g_netdev && !netdev_is_virtual(nd) && nd->netns == 0)
 		g_netdev = nd;
 }
 
-struct netdev *netdev_active(void) { return g_netdev; }
+/* The namespace an interface lookup should be answered in. Inside a receive
+ * path that is the arriving interface's namespace; otherwise it is the calling
+ * task's. Both are 0 until something unshares, and namespace_net_context()
+ * short-circuits on that. */
+static u32 net_ns_ctx(void) { return namespace_net_context(); }
+
+struct netdev *netdev_slot(int idx)
+{
+	if (idx <= 0 || (usize)idx > g_netdev_count)
+		return 0;
+	return g_netdevs[idx - 1];
+}
+
+usize netdev_slot_count(void) { return g_netdev_count; }
+
+int netdev_set_netns(struct netdev *nd, u32 ns)
+{
+	if (!nd)
+		return -ENODEV;
+	if (!namespace_net_live(ns))
+		return -EINVAL;
+	if (nd->netns == ns)
+		return 0;
+	/* Moving the interface the initial namespace routes through would strand
+	 * every socket already using it. Linux allows it; b1nix has exactly one
+	 * L3 configuration, so it would be a one-way trip to no networking. */
+	if (nd == g_netdev)
+		return -EBUSY;
+	/* Stacking does not survive the move: a bridge port, a VLAN's lower
+	 * device or a bond slave that lands in another namespace would forward
+	 * frames across the boundary, which is the one thing the boundary is for.
+	 * The veth pair is the sanctioned way through. */
+	if (nd->master || nd->lower)
+		return -EBUSY;
+	for (usize i = 0; i < g_netdev_count; i++) {
+		if (!g_netdevs[i])
+			continue;
+		if (g_netdevs[i]->master == nd || g_netdevs[i]->lower == nd)
+			return -EBUSY;
+	}
+	nd->netns = ns;
+	return 0;
+}
+
+/* Tear a network namespace down: everything created in it goes with it, and a
+ * physical NIC that was moved into it returns to the initial namespace rather
+ * than becoming unreachable (this is what Linux does too). */
+void net_ns_destroy(u32 ns)
+{
+	if (ns == 0)
+		return;
+	for (usize i = 0; i < g_netdev_count; i++) {
+		struct netdev *nd = g_netdevs[i];
+		if (!nd || nd->netns != ns)
+			continue;
+		if (netdev_is_virtual(nd) && nd->destroy) {
+			nd->destroy(nd);
+			continue;
+		}
+		nd->netns = 0;
+	}
+	route_flush_ns(ns);
+	arp_flush_ns(ns);
+}
+
+int netdev_is_virtual(const struct netdev *nd)
+{
+	return nd && nd->kind != NETDEV_KIND_PHYS;
+}
+
+void netdev_unregister(struct netdev *nd)
+{
+	if (!nd)
+		return;
+	for (usize i = 0; i < g_netdev_count; i++) {
+		if (g_netdevs[i] != nd)
+			continue;
+		/* The slot is emptied, not compacted: the index is this interface's
+		 * identity for as long as anything remembers it. */
+		g_netdevs[i] = 0;
+		break;
+	}
+	/* Anything stacked on the departing device loses its footing. */
+	for (usize i = 0; i < g_netdev_count; i++) {
+		if (!g_netdevs[i])
+			continue;
+		if (g_netdevs[i]->master == nd)
+			g_netdevs[i]->master = 0;
+		if (g_netdevs[i]->lower == nd)
+			g_netdevs[i]->lower = 0;
+	}
+	if (g_netdev == nd) {
+		dhcp_stop();
+		struct netdev *next = netdev_best();
+		g_netdev = next;
+		net_reset_interface_state(next);
+	}
+	if (g_receiving_netdev == nd)
+		g_receiving_netdev = 0;
+}
+
+/* The device the caller's namespace routes through. Only the initial namespace
+ * has one: the L3 configuration (address, gateway, netmask) is single, so a
+ * namespaced caller gets NULL and its frames go no further than the packet
+ * sockets and the veth peer. That is also what keeps a frame received on a
+ * namespaced interface out of the global ARP/IPv4 demux, which drops anything
+ * that did not arrive on netdev_active(). */
+struct netdev *netdev_active(void)
+{
+	if (net_ns_ctx() != 0)
+		return 0;
+	return g_netdev;
+}
 struct netdev *netdev_receiving(void) { return g_receiving_netdev; }
 
 /* M84: interface indices. Registration order defines a stable 1-based index
@@ -62,13 +206,30 @@ struct netdev *netdev_by_index(int idx)
 {
 	if (idx <= 0 || (usize)idx > g_netdev_count)
 		return 0;
-	return g_netdevs[idx - 1];
+	struct netdev *nd = g_netdevs[idx - 1]; /* NULL for a retired index */
+	/* An index belonging to another namespace resolves to nothing, so every
+	 * caller that turns an ifindex into a device — the ioctls, the netlink
+	 * dumps, the FIB's oif — is namespace-scoped by construction. */
+	if (nd && nd->netns != net_ns_ctx())
+		return 0;
+	return nd;
 }
 
 void netdev_ifname(int idx, char *out, usize cap)
 {
 	if (!out || cap < 6)
 		return;
+	struct netdev *nd = netdev_by_index(idx);
+	if (nd && nd->ifname[0]) {
+		usize n = strlen(nd->ifname);
+		if (n > cap - 1)
+			n = cap - 1;
+		memcpy(out, nd->ifname, n);
+		out[n] = '\0';
+		return;
+	}
+	/* No such device: fall back to the positional name so callers that ask
+	 * about an index they have not checked still get something printable. */
 	int n = idx > 0 ? idx - 1 : 0;
 	if (n > 9)
 		n = 9;
@@ -81,12 +242,15 @@ void netdev_ifname(int idx, char *out, usize cap)
 
 int netdev_index_by_name(const char *name)
 {
-	if (!name || name[0] != 'e' || name[1] != 't' || name[2] != 'h')
+	if (!name || !name[0])
 		return 0;
-	if (name[3] < '0' || name[3] > '9' || name[4] != '\0')
-		return 0;
-	int idx = (name[3] - '0') + 1;
-	return netdev_by_index(idx) ? idx : 0;
+	u32 ns = net_ns_ctx();
+	for (usize i = 0; i < g_netdev_count; i++) {
+		if (g_netdevs[i] && g_netdevs[i]->netns == ns &&
+		    strcmp(g_netdevs[i]->ifname, name) == 0)
+			return (int)i + 1;
+	}
+	return 0;
 }
 
 static int netdev_link_state(struct netdev *nd)
@@ -99,13 +263,23 @@ static int netdev_link_state(struct netdev *nd)
 static struct netdev *netdev_best(void)
 {
 	/* An administratively down interface is not a candidate, whatever its
-	 * carrier says — that is the whole point of taking it down. */
+	 * carrier says — that is the whole point of taking it down. Only the
+	 * initial namespace's devices are candidates: g_netdev carries the one L3
+	 * configuration this kernel has. */
 	for (usize i = 0; i < g_netdev_count; i++) {
+		if (!g_netdevs[i] || netdev_is_virtual(g_netdevs[i]))
+			continue;
+		if (g_netdevs[i]->netns != 0)
+			continue;
 		if (!g_netdevs[i]->admin_down &&
 		    netdev_link_state(g_netdevs[i]) == 1)
 			return g_netdevs[i];
 	}
 	for (usize i = 0; i < g_netdev_count; i++) {
+		if (!g_netdevs[i] || netdev_is_virtual(g_netdevs[i]))
+			continue;
+		if (g_netdevs[i]->netns != 0)
+			continue;
 		if (!g_netdevs[i]->admin_down)
 			return g_netdevs[i];
 	}
@@ -272,6 +446,8 @@ int net_dhcp_try_failover(void)
 		for (usize step = 1; step < g_netdev_count; step++) {
 			struct netdev *candidate =
 				g_netdevs[(active_index + step) % g_netdev_count];
+			if (!candidate || netdev_is_virtual(candidate))
+				continue;
 			int link = netdev_link_state(candidate);
 			if ((pass == 0 && link != 1) || (pass == 1 && link >= 0))
 				continue;
@@ -601,7 +777,8 @@ void net_send_ethernet_tx(struct netdev *nd, struct mac_addr dst,
 	hdr[12] = (ethertype >> 8) & 0xFF;
 	hdr[13] = ethertype & 0xFF;
 
-	nd->transmit(nd, hdr, payload, size, tx_flags);
+	if (nd->transmit(nd, hdr, payload, size, tx_flags) == 0)
+		packet_socket_tx(nd, hdr, payload, size);
 }
 
 void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, usize size)
@@ -609,8 +786,53 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 	net_send_ethernet_tx(netdev_active(), dst, ethertype, payload, size, 0);
 }
 
+int netdev_transmit_frame(struct netdev *nd, const u8 hdr[14],
+                          const void *payload, usize payload_len, u32 tx_flags)
+{
+	if (!nd || !nd->transmit)
+		return -ENODEV;
+	if (nd->admin_down)
+		return -ENETDOWN;
+	int rc = nd->transmit(nd, hdr, payload, payload_len, tx_flags);
+	if (rc == 0)
+		packet_socket_tx(nd, hdr, payload, payload_len);
+	return rc;
+}
+
+/* Bound on how deeply one received frame may be re-delivered: a VLAN on a
+ * bridge port on a bond is three, and anything past that is a stacking loop
+ * rather than a configuration. */
+#define NET_RX_MAX_DEPTH 4
+static volatile int net_rx_depth;
+
+void net_deliver_frame(struct netdev *dev, const void *frame, usize len,
+                       u32 rx_flags)
+{
+	if (!dev || !frame || len < 14)
+		return;
+	if (__atomic_fetch_add(&net_rx_depth, 1, __ATOMIC_ACQUIRE) >=
+	    NET_RX_MAX_DEPTH) {
+		__atomic_fetch_sub(&net_rx_depth, 1, __ATOMIC_RELEASE);
+		return;
+	}
+	struct netdev *prev = g_receiving_netdev;
+	g_receiving_netdev = dev;
+	u32 prev_ns = namespace_net_push_context(dev->netns);
+	ethernet_receive_flags(frame, len, rx_flags);
+	namespace_net_pop_context(prev_ns);
+	g_receiving_netdev = prev;
+	__atomic_fetch_sub(&net_rx_depth, 1, __ATOMIC_RELEASE);
+}
+
 /* ── Loopback deferral queue (see net.h) ── */
-#define NET_LOOPBACK_Q 256
+/* Depth of the ring, in packets. Linux's equivalent — the per-CPU backlog a
+ * loopback packet is queued on — is net.core.netdev_max_backlog, 1000 by
+ * default; this is the same number. Each slot is a pointer, a length and a
+ * flag, so the ring costs 24 bytes apiece and the packet payloads are the
+ * kmalloc'd copies below. A full ring drops, and the drop is invisible to the
+ * sender: only a retransmit recovers it, which is why the depth should be the
+ * one Linux found sufficient rather than a quarter of it. */
+#define NET_LOOPBACK_Q 1000
 struct net_loopback_pkt { u8 *data; usize len; int is_v6; };
 static struct net_loopback_pkt net_loopback_q[NET_LOOPBACK_Q];
 static volatile u32 net_lb_head; /* consumer */
@@ -685,10 +907,8 @@ void net_poll(void)
 	 * before/without a NIC (the guard below would otherwise skip it). */
 	net_loopback_drain();
 
-	struct netdev *nd = netdev_active();
-	if (!nd) {
+	if (!g_netdev)
 		return;
-	}
 
 	tcp_timer_tick();
 
@@ -697,7 +917,9 @@ void net_poll(void)
 		if (!polled || !polled->poll)
 			continue;
 		g_receiving_netdev = polled;
+		u32 prev_ns = namespace_net_push_context(polled->netns);
 		polled->poll(polled);
+		namespace_net_pop_context(prev_ns);
 	}
 	g_receiving_netdev = 0;
 }
