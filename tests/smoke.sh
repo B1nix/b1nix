@@ -266,7 +266,7 @@ run_qemu() {
 
 		set -- qemu-system-x86_64 ${accel_args} ${mem_args} ${cpu_args} \
 			-cdrom "$PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}" \
-			-serial stdio -display ${GPU_DISPLAY:-none} -monitor none -no-reboot \
+			-serial stdio -serial null -display ${GPU_DISPLAY:-none} -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04
 
 		if [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
@@ -288,11 +288,11 @@ run_qemu() {
 			-device intel-hda,id=hda -device hda-duplex,bus=hda.0,audiodev=audio0 \
 			-device AC97,audiodev=audio0 \
 			-device ich9-ahci,id=ahci \
-				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw \
+				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw,discard=unmap \
 				-device ide-hd,drive=satadrive,bus=ahci.0 \
 				-drive file="$SWAP_IMG",if=none,id=swapdrive,format=raw \
 				-device ide-hd,drive=swapdrive,bus=ahci.1 \
-				-drive file="$NVME_IMG",if=none,id=nvmedrive,format=raw \
+				-drive file="$NVME_IMG",if=none,id=nvmedrive,format=raw,discard=unmap \
 				-device nvme,serial=deadbeef,drive=nvmedrive \
 				${EXTRA_QEMU_ARGS:-}
 		else
@@ -432,7 +432,7 @@ else
 	QUICK_CMDLINE=""
 	[ "$SMOKE_QUICK" = "1" ] && QUICK_CMDLINE="b1nix.smoke=quick"
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init >"$BUILD_LOG" 2>&1 || {
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot >"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
 		}
@@ -469,8 +469,10 @@ _mkimg() {  # mkimg <instance-suffix>
             echo "Error: Failed to format sata $1 image as ext4."; exit 1
         }
     }
-    "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_nvme" 2>/dev/null || {
-        "$MKE2FS" -F -t ext4 -q "$_nvme" 2>/dev/null || {
+    # The NVMe image carries a volume label: `findfs LABEL=` has to have
+    # something to find (M109). Not "b1nix-root" — that name selects the root.
+    "$MKE2FS" -F -t ext4 -L m109label -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_nvme" 2>/dev/null || {
+        "$MKE2FS" -F -t ext4 -L m109label -q "$_nvme" 2>/dev/null || {
             echo "Error: Failed to format nvme $1 image as ext4."; exit 1
         }
     }
@@ -478,6 +480,7 @@ _mkimg() {  # mkimg <instance-suffix>
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
     _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg init; _mkimg iommu; _mkimg amdvi
+    _mkimg switchroot
 }
 
 # Define logs
@@ -489,6 +492,7 @@ POSIX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-posix-$ARCH.log"
 GFX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-gfx-$ARCH.log"
 OPENRC_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-openrc-$ARCH.log"
 INIT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-init-$ARCH.log"
+SWITCHROOT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-switchroot-$ARCH.log"
 IOMMU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-iommu-$ARCH.log"
 AMDVI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-amdvi-$ARCH.log"
 
@@ -556,7 +560,7 @@ launch_blk() {
 		# to any instance before, so nothing exercised its feature
 		# negotiation, its FLUSH or its WRITE ZEROES.
 		EXTRA_QEMU_ARGS="-drive file=$(disk_img usb blk),if=none,id=usbdisk,format=raw -device usb-storage,bus=xhci.0,drive=usbdisk \
-			-drive file=$(disk_img vblk blk),if=none,id=vblkdisk,format=raw -device virtio-blk-pci,drive=vblkdisk"
+			-drive file=$(disk_img vblk blk),if=none,id=vblkdisk,format=raw,discard=unmap -device virtio-blk-pci,drive=vblkdisk"
 		export EXTRA_QEMU_ARGS
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[blk]   "
@@ -641,6 +645,24 @@ launch_init() {
 		run_qemu "$INIT_LOG"
 	) &
 	pid_init=$!
+}
+
+# M109: the initramfs boot. The kernel keeps the RAM filesystem as / and PID 1
+# is /init from the initramfs, which mounts the real root below / and hands the
+# machine over with BusyBox's switch_root. The markers after the switch are
+# printed by the process running in the NEW root.
+launch_switchroot() {
+	(
+		SATA_IMG=$(disk_img sata switchroot)
+		NVME_IMG=$(disk_img nvme switchroot)
+		SWAP_IMG=$(disk_img swap switchroot)
+		B1NIX_ISO_NAME=b1nix-switchroot.iso
+		SMOKE_DONE_PATTERN="M109-SMOKE: done-switchroot|KERNEL PANIC|\[PANIC\]"
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[swroot]"
+		run_qemu "$SWITCHROOT_LOG"
+	) &
+	pid_switchroot=$!
 }
 
 # M100b: the same OpenRC ISO, on a q35 machine with an Intel IOMMU in front of
@@ -750,7 +772,7 @@ run_slot_pool() {
 if [ "$SMOKE_PARALLEL" = "1" ]; then
 	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
-	_inst_list="sys blk posix gfx openrc init iommu amdvi"
+	_inst_list="sys blk posix gfx openrc init switchroot iommu amdvi"
 	[ -n "${SMOKE_INSTANCES:-}" ] && _inst_list="$SMOKE_INSTANCES"
 	# Drop the logs of every instance this run will not start. Their checks
 	# would otherwise grep the previous run's output and report a pass nobody
@@ -762,7 +784,7 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	if [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMOKE_INSTANCES " | grep -q " smp "; then
 		_ran_list="$_ran_list smp"
 	fi
-	for _known in sys blk posix gfx openrc init iommu amdvi smp; do
+	for _known in sys blk posix gfx openrc init switchroot iommu amdvi smp; do
 		case " $_ran_list " in
 		*" $_known "*) continue ;;
 		esac
@@ -793,7 +815,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	for _i in sys blk posix gfx openrc init iommu amdvi smp; do
+	for _i in sys blk posix gfx openrc init switchroot iommu amdvi smp; do
 	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" "$(disk_img vblk "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
@@ -1264,6 +1286,15 @@ check_output "$LOG" "BPKG-SMOKE: ok dep-resolution" "bpkg install resolves depen
 check_output "$LOG" "BPKG-SMOKE: ok apk-signature" "bpkg verifies a real Alpine package's RSA signature and its datahash before extracting it"
 check_output "$LOG" "BPKG-SMOKE: ok apk-signature-reject" "a payload byte flipped behind a valid signature is caught by the datahash and installs nothing"
 check_output "$LOG" "BPKG-SMOKE: ok apk-format" "bpkg installs a real Alpine APKINDEX/.apk package"
+check_output "$LOG" "BPKG-SMOKE: ok install-scripts" "bpkg runs .pre-install before unpacking and .post-install after, with the version as \$1"
+check_output "$LOG" "BPKG-SMOKE: ok triggers" "an armed trigger fires for the transaction that writes into the directory it watches, not for its own package's install"
+check_output "$LOG" "BPKG-SMOKE: ok world" "explicitly requested packages are tracked in /etc/apk/world"
+check_output "$LOG" "BPKG-SMOKE: ok deinstall-script" "bpkg remove runs the .post-deinstall kept from install time and drops the name from world"
+check_output "$LOG" "BPKG-SMOKE: ok upgrade-scripts" "an upgrade runs .pre-upgrade/.post-upgrade instead of the install scripts, with the new version in \$1 and the replaced one in \$2"
+check_output "$LOG" "BPKG-SMOKE: ok upgrade-order" ".pre-upgrade runs before the new payload is unpacked and .post-upgrade after"
+check_output "$LOG" "BPKG-SMOKE: ok upgrade-no-deinstall" "an upgrade does not run the old version's deinstall scripts"
+check_output "$LOG" "BPKG-SMOKE: ok upgrade-fallback" "a package with no upgrade scripts still has its install scripts run on an upgrade"
+check_output "$LOG" "BPKG-SMOKE: ok upgrade-abort" "a failing .pre-upgrade abandons the upgrade and leaves the installed version in place"
 check_output "$LOG" "BPKG-SMOKE: done" "bpkg smoke completes"
 check_output "$LOG" "M22-POLISH: start" "M22 Polish starts"
 check_output "$LOG" "M22-POLISH: ok utility-flags" "M22 Polish utility flags verify"
@@ -1613,6 +1644,12 @@ check_output "$LOG" "M32-NET: ok select-pipe-ready" "select() reports a buffered
 check_output "$LOG" "M32-NET: ok select-multi-fd" "select() across multiple fds isolates readability"
 check_output "$LOG" "M32-NET: ok sockopt-reuseaddr" "M32b: setsockopt/getsockopt SO_REUSEADDR round-trips"
 check_output "$LOG" "M32-NET: ok sockopt-nodelay" "M32b: setsockopt/getsockopt TCP_NODELAY round-trips"
+check_output "$LOG" "M32-NET: ok idle-connection" "a TCP connection left idle for five seconds with keepalive off still carries data — the control for the keepalive check"
+check_output "$LOG" "M32-NET: ok keepalive-defaults" "a fresh TCP socket reports Linux's keepalive defaults (7200s idle, 9 probes)"
+check_output "$LOG" "M32-NET: ok keepalive-rejects-zero" "a zero keepalive interval is refused rather than stored"
+check_output "$LOG" "M32-NET: ok keepalive-set" "TCP_KEEPIDLE/KEEPINTVL/KEEPCNT round-trip through get/setsockopt"
+check_output "$LOG" "M32-NET: ok keepalive-live" "an idle connection with keepalive on still carries data after several probes have gone out and been answered"
+check_output "$LOG" "M32-NET: ok keepalive-udp-refused" "TCP_KEEPIDLE on a datagram socket is refused"
 check_output "$LOG" "M32-NET: ok sockopt-sotype" "M32b: getsockopt SO_TYPE reports the real socket type"
 check_output "$LOG" "M32-NET: ok getsockname" "M32b: getsockname reports the bound local address"
 check_output "$LOG" "M32-NET: ok getpeername" "M32b: getpeername reports the connected peer address"
@@ -1955,6 +1992,66 @@ check_output "$LOG" "M107-SMOKE: ok applet-hwclock" "BusyBox hwclock -r reads th
 check_output "$LOG" "M107-SMOKE: ok applet-lsof" "BusyBox lsof lists an open file by its full path"
 check_output "$LOG" "M107-SMOKE: ok applet-chvt" "BusyBox chvt switches the active virtual terminal"
 check_output "$LOG" "M107-SMOKE: done" "M107 subsystem suite completes"
+# ── M109: AF_PACKET, pivot_root(2), volume identity ──
+check_output "$BLK_LOG" "M109-SMOKE: ok packet-socket" "an AF_PACKET socket binds to an interface and getsockname reports a 20-byte sockaddr_ll"
+check_output "$BLK_LOG" "M109-SMOKE: ok packet-tx-rx" "a frame sent on one packet socket arrives byte-for-byte on another, with its MAC, ethertype and ifindex"
+check_output "$BLK_LOG" "M109-SMOKE: ok packet-filter" "a socket bound to one ethertype does not see another's frames, while ETH_P_ALL sees both"
+check_output "$BLK_LOG" "M109-SMOKE: ok packet-dgram" "AF_PACKET SOCK_DGRAM strips the header on receive and builds it from the sockaddr_ll on send"
+check_output "$BLK_LOG" "M109-SMOKE: ok gretap-loop" "a gretap tunnel encapsulates a frame in GRE over IPv4 and delivers it back, decapsulated, as a received frame"
+check_output "$BLK_LOG" "M109-SMOKE: ok vlan-tag" "a frame sent on a vlan device leaves the lower interface tagged 802.1Q with the right VID"
+check_output "$BLK_LOG" "M109-SMOKE: ok vlan-strip" "a tagged frame arriving on the lower interface is matched, stripped and delivered on the vlan device"
+check_output "$BLK_LOG" "M109-SMOKE: ok vlan-vid-filter" "a tag for an unconfigured VID never surfaces on the vlan device, while a correct one still does"
+check_output "$BLK_LOG" "M109-SMOKE: ok bridge-learn" "the bridge learns a source address against the port it arrived on and lists it in /proc/net/bridge"
+check_output "$BLK_LOG" "M109-SMOKE: ok bridge-flood" "a broadcast received on one bridge port is flooded out the other, unchanged"
+check_output "$BLK_LOG" "M109-SMOKE: ok bridge-fdb-forward" "a unicast for a learned address leaves by that port alone"
+check_output "$BLK_LOG" "M109-SMOKE: ok bond-active-tx" "a bond transmits through its active slave and not through the backup"
+check_output "$BLK_LOG" "M109-SMOKE: ok bond-failover" "with the active slave down the bond sends through the other one, and that slave's received frames surface on the bond"
+check_output "$BLK_LOG" "M109-SMOKE: ok vnet-link-lifecycle" "RTM_NEWLINK creates a virtual device, a duplicate name is EEXIST, RTM_DELLINK removes it, and a physical NIC cannot be deleted"
+check_output "$BLK_LOG" "M109-SMOKE: ok pivot-root" "pivot_root(2) makes a mounted filesystem the root, parks the old one at put_old, and the mount table moves with it"
+check_output "$BLK_LOG" "M109-SMOKE: ok pivot-root-errno" "pivot_root rejects a plain directory, a put_old outside new_root, and the current root"
+check_output "$BLK_LOG" "M109-SMOKE: ok blkid-probe" "blkid reports a canonically shaped UUID and a filesystem type for a real disk"
+check_output "$BLK_LOG" "M109-SMOKE: ok sysfs-ident" "/sys/block/<dev>/{uuid,fstype} agree with blkid about the same device"
+check_output "$BLK_LOG" "M109-SMOKE: done" "M109 suite completes"
+# ── M109: namespaces (unshare/nsenter) ──
+check_output "$BLK_LOG" "M109-SMOKE: ok uts-namespace" "a child that unshares its UTS namespace renames itself and the parent keeps its own hostname"
+check_output "$BLK_LOG" "M109-SMOKE: ok ns-handles" "/proc/<pid>/ns/uts differs after an unshare while /proc/<pid>/ns/mnt still matches"
+check_output "$BLK_LOG" "M109-SMOKE: ok setns-uts" "setns(2) on a child's ns handle joins its UTS namespace and the caller's own handle takes it back"
+check_output "$BLK_LOG" "M109-SMOKE: ok mount-namespace" "a mount made under CLONE_NEWNS is absent from the parent's /proc/mounts and its files unreachable outside"
+check_output "$BLK_LOG" "M109-SMOKE: done" "M109 namespace suite completes"
+check_output "$LOG" "M109-SMOKE: ok uts-namespace" "a child that unshares its UTS namespace renames itself and the parent keeps its own hostname"
+check_output "$LOG" "M109-SMOKE: ok ns-handles" "/proc/<pid>/ns/uts differs after an unshare while /proc/<pid>/ns/mnt still matches"
+check_output "$LOG" "M109-SMOKE: ok setns-uts" "setns(2) on a child's ns handle joins its UTS namespace and the caller's own handle takes it back"
+check_output "$LOG" "M109-SMOKE: ok mount-namespace" "a mount made under CLONE_NEWNS is absent from the parent's /proc/mounts and its files unreachable outside"
+check_output "$LOG" "M109-SMOKE: ok pid-namespace" "unshare(CLONE_NEWPID) numbers the caller's children from 1: the first child reports getpid()==1 and getppid()==0, its own child gets 2, and waitpid inside the namespace reports that 2"
+check_output "$LOG" "M109-SMOKE: ok pid-ns-isolation" "a pid from outside a PID namespace names nothing inside it - kill() on it is ESRCH"
+check_output "$LOG" "M109-SMOKE: ok pid-ns-handles" "/proc/<pid>/ns/pid differs for the task inside the new namespace and is unchanged for the task that unshared"
+check_output "$LOG" "M109-SMOKE: ok veth-pair" "ip link add ... type veth peer name ... makes two interfaces, both listed in /proc/net/dev, and a duplicate name is EEXIST"
+check_output "$LOG" "M109-SMOKE: ok veth-carries-frame" "a frame sent on one end of a veth arrives on the other as a received frame, byte for byte"
+check_output "$LOG" "M109-SMOKE: ok net-namespace" "unshare(CLONE_NEWNET) leaves a task with no interfaces at all - not the NIC, not a veth pair created before the unshare"
+check_output "$LOG" "M109-SMOKE: ok veth-crosses-namespace" "one veth end moved into another network namespace vanishes from this one, and a frame sent here is received there"
+check_output "$LOG" "M109-SMOKE: ok unlink-enoent" "unlink of a name that exists on neither the filesystem nor the VFS still fails ENOENT, while an in-memory device node on an on-disk directory really is removed"
+check_output "$LOG" "M109-UEVENT: ok sysfs-dev-tree" "/sys/dev/block/<maj:min>/{dev,uevent} agree with each other and with the block node in /dev"
+check_output "$LOG" "M109-UEVENT: ok uevent-hotplug-add" "a loop device added after boot broadcasts add@/block/loop8 with ACTION/SUBSYSTEM/DEVNAME/MAJOR/MINOR/SEQNUM"
+check_output "$LOG" "M109-UEVENT: ok mdev-scan" "mdev -s creates the missing node as a block special file with the major:minor /sys published"
+check_output "$LOG" "M109-UEVENT: ok uevent-hotplug-remove" "removing the device broadcasts remove@/block/loop8 with an advancing SEQNUM and it leaves /sys"
+check_output "$LOG" "M109-UEVENT: ok mdev-daemon" "mdev -d creates and unlinks /dev/loop8 from the netlink broadcast alone"
+check_output "$LOG" "M109-UEVENT: done" "the M109 uevent suite ran to completion"
+check_output "$LOG" "M109-SMOKE: ok net-ns-routes" "a route added inside a network namespace is in its own /proc/net/route and absent from the initial namespace's"
+check_output "$LOG" "M109-SMOKE: done" "M109 namespace suite completes"
+# ── M109: device nodes, findfs/blkid, and mount(MS_MOVE)/switch_root ──
+check_output "$BLK_LOG" "M109-SMOKE: ok dev-nodes-listed" "a readdir of /dev lists every block device /sys/block names, as a block special file"
+check_output "$BLK_LOG" "M109-SMOKE: ok dir-merge-no-dups" "a directory with both on-disk entries and in-memory children lists each name once"
+check_output "$BLK_LOG" "M109-SMOKE: ok findfs-uuid" "findfs UUID= names the device whose superblock carries that UUID"
+check_output "$BLK_LOG" "M109-SMOKE: ok findfs-label" "findfs LABEL= names the device carrying that volume label"
+check_output "$BLK_LOG" "M109-SMOKE: ok blkid-lists-disks" "blkid reports the disk with the UUID its superblock holds"
+check_output "$BLK_LOG" "M109-SMOKE: ok mount-move" "MS_MOVE moves a mount and the mount nested inside it to a new target"
+check_output "$BLK_LOG" "M109-SMOKE: ok mount-move-statfs" "the moved mount still reports its own filesystem type at the new path"
+check_output "$BLK_LOG" "M109-SMOKE: done" "M109 device-node and mount suite completes"
+check_output "$SWITCHROOT_LOG" "M109-SMOKE: ok initramfs-root-statfs" "statfs reports RAMFS/TMPFS for an initramfs root, which is what switch_root demands"
+check_output "$SWITCHROOT_LOG" "M109-SMOKE: ok switchroot-mount-newroot" "the initramfs PID 1 mounts the real root below /"
+check_output "$SWITCHROOT_LOG" "M109-SMOKE: ok switch-root" "switch_root moved the new root onto / — the new init sees its files and not the initramfs's"
+check_output "$SWITCHROOT_LOG" "M109-SMOKE: ok switch-root-init-pid1" "the process running in the new root is PID 1"
+check_output "$SWITCHROOT_LOG" "M109-SMOKE: done-switchroot" "the switch_root instance completes"
 # ── M108: BusyBox owns su, passwd and init ──
 # su/passwd run on the posix instance; the init markers come from the dedicated
 # init instance, where the checks are driven by PID 1 itself out of /etc/inittab.
@@ -1967,6 +2064,8 @@ check_output "$LOG" "M108-SMOKE: ok passwd-writes-sha512" "BusyBox passwd rewrit
 check_output "$LOG" "M108-SMOKE: ok passwd-pam-accepts-new" "the PAM path accepts the password BusyBox passwd wrote"
 check_output "$LOG" "M108-SMOKE: ok passwd-pam-rejects-old" "the PAM path rejects the password BusyBox passwd replaced"
 check_output "$LOG" "M108-SMOKE: ok su-accepts-passwd-hash" "BusyBox su authenticates the hash BusyBox passwd wrote"
+check_output "$LOG" "M108-SMOKE: ok shadow-concurrent-passwd" "four simultaneous BusyBox passwd runs all reach /etc/shadow: no update lost, no bystander hash moved, no duplicated or truncated record in either database"
+check_output "$LOG" "M108-SMOKE: ok shadow-lock-excl" "open(O_CREAT|O_EXCL) admits exactly one racer per round, and fcntl(F_SETLK,F_WRLCK) blocks a second writer, names its holder via F_GETLK and is released when that holder exits"
 check_output "$LOG" "M108-SMOKE: done" "M108 su/passwd suite completes"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-pid1" "the default PID 1 is the BusyBox multicall ELF running as init"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-openrc-runlevels" "OpenRC's default runlevel and its local.d hooks run under BusyBox init"
@@ -2015,6 +2114,8 @@ check_output "$LOG" "M86-SMOKE: ok rusage-thread" "getrusage separates RUSAGE_TH
 check_output "$LOG" "M86-SMOKE: ok times-process" "times(2) reports process CPU time covering every thread"
 check_output "$LOG" "M86-SMOKE: ok rusage-children" "getrusage(RUSAGE_CHILDREN) accumulates a reaped child's CPU time"
 check_output "$LOG" "M86-SMOKE: ok proc-stat-times" "/proc/self/stat reports real utime/stime and a live thread count"
+check_output "$LOG" "M86-SMOKE: ok proc-stat-width" "/proc/<pid>/stat carries all 52 fields, so a reader that asks for one by index finds it"
+check_output "$LOG" "M86-SMOKE: ok proc-stat-width-gone" "a task that has exited but not been reaped still reports a full-width stat line, not a four-field stub"
 check_output "$LOG" "M86-SMOKE: ok rusage-maxrss" "ru_maxrss is a high-water mark that survives the munmap of the pages that set it"
 check_output "$LOG" "M86-SMOKE: ok group-stop-blocked" "a process-directed stop reaches a thread parked in a blocking syscall, and SIGCONT resumes it"
 check_output "$LOG" "M86-SMOKE: ok tkill-self" "tkill(gettid(), sig) delivers to the calling thread"
@@ -2147,6 +2248,35 @@ check_output "$BLK_LOG" "virtio-blk: registered vda" "virtio-blk probes and regi
 check_output "$BLK_LOG" "flush=yes" "virtio-blk negotiates VIRTIO_BLK_F_FLUSH instead of declining every feature the host offers"
 check_output "$BLK_LOG" "M14-BLK: ok durable-roundtrip dev=vda" "a pattern written to vda survives a device flush and a full block-cache drop"
 check_output "$BLK_LOG" "M14-BLK: ok zero-blocks" "blk_zero_blocks leaves a range reading back as zeroes"
+
+# ── M109: inode attributes, discard, I/O priorities, serial line settings ──
+check_output "$BLK_LOG" "discard=yes" "virtio-blk negotiates VIRTIO_BLK_F_DISCARD, so blkdiscard reaches a device that has the command"
+check_output "$BLK_LOG" "nvme: dataset-management=yes" "the NVMe controller's ONCS says Dataset Management, so Deallocate is a command it really has"
+check_output "$BLK_LOG" "M109-SMOKE: ok attr-roundtrip" "FS_IOC_SETFLAGS stores the ext2 attribute byte, FS_IOC_GETFLAGS reads it back, and a flag the format cannot hold is refused"
+check_output "$BLK_LOG" "M109-SMOKE: ok attr-immutable" "chattr +i makes write, truncate, rename and unlink all fail EPERM, and -i gives the file back"
+check_output "$BLK_LOG" "M109-SMOKE: ok attr-append" "chattr +a refuses a plain write and a truncate but accepts an O_APPEND write"
+check_output "$BLK_LOG" "M109-SMOKE: ok attr-persist" "the attribute flags survive umount and remount, so they reached the on-disk i_flags"
+check_output "$BLK_LOG" "M109-SMOKE: ok attr-applets" "BusyBox chattr sets flags that BusyBox lsattr prints, and clears them again"
+check_output "$BLK_LOG" "M109-SMOKE: ok discard-support" "every block device either has the discard command or reports EOPNOTSUPP — never an I/O error"
+check_output "$BLK_LOG" "M109-SMOKE: ok discard-virtio" "BLKDISCARD on virtio-blk accepts a valid range and rejects a misaligned or out-of-range one"
+check_output "$BLK_LOG" "M109-SMOKE: ok discard-zeroout" "BLKZEROOUT makes a range that held a pattern read back as zeroes"
+check_output "$BLK_LOG" "M109-SMOKE: ok discard-applet" "BusyBox blkdiscard trims a range of the scratch disk"
+check_output "$BLK_LOG" "M109-SMOKE: ok fstrim-ioctl" "FITRIM walks a mounted ext4's free bitmaps and offers no more than the filesystem has free"
+check_output "$BLK_LOG" "M109-SMOKE: ok fstrim-keeps-data" "a file written before the trim is still readable after it"
+check_output "$BLK_LOG" "M109-SMOKE: ok fstrim-applet" "BusyBox fstrim runs on the mount point"
+check_output "$BLK_LOG" "M109-SMOKE: ok ioprio-roundtrip" "ioprio_set/ioprio_get round-trip a class and level, and refuse a class that does not exist"
+check_output "$BLK_LOG" "M109-SMOKE: ok ioprio-applet" "BusyBox ionice sets a process's I/O class and reads it back"
+check_output "$BLK_LOG" "M109-SMOKE: ok serial-line" "tcsetattr reprograms COM2's baud, word length, parity and stop bits, and tcgetattr reports the chip"
+check_output "$BLK_LOG" "M109-SMOKE: ok serial-badbaud" "a baud rate the divisor cannot express is refused, leaving the line as it was"
+check_output "$BLK_LOG" "M109-SMOKE: ok serial-modem" "TIOCMGET reads the real modem lines and TIOCMBIC/TIOCMBIS change one"
+check_output "$BLK_LOG" "M109-SMOKE: ok serial-setserial" "TIOCGSERIAL reports COM2's actual port, IRQ and clock, and TIOCSSERIAL refuses to fake changing them"
+
+# Limits that used to be compiled in. Both checks deliberately exceed the old
+# constant, so they can only pass on a kernel that derives the limit at runtime.
+check_output "$BLK_LOG" "M109-SMOKE: ok mounts-past-64" "96 filesystems mount at once and the last one is writable (the mount table was a fixed 64 entries shared by every namespace)"
+check_output "$BLK_LOG" "M109-SMOKE: ok fs-run-past-64" "a 512 KiB file on ext4 reads back byte-for-byte after a remount, in one read(2) spanning far more than the 64 blocks the coalescer used to fold into a request"
+
+check_output "$BLK_LOG" "M109-SMOKE: done" "M109 suite completes"
 
 # Network tests are only wired for the current x86_64/x86 QEMU path.
 if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
@@ -2418,7 +2548,7 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-for _i in sys blk posix gfx openrc init iommu amdvi smp; do
+for _i in sys blk posix gfx openrc init switchroot iommu amdvi smp; do
     rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")"
 done
 echo ""

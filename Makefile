@@ -65,6 +65,9 @@ MODULE_OUT_DIR := $(BUILD_DIR)/modules
 MODULE_NAMES := isofs ntfs btrfs hda ipv6 ndp ntp
 MODULE_KOS := $(patsubst %,$(MODULE_OUT_DIR)/%.ko,$(MODULE_NAMES))
 INITRAMFS_MODULES_INC := $(INC_DIR)/initramfs_modules.inc
+# M109: the initramfs /init of the switchroot instance — the PID 1 that mounts
+# the real root below / and hands over to BusyBox's switch_root.
+INITRAMFS_M109_SWITCHROOT_INC := $(INC_DIR)/initramfs_m109_switchroot.inc
 # b1cc (in-tree C compiler + its M5/M32-M34 smoke corpus)
 INITRAMFS_B1CC_M34_INC := $(INC_DIR)/initramfs_b1cc_m34.inc
 INITRAMFS_CURL_INC := $(INC_DIR)/initramfs_curl.inc
@@ -173,6 +176,7 @@ endif
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_MODULES_INC) \
+	$(INITRAMFS_M109_SWITCHROOT_INC) \
 	$(INITRAMFS_LD_MUSL_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(AP_TRAMPOLINE_OFFSETS) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 DROPBEAR_VERSION := 2022.83
@@ -368,6 +372,7 @@ KERNEL_SOURCES := \
 	kernel/dev/ioapic.c \
 	kernel/dev/blk.c \
 	kernel/dev/loop.c \
+	kernel/dev/uevent.c \
 	kernel/dev/ramdisk.c \
 	kernel/dev/video.c \
 	kernel/ipc/mqueue.c \
@@ -381,6 +386,7 @@ KERNEL_SOURCES := \
 	kernel/sched/m28_ctxbench.c \
 	kernel/sched/m28_heapbench.c \
 	kernel/sched/futex.c \
+	kernel/sched/namespace.c \
 	kernel/sched/rseq.c \
 	kernel/sched/ptrace.c \
 	kernel/sched/seccomp.c \
@@ -455,6 +461,13 @@ KERNEL_SOURCES += \
 	kernel/net/net.c \
 	kernel/net/socket.c \
 	kernel/net/netlink.c \
+	kernel/net/packet.c \
+	kernel/net/vlan.c \
+	kernel/net/bridge.c \
+	kernel/net/bond.c \
+	kernel/net/gre.c \
+	kernel/net/vnet.c \
+	kernel/net/veth.c \
 	kernel/net/unix.c \
 	kernel/net/arp.c \
 	kernel/net/ethernet.c \
@@ -688,7 +701,8 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@echo "Analysis results in $(ANALYZE_DIR)"
 	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
 
-.PHONY: all analyze objects FORCE iso iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-live iso-test iso-full check-dynamic iso-pass-chromium-disk iso-pass-chromium-disk-impl \
+.PHONY: all analyze objects FORCE iso iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot iso-live iso-test iso-full check-dynamic iso-pass-chromium-disk iso-pass-chromium-disk-impl \
+	iso-chromium-min-disk iso-chromium-min-disk-impl \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source install-ports root-image disk-image \
@@ -897,6 +911,11 @@ $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/helpers/native_smoke.S $(USERSPACE_
 	@$(MAKE) -C userspace build/$(ARCH)/bin/native_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_native_smoke_elf userspace/build/$(ARCH)/bin/native_smoke > $@
+
+$(INITRAMFS_M109_SWITCHROOT_INC): userspace/bin/helpers/m109_switchroot_init.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m109_switchroot_init
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m109_switchroot_elf userspace/build/$(ARCH)/bin/m109_switchroot_init > $@
 
 $(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/compiler/b1cc_m34_corpus.c userspace/Makefile $(wildcard userspace/b1cc/tests/*.c) $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
@@ -1349,6 +1368,9 @@ SMOKE_CMDLINE_openrc=init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest b1
 # things only PID 1 can be asked about: its own identity, orphan reaping, getty
 # respawn, and that OpenRC's default runlevel really ran underneath.
 SMOKE_CMDLINE_init=b1nix.test=1 b1nix.smoke=init
+# M109: the initramfs stays /, and /init (an initramfs binary) mounts the real
+# root and hands over with switch_root.
+SMOKE_CMDLINE_switchroot=b1nix.test=1 b1nix.smoke=switchroot root=initramfs init=/init
 
 # Hardware-passthrough instance, beside the smoke ISOs rather than instead of
 # the ordinary one.
@@ -1399,6 +1421,40 @@ SMOKE_CMDLINE_pass-bright=b1nix.i915sway b1nix.use-cage b1nix.bright b1nix.drm-d
 # the staging root and the image size through conditionals that are evaluated
 # when this file is read, so it has to be set before make starts, not while it
 # runs.
+# The minimal browser case, with no passthrough and no compositor in the image.
+#
+# The same binary and the same flags print the document on a Linux host in about
+# a second (verified under bwrap against the very apk this image installs), so a
+# hang here is this kernel's. Boots to init, runs one browser, reports, and
+# needs no GPU — which makes it the loop to iterate in.
+# The watchdog's dump is megabytes a minute once the browser has thirty threads,
+# and formatting it starves the very shell that is supposed to report the
+# verdict. Diagnostics are opt-in through CMIN_EXTRA; the default run answers
+# only "did it print the document".
+SMOKE_CMDLINE_chromium-min=b1nix.chromium-min $(CMIN_EXTRA)
+
+iso-chromium-min-disk:
+	@$(MAKE) --no-print-directory B1NIX_BROWSER=1 iso-chromium-min-disk-impl
+
+# The same browser image, booted the ordinary way: no probe, a getty on the
+# serial line, so the machine can be driven by hand instead of by an inittab
+# hook. This is the configuration to answer "what does it do when a person
+# starts it", which the probe deliberately does not.
+SMOKE_CMDLINE_shell=b1nix.serial-getty $(SHELL_EXTRA)
+
+iso-shell:
+	@$(MAKE) --no-print-directory B1NIX_BROWSER=1 iso-shell-impl
+
+iso-shell-impl: root-image check-dynamic $(KERNEL_ELF)
+	@$(MKISO) --stage $(BUILD_DIR)/iso-shell --out $(BUILD_DIR)/b1nix-shell.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "$(SMOKE_CMDLINE_shell)"
+
+iso-chromium-min-disk-impl: root-image check-dynamic $(KERNEL_ELF)
+	@$(MKISO) --stage $(BUILD_DIR)/iso-chromium-min-disk --out $(BUILD_DIR)/b1nix-chromium-min-disk.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "$(SMOKE_CMDLINE_chromium-min)"
+
 iso-pass-chromium-disk:
 	@$(MAKE) --no-print-directory B1NIX_BROWSER=1 iso-pass-chromium-disk-impl
 
@@ -1407,7 +1463,7 @@ iso-pass-chromium-disk-impl: root-image check-dynamic $(KERNEL_ELF)
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_pass-chromium)"
 
-iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
+iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \

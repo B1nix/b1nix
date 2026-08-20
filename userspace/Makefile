@@ -307,6 +307,13 @@ BINARIES += $(BUILD)/bin/m96_smoke
 # M107: netlink, VTs/console fonts, loop devices, /proc fd+maps, kmsg/syslog,
 # inotify, RTC + watchdog, i2c.
 BINARIES += $(BUILD)/bin/m107_smoke
+# M109: AF_PACKET, pivot_root(2), volume identity, and UTS/mount namespaces.
+# M109: the merged /dev listing, findfs/blkid, and mount(MS_MOVE).
+# M109: inode attribute flags (chattr/lsattr), block discard (blkdiscard,
+# fstrim), I/O priorities (ionice) and the serial line's hardware settings.
+BINARIES += $(BUILD)/bin/m109_smoke
+# M109: the uevent hot-plug channel - netlink uevents, /sys/dev/block, mdev.
+BINARIES += $(BUILD)/bin/m109_uevent_smoke
 # M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
 BINARIES += $(BUILD)/bin/m98_smoke
 # M100: DRM core -- scatter-gather GEM objects through /dev/dri/card0.
@@ -444,6 +451,21 @@ $(BUILD)/bin/b1cc_selfsmoke: bin/compiler/b1cc_selfsmoke.c $(MUSL_LIB)/libc.a $(
 	$(LD) $(LDFLAGS) -static -o $@ $(MUSL_CRT1) $(MUSL_CRTI) $(BUILD)/bin/b1cc_selfsmoke.o \
 	  $(MUSL_LIB)/libc.a $(MUSL_CRTN) $(BUILTINS_LIB)
 	$(call stamp_linux_osabi,$@)
+
+# M109: the initramfs /init of the switchroot instance. Linked exactly like
+# every other program here — a PIE against musl's shared libc through
+# /lib/ld-musl-x86_64.so.1, both of which the initramfs already carries — so it
+# gets a load base the loader picks rather than the fixed 2 MiB a static link
+# lands on, which is inside the kernel's identity mapping. Deliberately not in
+# BINARIES: it ships inside the kernel image, not in the rootfs.
+$(BUILD)/bin/m109_switchroot_init: bin/helpers/m109_switchroot_init.c $(GEN_LIBDEP) $(GEN_CRT0)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $(BUILD)/bin/m109_switchroot_init.o
+	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) \
+	  $(BUILD)/bin/m109_switchroot_init.o $(GEN_LINK_LIBS)
+ifeq ($(GEN_MUSL_POSTLINK),1)
+	$(call stamp_linux_osabi,$@)
+endif
 
 $(BUILD)/src/tui_common.o: src/tui_common.c include/tui.h
 	@mkdir -p $(dir $@)
@@ -1021,6 +1043,11 @@ endif
 	@#   m108pw    the account whose password `passwd` rewrites.
 	@printf "m108user:x:1002:1002:M108 su caller:/home/m108user:/bin/m108shell\nm108peer:x:1003:1003:M108 su target:/home/m108peer:/bin/sh\nm108pw:x:1004:1004:M108 passwd target:/home/m108pw:/bin/sh\n" >> $(ROOTFS)/etc/passwd
 	@mkdir -p $(ROOTFS)/home/m108user $(ROOTFS)/home/m108peer $(ROOTFS)/home/m108pw
+	@# M108: four accounts whose passwords are rewritten SIMULTANEOUSLY, to
+	@# prove /etc/shadow locking. Separate from m108pw so the concurrent run and
+	@# the single-writer passwd test never touch the same record.
+	@printf "m108c0:x:1010:1010:M108 concurrent passwd 0:/home/m108c0:/bin/sh\nm108c1:x:1011:1011:M108 concurrent passwd 1:/home/m108c1:/bin/sh\nm108c2:x:1012:1012:M108 concurrent passwd 2:/home/m108c2:/bin/sh\nm108c3:x:1013:1013:M108 concurrent passwd 3:/home/m108c3:/bin/sh\n" >> $(ROOTFS)/etc/passwd
+	@mkdir -p $(ROOTFS)/home/m108c0 $(ROOTFS)/home/m108c1 $(ROOTFS)/home/m108c2 $(ROOTFS)/home/m108c3
 	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:20000:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:20000:0:99999:7:::\n' > $(ROOTFS)/etc/shadow
 	@# M104: dedicated /etc/shadow entry for the PAM smoke test
 	@# (userspace/bin/smoke/m104_pam_smoke.c) — a real SHA-512 "$$6$$" hash of the
@@ -1038,7 +1065,15 @@ endif
 	@printf 'm108user:$$6$$m108usersalt$$U7uuAPJyfx58AT26qAudu8PvVKsmO6jTB5EiK/pag6OV8oGNxzS9DPtQlEhTAc4URuN2oMFLgarPW2Utx3DGA1:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
 	@printf 'm108peer:$$6$$m108peersalt$$TCl.o4K5Iw7SlNXrk9dNp4NHfvT0JPCUmyk9otIuGpjRuq8d0trvLR6DDBava0iQY5MBTlU6kRnSNF4XOZXPF/:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
 	@printf 'm108pw:$$6$$m108pwsalt$$YvQPFIRKzF9l53ejsICs/u66sJBq6NfeOai7reDJDsOGog0q.k7t7bHAfGgVrOs3Ni0rrwKmaEwEWvZv3Tl9V1:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
-	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\npamtest:x:1001:pamtest\nm108user:x:1002:\nm108peer:x:1003:\nm108pw:x:1004:\n" > $(ROOTFS)/etc/group
+	@# The four concurrent-passwd accounts. Plaintexts (host:
+	@# `openssl passwd -6 -salt m108cNsalt 'M108concN!'`):
+	@#   m108c0 = M108conc0!   m108c1 = M108conc1!
+	@#   m108c2 = M108conc2!   m108c3 = M108conc3!
+	@printf 'm108c0:$$6$$m108c0salt$$HuyPuTI9qFa/FoKggrJeCwtFkHsDDJlaoFORwM3kqCOFoGZc95vIxua/wd6tNJcFpVnh72HFmSPBF8.dxCdMe0:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf 'm108c1:$$6$$m108c1salt$$V7SApmUI/.YLU4jynPO7G0q4cD6Vfy2RXg.lKfo7M4ME8Xh5WJ1Zr0R1YuU.dyIZA.DHfHFJzj.aqXlb9JN5I0:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf 'm108c2:$$6$$m108c2salt$$yeLeTxwP6LfUNDPRWwuqy4bN1qaSxaFIBljpDoNwzqgBiBfxzuWgL2dF9dtUjKqxFDG.wZIp1w1uQqOcyeByN/:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf 'm108c3:$$6$$m108c3salt$$k3HI/VMOXhcyVakp9WNAJfC0k9a1FvB2LdRLDC64bMRgkeQkSnxa.MF0p/ZCY/4tUzpNeM5Ecd6uyn6ngxCB.1:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\npamtest:x:1001:pamtest\nm108user:x:1002:\nm108peer:x:1003:\nm108pw:x:1004:\nm108c0:x:1010:\nm108c1:x:1011:\nm108c2:x:1012:\nm108c3:x:1013:\n" > $(ROOTFS)/etc/group
 	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/bin/m108shell\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
 	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/zsh/bpkg-smoke.sh,
 	@# sshd init.d, bb-w6/bb-w2b fixtures — real files (not embedded kernel C

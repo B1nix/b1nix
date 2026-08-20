@@ -1038,6 +1038,147 @@ static int test_curl_ipv6(void) {
 
 
 
+
+
+/* The control for the keepalive check: the same idle wait on a connection with
+ * keepalive OFF. If this one also loses the connection, the probes are
+ * innocent and something else drops idle connections — which is a much bigger
+ * bug, and the two markers tell them apart. */
+static int test_idle_connection(void) {
+  unsigned short port = 3402;
+  int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (lfd < 0 || fd < 0) { fail("idle-connection"); return -1; }
+  int reuse = 1;
+  setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  struct sockaddr_in a;
+  make_loopback_addr(port, &a);
+  if (bind(lfd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(lfd, 1) < 0) {
+    fail("idle-connection"); close(fd); close(lfd); return -1;
+  }
+  if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+    fail("idle-connection"); close(fd); close(lfd); return -1;
+  }
+  int sfd = accept(lfd, 0, 0);
+  if (sfd < 0) { fail("idle-connection"); close(fd); close(lfd); return -1; }
+
+  sleep(5);
+
+  const char *msg = "idle-still-here";
+  if (send(fd, msg, strlen(msg), 0) < 0) {
+    fail("idle-connection");
+    close(sfd); close(fd); close(lfd); return -1;
+  }
+  char buf[64];
+  int n = recv_with_retry(sfd, buf, sizeof(buf) - 1);
+  if (n <= 0) {
+    fail("idle-connection");
+    close(sfd); close(fd); close(lfd); return -1;
+  }
+  buf[n] = '\0';
+  if (strcmp(buf, msg) != 0) {
+    fail("idle-connection");
+    close(sfd); close(fd); close(lfd); return -1;
+  }
+  ok("idle-connection");
+  close(sfd); close(fd); close(lfd);
+  return 0;
+}
+
+/* Keepalive: the options, and the probes they turn on.
+ *
+ * Setting a value is the easy half. The half that matters is that the probe
+ * b1nix sends is a segment the peer accepts: a keepalive carries a sequence
+ * number one behind the next byte, and getting that wrong earns an RST that
+ * kills the connection instead of confirming it. So the check sets a one
+ * second idle time with a one second interval, leaves an established loopback
+ * connection alone for long enough for several probes to go out and be
+ * answered, and then requires the connection to still carry data. */
+static int test_tcp_keepalive(void) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) { fail("keepalive-create"); return -1; }
+
+  int v = 0;
+  socklen_t vlen = sizeof(v);
+  if (getsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &v, &vlen) != 0 || v != 7200) {
+    fail("keepalive-defaults"); close(fd); return -1;
+  }
+  v = 0; vlen = sizeof(v);
+  if (getsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &v, &vlen) != 0 || v != 9) {
+    fail("keepalive-defaults"); close(fd); return -1;
+  }
+  ok("keepalive-defaults");
+
+  int zero = 0;
+  if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &zero, sizeof(zero)) == 0) {
+    fail("keepalive-rejects-zero"); close(fd); return -1;
+  }
+  ok("keepalive-rejects-zero");
+
+  int one = 1;
+  if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &one, sizeof(one)) != 0 ||
+      setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &one, sizeof(one)) != 0) {
+    fail("keepalive-set"); close(fd); return -1;
+  }
+  int cnt = 8;
+  if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt)) != 0) {
+    fail("keepalive-set"); close(fd); return -1;
+  }
+  v = 0; vlen = sizeof(v);
+  if (getsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &v, &vlen) != 0 || v != 1) {
+    fail("keepalive-set"); close(fd); return -1;
+  }
+  ok("keepalive-set");
+  if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) != 0) {
+    fail("keepalive-set"); close(fd); return -1;
+  }
+
+  unsigned short port = 3401;
+  int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (lfd < 0) { fail("keepalive-live"); close(fd); return -1; }
+  int reuse = 1;
+  setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  struct sockaddr_in a;
+  make_loopback_addr(port, &a);
+  if (bind(lfd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(lfd, 1) < 0) {
+    fail("keepalive-live"); close(fd); close(lfd); return -1;
+  }
+  if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+    fail("keepalive-live"); close(fd); close(lfd); return -1;
+  }
+  int sfd = accept(lfd, 0, 0);
+  if (sfd < 0) { fail("keepalive-live"); close(fd); close(lfd); return -1; }
+
+  /* Idle for long enough that several probes are due. */
+  sleep(5);
+
+  const char *msg = "keepalive-still-here";
+  if (send(fd, msg, strlen(msg), 0) < 0) {
+    fail("keepalive-live"); close(sfd); close(fd); close(lfd); return -1;
+  }
+  char buf[64];
+  int n = recv_with_retry(sfd, buf, sizeof(buf) - 1);
+  if (n <= 0) { fail("keepalive-live"); close(sfd); close(fd); close(lfd); return -1; }
+  buf[n] = '\0';
+  if (strcmp(buf, msg) != 0) {
+    fail("keepalive-live"); close(sfd); close(fd); close(lfd); return -1;
+  }
+  ok("keepalive-live");
+
+  close(sfd); close(fd); close(lfd);
+
+  /* A datagram socket has no keepalive to configure. */
+  int ufd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (ufd >= 0) {
+    if (setsockopt(ufd, IPPROTO_TCP, TCP_KEEPIDLE, &one, sizeof(one)) == 0) {
+      fail("keepalive-udp-refused"); close(ufd); return -1;
+    }
+    ok("keepalive-udp-refused");
+    close(ufd);
+  }
+  return 0;
+}
+
 /* M32b: socket option / address / shutdown API hardening. */
 static int test_socket_options(void) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1856,6 +1997,8 @@ int main(int argc, char **argv) {
   if (test_crypto() != 0)              return 1;
   if (test_dropbear_keygen() != 0)     return 1;
   if (test_socket_options() != 0)      return 1;
+  if (test_idle_connection() != 0)     return 1;
+  if (test_tcp_keepalive() != 0)       return 1;
   test_external_net();
   if (test_getnameinfo() != 0)         return 1;
   if (test_v4mapped_udp() != 0)        return 1;

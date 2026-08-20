@@ -34,6 +34,16 @@
  *   passwd-pam-rejects-old  and rejects the one it replaced.
  *   su-accepts-passwd-hash  and BusyBox `su` authenticates that same new
  *                    password — the round trip closes in both directions.
+ *   shadow-concurrent-passwd  four `passwd` processes released at the same
+ *                    instant, on four different accounts, all land in
+ *                    /etc/shadow: no update is lost, no bystander's hash
+ *                    moves, and neither database ends up with a duplicated or
+ *                    truncated record.
+ *   shadow-lock-excl  the two primitives that serialisation rests on, checked
+ *                    without the applet: open(O_CREAT|O_EXCL) admits exactly
+ *                    one racer per round, and fcntl(F_SETLK, F_WRLCK) really
+ *                    locks — EAGAIN for a second writer, F_GETLK naming the
+ *                    holder, release when that holder dies.
  *
  * `m108_smoke initcheck` mode (runs on the init instance, from /etc/inittab,
  * where PID 1 is /sbin/init — the BusyBox multicall ELF, and the kernel's
@@ -65,6 +75,7 @@
 #define _GNU_SOURCE
 #endif
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <signal.h>
@@ -508,6 +519,521 @@ static void check_passwd(void)
 	}
 }
 
+/* ── phase 5: several password changes at once ───────────────────────────
+ * Every BusyBox applet that edits an account database — passwd, chpasswd,
+ * adduser, deluser, addgroup — goes through libbb's update_passwd(), which
+ * serialises writers by creating "<file>+" with O_CREAT|O_EXCL and rewrites the
+ * file underneath it: copy every line to "<file>+", then rename() it over the
+ * original. Two things have to hold for that to be safe, and both are checked
+ * here rather than assumed:
+ *
+ *   shadow-concurrent-passwd  four real `passwd` processes, released together
+ *                    and changing four DIFFERENT accounts, all succeed, and
+ *                    afterwards every one of the four hashes has moved and is a
+ *                    "$6$" SHA-512 crypt string, every account that was in the
+ *                    file beforehand is still there with the hash it had, and
+ *                    neither /etc/shadow nor /etc/passwd has a duplicated or
+ *                    truncated record. A lost update — a writer copying out a
+ *                    snapshot it took before another writer's rename — shows up
+ *                    here as an unchanged hash even though that passwd exited 0.
+ *   shadow-lock-excl  the primitives underneath, without the applet:
+ *                    open(O_CREAT|O_EXCL) picks exactly one winner in every one
+ *                    of many rounds, and fcntl(F_SETLK, F_WRLCK) is a real lock
+ *                    — it turns a second writer away with EAGAIN, F_GETLK names
+ *                    the process holding it, and it is released when that
+ *                    process dies without ever having unlocked.
+ */
+#define CONC_N 4
+
+static const char *const conc_user[CONC_N] = {
+	"m108c0", "m108c1", "m108c2", "m108c3"
+};
+static const char *const conc_pass[CONC_N] = {
+	"M108conc0!", "M108conc1!", "M108conc2!", "M108conc3!"
+};
+
+/* Accounts whose hash must be exactly what it was after the storm. m108pw is
+ * deliberately not in this list: check_passwd() above rewrites it. */
+static const char *const conc_bystander[] = {
+	"root", "user", "pamtest", USER_CALLER, USER_PEER
+};
+#define CONC_BYSTANDERS (sizeof(conc_bystander) / sizeof(conc_bystander[0]))
+
+/* Every account that must still be listed in both databases afterwards. */
+static const char *const conc_present[] = {
+	"root", "user", "pamtest", USER_CALLER, USER_PEER, USER_PW,
+	"m108c0", "m108c1", "m108c2", "m108c3"
+};
+#define CONC_PRESENT (sizeof(conc_present) / sizeof(conc_present[0]))
+
+/* Structural check of a colon-separated account database. Every non-empty line
+ * must carry at least `min_colons` separators — a half-written record does not —
+ * and must start with a name; no name may appear twice, which is what a merge of
+ * two versions of the file leaves behind; and every name in `want` must still be
+ * listed. Returns NULL when the file is intact, else a short reason. It
+ * deliberately says nothing about any field's contents: this runs on /etc/shadow
+ * and must never put a hash on the console. */
+static const char *db_is_intact(const char *path, int min_colons,
+                                const char *const *want, size_t nwant)
+{
+	FILE *f;
+	char line[1024];
+	static char names[64][64];
+	size_t nnames = 0;
+	size_t i, j;
+	const char *why = NULL;
+
+	f = fopen(path, "r");
+	if (f == NULL)
+		return "a database file is gone";
+	while (fgets(line, sizeof(line), f) != NULL) {
+		const char *p;
+		int colons = 0;
+		size_t nlen;
+
+		line[strcspn(line, "\r\n")] = '\0';
+		if (line[0] == '\0')
+			continue;
+		for (p = line; *p != '\0'; p++)
+			if (*p == ':')
+				colons++;
+		if (colons < min_colons) {
+			why = "a record is truncated";
+			break;
+		}
+		nlen = strcspn(line, ":");
+		if (nlen == 0 || nlen >= sizeof(names[0])) {
+			why = "a record has no usable name";
+			break;
+		}
+		if (nnames >= sizeof(names) / sizeof(names[0])) {
+			why = "more records than this check can hold";
+			break;
+		}
+		memcpy(names[nnames], line, nlen);
+		names[nnames][nlen] = '\0';
+		nnames++;
+	}
+	fclose(f);
+	if (why != NULL)
+		return why;
+
+	for (i = 0; i < nnames; i++)
+		for (j = i + 1; j < nnames; j++)
+			if (strcmp(names[i], names[j]) == 0)
+				return "a record is duplicated";
+
+	for (i = 0; i < nwant; i++) {
+		for (j = 0; j < nnames; j++)
+			if (strcmp(want[i], names[j]) == 0)
+				break;
+		if (j == nnames)
+			return "a record was lost";
+	}
+	return NULL;
+}
+
+/* One of the concurrent writers. Does not return: it becomes `passwd <user>`
+ * with the new password typed twice on a pipe, but only once `gate` reports
+ * EOF — so every writer leaves the starting line at the same moment and the
+ * rewrites really overlap. */
+static void conc_passwd_child(int gate, const char *user, const char *password)
+{
+	char text[128];
+	size_t len;
+	char c;
+	int p[2];
+	char *argv[3];
+
+	argv[0] = (char *)"/bin/passwd";
+	argv[1] = (char *)user;
+	argv[2] = NULL;
+
+	snprintf(text, sizeof(text), "%s\n%s\n", password, password);
+	len = strlen(text);
+	if (pipe(p) != 0)
+		_exit(120);
+	/* Both prompts are queued before the gate opens, and the write end is
+	 * closed straight away: nothing this process does after the race can
+	 * stall on a pipe, and passwd sees a clean EOF after the second line. */
+	if (write(p[1], text, len) != (ssize_t)len)
+		_exit(121);
+	close(p[1]);
+
+	while (read(gate, &c, 1) > 0)
+		;
+	close(gate);
+
+	if (dup2(p[0], STDIN_FILENO) < 0)
+		_exit(122);
+	close(p[0]);
+	execv(argv[0], argv);
+	_exit(127);
+}
+
+static void check_shadow_concurrent(void)
+{
+	char before[CONC_N][256];
+	char bystand[CONC_BYSTANDERS][256];
+	char now[256];
+	pid_t kid[CONC_N];
+	int gate[2];
+	const char *why;
+	size_t b;
+	int i, started = 0, bad = 0;
+
+	for (i = 0; i < CONC_N; i++) {
+		if (shadow_hash(conc_user[i], before[i], sizeof(before[i])) != 0) {
+			fail("shadow-concurrent-passwd",
+			     "a test account has no /etc/shadow entry");
+			return;
+		}
+	}
+	for (b = 0; b < CONC_BYSTANDERS; b++) {
+		if (shadow_hash(conc_bystander[b], bystand[b],
+		                sizeof(bystand[b])) != 0) {
+			fail("shadow-concurrent-passwd",
+			     "a bystander account has no /etc/shadow entry");
+			return;
+		}
+	}
+
+	if (pipe(gate) != 0) {
+		fail("shadow-concurrent-passwd", "pipe failed");
+		return;
+	}
+	for (i = 0; i < CONC_N; i++) {
+		kid[i] = fork();
+		if (kid[i] < 0)
+			break;
+		if (kid[i] == 0) {
+			close(gate[1]);
+			conc_passwd_child(gate[0], conc_user[i], conc_pass[i]);
+		}
+		started++;
+	}
+	/* This is the last write end; closing it is the starting gun. */
+	close(gate[1]);
+	close(gate[0]);
+
+	for (i = 0; i < started; i++) {
+		int status = -1;
+		if (waitpid(kid[i], &status, 0) != kid[i] || !exited_zero(status))
+			bad = 1;
+	}
+	if (started != CONC_N) {
+		fail("shadow-concurrent-passwd", "could not start all writers");
+		return;
+	}
+	if (bad) {
+		fail("shadow-concurrent-passwd",
+		     "a concurrent passwd exited non-zero");
+		return;
+	}
+
+	/* Everything below is read back out of the files: what the applets said
+	 * about themselves does not enter into it. */
+	for (i = 0; i < CONC_N; i++) {
+		if (shadow_hash(conc_user[i], now, sizeof(now)) != 0) {
+			fail("shadow-concurrent-passwd",
+			     "a rewritten account is no longer in /etc/shadow");
+			return;
+		}
+		if (strcmp(now, before[i]) == 0) {
+			fail("shadow-concurrent-passwd",
+			     "an update was lost: a hash never changed");
+			return;
+		}
+		if (strncmp(now, "$6$", 3) != 0) {
+			fail("shadow-concurrent-passwd",
+			     "a rewritten hash is not a SHA-512 crypt string");
+			return;
+		}
+	}
+	for (b = 0; b < CONC_BYSTANDERS; b++) {
+		if (shadow_hash(conc_bystander[b], now, sizeof(now)) != 0) {
+			fail("shadow-concurrent-passwd",
+			     "a bystander account is no longer in /etc/shadow");
+			return;
+		}
+		if (strcmp(now, bystand[b]) != 0) {
+			fail("shadow-concurrent-passwd",
+			     "a bystander account's hash changed");
+			return;
+		}
+	}
+
+	/* passwd rewrites /etc/passwd as well as /etc/shadow, so both files went
+	 * through the same four-way race and both are checked. */
+	why = db_is_intact("/etc/shadow", 8, conc_present, CONC_PRESENT);
+	if (why == NULL)
+		why = db_is_intact("/etc/passwd", 6, conc_present, CONC_PRESENT);
+	if (why != NULL) {
+		fail("shadow-concurrent-passwd", why);
+		return;
+	}
+	ok("shadow-concurrent-passwd");
+}
+
+/* ── the primitives underneath, on their own ─────────────────────────────── */
+
+/* Same directory and same filesystem as the file the applets lock, so this is
+ * the O_EXCL path they really take. Removed again when the check is done. */
+#define EXCL_PATH   "/etc/shadow.lock"
+#define EXCL_ROUNDS 200
+#define LOCKF_PATH  "/tmp/m108-shadow-lock.dat"
+
+/* 1 = created it, 0 = someone else already had, -1 = anything else. */
+static int excl_try(void)
+{
+	int fd = open(EXCL_PATH, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+	if (fd >= 0) {
+		close(fd);
+		return 1;
+	}
+	return (errno == EEXIST) ? 0 : -1;
+}
+
+static void excl_child(int gate, int result_fd)
+{
+	char c;
+	char verdict;
+
+	while (read(gate, &c, 1) > 0)
+		;
+	close(gate);
+	switch (excl_try()) {
+	case 1:  verdict = 'w'; break;
+	case 0:  verdict = 'e'; break;
+	default: verdict = '?'; break;
+	}
+	(void)!write(result_fd, &verdict, 1);
+	close(result_fd);
+	_exit(0);
+}
+
+static const char *check_excl_rounds(void)
+{
+	int round;
+
+	for (round = 0; round < EXCL_ROUNDS; round++) {
+		/* Odd rounds race this process against one child; even rounds
+		 * race two children against each other. The two shapes reach
+		 * the open() with very different timings, and neither of them
+		 * may ever produce two winners. */
+		int parent_races = round & 1;
+		int nkids = parent_races ? 1 : 2;
+		int gate[2], res[2];
+		pid_t kid[2];
+		int wins = 0, taken = 0, k, started = 0;
+		const char *why = NULL;
+
+		if (unlink(EXCL_PATH) != 0 && errno != ENOENT)
+			return "cannot clear the lock file between rounds";
+		if (pipe(gate) != 0)
+			return "pipe failed";
+		if (pipe(res) != 0) {
+			close(gate[0]);
+			close(gate[1]);
+			return "pipe failed";
+		}
+		for (k = 0; k < nkids; k++) {
+			kid[k] = fork();
+			if (kid[k] < 0)
+				break;
+			if (kid[k] == 0) {
+				close(gate[1]);
+				close(res[0]);
+				excl_child(gate[0], res[1]);
+			}
+			started++;
+		}
+		close(gate[0]);
+		close(res[1]);
+		close(gate[1]); /* release every racer at once */
+
+		if (parent_races && started == nkids) {
+			switch (excl_try()) {
+			case 1:  wins++; break;
+			case 0:  taken++; break;
+			default:
+				why = "open(O_EXCL) failed with an unexpected error";
+				break;
+			}
+		}
+		for (k = 0; k < started; k++) {
+			char verdict = '?';
+			if (read(res[0], &verdict, 1) != 1) {
+				if (why == NULL)
+					why = "a racer reported nothing";
+			} else if (verdict == 'w') {
+				wins++;
+			} else if (verdict == 'e') {
+				taken++;
+			} else if (why == NULL) {
+				why = "open(O_EXCL) failed with an unexpected error";
+			}
+		}
+		close(res[0]);
+		for (k = 0; k < started; k++)
+			waitpid(kid[k], NULL, 0);
+
+		if (started != nkids)
+			return "fork failed";
+		if (why != NULL)
+			return why;
+		if (wins != 1)
+			return (wins == 0) ? "no racer created the lock file"
+			                   : "two racers created the same lock file";
+		if (taken != 1)
+			return "a racer neither won nor saw EEXIST";
+		if (access(EXCL_PATH, F_OK) != 0)
+			return "the winner's lock file does not exist";
+	}
+	unlink(EXCL_PATH);
+	return NULL;
+}
+
+static int setlk(int fd, int cmd, short type)
+{
+	struct flock fl;
+
+	memset(&fl, 0, sizeof(fl));
+	fl.l_type = type;
+	fl.l_whence = SEEK_SET;
+	fl.l_start = 0;
+	fl.l_len = 0; /* whole file — exactly what update_passwd() asks for */
+	return fcntl(fd, cmd, &fl);
+}
+
+static const char *check_record_lock(void)
+{
+	static const char payload[] = "m108-record-lock\n";
+	const char *why = NULL;
+	int fd = -1, held[2] = { -1, -1 }, go[2] = { -1, -1 };
+	pid_t kid = -1;
+	struct flock probe;
+	char c;
+	int status = -1, rc;
+
+	fd = open(LOCKF_PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return "cannot create the scratch file";
+	if (write(fd, payload, sizeof(payload) - 1) !=
+	    (ssize_t)(sizeof(payload) - 1)) {
+		why = "cannot write the scratch file";
+		goto out;
+	}
+	if (pipe(held) != 0 || pipe(go) != 0) {
+		why = "pipe failed";
+		goto out;
+	}
+
+	kid = fork();
+	if (kid < 0) {
+		why = "fork failed";
+		goto out;
+	}
+	if (kid == 0) {
+		char verdict;
+
+		close(held[0]);
+		close(go[1]);
+		verdict = (setlk(fd, F_SETLK, F_WRLCK) == 0) ? 'y' : 'n';
+		(void)!write(held[1], &verdict, 1);
+		/* Hold the lock until the parent has finished probing, then exit
+		 * WITHOUT unlocking: the release has to come from process
+		 * teardown, which is the only thing that frees a database from a
+		 * writer that died mid-rewrite. */
+		while (read(go[0], &c, 1) > 0)
+			;
+		_exit(0);
+	}
+	close(held[1]);
+	held[1] = -1;
+	close(go[0]);
+	go[0] = -1;
+
+	if (read(held[0], &c, 1) != 1 || c != 'y') {
+		why = "the child could not take a write lock";
+		goto out;
+	}
+
+	errno = 0;
+	rc = setlk(fd, F_SETLK, F_WRLCK);
+	if (rc != -1 || (errno != EAGAIN && errno != EACCES)) {
+		why = "a held write lock did not block a second F_SETLK";
+		goto out;
+	}
+
+	memset(&probe, 0, sizeof(probe));
+	probe.l_type = F_WRLCK;
+	probe.l_whence = SEEK_SET;
+	probe.l_start = 0;
+	probe.l_len = 0;
+	if (fcntl(fd, F_GETLK, &probe) != 0) {
+		why = "F_GETLK failed";
+		goto out;
+	}
+	if (probe.l_type == F_UNLCK) {
+		why = "F_GETLK reported no holder for a locked range";
+		goto out;
+	}
+	if (probe.l_pid != (int)kid) {
+		why = "F_GETLK named the wrong holder";
+		goto out;
+	}
+
+	close(go[1]); /* the child exits, still holding the lock */
+	go[1] = -1;
+	if (waitpid(kid, &status, 0) != kid || !exited_zero(status)) {
+		kid = -1;
+		why = "the lock holder did not exit cleanly";
+		goto out;
+	}
+	kid = -1;
+
+	if (setlk(fd, F_SETLK, F_WRLCK) != 0) {
+		why = "the lock outlived the process that held it";
+		goto out;
+	}
+	setlk(fd, F_SETLK, F_UNLCK);
+
+out:
+	if (kid > 0) {
+		if (go[1] >= 0) {
+			close(go[1]);
+			go[1] = -1;
+		}
+		waitpid(kid, NULL, 0);
+	}
+	if (fd >= 0)
+		close(fd);
+	if (held[0] >= 0)
+		close(held[0]);
+	if (held[1] >= 0)
+		close(held[1]);
+	if (go[0] >= 0)
+		close(go[0]);
+	if (go[1] >= 0)
+		close(go[1]);
+	unlink(LOCKF_PATH);
+	return why;
+}
+
+static void check_shadow_lock_primitives(void)
+{
+	const char *why = check_excl_rounds();
+
+	if (why == NULL)
+		why = check_record_lock();
+	if (why != NULL)
+		fail("shadow-lock-excl", why);
+	else
+		ok("shadow-lock-excl");
+}
+
 /* ── initcheck mode: BusyBox init as PID 1 ──────────────────────────── */
 
 /* /proc/1/cmdline is NUL-separated; return its argv[0]. */
@@ -790,6 +1316,8 @@ int main(int argc, char **argv)
 	check_su_uid_and_shell();
 	check_su_password();
 	check_passwd();
+	check_shadow_concurrent();
+	check_shadow_lock_primitives();
 	emit("M108-SMOKE: done\n");
 	return failures != 0;
 }

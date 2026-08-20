@@ -371,6 +371,94 @@ static void test_rusage_children(void) {
  * cminflt majflt cmajflt utime stime ... — fields are 1-based, so utime is 14,
  * stime 15 and num_threads 20. The comm field is parenthesised and may contain
  * spaces, so parsing starts after the last ')'. */
+
+/* The width of the line, not just its contents.
+ *
+ * A reader that wants field 23 counts tokens; b1nix printed 24 of the 52
+ * fields Linux does, and printed FOUR for a task that had already exited
+ * ("<pid> (gone) Z 0"). Chromium reads a field by index, checks the count, and
+ * traps when the line is short — and its crash handler walks every thread of
+ * the process, so a thread that died mid-walk hit the short line and brought
+ * the browser down, repeatedly. Both widths are checked here: a live task and
+ * one that has just exited but not yet been reaped. */
+static int stat_field_count(const char *path) {
+  char buf[1024];
+  int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return -1;
+  long n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0)
+    return -1;
+  buf[n] = 0;
+  char *close_paren = strrchr(buf, ')');
+  if (!close_paren)
+    return -1;
+  int count = 2; /* pid and (comm), which the paren split already accounted for */
+  for (char *tok = strtok(close_paren + 1, " \t\n"); tok;
+       tok = strtok(0, " \t\n"))
+    count++;
+  return count;
+}
+
+static void test_proc_stat_width(void) {
+  int live = stat_field_count("/proc/self/stat");
+  check("proc-stat-width", live == 52, live);
+
+  /* The line for a task that is no longer there.
+   *
+   * The descriptor is opened while the child is alive and read after it has
+   * gone, which is the same sequence a crash handler walks when a thread dies
+   * mid-dump — and the case that used to answer with four fields. Reading
+   * through the open handle avoids depending on how long a pid directory
+   * outlives its task, which is a separate question. */
+  int rep[2];
+  if (pipe(rep) != 0) {
+    fail("proc-stat-width-gone", -1);
+    return;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    fail("proc-stat-width-gone", -1);
+    return;
+  }
+  if (pid == 0) {
+    char c;
+    close(rep[1]);
+    read(rep[0], &c, 1); /* wait until the parent has the file open */
+    _exit(0);
+  }
+  close(rep[0]);
+
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    fail("proc-stat-width-gone", fd);
+    close(rep[1]);
+    waitpid(pid, 0, 0);
+    return;
+  }
+  close(rep[1]); /* release the child */
+  waitpid(pid, 0, 0);
+
+  char buf[1024];
+  long n = pread(fd, buf, sizeof(buf) - 1, 0);
+  close(fd);
+  if (n <= 0) {
+    fail("proc-stat-width-gone", n);
+    return;
+  }
+  buf[n] = 0;
+  char *close_paren = strrchr(buf, ')');
+  int count = 2;
+  if (close_paren)
+    for (char *tok = strtok(close_paren + 1, " \t\n"); tok;
+         tok = strtok(0, " \t\n"))
+      count++;
+  check("proc-stat-width-gone", close_paren && count == 52, count);
+}
+
 static void test_proc_stat_times(void) {
   burn_ms(120);
   struct burner_arg a = {.ms = 200};
@@ -868,6 +956,7 @@ int main(void) {
   test_rusage_and_times();
   test_rusage_children();
   test_proc_stat_times();
+  test_proc_stat_width();
   test_rusage_maxrss();
   test_group_stop_blocked();
 

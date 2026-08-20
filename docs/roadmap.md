@@ -925,15 +925,30 @@ M102a and M102b are two consumers of it rather than two ports.
 
 ## M104: Native Package Manager (`bpkg`)
 
-- [x] `initial` Write `/bin/bpkg` as a plain C ELF with its own inflate, tar and SHA-256.
-- [x] `initial` Read both the house flat index and a real Alpine repository.
-- [x] Resolve dependencies and support update, install, remove, list, search and info.
-- [x] Speak HTTPS (mbedTLS, chain verified against the host-derived CA bundle) and read several repositories from one `INDEX_URL`.
-- [x] Resolve Alpine's virtual dependencies (`so:`/`cmd:`/path) through the index's `p:` provides, with `/etc/bpkg.provided` for what the base image already supplies.
-- [x] Verify a package end to end: RSA/SHA-1 signature against Alpine's keys, then `.PKGINFO`'s `datahash` against the payload. Unsigned over the network is refused.
-- [x] Install and run a real package from the real mirror: `bpkg install neofetch figlet` resolves and installs bash, readline, libncursesw and ncurses-terminfo-base, each signature-checked, and the unmodified Alpine binaries run. See [bpkg](bpkg-package-manager.md).
-- [ ] `planned` Run `.post-install`/`.pre-install` scripts and triggers, and track `/etc/apk/world`.
-- [ ] `partial` Migrate the from-source ports to packages. `tools/packages/alpine-fetch.sh` installs an Alpine package into a build prefix at image-build time, pinned by sha256 in `tools/packages/alpine.lock`. Proven on `zlib`: the port no longer builds anything, and `m53_zlib_smoke` links Alpine's `libz.so.1` dynamically. See [ports migration](ports-migration-plan.md).
+- [x] `/bin/bpkg`: a plain C ELF with its own inflate, tar and SHA-256, reading
+      both the house flat index and real Alpine repositories over HTTPS
+      (mbedTLS, chain verified), with update/install/remove/list/search/info.
+- [x] Resolve Alpine's virtual dependencies (`so:`/`cmd:`/path) through the
+      index's `p:` provides, with `/etc/bpkg.provided` for what the base image
+      already supplies.
+- [x] Verify a package end to end — RSA/SHA-1 signature against Alpine's keys,
+      then `.PKGINFO`'s `datahash` against the payload. Unsigned over the
+      network is refused.
+- [x] Install and run unmodified Alpine binaries from the real mirror:
+      `bpkg install neofetch figlet` pulls bash, readline and ncurses with it.
+      See [bpkg](bpkg-package-manager.md).
+- [x] Control-member scripts, upgrade scripts and triggers, with
+      `/etc/apk/world` tracked; each `BPKG-SMOKE` marker is gated on a side
+      effect the script itself produced.
+- [x] Migrate the from-source ports to packages: 49 of 54 port scripts are
+      gone, replaced by `tools/packages/alpine-ports.map` +
+      `alpine-fetch.sh`, pinned by sha256. See
+      [ports migration](ports-migration-plan.md).
+- [ ] `wontfix` Five ports stay from-source: `musl`, `libcxx-musl` and
+      `busybox` are what the toolchain is built *out of* (a package cannot
+      supply the sysroot it is compiled against), and `openrc`/`rust` are the
+      running system's behaviour rather than build artefacts — Alpine's
+      `openrc` took the boot straight to poweroff and its `runit` is static.
 
 ## M105: PAM (OpenPAM + pam_unix.so)
 
@@ -959,7 +974,12 @@ M102a and M102b are two consumers of it rather than two ports.
 - [x] Give block-backed device nodes `S_IFBLK`, and honour the interface name in `SIOCGIF*`.
 - [x] Administer IPv6 neighbours and interface up/down state for real.
 - [x] Give every `/dev/kmsg` reader its own cursor.
-- [ ] MTD and UBI applets stay unbuilt.
+- [ ] `wontfix` MTD and UBI applets stay unbuilt. They speak the raw-NAND MTD
+      ioctl ABI plus UBI's whole volume layer, and no b1nix target hands the
+      kernel a flash chip — the only flash QEMU's x86_64 machines emulate is
+      the firmware's own `pflash`. A RAM-backed pseudo-chip would only test
+      b1nix against b1nix. M109 keeps MTD among the single-device gaps should a
+      target that has one ever appear.
 
 ## M108: Hand ownership of base tools to BusyBox
 
@@ -971,22 +991,71 @@ M102a and M102b are two consumers of it rather than two ports.
 - [x] Delete three forged init markers from the smoke hook and let the real paths report.
 - [x] Fix `execve` to publish post-exec credentials in the auxv and refresh capabilities and fsuid.
 - [x] Group `userspace/bin` by purpose.
-- [ ] Confirm `/etc/shadow` locking under concurrent password changes.
+- [x] `/etc/shadow` locking under concurrent password changes, confirmed and
+      then fixed: BusyBox `update_passwd` opened the file *before* taking its
+      `<file>+` `O_EXCL` lock, so a losing racer rewrote a stale snapshot over
+      the winner's update — and both exited 0. The read now happens under the
+      lock (`tools/patches/busybox/b1nix-config.sh`). The kernel primitives it
+      rests on were already sound, and are now proved: four simultaneous
+      `passwd` runs all land, and `M108-SMOKE: ok shadow-lock-excl` shows
+      `O_CREAT|O_EXCL` admitting exactly one racer per round and `F_SETLK`
+      blocking, naming and releasing its holder.
 
 ## M109: Alpine applet parity
 
 - [x] Build 283 of Alpine's 321 applets and prove each one through `/bin`.
-- [x] Add `/dev/zero`, `/dev/urandom` and `/dev/random`, unblocking `shred`, `who` and `cpio`.
-- [ ] `planned` Add `AF_PACKET` for the DHCP clients and raw-frame tools.
-- [ ] `planned` Add namespaces for `unshare` and `nsenter`.
-- [ ] `planned` Add `pivot_root(2)` and `switch_root`.
-- [ ] `planned` Add bridge, VLAN, bonding and tunnel devices.
-- [ ] `planned` Add inode attribute flags for `chattr` and `lsattr`.
-- [ ] `planned` Add discard so `fstrim` and `blkdiscard` work.
-- [ ] `planned` Add I/O priorities for `ionice`.
-- [ ] `planned` Add a uevent channel for `mdev`.
-- [ ] `planned` Add filesystem UUID and label probing for `findfs`.
-- [ ] `planned` Add the remaining single-device gaps: CD-ROM, MTD, rfkill, md, nbd, floppy, serial config.
+- [x] `/dev/zero`, `/dev/urandom` and `/dev/random`, unblocking `shred`, `who`
+      and `cpio`.
+- [x] `AF_PACKET` (`kernel/net/packet.c`): SOCK_RAW and SOCK_DGRAM, bound to an
+      interface and/or ethertype, with taps on both the receive and the
+      transmit path so a socket sees its own outgoing frames the way `tcpdump`
+      does. Gated on CAP_NET_RAW.
+- [x] `pivot_root(2)` and `mount(MS_MOVE)`: a move retargets a mount and every
+      mount nested in it, so `umount` and `/proc/mounts` follow the tree, and
+      an initramfs boot hands the machine over to the real root
+      (`switchroot` smoke instance). BusyBox `pivot_root`/`switch_root` built.
+- [x] Filesystem UUID and label probing (`blk_probe_uuid`/`blk_probe_label`) for
+      ext2/3/4, FAT and exFAT, exposed at `/sys/block/<dev>/{uuid,label,fstype}`
+      and used by `root=UUID=`, `findfs` and `blkid`. Readdir now merges a
+      directory's in-memory children over its on-disk entries, so `/dev` lists
+      the nodes those tools scan for.
+- [x] Virtual network devices: 802.1Q VLAN, a learning bridge, active-backup
+      bonding and gretap tunnels (ipip carries no ethernet header, so it does
+      not fit the device model), created by `ip link add` and in /proc/net.
+- [x] Namespaces, all four kinds (`kernel/sched/namespace.c`): UTS, mount, PID
+      and network, through `unshare(2)`, `setns(2)` and `/proc/<pid>/ns/*`.
+      PID is a translation over the kernel's one flat id space — a task created
+      in a namespace is numbered from 1 there and cannot be named from outside
+      it — and translation happens at the syscall boundary, so `struct task`
+      does not grow. As on Linux, `unshare(CLONE_NEWPID)` affects children, and
+      `/proc` reports the namespace it was mounted in.
+- [x] Network namespaces own their interfaces, routes, neighbours and socket
+      bindings; a `veth` pair (`kernel/net/veth.c`, `ip link add ... type veth
+      peer name ...`) plus `ip link set <dev> netns <pid>` is how a frame
+      crosses between them. See [namespaces](namespaces.md).
+- [ ] `planned` A namespace has no private IPv4 configuration: `kernel/net/net.c`
+      holds one `local_ip`/`gateway_ip`/`netmask` and `ipv4_send_tx` stamps every
+      packet's source from it, so IP inside a namespace needs that state made
+      per-namespace first. Until then a namespaced interface carries frames
+      (AF_PACKET, veth) but not addresses.
+- [x] A uevent channel for `mdev` (`kernel/dev/uevent.c`): `NETLINK_KOBJECT_UEVENT`
+      messages on device registration and removal, and a `/sys/dev/block` tree
+      carrying `dev`/`uevent`, so `mdev -s` populates `/dev` and `mdev -d`
+      maintains it against a device that appears after boot.
+- [x] Inode attribute flags for `chattr`/`lsattr`: `FS_IOC_GET/SETFLAGS` over
+      ext4's on-disk `i_flags`, with immutable and append-only enforced in the
+      write, truncate, rename and unlink paths (the other six are stored only).
+- [x] Discard for `blkdiscard` and `fstrim`: `BLKDISCARD`/`BLKZEROOUT` down to
+      virtio-blk DISCARD, NVMe DSM Deallocate and ATA TRIM, plus a `FITRIM` walk
+      of a mounted ext4's free bitmaps. No command on the device, no pretending:
+      `EOPNOTSUPP`, never a software fallback that writes the I/O it saves.
+- [x] I/O priorities for `ionice`: `ioprio_set`/`ioprio_get` drive the block
+      layer's admission gate, which hands a busy device to the best-priority
+      waiter and ages waiters so no class starves another.
+- [x] The single-device gaps, triaged: serial configuration is real (termios
+      baud/parity/stop bits on the 16550, `TIOCM*`, `TIOCGSERIAL`). `wontfix` —
+      CD-ROM and MTD (no ATAPI packet path, no flash device), rfkill (no radio),
+      md, nbd and floppy (no RAID layer, no network block device, no controller).
 - [ ] `wontfix` `i2ctransfer` needs raw I2C an SMBus controller cannot issue.
 
 ## M110: Unix block-device names
@@ -1008,7 +1077,10 @@ M102a and M102b are two consumers of it rather than two ports.
       devices carry a bus, the live-ISO path finds the boot medium by mounting
       candidates and looking for the boot image, and swap asks for "the second
       ATA disk" rather than for `sdb`.
-- [ ] `planned` Fix the live-USB root switch: `loop_register_file()` registers a
-      second block device named `loop0` beside the empty one `loop_init()`
-      already made, so the mount picks up the empty one and the boot falls back
-      to `ram0`. Medium selection is covered by `tests/liveusb.sh`.
+- [x] Fix the live-USB root switch: `loop_register_file()` registered a *second*
+      block device named `loop0` beside the empty one `loop_init()` had already
+      made, so `blk_get("loop0")` returned the unassociated one and the boot
+      fell back to `ram0`. It now binds the backing file into the first free
+      pre-registered loop slot — the device the mount finds is the one carrying
+      the file — and returns it, so the caller names it rather than assuming
+      `loop0`. Covered by `tests/liveusb.sh`.

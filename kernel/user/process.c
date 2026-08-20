@@ -1442,8 +1442,26 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   return 0;
 }
 
+/* How long tearing an address space down actually takes, and how much of it
+ * there was. A process exit that takes minutes is invisible from outside — the
+ * shell simply does not come back — so the cost is reported where it is paid.
+ * `b1nix.trace-teardown`. */
 void user_address_space_cleanup(struct task *t) {
   if (!t) return;
+
+  extern int bootinfo_has_flag(const char *flag);
+  /* Cycles, not ticks: teardown runs with interrupts off in places, so the
+   * tick counter stands still and reports every teardown as instant. */
+  u64 td_t0;
+
+  __asm__ volatile("rdtsc" : "=A"(td_t0));
+  {
+    u32 lo, hi;
+
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    td_t0 = ((u64)hi << 32) | lo;
+  }
+  u64 td_pages = 0, td_vmas = 0;
 
   /* Release this task's shm bookkeeping (shm_nattch + per-process attach slot)
    * before we unmap its VMAs. This is the single teardown chokepoint for every
@@ -1471,8 +1489,16 @@ void user_address_space_cleanup(struct task *t) {
     struct vm_area *next = vma->next;
 
     /* FIX: Unmap actual physical hardware frames to prevent memory leaks */
-    for (u64 v = vma->start; v < vma->end; v += PAGE_SIZE) {
-      paging_unmap_page_from_space(t->pml4_phys, v);
+    {
+      /* One lock acquisition for the whole mapping, not one per page. */
+      extern void paging_unmap_range_from_space(u64 pml4_phys, u64 base,
+                                                usize npages);
+
+      usize np = (usize)((vma->end - vma->start) / PAGE_SIZE);
+
+      td_pages += np;
+      td_vmas++;
+      paging_unmap_range_from_space(t->pml4_phys, vma->start, np);
     }
 
     if (vma->node) {
@@ -1493,6 +1519,21 @@ void user_address_space_cleanup(struct task *t) {
    * much more expensive and still need the same cross-CPU guarantee. */
   extern void tlb_shootdown_all(void);
   tlb_shootdown_all();
+
+  if (bootinfo_has_flag("b1nix.trace-teardown")) {
+    console_write("teardown: pid=");
+    console_write_dec(t->id);
+    console_write(" vmas=");
+    console_write_dec(td_vmas);
+    console_write(" pages=");
+    console_write_dec(td_pages);
+    u32 lo1, hi1;
+
+    __asm__ volatile("rdtsc" : "=a"(lo1), "=d"(hi1));
+    console_write(" kcycles=");
+    console_write_dec((((u64)hi1 << 32) | lo1) - td_t0) ;
+    console_write("\n");
+  }
 }
 
 static int user_run_elf_image(struct user_loaded_image *image) {

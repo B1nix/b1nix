@@ -450,10 +450,24 @@ Per the task's own ground rules, restated as a concrete checklist per port
 4. Only then: delete that port's `tools/ports/build-*.sh` and remove its
    `local`-mode fallback in `install-ports.sh`.
 
-Nothing in this pass reached step 3 for any real port (see
-`docs/bpkg-package-manager.md` for exactly what stopped short and why —
-mainly: a full ISO/QEMU cycle needs a from-scratch toolchain build this
-environment didn't have time for). The zlib PoC above reached step 2 for a
-real artifact. That is the honest state of part 2 of this task: a concrete,
-ordered plan plus a verified-as-far-as-time-allowed proof of the mechanism,
-not a completed migration.
+## Where it actually stands
+
+The migration is done, and it took the cheaper route this document argued for
+later on: rather than publishing b1nix's own packages, the image installs
+Alpine's. `tools/packages/alpine-ports.map` names, per old port, the Alpine
+packages that replaced it; `tools/packages/alpine-fetch.sh` fetches each into a
+build prefix at image-build time, pinned by sha256 in
+`tools/packages/alpine.lock`. 49 of the original 54 `tools/ports/build-*.sh`
+scripts are gone, and every wave cleared step 3 — a full `tests/smoke.sh` run
+with the same marker set — before its script was deleted.
+
+Five stay from-source, deliberately, and are marked `wontfix` on the roadmap:
+
+- `musl`, `libcxx-musl` — what the toolchain is built out of. A package cannot
+  supply the sysroot it is itself compiled against.
+- `busybox` — configured from this tree's applet manifest, which is the whole
+  point of `tools/configs/applet-manifest.conf`.
+- `openrc` — Alpine's brings its own `/lib/rc`, `/etc/init.d` and runlevels,
+  which replaced the image's and took the boot straight to poweroff. Alpine's
+  `runit` is statically linked, which `tools/check-dynamic.sh` rejects outright.
+- `rust` — staged as a toolchain, like LLVM and clang, not as an image package.

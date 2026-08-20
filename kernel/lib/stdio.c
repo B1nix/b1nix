@@ -37,13 +37,23 @@ static void print_dec_to(char *tmp, int *len, u64 value)
 	tmp[(*len)++] = '0' + (value % 10);
 }
 
-static void print_hex_to(char *tmp, int *len, u64 value)
+/* %x and %X differ only in case, and the difference is load-bearing: the
+ * /proc files this kernel writes with %X — /proc/net/route, /proc/net/tcp,
+ * /proc/net/ipv6_route — are uppercase on Linux, and anything that string
+ * matches them (rather than parsing with a case-insensitive %x) reads a
+ * lowercase kernel as having no such route at all. */
+static void print_hex_case_to(char *tmp, int *len, u64 value, int upper)
 {
-	const char *hex = "0123456789abcdef";
+	const char *hex = upper ? "0123456789ABCDEF" : "0123456789abcdef";
 	if (value >= 16) {
-		print_hex_to(tmp, len, value / 16);
+		print_hex_case_to(tmp, len, value / 16, upper);
 	}
 	tmp[(*len)++] = hex[value % 16];
+}
+
+static void print_hex_to(char *tmp, int *len, u64 value)
+{
+	print_hex_case_to(tmp, len, value, 0);
 }
 
 static void append_char(char *str, size_t size, int *pos, char ch)
@@ -134,7 +144,8 @@ static int vsnprintf_impl(char *str, size_t size, const char *fmt, va_list args)
 		case 'X': {
 			char tmp[32];
 			int len = 0;
-			print_hex_to(tmp, &len, va_arg(args, unsigned int));
+			print_hex_case_to(tmp, &len, va_arg(args, unsigned int),
+			                  fmt[i] == 'X');
 			append_number(str, size, &pos, tmp, len, 0, width, zero_pad);
 			break;
 		}
@@ -283,7 +294,8 @@ static int vsnprintf_impl(char *str, size_t size, const char *fmt, va_list args)
 			case 'X': {
 				char tmp[32];
 				int len = 0;
-				print_hex_to(tmp, &len, va_arg(args, unsigned long));
+				print_hex_case_to(tmp, &len, va_arg(args, unsigned long),
+				                  fmt[i] == 'X');
 				append_number(str, size, &pos, tmp, len, 0, width, zero_pad);
 				break;
 			}

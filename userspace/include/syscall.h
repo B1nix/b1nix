@@ -235,6 +235,15 @@ enum {
   /* --- M104: growing a mapping in place. musl's realloc reaches for this on
      every large block, so a libc without it cannot grow one. --- */
   SYS_MREMAP           = 248, /* mremap(old, old_len, new_len, flags, new_addr) */
+
+  /* --- M109: what an initramfs does last. switch_root drives this.
+     249-256 (robust lists, the sched_* family) exist in the kernel header
+     only; the number is what has to match, and it does. --- */
+  SYS_PIVOT_ROOT       = 257, /* pivot_root(new_root, put_old) */
+  /* --- M109: namespaces, what unshare(1) and nsenter(1) run on. Numbers must
+     match kernel/include/b1nix/syscall.h. --- */
+  SYS_UNSHARE          = 258, /* unshare(flags) */
+  SYS_SETNS            = 259, /* setns(fd, nstype) */
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

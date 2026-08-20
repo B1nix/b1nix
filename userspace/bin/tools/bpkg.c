@@ -13,10 +13,12 @@
  *      separated record per package in Alpine's "C:value" key/value form)
  *      plus per-package .apk files, each of which is a concatenation of
  *      gzip members (signature tar, control tar with .PKGINFO, then the
- *      data tar with the actual files). We do not verify the RSA
- *      signature (no public-key crypto is linked into this binary) or the
- *      per-file Q1 checksums in APKINDEX -- both are documented gaps, not
- *      silently skipped checks.
+ *      data tar with the actual files). The RSA signature and the control
+ *      member's datahash are both verified when mbedTLS is linked in, and a
+ *      signed package is refused outright when it is not. The per-file Q1
+ *      checksums in APKINDEX stay unread -- the signature chain already
+ *      covers the same bytes -- which is a documented gap, not a silently
+ *      skipped check.
  *
  * gzip/deflate and tar are both implemented locally (RFC 1951/1952, POSIX
  * ustar + GNU longname) so this binary has no dependency on a ported zlib
@@ -30,19 +32,27 @@
  *   /var/lib/bpkg/index            cached copy of the last-fetched index
  *   /var/lib/bpkg/installed/NAME.list   newline-separated installed paths
  *   /var/lib/bpkg/installed/NAME.ver    installed version string
+ *   /var/lib/bpkg/scripts/NAME.SCRIPT   the package's own install scripts,
+ *                                       kept so deinstall and triggers can
+ *                                       still run after the .apk is gone
+ *   /var/lib/bpkg/scripts/NAME.triggers the trigger's path patterns
+ *   /etc/apk/world                      explicitly requested packages
  *
  * Usage:
  *   bpkg update                    refresh /var/lib/bpkg/index from INDEX_URL
  *   bpkg list                      list installed packages
  *   bpkg search TERM               search the cached index
- *   bpkg install NAME [NAME...]    resolve deps, download, extract
+ *   bpkg install NAME [NAME...]    resolve deps, download, extract; over an
+ *                                  older version this is an upgrade
  *   bpkg remove NAME                delete NAME's recorded files
  *   bpkg info NAME                  show cached index metadata for NAME
+ *   bpkg world                      list the explicitly requested packages
  */
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <netdb.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -50,6 +60,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ------------------------------------------------------------------ */
@@ -978,6 +989,7 @@ static int fetch_url(const char *url, struct buf *out) {
 #define BPKG_CONF "/etc/bpkg.conf"
 #define BPKG_STATE_DIR "/var/lib/bpkg"
 #define BPKG_INSTALLED_DIR "/var/lib/bpkg/installed"
+#define BPKG_SCRIPTS_DIR "/var/lib/bpkg/scripts"
 /*
  * In the state directory, where the rest of bpkg's state lives.
  *
@@ -1122,6 +1134,7 @@ static int is_apkindex_url(const char *url) {
 static void ensure_state_dirs(void) {
     mkdir(BPKG_STATE_DIR, 0755);
     mkdir(BPKG_INSTALLED_DIR, 0755);
+    mkdir(BPKG_SCRIPTS_DIR, 0755);
     /* The cache directory as well: the index lives there now, beside the
      * packages, and `update` writes it with open() rather than through
      * write_whole_file — so nothing else would create it. */
@@ -1633,6 +1646,361 @@ static int apk_verify(const uint8_t *sig_tar, size_t sig_tar_len,
 }
 #endif /* B1NIX_HAVE_MBEDTLS */
 
+/* ------------------------------------------------------------------ */
+/* package scripts, triggers and /etc/apk/world                        */
+/* ------------------------------------------------------------------ */
+
+/* Locate a named member in an already-decompressed tar. Alpine's control
+ * member is a handful of dot-files (.PKGINFO, .pre-install, .post-install,
+ * .trigger, ...), so a linear walk per lookup is cheap and keeps this
+ * independent of member order. */
+static int tar_find_file(const uint8_t *tar, size_t len, const char *want,
+                         const uint8_t **content, size_t *clen) {
+    size_t pos = 0;
+    while (pos + 512 <= len) {
+        const struct tar_hdr *h = (const struct tar_hdr *)(tar + pos);
+        int allzero = 1;
+        for (size_t i = 0; i < 512; i++) if (tar[pos + i]) { allzero = 0; break; }
+        if (allzero) { pos += 512; continue; }
+        long size = tar_octal(h->size, 12);
+        char name[128];
+        snprintf(name, sizeof(name), "%.100s", h->name);
+        const char *n = name;
+        if (n[0] == '.' && n[1] == '/') n += 2;
+        pos += 512;
+        if (size < 0 || pos + (size_t)size > len) return -1;
+        if ((h->typeflag == '0' || h->typeflag == 0) && strcmp(n, want) == 0) {
+            *content = tar + pos;
+            *clen = (size_t)size;
+            return 0;
+        }
+        pos += ((size_t)size + 511) & ~(size_t)511;
+    }
+    return -1;
+}
+
+/* Every path installed during this run of bpkg, absolute and newline
+ * separated. Triggers are a property of the whole transaction, not of one
+ * package: ca-certificates' trigger has to fire when some *other* package
+ * drops a certificate into the directory it watches, so what the triggers
+ * are matched against is this list, collected across every install. */
+static struct buf g_txn_paths;
+
+static void txn_record(const struct buf *filelist) {
+    const char *p = (const char *)filelist->p;
+    size_t i = 0, start = 0;
+    for (; i <= filelist->len; i++) {
+        if (i == filelist->len || p[i] == '\n') {
+            if (i > start) {
+                buf_append(&g_txn_paths, "/", 1);
+                buf_append(&g_txn_paths, p + start, i - start);
+                buf_append(&g_txn_paths, "\n", 1);
+            }
+            start = i + 1;
+        }
+    }
+}
+
+/* Write a script out of the control member and make it executable. Returns 0
+ * when the script exists and was staged, -1 when the package has none. */
+static int stage_script(const uint8_t *ctl_tar, size_t ctl_len, const char *pkgname,
+                        const char *which, char *out, size_t outcap) {
+    const uint8_t *body = NULL; size_t blen = 0;
+    if (!ctl_tar || tar_find_file(ctl_tar, ctl_len, which, &body, &blen) < 0) return -1;
+    snprintf(out, outcap, "%s/%s%s", BPKG_SCRIPTS_DIR, pkgname, which);
+    int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (fd < 0) {
+        fprintf(stderr, "bpkg: cannot stage %s for %s: %s\n", which, pkgname, strerror(errno));
+        return -1;
+    }
+    if (blen && write(fd, body, blen) != (ssize_t)blen) {
+        fprintf(stderr, "bpkg: short write staging %s for %s\n", which, pkgname);
+        close(fd);
+        unlink(out);
+        return -1;
+    }
+    close(fd);
+    chmod(out, 0755);
+    return 0;
+}
+
+/*
+ * Run one staged script.
+ *
+ * apk chroots into the install root before running these. bpkg deliberately
+ * does not: on a real system install_root() is "/", where a chroot would be a
+ * no-op anyway, and the scratch root the smoke test installs into holds no
+ * shell to chroot to. Instead the script runs with the install root as its
+ * working directory and BPKG_ROOT in its environment, which is the same
+ * information a chroot would have conveyed and is what the fixture scripts
+ * use to place their side effects.
+ *
+ * A script that fails is reported and its exit status returned; the caller
+ * decides. Nothing here is silent.
+ */
+static int run_script(const char *path, const char *pkgname, const char *which,
+                      const char *newver, const char *oldver) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "bpkg: fork for %s%s failed: %s\n", pkgname, which, strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        if (chdir(install_root()) != 0) _exit(127);
+        setenv("BPKG_ROOT", install_root(), 1);
+        char *const argv[] = { (char *)"sh", (char *)path, (char *)newver,
+                               (char *)oldver, NULL };
+        execv("/bin/sh", argv);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (rc != 0)
+        fprintf(stderr, "bpkg: %s%s exited %d\n", pkgname, which, rc);
+    else
+        printf("bpkg: ran %s%s\n", pkgname, which);
+    return rc;
+}
+
+/* Stage and immediately run one of the install-time scripts. */
+static int run_control_script(const uint8_t *ctl_tar, size_t ctl_len, const char *pkgname,
+                              const char *which, const char *newver, const char *oldver) {
+    char path[640];
+    if (stage_script(ctl_tar, ctl_len, pkgname, which, path, sizeof(path)) < 0)
+        return 0; /* no such script: nothing to do, and not an error */
+    int rc = run_script(path, pkgname, which, newver, oldver);
+    unlink(path);
+    return rc;
+}
+
+/*
+ * Which of the two scripts this phase runs.
+ *
+ * An upgrade gets its own pair: when the new package ships .pre-upgrade or
+ * .post-upgrade, that script runs INSTEAD of the matching install script, and
+ * is handed the version being replaced in $2. A package that ships neither --
+ * most of them -- has its install scripts run for the upgrade instead, which
+ * is why so many Alpine scripts branch on $2 being non-empty.
+ *
+ * The choice is made per phase, not per package: a package that ships only
+ * .post-upgrade gets .pre-install and .post-upgrade, because that is the pair
+ * it actually wrote.
+ */
+static const char *phase_script(const uint8_t *ctl_tar, size_t ctl_len, int upgrading,
+                                const char *upgrade_name, const char *install_name) {
+    const uint8_t *body = NULL; size_t blen = 0;
+    if (!upgrading || !ctl_tar) return install_name;
+    if (tar_find_file(ctl_tar, ctl_len, upgrade_name, &body, &blen) < 0) return install_name;
+    return upgrade_name;
+}
+
+/* Keep .pre-deinstall/.post-deinstall for later: by the time they are needed
+ * the .apk they came from is long gone. */
+static void keep_deinstall_scripts(const uint8_t *ctl_tar, size_t ctl_len, const char *pkgname) {
+    char path[640];
+    stage_script(ctl_tar, ctl_len, pkgname, ".pre-deinstall", path, sizeof(path));
+    stage_script(ctl_tar, ctl_len, pkgname, ".post-deinstall", path, sizeof(path));
+}
+
+/* A package's trigger is a script plus the path patterns that arm it, the
+ * patterns coming from .PKGINFO's "triggers = " line. Both are kept on disk
+ * so a package installed a month ago still fires when today's install writes
+ * into a directory it watches. */
+static void record_triggers(const uint8_t *ctl_tar, size_t ctl_len, const char *pkgname) {
+    const uint8_t *pkginfo = NULL; size_t plen = 0;
+    char patterns[1024];
+    char path[640];
+
+    if (!ctl_tar) return;
+    if (tar_find_file(ctl_tar, ctl_len, ".PKGINFO", &pkginfo, &plen) < 0) return;
+    if (pkginfo_value(pkginfo, plen, "triggers", patterns, sizeof(patterns)) < 0) return;
+    if (!patterns[0]) return;
+    if (stage_script(ctl_tar, ctl_len, pkgname, ".trigger", path, sizeof(path)) < 0) {
+        fprintf(stderr, "bpkg: %s declares triggers but ships no .trigger script\n", pkgname);
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/%s.triggers", BPKG_SCRIPTS_DIR, pkgname);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    dprintf(fd, "%s\n", patterns);
+    close(fd);
+}
+
+/* True when `abspath`, or the directory holding it, matches `pattern`. Alpine
+ * writes its triggers as directory globs -- "/usr/share/applications", or the
+ * same with a trailing slash-star -- so both forms have to hit. Returns the
+ * directory to hand the trigger script in `dir`. */
+static int trigger_matches(const char *pattern, const char *abspath, char *dir, size_t dircap) {
+    const char *slash = strrchr(abspath, '/');
+    size_t dlen = slash && slash != abspath ? (size_t)(slash - abspath) : 1;
+    snprintf(dir, dircap, "%.*s", (int)dlen, abspath);
+    if (fnmatch(pattern, abspath, FNM_PATHNAME) == 0) return 1;
+    if (fnmatch(pattern, dir, FNM_PATHNAME) == 0) return 1;
+    return 0;
+}
+
+/* Fire every armed trigger whose patterns match something this transaction
+ * installed, once per package, with the matching directories as arguments --
+ * which is the interface Alpine's own trigger scripts are written against. */
+static void run_pending_triggers(void) {
+    if (!g_txn_paths.len) return;
+
+    DIR *d = opendir(BPKG_SCRIPTS_DIR);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        size_t nlen = strlen(de->d_name);
+        if (nlen <= 9 || strcmp(de->d_name + nlen - 9, ".triggers") != 0) continue;
+        char pkgname[128];
+        snprintf(pkgname, sizeof(pkgname), "%.*s", (int)(nlen - 9), de->d_name);
+
+        char tpath[640];
+        snprintf(tpath, sizeof(tpath), "%s/%s", BPKG_SCRIPTS_DIR, de->d_name);
+        struct buf pat;
+        if (read_whole_file(tpath, &pat) < 0) continue;
+        char patterns[1024];
+        size_t n = pat.len < sizeof(patterns) - 1 ? pat.len : sizeof(patterns) - 1;
+        memcpy(patterns, pat.p, n); patterns[n] = 0;
+        buf_free(&pat);
+        char *nl = strchr(patterns, '\n'); if (nl) *nl = 0;
+
+        /* Collect the distinct directories this package's patterns matched. */
+        char dirs[16][512]; int ndirs = 0;
+        char work[1024]; snprintf(work, sizeof(work), "%s", patterns);
+        char *sp = NULL;
+        for (char *pt = strtok_r(work, " \t", &sp); pt && ndirs < 16; pt = strtok_r(NULL, " \t", &sp)) {
+            const char *p = (const char *)g_txn_paths.p;
+            size_t i = 0, start = 0;
+            for (; i <= g_txn_paths.len && ndirs < 16; i++) {
+                if (i != g_txn_paths.len && p[i] != '\n') continue;
+                if (i > start) {
+                    char abspath[1024];
+                    size_t l = i - start < sizeof(abspath) - 1 ? i - start : sizeof(abspath) - 1;
+                    memcpy(abspath, p + start, l); abspath[l] = 0;
+                    char dir[512];
+                    if (trigger_matches(pt, abspath, dir, sizeof(dir))) {
+                        int seen = 0;
+                        for (int k = 0; k < ndirs; k++) if (strcmp(dirs[k], dir) == 0) { seen = 1; break; }
+                        if (!seen) snprintf(dirs[ndirs++], sizeof(dirs[0]), "%s", dir);
+                    }
+                }
+                start = i + 1;
+            }
+        }
+        if (!ndirs) continue;
+
+        char spath[640];
+        snprintf(spath, sizeof(spath), "%s/%s.trigger", BPKG_SCRIPTS_DIR, pkgname);
+        if (access(spath, X_OK) != 0) continue;
+
+        pid_t pid = fork();
+        if (pid < 0) continue;
+        if (pid == 0) {
+            char *argv[20];
+            int a = 0;
+            argv[a++] = (char *)"sh";
+            argv[a++] = spath;
+            for (int k = 0; k < ndirs && a < 19; k++) argv[a++] = dirs[k];
+            argv[a] = NULL;
+            if (chdir(install_root()) != 0) _exit(127);
+            setenv("BPKG_ROOT", install_root(), 1);
+            execv("/bin/sh", argv);
+            _exit(127);
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        if (rc != 0) fprintf(stderr, "bpkg: trigger for %s exited %d\n", pkgname, rc);
+        else printf("bpkg: ran trigger for %s (%d path(s))\n", pkgname, ndirs);
+    }
+    closedir(d);
+}
+
+/* ---- /etc/apk/world -------------------------------------------------- */
+
+/* The set of packages somebody asked for by name, as opposed to the ones that
+ * came in as dependencies. Alpine keeps it one constraint per line, sorted;
+ * so does this, so apk and bpkg can read each other's file. */
+static void world_path(char *out, size_t cap) {
+    const char *root = install_root();
+    if (strcmp(root, "/") == 0) snprintf(out, cap, "/etc/apk/world");
+    else snprintf(out, cap, "%s/etc/apk/world", root);
+}
+
+static int world_read(char names[][128], int max) {
+    char path[640];
+    world_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int n = 0;
+    char line[256];
+    while (n < max && fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+        if (!line[0]) continue;
+        snprintf(names[n++], 128, "%s", line);
+    }
+    fclose(f);
+    return n;
+}
+
+static int world_write(char names[][128], int n) {
+    /* sort, so the file is stable across runs and diffable */
+    for (int i = 1; i < n; i++) {
+        char tmp[128]; snprintf(tmp, sizeof(tmp), "%s", names[i]);
+        int j = i - 1;
+        while (j >= 0 && strcmp(names[j], tmp) > 0) { snprintf(names[j + 1], 128, "%s", names[j]); j--; }
+        snprintf(names[j + 1], 128, "%s", tmp);
+    }
+    /* The directories may not exist yet on a fresh root. */
+    const char *root = install_root();
+    const char *sep = strcmp(root, "/") == 0 ? "" : "/";
+    char dir[640];
+    snprintf(dir, sizeof(dir), "%s%setc", root, sep);
+    mkdir(dir, 0755);
+    snprintf(dir, sizeof(dir), "%s%setc/apk", root, sep);
+    mkdir(dir, 0755);
+
+    char path[640];
+    world_path(path, sizeof(path));
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "bpkg: cannot write %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    for (int i = 0; i < n; i++) dprintf(fd, "%s\n", names[i]);
+    close(fd);
+    return 0;
+}
+
+static void world_add(const char *name) {
+    static char names[512][128];
+    int n = world_read(names, 512);
+    for (int i = 0; i < n; i++) if (strcmp(names[i], name) == 0) return;
+    if (n >= 512) return;
+    snprintf(names[n++], 128, "%s", name);
+    world_write(names, n);
+}
+
+static void world_remove(const char *name) {
+    static char names[512][128];
+    int n = world_read(names, 512);
+    int out = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(names[i], name) == 0) continue;
+        if (out != i) snprintf(names[out], 128, "%s", names[i]);
+        out++;
+    }
+    if (out != n) world_write(names, out);
+}
+
+static int cmd_world(void) {
+    static char names[512][128];
+    int n = world_read(names, 512);
+    for (int i = 0; i < n; i++) printf("%s\n", names[i]);
+    return 0;
+}
+
 static int already_installed(const char *name, const char *version) {
     char verpath[512]; snprintf(verpath, sizeof(verpath), "%s/%s.ver", BPKG_INSTALLED_DIR, name);
     FILE *f = fopen(verpath, "r");
@@ -1670,6 +2038,32 @@ static int install_one(struct pkgset *set, const char *name) {
         printf("bpkg: %s %s already installed\n", pk->name, pk->version);
         return 0;
     }
+
+    /* Before anything is staged: the scripts directory has to exist by the
+     * time a .pre-install is written out, which happens before extraction. */
+    ensure_state_dirs();
+
+    /* An install over an older version is an upgrade: the scripts are told so
+     * through their second argument, and a package that ships .pre-upgrade or
+     * .post-upgrade has those run in place of the install scripts. Empty means
+     * a fresh install. The old version's deinstall scripts are deliberately
+     * not run -- that is what separates an upgrade from remove-then-install. */
+    char oldver[128] = "";
+    {
+        char vp[512];
+        snprintf(vp, sizeof(vp), "%s/%s.ver", BPKG_INSTALLED_DIR, pk->name);
+        FILE *vf = fopen(vp, "r");
+        if (vf) {
+            if (fgets(oldver, sizeof(oldver), vf)) {
+                char *nl = strchr(oldver, '\n');
+                if (nl) *nl = 0;
+            }
+            fclose(vf);
+        }
+    }
+    int upgrading = oldver[0] != 0;
+    if (upgrading)
+        printf("bpkg: upgrading %s %s -> %s\n", pk->name, oldver, pk->version);
 
     /*
      * A downloaded package is kept.
@@ -1722,6 +2116,10 @@ static int install_one(struct pkgset *set, const char *name) {
     }
 
     struct buf filelist; buf_init(&filelist);
+    /* The control member of an .apk, when it has one: where .pre-install,
+     * .post-install, the deinstall scripts and .trigger live. */
+    const uint8_t *ctl_tar = NULL;
+    size_t ctl_len = 0;
     int rc;
     if (!pk->is_apk) {
         struct buf tar;
@@ -1792,6 +2190,17 @@ static int install_one(struct pkgset *set, const char *name) {
                 fprintf(stderr, "bpkg: %s is signed, but this bpkg was built without mbedTLS and cannot check the signature -- refusing to install\n", pk->name);
                 rc = -1;
 #endif
+                if (rc == 0) {
+                    ctl_tar = member[1].p;
+                    ctl_len = member[1].len;
+                    const char *pre = phase_script(ctl_tar, ctl_len, upgrading,
+                                                   ".pre-upgrade", ".pre-install");
+                    if (run_control_script(ctl_tar, ctl_len, pk->name, pre,
+                                           pk->version, oldver) != 0) {
+                        fprintf(stderr, "bpkg: %s %s failed -- not installing\n", pk->name, pre);
+                        rc = -1;
+                    }
+                }
                 if (rc == 0)
                     rc = tar_extract(member[2].p, member[2].len, install_root(), &filelist);
             }
@@ -1803,8 +2212,33 @@ static int install_one(struct pkgset *set, const char *name) {
                 fprintf(stderr, "bpkg: %s carries no signature -- refusing to install an unsigned package fetched over the network\n", pk->name);
                 rc = -1;
             } else {
-                rc = tar_extract(member[members - 1].p, member[members - 1].len, install_root(), &filelist);
+                if (members >= 2) {
+                    ctl_tar = member[members - 2].p;
+                    ctl_len = member[members - 2].len;
+                }
+                rc = 0;
+                const char *pre = phase_script(ctl_tar, ctl_len, upgrading,
+                                               ".pre-upgrade", ".pre-install");
+                if (run_control_script(ctl_tar, ctl_len, pk->name, pre,
+                                       pk->version, oldver) != 0) {
+                    fprintf(stderr, "bpkg: %s %s failed -- not installing\n", pk->name, pre);
+                    rc = -1;
+                }
+                if (rc == 0)
+                    rc = tar_extract(member[members - 1].p, member[members - 1].len, install_root(), &filelist);
             }
+        }
+        if (rc == 0 && ctl_tar) {
+            /* The package is on disk now, so a failing .post-install is a
+             * broken package rather than a reason to unwind: report it, keep
+             * the install, and let the exit status carry it. */
+            const char *post = phase_script(ctl_tar, ctl_len, upgrading,
+                                            ".post-upgrade", ".post-install");
+            if (run_control_script(ctl_tar, ctl_len, pk->name, post,
+                                   pk->version, oldver) != 0)
+                fprintf(stderr, "bpkg: %s installed, but its %s failed\n", pk->name, post);
+            keep_deinstall_scripts(ctl_tar, ctl_len, pk->name);
+            record_triggers(ctl_tar, ctl_len, pk->name);
         }
         for (int i = 0; i < members; i++) buf_free(&member[i]);
     }
@@ -1817,8 +2251,8 @@ static int install_one(struct pkgset *set, const char *name) {
 
     if (rc < 0) { fprintf(stderr, "bpkg: failed to extract %s\n", pk->name); buf_free(&filelist); return -1; }
 
-    ensure_state_dirs();
     record_install(pk->name, pk->version, &filelist);
+    txn_record(&filelist);
     buf_free(&filelist);
     printf("bpkg: installed %s %s\n", pk->name, pk->version);
     return 0;
@@ -1856,15 +2290,34 @@ static int cmd_install(int argc, char **argv) {
     char visited[256][128]; int nvisited = 0;
     int rc = 0;
     for (int i = 0; i < argc; i++) {
-        if (install_with_deps(&set, argv[i], visited, &nvisited, 256) < 0) rc = 1;
+        if (install_with_deps(&set, argv[i], visited, &nvisited, 256) < 0) { rc = 1; continue; }
+        /* Named on the command line, so it is a member of world -- unlike the
+         * dependencies install_with_deps pulled in behind it, which are not. */
+        struct pkg *pk = pkg_resolve(&set, argv[i]);
+        world_add(pk ? pk->name : argv[i]);
     }
+    /* Triggers fire once for the whole transaction, after everything is on
+     * disk: a trigger that ran per package would see a half-populated
+     * directory and would run again for the next one. */
+    run_pending_triggers();
+    buf_free(&g_txn_paths);
     return rc;
+}
+
+/* Run a deinstall script kept from install time, if the package shipped one. */
+static void run_kept_script(const char *name, const char *which) {
+    char path[640];
+    snprintf(path, sizeof(path), "%s/%s%s", BPKG_SCRIPTS_DIR, name, which);
+    if (access(path, X_OK) != 0) return;
+    run_script(path, name, which, "", "");
+    unlink(path);
 }
 
 static int cmd_remove(const char *name) {
     char listpath[512]; snprintf(listpath, sizeof(listpath), "%s/%s.list", BPKG_INSTALLED_DIR, name);
     FILE *f = fopen(listpath, "r");
     if (!f) { fprintf(stderr, "bpkg: %s is not installed\n", name); return 1; }
+    run_kept_script(name, ".pre-deinstall");
     char line[1024];
     int removed = 0;
     while (fgets(line, sizeof(line), f)) {
@@ -1877,6 +2330,15 @@ static int cmd_remove(const char *name) {
     unlink(listpath);
     char verpath[512]; snprintf(verpath, sizeof(verpath), "%s/%s.ver", BPKG_INSTALLED_DIR, name);
     unlink(verpath);
+    run_kept_script(name, ".post-deinstall");
+    /* A removed package's trigger must not keep firing on other packages'
+     * installs, and world only lists what is still wanted. */
+    char tpath[640];
+    snprintf(tpath, sizeof(tpath), "%s/%s.triggers", BPKG_SCRIPTS_DIR, name);
+    unlink(tpath);
+    snprintf(tpath, sizeof(tpath), "%s/%s.trigger", BPKG_SCRIPTS_DIR, name);
+    unlink(tpath);
+    world_remove(name);
     printf("bpkg: removed %s (%d files)\n", name, removed);
     return 0;
 }
@@ -1891,7 +2353,8 @@ static void usage(void) {
         "       bpkg search TERM\n"
         "       bpkg info NAME\n"
         "       bpkg install NAME [NAME...]\n"
-        "       bpkg remove NAME\n");
+        "       bpkg remove NAME\n"
+        "       bpkg world\n");
 }
 
 int main(int argc, char **argv) {
@@ -1902,6 +2365,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "info") == 0) { if (argc < 3) { usage(); return 2; } return cmd_info(argv[2]); }
     if (strcmp(argv[1], "install") == 0) { if (argc < 3) { usage(); return 2; } return cmd_install(argc - 2, argv + 2); }
     if (strcmp(argv[1], "remove") == 0) { if (argc < 3) { usage(); return 2; } return cmd_remove(argv[2]); }
+    if (strcmp(argv[1], "world") == 0) return cmd_world();
     usage();
     return 2;
 }

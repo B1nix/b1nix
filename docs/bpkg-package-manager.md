@@ -130,6 +130,21 @@ against fixtures pre-staged in the rootfs:
   with the host's own `tar`/`gzip` (not `bpkg` itself), proving the apk
   parser/splitter against byte-for-byte real Alpine tooling output, not a
   format `bpkg` invented for itself.
+- `apkrepo-scripts/` — generated packages
+  (`tools/packages/make-script-fixture.sh`) covering the install scripts,
+  triggers, upgrades and `/etc/apk/world`. `scripted` ships every script and
+  arms a trigger on a directory it does *not* itself write to; `triggerbait`
+  writes into that directory. Each marker is gated on a side effect the script
+  produced — the `.pre-install` records whether the payload was already on
+  disk when it ran, so `ok install-scripts` is proof of ordering rather than
+  of bpkg claiming to have run something.
+  Two repositories are staged, `x86_64/` and `v2/x86_64/`, because one
+  `APKINDEX` names one version per package — so an upgrade is what it is on a
+  real system: the index is refreshed and now names a newer release. `scripted`
+  2.0 ships `.pre-upgrade`/`.post-upgrade` plus *poisoned* install scripts that
+  write to a file nothing may contain; `noupgrade` ships install scripts only,
+  for the fallback; `failupgrade` 2.0's `.pre-upgrade` exits non-zero, so the
+  upgrade has to be abandoned with 1.0 still installed.
 
 Additionally, before this ever reached the target build, every hard piece —
 DEFLATE, gzip framing, tar extraction (including the `./`-prefixed and
@@ -150,14 +165,49 @@ against musl (`x86_64-unknown-elf`, `ld.lld`, PT_INTERP
   prove; it stays unread.
 - **No chunked transfer-encoding.** Every target this ships against
   (jsDelivr, Alpine mirrors) sends `Content-Length` for static files.
-- **No `.post-install` / `.pre-install` scripts, no triggers, no
-  `/etc/apk/world`.** A real `.apk` may carry them; `bpkg` extracts the
-  payload and records the file list, nothing more. Packages that need a
-  post-install step are installed incompletely — that is a gap, not a
-  silent success, and it is the next thing to build before migrating the
-  from-source ports to packages.
 - **No file-conflict detection between packages.** Two packages owning the
   same path both write it; last one wins.
+
+## Install scripts, triggers and `/etc/apk/world`
+
+An `.apk`'s control member carries more than `.PKGINFO`, and `bpkg` now runs
+what it finds there:
+
+- **`.pre-install` runs before the payload is unpacked, `.post-install`
+  after**, both with the new version as `$1` and the previously installed
+  version — empty on a fresh install — as `$2`. A `.pre-install` that fails
+  aborts the install; a `.post-install` that fails is reported and the
+  install stands, because by then the files are already on disk.
+- **`.pre-upgrade` / `.post-upgrade` replace them on an upgrade.** When the
+  new package ships one, it runs *instead of* the matching install script,
+  with the new version as `$1` and the version being replaced as `$2`; the
+  choice is made per phase, so a package shipping only `.post-upgrade` gets
+  `.pre-install` and `.post-upgrade`. A package shipping neither — most of
+  them — has its install scripts run for the upgrade, which is why so many
+  Alpine scripts branch on `$2` being non-empty. A failing `.pre-upgrade`
+  abandons the upgrade: nothing is unpacked and the installed version stays
+  as it was. The old version's **deinstall scripts do not run** — that is
+  what separates an upgrade from a remove followed by an install.
+- **`.pre-deinstall` / `.post-deinstall` are staged and kept** under
+  `/var/lib/bpkg/scripts/`, because by the time `bpkg remove` needs them the
+  `.apk` they came from is long gone.
+- **Triggers.** A package declaring `triggers = <path globs>` in `.PKGINFO`
+  has its `.trigger` script and its patterns recorded. Every path installed
+  during a run of `bpkg install` is collected, and at the end of that run —
+  once, not per package — each armed trigger whose patterns match runs with
+  the matching directories as its arguments. This is the semantics that
+  matters: `ca-certificates`' trigger has to fire when some *other* package
+  drops a certificate into the directory it watches.
+- **`/etc/apk/world`** lists what was asked for by name, sorted, one per
+  line — the same file and format `apk` uses, so the two can read each
+  other's. Dependencies pulled in behind a request are not members.
+  `bpkg world` prints it; `bpkg remove` drops the name.
+
+Unlike `apk`, `bpkg` does not `chroot` into the install root before running a
+script. On a real system the root is `/`, where a `chroot` would be a no-op;
+for a non-`/` root the script instead runs with that root as its working
+directory and `BPKG_ROOT` in its environment. Staging a shell inside a
+scratch root purely so it could be chrooted into would buy nothing.
 
 ## Usage
 
@@ -168,6 +218,7 @@ bpkg search TERM                # search the cached index by name substring
 bpkg info NAME                  # show cached index metadata for NAME
 bpkg install NAME [NAME...]     # resolve deps, download, verify, extract
 bpkg remove NAME                 # delete NAME's recorded files + metadata
+bpkg world                       # list the explicitly requested packages
 ```
 
 Configuration lives in `/etc/bpkg.conf` (`INDEX_URL=...`, one KEY=VALUE per

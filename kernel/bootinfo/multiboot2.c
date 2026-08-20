@@ -266,3 +266,33 @@ int bootinfo_get_kv(const char *key, char *out, usize out_size)
 
 	return 0;
 }
+
+/* Decimal `key=N` from the command line, or `fallback` when the key is absent,
+ * empty, or not a number.
+ *
+ * Every derived limit in the kernel — the block cache, the page-cache hash, the
+ * read-ahead windows, the mount and pty tables — is overridable by a
+ * `b1nix.*=N` option, and each used to carry its own copy of this loop. One
+ * parser keeps the precedence uniform: an explicit override always wins over
+ * whatever the machine or the device reports.
+ *
+ * A non-numeric value is ignored rather than read as 0, so a typo degrades to
+ * the derived default instead of silently disabling the thing it names. */
+u32 bootinfo_get_u32(const char *key, u32 fallback)
+{
+	char buf[24];
+
+	if (!bootinfo_get_kv(key, buf, sizeof(buf)) || !buf[0]) {
+		return fallback;
+	}
+	if (buf[0] < '0' || buf[0] > '9') {
+		return fallback;
+	}
+
+	u32 v = 0;
+
+	for (const char *p = buf; *p >= '0' && *p <= '9'; p++) {
+		v = v * 10u + (u32)(*p - '0');
+	}
+	return v;
+}

@@ -11,16 +11,13 @@
 # storage is an ordinary sd* disk: it is found by mounting candidates and
 # looking for the boot image, removable media first.
 #
-# KNOWN, PRE-EXISTING: the root switch that follows does NOT complete, and the
-# cause has nothing to do with naming. loop_init() already registered loop0..7
-# as empty devices, so loop_register_file(..., "loop0") registers a SECOND block
-# device also called loop0. blk_get("loop0") returns the first match — the empty
-# one — so mounting it reads a device with no backing file
-# ("blk_read_cached: read_blocks failed for loop0 lba=2") and the kernel falls
-# back to ram0. The fix belongs in loop_register_file (bind into the existing
-# slot instead of registering a duplicate), which is why this script checks
-# medium selection and reports the root switch separately instead of asserting
-# it.
+# It also checks the root switch that follows. That used to fail for a reason
+# unrelated to naming: loop_init() had already registered loop0..7 as empty
+# devices, so loop_register_file(..., "loop0") registered a SECOND block device
+# also called loop0, and blk_get("loop0") returned the first match — the empty
+# one. Mounting it read a device with no backing file and the kernel fell back
+# to ram0. loop_register_file now binds into a free pre-registered slot, so the
+# device the mount finds is the one carrying the image.
 set -e
 
 PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -66,11 +63,13 @@ check "rootfs: liveiso mount requested" "the live-ISO path runs"
 check "isofs: mounted sd" "the boot medium is found by content and mounted at /mnt/iso"
 check "loop: loop0 backing /boot/rootfs.img" "the boot image on it is found and attached to loop0"
 
-if grep -aq "M37-LIVEISO: ok isofs-loop-root" "$LOG"; then
-	echo "  NOTE  the root switch completed too (the loop/isofs read bug is gone)"
-else
-	echo "  NOTE  root switch did NOT complete — known loop-over-isofs read failure:"
-	grep -a "read_blocks failed for loop0" "$LOG" | head -2 | sed 's/^/        /'
+check "rootfs: loop0 mounted at / as ext4" "the loop device the image was attached to is the one that mounts"
+check "M37-LIVEISO: ok isofs-loop-root" "the root switch completes rather than falling back to ram0"
+
+if grep -aq "rootfs: ram0 mounted at / (Live CD fallback)" "$LOG"; then
+	echo "  FAIL  the boot fell back to ram0"
+	grep -a "read_blocks failed for loop" "$LOG" | head -2 | sed 's/^/        /'
+	fail=1
 fi
 
 echo "log: $LOG"

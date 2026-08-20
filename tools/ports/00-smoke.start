@@ -128,6 +128,9 @@ run_test /bin/m39_smoke sys
 
 # ---- blk (storage) ----
 run_test /bin/m14_smoke blk
+# M109 needs the virtio-blk scratch disk and the nvme ext4 image, and it mounts
+# the latter at /mnt/ext4nvme — so it runs after m14_smoke has released it.
+run_test /bin/m109_smoke blk
 run_test /bin/m24b_smoke sys
 run_test /bin/diskbench blk
 run_test /bin/ext_stress blk
@@ -162,6 +165,10 @@ run_test /bin/m86_smoke posix
 run_test /bin/m95_smoke posix
 run_test /bin/m96_smoke posix
 run_test /bin/m107_smoke posix
+# M109: the uevent hot-plug channel. Creates and destroys /dev/loop8 and runs
+# mdev, so it must not overlap another test touching /dev — hence the same
+# sequential group.
+run_test /bin/m109_uevent_smoke posix
 run_test /bin/m63_smoke posix
 run_test /bin/m71_aslr posix
 run_test /bin/m42_w5pre_smoke posix

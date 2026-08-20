@@ -141,70 +141,32 @@ extern void lkpi_cpuinfo_init(void);
 
 extern void bootinfo_init_from_fdt(u64 dtb_address);
 
-static int parse_hex_digit(char c) {
-	if (c >= '0' && c <= '9') return c - '0';
-	if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-	if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-	return -1;
+/* Case-insensitive compare for a UUID: the cmdline may spell it either way,
+ * and blk_probe_uuid always prints lower case. */
+static int uuid_equal(const char *a, const char *b) {
+	for (usize i = 0;; i++) {
+		char ca = a[i], cb = b[i];
+		if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+		if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+		if (ca != cb) return 0;
+		if (!ca) return 1;
+	}
 }
 
-static int parse_uuid(const char *str, u8 *uuid_out) {
-	int out_idx = 0;
-	for (int i = 0; str[i] != '\0' && out_idx < 16; i++) {
-		if (str[i] == '-') {
-			continue;
-		}
-		int high = parse_hex_digit(str[i]);
-		if (high < 0) return 0;
-		i++;
-		if (str[i] == '\0') return 0;
-		int low = parse_hex_digit(str[i]);
-		if (low < 0) return 0;
-		uuid_out[out_idx++] = (u8)((high << 4) | low);
-	}
-	return (out_idx == 16);
-}
-
-static int match_label(const char *expected, const char *s_volume_name) {
-	int len = 0;
-	while (expected[len] != '\0') {
-		if (len >= 16) return 0;
-		if (expected[len] != s_volume_name[len]) return 0;
-		len++;
-	}
-	for (int i = len; i < 16; i++) {
-		if (s_volume_name[i] != '\0' && s_volume_name[i] != ' ' &&
-		    s_volume_name[i] != '\r' && s_volume_name[i] != '\n') {
-			return 0;
-		}
-	}
-	return 1;
-}
-
-static struct block_device *find_device_by_uuid(const u8 *expected_uuid) {
-	u8 *sb_buf = kmalloc(1024);
-	if (!sb_buf) return 0;
-
-	struct block_device *found = 0;
-	usize count = blk_count();
-	for (usize i = 0; i < count; i++) {
+/* root=UUID=… / root=LABEL=… now ask the block layer what is on the device
+ * rather than opening the ext superblock here: one implementation, and it
+ * covers FAT and exFAT too (see blk_probe_uuid/blk_probe_label). */
+static struct block_device *find_device_by_uuid(const char *expected_uuid) {
+	char uuid[40];
+	for (usize i = 0; i < blk_count(); i++) {
 		struct block_device *dev = blk_at(i);
-		if (!dev || dev->block_size != 512 || dev->block_count < 4) {
+		if (!dev || dev->block_size != 512 || dev->block_count < 4)
 			continue;
-		}
-		if (blk_read_cached(dev, 2, 2, sb_buf) == 0) {
-			struct ext2_superblock *sb = (struct ext2_superblock *)sb_buf;
-			if (sb->s_magic == EXT2_SUPER_MAGIC) {
-				if (memcmp(sb->s_uuid, expected_uuid, 16) == 0) {
-					found = dev;
-					break;
-				}
-			}
-		}
+		if (blk_probe_uuid(dev, uuid, sizeof(uuid)) == 0 &&
+		    uuid_equal(uuid, expected_uuid))
+			return dev;
 	}
-
-	kfree(sb_buf);
-	return found;
+	return 0;
 }
 
 /* The live medium is whichever block device actually carries the boot image —
@@ -258,39 +220,21 @@ static struct block_device *blk_first_removable(void) {
 }
 
 static struct block_device *find_device_by_label(const char *expected_label) {
-	u8 *sb_buf = kmalloc(1024);
-	if (!sb_buf) return 0;
-
-	struct block_device *found = 0;
-	usize count = blk_count();
-	for (usize i = 0; i < count; i++) {
+	char label[64];
+	for (usize i = 0; i < blk_count(); i++) {
 		struct block_device *dev = blk_at(i);
-		if (!dev || dev->block_size != 512 || dev->block_count < 4) {
+		if (!dev || dev->block_size != 512 || dev->block_count < 4)
 			continue;
-		}
-		if (blk_read_cached(dev, 2, 2, sb_buf) == 0) {
-			struct ext2_superblock *sb = (struct ext2_superblock *)sb_buf;
-			if (sb->s_magic == EXT2_SUPER_MAGIC) {
-				if (match_label(expected_label, sb->s_volume_name)) {
-					found = dev;
-					break;
-				}
-			}
-		}
+		if (blk_probe_label(dev, label, sizeof(label)) == 0 &&
+		    strcmp(label, expected_label) == 0)
+			return dev;
 	}
-
-	kfree(sb_buf);
-	return found;
+	return 0;
 }
 
 static struct block_device *find_root_device(const char *root_val) {
 	if (strncmp(root_val, "UUID=", 5) == 0) {
-		const char *uuid_str = root_val + 5;
-		u8 expected_uuid[16];
-		if (!parse_uuid(uuid_str, expected_uuid)) {
-			return 0;
-		}
-		return find_device_by_uuid(expected_uuid);
+		return find_device_by_uuid(root_val + 5);
 	} else if (strncmp(root_val, "LABEL=", 6) == 0) {
 		const char *label_str = root_val + 6;
 		return find_device_by_label(label_str);
@@ -448,6 +392,11 @@ void kernel_main(usize arg0, usize arg1)
 		console_write("timer: LAPIC calibration unavailable, keeping PIT IRQ0 active\n");
 	}
 	blk_cache_init();
+	/* Before initramfs and the filesystems, not after: the page cache's hash
+	 * and bucket locks are allocated here now rather than being static arrays,
+	 * so anything that reads a file has to run after this point. It needs only
+	 * the PMM and the heap, both of which are already up. */
+	page_cache_init();
 
 	initramfs_init();
 	fuse_init();
@@ -468,7 +417,6 @@ void kernel_main(usize arg0, usize arg1)
 	amdvi_init();
 
 	vfs_init();
-	page_cache_init();
 	ext2_init();
 	ext1_init();
 	ext3_init();
@@ -712,7 +660,15 @@ void kernel_main(usize arg0, usize arg1)
 		int rc = -1;
 		char root_val[64];
 		if (bootinfo_get_kv("root", root_val, sizeof(root_val))) {
-			if (strcmp(root_val, "liveiso") == 0) {
+			if (strcmp(root_val, "initramfs") == 0) {
+				/* Keep the RAM filesystem as /, the way Linux does before an
+				 * initramfs hands over with switch_root. The boot then has a
+				 * real root to move onto / itself, rather than one the kernel
+				 * already mounted there. */
+				console_write("rootfs: staying on the initramfs (root=initramfs)\n");
+				rc = 0;
+				vfs_repopulate_after_root_mount();
+			} else if (strcmp(root_val, "liveiso") == 0) {
 				console_write("rootfs: liveiso mount requested, searching for the boot medium...\n");
 				const char *iso_fstype = 0;
 				char mounted_iso_name[64];
@@ -742,20 +698,20 @@ void kernel_main(usize arg0, usize arg1)
 				}
 
 				if (rc == 0) {
-					struct block_device *loop_dev = loop_register_file("/mnt/iso/boot/rootfs.img", "loop0");
+					struct block_device *loop_dev = loop_register_file("/mnt/iso/boot/rootfs.img");
 					if (loop_dev && !IS_ERR(loop_dev)) {
-						if (is_exfat) {
-							console_write("livefile: loop0 backing /boot/rootfs.img\n");
-						} else {
-							console_write("loop: loop0 backing /boot/rootfs.img\n");
-						}
+						char loop_buf[96];
+						snprintf(loop_buf, sizeof(loop_buf), "%s: %s backing /boot/rootfs.img\n",
+							 is_exfat ? "livefile" : "loop", loop_dev->name);
+						console_write(loop_buf);
 						/* If we are running in test/smoke mode, we mount at /mnt/root
 						 * to keep the bootstrap initramfs as active root.
 						 * Otherwise (on real hardware or normal boots), we mount
 						 * loop0 as the primary rootfs at /. */
-						rc = vfs_mount("loop0", "/", "ext4", 0);
+						rc = vfs_mount(loop_dev->name, "/", "ext4", 0);
 						if (rc == 0) {
-							console_write("rootfs: loop0 mounted at / as ext4\n");
+							snprintf(loop_buf, sizeof(loop_buf), "rootfs: %s mounted at / as ext4\n", loop_dev->name);
+							console_write(loop_buf);
 							vfs_repopulate_after_root_mount();
 								if (mounted_iso_name[0] != '\0') {
 									int remount_rc = vfs_mount(mounted_iso_name, "/mnt/iso", is_exfat ? "exfat" : "iso9660", 0);

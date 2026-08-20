@@ -101,7 +101,7 @@ programs      zsh curl libcurl samurai bmake dropbear dropbear-ssh \
 # process, that process needs a working EGL, and with no driver under libEGL it
 # died with "Initialization of all EGL display types failed" and no window ever
 # appeared.
-browser       chromium chromium-swiftshader
+browser       chromium chromium-swiftshader strace
 
 # The curl library, for what links against it rather than runs it (NetSurf).
 curlbuild     libcurl curl-dev curl-static
