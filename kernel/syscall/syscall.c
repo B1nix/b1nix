@@ -2,6 +2,7 @@
 #include <b1nix/console.h>
 #include <b1nix/dirent.h>
 #include <b1nix/errno.h>
+#include <b1nix/kprintf.h>
 #include <b1nix/initramfs.h>
 #include <b1nix/io.h>
 #include <b1nix/klog.h>
@@ -2053,7 +2054,13 @@ static isize sys_mount(const char *user_src, const char *user_target,
   char *ksrc = kmalloc(VFS_MAX_PATH);
   if (!ksrc)
     return -ENOMEM;
-  if (strncpy_from_user(ksrc, user_src, VFS_MAX_PATH) < 0) {
+  /* source and type are both allowed to be NULL: a propagation change
+   * (mount(NULL, "/", NULL, MS_REC|MS_SHARED, NULL) — the first thing systemd
+   * does as PID 1) and a remount name neither. Copying from a NULL pointer
+   * reported EFAULT, which systemd treats as fatal for the propagation call. */
+  if (!user_src)
+    ksrc[0] = '\0';
+  else if (strncpy_from_user(ksrc, user_src, VFS_MAX_PATH) < 0) {
     kfree(ksrc);
     return -EFAULT;
   }
@@ -2069,15 +2076,34 @@ static isize sys_mount(const char *user_src, const char *user_target,
     return -EFAULT;
   }
 
-  /* MS_MOVE moves a mount that already exists, so there is no filesystem type
-   * to name and userspace passes NULL — switch_root calls
-   * mount(".", "/", NULL, MS_MOVE, NULL). Paths go through the resolver
-   * because that "." is relative to the caller's cwd. */
+  /* The operations that name no filesystem, in the order Linux checks them.
+   * Each of these takes a target that already exists and changes something
+   * about it, so none of them reaches the filesystem type at all. */
   if (flags & MS_MOVE) {
+    /* switch_root calls mount(".", "/", NULL, MS_MOVE, NULL); the "." is
+     * relative to the caller's cwd, so both go through the resolver. */
     int mres = vfs_move_mount(ksrc, ktarget);
     kfree(ksrc);
     kfree(ktarget);
     return (isize)mres;
+  }
+  if (flags & MS_PROPAGATION_MASK) {
+    int pres = vfs_set_propagation(ktarget, flags);
+    kfree(ksrc);
+    kfree(ktarget);
+    return (isize)pres;
+  }
+  if (flags & MS_BIND) {
+    int bres = vfs_bind_mount(ksrc, ktarget, flags);
+    kfree(ksrc);
+    kfree(ktarget);
+    return (isize)bres;
+  }
+  if (flags & MS_REMOUNT) {
+    int rres = vfs_remount(ktarget, flags);
+    kfree(ksrc);
+    kfree(ktarget);
+    return (isize)rres;
   }
 
   char *ktype = kmalloc(64);
@@ -2096,6 +2122,15 @@ static isize sys_mount(const char *user_src, const char *user_target,
   }
 
   int res = vfs_mount(ksrc, ktarget, ktype, flags);
+  /* Which mounts an init system actually asks for, and what it got. A mount
+   * that fails non-fatally (systemd tries three variants of cgroup2 before
+   * falling back) is invisible from the guest side. */
+  if (bootinfo_has_flag("b1nix.trace-mount")) {
+    char line[256];
+    snprintf(line, sizeof(line), "mount: '%s' -> '%s' type='%s' flags=0x%llx = %d",
+             ksrc, ktarget, ktype, (unsigned long long)flags, res);
+    klog_info(line);
+  }
   kfree(ksrc);
   kfree(ktarget);
   kfree(ktype);
@@ -2299,7 +2334,7 @@ static void fill_b1nix_utsname(struct b1nix_utsname *uts) {
   memset(uts, 0, sizeof(*uts));
   copy_cstr(uts->sysname, sizeof(uts->sysname), "B1NIX");
   kernel_hostname_get(uts->nodename, sizeof(uts->nodename));
-  copy_cstr(uts->release, sizeof(uts->release), B1NIX_VERSION_STR);
+  copy_cstr(uts->release, sizeof(uts->release), B1NIX_RELEASE_STR);
   copy_cstr(uts->version, sizeof(uts->version), "#1 SMP");
 #if defined(__aarch64__)
   copy_cstr(uts->machine, sizeof(uts->machine), "aarch64");
@@ -2317,10 +2352,47 @@ static isize sys_linux_uname(u64 arg0) {
   fill_b1nix_utsname(&uts);
   struct linux_utsname lx;
   linux_utsname_from_b1nix(&lx, &uts);
+  /* A process running under the Linux personality is told it is on Linux, and
+   * told a Linux kernel version.
+   *
+   * This is not decoration. glibc's ld.so refuses to start with "FATAL: kernel
+   * too old" unless the release string parses as at least the version its
+   * NT_GNU_ABI_TAG note asks for (3.2.0 for every Debian binary), and a
+   * distribution's shell scripts branch on `uname -s`. b1nix's own version is
+   * kept in the string rather than hidden, so a boot log still identifies the
+   * kernel that is actually running. Native-personality callers keep seeing
+   * "B1NIX" and the bare version. */
+  copy_cstr(lx.sysname, sizeof(lx.sysname), "Linux");
+  copy_cstr(lx.release, sizeof(lx.release),
+            B1NIX_RELEASE_STR);
+  copy_cstr(lx.version, sizeof(lx.version), "#1 SMP b1nix");
   kernel_domainname_get(lx.domainname, sizeof(lx.domainname));
   if (copy_to_user((void *)(usize)arg0, &lx, sizeof(lx)) < 0)
     return -EFAULT;
   return 0;
+}
+
+/* The caller's user registers, for a clone(2) child that must resume with them
+ * (see struct clone_user_regs). */
+static void clone_regs_from_frame(struct clone_user_regs *r,
+                                  const struct interrupt_frame *f) {
+  memset(r, 0, sizeof(*r));
+  if (!f)
+    return;
+  r->rbx = f->rbx;
+  r->rcx = f->rcx;
+  r->rdx = f->rdx;
+  r->rsi = f->rsi;
+  r->rdi = f->rdi;
+  r->rbp = f->rbp;
+  r->r8 = f->r8;
+  r->r9 = f->r9;
+  r->r10 = f->r10;
+  r->r11 = f->r11;
+  r->r12 = f->r12;
+  r->r13 = f->r13;
+  r->r14 = f->r14;
+  r->r15 = f->r15;
 }
 
 /* Map a b1nix dirent type (1=file, 2=device, 3=directory) to a Linux d_type. */
@@ -3025,6 +3097,8 @@ struct syscall_cmsghdr {
 #define K_SOL_SOCKET 1
 #define K_SCM_RIGHTS 1
 #define K_SCM_CREDENTIALS 2
+#define K_SCM_TIMESTAMP 29
+#define K_SCM_TIMESTAMPNS 35
 #define K_MSG_CTRUNC 0x08
 #define K_CMSG_ALIGN(n) (((n) + sizeof(usize) - 1) & ~(sizeof(usize) - 1))
 
@@ -3271,6 +3345,43 @@ static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
       ctrunc = 1;
     }
   }
+  /* SCM_TIMESTAMP: when the socket asked for arrival stamps, every received
+   * message carries the moment it landed in the receive buffer. */
+  {
+    int ts_mode = vfs_socket_timestamp_enabled(fd);
+    u64 stamp = ts_mode ? vfs_socket_last_timestamp_usec(fd) : 0;
+    if (ts_mode && stamp) {
+      /* SO_TIMESTAMP carries a struct timeval, SO_TIMESTAMPNS a timespec. */
+      i64 val[2];
+      usize vlen;
+      int ctype;
+      if (ts_mode == 1) {
+        val[0] = (i64)(stamp / 1000000ull);
+        val[1] = (i64)(stamp % 1000000ull);
+        ctype = K_SCM_TIMESTAMP;
+        vlen = sizeof(val);
+      } else {
+        val[0] = (i64)(stamp / 1000000ull);
+        val[1] = (i64)((stamp % 1000000ull) * 1000ull);
+        ctype = K_SCM_TIMESTAMPNS;
+        vlen = sizeof(val);
+      }
+      usize cmsg_len = header_space + vlen;
+      usize space = header_space + K_CMSG_ALIGN(vlen);
+      if (control_len + space <= msg.msg_controllen &&
+          control_len + space <= sizeof(control)) {
+        struct syscall_cmsghdr *c =
+            (struct syscall_cmsghdr *)(control + control_len);
+        c->cmsg_len = cmsg_len;
+        c->cmsg_level = K_SOL_SOCKET;
+        c->cmsg_type = ctype;
+        memcpy((u8 *)c + sizeof(*c), val, vlen);
+        control_len += space;
+      } else {
+        ctrunc = 1;
+      }
+    }
+  }
   if (has_cred) {
     usize cmsg_len = header_space + sizeof(cred);
     usize space = header_space + K_CMSG_ALIGN(sizeof(cred));
@@ -3378,18 +3489,27 @@ static int socklen_copyout(void *user, usize klen) {
 }
 
 static u64 sys_accept(int fd, void *addr, usize *addrlen) {
-  /*addrlen is both in and out */
-  usize k_addrlen = 0;
+  /* addrlen is both in and out: in, the room the caller has; out, how long the
+   * address really is. The two are NOT the same number, and writing the second
+   * one's worth of bytes into the first one's buffer is memory corruption —
+   * dbus-daemon accepts with a 16-byte `struct sockaddr` and got a 110-byte
+   * sockaddr_un written over its stack frame ("*** stack smashing detected
+   * ***", SIGABRT, the system bus gone). Linux truncates the copy and reports
+   * the untruncated length, which is how a caller knows it needs a bigger
+   * buffer. */
+  usize user_cap = 0;
   if (addrlen) {
-    if (socklen_copyin(&k_addrlen, addrlen) != 0) return (u64)-EFAULT;
+    if (socklen_copyin(&user_cap, addrlen) != 0) return (u64)-EFAULT;
   }
 
   char k_addr[128]; /* enough for sockaddr_un */
+  usize k_addrlen = user_cap;
   int res = vfs_accept(fd, k_addr, &k_addrlen);
   if (res >= 0) {
-    if (addr && k_addrlen > 0) {
-      if (k_addrlen > sizeof(k_addr)) k_addrlen = sizeof(k_addr);
-      if (syscall_copyout(addr, k_addr, k_addrlen) != 0) return (u64)-EFAULT;
+    if (k_addrlen > sizeof(k_addr)) k_addrlen = sizeof(k_addr);
+    usize out = k_addrlen < user_cap ? k_addrlen : user_cap;
+    if (addr && out > 0) {
+      if (syscall_copyout(addr, k_addr, out) != 0) return (u64)-EFAULT;
     }
     if (addrlen) {
       if (socklen_copyout(addrlen, k_addrlen) != 0) return (u64)-EFAULT;
@@ -3436,13 +3556,18 @@ static u64 sys_getsockaddr(int fd, void *user_addr, usize *user_addrlen,
   if (socklen_copyin(&klen, user_addrlen) != 0)
     return (u64)-EFAULT;
   char kaddr[128];
+  usize user_cap = klen;
   if (klen > sizeof(kaddr))
     klen = sizeof(kaddr);
   int rc = want_peer ? vfs_getpeername(fd, kaddr, &klen)
                      : vfs_getsockname(fd, kaddr, &klen);
   if (rc < 0)
     return (u64)rc;
-  usize out = klen < sizeof(kaddr) ? klen : sizeof(kaddr);
+  if (klen > sizeof(kaddr))
+    klen = sizeof(kaddr);
+  /* Truncate to what the caller offered; report the real length (see
+   * sys_accept). */
+  usize out = klen < user_cap ? klen : user_cap;
   if (user_addr && out > 0 && syscall_copyout(user_addr, kaddr, out) < 0)
     return (u64)-EFAULT;
   if (socklen_copyout(user_addrlen, klen) != 0)
@@ -3597,6 +3722,58 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
           vaddr = vm_find_free_area(t, length);
         }
       }
+    }
+  }
+
+  /* Never return a range that is already somebody's.
+   *
+   * The free-area search deliberately runs without the VMA list lock — it is
+   * the longest walk in the kernel and holding a lock across it stalls every
+   * fault on every CPU. That is only sound while nothing else relinks the list
+   * underneath it, and "nothing else" is an assumption, not a guarantee. If the
+   * answer overlaps a live mapping, the caller is handed memory that already
+   * belongs to someone, and the two owners overwrite each other's data with no
+   * fault and no clue. Verify under the lock and search again; say so, because
+   * a retry here means the assumption above did not hold.
+   *
+   * Behind b1nix.vma-check: the verification walks the whole mapping list with
+   * the lock held, and a browser holds thousands of mappings and makes tens of
+   * thousands of calls — paid on every one, it cost twenty times the start-up
+   * time. It has never once fired, so it is a check to run when the placement
+   * is in question, not on every mmap forever. */
+  if (vaddr != (u64)-1 && !(flags & MAP_FIXED) &&
+      bootinfo_has_flag("b1nix.vma-check")) {
+    for (int attempt = 0; attempt < 4; attempt++) {
+      u64 cvflags;
+      int overlap = 0;
+
+      vma_list_lock(&cvflags);
+      for (struct vm_area *v = t->vma_list; v; v = v->next) {
+        if (v->start >= vaddr + length || v->end <= vaddr)
+          continue;
+        overlap = 1;
+        break;
+      }
+      vma_list_unlock(cvflags);
+      if (!overlap)
+        break;
+      {
+        static unsigned reported;
+
+        if (reported < 8) {
+          reported++;
+          console_write("mmap: placement landed on a live mapping at 0x");
+          console_write_hex64(vaddr);
+          console_write(" len 0x");
+          console_write_hex64((u64)length);
+          console_write(" in ");
+          console_write(t->name ? t->name : "?");
+          console_write("\n");
+        }
+      }
+      vaddr = vm_find_free_area(t, length);
+      if (vaddr == (u64)-1)
+        break;
     }
   }
 
@@ -3916,16 +4093,11 @@ static int mmap_failed(u64 r) { return r >= (u64)-4095; }
 static void mremap_note(const char *how, u64 from_len, u64 to_len) {
   static unsigned seen;
 
-  if (seen >= 32)
+  if (seen >= 32 || !console_level_enabled(LOGLEVEL_DEBUG))
     return;
   seen++;
-  console_write("mremap: ");
-  console_write(how);
-  console_write(" 0x");
-  console_write_hex64(from_len);
-  console_write(" -> 0x");
-  console_write_hex64(to_len);
-  console_write("\n");
+  k_dbg("mremap", "%s 0x%lx -> 0x%lx", how, (unsigned long)from_len,
+        (unsigned long)to_len);
 }
 
 static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
@@ -5355,18 +5527,57 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_FUTEX           202
 #define LX_ioctl           16
 #define LX_nanosleep       35
+#define LX_clone3          435
+#define LX_epoll_pwait2    441
+/* clone3 flags this kernel does not model, in the high word of clone_args. */
+#define LX_CLONE_PIDFD        0x00001000ULL
+#define LX_CLONE_INTO_CGROUP  0x200000000ULL
 
       /* Resolve a dirfd + user path to an absolute kernel path.
        * dirfd == AT_FDCWD (-100) or an absolute path → resolve normally.
        * Otherwise, get the absolute path of dirfd and join with the relative path.
        * Returns 0 on success, -errno on failure. kbuf must be VFS_MAX_PATH. */
+      /* symlinkat(target, newdirfd, linkpath) does NOT have (dirfd, path) as
+       * its first two arguments: arg0 is the symlink's CONTENT and arg1 is the
+       * descriptor. The generic block below read arg1 as a user string, so
+       * every symlinkat copied from the address 0xffffff9c (AT_FDCWD) and
+       * returned EFAULT — "Failed to create symlink '/var/lib/dbus/machine-id':
+       * Bad address" from systemd-tmpfiles, and the same for every symlink any
+       * glibc program creates through the *at form. */
+      if (number == LX_symlinkat) {
+        char target[VFS_MAX_PATH];
+        if (syscall_copyinstr(target, sizeof(target),
+                              (const char *)(usize)arg0) < 0)
+          return (u64)-EFAULT;
+        char lk_kpath[VFS_MAX_PATH];
+        if (syscall_copyinstr(lk_kpath, sizeof(lk_kpath),
+                              (const char *)(usize)arg2) < 0)
+          return (u64)-EFAULT;
+        if (lk_kpath[0] != '/' && (int)arg1 != AT_FDCWD) {
+          char lk_dirbuf[VFS_MAX_PATH];
+          int lrc = vfs_fd_abspath((int)arg1, lk_dirbuf, sizeof(lk_dirbuf));
+          if (lrc < 0)
+            return (u64)lrc;
+          char lk_joined[VFS_MAX_PATH];
+          usize ldlen = (usize)lrc;
+          if (ldlen + 1 + strlen(lk_kpath) >= sizeof(lk_joined))
+            return (u64)-ENAMETOOLONG;
+          memcpy(lk_joined, lk_dirbuf, ldlen);
+          lk_joined[ldlen] = '/';
+          strcpy(lk_joined + ldlen + 1, lk_kpath);
+          memcpy(lk_kpath, lk_joined, sizeof(lk_kpath));
+        }
+        char lk_resolved[VFS_MAX_PATH];
+        vfs_resolve_path(lk_kpath, lk_resolved);
+        return (u64)vfs_symlink(target, lk_resolved);
+      }
       if (number == LX_openat || number == LX_newfstatat ||
           number == LX_unlinkat || number == LX_mkdirat ||
           number == LX_mknodat ||
           number == LX_fchmodat || number == LX_fchownat ||
           number == LX_faccessat || number == LX_faccessat2 ||
           number == LX_readlinkat ||
-          number == LX_symlinkat || number == LX_renameat2 ||
+          number == LX_renameat2 ||
           number == LX_renameat ||
           number == LX_linkat) {
         int dirfd = (int)arg0;
@@ -5374,6 +5585,62 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         char kpath[VFS_MAX_PATH];
         if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
           return (u64)-EFAULT;
+        /* AT_EMPTY_PATH: an empty path means "the file dirfd already refers
+         * to". glibc's fstat() is exactly this — newfstatat(fd, "", &st,
+         * AT_EMPTY_PATH) — so without it every library glibc's loader opened
+         * failed at "cannot stat shared object": the empty path was appended
+         * to the fd's own path, producing "…/libc.so.6/" and -ENOTDIR. */
+        if (kpath[0] == '\0') {
+          int at_flags;
+          switch (number) {
+          case LX_newfstatat:
+          case LX_faccessat2:
+            at_flags = (int)arg3;
+            break;
+          /* fchownat(dirfd, path, owner, group, flags): the flags are the
+           * FIFTH argument. Reading the fourth found the GROUP id there, which
+           * never has AT_EMPTY_PATH set, so every fchownat(fd, "", u, g,
+           * AT_EMPTY_PATH) — how systemd copies ownership onto a temporary
+           * file — was rejected with ENOENT. systemd-sysusers died on it while
+           * writing /etc/gshadow, so the users dbus needs were never created
+           * and the bus refused to start. */
+          case LX_fchownat:
+          case LX_linkat:
+            at_flags = (int)arg4;
+            break;
+          default:
+            at_flags = 0;
+            break;
+          }
+          /* fstat(2) on a descriptor: answer from the descriptor itself, not
+           * from a path. A pipe, a socket or a deleted file has no path to
+           * resolve — that is why `cmd | tail` reported "cannot fstat
+           * 'standard input': Bad file descriptor", and why cat's check on
+           * its own stdout failed with ENOENT once devtmpfs had been mounted
+           * over the /dev the console fd was opened from. */
+          if (number == LX_newfstatat && (at_flags & AT_EMPTY_PATH) &&
+              dirfd != AT_FDCWD) {
+            struct b1nix_stat st;
+            int rc = vfs_fstat(dirfd, &st);
+            if (rc < 0)
+              return (u64)rc;
+            struct linux_stat lst;
+            linux_stat_from_b1nix(&lst, &st);
+            if (syscall_copyout((void *)(usize)arg2, &lst, sizeof(lst)) < 0)
+              return (u64)-EFAULT;
+            return 0;
+          }
+          /* Likewise for chown: answer from the descriptor. A path lookup is
+           * a fallback that cannot work for a file with no name. */
+          if (number == LX_fchownat && (at_flags & AT_EMPTY_PATH) &&
+              dirfd != AT_FDCWD)
+            return (u64)vfs_fchown(dirfd, (u16)arg2, (u16)arg3);
+          if (!(at_flags & AT_EMPTY_PATH) || dirfd == AT_FDCWD)
+            return (u64)-ENOENT;
+          int rc = vfs_fd_abspath(dirfd, kpath, sizeof(kpath));
+          if (rc < 0)
+            return (u64)rc;
+        }
         /* If path is absolute or dirfd is AT_FDCWD, use as-is. */
         if (kpath[0] != '/' && dirfd != AT_FDCWD) {
           char dirbuf[VFS_MAX_PATH];
@@ -5456,40 +5723,6 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           char new_resolved[VFS_MAX_PATH];
           vfs_resolve_path(new_kpath, new_resolved);
           return (u64)vfs_link(resolved, new_resolved);
-        }
-        case LX_symlinkat: {
-          /* Linux symlinkat(target, newdirfd, linkpath):
-           *   arg0 = target (the CONTENT of the symlink)
-           *   arg1 = newdirfd
-           *   arg2 = linkpath (where to create the symlink)
-           * The outer code resolves (arg0=dirfd, arg1=path) which is WRONG for
-           * symlinkat — arg0 is the target, not a dirfd. Re-resolve properly. */
-          char target[VFS_MAX_PATH];
-          if (syscall_copyinstr(target, sizeof(target),
-                                (const char *)(usize)arg0) < 0)
-            return (u64)-EFAULT;
-          /* Resolve linkpath from (arg1=newdirfd, arg2=linkpath). */
-          char lk_kpath[VFS_MAX_PATH];
-          if (syscall_copyinstr(lk_kpath, sizeof(lk_kpath),
-                                (const char *)(usize)arg2) < 0)
-            return (u64)-EFAULT;
-          if (lk_kpath[0] != '/' && (int)arg1 != AT_FDCWD) {
-            char lk_dirbuf[VFS_MAX_PATH];
-            int lrc = vfs_fd_abspath((int)arg1, lk_dirbuf, sizeof(lk_dirbuf));
-            if (lrc < 0)
-              return (u64)lrc;
-            char lk_joined[VFS_MAX_PATH];
-            usize ldlen = (usize)lrc;
-            if (ldlen + 1 + strlen(lk_kpath) >= sizeof(lk_joined))
-              return (u64)-ENAMETOOLONG;
-            memcpy(lk_joined, lk_dirbuf, ldlen);
-            lk_joined[ldlen] = '/';
-            strcpy(lk_joined + ldlen + 1, lk_kpath);
-            memcpy(lk_kpath, lk_joined, sizeof(lk_kpath));
-          }
-          char lk_resolved[VFS_MAX_PATH];
-          vfs_resolve_path(lk_kpath, lk_resolved);
-          return (u64)vfs_symlink(target, lk_resolved);
         }
         case LX_readlinkat: {
           /* arg0=dirfd, arg1=path, arg2=buf, arg3=bufsize. */
@@ -5709,12 +5942,23 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return (u64)ready_count;
       }
       if (number == LX_accept4) {
-        /* accept4(sockfd, addr, addrlen, flags): accept + set FD_CLOEXEC
-         * and O_NONBLOCK from flags. */
-        int rc = (int)vfs_accept((int)arg0, (void *)(usize)arg1,
-                                  (usize *)(usize)arg2);
-        if (rc < 0)
-          return (u64)rc;
+        /* accept4(sockfd, addr, addrlen, flags): accept + set FD_CLOEXEC and
+         * O_NONBLOCK from flags.
+         *
+         * Through sys_accept, NOT straight into vfs_accept with the caller's
+         * pointers. Handing user addresses to the VFS meant the peer address
+         * was written into the caller's buffer with no regard for how big the
+         * caller said it was, and the socklen_t beside it was written as a
+         * 64-bit word over a 32-bit field. dbus-daemon accepts with a 16-byte
+         * `struct sockaddr` on its stack; both writes ran past it, and glibc's
+         * canary caught the wreckage as "*** stack smashing detected ***" —
+         * SIGABRT, and the system bus gone on the first connection it
+         * served. */
+        u64 arc = sys_accept((int)arg0, (void *)(usize)arg1,
+                             (usize *)(usize)arg2);
+        if ((isize)arc < 0)
+          return arc;
+        int rc = (int)arc;
         if (arg3 & 02000000) /* O_CLOEXEC */
           sys_fcntl(rc, B1NIX_F_SETFD, B1NIX_FD_CLOEXEC);
         if (arg3 & 04000) /* O_NONBLOCK */
@@ -5774,10 +6018,59 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return 0;
       if (number == LX_prlimit64) {
         /* prlimit64(pid, resource, new_limit, old_limit).
-         * Simplified: only support getrlimit (new_limit=0). */
+         *
+         * Only the calling process's own limits are addressable (pid 0 or our
+         * own pid); Linux allows other pids under CAP_SYS_RESOURCE, which this
+         * kernel does not model. The old value is fetched BEFORE the new one is
+         * installed, which is the whole point of the combined call and what
+         * glibc's setrlimit64 and every shell's `ulimit` rely on. */
+        usize pid = (usize)arg0;
+        if (pid != 0 && pid != namespace_pid_to_user(scheduler_get_pid()))
+          return (u64)-EPERM;
+        if (arg3) {
+          isize r = sys_getrlimit((int)arg1, (void *)(usize)arg3);
+          if (r < 0)
+            return (u64)r;
+        }
         if (arg2)
-          return (u64)-ENOSYS; /* set not implemented yet */
-        return (u64)sys_getrlimit((int)arg1, (void *)(usize)arg3);
+          return (u64)sys_setrlimit((int)arg1, (const void *)(usize)arg2);
+        return 0;
+      }
+      /* epoll_pwait2(epfd, events, maxevents, timespec*, sigmask, sigsetsize)
+       * — epoll_pwait with a nanosecond timeout instead of a millisecond one.
+       * The wait itself has millisecond resolution here, so the timeout is
+       * rounded UP: a caller asking for 100 us must not be told "0", which
+       * means "return immediately" and turns a poll loop into a spin. */
+      if (number == LX_epoll_pwait2) {
+        int timeout_ms = -1;
+        if (arg3) {
+          struct timespec ts;
+          if (syscall_copyin(&ts, (const void *)(usize)arg3, sizeof(ts)) < 0)
+            return (u64)-EFAULT;
+          if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
+            return (u64)-EINVAL;
+          u64 ms = (u64)ts.tv_sec * 1000ull + ((u64)ts.tv_nsec + 999999ull) / 1000000ull;
+          if (ms > 0x7fffffffull)
+            ms = 0x7fffffffull;
+          timeout_ms = (int)ms;
+        }
+        int maxevents = (int)arg2;
+        if (maxevents <= 0)
+          return (u64)-EINVAL;
+        enum { EPOLL_PWAIT2_BATCH = 64 };
+        if (maxevents > EPOLL_PWAIT2_BATCH)
+          maxevents = EPOLL_PWAIT2_BATCH;
+        if (!arg1)
+          return (u64)-EFAULT;
+        struct b1nix_epoll_event kbuf[EPOLL_PWAIT2_BATCH];
+        int n = vfs_epoll_wait((int)arg0, kbuf, maxevents, timeout_ms);
+        if (n < 0)
+          return (u64)(isize)n;
+        if (n > 0 &&
+            syscall_copyout((void *)(usize)arg1, kbuf,
+                            (usize)n * sizeof(struct b1nix_epoll_event)) < 0)
+          return (u64)-EFAULT;
+        return (u64)n;
       }
       if (number == LX_set_robust_list) {
         /* set_robust_list(head, len): store the robust futex list head.
@@ -5787,6 +6080,62 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       if (number == LX_get_robust_list) {
         /* get_robust_list(pid, head_ptr, len_ptr): not implemented. */
         return (u64)-ENOSYS;
+      }
+      /* clone3(&args, size) — what glibc 2.34+ reaches for first in
+       * pthread_create and posix_spawn. It is the same thread creation as
+       * clone(2) with the arguments moved into a versioned struct, plus two
+       * things the flat call cannot express: the stack is given as the LOW
+       * address of the mapping with an explicit size (so the kernel computes
+       * the initial SP), and exit_signal is a full word rather than the low
+       * byte of the flags. glibc falls back to clone(2) on -ENOSYS, so this is
+       * not strictly required — but returning -ENOSYS costs every process a
+       * failed syscall at start-up and leaves the newer interface untested. */
+      if (number == LX_clone3) {
+        struct lx_clone_args {
+          u64 flags;
+          u64 pidfd;
+          u64 child_tid;
+          u64 parent_tid;
+          u64 exit_signal;
+          u64 stack;
+          u64 stack_size;
+          u64 tls;
+          u64 set_tid;
+          u64 set_tid_size;
+          u64 cgroup;
+        } ca;
+        usize size = (usize)arg1;
+        /* Linux accepts any size from CLONE_ARGS_SIZE_VER0 (64) upwards and
+         * requires the tail beyond what it knows to be zero. Copy what we
+         * understand and ignore a longer tail. */
+        if (size < 64)
+          return (u64)-EINVAL;
+        memset(&ca, 0, sizeof(ca));
+        usize copy = size < sizeof(ca) ? size : sizeof(ca);
+        if (syscall_copyin(&ca, (const void *)(usize)arg0, copy) < 0)
+          return (u64)-EFAULT;
+        /* Not modelled: pidfd hand-back, cgroup placement, caller-chosen tids. */
+        if (ca.set_tid || ca.set_tid_size || ca.cgroup)
+          return (u64)-EINVAL;
+        if (ca.flags & (LX_CLONE_PIDFD | LX_CLONE_INTO_CGROUP))
+          return (u64)-EINVAL;
+        if (ca.exit_signal > 63)
+          return (u64)-EINVAL;
+        /* The child's stack pointer is the TOP of the region, as Linux
+         * documents: "stack points to the lowest byte". A zero stack means
+         * fork-like sharing of the caller's, which the clone path handles. */
+        u64 child_sp = ca.stack ? ca.stack + ca.stack_size : 0;
+        u64 flags = ca.flags | (ca.exit_signal & 0xff);
+        if (!(flags & B1NIX_CLONE_VM) && child_sp == 0)
+          return ns_pid_out((u64)scheduler_fork_clone(flags, ca.parent_tid,
+                                                      ca.child_tid));
+        u64 child_entry = frame ? frame->rip : child_sp;
+        struct clone_user_regs uregs;
+        clone_regs_from_frame(&uregs, frame);
+        return (u64)scheduler_clone_thread(flags, child_entry, child_sp, 0,
+                                           ca.tls, ca.child_tid, ca.parent_tid,
+                                           ca.child_tid, arg5,
+                                           frame ? &uregs : 0);
       }
       /* Linux clone(2) has a different argument layout than b1nix SYS_CLONE:
        *   Linux: clone(flags, user_stack, parent_tidptr, child_tidptr, tls)
@@ -5815,6 +6164,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
          * surfaced far away, as a heap consistency check firing inside free(),
          * because that is where the wreckage was next touched.
          */
+        /* clone(2) without CLONE_VM and without a stack is fork(2): the child
+         * gets a copy of the address space and continues on the same stack.
+         * scheduler_clone_thread only ever makes threads and rejected a NULL
+         * stack outright with -EFAULT, which is what glibc reported as
+         * "Cannot fork" — musl never hit it because its fork passes plain
+         * SIGCHLD and took the native fork path. */
+        if (!(flags & B1NIX_CLONE_VM) && user_stack == 0)
+          return ns_pid_out(
+              (u64)scheduler_fork_clone(flags, parent_tid, child_tid));
+
         u64 b1nix_flags = flags;
         /* M92: musl's __clone stores the start_routine pointer in r9 before
          * calling syscall. The child expects to resume at the parent's RIP
@@ -5824,9 +6183,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
          * continues at the correct instruction. */
         u64 start_func = arg5; /* musl puts fn in r9 before syscall */
         u64 child_entry = frame ? frame->rip : user_stack;
+        struct clone_user_regs uregs;
+        clone_regs_from_frame(&uregs, frame);
         return (u64)scheduler_clone_thread(b1nix_flags, child_entry,
                                            user_stack, 0, tls_val, child_tid,
-                                           parent_tid, child_tid, start_func);
+                                           parent_tid, child_tid, start_func,
+                                           frame ? &uregs : 0);
       }
       /* Futex with extended ops for musl (WAIT_BITSET, WAKE_BITSET, REQUEUE,
        * CMP_REQUEUE, PRIVATE_FLAG). The dispatcher routes futex through
@@ -6106,89 +6468,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         arg2 = arg3;
       }
 
-      /* M92: termios struct translation for Linux tasks.
-       * Linux struct termios (44B): c_iflag(4), c_oflag(4), c_cflag(4),
-       * c_lflag(4), c_line(1), c_cc[19](19). Total 44.
-       * b1nix struct b1nix_termios (48B): c_iflag(4), c_oflag(4), c_cflag(4),
-       * c_lflag(4), c_cc[32](32). Total 48.
-       * Field order differs after c_lflag. Translate on TCGETS/TCSETS. */
-      if (number == LX_ioctl) {
-        int fd = (int)arg0;
-        u64 request = arg1;
-        /* Linux TCGETS=0x5401, TCSETS=0x5402 — same as b1nix. */
-        struct linux_termios {
-          u32 c_iflag;
-          u32 c_oflag;
-          u32 c_cflag;
-          u32 c_lflag;
-          u8 c_line;
-          u8 c_cc[19];
-        };
-        /* NOTE: device ioctl handlers (pty, serial tty) read/write their
-         * termios argument with syscall_copyin/copyout, which reject kernel
-         * pointers. So we cannot hand them a kernel-stack scratch struct —
-         * we repack through the caller's own (user) buffer and dispatch with
-         * the user pointer. arg2 points at musl's struct termios (>=48B), so
-         * a 48-byte b1nix_termios fits. */
-        if (request == B1NIX_TCGETS) {
-          /* Device fills the user buffer with b1nix layout, then we convert
-           * it to Linux layout in place. */
-          int rc = (int)vfs_ioctl(fd, B1NIX_TCGETS, (void *)(usize)arg2);
-          if (rc < 0)
-            return (u64)rc;
-          struct b1nix_termios bt;
-          if (syscall_copyin(&bt, (void *)(usize)arg2, sizeof(bt)) < 0)
-            return (u64)-EFAULT;
-          struct linux_termios lt;
-          lt.c_iflag = bt.c_iflag;
-          lt.c_oflag = bt.c_oflag;
-          lt.c_cflag = bt.c_cflag;
-          lt.c_lflag = bt.c_lflag;
-          lt.c_line = 0;
-          memset(lt.c_cc, 0, sizeof(lt.c_cc));
-          usize copy = sizeof(lt.c_cc) < sizeof(bt.c_cc)
-                           ? sizeof(lt.c_cc)
-                           : sizeof(bt.c_cc);
-          memcpy(lt.c_cc, bt.c_cc, copy);
-          if (syscall_copyout((void *)(usize)arg2, &lt, sizeof(lt)) < 0)
-            return (u64)-EFAULT;
-          return 0;
-        }
-        if (request == B1NIX_TCSETS || request == B1NIX_TCSETSW ||
-            request == B1NIX_TCSETSF) {
-          struct linux_termios lt;
-          if (syscall_copyin(&lt, (void *)(usize)arg2, sizeof(lt)) < 0)
-            return (u64)-EFAULT;
-          struct b1nix_termios bt;
-          memset(&bt, 0, sizeof(bt));
-          bt.c_iflag = lt.c_iflag;
-          bt.c_oflag = lt.c_oflag;
-          bt.c_cflag = lt.c_cflag;
-          bt.c_lflag = lt.c_lflag;
-          memcpy(bt.c_cc, lt.c_cc, sizeof(lt.c_cc));
-          /* Repack the b1nix layout back into the user buffer so the device's
-           * user-validated copyin succeeds, then dispatch with the user ptr.
-           * TCSADRAIN/TCSAFLUSH map to TCSETS (no output buffering).
-           *
-           * tcsetattr(3) takes a `const struct termios *`, so the caller's
-           * buffer must come back unchanged: save the original bytes and
-           * restore them afterwards. Leaving the b1nix layout behind shifted
-           * the caller's copy by one byte (c_cc[0] became c_cc[1], i.e. VINTR
-           * read back as VQUIT), so a second tcsetattr with the same struct
-           * installed the wrong control characters. */
-          u8 user_saved[sizeof(struct b1nix_termios)];
-          if (syscall_copyin(user_saved, (void *)(usize)arg2,
-                             sizeof(user_saved)) < 0)
-            return (u64)-EFAULT;
-          if (syscall_copyout((void *)(usize)arg2, &bt, sizeof(bt)) < 0)
-            return (u64)-EFAULT;
-          int src = vfs_ioctl(fd, B1NIX_TCSETS, (void *)(usize)arg2);
-          if (syscall_copyout((void *)(usize)arg2, user_saved,
-                              sizeof(user_saved)) < 0)
-            return (u64)-EFAULT;
-          return (u64)src;
-        }
-      }
+      /* termios needs no per-personality translation any more: every tty
+       * driver reads and writes the Linux wire layout directly (see
+       * <b1nix/termios_abi.h>). The translation that used to live here
+       * repacked through the CALLER'S buffer, writing a 48-byte
+       * struct b1nix_termios into what glibc passes to TCGETS — a 36-byte
+       * struct __kernel_termios — and smashed 12 bytes of its stack. */
       /* ── M40 completion: the rest of the Linux syscall surface ────────────
        * Every call below needs an argument-shape or semantic translation, so it
        * cannot be a plain number-table entry. Grouped by area. */
@@ -6283,11 +6568,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                    : (u64)-EFAULT;
       }
 
-      /* gettimeofday(96)(tv, tz) and time(201)(t*). The wall clock is the RTC
-       * snapshot plus uptime; sub-second resolution is the 100 Hz tick. */
+      /* gettimeofday(96)(tv, tz) and time(201)(t*). Both halves come from the
+       * one wall clock, for the reason rtc_now_unix_nanos explains. */
       if (number == 96 || number == 201) {
-        u64 secs = vfs_get_unix_time();
-        u64 ticks = scheduler_get_uptime_ticks();
+        u64 wall_ns = rtc_now_unix_nanos();
+        u64 secs = wall_ns / 1000000000ull;
         if (number == 201) {
           if (arg0 &&
               syscall_copyout((void *)(usize)arg0, &secs, sizeof(secs)) != 0)
@@ -6297,7 +6582,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         if (arg0) {
           struct timeval tv;
           tv.tv_sec = (i64)secs;
-          tv.tv_usec = (i64)((ticks % 100) * 10000);
+          tv.tv_usec = (i64)((wall_ns % 1000000000ull) / 1000ull);
           if (syscall_copyout((void *)(usize)arg0, &tv, sizeof(tv)) != 0)
             return (u64)-EFAULT;
         }
@@ -6406,6 +6691,27 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         if (!arg0 ||
             syscall_copyin(&hdr, (const void *)(usize)arg0, sizeof(hdr)) != 0)
           return (u64)-EFAULT;
+        /* The version negotiation, which is not optional.
+         *
+         * Linux answers a header whose version it does not recognise with
+         * EINVAL *and* the version it prefers written back into the header —
+         * that pair is how a caller discovers which layout to use. libcap-ng
+         * opens with capget(&hdr, NULL) and hdr.version = 0 for exactly this,
+         * and marks itself permanently broken if the version it reads back is
+         * not one it knows. Returning 0 and leaving the caller's zero in place
+         * therefore disabled the whole library: dbus-daemon's
+         * capng_change_id() then failed before making a single syscall, with
+         * errno untouched — "Failed to drop capabilities: Success" — and the
+         * system bus never started. */
+        {
+          u32 v = (u32)hdr.version;
+          if (v != 0x19980330u && v != 0x20071026u && v != 0x20080522u) {
+            hdr.version = 0x20080522u; /* _LINUX_CAPABILITY_VERSION_3 */
+            if (syscall_copyout((void *)(usize)arg0, &hdr, sizeof(hdr)) != 0)
+              return (u64)-EFAULT;
+            return (u64)-EINVAL;
+          }
+        }
         /* _LINUX_CAPABILITY_VERSION_1 carries one data struct, _2/_3 carry two
          * (the 64-bit capability set). Writing the wrong count would run off
          * the caller's buffer. */
@@ -7358,7 +7664,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                         (const char **)(usize)arg3, (int)arg4);
   case SYS_WAIT: {
     int kstatus = 0;
-    usize wpid = (usize)arg0;
+    /* The pid argument is an int, and must be read as one.
+     *
+     * glibc emits `mov $-1, %edi` for waitpid(-1, ...), so the register holds
+     * 0x00000000ffffffff — the upper half is not sign-extended, because the
+     * kernel is expected to truncate to int, as Linux's SYSCALL_DEFINE does.
+     * Reading it as a 64-bit value turned "any child" into the pid
+     * 4294967295, which no namespace could resolve: every wait() a Debian
+     * shell made came back -ECHILD and every command it ran reported status
+     * 255. (musl's wrapper widens to long, so this never showed up.) */
+    usize wpid = (usize)(isize)(int)arg0;
     if ((isize)wpid > 0 && !(wpid = ns_pid_in(arg0)))
       return (u64)-ECHILD;
     u64 wr = (u64)scheduler_wait(wpid, &kstatus);
@@ -7374,7 +7689,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     int kstatus = 0;
     /* Only a positive argument names a task; 0, -1 and the < -1 process-group
      * forms are relative to the caller and need no translation. */
-    usize wpid = (usize)arg0;
+    /* The pid argument is an int, and must be read as one.
+     *
+     * glibc emits `mov $-1, %edi` for waitpid(-1, ...), so the register holds
+     * 0x00000000ffffffff — the upper half is not sign-extended, because the
+     * kernel is expected to truncate to int, as Linux's SYSCALL_DEFINE does.
+     * Reading it as a 64-bit value turned "any child" into the pid
+     * 4294967295, which no namespace could resolve: every wait() a Debian
+     * shell made came back -ECHILD and every command it ran reported status
+     * 255. (musl's wrapper widens to long, so this never showed up.) */
+    usize wpid = (usize)(isize)(int)arg0;
     if ((isize)wpid > 0 && !(wpid = ns_pid_in(arg0)))
       return (u64)-ECHILD;
     u64 wr = (u64)scheduler_waitpid(wpid, &kstatus, (int)arg2);
@@ -7540,7 +7864,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                : (u64)-EPERM;
   }
   case SYS_WAITID: {
-    usize wid = (usize)arg1;
+    usize wid = (usize)(isize)(int)arg1;
     if ((arg0 == P_PID || arg0 == P_PGID) && arg1 != 0 && !(wid = ns_pid_in(arg1)))
       return (u64)-ECHILD;
     return (u64)scheduler_waitid((idtype_t)arg0, wid,
@@ -7695,7 +8019,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
      * process the caller may signal, < -1 = process group |pid|, > 0 = that
      * process. The old code sent pid 0 to a task lookup (always failing) and
      * pid -1 to process group 1. */
-    isize target = (isize)arg0;
+    /* Read as an int: a caller that loaded -1 into a 32-bit register leaves
+     * the upper half zero (see the note in SYS_WAITPID). */
+    isize target = (isize)(int)arg0;
     u64 kill_ret;
     /* Translate before decoding: a namespaced caller names both a process and
      * a process group by the numbers its namespace uses. */
@@ -8047,8 +8373,102 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* PR_SET_NAME (15) / PR_GET_NAME (16): the comm name is the task's own
      * string, which we do not rewrite; accept and ignore rather than fail, as
      * callers use it purely for diagnostics. */
-    if (option == 15)
+    /* PR_SET_NAME (15): really change comm. Accepting it and doing nothing
+     * meant a process that renamed itself was still listed under the name of
+     * the file it was exec'd from. */
+    if (option == 15) {
+      char nm[16];
+      if (syscall_copyin(nm, (const void *)(usize)arg1, sizeof(nm)) != 0) {
+        /* Linux copies up to 16 bytes and tolerates a shorter string as long
+         * as the NUL is inside the buffer; fall back to a string copy so a
+         * name at the very end of a mapping still works. */
+        if (syscall_copyinstr(nm, sizeof(nm), (const char *)(usize)arg1) < 0)
+          return (u64)-EFAULT;
+      }
+      nm[sizeof(nm) - 1] = '\0';
+      return (u64)scheduler_set_comm(current_task->id, nm);
+    }
+    /* PR_GET_NAME (16): the caller's comm, 16 bytes including the NUL. */
+    if (option == 16) {
+      char comm[16];
+      const char *nm = current_task && current_task->name ? current_task->name : "";
+      usize i = 0;
+      for (; nm[i] && i < sizeof(comm) - 1; i++)
+        comm[i] = nm[i];
+      comm[i] = '\0';
+      if (syscall_copyout((void *)(usize)arg1, comm, sizeof(comm)) != 0)
+        return (u64)-EFAULT;
       return 0;
+    }
+    /* PR_GET_PDEATHSIG (2). */
+    if (option == 2) {
+      int sig = scheduler_get_pdeathsig(current_task->id);
+      if (syscall_copyout((void *)(usize)arg1, &sig, sizeof(sig)) != 0)
+        return (u64)-EFAULT;
+      return 0;
+    }
+    /* PR_GET_DUMPABLE (3) / PR_SET_DUMPABLE (4). Every task here is dumpable:
+     * b1nix has no suid-binary core-dump suppression to switch off. */
+    if (option == 3)
+      return 1;
+    if (option == 4)
+      return (arg1 == 0 || arg1 == 1 || arg1 == 2) ? 0 : (u64)-EINVAL;
+    /* PR_GET_KEEPCAPS (7) / PR_SET_KEEPCAPS (8): the securebits KEEP_CAPS flag
+     * under its older name. Unlike PR_SET_SECUREBITS this needs no privilege. */
+    if (option == 7) {
+      struct cred *c = scheduler_get_current_cred();
+      return (u64)((cred_get_securebits(c) & SECBIT(SECURE_KEEP_CAPS)) ? 1 : 0);
+    }
+    if (option == 8) {
+      struct cred *c = scheduler_get_current_cred();
+      if (!c)
+        return (u64)-EINVAL;
+      if (arg1 > 1)
+        return (u64)-EINVAL;
+      if (c->securebits & SECBIT(SECURE_KEEP_CAPS_LOCKED))
+        return (u64)-EPERM;
+      if (arg1)
+        c->securebits |= SECBIT(SECURE_KEEP_CAPS);
+      else
+        c->securebits &= ~SECBIT(SECURE_KEEP_CAPS);
+      return 0;
+    }
+    /* PR_CAPBSET_READ (23) / PR_CAPBSET_DROP (24). */
+    if (option == 23) {
+      struct cred *c = scheduler_get_current_cred();
+      if (!c || (int)arg1 < 0 || (int)arg1 > CAP_LAST)
+        return (u64)-EINVAL;
+      return (u64)((c->cap_bounding >> (int)arg1) & 1);
+    }
+    if (option == 24) {
+      struct cred *c = scheduler_get_current_cred();
+      if (!c || (int)arg1 < 0 || (int)arg1 > CAP_LAST)
+        return (u64)-EINVAL;
+      if (!cred_has_cap(c, CAP_SETPCAP))
+        return (u64)-EPERM;
+      /* The bounding set is a CEILING on what may be gained, not a statement
+       * about what is held: dropping a capability from it must not take that
+       * capability away from the running process. Refreshing here did, so the
+       * moment systemd's bounding-set loop reached CAP_SETPCAP it lost the
+       * privilege the loop itself needs and every remaining drop returned
+       * EPERM — "Failed to drop capabilities" for every service that names a
+       * CapabilityBoundingSet, journald included. */
+      c->cap_bounding &= ~(1ULL << (int)arg1);
+      c->cap_inheritable &= c->cap_bounding;
+      return 0;
+    }
+    /* PR_GET_SECUREBITS (27) / PR_SET_SECUREBITS (28). */
+    if (option == 27)
+      return (u64)cred_get_securebits(scheduler_get_current_cred());
+    if (option == 28)
+      return (u64)cred_set_securebits(scheduler_get_current_cred(), (u32)arg1);
+    /* PR_SET_TIMERSLACK (29) / PR_GET_TIMERSLACK (30). The scheduler wakes on
+     * the 100 Hz tick, so the slack a caller can choose is already the tick;
+     * report that rather than a number nothing honours. */
+    if (option == 29)
+      return 0;
+    if (option == 30)
+      return (u64)(1000000000ULL / 100);
     return (u64)-EINVAL; /* other prctl options unsupported */
   }
   case SYS_MEM:
@@ -8454,12 +8874,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         ktp.tv_nsec = (i64)((ticks % 100) * 10000000);
       }
     } else {
-      /* CLOCK_REALTIME / CLOCK_REALTIME_COARSE: epoch-based wall clock. The
-       * seconds come from the wall clock; the sub-second part comes from the
-       * same fine source, so two readings a microsecond apart differ. */
-      ktp.tv_sec = (i64)vfs_get_unix_time();
-      ktp.tv_nsec = mono_ns ? (i64)(mono_ns % 1000000000ull)
-                            : (i64)((ticks % 100) * 10000000);
+      /* CLOCK_REALTIME / CLOCK_REALTIME_COARSE: epoch-based wall clock, taken
+       * whole from one source. Composing the seconds from the tick counter and
+       * the nanoseconds from the TSC made the clock walk backwards by up to a
+       * second (see rtc_now_unix_nanos). */
+      u64 wall_ns = rtc_now_unix_nanos();
+      ktp.tv_sec = (i64)(wall_ns / 1000000000ull);
+      ktp.tv_nsec = (i64)(wall_ns % 1000000000ull);
     }
     if (syscall_copyout((void *)(usize)arg1, &ktp, sizeof(struct timespec)) != 0) {
       return (u64)-EFAULT;
@@ -8511,7 +8932,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* SYS_CLONE(flags, entry, user_stack, arg, tls, ctid) — see
      * kernel/include/b1nix/syscall.h for the B1NIX_CLONE_* flag bits.
      * Returns the new TID on success or -errno on failure. */
-    return (u64)scheduler_clone_thread(arg0, arg1, arg2, arg3, arg4, arg5, 0, 0, 0);
+    return (u64)scheduler_clone_thread(arg0, arg1, arg2, arg3, arg4, arg5, 0, 0, 0, 0);
   case SYS_FUTEX:
     /* SYS_FUTEX(uaddr, op, val, timeout_ms) — WAIT/WAKE. timeout_ms>0 arms a
      * relative deadline on WAIT (returns -ETIMEDOUT on expiry); 0 = forever. */

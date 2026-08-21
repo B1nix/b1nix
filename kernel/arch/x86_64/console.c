@@ -6,6 +6,8 @@
 #include <b1nix/io.h>
 #include <b1nix/klog.h>
 #include <b1nix/kmsg.h>
+#include <b1nix/kprintf.h>
+#include <b1nix/ktime.h>
 #include <b1nix/vt.h>
 #include <b1nix/serial.h>
 #include <b1nix/spinlock.h>
@@ -91,10 +93,8 @@ void console_clear(void)
 	cursor_col = 0;
 }
 
-void console_putc(char ch)
+static void console_dev_putc(char ch)
 {
-	klog_putc(ch);   /* capture every console char into the dmesg ring buffer */
-	kmsg_putc(ch);   /* and into the /dev/kmsg record ring */
 	/* M107 virtual terminals: the kernel console is VT 1. While another VT
 	 * owns the display the character is still recorded in VT 1's cell buffer
 	 * (so switching back repaints it) but must not be drawn. Serial is never
@@ -135,6 +135,287 @@ void console_putc(char ch)
 	}
 }
 
+/* ── Line assembly: timestamps, severity and the loglevel filter ───────────
+ *
+ * Every character printed by the kernel passes through console_putc(), which
+ * is where a line acquires the shape an operator expects:
+ *
+ *     [    3.472918] ext4: mounted /dev/sata0 at /
+ *
+ * The bracketed monotonic timestamp is stamped when the line's first character
+ * arrives and comes from ktime_monotonic_ns(), the same clock /proc/uptime
+ * reports. If the line opens with a Linux-style "<N>" severity prefix (what
+ * kprintf() emits) the digit is consumed here: it sets the record's priority in
+ * the /dev/kmsg ring and decides whether the line reaches the screen and the
+ * serial port. A line without one is LOGLEVEL_DEFAULT, so the thousands of
+ * plain console_write() call sites still get timestamps and still answer to
+ * `quiet` without being converted one by one.
+ *
+ * Suppressed lines are only suppressed on the *console*: they are recorded in
+ * the ring in full, exactly as they would have been printed, so dmesg and the
+ * console never disagree about what a line said. */
+enum console_line_state {
+	CON_LINE_START = 0, /* nothing written on this line yet */
+	CON_LINE_LT,        /* saw '<' */
+	CON_LINE_LT_DIGIT,  /* saw "<N" */
+	CON_LINE_BODY,      /* prefix decided, printing the message */
+};
+
+static enum console_line_state con_state = CON_LINE_START;
+static int con_line_level = LOGLEVEL_DEFAULT;
+static int con_line_muted;
+static char con_pending_digit;
+
+static int con_loglevel = CONSOLE_LOGLEVEL_DEFAULT;
+static int con_configured; /* has the kernel command line been read yet? */
+
+/* Output produced before the command line has been parsed cannot be filtered
+ * yet — `quiet` is not known. It is held here and released by
+ * console_log_init() once the loglevel is decided, or dumped unconditionally if
+ * we crash first. Records are "\x01" + level digit + line text. */
+#define CON_EARLY_BUF_SIZE 16384
+static char con_early_buf[CON_EARLY_BUF_SIZE];
+static usize con_early_len;
+
+static void console_early_put(char ch)
+{
+	if (con_early_len < sizeof(con_early_buf))
+		con_early_buf[con_early_len++] = ch;
+}
+
+/* Emit one character of an already-decided line to the console devices. */
+static void console_line_out(char ch)
+{
+	if (con_line_muted)
+		return;
+	if (!con_configured) {
+		console_early_put(ch);
+		return;
+	}
+	console_dev_putc(ch);
+}
+
+/* Both sinks: the ring always, the devices only if the line is not filtered. */
+static void console_line_emit(char ch)
+{
+	klog_putc(ch); /* the dmesg transcript */
+	kmsg_putc(ch); /* and the /dev/kmsg record ring */
+	console_line_out(ch);
+}
+
+static void console_emit_timestamp(void)
+{
+	u64 ns = ktime_monotonic_ns();
+	u64 sec = ns / 1000000000ull;
+	u64 usec = (ns % 1000000000ull) / 1000ull;
+	char stamp[32];
+	usize pos = 0;
+
+	stamp[pos++] = '[';
+	/* Seconds, right-aligned in five columns like Linux's "[    3.472918]". */
+	char digits[24];
+	int n = 0;
+	if (sec == 0) {
+		digits[n++] = '0';
+	} else {
+		while (sec > 0 && n < (int)sizeof(digits)) {
+			digits[n++] = (char)('0' + (sec % 10));
+			sec /= 10;
+		}
+	}
+	for (int pad = n; pad < 5; pad++)
+		stamp[pos++] = ' ';
+	for (int i = n - 1; i >= 0; i--)
+		stamp[pos++] = digits[i];
+	stamp[pos++] = '.';
+	for (u64 div = 100000; div > 0; div /= 10) {
+		stamp[pos++] = (char)('0' + (usec / div) % 10);
+		if (div == 1)
+			break;
+	}
+	stamp[pos++] = ']';
+	stamp[pos++] = ' ';
+
+	for (usize i = 0; i < pos; i++)
+		console_line_emit(stamp[i]);
+}
+
+/* Open a line at the decided severity: record the priority for the kmsg record
+ * being assembled, apply the console filter, print the timestamp. */
+static void console_line_begin(int level)
+{
+	con_line_level = level;
+	con_line_muted = (!con_configured) ? 0 : (level > con_loglevel);
+	con_state = CON_LINE_BODY;
+
+	kmsg_set_line_prio(level);
+	if (!con_configured) {
+		console_early_put('\x01');
+		console_early_put((char)('0' + level));
+	}
+	console_emit_timestamp();
+}
+
+static void console_line_end(void)
+{
+	console_line_emit('\n');
+	con_state = CON_LINE_START;
+	con_line_muted = 0;
+	con_line_level = LOGLEVEL_DEFAULT;
+}
+
+void console_putc(char ch)
+{
+	switch (con_state) {
+	case CON_LINE_START:
+		if (ch == '<') {
+			con_state = CON_LINE_LT;
+			return;
+		}
+		console_line_begin(LOGLEVEL_DEFAULT);
+		break;
+	case CON_LINE_LT:
+		if (ch >= '0' && ch <= '7') {
+			con_pending_digit = ch;
+			con_state = CON_LINE_LT_DIGIT;
+			return;
+		}
+		/* Not a severity prefix after all — the '<' was message text. */
+		console_line_begin(LOGLEVEL_DEFAULT);
+		console_line_emit('<');
+		break;
+	case CON_LINE_LT_DIGIT:
+		if (ch == '>') {
+			console_line_begin(con_pending_digit - '0');
+			return;
+		}
+		console_line_begin(LOGLEVEL_DEFAULT);
+		console_line_emit('<');
+		console_line_emit(con_pending_digit);
+		break;
+	case CON_LINE_BODY:
+		break;
+	}
+
+	if (ch == '\n') {
+		console_line_end();
+		return;
+	}
+	console_line_emit(ch);
+}
+
+/* Raw console output: no timestamp, no severity, no filter.
+ *
+ * This is what a *terminal* write is — /dev/console and /dev/tty output, and
+ * the VT's keyboard echo. A shell prompt is not a log record: stamping it would
+ * put "[   12.345678] " in front of every echoed keystroke and in the middle of
+ * every screen repaint. It is still captured in the ring, so the dmesg
+ * transcript keeps showing what the console showed. */
+extern volatile u64 g_console_write_seq;
+
+void console_putc_raw(char ch)
+{
+	klog_putc(ch);
+	kmsg_putc(ch);
+	if (!con_configured) {
+		console_early_put(ch);
+		return;
+	}
+	console_dev_putc(ch);
+}
+
+void console_write_raw(const char *text)
+{
+	u64 flags;
+	g_console_write_seq++;
+	spin_lock_irqsave(&console_lock, &flags);
+	for (usize i = 0; text[i] != '\0'; i++)
+		console_putc_raw(text[i]);
+	spin_unlock_irqrestore(&console_lock, flags);
+}
+
+/* Release everything printed before the command line was known. */
+static void console_log_flush_early(void)
+{
+	usize i = 0;
+	int muted = 0;
+
+	while (i < con_early_len) {
+		char ch = con_early_buf[i++];
+		if (ch == '\x01' && i < con_early_len) {
+			int level = con_early_buf[i++] - '0';
+			muted = (level > con_loglevel);
+			continue;
+		}
+		if (!muted)
+			console_dev_putc(ch);
+	}
+	con_early_len = 0;
+}
+
+/* Read `loglevel=` and `quiet` from the kernel command line and let the console
+ * start printing. Called from kernel_main() as soon as bootinfo is parsed. */
+void console_log_init(void)
+{
+	u64 flags;
+
+	char value[16];
+	int level = CONSOLE_LOGLEVEL_DEFAULT;
+
+	/* `quiet` lowers the console to warnings and worse, exactly as on Linux;
+	 * an explicit `loglevel=` always wins over it. */
+	if (bootinfo_has_flag("quiet"))
+		level = CONSOLE_LOGLEVEL_QUIET;
+	if (bootinfo_get_kv("loglevel", value, sizeof(value)) && value[0])
+		level = (int)bootinfo_get_u32("loglevel", (u32)level);
+	if (level < 0)
+		level = 0;
+	if (level > LOGLEVEL_DEBUG)
+		level = LOGLEVEL_DEBUG;
+
+	spin_lock_irqsave(&console_lock, &flags);
+	con_loglevel = level;
+	con_configured = 1;
+	console_log_flush_early();
+	spin_unlock_irqrestore(&console_lock, flags);
+}
+
+/* Would a line at this level be printed? Asked BEFORE the line is built, so a
+ * suppressed debug line costs one comparison instead of a formatting pass and
+ * a console call. Nothing can be filtered before the command line is read, so
+ * everything is allowed through until then and held in the early buffer. */
+int console_level_enabled(int level)
+{
+	if (!con_configured)
+		return 1;
+	return level <= con_loglevel;
+}
+
+int console_loglevel_get(void)
+{
+	return con_loglevel;
+}
+
+void console_loglevel_set(int level)
+{
+	if (level < 0)
+		level = 0;
+	if (level > LOGLEVEL_DEBUG)
+		level = LOGLEVEL_DEBUG;
+	con_loglevel = level;
+}
+
+/* Dump anything still held in the early buffer regardless of severity. The
+ * crash paths call this: a boot that dies before the command line is parsed
+ * must not take its own diagnosis with it. */
+void console_log_panic_flush(void)
+{
+	con_loglevel = LOGLEVEL_DEBUG;
+	con_configured = 1;
+	con_line_muted = 0;
+	console_log_flush_early();
+}
+
 /* Bumped on every console write. The scheduler's silence watchdog samples it:
  * a test instance that stops printing has either wedged or deadlocked, and
  * without an in-guest dump the only evidence is a truncated log. */
@@ -159,6 +440,7 @@ void console_write(const char *text)
 void console_bust_lock(void)
 {
 	console_lock = 0;
+	console_log_panic_flush();
 }
 
 void console_lock_acquire_irqsave(u64 *flags)

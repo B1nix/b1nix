@@ -761,8 +761,10 @@ static int r_b1nix_prof(usize pid, struct sbuf *s) {
   extern void syscall_prof_dump(void);
   extern void pf_prof_dump(void);
   extern void syscall_prof_reset(void);
+  extern void kprof_dump(void);
   syscall_prof_dump();
   pf_prof_dump();
+  kprof_dump();
   {
     extern void vfs_inode_wait_stats(u64 *, u64 *, u64 *, const void **);
     extern void vfs_inode_wait_reset(void);
@@ -1058,11 +1060,8 @@ static int r_pid_statm(usize pid, struct sbuf *s) {
       text += pages;
     else if (v->prot & 0x2) /* PROT_WRITE */
       data += pages;
-    if (t->pml4_phys) {
-      for (u64 va = v->start; va < v->end; va += PAGE_SIZE)
-        if (paging_user_frame(t->pml4_phys, va))
-          resident++;
-    }
+    if (t->pml4_phys)
+      resident += paging_user_resident(t->pml4_phys, v->start, v->end);
   }
   /* The walk above already measured the resident set, so let the peak tracker
    * see it too (M86) — a `ps`/`top` poll then also refreshes ru_maxrss. */

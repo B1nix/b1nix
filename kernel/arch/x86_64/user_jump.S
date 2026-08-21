@@ -135,3 +135,69 @@ x86_clone_thread_jump:
     xorq %r11, %r11
 
     iretq
+
+/* void x86_clone_thread_jump_regs(u64 entry, u64 stack,
+ *                                 const struct clone_user_regs *regs);
+ *
+ * Drop to ring 3 at `entry` (the instruction after the caller's syscall) on
+ * `stack`, with the caller's whole register file restored and rax = 0.
+ *
+ * This is what Linux's clone(2) does, and libcs depend on it: glibc's
+ * __clone3 leaves the thread function in %r9 and its argument in %r8 across
+ * the syscall and uses them in the child, while its __clone pops both from the
+ * new stack. Zeroing the registers instead called the entry point with a NULL
+ * argument, or through a NULL pointer — every glibc program that creates a
+ * thread died at rip=0.
+ *
+ * struct clone_user_regs is, in order:
+ *   0 rbx  8 rcx 16 rdx 24 rsi 32 rdi 40 rbp
+ *  48 r8  56 r9  64 r10 72 r11 80 r12 88 r13 96 r14 104 r15
+ */
+.global x86_clone_thread_jump_regs
+.type x86_clone_thread_jump_regs, @function
+x86_clone_thread_jump_regs:
+    /* %rdi = entry, %rsi = stack, %rdx = regs */
+    movq %rdx, %r15        /* the register block survives the FS dance here */
+
+    /* Reload FS base: loading a segment selector zeroes the FS base, so
+     * snapshot it and put it back (same dance as x86_user_jump). */
+    movl $0xC0000100, %ecx
+    rdmsr
+    movl %eax, %r8d
+    movl %edx, %r9d
+    mov $0x1B, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    movl %r8d, %eax
+    movl %r9d, %edx
+    movl $0xC0000100, %ecx
+    wrmsr
+
+    /* iretq frame: SS, RSP, RFLAGS, CS, RIP */
+    pushq $0x1B            /* SS (user data) */
+    pushq %rsi             /* RSP (the new thread's stack) */
+    pushfq
+    popq %rax
+    orq $0x200, %rax       /* interrupts on in ring 3 */
+    pushq %rax             /* RFLAGS */
+    pushq $0x23            /* CS (user code) */
+    pushq %rdi             /* RIP */
+
+    /* The caller's registers, r15 (which holds the block) last. */
+    movq   0(%r15), %rbx
+    movq   8(%r15), %rcx
+    movq  16(%r15), %rdx
+    movq  24(%r15), %rsi
+    movq  32(%r15), %rdi
+    movq  40(%r15), %rbp
+    movq  48(%r15), %r8
+    movq  56(%r15), %r9
+    movq  64(%r15), %r10
+    movq  72(%r15), %r11
+    movq  80(%r15), %r12
+    movq  88(%r15), %r13
+    movq  96(%r15), %r14
+    movq 104(%r15), %r15
+    xorq %rax, %rax        /* clone(2) returns 0 in the child */
+    iretq

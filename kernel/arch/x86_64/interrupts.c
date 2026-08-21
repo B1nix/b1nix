@@ -34,6 +34,9 @@ void coredump_write(struct interrupt_frame *frame, int sig);
 static u64 g_pf_count;
 static u64 g_pf_cycles;
 
+/* kernel/arch/x86_64/kprof.c — tick-driven kernel profile. */
+void kprof_tick(u64 rip, int in_user, int in_idle, int cpu);
+
 static inline u64 pf_prof_now(void) {
   u32 lo, hi;
 
@@ -562,6 +565,17 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
      * the RIP distinguishes that from mere slow progress). */
     if (frame->cs == 0x1B || frame->cs == 0x23) {
       task_set_user_rip(current_task, frame->rip);
+    }
+    /* Sample where this tick landed. The distribution (user/kernel/idle) is
+     * always kept; the kernel-RIP histogram only under b1nix.sysprof. This is
+     * the per-CPU LAPIC timer, so every core contributes — vector 32 is the
+     * BSP's PIT and would have collected a sixth of the picture. */
+    {
+      int in_user = (frame->cs == 0x1B || frame->cs == 0x23);
+      int in_idle = (pcpu && pcpu->idle_task &&
+                     (struct task *)pcpu->cur_task == (struct task *)pcpu->idle_task);
+
+      kprof_tick(frame->rip, in_user, in_idle, pcpu ? (int)pcpu->cpu_id : 0);
     }
     if (is_bsp) {
       timer_ticks++;

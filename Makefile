@@ -59,8 +59,12 @@ INITRAMFS_NATIVE_SMOKE_INC := $(INC_DIR)/initramfs_native_smoke.inc
 # the same kernel sources with -DMODULE and shipped in the initramfs under
 # /lib/modules/$(B1NIX_RELEASE), together with the generated modules.dep /
 # modules.alias. The release subdirectory is what BusyBox's modprobe/modinfo/
-# depmod expect ($(uname -r), i.e. B1NIX_VERSION_STR).
-B1NIX_RELEASE := $(shell sed -n 's/.*B1NIX_VERSION_STR "\([^"]*\)".*/\1/p' kernel/include/b1nix/version.h)
+# depmod expect ($(uname -r), i.e. B1NIX_RELEASE_STR).
+B1NIX_VERSION := $(shell sed -n 's/^#define B1NIX_VERSION_STR "\([^"]*\)".*/\1/p' kernel/include/b1nix/version.h)
+B1NIX_ABI_RELEASE := $(shell sed -n 's/^#define B1NIX_LINUX_ABI_RELEASE "\([^"]*\)".*/\1/p' kernel/include/b1nix/version.h)
+# Must match B1NIX_RELEASE_STR in <b1nix/version.h> exactly: it names the
+# /lib/modules directory the kernel looks in and the vermagic it checks.
+B1NIX_RELEASE := $(B1NIX_ABI_RELEASE)-b1nix-$(B1NIX_VERSION)
 MODULE_OUT_DIR := $(BUILD_DIR)/modules
 MODULE_NAMES := isofs ntfs btrfs hda ipv6 ndp ntp
 MODULE_KOS := $(patsubst %,$(MODULE_OUT_DIR)/%.ko,$(MODULE_NAMES))
@@ -320,7 +324,7 @@ ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -m
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
 ASM_SOURCES := kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
-ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_console.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c
+ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_console.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c kernel/arch/x86_64/kprof.c
 else
 $(error Unsupported ARCH=$(ARCH). Active builds support ARCH=x86_64 only; i686 and AArch64 are archived)
 endif
@@ -329,6 +333,9 @@ KERNEL_SOURCES := \
 	kernel/main.c \
 	kernel/lib/string.c \
 	kernel/lib/klog.c \
+	kernel/lib/kprintf.c \
+	kernel/lib/ktime.c \
+	kernel/lib/termios_abi.c \
 	kernel/lib/stdio.c \
 	kernel/lib/ftrace.c \
 	kernel/lib/ftrace_demo.c \
@@ -363,6 +370,7 @@ KERNEL_SOURCES := \
 	kernel/fs/ext4.c \
 	kernel/fs/procfs.c \
 	kernel/fs/tmpfs.c \
+	kernel/fs/cgroup.c \
 	kernel/fs/sysfs.c \
 	kernel/fs/sysfs_attr.c \
 	kernel/fs/journal.c \
@@ -2048,3 +2056,23 @@ graphics-smoke:
 
 memory-smoke:
 	@sh tests/memory-smoke.sh
+
+# ── Debian (glibc) boot test ────────────────────────────────────────────────
+# Builds a real debian:bookworm root filesystem as an ext4 image and boots it as
+# b1nix's root, so the Linux-ABI layer is tested against a glibc distribution.
+# Deliberately NOT reachable from all/iso/smoke: it needs the network the first
+# time and is not part of the normal build.
+.PHONY: debian-image debian-smoke systemd-image systemd-smoke
+
+debian-image:
+	ARCH=$(ARCH) sh tools/images/mk-debian-image.sh
+
+debian-smoke:
+	sh tests/debian-smoke.sh $(ARCH)
+
+# The same tree with Debian's systemd (and its dependency closure) as PID 1.
+systemd-image:
+	ARCH=$(ARCH) PROFILE=systemd sh tools/images/mk-debian-image.sh
+
+systemd-smoke:
+	sh tests/systemd-smoke.sh $(ARCH)

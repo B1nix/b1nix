@@ -2,6 +2,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
+#include <b1nix/kprintf.h>
 #include <b1nix/linux_abi.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
@@ -836,14 +837,15 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   }
   image->phnum = ehdr->e_phnum;
   {
-    char line[VFS_MAX_PATH + 64];
+    /* Debug level: two lines per exec, and a shell execs constantly — these
+     * were most of the console traffic of a whole browser run. The personality
+     * line above stays at the default level because a smoke check asserts it,
+     * and a test must not depend on how verbose the console is. */
     if (load_base)
-      snprintf(line, sizeof(line), "ELF load: %s entry=0x%lx (PIE base=0x%lx)\n",
-               path, (unsigned long)image->entry, (unsigned long)load_base);
+      k_dbg("elf", "load: %s entry=0x%lx (PIE base=0x%lx)", path,
+            (unsigned long)image->entry, (unsigned long)load_base);
     else
-      snprintf(line, sizeof(line), "ELF load: %s entry=0x%lx\n", path,
-               (unsigned long)image->entry);
-    console_write(line);
+      k_dbg("elf", "load: %s entry=0x%lx", path, (unsigned long)image->entry);
   }
   image->address_space = user_address_space_create();
 
@@ -903,9 +905,8 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
       image->interp_path[il] = '\0';
     }
     image->entry = interp_entry;
-    snprintf(line, sizeof(line), "ELF load: PT_INTERP=%s (userspace ld.so, base=0x%lx)\n",
-             interp, (unsigned long)USER_LDSO_LOAD_BASE);
-    console_write(line);
+    k_dbg("elf", "load: PT_INTERP=%s (userspace ld.so, base=0x%lx)", interp,
+          (unsigned long)USER_LDSO_LOAD_BASE);
     break; /* at most one PT_INTERP */
   }
 
@@ -1603,8 +1604,30 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   }
   if (!total_pages)
     total_pages = 1;
-  u64 *mapped_va = kzalloc(sizeof(u64) * total_pages);
-  u64 *mapped_frame = kzalloc(sizeof(u64) * total_pages);
+  /* The tracker is a hash table, not a list.
+   *
+   * It was a plain array searched linearly for every page of every segment,
+   * which is quadratic in the size of the image: a large binary's data
+   * segments are tens of thousands of pages, so the scan alone ran into the
+   * hundreds of millions of comparisons per exec. With the resident-set walk
+   * fixed, this became the single largest consumer of kernel CPU in a browser
+   * start-up (43% of kernel samples), and a browser execs repeatedly — the
+   * zygote, each renderer, the crash handler.
+   *
+   * Open addressing with linear probing over a power-of-two table. A user page
+   * is never at virtual address 0, so a zeroed slot means empty and the table
+   * needs no separate occupancy bitmap. Sized to at least twice the page count
+   * so the load factor stays under a half and probe runs stay short. */
+  usize map_cap = 16;
+  while (map_cap < total_pages * 2) {
+    usize next = map_cap << 1;
+
+    if (next < map_cap) /* refuse to wrap on an absurd image */
+      break;
+    map_cap = next;
+  }
+  u64 *mapped_va = kzalloc(sizeof(u64) * map_cap);
+  u64 *mapped_frame = kzalloc(sizeof(u64) * map_cap);
   if (!mapped_va || !mapped_frame) {
     kfree(mapped_va);
     kfree(mapped_frame);
@@ -1652,8 +1675,14 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     u64 direct_base = vmm_direct_map_base();
     for (u64 v = vaddr_start; v < vaddr_end; v += PAGE_SIZE) {
       u64 frame = 0;
-      for (usize m = 0; m < n_mapped; m++) {
-        if (mapped_va[m] == v) { frame = mapped_frame[m]; break; }
+      usize slot = (usize)((v >> 12) * 0x9e3779b97f4a7c15ULL >> 40) & (map_cap - 1);
+
+      while (mapped_va[slot]) {
+        if (mapped_va[slot] == v) {
+          frame = mapped_frame[slot];
+          break;
+        }
+        slot = (slot + 1) & (map_cap - 1);
       }
       if (!frame) {
         frame = pmm_alloc_frame();
@@ -1665,8 +1694,18 @@ static int user_run_elf_image(struct user_loaded_image *image) {
         u64 flags = VMM_USER | VMM_WRITABLE;
         vmm_map_page(v, frame, flags);
         memset((void *)(usize)(direct_base + frame), 0, PAGE_SIZE);
-        mapped_va[n_mapped] = v;
-        mapped_frame[n_mapped] = frame;
+        /* At least one slot must stay empty or the probe above would not
+         * terminate. The sizing guarantees it (twice the page count, and at
+         * most one insert per page); this is the guard that says so out loud
+         * rather than hanging if the sizing is ever changed. */
+        if (n_mapped >= map_cap - 1) {
+          kfree(mapped_va);
+          kfree(mapped_frame);
+          return -ENOMEM;
+        }
+        /* The probe above stopped on the first empty slot; this is it. */
+        mapped_va[slot] = v;
+        mapped_frame[slot] = frame;
         n_mapped++;
       }
 

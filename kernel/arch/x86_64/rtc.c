@@ -1,12 +1,14 @@
 #include <b1nix/io.h>
 #include <b1nix/rtc.h>
+#include <b1nix/ktime.h>
 #include <b1nix/sched.h>
 
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
 
 u64 rtc_boot_time_seconds = 0;
-static i64 rtc_time_offset_seconds = 0;
+/* Applied to the wall clock by settimeofday(2), in nanoseconds. */
+static i64 rtc_time_offset_ns = 0;
 
 static u8 read_cmos(u8 reg) {
   outb(CMOS_ADDR, reg);
@@ -67,14 +69,26 @@ void rtc_init(void) {
   rtc_boot_time_seconds = d * 86400 + hour * 3600 + minute * 60 + second;
 }
 
-u64 rtc_now_unix_seconds(void) {
-  u64 base = rtc_boot_time_seconds + (scheduler_get_uptime_ticks() / 100);
-  i64 adjusted = (i64)base + rtc_time_offset_seconds;
-  if (adjusted < 0) return 0;
-  return (u64)adjusted;
+/* The wall clock, in nanoseconds since the epoch.
+ *
+ * ONE value, from which both the seconds and the sub-second part are taken.
+ * They used to come from different clocks — the seconds counted 100 Hz ticks
+ * while clock_gettime(CLOCK_REALTIME) took its nanoseconds from the TSC — and
+ * the two are not in phase, so the composite walked BACKWARDS by up to a
+ * second, over and over, all boot long. systemd-journald noticed ("Time jumped
+ * backwards, rotating") and threw its journal away each time; every file
+ * timestamp and every timeout computed from the wall clock was equally
+ * unreliable. */
+u64 rtc_now_unix_nanos(void) {
+  i64 ns = (i64)(rtc_boot_time_seconds * 1000000000ull) +
+           (i64)ktime_monotonic_ns() + rtc_time_offset_ns;
+  return ns < 0 ? 0 : (u64)ns;
 }
 
+u64 rtc_now_unix_seconds(void) { return rtc_now_unix_nanos() / 1000000000ull; }
+
 void rtc_set_unix_time(u64 unix_time_now) {
-  u64 base = rtc_boot_time_seconds + (scheduler_get_uptime_ticks() / 100);
-  rtc_time_offset_seconds = (i64)unix_time_now - (i64)base;
+  i64 base = (i64)(rtc_boot_time_seconds * 1000000000ull) +
+             (i64)ktime_monotonic_ns();
+  rtc_time_offset_ns = (i64)(unix_time_now * 1000000000ull) - base;
 }

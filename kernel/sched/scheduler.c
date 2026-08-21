@@ -5,6 +5,7 @@
 #include <b1nix/ipi.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+#include <b1nix/cgroup.h>
 #include <b1nix/namespace.h>
 #include <b1nix/panic.h>
 #include <b1nix/posix.h>
@@ -778,6 +779,12 @@ static void free_task_slot(struct task *t) {
   /* Same reason: the slot is about to be claimable by a new task that may
    * reuse this pid, and it must not inherit a parent-death signal. */
   scheduler_clear_pdeathsig(t->id);
+  /* Same reason: a reused id must not inherit the previous task's chosen
+   * comm. */
+  {
+    extern void scheduler_clear_comm_internal(usize pid);
+    scheduler_clear_comm_internal(t->id);
+  }
   u64 flags;
   tasks_lock(&flags);
   t->state = TASK_UNUSED;
@@ -1418,10 +1425,50 @@ static void scheduler_root_clear(struct task *t);
 /* Defined with the other sched_setaffinity state below; fork needs it here. */
 static u64 g_task_affinity[MAX_TASKS];
 
-int scheduler_fork_current(void) {
+/* fork(2), plus the two tid side effects Linux's clone(2) can ask for.
+ *
+ * glibc's fork is clone(CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD, NULL,
+ * NULL, NULL, &THREAD_SELF->tid) and it relies on the kernel to write the new
+ * thread id into the CHILD's copy of that word — "values of TID and PID are set
+ * by the kernel", as its own comment puts it. Nothing else does it, so a child
+ * whose tid is never written keeps its parent's, and raise()/abort() in that
+ * child then signals the parent.
+ *
+ * The write has to land in the child's address space only, which is why it is
+ * done here rather than by the caller: the word is written in the parent BEFORE
+ * the copy, so the child inherits it, and the parent's original value is put
+ * back AFTER — that second write faults the now-read-only COW page and gives
+ * the parent a private copy, leaving the child's untouched. */
+int scheduler_fork_clone(u64 flags, u64 parent_tid_addr, u64 child_tid_addr) {
+  int pid = scheduler_fork_ctid(child_tid_addr);
+  if (pid < 0)
+    return pid;
+  if ((flags & B1NIX_CLONE_PARENT_SETTID) && parent_tid_addr) {
+    u32 v = (u32)pid;
+    syscall_copyout((void *)(usize)parent_tid_addr, &v, sizeof(v));
+  }
+  if (flags & B1NIX_CLONE_CHILD_CLEARTID) {
+    struct task *child = scheduler_task_by_pid((usize)pid);
+    if (child)
+      task_set_child_tid_clear(child, child_tid_addr);
+  }
+  return pid;
+}
+
+int scheduler_fork_current(void) { return scheduler_fork_ctid(0); }
+
+int scheduler_fork_ctid(u64 child_tid_addr) {
   struct task *parent = current_task;
   if (!parent) {
     return -1;
+  }
+  /* pids.max: a cgroup between the parent and the root may be full. Linux's
+   * pids controller fails the fork with EAGAIN, which is what a process that
+   * hits RLIMIT_NPROC also sees, so nothing needs a new error path. */
+  {
+    int cg_err = cgroup_fork_allowed(parent->id);
+    if (cg_err < 0)
+      return cg_err;
   }
   /* "User" forks resume the child by iret'ing through the interrupt_frame.
    * All user tasks are real ELF processes (ELF32/ELF64) in Ring 3. */
@@ -1650,6 +1697,18 @@ int scheduler_fork_current(void) {
 #endif
 
   // 3. Clone address space with interrupts disabled
+  /* CLONE_CHILD_SETTID: stage the child's id in the parent's copy of the word
+   * so the clone carries it into the child, and restore the parent's value
+   * once the pages are shared COW (see the comment on scheduler_fork_clone). */
+  u32 ctid_saved = 0;
+  int ctid_staged = 0;
+  if (child_tid_addr) {
+    u32 v = (u32)child->id;
+    if (syscall_copyin(&ctid_saved, (const void *)(usize)child_tid_addr,
+                       sizeof(ctid_saved)) == 0 &&
+        syscall_copyout((void *)(usize)child_tid_addr, &v, sizeof(v)) == 0)
+      ctid_staged = 1;
+  }
   child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
 
   /* paging_clone_address_space just flipped every writable user page in the
@@ -1662,10 +1721,35 @@ int scheduler_fork_current(void) {
    * address and SIGSEGVs. The page tables were edited in place, so reloading
    * CR3 (parent == current task) flushes the stale entries. Reload explicitly:
    * switching to the address space already loaded no longer writes CR3. */
+  /* Every CPU, not only this one. A multithreaded parent has siblings running
+   * the same address space on other CPUs, and they cache the same writable
+   * translations that were just downgraded. A sibling then writes through its
+   * stale entry into the now-shared frame, and when this thread later takes
+   * the copy-on-write fault the page is copied away underneath it: two threads
+   * of one process end up writing the same address in two different physical
+   * pages. That is what corrupted the allocator's bookkeeping and killed sway
+   * inside malloc. A local CR3 reload cannot fix what another CPU has cached.
+   *
+   * The shootdown waits for the other CPUs to acknowledge, so it needs
+   * interrupts enabled; with them masked the local reload is all that is safe,
+   * and a fork from such a context has no running siblings to worry about. */
   if (parent == current_task) {
     extern void paging_reload_cr3(void);
-    paging_reload_cr3();
+    extern void tlb_shootdown_all(void);
+    u64 rf;
+
+    __asm__ volatile("pushfq\n\tpop %0" : "=r"(rf));
+    if (rf & (1ULL << 9))
+      tlb_shootdown_all();
+    else
+      paging_reload_cr3();
   }
+
+  /* Put the parent's own tid back. The page is read-only now, so this write
+   * takes the COW fault and separates the two copies. */
+  if (ctid_staged)
+    syscall_copyout((void *)(usize)child_tid_addr, &ctid_saved,
+                    sizeof(ctid_saved));
 
   // 4. Clone VMAs
   child->vma_list = 0;
@@ -1700,6 +1784,8 @@ int scheduler_fork_current(void) {
   }
   /* M109: a fork inherits the parent's namespaces. */
   namespace_fork_inherit(parent->id, child->id);
+  /* ...and its cgroup, which is where its resource limits come from. */
+  cgroup_fork_inherit(parent->id, child->id);
 
   // 5. Clone credentials and file descriptors
   task_init_cred(child);
@@ -2106,9 +2192,7 @@ u64 task_rss_sample(struct task *t, int force) {
   u64 resident = 0;
   if (t->pml4_phys) {
     for (struct vm_area *v = t->vma_list; v; v = v->next)
-      for (u64 va = v->start; va < v->end; va += PAGE_SIZE)
-        if (paging_user_frame(t->pml4_phys, va))
-          resident++;
+      resident += paging_user_resident(t->pml4_phys, v->start, v->end);
   }
   if (resident > g_task_maxrss_pages[idx])
     g_task_maxrss_pages[idx] = resident;
@@ -2361,6 +2445,11 @@ struct clone_thread_args {
   u64 user_stack;
   u64 user_arg;
   u64 start_func;  /* musl pthread: start_routine pointer for r9 */
+
+  /* The caller's user registers, handed to the child unchanged apart from a
+   * zero return value (see struct clone_user_regs). */
+  struct clone_user_regs uregs;
+  int have_uregs;
 };
 
 extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv);
@@ -2371,7 +2460,19 @@ static void clone_thread_kentry(void *arg) {
   u64 stack = cta->user_stack;
   u64 user_arg = cta->user_arg;
   u64 start_func = cta->start_func;
+  struct clone_user_regs uregs = cta->uregs;
+  int have_uregs = cta->have_uregs;
   kfree(cta);
+  if (have_uregs) {
+    /* Linux hands the child the caller's register file. Anything else breaks
+     * a libc that carries the thread entry point in a register across the
+     * syscall, which both glibc's __clone3 (function in %r9, argument in %r8)
+     * and its __clone (both on the new stack) do. */
+    extern void x86_clone_thread_jump_regs(u64 entry, u64 stack,
+                                           const struct clone_user_regs *r);
+    sched_acct_leave_kernel();
+    x86_clone_thread_jump_regs(entry, stack, &uregs);
+  }
   if (start_func) {
     /* M92 musl pthread: child continues at parent's RIP (after syscall in
      * musl __clone), with the new user stack and r9 = start_routine. The
@@ -2505,7 +2606,8 @@ void scheduler_vfork_release(void) {
 int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
                            u64 tls, u64 ctid,
                            u64 parent_tid_addr, u64 child_tid_addr,
-                           u64 start_func) {
+                           u64 start_func,
+                           const struct clone_user_regs *uregs) {
   g_has_any_thread = 1;
   struct task *parent = current_task;
   if (!parent) return -EINVAL;
@@ -2515,6 +2617,11 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   if (entry >= USER_SPACE_LIMIT ||
       user_stack >= USER_SPACE_LIMIT)
     return -EFAULT;
+  {
+    int cg_err = cgroup_fork_allowed(parent->id);
+    if (cg_err < 0)
+      return cg_err;
+  }
 
   struct clone_thread_args *cta = kzalloc(sizeof(*cta));
   if (!cta) return -ENOMEM;
@@ -2522,6 +2629,10 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   cta->user_stack = user_stack;
   cta->user_arg = arg;
   cta->start_func = start_func;
+  if (uregs) {
+    cta->uregs = *uregs;
+    cta->have_uregs = 1;
+  }
 
   void *kstack = kmalloc(KERNEL_STACK_SIZE);
   if (!kstack) { kfree(cta); return -ENOMEM; }
@@ -2590,12 +2701,36 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
      * userspace relies on is preserved. */
     extern u64 paging_clone_address_space(u64 pml4_phys);
     extern void paging_reload_cr3(void);
+    extern void tlb_shootdown_all(void);
     child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
-    /* The clone flipped the parent's writable user pages to COW in place; the
-     * parent keeps running on the same CR3, so reload it to drop the stale
-     * writable TLB entries (see the identical note in scheduler_fork_current). */
-    if (parent == current_task)
-      paging_reload_cr3();
+    /* The clone flipped the parent's writable user pages to COW in place, and
+     * every CPU that has one of those translations cached must be told —
+     * not merely this one.
+     *
+     * The parent here is a whole process, threads included, and its siblings
+     * run on other CPUs against the very same page tables. A sibling that
+     * keeps its stale writable entry writes into the now-shared frame; when
+     * the address is later copied for this address space, the copy is taken
+     * from the frame the sibling is still writing, and from then on the two
+     * threads have the same address backed by two different pages. Their
+     * atomics no longer see each other, so the allocator's mutual exclusion
+     * silently stops working and its bookkeeping is corrupted — a compositor
+     * died calling a function pointer that had been overwritten with pixel
+     * data from another thread's buffer. This is posix_spawn's path, so it
+     * ran every time the compositor started a client.
+     *
+     * The shootdown waits for the other CPUs to answer and so needs
+     * interrupts enabled; with them masked there are no siblings running to
+     * worry about and the local reload is what is safe. */
+    if (parent == current_task) {
+      u64 rf;
+
+      __asm__ volatile("pushfq\n\tpop %0" : "=r"(rf));
+      if (rf & (1ULL << 9))
+        tlb_shootdown_all();
+      else
+        paging_reload_cr3();
+    }
 
     child->vma_list = 0;
     struct vm_area *src_vma = parent->vma_list;
@@ -2758,6 +2893,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   /* M109: the child starts in the parent's namespaces, threads included — a
    * thread of a process that unshared is in that process's namespaces. */
   namespace_fork_inherit(parent->id, child->id);
+  cgroup_fork_inherit(parent->id, child->id);
 
   /* M80: PTRACE_O_TRACECLONE / TRACEVFORK — same as fork, with the event that
    * matches how this child was created. */
@@ -3133,6 +3269,7 @@ void scheduler_block_current(void) {
 }
 
 void scheduler_wake_task(usize task_id) {
+  int woke = 0;
   /* Interrupt-state-preserving for the same reason as scheduler_wake_all: this
    * may be called from an IRQs-off context (futex/loopback kicks), and a
    * force-enable there would drop interrupt masking a caller is relying on. */
@@ -3150,6 +3287,7 @@ void scheduler_wake_task(usize task_id) {
       T(i)->wait_chan = 0;
       T(i)->wake_tick = 0;
       sched_rq_enqueue_current(T(i));
+      woke = 1;
       break;
     }
 
@@ -3160,11 +3298,20 @@ void scheduler_wake_task(usize task_id) {
       T(i)->wait_chan = 0;
       T(i)->wake_tick = 0;
       sched_rq_enqueue_current(T(i));
+      woke = 1;
       break;
     }
   }
 
   interrupts_restore(flags);
+  /* Tell the other CPUs there is work rather than letting them find it on
+   * their next tick. An ordinary userspace task is not stealable, so a wake
+   * puts it on the global runqueue, where a CPU sitting in `sti; hlt` picks it
+   * up only at its next 10 ms LAPIC tick. Every blocking wait — futex, pipes,
+   * sockets — paid that. The other make-runnable paths already kick; this one,
+   * the hottest, did not. */
+  if (woke)
+    ipi_reschedule_all();
 }
 
 void scheduler_block_on(void *chan) {
@@ -3769,6 +3916,64 @@ int scheduler_set_pdeathsig(usize pid, int signo) {
   return 0;
 }
 
+/* PR_SET_NAME: a task's comm, when it has chosen one.
+ *
+ * comm starts as the basename of what was executed, but a process may rename
+ * itself and readers believe the new name — systemd renames PID 1 to "systemd"
+ * (it is exec'd as /sbin/init), and anything looking at /proc/1/comm to decide
+ * which init is running saw "init". Kept in a side table because struct task
+ * must not grow. */
+#define TASK_COMM_MAX 64
+static struct {
+  usize pid;
+  char name[16];
+} g_comm[TASK_COMM_MAX];
+
+int scheduler_set_comm(usize pid, const char *name) {
+  if (!name)
+    return -EINVAL;
+  int free_slot = -1;
+  for (int i = 0; i < TASK_COMM_MAX; i++) {
+    if (g_comm[i].pid == pid) {
+      free_slot = i;
+      break;
+    }
+    if (free_slot < 0 && g_comm[i].pid == 0)
+      free_slot = i;
+  }
+  if (free_slot < 0)
+    free_slot = (int)(pid % TASK_COMM_MAX); /* reuse rather than refuse */
+  usize j = 0;
+  for (; name[j] && j < sizeof(g_comm[0].name) - 1; j++)
+    g_comm[free_slot].name[j] = name[j];
+  g_comm[free_slot].name[j] = '\0';
+  g_comm[free_slot].pid = pid;
+  return 0;
+}
+
+const char *scheduler_comm_override(usize pid) {
+  for (int i = 0; i < TASK_COMM_MAX; i++)
+    if (g_comm[i].pid == pid)
+      return g_comm[i].name;
+  return 0;
+}
+
+void scheduler_clear_comm_internal(usize pid) {
+  for (int i = 0; i < TASK_COMM_MAX; i++)
+    if (g_comm[i].pid == pid) {
+      g_comm[i].pid = 0;
+      g_comm[i].name[0] = '\0';
+      return;
+    }
+}
+
+int scheduler_get_pdeathsig(usize pid) {
+  for (int i = 0; i < PDEATHSIG_MAX; i++)
+    if (g_pdeathsig[i].pid == pid)
+      return g_pdeathsig[i].signo;
+  return 0;
+}
+
 void scheduler_clear_pdeathsig(usize pid) {
   for (int i = 0; i < PDEATHSIG_MAX; i++) {
     if (g_pdeathsig[i].pid == pid) {
@@ -4130,6 +4335,7 @@ void scheduler_exit_current(int exit_code) {
    * reclaimed later, from unshare/setns — releasing a mount namespace means
    * dropping VFS references, which has no business running here. */
   namespace_task_exit(current_task->id);
+  cgroup_task_exit(current_task->id);
   {
     /* Close this thread's last CPU interval before handing its time over. */
     sched_acct_leave_kernel();
@@ -6487,6 +6693,43 @@ u64 vm_find_free_area(struct task *t, usize length) {
     candidate = vma->end;
     if (candidate + length > end || candidate + length < candidate)
       return (u64)-1;
+  }
+
+  /* The break is an obstacle too, and the VMA walk above cannot see it.
+   *
+   * A heap that has not grown yet is recorded as an empty VMA (start == end),
+   * so it blocks nothing and a mapping is free to land exactly where the
+   * break is about to grow. brk then maps its pages straight over the other
+   * mapping's live data — a compositor's pixel buffer ended up on top of the
+   * server's own structures that way, which reads as heap corruption at a
+   * random later moment rather than as the placement error it is. Reserve the
+   * range the break occupies, plus room to grow, and search again above it. */
+  if (t->heap_start && candidate + length > t->heap_start) {
+    u64 brk_end = t->user_brk > t->heap_start ? t->user_brk : t->heap_start;
+    /* Headroom scaled to the heap itself rather than a fixed number: a
+     * process that has already grown its break will grow it again, and one
+     * that has not costs a page of address space. Address space is the cheap
+     * resource here — running out of it is not what breaks, colliding is. */
+    u64 heap_size = brk_end - t->heap_start;
+    u64 headroom = heap_size < PAGE_SIZE ? PAGE_SIZE : heap_size;
+    u64 guard = brk_end + headroom;
+
+    if (guard < brk_end)
+      return (u64)-1;
+    guard = (guard + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (candidate < guard) {
+      candidate = guard;
+      /* One more pass: the region above the break may itself be taken. */
+      for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
+        if (vma->end <= candidate)
+          continue;
+        if (vma->start >= candidate + length)
+          break;
+        candidate = vma->end;
+        if (candidate + length > end || candidate + length < candidate)
+          return (u64)-1;
+      }
+    }
   }
   if (candidate + length > end || candidate + length < candidate)
     return (u64)-1;

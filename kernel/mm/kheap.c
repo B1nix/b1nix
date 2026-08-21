@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/console.h>
 #include <b1nix/vfs.h>
 #include <b1nix/klog.h>
@@ -342,12 +343,12 @@ static void track_free(u64 addr, usize size) {
 void kheap_dump_large_allocs(void) {
   u64 flags;
   if (spin_is_locked(&heap_lock)) {
-    console_write("[OOMDIAG] Large allocation dump skipped: heap_lock held\n");
+    k_info(NULL, "[OOMDIAG] Large allocation dump skipped: heap_lock held");
     return;
   }
 
   heap_acquire(&flags);
-  console_write("[OOMDIAG] Large allocations (>= 1MB):\n");
+  k_info(NULL, "[OOMDIAG] Large allocations (>= 1MB):");
   for (int i = 0; i < MAX_TRACKED_BLOCKS; i++) {
     if (tracked_blocks[i].addr != 0) {
       console_write("  Address: 0x");
@@ -445,7 +446,7 @@ void kheap_use_direct_map(void) {
 #if KHEAP_VALIDATE
 static void kheap_dump(void) {
   if (heap.base == 0) return;
-  console_write("=== KHEAP DUMP ===\n");
+  k_info(NULL, "=== KHEAP DUMP ===");
   console_write("heap.base: 0x"); console_write_hex64(heap.base);
   console_write(" heap.current: 0x"); console_write_hex64(heap.current);
   console_write(" heap.end: 0x"); console_write_hex64(heap.end);
@@ -462,12 +463,12 @@ static void kheap_dump(void) {
     console_write(" magic=0x"); console_write_hex64(block->magic);
     console_write("\n");
     if (block->size == 0 || block->size > 100u * 1024u * 1024u) {
-      console_write("  (aborting dump: insane size)\n");
+      k_info(NULL, "  (aborting dump: insane size)");
       break;
     }
     addr += KHEAP_HEADER_SIZE + block->size;
   }
-  console_write("==================\n");
+  k_info(NULL, "==================");
 }
 #endif /* KHEAP_VALIDATE */
 
@@ -516,7 +517,7 @@ void kheap_describe(u64 addr, const char *label) {
     cur = next;
     idx++;
   }
-  console_write(" past-heap-walk\n");
+  k_info(NULL, " past-heap-walk");
 }
 
 void kheap_validate(const char *func) {

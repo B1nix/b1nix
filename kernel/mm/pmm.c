@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/page_cache.h>
@@ -1973,7 +1974,7 @@ void pmm_switch_to_direct_map(void) {
 
   pmm_poison_enabled = bootinfo_has_flag("b1nix.pmm-poison");
   if (pmm_poison_enabled)
-    console_write("pmm: page poisoning enabled (debug, costs a page write per free)\n");
+    k_info("pmm", "page poisoning enabled (debug, costs a page write per free)");
 
   /* The direct map now exists, so free blocks can hold their intrusive list
    * header. Seed the buddy tree with every currently-free frame; from here on

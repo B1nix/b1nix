@@ -2686,6 +2686,73 @@ u64 paging_user_frame(u64 pml4_phys, u64 vaddr) {
   return pte & 0x000FFFFFFFFFF000ULL;
 }
 
+/* Resident 4 KiB pages in [start, end) of the address space at `pml4_phys`.
+ *
+ * The same answer as calling paging_user_frame once per page — including its
+ * deliberate blind spot, that a huge-mapped page counts as absent — but it
+ * descends the tables instead of restarting the walk at the PML4 for every
+ * page. That is the whole point: a caller counting a region asks about pages
+ * in address order, so the upper levels it re-reads are almost always the ones
+ * it just read.
+ *
+ * The difference is not a constant factor. A region that is reserved but not
+ * mapped — which is most of a browser's address space, since V8's sandbox and
+ * every thread's guard pages are reservations — has no page tables under it at
+ * all, and the per-page version still walked it one page at a time: 262,144
+ * lookups to learn that one absent PDPT entry covers a gigabyte. Here an
+ * absent entry advances the cursor to the end of what it covers, so the same
+ * gigabyte costs one read. Measured on a headless Chromium start-up, this walk
+ * (through task_rss_sample and /proc/<pid>/statm) was 82% of all kernel CPU
+ * time.
+ */
+u64 paging_user_resident(u64 pml4_phys, u64 start, u64 end) {
+  if (end <= start)
+    return 0;
+
+  u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE)
+                                       : (u64)(usize)kernel_pml4_virt);
+  const u64 pml4_span = 1ULL << 39;
+  const u64 pdpt_span = 1ULL << 30;
+  const u64 pd_span = 1ULL << 21;
+  u64 count = 0;
+  u64 va = start & ~(PAGE_SIZE - 1);
+
+  while (va < end) {
+    /* Where the entry at each level stops covering. Computed before the reads
+     * so an absent entry can skip its whole span in one step. */
+    u64 next_pml4 = (va & ~(pml4_span - 1)) + pml4_span;
+    u64 next_pdpt = (va & ~(pdpt_span - 1)) + pdpt_span;
+    u64 next_pd = (va & ~(pd_span - 1)) + pd_span;
+
+    u64 pml4e = pml4[pml4_index(va)];
+    if (!(pml4e & VMM_PRESENT)) {
+      va = next_pml4;
+      continue;
+    }
+    u64 *pdpt = table_from_entry(pml4e);
+    u64 pdpte = pdpt[pdpt_index(va)];
+    /* A 1 GiB leaf counts as absent, exactly as paging_user_frame reports it. */
+    if (!(pdpte & VMM_PRESENT) || (pdpte & HUGE_PAGE_FLAG)) {
+      va = next_pdpt;
+      continue;
+    }
+    u64 *pd = table_from_entry(pdpte);
+    u64 pde = pd[pd_index(va)];
+    if (!(pde & VMM_PRESENT) || (pde & HUGE_PAGE_FLAG)) {
+      va = next_pd;
+      continue;
+    }
+    /* One page table, resolved once: scan its entries directly. */
+    u64 *pt = table_from_entry(pde);
+    u64 stop = next_pd < end ? next_pd : end;
+
+    for (usize i = pt_index(va); va < stop; i++, va += PAGE_SIZE)
+      if (pt[i] & VMM_PRESENT)
+        count++;
+  }
+  return count;
+}
+
 /* Physical address backing `vaddr`, resolving 1 GiB and 2 MiB mappings as well
  * as 4 KiB ones. paging_user_frame above answers only for a 4 KiB leaf and
  * reports "not mapped" for a huge page — fine for callers that want to install
