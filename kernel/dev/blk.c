@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/lapic.h>
 #include <b1nix/blk.h>
 #include <b1nix/bootinfo.h>
@@ -1489,7 +1490,7 @@ static struct block_device *blk_cache_target(struct block_device *dev,
 int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
                     void *buffer) {
   if (!dev || !dev->read_blocks) {
-    console_write("blk_read_cached: dev or read_blocks is NULL\n");
+    k_info("blk_read_cached", "dev or read_blocks is NULL");
     return -1;
   }
   if (dev->block_count > 0 && (count > dev->block_count || lba > dev->block_count - count)) {
@@ -2094,7 +2095,7 @@ void blk_durability_selftest(void) {
 
   struct block_device *dev = blk_nth_on_bus(BLK_BUS_VIRTIO, 0);
   if (!dev || !dev->write_blocks) {
-    console_write("M14-BLK: no virtio-blk scratch device\n");
+    k_info(NULL, "M14-BLK: no virtio-blk scratch device");
     return;
   }
 
@@ -2104,7 +2105,7 @@ void blk_durability_selftest(void) {
   if (!out || !in) {
     if (out) kfree(out);
     if (in) kfree(in);
-    console_write("M14-BLK: FAIL durable-roundtrip out-of-memory\n");
+    k_info(NULL, "M14-BLK: FAIL durable-roundtrip out-of-memory");
     return;
   }
   for (u32 b = 0; b < nbytes; b++)

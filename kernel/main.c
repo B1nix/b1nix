@@ -3,6 +3,8 @@
 #include <b1nix/io.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
+#include <b1nix/kprintf.h>
+#include <b1nix/ktime.h>
 #include <b1nix/ftrace.h>
 #include <b1nix/gdbstub.h>
 #include <b1nix/initramfs.h>
@@ -17,6 +19,7 @@
 #include <b1nix/serial_tty.h>
 #include <b1nix/user.h>
 #include <b1nix/sysfs_attr.h>
+#include <b1nix/cgroup.h>
 #include <b1nix/vfs.h>
 #include <b1nix/syscall.h>
 #include <b1nix/blk.h>
@@ -299,26 +302,29 @@ void kernel_main(usize arg0, usize arg1)
 	serial_init();
 	serial_tty_init();
 	console_init();
-	console_write("b1nix kernel starting...\n");
 
-	console_write("arg0 (magic): 0x");
-	console_write_hex32((u32)arg0);
-	console_write("\n");
-	console_write("arg1 (info):  0x");
-	console_write_hex32((u32)arg1);
-	console_write("\n");
-
-	if (arg0 != 0x36d76289) {
-		console_write("Warning: Multiboot2 magic mismatch\n");
-	}
-
+	/* The command line is parsed before the first line is printed, because it
+	 * is what decides whether that line is printed at all: `loglevel=` and
+	 * `quiet` cannot filter output that has already gone out. Nothing above
+	 * prints, so nothing is lost by doing this first — and a boot that dies in
+	 * here still speaks, because the console holds anything printed before this
+	 * point and the panic path releases it. */
 #ifdef __aarch64__
 	bootinfo_init_from_fdt(arg0);
 #else
 	bootinfo_init_from_multiboot2((u32)arg0, (u32)arg1);
 #endif
+	console_log_init();
 
-	console_write("Step 1: Bootinfo parsed\n");
+	k_info(NULL, "b1nix kernel starting...");
+	k_info(NULL, "boot: multiboot2 magic 0x%08x, info at 0x%08x", (u32)arg0,
+	       (u32)arg1);
+
+	if (arg0 != 0x36d76289) {
+		k_warn(NULL, "Warning: Multiboot2 magic mismatch");
+	}
+
+	k_info(NULL, "Step 1: Bootinfo parsed");
 	/* The command line as the kernel actually received it. Every flag in this
 	 * file is read from it, and a run that behaves as though a flag were absent
 	 * is indistinguishable from a bug in what the flag controls until this is
@@ -333,7 +339,7 @@ void kernel_main(usize arg0, usize arg1)
 	percpu_init();
 
 	pmm_init(bootinfo_get());
-	console_write("Step 2: PMM initialized\n");
+	k_info(NULL, "Step 2: PMM initialized");
 
 	/* M77: runtime-tunable global resource caps (TCP slots, pipes, SHMMAX,
 	 * coredump). Sized from usable RAM here, after PMM knows how much memory
@@ -346,10 +352,10 @@ void kernel_main(usize arg0, usize arg1)
 	console_write("\n");
 
 	vmm_init();
-	console_write("Step 3.5: VMM initialized\n");
+	k_info(NULL, "Step 3.5: VMM initialized");
 
 	kheap_init();
-	console_write("Step 4: KHeap initialized\n");
+	k_info(NULL, "Step 4: KHeap initialized");
 
 	void *heap_probe = kzalloc(64);
 	console_write("Step 5: KHeap probe allocation: 0x");
@@ -358,17 +364,17 @@ void kernel_main(usize arg0, usize arg1)
 
 
 	kheap_use_direct_map();
-	console_write("Step 7: KHeap switched to direct map\n");
+	k_info(NULL, "Step 7: KHeap switched to direct map");
 
 #ifndef __aarch64__
 	if (bootinfo_get()->has_framebuffer) {
 		fb_console_init();
-		console_write("Step 8: FB Console initialized\n");
+		k_info(NULL, "Step 8: FB Console initialized");
 	}
 #endif
 
 	scheduler_init();
-	console_write("Step 9: Scheduler initialized\n");
+	k_info(NULL, "Step 9: Scheduler initialized");
 
 	uidgid_init();
 	arch_init();
@@ -377,19 +383,28 @@ void kernel_main(usize arg0, usize arg1)
 	 * CPUID guess. Silently no-ops on platforms without ACPI. */
 	acpi_init();
 	lapic_init();
+	/* The TSC is calibrated by lapic_init; hand the monotonic clock over to it
+	 * so log timestamps and /proc/uptime gain microsecond resolution. */
+	ktime_switch_to_tsc();
 	/* Switch IRQ routing from the 8259 PIC to the IOAPIC discovered via
 	 * ACPI. No-op (PIC stays in charge) when no IOAPIC was reported. */
 	ioapic_init();
+
+	/* Every PCI function, one stamped line each, before any driver claims
+	 * one. pci_init() existed and had no caller, so hardware b1nix has no
+	 * driver for was invisible in a boot log — the first thing anyone asks
+	 * for when a machine does not work. */
+	pci_init();
 
 	/* M28-A: switch the BSP scheduler tick from PIT IRQ0 (vector 32) to the
 	 * per-CPU LAPIC timer (vector 64) at 100 Hz. APs arm the same timer when
 	 * they enter the cooperative phase in ap_main, so every core now ticks
 	 * itself instead of relying on the BSP-only PIT route. */
 	if (lapic_timer_start_periodic_ms(10)) {
-		console_write("timer: LAPIC periodic timer armed at 100 Hz; masking PIT IRQ0\n");
+		k_info("timer", "LAPIC periodic timer armed at 100 Hz; masking PIT IRQ0");
 		ioapic_mask_irq(0);
 	} else {
-		console_write("timer: LAPIC calibration unavailable, keeping PIT IRQ0 active\n");
+		k_warn("timer", "LAPIC calibration unavailable, keeping PIT IRQ0 active");
 	}
 	blk_cache_init();
 	/* Before initramfs and the filesystems, not after: the page cache's hash
@@ -400,7 +415,7 @@ void kernel_main(usize arg0, usize arg1)
 
 	initramfs_init();
 	fuse_init();
-	console_write("Step 10: Initramfs & FUSE initialized\n");
+	k_info(NULL, "Step 10: Initramfs & FUSE initialized");
 
 #ifndef __aarch64__
 	/* M100a: reserve the DMA bounce pool here — early, while nothing has
@@ -426,6 +441,7 @@ void kernel_main(usize arg0, usize arg1)
 	nvme_init();
 	exfat_init();
 	tmpfs_init();
+	cgroup_init();   /* cgroup v2 — systemd mounts it before anything else */
 	procfs_init();
 	sysfs_init();
 	/* M95: load the optional filesystems, the HDA sound driver and the IPv6
@@ -469,7 +485,7 @@ void kernel_main(usize arg0, usize arg1)
 	if (bootinfo_has_flag("b1nix.drm-debug")) {
 		__drm_debug = B1NIX_DRM_DEBUG_MASK;
 		if (kthread_create("drm-stuck-watch", drm_stuck_watch_thread, 0) < 0)
-			console_write("drm-stuck-watch: thread refused\n");
+			k_err("drm-stuck-watch", "thread refused");
 	}
 	/* The atomic and state categories as well, when asked. KMS alone shows what
 	 * a modeset was computed to be; these show what the commit then did with
@@ -520,7 +536,7 @@ void kernel_main(usize arg0, usize arg1)
 
 		if (bootinfo_get_kv("b1nix.port-watch", pw, sizeof(pw)) &&
 		    !lkpi_i915_dump_port_state_pub)
-			console_write("port-watch: no i915 dump in this build\n");
+			k_info("port-watch", "no i915 dump in this build");
 		if (lkpi_i915_dump_port_state_pub &&
 		    bootinfo_get_kv("b1nix.port-watch", pw, sizeof(pw))) {
 			unsigned n = 0;
@@ -532,7 +548,7 @@ void kernel_main(usize arg0, usize arg1)
 			console_write_dec((u64)g_port_watch_period);
 			console_write("s\n");
 			if (kthread_create("port-watch", port_watch_thread, 0) < 0)
-				console_write("port-watch: thread refused\n");
+				k_err("port-watch", "thread refused");
 		}
 	}
 
@@ -546,7 +562,7 @@ void kernel_main(usize arg0, usize arg1)
 		 * compositor's own run photographs the panel and reads the registers
 		 * back — so the hold, and the flags that tuned it, are gone.
 		 */
-		console_write("B1NIX-GFX: done\n");
+		k_info(NULL, "B1NIX-GFX: done");
 		outw(0x604, 0x2000);
 		outw(0xB004, 0x2000);
 		outw(0x4004, 0x3400);
@@ -669,7 +685,7 @@ void kernel_main(usize arg0, usize arg1)
 				rc = 0;
 				vfs_repopulate_after_root_mount();
 			} else if (strcmp(root_val, "liveiso") == 0) {
-				console_write("rootfs: liveiso mount requested, searching for the boot medium...\n");
+				k_info("rootfs", "liveiso mount requested, searching for the boot medium...");
 				const char *iso_fstype = 0;
 				char mounted_iso_name[64];
 				mounted_iso_name[0] = '\0';
@@ -719,7 +735,7 @@ void kernel_main(usize arg0, usize arg1)
 										if (is_exfat) {
 											console_write("exfat: remounted at /mnt/iso after root switch\n");
 										} else {
-											console_write("isofs: remounted at /mnt/iso after root switch\n");
+											k_info("isofs", "remounted at /mnt/iso after root switch");
 										}
 									} else {
 										char err_buf[80];
@@ -730,7 +746,7 @@ void kernel_main(usize arg0, usize arg1)
 							if (is_exfat) {
 								console_write("M37-LIVEFILE: ok exfat-loop-root\n");
 							} else {
-								console_write("M37-LIVEISO: ok isofs-loop-root\n");
+								k_info(NULL, "M37-LIVEISO: ok isofs-loop-root");
 							}
 						}
 					} else {
@@ -739,10 +755,10 @@ void kernel_main(usize arg0, usize arg1)
 				}
 
 				if (rc != 0) {
-					console_write("rootfs: liveiso mount failed, falling back to ram0...\n");
+					k_err("rootfs", "liveiso mount failed, falling back to ram0...");
 					rc = vfs_mount("ram0", "/", "ext4", 0);
 					if (rc == 0) {
-						console_write("rootfs: ram0 mounted at / (Live CD fallback)\n");
+						k_warn("rootfs", "ram0 mounted at / (Live CD fallback)");
 						vfs_repopulate_after_root_mount();
 					} else {
 						char mount_err_buf[64];
@@ -828,7 +844,7 @@ void kernel_main(usize arg0, usize arg1)
 			if (rc == 0) {
 				/* mounted above */
 			} else if ((rc = vfs_mount("vda", "/", "ext4", 0)) == 0) {
-				console_write("rootfs: vda mounted at /\n");
+				k_info("rootfs", "vda mounted at /");
 				vfs_repopulate_after_root_mount();
 			} else {
 				/* Try finding a block device by default label 'b1nix-root' (e.g. USB flash drive) */
@@ -869,15 +885,15 @@ void kernel_main(usize arg0, usize arg1)
 		console_write("procfs: mounted at /proc\n");
 	vfs_mkdir("/sys", 0555);
 	if (vfs_mount("sys", "/sys", "sysfs", 0) == 0)
-		console_write("sysfs: mounted at /sys\n");
+		k_info("sysfs", "mounted at /sys");
 	/* BusyBox sysctl chdirs to /proc/sys; point at /sys where the actual
 	 * files live (kernel.osrelease → /sys/kernel/osrelease). */
 	vfs_symlink("/sys", "/proc/sys");
 #endif
 	if (bootinfo_has_flag("b1nix.task-watch") &&
 	    kthread_create("task-watch", task_watch_thread, 0) < 0)
-		console_write("task-watch: thread refused\n");
-	console_write("Step 11: Drivers initialized\n");
+		k_err("task-watch", "thread refused");
+	k_info(NULL, "Step 11: Drivers initialized");
 
 	/* Bring up Application Processors */
 	smp_boot_aps();
@@ -958,7 +974,7 @@ void kernel_main(usize arg0, usize arg1)
 			extern int blk_io_gate_selftest(void);
 			int io_rc = blk_io_gate_selftest();
 			if (io_rc == 0) {
-				console_write("M40-IOPRIO: ok elevator-order\n");
+				k_info(NULL, "M40-IOPRIO: ok elevator-order");
 			} else {
 				console_write("M40-IOPRIO: FAIL elevator-order check=");
 				console_write_dec((u64)io_rc);
@@ -984,6 +1000,10 @@ void kernel_main(usize arg0, usize arg1)
 		/* M84: IPv4 FIB (longest-prefix-match, host routes, metric
 		 * tie-break) and TCP robustness (option parsing, window
 		 * scaling, out-of-order reassembly). */
+		/* Boot-log format: timestamps, the severity filter and the
+		 * agreement between the console and the dmesg ring. */
+		log_format_selftest();
+
 		route_smoke();
 		tcp_robustness_smoke();
 		dhcpv6_smoke();
@@ -1000,14 +1020,14 @@ void kernel_main(usize arg0, usize arg1)
 				console_write(m94_path);
 				console_write("\n");
 			} else {
-				console_write("M94-INIT: ok default /sbin/init\n");
+				k_info(NULL, "M94-INIT: ok default /sbin/init");
 			}
 			/* Verify flag detection (flags are absent in normal test boot). */
 			int m94_single = bootinfo_has_flag("b1nix.single");
 			if (m94_single) {
-				console_write("M94-INIT: ok single-flag\n");
+				k_info(NULL, "M94-INIT: ok single-flag");
 			} else {
-				console_write("M94-INIT: ok no-override-flags\n");
+				k_info(NULL, "M94-INIT: ok no-override-flags");
 			}
 		}
 	}
@@ -1117,7 +1137,7 @@ void kernel_main(usize arg0, usize arg1)
 			if (rust_pid > 0)
 				console_write("M68-RUST: ok rustc-load\n");
 			else
-				console_write("M68-RUST: fail rustc-load\n");
+				k_info(NULL, "M68-RUST: fail rustc-load");
 		}
 	}
 
@@ -1152,7 +1172,7 @@ void kernel_main(usize arg0, usize arg1)
 				syscall_dispatch(SYS_WAIT, (u64)ver_pid, (u64)(usize)&ver_st, 0, 0, 0, 0);
 				console_write("M64-NATIVE-CLANG: ok clang-load\n");
 			} else {
-				console_write("M64-NATIVE-CLANG: fail clang-load\n");
+				k_info(NULL, "M64-NATIVE-CLANG: fail clang-load");
 			}
 
 			/* (2) Compile proof: emit an object for the default x86_64-b1nix
@@ -1180,7 +1200,7 @@ void kernel_main(usize arg0, usize arg1)
 			    elfmag[2] == 'L' && elfmag[3] == 'F')
 				console_write("M64-NATIVE-CLANG: ok compile\n");
 			else
-				console_write("M64-NATIVE-CLANG: fail compile\n");
+				k_info(NULL, "M64-NATIVE-CLANG: fail compile");
 
 			/* Diagnostic: also compile at -O2. The optimized path uses the
 			 * greedy allocator and has no "must use fast regalloc" check, so a
@@ -1206,7 +1226,7 @@ void kernel_main(usize arg0, usize arg1)
 			    elfmag2[2] == 'L' && elfmag2[3] == 'F')
 				console_write("M64-NATIVE-CLANG: ok compile-O2\n");
 			else
-				console_write("M64-NATIVE-CLANG: fail compile-O2\n");
+				k_info(NULL, "M64-NATIVE-CLANG: fail compile-O2");
 		}
 	}
 
@@ -1260,6 +1280,6 @@ void kernel_main(usize arg0, usize arg1)
 		}
 	}
 
-	console_write("\nM6 network layer demo complete\n");
+	k_info(NULL, "\nM6 network layer demo complete");
 	arch_halt();
 }

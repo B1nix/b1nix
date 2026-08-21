@@ -176,9 +176,42 @@ run_variant() {
 	# fine. Measuring runs against each other requires them to start alike.
 	rm -rf /dev/shm/cmin-*
 	echo "CMIN: variant $name start t=$(up)"
-	timeout -k 5 ${CMIN_BUDGET:-600} /usr/bin/chromium $COMMON --user-data-dir=/dev/shm/cmin-$name \
-		"$@" about:blank > $log 2>&1
-	rc=$?
+	# Time the DOM, not the exit.
+	#
+	# --dump-dom prints the document and the browser then does NOT leave: the
+	# run ends when the budget kills it, so its exit time says how long the
+	# budget was, not how long the page took. The only honest moment is the one
+	# the first "<html" is written, so the output goes through an awk that
+	# stamps it from /proc/uptime as it passes and otherwise copies its input
+	# unchanged. awk only wakes when the browser writes, which costs nothing in
+	# between — unlike the polling loop this file already replaced once, which
+	# could not get scheduled when the browser had every core busy.
+	# The exit status has to survive the pipe (ash has no PIPESTATUS), so the
+	# browser's own status is carried out in a file.
+	# The stamp is written to a file rather than to the console: awk's stderr
+	# is not reliably the console here, and the moment is in the value, not in
+	# when it gets echoed. It is printed below, once the run is over.
+	rcf=/tmp/cmin-rc-$name
+	domf=/tmp/cmin-dom-$name
+	rm -f $rcf $domf
+	{ timeout -k 5 ${CMIN_BUDGET:-600} /usr/bin/chromium $COMMON \
+		--user-data-dir=/dev/shm/cmin-$name "$@" about:blank 2>&1
+	  echo $? > $rcf; } | awk -v d="$domf" '
+		/<html/ && !seen {
+			seen = 1
+			if ((getline u < "/proc/uptime") > 0) {
+				close("/proc/uptime")
+				split(u, f, " ")
+				print f[1] > d
+				close(d)
+			}
+		}
+		{ print }' > $log
+	rc=$(cat $rcf 2>/dev/null)
+	rc=${rc:-1}
+	domt=$(cat $domf 2>/dev/null)
+	[ -n "$domt" ] && echo "CMIN: variant $name DOM at t=$domt"
+	rm -f $rcf $domf
 	echo "CMIN: variant $name returned from wait rc=$rc t=$(up)"
 	dom=$(grep -ac "<html" $log 2>/dev/null)
 	echo "CMIN: variant $name rc=$rc dom=$dom t=$(up) bytes=$(wc -c < $log 2>/dev/null)"

@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/net.h>
 #include <b1nix/console.h>
 #include <b1nix/sched.h>
@@ -191,7 +192,7 @@ void dns_receive(const void *data, usize size)
 	u16 ancount = bswap16(hdr->ancount);
 	if (ancount == 0) {
 		if (g_dns_verbose)
-			console_write("net: dns returned 0 answers\n");
+			k_info("net", "dns returned 0 answers");
 		return;
 	}
 
@@ -246,7 +247,7 @@ void dns_receive(const void *data, usize size)
 			memcpy(g_dns6_ip, ptr, 16);
 			g_dns6_have = 1;
 			if (g_dns_verbose)
-				console_write("net: dns resolved AAAA\n");
+				k_info("net", "dns resolved AAAA");
 		}
 	}
 }

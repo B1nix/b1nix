@@ -2115,6 +2115,32 @@ void virtio_gpu_get_mode(u32 *width, u32 *height)
     if (height) *height = gpu_scanout_height;
 }
 
+
+/* What a frame costs, split by where it goes.
+ *
+ * Three separate charges land on every present: a row-by-row copy into the
+ * resource's backing store, a TRANSFER_TO_HOST that the caller waits for, and
+ * a RESOURCE_FLUSH it waits for again. Which of them dominates decides whether
+ * the fix is to stop copying, to stop waiting, or neither — so they are
+ * counted apart rather than guessed at. Read through /proc/b1nix-prof. */
+static u64 g_gpu_presents, g_gpu_copy_bytes, g_gpu_copy_cycles;
+static u64 g_gpu_transfer_cycles, g_gpu_flush_cycles;
+
+static inline u64 gpu_tsc(void) {
+    unsigned lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
+
+void virtio_gpu_frame_stats(u64 *presents, u64 *copy_bytes, u64 *copy_cyc,
+                            u64 *xfer_cyc, u64 *flush_cyc) {
+    if (presents) *presents = __atomic_load_n(&g_gpu_presents, __ATOMIC_RELAXED);
+    if (copy_bytes) *copy_bytes = __atomic_load_n(&g_gpu_copy_bytes, __ATOMIC_RELAXED);
+    if (copy_cyc) *copy_cyc = __atomic_load_n(&g_gpu_copy_cycles, __ATOMIC_RELAXED);
+    if (xfer_cyc) *xfer_cyc = __atomic_load_n(&g_gpu_transfer_cycles, __ATOMIC_RELAXED);
+    if (flush_cyc) *flush_cyc = __atomic_load_n(&g_gpu_flush_cycles, __ATOMIC_RELAXED);
+}
+
 static int virtio_gpu_present_locked(const u32 *src, u32 width, u32 height,
                                      u32 dirty_x, u32 dirty_y, u32 dirty_w,
                                      u32 dirty_h, int cursor_x, int cursor_y,
@@ -2167,6 +2193,7 @@ static int virtio_gpu_present_locked(const u32 *src, u32 width, u32 height,
     if (dirty_x + dirty_w > width) dirty_w = width - dirty_x;
     if (dirty_y + dirty_h > height) dirty_h = height - dirty_y;
 
+    u64 t_copy = gpu_tsc();
     for (u32 row = 0; row < dirty_h; row++) {
         usize off = ((usize)(dirty_y + row) * width + dirty_x);
         memcpy(gpu_surface_virt + off, src + off, (usize)dirty_w * sizeof(u32));
@@ -2179,6 +2206,11 @@ static int virtio_gpu_present_locked(const u32 *src, u32 width, u32 height,
             virtio_gpu_draw_cursor_surface(cursor_x, cursor_y);
         }
     }
+
+    __atomic_fetch_add(&g_gpu_copy_cycles, gpu_tsc() - t_copy, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_gpu_copy_bytes,
+                       (u64)dirty_w * dirty_h * sizeof(u32), __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_gpu_presents, 1, __ATOMIC_RELAXED);
 
     struct virtio_gpu_transfer_to_host_2d transfer;
     struct virtio_gpu_resource_flush flush;
@@ -2194,8 +2226,10 @@ static int virtio_gpu_present_locked(const u32 *src, u32 width, u32 height,
     transfer.rect.height = dirty_h;
     transfer.offset = ((u64)dirty_y * width + dirty_x) * sizeof(u32);
     transfer.resource_id = gpu_resource_id;
-    if (virtio_gpu_send_cmd(&transfer, sizeof(transfer), &resp, sizeof(resp)) < 0 ||
-        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+    u64 t_xfer = gpu_tsc();
+    int xrc = virtio_gpu_send_cmd(&transfer, sizeof(transfer), &resp, sizeof(resp));
+    __atomic_fetch_add(&g_gpu_transfer_cycles, gpu_tsc() - t_xfer, __ATOMIC_RELAXED);
+    if (xrc < 0 || resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
         return -1;
     }
 
@@ -2208,8 +2242,10 @@ static int virtio_gpu_present_locked(const u32 *src, u32 width, u32 height,
     flush.rect.width = dirty_w;
     flush.rect.height = dirty_h;
     flush.resource_id = gpu_resource_id;
-    if (virtio_gpu_send_cmd(&flush, sizeof(flush), &resp, sizeof(resp)) < 0 ||
-        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+    u64 t_flush = gpu_tsc();
+    int frc = virtio_gpu_send_cmd(&flush, sizeof(flush), &resp, sizeof(resp));
+    __atomic_fetch_add(&g_gpu_flush_cycles, gpu_tsc() - t_flush, __ATOMIC_RELAXED);
+    if (frc < 0 || resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
         return -1;
     }
 

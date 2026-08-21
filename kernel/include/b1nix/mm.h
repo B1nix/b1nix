@@ -243,6 +243,11 @@ void paging_reload_cr3(void);
  * or 0 if the page is not present. Used to measure a task's real resident set
  * (/proc/<pid>/statm) without touching the current address space. */
 u64 paging_user_frame(u64 pml4_phys, u64 vaddr);
+/* The same count as one paging_user_frame call per page of [start, end), but
+ * descending the tables once instead of restarting at the PML4 for every page,
+ * and skipping an absent entry's whole span in a single step. Anyone counting
+ * a range wants this; the per-page call is for a single address. */
+u64 paging_user_resident(u64 pml4_phys, u64 start, u64 end);
 /* The leaf entry itself, for telling an executable page from a data one in
  * another task's space (see the stack walk in the task watchdog). */
 u64 paging_user_pte(u64 pml4_phys, u64 vaddr);

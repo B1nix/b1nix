@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/blk.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
@@ -491,7 +492,7 @@ void nvme_init(void)
     }
     
     if (!found) {
-        console_write("nvme: no NVMe controller found\n");
+        k_info("nvme", "no NVMe controller found");
         return;
     }
     
@@ -577,7 +578,7 @@ void nvme_init(void)
         cc &= ~NVME_CC_EN;
         regs->cc = cc;
         if (nvme_wait_ready(regs, 0) < 0) {
-            console_write("nvme: failed to disable\n");
+            k_err("nvme", "failed to disable");
             return;
         }
     }
@@ -615,7 +616,7 @@ void nvme_init(void)
         nvme.phys_admin_sq = nvme.phys_admin_cq = 0;
         nvme.phys_io_sq = nvme.phys_io_cq = 0;
         if (nvme.queue_size <= 2u) {
-            console_write("nvme: cannot reserve queues\n");
+            k_err("nvme", "cannot reserve queues");
             return;
         }
         nvme.queue_size /= 2u;
@@ -655,15 +656,15 @@ void nvme_init(void)
     regs->cc = cc;
     
     if (nvme_wait_ready(regs, 1) < 0) {
-        console_write("nvme: failed to enable\n");
+        k_err("nvme", "failed to enable");
         return;
     }
     
-    console_write("nvme: controller enabled\n");
+    k_info("nvme", "controller enabled");
     
     // Identify controller
     if (nvme_identify(&nvme, NVME_IDENTIFY_CNS_CTRL, 0, nvme.phys_identify_buf) < 0) {
-        console_write("nvme: identify controller failed\n");
+        k_err("nvme", "identify controller failed");
         return;
     }
     
@@ -703,13 +704,13 @@ void nvme_init(void)
     console_write("\n");
     
     if (nvme.namespace_count == 0) {
-        console_write("nvme: no namespaces\n");
+        k_info("nvme", "no namespaces");
         return;
     }
     
     // Identify the namespace this driver drives
     if (nvme_identify(&nvme, NVME_IDENTIFY_CNS_NS, NVME_NSID, nvme.phys_identify_buf + NVME_PAGE_SIZE) < 0) {
-        console_write("nvme: identify namespace 1 failed\n");
+        k_err("nvme", "identify namespace 1 failed");
         return;
     }
     
@@ -728,17 +729,17 @@ void nvme_init(void)
     
     // Create I/O completion queue
     if (nvme_create_io_cq(&nvme) < 0) {
-        console_write("nvme: create IO CQ failed\n");
+        k_err("nvme", "create IO CQ failed");
         return;
     }
-    console_write("nvme: IO CQ created\n");
+    k_info("nvme", "IO CQ created");
     
     // Create I/O submission queue
     if (nvme_create_io_sq(&nvme) < 0) {
-        console_write("nvme: create IO SQ failed\n");
+        k_err("nvme", "create IO SQ failed");
         return;
     }
-    console_write("nvme: IO SQ created\n");
+    k_info("nvme", "IO SQ created");
 
     /* M70: enable interrupt-driven I/O completion. The IO CQ was created with
      * IEN set (vector 0); unmask that vector (intmc) and register the handler,
@@ -862,11 +863,11 @@ void nvme_msix_selftest(void)
     if (!bootinfo_has_flag("b1nix.test=1"))
         return;
     if (!nvme.regs) {
-        console_write("M98-DRV-SMOKE: skip msi-delivery (no NVMe controller)\n");
+        k_info(NULL, "M98-DRV-SMOKE: skip msi-delivery (no NVMe controller)");
         return;
     }
     if (!nvme.use_msix) {
-        console_write("M98-DRV-SMOKE: skip msi-delivery (controller has no MSI-X)\n");
+        k_info(NULL, "M98-DRV-SMOKE: skip msi-delivery (controller has no MSI-X)");
         return;
     }
 
@@ -901,7 +902,7 @@ void nvme_msix_selftest(void)
 
     u8 *buf = (u8 *)kmalloc(512);
     if (!buf) {
-        console_write("M98-DRV-SMOKE: FAIL msi-delivery (no buffer)\n");
+        k_info(NULL, "M98-DRV-SMOKE: FAIL msi-delivery (no buffer)");
         return;
     }
 
@@ -934,7 +935,7 @@ void nvme_msix_selftest(void)
         return;
     }
     if (nvme.ir_handle >= 0)
-        console_write("M100C-SMOKE: ok ir-delivery (a remapped MSI-X reached its vector)\n");
+        k_info(NULL, "M100C-SMOKE: ok ir-delivery (a remapped MSI-X reached its vector)");
     console_write("M98-DRV-SMOKE: ok msi-delivery vector=");
     console_write_dec((u64)nvme.msix_vector);
     console_write(" hits=");

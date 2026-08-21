@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
 #include <b1nix/console.h>
@@ -96,5 +97,5 @@ void icmp_send_dest_unreachable(struct ipv4_addr dst, u8 code) {
   payload[3] = (u8)(csum & 0xff);
   ipv4_send(dst, 1 /* ICMP */, payload, sizeof(payload));
   if (bootinfo_has_flag("b1nix.test=1"))
-    console_write("UDP-SMOKE: icmp-port-unreachable\n");
+    k_info(NULL, "UDP-SMOKE: icmp-port-unreachable");
 }

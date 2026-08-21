@@ -8,9 +8,17 @@
  * mount root — everything below it is served by the generic VFS paths, and it
  * all disappears when the mount goes away, which is exactly tmpfs semantics.
  *
- * "ramfs" and "devtmpfs" are registered as aliases: they differ from tmpfs on
- * Linux only in swap/size accounting and in devtmpfs being populated by the
- * kernel, neither of which changes what a mount of them looks like here.
+ * "ramfs" is registered as an alias: it differs from tmpfs on Linux only in
+ * swap/size accounting, which does not change what a mount of it looks like
+ * here.
+ *
+ * "devtmpfs" is NOT an alias. On Linux it arrives already populated with every
+ * device node the kernel knows about, and an init system mounts it over /dev
+ * expecting exactly that. As a plain tmpfs it replaced the whole of /dev with
+ * an empty directory: systemd lost /dev/console the moment it mounted it and
+ * printed nothing for the rest of the boot, and no getty could open
+ * /dev/ttyS0. Its mount publishes the root first (so path lookups reach it)
+ * and then asks the VFS to lay the device nodes down inside it.
  */
 
 #include <b1nix/vfs.h>
@@ -52,8 +60,21 @@ static struct vfs_fs tmpfs_fs = {.name = "tmpfs", .mount = tmpfs_mount_cb,
                                  .flags = VFS_FS_NODEV};
 static struct vfs_fs ramfs_fs = {.name = "ramfs", .mount = tmpfs_mount_cb,
                                  .flags = VFS_FS_NODEV};
+static struct vfs_node *devtmpfs_mount_cb(const char *source, u64 flags,
+                                          void *data) {
+  struct vfs_node *root = tmpfs_mount_cb(source, flags, data);
+  if (IS_ERR(root))
+    return root;
+  /* Publish the mount root before populating: vfs_populate_dev creates its
+   * nodes by absolute path, and "/dev" only resolves into this filesystem once
+   * the mount entry knows its root. */
+  vfs_set_currently_mounting_root(root);
+  vfs_populate_dev();
+  return root;
+}
+
 static struct vfs_fs devtmpfs_fs = {.name = "devtmpfs",
-                                    .mount = tmpfs_mount_cb,
+                                    .mount = devtmpfs_mount_cb,
                                     .flags = VFS_FS_NODEV};
 
 void tmpfs_init(void) {

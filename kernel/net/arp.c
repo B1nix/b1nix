@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
@@ -56,7 +57,7 @@ static void arp_smoke_mark_resolution(void)
 {
 	if (bootinfo_has_flag("b1nix.test=1") && !arp_smoke_resolution_logged) {
 		arp_smoke_resolution_logged = 1;
-		console_write("\nARP-SMOKE: resolution-ready\n");
+		k_info(NULL, "\nARP-SMOKE: resolution-ready");
 	}
 }
 
@@ -223,7 +224,7 @@ int arp_resolve_dev(struct ipv4_addr ip, struct mac_addr *mac, struct netdev *de
 		net_send_ethernet_dev(dev, bcast, 0x0806, &req, sizeof(req));
 		
 			if (bootinfo_has_flag("b1nix.test=1") && !arp_smoke_request_logged) {
-			console_write("\nARP-SMOKE: request-sent\n");
+			k_info(NULL, "\nARP-SMOKE: request-sent");
 			arp_smoke_request_logged = 1;
 		}
 	}
@@ -254,7 +255,7 @@ void arp_receive(const void *data, usize size)
 	
 	if (bswap16(pkt->op) == ARP_OP_REPLY) {
 		if (bootinfo_has_flag("b1nix.test=1") && !arp_smoke_reply_logged) {
-			console_write("\nARP-SMOKE: reply-received\n");
+			k_info(NULL, "\nARP-SMOKE: reply-received");
 			arp_smoke_reply_logged = 1;
 		}
 	}

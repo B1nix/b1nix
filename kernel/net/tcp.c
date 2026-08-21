@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
@@ -995,7 +996,7 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
     kfree(rcvbuf);
     kfree(rp->data);
     kfree(rp);
-    console_write("tcp: no free connection slots\n");
+    k_info("tcp", "no free connection slots");
     return 0;
   }
 
@@ -1118,7 +1119,7 @@ static struct tcp_conn *tcp_connect_wait(struct tcp_conn *conn) {
       static unsigned reported;
       if (reported < 8) {
         reported++;
-        console_write("tcp: connect failed\n");
+        k_err("tcp", "connect failed");
       }
     }
     conn->used = 0;
@@ -2503,7 +2504,7 @@ void tcp_timer_tick(void) {
            * reader parked on it must be told rather than left waiting. */
           conn->state = TCP_CLOSED;
           conn->keepalive_probes = 0;
-          console_write("tcp: keepalive found a dead peer, connection closed\n");
+          k_info("tcp", "keepalive found a dead peer, connection closed");
           tcp_unlock();
           irq_restore(irq);
           tcp_clear_retransmit_queue(conn);
@@ -2659,9 +2660,9 @@ void tcp_robustness_smoke(void) {
     struct tcp_opts opt;
     tcp_parse_options(seg, (5 + 3) * 4, &opt);
     if (opt.mss == 1460 && opt.has_wscale && opt.wscale == 7 && opt.sack_ok)
-      console_write("M84-TCP: ok opt-parse\n");
+      k_info(NULL, "M84-TCP: ok opt-parse");
     else
-      console_write("M84-TCP: FAIL opt-parse\n");
+      k_info(NULL, "M84-TCP: FAIL opt-parse");
 
     /* A truncated / malformed option must terminate the walk instead of
      * running off the end or spinning on a zero length. */
@@ -2670,9 +2671,9 @@ void tcp_robustness_smoke(void) {
     o[0] = TCP_OPT_WSCALE; o[1] = 0; /* illegal length */
     tcp_parse_options(seg, (5 + 3) * 4, &opt);
     if (!opt.has_wscale && opt.mss == 0)
-      console_write("M84-TCP: ok opt-malformed\n");
+      k_info(NULL, "M84-TCP: ok opt-malformed");
     else
-      console_write("M84-TCP: FAIL opt-malformed\n");
+      k_info(NULL, "M84-TCP: FAIL opt-malformed");
   }
 
   /* 2/3/4. Live loopback connection: MSS negotiation, scaled window
@@ -2681,12 +2682,12 @@ void tcp_robustness_smoke(void) {
   u16 port = 7940;
   struct tcp_conn *srv = tcp_listen(port, 1);
   if (!srv) {
-    console_write("M84-TCP: FAIL listen\n");
+    k_info(NULL, "M84-TCP: FAIL listen");
     return;
   }
   struct tcp_conn *cli = tcp_connect(lo, port);
   if (!cli) {
-    console_write("M84-TCP: FAIL connect\n");
+    k_info(NULL, "M84-TCP: FAIL connect");
     tcp_close(srv);
     return;
   }
@@ -2699,7 +2700,7 @@ void tcp_robustness_smoke(void) {
       net_poll();
   }
   if (!acc) {
-    console_write("M84-TCP: FAIL accept\n");
+    k_info(NULL, "M84-TCP: FAIL accept");
     tcp_close(cli);
     tcp_close(srv);
     return;
@@ -2709,9 +2710,9 @@ void tcp_robustness_smoke(void) {
    * each side learned the other's. */
   if (cli->snd_mss == TCP_MSS && acc->snd_mss == TCP_MSS && cli->wscale_ok &&
       acc->wscale_ok && cli->sack_ok && acc->sack_ok)
-    console_write("M84-TCP: ok mss-negotiated\n");
+    k_info(NULL, "M84-TCP: ok mss-negotiated");
   else
-    console_write("M84-TCP: FAIL mss-negotiated\n");
+    k_info(NULL, "M84-TCP: FAIL mss-negotiated");
 
   /* The advertised window is our real buffer, shifted by the scale we
    * negotiated — a receive window past the unscaled 16-bit ceiling. The
@@ -2723,9 +2724,9 @@ void tcp_robustness_smoke(void) {
     u32 advertised = (u32)tcp_adv_window(acc) << acc->rcv_wscale;
     if (acc->rcv_wscale > 0 && acc->recv_cap > 0 &&
         advertised == acc->recv_cap && TCP_RECV_BUF_MAX > 65535)
-      console_write("M84-TCP: ok rcv-wscale\n");
+      k_info(NULL, "M84-TCP: ok rcv-wscale");
     else
-      console_write("M84-TCP: FAIL rcv-wscale\n");
+      k_info(NULL, "M84-TCP: FAIL rcv-wscale");
   }
 
   /* Window scaling: with a shift of 3 in effect, a 1000-byte advertisement
@@ -2745,9 +2746,9 @@ void tcp_robustness_smoke(void) {
     tcp_receive(lo, ackseg, sizeof(ackseg));
 
     if (cli->snd_wnd == 8000)
-      console_write("M84-TCP: ok wscale\n");
+      k_info(NULL, "M84-TCP: ok wscale");
     else
-      console_write("M84-TCP: FAIL wscale\n");
+      k_info(NULL, "M84-TCP: FAIL wscale");
     cli->snd_wscale = 0;
   }
 
@@ -2773,9 +2774,9 @@ void tcp_robustness_smoke(void) {
     int queued = (acc->ooo_segs == 1 && acc->recv_len == 0 &&
                   acc->rcv_nxt == base);
     if (queued)
-      console_write("M84-TCP: ok ooo-queued\n");
+      k_info(NULL, "M84-TCP: ok ooo-queued");
     else
-      console_write("M84-TCP: FAIL ooo-queued\n");
+      k_info(NULL, "M84-TCP: FAIL ooo-queued");
 
     memset(seg, 0, sizeof(seg));
     h->src_port = bswap16(cli->local_port);
@@ -2793,9 +2794,9 @@ void tcp_robustness_smoke(void) {
     int n = tcp_recv(acc, buf, sizeof(buf) - 1, 0);
     if (n == 10 && memcmp(buf, "helloworld", 10) == 0 && acc->ooo_segs == 0 &&
         acc->rcv_nxt == base + 10)
-      console_write("M84-TCP: ok ooo-reassembly\n");
+      k_info(NULL, "M84-TCP: ok ooo-reassembly");
     else
-      console_write("M84-TCP: FAIL ooo-reassembly\n");
+      k_info(NULL, "M84-TCP: FAIL ooo-reassembly");
 
     /* A retransmission of already-delivered bytes must be trimmed, not
      * re-appended to the stream. */
@@ -2810,9 +2811,9 @@ void tcp_robustness_smoke(void) {
     memcpy(seg + sizeof(struct tcp_header), "hello", 5);
     tcp_receive(lo, seg, sizeof(seg));
     if (acc->rcv_nxt == base + 10 && acc->recv_len == 0)
-      console_write("M84-TCP: ok dup-trim\n");
+      k_info(NULL, "M84-TCP: ok dup-trim");
     else
-      console_write("M84-TCP: FAIL dup-trim\n");
+      k_info(NULL, "M84-TCP: FAIL dup-trim");
   }
 
   /* SACK emission: with a hole in the stream, the ACK the receiver builds must
@@ -2843,9 +2844,9 @@ void tcp_robustness_smoke(void) {
     tcp_parse_options(ack, ((ack[12] >> 4) * 4), &o);
     if (alen > sizeof(struct tcp_header) && o.nsack == 1 &&
         o.sack_left[0] == base + 8 && o.sack_right[0] == base + 12)
-      console_write("M84-TCP: ok sack-emit\n");
+      k_info(NULL, "M84-TCP: ok sack-emit");
     else
-      console_write("M84-TCP: FAIL sack-emit\n");
+      k_info(NULL, "M84-TCP: FAIL sack-emit");
   }
 
   /* SACK consumption: a dup-ACK carrying a block covering the second queued

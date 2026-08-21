@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/net.h>
 #include <b1nix/console.h>
 #include <b1nix/sched.h>
@@ -383,7 +384,7 @@ void dhcp_receive(const void *data, usize size)
 		consecutive_naks = 0;
 		retry_not_before_ticks = 0;
 		if (bootinfo_has_flag("b1nix.test=1"))
-			console_write("DHCP-SMOKE: lease-acquired\n");
+			k_info(NULL, "DHCP-SMOKE: lease-acquired");
 		u64 now = scheduler_get_uptime_ticks();
 		lease_expire_ticks = now + (u64)lease_seconds * 100;
 		renew_ticks = now + ((u64)lease_seconds * 100) / 2;
@@ -404,7 +405,7 @@ void dhcp_receive(const void *data, usize size)
 		/* A server can NAK every immediate retry. Back off instead of filling
 		 * the console and network with a tight DISCOVER/REQUEST loop. */
 		if (consecutive_naks == 1)
-			console_write("net: dhcp NAK, retrying with backoff\n");
+			k_info("net", "dhcp NAK, retrying with backoff");
 		current_xid++;
 		dhcp_state = 0;
 		transaction_start_ticks = now;
@@ -438,12 +439,12 @@ void dhcp_tick(u64 now_ticks) {
 	    dhcp_state = 2;
 	    dhcp_fallback_announced = 1;
 	    if (bootinfo_has_flag("b1nix.test=1"))
-	      console_write("DHCP-SMOKE: fallback-static\n");
+	      k_warn(NULL, "DHCP-SMOKE: fallback-static");
 	    return;
   }
   if (dhcp_state == 0) {
     if (now_ticks - transaction_start_ticks >= 3000) {
-      console_write("net: dhcp transaction timed out, restarting\n");
+      k_info("net", "dhcp transaction timed out, restarting");
       dhcp_init();
     } else if (now_ticks - last_request_ticks >= 300) {
       dhcp_send_discover();
@@ -452,7 +453,7 @@ void dhcp_tick(u64 now_ticks) {
   }
   if (dhcp_state == 1) {
     if (now_ticks - transaction_start_ticks >= 3000) {
-      console_write("net: dhcp request timed out, restarting\n");
+      k_info("net", "dhcp request timed out, restarting");
       dhcp_init();
     } else if (now_ticks - last_request_ticks >= 300) {
       dhcp_send_request(offered_ip, 1);

@@ -16,7 +16,14 @@ void console_init(void);
 void console_clear(void);
 void console_putc(char ch);
 void console_write(const char *text);
+/* Terminal output — /dev/console, /dev/tty and VT echo. Unlike console_putc,
+ * these add no timestamp and no severity: they are not log records. */
+void console_putc_raw(char ch);
+void console_write_raw(const char *text);
 void console_bust_lock(void);
+/* Dump anything the console is still holding back because the kernel command
+ * line has not been parsed yet. Crash paths only. */
+void console_log_panic_flush(void);
 /* Let other subsystems that bypass console_write() but still hit the shared
  * physical UART (e.g. tty write() -> serial_port_putc()) serialize a whole
  * buffer against it, so neither side's multi-byte output can land mid-way

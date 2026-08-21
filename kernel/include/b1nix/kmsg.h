@@ -41,6 +41,11 @@ void kmsg_register_nodes(void);
  * A record is closed on '\n' or when the line buffer fills. */
 void kmsg_putc(char ch);
 
+/* Set the syslog priority of the record currently being assembled from console
+ * characters. The console line assembler calls this when it opens a line, so a
+ * record carries the same severity the console filtered on. */
+void kmsg_set_line_prio(int priority);
+
 /* Emit a complete record with an explicit syslog priority (0..7). */
 void kmsg_emit(int priority, const char *text);
 

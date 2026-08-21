@@ -142,6 +142,13 @@ struct ext4_bgd_64 {
 
 struct ext4_fs {
     struct block_device *bdev;
+    /* Which mount this filesystem is, as the VFS numbers them. Every inode
+     * this driver hands out must carry it: the page cache is keyed on
+     * (fs_id, ino), and this driver replaces ino with the on-disk number, so
+     * without the matching fs_id a file here shares a cache key with any
+     * in-memory file whose allocation counter happened to reach the same
+     * number. See ext4_setup_node. */
+    u32 fs_id;
     struct ext2_superblock sb;
     u32 block_size;
     u32 inodes_per_group;

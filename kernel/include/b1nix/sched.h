@@ -490,6 +490,12 @@ void m28_ctxbench_run(void);
  * kmalloc/kfree). >1 CPU + test mode only. See kernel/sched/m28_heapbench.c. */
 void m28_heapbench_run(void);
 int scheduler_fork_current(void);
+/* fork(2) with the tid side effects Linux's clone(2) carries: the new thread id
+ * written into the child's copy of *child_tid (CLONE_CHILD_SETTID), into the
+ * parent's *parent_tid (CLONE_PARENT_SETTID), and the address remembered for
+ * the futex wake on exit (CLONE_CHILD_CLEARTID). */
+int scheduler_fork_clone(u64 flags, u64 parent_tid_addr, u64 child_tid_addr);
+int scheduler_fork_ctid(u64 child_tid_addr);
 
 /* M29: SYS_CLONE entry. Creates a new task that runs `entry(arg)` in ring 3
  * on the provided user stack. `flags` is a B1NIX_CLONE_* bitmask. Returns
@@ -511,10 +517,26 @@ int scheduler_fork_current(void);
  * exit) to let a vfork parent continue. */
 void scheduler_vfork_release(void);
 
+/* The user register file a clone(2) child resumes with.
+ *
+ * Linux gives the child the caller's registers unchanged apart from a zero
+ * return value and the new stack pointer, and libcs depend on that: glibc's
+ * __clone3 keeps the thread function in %r9 and its argument in %r8 across the
+ * syscall, and its __clone pops both from the new stack. Handing the child a
+ * zeroed register file therefore called the thread function with a NULL
+ * argument (clone3) or called through a NULL pointer (clone) — dbus-daemon,
+ * systemd-logind and systemd's own worker threads all died at rip=0. The
+ * field ORDER here is the one kernel/arch/x86_64/user_jump.S loads. */
+struct clone_user_regs {
+  u64 rbx, rcx, rdx, rsi, rdi, rbp;
+  u64 r8, r9, r10, r11, r12, r13, r14, r15;
+};
+
 int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
                            u64 tls, u64 ctid,
                            u64 parent_tid_addr, u64 child_tid_addr,
-                           u64 start_func);
+                           u64 start_func,
+                           const struct clone_user_regs *uregs);
 
 /* M29: futex. op is B1NIX_FUTEX_WAIT or B1NIX_FUTEX_WAKE. Returns 0 on success,
  * -errno otherwise. WAIT blocks if *uaddr == val; WAKE wakes up to val
@@ -648,6 +670,11 @@ int scheduler_kill_all_user(int sig);
 /* prctl(PR_SET_PDEATHSIG): signo 0 clears. Delivered when the caller's parent
  * exits, just before the caller is reparented to init. */
 int scheduler_set_pdeathsig(usize pid, int signo);
+int scheduler_get_pdeathsig(usize pid);
+/* prctl(PR_SET_NAME): the comm a task chose for itself, or NULL when it never
+ * did (in which case comm is the basename of what it executed). */
+int scheduler_set_comm(usize pid, const char *name);
+const char *scheduler_comm_override(usize pid);
 void scheduler_clear_pdeathsig(usize pid);
 /* M86: kill(2) semantics for a positive pid — the signal targets the PROCESS,
  * so a thread that does not block it is chosen, and stop/continue signals act

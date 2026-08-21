@@ -13,6 +13,7 @@
  * advertisements, which is exactly what RFC 8415 says.
  */
 
+#include <b1nix/kprintf.h>
 #include <b1nix/net.h>
 #include <b1nix/netproto.h>
 #include <b1nix/netdev.h>
@@ -307,10 +308,10 @@ static void dh6_apply_lease(const struct dh6_parsed *p)
 
 	if (!dh6_bound_logged) {
 		dh6_bound_logged = 1;
-		console_write("net: dhcpv6 bound\n");
+		k_info("net", "dhcpv6 bound");
 	}
 	if (bootinfo_has_flag("b1nix.test=1"))
-		console_write("DHCP6-SMOKE: lease-acquired\n");
+		k_info(NULL, "DHCP6-SMOKE: lease-acquired");
 }
 
 /* Inbound datagram on UDP port 546. */
@@ -567,11 +568,11 @@ void dhcpv6_smoke(void)
 	dhcpv6_start_locked();
 
 	if (dh6_state != DH6_ST_SOLICIT) {
-		console_write("M84-DHCP6: FAIL solicit\n");
+		k_info(NULL, "M84-DHCP6: FAIL solicit");
 		dh6_leave();
 		return;
 	}
-	console_write("M84-DHCP6: ok solicit\n");
+	k_info(NULL, "M84-DHCP6: ok solicit");
 
 	/* Server DUID-LL of the synthetic server. */
 	u8 srv_duid[10] = {0, 3, 0, 1, 0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
@@ -618,9 +619,9 @@ void dhcpv6_smoke(void)
 
 	if (dh6_state == DH6_ST_REQUEST && dh6_serverid_len == sizeof(srv_duid) &&
 	    memcmp(dh6_serverid, srv_duid, sizeof(srv_duid)) == 0)
-		console_write("M84-DHCP6: ok advertise\n");
+		k_info(NULL, "M84-DHCP6: ok advertise");
 	else
-		console_write("M84-DHCP6: FAIL advertise\n");
+		k_info(NULL, "M84-DHCP6: FAIL advertise");
 
 	/* Reply → bound, address installed, on-link /128 route present. */
 	u8 rep[256];
@@ -644,23 +645,23 @@ void dhcpv6_smoke(void)
 	struct in6_addr_k cfg = net_get_ip6();
 	if (dhcpv6_is_bound() && memcmp(cfg.bytes, assigned.bytes, 16) == 0 &&
 	    routed && dh6_t1 == 100 && dh6_t2 == 200)
-		console_write("M84-DHCP6: ok reply-bound\n");
+		k_info(NULL, "M84-DHCP6: ok reply-bound");
 	else
-		console_write("M84-DHCP6: FAIL reply-bound\n");
+		k_info(NULL, "M84-DHCP6: FAIL reply-bound");
 
 	struct in6_addr_k got_dns = dns_get_server6();
 	if (memcmp(got_dns.bytes, dns6.bytes, 16) == 0)
-		console_write("M84-DHCP6: ok dns-option\n");
+		k_info(NULL, "M84-DHCP6: ok dns-option");
 	else
-		console_write("M84-DHCP6: FAIL dns-option\n");
+		k_info(NULL, "M84-DHCP6: FAIL dns-option");
 
 	/* T1 expiry must move the client into RENEW. */
 	dh6_t1_ticks = scheduler_get_uptime_ticks();
 	dhcpv6_tick_locked(scheduler_get_uptime_ticks() + 1);
 	if (dh6_state == DH6_ST_RENEW)
-		console_write("M84-DHCP6: ok renew\n");
+		k_info(NULL, "M84-DHCP6: ok renew");
 	else
-		console_write("M84-DHCP6: FAIL renew\n");
+		k_info(NULL, "M84-DHCP6: FAIL renew");
 
 	/* A malformed message (truncated option) must be rejected, not parsed. */
 	u8 bad[16];
@@ -674,9 +675,9 @@ void dhcpv6_smoke(void)
 	u32 before = dh6_replies_seen;
 	dh6_receive_locked(from, bad, 8);
 	if (dh6_replies_seen == before)
-		console_write("M84-DHCP6: ok malformed-rejected\n");
+		k_info(NULL, "M84-DHCP6: ok malformed-rejected");
 	else
-		console_write("M84-DHCP6: FAIL malformed-rejected\n");
+		k_info(NULL, "M84-DHCP6: FAIL malformed-rejected");
 
 	/* Leave the interface as SLAAC configured it: this test ran entirely
 	 * against a synthetic server, so its address must not survive. */

@@ -393,6 +393,44 @@ check_output() {
 	fi
 }
 
+# Check that a pattern does NOT appear in the log. The counterpart to
+# check_output: some properties (a filtered log line, an error that must never
+# be printed) can only be stated as an absence.
+check_absent() {
+	local log="$1"
+	local pattern="$2"
+	local desc="$3"
+
+	if ! [ -s "$log" ]; then
+		blocked "$desc" "no log to check: $pattern"
+	elif grep -q "$pattern" "$log" 2>/dev/null; then
+		fail "$desc" "output that must not appear: $pattern"
+	else
+		pass "$desc"
+	fi
+}
+
+# Every kernel log line carries a monotonic timestamp, dmesg style. The lines
+# that legitimately do not are the boot loader'"'"'s (it prints before the kernel
+# runs), the harness'"'"'s own "[smoke]"/"SMOKE-WATCHDOG" notes, and userspace
+# output, which is terminal output rather than a log record.
+check_log_timestamps() {
+	local log="$1"
+	local desc="$2"
+	local bad
+
+	if ! [ -s "$log" ]; then
+		blocked "$desc" "no log to check"
+		return
+	fi
+	bad=$(grep -aE "^(pmm|vmm|kheap|sched|vfs|ext4|ext2|blk|ahci|nvme|pci|net|tcp|dhcp|arp|acpi|lapic|ioapic|smp|timer|initramfs|procfs|sysfs|rootfs|Step )" "$log" | head -5)
+	if [ -n "$bad" ]; then
+		fail "$desc" "kernel lines without a timestamp: $(echo "$bad" | head -1)"
+	else
+		pass "$desc"
+	fi
+}
+
 # ── Build kernel first ──
 echo "=== B1NIX Smoke Tests ($ARCH) ==="
 echo ""
@@ -1742,6 +1780,26 @@ check_output "$LOG" "M84-DHCP6: ok reply-bound" "DHCPv6 Reply binds the address,
 check_output "$LOG" "M84-DHCP6: ok dns-option" "DHCPv6 option 23 records the IPv6 nameserver"
 check_output "$LOG" "M84-DHCP6: ok renew" "T1 expiry moves the DHCPv6 client into Renew"
 check_output "$LOG" "M84-DHCP6: ok malformed-rejected" "a truncated DHCPv6 option is rejected, not parsed"
+# ── M110: the boot log has the shape an operator expects ────────────────────
+echo ""
+echo "[RUN] M110 boot-log format checks..."
+check_log_timestamps "$LOG" "every kernel log line carries a monotonic timestamp"
+check_output "$LOG" "^\[ *[0-9][0-9]*\.[0-9][0-9][0-9][0-9][0-9][0-9]\] b1nix kernel starting" \
+	"the first kernel line is stamped in the dmesg [ssss.uuuuuu] form"
+check_output "$LOG" "^\[ *[0-9][0-9]*\.[0-9][0-9][0-9][0-9][0-9][0-9]\] pci [0-9a-f][0-9a-f]*:" \
+	"PCI lines are prefixed with the device they are about"
+check_output "$LOG" "M110-LOG: ok clock-monotonic" \
+	"the log clock never runs backwards"
+check_output "$LOG" "M110-LOG: ok clock-uptime-agree" \
+	"log timestamps and /proc/uptime read the same monotonic clock"
+check_output "$LOG" "M110-LOG: ok filter-recorded" \
+	"a line the console filter drops is still recorded in the ring"
+check_absent "$LOG" "M110-LOG: FAIL filter-let-a-debug-line-through" \
+	"a line above the console loglevel never reaches the console"
+check_output "$LOG" "m110-log: subsystem prefix" \
+	"a subsystem-tagged line renders as \"subsys: message\""
+check_output "$LOG" "M110-LOG: done" "the boot-log self-test ran to completion"
+
 check_output "$LOG" "M84-TCP: ok opt-parse" "TCP parses MSS, window-scale and SACK-permitted options"
 check_output "$LOG" "M84-TCP: ok opt-malformed" "a malformed TCP option terminates the walk instead of looping"
 check_output "$LOG" "M84-TCP: ok mss-negotiated" "handshake negotiates MSS and window scaling on both sides"
@@ -2537,6 +2595,26 @@ fi
 
 # ── Summary ──
 echo ""
+# ── Debian (glibc) boot gate ────────────────────────────────────────────────
+# The Linux ABI layer against a real glibc distribution rather than against the
+# musl it was developed with. Opt-in, because it needs an image built once from
+# the network: make debian-image, then SMOKE_DEBIAN=1 sh tests/smoke.sh.
+if [ "${SMOKE_DEBIAN:-0}" = "1" ]; then
+	echo ""
+	echo "[RUN] Debian (glibc) boot..."
+	if [ -f "build/$ARCH/debian.ext4" ]; then
+		if sh "$PROJECT_DIR/tests/debian-smoke.sh" "$ARCH" >"$PROJECT_DIR/smoke_run/b1nix-debian-run.log" 2>&1; then
+			pass "a Debian bookworm userspace boots on this kernel (dash, coreutils, sysvinit)"
+		else
+			fail "a Debian bookworm userspace boots on this kernel" \
+				"see smoke_run/b1nix-debian-boot.log"
+		fi
+	else
+		blocked "a Debian bookworm userspace boots on this kernel" \
+			"no build/$ARCH/debian.ext4 — run: make debian-image"
+	fi
+fi
+
 echo "=== Results ==="
 echo "  Passed:  $PASSED"
 echo "  Failed:  $FAILED"

@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/ahci.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
@@ -698,7 +699,7 @@ void ahci_init(void) {
   }
 
   if (!found) {
-    console_write("ahci: no SATA controller found\n");
+    k_info("ahci", "no SATA controller found");
     return;
   }
 
@@ -741,7 +742,7 @@ void ahci_init(void) {
 
   // If BAR5 is 0, controller is in IDE mode — skip AHCI init
   if (ahci_pci_bar5 == 0) {
-    console_write("ahci: ABAR is zero (likely IDE mode), skipping\n");
+    k_warn("ahci", "ABAR is zero (likely IDE mode), skipping");
     return;
   }
 

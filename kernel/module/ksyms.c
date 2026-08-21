@@ -8,6 +8,7 @@
  * than an insmod failure.
  */
 
+#include <b1nix/kprintf.h>
 #include <b1nix/blk.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
@@ -49,6 +50,7 @@ EXPORT_SYMBOL(__udivdi3);
 EXPORT_SYMBOL(__umoddi3);
 
 /* ── console / diagnostics ───────────────────────────────────────────────── */
+EXPORT_SYMBOL(kprintf);
 EXPORT_SYMBOL(console_write);
 EXPORT_SYMBOL(console_putc);
 EXPORT_SYMBOL(console_write_dec);

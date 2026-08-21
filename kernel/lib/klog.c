@@ -3,15 +3,12 @@
 #include <b1nix/console.h>
 #include <b1nix/serial.h>
 #include <b1nix/klog.h>
+#include <b1nix/kprintf.h>
 #include <b1nix/bootinfo.h>
 
 /* Kernel log ring buffer — KLOG_BUF_SIZE comes from <b1nix/klog.h> (64 KiB) so
  * the whole boot (PCI/driver/dhcp output, fed in via klog_putc from
  * console_putc) survives until the shell, where `dmesg` can read it back. */
-
-static const char *klog_level_names[] = {
-	"DEBUG", "INFO", "WARN", "ERROR", "PANIC"
-};
 
 static char klog_buf[KLOG_BUF_SIZE];
 static usize klog_write_pos;
@@ -138,38 +135,29 @@ void klog_putc(char ch)
 }
 
 /* ── Core log function ── */
+/* The legacy level-tagged entry points, expressed in terms of the structured
+ * logger so that a klog_warn() line is stamped, filtered and recorded exactly
+ * like every other kernel line. The old implementation wrote its own "[WARN] "
+ * prefix to the console AND a second copy straight to the UART, which is why
+ * warnings used to appear twice in a serial capture. */
+static const int klog_syslog_level[] = {
+    LOGLEVEL_DEBUG,   /* KLOG_DEBUG */
+    LOGLEVEL_INFO,    /* KLOG_INFO  */
+    LOGLEVEL_WARNING, /* KLOG_WARN  */
+    LOGLEVEL_ERR,     /* KLOG_ERROR */
+    LOGLEVEL_EMERG,   /* KLOG_PANIC */
+};
+
 static void klog_write_internal(int level, const char *message, int show_debug)
 {
-    const char *prefix = klog_level_names[level];
-    usize prefix_len = strlen(prefix);
-    usize msg_len = strlen(message);
-
-    /* Write to console and serial */
-    if (level >= KLOG_WARN || (level == KLOG_DEBUG && show_debug)) {
-        console_write("[");
-        console_write(prefix);
-        console_write("] ");
-        console_write(message);
-        console_write("\n");
-
-        serial_write("[");
-        serial_write(prefix);
-        serial_write("] ");
-        serial_write(message);
-        serial_write("\n");
-    }
-
-    /* Write to circular ring buffer */
-    for (usize i = 0; i < prefix_len; i++) {
-        klog_ring_put(prefix[i]);
-    }
-    klog_ring_put(':');
-    klog_ring_put(' ');
-    for (usize i = 0; i < msg_len; i++) {
-        klog_ring_put(message[i]);
-    }
-    klog_ring_put('\n');
+    (void)show_debug;
+    if (level < KLOG_DEBUG)
+        level = KLOG_DEBUG;
+    if (level > KLOG_PANIC)
+        level = KLOG_PANIC;
+    kprintf(klog_syslog_level[level], NULL, "%s", message ? message : "");
 }
+
 static void klog_write(int level, const char *message)
 {
     klog_write_internal(level, message, 0);
@@ -416,6 +404,10 @@ void panic_backtrace(void)
 
 void panic(const char *message)
 {
+	/* If we are dying before the command line was parsed, the console is
+	 * still holding every line of the boot back; release them, or the panic
+	 * arrives without the context that explains it. */
+	console_log_panic_flush();
 	klog_write(KLOG_PANIC, message);
 	panic_backtrace();
 	arch_halt();

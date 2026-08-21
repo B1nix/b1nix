@@ -252,6 +252,15 @@ int vfs_inotify_add_watch(int fd, const char *user_path, u32 mask) {
   char resolved[VFS_MAX_PATH];
   vfs_resolve_path(kpath, resolved);
   struct vfs_node *node = vfs_find_node(resolved); /* refcounted */
+  /* vfs_find_node reports failure as an ERR_PTR, which is not NULL. A missing
+   * path therefore installed a watch whose "node" was the encoded errno — and
+   * since every failed lookup with the same errno produced the SAME value, the
+   * next add_watch matched that watch and handed back its descriptor. systemd
+   * watches one cgroup.events per unit and keys a hash map on the descriptor,
+   * so two units collided on one wd and it reported "Failed to add memory
+   * inotify watch descriptor ... File exists". */
+  if (IS_ERR(node))
+    return (int)PTR_ERR(node);
   if (!node)
     return -ENOENT;
 

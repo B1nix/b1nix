@@ -11,6 +11,7 @@
  * (it is the layer that picks the source address the checksum depends on).
  */
 
+#include <b1nix/kprintf.h>
 #include <b1nix/errno.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
@@ -347,9 +348,9 @@ void mld_smoke(void)
 	query[0] = ICMP6_MLD_QUERY;
 	mld_receive(loop, loop, ICMP6_MLD_QUERY, query, sizeof(query));
 	if (__atomic_load_n(&mld_reports, __ATOMIC_RELAXED) > before)
-		console_write("M32-IP6: ok mld\n");
+		k_info(NULL, "M32-IP6: ok mld");
 	else
-		console_write("M32-IP6: fail mld\n");
+		k_info(NULL, "M32-IP6: fail mld");
 }
 
 void ndp_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
@@ -414,7 +415,7 @@ void ndp_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
 			mld_join_solicited_node(global);
 			if (!slaac_configured) {
 				slaac_configured = 1;
-				console_write("net: ipv6 SLAAC configured a global address\n");
+				k_info("net", "ipv6 SLAAC configured a global address");
 			}
 		}
 		/* M84: feed the advertisement into the IPv6 FIB — the on-link /64

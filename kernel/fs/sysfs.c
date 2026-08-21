@@ -115,6 +115,9 @@ static struct vfs_node *sysfs_mkchild(struct vfs_node *parent,
   n->name[nl] = '\0';
   n->inode->mode = (type == VFS_DIRECTORY) ? 0555 : 0444;
   n->inode->nlink = (type == VFS_DIRECTORY) ? 2 : 1;
+  /* A sysfs attribute is a regular file, not a character device. */
+  if (type == VFS_DEVICE || type == VFS_FILE)
+    n->inode->flags |= VFS_NODE_PSEUDO_REG;
   if (render) {
     struct sysfs_node *sn = kzalloc(sizeof(*sn));
     if (sn) {
@@ -521,7 +524,7 @@ static void sysfs_build_block(struct vfs_node *root) {
 
 /* ── content generators ── */
 static int g_ostype(char *b, usize c) { return snprintf(b, c, "B1NIX\n"); }
-static int g_osrelease(char *b, usize c) { return snprintf(b, c, "%s\n", B1NIX_VERSION_STR); }
+static int g_osrelease(char *b, usize c) { return snprintf(b, c, "%s\n", B1NIX_RELEASE_STR); }
 static int g_hostname(char *b, usize c) {
   char h[65];
   kernel_hostname_get(h, sizeof(h));
@@ -662,6 +665,21 @@ static isize sysfs_drop_caches_write(struct vfs_node *node, u64 offset,
   return (isize)size;          /* consume the whole write */
 }
 
+/* SYSFS_MAGIC. statfs on a synthetic filesystem used to report ENOSYS, which
+ * userspace reads as "this kernel has no statfs" rather than "this filesystem
+ * has none" — systemd identifies /sys, /proc and /sys/fs/cgroup by their magic
+ * numbers and takes a different path when it cannot. */
+static int sysfs_statfs(struct vfs_node *node, struct b1nix_statfs *st) {
+  (void)node;
+  if (!st)
+    return -EINVAL;
+  memset(st, 0, sizeof(*st));
+  st->f_type = 0x62656572;
+  st->f_bsize = 4096;
+  st->f_namelen = 255;
+  return 0;
+}
+
 static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
                                        void *data) {
   (void)source;
@@ -671,6 +689,7 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
   if (!root)
     return ERR_PTR(-ENOMEM);
   root->inode->mode = 0555;
+  root->inode->statfs_cb = sysfs_statfs;
 
   struct vfs_node *kern = sysfs_mkchild(root, "kernel", VFS_DIRECTORY, 0);
   /* /sys/kernel/mm/drop_caches — writable reclaim knob (see write_cb above). */

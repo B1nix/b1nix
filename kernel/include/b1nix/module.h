@@ -66,7 +66,7 @@ struct kernel_symbol {
  * loader parses that section before it touches anything else, which is how a
  * .ko built for a different kernel is rejected (vermagic) and how modinfo(8)
  * reports a module it has not loaded. */
-#define MODULE_VERMAGIC_STRING B1NIX_VERSION_STR " x86_64 SMP"
+#define MODULE_VERMAGIC_STRING B1NIX_RELEASE_STR " x86_64 SMP"
 
 #define __MODULE_INFO_CAT2(a, b) a##b
 #define __MODULE_INFO_CAT(a, b) __MODULE_INFO_CAT2(a, b)

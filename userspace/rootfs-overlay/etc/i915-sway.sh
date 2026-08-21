@@ -1,4 +1,18 @@
 #!/bin/sh
+
+# Whole-word flag matching.
+#
+# `grep -q b1nix.chromium /proc/cmdline` also matches b1nix.chromium-min, which
+# every image built by the browser target carries — so the branch that starts
+# the browser ran even when the run asked for a plain terminal client instead,
+# and the client never started. The dot is a regex wildcard as well, which is
+# the same trap one character smaller.
+has_flag() {
+	for tok in $(cat /proc/cmdline 2>/dev/null); do
+		[ "$tok" = "$1" ] && return 0
+	done
+	return 1
+}
 # i915-sway.sh — sway on the real display, through the passed-through GPU.
 #
 # The headless probe (sway-probe.sh) proved sway renders; this asks whether it
@@ -27,6 +41,26 @@ fi
 # into its parts instead of guessed at.
 up() { cut -d" " -f1 /proc/uptime 2>/dev/null || echo "?"; }
 echo "I915-SWAY: start t=$(up)"
+
+# A heap-churn check, when asked for one, instead of the compositor.
+#
+# The same shape of work the compositor's crash needs — several threads
+# allocating and freeing while every block is verified — with none of the
+# graphics, so a run costs seconds rather than two minutes.
+if has_flag b1nix.memstress; then
+	echo "I915-SWAY: running memstress instead of a compositor"
+	/usr/bin/memstress
+	echo "I915-SWAY: memstress exit $?"
+	[ -r /proc/b1nix-prof ] && cat /proc/b1nix-prof 2>/dev/null
+	/usr/bin/shmstress
+	echo "I915-SWAY: shmstress exit $?"
+	/usr/bin/fdstress
+	echo "I915-SWAY: fdstress exit $?"
+	/usr/bin/spawnstress
+	echo "I915-SWAY: spawnstress exit $?"
+	exit 0
+fi
+
 
 export HOME=/root
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
@@ -161,7 +195,7 @@ done
 # this system has been asked to run — threads, futexes, shared memory,
 # sandboxing and a Wayland client all at once — which is exactly why it is
 # worth running.
-if grep -q "b1nix.chromium" /proc/cmdline 2>/dev/null; then
+if has_flag b1nix.chromium; then
 	command -v chromium >/dev/null 2>&1 || NEED="$NEED chromium"
 fi
 [ -d /usr/share/fonts/dejavu ] || NEED="$NEED font-dejavu"
@@ -254,7 +288,7 @@ mkdir -p /etc/sway
 # client tells us nothing about whether it can drive a display — the two
 # questions get separated by b1nix.sway-clients.
 : > /etc/sway/config
-if grep -q "b1nix.chromium" /proc/cmdline 2>/dev/null && [ -x /usr/bin/chromium ]; then
+if has_flag b1nix.chromium && [ -x /usr/bin/chromium ]; then
 	# The browser as sway's client.
 	#
 	# --no-sandbox because chromium's sandbox wants namespaces this kernel does
@@ -279,7 +313,7 @@ if grep -q "b1nix.chromium" /proc/cmdline 2>/dev/null && [ -x /usr/bin/chromium 
 		echo 'gaps inner 5'
 		: # the browser is started below, by this script, so its output is ours
 	} > /etc/sway/config
-elif grep -q "b1nix.sway-clients" /proc/cmdline 2>/dev/null; then
+elif has_flag b1nix.sway-clients; then
 	{
 		# Saturated colour and large text, for the same reason cage's run
 		# uses them: the proof that the picture is on the panel is a
@@ -287,7 +321,20 @@ elif grep -q "b1nix.sway-clients" /proc/cmdline 2>/dev/null; then
 		# nothing. b1nix.bright asks for the readable version.
 		if grep -q "b1nix.bright" /proc/cmdline 2>/dev/null; then
 			echo 'output * bg #00cc44 solid_color'
-			echo 'exec /usr/bin/foot -o colors.background=00cc44 -o colors.foreground=101010 -o main.font=monospace:size=28 top'
+			# b1nix.client-nopty asks for a drawing client that opens no
+			# pseudo-terminal: the terminal is the only client here that
+			# does, and separating the two says whether the pty path is
+			# what the compositor's crash needs.
+			if has_flag b1nix.client-nopty; then
+				echo 'exec /usr/bin/swaybg -c "#00cc44"'
+			elif has_flag b1nix.client-quiet; then
+				# The same terminal, the same threads and buffers, but a
+				# program that writes nothing: what changes is the traffic
+				# through the pseudo-terminal, and nothing else.
+				echo 'exec /usr/bin/foot -o colors.background=00cc44 -o main.font=monospace:size=28 sleep 600'
+			else
+				echo 'exec /usr/bin/foot -o colors.background=00cc44 -o colors.foreground=101010 -o main.font=monospace:size=28 top'
+			fi
 		else
 			echo 'output * bg #2060c0 solid_color'
 			echo 'exec /usr/bin/foot'
@@ -440,7 +487,6 @@ if [ -z "$WAYLAND_DISPLAY" ] || [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; th
 	exit 0
 fi
 echo "I915-SWAY: ok socket t=$(up)"
-
 if [ -z "$SWAYSOCK" ]; then
 	SWAYSOCK=$(ls -1 "$XDG_RUNTIME_DIR"/sway-ipc.*.sock 2>/dev/null | head -1)
 	export SWAYSOCK
@@ -457,7 +503,7 @@ echo "--- end outputs ---"
 # When a browser was asked for, say whether it actually put a window on the
 # screen, and say it as a marker rather than leaving the run to be read by eye.
 # A run that ends without either marker is a run that told us nothing.
-if grep -q "b1nix.chromium" /proc/cmdline 2>/dev/null; then
+if has_flag b1nix.chromium; then
 	# Start the browser here rather than from sway's config. sway's exec
 	# detaches its children and their stdout and stderr go nowhere we can read:
 	# three runs in a row produced neither chromium's own errors nor the exit
@@ -755,6 +801,15 @@ PROOF
 			--v=1 \
 			--app=file:///root/browser-proof.html > /var/chromium.log 2>&1
 		echo "CHROMIUM-EXIT rc=$?"
+		# What the browser itself said, on the console.
+		#
+		# Its output went to a file inside the guest, so a crash here was
+		# visible only as a fault address: the lines that name which process
+		# type died, and what failed before it, never left the disk. The
+		# window is the interesting part, so the tail is enough.
+		echo "--- chromium log (tail) ---"
+		tail -40 /var/chromium.log 2>/dev/null
+		echo "--- end chromium log ---"
 	) &
 
 	# Who the browser's children are, while they are still alive.

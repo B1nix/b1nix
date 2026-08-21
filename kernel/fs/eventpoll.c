@@ -1,3 +1,4 @@
+#include <b1nix/lapic.h>
 /* M56 — Event-loop and IPC primitives: eventfd, timerfd, signalfd and epoll,
  * plus memfd file sealing.
  *
@@ -22,6 +23,7 @@
 #include <b1nix/spinlock.h>
 #include <b1nix/posix.h>
 #include <b1nix/linux_abi.h>
+#include <b1nix/lapic.h>
 #include <b1nix/user.h>
 #include <stdlib.h>
 #include <string.h>
@@ -166,6 +168,7 @@ static volatile int g_armed_timerfds = 0;
 struct timerfd_state {
   volatile int lock;
   int armed;
+  int clockid;       /* which clock an ABSTIME deadline is measured against */
   u64 next_tick;     /* absolute tick of the next expiration; 0 = disarmed */
   u64 interval_ticks; /* 0 = one-shot */
   u64 expirations;   /* accumulated, cleared on read */
@@ -256,13 +259,21 @@ static const struct vfs_file_ops timerfd_ops = {
 };
 
 int vfs_timerfd_create(int clockid, int flags) {
-  if (clockid != B1NIX_CLOCK_REALTIME && clockid != B1NIX_CLOCK_MONOTONIC)
+  /* The clocks Linux lets a timerfd use. b1nix has one monotonic base, so
+   * MONOTONIC and BOOTTIME are the same clock here, and the _ALARM variants
+   * differ from their bases only in waking a suspended machine — which this
+   * kernel never does. Rejecting them made sd-event fall back and, for
+   * BOOTTIME, gave up on the timer entirely. */
+  if (clockid != B1NIX_CLOCK_REALTIME && clockid != B1NIX_CLOCK_MONOTONIC &&
+      clockid != B1NIX_CLOCK_BOOTTIME && clockid != B1NIX_CLOCK_REALTIME_ALARM &&
+      clockid != B1NIX_CLOCK_BOOTTIME_ALARM)
     return -EINVAL;
   if (flags & ~(B1NIX_TFD_CLOEXEC | B1NIX_TFD_NONBLOCK))
     return -EINVAL;
   struct timerfd_state *t = kzalloc(sizeof(*t));
   if (!t)
     return -ENOMEM;
+  t->clockid = clockid;
 
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_TIMERFD);
   if (!h) {
@@ -284,22 +295,43 @@ int vfs_timerfd_create(int clockid, int flags) {
   return fd;
 }
 
+/* Ticks a timespec is worth, saturating rather than wrapping.
+ *
+ * systemd arms its "the wall clock was stepped" watch for TIME_T_MAX seconds.
+ * Multiplying that by the tick rate wraps a u64 back to a small number, so the
+ * timer that must never fire fired at once: epoll reported the descriptor
+ * readable on every pass, systemd rebuilt the watch, and PID 1 spun in its
+ * event loop printing "Looping too fast" instead of starting any unit. */
+#define TIMERFD_TICKS_MAX (~(u64)0 / 4)
+
 static u64 timespec_to_ticks(const struct timespec *ts) {
   if (ts->tv_sec < 0 || ts->tv_nsec < 0)
     return 0;
+  if ((u64)ts->tv_sec > TIMERFD_TICKS_MAX / TICKS_PER_SEC)
+    return TIMERFD_TICKS_MAX;
   u64 ticks = (u64)ts->tv_sec * TICKS_PER_SEC;
   /* Round sub-tick remainders up to one tick so a 1 ms timer still fires. */
   u64 ns = (u64)ts->tv_nsec;
   if (ns > 0)
     ticks += (ns + (1000000000ULL / TICKS_PER_SEC) - 1) /
              (1000000000ULL / TICKS_PER_SEC);
-  return ticks;
+  return ticks > TIMERFD_TICKS_MAX ? TIMERFD_TICKS_MAX : ticks;
+}
+
+/* "Now" on the clock a timerfd was created with, in ticks, so an ABSTIME
+ * deadline can be turned into a delay. The monotonic value is the same uptime
+ * tick count next_tick is measured in; the realtime value is the wall clock,
+ * which is what a caller comparing against clock_gettime(CLOCK_REALTIME)
+ * means. */
+static u64 timerfd_now_ticks(int clockid) {
+  if (clockid == B1NIX_CLOCK_REALTIME || clockid == B1NIX_CLOCK_REALTIME_ALARM)
+    return (u64)vfs_get_unix_time() * TICKS_PER_SEC;
+  return scheduler_get_uptime_ticks();
 }
 
 int vfs_timerfd_settime(int fd, int flags,
                         const struct b1nix_itimerspec *new_value,
                         struct b1nix_itimerspec *old_value) {
-  (void)flags; /* TFD_TIMER_ABSTIME treated relative (single monotonic base) */
   struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h || h->kind != VFS_HANDLE_TIMERFD)
     return -EBADF;
@@ -309,8 +341,23 @@ int vfs_timerfd_settime(int fd, int flags,
   if (!t)
     return -EINVAL;
 
+  /* it_value == 0 disarms, whatever the flags say. */
+  int disarm = (new_value->it_value.tv_sec == 0 &&
+                new_value->it_value.tv_nsec == 0);
   u64 value = timespec_to_ticks(&new_value->it_value);
   u64 interval = timespec_to_ticks(&new_value->it_interval);
+
+  /* TFD_TIMER_ABSTIME: it_value is a DEADLINE on this timerfd's clock, not a
+   * delay. Treating it as a delay put every one of systemd's timeouts (which
+   * are all absolute) roughly fifty years into the future, so no timeout it
+   * set ever fired. TFD_TIMER_CANCEL_ON_SET is accepted and has no effect:
+   * this kernel does not report a stepped wall clock to a sleeping timer. */
+  if (!disarm && (flags & B1NIX_TFD_TIMER_ABSTIME)) {
+    u64 now_clock = timerfd_now_ticks(t->clockid);
+    /* A deadline that has already passed fires at once, as on Linux. One tick
+     * rather than zero, because zero is how this state says "disarmed". */
+    value = value > now_clock ? value - now_clock : 1;
+  }
 
   while (__atomic_test_and_set(&t->lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
@@ -330,7 +377,7 @@ int vfs_timerfd_settime(int fd, int flags,
   }
 
   int was_armed = t->armed;
-  if (value == 0) {
+  if (disarm || value == 0) {
     /* Disarm. */
     t->armed = 0;
     t->next_tick = 0;
@@ -338,7 +385,9 @@ int vfs_timerfd_settime(int fd, int flags,
     if (was_armed)
       __atomic_sub_fetch(&g_armed_timerfds, 1, __ATOMIC_RELAXED);
   } else {
-    t->next_tick = scheduler_get_uptime_ticks() + value;
+    u64 base = scheduler_get_uptime_ticks();
+    t->next_tick = (value > TIMERFD_TICKS_MAX - base) ? TIMERFD_TICKS_MAX
+                                                      : base + value;
     t->interval_ticks = interval;
     t->armed = 1;
     t->expirations = 0;
@@ -472,19 +521,44 @@ int vfs_signalfd(int fd, u64 mask, int flags) {
 
 /* ---- epoll ------------------------------------------------------------- */
 
-#define EPOLL_MAX_WATCH 256
+/* Starting size only. The table grows on demand — see epoll_grow. A fixed
+ * ceiling here is a wall a compositor walks into: sway watches a descriptor
+ * per client, per input device and per timer, and a browser many more. */
+#define EPOLL_INIT_WATCH 64
 
 struct epoll_watch {
   int used;
   int fd;
+  /* The open file this watch was registered against, with a reference held.
+   *
+   * Watching by descriptor number alone is watching nothing: the number is
+   * reused the moment the file is closed, and the watch then reports the new
+   * file's readiness together with the OLD file's user data. Userspace
+   * dereferences that pointer, which by then belongs to whatever allocation
+   * took the freed memory. It is how sway came to call a function pointer made
+   * of pixel data. Linux keeps a file reference for exactly this reason; so do
+   * we, and the scan polls this file rather than looking the number up again. */
+  struct vfs_handle *file;
   u32 events;       /* requested event mask (incl. EPOLLET / EPOLLONESHOT) */
   u64 data;         /* opaque user data echoed back in epoll_wait */
   u32 last_revents; /* edge-triggered state: events seen on the last scan */
 };
 
+/* Retired tables, kept until the epoll fd is closed.
+ *
+ * Growth cannot free the table it replaces: epoll_wait scans it locklessly
+ * with interrupts disabled, and freeing underneath that scan is a use-after
+ * -free in the kernel. There are at most log2(watches) of these. */
+struct epoll_old_table {
+  struct epoll_old_table *next;
+  struct epoll_watch *watch;
+};
+
 struct epoll_state {
   volatile int lock;
-  struct epoll_watch watch[EPOLL_MAX_WATCH];
+  struct epoll_watch *watch;
+  int capacity;
+  struct epoll_old_table *retired;
 };
 
 static int epoll_close(struct vfs_handle *h) {
@@ -495,6 +569,19 @@ static int epoll_close(struct vfs_handle *h) {
 
 static void epoll_release(struct vfs_handle *h) {
   if (h->private_data) {
+    struct epoll_state *ep = (struct epoll_state *)h->private_data;
+
+    for (int i = 0; i < ep->capacity; i++)
+      if (ep->watch[i].used && ep->watch[i].file)
+        vfs_handle_release(ep->watch[i].file);
+    while (ep->retired) {
+      struct epoll_old_table *t = ep->retired;
+
+      ep->retired = t->next;
+      kfree(t->watch);
+      kfree(t);
+    }
+    kfree(ep->watch);
     kfree(h->private_data);
     h->private_data = 0;
   }
@@ -515,19 +602,33 @@ static void epoll_release(struct vfs_handle *h) {
 static u32 epoll_match(struct epoll_watch *w, u32 revents);
 
 static int epoll_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
-  static __thread int depth; /* per-CPU in practice: the walk never sleeps */
+  /* Per-CPU, spelled out.
+   *
+   * This was a `static __thread` variable, which in kernel code is not what it
+   * looks like: this kernel keeps %fs pointing at the CALLING THREAD'S user
+   * TLS base so that userspace %fs:N works, so a __thread variable here
+   * resolves through the user's TLS and the increment below wrote four bytes
+   * into the calling process's own thread-control block. Every program with an
+   * event loop was quietly corrupting its own libc state — which is why a
+   * compositor died following pointers out of its heap while nothing could be
+   * caught writing to them. */
+  static int depth[MAX_CPUS];
   struct epoll_state *ep = h ? (struct epoll_state *)h->private_data : 0;
+  int dcpu = (int)percpu_read(cpu_id);
+
+  if (dcpu < 0 || dcpu >= MAX_CPUS)
+    dcpu = 0;
 
   pfd->revents = 0;
-  if (!ep || depth >= 5)
+  if (!ep || depth[dcpu] >= 5)
     return 0;
 
-  depth++;
-  for (int i = 0; i < EPOLL_MAX_WATCH; i++) {
+  depth[dcpu]++;
+  for (int i = 0; i < ep->capacity; i++) {
     if (!ep->watch[i].used)
       continue;
     struct epoll_watch *w = &ep->watch[i];
-    struct vfs_handle *th = scheduler_fd_get(w->fd);
+    struct vfs_handle *th = w->file;
     struct b1nix_pollfd inner;
 
     if (!th || !th->ops || !th->ops->poll)
@@ -541,7 +642,7 @@ static int epoll_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
       break;
     }
   }
-  depth--;
+  depth[dcpu]--;
   return 0;
 }
 
@@ -555,6 +656,16 @@ int vfs_epoll_create(int flags) {
   if (flags & ~B1NIX_EPOLL_CLOEXEC)
     return -EINVAL;
   struct epoll_state *ep = kzalloc(sizeof(*ep));
+
+  if (ep) {
+    ep->watch = kzalloc(sizeof(struct epoll_watch) * EPOLL_INIT_WATCH);
+    if (!ep->watch) {
+      kfree(ep);
+      ep = 0;
+    } else {
+      ep->capacity = EPOLL_INIT_WATCH;
+    }
+  }
   if (!ep)
     return -ENOMEM;
 
@@ -577,6 +688,38 @@ int vfs_epoll_create(int flags) {
   return fd;
 }
 
+/* Double the watch table and return the index of a fresh slot.
+ *
+ * The old table is retired rather than freed: epoll_wait scans it without the
+ * lock and with interrupts disabled, so it may still be reading it. Called
+ * with ep->lock held. Returns -1 if there is no memory. */
+static int epoll_grow(struct epoll_state *ep) {
+  int new_cap = ep->capacity ? ep->capacity * 2 : EPOLL_INIT_WATCH;
+  struct epoll_watch *nw;
+  struct epoll_old_table *old;
+
+  if (new_cap <= ep->capacity)
+    return -1; /* overflow */
+  nw = kzalloc(sizeof(struct epoll_watch) * (usize)new_cap);
+  if (!nw)
+    return -1;
+  old = kzalloc(sizeof(*old));
+  if (!old) {
+    kfree(nw);
+    return -1;
+  }
+  memcpy(nw, ep->watch, sizeof(struct epoll_watch) * (usize)ep->capacity);
+  old->watch = ep->watch;
+  old->next = ep->retired;
+  ep->retired = old;
+  /* Publish the table before the size, so a scan that sees the new capacity
+   * is reading the table that has the slots. */
+  __atomic_store_n(&ep->watch, nw, __ATOMIC_RELEASE);
+  int slot = ep->capacity;
+  __atomic_store_n(&ep->capacity, new_cap, __ATOMIC_RELEASE);
+  return slot;
+}
+
 int vfs_epoll_ctl(int epfd, int op, int fd, struct b1nix_epoll_event *event) {
   struct vfs_handle *eh = scheduler_fd_get(epfd);
   if (!eh || eh->kind != VFS_HANDLE_EPOLL)
@@ -597,7 +740,7 @@ int vfs_epoll_ctl(int epfd, int op, int fd, struct b1nix_epoll_event *event) {
 
   /* Find an existing registration for fd. */
   int existing = -1, free_slot = -1;
-  for (int i = 0; i < EPOLL_MAX_WATCH; i++) {
+  for (int i = 0; i < ep->capacity; i++) {
     if (ep->watch[i].used) {
       if (ep->watch[i].fd == fd) {
         existing = i;
@@ -614,19 +757,29 @@ int vfs_epoll_ctl(int epfd, int op, int fd, struct b1nix_epoll_event *event) {
       rc = -EEXIST;
       break;
     }
-    if (free_slot < 0) {
-      rc = -ENOSPC;
-      break;
-    }
     if (!event) {
       rc = -EFAULT;
       break;
     }
-    ep->watch[free_slot].used = 1;
+    if (free_slot < 0) {
+      free_slot = epoll_grow(ep);
+      if (free_slot < 0) {
+        rc = -ENOMEM;
+        break;
+      }
+    }
+    /* Hold the file for as long as the watch names it. */
+    th = scheduler_fd_get_retain(fd);
+    if (!th) {
+      rc = -EBADF;
+      break;
+    }
+    ep->watch[free_slot].file = th;
     ep->watch[free_slot].fd = fd;
     ep->watch[free_slot].events = event->events;
     ep->watch[free_slot].data = event->data.u64;
     ep->watch[free_slot].last_revents = 0;
+    __atomic_store_n(&ep->watch[free_slot].used, 1, __ATOMIC_RELEASE);
     break;
   case B1NIX_EPOLL_CTL_MOD:
     if (existing < 0) {
@@ -646,7 +799,11 @@ int vfs_epoll_ctl(int epfd, int op, int fd, struct b1nix_epoll_event *event) {
       rc = -ENOENT;
       break;
     }
-    ep->watch[existing].used = 0;
+    __atomic_store_n(&ep->watch[existing].used, 0, __ATOMIC_RELEASE);
+    if (ep->watch[existing].file) {
+      vfs_handle_release(ep->watch[existing].file);
+      ep->watch[existing].file = 0;
+    }
     break;
   default:
     rc = -EINVAL;
@@ -699,11 +856,39 @@ int vfs_epoll_wait(int epfd, struct b1nix_epoll_event *events, int maxevents,
     scheduler_wait_prepare(vfs_poll_chan);
 
     int nready = 0;
-    for (int i = 0; i < EPOLL_MAX_WATCH && nready < maxevents; i++) {
-      if (!ep->watch[i].used)
+    for (int i = 0; i < ep->capacity && nready < maxevents; i++) {
+      if (!__atomic_load_n(&ep->watch[i].used, __ATOMIC_ACQUIRE))
         continue;
       struct epoll_watch *w = &ep->watch[i];
-      struct vfs_handle *th = scheduler_fd_get(w->fd);
+      struct vfs_handle *th = w->file;
+
+      /* Linux drops a registration once every DESCRIPTOR naming the file is
+       * closed — epoll's own hold on the file does not keep the watch alive
+       * (epoll(7): "removed ... after all file descriptors referring to it are
+       * closed"). Userspace relies on it: wl_event_source_remove() closes the
+       * descriptor and frees the source WITHOUT an EPOLL_CTL_DEL. Keeping the
+       * watch past that reports readiness with a pointer to freed memory, and
+       * the program calls through whatever has since moved in — for sway, a
+       * function pointer made of background pixels.
+       *
+       * Our hold is the only remaining reference exactly when the last
+       * descriptor is gone, so that is the test. */
+      /* Ask the descriptor table, not the reference count.
+       *
+       * Counting references cannot answer this: the count also rises for a
+       * message queued with SCM_RIGHTS, for an inherited copy, and for any
+       * transient hold, so a watch on a closed descriptor kept a count of two
+       * or three and never looked closed at all. What the rule actually says
+       * is simpler — the registration lasts as long as a descriptor still
+       * names this open file — so look the number up in the owner's table and
+       * compare the file it lands on. A closed descriptor finds nothing; a
+       * reused number finds somebody else. */
+      if (th && scheduler_fd_get(w->fd) != th) {
+        __atomic_store_n(&w->used, 0, __ATOMIC_RELEASE);
+        w->file = 0;
+        vfs_handle_release(th);
+        continue;
+      }
       struct b1nix_pollfd pfd;
       pfd.fd = w->fd;
       pfd.events = (short)(w->events & 0xffff);
@@ -733,6 +918,10 @@ int vfs_epoll_wait(int epfd, struct b1nix_epoll_event *events, int maxevents,
 
       events[nready].events = matched;
       events[nready].data.u64 = w->data;
+      /* Last few pointers this kernel handed back, for the fault reporter.
+       * If a program dies dereferencing one of these, the readiness report
+       * named an object it had already given up; if the address is absent,
+       * it came from somewhere else and this path is not the culprit. */
       nready++;
 
       /* EPOLLONESHOT: disable the watch after one report (mask down to 0). */

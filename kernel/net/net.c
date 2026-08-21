@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/namespace.h>
@@ -624,7 +625,7 @@ void net_dump_info(void)
 	dhcp_dump_info();
 
 	if (net_adapter_count == 0) {
-		console_write(" pci:    no network adapters found\n");
+		k_info(NULL, " pci:    no network adapters found");
 		return;
 	}
 
@@ -664,7 +665,7 @@ static void net_task(void *arg)
 		int link = netdev_link_state(g_netdev);
 		if (link != last_link_state) {
 			if (link == 0) {
-				console_write("net: link down\n");
+				k_info("net", "link down");
 				dhcp_stop();
 			} else {
 				console_write(link > 0 ? "net: link up\n"
@@ -744,7 +745,7 @@ void net_init(void)
 	if (networking_enabled && last_link_state != 0) {
 		dhcp_init();
 	} else if (networking_enabled && last_link_state == 0) {
-		console_write("net: waiting for link\n");
+		k_info("net", "waiting for link");
 	}
 
 	net_task_id = kthread_create("net_task", net_task, 0);

@@ -7,10 +7,36 @@
 #include <b1nix/uidgid.h>
 
 #define VFS_MAX_PATH 256
+
+/* mount(2) flags. The values are Linux's, because they are what userspace
+ * passes. */
 #define MS_RDONLY 1
-/* mount(2)'s MS_MOVE: move an existing mount to another mountpoint, without
- * unmounting it. Same value as Linux's, since that is what userspace passes. */
+#define MS_NOSUID 2
+#define MS_NODEV 4
+#define MS_NOEXEC 8
+#define MS_REMOUNT 32
+#define MS_BIND 4096
+/* Move an existing mount to another mountpoint, without unmounting it. */
 #define MS_MOVE 8192
+#define MS_REC 16384
+#define MS_SILENT 32768
+#define MS_UNBINDABLE (1u << 17)
+#define MS_PRIVATE (1u << 18)
+#define MS_SLAVE (1u << 19)
+#define MS_SHARED (1u << 20)
+#define MS_PROPAGATION_MASK (MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED)
+
+/* One row of the mount table, for /proc/<pid>/mountinfo. Separate from
+ * struct b1nix_mount_entry, which is the userspace ABI of the mounts syscall
+ * and therefore cannot grow. */
+struct vfs_mount_info {
+  char source[VFS_MAX_PATH];
+  char target[VFS_MAX_PATH];
+  char fstype[16];
+  u64 flags;
+  u32 propagation; /* MS_SHARED / MS_SLAVE / MS_PRIVATE / MS_UNBINDABLE */
+  u32 peer_group;  /* the "shared:N" / "master:N" number; 0 = none */
+};
 
 /* Standard permission bits */
 #define VFS_IRUSR 0400 /* Owner read */
@@ -44,6 +70,31 @@ enum vfs_node_type {
 
 /* inode->flags: the VFS owns inode->data and must kfree() it on release. */
 #define VFS_NODE_OWNS_DATA 0x80000000u
+
+/* inode->flags: a synthetic file whose contents are produced by a callback but
+ * which userspace must see as an ORDINARY FILE.
+ *
+ * Every file under /proc and /sys is S_IFREG on Linux, even though none of them
+ * has any bytes on a disk. b1nix builds them as VFS_DEVICE nodes because that
+ * is the node type whose read goes straight to a callback instead of through
+ * the page cache and inode->size — a distinction about how the kernel serves
+ * the read, not about what the file IS. Reporting it as S_IFCHR is simply
+ * wrong, and programs check: systemd's read_virtual_file() fstats /proc/cmdline
+ * and returns EBADF for anything that is not S_ISREG, which stopped PID 1
+ * before it had started a single unit. */
+#define VFS_NODE_PSEUDO_REG 0x40000000u
+
+/* inode->flags: this directory's children belong to the filesystem, not to
+ * whoever created it, so they do not make it "not empty".
+ *
+ * A cgroup v2 directory always carries its control files (cgroup.procs and the
+ * rest), and rmdir(2) on it is the documented way to destroy the cgroup. With
+ * the generic emptiness test in the way, no cgroup could ever be removed and
+ * systemd's tree would grow one directory per unit start forever. The
+ * filesystem's rmdir_cb decides whether the directory may go (a cgroup with
+ * processes is EBUSY, one with sub-cgroups is ENOTEMPTY) and clears the control
+ * files itself. */
+#define VFS_NODE_CTRL_CHILDREN 0x20000000u
 
 /* inode->attr: the ext2/3/4 i_flags low byte, shared verbatim with userspace
  * through FS_IOC_GETFLAGS/FS_IOC_SETFLAGS (chattr/lsattr).
@@ -375,6 +426,8 @@ struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
                               void *data, usize size, u32 flags);
 struct vfs_node *vfs_node_get(struct vfs_node *node);
 void vfs_node_put(struct vfs_node *node);
+u32 vfs_mounting_fs_id(void);
+
 struct vfs_node *vfs_create_node(enum vfs_node_type type);
 void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child);
 /* Unlink `child` from `parent`'s sibling list. Used by synthetic filesystems
@@ -452,7 +505,19 @@ void vfs_register_fs(struct vfs_fs *fs);
  * this from its exit path, or the VFS keeps a pointer into freed module text. */
 void vfs_unregister_fs(struct vfs_fs *fs);
 void vfs_set_currently_mounting_root(struct vfs_node *root);
+/* Lay down every device node the kernel knows about under /dev. Called after a
+ * root switch and by the devtmpfs mount, which is what makes mounting devtmpfs
+ * on /dev give a populated /dev rather than an empty directory. */
+void vfs_populate_dev(void);
 isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries);
+isize vfs_mounts_info(struct vfs_mount_info *out, usize max_entries);
+/* mount(2) with a propagation flag: change how mount events cross this
+ * mountpoint. No filesystem is mounted. */
+int vfs_set_propagation(const char *target, u64 flags);
+/* mount(2) with MS_BIND: publish an existing directory at a second place. */
+int vfs_bind_mount(const char *source, const char *target, u64 flags);
+/* mount(2) with MS_REMOUNT: change the flags of a mount that already exists. */
+int vfs_remount(const char *target, u64 flags);
 /* How many mount slots this machine was sized for — between MIN_MOUNTS and
  * MAX_MOUNTS, derived from RAM at vfs_init(). Callers sizing a buffer for
  * vfs_mounts() should ask for this rather than assume MAX_MOUNTS, and must
@@ -536,6 +601,9 @@ int vfs_shutdown(int fd, int how);
 int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len,
                         const void *src_ip, int src_is_v6, u16 src_port_net);
 usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap);
+/* SO_TIMESTAMP: 0 = off, 1 = SO_TIMESTAMP, 2 = SO_TIMESTAMPNS. */
+int vfs_socket_timestamp_enabled(int fd);
+u64 vfs_socket_last_timestamp_usec(int fd);
 
 /* M32b pseudo-terminals (kernel/dev/pty.c). */
 void pty_init(void);
@@ -711,6 +779,11 @@ struct vfs_socket_state {
    * kernel rather than from the message body, which process is asking it for a
    * dump. AF_UNIX only. */
   int so_passcred;
+  /* SO_TIMESTAMP / SO_TIMESTAMPNS: hand back the arrival time of each received
+   * message as an SCM_TIMESTAMP(NS) control message. */
+  int so_timestamp;
+  int so_timestampns;
+  int so_passsec;
   int tcp_nodelay;
   int ipv6_v6only;
   int so_error;

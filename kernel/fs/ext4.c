@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -1275,6 +1276,13 @@ static void ext4_setup_node(struct vfs_node *n, struct ext4_fs *fs, u32 ino, u32
    * name the same file for anything that pairs readdir with stat (hardlink
    * detection in du/tar/rsync, `find -inum`, samefile checks). */
   n->inode->ino = ino;
+  /* And say which filesystem that number belongs to. Inodes allocated after
+   * the mount call returns default to fs_id 0 — the same 0 that memfd, pipes
+   * and every other in-memory file carry — so a library page and a shared
+   * pixel buffer could hash to one page-cache entry and hand each other's
+   * contents out. That is what put image data inside a compositor's
+   * structures and killed it with a pointer made of pixels. */
+  n->inode->fs_id = fs->fs_id;
   {
     /* Carry the on-disk generation so a stored file handle can tell this file
      * apart from a later one that reuses the inode number. */
@@ -1382,6 +1390,7 @@ static struct vfs_node *ext4_vfs_mount_cb(const char *source, u64 flags, void *d
     struct ext2_superblock *sb = (struct ext2_superblock *)sb_buf;
     if (sb->s_magic != EXT2_SUPER_MAGIC) { kfree(sb_buf); return ERR_PTR(-EINVAL); }
     struct ext4_fs *fs = kmalloc(sizeof(struct ext4_fs)); memset(fs, 0, sizeof(struct ext4_fs));
+    fs->fs_id = vfs_mounting_fs_id();
     fs->bdev = dev; memcpy(&fs->sb, sb, sizeof(struct ext2_superblock));
     fs->block_size = 1024 << fs->sb.s_log_block_size;
     fs->inodes_per_group = fs->sb.s_inodes_per_group;
@@ -1400,9 +1409,9 @@ static struct vfs_node *ext4_vfs_mount_cb(const char *source, u64 flags, void *d
             fs->jdev = journal_mount(fs, fs->block_size, &ext4_jbd_ops);
             if (fs->jdev) {
                 if (fs->sb.s_feature_incompat & EXT3_FEATURE_INCOMPAT_RECOVER) {
-                    console_write("ext4: journal needs recovery\n");
+                    k_info("ext4", "journal needs recovery");
                     if (journal_recover(fs->jdev) == 0) {
-                        console_write("ext4: journal recovery complete\n");
+                        k_info("ext4", "journal recovery complete");
                     }
                 }
                 /* Mark as needing recovery (cleared on clean umount).
@@ -1434,7 +1443,7 @@ static int ext4_vfs_umount_cb(struct vfs_node *root_node) {
             /* Clear RECOVER flag: filesystem was cleanly unmounted */
             fs->sb.s_feature_incompat &= ~EXT3_FEATURE_INCOMPAT_RECOVER;
             ext4_write_superblock(fs);
-            console_write("ext4: clean umount, RECOVER flag cleared\n");
+            k_info("ext4", "clean umount, RECOVER flag cleared");
         }
     }
     return 0;

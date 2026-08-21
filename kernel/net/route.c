@@ -20,6 +20,7 @@
  * and compares bitwise. Conversion happens at the edges.
  */
 
+#include <b1nix/kprintf.h>
 #include <b1nix/net.h>
 #include <b1nix/namespace.h>
 #include <b1nix/netdev.h>
@@ -1017,7 +1018,7 @@ static void route_smoke_v4(void)
 	    !(fl & RTF_GATEWAY))
 		console_write("M84-ROUTE: ok delete\n");
 	else
-		console_write("M84-ROUTE: FAIL delete\n");
+		k_info(NULL, "M84-ROUTE: FAIL delete");
 
 	/* Metric tie-break: a second default route with a worse metric must not
 	 * displace the installed one, and it must take over once the better one
@@ -1129,7 +1130,7 @@ static void route_smoke_v6(void)
 	    memcmp(nh.bytes, ll.bytes, 16) == 0 && !(fl & RTF_GATEWAY))
 		console_write("M84-ROUTE6: ok link-local-onlink\n");
 	else
-		console_write("M84-ROUTE6: FAIL link-local-onlink\n");
+		k_info(NULL, "M84-ROUTE6: FAIL link-local-onlink");
 
 	/* Default route via a router, and deletion falling back to no route. */
 	route6_add(zero, 0, gw, RTF_UP, 0, 0);

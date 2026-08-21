@@ -48,6 +48,12 @@
 /* M56 memfd_create flags (Linux ABI). */
 #define B1NIX_MFD_CLOEXEC       0x0001
 #define B1NIX_MFD_ALLOW_SEALING 0x0002
+/* Linux 6.3 added these. glibc, pulseaudio and Chromium pass MFD_NOEXEC_SEAL
+ * by default now, and a kernel that rejects the whole call because of an
+ * unknown flag makes every one of them fail to get shared memory at all. */
+#define B1NIX_MFD_HUGETLB       0x0004
+#define B1NIX_MFD_NOEXEC_SEAL   0x0008
+#define B1NIX_MFD_EXEC          0x0010
 
 #define B1NIX_AF_UNIX 1
 #define B1NIX_AF_LOCAL B1NIX_AF_UNIX
@@ -294,14 +300,19 @@ struct timespec {
 #define B1NIX_EFD_CLOEXEC   0x00080000
 #define B1NIX_EFD_NONBLOCK  0x00000800
 
-/* M56 timerfd: clockids + flags (Linux ABI). Only relative arming is honored
- * (TFD_TIMER_ABSTIME is accepted but treated relative — b1nix has a single
- * monotonic tick base). */
-#define B1NIX_CLOCK_REALTIME      0
-#define B1NIX_CLOCK_MONOTONIC     1
+/* M56 timerfd: clockids + flags (Linux ABI). TFD_TIMER_ABSTIME is honoured
+ * against the clock the descriptor was created with. b1nix has one monotonic
+ * base, so BOOTTIME is MONOTONIC and the _ALARM clocks are their own bases:
+ * they differ on Linux only in waking a suspended machine. */
+#define B1NIX_CLOCK_REALTIME       0
+#define B1NIX_CLOCK_MONOTONIC      1
+#define B1NIX_CLOCK_BOOTTIME       7
+#define B1NIX_CLOCK_REALTIME_ALARM 8
+#define B1NIX_CLOCK_BOOTTIME_ALARM 9
 #define B1NIX_TFD_CLOEXEC         0x00080000
 #define B1NIX_TFD_NONBLOCK        0x00000800
 #define B1NIX_TFD_TIMER_ABSTIME   0x00000001
+#define B1NIX_TFD_TIMER_CANCEL_ON_SET 0x00000002
 
 /* M56 signalfd flags (Linux ABI). */
 #define B1NIX_SFD_CLOEXEC  0x00080000

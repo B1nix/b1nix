@@ -1084,3 +1084,53 @@ M102a and M102b are two consumers of it rather than two ports.
       pre-registered loop slot — the device the mount finds is the one carrying
       the file — and returns it, so the caller names it rather than assuming
       `loop0`. Covered by `tests/liveusb.sh`.
+
+## M111: A Debian userspace, and a boot log with a shape
+
+- [x] **Debian (glibc) boots on b1nix**: `/bin/dash`, the distro coreutils
+      (`ls`, `cat`, `mount`, `ps`, `id`, `dmesg`, `uname -a`) and Debian's own
+      **sysvinit 3.06 as PID 1** all run unmodified from a
+      `debian:bookworm-slim` root filesystem. `make debian-image` builds the
+      image (network once, cached); `make debian-smoke` boots and checks it.
+- [x] Eleven Linux-ABI gaps found and fixed by doing it — among them
+      `waitpid(-1)` read as 64 bits instead of `int` (every command reported
+      status 255), `fork` rejected because glibc passes a NULL stack to
+      `clone`, `TCGETS` writing 12 bytes past the end of glibc's termios
+      buffer, `AT_EMPTY_PATH`, shebang support on the `init=` path, and
+      `/dev/console` silently discarding every write. Details and the full list
+      in [`docs/debian-glibc-boot.md`](debian-glibc-boot.md).
+- [x] **The boot log looks like a kernel's**: `[    3.472918]` monotonic
+      timestamps on every kernel line from the same clock `/proc/uptime`
+      reports, Linux severity levels with `loglevel=` and `quiet`, subsystem
+      prefixes (`pci 0000:00:03.0:`, `ext4:`, `tcp:`), and one form shared by
+      the console, `dmesg` and `/dev/kmsg`.
+- [x] The mechanism (`kprintf`/`k_info`/`k_err`, `<b1nix/kprintf.h>`) is new;
+      the ~2000 plain `console_write` call sites keep working through the same
+      line assembler, so they are stamped and filtered without being converted.
+
+## M112: systemd as PID 1
+
+- [x] **Debian's systemd 252 boots b1nix as PID 1**, headless: cgroup v2 with
+      `/system.slice` per unit, journald with `journalctl` reading its journal
+      back, sysinit/basic/multi-user targets reached, dbus 1.14 serving the
+      system bus, `systemd-run --pipe` starting a transient unit through it, and
+      agetty's login prompt on the serial console. `make systemd-image` builds
+      the image (dependency closure resolved from the suite index, 23 packages);
+      `make systemd-smoke` boots it and checks 14 markers.
+- [x] **cgroup v2** (`kernel/fs/cgroup.c`): a real unified hierarchy with
+      `cgroup.procs`/`threads`/`events`/`subtree_control`, mkdir/rmdir as the
+      creation API, inotify on `cgroup.events`, `/proc/<pid>/cgroup`, and one
+      enforced controller (`pids`). `memory`, `cpu` and `io` are deliberately
+      not advertised — a limit nothing enforces is worse than an absent one.
+- [x] **Mount propagation, bind mounts and remount**: `MS_SHARED`/`SLAVE`/
+      `PRIVATE`/`UNBINDABLE` (+`MS_REC`), `MS_BIND`, `MS_REMOUNT`, reported in
+      `/proc/self/mountinfo`; devtmpfs became a real device filesystem instead
+      of an alias for tmpfs.
+- [x] 28 Linux-ABI defects found and fixed by doing it — among them the clone
+      child getting a zeroed register file (every glibc thread died at `rip=0`),
+      `accept4` writing past the caller's sockaddr (dbus died of a smashed
+      stack), `CLOCK_REALTIME` walking backwards, a freshly created file with
+      `st_nlink == 0`, and `/proc/<pid>/fd/N` frozen at its first target.
+      Details in [`docs/debian-systemd-boot.md`](debian-systemd-boot.md).
+- [ ] No udev, so no `.device` unit ever activates; `systemd-logind` does not
+      start. Both are listed in the document above.

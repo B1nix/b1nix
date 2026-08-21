@@ -6,6 +6,7 @@
  * over IPv6 are not implemented yet — ipv6_send() only handles ::1.
  */
 
+#include <b1nix/kprintf.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/netproto.h>
@@ -384,9 +385,9 @@ void ipv6_loopback_smoke(void)
 	net_loopback_drain();
 
 	if (icmpv6_echo_reply_count() > before)
-		console_write("M32-IP6: ok icmpv6-loopback\n");
+		k_info(NULL, "M32-IP6: ok icmpv6-loopback");
 	else
-		console_write("M32-IP6: fail icmpv6-loopback\n");
+		k_info(NULL, "M32-IP6: fail icmpv6-loopback");
 
 	/* A datagram to an unbound ::1 UDP port must produce ICMPv6 type 1,
 	 * code 4 rather than disappearing silently. */
@@ -403,9 +404,9 @@ void ipv6_loopback_smoke(void)
 	 * incrementing g_icmpv6_errors — all within this one drain cascade. */
 	net_loopback_drain();
 	if (__atomic_load_n(&g_icmpv6_errors, __ATOMIC_RELAXED) > err_before)
-		console_write("M32-IP6: ok icmpv6-errors\n");
+		k_err(NULL, "M32-IP6: ok icmpv6-errors");
 	else
-		console_write("M32-IP6: fail icmpv6-errors\n");
+		k_err(NULL, "M32-IP6: fail icmpv6-errors");
 
 }
 
@@ -416,7 +417,7 @@ void ipv6_loopback_smoke(void)
 void ipv6_realink_smoke(void)
 {
 	if (!net_is_ready()) {
-		console_write("M32-IP6: unsupported real-link\n");
+		k_warn(NULL, "M32-IP6: unsupported real-link");
 		return;
 	}
 
@@ -426,10 +427,10 @@ void ipv6_realink_smoke(void)
 		scheduler_sleep_ticks(1);
 	}
 	if (!net_get_prefix6_valid()) {
-		console_write("M32-IP6: unsupported real-link-slaac\n");
+		k_warn(NULL, "M32-IP6: unsupported real-link-slaac");
 		return;
 	}
-	console_write("M32-IP6: ok slaac-global\n");
+	k_info(NULL, "M32-IP6: ok slaac-global");
 
 	/* Ping the well-known slirp IPv6 gateway. */
 	struct in6_addr_k gw;
@@ -455,9 +456,9 @@ void ipv6_realink_smoke(void)
 		}
 	}
 	if (icmpv6_echo_reply_count() > before)
-		console_write("M32-IP6: ok real-link-ping\n");
+		k_info(NULL, "M32-IP6: ok real-link-ping");
 	else
-		console_write("M32-IP6: unsupported real-link-ping\n");
+		k_warn(NULL, "M32-IP6: unsupported real-link-ping");
 }
 
 /* ── M96: the IPv6 datapath is a loadable module ─────────────────────────── */

@@ -1126,7 +1126,7 @@ void module_sysfs_attach_root(struct vfs_node *sys_root) {
  * -r) and reads modules.dep/modules.alias from there, and uname's release is
  * B1NIX_VERSION_STR. Keeping the kernel's own request_module() on the same
  * files is what lets the applets replace /bin/kmod. */
-#define MODULE_DIR "/lib/modules/" B1NIX_VERSION_STR
+#define MODULE_DIR "/lib/modules/" B1NIX_RELEASE_STR
 
 static void module_path_for(const char *name, char *out, usize cap) {
   snprintf(out, cap, MODULE_DIR "/%s.ko", name);

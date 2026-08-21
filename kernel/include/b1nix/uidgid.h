@@ -52,7 +52,31 @@ struct cred {
      * nothing raises it, so a dropped capability stays dropped even across a
      * return to euid 0 (which otherwise re-grants the full set). */
     u64  cap_bounding;
+    /* securebits(7): how the kernel adjusts capabilities across a uid change.
+     * Zero is Linux's default and what this kernel did unconditionally before
+     * the field existed. systemd reads them for every service it starts —
+     * PR_GET_SECUREBITS reporting -EINVAL made it conclude the bits differed
+     * from what it wanted, call PR_SET_SECUREBITS, get EINVAL from that too,
+     * and fail the service at step SECUREBITS (status 213). */
+    u32  securebits;
 };
+
+/* securebits(7) bit numbers, as Linux's <linux/securebits.h>. Each flag has a
+ * LOCKED companion one bit above it: once the lock is set the flag can never
+ * change again, not even by a process holding CAP_SETPCAP. */
+#define SECURE_NOROOT                   0
+#define SECURE_NOROOT_LOCKED            1
+#define SECURE_NO_SETUID_FIXUP          2
+#define SECURE_NO_SETUID_FIXUP_LOCKED   3
+#define SECURE_KEEP_CAPS                4
+#define SECURE_KEEP_CAPS_LOCKED         5
+#define SECURE_NO_CAP_AMBIENT_RAISE     6
+#define SECURE_NO_CAP_AMBIENT_RAISE_LOCKED 7
+#define SECBIT(n) (1u << (n))
+#define SECURE_ALL_BITS                                                        \
+  (SECBIT(SECURE_NOROOT) | SECBIT(SECURE_NO_SETUID_FIXUP) |                    \
+   SECBIT(SECURE_KEEP_CAPS) | SECBIT(SECURE_NO_CAP_AMBIENT_RAISE))
+#define SECURE_ALL_LOCKS (SECURE_ALL_BITS << 1)
 
 /* Every capability b1nix defines (CAP_CHOWN..CAP_AUDIT_CONTROL and the few
  * above them) — the set a root task holds. */
@@ -158,5 +182,11 @@ int  cred_setresgid(struct cred *cred, int rgid, int egid, int sgid);
 int  cred_can_access(const struct cred *cred, u16 file_uid, u16 file_gid, u16 file_mode, u32 access_mask);
 int  cred_has_cap(const struct cred *cred, int cap);
 int  cred_has_cap_effective(const struct cred *cred, int cap);
+
+/* securebits(7). The setter enforces the LOCKED bits and requires CAP_SETPCAP,
+ * exactly as Linux does, and the flags it stores really change what
+ * cred_refresh_caps does on the next uid transition. */
+int  cred_set_securebits(struct cred *cred, u32 bits);
+u32  cred_get_securebits(const struct cred *cred);
 
 #endif /* B1NIX_UIDGID_H */

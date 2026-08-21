@@ -1,3 +1,4 @@
+#include <b1nix/termios_abi.h>
 #include <b1nix/arch.h>
 #include <b1nix/blk.h>
 #include <b1nix/loop.h>
@@ -125,6 +126,16 @@ struct vfs_mount_entry {
    * Every scan below skips entries from another namespace, which is what makes
    * a mount made under `unshare -m` invisible outside it. */
   u32 mnt_ns;
+  /* How mount events cross this mountpoint: MS_SHARED, MS_SLAVE, MS_PRIVATE or
+   * MS_UNBINDABLE. Linux's default for a new mount is private, and systemd's
+   * very first act as PID 1 is to make / shared — a call that has to mean
+   * something, because everything it later does with per-unit mount namespaces
+   * is described in terms of it. `peer_group` is the "shared:N" number
+   * /proc/self/mountinfo prints; mounts that were cloned from one another share
+   * it, and a new mount under a shared mount is created in every peer's
+   * namespace too. */
+  u32 propagation;
+  u32 peer_group;
 };
 /* Sized at vfs_init() from RAM, never reallocated — see MAX_MOUNTS in vfs.h for
  * the floor, the ceiling, and why this one is sized rather than grown. Until
@@ -1179,6 +1190,12 @@ int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
  * other's data. Publishing the id before the callback runs closes that. */
 static u32 g_mounting_fs_id;
 
+/* The id of the mount being established, for filesystems that create their
+ * inodes lazily. Only inodes allocated while fs->mount() runs pick it up
+ * automatically; a driver that builds nodes later (every on-disk one does,
+ * on lookup) has to record it at mount time and stamp its own inodes. */
+u32 vfs_mounting_fs_id(void) { return g_mounting_fs_id; }
+
 static struct vfs_inode *alloc_inode(void) {
   struct vfs_inode *inode = vfs_alloc_inode();
   if (inode) {
@@ -1994,6 +2011,17 @@ void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child) {
   vfs_tree_write_release(flags);
 }
 
+/* The type getdents reports for a child. Same rule as stat: a /proc or /sys
+ * pseudo-file is a regular file to userspace even though the VFS serves it
+ * through a device-style read callback. */
+static u32 vfs_dirent_type(const struct vfs_inode *inode) {
+  if (!inode)
+    return (u32)VFS_FILE;
+  if (inode->type != VFS_DIRECTORY && (inode->flags & VFS_NODE_PSEUDO_REG))
+    return (u32)VFS_FILE;
+  return (u32)inode->type;
+}
+
 void vfs_detach_child(struct vfs_node *parent, struct vfs_node *child) {
   if (!parent || !child)
     return;
@@ -2049,7 +2077,7 @@ isize vfs_readdir_children(struct vfs_node *dir, usize offset,
       continue;
     if (idx >= start) {
       copy_path(buf[count].name, 64, child->name);
-      buf[count].type = (u32)child->inode->type;
+      buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
       buf[count].is_exec = 0;
       buf[count].size = child->inode->size;
@@ -2289,10 +2317,12 @@ static isize tty_write(struct vfs_node *node, u64 offset, const char *buffer,
    * serial_tty.c's per-instance ttys, and had the same unlocked-UART bug. */
   u64 lock_flags;
   console_lock_acquire_irqsave(&lock_flags);
+  /* Raw: a write to /dev/console or /dev/tty is terminal output, not a kernel
+   * log record, so it gets no timestamp and no severity prefix. */
   for (usize i = 0; i < size; i++) {
     if ((console.termios.c_oflag & B1NIX_OPOST) && buffer[i] == '\n')
-      console_putc('\r');
-    console_putc(buffer[i]);
+      console_putc_raw('\r');
+    console_putc_raw(buffer[i]);
   }
   console_lock_release_irqrestore(lock_flags);
   return (isize)size;
@@ -2575,7 +2605,22 @@ void vfs_init(void) {
   add_node("/mnt/root", VFS_DIRECTORY, 0, 0, 0);
   vfs_symlink("/", "/persist");
 
-  add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
+  /* /dev/console is a terminal, not an empty node. It used to be created with
+   * no read/write callbacks at all, so everything written to it was silently
+   * discarded — which is why Debian's sysvinit, whose whole output goes to
+   * /dev/console, booted the machine without printing one line. It gets the
+   * same callbacks as /dev/tty because on this kernel it IS the same device:
+   * the boot console. */
+  {
+    struct vfs_node *con = add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
+    if (con && !IS_ERR(con)) {
+      con->inode->read_cb = tty_read;
+      con->inode->write_cb = tty_write;
+      con->inode->poll_cb = tty_poll;
+      con->inode->mode = 0620;
+      con->inode->gid = 5; /* group tty */
+    }
+  }
   add_node("/dev/vda", VFS_DEVICE, 0, 0, 0);
   /* M32b pseudo-terminals: /dev/ptmx + the /dev/pts mountpoint directory. Both
    * opens are intercepted in vfs_open_flags; the nodes exist so stat()/ls and
@@ -2631,7 +2676,20 @@ extern void virtio_gpu_dev_init(void);
 extern void sound_module_dev_init(void);
 extern void ac97_dev_init(void);
 
-void vfs_repopulate_after_root_mount(void) {
+/* Everything under /dev, built from what the drivers have already probed.
+ *
+ * Split out of vfs_repopulate_after_root_mount so that MOUNTING devtmpfs can
+ * run it too. On Linux devtmpfs arrives already populated by the kernel; here
+ * it used to be a plain alias for tmpfs, so systemd mounting devtmpfs on /dev
+ * replaced every device node in the machine with an empty directory — PID 1
+ * lost /dev/console mid-boot and printed nothing further, and no getty could
+ * ever open /dev/ttyS0.
+ *
+ * The node paths are absolute because the drivers that create them say
+ * "/dev/...", so this populates the filesystem mounted at /dev and nowhere
+ * else. A devtmpfs mounted at another path is an empty directory, which is
+ * the honest answer: none of these devices is reachable through it. */
+void vfs_populate_dev(void) {
   struct vfs_node *node;
 
   node = add_node("/dev", VFS_DIRECTORY, 0, 0, 0);
@@ -2639,6 +2697,11 @@ void vfs_repopulate_after_root_mount(void) {
 
   node = add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
   if (node && !IS_ERR(node)) {
+    /* Same callbacks as the boot-time node: without them a write to
+     * /dev/console in the real root goes nowhere. */
+    node->inode->read_cb = tty_read;
+    node->inode->write_cb = tty_write;
+    node->inode->poll_cb = tty_poll;
     node->inode->mode = 0620;
     node->inode->uid = 0;
     node->inode->gid = 5; // group tty
@@ -2757,18 +2820,6 @@ void vfs_repopulate_after_root_mount(void) {
   loop_register_nodes();
   i2c_register_nodes();
 
-  node = add_node("/home", VFS_DIRECTORY, 0, 0, 0);
-  if (node && !IS_ERR(node)) vfs_node_put(node);
-
-  node = add_node("/tmp", VFS_DIRECTORY, 0, 0, 0);
-  if (node && !IS_ERR(node)) {
-    node->inode->mode = 01777; // Sticky bit + rwxrwxrwx
-    node->inode->uid = 0;
-    node->inode->gid = 0;
-    vfs_node_put(node);
-  }
-
-
   /* /dev/shm — POSIX shared memory. musl's shm_open() opens
    * /dev/shm/<name>, and without the directory every caller fails at the
    * first step: wlroots allocates each output buffer through shm_open, so a
@@ -2781,6 +2832,30 @@ void vfs_repopulate_after_root_mount(void) {
     node->inode->gid = 0;
     vfs_node_put(node);
   }
+
+  /* Block-device nodes WITH their blk_dev + read/write callbacks and size.
+   * An unbound VFS_DEVICE placeholder reads as an empty file, which broke
+   * every disk tool. blk_create_dev_nodes() is the canonical binder. */
+  blk_create_dev_nodes();
+}
+
+void vfs_repopulate_after_root_mount(void) {
+  struct vfs_node *node;
+
+  vfs_populate_dev();
+
+  node = add_node("/home", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
+  node = add_node("/tmp", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->mode = 01777; // Sticky bit + rwxrwxrwx
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
+  }
+
+
 
   node = add_node("/run", VFS_DIRECTORY, 0, 0, 0);
   if (node && !IS_ERR(node)) {
@@ -2820,14 +2895,6 @@ void vfs_repopulate_after_root_mount(void) {
   vfs_unlink("/persist");
   vfs_rmdir("/persist");
   vfs_symlink("/", "/persist");
-
-  /* Re-bind block-device nodes (/dev/sdX, /dev/loopN, ...) WITH their
-   * blk_dev + read_cb/write_cb + size, so userspace can read/write raw disks
-   * after the root switch. The previous open-coded loop created unbound
-   * VFS_DEVICE placeholders (no read_cb/size → read() returned 0), which broke
-   * the disk installer (/bin/b1nix_install) and any disk tool (fdisk/dd) run on
-   * an installed system. blk_create_dev_nodes() is the canonical binder. */
-  blk_create_dev_nodes();
 
   // Shadow, passwd, group nodes (loaded from initramfs, exist on mount point or in VFS)
   node = vfs_find_node("/etc/shadow");
@@ -3823,6 +3890,14 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
   node->inode->fs_id   = parent->inode->fs_id;
   copy_path(node->name, VFS_NAME_MAX, name);
   node->inode->type = VFS_FILE;
+  /* One link: the name that was just created.
+   *
+   * Left at zero, every freshly created file stat'd as already unlinked, and
+   * programs check — systemd-journald refuses to append to a journal whose
+   * st_nlink is 0 (EIDRM, "the file has been deleted"), so it created the
+   * journal, wrote its header, decided the file was gone and removed it, on
+   * every start, forever. */
+  node->inode->nlink = 1;
   node->parent = parent;
 
   u16 umask = scheduler_get_current_umask();
@@ -4124,6 +4199,11 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
   node->inode->fs_id   = parent->inode->fs_id;
   copy_path(node->name, VFS_NAME_MAX, name);
   node->inode->type = VFS_DIRECTORY;
+  /* A directory has two links of its own ("." and its name in the parent), and
+   * the parent gains one for the new directory's "..". */
+  node->inode->nlink = 2;
+  if (parent->inode->nlink > 0)
+    parent->inode->nlink++;
   node->parent = parent;
 
   u16 umask = scheduler_get_current_umask();
@@ -4234,6 +4314,10 @@ static u32 vfs_node_type_mode(const struct vfs_node *node) {
     return B1NIX_S_IFREG;
   if (node->inode->type == VFS_DIRECTORY)
     return B1NIX_S_IFDIR;
+  /* A /proc or /sys file: served by a callback, but a regular file to anyone
+   * who stats it (see VFS_NODE_PSEUDO_REG). */
+  if (node->inode->flags & VFS_NODE_PSEUDO_REG)
+    return B1NIX_S_IFREG;
   if (node->inode->type == VFS_DEVICE)
     /* A device node backed by a block_device is a block device, and tools check
      * that: BusyBox losetup refuses any target that is not S_ISBLK, so with
@@ -4301,16 +4385,37 @@ int vfs_stat(const char *path, struct b1nix_stat *st) {
   return res;
 }
 
+/* statfs describes the FILESYSTEM a node lives on, not the node. Only mount
+ * roots carry a statfs_cb, so asking about any other path used to report
+ * ENOSYS — which is not "this filesystem has no answer", it is "this kernel
+ * does not implement statfs", and callers believe it. systemd decides whether
+ * the machine has a unified cgroup hierarchy by statfs()ing /sys/fs/cgroup and
+ * comparing f_type; an ENOSYS there sends it down the cgroup v1 path, which
+ * this kernel does not have, and PID 1 freezes. Resolve the node's mount and
+ * ask its root. */
+static int vfs_statfs_node(struct vfs_node *node, struct b1nix_statfs *st) {
+  if (node->inode->statfs_cb)
+    return node->inode->statfs_cb(node, st);
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(node);
+  if (mnt && mnt->root_node && mnt->root_node->inode &&
+      mnt->root_node->inode->statfs_cb)
+    return mnt->root_node->inode->statfs_cb(mnt->root_node, st);
+  return -ENOSYS;
+}
+
 int vfs_statfs(const char *path, struct b1nix_statfs *st) {
   struct vfs_node *node = vfs_find_node(path);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
 
-  int res = 0;
-  if (node->inode->statfs_cb) {
-    res = node->inode->statfs_cb(node, st);
-  } else {
-    res = -ENOSYS;
+  int res = vfs_statfs_node(node, st);
+  if (bootinfo_has_flag("b1nix.trace-statfs")) {
+    char line[192];
+    snprintf(line, sizeof(line),
+             "statfs: '%s' -> node %p '%s' cb=%d res=%d type=0x%llx", path,
+             (void *)node, node->name, node->inode->statfs_cb ? 1 : 0, res,
+             res == 0 ? (unsigned long long)st->f_type : 0ull);
+    klog_info(line);
   }
   vfs_node_put(node);
   return res;
@@ -4329,8 +4434,14 @@ int vfs_lstat(const char *path, struct b1nix_stat *st) {
 
 isize vfs_lseek(int handle, isize offset, int whence) {
   struct vfs_handle *h = get_handle(handle);
-  if (!h || h->kind != VFS_HANDLE_NODE)
+  if (!h)
     return -EBADF;
+  /* A pipe, socket or anonymous object has no file position. POSIX says
+   * ESPIPE, not EBADF — GNU head asks to seek backwards on standard input
+   * and takes EBADF as "this descriptor is broken", which is how a plain
+   * `cmd | head -1` came out as an error rather than a short read. */
+  if (h->kind != VFS_HANDLE_NODE)
+    return h->kind == VFS_HANDLE_NONE ? -EBADF : -ESPIPE;
   isize base = 0;
   if (whence == B1NIX_SEEK_SET)
     base = 0;
@@ -4446,7 +4557,11 @@ static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
       if (is_rmdir) {
         if (child->inode->type != VFS_DIRECTORY)
           return -ENOTDIR;
-        if (child->first_child)
+        /* A directory whose children are the filesystem's own control files
+         * (a cgroup) is never "not empty" because of them — its rmdir_cb makes
+         * that call. See VFS_NODE_CTRL_CHILDREN. */
+        if (child->first_child &&
+            !(child->inode->flags & VFS_NODE_CTRL_CHILDREN))
           return -ENOTEMPTY;
       } else {
         if (child->inode->type == VFS_DIRECTORY)
@@ -4687,6 +4802,7 @@ int vfs_symlink(const char *target, const char *link_path) {
   node->inode->data = target_copy;
   node->inode->size = len;
   node->inode->flags = VFS_NODE_OWNS_DATA;
+  node->inode->nlink = 1; /* the name just created */
   node->inode->mode = 0777;
   node->inode->uid = cred ? cred->euid : ROOT_UID;
   node->inode->gid = cred ? cred->egid : ROOT_GID;
@@ -5015,6 +5131,45 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
     st->st_blksize = 512;
     return 0;
   }
+  /* Descriptors that are not files at all — pipes, sockets and the anonymous
+   * objects (eventfd, timerfd, signalfd, epoll, inotify). fstat(2) works on
+   * every one of them on Linux, and userspace leans on it: GNU head and tail
+   * fstat standard input to size their buffer, and reported
+   * "cannot fstat 'standard input': Bad file descriptor" for anything read
+   * through a pipe, because a handle with no vfs_node fell through to a node
+   * lookup that could only fail. */
+  if (ph) {
+    u32 anon_mode = 0;
+    switch (ph->kind) {
+    case VFS_HANDLE_PIPE_READ:
+    case VFS_HANDLE_PIPE_WRITE:
+      anon_mode = B1NIX_S_IFIFO | 0600;
+      break;
+    case VFS_HANDLE_SOCKET:
+      anon_mode = B1NIX_S_IFSOCK | 0777;
+      break;
+    case VFS_HANDLE_EVENTFD:
+    case VFS_HANDLE_TIMERFD:
+    case VFS_HANDLE_SIGNALFD:
+    case VFS_HANDLE_EPOLL:
+    case VFS_HANDLE_INOTIFY:
+      /* Linux backs these with an anonymous inode, reported as a regular
+       * file with no name and no size. */
+      anon_mode = B1NIX_S_IFREG | 0600;
+      break;
+    default:
+      break;
+    }
+    if (anon_mode) {
+      memset(st, 0, sizeof(*st));
+      st->st_mode = anon_mode;
+      st->st_nlink = 1;
+      st->st_blksize = 4096;
+      st->st_ino = (u64)(usize)ph;
+      return 0;
+    }
+  }
+
   /* Descriptors with no node of their own — the imported DRM core's objects,
    * which Linux backs with an anonymous inode. fstat on one has to work: a
    * compositor stats every descriptor it is handed, and an error here reads as
@@ -5131,6 +5286,75 @@ int vfs_fsync(int fd) {
   return 0;
 }
 
+static u32 next_peer_group;
+static int path_is_under(const char *path, const char *under);
+
+/* A new mount under a SHARED mount appears in every namespace that holds a peer
+ * of that mount. This is the whole observable meaning of MS_SHARED here: a
+ * mount namespace is a copy of the table, so "the copies are peers" has to mean
+ * that a later mount reaches all of them.
+ *
+ * Called after the mount is fully published. Peers are found by peer group,
+ * which only a mount that was explicitly made shared (or cloned from one) ever
+ * has, so on a machine that never unshared a mount namespace this walks the
+ * table once and does nothing. */
+static void vfs_mount_propagate(int midx) {
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+
+  /* The mount this one was made INSIDE: the longest target that is a prefix of
+   * ours, in our own namespace. */
+  u32 ns = mounts[midx].mnt_ns;
+  int parent = -1;
+  usize best = 0;
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mounts[i].used || (int)i == midx || mounts[i].mnt_ns != ns)
+      continue;
+    if (!path_is_under(mounts[midx].target, mounts[i].target))
+      continue;
+    usize l = strlen(mounts[i].target);
+    if (parent < 0 || l > best) {
+      parent = (int)i;
+      best = l;
+    }
+  }
+  if (parent < 0 || mounts[parent].propagation != MS_SHARED ||
+      !mounts[parent].peer_group) {
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    return;
+  }
+
+  u32 group = mounts[parent].peer_group;
+  u32 child_group = next_peer_group++;
+  mounts[midx].propagation = MS_SHARED;
+  mounts[midx].peer_group = child_group;
+
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mounts[i].used || mounts[i].peer_group != group ||
+        mounts[i].mnt_ns == ns)
+      continue;
+    int slot = -1;
+    for (usize j = 0; j < mount_slots; j++)
+      if (!mounts[j].used) {
+        slot = (int)j;
+        break;
+      }
+    if (slot < 0)
+      break; /* out of table: the peer simply does not get it */
+    mounts[slot] = mounts[midx];
+    mounts[slot].mnt_ns = mounts[i].mnt_ns;
+    mounts[slot].peer_group = child_group;
+    mounts[slot].used = 1;
+    if (mounts[slot].root_node)
+      vfs_node_get(mounts[slot].root_node);
+    if (mounts[slot].mount_point)
+      vfs_node_get(mounts[slot].mount_point);
+    if (mounts[slot].owner)
+      (void)try_module_get(mounts[slot].owner);
+  }
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+}
+
 static struct vfs_mount_entry *currently_mounting = NULL;
 
 void vfs_set_currently_mounting_root(struct vfs_node *root) {
@@ -5196,12 +5420,33 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   mounts[midx].mount_point = target_node;
   mounts[midx].root_node = NULL;
   copy_path(mounts[midx].source, sizeof(mounts[midx].source), source ? source : "");
-  copy_path(mounts[midx].target, sizeof(mounts[midx].target), target);
+  /* The CANONICAL path of the mountpoint, not the string the caller used.
+   * systemd mounts through a descriptor — it opens the directory O_PATH and
+   * calls mount(..., "/proc/self/fd/4", ...) — so the raw string named a
+   * descriptor rather than a place. Every mount in the machine then appeared in
+   * /proc/self/mountinfo as "/proc/self/fd/4", nothing could be recognised as
+   * already mounted, and systemd mounted /proc, /sys and /dev a second and
+   * third time on each pass through its table. */
+  {
+    char canon[VFS_MAX_PATH];
+    if (vfs_get_node_path(target_node, canon, sizeof(canon)) == 0 && canon[0])
+      copy_path(mounts[midx].target, sizeof(mounts[midx].target), canon);
+    else
+      copy_path(mounts[midx].target, sizeof(mounts[midx].target), target);
+  }
   copy_path(mounts[midx].fstype, sizeof(mounts[midx].fstype), fstype);
-  mounts[midx].flags = flags;
+  mounts[midx].flags = flags & ~(u64)MS_PROPAGATION_MASK;
+  mounts[midx].propagation = MS_PRIVATE; /* Linux's default for a new mount */
+  mounts[midx].peer_group = 0;
   mounts[midx].owner = fs->owner;
   mounts[midx].mnt_ns = vfs_current_mnt_ns();
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  if (bootinfo_has_flag("b1nix.trace-mount")) {
+    char ml[192];
+    snprintf(ml, sizeof(ml), "vfs_mount: type='%s' target='%s' point=%p '%s'",
+             fstype, target, (void *)target_node, target_node->name);
+    klog_info(ml);
+  }
 
   currently_mounting = &mounts[midx];
   u32 new_fs_id;
@@ -5250,7 +5495,172 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   }
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
+  vfs_mount_propagate(midx);
   return 0;
+}
+
+/* ── mount propagation, bind mounts and remount ────────────────────────────
+ *
+ * Everything here operates on the mount TABLE; none of it mounts a filesystem.
+ *
+ * Propagation is what systemd asks for before it does anything else:
+ * mount(NULL, "/", NULL, MS_REC|MS_SHARED, NULL). Its per-unit sandboxing is
+ * then described relative to it — a unit with PrivateTmp= gets a mount
+ * namespace whose root is a slave of the host's, so mounts the host makes
+ * afterwards are still visible inside the unit while the unit's own are not
+ * visible outside. b1nix models a namespace as a copy of this table, so
+ * "shared" means: the copies are peers, and a mount made under one of them is
+ * made under all of them.
+ */
+
+static u32 next_peer_group = 1;
+
+/* Is `path` at or below `under`? Both are canonical. */
+static int path_is_under(const char *path, const char *under) {
+  if (under[0] == '/' && under[1] == '\0')
+    return 1;
+  usize ul = strlen(under);
+  if (strncmp(path, under, ul) != 0)
+    return 0;
+  return path[ul] == '\0' || path[ul] == '/';
+}
+
+int vfs_set_propagation(const char *target, u64 flags) {
+  u32 type = (u32)(flags & MS_PROPAGATION_MASK);
+  /* Exactly one propagation type, as Linux requires. */
+  if (type != MS_SHARED && type != MS_SLAVE && type != MS_PRIVATE &&
+      type != MS_UNBINDABLE)
+    return -EINVAL;
+
+  char canon[VFS_MAX_PATH];
+  struct vfs_node *node = vfs_find_node(target);
+  if (IS_ERR(node))
+    return (int)PTR_ERR(node);
+  if (vfs_get_node_path(node, canon, sizeof(canon)) != 0 || !canon[0])
+    copy_path(canon, sizeof(canon), target);
+  vfs_node_put(node);
+
+  int recursive = (flags & MS_REC) ? 1 : 0;
+  int touched = 0;
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mount_visible(i))
+      continue;
+    if (recursive ? !path_is_under(mounts[i].target, canon)
+                  : strcmp(mounts[i].target, canon) != 0)
+      continue;
+    mounts[i].propagation = type;
+    if (type == MS_SHARED) {
+      if (!mounts[i].peer_group)
+        mounts[i].peer_group = next_peer_group++;
+    } else if (type != MS_SLAVE) {
+      mounts[i].peer_group = 0;
+    }
+    touched = 1;
+  }
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+
+  /* Linux allows a propagation change on any mountpoint; a path that is not
+   * one is EINVAL. */
+  return touched ? 0 : -EINVAL;
+}
+
+int vfs_remount(const char *target, u64 flags) {
+  char canon[VFS_MAX_PATH];
+  struct vfs_node *node = vfs_find_node(target);
+  if (IS_ERR(node))
+    return (int)PTR_ERR(node);
+  if (vfs_get_node_path(node, canon, sizeof(canon)) != 0 || !canon[0])
+    copy_path(canon, sizeof(canon), target);
+  vfs_node_put(node);
+
+  int found = 0;
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mount_visible(i) || strcmp(mounts[i].target, canon) != 0)
+      continue;
+    /* MS_REMOUNT changes the mount's flags and nothing else. The propagation
+     * bits are not mount flags and are not touched by a remount. */
+    mounts[i].flags = (flags & ~(u64)(MS_REMOUNT | MS_PROPAGATION_MASK));
+    found = 1;
+  }
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  return found ? 0 : -EINVAL;
+}
+
+int vfs_bind_mount(const char *source, const char *target, u64 flags) {
+  struct vfs_node *src = vfs_find_node(source);
+  if (IS_ERR(src))
+    return (int)PTR_ERR(src);
+  struct vfs_node *tgt = vfs_find_node(target);
+  if (IS_ERR(tgt)) {
+    vfs_node_put(src);
+    return (int)PTR_ERR(tgt);
+  }
+  /* Linux allows a file-to-file bind; both ends must agree about which it is. */
+  if ((src->inode->type == VFS_DIRECTORY) !=
+      (tgt->inode->type == VFS_DIRECTORY)) {
+    vfs_node_put(src);
+    vfs_node_put(tgt);
+    return -ENOTDIR;
+  }
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  int midx = -1;
+  for (usize i = 0; i < mount_slots; i++)
+    if (!mounts[i].used) {
+      midx = (int)i;
+      break;
+    }
+  if (midx < 0) {
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    vfs_node_put(src);
+    vfs_node_put(tgt);
+    return -ENOMEM;
+  }
+  mounts[midx].used = 1;
+  mounts[midx].mount_point = tgt;   /* reference kept by the mount */
+  mounts[midx].root_node = src;     /* reference kept by the mount */
+  copy_path(mounts[midx].source, sizeof(mounts[midx].source), source);
+  {
+    char canon[VFS_MAX_PATH];
+    if (vfs_get_node_path(tgt, canon, sizeof(canon)) == 0 && canon[0])
+      copy_path(mounts[midx].target, sizeof(mounts[midx].target), canon);
+    else
+      copy_path(mounts[midx].target, sizeof(mounts[midx].target), target);
+  }
+  copy_path(mounts[midx].fstype, sizeof(mounts[midx].fstype), "bind");
+  mounts[midx].flags = flags & ~(u64)(MS_BIND | MS_REC | MS_PROPAGATION_MASK);
+  mounts[midx].owner = 0;
+  mounts[midx].mnt_ns = vfs_current_mnt_ns();
+  mounts[midx].propagation = MS_PRIVATE;
+  mounts[midx].peer_group = 0;
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  return 0;
+}
+
+isize vfs_mounts_info(struct vfs_mount_info *out, usize max_entries) {
+  if (!out && max_entries > 0)
+    return -EFAULT;
+  usize count = 0;
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mount_visible(i))
+      continue;
+    if (count < max_entries) {
+      copy_path(out[count].source, sizeof(out[count].source), mounts[i].source);
+      copy_path(out[count].target, sizeof(out[count].target), mounts[i].target);
+      copy_path(out[count].fstype, sizeof(out[count].fstype), mounts[i].fstype);
+      out[count].flags = mounts[i].flags;
+      out[count].propagation = mounts[i].propagation;
+      out[count].peer_group = mounts[i].peer_group;
+    }
+    count++;
+  }
+  return (isize)count;
 }
 
 /* Rewrite a mount's target when the directory it hangs under moves: "/old" and
@@ -5671,6 +6081,13 @@ int vfs_mnt_ns_clone(u32 from_ns, u32 to_ns) {
         continue;
       mounts[j] = mounts[i];
       mounts[j].mnt_ns = to_ns;
+      /* A shared mount's copy is its PEER: that is what "shared" means, and it
+       * is why a later mount under either of them shows up under both. A
+       * private mount's copy is unrelated to the original. */
+      if (mounts[i].propagation != MS_SHARED) {
+        mounts[j].propagation = MS_PRIVATE;
+        mounts[j].peer_group = 0;
+      }
       if (mounts[j].root_node)
         vfs_node_get(mounts[j].root_node);
       if (mounts[j].mount_point)
@@ -5890,7 +6307,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
          child && count < max_entries;
          child = next_child_by_seq(dir, seq_above)) {
       copy_path(buf[count].name, 64, child->name);
-      buf[count].type = (u32)child->inode->type;
+      buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
       buf[count].is_exec = 0;
       buf[count].size = child->inode->size;
@@ -5965,7 +6382,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
          child && count < max_entries;
          child = next_child_by_seq(dir, seq_above)) {
       copy_path(buf[count].name, 64, child->name);
-      buf[count].type = (u32)child->inode->type;
+      buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
       buf[count].is_exec = 0;
       buf[count].size = child->inode->size;
@@ -6027,7 +6444,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     }
     if (idx >= start) {
       copy_path(buf[count].name, 64, child->name);
-      buf[count].type = (u32)child->inode->type;
+      buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
       buf[count].is_exec = 0;
       buf[count].size = child->inode->size;
@@ -6442,7 +6859,24 @@ static int memfd_truncate(struct vfs_node *node, u64 length) {
 }
 
 int vfs_memfd_create(const char *name, u32 flags) {
-  if (flags & ~(u32)(B1NIX_MFD_CLOEXEC | B1NIX_MFD_ALLOW_SEALING))
+  /* MFD_NOEXEC_SEAL and MFD_EXEC decide whether the file may ever be mapped
+   * executable; MFD_HUGETLB asks for huge pages. b1nix never maps a memfd
+   * executable, so NOEXEC_SEAL is the behaviour it already has and EXEC is the
+   * one thing here it cannot honour. Huge pages are a performance request, not
+   * a semantic one, and are satisfied with ordinary pages.
+   *
+   * Rejecting these outright is what a kernel older than Linux 6.3 does, and
+   * modern userspace passes MFD_NOEXEC_SEAL by default: glibc, pulseaudio and
+   * Chromium all failed to create shared memory here, which in Chromium's case
+   * left its discardable-memory allocator uninstantiated and killed the
+   * browser the first time Skia cached a blur. */
+  if (flags & ~(u32)(B1NIX_MFD_CLOEXEC | B1NIX_MFD_ALLOW_SEALING |
+                     B1NIX_MFD_HUGETLB | B1NIX_MFD_NOEXEC_SEAL |
+                     B1NIX_MFD_EXEC))
+    return -EINVAL;
+  /* Linux refuses the pair: a file cannot be sealed non-executable and
+   * executable at once. */
+  if ((flags & B1NIX_MFD_NOEXEC_SEAL) && (flags & B1NIX_MFD_EXEC))
     return -EINVAL;
 
   struct vfs_node *node = vfs_create_node(VFS_FILE);
@@ -6702,6 +7136,37 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
       strcmp(node->name, "loop-control") == 0)
     return loop_ioctl(node, request, arg);
 
+  /* The tty ioctls whose argument is a VALUE, not a pointer.
+   *
+   * TIOCSCTTY takes 0 or 1 and TIOCNOTTY takes nothing at all, so the blanket
+   * "no argument means EINVAL" below rejected them out of hand. systemd opens
+   * the console for a getty and calls ioctl(fd, TIOCSCTTY, 0); the EINVAL came
+   * back as "Failed to set up standard input: Invalid argument" and no login
+   * prompt was ever printed. */
+  if ((strcmp(node->name, "tty") == 0 || strcmp(node->name, "console") == 0)) {
+    if (request == B1NIX_TIOCSCTTY) {
+      /* A session leader claims the console: its group becomes the foreground
+       * one, so ^C and job control reach the right processes. */
+      if (current_task) {
+        console.session_id = current_task->session_id;
+        console.fg_pgrp = current_task->process_group_id;
+        if (current_task->session_id == current_task->id)
+          scheduler_set_ctty(current_task, 1, 0);
+      }
+      return 0;
+    }
+    if (request == B1NIX_TIOCNOTTY)
+      return 0;
+    /* TIOCVHANGUP / TCFLSH / TCSBRK / TIOCEXCL / TIOCNXCL: nothing to do on a
+     * console with no line discipline state to throw away, and each is
+     * "succeeded" rather than "unsupported" because that is the truth — there
+     * is no buffered output to drain and no exclusive-open state to set. */
+    if (request == 0x5437 /* TIOCVHANGUP */ || request == 0x540B /* TCFLSH */ ||
+        request == 0x5409 /* TCSBRK */ || request == 0x540C /* TIOCEXCL */ ||
+        request == 0x540D /* TIOCNXCL */)
+      return 0;
+  }
+
   if (!arg)
     return -EINVAL;
 
@@ -6812,16 +7277,12 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
     return -ENOTTY;
 
   if (request == B1NIX_TCGETS) {
-    if (!arg || syscall_copyout(arg, &console.termios, sizeof(struct b1nix_termios)) < 0)
-      return -EFAULT;
-    return 0;
+    return tty_termios_copyout(arg, &console.termios);
   }
   if (request == B1NIX_TCSETS || request == B1NIX_TCSETSW ||
       request == B1NIX_TCSETSF) {
-    /* TCSADRAIN/TCSAFLUSH (TCSETSW/TCSETSF): no output buffering, so apply as TCSETS. */
-    if (!arg || syscall_copyin(&console.termios, arg, sizeof(struct b1nix_termios)) < 0)
-      return -EFAULT;
-    return 0;
+    /* TCSADRAIN/TCSAFLUSH (TCSETSW/TCSETSF): no output buffering, apply as TCSETS. */
+    return tty_termios_copyin(&console.termios, arg);
   }
   if (request == B1NIX_TIOCGPGRP) {
     /* The user buffer is a pid_t (32-bit) — copying sizeof(usize) would
@@ -7265,10 +7726,7 @@ int vfs_fstatfs(int fd, struct b1nix_statfs *st) {
   if (handle->kind != VFS_HANDLE_NODE || !handle->node)
     return -EINVAL;
 
-  if (handle->node->inode->statfs_cb)
-    return handle->node->inode->statfs_cb(handle->node, st);
-
-  return -ENOSYS;
+  return vfs_statfs_node(handle->node, st);
 }
 
 int vfs_syncfs(int fd) {

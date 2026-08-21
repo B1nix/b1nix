@@ -134,6 +134,9 @@ static struct vfs_node *mk_node(struct vfs_node *parent, const char *name,
   copy_name(n->name, sizeof(n->name), name);
   n->inode->mode = mode;
   n->inode->nlink = (type == VFS_DIRECTORY) ? 2 : 1;
+  /* A sysfs attribute is a regular file, not a character device. */
+  if (type == VFS_DEVICE || type == VFS_FILE)
+    n->inode->flags |= VFS_NODE_PSEUDO_REG;
   n->parent = parent;
   n->refcount++;
   vfs_attach_child(parent, n);
