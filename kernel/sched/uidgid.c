@@ -362,10 +362,51 @@ int cred_can_access(const struct cred *cred, u16 file_uid, u16 file_gid, u16 fil
 void cred_refresh_caps(struct cred *cred)
 {
     if (!cred) return;
-    u64 want = (cred->euid == ROOT_UID) ? CAP_FULL_SET : 0;
+    /* SECBIT_NO_SETUID_FIXUP: the kernel makes no capability adjustment at all
+     * when the effective uid changes. */
+    if (cred->securebits & SECBIT(SECURE_NO_SETUID_FIXUP))
+        return;
+
+    /* SECBIT_NOROOT: uid 0 is not special, so becoming root grants nothing. */
+    int root = (cred->euid == ROOT_UID) &&
+               !(cred->securebits & SECBIT(SECURE_NOROOT));
+    u64 want;
+    if (root)
+        want = CAP_FULL_SET;
+    else if (cred->securebits & SECBIT(SECURE_KEEP_CAPS))
+        /* SECBIT_KEEP_CAPS: leaving uid 0 keeps the permitted set instead of
+         * clearing it. This is what a service that drops to an unprivileged
+         * user but keeps one capability relies on. */
+        want = cred->cap_permitted;
+    else
+        want = 0;
     cred->cap_permitted = want & cred->cap_bounding;
     cred->cap_effective = cred->cap_permitted;
     cred->cap_inheritable &= cred->cap_bounding;
+}
+
+u32 cred_get_securebits(const struct cred *cred)
+{
+    return cred ? cred->securebits : 0;
+}
+
+int cred_set_securebits(struct cred *cred, u32 bits)
+{
+    if (!cred) return -EINVAL;
+    if (bits & ~(SECURE_ALL_BITS | SECURE_ALL_LOCKS))
+        return -EINVAL;
+    /* A lock, once set, can never be cleared. */
+    if ((cred->securebits & SECURE_ALL_LOCKS) & ~bits)
+        return -EPERM;
+    /* Nor can the flag a lock guards be changed. */
+    u32 changed = (cred->securebits ^ bits) & SECURE_ALL_BITS;
+    if (changed & (cred->securebits >> 1) & SECURE_ALL_BITS)
+        return -EPERM;
+    if (!cred_has_cap(cred, CAP_SETPCAP))
+        return -EPERM;
+    cred->securebits = bits;
+    cred_refresh_caps(cred);
+    return 0;
 }
 
 void cred_sync_fsids(struct cred *cred)
@@ -426,9 +467,12 @@ int cred_capset(struct cred *cred, u64 eff, u64 perm, u64 inh)
     cred->cap_permitted = perm;
     cred->cap_effective = eff;
     cred->cap_inheritable = inh;
-    /* Lowering the bounding set is what makes the drop stick across a later
-     * return to euid 0. */
-    cred->cap_bounding &= perm;
+    /* The bounding set is NOT touched here. On Linux only PR_CAPBSET_DROP
+     * lowers it; capset(2) changes what the process holds, not the ceiling on
+     * what it could ever hold. Shrinking it here made a library that raises a
+     * capability, does its work and puts the sets back (libcap's cap_set_proc,
+     * which systemd uses around every bounding-set change) permanently narrow
+     * the ceiling as a side effect. */
     return 0;
 }
 

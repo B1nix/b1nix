@@ -1,5 +1,7 @@
 #include <b1nix/vfs.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/ktime.h>
+#include <b1nix/rtc.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
@@ -51,13 +53,20 @@ static usize unix_rb_size(void) {
  * reaches it, and chromium sends them in bursts, so sixteen ran out and the
  * sender saw ENOBUFS — an error Linux never returns here, and one that Mojo
  * treats as a dead channel rather than a retry. */
-#define UNIX_CONTROL_SLOTS 32
+/* Ancillary-data slots per socket. One is taken by every message that carries
+ * descriptors or credentials — and with SO_PASSCRED set, which is what a bus
+ * daemon does to every connection, that is EVERY message. Thirty-two of them
+ * is a handful of round trips on a busy connection. */
+#define UNIX_CONTROL_SLOTS 256
 #define UNIX_MSG_SLOTS 64
 /* Accept-queue depth. Linux's somaxconn is 4096, but that queue is allocated;
  * ours is an array inside every AF_UNIX socket and is also snapshotted onto the
  * stack when a listener closes, so the depth is bounded by what both can carry
  * cheaply — 64 pointers is 512 bytes in either place. */
 #define UNIX_BACKLOG_MAX 64
+
+/* Wall-clock microseconds, the unit SCM_TIMESTAMP's struct timeval carries. */
+static u64 unix_wallclock_usec(void) { return rtc_now_unix_nanos() / 1000ull; }
 
 struct unix_control {
   int used;
@@ -66,6 +75,9 @@ struct unix_control {
   usize nhandles;
   struct b1nix_ucred cred;
   int has_cred;
+  /* Wall-clock microseconds at which this message was placed in the receive
+   * buffer, for SO_TIMESTAMP. Zero when the receiver had not asked. */
+  u64 stamp_usec;
 };
 
 struct unix_socket_data {
@@ -113,6 +125,9 @@ struct unix_socket_data {
   u64 read_seq;
   u64 write_seq;
   struct unix_control control[UNIX_CONTROL_SLOTS];
+  /* Arrival stamp of the message the last recv handed over, for the
+   * SCM_TIMESTAMP the syscall layer attaches. */
+  u64 last_stamp_usec;
 
   /* SOCK_SEQPACKET message boundaries: one length per datagram sitting in the
    * ring buffer, in arrival order. A stream socket leaves this empty and reads
@@ -527,6 +542,15 @@ int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s,
       unix_data_put(new_u);
       new_s->unix_data = srv;
       srv->socket = new_s;
+      /* An accepted socket's own address is the listener's, and callers act on
+       * it: dbus asks getsockname() what family its connection is on and only
+       * negotiates file-descriptor passing when the answer is AF_UNIX. With
+       * the address left zeroed it read family 0, refused NEGOTIATE_UNIX_FD,
+       * and sd-bus then rejected every message carrying a descriptor
+       * (EOPNOTSUPP) — which is how `systemd-run --pipe` hands its stdio to
+       * PID 1. */
+      new_s->local.un = s->local.un;
+      new_s->bound = s->bound;
       /* A connector that closed while still queued leaves the endpoint with no
        * peer: the accepted socket is then already at end of stream, which is
        * exactly what happened and what the reader should see. */
@@ -575,19 +599,82 @@ static u64 unix_deadline_remaining(u64 deadline) {
   return deadline <= now ? 1 : deadline - now;
 }
 
+/* The socket bound at `addr`, with a reference taken, or NULL when nothing is
+ * listening there. Used by an UNCONNECTED datagram send, which names its
+ * destination per message instead of once at connect time. */
+static struct unix_socket_data *unix_lookup_dest(
+    const struct b1nix_sockaddr_un *addr) {
+  if (!addr || !addr->sun_path[0])
+    return 0;
+  struct vfs_node *n = vfs_find_node(addr->sun_path);
+  if (IS_ERR(n))
+    return 0;
+  if (n->inode->type != VFS_SOCKET) {
+    vfs_node_put(n);
+    return 0;
+  }
+  struct vfs_socket_state *ps = (struct vfs_socket_state *)n->inode->data;
+  struct unix_socket_data *pu =
+      ps ? (struct unix_socket_data *)ps->unix_data : 0;
+  if (pu)
+    unix_data_get(pu);
+  vfs_node_put(n);
+  return pu;
+}
+
+/* `dest` non-NULL: an unconnected datagram send, addressed per message.
+ *
+ * This is how sd_notify(3) talks to PID 1 — one AF_UNIX SOCK_DGRAM socket, no
+ * connect, sendmsg with msg_name = $NOTIFY_SOCKET — so with the address thrown
+ * away and the call answered ENOTCONN, no Type=notify unit could ever report
+ * itself started. dbus.service is one, and systemd terminated it on its
+ * start-up timeout every time. */
+static isize unix_send_to(struct vfs_socket_state *s, const void *buf,
+                          usize len, struct vfs_handle **handles,
+                          usize nhandles, const struct b1nix_ucred *cred,
+                          int nonblock, const struct b1nix_sockaddr_un *dest);
+
 isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
                         struct vfs_handle **handles, usize nhandles,
                         const struct b1nix_ucred *cred, int nonblock) {
+  return unix_send_to(s, buf, len, handles, nhandles, cred, nonblock, 0);
+}
+
+isize unix_sendto(struct vfs_socket_state *s,
+                  const struct b1nix_sockaddr_un *addr, const void *buf,
+                  usize len, int nonblock) {
+  return unix_send_to(s, buf, len, 0, 0, 0, nonblock, addr);
+}
+
+static isize unix_send_to(struct vfs_socket_state *s, const void *buf,
+                          usize len, struct vfs_handle **handles,
+                          usize nhandles, const struct b1nix_ucred *cred,
+                          int nonblock, const struct b1nix_sockaddr_un *dest) {
   u64 snd_deadline = unix_deadline(s->so_sndtimeo_ms);
   /* /dev/log syslog sink: forward the datagram to the serial console prefixed
    * with "/dev/log: " (matches the M54-LOG smoke expectation). No peer/ring. */
-  if (s->syslog_sink) {
+  /* /dev/log with nothing bound there: the kernel is the syslog sink. A
+   * sendto() names the path per message, so the check has to look at the
+   * destination as well as at what connect() recorded. */
+  int to_syslog = s->syslog_sink;
+  if (!to_syslog && dest && dest->sun_path[0] &&
+      strcmp(dest->sun_path, "/dev/log") == 0) {
+    struct unix_socket_data *probe = unix_lookup_dest(dest);
+    if (probe)
+      unix_data_put(probe);
+    else
+      to_syslog = 1;
+  }
+  if (to_syslog) {
     char line[512];
     usize n = (buf && len < sizeof(line) - 1) ? len : (buf ? sizeof(line) - 1 : 0);
-    if (n) {
-      if (syscall_copyin(line, buf, n) < 0)
-        return -EFAULT;
-    }
+    /* `buf` is already a KERNEL buffer: every caller (send, sendto, sendmsg,
+     * write) bounces the payload in before reaching the socket layer. Copying
+     * it in a second time as if it were a user pointer failed the user-range
+     * check, so every syslog datagram — everything dbus-daemon logs, which is
+     * the only place it reports why it is exiting — came back EFAULT. */
+    if (n)
+      memcpy(line, buf, n);
     while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
       n--;
     line[n] = '\0';
@@ -600,20 +687,27 @@ isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
   if ((nhandles || cred) && len == 0)
     return -EINVAL;
 
-retry:
+retry:;
   /* Pin the peer for the duration of the write. Reading u->peer and taking the
    * reference under u's lock is what makes this safe: the peer closing on
    * another CPU clears u->peer and drops the link reference in unix_free_state,
    * but our own reference keeps the peer's data (and its ring buffer) alive
    * until we are done — without this the old code dereferenced freed memory. */
-  unix_lock(u);
-  struct unix_socket_data *peer_u = u->peer;
-  if (!s->connected || !peer_u) {
+  struct unix_socket_data *peer_u;
+  if (dest) {
+    peer_u = unix_lookup_dest(dest); /* reference taken */
+    if (!peer_u)
+      return -ECONNREFUSED;
+  } else {
+    unix_lock(u);
+    peer_u = u->peer;
+    if (!s->connected || !peer_u) {
+      unix_unlock(u);
+      return -ENOTCONN;
+    }
+    unix_data_get(peer_u);
     unix_unlock(u);
-    return -ENOTCONN;
   }
-  unix_data_get(peer_u);
-  unix_unlock(u);
 
   unix_lock(peer_u);
   usize free_space = peer_u->rb_size - peer_u->rb_count;
@@ -641,7 +735,7 @@ retry:
     int still_full = (peer_u->rb_count >= peer_u->rb_size);
     unix_unlock(peer_u);
     unix_data_put(peer_u);
-    if (!s->connected) {            /* peer hung up → retry reports ENOTCONN */
+    if (!dest && !s->connected) {   /* peer hung up → retry reports ENOTCONN */
       scheduler_wait_cancel();
       goto retry;
     }
@@ -668,21 +762,50 @@ retry:
     cred = &auto_cred;
   }
 
+  /* SO_TIMESTAMP on the receiving end: the arrival time belongs to the moment
+   * the bytes land in the receive buffer, which is here — not to whenever the
+   * reader gets round to calling recvmsg. */
+  u64 stamp_usec = 0;
+  if (peer_u->socket &&
+      (peer_u->socket->so_timestamp || peer_u->socket->so_timestampns))
+    stamp_usec = unix_wallclock_usec();
+
   int control_slot = -1;
-  if (nhandles || cred) {
+  if (nhandles || cred || stamp_usec) {
     for (int i = 0; i < UNIX_CONTROL_SLOTS; i++)
       if (!peer_u->control[i].used) {
         control_slot = i;
         break;
       }
     if (control_slot < 0) {
+      /* Out of ancillary slots is out of room, not a broken connection.
+       * Returning ENOBUFS here failed a write that had every chance of
+       * succeeding a moment later, and a bus client treats a failed write as
+       * a dead peer: PID 1's connection to dbus was torn down mid-call
+       * ("Got disconnect on API bus") whenever more than a few messages were
+       * in flight at once. Wait for the reader, exactly as a full ring does. */
+      struct vfs_socket_state *psock = peer_u->socket;
       unix_unlock(peer_u);
+      if (nonblock) {
+        unix_data_put(peer_u);
+        return -EAGAIN;
+      }
+      scheduler_wait_prepare(psock);
       unix_data_put(peer_u);
-      return -ENOBUFS;
+      if (scheduler_signal_pending()) {
+        scheduler_wait_cancel();
+        return -ERESTARTSYS;
+      }
+      scheduler_wait_commit();
+      goto retry;
     }
   }
 
-  int seqpacket = (s->type == B1NIX_SOCK_SEQPACKET);
+  /* A datagram keeps its boundaries. SOCK_DGRAM used to be read as an
+   * undivided byte stream, so two messages queued back to back arrived as one
+   * — which is not a smaller difference for a protocol like journald's or
+   * sd_notify's, it is a different protocol. */
+  int seqpacket = (s->type == B1NIX_SOCK_SEQPACKET || s->type == B1NIX_SOCK_DGRAM);
   if (seqpacket) {
     /* A SOCK_SEQPACKET write is all-or-nothing: a message that cannot fit
      * whole is either too large ever (EMSGSIZE) or has to wait for the reader
@@ -723,6 +846,7 @@ retry:
       ctl->cred = *cred;
       ctl->has_cred = 1;
     }
+    ctl->stamp_usec = stamp_usec;
   }
   for (usize i = 0; i < to_copy; i++) {
     peer_u->rb_buffer[peer_u->rb_tail] = ((const char *)buf)[i];
@@ -749,6 +873,13 @@ isize unix_send(struct vfs_socket_state *s, const void *buf, usize len,
   return unix_send_control(s, buf, len, 0, 0, 0, nonblock);
 }
 
+/* Arrival stamp of the message the last recv on this socket handed over, in
+ * wall-clock microseconds. 0 when nothing was stamped. */
+u64 unix_last_timestamp_usec(struct vfs_socket_state *s) {
+  struct unix_socket_data *u = s ? (struct unix_socket_data *)s->unix_data : 0;
+  return u ? u->last_stamp_usec : 0;
+}
+
 isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
                         int flags, struct vfs_handle **handles,
                         usize *nhandles, struct b1nix_ucred *cred,
@@ -764,7 +895,8 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
   while (1) {
     unix_lock(u);
     if (u->rb_count > 0) {
-      int seqpacket = (s->type == B1NIX_SOCK_SEQPACKET);
+      int seqpacket =
+          (s->type == B1NIX_SOCK_SEQPACKET || s->type == B1NIX_SOCK_DGRAM);
       usize avail = u->rb_count;
       if (seqpacket) {
         /* Exactly one message is visible to this call, and anything the caller
@@ -815,6 +947,7 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
             *cred = ctl->cred;
             *has_cred = 1;
           }
+          u->last_stamp_usec = ctl->stamp_usec;
           memset(ctl, 0, sizeof(*ctl));
         }
       }

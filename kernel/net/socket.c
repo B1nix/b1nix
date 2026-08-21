@@ -352,7 +352,15 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     return 0;
 
   if (s->domain == B1NIX_AF_UNIX) {
-    return unix_recv(s, buf, len);
+    /* Both the per-call MSG_DONTWAIT and the descriptor's own O_NONBLOCK.
+     * Neither reached the unix receive path, so read(2) on a non-blocking
+     * AF_UNIX socket BLOCKED — recvmsg had been fixed for this, plain read had
+     * not, and dbus-daemon reads its connections with read(). It parked in the
+     * middle of serving systemd's very first method call and stayed there
+     * until the caller gave up 25 seconds later. */
+    int nb = (h->flags & B1NIX_O_NONBLOCK) || (flags & B1NIX_MSG_DONTWAIT);
+    return unix_recv_control(s, buf, len,
+                             flags | (nb ? B1NIX_MSG_DONTWAIT : 0), 0, 0, 0, 0);
   }
 
   /* MSG_DONTWAIT asks for this ONE call not to block, whatever the descriptor
@@ -482,6 +490,20 @@ isize vfs_socket_sendto(int fd, const void *buf, usize len, int flags,
     isize rc = packet_send(s, buf, len);
     s->peer.ll = saved_ll;
     return rc;
+  }
+  if (s->domain == B1NIX_AF_UNIX) {
+    /* An address on an AF_UNIX send names the destination for THIS message,
+     * whether or not the socket was ever connected. Dropping it and falling
+     * through to the connected path is what made every sd_notify() call
+     * (sendmsg with msg_name and no connect) fail with ENOTCONN. */
+    if (addrlen < 2)
+      return -EINVAL;
+    extern isize unix_sendto(struct vfs_socket_state * s,
+                             const struct b1nix_sockaddr_un *addr,
+                             const void *buf, usize len, int nonblock);
+    return unix_sendto(s, (const struct b1nix_sockaddr_un *)addr, buf, len,
+                       (h->flags & B1NIX_O_NONBLOCK) ||
+                           (flags & B1NIX_MSG_DONTWAIT));
   }
   if (s->domain != B1NIX_AF_INET && s->domain != B1NIX_AF_INET6)
     return vfs_socket_send_h(h, buf, len, flags);
@@ -624,6 +646,31 @@ usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap) {
   if (!s) return 0;
   if (s->domain != B1NIX_AF_INET && s->domain != B1NIX_AF_INET6) return 0;
   return sock_fill_last_src(s, addr, cap);
+}
+
+/* SO_TIMESTAMP: whether the socket asked for arrival stamps, and the stamp of
+ * the message the last recvmsg handed over. Read by the syscall layer, which
+ * turns it into an SCM_TIMESTAMP control message — the same accessor shape as
+ * vfs_socket_last_srcaddr above, so no receive path has to grow an argument. */
+int vfs_socket_timestamp_enabled(int fd) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h || h->kind != VFS_HANDLE_SOCKET)
+    return 0;
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  if (!s)
+    return 0;
+  return s->so_timestamp ? 1 : (s->so_timestampns ? 2 : 0);
+}
+
+u64 vfs_socket_last_timestamp_usec(int fd) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h || h->kind != VFS_HANDLE_SOCKET)
+    return 0;
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  if (!s || s->domain != B1NIX_AF_UNIX)
+    return 0;
+  extern u64 unix_last_timestamp_usec(struct vfs_socket_state * s);
+  return unix_last_timestamp_usec(s);
 }
 
 static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
@@ -1150,6 +1197,17 @@ int vfs_socket(int domain, int type, int protocol) {
   socket->domain = domain;
   socket->type = type;
   socket->protocol = protocol;
+  /* A socket has an address family from the moment it exists, bound or not:
+   * getsockname(2) on an unbound socket reports the family with an empty
+   * address, and callers use exactly that to decide what kind of transport
+   * they are on. sd-bus asks sd_is_socket(fd, AF_UNIX, ...) before it offers
+   * file-descriptor passing, and a family of zero made it decide the
+   * connection could not carry descriptors — so `systemd-run --pipe`, which
+   * hands its stdio to PID 1 as descriptors, failed with EOPNOTSUPP before it
+   * sent anything. The family field is the first member of every sockaddr, so
+   * one assignment covers them all. */
+  socket->local.un.sun_family = (u16)domain;
+  socket->peer.un.sun_family = (u16)domain;
   /* Stamped once, here: the socket belongs to the namespace it was made in
    * for the rest of its life. */
   socket->netns = namespace_net_current();
@@ -1727,6 +1785,11 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
 #define SOCK_SO_PASSCRED  16
 #define SOCK_SO_PEERCRED  17
 #define SOCK_SO_ACCEPTCONN 30
+#define SOCK_SO_TIMESTAMP 29
+#define SOCK_SO_SNDBUFFORCE 32
+#define SOCK_SO_RCVBUFFORCE 33
+#define SOCK_SO_TIMESTAMPNS 35
+#define SOCK_SO_PASSSEC   34
 #define SOCK_TCP_NODELAY  1
 #define SOCK_TCP_KEEPIDLE  4
 #define SOCK_TCP_KEEPINTVL 5
@@ -1792,10 +1855,18 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
         tcp_set_keepalive((struct tcp_conn *)s->tcp_conn, s->so_keepalive);
       return 0;
     case SOCK_SO_SNDBUF:
-      s->so_sndbuf = sock_clamp_mem(v, sock_wmem_max());
+    case SOCK_SO_SNDBUFFORCE:
+      /* The FORCE variants are the privileged ones that ignore the sysctl
+       * ceiling. A caller that has to be root to use them is root here. */
+      s->so_sndbuf = (optname == SOCK_SO_SNDBUFFORCE)
+                         ? sock_clamp_mem(v, (u32)-1)
+                         : sock_clamp_mem(v, sock_wmem_max());
       return 0;
     case SOCK_SO_RCVBUF:
-      s->so_rcvbuf = sock_clamp_mem(v, sock_rmem_max());
+    case SOCK_SO_RCVBUFFORCE:
+      s->so_rcvbuf = (optname == SOCK_SO_RCVBUFFORCE)
+                         ? sock_clamp_mem(v, (u32)-1)
+                         : sock_clamp_mem(v, sock_rmem_max());
       /* On a TCP socket the value is not just recorded: it is the ceiling the
        * receive buffer may auto-tune to, and therefore the window we invite the
        * peer to fill. */
@@ -1803,8 +1874,30 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
         tcp_set_rcvbuf((struct tcp_conn *)s->tcp_conn, (u32)s->so_rcvbuf);
       return 0;
     case SOCK_SO_PASSCRED:
-      if (s->domain != B1NIX_AF_UNIX) return -ENOPROTOOPT;
+      /* Linux handles SO_PASSCRED generically in sock_setsockopt, so it
+       * succeeds on a netlink socket as well as on a unix one. Refusing it
+       * anywhere but AF_UNIX made systemd-journald exit 1 on start: its audit
+       * socket is AF_NETLINK, and it treats the failure as fatal. Credentials
+       * are only ever attached on AF_UNIX, which is also true on Linux for a
+       * kernel-originated netlink message. */
       s->so_passcred = v ? 1 : 0;
+      return 0;
+    /* SO_PASSSEC: ask for the sender's LSM label. There is no LSM here, so no
+     * SCM_SECURITY is ever attached — exactly what a Linux kernel built
+     * without SELinux or SMACK does with the same call. */
+    case SOCK_SO_PASSSEC:
+      s->so_passsec = v ? 1 : 0;
+      return 0;
+    /* SO_TIMESTAMP / SO_TIMESTAMPNS: stamp each received message with the
+     * moment it arrived and hand that back as an SCM_TIMESTAMP control
+     * message. systemd-journald sets it on its native socket and treats the
+     * failure as fatal — "SO_TIMESTAMP failed: Protocol not available" was the
+     * whole reason the Journal Service exited 1 on every start. */
+    case SOCK_SO_TIMESTAMP:
+      s->so_timestamp = v ? 1 : 0;
+      return 0;
+    case SOCK_SO_TIMESTAMPNS:
+      s->so_timestampns = v ? 1 : 0;
       return 0;
     case SOCK_SO_ERROR:     return -ENOPROTOOPT; /* read-only */
     default:                return -ENOPROTOOPT;
@@ -1894,6 +1987,9 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     case SOCK_SO_RCVBUF:    v = s->so_rcvbuf; break;
     case SOCK_SO_ACCEPTCONN: v = s->listening; break;
     case SOCK_SO_PASSCRED:  v = s->so_passcred; break;
+    case SOCK_SO_TIMESTAMP: v = s->so_timestamp; break;
+    case SOCK_SO_TIMESTAMPNS: v = s->so_timestampns; break;
+    case SOCK_SO_PASSSEC:   v = s->so_passsec; break;
     default:                return -ENOPROTOOPT;
     }
   } else if (level == SOCK_IPPROTO_TCP && optname == SOCK_TCP_NODELAY) {

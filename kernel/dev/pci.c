@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <b1nix/kprintf.h>
 #include <b1nix/irq.h>
 #include <b1nix/pci.h>
 #include <b1nix/acpi.h>
@@ -56,12 +58,6 @@ void pci_config_write8(u8 bus, u8 slot, u8 func, u8 offset, u8 value)
 	pci_config_write32(bus, slot, func, offset, current);
 }
 
-static void pci_print_hex16(u16 v)
-{
-	static const char hx[] = "0123456789abcdef";
-	for (int i = 12; i >= 0; i -= 4)
-		console_putc(hx[(v >> i) & 0xf]);
-}
 
 /* Enumerate and print EVERY PCI function so unrecognised hardware (e.g. a NIC
  * with no driver yet) is identifiable by vendor:device — visible later via
@@ -69,7 +65,7 @@ static void pci_print_hex16(u16 v)
  * flagged so they stand out. */
 void pci_init(void)
 {
-	console_write("pci: enumerating devices (bus:slot.func vendor:device class)\n");
+	k_info("pci", "enumerating devices");
 	for (u16 bus = 0; bus < 256; bus++) {
 		for (u8 slot = 0; slot < 32; slot++) {
 			if (pci_config_read16((u8)bus, slot, 0, 0) == 0xFFFF)
@@ -83,25 +79,23 @@ void pci_init(void)
 				u16 device = pci_config_read16((u8)bus, slot, func, 2);
 				u8 cls = pci_config_read8((u8)bus, slot, func, 0x0B);
 				u8 sub = pci_config_read8((u8)bus, slot, func, 0x0A);
-				console_write("pci: ");
-				console_write_dec((u32)bus);
-				console_putc(':');
-				console_write_dec((u32)slot);
-				console_putc('.');
-				console_write_dec((u32)func);
-				console_write("  ");
-				pci_print_hex16(vendor);
-				console_putc(':');
-				pci_print_hex16(device);
-				console_write("  class=");
-				pci_print_hex16(((u16)cls << 8) | sub);
+				/* One line per function, addressed the way every other
+				 * operating system addresses a PCI device — the domain,
+				 * bus, slot and function that lspci prints and that a
+				 * hardware bug report quotes. */
+				char addr[24];
+				snprintf(addr, sizeof(addr), "pci 0000:%02x:%02x.%u",
+				         (unsigned)bus, (unsigned)slot, (unsigned)func);
+				const char *kind = "";
 				if (cls == 0x02)
-					console_write("  [network]");
+					kind = " [network]";
 				else if (cls == 0x01)
-					console_write("  [storage]");
+					kind = " [storage]";
 				else if (cls == 0x0C && sub == 0x03)
-					console_write("  [usb]");
-				console_putc('\n');
+					kind = " [usb]";
+				k_info(addr, "%04x:%04x class=%04x%s", (unsigned)vendor,
+				       (unsigned)device, (unsigned)(((u16)cls << 8) | sub),
+				       kind);
 			}
 		}
 	}
@@ -1034,11 +1028,11 @@ static void pci_selftest_bars(const struct pci_device_info *dev)
 	if (dev->vendor_id == 0x1AF4 && bars[0].valid && bars[0].is_io) {
 		u32 raw0 = pci_config_read32(dev->bus, dev->slot, dev->func, PCI_CFG_BAR0);
 		if ((u16)(raw0 & ~3u) == (u16)bars[0].base && bars[0].base != 0)
-			console_write("M98-DRV-SMOKE: ok bar-restore\n");
+			k_info(NULL, "M98-DRV-SMOKE: ok bar-restore");
 		else
-			console_write("M98-DRV-SMOKE: FAIL bar-restore\n");
+			k_info(NULL, "M98-DRV-SMOKE: FAIL bar-restore");
 	} else {
-		console_write("M98-DRV-SMOKE: ok bar-restore\n");
+		k_info(NULL, "M98-DRV-SMOKE: ok bar-restore");
 	}
 }
 
@@ -1085,11 +1079,11 @@ static void pci_selftest_caps(const struct pci_device_info *dev)
 		u32 id0 = pci_ecam_read32(dev->bus, dev->slot, dev->func, 0x00);
 		u32 legacy = pci_config_read32(dev->bus, dev->slot, dev->func, 0x00);
 		if (id0 == legacy)
-			console_write("M98-DRV-SMOKE: ok ecam-config\n");
+			k_info(NULL, "M98-DRV-SMOKE: ok ecam-config");
 		else
-			console_write("M98-DRV-SMOKE: FAIL ecam-config\n");
+			k_info(NULL, "M98-DRV-SMOKE: FAIL ecam-config");
 	} else {
-		console_write("M98-DRV-SMOKE: skip ecam-config (no MCFG table)\n");
+		k_info(NULL, "M98-DRV-SMOKE: skip ecam-config (no MCFG table)");
 	}
 }
 
@@ -1102,9 +1096,9 @@ static void pci_selftest_busmaster(const struct pci_device_info *dev)
 	 * command register may have moved. */
 	int clean = ((after & ~PCI_CMD_BUS_MASTER) == (before & ~PCI_CMD_BUS_MASTER));
 	if (set && (after & PCI_CMD_BUS_MASTER) && clean)
-		console_write("M98-DRV-SMOKE: ok bus-master\n");
+		k_info(NULL, "M98-DRV-SMOKE: ok bus-master");
 	else
-		console_write("M98-DRV-SMOKE: FAIL bus-master\n");
+		k_info(NULL, "M98-DRV-SMOKE: FAIL bus-master");
 	if (!(before & PCI_CMD_BUS_MASTER))
 		pci_command_clear(dev->bus, dev->slot, dev->func, PCI_CMD_BUS_MASTER);
 }
@@ -1191,7 +1185,7 @@ static void pci_selftest_msi(void)
 		u64 want_addr = 0xFEE00000ULL | ((u64)(lapic_id() & 0xFF) << 12);
 		if (rc == 0 && rb == 0 && en && addr == want_addr &&
 		    data == (u16)vector) {
-			console_write("M98-DRV-SMOKE: ok msi-config\n");
+			k_info(NULL, "M98-DRV-SMOKE: ok msi-config");
 		} else {
 			console_write("M98-DRV-SMOKE: FAIL msi-config addr=0x");
 			console_write_hex64(addr);
@@ -1208,7 +1202,7 @@ static void pci_selftest_msi(void)
 		if (vec > 0)
 			msi_free_vector(vec);
 	} else {
-		console_write("M98-DRV-SMOKE: skip msi-config (no MSI-capable function)\n");
+		k_info(NULL, "M98-DRV-SMOKE: skip msi-config (no MSI-capable function)");
 	}
 
 	if (have_msix) {
@@ -1263,7 +1257,7 @@ static void pci_selftest_msi(void)
 		if (vec > 0)
 			msi_free_vector(vec);
 	} else {
-		console_write("M98-DRV-SMOKE: skip msix-config (no MSI-X-capable function)\n");
+		k_info(NULL, "M98-DRV-SMOKE: skip msix-config (no MSI-X-capable function)");
 	}
 }
 
@@ -1308,7 +1302,7 @@ static void pci_selftest_stolen_decode(void)
 		bad = 6;
 
 	if (!bad) {
-		console_write("M98-DRV-SMOKE: ok stolen-decode\n");
+		k_info(NULL, "M98-DRV-SMOKE: ok stolen-decode");
 	} else {
 		console_write("M98-DRV-SMOKE: FAIL stolen-decode case=");
 		console_write_dec((u64)bad);
@@ -1334,12 +1328,12 @@ static void pci_selftest_stolen(void)
 		console_write_hex64(st.dsm_size);
 		console_write("\n");
 	} else if (host_vendor != 0x8086) {
-		console_write("M98-DRV-SMOKE: ok stolen absent (non-Intel host bridge)\n");
+		k_info(NULL, "M98-DRV-SMOKE: ok stolen absent (non-Intel host bridge)");
 	} else {
 		/* Intel host bridge with no graphics stolen memory — QEMU's Q35 and
 		 * 440FX both land here. Reporting absence IS the correct answer, and it
 		 * is what the code must return rather than a fabricated aperture. */
-		console_write("M98-DRV-SMOKE: ok stolen absent (no GSM on this bridge)\n");
+		k_info(NULL, "M98-DRV-SMOKE: ok stolen absent (no GSM on this bridge)");
 	}
 }
 
@@ -1356,7 +1350,7 @@ void pci_selftest(void)
 		 * line in the log that no defect stands behind, which is exactly the
 		 * false trail this suite is supposed to avoid. The other instances,
 		 * which do have devices, are what prove the code. */
-		console_write("M98-DRV-SMOKE: skip bar-enum (no PCI device with a BAR)\n");
+		k_info(NULL, "M98-DRV-SMOKE: skip bar-enum (no PCI device with a BAR)");
 		return;
 	}
 

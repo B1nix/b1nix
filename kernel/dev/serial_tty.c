@@ -16,6 +16,7 @@
  * Output still interleaves with the kernel log on COM1 — same property as a
  * Linux console=ttyS0 system running a getty on the same port.
  */
+#include <b1nix/termios_abi.h>
 #include <b1nix/vfs.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -405,16 +406,17 @@ static int stty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
 
   switch (request) {
   case B1NIX_TCGETS:
-    if (!arg || syscall_copyout(arg, &t->termios, sizeof(t->termios)) < 0)
-      return -EFAULT;
-    return 0;
+    return tty_termios_copyout(arg, &t->termios);
   case B1NIX_TCSETS:
   case B1NIX_TCSETSW: /* TCSADRAIN — no output buffering, so same as TCSETS */
   case B1NIX_TCSETSF: /* TCSAFLUSH — no input queue to flush here either */
   {
-    struct b1nix_termios want;
-    if (!arg || syscall_copyin(&want, arg, sizeof(want)) < 0)
-      return -EFAULT;
+    struct b1nix_termios want = t->termios;
+    {
+      int cin = tty_termios_copyin(&want, arg);
+      if (cin < 0)
+        return cin;
+    }
     struct b1nix_termios saved = t->termios;
     t->termios = want;
     int rc = stty_apply_cflag(t, want.c_cflag);

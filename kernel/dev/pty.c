@@ -12,6 +12,7 @@
  * vfs_file_ops, so master/slave fds flow through the normal read/write/poll/
  * ioctl/close paths and inherit across fork/exec.
  */
+#include <b1nix/termios_abi.h>
 #include <b1nix/vfs.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
@@ -325,13 +326,16 @@ static int pty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
 
   switch (request) {
   case B1NIX_TCGETS:
-    if (!arg || syscall_copyout(arg, &p->termios, sizeof(p->termios)) < 0)
-      return -EFAULT;
-    return 0;
+    return tty_termios_copyout(arg, &p->termios);
+  /* TCSADRAIN and TCSAFLUSH: there is no output queue to drain and no input
+   * queue that outlives the call, so all three are the same operation. They
+   * used to be folded into TCSETS by the Linux-ABI ioctl wrapper; the wrapper
+   * is gone, and a pty that answered only TCSETS made dbclient fail with
+   * "Failed to set raw TTY mode". */
+  case B1NIX_TCSETSW:
+  case B1NIX_TCSETSF:
   case B1NIX_TCSETS:
-    if (!arg || syscall_copyin(&p->termios, arg, sizeof(p->termios)) < 0)
-      return -EFAULT;
-    return 0;
+    return tty_termios_copyin(&p->termios, arg);
   case B1NIX_TIOCGWINSZ:
     if (!arg || syscall_copyout(arg, &p->winsize, sizeof(p->winsize)) < 0)
       return -EFAULT;

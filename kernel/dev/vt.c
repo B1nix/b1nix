@@ -20,6 +20,7 @@
  * contents survive being switched away from.
  */
 
+#include <b1nix/termios_abi.h>
 #include <b1nix/vt.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -269,9 +270,9 @@ static void vt_repaint(struct vt_screen *v) {
         if (v->cells[(usize)r * g_cols + c] != ' ')
           last = (u16)(c + 1);
       for (u16 c = 0; c < last; c++)
-        console_putc(v->cells[(usize)r * g_cols + c]);
+        console_putc_raw(v->cells[(usize)r * g_cols + c]);
       if (r + 1 < g_rows && (last || r < v->row))
-        console_putc('\n');
+        console_putc_raw('\n');
       else if (r >= v->row)
         break;
     }
@@ -327,7 +328,7 @@ static void vt_input_char(struct vt_screen *v, char c) {
   if (!canon) {
     vt_queue_put(v, c);
     if (echo && is_active)
-      console_putc(c);
+      console_putc_raw(c);
     return;
   }
 
@@ -335,7 +336,7 @@ static void vt_input_char(struct vt_screen *v, char c) {
     if (v->line_len) {
       v->line_len--;
       if (echo && is_active)
-        console_write("\b \b");
+        console_write_raw("\b \b");
     }
     return;
   }
@@ -346,7 +347,7 @@ static void vt_input_char(struct vt_screen *v, char c) {
       vt_queue_put(v, v->line[i]);
     v->line_len = 0;
     if (echo && is_active)
-      console_putc('\n');
+      console_putc_raw('\n');
     return;
   }
   if (c == v->termios.c_cc[B1NIX_VEOF]) { /* ^D: end the line as-is */
@@ -360,7 +361,7 @@ static void vt_input_char(struct vt_screen *v, char c) {
   if (v->line_len < VT_LINE_MAX) {
     v->line[v->line_len++] = c;
     if (echo && is_active)
-      console_putc(c);
+      console_putc_raw(c);
   }
 }
 
@@ -516,12 +517,12 @@ static isize vt_node_write(struct vfs_node *node, u64 offset, const char *buf,
     if ((v->termios.c_oflag & B1NIX_OPOST) && c == '\n') {
       vt_record(v, '\r');
       if (idx == g_active)
-        console_putc('\r');
+        console_putc_raw('\r');
     }
     vt_record(v, c);
     if (idx == g_active) {
       g_replaying = 1; /* the record above already happened */
-      console_putc(c);
+      console_putc_raw(c);
       g_replaying = 0;
     }
   }
@@ -975,13 +976,11 @@ static int vt_ioctl(struct vfs_node *node, u64 request, void *arg) {
     return vt_gio_fontx(arg);
 
   case B1NIX_TCGETS:
-    return syscall_copyout(arg, &v->termios, sizeof(v->termios)) < 0 ? -EFAULT
-                                                                     : 0;
+    return tty_termios_copyout(arg, &v->termios);
   case B1NIX_TCSETS:
   case B1NIX_TCSETSW:
   case B1NIX_TCSETSF:
-    return syscall_copyin(&v->termios, arg, sizeof(v->termios)) < 0 ? -EFAULT
-                                                                    : 0;
+    return tty_termios_copyin(&v->termios, arg);
   case B1NIX_TIOCGWINSZ: {
     struct b1nix_winsize ws;
     memset(&ws, 0, sizeof(ws));

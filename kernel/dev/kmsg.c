@@ -6,7 +6,10 @@
  * record with a real priority instead of an ASCII "<LEVEL>:" prefix.
  */
 
+#include <b1nix/console.h>
 #include <b1nix/kmsg.h>
+#include <b1nix/kprintf.h>
+#include <b1nix/ktime.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
@@ -53,13 +56,21 @@ static usize g_line_len;
 static u64 g_dev_cursor = 1;
 static u64 g_proc_cursor = 1;
 
-static int g_console_level = 7;
 static int g_inited;
 
 static u64 kmsg_now_usec(void) {
-  /* The scheduler tick is 100 Hz; that is the real resolution of this clock
-   * and the timestamps say so rather than pretending to microseconds. */
-  return scheduler_get_uptime_ticks() * 10000ull;
+  /* The one monotonic clock: the same reading the console stamps a line with
+   * and the same one /proc/uptime reports. */
+  return ktime_monotonic_ns() / 1000ull;
+}
+
+/* Priority of the record currently being folded out of console characters. The
+ * console line assembler sets it when it opens a line; it falls back to
+ * KMSG_DEFAULT_PRIO for anything written without a severity. */
+static int g_line_prio = KMSG_DEFAULT_PRIO;
+
+void kmsg_set_line_prio(int priority) {
+  g_line_prio = priority & 7;
 }
 
 static void kmsg_store(int prio, const char *text, usize len) {
@@ -103,9 +114,10 @@ void kmsg_putc(char ch) {
     return;
   if (ch == '\n') {
     if (g_line_len) {
-      kmsg_store(KMSG_DEFAULT_PRIO, g_line, g_line_len);
+      kmsg_store(g_line_prio, g_line, g_line_len);
       g_line_len = 0;
     }
+    g_line_prio = KMSG_DEFAULT_PRIO;
     return;
   }
   if (g_line_len < KMSG_TEXT_MAX - 1) {
@@ -114,7 +126,7 @@ void kmsg_putc(char ch) {
   }
   /* An over-long line is closed where it overflows rather than truncated
    * away, so nothing is silently lost. */
-  kmsg_store(KMSG_DEFAULT_PRIO, g_line, g_line_len);
+  kmsg_store(g_line_prio, g_line, g_line_len);
   g_line_len = 0;
   g_line[g_line_len++] = ch;
 }
@@ -318,14 +330,21 @@ static isize kmsg_dev_write(struct vfs_node *node, u64 offset, const char *buf,
   usize len = size - off;
   while (len && (buf[off + len - 1] == '\n' || buf[off + len - 1] == '\r'))
     len--;
-  kmsg_store(prio, buf + off, len);
-  /* Linux shows /dev/kmsg writes in dmesg too, and dmesg reads the klog
-   * character transcript here — so mirror the text into it. */
+  /* One path, one record. The message is handed to the console with the
+   * severity it asked for, and the console's line assembler is what creates
+   * the ring record — the same way a kernel kprintf() line becomes one. An
+   * earlier version stored the record here AND mirrored the text through
+   * klog, which now also produces a record: every write landed in dmesg
+   * twice, once at the requested priority and once at the default. */
   char line[KMSG_TEXT_MAX];
-  usize n = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
-  memcpy(line, buf + off, n);
-  line[n] = '\0';
-  klog_info(line);
+  usize n = len < sizeof(line) - 5 ? len : sizeof(line) - 5;
+  line[0] = '<';
+  line[1] = (char)('0' + (prio & 7));
+  line[2] = '>';
+  memcpy(line + 3, buf + off, n);
+  line[3 + n] = '\n';
+  line[4 + n] = '\0';
+  console_write(line);
   return (isize)size;
 }
 
@@ -391,13 +410,20 @@ isize kmsg_syslog(int type, char *ubuf, int len) {
   switch (type) {
   case SYSLOG_ACTION_CLOSE:
   case SYSLOG_ACTION_OPEN:
+    return 0;
+  /* `dmesg -n` and friends: these move the same console filter the
+   * `loglevel=` boot parameter sets, so the two agree. Linux's level is a
+   * "print messages below this" bound, hence the -1. */
   case SYSLOG_ACTION_CONSOLE_OFF:
+    console_loglevel_set(CONSOLE_LOGLEVEL_QUIET - 1);
+    return 0;
   case SYSLOG_ACTION_CONSOLE_ON:
+    console_loglevel_set(CONSOLE_LOGLEVEL_DEFAULT);
     return 0;
   case SYSLOG_ACTION_CONSOLE_LEVEL:
     if (len < 1 || len > 8)
       return -EINVAL;
-    g_console_level = len;
+    console_loglevel_set(len - 1);
     return 0;
   case SYSLOG_ACTION_SIZE_BUFFER:
     /* The size a caller must allocate to hold everything READ_ALL can hand
