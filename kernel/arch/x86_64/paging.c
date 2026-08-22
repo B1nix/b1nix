@@ -1,4 +1,6 @@
 #include <b1nix/console.h>
+#include <b1nix/bootinfo.h>
+
 #include <b1nix/user.h>
 #include <b1nix/lockdep.h>
 #include <b1nix/sched.h>
@@ -510,6 +512,18 @@ void vmm_map_page_in_table(u64 *pml4, u64 virtual_address, u64 physical_address,
   pt[pt_index(virtual_address)] =
       (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
   invalidate_page(virtual_address);
+  /* Every user page install, when the run asks for them. This is the only
+   * edit that leaves no mapping call behind it, so a range that holds pages
+   * with no mmap to account for is either explained here or by nothing. */
+  {
+    extern int vma_trace_faults_enabled(void);
+    extern void vma_trace_record(const char *what, u64 start, u64 end);
+
+    if (flags & VMM_USER) {
+      if (vma_trace_faults_enabled())
+        vma_trace_record("map-page", virtual_address, virtual_address + PAGE_SIZE);
+    }
+  }
 }
 
 void vmm_init(void) {
@@ -660,7 +674,16 @@ void *vmm_map_mmio(u64 physical_address, usize size, u64 flags) {
   return (void *)(usize)(virt_base + phys_offset);
 }
 
-static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address) {
+/* Clear one leaf entry.
+ *
+ * `defer` decides who releases the frame. With NULL the frame goes back to the
+ * allocator here, which is only safe when no other CPU can still be holding
+ * the translation — a mapping being torn down in a space nobody runs in, or a
+ * page that was never published. Otherwise pass a slot: the frame is reported
+ * instead of freed, and the caller releases it AFTER its shootdown. A frame
+ * handed back while another core's TLB still names it is a write into whatever
+ * the allocator gives that frame to next. */
+static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address, u64 *defer) {
   if ((virtual_address & (PAGE_SIZE - 1)) != 0) {
     panic("vmm_unmap_page requires page-aligned address");
   }
@@ -695,7 +718,10 @@ static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address) {
     u64 frame = pte & PAGE_ENTRY_ADDRESS_MASK;
     if (frame) {
       if (pte & VMM_USER) {
-        pmm_free_frame(frame);
+        if (defer)
+          *defer = frame;
+        else
+          pmm_free_frame(frame);
         extern void eviction_unregister_page(u64 frame);
         eviction_unregister_page(frame);
       }
@@ -715,8 +741,10 @@ static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address) {
 
 void vmm_unmap_page(u64 virtual_address) {
   u64 _vmflags;
+  u64 defer = 0;
+
   vmm_write_acquire(&_vmflags);
-  unmap_page_from_pml4(get_current_pml4(), virtual_address);
+  unmap_page_from_pml4(get_current_pml4(), virtual_address, &defer);
   vmm_write_release(_vmflags);
   /* M28 #5: every other CPU that has cached this translation needs to drop
    * it before we return; otherwise a write through their stale TLB entry hits
@@ -726,12 +754,15 @@ void vmm_unmap_page(u64 virtual_address) {
    * reader doesn't block the shootdown ACK. */
   extern void tlb_shootdown_page(u64);
   tlb_shootdown_page(virtual_address);
+  /* After the flush, never before. */
+  if (defer)
+    pmm_free_frame(defer);
 }
 
 void vmm_unmap_page_nosync(u64 virtual_address) {
   u64 _vmflags;
   vmm_write_acquire(&_vmflags);
-  unmap_page_from_pml4(get_current_pml4(), virtual_address);
+  unmap_page_from_pml4(get_current_pml4(), virtual_address, 0);
   vmm_write_release(_vmflags);
 }
 
@@ -740,7 +771,7 @@ void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address) {
   vmm_write_acquire(&_vmflags);
   u64 *pml4 = pml4_phys ? (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE)
                          : kernel_pml4_virt;
-  unmap_page_from_pml4(pml4, virtual_address);
+  unmap_page_from_pml4(pml4, virtual_address, 0);
   vmm_write_release(_vmflags);
 }
 
@@ -783,7 +814,7 @@ void paging_unmap_range_from_space(u64 pml4_phys, u64 base, usize npages) {
       continue;
     }
     if (pdpte & HUGE_PAGE_FLAG) {
-      unmap_page_from_pml4(pml4, va);
+      unmap_page_from_pml4(pml4, va, 0);
       va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
       continue;
     }
@@ -796,7 +827,7 @@ void paging_unmap_range_from_space(u64 pml4_phys, u64 base, usize npages) {
       continue;
     }
     if (pde & HUGE_PAGE_FLAG) {
-      unmap_page_from_pml4(pml4, va);
+      unmap_page_from_pml4(pml4, va, 0);
       va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
       continue;
     }
@@ -810,7 +841,7 @@ void paging_unmap_range_from_space(u64 pml4_phys, u64 base, usize npages) {
       tab_end = end;
     for (; va < tab_end; va += PAGE_SIZE) {
       if (pt[pt_index(va)])
-        unmap_page_from_pml4(pml4, va);
+        unmap_page_from_pml4(pml4, va, 0);
     }
   }
   vmm_write_release(_vmflags);
@@ -1383,7 +1414,7 @@ usize vmm_unmap_range_collect(u64 base, usize npages, u64 *frames_out) {
       continue;
     }
     if (pdpte & HUGE_PAGE_FLAG) {
-      unmap_page_from_pml4(pml4, va);
+      unmap_page_from_pml4(pml4, va, 0);
       va = (va + (1ULL << 30)) & ~((1ULL << 30) - 1);
       continue;
     }
@@ -1396,7 +1427,7 @@ usize vmm_unmap_range_collect(u64 base, usize npages, u64 *frames_out) {
       continue;
     }
     if (pde & HUGE_PAGE_FLAG) {
-      unmap_page_from_pml4(pml4, va);
+      unmap_page_from_pml4(pml4, va, 0);
       va = (va + (1ULL << 21)) & ~((1ULL << 21) - 1);
       continue;
     }
@@ -1450,11 +1481,178 @@ usize vmm_unmap_range_nosync(u64 base, usize npages, u64 *frames_out) {
     frames_out[i] = (pte && (*pte & VMM_PRESENT))
                         ? (*pte & 0x000ffffffffff000ULL)
                         : 0;
-    unmap_page_from_pml4(get_current_pml4(), va);
+    unmap_page_from_pml4(get_current_pml4(), va, 0);
   }
   vmm_write_release(_vmflags);
   return npages;
 }
+
+
+/* A ring of the last address-space edits, for attributing leftovers.
+ *
+ * When a freshly allocated destination turns out to hold pages, the only
+ * question that matters is which earlier mapping left them — and by then every
+ * trace of that mapping is gone. Recording each mmap/munmap/move with its range
+ * and the thread that made it costs four stores on paths that already walk page
+ * tables, and turns "somebody left pages here" into a named sequence of calls.
+ *
+ * Deliberately lock-free: the index is bumped atomically and a torn entry would
+ * at worst misreport one line of a diagnostic. A lock here would sit on the
+ * munmap path of every process for the sake of a message almost never printed.
+ */
+#define VMA_TRACE_N 8192
+struct vma_trace_ent {
+  u64 start, end;
+  u64 seq;
+  u64 space;  /* the PML4 frame: which address space these addresses are in */
+  u32 pid;
+  u32 task;   /* which thread of it: the task slot, not the shared pid */
+  const char *what;
+};
+static struct vma_trace_ent g_vma_trace[VMA_TRACE_N];
+static u64 g_vma_trace_seq;
+
+/* Page installs are recorded too, when asked for: they are the only edits that
+ * happen with no mapping call behind them, so a leftover with no munmap to
+ * blame is either theirs or nobody's. Off by default — a fault is frequent
+ * enough that four stores per fault is a real cost, and the flag is read once. */
+static int vma_trace_faults = -1;
+
+int vma_trace_faults_enabled(void) {
+  /* Do not cache a "no" answer taken before the command line was parsed: the
+   * first user page is mapped early enough that an eager read of the flag
+   * settles on 0 for the whole boot, and the tracing then never happens no
+   * matter what the run asked for. Cache only the positive. */
+  if (vma_trace_faults < 0) {
+    const struct boot_info *bi = bootinfo_get();
+
+    if (!bi || !bi->command_line[0])
+      return 0;
+    vma_trace_faults = bootinfo_has_flag("b1nix.vma-trace") ? 1 : 0;
+    /* Say so once. A probe that silently never armed looks exactly like a
+     * probe that armed and found nothing, and the two have opposite meanings. */
+    console_write(vma_trace_faults ? "vma-trace: armed\n"
+                                   : "vma-trace: not requested\n");
+  }
+  return vma_trace_faults;
+}
+
+void vma_trace_record(const char *what, u64 start, u64 end) {
+  u64 seq = __atomic_add_fetch(&g_vma_trace_seq, 1, __ATOMIC_RELAXED);
+  struct vma_trace_ent *e = &g_vma_trace[seq % VMA_TRACE_N];
+
+  e->start = start;
+  e->end = end;
+  e->space = current_task ? current_task->pml4_phys : 0;
+  e->pid = current_task ? (u32)current_task->id : 0;
+  e->task = (u32)(((u64)(usize)current_task >> 6) & 0xffff);
+  e->what = what;
+  __atomic_store_n(&e->seq, seq, __ATOMIC_RELEASE);
+}
+
+/* The newest recorded edit covering one address, however far back it is.
+ *
+ * The range listing is capped, and the entry that explains a leftover page can
+ * be older than the cap — this answers "what was the last mapping call that
+ * covered THIS page" with no window at all. */
+void vma_trace_dump_addr(u64 va) {
+  u64 space = current_task ? current_task->pml4_phys : 0;
+  u64 now = __atomic_load_n(&g_vma_trace_seq, __ATOMIC_ACQUIRE);
+  u64 first = now > VMA_TRACE_N ? now - VMA_TRACE_N : 1;
+
+  for (u64 i = now; i >= first; i--) {
+    struct vma_trace_ent *e = &g_vma_trace[i % VMA_TRACE_N];
+
+    if (__atomic_load_n(&e->seq, __ATOMIC_ACQUIRE) != i || e->space != space)
+      continue;
+    if (va < e->start || va >= e->end)
+      continue;
+    console_write("  last edit covering 0x");
+    console_write_hex64(va);
+    console_write(": #");
+    console_write_dec(e->seq);
+    console_write(" tid ");
+    console_write_dec(e->pid);
+    console_write(" ");
+    console_write(e->what);
+    console_write(" 0x");
+    console_write_hex64(e->start);
+    console_write("-0x");
+    console_write_hex64(e->end);
+    console_write("\n");
+    return;
+  }
+  console_write("  no recorded edit ever covered 0x");
+  console_write_hex64(va);
+  console_write("\n");
+}
+
+/* Every recorded edit that touched this range, oldest first. */
+void vma_trace_dump(u64 start, u64 end) {
+  /* Only this address space's edits. The ring is global, and an address in one
+   * process says nothing about the same address in another — mixing them in
+   * makes an unrelated process's mapping look like an explanation. */
+  u64 space = current_task ? current_task->pml4_phys : 0;
+  u64 now = __atomic_load_n(&g_vma_trace_seq, __ATOMIC_ACQUIRE);
+  u64 first = now > VMA_TRACE_N ? now - VMA_TRACE_N : 1;
+  unsigned shown = 0;
+
+  /* Newest first: the edits that explain a leftover are the ones just before
+   * it, and an oldest-first listing spends its whole budget on history. */
+  console_write("  edits touching this range (newest first):\n");
+  for (u64 i = now; i >= first && shown < 16; i--) {
+    struct vma_trace_ent *e = &g_vma_trace[i % VMA_TRACE_N];
+
+    if (__atomic_load_n(&e->seq, __ATOMIC_ACQUIRE) != i)
+      continue;
+    if (e->start >= end || e->end <= start)
+      continue;
+    if (e->space != space)
+      continue;
+    shown++;
+    console_write("    #");
+    console_write_dec(e->seq);
+    console_write(" pid ");
+    console_write_dec(e->pid);
+    console_write(" thread ");
+    console_write_dec(e->task);
+    console_write(" ");
+    console_write(e->what);
+    console_write(" 0x");
+    console_write_hex64(e->start);
+    console_write("-0x");
+    console_write_hex64(e->end);
+    console_write("\n");
+  }
+  if (!shown)
+    console_write("    (none recorded)\n");
+
+  /* And the last few edits of any range, so an empty list above can be read as
+   * "nothing touched this range" rather than "nothing is being recorded". */
+  console_write("  most recent edits of this space, any range:\n");
+  shown = 0;
+  for (u64 i = now; i >= first && shown < 6; i--) {
+    struct vma_trace_ent *e = &g_vma_trace[i % VMA_TRACE_N];
+
+    if (__atomic_load_n(&e->seq, __ATOMIC_ACQUIRE) != i || e->space != space)
+      continue;
+    shown++;
+    console_write("    #");
+    console_write_dec(e->seq);
+    console_write(" tid ");
+    console_write_dec(e->pid);
+    console_write(" ");
+    console_write(e->what);
+    console_write(" 0x");
+    console_write_hex64(e->start);
+    console_write("\n");
+  }
+}
+
+
+/* How many times a move has reported a dirty destination. The scan that
+ * produces the report is itself expensive, so this bounds both. */
+static unsigned move_leftovers_reported;
 
 
 /* Move a range's leaf entries to another address, without touching the pages.
@@ -1475,6 +1673,11 @@ void paging_move_range(u64 old_start, u64 new_start, u64 len) {
   extern void tlb_shootdown_all(void);
   u64 flags;
 
+  /* Recorded after the destination has been inspected, not before: an entry
+   * for the move itself would otherwise be the newest edit covering the very
+   * page whose history is being asked for, and answer every question with
+   * itself. */
+
   /* A block at a time: the tables for a whole block are built first, outside
    * the lock, then one critical section moves its entries. Taking the write
    * lock per page turned a large move into hundreds of thousands of lock
@@ -1484,6 +1687,137 @@ void paging_move_range(u64 old_start, u64 new_start, u64 len) {
   /* One page table covers this much address space, and it is also the block
    * size: a span this size shares one destination table. */
   const u64 block = 512 * PAGE_SIZE;
+
+  /* The destination must be empty before anything is moved into it.
+   *
+   * It is supposed to be — it is a mapping that was created moments ago — and
+   * yet it arrives holding present, read-only, user entries naming real
+   * frames: pages left behind by whatever occupied this address before. The
+   * move then overwrites them, the frames they named are never released by
+   * their owner, and the unmap that follows frees a frame the surviving entry
+   * still points at. That is the "pmm: double free ... from
+   * unmap_page_from_pml4" that killed the shell running the browser.
+   *
+   * Clearing them here is right whoever left them: no caller of this function
+   * intends to inherit another mapping's pages. Collected, flushed, then
+   * freed — never freed before the flush. */
+  {
+    enum { MOVE_CLEAR_BATCH = 64 };
+    u64 frames[MOVE_CLEAR_BATCH];
+    u64 stop = new_start + len;
+    usize cleared = 0;
+
+    /* Read the destination before touching it.
+     *
+     * Only while there is a report left to make: the scan walks every page of
+     * the destination, and mremap is called on every large realloc — paying a
+     * full walk per call forever, to print nothing, is not a diagnostic, it is
+     * a tax.
+     *
+     * What the leftovers ARE decides who left them, and the clear is what
+     * destroys that evidence: a run of copy-on-write zero pages is the fault
+     * handler's read-ahead, which installs up to sixteen neighbours per fault,
+     * while ordinary private frames are pages something actually wrote to. */
+    u64 scan_first_va = 0, scan_first_pte = 0;
+    usize scan_present = 0, scan_cow = 0, scan_zero = 0, scan_lazy = 0;
+
+    for (u64 v = new_start; move_leftovers_reported < 8 && v < stop;
+         v += PAGE_SIZE) {
+      u64 *pte = pf_leaf_pte_ptr(v);
+
+      if (!pte || !*pte)
+        continue;
+      if (!scan_first_va) {
+        scan_first_va = v;
+        scan_first_pte = *pte;
+      }
+      if (*pte & VMM_PRESENT) {
+        scan_present++;
+        if (*pte & VMM_COW)
+          scan_cow++;
+        if ((*pte & PAGE_ENTRY_ADDRESS_MASK) == pmm_zero_page())
+          scan_zero++;
+      } else if (*pte & VMM_LAZY) {
+        scan_lazy++;
+      }
+    }
+
+    for (u64 v = new_start; v < stop;) {
+      usize n = (usize)((stop - v) / PAGE_SIZE);
+
+      if (n > MOVE_CLEAR_BATCH)
+        n = MOVE_CLEAR_BATCH;
+      usize nf = vmm_unmap_range_collect(v, n, frames);
+      if (nf) {
+        tlb_shootdown_all();
+        for (usize k = 0; k < nf; k++)
+          pmm_free_frame(frames[k]);
+        cleared += nf;
+      }
+      v += (u64)n * PAGE_SIZE;
+    }
+    if (cleared) {
+      if (move_leftovers_reported < 8) {
+        move_leftovers_reported++;
+        console_write("mremap: leftovers present=");
+        console_write_dec(scan_present);
+        console_write(" cow=");
+        console_write_dec(scan_cow);
+        console_write(" zero-page=");
+        console_write_dec(scan_zero);
+        console_write(" lazy=");
+        console_write_dec(scan_lazy);
+        console_write(" first 0x");
+        console_write_hex64(scan_first_va);
+        console_write(" pte=0x");
+        console_write_hex64(scan_first_pte);
+        console_write("\n");
+        vma_trace_dump_addr(scan_first_va);
+        vma_trace_dump(new_start, new_start + len);
+        console_write("mremap: destination 0x");
+        console_write_hex64(new_start);
+        console_write(" arrived holding ");
+        console_write_dec(cleared);
+        console_write(" page(s) left by a previous mapping");
+        /* Whose pages they are decides what this is.
+         *
+         * The destination came from the allocator moments ago, so nothing of
+         * this process should cover it. If a live mapping does — one other
+         * than the fresh one being moved into — then the allocator handed out
+         * an address that was already taken, and the pages just freed belonged
+         * to a mapping that is still in use. That is a different fault from
+         * leftovers of a mapping that is already gone, and only one of the two
+         * corrupts a running program. */
+        {
+          struct task *t = current_task;
+          struct vm_area *owner = 0;
+
+          if (t) {
+            for (struct vm_area *v = t->vma_list; v; v = v->next) {
+              if (v->start < new_start + len && v->end > new_start &&
+                  v->start != new_start) {
+                owner = v;
+                break;
+              }
+            }
+          }
+          if (owner) {
+            console_write("; a LIVE mapping 0x");
+            console_write_hex64(owner->start);
+            console_write("-0x");
+            console_write_hex64(owner->end);
+            console_write(" still covers it");
+          } else {
+            console_write("; no live mapping covers it");
+          }
+        }
+        console_write("\n");
+      }
+    }
+  }
+
+  vma_trace_record("move-src", old_start, old_start + len);
+  vma_trace_record("move-dst", new_start, new_start + len);
 
   for (u64 base = 0; base < len; base += block) {
     u64 span = len - base;
@@ -1782,16 +2116,42 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
      * take would otherwise loop here forever with nothing on the console;
      * after a few attempts the fault goes down the ordinary path, which either
      * services it or reports it. */
-    static u64 spurious_va;
-    static unsigned spurious_repeat;
+    /* Retry, and keep retrying: a fault the leaf permits is not an access
+     * error, whatever the CPU thought it had cached.
+     *
+     * The budget that used to bound this lived in file-scope statics shared by
+     * every core, so one CPU's attempts were charged to another CPU's address.
+     * It ran out on unrelated faults and the fault was then handed to the
+     * ordinary path, which delivered SIGSEGV for a write to a page whose own
+     * entry said writable — a fork/exec workload lost a thread to it about
+     * every fourth run on six cores. Per-CPU accounting is what makes the
+     * count mean anything. It stays bounded so a genuine fault still reaches
+     * the signal that reports it, and every sixty-fourth attempt on the same
+     * address reloads CR3, which drops every non-global translation this CPU
+     * holds. */
+    struct percpu *pf_pcpu = get_percpu();
+    static u64 spurious_va_cpu[MAX_CPUS];
+    static unsigned spurious_repeat_cpu[MAX_CPUS];
+    unsigned pf_cpu = pf_pcpu ? (unsigned)pf_pcpu->cpu_id : 0u;
     static u64 spurious_count;
 
+    if (pf_cpu >= MAX_CPUS)
+      pf_cpu = 0;
     if (stale) {
-      if (page_aligned == spurious_va && ++spurious_repeat > 4) {
-        stale = 0;
-      } else if (page_aligned != spurious_va) {
-        spurious_va = page_aligned;
-        spurious_repeat = 1;
+      if (page_aligned == spurious_va_cpu[pf_cpu]) {
+        unsigned n = ++spurious_repeat_cpu[pf_cpu];
+
+        if ((n % 64u) == 0u) {
+          u64 cr3;
+
+          __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+          __asm__ volatile("movq %0, %%cr3" : : "r"(cr3) : "memory");
+        }
+        if (n > 256u)
+          stale = 0; /* not a translation of ours: let the ordinary path decide */
+      } else {
+        spurious_va_cpu[pf_cpu] = page_aligned;
+        spurious_repeat_cpu[pf_cpu] = 1;
       }
     }
     if (stale) {
@@ -1845,8 +2205,18 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
      * the mapping at the single shared read-only zero page instead of
      * allocating a frame. The first store faults into the COW path and
      * materialises a private frame (served from the pre-zeroed pool — no
-     * memset). Capacity win: brk/mmap regions stay unbacked until written. */
-    u64 zero_pg = pmm_zero_page();
+     * memset). Capacity win: brk/mmap regions stay unbacked until written.
+     *
+     * Not when the access that faulted is itself a store.
+     *
+     * The dedup pays off for pages that are mapped and then read, or never
+     * touched at all. For a page whose first access is a write — which is
+     * every buffer an allocator hands out and immediately fills — it costs two
+     * faults instead of one: the first installs the shared page read-only, the
+     * store faults again, and the copy path allocates the frame that could
+     * have been installed straight away. Measured on a heap-churn run: 2.3 s
+     * of work took 5 s. A write fault gets its own frame here. */
+    u64 zero_pg = (error_code & PF_WRITE) ? 0 : pmm_zero_page();
     if (zero_pg) {
       u64 cflags;
       vmm_write_acquire(&cflags);
@@ -1886,6 +2256,9 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       vmm_write_release(cflags);
       /* Not registered in the eviction ring: one shared frame, read-only, and
        * swap must never evict a frame mapped in many address spaces. */
+      if (vma_trace_faults_enabled())
+        vma_trace_record(anon_vma ? "pf-zero(vma)" : "pf-zero(NO VMA)",
+                         page_aligned, page_aligned + PAGE_SIZE);
       return 0;
     }
     // Prepare a zeroed frame OUTSIDE the lock (alloc may run reclaim/swap).
@@ -1923,6 +2296,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
                         VMM_PRESENT | VMM_WRITABLE | VMM_USER);
     vmm_write_release(cflags);
     eviction_register_page(current_task, page_aligned, frame);
+
     return 0;
   }
 
@@ -1972,7 +2346,13 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       }
       va = va->next;
     }
-    if (anon_page && pmm_zero_page()) {
+    /* Not for a store. See the note on the same decision in the no-leaf path
+     * above: a page whose first access is a write pays two faults for the
+     * shared zero page and then allocates the frame anyway, and an allocator
+     * filling the block it has just been handed does exactly that for every
+     * page of it. Fall through to the allocate-and-map path below, which
+     * serves the store in one fault. */
+    if (anon_page && !(error_code & PF_WRITE) && pmm_zero_page()) {
       u64 cflags;
       vmm_write_acquire(&cflags);
       u64 *slot = pf_leaf_pte_ptr(page_aligned);
@@ -1994,6 +2374,8 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
         zflags |= VMM_USER;
       if (*slot & VMM_NO_EXECUTE) zflags |= VMM_NO_EXECUTE;
       *slot = pmm_zero_page() | zflags;
+      if (vma_trace_faults_enabled())
+        vma_trace_record("pf-lazy-zero", page_aligned, page_aligned + PAGE_SIZE);
       invalidate_page(page_aligned);
       vmm_write_release(cflags);
       /* Shared frame: never registered in the eviction ring (swap must not
@@ -2210,6 +2592,8 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       flags |= VMM_COW;
     }
     *slot = frame | flags;
+    if (vma_trace_faults_enabled())
+      vma_trace_record("pf-file/anon", page_aligned, page_aligned + PAGE_SIZE);
     invalidate_page(page_aligned);
     vmm_write_release(cflags);
     /* Shared page-cache frames are owned by the cache and mapped in several
@@ -2293,6 +2677,8 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     if (*slot & VMM_USER) flags |= VMM_USER;
     if (*slot & VMM_NO_EXECUTE) flags |= VMM_NO_EXECUTE;
     *slot = new_frame | flags;
+    if (vma_trace_faults_enabled())
+      vma_trace_record("pf-cow-a", page_aligned, page_aligned + PAGE_SIZE);
     invalidate_page(page_aligned);
     vmm_write_release(cflags);
     eviction_register_page(current_task, page_aligned, new_frame);
@@ -2347,6 +2733,10 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
        * has a permanent reservation). */
       addrspace_note_replaced(*slot);
       *slot = new_frame | new_flags;
+    if (vma_trace_faults_enabled())
+      vma_trace_record("pf-cow-d", page_aligned, page_aligned + PAGE_SIZE);
+      if (vma_trace_faults_enabled())
+        vma_trace_record("pf-cow-b", page_aligned, page_aligned + PAGE_SIZE);
       invalidate_page(page_aligned);
       vmm_write_release(cflags);
       cow_publish_page(page_aligned);
@@ -2358,6 +2748,8 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       // Sole owner now — just flip to writable in place, no copy needed.
       addrspace_note_replaced(*slot);
       *slot = old_frame | new_flags;
+      if (vma_trace_faults_enabled())
+        vma_trace_record("pf-cow-c", page_aligned, page_aligned + PAGE_SIZE);
       invalidate_page(page_aligned);
       vmm_write_release(cflags);
       pmm_free_frame(new_frame); // didn't need the spare
@@ -2379,6 +2771,76 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     eviction_unregister_page(old_frame);
     eviction_register_page(current_task, page_aligned, new_frame);
     return 0;
+  }
+
+  /* Nothing above claimed this fault — usually a wild access, but not always.
+   *
+   * Threads share an address space, and a sibling on another CPU may resolve
+   * the very page this fault was taken on (a copy-on-write break, an mprotect)
+   * between the moment the CPU raised the fault and the moment this handler
+   * read the tables. Every case above then declines it: the leaf no longer
+   * says copy-on-write, is no longer lazy and is no longer swapped, because it
+   * is simply present and writable. Falling off the end of this function kills
+   * the thread for writing to memory it is entitled to write to — which is how
+   * a compositor's thread came to die at error 0x7 on a page whose entry, in
+   * the very report that announced its death, read present, writable and user.
+   *
+   * If the live entry permits what faulted, the honest answer is to run the
+   * instruction again — always, not a few times.
+   *
+   * The count that used to bound this lived in file-scope statics shared by
+   * every core, so one CPU's retries were charged to another CPU's address:
+   * with several threads faulting at once the allowance was spent on faults
+   * that had nothing to do with each other, and the next thread to be forgiven
+   * nothing died. That is the SIGSEGV above, and it killed a fork/exec
+   * workload about one run in four on six cores. Per-CPU, the count means
+   * something. It stays bounded, because a fault that really is the program's
+   * own must still reach the signal that reports it — a test that provokes one
+   * and waits for SIGSEGV would otherwise wait forever — but the bound is now
+   * per-CPU and generous, and every eighth attempt on the same address reloads
+   * CR3, which drops every non-global translation this CPU holds. */
+  {
+    struct percpu *rs_pcpu = get_percpu();
+    static u64 resolved_va_cpu[MAX_CPUS];
+    static unsigned resolved_repeat_cpu[MAX_CPUS];
+    unsigned rs_cpu = rs_pcpu ? (unsigned)rs_pcpu->cpu_id : 0u;
+
+    if (rs_cpu >= MAX_CPUS)
+      rs_cpu = 0;
+    u64 *resolved_va = &resolved_va_cpu[rs_cpu];
+    unsigned *resolved_repeat = &resolved_repeat_cpu[rs_cpu];
+    u64 rf;
+    u64 live = 0;
+
+    vmm_read_acquire(&rf);
+    {
+      u64 *now = pf_leaf_pte_ptr(page_aligned);
+
+      if (now)
+        live = *now;
+    }
+    vmm_read_release(rf);
+
+    if ((live & VMM_PRESENT) &&
+        (!(error_code & PF_WRITE) || (live & VMM_WRITABLE)) &&
+        (!(error_code & PF_USER) || (live & VMM_USER))) {
+      if (page_aligned != *resolved_va) {
+        *resolved_va = page_aligned;
+        *resolved_repeat = 0;
+      }
+      if ((++*resolved_repeat % 8u) == 0u) {
+        u64 cr3;
+
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+        __asm__ volatile("movq %0, %%cr3" : : "r"(cr3) : "memory");
+      }
+      if (*resolved_repeat <= 64) {
+        if (*resolved_repeat <= 8)
+          fault_note(1, live, "another CPU resolved this entry; retrying");
+        invalidate_page(page_aligned);
+        return 0;
+      }
+    }
   }
 
   return -1; // Unhandled
@@ -3079,4 +3541,212 @@ void paging_swap_in_all_swapped(u64 pml4_phys) {
   }
   u64 *pml4 = (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE);
   swap_in_recursive(pml4, 0, 0, pml4_phys);
+}
+
+/* Is any physical frame in this address space reachable through two mappings
+ * that should have nothing to do with each other?
+ *
+ * The compositor died twice with a wl_list link holding 0xff242424ff242424 —
+ * two pixels of the terminal's background colour, sitting in a heap object
+ * several megabytes away from any buffer. Pixels written by one process
+ * appearing inside another's heap means one physical page is reachable from
+ * both, and no amount of reading the allocator says which page or which
+ * mapping. This finds it: every frame under a shared mapping goes into a set,
+ * then every frame under a private one is looked up in it. A hit prints both
+ * virtual addresses and both mappings, which names the two owners.
+ *
+ * Only from the crash path, and only when b1nix.frame-alias asks: it walks the
+ * whole address space and allocates a table proportional to the shared part.
+ */
+#define VMM_ALIAS_MAX_SHARED (1u << 16) /* 65536 pages = 256 MiB of sharing */
+
+void vmm_report_frame_aliases(struct task *t) {
+  if (!t || !t->pml4_phys || !t->vma_list)
+    return;
+
+  usize shared_pages = 0;
+  for (struct vm_area *v = t->vma_list; v; v = v->next)
+    if (v->flags & MAP_SHARED)
+      shared_pages += (usize)((v->end - v->start) / PAGE_SIZE);
+
+  if (shared_pages == 0)
+    return;
+  if (shared_pages > VMM_ALIAS_MAX_SHARED) {
+    console_write("frame-alias: too much shared mapping to scan (");
+    console_write_dec(shared_pages);
+    console_write(" pages)\n");
+    return;
+  }
+
+  /* Open-addressed set, power of two, half full at worst. 0 means empty, so a
+   * frame of 0 (which is never handed to userspace) needs no special case. */
+  usize slots = 1;
+  while (slots < shared_pages * 2)
+    slots <<= 1;
+  u64 *set = kzalloc(slots * sizeof(u64));
+  u64 *addr = kzalloc(slots * sizeof(u64));
+  if (!set || !addr) {
+    if (set)
+      kfree(set);
+    if (addr)
+      kfree(addr);
+    console_write("frame-alias: no memory for the scan\n");
+    return;
+  }
+
+  usize mask = slots - 1;
+  for (struct vm_area *v = t->vma_list; v; v = v->next) {
+    if (!(v->flags & MAP_SHARED))
+      continue;
+    for (u64 va = v->start; va < v->end; va += PAGE_SIZE) {
+      u64 f = paging_user_frame(t->pml4_phys, va);
+      if (!f)
+        continue;
+      usize i = (usize)((f >> 12) * 0x9E3779B97F4A7C15ull >> 40) & mask;
+      while (set[i] && set[i] != f)
+        i = (i + 1) & mask;
+      set[i] = f;
+      addr[i] = va;
+    }
+  }
+
+  unsigned found = 0;
+  for (struct vm_area *v = t->vma_list; v && found < 8; v = v->next) {
+    if (v->flags & MAP_SHARED)
+      continue;
+    for (u64 va = v->start; va < v->end && found < 8; va += PAGE_SIZE) {
+      u64 f = paging_user_frame(t->pml4_phys, va);
+      if (!f)
+        continue;
+      usize i = (usize)((f >> 12) * 0x9E3779B97F4A7C15ull >> 40) & mask;
+      while (set[i] && set[i] != f)
+        i = (i + 1) & mask;
+      if (set[i] != f)
+        continue;
+      found++;
+      console_write("frame-alias: frame 0x");
+      console_write_hex64(f);
+      console_write(" is mapped BOTH at 0x");
+      console_write_hex64(va);
+      console_write(" (private, ");
+      console_write(v->node && v->node->name[0] ? v->node->name : "<anonymous>");
+      console_write(") and at 0x");
+      console_write_hex64(addr[i]);
+      console_write(" (shared)\n");
+    }
+  }
+  if (!found)
+    console_write("frame-alias: no frame in this address space is reachable "
+                  "from two of its own mappings\n");
+
+  /* And the same question across processes.
+   *
+   * The pixels that landed in the compositor's heap were written by the
+   * terminal, in another address space entirely — so a frame reachable twice
+   * within one process was never going to find it. This rebuilds the set from
+   * the faulting task's PRIVATE pages and asks every other task whether it
+   * maps any of them. A private anonymous page of one process is nobody
+   * else's business; a hit is the allocator handing one frame to two owners,
+   * which is exactly the fault being hunted. */
+  for (usize i = 0; i < slots; i++) {
+    set[i] = 0;
+    addr[i] = 0;
+  }
+  /* Anonymous only. A private mapping of a FILE legitimately shares the page
+   * cache's frames with every other reader until someone writes — the first
+   * version of this scan reported nine hundred such pages of libcairo and said
+   * nothing at all. Anonymous memory has no such excuse: it belongs to one
+   * address space, and a second mapper of it is the bug. */
+  usize private_pages = 0;
+  for (struct vm_area *v = t->vma_list; v; v = v->next)
+    if (!(v->flags & MAP_SHARED) && !v->node)
+      private_pages += (usize)((v->end - v->start) / PAGE_SIZE);
+
+  if (private_pages == 0 || private_pages > VMM_ALIAS_MAX_SHARED) {
+    console_write("frame-alias: private set too large to scan (");
+    console_write_dec(private_pages);
+    console_write(" pages)\n");
+    kfree(set);
+    kfree(addr);
+    return;
+  }
+  if (private_pages * 2 > slots) {
+    kfree(set);
+    kfree(addr);
+    slots = 1;
+    while (slots < private_pages * 2)
+      slots <<= 1;
+    set = kzalloc(slots * sizeof(u64));
+    addr = kzalloc(slots * sizeof(u64));
+    if (!set || !addr) {
+      if (set)
+        kfree(set);
+      if (addr)
+        kfree(addr);
+      console_write("frame-alias: no memory for the cross-process scan\n");
+      return;
+    }
+    mask = slots - 1;
+  }
+
+  for (struct vm_area *v = t->vma_list; v; v = v->next) {
+    if ((v->flags & MAP_SHARED) || v->node)
+      continue;
+    for (u64 va = v->start; va < v->end; va += PAGE_SIZE) {
+      u64 f = paging_user_frame(t->pml4_phys, va);
+      if (!f || f == pmm_zero_page())
+        continue;
+      usize i = (usize)((f >> 12) * 0x9E3779B97F4A7C15ull >> 40) & mask;
+      while (set[i] && set[i] != f)
+        i = (i + 1) & mask;
+      set[i] = f;
+      addr[i] = va;
+    }
+  }
+
+  unsigned cross = 0;
+  for (usize ti = 0; ti < scheduler_task_slots() && cross < 8; ti++) {
+    struct task *o = scheduler_task_slot(ti);
+
+    if (!o || o == t || !o->pml4_phys || !o->vma_list)
+      continue;
+    /* Threads of the same process share the tables — sharing there is the
+     * point, not a fault. */
+    if (o->pml4_phys == t->pml4_phys)
+      continue;
+    for (struct vm_area *v = o->vma_list; v && cross < 8; v = v->next) {
+      for (u64 va = v->start; va < v->end && cross < 8; va += PAGE_SIZE) {
+        u64 f = paging_user_frame(o->pml4_phys, va);
+
+        if (!f || f == pmm_zero_page())
+          continue;
+        usize i = (usize)((f >> 12) * 0x9E3779B97F4A7C15ull >> 40) & mask;
+        while (set[i] && set[i] != f)
+          i = (i + 1) & mask;
+        if (set[i] != f)
+          continue;
+        cross++;
+        console_write("frame-alias: frame 0x");
+        console_write_hex64(f);
+        console_write(" is PRIVATE here at 0x");
+        console_write_hex64(addr[i]);
+        console_write(" and also mapped by pid ");
+        console_write_dec(o->id);
+        console_write(" (");
+        console_write(o->name);
+        console_write(") at 0x");
+        console_write_hex64(va);
+        console_write(" in ");
+        console_write(v->node && v->node->name[0] ? v->node->name
+                                                  : "<anonymous>");
+        console_write("\n");
+      }
+    }
+  }
+  if (!cross)
+    console_write("frame-alias: no private frame of this task is mapped by "
+                  "another process\n");
+
+  kfree(set);
+  kfree(addr);
 }

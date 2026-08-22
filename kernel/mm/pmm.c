@@ -114,7 +114,7 @@ static void kswapd_thread(void *arg) {
     }
     /* Sleep until an allocation wakes us on low free, or 500 ms elapses
      * (TIMER_HZ=100 -> 50 ticks) so slow growth is still trimmed. */
-    scheduler_block_on_timeout(&kswapd_chan, 50);
+    scheduler_block_on_timeout(&kswapd_chan, SCHED_MS_TO_TICKS(500));
   }
 }
 
@@ -1366,6 +1366,27 @@ void pmm_free_frame(u64 frame) {
         }
         console_write("\n");
         pmm_report_frame_free_site(frame);
+        /* Is it still mapped? A frame that is parked in a bucket and also
+         * reachable from a live address space is the whole diagnosis: the
+         * allocator will hand it out while somebody is still writing to it. */
+        if (current_task && current_task->pml4_phys && current_task->vma_list) {
+          extern u64 paging_user_frame(u64 pml4_phys, u64 vaddr);
+          unsigned found = 0;
+
+          for (struct vm_area *v = current_task->vma_list; v && found < 4;
+               v = v->next) {
+            for (u64 va = v->start; va < v->end && found < 4; va += PAGE_SIZE) {
+              if (paging_user_frame(current_task->pml4_phys, va) != frame)
+                continue;
+              found++;
+              console_write("  still mapped at 0x");
+              console_write_hex64(va);
+              console_write(v->node ? " (file-backed)\n" : " (anonymous)\n");
+            }
+          }
+          if (!found)
+            console_write("  not mapped anywhere in this task\n");
+        }
         console_lock_release_irqrestore(cflags);
         klog_warn("pmm_free_frame: double free (page already parked in a bucket)");
       }
@@ -1554,17 +1575,31 @@ static void zero_frames(u64 frame, usize count) {
  * bitmap words. Returns the run's base frame (claimed + zeroed), or 0. Used for
  * contiguous (count>1) requests and as the count==1 fallback before the free
  * list is built. Caller holds pmm_lock. */
-static u64 bitmap_scan_alloc(usize count) {
-  usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
-  if (count == 0 || count > frame_count) {
-    return 0;
-  }
+/* Where the last scan stopped.
+ *
+ * The scan used to begin at frame zero every time. The low frames are the ones
+ * the kernel and the boot modules hold, so every allocation re-walked the whole
+ * occupied head of the bitmap before reaching anything free — and the walk gets
+ * LONGER as the machine gets more memory. Filling one GEM object of a few
+ * thousand pages therefore cost seconds, which is what made an i915 submission
+ * take two of them (four, with six gigabytes of RAM) and a compositor's frames
+ * arrive late enough to look like a hang.
+ *
+ * A rotating cursor makes bulk allocation amortised constant: each call starts
+ * where the last one left off and wraps once. It is a hint, not state anything
+ * depends on — a stale value only costs one extra pass. */
+static usize g_scan_cursor;
 
+/* Scan [lo, hi) for `count` contiguous free frames; 0 if there is no such run.
+ * A run never spans the ends of the window, which is what lets the caller use
+ * two windows to implement the wrap. */
+static u64 bitmap_scan_window(usize lo, usize hi, usize count) {
   const u64 *words = (const u64 *)pmm.bitmap;
+  usize frame_count = hi;
   usize run = 0;
   usize run_start = 0;
 
-  for (usize idx = 0; idx < frame_count;) {
+  for (usize idx = lo; idx < frame_count;) {
     if ((idx % 64) == 0 && idx + 64 <= frame_count && words[idx / 64] == ~0ULL) {
       run = 0;
       idx += 64;
@@ -1605,6 +1640,7 @@ static u64 bitmap_scan_alloc(usize count) {
         u64 frame = frame_from_index(run_start);
         pmm_check_handout(frame);
       zero_frames(frame, count);
+        g_scan_cursor = run_start + count;
         return frame;
       }
     } else {
@@ -1613,6 +1649,32 @@ static u64 bitmap_scan_alloc(usize count) {
     idx++;
   }
   return 0;
+}
+
+static u64 bitmap_scan_alloc(usize count) {
+  usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
+  usize start;
+  u64 frame;
+
+  if (count == 0 || count > frame_count)
+    return 0;
+
+  start = g_scan_cursor;
+  if (start >= frame_count)
+    start = 0;
+
+  /* From the cursor to the end, then from the beginning to the cursor. Two
+   * windows rather than one wrapping walk: a run that straddles the wrap is
+   * not worth the bookkeeping, and losing it costs at most one allocation. */
+  frame = bitmap_scan_window(start, frame_count, count);
+  if (frame)
+    return frame;
+  if (start == 0)
+    return 0;
+  frame = bitmap_scan_window(0, start, count);
+  if (!frame)
+    g_scan_cursor = 0;
+  return frame;
 }
 
 /* Global pressure tracker. Per-call retry counters are blind to the real
@@ -1848,6 +1910,27 @@ u64 pmm_alloc_frames(usize count) {
       if (ce > 0)
         continue;
       return 0;
+    }
+    /* Clean pages first, always.
+     *
+     * A burst of allocation — a compositor filling a few GEM objects, say —
+     * outruns kswapd's background trimming, and the allocation then reclaims
+     * for itself. Going straight to full eviction makes that allocation wait
+     * for dirty pages to reach the disk: an i915 submission took over two
+     * seconds this way, and the driver, concluding the GPU was wedged, evicted
+     * its whole address space and returned -ENOSPC. Clean cache is almost
+     * always there (a read-mostly root filesystem is nearly all of it) and
+     * costs nothing to drop, so take that first and only write back if it was
+     * not enough. */
+    {
+      usize clean_first = page_cache_evict_clean(reclaim_target);
+
+      if (clean_first >= reclaim_target) {
+        pmm_clean_alloc_streak = 0;
+        continue;
+      }
+      if (clean_first)
+        reclaim_target -= clean_first;
     }
     /* Top-level reclaim: full eviction (writes dirty pages back). Run it inside
      * the reclaim context so a nested alloc takes the clean-only path above. */

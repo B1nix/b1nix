@@ -6,6 +6,9 @@
 #include <b1nix/sched.h>
 #include <string.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/klog.h>
+#include <b1nix/lapic.h>
+#include <b1nix/arch.h>
 
 /* Hash width, derived at init rather than compiled in.
  *
@@ -43,7 +46,16 @@ static struct page_cache_entry *lru_head;       /* inactive (oldest at head) */
 static struct page_cache_entry *lru_tail;
 static struct page_cache_entry *active_head;     /* active (oldest at head) */
 static struct page_cache_entry *active_tail;
-static volatile int pc_lock = 0;
+/* A queue, not a scramble — the same change the console lock needed.
+ *
+ * This is the busiest global lock in the kernel: every read, every write and
+ * every eviction passes through it. As a test-and-set lock it has no order, so
+ * a CPU can lose the exchange indefinitely while others keep re-taking it. The
+ * console lock proved that is not theoretical here — it starved until the
+ * kernel's own lockup detector fired on a lock whose value was zero. `next` is
+ * the ticket drawn on arrival, `owner` is whose turn it is. */
+static volatile u32 pc_lock_next;
+static volatile u32 pc_lock_owner;
 
 /* Refault ring: keys (ino,offset) of pages evicted recently. If a page is
  * re-added soon after eviction it was wrongly evicted (working set bigger than
@@ -95,30 +107,153 @@ static void m26_diag_task(void) {
  */
 static volatile int *pc_bucket;
 
-static void lock_bucket(u32 h) {
+/* Interrupts off while a bucket is held, for the same reason the cache-wide
+ * lock masks them.
+ *
+ * The lookup path takes a bucket with interrupts enabled, so its holder could
+ * be preempted mid-chain — and a CPU that holds pc_lock (masked) then waits on
+ * that same bucket forever, while every other CPU waits on pc_lock behind it.
+ * Nothing can run the preempted holder, because nothing is left to run it on.
+ * The section is a few pointer reads; masking costs nothing and removes the
+ * only way it can be interrupted. */
+static u64 lock_bucket(u32 h) {
   extern void tlb_shootdown_poll(void);
 
+  /* Preemption off, interrupts on.
+   *
+   * The holder must not be descheduled — a CPU inside the cache-wide lock can
+   * be waiting for this bucket, and nothing would be left to run the holder.
+   * Masking interrupts would do it too, but this section sits on the lookup
+   * path of every read in the system, and the machine still needs its timer. */
+  scheduler_preempt_disable();
   while (__sync_lock_test_and_set(&pc_bucket[h], 1)) {
     while (pc_bucket[h]) {
       __asm__ volatile("pause");
       tlb_shootdown_poll();
     }
   }
+  return 0;
 }
 
-static void unlock_bucket(u32 h) { __sync_lock_release(&pc_bucket[h]); }
+static void unlock_bucket(u32 h, u64 flags) {
+  (void)flags;
+  __sync_lock_release(&pc_bucket[h]);
+  scheduler_preempt_enable();
+}
+
+/* Who holds pc_lock, so a wedge can name its owner instead of being guessed at.
+ *
+ * Three runs of a browser under a compositor ended with every CPU spinning
+ * here and the console silent — a hard wedge that looks, from outside, exactly
+ * like a slow machine. Nothing in the dump said which call had taken the lock
+ * and not given it back, so the search was a reading of the source rather than
+ * a measurement. These three words cost one store per acquire and turn the
+ * next occurrence into an address. */
+static volatile u64 pc_lock_owner_ra;
+static volatile u64 pc_lock_owner_task;
+static volatile int pc_lock_owner_cpu = -1;
+/* Set by a waiter that has spun past the threshold, read by the task dump. */
+static volatile u64 pc_lock_stuck_waiter_ra;
+static volatile u32 pc_lock_stuck_count;
+
+/* Spins before a waiter says so. At a few nanoseconds an iteration this is
+ * some seconds of real contention — far longer than any legitimate hold of
+ * this lock, which never blocks and never does I/O. */
+#define PC_LOCK_STUCK_SPINS 400000000ull
+
+/* Deliberately silent.
+ *
+ * The first version of this printed the holder from inside the spin loop, and
+ * that made the wedge worse rather than visible: console_write takes the
+ * console lock with interrupts masked, so a waiter that started reporting
+ * could no longer be preempted, and it joined a second queue while still in
+ * the first. The record below is enough — pc_lock_owner_ra and
+ * pc_lock_owner_task are ordinary variables, readable from a debugger or a
+ * monitor on a machine that has stopped, and that is exactly when they are
+ * wanted. The task dump prints them from a context that may safely print. */
+static void pc_lock_report_stuck(const char *what, u64 waiter_ra) {
+  (void)what;
+  pc_lock_stuck_waiter_ra = waiter_ra;
+  __atomic_add_fetch(&pc_lock_stuck_count, 1u, __ATOMIC_RELAXED);
+}
+
+/* What the page-cache lock is doing, for the task dump.
+ *
+ * A machine whose CPUs are all spinning here says nothing about why. These
+ * three numbers do: whether the lock is held at all, which call took it, and
+ * which task that was. Printed from the watchdog's dump, never from the spin
+ * loop. */
+void page_cache_dump_lock(void) {
+  u32 next = __atomic_load_n(&pc_lock_next, __ATOMIC_ACQUIRE);
+  u32 owner = __atomic_load_n(&pc_lock_owner, __ATOMIC_ACQUIRE);
+
+  console_write("pc_lock: ");
+  if (next == owner) {
+    console_write("free\n");
+    return;
+  }
+  console_write("held, ");
+  console_write_dec((u64)(next - owner - 1));
+  console_write(" waiting, taken at 0x");
+  console_write_hex64(pc_lock_owner_ra);
+  ksym_print(pc_lock_owner_ra);
+  console_write(" by task ");
+  console_write_dec(pc_lock_owner_task);
+  console_write(" on cpu ");
+  console_write_dec((u64)(unsigned)pc_lock_owner_cpu);
+  if (pc_lock_stuck_count) {
+    console_write(", a waiter gave up at 0x");
+    console_write_hex64(pc_lock_stuck_waiter_ra);
+    ksym_print(pc_lock_stuck_waiter_ra);
+  }
+  console_write("\n");
+}
+
+static void pc_lock_took(u64 ra) {
+  pc_lock_owner_ra = ra;
+  pc_lock_owner_cpu = (int)percpu_read(cpu_id);
+  pc_lock_owner_task = current_task ? current_task->id : 0;
+}
 
 static void lock_pc(void) {
   extern void tlb_shootdown_poll(void);
-  while (__sync_lock_test_and_set(&pc_lock, 1)) {
-    /* Drain TLB shootdowns while spinning — a waiter that entered with IRQs
-     * disabled otherwise can't ACK the initiator's IPI (deadlock). */
-    while (pc_lock) { __asm__ volatile("pause"); tlb_shootdown_poll(); }
+  u64 spins = 0;
+  u64 ra = (u64)(usize)__builtin_return_address(0);
+  /* Preemption off BEFORE the ticket is drawn, and kept off until the release.
+   *
+   * A ticket lock hands the turn to one particular waiter. If that waiter can
+   * be descheduled while it spins, its turn comes up while it is off-CPU and
+   * everybody behind it waits for a task no CPU is running — which is how
+   * three runs died with "pc_lock: held, 7 waiting" repeated every thirty
+   * seconds and the holder's record already cleared.
+   *
+   * Preemption, not interrupts. Masking interrupts also stops the handoff, and
+   * it was the first thing tried, but the sections under this lock include
+   * walks of the whole cache — a hundred thousand entries on a large guest —
+   * and running those with the timer off starves everything the machine does
+   * on a clock. The browser went from printing its document in ninety seconds
+   * to not printing it in seven hundred. Nothing here sleeps, so keeping the
+   * task on its CPU is all that is required. */
+  scheduler_preempt_disable();
+  u32 me = __atomic_fetch_add(&pc_lock_next, 1u, __ATOMIC_SEQ_CST);
+
+  while (__atomic_load_n(&pc_lock_owner, __ATOMIC_ACQUIRE) != me) {
+    /* Drain TLB shootdowns while spinning — a waiter with interrupts masked
+     * cannot ACK the initiator's IPI, and the initiator waits masked too. */
+    __asm__ volatile("pause");
+    tlb_shootdown_poll();
+    if (++spins == PC_LOCK_STUCK_SPINS)
+      pc_lock_report_stuck("lock_pc", ra);
   }
+  pc_lock_took(ra);
 }
 
 static void unlock_pc(void) {
-  __sync_lock_release(&pc_lock);
+  pc_lock_owner_ra = 0;
+  pc_lock_owner_cpu = -1;
+  pc_lock_owner_task = 0;
+  __atomic_add_fetch(&pc_lock_owner, 1u, __ATOMIC_RELEASE);
+  scheduler_preempt_enable();
 }
 
 static void page_cache_process_deferred_free(void) {
@@ -249,7 +384,8 @@ void page_cache_init(void) {
   active_head = active_tail = 0;
   pc_refault_w = 0;
   for (u32 i = 0; i < PC_REFAULT_N; i++) { pc_refault[i].ino = 0; pc_refault[i].offset = 0; }
-  pc_lock = 0;
+  pc_lock_next = 0;
+  pc_lock_owner = 0;
 }
 
 /* How many cached pages are dirty right now. See page_cache_flush_inode. */
@@ -540,7 +676,7 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
   /* The lookup needs its chain, nothing else: the hit path no longer touches
    * the LRU lists (it sets PAGE_CACHE_REFERENCED instead), so the cache-wide
    * lock is not involved at all. */
-  lock_bucket(h);
+  u64 bflags_h = lock_bucket(h);
   struct page_cache_entry *curr = hash_table[h];
   while (curr) {
     /* Identity by (fs_id, ino), not the inode pointer — the inode slab pool
@@ -569,7 +705,7 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
             offset / PAGE_SIZE == r->next)
           r->next = offset / PAGE_SIZE + 1;
       }
-      unlock_bucket(h);
+      unlock_bucket(h, bflags_h);
       return curr;
     }
     curr = curr->hash_next;
@@ -606,7 +742,7 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
       r->win = 0;
     }
   }
-  unlock_bucket(h);
+  unlock_bucket(h, bflags_h);
 
   if (ra_pages)
     pc_readahead(inode, offset, ra_pages);
@@ -670,14 +806,14 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   /* Mutator order: the cache-wide lock first (the LRU lists below need it),
    * the bucket second, and the bucket only across the chain edit. */
   lock_pc();
-  lock_bucket(h);
+  u64 bflags_h = lock_bucket(h);
   // Check if it was added concurrently
   struct page_cache_entry *curr = hash_table[h];
   while (curr) {
     /* (fs_id, ino), not the inode pointer — see the matching comment in
      * page_cache_get_page. */
     if (pc_key_eq(curr, inode, offset)) {
-      unlock_bucket(h);
+      unlock_bucket(h, bflags_h);
       unlock_pc();
       kfree(new_entry);
       return -EEXIST;
@@ -690,7 +826,7 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   hash_table[h] = new_entry;
   if (inode)
     __atomic_add_fetch(&inode->cached_pages, 1, __ATOMIC_RELEASE);
-  unlock_bucket(h);
+  unlock_bucket(h, bflags_h);
 
   /* Refault: this page was evicted recently and is already back — the working
    * set is bigger than the inactive list, so seed it straight onto the active
@@ -795,17 +931,34 @@ int page_cache_flush_inode(struct vfs_inode *inode) {
   u64 want = __atomic_load_n(&inode->dirty_pages, __ATOMIC_ACQUIRE);
   u64 written = 0;
 
+  /* Restart the walk after every write, exactly as eviction does.
+   *
+   * writeback_page_locked gives pc_lock back while the filesystem writes, and
+   * in that window another CPU may evict the very entry this walk is standing
+   * on — so the `curr->lru_next` read after it returned followed a pointer out
+   * of a freed structure. Picking one page per pass and finding it from the
+   * head again is the same fix the eviction loop already carries, and it costs
+   * a list walk per dirty page of one inode, not per page in the machine.
+   * Bounded: writeback clears DIRTY, so no page is chosen twice. */
   lock_pc();
-  struct page_cache_entry *heads[2] = { lru_head, active_head };
-  for (int li = 0; li < 2 && written < want; li++) {
-    for (struct page_cache_entry *curr = heads[li]; curr;
-         curr = curr->lru_next) {
-      if (curr->inode == inode && (curr->flags & PAGE_CACHE_DIRTY)) {
-        writeback_page_locked(curr);
-        if (++written >= want)
+  while (written < want) {
+    struct page_cache_entry *flush = 0;
+    struct page_cache_entry *heads[2] = { lru_head, active_head };
+
+    for (int li = 0; li < 2 && !flush; li++) {
+      for (struct page_cache_entry *curr = heads[li]; curr;
+           curr = curr->lru_next) {
+        if (curr->inode == inode && (curr->flags & PAGE_CACHE_DIRTY) &&
+            !(inode->flags & VFS_NODE_MEMORY_BACKED)) {
+          flush = curr;
           break;
+        }
       }
     }
+    if (!flush)
+      break;
+    writeback_page_locked(flush);
+    written++;
   }
   unlock_pc();
   return 0;
@@ -828,7 +981,7 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
       struct page_cache_entry *next = curr->lru_next;
       if (curr->inode == inode) {
         u32 h = pc_hash(curr->inode, curr->offset);
-        lock_bucket(h);
+        u64 bflags_h = lock_bucket(h);
         struct page_cache_entry **prev = &hash_table[h];
         struct page_cache_entry *hcurr = *prev;
         while (hcurr) {
@@ -839,7 +992,7 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
           prev = &hcurr->hash_next;
           hcurr = hcurr->hash_next;
         }
-        unlock_bucket(h);
+        unlock_bucket(h, bflags_h);
         lru_remove(curr);
         if (curr->inode && curr->inode->cached_pages)
           __atomic_sub_fetch(&curr->inode->cached_pages, 1, __ATOMIC_RELEASE);
@@ -899,7 +1052,7 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
          * reader still holds a reference, neutralize in place instead. */
         if (curr->refcount == 0) {
           u32 h = pc_hash(curr->inode, curr->offset);
-          lock_bucket(h);
+          u64 bflags_h = lock_bucket(h);
           struct page_cache_entry **prev = &hash_table[h];
           struct page_cache_entry *hcurr = *prev;
           while (hcurr) {
@@ -910,7 +1063,7 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
             prev = &hcurr->hash_next;
             hcurr = hcurr->hash_next;
           }
-          unlock_bucket(h);
+          unlock_bucket(h, bflags_h);
           lru_remove(curr);
           pmm_free_frame(curr->frame);
           curr->inode = 0;
@@ -992,7 +1145,7 @@ usize page_cache_evict_clean(usize target_pages) {
       continue;
     }
     u32 h = pc_hash(victim->inode, victim->offset);
-    lock_bucket(h);
+    u64 bflags_h = lock_bucket(h);
     struct page_cache_entry **prev = &hash_table[h];
     struct page_cache_entry *hcurr = *prev;
     while (hcurr) {
@@ -1003,7 +1156,7 @@ usize page_cache_evict_clean(usize target_pages) {
       prev = &hcurr->hash_next;
       hcurr = hcurr->hash_next;
     }
-    unlock_bucket(h);
+    unlock_bucket(h, bflags_h);
     lru_remove(victim);
     pc_refault_record(victim->key_ino, victim->offset);
     pmm_free_frame(victim->frame);
@@ -1061,11 +1214,24 @@ usize page_cache_evict(usize target_pages) {
         continue;
       }
       if (curr->flags & PAGE_CACHE_DIRTY) {
-        if (curr->inode && curr->inode->write_cb) {
+        /* An in-memory file has nowhere to write back to: this cache is where
+         * its bytes live, and write_cb would copy the page into the inode's
+         * heap buffer so the same bytes are held twice -- asked for under
+         * memory pressure, which is the worst moment for a second copy. Such a
+         * page is unflushable in the same sense as one with no write_cb at
+         * all; it is reclaimable only by swapping.
+         *
+         * Skipped at SELECTION, not inside the writeback. Both loops here take
+         * "writeback clears DIRTY" as their termination argument, so a
+         * writeback that returns without clearing it hands the same page back
+         * on the next pass forever -- an endless reclaim loop holding pc_lock,
+         * which is what the first version of this did. */
+        if (curr->inode && curr->inode->write_cb &&
+            !(curr->inode->flags & VFS_NODE_MEMORY_BACKED)) {
           flush = curr; /* oldest flushable dirty page */
           break;
         }
-        dirty_skipped++; /* no write_cb — cannot reclaim, leave it in place */
+        dirty_skipped++; /* unflushable — cannot reclaim, leave it in place */
         curr = next;
         continue;
       }
@@ -1090,7 +1256,7 @@ usize page_cache_evict(usize target_pages) {
     /* Evict the clean victim: unlink from the hash chain + LRU, free its frame,
      * and defer the entry's kfree. */
     u32 h = pc_hash(victim->inode, victim->offset);
-    lock_bucket(h);
+    u64 bflags_h = lock_bucket(h);
     struct page_cache_entry **prev = &hash_table[h];
     struct page_cache_entry *hcurr = *prev;
     while (hcurr) {
@@ -1101,7 +1267,7 @@ usize page_cache_evict(usize target_pages) {
       prev = &hcurr->hash_next;
       hcurr = hcurr->hash_next;
     }
-    unlock_bucket(h);
+    unlock_bucket(h, bflags_h);
     lru_remove(victim);
     pc_refault_record(victim->key_ino, victim->offset);
     pmm_free_frame(victim->frame);
