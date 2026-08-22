@@ -115,6 +115,8 @@ static u16 g_sysring[MAX_TASKS][SYSRING_DEPTH];
 static u8 g_sysring_pos[MAX_TASKS];
 static void *g_task_xsave_raw[MAX_TASKS];
 
+
+
 static usize task_index(const struct task *task);
 
 /* Save/restore whichever representation this task uses. A task with an XSAVE
@@ -814,7 +816,7 @@ static usize task_index(const struct task *task) {
  * cur_task somewhere with stack_released==0 is therefore actively running (it
  * was woken BLOCKED->READY mid-flight and kept running) and will not publish
  * stack_released soon — the picker must not wait on it. */
-static int task_running_somewhere(struct task *t) {
+int task_running_somewhere(struct task *t) {
   for (int c = 0; c < g_max_cpus; c++) {
     struct percpu *pc = get_percpu_n(c);
     if (pc && (struct task *)pc->cur_task == t)
@@ -935,10 +937,25 @@ static struct task *pick_next_task(void) {
        * scheduler_yield's eventual state=RUNNING store. The same fix is
        * applied to the scan path below. Under M24b BKL the race couldn't
        * happen; T1+ depends on this. */
+      /* Never claim a task that is still some CPU's current task.
+       *
+       * stack_released stays set for the whole time a task runs — it is
+       * published when the task leaves a CPU and nothing takes it back when
+       * the task is resumed. A waker that CASes a live task BLOCKED->READY
+       * while it is executing its own block loop therefore leaves it looking
+       * exactly like a parked task with its stack handed over, and a second
+       * CPU loads its saved RSP and returns through a word that is now part of
+       * a live frame. The rip that results is a small integer — a system-call
+       * argument, executed. The per-CPU current-task pointers are what
+       * actually say who is running what. */
+      if (t != current_task && task_running_somewhere(t))
+        continue;
       enum task_state expected = TASK_READY;
       if (__atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING,
                                       0, __ATOMIC_ACQUIRE,
                                       __ATOMIC_RELAXED)) {
+        /* The stack is this CPU's again from here on. */
+        __atomic_store_n(&t->stack_released, 0, __ATOMIC_RELEASE);
         g_min_pass = g_task_pass[task_index(t)];
         return t;
       }
@@ -1007,8 +1024,11 @@ static struct task *pick_next_task(void) {
     /* If the wait bailed with stack_released still 0 (task running on another
      * CPU or re-blocked), do not claim it — its context isn't safe to load.
      * Treat as no-work; the next pick re-finds it once it has switched out. */
-    if (best_task == current_task ||
-        __atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE)) {
+    /* Same gate as the runqueue path: a task that is some CPU's current task
+     * is executing, whatever its state and lease say. */
+    if ((best_task == current_task ||
+         __atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE)) &&
+        (best_task == current_task || !task_running_somewhere(best_task))) {
       /* F5 (M28 #7): atomic claim — see global-rq comment above. If we lose
        * the CAS, return 0 (no work this iteration) and let the caller retry;
        * starting a fresh scan here can spin under contention without ever
@@ -1017,6 +1037,7 @@ static struct task *pick_next_task(void) {
       if (__atomic_compare_exchange_n(&best_task->state, &expected,
                                       TASK_RUNNING, 0, __ATOMIC_ACQUIRE,
                                       __ATOMIC_RELAXED)) {
+        __atomic_store_n(&best_task->stack_released, 0, __ATOMIC_RELEASE);
         g_min_pass = g_task_pass[task_index(best_task)];
         return best_task;
       }
@@ -1052,8 +1073,6 @@ static void wake_sleepers(void) {
         if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
                                         0, __ATOMIC_ACQUIRE,
                                         __ATOMIC_RELAXED)) {
-          T(i)->wake_tick = 0;
-          T(i)->wait_chan = 0;
           sched_rq_enqueue_current(T(i));
           woken++;
         }
@@ -2082,10 +2101,23 @@ u64 task_syscall_entry_rbp(const struct task *t) {
 /* Print " (module+offset)" for a userspace address, or nothing when it falls
  * outside every mapping. A bare address says little when everything is loaded
  * above 0x500000000000; the module name is the part that identifies a layer. */
+/* How far the dump will follow a VMA list before giving up on it.
+ *
+ * The dump reads live tasks with no lock — that is what makes it usable from a
+ * watchdog — so a list it walks may be edited or freed underneath it, and a
+ * `next` pointer into reused memory turns the walk into a loop that never
+ * ends. One run was lost exactly that way: the console stopped mid-entry and
+ * the machine spun at full load for eleven minutes with nothing to show for
+ * it. A bound cannot make the walk correct, but it does make it finish. No
+ * real process has thousands of mappings alive at once. */
+#define SCHED_DUMP_VMA_MAX 4096u
+
 static void sched_name_user_addr(struct task *t, u64 addr) {
   if (!t || !addr)
     return;
-  for (struct vm_area *v = t->vma_list; v; v = v->next) {
+  unsigned guard = 0;
+  for (struct vm_area *v = t->vma_list; v && guard < SCHED_DUMP_VMA_MAX;
+       v = v->next, guard++) {
     if (addr >= v->start && addr < v->end) {
       console_write(" (");
       console_write(v->node && v->node->name[0] ? v->node->name : "anon");
@@ -3201,6 +3233,61 @@ int scheduler_yield(void) {
    * outgoing task is touched any further. */
   sched_acct_on_switch(old_task);
 
+  /* Nobody else may be running it — and if somebody is, do not switch.
+   *
+   * The switcher resumes a task by loading its saved RSP and returning through
+   * the word it points at. That word is a return address only while the task
+   * really is suspended: one still running on another CPU has a context.rsp
+   * naming a slot that is part of a live frame, and the `ret` jumps to
+   * whatever it holds — the rip that results is a small integer, a system-call
+   * argument executed as code.
+   *
+   * The pickers gate on this too, but they read the per-CPU pointers before
+   * the winning CPU has published its own claim, so a narrow window survives
+   * them. This is the last point where the question can still be asked, and
+   * the answer costs one pass over the online CPUs. Declining to switch is
+   * always safe: the task goes back to READY and is picked again once its
+   * current CPU really lets go.
+   */
+  {
+    struct percpu *me = get_percpu();
+    int claimed_elsewhere = 0;
+
+    for (int c = 0; c < g_max_cpus; c++) {
+      struct percpu *pc = get_percpu_n(c);
+
+      if (!pc || pc == me || (struct task *)pc->cur_task != new_task)
+        continue;
+      claimed_elsewhere = 1;
+      break;
+    }
+    if (claimed_elsewhere) {
+      static unsigned reported;
+
+      if (reported < 8) {
+        reported++;
+        console_write("sched: declined to switch to pid ");
+        console_write_dec((u64)new_task->id);
+        console_write(" (");
+        console_write(new_task->name ? new_task->name : "(none)");
+        console_write("): still the current task of another cpu\n");
+      }
+      /* Hand it back rather than stranding it in RUNNING with no CPU. */
+      __atomic_store_n(&new_task->state, TASK_READY, __ATOMIC_RELEASE);
+      /* The outgoing task keeps running: this CPU simply did not switch. It
+       * was marked READY a moment ago and may have been enqueued; reclaim it
+       * the same way the nothing-runnable path above does, or a picker will
+       * chase a runqueue entry for a task that never left this CPU. */
+      if (old_task->state == TASK_READY) {
+        old_task->state = TASK_RUNNING;
+        sched_rq_remove_task(old_task);
+      } else {
+        old_task->state = TASK_RUNNING;
+      }
+      interrupts_enable();
+      return 0;
+    }
+  }
   new_task->state = TASK_RUNNING;
   current_task = new_task;
 
@@ -3262,6 +3349,7 @@ void scheduler_block_current(void) {
    * CPU is still mid-arch_context_switch on this very stack. yield's
    * RUNNING->READY arm only clears it when state==RUNNING, which is already
    * false here, so we must do it ourselves. */
+  current_task->wait_chan = 0;
   task_lease_clear(current_task, __func__);
   current_task->state = TASK_BLOCKED;
   scheduler_yield();
@@ -3284,8 +3372,6 @@ void scheduler_wake_task(usize task_id) {
     if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
                                     0, __ATOMIC_ACQUIRE,
                                     __ATOMIC_RELAXED)) {
-      T(i)->wait_chan = 0;
-      T(i)->wake_tick = 0;
       sched_rq_enqueue_current(T(i));
       woke = 1;
       break;
@@ -3295,8 +3381,6 @@ void scheduler_wake_task(usize task_id) {
     if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
                                     0, __ATOMIC_ACQUIRE,
                                     __ATOMIC_RELAXED)) {
-      T(i)->wait_chan = 0;
-      T(i)->wake_tick = 0;
       sched_rq_enqueue_current(T(i));
       woke = 1;
       break;
@@ -3552,6 +3636,16 @@ int scheduler_can_block(void) {
   return scheduler_started && current_task != 0 && interrupts_enabled();
 }
 
+/* The waker does not touch the woken task's wait_chan or wake_tick.
+ *
+ * Both belong to the task that is blocking, and it writes them on the way into
+ * every wait. A waker that clears them after its CAS is racing the task it just
+ * released: by the time the store lands, that task can already be running on
+ * another CPU and back inside its wait loop with a fresh channel published —
+ * and the stale zero then erases it. A task blocked on a channel nobody can
+ * name is never woken again, which is how a compositor parked in epoll_wait
+ * stopped answering its IPC socket while still, from outside, perfectly alive.
+ * The same store applied to wake_tick strands a sleeper with no deadline. */
 void scheduler_wake_all(void *chan) {
   /* Preserve the caller's interrupt state instead of force-enabling. This is
    * called from inside IRQs-off spinlock critical sections (e.g. tcp_input
@@ -3577,7 +3671,6 @@ void scheduler_wake_all(void *chan) {
     if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
                                     0, __ATOMIC_ACQUIRE,
                                     __ATOMIC_RELAXED)) {
-      T(i)->wait_chan = 0;
       sched_rq_enqueue_current(T(i));
       woken++;
     }
@@ -3591,6 +3684,29 @@ void scheduler_wake_all(void *chan) {
 }
 
 void scheduler_sleep_ticks(u64 ticks) {
+  (void)scheduler_sleep_ticks_state(ticks, 1);
+}
+
+/*
+ * Sleep, and say what happened instead of insisting.
+ *
+ * A caller that sleeps in a loop -- a nanosleep finishing its deadline after an
+ * early wake -- cannot decide beforehand that it is still allowed to sleep: it
+ * reads its own state, and another CPU stops or kills it before the call lands.
+ * Checking outside and calling a function that requires the answer is a race by
+ * construction, so the decision belongs here, under the same interrupt
+ * disable that acts on it.
+ *
+ * Returns SLEEP_OK when it slept, SLEEP_RETRY when the task must not sleep now
+ * but still exists (stopped by a signal, or blocked on a channel -- the caller
+ * yields and asks again, so a sleep survives SIGSTOP/SIGCONT rather than
+ * returning short), and SLEEP_GONE when the task is being torn down.
+ *
+ * `strict` keeps the original contract for every other caller: a state that
+ * cannot sleep is a bug there, and panics naming the state rather than leaving
+ * one line in the log and a rebuild with printf to find it.
+ */
+int scheduler_sleep_ticks_state(u64 ticks, int strict) {
   interrupts_disable();
 
   if (current_task == 0) {
@@ -3606,18 +3722,37 @@ void scheduler_sleep_ticks(u64 ticks) {
    * reproducible. Treat SLEEPING-at-entry as a no-op-sleep recovery: we're
    * effectively already RUNNING (the kernel just kept us on-CPU), so reset
    * state and proceed. */
-  if (current_task->state == TASK_SLEEPING) {
+  if (current_task->state == TASK_SLEEPING || current_task->state == TASK_READY) {
+    /* SLEEPING: a yield that found nothing else to run left our own state
+     * behind (see below). READY: a waker on another CPU promoted us while we
+     * were still executing here — it happens on any path that sleeps more than
+     * once, which a sleep that keeps going until its deadline does. Both mean
+     * the same thing at this point: the task is on this CPU and about to sleep
+     * again, so put the state back and carry on. */
     current_task->state = TASK_RUNNING;
   } else if (current_task->state != TASK_RUNNING) {
-    /* A different fault from "no task at all", and it used to say the same
-     * thing: this one is a task that is on a wait channel or already dying and
-     * asked to sleep anyway. Naming the state is the difference between one
-     * look at the log and a rebuild with printf. */
+    /* A different fault from "no task at all": a task that is on a wait
+     * channel, stopped, or already dying and asked to sleep anyway. */
+    int st = current_task->state;
+
+    if (!strict) {
+      interrupts_enable();
+      return (st == TASK_DEAD || st == TASK_REAPING) ? SLEEP_GONE : SLEEP_RETRY;
+    }
+    static const char *const names[] = {"RUNNING", "READY",   "BLOCKED",
+                                        "SLEEPING", "STOPPED", "DEAD"};
     klog_warn("scheduler_sleep_ticks: task is not running");
+    klog_warn(st >= 0 && st < (int)(sizeof(names) / sizeof(names[0]))
+                  ? names[st]
+                  : "state out of range");
     panic("scheduler_sleep_ticks with a task that is not running");
   }
 
   current_task->wake_tick = scheduler_ticks + ticks;
+  /* A timed sleep waits on the clock, not on a channel. Leaving the previous
+   * wait's channel in place invites a wake meant for that channel to cut this
+   * sleep short, now that wakers no longer clear it. */
+  current_task->wait_chan = 0;
   /* M28 T4: claim the stack lease before publishing SLEEPING — a timer-tick
    * wake_sleepers on another CPU can CAS us SLEEPING->READY and resume us; see
    * scheduler_block_current for the full race. */
@@ -3674,6 +3809,7 @@ void scheduler_sleep_ticks(u64 ticks) {
     }
   }
   current_task->state = TASK_RUNNING;
+  return SLEEP_OK;
 }
 
 /* Silence watchdog (test mode only). A wedged instance prints nothing, so the
@@ -4064,7 +4200,6 @@ static void terminate_group_siblings(struct task *t) {
                                            __ATOMIC_RELAXED);
       }
       if (woke) {
-        sibling->wait_chan = 0;
         sched_rq_enqueue_current(sibling);
       }
     }
@@ -4171,6 +4306,22 @@ void scheduler_exit_thread(int exit_code) {
        * process dies by signal, so report that rather than the exit code. */
       if (__atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE) &
           (1ULL << (SIGKILL - 1))) {
+        {
+          static unsigned reported;
+
+          if (reported < 8) {
+            reported++;
+            console_write("exit: parked leader pid ");
+            console_write_dec((u64)me);
+            console_write(" (");
+            console_write(current_task->name ? current_task->name : "?");
+            console_write(") reports SIGKILL instead of its own exit code ");
+            console_write_dec((u64)(unsigned)exit_code);
+            console_write("; override=");
+            console_write_dec((u64)g_task_parked_override[idx]);
+            console_write("\n");
+          }
+        }
         exit_code = TASK_EXIT_SIGNALED | SIGKILL;
         break;
       }
@@ -4330,6 +4481,19 @@ void scheduler_exit_current(int exit_code) {
   scheduler_vfork_release();
   if (current_task == 0) {
     panic("scheduler_exit_current without current task");
+  }
+  /* Hand back the address-space mutex if this task still holds it.
+   *
+   * It is a yielding lock with no owner recorded until now and no release
+   * except by the caller that took it, and a task can die inside a mapping
+   * call — exit_group SIGKILLs its siblings wherever they are. The slot is
+   * shared by hash across address spaces, so a leaked one takes unrelated
+   * processes down with it: they spin in vma_mutator_lock forever and the
+   * guest goes quiet with no panic to explain it. */
+  {
+    extern void syscall_release_vma_locks(struct task *t);
+
+    syscall_release_vma_locks(current_task);
   }
   /* M109: drop this task's namespace row. The namespaces themselves are
    * reclaimed later, from unshare/setns — releasing a mount namespace means
@@ -4601,6 +4765,10 @@ int scheduler_waitpid(usize pid, int *status, int options) {
        * still-alive — the wakeup is lost and the parent sleeps forever (the
        * -smp pipeline / waitpid wedge). The fence pairs with the full barrier in
        * scheduler_wake_blocked_parent's CAS. */
+      /* This wait has no channel — it ends when a child changes state, and
+       * the wakers reach it by id. Clear whatever channel the previous wait
+       * left behind so a wake meant for that channel cannot land here. */
+      current_task->wait_chan = 0;
       task_lease_clear(current_task, __func__);
       __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
       __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -4825,6 +4993,10 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
       if (current_task->state == TASK_BLOCKED || current_task->state == TASK_SLEEPING) {
         current_task->state = TASK_RUNNING;
       }
+      /* This wait has no channel — it ends when a child changes state, and
+       * the wakers reach it by id. Clear whatever channel the previous wait
+       * left behind so a wake meant for that channel cannot land here. */
+      current_task->wait_chan = 0;
       task_lease_clear(current_task, __func__);
       __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
       __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -5043,6 +5215,48 @@ usize scheduler_task_count(void) {
  * read the already-public struct directly. */
 usize scheduler_task_slots(void) { return g_task_hwm; }
 
+/* Which slot of the task table the running task occupies.
+ *
+ * For per-task side tables kept outside struct task: the imported-driver shim
+ * needs somewhere stable to hang its idea of `current`, and a per-CPU slot is
+ * not that — any other task running on the same CPU overwrites it, and a waiter
+ * that saved the pointer then gets somebody else woken in its place. The index
+ * is what the scheduler already uses internally; MAX_TASKS bounds it. */
+/* Wake a task without touching a runqueue.
+ *
+ * scheduler_wake_task enqueues, and enqueueing takes the runqueue lock. From an
+ * interrupt handler that is a deadlock waiting to happen: the code the
+ * interrupt suspended may hold that very lock on this CPU, and the next timer
+ * tick then spins on it forever — which is exactly how the i915 fence callback,
+ * once it started actually waking anything, wedged the boot.
+ *
+ * The enqueue is an optimisation. pick_next_task also scans the task table for
+ * READY tasks, so a task promoted here is found on the next pick; it costs a
+ * scan, not a wakeup. Safe to call with interrupts off and locks held. */
+void scheduler_wake_task_norq(usize task_id) {
+  u64 flags = interrupts_save();
+
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->id != task_id)
+      continue;
+    enum task_state expected = TASK_BLOCKED;
+    if (!__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      expected = TASK_SLEEPING;
+      __atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
+                                  __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+    }
+    break;
+  }
+  interrupts_restore(flags);
+}
+
+usize scheduler_current_slot(void) {
+  return current_task ? task_index(current_task) : 0;
+}
+
+usize scheduler_max_task_slots(void) { return MAX_TASKS; }
+
 struct task *scheduler_task_slot(usize index) {
   if (index >= g_task_hwm)
     return 0;
@@ -5135,6 +5349,12 @@ void scheduler_dump_tasks(void) {
     /* Which fcntl a spinning thread repeats. See vfs_fcntl_dump_counts. */
     extern void vfs_fcntl_dump_counts(void);
     vfs_fcntl_dump_counts();
+  }
+  {
+    /* Who holds the page-cache lock. Every wedge this session ended with the
+     * CPUs spinning on it, and nothing in the dump said whose it was. */
+    extern void page_cache_dump_lock(void);
+    page_cache_dump_lock();
   }
   scheduler_dump_thread_exits();
   console_write("tick=");
@@ -5272,7 +5492,9 @@ void scheduler_dump_tasks(void) {
        * says nothing when everything is loaded above 0x700000000000 — the same
        * number could be the loader, the C library or a 30 MB renderer. */
       if (g_task_user_rip_shown) {
-        for (struct vm_area *v = T(i)->vma_list; v; v = v->next) {
+        unsigned guard = 0;
+        for (struct vm_area *v = T(i)->vma_list; v && guard < SCHED_DUMP_VMA_MAX;
+             v = v->next, guard++) {
           if (g_task_user_rip_shown >= v->start && g_task_user_rip_shown < v->end) {
             console_write(" in=");
             console_write(v->node && v->node->name[0] ? v->node->name
@@ -5376,7 +5598,9 @@ void scheduler_dump_tasks(void) {
             continue;
           value = *(volatile u64 *)(usize)(frame + vmm_direct_map_base() +
                                            (addr & (PAGE_SIZE - 1)));
-          for (struct vm_area *v = T(i)->vma_list; v; v = v->next) {
+          unsigned vguard = 0;
+          for (struct vm_area *v = T(i)->vma_list;
+               v && vguard < SCHED_DUMP_VMA_MAX; v = v->next, vguard++) {
             /* In a mapping AND on an executable page. The VMA's prot cannot
              * be trusted for this — the loader maps a library's text and the
              * flag is not mirrored back, so every VMA reads non-executable —
@@ -5446,6 +5670,10 @@ void scheduler_dump_tasks(void) {
       scheduler_dump_sysring(i);
     }
   }
+  /* A dump that stops half way looks exactly like a dump that had nothing more
+   * to say, and one run was read as "the machine went quiet" when in fact the
+   * dump itself had wedged. This line is the proof it finished. */
+  console_write("TASK-DUMP: end\n");
 }
 
 void scheduler_set_stdout(int fd) {
@@ -6484,6 +6712,14 @@ sighandler_t scheduler_get_sighandler(int sig) {
   return current_task->sigactions[sig - 1].sa_handler;
 }
 
+/* The CALLER's own id, one per thread — not the thread-group id
+ * scheduler_get_pid() answers with. Anything that keeps per-task state keyed by
+ * a number needs this one: keyed by the group id, every thread of a process
+ * shares the entry, which is the sharing such a table exists to remove. */
+usize scheduler_current_task_id(void) {
+  return current_task ? current_task->id : 0;
+}
+
 usize scheduler_get_pid(void) {
   if (!current_task)
     return 0;
@@ -6599,17 +6835,101 @@ void vma_insert(struct task *t, struct vm_area *vma) {
  */
 static struct vm_area *g_vma_cache[MAX_TASKS];
 
+/* The cache is stamped, not merely cleared.
+ *
+ * Clearing it named one task — the one doing the unmapping — while the list it
+ * caches is shared by every CLONE_VM thread of the process. So a sibling kept
+ * a pointer to a struct that had already been kfree'd, and went on serving
+ * faults out of it: a mapping that no longer existed answered for an address
+ * that by then belonged to somebody else's fresh mmap, and the page installed
+ * there was written into a range its owner believed untouched. That is the
+ * foreign data found in a freshly mapped destination, and it is why the
+ * failure needed several cores and several threads to show itself.
+ *
+ * A counter bumped on every unlink invalidates every task's cache at once, at
+ * the cost of one atomic on a path that already frees memory and shoots down
+ * TLBs. Per-address-space stamping would keep more of the cache alive, but
+ * unlinking is rare and correctness here is worth more than the hit rate. */
+static u64 g_vma_cache_gen[MAX_TASKS];
+static u64 g_vma_gen;
+
+void vma_cache_invalidate_all(void) {
+  __atomic_add_fetch(&g_vma_gen, 1, __ATOMIC_SEQ_CST);
+}
+
+/* Freeing a mapping while a fault is walking the list.
+ *
+ * vma_lookup deliberately walks without the list lock — it runs in the page
+ * fault path, the list is long in a browser, and holding a lock with
+ * interrupts off across that walk wedged the machine. The exposure it leaves
+ * is that the node under the walker can be kfree'd: the handler then reads
+ * prot, node and offset out of freed memory and acts on them, which is a write
+ * anywhere. Six threads doing nothing but mmap/fill/munmap on six CPUs kill
+ * the guest in five seconds, and that is the shape of it.
+ *
+ * A walker counter closes it without taking a lock in the fault path: retiring
+ * a mapping puts it on a list instead of freeing it, and the list is drained
+ * only when no CPU is inside a walk. A walker that starts after the unlink is
+ * published cannot reach a retired node, because it begins from a head that no
+ * longer leads to one — so "no walkers right now" is enough to free.
+ */
+static volatile u32 g_vma_walkers;
+static struct vm_area *g_vma_retired;
+
+/* Drain what is safe to drain. Called with the list lock held. */
+static void vma_retire_drain_locked(void) {
+  if (!g_vma_retired)
+    return;
+  if (__atomic_load_n(&g_vma_walkers, __ATOMIC_SEQ_CST) != 0)
+    return;
+
+  struct vm_area *v = g_vma_retired;
+
+  g_vma_retired = 0;
+  while (v) {
+    struct vm_area *next = v->retired_next;
+
+    kfree(v);
+    v = next;
+  }
+}
+
+/* Hand a mapping over to be freed once no walker can be holding it. */
+void vma_retire(struct vm_area *vma) {
+  u64 flags;
+
+  if (!vma)
+    return;
+  vma_list_lock(&flags);
+  vma->retired_next = g_vma_retired;
+  g_vma_retired = vma;
+  vma_retire_drain_locked();
+  vma_list_unlock(flags);
+}
+
+/* A chance to reclaim, taken from a path that is not a fault. */
+void vma_retire_poll(void) {
+  u64 flags;
+
+  if (!__atomic_load_n((struct vm_area *volatile *)&g_vma_retired,
+                       __ATOMIC_RELAXED))
+    return;
+  vma_list_lock(&flags);
+  vma_retire_drain_locked();
+  vma_list_unlock(flags);
+}
+
 struct vm_area *vma_lookup(struct task *t, u64 addr) {
   if (!t)
     return 0;
 
   usize slot = task_index(t);
+  u64 gen = __atomic_load_n(&g_vma_gen, __ATOMIC_ACQUIRE);
   struct vm_area *hit = g_vma_cache[slot];
 
-  /* The cached mapping is only trusted while it is still in this task's list;
-   * a freed one would be a use-after-free, so the cache is cleared by every
-   * path that unlinks (vma_cache_forget). */
-  if (hit && addr >= hit->start && addr < hit->end)
+  /* The cached mapping is only trusted while nothing has been unlinked from
+   * any list since it was cached; a freed one would be a use-after-free. */
+  if (hit && g_vma_cache_gen[slot] == gen && addr >= hit->start && addr < hit->end)
     return hit;
 
   /* Deliberately NOT under the list lock.
@@ -6624,18 +6944,76 @@ struct vm_area *vma_lookup(struct task *t, u64 addr) {
    * never lands mid-splice. The remaining exposure is a mapping freed while
    * this walk holds it — pre-existing, and not something a spinlock in the
    * fault path can pay for. */
+  __atomic_add_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
   for (struct vm_area *v = t->vma_list; v && v->start <= addr; v = v->next) {
     if (addr < v->end) {
-      g_vma_cache[slot] = v;
+      /* Stamp first, publish second: a walker that reads the pointer must
+       * never find it paired with a generation newer than the one it was
+       * cached under. */
+      g_vma_cache_gen[slot] = gen;
+      __atomic_store_n(&g_vma_cache[slot], v, __ATOMIC_RELEASE);
+      __atomic_sub_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
       return v;
     }
   }
+  __atomic_sub_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
   return 0;
 }
 
 void vma_cache_forget(struct task *t) {
   if (t)
     g_vma_cache[task_index(t)] = 0;
+}
+
+/* What every thread of this address space believes the mapping list to be.
+ *
+ * Each task carries its own copy of the list head, kept in step by copying it
+ * around on change. If one copy is stale, that thread walks a different list
+ * from its siblings — and the free-area search that runs on it can hand out an
+ * address another thread is already using. This prints the heads side by side,
+ * and says which threads' lists cover a given range, which is the difference
+ * between "the allocator is wrong" and "the allocator was told the wrong
+ * thing". Diagnostic only; called when a placement has already gone wrong.
+ */
+void vma_report_space(u64 start, u64 end) {
+  struct task *me = current_task;
+
+  if (!me)
+    return;
+  console_write("  address-space view, threads of pml4 0x");
+  console_write_hex64(me->pml4_phys);
+  console_write(":\n");
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+
+    if (t->state == TASK_UNUSED || t->pml4_phys != me->pml4_phys)
+      continue;
+    console_write("    tid ");
+    console_write_dec(t->id);
+    console_write(" head 0x");
+    console_write_hex64((u64)(usize)t->vma_list);
+    /* Does this thread's list cover the range in question? */
+    {
+      struct vm_area *cover = 0;
+      unsigned steps = 0;
+
+      for (struct vm_area *v = t->vma_list; v && ++steps < 100000u; v = v->next) {
+        if (v->start < end && v->end > start) {
+          cover = v;
+          break;
+        }
+      }
+      if (cover) {
+        console_write(" COVERS 0x");
+        console_write_hex64(cover->start);
+        console_write("-0x");
+        console_write_hex64(cover->end);
+      } else {
+        console_write(" does not cover it");
+      }
+    }
+    console_write("\n");
+  }
 }
 
 u64 vm_find_free_area(struct task *t, usize length) {
@@ -6799,8 +7177,11 @@ void vma_delete_range(struct task *task, u64 start, u64 end) {
       __atomic_store_n(curr, vma->next, __ATOMIC_RELEASE);
       vma_list_unlock(dvflags);
     }
-    /* The lookup cache may be pointing at what is about to be freed. */
+    /* Every task's lookup cache may be pointing at what is about to be freed,
+     * not just this one's: the list belongs to the address space, and its
+     * threads each cache out of it. */
     vma_cache_forget(task);
+    vma_cache_invalidate_all();
     if (vma->node) {
       if (vma->node->inode && vma->node->inode->mmap_close_cb)
         vma->node->inode->mmap_close_cb(vma->node);
@@ -6809,7 +7190,7 @@ void vma_delete_range(struct task *task, u64 start, u64 end) {
             vma->node, (u64)vma->offset, (usize)(vma->end - vma->start));
       vfs_node_put(vma->node);
     }
-    kfree(vma);
+    vma_retire(vma);
   }
 }
 
@@ -7196,6 +7577,14 @@ int scheduler_signal_pending_any(void) {
           ~current_task->blocked_signals) != 0;
 }
 
+/* Is this signal's default action to do nothing?
+ *
+ * Only four are ignored by default. Everything else either terminates the
+ * process or stops it, and both of those have to end a wait. */
+static int sig_default_is_ignore(int sig) {
+  return sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT;
+}
+
 int scheduler_signal_pending(void) {
   if (!current_task)
     return 0;
@@ -7206,9 +7595,25 @@ int scheduler_signal_pending(void) {
   for (int i = 1; i < NSIG; i++) {
     if (!(pending & (1ULL << (i - 1))))
       continue;
-    sighandler_t h = current_task->sigactions[i - 1].sa_handler;
-    if (h != SIG_IGN && h != SIG_DFL)
+    /* SIGKILL cannot be caught, blocked or ignored, and a task that is about
+     * to die must not be left waiting for a message that will never come. */
+    if (i == SIGKILL || i == SIGSTOP)
       return 1;
+
+    sighandler_t h = current_task->sigactions[i - 1].sa_handler;
+
+    if (h == SIG_IGN)
+      continue;
+    /* A handler obviously interrupts the wait — the handler has to run. But so
+     * does a signal left at its default disposition when that default is to
+     * terminate the process: this returned 0 for those, so a process blocked
+     * in recvmsg, read or accept could not be killed at all. What that looked
+     * like was a Wayland client that survived every kill, a shell stuck in
+     * wait4 for it forever, and a session that could not be torn down —
+     * reported as "the compositor hangs the machine". */
+    if (h == SIG_DFL && sig_default_is_ignore(i))
+      continue;
+    return 1;
   }
   return 0;
 }

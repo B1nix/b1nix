@@ -211,8 +211,15 @@ static u64 futex_key_word_for(u64 uaddr, int priv) {
   return uaddr;
 }
 
-/* Scheduler tick cadence (TIMER_HZ) is 100 Hz → 10 ms per tick. */
-#define FUTEX_MS_PER_TICK 10
+/* Milliseconds per scheduler tick, from the timer that was actually armed.
+ *
+ * This was the literal 10, true only while the tick ran at 100 Hz. Programmed
+ * faster it silently divided every futex timeout by the ratio — a fifteen
+ * millisecond wait became fifteen ticks of one millisecond only by accident,
+ * and any other rate would have made timeouts expire early. A deadline has to
+ * be converted with the rate the machine is running, not the rate it was
+ * written against. */
+#define FUTEX_MS_PER_TICK (1000u / sched_tick_hz())
 
 void futex_watch_arm(u64 uaddr);
 

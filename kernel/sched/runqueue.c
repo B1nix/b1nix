@@ -151,9 +151,29 @@ struct task *sched_steal_task(void) {
           rq_enqueue(&victim->runqueue, t);
           continue;
         }
-        if (t->state == TASK_READY && t->stealable) {
-            /* Successfully stolen — caller will run it on this CPU */
-            return t;
+        /* Claim it the way every other picker does.
+         *
+         * This path used to take a task on a plain `state == READY` read, with
+         * none of the protections the runqueue and scan paths grew: no wait
+         * for the outgoing CPU to publish its stack hand-off, no check that
+         * the task is not some CPU's current task, and no atomic claim. A task
+         * that a waker had marked READY while it went on executing was
+         * therefore stolen out from under the CPU running it, and two CPUs
+         * ended up returning through one kernel stack — which surfaces as a
+         * jump to a small integer with no backtrace.
+         */
+        if (t->state == TASK_READY && t->stealable &&
+            __atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE) &&
+            !task_running_somewhere(t)) {
+            enum task_state expected = TASK_READY;
+
+            if (__atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING,
+                                            0, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_RELAXED)) {
+                /* The stack belongs to this CPU from here on. */
+                __atomic_store_n(&t->stack_released, 0, __ATOMIC_RELEASE);
+                return t;
+            }
         }
 
         /* Not stealable / not runnable — put back */
@@ -161,4 +181,30 @@ struct task *sched_steal_task(void) {
     }
 
     return NULL;
+}
+
+/* Is there anything besides the caller waiting for this CPU?
+ *
+ * Asked by a task that is about to wait out a sub-tick sleep on the clock: if
+ * nothing else wants the CPU, waiting precisely costs nothing, because the
+ * alternative is an idle loop. If something does, precision is not worth
+ * taking its turn away — a task spinning out a sleep is indistinguishable from
+ * a busy one to the scheduler, and a cooperative-bias test watched its
+ * favoured workers get four turns against seventy thousand while sleepers
+ * yielded in front of them.
+ *
+ * A peek, not a count: the queues are read without their locks because the
+ * answer is a hint and a wrong one costs only precision. */
+int sched_other_work_pending(void) {
+    struct runqueue *g = sched_global_rq();
+
+    if (g && g->head)
+        return 1;
+    for (int i = 0; i < g_max_cpus; i++) {
+        struct percpu *pc = get_percpu_n(i);
+
+        if (pc && pc->runqueue.head)
+            return 1;
+    }
+    return 0;
 }

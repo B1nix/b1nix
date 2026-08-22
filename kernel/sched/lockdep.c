@@ -5,6 +5,7 @@
  * configurations, but every public function body collapses to nothing.
  */
 
+#include <lkpi/lock.h>
 #include <b1nix/console.h>
 #include <b1nix/lapic.h>
 #include <b1nix/lockdep.h>
@@ -193,6 +194,28 @@ void lockdep_dump_all(void) {
  * marker. spin_lock() calls this once its spin count crosses the threshold so
  * the failure names the lock, the CPU, the current task, and the caller.
  */
+static int spin_owner_report_lkpi(volatile int *lock) {
+	const struct lkpi_spinlock *l = (const struct lkpi_spinlock *)lock;
+
+	if (l->owner_cpu < 0 || l->owner_cpu >= (int)MAX_CPUS || !l->acquired_at)
+		return 0;
+	console_write("\n  holder: cpu ");
+	console_write_dec((u64)l->owner_cpu);
+	console_write(" task ");
+	console_write_dec(l->owner_task);
+	console_write(" took it at 0x");
+	console_write_hex64(l->acquired_at);
+	ksym_print(l->acquired_at);
+	return 1;
+}
+
+static void spin_owner_report(volatile int *lock) {
+	if (spin_owner_report_lkpi(lock))
+		return;
+	console_write("\n  holder: not recorded (not a driver lock)");
+}
+
+
 void spin_lock_stuck(volatile int *lock, u64 caller) {
     console_bust_lock();
     console_write("\nSPINLOCK LOCKUP on cpu ");
@@ -201,6 +224,14 @@ void spin_lock_stuck(volatile int *lock, u64 caller) {
     console_write_hex64((u64)(usize)lock);
     console_write(" value=");
     console_write_dec((u64)(unsigned)*lock);
+    /* And WHAT the lock is: an address alone names nothing, and every lockup
+     * report so far has ended in guessing which structure it belonged to. The
+     * heap knows the allocation it falls inside. */
+    {
+        extern void kheap_describe(u64 addr, const char *prefix);
+
+        kheap_describe((u64)(usize)lock, " lock->");
+    }
     console_write("\n  caller: 0x");
     console_write_hex64(caller);
     ksym_print(caller);
@@ -210,6 +241,7 @@ void spin_lock_stuck(volatile int *lock, u64 caller) {
      * frames so the site is in the report — a self-deadlock is only actionable
      * once you can see who already held it.
      */
+    spin_owner_report(lock);
     console_write("\n  backtrace:");
     arch_backtrace((u64)(usize)__builtin_frame_address(0), caller);
     if (current_task) {

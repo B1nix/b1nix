@@ -40,7 +40,6 @@
 #define NS_MAX_UTS 8    /* slot 0 is the initial UTS namespace */
 #define NS_MAX_MNT 8    /* slot 0 is the initial mount namespace */
 #define NS_MAX_PID 8    /* slot 0 is the initial pid namespace */
-#define NS_MAX_NET 8    /* slot 0 is the initial network namespace */
 /* Tasks a non-initial pid namespace can number at once. */
 #define PIDNS_MAX_TASKS 64
 
@@ -301,6 +300,10 @@ void namespace_fork_inherit(usize parent_pid, usize child_pid) {
  * about to return, so a number deleted at reap time is already gone by the
  * time the answer needs it. See struct pidns_slot. */
 void namespace_task_reaped(usize pid) {
+  /* Release any receive-context slot the task still holds. Push and pop are
+   * paired inside one call frame, so this should never find one — but a pid is
+   * reused, and a slot left behind would answer for its next owner. */
+  namespace_net_release(pid);
   if (!ns_ready)
     return;
   u64 flags;
@@ -470,9 +473,39 @@ int namespace_pid_visible_from(usize observer_pid, usize kernel_pid) {
  * A socket call, an ioctl or a netlink message belongs to the caller. A frame
  * being demultiplexed belongs to the interface it arrived on, which may be in
  * a namespace no running task is currently in — so the receive path pushes a
- * context around the delivery, exactly as g_receiving_netdev already does. */
+ * context around the delivery, exactly as g_receiving_netdev already does.
+ *
+ * That context is PER TASK, not one word for the machine. Two CPUs demultiplex
+ * frames at the same time, and a delivery can sleep (a reply generated inside
+ * it waits for ARP), so a single global would let one task's receive context
+ * become another task's answer to "which namespace am I in?" — which is a
+ * frame stamped with, or delivered to, the wrong namespace's address.
+ *
+ * Each slot is claimed by its owner and read by nobody else, so the only
+ * shared step is claiming a free one. A task with no slot is not inside a
+ * receive path and gets the namespace it belongs to. */
 
-static u32 net_rx_ns; /* the interface's namespace, while a frame is in flight */
+/* Keyed by the task's own id, the same number namespace_task_reaped() releases
+ * with: scheduler_get_pid() is the thread-group id, so keying on it would give
+ * every thread of a process one shared entry and hand one thread's receive
+ * context to another -- exactly the sharing this table replaced. */
+#define NS_RX_SLOTS 32
+struct ns_rx_slot {
+  usize key; /* pid + 1, so that 0 means "free" */
+  u32 ns;
+};
+static struct ns_rx_slot ns_rx[NS_RX_SLOTS];
+/* Non-zero while any task is inside a receive path: the fast path for every
+ * other caller, which is almost all of them. */
+static int ns_rx_live;
+
+static struct ns_rx_slot *ns_rx_find(usize key) {
+  for (int i = 0; i < NS_RX_SLOTS; i++) {
+    if (__atomic_load_n(&ns_rx[i].key, __ATOMIC_ACQUIRE) == key)
+      return &ns_rx[i];
+  }
+  return 0;
+}
 
 u32 namespace_net_current(void) {
   if (!ns_any)
@@ -481,20 +514,68 @@ u32 namespace_net_current(void) {
 }
 
 u32 namespace_net_context(void) {
-  u32 rx = __atomic_load_n(&net_rx_ns, __ATOMIC_RELAXED);
-  if (rx)
-    return rx;
+  if (__atomic_load_n(&ns_rx_live, __ATOMIC_RELAXED)) {
+    struct ns_rx_slot *slot = ns_rx_find(scheduler_current_task_id() + 1);
+    if (slot) {
+      u32 rx = __atomic_load_n(&slot->ns, __ATOMIC_RELAXED);
+      if (rx)
+        return rx;
+    }
+  }
   return namespace_net_current();
 }
 
 u32 namespace_net_push_context(u32 ns) {
-  u32 prev = __atomic_load_n(&net_rx_ns, __ATOMIC_RELAXED);
-  __atomic_store_n(&net_rx_ns, ns, __ATOMIC_RELAXED);
-  return prev;
+  usize key = scheduler_current_task_id() + 1;
+  struct ns_rx_slot *slot = ns_rx_find(key);
+  if (slot) {
+    /* Already inside a delivery — a bridge handing a frame back, or a reply
+     * that re-enters the receive path. The caller keeps the previous value on
+     * its stack and hands it back to the pop below. */
+    u32 prev = __atomic_load_n(&slot->ns, __ATOMIC_RELAXED);
+    __atomic_store_n(&slot->ns, ns, __ATOMIC_RELAXED);
+    return prev;
+  }
+  if (!ns)
+    return 0; /* nothing to record: the initial namespace is the default */
+  for (int i = 0; i < NS_RX_SLOTS; i++) {
+    usize expect = 0;
+    if (__atomic_compare_exchange_n(&ns_rx[i].key, &expect, key, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+      __atomic_store_n(&ns_rx[i].ns, ns, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&ns_rx_live, 1, __ATOMIC_RELAXED);
+      return 0;
+    }
+  }
+  /* Every slot taken. The delivery still happens; it resolves in the calling
+   * task's own namespace, which is what it did before this table existed. */
+  return 0;
+}
+
+/* Give up the slot of a task that is gone. */
+void namespace_net_release(usize pid) {
+  if (!__atomic_load_n(&ns_rx_live, __ATOMIC_RELAXED))
+    return;
+  struct ns_rx_slot *slot = ns_rx_find(pid + 1);
+  if (!slot)
+    return;
+  __atomic_store_n(&slot->ns, 0, __ATOMIC_RELAXED);
+  __atomic_fetch_sub(&ns_rx_live, 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&slot->key, (usize)0, __ATOMIC_RELEASE);
 }
 
 void namespace_net_pop_context(u32 saved) {
-  __atomic_store_n(&net_rx_ns, saved, __ATOMIC_RELAXED);
+  usize key = scheduler_current_task_id() + 1;
+  struct ns_rx_slot *slot = ns_rx_find(key);
+  if (!slot)
+    return;
+  if (saved) {
+    __atomic_store_n(&slot->ns, saved, __ATOMIC_RELAXED);
+    return;
+  }
+  __atomic_store_n(&slot->ns, 0, __ATOMIC_RELAXED);
+  __atomic_fetch_sub(&ns_rx_live, 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&slot->key, (usize)0, __ATOMIC_RELEASE);
 }
 
 int namespace_net_live(u32 ns) {
