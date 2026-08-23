@@ -18,12 +18,16 @@ typedef volatile int spinlock_t;
 /* Atomically exchange byte: lock cmpxchg or xchg.
  * Returns the old value. */
 static inline int spin_xchg(volatile int *lock, int val) {
+#if defined(__x86_64__)
     int old;
     __asm__ volatile("xchg %0, %1"
                      : "=r"(old), "+m"(*lock)
                      : "0"(val)
                      : "memory");
     return old;
+#else
+    return __atomic_exchange_n(lock, val, __ATOMIC_SEQ_CST);
+#endif
 }
 
 /* Drain any in-flight cross-CPU TLB shootdown while spin-waiting (defined in
@@ -64,8 +68,12 @@ static inline void spin_lock(spinlock_t *lock) {
     while (spin_xchg(lock, 1) != 0) {
         /* Pause to hint to the CPU that we're in a spin-wait loop.
          * Improves performance and power consumption on SMP. */
+#if defined(__x86_64__)
         __asm__ volatile("pause");
         tlb_shootdown_poll();
+#elif defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
         /* A spin that never ends is a deadlock, not contention: turn the silent
          * hang into a named panic (which lock, which CPU, which task).
          *
@@ -110,6 +118,10 @@ static inline int spin_is_locked(spinlock_t *lock) {
 static inline void spin_lock_irqsave(spinlock_t *lock, u64 *flags) {
 #ifdef __x86_64__
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(*flags) : : "memory");
+#elif defined(__aarch64__)
+    u64 daif;
+    __asm__ volatile("mrs %0, daif; msr daifset, #2" : "=r"(daif) : : "memory");
+    *flags = daif;
 #else
     u32 f32;
     __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
@@ -122,6 +134,8 @@ static inline void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
     spin_unlock(lock);
 #ifdef __x86_64__
     __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("msr daif, %0" : : "r"(flags) : "memory");
 #else
     u32 f32 = (u32)flags;
     __asm__ volatile("pushl %0; popfd" : : "r"(f32) : "memory");

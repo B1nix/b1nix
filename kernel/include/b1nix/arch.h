@@ -4,7 +4,7 @@
 #include <b1nix/types.h>
 
 #ifdef __aarch64__
-// aarch64 headers
+#include <b1nix/arch_aarch64.h>
 #elif defined(__x86_64__)
 #include <b1nix/arch_x86_64.h>
 #else
@@ -13,6 +13,16 @@
 
 void arch_init(void);
 void arch_halt(void) __attribute__((noreturn));
+#if defined(__aarch64__)
+/* PSCI SYSTEM_OFF / SYSTEM_RESET (kernel/arch/aarch64/arch.c). */
+void arch_psci_poweroff(void);
+void arch_psci_reset(void);
+/* Rebuild boot.S's identity map from the RAM banks the device tree reported:
+ * RAM as Normal memory, everything else as Device. Runs immediately after the
+ * tree is walked and before the console, the pmm or the heap
+ * (kernel/arch/aarch64/paging.c). */
+void aarch64_boot_map_rebuild(void);
+#endif
 void arch_set_kernel_stack(u64 stack_top);
 #ifdef __x86_64__
 /* TSS.rsp0 of a CPU: the stack a ring-3 exception frame is pushed on. */
@@ -32,6 +42,17 @@ static inline void interrupts_enable(void) {
   __asm__ volatile("msr daifclr, #2" : : : "memory");
 #else
   __asm__ volatile("sti" : : : "memory");
+#endif
+}
+
+/* Unmask interrupts and idle until one arrives — the two must be one step, or
+ * a wakeup delivered in between is lost and the CPU waits for the next one.
+ * x86_64 spells it `sti; hlt`, and this arch `msr daifclr, #2; wfi`. */
+static inline void interrupts_enable_and_wait(void) {
+#ifdef __aarch64__
+  __asm__ volatile("msr daifclr, #2; wfi" : : : "memory");
+#else
+  __asm__ volatile("sti; hlt" : : : "memory");
 #endif
 }
 
@@ -78,7 +99,6 @@ static inline void interrupts_restore(u64 f) {
   __asm__ volatile("pushl %0; popfd" : : "r"(f32) : "memory", "cc");
 #endif
 }
-
 
 /* ── FPU / XSAVE state management (M80) ──────────────────────────────────────
  * The kernel saves userspace FPU state on every context switch. With XSAVE
@@ -136,8 +156,29 @@ u64 boot_stack_peak_bytes(void);
 u64 boot_stack_size_bytes(void);
 int boot_stack_is_guard_addr(u64 addr);
 
+/* Who the processor says it is, for /proc/cpuinfo. Both come from the CPU
+ * itself — the CPUID brand string on x86_64, MIDR_EL1 on aarch64 — rather than
+ * from a constant compiled into the kernel. Always NUL-terminated. */
+void arch_cpu_vendor(char *buf, usize len);
+void arch_cpu_model(char *buf, usize len);
+
 int arch_xsave_enabled(void);
 u64 arch_xsave_mask(void);
 usize arch_xsave_area_size(void);
+
+/* linuxkpi (<linux/compiler.h>) defines a cpu_relax() of its own that also
+ * services TLB shootdowns, and a TU pulling both headers failed to compile on
+ * either arch. Whichever lands first now wins; inside imported code include
+ * the linuxkpi one first, so the shootdown servicing is kept. */
+#ifndef B1NIX_CPU_RELAX_DEFINED
+#define B1NIX_CPU_RELAX_DEFINED 1
+static inline void cpu_relax(void) {
+#if defined(__x86_64__)
+  __asm__ volatile("pause");
+#elif defined(__aarch64__)
+  __asm__ volatile("yield");
+#endif
+}
+#endif
 
 #endif

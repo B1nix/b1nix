@@ -419,6 +419,33 @@ void msi_free_vector(int vector) {
   spin_unlock_irqrestore(&g_irq_lock, flags);
 }
 
+/* See the note at the call site in kernel/dev/pci.c. On x86 the pair has been
+ * the same since the first MSI: the local APIC's address, and the vector as
+ * the data. */
+int arch_msi_prepare(u8 bus, u8 slot, u8 func, int vector, u64 *addr_out,
+                     u32 *data_out) {
+  extern u64 pci_msi_message_address(u32 apic_id);
+  (void)bus;
+  (void)slot;
+  (void)func;
+  *addr_out = pci_msi_message_address(lapic_id());
+  *data_out = (u32)vector;
+  return 0;
+}
+
+int arch_msi_supported(void) { return 1; }
+
+int arch_msi_expected(int vector, u64 *addr_out, u32 *data_out) {
+  extern u64 pci_msi_message_address(u32 apic_id);
+
+  if (vector < (int)MSI_VECTOR_BASE ||
+      vector >= (int)(MSI_VECTOR_BASE + MSI_VECTOR_COUNT))
+    return -1;
+  *addr_out = pci_msi_message_address(lapic_id());
+  *data_out = (u32)vector;
+  return 0;
+}
+
 int msi_dispatch(int vector) {
   if (vector < (int)MSI_VECTOR_BASE ||
       vector >= (int)(MSI_VECTOR_BASE + MSI_VECTOR_COUNT))

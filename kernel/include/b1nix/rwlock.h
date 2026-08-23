@@ -2,6 +2,7 @@
 #define B1NIX_RWLOCK_H
 
 #include <b1nix/types.h>
+#include <b1nix/arch.h>
 
 /* Read-write spinlock for kernel-internal data that is overwhelmingly read
  * (the VFS parent/sibling chain is the canonical client). Many concurrent
@@ -57,7 +58,7 @@ static inline void rw_read_lock(rwlock_t *lock) {
                                             __ATOMIC_RELAXED))
                 return;
         }
-        __asm__ volatile("pause");
+        cpu_relax();
         tlb_shootdown_poll();
     }
 }
@@ -74,7 +75,7 @@ static inline void rw_write_lock(rwlock_t *lock) {
                                         __ATOMIC_ACQUIRE,
                                         __ATOMIC_RELAXED))
             return;
-        __asm__ volatile("pause");
+        cpu_relax();
         tlb_shootdown_poll();
     }
 }
@@ -86,6 +87,10 @@ static inline void rw_write_unlock(rwlock_t *lock) {
 static inline void rw_read_lock_irqsave(rwlock_t *lock, u64 *flags) {
 #ifdef __x86_64__
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(*flags) : : "memory");
+#elif defined(__aarch64__)
+    u64 daif;
+    __asm__ volatile("mrs %0, daif; msr daifset, #2" : "=r"(daif) : : "memory");
+    *flags = daif;
 #else
     u32 f32;
     __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
@@ -98,6 +103,8 @@ static inline void rw_read_unlock_irqrestore(rwlock_t *lock, u64 flags) {
     rw_read_unlock(lock);
 #ifdef __x86_64__
     __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("msr daif, %0" : : "r"(flags) : "memory");
 #else
     u32 f32 = (u32)flags;
     __asm__ volatile("pushl %0; popfd" : : "r"(f32) : "memory");
@@ -107,6 +114,10 @@ static inline void rw_read_unlock_irqrestore(rwlock_t *lock, u64 flags) {
 static inline void rw_write_lock_irqsave(rwlock_t *lock, u64 *flags) {
 #ifdef __x86_64__
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(*flags) : : "memory");
+#elif defined(__aarch64__)
+    u64 daif;
+    __asm__ volatile("mrs %0, daif; msr daifset, #2" : "=r"(daif) : : "memory");
+    *flags = daif;
 #else
     u32 f32;
     __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
@@ -119,6 +130,8 @@ static inline void rw_write_unlock_irqrestore(rwlock_t *lock, u64 flags) {
     rw_write_unlock(lock);
 #ifdef __x86_64__
     __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("msr daif, %0" : : "r"(flags) : "memory");
 #else
     u32 f32 = (u32)flags;
     __asm__ volatile("pushl %0; popfd" : : "r"(f32) : "memory");
