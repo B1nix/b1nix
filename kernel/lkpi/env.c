@@ -18,7 +18,11 @@
 #include <string.h>
 
 #include <b1nix/pci.h>
+#if defined(__x86_64__)
 #include <b1nix/arch_x86_64.h>
+#else
+#include <b1nix/arch_aarch64.h>
+#endif
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/sched.h>
@@ -257,7 +261,7 @@ int lkpi_can_block(void) { return scheduler_can_block(); }
 
 void lkpi_cpu_relax(void)
 {
-	__asm__ volatile("pause");
+	cpu_relax();
 	/* Servicing shootdowns here is not optional: a caller spinning with
 	 * interrupts disabled would otherwise leave the CPU that sent one waiting
 	 * forever. */
@@ -784,7 +788,15 @@ int lkpi_pci_bar(u32 bus, u32 slot, u32 func, u32 index, u64 *start, u64 *size,
  * from the CPU's own capability rather than assumed: a driver that maps an
  * aperture WC when the PAT is not programmed gets uncached memory and blames
  * the GPU for the frame rate. */
-int lkpi_pat_enabled(void) { return pat_available(); }
+int lkpi_pat_enabled(void)
+{
+#if defined(__x86_64__)
+	return pat_available();
+#else
+	/* No PAT outside x86: memory type comes from MAIR here. */
+	return 0;
+#endif
+}
 
 /* One CPUID query per call, the encoding described in <asm/cpufeature.h>.
  * Upstream patches the branch away at boot; this does not, and the cost is a
@@ -796,9 +808,15 @@ int lkpi_cpu_has(u32 feature)
   u32 bit = feature & 31;
   u32 eax = 0, ebx = 0, ecx = 0, edx = 0;
 
+#if defined(__x86_64__)
   __asm__ volatile("cpuid"
                    : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
                    : "a"(leaf), "c"(0));
+#else
+  /* No CPUID here. The callers ask about x86 features (PAT, CLFLUSH); the
+   * honest answer on this arch is that it has none of them. */
+  (void)leaf;
+#endif
 
   u32 value = reg == 0 ? eax : reg == 1 ? ebx : reg == 2 ? ecx : edx;
   return (value >> bit) & 1u;
@@ -933,10 +951,34 @@ int lkpi_bootflag(const char *flag)
  */
 static u64 lkpi_tsc(void)
 {
+#if defined(__x86_64__)
 	u32 lo, hi;
 
 	__asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
 	return ((u64)hi << 32) | lo;
+#else
+	/* CNTVCT_EL0, the counter that runs regardless of the timer interrupt. */
+	u64 v;
+
+	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+	return v;
+#endif
+}
+
+/* The rate lkpi_tsc() advances at, in kHz. On x86_64 that is the calibrated CPU
+ * clock; on aarch64 the counter has its own frequency (CNTFRQ_EL0) and using
+ * the CPU's kHz here would scale every delay and timestamp by whatever ratio
+ * happens to hold between them. */
+static u32 lkpi_tsc_khz(void)
+{
+#if defined(__x86_64__)
+	return arch_cpu_khz();
+#else
+	u64 hz;
+
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+	return (u32)(hz / 1000ull);
+#endif
 }
 
 /*
@@ -956,7 +998,7 @@ static u64 lkpi_tsc(void)
  */
 void lkpi_udelay(u64 usecs)
 {
-	u32 khz = arch_cpu_khz();
+	u32 khz = lkpi_tsc_khz();
 	u64 start, cycles;
 
 	if (!khz) {

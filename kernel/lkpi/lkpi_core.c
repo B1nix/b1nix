@@ -4,6 +4,7 @@
  * M99 linuxkpi: allocator shims, ioremap, dma-mapping, sleeping mutex.
  */
 
+#include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/iommu.h>
@@ -937,7 +938,7 @@ void lkpi_mutex_lock(struct lkpi_mutex *m)
 			/* Early boot / interrupt context: spin instead of parking. A
 			 * driver taking a mutex there is a bug, but hanging the machine
 			 * is a worse way to report it than making progress. */
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}

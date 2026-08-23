@@ -14,6 +14,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
+#include <b1nix/memtype.h>
 #include <b1nix/mm.h>
 #include <b1nix/posix.h>
 #include <b1nix/sched.h>
@@ -372,35 +373,47 @@ static void test_ioremap(void)
 		lkpi_report("ioremap", 0, 2);
 		return;
 	}
+	/* Each failure carries its own detail code: "FAIL ioremap detail=0" named
+	 * nothing, and the two things that were actually broken here (the mapping
+	 * was the direct-map alias, and the WC attribute was absent) look identical
+	 * in that message. */
+	int detail = 0;
 	/* A genuinely new mapping, not the direct-map alias handed back. */
 	if ((usize)io == (usize)direct)
-		ok = 0;
-	/* Reads through the device mapping must see what the direct map wrote. */
+		{ ok = 0; detail = 3; }
+	/* Reads through the device mapping must see what the direct map wrote. The
+	 * two aliases have different memory types, so the cacheable one has to be
+	 * written back before the uncached one can observe it. */
+	cache_flush_range((const void *)direct, PAGE_SIZE);
 	for (int i = 0; i < 8 && ok; i++)
 		if (readl((const volatile void *)&io[i]) != 0xDEAD0000u + (u32)i)
-			ok = 0;
+			{ ok = 0; detail = 4; }
 	/* And writes through it must be visible on the other side. */
 	writel(0x600DBEEFu, (volatile void *)&io[3]);
-	if (direct[3] != 0x600DBEEFu)
-		ok = 0;
+	cache_flush_range((const void *)direct, PAGE_SIZE);
+	if (ok && direct[3] != 0x600DBEEFu)
+		{ ok = 0; detail = 5; }
 
 	/* A write-combining mapping of the same frame must carry the WC page
 	 * attribute in its installed PTE, verified from the page tables. */
 	volatile u32 *wc = ioremap_wc(frame, PAGE_SIZE);
 	if (!wc) {
-		ok = 0;
+		{ ok = 0; detail = 6; }
 	} else {
-		u64 pte = paging_leaf_pte((u64)(usize)wc);
-		if (!(pte & VMM_PRESENT) ||
-		    (pte & (VMM_PAT | VMM_PCD | VMM_PWT)) != VMM_WC)
-			ok = 0;
+		/* Ask the arch whether the installed entry carries the WC type:
+		 * the encoding is a PAT slot on x86_64 and an MAIR slot on
+		 * aarch64, and VMM_WC's bit positions mean something else
+		 * entirely in an AArch64 descriptor (AP[1] and AttrIndx). */
+		if (!paging_pte_is_wc(paging_leaf_pte((u64)(usize)wc)))
+			{ ok = 0; detail = 7; }
 		writel(0xCAFEF00Du, (volatile void *)&wc[5]);
 		mb();
-		if (direct[5] != 0xCAFEF00Du)
-			ok = 0;
+		cache_flush_range((const void *)direct, PAGE_SIZE);
+		if (ok && direct[5] != 0xCAFEF00Du)
+			{ ok = 0; detail = 8; }
 	}
 
-	lkpi_report("ioremap", ok, 0);
+	lkpi_report("ioremap", ok, detail);
 	/* The MMIO aliases are permanent, so the frame stays owned by them. */
 }
 
@@ -600,6 +613,16 @@ static void test_dma_bounce_sg(void)
 
 	/* Every entry must address the one block, in order and end to end. */
 	dma_addr_t base = sgt.sgl[0].dma_address;
+	/* A failed mapping leaves no device address, and the checks below read and
+	 * write through it — reporting the failure beats faulting the kernel on a
+	 * null dereference, which is what an unmapped bounce pool used to do. */
+	if (!base) {
+		sg_free_table(&sgt);
+		for (u32 i = 0; i < pages; i++)
+			pmm_free_frame(frames[i]);
+		lkpi_report("dma-bounce-sg", 0, 4);
+		return;
+	}
 	if (!dma_mapping_is_bounced(base))
 		ok &= ~(1 << 1);
 	u64 off = 0;

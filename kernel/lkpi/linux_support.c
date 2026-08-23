@@ -1051,9 +1051,24 @@ void lkpi_cpuinfo_init(void)
 {
   u32 eax = 0, ebx = 0, ecx = 0, edx = 0;
 
+#if defined(__x86_64__)
   __asm__ volatile("cpuid"
                    : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
                    : "a"(1u), "c"(0u));
+#else
+  /* No CPUID here. boot_cpu_data stays zeroed, which is what the imported code
+   * reads as "no x86 quirk applies" — the cache line size below is filled from
+   * CTR_EL0 instead, since flush loops divide by it. */
+  {
+    u64 ctr;
+
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    /* CTR_EL0.CWG, log2 of the cache writeback granule in words. */
+    u32 cwg = (u32)((ctr >> 24) & 0xf);
+
+    ebx = (u32)(((cwg ? (4u << cwg) : 64u) / 8u) << 8);
+  }
+#endif
 
   boot_cpu_data.x86 = (u8)((eax >> 8) & 0xf);
   boot_cpu_data.x86_model = (u8)((eax >> 4) & 0xf);

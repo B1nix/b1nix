@@ -18,9 +18,17 @@
 #include <b1nix/spinlock.h>
 #include <lkpi/page.h>
 
-/* Above the DRM vmap window (0xffffa100_00000000), with a terabyte of
- * clearance, so the two never grow into each other. */
+/* Above the DRM vmap window, with clearance so the two never grow into each
+ * other. On aarch64 both live under 512 GiB, inside the L0[0] entry every
+ * address space shares — see the note on DRM_VMAP_BASE in kernel/dev/drm.c. */
+#if defined(__aarch64__)
+#define LKPI_VMAP_BASE  0x5800000000ULL /* 352 GiB, 32 GiB above DRM's */
+/* Below the identity map's start: nothing the kernel owns lives under it. */
+#define LKPI_MIN_KERNEL_ADDR 0x40000000ULL
+#else
 #define LKPI_VMAP_BASE  0xffffa20000000000ULL
+#define LKPI_MIN_KERNEL_ADDR 0xffff800000000000ULL
+#endif
 #define LKPI_VMAP_PAGES 8192u /* 32 MiB of window */
 
 static spinlock_t g_vmap_lock = SPINLOCK_INIT;
@@ -263,7 +271,12 @@ void *lkpi_vmap(struct page **pages, usize count, u32 prot)
 		 * #GP inside the mapping loop, which reports the fault here and says
 		 * nothing about who built the array. Refuse, and name the slot.
 		 */
-		if (pages[i] && (u64)(usize)pages[i] < 0xffff800000000000ull) {
+		/* "Kernel address" is spelled differently per arch: x86_64 puts the
+		 * kernel half at the top of the canonical range, while aarch64's
+		 * kernel objects live in the low half (identity RAM from 0x40000000,
+		 * heap at 64 GiB). Testing the x86 bound here rejected every legitimate
+		 * struct page on aarch64 and failed every vmap. */
+		if (pages[i] && (u64)(usize)pages[i] < LKPI_MIN_KERNEL_ADDR) {
 			char msg[96];
 			snprintf(msg, sizeof(msg),
 			         "lkpi_vmap: slot %lu of %lu is not a kernel pointer (%p)",

@@ -17,6 +17,7 @@
  *     verified rather than inferred from lookups succeeding.
  */
 
+#include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -1125,7 +1126,7 @@ static void rcu_reader_thread(void *arg)
 			g_rcu_reader_saw_poison = 1;
 			break;
 		}
-		__asm__ volatile("pause");
+		cpu_relax();
 		tlb_shootdown_poll();
 	}
 
@@ -1199,7 +1200,7 @@ void lkpi_rcu_smp_selftest(void)
 		}
 		if (g_rcu_reader_done)
 			break;
-		__asm__ volatile("pause");
+		cpu_relax();
 		tlb_shootdown_poll();
 	}
 
@@ -1214,7 +1215,7 @@ void lkpi_rcu_smp_selftest(void)
 		 * the reader seeing it: the reader had simply started later. The
 		 * poison is only evidence when it lands while a reader is inside. */
 		for (u64 i = 0; i < 200000000ull && !g_rcu_reader_done; i++) {
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 		}
 		synchronize_rcu();
@@ -1235,7 +1236,7 @@ void lkpi_rcu_smp_selftest(void)
 	g_rcu_shared.magic = RCU_POISON;
 
 	for (u64 i = 0; i < 200000000ull && !g_rcu_reader_done; i++) {
-		__asm__ volatile("pause");
+		cpu_relax();
 		tlb_shootdown_poll();
 	}
 	if (!g_rcu_reader_done)

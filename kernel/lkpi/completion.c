@@ -69,7 +69,7 @@ void wait_for_completion(struct completion *c)
 			/* No scheduler yet (early boot) or interrupts are off: poll. The
 			 * completion can still be set by a device interrupt in the first
 			 * case and by another CPU in the second. */
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}
@@ -89,18 +89,39 @@ void wait_for_completion(struct completion *c)
  * is the whole point of using it here. */
 static u64 tsc_per_tick(void)
 {
+#if defined(__aarch64__)
+	/* CNTVCT_EL0 advances at CNTFRQ_EL0, not at the CPU clock, so the CPU's
+	 * calibrated kHz would be the wrong scale here. A tick is 10 ms. */
+	u64 hz;
+
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+	return hz ? hz / 100ull : 0;
+#else
 	u32 khz = arch_cpu_khz();
 
 	/* A tick is 10 ms, so a tick is 10 * (cycles per ms). */
 	return khz ? (u64)khz * 10ull : 0;
+#endif
 }
 
+/* A cycle counter that keeps running with interrupts off. x86_64 has the TSC;
+ * aarch64's equivalent is the virtual counter CNTVCT_EL0, which is likewise
+ * independent of the timer interrupt. */
 static inline u64 read_tsc(void)
 {
+#if defined(__x86_64__)
 	u32 lo, hi;
 
 	__asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
 	return ((u64)hi << 32) | lo;
+#elif defined(__aarch64__)
+	u64 v;
+
+	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+	return v;
+#else
+	return 0;
+#endif
 }
 
 u64 wait_for_completion_timeout(struct completion *c, u64 timeout_ticks)
@@ -141,7 +162,7 @@ u64 wait_for_completion_timeout(struct completion *c, u64 timeout_ticks)
 			 * not enough. */
 			if (tsc_deadline && read_tsc() >= tsc_deadline)
 				return 0;
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}

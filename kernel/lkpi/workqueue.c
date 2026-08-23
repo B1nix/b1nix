@@ -5,7 +5,7 @@
  * See kernel/include/lkpi/workqueue.h.
  */
 
-#include <b1nix/console.h>
+#include <b1nix/arch.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
@@ -237,7 +237,7 @@ int flush_work(struct work_struct *work)
 	while (work->pending || work->running) {
 		waited = 1;
 		if (!scheduler_can_block()) {
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}
@@ -263,7 +263,7 @@ void flush_workqueue(struct workqueue_struct *wq)
 		if (idle)
 			return;
 		if (!scheduler_can_block()) {
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}
@@ -293,12 +293,36 @@ void destroy_workqueue(struct workqueue_struct *wq)
 }
 
 static struct workqueue_struct *g_system_wq;
+static struct workqueue_struct *g_system_unbound_wq;
 
 struct workqueue_struct *lkpi_system_wq(void)
 {
 	if (!g_system_wq)
 		g_system_wq = alloc_workqueue("lkpi-events", 0, 1);
 	return g_system_wq;
+}
+
+/*
+ * A pool of its own, because upstream's two names are two pools.
+ *
+ * Each queue here is served by exactly one thread, so a work item that queues
+ * more work and then waits for it deadlocks if both land in the same queue —
+ * nothing is left to run the inner item. That is not hypothetical: RMFB runs
+ * drm_mode_rmfb_work_fn on system_wq, which removes the framebuffer from its
+ * planes through an atomic commit, and that commit queues commit_work on
+ * system_unbound_wq and waits. Aliasing the two names wedged the only worker
+ * and, behind it, every later commit — a page flip then never sent its
+ * completion event and userspace waited on a frame that could not land.
+ *
+ * Linux does not hit this because system_wq is a per-CPU pool and
+ * system_unbound_wq an unbound one with real concurrency; keeping them
+ * separate is the property the imported code is entitled to, not a workaround.
+ */
+struct workqueue_struct *lkpi_system_unbound_wq(void)
+{
+	if (!g_system_unbound_wq)
+		g_system_unbound_wq = alloc_workqueue("lkpi-unbound", 0, 1);
+	return g_system_unbound_wq;
 }
 
 int workqueue_pending(struct workqueue_struct *wq)

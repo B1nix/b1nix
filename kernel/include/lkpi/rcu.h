@@ -88,21 +88,13 @@ void rcu_init(void);
 #define rcu_assign_pointer(slot, ptr) \
 	__atomic_store_n(&(slot), (ptr), __ATOMIC_RELEASE)
 
-/*
- * Read a pointer published that way. Must be called inside a read-side section:
- * the pointer is only guaranteed to stay alive for as long as that section.
- */
 #define rcu_dereference(slot) __atomic_load_n(&(slot), __ATOMIC_ACQUIRE)
 
-/*
- * Read a pointer while holding the lock that guards updates to it, rather than
- * inside a read-side section. The condition argument documents which lock that
- * is; it is not checked here, because b1nix's lock checker knows nothing about
- * the classes imported code declares — see <linux/lockdep.h>.
- */
 #define rcu_dereference_protected(slot, cond) \
 	((void)(cond), __atomic_load_n(&(slot), __ATOMIC_RELAXED))
 #define rcu_dereference_raw(slot) rcu_dereference(slot)
+#define rcu_access_pointer(p)     __atomic_load_n(&(p), __ATOMIC_RELAXED)
+#define RCU_INIT_POINTER(p, v)    do { (p) = (v); } while (0)
 #define rcu_replace_pointer(slot, ptr, cond)                        \
 	({                                                              \
 		typeof(slot) __old = (slot);                                \
@@ -110,27 +102,6 @@ void rcu_init(void);
 		rcu_assign_pointer(slot, ptr);                              \
 		__old;                                                      \
 	})
-
-
-/*
- * Publishing and reading a pointer under RCU.
- *
- * The barriers are the whole content: the writer must not let the store of the
- * pointer be seen before the stores that initialised what it points at, and the
- * reader must not let the load of the target be hoisted above the load of the
- * pointer. Both are real here, not decoration — b1nix runs SMP with a weakly
- * ordered compiler even where x86 gives ordering for free.
- */
-#define rcu_dereference(p)        __atomic_load_n(&(p), __ATOMIC_CONSUME)
-#define rcu_dereference_raw(p)    rcu_dereference(p)
-#define rcu_dereference_protected(p, c) ({ (void)(c); (p); })
-/* Reading only to compare or to test for NULL: no dereference follows, so no
- * ordering is needed, and saying so keeps the distinction upstream draws. */
-#define rcu_access_pointer(p)     __atomic_load_n(&(p), __ATOMIC_RELAXED)
-#define rcu_assign_pointer(p, v)  __atomic_store_n(&(p), (v), __ATOMIC_RELEASE)
-/* Initialising a pointer nobody can be reading yet — no release needed, and
- * upstream keeps the separate name so that claim stays visible at the call. */
-#define RCU_INIT_POINTER(p, v)    do { (p) = (v); } while (0)
 
 
 /* Free after a grace period. b1nix's synchronize_rcu is a real wait (see the

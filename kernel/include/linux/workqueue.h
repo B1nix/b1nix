@@ -30,7 +30,7 @@
  * one name the preprocessor refuses to expand twice, and turned every alias of
  * it into `(system_wq())()`. */
 #define system_wq         (lkpi_system_wq())
-#define system_unbound_wq (lkpi_system_wq())
+#define system_unbound_wq (lkpi_system_unbound_wq())
 #define system_highpri_wq (lkpi_system_wq())
 #define system_long_wq    (lkpi_system_wq())
 /* A work item living on the caller's stack. b1nix tracks no per-item debug
