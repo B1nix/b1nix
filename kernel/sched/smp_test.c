@@ -21,6 +21,7 @@
 #include <b1nix/console.h>
 #include <b1nix/lapic.h>
 #include <b1nix/runqueue.h>
+#include <b1nix/arch.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 
@@ -71,7 +72,7 @@ void smp_selftest_run(void) {
     int cpus = get_online_cpu_count();
     for (u64 w = 0; cpus <= 1 && w < 400; w++) {
         for (volatile int k = 0; k < 100000; k++)
-            __asm__ volatile("pause");
+            cpu_relax();
         cpus = get_online_cpu_count();
     }
     if (cpus <= 1) {
@@ -107,7 +108,7 @@ void smp_selftest_run(void) {
         done = g_smp_done;
         spin_unlock(&g_smp_lock);
         for (volatile int k = 0; k < 20000; k++)
-            __asm__ volatile("pause");
+            cpu_relax();
         spins++;
     } while (done < created && spins < max_spins);
 

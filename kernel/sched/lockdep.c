@@ -299,6 +299,11 @@ void spin_lock_stuck(volatile int *lock, u64 caller) {
     console_write("\n  caller: 0x");
     console_write_hex64(caller);
     ksym_print(caller);
+    {
+        /* If this is a runqueue lock, name the CPU that has it. */
+        extern void rq_describe_lock(const void *lock);
+        rq_describe_lock((const void *)lock);
+    }
     /*
      * The immediate caller is whichever inline wrapper took the lock, which
      * names the locking helper and not the code that wanted the lock. Walk the

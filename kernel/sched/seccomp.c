@@ -316,8 +316,13 @@ int seccomp_filter_syscall(u64 number, u64 a0, u64 a1, u64 a2, u64 a3,
   struct seccomp_data data;
   memset(&data, 0, sizeof(data));
   data.nr = (int)number;
+#if defined(__aarch64__)
+  data.arch = AUDIT_ARCH_AARCH64;
+  data.instruction_pointer = frame ? frame->elr : 0;
+#else
   data.arch = AUDIT_ARCH_X86_64;
   data.instruction_pointer = frame ? frame->rip : 0;
+#endif
   data.args[0] = a0;
   data.args[1] = a1;
   data.args[2] = a2;

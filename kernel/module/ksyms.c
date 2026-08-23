@@ -111,8 +111,11 @@ EXPORT_SYMBOL(pci_find_class);
 EXPORT_SYMBOL(pci_config_read16);
 EXPORT_SYMBOL(pci_config_read32);
 EXPORT_SYMBOL(pci_config_write16);
+#if defined(__x86_64__)
+/* Port I/O exists only on x86; AArch64 modules use MMIO. */
 EXPORT_SYMBOL(inb);
 EXPORT_SYMBOL(outb);
+#endif
 
 /* ── sound core ──────────────────────────────────────────────────────────── */
 EXPORT_SYMBOL(sound_register);

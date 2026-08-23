@@ -20,6 +20,7 @@
  *   M28-HEAPBENCH: ok
  */
 
+#include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
@@ -30,9 +31,17 @@
 #define HB_OPS_PER_WORKER 20000u
 
 static inline u64 hb_rdtsc(void) {
+#if defined(__x86_64__)
     u32 lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((u64)hi << 32) | lo;
+#elif defined(__aarch64__)
+    u64 val;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+#else
+    return 0;
+#endif
 }
 
 static spinlock_t hb_lock = SPINLOCK_INIT;
@@ -47,7 +56,7 @@ static volatile int hb_go;
 static void hb_worker(void *arg) {
     (void)arg;
     while (!__atomic_load_n(&hb_go, __ATOMIC_ACQUIRE))
-        __asm__ volatile("pause");
+        cpu_relax();
 
     /* Mix of small size classes — the common kmalloc traffic (task structs,
      * vfs nodes, fd tables, path buffers). Each iteration allocs and frees so
@@ -97,7 +106,7 @@ static u64 hb_run_round(int nworkers) {
         done = hb_done;
         spin_unlock(&hb_lock);
         for (volatile int k = 0; k < 20000; k++)
-            __asm__ volatile("pause");
+            cpu_relax();
         spins++;
     } while (done < created && spins < max_spins);
 

@@ -221,7 +221,11 @@ void rseq_on_return_to_user(struct interrupt_frame *frame) {
   if (cs.version != 0)
     return;
 
+#if defined(__aarch64__)
+  u64 rip = frame->elr;
+#else
   u64 rip = frame->rip;
+#endif
   if (rip < cs.start_ip || rip >= cs.start_ip + cs.post_commit_offset) {
     /* Not inside the sequence: the descriptor is consumed either way, so a
      * later interruption cannot re-abort against a stale section. */
@@ -245,7 +249,11 @@ void rseq_on_return_to_user(struct interrupt_frame *frame) {
   u64 zero = 0;
   if (syscall_copyout((void *)(usize)(uptr + RSEQ_CS_OFF), &zero, sizeof(zero)) < 0)
     return;
+#if defined(__aarch64__)
+  frame->elr = cs.abort_ip;
+#else
   frame->rip = cs.abort_ip;
+#endif
 }
 
 int rseq_is_registered(struct task *t) {

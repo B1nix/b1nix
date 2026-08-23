@@ -801,6 +801,14 @@ void net_init(void)
 	net_scan_pci_adapters();
 
 	/* Probe every supported NIC, then prefer one whose PHY reports carrier. */
+#if defined(__aarch64__)
+	/* QEMU virt has no PCI host bridge wired up here: the NIC arrives over the
+	 * virtio-mmio transport, same as the block device. */
+	{
+		extern int virtio_net_mmio_init(void);
+		virtio_net_mmio_init();
+	}
+#endif
 	virtio_net_probe();
 	e1000_probe();
 	r8169_probe();   /* Realtek RTL8169/8168/8111/810x family (e.g. ZG5 RTL8102E) */
@@ -820,6 +828,15 @@ void net_init(void)
 		net_proto_reset();
 	}
 
+	/* The pump runs even with no NIC: loopback delivery is deferred onto a
+	 * queue that only net_poll() drains, so without this daemon every
+	 * 127.0.0.1 connect/accept blocks forever. x86_64 never noticed because
+	 * the smoke instances always have a virtio-net/e1000 attached; aarch64
+	 * (QEMU virt, no PCI NIC) hung in net_smoke's TCP loopback test. */
+	if (!nd) {
+		net_task_id = kthread_create("net_task", net_task, 0);
+		return;
+	}
 	/* Networking is on by default: bring the link up via DHCP whenever a NIC is
 	 * present. Opt out with b1nix.net=off (or b1nix.nonet) for an isolated boot;
 	 * b1nix.net=dhcp is still accepted as an explicit no-op for back-compat. */

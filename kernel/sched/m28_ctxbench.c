@@ -24,9 +24,17 @@
 #include <b1nix/sched.h>
 
 static inline u64 rdtsc(void) {
+#if defined(__x86_64__)
     u32 lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((u64)hi << 32) | lo;
+#elif defined(__aarch64__)
+    u64 val;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+#else
+    return 0;
+#endif
 }
 
 void m28_ctxbench_run(void) {

@@ -21,7 +21,6 @@ void *memcpy(void *dest, const void *src, size_t count)
 {
 	unsigned char *d = dest;
 	const unsigned char *s = src;
-
 #ifdef __x86_64__
 	if (count >= STRING_INSN_THRESHOLD) {
 		/* cld: the copy must run forward. The ABI hands every function DF
@@ -35,11 +34,20 @@ void *memcpy(void *dest, const void *src, size_t count)
 	}
 #endif
 
-	while (count >= 8) {
-		*(unsigned long long *)d = *(const unsigned long long *)s;
-		d += 8;
-		s += 8;
-		count -= 8;
+	/* Only widen the copy when both sides share an 8-byte phase: aarch64
+	 * traps unaligned accesses to device memory, and the wide loop below is
+	 * the one path that would issue them. */
+	if (((uintptr_t)d & 7) == ((uintptr_t)s & 7)) {
+		while (count > 0 && ((uintptr_t)d & 7)) {
+			*d++ = *s++;
+			count--;
+		}
+		while (count >= 8) {
+			*(unsigned long long *)d = *(const unsigned long long *)s;
+			d += 8;
+			s += 8;
+			count -= 8;
+		}
 	}
 	while (count > 0) {
 		*d++ = *s++;
@@ -52,8 +60,7 @@ void *memset(void *dest, int value, size_t count)
 {
 	unsigned char *d = dest;
 	unsigned char v = (unsigned char)value;
-	unsigned long long v64 = ((unsigned long long)v << 56) | ((unsigned long long)v << 48) | ((unsigned long long)v << 40) | ((unsigned long long)v << 32) | 
-	             ((unsigned long long)v << 24) | ((unsigned long long)v << 16) | ((unsigned long long)v << 8) | (unsigned long long)v;
+	unsigned long long v64 = (unsigned long long)v * 0x0101010101010101ULL;
 
 #ifdef __x86_64__
 	if (count >= STRING_INSN_THRESHOLD) {
@@ -65,6 +72,10 @@ void *memset(void *dest, int value, size_t count)
 	}
 #endif
 
+	while (count > 0 && ((uintptr_t)d & 7)) {
+		*d++ = v;
+		count--;
+	}
 	while (count >= 8) {
 		*(unsigned long long *)d = v64;
 		d += 8;

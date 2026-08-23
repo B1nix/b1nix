@@ -395,7 +395,7 @@ static volatile int dcache_lock = 0;
 static void dcache_acquire(u64 *flags) {
   *flags = interrupts_save();
   while (__atomic_test_and_set(&dcache_lock, __ATOMIC_ACQUIRE))
-    __asm__ volatile("pause" ::: "memory");
+    cpu_relax();
 }
 
 static void dcache_release(u64 flags) {
@@ -1178,10 +1178,10 @@ static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node) {
 }
 
 void virtio_blk_init(void);
-#ifndef __aarch64__
+void virtio_blk_mmio_init(void);
+void bcm2711_emmc_init(void);
 extern char ps2_kbd_getc(void);
 extern int ps2_kbd_has_data(void);
-#endif
 int serial_has_data(void);
 
 int vfs_mount(const char *source, const char *target, const char *fstype,
@@ -2826,6 +2826,12 @@ void vfs_init(void) {
 
 #ifndef __aarch64__
   virtio_blk_init();
+#else
+  virtio_blk_mmio_init();
+  /* The SD card a Raspberry Pi 4 boots from. Returns immediately on a board
+   * whose device tree describes no such controller, which is every other one
+   * this port runs on. */
+  bcm2711_emmc_init();
 #endif
 
   for (usize i = 0; i < blk_count(); i++) {
@@ -2994,9 +3000,15 @@ void vfs_populate_dev(void) {
   virtio_gpu_dev_init();
 
   /* Sound device nodes (/dev/dsp, /dev/dsp1) created by hda_init/ac97_init
-   * land on the initramfs root and are re-registered here, like fb/input. */
+   * land on the initramfs root and are re-registered here, like fb/input.
+   *
+   * HDA is a PCI device driven entirely through MMIO, so it belongs on every
+   * arch that has a PCI bus — which this port does now. AC'97 stays x86: its
+   * register file is reached through I/O ports, which do not exist here. */
   sound_module_dev_init();
+#if defined(__x86_64__)
   ac97_dev_init();
+#endif
 
   /* M107 device nodes — virtual terminals, /dev/kmsg, /dev/rtc*, /dev/watchdog,
    * /dev/loop-control and the SMBus adapter. Same reason as everything above:
@@ -4005,7 +4017,14 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
         return -ENOMEM;
       }
       if (node->inode->data) {
-        memcpy(new_data, node->inode->data, node->inode->size);
+        /* Preserve what the old buffer held, but never more than the new one
+         * can take: a node whose data came from the initramfs carries a real
+         * size with capacity 0, and copying that whole file into a buffer
+         * sized for the incoming write alone overruns the kernel heap. */
+        usize keep = node->inode->size;
+        if (keep > new_cap)
+          keep = new_cap;
+        memcpy(new_data, node->inode->data, keep);
         if (node->inode->flags & VFS_NODE_OWNS_DATA)
           kfree(node->inode->data);
       }
@@ -6348,6 +6367,21 @@ int vfs_move_mount(const char *source, const char *target) {
   return 0;
 }
 
+/* Is this block device the source of a live mount? A self-test that wants a
+ * disk nothing else owns has no other way to ask: on one board the first
+ * virtio disk is a scratch image, on another it is the root filesystem, and
+ * writing test patterns into the running root is not a mistake worth making
+ * twice. */
+int vfs_device_is_mounted(const char *name) {
+  if (!name || !name[0] || !mounts)
+    return 0;
+  for (usize i = 0; i < mount_slots; i++) {
+    if (mounts[i].used && strcmp(mounts[i].source, name) == 0)
+      return 1;
+  }
+  return 0;
+}
+
 int vfs_umount(const char *target) {
   if (!target)
     return -EINVAL;
@@ -7398,7 +7432,11 @@ int vfs_ftruncate(int fd, u64 length) {
       return -ENOMEM;
     }
     if (inode->data) {
-      memcpy(new_data, inode->data, inode->size);
+      /* Same clamp as vfs_write: copy no more than the new buffer holds. */
+      usize keep = inode->size;
+      if (keep > new_cap)
+        keep = new_cap;
+      memcpy(new_data, inode->data, keep);
       if (inode->flags & VFS_NODE_OWNS_DATA)
         kfree(inode->data);
     }

@@ -16,44 +16,7 @@ static usize klog_read_pos;
 static int klog_overflow;
 
 /* ── Symbol table for backtraces ── */
-#define MAX_SYMBOLS 2048
 
-struct kernel_symbol {
-	u64 address;
-	char name[64];
-};
-
-static struct kernel_symbol symbol_table[MAX_SYMBOLS];
-static int symbol_count;
-
-void klog_register_symbol(u64 address, const char *name)
-{
-	if (symbol_count >= MAX_SYMBOLS) return;
-	symbol_table[symbol_count].address = address;
-	usize len = strlen(name);
-	if (len > 63) len = 63;
-	memcpy(symbol_table[symbol_count].name, name, len);
-	symbol_table[symbol_count].name[len] = '\0';
-	symbol_count++;
-}
-
-static const char *klog_lookup_symbol(u64 address)
-{
-	const char *best_name = 0;
-	u64 best_diff = (u64)-1;
-
-	for (int i = 0; i < symbol_count; i++) {
-		if (symbol_table[i].address <= address) {
-			u64 diff = address - symbol_table[i].address;
-			if (diff < best_diff) {
-				best_diff = diff;
-				best_name = symbol_table[i].name;
-			}
-		}
-	}
-
-	return best_name;
-}
 
 /* ── kallsyms: post-link symbol blob (M35) ──
  * Walks the packed [u64 addr][asciz name] records the two-pass link emitted
@@ -301,7 +264,12 @@ usize klog_size(void)
 	return KLOG_BUF_SIZE - klog_read_pos + klog_write_pos;
 }
 
-/* ── Enhanced panic with backtrace ── */
+/* ── Enhanced panic with backtrace ──
+ * Symbolication goes through ksym_print/ksym_lookup, i.e. the kallsyms blob the
+ * two-pass link appends. It used to use klog_lookup_symbol, which reads a small
+ * table that code has to register into by hand and which is empty in practice —
+ * so every kernel panic on every arch printed a bare address list, and aarch64
+ * (no gdbstub here) had nothing else to go on. */
 void panic_backtrace(void)
 {
 	int depth = 0;
@@ -321,22 +289,7 @@ void panic_backtrace(void)
 		console_write(" 0x");
 		console_write_hex64(lr);
 
-		const char *name = klog_lookup_symbol(lr);
-		if (name) {
-			console_write(" <");
-			console_write(name);
-			u64 sym_addr = 0;
-			for (int i = 0; i < symbol_count; i++) {
-				if (symbol_table[i].address <= lr &&
-				    symbol_table[i].address > sym_addr)
-					sym_addr = symbol_table[i].address;
-			}
-			if (sym_addr && lr > sym_addr) {
-				console_write("+0x");
-				console_write_hex64(lr - sym_addr);
-			}
-			console_write(">");
-		}
+		ksym_print(lr);
 		console_write("\n");
 
 		if (fp == 0 || fp <= (u64)(usize)rbp) break;
@@ -359,12 +312,7 @@ void panic_backtrace(void)
 		console_write(" 0x");
 		console_write_hex64(rip);
 
-		const char *name = klog_lookup_symbol(rip);
-		if (name) {
-			console_write(" <");
-			console_write(name);
-			console_write(">");
-		}
+		ksym_print(rip);
 		console_write("\n");
 
 		rbp = (u64 *)(usize)new_rbp;
@@ -386,12 +334,7 @@ void panic_backtrace(void)
 		console_write(" 0x");
 		console_write_hex64(eip);
 
-		const char *name = klog_lookup_symbol(eip);
-		if (name) {
-			console_write(" <");
-			console_write(name);
-			console_write(">");
-		}
+		ksym_print(eip);
 		console_write("\n");
 
 		ebp = (u32 *)(usize)new_ebp;

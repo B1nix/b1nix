@@ -269,12 +269,16 @@ struct task {
   int stop_report_pending;
   int continued_report_pending;
 
-  /* x86 FPU/SSE state. 512-byte FXSAVE area, 16-byte aligned for
-   * fxsave/fxrstor. Saved/restored across context switches so userspace
-   * XMM/MXCSR/x87 state survives scheduling (e.g. the native GCC's cc1).
-   * fpu_initialized is 0 until the task has run once; the first switch-in
-   * loads a clean FPU image instead of the uninitialized buffer. */
-  __attribute__((aligned(16))) u8 fpu_state[512];
+  /* Per-task FPU state, saved/restored across context switches so userspace
+   * vector state survives scheduling. fpu_initialized is 0 until the task has
+   * run once; the first switch-in loads a clean image instead of the
+   * uninitialized buffer.
+   *
+   * The layout is the architecture's ptrace FP register set (struct
+   * user_fpregs_struct), so PTRACE_GETFPREGS/NT_PRFPREG can copy it out
+   * verbatim: x86_64's 512-byte FXSAVE area, or aarch64's user_fpsimd_state
+   * (32 V registers + FPSR + FPCR + 8 reserved = 528). */
+  __attribute__((aligned(16))) u8 fpu_state[528];
   int fpu_initialized;
 
   /* SMP work-stealing: when set, this task is a self-contained CPU-bound
@@ -473,6 +477,10 @@ int  scheduler_setrlimit(int resource, const struct rlimit *rlim);
 /* ── Scheduler ── */
 
 void scheduler_init(void);
+/* True when `t` is the address of a real task slot. Runqueue walks use it to
+ * tell a corrupted list from a short one. */
+int sched_task_ptr_valid(const struct task *t);
+
 int kthread_create(const char *name, kernel_thread_entry entry, void *arg);
 /* Like kthread_create, but marks the task ap_runnable so Application Processors
  * may run it (used for userspace processes, which enter ring 3 and release the
@@ -525,7 +533,9 @@ int scheduler_fork_ctid(u64 child_tid_addr);
  * exit) to let a vfork parent continue. */
 void scheduler_vfork_release(void);
 
-/* The user register file a clone(2) child resumes with.
+struct interrupt_frame;
+
+/* The user register file a clone(2) child resumes with on x86_64.
  *
  * Linux gives the child the caller's registers unchanged apart from a zero
  * return value and the new stack pointer, and libcs depend on that: glibc's
@@ -540,11 +550,22 @@ struct clone_user_regs {
   u64 r8, r9, r10, r11, r12, r13, r14, r15;
 };
 
+#if defined(__aarch64__)
+/* user_lr: the caller's link register at the clone(2) syscall. AArch64 has no
+ * return address on the stack, so a vfork child — which resumes at the parent's
+ * continuation and immediately `ret`s — needs it; 0 elsewhere. */
+int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
+                           u64 tls, u64 ctid,
+                           u64 parent_tid_addr, u64 child_tid_addr,
+                           u64 start_func, u64 user_lr,
+                           const struct interrupt_frame *pframe);
+#else
 int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
                            u64 tls, u64 ctid,
                            u64 parent_tid_addr, u64 child_tid_addr,
                            u64 start_func,
                            const struct clone_user_regs *uregs);
+#endif
 
 /* M29: futex. op is B1NIX_FUTEX_WAIT or B1NIX_FUTEX_WAKE. Returns 0 on success,
  * -errno otherwise. WAIT blocks if *uaddr == val; WAKE wakes up to val
@@ -763,6 +784,11 @@ int scheduler_timer_delete(int id);
 void scheduler_timer_cleanup_task(usize task_id);
 void scheduler_deliver_pending_signals(void);
 int  scheduler_signal_pending(void);
+/* Also true when the pending signal's DEFAULT action stops or kills the task
+ * (SIGSTOP has no handler to report, so the narrower predicate above misses
+ * it). Used by the poll/select sleep so PTRACE_ATTACH can stop a tracee that
+ * is blocked in a syscall. */
+int  scheduler_signal_pending_or_stops(void);
 /* Any deliverable signal, handler or not — what a sleep must check to know it
  * was cut short (SIGKILL has no handler and still ends the wait). */
 int  scheduler_signal_pending_any(void);

@@ -1,3 +1,4 @@
+#include <b1nix/console.h>
 #include <b1nix/vfs.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/ktime.h>
@@ -965,6 +966,16 @@ retry:;
     if (unix_deadline_passed(snd_deadline)) {
       unix_data_put(peer_u);
       return -EAGAIN; /* SO_SNDTIMEO expired with the buffer still full */
+    }
+    /* A wait channel of NULL is one nothing can ever wake: every wake on this
+     * path is guarded by `if (peer_sock)`, so a sleeper published against NULL
+     * stays BLOCKED for good — which is exactly how a full buffer here wedged
+     * both ends of the socket. Yield and re-test instead; the peer either
+     * acquires a socket state or hangs up, and both are handled on retry. */
+    if (!psock) {
+      unix_data_put(peer_u);
+      scheduler_yield();
+      goto retry;
     }
     if (snd_deadline)
       scheduler_wait_prepare_timeout(psock, unix_deadline_remaining(snd_deadline));

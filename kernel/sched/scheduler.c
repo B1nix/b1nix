@@ -29,6 +29,8 @@
 extern void tlb_shootdown_poll(void);
 #ifdef __x86_64__
 #include <b1nix/arch_x86_64.h>
+#elif defined(__aarch64__)
+#include <b1nix/arch_aarch64.h>
 #else
 #include <b1nix/arch_x86.h>
 #endif
@@ -79,7 +81,22 @@ _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
  * and the VFS/ext4 call chain they exceed 16 KB. SMP/T8 preemption adds
  * enough nested scheduler/signal/syscall frames that 32 KB still leaves too
  * little headroom for the M12/M14 stress paths. */
+/* aarch64 needs more headroom than x86_64's tuned 64 KB: SAVE_REGS/
+ * RESTORE_REGS plus this build's unoptimized (-O0-ish, -mgeneral-regs-only)
+ * codegen produce noticeably bigger per-frame stack usage for the same VFS/
+ * ext4/ELF-load call chains, and openrc-init's boot sequence was observed
+ * driving a task to ~64 KB of usage on a single syscall (real overflow into
+ * adjacent kheap memory, not just a tight fit) before ever calling fork(). */
+#if defined(__aarch64__)
+#define KERNEL_STACK_SIZE (128 * 1024)
+#else
 #define KERNEL_STACK_SIZE (64 * 1024)
+#endif
+/* Written at the lowest address of every kernel stack and verified on each
+ * context switch. A kernel stack is an ordinary heap block, so an overflow
+ * silently corrupts whatever object sits below it and only surfaces later,
+ * somewhere unrelated — this turns that into an immediate, named panic. */
+#define KSTACK_CANARY 0xC0FFEE5713579BDFULL
 #define TASK_ENV_MAX 16
 #define TASK_ENV_VALUE_MAX 64
 
@@ -429,6 +446,34 @@ static int   g_task_nnp[MAX_TASKS];
 static inline struct task *T(usize i) {
   return &g_task_chunks[i >> 6][i & 63];
 }
+
+/*
+ * Is this a pointer to a real task slot?
+ *
+ * A runqueue holds task pointers and nothing else, so anything that is not the
+ * address of a slot means the list has been corrupted. Following such a
+ * pointer is not a crash at the point of corruption - the scheduler switches
+ * to a context assembled from whatever that memory held, and the fault
+ * surfaces later somewhere unrelated (a data abort in scheduler_yield's
+ * epilogue with a FAR of -3, for instance). Checking here names the problem
+ * where it can still be attributed.
+ */
+int sched_task_ptr_valid(const struct task *t) {
+  if (!t)
+    return 0;
+  for (usize c = 0; c < TASK_MAX_CHUNKS; c++) {
+    const struct task *base = g_task_chunks[c];
+
+    if (!base)
+      continue;
+    if (t >= base && t < base + TASK_CHUNK_SIZE) {
+      usize off = (usize)((const char *)t - (const char *)base);
+
+      return (off % sizeof(struct task)) == 0;
+    }
+  }
+  return 0;
+}
 /* current_task is per-CPU now (a macro -> get_percpu()->cur_task, see sched.h). */
 /* PID numbering follows the Unix model: the boot/idle task is PID 0 (Linux's
  * "swapper"), PID 1 is reserved for the userspace init process, and everything
@@ -654,6 +699,12 @@ static struct task *find_unused_task(void) {
    * — it is the permanent boot/idle task (the BSP's idle-fallback target). */
   for (usize i = 1; i < g_task_hwm; i++) {
     if (T(i)->state == TASK_UNUSED) {
+      /* A slot marked UNUSED while its task is still the one executing on this
+       * CPU means somebody reaped a live task; memsetting it here would turn
+       * that into an unexplainable crash somewhere else entirely. Fail at the
+       * point where the corruption would be created instead. */
+      if (T(i) == current_task)
+        panic("sched: reusing the slot of the task that is running");
       memset(T(i), 0, sizeof(struct task));
       /* M29: clear side-table metadata so the reused slot starts clean. */
       g_task_is_thread[i] = 0;
@@ -930,7 +981,7 @@ static struct task *pick_next_task(void) {
              __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == TASK_READY &&
              !__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE) &&
              !task_running_somewhere(t)) {
-        __asm__ volatile("pause");
+        cpu_relax();
         tlb_shootdown_poll();
         /* A hand-off that never completes is a deadlock, not contention: name
          * the task instead of spinning here with IRQs off forever (a silent,
@@ -1030,7 +1081,7 @@ static struct task *pick_next_task(void) {
            __atomic_load_n(&best_task->state, __ATOMIC_ACQUIRE) == TASK_READY &&
            !__atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE) &&
            !task_running_somewhere(best_task)) {
-      __asm__ volatile("pause");
+      cpu_relax();
       tlb_shootdown_poll();
       if (++handoff_spins > SCHED_HANDOFF_GRACE_SPINS) {
         sched_handoff_recover(best_task, "scan");
@@ -1281,7 +1332,23 @@ void scheduler_init(void) {
   boot->umask = 022;
   boot->process_group_id = boot->id;
   boot->session_id = boot->id;
+#if defined(__x86_64__)
   boot->kernel_stack_ptr = (u64)(usize)x86_syscall_stack_top;
+#elif defined(__aarch64__)
+  /* The boot task's own stack, the one boot.S set SP to. This must not be 0:
+   * the scheduler publishes it into this CPU's block (arch_set_kernel_stack), and the exception
+   * vectors' EL0_KSTACK_RESET treats 0 as "no task scheduled yet" and keeps
+   * whatever SP_EL1 happens to hold. Entering EL0 from the boot task therefore
+   * left SP_EL1 at 0, and the next SAVE_REGS turned that into -0x130 —
+   * observed as `interrupted SP_EL1: 0xfffffffffffffed0` with the task's real
+   * stack megabytes away. Give it the address it is actually running on. */
+  {
+    extern u8 stack_top[];
+    boot->kernel_stack_ptr = (u64)(usize)stack_top;
+  }
+#else
+  boot->kernel_stack_ptr = 0;
+#endif
   boot->pml4_phys = 0; // Kernel PML4
   boot->vma_list = 0;
   task_init_cred(boot);
@@ -1382,7 +1449,16 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
     return -1;
   }
 
-  u64 stack_top = align_down_u64((u64)(usize)stack + KERNEL_STACK_SIZE, 16);
+  /* Keep a slot of headroom below the end of the allocation instead of putting
+   * the stack top exactly at it. Entry code briefly touches the top of the
+   * frame it is building, which is harmless inside the heap but faults when
+   * this stack happens to be the topmost heap block — its exclusive top is
+   * then heap.end, the first unmapped address. That made the machine die at
+   * exception entry/exit with a translation fault at exactly heap.end,
+   * seemingly at random, since it needed the stack to land at the heap edge. */
+  *(u64 *)stack = KSTACK_CANARY;
+  u64 stack_top =
+      align_down_u64((u64)(usize)stack + KERNEL_STACK_SIZE - 64, 16);
   task->kernel_stack_ptr = stack_top;
 #ifdef __x86_64__
   u64 initial_rsp = stack_top - 16;
@@ -1411,8 +1487,12 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->wake_tick = 0;
 #ifdef __aarch64__
   task->context.fp = 0;
-  task->context.lr =
-      initial_rsp; // Use lr for entry point on AArch64 trampoline
+  /* arch_context_switch (context_switch.S) restores x30/lr from here and
+   * then `ret`s to it — lr IS the entry point on first switch-in, not a
+   * stack address. (Previously set to initial_rsp: the very first switch
+   * to any newly created aarch64 task `ret`ed into its own freshly
+   * kzalloc'd — therefore zeroed — kernel stack and immediately UDF-trapped.) */
+  task->context.lr = (u64)(usize)trampoline;
   task->context.sp = initial_rsp;
   task->context.x19 = 0;
   task->context.x20 = 0;
@@ -1432,12 +1512,6 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->context.r13 = 0;
   task->context.r14 = 0;
   task->context.r15 = 0;
-#else
-  task->context.esp = (u32)initial_rsp;
-  task->context.ebp = 0;
-  task->context.ebx = 0;
-  task->context.esi = 0;
-  task->context.edi = 0;
 #endif
   task->stdout_fd = parent_task ? parent_task->stdout_fd : -1;
   if (stealable) {
@@ -1537,7 +1611,16 @@ int kthread_create_user(const char *name, kernel_thread_entry entry, void *arg,
 
 int sched_create_stealable_worker(const char *name, kernel_thread_entry entry,
                                   void *arg) {
-  return kthread_create_impl(name, entry, arg, ap_worker_trampoline, 1, 0);
+  int id = kthread_create_impl(name, entry, arg, ap_worker_trampoline, 1, 0);
+
+  /* Tell the other CPUs there is something to steal. On x86_64 this is a
+   * reschedule IPI and mostly redundant — an idle AP is spinning on the
+   * runqueues there. On aarch64 it is the SEV that ends the idle CPU's WFE,
+   * and without it a CPU that parked before the workers existed sleeps
+   * through the whole test: `completed=0`, every worker still on the BSP. */
+  if (id >= 0)
+    ipi_reschedule_all();
+  return id;
 }
 
 /* Reap a finished stealable worker. Called by an AP from ap_main AFTER the
@@ -1726,6 +1809,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   // Copy parent's kernel stack
   void *parent_stack = parent->stack;
   memcpy(child_stack, parent_stack, KERNEL_STACK_SIZE);
+  *(u64 *)child_stack = KSTACK_CANARY;
 
   child->stack = child_stack;
 
@@ -1787,56 +1871,36 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
     child->context.rsp -= 8;
     *(u64 *)(usize)child->context.rsp = (u64)x86_fork_kernel_trampoline;
   }
-#else
-  u32 current_esp, current_ebp;
-  __asm__ volatile("movl %%esp, %0" : "=r"(current_esp));
-  __asm__ volatile("movl %%ebp, %0" : "=r"(current_ebp));
+#elif defined(__aarch64__)
+  if (is_user && frame) {
+    /* Unlike x86_64 (TSS.rsp0 hardware-pins every EL0->EL1 entry to a fixed
+     * address == kernel_stack_ptr), aarch64's SP_EL1 is just whatever the
+     * general kernel "sp" was left at by the last context switch — it drifts
+     * with call depth and is NOT reliably kernel_stack_ptr - sizeof(frame).
+     * `frame` (passed down from isr.S's sync_el0, which set it to `sp` right
+     * after SAVE_REGS) is the one thing that DOES point at the real live
+     * frame. Relocate it into the child's copied stack by the same byte
+     * offset every other parent-stack pointer in this function uses, force
+     * x0=0 (fork's child return value), and let the child continue there. */
+    struct interrupt_frame *child_frame =
+        (struct interrupt_frame *)((u64)(usize)frame + stack_offset);
+    child_frame->x0 = 0;
 
-  // Save callee-saved registers of parent to restore in child context
-  __asm__ volatile("movl %%ebx, %0" : "=r"(child->context.ebx));
-  __asm__ volatile("movl %%esi, %0" : "=r"(child->context.esi));
-  __asm__ volatile("movl %%edi, %0" : "=r"(child->context.edi));
-
-  extern void x86_fork_child_trampoline(void);
-  extern void x86_fork_kernel_trampoline(void);
-
-  if (is_user) {
-    struct interrupt_frame *child_iframe = (struct interrupt_frame *)(usize)(child->kernel_stack_ptr - sizeof(struct interrupt_frame));
-    child_iframe->eax = 0;
-
-    /* x86_fork_child_trampoline jmps into x86_syscall_return, whose first pop
-     * expects ESP at the very base of the interrupt_frame (the saved EAX slot).
-     * arch_context_switch's `ret` pops the trampoline address we push below and
-     * leaves ESP at context.esp + 4, so context.esp must be child_iframe - 4
-     * for ESP to land exactly on child_iframe after the return. (An earlier
-     * stray `- 16` here left ESP 16 bytes low, so the 7 register pops + iret
-     * read EIP/CS from the wrong slots and iret faulted with a garbage CS.) */
-    child->context.esp = (u32)(usize)child_iframe;
-    child->context.ebp = current_ebp + (u32)stack_offset;
-
-    child->context.esp -= 4;
-    *(u32 *)(usize)child->context.esp = (u32)(usize)x86_fork_child_trampoline;
+    extern void aarch64_fork_child_trampoline(void);
+    child->context.sp = (u64)(usize)child_frame;
+    child->context.fp = 0;
+    child->context.lr = (u64)(usize)aarch64_fork_child_trampoline;
+  } else if (is_user) {
+    /* No frame (shouldn't happen for a real EL0 fork, but fail safe rather
+     * than resume with a garbage/uninitialized frame). */
+    free_task_slot(child);
+    kfree(child_stack);
+    interrupts_enable();
+    return -1;
   } else {
-    child->context.esp = current_esp + (u32)stack_offset;
-    child->context.ebp = current_ebp + (u32)stack_offset;
-
-    /* Relocate the entire saved frame-pointer chain into the child's copied stack. */
-    u32 clo = (u32)(usize)child_stack;
-    u32 chi = clo + KERNEL_STACK_SIZE;
-    u32 fp = child->context.ebp;
-    for (int i = 0; i < 64 && fp >= clo && fp + 8 <= chi; i++) {
-      u32 saved = *(u32 *)(usize)fp;
-      if (saved == 0)
-        break;
-      u32 reloc = saved + (u32)stack_offset;
-      if (reloc < clo || reloc + 8 > chi)
-        break;
-      *(u32 *)(usize)fp = reloc;
-      fp = reloc;
-    }
-
-    child->context.esp -= 4;
-    *(u32 *)(usize)child->context.esp = (u32)(usize)x86_fork_kernel_trampoline;
+    child->context.sp = (u64)(usize)child_stack + KERNEL_STACK_SIZE;
+    child->context.fp = 0;
+    child->context.lr = (u64)(usize)arch_halt;
   }
 #endif
 
@@ -2629,11 +2693,18 @@ struct clone_thread_args {
   u64 user_stack;
   u64 user_arg;
   u64 start_func;  /* musl pthread: start_routine pointer for r9 */
-
   /* The caller's user registers, handed to the child unchanged apart from a
    * zero return value (see struct clone_user_regs). */
   struct clone_user_regs uregs;
   int have_uregs;
+  u64 user_lr;     /* aarch64: caller's x30 (see scheduler_clone_thread) */
+#if defined(__aarch64__)
+  /* The parent's register frame at the clone(2) syscall. A clone child must
+   * inherit the whole register file, not just SP/PC: musl's vfork returns
+   * into a caller whose callee-saved registers are live. */
+  struct interrupt_frame uframe;
+  int have_uframe;
+#endif
 };
 
 extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv);
@@ -2646,6 +2717,12 @@ static void clone_thread_kentry(void *arg) {
   u64 start_func = cta->start_func;
   struct clone_user_regs uregs = cta->uregs;
   int have_uregs = cta->have_uregs;
+  u64 user_lr = cta->user_lr;
+  (void)user_lr;
+#if defined(__aarch64__)
+  struct interrupt_frame uframe = cta->uframe;
+  int have_uframe = cta->have_uframe;
+#endif
   kfree(cta);
   if (have_uregs) {
     /* Linux hands the child the caller's register file. Anything else breaks
@@ -2674,24 +2751,43 @@ static void clone_thread_kentry(void *arg) {
    * a dummy return-address slot. Without the `-8`, the thread entry runs with
    * %rsp ≡ 0 (mod 16), and the first `movaps %xmm,off(%rsp)` with a 16-aligned
    * `off` #GPs — e.g. Rust std's stack_overflow::make_handler zeroes a stack
-   * struct that way (the M67 std::thread crash). The i386 branch below already
-   * builds this frame; x86_64 must too. x86_user_jump drops its 3rd positional
+   * struct that way (the M67 std::thread crash). x86_user_jump drops its 3rd positional
    * (user_arg) into %rdi = start_routine's void* argument. */
   u64 sp = ((u64)stack & ~0xFUL) - 8;
   *(volatile u64 *)(usize)sp = 0; /* return address: threads exit via SYS_EXIT_THREAD, never ret */
   sched_acct_leave_kernel(); /* M86: kernel-time interval ends at the ring-3 jump */
   x86_user_jump((usize)entry, (usize)sp, (usize)user_arg, 0);
-#else
-  /* SysV i386 passes arguments on the stack, not in registers, and the 32-bit
-   * x86_user_jump clears the GPRs — so the thread's start_routine(void*) would
-   * read a zero arg from [esp+4] and dereference it (the M29 pthread crash).
-   * Build the expected call frame on the (CLONE_VM-shared, already-mapped) user
-   * stack: a fake return address at [esp] and the void* arg at [esp+4]. */
-  u32 sp = (u32)stack & ~0xFU; /* keep the 16-byte ABI alignment */
-  sp -= 8;
-  *(volatile u32 *)(usize)(sp + 4) = (u32)user_arg;
-  *(volatile u32 *)(usize)(sp + 0) = 0; /* return address: threads exit via SYS_EXIT_THREAD */
-  x86_user_jump((usize)entry, (usize)sp, 0, 0);
+#elif defined(__aarch64__)
+  /* AAPCS64: SP stays 16-byte aligned and there is no return address on the
+   * stack (x30 holds it), so no dummy slot to build. x0 carries the argument;
+   * for a musl clone that argument is 0, which is also the clone(2) return
+   * value the child must see — musl's __clone branches on it and then picks
+   * fn/arg back off the new stack itself. */
+  {
+    extern void aarch64_user_thread_jump(u64 entry, u64 sp, u64 arg, u64 lr);
+    extern void aarch64_eret_frame(struct interrupt_frame *f);
+    u64 sp = stack & ~0xFULL;
+    sched_acct_leave_kernel();
+    if (have_uframe) {
+      struct interrupt_frame f __attribute__((aligned(16))) = uframe;
+      f.x0 = user_arg; /* clone(2) returns 0 in the child */
+      f.sp_el0 = sp;
+      f.elr = entry;
+      /* CLONE_SETTLS: the thread pointer is a REGISTER on this arch, and only
+       * the kernel can hand it to a brand-new thread — musl's __clone passes
+       * it in the tls argument and the child then reads `self` straight out of
+       * TPIDR_EL0. Without this the child ran on the parent's thread pointer,
+       * so pthread_exit updated and woke the MAIN thread's detach_state while
+       * the joiner waited on the child's — pthread_join hung forever.
+       * (The initial thread sets TPIDR_EL0 itself, which is why the plain
+       * exec path needs nothing here.) */
+      if (task_tls_base(current_task))
+        f.tpidr_el0 = task_tls_base(current_task);
+      f.spsr &= 0xF0000000ULL; /* EL0t, IRQs unmasked, keep NZCV */
+      aarch64_eret_frame(&f);
+    }
+    aarch64_user_thread_jump(entry, sp, user_arg, user_lr);
+  }
 #endif
 }
 
@@ -2787,11 +2883,19 @@ void scheduler_vfork_release(void) {
   scheduler_wake_all(&g_task_vfork_pending[idx]);
 }
 
+#if defined(__aarch64__)
+int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
+                           u64 tls, u64 ctid,
+                           u64 parent_tid_addr, u64 child_tid_addr,
+                           u64 start_func, u64 user_lr,
+                           const struct interrupt_frame *pframe) {
+#else
 int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
                            u64 tls, u64 ctid,
                            u64 parent_tid_addr, u64 child_tid_addr,
                            u64 start_func,
                            const struct clone_user_regs *uregs) {
+#endif
   g_has_any_thread = 1;
   struct task *parent = current_task;
   if (!parent) return -EINVAL;
@@ -2813,10 +2917,17 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   cta->user_stack = user_stack;
   cta->user_arg = arg;
   cta->start_func = start_func;
+#if defined(__aarch64__)
+  cta->user_lr = user_lr;
+  cta->have_uframe = pframe ? 1 : 0;
+  if (pframe)
+    cta->uframe = *pframe;
+#else
   if (uregs) {
     cta->uregs = *uregs;
     cta->have_uregs = 1;
   }
+#endif
 
   void *kstack = kmalloc(KERNEL_STACK_SIZE);
   if (!kstack) { kfree(cta); return -ENOMEM; }
@@ -2826,8 +2937,13 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   interrupts_enable();
   if (!child) { kfree(kstack); kfree(cta); return -EAGAIN; }
 
-  /* Bootstrap kernel context — same shape as kthread_create_impl. */
-  u64 stack_top = align_down_u64((u64)(usize)kstack + KERNEL_STACK_SIZE, 16);
+  /* Bootstrap kernel context — same shape as kthread_create_impl, including
+   * the headroom slot below the end of the allocation (see the note there:
+   * putting the stack top exactly at the block end faults at exception entry
+   * whenever that block happens to be the topmost one in the heap). */
+  *(u64 *)kstack = KSTACK_CANARY;
+  u64 stack_top =
+      align_down_u64((u64)(usize)kstack + KERNEL_STACK_SIZE - 64, 16);
   child->kernel_stack_ptr = stack_top;
 #ifdef __x86_64__
   u64 initial_rsp = stack_top - 16;
@@ -2846,16 +2962,13 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   child->context.r13 = 0;
   child->context.r14 = 0;
   child->context.r15 = 0;
-#else
-  *(u32 *)(usize)initial_rsp = (u32)(usize)kernel_thread_trampoline;
+#elif defined(__aarch64__)
   child->stack = kstack;
   child->entry = clone_thread_kentry;
   child->arg = cta;
-  child->context.esp = (u32)initial_rsp;
-  child->context.ebp = 0;
-  child->context.ebx = 0;
-  child->context.esi = 0;
-  child->context.edi = 0;
+  child->context.sp = initial_rsp;
+  child->context.fp = 0;
+  child->context.lr = (u64)(usize)kernel_thread_trampoline;
 #endif
 
   /* Name — keep short (kthread_create truncates at 15 chars). */
@@ -3145,6 +3258,8 @@ void scheduler_reap_dead_threads(void) {
     if (!__atomic_compare_exchange_n(&t->state, &expected, TASK_REAPING, 0,
                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
       continue;
+    if (t == current_task)
+      panic("sched: reaping the task that is running");
 
     u64 last_pml4 = mm_release_user(t);
     if (last_pml4) {
@@ -3233,6 +3348,8 @@ void scheduler_reap_orphan_zombies(void) {
     if (!__atomic_compare_exchange_n(&t->state, &expected, TASK_REAPING, 0,
                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
       continue;
+    if (t == current_task)
+      panic("sched: reaping the task that is running");
 
     if (t->user_image) { user_image_free(t->user_image); t->user_image = 0; }
     u64 last_pml4 = mm_release_user(t);
@@ -3363,7 +3480,11 @@ int scheduler_yield(void) {
     u64 lo = (u64)(usize)new_task->stack;
     u64 hi = lo + KERNEL_STACK_SIZE;
     u64 ksp = new_task->kernel_stack_ptr;
+#ifdef __aarch64__
+    u64 crsp = new_task->context.sp;
+#elif defined(__x86_64__)
     u64 crsp = new_task->context.rsp;
+#endif
     if (ksp < lo || ksp > hi || (crsp != 0 && (crsp < lo || crsp > hi))) {
       console_write("sched: corrupt kernel stack pointer for pid ");
       console_write_dec((u64)new_task->id);
@@ -3377,6 +3498,16 @@ int scheduler_yield(void) {
       console_write_hex64(crsp);
       console_write("\n");
       panic("corrupt task kernel stack pointer");
+    }
+    if (*(u64 *)(usize)lo != KSTACK_CANARY) {
+      console_write("sched: kernel stack overflow for pid ");
+      console_write_dec((u64)new_task->id);
+      console_write(" name=");
+      console_write(new_task->name ? new_task->name : "(none)");
+      console_write(" stack=0x");
+      console_write_hex64(lo);
+      console_write("\n");
+      panic("kernel stack overflow");
     }
   }
 
@@ -3957,7 +4088,7 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
         if (st == TASK_READY || st == TASK_DEAD || st == TASK_REAPING)
           break;
       }
-      __asm__ volatile("sti; hlt");
+      interrupts_enable_and_wait();
     }
   }
   current_task->state = TASK_RUNNING;
@@ -3969,7 +4100,12 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
  * reads as missing. Dump the task table from inside the guest instead: state,
  * wait channel, fd-lock holder and lease site for every task is usually enough
  * to name the deadlock without a second, instrumented run. Dumps at most three
- * times so the host's own stall timer still gets to kill a hopeless instance. */
+ * times IN A ROW so the host's own stall timer still gets to kill a hopeless
+ * instance — the budget is per stall, not per boot. It used to be per boot, and
+ * three early stalls that the instance recovered from spent it: the wedge that
+ * actually ended the run (m32_smoke's TLS section, which costs every check
+ * after it in the lane) then produced no dump at all and had to be chased
+ * blind. Output resuming means the instance moved on, so the budget resets. */
 #define SILENCE_WATCHDOG_TICKS (60 * 100) /* 60s at the 100 Hz timer tick */
 #define SILENCE_WATCHDOG_MAX_DUMPS 3
 extern volatile u64 g_console_write_seq;
@@ -3986,6 +4122,7 @@ static void serial_silence_watchdog(void) {
   if (seq != last_seq) {
     last_seq = seq;
     last_change_tick = scheduler_ticks;
+    dumps = 0;
     return;
   }
   if (scheduler_ticks - last_change_tick < SILENCE_WATCHDOG_TICKS)
@@ -4093,9 +4230,17 @@ void scheduler_on_timer_tick(void) {
 static u64 g_acct_stamp[MAX_CPUS];
 
 static inline u64 acct_rdtsc(void) {
+#if defined(__x86_64__)
   u32 lo, hi;
   __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
   return ((u64)hi << 32) | lo;
+#else
+  /* AArch64's equivalent free-running counter, same contract: a monotonic
+   * cycle-ish stamp whose rate arch_cpu_khz() reports. */
+  u64 cnt;
+  __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(cnt));
+  return cnt;
+#endif
 }
 
 static inline u64 acct_cycles_to_ns(u64 cycles) {
@@ -5004,7 +5149,7 @@ int scheduler_waitpid(usize pid, int *status, int options) {
              * release of the asm's `movl $1, (%rdx)` after the RSP swap. */
             while (!__atomic_load_n(&T(i)->stack_released,
                                     __ATOMIC_ACQUIRE)) {
-              __asm__ volatile("pause");
+              cpu_relax();
               tlb_shootdown_poll();
             }
 
@@ -5058,6 +5203,8 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               kfree((void *)T(i)->name);
               T(i)->name = 0;
             }
+            if (T(i) == current_task)
+              panic("sched: freeing the kernel stack we are running on");
             kfree(T(i)->stack);
             if (may_block)
               scheduler_waitpid_fast_return();
@@ -5223,7 +5370,7 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
                                               __ATOMIC_ACQUIRE,
                                               __ATOMIC_RELAXED)) {
                 while (!__atomic_load_n(&child->stack_released, __ATOMIC_ACQUIRE)) {
-                  __asm__ volatile("pause");
+                  cpu_relax();
                   tlb_shootdown_poll();
                 }
 
@@ -5267,6 +5414,8 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
                   kfree((void *)child->name);
                   child->name = 0;
                 }
+                if (child == current_task)
+                  panic("sched: freeing the kernel stack we are running on");
                 kfree(child->stack);
                 if (may_block)
                   scheduler_waitpid_fast_return();
@@ -5594,7 +5743,11 @@ void scheduler_dump_tasks(void) {
       /* Saved kernel RSP + fd_lock state: a task stuck holding its fd_lock
        * (the lock every other CPU then spins on) is only identifiable here. */
       console_write(" rsp=0x");
+#ifdef __aarch64__
+      console_write_hex64(T(i)->context.sp);
+#elif defined(__x86_64__)
       console_write_hex64(T(i)->context.rsp);
+#endif
       console_write(" kstack=0x");
       console_write_hex64((u64)(usize)T(i)->stack);
       console_write(" fdlock=");
@@ -5826,11 +5979,18 @@ void scheduler_dump_tasks(void) {
       /* The kernel return addresses still on the task's stack. A blocked task
        * left them there, so they name the path that put it to sleep — which is
        * the one thing state and wait channel together still do not say. */
-      if (T(i) != current_task && T(i)->context.rsp) {
+#if defined(__x86_64__)
+#define TASK_CTX_SP(t) ((t)->context.rsp)
+#elif defined(__aarch64__)
+#define TASK_CTX_SP(t) ((t)->context.sp)
+#else
+#define TASK_CTX_SP(t) ((t)->context.esp)
+#endif
+      if (T(i) != current_task && TASK_CTX_SP(T(i))) {
         extern char __kernel_text_start[], __kernel_text_end[];
         u64 lo = (u64)(usize)__kernel_text_start;
         u64 hi = (u64)(usize)__kernel_text_end;
-        const u64 *stack = (const u64 *)(usize)T(i)->context.rsp;
+        const u64 *stack = (const u64 *)(usize)TASK_CTX_SP(T(i));
         unsigned printed = 0;
 
         console_write(" callers=");
@@ -7181,7 +7341,17 @@ void vma_report_space(u64 start, u64 end) {
 }
 
 u64 vm_find_free_area(struct task *t, usize length) {
-#ifdef __x86_64__
+#if defined(__aarch64__)
+  /* AArch64 keeps the whole kernel half — RAM identity map and device windows
+   * — in L0[0], and that top-level entry is SHARED by pointer with every
+   * process (see paging_clone_address_space, which only copies L0[1..511]).
+   * So an mmap region anywhere below 512 GiB would land in page tables every
+   * process shares: two programs' heaps aliased the same pages and musl's
+   * mallocng metadata was silently overwritten. Start in the per-process half
+   * instead (1 TiB, L0 index 2). */
+  u64 start = 0x10000000000ULL;
+  u64 end = 0x7FFFFFFFFFFFULL;
+#elif defined(__x86_64__)
   /* The bootstrap identity map occupies the low 4 GiB with huge pages.
    * File-backed lazy mappings need ordinary leaf PTEs, so start above it. */
   u64 start = 0x100000000ULL;
@@ -7780,6 +7950,47 @@ int scheduler_signal_pending(void) {
     if (h == SIG_DFL && sig_default_is_ignore(i))
       continue;
     return 1;
+  }
+  return 0;
+}
+
+/* Like scheduler_signal_pending, but also true for a pending STOP signal.
+ *
+ * scheduler_signal_pending only reports signals with a user handler, because a
+ * handler is what a blocking call has to return to userspace to run. A handler
+ * cannot exist for SIGSTOP at all, so a task parked in poll() was invisible to
+ * it and slept through its own stop. PTRACE_ATTACH depends on exactly this: it
+ * leaves SIGSTOP pending and expects the tracee to stop at its next return to
+ * userspace, which a task blocked in a syscall reaches only if the syscall
+ * gives up first. Attaching to a process sitting in pause() — which is ppoll()
+ * here, this arch having no SYS_pause — therefore never produced a stop.
+ *
+ * Only the stop group is added. A fatal default action deliberately is NOT:
+ * the scheduler kills such a task itself at the next context switch
+ * (scheduler_deliver_pending_signals), no return to userspace required, so
+ * reporting those here only makes blocking calls bail out for a task that is
+ * about to die anyway. Widening this to every fatal default was tried and
+ * wedged the posix lane — the syscall returned -ERESTARTSYS, was restarted,
+ * saw the same pending signal and span. Default-ignore signals (SIGCHLD,
+ * SIGURG, SIGWINCH) must not interrupt anything either; waking a blocking call
+ * on SIGCHLD is what used to break dropbear's session loop. */
+int scheduler_signal_pending_or_stops(void) {
+  if (!current_task)
+    return 0;
+  u64 pending = __atomic_load_n(&current_task->pending_signals,
+                                __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+  if (pending == 0)
+    return 0;
+  for (int i = 1; i < NSIG; i++) {
+    if (!(pending & (1ULL << (i - 1))))
+      continue;
+    sighandler_t h = current_task->sigactions[i - 1].sa_handler;
+    if (h == SIG_IGN)
+      continue;
+    if (h != SIG_DFL)
+      return 1; /* a handler to run */
+    if (i == SIGSTOP || i == SIGTSTP || i == SIGTTIN || i == SIGTTOU)
+      return 1; /* stopping needs a return to userspace to happen */
   }
   return 0;
 }

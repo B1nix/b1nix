@@ -80,6 +80,13 @@ struct mod_rela {
 
 #define ET_REL 1
 #define EM_X86_64 62
+#define EM_AARCH64 183
+
+#if defined(__aarch64__)
+#define MODULE_EM EM_AARCH64
+#else
+#define MODULE_EM EM_X86_64
+#endif
 
 #define SHT_PROGBITS 1
 #define SHT_SYMTAB 2
@@ -108,6 +115,24 @@ struct mod_rela {
 #define R_X86_64_PC64 24
 #define R_X86_64_GOTPCRELX 41
 #define R_X86_64_REX_GOTPCRELX 42
+
+/* AArch64 static relocations (ELF for the Arm 64-bit Architecture, table 4-9).
+ * Only the ones the compiler actually emits for these modules are handled; the
+ * set was taken from the .ko files themselves, not from memory. */
+#define R_AARCH64_NONE 0
+#define R_AARCH64_ABS64 257
+#define R_AARCH64_ABS32 258
+#define R_AARCH64_PREL64 260
+#define R_AARCH64_PREL32 261
+#define R_AARCH64_ADR_PREL_PG_HI21 275
+#define R_AARCH64_ADD_ABS_LO12_NC 277
+#define R_AARCH64_LDST8_ABS_LO12_NC 278
+#define R_AARCH64_JUMP26 282
+#define R_AARCH64_CALL26 283
+#define R_AARCH64_LDST16_ABS_LO12_NC 284
+#define R_AARCH64_LDST32_ABS_LO12_NC 285
+#define R_AARCH64_LDST64_ABS_LO12_NC 286
+#define R_AARCH64_LDST128_ABS_LO12_NC 299
 
 /* Section names the loader treats specially. */
 #define SEC_KSYMTAB ".ksymtab"
@@ -318,6 +343,80 @@ static int module_apply_relocs(struct mod_load_ctx *c, struct module *mod) {
       if (r[j].r_offset >= c->sh[target].sh_size)
         return -EINVAL;
       void *loc = (void *)(usize)P;
+#if defined(__aarch64__)
+      switch (type) {
+      case R_AARCH64_NONE:
+        break;
+      case R_AARCH64_ABS64:
+        *(u64 *)loc = S + (u64)A;
+        break;
+      case R_AARCH64_ABS32: {
+        u64 v = S + (u64)A;
+        if (v > 0xffffffffULL)
+          return -EOVERFLOW;
+        *(u32 *)loc = (u32)v;
+        break;
+      }
+      case R_AARCH64_PREL64:
+        *(u64 *)loc = S + (u64)A - P;
+        break;
+      case R_AARCH64_PREL32: {
+        u64 v = S + (u64)A - P;
+        if (!reloc_fits_i32(v))
+          return -EOVERFLOW;
+        *(u32 *)loc = (u32)v;
+        break;
+      }
+      case R_AARCH64_JUMP26:
+      case R_AARCH64_CALL26: {
+        /* B / BL: a signed 26-bit word displacement, i.e. +-128 MiB. The
+         * module region is deliberately placed within that reach of the kernel
+         * (see MODULE_REGION_BASE in b1nix/module.h) so no PLT veneers are
+         * needed. */
+        i64 off = (i64)(S + (u64)A - P);
+        if (off < -(i64)(1 << 27) || off >= (i64)(1 << 27) || (off & 3))
+          return -EOVERFLOW;
+        u32 insn = *(u32 *)loc;
+        insn = (insn & 0xfc000000u) | (((u32)(off >> 2)) & 0x03ffffffu);
+        *(u32 *)loc = insn;
+        break;
+      }
+      case R_AARCH64_ADR_PREL_PG_HI21: {
+        /* ADRP: the 4 KiB-page delta, split into immlo (bits 30:29) and
+         * immhi (bits 23:5). */
+        i64 off = (i64)(((S + (u64)A) & ~0xfffULL) - (P & ~0xfffULL));
+        off >>= 12;
+        if (off < -(i64)(1 << 20) || off >= (i64)(1 << 20))
+          return -EOVERFLOW;
+        u32 insn = *(u32 *)loc;
+        insn &= ~((3u << 29) | (0x7ffffu << 5));
+        insn |= (u32)((off & 3) << 29) | (u32)(((off >> 2) & 0x7ffff) << 5);
+        *(u32 *)loc = insn;
+        break;
+      }
+      case R_AARCH64_ADD_ABS_LO12_NC:
+      case R_AARCH64_LDST8_ABS_LO12_NC:
+      case R_AARCH64_LDST16_ABS_LO12_NC:
+      case R_AARCH64_LDST32_ABS_LO12_NC:
+      case R_AARCH64_LDST64_ABS_LO12_NC:
+      case R_AARCH64_LDST128_ABS_LO12_NC: {
+        /* The low 12 bits of the target, scaled by the access size for the
+         * load/store forms (_NC: no overflow check, by definition). */
+        unsigned shift = 0;
+        switch (type) {
+        case R_AARCH64_LDST16_ABS_LO12_NC: shift = 1; break;
+        case R_AARCH64_LDST32_ABS_LO12_NC: shift = 2; break;
+        case R_AARCH64_LDST64_ABS_LO12_NC: shift = 3; break;
+        case R_AARCH64_LDST128_ABS_LO12_NC: shift = 4; break;
+        default: shift = 0; break; /* ADD and LDST8 are unscaled */
+        }
+        u32 imm = (u32)(((S + (u64)A) & 0xfffULL) >> shift);
+        u32 insn = *(u32 *)loc;
+        insn = (insn & ~(0xfffu << 10)) | ((imm & 0xfffu) << 10);
+        *(u32 *)loc = insn;
+        break;
+      }
+#else
       switch (type) {
       case R_X86_64_NONE:
         break;
@@ -351,6 +450,7 @@ static int module_apply_relocs(struct mod_load_ctx *c, struct module *mod) {
         *(u32 *)loc = (u32)v;
         break;
       }
+#endif
       default: {
         char buf[80];
         snprintf(buf, sizeof(buf), "module: unsupported relocation type %u\n",
@@ -456,7 +556,7 @@ int module_load_image(const void *image, usize size, const char *params) {
       eh->e_ident[3] != 'F')
     return -ENOEXEC;
   if (eh->e_ident[4] != 2 /* ELFCLASS64 */ || eh->e_type != ET_REL ||
-      eh->e_machine != EM_X86_64)
+      eh->e_machine != MODULE_EM)
     return -ENOEXEC;
   if (eh->e_shoff == 0 || eh->e_shnum == 0 ||
       eh->e_shoff + (u64)eh->e_shnum * sizeof(struct mod_shdr) > size)

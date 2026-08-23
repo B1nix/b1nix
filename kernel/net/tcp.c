@@ -379,7 +379,7 @@ void tlb_shootdown_poll(void);
 
 static void tcp_lock(void) {
   while (__atomic_test_and_set(&tcp_queue_lock, __ATOMIC_ACQUIRE)) {
-    __asm__ volatile("pause");
+    cpu_relax();
     tlb_shootdown_poll();
   }
 }

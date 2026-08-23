@@ -477,6 +477,13 @@ MODULE_ALIAS("ethertype-0x86dd");
 module_param_desc(ipv6_hop_limit, MODULE_PARAM_INT, 0644,
                   "hop limit for outgoing IPv6 datagrams");
 
+/* The protocol's own minimum link MTU (RFC 8200 sec. 5). Genuinely read-only:
+ * it is a property of IPv6, not a tunable, and a module exporting a constant
+ * this way is the normal shape for "tell me what this module assumes". */
+static int ipv6_min_mtu = 1280;
+module_param_desc(ipv6_min_mtu, MODULE_PARAM_INT, 0444,
+                  "minimum IPv6 link MTU (RFC 8200)");
+
 static void ipv6_module_selftest(void) {
 	ipv6_loopback_smoke();
 	ipv6_realink_smoke();

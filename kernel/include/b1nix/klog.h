@@ -40,7 +40,6 @@ usize klog_cursor_now(void);
 usize klog_drain(usize *cursor, char *buf, usize max_len);
 
 /* Symbol table for backtraces */
-void klog_register_symbol(u64 address, const char *name);
 void panic_backtrace(void);
 
 /* kallsyms: resolve a kernel text address to "name"+offset (M35). Returns the

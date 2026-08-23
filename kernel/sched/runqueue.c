@@ -2,6 +2,8 @@
 #include <b1nix/lockdep.h>
 #include <b1nix/runqueue.h>
 #include <b1nix/sched.h>
+#include <b1nix/console.h>
+#include <b1nix/klog.h>
 #include <b1nix/spinlock.h>
 
 /* ── Locked enqueue / dequeue ──
@@ -21,9 +23,120 @@
  * off across the whole pick/switch; only a careless IRQs-on caller is corrected.
  */
 
+/*
+ * Who holds a runqueue lock.
+ *
+ * A spinlock here is a bare int with nowhere to record an owner, so a lockup
+ * report could name the lock and the CPUs waiting on it but never the CPU that
+ * was holding it - which is the only thing that makes a deadlock actionable.
+ * This side table carries that: every acquirer stamps its CPU and its own
+ * caller, and the lockup path prints them.
+ *
+ * A missed clear costs a stale line in a panic report and nothing else, so
+ * the table is deliberately lock-free.
+ */
+#define RQ_OWNER_SLOTS 16
+static struct {
+    const void *lock;
+    u32 cpu;
+    u64 caller;
+} g_rq_owner[RQ_OWNER_SLOTS];
+
+static void rq_owner_set(struct runqueue *rq, u64 caller) {
+    struct percpu *pcpu = get_percpu();
+
+    for (u32 i = 0; i < RQ_OWNER_SLOTS; i++) {
+        const void *slot = g_rq_owner[i].lock;
+
+        if (slot && slot != (const void *)&rq->lock)
+            continue;
+        g_rq_owner[i].lock = (const void *)&rq->lock;
+        g_rq_owner[i].cpu = pcpu ? pcpu->cpu_id : 0xffffffffu;
+        g_rq_owner[i].caller = caller;
+        return;
+    }
+}
+
+static void rq_owner_clear(struct runqueue *rq) {
+    for (u32 i = 0; i < RQ_OWNER_SLOTS; i++) {
+        if (g_rq_owner[i].lock == (const void *)&rq->lock) {
+            g_rq_owner[i].lock = 0;
+            return;
+        }
+    }
+}
+
+/* Called from the spinlock lockup path, which knows only the address. */
+void rq_describe_lock(const void *lock) {
+    extern void ksym_print(u64 addr);
+
+    for (u32 i = 0; i < RQ_OWNER_SLOTS; i++) {
+        if (g_rq_owner[i].lock != lock)
+            continue;
+        console_write("\n  runqueue lock last taken by cpu ");
+        console_write_dec(g_rq_owner[i].cpu);
+        console_write(" from 0x");
+        console_write_hex64(g_rq_owner[i].caller);
+        ksym_print(g_rq_owner[i].caller);
+        return;
+    }
+}
+
+/*
+ * A runqueue list must be finite.
+ *
+ * Every walk in this file follows next_run to NULL, so a chain that loops back
+ * on itself is not a corrupted list that recovers - it is a walk that never
+ * ends, inside the lock, which is what wedged a Raspberry Pi: three CPUs
+ * reported a lockup on the global runqueue's lock while the fourth was still
+ * in this loop. Bound the walk by the size of the task table (a list can hold
+ * at most every task once), and report what is in the ring instead of spinning
+ * in it. MAX_TASKS is 4096; a real runqueue never comes close.
+ */
+#define RQ_WALK_LIMIT 4096
+
+static void rq_report_bad(struct runqueue *rq, const char *what,
+                          const struct task *bad) {
+    console_write("\nRUNQUEUE CORRUPT: ");
+    console_write(what);
+    console_write(" ptr=0x");
+    console_write_hex64((u64)(usize)bad);
+    console_write(" lock=0x");
+    console_write_hex64((u64)(usize)&rq->lock);
+    console_write("\n");
+}
+
+static void rq_report_cycle(struct runqueue *rq) {
+    struct task *c = rq->head;
+
+    console_write("\nRUNQUEUE CYCLE: lock=0x");
+    console_write_hex64((u64)(usize)&rq->lock);
+    console_write(" head=0x");
+    console_write_hex64((u64)(usize)rq->head);
+    console_write(" tail=0x");
+    console_write_hex64((u64)(usize)rq->tail);
+    console_write("\n  chain:");
+    for (u32 i = 0; i < 24 && c; i++, c = c->next_run) {
+        console_write("\n    [");
+        console_write_dec(i);
+        console_write("] task=0x");
+        console_write_hex64((u64)(usize)c);
+        console_write(" id=");
+        console_write_dec(c->id);
+        console_write(" state=");
+        console_write_dec((u64)c->state);
+        console_write(" stealable=");
+        console_write_dec((u64)c->stealable);
+        console_write(" name=");
+        console_write(c->name ? c->name : "?");
+    }
+    console_write("\n");
+}
+
 void rq_enqueue(struct runqueue *rq, struct task *t) {
     u64 flags;
     spin_lock_irqsave(&rq->lock, &flags);
+    rq_owner_set(rq, (u64)(usize)__builtin_return_address(0));
     LOCKDEP_ACQUIRE(LOCKDEP_LVL_RUNQUEUE);
     /* Idempotent enqueue: a task must appear on a runqueue at most once.
      * Linking a task that is already queued corrupts the singly-linked
@@ -34,31 +147,53 @@ void rq_enqueue(struct runqueue *rq, struct task *t) {
      * happens when a task races two make-runnable events — e.g. a waitpid that
      * re-publishes BLOCKED and is woken again before its previous stale runqueue
      * entry was scrubbed. Skip the re-link; the task is already runnable. */
+    u32 walked = 0;
     for (struct task *c = rq->head; c; c = c->next_run) {
         if (c == t) {
             LOCKDEP_RELEASE(LOCKDEP_LVL_RUNQUEUE);
+            rq_owner_clear(rq);
             spin_unlock_irqrestore(&rq->lock, flags);
             return;
+        }
+        if (++walked > RQ_WALK_LIMIT) {
+            rq_report_cycle(rq);
+            panic("runqueue list is cyclic");
+        }
+        if (c->next_run && !sched_task_ptr_valid(c->next_run)) {
+            rq_report_bad(rq, "next_run is not a task slot", c->next_run);
+            rq_report_cycle(rq);
+            panic("runqueue list is corrupt");
         }
     }
     t->next_run = NULL;
     if (rq->tail) { rq->tail->next_run = t; rq->tail = t; }
     else          { rq->head = t; rq->tail = t; }
     LOCKDEP_RELEASE(LOCKDEP_LVL_RUNQUEUE);
+    rq_owner_clear(rq);
     spin_unlock_irqrestore(&rq->lock, flags);
 }
 
 struct task *rq_dequeue(struct runqueue *rq) {
     u64 flags;
     spin_lock_irqsave(&rq->lock, &flags);
+    rq_owner_set(rq, (u64)(usize)__builtin_return_address(0));
     LOCKDEP_ACQUIRE(LOCKDEP_LVL_RUNQUEUE);
     struct task *t = rq->head;
+    if (t && !sched_task_ptr_valid(t)) {
+        rq_report_bad(rq, "head is not a task slot", t);
+        panic("runqueue list is corrupt");
+    }
     if (t) {
+        if (t->next_run && !sched_task_ptr_valid(t->next_run)) {
+            rq_report_bad(rq, "next_run is not a task slot", t->next_run);
+            panic("runqueue list is corrupt");
+        }
         rq->head = t->next_run;
         t->next_run = NULL;
         if (!rq->head) rq->tail = NULL;
     }
     LOCKDEP_RELEASE(LOCKDEP_LVL_RUNQUEUE);
+    rq_owner_clear(rq);
     spin_unlock_irqrestore(&rq->lock, flags);
     return t;
 }
@@ -67,6 +202,7 @@ int rq_remove(struct runqueue *rq, struct task *t) {
     int removed = 0;
     u64 flags;
     spin_lock_irqsave(&rq->lock, &flags);
+    rq_owner_set(rq, (u64)(usize)__builtin_return_address(0));
     LOCKDEP_ACQUIRE(LOCKDEP_LVL_RUNQUEUE);
     struct task *prev = 0;
     struct task *cur = rq->head;
@@ -85,6 +221,7 @@ int rq_remove(struct runqueue *rq, struct task *t) {
         cur = next;
     }
     LOCKDEP_RELEASE(LOCKDEP_LVL_RUNQUEUE);
+    rq_owner_clear(rq);
     spin_unlock_irqrestore(&rq->lock, flags);
     return removed;
 }

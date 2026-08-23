@@ -3,6 +3,11 @@
 
 #include <b1nix/types.h>
 
+/* No alignment attribute: these are embedded in packed on-the-wire structs
+ * (ARP, IPv4, DHCP, ICMP), and an explicitly aligned member type still forces
+ * its alignment inside a packed struct — which pushed every field after a
+ * misaligned address 2 bytes out. ARP requests went out with the sender MAC
+ * and both addresses shifted, so nothing ever answered them. */
 struct mac_addr {
 	u8 bytes[6];
 };
@@ -13,7 +18,7 @@ struct ipv4_addr {
 
 struct in6_addr_k {
 	u8 bytes[16];
-};
+} __attribute__((aligned(4)));
 
 void net_init(void);
 void net_poll(void);
