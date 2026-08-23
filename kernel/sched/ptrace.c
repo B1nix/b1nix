@@ -472,14 +472,23 @@ static void ptrace_write_fxsave_region(struct task *t, const void *src) {
     bv |= (arch_xsave_mask() & 0x3);
     memcpy((u8 *)area + 512, &bv, sizeof(bv));
   } else {
-    memcpy(t->fpu_state, src, 512);
+    /* No XSAVE area: the task's own save area IS the arch's register set, so
+     * copy exactly that much (528 bytes on aarch64, 512 on x86_64). */
+    memcpy(t->fpu_state, src, sizeof(struct user_fpregs_struct));
   }
   t->fpu_initialized = 1;
 }
 
+#if defined(__x86_64__)
+typedef struct user_regs_struct native_regs_t;
+#elif defined(__aarch64__)
+typedef struct b1nix_user_pt_regs native_regs_t;
+#endif
+
 static void frame_to_uregs(const struct interrupt_frame *f, struct task *t,
-                           struct user_regs_struct *u) {
+                           native_regs_t *u) {
   memset(u, 0, sizeof(*u));
+#if defined(__x86_64__)
   /* fs_base is the tracee's TLS pointer. A crash reporter needs it to find the
    * thread's own bookkeeping (it is where the thread pointer lives on x86_64),
    * so report the value the kernel restores on switch-in rather than 0. */
@@ -492,10 +501,24 @@ static void frame_to_uregs(const struct interrupt_frame *f, struct task *t,
   u->orig_rax = f->rax;
   u->rip = f->rip; u->cs = f->cs; u->eflags = f->rflags;
   u->rsp = f->rsp; u->ss = f->ss;
+#elif defined(__aarch64__)
+  u->regs[0] = f->x0; u->regs[1] = f->x1; u->regs[2] = f->x2; u->regs[3] = f->x3;
+  u->regs[4] = f->x4; u->regs[5] = f->x5; u->regs[6] = f->x6; u->regs[7] = f->x7;
+  u->regs[8] = f->x8; u->regs[9] = f->x9; u->regs[10] = f->x10; u->regs[11] = f->x11;
+  u->regs[12] = f->x12; u->regs[13] = f->x13; u->regs[14] = f->x14; u->regs[15] = f->x15;
+  u->regs[16] = f->x16; u->regs[17] = f->x17; u->regs[18] = f->x18; u->regs[19] = f->x19;
+  u->regs[20] = f->x20; u->regs[21] = f->x21; u->regs[22] = f->x22; u->regs[23] = f->x23;
+  u->regs[24] = f->x24; u->regs[25] = f->x25; u->regs[26] = f->x26; u->regs[27] = f->x27;
+  u->regs[28] = f->x28; u->regs[29] = f->x29; u->regs[30] = f->x30;
+  u->sp = f->sp_el0;
+  u->pc = f->elr;
+  u->pstate = f->spsr;
+#endif
 }
 
-static void uregs_to_frame(const struct user_regs_struct *u,
+static void uregs_to_frame(const native_regs_t *u,
                            struct interrupt_frame *f) {
+#if defined(__x86_64__)
   f->r15 = u->r15; f->r14 = u->r14; f->r13 = u->r13; f->r12 = u->r12;
   f->rbp = u->rbp; f->rbx = u->rbx; f->r11 = u->r11; f->r10 = u->r10;
   f->r9 = u->r9;   f->r8 = u->r8;   f->rax = u->rax; f->rcx = u->rcx;
@@ -506,6 +529,19 @@ static void uregs_to_frame(const struct user_regs_struct *u,
    * taken, with TF owned by PTRACE_SINGLESTEP. */
   f->rflags = (f->rflags & ~0xcd5ULL) | (u->eflags & 0xcd5ULL);
   f->rsp = u->rsp;
+#elif defined(__aarch64__)
+  f->x0 = u->regs[0]; f->x1 = u->regs[1]; f->x2 = u->regs[2]; f->x3 = u->regs[3];
+  f->x4 = u->regs[4]; f->x5 = u->regs[5]; f->x6 = u->regs[6]; f->x7 = u->regs[7];
+  f->x8 = u->regs[8]; f->x9 = u->regs[9]; f->x10 = u->regs[10]; f->x11 = u->regs[11];
+  f->x12 = u->regs[12]; f->x13 = u->regs[13]; f->x14 = u->regs[14]; f->x15 = u->regs[15];
+  f->x16 = u->regs[16]; f->x17 = u->regs[17]; f->x18 = u->regs[18]; f->x19 = u->regs[19];
+  f->x20 = u->regs[20]; f->x21 = u->regs[21]; f->x22 = u->regs[22]; f->x23 = u->regs[23];
+  f->x24 = u->regs[24]; f->x25 = u->regs[25]; f->x26 = u->regs[26]; f->x27 = u->regs[27];
+  f->x28 = u->regs[28]; f->x29 = u->regs[29]; f->x30 = u->regs[30];
+  f->sp_el0 = u->sp;
+  f->elr = u->pc;
+  f->spsr = u->pstate;
+#endif
 }
 
 /* ── crash record (M80 crash capture) ────────────────────────────────────────
@@ -614,25 +650,18 @@ static void ptrace_do_stop(struct task *t, struct ptrace_link *l, int signo,
   /* Resuming: adopt whatever the tracer left behind. */
   spin_lock_irqsave(&g_ptrace_lock, &flags);
   if (l->used && l->regs_dirty) {
-    struct interrupt_frame snap = l->snapshot;
+    *frame = l->snapshot;
     l->regs_dirty = 0;
     spin_unlock_irqrestore(&g_ptrace_lock, flags);
-    frame->rip = snap.rip;
-    frame->rsp = snap.rsp;
-    frame->rax = snap.rax; frame->rbx = snap.rbx; frame->rcx = snap.rcx;
-    frame->rdx = snap.rdx; frame->rsi = snap.rsi; frame->rdi = snap.rdi;
-    frame->rbp = snap.rbp;
-    frame->r8 = snap.r8;   frame->r9 = snap.r9;   frame->r10 = snap.r10;
-    frame->r11 = snap.r11; frame->r12 = snap.r12; frame->r13 = snap.r13;
-    frame->r14 = snap.r14; frame->r15 = snap.r15;
-    frame->rflags = snap.rflags;
     spin_lock_irqsave(&g_ptrace_lock, &flags);
   }
   if (l->used) {
+#ifdef __x86_64__
     if (l->single_step)
       frame->rflags |= X86_RFLAGS_TF;
     else
       frame->rflags &= ~X86_RFLAGS_TF;
+#endif
     l->live = 0;
   }
   spin_unlock_irqrestore(&g_ptrace_lock, flags);
@@ -647,8 +676,13 @@ int ptrace_signal_stop(struct task *t, int signo,
   /* Only ever park on a return to ring 3: a kernel-mode frame may live on a
    * per-CPU/IST stack that another task reuses while this one sleeps, and
    * resuming from it would jump into whatever overwrote it. */
+#if defined(__aarch64__)
+  if ((frame->spsr & 0xF) != 0)
+    return 0;
+#else
   if (frame->cs != 0x1B && frame->cs != 0x23)
     return 0;
+#endif
   u64 flags;
   spin_lock_irqsave(&g_ptrace_lock, &flags);
   struct ptrace_link *l = link_of(t);
@@ -679,8 +713,13 @@ void ptrace_syscall_stop(struct task *t, struct interrupt_frame *frame,
     return;
   /* Only ever park on a frame that really came from ring 3 (see the same guard
    * in ptrace_signal_stop). */
+#if defined(__aarch64__)
+  if ((frame->spsr & 0xF) != 0)
+    return;
+#else
   if (frame->cs != 0x1B && frame->cs != 0x23)
     return;
+#endif
   u64 flags;
   spin_lock_irqsave(&g_ptrace_lock, &flags);
   struct ptrace_link *l = link_of(t);
@@ -773,7 +812,9 @@ int ptrace_handle_debug_trap(struct interrupt_frame *frame) {
   if (!mine)
     return 0;
 
+#ifdef __x86_64__
   frame->rflags &= ~X86_RFLAGS_TF;
+#endif
   ptrace_do_stop(t, l, SIGTRAP, frame);
   return 1;
 }
@@ -908,7 +949,7 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
   case PTRACE_GETREGS: {
     if (!stopped)
       return -ESRCH;
-    struct user_regs_struct u;
+    native_regs_t u;
     spin_lock_irqsave(&g_ptrace_lock, &flags);
     struct interrupt_frame snap = l->snapshot;
     spin_unlock_irqrestore(&g_ptrace_lock, flags);
@@ -936,7 +977,7 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
       return -EFAULT;
     /* Make sure the (possibly never-run) tracee restores what was just written
      * instead of a clean FPU image on its next switch-in. */
-    ptrace_write_fxsave_region(t, f.fxsave);
+    ptrace_write_fxsave_region(t, &f);
     return 0;
   }
   case PTRACE_GETREGSET:
@@ -952,11 +993,15 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
     u8 buf[ARCH_XSAVE_MAX_SIZE];
     usize full;
     if (addr == NT_PRSTATUS) {
-      full = sizeof(struct user_regs_struct);
+      full = sizeof(native_regs_t);
     } else if (addr == NT_PRFPREG) {
       full = sizeof(struct user_fpregs_struct);
     } else if (addr == NT_X86_XSTATE) {
       full = ptrace_xstate_size(t);
+#if defined(__aarch64__)
+    } else if (addr == NT_ARM_TLS) {
+      full = sizeof(u64);
+#endif
     } else {
       return -EINVAL; /* no other register set exists on this port */
     }
@@ -966,7 +1011,7 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
 
     if (request == PTRACE_GETREGSET) {
       if (addr == NT_PRSTATUS) {
-        struct user_regs_struct u;
+        native_regs_t u;
         spin_lock_irqsave(&g_ptrace_lock, &flags);
         struct interrupt_frame snap = l->snapshot;
         spin_unlock_irqrestore(&g_ptrace_lock, flags);
@@ -974,6 +1019,11 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
         memcpy(buf, &u, sizeof(u));
       } else if (addr == NT_X86_XSTATE) {
         ptrace_build_xstate(t, buf);
+#if defined(__aarch64__)
+      } else if (addr == NT_ARM_TLS) {
+        u64 tls = task_tls_base(t);
+        memcpy(buf, &tls, sizeof(tls));
+#endif
       } else {
         memcpy(buf, ptrace_fxsave_region(t), sizeof(struct user_fpregs_struct));
       }
@@ -983,7 +1033,7 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
       /* A short SETREGSET writes only the prefix the caller supplied, so start
        * from the current values rather than from zeroes. */
       if (addr == NT_PRSTATUS) {
-        struct user_regs_struct u;
+        native_regs_t u;
         spin_lock_irqsave(&g_ptrace_lock, &flags);
         struct interrupt_frame snap = l->snapshot;
         spin_unlock_irqrestore(&g_ptrace_lock, flags);
@@ -991,18 +1041,29 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
         memcpy(buf, &u, sizeof(u));
       } else if (addr == NT_X86_XSTATE) {
         ptrace_build_xstate(t, buf);
+#if defined(__aarch64__)
+      } else if (addr == NT_ARM_TLS) {
+        u64 tls = task_tls_base(t);
+        memcpy(buf, &tls, sizeof(tls));
+#endif
       } else {
         ptrace_build_xstate(t, buf);
       }
       if (syscall_copyin(buf, (const void *)(usize)iov.iov_base, n) < 0)
         return -EFAULT;
       if (addr == NT_PRSTATUS) {
-        struct user_regs_struct u;
+        native_regs_t u;
         memcpy(&u, buf, sizeof(u));
         spin_lock_irqsave(&g_ptrace_lock, &flags);
         uregs_to_frame(&u, &l->snapshot);
         l->regs_dirty = 1;
         spin_unlock_irqrestore(&g_ptrace_lock, flags);
+#if defined(__aarch64__)
+      } else if (addr == NT_ARM_TLS) {
+        u64 tls;
+        memcpy(&tls, buf, sizeof(tls));
+        task_set_tls_base(t, tls);
+#endif
       } else if (addr == NT_X86_XSTATE && task_xsave_area(t)) {
         /* A full XSAVE area was written: adopt it wholesale, so a debugger can
          * set AVX registers and not just the legacy half. */
@@ -1064,7 +1125,7 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
   case PTRACE_SETREGS: {
     if (!stopped)
       return -ESRCH;
-    struct user_regs_struct u;
+    native_regs_t u;
     if (syscall_copyin(&u, (const void *)(usize)data, sizeof(u)) < 0)
       return -EFAULT;
     spin_lock_irqsave(&g_ptrace_lock, &flags);

@@ -16,6 +16,206 @@
 #include <b1nix/posix.h>
 #include <b1nix/syscall.h>
 
+#if defined(__aarch64__)
+#define LX_read            63
+#define LX_write           64
+#define LX_open            0xffff
+#define LX_close           57
+#define LX_stat            0xffff
+#define LX_fstat           80
+#define LX_lstat           0xffff
+#define LX_poll            0xffff
+#define LX_lseek           62
+#define LX_mmap            222
+#define LX_mprotect        226
+#define LX_munmap          215
+/* asm-generic 216. Added with mremap's shared table entry, which named a
+ * constant only the x86_64 arm defined. */
+#define LX_mremap          216
+#define LX_brk             214
+#define LX_rt_sigaction    134
+#define LX_rt_sigprocmask  135
+#define LX_rt_sigreturn    139
+#define LX_ioctl           29
+#define LX_readv           65
+#define LX_writev          66
+#define LX_access          0xffff
+#define LX_pipe            0xffff
+#define LX_select          0xffff
+#define LX_sched_yield     124
+/* asm-generic numbering (Linux arch/arm64): the scheduling-policy calls sit
+ * just below sched_yield, not where x86_64 puts them. */
+#define LX_sched_setparam       118
+#define LX_sched_setscheduler   119
+#define LX_sched_getscheduler   120
+#define LX_sched_getparam       121
+#define LX_sched_get_priority_max 125
+#define LX_sched_get_priority_min 126
+#define LX_madvise         233
+#define LX_dup             23
+#define LX_dup2            0xffff
+#define LX_nanosleep       101
+#define LX_getpid          172
+#define LX_socket          198
+#define LX_connect         203
+#define LX_accept          202
+#define LX_sendto          206
+#define LX_recvfrom        207
+#define LX_shutdown        210
+#define LX_bind            200
+#define LX_listen          201
+#define LX_getsockname     204
+#define LX_getpeername     205
+#define LX_setsockopt      208
+#define LX_getsockopt      209
+#define LX_clone           220
+#define LX_fork            0xffff
+#define LX_vfork           0xffff
+#define LX_execve          221
+#define LX_execveat        281
+#define LX_exit            93
+#define LX_wait4           260
+#define LX_kill            129
+#define LX_uname           160
+#define LX_fcntl           25
+#define LX_fsync           82
+#define LX_getcwd          17
+#define LX_chdir           49
+#define LX_rename          0xffff
+#define LX_sysinfo         179
+#define LX_times           153
+#define LX_flock           32
+#define LX_mknod           0xffff
+#define LX_sched_getaffinity 123
+#define LX_clock_getres    114
+#define LX_statx           291
+#define LX_mkdir           0xffff
+#define LX_rmdir           0xffff
+#define LX_unlink          0xffff
+#define LX_symlink         0xffff
+#define LX_readlink        0xffff
+#define LX_chmod           0xffff
+#define LX_chown           0xffff
+#define LX_umask           166
+#define LX_getuid          174
+#define LX_getgid          176
+#define LX_setuid          146
+#define LX_setgid          144
+#define LX_geteuid         175
+#define LX_getegid         177
+#define LX_setpgid         154
+#define LX_getppid         173
+#define LX_getpgrp         0xffff
+#define LX_setsid          157
+#define LX_getpgid         155
+#define LX_getsid          156
+#define LX_alarm           0xffff
+#define LX_ftruncate       46
+#define LX_fchdir          50
+#define LX_link            0xffff
+#define LX_setpriority     140
+#define LX_sync            81
+#define LX_fchmod          52
+#define LX_fchown          55
+#define LX_gettid          178
+#define LX_getdents64      61
+#define LX_clock_gettime   113
+#define LX_exit_group      94
+#define LX_openat          56
+#define LX_newfstatat      79
+#define LX_unlinkat        35
+#define LX_mkdirat         34
+#define LX_linkat          37
+#define LX_symlinkat       36
+#define LX_readlinkat      78
+#define LX_fchmodat        53
+#define LX_fchownat        54
+#define LX_faccessat       48
+#define LX_renameat2       276
+#define LX_pipe2           59
+#define LX_dup3            24
+#define LX_ppoll           73
+#define LX_pselect6        72
+#define LX_accept4         242
+#define LX_clock_nanosleep 115
+#define LX_set_tid_address 96
+#define LX_prlimit64       261
+#define LX_set_robust_list 99
+#define LX_get_robust_list 100
+#define LX_prctl           167
+/* asm-generic nr 277 — it was marked "does not exist here", so every
+ * seccomp(2) from an aarch64 binary returned ENOSYS and no filter could be
+ * installed at all. */
+#define LX_seccomp         277
+#define LX_getrandom       278
+#define LX_reboot          142
+#define LX_io_setup        0
+#define LX_io_submit       2
+#define LX_io_getevents    4
+#define LX_sendmsg         211
+#define LX_recvmsg         212
+#define LX_getgroups       158
+#define LX_setgroups       159
+#define LX_sigaltstack     132
+#define LX_selfhost_status 511
+#define LX_eventfd2        19
+#define LX_eventfd         0xffff
+#define LX_epoll_create1   20
+#define LX_epoll_ctl       21
+#define LX_epoll_wait      0xffff
+#define LX_epoll_pwait     22
+#define LX_timer_settime   110
+#define LX_timer_gettime   108
+#define LX_timer_delete    111
+#define LX_timerfd_create  85
+#define LX_timerfd_settime 86
+#define LX_timerfd_gettime 87
+#define LX_signalfd4       74
+#define LX_signalfd        0xffff
+#define LX_memfd_create    279
+#define LX_msync           227
+#define LX_sendfile        71
+#define LX_splice          76
+#define LX_fallocate       47
+#define LX_inotify_init    0xffff
+#define LX_inotify_add_watch 27
+#define LX_inotify_rm_watch  28
+#define LX_inotify_init1   26
+#define LX_copy_file_range 285
+#define LX_socketpair      199
+#define LX_shmat           196
+#define LX_shmctl          195
+#define LX_shmdt           197
+#define LX_getrlimit       163
+#define LX_getrusage       165
+#define LX_setreuid        145
+#define LX_setregid        143
+#define LX_setresuid       147
+#define LX_setresgid       149
+#define LX_setrlimit       164
+#define LX_mount           40
+#define LX_umount2         39
+#define LX_getcpu          168
+#define LX_mincore         232
+#define LX_fdatasync       83
+#define LX_statfs          43
+#define LX_fstatfs         44
+#define LX_settimeofday    170
+#define LX_syncfs          267
+#define LX_rt_tgsigqueueinfo 240
+/* M95 loadable modules (aarch64 numbering). */
+#define LX_init_module     105
+#define LX_delete_module   106
+#define LX_finit_module    273
+#define LX_setxattr        5
+#define LX_lsetxattr       6
+#define LX_getxattr        8
+#define LX_lgetxattr       9
+#define LX_listxattr       11
+#define LX_llistxattr      12
+#define LX_removexattr     14
+#define LX_lremovexattr    15
+#else
 /* Linux x86_64 syscall numbers (subset). Named to mirror __NR_* so the table is
  * auditable against asm/unistd_64.h. */
 #define LX_read            0
@@ -208,18 +408,15 @@
 #define LX_settimeofday    164
 #define LX_syncfs          306
 #define LX_rt_tgsigqueueinfo 297
-
-/* The f* xattr variants take a descriptor and have no native handler, so they
- * stay unmapped (-ENOSYS). The follow/don't-follow argument these numbers imply
- * is supplied by the dispatcher — see LINUX_NR_*XATTR in <b1nix/linux_abi.h>. */
 #define LX_setxattr        188
-#define LX_lsetxattr       189
+#define LX_lsetxattr       199
 #define LX_getxattr        191
 #define LX_lgetxattr       192
 #define LX_listxattr       194
 #define LX_llistxattr      195
 #define LX_removexattr     197
 #define LX_lremovexattr    198
+#endif
 
 struct lx_map {
 	u64 linux_nr;

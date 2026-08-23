@@ -241,7 +241,9 @@ static void lock_pc(void) {
   while (__atomic_load_n(&pc_lock_owner, __ATOMIC_ACQUIRE) != me) {
     /* Drain TLB shootdowns while spinning — a waiter with interrupts masked
      * cannot ACK the initiator's IPI, and the initiator waits masked too. */
-    __asm__ volatile("pause");
+    /* cpu_relax(), not a bare `pause`: that mnemonic exists only on x86 and
+     * this file is built for both arches again. */
+    cpu_relax();
     tlb_shootdown_poll();
     if (++spins == PC_LOCK_STUCK_SPINS)
       pc_lock_report_stuck("lock_pc", ra);

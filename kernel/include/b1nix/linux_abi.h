@@ -21,6 +21,54 @@
 
 /* Linux x86_64 syscall numbers whose result struct layout differs from b1nix's
  * and therefore needs a semantic translation, not just a number remap. */
+#if defined(__aarch64__)
+#define LINUX_NR_STAT       0xffff
+#define LINUX_NR_FSTAT      80
+#define LINUX_NR_LSTAT      0xffff
+#define LINUX_NR_UNAME      160
+#define LINUX_NR_GETDENTS64 61
+#define LINUX_NR_ARCH_PRCTL 0xffff
+#define LINUX_NR_RT_SIGACTION 134
+#define LINUX_NR_RT_SIGPROCMASK 135
+#define LINUX_NR_RT_SIGRETURN 139
+#define LINUX_NR_KILL        129
+#define LINUX_NR_TKILL       130
+#define LINUX_NR_TGKILL      131
+#define LINUX_NR_REBOOT      142
+#define LINUX_NR_SETXATTR     5
+#define LINUX_NR_LSETXATTR    6
+#define LINUX_NR_GETXATTR     8
+#define LINUX_NR_LGETXATTR    9
+#define LINUX_NR_LISTXATTR    11
+#define LINUX_NR_LLISTXATTR   12
+#define LINUX_NR_REMOVEXATTR  14
+#define LINUX_NR_LREMOVEXATTR 15
+#define LINUX_NR_SIGNALFD4    74
+#define LINUX_NR_OPEN         0xffff
+#define LINUX_NR_FCNTL        25
+#define LINUX_NR_SELECT       0xffff
+#define LINUX_NR_PSELECT6     72
+#define LINUX_NR_SETITIMER    103
+#define LINUX_NR_GETITIMER    102
+#define LINUX_NR_UTIMES       0xffff
+#define LINUX_NR_UTIMENSAT    88
+/* asm-generic 95 — the x86_64 number (247) was left here, so waitid(2) from an
+ * aarch64 binary was routed as whatever 247 means on this ABI. */
+#define LINUX_NR_WAITID       95
+#define LINUX_NR_PRLIMIT64    261
+#define LINUX_NR_SHMGET       194
+#define LINUX_NR_RT_SIGTIMEDWAIT 137
+#define LINUX_NR_RT_SIGSUSPEND 133
+#define LINUX_NR_MQ_OPEN      180
+#define LINUX_NR_MQ_UNLINK    181
+#define LINUX_NR_MQ_TIMEDSEND 182
+#define LINUX_NR_MQ_TIMEDRECEIVE 183
+#define LINUX_NR_SETPRIORITY  140
+#define LINUX_NR_GETPRIORITY  141
+#define LINUX_NR_RT_SIGQUEUEINFO 138
+#define LINUX_NR_TIMER_CREATE 107
+#define LINUX_NR_SYSINFO      179
+#else
 #define LINUX_NR_STAT       4
 #define LINUX_NR_FSTAT      5
 #define LINUX_NR_LSTAT      6
@@ -33,14 +81,7 @@
 #define LINUX_NR_KILL        62
 #define LINUX_NR_TKILL       200
 #define LINUX_NR_TGKILL      234
-/* reboot(magic1, magic2, cmd, arg): Linux passes its command in arg2 as a magic
- * constant, b1nix's SYS_REBOOT takes its own command in arg0. */
 #define LINUX_NR_REBOOT      169
-/* The xattr calls: b1nix's handlers carry a trailing `nofollow` argument that
- * selects the follow-symlink (setxattr) or don't-follow (lsetxattr) variant,
- * which Linux encodes in the syscall number instead. The caller never supplies
- * that argument, so it must be set from the number rather than read off a
- * register that holds nothing in particular. */
 #define LINUX_NR_SETXATTR     188
 #define LINUX_NR_LSETXATTR    189
 #define LINUX_NR_GETXATTR     191
@@ -48,8 +89,31 @@
 #define LINUX_NR_LISTXATTR    194
 #define LINUX_NR_LLISTXATTR   195
 #define LINUX_NR_REMOVEXATTR  197
-#define LINUX_NR_LREMOVEXATTR    198
-#define LINUX_NR_SIGNALFD4       289
+#define LINUX_NR_LREMOVEXATTR 198
+#define LINUX_NR_SIGNALFD4    289
+#define LINUX_NR_OPEN         2
+#define LINUX_NR_FCNTL        72
+#define LINUX_NR_SELECT       23
+#define LINUX_NR_PSELECT6     270
+#define LINUX_NR_SETITIMER    38
+#define LINUX_NR_GETITIMER    36
+#define LINUX_NR_UTIMES       235
+#define LINUX_NR_UTIMENSAT    280
+#define LINUX_NR_WAITID       247
+#define LINUX_NR_PRLIMIT64    302
+#define LINUX_NR_SHMGET       29
+#define LINUX_NR_RT_SIGTIMEDWAIT 128
+#define LINUX_NR_RT_SIGSUSPEND 130
+#define LINUX_NR_MQ_OPEN      240
+#define LINUX_NR_MQ_UNLINK    241
+#define LINUX_NR_MQ_TIMEDSEND 242
+#define LINUX_NR_MQ_TIMEDRECEIVE 243
+#define LINUX_NR_SETPRIORITY  141
+#define LINUX_NR_GETPRIORITY  140
+#define LINUX_NR_RT_SIGQUEUEINFO 129
+#define LINUX_NR_TIMER_CREATE 222
+#define LINUX_NR_SYSINFO      99
+#endif
 
 /* reboot(2) command constants (linux/reboot.h). */
 #define LINUX_REBOOT_CMD_RESTART   0x01234567u
@@ -115,6 +179,48 @@ struct linux_ucontext {
   unsigned char __fpregs_mem[512];
 };
 
+/* Linux aarch64's ucontext_t, which has nothing in common with the x86_64 one
+ * above. uc_mcontext sits at offset 176 (the kernel pads uc_sigmask out to the
+ * 1024-bit set glibc declares, and the 16-byte alignment of struct sigcontext
+ * adds the final 8), and the 4 KiB reserved tail carries a chain of
+ * _aarch64_ctx records — the FPSIMD one first, then a zero terminator. A crash
+ * reporter reads exactly these fields out of the crashing process's memory. */
+struct linux_aarch64_ctx_head {
+  u32 magic;
+  u32 size;
+};
+
+#define LX_FPSIMD_MAGIC 0x46508001u
+
+struct linux_fpsimd_context {
+  struct linux_aarch64_ctx_head head; /* 0 */
+  u32 fpsr;                           /* 8 */
+  u32 fpcr;                           /* 12 */
+  u8 vregs[512];                      /* 16 — V0-V31, 16 bytes each */
+};
+
+struct linux_sigcontext_aarch64 {
+  u64 fault_address; /* 0 */
+  u64 regs[31];      /* 8 */
+  u64 sp;            /* 256 */
+  u64 pc;            /* 264 */
+  u64 pstate;        /* 272 */
+  u8 __reserved[4096] __attribute__((aligned(16))); /* 280 */
+};
+
+struct linux_ucontext_aarch64 {
+  u64 uc_flags;          /* 0 */
+  u64 uc_link;           /* 8 */
+  u64 uc_stack_ss_sp;    /* 16 */
+  u32 uc_stack_ss_flags; /* 24 */
+  u32 _ucpad;            /* 28 */
+  u64 uc_stack_ss_size;  /* 32 */
+  u64 uc_sigmask;        /* 40 — kernel sigset_t (64 bits) */
+  u8 _sigpad[120];       /* 48 — padded out to glibc's 1024-bit set */
+  u64 _align_pad;        /* 168 — struct sigcontext is 16-byte aligned */
+  struct linux_sigcontext_aarch64 uc_mcontext; /* 176 */
+};
+
 /* gregs[] indices (Linux REG_* enum). */
 enum {
   LX_REG_R8 = 0, LX_REG_R9, LX_REG_R10, LX_REG_R11, LX_REG_R12, LX_REG_R13,
@@ -143,6 +249,36 @@ struct linux_dirent64 {
  * widths differ from b1nix's `struct b1nix_stat` (e.g. Linux has a 64-bit
  * st_nlink before a 32-bit st_mode, then a __pad0), so a Linux binary that reads
  * st_mode/st_size off a b1nix-filled buffer gets the wrong bytes. 144 bytes. */
+/* Linux `struct stat`. The layout is per-arch: x86_64 has its own 144-byte
+ * ABI struct, while every asm-generic port (aarch64 among them) uses the
+ * 128-byte generic one with a different field ORDER as well — st_mode/st_nlink
+ * are 32-bit and swapped, and the trailing padding is 2 ints, not 3 longs.
+ * Copying the x86_64 shape out to an aarch64 process overran its 128-byte
+ * buffer by 16 bytes, which on musl's own stack frame is exactly the saved
+ * x30/x19 — every fstatat returned to address 0. */
+#if defined(__aarch64__)
+struct linux_stat {
+  u64 st_dev;
+  u64 st_ino;
+  u32 st_mode;
+  u32 st_nlink;
+  u32 st_uid;
+  u32 st_gid;
+  u64 st_rdev;
+  u64 __pad1;
+  i64 st_size;
+  i32 st_blksize;
+  i32 __pad2;
+  i64 st_blocks;
+  i64 st_atime;
+  u64 st_atime_nsec;
+  i64 st_mtime;
+  u64 st_mtime_nsec;
+  i64 st_ctime;
+  u64 st_ctime_nsec;
+  u32 __unused[2];
+};
+#else
 struct linux_stat {
   u64 st_dev;
   u64 st_ino;
@@ -163,10 +299,11 @@ struct linux_stat {
   u64 st_ctime_nsec;
   i64 __unused[3];
 };
+#endif
 
 struct b1nix_stat; /* forward decl; defined in <b1nix/posix.h> */
 
-/* Convert a b1nix stat result into the Linux x86_64 layout. */
+/* Convert a b1nix stat result into this arch's Linux stat layout. */
 void linux_stat_from_b1nix(struct linux_stat *out, const struct b1nix_stat *in);
 
 /* Linux `struct utsname` (new_utsname): six NUL-terminated 65-byte fields,

@@ -66,6 +66,9 @@ struct interrupt_frame;
 #define NT_PRSTATUS 1
 #define NT_PRFPREG 2
 #define NT_X86_XSTATE 0x202
+/* aarch64: the thread pointer (TPIDR_EL0). A debugger needs it to find TLS —
+ * Crashpad asks for it on every thread it snapshots. */
+#define NT_ARM_TLS 0x401
 /* XSAVE area b1nix reports for NT_X86_XSTATE: legacy FXSAVE region + header. */
 #define B1NIX_XSTATE_SIZE 576
 
@@ -77,13 +80,37 @@ struct user_regs_struct {
   u64 fs_base, gs_base, ds, es, fs, gs;
 };
 
-/* Linux's user_fpregs_struct is byte-for-byte the 512-byte FXSAVE area, which
- * is exactly how the kernel stores a task's FPU state (task->fpu_state). It is
- * declared opaque here because nothing in the kernel interprets its fields —
- * PTRACE_GETFPREGS/NT_PRFPREG copy the area out verbatim. */
+/* Linux aarch64 struct user_pt_regs. */
+struct b1nix_user_pt_regs {
+  u64 regs[31];
+  u64 sp;
+  u64 pc;
+  u64 pstate;
+};
+
+/* The FP register set a debugger sees, which is a different object on each
+ * architecture and is NOT interpreted here — PTRACE_GETFPREGS/NT_PRFPREG copy
+ * the task's save area out verbatim, so the save area's layout IS this layout.
+ *
+ * x86_64: Linux's user_fpregs_struct is byte-for-byte the 512-byte FXSAVE area.
+ *
+ * aarch64: Linux's user_fpsimd_state — 32 128-bit V registers followed by FPSR
+ * and FPCR and 8 reserved bytes, 528 in all. Handing back the x86 512 made
+ * every arm64 debugger reject the set outright: Crashpad's ptracer.cc checks
+ * the length and refuses ("Unexpected registers size 512 != 528"), which cost
+ * it the thread snapshot and therefore the whole minidump. */
+#if defined(__aarch64__)
+struct user_fpregs_struct {
+  u8 vregs[512];  /* V0-V31, 16 bytes each — arch_fpu_save's layout */
+  u32 fpsr;
+  u32 fpcr;
+  u32 reserved[2];
+};
+#else
 struct user_fpregs_struct {
   u8 fxsave[512];
 };
+#endif
 
 /* struct iovec as PTRACE_GETREGSET/SETREGSET take it in `data`. */
 struct ptrace_iovec {
