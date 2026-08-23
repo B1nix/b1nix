@@ -26,6 +26,19 @@ int pci_find_device(u16 vendor_id, u16 device_id, struct pci_device_info *info);
 int pci_find_class(u8 class_code, u8 subclass, u8 index, struct pci_device_info *info);
 u32 pci_get_vram_size(u16 vendor_id, u16 device_id);
 
+/* The interrupt line a driver should register a handler on, or 0xFF when the
+ * device raises no INTx at all. On x86 that is config space 0x3C, which the
+ * firmware filled in; on aarch64 no firmware ran, so the byte is meaningless
+ * and the number comes from the host bridge's device-tree interrupt-map
+ * instead. Drivers must call this rather than reading 0x3C themselves. */
+u8 pci_intx_line(u8 bus, u8 slot, u8 func);
+
+#if defined(__aarch64__)
+/* Decoded from the host bridge's device-tree interrupt-map (see
+ * kernel/arch/aarch64/bootinfo.c). 0 when the tree describes no route. */
+u32 pci_intx_gsi(u8 bus, u8 slot, u8 func, u8 pin);
+#endif
+
 /* ── M98 T3: modern PCI ───────────────────────────────────────────── */
 
 /* Config-space register numbers used by the helpers below. */
@@ -73,6 +86,26 @@ struct pci_bar {
  * Returns 0 on success (check bar->valid), -1 on a bad argument.
  */
 int pci_bar_read(u8 bus, u8 slot, u8 func, u8 index, struct pci_bar *bar);
+
+/* An address on the PCI bus, as the CPU has to issue it. The identity on a PC
+ * and on QEMU virt; a shift by the host bridge's window offset on a board whose
+ * bridge maps the bus somewhere else, as a BCM2711's does. pci_bar_read already
+ * applies it, so struct pci_bar::base is a CPU address. */
+u64 pci_bus_to_cpu(u64 bus_addr);
+
+#if defined(__aarch64__)
+/*
+ * A host bridge whose configuration space is not a flat ECAM window installs
+ * its own accessors here, before pci_init() runs. Config space on a BCM2711 is
+ * an index/data pair behind a controller that has to be brought out of reset
+ * first, so there is nothing to read until its driver says there is.
+ */
+struct pci_config_ops {
+	u32 (*read32)(u8 bus, u8 slot, u8 func, u8 offset);
+	void (*write32)(u8 bus, u8 slot, u8 func, u8 offset, u32 value);
+};
+void pci_set_config_ops(const struct pci_config_ops *ops);
+#endif
 
 /* Decode every BAR of a function into out[PCI_MAX_BARS]. Returns the number of
  * implemented (valid) BARs. */

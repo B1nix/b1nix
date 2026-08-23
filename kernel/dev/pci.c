@@ -16,16 +16,61 @@
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
 
+#ifndef __aarch64__
 static u32 pci_get_config_address(u8 bus, u8 slot, u8 func, u8 offset)
 {
 	return (u32)((bus << 16) | (slot << 11) | (func << 8) | (offset & 0xFC) | ((u32)0x80000000));
 }
+#endif
 
+#ifdef __aarch64__
+/* AArch64 has no port I/O, so configuration space is reached only through
+ * memory. Where that memory is, and how many buses it covers, is the board's
+ * business and comes out of the device tree — it used to be QEMU virt's
+ * 0x3f000000 compiled in, which on a Raspberry Pi is ordinary RAM: the
+ * enumerator read a plausible-looking "device" out of it and then wrote
+ * BAR-sizing probes over whatever was living there.
+ *
+ * ECAM address = base + (bus << 20) + (dev << 15) + (fn << 12) + offset.
+ * The window is inside the direct map this port builds at boot, so it needs no
+ * separate mapping.
+ *
+ * A host bridge that is not ECAM — a BCM2711's, which has to be brought out of
+ * reset and have its link trained before config space answers at all — hands
+ * this file its own pair of accessors instead. */
+static u64 g_pci_ecam_base;
+static u32 g_pci_ecam_buses;
+static const struct pci_config_ops *g_pci_ops;
+
+void pci_set_config_ops(const struct pci_config_ops *ops)
+{
+	g_pci_ops = ops;
+}
+
+static inline volatile u32 *pci_ecam_slot(u8 bus, u8 slot, u8 func, u8 offset)
+{
+	if (!g_pci_ecam_base || bus >= g_pci_ecam_buses)
+		return 0;
+	return (volatile u32 *)(usize)(g_pci_ecam_base +
+	                               ((u64)bus << 20) + ((u64)slot << 15) +
+	                               ((u64)func << 12) + (offset & 0xFC));
+}
+
+u32 pci_config_read32(u8 bus, u8 slot, u8 func, u8 offset)
+{
+	if (g_pci_ops)
+		return g_pci_ops->read32(bus, slot, func, offset);
+
+	volatile u32 *p = pci_ecam_slot(bus, slot, func, offset);
+	return p ? *p : 0xFFFFFFFFu;
+}
+#else
 u32 pci_config_read32(u8 bus, u8 slot, u8 func, u8 offset)
 {
 	outl(PCI_CONFIG_ADDRESS, pci_get_config_address(bus, slot, func, offset));
 	return inl(PCI_CONFIG_DATA);
 }
+#endif
 
 u16 pci_config_read16(u8 bus, u8 slot, u8 func, u8 offset)
 {
@@ -41,8 +86,19 @@ u8 pci_config_read8(u8 bus, u8 slot, u8 func, u8 offset)
 
 void pci_config_write32(u8 bus, u8 slot, u8 func, u8 offset, u32 value)
 {
+#ifdef __aarch64__
+	if (g_pci_ops) {
+		g_pci_ops->write32(bus, slot, func, offset, value);
+		return;
+	}
+
+	volatile u32 *p = pci_ecam_slot(bus, slot, func, offset);
+	if (p)
+		*p = value;
+#else
 	outl(PCI_CONFIG_ADDRESS, pci_get_config_address(bus, slot, func, offset));
 	outl(PCI_CONFIG_DATA, value);
+#endif
 }
 
 void pci_config_write16(u8 bus, u8 slot, u8 func, u8 offset, u16 value)
@@ -61,13 +117,160 @@ void pci_config_write8(u8 bus, u8 slot, u8 func, u8 offset, u8 value)
 	pci_config_write32(bus, slot, func, offset, current);
 }
 
+/* An address on the PCI bus, as the CPU has to issue it.
+ *
+ * On a PC, and on QEMU virt, the host bridge's memory window is an identity
+ * mapping and this is the identity. A BCM2711 maps the bus's 0xf8000000
+ * upwards onto CPU addresses at 0x6_00000000, so the two differ by the window's
+ * offset — and only inside the window, since anything outside it was never
+ * translated by this bridge in the first place. */
+u64 pci_bus_to_cpu(u64 bus_addr)
+{
+#ifdef __aarch64__
+	u64 pci_base = fdt_pci_mmio_pci_base();
+	u64 size = fdt_pci_mmio_size();
+
+	if (size && bus_addr >= pci_base && bus_addr - pci_base < size)
+		return bus_addr - pci_base + fdt_pci_mmio_base();
+#endif
+	return bus_addr;
+}
 
 /* Enumerate and print EVERY PCI function so unrecognised hardware (e.g. a NIC
  * with no driver yet) is identifiable by vendor:device — visible later via
  * `dmesg | grep pci`. Class 0x02 (network) / 0x01 (storage) / 0x0c03 (usb) are
  * flagged so they stand out. */
+#ifdef __aarch64__
+/* Give every unassigned memory BAR an address.
+ *
+ * On a PC something has already done this before the kernel runs — the BIOS or
+ * UEFI walks the bus and programs each BAR. QEMU virt has no such firmware:
+ * the kernel is the first thing to touch PCI, so every device comes up with
+ * its BARs reading zero. A driver that trusts them then maps register block 0
+ * and talks to nothing, which is what "ahci: ABAR is zero (likely IDE mode)"
+ * really meant.
+ *
+ * Hand out addresses from the board's 32-bit PCIe MMIO window, naturally
+ * aligned to each BAR's size (a BAR only decodes address bits above its size,
+ * so a misaligned base silently aliases), then switch on memory decoding and
+ * bus mastering — a device whose command register still reads 0 answers no
+ * cycles and performs no DMA.
+ *
+ * The window is the one the host bridge's `ranges` declares, so it is the
+ * board's rather than QEMU virt's — which was compiled in here until now.
+ * A BAR holds the address the device sees, which is the window's PCI address;
+ * the CPU reaches the same register block at the window's CPU address. On virt
+ * those are equal and on a BCM2711 they are not, so they are tracked apart. */
+static u64 pci_mmio_next;
+static u64 pci_mmio_end;
+/* The same, for the I/O window: a card whose registers live behind an I/O BAR
+ * (the AC'97 codec) needs one assigned out of it. */
+static u64 pci_io_next;
+static u64 pci_io_end;
+
+static int pci_bar_count(u8 bus, u8 slot, u8 func);
+
+static void pci_assign_bars(u8 bus, u8 slot, u8 func)
+{
+	int nbars = pci_bar_count(bus, slot, func);
+	for (int i = 0; i < nbars; i++) {
+		struct pci_bar bar;
+		if (pci_bar_read(bus, slot, func, (u8)i, &bar) != 0)
+			continue;
+		console_write("pci:   bar");
+		console_write_dec((u64)i);
+		console_write(" of ");
+		console_write_dec(slot);
+		console_write(" valid=");
+		console_write_dec((u64)bar.valid);
+		console_write(" io=");
+		console_write_dec((u64)bar.is_io);
+		console_write(" base=0x");
+		console_write_hex64(bar.base);
+		console_write(" size=0x");
+		console_write_hex64(bar.size);
+		console_write("\n");
+		if (!bar.valid || bar.base || !bar.size)
+			continue;
+
+		u64 base;
+
+		if (bar.is_io) {
+			base = (pci_io_next + bar.size - 1) & ~(bar.size - 1);
+			if (base + bar.size > pci_io_end)
+				continue; /* no I/O window, or it is used up */
+			pci_io_next = base + bar.size;
+			pci_config_write32(bus, slot, func,
+			                   (u8)(PCI_CFG_BAR0 + i * 4), (u32)base | 1u);
+			console_write("pci: assigned I/O BAR");
+			console_write_dec((u64)bar.index);
+			console_write(" of ");
+			console_write_dec(slot);
+			console_write(" -> 0x");
+			console_write_hex64(base);
+			console_write("\n");
+			continue;
+		}
+
+		base = (pci_mmio_next + bar.size - 1) & ~(bar.size - 1);
+		if (base + bar.size > pci_mmio_end)
+			break; /* window exhausted — leave the rest unassigned */
+		u8 off = (u8)(PCI_CFG_BAR0 + i * 4);
+		pci_config_write32(bus, slot, func, off, (u32)base);
+		if (bar.is_64bit) {
+			pci_config_write32(bus, slot, func, (u8)(off + 4),
+			                   (u32)(base >> 32));
+			i++; /* the upper half is part of this BAR, not the next */
+		}
+		pci_mmio_next = base + bar.size;
+
+		console_write("pci: assigned BAR");
+		console_write_dec((u64)bar.index);
+		console_write(" of ");
+		console_write_dec(slot);
+		console_write(".");
+		console_write_dec(func);
+		console_write(" -> 0x");
+		console_write_hex64(base);
+		console_write("\n");
+	}
+	/* I/O space | memory space | bus master. */
+	u16 cmd = pci_config_read16(bus, slot, func, PCI_CFG_COMMAND);
+	pci_config_write16(bus, slot, func, PCI_CFG_COMMAND, (u16)(cmd | 0x7));
+}
+#endif
+
 void pci_init(void)
 {
+#ifdef __aarch64__
+	/* Nothing is scanned until the tree says there is something to scan. A
+	 * board with no host bridge — or one whose bridge this kernel cannot
+	 * bring up — gets no bus walk, rather than a walk of whatever memory
+	 * happens to sit at another board's ECAM address. */
+	if (!g_pci_ops) {
+		if (fdt_pci_host_kind() != FDT_PCI_HOST_ECAM) {
+			k_info("pci", "no usable host bridge in the device tree — not scanning");
+			return;
+		}
+		g_pci_ecam_base = fdt_pci_cfg_base();
+		/* One megabyte of config space per bus. */
+		g_pci_ecam_buses = (u32)(fdt_pci_cfg_size() >> 20);
+		if (!g_pci_ecam_base || !g_pci_ecam_buses) {
+			k_info("pci", "the device tree's ECAM window is unusable — not scanning");
+			return;
+		}
+	}
+	pci_mmio_next = fdt_pci_mmio_pci_base();
+	pci_mmio_end = pci_mmio_next + fdt_pci_mmio_size();
+	/* Skip the first page of the window: a BAR reading zero means unassigned,
+	 * so handing out address zero would look exactly like having handed out
+	 * nothing. */
+	pci_io_next = fdt_pci_io_pci_base() + 0x1000;
+	pci_io_end = pci_io_next + fdt_pci_io_size();
+	if (pci_mmio_next == pci_mmio_end) {
+		k_info("pci", "the device tree declares no MMIO window — BARs stay unassigned");
+	}
+#endif
 	k_info("pci", "enumerating devices");
 	for (u16 bus = 0; bus < 256; bus++) {
 		for (u8 slot = 0; slot < 32; slot++) {
@@ -80,6 +283,9 @@ void pci_init(void)
 				if (vendor == 0xFFFF)
 					continue;
 				u16 device = pci_config_read16((u8)bus, slot, func, 2);
+#ifdef __aarch64__
+				pci_assign_bars((u8)bus, slot, func);
+#endif
 				u8 cls = pci_config_read8((u8)bus, slot, func, 0x0B);
 				u8 sub = pci_config_read8((u8)bus, slot, func, 0x0A);
 				/* One line per function, addressed the way every other
@@ -102,6 +308,30 @@ void pci_init(void)
 			}
 		}
 	}
+}
+
+/* See the declaration in <b1nix/pci.h>. */
+u8 pci_intx_line(u8 bus, u8 slot, u8 func)
+{
+#if defined(__aarch64__)
+	u8 pin = pci_config_read8(bus, slot, func, 0x3D);
+
+	if (pin < 1 || pin > 4)
+		return 0xFF; /* the device drives no INTx line */
+
+	u32 gsi = pci_intx_gsi(bus, slot, func, pin);
+	if (gsi)
+		return (u8)gsi;
+
+	/* No usable interrupt-map — a board that describes its bridge some other
+	 * way, or a boot with no device tree. Fall back to the swizzle every PCI
+	 * bridge implements (INTA of slot n lands where INTB of slot n-1 does) over
+	 * QEMU virt's four SPIs, 3..6, which are GIC IDs 35..38. Wrong on a board
+	 * that is not virt, but a wrong line polls exactly like no line at all. */
+	return (u8)(35 + ((slot + pin - 1) & 3));
+#else
+	return pci_config_read8(bus, slot, func, 0x3C);
+#endif
 }
 
 int pci_find_device(u16 vendor_id, u16 device_id, struct pci_device_info *info)
@@ -129,7 +359,7 @@ int pci_find_device(u16 vendor_id, u16 device_id, struct pci_device_info *info)
 						info->class_code = pci_config_read8((u8)bus, slot, func, 0x0B);
 						info->subclass = pci_config_read8((u8)bus, slot, func, 0x0A);
 						info->prog_if = pci_config_read8((u8)bus, slot, func, 0x09);
-						info->irq_line = pci_config_read8((u8)bus, slot, func, 0x3C);
+						info->irq_line = pci_intx_line((u8)bus, slot, func);
 					}
 					return 1;
 				}
@@ -170,7 +400,7 @@ int pci_find_class(u8 class_code, u8 subclass, u8 index, struct pci_device_info 
 					info->class_code = cls;
 					info->subclass = sub;
 					info->prog_if = pci_config_read8((u8)bus, slot, func, 0x09);
-					info->irq_line = pci_config_read8((u8)bus, slot, func, 0x3C);
+					info->irq_line = pci_intx_line((u8)bus, slot, func);
 				}
 				return 1;
 			}
@@ -291,23 +521,8 @@ int pci_bar_read(u8 bus, u8 slot, u8 func, u8 index, struct pci_bar *bar)
 
 	u8 off = (u8)(PCI_CFG_BAR0 + index * 4);
 	u32 orig_lo = pci_config_read32(bus, slot, func, off);
-	if (orig_lo == 0 || orig_lo == 0xFFFFFFFFu)
+	if (orig_lo == 0xFFFFFFFFu)
 		return 0;
-
-	bar->is_io = (orig_lo & PCI_BAR_IO) ? 1 : 0;
-	bar->is_64bit = (!bar->is_io &&
-	                 (orig_lo & PCI_BAR_MEM_TYPE_MASK) == PCI_BAR_MEM_TYPE_64)
-	                    ? 1
-	                    : 0;
-	bar->prefetchable =
-	    (!bar->is_io && (orig_lo & PCI_BAR_MEM_PREFETCH)) ? 1 : 0;
-
-	u32 orig_hi = 0;
-	if (bar->is_64bit) {
-		if (index + 1 >= nbars)
-			return 0; /* malformed: 64-bit BAR with no upper half */
-		orig_hi = pci_config_read32(bus, slot, func, (u8)(off + 4));
-	}
 
 	/*
 	 * Sizing writes all-ones and reads back the mask of the bits the device
@@ -321,8 +536,29 @@ int pci_bar_read(u8 bus, u8 slot, u8 func, u8 index, struct pci_bar *bar)
 
 	pci_config_write32(bus, slot, func, off, 0xFFFFFFFFu);
 	u32 mask_lo = pci_config_read32(bus, slot, func, off);
+	if (mask_lo == 0 || mask_lo == 0xFFFFFFFFu) {
+		pci_config_write32(bus, slot, func, off, orig_lo);
+		pci_config_write16(bus, slot, func, PCI_CFG_COMMAND, cmd);
+		return 0;
+	}
+
+	bar->is_io = (mask_lo & PCI_BAR_IO) ? 1 : 0;
+	bar->is_64bit = (!bar->is_io &&
+	                 (mask_lo & PCI_BAR_MEM_TYPE_MASK) == PCI_BAR_MEM_TYPE_64)
+	                    ? 1
+	                    : 0;
+	bar->prefetchable =
+	    (!bar->is_io && (mask_lo & PCI_BAR_MEM_PREFETCH)) ? 1 : 0;
+
+	u32 orig_hi = 0;
 	u32 mask_hi = 0xFFFFFFFFu;
 	if (bar->is_64bit) {
+		if (index + 1 >= nbars) {
+			pci_config_write32(bus, slot, func, off, orig_lo);
+			pci_config_write16(bus, slot, func, PCI_CFG_COMMAND, cmd);
+			return 0; /* malformed: 64-bit BAR with no upper half */
+		}
+		orig_hi = pci_config_read32(bus, slot, func, (u8)(off + 4));
 		pci_config_write32(bus, slot, func, (u8)(off + 4), 0xFFFFFFFFu);
 		mask_hi = pci_config_read32(bus, slot, func, (u8)(off + 4));
 		pci_config_write32(bus, slot, func, (u8)(off + 4), orig_hi);
@@ -346,6 +582,13 @@ int pci_bar_read(u8 bus, u8 slot, u8 func, u8 index, struct pci_bar *bar)
 	u64 size = (~mask) + 1;
 	if (size == 0 || (size & (size - 1)) != 0)
 		return 0; /* device did not decode a sane power-of-two window */
+
+	/* A BAR holds the address the DEVICE sees. Every caller of this wants the
+	 * one the CPU has to issue, and on a host bridge whose window is not an
+	 * identity mapping those differ. A BAR reading zero is unassigned, not an
+	 * address, so it is left alone — pci_assign_bars tests for exactly that. */
+	if (!bar->is_io && bar->base)
+		bar->base = pci_bus_to_cpu(bar->base);
 
 	bar->size = size;
 	bar->valid = 1;
@@ -409,6 +652,15 @@ static void pci_ecam_probe(void)
 		return;
 	ecam_probed = 1;
 
+#ifdef __aarch64__
+	/* No ACPI here — the board's window, see pci_ecam_slot above. It is left
+	 * at zero on a board whose bridge is not ECAM, which is what "no extended
+	 * config space" means for every caller. */
+	ecam_base_phys = g_pci_ecam_base;
+	ecam_start_bus = 0;
+	ecam_end_bus = g_pci_ecam_buses ? g_pci_ecam_buses - 1 : 0;
+	return;
+#else
 	const struct acpi_sdt_header *mcfg = acpi_find_table("MCFG");
 	if (!mcfg)
 		return;
@@ -423,6 +675,7 @@ static void pci_ecam_probe(void)
 	ecam_base_phys = a->base;
 	ecam_start_bus = a->start_bus;
 	ecam_end_bus = a->end_bus;
+#endif
 }
 
 u8 pci_ecam_available(void)
@@ -656,6 +909,10 @@ static u64 msi_message_address(u32 apic_id)
 	return 0xFEE00000ULL | ((u64)(apic_id & 0xFF) << 12);
 }
 
+/* The same address, for the arch layer that builds the message pair (x86_64's
+ * arch_msi_prepare). */
+u64 pci_msi_message_address(u32 apic_id) { return msi_message_address(apic_id); }
+
 int pci_msi_enable(u8 bus, u8 slot, u8 func, u8 vector)
 {
 	u8 cap = pci_find_capability(bus, slot, func, PCI_CAP_ID_MSI);
@@ -814,13 +1071,24 @@ int pci_msix_enable(u8 bus, u8 slot, u8 func, u32 entry, u8 vector)
 	if (!t || entry >= entries)
 		return -1;
 
-	u64 addr = msi_message_address(lapic_id());
+	/* The address/data pair is what a message interrupt IS, and it is not the
+	 * same shape on every machine: on x86 the address names the local APIC and
+	 * the data is the vector, while on aarch64 it is the ITS's translation
+	 * register and an EventID that the ITS has been told maps to this vector.
+	 * arch_msi_prepare owns that difference (and, on aarch64, the ITS commands
+	 * that must run before the device is allowed to write). */
+	u64 addr = 0;
+	u32 data = 0;
+
+	if (arch_msi_prepare(bus, slot, func, vector, &addr, &data) < 0)
+		return -1;
+
 	volatile u32 *e = t + entry * 4;
 	/* Mask the entry while its address/data are in flux, then unmask. */
 	e[3] = PCI_MSIX_VECTOR_CTRL_MASK;
 	e[0] = (u32)(addr & 0xFFFFFFFFu);
 	e[1] = (u32)(addr >> 32);
-	e[2] = (u32)vector;
+	e[2] = data;
 	e[3] = 0;
 
 	pci_command_set(bus, slot, func,
@@ -1216,6 +1484,16 @@ static void pci_selftest_msi(void)
 		 * command register and the table entry, and put all three back. A
 		 * virtio function driven over INTx would otherwise be left with MSI-X
 		 * enabled and its legacy pin disabled. */
+		if (!arch_msi_supported()) {
+			/* No interrupt controller that can carry a message: a GICv2
+			 * board has no ITS, and programming an entry that nothing can
+			 * deliver proves nothing. */
+			console_write("M98-DRV-SMOKE: skip msix-config (no MSI controller "
+			              "on this board)\n");
+			msi_free_vector(vector);
+			return;
+		}
+
 		u8 msix_cap = pci_find_capability(msix_dev.bus, msix_dev.slot,
 		                                  msix_dev.func, PCI_CAP_ID_MSIX);
 		u16 saved_cmd = pci_config_read16(msix_dev.bus, msix_dev.slot,
@@ -1234,9 +1512,17 @@ static void pci_selftest_msi(void)
 		u32 data = 0, vctrl = 0xFFFFFFFFu;
 		int rb = pci_msix_entry_readback(msix_dev.bus, msix_dev.slot,
 		                                 msix_dev.func, 0, &addr, &data, &vctrl);
-		u64 want_addr = 0xFEE00000ULL | ((u64)(lapic_id() & 0xFF) << 12);
-		if (n > 0 && rc == 0 && rb == 0 && addr == want_addr &&
-		    data == (u32)vector && (vctrl & 1u) == 0) {
+		/* The pair a device must write is the arch's to define — the local
+		 * APIC's address and the vector on x86, the ITS's translation register
+		 * and an EventID here. Comparing against the x86 pair on a machine
+		 * that has neither used to "pass" by writing an address nothing reads
+		 * and reading it back. */
+		u64 want_addr = 0;
+		u32 want_data = 0;
+		int have_pair = arch_msi_expected(vector, &want_addr, &want_data) == 0;
+
+		if (n > 0 && rc == 0 && rb == 0 && have_pair && addr == want_addr &&
+		    data == want_data && (vctrl & 1u) == 0) {
 			console_write("M98-DRV-SMOKE: ok msix-config vectors=");
 			console_write_dec((u64)n);
 			console_write("\n");
