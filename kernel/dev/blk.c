@@ -2273,9 +2273,31 @@ void blk_durability_selftest(void) {
     console_write("\n");
   }
 
-  struct block_device *dev = blk_nth_on_bus(BLK_BUS_VIRTIO, 0);
-  if (!dev || !dev->write_blocks) {
-    k_info(NULL, "M14-BLK: no virtio-blk scratch device");
+  /* The first virtio disk that nothing has mounted. Taking index 0 blindly is
+   * only safe on a board where the root filesystem arrives some other way: on
+   * aarch64 the root IS the first virtio disk, and this test writes a pattern
+   * at LBA 2048 — a megabyte into whatever it picks. */
+  struct block_device *dev = 0;
+  for (usize n = 0; n < blk_device_count; n++) {
+    struct block_device *cand = blk_nth_on_bus(BLK_BUS_VIRTIO, n);
+    if (!cand)
+      break;
+    if (cand->write_blocks && !vfs_device_is_mounted(cand->name)) {
+      dev = cand;
+      break;
+    }
+  }
+  /* A Raspberry Pi has no virtio disk at all; there the SD card is the only
+   * block device the test can use. */
+  for (usize n = 0; !dev; n++) {
+    struct block_device *cand = blk_nth_on_bus(BLK_BUS_MMC, n);
+    if (!cand)
+      break;
+    if (cand->write_blocks && !vfs_device_is_mounted(cand->name))
+      dev = cand;
+  }
+  if (!dev) {
+    k_info(NULL, "M14-BLK: no unmounted virtio-blk scratch device");
     return;
   }
 

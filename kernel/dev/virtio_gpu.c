@@ -1,4 +1,5 @@
 #include <b1nix/bootinfo.h>
+#include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/dma_fence.h>
 #include <b1nix/errno.h>
@@ -364,9 +365,17 @@ static void virtio_gpu_reap_used(struct virtqueue *vq)
 
 static inline u64 gpu_rdtsc(void)
 {
+#if defined(__x86_64__)
     u32 lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((u64)hi << 32) | lo;
+#elif defined(__aarch64__)
+    u64 val;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+#else
+    return 0;
+#endif
 }
 
 /* One watchdog period is what a lost interrupt costs before the wait notices
@@ -420,7 +429,7 @@ static int virtio_gpu_wait_used(struct virtqueue *vq, u16 target_used)
     if (!gpu_wait_no_spin) {
         for (int round = 0; round < 16; round++) {
             for (int i = 0; i < 256; i++)
-                __asm__ volatile("pause");
+                cpu_relax();
             if (vq->used->idx == target_used) {
                 gpu_wait_spun++;
                 vq->last_used_idx = vq->used->idx;
@@ -2042,7 +2051,7 @@ void virtio_gpu_init(void)
             }
         }
         if (!gpu_irq_ready && gpu_isr_cfg) {
-            gpu_irq_line = pci_config_read8(pci.bus, pci.slot, pci.func, 0x3C);
+            gpu_irq_line = pci_intx_line(pci.bus, pci.slot, pci.func);
             if (gpu_irq_line != 0 && gpu_irq_line != 0xff &&
                 irq_register_handler(gpu_irq_line, virtio_gpu_irq, 0) == 0) {
                 irq_unmask(gpu_irq_line);
@@ -2160,8 +2169,21 @@ void virtio_gpu_irq_selftest(void)
      * counts are printed instead: a driver that stopped receiving interrupts
      * altogether fails on the count above, which is the property that matters.
      */
-    if (gpu_irq_count - irqs0 == VGPU_IRQ_SELFTEST_CMDS &&
-        gpu_wait_parked > parks0) {
+    /*
+     * A message per completion is exact; a level-triggered line is not. INTx
+     * stays asserted until the cause is read, so one trip through the handler
+     * can retire two completions and the count comes out short — legitimately,
+     * and it did on aarch64, where the GIC delivers 6 for 8 commands. What
+     * must hold on both is that interrupts arrive at all and never exceed one
+     * per command; MSI-X, which cannot coalesce, is still held to the exact
+     * number.
+     */
+    u64 irqs = gpu_irq_count - irqs0;
+    int count_ok = (gpu_msix_vector >= 0)
+                       ? (irqs == VGPU_IRQ_SELFTEST_CMDS)
+                       : (irqs > 0 && irqs <= VGPU_IRQ_SELFTEST_CMDS);
+
+    if (count_ok && gpu_wait_parked > parks0) {
         console_write("M52-GFX: ok gpu-irq\n");
     } else {
         console_write("M52-GFX: fail gpu-irq not-interrupt-driven\n");

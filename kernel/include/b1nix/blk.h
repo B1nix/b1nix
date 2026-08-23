@@ -19,6 +19,7 @@ enum blk_bus {
 	BLK_BUS_MD,      /* software RAID — an array over other block devices */
 	BLK_BUS_NBD,     /* a remote export reached over TCP */
 	BLK_BUS_MTD,     /* raw flash, through the MTD layer */
+	BLK_BUS_MMC,     /* SD/MMC — named mmcblk* */
 };
 
 /* What one command to this device may carry. Linux keeps the same three

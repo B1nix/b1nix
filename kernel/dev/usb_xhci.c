@@ -345,7 +345,11 @@ static int evt_poll_hw(struct trb *out, int timeout_loops)
 		struct trb *e = &evt_ring[evt_deq];
 		u32 control = ((volatile struct trb *)e)->control;
 		if ((control & TRB_CYCLE) == evt_cycle) {
+#if defined(__aarch64__)
+			__asm__ volatile("dmb ishld" ::: "memory");
+#else
 			__asm__ volatile("lfence" ::: "memory");
+#endif
 			*out = *e;
 			evt_deq++;
 			if (evt_deq == RING_LEN) { evt_deq = 0; evt_cycle ^= 1; }
@@ -449,7 +453,11 @@ static int evt_wait_transfer(int target_slot, int target_dci, struct trb *out, i
 /* ── Command ring ───────────────────────────────────────────────────────── */
 static void ring_doorbell(u32 slot, u32 target)
 {
+#if defined(__aarch64__)
+	__asm__ volatile("dmb ishst" ::: "memory");
+#else
 	__asm__ volatile("sfence" ::: "memory");
+#endif
 	db_array[slot] = target;
 }
 

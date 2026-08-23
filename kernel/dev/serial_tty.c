@@ -667,8 +667,9 @@ void serial_tty_init(void) {
   for (int i = 0; i < SERIAL_NPORTS; i++) {
     struct serial_tty *t = &sttys[i];
     t->com = i;
-    strcpy(t->name, "ttyS0");
+    t->name[0] = 't'; t->name[1] = 't'; t->name[2] = 'y'; t->name[3] = 'S';
     t->name[4] = (char)('0' + i);
+    t->name[5] = '\0';
     stty_reset(t);
     if (serial_port_present(i))
       t->registered = 1;

@@ -88,10 +88,14 @@ void watchdog_tick(void) {
   g_fired = 1;
   console_write("watchdog: timeout expired, resetting the machine\n");
   interrupts_disable();
+#ifdef __aarch64__
+  arch_psci_reset();
+#else
   /* Pulse the 8042 reset line, the same path SYS_REBOOT's restart takes. */
   while (inb(0x64) & 0x02)
     ;
   outb(0x64, 0xFE);
+#endif
   arch_halt();
 }
 

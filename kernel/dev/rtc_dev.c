@@ -77,6 +77,165 @@ struct rtc_wkalrm_k {
 static spinlock_t rtc_lock = SPINLOCK_INIT;
 static u32 g_irq_freq = 2;
 
+/* Calendar helpers, shared by both backends. */
+static int is_leap(int year) {
+  return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+static int days_in_month(int year, int mon /* 0-11 */) {
+  static const int d[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (mon == 1 && is_leap(year))
+    return 29;
+  return d[mon];
+}
+
+/* Read the hardware clock. Retries until two consecutive reads agree and the
+ * update-in-progress flag is clear, which is the only way to avoid a torn
+ * value across a second boundary. */
+
+#if defined(__aarch64__)
+/* ── PL031 backend (QEMU virt) ───────────────────────────────────────────
+ * The ARM PrimeCell RTC is a plain 32-bit seconds-since-epoch counter with one
+ * match register for the alarm — no BCD, no update-in-progress window, and no
+ * periodic interrupt. Everything below the node/ioctl layer is therefore much
+ * simpler than the CMOS backend it replaces on this arch. QEMU maps it at
+ * 0x09010000, inside the identity-mapped low MMIO window the GIC and UART also
+ * live in, so no mapping call is needed. */
+#define PL031_BASE 0x09010000ULL
+#define PL031_DR   0x000 /* data: current value, seconds */
+#define PL031_MR   0x004 /* match: alarm */
+#define PL031_LR   0x008 /* load: set the counter */
+#define PL031_CR   0x00c /* control: bit 0 enables */
+#define PL031_IMSC 0x010 /* interrupt mask set/clear */
+#define PL031_RIS  0x014 /* raw interrupt status */
+#define PL031_ICR  0x01c /* interrupt clear */
+
+static volatile u32 *pl031_reg(u32 off) {
+  return (volatile u32 *)(usize)(PL031_BASE + off);
+}
+
+/* Days since the epoch for a Gregorian date, then the usual 86400 scaling. */
+static u64 rtc_tm_to_epoch(const struct rtc_time_k *t) {
+  int year = t->tm_year + 1900;
+  i64 days = 0;
+  for (int y = 1970; y < year; y++)
+    days += is_leap(y) ? 366 : 365;
+  for (int m = 0; m < t->tm_mon; m++)
+    days += days_in_month(year, m);
+  days += t->tm_mday - 1;
+  return (u64)days * 86400ULL + (u64)t->tm_hour * 3600ULL +
+         (u64)t->tm_min * 60ULL + (u64)t->tm_sec;
+}
+
+static void rtc_epoch_to_tm(u64 secs, struct rtc_time_k *out) {
+  memset(out, 0, sizeof(*out));
+  u64 days = secs / 86400ULL;
+  u32 rem = (u32)(secs % 86400ULL);
+  out->tm_hour = (int)(rem / 3600);
+  out->tm_min = (int)((rem % 3600) / 60);
+  out->tm_sec = (int)(rem % 60);
+  out->tm_wday = (int)((days + 4) % 7); /* 1970-01-01 was a Thursday */
+  int year = 1970;
+  while (1) {
+    u64 ylen = is_leap(year) ? 366 : 365;
+    if (days < ylen)
+      break;
+    days -= ylen;
+    year++;
+  }
+  out->tm_year = year - 1900;
+  out->tm_yday = (int)days;
+  int mon = 0;
+  while (mon < 11 && days >= (u64)days_in_month(year, mon)) {
+    days -= (u64)days_in_month(year, mon);
+    mon++;
+  }
+  out->tm_mon = mon;
+  out->tm_mday = (int)days + 1;
+  out->tm_isdst = -1;
+}
+
+static int rtc_hw_read(struct rtc_time_k *out) {
+  rtc_epoch_to_tm(*pl031_reg(PL031_DR), out);
+  return 0;
+}
+
+static int rtc_hw_write(const struct rtc_time_k *t) {
+  int year = t->tm_year + 1900;
+  if (t->tm_mon < 0 || t->tm_mon > 11 || t->tm_mday < 1 ||
+      t->tm_mday > days_in_month(year, t->tm_mon) || t->tm_hour < 0 ||
+      t->tm_hour > 23 || t->tm_min < 0 || t->tm_min > 59 || t->tm_sec < 0 ||
+      t->tm_sec > 59 || year < 1970 || year > 3000)
+    return -EINVAL;
+  u64 flags;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  *pl031_reg(PL031_LR) = (u32)rtc_tm_to_epoch(t);
+  *pl031_reg(PL031_CR) = 1;
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  return 0;
+}
+
+static int rtc_alarm_read(struct rtc_wkalrm_k *out) {
+  u64 flags;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  u32 match = *pl031_reg(PL031_MR);
+  u32 mask = *pl031_reg(PL031_IMSC);
+  u32 ris = *pl031_reg(PL031_RIS);
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  memset(out, 0, sizeof(*out));
+  rtc_epoch_to_tm(match, &out->time);
+  out->enabled = (mask & 1) ? 1 : 0;
+  out->pending = (ris & 1) ? 1 : 0;
+  return 0;
+}
+
+/* The alarm register holds a full timestamp, but RTC_ALM_SET only carries
+ * hour/min/sec — the same "next time those hands come round" semantics the
+ * CMOS backend has. Build it from today's date and roll to tomorrow when the
+ * time of day has already passed. */
+static int rtc_alarm_write(const struct rtc_time_k *t, int enable) {
+  if (t->tm_sec < 0 || t->tm_sec > 59 || t->tm_min < 0 || t->tm_min > 59 ||
+      t->tm_hour < 0 || t->tm_hour > 23)
+    return -EINVAL;
+  u64 flags;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  u64 now = *pl031_reg(PL031_DR);
+  u64 midnight = (now / 86400ULL) * 86400ULL;
+  u64 when = midnight + (u64)t->tm_hour * 3600ULL + (u64)t->tm_min * 60ULL +
+             (u64)t->tm_sec;
+  if (when <= now)
+    when += 86400ULL;
+  *pl031_reg(PL031_MR) = (u32)when;
+  *pl031_reg(PL031_ICR) = 1;
+  *pl031_reg(PL031_IMSC) = enable ? 1u : 0u;
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  return 0;
+}
+
+/* Only the alarm interrupt exists on PL031; there is no update-done or
+ * periodic source to switch on, so those are reported as unsupported rather
+ * than silently accepted. */
+static int rtc_set_status_b(u8 bit, int on) {
+  if (bit != RTC_B_AIE)
+    return -EINVAL;
+  u64 flags;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  *pl031_reg(PL031_IMSC) = on ? 1u : 0u;
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  return 0;
+}
+
+u64 rtc_now_unix_seconds(void) { return *pl031_reg(PL031_DR); }
+
+void rtc_set_unix_time(u64 sec) {
+  u64 flags;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  *pl031_reg(PL031_LR) = (u32)sec;
+  *pl031_reg(PL031_CR) = 1;
+  spin_unlock_irqrestore(&rtc_lock, flags);
+}
+
+#else
 static u8 cmos_read(u8 reg) {
   outb(CMOS_ADDR, reg);
   return inb(CMOS_DATA);
@@ -93,20 +252,6 @@ static int bcd_to_bin(u8 v) { return (v & 0x0F) + ((v >> 4) * 10); }
 static u8 bin_to_bcd(int v) { return (u8)(((v / 10) << 4) | (v % 10)); }
 
 /* Days in a month, honouring the proleptic Gregorian leap rule. */
-static int is_leap(int year) {
-  return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-}
-
-static int days_in_month(int year, int mon /* 0-11 */) {
-  static const int d[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-  if (mon == 1 && is_leap(year))
-    return 29;
-  return d[mon];
-}
-
-/* Read the hardware clock. Retries until two consecutive reads agree and the
- * update-in-progress flag is clear, which is the only way to avoid a torn
- * value across a second boundary. */
 static int rtc_hw_read(struct rtc_time_k *out) {
   u8 s1[7], s2[7];
   u8 b;
@@ -301,6 +446,8 @@ static int rtc_set_status_b(u8 bit, int on) {
   return 0;
 }
 
+#endif /* CMOS vs PL031 backend */
+
 /* Reading /dev/rtc0 blocks for an interrupt in Linux; there is no RTC IRQ
  * consumer here, so a read reports the current time as text instead of lying
  * about an interrupt that will never arrive. */
@@ -406,6 +553,11 @@ static int rtc_ioctl(struct vfs_node *node, u64 request, void *arg) {
       rate++;
     if (rate >= 16)
       return -EINVAL;
+#if defined(__aarch64__)
+    /* PL031 has no periodic interrupt source at all — only the alarm match. */
+    (void)rate;
+    return -EINVAL;
+#else
     u64 flags;
     spin_lock_irqsave(&rtc_lock, &flags);
     u8 a = cmos_read(CMOS_STATUS_A);
@@ -413,6 +565,7 @@ static int rtc_ioctl(struct vfs_node *node, u64 request, void *arg) {
     spin_unlock_irqrestore(&rtc_lock, flags);
     g_irq_freq = (u32)f;
     return 0;
+#endif
   }
   default:
     return -ENOTTY;

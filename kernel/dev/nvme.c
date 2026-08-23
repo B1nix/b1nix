@@ -1,14 +1,40 @@
+#include <b1nix/arch.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/blk.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/amdvi.h>
 #include <b1nix/iommu.h>
+#if defined(__aarch64__)
+#include <b1nix/smmuv3.h>
+#else
+/* The SMMUv3 is an arm64 unit and kernel/dev/smmuv3.c is not built for x86_64.
+ * These stand in for it so the unit indirection below reads the same on both
+ * arches. Every one of them is unreachable here: unit_smmu_active() is a
+ * compile-time zero on this arch. */
+static inline int smmuv3_active(void) { return 0; }
+static inline int smmuv3_map(u64 iova, u64 phys, usize size, int writable)
+{ (void)iova; (void)phys; (void)size; (void)writable; return -1; }
+static inline int smmuv3_unmap(u64 iova, usize size)
+{ (void)iova; (void)size; return -1; }
+static inline u64 smmuv3_translate(u64 iova) { (void)iova; return 0; }
+static inline u32 smmuv3_fault_count(void) { return 0; }
+static inline void smmuv3_fault_clear(void) {}
+static inline int smmuv3_attach_device(u8 bus, u8 slot, u8 func)
+{ (void)bus; (void)slot; (void)func; return -1; }
+static inline void smmuv3_detach_device(u8 bus, u8 slot, u8 func)
+{ (void)bus; (void)slot; (void)func; }
+static inline void smmuv3_fault_last(u64 *addr, u32 *sid, u8 *type)
+{ if (addr) *addr = 0; if (sid) *sid = 0; if (type) *type = 0; }
+#endif
 #include <b1nix/irq.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/nvme.h>
 #include <b1nix/pci.h>
+#if defined(__aarch64__)
+#include <b1nix/gicv3.h>
+#endif
 #include <lkpi/dma-mapping.h>
 #include <b1nix/sched.h>
 #include <string.h>
@@ -153,7 +179,7 @@ static int nvme_wait_ready(volatile struct nvme_registers *regs, int ready)
         u32 csts = regs->csts;
         int rdy = (csts & NVME_CSTS_RDY) ? 1 : 0;
         if (rdy == ready) return 0;
-        __asm__ volatile("pause");
+        cpu_relax();
         timeout--;
     }
     return -1; // Timeout
@@ -295,7 +321,7 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
          * microseconds, and yielding on the first not-done pays a full scheduler
          * round-trip per command, capping throughput far below the device. */
         for (int s = 0; s < 4096 && cqe->status == 0xFFFF; s++)
-            __asm__ volatile("pause");
+            cpu_relax();
         if (cqe->status != 0xFFFF) {
             u16 status = cqe->status;
             cqe->status = 0xFFFF; // Reset status on consume
@@ -315,28 +341,18 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
             return 0;
         }
 
-        // Fast path: brief in-RAM spin (no MMIO) to catch a quick completion.
         for (int i = 0; i < 4000; i++) {
             if (dev->io_cq[dev->io_cq_head].status != 0xFFFF)
                 break;
-            __asm__ volatile("pause");
+            cpu_relax();
         }
-        if (dev->io_cq[dev->io_cq_head].status != 0xFFFF)
-            continue;
-
-        if (!scheduler_can_block()) {
-            if (spins == 10000000ULL)
-                nvme_wait_note("io");
+        while (dev->io_cq[dev->io_cq_head].status == 0xFFFF) {
+            for (int i = 0; i < 256; i++)
+                cpu_relax();
+            if (dev->io_cq[dev->io_cq_head].status != 0xFFFF)
+                break;
             scheduler_yield();
-            spins++;
-            continue;
         }
-        scheduler_wait_prepare_timeout(&dev->io_cq, NVME_IO_WATCHDOG_TICKS);
-        if (dev->io_cq[dev->io_cq_head].status != 0xFFFF) {
-            scheduler_wait_cancel();
-            continue;
-        }
-        scheduler_wait_commit();
     }
 }
 
@@ -510,7 +526,7 @@ void nvme_init(void)
     pci_config_write16(pci_info.bus, pci_info.slot, pci_info.func, 0x04, command);
 
     // Legacy interrupt line for the controller (M70: completion IRQ).
-    u8 nvme_irq_line = pci_config_read8(pci_info.bus, pci_info.slot, pci_info.func, 0x3C);
+    u8 nvme_irq_line = pci_intx_line(pci_info.bus, pci_info.slot, pci_info.func);
     
     // Read BAR0 (64-bit MMIO base)
     u32 bar0_low = pci_config_read32(pci_info.bus, pci_info.slot, pci_info.func, 0x10);
@@ -523,8 +539,12 @@ void nvme_init(void)
     console_write("\n");
     
     // Map the controller registers.
-#ifdef __x86_64__
-    // x86_64: the direct map already covers PCI MMIO BARs.
+#if defined(__x86_64__) || defined(__aarch64__)
+    /* x86_64: the direct map already covers PCI MMIO BARs. aarch64: the same
+     * is true — build_kernel_half maps the board's PCIe MMIO window as Device
+     * memory, and vmm_direct_map_base() is 0 there, so this is the identity
+     * address. Going through vmm_map_mmio instead returned NULL (it is a stub
+     * on that arch) and the first register read faulted at address 0. */
     u64 regs_virt = vmm_direct_map_base() + bar0;
 #else
     // 32-bit: BAR0 lives at ~4 GB of MMIO space, above the 1 GB direct map, so
@@ -891,7 +911,14 @@ void nvme_msix_selftest(void)
                 iommu_ir_entry_read(nvme.ir_handle, &entry_vector, 0, 0) == 0 &&
                 entry_vector == (u8)nvme.msix_vector;
     } else {
-        armed = rb == 0 && data == (u32)nvme.msix_vector && (vctrl & 1u) == 0;
+        /* The data word is the vector on x86 and an ITS EventID on aarch64, so
+         * ask the arch what it programmed rather than assuming either. */
+        u64 want_addr = 0;
+        u32 want_data = 0;
+
+        armed = rb == 0 && (vctrl & 1u) == 0 &&
+                arch_msi_expected(nvme.msix_vector, &want_addr, &want_data) == 0 &&
+                addr == want_addr && data == want_data;
     }
     if (!armed) {
         console_write("M98-DRV-SMOKE: FAIL msi-delivery (entry 0 not armed for vector ");
@@ -907,6 +934,7 @@ void nvme_msix_selftest(void)
     }
 
     u32 before = __atomic_load_n(&nvme.irq_hits, __ATOMIC_RELAXED);
+
     /* read_blocks returns the block count it transferred, not 0. */
     int rc = nvme_blk_read(&nvme.blk_dev, 0, 1, buf);
     /* The handler runs on this CPU in interrupt context; by the time the read
@@ -964,64 +992,123 @@ void nvme_msix_selftest(void)
  * through this thin indirection rather than being written twice — and the
  * marker they print names the milestone the active unit belongs to.
  */
-static int unit_active(void) { return iommu_active() || amdvi_active(); }
+#if defined(__aarch64__)
+/* The third unit is this architecture's own: an ARM SMMUv3 (kernel/dev/smmuv3.c).
+ * It is reached through the same indirection and answers the same questions —
+ * only the milestone the marker names changes, because the hardware being
+ * proven is not VT-d and must not claim VT-d's marker. */
+#define unit_iommu_active() 0
+#define unit_amdvi_active() 0
+#define unit_smmu_active()  smmuv3_active()
+#else
+#define unit_iommu_active() iommu_active()
+#define unit_amdvi_active() amdvi_active()
+#define unit_smmu_active()  0
+#endif
+
+static int unit_active(void)
+{
+	return unit_iommu_active() || unit_amdvi_active() || unit_smmu_active();
+}
 
 static const char *unit_suite(void)
 {
-	return iommu_active() ? "M100B-SMOKE" : "M100D-SMOKE";
+	if (unit_smmu_active())
+		return "M100E-SMOKE";
+	return unit_iommu_active() ? "M100B-SMOKE" : "M100D-SMOKE";
 }
 
 static int unit_map_identity(u64 phys, usize size, int writable)
 {
-	if (iommu_active())
-		return iommu_map_identity(phys, size, writable);
 	u64 base = phys & ~(u64)(NVME_PAGE_SIZE - 1);
+
+	if (unit_iommu_active())
+		return iommu_map_identity(phys, size, writable);
+	if (unit_smmu_active())
+		return smmuv3_map(base, base, (usize)((phys - base) + size), writable);
 	return amdvi_map(base, base, (usize)((phys - base) + size), writable);
 }
 
 static int unit_unmap(u64 base, usize size)
 {
-	if (iommu_active())
+	if (unit_iommu_active())
 		return iommu_unmap(base, size);
+	if (unit_smmu_active())
+		return smmuv3_unmap(base, size);
 	return amdvi_unmap(base, size);
 }
 
 static u64 unit_translate(u64 iova)
 {
-	return iommu_active() ? iommu_translate(iova) : amdvi_translate(iova);
+	if (unit_iommu_active())
+		return iommu_translate(iova);
+	if (unit_smmu_active())
+		return smmuv3_translate(iova);
+	return amdvi_translate(iova);
 }
 
 static u32 unit_fault_count(void)
 {
-	return iommu_active() ? iommu_fault_count() : amdvi_fault_count();
+	if (unit_iommu_active())
+		return iommu_fault_count();
+	if (unit_smmu_active())
+		return smmuv3_fault_count();
+	return amdvi_fault_count();
 }
 
 static void unit_fault_clear(void)
 {
-	if (iommu_active())
+	if (unit_iommu_active())
 		iommu_fault_clear();
+	else if (unit_smmu_active())
+		smmuv3_fault_clear();
 	else
 		amdvi_fault_clear();
 }
 
 static int unit_attach(void)
 {
-	if (iommu_active())
-		return iommu_attach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
 	u16 bdf = (u16)((nvme.pci_bus << 8) | ((nvme.pci_slot & 0x1F) << 3) |
 	                (nvme.pci_func & 7));
+
+	if (unit_iommu_active())
+		return iommu_attach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
+	if (unit_smmu_active())
+		return smmuv3_attach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
 	return amdvi_attach_device(bdf);
 }
 
 static void unit_detach(void)
 {
-	if (iommu_active()) {
+	u16 bdf = (u16)((nvme.pci_bus << 8) | ((nvme.pci_slot & 0x1F) << 3) |
+	                (nvme.pci_func & 7));
+
+	if (unit_iommu_active()) {
 		iommu_detach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
 		return;
 	}
-	u16 bdf = (u16)((nvme.pci_bus << 8) | ((nvme.pci_slot & 0x1F) << 3) |
-	                (nvme.pci_func & 7));
+	if (unit_smmu_active()) {
+		smmuv3_detach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
+		return;
+	}
 	amdvi_detach_device(bdf);
+}
+
+/* The last fault the active unit recorded, however it spells one. */
+static void unit_fault_last(u64 *addr, u16 *src, u8 *reason)
+{
+	if (unit_smmu_active()) {
+		u32 sid = 0;
+		u8 type = 0;
+
+		smmuv3_fault_last(addr, &sid, &type);
+		if (src)
+			*src = (u16)sid;
+		if (reason)
+			*reason = type;
+		return;
+	}
+	iommu_fault_last(addr, src, reason);
 }
 
 static int nvme_iommu_map_own_pages(void)
@@ -1034,6 +1121,21 @@ static int nvme_iommu_map_own_pages(void)
         unit_map_identity(nvme.phys_io_cq, cq_bytes, 1) != 0 ||
         unit_map_identity(nvme.phys_identify_buf, NVME_PAGE_SIZE, 1) != 0)
         return -1;
+#if defined(__aarch64__)
+    /* The device's interrupt is a memory write too, and behind an SMMU it is
+     * translated like any other: the ITS's translation register has to be in
+     * the domain or the MSI faults instead of arriving. x86 has no equivalent
+     * line here because its message goes to the local APIC, which is not
+     * behind the DMA remapping unit. */
+    if (unit_smmu_active() && its_ready()) {
+        u64 doorbell = its_translater_phys();
+
+        if (doorbell &&
+            unit_map_identity(doorbell & ~(u64)(NVME_PAGE_SIZE - 1),
+                              NVME_PAGE_SIZE, 1) != 0)
+            return -1;
+    }
+#endif
     return 0;
 }
 
@@ -1158,7 +1260,7 @@ void nvme_iommu_selftest(void)
         console_write(unit_suite()); console_write(": ok nvme-translated (read through its own domain, no faults)\n");
     } else {
         u64 fa = 0; u16 fs = 0; u8 fr = 0;
-        iommu_fault_last(&fa, &fs, &fr);
+        unit_fault_last(&fa, &fs, &fr);
         console_write(unit_suite()); console_write(": FAIL nvme-translated rc=");
         console_write_dec((u64)(i64)rc);
         console_write(" faults=");

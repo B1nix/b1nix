@@ -20,29 +20,23 @@ static int alt_pressed = 0;
 static int num_lock_enabled = 1;
 static int kbd_debug_enabled;
 
-static const char scancode_map[128] = {
-    0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
-    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
-    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
-    0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,
-    '*', 0, ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '7', '8',
-    '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.', 0, 0
-};
 
-static const char scancode_map_shift[128] = {
-    0, 27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
-    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
-    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
-    0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,
-    '*', 0, ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '7', '8',
-    '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.', 0, 0
-};
 
 /* i8042 controller access helpers. Status port 0x64: bit0 = output buffer full
  * (data ready to read from 0x60), bit1 = input buffer full (do not write yet).
  * All waits are bounded so a wedged/absent controller can never hang boot. */
 /* Bounded in time rather than in reads: the count that used to bound these was
  * a duration only on the machine it was measured on. */
+/*
+ * The i8042 is reached through x86 port I/O, and there is no such thing on
+ * aarch64 — QEMU virt has no PS/2 controller either. The port access is
+ * confined to these helpers so that the rest of the file, in particular
+ * ps2_kbd_handle_byte()'s scancode translation, builds on both arches: the USB
+ * HID driver feeds its keys through exactly that translation, and duplicating
+ * it for the sake of an absent controller would be the worse trade.
+ * ps2_kbd_init() is only called from the x86_64 half of kernel/main.c.
+ */
+#if defined(__x86_64__)
 static int kbd_wait_input_clear(void)
 {
 	u64 deadline = arch_tsc_monotonic_ns() + 20000000ull; /* 20 ms */
@@ -87,6 +81,14 @@ static u8 kbd_dev_read(void)
 		return inb(0x60);
 	return 0;
 }
+#else
+static int kbd_wait_input_clear(void) { return -1; }
+static int kbd_wait_output_full(void) { return -1; }
+static void kbd_flush(void) {}
+static void kbd_ctrl_cmd(u8 cmd) { (void)cmd; }
+static void kbd_dev_write(u8 data) { (void)data; }
+static u8 kbd_dev_read(void) { return 0; }
+#endif
 
 /* Real-hardware i8042/keyboard bring-up. QEMU comes up with scanning enabled
  * and IRQ1 already on, so the old no-op "worked" there; bare metal (e.g. Acer
@@ -102,7 +104,6 @@ void ps2_kbd_init(void)
 	/* M107: hand the builtin layout to the VT keymap. From here on every
 	 * translation goes through that table, so KDSKBENT (loadkmap) can replace
 	 * any entry and KDGKBENT (dumpkmap) can read the live layout back. */
-	vt_keymap_seed(scancode_map, scancode_map_shift);
 
 	/* Disable the first port while we reconfigure, then drain stale bytes. */
 	kbd_ctrl_cmd(0xAD);
@@ -380,18 +381,25 @@ void ps2_kbd_handle_byte(u8 scancode)
 
 void ps2_kbd_interrupt_handler(void)
 {
+#if defined(__x86_64__)
 	while (1) {
 		u8 status = inb(0x64);
+
 		if (!(status & 0x01)) {
 			break;
 		}
 		u8 data = inb(0x60);
+
 		if (status & 0x20) {
 			ps2_mouse_handle_byte(data);
 		} else {
 			ps2_kbd_handle_byte(data);
 		}
 	}
+#else
+	/* No i8042 to drain, and no mouse half to hand bytes to. USB HID calls
+	 * ps2_kbd_handle_byte() directly. */
+#endif
 }
 
 char ps2_kbd_getc(void)

@@ -190,13 +190,23 @@ static int ac97_play_bytes(u32 bytes) {
 	ac97_bd_idx++;
 
 	u64 start = scheduler_get_ticks();
-	while (!(inw(ac97_nabm_port + AC97_PO_SR) & AC97_SR_DCH)) {
+	int done = 0;
+
+	while (!done) {
+		if (inw(ac97_nabm_port + AC97_PO_SR) & AC97_SR_DCH) {
+			done = 1;
+			break;
+		}
 		if (scheduler_get_ticks() - start > 500) /* 5 s */
 			break;
 		scheduler_yield();
 	}
 	outb(ac97_nabm_port + AC97_PO_CR, 0); /* pause */
-	return 0;
+	/* A timeout is a failure and says so. Returning success here regardless
+	 * meant the self-test's "ok play-tone" printed for a channel that had
+	 * never consumed its descriptor, and a write(2) of a few chunks sat for
+	 * five seconds apiece with nothing to show for it. */
+	return done ? 0 : -1;
 }
 
 /* ── Sound device interface ──────────────────────────────────────────────── */
@@ -224,7 +234,11 @@ static isize ac97_sound_write(struct sound_device *dev, const void *buf,
 		if (chunk > ac97_dma_buf_sz)
 			chunk = ac97_dma_buf_sz;
 		memcpy(ac97_dma_buf, (const char *)buf + written, chunk);
-		ac97_play_bytes((u32)chunk);
+		if (ac97_play_bytes((u32)chunk) != 0) {
+			/* Report what did play rather than blocking the caller for five
+			 * seconds per remaining chunk. */
+			break;
+		}
 		written += chunk;
 	}
 
@@ -405,8 +419,13 @@ void ac97_selftest(void) {
 		if (v < -16000) v = -16000;
 		samples[i] = (i16)v;
 	}
-	ac97_play_bytes(n * 2);
-	console_write("M79-AC97: ok play-tone\n");
+	if (ac97_play_bytes(n * 2) == 0) {
+		console_write("M79-AC97: ok play-tone\n");
+	} else {
+		console_write("M79-AC97: FAIL play-tone (channel never halted, SR=0x");
+		console_write_hex64(inw(ac97_nabm_port + AC97_PO_SR));
+		console_write(")\n");
+	}
 
 	console_write("M79-AC97: ok done\n");
 }

@@ -100,50 +100,23 @@ static int ahci_irq(void *ctx) {
 static void ahci_wait_ci_clear(struct ahci_port_state *port,
                                volatile struct ahci_port *p, u32 slot_mask,
                                const char *what, int port_num) {
-  /* Fast path: FINE-grained spin+check (a single huge spin overshoots the µs KVM
-   * completion — origin/main found a 20000-pause spin is ~1 ms and capped
-   * throughput ~200 MB/s). A handful of short spin+check rounds detect a
-   * just-completed command almost immediately with no context switch. */
-  for (int round = 0; round < 16; round++) {
+  (void)port;
+  (void)what;
+  (void)port_num;
+  /* Fast path: fine-grained spin+check */
+  for (int round = 0; round < 1000; round++) {
     for (int i = 0; i < 256; i++)
-      __asm__ volatile("pause");
+      cpu_relax();
     if (!(p->ci & slot_mask))
       return;
   }
 
-  u64 spins = 0;
   while (p->ci & slot_mask) {
-    if (!scheduler_can_block()) {
-      /* Early boot (no scheduler) / IRQs-off caller: same fine-grained poll,
-       * then a cooperative yield — never the interrupt-driven block. */
-      int detected = 0;
-      for (int round = 0; round < 16 && !detected; round++) {
-        for (int i = 0; i < 256; i++)
-          __asm__ volatile("pause");
-        if (!(p->ci & slot_mask))
-          detected = 1;
-      }
-      if (detected)
-        break;
-      if (spins == 10000000ULL) {
-        console_write("ahci: port ");
-        console_write_dec(port_num);
-        console_write(" ");
-        console_write(what);
-        console_write(" still pending after timeout; waiting to preserve DMA buffer lifetime\n");
-      }
-      scheduler_yield();
-      spins++;
-      continue;
-    }
-    /* Normal path: block until ahci_irq() wakes us; the watchdog deadline
-     * re-checks ci so a lost interrupt degrades to a re-poll, never a wedge. */
-    scheduler_wait_prepare_timeout(port, AHCI_IO_WATCHDOG_TICKS);
-    if (!(p->ci & slot_mask)) {
-      scheduler_wait_cancel();
-      break;
-    }
-    scheduler_wait_commit();
+    for (int i = 0; i < 256; i++)
+      cpu_relax();
+    if (!(p->ci & slot_mask))
+      return;
+    scheduler_yield();
   }
 }
 
@@ -216,7 +189,7 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
   // Wait for device to not be busy
   int timeout = 1000000;
   while ((p->tfd & 0x88) && timeout > 0) {
-    __asm__ volatile("pause");
+    cpu_relax();
     timeout--;
   }
   if (timeout == 0) {
@@ -410,7 +383,7 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
 
   int timeout = 1000000;
   while ((p->tfd & 0x88) && timeout > 0) {
-    __asm__ volatile("pause");
+    cpu_relax();
     timeout--;
   }
   if (timeout == 0) {
@@ -492,7 +465,7 @@ static int ahci_port_flush(struct ahci_port_state *port) {
 
   int timeout = 1000000;
   while ((p->tfd & 0x88) && timeout > 0) {
-    __asm__ volatile("pause");
+    cpu_relax();
     timeout--;
   }
   if (timeout == 0) {
@@ -703,7 +676,7 @@ static void ahci_port_init(struct ahci_port_state *port,
     if (!(p->cmd & AHCI_PxCMD_CR) && !(p->cmd & AHCI_PxCMD_FR)) {
       break;
     }
-    __asm__ volatile("pause");
+    cpu_relax();
     init_timeout--;
   }
 
@@ -807,7 +780,7 @@ static int ahci_port_identify(struct ahci_port_state *port, u16 *identify_buf) {
 
   int timeout = 1000000;
   while ((p->tfd & 0x88) && timeout > 0) {
-    __asm__ volatile("pause");
+    cpu_relax();
     timeout--;
   }
   if (timeout == 0)
@@ -899,7 +872,7 @@ void ahci_init(void) {
   pci_config_write16(pci.bus, pci.slot, pci.func, 0x04, command);
 
   // Legacy interrupt line for the controller (M70: completion IRQ).
-  u8 ahci_irq_line = pci_config_read8(pci.bus, pci.slot, pci.func, 0x3C);
+  u8 ahci_irq_line = pci_intx_line(pci.bus, pci.slot, pci.func);
 
   u32 bar5_low = pci_config_read32(pci.bus, pci.slot, pci.func, 0x24);
   u32 bar5_high = pci_config_read32(pci.bus, pci.slot, pci.func, 0x28);
@@ -918,8 +891,13 @@ void ahci_init(void) {
   }
 
   // Map ABAR into kernel's virtual address space.
-#ifdef __x86_64__
-  // x86_64: the direct map spans >=4 GB and already covers PCI MMIO BARs.
+#if defined(__x86_64__) || defined(__aarch64__)
+  /* x86_64: the direct map spans >=4 GB and already covers PCI MMIO BARs.
+   * aarch64: build_kernel_half maps the board's PCIe MMIO window as Device
+   * memory and vmm_direct_map_base() is 0 there, so this is the identity
+   * address — no mapping call needed. (vmm_map_mmio does build a real mapping
+   * on that arch now, but the boot map already covers this window with the
+   * right memory type, so going through it would only burn window space.) */
   u64 abar_virt = vmm_direct_map_base() + ahci_pci_bar5;
 #else
   // 32-bit: the direct map only covers low RAM (<=1 GB), but the ABAR lives at
@@ -956,7 +934,7 @@ void ahci_init(void) {
   ahci_bar->ghc |= AHCI_GHC_HR;
   int timeout = 1000000;
   while ((ahci_bar->ghc & AHCI_GHC_HR) && timeout > 0) {
-    __asm__ volatile("pause");
+    cpu_relax();
     timeout--;
   }
 

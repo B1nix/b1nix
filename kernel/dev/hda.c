@@ -192,7 +192,7 @@ static void hda_delay_ms(int ms) {
 		 * access is a VM exit under virtualisation -- paying one per
 		 * iteration to mark time is the cost this loop is trying to avoid. */
 		while (arch_tsc_monotonic_ns() < deadline)
-			__asm__ volatile("pause");
+			cpu_relax(); /* not a bare `pause`: x86-only mnemonic */
 		return;
 	}
 	while (arch_tsc_monotonic_ns() < deadline) {

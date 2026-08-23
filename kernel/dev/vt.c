@@ -429,6 +429,30 @@ int vt_kbd_hotkey(u8 scancode, int alt) {
 
 /* ── Keymap ─────────────────────────────────────────────────────────────── */
 
+/* The default set-1 layout. It belongs to the console, not to a particular
+ * keyboard driver: KDGKBENT/KDSKBENT and loadkmap operate on this table
+ * whatever feeds scancodes into it. It used to live in the PS/2 driver and be
+ * seeded from there, which left the table empty on a machine with no PS/2
+ * controller (aarch64 takes input from virtio-input) — so the console reported
+ * an empty layout and loadkmap had nothing to modify. */
+static const char vt_default_map[128] = {
+    0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
+    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
+    0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,
+    '*', 0, ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '7', '8',
+    '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.', 0, 0
+};
+
+static const char vt_default_map_shift[128] = {
+    0, 27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
+    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
+    0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,
+    '*', 0, ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '7', '8',
+    '9', '-', '4', '5', '6', '+', '1', '2', '3', '0', '.', 0, 0
+};
+
 void vt_keymap_seed(const char *plain, const char *shifted) {
   for (int t = 0; t < VT_NR_TABLES; t++)
     for (int k = 0; k < VT_NR_KEYS; k++)
@@ -594,6 +618,9 @@ static int vt_node_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
 static int vt_font_publish(u32 height, u32 count) {
   if (height == 0 || height > VT_FONT_MAX_H || count == 0 || count > 256)
     return -EINVAL;
+  /* Keeping the font purely in software when the renderer refuses it (a console
+   * with no framebuffer) was tried and made the console output garble and the
+   * lane hang, so the refusal is propagated: no framebuffer, no font. */
   if (fb_console_set_font(g_font, height, VT_FONT_MAX_H, count) != 0)
     return -EINVAL;
   g_font_h = height;
@@ -1247,12 +1274,23 @@ void vt_init(void) {
     return;
 
   vt_compute_geometry();
+  /* A console without a framebuffer has no builtin glyph bitmap (aarch64 has
+   * no boot framebuffer at all). Everything else the VT layer does — switching,
+   * per-VT termios/mode state, allocation — is independent of fonts, so start
+   * with an empty font table instead of copying from a null pointer. */
   const u8 *builtin = fb_console_builtin_font();
   memset(g_font, 0, sizeof(g_font));
-  for (u32 g = 0; g < 128; g++)
-    memcpy(g_font + g * VT_FONT_MAX_H, builtin + g * 8, 8);
-  g_font_h = 8;
-  g_font_count = 128;
+  if (builtin) {
+    for (u32 g = 0; g < 128; g++)
+      memcpy(g_font + g * VT_FONT_MAX_H, builtin + g * 8, 8);
+    g_font_h = 8;
+    g_font_count = 128;
+  } else {
+    g_font_h = 0;
+    g_font_count = 0;
+  }
+
+  vt_keymap_seed(vt_default_map, vt_default_map_shift);
 
   for (int i = 1; i <= VT_COUNT; i++) {
     struct vt_screen *v = &g_vts[i];

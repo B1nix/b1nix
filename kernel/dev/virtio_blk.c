@@ -1,5 +1,6 @@
 #include <b1nix/arch.h>
 #include <b1nix/blk.h>
+#include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/io.h>
 #include <b1nix/irq.h>
@@ -335,7 +336,7 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
     for (;;) {
       if (inst->vq.used->idx != inst->vq.last_used_idx)
         break;
-      __asm__ volatile("pause");
+      cpu_relax(); /* not a bare `pause`: x86-only mnemonic */
       /* The clock read is a counter read and a multiply, so it is checked
        * every few hundred pauses rather than on each one. */
       static const unsigned check_every = 256;
@@ -599,8 +600,7 @@ void virtio_blk_init(void) {
     }
 
     inst->dev.port_base = (u16)(bar0 & ~3);
-    inst->dev.irq =
-        pci_config_read8(pci_info.bus, pci_info.slot, pci_info.func, 0x3C);
+    inst->dev.irq = pci_intx_line(pci_info.bus, pci_info.slot, pci_info.func);
 
     // Reset device
     virtio_set_status(&inst->dev, 0);

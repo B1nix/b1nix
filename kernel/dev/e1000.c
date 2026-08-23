@@ -19,6 +19,7 @@
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/pci.h>
+#include <b1nix/irq.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/arch.h>
@@ -564,7 +565,7 @@ int e1000_probe(void)
 	e1000_print_mac(e1000_mac);
 	console_write("\n");
 
-	if (e1000_netdev.irq >= 0) {
+	if (e1000_netdev.irq >= 0 && e1000_netdev.irq != 0xFF) {
 		/* Arm receive interrupts. Until this write the driver was purely
 		 * polled: net_task woke on the ~100 Hz tick, so every inbound frame
 		 * waited up to a full tick before it was even looked at. RXT0 fires per
@@ -576,11 +577,14 @@ int e1000_probe(void)
 		 * cause is cleared: e1000_irq_ack() reads ICR on every interrupt, and
 		 * net_handle_irq() consults EVERY registered device on the line — a
 		 * standby e1000 sharing an IRQ must be acknowledged too, or its
-		 * unserviced level would livelock the CPU. */
+		 * unserviced level would livelock the CPU.
+		 *
+		 * The line itself comes from pci_intx_line(), which is config-space
+		 * 0x3C on x86 and the device tree's interrupt-map on aarch64. */
 		e1000_write(E1000_IMS, E1000_INT_RXT0 | E1000_INT_RXDMT0 |
 		                       E1000_INT_RXO | E1000_INT_LSC);
 		(void)e1000_read(E1000_ICR);
-		x86_pic_unmask((u16)e1000_netdev.irq);
+		irq_unmask((u8)e1000_netdev.irq);
 	}
 
 	return 1;
@@ -634,7 +638,27 @@ void e1000_selftest(void)
 	console_write(up ? "M37-E1000: ok link\n"
 	                 : "M37-E1000: link down (continuing)\n");
 
-	/* Build an ARP request: who-has 10.0.2.2, tell 10.0.2.15. */
+	/* Which SLIRP segment this NIC is on. QEMU's user networking always puts
+	 * the gateway at x.y.z.2 and hands the guest x.y.z.15, but WHICH /24 that
+	 * is depends on how the lane wired this second NIC: a lane that already has
+	 * a SLIRP on 10.0.2.x must give the e1000 its own subnet, or both would
+	 * answer for the same gateway address. Default 10.0.2 (the x86_64 lane);
+	 * the aarch64 lane passes b1nix.e1000-subnet=3. */
+	u8 subnet = 2;
+	{
+		char sn[8];
+		if (bootinfo_get_kv("b1nix.e1000-subnet", sn, sizeof(sn)) == 1) {
+			int v = 0, i = 0;
+			while (sn[i] >= '0' && sn[i] <= '9') {
+				v = v * 10 + (sn[i] - '0');
+				i++;
+			}
+			if (i > 0 && v >= 0 && v <= 255)
+				subnet = (u8)v;
+		}
+	}
+
+	/* Build an ARP request: who-has 10.0.<subnet>.2, tell 10.0.<subnet>.15. */
 	u8 eth[14];
 	memset(eth, 0xff, 6);                 /* broadcast dst */
 	memcpy(eth + 6, e1000_mac.bytes, 6);  /* our src       */
@@ -646,9 +670,9 @@ void e1000_selftest(void)
 	arp[4] = 6; arp[5] = 4;               /* hlen/plen       */
 	arp[6] = 0x00; arp[7] = 0x01;         /* op: request     */
 	memcpy(arp + 8, e1000_mac.bytes, 6);  /* sender MAC      */
-	arp[14] = 10; arp[15] = 0; arp[16] = 2; arp[17] = 15;  /* sender 10.0.2.15 */
+	arp[14] = 10; arp[15] = 0; arp[16] = subnet; arp[17] = 15; /* sender .15 */
 	memset(arp + 18, 0, 6);               /* target MAC      */
-	arp[24] = 10; arp[25] = 0; arp[26] = 2; arp[27] = 2;   /* target 10.0.2.2  */
+	arp[24] = 10; arp[25] = 0; arp[26] = subnet; arp[27] = 2; /* target .2  */
 
 	if (e1000_xmit(eth, arp, sizeof(arp)) == 0)
 		console_write("M37-E1000: ok tx\n");
@@ -665,7 +689,7 @@ void e1000_selftest(void)
 			    frame[12] == 0x08 && frame[13] == 0x06 &&  /* ARP   */
 			    frame[20] == 0x00 && frame[21] == 0x02 &&  /* reply */
 			    frame[28] == 10 && frame[29] == 0 &&
-			    frame[30] == 2 && frame[31] == 2) {        /* from 10.0.2.2 */
+			    frame[30] == subnet && frame[31] == 2) {   /* from the gateway */
 				got = 1;
 				break;
 			}

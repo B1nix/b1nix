@@ -38,7 +38,7 @@ int virtio_init_device(struct virtio_device *dev, u16 vendor, u16 device)
 	}
 
 	dev->port_base = (u16)(bar0 & ~3);
-	dev->irq = pci_config_read8(pci_info.bus, pci_info.slot, pci_info.func, 0x3C);
+	dev->irq = pci_intx_line(pci_info.bus, pci_info.slot, pci_info.func);
 
 	// Reset device
 	virtio_set_status(dev, 0);
