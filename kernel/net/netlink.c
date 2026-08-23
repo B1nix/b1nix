@@ -33,6 +33,9 @@
 #include <b1nix/netproto.h>
 #include <b1nix/posix.h>
 #include <b1nix/sched.h>
+#include <b1nix/sock_filter.h>
+#include <b1nix/klog.h>
+#include <stdio.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/vnet.h>
 #include <b1nix/vfs.h>
@@ -896,37 +899,46 @@ static int nl_do_addr(u16 type, const u8 *body, usize blen) {
   u16 alen = a.ptr[IFA_LOCAL] ? a.len[IFA_LOCAL] : a.len[IFA_ADDRESS];
 
   struct nl_iface iface;
-  if (ifindex && !nl_iface_by_index(ifindex, &iface))
+  if (ifindex && ifindex != NETLINK_LO_IFINDEX && !nl_iface_by_index(ifindex, &iface))
     return -ENODEV;
-  /* b1nix owns exactly one L3 configuration and it belongs to the active
-   * interface; loopback's addresses are constants, not configuration. */
+  /* Loopback's addresses are constants, not configuration. */
   if (ifindex == NETLINK_LO_IFINDEX)
     return -EOPNOTSUPP;
-  int active = netdev_index_of(netdev_active());
-  if (!active)
+  /* Each network namespace owns one L3 configuration, held by the interface it
+   * routes through. Inside a namespace created by unshare(CLONE_NEWNET) that
+   * is the veth end moved into it, so `ip addr add ... dev veth1` configures
+   * THAT namespace and leaves the initial one untouched.
+   *
+   * A namespace with no interface up yet has no holder; the named device
+   * becomes it, which is what makes `ip addr add` before `ip link set up`
+   * work in either order. */
+  u32 ns = namespace_net_current();
+  struct netdev *holder = netdev_active();
+  struct netdev *nd = ifindex ? netdev_by_index(ifindex) : holder;
+  if (!nd)
     return -ENODEV;
-  if (ifindex && ifindex != active)
+  if (holder && nd != holder)
     return -EOPNOTSUPP;
 
   if (family == B1NIX_AF_INET) {
     if (!addr || alen < 4)
       return -EINVAL;
     if (type == RTM_DELADDR) {
-      struct ipv4_addr cur = net_get_ip();
+      struct ipv4_addr cur = net_get_ip_ns(ns);
       if (memcmp(cur.bytes, addr, 4) != 0)
         return -EADDRNOTAVAIL;
       struct ipv4_addr zero = {{0, 0, 0, 0}};
-      net_set_ip(zero);
-      net_set_netmask(zero);
+      net_set_ip_ns(ns, zero);
+      net_set_netmask_ns(ns, zero);
       route_flush_dynamic();
       return 0;
     }
     struct ipv4_addr ip;
     memcpy(ip.bytes, addr, 4);
     struct ipv4_addr mask = route_host_to_ipv4(nl_plen_to_mask(plen));
-    net_set_ip(ip);
-    net_set_netmask(mask);
-    route_configure_interface(ip, mask, net_get_gateway());
+    net_set_ip_ns(ns, ip);
+    net_set_netmask_ns(ns, mask);
+    route_configure_interface(ip, mask, net_get_gateway_ns(ns));
     return 0;
   }
   if (family == B1NIX_AF_INET6) {
@@ -967,6 +979,45 @@ static int nl_do_addr(u16 type, const u8 *body, usize blen) {
 #define MAX_UEVENT_SOCKS 32
 static struct vfs_socket_state *uevent_socks[MAX_UEVENT_SOCKS];
 
+/* Which multicast groups a listener joined. Linux's sockaddr_nl.nl_groups is
+ * a bitmask of the first 32 groups, so group N is bit N-1; libudev binds with
+ * nl_groups = 1 for the kernel's own announcements and 2 for the ones udevd
+ * re-broadcasts, and those two must not be confused: udevd itself listens on
+ * group 1, and if the messages it sends on group 2 came back to it, it would
+ * process its own output forever. */
+static u32 nl_sock_groups(const struct vfs_socket_state *s) {
+  return s->local.nl.nl_groups;
+}
+
+static void netlink_uevent_trace(const char *what,
+                                 const struct vfs_socket_state *s) {
+  if (!bootinfo_has_flag("b1nix.trace-uevent"))
+    return;
+  int n = 0;
+  for (int i = 0; i < MAX_UEVENT_SOCKS; i++)
+    if (uevent_socks[i])
+      n++;
+  char l[160];
+  snprintf(l, sizeof(l), "uevent-sock %s: sock=%p groups=0x%x pid=%u now=%d",
+           what, (const void *)s, (unsigned)s->local.nl.nl_groups,
+           (unsigned)(current_task ? current_task->id : 0), n);
+  klog_info(l);
+}
+
+/* A netlink port id identifies a SOCKET, not a process: two sockets in one
+ * task must not share one, or a unicast message addressed to either is
+ * delivered to whichever was registered first. Linux starts from the pid and
+ * picks something else when that is taken; so does this. */
+u32 netlink_alloc_portid(u32 want, const struct vfs_socket_state *self) {
+  static u32 next_spare = 0x40000000u;
+  for (int i = 0; i < MAX_UEVENT_SOCKS; i++) {
+    struct vfs_socket_state *t = uevent_socks[i];
+    if (t && t != self && t->local.nl.nl_pid == want)
+      return next_spare++;
+  }
+  return want;
+}
+
 void netlink_uevent_register(struct vfs_socket_state *s) {
   for (int i = 0; i < MAX_UEVENT_SOCKS; i++) {
     if (uevent_socks[i] == s)
@@ -975,26 +1026,122 @@ void netlink_uevent_register(struct vfs_socket_state *s) {
   for (int i = 0; i < MAX_UEVENT_SOCKS; i++) {
     if (!uevent_socks[i]) {
       uevent_socks[i] = s;
+      netlink_uevent_trace("register", s);
       return;
     }
   }
 }
 
 void netlink_uevent_unregister(struct vfs_socket_state *s) {
-  for (int i = 0; i < MAX_UEVENT_SOCKS; i++) {
-    if (uevent_socks[i] == s)
+  for (int i = 0; i < MAX_UEVENT_SOCKS; i++)
+    if (uevent_socks[i] == s) {
       uevent_socks[i] = 0;
-  }
+      netlink_uevent_trace("unregister", s);
+    }
 }
 
 static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
                             usize len);
 
-void netlink_uevent_broadcast(const void *payload, usize len) {
+/* Copy one announcement to every listener that joined one of `groups`, except
+ * the sender (a socket never receives its own multicast). */
+/* Whether the message being queued comes from the kernel rather than from a
+ * write() by a task, and which multicast group it belongs to. Both describe
+ * the message a receiver will read back as its source address.
+ *
+ * The default is "from the kernel", and it has to be: nearly every netlink
+ * message a task receives is a REPLY the kernel builds in that task's own
+ * context, and crediting it to the task turns `nl_pid` from 0 into the
+ * caller's pid. Every netlink client checks that -- a reply that does not come
+ * from the kernel is not a reply -- so iproute2 discarded the answer to every
+ * request it made and waited for one that never came.
+ *
+ * Only a task's own write(2) to a uevent socket clears the flag, for the
+ * length of the delivery. */
+static int nl_enqueue_from_kernel = 1;
+static u32 nl_enqueue_groups;
+
+static void netlink_uevent_deliver(u32 groups, const void *payload, usize len,
+                                   const struct vfs_socket_state *from) {
+  if (!groups)
+    return;
+  int listeners = 0, delivered = 0;
+  nl_enqueue_groups = groups;
   for (int i = 0; i < MAX_UEVENT_SOCKS; i++) {
-    if (uevent_socks[i])
-      netlink_enqueue(uevent_socks[i], (const u8 *)payload, len);
+    struct vfs_socket_state *t = uevent_socks[i];
+    if (!t || t == from)
+      continue;
+    listeners++;
+    if (nl_sock_groups(t) & groups) {
+      netlink_enqueue(t, (const u8 *)payload, len);
+      delivered++;
+    }
   }
+  /* Who was listening and who got it. A uevent that reaches nobody looks
+   * exactly like one that was never sent, from userspace. `b1nix.trace-uevent`. */
+  nl_enqueue_groups = 0;
+  if (bootinfo_has_flag("b1nix.trace-uevent")) {
+    char ul[256];
+    snprintf(ul, sizeof(ul), "uevent: groups=0x%x len=%lu listeners=%d sent=%d '%s'",
+             (unsigned)groups, (unsigned long)len, listeners, delivered,
+             (const char *)payload);
+    klog_info(ul);
+  }
+}
+
+void netlink_uevent_broadcast(const void *payload, usize len) {
+  netlink_uevent_deliver(NETLINK_UEVENT_GROUP_KERNEL, payload, len, 0);
+}
+
+/* A uevent written to a NETLINK_KOBJECT_UEVENT socket. This is not a request
+ * with a reply: udevd re-broadcasts every kernel event it has processed on
+ * group 2, in libudev's own framing, and that broadcast is the only thing
+ * systemd's device monitor ever reads. The payload is opaque here — the
+ * kernel is a relay for it, exactly as Linux is. */
+/* One message to ONE socket, addressed by the port id the kernel gave it at
+ * bind(). This is how systemd-udevd hands a device to a worker: the worker
+ * opens its own NETLINK_KOBJECT_UEVENT socket in no group at all, and the
+ * manager sendto()s the device to that socket's nl_pid. Answering such a send
+ * with EINVAL -- "a unicast uevent has no meaning" -- is what made every
+ * worker report "did not accept message, killing the worker: Invalid
+ * argument", so no device was ever processed however well the broadcast
+ * worked. */
+static int netlink_uevent_unicast(u32 dest_pid, const void *payload, usize len,
+                                  const struct vfs_socket_state *from) {
+  for (int i = 0; i < MAX_UEVENT_SOCKS; i++) {
+    struct vfs_socket_state *t = uevent_socks[i];
+    if (!t || t == from)
+      continue;
+    if (t->local.nl.nl_pid != dest_pid)
+      continue;
+    nl_enqueue_groups = 0;
+    netlink_enqueue(t, (const u8 *)payload, len);
+    return 0; /* a unicast message belongs to no group */
+  }
+  return -ECONNREFUSED; /* no socket holds that port id */
+}
+
+static isize netlink_uevent_send(struct vfs_socket_state *s, const void *buf,
+                                 usize len) {
+  u32 groups = s->peer.nl.nl_groups;
+  u32 dest_pid = s->peer.nl.nl_pid;
+  if (len > NL_SLOT_MAX)
+    return -EMSGSIZE;
+  if (groups) {
+    nl_enqueue_from_kernel = 0;
+    netlink_uevent_deliver(groups, buf, len, s);
+    nl_enqueue_from_kernel = 1;
+    return (isize)len;
+  }
+  if (dest_pid) {
+    nl_enqueue_from_kernel = 0;
+    int r = netlink_uevent_unicast(dest_pid, buf, len, s);
+    nl_enqueue_from_kernel = 1;
+    return r < 0 ? (isize)r : (isize)len;
+  }
+  /* nl_pid 0 with no group is the kernel, which has nothing to do with a
+   * uevent a task wrote. */
+  return -EINVAL;
 }
 
 /* ── Queue plumbing ─────────────────────────────────────────────────────── */
@@ -1003,10 +1150,33 @@ static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
                             usize len) {
   if (s->udp_q_count >= SOCK_DGRAM_Q_SLOTS)
     return;
+  /* A socket filter runs before the datagram is queued and decides how much of
+   * it the socket accepts; zero means the message is not for this listener.
+   * systemd's device monitor relies on this to see only tagged devices. */
+  if (s->sk_filter) {
+    u32 keep = sock_filter_run((const struct sock_filter_prog *)s->sk_filter,
+                               data, (u32)len);
+    if (keep == 0)
+      return;
+    if (keep < len)
+      len = keep;
+  }
   u8 slot = s->udp_q_tail;
   usize copy = len > NL_SLOT_MAX ? NL_SLOT_MAX : len;
   memcpy(s->udp_q_buf[slot], data, copy);
   s->udp_q_len[slot] = copy;
+  /* Recorded per message, because that is the granularity SCM_CREDENTIALS
+   * has. netlink_enqueue runs in the SENDER's context: a uevent posted by the
+   * kernel has no task behind it and is credited to pid 0 / uid 0, which is
+   * what a udev monitor requires before it will look at the message. */
+  s->udp_q_nlgroups[slot] = nl_enqueue_groups;
+  {
+    struct cred *c = nl_enqueue_from_kernel ? 0 : scheduler_get_current_cred();
+    s->udp_q_cred[slot][0] =
+        nl_enqueue_from_kernel ? 0u : (u32)scheduler_get_pid();
+    s->udp_q_cred[slot][1] = c ? (u32)c->euid : 0u;
+    s->udp_q_cred[slot][2] = c ? (u32)c->egid : 0u;
+  }
   s->udp_q_tail = (u8)((s->udp_q_tail + 1) % SOCK_DGRAM_Q_SLOTS);
   s->udp_q_count++;
   s->recv_len = s->udp_q_len[s->udp_q_head];
@@ -1065,6 +1235,9 @@ isize netlink_socket_send(struct vfs_socket_state *s, const void *buf,
                           usize len) {
   if (!s || !buf || len < 16)
     return -EINVAL;
+
+  if (s->protocol == NETLINK_KOBJECT_UEVENT)
+    return netlink_uevent_send(s, buf, len);
 
   u8 *out = kmalloc(NL_DUMP_MAX);
   if (!out)

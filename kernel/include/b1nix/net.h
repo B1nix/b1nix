@@ -290,7 +290,18 @@ void tcp_timer_tick(void);
 u32 tcp_debug_peek_iss(struct ipv4_addr remote_ip, u16 remote_port,
                        u16 local_port);
 
-// Network state
+/* ── Network state ────────────────────────────────────────────────────────
+ *
+ * The IPv4 configuration is per network namespace. The plain accessors resolve
+ * the namespace the way the rest of the net layer does — the arriving
+ * interface's inside a receive path, the calling task's everywhere else — so a
+ * socket send, an ioctl, a netlink message and a demux each read the address
+ * belonging to their own namespace without having to say so.
+ *
+ * The _ns forms are for the callers that must name a namespace explicitly: the
+ * transmit path, which stamps the source address of the interface the frame
+ * actually leaves by, and the teardown paths, which act on a namespace nobody
+ * is currently in. */
 struct mac_addr net_get_mac(void);
 struct ipv4_addr net_get_ip(void);
 struct ipv4_addr net_get_gateway(void);
@@ -298,6 +309,15 @@ struct ipv4_addr net_get_netmask(void);
 void net_set_ip(struct ipv4_addr ip);
 void net_set_gateway(struct ipv4_addr gw);
 void net_set_netmask(struct ipv4_addr mask);
+
+struct ipv4_addr net_get_ip_ns(u32 ns);
+struct ipv4_addr net_get_gateway_ns(u32 ns);
+struct ipv4_addr net_get_netmask_ns(u32 ns);
+void net_set_ip_ns(u32 ns, struct ipv4_addr ip);
+void net_set_gateway_ns(u32 ns, struct ipv4_addr gw);
+void net_set_netmask_ns(u32 ns, struct ipv4_addr mask);
+/* Drop every IPv4 fact a namespace held (used when it is torn down). */
+void net_ns_clear_ipv4(u32 ns);
 
 /* ── M84: IPv4 FIB (kernel/net/route.c) ──────────────────────────────────
  * Longest-prefix-match routing table. Addresses are host order (a.b.c.d ->
@@ -449,6 +469,9 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
                         usize *nhandles, struct b1nix_ucred *cred,
                         int *has_cred);
 int unix_poll(struct vfs_socket_state *s, struct b1nix_pollfd *pfd);
+/* shutdown(2)'s peer-visible half: how_wr closes this socket's write half, so
+ * the peer's next drained read returns end-of-file. */
+int unix_shutdown(struct vfs_socket_state *s, int how_wr, int how_rd);
 /* SO_PEERCRED — credentials of the peer socket's creator. -ENOTCONN if the
  * socket has no peer. */
 int unix_peer_cred(struct vfs_socket_state *s, struct b1nix_ucred *out);

@@ -231,7 +231,7 @@ struct tcp_retransmit_pkt {
 #define TCP_KEEPIDLE_DEFAULT  7200
 #define TCP_KEEPINTVL_DEFAULT 75
 #define TCP_KEEPCNT_DEFAULT   9
-#define TCP_TICKS_PER_SEC     100
+#define TCP_TICKS_PER_SEC SCHED_TICKS_PER_SEC /* see sched.h */
 
 struct tcp_conn {
   int used;

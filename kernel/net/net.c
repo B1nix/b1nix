@@ -113,7 +113,14 @@ int netdev_set_netns(struct netdev *nd, u32 ns)
 		if (g_netdevs[i]->master == nd || g_netdevs[i]->lower == nd)
 			return -EBUSY;
 	}
+	u32 from = nd->netns;
 	nd->netns = ns;
+	/* A namespace that has just lost its last interface has nothing left to
+	 * hold an address: keeping the L3 configuration would leave it answering
+	 * for an address no cable reaches. The initial namespace is handled by
+	 * net_reset_interface_state() instead, which knows about DHCP. */
+	if (from != 0 && !netdev_active_ns(from))
+		net_ns_clear_ipv4(from);
 	return 0;
 }
 
@@ -134,6 +141,7 @@ void net_ns_destroy(u32 ns)
 		}
 		nd->netns = 0;
 	}
+	net_ns_clear_ipv4(ns);
 	route_flush_ns(ns);
 	arp_flush_ns(ns);
 }
@@ -174,17 +182,46 @@ void netdev_unregister(struct netdev *nd)
 		g_receiving_netdev = 0;
 }
 
-/* The device the caller's namespace routes through. Only the initial namespace
- * has one: the L3 configuration (address, gateway, netmask) is single, so a
- * namespaced caller gets NULL and its frames go no further than the packet
- * sockets and the veth peer. That is also what keeps a frame received on a
- * namespaced interface out of the global ARP/IPv4 demux, which drops anything
- * that did not arrive on netdev_active(). */
+/* The device a namespace routes through — the one its IPv4 configuration
+ * belongs to.
+ *
+ * The initial namespace has g_netdev, chosen by carrier and maintained by the
+ * DHCP/failover machinery. A namespace created by unshare(CLONE_NEWNET) has
+ * none of that: it holds whatever interfaces were moved into it, so its active
+ * device is simply the first administratively up one. Virtual devices count
+ * there — a veth end is normally the ONLY interface such a namespace has, and
+ * refusing it would leave the namespace unable to hold an address at all. */
+struct netdev *netdev_active_ns(u32 ns)
+{
+	if (ns == 0)
+		return g_netdev;
+	for (usize i = 0; i < g_netdev_count; i++) {
+		struct netdev *nd = g_netdevs[i];
+		if (!nd || nd->netns != ns || nd->admin_down)
+			continue;
+		return nd;
+	}
+	return 0;
+}
+
 struct netdev *netdev_active(void)
 {
-	if (net_ns_ctx() != 0)
+	return netdev_active_ns(net_ns_ctx());
+}
+
+/* Is this the interface its namespace's IPv4 configuration is attached to?
+ *
+ * "Active" alone is not the question a destroy or an enslave has to ask. A
+ * namespace's only veth end is active the moment it comes up, addressed or
+ * not, and refusing to delete an unaddressed cable would be a rule invented
+ * by the implementation. What must not happen silently is an interface
+ * carrying an address being taken away from under the sockets using it. */
+int netdev_holds_address(struct netdev *nd)
+{
+	if (!nd || nd != netdev_active_ns(nd->netns))
 		return 0;
-	return g_netdev;
+	struct ipv4_addr ip = net_get_ip_ns(nd->netns);
+	return (ip.bytes[0] | ip.bytes[1] | ip.bytes[2] | ip.bytes[3]) != 0;
 }
 struct netdev *netdev_receiving(void) { return g_receiving_netdev; }
 
@@ -299,12 +336,34 @@ static int networking_enabled;
 static int last_link_state = -2;
 
 static struct mac_addr local_mac;
-static struct ipv4_addr local_ip = { { 0, 0, 0, 0 } };
-static struct ipv4_addr gateway_ip = { { 0, 0, 0, 0 } };
-/* M84: the interface netmask is real state now (DHCP option 1), not a /24
- * assumption baked into ipv4_send/procfs. It defines the on-link prefix the
- * FIB installs. */
-static struct ipv4_addr netmask_ip = { { 0, 0, 0, 0 } };
+
+/* The IPv4 configuration, one set per network namespace.
+ *
+ * This used to be three file-scope globals, which is why an interface moved
+ * into a namespace could carry frames but never an address: every reader — the
+ * transmit path's source stamp, the receive path's "is this for us", ARP, the
+ * ioctls, netlink — read the single configuration the initial namespace owned.
+ * Indexing by namespace makes each of those readers answer in its own
+ * namespace with no other change, and slot 0 is the initial namespace, so its
+ * behaviour is exactly what it was.
+ *
+ * M84: the netmask is real state (DHCP option 1), not a /24 assumption baked
+ * into ipv4_send/procfs. It defines the on-link prefix the FIB installs. */
+struct net_ns_ipv4 {
+	struct ipv4_addr ip;
+	struct ipv4_addr gateway;
+	struct ipv4_addr netmask;
+};
+
+static struct net_ns_ipv4 net_ns_v4[NS_MAX_NET];
+
+static struct net_ns_ipv4 *net_v4(u32 ns)
+{
+	/* An out-of-range id can only come from a caller that invented one; the
+	 * initial namespace is the safe answer and never a silent write into
+	 * another namespace's state. */
+	return &net_ns_v4[ns < NS_MAX_NET ? ns : 0];
+}
 
 /* IPv6 interface state: link-local is derived from the MAC at probe time; the
  * global address / prefix / gateway are filled in by SLAAC (see ndp.c). */
@@ -324,13 +383,36 @@ struct net_adapter {
 static struct net_adapter net_adapters[NET_MAX_ADAPTERS];
 static usize net_adapter_count;
 
-struct mac_addr net_get_mac(void) { return local_mac; }
-struct ipv4_addr net_get_ip(void) { return local_ip; }
-struct ipv4_addr net_get_gateway(void) { return gateway_ip; }
-struct ipv4_addr net_get_netmask(void) { return netmask_ip; }
-void net_set_ip(struct ipv4_addr ip) { local_ip = ip; }
-void net_set_gateway(struct ipv4_addr gw) { gateway_ip = gw; }
-void net_set_netmask(struct ipv4_addr mask) { netmask_ip = mask; }
+/* The station address of the interface the caller's namespace transmits
+ * through. Only the initial namespace caches one (local_mac follows whichever
+ * NIC is active); anywhere else it is the moved-in interface's own. */
+struct mac_addr net_get_mac(void)
+{
+	u32 ns = net_ns_ctx();
+	if (ns == 0)
+		return local_mac;
+	struct netdev *nd = netdev_active_ns(ns);
+	return nd ? nd->mac : (struct mac_addr){{0, 0, 0, 0, 0, 0}};
+}
+
+struct ipv4_addr net_get_ip_ns(u32 ns) { return net_v4(ns)->ip; }
+struct ipv4_addr net_get_gateway_ns(u32 ns) { return net_v4(ns)->gateway; }
+struct ipv4_addr net_get_netmask_ns(u32 ns) { return net_v4(ns)->netmask; }
+void net_set_ip_ns(u32 ns, struct ipv4_addr ip) { net_v4(ns)->ip = ip; }
+void net_set_gateway_ns(u32 ns, struct ipv4_addr gw) { net_v4(ns)->gateway = gw; }
+void net_set_netmask_ns(u32 ns, struct ipv4_addr m) { net_v4(ns)->netmask = m; }
+
+void net_ns_clear_ipv4(u32 ns)
+{
+	memset(net_v4(ns), 0, sizeof(struct net_ns_ipv4));
+}
+
+struct ipv4_addr net_get_ip(void) { return net_get_ip_ns(net_ns_ctx()); }
+struct ipv4_addr net_get_gateway(void) { return net_get_gateway_ns(net_ns_ctx()); }
+struct ipv4_addr net_get_netmask(void) { return net_get_netmask_ns(net_ns_ctx()); }
+void net_set_ip(struct ipv4_addr ip) { net_set_ip_ns(net_ns_ctx(), ip); }
+void net_set_gateway(struct ipv4_addr gw) { net_set_gateway_ns(net_ns_ctx(), gw); }
+void net_set_netmask(struct ipv4_addr m) { net_set_netmask_ns(net_ns_ctx(), m); }
 
 struct in6_addr_k net_get_ip6_ll(void) { return local_ip6_ll; }
 struct in6_addr_k net_get_ip6(void) { return local_ip6; }
@@ -352,9 +434,12 @@ static void net_reset_interface_state(struct netdev *nd)
 	 * still report the hardware, but drop every L3 fact. */
 	if (nd)
 		local_mac = nd->mac;
-	local_ip = zero4;
-	gateway_ip = zero4;
-	netmask_ip = zero4;
+	/* This is the initial namespace's interface changing under it. A namespace
+	 * that was handed an interface keeps its own configuration; nothing here
+	 * happened to it. */
+	net_set_ip_ns(0, zero4);
+	net_set_gateway_ns(0, zero4);
+	net_set_netmask_ns(0, zero4);
 	/* The FIB describes the old interface's topology; a switch invalidates
 	 * every autoconfigured route. */
 	route_flush_dynamic();
@@ -611,15 +696,16 @@ void net_dump_info(void)
 	console_write("\n mac:    ");
 	print_mac(local_mac);
 	console_write("\n ip:     ");
-	print_ipv4(local_ip);
+	print_ipv4(net_get_ip());
 	console_write("\n gateway:");
 	console_putc(' ');
-	print_ipv4(gateway_ip);
+	struct ipv4_addr gw = net_get_gateway();
+	print_ipv4(gw);
 	console_write(" [raw:");
-	console_write_hex32(((u32)gateway_ip.bytes[0] << 24) |
-	                    ((u32)gateway_ip.bytes[1] << 16) |
-	                    ((u32)gateway_ip.bytes[2] <<  8) |
-	                     (u32)gateway_ip.bytes[3]);
+	console_write_hex32(((u32)gw.bytes[0] << 24) |
+	                    ((u32)gw.bytes[1] << 16) |
+	                    ((u32)gw.bytes[2] <<  8) |
+	                     (u32)gw.bytes[3]);
 	console_write("]");
 	console_write("\n");
 	dhcp_dump_info();
@@ -662,7 +748,10 @@ static void net_task(void *arg)
 		if (best != g_netdev && netdev_link_state(g_netdev) != 1)
 			net_switch_active(best);
 
-		int link = netdev_link_state(g_netdev);
+		/* No interface at all: there is no carrier to report a change in, and
+		 * saying "link down" about a machine that has no link is noise. The
+		 * loopback drain below is why this daemon still runs. */
+		int link = g_netdev ? netdev_link_state(g_netdev) : last_link_state;
 		if (link != last_link_state) {
 			if (link == 0) {
 				k_info("net", "link down");
@@ -702,9 +791,7 @@ void net_init(void)
 	g_netdev_count = 0;
 	memset(g_netdevs, 0, sizeof(g_netdevs));
 	memset(&local_mac, 0, sizeof(local_mac));
-	local_ip = (struct ipv4_addr){{0, 0, 0, 0}};
-	gateway_ip = (struct ipv4_addr){{0, 0, 0, 0}};
-	netmask_ip = (struct ipv4_addr){{0, 0, 0, 0}};
+	memset(net_ns_v4, 0, sizeof(net_ns_v4));
 	/* Default policy (everything looks in the main table) plus the standing
 	 * on-link IPv6 routes: fe80::/10, ::1/128 and ff02::/16 exist by
 	 * definition, so NDP works before any router advertisement. */
@@ -733,21 +820,29 @@ void net_init(void)
 		net_proto_reset();
 	}
 
-	if (!nd) {
-		return;
-	}
 	/* Networking is on by default: bring the link up via DHCP whenever a NIC is
 	 * present. Opt out with b1nix.net=off (or b1nix.nonet) for an isolated boot;
 	 * b1nix.net=dhcp is still accepted as an explicit no-op for back-compat. */
-	networking_enabled = !bootinfo_has_flag("b1nix.net=off") &&
+	networking_enabled = nd && !bootinfo_has_flag("b1nix.net=off") &&
 	                     !bootinfo_has_flag("b1nix.nonet");
-	last_link_state = netdev_link_state(nd);
-	if (networking_enabled && last_link_state != 0) {
-		dhcp_init();
-	} else if (networking_enabled && last_link_state == 0) {
-		k_info("net", "waiting for link");
+	if (nd) {
+		last_link_state = netdev_link_state(nd);
+		if (networking_enabled && last_link_state != 0) {
+			dhcp_init();
+		} else if (networking_enabled && last_link_state == 0) {
+			k_info("net", "waiting for link");
+		}
 	}
 
+	/* Unconditionally, even with no NIC at all: net_task is the only thing that
+	 * drains the loopback queue in a clean context. ipv4_send_tx does not
+	 * deliver a datagram addressed to 127.0.0.0/8 synchronously -- that would
+	 * re-enter the TCP state machine mid-send -- it queues it and wakes this
+	 * daemon. Without the daemon the queue is drained only by the net_poll()
+	 * calls inside TCP's own blocking waits, so a NON-blocking loopback
+	 * connection (which is what every event-loop program makes) had nothing to
+	 * move it: the SYN sat in the queue until TCP gave up minutes later.
+	 * Loopback is a property of the stack, not of the hardware. */
 	net_task_id = kthread_create("net_task", net_task, 0);
 }
 
@@ -774,7 +869,7 @@ void net_send_ethernet_tx(struct netdev *nd, struct mac_addr dst,
 	memcpy(hdr, dst.bytes, 6);
 	/* The source MAC must be the transmitting device's own address, which is
 	 * only the cached local_mac when that device is the active one. */
-	memcpy(hdr + 6, (nd == netdev_active()) ? local_mac.bytes : nd->mac.bytes, 6);
+	memcpy(hdr + 6, (nd == g_netdev) ? local_mac.bytes : nd->mac.bytes, 6);
 	hdr[12] = (ethertype >> 8) & 0xFF;
 	hdr[13] = ethertype & 0xFF;
 

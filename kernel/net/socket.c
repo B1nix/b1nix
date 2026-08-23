@@ -11,6 +11,7 @@
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/netlink.h>
+#include <b1nix/sock_filter.h>
 #include <b1nix/packet.h>
 
 /* Defined below, next to the option code it mirrors. */
@@ -409,6 +410,13 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     s->udp_last_src_port = s->udp_q_src_port[slot];
     s->udp_last_src_is6 = s->udp_q_src_is6[slot];
     s->udp_last_src_valid = 1;
+    /* Carried alongside the payload so recvmsg can turn it into
+     * SCM_CREDENTIALS; see vfs_socket_state::udp_q_cred. */
+    s->nl_last_cred[0] = s->udp_q_cred[slot][0];
+    s->nl_last_cred[1] = s->udp_q_cred[slot][1];
+    s->nl_last_cred[2] = s->udp_q_cred[slot][2];
+    s->nl_last_groups = s->udp_q_nlgroups[slot];
+    s->nl_have_cred = 1;
     if (!(flags & B1NIX_MSG_PEEK)) {
       s->udp_q_head = (u8)((s->udp_q_head + 1) % SOCK_DGRAM_Q_SLOTS);
       s->udp_q_count--;
@@ -504,6 +512,21 @@ isize vfs_socket_sendto(int fd, const void *buf, usize len, int flags,
     return unix_sendto(s, (const struct b1nix_sockaddr_un *)addr, buf, len,
                        (h->flags & B1NIX_O_NONBLOCK) ||
                            (flags & B1NIX_MSG_DONTWAIT));
+  }
+  if (s->domain == B1NIX_AF_NETLINK) {
+    /* The sockaddr_nl on a netlink send names the destination: nl_pid 0 is
+     * the kernel, a non-zero nl_groups is a multicast group. Dropping it (as
+     * the generic path below does) is what made udevd's re-broadcast of a
+     * uevent go nowhere, so systemd's device monitor never saw a device. */
+    if (addrlen < sizeof(struct b1nix_sockaddr_nl))
+      return -EINVAL;
+    if (s->shut_wr)
+      return -EPIPE;
+    struct b1nix_sockaddr_nl saved_nl = s->peer.nl;
+    memcpy(&s->peer.nl, addr, sizeof(s->peer.nl));
+    isize rc = netlink_socket_send(s, buf, len);
+    s->peer.nl = saved_nl;
+    return rc;
   }
   if (s->domain != B1NIX_AF_INET && s->domain != B1NIX_AF_INET6)
     return vfs_socket_send_h(h, buf, len, flags);
@@ -644,6 +667,22 @@ usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap) {
   if (!h || h->kind != VFS_HANDLE_SOCKET || !addr || !cap) return 0;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (!s) return 0;
+  /* A netlink receiver reads msg_name to learn who sent the message, and a
+   * zeroed one is not "unknown" -- it is family 0. systemd's device monitor
+   * requires nl_family == AF_NETLINK and nl_pid == 0 before it will look at a
+   * uevent, and logged every one of ours as "Unicast netlink message ignored":
+   * the events were delivered, systemd-udevd read them, and threw them all
+   * away, so no device was ever processed and no .device unit could exist. */
+  if (s->domain == B1NIX_AF_NETLINK) {
+    struct b1nix_sockaddr_nl nl;
+    memset(&nl, 0, sizeof(nl));
+    nl.nl_family = B1NIX_AF_NETLINK;
+    nl.nl_pid = s->nl_last_cred[0]; /* 0 when the kernel sent it */
+    nl.nl_groups = s->nl_last_groups;
+    usize n = cap < sizeof(nl) ? cap : sizeof(nl);
+    memcpy(addr, &nl, n);
+    return sizeof(nl);
+  }
   if (s->domain != B1NIX_AF_INET && s->domain != B1NIX_AF_INET6) return 0;
   return sock_fill_last_src(s, addr, cap);
 }
@@ -731,6 +770,10 @@ static int socket_teardown(struct vfs_handle *h) {
     packet_sock_unregister(s);
   if (s->domain == B1NIX_AF_NETLINK)
     netlink_uevent_unregister(s);
+  if (s->sk_filter) {
+    kfree(s->sk_filter);
+    s->sk_filter = 0;
+  }
   if ((s->domain == B1NIX_AF_INET || s->domain == B1NIX_AF_INET6) &&
       s->type == B1NIX_SOCK_DGRAM && s->bound) {
     for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
@@ -770,6 +813,8 @@ static void socket_release(struct vfs_handle *h) {
 #define SIOC_GIFCONF    0x8912
 #define SIOC_GIFFLAGS   0x8913
 #define SIOC_SIFFLAGS   0x8914
+#define SIOC_SIFADDR    0x8916
+#define SIOC_SIFNETMASK 0x891C
 #define SIOC_GIFADDR    0x8915
 #define SIOC_GIFBRDADDR 0x8919
 #define SIOC_GIFNETMASK 0x891B
@@ -1020,8 +1065,11 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
       return -ENODEV;
     nd = netdev_by_index(if_idx);
   }
-  /* b1nix holds one L3 configuration, owned by the active interface: any other
-   * NIC is up but unaddressed. */
+  /* Each network namespace holds one L3 configuration, owned by the interface
+   * that namespace routes through: any other NIC is up but unaddressed. The
+   * namespace is resolved from the caller, so the same ioctl on the same name
+   * answers differently on either side of an unshare(CLONE_NEWNET). */
+  u32 ns = namespace_net_current();
   int has_l3 = is_lo || (nd && nd == netdev_active());
 
   switch (request) {
@@ -1065,6 +1113,42 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     memset(&r.u, 0, sizeof(r.u));
     r.u.addr.sin_family = B1NIX_AF_INET;
     r.u.addr.sin_addr = net_ip_as_be(bc);
+    break;
+  }
+  case SIOC_SIFADDR:
+  case SIOC_SIFNETMASK: {
+    /* `ifconfig <if> <addr> netmask <mask>`. The address is the NAMESPACE's,
+     * assigned through the interface that namespace routes through — which is
+     * a veth end inside a namespace and the NIC in the initial one. */
+    if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+      return -EPERM;
+    if (is_lo)
+      return -EOPNOTSUPP;
+    if (!nd)
+      return -ENODEV;
+    struct netdev *holder = netdev_active();
+    if (holder && nd != holder)
+      return -EOPNOTSUPP;
+    if (r.u.addr.sin_family != B1NIX_AF_INET)
+      return -EAFNOSUPPORT;
+    struct ipv4_addr v;
+    u32 be = r.u.addr.sin_addr;
+    v.bytes[0] = (u8)(be & 0xff);
+    v.bytes[1] = (u8)((be >> 8) & 0xff);
+    v.bytes[2] = (u8)((be >> 16) & 0xff);
+    v.bytes[3] = (u8)((be >> 24) & 0xff);
+    if (request == SIOC_SIFADDR)
+      net_set_ip_ns(ns, v);
+    else
+      net_set_netmask_ns(ns, v);
+    /* An address without a prefix reaches nothing: install the on-link route
+     * (and the default via the namespace's gateway) as soon as both halves of
+     * the configuration are present. */
+    struct ipv4_addr cur_ip = net_get_ip_ns(ns);
+    struct ipv4_addr cur_nm = net_get_netmask_ns(ns);
+    if ((cur_ip.bytes[0] | cur_ip.bytes[1] | cur_ip.bytes[2] | cur_ip.bytes[3]) &&
+        (cur_nm.bytes[0] | cur_nm.bytes[1] | cur_nm.bytes[2] | cur_nm.bytes[3]))
+      route_configure_interface(cur_ip, cur_nm, net_get_gateway_ns(ns));
     break;
   }
   case SIOC_GIFFLAGS:
@@ -1275,6 +1359,11 @@ int vfs_socketpair(int domain, int type, int protocol, int sv[2]) {
   sa->domain = sb->domain = domain;
   sa->type = sb->type = type;
   sa->protocol = sb->protocol = protocol;
+  /* Both ends have an address family from the moment they exist, exactly as
+   * vfs_socket() stamps one — a socketpair is where sd-bus looks hardest, and
+   * these two were left at zero because this path allocates its own state. */
+  sa->local.un.sun_family = sa->peer.un.sun_family = (u16)domain;
+  sb->local.un.sun_family = sb->peer.un.sun_family = (u16)domain;
 
   if (unix_init_state(sa) < 0) { kfree(sa); sa = 0; goto fail; }
   if (unix_init_state(sb) < 0) { kfree(sb); sb = 0; goto fail; }
@@ -1335,13 +1424,26 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
     if (addr && addrlen >= sizeof(nl))
       memcpy(&nl, addr, sizeof(nl));
     nl.nl_family = B1NIX_AF_NETLINK;
-    if (nl.nl_pid == 0)
+    if (nl.nl_pid == 0) {
       nl.nl_pid = (u32)scheduler_get_pid();
+      /* Only the uevent protocol keeps a socket registry, and only there does
+       * a duplicate port id matter (it decides which socket a unicast device
+       * handoff reaches). Every other netlink protocol keeps the pid, which is
+       * what libnetlink matches its replies against. */
+      if (s->protocol == NETLINK_KOBJECT_UEVENT) {
+        extern u32 netlink_alloc_portid(u32 want,
+                                        const struct vfs_socket_state *self);
+        nl.nl_pid = netlink_alloc_portid(nl.nl_pid, s);
+      }
+    }
     memcpy(&s->local, &nl, sizeof(nl));
     s->bound = 1;
     /* A non-zero group on NETLINK_KOBJECT_UEVENT is a listener asking for the
      * hotplug broadcast — the only thing that group carries. */
-    if (s->protocol == NETLINK_KOBJECT_UEVENT && nl.nl_groups)
+    /* Registered whatever groups it asked for: a socket in NO group is still a
+     * valid unicast destination, and that is exactly what a systemd-udevd
+     * worker binds so the manager can send it one device at a time. */
+    if (s->protocol == NETLINK_KOBJECT_UEVENT)
       netlink_uevent_register(s);
     return 0;
   }
@@ -1450,6 +1552,35 @@ int vfs_listen(int fd, int backlog) {
   return -ENOPROTOOPT;
 }
 
+/* How long an AF_UNIX address really is.
+ *
+ * getsockname(2)/getpeername(2) report the address's TRUE length, and a caller
+ * is entitled to use that number as the capacity for its next call: Qt's
+ * QNativeSocketEnginePrivate::fetchConnectionParameters() declares one
+ * `socklen_t sockAddrSize = sizeof(qt_sockaddr)` (28 bytes) and passes the SAME
+ * variable to getsockname and then to getpeername. Answering the first call
+ * with a flat sizeof(struct sockaddr_un) -- 110 -- told it the buffer was 110
+ * bytes long, and the second call filled 110 bytes of a 28-byte union. That is
+ * the stack smash that killed every kioworker KDE's folder view started, and
+ * the same lie had already been fixed for AF_NETLINK and AF_PACKET below.
+ *
+ * Linux's unix_getname(): an unnamed socket -- one never bound, which is both
+ * ends of a socketpair and the peer of every accepted connection -- reports
+ * sizeof(sa_family_t); a bound one reports the offset of sun_path plus its
+ * NUL-terminated name. b1nix has no abstract (leading-NUL) names, so an empty
+ * sun_path means unnamed. */
+static usize unix_reported_addrlen(const struct b1nix_sockaddr_un *un) {
+  usize base = sizeof(un->sun_family);
+  if (un->sun_family != B1NIX_AF_UNIX || un->sun_path[0] == '\0')
+    return base;
+  usize n = 0;
+  while (n < sizeof(un->sun_path) && un->sun_path[n])
+    n++;
+  if (n < sizeof(un->sun_path))
+    n++; /* the terminator counts, as it does on Linux */
+  return base + n;
+}
+
 int vfs_accept(int fd, void *addr, usize *addrlen) {
   struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h) return -EBADF;
@@ -1480,10 +1611,17 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
   int res = 0;
   if (s->domain == B1NIX_AF_UNIX) {
     unix_init_state(new_s);
+    new_s->local.un.sun_family = new_s->peer.un.sun_family = B1NIX_AF_UNIX;
     res = unix_accept(s, new_s, (h->flags & B1NIX_O_NONBLOCK) != 0);
-    if (res == 0 && addr && addrlen && *addrlen >= sizeof(struct b1nix_sockaddr_un)) {
-      memcpy(addr, &new_s->peer.un, sizeof(struct b1nix_sockaddr_un));
-      *addrlen = sizeof(struct b1nix_sockaddr_un);
+    if (res == 0 && addr && addrlen) {
+      /* Truncate to what the caller offered and report the real length, as
+       * accept(2) is defined to do — an accepted AF_UNIX peer is unnamed, so
+       * that length is 2, not the 110 this used to claim. */
+      usize need = unix_reported_addrlen(&new_s->peer.un);
+      usize copy = *addrlen < need ? *addrlen : need;
+      if (copy)
+        memcpy(addr, &new_s->peer.un, copy);
+      *addrlen = need;
     }
   } else if (s->domain == B1NIX_AF_INET && s->type == B1NIX_SOCK_STREAM) {
     u16 local_port = ntoh16(s->local.in.sin_port);
@@ -1728,8 +1866,23 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
     *control_truncated = 0;
 
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
-  if (s->domain != B1NIX_AF_UNIX)
-    return vfs_socket_recv_h(h, buf, len, flags);
+  if (s->domain != B1NIX_AF_UNIX) {
+    isize nrc = vfs_socket_recv_h(h, buf, len, flags);
+    /* SO_PASSCRED on a netlink socket: the sender's credentials come back as
+     * SCM_CREDENTIALS, exactly as on Linux. systemd-udevd's device monitor
+     * sets SO_PASSCRED on the uevent socket and drops every message that
+     * arrives without them ("No sender credentials received"), so a uevent
+     * delivered without this is a uevent that never happened -- no device is
+     * ever processed, no .device unit is ever created, and udevd looks idle. */
+    if (nrc >= 0 && s->domain == B1NIX_AF_NETLINK && s->so_passcred &&
+        s->nl_have_cred && cred && has_cred) {
+      cred->pid = (int)s->nl_last_cred[0];
+      cred->uid = (u32)s->nl_last_cred[1];
+      cred->gid = (u32)s->nl_last_cred[2];
+      *has_cred = 1;
+    }
+    return nrc;
+  }
 
   struct vfs_handle *handles[VFS_SCM_MAX_FDS] = {0};
   usize nhandles = 0;
@@ -1790,6 +1943,9 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
 #define SOCK_SO_RCVBUFFORCE 33
 #define SOCK_SO_TIMESTAMPNS 35
 #define SOCK_SO_PASSSEC   34
+#define SOCK_SO_ATTACH_FILTER 26
+#define SOCK_SO_DETACH_FILTER 27
+#define SOCK_SO_LOCK_FILTER   44
 #define SOCK_TCP_NODELAY  1
 #define SOCK_TCP_KEEPIDLE  4
 #define SOCK_TCP_KEEPINTVL 5
@@ -1812,6 +1968,25 @@ struct sock_timeval {
   i64 tv_sec;
   i64 tv_usec;
 };
+
+/* SO_ATTACH_FILTER, split out because its optval is a struct sock_fprog whose
+ * `filter` member is a pointer into userspace: the syscall layer resolves that
+ * pointer and hands the instructions down as a kernel array. */
+int vfs_sock_attach_filter(int fd, const void *insns, u32 count) {
+  int err;
+  struct vfs_socket_state *s = socket_state_for_fd(fd, &err);
+  if (!s) return err;
+  struct sock_filter_prog *prog =
+      sock_filter_compile((const struct sock_filter_insn *)insns, count);
+  if (!prog)
+    return -EINVAL;
+  /* Replacing an attached program is allowed and is what a monitor does when
+   * its match list changes; the old one goes only once the new one is built. */
+  if (s->sk_filter)
+    kfree(s->sk_filter);
+  s->sk_filter = prog;
+  return 0;
+}
 
 int vfs_setsockopt(int fd, int level, int optname, const void *optval,
                    usize optlen) {
@@ -1899,6 +2074,19 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     case SOCK_SO_TIMESTAMPNS:
       s->so_timestampns = v ? 1 : 0;
       return 0;
+    /* SO_DETACH_FILTER takes no meaningful value: it removes whatever
+     * program is attached, and says ENOENT when there was none. */
+    case SOCK_SO_DETACH_FILTER:
+      if (!s->sk_filter)
+        return -ENOENT;
+      kfree(s->sk_filter);
+      s->sk_filter = 0;
+      return 0;
+    /* SO_LOCK_FILTER pins the attached program against a later detach. There
+     * is no privilege boundary here that the lock would protect, so accept
+     * the request only in the form that changes nothing. */
+    case SOCK_SO_LOCK_FILTER:
+      return v ? -EPERM : 0;
     case SOCK_SO_ERROR:     return -ENOPROTOOPT; /* read-only */
     default:                return -ENOPROTOOPT;
     }
@@ -2035,7 +2223,7 @@ static int sock_copy_local_peer(struct vfs_socket_state *s, int want_peer,
   else if (s->domain == B1NIX_AF_NETLINK) need = sizeof(struct b1nix_sockaddr_nl);
   /* AF_PACKET is 20 bytes; udhcpc checks the length it gets back. */
   else if (s->domain == B1NIX_AF_PACKET) need = sizeof(struct b1nix_sockaddr_ll);
-  else need = sizeof(struct b1nix_sockaddr_un);
+  else need = unix_reported_addrlen(&src->un);
 
   usize copy = *addrlen < need ? *addrlen : need;
   memcpy(addr, src, copy);
@@ -2066,6 +2254,12 @@ int vfs_shutdown(int fd, int how) {
     return -EINVAL;
   if (how == SOCK_SHUT_RD || how == SOCK_SHUT_RDWR) s->shut_rd = 1;
   if (how == SOCK_SHUT_WR || how == SOCK_SHUT_RDWR) s->shut_wr = 1;
+  /* Half-close is a statement to the PEER, not only a local flag: closing the
+   * write half must make the other end's read return 0. Recording it here and
+   * nowhere else left every AF_UNIX half-close invisible to the reader. */
+  if (s->domain == B1NIX_AF_UNIX && s->unix_data)
+    unix_shutdown(s, how == SOCK_SHUT_WR || how == SOCK_SHUT_RDWR,
+                  how == SOCK_SHUT_RD || how == SOCK_SHUT_RDWR);
   /* Wake any blocked reader so it observes the now-closed half. */
   scheduler_wake_all(s);
   scheduler_wake_all(vfs_poll_chan);

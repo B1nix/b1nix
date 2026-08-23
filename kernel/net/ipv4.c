@@ -1,3 +1,4 @@
+#include <b1nix/namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/vnet.h>
@@ -245,17 +246,34 @@ static u32 ipv4_apply_l4_csum(u8 *buffer, usize total_size, u32 ip_tx_flags,
 
 static u16 ip_id_counter = 0;
 
+/* The source address to stamp on a frame leaving by `dev`.
+ *
+ * The address belongs to the namespace that OWNS the interface, not to
+ * whichever namespace happened to call: a namespace can only transmit through
+ * an interface of its own, so the two normally agree — and when a kernel path
+ * hands over a device explicitly, the device is the authority. `fallback_ns`
+ * covers the case where no interface was resolved at all, where the caller's
+ * own namespace is the only answer there is. */
+static struct ipv4_addr ipv4_source_for(const struct netdev *dev, u32 fallback_ns)
+{
+	return net_get_ip_ns(dev ? dev->netns : fallback_ns);
+}
+
 void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize size)
 {
 	ipv4_send_tx(dst, protocol, payload, size, 0);
 }
 
-void ipv4_send_tx(struct ipv4_addr dst, u8 protocol, const void *payload,
-                  usize size, u32 ip_tx_flags)
+/* Build the datagram once the source address is known. The header checksum
+ * covers the source, so it cannot be filled in before the egress interface has
+ * been chosen — which is why the routing decision happens above this. */
+static u8 *ipv4_build(struct ipv4_addr src, struct ipv4_addr dst, u8 protocol,
+                      const void *payload, usize size, usize *total_out)
 {
 	usize total_size = sizeof(struct ipv4_header) + size;
 	u8 *buffer = kzalloc(total_size);
-	if (!buffer) return;
+	if (!buffer)
+		return 0;
 
 	struct ipv4_header *hdr = (struct ipv4_header *)buffer;
 	hdr->ihl_version = (4 << 4) | 5;
@@ -265,19 +283,34 @@ void ipv4_send_tx(struct ipv4_addr dst, u8 protocol, const void *payload,
 	hdr->frag_offset = 0;
 	hdr->ttl = 64;
 	hdr->protocol = protocol;
-	hdr->src = net_get_ip();
+	hdr->src = src;
 	hdr->dst = dst;
-	if (ipv4_is_loopback(dst)) {
-		hdr->src = dst;
-	}
 	hdr->checksum = 0;
-
-	u16 csum = ipv4_checksum((const u8 *)hdr, sizeof(struct ipv4_header));
-	hdr->checksum = bswap16(csum);
-
+	hdr->checksum = bswap16(ipv4_checksum((const u8 *)hdr,
+	                                      sizeof(struct ipv4_header)));
 	memcpy(buffer + sizeof(struct ipv4_header), payload, size);
+	*total_out = total_size;
+	return buffer;
+}
+
+void ipv4_send_tx(struct ipv4_addr dst, u8 protocol, const void *payload,
+                  usize size, u32 ip_tx_flags)
+{
+	/* The namespace this send belongs to: the caller's, or the arriving
+	 * interface's when the send is a reply generated inside a receive path
+	 * (an ICMP echo reply, a TCP ACK). Every address decision below is made
+	 * in it. */
+	u32 ns = namespace_net_context();
+	usize total_size = 0;
+	u8 *buffer;
 
 	if (ipv4_is_loopback(dst)) {
+		/* A datagram that never leaves the host: source and destination are
+		 * the same address by construction, and there is no device whose
+		 * namespace could say otherwise. */
+		buffer = ipv4_build(dst, dst, protocol, payload, size, &total_size);
+		if (!buffer)
+			return;
 		/* No device, so the checksum is completed in software here. */
 		(void)ipv4_apply_l4_csum(buffer, total_size, ip_tx_flags, 0);
 		/* Defer delivery instead of recursing into ipv4_receive here: a
@@ -290,13 +323,17 @@ void ipv4_send_tx(struct ipv4_addr dst, u8 protocol, const void *payload,
 	}
 
 	struct mac_addr dst_mac;
-	
+
 	// Determine if broadcast or not
 	if (ipv4_is_broadcast(dst)) {
+		struct netdev *dev = netdev_active_ns(ns);
+		buffer = ipv4_build(ipv4_source_for(dev, ns), dst, protocol, payload,
+		                    size, &total_size);
+		if (!buffer)
+			return;
 		for (int i = 0; i < 6; i++) dst_mac.bytes[i] = 0xFF;
-		u32 tx = ipv4_apply_l4_csum(buffer, total_size, ip_tx_flags,
-		                            netdev_active());
-		net_send_ethernet_tx(0, dst_mac, 0x0800, buffer, total_size, tx);
+		u32 tx = ipv4_apply_l4_csum(buffer, total_size, ip_tx_flags, dev);
+		net_send_ethernet_tx(dev, dst_mac, 0x0800, buffer, total_size, tx);
 		kfree(buffer);
 		return;
 	}
@@ -315,21 +352,23 @@ void ipv4_send_tx(struct ipv4_addr dst, u8 protocol, const void *payload,
 		sport = (u16)(((u16)l4[0] << 8) | l4[1]);
 		dport = (u16)(((u16)l4[2] << 8) | l4[3]);
 	}
-	struct ipv4_addr local = net_get_ip();
+	struct ipv4_addr local = net_get_ip_ns(ns);
 	u32 flow = route_flow_hash(local.bytes, dst.bytes, 4, protocol, sport, dport);
 
 	struct ipv4_addr route_ip;
 	int oif = 0;
-	if (!route_lookup_ex(local, dst, flow, 0, &route_ip, 0, &oif)) {
-		kfree(buffer);
+	if (!route_lookup_ex(local, dst, flow, 0, &route_ip, 0, &oif))
 		return;
-	}
-	struct netdev *dev = oif ? netdev_by_index(oif) : 0;
+	struct netdev *dev = oif ? netdev_by_index(oif) : netdev_active_ns(ns);
+
+	buffer = ipv4_build(ipv4_source_for(dev, ns), dst, protocol, payload, size,
+	                    &total_size);
+	if (!buffer)
+		return;
 
 	for (int tries = 0; tries < 25; tries++) {
 		if (arp_resolve_dev(route_ip, &dst_mac, dev)) {
-			u32 tx = ipv4_apply_l4_csum(buffer, total_size, ip_tx_flags,
-			                            dev ? dev : netdev_active());
+			u32 tx = ipv4_apply_l4_csum(buffer, total_size, ip_tx_flags, dev);
 			net_send_ethernet_tx(dev, dst_mac, 0x0800, buffer, total_size, tx);
 			kfree(buffer);
 			return;

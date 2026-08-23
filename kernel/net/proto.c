@@ -92,12 +92,45 @@ const char *proto_name_at(usize index) {
   return 0;
 }
 
+/* A snapshot of the list, taken under the lock that writers hold.
+ *
+ * The dispatch depth below counts readers so an unregistering module knows
+ * when its text is safe to free. It does NOT exclude a writer: proto_register
+ * mutates proto_list under proto_lock, and a walk holding only the counter can
+ * be in the middle of the list while that happens. The IOMMU instance panicked
+ * on it in one boot out of two -- a #GP calling p->reset() through a pointer
+ * that was not a function -- and because it is a coin flip it also lands on
+ * whatever change happens to be under test, which cost a wrong attribution
+ * tonight.
+ *
+ * Copying the pointers under the lock and calling the callbacks afterwards
+ * fixes the walk without holding a spinlock across a callback that may sleep.
+ * The depth counter is still taken around the calls, because it is what keeps
+ * an entry's text alive while its callback runs.
+ */
+#define PROTO_SNAPSHOT_MAX 16
+
+static unsigned proto_snapshot(struct net_proto **out, unsigned max) {
+  unsigned n = 0;
+  u64 flags;
+
+  spin_lock_irqsave(&proto_lock, &flags);
+  for (struct net_proto *p = proto_list; p && n < max; p = p->next)
+    out[n++] = p;
+  spin_unlock_irqrestore(&proto_lock, flags);
+  return n;
+}
+
 int proto_deliver_ether(u16 ether_type, const void *data, usize size) {
+  struct net_proto *snap[PROTO_SNAPSHOT_MAX];
   int delivered = 0;
+  unsigned n;
+
   proto_dispatch_enter();
-  for (struct net_proto *p = proto_list; p; p = p->next) {
-    if (p->ether_type == ether_type && p->receive) {
-      p->receive(data, size);
+  n = proto_snapshot(snap, PROTO_SNAPSHOT_MAX);
+  for (unsigned i = 0; i < n; i++) {
+    if (snap[i]->ether_type == ether_type && snap[i]->receive) {
+      snap[i]->receive(data, size);
       delivered = 1;
     }
   }
@@ -106,29 +139,38 @@ int proto_deliver_ether(u16 ether_type, const void *data, usize size) {
 }
 
 void net_proto_tick(u64 now_ticks) {
+  struct net_proto *snap[PROTO_SNAPSHOT_MAX];
+  unsigned n;
+
   proto_dispatch_enter();
-  for (struct net_proto *p = proto_list; p; p = p->next) {
-    if (p->tick)
-      p->tick(now_ticks);
-  }
+  n = proto_snapshot(snap, PROTO_SNAPSHOT_MAX);
+  for (unsigned i = 0; i < n; i++)
+    if (snap[i]->tick)
+      snap[i]->tick(now_ticks);
   proto_dispatch_leave();
 }
 
 void net_proto_reset(void) {
+  struct net_proto *snap[PROTO_SNAPSHOT_MAX];
+  unsigned n;
+
   proto_dispatch_enter();
-  for (struct net_proto *p = proto_list; p; p = p->next) {
-    if (p->reset)
-      p->reset();
-  }
+  n = proto_snapshot(snap, PROTO_SNAPSHOT_MAX);
+  for (unsigned i = 0; i < n; i++)
+    if (snap[i]->reset)
+      snap[i]->reset();
   proto_dispatch_leave();
 }
 
 void net_proto_selftest(void) {
+  struct net_proto *snap[PROTO_SNAPSHOT_MAX];
+  unsigned n;
+
   proto_dispatch_enter();
-  for (struct net_proto *p = proto_list; p; p = p->next) {
-    if (p->selftest)
-      p->selftest();
-  }
+  n = proto_snapshot(snap, PROTO_SNAPSHOT_MAX);
+  for (unsigned i = 0; i < n; i++)
+    if (snap[i]->selftest)
+      snap[i]->selftest();
   proto_dispatch_leave();
 }
 

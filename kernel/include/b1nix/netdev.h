@@ -174,6 +174,13 @@ void net_deliver_frame(struct netdev *dev, const void *frame, usize len,
 /* The active NIC of the caller's network namespace, or NULL if it has none.
  * The initial namespace's answer is the device the drivers probed. */
 struct netdev *netdev_active(void);
+/* The same question asked about a namespace that is not the caller's — the
+ * transmit path needs it to stamp a source address for the interface a frame
+ * actually leaves by. */
+struct netdev *netdev_active_ns(u32 ns);
+/* Does this interface carry its namespace's IPv4 configuration? Destroying or
+ * enslaving one that does would take the address with it. */
+int netdev_holds_address(struct netdev *nd);
 
 /* The registry without the namespace filter, for the kernel's own scans
  * (net_poll, teardown). `idx` is 1-based, as netdev_index_of returns. */

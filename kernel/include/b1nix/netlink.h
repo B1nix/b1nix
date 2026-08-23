@@ -39,6 +39,13 @@ isize netlink_socket_send(struct vfs_socket_state *s, const void *buf,
  */
 #define NETLINK_KOBJECT_UEVENT 15
 
+/* nl_groups is a bitmask of the first 32 multicast groups, so group N is bit
+ * N-1. Group 1 carries what the kernel itself announces; group 2 carries what
+ * udevd re-broadcasts once it has processed an event and written its database,
+ * and group 2 is the only one systemd's device monitor reads. */
+#define NETLINK_UEVENT_GROUP_KERNEL 0x1u
+#define NETLINK_UEVENT_GROUP_UDEV   0x2u
+
 void netlink_uevent_register(struct vfs_socket_state *s);
 void netlink_uevent_unregister(struct vfs_socket_state *s);
 void netlink_uevent_broadcast(const void *payload, usize len);

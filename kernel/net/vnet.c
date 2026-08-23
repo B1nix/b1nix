@@ -14,7 +14,7 @@ int vnet_destroy(struct netdev *nd)
 		return -EINVAL;
 	if (!netdev_is_virtual(nd) || !nd->destroy)
 		return -EOPNOTSUPP;
-	if (nd == netdev_active())
+	if (netdev_holds_address(nd))
 		return -EBUSY;
 	/* Leave the bridge or bond first: unregistering only clears the departing
 	 * device's own pointers, and a master left holding a pointer to a
@@ -43,7 +43,7 @@ int vnet_set_master(struct netdev *dev, struct netdev *master)
 	/* Enslaving the interface that holds the address would take the stack's
 	 * L3 configuration with it, silently. An operator who means to do that
 	 * takes the interface down first. */
-	if (dev == netdev_active())
+	if (netdev_holds_address(dev))
 		return -EBUSY;
 	if (master->kind == NETDEV_KIND_BRIDGE)
 		return bridge_add_port(master, dev);

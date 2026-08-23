@@ -135,6 +135,16 @@ struct unix_socket_data {
   u32 msg_len[UNIX_MSG_SLOTS];
   u8 msg_head, msg_tail, msg_count;
 
+  /* The peer called shutdown(SHUT_WR): it will send nothing more, so this
+   * socket must report end-of-file once the bytes already in the ring have
+   * been read. Linux's half-close, and not a nicety: `udevadm control --ping`
+   * shuts its write half down and then waits for systemd-udevd to close the
+   * connection, and systemd-udevd closes it when its read returns 0. With no
+   * way to deliver that zero the daemon held the connection open and every
+   * `udevadm control` call ran to its timeout against a daemon that had
+   * already answered. */
+  int peer_wr_shut;
+
   volatile int lock;
   /* Lifetime: a unix_socket_data outlives its own socket as long as a PEER (or
    * a listener backlog slot) still points at it. Each such pointer is a counted
@@ -399,6 +409,20 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
     s->syslog_sink = 1;
     s->connected = 1;
     return 0;
+  }
+  /* Which socket a client actually talks to. `systemctl` reaches the manager
+   * over /run/systemd/private for some calls and over the D-Bus system bus for
+   * others, and "the same socket answers other calls quickly" is a claim about
+   * which path a given invocation took -- not something to assume.
+   * b1nix.trace-unix-connect names it, with the caller, for every connect. */
+  if (bootinfo_has_flag("b1nix.trace-unix-connect")) {
+    console_write("UNIX-CONNECT: pid=");
+    console_write_dec(current_task ? current_task->id : 0);
+    console_write(" comm=");
+    console_write(current_task && current_task->name ? current_task->name : "?");
+    console_write(" path=");
+    console_write(addr->sun_path);
+    console_write("\n");
   }
   struct vfs_node *peer_node = vfs_find_node(addr->sun_path);
   if (IS_ERR(peer_node)) return -ECONNREFUSED;
@@ -959,7 +983,12 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
       
       return (isize)to_copy;
     }
+    int peer_done = __atomic_load_n(&u->peer_wr_shut, __ATOMIC_ACQUIRE);
     unix_unlock(u);
+    /* The ring is empty and the peer has closed its write half: that is
+     * end-of-file, exactly as if the peer had closed the socket. */
+    if (peer_done)
+      return 0;
     if ((s->type == B1NIX_SOCK_STREAM || s->type == B1NIX_SOCK_SEQPACKET) &&
         !s->connected) {
       /* End of file on a stream socket is how a child decides its parent has
@@ -990,7 +1019,8 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
     int have_data = (u->rb_count > 0);
     int disconnected =
         ((s->type == B1NIX_SOCK_STREAM || s->type == B1NIX_SOCK_SEQPACKET) &&
-         !s->connected);
+         !s->connected) ||
+        __atomic_load_n(&u->peer_wr_shut, __ATOMIC_ACQUIRE);
     unix_unlock(u);
     if (have_data || disconnected) {
       scheduler_wait_cancel();
@@ -1012,13 +1042,20 @@ int unix_poll(struct vfs_socket_state *s, struct b1nix_pollfd *pfd) {
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
   pfd->revents = 0;
   if (u->rb_count > 0) pfd->revents |= B1NIX_POLLIN;
-  /* POLLHUP means a peer that WAS there is gone. A listening socket has no
+  /* POLLHUP means a peer that WAS there is gone. SOCK_SEQPACKET is
+   * connection-oriented too, and its hangup is the whole protocol for
+   * `udevadm control`: the client sends its message and then waits for
+   * systemd-udevd to CLOSE the accepted connection. Reporting no hangup on a
+   * seqpacket left `udevadm control --ping` and `udevadm settle` blocked until
+   * their timeout, on a daemon that had already answered.
+   *
+   * A listening socket has no
    * peer by definition and a fresh socket has not had one yet; reporting HUP
    * for either tells an event loop that its socket died, which is how sway's
    * IPC listener ended up unusable — every dispatch saw HANGUP on the one fd
    * it was waiting to accept connections on. */
-  if (s->type == B1NIX_SOCK_STREAM && !s->listening && !s->connected &&
-      u->had_peer)
+  if ((s->type == B1NIX_SOCK_STREAM || s->type == B1NIX_SOCK_SEQPACKET) &&
+      !s->listening && !s->connected && u->had_peer)
     pfd->revents |= B1NIX_POLLHUP;
   
   /* Check if peer has space for writing. Pin the peer while we read it so a
@@ -1037,6 +1074,41 @@ int unix_poll(struct vfs_socket_state *s, struct b1nix_pollfd *pfd) {
   }
   
   if (s->listening && u->backlog_count > 0) pfd->revents |= B1NIX_POLLIN;
-  
+
+  /* A peer that has shut its write half down has made this socket readable:
+   * the read that follows returns 0. An event loop that is never told stays in
+   * epoll_wait for ever holding a connection whose other end is finished with
+   * it. Linux reports EPOLLRDHUP alongside, for a reader that asked. */
+  if (__atomic_load_n(&u->peer_wr_shut, __ATOMIC_ACQUIRE)) {
+    pfd->revents |= B1NIX_POLLIN;
+    if (pfd->events & B1NIX_POLLRDHUP)
+      pfd->revents |= B1NIX_POLLRDHUP;
+  }
+
+  return 0;
+}
+
+/* shutdown(2) on an AF_UNIX socket. Closing the write half is a statement the
+ * PEER has to hear -- it is the only way a reader learns that no more data is
+ * coming without the descriptor being closed -- so the flag is set on the peer
+ * and the peer is woken. */
+int unix_shutdown(struct vfs_socket_state *s, int how_wr, int how_rd) {
+  struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
+
+  (void)how_rd;
+  if (!u || !how_wr)
+    return 0;
+  unix_lock(u);
+  struct unix_socket_data *peer = u->peer;
+  if (peer)
+    unix_data_get(peer);
+  unix_unlock(u);
+  if (!peer)
+    return 0;
+  __atomic_store_n(&peer->peer_wr_shut, 1, __ATOMIC_RELEASE);
+  if (peer->socket)
+    scheduler_wake_all(peer->socket);
+  scheduler_wake_all(vfs_poll_chan);
+  unix_data_put(peer);
   return 0;
 }

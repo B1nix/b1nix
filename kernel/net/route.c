@@ -336,8 +336,13 @@ void route_configure_interface(struct ipv4_addr ip, struct ipv4_addr mask,
 
 	u64 f;
 	spin_lock_irqsave(&route_lock, &f);
+	/* Only THIS namespace's autoconfigured routes go: the address being
+	 * configured describes one namespace's topology and says nothing about
+	 * anyone else's. Without the filter, bringing an address up inside a
+	 * namespace deleted the on-link route another namespace had just
+	 * installed, and its next packet had nowhere to go. */
 	for (int i = 0; i < ROUTE_MAX_ENTRIES; i++) {
-		if (routes[i].used && routes[i].dynamic)
+		if (routes[i].used && routes[i].dynamic && routes[i].ns == ns)
 			memset(&routes[i], 0, sizeof(routes[i]));
 	}
 	if (h_ip != 0)
@@ -655,10 +660,13 @@ int route6_del(struct in6_addr_k dst, u8 plen, struct in6_addr_k gw)
 
 void route6_flush_dynamic(void)
 {
+	/* The caller's namespace only — autoconfiguration in one says nothing
+	 * about another's topology (see route_configure_interface). */
+	u32 ns = route_ns();
 	u64 f;
 	spin_lock_irqsave(&route_lock, &f);
 	for (int i = 0; i < ROUTE6_MAX_ENTRIES; i++) {
-		if (routes6[i].used && routes6[i].dynamic)
+		if (routes6[i].used && routes6[i].dynamic && routes6[i].ns == ns)
 			memset(&routes6[i], 0, sizeof(routes6[i]));
 	}
 	spin_unlock_irqrestore(&route_lock, f);
@@ -815,7 +823,7 @@ void route6_configure_interface(struct in6_addr_k prefix, u8 plen,
 	u64 f;
 	spin_lock_irqsave(&route_lock, &f);
 	for (int i = 0; i < ROUTE6_MAX_ENTRIES; i++) {
-		if (routes6[i].used && routes6[i].dynamic)
+		if (routes6[i].used && routes6[i].dynamic && routes6[i].ns == ns)
 			memset(&routes6[i], 0, sizeof(routes6[i]));
 	}
 	if (!in6_is_zero_bytes(prefix.bytes))
