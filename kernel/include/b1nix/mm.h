@@ -14,6 +14,8 @@
  * physical image, so no separate high window is needed. */
 #ifdef __x86_64__
 #define KERNEL_VMA 0xFFFFFFFF80000000ULL
+#elif defined(__aarch64__)
+#define KERNEL_VMA 0x0ULL
 #else
 #define KERNEL_VMA 0x80000000ULL
 #endif
@@ -27,6 +29,26 @@
  * the ceiling does not add page tables or boot work on smaller machines. */
 #define DIRECT_MAP_MAX  (64ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL)
 #define KHEAP_START 0xffffc00000000000ULL
+#elif defined(__aarch64__)
+#define DIRECT_MAP_BASE 0x0ULL
+/* 4 GiB, and not because any board has that much RAM: every arm64 board puts
+ * its registers somewhere in the low 32-bit space (a Raspberry Pi 4's GIC and
+ * PL011 are at 0xff841000 and 0xfe201000, above its first gigabyte of RAM),
+ * and drivers reach them as phys + DIRECT_MAP_BASE. */
+#define DIRECT_MAP_MIN  (4ULL * 1024ULL * 1024ULL * 1024ULL)
+/* 32 GiB — four times the largest Raspberry Pi 4, and still clear of the
+ * kernel heap at 64 GiB (KHEAP_START below). RAM above this is left out of
+ * the direct map rather than colliding with the heap. */
+#define DIRECT_MAP_MAX  (32ULL * 1024ULL * 1024ULL * 1024ULL)
+/* 64 GiB. The heap MUST NOT live inside the identity-mapped RAM window
+ * (0x40000000 upwards): heap growth remaps those virtual addresses onto other
+ * frames, so a heap object at 0x48008000 and the physical frame 0x48008000 —
+ * which the pmm is free to hand to anybody — share one address. The other
+ * owner's memset then lands on live heap objects, and the damage surfaces much
+ * later as, for example, a task struct full of zeros. 64 GiB is still inside
+ * L0[0], the half every process shares by pointer, so heap mappings stay
+ * globally visible exactly as before. */
+#define KHEAP_START     0x1000000000ULL
 #else
 #define DIRECT_MAP_BASE 0x80000000ULL
 #define DIRECT_MAP_MIN  (256ULL * 1024ULL * 1024ULL)
@@ -80,7 +102,7 @@ extern u64 g_direct_map_size;
  * rather than wrong. */
 #define VMM_WC (VMM_PAT | VMM_PWT)
 
-#ifdef __x86_64__
+#if defined(__x86_64__) || defined(__aarch64__)
 #define VMM_NO_EXECUTE (1ULL << 63)
 #else
 #define VMM_NO_EXECUTE 0ULL
@@ -207,6 +229,9 @@ void kheap_dump_tracked_by_caller(void);
 /* Test mode: the allocator hands back the unused tail of a reused block. */
 void kheap_selftest(void);
 usize kmalloc_reuse_probe_size(void *ptr);
+/* Current general-heap extent: [base, current) is handed out, [current, end) is
+ * mapped but unallocated, and everything at or above end is unmapped. */
+void kheap_bounds(u64 *base, u64 *current, u64 *end);
 void *kmalloc(usize size);
 void *kzalloc(usize size);
 void kfree(void *ptr);
@@ -257,6 +282,13 @@ void paging_dump_entries(u64 virtual_address);
  * when nothing 4 KiB-mapped is there. Used to verify memory-type bits (M98). */
 u64 paging_leaf_pte(u64 virtual_address);
 
+/* Does this leaf entry carry the write-combining memory type? The encoding is
+ * genuinely architectural — x86_64 selects a PAT slot with the PAT/PCD/PWT bit
+ * triple, aarch64 an MAIR slot with AttrIndx — so callers that want to *verify*
+ * the type (rather than request it) must ask the arch instead of matching
+ * VMM_WC, whose bit positions mean something else entirely on aarch64. */
+int paging_pte_is_wc(u64 pte);
+
 /* M100: install the kernel-half page-table path for a range without mapping a
  * page into it, so the window exists in every address space created later (new
  * address spaces copy PML4 entries by value — an entry created afterwards is
@@ -276,6 +308,11 @@ u64 paging_create_address_space(void);
 u64 paging_clone_address_space(u64 src_pml4_phys);
 void paging_free_address_space(u64 pml4_phys);
 void paging_switch_address_space(u64 pml4_phys);
+#if defined(__aarch64__)
+/* Physical address of the kernel's translation-table root, for the secondary
+ * CPUs that must install it before they can touch the heap. */
+u64 paging_kernel_root_phys(void);
+#endif
 /* Flush this CPU's TLB for the address space it is already running on. Use
  * this — not a switch to the current PML4 — after editing live page tables of
  * the running space; the switch skips the CR3 write when nothing changed. */

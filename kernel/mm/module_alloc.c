@@ -108,9 +108,15 @@ void *module_alloc(usize size) {
    * executable. */
   usize mapped = 0;
   for (usize i = 0; i < pages; i++) {
+#if defined(__aarch64__)
+    /* Identity: the region IS reserved physical memory (b1nix/module.h), so a
+     * page is backed by the frame at its own address. */
+    u64 frame = base + (u64)i * PAGE_SIZE;
+#else
     u64 frame = pmm_alloc_frame();
     if (!frame)
       break;
+#endif
     vmm_map_page(base + (u64)i * PAGE_SIZE, frame,
                  VMM_PRESENT | VMM_WRITABLE | VMM_NO_EXECUTE);
     mapped++;
@@ -121,8 +127,12 @@ void *module_alloc(usize size) {
       u64 va = base + (u64)i * PAGE_SIZE;
       u64 frame = vmm_virt_to_phys((void *)(usize)va);
       vmm_unmap_page(va);
+#if !defined(__aarch64__)
       if (frame)
         pmm_free_frame(frame);
+#else
+      (void)frame; /* reserved region: the frames are not the pmm's to take back */
+#endif
     }
     spin_lock_irqsave(&module_alloc_lock, &flags);
     for (usize j = start; j < start + pages; j++)

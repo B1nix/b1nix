@@ -3436,6 +3436,11 @@ u64 paging_pml4_entry_in(u64 pml4_phys, u64 virtual_address) {
   return pml4[pml4_index(virtual_address)];
 }
 
+int paging_pte_is_wc(u64 pte) {
+  /* PAT slot 5, which pat_init_cpu() programs to write-combining. */
+  return (pte & VMM_PRESENT) && (pte & (VMM_PAT | VMM_PCD | VMM_PWT)) == VMM_WC;
+}
+
 u64 paging_leaf_pte(u64 virtual_address) {
   u64 *pml4 = get_current_pml4();
   u64 pml4e = pml4[pml4_index(virtual_address)];

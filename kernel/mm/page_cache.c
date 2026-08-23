@@ -1,3 +1,4 @@
+#include <b1nix/arch.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/vfs.h>
 #include <b1nix/mm.h>
@@ -128,7 +129,7 @@ static u64 lock_bucket(u32 h) {
   scheduler_preempt_disable();
   while (__sync_lock_test_and_set(&pc_bucket[h], 1)) {
     while (pc_bucket[h]) {
-      __asm__ volatile("pause");
+      cpu_relax();
       tlb_shootdown_poll();
     }
   }

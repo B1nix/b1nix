@@ -30,6 +30,11 @@
 /* The eight-slot encoding programmed by pat_init_cpu(). */
 #define B1NIX_PAT_VALUE 0x0007010600070406ULL
 
+/* x86-only primitives: MSRs, fences and CLFLUSH have no AArch64 equivalent
+ * (and every caller of the PAT/cache API below is already inside an x86 guard).
+ * The header itself is included unconditionally, so gate the asm, not the
+ * include. */
+#if defined(__x86_64__)
 static inline u64 rdmsr(u32 msr)
 {
 	u32 lo, hi;
@@ -68,6 +73,17 @@ static inline void mem_wbinvd(void)
 {
 	__asm__ volatile("wbinvd" ::: "memory");
 }
+#else
+/* AArch64 barrier equivalents — the LKPI MMIO helpers (kernel/include/lkpi/
+ * io.h) call these on every arch. */
+static inline void mem_mfence(void) { __asm__ volatile("dsb sy" ::: "memory"); }
+static inline void mem_sfence(void) { __asm__ volatile("dsb st" ::: "memory"); }
+static inline void mem_clflush(const void *addr)
+{
+	__asm__ volatile("dc civac, %0" : : "r"(addr) : "memory");
+}
+static inline void mem_wbinvd(void) { __asm__ volatile("dsb sy" ::: "memory"); }
+#endif
 
 /* Program this CPU's IA32_PAT. Called once on the BSP from arch_init and once
  * per AP from x86_ap_arch_init — the PAT is per-CPU state and an AP that never
