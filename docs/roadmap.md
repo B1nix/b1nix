@@ -8,6 +8,11 @@ Status:
 - `planned`: not implemented.
 - `deferred`: intentionally postponed.
 
+AArch64 is a second target of this same kernel, not a milestone of its own:
+each gap belongs to the milestone that owns the mechanism. The inventory of
+what differs from x86_64, the history of the port and the procedure for moving
+a mechanism across is in [aarch64-parity.md](aarch64-parity.md).
+
 ## M0: Boot and Diagnostics
 
 - [x] Build a freestanding kernel ELF and GRUB ISO.
@@ -644,6 +649,15 @@ Status:
 - [x] Run upstream Crashpad unpatched: it attaches to a crashing process and writes a real minidump.
 - [x] Publish measured CPU clock in `/proc/cpuinfo` and sysfs cpufreq.
 - [x] Give every filesystem a real `st_dev`, kept apart from the mount id the inode cache keys on.
+- [x] Run upstream Crashpad unpatched on aarch64 too: five kernel defects sat
+      between the crash and the minidump (EL1 signal-frame fault, x86-packed
+      `epoll_event`, x86-sized FP regset, missing `NT_ARM_TLS`, and a null
+      `ucontext_t`). Detail in [aarch64-parity.md](aarch64-parity.md).
+- [x] Save FPSR/FPCR across context switches on aarch64 — the vector registers
+      were saved, the control and status words were not.
+- [ ] `planned` Record `/proc/<pid>/cmdline` for processes that never called
+      execve (a plain `fork` child, a `posix_spawn`ed handler): the entry is
+      written at exec only, so those show up blank in `ps`.
 
 ## M81: Chromium GPU Acceleration
 
@@ -1365,3 +1379,48 @@ never asks for. That is the whole point of the exercise, and it found nine.
       taken earlier would prove nothing. An intermediate tree reached
       `Multi-User System` and `Graphical Interface`; the final one does not,
       and which later change cost that was not isolated.
+- [x] **Debian's systemd 252 boots b1nix as PID 1**, headless: cgroup v2 with
+      `/system.slice` per unit, journald with `journalctl` reading its journal
+      back, sysinit/basic/multi-user targets reached, dbus 1.14 serving the
+      system bus, `systemd-run --pipe` starting a transient unit through it, and
+      agetty's login prompt on the serial console. `make systemd-image` builds
+      the image (dependency closure resolved from the suite index, 23 packages);
+      `make systemd-smoke` boots it and checks 14 markers.
+- [x] **cgroup v2** (`kernel/fs/cgroup.c`): a real unified hierarchy with
+      `cgroup.procs`/`threads`/`events`/`subtree_control`, mkdir/rmdir as the
+      creation API, inotify on `cgroup.events`, `/proc/<pid>/cgroup`, and one
+      enforced controller (`pids`). `memory`, `cpu` and `io` are deliberately
+      not advertised — a limit nothing enforces is worse than an absent one.
+- [x] **Mount propagation, bind mounts and remount**: `MS_SHARED`/`SLAVE`/
+      `PRIVATE`/`UNBINDABLE` (+`MS_REC`), `MS_BIND`, `MS_REMOUNT`, reported in
+      `/proc/self/mountinfo`; devtmpfs became a real device filesystem instead
+      of an alias for tmpfs.
+- [x] 28 Linux-ABI defects found and fixed by doing it — among them the clone
+      child getting a zeroed register file (every glibc thread died at `rip=0`),
+      `accept4` writing past the caller's sockaddr (dbus died of a smashed
+      stack), `CLOCK_REALTIME` walking backwards, a freshly created file with
+      `st_nlink == 0`, and `/proc/<pid>/fd/N` frozen at its first target.
+      Details in [`docs/debian-systemd-boot.md`](debian-systemd-boot.md).
+- [ ] No udev, so no `.device` unit ever activates; `systemd-logind` does not
+      start. Both are listed in the document above.
+
+## M113: Ask the processor instead of guessing
+
+Values the CPU publishes about itself, which the kernel was inventing or
+measuring instead of reading.
+
+- [x] `/proc/cpuinfo` names the real processor: the CPUID brand string on
+      x86_64, `MIDR_EL1`'s implementer and part number on aarch64. Both replace
+      the constant `B1NIX` / `b1nix virtual CPU` the file used to print.
+- [x] Seed the kernel CSPRNG from hardware on aarch64 too: `RNDR` when
+      `ID_AA64ISAR0_EL1` reports FEAT_RNG, matching the existing RDRAND path.
+      Its software fallback now mixes the cycle counter rather than the 10 ms
+      scheduler tick, which repeated across a burst of calls.
+- [x] Take `TCR_EL1.IPS` from `ID_AA64MMFR0_EL1.PARange` instead of hardcoding
+      40-bit output: the constant asked a narrower CPU for an output size it
+      does not implement, and capped a wider one at 1 TiB.
+- [ ] `planned` (x86_64 only, untested here — this machine runs no x86 lanes)
+      take the TSC frequency from CPUID leaf 15h/16h when the processor
+      publishes it, and keep the PIT calibration in `lapic.c` as the fallback.
+- [ ] `planned` Publish a `flags` / `Features` line in `/proc/cpuinfo` from the
+      CPUID feature words and the `ID_AA64ISAR*`/`ID_AA64PFR*` registers.

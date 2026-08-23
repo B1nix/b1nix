@@ -19,3 +19,16 @@ CLAUDE.md
 AGENTS.md
 /.mimocode
 /graphify-out
+
+# Board firmware & binaries
+*.uf2
+*.bin
+*.elf
+*.hex
+*.img
+tools/blobs/
+tools/rp2350/bin/
+tools/rp2350/build-*/
+tools/rp2350/pico-sdk/
+
+
