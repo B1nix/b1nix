@@ -1,0 +1,33 @@
+# ==============================================================================
+# Raspberry Pi 4 PXE & TFTP Boot Configuration for dnsmasq
+# ==============================================================================
+# Usage:
+#   sudo dnsmasq -d -C tools/rpi4/dnsmasq_rpi4.conf.example
+# ==============================================================================
+
+# Network interface connected to the Raspberry Pi 4 (adjust for your host, e.g. eth0, en0)
+# interface=eth0
+bind-interfaces
+
+# ------------------------------------------------------------------------------
+# DHCP Configuration
+# ------------------------------------------------------------------------------
+# Option A: Standalone DHCP server on dedicated subnet (e.g. 192.168.4.0/24)
+dhcp-range=192.168.4.50,192.168.4.150,255.255.255.0,12h
+
+# Option B: Proxy DHCP mode (use if your local LAN router provides DHCP leases)
+# dhcp-range=192.168.1.0,proxy
+
+# ------------------------------------------------------------------------------
+# TFTP Server Settings
+# ------------------------------------------------------------------------------
+enable-tftp
+tftp-root=/srv/tftp/rpi4
+
+# Raspberry Pi bootloader vendor class match
+dhcp-vendorclass=set:rpi,PXEClient:Arch:00000:UNDI:002001
+dhcp-reply-delay=1
+
+# Log DHCP and TFTP queries for troubleshooting
+log-dhcp
+log-queries
