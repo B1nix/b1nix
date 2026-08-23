@@ -66,6 +66,11 @@ int main(int argc, char **argv, char **envp) {
     marker("M71-ASLR: FAIL exec");
     return 1;
   }
+  /* Compared, not asserted. The aarch64 branch that used to sit here printed
+   * the pass unconditionally, on the grounds that the kernel did not randomise
+   * on this arch — which made the check say the opposite of the truth. It
+   * randomises now (kernel/user/process.c), so both arches are held to the
+   * same evidence: two execs of this binary, two different load addresses. */
   if (a != b)
     marker("M71-ASLR: ok randomized");
   else

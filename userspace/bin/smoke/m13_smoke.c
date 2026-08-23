@@ -246,11 +246,9 @@ int main(int argc, char **argv, char **envp) {
     marker("M13-SMOKE: fail argc-argv0\n");
   }
 
-#ifdef __x86_64__
-  unsigned long want_argv_align = 8;
-#else
-  unsigned long want_argv_align = 4;
-#endif
+  /* At the ELF entry point SP is 16-byte aligned and holds argc (one word),
+   * so argv sits one word above it: 8 on any 64-bit ABI, 4 on 32-bit. */
+  unsigned long want_argv_align = sizeof(long);
   if (((unsigned long)argv & 0xF) == want_argv_align) {
     marker("M13-SMOKE: ok stack-align\n");
   } else {

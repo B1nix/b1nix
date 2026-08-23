@@ -71,7 +71,8 @@ int main(void) {
     struct dirent *e;
     while ((e = readdir(d)) != 0) {
       n++;
-      if (strcmp(e->d_name, "m26-smoke") == 0)
+      if (strcmp(e->d_name, "m26-smoke") == 0 ||
+          strcmp(e->d_name, "m26_smoke") == 0)
         found_self = 1;
     }
     closedir(d);

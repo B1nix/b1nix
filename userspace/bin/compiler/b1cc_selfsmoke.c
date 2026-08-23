@@ -36,6 +36,14 @@ static int run(char *const argv[]) {
 
 int main(void) {
     /* 1. write a trivial source (no #include, so no header deps) */
+
+/* The compiler is asked for this machine's target explicitly: without it b1cc
+ * falls back to its host default instead of the native b1nix path. */
+#if defined(__aarch64__)
+#define B1CC_TARGET_FLAG "--target=aarch64-b1nix"
+#else
+#define B1CC_TARGET_FLAG "--target=x86_64-b1nix"
+#endif
     int fd = open("/tmp/b1cc_r42.c", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { marker("B1CC-SELF-COMPILE-SMOKE: fail write-src\n"); return 1; }
     const char *src = "int main(void) { return 40 + 2; }\n";
@@ -44,7 +52,7 @@ int main(void) {
 
     /* 2. compile + internal-link with the on-device b1cc */
     char *cargv[] = { "/bin/b1cc", "/tmp/b1cc_r42.c",
-                      "--target=x86_64-b1nix", "-o", "/tmp/b1cc_r42", NULL };
+                      B1CC_TARGET_FLAG, "-o", "/tmp/b1cc_r42", NULL };
     int crc = run(cargv);
     if (crc != 0) {
         char b[64];
@@ -77,7 +85,7 @@ int main(void) {
     close(pfd);
 
     char *pcargv[] = { "/bin/b1cc", "/tmp/b1cc_pie.c", "-fPIC",
-                       "--target=x86_64-b1nix", "-o", "/tmp/b1cc_pie", NULL };
+                       B1CC_TARGET_FLAG, "-o", "/tmp/b1cc_pie", NULL };
     int pcrc = run(pcargv);
     if (pcrc != 0) {
         char b[64];
@@ -112,7 +120,7 @@ int main(void) {
     }
 
     char *soargv[] = { "/bin/b1cc", "/tmp/libmath.c", "-fPIC", "-shared",
-                       "--soname=libmath.so.1", "--target=x86_64-b1nix",
+                       "--soname=libmath.so.1", B1CC_TARGET_FLAG,
                        "-o", "/tmp/lib/libmath.so.1", NULL };
     int sorc = run(soargv);
     if (sorc != 0) {
@@ -123,7 +131,7 @@ int main(void) {
     }
 
     char *mnargv[] = { "/bin/b1cc", "/tmp/dynmain.c", "-fPIC", "-lmath",
-                       "--target=x86_64-b1nix", "-o", "/tmp/bin/dynmain", NULL };
+                       B1CC_TARGET_FLAG, "-o", "/tmp/bin/dynmain", NULL };
     int mnrc = run(mnargv);
     if (mnrc != 0) {
         char b[64];

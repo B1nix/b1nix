@@ -40,6 +40,8 @@ fi
 ARCH="${B1NIX_ARCH:-x86_64}"
 if [ "$ARCH" = "x86" ]; then
   TRIPLET="i686-b1nix"; LDEMU="elf_i386"
+elif [ "$ARCH" = "aarch64" ]; then
+  TRIPLET="aarch64-b1nix"; LDEMU="aarch64elf"
 else
   TRIPLET="x86_64-b1nix"; LDEMU="elf_x86_64"
 fi
@@ -47,7 +49,7 @@ fi
 # Intercept GCC-specific query flags
 for arg in "$@"; do
   if [ "$arg" = "-print-sysroot" ]; then
-    echo "$ROOT/build/x86_64/toolchain/cross/$TRIPLET"
+    echo "$ROOT/build/$ARCH/toolchain/cross/$TRIPLET"
     exit 0
   fi
 done
@@ -60,7 +62,7 @@ IS_COMPILE_ONLY=0
 for _a in "$@"; do [ "$_a" = "-c" ] && IS_COMPILE_ONLY=1; done
 
 GXX=""  # unused — GCC fallback removed; kept to avoid unbound-var in stale callers
-CROSS="$ROOT/build/x86_64/toolchain/cross"
+CROSS="$ROOT/build/$ARCH/toolchain/cross"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 USR="$ROOT/userspace"
 LIB="$USR/build/$ARCH/libb1nix.a"
@@ -120,22 +122,29 @@ elif [ "${B1NIX_LINK:-dynamic}" != "static" ] && [ -f "$MUSL_CRT1" ] && [ -f "$M
   # musl dynamic (M92, default/preferred): non-PIE ET_EXEC + PT_INTERP against
   # musl's own shared libc.so, replacing the retired b1nix libc.so.1/ld-b1nix.so
   # pair — same non-PIE-executable-links-a-shared-libc model, just musl's ABI.
-  # DT_NEEDED must read "ld-musl-x86_64.so.1" (the name the kernel searches
-  # for in /lib), so record it via a same-named symlink rather than the raw
-  # install path (which would embed a build-tree-relative NEEDED entry).
+  # DT_NEEDED must read the interpreter name the kernel searches for in /lib,
+  # so record it via a same-named symlink rather than the raw install path
+  # (which would embed a build-tree-relative NEEDED entry).
+  #
+  # PER-ARCH. This used to say ld-musl-x86_64.so.1 in all four places, so every
+  # C++ binary built for aarch64 asked for an interpreter that does not exist
+  # there: the kernel loader refused the image outright ("failed to load"),
+  # /bin/sh then read the ELF as a shell script, and the test using it never
+  # ran. crashpad_smoke was the visible casualty.
+  MUSL_LDSO_NAME="ld-musl-${ARCH}.so.1"
   MUSL_LINK_DIR="${TMPDIR:-/tmp}/b1nix-cxx-musl-link.$$"
   mkdir -p "$MUSL_LINK_DIR"
-  ln -sf "$MUSL_SO" "$MUSL_LINK_DIR/ld-musl-x86_64.so.1"
+  ln -sf "$MUSL_SO" "$MUSL_LINK_DIR/$MUSL_LDSO_NAME"
   if [ "$WANT_PIE" -eq 1 ] && [ -f "$MUSL_SCRT1" ]; then
     PRE_CRT="$MUSL_SCRT1 $MUSL_CRTI"
-    DYN_EXTRA="-pie --dynamic-linker /lib/ld-musl-x86_64.so.1 -L$MUSL_LINK_DIR --eh-frame-hdr"
+    DYN_EXTRA="-pie --dynamic-linker /lib/$MUSL_LDSO_NAME -L$MUSL_LINK_DIR --eh-frame-hdr"
   else
     PRE_CRT="$MUSL_CRT1 $MUSL_CRTI"
-    DYN_EXTRA="--dynamic-linker /lib/ld-musl-x86_64.so.1 -L$MUSL_LINK_DIR --eh-frame-hdr"
+    DYN_EXTRA="--dynamic-linker /lib/$MUSL_LDSO_NAME -L$MUSL_LINK_DIR --eh-frame-hdr"
   fi
   POST_CRT="$MUSL_CRTN"
   GROUP_LIBC=""
-  POST_GROUP="-l:ld-musl-x86_64.so.1"
+  POST_GROUP="-l:$MUSL_LDSO_NAME"
 elif [ -f "$MUSL_CRT1" ] && [ -f "$MUSL_LIBA" ] && [ "${B1NIX_LINK:-dynamic}" = "static" ]; then
   IS_MUSL_LINK=1
   DYN_EXTRA=""
@@ -166,12 +175,16 @@ fi
 # ── Resolve C++ standard library (LLVM libc++) ───────────────────────────
 # The unified runtimes build (build-libcxx.sh) installs libc++.a, libc++abi.a and
 # libunwind.a together under libcxx-install/lib.
-LIBCXX_RT="$ROOT/build/x86_64/toolchain/llvm-runtimes-build/libcxx-install"
+LIBCXX_RT="$ROOT/build/$ARCH/toolchain/llvm-runtimes-build-musl/libcxx-install"
+[ -f "$LIBCXX_RT/lib/libc++.a" ] || LIBCXX_RT="$ROOT/build/$ARCH/toolchain/llvm-runtimes-build/libcxx-install"
+[ -f "$LIBCXX_RT/lib/libc++.a" ] || LIBCXX_RT="$ROOT/build/$ARCH/rootfs"
 LIBCXXABI_RT="$LIBCXX_RT"
-LLVM_RT="$ROOT/build/x86_64/toolchain/llvm-runtimes-build/install/lib"
+LLVM_RT="$ROOT/build/$ARCH/toolchain/llvm-runtimes-build/install/lib"
+[ -f "$LLVM_RT/libcompiler_rt.a" ] || LLVM_RT="$ROOT/build/$ARCH/rootfs/lib"
 # Shared LLVM C++ runtime (build-libcxx-shared.sh): libc++.so.1 + libc++abi.so.1
 # (the latter folds libunwind). Linked dynamically in the default dynamic mode.
-CXXSO_DIR="$ROOT/build/x86_64/toolchain/cross/$TRIPLET/lib"
+CXXSO_DIR="$ROOT/build/$ARCH/toolchain/cross/$TRIPLET/lib"
+[ -f "$CXXSO_DIR/libc++.so.1" ] || CXXSO_DIR="$ROOT/build/$ARCH/rootfs/lib"
 
 CXX_STDLIB="libc++"
 
@@ -238,8 +251,11 @@ CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/nul
 # with hand-rolled -isystem paths breaks clang's stddef.h #include_next
 # chain, so ::nullptr_t goes undefined and every libc++ header that names
 # nullptr_t fails to compile. This mirrors how libc++ itself was built.
-LIBCXX_HDR="$ROOT/build/x86_64/toolchain/llvm-runtimes-build/libcxx-install/include/c++/v1"
-SYSROOT="$ROOT/build/x86_64/toolchain/sysroot"
+SYSROOT="$ROOT/build/$ARCH/toolchain/sysroot"
+[ -d "$SYSROOT" ] || SYSROOT="$ROOT/build/$ARCH/rootfs"
+LIBCXX_HDR="$SYSROOT/include/c++/v1"
+[ -d "$LIBCXX_HDR" ] || LIBCXX_HDR="$ROOT/build/$ARCH/toolchain/llvm-runtimes-build-musl/libcxx-install/include/c++/v1"
+[ -d "$LIBCXX_HDR" ] || LIBCXX_HDR="$ROOT/build/$ARCH/toolchain/llvm-runtimes-build/libcxx-install/include/c++/v1"
 CXXFLAGS="--target=$TRIPLET --sysroot=$SYSROOT -nostdinc++ -isystem $LIBCXX_HDR"
 CXXFLAGS="$CXXFLAGS -std=c++17 -O2 -ffunction-sections -fdata-sections -Db1nix"
 # Platform identity. b1nix implements the Linux ABI, but its triple is
@@ -299,7 +315,7 @@ while [ $# -gt 0 ]; do
     # gives tool exes `lib/libLLVM.so.NN` directly); classify them as inputs so
     # the exe-link path below actually puts them on the ld line instead of
     # dropping them into passthru → undefined llvm:: symbols.
-    *.cpp|*.cc|*.cxx|*.C|*.o|*.a|*.so|*.so.*) inputs+=("$1") ;;
+    *.cpp|*.cc|*.cxx|*.C|*.c|*.s|*.S|*.o|*.a|*.so|*.so.*) inputs+=("$1") ;;
     # @file: a linker response file (GN/ninja avoids command-line length limits
     # this way, e.g. `-Wl,--start-group @./d8.rsp -Wl,--end-group`). ld.lld
     # expands these natively — treat as a link input so it reaches the LD
@@ -318,7 +334,7 @@ for f in $CXXFLAGS; do
 done
 
 if [ "$compile_only" -eq 1 ]; then
-  run_cxx "${cxx_flags[@]}" "${passthru[@]+${passthru[@]}}" -c "${inputs[@]}" -o "$output"
+  run_cxx "${cxx_flags[@]}" "${passthru[@]+${passthru[@]}}" -c "${inputs[@]+"${inputs[@]}"}" -o "$output"
   exit $?
 fi
 

@@ -4,16 +4,16 @@
 # All binaries are ELF executables loadable by the B1NIX kernel.
 
 B1NIX_ARCH ?= x86_64
-ifeq ($(B1NIX_ARCH),x86)
-TARGET   := i686-unknown-elf
-LDFLAGS  := -m elf_i386
-# Host triplet for the per-triplet ported-library install trees (must match
-# tools/toolchain/env.sh: x86 -> i686-b1nix, x86_64 -> x86_64-b1nix).
-B1NIX_TRIPLET := i686-b1nix
+ifeq ($(B1NIX_ARCH),aarch64)
+TARGET   := aarch64-unknown-elf
+LDFLAGS  := -m aarch64elf
+B1NIX_TRIPLET := aarch64-b1nix
+FLOAT_FLAGS :=
 else
 TARGET   := x86_64-unknown-elf
 LDFLAGS  := -m elf_x86_64
 B1NIX_TRIPLET := x86_64-b1nix
+FLOAT_FLAGS := -msoft-float -mno-implicit-float
 endif
 # Prefix ccache when present so userspace ELFs recompile from cache after a
 # `make clean` (explicit `make CC=...` still wins — command-line beats `:=`).
@@ -89,9 +89,14 @@ LIBCXX_INCLUDE := $(firstword $(wildcard \
 # darwin, not our x86_64-linux cross target). Use our own cross-built
 # compiler-rt directly instead (see tools/toolchain/build-llvm-runtimes.sh).
 BUILTINS_LIB  := $(firstword $(wildcard \
+                   ../build/$(B1NIX_ARCH)/compiler-rt-builtins/libclang_rt.builtins-$(B1NIX_ARCH).a \
                    ../build/$(B1NIX_ARCH)/toolchain/sysroot/usr/lib/libcompiler_rt.a \
                    ../build/$(B1NIX_ARCH)/toolchain/llvm-runtimes-build/install/lib/libcompiler_rt.a \
-                   ../build/$(B1NIX_ARCH)/toolchain/cross/$(B1NIX_TRIPLET)/lib/libcompiler_rt.a))
+                   ../build/$(B1NIX_ARCH)/toolchain/cross/$(B1NIX_TRIPLET)/lib/libcompiler_rt.a \
+                   $(MUSL_LIB)/libclang_rt.builtins-$(B1NIX_ARCH).a \
+                   $(MUSL_LIB)/libcompiler_rt.a \
+                   $(CLANG_RES_DIR)/lib/*/libclang_rt.builtins-$(B1NIX_ARCH).a \
+                   $(CLANG_RES_DIR)/lib/libclang_rt.builtins-$(B1NIX_ARCH).a))
 
 # NOTE: -MD (not -MMD). Our headers live under `include/`, pulled in via
 # `-isystem include`, which makes them *system* headers — and -MMD omits system
@@ -99,7 +104,7 @@ BUILTINS_LIB  := $(firstword $(wildcard \
 # userspace/include/ would NOT trigger a recompile (observed: a struct-size
 # change to <unistd.h> left a stale statvfs.o, crashing BusyBox df on i686).
 # -MD records every header so header edits rebuild the affected objects.
-CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -fno-pic -fno-pie -fdirect-access-external-data -MD -MP
+CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 $(FLOAT_FLAGS) -Db1nix -fno-pic -fno-pie -fdirect-access-external-data -MD -MP
 # When LINK=musl, add musl headers (preferred for standard POSIX) and
 # -D__linux__ so musl's internal arch detection works. b1nix-specific headers
 # (<b1nix/syscall.h> etc.) stay via the original -I include as fallback.
@@ -120,7 +125,8 @@ CIC      := ../tools/copy-if-changed.sh
 # it comes out identical.
 ETCSTAGE := ../build/$(B1NIX_ARCH)/.etc-stage
 # Strong utmp/utmpx overrides for musl's weak no-op stubs (real login accounting).
-UTMP_OBJ := $(BUILD)/compat/utmp.o
+UTMP_OBJ  := $(BUILD)/compat/utmp.o
+CRYPT_OBJ := $(BUILD)/compat/crypt.o
 # No link script for the smoke binaries: they are musl PIEs, so the loader picks
 # the base (randomized under b1nix.aslr) instead of a fixed address baked into a
 # script — GEN_LINKER/BESPOKE_LINKER stay empty, see the -T guards below.
@@ -152,11 +158,11 @@ MUSL_CRTN    := $(MUSL_LIB)/crtn.o
 GEN_PIC        := -fPIC
 GEN_CRT0       := $(MUSL_CRT1)
 GEN_LINKER     :=
-GEN_LIBDEP     := $(MUSL_LIBSO) $(UTMP_OBJ)
-GEN_LINK_EXTRA := -pie -z norelro --hash-style=sysv \
-                  --dynamic-linker /lib/ld-musl-x86_64.so.1 \
+GEN_LIBDEP     := $(MUSL_LIBSO) $(UTMP_OBJ) $(CRYPT_OBJ)
+GEN_LINK_EXTRA := -pie -z norelro --hash-style=sysv --allow-shlib-undefined \
+                  --dynamic-linker /lib/ld-musl-$(B1NIX_ARCH).so.1 \
                   -L$(MUSL_LIB)
-GEN_LINK_LIBS  := $(MUSL_CRTI) $(UTMP_OBJ) -lc $(MUSL_CRTN) $(BUILTINS_LIB)
+GEN_LINK_LIBS  := $(MUSL_CRTI) $(UTMP_OBJ) $(CRYPT_OBJ) -lc $(MUSL_CRTN) $(BUILTINS_LIB)
 GEN_MUSL_POSTLINK := 1
 
 # ── Post-link: EI_OSABI = ELFOSABI_LINUX (3) ─────────────────────────────
@@ -184,21 +190,23 @@ endef
 # headers stay inside the first PT_LOAD where AT_PHDR can find them.
 BESPOKE_CRT0   := $(MUSL_CRT1)
 BESPOKE_CXX_EXTRA := --eh-frame-hdr
-BESPOKE_EXTRA  := -pie -z norelro --hash-style=sysv \
-                  --dynamic-linker /lib/ld-musl-x86_64.so.1 \
+BESPOKE_EXTRA  := -pie -z norelro --hash-style=sysv --allow-shlib-undefined \
+                  --dynamic-linker /lib/ld-musl-$(B1NIX_ARCH).so.1 \
                   -L$(MUSL_LIB)
-BESPOKE_LIBC   := $(MUSL_CRTI) $(UTMP_OBJ) -lc $(MUSL_CRTN) $(BUILTINS_LIB)
+BESPOKE_LIBC   := $(MUSL_CRTI) $(UTMP_OBJ) $(CRYPT_OBJ) -lc $(MUSL_CRTN) $(BUILTINS_LIB)
+BESPOKE_LIBC_NOPAM := $(MUSL_CRTI) $(UTMP_OBJ) $(CRYPT_OBJ) -lc $(MUSL_CRTN) $(BUILTINS_LIB)
 BESPOKE_LIBCXX_EXTRA := $(BUILD)/libcxx_compat.o
 BESPOKE_LINKER :=
-BESPOKE_LIBDEP := $(MUSL_LIBSO) $(MUSL_CRT1) $(UTMP_OBJ)
+BESPOKE_LIBDEP := $(MUSL_LIBSO) $(MUSL_CRT1) $(UTMP_OBJ) $(CRYPT_OBJ)
+BESPOKE_LIBDEP_NOPAM := $(MUSL_LIBSO) $(MUSL_CRT1) $(UTMP_OBJ) $(CRYPT_OBJ)
 BESPOKE_PIC    := -fPIC
 BESPOKE_MUSL_POSTLINK := 1
 # Same reasoning as CLANG_BIN/CC above: prefer the real Homebrew LLVM clang++.
 CLANGXX_BIN    := $(shell command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo clang++)
 CXX            := $(if $(CCACHE),$(CCACHE) $(CLANGXX_BIN),$(CLANGXX_BIN))
-CXXFLAGS       := --target=x86_64-unknown-elf -ffreestanding -nostdinc++ \
+CXXFLAGS       := --target=$(TARGET) -ffreestanding -nostdinc++ \
                   -isystem $(LIBCXX_INCLUDE) -nostdinc -isystem $(MUSL_INCLUDE) \
-                  -isystem $(CLANG_RES_DIR)/include -idirafter include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix \
+                  -isystem $(CLANG_RES_DIR)/include -idirafter include -Wall -Wextra -O2 $(FLOAT_FLAGS) -Db1nix \
                   -fPIC -MD -MP -D__linux__ -D__b1nix__ -D_GNU_SOURCE
 
 
@@ -217,7 +225,10 @@ CXXFLAGS       := --target=x86_64-unknown-elf -ffreestanding -nostdinc++ \
 PORTS_ROOT := ../build/$(B1NIX_ARCH)/ports
 M53_PORT_SMOKES := $(BUILD)/bin/m53_zlib_smoke $(BUILD)/bin/m53_libpng_smoke \
 	$(BUILD)/bin/m53_libjpeg_smoke $(BUILD)/bin/m53_libwebp_smoke \
-	$(BUILD)/bin/m53_libvpx_smoke $(BUILD)/bin/m53_virgl_smoke
+	$(BUILD)/bin/m53_libvpx_smoke
+ifneq ($(B1NIX_ARCH),aarch64)
+M53_PORT_SMOKES += $(BUILD)/bin/m53_virgl_smoke
+endif
 ifneq ($(wildcard $(PORTS_ROOT)/libwapcaplet/install/include),)
 M53_PORT_SMOKES += $(BUILD)/bin/m53_wapcaplet_smoke
 endif
@@ -302,10 +313,6 @@ BINARIES += $(BUILD)/bin/m101t_smoke
 $(BUILD)/bin/m101t_smoke: CFLAGS += -I ../build/src/drm-core-6.6/include/uapi \
 	-D__user=
 BINARIES += $(BUILD)/bin/m51_smoke
-# M51 ported-library smokes. These used to reach the guest only through the
-# xxd/.inc initramfs path, which became bootstrap-only after the ext4-root
-# migration — install them like every other binary so /bin/init's discovery
-# loop finds them in the rootfs.
 BINARIES += $(BUILD)/bin/m51_pixman_smoke
 BINARIES += $(BUILD)/bin/m51_freetype_smoke
 BINARIES += $(BUILD)/bin/m51_cairo_smoke
@@ -325,27 +332,31 @@ BINARIES += $(BUILD)/bin/gl_probe
 BINARIES += $(BUILD)/bin/framecheck
 BINARIES += $(BUILD)/bin/cxx_smoke
 BINARIES += $(BUILD)/bin/m55_iostream
-BINARIES += $(BUILD)/bin/m64_clang_smoke
+# M57 (Mojo IPC core) and M75 are plain POSIX C over the libc.
 BINARIES += $(BUILD)/bin/m57_smoke
 BINARIES += $(BUILD)/bin/m75_smoke
-BINARIES += $(BUILD)/bin/m73_smoke
-# M104: OpenPAM smoke — links libpam.so.2 (tools/ports/build-openpam.sh)
-BINARIES += $(BUILD)/bin/m104_pam_smoke
-# M108: BusyBox su/passwd/init smoke — also links libpam.so.2 (bespoke rule).
+# M108: BusyBox su/passwd/init smoke — links libpam (bespoke rule). The PAM
+# package is an Alpine one and installs for both arches, so this is no longer
+# arch-gated.
 BINARIES += $(BUILD)/bin/m108_smoke
 # M108: the login shell of the m108user account (an ELF, so su's login argv[0]
 # survives — see bin/helpers/m108shell.c).
 BINARIES += $(BUILD)/bin/m108shell
-# M80: ptrace register sets, /proc/<pid>/task|auxv|mem, crash capture.
+# M80's three x86 pieces have aarch64 equivalents now (getpid's ABI number,
+# FPCR for MXCSR, q0 for ymm0) and all 25 of its checks pass here.
 BINARIES += $(BUILD)/bin/m80_smoke
-# M86: per-thread CPU accounting, tkill/tgkill, pthread_exit return values.
+
+ifneq ($(B1NIX_ARCH),aarch64)
+# Native clang runs inside the guest and is only built for x86_64.
+BINARIES += $(BUILD)/bin/m64_clang_smoke
+endif
+# Kernel-feature smoke tests that need no ported library — they exercise
+# ptrace, seccomp, loadable modules, netlink/loop/inotify, the VFS audit
+# and per-thread accounting, so they belong on every arch, not just the
+# one they were first written for.
 BINARIES += $(BUILD)/bin/m86_smoke
-# M95/M96: the two loadable-kernel-module smoke tests. The module utilities
-# themselves are BusyBox applets (insmod/rmmod/lsmod/modinfo/modprobe/depmod).
 BINARIES += $(BUILD)/bin/m95_smoke
 BINARIES += $(BUILD)/bin/m96_smoke
-# M107: netlink, VTs/console fonts, loop devices, /proc fd+maps, kmsg/syslog,
-# inotify, RTC + watchdog, i2c.
 BINARIES += $(BUILD)/bin/m107_smoke
 # M109: AF_PACKET, pivot_root(2), volume identity, and UTS/mount namespaces.
 # M109: the merged /dev listing, findfs/blkid, and mount(MS_MOVE).
@@ -356,12 +367,15 @@ BINARIES += $(BUILD)/bin/m109_smoke
 BINARIES += $(BUILD)/bin/m109_uevent_smoke
 # M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
 BINARIES += $(BUILD)/bin/m98_smoke
-# M100: DRM core -- scatter-gather GEM objects through /dev/dri/card0.
 BINARIES += $(BUILD)/bin/m100_smoke
 BINARIES += $(BUILD)/bin/m63_smoke
-BINARIES += $(BUILD)/bin/m71_aslr
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke
 BINARIES += $(BUILD)/bin/m46_smoke
+BINARIES += $(BUILD)/bin/m73_smoke
+# M104: PAM smoke — links libpam. The smallest program that makes ld.so load a
+# SECOND shared library, which is what used to fail on aarch64.
+BINARIES += $(BUILD)/bin/m104_pam_smoke
+BINARIES += $(BUILD)/bin/m71_aslr
 BINARIES += $(BUILD)/bin/lock_smoke
 BINARIES += $(BUILD)/bin/futex_stress
 BINARIES += $(BUILD)/bin/invite_stress
@@ -398,8 +412,24 @@ BINARIES += $(BUILD)/bin/bpkg
 BINARIES += $(BUILD)/bin/m92_abi_smoke
 # M92: musl POSIX smoke test (built with LINK=musl)
 BINARIES += $(BUILD)/bin/musl_posix_smoke
-# b1cc (standalone "better C" compiler + its M5/M7/M32-M34 smoke binaries)
+# b1cc (standalone "better C" compiler + its M5/M7/M32-M34 smoke binaries).
+# The corpus binaries are produced *by* b1cc, so they can only be built where
+# b1cc has a code generator for this target. Ask b1cc itself rather than
+# testing the arch name: the moment its aarch64 backend lands, these build
+# again with no edit here.
+# The arm64 backend still emits Mach-O assembly syntax (.cstring, @PAGE/@PAGEOFF,
+# leading underscores), which the ELF assembler rejects — so probe all the way
+# through assembly, not just code generation. Re-enables itself once the backend
+# grows an ELF flavour.
+CROSS_AS_PROBE := clang --target=$(B1NIX_ARCH)-unknown-elf -c
+B1CC_TARGET_OK := $(shell [ -x $(B1CC) ] && printf 'int g;const char*s="x";int main(void){g=1;return s[0]+g;}\n' > $(BUILD)/.b1cc_probe.c && \
+  $(B1CC) --target=$(B1NIX_ARCH)-b1nix -S $(BUILD)/.b1cc_probe.c -o $(BUILD)/.b1cc_probe.s >/dev/null 2>&1 && \
+  $(CROSS_AS_PROBE) $(BUILD)/.b1cc_probe.s -o $(BUILD)/.b1cc_probe.o >/dev/null 2>&1 && echo yes)
+ifeq ($(B1CC_TARGET_OK),yes)
 BINARIES += $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke
+else
+$(info b1cc: cannot yet produce $(B1NIX_ARCH)-b1nix objects (arm64 codegen works; its assembly is still Mach-O syntax) — M5/M7/M32-M34 b1cc corpus not built)
+endif
 
 ifeq ($(B1NIX_ARCH),x86_64)
 BINARIES += $(BUILD)/bin/m30_dynamic
@@ -417,6 +447,10 @@ DEPS := $(BIN_OBJS:.o=.d)
 all: $(BINARIES)
 
 # utmp/utmpx overrides for musl's weak stubs (real login accounting).
+$(CRYPT_OBJ): compat/crypt.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $@
+
 $(UTMP_OBJ): compat/utmp.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $@
@@ -626,6 +660,7 @@ $(BUILD)/bin/native_smoke: bin/helpers/native_smoke.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/native_smoke.o
 	$(LD) $(LDFLAGS) $(if $(LINKER),-T $(LINKER)) -o $@ $(BUILD)/bin/native_smoke.o
+	python3 -c "import sys; f=sys.argv[1]; fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
 
 # M104: OpenPAM smoke — the one binary in this tree that links a THIRD-PARTY
 # M104: Linux-PAM smoke. Links libpam.so.0 as DT_NEEDED.
@@ -1016,11 +1051,15 @@ install-headers-libs:
 	@# against. The b1nix-only extras copied above (EGL/, b1nix/, tui.h, ...)
 	@# stay; anything musl also ships is overwritten by musl's version. Skip
 	@# c++/v1 (16 MB of libc++ headers) — the C toolchains don't need it.
-	@for d in $$(cd $(MUSL_INCLUDE) && find . -type d -not -path './c++*'); do \
-		mkdir -p $(ROOTFS)/include/$$d; \
-	done
-	@cd $(MUSL_INCLUDE) && find . -type f -name '*.h' -not -path './c++/*' \
-		-print0 | xargs -0 -r $(abspath $(CIC)) --into $(abspath $(ROOTFS))/include
+	@# Guarded: aarch64 stages its musl headers elsewhere, and an unguarded
+	@# `cd` into a directory that does not exist failed the whole target.
+	@if [ -d $(MUSL_INCLUDE) ]; then \
+		for d in $$(cd $(MUSL_INCLUDE) && find . -type d -not -path './c++*'); do \
+			mkdir -p $(ROOTFS)/include/$$d; \
+		done; \
+		cd $(MUSL_INCLUDE) && find . -type f -name '*.h' -not -path './c++/*' \
+			-print0 | xargs -0 -r $(abspath $(CIC)) --into $(abspath $(ROOTFS))/include; \
+	fi
 	@mkdir -p $(ROOTFS)/usr
 	@$(call link_if_changed,../include,$(ROOTFS)/usr/include)
 	@$(call link_if_changed,../lib,$(ROOTFS)/usr/lib)

@@ -7,6 +7,14 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
+/* The compiler is asked for this machine's target explicitly: without it b1cc
+ * falls back to its host default instead of the native b1nix path. */
+#if defined(__aarch64__)
+#define B1CC_TARGET_FLAG "--target=aarch64-b1nix"
+#else
+#define B1CC_TARGET_FLAG "--target=x86_64-b1nix"
+#endif
+
 struct case_item { const char *name; const char *source; int expected; };
 static const struct case_item cases[] = {
     {"return_42", "/tests/m34/return_42.c", 42},
@@ -53,7 +61,7 @@ int main(void) {
         char output[96];
         snprintf(output, sizeof(output), "/tmp/m34_%s", cases[i].name);
         char *compile_argv[] = {"/bin/b1cc", (char *)cases[i].source,
-                                "--target=x86_64-b1nix", "-o", output, "-lm", NULL};
+                                B1CC_TARGET_FLAG, "-o", output, "-lm", NULL};
         int compile_status = run(compile_argv);
         int status = -1;
         if (compile_status == 0) {
@@ -72,7 +80,7 @@ int main(void) {
             printf("B1CC-M34-TARGET: %s fail compile=%d exit=%d expected=%d\n",
                    cases[i].name, compile_status, status, cases[i].expected);
             if (strcmp(cases[i].name, "precedence") == 0) {
-                char *dump_argv[] = {"/bin/b1cc", (char *)cases[i].source, "--target=x86_64-b1nix", "-S", "-o", "/tmp/precedence.s", NULL};
+                char *dump_argv[] = {"/bin/b1cc", (char *)cases[i].source, B1CC_TARGET_FLAG, "-S", "-o", "/tmp/precedence.s", NULL};
                 run(dump_argv);
                 FILE *f = fopen("/tmp/precedence.s", "r");
                 if (f) {

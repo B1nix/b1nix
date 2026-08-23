@@ -15,6 +15,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 case "$ARCH" in
 	x86) PKG_ARCH=i686; TRIPLET=i686-b1nix ;;
 	x86_64) PKG_ARCH=x86_64; TRIPLET=x86_64-b1nix ;;
+	aarch64) PKG_ARCH=aarch64; TRIPLET=aarch64-b1nix ;;
 	*) echo "install-ports: unsupported architecture '$ARCH'" >&2; exit 2 ;;
 esac
 

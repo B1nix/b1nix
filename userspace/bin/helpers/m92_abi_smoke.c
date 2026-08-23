@@ -7,7 +7,25 @@
 
 static void test_all(void);
 
-#ifdef __linux__
+#if defined(__linux__) && defined(__aarch64__)
+/* Linux asm-generic (AArch64) numbers. open/stat/unlink are the *at forms. */
+#include <signal.h>
+#include <string.h>
+#define BX_write          64
+#define BX_open           56   /* openat */
+#define BX_close          57
+#define BX_stat           79   /* newfstatat */
+#define BX_unlink         35   /* unlinkat */
+#define BX_getpid        172
+#define BX_kill          129
+#define BX_signal        134   /* rt_sigaction */
+#define BX_brk           214
+#define BX_mmap          222
+#define BX_munmap        215
+#define BX_exit           93
+#define BX_clock_gettime 113
+#define BX_SIGUSR1        SIGUSR1
+#elif defined(__linux__)
 #include <sys/syscall.h>
 #include <signal.h>
 #include <string.h>
@@ -45,12 +63,45 @@ static void test_all(void);
 #endif
 
 
+#ifdef __aarch64__
+/* AArch64: number in x8, args x0..x5, trap with `svc #0`, result back in x0.
+ * Nothing is clobbered the way x86_64's rcx/r11 are. */
+static long sys(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
+  register long x8 __asm__("x8") = nr;
+  register long x0 __asm__("x0") = a0;
+  register long x1 __asm__("x1") = a1;
+  register long x2 __asm__("x2") = a2;
+  register long x3 __asm__("x3") = a3;
+  register long x4 __asm__("x4") = a4;
+  register long x5 __asm__("x5") = a5;
+  __asm__ volatile ("svc #0"
+                    : "+r"(x0)
+                    : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                    : "memory");
+  return x0;
+}
+#else
 static long sys(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
   long ret;
   __asm__ volatile ("syscall" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2),
                     "r"(a3), "r"(a4), "r"(a5) : "rcx", "r11", "memory");
   return ret;
 }
+#endif
+
+/* open/stat/unlink do not exist on the asm-generic ABI AArch64 uses — it has
+ * only the *at forms, which take a directory fd first. Wrap the three so the
+ * call sites below stay one shape on both. */
+#ifdef __aarch64__
+#define RAW_AT_FDCWD (-100)
+#define raw_open(path)        sys(BX_open, RAW_AT_FDCWD, (long)(path), 0, 0, 0, 0)
+#define raw_stat(path, st)    sys(BX_stat, RAW_AT_FDCWD, (long)(path), (long)(st), 0, 0, 0)
+#define raw_unlink(path)      sys(BX_unlink, RAW_AT_FDCWD, (long)(path), 0, 0, 0, 0)
+#else
+#define raw_open(path)        sys(BX_open, (long)(path), 0, 0, 0, 0, 0)
+#define raw_stat(path, st)    sys(BX_stat, (long)(path), (long)(st), 0, 0, 0, 0)
+#define raw_unlink(path)      sys(BX_unlink, (long)(path), 0, 0, 0, 0, 0)
+#endif
 
 static void raw_write(const char *s, int len) {
   sys(BX_write, 1, (long)s, len, 0, 0, 0);
@@ -95,7 +146,7 @@ static void test_mmap(void) {
 }
 
 static void test_open(void) {
-  long fd = sys(BX_open, (long)"/dev/null", 0, 0, 0, 0, 0);
+  long fd = raw_open("/dev/null");
   if (fd >= 0) { sys(BX_close, fd, 0, 0, 0, 0, 0); ok2("open"); }
   else fail2("open");
 }
@@ -103,7 +154,7 @@ static void test_open(void) {
 static void test_stat(void) {
   /* Linux struct stat = 144 bytes on x86_64 */
   char st[144] = {0};
-  long rc = sys(BX_stat, (long)"/dev/null", (long)st, 0, 0, 0, 0);
+  long rc = raw_stat("/dev/null", st);
   if (rc == 0) ok2("stat"); else fail2("stat");
 }
 
@@ -143,10 +194,14 @@ static void test_signal(void) {
 
 static void test_unlink(void) {
   const char *path = "/tmp/m92abi.txt";
+#ifdef __aarch64__
+  long fd = sys(BX_open, RAW_AT_FDCWD, (long)path, 0x241, 0644, 0, 0);
+#else
   long fd = sys(BX_open, (long)path, 0x241, 0644, 0, 0, 0);
+#endif
   if (fd >= 0) {
     sys(BX_close, fd, 0, 0, 0, 0, 0);
-    long rc = sys(BX_unlink, (long)path, 0, 0, 0, 0, 0);
+    long rc = raw_unlink(path);
     if (rc == 0) ok2("unlink");
     else { raw_write("unlink rc=", 10); raw_write("fail\n", 5); fail2("unlink"); }
   } else { raw_write("open-for-unlink failed\n", 22); fail2("unlink"); }

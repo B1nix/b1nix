@@ -161,10 +161,17 @@ extern "C" int main() {
     return 1;
   }
 
-  /* Tear down the tree and confirm it is gone. */
+  /* Tear down the tree and confirm it is gone. Report which of the three ways
+   * this can fail actually happened — a bare "fail" here says nothing about
+   * whether the walk, the unlink or the rmdir is the broken one, and this check
+   * failed for a while on an ENOTEMPTY whose real cause was two syscall layers
+   * away (libc++ drives remove_all with openat(O_DIRECTORY), whose flag number
+   * differs between x86_64 and aarch64). */
   std::uintmax_t removed = fs::remove_all(dir, ec);
-  if (ec || removed != 3 /* dir + 2 files */ || fs::exists(dir)) {
-    std::cout << "M55-IOSTREAM: fail remove_all\n";
+  bool still_there = fs::exists(dir);
+  if (ec || removed != 3 /* dir + 2 files */ || still_there) {
+    std::cout << "M55-IOSTREAM: fail remove_all (removed=" << removed
+              << " ec=" << ec.value() << " exists=" << still_there << ")\n";
     return 1;
   }
 

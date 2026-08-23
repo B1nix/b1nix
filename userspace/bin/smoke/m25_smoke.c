@@ -5,7 +5,11 @@
  * not exist inside the guest. The host-side b1cc rules in userspace/Makefile
  * pass the same flag. */
 #define B1CC_PATH "/bin/b1cc"
+#if defined(__aarch64__)
+#define B1CC_TARGET "--target=aarch64-b1nix"
+#else
 #define B1CC_TARGET "--target=x86_64-b1nix"
+#endif
 /* Everything in the image is a musl PIE against the shared libc; b1cc's output
  * is no exception. -fPIC -pie selects its dynamic link path, which stamps
  * PT_INTERP + DT_NEEDED=libc.so so the loader resolves the program's libc
@@ -302,21 +306,31 @@ int main(void) {
     marker("M25-SMOKE: fail run-utility\n");
     return 1;
   }
+  /* Each way this can fail says which one it was: "the output was wrong" alone
+   * does not distinguish a compiler that mis-passed open()'s mode from one that
+   * wrote the wrong bytes. */
   int out_fd = open("/tmp/mini-echo.out", O_RDONLY);
   if (out_fd < 0) {
-    marker("M25-SMOKE: fail verify-utility-output\n");
+    char e[80];
+    snprintf(e, sizeof(e), "M25-SMOKE: fail verify-utility-output (open errno=%d)\n", errno);
+    marker(e);
     return 1;
   }
   char outbuf[64];
   ssize_t out_n = read(out_fd, outbuf, sizeof(outbuf) - 1);
   close(out_fd);
   if (out_n < 0) {
-    marker("M25-SMOKE: fail verify-utility-output\n");
+    char e[80];
+    snprintf(e, sizeof(e), "M25-SMOKE: fail verify-utility-output (read errno=%d)\n", errno);
+    marker(e);
     return 1;
   }
   outbuf[out_n] = '\0';
   if (strcmp(outbuf, "alpha beta\n") != 0) {
-    marker("M25-SMOKE: fail verify-utility-output\n");
+    char e[160];
+    snprintf(e, sizeof(e), "M25-SMOKE: fail verify-utility-output (got %ld bytes: \"%s\")\n",
+             (long)out_n, outbuf);
+    marker(e);
     return 1;
   }
   marker("M25-SMOKE: ok compile-utility\n");

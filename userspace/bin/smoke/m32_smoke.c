@@ -543,7 +543,7 @@ static int test_tcp_client_server(void) {
     curl_pid = fork();
     if (curl_pid < 0) {
       fail("curl-https-fork");
-      kill(tls_srv, SIGTERM);
+      kill(tls_srv, SIGKILL);
       { int s = 0; waitpid(tls_srv, &s, 0); }
       return -1;
     }
@@ -567,8 +567,16 @@ static int test_tcp_client_server(void) {
   }
   /* Always terminate the server before reaping it: if every connect failed the
    * single-shot server is still blocked in accept(), so a plain waitpid() would
-   * hang forever — the historical M32-NET smoke stall under parallel load. */
-  kill(tls_srv, SIGTERM);
+   * hang forever — the historical M32-NET smoke stall under parallel load.
+   *
+   * SIGKILL, not SIGTERM: the instance's test runner starts with
+   * `trap '' ... TERM ...` (tools/ports/00-smoke.start) and SIG_IGN is
+   * inherited across both fork and execve, so every process in the test tree
+   * ignores SIGTERM. The kill silently did nothing, the waitpid below never
+   * returned, and the lane died there — taking every check that runs after
+   * m32_smoke (m53_*, m34, m35, m36, cxx, m55, m98, m104: ~380 of them) with
+   * it. That is the whole 1022-vs-640 swing between runs. */
+  kill(tls_srv, SIGKILL);
   { int srv_status = 0; waitpid(tls_srv, &srv_status, 0); }
   if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) != 0) {
     fail("curl-https-handshake");
@@ -624,8 +632,9 @@ static int test_tcp_client_server(void) {
   waitpid(curl_pid, &curl_status, 0);
   /* Same single-shot-server hang guard as the positive path: terminate before
    * reaping so a refused connect (server not yet bound under load) can't leave
-   * us blocked in waitpid. */
-  kill(tls_srv, SIGTERM);
+   * us blocked in waitpid. SIGKILL for the same reason as above: the test tree
+   * inherits an ignored SIGTERM from the runner's trap. */
+  kill(tls_srv, SIGKILL);
   { int srv_status = 0; waitpid(tls_srv, &srv_status, 0); }
   if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) == 0) {
     fail("curl-https-selfsigned-reject");
@@ -779,6 +788,12 @@ static int curl_fetch(const char *url, const char *family) {
     execve("/bin/curl", argv, envp);
     _exit(127);
   }
+  /* Plain blocking wait. A WNOHANG poll loop with usleep() was tried here to
+   * cap a hung probe, and it made the lane twice as slow (246 s -> 478 s,
+   * reproduced): the stuck curl is spinning in userspace, so the poller
+   * competes with it for the one CPU this arch has instead of letting it run
+   * out. The stall this was meant to bound is a real defect — see
+   * docs/aarch64-parity.md — and it belongs in the kernel, not here. */
   int st = 0;
   waitpid(pid, &st, 0);
   return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
@@ -1006,10 +1021,10 @@ static int test_curl_ipv6(void) {
   waitpid(cpid, &cst, 0);
 
   /* If the client failed to connect, the server is still blocked in accept()
-   * with no timeout — force it out with SIGTERM so the waitpid below cannot
-   * hang the whole suite until the QEMU watchdog. Harmless if it already
-   * exited. */
-  kill(pid, SIGTERM);
+   * with no timeout — force it out so the waitpid below cannot hang the whole
+   * suite until the QEMU watchdog. Harmless if it already exited. SIGKILL,
+   * because the runner's `trap '' TERM` is inherited by this whole tree. */
+  kill(pid, SIGKILL);
   int sst = 0;
   waitpid(pid, &sst, 0);
 
@@ -1624,31 +1639,73 @@ static void ssh_kill_server(int srv) {
  * /etc/shadow) + a single remote command, captured to a file. */
 static int ssh_test_login(void) {
   unlink("/tmp/ssh_out");
+  unlink("/tmp/ssh_ran");
   int cli = fork();
   if (cli == 0) {
     int o = open("/tmp/ssh_out", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (o >= 0) { dup2(o, 1); if (o > 2) close(o); }
+    int e = open("/tmp/ssh_err", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (e >= 0) { dup2(e, 2); if (e > 2) close(e); }
+    int z = open("/dev/null", O_RDONLY);
+    if (z >= 0) { dup2(z, 0); if (z > 2) close(z); }
     char *av[] = {"/bin/dbclient", "-y", "-y", "-p", "2222",
-                  "root@127.0.0.1", "echo", "M32B-SSH-LOGIN-OK", 0};
+                  "root@127.0.0.1",
+                  "echo RAN > /tmp/ssh_ran; echo M32B-SSH-LOGIN-OK", 0};
     char *ev[] = {"DROPBEAR_PASSWORD=root", 0};
     execve("/bin/dbclient", av, ev);
     _exit(127);
   }
-  int cst = 0;
-  int done = ssh_reap_client(cli, &cst);
+  /* Wait on the OUTPUT, not on the client's exit. The pass condition is the
+   * marker in the file — that alone proves KEX + auth + remote exec — and the
+   * client may well outlive it (loopback connection-close pacing). Poll for up
+   * to 90 s: the remote login shell here is zsh, and its FIRST exec in a lane
+   * is a cold one (this arch loads ELF segments eagerly, so the whole binary
+   * and its libraries come off the disk before main runs). The old 20 s bound
+   * cut exactly that cold start off; every later zsh in the same lane — the
+   * pty check right after this one — starts from cache and finishes at once. */
+  int cst = 0, done = 0;
   char buf[256];
-  int fd = open("/tmp/ssh_out", O_RDONLY);
-  int n = fd >= 0 ? (int)read(fd, buf, sizeof(buf) - 1) : -1;
-  if (fd >= 0) close(fd);
-  buf[n > 0 ? n : 0] = '\0';
-  /* Pass on the captured remote-command output: the client may not self-exit
-   * within the poll window (loopback connection-close pacing), but a correct
-   * marker in the file proves KEX + auth + remote exec all succeeded. */
+  int n = -1;
+  for (int i = 0; i < 90; i++) {
+    int fd = open("/tmp/ssh_out", O_RDONLY);
+    n = fd >= 0 ? (int)read(fd, buf, sizeof(buf) - 1) : -1;
+    if (fd >= 0) close(fd);
+    buf[n > 0 ? n : 0] = '\0';
+    if (strstr(buf, "M32B-SSH-LOGIN-OK"))
+      break;
+    if (waitpid(cli, &cst, WNOHANG) == cli) {
+      done = 1;
+      break;
+    }
+    /* Progress trace: the harness kills an instance that goes quiet, and this
+     * wait is the longest silent stretch in the suite. */
+    if (i % 5 == 0) {
+      char dbg[64];
+      snprintf(dbg, sizeof(dbg), "M32B-SSH: dbg login wait=%d\n", i);
+      emit(dbg);
+    }
+    sleep(1);
+  }
+  if (!done && waitpid(cli, &cst, WNOHANG) != cli)
+    kill(cli, SIGKILL);
+  {
+    int fd = open("/tmp/ssh_out", O_RDONLY);
+    n = fd >= 0 ? (int)read(fd, buf, sizeof(buf) - 1) : -1;
+    if (fd >= 0) close(fd);
+    buf[n > 0 ? n : 0] = '\0';
+  }
   if (!strstr(buf, "M32B-SSH-LOGIN-OK")) {
-    char dbg[320];
+    char ran[64] = {0}, err[192] = {0};
+    int rf = open("/tmp/ssh_ran", O_RDONLY);
+    if (rf >= 0) { int rn = (int)read(rf, ran, sizeof(ran) - 1); ran[rn > 0 ? rn : 0] = 0; close(rf); }
+    int ef = open("/tmp/ssh_err", O_RDONLY);
+    if (ef >= 0) { int en = (int)read(ef, err, sizeof(err) - 1); err[en > 0 ? en : 0] = 0; close(ef); }
+    for (int i = 0; err[i]; i++) if (err[i] == '\n') err[i] = '|';
+    for (int i = 0; ran[i]; i++) if (ran[i] == '\n') ran[i] = '|';
+    char dbg[640];
     snprintf(dbg, sizeof(dbg),
-             "M32B-SSH: dbg handshake done=%d cli=0x%x out=[%s]\n",
-             done, cst, buf);
+             "M32B-SSH: dbg handshake done=%d cli=0x%x out=[%s] ran=[%s] err=[%s]\n",
+             done, cst, buf, ran, err);
     emit(dbg);
     emit("M32B-SSH: FAIL handshake\n");
     return -1;

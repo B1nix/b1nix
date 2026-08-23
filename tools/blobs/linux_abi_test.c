@@ -20,7 +20,93 @@ typedef long i64;
 typedef unsigned int u32;
 typedef int i32;
 
-/* ── Linux x86_64 syscall numbers used below ── */
+/* ── Linux syscall numbers used below ──
+ *
+ * These are NOT shared between architectures. x86_64 keeps its historical
+ * numbering; aarch64 uses asm-generic, which renumbers everything and simply
+ * does not have the legacy calls (open, creat, mkdir, rmdir, unlink, fork,
+ * pause, time, epoll_create, utime, getdents) — the *at forms and the 64-bit
+ * variants replaced them. Those are expressed through the wrappers below so
+ * the tests themselves stay architecture-neutral. Values are taken from the
+ * kernel's own translation tables (kernel/syscall/syscall.c and
+ * kernel/syscall/linux_abi.c), which is what actually has to agree. */
+#if defined(__aarch64__)
+#define SYS_read            63
+#define SYS_write           64
+#define SYS_close           57
+#define SYS_fstat           80
+#define SYS_lseek           62
+#define SYS_mmap            222
+#define SYS_munmap          215
+#define SYS_pread64         67
+#define SYS_pwrite64        68
+#define SYS_mincore         232
+#define SYS_rt_sigpending   136
+#define SYS_uname           160
+#define SYS_truncate        45
+#define SYS_gettimeofday    169
+#define SYS_getresuid       148
+#define SYS_getresgid       150
+#define SYS_capget          90
+#define SYS_personality     92
+#define SYS_statfs          43
+#define SYS_fstatfs         44
+#define SYS_sched_getparam  121
+#define SYS_sched_getscheduler 120
+#define SYS_sched_get_priority_max 125
+#define SYS_sched_rr_get_interval  127
+#define SYS_mlock           228
+#define SYS_munlock         229
+#define SYS_chroot          51
+#define SYS_sethostname     161
+#define SYS_sched_setaffinity 122
+#define SYS_readlinkat      78
+#define SYS_unlinkat        35
+#define SYS_renameat        38
+#define SYS_exit_group      94
+#define SYS_readahead       213
+#define SYS_unshare         97
+#define SYS_syncfs          267
+#define SYS_preadv          69
+#define SYS_getpid          172
+#define SYS_sched_getaffinity 123
+#define SYS_capset          91
+#define SYS_setfsuid        151
+#define SYS_setfsgid        152
+#define SYS_getcwd          17
+#define SYS_chdir           49
+#define SYS_semget          190
+#define SYS_semop           193
+#define SYS_semctl          191
+#define SYS_msgget          186
+#define SYS_msgsnd          189
+#define SYS_msgrcv          188
+#define SYS_msgctl          187
+#define SYS_ptrace          117
+#define SYS_ioprio_set      30
+#define SYS_ioprio_get      31
+#define SYS_tee             77
+#define SYS_vmsplice        75
+#define SYS_pipe2           59
+#define SYS_name_to_handle_at 264
+#define SYS_open_by_handle_at 265
+#define SYS_rseq            293
+#define SYS_swapon          224
+#define SYS_swapoff         225
+#define SYS_wait4           260
+/* asm-generic replacements for the calls x86_64 spells legacy. */
+#define SYS_openat          56
+#define SYS_mkdirat         34
+#define SYS_getdents64      61
+#define SYS_clone           220
+#define SYS_ppoll           73
+#define SYS_clock_gettime   113
+#define SYS_epoll_create1   20
+#define SYS_utimensat       88
+#define SYS_newfstatat      79
+#define SYS_kill            129
+#define SYS_settimeofday    170
+#else
 #define SYS_read            0
 #define SYS_write           1
 #define SYS_open            2
@@ -95,6 +181,18 @@ typedef int i32;
 #define SYS_mkdir           83
 #define SYS_rmdir           84
 #define SYS_unlink          87
+#define SYS_openat          257
+#define SYS_mkdirat         258
+#define SYS_getdents64      217
+#define SYS_clone           56
+#define SYS_ppoll           271
+#define SYS_clock_gettime   228
+#define SYS_epoll_create1   291
+#define SYS_utimensat       280
+#define SYS_newfstatat      262
+#define SYS_kill            62
+#define SYS_settimeofday    164
+#endif
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -104,6 +202,23 @@ typedef int i32;
 
 #define AT_FDCWD (-100)
 
+#if defined(__aarch64__)
+/* AArch64: number in x8, args x0..x5, trap with `svc #0`. */
+static long sys6(long n, long a, long b, long c, long d, long e, long f) {
+  register long x8 __asm__("x8") = n;
+  register long x0 __asm__("x0") = a;
+  register long x1 __asm__("x1") = b;
+  register long x2 __asm__("x2") = c;
+  register long x3 __asm__("x3") = d;
+  register long x4 __asm__("x4") = e;
+  register long x5 __asm__("x5") = f;
+  __asm__ volatile("svc #0"
+                   : "+r"(x0)
+                   : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                   : "memory");
+  return x0;
+}
+#else
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
   long ret;
   register long r10 __asm__("r10") = d;
@@ -115,12 +230,69 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f) {
                    : "rcx", "r11", "memory");
   return ret;
 }
+#endif
 #define sys0(n)                sys6((n), 0, 0, 0, 0, 0, 0)
 #define sys1(n, a)             sys6((n), (long)(a), 0, 0, 0, 0, 0)
 #define sys2(n, a, b)          sys6((n), (long)(a), (long)(b), 0, 0, 0, 0)
 #define sys3(n, a, b, c)       sys6((n), (long)(a), (long)(b), (long)(c), 0, 0, 0)
 #define sys4(n, a, b, c, d)    sys6((n), (long)(a), (long)(b), (long)(c), (long)(d), 0, 0)
 #define sys5(n, a, b, c, d, e) sys6((n), (long)(a), (long)(b), (long)(c), (long)(d), (long)(e), 0)
+
+/* Calls x86_64 has as dedicated numbers and asm-generic expresses through the
+ * *at forms. Wrapping them here keeps every test below architecture-neutral
+ * while still driving the syscall the architecture really provides. */
+#if defined(__aarch64__)
+#define AT_REMOVEDIR_ 0x200
+static long t_open(const char *p_, long fl, long mode) {
+  return sys4(SYS_openat, AT_FDCWD, p_, fl, mode);
+}
+static long t_creat(const char *p_, long mode) {
+  return sys4(SYS_openat, AT_FDCWD, p_, O_WRONLY | O_CREAT | O_TRUNC, mode);
+}
+static long t_mkdir(const char *p_, long mode) {
+  return sys3(SYS_mkdirat, AT_FDCWD, p_, mode);
+}
+static long t_rmdir(const char *p_) {
+  return sys3(SYS_unlinkat, AT_FDCWD, p_, AT_REMOVEDIR_);
+}
+__attribute__((unused)) static long t_unlink(const char *p_) {
+  return sys3(SYS_unlinkat, AT_FDCWD, p_, 0);
+}
+static long t_fork(void) { return sys5(SYS_clone, 17 /* SIGCHLD */, 0, 0, 0, 0); }
+__attribute__((unused)) static long t_pause(void) { return sys4(SYS_ppoll, 0, 0, 0, 0); }
+static long t_getdents(long fd, void *buf, long n) {
+  return sys3(SYS_getdents64, fd, buf, n);
+}
+static long t_epoll_create(long size) { (void)size; return sys1(SYS_epoll_create1, 0); }
+static long t_time(void) {
+  long ts[2] = {0, 0};
+  long r = sys2(SYS_clock_gettime, 0 /* CLOCK_REALTIME */, ts);
+  return r < 0 ? r : ts[0];
+}
+static long t_utime(const char *p_, const unsigned long *times) {
+  /* utimensat takes struct timespec[2]; utime's utimbuf is two seconds. */
+  long ts[4] = {times ? times[0] : 0, 0, times ? times[1] : 0, 0};
+  return sys4(SYS_utimensat, AT_FDCWD, p_, times ? (long)ts : 0, 0);
+}
+#else
+static long t_open(const char *p_, long fl, long mode) {
+  return sys3(SYS_open, p_, fl, mode);
+}
+static long t_creat(const char *p_, long mode) { return sys2(SYS_creat, p_, mode); }
+static long t_mkdir(const char *p_, long mode) { return sys2(SYS_mkdir, p_, mode); }
+static long t_rmdir(const char *p_) { return sys1(SYS_rmdir, p_); }
+__attribute__((unused)) static long t_unlink(const char *p_) { return sys1(SYS_unlink, p_); }
+static long t_fork(void) { return sys0(SYS_fork); }
+__attribute__((unused)) static long t_pause(void) { return sys0(SYS_pause); }
+static long t_getdents(long fd, void *buf, long n) {
+  return sys3(SYS_getdents, fd, buf, n);
+}
+static long t_epoll_create(long size) { return sys1(SYS_epoll_create, size); }
+static long t_time(void) { return sys1(SYS_time, 0); }
+static long t_utime(const char *p_, const unsigned long *times) {
+  return sys2(SYS_utime, p_, times);
+}
+#endif
 
 /* ── tiny string helpers ── */
 static unsigned slen(const char *s) {
@@ -187,7 +359,7 @@ static void check(const char *name, int cond, long v) {
 
 /* Read a whole file into buf; returns the byte count or -errno. */
 static long slurp(const char *path, char *buf, unsigned cap) {
-  long fd = sys3(SYS_open, path, O_RDONLY, 0);
+  long fd = t_open(path, O_RDONLY, 0);
   if (fd < 0)
     return fd;
   long n = sys3(SYS_read, fd, buf, cap - 1);
@@ -244,7 +416,7 @@ struct lx_stat {
 #define TMPFILE2 "/tmp/m40abi.tmp2"
 
 static void test_positional_io(void) {
-  long fd = sys3(SYS_open, TMPFILE, O_RDWR | O_CREAT | O_TRUNC, 0644);
+  long fd = t_open(TMPFILE, O_RDWR | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) {
     fail("pread-pwrite", fd);
     return;
@@ -276,7 +448,7 @@ static void test_positional_io(void) {
 
   /* truncate(2) by path, then confirm the size through stat. */
   long tr = sys2(SYS_truncate, TMPFILE, 4);
-  fd = sys3(SYS_open, TMPFILE, O_RDONLY, 0);
+  fd = t_open(TMPFILE, O_RDONLY, 0);
   struct lx_stat st;
   long sr = sys2(SYS_fstat, fd, &st);
   sys1(SYS_close, fd);
@@ -284,14 +456,14 @@ static void test_positional_io(void) {
 
   /* utime(2) with an explicit stamp, read back through fstat. */
   u64 times[2] = {1700000000UL, 1700000123UL};
-  long ut = sys2(SYS_utime, TMPFILE, times);
-  fd = sys3(SYS_open, TMPFILE, O_RDONLY, 0);
+  long ut = t_utime(TMPFILE, times);
+  fd = t_open(TMPFILE, O_RDONLY, 0);
   sr = sys2(SYS_fstat, fd, &st);
   sys1(SYS_close, fd);
   check("utime", ut == 0 && sr == 0 && st.st_mtime == 1700000123, ut);
 
   /* creat(2) + renameat(2) + unlinkat(2). */
-  long cfd = sys2(SYS_creat, TMPFILE2, 0644);
+  long cfd = t_creat(TMPFILE2, 0644);
   if (cfd >= 0)
     sys1(SYS_close, cfd);
   long rn = sys4(SYS_renameat, AT_FDCWD, TMPFILE2, AT_FDCWD, TMPFILE);
@@ -307,9 +479,9 @@ static void test_fs_calls(void) {
   /* Use a regular file, not a directory: open(2) on a directory is not
    * guaranteed to hand back a readable descriptor, and the point here is the
    * fd-based filesystem calls, not directory opening. */
-  long fd = sys3(SYS_open, "/etc/m40-smoke.sh", O_RDONLY, 0);
+  long fd = t_open("/etc/m40-smoke.sh", O_RDONLY, 0);
   if (fd < 0)
-    fd = sys3(SYS_open, "/etc/inittab", O_RDONLY, 0);
+    fd = t_open("/etc/inittab", O_RDONLY, 0);
   struct lx_statfs f2;
   long r2 = sys2(SYS_fstatfs, fd, &f2);
   check("fstatfs", r2 == 0 && f2.f_bsize == sfs.f_bsize, r2);
@@ -324,7 +496,7 @@ static void test_fs_calls(void) {
 static void test_time_calls(void) {
   struct lx_timeval tv;
   long r = sys2(SYS_gettimeofday, &tv, 0);
-  long t = sys1(SYS_time, 0);
+  long t = t_time();
   long d = t - tv.tv_sec;
   if (d < 0)
     d = -d;
@@ -468,7 +640,7 @@ static void test_documented_gaps(void) {
 }
 
 static void test_epoll(void) {
-  long fd = sys1(SYS_epoll_create, 1);
+  long fd = t_epoll_create(1);
   check("epoll-create", fd >= 0, fd);
   if (fd >= 0)
     sys1(SYS_close, fd);
@@ -483,23 +655,35 @@ static void test_epoll(void) {
 void abi_main(void);
 
 __attribute__((naked)) void _start(void) {
+#if defined(__aarch64__)
+  /* Clear the frame pointer, align SP, call in. AAPCS64 wants SP 16-aligned;
+   * the kernel already hands us that, so this only makes it explicit. */
+  __asm__ volatile("mov x29, #0\n\t"
+                   "mov x30, #0\n\t"
+                   "mov x9, sp\n\t"
+                   "and x9, x9, #-16\n\t"
+                   "mov sp, x9\n\t"
+                   "bl abi_main\n\t"
+                   "brk #0");
+#else
   __asm__ volatile("xorq %rbp, %rbp\n\t"
                    "andq $-16, %rsp\n\t"
                    "callq abi_main\n\t"
                    "hlt");
+#endif
 }
 
 
 /* ── the calls closed in the M40 follow-up ─────────────────────────────── */
 
 static void test_getdents_legacy(void) {
-  long fd = sys3(SYS_open, "/etc", O_RDONLY, 0);
+  long fd = t_open("/etc", O_RDONLY, 0);
   if (fd < 0) {
     fail("getdents-legacy", fd);
     return;
   }
   char buf[1024];
-  long n = sys3(SYS_getdents, fd, buf, sizeof(buf));
+  long n = t_getdents(fd, buf, sizeof(buf));
   sys1(SYS_close, fd);
   if (n <= 0) {
     fail("getdents-legacy", n);
@@ -528,13 +712,13 @@ static void test_getdents_legacy(void) {
  * match what stat(2) reports for the same file, and two entries must not share
  * one (both are true of a synthesized index only by accident). */
 static void test_getdents_ino(void) {
-  long fd = sys3(SYS_open, "/etc", O_RDONLY, 0);
+  long fd = t_open("/etc", O_RDONLY, 0);
   if (fd < 0) {
     fail("getdents-ino", fd);
     return;
   }
   char buf[2048];
-  long n = sys3(217 /* getdents64 */, fd, buf, sizeof(buf));
+  long n = sys3(SYS_getdents64, fd, buf, sizeof(buf));
   sys1(SYS_close, fd);
   if (n <= 0) {
     fail("getdents-ino", n);
@@ -575,7 +759,7 @@ static void test_getdents_ino(void) {
         path[p++] = name[q++];
       path[p] = '\0';
       struct lx_stat st;
-      if (sys4(262 /* newfstatat */, AT_FDCWD, path, &st, 0) == 0 &&
+      if (sys4(SYS_newfstatat, AT_FDCWD, path, &st, 0) == 0 &&
           st.st_ino == ino)
         matched = 1;
     }
@@ -723,7 +907,7 @@ static void test_file_handles(void) {
     int handle_type;
     unsigned payload;
   } fh2 = {sizeof(unsigned), 0, 0};
-  long w = sys3(SYS_open, "/tmp/m40handle", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  long w = t_open("/tmp/m40handle", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (w >= 0) {
     sys3(SYS_write, w, "a", 1);
     sys1(SYS_close, w);
@@ -731,7 +915,7 @@ static void test_file_handles(void) {
   long r2 = sys5(SYS_name_to_handle_at, AT_FDCWD, "/tmp/m40handle", &fh2,
                  &mount_id, 0);
   sys3(SYS_unlinkat, AT_FDCWD, "/tmp/m40handle", 0);
-  w = sys3(SYS_open, "/tmp/m40handle", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  w = t_open("/tmp/m40handle", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (w >= 0) {
     sys3(SYS_write, w, "b", 1);
     sys1(SYS_close, w);
@@ -772,6 +956,32 @@ static struct lx_rseq_cs g_rseq_cs;
  * kernel checks before it will ever redirect execution there. */
 static long rseq_run_section(void) {
   long ret = 0;
+#if defined(__aarch64__)
+  __asm__ volatile(
+      "adr x9, 1f\n\t"
+      "str x9, [%1, #8]\n\t"          /* cs.start_ip           */
+      "adr x10, 2f\n\t"
+      "sub x10, x10, x9\n\t"
+      "str x10, [%1, #16]\n\t"        /* cs.post_commit_offset */
+      "adr x9, 4f\n\t"
+      "str x9, [%1, #24]\n\t"         /* cs.abort_ip           */
+      "str %1, [%2, #8]\n\t"          /* rseq->rseq_cs = &cs   */
+      "1:\n\t"
+      "movz x11, #0x4600\n\t"
+      "movk x11, #0x23c3, lsl #16\n\t" /* 600000000 iterations, as x86 uses */
+      "3: subs x11, x11, #1\n\t"
+      "b.ne 3b\n\t"
+      "mov %0, #1\n\t"                /* reached the commit    */
+      "2:\n\t"
+      "b 5f\n\t"
+      ".long 0x53053053\n\t"          /* abort signature       */
+      "4:\n\t"
+      "mov %0, #2\n\t"                /* restarted by the kernel */
+      "5:\n\t"
+      : "=&r"(ret)
+      : "r"(&g_rseq_cs), "r"(&g_rseq_area)
+      : "x9", "x10", "x11", "memory");
+#else
   __asm__ volatile(
       "leaq 1f(%%rip), %%rax\n\t"
       "movq %%rax, 8(%1)\n\t"          /* cs.start_ip           */
@@ -795,6 +1005,7 @@ static long rseq_run_section(void) {
       : "=&r"(ret)
       : "r"(&g_rseq_cs), "r"(&g_rseq_area)
       : "rax", "rcx", "rdx", "memory");
+#endif
   return ret;
 }
 
@@ -838,24 +1049,24 @@ static void test_swap_cycle(void) {
 
 static void test_chroot(void) {
   /* chroot is irreversible for the calling task, so run it in a child. */
-  sys2(SYS_mkdir, "/tmp/m40jail", 0755);
-  long fd = sys3(SYS_open, "/tmp/m40jail/inside", O_WRONLY | O_CREAT | O_TRUNC,
+  t_mkdir("/tmp/m40jail", 0755);
+  long fd = t_open("/tmp/m40jail/inside", O_WRONLY | O_CREAT | O_TRUNC,
                  0644);
   if (fd >= 0) {
     sys3(SYS_write, fd, "x", 1);
     sys1(SYS_close, fd);
   }
 
-  long pid = sys0(SYS_fork);
+  long pid = t_fork();
   if (pid == 0) {
     /* Child: inside the jail, "/inside" must exist and "/etc" must not, and
      * ".." must not climb out of it. */
     long cr = sys1(SYS_chroot, "/tmp/m40jail");
     int ok_status = 0;
     if (cr == 0) {
-      long f1 = sys3(SYS_open, "/inside", O_RDONLY, 0);
-      long f2 = sys3(SYS_open, "/etc/m40-smoke.sh", O_RDONLY, 0);
-      long f3 = sys3(SYS_open, "/../../etc/m40-smoke.sh", O_RDONLY, 0);
+      long f1 = t_open("/inside", O_RDONLY, 0);
+      long f2 = t_open("/etc/m40-smoke.sh", O_RDONLY, 0);
+      long f3 = t_open("/../../etc/m40-smoke.sh", O_RDONLY, 0);
       if (f1 >= 0)
         sys1(SYS_close, f1);
       ok_status = (f1 >= 0 && f2 < 0 && f3 < 0) ? 0 : 1;
@@ -872,17 +1083,17 @@ static void test_chroot(void) {
         pid > 0 ? (long)status : pid);
 
   sys3(SYS_unlinkat, AT_FDCWD, "/tmp/m40jail/inside", 0);
-  sys1(SYS_rmdir, "/tmp/m40jail");
+  t_rmdir("/tmp/m40jail");
 }
 
 static void test_ptrace(void) {
-  long pid = sys0(SYS_fork);
+  long pid = t_fork();
   if (pid == 0) {
     sys4(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0);
     /* Announce ourselves as traced, then stop for the tracer. */
     sys3(SYS_write, 1, "", 0);
     /* Raise SIGUSR1 (Linux 10) on ourselves — the tracer sees the stop. */
-    sys2(62 /* kill */, sys0(SYS_getpid), 10);
+    sys2(SYS_kill, sys0(SYS_getpid), 10);
     sys1(SYS_exit_group, 0);
     for (;;)
       ;
@@ -898,11 +1109,21 @@ static void test_ptrace(void) {
   /* Read the stopped child's registers: rip must be a plausible userspace
    * address inside the test binary. */
   struct {
-    unsigned long r[27];
+    /* x86_64's user_regs_struct is 27 words; aarch64's is 34 (x0..x30, sp, pc,
+     * pstate). Size for the larger so the kernel can fill either. */
+    unsigned long r[34];
   } regs;
   long gr = sys4(SYS_ptrace, 12 /* PTRACE_GETREGS */, pid, 0, &regs);
+#if defined(__aarch64__)
+  /* user_regs_struct here is x0..x30, sp, pc, pstate — the program counter is
+   * index 32, not x86_64's 16. The blob is linked into the user half (see
+   * build-linux-abi-test.sh), so that is the range its pc must fall in. */
+  unsigned long rip = regs.r[32];
+  int rip_ok = (gr == 0 && rip > 0x500000000000UL && rip < 0x500001000000UL);
+#else
   unsigned long rip = regs.r[16];
   int rip_ok = (gr == 0 && rip > 0x200000UL && rip < 0x400000UL);
+#endif
 
   /* Peek the word at the child's rip — it must match this process's own copy
    * of the same code, since both run the same binary image. */
@@ -953,7 +1174,7 @@ static void test_affinity(void) {
 /* capset(2) really drops a capability: after dropping CAP_SYS_TIME the
  * privileged operation it guards must start failing, even though we are root. */
 static void test_capdrop(void) {
-  long pid = sys0(SYS_fork);
+  long pid = t_fork();
   if (pid == 0) {
     unsigned hdr[2] = {0x20080522u, 0}; /* _LINUX_CAPABILITY_VERSION_3 */
     unsigned caps[6] = {0, 0, 0, 0, 0, 0};
@@ -968,7 +1189,7 @@ static void test_capdrop(void) {
     /* settimeofday needs CAP_SYS_TIME; with it dropped it must report EPERM
      * even for uid 0. */
     struct lx_timeval tv = {1700000000, 0};
-    long st = sys2(164 /* settimeofday */, &tv, 0);
+    long st = sys2(SYS_settimeofday, &tv, 0);
 
     /* And the drop must be visible through capget. */
     unsigned after[6] = {0, 0, 0, 0, 0, 0};
@@ -990,21 +1211,21 @@ static void test_capdrop(void) {
  * the effective uid. Run it in a child: a root-only file must become
  * unreadable once fsuid is a plain user. */
 static void test_setfsuid(void) {
-  long fd = sys3(SYS_open, "/tmp/m40fsuid", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  long fd = t_open("/tmp/m40fsuid", O_WRONLY | O_CREAT | O_TRUNC, 0600);
   if (fd >= 0) {
     sys3(SYS_write, fd, "x", 1);
     sys1(SYS_close, fd);
   }
-  long pid = sys0(SYS_fork);
+  long pid = t_fork();
   if (pid == 0) {
     long prev = sys1(SYS_setfsuid, 1000);
     long now = sys1(SYS_setfsuid, 1000); /* returns the previous = 1000 */
-    long f = sys3(SYS_open, "/tmp/m40fsuid", O_RDONLY, 0);
+    long f = t_open("/tmp/m40fsuid", O_RDONLY, 0);
     if (f >= 0)
       sys1(SYS_close, f);
     /* Back to root, and the file is readable again. */
     sys1(SYS_setfsuid, 0);
-    long f2 = sys3(SYS_open, "/tmp/m40fsuid", O_RDONLY, 0);
+    long f2 = t_open("/tmp/m40fsuid", O_RDONLY, 0);
     if (f2 >= 0)
       sys1(SYS_close, f2);
     int rc = (prev == 0 && now == 1000 && f < 0 && f2 >= 0) ? 0 : 1;
@@ -1029,13 +1250,19 @@ static void test_ptrace_nonparent(void) {
     fail("ptrace-nonparent", -1);
     return;
   }
-  long child = sys0(SYS_fork);
+  long child = t_fork();
   if (child == 0) {
-    long grand = sys0(SYS_fork);
+    long grand = t_fork();
     if (grand == 0) {
       /* Grandchild: spin until someone stops us, then exit. */
       for (long i = 0; i < 200000000L; i++)
-        __asm__ volatile("pause");
+        __asm__ volatile(
+#if defined(__aarch64__)
+            "yield"
+#else
+            "pause"
+#endif
+            );
       sys1(SYS_exit_group, 0);
       for (;;)
         ;
@@ -1071,9 +1298,9 @@ static void test_ptrace_nonparent(void) {
 /* chroot keeps a working directory that lies inside the new root, rewritten to
  * the root-relative form. */
 static void test_chroot_cwd(void) {
-  sys2(SYS_mkdir, "/tmp/m40jail2", 0755);
-  sys2(SYS_mkdir, "/tmp/m40jail2/sub", 0755);
-  long pid = sys0(SYS_fork);
+  t_mkdir("/tmp/m40jail2", 0755);
+  t_mkdir("/tmp/m40jail2/sub", 0755);
+  long pid = t_fork();
   if (pid == 0) {
     long cd = sys1(SYS_chdir, "/tmp/m40jail2/sub");
     long cr = sys1(SYS_chroot, "/tmp/m40jail2");
@@ -1088,8 +1315,8 @@ static void test_chroot_cwd(void) {
   long w = sys4(SYS_wait4, pid, &status, 0, 0);
   check("chroot-keeps-cwd", pid > 0 && w == pid && (status & 0xff00) == 0,
         pid > 0 ? (long)status : pid);
-  sys1(SYS_rmdir, "/tmp/m40jail2/sub");
-  sys1(SYS_rmdir, "/tmp/m40jail2");
+  t_rmdir("/tmp/m40jail2/sub");
+  t_rmdir("/tmp/m40jail2");
 }
 
 void abi_main(void) {

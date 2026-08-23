@@ -25,7 +25,31 @@ MUSL_LIB="$MUSL_INSTALL/lib"
 export PROJECT_DIR="$ROOT_DIR"
 . "$ROOT_DIR/tools/toolchain/env.sh" 2>/dev/null || true
 CLANG="${CLANG:-clang}"
+AR="${AR:-$(command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || echo ar)}"
+# -fuse-ld=lld on macOS resolves to the host's Mach-O ld64.lld, which
+# doesn't understand -dynamic-linker. Point clang at the ELF ld.lld binary
+# directly (same one userspace/Makefile uses) so it stays the ELF linker
+# regardless of host platform.
+LDLLD="${LDLLD:-$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/lld/bin/ld.lld)}"
+# Linking goes straight through ld.lld (see link_bin below), not through
+# clang's own link driver — so we lose clang's implicit auto-link of its
+# compiler-rt builtins (128-bit __multf3-style soft-float helpers on
+# aarch64, __mulsc3-style complex-multiply helpers musl's libc.so itself
+# references on every arch) and must supply that archive explicitly.
+BUILTINS_LIB="$ROOT_DIR/build/$ARCH/compiler-rt-builtins/libclang_rt.builtins-$ARCH.a"
+if [ ! -f "$BUILTINS_LIB" ]; then
+    ARCH="$ARCH" sh "$ROOT_DIR/tools/ports/build-compiler-rt-builtins.sh"
+fi
 B1NIX_TRIPLET="${B1NIX_TRIPLET:-x86_64-b1nix}"
+# clang's --target wants the generic ELF triplet (matches userspace/Makefile's
+# TARGET), not the b1nix-b1nix cross-GCC triplet above — clang has no ToolChain
+# for an OS literally named "b1nix" and falls back to macOS Mach-O linker
+# driver flags, which ld.lld then rejects.
+case "$ARCH" in
+  aarch64) CLANG_TARGET="aarch64-unknown-elf" ;;
+  x86)     CLANG_TARGET="i686-unknown-elf" ;;
+  *)       CLANG_TARGET="x86_64-unknown-elf" ;;
+esac
 OBJ_DIR="$BUILD_DIR/openrc-obj"
 LIB_DIR="$BUILD_DIR/openrc-lib"
 BIN_DIR="$PREFIX/sbin"
@@ -35,7 +59,7 @@ mkdir -p "$OBJ_DIR" "$LIB_DIR" "$BIN_DIR" "$PREFIX/etc/init.d" \
          "$PREFIX/libexec/openrc/functions" "$SHIM_DIR/sys"
 
 INC_FLAGS="-isystem $MUSL_INCLUDE -isystem $SHIM_DIR"
-CFLAGS_BASE="--target=$B1NIX_TRIPLET -ffreestanding -nostdinc -fPIC $INC_FLAGS -Db1nix -D__b1nix__ -D__linux__ -DPATH_MAX=4096 -DHAVE_STRUCT_TIMESPEC -D_GNU_SOURCE -DHAVE_STRLCAT -DHAVE_STRLCPY -Wall -Wno-unused-function -Wno-unused-variable -Wno-sign-compare -Wno-type-limits -Wno-pointer-sign -Wno-implicit-function-declaration -Wno-int-conversion -Wno-unused-but-set-variable -Wno-enum-conversion"
+CFLAGS_BASE="--target=$CLANG_TARGET -ffreestanding -nostdinc -fPIC $INC_FLAGS -Db1nix -D__b1nix__ -D__linux__ -DPATH_MAX=4096 -DHAVE_STRUCT_TIMESPEC -D_GNU_SOURCE -DHAVE_STRLCAT -DHAVE_STRLCPY -Wall -Wno-unused-function -Wno-unused-variable -Wno-sign-compare -Wno-type-limits -Wno-pointer-sign -Wno-implicit-function-declaration -Wno-int-conversion -Wno-unused-but-set-variable -Wno-enum-conversion"
 COMPILE_FLAGS="-I$SRC_DIR/src -I$SRC_DIR/src/shared -I$SRC_DIR/src/librc -I$OBJ_DIR -I$SRC_DIR/src/libeinfo -D_RC_PATH=\"/etc/rc\",\"/etc\",\"/libexec/openrc/rc\" -DHAVE_INITSCRIPTS=\"/etc/init.d\" -UHAVE_CLOSE_RANGE"
 
 echo "=== Building OpenRC for b1nix ($ARCH) ==="
@@ -43,6 +67,20 @@ echo "  SRC:      $SRC_DIR"
 echo "  MUSL:     $MUSL_INCLUDE"
 echo "  PREFIX:   $PREFIX"
 
+OPENRC_VERSION="${OPENRC_VERSION:-master}"
+if [ ! -f "$SRC_DIR/src/openrc-init/openrc-init.c" ]; then
+    _tar_parent="$ROOT_DIR/build/src"
+    _tarball="$_tar_parent/openrc-$OPENRC_VERSION.tar.gz"
+    mkdir -p "$_tar_parent"
+    if [ ! -f "$_tarball" ]; then
+        curl -fL "https://github.com/OpenRC/openrc/archive/refs/heads/$OPENRC_VERSION.tar.gz" \
+            -o "$_tarball" || wget -O "$_tarball" \
+            "https://github.com/OpenRC/openrc/archive/refs/heads/$OPENRC_VERSION.tar.gz"
+    fi
+    rm -rf "$SRC_DIR"
+    mkdir -p "$SRC_DIR"
+    tar -xzf "$_tarball" -C "$SRC_DIR" --strip-components=1
+fi
 if [ ! -d "$SRC_DIR" ]; then
     echo "OpenRC source not found at $SRC_DIR" >&2; exit 1
 fi
@@ -72,6 +110,12 @@ cc_file() {
     $CLANG $CFLAGS_BASE $COMPILE_FLAGS $extra -c "$src" -o "$obj" 2>&1
 }
 
+case "$ARCH" in
+  aarch64) LD_EMU="aarch64elf" ;;
+  x86)     LD_EMU="elf_i386" ;;
+  *)       LD_EMU="elf_x86_64" ;;
+esac
+
 link_bin() {
     local out="$1"; shift
     # Dynamic, like the rest of the userspace and like every distribution that
@@ -80,10 +124,16 @@ link_bin() {
     # tells the kernel loader this is a Linux-ABI image — no EI_OSABI stamping
     # needed. tools/check-dynamic.sh fails the build if anything here regresses
     # to -static.
-    $CLANG --target=$B1NIX_TRIPLET -nostdlib -pie -fuse-ld=lld \
-        -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+    # Invoke ld.lld directly rather than through `clang -fuse-ld=` — same as
+    # userspace/Makefile's $(LD) calls. Apple clang's driver quietly routes
+    # x86_64 (but not aarch64) link jobs through its Darwin/gcc frontend even
+    # with an explicit --target=x86_64-unknown-elf, which then hands ld.lld a
+    # pile of Mach-O-only flags (-arch, -platform_version, -syslibroot...)
+    # that it rejects outright.
+    "$LDLLD" -m "$LD_EMU" -pie --eh-frame-hdr \
+        -dynamic-linker /lib/ld-musl-$ARCH.so.1 \
         "$MUSL_LIB/Scrt1.o" "$MUSL_LIB/crti.o" "$@" \
-        -L"$MUSL_LIB" -lc "$MUSL_LIB/crtn.o" -o "$out" 2>&1 || return $?
+        -L"$MUSL_LIB" -lc ${BUILTINS_LIB:+"$BUILTINS_LIB"} "$MUSL_LIB/crtn.o" -o "$out" 2>&1 || return $?
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -186,26 +236,35 @@ CAPEOF
 
 # openrc-init.c: replace utmp.h with compat, remove CLOCK_BOOTTIME block
 INIT_SRC="$SRC_DIR/src/openrc-init/openrc-init.c"
-sed -i 's|#include <utmp.h>|#include "../../b1nix_compat.h"|' "$INIT_SRC"
-sed -i 's|#include "wtmp.h"||' "$INIT_SRC"
-sed -i '/#if defined(__linux__)/,/#endif/c\/* b1nix: use CLOCK_BOOTTIME from compat *\/' "$INIT_SRC"
+# sed -i's extension argument is spelled differently on BSD (macOS) vs GNU —
+# `-i.bak` (glued, no space) is the one spelling both accept, so every call
+# below uses that plus a cleanup rm instead of bare `-i 'script'` (which BSD
+# sed misparses: it treats the script as the backup extension and the target
+# file as the script itself).
+sedi() { sed -i.bak -e "$1" "$2" && rm -f "$2.bak"; }
+
+sedi 's|#include <utmp.h>|#include "../../b1nix_compat.h"|' "$INIT_SRC"
+sedi 's|#include "wtmp.h"||' "$INIT_SRC"
+sedi '/#if defined(__linux__)/,/#endif/c\
+/* b1nix: use CLOCK_BOOTTIME from compat */' "$INIT_SRC"
 
 # shared/misc.c: add compat header, remove sys/sysinfo.h
 MISC_SRC="$SRC_DIR/src/shared/misc.c"
-sed -i '1i #include "../../b1nix_compat.h"' "$MISC_SRC"
-sed -i 's|#include <sys/sysinfo.h>|/* b1nix: no sysinfo.h */|' "$MISC_SRC"
+sedi '1i\
+#include "../../b1nix_compat.h"' "$MISC_SRC"
+sedi 's|#include <sys/sysinfo.h>|/* b1nix: no sysinfo.h */|' "$MISC_SRC"
 
 # openrc-run.c: no pty.h
-sed -i 's|#include <pty.h>|/* b1nix: no pty.h */|' "$SRC_DIR/src/openrc-run/openrc-run.c"
+sedi 's|#include <pty.h>|/* b1nix: no pty.h */|' "$SRC_DIR/src/openrc-run/openrc-run.c"
 
 # start-stop-daemon / supervise-daemon: stub ioprio + no capability
 for f in "$SRC_DIR/src/start-stop-daemon/start-stop-daemon.c" \
          "$SRC_DIR/src/supervise-daemon/supervise-daemon.c"; do
-    sed -i 's|return syscall(SYS_ioprio_set.*|return 0;|' "$f"
+    sedi 's|return syscall(SYS_ioprio_set.*|return 0;|' "$f"
 done
 
 # librc/librc.c: no kvm
-sed -i 's|#include <kvm.h>|/* b1nix: no kvm */|' "$SRC_DIR/src/librc/librc.c"
+sedi 's|#include <kvm.h>|/* b1nix: no kvm */|' "$SRC_DIR/src/librc/librc.c"
 
 echo "Patches applied."
 
@@ -222,7 +281,7 @@ for src in "$SRC_DIR"/src/libeinfo/*.c; do
     cc_file "$src" "$obj" "-I$SRC_DIR/src -I$SRC_DIR/src/shared" || continue
     EINFO_OBJS="$EINFO_OBJS $obj"
 done
-llvm-ar rcs "$LIB_DIR/libeinfo.a" $EINFO_OBJS
+$AR rcs "$LIB_DIR/libeinfo.a" $EINFO_OBJS
 echo "  -> libeinfo.a"
 
 # ═══════════════════════════════════════════════════════════════════
@@ -251,7 +310,7 @@ for src in "$SRC_DIR"/src/librc/librc.c \
     cc_file "$src" "$obj" "-I$SRC_DIR/src -I$SRC_DIR/src/shared -I$SRC_DIR/src/librc -I$OBJ_DIR -D_RC_PATH=\"/etc/rc\",\"/etc\",\"/libexec/openrc/rc\"" || continue
     LIBRC_OBJS="$LIBRC_OBJS $obj"
 done
-llvm-ar rcs "$LIB_DIR/librc.a" $LIBRC_OBJS
+$AR rcs "$LIB_DIR/librc.a" $LIBRC_OBJS
 echo "  -> librc.a"
 
 # Generate version.h
@@ -280,7 +339,7 @@ for src in "$SRC_DIR/src/shared/misc.c" \
     cc_file "$src" "$obj" || continue
     SHARED_OBJS="$SHARED_OBJS $obj"
 done
-llvm-ar rcs "$LIB_DIR/libshared.a" $SHARED_OBJS
+$AR rcs "$LIB_DIR/libshared.a" $SHARED_OBJS
 echo "  -> libshared.a"
 
 # ═══════════════════════════════════════════════════════════════════
@@ -381,7 +440,7 @@ for variant in service_starting service_started service_stopping service_stopped
                service_started_daemon service_crashed; do
     echo -n "  $variant ... "
     SV_OBJ="$OBJ_DIR/${variant}.o"
-    cc_file "$SRC_DIR/src/service/service.c" "$SV_OBJ" "-D${variant^^}" 2>/dev/null && \
+    cc_file "$SRC_DIR/src/service/service.c" "$SV_OBJ" "-D$(echo "$variant" | tr a-z A-Z)" 2>/dev/null && \
     link_bin "$BIN_DIR/$variant" "$SV_OBJ" \
         "$LIB_DIR/libshared.a" "$LIB_DIR/librc.a" "$LIB_DIR/libeinfo.a" 2>/dev/null && \
         echo "ok" && OK_COUNT=$((OK_COUNT+1)) || { echo "FAIL"; FAIL_COUNT=$((FAIL_COUNT+1)); }
@@ -393,7 +452,7 @@ for variant in mark_service_starting mark_service_started mark_service_stopping 
                mark_service_failed mark_service_crashed; do
     echo -n "  $variant ... "
     MS_OBJ="$OBJ_DIR/${variant}.o"
-    cc_file "$SRC_DIR/src/mark_service/mark_service.c" "$MS_OBJ" "-D${variant^^}" 2>/dev/null && \
+    cc_file "$SRC_DIR/src/mark_service/mark_service.c" "$MS_OBJ" "-D$(echo "$variant" | tr a-z A-Z)" 2>/dev/null && \
     link_bin "$BIN_DIR/$variant" "$MS_OBJ" \
         "$LIB_DIR/libshared.a" "$LIB_DIR/librc.a" "$LIB_DIR/libeinfo.a" 2>/dev/null && \
         echo "ok" && OK_COUNT=$((OK_COUNT+1)) || { echo "FAIL"; FAIL_COUNT=$((FAIL_COUNT+1)); }
@@ -403,7 +462,7 @@ done
 for variant in service_get_value service_set_value service_export get_options save_options; do
     echo -n "  $variant ... "
     VL_OBJ="$OBJ_DIR/${variant}.o"
-    cc_file "$SRC_DIR/src/value/value.c" "$VL_OBJ" "-D${variant^^}" 2>/dev/null && \
+    cc_file "$SRC_DIR/src/value/value.c" "$VL_OBJ" "-D$(echo "$variant" | tr a-z A-Z)" 2>/dev/null && \
     link_bin "$BIN_DIR/$variant" "$VL_OBJ" \
         "$LIB_DIR/libshared.a" "$LIB_DIR/librc.a" "$LIB_DIR/libeinfo.a" 2>/dev/null && \
         echo "ok" && OK_COUNT=$((OK_COUNT+1)) || { echo "FAIL"; FAIL_COUNT=$((FAIL_COUNT+1)); }

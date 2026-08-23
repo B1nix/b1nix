@@ -33,6 +33,40 @@ set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 ARCH="${ARCH:-${B1NIX_ARCH:-x86_64}}"
+
+# The dependency closure reads DT_NEEDED out of the installed ELFs, and it does
+# that with readelf — which is not a given. macOS ships none, only LLVM's, and
+# every invocation here sends stderr to /dev/null: a missing readelf therefore
+# did not fail, it silently reported that nothing depends on anything. curl was
+# installed without libssl, libcrypto, libcares, libnghttp2, libidn2 or libpsl
+# and the guest could not start it. Pick whichever exists, and say so if none
+# does rather than quietly shipping a broken closure.
+READELF="$(command -v readelf || command -v llvm-readelf || command -v eu-readelf || true)"
+if [ -z "$READELF" ]; then
+	echo "alpine-fetch: no readelf (tried readelf, llvm-readelf, eu-readelf);" >&2
+	echo "  the shared-library dependency closure cannot run without one." >&2
+	exit 1
+fi
+
+# `cp -a --remove-destination` is GNU coreutils; BSD cp (macOS, where this tree
+# is also built) has no --remove-destination and fails the whole install with
+# "illegal option". Use GNU cp when it is installed, and otherwise unlink the
+# destination first, which is what the flag is for here — a name already in the
+# prefix may be a symlink that plain cp would try to write through.
+if command -v gcp >/dev/null 2>&1 && gcp --version 2>/dev/null | grep -q coreutils; then
+	pkg_cp() { gcp -a --remove-destination "$1" "$2"; }
+elif cp --version 2>/dev/null | grep -q coreutils; then
+	pkg_cp() { cp -a --remove-destination "$1" "$2"; }
+else
+	pkg_cp() {
+		# "$1/." means "the contents of $1"; only a plain file destination can
+		# be unlinked ahead of the copy.
+		case "$1" in
+		*/.) cp -R -p "$1" "$2" ;;
+		*)   rm -f "$2"; cp -R -p "$1" "$2" ;;
+		esac
+	}
+fi
 ALPINE_RELEASE="${ALPINE_RELEASE:-v3.20}"
 ALPINE_REPO="${ALPINE_REPO:-main}"
 ALPINE_MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
@@ -306,9 +340,32 @@ install_one() {
 	#
 	tmp="$CACHE/.x-$name"
 	rm -rf "$tmp"; mkdir -p "$tmp"
+	#
+	# A case-insensitive filesystem (macOS default) cannot hold two of a
+	# package's paths that differ only in case, and tar then fails the whole
+	# extraction. ncurses-terminfo is the one package in this set that has any
+	# — 25 of them, for terminals like p12/p14 and hp2621a — so treat losing
+	# one of each pair as acceptable rather than losing the package, and say so
+	# once. On a case-sensitive filesystem nothing collides and this is dead
+	# code: the retry is only reached if the first extraction failed.
+	#
 	tar -xzf "$apk" -C "$tmp" 2>/dev/null || {
-		echo "alpine-fetch: cannot unpack $apk" >&2
-		exit 1
+		rm -rf "$tmp"; mkdir -p "$tmp"
+		if tar -xzf "$apk" -C "$tmp" 2>/dev/null -k; then
+			echo "alpine-fetch: $name: kept the first of each name that differs only in case" >&2
+		else
+			# -k stops at the first clash on some tars; accept a partial
+			# extraction only when the clash is what caused it, i.e. the
+			# archive holds names that collide case-insensitively.
+			if tar -tzf "$apk" 2>/dev/null | grep -v '/$' |
+			   awk '{ l = tolower($0); if (seen[l]++) found = 1 } END { exit !found }'; then
+				tar -xzf "$apk" -C "$tmp" 2>/dev/null || true
+				echo "alpine-fetch: $name: names differing only in case; this filesystem keeps one of each" >&2
+			else
+				echo "alpine-fetch: cannot unpack $apk" >&2
+				exit 1
+			fi
+		fi
 	}
 	rm -f "$tmp/.PKGINFO" "$tmp/.SIGN."* "$tmp/.pre-install" \
 	      "$tmp/.post-install" "$tmp/.pre-upgrade" "$tmp/.post-upgrade" \
@@ -340,8 +397,8 @@ install_one() {
 		# already goes.
 		#
 		(cd "$tmp" && find . -type d -exec mkdir -p "$PREFIX/{}" \;)
-		(cd "$tmp" && find . ! -type d -exec cp -a --remove-destination \
-			"{}" "$PREFIX/{}" \;)
+		(cd "$tmp" && find . ! -type d -exec sh -c \
+			'rm -f "$2/$1"; cp -R -p "$1" "$2/$1"' _ "{}" "$PREFIX" \;)
 		(cd "$tmp" && find . ! -type d) | sed "s|^\.|$PREFIX|" >> "$INSTALLED"
 		rm -rf "$tmp"
 		echo "$name" >> "$PKGS_SEEN"
@@ -350,7 +407,7 @@ install_one() {
 	fi
 
 	mkdir -p "$PREFIX/include" "$PREFIX/lib"
-	[ -d "$tmp/usr/include" ] && cp -a --remove-destination "$tmp/usr/include/." "$PREFIX/include/"
+	[ -d "$tmp/usr/include" ] && pkg_cp "$tmp/usr/include/." "$PREFIX/include/"
 	#
 	# usr/lib first, lib second, so real files win.
 	#
@@ -363,12 +420,12 @@ install_one() {
 	# --remove-destination, because a name already there may be a symlink into a
 	# directory this flattening removed: plain cp would try to write through it
 	# and refuse.
-	[ -d "$tmp/usr/lib" ] && cp -a --remove-destination "$tmp/usr/lib/." "$PREFIX/lib/"
-	[ -d "$tmp/lib" ] && cp -a --remove-destination "$tmp/lib/." "$PREFIX/lib/"
-	[ -d "$tmp/usr/sbin" ] && { mkdir -p "$PREFIX/sbin"; cp -a --remove-destination "$tmp/usr/sbin/." "$PREFIX/sbin/"; }
-	[ -d "$tmp/sbin" ] && { mkdir -p "$PREFIX/sbin"; cp -a --remove-destination "$tmp/sbin/." "$PREFIX/sbin/"; }
-	[ -d "$tmp/usr/bin" ] && { mkdir -p "$PREFIX/bin"; cp -a --remove-destination "$tmp/usr/bin/." "$PREFIX/bin/"; }
-	[ -d "$tmp/bin" ] && { mkdir -p "$PREFIX/bin"; cp -a --remove-destination "$tmp/bin/." "$PREFIX/bin/"; }
+	[ -d "$tmp/usr/lib" ] && pkg_cp "$tmp/usr/lib/." "$PREFIX/lib/"
+	[ -d "$tmp/lib" ] && pkg_cp "$tmp/lib/." "$PREFIX/lib/"
+	[ -d "$tmp/usr/sbin" ] && { mkdir -p "$PREFIX/sbin"; pkg_cp "$tmp/usr/sbin/." "$PREFIX/sbin/"; }
+	[ -d "$tmp/sbin" ] && { mkdir -p "$PREFIX/sbin"; pkg_cp "$tmp/sbin/." "$PREFIX/sbin/"; }
+	[ -d "$tmp/usr/bin" ] && { mkdir -p "$PREFIX/bin"; pkg_cp "$tmp/usr/bin/." "$PREFIX/bin/"; }
+	[ -d "$tmp/bin" ] && { mkdir -p "$PREFIX/bin"; pkg_cp "$tmp/bin/." "$PREFIX/bin/"; }
 	find "$PREFIX" -type f -o -type l 2>/dev/null >> "$INSTALLED"
 	rm -rf "$tmp"
 
@@ -523,11 +580,11 @@ while [ "$round" -lt 16 ]; do
 		case "$so" in
 		*.so|*.so.*) ;;
 		*)
-			readelf -hW "$so" 2>/dev/null |
+			"$READELF" -hW "$so" 2>/dev/null |
 				grep -qE 'Type:[[:space:]]+(EXEC|DYN)' || continue
 			;;
 		esac
-		for need in $(readelf -dW "$so" 2>/dev/null |
+		for need in $("$READELF" -dW "$so" 2>/dev/null |
 		              sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
 			case "$need" in libc.musl-*|ld-musl-*) continue ;; esac
 			if grep -qxF -- "$need" "$PRESENT"; then
@@ -599,7 +656,7 @@ for a in "$PREFIX"/lib/*.a; do
 	member="$(ar t "$a" 2>/dev/null | head -1)"
 	[ -n "$member" ] || continue
 	ar p "$a" "$member" > "$PREFIX/.member.o" 2>/dev/null || continue
-	if readelf -sW "$PREFIX/.member.o" 2>/dev/null | grep -q "__gnu_lto_slim"; then
+	if "$READELF" -sW "$PREFIX/.member.o" 2>/dev/null | grep -q "__gnu_lto_slim"; then
 		rm -f "$a"
 		echo "alpine-fetch: $(basename "$a") is a slim-LTO archive with no code; dropped, use the shared library" >&2
 	fi

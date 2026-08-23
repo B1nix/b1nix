@@ -16,6 +16,12 @@
 #include <sys/soundcard.h>
 #include <unistd.h>
 
+#ifndef VOLUME_PACK
+#define VOLUME_LEFT(v)  ((v) & 0xFF)
+#define VOLUME_RIGHT(v) (((v) >> 8) & 0xFF)
+#define VOLUME_PACK(l, r) ((((r) & 0xFF) << 8) | ((l) & 0xFF))
+#endif
+
 static void marker(const char *text) {
 	write(1, text, strlen(text));
 }
@@ -84,7 +90,12 @@ int main(int argc, char **argv) {
 
 	/* Play a short 440 Hz tone through the AC'97 PCM-out DMA engine. */
 	{
-		static char buf[9600]; /* 100 ms of 48 kHz stereo 16-bit */
+		/* 100 ms of 48 kHz stereo 16-bit: 4800 frames, and a frame is two
+		 * channels of two bytes. The buffer was half that and the loop below
+		 * wrote every one of the 4800 frames into it, which put 9600 bytes
+		 * past its end - onto the first page of the heap, which on aarch64 is
+		 * not mapped until something asks for it. */
+		static char buf[19200];
 		int n = 4800;
 		for (int i = 0; i < n; i++) {
 			int period = 48000 / 440;

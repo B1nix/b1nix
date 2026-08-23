@@ -43,10 +43,10 @@ if [ -d "$PROJECT_DIR/userspace/include" ]; then
         mkdir -p "$_dir/sys"
         for _tree in linux asm asm-generic b1nix; do
             [ -d "$PROJECT_DIR/userspace/include/$_tree" ] &&
-                cp -Rn "$PROJECT_DIR/userspace/include/$_tree" "$_dir/" 2>/dev/null
+                cp -Rn "$PROJECT_DIR/userspace/include/$_tree" "$_dir/" 2>/dev/null || true
         done
         [ -f "$PROJECT_DIR/userspace/include/sys/cdefs.h" ] &&
-            cp -n "$PROJECT_DIR/userspace/include/sys/cdefs.h" "$_dir/sys/" 2>/dev/null
+            cp -n "$PROJECT_DIR/userspace/include/sys/cdefs.h" "$_dir/sys/" 2>/dev/null || true
     done
 fi
 

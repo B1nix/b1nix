@@ -30,7 +30,7 @@ CONFIG_FRAGMENT="$PROJECT_DIR/tools/configs/busybox-${BUSYBOX_VER}.config"
 INSTALL_DIR="${BUSYBOX_INSTALL_DIR:-$SYSROOT/opt/busybox/bin}"
 
 # ── musl paths ──
-MUSL_INSTALL="$PROJECT_DIR/build/x86_64/ports/musl/install"
+MUSL_INSTALL="$PROJECT_DIR/build/$B1NIX_ARCH/ports/musl/install"
 MUSL_INCLUDE="$MUSL_INSTALL/include"
 MUSL_LIB="$MUSL_INSTALL/lib"
 
@@ -45,15 +45,15 @@ export PATH="$CROSS_PREFIX/bin:$PATH"
 
 # ── 0. Install musl headers into sysroot ──
 # With musl we don't build the b1nix native libc — just stage musl headers.
-MUSL_INSTALL_HDR="$PROJECT_DIR/build/x86_64/ports/musl/install"
+MUSL_INSTALL_HDR="$PROJECT_DIR/build/$B1NIX_ARCH/ports/musl/install"
 if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
   (
-    flock -x 9
+    if command -v flock >/dev/null 2>&1; then flock -x 9 2>/dev/null || true; fi
     mkdir -p "$SYSROOT/include" "$SYSROOT/lib" "$SYSROOT/usr"
     cp -r "$MUSL_INSTALL_HDR/include/"* "$SYSROOT/include/" 2>/dev/null || true
     ln -sfn ../include "$SYSROOT/usr/include"
     ln -sfn ../lib "$SYSROOT/usr/lib"
-  ) 9>/tmp/b1nix-userspace-headers.lock
+  ) 9>"$PROJECT_DIR/build/tmp/b1nix-userspace-headers.lock"
 fi
 
 # Workaround for spaces in path (e.g. "Documents/GitHub"): build tools like
@@ -129,8 +129,14 @@ echo "Building BusyBox (musl)..."
 # -include sys/sysinfo.h: busybox's libbb.h needs struct sysinfo.
 # -Wno-error flags: match GCC baseline leniency for upstream code.
 MUSL_CC="$PROJECT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc"
-export EXTRA_CFLAGS="-fcommon -isystem $MUSL_INCLUDE -isystem $SYSROOT/include -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -D_GNU_SOURCE"
-export EXTRA_LDFLAGS="-rtlib=compiler-rt -unwindlib=libunwind -L$MUSL_LIB -fuse-ld=lld -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 -lc"
+# -fPIC: every rootfs binary must be a dynamic PIE (project rule — see
+# "Dynamic Linking Is Mandatory" in CLAUDE.md). Without it aarch64's default
+# (non-PIC) codegen emits R_AARCH64_ABS64 relocations against local symbols,
+# which ld.lld rejects outright at the final PIE link ("recompile with
+# -fPIC"). x86_64 tolerates the omission (its absolute relocations still
+# link), which is why this was never hit building busybox for that arch.
+export EXTRA_CFLAGS="-fcommon -fPIC -isystem $MUSL_INCLUDE -isystem $SYSROOT/include -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -D_GNU_SOURCE"
+export EXTRA_LDFLAGS="-rtlib=compiler-rt -unwindlib=libunwind -L$MUSL_LIB -fuse-ld=lld -Wl,-dynamic-linker,/lib/ld-musl-$B1NIX_ARCH.so.1 -lc"
 # Build BusyBox as a musl PIE (ET_DYN), exactly like every other ported musl
 # binary (js, id, displayd, ...). The kernel relocates a PIE to the high ASLR
 # base (aslr_pie_base, ~0x500000000000), which the userspace ld.so relocates
@@ -160,7 +166,7 @@ export CC="$CCACHE $MUSL_CC"
 
 make -C "$BUILD_DIR" -j"$NPROC" \
     HOSTCC="$HOST_CC" HOSTCXX="$HOST_CXX" HOSTLD="$HOST_LD" \
-    CC="$CC" AR="$TARGET_AR" RANLIB="$TARGET_RANLIB" STRIP="$TARGET_STRIP"
+    CC="$CC" AR="$TARGET_AR" RANLIB="$TARGET_RANLIB" STRIP="$TARGET_STRIP" < /dev/null
 
 # ── 4. Install ──────────────────────────────────────────────────────────────
 echo "Installing standalone BusyBox package..."

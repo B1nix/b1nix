@@ -849,6 +849,67 @@ static void test_kill_unblocked(void) {
   check("kill-unblocked", handled == (int)tid, (long)handled);
 }
 
+/* A signal HANDLER must also run in a task that is making no syscalls at all.
+ * Every other check here signals a target inside a syscall or about to enter
+ * one, so they pass on a kernel whose only delivery points are the syscall and
+ * fault paths. That was exactly aarch64: its IRQ handler took no register
+ * frame and never looked at pending signals, while x86_64 delivers from its
+ * timer vector. Default-action *termination* hides the gap, because the
+ * scheduler kills such a task itself on the next switch without needing a user
+ * frame — running a handler is the part that cannot be faked, since it has to
+ * rewrite the interrupted userspace context.
+ *
+ * The child's loop is finite on purpose: a kernel that never delivers must fail
+ * this check, not hang the instance. */
+static volatile sig_atomic_t g_compute_hit;
+
+static void compute_loop_handler(int sig) {
+  (void)sig;
+  g_compute_hit = 1;
+  _exit(7); /* the handler ran — report it through the exit status */
+}
+
+static void test_signal_compute_loop(void) {
+  pid_t pid = fork();
+  if (pid < 0) {
+    fail("signal-compute-loop-fork", -1);
+    return;
+  }
+  if (pid == 0) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = compute_loop_handler;
+    sigaction(SIGUSR1, &sa, 0);
+    /* No syscalls past this point, deliberately. */
+    volatile unsigned long acc = 1;
+    for (unsigned long i = 0; i < 4000000000UL; i++)
+      acc = acc * 1103515245UL + 12345UL;
+    _exit(g_compute_hit ? 7 : 0); /* 0 = the handler never ran */
+  }
+
+  usleep(100000); /* let the child leave fork bookkeeping for the loop */
+  if (kill(pid, SIGUSR1) != 0) {
+    fail("signal-compute-loop-kill", -1);
+    kill(pid, SIGKILL);
+    { int s = 0; waitpid(pid, &s, 0); }
+    return;
+  }
+
+  int status = 0;
+  for (int i = 0; i < 600; i++) { /* up to ~60 s; a working kernel takes one tick */
+    if (waitpid(pid, &status, WNOHANG) == pid) {
+      check("signal-compute-loop", WIFEXITED(status) && WEXITSTATUS(status) == 7,
+            WIFEXITED(status) ? (long)WEXITSTATUS(status)
+                              : -(long)WTERMSIG(status));
+      return;
+    }
+    usleep(100000);
+  }
+  kill(pid, SIGKILL);
+  { int s = 0; waitpid(pid, &s, 0); }
+  fail("signal-compute-loop", -2);
+}
+
 /* ── 4: pthread_exit ────────────────────────────────────────────────────── */
 
 static volatile int g_cleanup_ran;
@@ -963,6 +1024,7 @@ int main(void) {
   test_tkill_self();
   test_tgkill_thread();
   test_kill_unblocked();
+  test_signal_compute_loop();
 
   test_pthread_exit_retval();
   test_pthread_exit_main();

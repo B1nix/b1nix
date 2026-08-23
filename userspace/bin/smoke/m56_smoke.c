@@ -157,19 +157,33 @@ static int test_signalfd(void) {
     return ok;
 }
 
+/* Names the step that failed — a bare "FAIL seal" says nothing about which of
+ * the six syscalls in the sequence broke, which is exactly what you need when
+ * the test starts failing on a new arch. */
+static const char *g_seal_stage = "?";
+static int g_seal_errno = 0;
+static int g_seal_fd = -1;
+
 static int test_seal(void) {
+    g_seal_stage = "memfd_create";
     int fd = memfd_create("m56seal", MFD_ALLOW_SEALING);
     if (fd < 0)
         return 0;
 
     /* Grow it and write some bytes first (sealing is added afterward). */
-    if (ftruncate(fd, 64) != 0) { close(fd); return 0; }
+    g_seal_stage = "ftruncate";
+    g_seal_fd = fd;
+    if (ftruncate(fd, 64) != 0) { g_seal_errno = errno; close(fd); return 0; }
     char buf[8] = "hello";
+    g_seal_stage = "write";
     if (write(fd, buf, 5) != 5) { close(fd); return 0; }
 
     /* Seal against writes; a subsequent write must fail with EPERM. */
+    g_seal_stage = "add-seals";
     if (fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE) != 0) { close(fd); return 0; }
+    g_seal_stage = "get-seals";
     if (fcntl(fd, F_GET_SEALS, 0) != F_SEAL_WRITE) { close(fd); return 0; }
+    g_seal_stage = "sealed-write";
     lseek(fd, 0, SEEK_SET);
     ssize_t w = write(fd, buf, 5);
     int ok = (w < 0 && errno == EPERM);
@@ -242,8 +256,14 @@ int main(int argc, char **argv) {
     if (test_signalfd()) marker("M56-SMOKE: ok signalfd\n");
     else                 marker("M56-SMOKE: FAIL signalfd\n");
 
-    if (test_seal())     marker("M56-SMOKE: ok seal\n");
-    else                 marker("M56-SMOKE: FAIL seal\n");
+    if (test_seal()) {
+        marker("M56-SMOKE: ok seal\n");
+    } else {
+        char why[96];
+        snprintf(why, sizeof(why), "M56-SMOKE: FAIL seal at %s (fd=%d errno=%d)\n",
+                 g_seal_stage, g_seal_fd, g_seal_errno);
+        marker(why);
+    }
 
     marker("M56-SMOKE: done\n");
     return 0;

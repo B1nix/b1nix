@@ -89,7 +89,11 @@ LLD_PATH="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/ld.
 # ToolChain's link-arg synthesis. build-musl.sh already works around this by
 # compiling with an explicit x86_64-unknown-linux-gnu target instead of
 # $B1NIX_TRIPLET — do the same here for anything that links.
-CLANG_TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+if [ "${B1NIX_ARCH:-x86_64}" = "aarch64" ]; then
+    CLANG_TARGET_TRIPLE="aarch64-unknown-linux-gnu"
+else
+    CLANG_TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+fi
 
 # Common CMake flags for cross-compiling to b1nix
 COMMON_CMAKE_ARGS=(

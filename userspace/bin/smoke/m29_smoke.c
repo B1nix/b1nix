@@ -19,7 +19,17 @@
 #include <sys/syscall.h>
 #define SYS_YIELD __NR_sched_yield
 #define SYS_GETTID __NR_gettid
+#define SYS_WAITPID __NR_wait4
+#if defined(__x86_64__)
 #define SYS_SET_TLS_VIA_ARCH_PRCTL
+#endif
+#ifndef SYS_SET_TLS
+#ifdef __NR_set_tls
+#define SYS_SET_TLS __NR_set_tls
+#else
+#define SYS_SET_TLS 108
+#endif
+#endif
 #endif
 #include <utmp.h>
 #include <locale.h>
@@ -263,7 +273,7 @@ static int test_thread_local(void) {
 static int test_tls(void) {
   long val = 0xCAFE;
   long readback = 0;
-#ifdef SYS_SET_TLS_VIA_ARCH_PRCTL
+#if defined(SYS_SET_TLS_VIA_ARCH_PRCTL) && defined(__NR_arch_prctl)
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003
   /* musl uses %fs as its thread pointer, so temporarily pointing it at our
@@ -279,13 +289,31 @@ static int test_tls(void) {
     __asm__ volatile("movq %%fs:0, %0" : "=r"(readback));
   syscall(__NR_arch_prctl, ARCH_SET_FS, saved_fs);
   if (rc != 0) { fail("tls-set"); return -1; }
+#elif defined(__aarch64__)
+  /* aarch64 has no set_tls syscall (and this binary runs with the Linux
+   * personality, so b1nix's own SYS_SET_TLS number is not reachable): the
+   * thread pointer is the writable EL0 register TPIDR_EL0, exactly as musl's
+   * __set_thread_area sets it. Point it at our scratch var, force a trip
+   * through the kernel (sched_yield, asm-generic nr 124) so the round-trip
+   * really proves the scheduler saves and restores TPIDR_EL0, then restore
+   * the real TP before touching libc again. */
+  unsigned long saved_tp = 0;
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(saved_tp));
+  __asm__ volatile("msr tpidr_el0, %0" :: "r"(&val));
+  register long x8 __asm__("x8") = 124;
+  __asm__ volatile("svc #0" :: "r"(x8) : "x0", "memory");
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(readback));
+  readback = *(long *)readback;
+  __asm__ volatile("msr tpidr_el0, %0" :: "r"(saved_tp));
 #else
   long rc = syscall(SYS_SET_TLS, &val);
   if (rc != 0) { fail("tls-set"); return -1; }
 #ifdef __x86_64__
   __asm__ volatile("movq %%fs:0, %0" : "=r"(readback));
-#else
+#elif defined(__i386__)
   __asm__ volatile("movl %%gs:0, %0" : "=r"(readback));
+#elif defined(__aarch64__)
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(readback));
 #endif
 #endif
   if (readback != 0xCAFE) { fail("tls-read"); return -1; }
@@ -555,6 +583,15 @@ static int test_time_hammer(void) {
   struct timespec mono, prev_mono = {0, 0};
   const int ITERS = 300000;
   for (int i = 0; i < ITERS; i++) {
+    /* 300k iterations x 2 syscalls with no output at all, which the harness
+     * watchdog cannot tell from a hang: it kills an instance after 120s of
+     * SILENCE, not after 120s of work. On a loaded host this loop crosses that
+     * threshold and the whole lane is reported wedged — which is where this
+     * suite's run-to-run variance was coming from. Emit a heartbeat instead of
+     * shortening the test; the work is unchanged. */
+    if (i && (i % 50000) == 0)
+      printf("M29-PTHREAD: time-hammer %d/%d\n", i, ITERS), fflush(stdout);
+
     if (gettimeofday(&tv, NULL) != 0) { fail("time-gettimeofday"); return -1; }
     if (tv.tv_usec < 0 || tv.tv_usec >= 1000000) { fail("time-usec-range"); return -1; }
     if (tv.tv_sec < prev_tv.tv_sec) { fail("time-wall-backwards"); return -1; }

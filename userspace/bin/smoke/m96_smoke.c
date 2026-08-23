@@ -274,7 +274,9 @@ static void t_param_write(void) {
 }
 
 static void t_param_readonly(void) {
-  const char *p = "/sys/module/hda/parameters/hda_sample_rate";
+  /* ipv6's RFC-fixed minimum MTU: a 0444 parameter in a module every arch
+   * ships (hda is an Intel HD Audio PCI driver, absent on aarch64). */
+  const char *p = "/sys/module/ipv6/parameters/ipv6_min_mtu";
   char before[64];
   if (read_first_line(p, before, sizeof(before)) != 0) {
     fail("param-readonly", "read-only parameter is not readable");
@@ -283,7 +285,7 @@ static void t_param_readonly(void) {
   errno = 0;
   int fd = open(p, O_WRONLY);
   if (fd >= 0) {
-    ssize_t n = write(fd, "8000\n", 5);
+    ssize_t n = write(fd, "9000\n", 5);
     int saved = errno;
     close(fd);
     if (n >= 0) {

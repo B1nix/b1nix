@@ -6,9 +6,9 @@
 # Source it (it is not executable) AFTER defining PROJECT_DIR (or ROOT_DIR).
 # It reads B1NIX_ARCH (default x86_64) and exports:
 #
-#   B1NIX_ARCH           normalized arch key        x86 | x86_64
-#   B1NIX_TRIPLET        cross/native host triplet  i686-b1nix | x86_64-b1nix
-#   B1NIX_GCC_ARCH       i386-family gcc arch       i686 | x86_64
+#   B1NIX_ARCH           normalized arch key        x86_64 | aarch64
+#   B1NIX_TRIPLET        cross/native host triplet  x86_64-b1nix | aarch64-b1nix
+#   B1NIX_GCC_ARCH       gcc arch name              x86_64 | aarch64
 #   B1NIX_ROOTFS         per-arch sysroot           $PROJECT_DIR/build/<arch>/rootfs
 #   TOOLCHAIN_BUILD_ROOT shared build parent        .../build/<arch>/toolchain (or $HOME/b1nix-toolchain)
 #   TOOLCHAIN_DIST_DIR   shared tarball cache        $TOOLCHAIN_BUILD_ROOT/dist
@@ -35,23 +35,32 @@ fi
 
 B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
 case "$B1NIX_ARCH" in
-    x86)
-        B1NIX_TRIPLET="i686-b1nix"
-        B1NIX_GCC_ARCH="i686"
-        B1NIX_TARGET_ARCH="i686"
-        ;;
     x86_64)
         B1NIX_TRIPLET="x86_64-b1nix"
         B1NIX_GCC_ARCH="x86_64"
         B1NIX_TARGET_ARCH="x86_64"
         ;;
+    aarch64)
+        B1NIX_TRIPLET="aarch64-b1nix"
+        B1NIX_GCC_ARCH="aarch64"
+        B1NIX_TARGET_ARCH="aarch64"
+        ;;
     *)
-        echo "tools/toolchain/env.sh: unsupported B1NIX_ARCH='$B1NIX_ARCH' (use x86 or x86_64)" >&2
+        echo "tools/toolchain/env.sh: unsupported B1NIX_ARCH='$B1NIX_ARCH' (use x86_64 or aarch64)" >&2
         exit 1
         ;;
 esac
 
 B1NIX_ROOTFS="$PROJECT_DIR/build/$B1NIX_ARCH/rootfs"
+
+# Port builds run through the compiler *wrappers* in tools/toolchain/bin, which
+# append --target from B1NIX_ARCH. ccache never sees that flag — the command
+# line it hashes is identical for every arch — so an x86_64 object was served
+# straight back for the same source in an aarch64 build (mbedTLS shipped
+# elf64-x86-64 members inside build/aarch64/.../libmbedtls.a). Give each arch
+# its own ccache namespace so the key includes the arch.
+CCACHE_NAMESPACE="b1nix-$B1NIX_ARCH"
+export CCACHE_NAMESPACE
 
 # GNU make's $(CURDIR) and libtool resolve all symlinks to the real path. On
 # WSL the Windows-side filesystem (/mnt/c/...) can have spaces in usernames,

@@ -27,22 +27,18 @@ fi
 USR="$PROJECT_DIR/userspace"
 INCLUDE="$USR/include"
 B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
-if [ "$B1NIX_ARCH" = "x86" ]; then
-	TARGET="i686-unknown-elf"
-	LD_EMULATION="elf_i386"
-	ARCH_FLAGS="-fomit-frame-pointer"
+if [ "$B1NIX_ARCH" = "aarch64" ]; then
+	TARGET="aarch64-unknown-elf"
+	LD_EMULATION="aarch64elf"
+	ARCH_FLAGS=""
 else
 	TARGET="x86_64-unknown-elf"
 	LD_EMULATION="elf_x86_64"
 	ARCH_FLAGS=""
 fi
 
-if [ "$B1NIX_ARCH" = "x86" ]; then
-	TRIPLET="i686-b1nix"
-else
 	TRIPLET="x86_64-b1nix"
-fi
-MUSL_INCLUDE="$PROJECT_DIR/build/x86_64/ports/musl/install/include"
+MUSL_INCLUDE="$PROJECT_DIR/build/$B1NIX_ARCH/ports/musl/install/include"
 
 # Intercept GCC-specific query flags
 for arg in "$@"; do
@@ -107,7 +103,7 @@ for _a in "$@"; do
 		r_args=()
 		for _rarg in "$@"; do
 			case "$_rarg" in
-			-rtlib=*|-unwindlib=*|-static-libgcc) continue ;;
+			-rtlib=*|-unwindlib=*|-static-libgcc|-fuse-ld=*) continue ;;
 			esac
 			r_args+=("$_rarg")
 		done
@@ -176,7 +172,19 @@ fi
 if [ -n "$RES_INC" ]; then
   cflags+=($RES_INC)
 fi
-cflags+=("-Wall" "-Wextra" "-O2" "-msoft-float" "-mno-implicit-float" "-Db1nix" "-D__b1nix__" "-D__unix__" "-D__STDC_NO_ATOMICS__")
+if [ "$B1NIX_ARCH" = "aarch64" ]; then
+  # -mgeneral-regs-only belongs to the KERNEL's build (no FP/SIMD in kernel
+  # context — see the top-level Makefile's ARCH_CFLAGS) and must not leak
+  # into userspace port builds through this autotools wrapper: it disables
+  # the FP registers entirely, so any use of `double` (busybox's printf/seq,
+  # anything calling strtod) fails to compile ("ABI 'aapcs' does not support
+  # it") even though userspace ELFs run in an environment that fully permits
+  # floating point — kernel/dev/virtio_blk_mmio.c and every other userspace
+  # binary built via tools/b1nix-musl-cc never carried this flag.
+  cflags+=("-Wall" "-Wextra" "-O2" "-Db1nix" "-D__b1nix__" "-D__unix__" "-D__STDC_NO_ATOMICS__")
+else
+  cflags+=("-Wall" "-Wextra" "-O2" "-msoft-float" "-mno-implicit-float" "-Db1nix" "-D__b1nix__" "-D__unix__" "-D__STDC_NO_ATOMICS__")
+fi
 
 C_ONLY_FLAGS=("-include" "string.h")
 
@@ -295,8 +303,8 @@ done
 # standalone libunwind build leaves incomplete — missing the register
 # save/restore assembly) is where build-libcxx.sh installs the AUTHORITATIVE
 # libunwind.a. See its "Install into cross sysroot" step.
-SYSROOT_LIB="$(ls -d "$PROJECT_DIR/build/x86_64/toolchain/sysroot/usr/lib" "$PROJECT_DIR/build/x86_64/toolchain/$TRIPLET/sysroot/usr/lib" 2>/dev/null | head -1)"
-CROSS_LIB="$(ls -d "$PROJECT_DIR/build/x86_64/toolchain/cross/$TRIPLET/lib" "$PROJECT_DIR/build/x86_64/toolchain/$TRIPLET/cross/$TRIPLET/lib" 2>/dev/null | head -1)"
+SYSROOT_LIB="$(ls -d "$PROJECT_DIR/build/$B1NIX_ARCH/toolchain/sysroot/usr/lib" "$PROJECT_DIR/build/$B1NIX_ARCH/toolchain/$TRIPLET/sysroot/usr/lib" 2>/dev/null | head -1)"
+CROSS_LIB="$(ls -d "$PROJECT_DIR/build/$B1NIX_ARCH/toolchain/cross/$TRIPLET/lib" "$PROJECT_DIR/build/$B1NIX_ARCH/toolchain/$TRIPLET/cross/$TRIPLET/lib" 2>/dev/null | head -1)"
 libdirs=()
 [ -d "$SYSROOT_LIB" ] && libdirs+=("-L" "$SYSROOT_LIB")
 [ -d "$CROSS_LIB" ] && libdirs+=("-L" "$CROSS_LIB")
@@ -332,18 +340,14 @@ if [ "$is_shared" -eq 1 ]; then
   exec "$LD" -m "$LD_EMULATION" -shared --hash-style=sysv -o "$output" \
     "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" "${runtime_libs[@]}" ${B1NIX_LD_EXTRA:-} "${cxx_shared[@]}" "$SHARED_LIBC"
 elif [ "$B1NIX_LINK" = "dynamic" ] && [ -f "$MUSL_SCRT1" ] && [ -f "$MUSL_SO" ]; then
-  # musl PIE/ET_DYN dynamic link (M92): the retired b1nix shared libc.so.1 +
-  # crt0-dynamic.o have no Makefile rule anymore, so route through musl's own
-  # Scrt1.o/libc.so instead — same DT_NEEDED-by-basename trick b1nix-musl-cc
-  # uses (a same-named symlink so the recorded NEEDED entry is the bare
-  # "ld-musl-x86_64.so.1" the kernel actually searches for in /lib).
+  MUSL_LDSONAME="ld-musl-${B1NIX_GCC_ARCH}.so.1"
   musl_link_dir="${TMPDIR:-/tmp}/b1nix-autotools-musl-link.$$"
   mkdir -p "$musl_link_dir"
-  ln -sf "$MUSL_SO" "$musl_link_dir/ld-musl-x86_64.so.1"
-  "$LD" -m "$LD_EMULATION" -pie --dynamic-linker /lib/ld-musl-x86_64.so.1 \
+  ln -sf "$MUSL_SO" "$musl_link_dir/$MUSL_LDSONAME"
+  "$LD" -m "$LD_EMULATION" -pie --dynamic-linker /lib/$MUSL_LDSONAME \
     --hash-style=sysv -o "$output" "$MUSL_SCRT1" "$MUSL_CRTI" \
     "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" "${runtime_libs[@]}" \
-    ${B1NIX_LD_EXTRA:-} -L"$musl_link_dir" -l:ld-musl-x86_64.so.1 "$MUSL_CRTN"
+    ${B1NIX_LD_EXTRA:-} -L"$musl_link_dir" -l:$MUSL_LDSONAME "$MUSL_CRTN"
   ld_status=$?
   rm -rf "$musl_link_dir"
   if [ "$ld_status" -eq 0 ]; then

@@ -31,7 +31,7 @@
 
 	.section .rodata
 msg:
-	.ascii "M40-LINUX: hello from a static linux x86_64 binary\n"
+	.ascii "M40-LINUX: hello from a static linux binary\n"
 	.set msg_len, . - msg
 okmsg:
 	.ascii "M40-LINUX: ok fstat\n"

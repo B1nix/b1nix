@@ -54,7 +54,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if defined(__aarch64__)
+/* Mirrors MODULE_REGION_BASE in kernel/include/b1nix/module.h: this port has no
+ * higher half, so modules live just above the kernel image instead. */
+#define MODULE_REGION_BASE 0x41000000ULL
+#else
 #define MODULE_REGION_BASE 0xffffffffc0000000ULL
+#endif
 
 static int failures;
 

@@ -24,7 +24,7 @@ SRC_DIR="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/llvm-project-${LLVM_VER}.src"
 INSTALL_DIR="$BUILD_HOME/libcxx-install"
 RT_BUILD="$BUILD_HOME/build-runtimes"
 
-MUSL_SYSROOT="$PROJECT_DIR/build/x86_64/ports/musl/install"
+MUSL_SYSROOT="$PROJECT_DIR/build/${B1NIX_ARCH:-x86_64}/ports/musl/install"
 
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then NPROC=$(sysctl -n hw.ncpu); else NPROC=$(nproc); fi
@@ -224,9 +224,11 @@ rewrite_needed() {
     fi
 }
 
+READELF_BIN="$(command -v readelf 2>/dev/null || command -v llvm-readelf 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-readelf)"
+
 for so in "$ABI_SO" "$CXX_SO"; do
     # Collect current DT_NEEDED entries that look like absolute paths.
-    needed_list=$("$READELF" -d "$so" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p')
+    needed_list=$("$READELF_BIN" -d "$so" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p')
     for n in $needed_list; do
         case "$n" in
             */libc.so)
@@ -242,9 +244,9 @@ done
 # Verify: no absolute-path DT_NEEDED survived (a silent miss here breaks every
 # dynamically-linked C++ binary at load time — better to fail the build).
 for so in "$ABI_SO" "$CXX_SO"; do
-    if "$READELF" -d "$so" 2>/dev/null | grep -q 'NEEDED.*\[/'; then
+    if "$READELF_BIN" -d "$so" 2>/dev/null | grep -q 'NEEDED.*\[/'; then
         echo "build-libcxx-musl.sh: ERROR — absolute-path DT_NEEDED remains in $so:" >&2
-        "$READELF" -d "$so" 2>/dev/null | grep 'NEEDED.*\[/' >&2
+        "$READELF_BIN" -d "$so" 2>/dev/null | grep 'NEEDED.*\[/' >&2
         exit 1
     fi
 done

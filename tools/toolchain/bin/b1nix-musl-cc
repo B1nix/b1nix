@@ -63,8 +63,15 @@ MUSL_CFLAGS="--target=$B1NIX_TRIPLET -ffreestanding -nostdinc -fno-builtin -fno-
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 
+if [ "$B1NIX_ARCH" = "aarch64" ]; then
+	LD_EMULATION="aarch64elf"
+else
+	LD_EMULATION="elf_x86_64"
+fi
+
 LD_BIN="${LD:-$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/lld/bin/ld.lld)}"
-BUILTINS_LIB="$(find "$CLANG_RES_DIR/lib" -name "libclang_rt.builtins-x86_64.a" 2>/dev/null | head -1 || true)"
+BUILTINS_LIB="$(find "$CLANG_RES_DIR/lib" -name "libclang_rt.builtins-${B1NIX_GCC_ARCH}.a" 2>/dev/null | head -1 || true)"
+[ -n "$BUILTINS_LIB" ] || BUILTINS_LIB="$ROOT_DIR/build/$B1NIX_ARCH/toolchain/llvm-runtimes-build/install/lib/libcompiler_rt.a"
 
 # Parse arguments
 OUTPUT=""
@@ -144,7 +151,7 @@ case "$LINK_MODE" in
     done
 
     # Link statically: musl crt1 + crti + musl libc.a + crtn
-    $LD_BIN -m elf_x86_64 -static \
+    $LD_BIN -m "$LD_EMULATION" --allow-shlib-undefined -static \
       $EXTRA_LDFLAGS \
       $MUSL_CRT1 $MUSL_CRTI \
       $TMPOBJS \
@@ -168,13 +175,13 @@ with open(f, 'r+b') as fh:
   dynamic)
     # Dynamic linking: produce a PIE/ET_DYN that imports from musl's libc.so
     # via the kernel's in-kernel eager dynamic linker.
-    MUSL_LDSONAME="ld-musl-x86_64.so.1"
+    MUSL_LDSONAME="ld-musl-${B1NIX_GCC_ARCH}.so.1"
     MUSL_SCRT1="$MUSL_LIB/Scrt1.o"
 
     # We need the .so to be in a directory where we can reference it by just
-    # the filename, so DT_NEEDED = "ld-musl-x86_64.so.1" (not the full path).
+    # the filename, so DT_NEEDED = "ld-musl-${B1NIX_GCC_ARCH}.so.1" (not the full path).
     # Use a temp directory with a symlink.
-    MUSL_LINK_DIR="/tmp/b1nix-musl-link-$$"
+    MUSL_LINK_DIR="${TMPDIR:-/tmp}/b1nix-musl-link-$$"
     mkdir -p "$MUSL_LINK_DIR"
     if [ ! -f "$MUSL_LINK_DIR/$MUSL_LDSONAME" ]; then
       # $MUSL_LIBSO, not the source build tree: that tree is deleted by a clean
@@ -199,13 +206,13 @@ with open(f, 'r+b') as fh:
 
     # Link as PIE/ET_DYN against musl's shared library.
     # -pie produces ET_DYN (required for b1nix's in-kernel dynamic linker).
-    # The .so is passed directly (not via -l) so DT_NEEDED = "ld-musl-x86_64.so.1".
-    $LD_BIN -m elf_x86_64 -pie --allow-shlib-undefined \
-      -dynamic-linker /lib/ld-musl-x86_64.so.1 \
+    # The .so is passed directly (not via -l) so DT_NEEDED = "ld-musl-${B1NIX_GCC_ARCH}.so.1".
+    $LD_BIN -m "$LD_EMULATION" --allow-shlib-undefined -pie --allow-shlib-undefined \
+      -dynamic-linker /lib/$MUSL_LDSONAME \
       $EXTRA_LDFLAGS \
       $MUSL_SCRT1 $MUSL_CRTI \
       $TMPOBJS \
-      -L"$MUSL_LINK_DIR" -l:ld-musl-x86_64.so.1 \
+      -L"$MUSL_LINK_DIR" -l:$MUSL_LDSONAME \
       $MUSL_CRTN \
       ${BUILTINS_LIB:+"$BUILTINS_LIB"} \
       -o "$OUTPUT"
@@ -227,10 +234,16 @@ with open(f, 'r+b') as fh:
     ;;
   ldso)
     # Real userspace ld.so mode (musl-port.md).
-    MUSL_LDSONAME="ld-musl-x86_64.so.1"
+    # Per-arch, like the dynamic branch above: this used to hardcode x86_64 in
+    # three places, so anything built through this mode on aarch64 came out
+    # asking for /lib/ld-musl-x86_64.so.1 — an interpreter that does not exist
+    # there. The kernel loader then refused the image ("failed to load"), /bin/sh
+    # fell back to reading the ELF as a shell script, and crashpad_smoke never
+    # ran at all.
+    MUSL_LDSONAME="ld-musl-${B1NIX_GCC_ARCH}.so.1"
     MUSL_SCRT1="$MUSL_LIB/Scrt1.o"
 
-    MUSL_LINK_DIR="/tmp/b1nix-musl-link-$$"
+    MUSL_LINK_DIR="${TMPDIR:-/tmp}/b1nix-musl-link-$$"
     mkdir -p "$MUSL_LINK_DIR"
     ln -sf "$MUSL_SRC_BUILD/lib/libc.so" "$MUSL_LINK_DIR/$MUSL_LDSONAME"
     MUSL_SO="$MUSL_LINK_DIR/$MUSL_LDSONAME"
@@ -242,8 +255,8 @@ with open(f, 'r+b') as fh:
       TMPOBJS="$TMPOBJS $OBJ"
     done
 
-    $LD_BIN -m elf_x86_64 -pie --allow-shlib-undefined \
-      -dynamic-linker /lib/ld-musl-x86_64.so.1 \
+    $LD_BIN -m "$LD_EMULATION" -pie --allow-shlib-undefined \
+      -dynamic-linker /lib/$MUSL_LDSONAME \
       -L"$MUSL_SRC_BUILD/lib" \
       $EXTRA_LDFLAGS \
       $MUSL_SCRT1 $MUSL_CRTI \
