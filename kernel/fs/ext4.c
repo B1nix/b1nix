@@ -1,3 +1,4 @@
+#include <b1nix/sched.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
@@ -120,10 +121,28 @@ static void ext4_write_bgd_tx(struct ext4_fs *fs, u32 group, struct ext4_bgd_64 
     ext4_journal_write_tx(fs, h, bg_block, buf); kfree(buf);
 }
 
-static void ext4_write_superblock(struct ext4_fs *fs) {
+/* Put the in-memory superblock on the disk, now. */
+static void ext4_flush_superblock(struct ext4_fs *fs) {
     u8 *sb_buf = kmalloc(1024);
+    if (!sb_buf)
+        return;
     if (blk_read_cached(fs->bdev, 2, 2, sb_buf) >= 0) { memcpy(sb_buf, &fs->sb, sizeof(struct ext2_superblock)); blk_write_cached(fs->bdev, 2, 2, sb_buf); }
     kfree(sb_buf);
+    fs->sb_dirty = 0;
+    fs->sb_write_tick = scheduler_get_ticks();
+}
+
+/* Write the superblock out.
+ *
+ * It was deferred to the block layer's writeback deadline for a while, on the
+ * argument that the free counts are advisory and Linux does the same. The
+ * measurement did not support it — the device traffic was unchanged, because
+ * the cache already absorbs the repeated writes — and it cost a virtio-blk
+ * write that never completed, with the log naming lba 2 every time. Written
+ * when it changes, as before.
+ */
+static void ext4_write_superblock(struct ext4_fs *fs) {
+    ext4_flush_superblock(fs);
 }
 
 static u32 ext4_bgd_block_bitmap(struct ext4_fs *fs, struct ext4_bgd_64 *bgd) {
@@ -1245,8 +1264,26 @@ static int ext4_vfs_statfs(struct vfs_node *node, struct b1nix_statfs *st) {
 }
 
 static int ext4_vfs_fsync(struct vfs_node *node) {
+  if (node && node->inode) {
+    struct ext4_inode_info *info = (struct ext4_inode_info *)node->inode->data;
+
+    /* The deferred superblock counts belong on the disk before this returns:
+     * fsync is the caller saying it wants what it wrote to survive. */
+    if (info && info->fs && info->fs->sb_dirty)
+      ext4_flush_superblock(info->fs);
+  }
+  /* The file's own blocks are already on the disk by the time this runs:
+   * vfs_fsync flushes them by inode before calling here. Draining the whole
+   * device's cache on top of that is what an fsync used to do, and it is what
+   * made one call to it write out every dirty block in the machine — a quarter
+   * of a million device commands for a workload that wrote four megabytes.
+   * What is still owed is the device's own write cache, which is a flush
+   * command, not a drain. */
   if (node && node->inode && node->inode->blk_dev) {
-    blk_cache_flush(node->inode->blk_dev);
+    struct block_device *d = node->inode->blk_dev;
+
+    if (d->flush)
+      d->flush(d);
   }
   return 0;
 }
@@ -1438,11 +1475,16 @@ static struct vfs_node *ext4_vfs_mount_cb(const char *source, u64 flags, void *d
 static int ext4_vfs_umount_cb(struct vfs_node *root_node) {
     struct ext4_inode_info *ni = (struct ext4_inode_info *)root_node->inode->data;
     struct ext4_fs *fs = ni->fs;
+
+    /* Whatever the journal state, the counts deferred since the last deadline
+     * go out here: this is the last moment they can. */
+    if (fs->sb_dirty)
+        ext4_flush_superblock(fs);
     if (fs->sb.s_feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL) {
         if (fs->jdev) {
             /* Clear RECOVER flag: filesystem was cleanly unmounted */
             fs->sb.s_feature_incompat &= ~EXT3_FEATURE_INCOMPAT_RECOVER;
-            ext4_write_superblock(fs);
+            ext4_flush_superblock(fs);
             k_info("ext4", "clean umount, RECOVER flag cleared");
         }
     }

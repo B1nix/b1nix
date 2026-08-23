@@ -2,6 +2,9 @@
 #include <b1nix/arch.h>
 #include <b1nix/blk.h>
 #include <b1nix/loop.h>
+#include <b1nix/md.h>
+#include <b1nix/mtd.h>
+#include <b1nix/nbd.h>
 #include <b1nix/vt.h>
 #include <b1nix/kmsg.h>
 #include <b1nix/rtc.h>
@@ -243,12 +246,44 @@ out:
  * mounts[] is read without vfs_mount_lock here, matching the downward crossing
  * in vfs_find_node_internal: entries are published root_node-last and callers
  * already hold a reference to the node being walked. */
+/* Defined below; the mount seam needs to know the machine root. */
+static struct vfs_node *root_node;
+static void mount_record_target(const char *target, struct vfs_node *node,
+                                char *out, usize out_len);
+
+/* The node a mount ROOT is covered by, so a path walk can step across the seam
+ * instead of stopping at a filesystem root's NULL parent.
+ *
+ * Only a filesystem root needs the seam. A node with a parent already has a
+ * name in a directory, and that chain IS its canonical path -- following a
+ * mount entry from such a node instead is how a bind mount rewrote the name of
+ * the file it bound. Binding a file onto ITSELF (which is every
+ * ReadOnlyPaths=, ProtectHostname= and ProtectKernelTunables= entry systemd
+ * sets up) then made the seam a self-loop: the walk stepped from the node to
+ * itself until its step budget ran out and rendered the file's path as "/".
+ * That is what put /proc/self/fd/<n> -- the target of every mount systemd
+ * makes -- on the root directory, and mounting a unit's private tree over "/"
+ * is what turned every later cgroup and /dev/console operation into ENOTDIR.
+ *
+ * The machine root names itself for the same reason: a recursive bind of "/"
+ * somewhere else (systemd's unit-root) must not rename "/" to that place. */
 static struct vfs_node *vfs_mount_point_of(const struct vfs_node *node) {
-  if (!node)
+  if (!node || node == root_node || node->parent)
     return 0;
   for (int i = 0; i < (int)mount_slots; i++) {
-    if (mount_visible(i) && mounts[i].root_node == node)
-      return mounts[i].mount_point;
+    if (!mount_visible(i) || mounts[i].root_node != node)
+      continue;
+    /* The FIRST mount of this root is the one that gives it its name; a later
+     * bind of the same filesystem somewhere else does not rename it. Taking a
+     * later entry instead makes the walk circular -- the root bound under
+     * /run/systemd/unit-root sent every path through
+     * /run/systemd/unit-root/run/systemd/unit-root/... until it overflowed and
+     * every openat(dirfd, name) in the machine answered ENAMETOOLONG.
+     *
+     * And a mount whose root IS its own mount point (a bind of a file onto
+     * itself, which is every ReadOnlyPaths= entry) crosses nothing: stepping
+     * to it lands back where the walk started. */
+    return mounts[i].mount_point == node ? 0 : mounts[i].mount_point;
   }
   return 0;
 }
@@ -1275,19 +1310,36 @@ void vfs_node_put(struct vfs_node *node) {
   }
 }
 
-static void split_path(const char *path, char *first_part, usize first_size,
-                        const char **rest) {
+/* Peel the first component off `path`.
+ *
+ * Returns 1 when the component did not fit in `first_size` and 0 otherwise.
+ *
+ * It used to return nothing and truncate silently, and the damage was not the
+ * truncation -- it was that `*rest` then resumed in the MIDDLE of the name, so
+ * a component longer than the buffer was re-parsed as two components. With a
+ * 64-byte buffer, "/tmp/systemd-private-<32 hex>-systemd-logind.service-XXXXXX"
+ * (78 characters) was looked up as a 63-character directory containing a
+ * 15-character one. Nothing of that shape exists, so every path with a long
+ * component answered ENOENT -- while creating it through a different route
+ * succeeded, because the name was stored whole. That is what broke PrivateTmp=
+ * for every unit that sets it: systemd's mkdtemp() created the directory and
+ * the very next mkdir() inside it could not find it.
+ *
+ * A component that does not fit is ENAMETOOLONG, which is what Linux answers
+ * and what the caller can act on -- never a different, shorter path. */
+static int split_path(const char *path, char *first_part, usize first_size,
+                      const char **rest) {
   if (!path || !first_part || !first_size) {
     if (first_part && first_size) first_part[0] = '\0';
     if (rest) *rest = 0;
-    return;
+    return 0;
   }
   while (*path == '/')
     path++;
   if (*path == '\0') {
     first_part[0] = '\0';
     *rest = 0;
-    return;
+    return 0;
   }
   usize i = 0;
   while (path[i] != '\0' && path[i] != '/' && i + 1 < first_size) {
@@ -1295,7 +1347,16 @@ static void split_path(const char *path, char *first_part, usize first_size,
     i++;
   }
   first_part[i] = '\0';
+  /* Still inside the name: it was too long for the buffer. Step over the rest
+   * of it so `*rest` starts at a real boundary rather than mid-name. */
+  if (path[i] != '\0' && path[i] != '/') {
+    while (path[i] != '\0' && path[i] != '/')
+      i++;
+    *rest = path + i;
+    return 1;
+  }
   *rest = path + i;
+  return 0;
 }
 
 struct vfs_node *find_child(struct vfs_node *parent, const char *name) {
@@ -1522,7 +1583,10 @@ vfs_find_node_internal(const char *path, int follow_final, int symlink_depth) {
     current = vfs_cross_root_mount(current);
   vfs_inode_lock_read(current->inode);
 
-  char part[64];
+  /* One component, at the size a name may actually be. This was 64 while
+   * VFS_NAME_MAX is 256, so every name of 64 characters or more resolved to
+   * something that does not exist -- see split_path. */
+  char part[VFS_NAME_MAX];
   const char *rest = curr_path;
 
 restart_traversal:
@@ -1530,7 +1594,13 @@ restart_traversal:
     while (*rest == '/')
       rest++;
 
-    split_path(rest, part, sizeof(part), &rest);
+    if (split_path(rest, part, sizeof(part), &rest)) {
+      vfs_inode_unlock_read(current->inode);
+      vfs_node_put(current);
+      kfree(curr_path);
+      kfree(parent_path);
+      return ERR_PTR(-ENAMETOOLONG);
+    }
 
     if (part[0] == '\0') {
       int orig_len = strlen(path);
@@ -1600,6 +1670,13 @@ restart_traversal:
       return ERR_PTR(-ENOTDIR);
     }
 
+    /* A directory whose children go stale (see lookup_refresh) gets the
+     * callback before the lookup, not only when it misses. */
+    if (current->inode->lookup_cb && current->inode->lookup_refresh) {
+      vfs_inode_unlock_read(current->inode);
+      current->inode->lookup_cb(current, part);
+      vfs_inode_lock_read(current->inode);
+    }
     struct vfs_node *child = find_child(current, part);
     if (!child && current->inode->lookup_cb) {
       /* Synthetic dir (procfs/sysfs) with lazily-materialised children: give it
@@ -1646,6 +1723,46 @@ restart_traversal:
     current = child;
 
     int is_final = (!rest || rest[0] == '\0');
+    /* A magic link (/proc/<pid>/fd/<n>) names an open file, not a path: step
+     * straight to the node the descriptor holds. systemd mounts every API
+     * filesystem and every unit sandbox entry by opening the destination
+     * O_PATH and passing /proc/self/fd/<n> to mount(2) -- exactly so that the
+     * destination cannot be re-resolved -- and re-walking the stored target
+     * string is a different operation with a different answer. */
+    if (current->inode->type == VFS_SYMLINK && current->inode->magic_link_cb &&
+        (follow_final || !is_final)) {
+      if (++symlink_depth > VFS_MAX_SYMLINK_DEPTH) {
+        vfs_inode_unlock_read(current->inode);
+        vfs_node_put(current);
+        kfree(curr_path);
+        kfree(parent_path);
+        return ERR_PTR(-ELOOP);
+      }
+      struct vfs_node *(*mcb)(struct vfs_node *) = current->inode->magic_link_cb;
+      vfs_inode_unlock_read(current->inode);
+      struct vfs_node *tgtn = mcb(current);
+      if (IS_ERR(tgtn)) {
+        vfs_node_put(current);
+        kfree(curr_path);
+        kfree(parent_path);
+        return tgtn;
+      }
+      if (tgtn) {
+        vfs_node_put(current);
+        current = tgtn; /* referenced by the callback */
+        vfs_inode_lock_read(current->inode);
+        /* Anything relative resolved from here on hangs off the node's own
+         * place in the tree, not off /proc/<pid>/fd. */
+        if (vfs_get_node_path(current, parent_path, VFS_MAX_PATH) != 0) {
+          parent_path[0] = '/';
+          parent_path[1] = '\0';
+        }
+        continue; /* the empty-part branch returns it when this was final */
+      }
+      /* NULL: not a magic link after all -- fall through to the stored
+       * target string, which is what a pipe or socket descriptor uses. */
+      vfs_inode_lock_read(current->inode);
+    }
     if (current->inode->type == VFS_SYMLINK && (follow_final || !is_final)) {
       if (++symlink_depth > VFS_MAX_SYMLINK_DEPTH) {
         vfs_inode_unlock_read(current->inode);
@@ -1776,7 +1893,7 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         root_node->inode->ctime = vfs_get_unix_time();
   }
 
-  char part[64];
+  char part[VFS_NAME_MAX];
   const char *rest = path;
   struct vfs_node *current = root_node;
   vfs_node_get(current);
@@ -1786,13 +1903,19 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
    * current now holds one reference valid throughout the loop below. */
 
   while (1) {
-    split_path(rest, part, sizeof(part), &rest);
+    if (split_path(rest, part, sizeof(part), &rest)) {
+      vfs_node_put(current);
+      return ERR_PTR(-ENAMETOOLONG);
+    }
     if (part[0] == '\0') {
       struct vfs_node *ret = current;
       vfs_node_put(current);
       return ret;
     }
 
+    if (current->inode && current->inode->lookup_cb &&
+        current->inode->lookup_refresh)
+      current->inode->lookup_cb(current, part);
     struct vfs_node *child = find_child(current, part);
     if (!child && current->inode && current->inode->lookup_cb) {
       current->inode->lookup_cb(current, part);
@@ -2104,6 +2227,7 @@ struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind) {
   h->refcount = 1;
   h->kind = kind;
   h->ns_pin = 0; /* M109: only a /proc/<pid>/ns/<kind> open sets this */
+  h->open_path = 0;
   return h;
 }
 
@@ -2152,6 +2276,10 @@ void vfs_handle_release(struct vfs_handle *h) {
     vfs_node_put(h->node);
   }
 
+  if (h->open_path) {
+    kfree(h->open_path);
+    h->open_path = 0;
+  }
   vfs_free_handle(h);
 }
 
@@ -2705,6 +2833,11 @@ void vfs_populate_dev(void) {
     node->inode->mode = 0620;
     node->inode->uid = 0;
     node->inode->gid = 5; // group tty
+    /* The number the Linux ABI fixes for this node. Left at 0, stat() reported
+     * st_rdev == 0 -- a device file that is no device -- so anything that
+     * identifies a device by its number rather than its path could not see it,
+     * /sys/dev/char included. These numbers are not ours to choose. */
+    node->inode->rdev = ((u64)5 << 8) | (u64)1; /* /dev/console */
     vfs_node_put(node);
   }
 
@@ -2713,6 +2846,7 @@ void vfs_populate_dev(void) {
     node->inode->mode = 0666;
     node->inode->uid = 0;
     node->inode->gid = 5; // group tty
+    node->inode->rdev = ((u64)5 << 8) | (u64)2; /* /dev/ptmx */
     vfs_node_put(node);
   }
 
@@ -2733,6 +2867,7 @@ void vfs_populate_dev(void) {
     node->inode->mode = 0666;
     node->inode->uid = 0;
     node->inode->gid = 0;
+    node->inode->rdev = ((u64)1 << 8) | (u64)3; /* /dev/null */
     vfs_node_put(node);
   }
 
@@ -2747,6 +2882,7 @@ void vfs_populate_dev(void) {
     node->inode->mode = 0666;
     node->inode->uid = 0;
     node->inode->gid = 0;
+    node->inode->rdev = ((u64)1 << 8) | (u64)5; /* /dev/zero */
     vfs_node_put(node);
   }
 
@@ -2837,6 +2973,14 @@ void vfs_populate_dev(void) {
    * An unbound VFS_DEVICE placeholder reads as an empty file, which broke
    * every disk tool. blk_create_dev_nodes() is the canonical binder. */
   blk_create_dev_nodes();
+
+  /* The flash character device, for the same reason and at the same moment.
+   * /dev is rebuilt from this list every time devtmpfs mounts, so a node
+   * created once at probe time disappears the moment the real root is in
+   * place -- which is exactly what happened to /dev/mtd0: the chip was found
+   * and its block face registered, while the interface that can erase it was
+   * quietly gone. */
+  mtd_create_dev_nodes();
 }
 
 void vfs_repopulate_after_root_mount(void) {
@@ -2929,7 +3073,37 @@ int vfs_open_flags(const char *path, int flags) {
   return vfs_open_flags_mode(path, flags, 0666);
 }
 
+/* The real body; the wrapper below reports a refused graphics open. */
+static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode);
+
 int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
+  int rc = vfs_open_flags_mode_inner(path, flags, mode);
+
+  /*
+   * A refused open of a graphics node, with the flags that were asked for.
+   *
+   * A compositor reports "failed to open drm device" for anything that goes
+   * wrong on the way to a usable fd, and the same node opens perfectly well
+   * from a shell — so the difference is in the flags, and the errno is the only
+   * thing that says which. Reported here rather than at a syscall, because the
+   * callers arrive through open, openat and the kernel's own helpers, and the
+   * one that mattered went through the entry the first attempt did not cover.
+   */
+  if (rc < 0 && path && path[0] == '/' && path[1] == 'd' && path[2] == 'e' &&
+      path[3] == 'v' && path[4] == '/' && path[5] == 'd' && path[6] == 'r' &&
+      path[7] == 'i' && bootinfo_has_flag("b1nix.drm-debug")) {
+    console_write("drm: open ");
+    console_write(path);
+    console_write(" flags=0x");
+    console_write_hex64((u64)(u32)flags);
+    console_write(" -> -");
+    console_write_dec((u64)(-rc));
+    console_write("\n");
+  }
+  return rc;
+}
+
+static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   int res = 0;
   if (!path)
     return -EINVAL;
@@ -3329,6 +3503,16 @@ int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
     goto out;
   }
   h->node = node; /* Already has ref from find_node */
+  /* The name this descriptor was opened under (see vfs_handle::open_path).
+   * `resolved` is already absolute and lexically normalised. */
+  {
+    usize rl = strlen(resolved);
+    char *op = kmalloc(rl + 1);
+    if (op) {
+      memcpy(op, resolved, rl + 1);
+      h->open_path = op;
+    }
+  }
   extern const struct vfs_file_ops node_file_ops;
   h->ops = &node_file_ops;
   h->flags = flags;
@@ -3439,7 +3623,26 @@ static isize node_read_impl(struct vfs_handle *h, char *buf, usize size,
       if (posp) *posp += total_read; else h->offset += total_read;
     }
   } else if (node->inode->read_cb) {
+    /* Not under the inode lock: a device read blocks.
+     *
+     * This called the driver while holding the inode's WRITE lock. For a file
+     * the callback returns promptly; for a device it waits for input, and a
+     * terminal with a shell sitting on it waits forever -- so every other
+     * operation on that node, including open(2), blocked behind a lock nobody
+     * was going to release. logind hit exactly that: it opens /dev/tty1 while
+     * taking control of a session, the open never returned, and the D-Bus call
+     * that was waiting for it timed out with no reply. The watchdog named it
+     * outright -- "inode ino=58130 rw_lock=-1 holder=202" with task 202 parked
+     * on the VT's input queue.
+     *
+     * The lock protects this inode's own fields; the driver has its own
+     * locking for its device, and the offset it advances lives on the handle,
+     * not the inode. So drop it for the duration of the call and take it again
+     * afterwards, leaving the single unlock at the end of the function
+     * balanced. */
+    vfs_inode_unlock(node->inode);
     res = node->inode->read_cb(node, offset, buf, size, h->flags);
+    vfs_inode_lock(node->inode);
     if (res > 0) {
       if (posp) *posp += (usize)res; else h->offset += (usize)res;
     }
@@ -3773,6 +3976,37 @@ int vfs_node_fsync(struct vfs_node *node) {
   if (node->inode->fsync_cb)
     return node->inode->fsync_cb(node);
   return 0;
+}
+
+/*
+ * A descriptor held by the kernel rather than by a process.
+ *
+ * nbd-client opens the socket, completes the NBD handshake and hands the
+ * descriptor to the kernel, which then does the block I/O on it -- possibly
+ * long after the process that opened it has moved on. A raw fd number is no
+ * good for that: it is an index into one process's table, and it can be closed
+ * or reused underneath us. These take and use a reference on the handle
+ * itself.
+ */
+struct vfs_handle *vfs_handle_acquire(int fd) {
+  struct vfs_handle *h = get_handle(fd);
+
+  if (!h)
+    return 0;
+  __atomic_fetch_add(&h->refcount, 1, __ATOMIC_RELAXED);
+  return h;
+}
+
+isize vfs_handle_write(struct vfs_handle *h, const void *buf, usize size) {
+  if (!h || !h->ops || !h->ops->write)
+    return -EBADF;
+  return h->ops->write(h, (const char *)buf, size);
+}
+
+isize vfs_handle_read(struct vfs_handle *h, void *buf, usize size) {
+  if (!h || !h->ops || !h->ops->read)
+    return -EBADF;
+  return h->ops->read(h, (char *)buf, size);
 }
 
 isize vfs_write(int fd, const char *buf, usize size) {
@@ -4539,8 +4773,14 @@ static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
 
   /* Защита точек монтирования */
   for (int i = 0; i < (int)mount_slots; i++) {
-    if (mount_visible(i) && strcmp(mounts[i].target, r_path) == 0)
+    if (mount_visible(i) && strcmp(mounts[i].target, r_path) == 0) {
+      if (bootinfo_has_flag("b1nix.trace-mount")) {
+        char bl[320];
+        snprintf(bl, sizeof(bl), "unlink EBUSY: '%s' is mount target %d", r_path, i);
+        klog_info(bl);
+      }
       return -EBUSY;
+    }
   }
 
   struct vfs_node *prev = 0, *child = parent->first_child;
@@ -4842,6 +5082,17 @@ out_unlock:
 
 isize vfs_readlink(const char *path, char *buffer, usize size) {
   isize res = 0;
+  {
+    /* Once, not per readlink: bootinfo_has_flag scans the command line. */
+    static int trace = -1;
+    if (trace < 0)
+      trace = bootinfo_has_flag("b1nix.trace-mount") ? 1 : 0;
+    if (trace && path) {
+      char rl[320];
+      snprintf(rl, sizeof(rl), "readlink: '%s'", path);
+      klog_info(rl);
+    }
+  }
   if (!path || !buffer || size == 0) {
     res = -EINVAL;
     goto out;
@@ -5397,6 +5648,10 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
    * let two concurrent mounts pick the same index, and lookups walking
    * mounts[] could observe a half-written entry. The fs->mount() callback
    * itself runs outside the lock (it sleeps on block I/O). */
+  /* Named before the lock: the resolver takes vfs_mount_lock itself. */
+  char rectgt[VFS_MAX_PATH];
+  mount_record_target(target, target_node, rectgt, sizeof(rectgt));
+
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 
@@ -5427,13 +5682,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
    * /proc/self/mountinfo as "/proc/self/fd/4", nothing could be recognised as
    * already mounted, and systemd mounted /proc, /sys and /dev a second and
    * third time on each pass through its table. */
-  {
-    char canon[VFS_MAX_PATH];
-    if (vfs_get_node_path(target_node, canon, sizeof(canon)) == 0 && canon[0])
-      copy_path(mounts[midx].target, sizeof(mounts[midx].target), canon);
-    else
-      copy_path(mounts[midx].target, sizeof(mounts[midx].target), target);
-  }
+  copy_path(mounts[midx].target, sizeof(mounts[midx].target), rectgt);
   copy_path(mounts[midx].fstype, sizeof(mounts[midx].fstype), fstype);
   mounts[midx].flags = flags & ~(u64)MS_PROPAGATION_MASK;
   mounts[midx].propagation = MS_PRIVATE; /* Linux's default for a new mount */
@@ -5536,8 +5785,7 @@ int vfs_set_propagation(const char *target, u64 flags) {
   struct vfs_node *node = vfs_find_node(target);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
-  if (vfs_get_node_path(node, canon, sizeof(canon)) != 0 || !canon[0])
-    copy_path(canon, sizeof(canon), target);
+  mount_record_target(target, node, canon, sizeof(canon));
   vfs_node_put(node);
 
   int recursive = (flags & MS_REC) ? 1 : 0;
@@ -5572,8 +5820,7 @@ int vfs_remount(const char *target, u64 flags) {
   struct vfs_node *node = vfs_find_node(target);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
-  if (vfs_get_node_path(node, canon, sizeof(canon)) != 0 || !canon[0])
-    copy_path(canon, sizeof(canon), target);
+  mount_record_target(target, node, canon, sizeof(canon));
   vfs_node_put(node);
 
   int found = 0;
@@ -5588,10 +5835,65 @@ int vfs_remount(const char *target, u64 flags) {
     found = 1;
   }
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  if (!found && bootinfo_has_flag("b1nix.trace-mount")) {
+    char rl[320];
+    snprintf(rl, sizeof(rl), "remount: no mount recorded at '%s'", canon);
+    klog_info(rl);
+  }
   return found ? 0 : -EINVAL;
 }
 
+/* The name to record for a mount point.
+ *
+ * Not the node's own path: a node reached through a bind mount has a name in
+ * two places, and the mount belongs at the one the caller named. systemd
+ * mounts everything through /proc/self/fd/<n> (it opens the destination
+ * O_PATH so no symlink can be swapped in), and that descriptor knows the name
+ * it was opened under -- so when the target is such a link, its readlink text
+ * IS the canonical answer. Everything else canonicalises through the node, and
+ * the raw string is the last resort.
+ *
+ * Getting this wrong is not cosmetic: systemd re-reads /proc/self/mountinfo
+ * after each bind to check the mount took, and a row filed under a different
+ * name means it never sees its own mount. It retries 32 times and then fails
+ * the unit with EBUSY, which is what kept systemd-udevd from ever starting. */
+static void mount_record_target(const char *target, struct vfs_node *node,
+                                char *out, usize out_len) {
+  out[0] = '\0';
+  if (target && strncmp(target, "/proc/", 6) == 0) {
+    char link[VFS_MAX_PATH];
+    isize n = vfs_readlink(target, link, sizeof(link) - 1);
+    if (n > 0 && link[0] == '/') {
+      link[n] = '\0';
+      copy_path(out, out_len, link);
+      return;
+    }
+  }
+  if (target && target[0]) {
+    char norm[VFS_MAX_PATH];
+    vfs_resolve_path(target, norm);
+    if (norm[0]) {
+      copy_path(out, out_len, norm);
+      return;
+    }
+  }
+  {
+    char canon[VFS_MAX_PATH];
+    if (node && vfs_get_node_path(node, canon, sizeof(canon)) == 0 && canon[0]) {
+      copy_path(out, out_len, canon);
+      return;
+    }
+  }
+  copy_path(out, out_len, target ? target : "");
+}
+
 int vfs_bind_mount(const char *source, const char *target, u64 flags) {
+  /* A bind needs something to bind. An empty source resolves to the root
+   * directory, so accepting one here quietly bind-mounts the whole filesystem
+   * over the target -- the loudest possible way to answer a caller that simply
+   * passed NULL because it meant a remount. Linux answers EINVAL. */
+  if (!source || !source[0])
+    return -EINVAL;
   struct vfs_node *src = vfs_find_node(source);
   if (IS_ERR(src))
     return (int)PTR_ERR(src);
@@ -5600,13 +5902,51 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
     vfs_node_put(src);
     return (int)PTR_ERR(tgt);
   }
+  if (bootinfo_has_flag("b1nix.trace-mount")) {
+    char sp[VFS_MAX_PATH], tp[VFS_MAX_PATH], bl[512];
+    if (vfs_get_node_path(src, sp, sizeof(sp)) != 0)
+      sp[0] = '\0';
+    if (vfs_get_node_path(tgt, tp, sizeof(tp)) != 0)
+      tp[0] = '\0';
+    char rt[VFS_MAX_PATH];
+    mount_record_target(target, tgt, rt, sizeof(rt));
+    snprintf(bl, sizeof(bl),
+             "bind: '%s'(%p '%s' t=%d) -> '%s'(%p '%s' t=%d) recorded='%s'",
+             source, (void *)src, sp, (int)src->inode->type, target,
+             (void *)tgt, tp, (int)tgt->inode->type, rt);
+    klog_info(bl);
+  }
   /* Linux allows a file-to-file bind; both ends must agree about which it is. */
   if ((src->inode->type == VFS_DIRECTORY) !=
       (tgt->inode->type == VFS_DIRECTORY)) {
+    /* Named, because a caller only ever hears ENOTDIR and cannot tell which end
+     * disagreed -- systemd reports the whole thing as "Failed to set up mount
+     * namespacing" against the target path, and the source is the half that has
+     * been wrong here. Bounded: a boot that does this once does it hundreds of
+     * times. */
+    static unsigned told;
+
+    if (told < 8) {
+      char line[192];
+
+      told++;
+      snprintf(line, sizeof(line),
+               "bind: kind mismatch: source %s is a %s, target %s is a %s "
+               "(resolved to '%s')\n",
+               source, src->inode->type == VFS_DIRECTORY ? "directory" : "file",
+               target, tgt->inode->type == VFS_DIRECTORY ? "directory" : "file",
+               tgt->name);
+      console_write(line);
+    }
     vfs_node_put(src);
     vfs_node_put(tgt);
     return -ENOTDIR;
   }
+
+  /* Resolved before the mount lock is taken: naming the target walks the path
+   * resolver, which takes that same lock. */
+  char rectgt[VFS_MAX_PATH];
+  mount_record_target(target, tgt, rectgt, sizeof(rectgt));
 
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
@@ -5626,13 +5966,7 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
   mounts[midx].mount_point = tgt;   /* reference kept by the mount */
   mounts[midx].root_node = src;     /* reference kept by the mount */
   copy_path(mounts[midx].source, sizeof(mounts[midx].source), source);
-  {
-    char canon[VFS_MAX_PATH];
-    if (vfs_get_node_path(tgt, canon, sizeof(canon)) == 0 && canon[0])
-      copy_path(mounts[midx].target, sizeof(mounts[midx].target), canon);
-    else
-      copy_path(mounts[midx].target, sizeof(mounts[midx].target), target);
-  }
+  copy_path(mounts[midx].target, sizeof(mounts[midx].target), rectgt);
   copy_path(mounts[midx].fstype, sizeof(mounts[midx].fstype), "bind");
   mounts[midx].flags = flags & ~(u64)(MS_BIND | MS_REC | MS_PROPAGATION_MASK);
   mounts[midx].owner = 0;
@@ -6776,12 +7110,30 @@ static isize memfd_read(struct vfs_node *node, u64 offset, char *buffer,
     return 0;
   usize available = node->inode->size - (usize)offset;
   usize count = size < available ? size : available;
-  if (count > 0 && node->inode->data)
-    memcpy(buffer, (const char *)node->inode->data + offset, count);
+  /* Beyond what is backed, the file reads as zeroes.
+   *
+   * A hole is not an error and not a short read: ftruncate no longer allocates
+   * (see memfd_truncate), so most of a freshly sized region has no buffer
+   * behind it at all. Returning the count without touching the caller's buffer
+   * would hand back whatever was already in it. */
+  if (count > 0) {
+    usize backed = node->inode->capacity > (usize)offset
+                       ? node->inode->capacity - (usize)offset
+                       : 0;
+    usize from_data = backed < count ? backed : count;
+
+    if (from_data && node->inode->data)
+      memcpy(buffer, (const char *)node->inode->data + offset, from_data);
+    else
+      from_data = 0;
+    if (count > from_data)
+      memset(buffer + from_data, 0, count - from_data);
+  }
   return (isize)count;
 }
 
 static int memfd_truncate(struct vfs_node *node, u64 length);
+static int memfd_reserve(struct vfs_inode *inode, u64 length);
 
 static isize memfd_write(struct vfs_node *node, u64 offset,
                          const char *buffer, usize size, int flags) {
@@ -6798,8 +7150,13 @@ static isize memfd_write(struct vfs_node *node, u64 offset,
   }
   usize available = node->inode->size - (usize)offset;
   usize count = size < available ? size : available;
-  if (count > 0 && node->inode->data)
+  if (count > 0) {
+    int rc = memfd_reserve(node->inode, offset + count);
+
+    if (rc < 0)
+      return rc;
     memcpy((char *)node->inode->data + offset, buffer, count);
+  }
   return (isize)count;
 }
 
@@ -6813,7 +7170,46 @@ static int memfd_truncate(struct vfs_node *node, u64 length) {
     return -EINVAL;
   struct vfs_inode *inode = node->inode;
 
-  if (length > inode->capacity) {
+  /* Setting the size allocates nothing.
+   *
+   * This is what makes an anonymous shared region affordable, and it is what
+   * Linux does: ftruncate on a memfd records a length, and pages appear as
+   * they are touched. Allocating the whole length here made a compositor's
+   * 512 MiB buffer pool cost 512 MiB of contiguous kernel memory the instant
+   * it was created -- and, because the capacity doubled rather than matching
+   * the request, a 260 MiB pool cost the same. Four such regions exhausted a
+   * 4 GiB machine about twenty seconds into a KDE session, after which the
+   * failures were whatever ran next: a lazy page with no frame to back it, a
+   * shootdown stalled behind a starved CPU, the OOM killer taking the shell.
+   *
+   * Mapping the region is unaffected -- an mmap faults page by page through
+   * the page cache, which calls read_cb and gets zeroes for a hole. Only a
+   * write(2) into the file needs a real buffer, and memfd_write reserves it
+   * then, for as much of the file as it is about to write.
+   */
+  if (length > inode->size && inode->data &&
+      inode->capacity > (usize)inode->size)
+    memset((char *)inode->data + inode->size, 0,
+           (usize)((length < inode->capacity ? length : inode->capacity) -
+                   inode->size));
+  inode->size = (usize)length;
+  return 0;
+}
+
+/* Give an in-memory file a buffer covering at least `length` bytes.
+ *
+ * Called from the write path only: everything else either reads (holes are
+ * zeroes) or maps (the page cache owns the pages). The growth still doubles,
+ * because a file being written a piece at a time would otherwise reallocate on
+ * every call -- but it is now driven by bytes actually written rather than by
+ * a size someone declared. */
+static int memfd_reserve(struct vfs_inode *inode, u64 length) {
+  if (!inode)
+    return -EINVAL;
+  if (length <= inode->capacity && inode->data)
+    return 0;
+
+  {
     usize new_cap = inode->capacity ? inode->capacity : 1024;
     while (new_cap < length) {
       if (new_cap > (usize)1 << 40)
@@ -6842,19 +7238,25 @@ static int memfd_truncate(struct vfs_node *node, u64 length) {
       console_write(" Mcycles\n");
     }
     if (inode->data) {
-      memcpy(new_data, inode->data, inode->size);
+      /* By capacity, not by size.
+       *
+       * Since ftruncate stopped allocating, the size is a declaration and the
+       * capacity is the buffer -- and the size can be enormously larger. A
+       * file declared 512 MiB whose first write is four bytes has a 1 KiB
+       * buffer; copying `size` bytes out of it reads half a gigabyte past the
+       * source and writes it past the destination, which faulted in kernel
+       * memcpy exactly one page after the new allocation ended. */
+      usize keep = inode->capacity < new_cap ? inode->capacity : new_cap;
+
+      memcpy(new_data, inode->data, keep);
       if (inode->flags & VFS_NODE_OWNS_DATA)
         kfree(inode->data);
     }
     inode->data = new_data;
     inode->capacity = new_cap;
     inode->flags |= VFS_NODE_OWNS_DATA;
-  } else if (length > inode->size && inode->data) {
-    memset((char *)inode->data + inode->size, 0,
-           (usize)(length - inode->size));
   }
 
-  inode->size = (usize)length;
   return 0;
 }
 
@@ -6896,6 +7298,9 @@ int vfs_memfd_create(const char *name, u32 flags) {
   node->inode->read_cb = memfd_read;
   node->inode->write_cb = memfd_write;
   node->inode->truncate_cb = memfd_truncate;
+  /* write_cb stays, because write(2) still has to work; the flag is what tells
+   * reclaim not to call it for a page it already holds. */
+  node->inode->flags |= VFS_NODE_MEMORY_BACKED;
   node->inode->atime = node->inode->mtime = node->inode->ctime =
       vfs_get_unix_time();
 
@@ -7143,6 +7548,22 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
    * the console for a getty and calls ioctl(fd, TIOCSCTTY, 0); the EINVAL came
    * back as "Failed to set up standard input: Invalid argument" and no login
    * prompt was ever printed. */
+  /* TIOCCONS: print the kernel console on THIS terminal from now on.
+   *
+   * Linux's rule, kept here: issued on /dev/console it cancels any
+   * redirection; issued on a terminal it redirects to that terminal. Only
+   * root may move the console, because the machine's log is not something an
+   * ordinary user gets to capture. */
+  if (request == B1NIX_TIOCCONS) {
+    struct cred *c = scheduler_get_current_cred();
+
+    if (!cred_has_cap(c, CAP_SYS_ADMIN))
+      return -EPERM;
+    if (strcmp(node->name, "console") == 0)
+      return console_redirect_set(0) == 0 ? 0 : -EIO;
+    return console_redirect_set(node) == 0 ? 0 : -EIO;
+  }
+
   if ((strcmp(node->name, "tty") == 0 || strcmp(node->name, "console") == 0)) {
     if (request == B1NIX_TIOCSCTTY) {
       /* A session leader claims the console: its group becomes the foreground
@@ -7157,6 +7578,7 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
     }
     if (request == B1NIX_TIOCNOTTY)
       return 0;
+
     /* TIOCVHANGUP / TCFLSH / TCSBRK / TIOCEXCL / TIOCNXCL: nothing to do on a
      * console with no line discipline state to throw away, and each is
      * "succeeded" rather than "unsupported" because that is the truth — there
@@ -7166,6 +7588,87 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
         request == 0x540D /* TIOCNXCL */)
       return 0;
   }
+
+  /* These come BEFORE the "an ioctl with no argument is a mistake" rule
+   * below: RAID_AUTORUN, NBD_DO_IT, NBD_CLEAR_SOCK and NBD_DISCONNECT all
+   * carry no argument, and the blanket rejection turned every one of them into
+   * "ioctl 0x914 failed: Invalid argument" without the handler ever running. */
+  /* The nbd ioctls (0xab00..0xab0a), as nbd-client issues them.
+   *
+   * The client has already connected and completed the handshake; what reaches
+   * here is the geometry it learned and the socket it learned it on. The
+   * device is named by the node the ioctl was issued on -- /dev/nbd0 is
+   * device 0 -- so the kernel does not have to guess which export is meant.
+   */
+  if ((request & 0xFF00) == 0xab00) {
+    struct cred *c = scheduler_get_current_cred();
+    unsigned index = 0;
+    const char *nm = node->name;
+
+    if (!cred_has_cap(c, CAP_SYS_ADMIN))
+      return -EPERM;
+    if (strncmp(nm, "nbd", 3) != 0)
+      return -ENOTTY;
+    for (const char *p = nm + 3; *p >= '0' && *p <= '9'; p++)
+      index = index * 10 + (unsigned)(*p - '0');
+
+    struct nbd_device *nd = nbd_device_at(index);
+    if (!nd)
+      return -ENODEV;
+
+    switch (request & 0xFF) {
+    case 0x00: { /* NBD_SET_SOCK: the connected socket, by descriptor */
+      struct vfs_handle *sock = vfs_handle_acquire((int)(isize)arg);
+
+      if (!sock)
+        return -EBADF;
+      int rc = nbd_set_socket(nd, sock);
+      if (rc != 0)
+        vfs_handle_release(sock);
+      return rc;
+    }
+    case 0x01: /* NBD_SET_BLKSIZE */
+      return nbd_set_geometry(nd, (u32)(usize)arg, nbd_block_count(nd));
+    case 0x02: /* NBD_SET_SIZE: bytes */
+      return nbd_set_geometry(nd, nbd_block_size(nd),
+                              (u64)(usize)arg / (nbd_block_size(nd) ?: 512));
+    case 0x07: /* NBD_SET_SIZE_BLOCKS */
+      return nbd_set_geometry(nd, nbd_block_size(nd) ?: 512, (u64)(usize)arg);
+    case 0x03: /* NBD_DO_IT: serve until disconnected */
+      return nbd_run(nd);
+    case 0x04: /* NBD_CLEAR_SOCK */
+    case 0x05: /* NBD_CLEAR_QUE — nothing is queued here; clearing is the same */
+      return nbd_clear_socket(nd);
+    case 0x08: /* NBD_DISCONNECT */
+      return nbd_disconnect(nd);
+    case 0x06: /* NBD_PRINT_DEBUG */
+    case 0x09: /* NBD_SET_TIMEOUT */
+    case 0x0a: /* NBD_SET_FLAGS */
+      return 0;
+    default:
+      return -ENOTTY;
+    }
+  }
+
+  /* RAID_AUTORUN: "find the arrays and start them".
+   *
+   * The number is _IO(MD_MAJOR=9, 0x14) = 0x0914, which is what raidautorun
+   * actually sends -- an invented one produced "ioctl 0x914 failed: Invalid
+   * argument" and no assembly at all.
+   *
+   * This is what `raidautorun /dev/md0` asks for, and it is the only assembly
+   * path here -- there is no mdadm on this system, so an array is described by
+   * the superblocks its members carry and brought up by this scan. Requires
+   * CAP_SYS_ADMIN: assembling an array publishes a new block device.
+   */
+  if (request == 0x0914) {
+    struct cred *c = scheduler_get_current_cred();
+
+    if (!cred_has_cap(c, CAP_SYS_ADMIN))
+      return -EPERM;
+    return md_autorun() > 0 ? 0 : -ENODEV;
+  }
+
 
   if (!arg)
     return -EINVAL;

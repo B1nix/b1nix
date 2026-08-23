@@ -9,7 +9,7 @@
  * changes wake any poller blocked on vfs_poll_chan, so the objects work with
  * poll(2), select(2) and the epoll added here.
  *
- * The kernel timer tick (100 Hz) drives timerfd: scheduler_on_timer_tick calls
+ * The kernel timer tick drives timerfd: scheduler_on_timer_tick calls
  * eventpoll_timer_tick(), which — only when at least one timerfd is armed —
  * wakes vfs_poll_chan so blocked pollers re-scan and observe expirations. The
  * expiration count itself is computed lazily from the monotonic tick on each
@@ -28,9 +28,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Ticks are 100 Hz (10 ms), matching the poll/select millisecond conversion
- * elsewhere in the kernel. */
-#define TICKS_PER_SEC 100ULL
+/* The tick rate the timer was actually programmed with -- read, never written
+ * out. It has not been 100 Hz since the LAPIC timer could be calibrated, and a
+ * comment claiming otherwise is how a reader talks themselves into hardcoding
+ * it again. */
+#define TICKS_PER_SEC SCHED_TICKS_PER_SEC /* see sched.h */
 
 extern int syscall_copyin(void *dst, const void *user_src, usize size);
 extern int syscall_copyout(void *user_dst, const void *src, usize size);
@@ -353,10 +355,38 @@ int vfs_timerfd_settime(int fd, int flags,
    * set ever fired. TFD_TIMER_CANCEL_ON_SET is accepted and has no effect:
    * this kernel does not report a stepped wall clock to a sleeping timer. */
   if (!disarm && (flags & B1NIX_TFD_TIMER_ABSTIME)) {
-    u64 now_clock = timerfd_now_ticks(t->clockid);
-    /* A deadline that has already passed fires at once, as on Linux. One tick
-     * rather than zero, because zero is how this state says "disarmed". */
-    value = value > now_clock ? value - now_clock : 1;
+    /* Resolve the deadline on the clock the caller read it from.
+     *
+     * This converted the deadline to scheduler ticks and compared it against
+     * the uptime tick count — a different, coarser clock than the
+     * CLOCK_MONOTONIC userspace used to compute it. The two need only disagree
+     * by more than the interval being timed for every deadline to look already
+     * past, and a compositor asking for the next frame in sixteen milliseconds
+     * then gets a timer that fires immediately, for ever: it spins repainting
+     * and never services anything else, which is what "the compositor hangs
+     * the machine" turned out to be.
+     *
+     * The monotonic case is computed in nanoseconds against the same counter
+     * clock_gettime answers from, and only the resulting delay is turned into
+     * ticks. The realtime case keeps the seconds-based comparison, which is
+     * the clock those deadlines are actually expressed on. */
+    if (t->clockid == B1NIX_CLOCK_REALTIME ||
+        t->clockid == B1NIX_CLOCK_REALTIME_ALARM) {
+      u64 now_clock = timerfd_now_ticks(t->clockid);
+
+      value = value > now_clock ? value - now_clock : 1;
+    } else {
+      extern u64 arch_tsc_monotonic_ns(void);
+      u64 now_ns = arch_tsc_monotonic_ns();
+      u64 want_ns = (u64)new_value->it_value.tv_sec * 1000000000ull +
+                    (u64)new_value->it_value.tv_nsec;
+      u64 tick_ns = 1000000000ull / TICKS_PER_SEC;
+      u64 delay_ns = want_ns > now_ns ? want_ns - now_ns : 0;
+
+      value = (delay_ns + tick_ns - 1) / tick_ns;
+      if (value == 0)
+        value = 1; /* already due: fire on the next tick, not never */
+    }
   }
 
   while (__atomic_test_and_set(&t->lock, __ATOMIC_ACQUIRE))
@@ -838,7 +868,7 @@ int vfs_epoll_wait(int epfd, struct b1nix_epoll_event *events, int maxevents,
   u64 start_ticks = scheduler_get_uptime_ticks();
   /* timeout in ms; <0 means wait forever, matching epoll_wait(2). */
   u64 timeout_ticks =
-      (timeout < 0) ? (u64)-1 : ((u64)timeout) / (1000ULL / TICKS_PER_SEC);
+      (timeout < 0) ? (u64)-1 : SCHED_MS_TO_TICKS((u64)timeout);
 
   if (timeout > 0) {
     u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;

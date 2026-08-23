@@ -17,6 +17,7 @@
 #include <b1nix/procfs.h>
 #include <b1nix/sched.h>
 #include <b1nix/sysfs_attr.h>
+#include <b1nix/uevent.h>
 #include <b1nix/arch.h>
 #include <b1nix/vfs.h>
 #include <b1nix/version.h>
@@ -25,6 +26,17 @@
 #include <string.h>
 
 typedef int (*sysfs_render)(char *buf, usize cap);
+
+/* The identity a writable `uevent` file re-announces. Held per node so a write
+ * can rebuild the same message the device's own registration sent, rather than
+ * a second, differently-shaped description of one device. */
+struct sysfs_uevent {
+  char devpath[96];
+  char subsystem[24];
+  char devname[40];
+  int major;
+  int minor;
+};
 
 struct sysfs_node {
   sysfs_render render;
@@ -36,6 +48,9 @@ struct sysfs_node {
    * attached, and the sysfs tree is built long before that. */
   int ident_blk;       /* >=0: index into the block registry, else -1 */
   int ident_kind;      /* SYSFS_IDENT_* */
+  /* Non-NULL on a `uevent` file: writing an action to it re-announces the
+   * device on the hotplug netlink group. */
+  struct sysfs_uevent *ue;
 };
 
 #define SYSFS_IDENT_UUID   1
@@ -233,6 +248,7 @@ static void sysfs_mk_ident(struct vfs_node *parent, int blk_index) {
 
 static struct vfs_node *g_sysfs_block;
 static struct vfs_node *g_sysfs_devblock;
+static struct vfs_node *g_sysfs_devchar;
 static struct vfs_node *g_sysfs_classblock;
 /* The registry generation the tree below was built from. */
 static u32 g_sysfs_blk_gen;
@@ -306,12 +322,152 @@ static int sysfs_blk_index(struct block_device *dev) {
   return -1;
 }
 
+/* Writing to a `uevent` file re-announces the device.
+ *
+ * This is not a convenience: it is the whole of device coldplug. A kernel
+ * announces each device once, when it appears, which for everything present at
+ * boot is long before any listener exists. `udevadm trigger` — and mdev -s, and
+ * every other hotplug manager — recovers those missed announcements by writing
+ * "add" to each device's uevent file, and a kernel that ignores the write
+ * leaves udev with an empty database and systemd with no `.device` unit at all.
+ *
+ * The accepted actions are Linux's; the event carries the same DEVPATH,
+ * SUBSYSTEM, DEVNAME and MAJOR/MINOR the device's own registration sent, so a
+ * triggered event and a real hotplug event are indistinguishable, which is
+ * exactly what makes the trigger worth having.
+ */
+static isize sysfs_uevent_write_cb(struct vfs_node *node, u64 offset,
+                                   const char *buffer, usize size, int flags) {
+  (void)offset;
+  (void)flags;
+  struct sysfs_node *sn = node ? (struct sysfs_node *)node->inode->data : 0;
+  if (!sn || !sn->ue || !buffer || size == 0)
+    return -EINVAL;
+
+  /* The first word is the action; udev appends a synthetic-event UUID after
+   * it, which the kernel records but nothing here needs. */
+  char action[16];
+  usize n = 0;
+  while (n < size && n < sizeof(action) - 1 && buffer[n] != ' ' &&
+         buffer[n] != '\n' && buffer[n] != '\0')
+    n++;
+  memcpy(action, buffer, n);
+  action[n] = '\0';
+
+  static const char *const known[] = {"add",  "remove", "change", "move",
+                                      "online", "offline", "bind", "unbind"};
+  int ok = 0;
+  for (usize i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+    if (strcmp(action, known[i]) == 0) {
+      ok = 1;
+      break;
+    }
+  }
+  if (!ok)
+    return -EINVAL;
+
+  uevent_post(action, sn->ue->devpath, sn->ue->subsystem,
+              sn->ue->devname[0] ? sn->ue->devname : 0, sn->ue->major,
+              sn->ue->minor);
+  return (isize)size;
+}
+
 /* The `uevent` file, in the shape Linux writes it: the properties a helper
- * reads for a device it did not learn about from a netlink message. */
-static void sysfs_mk_uevent(struct vfs_node *dir, usize index, const char *name,
-                            const char *devtype) {
+ * reads for a device it did not learn about from a netlink message, and a
+ * write that re-announces the device. */
+static void sysfs_mk_uevent_at(struct vfs_node *dir, const char *devpath,
+                               const char *subsystem, usize index,
+                               const char *name, const char *devtype) {
   sysfs_mkstr(dir, "uevent", "MAJOR=%d\nMINOR=%lu\nDEVNAME=%s\nDEVTYPE=%s\n",
               BLK_SYSFS_MAJOR, (unsigned long)index, name, devtype);
+  struct vfs_node *n = sysfs_child(dir, "uevent");
+  if (!n)
+    return;
+  struct sysfs_node *sn = (struct sysfs_node *)n->inode->data;
+  if (!sn)
+    return;
+  struct sysfs_uevent *ue = kzalloc(sizeof(*ue));
+  if (!ue)
+    return;
+  strncpy(ue->devpath, devpath, sizeof(ue->devpath) - 1);
+  strncpy(ue->subsystem, subsystem, sizeof(ue->subsystem) - 1);
+  strncpy(ue->devname, name, sizeof(ue->devname) - 1);
+  ue->major = BLK_SYSFS_MAJOR;
+  ue->minor = (int)index;
+  sn->ue = ue;
+  n->inode->mode = 0644;
+  n->inode->write_cb = sysfs_uevent_write_cb;
+}
+
+/* The `subsystem` symlink every Linux device directory carries. udev reads its
+ * basename to learn which subsystem a device enumerated from /sys belongs to;
+ * without it a device found by a scan has no subsystem, and every
+ * SUBSYSTEM=="…" rule — including the one that tags block devices for systemd
+ * — silently fails to match. */
+static void sysfs_mk_subsystem_link(struct vfs_node *dir, const char *target) {
+  if (!dir || sysfs_child(dir, "subsystem"))
+    return;
+  struct vfs_node *n = sysfs_mkchild(dir, "subsystem", VFS_SYMLINK, 0);
+  if (!n)
+    return;
+  usize len = strlen(target);
+  char *copy = kmalloc(len + 1);
+  if (!copy)
+    return;
+  memcpy(copy, target, len + 1);
+  n->inode->mode = 0777;
+  n->inode->data = copy;
+  n->inode->size = len;
+}
+
+/* The `queue` directory a whole disk carries, and a partition does not.
+ *
+ * That distinction is not decoration: it is how systemd tells the two apart.
+ * block_get_whole_disk() asks for <dev>/queue first and calls the device a
+ * whole disk if it is there; failing that it looks for <dev>/partition and
+ * walks to the parent. b1nix published neither for a disk, so systemd-udevd
+ * answered `vda: Failed to get whole disk device: No such file or directory`,
+ * abandoned the event before running a single rule -- `Failed to process
+ * device, ignoring` -- and the device was never tagged. An untagged device
+ * gets no `.device` unit, so nothing that is `BoundTo=` a device could ever
+ * start on this machine.
+ *
+ * Every value below is one the block layer actually knows. Attributes whose
+ * answer this kernel does not have (optimal_io_size, write_cache) are left out
+ * rather than guessed: a wrong number here is a number a filesystem will lay
+ * itself out around. The scheduler really is `none` -- there is no I/O
+ * scheduler to name. */
+static void sysfs_mk_queue_dir(struct vfs_node *dir, struct block_device *d) {
+  if (!dir || !d || sysfs_child(dir, "queue"))
+    return;
+  struct vfs_node *q = sysfs_mkchild(dir, "queue", VFS_DIRECTORY, 0);
+  if (!q)
+    return;
+
+  unsigned long bs = (unsigned long)(d->block_size ? d->block_size : 512);
+  u32 max_sectors = d->limits.max_sectors ? d->limits.max_sectors
+                                          : BLK_DEF_MAX_SECTORS;
+  u32 max_segments = d->limits.max_segments ? d->limits.max_segments
+                                            : BLK_DEF_MAX_SEGMENTS;
+  u32 depth = d->limits.queue_depth ? d->limits.queue_depth
+                                    : BLK_DEF_QUEUE_DEPTH;
+
+  sysfs_mkstr(q, "logical_block_size", "%lu\n", bs);
+  sysfs_mkstr(q, "physical_block_size", "%lu\n", bs);
+  sysfs_mkstr(q, "hw_sector_size", "%lu\n", bs);
+  sysfs_mkstr(q, "minimum_io_size", "%lu\n", bs);
+  /* Linux reports these in KiB, from a limit counted in 512-byte sectors. */
+  sysfs_mkstr(q, "max_sectors_kb", "%lu\n", (unsigned long)(max_sectors / 2));
+  sysfs_mkstr(q, "max_hw_sectors_kb", "%lu\n",
+              (unsigned long)(max_sectors / 2));
+  sysfs_mkstr(q, "max_segments", "%lu\n", (unsigned long)max_segments);
+  sysfs_mkstr(q, "nr_requests", "%lu\n", (unsigned long)depth);
+  sysfs_mkstr(q, "rotational", "%d\n", d->rotational ? 1 : 0);
+  /* No I/O scheduler exists here, and Linux spells that "none". */
+  sysfs_mkstr(q, "scheduler", "none\n");
+  /* Zero means "does not support discard", which is exactly true of a device
+   * whose driver never offered the command. */
+  sysfs_mkstr(q, "discard_granularity", "%lu\n", d->discard ? bs : 0UL);
 }
 
 /* Publish one registry entry in all three directories. */
@@ -333,6 +489,15 @@ static void sysfs_block_publish(usize index, struct block_device *d) {
   snprintf(majmin, sizeof(majmin), "%d:%lu", BLK_SYSFS_MAJOR,
            (unsigned long)index);
 
+  /* One canonical DEVPATH per device, the same one blk_announce() puts in the
+   * hotplug message, so a re-announcement triggered through any of the three
+   * directories below names the device udev already knows. */
+  char devpath[96];
+  if (part && parent && parent->name)
+    snprintf(devpath, sizeof(devpath), "/block/%s/%s", parent->name, d->name);
+  else
+    snprintf(devpath, sizeof(devpath), "/block/%s", d->name);
+
   /* /sys/block/<disk>/ — a partition is a subdirectory of its disk, which the
    * ascending walk over the registry has already published (a partition is
    * only ever registered by the scan that follows its disk). */
@@ -351,9 +516,12 @@ static void sysfs_block_publish(usize index, struct block_device *d) {
       } else {
         sysfs_mkstr(bd, "removable", "%d\n", blk_is_removable(d));
         sysfs_mkstr(bd, "ro", "0\n");
+        sysfs_mk_queue_dir(bd, d);
       }
       sysfs_mk_ident(bd, (int)index);
-      sysfs_mk_uevent(bd, index, d->name, devtype);
+      sysfs_mk_uevent_at(bd, devpath, "block", index, d->name, devtype);
+      sysfs_mk_subsystem_link(bd, part ? "../../../class/block"
+                                       : "../../class/block");
     }
   }
 
@@ -366,7 +534,10 @@ static void sysfs_block_publish(usize index, struct block_device *d) {
       sysfs_mk_live_size(dbd, (int)index);
       if (part)
         sysfs_mkstr(dbd, "partition", "%d\n", partno);
-      sysfs_mk_uevent(dbd, index, d->name, devtype);
+      else
+        sysfs_mk_queue_dir(dbd, d);
+      sysfs_mk_uevent_at(dbd, devpath, "block", index, d->name, devtype);
+      sysfs_mk_subsystem_link(dbd, "../../../class/block");
     }
   }
 
@@ -389,7 +560,10 @@ static void sysfs_block_publish(usize index, struct block_device *d) {
         sysfs_mkchild(g_sysfs_classblock, d->name, VFS_DIRECTORY, 0);
     if (cb) {
       sysfs_mkstr(cb, "dev", "%s\n", majmin);
-      sysfs_mk_uevent(cb, index, d->name, devtype);
+      if (!part)
+        sysfs_mk_queue_dir(cb, d);
+      sysfs_mk_uevent_at(cb, devpath, "block", index, d->name, devtype);
+      sysfs_mk_subsystem_link(cb, "../../../class/block");
     }
   }
 
@@ -497,11 +671,149 @@ static void sysfs_block_hook(struct vfs_node *dir) {
   dir->inode->readdir_lists_children = 1;
 }
 
+/* ── /sys/dev/char ──────────────────────────────────────────────────────────
+ *
+ * The counterpart of /sys/dev/block, and it did not exist at all: the `dev`
+ * directory carried only `block`. That is the view libudev uses to find a
+ * device by its number -- udev_device_new_from_devnum() for a character device
+ * looks up /sys/dev/char/<major>:<minor> and gets nothing -- so every
+ * character device in the machine was invisible to anything that identifies
+ * devices the way udev does rather than by path.
+ *
+ * Populated from the character devices actually present under /dev: a node is
+ * listed here because it exists, with the numbers it really reports as
+ * st_rdev. Nothing is enumerated that the kernel has not created.
+ *
+ * What is deliberately NOT here is the `device` symlink. On Linux it points
+ * into /sys/devices/... at the bus address the node hangs off, and libdrm's
+ * drmGetDevice2() follows it to read a card's vendor and device id. b1nix's
+ * sysfs has no bus tree to point at -- /sys/devices holds `system` and nothing
+ * else -- so there is no target that would be true. A symlink to a directory
+ * we invented would be worse than its absence: absence is an honest "this
+ * kernel does not publish bus topology", which a caller can handle, while a
+ * wrong link is an answer it cannot check. Publishing the bus tree is the
+ * separate piece of work this needs.
+ */
+static const char *sysfs_char_subsystem(u32 major) {
+  /* Only where the major really is one of ours. An unknown major gets no
+   * subsystem link rather than a guessed one. */
+  switch (major) {
+  case 226:
+    return "drm";
+  case 4:
+  case 5:
+  case 136:
+    return "tty";
+  case 1:
+    return "mem";
+  case 10:
+    return "misc";
+  default:
+    return 0;
+  }
+}
+
+static void sysfs_char_publish(struct vfs_node *devnode, const char *name) {
+  if (!g_sysfs_devchar || !devnode || !devnode->inode)
+    return;
+  u64 rdev = devnode->inode->rdev;
+  if (!rdev)
+    return; /* no device number: nothing to file it under */
+  u32 major = (u32)(rdev >> 8);
+  u32 minor = (u32)(rdev & 0xff);
+  /* Block devices have their own view; this one is for character devices. */
+  if (major == BLK_SYSFS_MAJOR)
+    return;
+  /* DRM (226) publishes its own entries here, and they are better than what
+   * this walk could build: each is a LINK to the card's minor directory, which
+   * carries the `device` link up to the PCI node -- the chain libdrm follows
+   * to name the bus a card sits on. Creating a plain directory of the same
+   * name would shadow that link and leave /sys/dev/char/226:N/device missing,
+   * which is worse than not publishing the entry at all. */
+  if (major == 226)
+    return;
+
+  char majmin[24];
+  snprintf(majmin, sizeof(majmin), "%u:%u", (unsigned)major, (unsigned)minor);
+  if (sysfs_child(g_sysfs_devchar, majmin))
+    return;
+  struct vfs_node *cd =
+      sysfs_mkchild(g_sysfs_devchar, majmin, VFS_DIRECTORY, 0);
+  if (!cd)
+    return;
+  sysfs_mkstr(cd, "dev", "%s\n", majmin);
+  /* The same four properties Linux puts in a character device's uevent. */
+  sysfs_mkstr(cd, "uevent", "MAJOR=%u\nMINOR=%u\nDEVNAME=%s\n",
+              (unsigned)major, (unsigned)minor, name);
+  const char *sub = sysfs_char_subsystem(major);
+  if (sub) {
+    char target[64];
+    snprintf(target, sizeof(target), "../../../class/%s", sub);
+    sysfs_mk_subsystem_link(cd, target);
+  }
+}
+
+/* Walk /dev and file every character device under /sys/dev/char. Called on
+ * lookup and readdir, so a node created after the mount still appears -- the
+ * same laziness /sys/dev/block already uses.
+ *
+ * Recursive, because the devices that most need this are not at the top level:
+ * a DRM card is /dev/dri/card0 and a pty slave is /dev/pts/N, so a walk of
+ * /dev's immediate children would have found neither -- and finding the DRM
+ * node by its number is the whole reason libdrm reads this directory. DEVNAME
+ * is the path relative to /dev, which is what Linux puts there ("dri/card0",
+ * not "card0"). Depth is bounded: /dev is a device tree, not a filesystem to
+ * recurse into without limit. */
+static void sysfs_char_walk(struct vfs_node *dir, const char *prefix,
+                            int depth) {
+  if (!dir || depth > 3)
+    return;
+  for (struct vfs_node *c = dir->first_child; c; c = c->next_sibling) {
+    if (!c->inode || c->deleted)
+      continue;
+    char name[96];
+    if (prefix[0])
+      snprintf(name, sizeof(name), "%s/%s", prefix, c->name);
+    else
+      snprintf(name, sizeof(name), "%s", c->name);
+    if (c->inode->type == VFS_DIRECTORY) {
+      sysfs_char_walk(c, name, depth + 1);
+      continue;
+    }
+    if (c->inode->type != VFS_DEVICE)
+      continue;
+    sysfs_char_publish(c, name);
+  }
+}
+
+static void sysfs_char_refresh(void) {
+  if (!g_sysfs_devchar)
+    return;
+  struct vfs_node *dev = vfs_find_node("/dev");
+  if (!dev || IS_ERR(dev))
+    return;
+  sysfs_char_walk(dev, "", 0);
+  vfs_node_put(dev);
+}
+
+static isize sysfs_char_readdir(struct vfs_node *dir, usize offset,
+                                struct dirent *buf, usize max_entries) {
+  sysfs_char_refresh();
+  return vfs_readdir_children(dir, offset, buf, max_entries);
+}
+
+static int sysfs_char_lookup(struct vfs_node *dir, const char *name) {
+  sysfs_char_refresh();
+  return sysfs_child(dir, name) ? 0 : -1;
+}
+
 static void sysfs_build_block(struct vfs_node *root) {
   struct vfs_node *block = sysfs_mkchild(root, "block", VFS_DIRECTORY, 0);
   struct vfs_node *devp = sysfs_mkchild(root, "dev", VFS_DIRECTORY, 0);
   struct vfs_node *devblock =
       devp ? sysfs_mkchild(devp, "block", VFS_DIRECTORY, 0) : 0;
+  struct vfs_node *devchar =
+      devp ? sysfs_mkchild(devp, "char", VFS_DIRECTORY, 0) : 0;
   struct vfs_node *classp = sysfs_mkchild(root, "class", VFS_DIRECTORY, 0);
   struct vfs_node *classblock =
       classp ? sysfs_mkchild(classp, "block", VFS_DIRECTORY, 0) : 0;
@@ -516,10 +828,18 @@ static void sysfs_build_block(struct vfs_node *root) {
   memset(g_sysfs_blkent, 0, sizeof(g_sysfs_blkent));
   g_sysfs_blk_gen = 0; /* blk_generation() is never 0 — forces the first build */
 
+  g_sysfs_devchar = devchar;
+  if (devchar && devchar->inode) {
+    devchar->inode->readdir_cb = sysfs_char_readdir;
+    devchar->inode->lookup_cb = sysfs_char_lookup;
+    devchar->inode->readdir_lists_children = 1;
+  }
+
   sysfs_block_hook(block);
   sysfs_block_hook(devblock);
   sysfs_block_hook(classblock);
   sysfs_block_refresh();
+  sysfs_char_refresh();
 }
 
 /* ── content generators ── */

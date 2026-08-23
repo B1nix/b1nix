@@ -23,6 +23,7 @@
 
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/cgroup.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
 #include <b1nix/kmsg.h>
@@ -45,8 +46,9 @@
 #include <stdio.h>
 #include <string.h>
 
-/* 100 Hz LAPIC tick (see kernel_main: lapic_timer_start_periodic_ms(10)). */
-#define PROCFS_HZ 100u
+/* The scheduler tick, as programmed — /proc reports times in these units and a
+ * literal here would misreport every one of them the moment the rate changed. */
+#define PROCFS_HZ (sched_tick_hz())
 
 /* ── tiny string builder over a fixed buffer ── */
 struct sbuf {
@@ -323,6 +325,14 @@ static struct vfs_node *procfs_mkchild(struct vfs_node *parent,
   n->inode->uid = 0;
   n->inode->gid = 0;
   n->inode->nlink = (type == VFS_DIRECTORY) ? 2 : 1;
+  /* A /proc file is served through a device-style read callback, but to
+   * anyone who stats it it is a REGULAR FILE — that is what it is on Linux,
+   * and programs check. systemd's read_virtual_file() fstat()s the descriptor
+   * and returns EBADF for anything that is not S_ISREG, so /proc/cmdline
+   * reported as a character device made PID 1 fail before it had started:
+   * "Failed to fix up PID 1 environment: Bad file descriptor". */
+  if (type != VFS_DIRECTORY && type != VFS_SYMLINK)
+    n->inode->flags |= VFS_NODE_PSEUDO_REG;
   if (render) {
     struct procfs_node *pn = kzalloc(sizeof(*pn));
     if (pn) {
@@ -335,6 +345,24 @@ static struct vfs_node *procfs_mkchild(struct vfs_node *parent,
   n->parent = parent;
   n->refcount++;
   vfs_attach_child(parent, n);
+  return n;
+}
+
+/* Same, for a per-process file: the pid the renderer and writer are called
+ * with is the process the file belongs to, not 0. */
+static struct vfs_node *procfs_mkchild_writable_pid(struct vfs_node *parent,
+                                                    const char *name,
+                                                    procfs_render render,
+                                                    procfs_writer write,
+                                                    usize pid) {
+  struct vfs_node *n = procfs_mkchild(parent, name, VFS_DEVICE, render, pid);
+  if (!n)
+    return 0;
+  struct procfs_node *pn = pn_of(n);
+  if (pn)
+    pn->write = write;
+  n->inode->mode = 0644;
+  n->inode->write_cb = procfs_write_cb;
   return n;
 }
 
@@ -373,10 +401,21 @@ static int r_meminfo(usize pid, struct sbuf *s) {
 static int r_uptime(usize pid, struct sbuf *s) {
   (void)pid;
   u64 ticks = scheduler_get_uptime_ticks();
-  u64 sec = ticks / PROCFS_HZ;
-  u64 cs = (ticks % PROCFS_HZ); /* centiseconds at 100 Hz */
-  sb_addf(s, "%lu.%lu %lu.%lu\n", (unsigned long)sec, (unsigned long)cs,
-          (unsigned long)sec, (unsigned long)cs);
+  u64 hz = PROCFS_HZ;
+  u64 sec = ticks / hz;
+  /* Hundredths, derived from the tick rate rather than assuming it.
+   *
+   * This printed `ticks % 100` and called the result centiseconds, which is
+   * true at one rate and at no other: at a kilohertz tick the remainder counts
+   * milliseconds, and printed without padding it also lost them — five
+   * milliseconds past the second came out as ".5", i.e. half a second. Linux
+   * prints two digits here and so does this. */
+  u64 cs = (ticks % hz) * 100u / hz;
+
+  sb_addf(s, "%lu.%lu%lu %lu.%lu%lu\n", (unsigned long)sec,
+          (unsigned long)(cs / 10), (unsigned long)(cs % 10),
+          (unsigned long)sec, (unsigned long)(cs / 10),
+          (unsigned long)(cs % 10));
   return 0;
 }
 
@@ -538,6 +577,76 @@ static int r_sys_domainname(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/sys/kernel/random/boot_id — 128 random bits, formatted as a UUID, the
+ * same for every reader for as long as the machine is up.
+ *
+ * It is not decoration. systemd-journald stamps every journal file header with
+ * it (sd_id128_get_boot), and a missing file is ENOENT there — which journald
+ * reports as "Failed to open runtime journal: No such file or directory" and
+ * exits 1 on, forever, taking every unit that logs with it. `uuid` is the same
+ * shape with a fresh value on each read, which is what Linux gives.
+ *
+ * Generated once, lazily, from the kernel's own entropy source. */
+static void proc_uuid_str(char out[37], const u64 v[2]) {
+  static const char hex[] = "0123456789abcdef";
+  u8 b[16];
+  for (int i = 0; i < 8; i++) {
+    b[i] = (u8)(v[0] >> (8 * i));
+    b[8 + i] = (u8)(v[1] >> (8 * i));
+  }
+  /* RFC 4122 version 4, variant 1 — what Linux writes and what
+   * sd_id128_from_string() accepts. */
+  b[6] = (u8)((b[6] & 0x0f) | 0x40);
+  b[8] = (u8)((b[8] & 0x3f) | 0x80);
+  int o = 0;
+  for (int i = 0; i < 16; i++) {
+    if (i == 4 || i == 6 || i == 8 || i == 10)
+      out[o++] = '-';
+    out[o++] = hex[(b[i] >> 4) & 0xf];
+    out[o++] = hex[b[i] & 0xf];
+  }
+  out[o] = '\0';
+}
+
+static int r_sys_boot_id(usize pid, struct sbuf *s) {
+  (void)pid;
+  static u64 boot_id[2];
+  static int have;
+  if (!have) {
+    boot_id[0] = kernel_random_u64();
+    boot_id[1] = kernel_random_u64();
+    have = 1;
+  }
+  char u[37];
+  proc_uuid_str(u, boot_id);
+  sb_addf(s, "%s\n", u);
+  return 0;
+}
+
+static int r_sys_random_uuid(usize pid, struct sbuf *s) {
+  (void)pid;
+  u64 v[2] = {kernel_random_u64(), kernel_random_u64()};
+  char u[37];
+  proc_uuid_str(u, v);
+  sb_addf(s, "%s\n", u);
+  return 0;
+}
+
+/* The pool is a CSPRNG that never blocks here, so it is always full. */
+static int r_sys_entropy_avail(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "256\n");
+  return 0;
+}
+
+/* The highest capability this kernel knows. libcap and systemd read it to size
+ * their bounding-set loops; without it they fall back to guessing. */
+static int r_sys_cap_last_cap(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%d\n", CAP_LAST_CAP);
+  return 0;
+}
+
 static int r_sys_ostype(usize pid, struct sbuf *s) {
   (void)pid;
   sb_puts(s, "B1NIX\n");
@@ -551,6 +660,19 @@ static int r_sys_osrelease(usize pid, struct sbuf *s) {
 }
 
 static int r_sys_pid_max(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%lu\n", (unsigned long)scheduler_max_tasks());
+  return 0;
+}
+
+/* /proc/sys/kernel/threads-max — the system-wide ceiling on tasks.
+ *
+ * systemd reads it together with pid_max to turn DefaultTasksMax=15% into a
+ * number before it starts a unit (procfs_tasks_get_limit). A missing file is
+ * ENOENT there, and the manager reports it as "Failed to run 'start' task: No
+ * such file or directory" without ever forking -- so the unit never runs and
+ * the message names no file. b1nix's ceiling is its task table. */
+static int r_sys_threads_max(usize pid, struct sbuf *s) {
   (void)pid;
   sb_addf(s, "%lu\n", (unsigned long)scheduler_max_tasks());
   return 0;
@@ -789,6 +911,21 @@ static int r_b1nix_prof(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/b1nix-tasks — reading it prints the scheduler's task dump to the
+ * console. The same dump b1nix.task-watch prints on a ten-second timer, but
+ * asked for at a chosen moment instead: a harness that has just watched a
+ * daemon stop answering can take one sample right then and see which syscall
+ * every task is in, rather than paying for sixty dumps of a healthy machine to
+ * catch the one that is not. */
+static int r_b1nix_tasks(usize pid, struct sbuf *s) {
+  extern void scheduler_dump_tasks(void);
+
+  (void)pid;
+  scheduler_dump_tasks();
+  sb_puts(s, "task dump written to console\n");
+  return 0;
+}
+
 static int r_cmdline(usize pid, struct sbuf *s) {
   (void)pid;
   const char *cmd = bootinfo_cmdline();
@@ -827,7 +964,13 @@ static int r_kallsyms(usize pid, struct sbuf *s) {
  * breaks process lookup by name. `out` must hold at least 16 bytes. */
 #define PROC_COMM_LEN 16
 static void proc_comm(const struct task *t, char out[PROC_COMM_LEN]) {
-  const char *name = (t && t->name) ? t->name : "?";
+  /* A process that renamed itself is listed under the name it chose. PR_SET_NAME
+   * recorded one and nothing ever read it back, so systemd -- exec'd by the
+   * kernel as /sbin/init and renamed to "systemd" straight away -- was still
+   * reported as "init" by /proc/1/comm, which is the file every "which init is
+   * this" check reads. */
+  const char *chosen = t ? scheduler_comm_override(t->id) : 0;
+  const char *name = chosen ? chosen : ((t && t->name) ? t->name : "?");
   const char *base = strrchr(name, '/');
   base = base ? base + 1 : name;
   if (!*base) /* trailing slash, e.g. a directory exec path */
@@ -937,6 +1080,143 @@ static int r_pid_comm(usize pid, struct sbuf *s) {
   char comm[PROC_COMM_LEN];
   proc_comm(t, comm);
   sb_addf(s, "%s\n", comm);
+  return 0;
+}
+
+/* /proc/<pid>/cgroup — the v2 line, "0::<path>".
+ *
+ * systemd asks this of itself before it does anything else: cg_pid_get_path()
+ * reads it to learn which cgroup PID 1 is in, and an absent file is ESRCH,
+ * which it reports as "Cannot determine cgroup we are running in" and freezes.
+ * There is exactly one hierarchy here, so there is exactly one line. */
+static int r_pid_cgroup(usize pid, struct sbuf *s) {
+  char path[128];
+  if (cgroup_path_of(pid, path, sizeof(path)) < 0)
+    return -ESRCH;
+  sb_addf(s, "0::%s\n", path);
+  return 0;
+}
+
+/*
+ * /proc/<pid>/oom_score_adj — the OOM-killer bias, recorded per process.
+ *
+ * systemd sets it on nearly every service it starts, and treats the write
+ * failing as fatal to the spawn: every unit in this image died at
+ * "Failed at step OOM_ADJUST" because the file was not there, which took
+ * dbus, journald and systemd-udevd down with it.
+ *
+ * It is a stored tunable here and it is reported honestly as one: this kernel
+ * has no OOM killer to bias — kmalloc panics rather than choosing a victim —
+ * so the value is what userspace set and nothing acts on it yet. Recording it
+ * in a side table keeps struct task the size it is.
+ */
+#define PROC_OOM_SLOTS 128
+#define PROC_OOM_MIN (-1000)
+#define PROC_OOM_MAX 1000
+
+static struct {
+  usize pid;
+  int adj;
+  u8 used;
+} g_oom_adj[PROC_OOM_SLOTS];
+static spinlock_t g_oom_lock;
+
+static int proc_oom_adj_get(usize pid) {
+  u64 flags;
+  int v = 0;
+  spin_lock_irqsave(&g_oom_lock, &flags);
+  for (usize i = 0; i < PROC_OOM_SLOTS; i++) {
+    if (g_oom_adj[i].used && g_oom_adj[i].pid == pid) {
+      v = g_oom_adj[i].adj;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&g_oom_lock, flags);
+  return v;
+}
+
+static void proc_oom_adj_set(usize pid, int adj) {
+  u64 flags;
+  usize free_slot = PROC_OOM_SLOTS;
+  spin_lock_irqsave(&g_oom_lock, &flags);
+  for (usize i = 0; i < PROC_OOM_SLOTS; i++) {
+    if (g_oom_adj[i].used && g_oom_adj[i].pid == pid) {
+      g_oom_adj[i].adj = adj;
+      spin_unlock_irqrestore(&g_oom_lock, flags);
+      return;
+    }
+    if (!g_oom_adj[i].used && free_slot == PROC_OOM_SLOTS)
+      free_slot = i;
+  }
+  /* The default is 0, so a process that cannot get a slot reads back the
+   * default rather than another process's value. */
+  if (adj != 0 && free_slot < PROC_OOM_SLOTS) {
+    g_oom_adj[free_slot].pid = pid;
+    g_oom_adj[free_slot].adj = adj;
+    g_oom_adj[free_slot].used = 1;
+  }
+  spin_unlock_irqrestore(&g_oom_lock, flags);
+}
+
+static int r_pid_oom_score_adj(usize pid, struct sbuf *s) {
+  sb_addf(s, "%d\n", proc_oom_adj_get(pid));
+  return 0;
+}
+
+static int w_pid_oom_score_adj(usize pid, const char *buf, usize len) {
+  int sign = 1, v = 0;
+  usize i = 0;
+  while (i < len && (buf[i] == ' ' || buf[i] == '\t'))
+    i++;
+  if (i < len && (buf[i] == '-' || buf[i] == '+')) {
+    sign = buf[i] == '-' ? -1 : 1;
+    i++;
+  }
+  if (i >= len || buf[i] < '0' || buf[i] > '9')
+    return -EINVAL;
+  for (; i < len && buf[i] >= '0' && buf[i] <= '9'; i++)
+    v = v * 10 + (buf[i] - '0');
+  v *= sign;
+  if (v < PROC_OOM_MIN || v > PROC_OOM_MAX)
+    return -EINVAL;
+  proc_oom_adj_set(pid, v);
+  return (int)len;
+}
+
+/* /proc/<pid>/oom_score — Linux derives it from the process's memory footprint
+ * and the bias above. With no OOM killer there is no victim ranking to report,
+ * so the bias is all this can honestly say. */
+static int r_pid_oom_score(usize pid, struct sbuf *s) {
+  int adj = proc_oom_adj_get(pid);
+  int score = adj < 0 ? 0 : adj;
+  sb_addf(s, "%d\n", score);
+  return 0;
+}
+
+/* /proc/cgroups — the controllers this kernel has. Hierarchy 0 is what Linux
+ * reports for a controller that is only available on the unified hierarchy. */
+static int r_cgroups(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "#subsys_name\thierarchy\tnum_cgroups\tenabled\n");
+  const char *c = cgroup_available_controllers();
+  while (c && *c) {
+    while (*c == ' ')
+      c++;
+    const char *start = c;
+    while (*c && *c != ' ' && *c != '\n')
+      c++;
+    if (c > start) {
+      char name[32];
+      usize n = (usize)(c - start);
+      if (n > sizeof(name) - 1)
+        n = sizeof(name) - 1;
+      memcpy(name, start, n);
+      name[n] = '\0';
+      sb_addf(s, "%s\t0\t1\t1\n", name);
+    }
+    if (*c == '\n')
+      break;
+  }
   return 0;
 }
 
@@ -1305,22 +1585,105 @@ struct procfs_fd_snap {
   struct vfs_node *node;
 };
 
+/* The symlink target buffer, allocated once per descriptor number and then
+ * rewritten in place. */
+#define PROCFS_FD_TARGET_MAX 256
+
+/* The magic-link half of /proc/<pid>/fd/<n>: what the descriptor holds right
+ * now, resolved from the owner's live fd table rather than by re-walking the
+ * path string this symlink reads back as.
+ *
+ * That distinction is the whole point of the file. systemd opens every mount
+ * destination O_PATH|O_NOFOLLOW and then calls mount(2) on /proc/self/fd/<n>,
+ * so that nothing can substitute a symlink for the destination in between --
+ * a re-walk of the name gives that guarantee away, and gives the wrong answer
+ * whenever the file's name has changed or it has none.
+ *
+ * A descriptor that holds no VFS node (a pipe, a socket, an eventfd) returns
+ * NULL: the resolver then falls back to the "pipe:[7]"-style string, which is
+ * exactly what it did before, so nothing that worked stops working. */
+static struct vfs_node *procfs_fd_magic_link(struct vfs_node *link) {
+  if (!link || !link->parent)
+    return ERR_PTR(-ENOENT);
+  int fd = 0;
+  for (const char *q = link->name; *q; q++) {
+    if (*q < '0' || *q > '9')
+      return ERR_PTR(-ENOENT);
+    fd = fd * 10 + (*q - '0');
+  }
+  usize pid = pid_from_parent(link->parent);
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return ERR_PTR(-ENOENT);
+  struct vfs_node *out = 0;
+  int open_fd = 0;
+  u64 flags;
+  spin_lock_irqsave(&t->fd_lock, &flags);
+  struct vfs_handle *h =
+      (t->fd_table && (usize)fd < t->fd_capacity) ? t->fd_table[fd] : 0;
+  if (h && h->used) {
+    open_fd = 1;
+    if (h->kind == VFS_HANDLE_NODE && h->node)
+      out = vfs_node_get(h->node);
+  }
+  spin_unlock_irqrestore(&t->fd_lock, flags);
+  if (!open_fd)
+    return ERR_PTR(-ENOENT); /* closed: Linux answers ENOENT too */
+  return out;                /* NULL: no node behind it, use the string */
+}
+
 static void procfs_fd_symlink(struct vfs_node *dir, int fd, const char *target) {
   char name[16];
   snprintf(name, sizeof(name), "%d", fd);
-  if (find_child(dir, name))
-    return; /* already materialised */
+  struct vfs_node *existing = find_child(dir, name);
+  if (existing) {
+    /*
+     * Refresh it. A descriptor NUMBER is reused the moment the descriptor is
+     * closed, so a symlink materialised once and never updated reports the
+     * first file that fd ever held, for the life of the process. systemd
+     * mounts every API filesystem by opening the mount point and passing
+     * /proc/self/fd/<n> as the target — always the same small fd number — so a
+     * frozen link put devtmpfs, tmpfs and cgroup2 all on top of whatever fd 4
+     * was first, and PID 1 died reporting that the unified cgroup hierarchy
+     * was not mounted.
+     *
+     * The buffer is rewritten in place rather than replaced: a reader may hold
+     * the old pointer, and freeing it under them is a use-after-free. Writing
+     * the terminator first means a concurrent readlink sees either the old
+     * path or a prefix of the new one, never two paths run together.
+     */
+    existing->inode->magic_link_cb = procfs_fd_magic_link;
+    char *buf = (char *)existing->inode->data;
+    if (buf) {
+      usize tl = strlen(target);
+      if (tl > PROCFS_FD_TARGET_MAX - 1)
+        tl = PROCFS_FD_TARGET_MAX - 1;
+      buf[0] = '\0';
+      memcpy(buf, target, tl);
+      buf[tl] = '\0';
+      existing->inode->size = tl;
+    }
+    return;
+  }
   struct vfs_node *n = vfs_create_node(VFS_SYMLINK);
   if (!n)
     return;
   usize nl = strlen(name);
   memcpy(n->name, name, nl);
   n->name[nl] = '\0';
-  char *dup = strdup(target);
+  char *dup = (char *)kmalloc(PROCFS_FD_TARGET_MAX);
+  if (dup) {
+    usize tl = strlen(target);
+    if (tl > PROCFS_FD_TARGET_MAX - 1)
+      tl = PROCFS_FD_TARGET_MAX - 1;
+    memcpy(dup, target, tl);
+    dup[tl] = '\0';
+  }
   n->inode->data = dup;
   n->inode->size = dup ? strlen(dup) : 0;
   n->inode->mode = 0777;
   n->inode->nlink = 1;
+  n->inode->magic_link_cb = procfs_fd_magic_link;
   n->parent = dir;
   n->refcount++;
   vfs_attach_child(dir, n);
@@ -1353,14 +1716,25 @@ static void procfs_fd_fill_target(struct vfs_handle *h, int fd, char *tg,
     break;
   }
   case VFS_HANDLE_NODE:
-    /* The caller resolves the full path after dropping fd_lock (see
-     * procfs_fd_resolve); the basename is the fallback when it cannot. */
-    if (h->node && h->node->name[0])
-      snprintf(tg, sz, "/%s", h->node->name);
-    else
-      snprintf(tg, sz, "anon_inode:[unknown]");
-    if (out_node)
-      *out_node = h->node ? vfs_node_get(h->node) : 0;
+    /* The name the descriptor was opened under, which is the answer this file
+     * is asked for. Deriving it from the node walks the parent chain and gives
+     * the node's FIRST name, so a file opened through a bind mount was
+     * reported at the other place -- and mount(2) on this link then recorded
+     * the mount somewhere the caller was not looking. It also costs nothing
+     * here: the string is already on the handle, so the path walk (which
+     * yields, and so cannot run under fd_lock) is not needed at all. */
+    if (h->open_path && h->open_path[0]) {
+      snprintf(tg, sz, "%s", h->open_path);
+    } else {
+      /* The caller resolves the full path after dropping fd_lock (see
+       * procfs_fd_resolve); the basename is the fallback when it cannot. */
+      if (h->node && h->node->name[0])
+        snprintf(tg, sz, "/%s", h->node->name);
+      else
+        snprintf(tg, sz, "anon_inode:[unknown]");
+      if (out_node)
+        *out_node = h->node ? vfs_node_get(h->node) : 0;
+    }
     break;
   default:
     snprintf(tg, sz, "anon_inode:[unknown]");
@@ -1489,23 +1863,32 @@ static int procfs_fd_lookup(struct vfs_node *dir, const char *name) {
   struct task *t = scheduler_task_by_pid(pid);
   if (!t)
     return -1;
-  struct procfs_fd_snap snap;
-  memset(&snap, 0, sizeof(snap));
-  snap.fd = fd;
+  /* A single lookup has room for a whole path, unlike the readdir snapshot
+   * (which holds one of these per open descriptor). The path is what mount(2)
+   * records when it is handed this link, so truncating it here would move the
+   * mount somewhere else. */
+  char target[PROCFS_FD_TARGET_MAX];
+  struct vfs_node *pathnode = 0;
+  target[0] = '\0';
   int ok = 0;
   u64 flags;
   spin_lock_irqsave(&t->fd_lock, &flags);
   struct vfs_handle *h =
       (t->fd_table && (usize)fd < t->fd_capacity) ? t->fd_table[fd] : 0;
   if (h && h->used) {
-    procfs_fd_fill_target(h, fd, snap.target, sizeof(snap.target), &snap.node);
+    procfs_fd_fill_target(h, fd, target, sizeof(target), &pathnode);
     ok = 1;
   }
   spin_unlock_irqrestore(&t->fd_lock, flags);
   if (!ok)
     return -1;
-  procfs_fd_resolve(&snap);
-  procfs_fd_symlink(dir, fd, snap.target); /* idempotent (find_child guard) */
+  if (pathnode) {
+    char path[PROCFS_FD_TARGET_MAX];
+    if (vfs_get_node_path(pathnode, path, sizeof(path)) == 0 && path[0])
+      snprintf(target, sizeof(target), "%s", path);
+    vfs_node_put(pathnode);
+  }
+  procfs_fd_symlink(dir, fd, target); /* idempotent (find_child guard) */
   return 0;
 }
 
@@ -1558,6 +1941,45 @@ static isize procfs_root_readlink(struct vfs_node *node, u64 offset, char *buf,
     return 0;
   buf[0] = '/';
   return 1;
+}
+
+/* /proc/self — a SYMLINK to the caller's own pid directory, which is what
+ * Linux has and what every user of this path assumes.
+ *
+ * It used to be a pid directory in its own right, shared by every process on
+ * the system. That is fine for a file whose contents are rendered per caller,
+ * and wrong for anything with state: /proc/<pid>/fd/<n> materialises one child
+ * node per descriptor NUMBER and refreshes its target on lookup, so under
+ * /proc/self those children were shared too. Two processes with different files
+ * on the same descriptor number then had one node between them, and whichever
+ * looked it up last decided what the other one saw. systemd performs every
+ * mount by opening the destination and passing /proc/self/fd/<n> as the target
+ * (mount_nofollow, so a symlink cannot be swapped in underneath it), always on
+ * a small descriptor number — so a child setting up its unit root was handed
+ * PID 1's last mount point instead of its own file, and the bind was refused
+ * as a directory-onto-file mismatch. As a symlink there is nothing to share:
+ * the path resolves into the caller's own /proc/<pid> tree.
+ *
+ * Rendered rather than stored, because the answer differs per reader. */
+static isize procfs_self_readlink(struct vfs_node *node, u64 offset, char *buf,
+                                  usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)flags;
+  char num[24];
+  usize len;
+
+  /* Absolute, where Linux writes a bare pid. A relative target has to be
+   * resolved against the directory the link sits in, and this resolver starts
+   * from the root instead -- so "36" looked for /36, found nothing, and handed
+   * back the root directory rather than an error. Naming the whole path costs
+   * a reader nothing and removes the question. */
+  snprintf(num, sizeof(num), "/proc/%lu", (unsigned long)scheduler_get_pid());
+  len = strlen(num);
+  if (len > size)
+    len = size;
+  memcpy(buf, num, len);
+  return (isize)len;
 }
 
 static void procfs_make_symlink(struct vfs_node *dir, const char *name,
@@ -1865,6 +2287,10 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_mkchild(d, "environ", VFS_DEVICE, r_pid_environ, pid);
   procfs_mkchild(d, "statm", VFS_DEVICE, r_pid_statm, pid);
   procfs_mkchild(d, "limits", VFS_DEVICE, r_pid_limits, pid);
+  procfs_mkchild(d, "cgroup", VFS_DEVICE, r_pid_cgroup, pid);
+  procfs_mkchild_writable_pid(d, "oom_score_adj", r_pid_oom_score_adj,
+                              w_pid_oom_score_adj, pid);
+  procfs_mkchild(d, "oom_score", VFS_DEVICE, r_pid_oom_score, pid);
   procfs_make_symlink(d, "cwd", procfs_cwd_readlink);
   procfs_make_symlink(d, "root", procfs_root_readlink);
   struct vfs_node *nsdir = procfs_mkchild(d, "ns", VFS_DIRECTORY, 0, pid);
@@ -1882,6 +2308,9 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   if (fddir) {
     fddir->inode->readdir_cb = procfs_fd_readdir;
     fddir->inode->lookup_cb = procfs_fd_lookup;
+    /* An fd number is reused, so the symlink under it has to be re-rendered on
+     * every lookup rather than materialised once. */
+    fddir->inode->lookup_refresh = 1;
     /* procfs_fd_readdir ends in vfs_readdir_children, so the VFS must not
      * append the in-memory children a second time. */
     fddir->inode->readdir_lists_children = 1;
@@ -2315,9 +2744,11 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "stat", VFS_DEVICE, r_stat, 0);
   procfs_mkchild(root, "vmstat", VFS_DEVICE, r_vmstat, 0);
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);
+  procfs_mkchild(root, "cgroups", VFS_DEVICE, r_cgroups, 0);
   procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
   procfs_mkchild(root, "b1nix-prof", VFS_DEVICE, r_b1nix_prof, 0);
+  procfs_mkchild(root, "b1nix-tasks", VFS_DEVICE, r_b1nix_tasks, 0);
   /* M107: /proc/kmsg — the same record stream as /dev/kmsg. klogd reads this
    * one and expects it to block until a message arrives. */
   {
@@ -2346,6 +2777,16 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
       procfs_mkchild(kern, "osrelease", VFS_DEVICE, r_sys_osrelease, 0);
       procfs_mkchild(kern, "version", VFS_DEVICE, r_version, 0);
       procfs_mkchild(kern, "pid_max", VFS_DEVICE, r_sys_pid_max, 0);
+      procfs_mkchild(kern, "cap_last_cap", VFS_DEVICE, r_sys_cap_last_cap, 0);
+      procfs_mkchild(kern, "threads-max", VFS_DEVICE, r_sys_threads_max, 0);
+      struct vfs_node *rnd =
+          procfs_mkchild(kern, "random", VFS_DIRECTORY, 0, 0);
+      if (rnd) {
+        procfs_mkchild(rnd, "boot_id", VFS_DEVICE, r_sys_boot_id, 0);
+        procfs_mkchild(rnd, "uuid", VFS_DEVICE, r_sys_random_uuid, 0);
+        procfs_mkchild(rnd, "entropy_avail", VFS_DEVICE, r_sys_entropy_avail,
+                       0);
+      }
       /* M80: yama-style ptrace attach restriction. */
       struct vfs_node *yama =
           procfs_mkchild(kern, "yama", VFS_DIRECTORY, 0, 0);
@@ -2388,7 +2829,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
 
   /* /proc/self — per-process view of the *calling* task (pid resolved at read
    * time via pid_from_parent → scheduler_get_pid). */
-  procfs_make_piddir(root, "self", 0);
+  procfs_make_symlink(root, "self", procfs_self_readlink);
   return root;
 }
 

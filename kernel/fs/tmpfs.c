@@ -33,10 +33,30 @@ static int tmpfs_statfs(struct vfs_node *node, struct b1nix_statfs *st) {
   memset(st, 0, sizeof(*st));
   st->f_type = 0x01021994; /* TMPFS_MAGIC, as Linux reports */
   st->f_bsize = 4096;
-  /* Backed by the kernel heap, so the free/total counts are the heap's. */
-  st->f_blocks = 0;
-  st->f_bfree = 0;
-  st->f_bavail = 0;
+  /*
+   * Real numbers, because a program that asks is entitled to act on them.
+   *
+   * Reporting zero blocks and zero free said "this filesystem cannot hold
+   * anything", and systemd believes it: `systemctl daemon-reload` refuses
+   * outright -- "not enough space available on /run/systemd. Currently, 0B are
+   * free, but a safety buffer of 16.0M is expected" -- so no unit written at
+   * runtime was ever loaded, and every one of them came back as "Unit not
+   * found". df showed the same nothing.
+   *
+   * A tmpfs is backed by physical memory, so its size is the memory it may
+   * use and its free space is the memory still free. Linux caps a default
+   * tmpfs at half of RAM and reports that; the same convention is used here
+   * rather than promising every page, since handing out the last frame to a
+   * file is how a machine dies without a message.
+   */
+  u64 total_pages = pmm_total_usable_memory() / 4096ull / 2ull;
+  u64 free_pages = (u64)pmm_free_frame_count();
+
+  if (free_pages > total_pages)
+    free_pages = total_pages;
+  st->f_blocks = total_pages;
+  st->f_bfree = free_pages;
+  st->f_bavail = free_pages;
   st->f_namelen = 255;
   return 0;
 }
