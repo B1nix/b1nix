@@ -1,3 +1,4 @@
+#include <b1nix/arch.h>
 /* /dev/i2c-N — the PIIX4/ICH9 SMBus host controller (M107).
  *
  * QEMU's `pc` machine puts a PIIX4 power-management function at 00:01.3
@@ -113,9 +114,16 @@ static u8 g_slave_addr; /* set by I2C_SLAVE; one bus, one client at a time */
 static spinlock_t i2c_lock = SPINLOCK_INIT;
 
 /* Wait for the controller to go idle, then for a transaction to complete.
- * Bounded: a wedged southbridge must not hang the caller forever. */
+ *
+ * Bounded in time, not in reads: a wedged southbridge must not hang the caller
+ * forever, but "a hundred thousand port reads" is a duration only on the
+ * machine somebody counted it on — elsewhere it is a different wait entirely,
+ * too short to let slow hardware answer or long enough to stall a boot. The
+ * clock the kernel calibrates says what a millisecond is. */
 static int smb_wait_idle(void) {
-  for (int i = 0; i < 100000; i++) {
+  u64 deadline = arch_tsc_monotonic_ns() + 50000000ull; /* 50 ms */
+
+  while (arch_tsc_monotonic_ns() < deadline) {
     u8 s = inb((u16)(g_smb_base + SMB_HST_STS));
     if (!(s & SMB_STS_HOST_BUSY))
       return 0;
@@ -124,7 +132,10 @@ static int smb_wait_idle(void) {
 }
 
 static int smb_wait_done(void) {
-  for (int i = 0; i < 500000; i++) {
+  u64 start = arch_tsc_monotonic_ns();
+  u64 deadline = start + 250000000ull; /* 250 ms */
+
+  while (arch_tsc_monotonic_ns() < deadline) {
     u8 s = inb((u16)(g_smb_base + SMB_HST_STS));
     if (s & (SMB_STS_DEV_ERR | SMB_STS_BUS_ERR | SMB_STS_FAILED)) {
       outb((u16)(g_smb_base + SMB_HST_STS), SMB_STS_ALL);
@@ -136,9 +147,13 @@ static int smb_wait_done(void) {
       outb((u16)(g_smb_base + SMB_HST_STS), SMB_STS_ALL);
       return 0;
     }
-    if (!(s & SMB_STS_HOST_BUSY) && i > 16) {
-      /* Some implementations drop BUSY without raising INTR on a quick
-       * command; treat a settled controller with no error as success. */
+    /* Some implementations drop BUSY without raising INTR on a quick command;
+     * treat a settled controller with no error as success — but only after
+     * giving it a moment to start, or a controller that has not picked the
+     * command up yet reads as one that has finished it. The grace used to be
+     * "sixteen reads", which is a length of time only on one machine. */
+    if (!(s & SMB_STS_HOST_BUSY) &&
+        arch_tsc_monotonic_ns() - start > 20000ull /* 20 µs */) {
       outb((u16)(g_smb_base + SMB_HST_STS), SMB_STS_ALL);
       return 0;
     }

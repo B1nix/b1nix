@@ -50,6 +50,23 @@
 #define PTY_LINE  1024
 
 struct pty {
+  /* Guards everything below it in this structure.
+   *
+   * The rings were mutated with no lock at all: a terminal's write to the
+   * slave and its own read of the master run on different CPUs at the same
+   * time, and both update `out_count` with a read-modify-write. A lost update
+   * there makes the count disagree with the ring — too high, and a reader
+   * hands out bytes that were never written; wrapped below zero (it is
+   * unsigned), and the "is there room" test never says no again, so head and
+   * tail walk past each other and the line discipline reads its own garbage.
+   * That is what a compositor with a terminal on it hit on six cores and never
+   * on one.
+   *
+   * Taken with interrupts masked: the line discipline is reached from a
+   * write(2) on any CPU, and the wakeups it drives run from the scheduler.
+   * Nothing that can sleep — signal delivery, wakeups, copies to and from user
+   * memory — happens while it is held. */
+  spinlock_t lock;
   int used;
   int index;
   int master_open;
@@ -141,26 +158,32 @@ static void pty_signal_fg(struct pty *p, int sig) {
   scheduler_kill_process_group(p->fg_pgrp, sig);
 }
 
-/* Process one byte arriving from the master (the "keyboard" side). */
-static void pty_input_char(struct pty *p, u8 c) {
+/* Return a slot to its unused state, ready to be handed out again.
+ *
+ * Called only when neither side is open, so nothing is inside the lock and
+ * zeroing it leaves it in exactly the state SPINLOCK_INIT names. */
+static void pty_wipe(struct pty *p) {
+  memset(p, 0, sizeof(*p));
+}
+
+/* Process one byte arriving from the master (the "keyboard" side).
+ *
+ * Returns the signal the byte asks for, or 0. It is not delivered here: this
+ * runs under p->lock, and killing a process group takes scheduler locks and
+ * walks the task list. The caller sends it once the lock is dropped. */
+static int pty_input_char(struct pty *p, u8 c) {
   struct b1nix_termios *t = &p->termios;
 
   if ((t->c_iflag & B1NIX_ICRNL) && c == '\r')
     c = '\n';
 
   if (t->c_lflag & B1NIX_ISIG) {
-    if (c == t->c_cc[B1NIX_VINTR]) {
-      pty_signal_fg(p, SIGINT);
-      return;
-    }
-    if (c == t->c_cc[B1NIX_VQUIT]) {
-      pty_signal_fg(p, SIGQUIT);
-      return;
-    }
-    if (c == t->c_cc[B1NIX_VSUSP]) {
-      pty_signal_fg(p, SIGTSTP);
-      return;
-    }
+    if (c == t->c_cc[B1NIX_VINTR])
+      return SIGINT;
+    if (c == t->c_cc[B1NIX_VQUIT])
+      return SIGQUIT;
+    if (c == t->c_cc[B1NIX_VSUSP])
+      return SIGTSTP;
   }
 
   if (t->c_lflag & B1NIX_ICANON) {
@@ -173,11 +196,11 @@ static void pty_input_char(struct pty *p, u8 c) {
           pty_output(p, '\b');
         }
       }
-      return;
+      return 0;
     }
     if (c == t->c_cc[B1NIX_VEOF]) {
       pty_commit_line(p);
-      return;
+      return 0;
     }
     if (t->c_lflag & B1NIX_ECHO)
       pty_output(p, c);
@@ -190,30 +213,59 @@ static void pty_input_char(struct pty *p, u8 c) {
       pty_output(p, c);
     rb_putc(p->in, &p->in_tail, &p->in_count, c);
   }
+  return 0;
 }
 
 /* ── master file ops ── */
 static isize pty_master_read(struct vfs_handle *h, char *buf, usize size) {
   struct pty *p = (struct pty *)h->private_data;
-  while (p->out_count == 0) {
-    if (!p->slave_open)
+  u64 f;
+  for (;;) {
+    spin_lock_irqsave(&p->lock, &f);
+    if (p->out_count > 0) {
+      usize n = 0;
+      u8 c;
+      while (n < size && rb_getc(p->out, &p->out_head, &p->out_count, &c))
+        buf[n++] = (char)c;
+      spin_unlock_irqrestore(&p->lock, f);
+      scheduler_wake_all(&p->out_tail); /* writers waiting for out space */
+      return (isize)n;
+    }
+    int eof = !p->slave_open;
+    spin_unlock_irqrestore(&p->lock, f);
+    if (eof)
       return 0; /* slave gone: EOF */
     if (h->flags & B1NIX_O_NONBLOCK)
       return -EAGAIN;
     scheduler_block_on(&p->out_count);
   }
-  usize n = 0;
-  u8 c;
-  while (n < size && rb_getc(p->out, &p->out_head, &p->out_count, &c))
-    buf[n++] = (char)c;
-  scheduler_wake_all(&p->out_tail); /* writers waiting for out space */
-  return (isize)n;
 }
 
 static isize pty_master_write(struct vfs_handle *h, const char *buf, usize size) {
   struct pty *p = (struct pty *)h->private_data;
-  for (usize i = 0; i < size; i++)
-    pty_input_char(p, (u8)buf[i]);
+  u64 f;
+  /* The signals the line discipline asks for, collected under the lock and
+   * sent after it: killing a process group walks the task list and takes the
+   * scheduler's own locks, which is not something to do from inside this one.
+   * Four slots is more than a write can usefully produce — the same signal
+   * twice in one buffer is one signal to the group either way. */
+  int sigs[4];
+  int nsig = 0;
+  spin_lock_irqsave(&p->lock, &f);
+  for (usize i = 0; i < size; i++) {
+    int sig = pty_input_char(p, (u8)buf[i]);
+    if (sig) {
+      int seen = 0;
+      for (int k = 0; k < nsig; k++)
+        if (sigs[k] == sig)
+          seen = 1;
+      if (!seen && nsig < (int)(sizeof(sigs) / sizeof(sigs[0])))
+        sigs[nsig++] = sig;
+    }
+  }
+  spin_unlock_irqrestore(&p->lock, f);
+  for (int k = 0; k < nsig; k++)
+    pty_signal_fg(p, sigs[k]);
   scheduler_wake_all(&p->in_count);  /* wake slave readers */
   scheduler_wake_all(&p->out_count); /* echo produced master-readable output */
   scheduler_wake_all(vfs_poll_chan);
@@ -222,11 +274,14 @@ static isize pty_master_write(struct vfs_handle *h, const char *buf, usize size)
 
 static int pty_master_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   struct pty *p = (struct pty *)h->private_data;
+  u64 f;
   pfd->revents = 0;
+  spin_lock_irqsave(&p->lock, &f);
   if (p->out_count > 0 || !p->slave_open)
     pfd->revents |= B1NIX_POLLIN;
   if (p->in_count < PTY_BUF)
     pfd->revents |= B1NIX_POLLOUT;
+  spin_unlock_irqrestore(&p->lock, f);
   return 0;
 }
 
@@ -235,55 +290,73 @@ static int pty_master_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
  * across dup2/fork hangs up only when its LAST fd is closed, not the first. */
 static void pty_master_release(struct vfs_handle *h) {
   struct pty *p = (struct pty *)h->private_data;
+  u64 f;
   if (!p)
     return;
+  spin_lock_irqsave(&p->lock, &f);
   p->master_open = 0;
+  int last = !p->slave_open;
+  spin_unlock_irqrestore(&p->lock, f);
   /* Hangup: signal the foreground group, then wake blocked slave readers so
    * they observe EOF. */
   pty_signal_fg(p, SIGHUP);
   scheduler_wake_all(&p->in_count);
   scheduler_wake_all(vfs_poll_chan);
-  if (!p->slave_open) {
-    memset(p, 0, sizeof(*p));
-  }
+  if (last)
+    pty_wipe(p);
   h->private_data = 0;
 }
 
 /* ── slave file ops ── */
 static isize pty_slave_read(struct vfs_handle *h, char *buf, usize size) {
   struct pty *p = (struct pty *)h->private_data;
-  while (p->in_count == 0) {
+  u64 f;
+  for (;;) {
+    spin_lock_irqsave(&p->lock, &f);
+    if (p->in_count > 0) {
+      usize n = 0;
+      u8 c;
+      while (n < size && rb_getc(p->in, &p->in_head, &p->in_count, &c))
+        buf[n++] = (char)c;
+      spin_unlock_irqrestore(&p->lock, f);
+      return (isize)n;
+    }
     if (p->in_eof) {
       p->in_eof = 0;
+      spin_unlock_irqrestore(&p->lock, f);
       return 0;
     }
-    if (!p->master_open)
+    int hup = !p->master_open;
+    spin_unlock_irqrestore(&p->lock, f);
+    if (hup)
       return 0; /* hangup: EOF */
     if (h->flags & B1NIX_O_NONBLOCK)
       return -EAGAIN;
     scheduler_block_on(&p->in_count);
   }
-  usize n = 0;
-  u8 c;
-  while (n < size && rb_getc(p->in, &p->in_head, &p->in_count, &c))
-    buf[n++] = (char)c;
-  return (isize)n;
 }
 
 static isize pty_slave_write(struct vfs_handle *h, const char *buf, usize size) {
   struct pty *p = (struct pty *)h->private_data;
+  u64 f;
   usize i = 0;
-  for (; i < size; i++) {
-    /* Each logical byte may expand to 2 (ONLCR); wait for room for both. */
-    while (PTY_BUF - p->out_count < 2) {
-      if (!p->master_open)
-        return i ? (isize)i : -EPIPE;
-      if (h->flags & B1NIX_O_NONBLOCK)
-        return i ? (isize)i : -EAGAIN;
-      scheduler_wake_all(&p->out_count); /* let the master drain */
-      scheduler_block_on(&p->out_tail);
-    }
-    pty_output(p, (u8)buf[i]);
+  while (i < size) {
+    spin_lock_irqsave(&p->lock, &f);
+    /* Each logical byte may expand to 2 (ONLCR); write while there is room for
+     * both, and give the lock back before waiting for more. */
+    while (i < size && PTY_BUF - p->out_count >= 2)
+      pty_output(p, (u8)buf[i++]);
+    int hup = !p->master_open;
+    spin_unlock_irqrestore(&p->lock, f);
+    if (i == size)
+      break;
+    if (hup)
+      return i ? (isize)i : -EPIPE;
+    if (h->flags & B1NIX_O_NONBLOCK)
+      return i ? (isize)i : -EAGAIN;
+    scheduler_wake_all(&p->out_count); /* let the master drain */
+    scheduler_wake_all(vfs_poll_chan);
+    scheduler_block_on(&p->out_tail);
   }
   scheduler_wake_all(&p->out_count);
   scheduler_wake_all(vfs_poll_chan);
@@ -292,11 +365,14 @@ static isize pty_slave_write(struct vfs_handle *h, const char *buf, usize size) 
 
 static int pty_slave_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   struct pty *p = (struct pty *)h->private_data;
+  u64 f;
   pfd->revents = 0;
+  spin_lock_irqsave(&p->lock, &f);
   if (p->in_count > 0 || p->in_eof || !p->master_open)
     pfd->revents |= B1NIX_POLLIN;
   if (PTY_BUF - p->out_count >= 2)
     pfd->revents |= B1NIX_POLLOUT;
+  spin_unlock_irqrestore(&p->lock, f);
   return 0;
 }
 
@@ -307,14 +383,17 @@ static int pty_slave_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
  * read on the shared handle fails (tcgetattr -> EINVAL). Same fix as sockets. */
 static void pty_slave_release(struct vfs_handle *h) {
   struct pty *p = (struct pty *)h->private_data;
+  u64 f;
   if (!p)
     return;
+  spin_lock_irqsave(&p->lock, &f);
   p->slave_open = 0;
+  int last = !p->master_open;
+  spin_unlock_irqrestore(&p->lock, f);
   scheduler_wake_all(&p->out_count); /* master readers observe EOF */
   scheduler_wake_all(vfs_poll_chan);
-  if (!p->master_open) {
-    memset(p, 0, sizeof(*p));
-  }
+  if (last)
+    pty_wipe(p);
   h->private_data = 0;
 }
 
@@ -324,9 +403,20 @@ static int pty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   if (!p)
     return -EINVAL;
 
+  /* Every case below copies through a local first. The lock must not be held
+   * across a copy to or from user memory: that memory may be paged out, and
+   * faulting it in with a spinlock held (interrupts masked) is how a CPU stops
+   * for good. */
+  u64 f;
+
   switch (request) {
-  case B1NIX_TCGETS:
-    return tty_termios_copyout(arg, &p->termios);
+  case B1NIX_TCGETS: {
+    struct b1nix_termios snapshot;
+    spin_lock_irqsave(&p->lock, &f);
+    snapshot = p->termios;
+    spin_unlock_irqrestore(&p->lock, f);
+    return tty_termios_copyout(arg, &snapshot);
+  }
   /* TCSADRAIN and TCSAFLUSH: there is no output queue to drain and no input
    * queue that outlives the call, so all three are the same operation. They
    * used to be folded into TCSETS by the Linux-ABI ioctl wrapper; the wrapper
@@ -334,18 +424,36 @@ static int pty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
    * "Failed to set raw TTY mode". */
   case B1NIX_TCSETSW:
   case B1NIX_TCSETSF:
-  case B1NIX_TCSETS:
-    return tty_termios_copyin(&p->termios, arg);
-  case B1NIX_TIOCGWINSZ:
-    if (!arg || syscall_copyout(arg, &p->winsize, sizeof(p->winsize)) < 0)
+  case B1NIX_TCSETS: {
+    struct b1nix_termios want;
+    int rc = tty_termios_copyin(&want, arg);
+    if (rc < 0)
+      return rc;
+    spin_lock_irqsave(&p->lock, &f);
+    p->termios = want;
+    spin_unlock_irqrestore(&p->lock, f);
+    return 0;
+  }
+  case B1NIX_TIOCGWINSZ: {
+    struct b1nix_winsize ws;
+    spin_lock_irqsave(&p->lock, &f);
+    ws = p->winsize;
+    spin_unlock_irqrestore(&p->lock, f);
+    if (!arg || syscall_copyout(arg, &ws, sizeof(ws)) < 0)
       return -EFAULT;
     return 0;
-  case B1NIX_TIOCSWINSZ:
-    if (!arg || syscall_copyin(&p->winsize, arg, sizeof(p->winsize)) < 0)
+  }
+  case B1NIX_TIOCSWINSZ: {
+    struct b1nix_winsize ws;
+    if (!arg || syscall_copyin(&ws, arg, sizeof(ws)) < 0)
       return -EFAULT;
+    spin_lock_irqsave(&p->lock, &f);
+    p->winsize = ws;
+    spin_unlock_irqrestore(&p->lock, f);
     /* A window-size change notifies the foreground group. */
     pty_signal_fg(p, SIGWINCH);
     return 0;
+  }
   case B1NIX_TIOCGPTN: {
     u32 n = (u32)p->index;
     if (!arg || syscall_copyout(arg, &n, sizeof(n)) < 0)
@@ -367,7 +475,9 @@ static int pty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     int fg32;
     if (!arg || syscall_copyin(&fg32, arg, sizeof(fg32)) < 0)
       return -EFAULT;
+    spin_lock_irqsave(&p->lock, &f);
     p->fg_pgrp = (usize)fg32;
+    spin_unlock_irqrestore(&p->lock, f);
     return 0;
   }
   case B1NIX_TIOCSCTTY:
@@ -522,8 +632,10 @@ int pty_open_slave(int index, int flags) {
   h->private_data = p;
   h->ops = &pty_slave_ops;
   h->flags = flags;
-  p->slave_open = 1;
 
+  u64 f;
+  spin_lock_irqsave(&p->lock, &f);
+  p->slave_open = 1;
   /* If no session owns this pty yet, the opener becomes its controlling
    * process group (sane default so ^C/job-control work without an explicit
    * TIOCSCTTY). */
@@ -531,10 +643,13 @@ int pty_open_slave(int index, int flags) {
     p->fg_pgrp = current_task->process_group_id;
     p->session_id = current_task->session_id;
   }
+  spin_unlock_irqrestore(&p->lock, f);
 
   int fd = scheduler_fd_alloc(h);
   if (fd < 0) {
+    spin_lock_irqsave(&p->lock, &f);
     p->slave_open = 0;
+    spin_unlock_irqrestore(&p->lock, f);
     vfs_handle_release(h);
     return -EMFILE;
   }

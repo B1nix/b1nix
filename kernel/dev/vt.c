@@ -28,6 +28,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/posix.h>
 #include <b1nix/sched.h>
+#include <b1nix/sysfs_attr.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/syscall.h>
 #include <b1nix/vfs.h>
@@ -65,6 +66,13 @@
 #define K_XLATE     0x01
 #define K_MEDIUMRAW 0x02
 #define K_UNICODE   0x03
+/* Keyboard off: the console delivers nothing to userspace and prints nothing
+ * of its own. A session manager sets it while a compositor owns the display,
+ * so keystrokes go to the compositor's input devices and not to the terminal
+ * underneath. Missing it made KDSKBMODE answer EINVAL, which is what a session
+ * manager's TakeControl turns into org.freedesktop.DBus.Error.InvalidArgs --
+ * the refusal that kept kwin off every card. */
+#define K_OFF       0x04
 
 #define KB_101 0x02 /* KDGKBTYPE: a normal PC keyboard */
 
@@ -101,11 +109,16 @@
 #define VT_PIO_FONT_SIZE (VT_FONT_GLYPHS * VT_PIO_FONT_STRIDE)
 
 struct vt_screen {
+  /* The size a caller set with TIOCSWINSZ, reported back by TIOCGWINSZ. The
+   * console's real geometry comes from the framebuffer and the font and does
+   * not move; this is what the caller was told, which is what it checks. */
+  u16 ws_row, ws_col;
+  u8 winsize_set;
   int allocated;
   char *cells; /* rows * cols, ' '-filled */
   u16 row, col;
   int mode;    /* KD_TEXT / KD_GRAPHICS */
-  int kbmode;  /* K_XLATE / K_RAW / K_MEDIUMRAW / K_UNICODE */
+  int kbmode;  /* K_XLATE / K_RAW / K_MEDIUMRAW / K_UNICODE / K_OFF */
   u8 vt_mode;  /* VT_AUTO / VT_PROCESS */
   u8 relsig, acqsig;
   int waitv;   /* VT_SETMODE waitv */
@@ -921,7 +934,8 @@ static int vt_ioctl(struct vfs_node *node, u64 request, void *arg) {
                                                                    : 0;
   case KDSKBMODE: {
     int m = (int)(isize)arg;
-    if (m != K_RAW && m != K_XLATE && m != K_MEDIUMRAW && m != K_UNICODE)
+    if (m != K_RAW && m != K_XLATE && m != K_MEDIUMRAW && m != K_UNICODE &&
+        m != K_OFF)
       return -EINVAL;
     v->kbmode = m;
     return 0;
@@ -984,11 +998,36 @@ static int vt_ioctl(struct vfs_node *node, u64 request, void *arg) {
   case B1NIX_TIOCGWINSZ: {
     struct b1nix_winsize ws;
     memset(&ws, 0, sizeof(ws));
-    ws.ws_row = g_rows;
-    ws.ws_col = g_cols;
+    /* What was set, if anything was, and the real geometry otherwise. A
+     * caller that sets a size and reads it back expects its own answer. */
+    ws.ws_row = v->winsize_set ? v->ws_row : g_rows;
+    ws.ws_col = v->winsize_set ? v->ws_col : g_cols;
     ws.ws_xpixel = (u16)(g_cols * 8);
     ws.ws_ypixel = (u16)(g_rows * g_font_h);
     return syscall_copyout(arg, &ws, sizeof(ws)) < 0 ? -EFAULT : 0;
+  }
+  case B1NIX_TIOCSWINSZ: {
+    /* Accepted, because refusing it is a lie about what this is.
+     *
+     * This fell through to -ENOTTY, which tells the caller "not a terminal"
+     * about a terminal, for an ioctl every terminal answers. util-linux's
+     * login sets the size during startup, and on the failure path it went on
+     * to use a buffer it had not filled -- faulting with a string that had no
+     * terminator and a pointer walked to 0x800000000000. On Linux the call
+     * succeeds and that path never runs.
+     *
+     * The console's geometry is fixed by the framebuffer and the font, so a
+     * caller cannot resize it; the size it asked for is recorded and reported
+     * back, which is what a caller checks, and the screen keeps the geometry
+     * it actually has. Refusing outright is the one answer that is wrong. */
+    struct b1nix_winsize ws;
+
+    if (syscall_copyin(&ws, arg, sizeof(ws)) < 0)
+      return -EFAULT;
+    v->winsize_set = 1;
+    v->ws_row = ws.ws_row;
+    v->ws_col = ws.ws_col;
+    return 0;
   }
   case B1NIX_TIOCGPGRP: {
     int fg = (int)v->fg_pgrp;
@@ -1006,7 +1045,57 @@ static int vt_ioctl(struct vfs_node *node, u64 request, void *arg) {
     return 0;
   case B1NIX_TIOCNOTTY:
     return 0;
+  /* TCSBRK / TCFLSH: 0x5409 and 0x540B.
+   *
+   * Both fell through to -ENOTTY, and util-linux's login issues them while
+   * preparing the terminal. It takes the refusal, carries on, and then uses a
+   * buffer it never filled -- the fault had a frame pointer holding the bytes
+   * " root" and a pointer walked to the first address past the user half. On
+   * Linux both calls succeed on a console and that path never runs.
+   *
+   * TCSBRK waits for queued output to drain (and, with a non-zero argument,
+   * sends a break). This console writes straight to the framebuffer, so there
+   * is nothing queued to wait for and no line to break: the honest answer is
+   * that it is already done.
+   *
+   * TCFLSH discards what is queued. There is no output queue, so only the
+   * input side has anything to discard, and the argument says which: 0 input,
+   * 1 output, 2 both. */
+  case 0x5409: /* TCSBRK */
+    return 0;
+  case 0x5429: { /* TIOCGSID -- the session this terminal belongs to. */
+    int sid = (int)v->session_id;
+
+    /* Linux answers ENOTTY when the terminal is not a controlling terminal of
+     * any session. Here session_id is set by TIOCSCTTY and starts at 1 (init),
+     * so it always names one; reporting it is the truthful answer, and
+     * refusing was what sent login down its error path. */
+    return syscall_copyout(arg, &sid, sizeof(sid)) < 0 ? -EFAULT : 0;
+  }
+  case 0x540B: { /* TCFLSH */
+    usize which = (usize)arg;
+
+    if (which == 0 || which == 2) {
+      v->q_head = v->q_tail = v->q_count = 0;
+      v->line_len = 0;
+    }
+    return 0;
+  }
   default:
+    /* Which request was refused, when asked.
+     *
+     * "errno 25 from syscall 16" names ioctl and stops there, and a terminal
+     * answers a dozen different ones -- so the trace that found the failure
+     * could not say what had failed. util-linux's login takes the refusal and
+     * then uses a buffer it never filled, so the request code is the whole
+     * question. `b1nix.trace-ioctl`. */
+    if (bootinfo_has_flag("b1nix.trace-ioctl")) {
+      console_write("vt: unhandled ioctl 0x");
+      console_write_hex64((u64)request);
+      console_write(" on tty");
+      console_write_dec((u64)(usize)(v - g_vts));
+      console_write("\n");
+    }
     return -ENOTTY;
   }
 }
@@ -1035,11 +1124,94 @@ void vt_register_nodes(void) {
       continue;
     n->inode->mode = 0620;
     n->inode->gid = 5; /* tty */
+    /* The number the console really has.
+     *
+     * Left at zero, every virtual terminal was a device file that was no
+     * device: stat reported 0:0, so nothing could identify it by devnum.
+     * util-linux's login does exactly that when it works out which terminal
+     * it is on -- it faulted here with a string that had no terminator, in
+     * that part of its startup -- and udev cannot file a node it cannot
+     * number either. Major 4 is the Linux console major; the minor is the VT,
+     * with 0 meaning "the current one", as on Linux. */
+    n->inode->rdev = ((u64)4 << 8) | (u64)i;
     n->inode->read_cb = vt_node_read;
     n->inode->write_cb = vt_node_write;
     n->inode->poll_cb = vt_node_poll;
     n->inode->ioctl_cb = vt_ioctl;
   }
+}
+
+/* ── /sys/class/tty, so a session manager can see the consoles ──────────── */
+
+/*
+ * logind decides whether a seat has virtual terminals by opening
+ * /sys/class/tty/tty0/active. With the file absent it concludes there are
+ * none, and then refuses to create a session whose VT number is not zero --
+ * "Seat has no VTs but VT number not 0" -- which is exactly what a login on
+ * tty1 asks for. The compositor's DRM backend takes its devices from that
+ * session, so with no session it never issues a single open() on /dev/dri:
+ * a kernel trace of a whole boot recorded five, every one of them from a
+ * shell probe and none from the compositor.
+ *
+ * Rendered per read rather than stored, because the value moves: a VT switch
+ * must change what this file says, and a cached string would keep answering
+ * with the console that was active when it was registered.
+ */
+static isize vt_sysfs_active_show(void *ctx, char *buf, usize cap)
+{
+	(void)ctx;
+	return (isize)snprintf(buf, cap, "tty%d\n", vt_active());
+}
+
+/* Every VT publishes the device number it really has, so a lookup by devnum
+ * finds it. Major 4 is the Linux console major, and it is what our own nodes
+ * carry; the minor is the VT number, as on Linux. */
+static isize vt_sysfs_dev_show(void *ctx, char *buf, usize cap)
+{
+	return (isize)snprintf(buf, cap, "4:%d\n", (int)(usize)ctx);
+}
+
+static isize vt_sysfs_uevent_show(void *ctx, char *buf, usize cap)
+{
+	int minor = (int)(usize)ctx;
+
+	if (minor == 0)
+		return (isize)snprintf(buf, cap,
+			"MAJOR=4\nMINOR=0\nDEVNAME=tty0\n");
+	return (isize)snprintf(buf, cap,
+		"MAJOR=4\nMINOR=%d\nDEVNAME=tty%d\n", minor, minor);
+}
+
+static void vt_sysfs_publish(void)
+{
+	struct sysfs_dir *cls = sysfs_reg_dir(sysfs_reg_dir(0, "class"), "tty");
+	struct sysfs_dir *d;
+	char name[8];
+
+	if (!cls)
+		return;
+
+	/* tty0 is not a console of its own: it is the name for "whichever is
+	 * current", which is why the active file lives here and nowhere else. */
+	d = sysfs_reg_dir(cls, "tty0");
+	if (d) {
+		(void)sysfs_reg_attr(d, "active", 0444, vt_sysfs_active_show, 0, 0, 0);
+		(void)sysfs_reg_attr(d, "dev", 0444, vt_sysfs_dev_show, 0,
+				     (void *)(usize)0, 0);
+		(void)sysfs_reg_attr(d, "uevent", 0444, vt_sysfs_uevent_show, 0,
+				     (void *)(usize)0, 0);
+	}
+
+	for (int i = 1; i <= VT_COUNT; i++) {
+		snprintf(name, sizeof(name), "tty%d", i);
+		d = sysfs_reg_dir(cls, name);
+		if (!d)
+			continue;
+		(void)sysfs_reg_attr(d, "dev", 0444, vt_sysfs_dev_show, 0,
+				     (void *)(usize)i, 0);
+		(void)sysfs_reg_attr(d, "uevent", 0444, vt_sysfs_uevent_show, 0,
+				     (void *)(usize)i, 0);
+	}
 }
 
 void vt_init(void) {
@@ -1073,6 +1245,7 @@ void vt_init(void) {
   vt_alloc_cells(&g_vts[2]);
   g_active = VT_CONSOLE;
   g_inited = 1;
+  vt_sysfs_publish();
 
   vt_register_nodes();
 }

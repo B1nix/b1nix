@@ -303,20 +303,20 @@ static void inj_goto(int x, int y) {
 static void inj_drag(int x, int y, int dx, int dy, int steps) {
   inj_goto(x, y);
   inj_btn(1);
-  scheduler_sleep_ticks(2);
+  scheduler_sleep_ticks(SCHED_MS_TO_TICKS(20));
   for (int i = 0; i < steps; i++) {
     inj_move(dx, dy);
-    scheduler_sleep_ticks(2);
+    scheduler_sleep_ticks(SCHED_MS_TO_TICKS(20));
   }
   inj_btn(0);
-  scheduler_sleep_ticks(5);
+  scheduler_sleep_ticks(SCHED_MS_TO_TICKS(50));
 }
 
 static void gfxtest_thread(void *arg) {
   (void)arg;
   while (!input_dev_has_clients(INPUT_DEV_MOUSE))
-    scheduler_sleep_ticks(10);
-  scheduler_sleep_ticks(200); /* let the desktop apps map their windows */
+    scheduler_sleep_ticks(SCHED_MS_TO_TICKS(100));
+  scheduler_sleep_ticks(SCHED_MS_TO_TICKS(2000)); /* let the desktop apps map their windows */
   console_write("gfxtest: drag injector active\n");
   for (;;) {
     /* gpaint title (placement 0 ≈ (48,92), title row ~84). */

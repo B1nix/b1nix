@@ -1,3 +1,4 @@
+#include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/input.h>
 #include <b1nix/io.h>
@@ -40,9 +41,13 @@ static const char scancode_map_shift[128] = {
 /* i8042 controller access helpers. Status port 0x64: bit0 = output buffer full
  * (data ready to read from 0x60), bit1 = input buffer full (do not write yet).
  * All waits are bounded so a wedged/absent controller can never hang boot. */
+/* Bounded in time rather than in reads: the count that used to bound these was
+ * a duration only on the machine it was measured on. */
 static int kbd_wait_input_clear(void)
 {
-	for (int i = 0; i < 100000; i++)
+	u64 deadline = arch_tsc_monotonic_ns() + 20000000ull; /* 20 ms */
+
+	while (arch_tsc_monotonic_ns() < deadline)
 		if (!(inb(0x64) & 0x02))
 			return 0;
 	return -1;
@@ -50,7 +55,9 @@ static int kbd_wait_input_clear(void)
 
 static int kbd_wait_output_full(void)
 {
-	for (int i = 0; i < 100000; i++)
+	u64 deadline = arch_tsc_monotonic_ns() + 20000000ull; /* 20 ms */
+
+	while (arch_tsc_monotonic_ns() < deadline)
 		if (inb(0x64) & 0x01)
 			return 0;
 	return -1;

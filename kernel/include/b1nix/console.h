@@ -34,4 +34,12 @@ void console_write_hex32(u32 value);
 void console_write_hex64(u64 value);
 void console_write_dec(u64 value);
 
+
+/* TIOCCONS: kernel console output copied to a terminal. push() is called from
+ * console_write() under its lock and never sleeps; set() takes a reference on
+ * the target and starts the draining thread on first use (0 clears it). */
+struct vfs_node;
+void console_redirect_push(const char *text);
+int console_redirect_set(struct vfs_node *node);
+
 #endif

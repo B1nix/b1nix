@@ -175,15 +175,26 @@ static int hda_muted;
 static inline u32 hda_wallclock(void) { return *(volatile u32 *)(hda_regs + HDA_WALLCLK); }
 
 static void hda_delay_ms(int ms) {
+	/* Against the calibrated clock, not against a guess at how long an I/O
+	 * port read takes.
+	 *
+	 * The fallback here counted "about a microsecond per iteration", which is
+	 * a statement about a particular processor and a particular hypervisor and
+	 * about nothing else — on a faster machine the wait is short and the
+	 * hardware is not ready, on a slower one the boot is longer than it needs
+	 * to be. The kernel calibrates a nanosecond clock at boot; a delay should
+	 * be expressed in the unit it asks for and measured with that. */
+	u64 deadline = arch_tsc_monotonic_ns() + (u64)ms * 1000000ull;
 	u32 start = hda_wallclock();
-	/* If wall clock is stuck at 0, use a busy-loop fallback (~1 µs per iter) */
-	if (start == 0 && ms <= 100) {
-		for (volatile int i = 0; i < ms * 1000; i++)
+
+	if (start == 0) {
+		while (arch_tsc_monotonic_ns() < deadline)
 			(void)inb(0x80);
 		return;
 	}
-	for (int spins = 0; spins < ms * 10 + 1000; spins++) {
+	while (arch_tsc_monotonic_ns() < deadline) {
 		u32 now = hda_wallclock();
+
 		if ((u32)(now - start) >= (u32)ms)
 			return;
 		scheduler_yield();
@@ -232,13 +243,36 @@ static u32 hda_corb_send_wait(u32 verb) {
 		return 0;
 	}
 
-	/* Poll RIRBWP for a new entry. */
-	for (int i = 0; i < 500000; i++) {
+	/* Poll RIRBWP for a new entry, bounded by time rather than by a count of
+	 * reads.
+	 *
+	 * Every one of those reads is an MMIO access, which under a hypervisor is
+	 * a trap out of the guest costing a microsecond or so. Half a million of
+	 * them is therefore most of a second per verb, and the probe sends two per
+	 * codec address across four addresses — twenty seconds of boot, every
+	 * boot, spent waiting for a codec that is not there. A codec that IS there
+	 * answers in microseconds: the specification's own wait after a controller
+	 * reset, before codecs are even required to have announced themselves, is
+	 * 521 µs.
+	 *
+	 * So: a short spin for the answer that normally arrives immediately, then
+	 * a bounded wait on the tick, with the read count still capped in case the
+	 * clock is not running yet (this can run before the timer is live). */
+	extern u64 scheduler_get_uptime_ticks(void);
+	u64 start = scheduler_get_uptime_ticks();
+
+	for (int i = 0; i < 20000; i++) {
 		u16 new_wp = hda_r16(HDA_RIRBWP) & 0xFF;
 		if (new_wp != old_wp) {
 			u32 resp = hda_rirb[new_wp & 0xFF];
 			return resp;
 		}
+		/* Ten ticks is a tenth of a second — four orders of magnitude more
+		 * than a working codec needs, and a fiftieth of what this cost
+		 * before. */
+		if ((i & 0xff) == 0xff && scheduler_get_uptime_ticks() - start > 10)
+			break;
+		__asm__ volatile("pause");
 	}
 	return 0;
 }

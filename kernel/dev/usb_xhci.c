@@ -1628,7 +1628,7 @@ int xhci_probe(void)
 
 	if (xhci_run_requested) {
 		console_write("xhci: waiting for ports to settle...\n");
-		scheduler_sleep_ticks(5);
+		scheduler_sleep_ticks(SCHED_MS_TO_TICKS(50));
 		console_write("xhci: enumerating ports...\n");
 		usb_enumerate_ports();
 	}
