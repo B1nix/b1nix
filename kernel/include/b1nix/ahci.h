@@ -52,6 +52,15 @@
 #define ATA_CMD_READ_DMA_EXT    0x25
 #define ATA_CMD_WRITE_DMA_EXT   0x35
 #define ATA_CMD_IDENTIFY        0xEC
+#define ATA_CMD_IDENTIFY_PACKET 0xA1
+
+/* Port signatures (PxSIG). A port says what kind of device answered on it, and
+ * the probe has to ask: IDENTIFY DEVICE sent to a packet device is aborted, and
+ * on QEMU's ich9-ahci the port then never clears CI at all. */
+#define AHCI_SIG_ATA    0x00000101u
+#define AHCI_SIG_ATAPI  0xEB140101u
+#define AHCI_SIG_SEMB   0xC33C0101u
+#define AHCI_SIG_PM     0x96690101u
 #define ATA_CMD_FLUSH_CACHE     0xE7
 #define ATA_CMD_FLUSH_CACHE_EXT 0xEA
 /* DATA SET MANAGEMENT. The command itself only says "here is a list of ranges

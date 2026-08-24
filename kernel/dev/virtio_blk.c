@@ -1,3 +1,4 @@
+#include <b1nix/arch.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
 #include <b1nix/io.h>
@@ -221,6 +222,9 @@ static int vblk_add_region(struct virtqueue *vq, u16 *next_desc, u16 *prev,
   return 0;
 }
 
+volatile u64 vblk_reads, vblk_read_sectors, vblk_writes, vblk_write_sectors,
+    vblk_flushes;
+
 static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
                              u32 count, void *buffer, u32 type) {
   struct virtio_blk_dma_req *dma = kzalloc(sizeof(struct virtio_blk_dma_req));
@@ -314,12 +318,35 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
    * is nobody's critical path in the same way, and spinning a millisecond on
    * every one of them made fdatasync and ftruncate markedly worse — so those
    * keep the short spin and take the sleep. */
-  int spin = (type == VIRTIO_BLK_T_IN) ? 300000 : 4000;
+  /* Bounded in time, not in iterations.
+   *
+   * "Three hundred thousand pauses" is a number whose meaning changes with
+   * every processor it runs on: what was a millisecond on the machine it was
+   * tuned against is half that on a faster one and twice on a slower. The
+   * clock this kernel already calibrates at boot says how long a wait actually
+   * is, so the budget is expressed as one — a millisecond for a read, whose
+   * requester cannot continue without it, and a short one for a write or a
+   * flush, which is nobody's critical path and whose long spin made fdatasync
+   * markedly worse. */
+  {
+    u64 budget_ns = (type == VIRTIO_BLK_T_IN) ? 1000000ull : 15000ull;
+    u64 spin_start = arch_tsc_monotonic_ns();
 
-  for (int i = 0; i < spin; i++) {
-    if (inst->vq.used->idx != inst->vq.last_used_idx)
-      break;
-    __asm__ volatile("pause");
+    for (;;) {
+      if (inst->vq.used->idx != inst->vq.last_used_idx)
+        break;
+      __asm__ volatile("pause");
+      /* The clock read is a counter read and a multiply, so it is checked
+       * every few hundred pauses rather than on each one. */
+      static const unsigned check_every = 256;
+      static unsigned since_check;
+
+      if (++since_check < check_every)
+        continue;
+      since_check = 0;
+      if (arch_tsc_monotonic_ns() - spin_start >= budget_ns)
+        break;
+    }
   }
   /* What a request actually costs, summarised rather than sampled.
    *
@@ -334,6 +361,24 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
 
   vblk_reqs++;
   vblk_sectors += count;
+  /* Split by direction and by size: "a quarter of a million requests" says
+   * nothing about which half of the system to fix, and an average of 738 bytes
+   * per request could be a stream of single sectors or a mix of one huge read
+   * with many tiny writes. */
+  {
+    extern volatile u64 vblk_reads, vblk_read_sectors, vblk_writes,
+        vblk_write_sectors, vblk_flushes;
+
+    if (type == VIRTIO_BLK_T_IN) {
+      vblk_reads++;
+      vblk_read_sectors += count;
+    } else if (type == VIRTIO_BLK_T_FLUSH) {
+      vblk_flushes++;
+    } else {
+      vblk_writes++;
+      vblk_write_sectors += count;
+    }
+  }
   if (inst->vq.used->idx == inst->vq.last_used_idx)
     vblk_slow++;
 
@@ -396,7 +441,17 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
     console_write_dec(vblk_sectors / 2048);
     console_write(" MiB moved, ");
     console_write_dec(vblk_irq_completions);
-    console_write(" completion interrupts\n");
+    console_write(" completion interrupts; reads ");
+    console_write_dec(vblk_reads);
+    console_write("/");
+    console_write_dec(vblk_read_sectors);
+    console_write(" sectors, writes ");
+    console_write_dec(vblk_writes);
+    console_write("/");
+    console_write_dec(vblk_write_sectors);
+    console_write(" sectors, flushes ");
+    console_write_dec(vblk_flushes);
+    console_write("\n");
   }
 
   int ret = (dma->status != 0) ? -1

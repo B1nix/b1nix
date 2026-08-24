@@ -1,3 +1,4 @@
+#include <b1nix/arch.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/ahci.h>
 #include <b1nix/blk.h>
@@ -32,6 +33,7 @@ struct ahci_port_state {
   u64 phys_cmd_table;
   u64 phys_fis;
   int present;
+  int atapi;         // the port answered with the packet-device signature
   volatile int busy; // yield-safe per-port I/O mutex (see ahci_port_lock)
 };
 
@@ -276,6 +278,121 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
 
   ahci_port_unlock(port);
   return (int)count;
+}
+
+/*
+ * ATAPI: SCSI commands carried inside an ATA PACKET command.
+ *
+ * A CD-ROM is not addressed like a disk. Its blocks are 2048 bytes, and the
+ * command that reads them is SCSI READ(10) in the command table's `acmd` field
+ * rather than an ATA opcode in the FIS. The AHCI side is nearly the same as a
+ * disk read: the A bit in the command header says "this is a packet command"
+ * and the controller takes the SCSI block from acmd.
+ *
+ * Only the read path exists. A CD-ROM is read-only media as far as this driver
+ * is concerned, and a write path that could not be tested against a burner
+ * would be code nobody has ever run.
+ */
+static int ahci_packet_command(struct ahci_port_state *port, const u8 *acmd,
+                               void *buffer, u32 bytes) {
+  if (!port->present)
+    return -1;
+
+  ahci_port_lock(port);
+
+  volatile struct ahci_port *p = &port->abar->ports[port->port_num];
+  struct ahci_cmd_header *cmd_hdr = &port->cmd_list[0];
+  struct ahci_cmd_table *cmd_table = port->cmd_table;
+
+  int timeout = 1000000;
+  while ((p->tfd & 0x88) && timeout > 0) {
+    __asm__ volatile("pause");
+    timeout--;
+  }
+  if (timeout == 0) {
+    ahci_port_unlock(port);
+    return -1;
+  }
+
+  u32 ctba = cmd_hdr->ctba;
+  u32 ctbau = cmd_hdr->ctbau;
+  memset(cmd_hdr, 0, sizeof(struct ahci_cmd_header));
+  cmd_hdr->ctba = ctba;
+  cmd_hdr->ctbau = ctbau;
+  cmd_hdr->cfis_len = sizeof(struct fis_reg_h2d) / 4;
+  cmd_hdr->write = 0;
+  cmd_hdr->atapi = 1; /* the controller reads the SCSI block from acmd */
+
+  int prdt_n = bytes ? ahci_build_prdt(cmd_table, buffer, bytes) : 0;
+  if (prdt_n < 0) {
+    ahci_port_unlock(port);
+    return -1;
+  }
+  cmd_hdr->prdtl = (u16)prdt_n;
+
+  memset(cmd_table->cfis, 0, 64);
+  memset(cmd_table->acmd, 0, sizeof(cmd_table->acmd));
+  memcpy(cmd_table->acmd, acmd, 12); /* 12-byte packet, as ATAPI defines it */
+
+  struct fis_reg_h2d *fis = (struct fis_reg_h2d *)cmd_table->cfis;
+  fis->fis_type = FIS_TYPE_REG_H2D;
+  fis->c = 1;
+  fis->command = 0xA0;   /* ATA PACKET */
+  fis->feature_low = 0x01;  /* DMA, not PIO: the data comes through the PRDT */
+  /* The byte count limit the device may use per transfer, in the LBA mid/high
+   * registers -- ATAPI's own name for "how much you may send at once". */
+  fis->lba1 = (u8)(bytes & 0xFF);
+  fis->lba2 = (u8)((bytes >> 8) & 0xFF);
+
+  p->serr = p->serr;
+  p->ci = 1;
+
+  ahci_wait_ci_clear(port, p, 1, "packet", port->port_num);
+
+  u32 tfd = p->tfd;
+  if (tfd & 0x01) {
+    ahci_port_unlock(port);
+    return -1;
+  }
+  ahci_port_unlock(port);
+  return 0;
+}
+
+/* READ CAPACITY(10): the last addressable block and the block size. */
+static int ahci_packet_capacity(struct ahci_port_state *port, u64 *blocks,
+                                u32 *block_size) {
+  u8 acmd[12] = {0x25};
+  u8 *cap = kzalloc(64);
+
+  if (!cap)
+    return -1;
+  if (ahci_packet_command(port, acmd, cap, 8) != 0) {
+    kfree(cap);
+    return -1;
+  }
+  u32 last = ((u32)cap[0] << 24) | ((u32)cap[1] << 16) | ((u32)cap[2] << 8) |
+             (u32)cap[3];
+  u32 bs = ((u32)cap[4] << 24) | ((u32)cap[5] << 16) | ((u32)cap[6] << 8) |
+           (u32)cap[7];
+  kfree(cap);
+  if (bs == 0)
+    return -1;
+  *blocks = (u64)last + 1;
+  *block_size = bs;
+  return 0;
+}
+
+static int ahci_packet_read(struct ahci_port_state *port, u64 lba, u32 count,
+                            void *buffer, u32 block_size) {
+  u8 acmd[12] = {0x28}; /* READ(10) */
+
+  acmd[2] = (u8)((lba >> 24) & 0xFF);
+  acmd[3] = (u8)((lba >> 16) & 0xFF);
+  acmd[4] = (u8)((lba >> 8) & 0xFF);
+  acmd[5] = (u8)(lba & 0xFF);
+  acmd[7] = (u8)((count >> 8) & 0xFF);
+  acmd[8] = (u8)(count & 0xFF);
+  return ahci_packet_command(port, acmd, buffer, count * block_size);
 }
 
 static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
@@ -534,6 +651,16 @@ static int ahci_blk_read(struct block_device *dev, u64 lba, u32 count,
   return ahci_port_read(port, lba, count, buffer);
 }
 
+/* A CD-ROM's blocks, through the packet path. Read-only: a write to it fails
+ * rather than pretending, because there is no write path here to take it. */
+static int ahci_blk_packet_read(struct block_device *dev, u64 lba, u32 count,
+                                void *buffer) {
+  struct ahci_port_state *port = (struct ahci_port_state *)dev->priv;
+  return ahci_packet_read(port, lba, count, buffer, (u32)dev->block_size) == 0
+             ? (int)count
+             : -1;
+}
+
 static int ahci_blk_write(struct block_device *dev, u64 lba, u32 count,
                           const void *buffer) {
   struct ahci_port_state *port = (struct ahci_port_state *)dev->priv;
@@ -626,10 +753,48 @@ static void ahci_port_init(struct ahci_port_state *port,
   p->ie = 0xFFFFFFFF;
 
   port->present = 1;
+  port->atapi = (p->sig == AHCI_SIG_ATAPI);
 
   console_write("ahci: port ");
   console_write_dec(num);
-  console_write(" ready\n");
+  console_write(port->atapi ? " ready (packet device)\n" : " ready\n");
+}
+
+/* Wait for a command to complete, but give up.
+ *
+ * The I/O path above deliberately never gives up: the command's PRDT points at
+ * a live buffer, and abandoning the wait would hand that memory back while the
+ * controller may still write into it. A probe has neither problem — the buffer
+ * is ours and the port carries nothing yet — and a probe that cannot give up is
+ * a boot that cannot finish. That is what an ATAPI device on the port did: the
+ * IDENTIFY it cannot answer left CI set, and the machine stopped there, before
+ * userspace, every time it was booted on q35.
+ *
+ * Returns 0 when the slot cleared, -1 on the deadline. */
+static int ahci_wait_ci_clear_bounded(volatile struct ahci_port *p,
+                                      u32 slot_mask, u64 timeout_ms) {
+  u64 deadline = arch_tsc_monotonic_ns() + timeout_ms * 1000000ull;
+  while (p->ci & slot_mask) {
+    for (int i = 0; i < 256; i++)
+      __asm__ volatile("pause");
+    if (arch_tsc_monotonic_ns() >= deadline)
+      return (p->ci & slot_mask) ? -1 : 0;
+  }
+  return 0;
+}
+
+/* Stop a port that will not answer, so nothing later waits on it. */
+static void ahci_port_disable(struct ahci_port_state *port,
+                              volatile struct ahci_port *p, const char *why) {
+  p->cmd &= ~AHCI_PxCMD_ST;
+  p->ie = 0;
+  p->is = p->is;
+  port->present = 0;
+  console_write("ahci: port ");
+  console_write_dec(port->port_num);
+  console_write(" ");
+  console_write(why);
+  console_write("; leaving it alone\n");
 }
 
 static int ahci_port_identify(struct ahci_port_state *port, u16 *identify_buf) {
@@ -670,13 +835,19 @@ static int ahci_port_identify(struct ahci_port_state *port, u16 *identify_buf) {
   struct fis_reg_h2d *fis = (struct fis_reg_h2d *)cmd_table->cfis;
   fis->fis_type = FIS_TYPE_REG_H2D;
   fis->c = 1;
-  fis->command = ATA_CMD_IDENTIFY;
+  /* A packet device answers IDENTIFY PACKET DEVICE and aborts the other one. */
+  fis->command = port->atapi ? ATA_CMD_IDENTIFY_PACKET : ATA_CMD_IDENTIFY;
   fis->device = 0;
 
   p->serr = p->serr;
   p->ci = 1;
 
-  ahci_wait_ci_clear(port, p, 1, "identify", port->port_num);
+  /* Bounded: see ahci_wait_ci_clear_bounded. A device that does not answer its
+   * own identify is a device this driver cannot use, not a reason to stop. */
+  if (ahci_wait_ci_clear_bounded(p, 1, 2000) != 0) {
+    ahci_port_disable(port, p, "did not answer identify");
+    return -1;
+  }
 
   u32 tfd = p->tfd;
   if (tfd & 0x01) {
@@ -799,6 +970,47 @@ void ahci_init(void) {
   for (int i = 0; i < 32 && i < (int)n_ports; i++) {
     if (pi & (1 << i)) {
       ahci_port_init(&ports[i], ahci_bar, i);
+      /* A packet device is a CD-ROM, not a disk: its blocks are 2048 bytes and
+       * it speaks SCSI over ATA, neither of which this driver implements. It
+       * gets identified for the log and then left alone — registering it as a
+       * 512-byte block device would hand the block layer a disk that answers
+       * nothing. */
+      /* A packet device is a CD-ROM: 2048-byte blocks, and SCSI commands
+       * carried inside ATA PACKET rather than ATA opcodes. It registers as a
+       * read-only block device so an ISO on it mounts like any other
+       * filesystem; a device that reports no medium is left alone rather than
+       * published as a disk that answers nothing. */
+      if (ports[i].present && ports[i].atapi) {
+        u16 *pbuf = kzalloc(512);
+        if (pbuf) {
+          (void)ahci_port_identify(&ports[i], pbuf);
+          kfree(pbuf);
+        }
+
+        u64 blocks = 0;
+        u32 bsize = 0;
+        if (ahci_packet_capacity(&ports[i], &blocks, &bsize) != 0 || blocks == 0) {
+          volatile struct ahci_port *pp = &ahci_bar->ports[i];
+          ahci_port_disable(&ports[i], pp, "packet device reports no medium");
+          continue;
+        }
+
+        struct block_device *dev = &ahci_devices[ahci_device_count];
+        dev->block_size = bsize;
+        dev->block_count = blocks;
+        dev->priv = &ports[i];
+        dev->read_blocks = ahci_blk_packet_read;
+        dev->write_blocks = 0; /* read-only medium */
+        dev->rotational = 1;
+        blk_register_disk(dev, "sr", BLK_BUS_ATA);
+        ahci_device_count++;
+        console_write("ahci: cd-rom registered, ");
+        console_write_dec((u32)blocks);
+        console_write(" blocks of ");
+        console_write_dec(bsize);
+        console_write(" bytes\n");
+        continue;
+      }
       if (ports[i].present) {
         // Register as block device
         struct block_device *dev = &ahci_devices[ahci_device_count];

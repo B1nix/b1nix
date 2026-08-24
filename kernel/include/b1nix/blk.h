@@ -16,6 +16,9 @@ enum blk_bus {
 	BLK_BUS_VIRTIO,
 	BLK_BUS_MEMORY,  /* ramdisk */
 	BLK_BUS_LOOP,
+	BLK_BUS_MD,      /* software RAID — an array over other block devices */
+	BLK_BUS_NBD,     /* a remote export reached over TCP */
+	BLK_BUS_MTD,     /* raw flash, through the MTD layer */
 };
 
 /* What one command to this device may carry. Linux keeps the same three
@@ -240,6 +243,8 @@ void blk_create_dev_nodes(void);
 void blk_cache_init(void);
 int blk_read_cached(struct block_device *dev, u64 lba, u32 count, void *buffer);
 int blk_write_cached(struct block_device *dev, u64 lba, u32 count, const void *buffer);
+/* The writeback deadline a filesystem should defer metadata against. */
+u64 blk_writeback_interval_ticks(void);
 /* Make `count` blocks starting at `lba` read back as zeroes. Uses the device's
  * own WRITE ZEROES when it has one (keeping the block cache coherent), and
  * otherwise writes the zeroes through the cache exactly as before. */
