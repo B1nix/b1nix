@@ -27,6 +27,7 @@
  * its own without this file changing.
  */
 
+#include <linux/pci.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -41,6 +42,9 @@
 #include <lkpi/drmdev.h>
 #include <lkpi/env.h>
 #include <drm/drm_mode.h>
+#include <asm/ioctl.h>
+#include <linux/atomic.h>
+#include <uapi/drm/i915_drm.h>
 
 /* Upstream's file operations, as drm_drv.c builds them for a driver that uses
  * DEFINE_DRM_GEM_FOPS. Called directly rather than through a table: b1nix's VFS
@@ -126,6 +130,45 @@ u32 lkpi_drm_primary_minor(void)
 unsigned lkpi_drm_device_count(void)
 {
 	return g_drm_count;
+}
+
+/* The PCI identity behind a registered card.
+ *
+ * Every card used to be published in sysfs under one hardcoded PCI address
+ * claiming to be the Intel part, whichever device it actually belonged to. With
+ * two cards that makes them indistinguishable: Mesa enumerates EGL devices,
+ * matches them to DRM nodes through sysfs, finds two nodes on one device, and
+ * initialises the wrong one — "DRI2: failed to create screen" on a GPU that was
+ * never the one being driven. Each card is described by its own device now, and
+ * this is where the description comes from. */
+int lkpi_drm_pci_at(unsigned index, struct lkpi_drm_pci_id *out)
+{
+	struct drm_device *dev;
+	struct pci_dev *pdev;
+
+	if (index >= g_drm_count || !out)
+		return -EINVAL;
+	dev = g_drm[index].dev;
+	if (!dev || !dev->dev)
+		return -ENODEV;
+	/* Not to_pci_dev(): a container_of cannot tell a PCI function from
+	 * anything else that happens to sit at that address, and publishing what it
+	 * returns for a non-PCI parent is how every card ended up reporting
+	 * 0000:0000. A parent that is not a PCI function has no PCI identity, and
+	 * saying so lets the caller fall back instead of inventing one. */
+	pdev = lkpi_dev_to_pci(dev->dev);
+	if (!pdev)
+		return -ENODEV;
+	out->bus = pdev->bus_nr;
+	out->slot = pdev->slot;
+	out->func = pdev->func;
+	out->vendor = pdev->vendor;
+	out->device = pdev->device;
+	out->subsystem_vendor = pdev->subsystem_vendor;
+	out->subsystem_device = pdev->subsystem_device;
+	out->revision = pdev->revision;
+	out->pci_class = pdev->class;
+	return 0;
 }
 
 int lkpi_drm_minor_at(unsigned index, u32 *out_minor)
@@ -337,6 +380,143 @@ static void debug_dump_connector_modes(void *user_arg)
 	}
 }
 
+/* ── EXECBUFFER2 accounting ─────────────────────────────────────── */
+
+/*
+ * What Mesa actually submits, counted at the crossing.
+ *
+ * "iris submits softpin-only" is a claim about the *guest*, and the only place
+ * it can be checked without trusting either side is here: the argument as it
+ * arrives from userspace, before the driver has looked at it. Reading it back
+ * out of the driver would prove nothing about the ABI, because by then the
+ * driver has already reinterpreted whatever we handed it.
+ *
+ * Four numbers settle the claim, and they have to be separated:
+ *
+ *   pinned  objects carrying EXEC_OBJECT_PINNED — the address is the client's
+ *           choice and the kernel must honour it rather than assign one.
+ *   relocs  the total relocation_count over every object. Softpin-only means
+ *           this stays zero: one non-zero entry and the kernel would have to
+ *           run the relocation path, which is a different code path with
+ *           different failure modes, and the claim would be false.
+ *   flags   the OR of every execbuffer2 flags word seen. Last-wins would hide
+ *           the one submission in a thousand that asks for something else.
+ *   fail    calls that returned an error. A run that submits nothing and a run
+ *           where every submission is rejected both produce no pixels, and a
+ *           call count alone cannot tell them apart.
+ *
+ * The structures come from the pinned import tree's uapi header, not from a
+ * copy kept here: a private copy is how a kernel drifts from the ABI it claims
+ * to serve without anything failing to build.
+ *
+ * All of it is behind b1nix.i915-execbuf, because it copies the whole object
+ * array in from userspace a second time on every submission — acceptable for a
+ * diagnostic run, not for the ordinary path.
+ */
+static atomic64_t execbuf_calls;
+static atomic64_t execbuf_fail;
+static atomic64_t execbuf_objs;
+static atomic64_t execbuf_pinned;
+static atomic64_t execbuf_relocs;
+/* A plain word rather than an atomic64_t: the shim has no atomic64_or, and an
+ * OR is the one operation this needs. */
+static u64 execbuf_flags_seen;
+
+/* Computed from the pinned uapi header rather than written as a literal — a
+ * hand-copied 0x40406469 stays right only until the struct changes size.
+ *
+ * Matched on type and number alone, deliberately: the same command exists as
+ * DRM_IOW and as DRM_IOWR (the _WR form, which returns an out-fence), and both
+ * are the submission this is counting. */
+#define B1NIX_EXECBUF2_NR (DRM_COMMAND_BASE + DRM_I915_GEM_EXECBUFFER2)
+
+static int execbuf_is_execbuffer2(u64 request)
+{
+	return _IOC_TYPE((unsigned int)request) == DRM_IOCTL_BASE &&
+	       _IOC_NR((unsigned int)request) == B1NIX_EXECBUF2_NR;
+}
+
+/* One line per submission while the numbers are small, then one per doubling
+ * and one per 1024 after that. A GL probe submits a handful of batches and a
+ * compositor submits thousands; any fixed interval either says nothing about
+ * the first or drowns the log in the second. */
+static int execbuf_should_report(u64 n)
+{
+	return (n & (n - 1)) == 0 || (n % 1024) == 0;
+}
+
+static void execbuf_account(void *user_arg, isize ret)
+{
+	struct drm_i915_gem_execbuffer2 eb;
+	u64 objs = 0, pinned = 0, relocs = 0, i;
+	u64 n;
+
+	if (lkpi_copy_from_user(&eb, user_arg, sizeof(eb)) != 0)
+		return;
+
+	/* Bounded on purpose. A confused or hostile client can name a buffer
+	 * count that describes no memory it owns, and this walk must not be what
+	 * turns that into a kernel fault. 4096 is far above anything Mesa
+	 * submits, so a run that reaches the cap is itself worth seeing. */
+	for (i = 0; i < eb.buffer_count && i < 4096; i++) {
+		struct drm_i915_gem_exec_object2 obj;
+		const void *src = (const void *)(usize)(eb.buffers_ptr +
+		                                        i * sizeof(obj));
+
+		if (lkpi_copy_from_user(&obj, src, sizeof(obj)) != 0)
+			break;
+		objs++;
+		if (obj.flags & EXEC_OBJECT_PINNED)
+			pinned++;
+		relocs += obj.relocation_count;
+		/* Where the client asked for the object, on a submission the kernel
+		 * refused.
+		 *
+		 * A softpin address is not a hint: if it cannot be bound there, the
+		 * driver has nowhere else to put the object and answers -ENOSPC after
+		 * evicting the entire address space trying. Mesa's iris lays its
+		 * buffers out in memzones spread across the full 48-bit range, so an
+		 * address space that is narrower than the driver reports would fail
+		 * exactly here — on the first batch that reaches a high zone, with
+		 * every earlier one succeeding. The offsets are the only thing that
+		 * distinguishes that from genuine exhaustion. */
+		if (ret < 0)
+			pr_info("I915-EXECBUF:   obj[%llu] handle=%u offset=0x%llx "
+			        "pad_to_size=0x%llx flags=0x%llx\n",
+			        (unsigned long long)i, (unsigned)obj.handle,
+			        (unsigned long long)obj.offset,
+			        (unsigned long long)obj.pad_to_size,
+			        (unsigned long long)obj.flags);
+	}
+
+	n = (u64)atomic64_inc_return(&execbuf_calls);
+	if (ret < 0)
+		atomic64_inc(&execbuf_fail);
+	atomic64_add((long)objs, &execbuf_objs);
+	atomic64_add((long)pinned, &execbuf_pinned);
+	atomic64_add((long)relocs, &execbuf_relocs);
+	__atomic_fetch_or(&execbuf_flags_seen, (u64)eb.flags, __ATOMIC_RELAXED);
+
+	/* Every failure is reported, however many there are: a submission the
+	 * kernel rejected is the whole reason this counter exists. */
+	if (ret >= 0 && !execbuf_should_report(n))
+		return;
+	pr_info("I915-EXECBUF: call #%llu bufs=%u pinned=%llu relocs=%llu "
+	        "flags=0x%llx batch_len=%u -> %d\n",
+	        (unsigned long long)n, (unsigned)eb.buffer_count,
+	        (unsigned long long)pinned, (unsigned long long)relocs,
+	        (unsigned long long)eb.flags, (unsigned)eb.batch_len, (int)ret);
+	pr_info("I915-EXECBUF: total calls=%lld fail=%lld objs=%lld pinned=%lld "
+	        "relocs=%lld flags=0x%llx\n",
+	        (long long)atomic64_read(&execbuf_calls),
+	        (long long)atomic64_read(&execbuf_fail),
+	        (long long)atomic64_read(&execbuf_objs),
+	        (long long)atomic64_read(&execbuf_pinned),
+	        (long long)atomic64_read(&execbuf_relocs),
+	        (unsigned long long)__atomic_load_n(&execbuf_flags_seen,
+	                                            __ATOMIC_RELAXED));
+}
+
 isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 {
 	/* 0xc05064a7: DRM_IOCTL_MODE_GETCONNECTOR. */
@@ -385,8 +565,25 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 
 	if (!filp)
 		return -EBADF;
-	return (isize)drm_ioctl(filp, (unsigned int)request,
-	                        (unsigned long)(usize)user_arg);
+
+	isize ret = (isize)drm_ioctl(filp, (unsigned int)request,
+	                             (unsigned long)(usize)user_arg);
+
+	/* After the call, not before: the argument is counted either way, but the
+	 * only way to know a submission was *accepted* is its return value. */
+	if (execbuf_is_execbuffer2(request) && user_arg &&
+	    lkpi_bootflag("b1nix.i915-execbuf"))
+		execbuf_account(user_arg, ret);
+	/* A refused ioctl, named.
+	 *
+	 * Userspace usually reports only that something did not work — "failed to
+	 * open drm device" covers an open that succeeded and a follow-up call that
+	 * did not — and the number of the call that was actually refused is the
+	 * difference between a guess and a fix. Behind the debug flag, because a
+	 * working session issues thousands of these per second. */
+	if (ret < 0 && lkpi_bootflag("b1nix.drm-debug"))
+		pr_info("drm: ioctl 0x%08x -> %d\n", (unsigned)request, (int)ret);
+	return ret;
 }
 
 isize lkpi_drm_read(void *file, void *user_buf, usize len)

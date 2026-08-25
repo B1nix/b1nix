@@ -186,7 +186,7 @@ long dma_resv_wait_timeout(struct dma_resv *obj, enum dma_resv_usage usage,
 			return dma_resv_test_signaled(obj, usage) ? 1 : 0;
 		}
 		if (lkpi_can_block())
-			lkpi_sleep_ticks(1);
+			lkpi_sleep_jiffies(1);
 		else
 			lkpi_cpu_relax();
 	}

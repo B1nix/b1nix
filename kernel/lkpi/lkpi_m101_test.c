@@ -119,7 +119,7 @@ static void wq_thread(void *arg)
 	/* Sleep first, so the waiter is genuinely parked before the wake. A
 	 * wake that arrives before the wait is a different (also valid) path,
 	 * tested separately below by setting the condition up front. */
-	scheduler_sleep_ticks(3);
+	scheduler_sleep_ticks(SCHED_MS_TO_TICKS(30));
 	g_wq_condition = 0xABCDu;
 	wake_up(&g_wq);
 	g_wq_thread_done = 1;
@@ -957,7 +957,7 @@ static void kw_slow_handler(struct kthread_work *work)
 	(void)work;
 	/* Sleeps, which a handler is allowed to do — and which makes the flush
 	 * below have something real to wait for. */
-	scheduler_sleep_ticks(5);
+	scheduler_sleep_ticks(SCHED_MS_TO_TICKS(50));
 	g_kw_slow_done = 1;
 }
 

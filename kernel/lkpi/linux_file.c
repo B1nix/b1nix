@@ -435,10 +435,30 @@ struct file *shmem_file_setup_with_mnt(struct vfsmount *mnt, const char *name,
 	return shmem_file_setup(name, size, flags);
 }
 
+/* How much of a GEM object's fill is spent here.
+ *
+ * The submission that takes two seconds parks inside the imported
+ * shmem_sg_alloc_table, and imported objects carry no frame pointers, so the
+ * backtrace stops at that one frame — everything below it is invisible. These
+ * two counters say whether the time is in this function at all, which is the
+ * difference between fixing the page supply and fixing something else. */
+static u64 g_shmem_folio_calls;
+static u64 g_shmem_folio_ns;
+
+void lkpi_shmem_counts(u64 *calls, u64 *ns)
+{
+	if (calls)
+		*calls = g_shmem_folio_calls;
+	if (ns)
+		*ns = g_shmem_folio_ns;
+}
+
 struct folio *shmem_read_folio_gfp(struct address_space *mapping,
                                    unsigned long index, gfp_t gfp)
 {
 	struct lkpi_shmem *sh = shmem_from_mapping(mapping);
+	u64 t0 = lkpi_monotonic_ns();
+	struct folio *ret;
 
 	(void)gfp;
 	if (!sh || index >= sh->npages)
@@ -452,7 +472,10 @@ struct folio *shmem_read_folio_gfp(struct address_space *mapping,
 	}
 	/* struct folio starts with its struct page — see <linux/mm.h> — so one
 	 * page is its own folio. */
-	return page_folio(&sh->pages[index]);
+	ret = page_folio(&sh->pages[index]);
+	g_shmem_folio_calls++;
+	g_shmem_folio_ns += lkpi_monotonic_ns() - t0;
+	return ret;
 }
 
 void shmem_truncate_range(struct inode *inode, loff_t start, loff_t end)

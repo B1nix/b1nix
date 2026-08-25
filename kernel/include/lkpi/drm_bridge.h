@@ -43,6 +43,15 @@ void lkpi_drm_register_device(struct drm_device *dev, lkpi_drm_page_fn resolver)
 
 /* Every registered device, so b1nix can publish a node per card. Index is
  * registration order, which is boot order. */
+/* What a card is, on the bus. Filled by lkpi_drm_pci_at so each DRM minor can
+ * be published in sysfs under the device it actually belongs to. */
+struct lkpi_drm_pci_id {
+	u8 bus, slot, func, revision;
+	u16 vendor, device, subsystem_vendor, subsystem_device;
+	u32 pci_class;
+};
+int lkpi_drm_pci_at(unsigned index, struct lkpi_drm_pci_id *out);
+
 unsigned lkpi_drm_device_count(void);
 int lkpi_drm_minor_at(unsigned index, u32 *out_minor);
 

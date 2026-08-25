@@ -27,6 +27,7 @@
  * <lkpi/env.h>. */
 #include <drm/drm_fourcc.h>
 #include <drm/drm_mm.h>
+#include <drm/drm_vma_manager.h>
 #include <drm/drm_rect.h>
 #include <linux/errno.h>
 #include <linux/printk.h>
@@ -95,6 +96,64 @@ static void test_drm_mm(void)
 	}
 	if (overlaps != 0)
 		ok = 0;
+
+	/* The SAME allocator, asked for the lowest free address instead of the
+	 * best fit.
+	 *
+	 * The two modes walk different trees: best-fit descends the hole SIZE
+	 * tree, lowest-address descends the hole ADDRESS tree, and only the
+	 * second carries the subtree_max_hole augmentation. Everything above
+	 * exercised the first, so the augmented half had never been asked a
+	 * question -- and it is the half every real consumer uses: GEM mmap
+	 * offsets and i915's GGTT/PPGTT both insert with DRM_MM_INSERT_LOW,
+	 * where a wrong subtree maximum reads as "no suitable hole" (-ENOSPC)
+	 * with the space plainly there.
+	 */
+	{
+		static struct drm_mm low_mm;
+		static struct drm_mm_node low_nodes[MM_NODES];
+		usize placed = 0;
+		int low_ok = 1;
+
+		memset(&low_mm, 0, sizeof(low_mm));
+		memset(low_nodes, 0, sizeof(low_nodes));
+		/* The range the GEM mmap manager actually uses, not a small one:
+		 * it starts past 4 GiB and spans 256 times that, so anything in
+		 * the hole arithmetic that is computed in 32 bits, or that
+		 * overflows near the top, is exercised here rather than in a
+		 * driver. */
+		drm_mm_init(&low_mm, DRM_FILE_PAGE_OFFSET_START,
+			    DRM_FILE_PAGE_OFFSET_SIZE);
+
+		for (usize i = 0; i < MM_NODES; i++) {
+			if (drm_mm_insert_node_in_range(
+				    &low_mm, &low_nodes[i], 1, 0, 0,
+				    DRM_FILE_PAGE_OFFSET_START,
+				    DRM_FILE_PAGE_OFFSET_START +
+					    DRM_FILE_PAGE_OFFSET_SIZE,
+				    DRM_MM_INSERT_LOW) != 0)
+				break;
+			placed++;
+		}
+		/* Ascending addresses, no overlaps: that is what "lowest first"
+		 * means, and a stale subtree maximum breaks it. */
+		for (usize i = 1; low_ok && i < placed; i++) {
+			if (low_nodes[i].start <= low_nodes[i - 1].start ||
+			    low_nodes[i - 1].start + low_nodes[i - 1].size >
+				    low_nodes[i].start)
+				low_ok = 0;
+		}
+		if (placed != MM_NODES)
+			low_ok = 0;
+		import_report("drm-mm-insert-low", low_ok, (u64)placed);
+		if (!low_ok)
+			ok = 0;
+
+		for (usize i = 0; i < placed; i++)
+			if (drm_mm_node_allocated(&low_nodes[i]))
+				drm_mm_remove_node(&low_nodes[i]);
+		drm_mm_takedown(&low_mm);
+	}
 
 	/* Freeing half and reallocating must reuse the holes — otherwise the
 	 * allocator is leaking address space rather than managing it. */

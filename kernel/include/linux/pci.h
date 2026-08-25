@@ -24,8 +24,20 @@
 struct pci_bus { unsigned char number; };
 static inline int pci_domain_nr(struct pci_bus *bus) { (void)bus; return 0; }
 
+/* Stamped into every pci_dev this shim constructs.
+ *
+ * to_pci_dev() is a container_of: it cannot fail, cannot check, and will
+ * happily reinterpret any struct device as a PCI function. A DRM device whose
+ * parent was a bare struct device therefore had its neighbouring members read
+ * as vendor and slot, and the result was published in sysfs as the hardware's
+ * identity. Anything that means to ask "is this parent a PCI function" must be
+ * able to get a real answer. */
+#define LKPI_PCI_DEV_MAGIC 0x50434944u /* 'PCID' */
+
 struct pci_dev {
 	struct device dev;
+	/* LKPI_PCI_DEV_MAGIC when this really is one. */
+	u32 lkpi_is_pci;
 	/* The bus object, as Linux has it — imported code reads bus->number. */
 	struct pci_bus *bus;
 	u8 bus_nr;
@@ -49,6 +61,18 @@ struct pci_dev {
 };
 
 #define to_pci_dev(d) container_of(d, struct pci_dev, dev)
+
+/* Is this device the `dev` member of a pci_dev the shim built? */
+static inline struct pci_dev *lkpi_dev_to_pci(struct device *d)
+{
+	struct pci_dev *p;
+
+	if (!d)
+		return 0;
+	p = to_pci_dev(d);
+	return p->lkpi_is_pci == LKPI_PCI_DEV_MAGIC ? p : 0;
+}
+
 
 static inline void *pci_get_drvdata(struct pci_dev *pdev)
 {

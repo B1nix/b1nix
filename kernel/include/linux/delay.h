@@ -8,7 +8,7 @@
 static inline void udelay(unsigned long usecs) { lkpi_udelay(usecs); }
 static inline void ndelay(unsigned long ns) { udelay((ns + 999) / 1000); }
 static inline void mdelay(unsigned long ms) { udelay(ms * 1000); }
-static inline void msleep(unsigned int ms) { lkpi_sleep_ticks((ms + 9) / 10); }
+static inline void msleep(unsigned int ms) { lkpi_sleep_jiffies((ms + 9) / 10); }
 static inline void usleep_range(unsigned long lo, unsigned long hi)
 { (void)hi; udelay(lo); }
 

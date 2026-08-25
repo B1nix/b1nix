@@ -120,11 +120,24 @@ static int fb_flush_rect(struct b1nix_fb_rect *r) {
 }
 
 /* Linux's own framebuffer interface, so fbset and anything else written for
- * /dev/fb0 works without a b1nix-specific code path. Only the two GET ioctls
- * exist: the mode is fixed by whatever the bootloader handed us, so accepting
- * FBIOPUT_VSCREENINFO would mean reporting a mode change that never happened. */
+ * /dev/fb0 works without a b1nix-specific code path.
+ *
+ * The write side is answered too, and refusing it was a mistake worth naming:
+ * the mode here is fixed by whatever the bootloader handed us, and the old
+ * comment reasoned that accepting FBIOPUT_VSCREENINFO would report a change
+ * that never happened. That is not what the call means. Linux's contract is
+ * that the driver ADJUSTS the caller's request down to what the hardware can
+ * actually do, writes the result back, and returns success -- every
+ * fixed-mode driver in Linux does exactly that. Refusing it fails clients
+ * which, like most, set the mode before drawing even when they intend to keep
+ * the one they have. */
 #define FBIOGET_VSCREENINFO 0x4600
+#define FBIOPUT_VSCREENINFO 0x4601
 #define FBIOGET_FSCREENINFO 0x4602
+#define FBIOPAN_DISPLAY     0x4606
+#define FBIOBLANK           0x4611
+#define FB_ACTIVATE_TEST    0x02
+#define FB_BLANK_UNBLANK    0
 
 struct fb_bitfield_u {
   u32 offset;
@@ -173,6 +186,50 @@ static int fb_ioctl(struct vfs_node *node, u64 request, void *arg) {
     if (!arg || syscall_copyout(arg, &v, sizeof(v)) < 0)
       return -EFAULT;
     return 0;
+  }
+  case FBIOPUT_VSCREENINFO: {
+    /* Adjusted, not applied. The geometry comes from the bootloader and does
+     * not move, so the answer is the mode that is really in force -- which is
+     * what the caller reads back and what Linux's own fixed-mode drivers
+     * return. FB_ACTIVATE_TEST asks whether a mode would be accepted without
+     * setting it; the answer is the same either way. */
+    struct fb_var_screeninfo_u v;
+
+    if (!arg || syscall_copyin(&v, arg, sizeof(v)) < 0)
+      return -EFAULT;
+    v.xres = v.xres_virtual = fb_console_width();
+    v.yres = v.yres_virtual = fb_console_height();
+    v.xoffset = v.yoffset = 0;
+    v.bits_per_pixel = 32;
+    v.red.offset = 16; v.red.length = 8; v.red.msb_right = 0;
+    v.green.offset = 8; v.green.length = 8; v.green.msb_right = 0;
+    v.blue.offset = 0; v.blue.length = 8; v.blue.msb_right = 0;
+    v.transp.offset = 24; v.transp.length = 0; v.transp.msb_right = 0;
+    v.grayscale = 0;
+    v.nonstd = 0;
+    if (syscall_copyout(arg, &v, sizeof(v)) < 0)
+      return -EFAULT;
+    return 0;
+  }
+  case FBIOPAN_DISPLAY: {
+    /* No panning: the fixed info reports xpanstep and ypanstep as zero, which
+     * is how a driver says so, and the only offset that can be honoured is
+     * the one already in force. A request to move elsewhere is refused rather
+     * than silently ignored -- a client that pans and is told it worked would
+     * draw into a region that is never shown. */
+    struct fb_var_screeninfo_u v;
+
+    if (!arg || syscall_copyin(&v, arg, sizeof(v)) < 0)
+      return -EFAULT;
+    if (v.xoffset != 0 || v.yoffset != 0)
+      return -EINVAL;
+    return 0;
+  }
+  case FBIOBLANK: {
+    /* Unblanking is the state this display is permanently in, so it succeeds.
+     * Blanking is not something this driver can do, and claiming otherwise
+     * would leave a screen lit that the caller believes is dark. */
+    return (usize)arg == FB_BLANK_UNBLANK ? 0 : -EINVAL;
   }
   case FBIOGET_FSCREENINFO: {
     struct fb_fix_screeninfo_u f;

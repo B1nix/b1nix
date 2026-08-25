@@ -19,6 +19,7 @@
  * Emits M47-GFX markers consumed by tests/smoke.sh.
  */
 #include <b1nix/fb.h>
+#include <linux/fb.h>
 #include <b1nix/input.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -61,6 +62,48 @@ static int test_fb(void) {
 		return -1;
 	}
 	marker("M47-GFX: ok fb-info\n");
+
+	/* Linux's own mode interface, both halves.
+	 *
+	 * Setting the mode is what a real fbdev client does before it draws,
+	 * even when it intends to keep the mode it already has, and this driver
+	 * used to refuse it -- reasoning that a fixed mode cannot be changed. The
+	 * call does not mean "change it": the driver adjusts the request to what
+	 * the hardware can do and reports that back. Refusing failed every client
+	 * that asks. Checked here by asking for a deliberately impossible mode
+	 * and requiring the answer to be the mode that is really in force.
+	 */
+	{
+		struct fb_var_screeninfo want;
+
+		memset(&want, 0, sizeof(want));
+		if (ioctl(fd, FBIOGET_VSCREENINFO, &want) != 0) {
+			marker("M47-GFX: fail fb-getvar\n");
+			close(fd);
+			return -1;
+		}
+		if (want.xres != info.width || want.yres != info.height ||
+		    want.bits_per_pixel != 32) {
+			marker("M47-GFX: fail fb-getvar-mismatch\n");
+			close(fd);
+			return -1;
+		}
+		want.xres = 1;
+		want.yres = 1;
+		want.bits_per_pixel = 8;
+		if (ioctl(fd, FBIOPUT_VSCREENINFO, &want) != 0) {
+			marker("M47-GFX: fail fb-putvar\n");
+			close(fd);
+			return -1;
+		}
+		if (want.xres != info.width || want.yres != info.height ||
+		    want.bits_per_pixel != 32) {
+			marker("M47-GFX: fail fb-putvar-adjust\n");
+			close(fd);
+			return -1;
+		}
+		marker("M47-GFX: ok fb-putvar\n");
+	}
 
 	size_t map_len = (size_t)info.pitch * info.height;
 

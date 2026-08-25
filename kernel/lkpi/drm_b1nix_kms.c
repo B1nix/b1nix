@@ -42,6 +42,8 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
+#include <drm/drm_ioctl.h>
+#include <uapi/drm/virtgpu_drm.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_mode_config.h>
 #include <drm/drm_modes.h>
@@ -54,6 +56,7 @@
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/iosys-map.h>
+#include <linux/pci.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -84,6 +87,10 @@ struct b1nix_gem {
 	struct page **pages;
 	usize npages;
 	void *vaddr;
+	/* The virgl resource this object backs, or 0 for a plain dumb buffer.
+	 * A GEM handle is what Mesa passes around; the host knows only resource
+	 * ids, and this is where one becomes the other. */
+	u32 res_id;
 	usize size;
 };
 
@@ -97,6 +104,11 @@ static void b1nix_gem_free(struct drm_gem_object *obj)
 	struct b1nix_gem *bo = to_b1nix_gem(obj);
 
 	drm_gem_private_object_fini(obj);
+	/* Tell the host before the pages go: the resource points at them, and
+	 * freeing the memory a live resource is attached to leaves the host
+	 * writing into whatever takes their place. */
+	if (bo->res_id)
+		lkpi_virgl_unref(bo->res_id);
 	if (bo->vaddr)
 		lkpi_vunmap(bo->vaddr);
 	if (bo->pages)
@@ -202,7 +214,18 @@ static int b1nix_dumb_create(struct drm_file *file, struct drm_device *dev,
 /* ── the display pipe ───────────────────────────────────────────── */
 
 struct b1nix_drm {
-	struct device parent;
+	/* The parent is a REAL pci_dev, not a bare device.
+	 *
+	 * The core hands drm_device->dev straight to sysfs and to anything that
+	 * wants the hardware's identity, and every such reader gets there with
+	 * to_pci_dev() -- a container_of, which cannot fail and cannot check. A
+	 * parent that was only a struct device therefore had its neighbouring
+	 * members read as vendor, device and slot, and b1nix published the result
+	 * as fact: 0000:0000, which is precisely the id Mesa refuses to match a
+	 * driver against. The fix is not to guess better at the far end; it is for
+	 * the device to be what the far end is entitled to assume it is. */
+	struct pci_dev pdev;
+	struct pci_bus pci_bus;
 	struct drm_device *drm;
 	struct drm_simple_display_pipe pipe;
 	struct drm_connector connector;
@@ -390,14 +413,481 @@ static const u32 b1nix_formats[] = {
 	DRM_FORMAT_XRGB8888,
 };
 
+/* ── the virtgpu ioctls Mesa speaks ──────────────────────────────────────
+ *
+ * The generic DRM ioctls get a client as far as opening the node. Rendering
+ * needs the driver's own: Mesa's virgl winsys asks GETPARAM whether 3D is
+ * there, reads the capset, creates resources, maps them, submits virgl command
+ * streams and transfers pixels in both directions. Those are these.
+ *
+ * Every resource is a GEM object, because that is what a `bo_handle` means to
+ * the caller: the handle is per-file and refcounted by the DRM core, and the
+ * resource id the host knows is carried inside the object. Nothing here hands
+ * a raw resource id to userspace.
+ *
+ * One virgl context serves the node. Per-file contexts are what CONTEXT_INIT
+ * exists for and are not implemented; a client that asks for one is told so
+ * rather than being given the shared one under a different name.
+ */
+#define B1NIX_VIRGL_CTX 3
+
+/*
+ * What Mesa asked for and what it was told.
+ *
+ * A client that cannot create a screen reports one line -- "failed to create
+ * dri2 screen" -- for a sequence of half a dozen ioctls, so from the outside
+ * every failure looks the same. b1nix.virgl-trace prints each call and its
+ * answer, which is the difference between knowing WHICH call refused and
+ * guessing.
+ */
+static int virgl_trace(void)
+{
+	static int on = -1;
+
+	if (on < 0)
+		on = lkpi_bootflag("b1nix.virgl-trace");
+	return on;
+}
+
+#define VIRGL_TRACE(fmt, ...)                                                  \
+	do {                                                                   \
+		if (virgl_trace())                                             \
+			pr_info("virgl: " fmt "\n", ##__VA_ARGS__);            \
+	} while (0)
+
+/*
+ * Is the accelerated path offered at all?
+ *
+ * It is complete up to one defect that is NOT in this file: the first real use
+ * of upstream's drm_mm range allocator -- inserting a SECOND mmap offset --
+ * faults inside drm_mm_insert_node_in_range, in the shim's augmented rbtree.
+ * Until that is fixed, a client that takes this path renders one object and
+ * then takes the machine down with it.
+ *
+ * So the offer is behind b1nix.virgl-drm. Off, GETPARAM answers "no 3D" and
+ * Mesa falls back to software cleanly, which is the designed behaviour and is
+ * safe. On, the path runs for whoever is working on it. Answering "yes" by
+ * default while knowing it crashes would be the worst of the three.
+ */
+static int b1nix_virgl_offered(void)
+{
+	static int on = -1;
+
+	if (on < 0)
+		on = lkpi_bootflag("b1nix.virgl-drm");
+	return on && lkpi_virgl_available();
+}
+
+static int b1nix_virgl_ctx_ready(void)
+{
+	static int made;
+
+	if (!b1nix_virgl_offered())
+		return 0;
+	if (!made) {
+		if (lkpi_virgl_ctx_create(B1NIX_VIRGL_CTX) < 0)
+			return 0;
+		made = 1;
+	}
+	return 1;
+}
+
+static struct b1nix_gem *b1nix_gem_lookup(struct drm_file *file, u32 handle)
+{
+	struct drm_gem_object *obj = drm_gem_object_lookup(file, handle);
+
+	return obj ? to_b1nix_gem(obj) : 0;
+}
+
+/*
+ * GETPARAM writes THROUGH the pointer in `value`, it does not fill the field.
+ *
+ * This is the part of the ABI that is easy to get backwards and impossible to
+ * notice from the kernel side: `struct drm_virtgpu_getparam.value` is a user
+ * pointer, and upstream copies a 4-byte int to it. Filling the field instead
+ * makes every query "succeed" while the caller reads whatever was on its own
+ * stack -- so Mesa was told 3D was unavailable by its own zeroed variable,
+ * gave up before asking anything else, and reported only "failed to create
+ * dri2 screen". The size matters as much as the direction: an int, not a u64.
+ */
+static int b1nix_ioctl_getparam(struct drm_device *dev, void *data,
+				struct drm_file *file)
+{
+	struct drm_virtgpu_getparam *args = data;
+	int value = 0;
+
+	(void)file;
+	switch (args->param) {
+	case VIRTGPU_PARAM_3D_FEATURES:
+		VIRGL_TRACE("driver %s %d.%d.%d", dev->driver->name,
+			    dev->driver->major, dev->driver->minor,
+			    dev->driver->patchlevel);
+		/* Answer with what is true, not with what makes Mesa proceed:
+		 * claiming 3D on a device that cannot render turns a clean
+		 * fallback to software into an outright failure. */
+		value = b1nix_virgl_offered() ? 1 : 0;
+		break;
+	case VIRTGPU_PARAM_CAPSET_QUERY_FIX:
+		value = 1;
+		break;
+	case VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs: {
+		/* The end of the conversation, if it is zero: told there is no
+		 * capset, Mesa concludes there is no context it could create
+		 * and stops without asking what a capset contains. The ids come
+		 * from the host's own replies, never from a guess here. */
+		u64 mask = 0;
+
+		if (lkpi_virgl_capset_ids(&mask) < 0)
+			mask = 0;
+		value = (int)mask;
+		break;
+	}
+	default:
+		/* Blob resources, cross-device sharing, context init, fenced
+		 * rings: not implemented, and said so. */
+		value = 0;
+		break;
+	}
+
+	VIRGL_TRACE("getparam %llu -> %d", (unsigned long long)args->param,
+		    value);
+	if (lkpi_copy_to_user((void *)(usize)args->value, &value,
+			      sizeof(value)) != 0)
+		return -EFAULT;
+	return 0;
+}
+
+static int b1nix_ioctl_get_caps(struct drm_device *dev, void *data,
+				struct drm_file *file)
+{
+	struct drm_virtgpu_get_caps *args = data;
+
+	(void)dev;
+	(void)file;
+	/* The capset is what tells Mesa which virgl features the host offers.
+	 * It comes from the host, never from here: a fabricated one would make
+	 * Mesa emit commands the host rejects, which is worse than no
+	 * acceleration at all. */
+	void *blob;
+	u32 len = args->size;
+	int ret;
+
+	VIRGL_TRACE("get_caps id=%u ver=%u size=%u", args->cap_set_id,
+		    args->cap_set_ver, args->size);
+	if (args->size == 0 || args->size > 64u * 1024u)
+		return -EINVAL;
+	if (!b1nix_virgl_offered())
+		return -ENODEV;
+
+	blob = kzalloc(args->size, GFP_KERNEL);
+	if (!blob)
+		return -ENOMEM;
+	if (lkpi_virgl_capset(0, args->cap_set_id, args->cap_set_ver, blob,
+			      &len) < 0) {
+		VIRGL_TRACE("get_caps: host refused");
+		kfree(blob);
+		return -EIO;
+	}
+	VIRGL_TRACE("get_caps -> %u bytes", len);
+	ret = lkpi_copy_to_user((void *)(usize)args->addr, blob, len) == 0 ? 0
+									  : -EFAULT;
+	kfree(blob);
+	return ret;
+}
+
+static int b1nix_ioctl_resource_create(struct drm_device *dev, void *data,
+				       struct drm_file *file)
+{
+	struct drm_virtgpu_resource_create *args = data;
+	struct lkpi_virgl_res_desc d;
+	struct b1nix_gem *bo;
+	u64 *phys = 0;
+	u32 handle = 0;
+	u32 res_id;
+	usize size;
+	int ret;
+
+	VIRGL_TRACE("res_create %ux%u fmt=%u bind=0x%x target=%u", args->width,
+		    args->height, args->format, args->bind, args->target);
+	if (!b1nix_virgl_ctx_ready())
+		return -ENODEV;
+	if (args->width == 0)
+		return -EINVAL;
+
+	/* The host validates transfers against this size, so it has to be the
+	 * size of the memory actually attached, rounded to whole pages -- a
+	 * mapping is only ever handed out in pages. */
+	size = args->size ? args->size
+			  : (usize)args->width * (args->height ? args->height : 1) * 4u;
+	size = (size + PAGE_SIZE - 1) & ~(usize)(PAGE_SIZE - 1);
+	if (size == 0)
+		return -EINVAL;
+
+	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
+	if (!bo)
+		return -ENOMEM;
+	bo->npages = size / PAGE_SIZE;
+	bo->pages = shmem_alloc_pages(bo->npages);
+	if (!bo->pages) {
+		kfree(bo);
+		return -ENOMEM;
+	}
+	bo->vaddr = lkpi_vmap(bo->pages, bo->npages, LKPI_PROT_RW);
+	if (!bo->vaddr) {
+		shmem_free_pages(bo->pages, bo->npages);
+		kfree(bo);
+		return -ENOMEM;
+	}
+	memset(bo->vaddr, 0, size);
+
+	res_id = lkpi_virgl_res_alloc();
+	if (!res_id) {
+		ret = -ENOSPC;
+		goto out_free;
+	}
+
+	phys = kzalloc(sizeof(u64) * bo->npages, GFP_KERNEL);
+	if (!phys) {
+		ret = -ENOMEM;
+		goto out_res;
+	}
+	for (usize i = 0; i < bo->npages; i++)
+		phys[i] = page_to_phys(bo->pages[i]);
+
+	d.target = args->target;
+	d.format = args->format;
+	d.bind = args->bind;
+	d.width = args->width;
+	d.height = args->height;
+	d.depth = args->depth;
+	d.array_size = args->array_size;
+	d.last_level = args->last_level;
+	d.nr_samples = args->nr_samples;
+	d.flags = args->flags;
+
+	if (lkpi_virgl_res_create(B1NIX_VIRGL_CTX, &d, phys, (u32)bo->npages,
+				  res_id) < 0) {
+		VIRGL_TRACE("res_create res=%u FAILED", res_id);
+		ret = -EIO;
+		goto out_phys;
+	}
+	VIRGL_TRACE("res_create res=%u ok (%u pages)", res_id, (u32)bo->npages);
+	kfree(phys);
+	phys = 0;
+	bo->res_id = res_id;
+
+	drm_gem_private_object_init(dev, &bo->base, size);
+	bo->base.funcs = &b1nix_gem_funcs;
+	ret = drm_gem_create_mmap_offset(&bo->base);
+	if (ret)
+		goto out_obj;
+	ret = drm_gem_handle_create(file, &bo->base, &handle);
+	/* The handle owns the object now; this reference was only for us. */
+	drm_gem_object_put(&bo->base);
+	if (ret)
+		return ret;
+
+	args->bo_handle = handle;
+	args->res_handle = res_id;
+	args->size = (u32)size;
+	if (args->stride == 0)
+		args->stride = args->width * 4u;
+	return 0;
+
+out_obj:
+	lkpi_virgl_unref(res_id);
+	bo->res_id = 0;
+	drm_gem_object_put(&bo->base);
+	return ret;
+out_phys:
+	kfree(phys);
+out_res:
+	lkpi_virgl_unref(res_id);
+out_free:
+	lkpi_vunmap(bo->vaddr);
+	shmem_free_pages(bo->pages, bo->npages);
+	kfree(bo);
+	return ret;
+}
+
+static int b1nix_ioctl_map(struct drm_device *dev, void *data,
+			   struct drm_file *file)
+{
+	struct drm_virtgpu_map *args = data;
+	struct b1nix_gem *bo = b1nix_gem_lookup(file, args->handle);
+
+	(void)dev;
+	if (!bo)
+		return -ENOENT;
+	/* The offset is a key into the node's mmap space, not an address. */
+	args->offset = drm_vma_node_offset_addr(&bo->base.vma_node);
+	drm_gem_object_put(&bo->base);
+	return 0;
+}
+
+static int b1nix_ioctl_resource_info(struct drm_device *dev, void *data,
+				     struct drm_file *file)
+{
+	struct drm_virtgpu_resource_info *args = data;
+	struct b1nix_gem *bo = b1nix_gem_lookup(file, args->bo_handle);
+
+	(void)dev;
+	if (!bo)
+		return -ENOENT;
+	args->res_handle = bo->res_id;
+	args->size = (u32)bo->base.size;
+	args->blob_mem = 0;
+	drm_gem_object_put(&bo->base);
+	return 0;
+}
+
+static int b1nix_ioctl_execbuffer(struct drm_device *dev, void *data,
+				  struct drm_file *file)
+{
+	struct drm_virtgpu_execbuffer *args = data;
+	u32 *cmd;
+	int ret;
+
+	(void)dev;
+	(void)file;
+	if (!b1nix_virgl_ctx_ready())
+		return -ENODEV;
+	if (args->size == 0 || (args->size & 3))
+		return -EINVAL;
+	if (args->size > 512u * 1024u)
+		return -EINVAL;
+
+	cmd = kzalloc(args->size, GFP_KERNEL);
+	if (!cmd)
+		return -ENOMEM;
+	if (lkpi_copy_from_user(cmd, (const void *)(usize)args->command,
+				args->size) != 0) {
+		kfree(cmd);
+		return -EFAULT;
+	}
+	VIRGL_TRACE("execbuffer %u bytes, %u bo handles", args->size,
+		    args->num_bo_handles);
+	ret = lkpi_virgl_submit(B1NIX_VIRGL_CTX, cmd, args->size) < 0 ? -EIO : 0;
+	VIRGL_TRACE("execbuffer -> %d", ret);
+	kfree(cmd);
+	return ret;
+}
+
+static int b1nix_transfer(struct drm_file *file, u32 bo_handle,
+			  const struct drm_virtgpu_3d_box *box, u32 level,
+			  u32 offset, int to_host)
+{
+	struct b1nix_gem *bo = b1nix_gem_lookup(file, bo_handle);
+	u32 box6[6];
+	int ret;
+
+	if (!bo)
+		return -ENOENT;
+	if (!bo->res_id) {
+		/* A dumb buffer has no host-side resource: there is nothing to
+		 * transfer to or from, and saying so beats pretending. */
+		drm_gem_object_put(&bo->base);
+		return -EINVAL;
+	}
+	box6[0] = box->x;
+	box6[1] = box->y;
+	box6[2] = box->z;
+	box6[3] = box->w;
+	box6[4] = box->h;
+	box6[5] = box->d;
+	ret = lkpi_virgl_transfer(to_host, B1NIX_VIRGL_CTX, bo->res_id, level,
+				  box6, offset) < 0
+		      ? -EIO
+		      : 0;
+	VIRGL_TRACE("transfer %s res=%u %ux%u -> %d", to_host ? "to" : "from",
+		    bo->res_id, box->w, box->h, ret);
+	drm_gem_object_put(&bo->base);
+	return ret;
+}
+
+static int b1nix_ioctl_transfer_to_host(struct drm_device *dev, void *data,
+					struct drm_file *file)
+{
+	struct drm_virtgpu_3d_transfer_to_host *args = data;
+
+	(void)dev;
+	return b1nix_transfer(file, args->bo_handle, &args->box, args->level,
+			      args->offset, 1);
+}
+
+static int b1nix_ioctl_transfer_from_host(struct drm_device *dev, void *data,
+					  struct drm_file *file)
+{
+	struct drm_virtgpu_3d_transfer_from_host *args = data;
+
+	(void)dev;
+	return b1nix_transfer(file, args->bo_handle, &args->box, args->level,
+			      args->offset, 0);
+}
+
+static int b1nix_ioctl_wait(struct drm_device *dev, void *data,
+			    struct drm_file *file)
+{
+	struct drm_virtgpu_3d_wait *args = data;
+	struct b1nix_gem *bo = b1nix_gem_lookup(file, args->handle);
+
+	(void)dev;
+	if (!bo)
+		return -ENOENT;
+	/* Submissions on this path complete before the transport returns -- the
+	 * command is fenced and waited on inside vgpu_submit_stream -- so by the
+	 * time a client asks, the work it is asking about is done. When
+	 * submission becomes asynchronous this has to grow a real wait, and the
+	 * comment is here so that is not forgotten. */
+	VIRGL_TRACE("wait handle=%u", args->handle);
+	drm_gem_object_put(&bo->base);
+	return 0;
+}
+
+static const struct drm_ioctl_desc b1nix_drm_ioctls[] = {
+	DRM_IOCTL_DEF_DRV(VIRTGPU_GETPARAM, b1nix_ioctl_getparam,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VIRTGPU_GET_CAPS, b1nix_ioctl_get_caps,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VIRTGPU_RESOURCE_CREATE, b1nix_ioctl_resource_create,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VIRTGPU_RESOURCE_INFO, b1nix_ioctl_resource_info,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VIRTGPU_MAP, b1nix_ioctl_map, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VIRTGPU_EXECBUFFER, b1nix_ioctl_execbuffer,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VIRTGPU_TRANSFER_TO_HOST,
+			  b1nix_ioctl_transfer_to_host, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VIRTGPU_TRANSFER_FROM_HOST,
+			  b1nix_ioctl_transfer_from_host, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VIRTGPU_WAIT, b1nix_ioctl_wait, DRM_RENDER_ALLOW),
+};
+
 static const struct drm_driver b1nix_drm_driver = {
-	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
-	.name = "b1nix",
-	.desc = "b1nix scanout on the imported DRM core",
+	/* DRIVER_RENDER: the driver ioctls below are served on the render node,
+	 * which is what a client that only wants to draw opens -- it needs no
+	 * master lease and no modeset rights. */
+	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC |
+			   DRIVER_RENDER,
+	/* The name is not decoration: it is the FIRST thing Mesa's loader matches,
+	 * ahead of the PCI id, and it looks for "<name>_dri.so". Called "b1nix" it
+	 * sent every client hunting for a b1nix_dri.so that does not exist and
+	 * never will, while the driver for the hardware actually behind this device
+	 * -- virtio-gpu -- sat unused in the image. The device is a virtio GPU; the
+	 * honest name is the one its driver is called by everywhere else. */
+	.name = "virtio_gpu",
+	.desc = "virtio GPU",
 	.date = "20260808",
-	.major = 1,
-	.minor = 0,
+	/* 0.1, which is what upstream's virtio_gpu reports. A driver that takes
+	 * another driver's name should answer its version too, and some versions
+	 * of Mesa's virgl winsys refuse a major other than 0 outright. It was
+	 * NOT what stopped this client -- changing it alone changed nothing --
+	 * so it is here for correctness rather than as the fix. */
+	.major = 0,
+	.minor = 1,
 	.dumb_create = b1nix_dumb_create,
+	.ioctls = b1nix_drm_ioctls,
+	.num_ioctls = (int)(sizeof(b1nix_drm_ioctls) / sizeof(b1nix_drm_ioctls[0])),
 };
 
 static const struct drm_client_funcs b1nix_client_funcs = {
@@ -421,13 +911,39 @@ static int b1nix_drm_bringup(struct b1nix_drm *b)
 		return -ENODEV;
 
 	/* The DRM device hangs off a parent device, the way a PCI driver's does.
-	 * b1nix's virtio-gpu is not modelled as a `struct device`, so this driver
-	 * owns one and names it after the scanout it drives — enough for the core's
-	 * dev_name() and for the sysfs entry to land somewhere honest. */
-	device_initialize(&b->parent);
-	dev_set_name(&b->parent, "virtio-gpu");
+	 * b1nix's virtio-gpu is not modelled as a `struct pci_dev`, so this driver
+	 * owns one and fills it from the enumerator: the real bus address and the
+	 * real vendor/device ids of the function the scanout is driving. Anything
+	 * downstream that reaches for the hardware's identity then finds the
+	 * hardware's identity. */
+	{
+		u16 vendor = 0, device = 0;
+		u8 bus = 0, slot = 0, func = 0;
 
-	drm = drm_dev_alloc(&b1nix_drm_driver, &b->parent);
+		if (lkpi_scanout_pci_id(&vendor, &device, &bus, &slot, &func) != 0)
+			return -ENODEV;
+		b->pdev.bus_nr = bus;
+		b->pdev.slot = slot;
+		b->pdev.func = func;
+		b->pdev.devfn = (unsigned)((slot << 3) | func);
+		b->pdev.vendor = vendor;
+		b->pdev.device = device;
+		/* virtio's subsystem ids carry the device type; 0x0010 is the GPU,
+		 * which is what a virtio driver matches on for the legacy id. */
+		b->pdev.subsystem_vendor = vendor;
+		b->pdev.subsystem_device = 0x0010;
+		pci_read_config_byte(&b->pdev, 0x08, &b->pdev.revision);
+		b->pdev.class = 0x030000; /* display / VGA-compatible */
+		/* Imported code reads pdev->bus->number rather than bus_nr; a null
+		 * bus pointer is a fault waiting for the first reader. */
+		b->pci_bus.number = bus;
+		b->pdev.bus = &b->pci_bus;
+		b->pdev.lkpi_is_pci = LKPI_PCI_DEV_MAGIC;
+		device_initialize(&b->pdev.dev);
+		dev_set_name(&b->pdev.dev, "0000:%02x:%02x.%u", bus, slot, func);
+	}
+
+	drm = drm_dev_alloc(&b1nix_drm_driver, &b->pdev.dev);
 	if (IS_ERR(drm))
 		return PTR_ERR(drm);
 	b->drm = drm;

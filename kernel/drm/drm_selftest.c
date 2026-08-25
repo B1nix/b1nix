@@ -58,7 +58,7 @@ static void fence_signal_thread(void *arg)
 	(void)arg;
 	/* Give the main thread time to park on the fence, so the wakeup path — not
 	 * a fast-path "already signalled" check — is what is being tested. */
-	scheduler_sleep_ticks(3);
+	scheduler_sleep_ticks(SCHED_MS_TO_TICKS(30));
 	dma_fence_signal(&g_fence);
 	g_signaller_done = 1;
 	scheduler_exit_current(0);

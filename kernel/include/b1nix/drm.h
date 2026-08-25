@@ -117,6 +117,16 @@ int drm_card1_open(int flags);
 int drm_card1_present(void);
 /* Publish /sys/dev/char/226:<num> and /sys/class/drm/card<num>, which is how
  * libdrm decides a descriptor is a DRM primary node. */
+/* What a card is on the bus, for publishing it in sysfs as itself. */
+struct drm_pci_ident {
+	u8 bus, slot, func, revision;
+	u16 vendor, device, subsystem_vendor, subsystem_device;
+	u32 pci_class;
+	const char *driver;
+};
+void drm_sysfs_publish_card_id(unsigned num, const struct drm_pci_ident *id);
+void drm_sysfs_publish_render_id(unsigned gpu_num, unsigned minor_num,
+                                 const struct drm_pci_ident *id);
 void drm_sysfs_publish_card(unsigned num);
 /* Same, for a render minor (renderD<minor>) belonging to gpu<gpu_num>. */
 void drm_sysfs_publish_render(unsigned gpu_num, unsigned minor_num);

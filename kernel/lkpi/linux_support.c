@@ -63,12 +63,28 @@ void add_taint(unsigned flag, int lockdep_ok)
 
 /* ── deferred work from interrupt context ───────────────────────── */
 
+/* Queued and executed, for the same reason the tasklets are counted: a
+ * breadcrumb that is never posted and one that is never run look identical
+ * from outside. */
+static u64 g_irq_work_queued;
+static u64 g_irq_work_ran;
+static u64 g_irq_handled;
+
+void lkpi_irq_work_counts(u64 *queued, u64 *ran, u64 *handled)
+{
+	if (queued)  *queued = g_irq_work_queued;
+	if (ran)     *ran = g_irq_work_ran;
+	if (handled) *handled = g_irq_handled;
+}
+
 static void irq_work_run(struct work_struct *work)
 {
 	struct irq_work *iw = container_of(work, struct irq_work, work);
 
-	if (iw->func)
+	if (iw->func) {
+		g_irq_work_ran++;
 		iw->func(iw);
+	}
 }
 
 void lkpi_irq_work_queue(struct irq_work *w)
@@ -76,8 +92,19 @@ void lkpi_irq_work_queue(struct irq_work *w)
 	if (!w || !w->func)
 		return;
 	/* A workqueue item, so this runs on a kernel thread rather than out of a
-	 * self-IPI. Later than upstream, and <linux/irq_work.h> says so. */
-	INIT_WORK(&w->work, irq_work_run);
+	 * self-IPI. Later than upstream, and <linux/irq_work.h> says so.
+	 *
+	 * Initialised ONCE, not on every queue. INIT_WORK zeroes the whole
+	 * work_struct, linkage included, and this is called from interrupt
+	 * handlers that fire again while the previous item is still queued —
+	 * wiping the linkage of a linked item truncates the queue and loses
+	 * everything behind it. i915 queues its breadcrumb work from every GT
+	 * interrupt, so the second interrupt threw away the signalling work of the
+	 * first: the fence never signalled and the waiter slept out its timeout
+	 * with the request long since complete. */
+	if (w->work.func != irq_work_run)
+		INIT_WORK(&w->work, irq_work_run);
+	g_irq_work_queued++;
 	schedule_work(&w->work);
 }
 
@@ -342,6 +369,20 @@ struct dma_fence *dma_fence_array_next(struct dma_fence *head,
  *   arrived inside it, and the engine simply stops.
  */
 
+/* Counted, because "the tasklet never ran" and "the tasklet ran and did
+ * nothing" are different faults and the driver's own logs distinguish neither.
+ * Read back through lkpi_tasklet_counts(). */
+static u64 g_tasklet_scheduled;
+static u64 g_tasklet_ran;
+
+void lkpi_tasklet_counts(u64 *scheduled, u64 *ran)
+{
+	if (scheduled)
+		*scheduled = g_tasklet_scheduled;
+	if (ran)
+		*ran = g_tasklet_ran;
+}
+
 static void tasklet_run(struct work_struct *work)
 {
 	struct tasklet_struct *t = container_of(work, struct tasklet_struct, work);
@@ -356,6 +397,7 @@ static void tasklet_run(struct work_struct *work)
 	                   __ATOMIC_ACQ_REL);
 	__atomic_or_fetch(&t->state, 1UL << TASKLET_STATE_RUN, __ATOMIC_ACQ_REL);
 
+	g_tasklet_ran++;
 	if (t->callback)
 		t->callback(t);
 	else if (t->func)
@@ -399,6 +441,7 @@ void tasklet_schedule(struct tasklet_struct *t)
 		return;
 	if (atomic_read(&t->count))
 		return; /* disabled; tasklet_enable will queue it */
+	g_tasklet_scheduled++;
 	schedule_work(&t->work);
 }
 
@@ -1931,6 +1974,7 @@ static struct pci_dev *lkpi_pci_publish(u8 bus, u8 slot, u8 func)
 		return 0;
 	cls = pci_config_read32(bus, slot, func, 0x08);
 	d = &lkpi_pci_found[lkpi_pci_found_n++];
+	d->lkpi_is_pci = LKPI_PCI_DEV_MAGIC;
 	d->bus_nr = bus;
 	d->slot = slot;
 	d->func = func;
@@ -2222,8 +2266,14 @@ static int lkpi_irq_trampoline(void *ctx)
 		lkpi_printk("lkpi: first device interrupt delivered\n");
 	if (i >= LKPI_IRQ_MAX || !lkpi_irqs[i].used)
 		return 0;
-	return lkpi_irqs[i].handler((int)lkpi_irqs[i].irq, lkpi_irqs[i].dev)
-	       == IRQ_HANDLED;
+	{
+		int handled = lkpi_irqs[i].handler((int)lkpi_irqs[i].irq,
+		                                   lkpi_irqs[i].dev) == IRQ_HANDLED;
+
+		if (handled)
+			g_irq_handled++;
+		return handled;
+	}
 }
 
 /* Claim an MSI vector, with the trampoline already attached; the driver's own

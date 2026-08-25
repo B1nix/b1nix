@@ -12,13 +12,27 @@
 #define TASK_UNINTERRUPTIBLE 2
 #define MAX_SCHEDULE_TIMEOUT ((long)(~0UL >> 1))
 static inline void cond_resched(void) { lkpi_yield(); }
-static inline void set_current_state(int state) { (void)state; }
-static inline void __set_current_state(int state) { (void)state; }
+/* Arm the park, the way Linux's two-statement sleep needs it.
+ *
+ * set_current_state(TASK_INTERRUPTIBLE) followed by schedule() is a contract: a
+ * wake between the two cancels the sleep. A no-op here broke it, and the loss
+ * was invisible except as a wait that always ran to its full timeout. */
+static inline void set_current_state(int state)
+{
+	if (state != TASK_RUNNING)
+		lkpi_prepare_to_sleep();
+}
+static inline void __set_current_state(int state) { set_current_state(state); }
+/* Sleep, and say how much of the sleep was left.
+ *
+ * The return value is the contract: callers read zero as "the timeout expired"
+ * and anything positive as "something woke me". Answering zero always made
+ * every completed wait look like a timed-out one. */
 static inline long schedule_timeout(long timeout)
 {
-	if (timeout > 0)
-		lkpi_sleep_ticks((u64)timeout);
-	return 0;
+	if (timeout <= 0)
+		return 0;
+	return (long)lkpi_sleep_jiffies((u64)timeout);
 }
 /*
  * schedule(), as the caller of prepare_to_wait() means it.
@@ -46,7 +60,15 @@ static inline int signal_pending(void *t) { (void)t; return 0; }
 /* Wake a task that parked itself. lkpi's wait queues wake by channel, so this
  * is only reached for a task holding a pointer rather than a channel — nothing
  * in the core does, and the day one does it needs a real per-task wake. */
-static inline int wake_up_process(void *task) { (void)task; return 0; }
+/* Wake a task that parked with schedule_timeout().
+ *
+ * A stub returning 0 made every wait in imported code run to its full timeout:
+ * the wakeup that should have ended it early went nowhere. i915_request_wait is
+ * built on exactly this — park, and let the fence callback wake you — so a
+ * request the hardware finished in microseconds took the full two seconds and
+ * then reported a timeout. */
+static inline int wake_up_process(struct lkpi_task *task)
+{ return lkpi_wake_task(task); }
 
 static inline int sched_set_fifo(void *task) { (void)task; return -EINVAL; }
 static inline int sched_set_fifo_low(void *task) { (void)task; return -EINVAL; }

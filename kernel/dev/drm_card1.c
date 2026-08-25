@@ -251,6 +251,9 @@ static struct {
 	struct vfs_node *node;
 	u32 minor;
 	char path[24];
+  /* What the card is on the bus, so its render node is published beside it. */
+  struct drm_pci_ident ident;
+  int have_ident;
 } g_cards[DRM_IMPORTED_MAX];
 static unsigned g_card_count;
 
@@ -394,7 +397,40 @@ void drm_card1_init(void) {
      * card0 above carries the same. inode->rdev is what fstat reports as
      * st_rdev. */
     node->inode->rdev = ((u64)226 << 8) | (u64)num;
-    drm_sysfs_publish_card(num);
+    /* Published under the device it actually is, not under a fixed address
+     * shared with every other card: the graphics stack resolves a DRM node to
+     * a GPU through sysfs, and two nodes on one device are two nodes it cannot
+     * tell apart. */
+    {
+      struct lkpi_drm_pci_id pci;
+      struct drm_pci_ident id;
+
+      if (lkpi_drm_pci_at(i, &pci) == 0) {
+        id.bus = pci.bus;
+        id.slot = pci.slot;
+        id.func = pci.func;
+        id.revision = pci.revision;
+        id.vendor = pci.vendor;
+        id.device = pci.device;
+        id.subsystem_vendor = pci.subsystem_vendor;
+        id.subsystem_device = pci.subsystem_device;
+        id.pci_class = pci.pci_class;
+        /* The uevent's DRIVER= line, which is what a udev rule and anything
+         * reading /sys/.../uevent matches on. "virtio-pci" named the bus the
+         * function sits on rather than the driver bound to it, so the one
+         * device whose driver userspace could have used advertised a name no
+         * DRI driver is called by. */
+        id.driver = (pci.vendor == 0x8086)  ? "i915"
+                    : (pci.vendor == 0x1af4) ? "virtio_gpu"
+                                             : "drm";
+        g_cards[g_card_count].ident = id;
+        g_cards[g_card_count].have_ident = 1;
+        drm_sysfs_publish_card_id(num, &id);
+      } else {
+        g_cards[g_card_count].have_ident = 0;
+        drm_sysfs_publish_card(num);
+      }
+    }
     node->inode->mmap_handle_page_phys_cb = card1_mmap_page_phys;
     g_cards[g_card_count].node = node;
     g_cards[g_card_count].minor = minor;
@@ -409,7 +445,7 @@ void drm_card1_init(void) {
     return;
 
   /*
-   * A render node for the first imported device.
+   * A render node for EVERY imported device, not only the first.
    *
    * Userspace does not use a card node for drawing. Mesa and anything built on
    * it open /dev/dri/renderD128 — the unprivileged half of a DRM device, with
@@ -423,32 +459,57 @@ void drm_card1_init(void) {
    * Its device number is the render range's first minor (128), which is how
    * libdrm recognises it as one — drmGetNodeTypeFromFd() reads exactly that.
    */
-  if (g_card_count < DRM_IMPORTED_MAX) {
-    struct vfs_node *node =
-        vfs_add_node("/dev/dri/renderD128", VFS_DEVICE, 0, 0, 0);
+  {
+    unsigned cards = g_card_count; /* before the render nodes are appended */
 
-    if (node && !IS_ERR(node)) {
-      const char *path = "/dev/dri/renderD128";
-      char *p = g_cards[g_card_count].path;
+    for (unsigned i = 0; i < cards && g_card_count < DRM_IMPORTED_MAX; i++) {
+      char path[24];
+      unsigned num = 128 + i;
+      const char *prefix = "/dev/dri/renderD";
       usize n = 0;
+      struct vfs_node *node;
 
-      while (path[n] && n + 1 < sizeof(g_cards[0].path)) {
-        p[n] = path[n];
-        n++;
+      while (prefix[n]) { path[n] = prefix[n]; n++; }
+      path[n++] = (char)('0' + (num / 100));
+      path[n++] = (char)('0' + ((num / 10) % 10));
+      path[n++] = (char)('0' + (num % 10));
+      path[n] = 0;
+
+      node = vfs_add_node(path, VFS_DEVICE, 0, 0, 0);
+      if (!node || IS_ERR(node))
+        continue;
+
+      {
+        char *p = g_cards[g_card_count].path;
+        usize k = 0;
+
+        while (path[k] && k + 1 < sizeof(g_cards[0].path)) {
+          p[k] = path[k];
+          k++;
+        }
+        p[k] = 0;
       }
-      p[n] = 0;
 
       /* Rendering is what every graphical client does, so this one is not
        * root-only the way a card node is. */
       node->inode->mode = 0666;
-      node->inode->rdev = ((u64)226 << 8) | (u64)128;
+      node->inode->rdev = ((u64)226 << 8) | (u64)num;
       node->inode->mmap_handle_page_phys_cb = card1_mmap_page_phys;
-      /* And in sysfs, where a graphics stack actually looks for it. */
-      drm_sysfs_publish_render(1, 128);
+      /* And in sysfs, under the same device as its card — that pairing is what
+       * lets Mesa match an EGL device to the node it should render on. */
+      if (g_cards[i].have_ident)
+        drm_sysfs_publish_render_id(i + 1, num, &g_cards[i].ident);
+      else
+        drm_sysfs_publish_render(i + 1, num);
       g_cards[g_card_count].node = node;
-      g_cards[g_card_count].minor = g_cards[0].minor;
+      g_cards[g_card_count].minor = g_cards[i].minor;
       g_card_count++;
-      console_write("drm: /dev/dri/renderD128 ready (render node for card1)\n");
+
+      console_write("drm: ");
+      console_write(path);
+      console_write(" ready (render node for card");
+      console_write_dec((u64)(i + 1));
+      console_write(")\n");
     }
   }
 }

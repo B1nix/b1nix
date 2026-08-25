@@ -27,6 +27,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #define CARD "/dev/dri/card1"
@@ -86,8 +88,113 @@ static long record_dec(const char *text, const char *key)
 	return (long)strtol(p, 0, 10);
 }
 
+
+/* One "0x...."-style sysfs attribute as a number. Returns 0 when the file is
+ * absent or unreadable, which is distinct from it reading zero — and telling
+ * those apart is the whole point here. */
+static int read_sysfs_hex(const char *path, unsigned long *out)
+{
+	char buf[32];
+	int fd = open(path, O_RDONLY);
+	ssize_t n;
+
+	if (fd < 0)
+		return 0;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return 0;
+	buf[n] = '\0';
+	*out = strtoul(buf, NULL, 0);
+	return 1;
+}
+
 int main(void)
 {
+	/* Unbuffered, because this output IS the record. Through a pipe stdio
+	 * buffers by block, so a run that stops half way prints nothing at all and
+	 * the last step it completed -- the one piece of information a hang leaves
+	 * behind -- is lost with the buffer. */
+	setvbuf(stdout, NULL, _IONBF, 0);
+
+	/* ── the sequence a compositor's session layer performs ──────────
+	 *
+	 * Not a paraphrase: kwin's direct session (the one it uses when there is
+	 * no logind) stats the node, opens it O_RDWR|O_CLOEXEC|O_NOCTTY|O_NONBLOCK,
+	 * checks that st_rdev's major is DRM's, and then takes the master lease.
+	 * If any of those fails it closes the fd and reports only "failed to open
+	 * drm device" -- a message that names the open and blames the wrong step.
+	 * Each part is checked separately here so the next such failure names
+	 * itself.
+	 *
+	 * FIRST, before this test opens the node for anything else: the master
+	 * lease is exclusive, so a probe taken while another descriptor of this
+	 * same process already holds it is told "busy" -- correctly, and about the
+	 * wrong thing. A compositor is the first opener; so is this. */
+	{
+		struct stat st;
+		int sfd;
+
+		/* Something opened this node before the compositor did, and closed it.
+		 *
+		 * That is not a contrived situation: every start-up script probes the
+		 * card to report whether it can be opened at all, and a seat daemon
+		 * does the same. The FIRST opener of a primary node becomes DRM master,
+		 * and closing it has to give the lease back -- otherwise the compositor
+		 * that follows is refused, and reports the refusal as "failed to open
+		 * drm device", naming a node that opens perfectly well from a shell. */
+		int probe = open(CARD, O_RDWR | O_CLOEXEC);
+
+		if (probe >= 0)
+			close(probe);
+
+		if (stat(CARD, &st) != 0) {
+			fail("session-stat", errno);
+		} else {
+			report("session-rdev-major", major(st.st_rdev) == 226,
+			       (long)major(st.st_rdev));
+		}
+		/* O_NOCTTY and O_NONBLOCK are the flags a session layer adds and an
+		 * ordinary test never passes; a character device that refuses either
+		 * is invisible until a compositor tries it. */
+		sfd = open(CARD, O_RDWR | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
+		if (sfd < 0) {
+			fail("session-open-nonblock", errno);
+		} else {
+			ok("session-open-nonblock");
+			/* The master lease. Without it no modeset ioctl is permitted,
+			 * so a core that does not implement it cannot drive a display
+			 * however well the rest of it works. */
+			if (ioctl(sfd, DRM_IOCTL_SET_MASTER, 0) != 0)
+				fail("session-set-master", errno);
+			else
+				ok("session-set-master");
+			if (ioctl(sfd, DRM_IOCTL_DROP_MASTER, 0) != 0)
+				fail("session-drop-master", errno);
+			else
+				ok("session-drop-master");
+			close(sfd);
+		}
+	}
+
+	/* ── the identity Mesa matches a driver against ──────────────────
+	 *
+	 * libdrm does not enumerate by walking /dev: it starts from the minor's
+	 * sysfs entry, follows its "device" link and reads the PCI identity there.
+	 * A parent with none of it describes no device, so the node is dropped and
+	 * a caller that asked for the list gets nothing. This card used to publish
+	 * 0000:0000 for exactly that parent, because it was not a PCI function at
+	 * all and the reader took its neighbouring members for one. */
+	{
+		unsigned long vendor = 0, device = 0;
+		int good = read_sysfs_hex("/sys/class/drm/card1/device/vendor", &vendor) &&
+		           read_sysfs_hex("/sys/class/drm/card1/device/device", &device);
+
+		report("pci-identity", good && vendor == 0x1af4 &&
+		                           (device == 0x1050 || device == 0x1010),
+		       (long)((vendor << 16) | device));
+	}
+
 	int fd = open(CARD, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		fail("open", errno);
@@ -111,7 +218,10 @@ int main(void)
 		if (ioctl(fd, DRM_IOCTL_VERSION, &v) != 0)
 			fail("version", errno);
 		else
-			report("version", strcmp(name, "b1nix") == 0, (long)v.version_major);
+			/* The name Mesa's loader turns into "<name>_dri.so". It has
+			 * to be the driver's real name, not this system's. */
+			report("version", strcmp(name, "virtio_gpu") == 0,
+			       (long)v.version_major);
 	}
 
 	/* ── resources: what the device has ─────────────────────────── */

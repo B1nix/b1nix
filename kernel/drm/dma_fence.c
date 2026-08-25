@@ -4,6 +4,7 @@
  * M100 — dma-fence. See kernel/include/b1nix/dma_fence.h.
  */
 
+#include <lkpi/env.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/spinlock.h>
@@ -16,6 +17,27 @@ _Static_assert(sizeof(spinlock_t) == sizeof(int),
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <string.h>
+
+static int fence_enable_signaling(struct dma_fence *f);
+
+/* Where the notification chain stops.
+ *
+ * Four counts, because four things have to happen and the driver's own logs
+ * distinguish none of them: the driver is asked to arm, it accepts, something
+ * signals the fence, and the signal reaches the callbacks that wake waiters.
+ * Read back through lkpi_fence_counts(). */
+static u64 g_fence_arm_asked;
+static u64 g_fence_arm_accepted;
+static u64 g_fence_signalled;
+static u64 g_fence_callbacks;
+
+void lkpi_fence_counts(u64 *asked, u64 *accepted, u64 *signalled, u64 *callbacks)
+{
+	if (asked)     *asked = g_fence_arm_asked;
+	if (accepted)  *accepted = g_fence_arm_accepted;
+	if (signalled) *signalled = g_fence_signalled;
+	if (callbacks) *callbacks = g_fence_callbacks;
+}
 
 static u64 g_next_context = 1;
 static spinlock_t g_context_lock = SPINLOCK_INIT;
@@ -88,9 +110,78 @@ void dma_fence_put(struct dma_fence *f)
 		release(f);
 }
 
+/*
+ * The flag is the truth, not the int beside it.
+ *
+ * Upstream keeps the signalled state in fence->flags, and imported code sets it
+ * there directly: i915's breadcrumbs never call into the dma-fence API at all —
+ * they test_and_set DMA_FENCE_FLAG_SIGNALED_BIT and run the callbacks
+ * themselves, which is what makes an interrupt-driven fence cheap. This shim
+ * kept its own `signaled` int as the source of truth, so a fence i915 had
+ * signalled still read as pending: the callback ran, the waiter woke, re-checked
+ * dma_fence_is_signaled(), was told no, and went back to sleep until its
+ * timeout. Every GPU wait in the driver ended that way.
+ *
+ * Both are now read, and the int stays as a mirror for the paths that set it.
+ */
+/* What this fence has RECORDED about itself — no driver involved.
+ *
+ * The distinction matters where the state is changed rather than read: the
+ * "already signalled?" guard in the signal path must consult only what has been
+ * recorded, because a driver-backed fence answers "complete" from the hardware
+ * the moment the work finishes, and a guard that believes it refuses to ever
+ * perform the signal — leaving the flag unset, the callbacks unrun, and every
+ * waiter parked. */
+static int fence_signal_recorded(struct dma_fence *f)
+{
+	if (!f)
+		return 1;
+	if (__atomic_load_n(&f->flags, __ATOMIC_ACQUIRE) &
+	    (1UL << DMA_FENCE_FLAG_SIGNALED_BIT))
+		return 1;
+	return f->signaled;
+}
+
+/* The state as anyone waiting on it should see it, driver included. Safe to
+ * call with f->lock held. */
+static int fence_signaled(struct dma_fence *f)
+{
+	if (!f)
+		return 1;
+	if (__atomic_load_n(&f->flags, __ATOMIC_ACQUIRE) &
+	    (1UL << DMA_FENCE_FLAG_SIGNALED_BIT))
+		return 1;
+	if (f->signaled)
+		return 1;
+	/* And what the driver says. For i915 this reads the breadcrumb the engine
+	 * wrote, so a request the hardware finished is complete here whether or
+	 * not an interrupt has been processed yet. */
+	if (f->ops && f->ops->signaled)
+		return f->ops->signaled(f) ? 1 : 0;
+	return 0;
+}
+
+/*
+ * Ask, and settle it.
+ *
+ * Upstream's dma_fence_is_signaled() does two things: it consults the driver
+ * through ops->signaled, and if the driver says yes it signals the fence there
+ * and then, which runs the callbacks. This shim did neither — it read a flag of
+ * its own — so a fence whose work the GPU had finished still read as pending.
+ * Every wait loop in the imported tree is written around this call, i915's
+ * included: it woke, asked, was told no, and slept again until its timeout.
+ */
 int dma_fence_is_signaled(struct dma_fence *f)
 {
-	return f ? f->signaled : 1;
+	if (!f)
+		return 1;
+	if (__atomic_load_n(&f->flags, __ATOMIC_ACQUIRE) &
+	    (1UL << DMA_FENCE_FLAG_SIGNALED_BIT))
+		return 1;
+	if (!fence_signaled(f))
+		return 0;
+	dma_fence_signal(f);
+	return 1;
 }
 
 int dma_fence_error(struct dma_fence *f)
@@ -111,13 +202,14 @@ static int fence_signal_common(struct dma_fence *f, int error, int held)
 
 	if (!held)
 		lkpi_spin_lock(f->lock);
-	if (f->signaled) {
+	if (fence_signal_recorded(f)) {
 		if (!held)
 			lkpi_spin_unlock(f->lock);
 		return -EINVAL;
 	}
 	f->error = error;
 	f->signaled = 1;
+	g_fence_signalled++;
 	/* Same fact in the form imported code reads. Set here, next to the field it
 	 * mirrors, so the two cannot diverge. */
 	__atomic_or_fetch(&f->flags, 1UL << DMA_FENCE_FLAG_SIGNALED_BIT,
@@ -143,8 +235,10 @@ static int fence_signal_common(struct dma_fence *f, int error, int held)
 	struct dma_fence_cb *cur, *tmp;
 	list_for_each_entry_safe(cur, tmp, &cbs, node) {
 		list_del_init(&cur->node);
-		if (cur->func)
+		if (cur->func) {
+			g_fence_callbacks++;
 			cur->func(f, cur);
+		}
 	}
 
 	scheduler_wake_all(f);
@@ -167,6 +261,29 @@ int dma_fence_add_callback(struct dma_fence *f, struct dma_fence_cb *cb,
 	return dma_fence_add_callback_data(f, cb, func, 0);
 }
 
+/*
+ * Tell the driver somebody is waiting.
+ *
+ * A fence does not signal itself. Drivers arm whatever notifies them — for
+ * i915, putting the request on the engine's breadcrumb list and unmasking the
+ * user interrupt — only when the core asks, through ops->enable_signaling, and
+ * the core asks the first time anyone waits on the fence or registers a
+ * callback. This shim never asked, so nothing was ever armed: the GPU executed
+ * the work, the interrupt arrived, the breadcrumb worker found an empty signal
+ * list, and the waiter slept until its timeout with the request long since
+ * complete.
+ *
+ * Called with f->lock held, as upstream calls it: i915's implementation adds
+ * the request to a list the interrupt handler walks, and expects the fence to
+ * be pinned for the duration. A driver that answers false means the fence is
+ * already effectively done, and the caller signals it.
+ *
+ * Returns 1 when the fence is now armed (or already signalled), 0 when the
+ * driver declined and the fence must be signalled instead.
+ */
+
+
+
 int dma_fence_add_callback_data(struct dma_fence *f, struct dma_fence_cb *cb,
                                 dma_fence_cb_fn func, void *data)
 {
@@ -177,7 +294,7 @@ int dma_fence_add_callback_data(struct dma_fence *f, struct dma_fence_cb *cb,
 	INIT_LIST_HEAD(&cb->node);
 
 	lkpi_spin_lock(f->lock);
-	if (f->signaled) {
+	if (fence_signaled(f)) {
 		lkpi_spin_unlock(f->lock);
 		/* The callback takes the cb, not the data — the same signature the
 		 * deferred path uses. Passing `data` here instead handed the callback
@@ -188,6 +305,39 @@ int dma_fence_add_callback_data(struct dma_fence *f, struct dma_fence_cb *cb,
 	}
 	list_add(&cb->node, &f->cb_list);
 	lkpi_spin_unlock(f->lock);
+	/*
+	 * Arm with the fence lock DROPPED.
+	 *
+	 * Upstream arms under it, and i915's arming takes the engine's breadcrumb
+	 * lock beneath — an order that wedged a CPU here within seconds. The
+	 * callback is already on the list, so a fence that signals in this window
+	 * runs it; the only thing the lock would add is atomicity between adding
+	 * and arming, and the arming path is idempotent.
+	 */
+	if (!fence_enable_signaling(f))
+		dma_fence_signal(f);
+	return 0;
+}
+
+/* Arm the driver's notification, once. Returns 0 only when the driver declines
+ * — which means the fence is already effectively done and must be signalled. */
+static int fence_enable_signaling(struct dma_fence *f)
+{
+	unsigned long was;
+
+	if (fence_signaled(f))
+		return 1;
+	was = __atomic_fetch_or(&f->flags, 1UL << DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT,
+	                        __ATOMIC_ACQ_REL);
+	if (was & (1UL << DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT))
+		return 1;
+	if (!f->ops || !f->ops->enable_signaling)
+		return 1;
+	g_fence_arm_asked++;
+	if (f->ops->enable_signaling(f)) {
+		g_fence_arm_accepted++;
+		return 1;
+	}
 	return 0;
 }
 
@@ -202,7 +352,16 @@ int dma_fence_wait_uninterruptible(struct dma_fence *f)
 {
 	if (!f)
 		return -EINVAL;
-	while (!f->signaled) {
+	/* Deliberately does NOT arm ops->enable_signaling.
+	 *
+	 * This wait is the shim's own, and its callers reach it holding locks the
+	 * driver's arming path also takes — i915's takes the engine's breadcrumb
+	 * lock — so asking here inverts an order the interrupt path relies on and
+	 * wedges the CPU. The place to ask is where a callback is registered, which
+	 * is the path a driver's own waits go through; this one polls the flag and
+	 * needs nobody armed to make progress.
+	 */
+	while (!fence_signaled(f)) {
 		if (!scheduler_can_block()) {
 			/* Interrupt context or pre-scheduler boot: poll. The signaller is
 			 * another CPU or an interrupt on this one, so this terminates. */
@@ -213,7 +372,7 @@ int dma_fence_wait_uninterruptible(struct dma_fence *f)
 		/* Two-phase wait: publish on the fence's channel, re-check, then park.
 		 * A signal landing in between therefore cannot be missed. */
 		scheduler_wait_prepare(f);
-		if (f->signaled)
+		if (fence_signaled(f))
 			scheduler_wait_cancel();
 		else
 			scheduler_wait_commit();
@@ -252,7 +411,7 @@ i64 dma_fence_wait_timeout(struct dma_fence *f, int intr, u64 timeout_ticks)
 			tsc_deadline = lkpi_rdtsc() + timeout_ticks * (u64)khz * 10ull;
 	}
 	for (;;) {
-		if (f->signaled)
+		if (fence_signaled(f))
 			return f->error ? (i64)f->error : 1;
 		u64 now = scheduler_get_ticks();
 		if (now >= deadline)
@@ -265,7 +424,7 @@ i64 dma_fence_wait_timeout(struct dma_fence *f, int intr, u64 timeout_ticks)
 			continue;
 		}
 		scheduler_wait_prepare_timeout(f, deadline - now);
-		if (f->signaled)
+		if (fence_signaled(f))
 			scheduler_wait_cancel();
 		else
 			scheduler_wait_commit();
@@ -331,7 +490,7 @@ void dma_fence_set_error(struct dma_fence *fence, int error)
 		return;
 	/* Setting an error after the fence signalled would change an answer a
 	 * waiter has already acted on. */
-	if (__atomic_load_n(&fence->signaled, __ATOMIC_ACQUIRE))
+	if (dma_fence_is_signaled(fence))
 		return;
 	fence->error = error;
 }

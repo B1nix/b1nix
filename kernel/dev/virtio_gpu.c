@@ -280,6 +280,10 @@ static volatile u16 *gpu_notify_addr[2];
 /* Guards gpu_present_busy only — see gpu_present_acquire(). */
 static spinlock_t gpu_present_lock;
 static int gpu_present_busy;
+/* Pages behind the control request buffer. A virgl command stream is a single
+ * command and must fit in one piece; 16 pages carries the largest Mesa emits
+ * here with room to spare. */
+#define VGPU_CTRL_REQ_PAGES 16
 static u8 *gpu_control_req_dma;
 static u8 *gpu_control_resp_dma;
 static u8 *gpu_cursor_req_dma;
@@ -548,7 +552,7 @@ static int virtio_gpu_submit_pair(struct virtio_device *dev, struct virtqueue *v
 static int virtio_gpu_send_cmd(const void *req, usize req_len, void *resp, usize resp_len)
 {
     if (!gpu_control_req_dma || !gpu_control_resp_dma ||
-        req_len > PAGE_SIZE || resp_len > PAGE_SIZE)
+        req_len > VGPU_CTRL_REQ_PAGES * PAGE_SIZE || resp_len > PAGE_SIZE)
         return -1;
     memcpy(gpu_control_req_dma, req, req_len);
     memset(gpu_control_resp_dma, 0, resp_len);
@@ -1253,17 +1257,26 @@ static int vgpu_res_create_attach(u32 ctx_id, const struct b1nix_virgl_res_creat
         resp.type != VIRTIO_GPU_RESP_OK_NODATA)
         return -1;
 
-    memset(&attach, 0, sizeof(attach));
-    attach.req.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
-    attach.req.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
-    attach.req.hdr.fence_id = gpu_fence_id++;
-    attach.req.resource_id = p->res_id;
-    attach.req.nr_entries = 1;
-    attach.entry.addr = phys;
-    attach.entry.length = (u32)size;
-    if (virtio_gpu_send_cmd(&attach, sizeof(attach), &resp, sizeof(resp)) < 0 ||
-        resp.type != VIRTIO_GPU_RESP_OK_NODATA)
-        return -1;
+    /* phys == 0 means "the caller will attach the backing itself".
+     *
+     * A resource backed by one contiguous run attaches here, in a single
+     * entry. A resource backed by a GEM object's scattered pages cannot: it
+     * needs an entry per run, which is a variable-length command, so that
+     * caller sends its own through vgpu_res_attach_sg() after this returns.
+     * The create and the context binding are the same either way. */
+    if (phys) {
+        memset(&attach, 0, sizeof(attach));
+        attach.req.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+        attach.req.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+        attach.req.hdr.fence_id = gpu_fence_id++;
+        attach.req.resource_id = p->res_id;
+        attach.req.nr_entries = 1;
+        attach.entry.addr = phys;
+        attach.entry.length = (u32)size;
+        if (virtio_gpu_send_cmd(&attach, sizeof(attach), &resp, sizeof(resp)) < 0 ||
+            resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+            return -1;
+    }
 
     memset(&ctxres, 0, sizeof(ctxres));
     ctxres.hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
@@ -1286,8 +1299,16 @@ static int vgpu_submit_stream_locked(u32 ctx_id, const u32 *cmd, u32 cmd_bytes)
 {
     struct virtio_gpu_ctrl_hdr resp;
     if (!vgpu_udev_submit_buf || cmd_bytes == 0 ||
-        cmd_bytes + sizeof(struct virtio_gpu_ctrl_hdr) + 8 > VGPU_SUBMIT_BUF_BYTES)
+        cmd_bytes + sizeof(struct virtio_gpu_ctrl_hdr) + 8 > VGPU_SUBMIT_BUF_BYTES) {
+        /* Silent refusals cost an afternoon: every one of these arrives
+         * upstairs as the same EIO, and from there as "failed to draw". */
+        console_write("virtio-gpu: submit rejected before sending (buf=");
+        console_write_dec(vgpu_udev_submit_buf ? 1 : 0);
+        console_write(" bytes=");
+        console_write_dec(cmd_bytes);
+        console_write(")\n");
         return -1;
+    }
     struct virtio_gpu_cmd_submit *s = (struct virtio_gpu_cmd_submit *)vgpu_udev_submit_buf;
     memset(s, 0, sizeof(struct virtio_gpu_ctrl_hdr) + 8);
     s->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
@@ -1298,8 +1319,14 @@ static int vgpu_submit_stream_locked(u32 ctx_id, const u32 *cmd, u32 cmd_bytes)
     memcpy(vgpu_udev_submit_buf + sizeof(struct virtio_gpu_ctrl_hdr) + 8, cmd, cmd_bytes);
     usize len = sizeof(struct virtio_gpu_ctrl_hdr) + 8 + cmd_bytes;
     if (virtio_gpu_send_cmd(vgpu_udev_submit_buf, len, &resp, sizeof(resp)) < 0 ||
-        resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        /* Say what the host answered: every failure otherwise arrives
+         * upstairs as the same EIO. */
+        console_write("virtio-gpu: submit refused, resp 0x");
+        console_write_hex32(resp.type);
+        console_write("\n");
         return -1;
+    }
     return 0;
 }
 
@@ -1332,13 +1359,25 @@ static struct drm_gpu_scheduler vgpu_sched;
 static struct drm_sched_entity vgpu_sched_entity;
 static int vgpu_sched_ready;
 
+/* Exclusion on the shared submit buffer that does NOT disable interrupts.
+ *
+ * The job below does a full device round trip, and a real 3D command takes
+ * milliseconds on the host. Held under spin_lock_irqsave that is fatal rather
+ * than slow: with interrupts off the completion interrupt cannot be delivered
+ * and the timer cannot tick, so the wait can only poll and nothing else on the
+ * machine runs -- the guest stops dead after the first command the host
+ * actually executes. Yielding while waiting keeps the mutual exclusion and lets the
+ * rest of the system live. */
+static volatile int vgpu_submit_busy;
+
 static int vgpu_sched_run_job(struct drm_sched_job *job)
 {
     struct vgpu_submit_job *sj = (struct vgpu_submit_job *)job;
-    u64 flags;
-    spin_lock_irqsave(&vgpu_udev_lock, &flags);
+
+    while (__atomic_exchange_n(&vgpu_submit_busy, 1, __ATOMIC_ACQUIRE))
+        scheduler_yield();
     sj->result = vgpu_submit_stream_locked(sj->ctx_id, sj->cmd, sj->cmd_bytes);
-    spin_unlock_irqrestore(&vgpu_udev_lock, flags);
+    __atomic_store_n(&vgpu_submit_busy, 0, __ATOMIC_RELEASE);
     /* The device round trip completed inside vgpu_submit_stream_locked, so the
      * job is done by the time run_job returns; the scheduler signals the fence
      * with this result. */
@@ -1391,13 +1430,16 @@ static int vgpu_submit_stream(u32 ctx_id, const u32 *cmd, u32 cmd_bytes)
      * scheduler thread still holds a reference after the fence signals, so the
      * job must not live on the submitter's stack. */
     struct vgpu_submit_job *job = kzalloc(sizeof(*job));
-    if (!job)
+    if (!job) {
+        console_write("virtio-gpu: submit job alloc failed\n");
         return -1;
+    }
     job->ctx_id = ctx_id;
     job->cmd = cmd;
     job->cmd_bytes = cmd_bytes;
     job->result = -1;
     if (drm_sched_job_init(&job->base, &vgpu_sched_entity) < 0) {
+        console_write("virtio-gpu: submit job init failed\n");
         kfree(job);
         return -1;
     }
@@ -1412,7 +1454,18 @@ static int vgpu_submit_stream(u32 ctx_id, const u32 *cmd, u32 cmd_bytes)
     int result = job->result;
     dma_fence_put(fence);
     dma_fence_put(&job->base.finished); /* the creator's reference */
-    return (err || result < 0) ? -1 : 0;
+    if (err || result < 0) {
+        /* Two very different failures reach the caller as one: the job ran and
+         * the device refused it, or the job never ran at all. Print both
+         * numbers rather than make the next reader guess which. */
+        console_write("virtio-gpu: submit wait err=");
+        console_write_dec((u32)(err < 0 ? -err : err));
+        console_write(" result=");
+        console_write_dec((u32)(result < 0 ? -result : result));
+        console_write("\n");
+        return -1;
+    }
+    return 0;
 }
 
 /* Copy a GPU-rendered resource region back into its guest backing. */
@@ -1915,17 +1968,23 @@ void virtio_gpu_init(void)
                                     VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
     }
 
-    u64 dma_phys = pmm_alloc_frames(4);
+    /* The control request buffer holds a whole command, and a virgl command
+     * stream is routinely larger than a page: Mesa's first submission here is
+     * 4620 bytes. One page for it meant virtio_gpu_send_cmd() refused the
+     * command before it ever reached the host, and the caller saw an untouched
+     * response buffer -- a zero where a refusal code would have been. The
+     * responses stay one page each; nothing answers with more. */
+    u64 dma_phys = pmm_alloc_frames(VGPU_CTRL_REQ_PAGES + 3);
     if (!dma_phys) {
         console_write("virtio-gpu: DMA scratch allocation failed\n");
         return;
     }
     u8 *dma = (u8 *)(usize)(dma_phys + vmm_direct_map_base());
-    memset(dma, 0, 4 * PAGE_SIZE);
+    memset(dma, 0, (VGPU_CTRL_REQ_PAGES + 3) * PAGE_SIZE);
     gpu_control_req_dma = dma;
-    gpu_control_resp_dma = dma + PAGE_SIZE;
-    gpu_cursor_req_dma = dma + 2 * PAGE_SIZE;
-    gpu_cursor_resp_dma = dma + 3 * PAGE_SIZE;
+    gpu_control_resp_dma = dma + VGPU_CTRL_REQ_PAGES * PAGE_SIZE;
+    gpu_cursor_req_dma = dma + (VGPU_CTRL_REQ_PAGES + 1) * PAGE_SIZE;
+    gpu_cursor_resp_dma = dma + (VGPU_CTRL_REQ_PAGES + 2) * PAGE_SIZE;
 
     gpu_ready = 1;
     controlq_next_pair = 0;
@@ -2141,6 +2200,64 @@ void virtio_gpu_frame_stats(u64 *presents, u64 *copy_bytes, u64 *copy_cyc,
     if (flush_cyc) *flush_cyc = __atomic_load_n(&g_gpu_flush_cycles, __ATOMIC_RELAXED);
 }
 
+/* ── where a frame's time goes ───────────────────────────────────────────
+ *
+ * A present is three things: copying the damaged rows into the shared surface,
+ * a TRANSFER_TO_HOST_2D, and a RESOURCE_FLUSH. The last two are fenced device
+ * round trips, and a round trip that waits badly costs the same on every frame
+ * -- which is the shape of "everything is smooth but slow". Guessing which of
+ * the three dominates is how a week goes; b1nix.gfx-prof measures it.
+ *
+ * Off by default and free when off: one flag test per present.
+ */
+static u64 gfx_prof_copy_ns, gfx_prof_transfer_ns, gfx_prof_flush_ns;
+static u64 gfx_prof_frames;
+
+static int gfx_prof_on(void)
+{
+	static int on = -1;
+
+	if (on < 0)
+		on = bootinfo_has_flag("b1nix.gfx-prof") ? 1 : 0;
+	return on;
+}
+
+static u64 gfx_prof_now(void)
+{
+	return gfx_prof_on() ? arch_tsc_monotonic_ns() : 0;
+}
+
+static void gfx_prof_add(u64 *acc, u64 t0)
+{
+	if (t0)
+		*acc += arch_tsc_monotonic_ns() - t0;
+}
+
+void virtio_gpu_prof_report(void)
+{
+	if (!gfx_prof_on() || !gfx_prof_frames)
+		return;
+	console_write("gfx-prof: frames=");
+	console_write_dec((u32)gfx_prof_frames);
+	console_write(" copy=");
+	console_write_dec((u32)(gfx_prof_copy_ns / gfx_prof_frames / 1000));
+	console_write("us transfer=");
+	console_write_dec((u32)(gfx_prof_transfer_ns / gfx_prof_frames / 1000));
+	console_write("us flush=");
+	console_write_dec((u32)(gfx_prof_flush_ns / gfx_prof_frames / 1000));
+	/* The three times above say how long a frame waited; these two say why.
+	 * A wait the short spin satisfies costs nothing beyond the spin, while a
+	 * parked wait costs an interrupt and a context switch -- so a frame path
+	 * that mostly parks is bounded by the scheduler, not by the GPU, and the
+	 * fix for that is a different fix. Reported as running totals because the
+	 * counters are device-wide, not per-frame. */
+	console_write("us spun=");
+	console_write_dec((u32)gpu_wait_spun);
+	console_write(" parked=");
+	console_write_dec((u32)gpu_wait_parked);
+	console_write("\n");
+}
+
 static int virtio_gpu_present_locked(const u32 *src, u32 width, u32 height,
                                      u32 dirty_x, u32 dirty_y, u32 dirty_w,
                                      u32 dirty_h, int cursor_x, int cursor_y,
@@ -2194,10 +2311,12 @@ static int virtio_gpu_present_locked(const u32 *src, u32 width, u32 height,
     if (dirty_y + dirty_h > height) dirty_h = height - dirty_y;
 
     u64 t_copy = gpu_tsc();
+    u64 t_copy0 = gfx_prof_now();
     for (u32 row = 0; row < dirty_h; row++) {
         usize off = ((usize)(dirty_y + row) * width + dirty_x);
         memcpy(gpu_surface_virt + off, src + off, (usize)dirty_w * sizeof(u32));
     }
+    gfx_prof_add(&gfx_prof_copy_ns, t_copy0);
     if (cursor_visible) {
         if (gpu_hw_cursor_ready) {
             (void)virtio_gpu_cursor_submit(VIRTIO_GPU_CMD_MOVE_CURSOR, cursor_x,
@@ -2227,7 +2346,9 @@ static int virtio_gpu_present_locked(const u32 *src, u32 width, u32 height,
     transfer.offset = ((u64)dirty_y * width + dirty_x) * sizeof(u32);
     transfer.resource_id = gpu_resource_id;
     u64 t_xfer = gpu_tsc();
+    u64 t_xfer0 = gfx_prof_now();
     int xrc = virtio_gpu_send_cmd(&transfer, sizeof(transfer), &resp, sizeof(resp));
+    gfx_prof_add(&gfx_prof_transfer_ns, t_xfer0);
     __atomic_fetch_add(&g_gpu_transfer_cycles, gpu_tsc() - t_xfer, __ATOMIC_RELAXED);
     if (xrc < 0 || resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
         return -1;
@@ -2243,7 +2364,22 @@ static int virtio_gpu_present_locked(const u32 *src, u32 width, u32 height,
     flush.rect.height = dirty_h;
     flush.resource_id = gpu_resource_id;
     u64 t_flush = gpu_tsc();
+    u64 t_flush0 = gfx_prof_now();
     int frc = virtio_gpu_send_cmd(&flush, sizeof(flush), &resp, sizeof(resp));
+    gfx_prof_add(&gfx_prof_flush_ns, t_flush0);
+    if (gfx_prof_on()) {
+        /* A compositor presents on damage, not on a clock: a whole desktop
+         * session drew fewer than the 120 frames this used to wait for, so the
+         * instrument stayed silent through exactly the runs it was built for.
+         * Report early, then periodically. */
+        gfx_prof_frames++;
+        /* The first few unconditionally, then periodically. A desktop at rest
+         * presented fewer than ten frames in twenty seconds here, so any
+         * threshold above a handful means the instrument reports nothing at
+         * all for exactly the workload it was added to measure. */
+        if (gfx_prof_frames <= 3 || gfx_prof_frames % 30 == 0)
+            virtio_gpu_prof_report();
+    }
     __atomic_fetch_add(&g_gpu_flush_cycles, gpu_tsc() - t_flush, __ATOMIC_RELAXED);
     if (frc < 0 || resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
         return -1;
@@ -2301,4 +2437,331 @@ int virtio_gpu_present(const u32 *src, u32 width, u32 height, u32 dirty_x,
                                        cursor_visible);
     gpu_present_release();
     return rc;
+}
+
+/* ── the transport, for the DRM node ─────────────────────────────────────
+ *
+ * Everything above serves /dev/virtio-gpu, b1nix's own front door to virgl.
+ * Mesa does not knock there: its virgl winsys speaks the Linux DRM ioctls on
+ * the DRM node. Those live in the shim (kernel/lkpi/), which may not include
+ * b1nix headers, so the transport is exported here as plain functions over
+ * plain scalars and the shim calls them through lkpi_virgl_*.
+ *
+ * Resource ids are drawn from the SAME table the character device uses. Two
+ * front doors handing out the same id to different callers would be a bug
+ * that only shows up when both are in use at once -- which is exactly what a
+ * compositor and a test do.
+ */
+
+int virtio_gpu_virgl_available(void)
+{
+	return vgpu_udev_ready && virtio_gpu_ready();
+}
+
+/* Claim a resource id, or 0 when the table is full. */
+u32 virtio_gpu_virgl_res_alloc(void)
+{
+	u64 flags;
+	u32 id = 0;
+
+	spin_lock_irqsave(&vgpu_udev_lock, &flags);
+	for (int i = 0; i < VGPU_UDEV_MAX_RES; i++) {
+		if (vgpu_udev_res_tab[i].used)
+			continue;
+		vgpu_udev_res_tab[i].used = 1;
+		/* Ids are 1-based and never zero: zero is "no resource" in every
+		 * virtio-gpu command, so handing it out would read as absence. */
+		vgpu_udev_res_tab[i].res_id = (u32)i + VGPU_UDEV_RES_BASE;
+		id = vgpu_udev_res_tab[i].res_id;
+		break;
+	}
+	spin_unlock_irqrestore(&vgpu_udev_lock, flags);
+	return id;
+}
+
+static struct vgpu_udev_res *vgpu_res_by_id(u32 res_id)
+{
+	for (int i = 0; i < VGPU_UDEV_MAX_RES; i++)
+		if (vgpu_udev_res_tab[i].used && vgpu_udev_res_tab[i].res_id == res_id)
+			return &vgpu_udev_res_tab[i];
+	return 0;
+}
+
+/*
+ * Attach a scattered set of pages as a resource's backing.
+ *
+ * RESOURCE_ATTACH_BACKING carries nr_entries entries; the character device
+ * sends exactly one because it allocates a contiguous run. A GEM object's
+ * pages are deliberately NOT contiguous -- the shim's page allocator scatters
+ * them on purpose, so that a driver assuming page[i+1] follows page[i] breaks
+ * here rather than on hardware with the IOMMU off. Demanding a contiguous run
+ * for a 1920x1080 surface would be asking the allocator for 2000 adjacent
+ * pages, which is a request that fails under any real fragmentation.
+ *
+ * Adjacent pages are coalesced into one entry, so the common case where the
+ * allocator did hand out a run costs one entry rather than thousands.
+ */
+static int vgpu_res_attach_sg(u32 res_id, const u64 *phys, u32 npages)
+{
+	struct virtio_gpu_ctrl_hdr resp;
+	u8 *buf = vgpu_udev_submit_buf;
+	/* The whole submit buffer, not one page of it: a 1920x1080 surface is
+	 * 2048 pages, and even well coalesced that is far more entries than a
+	 * page holds. The send path now carries a multi-page command, so the
+	 * limit that matters is the buffer's own size. */
+	usize cap = VGPU_SUBMIT_BUF_BYTES < VGPU_CTRL_REQ_PAGES * PAGE_SIZE
+			    ? VGPU_SUBMIT_BUF_BYTES
+			    : VGPU_CTRL_REQ_PAGES * PAGE_SIZE;
+
+	if (!buf || npages == 0)
+		return -1;
+
+	struct virtio_gpu_resource_attach_backing *req =
+		(struct virtio_gpu_resource_attach_backing *)buf;
+	struct virtio_gpu_mem_entry *ent =
+		(struct virtio_gpu_mem_entry *)(buf + sizeof(*req));
+	usize max_entries = (cap - sizeof(*req)) / sizeof(*ent);
+	u32 n = 0;
+
+	memset(buf, 0, sizeof(*req));
+	for (u32 i = 0; i < npages; i++) {
+		if (n > 0 && ent[n - 1].addr + ent[n - 1].length == phys[i]) {
+			ent[n - 1].length += (u32)PAGE_SIZE;
+			continue;
+		}
+		if (n >= max_entries) {
+			console_write("virtio-gpu: backing too fragmented for one attach\n");
+			return -1;
+		}
+		ent[n].addr = phys[i];
+		ent[n].length = (u32)PAGE_SIZE;
+		ent[n].padding = 0;
+		n++;
+	}
+
+	req->hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+	req->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+	req->hdr.fence_id = gpu_fence_id++;
+	req->hdr.ctx_id = 0;
+	req->resource_id = res_id;
+	req->nr_entries = n;
+
+	usize len = sizeof(*req) + (usize)n * sizeof(*ent);
+	if (virtio_gpu_send_cmd(buf, len, &resp, sizeof(resp)) < 0 ||
+	    resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+		return -1;
+	return 0;
+}
+
+int virtio_gpu_virgl_res_create(u32 ctx_id, const struct virtio_gpu_res_params *p,
+				const u64 *phys, u32 npages, u32 res_id)
+{
+	struct virtio_gpu_resource_create_3d c3d;
+	struct virtio_gpu_ctx_resource ctxres;
+	struct virtio_gpu_ctrl_hdr resp;
+	struct vgpu_udev_res *slot = vgpu_res_by_id(res_id);
+
+	if (!p || !phys || npages == 0 || !slot)
+		return -1;
+
+	/* The wire struct is filled here rather than through the character
+	 * device's ABI struct, which has no last_level, nr_samples or flags:
+	 * those are zero for a plain surface and NOT zero for the mipmapped or
+	 * multisampled textures Mesa creates. Widening that ABI would change a
+	 * struct userspace already copies by size, so this path fills the
+	 * command it actually sends. */
+	memset(&c3d, 0, sizeof(c3d));
+	c3d.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+	c3d.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+	c3d.hdr.fence_id = gpu_fence_id++;
+	c3d.hdr.ctx_id = ctx_id;
+	c3d.resource_id = res_id;
+	c3d.target = p->target;
+	c3d.format = p->format;
+	c3d.bind = p->bind;
+	c3d.width = p->width;
+	c3d.height = p->height ? p->height : 1;
+	c3d.depth = p->depth ? p->depth : 1;
+	c3d.array_size = p->array_size ? p->array_size : 1;
+	c3d.last_level = p->last_level;
+	c3d.nr_samples = p->nr_samples;
+	c3d.flags = p->flags;
+	if (virtio_gpu_send_cmd(&c3d, sizeof(c3d), &resp, sizeof(resp)) < 0 ||
+	    resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+		return -1;
+
+	/* Backing first, then the context binding: the host must know where the
+	 * resource lives before anything in the context refers to it. */
+	if (vgpu_res_attach_sg(res_id, phys, npages) < 0)
+		return -1;
+
+	memset(&ctxres, 0, sizeof(ctxres));
+	ctxres.hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+	ctxres.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+	ctxres.hdr.fence_id = gpu_fence_id++;
+	ctxres.hdr.ctx_id = ctx_id;
+	ctxres.resource_id = res_id;
+	if (virtio_gpu_send_cmd(&ctxres, sizeof(ctxres), &resp, sizeof(resp)) < 0 ||
+	    resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+		return -1;
+
+	slot->width = p->width;
+	slot->height = p->height;
+	slot->format = p->format;
+	slot->bind = p->bind;
+	slot->size = (u64)npages * PAGE_SIZE;
+	slot->phys = phys[0];
+	return 0;
+}
+
+int virtio_gpu_virgl_ctx_create(u32 ctx_id)
+{
+	return vgpu_ctx_create(ctx_id);
+}
+
+int virtio_gpu_virgl_submit(u32 ctx_id, const u32 *cmd, u32 bytes)
+{
+	return vgpu_submit_stream(ctx_id, cmd, bytes);
+}
+
+int virtio_gpu_virgl_transfer(int to_host, u32 ctx_id, u32 res_id, u32 level,
+			      const u32 *box6, u64 offset)
+{
+	struct b1nix_virgl_transfer_abi t;
+
+	if (!box6)
+		return -1;
+	memset(&t, 0, sizeof(t));
+	t.res_id = res_id;
+	t.level = level;
+	t.box.x = box6[0];
+	t.box.y = box6[1];
+	t.box.z = box6[2];
+	t.box.w = box6[3];
+	t.box.h = box6[4];
+	t.box.d = box6[5];
+	t.offset = offset;
+	return to_host ? vgpu_transfer_to_host(ctx_id, &t)
+		       : vgpu_transfer_from_host(ctx_id, &t);
+}
+
+int virtio_gpu_virgl_unref(u32 res_id)
+{
+	struct vgpu_udev_res *slot = vgpu_res_by_id(res_id);
+	int rc = vgpu_res_unref_id(res_id);
+
+	if (slot) {
+		u64 flags;
+
+		spin_lock_irqsave(&vgpu_udev_lock, &flags);
+		/* The pages belong to the GEM object that asked for this
+		 * resource, not to the table: it frees them. */
+		memset(slot, 0, sizeof(*slot));
+		spin_unlock_irqrestore(&vgpu_udev_lock, flags);
+	}
+	return rc;
+}
+
+/*
+ * The capset, for the DRM node.
+ *
+ * This is what tells Mesa which virgl features the host offers, and it is not
+ * optional: virgl's winsys fails to create a screen without it and falls back
+ * to software, so an adapter that serves everything else and not this delivers
+ * nothing. `index` selects a capset (0 is the first), `want_ver` the version
+ * asked for; the buffer is filled with the blob and the real length returned
+ * through *len.
+ */
+int virtio_gpu_virgl_capset(u32 index, u32 want_id, u32 want_ver, void *out,
+			    u32 *len)
+{
+	struct virtio_gpu_get_capset_info capreq;
+	struct virtio_gpu_resp_capset_info capresp;
+	struct virtio_gpu_get_capset getcap;
+	struct {
+		struct virtio_gpu_ctrl_hdr hdr;
+		u8 capset_data[3072];
+	} __attribute__((packed)) capdata;
+	usize capdata_len = sizeof(capdata);
+
+	if (!out || !len || !vgpu_udev_ready)
+		return -1;
+
+	/* Find the capset by ID, not by index.
+	 *
+	 * The host numbers its capsets by index and names them by id, and the
+	 * two do not match: VIRGL is index 0, VIRGL2 is index 1. A caller asks
+	 * for an id -- Mesa asks for VIRGL2 -- so looking only at index 0 turned
+	 * "you asked for a capset I have" into "the host refused", which is what
+	 * it did. A caller that named a capset gets that one or nothing: handing
+	 * it another capset's blob would be answered as if it were the one asked
+	 * for, and every command built from it would be wrong. */
+	int found = 0;
+
+	for (u32 i = index; i < index + 4 && !found; i++) {
+		memset(&capreq, 0, sizeof(capreq));
+		memset(&capresp, 0, sizeof(capresp));
+		capreq.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+		capreq.capset_index = i;
+		if (virtio_gpu_send_cmd(&capreq, sizeof(capreq), &capresp,
+					sizeof(capresp)) < 0 ||
+		    capresp.hdr.type != VIRTIO_GPU_RESP_OK_CAPSET_INFO)
+			break;
+		if (!want_id || capresp.capset_id == want_id)
+			found = 1;
+	}
+	if (!found)
+		return -1;
+
+	if (capresp.capset_max_size + sizeof(struct virtio_gpu_ctrl_hdr) < capdata_len)
+		capdata_len = capresp.capset_max_size + sizeof(struct virtio_gpu_ctrl_hdr);
+
+	memset(&getcap, 0, sizeof(getcap));
+	memset(&capdata, 0, sizeof(capdata));
+	getcap.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
+	getcap.capset_id = capresp.capset_id;
+	getcap.capset_version = want_ver ? want_ver : capresp.capset_max_version;
+	if (virtio_gpu_send_cmd(&getcap, sizeof(getcap), &capdata, capdata_len) < 0)
+		return -1;
+
+	u32 blob = (u32)(capdata_len - sizeof(struct virtio_gpu_ctrl_hdr));
+	if (*len < blob)
+		blob = *len;
+	memcpy(out, capdata.capset_data, blob);
+	*len = blob;
+	return 0;
+}
+
+/*
+ * Which capsets the host offers, as a bitmask of capset ids.
+ *
+ * Mesa's virgl winsys asks this before anything else that matters, and a zero
+ * answer ends the conversation: with no capset there is no context to create,
+ * so it gives up without ever asking what the capset contains. The ids come
+ * from the host's own GET_CAPSET_INFO replies -- claiming a capset the host
+ * does not have would send Mesa down a path the host then rejects.
+ */
+int virtio_gpu_virgl_capset_ids(u64 *mask)
+{
+	if (!mask || !vgpu_udev_ready)
+		return -1;
+	*mask = 0;
+	/* Four is more than any host offers today; the loop stops at the first
+	 * index the host declines to describe. */
+	for (u32 index = 0; index < 4; index++) {
+		struct virtio_gpu_get_capset_info req;
+		struct virtio_gpu_resp_capset_info resp;
+
+		memset(&req, 0, sizeof(req));
+		memset(&resp, 0, sizeof(resp));
+		req.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+		req.capset_index = index;
+		if (virtio_gpu_send_cmd(&req, sizeof(req), &resp, sizeof(resp)) < 0 ||
+		    resp.hdr.type != VIRTIO_GPU_RESP_OK_CAPSET_INFO)
+			break;
+		if (resp.capset_id == 0 || resp.capset_id >= 64)
+			continue;
+		*mask |= 1ull << resp.capset_id;
+	}
+	return *mask ? 0 : -1;
 }

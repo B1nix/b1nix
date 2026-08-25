@@ -20,9 +20,11 @@
 #include <b1nix/pci.h>
 #include <b1nix/arch_x86_64.h>
 #include <b1nix/console.h>
+#include <b1nix/errno.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/sysfs_attr.h>
+#include <b1nix/uidgid.h>
 #include <b1nix/virtio_gpu.h>
 #include <b1nix/tlb.h>
 #include <b1nix/drm.h>
@@ -31,7 +33,29 @@
 #include <stdarg.h>
 #include <stdio.h>
 
-u64 lkpi_ticks(void) { return scheduler_get_ticks(); }
+/* A jiffy, in the units the imported code was written for.
+ *
+ * linux/jiffies.h fixes HZ at 100 — imported code converts through
+ * msecs_to_jiffies and is right whatever the real rate is, as long as the
+ * counter it reads advances at the rate HZ claims. This used to be the raw
+ * scheduler tick because the scheduler ran at 100 Hz too, and when the timer
+ * was reprogrammed to 1 kHz that quiet coincidence broke every timeout in the
+ * driver: a two-second wait expired in two hundred milliseconds, and an i915
+ * request that the hardware had already completed came back as a timeout.
+ *
+ * So scale, rather than assume. A tick rate that is not a multiple of HZ
+ * simply rounds; a rate below it cannot happen (the timer is never programmed
+ * slower than the PIT's 100 Hz), and the max() keeps the divisor sane if it
+ * ever were. */
+u64 lkpi_ticks(void)
+{
+	u32 hz = sched_tick_hz();
+	u32 per_jiffy = hz / 100u;
+
+	if (per_jiffy < 1u)
+		per_jiffy = 1u;
+	return scheduler_get_ticks() / per_jiffy;
+}
 
 /* ── stuck-call watchdog ────────────────────────────────────────
  *
@@ -105,8 +129,50 @@ int lkpi_diag_watch_report(u64 min_ms)
   return 1;
 }
 
-void lkpi_sleep_ticks(u64 ticks)
+/* Sleep for a number of JIFFIES, not scheduler ticks.
+ *
+ * Every caller counts in jiffies — msleep converts milliseconds at HZ, and
+ * schedule_timeout is handed a jiffy count straight out of imported code — and
+ * this used to pass that number to the scheduler as if a jiffy were a tick.
+ * That was true while both were 10 ms and became a tenfold error the moment the
+ * timer moved to 1 kHz: every driver timeout expired ten times too early, and
+ * an i915 request the hardware had already completed came back as a timeout
+ * because the wait for it lasted 200 ms instead of two seconds. */
+/* Wake a task that parked in schedule_timeout, named by the snapshot above.
+ *
+ * The pid in that snapshot is b1nix's task id, and waking by id is safe against
+ * the task having exited in the meantime: the scheduler finds no live task and
+ * does nothing. */
+void lkpi_prepare_to_sleep(void)
 {
+	lkpi_current()->wake_pending = 0;
+}
+
+int lkpi_wake_task(struct lkpi_task *t)
+{
+	if (!t || t->pid <= 0)
+		return 0;
+	/* Record it first. If the target has not parked yet the state CAS below
+	 * finds it RUNNING and does nothing, and this flag is the only thing that
+	 * keeps the wake from being lost. */
+	t->wake_pending = 1;
+	/* Without the runqueue: this runs from fence callbacks, and those run from
+	 * interrupt handlers. See scheduler_wake_task_norq. */
+	scheduler_wake_task_norq((usize)t->pid);
+	return 1;
+}
+
+u64 lkpi_sleep_jiffies(u64 jiffies_count)
+{
+	u32 hz = sched_tick_hz();
+	u32 per_jiffy = hz / 100u;
+	u64 ticks, deadline, now;
+
+	if (per_jiffy < 1u)
+		per_jiffy = 1u;
+	ticks = jiffies_count * per_jiffy;
+	deadline = scheduler_get_ticks() + ticks;
+	{
   watch_note_park((u64)(usize)__builtin_return_address(0),
                   (u64)(usize)__builtin_frame_address(0));
   /*
@@ -121,7 +187,63 @@ void lkpi_sleep_ticks(u64 ticks)
    */
   if (scheduler_wait_armed())
     scheduler_wait_cancel();
-  scheduler_sleep_ticks(ticks);
+	}
+
+	/*
+	 * Sleep in slices, checking for a wake between them.
+	 *
+	 * A single long sleep can only be cut short by the state CAS a waker
+	 * performs, and that CAS misses a task that has not parked yet — the
+	 * window between "decided to sleep" and "published SLEEPING". Slicing
+	 * bounds that miss to one slice instead of the whole timeout, and the flag
+	 * catches it on the very next check. One jiffy is the resolution the
+	 * imported code asked for anyway.
+	 */
+	{
+		struct lkpi_task *self = lkpi_current();
+		u64 left, slice;
+
+		/*
+		 * One slice, then back to the caller with the remainder.
+		 *
+		 * schedule_timeout() is allowed to return before its deadline — every
+		 * caller in the imported tree is a loop that re-tests its condition and
+		 * sleeps again, precisely because a wake can be spurious. Sleeping the
+		 * whole timeout in one go turns that loop into a single shot, and a
+		 * condition that becomes true while the task sleeps is then not noticed
+		 * until the deadline: i915_request_wait slept a full second on a
+		 * request the GPU had finished in microseconds, because the only thing
+		 * that would have re-checked it was the loop it never returned to.
+		 *
+		 * A jiffy is the resolution the caller asked for, so a slice is a
+		 * jiffy. A wake posted before the sleep is honoured immediately.
+		 */
+		if (self->wake_pending) {
+			self->wake_pending = 0;
+		} else {
+			now = scheduler_get_ticks();
+			if (now < deadline) {
+				left = deadline - now;
+				slice = left < per_jiffy ? left : per_jiffy;
+				scheduler_sleep_ticks(slice);
+			}
+		}
+	}
+
+	/*
+	 * How much of the sleep was left.
+	 *
+	 * schedule_timeout() returns the remainder, and zero means — to every
+	 * caller in the imported tree — that the wait expired. Returning zero
+	 * unconditionally, as this used to, turned every early wake into a
+	 * reported timeout: i915_request_wait was woken the moment its fence
+	 * signalled, saw a remainder of zero, and answered -ETIME for a request
+	 * the hardware had already retired.
+	 */
+	now = scheduler_get_ticks();
+	if (now >= deadline)
+		return 0;
+	return (deadline - now) / per_jiffy;
 }
 
 void lkpi_yield(void)
@@ -257,13 +379,27 @@ void lkpi_wake_all(void *chan)
  * hold it across a sleep, and a task can exit in that window. Copying costs a
  * few stores and removes the lifetime question entirely.
  */
-static struct lkpi_task g_lkpi_task[MAX_CPUS];
+/* One per task slot, not one per CPU.
+ *
+ * A per-CPU snapshot is stable only until the next task on that CPU asks for
+ * `current`, and imported code holds the pointer across a sleep on purpose:
+ * i915_request_wait saves it and has the fence callback wake it. With the
+ * snapshot shared per CPU that callback woke whichever task had most recently
+ * run there, so the waiter slept out its full timeout with its request long
+ * since complete — two seconds per engine, and the GT read as dead.
+ *
+ * Indexed by the scheduler's own task slot, so it is stable for the life of the
+ * task and reused only when the slot is. */
+static struct lkpi_task g_lkpi_task[4096];
 
 struct lkpi_task *lkpi_current(void)
 {
-	struct percpu *pc = get_percpu();
-	u32 cpu = pc && pc->cpu_id < MAX_CPUS ? pc->cpu_id : 0;
-	struct lkpi_task *t = &g_lkpi_task[cpu];
+	usize slot = scheduler_current_slot();
+	struct lkpi_task *t;
+
+	if (slot >= sizeof(g_lkpi_task) / sizeof(g_lkpi_task[0]))
+		slot = 0;
+	t = &g_lkpi_task[slot];
 
 	struct task *cur = current_task;
 	if (cur) {
@@ -445,6 +581,111 @@ void lkpi_scanout_mode(u32 *width, u32 *height)
 {
   virtio_gpu_get_mode(width, height);
 }
+
+/* ── capabilities ────────────────────────────────────────────────── */
+
+/* Linux's capability numbers are not b1nix's -- CAP_SYS_ADMIN is 21 there and
+ * 20 here, and the two lists diverge from CAP_SYS_RAWIO onwards. Imported code
+ * passes Linux's, so the translation belongs here, at the one file that is
+ * allowed to see both headers. Only the capabilities imported drivers actually
+ * ask about are mapped; anything else is refused rather than guessed at, which
+ * is the answer a driver can act on safely. */
+int lkpi_capable(int cap)
+{
+  struct cred *c = scheduler_get_current_cred();
+  int b1nix_cap;
+
+  if (!c)
+    return 0;
+  switch (cap) {
+  case 17: b1nix_cap = CAP_SYS_RAWIO; break; /* Linux CAP_SYS_RAWIO */
+  case 21: b1nix_cap = CAP_SYS_ADMIN; break; /* Linux CAP_SYS_ADMIN */
+  case 23: b1nix_cap = CAP_SYS_NICE; break;  /* Linux CAP_SYS_NICE  */
+  default: return 0;
+  }
+  return cred_has_cap(c, b1nix_cap) ? 1 : 0;
+}
+
+int lkpi_scanout_pci_id(u16 *vendor, u16 *device, u8 *bus, u8 *slot, u8 *func)
+{
+  /* Both device ids virtio-gpu is enumerated under, in the order the driver
+   * itself looks for them, so the answer is the function the driver bound to
+   * and not merely a virtio device that happens to be present. */
+  static const u16 ids[] = { 0x1010, 0x1050 };
+  struct pci_device_info info;
+
+  for (unsigned i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+    if (!pci_find_device(0x1af4, ids[i], &info))
+      continue;
+    if (vendor)
+      *vendor = 0x1af4;
+    if (device)
+      *device = ids[i];
+    if (bus)
+      *bus = info.bus;
+    if (slot)
+      *slot = info.slot;
+    if (func)
+      *func = info.func;
+    return 0;
+  }
+  return -ENODEV;
+}
+
+/* ── virgl bridge ───────────────────────────────────────────────────────
+ *
+ * Straight pass-through: the shim adds nothing but the boundary itself, so the
+ * driver ioctls above can reach b1nix's virtio-gpu transport without either
+ * side including the other's headers.
+ */
+int lkpi_virgl_available(void) { return virtio_gpu_virgl_available(); }
+
+u32 lkpi_virgl_res_alloc(void) { return virtio_gpu_virgl_res_alloc(); }
+
+int lkpi_virgl_ctx_create(u32 ctx_id)
+{
+  return virtio_gpu_virgl_ctx_create(ctx_id);
+}
+
+int lkpi_virgl_res_create(u32 ctx_id, const struct lkpi_virgl_res_desc *d,
+                          const u64 *phys, u32 npages, u32 res_id)
+{
+  struct virtio_gpu_res_params p;
+
+  if (!d)
+    return -1;
+  p.target = d->target;
+  p.format = d->format;
+  p.bind = d->bind;
+  p.width = d->width;
+  p.height = d->height;
+  p.depth = d->depth;
+  p.array_size = d->array_size;
+  p.last_level = d->last_level;
+  p.nr_samples = d->nr_samples;
+  p.flags = d->flags;
+  return virtio_gpu_virgl_res_create(ctx_id, &p, phys, npages, res_id);
+}
+
+int lkpi_virgl_submit(u32 ctx_id, const u32 *cmd, u32 bytes)
+{
+  return virtio_gpu_virgl_submit(ctx_id, cmd, bytes);
+}
+
+int lkpi_virgl_transfer(int to_host, u32 ctx_id, u32 res_id, u32 level,
+                        const u32 *box6, u64 offset)
+{
+  return virtio_gpu_virgl_transfer(to_host, ctx_id, res_id, level, box6, offset);
+}
+
+int lkpi_virgl_unref(u32 res_id) { return virtio_gpu_virgl_unref(res_id); }
+
+int lkpi_virgl_capset(u32 index, u32 want_id, u32 want_ver, void *out, u32 *len)
+{
+  return virtio_gpu_virgl_capset(index, want_id, want_ver, out, len);
+}
+
+int lkpi_virgl_capset_ids(u64 *mask) { return virtio_gpu_virgl_capset_ids(mask); }
 
 int lkpi_scanout_present(const u32 *pixels, u32 width, u32 height, u32 dirty_x,
                          u32 dirty_y, u32 dirty_w, u32 dirty_h)

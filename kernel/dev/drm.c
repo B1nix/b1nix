@@ -659,9 +659,30 @@ static void drm_sysfs_text_free(void *ctx) { kfree(ctx); }
  *   /sys/class/drm/card<n>   -> the minor
  *   /sys/dev/char/226:<n>    -> the minor
  */
-static struct sysfs_dir *drm_sysfs_pci_device(void);
+static struct sysfs_dir *drm_sysfs_pci_device_id(const struct drm_pci_ident *id);
 
-void drm_sysfs_publish_card(unsigned num) {
+/*
+ * The PCI slot the minors of this device hang off, spelled the way sysfs
+ * spells it.
+ *
+ * One place, because the directory the attributes are written into and the
+ * /sys/class and /sys/dev/char links that point AT it have to agree. They did
+ * not: the directory was built from the card's real address while both links
+ * were built from a hardcoded "0000:00:02.0", so every device that was not at
+ * that address published two dangling links. libdrm resolves a minor through
+ * exactly those links, so the node was invisible to Mesa — /dev/dri/renderD128
+ * existed, /sys/class/drm/renderD128 existed, and reading its `dev` attribute
+ * through the link failed with ENOENT.
+ */
+static void drm_sysfs_slotname(const struct drm_pci_ident *id, char *buf,
+                               usize n) {
+	snprintf(buf, n, "%04x:%02x:%02x.%u", 0, id ? id->bus : 0,
+	         id ? id->slot : 2, id ? id->func : 0u);
+}
+
+void drm_sysfs_publish_card(unsigned num) { drm_sysfs_publish_card_id(num, 0); }
+
+void drm_sysfs_publish_card_id(unsigned num, const struct drm_pci_ident *id) {
 	char card[16], node[24], minordir[64], *uevent, *devtext;
 
 	snprintf(card, sizeof(card), "card%u", num);
@@ -670,7 +691,7 @@ void drm_sysfs_publish_card(unsigned num) {
 	/* Under the PCI device, for the same reason the render node is: libdrm
 	 * reads a minor's identity from its parent, and a parent with no PCI
 	 * attributes leaves the device undescribable and therefore invisible. */
-	struct sysfs_dir *dev = drm_sysfs_pci_device();
+	struct sysfs_dir *dev = drm_sysfs_pci_device_id(id);
 	struct sysfs_dir *drm = dev ? sysfs_reg_dir(dev, "drm") : 0;
 	struct sysfs_dir *minor = drm ? sysfs_reg_dir(drm, card) : 0;
 
@@ -708,8 +729,13 @@ void drm_sysfs_publish_card(unsigned num) {
 	(void)sysfs_reg_link(minor, "subsystem", "../../../../../../class/drm");
 	(void)sysfs_reg_link(minor, "device", "../..");
 
-	snprintf(minordir, sizeof(minordir),
-	         "../../devices/pci0000:00/0000:00:02.0/drm/card%u", num);
+	{
+		char slot[16];
+
+		drm_sysfs_slotname(id, slot, sizeof(slot));
+		snprintf(minordir, sizeof(minordir),
+		         "../../devices/pci0000:00/%s/drm/card%u", slot, num);
+	}
 
 	struct sysfs_dir *cls = sysfs_reg_dir(sysfs_reg_dir(0, "class"), "drm");
 	if (cls)
@@ -735,36 +761,81 @@ void drm_sysfs_publish_card(unsigned num) {
  * The values are the passed-through GPU's own (Intel 8086:3e98, slot
  * 0000:00:02.0) — the same ones the guest's PCI config space reports.
  */
-static struct sysfs_dir *drm_sysfs_pci_device(void)
+/*
+ * The sysfs directory for one PCI function, described as itself.
+ *
+ * This used to be a single cached directory with the Intel part's ids written
+ * into it, shared by every DRM minor. With one card that is merely untrue; with
+ * two it is fatal, because the graphics stack tells cards apart by the device
+ * they hang off. Mesa enumerates EGL devices, resolves each to a DRM node
+ * through sysfs, finds both nodes on the same device and initialises whichever
+ * it saw first — which is how a compositor driving the Intel GPU ended up
+ * asking iris to create a screen on the virtual one.
+ *
+ * `id` NULL keeps the old behaviour for callers that have no identity to give.
+ */
+static struct sysfs_dir *drm_sysfs_pci_device_id(const struct drm_pci_ident *id)
 {
-	static struct sysfs_dir *cached;
+	char slotname[16];
+	char vendor_s[16], device_s[16], subv_s[16], subd_s[16], rev_s[16],
+	     class_s[16], uevent_s[192];
 
-	if (cached)
-		return cached;
+	drm_sysfs_slotname(id, slotname, sizeof(slotname));
+	/*
+	 * With no identity, publish none.
+	 *
+	 * These fields used to fall back to the passed-through Intel part's ids
+	 * (8086:3e98 at 00:02.0) whenever the PCI lookup came up empty. A card
+	 * described as a device it is not is worse than a card described as
+	 * nothing: the graphics stack tells cards apart by the device they hang
+	 * off, which is exactly how a compositor driving one GPU ended up asking
+	 * iris for a screen on the other. An absent attribute is a truthful "this
+	 * kernel does not know"; a borrowed one is an answer userspace cannot
+	 * check. The directory itself stays either way, so the minor beneath it is
+	 * still enumerable.
+	 */
+	vendor_s[0] = device_s[0] = subv_s[0] = subd_s[0] = 0;
+	rev_s[0] = class_s[0] = uevent_s[0] = 0;
+	if (id) {
+		snprintf(vendor_s, sizeof(vendor_s), "0x%04x\n", id->vendor);
+		snprintf(device_s, sizeof(device_s), "0x%04x\n", id->device);
+		snprintf(subv_s, sizeof(subv_s), "0x%04x\n", id->subsystem_vendor);
+		snprintf(subd_s, sizeof(subd_s), "0x%04x\n", id->subsystem_device);
+		snprintf(rev_s, sizeof(rev_s), "0x%02x\n", id->revision);
+		snprintf(class_s, sizeof(class_s), "0x%06x\n", id->pci_class);
+		snprintf(uevent_s, sizeof(uevent_s),
+		         "DRIVER=%s\nPCI_CLASS=%X\nPCI_ID=%04X:%04X\n"
+		         "PCI_SUBSYS_ID=%04X:%04X\nPCI_SLOT_NAME=%s\n",
+		         id->driver ? id->driver : "drm", id->pci_class,
+		         id->vendor, id->device, id->subsystem_vendor,
+		         id->subsystem_device, slotname);
+	}
 
 	struct sysfs_dir *devices = sysfs_reg_dir(0, "devices");
 	struct sysfs_dir *root = sysfs_reg_dir(devices, "pci0000:00");
-	struct sysfs_dir *dev = sysfs_reg_dir(root, "0000:00:02.0");
+	struct sysfs_dir *dev = sysfs_reg_dir(root, slotname);
 
 	if (!dev)
 		return 0;
 
-	static const struct { const char *name; const char *value; } attrs[] = {
-		{ "vendor",            "0x8086\n" },
-		{ "device",            "0x3e98\n" },
-		{ "subsystem_vendor",  "0x8086\n" },
-		{ "subsystem_device",  "0x2212\n" },
-		{ "revision",          "0x00\n" },
-		{ "class",             "0x030000\n" },
-		{ "uevent",
-		  "DRIVER=i915\nPCI_CLASS=30000\nPCI_ID=8086:3E98\n"
-		  "PCI_SUBSYS_ID=8086:2212\nPCI_SLOT_NAME=0000:00:02.0\n" },
+	const struct { const char *name; const char *value; } attrs[] = {
+		{ "vendor",            vendor_s },
+		{ "device",            device_s },
+		{ "subsystem_vendor",  subv_s },
+		{ "subsystem_device",  subd_s },
+		{ "revision",          rev_s },
+		{ "class",             class_s },
+		{ "uevent",            uevent_s },
 	};
 
 	for (unsigned i = 0; i < sizeof(attrs) / sizeof(attrs[0]); i++) {
 		usize len = strlen(attrs[i].value) + 1;
-		char *text = kmalloc(len);
+		char *text;
 
+		/* Empty means unknown -- see above. Nothing is published for it. */
+		if (attrs[i].value[0] == 0)
+			continue;
+		text = kmalloc(len);
 		if (!text)
 			continue;
 		memcpy(text, attrs[i].value, len);
@@ -778,13 +849,18 @@ static struct sysfs_dir *drm_sysfs_pci_device(void)
 	struct sysfs_dir *bus = sysfs_reg_dir(sysfs_reg_dir(0, "bus"), "pci");
 	struct sysfs_dir *busdev = sysfs_reg_dir(bus, "devices");
 
-	if (busdev)
-		(void)sysfs_reg_link(busdev, "0000:00:02.0",
-		                     "../../../devices/pci0000:00/0000:00:02.0");
+	if (busdev) {
+		char target[80];
 
-	cached = dev;
-	return cached;
+		snprintf(target, sizeof(target),
+		         "../../../devices/pci0000:00/%s", slotname);
+		(void)sysfs_reg_link(busdev, slotname, target);
+	}
+
+	return dev;
 }
+
+
 
 /*
  * The same publication for a render node.
@@ -799,14 +875,18 @@ static struct sysfs_dir *drm_sysfs_pci_device(void)
  * It hangs off the same gpu directory as its card: they are two minors of one
  * device, and that is what the "device" link says.
  */
-void drm_sysfs_publish_render(unsigned gpu_num, unsigned minor_num) {
+void drm_sysfs_publish_render(unsigned gpu_num, unsigned minor_num)
+{ drm_sysfs_publish_render_id(gpu_num, minor_num, 0); }
+
+void drm_sysfs_publish_render_id(unsigned gpu_num, unsigned minor_num,
+                                 const struct drm_pci_ident *id) {
 	char name[16], node[24], minordir[72], *uevent, *devtext;
 
 	snprintf(name, sizeof(name), "renderD%u", minor_num);
 	snprintf(node, sizeof(node), "226:%u", minor_num);
 
 	(void)gpu_num;
-	struct sysfs_dir *dev = drm_sysfs_pci_device();
+	struct sysfs_dir *dev = drm_sysfs_pci_device_id(id);
 	struct sysfs_dir *drm = dev ? sysfs_reg_dir(dev, "drm") : 0;
 	struct sysfs_dir *minor = drm ? sysfs_reg_dir(drm, name) : 0;
 
@@ -835,8 +915,13 @@ void drm_sysfs_publish_render(unsigned gpu_num, unsigned minor_num) {
 	(void)sysfs_reg_link(minor, "subsystem", "../../../../../../class/drm");
 	(void)sysfs_reg_link(minor, "device", "../..");
 
-	snprintf(minordir, sizeof(minordir),
-	         "../../devices/pci0000:00/0000:00:02.0/drm/renderD%u", minor_num);
+	{
+		char slot[16];
+
+		drm_sysfs_slotname(id, slot, sizeof(slot));
+		snprintf(minordir, sizeof(minordir),
+		         "../../devices/pci0000:00/%s/drm/renderD%u", slot, minor_num);
+	}
 
 	struct sysfs_dir *cls = sysfs_reg_dir(sysfs_reg_dir(0, "class"), "drm");
 	if (cls)

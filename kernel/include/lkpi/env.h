@@ -22,8 +22,10 @@
  */
 
 /* ── time ───────────────────────────────────────────────────────── */
-u64 lkpi_ticks(void);            /* scheduler ticks, 10 ms each */
-void lkpi_sleep_ticks(u64 ticks); /* parks; must not be called atomically */
+u64 lkpi_ticks(void);            /* jiffies: 10 ms each, whatever the tick rate */
+/* Park for a number of jiffies; returns the jiffies left when woken early,
+ * zero when the whole sleep elapsed. Not from atomic context. */
+u64 lkpi_sleep_jiffies(u64 jiffies_count);
 
 /* ── scheduling ─────────────────────────────────────────────────── */
 void lkpi_yield(void);
@@ -69,6 +71,15 @@ void lkpi_udelay(u64 usecs);
 
 /* Device interrupts taken so far. */
 u64 lkpi_device_irq_count(void);
+/* Tasklets queued and tasklets actually executed, for telling a completion that
+ * was never posted apart from one that was never processed. */
+void lkpi_tasklet_counts(u64 *scheduled, u64 *ran);
+/* Fence notification chain: armings asked for and accepted, fences signalled,
+ * and callbacks run. Locates which link of the chain is missing. */
+void lkpi_fence_counts(u64 *asked, u64 *accepted, u64 *signalled, u64 *callbacks);
+/* Deferred work posted from interrupt handlers, and interrupts the driver
+ * claimed. Separates "the device never raised it" from "we never ran it". */
+void lkpi_irq_work_counts(u64 *queued, u64 *ran, u64 *handled);
 
 
 /* ── two-phase wait ─────────────────────────────────────────────
@@ -114,6 +125,17 @@ struct lkpi_task {
 	int pid;
 	int tgid;
 	char comm[16];
+	/* A wake that arrived before the task managed to sleep.
+	 *
+	 * Linux's park is two statements — set_current_state() publishes the
+	 * intent, schedule() carries it out — and a wake landing between them must
+	 * cancel the sleep rather than be lost. Nothing in b1nix's task state can
+	 * express "about to sleep", so the intent is recorded here instead: the
+	 * waker sets it, and the sleep checks it before parking and between
+	 * slices. Without it a fence that signals in microseconds — which is what
+	 * a GPU does — woke a task that had not yet slept, and the task then slept
+	 * out its whole timeout. */
+	volatile int wake_pending;
 	/* The calling process's address space. b1nix's is not a struct mm_struct
 	 * and nothing here can walk it from another task — see find_vma() in
 	 * <linux/mm.h> — so this is always NULL and exists because imported code
@@ -122,6 +144,11 @@ struct lkpi_task {
 };
 
 struct lkpi_task *lkpi_current(void);
+/* Wake a task parked in schedule_timeout, or about to park. Returns 1 if a
+ * wake was posted. Safe from interrupt context. */
+int lkpi_wake_task(struct lkpi_task *t);
+/* Arm the park: what set_current_state() means here. */
+void lkpi_prepare_to_sleep(void);
 
 /* ── userspace access ───────────────────────────────────────────── */
 /* Return 0 on success, non-zero on fault — validated against the calling
@@ -219,12 +246,63 @@ int lkpi_vsnprintf(char *buf, usize cap, const char *fmt, __builtin_va_list ap);
  */
 int lkpi_scanout_ready(void);
 void lkpi_scanout_mode(u32 *width, u32 *height);
+
+/* Where the scanout device sits on the PCI bus, and what it says it is.
+ *
+ * A DRM device is identified to userspace by its parent's PCI address and ids:
+ * Mesa's loader reads them out of sysfs to pick a DRI driver, and EGL's device
+ * enumeration matches a render node to a card the same way. The shim has no
+ * business inventing them, and inventing them is exactly what publishing a
+ * fabricated parent amounted to. Returns 0 on success. */
+int lkpi_scanout_pci_id(u16 *vendor, u16 *device, u8 *bus, u8 *slot, u8 *func);
+
+/* Does the task that made this call hold a Linux capability?
+ *
+ * `cap` is Linux's own number, because that is what imported code passes; the
+ * translation to b1nix's numbering happens on the other side of this boundary.
+ * Answering a flat "no" was safe only for a driver deciding what to attempt on
+ * its own behalf -- for an ioctl arriving from ring 3 it denies root, which is
+ * how a compositor running as root was refused the DRM master lease. */
+int lkpi_capable(int cap);
 /* A frame of 32-bit XRGB pixels, `width` * `height`, of which only the
  * rectangle (dirty_x, dirty_y, dirty_w, dirty_h) is copied and flushed to the
  * host. Pass the whole frame when the caller has no damage to report.
  * Returns 0 on success. */
 int lkpi_scanout_present(const u32 *pixels, u32 width, u32 height, u32 dirty_x,
                          u32 dirty_y, u32 dirty_w, u32 dirty_h);
+
+/* ── virgl, for the DRM node's driver ioctls ─────────────────────────────
+ *
+ * Mesa's virgl winsys speaks DRM_IOCTL_VIRTGPU_* on the render node. Those are
+ * served by the imported DRM core calling into our driver, which lives on this
+ * side of the boundary and therefore cannot include b1nix headers. These are
+ * the transport, in plain scalars.
+ */
+struct lkpi_virgl_res_desc {
+	u32 target, format, bind, width, height, depth;
+	u32 array_size, last_level, nr_samples, flags;
+};
+
+/* Is there a virgl-capable GPU at all? A driver that says yes and then cannot
+ * deliver is worse than one that says no: Mesa falls back cleanly on no, and
+ * fails outright on a broken yes. */
+int lkpi_virgl_available(void);
+/* Claim a resource id; 0 when none is free. */
+u32 lkpi_virgl_res_alloc(void);
+/* Create a resource over `npages` pages, which need not be contiguous. */
+int lkpi_virgl_res_create(u32 ctx_id, const struct lkpi_virgl_res_desc *d,
+			  const u64 *phys, u32 npages, u32 res_id);
+int lkpi_virgl_ctx_create(u32 ctx_id);
+int lkpi_virgl_submit(u32 ctx_id, const u32 *cmd, u32 bytes);
+/* box6 is x, y, z, w, h, d. */
+int lkpi_virgl_transfer(int to_host, u32 ctx_id, u32 res_id, u32 level,
+			const u32 *box6, u64 offset);
+int lkpi_virgl_unref(u32 res_id);
+/* Read a capset blob into `out`; *len is the buffer size in and the blob
+ * length out. Mesa cannot create a virgl screen without this. */
+int lkpi_virgl_capset(u32 index, u32 want_id, u32 want_ver, void *out, u32 *len);
+/* Bitmask of capset ids the host offers; Mesa refuses to go on without one. */
+int lkpi_virgl_capset_ids(u64 *mask);
 
 /* ── diagnostics ────────────────────────────────────────────────── */
 void lkpi_panic(const char *message) __attribute__((noreturn));
