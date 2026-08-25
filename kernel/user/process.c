@@ -1507,7 +1507,10 @@ void user_address_space_cleanup(struct task *t) {
         vma->node->inode->mmap_close_cb(vma->node);
       vfs_node_put(vma->node);
     }
+    /* Not only this task's cache: a thread of the same address space that has
+     * not been torn down yet still caches out of this very list. */
     vma_cache_forget(t);
+    vma_cache_invalidate_all();
     kfree(vma);
     vma = next;
   }

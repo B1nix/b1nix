@@ -100,6 +100,19 @@ struct linux_ucontext {
   u64 __reserved[8];       /* 232 */
   u64 uc_sigmask;          /* 296 (kernel sigset) */
   unsigned char _sigpad[120];
+  /* 424: __fpregs_mem, the floating-point state a ucontext_t carries INSIDE
+   * itself.
+   *
+   * uc_mcontext.fpregs is a pointer, so it is tempting to leave the space out
+   * when the pointer is null -- and that is what was done. But the C library's
+   * ucontext_t is 936 bytes on x86_64 and this tail is part of the object, not
+   * something hanging off it: a handler that copies its ucontext, or that calls
+   * into getcontext/swapcontext with it, reads and writes the whole 936. The
+   * kernel reserved 424 and then placed the siginfo immediately above, so the
+   * rest of the object overlapped the siginfo, the red zone and the interrupted
+   * frame -- including its stack canary. Reserving what the ABI says the object
+   * is costs half a kilobyte of stack and removes the overlap. */
+  unsigned char __fpregs_mem[512];
 };
 
 /* gregs[] indices (Linux REG_* enum). */

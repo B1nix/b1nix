@@ -15,6 +15,7 @@
 #include <b1nix/io.h>
 #include <b1nix/mixer.h>
 #include <b1nix/mm.h>
+#include <b1nix/arch.h>
 #include <b1nix/module.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
@@ -30,6 +31,10 @@
 #include <string.h>
 
 /* ── libc-ish primitives ─────────────────────────────────────────────────── */
+/* The calibrated monotonic clock. A driver that waits for hardware should
+ * express the wait in time, not in a count of port reads that means something
+ * different on every machine — so it needs to be able to read a clock. */
+EXPORT_SYMBOL(arch_tsc_monotonic_ns);
 EXPORT_SYMBOL(memcpy);
 EXPORT_SYMBOL(memset);
 EXPORT_SYMBOL(memcmp);

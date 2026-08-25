@@ -26,6 +26,7 @@ void tlb_shootdown_all(void);
 #include <b1nix/blk.h>
 #include <b1nix/shm.h>
 #include <b1nix/sysv_ipc.h>
+#include <b1nix/sock_filter.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
@@ -187,6 +188,89 @@ int syscall_copyin(void *dst, const void *user_src, usize size) {
   return 0;
 }
 
+/* Make every page of a user range genuinely writable, or refuse.
+ *
+ * The VMA list says what a program is ALLOWED to do; the page tables say what
+ * the CPU will actually permit, and the two disagree routinely -- a
+ * copy-on-write page inside a PROT_WRITE mapping is read-only in the tables,
+ * and so is one whose region was later downgraded. memcpy obeys the tables, so
+ * a copyout validated against the list alone stores into a read-only page from
+ * ring 0. A user-mode store there is an ordinary fault the handler either
+ * services or reports as SIGSEGV; the same store from the kernel arrived as an
+ * unhandled exception and PANICKED the machine -- seen clearing a dying
+ * thread's tid word, which musl points at its own thread-list lock, so the
+ * crash landed on every threaded program that exited at the wrong moment.
+ *
+ * Resolving it here rather than inside the copy is deliberate twice over: the
+ * caller gets the EFAULT it already knows how to handle, and the fault is taken
+ * at a point of this function's choosing rather than in the middle of a memcpy
+ * some callers reach from a context where faulting is not allowed. */
+static int user_range_prepare_write(void *user_dst, usize size) {
+  extern u64 vmm_query_leaf_pte(u64 vaddr);
+  const u64 need = VMM_PRESENT | VMM_USER | VMM_WRITABLE;
+  u64 start = (u64)(usize)user_dst;
+  u64 end = start + size;
+
+  if (!current_task || !current_task->user_image)
+    return 1; /* early boot writes go to kernel memory */
+  for (u64 v = start & ~(u64)(PAGE_SIZE - 1); v < end; v += PAGE_SIZE) {
+    u64 pte = vmm_query_leaf_pte(v);
+
+    /* Only the one case that is fatal is handled here. A page that is absent,
+     * lazy, or under a huge entry with no leaf of its own faults from the copy
+     * itself and the handler services it exactly as it always has; taking those
+     * faults early instead would double the work on the hottest path in the
+     * kernel for no gain. What the handler cannot survive is a store to a page
+     * that IS present and IS read-only, because that arrives as a supervisor
+     * protection fault with nothing to fix up. */
+    if (!(pte & VMM_PRESENT) || (pte & need) == need)
+      continue;
+    if (!(pte & VMM_USER))
+      return 0;
+    /* Ask for the same fault a store from ring 3 would take -- which breaks a
+     * copy-on-write sharing, or fails because the page really is read-only.
+     *
+     * More than once, because the handler answers some faults by resolving one
+     * layer and asking to be called again (a huge identity page is split, a
+     * translation another CPU changed is flushed and retried). A single call
+     * therefore proves nothing about whether the page can be written; only the
+     * table does, and only after the handler has stopped making progress. */
+    int rc = 0;
+    for (int attempt = 0; attempt < 4; attempt++) {
+      /* PF_PRESENT matters: the handler decides which kind of fault this is
+       * from the error code, not from the entry. Without it the page is taken
+       * for an absent one and served by the anonymous fast path, which sees a
+       * present leaf, calls the fault already handled and returns success --
+       * leaving the entry exactly as read-only as it found it. The code the CPU
+       * would have reported is the code to pass. */
+      rc = vmm_handle_page_fault(v, PF_USER | PF_WRITE | PF_PRESENT);
+      pte = vmm_query_leaf_pte(v);
+      if ((pte & need) == need || rc < 0)
+        break;
+    }
+    if ((pte & need) != need) {
+      /* Bounded, because this is the report of a write the kernel was asked to
+       * make into memory the program itself could not write. Silence here is
+       * what turned it into an unexplained EFAULT far from its cause. */
+      static unsigned refused;
+
+      if (refused < 8) {
+        char line[128];
+
+        refused++;
+        snprintf(line, sizeof(line),
+                 "copyout: refusing write to read-only user page va 0x%llx "
+                 "pte 0x%llx rc %d task %s\n",
+                 (unsigned long long)v, (unsigned long long)pte, rc,
+                 current_task->name ? current_task->name : "?");
+        console_write(line);
+      }
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int syscall_copyout(void *user_dst, const void *src, usize size) {
   if (size == 0)
     return 0;
@@ -194,6 +278,9 @@ int syscall_copyout(void *user_dst, const void *src, usize size) {
     return -EFAULT;
 
   if (!is_user_range_valid(user_dst, size, 1)) {
+    return -EFAULT;
+  }
+  if (!user_range_prepare_write(user_dst, size)) {
     return -EFAULT;
   }
 
@@ -1002,7 +1089,28 @@ static u64 sys_execveat(int dirfd, const char *user_path, const char **user_argv
 }
 
 static u64 sys_ioctl(int fd, u64 request, void *arg) {
-  return (u64)vfs_ioctl(fd, request, arg);
+  int rc = vfs_ioctl(fd, request, arg);
+
+  /* Which request on which descriptor was refused as "not a terminal".
+   *
+   * "errno 25 from syscall 16" names ioctl and no more, and a terminal answers
+   * a dozen requests through several handlers. util-linux's login takes an
+   * ENOTTY, carries on, and then uses a buffer it never filled -- so the
+   * request code and the descriptor are the whole question, and neither the
+   * errno trace nor the VT layer's own trace could answer it once the refusal
+   * came from somewhere other than the VT. `b1nix.trace-ioctl`. */
+  if (rc == -ENOTTY && bootinfo_has_flag("b1nix.trace-ioctl")) {
+    console_write("ioctl: ENOTTY req=0x");
+    console_write_hex64(request);
+    console_write(" fd=");
+    console_write_dec((u64)(u32)fd);
+    if (current_task) {
+      console_write(" by ");
+      console_write(current_task->name);
+    }
+    console_write("\n");
+  }
+  return (u64)rc;
 }
 
 static int user_frame_is_valid(const struct interrupt_frame *frame) {
@@ -1523,6 +1631,56 @@ static isize sys_fchdir(int fd) {
   return (isize)scheduler_set_cwd(resolved);
 }
 
+/* ── Wall time to scheduler ticks ───────────────────────────────────────────
+ *
+ * At the rate the timer was ACTUALLY programmed with, never a written-out
+ * constant. Every conversion below used a hardcoded 100, and the LAPIC timer
+ * has been armed at 1 kHz since it could be calibrated -- so every POSIX
+ * timer, every alarm(2) and every setitimer(2) in the machine fired TEN TIMES
+ * EARLY. `timeout 120 systemctl daemon-reload` killed systemctl after twelve
+ * seconds and reported a timeout; `timeout 25 systemctl start` gave up after
+ * two and a half. A working daemon is indistinguishable from a hung one when
+ * the clock the test is held to runs ten times fast, so this was not one bug
+ * but a wrong answer given to every question anything asked with a timeout.
+ *
+ * sched.h says this in as many words -- "written as a bare count it silently
+ * became ten times shorter when the timer moved from 100 Hz to 1 kHz" -- and
+ * SCHED_MS_TO_TICKS exists for it. These call sites predate it.
+ *
+ * Saturating, not wrapping: a deadline further out than the counter can hold
+ * means "never", and wrapping turns never into now -- which is how a timerfd
+ * armed for TIME_T_MAX once fired immediately.
+ */
+#define SC_TICKS_MAX ((u64)1 << 62)
+
+static u64 sc_tick_hz(void) {
+  u64 hz = SCHED_TICKS_PER_SEC;
+
+  return hz ? hz : 100;
+}
+
+/* seconds + a fraction (nsec with frac_per_sec 1e9, usec with 1e6) to ticks,
+ * rounded UP so a wait is never shorter than the caller asked for. */
+static u64 sc_time_to_ticks(u64 sec, u64 frac, u64 frac_per_sec) {
+  u64 hz = sc_tick_hz();
+
+  if (sec > SC_TICKS_MAX / hz)
+    return SC_TICKS_MAX;
+  u64 t = sec * hz;
+  u64 add = (frac * hz + (frac_per_sec - 1)) / frac_per_sec;
+  if (t > SC_TICKS_MAX - add)
+    return SC_TICKS_MAX;
+  return t + add;
+}
+
+static void sc_ticks_to_time(u64 ticks, u64 *sec, u64 *frac,
+                             u64 frac_per_sec) {
+  u64 hz = sc_tick_hz();
+
+  *sec = ticks / hz;
+  *frac = ((ticks % hz) * frac_per_sec) / hz;
+}
+
 static u64 sys_alarm(unsigned int seconds) {
   if (!current_task)
     return 0;
@@ -1532,7 +1690,9 @@ static u64 sys_alarm(unsigned int seconds) {
   u64 remaining = 0;
   if (old_alarm > 0) {
     if (old_alarm > current_ticks) {
-      remaining = (old_alarm - current_ticks + 99) / 100;
+      /* alarm(2) reports the remainder in whole seconds, rounded up. */
+      u64 hz = sc_tick_hz();
+      remaining = (old_alarm - current_ticks + hz - 1) / hz;
     } else {
       remaining = 0;
     }
@@ -1541,7 +1701,9 @@ static u64 sys_alarm(unsigned int seconds) {
   if (seconds == 0) {
     task_set_alarm_ticks(current_task, 0);
   } else {
-    task_set_alarm_ticks(current_task, current_ticks + (u64)seconds * 100);
+    task_set_alarm_ticks(current_task,
+                         current_ticks +
+                             sc_time_to_ticks((u64)seconds, 0, 1000000000ull));
   }
 
   return remaining;
@@ -1592,11 +1754,12 @@ static isize sys_cpu_clock_ns(int clk_id, u64 *out_ns) {
   return 0;
 }
 
-/* clock_getres(2). The wall/monotonic clocks are driven off the 100 Hz
- * scheduler tick (see SYS_CLOCK_GETTIME), so 10 ms is their honest resolution
- * — reporting Linux's 1 ns would be a lie a caller can act on (poll loops
- * sized from the resolution). The CPU-time clocks are different: M86 accounts
- * them from the TSC, so their resolution really is nanoseconds. */
+/* clock_getres(2). A tick-driven clock's honest resolution is one tick, and
+ * the tick is whatever the timer was programmed with — reporting Linux's 1 ns
+ * would be a lie a caller can act on (poll loops sized from the resolution),
+ * and so would reporting a 10 ms tick on a kernel running at 1 kHz. The
+ * CPU-time clocks are different: M86 accounts them from the TSC, so their
+ * resolution really is nanoseconds. */
 static isize sys_clock_getres(int clk_id, struct timespec *user_res) {
   int is_cpu_clock = (clk_id < 0 || clk_id == 2 || clk_id == 3);
   if (clk_id > 7)
@@ -1619,9 +1782,10 @@ static isize sys_clock_getres(int clk_id, struct timespec *user_res) {
   if (is_cpu_clock)
     res.tv_nsec = 1;
   else if (clk_id == 5 || clk_id == 6) /* the *_COARSE pair */
-    res.tv_nsec = 10000000;
+    res.tv_nsec = (i64)(1000000000ULL / sc_tick_hz());
   else
-    res.tv_nsec = arch_tsc_clock_ready() ? 1 : 10000000;
+    res.tv_nsec = arch_tsc_clock_ready() ? 1
+                                        : (i64)(1000000000ULL / sc_tick_hz());
   if (syscall_copyout(user_res, &res, sizeof(res)) != 0)
     return -EFAULT;
   return 0;
@@ -1654,7 +1818,7 @@ static isize sys_sigtimedwait_kernel(u64 set, const struct timespec *user_ts) {
       return -EINVAL;
     has_timeout = 1;
     deadline = scheduler_get_ticks() +
-               (u64)ts.tv_sec * 100 + (u64)ts.tv_nsec / 10000000;
+               sc_time_to_ticks((u64)ts.tv_sec, (u64)ts.tv_nsec, 1000000000ull);
   }
 
   for (;;) {
@@ -1842,16 +2006,20 @@ static u64 sigsuspend_with_mask(u64 mask) {
     if (has_deliverable) {
       break;
     }
+    /* No channel: this wait ends on a signal, and the previous wait's channel
+     * must not be left behind to catch a wake meant for it. */
+    current_task->wait_chan = 0;
     current_task->state = TASK_BLOCKED;
     scheduler_yield();
   }
   interrupts_restore(flags);
 
-  if (task_has_saved_sigmask(current_task)) {
-    current_task->blocked_signals = task_saved_sigmask(current_task);
-    task_clear_saved_sigmask(current_task);
-  }
-
+  /* The temporary mask stays installed. It is the return to ring 3 that puts
+   * the original back — either through the signal frame, once a handler has
+   * been entered with the wait mask in force, or through the restore in
+   * arch_check_and_deliver_signals when nothing was delivered. Undoing it here
+   * re-blocked the very signal that ended the wait, so the handler never ran
+   * and the caller looped on sigsuspend forever. */
   return (u64)-EINTR;
 }
 
@@ -1875,6 +2043,38 @@ static int mlock_populate(u64 start, u64 end) {
       return -1;
   }
   return 0;
+}
+
+/* Install a wait mask for the duration of one blocking call.
+ *
+ * epoll_pwait, ppoll and pselect exist for one reason: a program that keeps a
+ * signal blocked everywhere else wants it deliverable while — and only while —
+ * it is parked in the wait. b1nix dropped the mask argument on the floor and
+ * ran the plain wait instead, so for any program using that idiom the signal
+ * was never deliverable at all. A terminal emulator blocking SIGTERM and
+ * unblocking it across its epoll could not be asked to quit: SIGTERM sat
+ * pending while the process ran on, and only SIGKILL ended it.
+ *
+ * The original mask comes back the same way sigsuspend's does — through the
+ * signal frame once a handler is entered, or through the return to ring 3 when
+ * nothing was delivered. Restoring it here would re-block the signal before it
+ * could be acted on, which is the whole defect over again.
+ *
+ * mask is in Linux numbering, as every caller of this path is. */
+static void syscall_wait_mask_install(u64 lx_mask) {
+  if (!current_task)
+    return;
+  /* Never overwrite a mask already put aside. A wait interrupted by a signal
+   * comes back through this same entry point when the call is restarted, and a
+   * second save would store the temporary mask as if it were the caller's own
+   * — the real one would then never come back and the process would run for
+   * the rest of its life with everything but the wait signal blocked. */
+  if (task_has_saved_sigmask(current_task))
+    return;
+  u64 b_mask = linux_sigset_to_b1nix(lx_mask);
+  task_set_saved_sigmask(current_task, current_task->blocked_signals, 1);
+  current_task->blocked_signals =
+      b_mask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
 }
 
 static u64 sys_sigsuspend(const u64 *user_mask) {
@@ -2078,32 +2278,46 @@ static isize sys_mount(const char *user_src, const char *user_target,
 
   /* The operations that name no filesystem, in the order Linux checks them.
    * Each of these takes a target that already exists and changes something
-   * about it, so none of them reaches the filesystem type at all. */
-  if (flags & MS_MOVE) {
+   * about it, so none of them reaches the filesystem type at all.
+   *
+   * The order is Linux's do_mount() and it is not a matter of taste: REMOUNT is
+   * tested BEFORE BIND, because `MS_BIND|MS_REMOUNT|MS_RDONLY` is how every
+   * caller turns an existing bind read-only -- it is what systemd's
+   * ProtectHostname=, ProtectKernelTunables= and ReadOnlyPaths= all come down
+   * to. Tested the other way round it was taken for a fresh bind of a NULL
+   * source, which resolves to `/`, and binding a directory onto
+   * /proc/sys/kernel/domainname answered ENOTDIR -- which systemd reports as
+   * "Failed to set up mount namespacing" and treats as fatal, so
+   * systemd-udevd never started. */
+  int done = 1, dres = 0;
+  const char *dop = "";
+  if (flags & MS_REMOUNT) {
+    dop = "remount";
+    dres = vfs_remount(ktarget, flags);
+  } else if (flags & MS_BIND) {
+    dop = "bind";
+    dres = vfs_bind_mount(ksrc, ktarget, flags);
+  } else if (flags & MS_PROPAGATION_MASK) {
+    dop = "propagation";
+    dres = vfs_set_propagation(ktarget, flags);
+  } else if (flags & MS_MOVE) {
     /* switch_root calls mount(".", "/", NULL, MS_MOVE, NULL); the "." is
      * relative to the caller's cwd, so both go through the resolver. */
-    int mres = vfs_move_mount(ksrc, ktarget);
-    kfree(ksrc);
-    kfree(ktarget);
-    return (isize)mres;
+    dop = "move";
+    dres = vfs_move_mount(ksrc, ktarget);
+  } else {
+    done = 0;
   }
-  if (flags & MS_PROPAGATION_MASK) {
-    int pres = vfs_set_propagation(ktarget, flags);
+  if (done) {
+    if (bootinfo_has_flag("b1nix.trace-mount")) {
+      char line[320];
+      snprintf(line, sizeof(line), "mount[%s]: '%s' -> '%s' flags=0x%llx = %d",
+               dop, ksrc, ktarget, (unsigned long long)flags, dres);
+      klog_info(line);
+    }
     kfree(ksrc);
     kfree(ktarget);
-    return (isize)pres;
-  }
-  if (flags & MS_BIND) {
-    int bres = vfs_bind_mount(ksrc, ktarget, flags);
-    kfree(ksrc);
-    kfree(ktarget);
-    return (isize)bres;
-  }
-  if (flags & MS_REMOUNT) {
-    int rres = vfs_remount(ktarget, flags);
-    kfree(ksrc);
-    kfree(ktarget);
-    return (isize)rres;
+    return (isize)dres;
   }
 
   char *ktype = kmalloc(64);
@@ -2152,6 +2366,54 @@ static isize sys_umount(const char *user_target) {
   return (isize)res;
 }
 
+/*
+ * readahead(fd, offset, count) -- pull a file's contents into the cache before
+ * anything asks for them.
+ *
+ * It is real work rather than an accepted hint: the pages are read through the
+ * ordinary VFS path, so they land in the same page/block cache a later read
+ * will hit, and a caller that asks for a megabyte pays for a megabyte here
+ * instead of paying for it a block at a time later. Returning 0 without
+ * reading would be indistinguishable to the caller and a lie to anyone timing
+ * it, so this reads.
+ *
+ * Linux semantics kept: EBADF for a bad descriptor, EINVAL for a descriptor
+ * that cannot be read this way, and 0 on success. A short read at end-of-file
+ * is success -- there was simply less to warm than asked for.
+ */
+static isize sys_readahead(int fd, u64 offset, usize count) {
+  if (fd < 0)
+    return -EBADF;
+  if (count == 0)
+    return 0;
+
+  /* One block-sized staging buffer, reused: the point is to populate the
+   * cache, and the bytes themselves are thrown away. 64 KiB keeps the number
+   * of VFS round trips low without asking the heap for anything awkward. */
+  enum { RA_CHUNK = 65536 };
+  char *buf = kmalloc(RA_CHUNK);
+  if (!buf)
+    return -ENOMEM;
+
+  usize done = 0;
+  isize rc = 0;
+  while (done < count) {
+    usize want = count - done;
+    if (want > RA_CHUNK)
+      want = RA_CHUNK;
+    isize got = vfs_pread(fd, buf, want, offset + done);
+    if (got < 0) {
+      rc = got;
+      break;
+    }
+    if (got == 0) /* end of file: nothing left to warm, and that is not an error */
+      break;
+    done += (usize)got;
+  }
+  kfree(buf);
+  return rc < 0 ? rc : 0;
+}
+
 static isize sys_pivot_root(const char *user_new, const char *user_old) {
   /* Replacing the root of every process is CAP_SYS_ADMIN territory, and Linux
    * gates it there too. */
@@ -2180,6 +2442,7 @@ static isize sys_pivot_root(const char *user_new, const char *user_old) {
   kfree(kold);
   return (isize)res;
 }
+
 
 static isize sys_stat(const char *user_path, struct b1nix_stat *user_st) {
   char *kpath = kmalloc(VFS_MAX_PATH);
@@ -2833,7 +3096,16 @@ static int select_poll_signal_pending(void) {
 
 #define POLL_STACK_FDS 64
 
-static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
+/* poll(2) and its high-resolution siblings.
+ *
+ * ppoll and pselect are given a struct timespec and were served by rounding it
+ * to whole milliseconds, so every sub-millisecond wait a program asked for
+ * became either zero — a poll loop that spins — or a full millisecond. The
+ * deadline is kept in nanoseconds on the same counter clock_gettime answers
+ * from; only the sleep between scans is expressed in ticks, and it is never
+ * shorter than the wait that remains. */
+static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
+                       u64 timeout_ns, int infinite) {
   /* As many descriptors as the caller actually passed.
    *
    * The array used to be a fixed 64 on the kernel stack and anything past it
@@ -2859,8 +3131,8 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
     return -EFAULT;
   }
 
-  u64 start_ticks = scheduler_get_uptime_ticks();
-  u64 timeout_ticks = timeout == (u64)-1 ? (u64)-1 : timeout / 10;
+  u64 tick_ns = 1000000000ull / (u64)sched_tick_hz();
+  u64 deadline_ns = infinite ? 0 : arch_tsc_monotonic_ns() + timeout_ns;
 
   extern void *vfs_poll_chan;
 
@@ -2892,13 +3164,11 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
     }
 
     int timed_out = 0;
-    if (ready == 0 && timeout != 0 && timeout != (u64)-1) {
-      u64 now = scheduler_get_uptime_ticks();
-      if (now - start_ticks >= timeout_ticks)
-        timed_out = 1;
-    }
+    if (ready == 0 && !infinite && timeout_ns != 0 &&
+        arch_tsc_monotonic_ns() >= deadline_ns)
+      timed_out = 1;
 
-    if (ready > 0 || timeout == 0 || timed_out) {
+    if (ready > 0 || (!infinite && timeout_ns == 0) || timed_out) {
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
       syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
@@ -2924,13 +3194,24 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
      * next sleep was unbounded — a poll(10ms) could then sleep tens of
      * seconds until unrelated traffic kicked the chan (netd's reactor wedge,
      * every socket() timing out with ETIMEDOUT meanwhile). */
-    if (timeout != (u64)-1 && timeout != 0) {
-      u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
-      current_task->wake_tick = start_ticks + ticks;
+    if (!infinite && timeout_ns != 0) {
+      u64 now_ns = arch_tsc_monotonic_ns();
+      u64 rest_ns = deadline_ns > now_ns ? deadline_ns - now_ns : 0;
+      u64 ticks = (rest_ns + tick_ns - 1) / tick_ns;
+      if (ticks == 0)
+        ticks = 1;
+      current_task->wake_tick = scheduler_get_uptime_ticks() + ticks;
     }
 
     scheduler_wait_commit();
   }
+}
+
+/* poll(2): the timeout is whole milliseconds, (u64)-1 meaning "no timeout". */
+static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
+  if (timeout == (u64)-1)
+    return sys_poll_ns(user_fds, nfds, 0, 1);
+  return sys_poll_ns(user_fds, nfds, timeout * 1000000ull, 0);
 }
 
 static u64 sys_bind(int fd, const void *user_addr, usize addrlen) {
@@ -3332,7 +3613,11 @@ static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
     usize data_len = received_count * sizeof(int);
     usize cmsg_len = header_space + data_len;
     usize space = header_space + K_CMSG_ALIGN(data_len);
-    if (space <= msg.msg_controllen) {
+    /* Both bounds. msg_controllen is the caller's buffer; `control` is this
+     * function's, on the kernel stack, and a caller is free to name a
+     * msg_controllen larger than it. Checking only the caller's let a large
+     * enough request write past the end of ours. */
+    if (space <= msg.msg_controllen && space <= sizeof(control)) {
       struct syscall_cmsghdr *c = (struct syscall_cmsghdr *)control;
       c->cmsg_len = cmsg_len;
       c->cmsg_level = K_SOL_SOCKET;
@@ -3385,7 +3670,8 @@ static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
   if (has_cred) {
     usize cmsg_len = header_space + sizeof(cred);
     usize space = header_space + K_CMSG_ALIGN(sizeof(cred));
-    if (control_len + space <= msg.msg_controllen) {
+    if (control_len + space <= msg.msg_controllen &&
+        control_len + space <= sizeof(control)) {
       struct syscall_cmsghdr *c =
           (struct syscall_cmsghdr *)(control + control_len);
       c->cmsg_len = cmsg_len;
@@ -3503,7 +3789,9 @@ static u64 sys_accept(int fd, void *addr, usize *addrlen) {
   }
 
   char k_addr[128]; /* enough for sockaddr_un */
-  usize k_addrlen = user_cap;
+  /* What the socket layer is told it may write is OUR buffer, not the
+   * caller's: a caller is free to name a capacity larger than 128. */
+  usize k_addrlen = user_cap > sizeof(k_addr) ? sizeof(k_addr) : user_cap;
   int res = vfs_accept(fd, k_addr, &k_addrlen);
   if (res >= 0) {
     if (k_addrlen > sizeof(k_addr)) k_addrlen = sizeof(k_addr);
@@ -3518,10 +3806,44 @@ static u64 sys_accept(int fd, void *addr, usize *addrlen) {
   return (u64)res;
 }
 
+/* SOL_SOCKET / SO_ATTACH_FILTER, whose optval is a struct sock_fprog holding a
+ * pointer to the instruction array in userspace. Every other option's value is
+ * self-contained, so this is the one that has to be resolved here rather than
+ * in the socket layer. */
+#define SYS_SOL_SOCKET_LEVEL 1
+#define SYS_SO_ATTACH_FILTER 26
+
+static u64 sys_setsockopt_attach_filter(int fd, const void *user_optval,
+                                        usize optlen) {
+  struct sock_fprog_user fp;
+  if (optlen < sizeof(fp))
+    return (u64)-EINVAL;
+  if (syscall_copyin(&fp, user_optval, sizeof(fp)) < 0)
+    return (u64)-EFAULT;
+  if (fp.len == 0 || fp.len > BPF_MAXINSNS || fp.filter == 0)
+    return (u64)-EINVAL;
+
+  usize bytes = (usize)fp.len * sizeof(struct sock_filter_insn);
+  struct sock_filter_insn *insns = (struct sock_filter_insn *)kmalloc(bytes);
+  if (!insns)
+    return (u64)-ENOMEM;
+  u64 rc;
+  if (syscall_copyin(insns, (const void *)(usize)fp.filter, bytes) < 0)
+    rc = (u64)-EFAULT;
+  else
+    rc = (u64)vfs_sock_attach_filter(fd, insns, fp.len);
+  kfree(insns);
+  return rc;
+}
+
 static u64 sys_setsockopt(int fd, int level, int optname,
                           const void *user_optval, usize optlen) {
   u8 kopt[64];
-  if (!user_optval || optlen == 0 || optlen > sizeof(kopt))
+  if (!user_optval || optlen == 0)
+    return (u64)-EINVAL;
+  if (level == SYS_SOL_SOCKET_LEVEL && optname == SYS_SO_ATTACH_FILTER)
+    return sys_setsockopt_attach_filter(fd, user_optval, optlen);
+  if (optlen > sizeof(kopt))
     return (u64)-EINVAL;
   if (syscall_copyin(kopt, user_optval, optlen) < 0)
     return (u64)-EFAULT;
@@ -3617,6 +3939,94 @@ static void vma_audit(const char *where) {
   }
 }
 
+/* Sleep for exactly as long as asked, to the precision the clock allows.
+ *
+ * Whole scheduler ticks are slept; the remainder is waited out against the
+ * calibrated counter. Rounding the whole request up to a tick — which all
+ * three sleep entry points used to do — made every sub-tick sleep cost ten
+ * milliseconds, so a usleep(500) waited twenty times longer than it asked.
+ * One such call is invisible; a loop of them is not, and userspace is full of
+ * them: retry loops, poll intervals, backoffs, the drain loop of a handoff.
+ * Measured on one: five hundred iterations that should have taken half a
+ * second took seven and a half.
+ *
+ * The wait is bounded — only a remainder under two milliseconds is spun out,
+ * so a long sleep never burns a CPU and the most that can be burned is the
+ * tail of one tick — and it is interruptible, because a sleep that ignores a
+ * signal is a worse bug than a slow one.
+ *
+ * Returns the number of ticks actually slept, so a caller can report the
+ * remainder of an interrupted sleep.
+ */
+static u64 syscall_sleep_timespec(const struct timespec *ts, u64 *ticks_asked) {
+  u64 tick_ns = 1000000000ULL / (u64)sched_tick_hz();
+  u64 total_ns = (u64)ts->tv_sec * 1000000000ULL + (u64)ts->tv_nsec;
+  u64 start_ticks = scheduler_get_uptime_ticks();
+  u64 deadline_ns = arch_tsc_monotonic_ns() + total_ns;
+  u64 asked_ticks = (total_ns + tick_ns - 1) / tick_ns;
+  /* A sleep is bounded by BOTH clocks, and by whichever says "enough" first.
+   *
+   * The nanosecond counter is the precise one and decides the normal case. It
+   * is not, however, allowed to be the only way out: if it advances slower than
+   * the scheduler's ticks, the deadline is never reached and the loop below
+   * sleeps for ever, waking and re-sleeping a few ticks at a time. That is not
+   * hypothetical -- `sleep 3` inside the KDE image never returned, and the task
+   * dump showed a wake_tick five ticks ahead of the current tick, sixty seconds
+   * apart, every time. So the tick count the caller asked for is a ceiling.
+   * Two ticks of slack keep the ns deadline the one that normally fires, so
+   * sub-tick precision is unaffected. */
+  u64 tick_deadline = start_ticks + asked_ticks + 2;
+
+  if (ticks_asked)
+    *ticks_asked = asked_ticks;
+
+  /* Sleep the ticks, then finish on the clock.
+   *
+   * A tick-count sleep returns on the next tick boundary, so it can come back
+   * early — asking for five milliseconds and being given four is a sleep that
+   * did not happen, and callers that time anything with it are wrong. The
+   * remainder is therefore waited out against the counter.
+   *
+   * It has to be waited out by sleeping again, not by spinning. A tick sleep
+   * also ends early whenever anything promotes the task to READY, which any
+   * wake path does, and the residue is then not the sub-tick tail this waits
+   * for but the whole rest of the sleep. Spun on the counter, a `sleep 20`
+   * that was woken once burns a core for twenty seconds with the task never
+   * yielding: on a single-CPU guest nothing else runs for that whole time and
+   * the machine reads as wedged, which is exactly how it read.
+   *
+   * So: whole ticks go back to the scheduler, and only the last sub-tick
+   * fragment — bounded by one tick, a millisecond at the rate this kernel
+   * programs — is spun. Whether re-entry is allowed at all is the scheduler's
+   * answer, not ours: see scheduler_sleep_ticks_state. */
+  for (;;) {
+    u64 now_ns = arch_tsc_monotonic_ns();
+    if (now_ns >= deadline_ns)
+      break;
+    if (scheduler_get_uptime_ticks() >= tick_deadline)
+      break;
+    if (scheduler_signal_pending_any())
+      break;
+    u64 rest_ticks = (deadline_ns - now_ns) / tick_ns;
+    if (!rest_ticks) {
+      __asm__ volatile("pause");
+      continue;
+    }
+    /* Ask the scheduler to sleep and let IT decide whether this task may:
+     * reading our own state here and calling on the answer is a race, because
+     * another CPU stops or kills us in between. That race panicked the guest
+     * from this very loop. */
+    int slept = scheduler_sleep_ticks_state(rest_ticks, 0);
+    if (slept == SLEEP_GONE)
+      break;
+    if (slept == SLEEP_RETRY)
+      scheduler_yield(); /* stopped or blocked: give up the CPU, then re-check
+                          * the deadline — a sleep survives SIGSTOP/SIGCONT
+                          * instead of returning short. */
+  }
+  return scheduler_get_uptime_ticks() - start_ticks;
+}
+
 static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
                     isize offset) {
   if (length == 0)
@@ -3671,6 +4081,17 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
     /* Unmap the range this MAP_FIXED replaces, batched: same reason as
      * munmap's loop — one flush per batch instead of one per page. */
     {
+      /* Collect the frames, flush, and only then release them.
+       *
+       * This used the inline-freeing unmap, which hands each frame back to the
+       * allocator while the other CPUs still have the old translation cached —
+       * the flush came afterwards, once per batch. In that window a sibling
+       * thread's write goes to a frame that has already been given to somebody
+       * else, and the damage surfaces far away: a compositor died with two
+       * pixels of a terminal's background colour sitting in its allocator's
+       * metadata. munmap has done it in the right order for a while; a
+       * MAP_FIXED that replaces a live mapping is the same operation and must
+       * do the same thing. */
       enum { FIXED_BATCH = 64 };
       u64 frames[FIXED_BATCH];
       u64 stop = vaddr + length;
@@ -3680,8 +4101,10 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
 
         if (n > FIXED_BATCH)
           n = FIXED_BATCH;
-        vmm_unmap_range_nosync(v, n, frames);
+        usize nframes = vmm_unmap_range_collect(v, n, frames);
         tlb_shootdown_all();
+        for (usize k = 0; k < nframes; k++)
+          pmm_free_frame(frames[k]);
         v += (u64)n * PAGE_SIZE;
       }
     }
@@ -3797,7 +4220,27 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   if (prot & PROT_WRITE)
     vmm_flags |= VMM_WRITABLE;
 
-  if ((flags & MAP_ANONYMOUS) && ((flags & MAP_NORESERVE) || prot == PROT_NONE)) {
+  /* Anonymous memory is faulted in, not handed over.
+   *
+   * This branch used to be taken only for MAP_NORESERVE: every other anonymous
+   * mapping allocated a frame, zeroed it and installed a leaf for every page of
+   * the request, before the caller had touched any of them. musl's allocator
+   * maps in hundreds of kilobytes at a time and writes to a fraction of it, so
+   * the work was mostly wasted — and mremap made it visibly absurd: it mmaps a
+   * destination, and every page that mmap had just allocated and zeroed was
+   * freed again microseconds later by the move that overwrites them. (That
+   * freeing is also what the "destination arrived holding pages left by a
+   * previous mapping" report was seeing: not a foreign mapping's leftovers at
+   * all, but the destination's own eager allocation.)
+   *
+   * The fault handler zero-fills any absent anonymous page in this range
+   * already, and does it from the pre-zeroed pool with a shared read-only zero
+   * page until the first write — so lazy is not merely cheaper, it is what
+   * gives the mapping copy-on-write behaviour for pages that are only read.
+   *
+   * b1nix.eager-anon restores the old behaviour for a run that wants to
+   * compare. */
+  if ((flags & MAP_ANONYMOUS) && !bootinfo_has_flag("b1nix.eager-anon")) {
     /* Lazy commit — no frame reserved up front; the page-fault handler's Case 1
      * zero-fills a fresh frame on first touch (anonymous → no VMA node → stays
      * zeroed). Used for two cases:
@@ -3979,6 +4422,10 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   return vaddr;
 }
 
+void vma_trace_record(const char *what, u64 start, u64 end);
+int vma_trace_faults_enabled(void);
+
+
 static isize sys_munmap(void *addr, usize length) {
   u64 start = (u64)(usize)addr;
   if ((start & (PAGE_SIZE - 1)) != 0)
@@ -4052,6 +4499,7 @@ static isize sys_munmap(void *addr, usize length) {
       kfree(frames);
   }
 
+  vma_trace_record("munmap", start, end);
   // 2. Update VMA list using the new robust helper
   vma_delete_range(t, start, end);
 
@@ -4190,19 +4638,28 @@ static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
   if (!(flags & MREMAP_MAYMOVE))
     return (u64)-ENOMEM;
 
+  /* Diagnostic: refuse only the move, keeping shrink and grow-in-place.
+   *
+   * b1nix.no-mremap switches off the whole call, which also removes the
+   * mapping churn the caller does instead — so a fault that disappears with it
+   * has two possible homes. This narrows it to the entry-moving path alone:
+   * the caller falls back to allocate-copy-free, which exercises mmap and
+   * munmap just as hard. */
+  if (bootinfo_has_flag("b1nix.mremap-no-move"))
+    return (u64)-ENOMEM;
+
+  /* MAP_NORESERVE: nothing must be allocated into the destination. Every page
+   * of it is either overwritten by the move below or faulted in later by the
+   * caller, so anything installed here is allocated, zeroed and freed again
+   * within the same call. */
   u64 fresh = sys_mmap(0, new_len, (int)vma->prot,
-                       MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+                       MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
   if (mmap_failed(fresh))
     return fresh;
-
-  /* The pages move by having their page-table entries moved, not by being
-   * copied. Copying them read every byte through a 64 KiB kernel buffer and
-   * faulted in every page that had never been touched — for an allocation
-   * grown repeatedly, as chromium's allocator grows its arenas, that is the
-   * whole allocation re-read on every call, with the address-space mutex held
-   * throughout. Moving the entries also preserves what a copy could not: a
-   * lazy or swapped page stays lazy or swapped instead of being materialised.
-   */
+  /* This allocation does not go through the dispatcher, so it would otherwise
+   * be missing from the trace — and it is the very range whose contents are in
+   * question. */
+  vma_trace_record("mremap-dst", fresh, fresh + new_len);
   paging_move_range(old_start, fresh, old_len);
 
   (void)sys_munmap((void *)(usize)old_start, old_len);
@@ -4235,6 +4692,17 @@ static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
 #define VMA_LOCK_SLOTS 16
 static volatile int g_vma_mutex[VMA_LOCK_SLOTS];
 
+/* Who holds each slot.
+ *
+ * A yielding lock that is only ever released by the code that took it is
+ * released by nothing at all when that code's task dies first — and because
+ * the slot is shared by every address space hashing to it, the casualty is not
+ * only that process: every other one that hashes the same way spins in
+ * vma_mutator_lock forever, which is a guest that goes silent with no panic
+ * and no clue. Recording the owner makes the leak both reportable and
+ * repairable: the exit path hands back whatever the task still holds. */
+static struct task *g_vma_mutex_owner[VMA_LOCK_SLOTS];
+
 static unsigned vma_lock_slot(void) {
   u64 space = current_task ? current_task->pml4_phys : 0;
 
@@ -4249,13 +4717,59 @@ static unsigned vma_lock_slot(void) {
  * address space mid-call, and recomputing would then unlock a different one. */
 static unsigned vma_mutator_lock(void) {
   unsigned slot = vma_lock_slot();
+  unsigned long spins = 0;
 
-  while (__sync_lock_test_and_set(&g_vma_mutex[slot], 1))
+  while (__sync_lock_test_and_set(&g_vma_mutex[slot], 1)) {
     scheduler_yield();
+    /* Say who is being waited for, once, before the wait becomes a hang that
+     * has to be diagnosed from the outside. The count is generous: a mutator
+     * can legitimately block on frame reclaim or writeback while holding this,
+     * and yields are cheap. */
+    if (++spins == 2000000ul) {
+      struct task *owner = g_vma_mutex_owner[slot];
+
+      console_write("vma: mutator lock slot ");
+      console_write_dec(slot);
+      console_write(" held for a very long time by ");
+      if (owner) {
+        console_write(owner->name ? owner->name : "?");
+        console_write(" pid ");
+        console_write_dec(owner->id);
+        console_write(" state ");
+        console_write_dec((u64)owner->state);
+      } else {
+        console_write("nobody on record");
+      }
+      console_write("; waiter pid ");
+      console_write_dec(current_task ? current_task->id : 0);
+      console_write("\n");
+    }
+  }
+  g_vma_mutex_owner[slot] = current_task;
   return slot;
 }
 static void vma_mutator_unlock(unsigned slot) {
+  g_vma_mutex_owner[slot] = 0;
   __sync_lock_release(&g_vma_mutex[slot]);
+}
+
+/* Give back any address-space mutex this task still holds.
+ *
+ * Called from the exit path. A task that dies inside mmap — killed by the
+ * group leader's exit_group, or by a fault — would otherwise leave the slot
+ * set forever. */
+void syscall_release_vma_locks(struct task *t) {
+  if (!t)
+    return;
+  for (unsigned i = 0; i < VMA_LOCK_SLOTS; i++) {
+    if (g_vma_mutex_owner[i] != t)
+      continue;
+    g_vma_mutex_owner[i] = 0;
+    __sync_lock_release(&g_vma_mutex[i]);
+    console_write("vma: released a mutator lock left held by a dying task, pid ");
+    console_write_dec(t->id);
+    console_write("\n");
+  }
 }
 
 static isize sys_mprotect(void *addr, usize length, int prot) {
@@ -4985,6 +5499,73 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
   u64 ret = syscall_dispatch_impl_inner(number, arg0, arg1, arg2, arg3, arg4, arg5, frame);
   if (prof_t0)
     syscall_prof_account((u32)number, syscall_prof_now() - prof_t0);
+  /* Which call answered a given errno, when a program reports one and does not
+   * say what it asked. `b1nix.trace-errno=<n>`: an error is a number in a log
+   * message until the call that produced it has a name. */
+  {
+    /* Read from the command line ONCE. Asking bootinfo per system call means
+     * scanning the whole cmdline string on every entry into the kernel, which
+     * is not a diagnostic cost -- it is slow enough to stall the machine. */
+    static u32 trace_errno = (u32)-1;
+    /* Optional pid filter. ENOENT in particular is answered thousands of times
+     * in a normal boot -- every probe for a file that is not there is one --
+     * and printing them all through the serial console changes the timings
+     * being investigated and buries the one line that matters.
+     * `b1nix.trace-errno-pid=<pid>` narrows the trace to a single task; 0 (the
+     * default) keeps every task, as before. */
+    static u32 trace_errno_pid = (u32)-1;
+    if (trace_errno == (u32)-1) {
+      trace_errno = bootinfo_get_u32("b1nix.trace-errno", 0);
+      trace_errno_pid = bootinfo_get_u32("b1nix.trace-errno-pid", 0);
+    }
+    u32 e = trace_errno;
+    if (e) {
+      u32 pid = (unsigned)(current_task ? current_task->id : 0);
+      if (ret == (u64)(-(i64)e) &&
+          (trace_errno_pid == 0 || pid == trace_errno_pid)) {
+        /* The path, where the call has one. "errno 2 from syscall 83" says a
+         * mkdir failed; it does not say which directory, and the directory is
+         * the whole answer. Linux's numbering puts the path in different
+         * arguments for different calls, so the argument is chosen per call
+         * rather than guessed -- a wrong guess would dereference an integer. */
+        const char *upath = 0;
+        switch (number) {
+        case 21:  /* access */
+        case 59:  /* execve */
+        case 83:  /* mkdir */
+        case 84:  /* rmdir */
+        case 87:  /* unlink */
+        case 133: /* mknod */
+        case 161: /* chroot */
+          upath = (const char *)(usize)arg0;
+          break;
+        case 254: /* inotify_add_watch */
+        case 257: /* openat */
+        case 258: /* mkdirat */
+        case 262: /* newfstatat */
+        case 263: /* unlinkat */
+        case 267: /* readlinkat */
+        case 269: /* faccessat */
+          upath = (const char *)(usize)arg1;
+          break;
+        default:
+          break;
+        }
+        char pbuf[128];
+        pbuf[0] = '\0';
+        if (upath && strncpy_from_user(pbuf, upath, sizeof(pbuf)) < 0)
+          pbuf[0] = '\0';
+        char el[224];
+        if (pbuf[0])
+          snprintf(el, sizeof(el), "errno %u from syscall %llu (pid %u) path=%s",
+                   (unsigned)e, (unsigned long long)number, (unsigned)pid, pbuf);
+        else
+          snprintf(el, sizeof(el), "errno %u from syscall %llu (pid %u)",
+                   (unsigned)e, (unsigned long long)number, (unsigned)pid);
+        klog_info(el);
+      }
+    }
+  }
   g_trace_in_call = 0;
 
   if (watch_addr) {
@@ -5234,7 +5815,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return lx;
       }
       /* setitimer(38) / getitimer(36), ITIMER_REAL only — backed by the task
-       * alarm (100 Hz ticks) plus a repeat interval so periodic SIGALRM works
+       * alarm (scheduler ticks) plus a repeat interval so periodic SIGALRM works
        * (busybox ping's send loop). ITIMER_VIRTUAL/PROF are not implemented. */
       if (number == 38 || number == 36) {
         struct lx_itimerval {
@@ -5246,13 +5827,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         if (number == 36) { /* getitimer(which, curr) */
           memset(&itv, 0, sizeof(itv));
           u64 dl = task_alarm_ticks(current_task);
-          if (dl > now) {
-            itv.val_sec = (dl - now) / 100;
-            itv.val_usec = ((dl - now) % 100) * 10000;
-          }
+          if (dl > now)
+            sc_ticks_to_time(dl - now, &itv.val_sec, &itv.val_usec, 1000000ull);
           u64 iv = task_alarm_interval_ticks(current_task);
-          itv.int_sec = iv / 100;
-          itv.int_usec = (iv % 100) * 10000;
+          sc_ticks_to_time(iv, &itv.int_sec, &itv.int_usec, 1000000ull);
           if (arg1 &&
               syscall_copyout((void *)(usize)arg1, &itv, sizeof(itv)) < 0)
             return (u64)-EFAULT;
@@ -5262,19 +5840,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         struct lx_itimerval old;
         memset(&old, 0, sizeof(old));
         u64 odl = task_alarm_ticks(current_task);
-        if (odl > now) {
-          old.val_sec = (odl - now) / 100;
-          old.val_usec = ((odl - now) % 100) * 10000;
-        }
+        if (odl > now)
+          sc_ticks_to_time(odl - now, &old.val_sec, &old.val_usec, 1000000ull);
         u64 oiv = task_alarm_interval_ticks(current_task);
-        old.int_sec = oiv / 100;
-        old.int_usec = (oiv % 100) * 10000;
+        sc_ticks_to_time(oiv, &old.int_sec, &old.int_usec, 1000000ull);
         if (!arg1)
           return (u64)-EFAULT;
         if (syscall_copyin(&itv, (void *)(usize)arg1, sizeof(itv)) < 0)
           return (u64)-EFAULT;
-        u64 val_ticks = itv.val_sec * 100 + itv.val_usec / 10000;
-        u64 int_ticks = itv.int_sec * 100 + itv.int_usec / 10000;
+        u64 val_ticks = sc_time_to_ticks(itv.val_sec, itv.val_usec, 1000000ull);
+        u64 int_ticks = sc_time_to_ticks(itv.int_sec, itv.int_usec, 1000000ull);
         if ((itv.val_sec || itv.val_usec) && val_ticks == 0)
           val_ticks = 1; /* round a sub-tick value up, not to "disarmed" */
         if ((itv.int_sec || itv.int_usec) && int_ticks == 0)
@@ -5528,6 +6103,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_ioctl           16
 #define LX_nanosleep       35
 #define LX_clone3          435
+#define LX_epoll_pwait     281
 #define LX_epoll_pwait2    441
 /* clone3 flags this kernel does not model, in the high word of clone_args. */
 #define LX_CLONE_PIDFD        0x00001000ULL
@@ -5827,34 +6403,73 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           sys_fcntl((int)arg1, B1NIX_F_SETFD, B1NIX_FD_CLOEXEC);
         return (u64)rc;
       }
+      /* epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask, sigsetsize).
+       * The argument layout below epoll_wait is identical, so install the wait
+       * mask and let the table remap run the wait itself. */
+      if (number == LX_epoll_pwait && arg4) {
+        u64 lx_mask = 0;
+        if (syscall_copyin(&lx_mask, (void *)(usize)arg4, sizeof(lx_mask)) < 0)
+          return (u64)-EFAULT;
+        syscall_wait_mask_install(lx_mask);
+      }
       if (number == LX_ppoll) {
-        /* ppoll(fds, nfds, timeout_ts, sigmask, sigsetsize).
-         * Ignore sigmask — just call poll. timeout_ts is a pointer to
-         * struct timespec (seconds + nanoseconds), convert to ms. */
-        int nfds = (int)arg1;
-        u64 timeout_ms = (u64)-1; /* infinite */
-        if (arg2) {
-          /* struct timespec: tv_sec (8 bytes), tv_nsec (8 bytes). */
-          u64 tv_sec = 0, tv_nsec = 0;
-          syscall_copyin(&tv_sec, (void *)(usize)arg2, sizeof(tv_sec));
-          syscall_copyin(&tv_nsec, (void *)(usize)(arg2 + 8), sizeof(tv_nsec));
-          timeout_ms = tv_sec * 1000 + tv_nsec / 1000000;
+        /* ppoll(fds, nfds, timeout_ts, sigmask, sigsetsize). timeout_ts is a
+         * pointer to struct timespec (seconds + nanoseconds), convert to ms. */
+        if (arg3) {
+          u64 lx_mask = 0;
+          if (syscall_copyin(&lx_mask, (void *)(usize)arg3, sizeof(lx_mask)) < 0)
+            return (u64)-EFAULT;
+          syscall_wait_mask_install(lx_mask);
         }
-        return (u64)sys_poll((void *)(usize)arg0, nfds, (int)timeout_ms);
+        int nfds = (int)arg1;
+        /* struct timespec: tv_sec (8 bytes), tv_nsec (8 bytes). Kept in
+         * nanoseconds — rounding it to milliseconds turned a sub-millisecond
+         * wait into a spin or stretched it to a full tick. */
+        if (!arg2)
+          return (u64)sys_poll_ns((void *)(usize)arg0, nfds, 0, 1);
+        u64 tv_sec = 0, tv_nsec = 0;
+        if (syscall_copyin(&tv_sec, (void *)(usize)arg2, sizeof(tv_sec)) < 0 ||
+            syscall_copyin(&tv_nsec, (void *)(usize)(arg2 + 8),
+                           sizeof(tv_nsec)) < 0)
+          return (u64)-EFAULT;
+        if ((i64)tv_sec < 0 || (i64)tv_nsec < 0 || tv_nsec >= 1000000000ull)
+          return (u64)-EINVAL;
+        return (u64)sys_poll_ns((void *)(usize)arg0, nfds,
+                                tv_sec * 1000000000ull + tv_nsec, 0);
       }
       if (number == LX_pselect6) {
         /* pselect6(nfds, readfds, writefds, exceptfds, timeout_ts, sigmask).
-         * Ignore sigmask — convert fd_sets to pollfds and use the poll loop.
-         * timeout_ts is a pointer to struct timespec, convert to ms. */
+         * Convert fd_sets to pollfds and use the poll loop; timeout_ts is a
+         * pointer to struct timespec, kept in nanoseconds. The last argument is not
+         * the mask itself but a pointer to {const sigset_t *, size_t} — Linux
+         * ran out of register arguments and boxed the pair. */
+        if (arg5) {
+          struct { u64 ss; u64 len; } box = {0, 0};
+          if (syscall_copyin(&box, (void *)(usize)arg5, sizeof(box)) < 0)
+            return (u64)-EFAULT;
+          if (box.ss) {
+            u64 lx_mask = 0;
+            if (syscall_copyin(&lx_mask, (void *)(usize)box.ss,
+                               sizeof(lx_mask)) < 0)
+              return (u64)-EFAULT;
+            syscall_wait_mask_install(lx_mask);
+          }
+        }
         int nfds = (int)arg0;
         if (nfds < 0 || nfds > 1024)
           return (u64)-EINVAL;
-        u64 timeout_ms = (u64)-1;
+        int ps_infinite = 1;
+        u64 ps_timeout_ns = 0;
         if (arg4) {
           u64 tv_sec = 0, tv_nsec = 0;
-          syscall_copyin(&tv_sec, (void *)(usize)arg4, sizeof(tv_sec));
-          syscall_copyin(&tv_nsec, (void *)(usize)(arg4 + 8), sizeof(tv_nsec));
-          timeout_ms = tv_sec * 1000 + tv_nsec / 1000000;
+          if (syscall_copyin(&tv_sec, (void *)(usize)arg4, sizeof(tv_sec)) < 0 ||
+              syscall_copyin(&tv_nsec, (void *)(usize)(arg4 + 8),
+                             sizeof(tv_nsec)) < 0)
+            return (u64)-EFAULT;
+          if ((i64)tv_sec < 0 || (i64)tv_nsec < 0 || tv_nsec >= 1000000000ull)
+            return (u64)-EINVAL;
+          ps_infinite = 0;
+          ps_timeout_ns = tv_sec * 1000000000ull + tv_nsec;
         }
         u8 r_kset[128] = {0}, w_kset[128] = {0}, e_kset[128] = {0};
         if (arg1 && syscall_copyin(r_kset, (void *)(usize)arg1, 128) < 0)
@@ -5877,12 +6492,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           pfds[np].revents = 0;
           np++;
         }
-        /* Use the same inline poll loop as SYS_SELECT. */
-        u64 start_ticks = scheduler_get_uptime_ticks();
-        u64 timeout_ticks = timeout_ms == (u64)-1 ? (u64)-1 : timeout_ms / 10;
-        if (timeout_ms != (u64)-1 && timeout_ms != 0) {
-          u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
-          current_task->wake_tick = start_ticks + ticks;
+        /* Use the same inline poll loop as SYS_SELECT, on the same nanosecond
+         * deadline sys_poll_ns uses. */
+        u64 ps_tick_ns = 1000000000ull / (u64)sched_tick_hz();
+        u64 ps_deadline_ns =
+            ps_infinite ? 0 : arch_tsc_monotonic_ns() + ps_timeout_ns;
+        if (!ps_infinite && ps_timeout_ns != 0) {
+          u64 ticks = (ps_timeout_ns + ps_tick_ns - 1) / ps_tick_ns;
+          if (ticks == 0)
+            ticks = 1;
+          current_task->wake_tick = scheduler_get_uptime_ticks() + ticks;
         }
         extern void *vfs_poll_chan;
         int ready_count = 0;
@@ -5898,11 +6517,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
             if (pfds[i].revents) ready_count++;
           }
           int timed_out = 0;
-          if (ready_count == 0 && timeout_ms != 0 && timeout_ms != (u64)-1) {
-            u64 now = scheduler_get_uptime_ticks();
-            if (now - start_ticks >= timeout_ticks) timed_out = 1;
-          }
-          if (ready_count > 0 || timeout_ms == 0 || timed_out) {
+          if (ready_count == 0 && !ps_infinite && ps_timeout_ns != 0 &&
+              arch_tsc_monotonic_ns() >= ps_deadline_ns)
+            timed_out = 1;
+          if (ready_count > 0 || (!ps_infinite && ps_timeout_ns == 0) ||
+              timed_out) {
             scheduler_wait_cancel();
             break;
           }
@@ -5912,9 +6531,14 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           }
           /* Re-arm every iteration — an explicit wake clears wake_tick (see
            * sys_poll for the full unbounded-sleep failure this prevents). */
-          if (timeout_ms != (u64)-1 && timeout_ms != 0) {
-            u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
-            current_task->wake_tick = start_ticks + ticks;
+          if (!ps_infinite && ps_timeout_ns != 0) {
+            u64 now_ns = arch_tsc_monotonic_ns();
+            u64 rest_ns =
+                ps_deadline_ns > now_ns ? ps_deadline_ns - now_ns : 0;
+            u64 ticks = (rest_ns + ps_tick_ns - 1) / ps_tick_ns;
+            if (ticks == 0)
+              ticks = 1;
+            current_task->wake_tick = scheduler_get_uptime_ticks() + ticks;
           }
           scheduler_block_on(vfs_poll_chan);
         }
@@ -5973,9 +6597,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         struct timespec ts;
         if (syscall_copyin(&ts, (const void *)(usize)arg2, sizeof(ts)) != 0)
           return (u64)-EFAULT;
-        u64 ticks = (u64)ts.tv_sec * 100 + (u64)ts.tv_nsec / 10000000;
-        if (ticks == 0) ticks = 1;
-        scheduler_sleep_ticks(ticks);
+        (void)syscall_sleep_timespec(&ts, 0);
         return 0;
       }
       if (number == LX_nanosleep) {
@@ -5989,9 +6611,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           return (u64)-EFAULT;
         if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
           return (u64)-EINVAL;
-        u64 ticks = (u64)ts.tv_sec * 100 + (u64)ts.tv_nsec / 10000000;
-        if (ticks == 0) ticks = 1;
-        scheduler_sleep_ticks(ticks);
+        (void)syscall_sleep_timespec(&ts, 0);
         if (arg1) {
           struct timespec rem = {0, 0};
           if (syscall_copyout((void *)(usize)arg1, &rem, sizeof(rem)) != 0)
@@ -6261,7 +6881,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                 if (op & 256) {
                   now_ms = vfs_get_unix_time() * 1000;
                 } else {
-                  now_ms = scheduler_get_uptime_ticks() * 10;
+                  now_ms = scheduler_get_uptime_ticks() * (1000ull / sched_tick_hz());
                 }
                 if (req_ms > now_ms)
                   timeout_ms = req_ms - now_ms;
@@ -6296,6 +6916,86 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           int woken = scheduler_futex_requeue(arg0, arg4, (int)arg2, (int)arg3,
                                               futex_priv ? 1 : 0);
 
+          return (u64)woken;
+        }
+        /* FUTEX_WAKE_OP(5): change a word, then wake on one or both queues.
+         *
+         * One call does what a release of two coupled objects otherwise needs
+         * two of: it applies an arithmetic operation to *uaddr2, wakes up to
+         * `val` waiters on uaddr, and — if the value uaddr2 HELD BEFORE the
+         * operation satisfies a comparison — wakes up to `val2` waiters on
+         * uaddr2 as well. Qt's semaphores and its read/write locks are built on
+         * it, and refusing the op leaves the waiter parked forever: the release
+         * that was supposed to reach it reports an error the caller ignores,
+         * because on every other system the call cannot fail that way. That is
+         * why kwin_wayland stopped dead in a futex with nothing able to wake
+         * it, on a plugin scan that touches no hardware at all.
+         *
+         * val3 packs the whole instruction, as Linux defines it:
+         *   bits 28-31  operation (SET/ADD/OR/ANDN/XOR), bit 3 = shift oparg
+         *   bits 24-27  comparison (EQ/NE/LT/LE/GT/GE)
+         *   bits 12-23  operand
+         *   bits  0-11  comparison argument
+         */
+        if (base_op == 5) {
+          u32 encoded = (u32)arg5;
+          unsigned fop = (encoded >> 28) & 0xf;
+          unsigned fcmp = (encoded >> 24) & 0xf;
+          int oparg = (int)((encoded >> 12) & 0xfff);
+          int cmparg = (int)(encoded & 0xfff);
+          int oldval = 0, newval = 0, woken = 0;
+
+          /* A twelve-bit field is signed in Linux's reading of it. */
+          if (oparg & 0x800)
+            oparg |= ~0xfff;
+          if (cmparg & 0x800)
+            cmparg |= ~0xfff;
+          if (fop & 8) { /* FUTEX_OP_OPARG_SHIFT */
+            fop &= 7;
+            if (oparg < 0 || oparg > 31)
+              return (u64)-EINVAL;
+            oparg = 1 << oparg;
+          }
+
+          if (!arg4 || syscall_copyin(&oldval, (void *)(usize)arg4,
+                                      sizeof(oldval)) < 0)
+            return (u64)-EFAULT;
+          switch (fop) {
+          case 0: newval = oparg; break;              /* SET  */
+          case 1: newval = oldval + oparg; break;     /* ADD  */
+          case 2: newval = oldval | oparg; break;     /* OR   */
+          case 3: newval = oldval & ~oparg; break;    /* ANDN */
+          case 4: newval = oldval ^ oparg; break;     /* XOR  */
+          default: return (u64)-ENOSYS;
+          }
+          if (syscall_copyout((void *)(usize)arg4, &newval, sizeof(newval)) < 0)
+            return (u64)-EFAULT;
+
+          woken = scheduler_futex(arg0, B1NIX_FUTEX_WAKE | futex_priv,
+                                  (int)arg2, 0);
+          if (woken < 0)
+            woken = 0;
+
+          {
+            int fire = 0;
+
+            switch (fcmp) {
+            case 0: fire = (oldval == cmparg); break; /* EQ */
+            case 1: fire = (oldval != cmparg); break; /* NE */
+            case 2: fire = (oldval <  cmparg); break; /* LT */
+            case 3: fire = (oldval <= cmparg); break; /* LE */
+            case 4: fire = (oldval >  cmparg); break; /* GT */
+            case 5: fire = (oldval >= cmparg); break; /* GE */
+            default: return (u64)-ENOSYS;
+            }
+            if (fire) {
+              int more = scheduler_futex(arg4, B1NIX_FUTEX_WAKE | futex_priv,
+                                         (int)arg3, 0);
+
+              if (more > 0)
+                woken += more;
+            }
+          }
           return (u64)woken;
         }
         /* The priority-inheritance family: FUTEX_LOCK_PI(6),
@@ -6850,7 +7550,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       if (number == 148) { /* sched_rr_get_interval(pid, timespec) */
         if (!arg1)
           return (u64)-EFAULT;
-        struct timespec ts = {0, 10000000}; /* one 100 Hz tick */
+        /* One scheduler tick — the real one, not a written-out 10 ms. */
+        struct timespec ts = {0, (i64)(1000000000ULL / sc_tick_hz())};
         return syscall_copyout((void *)(usize)arg1, &ts, sizeof(ts)) == 0
                    ? 0
                    : (u64)-EFAULT;
@@ -7993,22 +8694,24 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)-EFAULT;
     if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
       return (u64)-EINVAL;
-    u64 ticks = (u64)ts.tv_sec * 100 + (u64)ts.tv_nsec / 10000000;
-    if (ticks == 0) ticks = 1;
-    u64 sleep_start = scheduler_get_uptime_ticks();
-    scheduler_sleep_ticks(ticks);
+    u64 ticks = 0;
+    u64 tick_ns = 1000000000ULL / (u64)sched_tick_hz();
+    u64 slept_ticks = syscall_sleep_timespec(&ts, &ticks);
+    u64 sleep_start = 0;
+
+    (void)sleep_start;
     /* Interrupted, not finished. A sleep cut short by a signal must say so,
      * with the time left in `rem` — a caller told the sleep completed simply
      * carries on, and one told nothing about the remainder cannot resume it.
      * Programs park here with timeouts of years precisely because a signal is
      * what they expect to end the wait. */
-    u64 slept = scheduler_get_uptime_ticks() - sleep_start;
-    int interrupted = slept < ticks && scheduler_signal_pending_any();
+    int interrupted = slept_ticks < ticks && scheduler_signal_pending_any();
+    u64 slept = slept_ticks;
     if (arg1) {
       u64 left = interrupted ? (ticks - slept) : 0;
       struct timespec rem;
-      rem.tv_sec = (i64)(left / 100);
-      rem.tv_nsec = (i64)((left % 100) * 10000000);
+      rem.tv_sec = (i64)(left / (u64)sched_tick_hz());
+      rem.tv_nsec = (i64)((left % (u64)sched_tick_hz()) * tick_ns);
       if (syscall_copyout((void *)(usize)arg1, &rem, sizeof(rem)) != 0)
         return (u64)-EFAULT;
     }
@@ -8137,16 +8840,20 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   }
   case SYS_TIMER_SETTIME: {
     /* timer_settime(id, flags, const itimerspec*, itimerspec*). Times convert to
-     * 100 Hz ticks; it_value all-zero disarms. TIMER_ABSTIME (flags&1) is treated
-     * relative (the smoke uses relative arming). */
+     * ticks at the rate the timer was programmed with (see sc_time_to_ticks --
+     * a hardcoded 100 here made every POSIX timer fire ten times early);
+     * it_value all-zero disarms. TIMER_ABSTIME (flags&1) is treated relative
+     * (the smoke uses relative arming). */
     struct k_timespec { i64 tv_sec; i64 tv_nsec; };
     struct k_itimerspec { struct k_timespec it_interval; struct k_timespec it_value; } its;
     if (!arg2)
       return (u64)-EINVAL;
     if (syscall_copyin(&its, (void *)(usize)arg2, sizeof(its)) < 0)
       return (u64)-EFAULT;
-    u64 first = (u64)its.it_value.tv_sec * 100 + (u64)its.it_value.tv_nsec / 10000000;
-    u64 interval = (u64)its.it_interval.tv_sec * 100 + (u64)its.it_interval.tv_nsec / 10000000;
+    u64 first = sc_time_to_ticks((u64)its.it_value.tv_sec,
+                                 (u64)its.it_value.tv_nsec, 1000000000ull);
+    u64 interval = sc_time_to_ticks((u64)its.it_interval.tv_sec,
+                                    (u64)its.it_interval.tv_nsec, 1000000000ull);
     /* A non-zero requested time shorter than one tick still arms (1 tick). */
     if (first == 0 && (its.it_value.tv_sec || its.it_value.tv_nsec))
       first = 1;
@@ -8158,10 +8865,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)rc;
     if (arg3) {
       struct k_itimerspec old;
-      old.it_value.tv_sec = (i64)(old_rem / 100);
-      old.it_value.tv_nsec = (i64)((old_rem % 100) * 10000000);
-      old.it_interval.tv_sec = (i64)(old_int / 100);
-      old.it_interval.tv_nsec = (i64)((old_int % 100) * 10000000);
+      u64 osec = 0, onsec = 0;
+      sc_ticks_to_time(old_rem, &osec, &onsec, 1000000000ull);
+      old.it_value.tv_sec = (i64)osec;
+      old.it_value.tv_nsec = (i64)onsec;
+      sc_ticks_to_time(old_int, &osec, &onsec, 1000000000ull);
+      old.it_interval.tv_sec = (i64)osec;
+      old.it_interval.tv_nsec = (i64)onsec;
       if (syscall_copyout((void *)(usize)arg3, &old, sizeof(old)) < 0)
         return (u64)-EFAULT;
     }
@@ -8174,10 +8884,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     int rc = scheduler_timer_gettime((int)arg0, &rem, &interval);
     if (rc < 0)
       return (u64)rc;
-    its.it_value.tv_sec = (i64)(rem / 100);
-    its.it_value.tv_nsec = (i64)((rem % 100) * 10000000);
-    its.it_interval.tv_sec = (i64)(interval / 100);
-    its.it_interval.tv_nsec = (i64)((interval % 100) * 10000000);
+    u64 gsec = 0, gnsec = 0;
+    sc_ticks_to_time(rem, &gsec, &gnsec, 1000000000ull);
+    its.it_value.tv_sec = (i64)gsec;
+    its.it_value.tv_nsec = (i64)gnsec;
+    sc_ticks_to_time(interval, &gsec, &gnsec, 1000000000ull);
+    its.it_interval.tv_sec = (i64)gsec;
+    its.it_interval.tv_nsec = (i64)gnsec;
     if (!arg1 || syscall_copyout((void *)(usize)arg1, &its, sizeof(its)) < 0)
       return (u64)-EFAULT;
     return 0;
@@ -8253,6 +8966,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     u64 r = sys_mmap((void *)(usize)arg0, (usize)arg1, (int)arg2, (int)arg3,
                      (int)arg4, (isize)arg5);
     vma_mutator_unlock(vma_slot);
+    if (!mmap_failed(r))
+      vma_trace_record("mmap", r, r + ((arg1 + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)));
     return r;
   }
   case SYS_MUNMAP: {
@@ -8463,12 +9178,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     if (option == 28)
       return (u64)cred_set_securebits(scheduler_get_current_cred(), (u32)arg1);
     /* PR_SET_TIMERSLACK (29) / PR_GET_TIMERSLACK (30). The scheduler wakes on
-     * the 100 Hz tick, so the slack a caller can choose is already the tick;
-     * report that rather than a number nothing honours. */
+     * the tick, so the slack a caller can choose is already the tick; report
+     * that rather than a number nothing honours -- and report the tick this
+     * kernel actually runs at, not the one it used to. */
     if (option == 29)
       return 0;
     if (option == 30)
-      return (u64)(1000000000ULL / 100);
+      return (u64)(1000000000ULL / sc_tick_hz());
     return (u64)-EINVAL; /* other prctl options unsupported */
   }
   case SYS_MEM:
@@ -8797,6 +9513,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_UMOUNT:
     return (u64)sys_umount((const char *)(usize)arg0);
 
+  case SYS_READAHEAD:
+    return (u64)sys_readahead((int)arg0, arg1, (usize)arg2);
+
   case SYS_PIVOT_ROOT:
     return (u64)sys_pivot_root((const char *)(usize)arg0,
                                (const char *)(usize)arg1);
@@ -8870,8 +9589,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         ktp.tv_sec = (i64)(mono_ns / 1000000000ull);
         ktp.tv_nsec = (i64)(mono_ns % 1000000000ull);
       } else {
-        ktp.tv_sec = (i64)(ticks / 100);
-        ktp.tv_nsec = (i64)((ticks % 100) * 10000000);
+        u64 tsec = 0, tnsec = 0;
+        sc_ticks_to_time(ticks, &tsec, &tnsec, 1000000000ull);
+        ktp.tv_sec = (i64)tsec;
+        ktp.tv_nsec = (i64)tnsec;
       }
     } else {
       /* CLOCK_REALTIME / CLOCK_REALTIME_COARSE: epoch-based wall clock, taken
@@ -9088,7 +9809,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     u64 start_ticks = scheduler_get_uptime_ticks();
     u64 timeout_ms = arg4;
     u64 timeout_ticks =
-        (timeout_ms == (u64)-1) ? (u64)-1 : timeout_ms / 10;
+        (timeout_ms == (u64)-1)
+            ? (u64)-1
+            : (timeout_ms + (1000ull / sched_tick_hz()) - 1) /
+                  (1000ull / sched_tick_hz());
 
     if (timeout_ms != (u64)-1 && timeout_ms != 0) {
       u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;

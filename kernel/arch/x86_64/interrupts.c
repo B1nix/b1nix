@@ -1128,6 +1128,16 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
                                                   : "<anonymous>");
         console_write("\n");
       }
+      /* And whether any two of those mappings are the same memory.
+       *
+       * Pixels from a client's buffer turned up inside the compositor's heap,
+       * which cannot happen unless one physical page is reachable twice. The
+       * map above shows what the process asked for; this says what it got. */
+      if (bootinfo_has_flag("b1nix.frame-alias")) {
+        extern void vmm_report_frame_aliases(struct task *t);
+        if (ft)
+          vmm_report_frame_aliases(ft);
+      }
     }
 
     console_write("\nuserspace stack dump (rsp=0x");
@@ -1297,6 +1307,8 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     }
 
     if (has_handler && !is_blocked) {
+      if (bootinfo_has_flag("b1nix.user-bt"))
+        arch_user_backtrace(frame);
       console_write("delivering signal ");
       console_write_dec(sig);
       console_write(" to handler in pid ");
@@ -1328,6 +1340,7 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     };
     const char *sname = (sig > 0 && sig < (int)(sizeof(sig_name)/sizeof(*sig_name)))
                           ? sig_name[sig] : "?";
+    arch_user_backtrace(frame);
     console_write("[FATAL] task '");
     console_write(current_task && current_task->name ? current_task->name : "?");
     console_write("' (pid ");
@@ -1351,6 +1364,40 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
       console_write_hex64(cr2);
       console_write(" pte=0x");
       console_write_hex64(vmm_query_leaf_pte(cr2 & ~(u64)0xfff));
+      /* And what the CPU actually objected to. A present page that refused a
+       * write and a page that was not there are the same signal and different
+       * bugs, and the entry alone cannot tell them apart — the error code is
+       * the half that says which. */
+      console_write(" err=0x");
+      console_write_hex64(frame->error_code);
+      console_write(" (");
+      console_write((frame->error_code & 1) ? "protection" : "not-present");
+      console_write((frame->error_code & 2) ? ", write" : ", read");
+      console_write((frame->error_code & 4) ? ", user" : ", kernel");
+      if (frame->error_code & 16)
+        console_write(", fetch");
+      console_write(")");
+      /* And why the demand-paging path declined it.
+       *
+       * The error code says what the CPU objected to; it does not say what the
+       * kernel decided afterwards. A page marked lazy that never materialises
+       * and an address with no VMA behind it produce the identical line, and
+       * they are different bugs. The handler already records its reason for
+       * every fault -- printing it here costs nothing on a boot that does not
+       * fault fatally, and saves a rebuild on one that does. */
+      {
+        int leaf_seen = 0;
+        u64 leaf_val = 0;
+        const char *why = 0;
+
+        paging_last_fault_leaf(&leaf_seen, &leaf_val, &why);
+        console_write(" handler=");
+        console_write(why ? why : "(none)");
+        console_write(" leaf_seen=");
+        console_write_dec((u64)leaf_seen);
+        console_write(" leaf=0x");
+        console_write_hex64(leaf_val);
+      }
     }
     console_write(" — terminating\n");
     /* M35: dump an ELF core for the fault-generating signals before the task
@@ -1490,4 +1537,129 @@ void arch_backtrace(u64 rbp, u64 rip) {
     console_write("  (no frames)");
 
   console_write("\n--- End Backtrace ---\n");
+}
+
+/* ── User-mode backtrace ────────────────────────────────────────────────────
+ * A ring-3 crash reports one address: the instruction that faulted. That names
+ * the victim, never the culprit — a detected stack smash faults inside the C
+ * library's __stack_chk_fail, and the function whose canary was overwritten is
+ * one frame further up. Scan the crashing thread's own stack for words that
+ * land in an executable mapping and attribute each to the module it belongs
+ * to. The offset printed is the address's offset within the named file, which
+ * is what llvm-addr2line wants for a position-independent object.
+ *
+ * Everything here reads user memory through syscall_copyin (which validates
+ * the pointer) and never dereferences a user address directly, so a fault
+ * inside the report cannot mask the fault being reported. */
+int syscall_copyin(void *dst, const void *user_src, unsigned long size);
+
+#define USER_BT_STACK_WORDS 192
+#define USER_BT_MAX_FRAMES  24
+
+/* Name the mapping an address falls in, and its offset within it. Returns 0
+ * when the address is not in an executable user mapping — i.e. it is not a
+ * return address, just stack data. */
+static const char *user_module_at(struct task *t, u64 addr, u64 *off) {
+  if (!t)
+    return 0;
+  for (struct vm_area *v = t->vma_list; v; v = v->next) {
+    if (addr < v->start || addr >= v->end)
+      continue;
+    if (!(v->prot & 0x4))
+      return 0; /* mapped, but not code */
+    if (v->node && v->node->name[0]) {
+      *off = (u64)v->offset + (addr - v->start);
+      return v->node->name;
+    }
+    break;
+  }
+  /* The executable's and the interpreter's own segments are mapped by the
+   * kernel loader and carry no backing node, so they have to be named from
+   * the image the way /proc/<pid>/maps names them. */
+  struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
+  if (!img)
+    return 0;
+  for (usize k = 0; k < img->segment_count; k++) {
+    const struct user_image_segment *seg = &img->segments[k];
+    if (!seg->memsz)
+      continue;
+    if (addr < seg->vaddr || addr >= seg->vaddr + seg->memsz)
+      continue;
+    if (img->interp_base && seg->vaddr >= img->interp_base &&
+        img->interp_path[0]) {
+      *off = addr - img->interp_base;
+      return img->interp_path;
+    }
+    *off = seg->file_offset + (addr - seg->vaddr);
+    return img->path ? img->path : "[exe]";
+  }
+  return 0;
+}
+
+static void user_bt_line(const char *tag, int idx, u64 addr, struct task *t) {
+  u64 off = 0;
+  const char *mod = user_module_at(t, addr, &off);
+  if (!mod)
+    return;
+  console_write("  ");
+  console_write(tag);
+  if (idx >= 0) {
+    console_write("[");
+    console_write_dec((usize)idx);
+    console_write("]");
+  }
+  console_write(" 0x");
+  console_write_hex64(addr);
+  console_write(" ");
+  console_write(mod);
+  console_write("+0x");
+  console_write_hex64(off);
+  console_write("\n");
+}
+
+/* Print what ring 3 was doing when it faulted: the faulting instruction, then
+ * every plausible return address still on its stack, innermost first. */
+void arch_user_backtrace(struct interrupt_frame *frame) {
+  struct task *t = current_task;
+  if (!t || !frame)
+    return;
+
+  console_write("--- User Backtrace (");
+  console_write(t->name ? t->name : "?");
+  console_write(" pid ");
+  console_write_dec(scheduler_get_pid());
+  console_write(") ---\n");
+
+  user_bt_line("rip", -1, frame->rip, t);
+  /* The raw words too: an address that resolves to nothing is still evidence
+   * (a canary, a length, a poison value), and a report that silently drops
+   * them cannot be re-read later for something it was not looking for. */
+  console_write("  rsp=0x");
+  console_write_hex64(frame->rsp);
+  console_write(":");
+  for (int i = 0; i < 8; i++) {
+    u64 word = 0;
+    if (syscall_copyin(&word, (const void *)(frame->rsp + (u64)i * 8), 8) != 0)
+      break;
+    console_write(" ");
+    console_write_hex64(word);
+  }
+  console_write("\n");
+  /* The return address of the call that faulted sits at the top of the stack
+   * when the callee has not pushed a frame yet — which is exactly the case for
+   * __stack_chk_fail. */
+  int frames = 0;
+  for (int i = 0; i < USER_BT_STACK_WORDS && frames < USER_BT_MAX_FRAMES; i++) {
+    u64 word = 0;
+    if (syscall_copyin(&word, (const void *)(frame->rsp + (u64)i * 8), 8) != 0)
+      break;
+    u64 off = 0;
+    if (!user_module_at(t, word, &off))
+      continue;
+    user_bt_line("ret", frames, word, t);
+    frames++;
+  }
+  if (frames == 0)
+    console_write("  (no return addresses on the stack)\n");
+  console_write("--- End User Backtrace ---\n");
 }

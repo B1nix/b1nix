@@ -283,6 +283,11 @@ enum {
 	 * and nsenter(1) run on. */
 	SYS_UNSHARE          = 258, /* unshare(flags) */
 	SYS_SETNS            = 259, /* setns(fd, nstype) */
+	/* readahead(fd, offset, count): pull a file's blocks into the page cache
+	 * before anything asks for them. Real work, not a hint we ignore -- the
+	 * block layer already reads ahead internally, and this is the same thing
+	 * asked for explicitly by a program that knows what it is about to read. */
+	SYS_READAHEAD        = 260,
 };
 
 /* Aliases: linux_abi.c references these generic names; map to the versioned ones. */

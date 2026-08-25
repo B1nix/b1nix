@@ -8,6 +8,9 @@
 #include <b1nix/console.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+#include <b1nix/sysfs_attr.h>
+#include <b1nix/uevent.h>
+#include <b1nix/errno.h>
 #include <string.h>
 
 #define PCI_CONFIG_ADDRESS 0xCF8
@@ -1360,4 +1363,212 @@ void pci_selftest(void)
 	pci_selftest_msi();
 	pci_selftest_stolen();
 	pci_selftest_stolen_decode();
+}
+
+/* ── /sys/devices/pci0000:00 ────────────────────────────────────────────────
+ *
+ * The bus topology, published for every function the enumeration finds.
+ *
+ * Until now the only PCI nodes in /sys were the ones the DRM layer created for
+ * its own cards, and when it had no identity to publish it filled the
+ * attributes with an Intel id it had written into the source. Everything else
+ * on the bus had no node at all, so /sys/devices held `system` and nothing
+ * else. That has two consequences beyond graphics. libdrm's drmGetDevice2()
+ * reads /sys/dev/char/226:N/device to find the bus a node sits on and can
+ * answer nothing without it; and udev's whole model is a device with a parent
+ * chain to match rules against, so a device with no parent has no subsystem
+ * chain and no rule can select it.
+ *
+ * Every value here is read out of config space at the moment of publishing.
+ * Nothing is defaulted: a function that is not present is not published, and
+ * an attribute whose register we do not read does not appear. In particular
+ * there is NO `driver` link, because this kernel does not record a binding
+ * between a PCI function and the code driving it -- and a `driver` link is
+ * read as a statement that something has claimed the device.
+ */
+static isize pci_sysfs_text_show(void *ctx, char *buf, usize cap) {
+	const char *text = (const char *)ctx;
+	usize n = 0;
+
+	while (text[n] && n + 1 < cap) { buf[n] = text[n]; n++; }
+	buf[n] = 0;
+	return (isize)n;
+}
+
+static void pci_sysfs_text_free(void *ctx) { kfree(ctx); }
+
+/* `uevent` is writable on Linux, and `udevadm trigger` uses that: it walks
+ * /sys/bus/pci/devices and writes "add" to each one to re-announce it. With the
+ * file read-only every device answered `Failed to write 'add' to
+ * .../uevent: Permission denied`, so a coldplug replay reached none of them.
+ *
+ * The write really re-announces the device -- accepting it and doing nothing
+ * would be the "writable file that silently discards writes" the sysfs
+ * registry's own contract warns against. The slot name is carried in the
+ * context so the handler knows which function it speaks for. */
+struct pci_sysfs_uevent {
+	char devpath[64];
+	char text[224];
+};
+
+static isize pci_sysfs_uevent_show(void *ctx, char *buf, usize cap) {
+	struct pci_sysfs_uevent *u = (struct pci_sysfs_uevent *)ctx;
+
+	return pci_sysfs_text_show(u ? u->text : "", buf, cap);
+}
+
+static isize pci_sysfs_uevent_store(void *ctx, const char *buf, usize len) {
+	struct pci_sysfs_uevent *u = (struct pci_sysfs_uevent *)ctx;
+	char action[16];
+	usize n = 0;
+
+	if (!u || !buf)
+		return -EINVAL;
+	while (n < len && n < sizeof(action) - 1 && buf[n] != ' ' &&
+	       buf[n] != '\n' && buf[n] != '\0')
+		n++;
+	memcpy(action, buf, n);
+	action[n] = '\0';
+
+	static const char *const known[] = {"add",    "remove", "change",
+	                                    "move",   "online", "offline",
+	                                    "bind",   "unbind"};
+	int ok = 0;
+	for (usize i = 0; i < sizeof(known) / sizeof(known[0]); i++)
+		if (strcmp(action, known[i]) == 0) { ok = 1; break; }
+	if (!ok)
+		return -EINVAL;
+
+	/* No device node behind a PCI function: no DEVNAME, no major/minor. */
+	uevent_post(action, u->devpath, "pci", 0, -1, -1);
+	return (isize)len;
+}
+
+static void pci_sysfs_attr(struct sysfs_dir *dir, const char *name,
+                           const char *value) {
+	usize len = strlen(value) + 1;
+	char *text = kmalloc(len);
+
+	if (!text)
+		return;
+	memcpy(text, value, len);
+	if (sysfs_reg_attr(dir, name, 0444, pci_sysfs_text_show, 0, text,
+	                   pci_sysfs_text_free) != 0)
+		kfree(text);
+}
+
+static void pci_sysfs_publish_one(u8 bus, u8 slot, u8 func) {
+	char slotname[20], buf[224];
+
+	u16 vendor = pci_config_read16(bus, slot, func, 0x00);
+	u16 device = pci_config_read16(bus, slot, func, 0x02);
+	u8 revision = pci_config_read8(bus, slot, func, 0x08);
+	u8 prog_if = pci_config_read8(bus, slot, func, 0x09);
+	u8 subclass = pci_config_read8(bus, slot, func, 0x0A);
+	u8 class_code = pci_config_read8(bus, slot, func, 0x0B);
+	u8 header_type = pci_config_read8(bus, slot, func, 0x0E) & 0x7F;
+	u8 irq = pci_config_read8(bus, slot, func, 0x3C);
+	u32 classfull = ((u32)class_code << 16) | ((u32)subclass << 8) | prog_if;
+
+	/* The subsystem id registers only exist on a type 0 (endpoint) header. A
+	 * bridge's 0x2C is its secondary bus numbers, so reading it as a subsystem
+	 * vendor would publish a number that means something else entirely. */
+	int has_subsys = (header_type == 0x00);
+	u16 subv = has_subsys ? pci_config_read16(bus, slot, func, 0x2C) : 0;
+	u16 subd = has_subsys ? pci_config_read16(bus, slot, func, 0x2E) : 0;
+
+	snprintf(slotname, sizeof(slotname), "%04x:%02x:%02x.%u", 0,
+	         (unsigned)bus, (unsigned)slot, (unsigned)func);
+
+	struct sysfs_dir *devices = sysfs_reg_dir(0, "devices");
+	struct sysfs_dir *root = sysfs_reg_dir(devices, "pci0000:00");
+	struct sysfs_dir *dev = sysfs_reg_dir(root, slotname);
+
+	if (!dev)
+		return;
+	/* Already published (the DRM layer may have created it first). */
+	if (sysfs_reg_find(dev, "vendor"))
+		return;
+
+	snprintf(buf, sizeof(buf), "0x%04x\n", (unsigned)vendor);
+	pci_sysfs_attr(dev, "vendor", buf);
+	snprintf(buf, sizeof(buf), "0x%04x\n", (unsigned)device);
+	pci_sysfs_attr(dev, "device", buf);
+	snprintf(buf, sizeof(buf), "0x%06x\n", (unsigned)classfull);
+	pci_sysfs_attr(dev, "class", buf);
+	snprintf(buf, sizeof(buf), "0x%02x\n", (unsigned)revision);
+	pci_sysfs_attr(dev, "revision", buf);
+	snprintf(buf, sizeof(buf), "%u\n", (unsigned)irq);
+	pci_sysfs_attr(dev, "irq", buf);
+	if (has_subsys) {
+		snprintf(buf, sizeof(buf), "0x%04x\n", (unsigned)subv);
+		pci_sysfs_attr(dev, "subsystem_vendor", buf);
+		snprintf(buf, sizeof(buf), "0x%04x\n", (unsigned)subd);
+		pci_sysfs_attr(dev, "subsystem_device", buf);
+	}
+
+	/* Linux's PCI uevent, field for field. MODALIAS is mechanical from the
+	 * ids; the 'sv'/'sd' fields are the wildcards Linux writes when a device
+	 * has no subsystem ids rather than a made-up pair. */
+	if (has_subsys)
+		snprintf(buf, sizeof(buf),
+		         "PCI_CLASS=%X\nPCI_ID=%04X:%04X\nPCI_SUBSYS_ID=%04X:%04X\n"
+		         "PCI_SLOT_NAME=%s\n"
+		         "MODALIAS=pci:v%08Xd%08Xsv%08Xsd%08Xbc%02Xsc%02Xi%02X\n",
+		         (unsigned)classfull, (unsigned)vendor, (unsigned)device,
+		         (unsigned)subv, (unsigned)subd, slotname,
+		         (unsigned)vendor, (unsigned)device, (unsigned)subv,
+		         (unsigned)subd, (unsigned)class_code, (unsigned)subclass,
+		         (unsigned)prog_if);
+	else
+		snprintf(buf, sizeof(buf),
+		         "PCI_CLASS=%X\nPCI_ID=%04X:%04X\nPCI_SLOT_NAME=%s\n"
+		         "MODALIAS=pci:v%08Xd%08Xsv*sd*bc%02Xsc%02Xi%02X\n",
+		         (unsigned)classfull, (unsigned)vendor, (unsigned)device,
+		         slotname, (unsigned)vendor, (unsigned)device,
+		         (unsigned)class_code, (unsigned)subclass, (unsigned)prog_if);
+	{
+		struct pci_sysfs_uevent *uc = kzalloc(sizeof(*uc));
+
+		if (uc) {
+			snprintf(uc->devpath, sizeof(uc->devpath),
+			         "/devices/pci0000:00/%s", slotname);
+			snprintf(uc->text, sizeof(uc->text), "%s", buf);
+			if (sysfs_reg_attr(dev, "uevent", 0644, pci_sysfs_uevent_show,
+			                   pci_sysfs_uevent_store, uc,
+			                   pci_sysfs_text_free) != 0)
+				kfree(uc);
+		}
+	}
+
+	(void)sysfs_reg_link(dev, "subsystem", "../../../bus/pci");
+
+	/* The other view userspace walks: /sys/bus/pci/devices/<addr>. */
+	struct sysfs_dir *busdir = sysfs_reg_dir(sysfs_reg_dir(0, "bus"), "pci");
+	struct sysfs_dir *busdev = sysfs_reg_dir(busdir, "devices");
+
+	if (busdev) {
+		char target[96];
+
+		snprintf(target, sizeof(target), "../../../devices/pci0000:00/%s",
+		         slotname);
+		(void)sysfs_reg_link(busdev, slotname, target);
+	}
+}
+
+void pci_sysfs_publish_all(void) {
+	for (u16 bus = 0; bus < 256; bus++) {
+		for (u8 slot = 0; slot < 32; slot++) {
+			if (pci_config_read16((u8)bus, slot, 0, 0) == 0xFFFF)
+				continue;
+			u8 header_type = pci_config_read8((u8)bus, slot, 0, 0x0E);
+			u8 max_func = (header_type & 0x80) ? 8 : 1;
+
+			for (u8 func = 0; func < max_func; func++) {
+				if (pci_config_read16((u8)bus, slot, func, 0) == 0xFFFF)
+					continue;
+				pci_sysfs_publish_one((u8)bus, slot, func);
+			}
+		}
+	}
 }

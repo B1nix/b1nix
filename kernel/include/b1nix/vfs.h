@@ -96,6 +96,14 @@ enum vfs_node_type {
  * files itself. */
 #define VFS_NODE_CTRL_CHILDREN 0x20000000u
 
+/* This file lives only in memory, so the page cache is its storage.
+ *
+ * Writing such a page "back" copies it into a kernel heap buffer that then
+ * holds the same bytes twice -- and reclaim does it under memory pressure,
+ * which is the worst moment to ask for a second copy. A memfd is a name and
+ * some pages; there is nothing behind it to write to. */
+#define VFS_NODE_MEMORY_BACKED 0x10000000u
+
 /* inode->attr: the ext2/3/4 i_flags low byte, shared verbatim with userspace
  * through FS_IOC_GETFLAGS/FS_IOC_SETFLAGS (chattr/lsattr).
  *   enforced by the VFS:  IMMUTABLE, APPEND
@@ -278,6 +286,25 @@ struct vfs_inode {
    * so their lookup path is unchanged. Must materialise `name` as a physical
    * child of `dir` (idempotent) and return 0 on success, <0 if no such child. */
   int (*lookup_cb)(struct vfs_node *dir, const char *name);
+  /* A "magic link": a symlink whose destination is a live object, not a path.
+   * /proc/<pid>/fd/<n> is the one Linux has and the one systemd depends on --
+   * it opens a mount destination O_PATH and then mounts onto
+   * /proc/self/fd/<n>, precisely so that no path can be re-walked (and swapped)
+   * underneath it. Re-resolving the STORED target string is not the same
+   * operation: the file may have no reachable name at all, or a different one
+   * by the time the string is read. When this is set, the path resolver steps
+   * straight to the node it returns.
+   *
+   * Returns a REFERENCED node (the caller drops it), an ERR_PTR for a
+   * descriptor that names no file, or NULL to say "no magic here, use the
+   * stored target string" -- which is what a pipe or socket descriptor gets,
+   * so their behaviour is unchanged. */
+  struct vfs_node *(*magic_link_cb)(struct vfs_node *link);
+  /* Run lookup_cb even when the child is already there, so it can REFRESH it.
+   * /proc/<pid>/fd is the case that needs it: a descriptor number is reused as
+   * soon as it is closed, and a symlink materialised once and then found by
+   * every later lookup reports the first file that fd ever held. */
+  int lookup_refresh;
   /* Refresh the inode fields that a synthetic filesystem computes rather than
    * stores, immediately before a stat reads them. /proc/<pid>/task is the case
    * that needed it: its link count is two plus the number of live threads, and
@@ -470,6 +497,14 @@ void vfs_close(int handle);
 /* Close a handle not (or no longer) reachable through an fd table. */
 struct vfs_handle;
 void vfs_close_handle(struct vfs_handle *h, int owner_pid);
+
+/* Hold a descriptor from kernel context: acquire takes a reference on the
+ * handle behind `fd` so it survives the owning process closing it, and the
+ * read/write pair work on that reference rather than on an fd number. Used by
+ * the network block device, which is handed a connected socket. */
+struct vfs_handle *vfs_handle_acquire(int fd);
+isize vfs_handle_write(struct vfs_handle *h, const void *buf, usize size);
+isize vfs_handle_read(struct vfs_handle *h, void *buf, usize size);
 int vfs_create(const char *path, u32 mode);
 int vfs_mkdir(const char *path, u32 mode);
 isize vfs_list(const char *dir_path, const char **names, usize max_names);
@@ -591,6 +626,10 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
                          int *received_fds, usize fd_capacity,
                          usize *received_count, struct b1nix_ucred *cred,
                          int *has_cred, int *control_truncated);
+/* SO_ATTACH_FILTER. The instructions are a kernel-side copy of the user's
+ * struct sock_filter[count]; see kernel/net/sock_filter.c. */
+int vfs_sock_attach_filter(int fd, const void *insns, u32 count);
+
 int vfs_setsockopt(int fd, int level, int optname, const void *optval,
                    usize optlen);
 int vfs_getsockopt(int fd, int level, int optname, void *optval,
@@ -759,6 +798,7 @@ struct vfs_socket_state {
     struct b1nix_sockaddr_in6 in6;
     struct b1nix_sockaddr_un un;
     struct b1nix_sockaddr_ll ll;
+    struct b1nix_sockaddr_nl nl;
   } local, peer;
   int bound;
   int connected;
@@ -784,6 +824,10 @@ struct vfs_socket_state {
   int so_timestamp;
   int so_timestampns;
   int so_passsec;
+  /* SO_ATTACH_FILTER: a classic-BPF program run over every datagram before it
+   * is queued (struct sock_filter_prog *, kmalloc'd, freed on close). NULL is
+   * an unfiltered socket, which is what one starts as. */
+  void *sk_filter;
   int tcp_nodelay;
   int ipv6_v6only;
   int so_error;
@@ -813,6 +857,21 @@ struct vfs_socket_state {
   u8 udp_q_src_ip[SOCK_DGRAM_Q_SLOTS][16];
   u16 udp_q_src_port[SOCK_DGRAM_Q_SLOTS];
   u8 udp_q_src_is6[SOCK_DGRAM_Q_SLOTS];
+  /* Who sent each queued datagram: pid, uid, gid. Linux attaches these to a
+   * netlink message as SCM_CREDENTIALS when the receiver set SO_PASSCRED, and
+   * systemd-udevd's device monitor DISCARDS, silently, every message that
+   * arrives without them -- so a kernel that delivers the uevent but not the
+   * credentials looks exactly like one that sends no uevents at all. The
+   * kernel's own broadcasts are pid 0, uid 0, as they are on Linux. */
+  u32 udp_q_cred[SOCK_DGRAM_Q_SLOTS][3];
+  /* The multicast group each queued netlink message arrived on, reported back
+   * in recvmsg's msg_name as sockaddr_nl.nl_groups. */
+  u32 udp_q_nlgroups[SOCK_DGRAM_Q_SLOTS];
+  /* The credentials, and the group, of the message the last receive handed
+   * over. */
+  u32 nl_last_cred[3];
+  u32 nl_last_groups;
+  int nl_have_cred;
   u8 udp_last_src_ip[16];
   u16 udp_last_src_port;
   u8 udp_last_src_is6;
@@ -837,6 +896,23 @@ struct vfs_handle {
    * hold a handle on the namespace it is about to leave. 0 = not an ns
    * handle; see procfs_ns_open_cb(). */
   u32 ns_pin;
+  /* The absolute path this descriptor was opened at.
+   *
+   * A node can be reached by more than one name -- a bind mount gives the same
+   * file a second place -- and the node itself only remembers the first. Linux
+   * keeps a (mount, dentry) pair per open file for exactly this reason, and
+   * everything that asks "where is this descriptor" means the name it was
+   * opened under: readlink("/proc/self/fd/<n>"), and mount(2) when the
+   * destination is that link. Deriving it from the node instead reported
+   * systemd's per-unit bind of /run/systemd/unit-root/proc/sys/kernel/... as
+   * /proc/sys/kernel/..., so the mount it had just made was not in
+   * /proc/self/mountinfo under the name it looked for, and it retried until it
+   * gave up with EBUSY -- which is why systemd-udevd never started.
+   *
+   * Owned by the handle, freed with it. NULL for anything that is not a file
+   * (pipes, sockets, eventfds) and when the allocation failed, in which case
+   * readers fall back to the node's own path. */
+  char *open_path;
 };
 
 /* Encoding of vfs_handle::ns_pin. */

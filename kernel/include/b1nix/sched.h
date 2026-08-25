@@ -183,6 +183,9 @@ struct vm_area {
   struct vfs_node *node;
   isize offset;
   struct vm_area *next;
+  /* Only while retired: the list of mappings unlinked but not yet freed,
+   * because a page-fault walker may still be holding one. See vma_retire. */
+  struct vm_area *retired_next;
 };
 
 typedef void (*kernel_thread_entry)(void *arg);
@@ -568,6 +571,8 @@ void scheduler_kcrit_enter(void);
 void scheduler_kcrit_leave(void);
 /* The shared runqueue of READY non-stealable tasks (scheduler.c). */
 struct runqueue *sched_global_rq(void);
+/* True when some other task is waiting for a CPU. A hint, read without locks. */
+int sched_other_work_pending(void);
 /* Initialise (and return) the dedicated idle task for AP `cpu` running on the
  * given kernel stack top. The AP runs it as current_task and the cooperative
  * scheduler parks back to it when no other task is runnable. */
@@ -580,6 +585,24 @@ void scheduler_block_on(void *chan);
 void scheduler_block_on_timeout(void *chan, u64 timeout_ticks);
 
 /* Monotonic scheduler tick counter (10 ms cadence). */
+/* The scheduler tick rate, read from the timer that was actually programmed.
+ *
+ * Three subsystems carried their own copy of this number — the event-poll
+ * timers, the TCP timers and the watchdog — so a change to the tick rate moved
+ * some of the kernel's deadlines and left the rest where they were. And a
+ * constant is the wrong shape for it regardless: time on this machine comes
+ * from a counter calibrated at boot, and the tick is a rate the kernel asks
+ * the interrupt controller for, so both are things to read rather than assume.
+ * sched_tick_hz() returns what the timer was armed with. */
+u32 sched_tick_hz(void);
+#define SCHED_TICKS_PER_SEC ((u64)sched_tick_hz())
+/* Milliseconds to ticks, rounded up so a wait is never shorter than asked.
+ * Every "sleep N ticks" that means a duration has to go through this: written
+ * as a bare count it silently became ten times shorter when the timer moved
+ * from 100 Hz to 1 kHz. */
+#define SCHED_MS_TO_TICKS(ms) \
+    (((u64)(ms) * SCHED_TICKS_PER_SEC + 999u) / 1000u)
+
 u64 scheduler_get_ticks(void);
 void scheduler_wait_prepare(void *chan);
 void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks);
@@ -641,6 +664,21 @@ void scheduler_dump_tasks(void);
 void scheduler_lease_clear_here(const char *site);
 /* M34: read-only task-table introspection for procfs / ps / top. */
 usize scheduler_task_slots(void);
+/* The running task's index in that table, and the table's fixed upper bound.
+ * For per-task side tables kept outside struct task. */
+/* scheduler_sleep_ticks_state() outcomes: it slept, it must not sleep now but
+ * the task is alive (yield and ask again), or the task is being torn down. */
+#define SLEEP_OK 0
+#define SLEEP_RETRY 1
+#define SLEEP_GONE 2
+int scheduler_sleep_ticks_state(u64 ticks, int strict);
+usize scheduler_current_task_id(void);
+usize scheduler_current_slot(void);
+/* Promote a blocked or sleeping task to READY without touching a runqueue.
+ * For wakes posted from interrupt context, where taking the runqueue lock can
+ * deadlock against the code the interrupt suspended. */
+void scheduler_wake_task_norq(usize task_id);
+usize scheduler_max_task_slots(void);
 struct task *scheduler_task_slot(usize index);
 struct task *scheduler_task_by_pid(usize pid);
 const char *scheduler_state_name(int state);
@@ -765,6 +803,19 @@ void vma_insert(struct task *t, struct vm_area *vma);
 struct vm_area *vma_lookup(struct task *t, u64 addr);
 /* Drop that cache — required by anything that unlinks or frees a mapping. */
 void vma_cache_forget(struct task *t);
+/* Invalidate every task's VMA lookup cache — call before freeing a vm_area,
+ * which any thread of the address space may still be holding. */
+/* True while a task is some CPU's current task — the only reliable answer to
+ * "is this executing right now". Its state and stack lease are not: a waker
+ * can mark a live task READY, and the lease stays published for as long as it
+ * runs. Every path that claims a task to run must consult this. */
+int task_running_somewhere(struct task *t);
+
+
+void vma_cache_invalidate_all(void);
+/* Free a mapping once no page-fault walker can still be holding it. */
+void vma_retire(struct vm_area *vma);
+void vma_retire_poll(void);
 struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr);
 void vma_delete_range(struct task *t, u64 start, u64 end);
 

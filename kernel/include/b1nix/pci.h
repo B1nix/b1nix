@@ -190,6 +190,12 @@ int pci_intel_stolen_read(struct pci_intel_stolen *out);
 int pci_intel_stolen_decode(u16 ggc, u32 bdsm, u32 bgsm,
                             struct pci_intel_stolen *out);
 
+/* Publish the bus topology under /sys/devices/pci0000:00, one directory per
+ * function, with /sys/bus/pci/devices links pointing at them. Every attribute
+ * is read from config space; nothing is defaulted, and no `driver` link is
+ * written because this kernel records no binding. */
+void pci_sysfs_publish_all(void);
+
 /* M98 in-kernel self-test (BAR sizing, capability walk, bus master, MSI/MSI-X
  * programming readback, stolen memory). No-op outside b1nix.test=1. */
 void pci_selftest(void);

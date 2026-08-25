@@ -11,6 +11,7 @@
 #include <b1nix/vt.h>
 #include <b1nix/serial.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/arch.h>
 
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
@@ -28,7 +29,77 @@ struct console_state console;
  *   "[M2tem6Dpt=1I cAount=G]"
  * under SMP. Held only across the body of a single console_write call —
  * individual console_putc still goes through serial_putc without recursion. */
-static spinlock_t console_lock = SPINLOCK_INIT;
+/* A queue, not a scramble.
+ *
+ * This was a plain test-and-set lock, and with four CPUs logging it starved:
+ * a CPU spun long enough for the kernel's own lockup detector to fire and
+ * report "SPINLOCK LOCKUP ... value=0" — a lockup on a lock that was free. The
+ * waiter simply never won the exchange, because a test-and-set lock has no
+ * order and the CPU already inside the console kept re-taking it. Three runs
+ * died that way: every core busy, the console silent, and nothing to read
+ * afterwards.
+ *
+ * A ticket lock hands the console out first-come-first-served, so a waiter's
+ * turn always arrives. `next` is drawn on arrival, `owner` is whose turn it
+ * is; they are equal when the lock is free. */
+/* Spins a waiter tolerates before it takes the console anyway. At a few
+ * nanoseconds an iteration this is seconds — orders of magnitude longer than
+ * any honest hold, which is a few hundred bytes down a serial line. */
+#define CONSOLE_LOCK_BYPASS_SPINS 2000000000ull
+
+struct console_ticket {
+	volatile u32 next;
+	volatile u32 owner;
+};
+
+static struct console_ticket console_lock;
+
+/* The ticket the current holder drew, so a release cannot run the queue past
+ * a section that was busted out from under it. */
+static volatile u32 console_lock_held_ticket;
+
+static void console_lock_acquire(void)
+{
+	extern void tlb_shootdown_poll(void);
+	u32 me = __atomic_fetch_add(&console_lock.next, 1u, __ATOMIC_SEQ_CST);
+	u64 spins = 0;
+
+	while (__atomic_load_n(&console_lock.owner, __ATOMIC_ACQUIRE) != me) {
+		__asm__ volatile("pause");
+		/* A waiter that entered with interrupts masked cannot ACK a
+		 * shootdown IPI, and the initiator waits for it with interrupts
+		 * masked too. Drain here for the same reason every other spin
+		 * loop in this kernel does. */
+		tlb_shootdown_poll();
+		/* The console may never be the thing that stops the machine.
+		 *
+		 * A holder that faults inside its own section, or one whose
+		 * section was busted while it ran, leaves a turn that never
+		 * comes up — and then every CPU that wants to say anything
+		 * waits for it forever, with nothing on the wire to say so.
+		 * After a long wait, take the console anyway: interleaved
+		 * output is a poor outcome, a dead machine is a worse one. */
+		if (++spins > CONSOLE_LOCK_BYPASS_SPINS) {
+			__atomic_store_n(&console_lock.owner, me,
+			                 __ATOMIC_RELEASE);
+			break;
+		}
+	}
+	console_lock_held_ticket = me;
+}
+
+static void console_lock_release(void)
+{
+	/* Advance the queue only if it is still standing where this section
+	 * left it. A bust (or a bypass) moves `owner` on without us, and an
+	 * unconditional increment would then run the turn past waiters that
+	 * are still holding valid tickets. */
+	u32 mine = console_lock_held_ticket;
+	u32 expect = mine;
+
+	__atomic_compare_exchange_n(&console_lock.owner, &expect, mine + 1u, 0,
+	                            __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
 
 static u16 vga_entry(char ch)
 {
@@ -328,10 +399,12 @@ void console_write_raw(const char *text)
 {
 	u64 flags;
 	g_console_write_seq++;
-	spin_lock_irqsave(&console_lock, &flags);
+	flags = interrupts_save();
+	console_lock_acquire();
 	for (usize i = 0; text[i] != '\0'; i++)
 		console_putc_raw(text[i]);
-	spin_unlock_irqrestore(&console_lock, flags);
+	console_lock_release();
+	interrupts_restore(flags);
 }
 
 /* Release everything printed before the command line was known. */
@@ -373,11 +446,13 @@ void console_log_init(void)
 	if (level > LOGLEVEL_DEBUG)
 		level = LOGLEVEL_DEBUG;
 
-	spin_lock_irqsave(&console_lock, &flags);
+	flags = interrupts_save();
+	console_lock_acquire();
 	con_loglevel = level;
 	con_configured = 1;
 	console_log_flush_early();
-	spin_unlock_irqrestore(&console_lock, flags);
+	console_lock_release();
+	interrupts_restore(flags);
 }
 
 /* Would a line at this level be printed? Asked BEFORE the line is built, so a
@@ -425,11 +500,17 @@ void console_write(const char *text)
 {
 	u64 flags;
 	g_console_write_seq++;
-	spin_lock_irqsave(&console_lock, &flags);
+	flags = interrupts_save();
+	console_lock_acquire();
 	for (usize i = 0; text[i] != '\0'; i++) {
 		console_putc(text[i]);
 	}
-	spin_unlock_irqrestore(&console_lock, flags);
+	console_lock_release();
+	interrupts_restore(flags);
+	/* ... and, when TIOCCONS has pointed the console at a terminal, a copy
+	 * goes into the redirect ring. Pushing bytes is all that happens here:
+	 * the write to the device itself belongs to a thread that may sleep. */
+	console_redirect_push(text);
 }
 
 /* Forcibly release the console lock (bust_spinlocks pattern). Called from the
@@ -439,18 +520,25 @@ void console_write(const char *text)
  * already crashing, so a momentarily garbled line on another CPU is acceptable. */
 void console_bust_lock(void)
 {
-	console_lock = 0;
+	/* Hand the queue to whoever is next rather than zeroing it: with a ticket
+	 * lock, "free" means owner == next, and a bare 0 would leave every waiter
+	 * holding a ticket that never comes up. */
+	__atomic_store_n(&console_lock.owner,
+	                 __atomic_load_n(&console_lock.next, __ATOMIC_ACQUIRE),
+	                 __ATOMIC_RELEASE);
 	console_log_panic_flush();
 }
 
 void console_lock_acquire_irqsave(u64 *flags)
 {
-	spin_lock_irqsave(&console_lock, flags);
+	*flags = interrupts_save();
+	console_lock_acquire();
 }
 
 void console_lock_release_irqrestore(u64 flags)
 {
-	spin_unlock_irqrestore(&console_lock, flags);
+	console_lock_release();
+	interrupts_restore(flags);
 }
 
 void console_write_hex32(u32 value)
@@ -458,11 +546,13 @@ void console_write_hex32(u32 value)
 	const char *digits = "0123456789abcdef";
 
 	u64 flags;
-	spin_lock_irqsave(&console_lock, &flags);
+	flags = interrupts_save();
+	console_lock_acquire();
 	for (int shift = 28; shift >= 0; shift -= 4) {
 		console_putc(digits[(value >> shift) & 0xf]);
 	}
-	spin_unlock_irqrestore(&console_lock, flags);
+	console_lock_release();
+	interrupts_restore(flags);
 }
 
 void console_write_hex64(u64 value)
@@ -470,20 +560,24 @@ void console_write_hex64(u64 value)
 	const char *digits = "0123456789abcdef";
 
 	u64 flags;
-	spin_lock_irqsave(&console_lock, &flags);
+	flags = interrupts_save();
+	console_lock_acquire();
 	for (int shift = 60; shift >= 0; shift -= 4) {
 		console_putc(digits[(value >> shift) & 0xf]);
 	}
-	spin_unlock_irqrestore(&console_lock, flags);
+	console_lock_release();
+	interrupts_restore(flags);
 }
 
 void console_write_dec(u64 value)
 {
 	u64 flags;
-	spin_lock_irqsave(&console_lock, &flags);
+	flags = interrupts_save();
+	console_lock_acquire();
 	if (value == 0) {
 		console_putc('0');
-		spin_unlock_irqrestore(&console_lock, flags);
+		console_lock_release();
+	interrupts_restore(flags);
 		return;
 	}
 
@@ -497,5 +591,6 @@ void console_write_dec(u64 value)
 	for (int j = i - 1; j >= 0; j--) {
 		console_putc(buf[j]);
 	}
-	spin_unlock_irqrestore(&console_lock, flags);
+	console_lock_release();
+	interrupts_restore(flags);
 }

@@ -72,6 +72,25 @@ void lapic_timer_start(u32 init_count) {
 
 static volatile int g_lapic_timer_periodic_active = 0;
 
+/* The period the scheduler tick is actually programmed with, in milliseconds.
+ *
+ * The tick rate used to be a constant repeated in four headers, and every
+ * conversion between time and ticks trusted that the timer had been programmed
+ * to match. It is the timer that decides: this records what was asked of the
+ * hardware, and sched_tick_hz() below is what the rest of the kernel reads.
+ * Zero until a periodic timer is armed. */
+static u32 g_tick_period_ms;
+
+/* Ticks per second, as programmed.
+ *
+ * The fallback is the PIT rate the boot path leaves running when the LAPIC
+ * timer cannot be calibrated (see TIMER_HZ in interrupts.c) — the one place a
+ * number still has to be assumed, because at that point nothing has programmed
+ * a rate to read back. */
+u32 sched_tick_hz(void) {
+    return g_tick_period_ms ? 1000u / g_tick_period_ms : 100u;
+}
+
 int lapic_timer_start_periodic_ms(u32 ms) {
     /* PIT-calibrated rate (per ms at divide=16). Zero means lapic_init never
      * managed to calibrate — without that we have no idea what one tick is, so
@@ -89,6 +108,7 @@ int lapic_timer_start_periodic_ms(u32 ms) {
 
     /* Match the calibration divider so the rate computed by
      * apic_timer_calibrate_against_pit lines up with what we program here. */
+    g_tick_period_ms = ms;
     lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
     lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LAPIC_LVT_PERIODIC);
     lapic_write(LAPIC_TIMER_INITCNT, (u32)init64);
@@ -398,9 +418,31 @@ void ap_main(u32 cpu_id) {
         interrupts_disable();
 
         struct task *t = pcpu ? rq_dequeue(&pcpu->runqueue) : (struct task *)0;
-        if (t && !(t->state == TASK_READY && t->stealable)) {
+        /* Claim it the way the other pickers do.
+         *
+         * A plain "state == READY" read is not a claim: the state says nothing
+         * about whether a CPU is still executing the task (a waker can mark a
+         * live task READY), and the stack lease stays published for as long as
+         * it runs. Taking a task that another CPU is on puts two CPUs on one
+         * kernel stack, which surfaces later as a return into a small integer.
+         */
+        if (t && !(t->state == TASK_READY && t->stealable &&
+                   __atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE) &&
+                   !task_running_somewhere(t))) {
             rq_enqueue(&pcpu->runqueue, t);
             t = NULL;
+        }
+        if (t) {
+            enum task_state expected = TASK_READY;
+
+            if (!__atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING,
+                                             0, __ATOMIC_ACQUIRE,
+                                             __ATOMIC_RELAXED)) {
+                rq_enqueue(&pcpu->runqueue, t);
+                t = NULL;
+            } else {
+                __atomic_store_n(&t->stack_released, 0, __ATOMIC_RELEASE);
+            }
         }
         if (!t)
             t = sched_steal_task();  /* only returns READY stealable workers */
@@ -430,12 +472,13 @@ void ap_main(u32 cpu_id) {
      * BKL when that task enters ring 3, so userspace runs in parallel with other
      * cores) and parks back to the idle task when nothing is left to run. */
 
-    /* M28-A: arm THIS AP's LAPIC timer at 100 Hz so the per-CPU scheduler tick
-     * fires here too. The BSP arms its own from main.c after lapic_init.
+    /* M28-A: arm THIS AP's LAPIC timer at the same rate the BSP uses, so the
+     * per-CPU scheduler tick fires here too — the period is read back rather
+     * than repeated, or the cores would count time differently.
      * Interrupts are already enabled here (Phase 1 ended with
      * interrupts_enable()) and the depth-1 BKL acquired below recursively
      * re-enters from the timer ISR — both already wired by M24b. */
-    lapic_timer_start_periodic_ms(10);
+    lapic_timer_start_periodic_ms(1000u / sched_tick_hz());
 
     struct task *idle = scheduler_setup_ap_idle((int)cpu_id, pcpu->kernel_stack_virt);
     pcpu->idle_task = idle;

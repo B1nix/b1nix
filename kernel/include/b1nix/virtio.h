@@ -38,7 +38,9 @@ struct vring_used_elem {
 } __attribute__((packed));
 
 struct vring_used {
-	u16 flags;
+	/* Written by the DEVICE while it is processing the queue, so the driver
+	 * must re-read it rather than cache it. */
+	volatile u16 flags;
 	volatile u16 idx;
 	struct vring_used_elem ring[];
 } __attribute__((packed));
@@ -46,6 +48,10 @@ struct vring_used {
 #define VRING_DESC_F_NEXT  1
 #define VRING_DESC_F_WRITE 2
 #define VRING_AVAIL_F_NO_INTERRUPT 1
+/* Set by the device in vring_used::flags while it is already looking at the
+ * queue: a notification then buys nothing and costs a port write, which on a
+ * hypervisor is a trap out of the guest. */
+#define VRING_USED_F_NO_NOTIFY 1
 
 struct virtqueue {
 	u16 queue_idx;

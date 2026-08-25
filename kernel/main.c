@@ -44,6 +44,9 @@
 #include <b1nix/errno.h>
 #include <b1nix/isofs.h>
 #include <b1nix/loop.h>
+#include <b1nix/md.h>
+#include <b1nix/mtd.h>
+#include <b1nix/nbd.h>
 #include <b1nix/vt.h>
 #include <b1nix/rtc.h>
 #include <b1nix/kmsg.h>
@@ -280,7 +283,11 @@ static void task_watch_thread(void *arg)
 {
 	(void)arg;
 	for (;;) {
-		scheduler_sleep_ticks(3000); /* thirty seconds */
+		/* Ten seconds, counted in ticks the scheduler is actually
+		 * running at. Written as a constant this slept for thirty
+		 * seconds at 100 Hz and for three at 1 kHz — the interval of a
+		 * diagnostic must not change because the timer was reprogrammed. */
+		scheduler_sleep_ticks(SCHED_MS_TO_TICKS(10000));
 		scheduler_dump_tasks();
 	}
 }
@@ -291,9 +298,28 @@ static void drm_stuck_watch_thread(void *arg)
 
 	(void)arg;
 	for (;;) {
-		scheduler_sleep_ticks(200); /* two seconds */
-		if (lkpi_diag_watch_report)
-			lkpi_diag_watch_report(4000);
+		/* Half a second between looks, and a second of patience before a
+		 * call is called slow. The old pair — two seconds and four — could
+		 * not see a submission that takes two: EXECBUFFER2 on this GPU
+		 * returns in about 2.1 s and was therefore never once reported,
+		 * which is why the compositor's stall looked like it had no cause. */
+		scheduler_sleep_ticks(SCHED_MS_TO_TICKS(500));
+		if (lkpi_diag_watch_report && lkpi_diag_watch_report(1000)) {
+			extern void lkpi_shmem_counts(u64 *calls, u64 *ns)
+				__attribute__((weak));
+			u64 calls = 0, ns = 0;
+
+			/* Printed only alongside a slow call, so the numbers describe
+			 * the stall rather than the boot as a whole. */
+			if (lkpi_shmem_counts) {
+				lkpi_shmem_counts(&calls, &ns);
+				console_write("lkpi: shmem folios=");
+				console_write_dec(calls);
+				console_write(" total_ms=");
+				console_write_dec(ns / 1000000ull);
+				console_write("\n");
+			}
+		}
 	}
 }
 
@@ -395,13 +421,33 @@ void kernel_main(usize arg0, usize arg1)
 	 * driver for was invisible in a boot log — the first thing anyone asks
 	 * for when a machine does not work. */
 	pci_init();
+	/* Publish the bus topology while the enumeration is fresh. The registry
+	 * holds it until /sys is mounted, so this does not depend on mount order:
+	 * a device with no node in /sys/devices has no parent for udev to match a
+	 * rule against, and libdrm cannot answer what bus a card sits on. */
+	pci_sysfs_publish_all();
 
 	/* M28-A: switch the BSP scheduler tick from PIT IRQ0 (vector 32) to the
 	 * per-CPU LAPIC timer (vector 64) at 100 Hz. APs arm the same timer when
 	 * they enter the cooperative phase in ap_main, so every core now ticks
 	 * itself instead of relying on the BSP-only PIT route. */
-	if (lapic_timer_start_periodic_ms(10)) {
-		k_info("timer", "LAPIC periodic timer armed at 100 Hz; masking PIT IRQ0");
+	/* One millisecond, not ten.
+	 *
+	 * The tick is the finest deadline the kernel can honour: a sleep, a
+	 * timeout, a poll interval can be no shorter and no more precise. At
+	 * 100 Hz the smallest of them was ten milliseconds, so a usleep(500) — or
+	 * any of the countless short waits a threaded program makes — cost twenty
+	 * times what it asked, and a five-hundred-iteration handoff took seven and
+	 * a half seconds instead of half a second. Linux ships 250 or 1000 Hz for
+	 * the same reason.
+	 *
+	 * The cost is the interrupt itself, ten times as often. It is a timer
+	 * interrupt on a calibrated LAPIC — a few hundred cycles — against
+	 * millisecond-scale waits it makes honest, and the rate is programmed
+	 * here and read back through sched_tick_hz() by everything that converts
+	 * between time and ticks, so nothing else has to be told. */
+	if (lapic_timer_start_periodic_ms(1)) {
+		k_info("timer", "LAPIC periodic timer armed at 1 kHz; masking PIT IRQ0");
 		ioapic_mask_irq(0);
 	} else {
 		k_warn("timer", "LAPIC calibration unavailable, keeping PIT IRQ0 active");
@@ -444,10 +490,6 @@ void kernel_main(usize arg0, usize arg1)
 	cgroup_init();   /* cgroup v2 — systemd mounts it before anything else */
 	procfs_init();
 	sysfs_init();
-	/* M95: load the optional filesystems, the HDA sound driver and the IPv6
-	 * protocol modules from /lib/modules in the initramfs. Each is optional —
-	 * the kernel boots and passes its tests with any of them absent. */
-	module_init_builtin_deps();
 	filelock_init();
 	mqueue_init();
 	shm_init();
@@ -504,6 +546,17 @@ void kernel_main(usize arg0, usize arg1)
 
 		if (card)
 			lkpi_i915_register_card(card);
+		/* And, when asked, whether the GT behind that card will run
+		 * anything: engines, address space, and one empty request per
+		 * engine taken to retirement. Costs nothing when the flag is
+		 * absent, and nothing at all when i915 did not bind. */
+		{
+			extern void lkpi_i915_gt_probe(struct drm_device *dev)
+				__attribute__((weak));
+
+			if (card && lkpi_i915_gt_probe)
+				lkpi_i915_gt_probe(card);
+		}
 	}
 	/*
 	 * Stop here when the boot exists only to exercise the display.
@@ -571,6 +624,9 @@ void kernel_main(usize arg0, usize arg1)
 #endif
 	virtio_input_init(); /* absolute pointer (virtio-tablet) — grab-free mouse */
 	fb_dev_init(); /* M47: /dev/fb0 mmap-able framebuffer (needs fb_console) */
+	nbd_init();    /* /dev/nbd0.. present and empty until a client attaches */
+	md_init();     /* /dev/md0.. present and empty until raidautorun fills one */
+	mtd_init();    /* CFI NOR flash, when b1nix.mtd asks for the probe */
 	drm_dev_init(); /* M50: minimal DRM/KMS dumb-buffer device over virtio-gpu */
 	/* M101t: the imported core comes up here rather than in the test block —
 	 * /dev/dri/card1 is a device userspace opens, not a self-test. The order
@@ -700,7 +756,7 @@ void kernel_main(usize arg0, usize arg1)
 						break;
 					if (blk_first_removable())
 						break;
-					scheduler_sleep_ticks(10);
+					scheduler_sleep_ticks(SCHED_MS_TO_TICKS(100));
 				}
 
 				int is_exfat = 0;
@@ -775,7 +831,7 @@ void kernel_main(usize arg0, usize arg1)
 					console_write("...\n");
 					int retries = 0;
 					while (retries < 50) {
-						scheduler_sleep_ticks(10);
+						scheduler_sleep_ticks(SCHED_MS_TO_TICKS(100));
 						root_dev = find_root_device(root_val);
 						if (root_dev) {
 							break;
@@ -893,6 +949,19 @@ void kernel_main(usize arg0, usize arg1)
 	if (bootinfo_has_flag("b1nix.task-watch") &&
 	    kthread_create("task-watch", task_watch_thread, 0) < 0)
 		k_err("task-watch", "thread refused");
+	/* M95: load the optional filesystems, the HDA sound driver and the IPv6
+	 * protocol modules from /lib/modules. Each is optional — the kernel boots
+	 * and passes its tests with any of them absent.
+	 *
+	 * After the root filesystem is mounted, not before. They live in
+	 * /lib/modules, and while the root arrived as a boot module already in
+	 * memory that was available from the first instant; served off a disk it
+	 * is not, and every one of them failed to load with ENOENT. Nothing
+	 * earlier in the boot needs them — they are optional filesystems, a sound
+	 * driver and a network protocol — so the load belongs on this side of the
+	 * mount. */
+	module_init_builtin_deps();
+
 	k_info(NULL, "Step 11: Drivers initialized");
 
 	/* Bring up Application Processors */

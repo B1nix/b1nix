@@ -106,11 +106,18 @@ int namespace_pid_visible_from(usize observer_pid, usize kernel_pid);
  *                            is the namespace of the interface the frame
  *                            arrived on (net_deliver_frame pushes it).
  */
+/* How many network namespaces this kernel can hold at once, slot 0 being the
+ * initial one. The net layer sizes its per-namespace tables from this, so the
+ * two never drift apart. */
+#define NS_MAX_NET 8
+
 u32 namespace_net_current(void);
 u32 namespace_net_context(void);
 /* Push/pop the receive-side context. Returns the previous value. */
 u32 namespace_net_push_context(u32 ns);
 void namespace_net_pop_context(u32 saved);
+/* Release the receive context of a task that has been reaped. */
+void namespace_net_release(usize pid);
 /* Does namespace `ns` exist (0 always does)? */
 int namespace_net_live(u32 ns);
 

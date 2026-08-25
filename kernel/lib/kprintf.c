@@ -75,7 +75,12 @@ void log_format_selftest(void)
 {
 	u64 t0 = ktime_monotonic_ns();
 	u64 t1 = ktime_monotonic_ns();
-	u64 ticks_ns = scheduler_get_uptime_ticks() * 10000000ull;
+	/* Ticks to nanoseconds at the rate the timer was armed with. The literal
+	 * ten milliseconds that used to be here was true of one tick rate and of
+	 * no other, so this check failed the moment the kernel ticked faster —
+	 * comparing a real clock against a tick count scaled by a number nobody
+	 * had updated. */
+	u64 ticks_ns = scheduler_get_uptime_ticks() * (1000000000ull / sched_tick_hz());
 
 	if (t1 >= t0)
 		k_info(NULL, "M110-LOG: ok clock-monotonic");
@@ -83,7 +88,7 @@ void log_format_selftest(void)
 		k_err(NULL, "M110-LOG: FAIL clock-monotonic");
 
 	/* The log stamp and /proc/uptime read one clock, so they can differ only
-	 * by the tick the coarse source is quantised to (10 ms) plus whatever
+	 * by the tick the coarse source is quantised to plus whatever
 	 * elapsed between the two reads. One second is a generous bound that
 	 * still catches "these are two unrelated counters". */
 	u64 diff = t1 > ticks_ns ? t1 - ticks_ns : ticks_ns - t1;

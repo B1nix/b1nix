@@ -104,6 +104,8 @@
 #define B1NIX_TIOCGWINSZ 0x5413
 #define B1NIX_TIOCSWINSZ 0x5414
 #define B1NIX_TIOCNOTTY 0x5422
+/* TIOCCONS: redirect the kernel console to the terminal this is issued on. */
+#define B1NIX_TIOCCONS  0x541D
 #define B1NIX_TIOCGPTN 0x80045430   /* get pty number (master) */
 #define B1NIX_TIOCSPTLCK 0x40045431 /* (un)lock slave (unlockpt) */
 
@@ -274,6 +276,9 @@ struct b1nix_statfs {
 #define B1NIX_POLLERR 0x008
 #define B1NIX_POLLHUP 0x010
 #define B1NIX_POLLNVAL 0x020
+/* Linux's POLLRDHUP: the peer has closed its write half. Reported only to a
+ * caller that asked for it, as Linux does. */
+#define B1NIX_POLLRDHUP 0x2000
 
 #define B1NIX_MSG_PEEK 0x02
 #define B1NIX_MSG_DONTWAIT 0x40

@@ -29,4 +29,39 @@ int virtio_gpu_show_cursor(int x, int y);
 int virtio_gpu_move_cursor(int x, int y);
 int virtio_gpu_hide_cursor(void);
 
+
+/* ── virgl, for the DRM node ─────────────────────────────────────────────
+ *
+ * Mesa speaks the Linux DRM ioctls, which are served in the shim
+ * (kernel/lkpi/) -- a layer that may not include b1nix headers. These are the
+ * plain entry points it reaches the transport through, via lkpi_virgl_*.
+ */
+
+/* What RESOURCE_CREATE_3D needs, without dragging the wire structs across. */
+struct virtio_gpu_res_params {
+	u32 target, format, bind, width, height, depth;
+	u32 array_size, last_level, nr_samples, flags;
+};
+
+int virtio_gpu_virgl_available(void);
+/* Claim a resource id (0 when the table is full). The same table the
+ * character device draws from, so the two front doors cannot collide. */
+u32 virtio_gpu_virgl_res_alloc(void);
+/* Create the resource, bind it to the context and attach `npages` pages as its
+ * backing. The pages need not be contiguous: adjacent ones are coalesced and
+ * the rest become separate entries. */
+int virtio_gpu_virgl_res_create(u32 ctx_id, const struct virtio_gpu_res_params *p,
+				const u64 *phys, u32 npages, u32 res_id);
+int virtio_gpu_virgl_ctx_create(u32 ctx_id);
+int virtio_gpu_virgl_submit(u32 ctx_id, const u32 *cmd, u32 bytes);
+/* box6 is x, y, z, w, h, d. */
+int virtio_gpu_virgl_transfer(int to_host, u32 ctx_id, u32 res_id, u32 level,
+			      const u32 *box6, u64 offset);
+int virtio_gpu_virgl_unref(u32 res_id);
+/* Read a capset blob. Without it Mesa cannot create a virgl screen at all. */
+int virtio_gpu_virgl_capset(u32 index, u32 want_id, u32 want_ver, void *out,
+			    u32 *len);
+/* Bitmask of the capset ids the host offers. Mesa gives up on a zero. */
+int virtio_gpu_virgl_capset_ids(u64 *mask);
+
 #endif

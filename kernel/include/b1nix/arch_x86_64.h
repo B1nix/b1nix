@@ -32,5 +32,11 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame);
 u64 sys_sigreturn(struct interrupt_frame *frame);
 void x86_pic_unmask(u8 irq);
 void arch_backtrace(u64 rbp, u64 rip);
+/* Ring-3 backtrace for a faulting task: the faulting instruction plus the
+ * return addresses still on the user stack, each named by the mapping it falls
+ * in. Printed on an unhandled fatal fault, and on a handled one under
+ * b1nix.user-bt. */
+struct interrupt_frame;
+void arch_user_backtrace(struct interrupt_frame *frame);
 
 #endif

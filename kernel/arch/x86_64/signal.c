@@ -205,7 +205,41 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
    * Updating it with restorer_slot (the modified RSP) would be wrong. */
 }
 
+/* The mask sigsuspend installed stays installed until a handler has actually
+ * been entered.
+ *
+ * sigsuspend(2) waits with a caller-supplied mask and must run the handler for
+ * the signal that ends the wait WITH that mask still in force; only the
+ * handler's own return puts the original mask back, which the signal frame
+ * carries. Restoring it in the syscall itself — as this kernel did — means the
+ * signal that just ended the wait is blocked again the instant the wait ends,
+ * so no handler ever runs, the pending bit is never consumed, and the program
+ * calls sigsuspend again with the same signal still pending.
+ *
+ * That is not a slow path, it is a livelock: a shell waiting for a child it had
+ * already reaped repeated rt_sigsuspend forever, and with it went every script
+ * driving the machine. The wait ends here instead — after delivery has had its
+ * chance — and only when nothing was delivered, which is the case Linux calls
+ * restore_saved_sigmask(). */
+static void arch_deliver_signals_body(struct interrupt_frame *frame);
+
 void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
+  arch_deliver_signals_body(frame);
+
+  /* Returning to ring 3 only: a kernel-mode return can land here while the task
+   * is still parked inside sigsuspend itself, and the temporary mask has to
+   * survive that. */
+  if (!current_task || !frame)
+    return;
+  if (frame->cs != 0x1B && frame->cs != 0x23)
+    return;
+  if (task_has_saved_sigmask(current_task)) {
+    current_task->blocked_signals = task_saved_sigmask(current_task);
+    task_clear_saved_sigmask(current_task);
+  }
+}
+
+static void arch_deliver_signals_body(struct interrupt_frame *frame) {
   /* rseq(2): this is a return to ring 3 after something that could have
    * preempted or migrated the task, which is exactly when the registered
    * cpu_id must be refreshed and an interrupted critical section aborted. */

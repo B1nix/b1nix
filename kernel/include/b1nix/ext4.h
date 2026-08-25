@@ -150,6 +150,18 @@ struct ext4_fs {
      * number. See ext4_setup_node. */
     u32 fs_id;
     struct ext2_superblock sb;
+    /* The superblock is written back on a deadline, not on every change.
+     *
+     * Its free-block and free-inode counts move on every allocation, and
+     * writing it there meant a read-modify-write of two sectors per allocated
+     * block — measured as the largest single source of device traffic on this
+     * system, a 512 KiB file costing five hundred superblock rewrites. The
+     * counts are advisory (fsck recomputes them), so Linux keeps them in
+     * memory and writes the superblock periodically and at sync; this does the
+     * same. `sb_dirty` says the in-memory copy has moved ahead of the disk,
+     * and `sb_write_tick` when it was last reconciled. */
+    int sb_dirty;
+    u64 sb_write_tick;
     u32 block_size;
     u32 inodes_per_group;
     u32 inode_size;
