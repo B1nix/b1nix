@@ -19,6 +19,8 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/timerfd.h>
+#include <sys/time.h>
+#include <signal.h>
 #include <poll.h>
 
 static long long ns_of(const struct timespec *t)
@@ -149,6 +151,124 @@ static int test_timer_fires(void)
 	return 0;
 }
 
+/* Do the SIGNAL timers keep the time they were given?
+ *
+ * timerfd above is one clock; alarm(2), setitimer(2) and the POSIX timers are
+ * another, and they had their own tick conversion with 100 written into it.
+ * The scheduler has run at 1 kHz since the LAPIC timer could be calibrated, so
+ * every one of them fired ten times early -- and because these are what
+ * timeout(1) arms, every bounded command in every test harness reported a
+ * timeout after a tenth of the time it was given. A working program is
+ * indistinguishable from a hung one when the clock it is held to runs fast,
+ * which makes this the one measurement that has to be right before any other
+ * measurement means anything.
+ *
+ * Measured against CLOCK_MONOTONIC, not counted in ticks: the point is
+ * precisely that the tick count and the wall time had stopped agreeing.
+ */
+static volatile sig_atomic_t g_fired;
+static void on_alarm(int sig) { (void)sig; g_fired = 1; }
+
+/* Wait up to `budget_ns` for g_fired, and report how long it really took. */
+static long long wait_fired(long long budget_ns)
+{
+	struct timespec t0, now;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;;) {
+		if (g_fired) {
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			return ns_of(&now) - ns_of(&t0);
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (ns_of(&now) - ns_of(&t0) > budget_ns)
+			return -1;
+		usleep(2000);
+	}
+}
+
+/* One second asked for, one second delivered -- within a generous half-second
+ * either way, which is still ten times tighter than the error being caught. */
+static int fired_on_time(const char *what, long long took_ns)
+{
+	if (took_ns < 0) {
+		printf("CLOCK: FAIL %s (never fired)\n", what);
+		return 1;
+	}
+	if (took_ns < 500000000LL) {
+		printf("CLOCK: FAIL %s (fired EARLY after %lld ms, asked for 1000)\n",
+		       what, took_ns / 1000000);
+		return 1;
+	}
+	if (took_ns > 1500000000LL) {
+		printf("CLOCK: FAIL %s (fired LATE after %lld ms, asked for 1000)\n",
+		       what, took_ns / 1000000);
+		return 1;
+	}
+	printf("CLOCK: ok %s (asked 1000 ms, fired after %lld ms)\n", what,
+	       took_ns / 1000000);
+	return 0;
+}
+
+static int test_alarm_keeps_time(void)
+{
+	struct sigaction sa, old;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = on_alarm;
+	sigaction(SIGALRM, &sa, &old);
+
+	/* alarm(2) counts in whole seconds, so one second is the shortest
+	 * honest request it can be given. */
+	g_fired = 0;
+	alarm(1);
+	long long took = wait_fired(6000000000LL);
+	alarm(0);
+	int bad = fired_on_time("alarm-keeps-time", took);
+
+	/* setitimer, same second, through the itimerval path. */
+	struct itimerval itv;
+	memset(&itv, 0, sizeof(itv));
+	itv.it_value.tv_sec = 1;
+	g_fired = 0;
+	if (setitimer(ITIMER_REAL, &itv, NULL) < 0) {
+		printf("CLOCK: FAIL itimer-keeps-time (setitimer errno %d)\n", errno);
+		bad++;
+	} else {
+		took = wait_fired(6000000000LL);
+		memset(&itv, 0, sizeof(itv));
+		setitimer(ITIMER_REAL, &itv, NULL);
+		bad += fired_on_time("itimer-keeps-time", took);
+	}
+
+	/* And the POSIX timer, which is what timeout(1) actually arms. */
+	timer_t tid;
+	struct sigevent sev;
+	memset(&sev, 0, sizeof(sev));
+	sev.sigev_notify = SIGEV_SIGNAL;
+	sev.sigev_signo = SIGALRM;
+	if (timer_create(CLOCK_REALTIME, &sev, &tid) < 0) {
+		printf("CLOCK: FAIL posix-timer-keeps-time (timer_create errno %d)\n",
+		       errno);
+		bad++;
+	} else {
+		struct itimerspec its;
+		memset(&its, 0, sizeof(its));
+		its.it_value.tv_sec = 1;
+		g_fired = 0;
+		if (timer_settime(tid, 0, &its, NULL) < 0) {
+			printf("CLOCK: FAIL posix-timer-keeps-time (timer_settime errno "
+			       "%d)\n", errno);
+			bad++;
+		} else {
+			took = wait_fired(6000000000LL);
+			bad += fired_on_time("posix-timer-keeps-time", took);
+		}
+		timer_delete(tid);
+	}
+
+	sigaction(SIGALRM, &old, NULL);
+	return bad;
+}
+
 int main(void)
 {
 	int bad = 0;
@@ -158,6 +278,7 @@ int main(void)
 	bad += test_advances();
 	bad += test_agrees_with_sleep();
 	bad += test_timer_fires();
+	bad += test_alarm_keeps_time();
 	printf("CLOCK: done (%d failed)\n", bad);
 	return bad ? 1 : 0;
 }

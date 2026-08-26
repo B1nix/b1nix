@@ -9,6 +9,9 @@
  *   MM-SMOKE: ok madvise
  *   MM-SMOKE: ok noreserve
  *   MM-SMOKE: ok sigaltstack
+ *   MM-SMOKE: ok ucontext-size
+ *   MM-SMOKE: ok copyout-cow
+ *   MM-SMOKE: ok copyout-readonly
  *   MM-SMOKE: done
  */
 #include <signal.h>
@@ -20,6 +23,10 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
+#include <ucontext.h>
+#include <sys/wait.h>
+#include <errno.h>
 #include <unistd.h>
 
 static void marker(const char *s) { write(1, s, strlen(s)); }
@@ -302,6 +309,165 @@ static int test_mmap_no_overlap(void) {
 	return 0;
 }
 
+
+/* ---- test 4: what the kernel may write into, and what it must refuse -------
+ *
+ * The VMA list says what a program is ALLOWED to do; the page tables say what
+ * the CPU will permit, and the two disagree routinely. Both halves of that
+ * disagreement have to behave, and neither was tested:
+ *
+ *   a) a page that is read-only in the tables because it is copy-on-write,
+ *      inside a mapping the program may write. The kernel's copy has to break
+ *      the sharing exactly as a store from the program would, and the parent's
+ *      copy must not change. Written from ring 0 without that step it faulted
+ *      in supervisor mode with nothing to fix up, and the machine panicked --
+ *      which is how every threaded program that exited at the wrong moment
+ *      brought the system down, since musl points its thread-list lock there.
+ *
+ *   b) a page the program itself may NOT write. The kernel must answer EFAULT
+ *      and leave the process running; it must not write anyway, and it must
+ *      not die.
+ *
+ * uname() is the instrument: a fixed-size struct the kernel fills in one
+ * copyout, with no side effects worth undoing. */
+static int test_kernel_write_cow(void)
+{
+	/* A private anonymous page, dirtied so it holds a real frame, then forked
+	 * so parent and child share that frame copy-on-write. */
+	struct utsname *shared =
+	    mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (shared == MAP_FAILED)
+		return 1;
+	memset(shared, 0x5a, 4096);
+
+	/* A second page, MAP_SHARED, so the child can report its verdict back. */
+	volatile int *verdict =
+	    mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (verdict == MAP_FAILED)
+		return 2;
+	*verdict = -1;
+
+	pid_t pid = fork();
+	if (pid < 0)
+		return 3;
+	if (pid == 0) {
+		/* The child has NOT written to `shared`, so its pages are still the
+		 * parent's frames, mapped read-only. This uname() is therefore a
+		 * kernel write into a copy-on-write page. */
+		int r = uname(shared);
+		if (r != 0)
+			*verdict = 10;
+		else if (shared->sysname[0] == 0)
+			*verdict = 11;
+		else
+			*verdict = 0;
+		_exit(0);
+	}
+	int st = 0;
+	if (waitpid(pid, &st, 0) != pid)
+		return 4;
+	if (*verdict != 0)
+		return 5 + (*verdict % 10);
+	/* The child's write must not have reached the parent's copy. */
+	for (int i = 0; i < 64; i++)
+		if (((unsigned char *)shared)[i] != 0x5a)
+			return 9;
+	munmap((void *)shared, 4096);
+	munmap((void *)verdict, 4096);
+	return 0;
+}
+
+static int test_kernel_write_readonly(void)
+{
+	unsigned char *p =
+	    mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED)
+		return 1;
+	memset(p, 0x3c, 4096);
+	if (mprotect(p, 4096, PROT_READ) != 0)
+		return 2;
+
+	errno = 0;
+	if (uname((struct utsname *)p) == 0)
+		return 3; /* wrote into a page the program cannot write */
+	if (errno != EFAULT)
+		return 4;
+	/* Nothing may have been written, and this process is still here to say so. */
+	for (int i = 0; i < 4096; i++)
+		if (p[i] != 0x3c)
+			return 5;
+	munmap(p, 4096);
+	return 0;
+}
+
+
+/* ---- test 5: the signal frame gives a ucontext_t the size of a ucontext_t ---
+ *
+ * The kernel hands an SA_SIGINFO handler two pointers and lays both objects out
+ * on the user stack itself. ucontext_t on x86_64 is 936 bytes, and the last 512
+ * of those -- __fpregs_mem -- live INSIDE the object even when
+ * uc_mcontext.fpregs is null. The kernel used to reserve 424 and place the
+ * siginfo immediately above, so the rest of the ucontext overlapped the
+ * siginfo, the red zone and the interrupted frame, canary included.
+ *
+ * The check is the contract itself: there must be room for a whole ucontext_t
+ * between where the kernel put it and whatever it put next. Reading the tail
+ * proves the pages are there; a handler is entitled to do that much. */
+static volatile int uc_verdict = -1;
+static volatile unsigned long uc_gap;
+
+static void uc_handler(int sig, siginfo_t *si, void *ctx)
+{
+	(void)sig;
+	unsigned char *uc = ctx;
+	unsigned char *info = (unsigned char *)si;
+	volatile unsigned long sum = 0;
+
+	if (!uc || !info) {
+		uc_verdict = 1;
+		return;
+	}
+	/* The kernel places the siginfo above the ucontext. Whatever the order, the
+	 * distance between them cannot be less than the object's own size. */
+	uc_gap = (unsigned long)(info > uc ? (info - uc) : (uc - info));
+	if (uc_gap < sizeof(ucontext_t)) {
+		uc_verdict = 2;
+		return;
+	}
+	/* Touch the whole object, including the tail that used to fall outside it. */
+	for (size_t i = 0; i < sizeof(ucontext_t); i++)
+		sum += uc[i];
+	(void)sum;
+	uc_verdict = 0;
+}
+
+static int test_ucontext_size(void)
+{
+	struct sigaction sa, old;
+	volatile unsigned long canary_guard[8];
+
+	for (int i = 0; i < 8; i++)
+		canary_guard[i] = 0xA5A5A5A5UL + (unsigned long)i;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = uc_handler;
+	sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGUSR2, &sa, &old) != 0)
+		return 1;
+	uc_verdict = -1;
+	if (raise(SIGUSR2) != 0)
+		return 2;
+	if (uc_verdict != 0)
+		return 10 + (uc_verdict < 0 ? 9 : uc_verdict);
+	/* And this frame is exactly as it was. */
+	for (int i = 0; i < 8; i++)
+		if (canary_guard[i] != 0xA5A5A5A5UL + (unsigned long)i)
+			return 3;
+	sigaction(SIGUSR2, &old, NULL);
+	return 0;
+}
+
 int main(void) {
 	marker("MM-SMOKE: start\n");
 
@@ -346,6 +512,27 @@ int main(void) {
 		return 30 + rc;
 	}
 	marker("MM-SMOKE: ok sigaltstack\n");
+
+	rc = test_kernel_write_cow();
+	if (rc != 0) {
+		marker("MM-SMOKE: fail copyout-cow\n");
+		return 70 + rc;
+	}
+	marker("MM-SMOKE: ok copyout-cow\n");
+
+	rc = test_ucontext_size();
+	if (rc != 0) {
+		marker("MM-SMOKE: fail ucontext-size\n");
+		return 90 + rc;
+	}
+	marker("MM-SMOKE: ok ucontext-size\n");
+
+	rc = test_kernel_write_readonly();
+	if (rc != 0) {
+		marker("MM-SMOKE: fail copyout-readonly\n");
+		return 80 + rc;
+	}
+	marker("MM-SMOKE: ok copyout-readonly\n");
 
 	marker("MM-SMOKE: done\n");
 	return 0;

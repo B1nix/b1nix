@@ -91,6 +91,8 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2090,6 +2092,407 @@ static void test_net_ns(void) {
   signal(SIGPIPE, prev == SIG_ERR ? SIG_DFL : prev);
 }
 
+/* ── a network namespace with an address of its own ───────────────────────
+ *
+ * The veth test above proves a namespaced interface carries FRAMES. This one
+ * proves it carries an ADDRESS: the IPv4 configuration is per namespace, so
+ * two namespaces joined by one veth pair each hold their own address, talk IP
+ * to each other over the cable, and neither address exists in the namespace
+ * that made the pair.
+ *
+ * Both ways of assigning an address are exercised, because both had to become
+ * namespace-aware: the ioctl pair `ifconfig` uses (SIOCSIFADDR /
+ * SIOCSIFNETMASK) on one side, and rtnetlink's RTM_NEWADDR — `ip addr add` —
+ * on the other.
+ */
+#define NSIP_PORT 7797
+#define NSIP_A "10.99.0.1"
+#define NSIP_B "10.99.0.2"
+#define NSIP_MSG "M109-NETNS-IPV4"
+/* 10.99.0.0 is host-order 0x0A630000; /proc/net/route prints it least
+ * significant byte first. */
+#define NSIP_ROUTE_HEX "0000630A"
+
+#define K_RTM_NEWADDR 20
+#define K_IFA_LOCAL 2
+#define K_IFA_ADDRESS 1
+
+/* nlmsghdr + ifaddrmsg. nlr_init lays down an ifinfomsg instead, which is a
+ * different fixed part and a different length. */
+static void nlr_init_addr(struct nlreq *r, unsigned type, unsigned flags,
+                          int ifindex, int plen) {
+  memset(r, 0, sizeof(*r));
+  nl_put_u16(r->b + 4, type);
+  nl_put_u16(r->b + 6, flags | NL_F_REQUEST | NL_F_ACK);
+  nl_put_u32(r->b + 8, ++g_nl_seq);
+  nl_put_u32(r->b + 12, (unsigned)getpid());
+  r->b[16] = AF_INET;          /* ifa_family */
+  r->b[17] = (unsigned char)plen; /* ifa_prefixlen */
+  nl_put_u32(r->b + 20, (unsigned)ifindex);
+  r->len = 24;                 /* 16 + sizeof(ifaddrmsg) */
+}
+
+/* `ip addr add <ip>/<plen> dev <ifindex>`. */
+static int addr_add_nl(int ifindex, const char *ip, int plen) {
+  struct in_addr a;
+  if (inet_aton(ip, &a) == 0)
+    return -1;
+  struct nlreq r;
+  nlr_init_addr(&r, K_RTM_NEWADDR, NL_F_CREATE, ifindex, plen);
+  nlr_attr(&r, K_IFA_LOCAL, &a.s_addr, 4);
+  nlr_attr(&r, K_IFA_ADDRESS, &a.s_addr, 4);
+  return nl_do(&r);
+}
+
+/* `ifconfig <if> <ip> netmask <mask>`. */
+static int addr_set_ioctl(const char *ifname, const char *ip,
+                          const char *mask) {
+  int s = socket(AF_INET, SOCK_DGRAM, 0);
+  if (s < 0)
+    return -errno;
+  struct ifreq r;
+  struct sockaddr_in *sin = (struct sockaddr_in *)&r.ifr_addr;
+  int rc = 0;
+
+  memset(&r, 0, sizeof(r));
+  snprintf(r.ifr_name, sizeof(r.ifr_name), "%s", ifname);
+  sin->sin_family = AF_INET;
+  if (inet_aton(ip, &sin->sin_addr) == 0)
+    rc = -1;
+  else if (ioctl(s, SIOCSIFADDR, &r) != 0)
+    rc = -errno;
+
+  if (rc == 0) {
+    memset(&r, 0, sizeof(r));
+    snprintf(r.ifr_name, sizeof(r.ifr_name), "%s", ifname);
+    sin = (struct sockaddr_in *)&r.ifr_netmask;
+    sin->sin_family = AF_INET;
+    if (inet_aton(mask, &sin->sin_addr) == 0)
+      rc = -1;
+    else if (ioctl(s, SIOCSIFNETMASK, &r) != 0)
+      rc = -errno;
+  }
+  close(s);
+  return rc;
+}
+
+/* SIOCGIFADDR read-back, as dotted quad. "" when the interface has none. */
+static void addr_get(const char *ifname, char *out, size_t cap) {
+  out[0] = '\0';
+  int s = socket(AF_INET, SOCK_DGRAM, 0);
+  if (s < 0)
+    return;
+  struct ifreq r;
+  memset(&r, 0, sizeof(r));
+  snprintf(r.ifr_name, sizeof(r.ifr_name), "%s", ifname);
+  if (ioctl(s, SIOCGIFADDR, &r) == 0) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)&r.ifr_addr;
+    snprintf(out, cap, "%s", inet_ntoa(sin->sin_addr));
+  }
+  close(s);
+}
+
+/* Poll a datagram socket for up to ~4 s. Returns the length, or -1. */
+static ssize_t udp_wait(int fd, void *buf, size_t cap,
+                        struct sockaddr_in *from) {
+  for (int i = 0; i < 800; i++) {
+    socklen_t fl = sizeof(*from);
+    ssize_t n = recvfrom(fd, buf, cap, MSG_DONTWAIT, (struct sockaddr *)from,
+                         &fl);
+    if (n >= 0)
+      return n;
+    if (errno != EAGAIN && errno != EWOULDBLOCK)
+      return -1;
+    usleep(5000);
+  }
+  return -1;
+}
+
+static int nsip_route_present(void) {
+  char rbuf[8192] = {0};
+  slurp("/proc/net/route", rbuf, sizeof(rbuf));
+  return strstr(rbuf, NSIP_ROUTE_HEX) != NULL;
+}
+
+/* The receiving side: address by rtnetlink, then echo one datagram back. */
+static void nsip_child_b(int rep, int go) {
+  char msg[256];
+  if (unshare(CLONE_NEWNET) != 0) {
+    snprintf(msg, sizeof(msg), "E unshare %d", errno);
+    write(rep, msg, strlen(msg) + 1);
+    _exit(0);
+  }
+  /* The inherited netlink socket was opened in the initial namespace. */
+  if (g_nl >= 0) {
+    close(g_nl);
+    g_nl = -1;
+  }
+  write(rep, "R", 2);
+  char c;
+  if (read(go, &c, 1) != 1)
+    _exit(0);
+
+  int idx = if_index("vethB");
+  int up = idx > 0 ? if_set_up("vethB", 1) : -1;
+  int aa = idx > 0 ? addr_add_nl(idx, NSIP_B, 24) : -1;
+  char mine[32];
+  addr_get("vethB", mine, sizeof(mine));
+
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in me;
+  memset(&me, 0, sizeof(me));
+  me.sin_family = AF_INET;
+  me.sin_port = htons(NSIP_PORT);
+  me.sin_addr.s_addr = htonl(INADDR_ANY);
+  int bnd = fd >= 0 ? bind(fd, (struct sockaddr *)&me, sizeof(me)) : -1;
+
+  snprintf(msg, sizeof(msg), "B %d %d %d %d %d %s", idx, up, aa, bnd,
+           nsip_route_present(), mine[0] ? mine : "-");
+  write(rep, msg, strlen(msg) + 1);
+
+  /* One datagram in, the same payload back to wherever it came from. The
+   * source address the kernel reports is the sender NAMESPACE's address —
+   * the thing ipv4_send_tx now stamps from the interface's namespace. */
+  int txp = idx > 0 ? packet_open(0x0800, SOCK_RAW, idx) : -1;
+  char buf[128];
+  struct sockaddr_in from;
+  memset(&from, 0, sizeof(from));
+  ssize_t n = fd >= 0 ? udp_wait(fd, buf, sizeof(buf) - 1, &from) : -1;
+  ssize_t back = -1;
+  if (n > 0) {
+    buf[n] = '\0';
+    back = sendto(fd, buf, (size_t)n, 0, (struct sockaddr *)&from,
+                  sizeof(from));
+  }
+  int wout = -1;
+  if (txp >= 0) {
+    unsigned char fbuf[512];
+    struct sll fsll;
+    wout = recv_dir(txp, NSIP_MSG, 0, fbuf, sizeof(fbuf), &fsll);
+    close(txp);
+  }
+  char mine2[32];
+  addr_get("vethB", mine2, sizeof(mine2));
+  snprintf(msg, sizeof(msg), "X %ld %s %s %ld %d %s", (long)n,
+           n > 0 ? inet_ntoa(from.sin_addr) : "-", n > 0 ? buf : "-",
+           (long)back, wout, mine2[0] ? mine2 : "-");
+  write(rep, msg, strlen(msg) + 1);
+  if (fd >= 0)
+    close(fd);
+  _exit(0);
+}
+
+/* The sending side: address by ioctl, then one request and its echo. */
+static void nsip_child_a(int rep, int go) {
+  char msg[256];
+  if (unshare(CLONE_NEWNET) != 0) {
+    snprintf(msg, sizeof(msg), "E unshare %d", errno);
+    write(rep, msg, strlen(msg) + 1);
+    _exit(0);
+  }
+  if (g_nl >= 0) {
+    close(g_nl);
+    g_nl = -1;
+  }
+  write(rep, "R", 2);
+  char c;
+  if (read(go, &c, 1) != 1)
+    _exit(0);
+
+  int idx = if_index("vethA");
+  int up = idx > 0 ? if_set_up("vethA", 1) : -1;
+  int aa = idx > 0 ? addr_set_ioctl("vethA", NSIP_A, "255.255.255.0") : -1;
+  char mine[32];
+  addr_get("vethA", mine, sizeof(mine));
+
+  int rxp = idx > 0 ? packet_open(0x0800, SOCK_RAW, idx) : -1;
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in me;
+  memset(&me, 0, sizeof(me));
+  me.sin_family = AF_INET;
+  me.sin_port = htons(NSIP_PORT + 1);
+  me.sin_addr.s_addr = htonl(INADDR_ANY);
+  int bnd = fd >= 0 ? bind(fd, (struct sockaddr *)&me, sizeof(me)) : -1;
+  struct sockaddr_in peer;
+  memset(&peer, 0, sizeof(peer));
+  peer.sin_family = AF_INET;
+  peer.sin_port = htons(NSIP_PORT);
+  inet_aton(NSIP_B, &peer.sin_addr);
+  ssize_t sent = fd >= 0 && bnd == 0
+                     ? sendto(fd, NSIP_MSG, strlen(NSIP_MSG), 0,
+                              (struct sockaddr *)&peer, sizeof(peer))
+                     : -1;
+  char buf[128];
+  struct sockaddr_in from;
+  memset(&from, 0, sizeof(from));
+  ssize_t got = fd >= 0 && sent > 0 ? udp_wait(fd, buf, sizeof(buf) - 1, &from)
+                                    : -1;
+  int rerr = got < 0 ? errno : 0;
+  if (got > 0)
+    buf[got] = '\0';
+  /* Did the reply reach the interface at all? A packet socket on this end
+   * separates "the peer never sent it" from "the stack did not deliver it". */
+  int wire = -1;
+  if (rxp >= 0) {
+    unsigned char fbuf[512];
+    struct sll fsll;
+    wire = recv_dir(rxp, NSIP_MSG, 1, fbuf, sizeof(fbuf), &fsll);
+    close(rxp);
+  }
+  snprintf(msg, sizeof(msg), "A %d %d %d %d %s %ld %ld %s %s %d %d %d", idx, up,
+           aa, nsip_route_present(), mine[0] ? mine : "-", (long)sent,
+           (long)got, got > 0 ? buf : "-",
+           got > 0 ? inet_ntoa(from.sin_addr) : "-", bnd, rerr, wire);
+  write(rep, msg, strlen(msg) + 1);
+  if (fd >= 0)
+    close(fd);
+  _exit(0);
+}
+
+static void test_net_ns_ipv4_inner(void) {
+  char host_eth[32], host_now[32], m[256];
+  int repa[2], gopa[2], repb[2], gopb[2];
+  int idx_a, idx_b, mv_a = -1, mv_b = -1;
+  int b_idx = -1, b_up = -1, b_aa = -1, b_bnd = -1, b_route = -1;
+  int a_idx = -1, a_up = -1, a_aa = -1, a_route = -1, a_bnd = -1;
+  int a_rerr = -1, a_wire = -1;
+  long a_sent = -1, a_got = -1, b_n = -1, b_back = -1;
+  char a_addr[32] = {0}, a_echo[64] = {0}, a_from[32] = {0};
+  char b_addr[32] = {0}, b_from[32] = {0}, b_payload[64] = {0};
+  char b_addr2[32] = {0};
+  int b_wout = -1;
+  int addr_ok, xchg_ok, leaked;
+  pid_t pa, pb;
+
+  addr_get("eth0", host_eth, sizeof(host_eth));
+
+  if (link_add_veth("vethA", "vethB") != 0) {
+    failm("netns-ipv4-address", "veth pair");
+    return;
+  }
+  idx_a = if_index("vethA");
+  idx_b = if_index("vethB");
+  if (pipe(repa) || pipe(gopa) || pipe(repb) || pipe(gopb)) {
+    failm("netns-ipv4-address", "pipe");
+    return;
+  }
+
+  pb = fork();
+  if (pb == 0) {
+    close(repa[0]); close(repa[1]); close(gopa[0]); close(gopa[1]);
+    close(repb[0]); close(gopb[1]);
+    nsip_child_b(repb[1], gopb[0]);
+  }
+  pa = fork();
+  if (pa == 0) {
+    close(repb[0]); close(repb[1]); close(gopb[0]); close(gopb[1]);
+    close(repa[0]); close(gopa[1]);
+    nsip_child_a(repa[1], gopa[0]);
+  }
+  close(repa[1]); close(gopa[0]); close(repb[1]); close(gopb[0]);
+  if (pa < 0 || pb < 0) {
+    failm("netns-ipv4-address", "fork");
+    close(repa[0]); close(gopa[1]); close(repb[0]); close(gopb[1]);
+    return;
+  }
+
+  memset(m, 0, sizeof(m));
+  if (read(repb[0], m, sizeof(m) - 1) <= 0 || m[0] != 'R') {
+    failm("netns-ipv4-address", m[0] ? m : "no report from B");
+    goto reap;
+  }
+  memset(m, 0, sizeof(m));
+  if (read(repa[0], m, sizeof(m) - 1) <= 0 || m[0] != 'R') {
+    failm("netns-ipv4-address", m[0] ? m : "no report from A");
+    goto reap;
+  }
+
+  /* One end of the cable into each namespace. Both indexes were taken before
+   * the first move: an interface that has left is not nameable here. */
+  mv_a = link_set_netns_pid(idx_a, pa);
+  mv_b = link_set_netns_pid(idx_b, pb);
+
+  /* B first: it must be listening before A sends. */
+  write(gopb[1], "g", 1);
+  memset(m, 0, sizeof(m));
+  if (read(repb[0], m, sizeof(m) - 1) <= 0 || m[0] != 'B' ||
+      sscanf(m + 2, "%d %d %d %d %d %31s", &b_idx, &b_up, &b_aa, &b_bnd,
+             &b_route, b_addr) != 6) {
+    failm("netns-ipv4-address", m[0] ? m : "B never configured");
+    goto reap;
+  }
+
+  write(gopa[1], "g", 1);
+  memset(m, 0, sizeof(m));
+  if (read(repa[0], m, sizeof(m) - 1) <= 0 || m[0] != 'A' ||
+      sscanf(m + 2, "%d %d %d %d %31s %ld %ld %63s %31s %d %d %d", &a_idx,
+             &a_up, &a_aa, &a_route, a_addr, &a_sent, &a_got, a_echo, a_from,
+             &a_bnd, &a_rerr, &a_wire) != 12) {
+    failm("netns-ipv4-exchange", m[0] ? m : "A never reported");
+    goto reap;
+  }
+
+  memset(m, 0, sizeof(m));
+  if (read(repb[0], m, sizeof(m) - 1) <= 0 || m[0] != 'X' ||
+      sscanf(m + 2, "%ld %31s %63s %ld %d %31s", &b_n, b_from, b_payload,
+             &b_back, &b_wout, b_addr2) != 6)
+    b_n = -1;
+
+  /* 1. The address took effect inside the namespace - by ioctl on one side,
+   *    by rtnetlink on the other - and each namespace got the on-link route
+   *    that comes with it. */
+  addr_ok = mv_a == 0 && mv_b == 0 && a_idx > 0 && b_idx > 0 && a_up == 0 &&
+            b_up == 0 && a_aa == 0 && b_aa == 0 &&
+            strcmp(a_addr, NSIP_A) == 0 && strcmp(b_addr, NSIP_B) == 0 &&
+            a_route == 1 && b_route == 1;
+  if (!addr_ok)
+    note("netns-ipv4-address: mv=%d/%d idx=%d/%d up=%d/%d set=%d/%d "
+         "addr=%s/%s route=%d/%d",
+         mv_a, mv_b, a_idx, b_idx, a_up, b_up, a_aa, b_aa, a_addr, b_addr,
+         a_route, b_route);
+  check("netns-ipv4-address", addr_ok, 0);
+
+  /* 2. A real IPv4 exchange over the cable: the datagram arrives with the
+   *    SENDING namespace's address as its source, and the echo comes back. */
+  xchg_ok = b_bnd == 0 && a_bnd == 0 && a_sent == (long)strlen(NSIP_MSG) &&
+            b_n == (long)strlen(NSIP_MSG) &&
+            strcmp(b_payload, NSIP_MSG) == 0 && strcmp(b_from, NSIP_A) == 0 &&
+            b_back == b_n && a_got == (long)strlen(NSIP_MSG) &&
+            strcmp(a_echo, NSIP_MSG) == 0 && strcmp(a_from, NSIP_B) == 0;
+  if (!xchg_ok)
+    note("netns-ipv4-exchange: bind=%d/%d sent=%ld rx=%ld from=%s payload=%s "
+         "back=%ld echo=%ld/%s from=%s rerr=%d wire=%d b-wire-out=%d "
+         "b-addr-after=%s",
+         b_bnd, a_bnd, a_sent, b_n, b_from, b_payload, b_back, a_got, a_echo,
+         a_from, a_rerr, a_wire, b_wout, b_addr2[0] ? b_addr2 : "-");
+  check("netns-ipv4-exchange", xchg_ok, 0);
+
+  /* 3. None of it exists out here: not the interfaces, not the addresses, not
+   *    the prefix they installed - and this namespace's own lease is
+   *    untouched. */
+  addr_get("eth0", host_now, sizeof(host_now));
+  leaked = nsip_route_present() || if_index("vethA") || if_index("vethB") ||
+           strcmp(host_now, NSIP_A) == 0 || strcmp(host_now, NSIP_B) == 0;
+  if (leaked || strcmp(host_now, host_eth) != 0)
+    note("netns-ipv4-isolated: route=%d vethA=%d vethB=%d eth0=%s was=%s",
+         nsip_route_present(), if_index("vethA"), if_index("vethB"), host_now,
+         host_eth[0] ? host_eth : "-");
+  check("netns-ipv4-isolated", !leaked && strcmp(host_now, host_eth) == 0, 0);
+
+reap:
+  close(repa[0]); close(gopa[1]); close(repb[0]); close(gopb[1]);
+  waitpid(pa, NULL, 0);
+  waitpid(pb, NULL, 0);
+  /* Both namespaces are gone with their last task, and the veth pair with
+   * them; nothing is left to delete here. */
+}
+
+static void test_net_ns_ipv4(void) {
+  void (*prev)(int) = signal(SIGPIPE, SIG_IGN);
+  test_net_ns_ipv4_inner();
+  signal(SIGPIPE, prev == SIG_ERR ? SIG_DFL : prev);
+}
+
 /* ── unlink of an in-memory node on an on-disk filesystem ─────────────────
  *
  * mknod(2) keeps a device node in memory even when its directory is on ext4 —
@@ -2862,12 +3265,28 @@ static void test_discard_support(void) {
     fail("discard-support", 1);
     return;
   }
-  if (access("/dev/ram0", F_OK) == 0) {
-    if (discard_probe("/dev/ram0", &sup) != 0 || sup) {
-      fail("discard-support", 2);
-      return;
-    }
-  } else {
+  /* And a device that has no discard command at all, whichever one that is.
+   *
+   * It used to be /dev/ram0, which existed only because the root filesystem
+   * travelled inside the boot image as a RAM disk. The point of the check is
+   * not that device in particular: it is that a device without the command
+   * answers EOPNOTSUPP rather than pretending, so any device that reports no
+   * discard support serves — and the run is only inconclusive if every device
+   * on the machine happens to have it. */
+  static const char *const plain[] = { "/dev/ram0", "/dev/sata1", "/dev/sata0",
+                                       "/dev/vdb" };
+  int checked = 0;
+
+  for (unsigned i = 0; i < sizeof(plain) / sizeof(plain[0]) && !checked; i++) {
+    if (access(plain[i], F_OK) != 0)
+      continue;
+    if (discard_probe(plain[i], &sup) != 0)
+      continue;
+    if (sup)
+      continue; /* this one has discard; it is not the example we need */
+    checked = 1;
+  }
+  if (!checked) {
     fail("discard-support", 3);
     return;
   }
@@ -3463,6 +3882,7 @@ int main(void) {
   test_pid_ns();
   test_veth_pair();
   test_net_ns();
+  test_net_ns_ipv4();
   test_unlink_enoent();
 
   test_dev_nodes_listed();

@@ -1,4 +1,6 @@
 #include <b1nix/aio.h>
+#include <stdint.h>
+#include <sys/types.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -22,7 +24,7 @@ static long ksys(long n, long a0, long a1, long a2, long a3, long a4) {
 int main(void) {
   printf("M8-AIO-SMOKE: start\n");
 
-  u64 ctx = 0;
+  uint64_t ctx = 0;
   if (ksys(SYS_IO_SETUP, 16, (long)&ctx, 0, 0, 0) < 0) {
     printf("M8-AIO-SMOKE: FAIL io_setup errno=%d\n", errno);
     return 1;
@@ -40,8 +42,8 @@ int main(void) {
   w.fd = fd;
   w.opcode = B1NIX_AIO_OP_WRITE;
   w.offset = 0;
-  w.addr = (u64)(usize)msg;
-  w.len = (u32)strlen(msg);
+  w.addr = (uint64_t)(uintptr_t)msg;
+  w.len = (uint32_t)strlen(msg);
 
   long sub = ksys(SYS_IO_SUBMIT, (long)ctx, 1, (long)&w, 0, 0);
   if (sub != 1) {
@@ -53,7 +55,7 @@ int main(void) {
 
   struct b1nix_aio_cqe cqe = {0};
   long got = ksys(SYS_IO_GETEVENTS, (long)ctx, 1, 1, (long)&cqe, 200);
-  if (got != 1 || cqe.res != (isize)w.len) {
+  if (got != 1 || cqe.res != (ssize_t)w.len) {
     printf("M8-AIO-SMOKE: FAIL io_getevents(write) got=%ld res=%ld\n", got,
            (long)cqe.res);
     close(fd);
@@ -68,8 +70,8 @@ int main(void) {
   r.fd = fd;
   r.opcode = B1NIX_AIO_OP_READ;
   r.offset = 0;
-  r.addr = (u64)(usize)rbuf;
-  r.len = (u32)w.len;
+  r.addr = (uint64_t)(uintptr_t)rbuf;
+  r.len = (uint32_t)w.len;
 
   sub = ksys(SYS_IO_SUBMIT, (long)ctx, 1, (long)&r, 0, 0);
   if (sub != 1) {
@@ -81,7 +83,7 @@ int main(void) {
 
   memset(&cqe, 0, sizeof(cqe));
   got = ksys(SYS_IO_GETEVENTS, (long)ctx, 1, 1, (long)&cqe, 200);
-  if (got != 1 || cqe.res != (isize)r.len) {
+  if (got != 1 || cqe.res != (ssize_t)r.len) {
     printf("M8-AIO-SMOKE: FAIL io_getevents(read) got=%ld res=%ld\n", got,
            (long)cqe.res);
     close(fd);

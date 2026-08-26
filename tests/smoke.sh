@@ -9,7 +9,11 @@ ARCH="${1:-x86_64}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 OS="$(uname -s)"
-if [ "$OS" = "Darwin" ]; then
+# SMOKE_JOBS caps the build parallelism. A machine shared with another build
+# does not have all its cores available, and -j$(nproc) there makes both slower.
+if [ -n "${SMOKE_JOBS:-}" ]; then
+	NPROC="$SMOKE_JOBS"
+elif [ "$OS" = "Darwin" ]; then
 	NPROC=$(sysctl -n hw.ncpu)
 else
 	NPROC=$(nproc)
@@ -105,6 +109,16 @@ fail() {
 blocked() {
 	printf "  ${YELLOW}BLOCKED${NC} %s - %s\n" "$1" "$2"
 	BLOCKED=$((BLOCKED + 1))
+}
+
+# A check that could not apply to this image at all — not a failure and not a
+# wedge, but a configuration this build cannot answer (the accelerated
+# composition path on an image that carries no GL driver, for instance). It has
+# to be said out loud: a check quietly omitted is indistinguishable from a check
+# that passed. Does not affect the exit status.
+skipped() {
+	printf "  ${YELLOW}SKIP${NC} %s - %s\n" "$1" "$2"
+	SKIPPED=$((SKIPPED + 1))
 }
 
 # An instance is "wedged" when its log never reached "B1NIX-TEST: done" (the
@@ -268,6 +282,25 @@ run_qemu() {
 			-cdrom "$PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}" \
 			-serial stdio -serial null -display ${GPU_DISPLAY:-none} -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04
+
+		# The root filesystem, as a disk rather than inside the image.
+		#
+		# snapshot=on: every write lands in a temporary overlay QEMU discards
+		# when it exits, so the instances share one file, cannot corrupt it and
+		# cannot see each other's writes — which is what makes it safe to run
+		# them at the same time. The kernel finds it by its b1nix-root label,
+		# so it does not matter which device name it lands on.
+		# Two instances keep the module-borne root and get no disk: blk needs
+		# the RAM disk it produces as a device with no discard command, and
+		# switchroot needs a second filesystem to switch INTO, distinct from
+		# the initramfs it starts on. Giving them the disk as well would put
+		# two filesystems with the same label in front of them.
+		if [ -z "${SMOKE_ROOT_MODULE:-}" ] &&
+		   [ "${B1NIX_ISO_NAME:-}" != "b1nix-blk.iso" ] &&
+		   [ "${B1NIX_ISO_NAME:-}" != "b1nix-switchroot.iso" ] &&
+		   [ -f "$PROJECT_DIR/build/$ARCH/root.ext4" ]; then
+			set -- "$@" -drive file="$PROJECT_DIR/build/$ARCH/root.ext4",format=raw,if=virtio,snapshot=on
+		fi
 
 		if [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
 			# restrict=off by default: the NET-SMOKE ping-gateway and BusyBox
@@ -597,8 +630,31 @@ launch_blk() {
 		# The USB stick, plus a virtio-blk disk. virtio-blk was not attached
 		# to any instance before, so nothing exercised its feature
 		# negotiation, its FLUSH or its WRITE ZEROES.
+		# ... and a CFI NOR flash chip, which is what MTD is for.
+		#
+		# QEMU gives x86_64 raw flash only through `-drive if=pflash`, and
+		# pflash unit 1 requires unit 0, which is the machine's firmware.
+		# Putting SeaBIOS there rather than OVMF keeps the ordinary BIOS
+		# boot working -- under OVMF the kernel does not load at all
+		# ("multiboot2: Could not find viable load address"), so a UEFI
+		# firmware would have traded flash for the ability to boot.
+		#
+		# The chip is emulated hardware, not a RAM pretence: the driver
+		# probes it with a CFI query and reads its size and erase-block
+		# layout out of the chip's own table.
+		_flash="$PROJECT_DIR/smoke_run/flash-blk.img"
+		dd if=/dev/zero of="$_flash" bs=1M count=4 2>/dev/null
+		_bios=""
+		for _b in /usr/share/qemu/bios-256k.bin /usr/share/seabios/bios-256k.bin; do
+			[ -f "$_b" ] && { _bios="$_b"; break; }
+		done
 		EXTRA_QEMU_ARGS="-drive file=$(disk_img usb blk),if=none,id=usbdisk,format=raw -device usb-storage,bus=xhci.0,drive=usbdisk \
 			-drive file=$(disk_img vblk blk),if=none,id=vblkdisk,format=raw,discard=unmap -device virtio-blk-pci,drive=vblkdisk"
+		if [ -n "$_bios" ]; then
+			EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS \
+			-drive if=pflash,format=raw,readonly=on,file=$_bios,unit=0 \
+			-drive if=pflash,format=raw,file=$_flash,unit=1"
+		fi
 		export EXTRA_QEMU_ARGS
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[blk]   "
@@ -1115,12 +1171,18 @@ check_output "$LOG" "MM-SMOKE: ok readdir-terminates" "readdir returns every ent
 check_output "$LOG" "SHMSHARE: ok memfd-fork" "a memfd mapped MAP_SHARED in two processes is one memory: each side sees the other's writes"
 check_output "$LOG" "SHMSHARE: ok memfd-scm-rights" "a memfd passed over AF_UNIX SCM_RIGHTS maps to the same memory in the receiver — the path libwayland uses"
 check_output "$LOG" "SHMSHARE: ok shm-open-shared" "a POSIX shared-memory object opened by name in a second process maps to the same memory (an in-memory file page must come from the page cache, or each mapper gets a private copy)"
+check_output "$LOG" "SHMSHARE: ok sparse-ftruncate" "sizing an anonymous shared file does not spend the memory: a compositor sizes a buffer pool once and paints small pieces of it, and backing the whole declaration eagerly exhausted a 4 GiB machine twenty seconds into a desktop session"
+check_output "$LOG" "SHMSHARE: ok sparse-write" "a small write into a hugely sized file reads back what was written: once the declared size stops matching the buffer, a grow path that copies the size rather than the buffer runs off both ends"
+check_output "$LOG" "SHMSHARE: ok sparse-hole" "the part of an anonymous file nobody wrote reads as zeroes, not as whatever the caller's buffer already held"
 check_output "$LOG" "SHMSHARE: done" "shared-mapping smoke completes"
 check_output "$LOG" "MM-SMOKE: ok shm-open" "POSIX shared memory works end to end (shm_open in /dev/shm, ftruncate, mmap, read back)"
 check_output "$LOG" "MM-SMOKE: ok mmap-no-overlap" "mmap never returns an address that is already mapped"
 check_output "$LOG" "MM-SMOKE: ok madvise" "madvise(MADV_DONTNEED) zeroes a refaulted anonymous page"
 check_output "$LOG" "MM-SMOKE: ok noreserve" "MAP_NORESERVE large mapping commits lazily on touch"
 check_output "$LOG" "MM-SMOKE: ok sigaltstack" "sigaltstack get/set/disable + SA_ONSTACK handler runs on alt stack"
+check_output "$LOG" "MM-SMOKE: ok ucontext-size" "an SA_SIGINFO handler is given a whole ucontext_t, not 424 bytes of one overlapping the frame that was interrupted"
+check_output "$LOG" "MM-SMOKE: ok copyout-cow" "the kernel writing into a copy-on-write page breaks the sharing instead of faulting in ring 0 (it used to panic the machine)"
+check_output "$LOG" "MM-SMOKE: ok copyout-readonly" "a syscall asked to write into a page the program cannot write answers EFAULT and the process survives"
 check_output "$LOG" "MM-SMOKE: done" "MM smoke completes"
 
 # ── M40 Linux ABI compatibility (x86_64 only: it runs a Linux x86_64 ELF) ──
@@ -1494,7 +1556,8 @@ check_output "$LOG" "M22-POLISH: done" "M22 Polish completes successfully"
 	check_output "$LOG" "BB-W10: ok stty" "stty reports the console's terminal settings"
 	check_output "$LOG" "BB-W10: ok blockdev" "blockdev --getsz reads the disk size through BLKGETSIZE"
 	check_output "$LOG" "BB-W10: ok blockdev-getro" "blockdev --getro reads the new BLKROGET ioctl"
-	check_output "$LOG" "BB-W10: ok fbset" "fbset reads /dev/fb0 through the Linux FBIOGET_*SCREENINFO ioctls"
+	check_output "$LOG" "M47-GFX: ok fb-putvar" "FBIOPUT_VSCREENINFO adjusts an impossible mode request down to the one really in force and reports it back, which is what Linux's fixed-mode drivers do and what a client that sets the mode before drawing depends on - refusing it failed every such client"
+check_output "$LOG" "BB-W10: ok fbset" "fbset reads /dev/fb0 through the Linux FBIOGET_*SCREENINFO ioctls"
 	check_output "$LOG" "BB-W10: ok lzop" "lzop/lzopcat round-trip a file"
 	check_output "$LOG" "BB-W10: ok fallocate" "fallocate reserves space through fallocate(2)"
 	check_output "$LOG" "BB-W10: ok flock" "flock takes a file lock and runs a command"
@@ -1503,6 +1566,15 @@ check_output "$LOG" "M22-POLISH: done" "M22 Polish completes successfully"
 	check_output "$LOG" "BB-W10: ok setpriv" "setpriv is present and reports its usage"
 	check_output "$LOG" "BB-W10: ok sha3sum" "sha3sum hashes stdin"
 	check_output "$LOG" "BB-W10: ok ipcalc" "ipcalc derives a network address"
+check_output "$LOG" "BB-W11: ok unshare-uts" "unshare -u gives a UTS namespace whose hostname the parent does not see"
+check_output "$LOG" "BB-W11: ok unshare-net" "unshare -n gives a network namespace with no interface but loopback, while the parent keeps its own"
+check_output "$LOG" "BB-W11: ok nsenter-uts" "nsenter -t <pid> -u reads the hostname of the namespace that process is in"
+check_output "$LOG" "BB-W11: done" "the namespace tools wave completes"
+check_output "$LOG" "BB-W12: ok readahead" "readahead(2) warms a file's blocks and leaves its contents intact"
+check_output "$LOG" "BB-W12: ok raid-assemble" "raidautorun assembles a mirror from the superblocks its members carry"
+check_output "$LOG" "BB-W12: ok raid-mirrors-both-members" "a write through the array lands on BOTH members, read back from each member directly"
+check_output "$LOG" "BB-W12: ok nbd-node" "/dev/nbd0 exists before anything is attached and refuses to read while empty"
+check_output "$LOG" "BB-W12: done" "the new-layer wave completes"
 	check_output "$LOG" "BB-W10: done" "the Alpine-parity applet wave completes"
 	check_output "$LOG" "BB-W9: done" "BusyBox wave 9 applet promotion completes"
 	check_output "$LOG" "BB-SMOKE: ok rm" "busybox rm works"
@@ -1740,6 +1812,18 @@ check_output "$LOG" "UNIX-SMOKE: ok rcvtimeo-data" "a socket with SO_RCVTIMEO st
 check_output "$LOG" "UNIX-SMOKE: ok fionread" "FIONREAD reports the bytes queued on a unix socket (every event-driven server asks this)"
 check_output "$LOG" "UNIX-SMOKE: ok peer-close-hup" "poll reports POLLHUP once the peer of a connected unix socket closes"
 check_output "$LOG" "UNIX-SMOKE: ok listen-no-hup" "a LISTENING unix socket reports readability for a queued client and never POLLHUP"
+# The clock every bounded test is held to. A timer that fires early makes a
+# working program look hung, so these have to be right before any other timing
+# in this suite means anything: alarm(2), setitimer(2) and the POSIX timers all
+# converted seconds to ticks with 100 written out, while the LAPIC timer has
+# been armed at 1 kHz -- so each fired ten times early and every `timeout N`
+# in every harness reported a timeout after N/10 seconds.
+check_output "$LOG" "CLOCK: ok alarm-keeps-time" "alarm(2) fires one second after it was asked for, measured against CLOCK_MONOTONIC rather than counted in ticks"
+check_output "$LOG" "CLOCK: ok itimer-keeps-time" "setitimer(ITIMER_REAL) keeps the time it was given"
+check_output "$LOG" "CLOCK: ok posix-timer-keeps-time" "timer_create/timer_settime keeps the time it was given - this is the timer timeout(1) arms, so it is the one that decides whether every bounded command in the suite is measuring anything"
+check_output "$LOG" "UNIX-SMOKE: ok shutdown-wr-poll" "a peer's shutdown(SHUT_WR) makes this socket poll readable, and POLLRDHUP for a caller that asked - without it an event loop never wakes to read the EOF"
+check_output "$LOG" "UNIX-SMOKE: ok shutdown-wr-eof" "after the queued bytes, a peer's shutdown(SHUT_WR) reads as end-of-file rather than blocking for ever"
+check_output "$LOG" "UNIX-SMOKE: ok shutdown-wr-oneway" "the half-close closes ONE direction: the reverse direction still carries data, and the shut half reports EPIPE"
 check_output "$LOG" "DNS-SMOKE: ok resolve-name" "getaddrinfo resolves a real name through musl's resolver (needs the SLIRP DNS, like the nslookup check)"
 check_output "$LOG" "M32-IP6: ok icmpv6-loopback" "ICMPv6 echo over the ::1 loopback datapath round-trips"
 check_output "$LOG" "M32-IP6: ok icmpv6-errors" "ICMPv6 reports an unreachable closed UDP port"
@@ -1911,6 +1995,9 @@ check_output "$LOG" "M42-W5PRE: ok fchdir" "fchdir() changes current working dir
 check_output "$LOG" "M42-W5PRE: ok fnmatch" "POSIX fnmatch matches brackets and PERIOD/PATHNAME flags"
 check_output "$LOG" "M42-W5PRE: ok regex" "POSIX regex matches intervals and named classes"
 check_output "$LOG" "M42-W5PRE: ok sigsuspend-alarm" "atomic sigsuspend waits for alarm and restores mask"
+check_output "$LOG" "M42-W5PRE: ok sigsuspend-blocked-signal" "sigsuspend runs the handler for a signal only its own mask unblocks"
+check_output "$LOG" "M42-W5PRE: ok pwait-sigmask" "ppoll delivers a signal its own mask unblocks"
+check_output "$LOG" "M42-W5PRE: ok ppoll-precision" "ppoll honours a sub-millisecond timeout instead of rounding it away"
 check_output "$LOG" "M42-W5PRE: ok interrupted-waitpid" "waitpid is interrupted by signal with EINTR"
 check_output "$LOG" "M42-W5PRE: ok job-control" "Job control SIGSTOP/SIGCONT changes state"
 check_output "$LOG" "M42-W5PRE: ok sigchld-on-exit" "SIGCHLD is delivered to the parent on child exit"
@@ -1946,6 +2033,8 @@ check_output "$LOG" "M57-SMOKE: ok exec-inherit" "non-CLOEXEC fd and dup2-stdio 
 check_output "$LOG" "M57-SMOKE: ok fd-broker" "socketpair + SCM_RIGHTS hands a live fd to a forked child"
 check_output "$LOG" "M57-SMOKE: ok fd-broker-death" "in-flight passed fd survives sender close and peer hangup is reported"
 check_output "$LOG" "M57-SMOKE: ok dupfd-cloexec" "F_DUPFD_CLOEXEC sets FD_CLOEXEC while F_DUPFD leaves it clear"
+check_output "$LOG" "M57-SMOKE: ok unix-addrlen" "getsockname/getpeername report an AF_UNIX address's real length (2 unnamed, offsetof(sun_path)+name+1 bound)"
+check_output "$LOG" "M57-SMOKE: ok unix-addrlen-reuse" "a socket-name call given more room than the address writes only the address (the Qt sockAddrSize reuse that smashed kioworker's stack)"
 check_output "$LOG" "M57-SMOKE: ok mojo-pipe" "Mojo message pipe write/read and handle passing work"
 check_output "$LOG" "M57-SMOKE: ok mojo-shm" "Mojo shared buffer create/duplicate/map/unmap over memfd work"
 check_output "$LOG" "M57-SMOKE: ok mojo-watcher" "Mojo watcher event loop integration over epoll works"
@@ -2052,6 +2141,13 @@ check_output "$LOG" "M107-SMOKE: ok applet-chvt" "BusyBox chvt switches the acti
 check_output "$LOG" "M107-SMOKE: done" "M107 subsystem suite completes"
 # ── M109: AF_PACKET, pivot_root(2), volume identity ──
 check_output "$BLK_LOG" "M109-SMOKE: ok packet-socket" "an AF_PACKET socket binds to an interface and getsockname reports a 20-byte sockaddr_ll"
+check_output "$BLK_LOG" "MTD-SMOKE: ok erase-all" "flash_eraseall erases the CFI NOR chip QEMU provides through -drive if=pflash"
+check_output "$BLK_LOG" "MTD-SMOKE: ok erase-yields-ones" "an erased flash block reads back as all-ones"
+check_output "$BLK_LOG" "MTD-SMOKE: ok program" "a pattern written to /dev/mtd0 reads back byte for byte"
+check_output "$BLK_LOG" "MTD-SMOKE: ok program-command-path" "the CFI program sequence (clear status, program, data, poll) completes on the chip"
+check_output "$BLK_LOG" "MTD-SMOKE: ok erase-restores-ones" "erasing lifts those bits back to one"
+check_output "$BLK_LOG" "MTD-SMOKE: ok mtdblock-node" "the same chip is reachable as a block device for a filesystem"
+check_output "$BLK_LOG" "MTD-SMOKE: done" "the flash wave completes"
 check_output "$BLK_LOG" "M109-SMOKE: ok packet-tx-rx" "a frame sent on one packet socket arrives byte-for-byte on another, with its MAC, ethertype and ifindex"
 check_output "$BLK_LOG" "M109-SMOKE: ok packet-filter" "a socket bound to one ethertype does not see another's frames, while ETH_P_ALL sees both"
 check_output "$BLK_LOG" "M109-SMOKE: ok packet-dgram" "AF_PACKET SOCK_DGRAM strips the header on receive and builds it from the sockaddr_ll on send"
@@ -2089,12 +2185,19 @@ check_output "$LOG" "M109-SMOKE: ok net-namespace" "unshare(CLONE_NEWNET) leaves
 check_output "$LOG" "M109-SMOKE: ok veth-crosses-namespace" "one veth end moved into another network namespace vanishes from this one, and a frame sent here is received there"
 check_output "$LOG" "M109-SMOKE: ok unlink-enoent" "unlink of a name that exists on neither the filesystem nor the VFS still fails ENOENT, while an in-memory device node on an on-disk directory really is removed"
 check_output "$LOG" "M109-UEVENT: ok sysfs-dev-tree" "/sys/dev/block/<maj:min>/{dev,uevent} agree with each other and with the block node in /dev"
+check_output "$LOG" "M109-UEVENT: ok sysfs-subsystem-link" "each device directory carries a subsystem symlink whose basename names the subsystem udev matches on"
+check_output "$LOG" "M109-UEVENT: ok uevent-trigger" "writing add to a device's sysfs uevent file re-announces it on the netlink group (device coldplug: what udevadm trigger and mdev -s do)"
+check_output "$LOG" "M109-UEVENT: ok uevent-bpf-filter" "SO_ATTACH_FILTER runs a real classic-BPF program over the udev group and drops what it rejects, and the verifier refuses a program with no return"
+check_output "$LOG" "M109-UEVENT: ok uevent-bpf-detach" "SO_DETACH_FILTER puts the socket back to receiving everything"
 check_output "$LOG" "M109-UEVENT: ok uevent-hotplug-add" "a loop device added after boot broadcasts add@/block/loop8 with ACTION/SUBSYSTEM/DEVNAME/MAJOR/MINOR/SEQNUM"
 check_output "$LOG" "M109-UEVENT: ok mdev-scan" "mdev -s creates the missing node as a block special file with the major:minor /sys published"
 check_output "$LOG" "M109-UEVENT: ok uevent-hotplug-remove" "removing the device broadcasts remove@/block/loop8 with an advancing SEQNUM and it leaves /sys"
 check_output "$LOG" "M109-UEVENT: ok mdev-daemon" "mdev -d creates and unlinks /dev/loop8 from the netlink broadcast alone"
 check_output "$LOG" "M109-UEVENT: done" "the M109 uevent suite ran to completion"
 check_output "$LOG" "M109-SMOKE: ok net-ns-routes" "a route added inside a network namespace is in its own /proc/net/route and absent from the initial namespace's"
+check_output "$LOG" "M109-SMOKE: ok netns-ipv4-address" "an interface moved into a network namespace takes an address of its own - by SIOCSIFADDR on one side and RTM_NEWADDR on the other - and each namespace gets the on-link route that comes with it"
+check_output "$LOG" "M109-SMOKE: ok netns-ipv4-exchange" "a UDP datagram crosses a veth pair between two network namespaces and is echoed back, each packet carrying the sending namespace's own address as its source"
+check_output "$LOG" "M109-SMOKE: ok netns-ipv4-isolated" "neither namespaced address, its prefix, nor its interface exists in the initial namespace, whose own lease is unchanged"
 check_output "$LOG" "M109-SMOKE: done" "M109 namespace suite completes"
 # ── M109: device nodes, findfs/blkid, and mount(MS_MOVE)/switch_root ──
 check_output "$BLK_LOG" "M109-SMOKE: ok dev-nodes-listed" "a readdir of /dev lists every block device /sys/block names, as a block special file"
@@ -2441,7 +2544,12 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 
 	# ── M101t: the imported DRM core's ioctl surface, from ring 3 ──
 	check_output "$LOG" "M101T-DRM: ok open" "M101t: /dev/dri/card1 opens through upstream's drm_open"
-	check_output "$LOG" "M101T-DRM: ok version" "M101t: DRM_IOCTL_VERSION names the driver on the imported core"
+	check_output "$LOG" "M101T-DRM: ok version" "M101t: DRM_IOCTL_VERSION names the driver on the imported core (virtio_gpu — the name Mesa turns into <name>_dri.so)"
+	check_output "$LOG" "M101T-DRM: ok pci-identity" "M101t: the card publishes virtio-gpu's real PCI id in sysfs, which is what Mesa matches a driver against (it read 0000:0000 while the parent was not a PCI function)"
+	check_output "$LOG" "M101T-DRM: ok session-rdev-major" "M101t: the node's st_rdev carries DRM's major, which is how a session layer recognises it"
+	check_output "$LOG" "M101T-DRM: ok session-open-nonblock" "M101t: the node opens with the flags a compositor's session adds (O_NOCTTY|O_NONBLOCK)"
+	check_output "$LOG" "M101T-DRM: ok session-set-master" "M101t: the master lease can be taken, without which no modeset ioctl is permitted"
+	check_output "$LOG" "M101T-DRM: ok session-drop-master" "M101t: and dropped again, so a second compositor can take it"
 	check_output "$LOG" "M101T-DRM: ok getresources" "M101t: two-pass GETRESOURCES fills the id arrays"
 	check_output "$LOG" "M101T-DRM: ok getconnector" "M101t: the connector reports connected with a usable mode"
 	check_output "$LOG" "M101T-DRM: ok getconnector-bounds" "M101t: the mode list stays inside the buffer userspace supplied"
@@ -2573,6 +2681,38 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M51-GFX: ok xkbcommon" "M51: ported xkbcommon keycode->keysym"
 	check_output "$LOG" "M51-GFX: ok harfbuzz" "M51: ported HarfBuzz OpenType shaping"
 	check_output "$LOG" "M51-GFX: ok fontconfig" "M51: ported Fontconfig font matching"
+
+	# ── Composition: both renderers, each checked on its own ──
+	#
+	# Software composition (pixman) and accelerated composition (GLES through
+	# EGL and gbm on a DRM render node) are two supported paths, and the point
+	# of checking them apart is that a regression in one must not be able to
+	# hide behind the other. /etc/render-smoke.sh runs each deliberately and
+	# only prints a marker after grim pulled a frame back out of the running
+	# compositor and /bin/framecheck found the colour the compositor was told
+	# to paint — twice, with two different colours, per run.
+	check_output "$LOG" "RENDER-SMOKE: ok selection" \
+		"the compositor's renderer is chosen at run time and the decision is recorded (/run/render-selection)"
+	check_output "$LOG" "RENDER-SMOKE: ok software-frame" \
+		"software composition: sway on pixman painted the colours it was told to and grim read them back"
+	check_output "$LOG" "RENDER-SMOKE: ok fallback-engaged" \
+		"with acceleration forced off the automatic choice returns pixman AND the compositor still comes up and still paints — a fallback, not a failure"
+	check_output "$LOG" "RENDER-SMOKE: done" "the renderer smoke runs to the end"
+	# The accelerated path needs a GL driver in the image, which the ordinary
+	# image deliberately does not carry (mesa-dri-gallium is 184 MB with LLVM
+	# behind it — see tools/packages/alpine-ports.map). Where it IS there, the
+	# frame is required; where it is not, the run says so in its own words and
+	# that is reported as a skip rather than passed over in silence.
+	if grep -q "RENDER-SMOKE: accel-status available" "$LOG" 2>/dev/null; then
+		check_output "$LOG" "RENDER-SMOKE: ok accel-frame" \
+			"accelerated composition: sway on GLES/EGL over a DRM render node painted the colours it was told to and grim read them back"
+	elif grep -q "RENDER-SMOKE: accel-status unavailable" "$LOG" 2>/dev/null; then
+		skipped "accelerated composition produces a frame" \
+			"$(grep -h 'RENDER-SMOKE: accel-status unavailable' "$LOG" | head -1 | sed 's/.*reason=//') — build the driver image with: make B1NIX_GPU_DRV=1 iso && boot it with b1nix.render-smoke"
+	else
+		check_output "$LOG" "RENDER-SMOKE: accel-status" \
+			"the accelerated path is evaluated and its verdict recorded"
+	fi
 
 	# The display server this section tested is gone: sway drives the display
 	# now, through the imported DRM stack, and its run lives in

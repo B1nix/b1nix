@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <time.h>
 #include <sys/socket.h>
@@ -339,6 +340,91 @@ static void test_unix_socket_events(void) {
   unlink(sun.sun_path);
 }
 
+/* shutdown(2)'s half-close, from the side that has to hear about it.
+ *
+ * Closing the write half is a statement to the PEER: its read must drain
+ * whatever is already queued and then return 0, and its poll must say the
+ * socket is readable so an event loop wakes up to find that out. b1nix
+ * recorded the flag on the calling socket and told the peer nothing, so both
+ * ends sat waiting for each other -- which is how `udevadm control --ping`
+ * timed out against a systemd-udevd that had already answered: udevadm shuts
+ * its write half and waits for the daemon to close, and the daemon closes when
+ * its read returns 0.
+ *
+ * The reverse direction is checked too, because "the peer sees EOF" must not
+ * be got by tearing the connection down: a half-close closes one direction. */
+#ifndef POLLRDHUP
+#define POLLRDHUP 0x2000
+#endif
+static void test_unix_half_close(void) {
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0) {
+    marker("UNIX-SMOKE: fail halfclose-socketpair\n");
+    return;
+  }
+
+  /* Queue data, THEN close the write half: the reader must see the bytes
+   * before the end of file, not lose them to it. */
+  if (write(sp[1], "bye", 3) != 3) {
+    marker("UNIX-SMOKE: fail halfclose-write\n");
+    close(sp[0]); close(sp[1]);
+    return;
+  }
+  if (shutdown(sp[1], SHUT_WR) < 0) {
+    marker("UNIX-SMOKE: fail shutdown-wr-call\n");
+    close(sp[0]); close(sp[1]);
+    return;
+  }
+
+  char buf[8];
+  ssize_t n = read(sp[0], buf, sizeof(buf));
+  if (n != 3 || memcmp(buf, "bye", 3) != 0) {
+    marker("UNIX-SMOKE: fail shutdown-wr-eof\n");
+    close(sp[0]); close(sp[1]);
+    return;
+  }
+
+  /* Readable, and readable for the reason the reader asked about. Polled
+   * before the second read, because a loop that is never told the socket is
+   * readable never makes that read at all. */
+  struct pollfd pfd = {sp[0], POLLIN | POLLRDHUP, 0};
+  int pr = poll(&pfd, 1, 1000);
+  if (pr == 1 && (pfd.revents & POLLIN) && (pfd.revents & POLLRDHUP))
+    marker("UNIX-SMOKE: ok shutdown-wr-poll\n");
+  else
+    marker("UNIX-SMOKE: fail shutdown-wr-poll\n");
+
+  n = read(sp[0], buf, sizeof(buf));
+  if (n == 0)
+    marker("UNIX-SMOKE: ok shutdown-wr-eof\n");
+  else
+    marker("UNIX-SMOKE: fail shutdown-wr-eof\n");
+
+  /* One direction, not both: sp[0] may still write and sp[1] may still read.
+   * And sp[1] itself may no longer write -- POSIX says EPIPE. */
+  int reverse_ok = 0;
+  if (write(sp[0], "back", 4) == 4) {
+    char rb[8];
+    if (read(sp[1], rb, sizeof(rb)) == 4 && memcmp(rb, "back", 4) == 0)
+      reverse_ok = 1;
+  }
+  /* A write to a socket whose write half is shut raises SIGPIPE as well as
+   * reporting EPIPE, and the default disposition would end this test rather
+   * than let it report. */
+  void (*old_pipe)(int) = signal(SIGPIPE, SIG_IGN);
+  errno = 0;
+  ssize_t w = write(sp[1], "x", 1);
+  int epipe_ok = (w < 0 && errno == EPIPE);
+  signal(SIGPIPE, old_pipe);
+  if (reverse_ok && epipe_ok)
+    marker("UNIX-SMOKE: ok shutdown-wr-oneway\n");
+  else
+    marker("UNIX-SMOKE: fail shutdown-wr-oneway\n");
+
+  close(sp[0]);
+  close(sp[1]);
+}
+
 /* SO_RCVTIMEO: a blocking recv with nothing to read must give up at the
  * deadline and report EAGAIN, not wait forever. */
 static void test_socket_timeouts(void) {
@@ -388,6 +474,7 @@ static void test_socket_timeouts(void) {
 
 int main(void) {
   test_unix_socket_events();
+  test_unix_half_close();
   test_socket_timeouts();
   test_ping_gateway();
   test_udp_send_recv();

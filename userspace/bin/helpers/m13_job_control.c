@@ -13,6 +13,18 @@
 
 static void marker(const char *s) { write(1, s, strlen(s)); }
 
+/*
+ * Poll until the child reports the state we are waiting for.
+ *
+ * The bound is a guard against hanging the whole instance, not a measurement:
+ * what is asserted is WIFSTOPPED/WIFCONTINUED, and that assertion is unchanged
+ * however long the wait runs. It used to be 256 tries -- about half a second --
+ * which is ample on an idle machine and NOT ample when the host is running
+ * several emulators at once: the run then reported "fail wuntraced" for a
+ * child that was merely late being scheduled. A generous bound removes that
+ * false failure without weakening the check, because a kernel that never
+ * reports the stop still fails here, just later.
+ */
 static int wait_for_status(int pid, int options, int *status_out, int tries) {
   int st = 0;
   for (int i = 0; i < tries; i++) {
@@ -88,7 +100,7 @@ int main(void) {
   }
 
   int st = 0;
-  if (wait_for_status(child, WUNTRACED, &st, 256) != 0 ||
+  if (wait_for_status(child, WUNTRACED, &st, 4000) != 0 ||
       !WIFSTOPPED(st)) {
     marker("M13-JC-SMOKE: fail wuntraced\n");
     return 1;
@@ -106,7 +118,7 @@ int main(void) {
     marker("M13-JC-SMOKE: fail sigcont\n");
     return 1;
   }
-  if (wait_for_status(child, WCONTINUED, &st, 128) != 0 ||
+  if (wait_for_status(child, WCONTINUED, &st, 4000) != 0 ||
       !WIFCONTINUED(st)) {
     marker("M13-JC-SMOKE: fail wcontinued\n");
     return 1;
@@ -128,7 +140,7 @@ int main(void) {
     _exit(3);
   }
   setpgid(reader, reader);
-  if (wait_for_status(reader, WUNTRACED, &st, 128) != 0 ||
+  if (wait_for_status(reader, WUNTRACED, &st, 4000) != 0 ||
       !stopped_by(st, SIGTTIN)) {
     marker("M13-JC-SMOKE: fail sigttin\n");
     kill(reader, SIGKILL);
@@ -164,7 +176,7 @@ int main(void) {
     _exit(4);
   }
   setpgid(writer, writer);
-  if (wait_for_status(writer, WUNTRACED, &st, 128) != 0 ||
+  if (wait_for_status(writer, WUNTRACED, &st, 4000) != 0 ||
       !stopped_by(st, SIGTTOU)) {
     tcsetattr(1, TCSADRAIN, &old_t);
     marker("M13-JC-SMOKE: fail sigttou\n");

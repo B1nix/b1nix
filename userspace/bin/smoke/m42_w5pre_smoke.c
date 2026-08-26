@@ -15,6 +15,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <poll.h>
+#include <time.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -271,6 +273,91 @@ int main(void) {
         return 1;
     }
     ok("sigsuspend-alarm");
+
+    /* A signal the caller keeps blocked, unblocked only by the wait mask.
+     *
+     * This is the case that distinguishes a correct sigsuspend from one that
+     * restores the caller's mask too early. The handler has to run while the
+     * wait mask is installed; a kernel that puts the original mask back before
+     * delivery re-blocks the very signal that ended the wait, so no handler
+     * runs, the signal stays pending, and a program that loops on sigsuspend —
+     * every shell waiting for a child does — never makes progress again. */
+    g_sigusr1_count = 0;
+    raise(SIGUSR1);                       /* blocked: pends, does not run */
+    if (g_sigusr1_count != 0) {
+        fail("sigsuspend-blocked-signal");
+        return 1;
+    }
+    sigset_t wait_mask;
+    sigfillset(&wait_mask);
+    sigdelset(&wait_mask, SIGUSR1);
+    ss_rc = sigsuspend(&wait_mask);
+    if (ss_rc != -1 || errno != EINTR || g_sigusr1_count != 1) {
+        char sb[128];
+        snprintf(sb, sizeof(sb), "sigsuspend-blocked-signal: rc=%d errno=%d count=%d\n",
+                 ss_rc, errno, g_sigusr1_count);
+        emit(sb);
+        fail("sigsuspend-blocked-signal");
+        return 1;
+    }
+    /* And the caller's own mask is back afterwards: SIGUSR1 blocked again. */
+    sigset_t after;
+    sigemptyset(&after);
+    sigprocmask(SIG_BLOCK, NULL, &after);
+    if (!sigismember(&after, SIGUSR1)) {
+        fail("sigsuspend-mask-restored");
+        return 1;
+    }
+    ok("sigsuspend-blocked-signal");
+
+    /* ppoll's mask argument is the same promise sigsuspend makes, for a wait
+     * on descriptors instead of on nothing: a signal blocked everywhere else
+     * must be deliverable for the duration of this call. A kernel that drops
+     * the argument leaves such a program unkillable by that signal — it stays
+     * pending while the process runs on. */
+    g_sigalrm_count = 0;
+    sigset_t alrm_mask;
+    sigemptyset(&alrm_mask);
+    sigaddset(&alrm_mask, SIGALRM);
+    sigprocmask(SIG_BLOCK, &alrm_mask, NULL);
+    alarm(1);
+    sigset_t poll_mask;
+    sigfillset(&poll_mask);
+    sigdelset(&poll_mask, SIGALRM);
+    struct timespec pto = { 5, 0 };
+    int pp = ppoll(NULL, 0, &pto, &poll_mask);
+    if (pp != -1 || errno != EINTR || g_sigalrm_count != 1) {
+        char pb[128];
+        snprintf(pb, sizeof(pb), "pwait-sigmask: rc=%d errno=%d count=%d\n",
+                 pp, errno, g_sigalrm_count);
+        emit(pb);
+        fail("pwait-sigmask");
+        return 1;
+    }
+    sigprocmask(SIG_UNBLOCK, &alrm_mask, NULL);
+    ok("pwait-sigmask");
+
+    /* And the timeout it was given, not the millisecond it rounds to.
+     *
+     * ppoll and pselect take a timespec because sub-millisecond waits are the
+     * point of them. Rounded to whole milliseconds, 200 us became either zero —
+     * an event loop that spins at full speed — or a whole tick. Measure both
+     * ends: the call must actually wait, and it must not wait ten times too
+     * long. */
+    struct timespec t0, t1, tiny = { 0, 200000 };  /* 200 us */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int tp = ppoll(NULL, 0, &tiny, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long long el_us = (long long)(t1.tv_sec - t0.tv_sec) * 1000000
+                    + (t1.tv_nsec - t0.tv_nsec) / 1000;
+    if (tp != 0 || el_us < 150 || el_us > 20000) {
+        char tb[128];
+        snprintf(tb, sizeof(tb), "ppoll-precision: rc=%d elapsed=%lldus\n", tp, el_us);
+        emit(tb);
+        fail("ppoll-precision");
+        return 1;
+    }
+    ok("ppoll-precision");
 
     // Test interrupted waitpid
     // We unblock SIGUSR1 in parent, spawn thread or just waitpid, but waitpid is interrupted by signal.

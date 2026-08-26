@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -37,6 +38,9 @@
 #include <unistd.h>
 
 #define SHM_SIZE 8192
+/* Big enough that backing it eagerly is unmistakable against any plausible
+ * machine, and far larger than this test ever touches. */
+#define SPARSE_SIZE ((off_t)512 * 1024 * 1024)
 #define PARENT_BYTE 0xA5
 #define CHILD_BYTE  0x5C
 
@@ -247,12 +251,106 @@ static void test_shm_open_shared(void) {
 	shm_unlink(name);
 }
 
+/* Reading MemFree, in kB. Negative if it cannot be read. */
+static long mem_free_kb(void) {
+	FILE *f = fopen("/proc/meminfo", "r");
+	char line[128];
+	long kb = -1;
+
+	if (!f)
+		return -1;
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "MemFree:", 8) == 0) {
+			kb = strtol(line + 8, NULL, 10);
+			break;
+		}
+	}
+	fclose(f);
+	return kb;
+}
+
+/*
+ * Declaring a size must not spend the memory, and writing after declaring it
+ * must not walk off the buffer.
+ *
+ * A compositor sizes a buffer pool once and then paints small pieces of it.
+ * When ftruncate allocated the whole length up front, a few such pools
+ * exhausted a 4 GiB machine about twenty seconds into a desktop session, and
+ * what failed afterwards was never the allocation itself -- it was a lazy page
+ * with no frame behind it, or a shootdown stalled behind a starved CPU. None
+ * of the existing checks noticed, because none of them declares a size it does
+ * not then fill.
+ *
+ * The write is the second half and its own trap: once the declared size stops
+ * matching the buffer, a grow path that copies `size` rather than the buffer's
+ * real extent reads and writes far past both.
+ */
+static void test_large_sparse(void) {
+	long before, after;
+	int fd = memfd_create("shm-sparse", MFD_CLOEXEC);
+	unsigned char buf[64];
+	static const unsigned char pattern[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+	if (fd < 0) { bad("sparse-ftruncate", "memfd_create"); return; }
+
+	before = mem_free_kb();
+	if (ftruncate(fd, SPARSE_SIZE) != 0) {
+		bad("sparse-ftruncate", "ftruncate");
+		close(fd);
+		return;
+	}
+	after = mem_free_kb();
+
+	if (before < 0 || after < 0) {
+		bad("sparse-ftruncate", "cannot read MemFree");
+	} else if (before - after > (long)(SPARSE_SIZE / 1024 / 4)) {
+		/* A quarter of the declared size is far beyond any bookkeeping and
+		 * far below the whole thing, so this separates "lazy" from "eager"
+		 * without depending on how much else the machine is doing. */
+		bad("sparse-ftruncate", "declaring a size consumed the memory");
+	} else {
+		ok("sparse-ftruncate");
+	}
+
+	/* The overflow case: a tiny write into a hugely declared file. */
+	if (pwrite(fd, pattern, sizeof(pattern), 0) != (ssize_t)sizeof(pattern)) {
+		bad("sparse-write", "pwrite");
+	} else {
+		memset(buf, 0xEE, sizeof(buf));
+		if (pread(fd, buf, sizeof(pattern), 0) != (ssize_t)sizeof(pattern))
+			bad("sparse-write", "pread");
+		else if (memcmp(buf, pattern, sizeof(pattern)) != 0)
+			bad("sparse-write", "read back what was not written");
+		else
+			ok("sparse-write");
+	}
+
+	/* Everything not written reads as zeroes, including far past any buffer
+	 * the write above may have caused to exist. */
+	memset(buf, 0xEE, sizeof(buf));
+	if (pread(fd, buf, sizeof(buf), SPARSE_SIZE - 4096) != (ssize_t)sizeof(buf)) {
+		bad("sparse-hole", "pread past the written region");
+	} else {
+		size_t i;
+
+		for (i = 0; i < sizeof(buf); i++)
+			if (buf[i] != 0)
+				break;
+		if (i != sizeof(buf))
+			bad("sparse-hole", "a hole did not read as zeroes");
+		else
+			ok("sparse-hole");
+	}
+	close(fd);
+}
+
 int main(void) {
 	printf("SHMSHARE: start\n");
 	fflush(stdout);
 	test_fork_shared();
 	test_scm_rights_shared();
 	test_shm_open_shared();
+	test_large_sparse();
 	printf("SHMSHARE: done\n");
 	fflush(stdout);
 	return 0;

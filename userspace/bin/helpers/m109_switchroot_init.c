@@ -69,7 +69,22 @@ int main(void) {
     marker("M109-SMOKE: FAIL switchroot-init-file");
 
   mkdir(NEWROOT, 0755);
-  if (mount("/dev/ram0", NEWROOT, "ext4", 0, NULL) != 0) {
+  /* The real root is whichever device carries it.
+   *
+   * It used to be /dev/ram0 without qualification, which was true only while
+   * the image travelled inside the boot image as a RAM disk. Served off a disk
+   * — which is how the instances boot now, and how a real machine boots — it is
+   * a block device with the same contents and a different name, so try the
+   * candidates in turn rather than naming one. */
+  static const char *const roots[] = { "/dev/ram0", "/dev/vda", "/dev/vdb",
+                                       "/dev/sata0" };
+  int mounted = 0;
+
+  for (unsigned i = 0; i < sizeof(roots) / sizeof(roots[0]) && !mounted; i++) {
+    if (mount(roots[i], NEWROOT, "ext4", 0, NULL) == 0)
+      mounted = 1;
+  }
+  if (!mounted) {
     marker("M109-SMOKE: FAIL switchroot-mount-newroot");
     marker("M109-SMOKE: done-switchroot");
     return 1;

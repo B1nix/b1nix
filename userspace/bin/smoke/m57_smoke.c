@@ -21,10 +21,12 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -631,6 +633,125 @@ static void test_mojo_broker(void) {
   }
 }
 
+/* ---- unix-addrlen: an address is as long as it actually is -------------- */
+/*
+ * getsockname(2) and getpeername(2) report the address's TRUE length, and a
+ * caller may reuse that number as the capacity for its next call. Qt's socket
+ * engine does exactly that: one `socklen_t sockAddrSize = sizeof(qt_sockaddr)`
+ * (28 bytes) handed to getsockname and then, unchanged, to getpeername. A
+ * kernel that answers the first call with a flat sizeof(struct sockaddr_un)
+ * (110) tells it the buffer is 110 bytes long and the second call fills 110
+ * bytes of a 28-byte object -- which is a detected stack smash in the caller,
+ * not a diagnosable kernel fault. That is what killed every kioworker KDE
+ * started.
+ *
+ * Two things are checked, and the second is the one that would have caught it:
+ *   - the reported length matches Linux (2 for an unnamed socket, the offset of
+ *     sun_path plus the NUL-terminated name for a bound one);
+ *   - a call given a capacity larger than the address writes only the address,
+ *     leaving the bytes past it untouched.
+ */
+static void test_unix_addrlen(void) {
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    fail("unix-addrlen", errno, 0);
+    return;
+  }
+
+  /* Both ends of a socketpair are unnamed: sizeof(sa_family_t) == 2. */
+  struct sockaddr_un sa;
+  socklen_t len = sizeof(sa);
+  memset(&sa, 0, sizeof(sa));
+  if (getsockname(sv[0], (struct sockaddr *)&sa, &len) != 0) {
+    fail("unix-addrlen", errno, 0);
+    goto out;
+  }
+  if (len != (socklen_t)sizeof(sa_family_t)) {
+    fail("unix-addrlen", (long)len, (long)sizeof(sa_family_t));
+    goto out;
+  }
+  if (sa.sun_family != AF_UNIX) {
+    fail("unix-addrlen", sa.sun_family, AF_UNIX);
+    goto out;
+  }
+  socklen_t plen = sizeof(sa);
+  if (getpeername(sv[0], (struct sockaddr *)&sa, &plen) != 0) {
+    fail("unix-addrlen", errno, 0);
+    goto out;
+  }
+  if (plen != (socklen_t)sizeof(sa_family_t)) {
+    fail("unix-addrlen", (long)plen, (long)sizeof(sa_family_t));
+    goto out;
+  }
+
+  /* A bound socket reports offsetof(sun_path) + strlen(path) + 1. */
+  {
+    static const char path[] = "/tmp/m57_addrlen.sock";
+    unlink(path);
+    int ls = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ls < 0) {
+      fail("unix-addrlen", errno, 0);
+      goto out;
+    }
+    struct sockaddr_un ba;
+    memset(&ba, 0, sizeof(ba));
+    ba.sun_family = AF_UNIX;
+    strcpy(ba.sun_path, path);
+    socklen_t want =
+        (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1);
+    if (bind(ls, (struct sockaddr *)&ba, sizeof(ba)) != 0) {
+      close(ls);
+      unlink(path);
+      fail("unix-addrlen", errno, 0);
+      goto out;
+    }
+    struct sockaddr_un got;
+    socklen_t glen = sizeof(got);
+    memset(&got, 0, sizeof(got));
+    int rc = getsockname(ls, (struct sockaddr *)&got, &glen);
+    close(ls);
+    unlink(path);
+    if (rc != 0 || glen != want || strcmp(got.sun_path, path) != 0) {
+      fail("unix-addrlen", (long)glen, (long)want);
+      goto out;
+    }
+  }
+  ok("unix-addrlen");
+
+  /* The Qt sequence itself: ONE socklen_t handed to getsockname and then,
+   * unchanged, to getpeername, with a 28-byte object to write into. The
+   * backing buffer is far larger than the object so a kernel that overruns is
+   * reported here instead of taking the test process down with it; the guard
+   * immediately after the object is what a compiler puts its canary next to. */
+  {
+    enum { QT_SOCKADDR = 28, GUARD = 8, SLACK = 192 };
+    unsigned char buf[QT_SOCKADDR + GUARD + SLACK];
+    memset(buf, 0, sizeof(buf));
+    memset(buf + QT_SOCKADDR, 0xA5, GUARD);
+
+    socklen_t sock_addr_size = QT_SOCKADDR;
+    if (getsockname(sv[0], (struct sockaddr *)buf, &sock_addr_size) != 0) {
+      fail("unix-addrlen-reuse", errno, 0);
+      goto out;
+    }
+    if (getpeername(sv[0], (struct sockaddr *)buf, &sock_addr_size) != 0) {
+      fail("unix-addrlen-reuse", errno, 0);
+      goto out;
+    }
+    for (int i = 0; i < GUARD; i++) {
+      if (buf[QT_SOCKADDR + i] != 0xA5) {
+        fail("unix-addrlen-reuse", buf[QT_SOCKADDR + i], 0xA5);
+        goto out;
+      }
+    }
+    ok("unix-addrlen-reuse");
+  }
+
+out:
+  close(sv[0]);
+  close(sv[1]);
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && argv[1] && strcmp(argv[1], "execchild") == 0)
     return exec_child_main(argc, argv);
@@ -644,6 +765,7 @@ int main(int argc, char **argv) {
   test_fd_broker();
   test_fd_broker_death();
   test_dupfd_cloexec();
+  test_unix_addrlen();
 
   test_mojo_pipe();
   test_mojo_shm();

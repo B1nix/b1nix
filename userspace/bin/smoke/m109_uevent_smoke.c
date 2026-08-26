@@ -268,6 +268,240 @@ static int uev_wait(int fd, const char *want, struct uev *out) {
   return -1;
 }
 
+/* ── coldplug, the subsystem link and socket filters ─────────────────────── */
+
+/*
+ * Writing an action to a device's `uevent` file makes the kernel re-announce
+ * it. This is the whole of device coldplug: everything present at boot was
+ * announced before any listener existed, and `udevadm trigger` (and `mdev -s`,
+ * and every other hotplug manager) recovers those announcements by writing
+ * "add" to each uevent file. A kernel that takes the write and says nothing
+ * leaves udev with an empty database.
+ */
+static void test_uevent_trigger(int nlfd) {
+  /* loop0 exists from boot, so this is unambiguously a device that was
+   * announced long before this socket was bound. */
+  const char *path = "/sys/block/loop0/uevent";
+  int fd = open(path, O_WRONLY);
+  if (fd < 0) {
+    failm("uevent-trigger", "cannot open /sys/block/loop0/uevent for writing");
+    return;
+  }
+  ssize_t w = write(fd, "add", 3);
+  close(fd);
+  if (w != 3) {
+    failm("uevent-trigger", "the write was not accepted");
+    return;
+  }
+
+  struct uev e;
+  if (uev_wait(nlfd, "add@/block/loop0", &e) != 0) {
+    failm("uevent-trigger", "no add@/block/loop0 arrived on the socket");
+    return;
+  }
+  if (strcmp(e.action, "add") != 0 || strcmp(e.subsystem, "block") != 0 ||
+      strcmp(e.devname, "loop0") != 0 || !e.have_seqnum) {
+    note("action='%s' subsystem='%s' devname='%s' seqnum=%d", e.action,
+         e.subsystem, e.devname, e.have_seqnum);
+    failm("uevent-trigger", "the re-announcement is not the device's own");
+    return;
+  }
+  ok("uevent-trigger");
+}
+
+/* udev learns the subsystem of a device it found by scanning /sys from the
+ * basename of the device's `subsystem` symlink. Without it every
+ * SUBSYSTEM=="..." rule misses. */
+static void test_subsystem_link(void) {
+  char target[256];
+  ssize_t n = readlink("/sys/block/loop0/subsystem", target, sizeof(target) - 1);
+  if (n <= 0) {
+    failm("sysfs-subsystem-link", "/sys/block/loop0/subsystem is not a link");
+    return;
+  }
+  target[n] = '\0';
+  const char *base = strrchr(target, '/');
+  base = base ? base + 1 : target;
+  if (strcmp(base, "block") != 0) {
+    note("subsystem -> '%s'", target);
+    failm("sysfs-subsystem-link", "the link does not name the block subsystem");
+    return;
+  }
+  ok("sysfs-subsystem-link");
+}
+
+/* SO_ATTACH_FILTER, and the group-2 relay udevd uses.
+ *
+ * systemd's device monitor binds group 2 — the group udevd re-broadcasts on
+ * once it has processed an event — and installs a classic-BPF program so the
+ * kernel drops everything that does not carry the tag it wants. It treats the
+ * setsockopt failing as fatal, so without a filter engine there is no device
+ * monitor at all, and no `.device` unit can ever activate.
+ */
+#define SO_ATTACH_FILTER_NR 26
+#define SO_DETACH_FILTER_NR 27
+
+struct bpf_insn_u {
+  unsigned short code;
+  unsigned char jt;
+  unsigned char jf;
+  unsigned int k;
+};
+
+struct bpf_prog_u {
+  unsigned short len;
+  unsigned short pad[3];
+  struct bpf_insn_u *filter;
+};
+
+/* A socket on the udev group. groups=0 means "sender only": it is registered
+ * for nothing and therefore never receives its own broadcast. */
+static int udev_group_socket(unsigned int groups) {
+  int fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
+  if (fd < 0)
+    return -1;
+  struct timeval tv;
+  tv.tv_sec = 1;
+  tv.tv_usec = 0;
+  (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  struct nlsa sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.nl_family = AF_NETLINK;
+  sa.nl_pid = 0; /* the kernel picks one */
+  sa.nl_groups = groups;
+  if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static int udev_group_send(int fd, const char *payload, size_t len) {
+  struct nlsa dst;
+  memset(&dst, 0, sizeof(dst));
+  dst.nl_family = AF_NETLINK;
+  dst.nl_pid = 0;
+  dst.nl_groups = 2; /* the "udev" group */
+  return (int)sendto(fd, payload, len, 0, (struct sockaddr *)&dst, sizeof(dst));
+}
+
+/* One datagram, or -1 when the socket's timeout expires with nothing there. */
+static int udev_group_recv(int fd, char *buf, size_t cap) {
+  ssize_t n = recv(fd, buf, cap - 1, 0);
+  if (n <= 0)
+    return -1;
+  buf[n] = '\0';
+  return (int)n;
+}
+
+static void test_bpf_filter(void) {
+  /* Two payloads that differ only in their first four bytes, which is what the
+   * filter looks at. Both are long enough to be a real netlink datagram. */
+  static const char wanted[] = "B1NXadd@/block/filter-yes";
+  static const char unwanted[] = "ZZZZadd@/block/filter-no!";
+
+  int sender = udev_group_socket(0);
+  int filtered = udev_group_socket(2);
+  int plain = udev_group_socket(2);
+  if (sender < 0 || filtered < 0 || plain < 0) {
+    failm("uevent-bpf-filter", "could not bind the udev group");
+    goto out;
+  }
+
+  /* Accept a datagram whose first 32-bit word is "B1NX", drop everything else.
+   * BPF_ABS loads are big-endian by definition of the instruction set. */
+  struct bpf_insn_u prog[] = {
+      {0x20, 0, 0, 0},          /* ld  [0]            (BPF_LD|BPF_W|BPF_ABS) */
+      {0x15, 0, 1, 0x42314e58}, /* jeq #"B1NX", else +1                      */
+      {0x06, 0, 0, 0xffffffff}, /* ret #-1  (accept the whole datagram)      */
+      {0x06, 0, 0, 0},          /* ret #0   (drop)                           */
+  };
+  struct bpf_prog_u fp;
+  fp.len = (unsigned short)(sizeof(prog) / sizeof(prog[0]));
+  fp.pad[0] = fp.pad[1] = fp.pad[2] = 0;
+  fp.filter = prog;
+  if (setsockopt(filtered, SOL_SOCKET, SO_ATTACH_FILTER_NR, &fp, sizeof(fp)) !=
+      0) {
+    failm("uevent-bpf-filter", "SO_ATTACH_FILTER was refused");
+    goto out;
+  }
+
+  /* A program the verifier must refuse: the last instruction is not a return,
+   * so it has no defined result. Accepting it would be worse than refusing it. */
+  struct bpf_insn_u bad[] = {{0x20, 0, 0, 0}};
+  struct bpf_prog_u badfp;
+  badfp.len = 1;
+  badfp.pad[0] = badfp.pad[1] = badfp.pad[2] = 0;
+  badfp.filter = bad;
+  if (setsockopt(plain, SOL_SOCKET, SO_ATTACH_FILTER_NR, &badfp,
+                 sizeof(badfp)) == 0) {
+    failm("uevent-bpf-filter", "a program with no return was accepted");
+    goto out;
+  }
+
+  if (udev_group_send(sender, unwanted, sizeof(unwanted)) < 0 ||
+      udev_group_send(sender, wanted, sizeof(wanted)) < 0) {
+    failm("uevent-bpf-filter", "the group-2 relay refused the send");
+    goto out;
+  }
+
+  /* The unfiltered socket sees both, in order: that is what proves the relay
+   * delivered them at all, and therefore that the filtered socket's silence is
+   * the filter's doing and not a lost message. */
+  char buf[256];
+  if (udev_group_recv(plain, buf, sizeof(buf)) < 0 ||
+      strcmp(buf, unwanted) != 0) {
+    failm("uevent-bpf-filter", "the unfiltered socket missed the first message");
+    goto out;
+  }
+  if (udev_group_recv(plain, buf, sizeof(buf)) < 0 ||
+      strcmp(buf, wanted) != 0) {
+    failm("uevent-bpf-filter", "the unfiltered socket missed the second message");
+    goto out;
+  }
+
+  /* The filtered socket sees only the one its program accepts. */
+  if (udev_group_recv(filtered, buf, sizeof(buf)) < 0) {
+    failm("uevent-bpf-filter", "the filtered socket received nothing at all");
+    goto out;
+  }
+  if (strcmp(buf, wanted) != 0) {
+    note("filtered socket got '%s'", buf);
+    failm("uevent-bpf-filter", "the filter passed a message it should drop");
+    goto out;
+  }
+  if (udev_group_recv(filtered, buf, sizeof(buf)) >= 0) {
+    failm("uevent-bpf-filter", "the filtered socket had a second message");
+    goto out;
+  }
+  ok("uevent-bpf-filter");
+
+  /* Detaching puts it back: the same rejected message now arrives. */
+  if (setsockopt(filtered, SOL_SOCKET, SO_DETACH_FILTER_NR, &(int){0},
+                 sizeof(int)) != 0) {
+    failm("uevent-bpf-detach", "SO_DETACH_FILTER was refused");
+    goto out;
+  }
+  if (udev_group_send(sender, unwanted, sizeof(unwanted)) < 0) {
+    failm("uevent-bpf-detach", "the group-2 relay refused the send");
+    goto out;
+  }
+  if (udev_group_recv(filtered, buf, sizeof(buf)) < 0 ||
+      strcmp(buf, unwanted) != 0) {
+    failm("uevent-bpf-detach", "the socket is still filtering after detach");
+    goto out;
+  }
+  ok("uevent-bpf-detach");
+
+out:
+  if (sender >= 0)
+    close(sender);
+  if (filtered >= 0)
+    close(filtered);
+  if (plain >= 0)
+    close(plain);
+}
+
 /* ── loop-control ────────────────────────────────────────────────────────── */
 
 static int loop_ctl(int req, int n) {
@@ -580,11 +814,16 @@ int main(void) {
   (void)loop_ctl(LOOP_CTL_REMOVE, HOT_LOOP);
   (void)unlink(HOT_NODE);
 
+  test_subsystem_link();
+  test_bpf_filter();
+
   int nlfd = uevent_socket();
   if (nlfd < 0) {
+    failm("uevent-trigger", "could not bind NETLINK_KOBJECT_UEVENT");
     failm("uevent-hotplug-add", "could not bind NETLINK_KOBJECT_UEVENT");
     failm("uevent-hotplug-remove", "could not bind NETLINK_KOBJECT_UEVENT");
   } else {
+    test_uevent_trigger(nlfd);
     test_hotplug_add(nlfd);
     test_mdev_scan();
     test_hotplug_remove(nlfd);

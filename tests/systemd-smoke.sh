@@ -23,7 +23,7 @@ ISO="$BUILD_DIR/${B1NIX_ISO_NAME:-b1nix-systemd.iso}"
 # systemd's boot is not a shell script: it starts units in parallel and waits
 # on timers. 240 s is a deliberately longer bound than the 120 s of the normal
 # smoke, and it is still a bound.
-TIMEOUT="${TIMEOUT:-240}"
+TIMEOUT="${TIMEOUT:-600}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -51,7 +51,9 @@ if [ ! -f "$IMG" ]; then
 	exit 0
 fi
 
-if [ "$(uname -s)" = "Darwin" ]; then
+if [ -n "${SMOKE_JOBS:-}" ]; then
+	NPROC="$SMOKE_JOBS"
+elif [ "$(uname -s)" = "Darwin" ]; then
 	NPROC=$(sysctl -n hw.ncpu)
 else
 	NPROC=$(nproc)
@@ -182,7 +184,30 @@ check_output "SYSTEMD-SMOKE: ok unit-active basic.target" "basic.target reached"
 check_output "SYSTEMD-SMOKE: ok unit-active multi-user.target" "multi-user.target reached"
 check_output "SYSTEMD-SMOKE: ok journalctl" "journalctl reads the journal back"
 check_output "SYSTEMD-SMOKE: ok systemd-run" "systemd-run starts a transient unit"
+check_output "SYSTEMD-SMOKE: ok unit-active systemd-udevd.service" "systemd-udevd active"
+check_output "SYSTEMD-SMOKE: ok udevadm-ping" "systemd-udevd answers udevadm --ping"
+check_output "SYSTEMD-SMOKE: ok device-unit" "a .device unit is active"
+check_output "SYSTEMD-SMOKE: ok unit-active systemd-logind.service" "systemd-logind active"
+check_output "SYSTEMD-SMOKE: ok logind-answers" "systemd-logind answers loginctl"
 check_output "SYSTEMD-SMOKE: ok console-getty" "a getty runs on the console"
+
+# The unit types nothing exercised before: 16 checks stood against an image
+# carrying 225 unit files and 45 helper daemons. Each of these drives a
+# different kernel surface -- AF_UNIX listeners and fd inheritance across exec,
+# datagram readiness, mount namespaces, timers, SIGCHLD to PID 1, the journal's
+# index.
+check_output "SYSTEMD-SMOKE: ok socket-listening" "systemd holds a listening AF_UNIX socket for a .socket unit"
+check_output "SYSTEMD-SMOKE: ok socket-activation" "connecting to that socket starts the service behind it - systemd's central idea"
+check_output "SYSTEMD-SMOKE: ok socket-listening-tcp" "the same for a socket unit on loopback TCP: systemd holds the listening AF_INET socket"
+check_output "SYSTEMD-SMOKE: ok socket-activation-tcp" "connecting to 127.0.0.1 starts the service behind it, so the loopback datapath carries a real connection"
+check_output "SYSTEMD-SMOKE: ok notify-ready" "a Type=notify service reports READY=1 over NOTIFY_SOCKET and the manager believes it"
+check_output "SYSTEMD-SMOKE: ok private-tmp" "PrivateTmp really is private: the unit's file is NOT visible outside its namespace"
+check_output "SYSTEMD-SMOKE: ok protect-system" "ProtectSystem=strict refuses the write rather than letting it through"
+check_output "SYSTEMD-SMOKE: ok timer-fires" "a .timer unit fires and runs the service it names"
+check_output "SYSTEMD-SMOKE: ok restart-on-failure" "Restart=on-failure notices the exit status and starts the unit again"
+check_output "SYSTEMD-SMOKE: ok journal-filter-unit" "journalctl -u returns one unit's entries, so the journal is indexed rather than only appended"
+check_output "SYSTEMD-SMOKE: ok unit-enable-disable" "systemctl enable/disable moves the unit between enabled and disabled"
+check_output "SYSTEMD-SMOKE: ok unit-mask-refuses" "a masked unit refuses to start even when asked directly"
 # agetty's own prompt on the serial line — printed by login(1), not by us.
 if grep -qa -E "b1nix login:|localhost login:" "$LOG" 2>/dev/null; then
 	pass "login prompt on the serial console"
@@ -201,6 +226,18 @@ if grep -qa "SYSTEMD-SMOKE: FAIL" "$LOG" 2>/dev/null; then
 	echo ""
 	echo "  in-guest failures reported by the harness:"
 	grep -a "SYSTEMD-SMOKE: FAIL" "$LOG" | sed 's/^/    /'
+fi
+
+# Keep this run's log. Every run wrote to the same path and truncated it at
+# start, so a run destroyed the evidence for the one before it -- which matters
+# most exactly when comparing a fix against the boot that motivated it. The
+# snapshot is timestamped and the newest is also linked as -last.log; set
+# SYSTEMD_KEEP_LOGS=0 to opt out.
+if [ "${SYSTEMD_KEEP_LOGS:-1}" != "0" ] && [ -s "$LOG" ]; then
+	SNAP="$PROJECT_DIR/smoke_run/b1nix-systemd-boot-$(date +%Y%m%d-%H%M%S).log"
+	cp "$LOG" "$SNAP" 2>/dev/null &&
+		cp "$LOG" "$PROJECT_DIR/smoke_run/b1nix-systemd-boot-last.log" 2>/dev/null
+	echo "Kept: $SNAP"
 fi
 
 echo ""

@@ -35,6 +35,17 @@
 #define WAITERS     8
 #define TIMED_LOOPS 500
 
+/* Milliseconds on the monotonic clock. Each phase reports its own, because
+ * "the three of them together took eight seconds" does not say which one is
+ * slow, and the answer decides which kernel path to look at. */
+static unsigned long now_ms_fs(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (unsigned long)ts.tv_sec * 1000UL + (unsigned long)ts.tv_nsec / 1000000UL;
+}
+
 static int futex_wait(volatile int *addr, int expect, int ms)
 {
 	struct timespec ts = { .tv_sec = ms / 1000,
@@ -75,6 +86,7 @@ static void *handoff_peer(void *arg)
 
 static int test_handoff(void)
 {
+	unsigned long phase_start = now_ms_fs();
 	pthread_t th;
 	int completed = 0;
 
@@ -105,7 +117,8 @@ static int test_handoff(void)
 	pthread_join(th, 0);
 
 	if (completed == ROUNDS) {
-		printf("FUTEX-STRESS: ok handoff (%d round trips)\n", completed);
+		printf("FUTEX-STRESS: ok handoff (%d round trips, %lu ms)\n", completed,
+		       now_ms_fs() - phase_start);
 		return 0;
 	}
 	printf("FUTEX-STRESS: FAIL handoff (stalled after %d of %d round trips)\n",
@@ -131,6 +144,7 @@ static void *broadcast_waiter(void *arg)
 
 static int test_broadcast(void)
 {
+	unsigned long phase_start = now_ms_fs();
 	pthread_t th[WAITERS];
 	int made = 0;
 
@@ -156,7 +170,8 @@ static int test_broadcast(void)
 		pthread_join(th[i], 0);
 
 	if (bcast_woken == WAITERS) {
-		printf("FUTEX-STRESS: ok broadcast (%d of %d woken)\n", bcast_woken,
+		printf("FUTEX-STRESS: ok broadcast (%lu ms) (%d of %d woken)\n",
+		       now_ms_fs() - phase_start, bcast_woken,
 		       WAITERS);
 		return 0;
 	}
@@ -188,6 +203,7 @@ static void *timed_waker(void *arg)
 
 static int test_timed(void)
 {
+	unsigned long phase_start = now_ms_fs();
 	pthread_t th;
 	int timeouts = 0;
 
@@ -219,7 +235,8 @@ static int test_timed(void)
 	pthread_join(th, 0);
 
 	if (timeouts == 0) {
-		printf("FUTEX-STRESS: ok timed (%d handoffs, no timeouts)\n",
+		printf("FUTEX-STRESS: ok timed (%lu ms) (%d handoffs, no timeouts)\n",
+		       now_ms_fs() - phase_start,
 		       TIMED_LOOPS);
 		return 0;
 	}
