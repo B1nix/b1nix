@@ -1,0 +1,19 @@
+# Libraries allowed to carry an unresolved symbol in the rootfs.
+#
+# tools/check-rootfs-links.sh fails the build when a binary cannot load: a
+# missing library, or a symbol nothing in its closure defines. That is the right
+# default -- the alternative is finding out inside the guest, where the only
+# evidence is a program that exits without a message.
+#
+# A few upstream libraries are built to resolve a symbol out of the EXECUTABLE
+# that loads them, so their closure genuinely does not contain it. Those are
+# listed here as "<path> <symbol> # reason". A line without a reason is an
+# error: an exception has to be an argued decision, not a way to quiet a check.
+#
+# The check still enforces everything else about the file, and every other file.
+
+# Samba resolves this out of the ctdbd binary, and the library is reached only
+# in a clustered Samba. It arrives with libsmbclient, which the Plasma closure
+# pulls in; removing it is not an option, because libtrusts-util-samba4.so
+# lists it in DT_NEEDED.
+usr/lib/samba/libsamba-cluster-support-samba4.so lp__ctdbd_socket # provided by the ctdbd executable at run time, cluster mode only

@@ -132,6 +132,12 @@ run_test /bin/m14_smoke blk
 # the latter at /mnt/ext4nvme — so it runs after m14_smoke has released it.
 run_test /bin/m109_smoke blk
 run_test /bin/m24b_smoke sys
+# Flash, as flash rather than as a slow disk. Only this instance is given a
+# chip (see tests/smoke.sh, which passes the pflash pair).
+if [ "$SMOKE_BLK" = "1" ] && [ -e /dev/mtd0 ]; then
+    /bin/sh /etc/mtd-smoke.sh
+fi
+
 run_test /bin/diskbench blk
 run_test /bin/ext_stress blk
 
@@ -153,6 +159,14 @@ run_test /bin/m51_xkb_smoke gfx
 run_test /bin/m51_harfbuzz_smoke gfx
 run_test /bin/m51_fontconfig_smoke gfx
 run_test /bin/m51_clipboard_smoke gfx
+
+# Composition, both paths. Software (pixman) and accelerated (GLES on a DRM
+# render node) are separate supported configurations, so each is run on purpose
+# and each carries its own marker — see /etc/render-smoke.sh. A shell script
+# rather than an ELF because the subject is the compositor and its clients.
+if [ "$SMOKE_GFX" = "1" ] && [ -x /etc/render-smoke.sh ]; then
+    /bin/sh /etc/render-smoke.sh
+fi
 
 # ---- posix (shell, coreutils, job control) ----
 run_test /bin/m13_job_control posix

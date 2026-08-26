@@ -244,6 +244,8 @@ enum {
      match kernel/include/b1nix/syscall.h. --- */
   SYS_UNSHARE          = 258, /* unshare(flags) */
   SYS_SETNS            = 259, /* setns(fd, nstype) */
+  /* readahead(fd, offset, count) -- matched with the kernel header. */
+  SYS_READAHEAD        = 260,
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

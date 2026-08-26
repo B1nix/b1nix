@@ -211,6 +211,38 @@ pkg_for_cmd_in() {
 		}' "$(index "$1")"
 }
 
+# Which package provides a plain name, for a dependency that is not a package.
+#
+# apk lets several packages answer to one name: plasma-workspace depends on
+# "pipewire-session-manager", and no package is called that -- wireplumber and
+# pipewire-media-session each list it under `p:`. Looking only at `P:` makes
+# such a dependency read as missing from the repository, which is what it did.
+pkg_for_provide_in() {
+	awk -v want="$2" -v RS= '
+		{
+			name = ""; found = 0
+			n = split($0, lines, "\n")
+			for (i = 1; i <= n; i++) {
+				if (lines[i] ~ /^P:/) name = substr(lines[i], 3)
+				if (lines[i] ~ /^p:/) {
+					split(substr(lines[i], 3), provs, " ")
+					for (j in provs) {
+						split(provs[j], kv, "=")
+						if (kv[1] == want) found = 1
+					}
+				}
+			}
+			if (found) { print name; exit }
+		}' "$(index "$1")"
+}
+
+pkg_for_provide() {
+	for r in $REPOS; do
+		got="$(pkg_for_provide_in "$r" "$1")"
+		[ -n "$got" ] && { echo "$got"; return; }
+	done
+}
+
 pkg_for_cmd() {
 	for r in $REPOS; do
 		n="$(pkg_for_cmd_in "$r" "$1")"
@@ -367,11 +399,23 @@ done
 # -dev packages of those, which is both useless to a linker that already has
 # the libraries and a large addition to alpine.lock.
 #
+# Each package's dependencies are read ONCE.
+#
+# The loop used to re-read every seen package on every round: eight rounds over
+# three hundred packages, each read an awk scan of a multi-megabyte index, so
+# the KDE closure took hours and the run was usually killed before it produced
+# an image. Expanding a package a second time cannot add anything the first
+# expansion missed, so the rounds now only look at what the previous round
+# newly installed, and the work becomes linear in the number of packages.
+PKGS_EXPANDED="$(mktemp)"
+: >"$PKGS_EXPANDED"
 round=0
 while [ "${ALPINE_LAYOUT:-flat}" = native ] && [ "$round" -lt 8 ]; do
 	round=$((round + 1))
 	added=0
-	for pkg in $(sort -u "$PKGS_SEEN"); do
+	for pkg in $(sort -u "$PKGS_SEEN" | grep -vxF -f "$PKGS_EXPANDED" 2>/dev/null ||
+		     sort -u "$PKGS_SEEN"); do
+		echo "$pkg" >>"$PKGS_EXPANDED"
 		set -- $(pkg_locate "$pkg")
 		[ -n "${1:-}" ] || continue
 		for dep in $(pkg_deps_in "$1" "$pkg"); do
@@ -390,6 +434,14 @@ while [ "${ALPINE_LAYOUT:-flat}" = native ] && [ "$round" -lt 8 ]; do
 			case "$dep" in *-dev) continue ;; esac
 			case " $ALPINE_SKIP_DEPS " in *" $dep "*) continue ;; esac
 			grep -qx "$dep" "$PKGS_SEEN" && continue
+			if [ -z "$(pkg_locate "$dep")" ]; then
+				alt="$(pkg_for_provide "$dep")"
+				if [ -n "$alt" ]; then
+					echo "alpine-fetch: $dep is provided by $alt" >&2
+					dep="$alt"
+					grep -qx "$dep" "$PKGS_SEEN" && continue
+				fi
+			fi
 			[ -n "$(pkg_locate "$dep")" ] || {
 				echo "alpine-fetch: $pkg needs $dep, which is in none of ($REPOS)" >&2
 				continue

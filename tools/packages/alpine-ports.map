@@ -83,7 +83,8 @@ pam           linux-pam linux-pam-dev
 # behind it, for hardware drivers this image has no use for — composition is
 # software (WLR_RENDERER=pixman) and the browser runs with --disable-gpu. When
 # M102a gets to running the iris driver on a real Intel GPU, that is the point
-# at which it earns its place.
+# at which it earns its place — which is what the `gpudrv` group below is:
+# opt-in, off by default, and pulled in by B1NIX_GPU_DRV=1.
 programs      zsh curl libcurl samurai bmake dropbear dropbear-ssh \
               dropbear-scp dropbear-dbclient \
               seatd sway swaybg grim foot foot-extra-terminfo cage \
@@ -102,6 +103,46 @@ programs      zsh curl libcurl samurai bmake dropbear dropbear-ssh \
 # died with "Initialization of all EGL display types failed" and no window ever
 # appeared.
 browser       chromium chromium-swiftshader strace
+
+# The hardware driver stack, for the runs that have hardware. mesa-dri-gallium
+# carries iris — the Gen8/Gen9.5 Intel driver M102a exists to run — and drags
+# llvm17-libs behind it, which is why it is not in `programs`: 184 MB is a lot
+# to carry on every image for a driver most runs cannot use. B1NIX_GPU_DRV=1
+# adds it, and the i915 passthrough run is what sets that.
+# foot and the fonts it needs come with it: since each optional group stages
+# into its own root, a driver image no longer inherits the terminal from
+# whatever was built before it, and a compositor with no client to composite
+# proves very little.
+gpudrv        mesa-dri-gallium foot font-dejavu
+
+# KDE. Not just the compositor: plasmashell brings the panel, the task manager,
+# the desktop and the menu — a desktop rather than a window manager. kwin_wayland
+# is a full Wayland compositor built on Qt6 and KF6, and it is
+# the first desktop on this system that is not wlroots — a different renderer, a
+# different input stack and a different set of assumptions about the kernel
+# underneath, which is exactly why it is worth running. Opt-in
+# (B1NIX_KDE=1) and its own staging root: the closure is Qt6 plus most of
+# KDE Frameworks.
+kde           repo:community kwin qt6-qtwayland kwayland-integration seatd \
+              libgpg-error libxtst elfutils mesa-dri-gallium foot \
+              font-dejavu xkeyboard-config \
+              lcms2 libxi dbus-libs icu-libs icu-data-en double-conversion \
+              libvorbis libltdl libgomp \
+              dbus dbus-libs elogind libelogind sway swaybg grim \
+              plasma-workspace plasma-desktop plasma-integration \
+              kactivitymanagerd breeze breeze-icons kde-cli-tools \
+              qt6-qtsvg kirigami libplasma util-linux-login
+              # libplasma, not plasma-framework: KF5's plasma-framework was
+              # renamed for KF6 and no package by the old name exists in v3.20.
+              #
+              # util-linux-login carries the only /bin/login here that is
+              # linked against libpam: kwin's DRM backend asks logind for its
+              # devices, logind only answers a registered session, and a
+              # session is created by pam_elogind.so during a PAM login.
+              # BusyBox's login applet does no PAM, so without this the
+              # compositor never issues a single open() on /dev/dri -- it
+              # refuses before the kernel is involved at all. Staged to
+              # /sbin/login-pam so the BusyBox applet keeps /bin/login.
 
 # The curl library, for what links against it rather than runs it (NetSurf).
 curlbuild     libcurl curl-dev curl-static

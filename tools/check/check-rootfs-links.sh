@@ -34,10 +34,27 @@ ROOTFS="${1:-$PROJECT_DIR/build/$ARCH/rootfs}"
 PY=$(command -v python3 || true)
 [ -n "$PY" ] || { echo "check-rootfs-links: python3 not found" >&2; exit 1; }
 
-"$PY" - "$ROOTFS" <<'PYEOF'
+"$PY" - "$ROOTFS" "$(dirname "$0")/configs/unresolved-allowlist.txt" <<'PYEOF'
 import os, struct, sys
 
 rootfs = sys.argv[1]
+
+# Symbols a named library is allowed to leave unresolved, because the executable
+# that loads it defines them. See tools/configs/unresolved-allowlist.txt; an
+# entry without a reason after '#' is refused there, not silently honoured.
+allowed_unresolved = {}
+try:
+    with open(sys.argv[2]) as fh:
+        for line in fh:
+            line = line.split('#')[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            allowed_unresolved.setdefault(parts[0], set()).add(parts[1])
+except (IndexError, OSError):
+    pass
 
 DT_NEEDED, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_HASH, DT_GNU_HASH = 1, 5, 6, 10, 11, 4, 0x6ffffef5
 DT_RPATH, DT_RUNPATH = 15, 29
@@ -184,7 +201,24 @@ class Elf:
         self.ok = True
 
 
-libdirs = [os.path.join(rootfs, d) for d in ('lib', 'usr/lib', 'usr/local/lib', 'usr/lib/chromium')]
+# The loader's search path is the image's own, not a list kept in step by hand:
+# musl reads /etc/ld-musl-<arch>.path and uses it instead of its built-in
+# default. Reading the same file is what makes this gate agree with the guest --
+# a directory added there for a package with no DT_RUNPATH (samba, chromium) is
+# searched by both, and one missing from there fails here rather than in the
+# guest, which is the whole point.
+_default_dirs = ('lib', 'usr/lib', 'usr/local/lib')
+_path_dirs = []
+for _cfg in glob.glob(os.path.join(rootfs, 'etc', 'ld-musl-*.path')):
+    try:
+        with open(_cfg) as _fh:
+            for _line in _fh:
+                _line = _line.split('#')[0].strip()
+                if _line:
+                    _path_dirs.append(_line.lstrip('/'))
+    except OSError:
+        pass
+libdirs = [os.path.join(rootfs, d) for d in (_path_dirs or _default_dirs)]
 libindex = {}
 for d in libdirs:
     if not os.path.isdir(d):
@@ -288,7 +322,10 @@ for p in sorted(targets):
     provided = set()
     for dep in closure.values():
         provided |= dep.defined
-    gone = sorted(sym for sym in e.undefined if sym not in provided and sym not in e.defined)
+    excused = allowed_unresolved.get(rel, set())
+    gone = sorted(sym for sym in e.undefined
+                  if sym not in provided and sym not in e.defined
+                  and sym not in excused)
     if gone:
         missing_syms.append((rel, gone))
 

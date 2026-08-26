@@ -81,6 +81,49 @@ fi
 [ -n "${LIMINE_DATADIR:-}" ] && [ -f "$LIMINE_DATADIR/limine-bios-cd.bin" ] || {
   echo "mkiso: cannot find Limine boot files (set LIMINE_DATADIR)" >&2; exit 1; }
 
+# ── skip a rebuild that would produce the same image ───────────────────────
+#
+# These targets are phony -- the smoke suite asks for seven ISOs on every run --
+# so xorriso repacked all seven whether or not anything in them had moved. That
+# is around a gigabyte of writes for the two images that carry the root
+# filesystem, and on a spinning disk it was the largest single part of a build
+# that had recompiled nothing.
+#
+# The stamp records what the image was made from: the identity (size and mtime,
+# the same evidence make itself uses) of the kernel and of every module, plus
+# the command line, the timeout, the arch and the config template. If the ISO
+# still exists and the stamp still matches, there is nothing to do.
+# MKISO_FORCE=1 rebuilds regardless.
+STAMP="$OUT.mkiso-stamp"
+ident() {
+  # size and mtime, without depending on GNU-only stat formats.
+  if stat -c '%s %Y' "$1" 2>/dev/null; then return; fi
+  stat -f '%z %m' "$1"
+}
+stamp_now() {
+  printf 'v1 arch=%s timeout=%s cmdline=%s\n' "$ARCH" "$TIMEOUT" "$CMDLINE"
+  printf 'kernel %s\n' "$(ident "$KERNEL")"
+  printf 'conf %s\n' "$(ident "$ROOT_DIR/boot/limine/limine.conf.in")"
+  printf 'self %s\n' "$(ident "$SELF")"
+  printf 'datadir %s %s\n' "$LIMINE_DATADIR" "$(ident "$LIMINE_DATADIR/limine-bios.sys")"
+  OLDIFS="$IFS"; IFS='
+'
+  for m in $MODULES; do
+    [ -n "$m" ] || continue
+    src="${m%:*}"; name="${m##*:}"
+    [ -f "$src" ] || { echo "mkiso: module not found: $src" >&2; exit 1; }
+    printf 'module %s %s\n' "$name" "$(ident "$src")"
+  done
+  IFS="$OLDIFS"
+}
+NEW_STAMP="$(stamp_now)"
+if [ "${MKISO_FORCE:-0}" != "1" ] && [ -f "$OUT" ] && [ -f "$STAMP" ] &&
+   [ "$NEW_STAMP" = "$(cat "$STAMP")" ]; then
+  printf 'up to date %s (%s)\n' "$OUT" "$(du -sh "$OUT" | cut -f1)"
+  exit 0
+fi
+rm -f "$STAMP"
+
 # ── stage the ISO root ─────────────────────────────────────────────────────
 mkdir -p "$STAGE/boot/limine" "$STAGE/EFI/BOOT"
 cp -f "$KERNEL" "$STAGE/boot/kernel.elf"
@@ -146,5 +189,7 @@ xorriso -as mkisofs -R -r -J \
 
 # Write Limine's BIOS boot stages into the ISO (no-op for UEFI boots).
 "$LIMINE_BIN" bios-install "$OUT" --quiet >/dev/null
+
+printf '%s\n' "$NEW_STAMP" > "$STAMP"
 
 printf 'created %s (%s)\n' "$OUT" "$(du -sh "$OUT" | cut -f1)"

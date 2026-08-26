@@ -36,6 +36,16 @@ B1CC_BINS_CC := $(realpath ../tools/b1nix-musl-cc)
 # b1cc otherwise locates the target headers through cwd-relative guesses, which
 # only resolve when it is invoked from the repository root. Hand it the sysroot
 # explicitly so every invocation works from any directory.
+# b1cc's own C library headers.
+#
+# These used to be userspace/include -- a full libc header tree sitting beside
+# the tests, which made it look like a second libc we maintained. It is not:
+# every binary here compiles against musl's headers (see CFLAGS below), and
+# this tree exists solely because b1cc's parser cannot read musl's. Deleting
+# it as a duplicate broke b1cc on its own corpus, with the parser stopping on
+# a musl typedef -- so it lives with the compiler that needs it, the way tcc
+# ships its own include directory, and userspace/include is left holding only
+# what describes this kernel's interfaces.
 B1CC_SYSROOT_INCLUDE := $(realpath include)
 B1CC_DIR := b1cc
 B1CC := $(B1CC_DIR)/build/b1cc
@@ -100,6 +110,15 @@ CFLAGS := -isystem $(MUSL_INCLUDE) -D__linux__ $(filter-out -fno-pic -fno-pie -f
 endif
 BUILD    := build/$(B1NIX_ARCH)
 ROOTFS   := ../build/$(B1NIX_ARCH)/rootfs
+# Copy into the staging root only where the bytes differ. A plain cp stamps a
+# fresh mtime on identical content, and the root image is repacked whenever
+# anything in the tree is newer than it -- so unconditional copies here cost a
+# full dd + mke2fs on every build, including the ones that changed nothing.
+CIC      := ../tools/copy-if-changed.sh
+# The account files are built by a chain of appends; assembling them here and
+# copying the result keeps that shape while still leaving the image alone when
+# it comes out identical.
+ETCSTAGE := ../build/$(B1NIX_ARCH)/.etc-stage
 # Strong utmp/utmpx overrides for musl's weak no-op stubs (real login accounting).
 UTMP_OBJ := $(BUILD)/compat/utmp.o
 # No link script for the smoke binaries: they are musl PIEs, so the loader picks
@@ -243,6 +262,7 @@ BINARIES := \
 	$(BUILD)/bin/m35_smoke \
 	$(BUILD)/bin/m36_smoke \
 	$(BUILD)/bin/diskbench \
+	$(BUILD)/bin/mdcreate \
 	$(BUILD)/bin/telinit \
 	$(BUILD)/bin/m30_pie \
 	$(BUILD)/bin/m38_sound \
@@ -250,6 +270,18 @@ BINARIES := \
 	$(BUILD)/bin/m39_smoke \
 	$(BUILD)/bin/m77_smoke \
 	$(BUILD)/bin/m47_smoke
+# The soak stressors. Ordinary programs in the image rather than smoke
+# binaries: the overnight loop runs them directly, and having them installed
+# means a failure can be reproduced by hand from a shell on a running guest.
+BINARIES += $(BUILD)/bin/memstress
+BINARIES += $(BUILD)/bin/vmstress
+BINARIES += $(BUILD)/bin/cpustress
+BINARIES += $(BUILD)/bin/diskstress
+BINARIES += $(BUILD)/bin/netstress
+BINARIES += $(BUILD)/bin/fdstress
+BINARIES += $(BUILD)/bin/spawnstress
+BINARIES += $(BUILD)/bin/shmstress
+BINARIES += $(BUILD)/bin/timerstress
 BINARIES += $(BUILD)/bin/m48_smoke
 # Same reasoning as M53_PORT_SMOKES above: these link ported libraries (wayland
 # and libffi) that a cleaned tree has not built yet, and a hard reference makes
@@ -283,6 +315,14 @@ BINARIES += $(BUILD)/bin/m51_fontconfig_smoke
 # Reaches its libraries through dlopen, so it needs no headers and links like
 # any other program — see the note at the top of bin/gfx/font_probe.c.
 BINARIES += $(BUILD)/bin/font_probe
+# M102a: the same dlopen trick for EGL/GLES — it renders off-screen on the
+# passed-through GPU and checks the pixels it gets back, so it needs neither GL
+# headers at build time nor a compositor at run time.
+BINARIES += $(BUILD)/bin/gl_probe
+# The pixel side of the compositor tests: reads back the PPM grim pulled out of
+# a running compositor and checks it really carries the colour that was asked
+# for. "grim exited 0" says a buffer arrived, not what is in it.
+BINARIES += $(BUILD)/bin/framecheck
 BINARIES += $(BUILD)/bin/cxx_smoke
 BINARIES += $(BUILD)/bin/m55_iostream
 BINARIES += $(BUILD)/bin/m64_clang_smoke
@@ -407,11 +447,13 @@ $(B1CC): $(B1CC_DIR)/Makefile $(wildcard $(B1CC_SRC_GLOB))
 #   bin/helpers/   programs a test drives rather than a test itself (fixtures,
 #                  target ELFs, tiny servers, the musl bring-up diagnostics)
 #   bin/tools/     b1nix-specific utilities that ship in the image
+#   bin/stress/    the soak stressors: bounded, self-verifying load generators
+#                  driven by /etc/soak.sh (see tools/soak/)
 #   bin/gui/       the GUI demo applications
 #   bin/compiler/  the b1cc corpus
 # Rules refer to a source through $(call bin_src,NAME) so a program can move
 # between categories without touching a build rule.
-BIN_CATS := smoke gfx helpers tools gui compiler
+BIN_CATS := smoke gfx helpers tools gui compiler stress
 # The trailing literal matters: with no fallback an unknown stem yields an empty
 # prerequisite, and a pattern rule with no prerequisites matches ANY target —
 # make then tried to build the -MD dependency files through it (bin/foo.d.o).
@@ -964,7 +1006,11 @@ install-headers-libs:
 	@echo "Installing musl userspace headers..."
 	@mkdir -p $(ROOTFS)/include
 	@mkdir -p $(ROOTFS)/lib
-	cp -r include/* $(ROOTFS)/include/
+	@# --skip-if-in: musl's copy of a header wins (see below), so a header both
+	@# trees ship is left to the musl pass instead of being written here and
+	@# overwritten a moment later -- 165 files rewritten on every build, each
+	@# one enough to make the root image look stale.
+	$(CIC) --skip-if-in $(MUSL_INCLUDE) -r include/* $(ROOTFS)/include/
 	@# musl owns every libc header in the image: in-guest compilers (b1cc,
 	@# native clang) must see the same declarations the binaries were built
 	@# against. The b1nix-only extras copied above (EGL/, b1nix/, tui.h, ...)
@@ -974,27 +1020,57 @@ install-headers-libs:
 		mkdir -p $(ROOTFS)/include/$$d; \
 	done
 	@cd $(MUSL_INCLUDE) && find . -type f -name '*.h' -not -path './c++/*' \
-		-exec cp {} $(abspath $(ROOTFS))/include/{} \;
+		-print0 | xargs -0 -r $(abspath $(CIC)) --into $(abspath $(ROOTFS))/include
 	@mkdir -p $(ROOTFS)/usr
-	ln -sfn ../include $(ROOTFS)/usr/include
-	ln -sfn ../lib $(ROOTFS)/usr/lib
+	@$(call link_if_changed,../include,$(ROOTFS)/usr/include)
+	@$(call link_if_changed,../lib,$(ROOTFS)/usr/lib)
+
+# Create a symlink only when it is not already what it should be.
+#
+# `ln -sfn` unlinks and recreates unconditionally, which gives the link a new
+# timestamp on every build. The root filesystem image is rebuilt whenever
+# anything in the staging tree is newer than it, so a few hundred symlinks
+# rewritten for nothing cost a full 189 MB image write — thirty seconds of
+# every build, including the many where only the kernel changed.
+# A no-op when the link is already right -- and also when the path is a real
+# directory, where `ln -sfn` cannot replace it and instead drops a link INSIDE
+# it (that is where /usr/include/include came from). Recreating that inner link
+# on every build gave the staging tree a new timestamp and repacked the image.
+define link_if_changed
+	if [ -d $(2) ] && [ ! -L $(2) ]; then :; \
+	elif [ "$$(readlink $(2) 2>/dev/null)" != "$(1)" ]; then ln -sfn $(1) $(2); fi
+endef
 
 install: all install-headers-libs
 	@echo "Installing userspace binaries..."
 	@mkdir -p $(ROOTFS)/bin
-	cp $(BINARIES) $(ROOTFS)/bin/
+	@# Content-compared: an unchanged binary keeps its timestamp, and the root
+	@# image is only rebuilt when something in the staging tree is newer than
+	@# it. An unconditional copy makes that test true on every build.
+	$(CIC) $(filter-out %/m31_setuid,$(BINARIES)) $(ROOTFS)/bin/
+	@# Copied with its mode rather than chmod'ed afterwards, or it never matches
+	@# its source again and is rewritten on every build.
+	@$(CIC) --mode 4755 $(BUILD)/bin/m31_setuid $(ROOTFS)/bin/m31_setuid
 ifneq (,)
 endif
-	@chmod 4755 $(ROOTFS)/bin/m31_setuid 2>/dev/null || true
 	@# M108: /bin/su and /bin/passwd are no longer ELFs of their own — they are
 	@# BusyBox applet symlinks onto /opt/busybox/bin/busybox-suid, which carries
 	@# the setuid bit (see the symlink block at the end of this target). Drop any
 	@# stale copies an older tree installed here, otherwise `cp` would keep an
 	@# unmaintained setuid-root binary alive in the image forever.
-	@rm -f $(ROOTFS)/bin/su $(ROOTFS)/bin/passwd
+	@# A stale ELF copy goes; the setuid links created at the end of this target
+	@# stay, or they are deleted and remade on every build and the image with
+	@# them.
+	@for n in su passwd; do \
+		case "$$(readlink $(ROOTFS)/bin/$$n 2>/dev/null)" in \
+		/opt/busybox/bin/busybox*) ;; \
+		*) rm -f $(ROOTFS)/bin/$$n ;; \
+		esac; \
+	done
 	@for b in m12_smoke:m12-smoke m13_smoke:m13-smoke m13_job_control:m13-job-control m14_smoke:m14-smoke m15_smoke:m15-smoke m17_smoke:m17-smoke m24b_smoke:m24b-smoke m25_smoke:m25-smoke m26_smoke:m26-smoke m27_smoke:m27-smoke m29_smoke:m29-smoke m31_smoke:m31-smoke m31_setuid:m31-setuid m32_smoke:m32-smoke m34_smoke:m34-smoke m35_smoke:m35-smoke m36_smoke:m36-smoke m47_smoke:m47-smoke m48_smoke:m48-smoke  m50_smoke:m50-smoke m51_smoke:m51-smoke  m57_smoke:m57-smoke m75_smoke:m75-smoke; do \
 		src=$${b%%:*}; dst=$${b##*:}; \
-		ln -sfn $$src $(ROOTFS)/bin/$$dst; \
+		[ "$$(readlink $(ROOTFS)/bin/$$dst 2>/dev/null)" = "$$src" ] || \
+			ln -sfn $$src $(ROOTFS)/bin/$$dst; \
 	done
 	@# M95: the module utilities are BusyBox applets (the /bin symlinks come
 	@# from the manifest loop above). /sbin carries the customary aliases, and
@@ -1003,17 +1079,18 @@ endif
 	@rm -f $(ROOTFS)/bin/kmod
 	@mkdir -p $(ROOTFS)/sbin
 	@for b in insmod rmmod lsmod modprobe depmod; do \
-		ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/sbin/$$b; \
+		[ "$$(readlink $(ROOTFS)/sbin/$$b 2>/dev/null)" = "/opt/busybox/bin/busybox" ] || \
+			ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/sbin/$$b; \
 	done
 	@mkdir -p $(ROOTFS)/home
-	cp hello_native.c $(ROOTFS)/home/
+	$(CIC) hello_native.c $(ROOTFS)/home/
 	@if [ -f ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/Scrt1.o ]; then \
-		cp ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/Scrt1.o $(ROOTFS)/lib/crt0.o ; \
-		cp ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/Scrt1.o $(ROOTFS)/lib/crt1.o ; \
+		$(CIC) ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/Scrt1.o $(ROOTFS)/lib/crt0.o ; \
+		$(CIC) ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/Scrt1.o $(ROOTFS)/lib/crt1.o ; \
 	fi
 	@if [ -f ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/libc.a ]; then \
-		cp ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/libc.a $(ROOTFS)/lib/libc.a ; \
-		cp ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/libc.a $(ROOTFS)/lib/libb1nix.a ; \
+		$(CIC) ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/libc.a $(ROOTFS)/lib/libc.a ; \
+		$(CIC) ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/libc.a $(ROOTFS)/lib/libb1nix.a ; \
 	fi
 	@# b1cc's native link path reads its start file from /lib/b1cc (the default
 	@# compiled in under -Db1nix). Stage musl's Scrt1.o so an on-device
@@ -1028,10 +1105,11 @@ endif
 	@# that fails to link.
 	@mkdir -p $(ROOTFS)/lib/b1cc
 	@if [ -f ../build/$(B1NIX_ARCH)/ports/musl/install/lib/Scrt1.o ]; then \
-		cp ../build/$(B1NIX_ARCH)/ports/musl/install/lib/Scrt1.o $(ROOTFS)/lib/b1cc/crt0-dynamic.o ; \
+		$(CIC) ../build/$(B1NIX_ARCH)/ports/musl/install/lib/Scrt1.o $(ROOTFS)/lib/b1cc/crt0-dynamic.o ; \
 	fi
 	@mkdir -p $(ROOTFS)/etc
-	@printf "root:x:0:0:root:/root:/bin/zsh\nuser:x:1000:1000:b1nix user:/home/user:/bin/zsh\npamtest:x:1001:1001:M104 PAM smoke test account:/home/pamtest:/bin/sh\n" > $(ROOTFS)/etc/passwd
+	@mkdir -p $(ETCSTAGE)
+	@printf "root:x:0:0:root:/root:/bin/zsh\nuser:x:1000:1000:b1nix user:/home/user:/bin/zsh\npamtest:x:1001:1001:M104 PAM smoke test account:/home/pamtest:/bin/sh\n" > $(ETCSTAGE)/passwd
 	@# M108: three accounts for the BusyBox su/passwd smoke
 	@# (userspace/bin/smoke/m108_smoke.c), kept apart from root/user/pamtest so the
 	@# test never touches a credential another test depends on.
@@ -1041,45 +1119,50 @@ endif
 	@#             login '-' prefix, rather than whatever shell it inherited.
 	@#   m108peer  the su *target*.
 	@#   m108pw    the account whose password `passwd` rewrites.
-	@printf "m108user:x:1002:1002:M108 su caller:/home/m108user:/bin/m108shell\nm108peer:x:1003:1003:M108 su target:/home/m108peer:/bin/sh\nm108pw:x:1004:1004:M108 passwd target:/home/m108pw:/bin/sh\n" >> $(ROOTFS)/etc/passwd
+	@printf "m108user:x:1002:1002:M108 su caller:/home/m108user:/bin/m108shell\nm108peer:x:1003:1003:M108 su target:/home/m108peer:/bin/sh\nm108pw:x:1004:1004:M108 passwd target:/home/m108pw:/bin/sh\n" >> $(ETCSTAGE)/passwd
 	@mkdir -p $(ROOTFS)/home/m108user $(ROOTFS)/home/m108peer $(ROOTFS)/home/m108pw
 	@# M108: four accounts whose passwords are rewritten SIMULTANEOUSLY, to
 	@# prove /etc/shadow locking. Separate from m108pw so the concurrent run and
 	@# the single-writer passwd test never touch the same record.
-	@printf "m108c0:x:1010:1010:M108 concurrent passwd 0:/home/m108c0:/bin/sh\nm108c1:x:1011:1011:M108 concurrent passwd 1:/home/m108c1:/bin/sh\nm108c2:x:1012:1012:M108 concurrent passwd 2:/home/m108c2:/bin/sh\nm108c3:x:1013:1013:M108 concurrent passwd 3:/home/m108c3:/bin/sh\n" >> $(ROOTFS)/etc/passwd
+	@printf "m108c0:x:1010:1010:M108 concurrent passwd 0:/home/m108c0:/bin/sh\nm108c1:x:1011:1011:M108 concurrent passwd 1:/home/m108c1:/bin/sh\nm108c2:x:1012:1012:M108 concurrent passwd 2:/home/m108c2:/bin/sh\nm108c3:x:1013:1013:M108 concurrent passwd 3:/home/m108c3:/bin/sh\n" >> $(ETCSTAGE)/passwd
 	@mkdir -p $(ROOTFS)/home/m108c0 $(ROOTFS)/home/m108c1 $(ROOTFS)/home/m108c2 $(ROOTFS)/home/m108c3
-	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:20000:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:20000:0:99999:7:::\n' > $(ROOTFS)/etc/shadow
+	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:20000:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:20000:0:99999:7:::\n' > $(ETCSTAGE)/shadow
 	@# M104: dedicated /etc/shadow entry for the PAM smoke test
 	@# (userspace/bin/smoke/m104_pam_smoke.c) — a real SHA-512 "$$6$$" hash of the
 	@# known plaintext "PamSmoke123!" (generated on the host with
 	@# `openssl passwd -6 -salt pamtestsalt 'PamSmoke123!'`), kept separate
 	@# from root/user so this test never depends on — or risks perturbing —
 	@# their credentials.
-	@printf 'pamtest:$$6$$pamtestsalt$$.8vbtO9GTrzzFPO1mFgs22hz1YDCsqQnz/AucCx/9DkM5GoSWTqA78BSIVE4IESMY2ZYdF7Ywln/2p2LVLdd20:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf 'pamtest:$$6$$pamtestsalt$$.8vbtO9GTrzzFPO1mFgs22hz1YDCsqQnz/AucCx/9DkM5GoSWTqA78BSIVE4IESMY2ZYdF7Ywln/2p2LVLdd20:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
 	@# M108: SHA-512 "$$6$$" hashes for the BusyBox su/passwd accounts. Same
 	@# scheme, same file and same crypt(3) comparison pam_unix.so uses, which is
 	@# the whole point of the milestone: one shadow format for the applet and
 	@# the PAM path. Plaintexts (host: `openssl passwd -6 -salt <salt> <pw>`):
 	@#   m108user = M108user!   m108peer = M108peer!   m108pw = M108old!
 	@# m108pw's password is the one m108_smoke rewrites with `passwd`.
-	@printf 'm108user:$$6$$m108usersalt$$U7uuAPJyfx58AT26qAudu8PvVKsmO6jTB5EiK/pag6OV8oGNxzS9DPtQlEhTAc4URuN2oMFLgarPW2Utx3DGA1:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
-	@printf 'm108peer:$$6$$m108peersalt$$TCl.o4K5Iw7SlNXrk9dNp4NHfvT0JPCUmyk9otIuGpjRuq8d0trvLR6DDBava0iQY5MBTlU6kRnSNF4XOZXPF/:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
-	@printf 'm108pw:$$6$$m108pwsalt$$YvQPFIRKzF9l53ejsICs/u66sJBq6NfeOai7reDJDsOGog0q.k7t7bHAfGgVrOs3Ni0rrwKmaEwEWvZv3Tl9V1:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
+	@printf 'm108user:$$6$$m108usersalt$$U7uuAPJyfx58AT26qAudu8PvVKsmO6jTB5EiK/pag6OV8oGNxzS9DPtQlEhTAc4URuN2oMFLgarPW2Utx3DGA1:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
+	@printf 'm108peer:$$6$$m108peersalt$$TCl.o4K5Iw7SlNXrk9dNp4NHfvT0JPCUmyk9otIuGpjRuq8d0trvLR6DDBava0iQY5MBTlU6kRnSNF4XOZXPF/:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
+	@printf 'm108pw:$$6$$m108pwsalt$$YvQPFIRKzF9l53ejsICs/u66sJBq6NfeOai7reDJDsOGog0q.k7t7bHAfGgVrOs3Ni0rrwKmaEwEWvZv3Tl9V1:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
 	@# The four concurrent-passwd accounts. Plaintexts (host:
 	@# `openssl passwd -6 -salt m108cNsalt 'M108concN!'`):
 	@#   m108c0 = M108conc0!   m108c1 = M108conc1!
 	@#   m108c2 = M108conc2!   m108c3 = M108conc3!
-	@printf 'm108c0:$$6$$m108c0salt$$HuyPuTI9qFa/FoKggrJeCwtFkHsDDJlaoFORwM3kqCOFoGZc95vIxua/wd6tNJcFpVnh72HFmSPBF8.dxCdMe0:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
-	@printf 'm108c1:$$6$$m108c1salt$$V7SApmUI/.YLU4jynPO7G0q4cD6Vfy2RXg.lKfo7M4ME8Xh5WJ1Zr0R1YuU.dyIZA.DHfHFJzj.aqXlb9JN5I0:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
-	@printf 'm108c2:$$6$$m108c2salt$$yeLeTxwP6LfUNDPRWwuqy4bN1qaSxaFIBljpDoNwzqgBiBfxzuWgL2dF9dtUjKqxFDG.wZIp1w1uQqOcyeByN/:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
-	@printf 'm108c3:$$6$$m108c3salt$$k3HI/VMOXhcyVakp9WNAJfC0k9a1FvB2LdRLDC64bMRgkeQkSnxa.MF0p/ZCY/4tUzpNeM5Ecd6uyn6ngxCB.1:20000:0:99999:7:::\n' >> $(ROOTFS)/etc/shadow
-	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\npamtest:x:1001:pamtest\nm108user:x:1002:\nm108peer:x:1003:\nm108pw:x:1004:\nm108c0:x:1010:\nm108c1:x:1011:\nm108c2:x:1012:\nm108c3:x:1013:\n" > $(ROOTFS)/etc/group
-	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/bin/m108shell\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
+	@printf 'm108c0:$$6$$m108c0salt$$HuyPuTI9qFa/FoKggrJeCwtFkHsDDJlaoFORwM3kqCOFoGZc95vIxua/wd6tNJcFpVnh72HFmSPBF8.dxCdMe0:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
+	@printf 'm108c1:$$6$$m108c1salt$$V7SApmUI/.YLU4jynPO7G0q4cD6Vfy2RXg.lKfo7M4ME8Xh5WJ1Zr0R1YuU.dyIZA.DHfHFJzj.aqXlb9JN5I0:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
+	@printf 'm108c2:$$6$$m108c2salt$$yeLeTxwP6LfUNDPRWwuqy4bN1qaSxaFIBljpDoNwzqgBiBfxzuWgL2dF9dtUjKqxFDG.wZIp1w1uQqOcyeByN/:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
+	@printf 'm108c3:$$6$$m108c3salt$$k3HI/VMOXhcyVakp9WNAJfC0k9a1FvB2LdRLDC64bMRgkeQkSnxa.MF0p/ZCY/4tUzpNeM5Ecd6uyn6ngxCB.1:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
+	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\npamtest:x:1001:pamtest\nm108user:x:1002:\nm108peer:x:1003:\nm108pw:x:1004:\nm108c0:x:1010:\nm108c1:x:1011:\nm108c2:x:1012:\nm108c3:x:1013:\n" > $(ETCSTAGE)/group
+	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/bin/m108shell\n/opt/busybox/bin/busybox\n" > $(ETCSTAGE)/shells
+	@$(CIC) $(ETCSTAGE)/passwd $(ETCSTAGE)/shadow $(ETCSTAGE)/group $(ETCSTAGE)/shells $(ROOTFS)/etc/
 	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/zsh/bpkg-smoke.sh,
 	@# sshd init.d, bb-w6/bb-w2b fixtures — real files (not embedded kernel C
 	@# strings) copied verbatim onto the ext4 root. cp -R preserves the tree
 	@# structure and creates /etc, /bin, /pkgs subdirs as needed.
-	@cp -R rootfs-overlay/. $(ROOTFS)/
+	@# --skip-if-in: a path the package staging root also provides is left to
+	@# the merge in root-image, which runs after this and wins anyway. Writing
+	@# ours here first only for it to be overwritten a moment later put a fresh
+	@# timestamp on the tree every build (etc/fonts/fonts.conf, etc/bpkg.conf).
+	@$(CIC) --skip-if-in ../build/$(B1NIX_ARCH)/pkgroot -r rootfs-overlay/. $(ROOTFS)/
 	@# BusyBox applet symlinks: every command in applet-manifest.conf (M42) is
 	@# "upstream" (native in-kernel dispatch was retired with the Ring 3 init
 	@# rewrite), so they become /bin/<cmd> -> /opt/busybox/bin/busybox.
@@ -1090,23 +1173,32 @@ endif
 	@# used to shadow chmod/chown/id/whoami/groups/halt/setfattr are deleted, so
 	@# the symlink can no longer race cp or have cp write a binary's bytes
 	@# through it into the busybox ELF. The rm below clears any stale copy left
-	@# in an incrementally built rootfs.
-	@rm -f $(ROOTFS)/bin/id $(ROOTFS)/bin/whoami $(ROOTFS)/bin/groups \
-	       $(ROOTFS)/bin/chmod $(ROOTFS)/bin/chown $(ROOTFS)/bin/halt \
-	       $(ROOTFS)/bin/setfattr $(ROOTFS)/bin/meminfo \
-	       $(ROOTFS)/bin/useradd $(ROOTFS)/bin/userdel $(ROOTFS)/bin/groupadd
+	@# in an incrementally built rootfs -- a stale COPY, which is what it is
+	@# there for, so a name that is already the right link is left alone. It was
+	@# deleting and recreating eleven links on every build, and the image was
+	@# repacked for it.
+	@for n in id whoami groups chmod chown halt setfattr meminfo \
+	          useradd userdel groupadd; do \
+		case "$$(readlink $(ROOTFS)/bin/$$n 2>/dev/null)" in \
+		/opt/busybox/bin/busybox*) ;; \
+		*) rm -f $(ROOTFS)/bin/$$n ;; \
+		esac; \
+	done
 	@mkdir -p $(ROOTFS)/bin
 	@awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$1); gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); if ($$2 == "upstream") print $$1; }' ../tools/configs/applet-manifest.conf | \
 		grep -vE '^(su|passwd|login)$$' | \
-		while read -r cmd; do ln -sfn /opt/busybox/bin/busybox "$(ROOTFS)/bin/$$cmd"; done
-	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/bin/sh
-	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/bin/ash
+		while read -r cmd; do \
+			[ "$$(readlink "$(ROOTFS)/bin/$$cmd" 2>/dev/null)" = "/opt/busybox/bin/busybox" ] || \
+				ln -sfn /opt/busybox/bin/busybox "$(ROOTFS)/bin/$$cmd"; \
+		done
+	@$(call link_if_changed,/opt/busybox/bin/busybox,$(ROOTFS)/bin/sh)
+	@$(call link_if_changed,/opt/busybox/bin/busybox,$(ROOTFS)/bin/ash)
 	@# /usr/bin/env: every third-party script starts "#!/usr/bin/env something",
 	@# and the kernel resolves that path literally — without this entry the
 	@# script fails with ENOENT and the shell reports "not found", which reads
 	@# like the script itself is missing. Alpine (and every distro) ships it.
 	@mkdir -p $(ROOTFS)/usr/bin
-	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/usr/bin/env
+	@$(call link_if_changed,/opt/busybox/bin/busybox,$(ROOTFS)/usr/bin/env)
 	@# M108: su, passwd and login are BusyBox's three BB_SUID_REQUIRE applets —
 	@# they need euid 0 to read /etc/shadow and to change identity, so they get
 	@# the setuid copy of the multicall ELF (build-busybox.sh installs
@@ -1116,9 +1208,9 @@ endif
 	@# CONFIG_FEATURE_SUID=y (libbb check_suid() drops euid for every applet
 	@# that is not BB_SUID_REQUIRE), even a hand-made symlink from `sh` to
 	@# busybox-suid yields no privilege.
-	@ln -sfn /opt/busybox/bin/busybox-suid $(ROOTFS)/bin/su
-	@ln -sfn /opt/busybox/bin/busybox-suid $(ROOTFS)/bin/passwd
-	@ln -sfn /opt/busybox/bin/busybox-suid $(ROOTFS)/bin/login
+	@$(call link_if_changed,/opt/busybox/bin/busybox-suid,$(ROOTFS)/bin/su)
+	@$(call link_if_changed,/opt/busybox/bin/busybox-suid,$(ROOTFS)/bin/passwd)
+	@$(call link_if_changed,/opt/busybox/bin/busybox-suid,$(ROOTFS)/bin/login)
 
 
 clean:

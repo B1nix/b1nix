@@ -15,6 +15,14 @@
 #   sh tools/run-i915-passthrough.sh --preflight     # what is missing, and how
 #   sh tools/run-i915-passthrough.sh                 # run, once bound
 #
+# What the guest proves is decided by the cmdline baked into the ISO:
+#   make B1NIX_I915=1 KERNEL_CMDLINE="b1nix.i915-gt-probe" iso
+# adds the GT report — engines, submission method, GGTT/PPGTT, and one empty
+# request per engine taken to retirement. That answers "did the GT come up"
+# without inferring it from register dumps, and it is the step before iris:
+# when a userspace driver fails, this says whether it failed on a GT that was
+# already unable to retire an empty request.
+#
 # Environment:
 #   IGD_BDF     PCI address of the GPU        (default: autodetected)
 #   MEM_MB      guest RAM                     (default: 2048)
@@ -137,6 +145,19 @@ preflight() {
 		else
 			echo "$node is not accessible to $(id -un). Run:"
 			echo "  sudo setfacl -m u:$(id -un):rw $node"
+		fi
+		# And whether the image it will boot carries a userspace driver.
+		# Without one the run can still prove the kernel side — modeset,
+		# GT bring-up, `b1nix.i915-gt-probe` — but nothing in the guest
+		# can render through the GPU, and that reads as a driver failure
+		# when it is a missing package.
+		iris="$ROOT_DIR/build/$ARCH/rootfs/usr/lib/xorg/modules/dri/iris_dri.so"
+		if [ -e "$iris" ]; then
+			echo "iris is in the image (userspace rendering available)."
+		else
+			echo "No iris in the image — kernel-side proof only. To add it:"
+			echo "  make B1NIX_GPU_DRV=1 iso"
+			echo "(184 MB: the Mesa megadriver and LLVM behind it.)"
 		fi
 		lim="$(ulimit -l)"
 		if [ "$lim" != "unlimited" ] && [ "${lim:-0}" -lt $((MEM_MB * 1024)) ]; then

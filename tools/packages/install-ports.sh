@@ -44,8 +44,13 @@ download_ports() {
 	state="$ROOTFS/var/lib/bpkg"
 	installed="$state/installed"
 	mkdir -p "$installed" "$ROOTFS/etc"
-	cp "$tmp/index" "$state/index"
-	printf "INDEX_URL='%s'\n" "$INDEX_URL" > "$ROOTFS/etc/bpkg.conf"
+	cmp -s "$tmp/index" "$state/index" 2>/dev/null || cp "$tmp/index" "$state/index"
+	# Only when the image does not already carry one. The rootfs overlay ships a
+	# commented bpkg.conf and is applied after this, so this line's one-liner
+	# never survived a build anyway -- it just rewrote the file, which repacked
+	# the root image behind it.
+	[ -f "$ROOTFS/etc/bpkg.conf" ] ||
+		printf "INDEX_URL='%s'\n" "$INDEX_URL" > "$ROOTFS/etc/bpkg.conf"
 
 	# Fields: name version arch sha url [deps]. The 6th 'deps' field is optional
 	# (comma-separated package names); we don't resolve deps here (download mode
@@ -64,6 +69,22 @@ download_ports() {
 			*) echo "install-ports: invalid checksum or URL for $name" >&2; exit 1 ;;
 		esac
 
+		# Already installed, at this exact version and checksum: nothing to
+		# download and nothing to unpack.
+		#
+		# This ran unconditionally, so every build re-downloaded the whole
+		# published set and re-extracted it over the staging root. That put the
+		# archives' timestamps back on hundreds of files, which made the next
+		# step's `cp -u` copy them all again, which made the root image look
+		# stale, which cost a full repack -- on a build that had changed
+		# nothing. The index is still fetched every time, so a package that
+		# moves is still picked up.
+		if [ "$(cat "$installed/$name.ver" 2>/dev/null)" = "$version" ] &&
+		   [ "$(cat "$installed/$name.sha" 2>/dev/null)" = "$sha" ] &&
+		   [ -f "$installed/$name.list" ]; then
+			continue
+		fi
+
 		archive="$tmp/$name.tar.gz"
 		echo "FETCH $name $version [$arch]"
 		fetch "$url" "$archive"
@@ -76,6 +97,7 @@ download_ports() {
 		tar -xzf "$archive" -C "$ROOTFS"
 		cp "$list" "$installed/$name.list"
 		printf '%s\n' "$version" > "$installed/$name.ver"
+		printf '%s\n' "$sha" > "$installed/$name.sha"
 	done < "$tmp/index"
 }
 
