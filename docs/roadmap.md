@@ -392,6 +392,9 @@ Status:
 - [x] Validate ext2/3/4, exFAT, and NTFS images with large-file reads.
 - [x] Verify persistent writes on ext2/ext3/ext4.
 - [x] Fix AHCI page-crossing DMA, ext2 xattr parsing, and exFAT filename case.
+- [x] Probe AHCI ports by signature: a packet device is identified with the
+      command it can answer and then left alone, and the probe is bounded, so a
+      CD-ROM on the controller no longer stops the boot (q35 boots).
 - [x] Add read-only NTFS driver with resident/non-resident data and indexes.
 - [x] Creation at runtime mountpoints supported and verified.
 
@@ -855,60 +858,80 @@ The vendor drivers are imported as they are written and never edited; everything
 they stand on is ours, written from scratch. One layer carries every vendor, so
 M102a and M102b are two consumers of it rather than two ports.
 
-- [x] Decide once where the DRM core comes from, and write the answer down: upstream `drivers/gpu/drm` imported verbatim, with M100's own core kept for virtio-gpu. Two cores are allowed only because one of them is never edited — recorded in [`docs/drm-import.md`](drm-import.md).
-- [x] Add `kref`, where only the last put releases and a weak reference on a dead object fails instead of resurrecting it.
-- [x] Add wait queues over the two-phase scheduler wait, with a timeout measured against the scheduler's own ticks.
-- [x] Add `ww_mutex` with real wound-wait: an older context wounds a younger holder, the younger is refused with `EDEADLK` and backs off, and the older is never wounded itself.
-- [x] Add red-black trees, balance verified rather than inferred — ascending inserts stay logarithmic instead of degenerating into a list.
-- [x] Give the rbtree an augmentation hook, so a field derived from a whole subtree survives rebalancing rather than going quietly stale.
-- [x] Add interval trees on top of it — the structure that answers "which ranges cover this address", checked against a brute-force scan.
-- [x] Add an xarray: sparse 64-bit index to pointer, ordered iteration, folding back to genuinely empty on erase.
-- [x] Add `kthread_worker`, a queue whose thread the caller owns, running its items in submission order.
-- [x] Add an RCU whose grace periods are honest: readers counted in two buckets, a writer flips which is current and waits for the old one to drain. Read sections disable interrupts, so they cannot sleep or migrate — stated in the header as the price.
-- [x] Prove the grace period rather than assume it: a reader on another CPU keeps re-reading an object the writer poisons the instant `synchronize_rcu` returns, so an early grace period is reported by the reader instead of corrupting memory quietly.
-- [x] Give `struct page` a backing our memory model can honour: page arrays, shmem-backed objects, `vmap`, and write-combining through the M98 PAT paths. No global mem_map — a page is allocated with its frame, so there is no physical-address-to-page lookup, and the header says so.
-- [x] Make the scatter real: a shmem array takes its frames one at a time, and the self-test asserts they are not one physical run, so a driver assuming `page[i+1]` follows `page[i]` breaks here rather than on hardware with the IOMMU off.
-- [x] Add `kobject` with the lifetime rule drivers depend on: release runs once, on the last put, and a child's release runs before its parent's reference is dropped.
-- [x] Add `pm_runtime`: usage-counted, suspends only on the last holder, refuses to claim a suspend the driver rejected, and leaves no reference behind on a failed resume.
-- [x] Add `sysfs`/`debugfs` attribute files: a registry that accepts registrations before `/sys` is mounted and materialises them when it is, so probe order and mount order need not agree. Classes, devices, attribute groups and links are real, removal takes one file without disturbing its siblings and releases the caller's context, a debugfs file gets the seq_file it is written against — `single_open`/`seq_read`, rendered once into a buffer that grows until the whole dump fits — so a read past the first buffer continues rather than restarting. Registering a device broadcasts a uevent on `NETLINK_KOBJECT_UEVENT` that a bound listener receives. Every part is proved by reading it back the way userspace would.
-- [x] Import the DRM core and build it unmodified: all 41 objects of upstream's `drm-y` compile, with nothing edited under the staged tree. Every fix went into the shim.
-- [x] Link the imported core into the kernel: 41 objects plus the MIT hdmi infoframe library, built from upstream's own `drm-y` list rather than a list chosen here.
-- [x] Wire it to a device and run it: a driver on the imported core registers a `drm_device`, a connector and a simple display pipe, and serves dumb buffers as GEM objects with handles.
-- [x] Pin the upstream release and record it the way the ports tree pins versions: Linux 6.6 with a SHA-256 verified *before* extraction, listed in `THIRD_PARTY_NOTICES.md` with its licence split.
-- [x] Prove the layer before any vendor driver: the in-kernel DRM client probes the connector, allocates a framebuffer and commits it through upstream's atomic helpers, and the pixels are then read back off virtio-gpu's scanout — corners and centre — so a commit that returns success without moving an image fails the test.
-- [x] Give the core a character device and drive it from ring 3: `/dev/dri/card1` beside the existing `card0`, served by upstream's own `drm_open`/`drm_ioctl`/`drm_read`/`drm_poll`, with dumb buffers mapped through `drm_vma_manager` — offsets resolved a page at a time and refused when `drm_vma_node_is_allowed` says the client does not own the object. A userspace test runs the sequence libdrm runs, against the *pinned* uapi headers rather than a copy, and checks the pattern it painted came out the far end of the commit. Two nodes on purpose: the new surface is proved on its own before anything moves onto it.
+- [x] `done` Decide once where the DRM core comes from and write the answer
+      down: upstream `drivers/gpu/drm` imported verbatim (Linux 6.6, SHA-256
+      verified before extraction), with M100's own core kept for virtio-gpu.
+      See [`drm-import.md`](drm-import.md).
+- [x] `done` Write the primitives it stands on — refcounting and lifetimes, wait
+      queues, wound-wait `ww_mutex`, rbtrees with augmentation, interval trees,
+      `xarray`, `kthread_worker`, RCU, `struct page`/`vmap`, `kobject`,
+      `pm_runtime`, sysfs/debugfs. Each one asserts the property a driver relies
+      on, not merely that it compiles. See
+      [`lkpi-primitives.md`](lkpi-primitives.md).
+- [x] `done` Build and link the imported core unmodified: all 41 objects of
+      upstream's own `drm-y` list, with every fix going into the shim.
+- [x] `done` Prove the layer before any vendor driver: the in-kernel DRM client
+      commits a framebuffer through upstream's atomic helpers and the pixels are
+      read back off virtio-gpu's scanout, so a commit that succeeds without
+      moving an image fails the test.
+- [x] `done` Serve it to ring 3: `/dev/dri/card1` through upstream's own
+      `drm_open`/`drm_ioctl`/`drm_read`/`drm_poll`, with dumb buffers mapped via
+      `drm_vma_manager` and a userspace test running libdrm's sequence against
+      the pinned uapi headers.
 
-- [ ] `planned` Hardware rendering as a second path, never as a replacement.
-      Composition today is software (`WLR_RENDERER=pixman`) and must stay a
-      supported, tested path: it is the only one that works on a machine whose
-      GPU we do not drive, and it is what proves the display pipeline in
-      isolation when acceleration breaks. The accelerated path — a real GL/GLES
-      driver in the guest on top of the imported DRM core, which wlroots picks
-      through EGL and gbm — is added beside it, chosen at run time and falling
-      back to software rather than failing. Both paths get their own smoke
-      coverage, so a regression in one cannot hide behind the other.
+- [ ] `partial` Hardware rendering as a second path, never as a replacement.
+      The choice is made at run time by `render-select.sh` and the software path
+      stays first-class: acceleration is claimed only when a render node opens,
+      a Mesa DRI driver is present, *and* `gl_probe` draws a shader triangle on
+      it and reads the pixels back — otherwise the compositor starts on pixman
+      rather than failing. Both paths carry their own smoke markers, plus one
+      for the forced-off fallback, and a frame counts only when `framecheck`
+      confirms the colour the compositor was told to paint. Both blockers named
+      here are fixed — the driver reports itself as `virtio_gpu` and the card
+      carries virtio-gpu's real PCI identity, because its parent is now a real
+      `pci_dev` — but the accelerated frame is still not produced: the node
+      serves no `DRM_IOCTL_VIRTGPU_*`, which is the ABI Mesa's virgl winsys
+      speaks. See [`render-path.md`](render-path.md).
+- [x] `done` Serve the DRM master lease to ring 3. `capable()` in the shim
+      answered "not privileged" unconditionally, so upstream's
+      `drm_master_check_perm()` refused `SET_MASTER` to root and no compositor
+      could modeset; it asks b1nix's own credentials now. `M101T-DRM` performs
+      the whole sequence a compositor's session layer performs and reports each
+      step separately.
 
 ## M102a: Intel i915 (Gen8/Gen9.5) + Mesa iris
 
-- [x] `done` Import i915 unmodified and cut it to the Gen8/Gen9.5 paths; no firmware is needed on these parts.
-- [x] `done` Display: a Wayland compositor (cage/sway on wlroots, pixman) drives a
-      physical HDMI monitor through the passed-through UHD 630 — atomic modeset,
-      page flips, and a photograph of the panel matching the guest's own
-      screenshot (`smoke_run/monitor-cage-top-green.jpg`). The last blocker was
-      `schedule()` in the shim: mapped to a yield, it left every blocking atomic
-      commit parked with nothing able to wake it.
-- [x] `done` sway drives the monitor at the EDID's preferred 1920x1080, with
-      swaybg and a foot terminal on it — photographed off the panel in
-      [docs/images/m102a-sway-on-monitor.jpg](images/m102a-sway-on-monitor.jpg),
-      and matching the guest's own screenshot from the same run. The fallback
-      720x400 and the crashes behind it were one bug: threads carried private
-      copies of the break and of the mapping-list head, so one thread mapped
-      fresh zero pages over another thread's live heap.
-- [ ] `planned` Bring up GTT/PPGTT, contexts and execlists submission through the shim.
-- [ ] `planned` Serve `EXECBUFFER2` softpin-only, and keep the ioctl ABI exactly as the pinned Mesa expects it.
-- [ ] `planned` Run Mesa `iris` against it — its own NIR backend, so no LLVM rebuild.
-- [ ] `planned` Bare metal on the Pavilion's Gen8, logs over netconsole (the guaranteed path — no OS on the laptop, ISO boots from USB).
-- [ ] `planned` *If VT-d and BIOS ever allow it:* KVM + VFIO passthrough for a faster loop (keeps virtual COM1).
+Detail, including every shim defect found along the way, is in
+[`i915-gen9-passthrough.md`](i915-gen9-passthrough.md).
+
+- [x] `done` Import i915 unmodified and cut it to the Gen8/Gen9.5 paths; no
+      firmware is needed on these parts.
+- [x] `done` Drive the physical monitor: sway on wlroots at the EDID's preferred
+      1920x1080 through the passed-through UHD 630 — atomic modeset and page
+      flips, photographed off the panel
+      ([image](images/m102a-sway-on-monitor.jpg)) and matching the guest's own
+      screenshot from the same run.
+- [x] `done` Survive client churn: sway keeps its display, its IPC and its
+      window tree across clients starting, quitting and being killed outright,
+      six runs out of six on six CPUs (`tools/soak/`).
+- [x] `done` Run the GT: four engines on execlists, 4 GiB of GGTT and 48-bit
+      PPGTT, requests that execute and retire, and a waiter with nobody polling
+      on its behalf woken by the completion interrupt. `b1nix.i915-gt-probe`
+      reports execution, signalling and *unprompted* signalling separately,
+      because they fail apart.
+- [x] `done` Serve `EXECBUFFER2` with the pinned Mesa's own ABI — the shim never
+      touches the argument — and confirm iris is softpin-only at the crossing:
+      zero relocations over a run.
+- [x] `done` Render with Mesa `iris` on the hardware, proved by pixels rather
+      than an initialisation message: `/bin/gl_probe` clears, draws a shader
+      triangle and reads both back, reporting
+      `Mesa Intel(R) UHD Graphics 630 (CFL GT2)`.
+- [ ] `planned` A compositor's submissions still fail: sway on gles2/iris gets
+      `-ENOSPC` from its third `EXECBUFFER2` after 6.8 s. That is `eb_reserve`
+      giving up after evicting the whole address space, so it is the binding
+      path — softpin addresses that cannot be honoured — not the submission.
+- [ ] `planned` Bare metal on the Pavilion's Gen8, logs over netconsole (the
+      guaranteed path — no OS on the laptop, ISO boots from USB).
 
 ## M102b: amdgpu on RX 6600 (render-only) + radeonsi
 
@@ -925,30 +948,28 @@ M102a and M102b are two consumers of it rather than two ports.
 
 ## M104: Native Package Manager (`bpkg`)
 
-- [x] `/bin/bpkg`: a plain C ELF with its own inflate, tar and SHA-256, reading
-      both the house flat index and real Alpine repositories over HTTPS
+Detail in [bpkg](bpkg-package-manager.md) and
+[ports migration](ports-migration-plan.md).
+
+- [x] `done` `/bin/bpkg`: a plain C ELF with its own inflate, tar and SHA-256,
+      reading both the house flat index and real Alpine repositories over HTTPS
       (mbedTLS, chain verified), with update/install/remove/list/search/info.
-- [x] Resolve Alpine's virtual dependencies (`so:`/`cmd:`/path) through the
-      index's `p:` provides, with `/etc/bpkg.provided` for what the base image
-      already supplies.
-- [x] Verify a package end to end — RSA/SHA-1 signature against Alpine's keys,
-      then `.PKGINFO`'s `datahash` against the payload. Unsigned over the
+- [x] `done` Resolve Alpine's virtual dependencies (`so:`/`cmd:`/path) through
+      the index's `p:` provides, with `/etc/bpkg.provided` for what the base
+      image already supplies.
+- [x] `done` Verify a package end to end — RSA/SHA-1 signature against Alpine's
+      keys, then `.PKGINFO`'s `datahash` against the payload. Unsigned over the
       network is refused.
-- [x] Install and run unmodified Alpine binaries from the real mirror:
-      `bpkg install neofetch figlet` pulls bash, readline and ncurses with it.
-      See [bpkg](bpkg-package-manager.md).
-- [x] Control-member scripts, upgrade scripts and triggers, with
+- [x] `done` Install and run unmodified Alpine binaries from the real mirror,
+      including control-member scripts, upgrade scripts and triggers with
       `/etc/apk/world` tracked; each `BPKG-SMOKE` marker is gated on a side
       effect the script itself produced.
-- [x] Migrate the from-source ports to packages: 49 of 54 port scripts are
-      gone, replaced by `tools/packages/alpine-ports.map` +
-      `alpine-fetch.sh`, pinned by sha256. See
-      [ports migration](ports-migration-plan.md).
+- [x] `done` Migrate the from-source ports to packages: 49 of 54 port scripts
+      are gone, replaced by `tools/packages/alpine-ports.map` +
+      `alpine-fetch.sh`, pinned by sha256.
 - [ ] `wontfix` Five ports stay from-source: `musl`, `libcxx-musl` and
-      `busybox` are what the toolchain is built *out of* (a package cannot
-      supply the sysroot it is compiled against), and `openrc`/`rust` are the
-      running system's behaviour rather than build artefacts — Alpine's
-      `openrc` took the boot straight to poweroff and its `runit` is static.
+      `busybox` are what the toolchain is built *out of*, and `openrc`/`rust`
+      are the running system's behaviour rather than build artefacts.
 
 ## M105: PAM (OpenPAM + pam_unix.so)
 
@@ -963,127 +984,141 @@ M102a and M102b are two consumers of it rather than two ports.
 
 ## M107: BusyBox applets blocked on missing kernel subsystems
 
-- [x] Add netlink route sockets: link, address, route and neighbour queries.
-- [x] Add virtual terminals, console fonts and keymaps.
-- [x] Add loop devices with offsets, size limits and a write path.
-- [x] Extend `/proc`: full paths in `fd/`, named map regions, per-process memory.
-- [x] Add a structured kernel log ring with syslog, `/dev/kmsg` and `/proc/kmsg`.
-- [x] Add inotify move cookies, attribute changes and self deletion.
-- [x] Add RTC read and write plus watchdog ioctls with a real reset deadline.
-- [x] Add SMBus i2c on the host controller, reporting what it cannot do.
-- [x] Give block-backed device nodes `S_IFBLK`, and honour the interface name in `SIOCGIF*`.
-- [x] Administer IPv6 neighbours and interface up/down state for real.
-- [x] Give every `/dev/kmsg` reader its own cursor.
-- [ ] `wontfix` MTD and UBI applets stay unbuilt. They speak the raw-NAND MTD
-      ioctl ABI plus UBI's whole volume layer, and no b1nix target hands the
-      kernel a flash chip — the only flash QEMU's x86_64 machines emulate is
-      the firmware's own `pflash`. A RAM-backed pseudo-chip would only test
-      b1nix against b1nix. M109 keeps MTD among the single-device gaps should a
-      target that has one ever appear.
+Each of these was an applet that could not work until the kernel grew the
+subsystem underneath it. Full list in
+[`applet-parity.md`](applet-parity.md).
+
+- [x] `done` Networking and terminals: netlink route sockets (link, address,
+      route, neighbour), virtual terminals with fonts and keymaps.
+- [x] `done` Storage and process visibility: loop devices with offsets and a
+      write path, `/proc` with full `fd/` paths, named map regions and
+      per-process memory.
+- [x] `done` Logging and watching: a structured kernel log ring with syslog,
+      `/dev/kmsg` and `/proc/kmsg` (each reader with its own cursor), and
+      inotify move cookies, attribute changes and self deletion.
+- [x] `done` Hardware odds and ends: RTC read/write, watchdog ioctls with a real
+      reset deadline, SMBus i2c, `S_IFBLK` on block-backed nodes, IPv6
+      neighbours and interface state.
+- [ ] `wontfix` MTD and UBI applets stay unbuilt: no b1nix target hands the
+      kernel a flash chip, and a RAM-backed pseudo-chip would only test b1nix
+      against b1nix.
 
 ## M108: Hand ownership of base tools to BusyBox
 
-- [x] Make `su`, `passwd`, `login`, `id`, `whoami` and `groups` BusyBox applets and delete the local ELFs.
-- [x] Keep the setuid bit on a second copy of the multicall binary, reached by three names only.
-- [x] Write and read one shadow format end to end: SHA-512, shared with PAM.
-- [x] Boot BusyBox init as PID 1 from `/sbin/init`, with OpenRC driving the runlevels.
-- [x] Exercise the inittab getty respawn: kill it and require PID 1 to replace it.
-- [x] Delete three forged init markers from the smoke hook and let the real paths report.
-- [x] Fix `execve` to publish post-exec credentials in the auxv and refresh capabilities and fsuid.
-- [x] Group `userspace/bin` by purpose.
-- [x] `/etc/shadow` locking under concurrent password changes, confirmed and
-      then fixed: BusyBox `update_passwd` opened the file *before* taking its
-      `<file>+` `O_EXCL` lock, so a losing racer rewrote a stale snapshot over
-      the winner's update — and both exited 0. The read now happens under the
-      lock (`tools/patches/busybox/b1nix-config.sh`). The kernel primitives it
-      rests on were already sound, and are now proved: four simultaneous
-      `passwd` runs all land, and `M108-SMOKE: ok shadow-lock-excl` shows
-      `O_CREAT|O_EXCL` admitting exactly one racer per round and `F_SETLK`
-      blocking, naming and releasing its holder.
+Detail in [`applet-parity.md`](applet-parity.md).
+
+- [x] `done` `su`, `passwd`, `login`, `id`, `whoami` and `groups` become BusyBox
+      applets and the local ELFs are deleted.
+- [x] `done` Keep the setuid bit on a second copy of the multicall binary,
+      reached by three names only; libbb's `check_suid()` drops euid for every
+      other applet, so no extra symlink can grant privilege.
+- [x] `done` Write and read one shadow format end to end — SHA-512, shared with
+      PAM — and fix `/etc/shadow` locking under concurrent password changes:
+      BusyBox read the file before taking its lock, so a losing racer rewrote a
+      stale snapshot and both exited 0.
+- [x] `done` Boot BusyBox init as PID 1 with OpenRC driving the runlevels, and
+      exercise the inittab getty respawn by killing it. Three forged init
+      markers were deleted from the smoke hook so the real paths report.
+- [x] `done` Fix `execve` to publish post-exec credentials in the auxv and
+      refresh capabilities and fsuid.
 
 ## M109: Alpine applet parity
 
-- [x] Build 283 of Alpine's 321 applets and prove each one through `/bin`.
-- [x] `/dev/zero`, `/dev/urandom` and `/dev/random`, unblocking `shred`, `who`
-      and `cpio`.
-- [x] `AF_PACKET` (`kernel/net/packet.c`): SOCK_RAW and SOCK_DGRAM, bound to an
-      interface and/or ethertype, with taps on both the receive and the
-      transmit path so a socket sees its own outgoing frames the way `tcpdump`
-      does. Gated on CAP_NET_RAW.
-- [x] `pivot_root(2)` and `mount(MS_MOVE)`: a move retargets a mount and every
-      mount nested in it, so `umount` and `/proc/mounts` follow the tree, and
-      an initramfs boot hands the machine over to the real root
-      (`switchroot` smoke instance). BusyBox `pivot_root`/`switch_root` built.
-- [x] Filesystem UUID and label probing (`blk_probe_uuid`/`blk_probe_label`) for
-      ext2/3/4, FAT and exFAT, exposed at `/sys/block/<dev>/{uuid,label,fstype}`
-      and used by `root=UUID=`, `findfs` and `blkid`. Readdir now merges a
-      directory's in-memory children over its on-disk entries, so `/dev` lists
-      the nodes those tools scan for.
-- [x] Virtual network devices: 802.1Q VLAN, a learning bridge, active-backup
-      bonding and gretap tunnels (ipip carries no ethernet header, so it does
-      not fit the device model), created by `ip link add` and in /proc/net.
-- [x] Namespaces, all four kinds (`kernel/sched/namespace.c`): UTS, mount, PID
-      and network, through `unshare(2)`, `setns(2)` and `/proc/<pid>/ns/*`.
-      PID is a translation over the kernel's one flat id space — a task created
-      in a namespace is numbered from 1 there and cannot be named from outside
-      it — and translation happens at the syscall boundary, so `struct task`
-      does not grow. As on Linux, `unshare(CLONE_NEWPID)` affects children, and
-      `/proc` reports the namespace it was mounted in.
-- [x] Network namespaces own their interfaces, routes, neighbours and socket
-      bindings; a `veth` pair (`kernel/net/veth.c`, `ip link add ... type veth
-      peer name ...`) plus `ip link set <dev> netns <pid>` is how a frame
-      crosses between them. See [namespaces](namespaces.md).
-- [ ] `planned` A namespace has no private IPv4 configuration: `kernel/net/net.c`
-      holds one `local_ip`/`gateway_ip`/`netmask` and `ipv4_send_tx` stamps every
-      packet's source from it, so IP inside a namespace needs that state made
-      per-namespace first. Until then a namespaced interface carries frames
-      (AF_PACKET, veth) but not addresses.
-- [x] A uevent channel for `mdev` (`kernel/dev/uevent.c`): `NETLINK_KOBJECT_UEVENT`
-      messages on device registration and removal, and a `/sys/dev/block` tree
-      carrying `dev`/`uevent`, so `mdev -s` populates `/dev` and `mdev -d`
-      maintains it against a device that appears after boot.
-- [x] Inode attribute flags for `chattr`/`lsattr`: `FS_IOC_GET/SETFLAGS` over
-      ext4's on-disk `i_flags`, with immutable and append-only enforced in the
-      write, truncate, rename and unlink paths (the other six are stored only).
-- [x] Discard for `blkdiscard` and `fstrim`: `BLKDISCARD`/`BLKZEROOUT` down to
-      virtio-blk DISCARD, NVMe DSM Deallocate and ATA TRIM, plus a `FITRIM` walk
-      of a mounted ext4's free bitmaps. No command on the device, no pretending:
-      `EOPNOTSUPP`, never a software fallback that writes the I/O it saves.
-- [x] I/O priorities for `ionice`: `ioprio_set`/`ioprio_get` drive the block
-      layer's admission gate, which hands a busy device to the best-priority
-      waiter and ages waiters so no class starves another.
-- [x] The single-device gaps, triaged: serial configuration is real (termios
-      baud/parity/stop bits on the 16550, `TIOCM*`, `TIOCGSERIAL`). `wontfix` —
-      CD-ROM and MTD (no ATAPI packet path, no flash device), rfkill (no radio),
-      md, nbd and floppy (no RAID layer, no network block device, no controller).
-- [ ] `wontfix` `i2ctransfer` needs raw I2C an SMBus controller cannot issue.
+The measure is not how many applets build but how many work: every one is
+exercised through `/bin`. Detail in [`applet-parity.md`](applet-parity.md).
+
+- [x] `done` Build 283 of Alpine's 321 applets and prove each one through
+      `/bin`.
+- [x] `done` Give the network applets what they speak: `AF_PACKET` (SOCK_RAW and
+      SOCK_DGRAM, with taps on both directions so a socket sees its own outgoing
+      frames), and virtual devices — VLAN, a learning bridge, active-backup
+      bonding, gretap.
+- [x] `done` Namespaces, all four kinds, with `veth` carrying frames between
+      network namespaces. See [namespaces](namespaces.md).
+- [x] `done` Storage and device plumbing: `pivot_root`/`MS_MOVE`, filesystem
+      UUID/label probing behind `root=UUID=`/`blkid`, inode attribute flags for
+      `chattr`, real discard for `fstrim`/`blkdiscard` (`EOPNOTSUPP` rather than
+      a software fallback), I/O priorities for `ionice`, and a
+      `NETLINK_KOBJECT_UEVENT` channel so `mdev` populates and maintains `/dev`.
+- [x] `done` The single-device gaps, triaged: serial configuration is real;
+      `wontfix` for rfkill and floppy — no such device on any b1nix target
+      — and for `i2ctransfer`, which needs raw I2C an SMBus controller cannot
+      issue. CD-ROM, md and nbd were on that list and are not any more: the
+      layers under them were built (M114).
+- [x] `done` A namespace carries its own IPv4 configuration: the address,
+      gateway and netmask are held per network namespace instead of in three
+      file-scope globals, `ifconfig` and `ip addr add` both take effect inside
+      one, and `ipv4_send_tx` stamps the source from the namespace owning the
+      interface the frame leaves by. Two defects were behind the failing
+      exchange — `route_configure_interface()` flushed every dynamic route with
+      no namespace filter, so configuring one namespace deleted another's
+      on-link route, and the receive-side namespace context was a single global
+      word two CPUs could overwrite for each other.
+- [ ] `partial` What a namespace still shares: IPv6 interface state is global,
+      a namespace holds exactly one IPv4 address (no secondaries), `bind()`
+      checks `EADDRINUSE` against one table for all namespaces, and DHCP runs
+      only in the initial namespace.
+
+## M114: The layers under the missing applets
+
+Alpine's BusyBox builds 304 applets and ours built 287. Most of the difference
+was not a build option but an absent kernel subsystem, so the subsystems were
+written. Detail in [applet parity](applet-parity.md).
+
+- [x] `done` `readahead(2)`: a real prefetch of a file's blocks into the cache
+      through the ordinary read path, not an accepted hint. Unblocks
+      `readahead`.
+- [x] `done` `TIOCCONS`: kernel console output copied to a terminal. The
+      console prints from under a spinlock with interrupts off, where a device
+      write may not sleep, so it pushes into a ring that a thread drains and
+      reports loss rather than swallowing it. Unblocks `setconsole`.
+- [x] `done` Software RAID (`kernel/dev/md.c`): striping and mirroring as an
+      ordinary block device, assembled by `RAID_AUTORUN` from superblocks the
+      members carry. The format is b1nix's own and says so — nothing here can
+      write or verify Linux's, so claiming it would be a promise no test could
+      keep. No resynchronisation: a failed member stays failed rather than
+      silently serving stale data. Unblocks `raidautorun`.
+- [x] `done` Network block device (`kernel/dev/nbd.c`): the NBD protocol over
+      the existing TCP stack, driven either from the kernel or through the
+      ioctl interface `nbd-client` speaks — the socket it hands over is held by
+      reference, because an fd number belongs to one process and can be closed
+      underneath the kernel. Unblocks `nbd-client`.
+- [x] `done` ATAPI packet reads: a CD-ROM registers as a read-only block device
+      with its own 2048-byte blocks, so an ISO on it mounts like any filesystem.
+      Read only — a write path that could never be tested would be code nobody
+      has run. Unblocks `eject` and `volname`.
+- [x] `done` MTD over CFI NOR flash (`kernel/dev/mtd.c`): the chip QEMU gives
+      through `-drive if=pflash`, probed with a CFI query and described by its
+      own table. `/dev/mtd0` offers the erase a block device cannot, and
+      `/dev/mtdblock0` the block face for a filesystem. Unblocks
+      `flash_eraseall` and `flashcp`. NAND stays out: its tools exist for
+      out-of-band data NOR has none of.
+- [x] `done` `nsenter` and `unshare` needed no new layer, only enabling: each
+      check compares the namespace's answer with the parent's, since a command
+      that exits 0 says nothing about isolation.
 
 ## M110: Unix block-device names
 
-- [x] Name disks the way the rest of Unix does: `sda`/`sdb` for SATA, `vda`/`vdb`
-      for virtio-blk, `nvme0n1` for NVMe. Partitions follow (`sda1`, `vda1`,
-      `nvme0n1p1`).
-- [x] Derive the suffix from the driver's enumeration index in `blk_disk_name()`
-      / `blk_nvme_name()` (`kernel/dev/blk.c`) — no per-device table, so a fifth
-      SATA disk is `sde` on its own.
-- [x] Clean break: the old `sata0`/`nvme0`/`virtio-blk0` names are gone, with no
-      aliases. Every consumer in the tree (root/swap selection, mounts, procfs,
-      sysfs, tests, guest scripts, docs) moved with them.
-- [x] Fold USB mass storage into the same `sd` sequence: it is a SCSI disk, so
-      it is an `sd*` like AHCI's. The block layer owns the sequence
-      (`blk_register_disk`), so registration order decides the letter whichever
-      bus delivered the disk.
-- [x] Stop identifying devices by name prefix where a fact will do: block
+- [x] `done` Name disks the way the rest of Unix does — `sda`/`sdb` for SATA,
+      `vda` for virtio-blk, `nvme0n1` for NVMe, with partitions following — and
+      derive the suffix from the driver's enumeration index in
+      `blk_disk_name()`/`blk_nvme_name()`, so a fifth SATA disk is `sde` with no
+      per-device table.
+- [x] `done` Clean break: the old `sata0`/`nvme0`/`virtio-blk0` names are gone
+      with no aliases, and every consumer in the tree moved with them — root and
+      swap selection, mounts, procfs, sysfs, tests, guest scripts, docs.
+- [x] `done` Fold USB mass storage into the same `sd` sequence: it is a SCSI
+      disk, and the block layer owns the sequence, so registration order decides
+      the letter whichever bus delivered the disk.
+- [x] `done` Stop identifying devices by name prefix where a fact will do: block
       devices carry a bus, the live-ISO path finds the boot medium by mounting
       candidates and looking for the boot image, and swap asks for "the second
       ATA disk" rather than for `sdb`.
-- [x] Fix the live-USB root switch: `loop_register_file()` registered a *second*
-      block device named `loop0` beside the empty one `loop_init()` had already
-      made, so `blk_get("loop0")` returned the unassociated one and the boot
-      fell back to `ram0`. It now binds the backing file into the first free
-      pre-registered loop slot — the device the mount finds is the one carrying
-      the file — and returns it, so the caller names it rather than assuming
-      `loop0`. Covered by `tests/liveusb.sh`.
+- [x] `done` Fix the live-USB root switch: `loop_register_file()` registered a
+      *second* device named `loop0` beside the empty one `loop_init()` had made,
+      so the mount found the unassociated one and the boot fell back to `ram0`.
+      It now binds into the first free pre-registered slot and returns it, so the
+      caller names it rather than assuming. Covered by `tests/liveusb.sh`.
 
 ## M111: A Debian userspace, and a boot log with a shape
 
@@ -1110,13 +1145,22 @@ M102a and M102b are two consumers of it rather than two ports.
 
 ## M112: systemd as PID 1
 
+- [ ] `partial` **PCI bus topology under `/sys/devices`** (M119): `/sys/devices`
+      held `system` and nothing else, so no device had a parent for udev to
+      match a rule against and libdrm could not name the bus a card sits on.
+      `pci_sysfs_publish_all()` now publishes every function the enumeration
+      finds — vendor/device/class/revision/irq/subsystem ids read from config
+      space — with `/sys/bus/pci/devices` links and a writable `uevent` that
+      really re-announces the device. `/sys/dev/char` exists for the first time.
+      No `driver` link: this kernel records no binding. The headless test image
+      has no DRM card, so the libdrm chain is not yet proven end to end.
 - [x] **Debian's systemd 252 boots b1nix as PID 1**, headless: cgroup v2 with
       `/system.slice` per unit, journald with `journalctl` reading its journal
       back, sysinit/basic/multi-user targets reached, dbus 1.14 serving the
       system bus, `systemd-run --pipe` starting a transient unit through it, and
       agetty's login prompt on the serial console. `make systemd-image` builds
       the image (dependency closure resolved from the suite index, 23 packages);
-      `make systemd-smoke` boots it and checks 14 markers.
+      `make systemd-smoke` boots it and checks 29 markers, 15 of which pass.
 - [x] **cgroup v2** (`kernel/fs/cgroup.c`): a real unified hierarchy with
       `cgroup.procs`/`threads`/`events`/`subtree_control`, mkdir/rmdir as the
       creation API, inotify on `cgroup.events`, `/proc/<pid>/cgroup`, and one
@@ -1132,5 +1176,68 @@ M102a and M102b are two consumers of it rather than two ports.
       stack), `CLOCK_REALTIME` walking backwards, a freshly created file with
       `st_nlink == 0`, and `/proc/<pid>/fd/N` frozen at its first target.
       Details in [`docs/debian-systemd-boot.md`](debian-systemd-boot.md).
-- [ ] No udev, so no `.device` unit ever activates; `systemd-logind` does not
-      start. Both are listed in the document above.
+- [x] `done` Five more defects that stopped PID 1 or every unit: `/proc` files
+      reported as character devices (systemd refuses to read anything that is
+      not a regular file), `/proc/<pid>/fd/N` frozen at its first target (so
+      five different mounts landed on one node), no `/proc/<pid>/cgroup` or
+      `/proc/cgroups`, no `oom_score_adj`, and a procfs writer returning 0 for a
+      successful write — which glibc's stdio spins on forever.
+- [ ] `partial` udev: `systemd-udevd` runs, receives the kernel's uevents,
+      forks a worker per device and now **processes and tags** them — `vda:
+      Failed to process device` is gone, the rule set runs to completion,
+      `TAGS=:systemd:` is set and `/run/udev/data/b8:0` is written. What it
+      needed was `/sys/block/<disk>/queue`: systemd tells a whole disk from a
+      partition by looking for `queue` and then `partition`, and vda had
+      neither, so it was neither and the event was abandoned before a single
+      rule ran. Still open: no `.device` unit is created from the tagged
+      device, `udevadm control --ping` times out, and `loop0`–`loop6` still
+      fail to process where vda no longer does.
+- [x] `done` **systemd-logind** reaches active and answers `loginctl`. It was
+      not a logind defect at all: every unit with `PrivateTmp=` failed at
+      `start` with `Result=resources`, because a path component longer than 63
+      characters resolved to nothing (see M119).
+- [ ] `partial` **`daemon-reload` takes ~90 s and then loses the bus**, which
+      is what most of the remaining red in `systemd-smoke` sits behind.
+      Measured: not per-unit work (61% more units moved the time 1.2%), not a
+      hanging generator (all twelve finish in ~1.2 s; `wait4` is 1 s of the
+      91), not work at all (203 `openat` across the whole window), and not a
+      kernel-side disconnect (one AF_UNIX teardown in the window, the client's,
+      after the call returned). What is left is that the Reload request never
+      reaches PID 1's event loop. Details and the refuted hypotheses in
+      [`debian-systemd-boot.md`](debian-systemd-boot.md).
+
+## M113: KDE Plasma
+
+A second desktop stack, chosen because it shares almost nothing with the first.
+Everything this system has run so far is wlroots — sway, cage and the clients
+around them. Plasma is Qt6 for its rendering and its event loop, KDE Frameworks
+underneath, and its own input and session handling, so it exercises assumptions
+wlroots never made. The ones it breaks on are ours.
+
+- [x] `done` **Plasma's desktop draws on b1nix**: kwin_wayland compositing, the
+      panel with its application launcher, task manager, system tray and a
+      running clock, the Breeze wallpaper, and a client window carrying KDE's
+      own decorations — [screenshot](images/m113-plasma-desktop.png), taken
+      inside the guest with `grim` and carried out through the serial log. 293
+      Alpine packages staged by `B1NIX_KDE=1`; `/etc/kde.sh` starts the session.
+- [x] `done` Three kernel defects it found, each fixed with its own coverage: a
+      kernel write into a read-only user page panicked the machine (it landed on
+      the tid word every dying thread clears); `/proc/self` was a directory
+      shared by every process, so the per-descriptor nodes under it were shared
+      too; and the signal frame reserved 424 bytes for a 936-byte `ucontext_t`,
+      overlapping the frame it interrupted.
+- [ ] `partial` kwin's **DRM backend** finds no device, and it never calls
+      `open` on `/dev/dri` at all — so it refuses before the kernel is
+      involved. The cause is the absent **logind session**, not device
+      enumeration: the KDE image ships elogind but no PAM modules, and its
+      BusyBox `login` does not use PAM, so no session is ever created. The
+      nested backend, which is how KDE itself is developed, is what the
+      screenshot above is taken from.
+- [x] `done` `kioworker`'s **detected stack smash** (`SIGSEGV` at
+      `__stack_chk_fail`), which left Plasma's desktop containment blank. The
+      `ucontext_t` reservation above was one writer past the end of a stack
+      object; the second was `getsockname`/`getpeername` reporting a flat
+      `sizeof(struct sockaddr_un)` for every AF_UNIX socket. Qt's socket engine
+      hands one `socklen_t` to both calls, so the 110 the first answered with
+      became the second's capacity for a 28-byte object. Covered by
+      `M57-SMOKE: ok unix-addrlen` and `unix-addrlen-reuse`.
