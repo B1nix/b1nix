@@ -1,0 +1,10 @@
+# runuser — change user without authenticating, for root.
+#
+# util-linux ships this file; the runuser subpackage alone does not, so it is
+# provided here. The session block is what matters: base-session pulls in
+# pam_elogind.so, which is what registers a login session with logind, and a
+# registered session is the only thing kwin's DRM backend will accept devices
+# through.
+auth       sufficient pam_rootok.so
+session    include    base-session
+account    include    base-account

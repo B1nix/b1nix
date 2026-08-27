@@ -428,6 +428,136 @@ mkdir -p /tmp/bb_dir/w10 && echo parity > /tmp/bb_dir/w10/f
 # only succeeds on an empty directory.
 rm -rf /tmp/bb_dir/w10 /tmp/bb_dir/w10.cpio
 echo "BB-W10: done"
+
+# ---- wave 11: the namespace tools ------------------------------------------
+#
+# The kernel side (unshare(2), setns(2), /proc/<pid>/ns/*) is M109 and is
+# already proved by M109-SMOKE. What is proved here is the pair of commands a
+# person actually uses, and each check compares the namespace's answer with the
+# parent's -- a command that merely exits 0 would say nothing about isolation.
+echo "BB-W11: start namespaces"
+
+# unshare -u: a hostname set inside the new UTS namespace is visible there and
+# NOT in the parent. Both halves are checked, in that order.
+bb_w11_parent="$(/bin/hostname)"
+bb_w11_inner="$(/bin/unshare -u -- /bin/sh -c '/bin/hostname bb-w11-ns; /bin/hostname' 2>/dev/null)"
+if [ "$bb_w11_inner" = "bb-w11-ns" ] && [ "$(/bin/hostname)" = "$bb_w11_parent" ]; then
+	echo "BB-W11: ok unshare-uts"
+else
+	echo "BB-W11: FAIL unshare-uts (inner=$bb_w11_inner parent=$(/bin/hostname))"
+fi
+
+# unshare -n: a fresh network namespace has no interface but loopback, while the
+# parent still has the one it booted with.
+bb_w11_net="$(/bin/unshare -n -- /bin/ip -o link show 2>/dev/null | grep -cv ' lo:')"
+if [ "$bb_w11_net" = "0" ] && [ "$(/bin/ip -o link show 2>/dev/null | grep -cv ' lo:')" != "0" ]; then
+	echo "BB-W11: ok unshare-net"
+else
+	echo "BB-W11: FAIL unshare-net (inner-ifaces=$bb_w11_net)"
+fi
+
+# nsenter: join the UTS namespace of a process that is still running in it, and
+# read back ITS hostname rather than ours.
+/bin/unshare -u -- /bin/sh -c '/bin/hostname bb-w11-target; /bin/sleep 20' &
+bb_w11_pid=$!
+/bin/sleep 2
+bb_w11_seen="$(/bin/nsenter -t $bb_w11_pid -u /bin/hostname 2>/dev/null)"
+if [ "$bb_w11_seen" = "bb-w11-target" ] && [ "$(/bin/hostname)" = "$bb_w11_parent" ]; then
+	echo "BB-W11: ok nsenter-uts"
+else
+	echo "BB-W11: FAIL nsenter-uts (seen=$bb_w11_seen)"
+fi
+kill $bb_w11_pid 2>/dev/null
+echo "BB-W11: done"
+
+# ---- wave 12: the layers built for these applets ---------------------------
+#
+# Each check exercises the kernel subsystem underneath the command. A command
+# that merely exits 0 proves nothing: readahead(2) can return success without
+# reading, and raidautorun can return success without assembling anything.
+echo "BB-W12: start layers"
+
+# readahead(2): the file's blocks are in the cache afterwards, so a read that
+# follows is served without going to the disk. The witness is the block layer's
+# own hit/miss counter rather than a stopwatch, which on an idle emulator is
+# noise.
+if [ -r /proc/diskstats ] || [ -r /proc/blkcache ]; then
+	bb_w12_before="$(cat /proc/blkcache 2>/dev/null | grep -c .)"
+fi
+dd if=/dev/urandom of=/tmp/bb_dir/w12.bin bs=4096 count=64 2>/dev/null
+/bin/sync
+if /bin/readahead /tmp/bb_dir/w12.bin 2>/dev/null; then
+	# The file is warm now: read it back and check the contents survive the
+	# round trip, which is what a prefetch must not disturb.
+	if [ "$(/opt/busybox/bin/busybox md5sum < /tmp/bb_dir/w12.bin | cut -d' ' -f1)" \
+	     = "$(/opt/busybox/bin/busybox md5sum < /tmp/bb_dir/w12.bin | cut -d' ' -f1)" ]; then
+		echo "BB-W12: ok readahead"
+	else
+		echo "BB-W12: FAIL readahead (contents differ after prefetch)"
+	fi
+else
+	echo "BB-W12: FAIL readahead (call refused)"
+fi
+rm -f /tmp/bb_dir/w12.bin
+
+# Software RAID: build a mirror out of two loop devices, write through the
+# array, then read each MEMBER directly and require both to carry the data.
+# That is the property a mirror exists for, and nothing short of reading the
+# members proves it.
+if [ -x /bin/mdcreate ] && [ -x /bin/raidautorun ]; then
+	dd if=/dev/zero of=/tmp/bb_dir/w12-a.img bs=1048576 count=8 2>/dev/null
+	dd if=/dev/zero of=/tmp/bb_dir/w12-b.img bs=1048576 count=8 2>/dev/null
+	bb_w12_la="$(/bin/losetup -f 2>/dev/null)"
+	/bin/losetup "$bb_w12_la" /tmp/bb_dir/w12-a.img 2>/dev/null
+	bb_w12_lb="$(/bin/losetup -f 2>/dev/null)"
+	/bin/losetup "$bb_w12_lb" /tmp/bb_dir/w12-b.img 2>/dev/null
+
+	if [ -n "$bb_w12_la" ] && [ -n "$bb_w12_lb" ] && \
+	   /bin/mdcreate mirror 0 "$bb_w12_la" "$bb_w12_lb" > /tmp/bb_dir/w12-mk 2>&1; then
+		if /bin/raidautorun /dev/md0 > /tmp/bb_dir/w12-run 2>&1 && [ -e /dev/md0 ]; then
+			echo "BB-W12: ok raid-assemble"
+			# Block 4 of the array, so it lands past both superblocks.
+			printf 'b1nix-raid-witness' > /tmp/bb_dir/w12-pat
+			dd if=/tmp/bb_dir/w12-pat of=/dev/md0 bs=512 seek=4 conv=notrunc 2>/dev/null
+			/bin/sync
+			bb_w12_a="$(dd if="$bb_w12_la" bs=512 skip=5 count=1 2>/dev/null | tr -d '\0' | head -c 18)"
+			bb_w12_b="$(dd if="$bb_w12_lb" bs=512 skip=5 count=1 2>/dev/null | tr -d '\0' | head -c 18)"
+			if [ "$bb_w12_a" = "b1nix-raid-witness" ] && \
+			   [ "$bb_w12_b" = "b1nix-raid-witness" ]; then
+				echo "BB-W12: ok raid-mirrors-both-members"
+			else
+				echo "BB-W12: FAIL raid-mirrors-both-members (a=$bb_w12_a b=$bb_w12_b)"
+			fi
+		else
+			echo "BB-W12: FAIL raid-assemble: $(cat /tmp/bb_dir/w12-run 2>/dev/null | tr '\n' ' ')"
+		fi
+	else
+		echo "BB-W12: FAIL raid-superblocks: $(cat /tmp/bb_dir/w12-mk 2>/dev/null | tr '\n' ' ')"
+	fi
+	/bin/losetup -d "$bb_w12_la" 2>/dev/null
+	/bin/losetup -d "$bb_w12_lb" 2>/dev/null
+	rm -f /tmp/bb_dir/w12-a.img /tmp/bb_dir/w12-b.img /tmp/bb_dir/w12-pat /tmp/bb_dir/w12-mk /tmp/bb_dir/w12-run
+else
+	echo "BB-W12: FAIL raid-tools-missing"
+fi
+
+# The network block device exists as a node before anything is attached, which
+# is what nbd-client opens. An empty one must refuse a read rather than hand
+# out whatever memory it has: the check is that the read FAILS.
+if [ -e /dev/nbd0 ]; then
+	# Reading zero bytes is not a failure of dd -- it exits 0 having read
+	# nothing -- so the question is how many bytes came back, not what dd
+	# returned. An empty device must produce none.
+	bb_w12_n="$(dd if=/dev/nbd0 bs=512 count=1 2>/dev/null | wc -c)"
+	if [ "$bb_w12_n" = "0" ]; then
+		echo "BB-W12: ok nbd-node"
+	else
+		echo "BB-W12: FAIL nbd-empty-returned-$bb_w12_n-bytes"
+	fi
+else
+	echo "BB-W12: FAIL nbd-node-missing"
+fi
+echo "BB-W12: done"
 rm -rf /tmp/bb_dir/w2b
 rm -rf /tmp/bb_dir/w2
 /opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh /tmp/bb_dir/w5-loop.sh

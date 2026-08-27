@@ -1,0 +1,12 @@
+lastlog, wtmp and utmp exist because login writes to them.
+
+Every distribution ships these three files, created empty. util-linux's login
+records the previous login in lastlog, appends to wtmp and updates utmp, and
+without them it takes its error paths -- which is where it faulted here, with
+a frame pointer holding the bytes " root" and a pointer walked past the end of
+the user address space: a record it never managed to fill, used as though it
+had been.
+
+Empty is the correct initial state for all three: a zero-length lastlog reads
+as "never logged in" for every uid, and wtmp and utmp are append-only logs
+that start out with nothing in them.

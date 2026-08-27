@@ -38,6 +38,17 @@
 # b1nix.i915sway — sway on the passed-through GPU's real output.
 ::wait:/bin/sh /etc/i915-sway.sh
 
+# Both composition paths, each proved on its own. On a test boot the gfx smoke
+# runs this from /etc/local.d/00-smoke.start; here it is reachable on an image
+# that carries a real GL driver (make B1NIX_GPU_DRV=1) with b1nix.render-smoke.
+::wait:/bin/sh -c 'grep -q b1nix.render-smoke /proc/cmdline 2>/dev/null && exec /bin/sh /etc/render-smoke.sh || true'
+# KDE's compositor, on b1nix.kde. Gated inside the script like the others.
+::wait:/bin/sh /etc/kde.sh
+
+# Soak hook: only does anything when the kernel cmdline carries b1nix.soak=<list>
+# — the overnight stress instance (see /etc/soak.sh and tools/soak/).
+::wait:/bin/sh /etc/soak.sh
+
 # Diagnostic hook: only does anything when the kernel cmdline carries
 # b1nix.chromium-min — the smallest browser case, with no compositor and no GPU.
 ::wait:/bin/sh /etc/chromium-min.sh

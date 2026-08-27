@@ -1,0 +1,11 @@
+/var/run is a symlink to /run, as it is on every distribution since 2011.
+
+It was simply absent here, and software compiled against the old path could
+not reach anything the new one holds: dbus binds its system bus socket in
+/run/dbus and its clients connect to /var/run/dbus/system_bus_socket, so the
+bus was running and unreachable at the same time. logind was then unreachable
+too, and kwin -- which asks logind for its graphics devices -- had no one to
+ask, which is why it never opened a card.
+
+The compatibility path is not optional: a program does not know which of the
+two names it was built with, and both have to arrive at the same directory.

@@ -1,0 +1,4 @@
+# runuser -l — the login-shell form. Same session stack; see pam.d/runuser.
+auth       sufficient pam_rootok.so
+session    include    base-session
+account    include    base-account

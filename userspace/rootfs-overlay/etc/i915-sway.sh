@@ -8,8 +8,13 @@
 # and the client never started. The dot is a regex wildcard as well, which is
 # the same trap one character smaller.
 has_flag() {
+	# A flag matches whether it stands alone or carries a value:
+	# b1nix.glprobe and b1nix.glprobe=virtio_gpu are the same flag, and an
+	# exact-token test silently ignored the second form -- the probe simply
+	# reported "not requested" for a command line that plainly requested it.
 	for tok in $(cat /proc/cmdline 2>/dev/null); do
 		[ "$tok" = "$1" ] && return 0
+		case "$tok" in "$1"=*) return 0 ;; esac
 	done
 	return 1
 }
@@ -134,6 +139,59 @@ if [ -x /bin/m101t_smoke ] && grep -q "b1nix.drm-enumerate" /proc/cmdline 2>/dev
 	# takes a while then looks like a test that hung.
 	B1NIX_CONNECTOR=111 /bin/m101t_smoke 2>&1
 	echo "--- end drm resources ---"
+fi
+
+# Render-only mode: draw off-screen on the GPU and check the pixels.
+#
+# The compositor answers a display question. This answers a different one that
+# had been quietly riding along with it: does the render engine actually
+# execute what Mesa submits? Every previous run stopped at "iris initialised",
+# which a driver that never successfully submits a batch also prints.
+#
+# It is placed here, before the package stage, because it needs nothing from
+# the network: Mesa is in the image whenever B1NIX_GPU_DRV=1 built it, and the
+# probe reaches libEGL and libGLESv2 through dlopen. A run costs seconds.
+if has_flag b1nix.glprobe; then
+	iris=/usr/lib/xorg/modules/dri/iris_dri.so
+	if ! grep -q 'b1nix\.glprobe=' /proc/cmdline 2>/dev/null && [ ! -e "$iris" ]; then
+		echo "I915-SWAY: fail no-iris (build with B1NIX_GPU_DRV=1)"
+		echo "I915-SWAY: done"
+		exit 0
+	fi
+	# Name the driver rather than let the loader search. Without this Mesa is
+	# free to answer with a software rasteriser, and a green run would then
+	# say nothing at all about the GPU — the probe checks GL_RENDERER for the
+	# same reason, but failing early is clearer than failing late.
+	#
+	# Which driver, though, depends on which GPU is in the machine:
+	# `b1nix.glprobe=virtio_gpu` probes the virtio GPU's virgl path, and a
+	# bare b1nix.glprobe keeps iris for the passed-through Intel part. The
+	# iris file check above is skipped when another driver is named, because
+	# demanding iris on a machine that has no Intel GPU would refuse a probe
+	# that is about to succeed.
+	drv=$(sed -n 's/.*b1nix\.glprobe=\([A-Za-z0-9_]*\).*/\1/p' /proc/cmdline)
+	export MESA_LOADER_DRIVER_OVERRIDE="${drv:-iris}"
+	export LIBGL_DRIVERS_PATH=/usr/lib/xorg/modules/dri
+	export EGL_LOG_LEVEL=debug
+	# Mesa's own account of why it gave up. Without these the client reports
+	# one line -- "failed to create dri2 screen" -- for every possible cause,
+	# and the driver's specific complaint stays inside it.
+	export MESA_DEBUG=1
+	export VIRGL_DEBUG=verbose
+	export LIBGL_DEBUG=verbose
+	# What Mesa reads to identify the device. drmGetDevice2 parses these, and
+	# a device it cannot identify is one pipe_loader will not create a screen
+	# for -- which looks from outside exactly like a driver that refused.
+	for f in vendor device revision subsystem_vendor subsystem_device; do
+		echo "I915-SWAY: pci $f = [$(cat /sys/class/drm/card1/device/$f 2>&1)]"
+	done
+	echo "I915-SWAY: pci link = [$(readlink /sys/class/drm/card1/device 2>&1)]"
+	echo "I915-SWAY: bus dir = [$(ls /sys/bus/pci/devices 2>&1 | tr '\n' ' ')]"
+	echo "I915-SWAY: gl probe on $CARD t=$(up)"
+	/bin/gl_probe /dev/dri/renderD128
+	echo "I915-SWAY: gl_probe exit $? t=$(up)"
+	echo "I915-SWAY: done"
+	exit 0
 fi
 
 # Card-only mode: enumerate the display and stop.
@@ -356,9 +414,38 @@ unset WAYLAND_DISPLAY
 # Naming the device by hand would hide a broken discovery path, and the next
 # compositor would not have the same escape hatch.
 #
-# The renderer is the one thing still chosen here: there is no GL driver for
-# this hardware yet, so pixman composites in software.
-export WLR_RENDERER=pixman
+# The renderer.
+#
+# Software by default: pixman needs nothing from the GPU beyond a dumb buffer,
+# so a run that fails still says something about KMS rather than about Mesa.
+# b1nix.i915gl asks for the hardware path instead — wlroots then brings up EGL
+# on the render node, which loads Mesa's iris and puts the GT to work. That
+# driver only reaches the image under B1NIX_GPU_DRV=1, so say plainly when it is
+# absent rather than letting EGL fail with a message about nothing in
+# particular.
+# The choice itself is /etc/render-select.sh, which every compositor launcher
+# here shares: it looks for a render node, a Mesa driver behind it and a
+# driver that really renders (gl_probe), and settles on pixman when any of
+# those is missing rather than letting the compositor fail to start. Software
+# unless b1nix.i915gl asks for the hardware path — a run that fails on pixman
+# says something about KMS, and one that fails on GLES says something about
+# Mesa, and keeping the default software keeps those apart.
+. /etc/render-select.sh
+if grep -q "b1nix.i915gl" /proc/cmdline 2>/dev/null; then
+	# Name iris: this is the passed-through Intel GPU, and letting the loader
+	# search has picked a different driver on a machine with two cards.
+	B1NIX_MESA_DRIVER=iris
+	export EGL_LOG_LEVEL=debug
+	export MESA_DEBUG=1
+else
+	B1NIX_RENDERER=pixman
+fi
+render_select
+unset B1NIX_MESA_DRIVER B1NIX_RENDERER
+echo "I915-SWAY: renderer $WLR_RENDERER ($RENDER_REASON)"
+if [ "$WLR_RENDERER" != gles2 ] && grep -q "b1nix.i915gl" /proc/cmdline 2>/dev/null; then
+	echo "I915-SWAY: fail no-accel ($RENDER_REASON; build with B1NIX_GPU_DRV=1)"
+fi
 # Naming the card by hand, for the one experiment that needs both GPUs present:
 # the kernel's own client mirrors onto the emulated one, and the compositor must
 # still be pointed at the assigned one. Ordinary runs leave this unset and rely
@@ -728,6 +815,15 @@ PROOF
 	# run's budget has to reach the window test that follows; the earlier
 	# version asked six questions in sequence and spent the whole run before
 	# reaching the one that matters.
+	# Only when a snapshot is being collected.
+	#
+	# This pre-run exists to give the kernel's watchdog something readable to
+	# dump, and it costs the run about two minutes of guest time before the
+	# window question is even asked — with the browser and the compositor both
+	# resident, that is the difference between reaching the verdict and being
+	# killed on the runner's timeout. Without b1nix.task-watch there is no
+	# watchdog to feed, so the run goes straight to the browser.
+	if has_flag b1nix.task-watch; then
 	echo "I915-SWAY: minimal start t=$(up)"
 	( timeout -k 5 150 /usr/bin/chromium --headless=new --no-sandbox \
 		--single-process --disable-gpu --disable-dev-shm-usage \
@@ -765,6 +861,7 @@ PROOF
 
 	echo "I915-SWAY: minimal after-quiet t=$(up) dom=$(grep -ac '<html' /var/min.log 2>/dev/null)"
 	pkill -f "chromium-min" 2>/dev/null
+	fi
 
 	echo "I915-SWAY: starting chromium on $WAYLAND_DISPLAY t=$(up)"
 	# The display name is the one discovered above, not a guess: sway names its
@@ -871,9 +968,14 @@ PROOF
 	# every fifteen, so it never fired while the browser was stalled. The stall
 	# happens within ten seconds of the browser starting, so hold quiet across
 	# it and let the watchdog take its snapshot.
-	sleep 100
-
-	sleep 20
+	# The silence is for the watchdog, so it is only kept when there is one:
+	# two minutes of saying nothing while the browser starts is two minutes the
+	# run does not have for the window it is waiting on.
+	if has_flag b1nix.task-watch; then
+		sleep 120
+	else
+		sleep 20
+	fi
 	while [ "$(date +%s)" -lt "$deadline" ]; do
 		# Bounded, because this is also a probe of the compositor.
 		#
@@ -885,7 +987,16 @@ PROOF
 		tree=$(timeout -k 2 5 swaymsg -t get_tree 2>/dev/null)
 		if [ -z "$tree" ]; then
 			echo "I915-SWAY: compositor did not answer get_tree within 5s"
-		elif echo "$tree" | grep -qi chromium; then
+		# "chromium" is the package name, not the window's.
+		#
+		# The toplevel this browser creates carries app_id
+		# "chrome-__root_browser-proof.html-Default" and, once the page has
+		# loaded, the title "b1nix" — neither of which contains the string this
+		# watch was looking for. So a run whose window was on the screen, acked
+		# its configure and set its title reported "no window after 300s", and
+		# the search went looking for a fault in the compositor that was never
+		# there. Match what the browser actually calls itself.
+		elif echo "$tree" | grep -qiE '"app_id": *"chrom|browser-proof'; then
 			win=1
 			break
 		fi
@@ -922,6 +1033,51 @@ PROOF
 	done
 	if [ -n "$win" ]; then
 		echo "I915-SWAY: ok chromium-window after $(($(date +%s) - t0))s"
+		# The picture, taken the moment the window is there rather than at the
+		# end of the run. The shot at the end has twice been lost to a
+		# compositor that did not survive to reach it, and "a toplevel exists"
+		# is not the same claim as "the browser drew the page" — this is the
+		# one that carries out of the guest, as base64 on the console.
+		if grim /var/browser-window.png 2>/var/grim-win.log; then
+			echo "I915-SWAY: ok browser-shot ($(wc -c < /var/browser-window.png) bytes)"
+			# Out through a disk, not through the console.
+			#
+			# The console is shared: the kernel writes its own lines
+			# between the guest's, and base64 that has a boot message
+			# spliced into the middle of a line is not recoverable —
+			# a 25 KB picture arrived with five lines destroyed and
+			# would not decompress. A raw block device carries the
+			# bytes exactly. The runner attaches one as the second
+			# virtio disk and reads the PNG straight off it: the
+			# length goes first, so the host knows where it ends.
+			# A second frame, eight seconds later.
+			#
+			# One picture proves a window was mapped with the page's colours in
+			# it; it does not prove the browser is still running. The proof
+			# page drives a counter from its own script once a second, so two
+			# frames that differ are a live renderer, and two identical frames
+			# are a picture left behind by one that stopped. Both go out on the
+			# disk, one after the other, each with its length.
+			sleep 8
+			grim /var/browser-window2.png 2>>/var/grim-win.log ||
+				echo "I915-SWAY: FAIL second-shot"
+			echo "I915-SWAY: second shot $(wc -c < /var/browser-window2.png 2>/dev/null) bytes"
+			if [ -b /dev/vdb ]; then
+				( printf 'B1NIXPNG%08d\n' "$(wc -c < /var/browser-window.png)"
+				  cat /var/browser-window.png
+				  printf 'B1NIXPNG%08d\n' "$(wc -c < /var/browser-window2.png)"
+				  cat /var/browser-window2.png ) > /dev/vdb 2>/dev/null &&
+					echo "I915-SWAY: shots written to /dev/vdb" ||
+					echo "I915-SWAY: shots could not be written to /dev/vdb"
+				sync
+			else
+				echo "---PNG-browser---"
+				base64 /var/browser-window.png
+				echo "---PNG-browser-END---"
+			fi
+		else
+			echo "I915-SWAY: FAIL browser-shot — $(head -1 /var/grim-win.log 2>/dev/null)"
+		fi
 	elif pgrep chromium >/dev/null 2>&1; then
 		echo "I915-SWAY: FAIL chromium-window (alive, no window after $(($(date +%s) - t0))s)"
 	fi

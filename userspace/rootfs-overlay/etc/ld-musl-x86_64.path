@@ -1,0 +1,14 @@
+# Where the dynamic loader looks for a DT_NEEDED library, for the packages that
+# put their private libraries outside the default directories.
+#
+# musl reads this file and uses it INSTEAD of its built-in default, so the
+# ordinary directories have to be listed here too. Samba is the reason it
+# exists: its libraries name each other with no DT_RUNPATH at all, so
+# libsamba-modules-samba4.so cannot find libsamba-debug-samba4.so unless
+# /usr/lib/samba is searched. Chromium keeps its own libraries beside itself
+# for the same reason.
+/lib
+/usr/lib
+/usr/local/lib
+/usr/lib/samba
+/usr/lib/chromium

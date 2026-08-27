@@ -174,7 +174,7 @@ run_variant() {
 	# second then starts on a machine with that much less to work with — which
 	# is what made the second run in a boot stall where the first had been
 	# fine. Measuring runs against each other requires them to start alike.
-	rm -rf /dev/shm/cmin-*
+	rm -rf "/dev/shm/cmin-$name"
 	echo "CMIN: variant $name start t=$(up)"
 	# Time the DOM, not the exit.
 	#
@@ -194,8 +194,16 @@ run_variant() {
 	rcf=/tmp/cmin-rc-$name
 	domf=/tmp/cmin-dom-$name
 	rm -f $rcf $domf
-	{ timeout -k 5 ${CMIN_BUDGET:-600} /usr/bin/chromium $COMMON \
-		--user-data-dir=/dev/shm/cmin-$name "$@" about:blank 2>&1
+	# In the background, and watched.
+	#
+	# --dump-dom prints the document and the browser then stays up, so a
+	# foreground pipeline sits in silence until the budget kills it — and every
+	# run that was cut short before that moment reported nothing at all, which
+	# read as "the browser never finished". It had, in fifteen seconds. Run it
+	# beside us and watch for the stamp instead: the answer is printed when it
+	# is true, not when the budget says so.
+	( { timeout -k 5 ${CMIN_BUDGET:-600} /usr/bin/chromium $COMMON \
+		--user-data-dir=${CMIN_PROFILE:-/dev/shm/cmin-$name} "$@" about:blank 2>&1
 	  echo $? > $rcf; } | awk -v d="$domf" '
 		/<html/ && !seen {
 			seen = 1
@@ -206,7 +214,28 @@ run_variant() {
 				close(d)
 			}
 		}
-		{ print }' > $log
+		{ print }' > $log ) &
+	pipe_pid=$!
+	waited=0
+	while [ "$waited" -lt "${CMIN_BUDGET:-600}" ]; do
+		[ -s "$domf" ] && break
+		[ -s "$rcf" ] && break
+		sleep 2
+		waited=$((waited + 2))
+	done
+	if [ -s "$domf" ]; then
+		echo "CMIN: variant $name DOM at t=$(cat $domf) (waited ${waited}s)"
+		# Do not try to kill it here.
+		#
+		# `pkill -f cmin-$name` matches on the whole command line, and this
+		# script's own shell carries that string too — the run killed itself
+		# and the console went quiet one line after printing the answer. The
+		# browser is already under `timeout`, which will end it; the document
+		# is what this variant exists to report, and it has been reported.
+		echo "CMIN: variant $name ok — the document was printed"
+		return 0
+	fi
+	wait $pipe_pid 2>/dev/null
 	rc=$(cat $rcf 2>/dev/null)
 	rc=${rc:-1}
 	domt=$(cat $domf 2>/dev/null)
@@ -247,6 +276,7 @@ grep -q "b1nix.chromium-flagmatrix" /proc/cmdline 2>/dev/null &&
 grep -q "b1nix.chromium-quiet" /proc/cmdline 2>/dev/null &&
 	COMMON="--no-sandbox --disable-gpu --dump-dom --disable-component-update \
 	        --disable-background-networking --no-first-run --disable-extensions"
+grep -q "b1nix.chromium-swaylike" /proc/cmdline 2>/dev/null && VARIANTS="swaylike"
 grep -q "b1nix.chromium-variants" /proc/cmdline 2>/dev/null &&
 	VARIANTS="single multi nozygote oldheadless"
 
@@ -259,6 +289,27 @@ grep -q "b1nix.chromium-variants" /proc/cmdline 2>/dev/null &&
 # steady, so the numbers can be compared to each other. b1nix.chromium-repeat=N.
 CMIN_REPEAT=$(sed -n "s/.*b1nix.chromium-repeat=\([0-9]*\).*/\1/p" /proc/cmdline 2>/dev/null)
 [ -n "$CMIN_REPEAT" ] || CMIN_REPEAT=1
+
+# The trace runs instead of the variants, not after them: the variant it would
+# follow is the one that hangs, so a block placed behind it never runs at all.
+grep -q "b1nix.chromium-trace" /proc/cmdline 2>/dev/null && VARIANTS=""
+
+# Somebody talking while the variant runs.
+#
+# Every ingredient of a variant — the flags, the budget wrapper, the pipe, the
+# awk, the profile on the tmpfs — finishes in fifteen seconds when the browser
+# is started in the background and the script keeps printing. Run in the
+# foreground, in silence, the same command does not finish at all. This starts
+# a printer beside it so the two runs differ in nothing else.
+# b1nix.chromium-watch.
+if grep -q "b1nix.chromium-watch" /proc/cmdline 2>/dev/null; then
+	( n=0
+	  while [ $n -lt 20 ]; do
+		sleep 15
+		n=$((n + 1))
+		echo "CMIN-WATCH: t=$(up) log=$(wc -l < /var/min-single.log 2>/dev/null) dom=$(grep -ac '<html' /var/min-single.log 2>/dev/null)"
+	  done ) &
+fi
 
 r=1
 while [ "$r" -le "$CMIN_REPEAT" ]; do
@@ -273,7 +324,23 @@ for v in $VARIANTS; do
 	# finishes a TLS fetch in 90 ms — is what the run spends its minutes on.
 	# This is the flag anyone would use for it.
 	bare-bgnet)  COMMON="$BARE --disable-background-networking" run_variant bare-bgnet ;;
-	single)      run_variant single --headless=new --single-process ;;
+	# A name per repeat, not one for all of them.
+	#
+	# Every repeat wiped /dev/shm/cmin-* before starting, and the previous
+	# browser was still running out of exactly that directory — the second run
+	# of three died with rc=137 for no reason of its own. Distinct profiles let
+	# the repeats overlap harmlessly, which is what makes them comparable.
+	single)      run_variant single-$r --headless=new --single-process ;;
+	# The one that was seen to work.
+	#
+	# The same binary printed the document under the compositor image with a
+	# profile on the ordinary filesystem and shared memory switched off, while
+	# this image's run — profile on a tmpfs, /dev/shm in use — stops seven
+	# seconds in. The two differ in exactly those two decisions, so this
+	# variant makes them the same and the comparison says which one matters.
+	swaylike)    COMMON="--no-sandbox --disable-gpu --dump-dom --disable-dev-shm-usage"
+	             CMIN_PROFILE=/tmp/cmin-swaylike
+	             run_variant swaylike --headless=new --single-process ;;
 	multi)       run_variant multi --headless=new ;;
 	nozygote)    run_variant nozygote --headless=new --single-process --no-zygote ;;
 	oldheadless) run_variant oldheadless --headless --single-process ;;
@@ -281,6 +348,95 @@ for v in $VARIANTS; do
 done
 	r=$((r + 1))
 done
+
+# What the browser says while it is stopping, not after.
+#
+# Every variant above reports only once its budget has run out, and a run whose
+# shell never gets that far reports nothing at all — which is how a stall came
+# to be described as "no output". This mode starts the browser in the
+# background and prints the tail of its own log every fifteen seconds, so the
+# last thing it managed to do is on the console whatever happens afterwards.
+# b1nix.chromium-trace.
+if grep -q "b1nix.chromium-trace" /proc/cmdline 2>/dev/null; then
+	log=/var/trace.log
+	rm -f $log
+	echo "CMIN-TRACE: start t=$(up)"
+
+	# A pipe, on its own, before the browser.
+	#
+	# The same browser with the same flags prints its document in fifteen
+	# seconds when its output goes to a file and never finishes when it goes
+	# through a pipe into awk. That is a claim about pipes, not about browsers,
+	# and it deserves a test that takes ten seconds and involves neither.
+	echo "CMIN-TRACE: pipe test (dd | wc) t=$(up)"
+	dd if=/dev/zero bs=4096 count=4000 2>/dev/null | wc -c
+	echo "CMIN-TRACE: pipe test done t=$(up)"
+	echo "CMIN-TRACE: pipe test (dd | awk) t=$(up)"
+	dd if=/dev/zero bs=1024 count=2000 2>/dev/null |
+		awk '{ n++ } END { print "awk saw", n, "records" }'
+	echo "CMIN-TRACE: awk pipe test done t=$(up)"
+	# The same flags the variants use, so the only thing this mode changes is
+	# where the output goes: a file instead of a pipe into awk. Two runs that
+	# differ in one decision are a comparison; two that differ in two are not.
+	trace_flags="--no-sandbox --headless=new --single-process --disable-gpu \
+		--enable-logging=stderr --v=1 --dump-dom"
+	grep -q "b1nix.chromium-trace-common" /proc/cmdline 2>/dev/null &&
+		trace_flags="$COMMON --headless=new --single-process"
+	# Where the profile lives, as the one thing that changes. The variant that
+	# stalls keeps it on the tmpfs; every trace that finishes keeps it on the
+	# root filesystem. b1nix.chromium-trace-shmprofile.
+	trace_profile=/tmp/cmin-trace
+	grep -q "b1nix.chromium-trace-shmprofile" /proc/cmdline 2>/dev/null &&
+		trace_profile=/dev/shm/cmin-trace
+	echo "CMIN-TRACE: flags $trace_flags"
+	echo "CMIN-TRACE: profile $trace_profile"
+	# With the budget wrapper, when asked. The variants run the browser under
+	# `timeout` and never finish; this mode runs it bare and finishes in
+	# fifteen seconds. The wrapper is the only remaining difference, so make it
+	# the one thing that changes. b1nix.chromium-trace-timeout.
+	if grep -q "b1nix.chromium-trace-timeout" /proc/cmdline 2>/dev/null; then
+		timeout -k 5 ${CMIN_BUDGET:-600} /usr/bin/chromium $trace_flags \
+			--user-data-dir=$trace_profile about:blank > $log 2>&1 &
+	elif grep -q "b1nix.chromium-trace-pipe" /proc/cmdline 2>/dev/null; then
+		# Through awk, exactly as the variants do it. Everything else is the
+		# same as the run that finishes in fifteen seconds, so if this one does
+		# not, the pipeline is the answer.
+		# The variants' awk, verbatim — it stamps the moment the first
+		# "<html" passes by reading /proc/uptime, and that read is the last
+		# thing left that the finishing run does not do.
+		( /usr/bin/chromium $trace_flags \
+			--user-data-dir=$trace_profile about:blank 2>&1 |
+			awk -v d=/tmp/trace-dom '
+			/<html/ && !seen {
+				seen = 1
+				if ((getline u < "/proc/uptime") > 0) {
+					close("/proc/uptime")
+					split(u, f, " ")
+					print f[1] > d
+					close(d)
+				}
+			}
+			{ print }' > $log ) &
+	else
+		/usr/bin/chromium $trace_flags \
+			--user-data-dir=$trace_profile about:blank > $log 2>&1 &
+	fi
+	bpid=$!
+	n=0
+	while [ $n -lt 14 ]; do
+		sleep 15
+		n=$((n + 1))
+		echo "CMIN-TRACE: t=$(up) lines=$(wc -l < $log 2>/dev/null) dom=$(grep -ac '<html' $log 2>/dev/null)"
+		tail -6 $log 2>/dev/null | sed 's/^/    /'
+		if grep -aq "<html" $log 2>/dev/null; then
+			echo "CMIN-TRACE: DOM at t=$(up)"
+			break
+		fi
+		kill -0 $bpid 2>/dev/null || { echo "CMIN-TRACE: browser exited"; break; }
+	done
+	kill $bpid 2>/dev/null
+	echo "CMIN-TRACE: done t=$(up)"
+fi
 
 echo "CMIN: summary"
 for v in $VARIANTS; do
