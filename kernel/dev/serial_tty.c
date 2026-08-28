@@ -407,13 +407,23 @@ static int stty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   switch (request) {
   case B1NIX_TCGETS:
     return tty_termios_copyout(arg, &t->termios);
+  /* TCGETS2 is the same question in the layout glibc 2.42 and later ask it in.
+   * A serial line is where the extra c_ispeed/c_ospeed words actually mean
+   * something, and they are filled from the rate the UART is running at. */
+  case B1NIX_TCGETS2:
+    return tty_termios2_copyout(arg, &t->termios);
   case B1NIX_TCSETS:
   case B1NIX_TCSETSW: /* TCSADRAIN — no output buffering, so same as TCSETS */
   case B1NIX_TCSETSF: /* TCSAFLUSH — no input queue to flush here either */
+  case B1NIX_TCSETS2:
+  case B1NIX_TCSETSW2:
+  case B1NIX_TCSETSF2:
   {
     struct b1nix_termios want = t->termios;
     {
-      int cin = tty_termios_copyin(&want, arg);
+      int cin = tty_is_termios2_set(request)
+                    ? tty_termios2_copyin(&want, arg)
+                    : tty_termios_copyin(&want, arg);
       if (cin < 0)
         return cin;
     }

@@ -2107,6 +2107,8 @@ check_output "$LOG" "M46-SMOKE: ok append-atomic" "concurrent O_APPEND writers n
 check_output "$LOG" "M46-SMOKE: ok truncate-zeros" "shrink-then-grow truncate reads back zeros"
 check_output "$LOG" "M46-SHEBANG-OK" "the #! script's interpreter actually ran"
 check_output "$LOG" "M46-SMOKE: ok shebang-exec" "direct execve() of a #! script works"
+check_output "$LOG" "M46-SMOKE: ok bad-shebang-exec" "200 execs of a #! script whose interpreter is missing fail cleanly and leave the kernel heap intact"
+check_output "$LOG" "M46-SMOKE: ok procfd-reopen" "opening /proc/self/fd/N is a fresh open with the caller's flags, not a dup — an O_PATH reference upgrades to a readable descriptor with its own offset"
 check_output "$LOG" "M46-SMOKE: ok exit-group" "exit_group semantics terminate all thread group members"
 check_output "$LOG" "M46-SMOKE: ok setresuid-setresgid" "setresuid/setresgid set credentials and EPERM is enforced"
 check_output "$LOG" "M46-SMOKE: ok waitid" "waitid waiting for child state transitions works"
@@ -2129,6 +2131,8 @@ check_output "$LOG" "M57-SMOKE: ok fd-broker" "socketpair + SCM_RIGHTS hands a l
 check_output "$LOG" "M57-SMOKE: ok fd-broker-death" "in-flight passed fd survives sender close and peer hangup is reported"
 check_output "$LOG" "M57-SMOKE: ok dupfd-cloexec" "F_DUPFD_CLOEXEC sets FD_CLOEXEC while F_DUPFD leaves it clear"
 check_output "$LOG" "M57-SMOKE: ok unix-addrlen" "getsockname/getpeername report an AF_UNIX address's real length (2 unnamed, offsetof(sun_path)+name+1 bound)"
+check_output "$LOG" "M57-SMOKE: ok unix-abstract" "an AF_UNIX name in the abstract namespace binds, connects and carries data (D-Bus, X11 and agetty use it)"
+check_output "$LOG" "M57-SMOKE: ok unix-abstract-rebind" "an abstract name is released when its socket closes — there is no file to unlink"
 check_output "$LOG" "M57-SMOKE: ok unix-addrlen-reuse" "a socket-name call given more room than the address writes only the address (the Qt sockAddrSize reuse that smashed kioworker's stack)"
 check_output "$LOG" "M57-SMOKE: ok mojo-pipe" "Mojo message pipe write/read and handle passing work"
 check_output "$LOG" "M57-SMOKE: ok mojo-shm" "Mojo shared buffer create/duplicate/map/unmap over memfd work"
@@ -2305,6 +2309,11 @@ check_output "$BLK_LOG" "M109-SMOKE: ok blkid-lists-disks" "blkid reports the di
 check_output "$BLK_LOG" "M109-SMOKE: ok mount-move" "MS_MOVE moves a mount and the mount nested inside it to a new target"
 check_output "$BLK_LOG" "M109-SMOKE: ok mount-move-statfs" "the moved mount still reports its own filesystem type at the new path"
 check_output "$BLK_LOG" "M109-SMOKE: done" "M109 device-node and mount suite completes"
+# `init=` naming a script. The kernel prints the path it was asked for, and the
+# markers below prove the interpreter line resolved to the real /init: before
+# the fix the ELF loader read "#!" as a bad magic number and the boot had no
+# PID 1 at all.
+check_output "$SWITCHROOT_LOG" "init: /init-shebang pid=1" "init= can name a #! script: the kernel resolves its interpreter line"
 check_output "$SWITCHROOT_LOG" "M109-SMOKE: ok initramfs-root-statfs" "statfs reports RAMFS/TMPFS for an initramfs root, which is what switch_root demands"
 check_output "$SWITCHROOT_LOG" "M109-SMOKE: ok switchroot-mount-newroot" "the initramfs PID 1 mounts the real root below /"
 check_output "$SWITCHROOT_LOG" "M109-SMOKE: ok switch-root" "switch_root moved the new root onto / — the new init sees its files and not the initramfs's"
@@ -2456,6 +2465,13 @@ check_output "$LOG" "M39-INIT: ok tty-raw-read" "ttyS0 raw (non-canonical) read 
 check_output "$LOG" "M39-INIT: ok tty-isig" "ttyS0 ISIG intercepts VINTR instead of queueing it"
 check_output "$LOG" "M39-INIT: ok tty-pgrp-independent" "ttyS0 foreground pgrp is independent of the console"
 check_output "$LOG" "M39-INIT: ok tty-sctty" "TIOCSCTTY claims ttyS0 as a controlling terminal"
+# termios2. glibc 2.42 made tcgetattr(3) issue TCGETS2 instead of TCGETS, and
+# isatty(3) is tcgetattr succeeding — so a kernel without these has no
+# terminals at all as far as a current glibc is concerned.
+check_output "$LOG" "M39-INIT: ok tty-tcgets2" "TCGETS2 reports the same line as TCGETS, with a real c_ospeed"
+check_output "$LOG" "M39-INIT: ok tty-tcsets2" "TCSETS2 applies a termios2 and TCGETS2 reads it back"
+check_output "$LOG" "M39-INIT: ok console-tcgets2" "the boot console answers TCGETS2 — the fd an init system logs to"
+check_output "$LOG" "M39-INIT: ok console-unknown-ioctl-enotty" "an ioctl the console does not implement is ENOTTY, not EPERM"
 check_output "$LOG" "M39-INIT: ok ttys0-write" "ttyS0 write path accepts a full buffer"
 check_output "$LOG" "M39-TTYS0-TX-OK" "ttyS0 TX actually reaches COM1 (marker travelled the UART path)"
 check_output "$LOG" "M39-INIT: ok ttys0-release" "closing the last ttyS0 handle releases the COM1 claim"

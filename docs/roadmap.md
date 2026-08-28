@@ -1322,3 +1322,46 @@ stacks.
       eight workers on a two-CPU guest can split four-and-four and get a core
       each), and the failure reports the shortest window any worker actually
       got. What it asserts is what is true: `M46-SMOKE: ok nice-applied`.
+
+## M118: Arch Linux userspace
+
+Debian ships systemd 252. Arch is rolling and its bootstrap tarball carries
+**systemd 261.2 on glibc 2.44** — nine releases newer, using interfaces Debian
+never asks for. That is the whole point of the exercise, and it found nine.
+
+- [x] `done` **The image builds as an ordinary user**: the official
+      `archlinux-bootstrap-x86_64.tar.zst`, sha256-verified, a pacman-db
+      dependency resolver over the repo `*.db` files, all inside one
+      `fakeroot`. No root, no `pacstrap`, no loop mounts.
+      `tools/images/mk-arch-image.sh`, harness `tests/arch-smoke.sh`.
+- [x] `done` **Nine kernel faults.** The ones worth remembering: `TCGETS2` was
+      missing from all four tty drivers, and glibc 2.42 routes every
+      `tcgetattr` through it — `isatty` IS `tcgetattr`, so this kernel had no
+      terminals at all and PID 1 had nowhere to say why it was dying;
+      `open("/proc/self/fd/N")` was a `dup` that discarded the flags, so an
+      `O_PATH` reference could not be upgraded and PID 1 read none of its own
+      configuration; and `clone(2)` ignored every `CLONE_NEW*` flag, so a
+      generator's "private" read-only remount made the real root read-only and
+      the boot went silent on `EROFS`. Also `PR_CAP_AMBIENT`,
+      `clone3(CLONE_INTO_CGROUP)`, the pidfd family, `close_range`,
+      `fchmodat2`, and `init=` naming a `#!` script.
+- [ ] `partial` **The boot stops at the credentials step.** journald, logind,
+      udevd and dbus-broker all fail with `Failed at step CREDENTIALS …
+      Function not implemented`: systemd builds a unit's credential directory
+      with the post-`mount(2)` API and none of it exists here. 34 units start
+      and 7 targets are reached; `arch-smoke` is 2/31.
+- [ ] `partial` **The new mount API is all-or-nothing, and that is measured.**
+      `open_tree`/`move_mount` advanced Arch one step and dropped Debian's
+      suite from 32/32 to **18** — systemd 252 detects their presence, takes
+      the new path for its sandboxing, and loses socket activation, the
+      readiness protocol and its device units. `mount_setattr` alone is
+      correct and still makes things worse: systemd gets far enough to wedge
+      at journald rather than fail fast. One member of a family whose absence
+      is detected as a unit is worse than the whole family being absent, so
+      none of it is in the tree. Detail in
+      [`arch-userspace.md`](arch-userspace.md).
+- [ ] `partial` No photograph. The graphics profile builds but is unexercised:
+      no compositor can start before the credentials step works, and a frame
+      taken earlier would prove nothing. An intermediate tree reached
+      `Multi-User System` and `Graphical Interface`; the final one does not,
+      and which later change cost that was not isolated.

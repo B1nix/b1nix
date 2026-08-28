@@ -3245,6 +3245,87 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
         struct vfs_handle *h = scheduler_fd_get(n);
         if (!h)
           return -EBADF;
+        /*
+         * A descriptor that names a FILE is re-OPENED, not duplicated.
+         *
+         * The two are not the same thing, and the difference is the whole
+         * reason userspace uses this path. dup(2) hands back the same open
+         * file description: same flags, same offset. Opening /proc/self/fd/<n>
+         * on Linux performs a fresh open of the file that descriptor refers
+         * to, with the flags given here -- which is how a program turns an
+         * O_PATH reference, which cannot be read, into a descriptor that can.
+         *
+         * Duplicating instead meant the flags argument was discarded, so the
+         * new descriptor was O_PATH too and every read of it answered EBADF.
+         * systemd 254 and later open every configuration file that way
+         * (chase() returns an O_PATH fd, fd_reopen() upgrades it), so PID 1
+         * read none of its own configuration: /etc/systemd/system.conf,
+         * /etc/os-release and /etc/machine-id all came back "Bad file
+         * descriptor", and the manager ran on defaults having reported each
+         * one as a syntax error at line 0.
+         *
+         * A descriptor with no VFS node behind it -- a pipe, a socket, an
+         * eventfd -- keeps the old behaviour, because there is no file to open
+         * afresh and another reference to the same description is the only
+         * meaningful answer. That is the case the comment above is about, and
+         * it is what bash's process substitution depends on.
+         */
+        if (h->kind == VFS_HANDLE_NODE && h->node) {
+          struct vfs_node *rnode = vfs_node_get(h->node);
+          /* Permissions are checked again, deliberately: an O_PATH reference
+           * must not become a way to open a file for writing that the caller
+           * could not have opened for writing by name. */
+          int access_mask = 0;
+          if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
+            access_mask |= W_OK;
+          if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
+            access_mask |= R_OK;
+          const struct cred *rcred = get_current_cred();
+          const int rpath_only = (flags & B1NIX_O_PATH) ? 1 : 0;
+          if (!rpath_only && rcred &&
+              !vfs_get_node_perm(rnode, rcred, (u32)access_mask)) {
+            vfs_node_put(rnode);
+            return -EACCES;
+          }
+          if (rnode->inode->type == VFS_DIRECTORY && !rpath_only &&
+              (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))) {
+            vfs_node_put(rnode);
+            return -EISDIR;
+          }
+          extern const struct vfs_file_ops node_file_ops;
+          struct vfs_handle *nh = alloc_raw_handle(VFS_HANDLE_NODE);
+          if (!nh) {
+            vfs_node_put(rnode);
+            return -ENFILE;
+          }
+          nh->node = rnode;
+          nh->ops = &node_file_ops;
+          nh->flags = flags;
+          nh->offset = (flags & B1NIX_O_APPEND) ? rnode->inode->size : 0;
+          if (h->open_path) {
+            usize pl = strlen(h->open_path);
+            char *op = kmalloc(pl + 1);
+            if (op) {
+              memcpy(op, h->open_path, pl + 1);
+              nh->open_path = op;
+            }
+          }
+          if (rnode->inode->open_cb && !rpath_only) {
+            int orc = rnode->inode->open_cb(rnode, nh);
+            if (orc < 0) {
+              vfs_handle_release(nh);
+              return orc;
+            }
+          }
+          int newfd = scheduler_fd_alloc(nh);
+          if (newfd < 0) {
+            vfs_handle_release(nh);
+            return newfd == -ENOMEM ? -ENOMEM : -EMFILE;
+          }
+          if (flags & B1NIX_O_CLOEXEC)
+            scheduler_fd_flags_set(newfd, B1NIX_FD_CLOEXEC);
+          return newfd;
+        }
         vfs_handle_retain(h);
         int newfd = scheduler_fd_alloc(h);
         if (newfd < 0)
@@ -5551,6 +5632,7 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
     case VFS_HANDLE_SIGNALFD:
     case VFS_HANDLE_EPOLL:
     case VFS_HANDLE_INOTIFY:
+    case VFS_HANDLE_PIDFD:
       /* Linux backs these with an anonymous inode, reported as a regular
        * file with no name and no size. */
       anon_mode = B1NIX_S_IFREG | 0600;
@@ -5563,7 +5645,13 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
       st->st_mode = anon_mode;
       st->st_nlink = 1;
       st->st_blksize = 4096;
-      st->st_ino = (u64)(usize)ph;
+      /* A pidfd's inode number is its identity: a caller stores it to tell one
+       * process reference from another and to notice a pid that has been
+       * reused. The handle's own address is not that -- a freed handle's
+       * address is handed out again -- so the pidfd carries a sequence number
+       * that is never issued twice in a boot. */
+      st->st_ino = (ph->kind == VFS_HANDLE_PIDFD) ? vfs_pidfd_id(ph)
+                                                  : (u64)(usize)ph;
       return 0;
     }
   }
@@ -6712,6 +6800,35 @@ int vfs_mount_id_for_path(const char *path) {
     }
   }
   return best_id;
+}
+
+/* Is this path the root of a mount -- the directory a filesystem is mounted
+ * ON, rather than somewhere below it?
+ *
+ * This is the question statx(2) answers with STATX_ATTR_MOUNT_ROOT, and since
+ * systemd 256 it is the ONLY way systemd asks it: the older routes through
+ * name_to_handle_at(2) and /proc/self/mountinfo were dropped, and a kernel
+ * that does not report the bit gets `-EUNATCH` -- "Failed to determine whether
+ * /proc is a mount point". PID 1 asks that about every API filesystem before
+ * it will mount anything, so on this kernel it asked five times, gave up, and
+ * exited before printing its own version banner. */
+int vfs_path_is_mount_root(const char *path) {
+  if (!path || path[0] != '/')
+    return 0;
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(path, resolved);
+  /* A trailing slash names the same directory; the root is "/" and keeps it. */
+  usize rlen = strlen(resolved);
+  while (rlen > 1 && resolved[rlen - 1] == '/')
+    resolved[--rlen] = '\0';
+
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mount_visible(i))
+      continue;
+    if (strcmp(mounts[i].target, resolved) == 0)
+      return 1;
+  }
+  return 0;
 }
 
 /* Directory cursor, high bit: the filesystem's half of a merged listing is
@@ -7978,10 +8095,22 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
   if (request == B1NIX_TCGETS) {
     return tty_termios_copyout(arg, &console.termios);
   }
+  /* TCGETS2/TCSETS2: the same operations in the layout glibc 2.42 and later
+   * use for every tcgetattr(3) and tcsetattr(3) call. This is the one that
+   * matters most on /dev/console: isatty(3) IS tcgetattr succeeding, and a
+   * console that refuses it is not a terminal to anything built against a libc
+   * that new -- including an init system, which then has nowhere to print the
+   * reason it is giving up. */
+  if (request == B1NIX_TCGETS2) {
+    return tty_termios2_copyout(arg, &console.termios);
+  }
   if (request == B1NIX_TCSETS || request == B1NIX_TCSETSW ||
       request == B1NIX_TCSETSF) {
     /* TCSADRAIN/TCSAFLUSH (TCSETSW/TCSETSF): no output buffering, apply as TCSETS. */
     return tty_termios_copyin(&console.termios, arg);
+  }
+  if (tty_is_termios2_set(request)) {
+    return tty_termios2_copyin(&console.termios, arg);
   }
   if (request == B1NIX_TIOCGPGRP) {
     /* The user buffer is a pid_t (32-bit) — copying sizeof(usize) would
@@ -8006,7 +8135,13 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
      * (getty's setsid-fallback path calls this and only needs success). */
     return 0;
   }
-  return -1;
+  /* An ioctl this terminal does not implement is ENOTTY, which is what Linux
+   * answers and what every caller tests for. It used to be a bare -1, i.e.
+   * EPERM -- "operation not permitted" for a request the console had simply
+   * never heard of. A program that probes for an optional ioctl reads EPERM as
+   * a permission problem worth reporting, or worth giving up over, and the two
+   * are not the same fact. */
+  return -ENOTTY;
 }
 
 void vfs_close_on_exec(void) {

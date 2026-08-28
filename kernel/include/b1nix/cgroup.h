@@ -25,6 +25,21 @@ void cgroup_fork_inherit(usize parent_pid, usize child_pid);
 /* Drop a task's membership. Called from the exit path. */
 void cgroup_task_exit(usize pid);
 
+/* clone3(CLONE_INTO_CGROUP): put a task straight into the cgroup a directory
+ * descriptor names, instead of into its parent's.
+ *
+ * The point of doing it at clone time rather than by writing cgroup.procs
+ * afterwards is that there is no window in which the child is accounted to the
+ * wrong cgroup -- which matters to anything that limits or counts by cgroup.
+ * glibc's posix_spawn() uses it for POSIX_SPAWN_SETCGROUP, and systemd 254 and
+ * later spawn every single unit through exactly that path: refusing the flag
+ * made posix_spawn answer EINVAL, and not one service on the machine could be
+ * started ("Failed to spawn executor: Invalid argument").
+ *
+ * `fd` must be a descriptor on a cgroup2 directory. Returns 0, or -EBADF /
+ * -EINVAL when it is not one. */
+int cgroup_attach_pid_at_fd(int fd, usize pid);
+
 /* pids.max: may `parent_pid` create another task? Returns 0 when it may, and
  * -EAGAIN when a cgroup between the parent and the root is at its limit —
  * which is the errno Linux's pids controller makes fork(2) return. */

@@ -996,6 +996,15 @@ static int vt_ioctl(struct vfs_node *node, u64 request, void *arg) {
   case B1NIX_TCSETSW:
   case B1NIX_TCSETSF:
     return tty_termios_copyin(&v->termios, arg);
+  /* The termios2 form of the same four. A glibc from 2.42 onwards issues only
+   * these, so a terminal that answers the 0x5401 family alone is not a
+   * terminal to anything built against it. */
+  case B1NIX_TCGETS2:
+    return tty_termios2_copyout(arg, &v->termios);
+  case B1NIX_TCSETS2:
+  case B1NIX_TCSETSW2:
+  case B1NIX_TCSETSF2:
+    return tty_termios2_copyin(&v->termios, arg);
   case B1NIX_TIOCGWINSZ: {
     struct b1nix_winsize ws;
     memset(&ws, 0, sizeof(ws));

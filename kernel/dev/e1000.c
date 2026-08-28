@@ -182,11 +182,12 @@ static int e1000_id_known(u16 dev)
 static inline u32 e1000_read(u32 reg)  { return *(volatile u32 *)(e1000_regs + reg); }
 static inline void e1000_write(u32 reg, u32 v) { *(volatile u32 *)(e1000_regs + reg) = v; }
 
-/* Coarse ~1 µs-per-iteration delay via the classic port-0x80 dummy read. */
-static void e1000_udelay(int loops)
+/* Real microseconds against the calibrated TSC. The port-0x80 dummy read this
+ * used to count is ~1 µs on hardware and a VM exit under virtualisation, so it
+ * was neither coarse nor cheap. See arch_udelay. */
+static void e1000_udelay(int us)
 {
-	for (int i = 0; i < loops; i++)
-		(void)inb(0x80);
+	arch_udelay((u32)us);
 }
 
 static void e1000_print_mac(struct mac_addr m)

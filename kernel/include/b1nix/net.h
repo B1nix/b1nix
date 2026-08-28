@@ -453,10 +453,13 @@ void unix_free_state(struct vfs_socket_state *s);
 /* M57: cross-connect two initialised AF_UNIX states as connected peers
  * (socketpair, no filesystem name). */
 void unix_link_pair(struct vfs_socket_state *a, struct vfs_socket_state *b);
-int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr);
+/* Drop any abstract name this socket bound; it dies with the socket. */
+void unix_abstract_release(struct vfs_socket_state *s);
+int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr,
+              usize addrlen);
 int unix_listen(struct vfs_socket_state *s, int backlog);
 int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr,
-                 int nonblock);
+                 usize addrlen, int nonblock);
 int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s,
                 int nonblock);
 isize unix_send(struct vfs_socket_state *s, const void *buf, usize len,

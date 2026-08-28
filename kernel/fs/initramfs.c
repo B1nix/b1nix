@@ -23,9 +23,20 @@
 /* M109: /init for a boot that keeps the initramfs as / (root=initramfs) — it
  * mounts the real root below / and hands over to BusyBox's switch_root. */
 #include "initramfs_m109_switchroot.inc"
+/* /init-shebang is how the switchroot instance is actually started, and it is
+ * a test rather than a convenience: `init=` reached the ELF loader directly and
+ * so could not name a script at all. A `#!` file failed on the magic number
+ * ("bad magic 23 21", which is "#!") and the machine came up with no PID 1,
+ * even though execve(2) had honoured `#!` for years. Booting the one instance
+ * whose whole subject is which program the kernel starts as PID 1 through an
+ * interpreter line means every M109 marker is also evidence that it resolves.
+ *
+ * The interpreter it names is /init itself, so what ends up running is exactly
+ * the same program as before; only the route to it is under test. */
 #define B1NIX_SWITCHROOT_INIT_FILE                                             \
   {"/init", (const char *)vfs_m109_switchroot_elf,                             \
-   sizeof(vfs_m109_switchroot_elf), INITRAMFS_EXECUTABLE},
+   sizeof(vfs_m109_switchroot_elf), INITRAMFS_EXECUTABLE},                     \
+  {"/init-shebang", "#!/init\n", 8, INITRAMFS_EXECUTABLE},
 #else
 #define B1NIX_MODULE_INITRAMFS_FILES
 #define B1NIX_SWITCHROOT_INIT_FILE

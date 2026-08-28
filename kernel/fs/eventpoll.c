@@ -161,6 +161,154 @@ int vfs_eventfd(unsigned int initval, int flags) {
   return fd;
 }
 
+/* ---- pidfd ------------------------------------------------------------- */
+/*
+ * pidfd_open(2). A descriptor that names a PROCESS rather than a number that
+ * happens to identify one today.
+ *
+ * The distinction is the whole reason it exists: a pid is reused, so a manager
+ * that stores one and later signals it can, after an unlucky sequence of
+ * exits, signal a process it has never heard of. A descriptor cannot be
+ * reused while it is held. systemd from 254 onwards is built around that
+ * guarantee -- its PidRef pairs a pid with a pidfd and re-verifies one against
+ * the other -- and it takes a pidfd on ITSELF before it will run a boot.
+ * Without the call, PID 1 reported "Failed to acquire PID reference on
+ * ourselves" and then sat in its event loop with no jobs, for ever.
+ *
+ * What a pidfd has to do here:
+ *   poll   readable once the process has exited, which is how an event loop
+ *          learns of a death without SIGCHLD;
+ *   fstat  a stable, unique st_ino, which is the "pidfd id" a caller stores to
+ *          tell two references apart;
+ *   signal pidfd_send_signal(2) delivers to the process the descriptor holds;
+ *   read   EINVAL, as on Linux for a non-PIDFD_THREAD descriptor.
+ */
+
+/* Ids are handed out in sequence and never reused within a boot, which is
+ * exactly the promise the id is for. */
+static u64 g_pidfd_next_id = 1;
+static volatile int g_pidfd_id_lock = 0;
+
+struct pidfd_state {
+  usize pid;
+  u64 id;
+};
+
+static u64 pidfd_alloc_id(void) {
+  while (__atomic_test_and_set(&g_pidfd_id_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  u64 id = g_pidfd_next_id++;
+  __atomic_clear(&g_pidfd_id_lock, __ATOMIC_RELEASE);
+  return id;
+}
+
+/* Has the process this descriptor names finished?
+ *
+ * "Gone from the table" and "sitting in the table as a zombie" are both an
+ * exit as far as a poller is concerned: the caller is waiting to be told it
+ * may reap, and a zombie is precisely a process waiting to be reaped. */
+static int pidfd_process_exited(const struct pidfd_state *p) {
+  if (!p)
+    return 1;
+  struct task *t = scheduler_task_by_pid(p->pid);
+  if (!t)
+    return 1;
+  enum task_state st = t->state;
+  return st == TASK_DEAD || st == TASK_REAPING || st == TASK_UNUSED;
+}
+
+static isize pidfd_read(struct vfs_handle *h, char *buf, usize len) {
+  (void)h;
+  (void)buf;
+  (void)len;
+  /* Linux: reading a process-directed pidfd is EINVAL. Only PIDFD_THREAD
+   * descriptors read back an exit status, and those are refused at open. */
+  return -EINVAL;
+}
+
+static int pidfd_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
+  struct pidfd_state *p = (struct pidfd_state *)h->private_data;
+  pfd->revents = 0;
+  if (!p)
+    return 0;
+  if (pidfd_process_exited(p))
+    pfd->revents |= B1NIX_POLLIN;
+  return 0;
+}
+
+static void pidfd_release(struct vfs_handle *h) {
+  if (h->private_data) {
+    kfree(h->private_data);
+    h->private_data = 0;
+  }
+}
+
+static const struct vfs_file_ops pidfd_ops = {
+    .read = pidfd_read,
+    .poll = pidfd_poll,
+    .release = pidfd_release,
+};
+
+usize vfs_pidfd_pid(struct vfs_handle *h) {
+  if (!h || h->kind != VFS_HANDLE_PIDFD || !h->private_data)
+    return 0;
+  return ((struct pidfd_state *)h->private_data)->pid;
+}
+
+u64 vfs_pidfd_id(struct vfs_handle *h) {
+  if (!h || h->kind != VFS_HANDLE_PIDFD || !h->private_data)
+    return 0;
+  return ((struct pidfd_state *)h->private_data)->id;
+}
+
+int vfs_pidfd_open(usize pid, int flags) {
+  /* PIDFD_NONBLOCK is O_NONBLOCK's value; PIDFD_THREAD (O_EXCL) is refused
+   * rather than silently treated as a process pidfd, because the two differ in
+   * what waiting on the descriptor means and a caller that asked for one and
+   * got the other would be told a lie. */
+  if (flags & ~(int)B1NIX_O_NONBLOCK)
+    return -EINVAL;
+  if (pid == 0)
+    return -EINVAL;
+
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -ESRCH;
+  if (t->state == TASK_DEAD || t->state == TASK_REAPING ||
+      t->state == TASK_UNUSED)
+    return -ESRCH;
+  /* Linux: a pid that names a thread rather than a thread group leader is
+   * EINVAL without PIDFD_THREAD. */
+  if (task_tgid(t) != pid)
+    return -EINVAL;
+
+  struct pidfd_state *p = kzalloc(sizeof(*p));
+  if (!p)
+    return -ENOMEM;
+  p->pid = pid;
+  p->id = pidfd_alloc_id();
+
+  struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_PIDFD);
+  if (!h) {
+    kfree(p);
+    return -ENFILE;
+  }
+  h->private_data = p;
+  h->ops = &pidfd_ops;
+  h->flags = (u32)(flags & B1NIX_O_NONBLOCK);
+  h->flags |= B1NIX_O_RDONLY;
+
+  int fd = scheduler_fd_alloc(h);
+  if (fd < 0) {
+    vfs_handle_release(h);
+    return fd == -ENOMEM ? -ENOMEM : -EMFILE;
+  }
+  /* Linux always sets close-on-exec on a pidfd; there is no flag to ask for
+   * it because there is no case for inheriting one across exec. */
+  scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
+  return fd;
+}
+
 /* ---- timerfd ----------------------------------------------------------- */
 
 /* Count of currently-armed timerfds. The timer ISR wakes pollers only when

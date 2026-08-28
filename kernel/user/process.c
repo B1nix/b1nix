@@ -2080,8 +2080,118 @@ int user_spawn(const char *path, int argc, const char **argv) {
   return user_spawn_env(path, argc, argv, default_env);
 }
 
+/* Read a `#!` interpreter line, if the file has one.
+ *
+ * Returns 1 and fills `interp` (and `opt`, empty when the line names no
+ * argument) when `path` is a script, 0 when it is an ordinary file, and a
+ * negative errno when the line is there but unusable.
+ *
+ * The parse lives here rather than inside user_execve_current so that the two
+ * ways a program can be started -- execve(2) and the kernel spawning one
+ * directly -- agree on what a script is. They did not: execve honoured `#!`
+ * and user_spawn_env did not, so `init=/some/script` reached the ELF loader,
+ * failed on the magic number, and the machine came up with no PID 1 at all.
+ * The message it left ("bad magic 23 21", which is "#!") named the cause and
+ * nothing acted on it. */
+static int user_read_shebang(const char *path, char *interp, usize interp_sz,
+                             char *opt, usize opt_sz) {
+  if (!interp || interp_sz == 0 || !opt || opt_sz == 0)
+    return -EINVAL;
+  interp[0] = '\0';
+  opt[0] = '\0';
+
+  struct vfs_node *node = vfs_find_node(path);
+  if (!node || IS_ERR(node))
+    return node ? (int)PTR_ERR(node) : -ENOENT;
+  if (node->inode->type != VFS_FILE) {
+    vfs_node_put(node);
+    return 0;
+  }
+
+  /* Linux reads BINPRM_BUF_SIZE (256) bytes of the header and truncates the
+   * interpreter line to what fits; 128 is more than any real shebang and keeps
+   * this off the boot stack's critical path. */
+  char head[128];
+  isize hn = 0;
+  if (node->inode->read_cb) {
+    hn = node->inode->read_cb(node, 0, head, sizeof(head) - 1, 0);
+  } else if (node->inode->data) {
+    hn = node->inode->size < sizeof(head) - 1 ? (isize)node->inode->size
+                                              : (isize)(sizeof(head) - 1);
+    memcpy(head, node->inode->data, (usize)hn);
+  }
+  vfs_node_put(node);
+  if (hn < 2 || head[0] != '#' || head[1] != '!')
+    return 0;
+
+  head[hn] = '\0';
+  char *line = head + 2;
+  while (*line == ' ' || *line == '\t')
+    line++;
+  char *nl = line;
+  while (*nl && *nl != '\n' && *nl != '\r')
+    nl++;
+  *nl = '\0';
+  if (*line == '\0')
+    return -ENOEXEC;
+
+  char *sp = line;
+  while (*sp && *sp != ' ' && *sp != '\t')
+    sp++;
+  if (*sp) {
+    *sp = '\0';
+    char *rest = sp + 1;
+    while (*rest == ' ' || *rest == '\t')
+      rest++;
+    if (*rest) {
+      usize n = strlen(rest);
+      if (n >= opt_sz)
+        n = opt_sz - 1;
+      memcpy(opt, rest, n);
+      opt[n] = '\0';
+    }
+  }
+  usize n = strlen(line);
+  if (n >= interp_sz)
+    return -ENAMETOOLONG;
+  memcpy(interp, line, n + 1);
+  return 1;
+}
+
 int user_spawn_env(const char *path, int argc, const char **argv,
                    const char **envp) {
+  /* One `#!` hop, the same limit execve(2) applies: an interpreter that is
+   * itself a script is ENOEXEC on Linux and here. The rewritten argv lives on
+   * this frame -- the image copies every string it is given -- so there is
+   * nothing to free on any path out. */
+  char interp[128], interp_opt[64];
+  /* 32, not USER_MAX_ARGS: this runs on the boot stack, whose headroom is
+   * measured and reported, and nothing the kernel spawns directly carries
+   * hundreds of arguments. Anything past the cap is dropped rather than
+   * overrunning the array. */
+  enum { SPAWN_SCRIPT_ARGS = 32 };
+  const char *script_argv[SPAWN_SCRIPT_ARGS];
+  int sb = user_read_shebang(path, interp, sizeof(interp), interp_opt,
+                             sizeof(interp_opt));
+  if (sb < 0)
+    return sb;
+  if (sb > 0) {
+    usize k = 0;
+    script_argv[k++] = interp;
+    if (interp_opt[0])
+      script_argv[k++] = interp_opt;
+    script_argv[k++] = path;
+    /* argv[0] named the script and has been replaced by the interpreter, so
+     * only the arguments after it carry over. */
+    if (argv)
+      for (usize a = 1; argv[a] && k + 1 < SPAWN_SCRIPT_ARGS; a++)
+        script_argv[k++] = argv[a];
+    script_argv[k] = 0;
+    path = interp;
+    argv = script_argv;
+    argc = 0; /* the array is NUL-terminated; a stale count would truncate it */
+  }
+
   struct vfs_node *node = vfs_find_node(path);
   if (!node || IS_ERR(node)) {
     return -1;
@@ -2337,13 +2447,13 @@ resolve:
     /* -1 here reached userspace as -errno, i.e. EPERM ("operation not
      * permitted") for what is really "this image could not be loaded" — the
      * error every failed exec reported, no matter the cause. */
+    /* Freed once. This block released `our_argv` twice -- the second `if`
+     * tested a pointer the first had already handed back -- so every failed
+     * exec of a `#!` script put the same array on the free list twice, which
+     * the heap's canaries catch only if something reallocates it in between. */
     if (our_argv)
       free_kernel_array(our_argv);
-    {
-      if (our_argv)
-        free_kernel_array(our_argv);
-      return -ENOEXEC;
-    }
+    return -ENOEXEC;
   }
 
   /* Past the point of no return: nothing below returns to sys_execve, so the

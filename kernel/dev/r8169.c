@@ -128,7 +128,9 @@ static inline void r_w8(u32 o, u8 v)  { *(volatile u8  *)(r_regs + o) = v; }
 static inline void r_w16(u32 o, u16 v){ *(volatile u16 *)(r_regs + o) = v; }
 static inline void r_w32(u32 o, u32 v){ *(volatile u32 *)(r_regs + o) = v; }
 
-static void r_udelay(int loops) { for (int i = 0; i < loops; i++) (void)inb(0x80); }
+/* Real microseconds against the calibrated TSC, not a count of port reads --
+ * every one of those is a VM exit. See arch_udelay. */
+static void r_udelay(int us) { arch_udelay((u32)us); }
 
 /* Hint the CPU (and the hypervisor) that this is a spin-wait. A bare
  * `while (test_and_set()) ;` loop pegs the core and, under virtualisation,

@@ -4,6 +4,7 @@
 #include <b1nix/memtype.h>
 #include <b1nix/mm.h>
 #include <b1nix/types.h>
+#include <b1nix/io.h>
 
 #define X86_TSS_SELECTOR 0x28
 
@@ -283,6 +284,22 @@ void arch_set_cpu_khz(u32 khz) {
    * a window the hypervisor stretched is worse than no value. */
   if (khz >= 100000u && khz <= 20000000u)
     g_cpu_khz = khz;
+}
+
+void arch_udelay(u32 us) {
+  u32 khz = arch_cpu_khz();
+
+  if (!khz) {
+    for (u32 i = 0; i < us; i++)
+      (void)inb(0x80);
+    return;
+  }
+
+  u64 want = ((u64)us * (u64)khz) / 1000ull;
+  u64 start = __builtin_ia32_rdtsc();
+
+  while (__builtin_ia32_rdtsc() - start < want)
+    __asm__ volatile("pause");
 }
 
 u32 arch_cpu_khz(void) { return g_cpu_khz; }

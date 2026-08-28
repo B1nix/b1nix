@@ -109,6 +109,22 @@
  * variants apply the termios identically to TCSETS. */
 #define B1NIX_TCSETSW 0x5403
 #define B1NIX_TCSETSF 0x5404
+/* The termios2 family: the same four operations against `struct termios2`,
+ * which carries explicit c_ispeed/c_ospeed words instead of encoding the rate
+ * in CBAUD alone.
+ *
+ * These are not an optional extra. glibc 2.42 made tcgetattr(3) issue TCGETS2
+ * rather than TCGETS, and isatty(3) IS tcgetattr succeeding -- so on a libc
+ * that new, a kernel without TCGETS2 has no terminals at all. That is what it
+ * looked like from inside: Arch's systemd 261 opened /dev/console, asked
+ * TCGETS2, was refused, closed it again and from then on had nowhere to print
+ * a single line -- including the line saying why it was about to give up.
+ * Every message its whole boot would have produced was lost to this one
+ * missing ioctl. */
+#define B1NIX_TCGETS2 0x802C542A
+#define B1NIX_TCSETS2 0x402C542B
+#define B1NIX_TCSETSW2 0x402C542C
+#define B1NIX_TCSETSF2 0x402C542D
 #define B1NIX_TIOCSCTTY 0x540E
 #define B1NIX_TIOCGPGRP 0x540F
 #define B1NIX_TIOCSPGRP 0x5410
@@ -472,6 +488,23 @@ typedef struct {
 #define STATX_BLOCKS 0x0400U
 #define STATX_BASIC_STATS 0x07ffU
 #define STATX_BTIME 0x0800U
+/* The mount id, in its two forms. STATX_MNT_ID is the 32-bit id that also
+ * appears in /proc/<pid>/mountinfo; STATX_MNT_ID_UNIQUE is the 64-bit id Linux
+ * 6.8 added, which is never reused within a boot. b1nix's mount ids are the
+ * mountinfo numbers and are not reused either, so one value answers both --
+ * and answering the unique form matters, because that is the one a current
+ * systemd asks for. */
+#define STATX_MNT_ID 0x1000U
+#define STATX_MNT_ID_UNIQUE 0x4000U
+
+/* stx_attributes bits. STATX_ATTR_MOUNT_ROOT says the path is the directory a
+ * filesystem is mounted on rather than something below it; stx_attributes_mask
+ * says which bits the kernel actually knows about, and a caller that finds the
+ * bit missing from the mask must not read anything into the value being zero.
+ * systemd 256 and later ask this question and no other -- there is no fallback
+ * to name_to_handle_at(2) any more -- so a kernel that leaves the mask empty
+ * simply cannot tell systemd what is mounted. */
+#define STATX_ATTR_MOUNT_ROOT 0x00002000ULL
 
 struct statx_timestamp {
   i64 tv_sec;
@@ -500,8 +533,21 @@ struct statx {
   u32 stx_rdev_minor;
   u32 stx_dev_major;
   u32 stx_dev_minor;
-  u64 __spare2[14];
+  /* Named, not spare. This word is where Linux puts the id of the mount the
+   * file lives on, and it is the FIRST thing systemd asks for when it wants to
+   * know whether a path is a mount point -- ahead of name_to_handle_at(2) and
+   * ahead of /proc/self/fdinfo. Left as padding it read back as zero with the
+   * mask bit clear, systemd reported "Failed to determine whether /proc is a
+   * mount point" for every API filesystem in turn, and PID 1 gave up before
+   * printing its own version banner. */
+  u64 stx_mnt_id;
+  u32 stx_dio_mem_align;
+  u32 stx_dio_offset_align;
+  u64 __spare2[12];
 };
+/* Linux's struct statx is 256 bytes and userspace passes a buffer of exactly
+ * that size. Naming a field out of the padding must not move anything. */
+_Static_assert(sizeof(struct statx) == 256, "struct statx must stay 256 bytes");
 
 /* System node/domain name, owned by the syscall layer (sethostname(2) /
  * setdomainname(2)) and read by uname(2), procfs and sysfs. */

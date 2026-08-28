@@ -15,6 +15,7 @@
  * Scope (intentional): one controller, one keyboard, no hubs, no interrupts
  * (timer-driven polling), no isoch/bulk. Enough for a console on real hardware.
  */
+#include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/pci.h>
 #include <b1nix/mm.h>
@@ -218,7 +219,9 @@ static inline void wr64(volatile u8 *b, u32 off, u64 v)
 	*(volatile u32 *)(b + off + 4) = (u32)(v >> 32);
 }
 
-static void udelay(int loops) { for (int i = 0; i < loops; i++) (void)inb(0x80); }
+/* Delays are real microseconds against the calibrated TSC (arch_udelay);
+ * this driver used to count port-0x80 reads, which is neither. */
+static void udelay(int us) { arch_udelay((u32)us); }
 
 static void xhci_pci_set_d0(const struct pci_device_info *p)
 {

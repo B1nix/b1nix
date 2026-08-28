@@ -557,6 +557,10 @@ isize vfs_mounts_info(struct vfs_mount_info *out, usize max_entries);
 /* The mount id of the mount a path lives on — the first field of that mount's
  * /proc/<pid>/mountinfo row. 0 when no mount matches. */
 int vfs_mount_id_for_path(const char *path);
+/* Whether a path is the root of a mount rather than somewhere below one --
+ * what statx(2) reports as STATX_ATTR_MOUNT_ROOT, and the only way a systemd
+ * from 256 onwards asks whether something is a mount point. */
+int vfs_path_is_mount_root(const char *path);
 /* mount(2) with a propagation flag: change how mount events cross this
  * mountpoint. No filesystem is mounted. */
 int vfs_set_propagation(const char *target, u64 flags);
@@ -594,6 +598,25 @@ int vfs_ioctl(int fd, u64 request, void *arg);
 
 /* M56 event-loop / IPC primitives (kernel/fs/eventpoll.c). */
 int vfs_eventfd(unsigned int initval, int flags);
+/* pidfd_open(2): a descriptor for a running process.
+ *
+ * The point of it is that a pid is a name that can be reused and a descriptor
+ * is not: once this succeeds, everything done through the descriptor is done
+ * to THAT process or to nothing, however long the caller holds it. systemd
+ * from 254 onwards keeps one for every process it manages (its PidRef), and
+ * takes one for itself before it will run a boot at all.
+ *
+ * `flags` accepts PIDFD_NONBLOCK; PIDFD_THREAD is refused, because a
+ * thread-directed pidfd would promise waiting semantics this kernel does not
+ * implement. */
+int vfs_pidfd_open(usize pid, int flags);
+/* The pid a pidfd refers to, or 0 when the descriptor is not a pidfd. Used by
+ * /proc/<pid>/fdinfo, which is where a caller reads it back. */
+usize vfs_pidfd_pid(struct vfs_handle *h);
+/* The pidfd's unique id -- what fstat(2) reports as st_ino. It identifies the
+ * process for as long as anything holds a reference, which is the guarantee a
+ * pid cannot give. */
+u64 vfs_pidfd_id(struct vfs_handle *h);
 int vfs_timerfd_create(int clockid, int flags);
 int vfs_timerfd_settime(int fd, int flags,
                         const struct b1nix_itimerspec *new_value,
@@ -714,7 +737,11 @@ enum vfs_handle_kind {
   VFS_HANDLE_SIGNALFD,
   VFS_HANDLE_EPOLL,
   /* M73: inotify filesystem-change notification. */
-  VFS_HANDLE_INOTIFY
+  VFS_HANDLE_INOTIFY,
+  /* pidfd_open(2): a descriptor that refers to a process rather than to a
+   * name for it, so a caller can signal or wait for exactly that process with
+   * no risk of the pid having been reused underneath it. */
+  VFS_HANDLE_PIDFD
 };
 
 struct vfs_file_ops {
@@ -907,6 +934,13 @@ struct vfs_socket_state {
   u8 udp_q_head;
   u8 udp_q_tail;
   u8 udp_q_count;
+  /* The addrlen a bound AF_UNIX socket was given. An abstract name is not a C
+   * string -- it begins with a NUL and its length comes from the caller -- so
+   * the length has to be kept to report the address back. Zero for anything
+   * never bound with one. Added at the END: this structure is reached from a
+   * lot of places and moving its existing members is a change nobody asked
+   * for. */
+  usize local_un_len;
 };
 
 struct vfs_handle {

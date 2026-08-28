@@ -99,6 +99,20 @@ void arch_xsave_capture_clean(void *area, u64 mask);
 void arch_set_cpu_khz(u32 khz);
 u32 arch_cpu_khz(void);
 
+/* Spin for `us` microseconds, measured against the calibrated TSC.
+ *
+ * Drivers used to write this as `for (i = 0; i < loops; i++) inb(0x80)`, which
+ * is wrong twice over: the loop count has no defined relation to time on any
+ * machine, so a call spelled "300 ms" was not 300 ms anywhere; and every read
+ * of an I/O port is a VM exit under virtualisation, so a long delay asked the
+ * hypervisor to leave and re-enter the guest hundreds of thousands of times.
+ * xhci port enumeration alone cost 1.14 s of a 2.55 s boot that way.
+ *
+ * Falls back to the old port loop when the TSC has not been calibrated (very
+ * early boot): a delay that returns at once would be worse than an approximate
+ * one, because these are recovery waits hardware is entitled to. */
+void arch_udelay(u32 us);
+
 /* The cycle-counter clock behind clock_gettime's monotonic family. Available
  * only on an invariant TSC with a calibrated frequency; callers must fall back
  * to the 100 Hz tick when arch_tsc_clock_ready() is false. */

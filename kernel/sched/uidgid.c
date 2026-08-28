@@ -467,6 +467,12 @@ int cred_capset(struct cred *cred, u64 eff, u64 perm, u64 inh)
     cred->cap_permitted = perm;
     cred->cap_effective = eff;
     cred->cap_inheritable = inh;
+    /* A capability is ambient only while it is BOTH permitted and inheritable;
+     * dropping it from either takes it out of the ambient set as well. Linux
+     * enforces this invariant on every change, and it is the whole reason the
+     * ambient set is safe: it can never carry something the process has just
+     * given up. */
+    cred->cap_ambient &= (perm & inh);
     /* The bounding set is NOT touched here. On Linux only PR_CAPBSET_DROP
      * lowers it; capset(2) changes what the process holds, not the ceiling on
      * what it could ever hold. Shrinking it here made a library that raises a

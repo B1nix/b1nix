@@ -6135,6 +6135,23 @@ void scheduler_fd_close_on_exec(void) {
  * excluded from waitpid interruption, so this never spuriously aborts a parent
  * blocked reaping another child. */
 static void post_sigchld_to_parent(usize parent_id, int job_control_event) {
+  /* A child changing state is also a readiness change on every pidfd that
+   * names it, and a poller has no other way to hear about it.
+   *
+   * A pidfd is readable exactly when the process it holds has exited, and
+   * b1nix's poll implementation re-examines its descriptors only when
+   * something wakes vfs_poll_chan. Nothing did on this path, so an epoll_wait
+   * on a pidfd slept through the death it was waiting for -- which is how
+   * systemd waits for the child it runs its generators in, and it sat in that
+   * epoll_wait for the rest of the boot.
+   *
+   * Announced before the SIGCHLD, and unconditionally: a pidfd holder need not
+   * be the parent, and there is no cheap way to ask which of them there are.
+   * Deaths are rare next to the wake this costs. */
+  {
+    extern void *vfs_poll_chan;
+    scheduler_wake_all(vfs_poll_chan);
+  }
   if (parent_id == 0)
     return;
   for (usize p = 0; p < g_task_hwm; p++) {

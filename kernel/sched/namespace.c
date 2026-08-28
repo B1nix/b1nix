@@ -38,7 +38,13 @@
 
 #define NS_MAX_TASKS 64 /* tasks that are NOT in the initial namespaces */
 #define NS_MAX_UTS 8    /* slot 0 is the initial UTS namespace */
-#define NS_MAX_MNT 8    /* slot 0 is the initial mount namespace */
+/* Mount namespaces. Eight was enough while the only caller was `unshare -m`
+ * from a shell; a systemd machine puts every sandboxed unit and every
+ * generator in one of its own, and runs out during the boot -- at which point
+ * clone(CLONE_NEWNS) answers ENOSPC and the unit fails to start for a reason
+ * that has nothing to do with the unit. The cost is one int per slot here plus
+ * whatever mount entries a namespace actually holds. */
+#define NS_MAX_MNT 64   /* slot 0 is the initial mount namespace */
 #define NS_MAX_PID 8    /* slot 0 is the initial pid namespace */
 /* Tasks a non-initial pid namespace can number at once. */
 #define PIDNS_MAX_TASKS 64
@@ -52,6 +58,15 @@ struct ns_row {
   /* Linux's pid_ns_for_children: unshare/setns of a PID namespace takes effect
    * on the tasks this one goes on to create, never on itself. */
   u32 pid_children;
+  /* Namespaces the NEXT child is born into, prepared by clone(2) before the
+   * fork and consumed by namespace_fork_inherit. 0 in a slot means "inherit".
+   *
+   * It is done ahead of the fork, not after it, because the child is runnable
+   * the moment the fork returns: a namespace handed to it afterwards is a
+   * namespace it may already have left the kernel without. Cloning a mount
+   * table also allocates and takes VFS locks, which the fork's tail — running
+   * with interrupts disabled — is no place for. */
+  u32 child_ns[NS_KIND_COUNT];
 };
 
 /* One entry per task numbered in a non-initial pid namespace.
@@ -283,11 +298,19 @@ void namespace_fork_inherit(usize parent_pid, usize child_pid) {
      * the child. That is what makes the first child pid 1. */
     if (p->pid_children)
       copy[NS_PID] = p->pid_children;
+    /* Namespaces clone(CLONE_NEW*) prepared for exactly this child. */
+    for (int k = 0; k < NS_KIND_COUNT; k++)
+      if (p->child_ns[k]) {
+        copy[k] = p->child_ns[k];
+        p->child_ns[k] = 0; /* one child, not every child after it */
+      }
     struct ns_row *c = ns_get_or_add_locked(child_pid);
     if (c) {
       for (int k = 0; k < NS_KIND_COUNT; k++)
         c->id[k] = copy[k];
       c->pid_children = 0;
+      for (int k = 0; k < NS_KIND_COUNT; k++)
+        c->child_ns[k] = 0;
       if (copy[NS_PID])
         pidns_enter_locked(copy[NS_PID], child_pid);
     }
@@ -816,6 +839,134 @@ int namespace_unshare(u64 flags) {
       return rc;
   }
   return 0;
+}
+
+/* clone(CLONE_NEW*): build the namespaces the next child is born into.
+ *
+ * Called by the PARENT, before the fork, with interrupts enabled — cloning a
+ * mount table allocates and takes VFS locks. namespace_fork_inherit then
+ * stamps the child with what was prepared here, under the same lock that makes
+ * the child visible, so there is no window in which the child exists outside
+ * the namespaces it asked for.
+ *
+ * Ignoring the flags instead — which is what happened before this existed —
+ * is not a smaller version of the feature, it is the wrong answer: a process
+ * that asked for a private mount namespace and quietly got the shared one goes
+ * on to remount things "for itself", and every one of those mounts is
+ * everyone's. */
+int namespace_child_prepare(u64 flags) {
+  u64 want = flags & (B1NIX_CLONE_NEWNS | B1NIX_CLONE_NEWUTS |
+                      B1NIX_CLONE_NEWNET);
+  if (!want)
+    return 0;
+
+  ns_gc();
+  usize pid = scheduler_get_pid();
+  u32 prepared[NS_KIND_COUNT] = {0};
+
+  u64 lf;
+  spin_lock_irqsave(&ns_lock, &lf);
+  ns_ensure_init();
+  struct ns_row *r = ns_get_or_add_locked(pid);
+  if (!r) {
+    spin_unlock_irqrestore(&ns_lock, lf);
+    return -ENOSPC;
+  }
+  u32 from_mnt = r->id[NS_MNT];
+
+  if (want & B1NIX_CLONE_NEWUTS) {
+    u32 slot = 0;
+    for (u32 i = 1; i < NS_MAX_UTS; i++)
+      if (!uts_ns[i].used) { slot = i; break; }
+    if (!slot) {
+      spin_unlock_irqrestore(&ns_lock, lf);
+      return -ENOSPC;
+    }
+    struct uts_ns *old = uts_current_locked();
+    uts_ns[slot].used = 1;
+    ns_copy_name(uts_ns[slot].host, sizeof(uts_ns[slot].host), old->host);
+    ns_copy_name(uts_ns[slot].domain, sizeof(uts_ns[slot].domain), old->domain);
+    prepared[NS_UTS] = slot;
+  }
+  if (want & B1NIX_CLONE_NEWNET) {
+    u32 slot = 0;
+    for (u32 i = 1; i < NS_MAX_NET; i++)
+      if (!net_ns_used[i]) { slot = i; break; }
+    if (!slot) {
+      if (prepared[NS_UTS])
+        uts_ns[prepared[NS_UTS]].used = 0;
+      spin_unlock_irqrestore(&ns_lock, lf);
+      return -ENOSPC;
+    }
+    net_ns_used[slot] = 1;
+    prepared[NS_NET] = slot;
+  }
+  u32 mnt_slot = 0;
+  if (want & B1NIX_CLONE_NEWNS) {
+    for (u32 i = 1; i < NS_MAX_MNT; i++)
+      if (!mnt_ns_used[i]) { mnt_slot = i; break; }
+    if (!mnt_slot) {
+      if (prepared[NS_UTS])
+        uts_ns[prepared[NS_UTS]].used = 0;
+      if (prepared[NS_NET])
+        net_ns_used[prepared[NS_NET]] = 0;
+      spin_unlock_irqrestore(&ns_lock, lf);
+      return -ENOSPC;
+    }
+    mnt_ns_used[mnt_slot] = 1; /* claimed, so no concurrent unshare takes it */
+  }
+  spin_unlock_irqrestore(&ns_lock, lf);
+
+  /* The mount-table copy takes VFS locks and must not run under ns_lock. */
+  if (mnt_slot) {
+    int rc = vfs_mnt_ns_clone(from_mnt, mnt_slot);
+    if (rc != 0) {
+      spin_lock_irqsave(&ns_lock, &lf);
+      mnt_ns_used[mnt_slot] = 0;
+      if (prepared[NS_UTS])
+        uts_ns[prepared[NS_UTS]].used = 0;
+      if (prepared[NS_NET])
+        net_ns_used[prepared[NS_NET]] = 0;
+      spin_unlock_irqrestore(&ns_lock, lf);
+      vfs_mnt_ns_destroy(mnt_slot);
+      return rc;
+    }
+    prepared[NS_MNT] = mnt_slot;
+  }
+
+  spin_lock_irqsave(&ns_lock, &lf);
+  r = ns_get_or_add_locked(pid);
+  if (r)
+    for (int k = 0; k < NS_KIND_COUNT; k++)
+      if (prepared[k])
+        r->child_ns[k] = prepared[k];
+  spin_unlock_irqrestore(&ns_lock, lf);
+  return 0;
+}
+
+/* The fork failed, so nothing will ever be born into what was prepared. */
+void namespace_child_prepare_abort(void) {
+  if (!ns_any)
+    return;
+  usize pid = scheduler_get_pid();
+  u32 drop_mnt = 0;
+  u64 lf;
+  spin_lock_irqsave(&ns_lock, &lf);
+  struct ns_row *r = ns_find_locked(pid);
+  if (r) {
+    if (r->child_ns[NS_UTS])
+      uts_ns[r->child_ns[NS_UTS]].used = 0;
+    if (r->child_ns[NS_NET])
+      net_ns_used[r->child_ns[NS_NET]] = 0;
+    drop_mnt = r->child_ns[NS_MNT];
+    if (drop_mnt)
+      mnt_ns_used[drop_mnt] = 0;
+    for (int k = 0; k < NS_KIND_COUNT; k++)
+      r->child_ns[k] = 0;
+  }
+  spin_unlock_irqrestore(&ns_lock, lf);
+  if (drop_mnt)
+    vfs_mnt_ns_destroy(drop_mnt);
 }
 
 int namespace_setns(int kind, u32 target) {

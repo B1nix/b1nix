@@ -1,5 +1,6 @@
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
+#include <b1nix/cgroup.h>
 #include <b1nix/dirent.h>
 #include <b1nix/errno.h>
 #include <b1nix/kprintf.h>
@@ -800,13 +801,19 @@ static int sys_statx(int dirfd, const char *user_path, int flags,
                      unsigned int mask, struct statx *user_buf) {
   struct b1nix_stat st;
   int rc;
+  /* The path the answer is about, kept so the mount id can be worked out from
+   * it below. Both branches produce one: AT_EMPTY_PATH names a descriptor, and
+   * a descriptor has an absolute path. */
+  char resolved[VFS_MAX_PATH];
+  resolved[0] = '\0';
   if ((flags & AT_EMPTY_PATH) && (!user_path || user_path[0] == '\0')) {
     rc = vfs_fstat(dirfd, &st);
+    if (vfs_fd_abspath(dirfd, resolved, sizeof(resolved)) < 0)
+      resolved[0] = '\0';
   } else {
     char kpath[VFS_MAX_PATH];
     if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
       return -EFAULT;
-    char resolved[VFS_MAX_PATH];
     int arc = syscall_resolve_at(dirfd, kpath, resolved, sizeof(resolved));
     if (arc < 0)
       return arc;
@@ -838,6 +845,52 @@ static int sys_statx(int dirfd, const char *user_path, int flags,
   sx.stx_rdev_minor = (u32)(st.st_rdev & 0xff);
   sx.stx_dev_major = (u32)(st.st_dev >> 8);
   sx.stx_dev_minor = (u32)(st.st_dev & 0xff);
+
+  /* The mount id, when the caller asked for it.
+   *
+   * Reported only when it is really known: the mask bit is what tells the
+   * caller the field means something, and setting it over a zero would be
+   * worse than leaving it clear -- systemd would then go looking in
+   * /proc/self/mountinfo for a row numbered 0, find none, and draw a
+   * conclusion from it. Both the 32-bit and the 64-bit form get the same
+   * number, which is the one /proc/<pid>/mountinfo prints; b1nix does not
+   * reuse mount ids within a boot, so it satisfies what MNT_ID_UNIQUE
+   * promises.
+   *
+   * This is how systemd asks whether a path is a mount point, and it asks
+   * before it will mount anything: without an answer it reported "Failed to
+   * determine whether /proc is a mount point" for each API filesystem in turn
+   * and then "Failed to mount API filesystems", and PID 1 exited. */
+  if (mask & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE)) {
+    int mid = resolved[0] ? vfs_mount_id_for_path(resolved) : 0;
+    if (mid > 0) {
+      sx.stx_mnt_id = (u64)mid;
+      sx.stx_mask |= mask & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE);
+    }
+  }
+
+  /* Whether this path is the root of a mount.
+   *
+   * stx_attributes_mask is the promise: it names the bits this kernel knows
+   * how to report, and a caller reads stx_attributes only for bits that appear
+   * in it. Both were left at zero, which says "this kernel cannot tell you
+   * anything about attributes" -- and since systemd 256 that is the only
+   * question systemd asks about mount points, the name_to_handle_at(2) and
+   * mountinfo fallbacks having been removed. It answered -EUNATCH for each of
+   * /proc, /sys, /dev, /dev/shm and /run, reported "Failed to mount API
+   * filesystems", and exited before it had printed one line about itself.
+   *
+   * Unlike stx_mnt_id above this is NOT conditional on a mask bit: Linux fills
+   * stx_attributes on every statx, and the mask is what tells the caller the
+   * value means something. */
+  if (resolved[0]) {
+    sx.stx_attributes_mask = STATX_ATTR_MOUNT_ROOT;
+    if (vfs_path_is_mount_root(resolved))
+      sx.stx_attributes |= STATX_ATTR_MOUNT_ROOT;
+  }
+  /* No path -- an AT_EMPTY_PATH call on a descriptor with no name -- means the
+   * question cannot be answered, and the mask stays empty rather than claiming
+   * an answer of "no". */
   if (syscall_copyout(user_buf, &sx, sizeof(sx)) < 0)
     return -EFAULT;
   return 0;
@@ -2583,6 +2636,52 @@ static u64 ns_pid_out(u64 kernel_pid) {
    * descendant, and every descendant is numbered in every ancestor namespace.
    * Report 0 rather than leaking the kernel's own id if it ever does. */
   return (u64)v;
+}
+
+/* The CLONE_NEW* flags b1nix has namespaces for. clone(2) may ask for them at
+ * the same time as it makes the child, and until now it did not get them:
+ * scheduler_fork_clone inherits the parent's namespaces and the flags were
+ * dropped on the floor.
+ *
+ * Dropping them is not a missing feature, it is a wrong answer. A caller that
+ * asked for a private mount namespace and was given the shared one goes on to
+ * remount things "for itself" -- and every one of those mounts is everybody's.
+ * systemd forks its generators with CLONE_NEWNS and then remounts the root
+ * read-only inside what it believes is its own namespace: the root really went
+ * read-only, PID 1's own log descriptor started answering EROFS, and the boot
+ * went silent from that point on with no error anywhere to say why. */
+#define CLONE_NS_FLAGS                                                         \
+  (B1NIX_CLONE_NEWNS | B1NIX_CLONE_NEWUTS | B1NIX_CLONE_NEWNET)
+
+/* Prepare, in the parent, the namespaces a clone(CLONE_NEW*) asks for.
+ *
+ * It must happen here and not in the child: a forked child does not return
+ * through this C code at all -- it resumes at x86_fork_child_trampoline and
+ * goes straight back to ring 3 -- and even if it did, it is runnable the
+ * instant the fork returns, so anything done to it afterwards can be too late.
+ *
+ * CLONE_NEWPID is refused rather than ignored. On clone it means the child is
+ * pid 1 of a fresh numbering, which is not what this kernel's unshare-shaped
+ * machinery does, and a process that believes it got a private pid namespace
+ * and did not is worse off than one told plainly that it cannot have one. */
+static int clone_prepare_namespaces(u64 flags) {
+  /* The namespaces this kernel does not have, refused rather than ignored --
+   * the same answer unshare(2) already gives, so the two calls agree about
+   * what exists.
+   *
+   * Ignoring CLONE_NEWUSER was not a harmless omission. systemd probes for
+   * id-mapped mounts by cloning into a user namespace and then writing the
+   * child's /proc/<pid>/uid_map; with the flag dropped it got an ordinary
+   * child, and the write failed with ENOENT because there is no such file.
+   * That ENOENT is fatal to the unit -- "Failed to set up special execution
+   * directory in /run" -- so journald could not start. Told plainly that user
+   * namespaces do not exist, systemd records "not supported" and carries on. */
+  if (flags & (B1NIX_CLONE_NEWUSER | B1NIX_CLONE_NEWIPC |
+               B1NIX_CLONE_NEWCGROUP | B1NIX_CLONE_NEWPID))
+    return -EINVAL;
+  if (!(flags & CLONE_NS_FLAGS))
+    return 0;
+  return namespace_child_prepare(flags);
 }
 
 /* ── M109: unshare(2) / setns(2) ────────────────────────────────────────── */
@@ -5565,6 +5664,7 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* Read from the command line ONCE. Asking bootinfo per system call means
      * scanning the whole cmdline string on every entry into the kernel, which
      * is not a diagnostic cost -- it is slow enough to stall the machine. */
+    enum { TRACE_ERRNO_ALL = 0xffffffffu - 1 };
     static u32 trace_errno = (u32)-1;
     /* Optional pid filter. ENOENT in particular is answered thousands of times
      * in a normal boot -- every probe for a file that is not there is one --
@@ -5574,14 +5674,31 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
      * default) keeps every task, as before. */
     static u32 trace_errno_pid = (u32)-1;
     if (trace_errno == (u32)-1) {
-      trace_errno = bootinfo_get_u32("b1nix.trace-errno", 0);
+      /* `b1nix.trace-errno=all` reports EVERY failing call rather than one
+       * chosen code. Guessing the code first is only possible when the program
+       * says which one it got, and a manager that dies without printing
+       * anything says nothing at all -- which is exactly when this is needed.
+       * Kept behind the same pid filter, because unfiltered it is thousands of
+       * lines a second. */
+      char ev[16];
+      if (bootinfo_get_kv("b1nix.trace-errno", ev, sizeof(ev)) &&
+          strcmp(ev, "all") == 0)
+        trace_errno = TRACE_ERRNO_ALL;
+      else
+        trace_errno = bootinfo_get_u32("b1nix.trace-errno", 0);
       trace_errno_pid = bootinfo_get_u32("b1nix.trace-errno-pid", 0);
     }
     u32 e = trace_errno;
     if (e) {
       u32 pid = (unsigned)(current_task ? current_task->id : 0);
-      if (ret == (u64)(-(i64)e) &&
-          (trace_errno_pid == 0 || pid == trace_errno_pid)) {
+      /* An errno return is a small negative value; anything below -4095 is a
+       * pointer or a byte count that happens to have the top bit set. */
+      i64 sret = (i64)ret;
+      int failed = (e == TRACE_ERRNO_ALL) ? (sret < 0 && sret >= -4095)
+                                          : (ret == (u64)(-(i64)e));
+      if (failed && (trace_errno_pid == 0 || pid == trace_errno_pid)) {
+        if (e == TRACE_ERRNO_ALL)
+          e = (u32)(-sret);
         /* The path, where the call has one. "errno 2 from syscall 83" says a
          * mkdir failed; it does not say which directory, and the directory is
          * the whole answer. Linux's numbering puts the path in different
@@ -5614,13 +5731,26 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
         pbuf[0] = '\0';
         if (upath && strncpy_from_user(pbuf, upath, sizeof(pbuf)) < 0)
           pbuf[0] = '\0';
-        char el[224];
+        /* The call's name, for a Linux-personality task. A number is a lookup
+         * every reader of the log has to do by hand, and the numbering is the
+         * one thing about this trace that is not obvious. Only Linux-ABI tasks
+         * get a name: for a native task the same integer means something else
+         * entirely, and a confidently wrong name is worse than none. */
+        const char *cname = "";
+        if (current_task && current_task->user_image &&
+            ((struct user_loaded_image *)current_task->user_image)
+                    ->personality == PERSONALITY_LINUX)
+          cname = linux_syscall_name(number);
+        char el[256];
         if (pbuf[0])
-          snprintf(el, sizeof(el), "errno %u from syscall %llu (pid %u) path=%s",
-                   (unsigned)e, (unsigned long long)number, (unsigned)pid, pbuf);
+          snprintf(el, sizeof(el),
+                   "errno %u from syscall %llu %s (pid %u) path=%s",
+                   (unsigned)e, (unsigned long long)number, cname,
+                   (unsigned)pid, pbuf);
         else
-          snprintf(el, sizeof(el), "errno %u from syscall %llu (pid %u)",
-                   (unsigned)e, (unsigned long long)number, (unsigned)pid);
+          snprintf(el, sizeof(el), "errno %u from syscall %llu %s (pid %u)",
+                   (unsigned)e, (unsigned long long)number, cname,
+                   (unsigned)pid);
         klog_info(el);
       }
     }
@@ -5952,11 +6082,36 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * scheduler_waitid write its b1nix siginfo into the user's (larger)
        * buffer, read it back, and rewrite it in the Linux layout. */
       if (number == 247) {
+        /* waitid(2)'s fourth idtype: the id is a pidfd rather than a pid. */
+        enum { LX_P_PIDFD = 3 };
         usize wid = (usize)arg1;
-        if ((arg0 == P_PID || arg0 == P_PGID) && arg1 != 0 &&
-            !(wid = namespace_pid_from_user((usize)arg1)))
+        u64 widtype = arg0;
+        /* P_PIDFD: wait for the process a pidfd holds. It is the same wait as
+         * P_PID once the descriptor has been read back into a pid -- the
+         * difference is that the descriptor cannot have started meaning a
+         * different process in the meantime, which is the whole point of
+         * having it.
+         *
+         * systemd runs every generator this way: it forks, takes a pidfd, and
+         * waits on the descriptor. Without this the wait answered EINVAL, and
+         * PID 1 reported "Failed to wait for
+         * /usr/lib/systemd/system-environment-generators/10-arch" and then
+         * "Failed to start up manager" -- the boot ended on the first
+         * generator Arch ships. */
+        if (widtype == LX_P_PIDFD) {
+          struct vfs_handle *wh = scheduler_fd_get((int)arg1);
+          if (!wh)
+            return (u64)-EBADF;
+          usize wpid = vfs_pidfd_pid(wh);
+          if (!wpid)
+            return (u64)-EBADF;
+          widtype = P_PID;
+          wid = wpid; /* already a kernel pid: no namespace translation */
+        } else if ((arg0 == P_PID || arg0 == P_PGID) && arg1 != 0 &&
+                   !(wid = namespace_pid_from_user((usize)arg1))) {
           return (u64)-ECHILD;
-        int wr = scheduler_waitid((idtype_t)arg0, wid,
+        }
+        int wr = scheduler_waitid((idtype_t)widtype, wid,
                                   (siginfo_t *)(usize)arg2, (int)arg3);
         if (wr < 0)
           return (u64)wr;
@@ -6146,6 +6301,21 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_fchownat        260
 #define LX_faccessat       269
 #define LX_faccessat2      439
+/* fchmodat2(dirfd, path, mode, flags): fchmodat with the flags argument the
+ * original call never had. glibc 2.39 and later issue it for every
+ * fchmodat(3) that passes a flag, falling back only when it answers ENOSYS --
+ * and a fallback that has to be discovered costs a syscall per call. */
+#define LX_fchmodat2       452
+/* close_range(first, last, flags): shut a whole range of descriptors in one
+ * call. It is how glibc implements closefrom(3) and how systemd closes the
+ * descriptors it does not want a child to inherit; without it both walk
+ * /proc/self/fd instead, which is a directory read per exec. */
+#define LX_close_range     436
+/* pidfd_open(pid, flags) and pidfd_send_signal(pidfd, sig, info, flags). A
+ * descriptor that names a process rather than a number that identifies one
+ * today; see vfs_pidfd_open. */
+#define LX_pidfd_open      434
+#define LX_pidfd_send_signal 424
 #define LX_renameat2       316
 #define LX_renameat        264
 #define LX_pipe2           293
@@ -6166,6 +6336,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_epoll_pwait2    441
 /* clone3 flags this kernel does not model, in the high word of clone_args. */
 #define LX_CLONE_PIDFD        0x00001000ULL
+#define LX_CLONE_DETACHED     0x00400000ULL
 #define LX_CLONE_INTO_CGROUP  0x200000000ULL
 
       /* Resolve a dirfd + user path to an absolute kernel path.
@@ -6206,10 +6377,87 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         vfs_resolve_path(lk_kpath, lk_resolved);
         return (u64)vfs_symlink(target, lk_resolved);
       }
+
+      /* close_range(first, last, flags): close every descriptor in the
+       * inclusive range. glibc's closefrom(3) and systemd's own
+       * close_all_fds() both reach for it before falling back to reading
+       * /proc/self/fd, and the fallback costs a directory walk on every exec.
+       *
+       * CLOSE_RANGE_UNSHARE (bit 1) asks for the descriptor table to be
+       * unshared first, which is only meaningful with CLONE_FILES; b1nix does
+       * not share tables that way, so there is nothing to unshare and the flag
+       * is accepted. CLOSE_RANGE_CLOEXEC (bit 2) marks rather than closes.
+       * A descriptor that is not open is not an error -- the range is a range,
+       * not a list. */
+      /* pidfd_open(pid, flags): take a reference to a process. */
+      if (number == LX_pidfd_open)
+        return (u64)(isize)vfs_pidfd_open((usize)arg0, (int)arg1);
+
+      /* pidfd_send_signal(pidfd, sig, info, flags): deliver a signal to the
+       * process the descriptor holds. The whole reason it exists is that the
+       * descriptor cannot have come to mean a different process since it was
+       * opened, which kill(2) on a pid cannot promise.
+       *
+       * `info` is not read: b1nix's signal delivery builds the siginfo itself
+       * and has no way to carry a caller-supplied one, so accepting a pointer
+       * and quietly ignoring its contents would be worse than refusing it. A
+       * NULL info -- what every caller in practice passes, and what systemd
+       * passes -- is honoured. */
+      if (number == LX_pidfd_send_signal) {
+        if (arg3 != 0)
+          return (u64)-EINVAL;
+        if (arg2 != 0)
+          return (u64)-EOPNOTSUPP;
+        struct vfs_handle *ph = scheduler_fd_get((int)arg0);
+        if (!ph)
+          return (u64)-EBADF;
+        usize target = vfs_pidfd_pid(ph);
+        if (!target)
+          return (u64)-EBADF;
+        int sig = (int)arg1;
+        if (sig < 0 || sig >= NSIG)
+          return (u64)-EINVAL;
+        if (sig == 0) {
+          /* The existence probe: no signal is sent, the answer is whether the
+           * process is still there. */
+          struct task *tt = scheduler_task_by_pid(target);
+          if (!tt || tt->state == TASK_DEAD || tt->state == TASK_REAPING ||
+              tt->state == TASK_UNUSED)
+            return (u64)-ESRCH;
+          return 0;
+        }
+        return (u64)(isize)scheduler_kill_thread_group_user(target, sig);
+      }
+
+      if (number == LX_close_range) {
+        enum { LX_CLOSE_RANGE_UNSHARE = 1u << 1,
+               LX_CLOSE_RANGE_CLOEXEC = 1u << 2 };
+        u32 first = (u32)arg0;
+        u32 last = (u32)arg1;
+        u32 cr_flags = (u32)arg2;
+        if (cr_flags & ~(u32)(LX_CLOSE_RANGE_UNSHARE | LX_CLOSE_RANGE_CLOEXEC))
+          return (u64)-EINVAL;
+        if (first > last)
+          return (u64)-EINVAL;
+        usize cap = current_task ? current_task->fd_capacity : 0;
+        u64 hi = last;
+        if (cap && hi > (u64)cap - 1)
+          hi = (u64)cap - 1;
+        for (u64 fd = first; cap && fd <= hi; fd++) {
+          if (!scheduler_fd_get((int)fd))
+            continue;
+          if (cr_flags & LX_CLOSE_RANGE_CLOEXEC)
+            scheduler_fd_flags_set((int)fd, B1NIX_FD_CLOEXEC);
+          else
+            vfs_close((int)fd);
+        }
+        return 0;
+      }
       if (number == LX_openat || number == LX_newfstatat ||
           number == LX_unlinkat || number == LX_mkdirat ||
           number == LX_mknodat ||
-          number == LX_fchmodat || number == LX_fchownat ||
+          number == LX_fchmodat || number == LX_fchmodat2 ||
+          number == LX_fchownat ||
           number == LX_faccessat || number == LX_faccessat2 ||
           number == LX_readlinkat ||
           number == LX_renameat2 ||
@@ -6230,6 +6478,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           switch (number) {
           case LX_newfstatat:
           case LX_faccessat2:
+          case LX_fchmodat2:
             at_flags = (int)arg3;
             break;
           /* fchownat(dirfd, path, owner, group, flags): the flags are the
@@ -6378,6 +6627,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           }
           return (u64)len;
         }
+        /* fchmodat2 carries a flags word fchmodat does not; b1nix has no
+         * per-symlink modes, so AT_SYMLINK_NOFOLLOW has nothing to change and
+         * the two are the same operation here. AT_EMPTY_PATH is handled by the
+         * shared block above. */
+        case LX_fchmodat2:
         case LX_fchmodat:
           return (u64)vfs_chmod(resolved, (u16)arg2);
         case LX_fchownat:
@@ -6793,10 +7047,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         usize copy = size < sizeof(ca) ? size : sizeof(ca);
         if (syscall_copyin(&ca, (const void *)(usize)arg0, copy) < 0)
           return (u64)-EFAULT;
-        /* Not modelled: pidfd hand-back, cgroup placement, caller-chosen tids. */
-        if (ca.set_tid || ca.set_tid_size || ca.cgroup)
+        /* Not modelled: caller-chosen tids. */
+        if (ca.set_tid || ca.set_tid_size)
           return (u64)-EINVAL;
-        if (ca.flags & (LX_CLONE_PIDFD | LX_CLONE_INTO_CGROUP))
+        /* CLONE_INTO_CGROUP names the child's cgroup with a directory
+         * descriptor. Without the flag the `cgroup` field means nothing, so a
+         * value there is a caller asking for something it did not request. */
+        if (!(ca.flags & LX_CLONE_INTO_CGROUP) && ca.cgroup)
+          return (u64)-EINVAL;
+        if ((ca.flags & LX_CLONE_PIDFD) &&
+            (!ca.pidfd || (ca.flags & (B1NIX_CLONE_THREAD | LX_CLONE_DETACHED))))
           return (u64)-EINVAL;
         if (ca.exit_signal > 63)
           return (u64)-EINVAL;
@@ -6805,9 +7065,30 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
          * fork-like sharing of the caller's, which the clone path handles. */
         u64 child_sp = ca.stack ? ca.stack + ca.stack_size : 0;
         u64 flags = ca.flags | (ca.exit_signal & 0xff);
-        if (!(flags & B1NIX_CLONE_VM) && child_sp == 0)
-          return ns_pid_out((u64)scheduler_fork_clone(flags, ca.parent_tid,
-                                                      ca.child_tid));
+        if (!(flags & B1NIX_CLONE_VM) && child_sp == 0) {
+          /* CLONE_PIDFD, the clone3 spelling: the descriptor goes into the
+           * `pidfd` field of the argument block rather than into parent_tid.
+           * Same reason as in clone(2) above -- this is how a modern manager
+           * gets a reference to the child it just made. */
+          int nsrc = clone_prepare_namespaces(ca.flags);
+          if (nsrc < 0)
+            return (u64)(isize)nsrc;
+          isize kid =
+              scheduler_fork_clone(flags, ca.parent_tid, ca.child_tid);
+          if (kid < 0)
+            namespace_child_prepare_abort();
+          /* CLONE_INTO_CGROUP: move the child out of the cgroup it inherited
+           * and into the one the descriptor names. Done before the caller is
+           * told the pid, so nothing can observe it in the wrong group. */
+          if ((ca.flags & LX_CLONE_INTO_CGROUP) && kid > 0)
+            (void)cgroup_attach_pid_at_fd((int)ca.cgroup, (usize)kid);
+          if ((ca.flags & LX_CLONE_PIDFD) && kid > 0) {
+            int pfd = vfs_pidfd_open((usize)kid, 0);
+            i32 pfd32 = pfd < 0 ? -1 : (i32)pfd;
+            syscall_copyout((void *)(usize)ca.pidfd, &pfd32, sizeof(pfd32));
+          }
+          return ns_pid_out((u64)kid);
+        }
         u64 child_entry = frame ? frame->rip : child_sp;
         struct clone_user_regs uregs;
         clone_regs_from_frame(&uregs, frame);
@@ -6849,9 +7130,47 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
          * stack outright with -EFAULT, which is what glibc reported as
          * "Cannot fork" — musl never hit it because its fork passes plain
          * SIGCHLD and took the native fork path. */
-        if (!(flags & B1NIX_CLONE_VM) && user_stack == 0)
-          return ns_pid_out(
-              (u64)scheduler_fork_clone(flags, parent_tid, child_tid));
+        if (!(flags & B1NIX_CLONE_VM) && user_stack == 0) {
+          /* CLONE_PIDFD: the caller wants a descriptor for the child, and it
+           * comes back through the parent_tid argument -- clone(2) reuses that
+           * pointer for it, which is why the two flags are mutually exclusive.
+           *
+           * This is how systemd forks EVERY child: safe_fork_full() asks for a
+           * pidfd and then waits for the child through it, in its event loop.
+           * The flag used to be ignored, so the pointer was never written and
+           * systemd waited on whatever descriptor its variable happened to
+           * hold -- which is never the child. The generators ran, exited, and
+           * were reaped, and PID 1 sat in epoll_wait for the rest of the boot
+           * waiting to be told about it. */
+          if (flags & LX_CLONE_PIDFD) {
+            if (!parent_tid ||
+                (flags & (B1NIX_CLONE_THREAD | LX_CLONE_DETACHED)))
+              return (u64)-EINVAL;
+            /* The pointer is checked before the fork: a child that exists and
+             * a caller that cannot be told its descriptor is the worst of both
+             * answers. */
+            i32 probe = -1;
+            if (syscall_copyout((void *)(usize)parent_tid, &probe,
+                                sizeof(probe)) < 0)
+              return (u64)-EFAULT;
+          }
+          int nsrc = clone_prepare_namespaces(flags);
+          if (nsrc < 0)
+            return (u64)(isize)nsrc;
+          isize kid = scheduler_fork_clone(
+              flags, (flags & LX_CLONE_PIDFD) ? 0 : parent_tid, child_tid);
+          if (kid < 0)
+            namespace_child_prepare_abort();
+          if ((flags & LX_CLONE_PIDFD) && kid > 0) {
+            /* Runs in the parent only: the child returns 0 from the fork. */
+            int pfd = vfs_pidfd_open((usize)kid, 0);
+            i32 pfd32 = (i32)pfd;
+            if (pfd < 0)
+              pfd32 = -1;
+            syscall_copyout((void *)(usize)parent_tid, &pfd32, sizeof(pfd32));
+          }
+          return ns_pid_out((u64)kid);
+        }
 
         u64 b1nix_flags = flags;
         /* M92: musl's __clone stores the start_routine pointer in r9 before
@@ -9230,6 +9549,58 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       c->cap_bounding &= ~(1ULL << (int)arg1);
       c->cap_inheritable &= c->cap_bounding;
       return 0;
+    }
+    /* PR_CAP_AMBIENT (47): the set a non-setuid execve carries across.
+     *
+     * systemd calls this before spawning EVERY process -- once to clear the
+     * set, then once per capability the unit asks to keep -- and treats a
+     * failure as fatal to the spawn ("Failed to apply the starting ambient
+     * set"). Answering EINVAL therefore did not degrade the machine, it
+     * stopped it: no unit could start at all.
+     *
+     * Linux's rule, kept here: a capability may be raised into the ambient set
+     * only while it is both permitted and inheritable, and it leaves the set
+     * as soon as it leaves either. */
+    if (option == 47) {
+      enum {
+        CAP_AMBIENT_IS_SET = 1,
+        CAP_AMBIENT_RAISE = 2,
+        CAP_AMBIENT_LOWER = 3,
+        CAP_AMBIENT_CLEAR_ALL = 4,
+      };
+      struct cred *c = scheduler_get_current_cred();
+      if (!c)
+        return (u64)-EINVAL;
+      if ((u32)arg1 == CAP_AMBIENT_CLEAR_ALL) {
+        /* The unused arguments must be zero; Linux checks and so do we,
+         * because a caller passing something there means something else. */
+        if (arg2 || arg3 || arg4)
+          return (u64)-EINVAL;
+        c->cap_ambient = 0;
+        return 0;
+      }
+      if ((int)arg2 < 0 || (int)arg2 > CAP_LAST || arg3 || arg4)
+        return (u64)-EINVAL;
+      u64 bit = 1ULL << (int)arg2;
+      switch ((u32)arg1) {
+      case CAP_AMBIENT_IS_SET:
+        return (u64)((c->cap_ambient & bit) ? 1 : 0);
+      case CAP_AMBIENT_RAISE:
+        if (!(c->cap_permitted & bit) || !(c->cap_inheritable & bit))
+          return (u64)-EPERM;
+        /* SECBIT_NOROOT-style locking: Linux refuses a raise once the ambient
+         * set has been locked by securebits. b1nix models the lock bits, so
+         * the same refusal applies. */
+        if (c->securebits & SECBIT(SECURE_NO_CAP_AMBIENT_RAISE))
+          return (u64)-EPERM;
+        c->cap_ambient |= bit;
+        return 0;
+      case CAP_AMBIENT_LOWER:
+        c->cap_ambient &= ~bit;
+        return 0;
+      default:
+        return (u64)-EINVAL;
+      }
     }
     /* PR_GET_SECUREBITS (27) / PR_SET_SECUREBITS (28). */
     if (option == 27)

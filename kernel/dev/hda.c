@@ -188,8 +188,11 @@ static void hda_delay_ms(int ms) {
 	u32 start = hda_wallclock();
 
 	if (start == 0) {
+		/* `pause`, not a port read: this is a spin hint, and an I/O-port
+		 * access is a VM exit under virtualisation -- paying one per
+		 * iteration to mark time is the cost this loop is trying to avoid. */
 		while (arch_tsc_monotonic_ns() < deadline)
-			(void)inb(0x80);
+			__asm__ volatile("pause");
 		return;
 	}
 	while (arch_tsc_monotonic_ns() < deadline) {

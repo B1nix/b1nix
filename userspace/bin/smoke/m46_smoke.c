@@ -315,6 +315,156 @@ static void test_shebang(void) {
   unlink(path);
 }
 
+/* A `#!` file whose interpreter does not exist must fail, and must fail
+ * cleanly.
+ *
+ * execve() builds a fresh argv for the interpreter before it knows whether the
+ * interpreter is there; when it is not, that array is released — and it used to
+ * be released TWICE, because the failure path freed it and then tested the same
+ * pointer and freed it again. Nothing is visible from userspace at the moment
+ * it happens: the array goes onto the free list twice and the damage surfaces
+ * later, in whatever allocation next receives it.
+ *
+ * So the test is a volume test. Two hundred failed execs put two hundred
+ * doubly-freed arrays into the kernel heap, and the heap's own canary check
+ * panics on the first one it notices — a machine that is still running
+ * afterwards, and still allocating, did not double-free them. The exec has to
+ * fail for the right reason too, or the loop is measuring nothing. */
+static void test_shebang_missing_interp(void) {
+  const char *path = "/tmp/m46badsh.sh";
+  unlink(path);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+  if (fd < 0) {
+    fail("bad-shebang-create", errno, 0);
+    return;
+  }
+  const char *script = "#!/nonexistent/interpreter -x\necho never\n";
+  write(fd, script, strlen(script));
+  close(fd);
+  chmod(path, 0755);
+
+  int failures = 0;
+  for (int i = 0; i < 200; i++) {
+    pid_t pid = fork();
+    if (pid == 0) {
+      char arg1[] = "one";
+      char *argv[] = {(char *)path, arg1, 0};
+      char *envp[] = {0};
+      execve(path, argv, envp);
+      /* 66 rather than 127: it says "execve returned", not "the shell could
+       * not find the command", and nothing else in this suite uses it. */
+      _exit(66);
+    }
+    int st2 = 0;
+    waitpid(pid, &st2, 0);
+    if (WIFEXITED(st2) && WEXITSTATUS(st2) == 66)
+      failures++;
+  }
+  unlink(path);
+
+  /* The heap still works after all that. A doubly-freed block is only a
+   * problem once it is handed out again, so ask for a few hundred of them. */
+  int alloc_ok = 1;
+  for (int i = 0; i < 256; i++) {
+    int probe = open("/tmp", O_RDONLY | O_DIRECTORY);
+    if (probe < 0) {
+      alloc_ok = 0;
+      break;
+    }
+    close(probe);
+  }
+  if (failures == 200 && alloc_ok)
+    ok("bad-shebang-exec");
+  else
+    fail("bad-shebang-exec", failures, alloc_ok);
+}
+
+/* Reopening a descriptor through /proc/self/fd/<n> is an OPEN, not a dup.
+ *
+ * The distinction is the whole reason userspace uses that path: an O_PATH
+ * descriptor names a file without opening its contents and cannot be read, and
+ * `open("/proc/self/fd/N", O_RDONLY)` is how a program turns one into a
+ * descriptor it can read. b1nix duplicated the open file description instead
+ * and discarded the flags, so the new descriptor was O_PATH as well and every
+ * read of it answered EBADF -- which is how systemd 261 came to read none of
+ * its own configuration files.
+ *
+ * Three things are checked, because "it can be read" alone would also pass on
+ * a plain dup of a readable descriptor:
+ *   1. an O_PATH reference reopens into something readable, with the right
+ *      contents;
+ *   2. the two descriptors have INDEPENDENT file offsets, which a dup would
+ *      not -- this is what says a new open file description was made;
+ *   3. the reopened descriptor outlives the one it came from.
+ */
+#ifndef O_PATH
+#define O_PATH 010000000
+#endif
+static void test_proc_fd_reopen(void) {
+  const char *path = "/tmp/m46reopen.txt";
+  const char *body = "b1nix-reopen-probe";
+  unlink(path);
+  int w = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (w < 0) {
+    fail("procfd-reopen-create", errno, 0);
+    return;
+  }
+  write(w, body, strlen(body));
+  close(w);
+
+  int pfd = open(path, O_PATH | O_CLOEXEC);
+  if (pfd < 0) {
+    fail("procfd-reopen-opath", errno, 0);
+    unlink(path);
+    return;
+  }
+  /* An O_PATH descriptor must NOT be readable. If this ever succeeds the test
+   * below proves nothing, because there would be no upgrade to perform. */
+  char scratch[8];
+  ssize_t bad = read(pfd, scratch, sizeof(scratch));
+  int opath_refuses = (bad < 0 && errno == EBADF);
+
+  char procpath[64];
+  snprintf(procpath, sizeof(procpath), "/proc/self/fd/%d", pfd);
+  int rfd = open(procpath, O_RDONLY | O_CLOEXEC);
+  if (rfd < 0) {
+    fail("procfd-reopen-open", errno, 0);
+    close(pfd);
+    unlink(path);
+    return;
+  }
+  /* The source goes away first: a reopened descriptor is independent of it. */
+  close(pfd);
+
+  char buf[64];
+  memset(buf, 0, sizeof(buf));
+  ssize_t n = read(rfd, buf, sizeof(buf) - 1);
+  int content_ok = (n == (ssize_t)strlen(body) && strcmp(buf, body) == 0);
+
+  /* Independent offsets. A dup would share one, so a second reopen would
+   * continue where the first left off instead of starting at the beginning. */
+  snprintf(procpath, sizeof(procpath), "/proc/self/fd/%d", rfd);
+  int rfd2 = open(procpath, O_RDONLY | O_CLOEXEC);
+  int offset_independent = 0;
+  if (rfd2 >= 0) {
+    char buf2[64];
+    memset(buf2, 0, sizeof(buf2));
+    ssize_t n2 = read(rfd2, buf2, sizeof(buf2) - 1);
+    offset_independent = (n2 == (ssize_t)strlen(body) &&
+                          strcmp(buf2, body) == 0);
+    close(rfd2);
+  }
+  close(rfd);
+  unlink(path);
+
+  if (opath_refuses && content_ok && offset_independent)
+    ok("procfd-reopen");
+  else
+    fail("procfd-reopen", (long)((opath_refuses << 2) | (content_ok << 1) |
+                                 offset_independent),
+         7);
+}
+
 static void *exit_group_thread(void *arg) {
   (void)arg;
   for (;;) {
@@ -1024,6 +1174,8 @@ int main(void) {
   test_append_atomic();
   test_truncate_zeros();
   test_shebang();
+  test_shebang_missing_interp();
+  test_proc_fd_reopen();
   test_exit_group();
   test_resuid_resgid();
   test_waitid();

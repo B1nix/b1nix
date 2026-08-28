@@ -216,6 +216,121 @@ int unix_init_state(struct vfs_socket_state *s) {
  * unix_free_state exactly as a path-connected pair would (waking the survivor,
  * releasing any in-flight SCM_RIGHTS handles). Both states must already be
  * AF_UNIX with unix_init_state run. */
+
+/*
+ * The abstract namespace.
+ *
+ * An AF_UNIX address whose sun_path starts with a NUL byte names a socket that
+ * has no filesystem entry at all: the name is the bytes after that NUL, it is
+ * not NUL-terminated, and its length comes from the caller's addrlen. Linux has
+ * had this since 2.2 and a great deal of software assumes it -- D-Bus offers
+ * `unix:abstract=`, X11 uses it, and util-linux's agetty reaches its reload
+ * socket that way, which is where this gap surfaced: every path here treated
+ * sun_path as a filesystem path, so an abstract address became a lookup of the
+ * empty string and every connect answered "cannot connect on UNIX socket".
+ *
+ * These cannot live in the VFS -- they have no name there and vanish with the
+ * socket rather than with a file -- so they get their own table. The name is
+ * kept with its length because it may contain NULs and is compared bytewise.
+ */
+#define UNIX_ABSTRACT_MAX 64
+#define UNIX_ABSTRACT_NAME_MAX 107
+
+struct unix_abstract_bind {
+  struct vfs_socket_state *owner;
+  u16 len; /* bytes of `name` in use, not counting the leading NUL */
+  char name[UNIX_ABSTRACT_NAME_MAX];
+  int used;
+};
+
+static struct unix_abstract_bind g_abstract[UNIX_ABSTRACT_MAX];
+static spinlock_t g_abstract_lock = SPINLOCK_INIT;
+
+/* An address is abstract when addrlen covers at least one byte of sun_path and
+ * that byte is NUL. addrlen shorter than that is the "unnamed" form, which is
+ * neither abstract nor a path. */
+static int unix_addr_is_abstract(const struct b1nix_sockaddr_un *addr,
+                                 usize addrlen) {
+  usize hdr = sizeof(u16); /* sun_family */
+
+  return addr && addrlen > hdr && addr->sun_path[0] == '\0';
+}
+
+static usize unix_abstract_len(usize addrlen) {
+  usize hdr = sizeof(u16) + 1; /* sun_family + the leading NUL */
+  usize n;
+
+  if (addrlen <= hdr)
+    return 0;
+  n = addrlen - hdr;
+  return n > UNIX_ABSTRACT_NAME_MAX ? UNIX_ABSTRACT_NAME_MAX : n;
+}
+
+static int unix_abstract_bind(struct vfs_socket_state *s,
+                              const struct b1nix_sockaddr_un *addr,
+                              usize addrlen) {
+  usize n = unix_abstract_len(addrlen);
+  u64 flags;
+  int free_slot = -1;
+
+  spin_lock_irqsave(&g_abstract_lock, &flags);
+  for (int i = 0; i < UNIX_ABSTRACT_MAX; i++) {
+    if (!g_abstract[i].used) {
+      if (free_slot < 0)
+        free_slot = i;
+      continue;
+    }
+    if (g_abstract[i].len == n &&
+        memcmp(g_abstract[i].name, addr->sun_path + 1, n) == 0) {
+      spin_unlock_irqrestore(&g_abstract_lock, flags);
+      return -EADDRINUSE;
+    }
+  }
+  if (free_slot < 0) {
+    spin_unlock_irqrestore(&g_abstract_lock, flags);
+    return -ENOMEM;
+  }
+  g_abstract[free_slot].owner = s;
+  g_abstract[free_slot].len = (u16)n;
+  memcpy(g_abstract[free_slot].name, addr->sun_path + 1, n);
+  g_abstract[free_slot].used = 1;
+  spin_unlock_irqrestore(&g_abstract_lock, flags);
+  return 0;
+}
+
+static struct vfs_socket_state *
+unix_abstract_lookup(const struct b1nix_sockaddr_un *addr, usize addrlen) {
+  usize n = unix_abstract_len(addrlen);
+  struct vfs_socket_state *found = 0;
+  u64 flags;
+
+  spin_lock_irqsave(&g_abstract_lock, &flags);
+  for (int i = 0; i < UNIX_ABSTRACT_MAX; i++) {
+    if (g_abstract[i].used && g_abstract[i].len == n &&
+        memcmp(g_abstract[i].name, addr->sun_path + 1, n) == 0) {
+      found = g_abstract[i].owner;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&g_abstract_lock, flags);
+  return found;
+}
+
+/* An abstract name lives exactly as long as the socket that bound it. */
+void unix_abstract_release(struct vfs_socket_state *s) {
+  u64 flags;
+
+  spin_lock_irqsave(&g_abstract_lock, &flags);
+  for (int i = 0; i < UNIX_ABSTRACT_MAX; i++) {
+    if (g_abstract[i].used && g_abstract[i].owner == s) {
+      g_abstract[i].used = 0;
+      g_abstract[i].owner = 0;
+      g_abstract[i].len = 0;
+    }
+  }
+  spin_unlock_irqrestore(&g_abstract_lock, flags);
+}
+
 void unix_link_pair(struct vfs_socket_state *a, struct vfs_socket_state *b) {
   struct unix_socket_data *ua = (struct unix_socket_data *)a->unix_data;
   struct unix_socket_data *ub = (struct unix_socket_data *)b->unix_data;
@@ -244,6 +359,8 @@ void unix_free_state(struct vfs_socket_state *s) {
    * inode->data, and after the kfree(s) below that's a UAF → GP fault (seen
    * as clients connecting to a crashed displayd's stale socket). Cleared
    * only if it still points at us — a new socket may have rebound the path. */
+  unix_abstract_release(s);
+
   if (s->bound && s->local.un.sun_path[0]) {
     struct vfs_node *bn = vfs_find_node(s->local.un.sun_path);
     if (!IS_ERR(bn)) {
@@ -388,14 +505,27 @@ int unix_peer_cred(struct vfs_socket_state *s, struct b1nix_ucred *out) {
   return 0;
 }
 
-int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr) {
+int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr,
+              usize addrlen) {
   if (s->bound) return -EINVAL;
-  
+
+  /* An abstract name has no filesystem entry to create. */
+  if (unix_addr_is_abstract(addr, addrlen)) {
+    int r = unix_abstract_bind(s, addr, addrlen);
+    if (r < 0)
+      return r;
+    s->local.un = *addr;
+    s->local_un_len = addrlen;
+    s->bound = 1;
+    return 0;
+  }
+
   /* Create VFS node */
   struct vfs_node *node = vfs_add_node(addr->sun_path, VFS_SOCKET, s, 0, 0);
   if (IS_ERR(node)) return (int)PTR_ERR(node);
   
   s->local.un = *addr;
+  s->local_un_len = addrlen;
   s->bound = 1;
   return 0;
 }
@@ -410,7 +540,7 @@ int unix_listen(struct vfs_socket_state *s, int backlog) {
 }
 
 int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr,
-                 int nonblock) {
+                 usize addrlen, int nonblock) {
   /* Kept for the caller's shape, and deliberately unused: a local connection
    * completes within this call whether or not the socket blocks. */
   (void)nonblock;
@@ -428,26 +558,72 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
    * others, and "the same socket answers other calls quickly" is a claim about
    * which path a given invocation took -- not something to assume.
    * b1nix.trace-unix-connect names it, with the caller, for every connect. */
-  if (bootinfo_has_flag("b1nix.trace-unix-connect")) {
+  int trace = bootinfo_has_flag("b1nix.trace-unix-connect");
+  if (trace) {
     console_write("UNIX-CONNECT: pid=");
     console_write_dec(current_task ? current_task->id : 0);
     console_write(" comm=");
     console_write(current_task && current_task->name ? current_task->name : "?");
     console_write(" path=");
-    console_write(addr->sun_path);
+    /* An abstract name is not a C string -- it starts with a NUL and its
+     * length comes from addrlen -- so print the readable part after it. */
+    console_write(unix_addr_is_abstract(addr, addrlen) ? "@" : "");
+    console_write(unix_addr_is_abstract(addr, addrlen) ? addr->sun_path + 1
+                                                       : addr->sun_path);
     console_write("\n");
   }
-  struct vfs_node *peer_node = vfs_find_node(addr->sun_path);
-  if (IS_ERR(peer_node)) return -ECONNREFUSED;
-  if (peer_node->inode->type != VFS_SOCKET) { vfs_node_put(peer_node); return -ENOTSOCK; }
-  
-  struct vfs_socket_state *peer_s = (struct vfs_socket_state *)peer_node->inode->data;
+  /* An abstract peer is found in the table rather than the filesystem, and
+   * there is no vfs node to hold a reference on -- the binding lives and dies
+   * with the socket, so `peer_node` stays NULL and every put below is guarded.
+   */
+  struct vfs_node *peer_node = 0;
+  struct vfs_socket_state *peer_s = 0;
+
+  if (unix_addr_is_abstract(addr, addrlen)) {
+    peer_s = unix_abstract_lookup(addr, addrlen);
+    if (!peer_s)
+      return -ECONNREFUSED;
+  } else {
+    peer_node = vfs_find_node(addr->sun_path);
+    if (IS_ERR(peer_node)) {
+      /* A path with nothing at it is ENOENT, not ECONNREFUSED.
+       *
+       * Linux distinguishes the two and callers act on the difference:
+       * ECONNREFUSED means "the socket is there and nobody is listening",
+       * which is a service that is down and may come back, while ENOENT means
+       * there is no such service on this system at all. systemd's userdb
+       * clients take the second as final and the first as worth waiting on. */
+      if (trace) {
+        console_write("UNIX-CONNECT:   -> errno ");
+        console_write_dec((u64)(usize) - (isize)PTR_ERR(peer_node));
+        console_write(" (nothing at that path)\n");
+      }
+      return (int)PTR_ERR(peer_node) == -ENOENT ? -ENOENT : -ECONNREFUSED;
+    }
+    /* A path that exists but is not a socket is ECONNREFUSED on Linux, which
+     * is what its unix_find_other() answers for one. */
+    if (peer_node->inode->type != VFS_SOCKET) {
+      vfs_node_put(peer_node);
+      return -ECONNREFUSED;
+    }
+    peer_s = (struct vfs_socket_state *)peer_node->inode->data;
+    if (trace) {
+      /* What was found there, and whether anyone is listening on it. A trace
+       * of connects that does not say what the far end was cannot tell "the
+       * service is down" from "this kernel handed the client something else". */
+      console_write("UNIX-CONNECT:   node=");
+      console_write(peer_node->name);
+      console_write(" listening=");
+      console_write_dec((u64)(peer_s && peer_s->listening));
+      console_write("\n");
+    }
+  }
   /* The socket file outlives its socket: after the owner closes (or crashes),
    * teardown clears inode->data. Linux semantics: ECONNREFUSED, not a deref. */
-  if (!peer_s) { vfs_node_put(peer_node); return -ECONNREFUSED; }
+  if (!peer_s) { if (peer_node) vfs_node_put(peer_node); return -ECONNREFUSED; }
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
   struct unix_socket_data *peer_u = (struct unix_socket_data *)peer_s->unix_data;
-  if (!peer_u) { vfs_node_put(peer_node); return -ECONNREFUSED; }
+  if (!peer_u) { if (peer_node) vfs_node_put(peer_node); return -ECONNREFUSED; }
   /* Hold the listener's endpoint for as long as this connect uses it.
    *
    * Finding it and using it are not one step: the checks below, the allocation
@@ -470,7 +646,7 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
    * it writes its message, waits for the daemon to close the connection, and
    * waits out its timeout against a daemon that never received one. */
   if (s->type == B1NIX_SOCK_STREAM || s->type == B1NIX_SOCK_SEQPACKET) {
-    if (!peer_s->listening) { vfs_node_put(peer_node); unix_data_put(peer_u); return -ECONNREFUSED; }
+    if (!peer_s->listening) { if (peer_node) vfs_node_put(peer_node); unix_data_put(peer_u); return -ECONNREFUSED; }
 
     /*
      * The far endpoint is built here, by the connector, and the pair is linked
@@ -489,10 +665,10 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
      * half-queued connection.
      */
     struct unix_socket_data *srv = kzalloc(sizeof(struct unix_socket_data));
-    if (!srv) { vfs_node_put(peer_node); unix_data_put(peer_u); return -ENOMEM; }
+    if (!srv) { if (peer_node) vfs_node_put(peer_node); unix_data_put(peer_u); return -ENOMEM; }
     srv->rb_size = unix_rb_size();
     srv->rb_buffer = kmalloc(srv->rb_size);
-    if (!srv->rb_buffer) { kfree(srv); vfs_node_put(peer_node); unix_data_put(peer_u); return -ENOMEM; }
+    if (!srv->rb_buffer) { kfree(srv); if (peer_node) vfs_node_put(peer_node); unix_data_put(peer_u); return -ENOMEM; }
     /* SO_PEERCRED on the accepted socket must report the server's identity, so
      * the endpoint inherits it from the listening socket rather than from the
      * process that happens to be connecting. */
@@ -531,7 +707,7 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
       unix_data_put(u);   /* the endpoint's reference on the connector */
       kfree(srv->rb_buffer);
       kfree(srv);
-      vfs_node_put(peer_node);
+      if (peer_node) vfs_node_put(peer_node);
       unix_data_put(peer_u); return -ECONNREFUSED;
     }
     peer_u->backlog[peer_u->backlog_count++] = srv;
@@ -552,7 +728,7 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
     u->had_peer = 1;
   }
 
-  vfs_node_put(peer_node);
+  if (peer_node) vfs_node_put(peer_node);
   unix_data_put(peer_u); /* the reference taken at lookup */
   return 0;
 }

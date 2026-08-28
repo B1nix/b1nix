@@ -57,6 +57,19 @@ void namespace_task_exit(usize pid);
  * zombie still has to be nameable by the parent that is about to wait for it. */
 void namespace_task_reaped(usize pid);
 
+/* clone(CLONE_NEW*): prepare the namespaces the caller's NEXT child is born
+ * into, then let namespace_fork_inherit stamp them onto it. Called by the
+ * parent before the fork, because the child is runnable the moment the fork
+ * returns and a mount-table copy cannot be made in the fork's tail.
+ *
+ * Covers CLONE_NEWNS, CLONE_NEWUTS and CLONE_NEWNET. CLONE_NEWPID is refused
+ * by the caller instead: on clone it means "this child is pid 1 of a new
+ * numbering", which is a different operation from what unshare(2) does here,
+ * and a wrong pid namespace is worse than an honest refusal. */
+int namespace_child_prepare(u64 flags);
+/* The fork failed; release what was prepared for a child that will not exist. */
+void namespace_child_prepare_abort(void);
+
 /* unshare(2) / setns(2) backends. Both act on the calling task. */
 int namespace_unshare(u64 flags);
 /* Join namespace `id` of kind `kind` — the pair a /proc/<pid>/ns/<kind>

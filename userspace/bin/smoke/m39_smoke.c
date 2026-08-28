@@ -6,6 +6,7 @@
  * injected with TIOCSTI (Linux semantics: byte enters the input queue as if
  * typed, travelling the full canonical/ISIG path).
  */
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -18,6 +19,13 @@
 #endif
 #ifndef TIOCSCTTY
 #define TIOCSCTTY 0x540E
+#endif
+/* The termios2 family. musl declares neither the requests nor the struct. */
+#ifndef TCGETS2
+#define TCGETS2 0x802C542A
+#endif
+#ifndef TCSETS2
+#define TCSETS2 0x402C542B
 #endif
 
 static void inject(int fd, const char *s) {
@@ -115,6 +123,76 @@ int main(void) {
 
   /* TIOCSCTTY: a session leader can claim the tty (getty relies on it). */
   mark(ioctl(sfd, TIOCSCTTY, 0) == 0, "tty-sctty");
+
+  /* ── termios2 ─────────────────────────────────────────────────────────────
+   *
+   * TCGETS2/TCSETS2 carry the same four flag words plus explicit c_ispeed and
+   * c_ospeed. They are checked here rather than through tcgetattr(3) because
+   * musl still issues the 0x5401 family: it is glibc from 2.42 onwards that
+   * uses termios2 for EVERY tcgetattr and tcsetattr call, and isatty(3) is
+   * tcgetattr succeeding -- so on a kernel that refuses TCGETS2 a glibc
+   * program has no terminals at all. The way that showed up was a stock Arch
+   * systemd opening /dev/console, being refused, closing it and having
+   * nowhere left to print the reason it then gave up.
+   *
+   * The struct is written out by hand for the same reason: musl's <termios.h>
+   * does not declare termios2, and the point is the wire layout the kernel
+   * sees, not whatever a header would build. */
+  struct k_termios2 {
+    unsigned int c_iflag, c_oflag, c_cflag, c_lflag;
+    unsigned char c_line;
+    unsigned char c_cc[19];
+    unsigned int c_ispeed, c_ospeed;
+  };
+  struct k_termios2 t2, t2b;
+  struct termios t1;
+  memset(&t2, 0, sizeof(t2));
+  int g2 = ioctl(sfd, TCGETS2, &t2);
+  /* The two views must agree about the line: same flag words, and a speed the
+   * serial port actually runs at rather than a zero-filled buffer. */
+  mark(g2 == 0 && tcgetattr(sfd, &t1) == 0 && t2.c_iflag == t1.c_iflag &&
+           t2.c_oflag == t1.c_oflag && t2.c_cflag == t1.c_cflag &&
+           t2.c_lflag == t1.c_lflag && t2.c_ospeed != 0 &&
+           t2.c_ispeed == t2.c_ospeed,
+       "tty-tcgets2");
+
+  /* TCSETS2 has to take: a set that is not read back is a set that did not
+   * happen, and tcsetattr(3) on a current glibc is exactly this call. */
+  int s2 = -1;
+  if (g2 == 0) {
+    t2b = t2;
+    t2b.c_lflag = 0;
+    s2 = ioctl(sfd, TCSETS2, &t2b);
+    struct k_termios2 back;
+    memset(&back, 0, sizeof(back));
+    int rb = ioctl(sfd, TCGETS2, &back);
+    mark(s2 == 0 && rb == 0 && back.c_lflag == 0 &&
+             back.c_ospeed == t2.c_ospeed,
+         "tty-tcsets2");
+    ioctl(sfd, TCSETS2, &t2); /* put the line back as it was */
+  } else {
+    mark(0, "tty-tcsets2");
+  }
+
+  /* The boot console answers it too. That is the fd an init system logs to,
+   * and it is a different code path from ttyS0's. */
+  {
+    struct k_termios2 c2;
+    memset(&c2, 0, sizeof(c2));
+    mark(ioctl(0, TCGETS2, &c2) == 0, "console-tcgets2");
+  }
+
+  /* An ioctl the console does not implement is ENOTTY, not EPERM. A program
+   * probing for an optional ioctl treats "not permitted" as a real refusal
+   * worth reporting or giving up over; "not a typewriter" is the answer that
+   * means "this device simply has no such request". 0x5480 is in the tty
+   * range and is not a request b1nix implements. */
+  {
+    char scratch[64];
+    errno = 0;
+    int rc = ioctl(0, 0x5480, scratch);
+    mark(rc < 0 && errno == ENOTTY, "console-unknown-ioctl-enotty");
+  }
 
   /* Real TX: this marker reaches the smoke log through the ttyS0 write path
    * (OPOST + UART), not through the console. */

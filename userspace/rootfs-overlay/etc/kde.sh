@@ -737,22 +737,32 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 
 	KWIN_SOCK=wayland-1
 	wait_kwin_socket
-	memsnap "kwin-up"
-	memsnap_loop &
-	__memloop=$!
+	# The memory profiler, behind a flag now that it has done its job.
+	#
+	# It found the allocator bug it was written for (the kernel heap never
+	# split a block it reused), and it is not free: the loop spawns cat, tr,
+	# sort and head every five seconds for the whole run, which is a
+	# measurable part of the time to a drawn desktop on a machine this slow.
+	# Kept, because the next memory question will want it, and off by default
+	# because the current one is answered.
+	if has_flag b1nix.kde-memprof; then
+		memsnap "kwin-up"
+		memsnap_loop &
+		__memloop=$!
+	fi
 	start_plasma
-	memsnap "plasma-started"
+	has_flag b1nix.kde-memprof && memsnap "plasma-started"
 
 	# The picture is taken from OUTSIDE, with the QEMU monitor's screendump on
 	# the scanout kwin programmed -- nothing in the guest produces it, so nothing
 	# in the guest can fake it. These two markers bracket the window in which the
 	# framebuffer is worth capturing; the host watches the serial log for them.
-	memsnap "scanout-ready"
+	has_flag b1nix.kde-memprof && memsnap "scanout-ready"
 	echo "KDE: SCANOUT-READY t=$(up)"
 	sleep 90
 	echo "KDE: SCANOUT-END t=$(up)"
-	memsnap "scanout-end"
-	kill $__memloop 2>/dev/null
+	has_flag b1nix.kde-memprof && memsnap "scanout-end"
+	[ -n "${__memloop:-}" ] && kill $__memloop 2>/dev/null
 	# The DRM backend's own account first and in full: the head of the log is
 	# Qt's plugin inventory, hundreds of lines that push every line about outputs,
 	# connectors and page flips past any cut.

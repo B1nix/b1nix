@@ -1488,7 +1488,14 @@ SMOKE_CMDLINE_openrc=init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest b1
 SMOKE_CMDLINE_init=b1nix.test=1 b1nix.smoke=init
 # M109: the initramfs stays /, and /init (an initramfs binary) mounts the real
 # root and hands over with switch_root.
-SMOKE_CMDLINE_switchroot=b1nix.test=1 b1nix.smoke=switchroot root=initramfs init=/init
+#
+# init= names /init-shebang, a two-line file whose interpreter line points at
+# /init. The program that runs is the same one; what the detour tests is that
+# `init=` can name a script at all, which it could not — the ELF loader saw
+# "#!" as a bad magic number and the machine came up with no PID 1. Every M109
+# marker below therefore also stands as evidence that the interpreter line
+# resolved.
+SMOKE_CMDLINE_switchroot=b1nix.test=1 b1nix.smoke=switchroot root=initramfs init=/init-shebang
 
 # Hardware-passthrough instance, beside the smoke ISOs rather than instead of
 # the ordinary one.

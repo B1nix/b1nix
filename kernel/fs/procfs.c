@@ -1855,6 +1855,7 @@ static isize procfs_fdinfo_read(struct vfs_node *node, u64 offset, char *buffer,
   u32 oflags = 0;
   char path[VFS_MAX_PATH];
   int open_fd = 0;
+  usize pidfd_pid = 0;
   path[0] = '\0';
   u64 irq;
   spin_lock_irqsave(&t->fd_lock, &irq);
@@ -1864,6 +1865,7 @@ static isize procfs_fdinfo_read(struct vfs_node *node, u64 offset, char *buffer,
     open_fd = 1;
     pos = h->offset;
     oflags = (u32)h->flags;
+    pidfd_pid = vfs_pidfd_pid(h);
     if (h->open_path && h->open_path[0])
       snprintf(path, sizeof(path), "%s", h->open_path);
   }
@@ -1875,9 +1877,22 @@ static isize procfs_fdinfo_read(struct vfs_node *node, u64 offset, char *buffer,
    * mount table and must not run with interrupts disabled. */
   int mnt_id = path[0] ? vfs_mount_id_for_path(path) : 0;
 
-  char text[128];
-  int n = snprintf(text, sizeof(text), "pos:\t%lu\nflags:\t0%o\nmnt_id:\t%d\n",
-                   (unsigned long)pos, (unsigned)oflags, mnt_id);
+  char text[192];
+  int n;
+  if (pidfd_pid) {
+    /* A pidfd's fdinfo carries the pid it refers to, and that line is not
+     * decoration: it is how a caller reads a pidfd back into a pid at all.
+     * systemd's pidfd_get_pid() parses exactly this file, and uses the answer
+     * to check that the pid it remembers still belongs to the process the
+     * descriptor holds. */
+    n = snprintf(text, sizeof(text),
+                 "pos:\t%lu\nflags:\t0%o\nmnt_id:\t%d\nPid:\t%lu\nNSpid:\t%lu\n",
+                 (unsigned long)pos, (unsigned)oflags, mnt_id,
+                 (unsigned long)pidfd_pid, (unsigned long)pidfd_pid);
+  } else {
+    n = snprintf(text, sizeof(text), "pos:\t%lu\nflags:\t0%o\nmnt_id:\t%d\n",
+                 (unsigned long)pos, (unsigned)oflags, mnt_id);
+  }
   if (n < 0)
     return 0;
   usize len = (usize)n;

@@ -950,6 +950,34 @@ void cgroup_task_exit(usize pid) {
     cg_events_refresh();
 }
 
+/* clone3(CLONE_INTO_CGROUP): the child is born in the cgroup this descriptor
+ * names. See the header for why a kernel that refuses the flag cannot start a
+ * systemd service at all.
+ *
+ * The descriptor has to be a cgroup2 DIRECTORY: those are the only nodes whose
+ * inode data is a struct cgroup, and a descriptor on one of the control files
+ * inside it names a file, not a group. */
+int cgroup_attach_pid_at_fd(int fd, usize pid) {
+  if (!cg_root)
+    return -EINVAL;
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h || h->kind != VFS_HANDLE_NODE || !h->node)
+    return -EBADF;
+  struct vfs_node *dir = h->node;
+  if (!dir->inode || dir->inode->type != VFS_DIRECTORY)
+    return -ENOTDIR;
+  /* Only a node this filesystem made carries a struct cgroup in inode->data,
+   * and its mkdir hook is what says it is one of ours -- a plain directory on
+   * some other filesystem would otherwise have its inode data read as a
+   * cgroup pointer. */
+  if (dir->inode->mkdir_cb != cg_mkdir_cb)
+    return -EINVAL;
+  struct cgroup *cg = (struct cgroup *)dir->inode->data;
+  if (!cg)
+    return -EINVAL;
+  return cg_attach_process(cg, pid, 0);
+}
+
 int cgroup_fork_allowed(usize parent_pid) {
   if (!cg_root)
     return 0;

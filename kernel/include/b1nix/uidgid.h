@@ -52,6 +52,16 @@ struct cred {
      * nothing raises it, so a dropped capability stays dropped even across a
      * return to euid 0 (which otherwise re-grants the full set). */
     u64  cap_bounding;
+    /* Ambient set (Linux 4.3): the capabilities a non-setuid execve keeps.
+     * A capability may only be ambient while it is BOTH permitted and
+     * inheritable, and losing either drops it from here too.
+     *
+     * It is not an optional refinement. systemd applies an ambient set before
+     * every process it spawns, and `prctl(PR_CAP_AMBIENT, ...)` answering
+     * EINVAL is reported as "Failed to apply the starting ambient set" -- a
+     * fatal error for the spawn, so with no ambient set at all not one unit
+     * on the machine can be started. */
+    u64  cap_ambient;
     /* securebits(7): how the kernel adjusts capabilities across a uid change.
      * Zero is Linux's default and what this kernel did unconditionally before
      * the field existed. systemd reads them for every service it starts —

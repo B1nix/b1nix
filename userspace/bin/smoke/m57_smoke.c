@@ -651,6 +651,109 @@ static void test_mojo_broker(void) {
  *   - a call given a capacity larger than the address writes only the address,
  *     leaving the bytes past it untouched.
  */
+/* The abstract namespace: an AF_UNIX address whose sun_path starts with a NUL.
+ *
+ * The name is the bytes AFTER that NUL, it is not NUL-terminated, and its
+ * length comes from addrlen -- so a kernel that treats sun_path as a path
+ * looks up the empty string and refuses every connect. That is what this
+ * kernel did, and it is why util-linux's agetty printed "cannot connect on
+ * UNIX socket" twice on every Debian boot. D-Bus (`unix:abstract=`) and X11
+ * want the same thing.
+ *
+ * The name here carries an embedded NUL on purpose: an abstract name is
+ * compared bytewise over addrlen, so a kernel comparing it as a C string would
+ * match two different names and pass everything else in this test. */
+static void test_unix_abstract(void) {
+  static const char nm[] = "b1nix\0abs";
+  const size_t nmlen = sizeof(nm) - 1; /* keep the embedded NUL, drop the tail */
+  struct sockaddr_un a;
+  socklen_t alen;
+
+  memset(&a, 0, sizeof(a));
+  a.sun_family = AF_UNIX;
+  a.sun_path[0] = '\0';
+  memcpy(a.sun_path + 1, nm, nmlen);
+  alen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + nmlen);
+
+  int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (srv < 0) {
+    fail("unix-abstract", errno, 0);
+    return;
+  }
+  if (bind(srv, (struct sockaddr *)&a, alen) != 0) {
+    fail("unix-abstract-bind", errno, 0);
+    close(srv);
+    return;
+  }
+  /* There is deliberately no filesystem assertion here. An abstract name has
+   * no path to look for, so the only thing that could be checked is the empty
+   * string -- which is not this socket's name and answers about something
+   * else entirely. The rebind at the end is what actually proves the binding
+   * is not a file: it succeeds with nothing unlinked. */
+  if (listen(srv, 4) != 0) {
+    fail("unix-abstract-listen", errno, 0);
+    close(srv);
+    return;
+  }
+
+  /* A second bind of the same name must be refused, or the namespace is not a
+   * namespace. */
+  int dup_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  int dup_rc = dup_fd >= 0 ? bind(dup_fd, (struct sockaddr *)&a, alen) : -1;
+  int dup_err = errno;
+  if (dup_fd >= 0)
+    close(dup_fd);
+  if (dup_rc == 0) {
+    fail("unix-abstract-inuse", 0, EADDRINUSE);
+    close(srv);
+    return;
+  }
+  (void)dup_err;
+
+  int cli = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (cli < 0 || connect(cli, (struct sockaddr *)&a, alen) != 0) {
+    fail("unix-abstract-connect", errno, 0);
+    if (cli >= 0) close(cli);
+    close(srv);
+    return;
+  }
+  int acc = accept(srv, NULL, NULL);
+  if (acc < 0) {
+    fail("unix-abstract-accept", errno, 0);
+    close(cli);
+    close(srv);
+    return;
+  }
+  if (write(cli, "hello", 5) != 5) {
+    fail("unix-abstract-write", errno, 0);
+    close(acc); close(cli); close(srv);
+    return;
+  }
+  char buf[8];
+  memset(buf, 0, sizeof(buf));
+  if (read(acc, buf, sizeof(buf)) != 5 || memcmp(buf, "hello", 5) != 0) {
+    fail("unix-abstract-read", 0, 5);
+    close(acc); close(cli); close(srv);
+    return;
+  }
+  ok("unix-abstract");
+
+  close(acc);
+  close(cli);
+  close(srv);
+
+  /* The name dies with the socket -- there is no file to unlink, so if the
+   * binding outlived it the name would be unusable for the rest of the boot. */
+  int again = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (again < 0 || bind(again, (struct sockaddr *)&a, alen) != 0) {
+    fail("unix-abstract-rebind", errno, 0);
+    if (again >= 0) close(again);
+    return;
+  }
+  close(again);
+  ok("unix-abstract-rebind");
+}
+
 static void test_unix_addrlen(void) {
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -766,6 +869,7 @@ int main(int argc, char **argv) {
   test_fd_broker_death();
   test_dupfd_cloexec();
   test_unix_addrlen();
+  test_unix_abstract();
 
   test_mojo_pipe();
   test_mojo_shm();

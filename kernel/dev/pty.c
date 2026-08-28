@@ -410,12 +410,19 @@ static int pty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   u64 f;
 
   switch (request) {
-  case B1NIX_TCGETS: {
+  case B1NIX_TCGETS:
+  /* TCGETS2 is the same question in the layout glibc 2.42 and later ask it in,
+   * and a pty has to answer it: isatty(3) is tcgetattr(3) succeeding, so a
+   * terminal that refuses TCGETS2 is not a terminal to anything linked against
+   * a libc that new. */
+  case B1NIX_TCGETS2: {
     struct b1nix_termios snapshot;
     spin_lock_irqsave(&p->lock, &f);
     snapshot = p->termios;
     spin_unlock_irqrestore(&p->lock, f);
-    return tty_termios_copyout(arg, &snapshot);
+    return tty_is_termios2_get(request)
+               ? tty_termios2_copyout(arg, &snapshot)
+               : tty_termios_copyout(arg, &snapshot);
   }
   /* TCSADRAIN and TCSAFLUSH: there is no output queue to drain and no input
    * queue that outlives the call, so all three are the same operation. They
@@ -424,9 +431,13 @@ static int pty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
    * "Failed to set raw TTY mode". */
   case B1NIX_TCSETSW:
   case B1NIX_TCSETSF:
-  case B1NIX_TCSETS: {
+  case B1NIX_TCSETS:
+  case B1NIX_TCSETS2:
+  case B1NIX_TCSETSW2:
+  case B1NIX_TCSETSF2: {
     struct b1nix_termios want;
-    int rc = tty_termios_copyin(&want, arg);
+    int rc = tty_is_termios2_set(request) ? tty_termios2_copyin(&want, arg)
+                                          : tty_termios_copyin(&want, arg);
     if (rc < 0)
       return rc;
     spin_lock_irqsave(&p->lock, &f);
