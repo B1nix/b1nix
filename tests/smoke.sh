@@ -943,6 +943,31 @@ else
 	fail "CR4.SMEP is set on every online CPU" "${_smep_line:-no smep tally in log}"
 fi
 
+# ── Every core agrees about what a page-table entry means ──
+#
+# CR4 is per-CPU, and two of its bits change the meaning of a page-table entry
+# rather than merely enabling a feature. PGE is the one that bit this kernel:
+# the AP trampoline set it and boot.S did not, so bit 8 of a leaf entry was a
+# flag available to software on the boot CPU and the architectural GLOBAL bit
+# on every other one -- and a global translation is not evicted by a write to
+# CR3, which is the only flush a context switch and tlb_shootdown_all() do. A
+# shared user page therefore kept a live translation on an AP after its address
+# space was destroyed and its frames handed to someone else, and the next
+# process to use that address on that core read and executed the dead one's
+# memory. It showed up as SIGILL and #GP on instructions that were perfectly
+# valid, in processes that had nothing to do with each other.
+#
+# Nothing had ever compared one core's control registers against another's, so
+# the divergence was invisible until its consequences were traced back to it.
+# The kernel now does that comparison at the end of SMP bring-up, and refuses
+# CR4.PGE outright while a software flag lives on bit 8. This is that check.
+if grep -aq "SMP-CPUSTATE: ok " "$LOG" 2>/dev/null; then
+	pass "every CPU's CR0/CR4/XCR0/EFER/PAT match the boot CPU's, PGE off"
+else
+	fail "every CPU's CR0/CR4/XCR0/EFER/PAT match the boot CPU's, PGE off" \
+		"$(grep -a 'SMP-CPUSTATE:' "$LOG" 2>/dev/null | head -3)"
+fi
+
 # ── The boot CPU's kernel stack has room for the boot path ──
 #
 # kernel_main runs every driver probe, every filesystem and network init and,
@@ -2087,7 +2112,7 @@ check_output "$LOG" "M46-SMOKE: ok setresuid-setresgid" "setresuid/setresgid set
 check_output "$LOG" "M46-SMOKE: ok waitid" "waitid waiting for child state transitions works"
 check_output "$LOG" "M46-SMOKE: ok times-getrusage" "times() and getrusage() accounting works"
 check_output "$LOG" "M46-SMOKE: ok orphaned-pgrp" "orphaned process groups with stopped tasks receive SIGHUP+SIGCONT"
-check_output "$LOG" "M46-SMOKE: ok nice-biasing" "nice value biases cooperative stride scheduling"
+check_output "$LOG" "M46-SMOKE: ok nice-applied" "nice() reaches the kernel for both classes and both keep running (the biasing itself is open, M117)"
 check_output "$LOG" "M46-SMOKE: ok dir-mtime-create" "creating an entry marks the containing directory modified"
 check_output "$LOG" "M46-SMOKE: ok dir-mtime-subsecond" "a second change inside the same second still moves the directory's mtime"
 check_output "$LOG" "M46-SMOKE: ok dir-mtime-unlink" "removing an entry marks the containing directory modified"

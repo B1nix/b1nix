@@ -57,7 +57,18 @@ extern u64 g_direct_map_size;
 #define VMM_USER (1ULL << 2)
 #define VMM_ACCESSED (1ULL << 5)
 #define VMM_DIRTY (1ULL << 6)
-#define VMM_SHARED (1ULL << 8)
+/* Software flag: the mapping is shared (MAP_SHARED, shm, a device's frames),
+ * so fork must not turn it into copy-on-write.
+ *
+ * Bit 52, not bit 8. Bit 8 of a leaf entry is the architectural GLOBAL bit,
+ * and a global translation survives every write to CR3 -- including the one a
+ * context switch does and the one every target of tlb_shootdown_all() does.
+ * Marking shared user pages global (which is what putting a software flag on
+ * bit 8 did, on any CPU whose CR4 had PGE set) left their translations alive
+ * on that core after the address space was destroyed and the frames reissued.
+ * Bits 52-58 are ignored by the CPU in every paging-structure entry, which is
+ * what a software flag needs to be. */
+#define VMM_SHARED (1ULL << 52)
 #define VMM_PWT (1ULL << 3)
 #define VMM_PCD (1ULL << 4)
 /* Leaf-PTE PAT bit (bit 7). Only ever set on a 4 KiB PTE — in a PDE/PDPTE the
@@ -123,6 +134,24 @@ extern u64 g_direct_map_size;
 #define VMM_SWAPPED (1ULL << 9) // Custom flag: page is swapped out
 #define VMM_LAZY (1ULL << 10)   // Custom flag: lazy allocation
 #define VMM_COW (1ULL << 11)    // Custom flag: copy-on-write mapping
+
+/* Software flags must live on bits the CPU ignores, or they are not flags --
+ * they are instructions to the MMU that nothing in this kernel meant to give.
+ * Bits 9-11 and 52-58 are the available ones in every paging-structure entry;
+ * bit 8 (GLOBAL) and bit 7 (PAT on a PTE, PS on a directory entry) are not.
+ * VMM_PAT is deliberately architectural and is excluded here. */
+#define VMM_SW_AVAILABLE_BITS                                                  \
+  ((0x7ULL << 9) | (0x7fULL << 52))
+_Static_assert((VMM_SHARED & ~VMM_SW_AVAILABLE_BITS) == 0,
+               "VMM_SHARED must sit on a bit the CPU ignores");
+_Static_assert((VMM_SWAPPED & ~VMM_SW_AVAILABLE_BITS) == 0,
+               "VMM_SWAPPED must sit on a bit the CPU ignores");
+_Static_assert((VMM_LAZY & ~VMM_SW_AVAILABLE_BITS) == 0,
+               "VMM_LAZY must sit on a bit the CPU ignores");
+_Static_assert((VMM_COW & ~VMM_SW_AVAILABLE_BITS) == 0,
+               "VMM_COW must sit on a bit the CPU ignores");
+_Static_assert((VMM_SHARED & (VMM_SWAPPED | VMM_LAZY | VMM_COW)) == 0,
+               "software page-table flags must not overlap");
 #define SWAP_BLOCK_SIZE PAGE_SIZE
 
 struct block_device;

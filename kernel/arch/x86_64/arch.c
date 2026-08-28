@@ -158,6 +158,20 @@ static void x86_tss_init_cpu(int cpu) {
 
 static void x86_tss_init(void) { x86_tss_init_cpu(0); }
 
+/* The ring-0 stack this CPU's TSS names for an entry from ring 3.
+ *
+ * Read-only, and only the fault report uses it. A ring-3 exception frame is
+ * pushed at TSS.rsp0, so if rsp0 does not name the running task's own kernel
+ * stack the frame is not that task's frame -- and every fact read out of it
+ * (the faulting RIP above all) is about some other process. That is not a
+ * distinction a report can make from the frame alone, so it has to ask the
+ * TSS. */
+u64 arch_kernel_stack_of_cpu(int cpu) {
+  if (cpu < 0 || cpu >= (int)MAX_CPUS)
+    return 0;
+  return x86_tss_arr[cpu].rsp0;
+}
+
 /* Named `top` rather than `stack_top`, which is now the boot stack's own
  * symbol declared above and would be shadowed here. */
 void arch_set_kernel_stack(u64 top) {
@@ -571,6 +585,130 @@ static void x86_enable_sse(void) {
   x86_enable_fsgsbase();
 }
 
+
+/* -- per-CPU control-register census ---------------------------------------
+ *
+ * A page-table entry does not mean the same thing on two CPUs whose CR4
+ * differs, and nothing in the kernel noticed when they did. The AP trampoline
+ * enabled CR4.PGE and boot.S did not, so bit 8 of a leaf entry was a software
+ * flag on the boot CPU and the architectural GLOBAL bit on every other one --
+ * and a global translation is not evicted by a write to CR3, which is the only
+ * flush a context switch and tlb_shootdown_all() perform. Shared user pages
+ * therefore kept working translations on the APs after their address space was
+ * gone and their frames reissued, and the next process to use those addresses
+ * on that core read and executed the dead one's memory.
+ *
+ * The fix is to make the CPUs agree; this is the check that says whether they
+ * do. Each CPU records CR0/CR4/XCR0/EFER as it finishes its own arch init, and
+ * the BSP compares them once the APs are up. Cheap, run once, and it fails
+ * loudly rather than leaving the difference to be found by its consequences. */
+static u64 g_cpu_cr0[MAX_CPUS];
+static u64 g_cpu_cr4[MAX_CPUS];
+static u64 g_cpu_xcr0[MAX_CPUS];
+static u64 g_cpu_efer[MAX_CPUS];
+static u64 g_cpu_pat[MAX_CPUS];
+static u8 g_cpu_state_seen[MAX_CPUS];
+
+void x86_record_cpu_state(int cpu) {
+  u64 cr0, cr4, xcr0 = 0, efer, pat;
+  u32 lo, hi;
+
+  if (cpu < 0 || cpu >= (int)MAX_CPUS)
+    return;
+  __asm__ volatile("movq %%cr0, %0" : "=r"(cr0));
+  __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+  __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080));
+  efer = ((u64)hi << 32) | lo;
+  if (cr4 & (1ULL << 18)) { /* OSXSAVE: XGETBV is only legal once it is set */
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    xcr0 = ((u64)hi << 32) | lo;
+  }
+  /* IA32_PAT, for the same reason CR4 is here rather than a different one.
+   *
+   * PAT is the table a page-table entry's PWT/PCD/PAT bits INDEX. It does not
+   * enable a feature; it decides what those bits mean. Two cores with
+   * different PAT entries read the same PTE as write-back on one and
+   * write-combining or uncacheable on another -- which is the same shape as
+   * the defect this census was written for (CR4.PGE made bit 8 mean two
+   * different things), and would corrupt exactly the device mappings that are
+   * hardest to attribute. */
+  __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x277));
+  pat = ((u64)hi << 32) | lo;
+
+  g_cpu_cr0[cpu] = cr0;
+  g_cpu_cr4[cpu] = cr4;
+  g_cpu_xcr0[cpu] = xcr0;
+  g_cpu_efer[cpu] = efer;
+  g_cpu_pat[cpu] = pat;
+  __atomic_store_n(&g_cpu_state_seen[cpu], 1, __ATOMIC_RELEASE);
+}
+
+static void report_cpu_state_diff(const char *reg, int cpu, u64 bsp, u64 got) {
+  console_write("SMP-CPUSTATE: FAIL ");
+  console_write(reg);
+  console_write(" differs on cpu ");
+  console_write_dec((u64)cpu);
+  console_write(": 0x");
+  console_write_hex64(got);
+  console_write(" vs cpu0 0x");
+  console_write_hex64(bsp);
+  console_write("\n");
+}
+
+/* Returns 1 when every online CPU agrees with the BSP. Prints one marker
+ * either way -- the smoke suite greps for it. */
+int x86_check_cpu_state_uniform(void) {
+  int cpus = g_max_cpus;
+  int ok = 1;
+
+  if (cpus > (int)MAX_CPUS)
+    cpus = (int)MAX_CPUS;
+  if (cpus < 1)
+    cpus = 1;
+  for (int c = 1; c < cpus; c++) {
+    if (!__atomic_load_n(&g_cpu_state_seen[c], __ATOMIC_ACQUIRE))
+      continue; /* never came up; SMP bring-up reports that on its own */
+    if (g_cpu_cr0[c] != g_cpu_cr0[0]) {
+      report_cpu_state_diff("cr0", c, g_cpu_cr0[0], g_cpu_cr0[c]);
+      ok = 0;
+    }
+    if (g_cpu_cr4[c] != g_cpu_cr4[0]) {
+      report_cpu_state_diff("cr4", c, g_cpu_cr4[0], g_cpu_cr4[c]);
+      ok = 0;
+    }
+    if (g_cpu_xcr0[c] != g_cpu_xcr0[0]) {
+      report_cpu_state_diff("xcr0", c, g_cpu_xcr0[0], g_cpu_xcr0[c]);
+      ok = 0;
+    }
+    if (g_cpu_pat[c] != g_cpu_pat[0]) {
+      report_cpu_state_diff("pat", c, g_cpu_pat[0], g_cpu_pat[c]);
+      ok = 0;
+    }
+    if (g_cpu_efer[c] != g_cpu_efer[0]) {
+      report_cpu_state_diff("efer", c, g_cpu_efer[0], g_cpu_efer[c]);
+      ok = 0;
+    }
+  }
+  /* PGE deserves its own line: with it set, bit 8 of a leaf entry stops being
+   * available to software, and this kernel puts a flag there. Uniformity alone
+   * would not catch every CPU having it on. */
+  for (int c = 0; c < cpus; c++) {
+    if (__atomic_load_n(&g_cpu_state_seen[c], __ATOMIC_ACQUIRE) &&
+        (g_cpu_cr4[c] & (1ULL << 7))) {
+      console_write("SMP-CPUSTATE: FAIL cr4.pge set on cpu ");
+      console_write_dec((u64)c);
+      console_write(" (bit 8 of a page-table entry is a software flag here)\n");
+      ok = 0;
+    }
+  }
+  if (ok) {
+    console_write("SMP-CPUSTATE: ok cr0/cr4/xcr0/efer/pat identical on ");
+    console_write_dec((u64)cpus);
+    console_write(" cpu(s), pge off\n");
+  }
+  return ok;
+}
+
 void arch_init(void) {
   x86_tss_init();
   x86_idt_init();
@@ -583,6 +721,7 @@ void arch_init(void) {
   x86_enable_sse();
   /* M98: program this CPU's IA32_PAT so VMM_WC means write-combining. */
   pat_init_cpu();
+  x86_record_cpu_state(0);
   __asm__ volatile("sti");
   console_write("arch: x86_64 initialized (syscalls enabled)\n");
 }
@@ -627,6 +766,11 @@ void x86_ap_arch_init(int cpu) {
    * actually depended on AP ticks doing anything visible; the shootdown
    * IPI does, which is how the gap surfaced. */
   lapic_init_local();
+
+  /* Everything that touches this CPU's control registers has run. Record them
+   * so the BSP can check that this core and the boot core agree about what a
+   * page-table entry means. */
+  x86_record_cpu_state(cpu);
 }
 
 void arch_halt(void) {

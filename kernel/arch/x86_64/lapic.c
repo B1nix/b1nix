@@ -604,6 +604,39 @@ static void apic_timer_calibrate_against_pit(void) {
     console_write(arch_tsc_clock_ready() ? "TSC\n" : "tick (no invariant TSC)\n");
 }
 
+/* AP kernel stacks: size, and the paint that makes their use measurable.
+ *
+ * Same size as the boot CPU's stack, for the same reason -- the deepest paths
+ * in this kernel are the same on any CPU. The paint is a byte the stack is
+ * filled with before the AP starts; how much of it survives is how much of the
+ * stack was never touched, which is the only honest way to answer "is this big
+ * enough" and the thing whose absence let 16 KiB stand. */
+#define AP_KSTACK_SIZE  262144u
+#define AP_KSTACK_PAINT 0x5a
+
+static u64 ap_kstack_base[MAX_CPUS];
+
+/* Bytes of the deepest CPU's stack that were ever used, and its total. Returns
+ * 0 when no AP has been brought up. */
+u64 ap_stack_peak(u64 *total_out) {
+  u64 worst = 0;
+
+  if (total_out)
+    *total_out = AP_KSTACK_SIZE;
+  for (int c = 0; c < (int)MAX_CPUS; c++) {
+    const u8 *b = (const u8 *)(usize)ap_kstack_base[c];
+    if (!b)
+      continue;
+    u64 clean = 0;
+    while (clean < AP_KSTACK_SIZE && b[clean] == AP_KSTACK_PAINT)
+      clean++;
+    u64 used = AP_KSTACK_SIZE - clean;
+    if (used > worst)
+      worst = used;
+  }
+  return worst;
+}
+
 /* Bring up Application Processors.
  * Returns number of CPUs successfully brought up (including BSP). */
 int smp_boot_aps(void) {
@@ -719,10 +752,24 @@ int smp_boot_aps(void) {
         pcpu->cpu_id = cpu_id;
         pcpu->apic_id = apic_id;
 
-        /* Allocate kernel stack */
-        void *stack = kmalloc(16384);
+        /* Allocate kernel stack.
+         *
+         * 16 KiB was far too small and the third instance of the same defect:
+         * the boot CPU's stack needed 256 KiB (it peaked at 103 KiB on the
+         * widest device tree), and the syscall path alone carries a
+         * 28,584-byte frame -- nearly twice this whole stack. An AP that
+         * overflowed ran off the end of a kmalloc block into whatever the heap
+         * had next, silently, which is what corruption of an unrelated
+         * process's state looks like from userspace. APs exist only on SMP,
+         * which is why the symptom only ever appeared there.
+         *
+         * Painted so the depth actually reached can be measured rather than
+         * assumed; ap_stack_peak() reports it. */
+        void *stack = kmalloc(AP_KSTACK_SIZE);
         if (!stack) { kfree(pcpu_raw); console_write("smp: stack alloc failed\n"); continue; }
-        u64 stack_top = ((u64)(usize)stack + 16384) & ~0xFULL;
+        memset(stack, AP_KSTACK_PAINT, AP_KSTACK_SIZE);
+        ap_kstack_base[cpu_id] = (u64)(usize)stack;
+        u64 stack_top = ((u64)(usize)stack + AP_KSTACK_SIZE) & ~0xFULL;
         pcpu->kernel_stack_virt = stack_top;
 
         /* Index the per-CPU table by the contiguous cpu_id, not the

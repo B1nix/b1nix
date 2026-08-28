@@ -842,6 +842,141 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     }
   }
 
+  /* SMP-FRAME: the things a ring-3 fault report is only true *because of*.
+   *
+   * Every fact this handler prints about a user fault -- the faulting RIP, the
+   * bytes at it, the mapping it fell in -- is read out of a frame the CPU
+   * pushed at TSS.rsp0, through the address space CR3 names, using
+   * `current_task` for the identity. If any of those three is not the running
+   * task's own, the report is internally consistent and about the wrong
+   * process, and nothing in it says so. A #UD on an instruction whose bytes
+   * are then dumped and are correct is exactly what that looks like, so the
+   * invariants get asserted rather than assumed:
+   *
+   *   rsp0    must be this task's kernel_stack_ptr, and the frame must sit
+   *           inside that task's kernel stack;
+   *   cr3     must be this task's PML4, or the fetch that faulted went through
+   *           another process's tables;
+   *   cs/ss   must be the ring-3 pair the kernel installs.
+   *
+   * One snprintf and one serial_write, because two CPUs faulting at once
+   * interleave anything built from several writes -- which would itself
+   * produce a report that pairs one fault's RIP with another's bytes. */
+  if ((frame->cs & 3) == 3) {
+    struct percpu *fp = get_percpu();
+    struct task *ft = current_task;
+    int fcpu = fp ? (int)fp->cpu_id : -1;
+    u64 cr3 = 0, cr4 = 0, xcr0 = 0;
+    u64 rsp0 = arch_kernel_stack_of_cpu(fcpu);
+    u64 ksp = ft ? ft->kernel_stack_ptr : 0;
+    u64 klo = ft && ft->stack ? (u64)(usize)ft->stack : 0;
+    u64 fa = (u64)(usize)frame;
+    char b[320];
+
+    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+    if (cr4 & (1ULL << 18)) {
+      u32 lo, hi;
+      __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+      xcr0 = ((u64)hi << 32) | lo;
+    }
+    snprintf(b, sizeof(b),
+             "SMP-FRAME cpu=%d pid=%u vec=%u cs=%x ss=%x rfl=%x "
+             "cr3=%p pml4=%p rsp0=%p ksp=%p frame=%p kstack=%p "
+             "xcr0=%x cr4=%x%s%s%s%s\n",
+             fcpu, (unsigned)(ft ? ft->id : 0), (unsigned)frame->vector,
+             (unsigned)frame->cs, (unsigned)frame->ss,
+             (unsigned)frame->rflags, (void *)(usize)cr3,
+             (void *)(usize)(ft ? ft->pml4_phys : 0), (void *)(usize)rsp0,
+             (void *)(usize)ksp, (void *)(usize)fa, (void *)(usize)klo,
+             (unsigned)xcr0, (unsigned)cr4,
+             (ft && cr3 != ft->pml4_phys) ? " BAD-CR3" : "",
+             (ft && rsp0 != ksp) ? " BAD-RSP0" : "",
+             (klo && !(fa > klo && fa < klo + 64u * 1024u)) ? " BAD-FRAME" : "",
+             (frame->cs != 0x23 || frame->ss != 0x1B) ? " BAD-SEL" : "");
+    serial_write(b);
+  }
+
+  /* And, for a fault that claims the instruction itself was refused, the bytes
+   * the CPU could have fetched -- read twice.
+   *
+   * Once through the faulting address as userspace sees it, which is what the
+   * dump below does and what a stale translation would answer wrongly; and
+   * once through the kernel's direct map of the physical frame the page tables
+   * actually name, which no TLB entry of the user address can affect. Two
+   * different answers say the translation lied. The same answer, decoding to a
+   * legal instruction, says the frame did. */
+  if ((frame->cs & 3) == 3 && (frame->vector == 6 || frame->vector == 13) &&
+      current_task && current_task->pml4_phys) {
+    u64 pte = paging_user_pte(current_task->pml4_phys,
+                              frame->rip & ~(u64)(PAGE_SIZE - 1));
+    char b[320];
+    char va[64], pa[64];
+    unsigned char op[16];
+    extern int syscall_copyin(void *dst, const void *user_src,
+                              unsigned long size);
+
+    va[0] = pa[0] = 0;
+    if (syscall_copyin(op, (void *)(usize)frame->rip, sizeof(op)) == 0)
+      for (unsigned i = 0; i < sizeof(op); i++)
+        snprintf(va + i * 2, sizeof(va) - i * 2, "%02x", op[i]);
+    if ((pte & VMM_PRESENT) &&
+        (pte & 0x000ffffffffff000ULL) < DIRECT_MAP_SIZE) {
+      const unsigned char *d =
+          (const unsigned char *)(usize)((pte & 0x000ffffffffff000ULL) +
+                                         DIRECT_MAP_BASE +
+                                         (frame->rip & (PAGE_SIZE - 1)));
+      for (unsigned i = 0; i < sizeof(op); i++)
+        snprintf(pa + i * 2, sizeof(pa) - i * 2, "%02x", d[i]);
+    }
+    snprintf(b, sizeof(b), "SMP-CODE rip=%p pte=%p va=[%s] phys=[%s]%s\n",
+             (void *)(usize)frame->rip, (void *)(usize)pte, va, pa,
+             (va[0] && pa[0] && strcmp(va, pa)) ? " MISMATCH" : "");
+    serial_write(b);
+
+    /* When the two disagree, say WHICH flush repairs it -- that is the whole
+     * diagnosis, not a detail.
+     *
+     * A reload of CR3 evicts every translation this CPU holds except the ones
+     * marked GLOBAL; INVLPG evicts the entry for one page whether it is global
+     * or not. So: if the reload leaves the wrong bytes and the INVLPG fixes
+     * them, the entry was global, and no context switch and no
+     * tlb_shootdown_all() (which asks its targets to reload CR3) could ever
+     * have removed it. If the reload already fixes them, it was an ordinary
+     * stale entry and what is missing is a shootdown at whoever changed the
+     * mapping. The two have completely different repairs, and nothing else
+     * distinguishes them from the outside.
+     *
+     * The task is being killed either way, so re-reading its instruction after
+     * two flushes costs nothing and changes nothing else. */
+    if (va[0] && pa[0] && strcmp(va, pa) != 0) {
+      char after_cr3[64], after_invlpg[64];
+      char c[320];
+
+      after_cr3[0] = after_invlpg[0] = 0;
+      paging_reload_cr3();
+      if (syscall_copyin(op, (void *)(usize)frame->rip, sizeof(op)) == 0)
+        for (unsigned i = 0; i < sizeof(op); i++)
+          snprintf(after_cr3 + i * 2, sizeof(after_cr3) - i * 2, "%02x", op[i]);
+      __asm__ volatile("invlpg (%0)"
+                       :
+                       : "r"(frame->rip & ~(u64)(PAGE_SIZE - 1))
+                       : "memory");
+      if (syscall_copyin(op, (void *)(usize)frame->rip, sizeof(op)) == 0)
+        for (unsigned i = 0; i < sizeof(op); i++)
+          snprintf(after_invlpg + i * 2, sizeof(after_invlpg) - i * 2, "%02x",
+                   op[i]);
+      snprintf(c, sizeof(c), "SMP-CODE after-cr3=[%s] after-invlpg=[%s] %s\n",
+               after_cr3, after_invlpg,
+               (strcmp(after_cr3, pa) != 0 && strcmp(after_invlpg, pa) == 0)
+                   ? "GLOBAL-ENTRY (survived a cr3 reload)"
+                   : (strcmp(after_cr3, pa) == 0
+                          ? "STALE-ENTRY (a cr3 reload cleared it)"
+                          : "still-wrong-after-both"));
+      serial_write(c);
+    }
+  }
+
   /* Fatal path. Bust the console lock first: this fault may have interrupted
    * code on this CPU that held it (e.g. a log/backtrace mid-print), so the
    * diagnostic console_write()s below would otherwise self-deadlock (spinlocks
@@ -1274,6 +1409,66 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   /* If exception happened in userspace (CS == 0x1B), send signal instead of
    * panic */
   if (frame->cs == 0x1B || frame->cs == 0x23) {
+    /*
+     * A #UD on an instruction that is not invalid.
+     *
+     * Weston and unrelated processes were killed by SIGILL on more than one
+     * CPU, at instructions whose bytes the kernel then dumped and which were
+     * exactly right -- a PLT `jmp *(%rip)` once. Correct bytes in an
+     * executable mapping and a #UD from the CPU is what a stale instruction
+     * translation looks like: the CPU fetched from a page the entry no longer
+     * names. An instruction fetch does not fault when the translation is
+     * merely old, so nothing here can notice it the way the page-fault handler
+     * notices a spurious data fault.
+     *
+     * So test it rather than guess: drop this CPU's translations for the
+     * faulting page, drop them everywhere, and let the instruction run again.
+     * If it was a real invalid opcode the second attempt faults at the same
+     * RIP and the signal goes out as before, one instruction later. If it
+     * executes, the memory was always right and the translation was not --
+     * which is the whole question, and the retry says so in the log.
+     *
+     * Bounded to one retry per RIP so a genuinely invalid instruction cannot
+     * loop, and counted so a run that leans on this cannot look clean.
+     *
+     * Behind b1nix.ud-retry: this is a measurement, not a repair. Swallowing
+     * one #UD would hide a real invalid opcode, and a kernel that silently
+     * retries faults is a kernel whose faults mean less.
+     *
+     * Result so far: the retry does NOT rescue the instruction -- it faults
+     * again at the same RIP after a full CR3 reload and a global shootdown.
+     * So the translation is not stale, which is what this was built to find
+     * out.
+     */
+    if (frame->vector == 6 && current_task &&
+        bootinfo_has_flag("b1nix.ud-retry")) {
+      static volatile u64 ud_retry_rip[MAX_CPUS];
+      static volatile u64 ud_retries;
+      int c = (int)dump_cpu;
+
+      if (c >= 0 && c < (int)MAX_CPUS && ud_retry_rip[c] != frame->rip) {
+        extern void tlb_shootdown_all(void);
+        u64 n = __atomic_add_fetch(&ud_retries, 1, __ATOMIC_RELAXED);
+
+        ud_retry_rip[c] = frame->rip;
+        __asm__ volatile("invlpg (%0)" : : "r"(frame->rip & ~0xFFFULL)
+                         : "memory");
+        paging_reload_cr3();
+        tlb_shootdown_all();
+        if (n <= 16) {
+          char b[128];
+
+          snprintf(b, sizeof(b),
+                   "UD-RETRY: #UD at rip=0x%lx (%s) — flushed and retrying"
+                   " [%lu]\n",
+                   (unsigned long)frame->rip,
+                   current_task->name ? current_task->name : "?",
+                   (unsigned long)n);
+          console_write(b);
+        }
+        return;
+      }
+    }
     int sig = 0;
     switch (frame->vector) {
     case 0:

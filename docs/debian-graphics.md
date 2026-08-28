@@ -235,7 +235,15 @@ raw error code instead.
 
 ## Open
 
-- **On more than one CPU a user process is intermittently killed by `SIGILL`,
+- ~~**On more than one CPU a user process is intermittently killed by
+  `SIGILL`.**~~ **FIXED** — see M116 in the roadmap. `CR4.PGE` was set on the
+  APs and not the BSP, and bit 8 of a leaf PTE (the GLOBAL bit) was in use as
+  the software flag `VMM_SHARED`, so shared translations on an AP survived the
+  address space that owned them. 0 ring-3 faults in 10 four-CPU runs, against
+  4 in 5. The original account follows, because what it ruled out is what made
+  the answer findable:
+
+  **On more than one CPU a user process is intermittently killed by `SIGILL`,
   and the instruction is valid.** Weston died of `SIGILL` in three runs, and in
   a fourth both it and an unrelated `journalctl` died of a `#GP`. The bytes at
   the faulting instruction, dumped by the kernel at the fault, are exactly what

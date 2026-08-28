@@ -987,6 +987,21 @@ void kernel_main(usize arg0, usize arg1)
 		console_write(" CPUs\n");
 	}
 
+	/* Do the cores agree about what a page-table entry means?
+	 *
+	 * They did not: the AP trampoline set CR4.PGE and boot.S did not, so bit 8
+	 * of a leaf entry was a software flag on the boot CPU and the GLOBAL bit on
+	 * every other one. Nothing was in a position to notice, because no check
+	 * had ever compared one core's control registers against another's. This
+	 * is that check, and it runs on every boot rather than in test mode: a
+	 * divergence here silently changes the memory model.
+	 */
+	{
+		extern int x86_check_cpu_state_uniform(void);
+
+		(void)x86_check_cpu_state_uniform();
+	}
+
 	/* M28 T4: enable cross-CPU TLB shootdown. With BKL out of syscall_entry.S
 	 * (T4), two CPUs can simultaneously execute vmm_unmap_page on different
 	 * pml4s; without shootdown, the stale TLB entry on another CPU lets a
@@ -1165,6 +1180,24 @@ void kernel_main(usize arg0, usize arg1)
 			         (unsigned long)used, (unsigned long)total,
 			         (unsigned long)(total ? (used * 100) / total : 0));
 			console_write(buf);
+		}
+		/* And the same for the APs, which had the same defect for longer: a
+		 * 16 KiB stack against a syscall path carrying a 28,584-byte frame.
+		 * They only exist on SMP, which is why the corruption they caused only
+		 * ever showed up there. */
+		{
+			extern u64 ap_stack_peak(u64 *total_out);
+			u64 total = 0;
+			u64 used = ap_stack_peak(&total);
+			char buf[96];
+
+			if (total) {
+				snprintf(buf, sizeof(buf),
+				         "AP-STACK: peak=%lu total=%lu pct=%lu\n",
+				         (unsigned long)used, (unsigned long)total,
+				         (unsigned long)((used * 100) / total));
+				console_write(buf);
+			}
 		}
 	}
 

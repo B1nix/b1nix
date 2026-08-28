@@ -1270,3 +1270,55 @@ the address being written, which named the write as a stack push. Worth
 remembering: a flaky fault in subsystem X whose bad value looks like
 uninitialised memory may have nothing to do with X. Check what is under the
 stacks.
+
+## M116: One page-table entry, two meanings
+
+- [x] `done` **`CR4.PGE` was set on the APs and not on the boot CPU**, and this
+      kernel used bit 8 of a leaf entry as the software flag `VMM_SHARED`. Bit 8
+      is the architectural GLOBAL bit, so the same entry meant "shared mapping"
+      on one core and "global page" on another — and a global translation is
+      not evicted by a write to CR3, which is the only flush a context switch,
+      `paging_reload_cr3()` and the target side of `tlb_shootdown_all()` do.
+      Every `MAP_SHARED` translation on an AP therefore outlived its address
+      space, and the next process to use that address on that core read and
+      **executed** the dead one's physical page after the frame was reissued.
+- [x] `done` It presented as `SIGILL`/`#GP` on valid instructions, in unrelated
+      processes, only ever on more than one CPU — and survived a full CR3
+      reload plus a global shootdown, which is what a global entry does and
+      what made three earlier hypotheses (the CR3-skip epoch scheme, AP stack
+      size, a corrupt exception frame) look right and measure wrong. Each was
+      refuted by measurement before this was found.
+- [x] `done` APs no longer set PGE; `VMM_SHARED` moves to bit 52, which the CPU
+      ignores in every paging-structure entry, and a `_Static_assert` pins each
+      software flag to the bits that are actually available.
+- [x] `done` **Nothing had ever compared one core's control registers against
+      another's.** `SMP-CPUSTATE` now censuses CR0/CR4/XCR0/EFER on every CPU
+      against the boot CPU at the end of bring-up and refuses `CR4.PGE`
+      outright while a software flag lives on bit 8. Covered by the suite.
+- [x] `done` Measured: **0 ring-3 faults in 10 runs** at `GFX_SMP=4`, against
+      **4 in 5** before. `tests/debian-graphics-smoke.sh` is 12/12 in nine
+      consecutive four-CPU runs, so its default returns to 4 CPUs.
+
+## M117: nice reaches the kernel, but does not yet bias the picker
+
+- [ ] `partial` **`nice()` round-trips and is stored, and the stride is
+      computed from it (`tickets = 20 - nice`, so 25 against 1000), but the
+      service the two classes receive is equal.** Measured with every worker
+      pinned to one CPU and stopping at one shared deadline, so the comparison
+      is between tasks in a single runqueue over a single interval:
+      `high=9953 low=9918`, `applied_nice high=-20 low=19`,
+      `shortest_window_ms=248`. The kernel's own dump shows both classes ending
+      at the same `pass` (~4,752,150) — with strides of 25 and 1000 the
+      high-priority tasks would have had to run ~40x more often to get there,
+      and they did not, so the stride is not reaching the accounting.
+      `scheduler_set_priority()` writes only `g_task_nice[]`; the comment above
+      it already called biasing the cooperative scheduler with that value
+      planned work.
+- [x] `done` **The check that covered this was passing by luck.** Each worker
+      timed its own 150 ms window from its own start, so under host load they
+      ran in windows that did not overlap and never competed — the ratio was
+      noise. It is a shared absolute deadline now, all workers are pinned to
+      one CPU (nice can only decide between tasks in the same runqueue, and
+      eight workers on a two-CPU guest can split four-and-four and get a core
+      each), and the failure reports the shortest window any worker actually
+      got. What it asserts is what is true: `M46-SMOKE: ok nice-applied`.

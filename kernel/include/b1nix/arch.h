@@ -14,6 +14,10 @@
 void arch_init(void);
 void arch_halt(void) __attribute__((noreturn));
 void arch_set_kernel_stack(u64 stack_top);
+#ifdef __x86_64__
+/* TSS.rsp0 of a CPU: the stack a ring-3 exception frame is pushed on. */
+u64 arch_kernel_stack_of_cpu(int cpu);
+#endif
 
 static inline void interrupts_disable(void) {
 #ifdef __aarch64__

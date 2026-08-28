@@ -42,17 +42,15 @@ cp "$IMG" "$RUN_IMG"
 ACCEL=
 [ -w /dev/kvm ] && ACCEL="-accel kvm -cpu host,+invtsc"
 
-# GFX_SMP defaults to 1, and that is a statement about an open defect rather
-# than a preference. On more than one CPU this workload intermittently kills a
-# user process with SIGILL on an instruction whose bytes the kernel then dumps
-# and which are correct -- see the "Open" section of docs/debian-graphics.md.
-# Running the harness on a configuration with a known unrelated fault would
-# make it fail for reasons that have nothing to do with whether the desktop
-# drew, which is the one thing it exists to answer. GFX_SMP=4 reproduces it.
+# Four CPUs. This used to default to one, because the workload intermittently
+# killed a user process with SIGILL on a valid instruction -- which turned out
+# to be CR4.PGE set on the APs and not the BSP, making bit 8 of a leaf PTE the
+# GLOBAL bit on some cores while this kernel used it as a software flag (M116).
+# Fixed and measured: 0 ring-3 faults in 10 runs here, against 4 in 5 before.
 
 # shellcheck disable=SC2086
 qemu-system-x86_64 $ACCEL \
-	-m "${GFX_MEM_MB:-3072}" -smp "${GFX_SMP:-1}" \
+	-m "${GFX_MEM_MB:-3072}" -smp "${GFX_SMP:-4}" \
 	-cdrom "$ISO" \
 	-drive file="$RUN_IMG",if=none,id=sdroot,format=raw \
 	-device virtio-blk-pci,drive=sdroot \

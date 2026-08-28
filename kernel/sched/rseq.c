@@ -18,11 +18,13 @@
  */
 
 #include <b1nix/arch.h>
+#include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/rseq.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
+#include <stdio.h>
 #include <string.h>
 
 /* struct rseq, as the ABI fixes it (kernel/rseq.h in Linux):
@@ -75,11 +77,41 @@ static struct rseq_reg *rseq_find(struct task *t) {
   return 0;
 }
 
+/* Name the refusal.
+ *
+ * Every ground below returns a bare errno, and glibc treats a failed rseq
+ * registration as fatal ("Fatal glibc error: rseq registration failed"), so a
+ * process dies at start-up and the kernel says nothing about which of four
+ * different reasons it was. Two rounds of work on this bug have been spent
+ * guessing between them. Rate-limited, because a genuine conflict can repeat
+ * per thread and the point is the first few. */
+static void rseq_refused(const char *why, u64 uptr, u32 len, u32 sig) {
+  static volatile u64 n;
+
+  if (__atomic_add_fetch(&n, 1, __ATOMIC_RELAXED) > 12)
+    return;
+  char b[160];
+  snprintf(b, sizeof(b),
+           "rseq: refused (%s) uptr=0x%lx len=%u sig=0x%x task=%s\n", why,
+           (unsigned long)uptr, (unsigned)len, (unsigned)sig,
+           current_task && current_task->name ? current_task->name : "?");
+  console_write(b);
+}
+
 int rseq_register(struct task *t, u64 uptr, u32 len, u32 sig, int unregister) {
   if (!t)
     return -EINVAL;
-  if (len < RSEQ_MIN_SIZE || (uptr & 0x1f))
+  if (len < RSEQ_MIN_SIZE) {
+    rseq_refused("len below the ABI minimum", uptr, len, sig);
     return -EINVAL;
+  }
+  if (uptr & 0x1f) {
+    /* The area must be 32-byte aligned. glibc places struct rseq inside the
+     * thread descriptor, so a thread whose TLS block is aligned differently
+     * from the main thread's arrives here and only here. */
+    rseq_refused("area not 32-byte aligned", uptr, len, sig);
+    return -EINVAL;
+  }
 
   u64 flags;
   spin_lock_irqsave(&g_rseq_lock, &flags);
@@ -103,7 +135,12 @@ int rseq_register(struct task *t, u64 uptr, u32 len, u32 sig, int unregister) {
     /* Re-registering the same area is the idempotent case libcs rely on when
      * two libraries both call rseq(); anything else is a conflict. */
     int same = (r->uptr == uptr && r->len == len && r->sig == sig);
+    u64 had = r->uptr;
     spin_unlock_irqrestore(&g_rseq_lock, flags);
+    if (!same)
+      rseq_refused(had == uptr ? "re-registration with different len/sig"
+                               : "task already registered at another area",
+                   uptr, len, sig);
     return same ? -EBUSY : -EINVAL;
   }
 
@@ -122,6 +159,7 @@ int rseq_register(struct task *t, u64 uptr, u32 len, u32 sig, int unregister) {
     return 0;
   }
   spin_unlock_irqrestore(&g_rseq_lock, flags);
+  rseq_refused("registration table full", uptr, len, sig);
   return -ENOMEM;
 }
 

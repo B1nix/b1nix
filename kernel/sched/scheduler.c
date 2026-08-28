@@ -664,6 +664,21 @@ static struct task *find_unused_task(void) {
       g_task_altstack_sp[i] = 0;
       g_task_altstack_size[i] = 0;
       rt_state_free(i); /* M74: drop any RT-signal state from the prior occupant */
+      /* And the rseq registration, for the same reason and one level up.
+       *
+       * The rseq table is keyed by the `struct task *`, and this loop is where
+       * that pointer is handed to a new task -- so a registration the previous
+       * occupant never had cleaned up belongs to the newcomer as far as
+       * rseq_find() is concerned. Its first registration then looks like a
+       * conflicting one at a different area, the kernel refuses it, and glibc
+       * treats a refused rseq registration as fatal: the thread dies at
+       * start-up ("Fatal glibc error: rseq registration failed").
+       *
+       * This was cleared on the fork path alone, so a pthread -- which does
+       * not take that path -- inherited whatever the recycled slot still held.
+       * Clearing it where the slot is allocated is the invariant that no exit
+       * path can miss. */
+      rseq_fork_clear(T(i));
       g_task_alarm_ticks[i] = 0;
       g_task_alarm_interval_ticks[i] = 0;
       g_task_execed[i] = 0;

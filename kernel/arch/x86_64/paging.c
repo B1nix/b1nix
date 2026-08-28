@@ -143,8 +143,21 @@ void paging_reload_cr3(void) {
   __asm__ volatile("movq %0, %%cr3" : : "r"(cr3) : "memory");
 }
 
+/* b1nix.no-cr3-skip: never elide the CR3 write on a context switch.
+ *
+ * The skip below is what makes the epoch scheme necessary, and the epoch only
+ * takes effect at a switch. This flag turns the whole mechanism off so a run
+ * can be compared against one with it on -- if a stale-translation symptom
+ * survives with every switch flushing the TLB, the cause is a missing
+ * cross-CPU shootdown somewhere and not the skip. Read once: this is the
+ * hottest path in the scheduler. */
+static int cr3_skip_disabled = -1;
+
 void paging_switch_address_space(u64 pml4_phys) {
   u64 target_phys = pml4_phys ? pml4_phys : kernel_pml4_phys;
+
+  if (cr3_skip_disabled < 0)
+    cr3_skip_disabled = bootinfo_has_flag("b1nix.no-cr3-skip") ? 1 : 0;
 
   /* The per-CPU record has to be read, tested and written on the CPU whose CR3
    * this is. The scheduler calls in with interrupts already masked, but the
@@ -159,7 +172,7 @@ void paging_switch_address_space(u64 pml4_phys) {
   if (pc) {
     u64 epoch = __atomic_load_n(&g_addrspace_epoch, __ATOMIC_ACQUIRE);
 
-    if (pc->loaded_pml4_phys == target_phys &&
+    if (!cr3_skip_disabled && pc->loaded_pml4_phys == target_phys &&
         pc->loaded_addrspace_epoch == epoch) {
       /* Same address space, and none has been created or destroyed since it
        * was loaded: CR3 already holds it and every translation cached under it

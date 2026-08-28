@@ -29,7 +29,20 @@ ap_32:
     movl (pml4_phys), %eax
     movl %eax, %cr3
     movl %cr4, %eax
-    orl $(1 << 5) | (1 << 7), %eax
+    /* PAE only -- deliberately NOT PGE (bit 7).
+     *
+     * boot.S sets PAE alone on the boot CPU, so setting PGE here made the APs
+     * run with a different CR4 from the BSP, and that difference changed what
+     * a page-table entry means: with PGE on, bit 8 of a leaf PTE is the GLOBAL
+     * bit, and a global translation is not evicted by a write to CR3. This
+     * kernel has no global pages -- bit 8 was in use as a software flag -- and
+     * its cross-CPU shootdown asks the targets to reload CR3, which by
+     * definition cannot flush a global entry. So a translation marked global
+     * on an AP outlived the address space it belonged to: the next process to
+     * use the same virtual address on that core kept fetching and reading the
+     * dead one's physical page, long after the frame had been freed and handed
+     * to someone else. Nothing wants PGE here; the CPUs must agree. */
+    orl $(1 << 5), %eax
     movl %eax, %cr4
     /* M95: probe NX support (CPUID.80000001H:EDX[20]) and enable EFER.NXE
      * together with LME. Without it, an AP that touches a module data page —
