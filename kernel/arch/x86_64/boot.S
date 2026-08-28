@@ -47,9 +47,48 @@ pd2:
 pd3:
 	.skip 4096
 
-.align 16
+/* The boot CPU's kernel stack, and the guard page that catches it running off
+ * the bottom.
+ *
+ * This stack is an ordinary .bss array, and so is everything under it: the six
+ * boot page tables above, and below those the plain scalars of the networking
+ * files (proto_list, proto_lock, the DHCP/DNS statics). Overflowing it was
+ * therefore completely silent. It wrote first through the boot page tables —
+ * dead memory by then, because vmm_init has long since switched CR3 to tables
+ * of its own — which gave the overflow 24 KiB of consequence-free runway, and
+ * only then reached the networking scalars. Nothing faulted and nothing
+ * complained; the first code to READ one of those words took the blame, which
+ * for months was net_proto_reset() at the end of net_init(), reading a
+ * proto_list that had a pushed register in it.
+ *
+ * Two changes, because the bug had two halves. The stack is large enough for
+ * the boot path with room to spare — the measured peak is 103,232 bytes on the
+ * deepest configuration, which is the whole of the old 64 KiB and half as much
+ * again — and `boot_stack_guard` below it is unmapped from the kernel window
+ * once paging is up (paging_install_guard_page), so an overflow faults on the
+ * instruction that overflows instead of quietly scribbling on a neighbour.
+ *
+ * The guard is 32 KiB rather than one page because a guard only works if the
+ * stack cannot step over it, and this kernel has a stack frame of 28,584 bytes
+ * (syscall_dispatch_impl_inner). One page under a frame that big is a tripwire
+ * a burglar walks past. 32 KiB is unmapped address space plus 32 KiB of .bss
+ * nothing reads; the cost is nil and the guarantee is total.
+ *
+ * All four symbols are page-aligned and global: the guard has to be whole pages
+ * to be unmappable, and C needs to see them to unmap it, to paint the stack,
+ * and to report its high-water mark. */
+.align 4096
+.global boot_stack_guard
+boot_stack_guard:
+	.skip 32768
+.global boot_stack_guard_end
+boot_stack_guard_end:
+
+.align 4096
+.global stack_bottom
 stack_bottom:
-	.skip 65536
+	.skip 262144
+.global stack_top
 stack_top:
 
 /* ---------------------------------------------------------------------------

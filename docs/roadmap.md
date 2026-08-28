@@ -1304,3 +1304,40 @@ wlroots never made. The ones it breaks on are ours.
       hands one `socklen_t` to both calls, so the 110 the first answered with
       became the second's capacity for a 28-byte object. Covered by
       `M57-SMOKE: ok unix-addrlen` and `unix-addrlen-reuse`.
+
+## M115: The stacks the kernel boots and syscalls on
+
+Two kernel stacks in `.bss` with nothing under them but more `.bss`. Both
+overflowed into it silently, and one of them had been doing so on every boot
+for months while the blame landed on whoever read the clobbered word next.
+
+- [x] `done` **The boot stack overflowed into `proto_list`.** The recurring
+      death of the `iommu` smoke instance — a `#GP` in `proto_snapshot` some
+      runs, a `SPINLOCK LOCKUP` on `proto_lock` in others, and misattributed to
+      the change under test at least twice — was neither a race nor anything in
+      `proto.c`. `stack_bottom` was 64 KiB; below it sit the six boot page
+      tables (24 KiB) and below those `proto_list` and friends. `kernel_main`
+      runs every probe and self-test inline plus a scheduler pass on any timer
+      tick, and exceeds 64 KiB. **The first 24 KiB of overflow landed in page
+      tables `vmm_init` had already abandoned, so it was consequence-free** —
+      only past that did it reach live state. Ordinary instances peak at
+      15,144 bytes; the `iommu` instance, with its switch, bridge, six tablets
+      and two NVMe, reaches 103,232, and `proto_list` sits 28,624 bytes down.
+      That is the whole reason only one instance ever failed.
+- [x] `done` Found with hardware watchpoints: a watchpoint on `proto_list`
+      fired with `rsp` **equal to the address being written** — the writes were
+      stack pushes. Now 256 KiB with a 32 KiB unmapped guard below, armed by
+      `paging_install_guard_page()` once the kernel window exists. **3 of 15
+      boots → 0 of 15**; and rebuilt at the old 64 KiB with the guard armed,
+      3 of 3 boots stop with `#EXC boot-stack overflow`, which says the old
+      stack overflowed on *every* boot and was merely usually harmless.
+- [x] `done` **`x86_syscall_stack` had the same defect, worse placed**: 64 KiB
+      with no guard, immediately above `stack_top`, so an overflow there ran
+      down into the boot stack. The syscall path carries a 28,584-byte frame.
+      Same treatment — 256 KiB and a 32 KiB guard.
+- [x] `done` Both guards are counted, not assumed: the kernel prints
+      `vmm: boot-stack guard N/N pages unmapped` and the same for the syscall
+      stack, `kernel_main` prints `BOOT-STACK: peak=/total=/pct=`, and the
+      suite fails a run whose peak passes 75%, whose paint is fully consumed,
+      or whose tripwire did not install. On every instance — the margin is the
+      thing under test.

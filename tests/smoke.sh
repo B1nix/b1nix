@@ -947,6 +947,76 @@ elif grep -aq "smep: unavailable" "$LOG" 2>/dev/null; then
 else
 	fail "CR4.SMEP is set on every online CPU" "${_smep_line:-no smep tally in log}"
 fi
+
+# ── The boot CPU's kernel stack has room for the boot path ──
+#
+# kernel_main runs every driver probe, every filesystem and network init and,
+# once the timer is armed, a whole scheduler pass on top of all of it, on the
+# single stack boot.S reserves. That stack used to be 64 KiB and the boot path
+# needs more than 100 KiB, so it ran off the bottom -- through the boot page
+# tables, which are dead by then and absorbed the damage silently, and on into
+# the .bss scalars underneath, where it rewrote proto_list and proto_lock. The
+# IOMMU instance died on that about one boot in five, in net_proto_reset, and
+# was misdiagnosed twice as a bug in whatever change was under test.
+#
+# Nothing could have caught it, because nothing measured the depth. This does,
+# on EVERY instance rather than only the one that happened to tip over -- the
+# margin is what is under test, not the crash. A peak past 75% fails the run
+# while the stack still holds, long before the guard page is reached.
+_bs_line=$(grep -a "BOOT-STACK: peak=" "$LOG" 2>/dev/null | tail -1)
+_bs_peak=$(echo "$_bs_line" | sed -n 's/.*peak=\([0-9]*\).*/\1/p')
+_bs_total=$(echo "$_bs_line" | sed -n 's/.*total=\([0-9]*\).*/\1/p')
+_bs_pct=$(echo "$_bs_line" | sed -n 's/.*pct=\([0-9]*\).*/\1/p')
+if [ -z "$_bs_peak" ] || [ -z "$_bs_total" ] || [ "$_bs_total" = "0" ]; then
+	fail "boot stack depth is measured and reported" \
+		"${_bs_line:-no BOOT-STACK line in log}"
+elif [ "$_bs_peak" -ge "$_bs_total" ]; then
+	# Saturated: the paint was consumed to the very bottom, so the real peak is
+	# unknown and at least this. That is an overflow whether or not it crashed.
+	fail "boot stack has headroom" "boot stack FULL: $_bs_line"
+elif [ "$_bs_pct" -gt 75 ]; then
+	fail "boot stack has headroom" "boot stack over 75% used: $_bs_line"
+else
+	pass "boot stack has headroom (${_bs_peak} of ${_bs_total} bytes, ${_bs_pct}%)"
+fi
+
+# ... and the guard under it is actually armed. An unmapped page cannot be
+# tested by touching it, so the kernel counts the pages it managed to unmap and
+# prints the tally; anything short of all of them means the tripwire is not
+# there, which is the state this bug lived in for months.
+_bs_guard=$(grep -a "vmm: boot-stack guard" "$LOG" 2>/dev/null | tail -1)
+_bs_g_got=$(echo "$_bs_guard" | sed -n 's|.*guard \([0-9]*\)/\([0-9]*\).*|\1|p')
+_bs_g_want=$(echo "$_bs_guard" | sed -n 's|.*guard \([0-9]*\)/\([0-9]*\).*|\2|p')
+if [ -n "$_bs_g_want" ] && [ "$_bs_g_want" -gt 0 ] && [ "$_bs_g_got" = "$_bs_g_want" ]; then
+	pass "boot-stack guard is armed ($_bs_g_got pages unmapped)"
+else
+	fail "boot-stack guard is armed" "${_bs_guard:-no boot-stack guard line in log}"
+fi
+
+# The syscall entry stack has the same tripwire, and needs it more: it sits
+# immediately above the boot stack, so an overflow there runs down into it.
+_sc_guard=$(grep -a "vmm: syscall-stack guard" "$LOG" 2>/dev/null | tail -1)
+_sc_g_got=$(echo "$_sc_guard" | sed -n 's|.*guard \([0-9]*\)/\([0-9]*\).*|\1|p')
+_sc_g_want=$(echo "$_sc_guard" | sed -n 's|.*guard \([0-9]*\)/\([0-9]*\).*|\2|p')
+if [ -n "$_sc_g_want" ] && [ "$_sc_g_want" -gt 0 ] && [ "$_sc_g_got" = "$_sc_g_want" ]; then
+	pass "syscall-stack guard is armed ($_sc_g_got pages unmapped)"
+else
+	fail "syscall-stack guard is armed" "${_sc_guard:-no syscall-stack guard line in log}"
+fi
+
+# The guard page under the boot stack must never be reached. If it ever is, the
+# fault handler names it -- which is the whole point of unmapping it: an
+# overflow becomes a report that says "boot-stack overflow" instead of a
+# networking pointer going bad three subsystems away.
+for _bs_log in "$LOG" "$SYS_LOG" "$OPENRC_LOG" "$IOMMU_LOG" "$AMDVI_LOG"; do
+	[ -f "$_bs_log" ] || continue
+	if grep -aq "boot-stack overflow" "$_bs_log" 2>/dev/null; then
+		fail "no boot-stack overflow on any instance" \
+			"guard page hit in $(basename "$_bs_log")"
+		_bs_overflow=1
+	fi
+done
+[ -n "${_bs_overflow:-}" ] || pass "no boot-stack overflow on any instance"
 # b1cc temporarily cut from the build (B1NIX_NO_B1CC) — restored as a separate
 # change. These checks are disabled until b1cc is re-added.
 # check_output "$LOG" "B1CC-R42-SMOKE: ok" "b1cc return_42 runs and exits with 42"

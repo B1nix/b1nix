@@ -106,6 +106,18 @@ u32 arch_cpu_max_khz(void);
  * publish one and it has to be measured instead. */
 u32 arch_tsc_khz_from_cpuid(void);
 
+/* Boot-stack accounting (x86_64: kernel/arch/x86_64/arch.c).
+ *
+ * boot_stack_paint() fills the unused part of the boot CPU's stack with a
+ * marker word and must be called at the top of kernel_main, while the stack is
+ * still shallow. boot_stack_peak_bytes() then reports how deep the boot path
+ * ever went. The boot stack overflowed silently for months because nobody
+ * could see this number. */
+void boot_stack_paint(void);
+u64 boot_stack_peak_bytes(void);
+u64 boot_stack_size_bytes(void);
+int boot_stack_is_guard_addr(u64 addr);
+
 int arch_xsave_enabled(void);
 u64 arch_xsave_mask(void);
 usize arch_xsave_area_size(void);

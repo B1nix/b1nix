@@ -325,6 +325,11 @@ static void drm_stuck_watch_thread(void *arg)
 
 void kernel_main(usize arg0, usize arg1)
 {
+	/* Before anything else that can go deep: the boot stack is still shallow
+	 * here, so this is the only point at which the unused part of it can be
+	 * painted and its high-water mark made measurable. */
+	boot_stack_paint();
+
 	serial_init();
 	serial_tty_init();
 	console_init();
@@ -1140,6 +1145,27 @@ void kernel_main(usize arg0, usize arg1)
 		drm_kms_selftest();    /* M101: a device on it, rendering to the scanout */
 		kheap_selftest();      /* the allocator splits blocks it reuses */
 		sysfs_attr_selftest(); /* M101: its /sys and debugfs files, read back */
+
+		/* How much of the boot CPU's stack the whole of kernel_main actually
+		 * used, reported last so it covers every probe and self-test above.
+		 *
+		 * This is the check that was missing. The boot stack used to be
+		 * 64 KiB and the boot path needed more than that on the deepest
+		 * configuration, but an overflow wrote into ordinary .bss and nothing
+		 * faulted, so the only evidence was a networking pointer going bad in
+		 * one boot out of five. A used/total pair in the log turns that into
+		 * an arithmetic fact anyone can read; the smoke suite fails the run if
+		 * the peak passes 75% of the stack, well before the guard page. */
+		{
+			u64 used = boot_stack_peak_bytes();
+			u64 total = boot_stack_size_bytes();
+			char buf[96];
+			snprintf(buf, sizeof(buf),
+			         "BOOT-STACK: peak=%lu total=%lu pct=%lu\n",
+			         (unsigned long)used, (unsigned long)total,
+			         (unsigned long)(total ? (used * 100) / total : 0));
+			console_write(buf);
+		}
 	}
 
 	userspace_init();

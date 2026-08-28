@@ -97,16 +97,23 @@ const char *proto_name_at(usize index) {
  * The dispatch depth below counts readers so an unregistering module knows
  * when its text is safe to free. It does NOT exclude a writer: proto_register
  * mutates proto_list under proto_lock, and a walk holding only the counter can
- * be in the middle of the list while that happens. The IOMMU instance panicked
- * on it in one boot out of two -- a #GP calling p->reset() through a pointer
- * that was not a function -- and because it is a coin flip it also lands on
- * whatever change happens to be under test, which cost a wrong attribution
- * tonight.
+ * be in the middle of the list while that happens. Copying the pointers under
+ * the lock and calling the callbacks afterwards fixes the walk without holding
+ * a spinlock across a callback that may sleep. The depth counter is still taken
+ * around the calls, because it is what keeps an entry's text alive while its
+ * callback runs.
  *
- * Copying the pointers under the lock and calling the callbacks afterwards
- * fixes the walk without holding a spinlock across a callback that may sleep.
- * The depth counter is still taken around the calls, because it is what keeps
- * an entry's text alive while its callback runs.
+ * A note on what this is NOT, because it was blamed for it twice. The IOMMU
+ * smoke instance used to die here about one boot in five, either faulting on a
+ * proto_list that was not a pointer or spinning on a proto_lock that read as
+ * held with no holder. Neither was a list race: nothing had registered a
+ * protocol yet at that point in the boot (the modules load from
+ * module_init_builtin_deps, hundreds of lines after net_init), so proto_list
+ * was supposed to be NULL and proto_lock zero. They were being written by the
+ * boot CPU's stack running off its bottom and down through the dead boot page
+ * tables into these two words, which are simply the .bss objects that happen to
+ * lie there. This code was never at fault; it was the first code to read the
+ * damage. Fixed in boot.S (a stack big enough, with a guard page under it).
  */
 #define PROTO_SNAPSHOT_MAX 16
 

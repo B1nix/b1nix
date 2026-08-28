@@ -578,6 +578,90 @@ void vmm_init(void) {
 
   extern void pmm_switch_to_direct_map(void);
   pmm_switch_to_direct_map();
+
+  /* Arm the boot stack's guard now that the kernel window is ours. See the
+   * comment on boot_stack_guard in boot.S: without this an overflow of the boot
+   * stack is silent, because everything under it is ordinary writable .bss.
+   * The guard spans several pages so no single stack frame can step over it.
+   *
+   * Counted and reported, not assumed. A guard that quietly failed to install
+   * is indistinguishable from one that was never needed, and this whole bug was
+   * a thing that failed without saying so. */
+  extern u8 boot_stack_guard[];
+  extern u8 boot_stack_guard_end[];
+  usize guard_want = 0, guard_got = 0;
+  for (u64 p = (u64)(usize)boot_stack_guard; p < (u64)(usize)boot_stack_guard_end;
+       p += PAGE_SIZE) {
+    guard_want++;
+    guard_got += (usize)paging_install_guard_page(p);
+  }
+  console_write("vmm: boot-stack guard ");
+  console_write_dec(guard_got);
+  console_write("/");
+  console_write_dec(guard_want);
+  console_write(guard_got == guard_want ? " pages unmapped\n"
+                                        : " pages unmapped — GUARD INCOMPLETE\n");
+
+  /* And the syscall entry stack, which sits immediately above the boot stack
+   * and so overflows INTO it. Same tripwire, reported the same way. */
+  extern u8 x86_syscall_stack_guard[];
+  extern u8 x86_syscall_stack_guard_end[];
+  usize sc_want = 0, sc_got = 0;
+  for (u64 p = (u64)(usize)x86_syscall_stack_guard;
+       p < (u64)(usize)x86_syscall_stack_guard_end; p += PAGE_SIZE) {
+    sc_want++;
+    sc_got += (usize)paging_install_guard_page(p);
+  }
+  console_write("vmm: syscall-stack guard ");
+  console_write_dec(sc_got);
+  console_write("/");
+  console_write_dec(sc_want);
+  console_write(sc_got == sc_want ? " pages unmapped\n"
+                                  : " pages unmapped — GUARD INCOMPLETE\n");
+}
+
+/* Unmap exactly one page from the kernel window, leaving its neighbours alone.
+ *
+ * vmm_unmap_page() cannot be used for this: the kernel window is mapped with
+ * 2 MiB huge pages, and its huge-page branch clears the whole PDE — which would
+ * unmap two megabytes of kernel image rather than one guard page. So split the
+ * huge page first and then clear the single leaf.
+ *
+ * Only the kernel window alias is removed. The same physical page is still
+ * reachable through the identity and direct maps, which is fine: this is a
+ * tripwire for a stack that grows down through the kernel window, not a
+ * guarantee that the frame is unreachable.
+ *
+ * Returns 1 when the page is now unmapped, 0 when it could not be — the caller
+ * reports the tally rather than trusting it. */
+int paging_install_guard_page(u64 virtual_address) {
+  if ((virtual_address & (PAGE_SIZE - 1)) != 0)
+    panic("paging_install_guard_page requires a page-aligned address");
+
+  u64 *pml4 = get_current_pml4();
+  u64 pml4e = pml4[pml4_index(virtual_address)];
+  if ((pml4e & VMM_PRESENT) == 0)
+    return 1; /* already not mapped here */
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(virtual_address)];
+  if ((pdpte & VMM_PRESENT) == 0)
+    return 1;
+  if ((pdpte & HUGE_PAGE_FLAG) != 0)
+    return 0; /* a 1 GiB leaf is not something to split for a tripwire */
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(virtual_address)];
+  if ((pde & VMM_PRESENT) == 0)
+    return 1;
+
+  u64 *pt = (pde & HUGE_PAGE_FLAG) ? split_huge_page(pd, pd_index(virtual_address))
+                                   : table_from_entry(pde);
+  if (!pt)
+    return 0;
+  u64 old = pt[pt_index(virtual_address)];
+  pt[pt_index(virtual_address)] = 0;
+  addrspace_note_replaced(old);
+  invalidate_page(virtual_address);
+  return 1;
 }
 
 /* Build the page-table path for virtual_address and install the leaf PTE.

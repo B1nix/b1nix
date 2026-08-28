@@ -37,6 +37,78 @@ static struct x86_tss x86_tss_arr[MAX_CPUS] __attribute__((aligned(16)));
 #define X86_DF_STACK_SIZE 8192
 static u8 x86_df_stack_bsp[X86_DF_STACK_SIZE] __attribute__((aligned(16)));
 
+/* ── boot-stack accounting ────────────────────────────────────────────────
+ *
+ * The boot CPU runs the whole of kernel_main — every driver probe, every
+ * filesystem and network init, and, once the timer is armed, a full scheduler
+ * pass on top of all of it whenever a tick lands — on the single stack that
+ * boot.S reserves. Nothing measured how much of it that actually costs, so the
+ * one fact that mattered went unnoticed: it did not fit. The path reached
+ * 65,016 of the old 65,536 bytes before a tick arrived, and the scheduler pass
+ * the tick ran took it another 29 KiB past the end, over the dead boot page
+ * tables and into the networking scalars beneath them.
+ *
+ * So measure it. The stack is painted with a known word at the top of
+ * kernel_main, while it is still shallow; the deepest word the boot path
+ * disturbed is then the high-water mark, and the smoke suite asserts it stays
+ * clear of the guard page. A stack that is merely big enough today is one
+ * regression away from being too small again, silently. */
+#define BOOT_STACK_PAINT 0xB1B1B1B1B1B1B1B1ULL
+
+extern u8 boot_stack_guard[];
+extern u8 boot_stack_guard_end[];
+extern u8 stack_bottom[];
+extern u8 stack_top[];
+
+/* Painted range, recorded so the report knows what was actually covered. */
+static u64 boot_stack_painted_from;
+static u64 boot_stack_painted_to;
+
+void boot_stack_paint(void) {
+  u64 sp;
+  __asm__ volatile("movq %%rsp, %0" : "=r"(sp));
+
+  u64 lo = (u64)(usize)stack_bottom;
+  /* Paint up to a little below the live frames. Nothing can be using the gap:
+   * _start ran cli and the IDT does not exist yet, so no interrupt can push
+   * into it while this loop runs, and the red zone is disabled. The 512 bytes
+   * are slack, not a requirement -- they only mean the reported peak is a few
+   * hundred bytes pessimistic, which is the safe direction. */
+  u64 hi = (sp > lo + 512) ? (sp - 512) : lo;
+  hi &= ~(u64)7;
+
+  for (u64 p = lo; p + 8 <= hi; p += 8)
+    *(volatile u64 *)(usize)p = BOOT_STACK_PAINT;
+
+  boot_stack_painted_from = lo;
+  boot_stack_painted_to = hi;
+}
+
+/* Bytes of the boot stack ever used, or 0 when it was never painted. Saturates
+ * at the painted size, which can only happen if the stack was filled — and the
+ * guard page below it makes that a fault rather than a number. */
+u64 boot_stack_peak_bytes(void) {
+  if (boot_stack_painted_to <= boot_stack_painted_from)
+    return 0;
+  u64 p = boot_stack_painted_from;
+  while (p + 8 <= boot_stack_painted_to &&
+         *(volatile u64 *)(usize)p == BOOT_STACK_PAINT)
+    p += 8;
+  return (u64)(usize)stack_top - p;
+}
+
+u64 boot_stack_size_bytes(void) {
+  return (u64)(usize)stack_top - (u64)(usize)stack_bottom;
+}
+
+/* True while `addr` is inside the guard region below the boot stack. The fault
+ * handler uses it to name a stack overflow instead of reporting an unexplained
+ * fault at an address nothing maps. */
+int boot_stack_is_guard_addr(u64 addr) {
+  return addr >= (u64)(usize)boot_stack_guard &&
+         addr < (u64)(usize)boot_stack_guard_end;
+}
+
 void x86_idt_init(void);
 void x86_idt_load(void); /* interrupts.c — load the shared IDT on this CPU */
 void x86_pic_init(void);
@@ -86,10 +158,12 @@ static void x86_tss_init_cpu(int cpu) {
 
 static void x86_tss_init(void) { x86_tss_init_cpu(0); }
 
-void arch_set_kernel_stack(u64 stack_top) {
+/* Named `top` rather than `stack_top`, which is now the boot stack's own
+ * symbol declared above and would be shadowed here. */
+void arch_set_kernel_stack(u64 top) {
   struct percpu *p = get_percpu();
   int cpu = p ? (int)p->cpu_id : 0;
-  x86_tss_arr[cpu].rsp0 = stack_top;
+  x86_tss_arr[cpu].rsp0 = top;
 }
 
 /* M29: write IA32_FS_BASE (MSR 0xC0000100) for userspace TLS. The kernel

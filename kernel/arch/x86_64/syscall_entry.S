@@ -3,11 +3,34 @@
 
 .extern syscall_dispatch_impl
 
+/* The syscall entry stack, and the guard that catches it running off the
+ * bottom.
+ *
+ * Same defect the boot stack had, and worse placed: this one sat immediately
+ * above stack_top, so an overflow here ran straight down into the boot CPU's
+ * stack -- silently, because that is ordinary writable .bss too. The syscall
+ * path is not shallow: it carries a 28,584-byte frame, so 64 KiB left little
+ * margin for anything nested behind it.
+ *
+ * 256 KiB with a 32 KiB unmapped guard below, armed by
+ * paging_install_guard_page() once the kernel window exists. The guard is
+ * several pages for the same reason the boot stack's is: a guard a single
+ * frame can step over is not a guard.
+ *
+ * Page-aligned and global because the guard has to be whole pages and the
+ * installer needs both ends. */
 .section .bss
-.align 16
+.align 4096
+.global x86_syscall_stack_guard
+x86_syscall_stack_guard:
+    .skip 32768
+.global x86_syscall_stack_guard_end
+x86_syscall_stack_guard_end:
+
+.align 4096
 .global x86_syscall_stack_bottom
 x86_syscall_stack_bottom:
-    .skip 65536
+    .skip 262144
 .global x86_syscall_stack_top
 x86_syscall_stack_top:
 

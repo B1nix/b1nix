@@ -825,6 +825,21 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     serial_write(" cr2=");
     serial_emerg_hex(read_cr2());
     serial_write("\n");
+
+    /* Name a boot-stack overflow for what it is.
+     *
+     * The page below the boot stack is unmapped (see boot_stack_guard in
+     * boot.S), so running off the bottom faults there. On #PF the address is
+     * in CR2; on #DF it is CR2 as well, because the double fault is the CPU
+     * failing to push the #PF frame onto the same dead stack. Either way the
+     * reader would otherwise be looking at a fault on an address that no
+     * source file mentions, which is exactly the sort of report that gets
+     * blamed on whatever change happened to be under test. */
+    if (boot_stack_is_guard_addr(read_cr2()) ||
+        boot_stack_is_guard_addr(frame->rsp)) {
+      serial_write("#EXC boot-stack overflow: the boot CPU ran off the bottom "
+                   "of its kernel stack (guard page)\n");
+    }
   }
 
   /* Fatal path. Bust the console lock first: this fault may have interrupted

@@ -186,6 +186,10 @@ void vmm_init(void);
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags);
 void *vmm_map_mmio(u64 physical_address, usize size, u64 flags);
 void vmm_unmap_page(u64 virtual_address);
+/* Remove one page from the kernel window without disturbing the 2 MiB mapping
+ * around it, so touching it faults. Used for the boot stack's guard region.
+ * Returns 1 when the page really is unmapped, 0 when it could not be. */
+int paging_install_guard_page(u64 virtual_address);
 /* Unmap without telling the other CPUs.
  *
  * For a caller retiring many pages at once. One page at a time, each unmap
