@@ -850,12 +850,9 @@ int lkpi_is_kswapd(void)
  * uncore->lock, and the boot CPU deadlocked against itself on real hardware.
  *
  * So the state is saved and nested: only the outermost enable restores, and it
- * restores what the outermost disable actually saw.
+ * restores what the outermost disable actually saw. The scheduler keeps that
+ * count now, so there is nothing to keep here.
  */
-static struct {
-	u32 depth;
-	u64 flags;
-} lkpi_preempt_state[MAX_CPUS];
 
 /*
  * Preemption off, interrupts ON — which is what Linux means by this.
@@ -930,9 +927,9 @@ int lkpi_bootflag(const char *flag)
  * already calibrated, so this is a real nanosecond clock rather than a finer
  * label on a coarse one.
  *
- * Counted from the first call so the values stay small, and computed as
- * quotient-plus-remainder rather than tsc × 1000000 / khz, which overflows 64
- * bits after roughly an hour and a half of uptime.
+ * The reading itself is now taken from the system clock (see
+ * lkpi_monotonic_ns); what stays here is the raw counter, which udelay uses to
+ * measure a busy-wait.
  */
 static u64 lkpi_tsc(void)
 {
@@ -941,8 +938,6 @@ static u64 lkpi_tsc(void)
 	__asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
 	return ((u64)hi << 32) | lo;
 }
-
-static u64 lkpi_tsc_base;
 
 /*
  * Busy-wait for a number of microseconds, measured rather than counted.
@@ -980,18 +975,37 @@ void lkpi_udelay(u64 usecs)
 
 u64 lkpi_monotonic_ns(void)
 {
-	u32 khz = arch_cpu_khz();
-	u64 now, delta;
+	u64 ns;
 
-	/* No calibrated TSC: fall back to the tick, coarse but never wrong about
-	 * the direction time moves. */
-	if (!khz)
-		return lkpi_ticks() * 10000000ull;
+	/* Whatever CLOCK_MONOTONIC is, this must be it.
+	 *
+	 * ktime_get() is not only a duration source inside the driver: the DRM
+	 * core stamps it into every page-flip and vblank event it delivers, and
+	 * the client that reads one compares it against the CLOCK_MONOTONIC it
+	 * gets from clock_gettime(2). Two clocks that count the same
+	 * nanoseconds from DIFFERENT ORIGINS are not the same clock, and the
+	 * difference is not a rounding error -- it is however far into the boot
+	 * the driver first asked for the time.
+	 *
+	 * This counted from its own first call, so weston read every flip event
+	 * as having happened about ten seconds before the frame it belonged to
+	 * ("computed repaint delay is insane: -10736 msec"), and scheduled the
+	 * next repaint immediately, every frame, for ever. Take the same base
+	 * the system clock uses. */
+	ns = arch_tsc_monotonic_ns();
+	if (ns)
+		return ns;
 
-	now = lkpi_tsc();
-	if (!lkpi_tsc_base)
-		lkpi_tsc_base = now;
-	delta = now - lkpi_tsc_base;
-
-	return (delta / khz) * 1000000ull + ((delta % khz) * 1000000ull) / khz;
+	/* The TSC is not yet declared fit to be a clock. Fall back to the tick,
+	 * which is coarse and is measured from boot -- the same origin, so the
+	 * changeover moves the resolution and not the epoch.
+	 *
+	 * A finer fallback that counted from its own first call was tried here and
+	 * is wrong for the same reason the bug above was: this function is called
+	 * before arch_tsc_clock_init has finished and again after, so the two
+	 * epochs both appear within one boot, and any code holding a timestamp
+	 * across the changeover sees time jump forward by the whole of the boot so
+	 * far. The guest watchdog did, and killed the machine at eleven seconds
+	 * for sixty seconds of silence. */
+	return lkpi_ticks() * 10000000ull;
 }

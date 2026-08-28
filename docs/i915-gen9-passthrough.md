@@ -8,6 +8,24 @@ a fault seen inside the driver is a defect there, and is fixed there.
 The development machine passes its UHD 630 through with VFIO; the guest drives
 the physical HDMI panel.
 
+## Host setup for the passthrough
+
+`intel_iommu=on` on the host command line, the iGPU bound to `vfio-pci`, and
+the host not driving it (`i915.modeset=0`, or blacklist the module) — which
+makes the host headless, so drive it over SSH. The UHD 630 must sit alone in
+its IOMMU group; it does here (group 0). QEMU needs `memlock` unlimited or the
+device's memory cannot be pinned.
+
+GVT-d (the whole device) rather than GVT-g (a mediated vGPU): mediation puts a
+layer between the driver and the hardware, and during bring-up every "is this
+mine or the mediator's" costs days. Render-only work can skip OpRegion/VBIOS
+handling entirely.
+
+The earlier plan recorded this route as blocked — the desktop BIOS was thought
+to hide the iGPU, and the laptop SKUs (Pentium 3825U, Celeron N3050) genuinely
+have VT-x without VT-d, so no IOMMU and no VFIO there. The desktop turned out
+to work, and M102a was closed through passthrough rather than bare metal.
+
 ## Display
 
 A Wayland compositor (cage, then sway, on wlroots with pixman) drives the

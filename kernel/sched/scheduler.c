@@ -4296,6 +4296,35 @@ static void reparent_children_and_signal_orphans(struct task *exiting) {
   }
 }
 
+/* Release what a dying task registered, on the paths that do not run
+ * scheduler_exit_current.
+ *
+ * A task killed by SIGKILL -- which is what exit_group posts to every sibling
+ * -- or by a fatal default action is marked DEAD from inside the scheduler,
+ * and every resource it holds is released by hand right there. Two were
+ * missing from that list, and both are the same shape: state kept in a table
+ * keyed by the task, which a recycled task slot then inherits.
+ *
+ * The address-space mutator lock: a thread killed inside mmap/munmap left the
+ * slot set for ever. It is shared by hash across address spaces, so the
+ * casualty was not only that process -- every other one hashing the same way
+ * spun in vma_mutator_lock until the machine went quiet, with no panic and
+ * nothing in the log but one warning naming an owner whose task slot had since
+ * been freed and reused.
+ *
+ * The rseq(2) area: glibc registers one for every thread it creates and treats
+ * a refusal as fatal ("Fatal glibc error: rseq registration failed"). A leaked
+ * entry both consumes a table slot for ever and, once the task slot is reused,
+ * makes the new thread's first registration look like a conflicting
+ * re-registration of a different area -- so the thread dies at start-up.
+ */
+static void release_task_registrations(struct task *t) {
+  extern void syscall_release_vma_locks(struct task *t);
+
+  syscall_release_vma_locks(t);
+  rseq_task_cleanup(t);
+}
+
 static void terminate_group_siblings(struct task *t) {
   usize tgid = g_task_tgid[task_index(t)];
   if (tgid == 0) return;
@@ -7556,6 +7585,7 @@ void scheduler_deliver_pending_signals(void) {
       reparent_children_and_signal_orphans(current_task);
       thread_release_ctid(current_task);
       scheduler_futex_cleanup_task(current_task->id);
+      release_task_registrations(current_task);
   scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
       ptrace_task_cleanup(current_task); /* M80: never leave a stale tracee link */
       task_lease_clear(current_task, __func__);
@@ -7607,6 +7637,7 @@ void scheduler_deliver_pending_signals(void) {
         reparent_children_and_signal_orphans(current_task);
         thread_release_ctid(current_task);
         scheduler_futex_cleanup_task(current_task->id);
+        release_task_registrations(current_task);
   scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
         ptrace_task_cleanup(current_task); /* M80: never leave a stale tracee link */
         task_lease_clear(current_task, __func__);

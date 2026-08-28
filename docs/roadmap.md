@@ -1059,44 +1059,6 @@ exercised through `/bin`. Detail in [`applet-parity.md`](applet-parity.md).
       checks `EADDRINUSE` against one table for all namespaces, and DHCP runs
       only in the initial namespace.
 
-## M114: The layers under the missing applets
-
-Alpine's BusyBox builds 304 applets and ours built 287. Most of the difference
-was not a build option but an absent kernel subsystem, so the subsystems were
-written. Detail in [applet parity](applet-parity.md).
-
-- [x] `done` `readahead(2)`: a real prefetch of a file's blocks into the cache
-      through the ordinary read path, not an accepted hint. Unblocks
-      `readahead`.
-- [x] `done` `TIOCCONS`: kernel console output copied to a terminal. The
-      console prints from under a spinlock with interrupts off, where a device
-      write may not sleep, so it pushes into a ring that a thread drains and
-      reports loss rather than swallowing it. Unblocks `setconsole`.
-- [x] `done` Software RAID (`kernel/dev/md.c`): striping and mirroring as an
-      ordinary block device, assembled by `RAID_AUTORUN` from superblocks the
-      members carry. The format is b1nix's own and says so — nothing here can
-      write or verify Linux's, so claiming it would be a promise no test could
-      keep. No resynchronisation: a failed member stays failed rather than
-      silently serving stale data. Unblocks `raidautorun`.
-- [x] `done` Network block device (`kernel/dev/nbd.c`): the NBD protocol over
-      the existing TCP stack, driven either from the kernel or through the
-      ioctl interface `nbd-client` speaks — the socket it hands over is held by
-      reference, because an fd number belongs to one process and can be closed
-      underneath the kernel. Unblocks `nbd-client`.
-- [x] `done` ATAPI packet reads: a CD-ROM registers as a read-only block device
-      with its own 2048-byte blocks, so an ISO on it mounts like any filesystem.
-      Read only — a write path that could never be tested would be code nobody
-      has run. Unblocks `eject` and `volname`.
-- [x] `done` MTD over CFI NOR flash (`kernel/dev/mtd.c`): the chip QEMU gives
-      through `-drive if=pflash`, probed with a CFI query and described by its
-      own table. `/dev/mtd0` offers the erase a block device cannot, and
-      `/dev/mtdblock0` the block face for a filesystem. Unblocks
-      `flash_eraseall` and `flashcp`. NAND stays out: its tools exist for
-      out-of-band data NOR has none of.
-- [x] `done` `nsenter` and `unshare` needed no new layer, only enabling: each
-      check compares the namespace's answer with the parent's, since a command
-      that exits 0 says nothing about isolation.
-
 ## M110: Unix block-device names
 
 - [x] `done` Name disks the way the rest of Unix does — `sda`/`sdb` for SATA,
@@ -1145,199 +1107,166 @@ written. Detail in [applet parity](applet-parity.md).
 
 ## M112: systemd as PID 1
 
-- [ ] `partial` **PCI bus topology under `/sys/devices`** (M119): `/sys/devices`
-      held `system` and nothing else, so no device had a parent for udev to
-      match a rule against and libdrm could not name the bus a card sits on.
-      `pci_sysfs_publish_all()` now publishes every function the enumeration
-      finds — vendor/device/class/revision/irq/subsystem ids read from config
-      space — with `/sys/bus/pci/devices` links and a writable `uevent` that
-      really re-announces the device. `/sys/dev/char` exists for the first time.
-      No `driver` link: this kernel records no binding. The headless test image
-      has no DRM card, so the libdrm chain is not yet proven end to end.
-- [x] **Debian's systemd 252 boots b1nix as PID 1**, headless: cgroup v2 with
-      `/system.slice` per unit, journald with `journalctl` reading its journal
-      back, sysinit/basic/multi-user targets reached, dbus 1.14 serving the
-      system bus, `systemd-run --pipe` starting a transient unit through it, and
-      agetty's login prompt on the serial console. `make systemd-image` builds
-      the image (dependency closure resolved from the suite index, 23 packages);
-      `make systemd-smoke` boots it and checks 31 markers, **29 of which pass**
-      (15 when the suite was written, 22 before this round).
-- [x] **cgroup v2** (`kernel/fs/cgroup.c`): a real unified hierarchy with
-      `cgroup.procs`/`threads`/`events`/`subtree_control`, mkdir/rmdir as the
-      creation API, inotify on `cgroup.events`, `/proc/<pid>/cgroup`, and one
-      enforced controller (`pids`). `memory`, `cpu` and `io` are deliberately
-      not advertised — a limit nothing enforces is worse than an absent one.
-- [x] **Mount propagation, bind mounts and remount**: `MS_SHARED`/`SLAVE`/
-      `PRIVATE`/`UNBINDABLE` (+`MS_REC`), `MS_BIND`, `MS_REMOUNT`, reported in
-      `/proc/self/mountinfo`; devtmpfs became a real device filesystem instead
-      of an alias for tmpfs.
-- [x] 28 Linux-ABI defects found and fixed by doing it — among them the clone
-      child getting a zeroed register file (every glibc thread died at `rip=0`),
-      `accept4` writing past the caller's sockaddr (dbus died of a smashed
-      stack), `CLOCK_REALTIME` walking backwards, a freshly created file with
-      `st_nlink == 0`, and `/proc/<pid>/fd/N` frozen at its first target.
-      Details in [`docs/debian-systemd-boot.md`](debian-systemd-boot.md).
-- [x] `done` Five more defects that stopped PID 1 or every unit: `/proc` files
-      reported as character devices (systemd refuses to read anything that is
-      not a regular file), `/proc/<pid>/fd/N` frozen at its first target (so
-      five different mounts landed on one node), no `/proc/<pid>/cgroup` or
-      `/proc/cgroups`, no `oom_score_adj`, and a procfs writer returning 0 for a
-      successful write — which glibc's stdio spins on forever.
-- [x] `done` udev: `systemd-udevd` runs, receives the kernel's uevents and
-      forks workers, and its **event queue drains again**. A worker takes its
-      first device across the fork and every later one over a unicast netlink
-      message, which it accepts only when the message's source `nl_pid` is the
-      manager's monitor port id — and this kernel reported the sending TASK's
-      pid there instead of the sending SOCKET's port id, so every later device
-      was discarded (`Unicast netlink message ignored`) and udevd sat at its
-      child limit. Fixed; one worker now processes several devices in turn,
-      `.device` units are created and `udevadm control --ping` is answered.
-- [x] `done` **systemd-logind** reaches active and answers `loginctl`. It was
-      not a logind defect at all: every unit with `PrivateTmp=` failed at
-      `start` with `Result=resources`, because a path component longer than 63
-      characters resolved to nothing (see M119).
-- [x] `done` **The boot reaches `graphical.target`**, and the 90-second
-      `daemon-reload` is retracted: it takes 0.6-0.7 s here, and the graphical
-      target was never *not reached* — the harness boots
-      `systemd.unit=multi-user.target`, so the manager was never asked for it.
-      Asked, it reaches active in one step.
-- [x] `done` **The unit cache could not see a new unit file.** POSIX requires
-      that creating or removing an entry mark the containing directory
-      modified, and nothing here did; timestamps also had whole-second
-      resolution. systemd re-reads a unit directory only when its mtime differs
-      from the one its last scan recorded, so a unit written after the first
-      reload was invisible for ever. Directories are now stamped on
-      create/unlink/rename and inodes carry nanoseconds. Four checks came back
-      with it: `notify-ready`, `private-tmp`, `timer-fires`,
-      `restart-on-failure`.
-- [x] `done` **A signal could not end a sleep.** `kill(2)` woke a target that
-      was blocked on a wait channel or stopped, and left one sleeping on the
-      clock where it was, so a process in `nanosleep(2)` carried the signal
-      until its sleep ran out — `kill -TERM` on `sleep 30` landed thirty
-      seconds later, and `timeout(1)` returned the right answer while bounding
-      nothing. Every bound in every harness here was that.
-- [x] `done` Four more Linux-ABI defects: `rename(2)` truncated a destination
-      name at 63 characters (atomic replace-by-rename uses long temporary
-      names); `open(2)` never consulted a mount's `MS_RDONLY`, so `O_WRONLY`
-      succeeded and `O_TRUNC` emptied files on a read-only mount; the mount
-      lookup answered with the oldest mount at a node rather than the newest,
-      which is what a self-bind + read-only remount depends on; and a
-      zero-length datagram was dropped on send, refused on receive and never
-      made a socket readable.
-- [x] `done` **All 32 systemd checks pass**, `graphical.target` included, on a
-      stock Debian userspace booted on this kernel: kernel 1.87 s + userspace
-      19.6 s. The four that were still red were measured against a **stale
-      image** — `tests/systemd-smoke.sh` does not rebuild
-      `debian-systemd.ext4`, so a harness change does not reach the guest until
-      `PROFILE=systemd tools/images/mk-debian-image.sh` runs again. Rebuilt,
-      with this round's kernel fixes in place, the whole-disk lookup, the
-      `.device` unit, `udevadm --ping`, `ProtectSystem=strict`, both socket
-      activations and `notify-ready` all pass. Details in
-      [`debian-systemd-boot.md`](debian-systemd-boot.md).
+Debian's systemd 252 runs as PID 1 on this kernel. **All 32 checks pass**,
+`graphical.target` included: kernel 1.87 s + userspace 19.6 s, 58 units.
+`make systemd-image` builds it, `make systemd-smoke` boots it.
+
+- [x] `done` The subsystems it needs: **cgroup v2** as a real unified hierarchy
+      (`kernel/fs/cgroup.c`, `pids` enforced; `memory`/`cpu`/`io` deliberately
+      not advertised — a limit nothing enforces is worse than an absent one);
+      **mount propagation, bind mounts and remount** reported in
+      `/proc/self/mountinfo`; devtmpfs as a real device filesystem; journald,
+      dbus and logind all active.
+- [x] `done` **~40 Linux-ABI defects**, each found by systemd asking something
+      by the standard and getting a different answer. The ones worth
+      remembering: `sockaddr_nl.nl_pid` is a *socket* port id and we filled it
+      from the task's pid, which discarded every udev worker's second device;
+      creating an entry never marked the containing directory modified, so
+      systemd could never see a new unit file; `kill(2)` did not wake a task in
+      `nanosleep`, so `timeout(1)` bounded nothing; `name_to_handle_at`
+      reported mount id 0, which disabled PID 1's device monitor for the whole
+      boot. Full list in [`debian-systemd-boot.md`](debian-systemd-boot.md).
+- [x] `done` Two retractions worth keeping: the 90-second `daemon-reload` does
+      not exist in this tree (0.6–0.7 s), and `graphical.target` was never
+      *unreached* — the harness boots `systemd.unit=multi-user.target`, so it
+      was never asked for.
+- [ ] `partial` **PCI bus topology under `/sys/devices`** (M119):
+      `pci_sysfs_publish_all()` publishes every function the enumeration finds,
+      with `/sys/bus/pci/devices` links and a writable `uevent`. No `driver`
+      link — this kernel records no binding.
+
+- [x] `done` **A Debian desktop draws on the DRM path.** `graphical.target` was
+      only ever a name on that image — it ships no display server. A
+      `PROFILE=graphics` image adds Debian's own Weston (160 packages) started
+      by a systemd unit on `/dev/dri/card1`, pixman renderer, nothing
+      underneath: 1280x800, connector `Virtual-1`, panel, clock and two client
+      windows, [photographed](images/m112-debian-weston.png) from the host.
+      `tests/debian-graphics-smoke.sh` (12 checks) asserts on the frame's
+      colour count, on `/usr/bin/weston` opening the card in the kernel's trace,
+      and on `/proc/1/comm`. Detail in [`debian-graphics.md`](debian-graphics.md).
+- [x] `done` **Five kernel defects it found**: a task SIGKILLed inside `mmap`
+      never handed back the per-address-space mutator lock, so every process
+      hashing to that slot spun for ever and the machine went quiet with no
+      panic — and the same omission for `rseq(2)`, which glibc treats as fatal;
+      the imported drivers' `ktime_get()` did not share an origin with
+      `CLOCK_MONOTONIC`, so every page-flip event read ~10 s stale; a read fault
+      installed its neighbour pages with the *faulting* page's protection,
+      putting shared page-cache frames writable into private mappings; and the
+      swap evictor's guard did not implement its own comment.
+- [ ] `partial` **On more than one CPU a process is intermittently killed by
+      `SIGILL` on a valid instruction.** The `#UD` report now dumps the bytes at
+      the faulting instruction and they match the library exactly, and
+      `b1nix.frame-alias` finds no aliased frame — the memory is right and the
+      CPU fetched something else, i.e. a stale instruction-TLB translation.
+      `GFX_SMP=4` lost the compositor in 4 runs of 5; `GFX_SMP=1` did not. The
+      graphics harness runs on one CPU and says why.
+
+⚠ `tests/systemd-smoke.sh` does **not** rebuild `debian-systemd.ext4`. Run
+`PROFILE=systemd sh tools/images/mk-debian-image.sh` first or you measure a
+stale guest; that alone accounted for four checks reported red.
 
 ## M113: KDE Plasma
 
-A second desktop stack, chosen because it shares almost nothing with the first.
-Everything this system has run so far is wlroots — sway, cage and the clients
-around them. Plasma is Qt6 for its rendering and its event loop, KDE Frameworks
-underneath, and its own input and session handling, so it exercises assumptions
-wlroots never made. The ones it breaks on are ours.
+A second desktop stack, chosen because it shares almost nothing with the first:
+everything before it was wlroots. Plasma is Qt6, KDE Frameworks, and its own
+input and session handling, so it breaks on assumptions wlroots never made.
 
-- [x] `done` **Plasma's desktop draws on b1nix**: kwin_wayland compositing, the
-      panel with its application launcher, task manager, system tray and a
-      running clock, the Breeze wallpaper, and a client window carrying KDE's
-      own decorations — [screenshot](images/m113-plasma-desktop.png), taken
-      inside the guest with `grim` and carried out through the serial log. 293
-      Alpine packages staged by `B1NIX_KDE=1`; `/etc/kde.sh` starts the session.
-- [x] `done` Three kernel defects it found, each fixed with its own coverage: a
-      kernel write into a read-only user page panicked the machine (it landed on
-      the tid word every dying thread clears); `/proc/self` was a directory
-      shared by every process, so the per-descriptor nodes under it were shared
-      too; and the signal frame reserved 424 bytes for a 936-byte `ucontext_t`,
-      overlapping the frame it interrupted.
-- [x] `done` **Plasma on the real DRM path**, with no compositor underneath:
+- [x] `done` **Plasma on the real DRM path**, no compositor underneath:
       kwin_wayland modesets `/dev/dri/card1` at 1280x800 and plasmashell paints
-      the panel and wallpaper on it —
-      [photograph](images/m113-plasma-drm.png), taken from the HOST with the
-      QEMU monitor's `screendump` on the virtio-gpu scanout, so nothing in the
-      guest takes part in producing it. `tests/kde-smoke.sh` asserts on the
-      frame's distinct-colour count (a display that never drew dumps a solid
-      rectangle; this one holds ~45000 colours), on `kwin`/`elogind` opening
-      the card in the kernel's own trace, and on the udev entry below.
-- [x] `done` The device chain kwin needs, end to end and with nothing written
-      by hand: the image now ships **eudev**, whose udevd runs elogind's own
-      `71-seat.rules` and writes `/run/udev/data/c226:1` with the `seat` and
-      `master-of-seat` tags. logind then reports `CanGraphical=true`, attaches
-      `[MASTER] drm:card1` to seat0, and answers `TakeDevice`. Details in
-      [docs/kde-plasma-drm.md](kde-plasma-drm.md).
-- [x] `done` **Plasma's memory appetite was the kernel's, and it was an
-      allocator bug.** The heap never split a free block on reuse: a 64-byte
-      allocation landing on a 512 KB free block consumed all 512 KB forever,
-      and coalescing made it a ratchet. On an idle desktop the kernel heap
-      climbed ~5 MB/s and never fell — 621 MB at kwin start, 1516 MB three
-      minutes later, live (not fragmented: live 1483 MB against 11 MB free).
-      With split-on-reuse the same workload holds **104 MB and stops growing**,
-      and Plasma runs in 4 GB again. Covered by `KHEAP-SELFTEST`.
-- [x] `done` The instruments that made it answerable, all absent before:
-      `/proc/meminfo` now reports Cached/Dirty/AnonPages/Slab/MemAvailable
-      rather than four numbers of which "available" was a copy of "free";
-      `/proc/<pid>/status` reports `VmRSS`/`VmSize`/`VmHWM`, the field every
-      memory tool reads; and `/proc/b1nix-kheap` prints the heap's live and
-      free blocks by size class and totals live allocations per calling site.
-- [x] `done` **Start-up: 165s → 63s.** Ninety of those seconds were this
-      harness waiting for strings in plasmashell's log that the build never
-      prints, while the desktop was already on screen — the second time that
-      check has been wrong in the same way, and both times its number was read
-      as Plasma being slow. It now keys on kwin's own log of plasmashell
-      binding globals. Of what remains, ~20s is `udevadm settle` timing out on
-      the udev worker stall (M112).
-- [ ] `partial` **kwin falls back to the legacy modeset path**: it asks for
-      `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` (capability 6), which Linux added
-      in 6.7 and the imported core is 6.6, so the refusal is correct and kwin
-      handles it. Atomic modesetting is separately disabled by kwin itself in
-      virtual machines. Legacy works; universal planes are not yet offered.
-- [x] `done` `kioworker`'s **detected stack smash** (`SIGSEGV` at
-      `__stack_chk_fail`), which left Plasma's desktop containment blank. The
-      `ucontext_t` reservation above was one writer past the end of a stack
-      object; the second was `getsockname`/`getpeername` reporting a flat
-      `sizeof(struct sockaddr_un)` for every AF_UNIX socket. Qt's socket engine
-      hands one `socklen_t` to both calls, so the 110 the first answered with
-      became the second's capacity for a 28-byte object. Covered by
-      `M57-SMOKE: ok unix-addrlen` and `unix-addrlen-reuse`.
+      on it — [photograph](images/m113-plasma-drm.png), taken from the HOST
+      with QEMU's `screendump`, so nothing in the guest produces it.
+      `tests/kde-smoke.sh` asserts on the frame's distinct-colour count (a
+      display that never drew dumps 2 colours; this holds ~45000), on the
+      kernel's own trace of `kwin`/`elogind` opening the card, and on the udev
+      entry. 293 Alpine packages via `B1NIX_KDE=1`; `/etc/kde.sh` runs it.
+- [x] `done` The wall was **`O_PATH` and `O_NOFOLLOW` being dropped** in the
+      open-flag translation, so every symlink was followed. systemd's `chase()`
+      — every `sd_device` lookup, so all of logind — walks paths with
+      `O_PATH|O_NOFOLLOW` and asks `fstat` what it got; it got the directory
+      behind `/sys/dev/char/226:1`, so the device came back named `226:1`
+      rather than `card1` and `TakeDevice` answered ENODEV without opening
+      anything.
+- [x] `done` The device chain, with nothing written by hand: the image ships
+      **eudev**, whose udevd runs elogind's own `71-seat.rules` and writes
+      `/run/udev/data/c226:1`. Needed the DRM `uevent` files to become writable
+      (`udevadm trigger` coldplugs by writing to them) and to carry `DEVTYPE`.
+- [x] `done` **Memory and start-up were both ours, not Plasma's**: a 4 GB guest
+      was exhausted because the kernel heap never split a reused block (M115),
+      and 90 s of a 165 s start-up was this harness waiting for log strings the
+      build never prints. Now 104 MB of heap, 63 s, and 4 GB is enough.
+- [ ] `partial` kwin falls back to the **legacy modeset path**: it asks for
+      `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`, added in Linux 6.7 while the
+      imported core is 6.6, so the refusal is correct. Universal planes are
+      not yet offered; legacy works.
+
+Details, and the traps this cost, in [`kde-plasma-drm.md`](kde-plasma-drm.md).
+
+## M114: The layers under the missing applets
+
+Alpine's BusyBox builds 304 applets and ours built 287. Most of the difference
+was not a build option but an absent kernel subsystem, so the subsystems were
+written. Detail in [applet parity](applet-parity.md).
+
+- [x] `done` `readahead(2)`: a real prefetch of a file's blocks into the cache
+      through the ordinary read path, not an accepted hint. Unblocks
+      `readahead`.
+- [x] `done` `TIOCCONS`: kernel console output copied to a terminal. The
+      console prints from under a spinlock with interrupts off, where a device
+      write may not sleep, so it pushes into a ring that a thread drains and
+      reports loss rather than swallowing it. Unblocks `setconsole`.
+- [x] `done` Software RAID (`kernel/dev/md.c`): striping and mirroring as an
+      ordinary block device, assembled by `RAID_AUTORUN` from superblocks the
+      members carry. The format is b1nix's own and says so — nothing here can
+      write or verify Linux's, so claiming it would be a promise no test could
+      keep. No resynchronisation: a failed member stays failed rather than
+      silently serving stale data. Unblocks `raidautorun`.
+- [x] `done` Network block device (`kernel/dev/nbd.c`): the NBD protocol over
+      the existing TCP stack, driven either from the kernel or through the
+      ioctl interface `nbd-client` speaks — the socket it hands over is held by
+      reference, because an fd number belongs to one process and can be closed
+      underneath the kernel. Unblocks `nbd-client`.
+- [x] `done` ATAPI packet reads: a CD-ROM registers as a read-only block device
+      with its own 2048-byte blocks, so an ISO on it mounts like any filesystem.
+      Read only — a write path that could never be tested would be code nobody
+      has run. Unblocks `eject` and `volname`.
+- [x] `done` MTD over CFI NOR flash (`kernel/dev/mtd.c`): the chip QEMU gives
+      through `-drive if=pflash`, probed with a CFI query and described by its
+      own table. `/dev/mtd0` offers the erase a block device cannot, and
+      `/dev/mtdblock0` the block face for a filesystem. Unblocks
+      `flash_eraseall` and `flashcp`. NAND stays out: its tools exist for
+      out-of-band data NOR has none of.
+- [x] `done` `nsenter` and `unshare` needed no new layer, only enabling: each
+      check compares the namespace's answer with the parent's, since a command
+      that exits 0 says nothing about isolation.
 
 ## M115: The stacks the kernel boots and syscalls on
 
-Two kernel stacks in `.bss` with nothing under them but more `.bss`. Both
-overflowed into it silently, and one of them had been doing so on every boot
-for months while the blame landed on whoever read the clobbered word next.
+Two kernel stacks in `.bss` with nothing below them but more `.bss`. Both
+overflowed into it silently; one had been doing so on every boot for months
+while the blame landed on whoever read the clobbered word next.
 
 - [x] `done` **The boot stack overflowed into `proto_list`.** The recurring
-      death of the `iommu` smoke instance — a `#GP` in `proto_snapshot` some
-      runs, a `SPINLOCK LOCKUP` on `proto_lock` in others, and misattributed to
-      the change under test at least twice — was neither a race nor anything in
-      `proto.c`. `stack_bottom` was 64 KiB; below it sit the six boot page
-      tables (24 KiB) and below those `proto_list` and friends. `kernel_main`
-      runs every probe and self-test inline plus a scheduler pass on any timer
-      tick, and exceeds 64 KiB. **The first 24 KiB of overflow landed in page
-      tables `vmm_init` had already abandoned, so it was consequence-free** —
-      only past that did it reach live state. Ordinary instances peak at
-      15,144 bytes; the `iommu` instance, with its switch, bridge, six tablets
-      and two NVMe, reaches 103,232, and `proto_list` sits 28,624 bytes down.
-      That is the whole reason only one instance ever failed.
-- [x] `done` Found with hardware watchpoints: a watchpoint on `proto_list`
-      fired with `rsp` **equal to the address being written** — the writes were
-      stack pushes. Now 256 KiB with a 32 KiB unmapped guard below, armed by
-      `paging_install_guard_page()` once the kernel window exists. **3 of 15
-      boots → 0 of 15**; and rebuilt at the old 64 KiB with the guard armed,
-      3 of 3 boots stop with `#EXC boot-stack overflow`, which says the old
-      stack overflowed on *every* boot and was merely usually harmless.
-- [x] `done` **`x86_syscall_stack` had the same defect, worse placed**: 64 KiB
-      with no guard, immediately above `stack_top`, so an overflow there ran
-      down into the boot stack. The syscall path carries a 28,584-byte frame.
-      Same treatment — 256 KiB and a 32 KiB guard.
-- [x] `done` Both guards are counted, not assumed: the kernel prints
-      `vmm: boot-stack guard N/N pages unmapped` and the same for the syscall
-      stack, `kernel_main` prints `BOOT-STACK: peak=/total=/pct=`, and the
-      suite fails a run whose peak passes 75%, whose paint is fully consumed,
-      or whose tripwire did not install. On every instance — the margin is the
-      thing under test.
+      death of the `iommu` instance — a `#GP` in `proto_snapshot` some runs, a
+      `SPINLOCK LOCKUP` on `proto_lock` in others, misattributed to the change
+      under test at least twice — was neither a race nor anything in
+      `proto.c`. 64 KiB of stack, then the boot page tables (24 KiB, already
+      abandoned by `vmm_init`, so that much overflow was consequence-free),
+      then live state 28,624 bytes down. Ordinary instances peak at 15,144
+      bytes; the `iommu` instance reaches 103,232, which is why only it failed.
+- [x] `done` Now 256 KiB with a 32 KiB unmapped guard below, and the same for
+      **`x86_syscall_stack`**, which had the identical defect worse placed —
+      64 KiB immediately above `stack_top`, so it overflowed *into* the boot
+      stack, and the syscall path carries a 28,584-byte frame.
+      **3 of 15 boots → 0 of 15.** Rebuilt at 64 KiB with the guard armed, 3 of
+      3 boots stop with `#EXC boot-stack overflow`: the old stack overflowed
+      every boot and was merely usually harmless.
+- [x] `done` Both guards are counted rather than assumed — the kernel prints
+      the pages it unmapped and `kernel_main` prints the peak, and the suite
+      fails a run over 75%, one whose paint is consumed, or one whose tripwire
+      did not install. On every instance: the margin is what is under test.
+
+Found with hardware watchpoints — one on `proto_list` fired with `rsp` equal to
+the address being written, which named the write as a stack push. Worth
+remembering: a flaky fault in subsystem X whose bad value looks like
+uninitialised memory may have nothing to do with X. Check what is under the
+stacks.

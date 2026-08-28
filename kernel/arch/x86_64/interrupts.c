@@ -1051,6 +1051,34 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
       break;
     }
 
+    /* The bytes at the faulting instruction.
+     *
+     * On an invalid-opcode fault this is the whole question, and it has two
+     * completely different answers. Either the program really does contain an
+     * instruction this CPU does not implement — in which case the bytes decode
+     * to it and the fault is the program's — or the bytes are not the
+     * instruction the program's own file holds at that offset, and what
+     * faulted is the mapping: a page that is not the page it should be. The
+     * two are indistinguishable from the address alone, and telling them apart
+     * by disassembling the library on the host and comparing by hand is a
+     * round trip per fault. */
+    if (frame->vector == 6) {
+      extern int syscall_copyin(void *dst, const void *user_src,
+                                unsigned long size);
+      unsigned char op[16];
+
+      console_write("opcode bytes at rip:");
+      if (syscall_copyin(op, (void *)(usize)frame->rip, sizeof(op)) == 0) {
+        for (unsigned i = 0; i < sizeof(op); i++) {
+          console_write(" ");
+          console_write_hex64(op[i]);
+        }
+        console_write("\n");
+      } else {
+        console_write(" unreadable\n");
+      }
+    }
+
     /*
      * What the registers were pointing at.
      *
@@ -1370,7 +1398,27 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
      * instruction, and only the faulting address and its page-table entry say
      * why it was refused. A write to a page that is present but read-only and
      * a write to nothing at all are the same signal and different bugs. */
-    if (sig == SIGSEGV || sig == SIGBUS) {
+    /* ...but ONLY for a page fault.
+     *
+     * CR2 is written by #PF and by nothing else, and the error code's
+     * present/write/user/fetch bits mean those things only in a #PF frame. A
+     * #GP raised in ring 3 -- an unaligned SSE access, a non-canonical address
+     * -- also becomes SIGSEGV here, and printing this block for it reports the
+     * CR2 of some unrelated earlier fault as the faulting address, together
+     * with a page-table entry for it and a decoding of a #GP selector as
+     * "not-present, read, kernel". Every word of that is false, and it is
+     * exactly the kind of confident wrong answer that costs a day. */
+    if ((sig == SIGSEGV || sig == SIGBUS) && frame->vector != 14) {
+      console_write(" vector=");
+      console_write_dec(frame->vector);
+      console_write(" (");
+      console_write(frame->vector < 32 && exception_names[frame->vector]
+                        ? exception_names[frame->vector]
+                        : "?");
+      console_write(") err=0x");
+      console_write_hex64(frame->error_code);
+      console_write(" (not a page fault: no faulting address)");
+    } else if (sig == SIGSEGV || sig == SIGBUS) {
       extern u64 vmm_query_leaf_pte(u64 vaddr);
       u64 cr2;
 

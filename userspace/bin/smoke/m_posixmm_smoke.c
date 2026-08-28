@@ -12,6 +12,9 @@
  *   MM-SMOKE: ok ucontext-size
  *   MM-SMOKE: ok copyout-cow
  *   MM-SMOKE: ok copyout-readonly
+ *   MM-SMOKE: ok file-map-privacy
+ *   MM-SMOKE: ok rseq-after-sigkill
+ *   MM-SMOKE: ok mmap-after-sigkill
  *   MM-SMOKE: done
  */
 #include <signal.h>
@@ -28,6 +31,7 @@
 #include <sys/wait.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 static void marker(const char *s) { write(1, s, strlen(s)); }
 
@@ -468,6 +472,304 @@ static int test_ucontext_size(void)
 	return 0;
 }
 
+
+/* ---- test: the address-space lock survives a SIGKILL taken inside mmap ----
+ *
+ * mmap/munmap/mprotect serialise on a per-address-space mutex, and the slot a
+ * space uses is chosen by hashing its PML4 frame, so unrelated processes share
+ * slots. The lock is yielding and is released only by the code that took it --
+ * so a task killed while holding one leaves it held for ever, and every other
+ * process whose address space hashes to that slot then blocks in mmap until
+ * the machine goes quiet. There is no error and no panic: the symptom is a
+ * guest that stops answering.
+ *
+ * scheduler_exit_current hands the lock back, but a task killed by SIGKILL is
+ * marked dead from inside the scheduler and never runs that path. exit_group
+ * posts SIGKILL to every sibling, so any multithreaded program that exits
+ * while one of its threads is in mmap could do this -- which is every desktop
+ * program there is.
+ *
+ * The test kills children at the moment they are looping through mmap, then
+ * asks fresh children to map memory and reports how many of them came back. A
+ * child that never returns from mmap is the leak, and because it hangs rather
+ * than fails, the reaping is bounded and the count is what is reported.
+ */
+#define MMK_VICTIMS 120
+#define MMK_PROBES 48
+
+static void mmk_map_loop(int rounds)
+{
+	for (int i = 0; i < rounds; i++) {
+		void *p = mmap(0, 64 * 4096, PROT_READ | PROT_WRITE,
+		               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (p == MAP_FAILED)
+			_exit(3);
+		*(volatile unsigned char *)p = 1;
+		munmap(p, 64 * 4096);
+	}
+}
+
+static int test_mmap_lock_after_sigkill(void)
+{
+	/* Kill each victim while it is inside the mapping loop. The delay is a
+	 * spin rather than a sleep: the window is the few microseconds a task
+	 * spends holding the lock, and a 10 ms tick steps straight over it. */
+	for (int v = 0; v < MMK_VICTIMS; v++) {
+		pid_t pid = fork();
+		if (pid < 0)
+			return 1;
+		if (pid == 0) {
+			mmk_map_loop(100000);
+			_exit(0);
+		}
+		volatile unsigned long spin = 0;
+		unsigned long budget = 2000UL + (unsigned long)v * 350UL;
+		while (spin < budget)
+			spin++;
+		kill(pid, SIGKILL);
+		waitpid(pid, 0, 0);
+	}
+
+	/* Now ask fresh processes to map memory. Each has its own address space,
+	 * so between them they cover the slot table; one that hashes to a leaked
+	 * slot never returns from its first mmap. */
+	pid_t probes[MMK_PROBES];
+	for (int i = 0; i < MMK_PROBES; i++) {
+		probes[i] = fork();
+		if (probes[i] < 0)
+			return 2;
+		if (probes[i] == 0) {
+			mmk_map_loop(40);
+			_exit(0);
+		}
+	}
+
+	/* Bounded, because the failure being tested for is a hang: a blocking
+	 * waitpid here would take the whole suite down with it instead of
+	 * reporting the number that matters. */
+	int reaped = 0;
+	for (int round = 0; round < 3000 && reaped < MMK_PROBES; round++) {
+		for (int i = 0; i < MMK_PROBES; i++) {
+			if (probes[i] <= 0)
+				continue;
+			int st = 0;
+			pid_t r = waitpid(probes[i], &st, WNOHANG);
+			if (r == probes[i]) {
+				probes[i] = -1;
+				reaped++;
+			}
+		}
+		if (reaped < MMK_PROBES)
+			usleep(5000);
+	}
+	if (reaped != MMK_PROBES) {
+		char msg[96];
+		int n = snprintf(msg, sizeof(msg),
+		                 "MM-SMOKE: mmap-after-sigkill stuck=%d of %d\n",
+		                 MMK_PROBES - reaped, MMK_PROBES);
+		if (n > 0)
+			write(1, msg, (size_t)n);
+		for (int i = 0; i < MMK_PROBES; i++)
+			if (probes[i] > 0)
+				kill(probes[i], SIGKILL);
+		return 3;
+	}
+	return 0;
+}
+
+
+/* ---- test: a file mapping's neighbours get the mapping's own protection ----
+ *
+ * A read fault on a file-backed page maps the pages around it too, straight
+ * out of the page cache and without a fault of their own. Those frames are
+ * shared with every other mapper of the file, so the protection they are
+ * installed with is the whole question: a MAP_PRIVATE writable mapping that
+ * gets one of them WRITABLE writes the process's private stores into the page
+ * cache, and the next program to map that file reads them -- which for a
+ * shared library means executing another process's relocated pointers.
+ *
+ * So: touch page 0 to bring a window in, store into a page the process never
+ * faulted itself, and ask the file what it holds. Private stores must not
+ * reach it; shared stores must.
+ */
+#define MMF_PAGES 32
+#define MMF_TOUCH_PAGE 7
+
+static int mmf_make(const char *path, unsigned char fill)
+{
+	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	unsigned char page[4096];
+	memset(page, fill, sizeof(page));
+	for (int i = 0; i < MMF_PAGES; i++) {
+		if (write(fd, page, sizeof(page)) != (ssize_t)sizeof(page)) {
+			close(fd);
+			return -1;
+		}
+	}
+	return fd;
+}
+
+static int mmf_byte_in_file(const char *path, off_t off)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	unsigned char b = 0;
+	ssize_t r = pread(fd, &b, 1, off);
+	close(fd);
+	return r == 1 ? (int)b : -1;
+}
+
+static int test_file_map_privacy(void)
+{
+	const char *priv = "/tmp/mm-map-private";
+	const char *shar = "/tmp/mm-map-shared";
+	size_t len = (size_t)MMF_PAGES * 4096;
+	off_t off = (off_t)MMF_TOUCH_PAGE * 4096;
+
+	int fd = mmf_make(priv, 0x5a);
+	if (fd < 0)
+		return 1;
+	unsigned char *p = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	if (p == MAP_FAILED) {
+		close(fd);
+		return 2;
+	}
+	/* Read page 0. Whatever the kernel maps around it is mapped now, without
+	 * a fault of its own -- which is the case under test. */
+	if (p[0] != 0x5a) {
+		munmap(p, len);
+		close(fd);
+		return 3;
+	}
+	p[off] = 0xc3;
+	if (p[off] != 0xc3) {
+		munmap(p, len);
+		close(fd);
+		return 4;
+	}
+	int in_file = mmf_byte_in_file(priv, off);
+	munmap(p, len);
+	close(fd);
+	unlink(priv);
+	if (in_file != 0x5a)
+		return 5; /* the private store escaped into the file */
+
+	/* The same shape, shared: the store must reach the file. */
+	fd = mmf_make(shar, 0x33);
+	if (fd < 0)
+		return 6;
+	p = mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (p == MAP_FAILED) {
+		close(fd);
+		return 7;
+	}
+	if (p[0] != 0x33) {
+		munmap(p, len);
+		close(fd);
+		return 8;
+	}
+	p[off] = 0x77;
+	if (msync(p, len, MS_SYNC) != 0) {
+		munmap(p, len);
+		close(fd);
+		return 9;
+	}
+	in_file = mmf_byte_in_file(shar, off);
+	munmap(p, len);
+	close(fd);
+	unlink(shar);
+	if (in_file != 0x77)
+		return 10; /* the shared store never reached the file */
+	return 0;
+}
+
+
+/* ---- test: a SIGKILLed task gives its rseq(2) area back ------------------
+ *
+ * glibc registers an rseq area for every thread it creates, and treats a
+ * refusal on a thread as fatal -- it prints "Fatal glibc error: rseq
+ * registration failed" and kills the process. So a kernel that loses track of
+ * a registration does not degrade, it kills programs; Weston's terminal died
+ * of exactly this.
+ *
+ * The registrations live in a table keyed by the task. The scheduler's
+ * SIGKILL path releases futexes, timers and ptrace links by hand and did not
+ * release this, so every task killed by a signal leaked its entry -- and once
+ * its task slot was reused, the next thread's first registration looked like a
+ * conflicting re-registration of a different area and was refused.
+ *
+ * Kill more children than the table has room for, then register from a fresh
+ * process. With the leak the table is full (or the recycled slot conflicts)
+ * and the registration is refused.
+ */
+#define RSEQ_SYS 334
+#define RSEQ_KILLS 200
+#define RSEQ_SIG 0x53053053u
+
+struct mm_rseq_area {
+	unsigned int cpu_id_start;
+	unsigned int cpu_id;
+	unsigned long long rseq_cs;
+	unsigned int flags;
+	unsigned int pad;
+} __attribute__((aligned(32)));
+
+static int mm_rseq_register(struct mm_rseq_area *a)
+{
+	return (int)syscall(RSEQ_SYS, a, (long)32, (long)0, (long)RSEQ_SIG);
+}
+
+static int test_rseq_after_sigkill(void)
+{
+	static struct mm_rseq_area probe;
+
+	/* Is rseq implemented at all? A kernel that answers ENOSYS has nothing
+	 * to leak and nothing to test; say so rather than passing quietly. */
+	if (mm_rseq_register(&probe) != 0)
+		return 1;
+	/* Give it back, so the parent's own slot is not what runs out. */
+	if ((int)syscall(RSEQ_SYS, &probe, (long)32, (long)1 /* UNREGISTER */,
+	                 (long)RSEQ_SIG) != 0)
+		return 2;
+
+	for (int i = 0; i < RSEQ_KILLS; i++) {
+		pid_t pid = fork();
+		if (pid < 0)
+			return 3;
+		if (pid == 0) {
+			static struct mm_rseq_area child_area;
+			if (mm_rseq_register(&child_area) != 0)
+				_exit(4);
+			/* Sit still and be killed while registered. */
+			for (;;)
+				pause();
+		}
+		/* Long enough for the child to have registered: it does that as its
+		 * first act, and the kill has to land after it. */
+		usleep(2000);
+		kill(pid, SIGKILL);
+		waitpid(pid, 0, 0);
+	}
+
+	/* A fresh process must still be able to register. */
+	pid_t pid = fork();
+	if (pid < 0)
+		return 5;
+	if (pid == 0) {
+		static struct mm_rseq_area after;
+		_exit(mm_rseq_register(&after) == 0 ? 0 : 6);
+	}
+	int st = 0;
+	if (waitpid(pid, &st, 0) != pid)
+		return 7;
+	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+		return 8;
+	return 0;
+}
+
 int main(void) {
 	marker("MM-SMOKE: start\n");
 
@@ -533,6 +835,27 @@ int main(void) {
 		return 80 + rc;
 	}
 	marker("MM-SMOKE: ok copyout-readonly\n");
+
+	rc = test_file_map_privacy();
+	if (rc != 0) {
+		marker("MM-SMOKE: fail file-map-privacy\n");
+		return 110 + rc;
+	}
+	marker("MM-SMOKE: ok file-map-privacy\n");
+
+	rc = test_rseq_after_sigkill();
+	if (rc != 0) {
+		marker("MM-SMOKE: fail rseq-after-sigkill\n");
+		return 120 + rc;
+	}
+	marker("MM-SMOKE: ok rseq-after-sigkill\n");
+
+	rc = test_mmap_lock_after_sigkill();
+	if (rc != 0) {
+		marker("MM-SMOKE: fail mmap-after-sigkill\n");
+		return 100 + rc;
+	}
+	marker("MM-SMOKE: ok mmap-after-sigkill\n");
 
 	marker("MM-SMOKE: done\n");
 	return 0;

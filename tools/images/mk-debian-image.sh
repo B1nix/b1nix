@@ -26,6 +26,9 @@ DEBS="$CACHE/debs"
 # Which init the image is built around.
 #   sysvinit — Debian's sysvinit-core as PID 1 (the original image)
 #   systemd  — Debian's systemd as PID 1, with its full dependency closure
+#   graphics — the systemd image plus a Wayland compositor (Weston) that
+#              modesets a DRM card, so the boot ends at a desktop on the
+#              scanout rather than at a target with nothing behind it
 PROFILE="${PROFILE:-sysvinit}"
 case "$PROFILE" in
 sysvinit)
@@ -38,8 +41,24 @@ systemd)
 	IMG_SIZE_MB="${IMG_SIZE_MB:-768}"
 	IMG_LABEL="${IMG_LABEL:-b1nix-systemd}"
 	;;
+graphics)
+	IMG="${IMG:-$BUILD_DIR/debian-graphics.ext4}"
+	# The tree is ~370 MiB (160 packages: Weston pulls in pango, ffmpeg and
+	# pipewire through libweston's optional backends). 768 MiB leaves room for
+	# /run and the journal without making every run copy a gigabyte.
+	IMG_SIZE_MB="${IMG_SIZE_MB:-768}"
+	IMG_LABEL="${IMG_LABEL:-b1nix-graphics}"
+	;;
 *) echo "mk-debian-image: unknown PROFILE '$PROFILE'" >&2; exit 1 ;;
 esac
+
+# Everything the systemd profile stages -- the machine-id, the unit
+# enablement, the console getty, the harness unit -- the graphics profile
+# needs too: it IS the systemd image with a compositor added. One predicate,
+# so a change to the systemd staging cannot silently miss the graphics image.
+is_systemd_profile() {
+	[ "$PROFILE" = "systemd" ] || [ "$PROFILE" = "graphics" ]
+}
 
 # Docker Hub source of the base rootfs.
 DOCKER_REPO="${DOCKER_REPO:-library/debian}"
@@ -77,6 +96,30 @@ systemd)
 	# /run/udev/data, so no device carries the "systemd" tag and no .device
 	# unit can ever activate.
 	PACKAGES="${PACKAGES:-systemd systemd-sysv udev dbus procps libproc2-0 libncursesw6}"
+	RESOLVE_DEPS="${RESOLVE_DEPS:-1}"
+	;;
+graphics)
+	# The systemd seed, plus what it takes to put a picture on a DRM card:
+	#
+	#   weston            Debian's Wayland compositor, 10.0.1. Its DRM backend
+	#                     is the same route a desktop takes -- find the card
+	#                     through libudev, open it through a launcher, modeset
+	#                     it, scan out of it. Chosen over a full desktop
+	#                     because everything it drags in is a dependency of
+	#                     the compositing, not of a desktop environment.
+	#   fonts-dejavu-core Weston's panel and its terminal draw text through
+	#                     pango, which needs a font on disk; the slim base
+	#                     ships none. The clock in the photograph is what this
+	#                     buys.
+	#   libpam-systemd    pam_systemd.so, which is what registers a logind
+	#                     session. Weston's preferred launcher asks logind for
+	#                     the card, and logind hands a device only to a session
+	#                     on the seat that owns it. Staged for that route; the
+	#                     run currently takes the direct launcher instead.
+	#   util-linux        /bin/login and /usr/bin/setsid, for making such a
+	#                     session the way a display manager would.
+	PACKAGES="${PACKAGES:-systemd systemd-sysv udev dbus procps libproc2-0 \
+libncursesw6 weston fonts-dejavu-core libpam-systemd util-linux}"
 	RESOLVE_DEPS="${RESOLVE_DEPS:-1}"
 	;;
 esac
@@ -549,7 +592,7 @@ FSTAB_EOF
 # and the sysusers/tmpfiles postinst hooks would have created have to be made
 # here. Everything below is ordinary image preparation — enablement symlinks,
 # a machine-id, an fstab — not a workaround for anything the kernel gets wrong.
-if [ "$PROFILE" = "systemd" ]; then
+if is_systemd_profile; then
 	log "staging systemd configuration"
 
 	[ -x "$ROOTFS/lib/systemd/systemd" ] || [ -x "$ROOTFS/usr/lib/systemd/systemd" ] ||
@@ -603,15 +646,10 @@ if [ "$PROFILE" = "systemd" ]; then
 	# The login prompt: console-getty.service, which runs agetty on
 	# /dev/console — on this machine, the serial line.
 	#
-	# NOT serial-getty@ttyS0.service. That unit is BoundTo=dev-ttyS0.device,
-	# and a .device unit only ever becomes active when udev tells systemd about
-	# the device. The image now ships udev and the kernel has the whole
-	# transport it needs — NETLINK_KOBJECT_UEVENT with SO_ATTACH_FILTER, a
-	# writable sysfs `uevent` file for coldplug, and the subsystem links — but
-	# systemd-udevd does not yet come up (see docs/debian-systemd-boot.md), so
-	# dev-ttyS0 still never appears and the getty would wait out its job
-	# timeout. console-getty.service is systemd's own unit for exactly this
-	# situation — it is what a container gets — and it depends on nothing but
+	# NOT serial-getty@ttyS0.service: it is BoundTo=dev-ttyS0.device, and a
+	# .device unit becomes active only once udev tells systemd about the device
+	# (see docs/debian-systemd-boot.md). console-getty.service is systemd's own
+	# unit for this case — what a container gets — and depends on nothing but
 	# /dev/console existing.
 	mkdir -p "$ROOTFS/etc/systemd/system/getty.target.wants"
 	ln -sf /lib/systemd/system/console-getty.service \
@@ -808,15 +846,13 @@ else
 	# moment udevd stopped answering. Printed by the kernel to the console.
 	cat /proc/b1nix-tasks >/dev/null 2>&1
 fi
-# What udevd itself said. It is the only account of what it did with the
-# events it was sent, and it exists now that journald runs.
+# What udevd itself said: the only account of what it did with the events it
+# was sent.
 say "SYSTEMD-SMOKE: --- journal: systemd-udevd.service ---"
 run journalctl -u systemd-udevd.service -b --no-pager -n 15
 
-# Coldplug, now. systemd-udev-trigger.service ran during sysinit, when udevd
-# was still failing to start, so those events had no listener; replaying them
-# is what a working udevd is for and is the only way a .device unit can appear
-# on this boot.
+# Coldplug, now: systemd-udev-trigger.service runs during sysinit, and a replay
+# is the only way a .device unit can appear if udevd was not listening then.
 timeout 20 udevadm trigger --action=add >/dev/null 2>&1 ||
 	say "SYSTEMD-SMOKE: udevadm trigger rc=$?"
 sleep 2
@@ -827,11 +863,9 @@ timeout 20 udevadm settle >/dev/null 2>&1 || true
 # manager cannot invent one. Print the list, then name the one we found.
 say "SYSTEMD-SMOKE: --- systemctl list-units --type=device ---"
 run systemctl --no-pager --no-legend --plain list-units --type=device --state=active
-# Polled, not sampled once. A .device unit appears when the manager's device
-# monitor receives the event udevd re-broadcasts after processing, and those
-# are two asynchronous programs: asking once, at whatever moment this line is
-# reached, measures the scheduler as much as the kernel. Twenty seconds is far
-# longer than the path takes when it works.
+# Polled, not sampled once: the manager's device monitor and udevd are two
+# asynchronous programs, so asking once measures the scheduler as much as the
+# kernel.
 dev_unit=""
 __i=0
 while [ $__i -lt 12 ]; do
@@ -851,23 +885,17 @@ case "$dev_unit" in
 	# told systemd. Print each link of that chain rather than the verdict.
 	say "SYSTEMD-SMOKE: --- udev enumeration diagnosis ---"
 	run sh -c 'timeout 15 udevadm info /sys/class/block/vda 2>&1 | head -24'
-	# The manager's own account of what it did with the event, rather than the
-	# absence of a unit. PID 1 only creates a .device unit from a message its
-	# device monitor accepted, and every reason it can refuse one is logged at
-	# debug level and nowhere else.
-	# Debug for ONE device and then straight back to info: at debug level this
-	# manager writes faster than the serial console drains, and a machine that
-	# slow times out its own udev workers -- which then looks like the defect
-	# being investigated.
+	# Every reason PID 1 can refuse to make a .device unit is logged at debug
+	# level and nowhere else. Debug for ONE device and straight back to info: at
+	# debug level the manager writes faster than the serial console drains, and
+	# a machine that slow times out its own udev workers.
 	run sh -c 'timeout 15 systemctl log-level debug 2>&1'
 	run sh -c 'timeout 20 udevadm trigger --action=change --subsystem-match=block --sysname-match=vda 2>&1'
 	sleep 2
 	run sh -c 'timeout 15 systemctl log-level info 2>&1'
 	run sh -c 'journalctl -b --no-pager -n 150 2>/dev/null | grep -ai "device\|monitor" | tail -25'
 	# Which syscall every task is sitting in, at the moment the units are
-	# missing. A udev worker that stopped answering is a task parked
-	# somewhere, and this names the place -- the alternative is guessing from
-	# the outside about a program that has stopped saying anything.
+	# missing: a udev worker that stopped answering is a task parked somewhere.
 	cat /proc/b1nix-tasks >/dev/null 2>&1
 	run sh -c 'timeout 15 udevadm settle --timeout=5 2>&1; echo "settle rc=$?"'
 	run sh -c 'ls /run/udev/data 2>&1 | tr "\n" " "'
@@ -878,61 +906,6 @@ case "$dev_unit" in
 	;;
 esac
 
-# Deep udev diagnosis: what the daemon says with udev.log_level=debug, and
-# what the device itself looks like in sysfs -- the subsystem link, the uevent
-# file and the properties udev derived from them.
-if [ "$SYSD_DEBUG" = 1 ]; then
-	say "SYSTEMD-SMOKE: --- udev deep: journal ---"
-	run sh -c 'journalctl -u systemd-udevd.service -b --no-pager -n 120 2>&1'
-	say "SYSTEMD-SMOKE: --- udev deep: sysfs vda ---"
-	run sh -c 'ls -la /sys/class/block/ 2>&1 | head -10'
-	run sh -c 'ls -la /sys/block/vda/ 2>&1 | head -30'
-	run sh -c 'readlink -f /sys/class/block/vda 2>&1'
-	# The path block_get_whole_disk() actually builds is
-	# /sys/dev/block/<major>:<minor>/queue -- not the /sys/block one -- so the
-	# view that decides the answer is listed rather than assumed from another.
-	run sh -c 'ls -la /sys/dev/block/ 2>&1 | head -6; ls -la /sys/dev/block/8:0/ 2>&1'
-	run sh -c 'ls -la /sys/block/loop0/ 2>&1 | head -10'
-	# /sys/dev/char: the view libudev uses to find a character device by its
-	# number, and libdrm to find the bus a DRM node sits on.
-	run sh -c 'echo "char dir: [$(ls /sys/dev/char/ 2>&1 | tr "\n" " ")]"'
-	run sh -c 'ls -la /sys/dev/char/226:0/ 2>&1; cat /sys/dev/char/226:0/uevent 2>&1'
-	run sh -c 'ls -l /dev/dri 2>&1 | head -6'
-	# The PCI bus tree, and the cheap proof it works: a device with a parent.
-	# udevadm walks /sys/devices upward, so "looking at parent device" appears
-	# only when the node really has one.
-	run sh -c 'ls /sys/devices/pci0000:00/ 2>&1 | head -12'
-	run sh -c 'ls /sys/bus/pci/devices/ 2>&1 | head -12'
-	run sh -c 'for d in /sys/bus/pci/devices/*; do echo "$d vendor=$(cat $d/vendor 2>&1) device=$(cat $d/device 2>&1) class=$(cat $d/class 2>&1)"; done 2>&1 | head -12'
-	run sh -c 'timeout 15 udevadm info /dev/dri/card0 2>&1 | head -20; echo "---"; timeout 15 udevadm info /dev/vda 2>&1 | grep -i "parent\|P:\|E: SUBSYSTEM" | head -10'
-	run sh -c 'ls -la /sys/devices 2>&1 | head -20'
-	run sh -c 'cat /sys/class/block/vda/uevent 2>&1'
-	run sh -c 'ls -la /sys/class/block/vda/subsystem 2>&1; readlink /sys/class/block/vda/subsystem 2>&1'
-	run sh -c 'ls -la /run/udev 2>&1; ls -la /run/udev/data 2>&1 | head -20'
-	# systemd asks "is this a whole disk?" by looking for
-	# /sys/dev/block/<major>:<minor>/queue -- NOT /sys/block/<name>/queue.
-	# Every block device in this machine answers "Failed to get whole disk
-	# device: No such file or directory", so this prints the exact path it
-	# looks at and whether it is there.
-	say "SYSTEMD-SMOKE: --- udev deep: /sys/dev/block ---"
-	run sh -c '[ -e /sys/dev/block/8:0/queue ] && echo "direct-first: 8:0/queue exists" || echo "direct-first: 8:0/queue MISSING"'
-	# And from inside the kind of mount namespace systemd-udevd.service runs
-	# in. The harness's own shell is in the initial namespace; the worker that
-	# answers "No such file or directory" is not, and "it is there" from the
-	# wrong namespace is not an answer.
-	run sh -c 'timeout 30 systemd-run --quiet --wait --pipe -p MountFlags=slave -p PrivateMounts=yes /bin/sh -c "[ -e /sys/dev/block/8:0/queue ] && echo ns: queue exists || echo ns: queue MISSING; ls /sys/dev/block 2>&1 | head -3" 2>&1'
-	run sh -c 'ls -la /sys/dev/block/ 2>&1 | head -24'
-	run sh -c 'for d in /sys/dev/block/*; do printf "%s queue=%s partition=%s\n" "$d" "$([ -e "$d/queue" ] && echo yes || echo NO)" "$([ -e "$d/partition" ] && echo yes || echo no)"; done 2>&1 | head -24'
-	run sh -c 'cat /sys/class/block/vda/uevent 2>&1; echo "--- /sys/block/vda:"; ls /sys/block/vda 2>&1'
-	run sh -c 'ls -la /dev/vda /dev/disk 2>&1 | head -12'
-	run sh -c 'ls /dev 2>&1 | tr "\n" " " | cut -c1-300'
-	say "SYSTEMD-SMOKE: --- udev deep: udevadm info ---"
-	run sh -c 'timeout 15 udevadm info --path=/sys/class/block/vda 2>&1 | head -30'
-	run sh -c 'timeout 15 udevadm test /sys/class/block/vda 2>&1 | tail -40'
-	say "SYSTEMD-SMOKE: --- udev deep: ping again ---"
-	run sh -c 'timeout 15 udevadm control --ping 2>&1; echo "ping rc=$?"'
-	run sh -c 'timeout 10 udevadm control --log-priority=debug 2>&1; echo "logprio rc=$?"'
-fi
 
 # ── 10. logind answers on the bus ──────────────────────────────────────────
 # is-active is systemd's bookkeeping; loginctl is a method call logind serves.
@@ -978,28 +951,22 @@ fi
 
 # ── 12. the unit types nothing exercised ────────────────────────────────
 #
-# 16 checks stood against an image carrying 225 unit files and 45 helper
-# daemons. What follows drives the parts systemd is actually built out of --
-# socket activation, timers, sandboxing, the readiness protocol -- because a
-# manager that reaches multi-user.target proves only that it can start
-# services in order, and every one of these exercises a different kernel
-# surface underneath.
+# Reaching multi-user.target proves only that the manager can start services in
+# order. What follows drives the parts systemd is built out of -- socket
+# activation, timers, sandboxing, the readiness protocol -- each of which
+# exercises a different kernel surface underneath.
 
-# Units go in /run/systemd/system, which has to exist before anything is
-# written into it -- a unit file that never landed makes every check below it
-# report "inactive", which reads exactly like a broken manager. And systemctl's
-# errors are kept: swallowing them is how a harness ends up measuring itself.
+# Units go in /run/systemd/system, which has to exist first: a unit file that
+# never landed makes every check below report "inactive", which reads exactly
+# like a broken manager. systemctl's errors are kept rather than swallowed.
 mkdir -p /run/systemd/system
 # Two things that must be true before any unit below can start, printed rather
 # than assumed: the directory exists and takes a file, and the manager accepts
 # a reload. "Unit not found" is what both failures look like from the outside.
 say "SYSTEMD-SMOKE:   unitdir=[$(ls -d /run/systemd/system 2>&1)] write=[$(: >/run/systemd/system/.probe 2>&1 && echo ok || echo failed)]"
-# A unit file the manager has not read is "not found" -- which is the right
-# answer, and not a kernel failure. Every unit below is written into
-# /run/systemd/system at runtime, and the six that were written AFTER the single
-# daemon-reload could never start: the harness was measuring its own ordering.
-# The reload no longer costs 90 s (it is under a second), so each new unit file
-# is followed by one.
+# A unit file the manager has not read is "not found", which is the right answer
+# and not a kernel failure -- so every unit written at runtime is followed by its
+# own daemon-reload. The reload costs under a second.
 sd_load() {
 	__lr=$(timeout 60 systemctl daemon-reload 2>&1)
 	__lrc=$?
@@ -1007,10 +974,9 @@ sd_load() {
 		say "SYSTEMD-SMOKE:   daemon-reload for $1 rc=$__lrc: ${__lr:-no output}"
 }
 # Lines in a file that may not exist. `wc -l < missing` is the SHELL failing to
-# open the redirect, before wc runs at all, so `2>/dev/null` on wc silences
-# nothing and `|| echo 0` never fires -- the error went to stderr, into the
-# journal, and became the newest entry for this unit. The journal-index check
-# below then read it back instead of a marker and called the index broken.
+# open the redirect before wc runs at all, so `2>/dev/null` on wc silences
+# nothing and `|| echo 0` never fires -- the error lands in the journal and
+# becomes this unit's newest entry, which the journal-index check reads back.
 count_lines() {
 	[ -f "$1" ] || { echo 0; return; }
 	wc -l <"$1" 2>/dev/null || echo 0
@@ -1023,10 +989,9 @@ sd_reload() {
 	__rc=$?
 	__t1=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
 	prof "after daemon-reload"
-	# rc as well as the text. A `timeout`-killed systemctl prints nothing, so
-	# reporting "${__r:-ok}" alone would call a reload that was cut off at two
-	# minutes a success -- a number that reads as a measurement and is not one.
-	# rc=124 is the timeout; anything else is what systemctl itself returned.
+	# rc as well as the text: a `timeout`-killed systemctl prints nothing, so
+	# "${__r:-ok}" alone would report a reload cut off at two minutes as a
+	# success. rc=124 is the timeout; anything else is systemctl's own.
 	say "SYSTEMD-SMOKE:   daemon-reload ${__t0}->${__t1} rc=${__rc}: ${__r:-no output}"
 }
 sd_start() {
@@ -1034,9 +999,8 @@ sd_start() {
 	__t0=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
 	__err=$(timeout 25 systemctl start "$__u" 2>&1)
 	__rc=$?
-	# Every query bounded too. An unbounded `systemctl is-active` against a
-	# manager that has stopped answering is what turned a 25 s failure into a
-	# five-minute one, and it hid which call was actually stuck.
+	# Every query bounded too: an unbounded `systemctl is-active` against a
+	# manager that has stopped answering hides which call is stuck.
 	__st=$(timeout 15 systemctl is-active "$__u" 2>&1)
 	__t1=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
 	if [ "$__st" = "active" ] || [ "$__st" = "activating" ]; then
@@ -1067,16 +1031,13 @@ sd_start() {
 # Two probes with no systemd in them at all, so a failure here is the kernel's
 # and a failure above it is the manager's.
 if [ "$SYSD_DEBUG" = 1 ]; then
-	# 1. Does `timeout` measure time correctly? Every bounded call in this
-	#    harness rests on it, and an rc=124 that arrives early would make a
-	#    working daemon look hung -- so the instrument is checked before its
-	#    readings are believed. Written to a file rather than passed with -e:
-	#    a multi-line perl program inside a shell single-quoted string is one
-	#    stray quote away from a syntax error that looks like a kernel fault.
-	# Does a plain kill reach a sleeping child at all? `timeout` returns the
-	# right answer and does not bound anything, and the two candidate causes --
-	# "the alarm is wrong" and "the signal never lands" -- are separated by
-	# doing the same thing without timeout(1) in the way.
+	# 1. Does `timeout` measure time correctly? Every bounded call here rests on
+	#    it, and an rc=124 that arrives early makes a working daemon look hung.
+	#    The perl goes in a file rather than after -e: a multi-line program
+	#    inside a single-quoted shell string is one stray quote from a syntax
+	#    error that reads as a kernel fault.
+	#    The plain kill beside it separates "the alarm is wrong" from "the
+	#    signal never lands".
 	say "SYSTEMD-SMOKE: --- kill-sleeper probe ---"
 	run sh -c 'sleep 30 & __p=$!; sleep 1; kill -TERM $__p; wait $__p; echo "kill-sleeper rc=$? (137/143 = signalled)"'
 	run sh -c '__a=$(cut -d" " -f1 /proc/uptime); sleep 30 & __p=$!; sleep 1; kill -KILL $__p; wait $__p >/dev/null 2>&1; __b=$(cut -d" " -f1 /proc/uptime); echo "kill-sleeper KILL elapsed ${__a}->${__b}"'
@@ -1091,13 +1052,10 @@ if [ "$SYSD_DEBUG" = 1 ]; then
 		say "  timerprobe: timeout $__lim sleep $__slp -> rc=$__rc (want $__want) elapsed ${__a}->${__b}"
 	done
 
-	# 1b. systemd's PrivateTmp sequence, reproduced with three commands.
+	# 1b. systemd's PrivateTmp sequence, reproduced with three commands:
 	#     setup_one_tmp_dir() does mkdtemp("/tmp/systemd-private-<id>-<unit>-
-	#     XXXXXX") and then mkdir(that + "/tmp"), and it is the SECOND call
-	#     that answers ENOENT -- which says the directory mkdtemp reported
-	#     creating is not there. Every unit with PrivateTmp= fails the same
-	#     way, systemd-logind among them, so this is one defect wearing
-	#     several names rather than a logind problem.
+	#     XXXXXX") and then mkdir(that + "/tmp"), and it is the SECOND call that
+	#     answers ENOENT. Every unit with PrivateTmp= fails the same way.
 	say "SYSTEMD-SMOKE: --- mkdtemp probe ---"
 	__d=$(mktemp -d /tmp/b1nix-probe-XXXXXX 2>&1)
 	say "  mkdtemp: mktemp -d -> [$__d]"
@@ -1408,14 +1366,12 @@ else
 	say "SYSTEMD-SMOKE: FAIL restart-on-failure (ran $(count_lines /run/b1nix-restart.count) times)"
 fi
 
-# The journal, asked for ONE unit rather than the whole boot: that is its
-# index, not its ability to append.
+# The journal, asked for ONE unit rather than the whole boot: that is its index,
+# not its ability to append.
 #
-# Written to STDOUT on purpose: every other marker goes to /dev/kmsg (agetty
-# takes the console away mid-run), and /dev/kmsg reaches journald as a KERNEL
-# message, which belongs to no unit. So the harness had nothing of its own in
-# its unit's journal and this check was reading whatever noise landed there
-# last. This line is the unit's own output, through StandardOutput=journal.
+# Written to STDOUT on purpose. Every other marker goes to /dev/kmsg, which
+# reaches journald as a KERNEL message belonging to no unit; this line is the
+# unit's own output, through StandardOutput=journal.
 echo "SYSTEMD-SMOKE journal-probe $$"
 sync 2>/dev/null || true
 sleep 1
@@ -1427,14 +1383,12 @@ else
 fi
 
 # enable/disable moves a unit between states. It needs an [Install] section to
-# be enabled at all -- without one the answer is "static", which is not a
-# failure of the manager but of the unit, and asking the wrong question was
-# this harness's own bug the first time round.
-# Bounded, like every other call in this harness. These four were not, and
-# `systemctl enable` does an implicit daemon-reload: when that stopped
-# answering the harness stopped with it, and every check after this point was
-# reported missing rather than failed. A bound turns "the run ended" into "this
-# call did not return", which is the thing worth knowing.
+# be enabled at all -- without one the answer is "static", which is a fault of
+# the unit and not of the manager.
+#
+# Bounded, like every other call here: `systemctl enable` does an implicit
+# daemon-reload, and an unbounded one takes the whole harness with it when the
+# manager stops answering.
 __ed_a=$(cut -d' ' -f1 /proc/uptime)
 timeout 60 systemctl enable b1nix-tick.timer >/dev/null 2>&1
 __ed_rc=$?
@@ -1461,15 +1415,14 @@ else
 fi
 systemctl unmask b1nix-tick.service >/dev/null 2>&1
 
-# How far the boot got, by target rather than by impression. systemd-analyze
-# answers only once the manager has finished starting up, so a machine that
-# reaches this point has genuinely completed its boot transaction -- and the
-# chain names the units it waited on, in order, which no marker of ours can.
-# systemd-analyze refuses to answer while the boot transaction is still
-# running, and this harness IS part of that transaction -- so asking here only
-# ever prints "Bootup is not yet finished". Ask from a process that outlives
-# it: this waits for the manager to stop reporting "starting" and then prints
-# the chain, which lands on the console after the harness's last marker.
+# How far the boot got, by target rather than by impression, with the chain of
+# units it waited on in order.
+#
+# systemd-analyze refuses to answer while the boot transaction is still running,
+# and this harness IS part of that transaction -- asking here only ever prints
+# "Bootup is not yet finished". So ask from a process that outlives it: wait for
+# the manager to stop reporting "starting", then print the chain, which lands on
+# the console after the harness's last marker.
 (
 	__i=0
 	while [ $__i -lt 30 ]; do
@@ -1494,10 +1447,9 @@ say "SYSTEMD-SMOKE: units-loaded=$(systemctl list-units --no-legend --no-pager 2
 say "SYSTEMD-SMOKE: done"
 SSTAGE_EOF
 	chmod 0755 "$ROOTFS/b1nix-systemd-stage.sh"
-	# A harness with a syntax error dies at the first line the shell cannot
-	# parse and prints nothing after it -- which reads exactly like a kernel
-	# that stopped answering. One unbalanced quote in a diagnostic cost a whole
-	# run that way. Parse it here, where the failure is a build error.
+	# A harness with a syntax error dies at the first line the shell cannot parse
+	# and prints nothing after it, which reads exactly like a kernel that stopped
+	# answering. Parse it here, where the failure is a build error.
 	sh -n "$ROOTFS/b1nix-systemd-stage.sh" ||
 		die "b1nix-systemd-stage.sh does not parse"
 
@@ -1514,18 +1466,21 @@ SSTAGE_EOF
 		ExecStart=/b1nix-systemd-stage.sh
 		StandardOutput=journal+console
 		StandardError=journal+console
-		# The harness bounds every command it runs, and the run itself is
-		# bounded by tests/systemd-smoke.sh. 90 s was tighter than either, so
-		# with b1nix.sysd-debug on -- where a single probe deliberately waits
-		# out a 30 s sleep -- systemd killed the harness partway through and
-		# every check after that point was reported as a missing marker.
+		# The harness bounds every command it runs and the run itself is bounded
+		# by tests/systemd-smoke.sh, so this must be looser than both: at 90 s
+		# systemd killed the harness partway through under b1nix.sysd-debug.
 		TimeoutStartSec=480s
 
 		[Install]
 		WantedBy=multi-user.target
 	UNIT_EOF
-	ln -sf /etc/systemd/system/b1nix-smoke.service \
-		"$ROOTFS/etc/systemd/system/multi-user.target.wants/b1nix-smoke.service"
+	# The graphics image has its own harness and a bounded run; the systemd
+	# harness takes a minute of that budget and asks nothing the graphics run
+	# depends on. `tests/systemd-smoke.sh` is where those 32 checks live.
+	if [ "$PROFILE" = "systemd" ]; then
+		ln -sf /etc/systemd/system/b1nix-smoke.service \
+			"$ROOTFS/etc/systemd/system/multi-user.target.wants/b1nix-smoke.service"
+	fi
 
 	# Users and groups the packages' postinst would have made. systemd-sysusers
 	# creates the rest at boot from /usr/lib/sysusers.d.
@@ -1535,6 +1490,318 @@ SSTAGE_EOF
 	fi
 
 	mkdir -p "$ROOTFS/var/log/journal" "$ROOTFS/run/systemd"
+fi
+
+# ── 4c. graphics profile: a compositor that modesets a card ─────────────────
+# The systemd image reaches graphical.target with nothing behind it: no display
+# server is installed, so the target is a name and the scanout stays whatever
+# the firmware left. This profile puts Weston on the DRM path — find the card
+# through libudev, open it, modeset it, scan out of it — so that "graphical"
+# means a picture on the virtual GPU that the host can photograph.
+if [ "$PROFILE" = "graphics" ]; then
+	log "staging the Weston graphical session"
+
+	[ -x "$ROOTFS/usr/bin/weston" ] ||
+		die "weston missing from the unpacked tree"
+
+	# pam_systemd is what registers a logind session, and Debian installs the
+	# line from libpam-systemd's postinst — which unpacking a .deb never runs.
+	# Weston's preferred launcher asks logind for the card, and logind hands a
+	# device only to a session, so without this there is no session to ask.
+	if [ -f "$ROOTFS/lib/x86_64-linux-gnu/security/pam_systemd.so" ] ||
+		[ -f "$ROOTFS/usr/lib/x86_64-linux-gnu/security/pam_systemd.so" ]; then
+		if ! grep -q 'pam_systemd.so' "$ROOTFS/etc/pam.d/common-session" 2>/dev/null; then
+			echo 'session optional        pam_systemd.so' \
+				>>"$ROOTFS/etc/pam.d/common-session"
+		fi
+	else
+		die "pam_systemd.so missing (libpam-systemd not unpacked?)"
+	fi
+
+	# Weston's own configuration. The background colour is opaque and dark so
+	# that a frame which is only the shell's background is still visibly
+	# different from a scanout nobody wrote to; the panel and its clock, and
+	# the terminal the harness starts, are what put thousands of colours in it.
+	mkdir -p "$ROOTFS/etc/xdg/weston"
+	cat >"$ROOTFS/etc/xdg/weston/weston.ini" <<-'WINI_EOF'
+		[core]
+		# No GL: the pixman renderer draws into a dumb buffer, which is the
+		# smallest honest path to a picture and needs no Mesa driver at all.
+		require-input=false
+		idle-time=0
+
+		[shell]
+		background-color=0xff1a3d5c
+		panel-position=top
+		locking=false
+		animation=none
+	WINI_EOF
+
+	# ── the graphical harness ───────────────────────────────────────────────
+	cat >"$ROOTFS/b1nix-graphics-stage.sh" <<'GSTAGE_EOF'
+#!/bin/sh
+# b1nix graphical harness — OUR file, not Debian's. Started by
+# b1nix-graphics.service once multi-user.target is up.
+#
+# Every "ok" below is printed only after the thing it names was observed to
+# have happened, and the thing the run is finally judged on is not printed here
+# at all: it is the frame the host takes off the virtual GPU with the QEMU
+# monitor's screendump, which nothing in this guest takes part in producing.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+export SYSTEMD_COLORS=0 SYSTEMD_PAGER=cat SYSTEMD_LESS=
+
+# /dev/kmsg, for the same reason the systemd harness uses it: a getty claims
+# /dev/console while this is still running and everything written to it after
+# that point disappears from the serial log.
+say() {
+	echo "$@" >/dev/kmsg 2>/dev/null ||
+		echo "$@" >/dev/console 2>/dev/null ||
+		echo "$@"
+}
+run() {
+	timeout 25 "$@" 2>&1 | sed 's/^/    /' |
+		while IFS= read -r __l; do say "$__l"; done
+}
+ok()   { say "GFX-SMOKE: ok $1"; }
+bad()  { say "GFX-SMOKE: FAIL $1"; }
+
+RUN_SECONDS=${GFX_RUN_SECONDS:-90}
+__rs=$(grep -o 'b1nix.gfx-seconds=[0-9]*' /proc/cmdline 2>/dev/null | head -1)
+[ -n "$__rs" ] && RUN_SECONDS=${__rs#b1nix.gfx-seconds=}
+
+say "GFX-SMOKE: start pid=$$ run_seconds=$RUN_SECONDS"
+
+# ── 0. whose init this is ──────────────────────────────────────────────────
+# Read PID 1 from /proc rather than from the boot messages: what a distribution
+# prints on the console is a banner, and a banner is not evidence of what is
+# running. This is a stock Debian image, so the answer is the point.
+pid1=$(tr -d '\000' </proc/1/comm 2>/dev/null | tr -d ' \n')
+if [ "$pid1" = "systemd" ]; then
+	ok "pid1-systemd"
+else
+	bad "pid1-systemd got='$pid1'"
+fi
+
+# ── 1. the card is there, and sysfs describes it ───────────────────────────
+say "GFX-SMOKE: --- /dev/dri ---"
+run sh -c 'ls -l /dev/dri 2>&1'
+say "GFX-SMOKE: --- /sys/class/drm ---"
+run sh -c 'ls -l /sys/class/drm 2>&1'
+
+CARD=
+for c in card1 card0; do
+	[ -e "/dev/dri/$c" ] || continue
+	# A node in /dev that sysfs does not describe is invisible to libudev, and
+	# weston finds its card through libudev and nothing else.
+	if [ -d "/sys/class/drm/$c" ]; then CARD=$c; break; fi
+done
+if [ -n "$CARD" ]; then
+	ok "drm-card $CARD"
+else
+	bad "drm-card (no /dev/dri/card* that /sys/class/drm also knows)"
+fi
+
+# ── 2. udev catalogued it, which is what gives it a seat ───────────────────
+# systemd-udev-trigger ran during sysinit; replaying the add events here is
+# what a coldplug is, and it is the only way the DRM nodes get a database
+# entry on this boot if they were enumerated before udevd was listening.
+run sh -c 'timeout 20 udevadm trigger --action=add --subsystem-match=drm 2>&1'
+timeout 20 udevadm settle --timeout=15 >/dev/null 2>&1 || true
+say "GFX-SMOKE: --- /run/udev/data ---"
+run sh -c 'ls /run/udev/data 2>&1 | tr "\n" " "'
+if ls /run/udev/data/c226:* >/dev/null 2>&1; then
+	ok "udev-db-drm"
+	run sh -c 'head -20 /run/udev/data/c226:* 2>&1'
+else
+	bad "udev-db-drm (no /run/udev/data entry for a DRM card)"
+fi
+if [ -n "$CARD" ]; then
+	say "GFX-SMOKE: --- udevadm info on the card ---"
+	run sh -c "timeout 15 udevadm info /dev/dri/$CARD 2>&1 | head -25"
+fi
+
+# ── 3. logind's view of the seat ───────────────────────────────────────────
+say "GFX-SMOKE: --- loginctl seat-status seat0 ---"
+run sh -c 'timeout 15 loginctl --no-pager seat-status seat0 2>&1 | head -20'
+if timeout 15 loginctl --no-pager show-seat seat0 2>/dev/null | grep -q '^CanGraphical=yes'; then
+	ok "seat-can-graphical"
+else
+	bad "seat-can-graphical (logind does not consider seat0 graphical)"
+	run sh -c 'timeout 15 loginctl --no-pager show-seat seat0 2>&1'
+fi
+
+# ── 4. the compositor ──────────────────────────────────────────────────────
+XDG_RUNTIME_DIR=/run/user/0
+export XDG_RUNTIME_DIR
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+export XDG_SEAT=seat0 XDG_VTNR=1 XDG_SESSION_TYPE=wayland
+export HOME=/root
+WLOG=/run/weston.log
+: >"$WLOG"
+
+if [ -z "$CARD" ]; then
+	bad "weston-start (no card to give it)"
+	say "GFX: SCANOUT-END"
+	say "GFX-SMOKE: done"
+	exit 0
+fi
+
+say "GFX-SMOKE: starting weston on $CARD"
+# --use-pixman: software composition into a dumb buffer. --tty=1 names the VT
+# for the direct launcher, which is the one that runs when no logind session
+# owns this process.
+weston --backend=drm-backend.so --drm-device="$CARD" --use-pixman \
+	--continue-without-input --idle-time=0 --tty=1 \
+	--log="$WLOG" >/run/weston.stdout 2>&1 &
+WPID=$!
+
+# Two independent things have to be true before the compositor is up, and
+# waiting for only one of them is how a harness ends up reporting a compositor
+# that has already exited: the Wayland socket exists, so clients can connect,
+# AND weston's own log says it created an output on the card.
+i=0
+sock=
+while [ $i -lt 60 ]; do
+	kill -0 "$WPID" 2>/dev/null || break
+	for s in "$XDG_RUNTIME_DIR"/wayland-*; do
+		case "$s" in
+		*'wayland-*') ;;
+		*.lock) ;;
+		*) [ -S "$s" ] && sock=$s ;;
+		esac
+	done
+	if [ -n "$sock" ] && grep -qa "utput" "$WLOG" 2>/dev/null; then break; fi
+	i=$((i + 1))
+	sleep 1
+done
+
+if kill -0 "$WPID" 2>/dev/null && [ -n "$sock" ]; then
+	ok "weston-socket $(basename "$sock")"
+	WAYLAND_DISPLAY=$(basename "$sock")
+	export WAYLAND_DISPLAY
+else
+	bad "weston-socket (no wayland socket after ${i}s)"
+fi
+say "GFX-SMOKE: --- weston log ---"
+run sh -c "head -60 $WLOG 2>&1"
+run sh -c 'head -20 /run/weston.stdout 2>&1'
+
+# The DRM backend, not some other one. Weston names the backend it loaded and
+# the connector it lit; a run that fell back to a headless backend says so in
+# the same file.
+if grep -qa "drm-backend\|DRM backend\|Output DRM\|onnector" "$WLOG" 2>/dev/null; then
+	ok "weston-drm-backend"
+else
+	bad "weston-drm-backend (weston's log does not name the DRM backend)"
+fi
+
+if ! kill -0 "$WPID" 2>/dev/null; then
+	bad "weston-alive (weston exited during start-up)"
+	say "GFX: SCANOUT-END"
+	say "GFX-SMOKE: done"
+	exit 0
+fi
+
+# Clients, so the frame carries more than the shell's background.
+#
+# Three of them, deliberately unalike. weston-simple-shm speaks the protocol
+# directly -- wl_shm, xdg_shell, nothing else -- and draws a moving gradient,
+# so it is the one that says whether a client can put pixels on this display at
+# all. weston-terminal and weston-flower go through Weston's toytoolkit, which
+# adds cairo, pango and an XCursor theme, and a failure in any of those is a
+# failure of the toolkit rather than of the compositor. Each writes to its own
+# file: a client that dies says why exactly once, and it says it there.
+weston-simple-shm >/run/wshm.log 2>&1 &
+SHM_PID=$!
+weston-terminal >/run/wterm.log 2>&1 &
+TERM_PID=$!
+weston-flower >/run/wflower.log 2>&1 &
+FLOWER_PID=$!
+sleep 5
+say "GFX: SCANOUT-READY"
+n=0
+alive=1
+clients_reported=0
+while [ $n -lt "$RUN_SECONDS" ]; do
+	if ! kill -0 "$WPID" 2>/dev/null; then
+		bad "weston-alive (it exited at t=${n}s)"
+		alive=0
+		break
+	fi
+	[ $((n % 15)) -eq 0 ] && say "GFX-SMOKE: weston alive t=${n}s"
+	# What the clients said, once, early. A client that failed to connect
+	# writes one line and exits, and without this the only evidence is a
+	# frame with nothing on it -- which is also what a compositor that never
+	# drew looks like.
+	if [ "$clients_reported" = 0 ] && [ $n -ge 8 ]; then
+		clients_reported=1
+		say "GFX-SMOKE: --- weston clients ---"
+		for __c in shm term flower; do
+			say "GFX-SMOKE: client $__c:"
+			run sh -c "head -25 /run/w$__c.log 2>&1"
+		done
+		run sh -c "echo \"alive: shm=$(kill -0 $SHM_PID 2>/dev/null && echo yes || echo no) term=$(kill -0 $TERM_PID 2>/dev/null && echo yes || echo no) flower=$(kill -0 $FLOWER_PID 2>/dev/null && echo yes || echo no)\"" 
+		# A client that is still running is one that connected, allocated a
+		# buffer and got it accepted; the process list is where that shows.
+		# kill -0 on the pid the shell recorded, not a name in ps(1).
+		#
+		# `ps -eo comm` does not list these processes on this system even while
+		# their windows are on the screen -- and a name is the wrong thing to
+		# ask about anyway, since comm is truncated to fifteen characters and
+		# weston-simple-shm is seventeen. The shell already knows exactly which
+		# process it started.
+		if kill -0 "$SHM_PID" 2>/dev/null; then
+			ok "client-drawing"
+		else
+			bad "client-drawing (no wayland client survived its first frame)"
+			# Run one in the foreground, with its output on the console
+			# rather than in a file. A client that dies leaving an empty log
+			# has said nothing about why, and a redirected stderr is one more
+			# thing that can be the reason it said nothing. It never exits on
+			# its own, so 124 from timeout(1) means it was still running.
+			run sh -c 'timeout 6 weston-simple-shm; echo "simple-shm rc=$?"'
+			run sh -c 'echo "env: XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY"'
+			run sh -c 'ls -la "$XDG_RUNTIME_DIR" 2>&1'
+		fi
+	fi
+	n=$((n + 1))
+	sleep 1
+done
+[ "$alive" = 1 ] && ok "weston-alive"
+say "GFX: SCANOUT-END"
+say "GFX-SMOKE: --- weston log (tail) ---"
+run sh -c "tail -40 $WLOG 2>&1"
+kill "$WPID" 2>/dev/null || true
+
+say "GFX-SMOKE: done"
+GSTAGE_EOF
+	chmod 0755 "$ROOTFS/b1nix-graphics-stage.sh"
+	sh -n "$ROOTFS/b1nix-graphics-stage.sh" ||
+		die "b1nix-graphics-stage.sh does not parse"
+
+	cat >"$ROOTFS/etc/systemd/system/b1nix-graphics.service" <<-'GUNIT_EOF'
+		[Unit]
+		Description=b1nix graphical session harness
+		After=multi-user.target systemd-user-sessions.service systemd-logind.service
+		Wants=multi-user.target
+
+		[Service]
+		Type=oneshot
+		RemainAfterExit=yes
+		ExecStart=/b1nix-graphics-stage.sh
+		StandardOutput=journal+console
+		StandardError=journal+console
+		TimeoutStartSec=600s
+
+		[Install]
+		WantedBy=multi-user.target
+	GUNIT_EOF
+	ln -sf /etc/systemd/system/b1nix-graphics.service \
+		"$ROOTFS/etc/systemd/system/multi-user.target.wants/b1nix-graphics.service"
+
+	mkdir -p "$ROOTFS/run/user/0"
 fi
 
 # ── 5. ext4 image ───────────────────────────────────────────────────────────
@@ -1550,10 +1817,18 @@ mke2fs -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file,^orphan_file -q \
 log "verifying image"
 debugfs -R "ls -l /" "$IMG" 2>/dev/null || die "debugfs: cannot list /"
 VERIFY_FILES="/b1nix-stage.sh /usr/bin/dash /usr/lib64/ld-linux-x86-64.so.2 /usr/bin/ps /sbin/init"
-if [ "$PROFILE" = "systemd" ]; then
+if is_systemd_profile; then
 	VERIFY_FILES="$VERIFY_FILES /usr/lib/systemd/systemd /usr/bin/systemctl \
 		/usr/bin/journalctl /usr/lib/systemd/systemd-journald \
-		/b1nix-systemd-stage.sh /etc/systemd/system/b1nix-smoke.service"
+		/b1nix-systemd-stage.sh"
+	if [ "$PROFILE" = "systemd" ]; then
+		VERIFY_FILES="$VERIFY_FILES /etc/systemd/system/b1nix-smoke.service"
+	fi
+fi
+if [ "$PROFILE" = "graphics" ]; then
+	VERIFY_FILES="$VERIFY_FILES /usr/bin/weston /usr/bin/weston-terminal \
+		/etc/xdg/weston/weston.ini /b1nix-graphics-stage.sh \
+		/etc/systemd/system/b1nix-graphics.service"
 fi
 for f in $VERIFY_FILES; do
 	debugfs -R "stat $f" "$IMG" >/dev/null 2>&1 || die "missing from image: $f"

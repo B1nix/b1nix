@@ -46,7 +46,16 @@ struct rseq_cs_desc {
   u64 abort_ip;
 };
 
-#define RSEQ_MAX_TASKS 64
+/* One entry per task the scheduler can hold, so this table can never be the
+ * thing that refuses a registration.
+ *
+ * It was 64. glibc registers rseq for every thread it creates and treats a
+ * refusal on a thread as fatal -- "Fatal glibc error: rseq registration
+ * failed", which is a killed process and not a degraded one -- so a desktop
+ * with more than 64 threads alive at once could not run. (The leak fixed
+ * alongside this made it worse, but 64 was too few regardless.) At 32 bytes an
+ * entry the whole table is 128 KiB of BSS. */
+#define RSEQ_MAX_TASKS 4096
 
 struct rseq_reg {
   struct task *task;

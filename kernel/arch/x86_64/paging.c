@@ -2682,8 +2682,19 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     vmm_write_release(cflags);
     /* Shared page-cache frames are owned by the cache and mapped in several
      * address spaces — leave them out of the per-task swap set (same as SysV
-     * shm, which never registers either). */
-    if (!vma_shared)
+     * shm, which never registers either).
+     *
+     * That is what this comment has always said and not what the condition
+     * did: `!vma_shared` excludes a MAP_SHARED mapping, and a MAP_PRIVATE
+     * read-only mapping of a shared library is not one — its frame comes
+     * straight out of the page cache and is mapped by every process that
+     * loaded the library. Registered, it could be chosen by the evictor, which
+     * writes it to swap, marks THIS task's entry swapped and hands the frame
+     * back for immediate reuse without ever asking who else holds it: the
+     * cache's entry and every other mapper's page table still point at it.
+     * The next program to execute from that page runs whatever was written
+     * over it. */
+    if (!vma_shared && !shared_cache_frame)
       eviction_register_page(current_task, page_aligned, frame);
     /* Map the neighbours that are already cached, while we are here.
      *
@@ -2719,14 +2730,45 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
         int installed = 0;
 
         if (nslot && !(*nslot & VMM_PRESENT) && !(*nslot & VMM_SWAPPED)) {
+          /* A neighbour is ALWAYS a page-cache frame -- it came out of the
+           * cache two lines up -- but `flags` was decided for the faulting
+           * page, whose frame need not have been. The COW downgrade above
+           * fires on `shared_cache_frame`, and that is 0 whenever the faulting
+           * page could not be added to the cache: a duplicate insert lost to
+           * another CPU, or an allocation refused under pressure. `flags` then
+           * still carries VMM_WRITABLE, and copying it here maps a shared
+           * cache page writable into a MAP_PRIVATE mapping.
+           *
+           * That is the libpam.so.2 corruption again, arriving by a different
+           * road: ld.so's relocation stores land in the page cache instead of
+           * in a private copy, every later mapper of the library gets the
+           * relocated bytes, and the one that executes them dies on a #UD.
+           *
+           * Found while chasing exactly such a #UD, which this did NOT fix --
+           * the bytes at that faulting instruction turned out to be correct.
+           * It is a real hole regardless: a private mapping must never be able
+           * to write into the cache.
+           *
+           * The neighbour's own protection is what decides this, and the
+           * neighbour's frame is shared by construction. */
           u64 f = flags;
 
+          if (!vma_shared && (f & VMM_WRITABLE)) {
+            f &= ~VMM_WRITABLE;
+            f |= VMM_COW;
+          }
           pmm_ref_frame(near->frame);
           *nslot = near->frame | f;
           invalidate_page(va);
           installed = 1;
         }
         vmm_write_release(nflags);
+        /* A writable shared mapping can be stored through without faulting
+         * again, so the entry is potentially dirty from the moment it is
+         * mapped -- the same reason the faulting page above is marked. Outside
+         * the page-table lock: this takes the cache's own lock. */
+        if (installed && vma_shared && (flags & VMM_WRITABLE))
+          page_cache_mark_dirty(near);
         page_cache_put_page(near);
         if (!installed)
           break;
@@ -2817,8 +2859,6 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
        * has a permanent reservation). */
       addrspace_note_replaced(*slot);
       *slot = new_frame | new_flags;
-    if (vma_trace_faults_enabled())
-      vma_trace_record("pf-cow-d", page_aligned, page_aligned + PAGE_SIZE);
       if (vma_trace_faults_enabled())
         vma_trace_record("pf-cow-b", page_aligned, page_aligned + PAGE_SIZE);
       invalidate_page(page_aligned);

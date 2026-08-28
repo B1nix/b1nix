@@ -4795,6 +4795,13 @@ static unsigned vma_mutator_lock(void) {
       console_write("; waiter pid ");
       console_write_dec(current_task ? current_task->id : 0);
       console_write("\n");
+      /* The owner's pid and state say that it is stuck, and nothing about
+       * where. The task dump names the syscall every task is in and the
+       * channel it is waiting on, so the one line that reports the stall also
+       * carries the answer — the alternative is a guest that has gone silent
+       * and a second run with an instrument added. Printed once, with the
+       * warning, for the same reason the warning is printed once. */
+      scheduler_dump_tasks();
     }
   }
   g_vma_mutex_owner[slot] = current_task;

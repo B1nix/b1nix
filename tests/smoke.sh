@@ -250,22 +250,17 @@ run_qemu() {
 			# with hardware virt, no extra VMs. Only with KVM/HVF, never TCG.
 			# +invtsc by name, because -cpu host does not include it: QEMU
 			# leaves the invariant-TSC bit clear even on a host that has one,
-			# since an invariant TSC blocks live migration. Without it the
-			# guest cannot trust the counter and falls back to the 100 Hz
-			# tick — so the TSC clock path, which is what real runs use, was
-			# never exercised by the smoke suite at all. Measured: the
-			# monotonic clock moved in 10 ms steps here and in nanoseconds in
-			# a passthrough run, on the same kernel.
+			# since an invariant TSC blocks live migration. Without it the guest
+			# cannot trust the counter and falls back to the 100 Hz tick, so the
+			# TSC clock path that real runs use goes unexercised.
 			accel_args="-accel kvm -cpu host,+invtsc"
 		elif [ "$(uname)" = "Darwin" ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw hvf; then
 			accel_args="-accel hvf -cpu host"
 		fi
 
-		# RAM: the historical default (no -m → 128 MiB) was enough until the real
-		# software-GL demo actually ran — it exhausts 127 MiB and OOMs, starving
-		# the later graphics tests (setcrtc, console-reclaim). The demo is gone,
-		# the graphics stack it starved is not, so the headroom stays. x86_64
-		# only: the 32-bit port caps usable RAM at 1 GiB, so keep it modest there.
+		# RAM: QEMU's default (128 MiB) starves the graphics tests (setcrtc,
+		# console-reclaim), so the headroom stays. The 32-bit port caps usable
+		# RAM at 1 GiB, so keep it modest there.
 		local mem_args="-m ${SMOKE_MEM_MB:-1024}"
 		if [ "$ARCH" = "x86" ]; then
 			mem_args="-m ${SMOKE_MEM_MB:-768}"
@@ -952,17 +947,13 @@ fi
 #
 # kernel_main runs every driver probe, every filesystem and network init and,
 # once the timer is armed, a whole scheduler pass on top of all of it, on the
-# single stack boot.S reserves. That stack used to be 64 KiB and the boot path
-# needs more than 100 KiB, so it ran off the bottom -- through the boot page
-# tables, which are dead by then and absorbed the damage silently, and on into
-# the .bss scalars underneath, where it rewrote proto_list and proto_lock. The
-# IOMMU instance died on that about one boot in five, in net_proto_reset, and
-# was misdiagnosed twice as a bug in whatever change was under test.
+# single stack boot.S reserves -- more than 100 KiB of it. Overflow runs off the
+# bottom through the boot page tables, which are dead by then and absorb the
+# damage silently, and on into the .bss scalars underneath.
 #
-# Nothing could have caught it, because nothing measured the depth. This does,
-# on EVERY instance rather than only the one that happened to tip over -- the
-# margin is what is under test, not the crash. A peak past 75% fails the run
-# while the stack still holds, long before the guard page is reached.
+# So measure the depth on EVERY instance rather than only the one that tips
+# over: the margin is what is under test, not the crash. A peak past 75% fails
+# the run while the stack still holds, long before the guard page is reached.
 _bs_line=$(grep -a "BOOT-STACK: peak=" "$LOG" 2>/dev/null | tail -1)
 _bs_peak=$(echo "$_bs_line" | sed -n 's/.*peak=\([0-9]*\).*/\1/p')
 _bs_total=$(echo "$_bs_line" | sed -n 's/.*total=\([0-9]*\).*/\1/p')
@@ -1017,16 +1008,8 @@ for _bs_log in "$LOG" "$SYS_LOG" "$OPENRC_LOG" "$IOMMU_LOG" "$AMDVI_LOG"; do
 	fi
 done
 [ -n "${_bs_overflow:-}" ] || pass "no boot-stack overflow on any instance"
-# b1cc temporarily cut from the build (B1NIX_NO_B1CC) — restored as a separate
-# change. These checks are disabled until b1cc is re-added.
-# check_output "$LOG" "B1CC-R42-SMOKE: ok" "b1cc return_42 runs and exits with 42"
-# check_output "$LOG" "B1CC-HELLO-SMOKE: ok" "b1cc hello runs and exits with 0"
-# check_output "$LOG" "B1CC-ARGV-SMOKE: ok" "b1cc argv propagation works"
-# check_output "$LOG" "B1CC-FILE-SMOKE: ok" "b1cc file write works"
-# check_output "$LOG" "B1CC-STDERR-SMOKE: ok" "b1cc stderr exit status propagates"
-# check_output "$LOG" "B1CC-BETTER-C-SMOKE: ok" "b1cc better C features work (M7)"
-# check_output "$LOG" "B1CC-M34-SMOKE: ok" "b1cc M34 features run on x86_64-b1nix"
-# check_output "$LOG" "B1CC-M34-TARGET: all ok" "b1cc M34 target corpus passes on-device"
+# b1cc is cut from the build (B1NIX_NO_B1CC); its B1CC-*-SMOKE checks were
+# removed with it and come back when b1cc does (they are in git).
 
 # ── Test 2: No panic ──
 if grep -q "KERNEL PANIC" "$LOG" 2>/dev/null; then
@@ -1263,6 +1246,9 @@ check_output "$LOG" "MM-SMOKE: ok sigaltstack" "sigaltstack get/set/disable + SA
 check_output "$LOG" "MM-SMOKE: ok ucontext-size" "an SA_SIGINFO handler is given a whole ucontext_t, not 424 bytes of one overlapping the frame that was interrupted"
 check_output "$LOG" "MM-SMOKE: ok copyout-cow" "the kernel writing into a copy-on-write page breaks the sharing instead of faulting in ring 0 (it used to panic the machine)"
 check_output "$LOG" "MM-SMOKE: ok copyout-readonly" "a syscall asked to write into a page the program cannot write answers EFAULT and the process survives"
+check_output "$LOG" "MM-SMOKE: ok file-map-privacy" "a store into a MAP_PRIVATE file page the process never faulted itself stays out of the file, and the same store through MAP_SHARED reaches it (the pages a read fault maps AROUND itself come straight from the page cache, so the protection they are installed with decides whether one process's writes are served to the next)"
+check_output "$LOG" "MM-SMOKE: ok rseq-after-sigkill" "a task SIGKILLed while it holds an rseq(2) registration gives it back, so a later process can still register (glibc registers one per thread and treats a refusal as fatal, so a leaked entry kills programs rather than slowing them)"
+check_output "$LOG" "MM-SMOKE: ok mmap-after-sigkill" "a task SIGKILLed inside mmap hands back the address-space lock, so unrelated processes can still map memory (a leaked slot blocks every process hashing to it, for ever, with no error and no panic)"
 check_output "$LOG" "MM-SMOKE: done" "MM smoke completes"
 
 # ── M40 Linux ABI compatibility (x86_64 only: it runs a Linux x86_64 ELF) ──
@@ -2017,21 +2003,10 @@ check_output "$LOG" "M53-VPX: ok decode-init" "libvpx VP8 decoder initializes"
 check_output "$LOG" "M53-VPX: ok decode" "libvpx decodes the VP8 frame to an I420 image"
 check_output "$LOG" "M53-VPX: ok luma" "decoded luma plane matches the original within tolerance"
 check_output "$LOG" "M53-VPX: done" "libvpx smoke completes"
-# ── M53 libwapcaplet userspace port (NetSurf browser-library chain, step 1) ──
-# ── M53 libparserutils userspace port (NetSurf browser-library chain, step 2) ──
-# ── M53 libhubbub userspace port (NetSurf browser-library chain, step 3) ──
-# ── M53 libcss userspace port (NetSurf browser-library chain, step 4) ──
-# ── M53 libdom userspace port (NetSurf browser-library chain, step 5) ──
-# ── M53 NetSurf helper/decoder libs (libnsutils/libnsgif/libnsbmp/libnslog) ──
-# ── M53 NetSurf framebuffer browser: render a real HTML page ──
-# ── M53 NetSurf on-screen frontend: render straight to /dev/fb0 ──
-# ── M53 NetSurf interactive input: synthesized keyboard/mouse drive the frontend ──
-# The loopback HTTP/HTTPS checks that stood here guarded NetSurf's web access.
-# Nothing starts m53_httpd/m53_httpsd since the browser was removed, so the
-# markers can no longer appear and the checks went with the feature.
-# ── M53 NetSurf public-internet HTTPS (off-link TLS to a real site) ──
-# Skips cleanly when the test host/usernet has no off-link route, so the suite
-# stays green offline (same policy as the M32 external probes).
+# NetSurf's checks stood here: the library chain (libwapcaplet, libparserutils,
+# libhubbub, libcss, libdom and the helper decoders), the framebuffer frontend,
+# and the loopback and off-link HTTP/HTTPS probes. They went with the browser --
+# nothing starts m53_httpd/m53_httpsd any more, so those markers cannot appear.
 # ── M34 procfs / sysfs synthetic filesystems ──
 check_output "$LOG" "procfs: mounted at /proc" "procfs mounted at /proc"
 check_output "$LOG" "sysfs: mounted at /sys" "sysfs mounted at /sys"

@@ -4,8 +4,7 @@ Implementation notes for the three milestones that turn b1nix's hand-rolled
 device code into something a ported Linux GPU driver can sit on. The roadmap
 entries are the status summary; this is the detail.
 
-The plan these implement is `docs/gpu-drm-plan.md` (written when the milestones
-were numbered M99–M101; the roadmap numbering M98/M99/M100 is authoritative).
+The roadmap (M98/M99/M100) is the authoritative status; this is the detail.
 
 ---
 
