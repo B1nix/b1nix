@@ -731,6 +731,31 @@ for u in systemd-journald.service systemd-tmpfiles-setup.service \
 	fi
 done
 
+# ── 4b. past multi-user: graphical.target ──────────────────────────────────
+# graphical.target is what a desktop machine's default target is, and reaching
+# it is the honest measure of "further than multi-user". It Requires
+# multi-user.target and Wants display-manager.service; a machine with no
+# display manager installed still reaches it, on Linux and here. The boot was
+# asked for multi-user.target, so this starts it explicitly and reports the
+# target's own state rather than an impression of it.
+gstate=$(timeout 30 systemctl start graphical.target 2>&1)
+grc=$?
+gst=$(timeout 15 systemctl is-active graphical.target 2>&1)
+if [ "$gst" = "active" ]; then
+	say "SYSTEMD-SMOKE: ok unit-active graphical.target"
+else
+	say "SYSTEMD-SMOKE: FAIL unit-active graphical.target state=$gst rc=$grc out='$gstate'"
+fi
+# Where the boot's time went, by unit, and the chain that decided it. This is
+# the report the milestone is measured by, so it is printed on every run and
+# not only under b1nix.sysd-debug.
+say "SYSTEMD-SMOKE: --- systemd-analyze ---"
+run sh -c 'timeout 25 systemd-analyze 2>&1'
+say "SYSTEMD-SMOKE: --- systemd-analyze critical-chain ---"
+run sh -c 'timeout 30 systemd-analyze critical-chain 2>&1 | head -30'
+say "SYSTEMD-SMOKE: --- systemd-analyze blame (top 12) ---"
+run sh -c 'timeout 30 systemd-analyze blame 2>&1 | head -12'
+
 # ── 5. the journal ─────────────────────────────────────────────────────────
 # journalctl reading back its own records is the end-to-end test of
 # /dev/kmsg, the journald sockets and the on-disk (well, /run) journal files.
@@ -779,6 +804,9 @@ else
 	say "SYSTEMD-SMOKE: --- udev diagnosis ---"
 	run systemctl status --no-pager -l systemd-udevd.service
 	run ls -la /run/udev
+	# Which syscall every task in the machine is sitting in, sampled at the
+	# moment udevd stopped answering. Printed by the kernel to the console.
+	cat /proc/b1nix-tasks >/dev/null 2>&1
 fi
 # What udevd itself said. It is the only account of what it did with the
 # events it was sent, and it exists now that journald runs.
@@ -799,8 +827,20 @@ timeout 20 udevadm settle >/dev/null 2>&1 || true
 # manager cannot invent one. Print the list, then name the one we found.
 say "SYSTEMD-SMOKE: --- systemctl list-units --type=device ---"
 run systemctl --no-pager --no-legend --plain list-units --type=device --state=active
-dev_unit=$(timeout 15 systemctl --no-pager --no-legend --plain list-units \
-	--type=device --state=active 2>/dev/null | awk 'NF {print $1; exit}')
+# Polled, not sampled once. A .device unit appears when the manager's device
+# monitor receives the event udevd re-broadcasts after processing, and those
+# are two asynchronous programs: asking once, at whatever moment this line is
+# reached, measures the scheduler as much as the kernel. Twenty seconds is far
+# longer than the path takes when it works.
+dev_unit=""
+__i=0
+while [ $__i -lt 12 ]; do
+	dev_unit=$(timeout 15 systemctl --no-pager --no-legend --plain list-units \
+		--type=device --state=active 2>/dev/null | awk 'NF {print $1; exit}')
+	case "$dev_unit" in *.device) break ;; esac
+	__i=$((__i + 1))
+	sleep 1
+done
 case "$dev_unit" in
 *.device)
 	say "SYSTEMD-SMOKE: ok device-unit $dev_unit"
@@ -810,7 +850,30 @@ case "$dev_unit" in
 	# A .device unit exists only if udev enumerated a device, processed it and
 	# told systemd. Print each link of that chain rather than the verdict.
 	say "SYSTEMD-SMOKE: --- udev enumeration diagnosis ---"
-	run sh -c 'timeout 15 udevadm info /sys/class/block/vda 2>&1 | head -14'
+	run sh -c 'timeout 15 udevadm info /sys/class/block/vda 2>&1 | head -24'
+	# The manager's own account of what it did with the event, rather than the
+	# absence of a unit. PID 1 only creates a .device unit from a message its
+	# device monitor accepted, and every reason it can refuse one is logged at
+	# debug level and nowhere else.
+	# Debug for ONE device and then straight back to info: at debug level this
+	# manager writes faster than the serial console drains, and a machine that
+	# slow times out its own udev workers -- which then looks like the defect
+	# being investigated.
+	run sh -c 'timeout 15 systemctl log-level debug 2>&1'
+	run sh -c 'timeout 20 udevadm trigger --action=change --subsystem-match=block --sysname-match=vda 2>&1'
+	sleep 2
+	run sh -c 'timeout 15 systemctl log-level info 2>&1'
+	run sh -c 'journalctl -b --no-pager -n 150 2>/dev/null | grep -ai "device\|monitor" | tail -25'
+	# Which syscall every task is sitting in, at the moment the units are
+	# missing. A udev worker that stopped answering is a task parked
+	# somewhere, and this names the place -- the alternative is guessing from
+	# the outside about a program that has stopped saying anything.
+	cat /proc/b1nix-tasks >/dev/null 2>&1
+	run sh -c 'timeout 15 udevadm settle --timeout=5 2>&1; echo "settle rc=$?"'
+	run sh -c 'ls /run/udev/data 2>&1 | tr "\n" " "'
+	# Whether /dev looks like a devtmpfs to the test systemd applies: the mount
+	# id of /dev, and the mountinfo row that id must name.
+	run sh -c 'grep -a " /dev " /proc/self/mountinfo 2>&1'
 	run sh -c 'timeout 15 systemctl --no-pager --no-legend --plain list-units --type=device --all 2>&1 | head -20'
 	;;
 esac
@@ -846,6 +909,21 @@ if [ "$SYSD_DEBUG" = 1 ]; then
 	run sh -c 'cat /sys/class/block/vda/uevent 2>&1'
 	run sh -c 'ls -la /sys/class/block/vda/subsystem 2>&1; readlink /sys/class/block/vda/subsystem 2>&1'
 	run sh -c 'ls -la /run/udev 2>&1; ls -la /run/udev/data 2>&1 | head -20'
+	# systemd asks "is this a whole disk?" by looking for
+	# /sys/dev/block/<major>:<minor>/queue -- NOT /sys/block/<name>/queue.
+	# Every block device in this machine answers "Failed to get whole disk
+	# device: No such file or directory", so this prints the exact path it
+	# looks at and whether it is there.
+	say "SYSTEMD-SMOKE: --- udev deep: /sys/dev/block ---"
+	run sh -c '[ -e /sys/dev/block/8:0/queue ] && echo "direct-first: 8:0/queue exists" || echo "direct-first: 8:0/queue MISSING"'
+	# And from inside the kind of mount namespace systemd-udevd.service runs
+	# in. The harness's own shell is in the initial namespace; the worker that
+	# answers "No such file or directory" is not, and "it is there" from the
+	# wrong namespace is not an answer.
+	run sh -c 'timeout 30 systemd-run --quiet --wait --pipe -p MountFlags=slave -p PrivateMounts=yes /bin/sh -c "[ -e /sys/dev/block/8:0/queue ] && echo ns: queue exists || echo ns: queue MISSING; ls /sys/dev/block 2>&1 | head -3" 2>&1'
+	run sh -c 'ls -la /sys/dev/block/ 2>&1 | head -24'
+	run sh -c 'for d in /sys/dev/block/*; do printf "%s queue=%s partition=%s\n" "$d" "$([ -e "$d/queue" ] && echo yes || echo NO)" "$([ -e "$d/partition" ] && echo yes || echo no)"; done 2>&1 | head -24'
+	run sh -c 'cat /sys/class/block/vda/uevent 2>&1; echo "--- /sys/block/vda:"; ls /sys/block/vda 2>&1'
 	run sh -c 'ls -la /dev/vda /dev/disk 2>&1 | head -12'
 	run sh -c 'ls /dev 2>&1 | tr "\n" " " | cut -c1-300'
 	say "SYSTEMD-SMOKE: --- udev deep: udevadm info ---"
@@ -916,6 +994,28 @@ mkdir -p /run/systemd/system
 # than assumed: the directory exists and takes a file, and the manager accepts
 # a reload. "Unit not found" is what both failures look like from the outside.
 say "SYSTEMD-SMOKE:   unitdir=[$(ls -d /run/systemd/system 2>&1)] write=[$(: >/run/systemd/system/.probe 2>&1 && echo ok || echo failed)]"
+# A unit file the manager has not read is "not found" -- which is the right
+# answer, and not a kernel failure. Every unit below is written into
+# /run/systemd/system at runtime, and the six that were written AFTER the single
+# daemon-reload could never start: the harness was measuring its own ordering.
+# The reload no longer costs 90 s (it is under a second), so each new unit file
+# is followed by one.
+sd_load() {
+	__lr=$(timeout 60 systemctl daemon-reload 2>&1)
+	__lrc=$?
+	[ "$__lrc" = 0 ] ||
+		say "SYSTEMD-SMOKE:   daemon-reload for $1 rc=$__lrc: ${__lr:-no output}"
+}
+# Lines in a file that may not exist. `wc -l < missing` is the SHELL failing to
+# open the redirect, before wc runs at all, so `2>/dev/null` on wc silences
+# nothing and `|| echo 0` never fires -- the error went to stderr, into the
+# journal, and became the newest entry for this unit. The journal-index check
+# below then read it back instead of a marker and called the index broken.
+count_lines() {
+	[ -f "$1" ] || { echo 0; return; }
+	wc -l <"$1" 2>/dev/null || echo 0
+}
+
 sd_reload() {
 	prof "before daemon-reload"
 	__t0=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
@@ -973,6 +1073,13 @@ if [ "$SYSD_DEBUG" = 1 ]; then
 	#    readings are believed. Written to a file rather than passed with -e:
 	#    a multi-line perl program inside a shell single-quoted string is one
 	#    stray quote away from a syntax error that looks like a kernel fault.
+	# Does a plain kill reach a sleeping child at all? `timeout` returns the
+	# right answer and does not bound anything, and the two candidate causes --
+	# "the alarm is wrong" and "the signal never lands" -- are separated by
+	# doing the same thing without timeout(1) in the way.
+	say "SYSTEMD-SMOKE: --- kill-sleeper probe ---"
+	run sh -c 'sleep 30 & __p=$!; sleep 1; kill -TERM $__p; wait $__p; echo "kill-sleeper rc=$? (137/143 = signalled)"'
+	run sh -c '__a=$(cut -d" " -f1 /proc/uptime); sleep 30 & __p=$!; sleep 1; kill -KILL $__p; wait $__p >/dev/null 2>&1; __b=$(cut -d" " -f1 /proc/uptime); echo "kill-sleeper KILL elapsed ${__a}->${__b}"'
 	say "SYSTEMD-SMOKE: --- timer probe ---"
 	for __spec in "3 60 124" "10 60 124" "10 2 0"; do
 		set -- $__spec
@@ -1170,6 +1277,15 @@ fi
 if sd_start b1nix-echo-tcp.socket; then
 	say "SYSTEMD-SMOKE: ok socket-listening-tcp"
 	timeout 15 perl -e 'use Socket; socket(S, PF_INET, SOCK_STREAM, 0) or exit 1; connect(S, sockaddr_in(17999, inet_aton("127.0.0.1"))) or exit 2; print S "hi\n"; close S' >/dev/null 2>&1
+	__prc=$?
+	# rc 1 = no socket, 2 = connect refused/timed out, 0 = the connection was
+	# really made. "The service did not start" means something different in
+	# each case, and the check used to discard it.
+	say "SYSTEMD-SMOKE:   tcp-probe connect rc=$__prc"
+	if [ "$__prc" != "0" ]; then
+		run sh -c 'cat /proc/net/tcp 2>&1 | head -6'
+		run sh -c 'systemctl show -p Listen b1nix-echo-tcp.socket 2>&1'
+	fi
 	if wait_for_file /run/b1nix-echo-tcp.done; then
 		say "SYSTEMD-SMOKE: ok socket-activation-tcp"
 	else
@@ -1188,6 +1304,7 @@ Type=notify
 NotifyAccess=all
 ExecStart=/bin/sh -c 'systemd-notify --ready; sleep 30'
 EOF
+sd_load b1nix-notify.service
 if sd_start b1nix-notify.service; then
 	say "SYSTEMD-SMOKE: ok notify-ready"
 else
@@ -1205,6 +1322,7 @@ Type=oneshot
 PrivateTmp=yes
 ExecStart=/bin/sh -c 'echo inside > /tmp/b1nix-private-probe; echo ran > /run/b1nix-private.ran'
 EOF
+sd_load b1nix-private.service
 timeout 25 systemctl start b1nix-private.service >/dev/null 2>&1
 if [ ! -f /run/b1nix-private.ran ]; then
 	say "SYSTEMD-SMOKE: FAIL private-tmp (the unit never ran: $(systemctl is-failed b1nix-private.service 2>&1))"
@@ -1217,19 +1335,21 @@ fi
 # ProtectSystem=strict: the filesystem is read-only for the unit, so the write
 # must FAIL. Same care as above -- the unit has to have run for the absence of
 # the file to mean anything.
-rm -f /etc/b1nix-should-not-exist /run/b1nix-ro.ran
+rm -f /etc/b1nix-should-not-exist /run/b1nix-ro.ran /run/b1nix-ro.err
 cat >/run/systemd/system/b1nix-ro.service <<'EOF'
 [Service]
 Type=oneshot
 ProtectSystem=strict
-ExecStart=/bin/sh -c 'echo x > /etc/b1nix-should-not-exist 2>/dev/null; echo ran > /run/b1nix-ro.ran'
+ExecStart=/bin/sh -c 'echo x > /etc/b1nix-should-not-exist 2>/run/b1nix-ro.err; echo "wrc=$?" >> /run/b1nix-ro.err; grep -c " ro," /proc/self/mountinfo >> /run/b1nix-ro.err 2>&1; grep " / " /proc/self/mountinfo >> /run/b1nix-ro.err 2>&1; grep " /etc " /proc/self/mountinfo >> /run/b1nix-ro.err 2>&1; echo ran > /run/b1nix-ro.ran'
 ReadWritePaths=/run
 EOF
+sd_load b1nix-ro.service
 timeout 25 systemctl start b1nix-ro.service >/dev/null 2>&1
 if [ ! -f /run/b1nix-ro.ran ]; then
 	say "SYSTEMD-SMOKE: FAIL protect-system (the unit never ran: $(systemctl is-failed b1nix-ro.service 2>&1))"
 elif [ -f /etc/b1nix-should-not-exist ]; then
 	say "SYSTEMD-SMOKE: FAIL protect-system (the write went through)"
+	run sh -c 'cat /run/b1nix-ro.err 2>&1 | head -12'
 	rm -f /etc/b1nix-should-not-exist
 else
 	say "SYSTEMD-SMOKE: ok protect-system"
@@ -1248,6 +1368,7 @@ AccuracySec=1s
 [Install]
 WantedBy=timers.target
 EOF
+sd_load b1nix-tick.timer
 rm -f /run/b1nix-tick.count
 if sd_start b1nix-tick.timer; then
 	i=0
@@ -1272,24 +1393,34 @@ ExecStart=/bin/sh -c 'echo run >> /run/b1nix-restart.count; exit 1'
 Restart=on-failure
 RestartSec=1
 EOF
+sd_load b1nix-restart.service
 timeout 20 systemctl start b1nix-restart.service >/dev/null 2>&1
 i=0
 while [ $i -lt 12 ]; do
-	runs=$(wc -l < /run/b1nix-restart.count 2>/dev/null || echo 0)
+	runs=$(count_lines /run/b1nix-restart.count)
 	[ "$runs" -ge 2 ] && break
 	i=$((i + 1)); sleep 1
 done
 systemctl stop b1nix-restart.service 2>/dev/null
-if [ "$(wc -l < /run/b1nix-restart.count 2>/dev/null || echo 0)" -ge 2 ]; then
+if [ "$(count_lines /run/b1nix-restart.count)" -ge 2 ]; then
 	say "SYSTEMD-SMOKE: ok restart-on-failure"
 else
-	say "SYSTEMD-SMOKE: FAIL restart-on-failure (ran $(wc -l < /run/b1nix-restart.count 2>/dev/null || echo 0) times)"
+	say "SYSTEMD-SMOKE: FAIL restart-on-failure (ran $(count_lines /run/b1nix-restart.count) times)"
 fi
 
 # The journal, asked for ONE unit rather than the whole boot: that is its
 # index, not its ability to append.
-if timeout 20 journalctl -u b1nix-smoke.service -n 5 --no-pager 2>/dev/null |
-	grep -q 'SYSTEMD-SMOKE\|b1nix-smoke'; then
+#
+# Written to STDOUT on purpose: every other marker goes to /dev/kmsg (agetty
+# takes the console away mid-run), and /dev/kmsg reaches journald as a KERNEL
+# message, which belongs to no unit. So the harness had nothing of its own in
+# its unit's journal and this check was reading whatever noise landed there
+# last. This line is the unit's own output, through StandardOutput=journal.
+echo "SYSTEMD-SMOKE journal-probe $$"
+sync 2>/dev/null || true
+sleep 1
+if timeout 20 journalctl -u b1nix-smoke.service -n 20 --no-pager 2>/dev/null |
+	grep -q 'SYSTEMD-SMOKE journal-probe'; then
 	say "SYSTEMD-SMOKE: ok journal-filter-unit"
 else
 	say "SYSTEMD-SMOKE: FAIL journal-filter-unit ($(timeout 20 journalctl -u b1nix-smoke.service -n 1 --no-pager 2>&1 | head -1))"
@@ -1299,17 +1430,30 @@ fi
 # be enabled at all -- without one the answer is "static", which is not a
 # failure of the manager but of the unit, and asking the wrong question was
 # this harness's own bug the first time round.
-if systemctl enable b1nix-tick.timer >/dev/null 2>&1 &&
-   [ "$(systemctl is-enabled b1nix-tick.timer 2>&1)" = "enabled" ] &&
-   systemctl disable b1nix-tick.timer >/dev/null 2>&1 &&
-   [ "$(systemctl is-enabled b1nix-tick.timer 2>&1)" = "disabled" ]; then
+# Bounded, like every other call in this harness. These four were not, and
+# `systemctl enable` does an implicit daemon-reload: when that stopped
+# answering the harness stopped with it, and every check after this point was
+# reported missing rather than failed. A bound turns "the run ended" into "this
+# call did not return", which is the thing worth knowing.
+__ed_a=$(cut -d' ' -f1 /proc/uptime)
+timeout 60 systemctl enable b1nix-tick.timer >/dev/null 2>&1
+__ed_rc=$?
+__ed_b=$(cut -d' ' -f1 /proc/uptime)
+say "SYSTEMD-SMOKE:   enable rc=$__ed_rc ${__ed_a}->${__ed_b}"
+if [ "$__ed_rc" = "0" ] &&
+   [ "$(timeout 20 systemctl is-enabled b1nix-tick.timer 2>&1)" = "enabled" ] &&
+   timeout 60 systemctl disable b1nix-tick.timer >/dev/null 2>&1 &&
+   [ "$(timeout 20 systemctl is-enabled b1nix-tick.timer 2>&1)" = "disabled" ]; then
 	say "SYSTEMD-SMOKE: ok unit-enable-disable"
 else
-	say "SYSTEMD-SMOKE: FAIL unit-enable-disable: $(systemctl is-enabled b1nix-tick.timer 2>&1)"
+	say "SYSTEMD-SMOKE: FAIL unit-enable-disable: $(timeout 20 systemctl is-enabled b1nix-tick.timer 2>&1)"
+	# Which syscall every task is in, at the moment the manager stopped
+	# answering. Printed by the kernel, so a wedged PID 1 cannot suppress it.
+	cat /proc/b1nix-tasks >/dev/null 2>&1
 fi
 
 # Masking: the strongest "no" -- a masked unit refuses even a direct start.
-if systemctl mask b1nix-tick.service >/dev/null 2>&1 &&
+if timeout 60 systemctl mask b1nix-tick.service >/dev/null 2>&1 &&
    ! timeout 10 systemctl start b1nix-tick.service >/dev/null 2>&1; then
 	say "SYSTEMD-SMOKE: ok unit-mask-refuses"
 else
@@ -1317,11 +1461,45 @@ else
 fi
 systemctl unmask b1nix-tick.service >/dev/null 2>&1
 
+# How far the boot got, by target rather than by impression. systemd-analyze
+# answers only once the manager has finished starting up, so a machine that
+# reaches this point has genuinely completed its boot transaction -- and the
+# chain names the units it waited on, in order, which no marker of ours can.
+# systemd-analyze refuses to answer while the boot transaction is still
+# running, and this harness IS part of that transaction -- so asking here only
+# ever prints "Bootup is not yet finished". Ask from a process that outlives
+# it: this waits for the manager to stop reporting "starting" and then prints
+# the chain, which lands on the console after the harness's last marker.
+(
+	__i=0
+	while [ $__i -lt 30 ]; do
+		case "$(systemctl is-system-running 2>&1)" in
+		starting) ;;
+		*) break ;;
+		esac
+		__i=$((__i + 1))
+		sleep 1
+	done
+	{
+		echo "SYSTEMD-SMOKE: --- systemd-analyze (after the transaction) ---"
+		timeout 30 systemd-analyze time 2>&1 | head -4
+		timeout 30 systemd-analyze critical-chain 2>&1 | head -24
+		timeout 30 systemd-analyze blame 2>&1 | head -10
+		echo "SYSTEMD-SMOKE: --- systemd-analyze end ---"
+	} >/dev/kmsg 2>&1
+) &
+
 say "SYSTEMD-SMOKE: units-loaded=$(systemctl list-units --no-legend --no-pager 2>/dev/null | wc -l) failed=$(systemctl list-units --state=failed --no-legend --no-pager 2>/dev/null | wc -l)"
 
 say "SYSTEMD-SMOKE: done"
 SSTAGE_EOF
 	chmod 0755 "$ROOTFS/b1nix-systemd-stage.sh"
+	# A harness with a syntax error dies at the first line the shell cannot
+	# parse and prints nothing after it -- which reads exactly like a kernel
+	# that stopped answering. One unbalanced quote in a diagnostic cost a whole
+	# run that way. Parse it here, where the failure is a build error.
+	sh -n "$ROOTFS/b1nix-systemd-stage.sh" ||
+		die "b1nix-systemd-stage.sh does not parse"
 
 	mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
 	cat >"$ROOTFS/etc/systemd/system/b1nix-smoke.service" <<-'UNIT_EOF'
@@ -1336,7 +1514,12 @@ SSTAGE_EOF
 		ExecStart=/b1nix-systemd-stage.sh
 		StandardOutput=journal+console
 		StandardError=journal+console
-		TimeoutStartSec=90s
+		# The harness bounds every command it runs, and the run itself is
+		# bounded by tests/systemd-smoke.sh. 90 s was tighter than either, so
+		# with b1nix.sysd-debug on -- where a single probe deliberately waits
+		# out a 30 s sleep -- systemd killed the harness partway through and
+		# every check after that point was reported as a missing marker.
+		TimeoutStartSec=480s
 
 		[Install]
 		WantedBy=multi-user.target

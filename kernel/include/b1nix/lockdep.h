@@ -80,12 +80,39 @@ void lockdep_dump_cpu(int cpu);
 /* Dump every CPU's stack — used by panic. */
 void lockdep_dump_all(void);
 
+/* Who is holding a plain spinlock, for the lockup detector.
+ *
+ * A spinlock_t is one int with no room for an owner, so when the detector
+ * fires on one it can only say "not recorded" and name the CPU that is stuck
+ * waiting -- never the one to blame. That has cost at least one wrong
+ * attribution: a recurring lockup in net_reset_interface_state was read as
+ * belonging to whatever change happened to be under test.
+ *
+ * Recording the holder means a store on every acquire, on the hottest path in
+ * the kernel, so it lives here under LOCKDEP rather than in the default build:
+ * `make LOCKDEP=1 ... iso` turns a blind lockup into a named one. */
+void lockdep_note_spin_acquire(const void *lock, u64 site);
+void lockdep_note_spin_release(const void *lock);
+/* The CPU holding `lock` and where it took it, or 0 if nothing recorded it. */
+int lockdep_spin_holder(const void *lock, int *cpu_out, u64 *site_out);
+
+#define LOCKDEP_NOTE_SPIN_ACQUIRE(l, site) lockdep_note_spin_acquire((l), (site))
+#define LOCKDEP_NOTE_SPIN_RELEASE(l)       lockdep_note_spin_release((l))
+
 #define LOCKDEP_ACQUIRE(lvl)         lockdep_acquire((int)(lvl), #lvl)
 #define LOCKDEP_RELEASE(lvl)         lockdep_release((int)(lvl))
 #define LOCKDEP_ACQUIRE_GLOBAL(lvl)  lockdep_acquire_global((int)(lvl), #lvl)
 #define LOCKDEP_RELEASE_GLOBAL(lvl)  lockdep_release_global((int)(lvl), #lvl)
 
 #else  /* !KERNEL_LOCKDEP */
+
+#define LOCKDEP_NOTE_SPIN_ACQUIRE(l, site) ((void)0)
+#define LOCKDEP_NOTE_SPIN_RELEASE(l)       ((void)0)
+static inline int lockdep_spin_holder(const void *lock, int *cpu_out,
+                                      u64 *site_out) {
+  (void)lock; (void)cpu_out; (void)site_out;
+  return 0;
+}
 
 #define LOCKDEP_ACQUIRE(lvl)         ((void)0)
 #define LOCKDEP_RELEASE(lvl)         ((void)0)

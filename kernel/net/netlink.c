@@ -998,8 +998,10 @@ static void netlink_uevent_trace(const char *what,
     if (uevent_socks[i])
       n++;
   char l[160];
-  snprintf(l, sizeof(l), "uevent-sock %s: sock=%p groups=0x%x pid=%u now=%d",
-           what, (const void *)s, (unsigned)s->local.nl.nl_groups,
+  snprintf(l, sizeof(l),
+           "uevent-sock %s: sock=%p groups=0x%x nl_pid=%u pid=%u now=%d", what,
+           (const void *)s, (unsigned)s->local.nl.nl_groups,
+           (unsigned)s->local.nl.nl_pid,
            (unsigned)(current_task ? current_task->id : 0), n);
   klog_info(l);
 }
@@ -1060,6 +1062,9 @@ static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
  * length of the delivery. */
 static int nl_enqueue_from_kernel = 1;
 static u32 nl_enqueue_groups;
+/* The port id of the socket a task's write(2) came from, for the length of the
+ * delivery. Zero while the kernel is the sender. */
+static u32 nl_enqueue_portid;
 
 static void netlink_uevent_deliver(u32 groups, const void *payload, usize len,
                                    const struct vfs_socket_state *from) {
@@ -1116,7 +1121,21 @@ static int netlink_uevent_unicast(u32 dest_pid, const void *payload, usize len,
       continue;
     nl_enqueue_groups = 0;
     netlink_enqueue(t, (const u8 *)payload, len);
+    if (bootinfo_has_flag("b1nix.trace-uevent")) {
+      char ul[192];
+      snprintf(ul, sizeof(ul),
+               "uevent-unicast: dest_nl_pid=%u len=%lu -> sock=%p queued=%d",
+               (unsigned)dest_pid, (unsigned long)len, (const void *)t,
+               (int)t->udp_q_count);
+      klog_info(ul);
+    }
     return 0; /* a unicast message belongs to no group */
+  }
+  if (bootinfo_has_flag("b1nix.trace-uevent")) {
+    char ul[128];
+    snprintf(ul, sizeof(ul), "uevent-unicast: dest_nl_pid=%u -> NO SOCKET",
+             (unsigned)dest_pid);
+    klog_info(ul);
   }
   return -ECONNREFUSED; /* no socket holds that port id */
 }
@@ -1129,13 +1148,17 @@ static isize netlink_uevent_send(struct vfs_socket_state *s, const void *buf,
     return -EMSGSIZE;
   if (groups) {
     nl_enqueue_from_kernel = 0;
+    nl_enqueue_portid = s->local.nl.nl_pid;
     netlink_uevent_deliver(groups, buf, len, s);
+    nl_enqueue_portid = 0;
     nl_enqueue_from_kernel = 1;
     return (isize)len;
   }
   if (dest_pid) {
     nl_enqueue_from_kernel = 0;
+    nl_enqueue_portid = s->local.nl.nl_pid;
     int r = netlink_uevent_unicast(dest_pid, buf, len, s);
+    nl_enqueue_portid = 0;
     nl_enqueue_from_kernel = 1;
     return r < 0 ? (isize)r : (isize)len;
   }
@@ -1170,6 +1193,7 @@ static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
    * kernel has no task behind it and is credited to pid 0 / uid 0, which is
    * what a udev monitor requires before it will look at the message. */
   s->udp_q_nlgroups[slot] = nl_enqueue_groups;
+  s->udp_q_nlportid[slot] = nl_enqueue_from_kernel ? 0u : nl_enqueue_portid;
   {
     struct cred *c = nl_enqueue_from_kernel ? 0 : scheduler_get_current_cred();
     s->udp_q_cred[slot][0] =

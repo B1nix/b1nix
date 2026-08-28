@@ -502,6 +502,10 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
 else
 	QUICK_CMDLINE=""
 	[ "$SMOKE_QUICK" = "1" ] && QUICK_CMDLINE="b1nix.smoke=quick"
+	# Extra kernel command line for one run, for a diagnostic flag that should
+	# not be on in every run (b1nix.debug=signal, a trace, ...). Empty by
+	# default, so nothing about a normal run changes.
+	QUICK_CMDLINE="$QUICK_CMDLINE ${SMOKE_EXTRA_CMDLINE:-}"
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
 		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot >"$BUILD_LOG" 2>&1 || {
 			print_build_failure
@@ -1102,6 +1106,12 @@ else
 	missing_marker "$LOG" "M17 EROFS marker emitted" "missing erofs/erofs-skip marker"
 fi
 check_output "$LOG" "M17-SMOKE: ok errno-isolation" "M17 errno isolation across successful syscall is correct"
+check_output "$LOG" "KHEAP-SELFTEST: ok split-on-reuse" "the allocator carves the unused tail off a block it reuses"
+check_output "$LOG" "KHEAP-SELFTEST: ok remainder-reusable" "and that tail is available to later allocations"
+check_output "$LOG" "M17-SMOKE: ok o-nofollow-eloop" "M17 O_NOFOLLOW refuses a symlink with ELOOP instead of following it"
+check_output "$LOG" "M17-SMOKE: ok o-path-symlink" "M17 O_PATH|O_NOFOLLOW opens the symlink itself and fstat reports S_IFLNK"
+check_output "$LOG" "M17-SMOKE: ok o-path-read-ebadf" "M17 an O_PATH descriptor has no contents to read (EBADF)"
+check_output "$LOG" "M17-SMOKE: ok o-path-dirfd" "M17 an O_PATH directory descriptor still anchors openat()"
 check_output "$LOG" "M17-SMOKE: done" "M17 smoke completes successfully"
 
 # ── M8 AIO / completion queues ──
@@ -1664,6 +1674,7 @@ check_output "$LOG" "M11-UTIL: ok sleep" "sleep 0 returns successfully"
 check_output "$LOG" "M11-UTIL: ok bad-flag-ls" "ls rejects unsupported flags"
 check_output "$LOG" "M11-UTIL: ok bad-flag-grep" "grep rejects unsupported flags"
 check_output "$LOG" "NET-SMOKE: ok ping-gateway" "ping -c 2 10.0.2.2 succeeds"
+check_output "$LOG" "NET-SMOKE: ok dual-stack-accept" "a dual-stack IPv6 listener accepts an IPv4 connection and names its peer ::ffff:127.0.0.1"
 check_output "$LOG" "UDP-SMOKE: probe-sent" "UDP probe command runs"
 check_output "$LOG" "UDP-SMOKE: icmp-port-unreachable" "UDP unbound port triggers ICMP unreachable"
 check_output "$LOG" "UDP-SMOKE: queue-2pkt-ok" "UDP socket queue preserves two packets"
@@ -1824,6 +1835,12 @@ check_output "$LOG" "CLOCK: ok posix-timer-keeps-time" "timer_create/timer_setti
 check_output "$LOG" "UNIX-SMOKE: ok shutdown-wr-poll" "a peer's shutdown(SHUT_WR) makes this socket poll readable, and POLLRDHUP for a caller that asked - without it an event loop never wakes to read the EOF"
 check_output "$LOG" "UNIX-SMOKE: ok shutdown-wr-eof" "after the queued bytes, a peer's shutdown(SHUT_WR) reads as end-of-file rather than blocking for ever"
 check_output "$LOG" "UNIX-SMOKE: ok shutdown-wr-oneway" "the half-close closes ONE direction: the reverse direction still carries data, and the shut half reports EPIPE"
+check_output "$LOG" "UNIX-SMOKE: ok seqpacket-accept" "a SOCK_SEQPACKET connect really queues a connection for accept(2) and the message arrives whole - it used to take the datagram path, which is why udevadm control --ping waited out its timeout against a daemon that had received nothing"
+check_output "$LOG" "UNIX-SMOKE: ok seqpacket-ctl-roundtrip" "udev's control protocol end to end over seqpacket: send, shutdown(SHUT_WR), and the client is released by the server CLOSING the connection"
+check_output "$LOG" "UNIX-SMOKE: ok dgrampair-epoll-wake" "a datagram arriving on an AF_UNIX socketpair wakes a task already parked in epoll_wait - systemd-udevd's manager waits for its workers exactly here"
+check_output "$LOG" "UNIX-SMOKE: ok dgrampair-scm-credentials" "and the message carries SCM_CREDENTIALS naming the child that sent it, which is how the manager knows WHICH worker finished"
+check_output "$LOG" "TCP-SMOKE: ok accept-after-peer-close" "a completed connection whose peer has already closed is still there to accept - the client is reaped before the server looks, so this cannot pass by winning a race (systemd socket activation is exactly this shape)"
+check_output "$LOG" "TCP-SMOKE: ok accept-after-peer-close-data" "and the bytes that client sent belong to the accepted socket rather than dying with the connection"
 check_output "$LOG" "DNS-SMOKE: ok resolve-name" "getaddrinfo resolves a real name through musl's resolver (needs the SLIRP DNS, like the nslookup check)"
 check_output "$LOG" "M32-IP6: ok icmpv6-loopback" "ICMPv6 echo over the ::1 loopback datapath round-trips"
 check_output "$LOG" "M32-IP6: ok icmpv6-errors" "ICMPv6 reports an unreachable closed UDP port"
@@ -2001,6 +2018,7 @@ check_output "$LOG" "M42-W5PRE: ok ppoll-precision" "ppoll honours a sub-millise
 check_output "$LOG" "M42-W5PRE: ok interrupted-waitpid" "waitpid is interrupted by signal with EINTR"
 check_output "$LOG" "M42-W5PRE: ok job-control" "Job control SIGSTOP/SIGCONT changes state"
 check_output "$LOG" "M42-W5PRE: ok sigchld-on-exit" "SIGCHLD is delivered to the parent on child exit"
+check_output "$LOG" "M42-W5PRE: ok kill-sleeping-child" "a signal sent to a task asleep in nanosleep reaches it at once rather than at the sleep's own deadline - measured in elapsed time, because the late answer is the same answer (this is why timeout(1) returned 124 on time and never killed anything)"
 check_output "$LOG" "M42-W5PRE: done" "M42 wave-5 prerequisite suite completes"
 # ── M46: VFS integrity + POSIX process conformance ──
 check_output "$LOG" "M46-SMOKE: start" "M46 conformance suite starts"
@@ -2025,6 +2043,13 @@ check_output "$LOG" "M46-SMOKE: ok waitid" "waitid waiting for child state trans
 check_output "$LOG" "M46-SMOKE: ok times-getrusage" "times() and getrusage() accounting works"
 check_output "$LOG" "M46-SMOKE: ok orphaned-pgrp" "orphaned process groups with stopped tasks receive SIGHUP+SIGCONT"
 check_output "$LOG" "M46-SMOKE: ok nice-biasing" "nice value biases cooperative stride scheduling"
+check_output "$LOG" "M46-SMOKE: ok dir-mtime-create" "creating an entry marks the containing directory modified"
+check_output "$LOG" "M46-SMOKE: ok dir-mtime-subsecond" "a second change inside the same second still moves the directory's mtime"
+check_output "$LOG" "M46-SMOKE: ok dir-mtime-unlink" "removing an entry marks the containing directory modified"
+check_output "$LOG" "M46-SMOKE: ok rename-long-name" "rename keeps a destination name longer than 63 characters whole"
+check_output "$LOG" "M46-SMOKE: ok empty-datagram-cred" "a zero-length AF_UNIX datagram is delivered, wakes poll, and carries SCM_CREDENTIALS"
+check_output "$LOG" "M46-SMOKE: ok rdonly-mount-open" "a read-only bind remount makes open(O_WRONLY) and O_TRUNC fail with EROFS"
+check_output "$LOG" "M46-SMOKE: ok signal-ends-sleep" "SIGTERM kills a process parked in nanosleep, promptly - what every bounded command depends on"
 check_output "$LOG" "M46-SMOKE: done" "M46 conformance suite completes"
 # ── M57: multiprocess broker primitives (fork/exec/FD inheritance + brokering) ──
 check_output "$LOG" "M57-SMOKE: ok fork-fdshare" "fork shares the open-file-description file offset with the child"
@@ -2186,9 +2211,11 @@ check_output "$LOG" "M109-SMOKE: ok veth-crosses-namespace" "one veth end moved 
 check_output "$LOG" "M109-SMOKE: ok unlink-enoent" "unlink of a name that exists on neither the filesystem nor the VFS still fails ENOENT, while an in-memory device node on an on-disk directory really is removed"
 check_output "$LOG" "M109-UEVENT: ok sysfs-dev-tree" "/sys/dev/block/<maj:min>/{dev,uevent} agree with each other and with the block node in /dev"
 check_output "$LOG" "M109-UEVENT: ok sysfs-subsystem-link" "each device directory carries a subsystem symlink whose basename names the subsystem udev matches on"
-check_output "$LOG" "M109-UEVENT: ok uevent-trigger" "writing add to a device's sysfs uevent file re-announces it on the netlink group (device coldplug: what udevadm trigger and mdev -s do)"
+check_output "$LOG" "M109-UEVENT: ok uevent-trigger" "writing add to a device's sysfs uevent file re-announces it on the netlink group, DEVTYPE included (device coldplug: what udevadm trigger and mdev -s do)"
+check_output "$LOG" "M109-UEVENT: ok uevent-trigger-tty" "the same coldplug write works on a device that is not a disk: /sys/class/tty/tty1/uevent takes an add and re-announces the terminal (it was read-only, so udevadm trigger reached no tty at all)"
 check_output "$LOG" "M109-UEVENT: ok uevent-bpf-filter" "SO_ATTACH_FILTER runs a real classic-BPF program over the udev group and drops what it rejects, and the verifier refuses a program with no return"
 check_output "$LOG" "M109-UEVENT: ok uevent-bpf-detach" "SO_DETACH_FILTER puts the socket back to receiving everything"
+check_output "$LOG" "M109-UEVENT: ok netlink-source-portid" "a unicast netlink message reports the SENDING SOCKET's port id as its source, not the sender's pid - what systemd-udevd checks before it accepts a device from its manager"
 check_output "$LOG" "M109-UEVENT: ok uevent-hotplug-add" "a loop device added after boot broadcasts add@/block/loop8 with ACTION/SUBSYSTEM/DEVNAME/MAJOR/MINOR/SEQNUM"
 check_output "$LOG" "M109-UEVENT: ok mdev-scan" "mdev -s creates the missing node as a block special file with the major:minor /sys published"
 check_output "$LOG" "M109-UEVENT: ok uevent-hotplug-remove" "removing the device broadcasts remove@/block/loop8 with an advancing SEQNUM and it leaves /sys"

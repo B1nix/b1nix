@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <time.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -425,6 +426,254 @@ static void test_unix_half_close(void) {
   close(sp[1]);
 }
 
+/*
+ * The shape systemd-udevd's manager waits in: an AF_UNIX SOCK_DGRAM socketpair
+ * with SO_PASSCRED on the reading end, watched by epoll, written by a forked
+ * child that reports it has finished.
+ *
+ * Both halves are load-bearing and both are asserted. The manager blocks in
+ * epoll_wait, so a datagram that arrives while it is already parked has to
+ * wake it -- a readiness that is only visible to a poll made afterwards is one
+ * it never makes. And it identifies which worker reported by the
+ * SCM_CREDENTIALS attached to the message, dropping any message without them:
+ * a datagram delivered with no credentials leaves every worker marked busy for
+ * ever, the event queue stops being drained, and udev processes nothing beyond
+ * its first batch. The parent enters epoll_wait BEFORE the child writes, so
+ * this measures the wake and not the level left behind afterwards.
+ */
+static void test_unix_dgram_pair_epoll(void) {
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) < 0) {
+    marker("UNIX-SMOKE: fail dgrampair-socketpair\n");
+    return;
+  }
+  int on = 1;
+  if (setsockopt(sp[0], SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) != 0) {
+    marker("UNIX-SMOKE: fail dgrampair-passcred\n");
+    close(sp[0]); close(sp[1]);
+    return;
+  }
+  int ep = epoll_create1(0);
+  struct epoll_event ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.events = EPOLLIN;
+  ev.data.fd = sp[0];
+  if (ep < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, sp[0], &ev) != 0) {
+    marker("UNIX-SMOKE: fail dgrampair-epoll-ctl\n");
+    if (ep >= 0) close(ep);
+    close(sp[0]); close(sp[1]);
+    return;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    marker("UNIX-SMOKE: fail dgrampair-fork\n");
+    close(ep); close(sp[0]); close(sp[1]);
+    return;
+  }
+  if (pid == 0) {
+    close(sp[0]);
+    /* Long enough that the parent is certainly inside epoll_wait. */
+    usleep(200000);
+    int result = 0x2a;
+    ssize_t w = send(sp[1], &result, sizeof(result), 0);
+    close(sp[1]);
+    _exit(w == (ssize_t)sizeof(result) ? 0 : 1);
+  }
+  close(sp[1]);
+
+  struct epoll_event got;
+  memset(&got, 0, sizeof(got));
+  int n = epoll_wait(ep, &got, 1, 5000);
+  if (n == 1 && (got.events & EPOLLIN))
+    marker("UNIX-SMOKE: ok dgrampair-epoll-wake\n");
+  else
+    marker("UNIX-SMOKE: fail dgrampair-epoll-wake\n");
+
+  int payload = 0;
+  struct iovec iov;
+  iov.iov_base = &payload;
+  iov.iov_len = sizeof(payload);
+  char control[CMSG_SPACE(sizeof(struct ucred))];
+  memset(control, 0, sizeof(control));
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+  ssize_t got_bytes = (n == 1) ? recvmsg(sp[0], &msg, MSG_DONTWAIT) : -1;
+  struct ucred cred;
+  memset(&cred, 0, sizeof(cred));
+  int have_cred = 0;
+  for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+    if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_CREDENTIALS) {
+      memcpy(&cred, CMSG_DATA(c), sizeof(cred));
+      have_cred = 1;
+    }
+  }
+  if (got_bytes == (ssize_t)sizeof(payload) && payload == 0x2a && have_cred &&
+      cred.pid == pid)
+    marker("UNIX-SMOKE: ok dgrampair-scm-credentials\n");
+  else
+    marker("UNIX-SMOKE: fail dgrampair-scm-credentials\n");
+
+  close(ep);
+  close(sp[0]);
+  int st = 0;
+  waitpid(pid, &st, 0);
+}
+
+/*
+ * SOCK_SEQPACKET over AF_UNIX, in the shape `udevadm control` uses it.
+ *
+ * Seqpacket is connection-oriented: it has a listener, a backlog and an
+ * accept, and it differs from a stream only in keeping message boundaries.
+ * connect(2) used to test for SOCK_STREAM alone and let a seqpacket fall
+ * through to the datagram path -- so the client "connected" to a listening
+ * socket that never queued anything for accept(), wrote its message into the
+ * listener's own buffer, and then waited for a close that could not come.
+ * That is exactly `udevadm control --ping`, and it timed out on every boot.
+ *
+ * The protocol below is udev's: send one message, shut the write half down,
+ * and wait for the server to CLOSE the connection. Both halves are asserted --
+ * the server must see the connection and the message, and the client must be
+ * released by the server's close.
+ */
+static void test_unix_seqpacket_ctl(void) {
+  const char *path = "/tmp/net_smoke_seqpacket.sock";
+  int srv = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+  if (srv < 0) { marker("UNIX-SMOKE: fail seqpacket-socket\n"); return; }
+  struct sockaddr_un sun;
+  memset(&sun, 0, sizeof(sun));
+  sun.sun_family = AF_UNIX;
+  strcpy(sun.sun_path, path);
+  unlink(path);
+  if (bind(srv, (struct sockaddr *)&sun, sizeof(sun)) < 0 ||
+      listen(srv, 4) < 0) {
+    marker("UNIX-SMOKE: fail seqpacket-bind\n");
+    close(srv);
+    return;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) { marker("UNIX-SMOKE: fail seqpacket-fork\n"); close(srv); return; }
+  if (pid == 0) {
+    close(srv);
+    int cli = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if (cli < 0)
+      _exit(1);
+    if (connect(cli, (struct sockaddr *)&sun, sizeof(sun)) < 0)
+      _exit(2);
+    if (send(cli, "PING", 4, 0) != 4)
+      _exit(3);
+    if (shutdown(cli, SHUT_WR) < 0)
+      _exit(4);
+    /* udev_ctrl_wait(): the answer is the server closing the connection. */
+    struct pollfd cp = {cli, POLLIN, 0};
+    int pr = poll(&cp, 1, 5000);
+    char sink[8];
+    ssize_t n = (pr == 1) ? recv(cli, sink, sizeof(sink), 0) : -1;
+    close(cli);
+    _exit(n == 0 ? 0 : 5);
+  }
+
+  /* The listener has to become readable: a connection that is not reported is
+   * one no event loop will ever accept. */
+  struct pollfd lp = {srv, POLLIN, 0};
+  int lr = poll(&lp, 1, 5000);
+  int acc = (lr == 1 && (lp.revents & POLLIN)) ? accept(srv, NULL, NULL) : -1;
+  char msg[16] = {0};
+  ssize_t got = (acc >= 0) ? recv(acc, msg, sizeof(msg), 0) : -1;
+  /* The client's shutdown reaches the accepted socket as end of stream. */
+  ssize_t eof = (acc >= 0) ? recv(acc, msg + 8, 4, 0) : -1;
+  if (acc >= 0)
+    close(acc);
+  close(srv);
+  unlink(path);
+
+  int st = 0;
+  waitpid(pid, &st, 0);
+  if (acc >= 0 && got == 4 && memcmp(msg, "PING", 4) == 0)
+    marker("UNIX-SMOKE: ok seqpacket-accept\n");
+  else
+    marker("UNIX-SMOKE: fail seqpacket-accept\n");
+  if (eof == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0)
+    marker("UNIX-SMOKE: ok seqpacket-ctl-roundtrip\n");
+  else
+    marker("UNIX-SMOKE: fail seqpacket-ctl-roundtrip\n");
+}
+
+/*
+ * A connection whose peer has already closed is still a connection to accept.
+ *
+ * "Is there something to accept" used to be re-derived on every poll and every
+ * accept from state == ESTABLISHED, so a client that connected, wrote and
+ * closed -- every one-shot client, and precisely what systemd's socket
+ * activation is driven by -- left ESTABLISHED for CLOSE_WAIT before the server
+ * ran, and the completed connection became invisible to both. The server saw
+ * nothing to accept and the bytes went away with the slot.
+ *
+ * The child is REAPED before the parent looks at the listener, so the close
+ * has certainly happened first: this cannot pass by winning a race.
+ */
+static void test_tcp_accept_after_peer_close(void) {
+  int srv = socket(AF_INET, SOCK_STREAM, 0);
+  if (srv < 0) { marker("TCP-SMOKE: fail accept-close-socket\n"); return; }
+  int one = 1;
+  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(56002);
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+      listen(srv, 4) < 0) {
+    marker("TCP-SMOKE: fail accept-close-listen\n");
+    close(srv);
+    return;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) { marker("TCP-SMOKE: fail accept-close-fork\n"); close(srv); return; }
+  if (pid == 0) {
+    close(srv);
+    int cli = socket(AF_INET, SOCK_STREAM, 0);
+    if (cli < 0)
+      _exit(1);
+    if (connect(cli, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+      _exit(2);
+    if (send(cli, "hi", 2, 0) != 2)
+      _exit(3);
+    close(cli);
+    _exit(0);
+  }
+
+  int st = 0;
+  waitpid(pid, &st, 0);
+  int child_ok = (WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+  struct pollfd lp = {srv, POLLIN, 0};
+  int pr = poll(&lp, 1, 5000);
+  int acc = (pr == 1 && (lp.revents & POLLIN)) ? accept(srv, NULL, NULL) : -1;
+  char buf[8] = {0};
+  ssize_t got = (acc >= 0) ? recv(acc, buf, sizeof(buf), 0) : -1;
+  if (acc >= 0)
+    close(acc);
+  close(srv);
+
+  if (child_ok && acc >= 0)
+    marker("TCP-SMOKE: ok accept-after-peer-close\n");
+  else
+    marker("TCP-SMOKE: fail accept-after-peer-close\n");
+  /* The data the peer sent before closing belongs to the accepted socket, not
+   * to the connection's tombstone. */
+  if (got == 2 && memcmp(buf, "hi", 2) == 0)
+    marker("TCP-SMOKE: ok accept-after-peer-close-data\n");
+  else
+    marker("TCP-SMOKE: fail accept-after-peer-close-data\n");
+}
+
 /* SO_RCVTIMEO: a blocking recv with nothing to read must give up at the
  * deadline and report EAGAIN, not wait forever. */
 static void test_socket_timeouts(void) {
@@ -472,13 +721,102 @@ static void test_socket_timeouts(void) {
   close(sp[1]);
 }
 
+
+/* An IPv6 listener that is not IPV6_V6ONLY must accept an IPv4 connection and
+ * report its peer as ::ffff:a.b.c.d. That is the default on Linux, and it is
+ * what systemd creates for `ListenStream=<port>`: the connection arrives over
+ * IPv4 on 127.0.0.1 and has to reach the AF_INET6 listener. Here the listening
+ * socket reported itself readable and then blocked in accept() for ever,
+ * because the accept path required the connection's family to be AF_INET6 —
+ * so a socket-activated service on loopback was never started by a connection
+ * that had really been made. */
+static void test_dual_stack_accept(void) {
+  int ls = -1, cs = -1, as = -1;
+  struct sockaddr_in6 sa6;
+  struct sockaddr_in sa4;
+  struct sockaddr_in6 peer;
+  socklen_t plen = sizeof(peer);
+  const unsigned short port = 17931;
+  int on = 1;
+
+  ls = socket(AF_INET6, SOCK_STREAM, 0);
+  if (ls < 0) { marker("NET-SMOKE: fail dual-stack-accept (socket)\n"); return; }
+  setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  memset(&sa6, 0, sizeof(sa6));
+  sa6.sin6_family = AF_INET6;
+  sa6.sin6_port = htons(port);
+  /* in6addr_any: the wildcard, which is what makes it dual-stack. */
+  if (bind(ls, (struct sockaddr *)&sa6, sizeof(sa6)) != 0) {
+    marker("NET-SMOKE: fail dual-stack-accept (bind)\n"); close(ls); return;
+  }
+  if (listen(ls, 4) != 0) {
+    marker("NET-SMOKE: fail dual-stack-accept (listen)\n"); close(ls); return;
+  }
+
+  cs = socket(AF_INET, SOCK_STREAM, 0);
+  if (cs < 0) {
+    marker("NET-SMOKE: fail dual-stack-accept (v4 socket)\n"); close(ls); return;
+  }
+  memset(&sa4, 0, sizeof(sa4));
+  sa4.sin_family = AF_INET;
+  sa4.sin_port = htons(port);
+  sa4.sin_addr.s_addr = htonl(0x7f000001); /* 127.0.0.1 */
+  if (connect(cs, (struct sockaddr *)&sa4, sizeof(sa4)) != 0) {
+    marker("NET-SMOKE: fail dual-stack-accept (connect)\n");
+    close(cs); close(ls); return;
+  }
+
+  /* Bounded: the defect this covers is an accept that never returns. */
+  {
+    struct pollfd pf = { .fd = ls, .events = POLLIN };
+    if (poll(&pf, 1, 5000) <= 0) {
+      marker("NET-SMOKE: fail dual-stack-accept (listener never readable)\n");
+      close(cs); close(ls); return;
+    }
+  }
+  fcntl(ls, F_SETFL, fcntl(ls, F_GETFL, 0) | O_NONBLOCK);
+  memset(&peer, 0, sizeof(peer));
+  as = accept(ls, (struct sockaddr *)&peer, &plen);
+  if (as < 0) {
+    marker("NET-SMOKE: fail dual-stack-accept (accept)\n");
+    close(cs); close(ls); return;
+  }
+
+  /* The peer must be reported as a v4-mapped address, not as zeros. */
+  if (peer.sin6_family != AF_INET6 ||
+      peer.sin6_addr.s6_addr[10] != 0xff || peer.sin6_addr.s6_addr[11] != 0xff ||
+      peer.sin6_addr.s6_addr[12] != 127 || peer.sin6_addr.s6_addr[15] != 1) {
+    marker("NET-SMOKE: fail dual-stack-accept (peer not ::ffff:127.0.0.1)\n");
+    close(as); close(cs); close(ls); return;
+  }
+
+  /* And it carries data, so it is a connection rather than a descriptor. */
+  if (write(cs, "hi", 2) == 2) {
+    char b[4] = {0};
+    struct pollfd pf = { .fd = as, .events = POLLIN };
+    if (poll(&pf, 1, 5000) > 0 && read(as, b, 2) == 2 && b[0] == 'h')
+      marker("NET-SMOKE: ok dual-stack-accept\n");
+    else
+      marker("NET-SMOKE: fail dual-stack-accept (no data over the connection)\n");
+  } else {
+    marker("NET-SMOKE: fail dual-stack-accept (write)\n");
+  }
+  close(as);
+  close(cs);
+  close(ls);
+}
+
 int main(void) {
   test_unix_socket_events();
   test_unix_half_close();
+  test_unix_seqpacket_ctl();
+  test_unix_dgram_pair_epoll();
   test_socket_timeouts();
   test_ping_gateway();
   test_udp_send_recv();
   test_tcp_path();
+  test_tcp_accept_after_peer_close();
+  test_dual_stack_accept();
   test_poll_readiness();
   test_dns_parse();
   return 0;

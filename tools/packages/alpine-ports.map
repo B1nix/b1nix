@@ -131,7 +131,7 @@ kde           repo:community kwin qt6-qtwayland kwayland-integration seatd \
               dbus dbus-libs elogind libelogind sway swaybg grim \
               plasma-workspace plasma-desktop plasma-integration \
               kactivitymanagerd breeze breeze-icons kde-cli-tools \
-              qt6-qtsvg kirigami libplasma util-linux-login
+              qt6-qtsvg kirigami libplasma util-linux-login eudev
               # libplasma, not plasma-framework: KF5's plasma-framework was
               # renamed for KF6 and no package by the old name exists in v3.20.
               #

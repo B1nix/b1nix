@@ -450,6 +450,89 @@ int main(void) {
     }
     ok("sigchld-on-exit");
 
+    /* A signal sent to a task that is ASLEEP has to reach it now, not when the
+     * sleep it is in would have ended anyway.
+     *
+     * Every kill path woke a target that was blocked or stopped and left a
+     * sleeping one alone, so the signal sat in pending_signals until nanosleep's
+     * own deadline expired. From outside that is `timeout 3 sleep 60` returning
+     * 124 on time and taking sixty seconds -- a bound that reports the right
+     * answer while bounding nothing, which corrupts every measurement made
+     * through it.
+     *
+     * The elapsed time is the assertion. Without it this check passes today,
+     * thirty seconds late, and proves nothing. */
+    {
+        struct timespec kt0, kt1;
+        clock_gettime(CLOCK_MONOTONIC, &kt0);
+        pid_t sleeper = fork();
+        if (sleeper == 0) {
+            /* Explicitly the default disposition. An ignored signal stays
+             * ignored across fork and exec, and whatever launched this binary
+             * had already set SIGTERM to SIG_IGN -- so without this the child
+             * would be right to sleep through the signal, and the check would
+             * be measuring the launcher rather than the kernel. */
+            signal(SIGTERM, SIG_DFL);
+            struct timespec long_sleep = {30, 0};
+            nanosleep(&long_sleep, NULL);
+            _exit(0);
+        }
+        if (sleeper < 0) {
+            fail("kill-sleeping-child");
+            return 1;
+        }
+        /* Let the child actually reach nanosleep: signalling it while it is
+         * still in fork/exec would test a different state entirely. */
+        usleep(200000);
+        errno = 0;
+        int krc = kill(sleeper, SIGTERM);
+        int kerr = errno;
+        /* Whether the child is still there two seconds later, and whether a
+         * SIGKILL ends it when a SIGTERM did not. A kill that reports success
+         * and changes nothing is the failure being measured, so the follow-up
+         * says which half is broken: the delivery or this particular signal. */
+        int kst = 0;
+        int alive_after = 0;
+        for (int w = 0; w < 20; w++) {
+            if (waitpid(sleeper, &kst, WNOHANG) == sleeper) {
+                alive_after = 0;
+                break;
+            }
+            alive_after = 1;
+            usleep(100000);
+        }
+        int killed_by_kill = 0;
+        if (alive_after) {
+            kill(sleeper, SIGKILL);
+            for (int w = 0; w < 20 && alive_after; w++) {
+                if (waitpid(sleeper, &kst, WNOHANG) == sleeper) {
+                    alive_after = 0;
+                    killed_by_kill = 1;
+                    break;
+                }
+                usleep(100000);
+            }
+        }
+        if (alive_after)
+            waitpid(sleeper, &kst, 0);
+        clock_gettime(CLOCK_MONOTONIC, &kt1);
+        long kms = (long)((kt1.tv_sec - kt0.tv_sec) * 1000 +
+                          (kt1.tv_nsec - kt0.tv_nsec) / 1000000);
+        if (kms < 3000 && WIFSIGNALED(kst) && WTERMSIG(kst) == SIGTERM) {
+            ok("kill-sleeping-child");
+        } else {
+            char kb[160];
+            snprintf(kb, sizeof(kb),
+                     "kill-sleeping-child: %ldms kill=%d errno=%d signalled=%d sig=%d exit=%d sigkill-ended=%d\n",
+                     kms, krc, kerr, WIFSIGNALED(kst),
+                     WIFSIGNALED(kst) ? WTERMSIG(kst) : -1,
+                     WIFEXITED(kst) ? WEXITSTATUS(kst) : -1, killed_by_kill);
+            emit(kb);
+            fail("kill-sleeping-child");
+            return 1;
+        }
+    }
+
     emit("M42-W5PRE: done\n");
     return 0;
 }

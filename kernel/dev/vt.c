@@ -31,6 +31,7 @@
 #include <b1nix/sysfs_attr.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/syscall.h>
+#include <b1nix/uevent.h>
 #include <b1nix/vfs.h>
 #include <stdio.h>
 #include <string.h>
@@ -1182,6 +1183,24 @@ static isize vt_sysfs_uevent_show(void *ctx, char *buf, usize cap)
 		"MAJOR=4\nMINOR=%d\nDEVNAME=tty%d\n", minor, minor);
 }
 
+/* Writing "add" to a device's `uevent` file re-announces it, and that is how
+ * every coldplug replay works: `udevadm trigger` walks /sys and writes to each
+ * one. These files were read-only, so the replay reached every VT with
+ * "Failed to write 'add' to '/sys/class/tty/ttyN/uevent': Permission denied"
+ * and no tty was ever announced to a manager that started after the kernel
+ * did. */
+static isize vt_sysfs_uevent_store(void *ctx, const char *buf, usize len)
+{
+	int minor = (int)(usize)ctx;
+	char name[8];
+	char devpath[32];
+
+	snprintf(name, sizeof(name), "tty%d", minor);
+	snprintf(devpath, sizeof(devpath), "/class/tty/%s", name);
+	/* A tty carries no DEVTYPE on Linux either. */
+	return uevent_store_write(buf, len, devpath, "tty", 0, name, 4, minor);
+}
+
 static void vt_sysfs_publish(void)
 {
 	struct sysfs_dir *cls = sysfs_reg_dir(sysfs_reg_dir(0, "class"), "tty");
@@ -1198,8 +1217,8 @@ static void vt_sysfs_publish(void)
 		(void)sysfs_reg_attr(d, "active", 0444, vt_sysfs_active_show, 0, 0, 0);
 		(void)sysfs_reg_attr(d, "dev", 0444, vt_sysfs_dev_show, 0,
 				     (void *)(usize)0, 0);
-		(void)sysfs_reg_attr(d, "uevent", 0444, vt_sysfs_uevent_show, 0,
-				     (void *)(usize)0, 0);
+		(void)sysfs_reg_attr(d, "uevent", 0644, vt_sysfs_uevent_show,
+				     vt_sysfs_uevent_store, (void *)(usize)0, 0);
 	}
 
 	for (int i = 1; i <= VT_COUNT; i++) {
@@ -1209,8 +1228,8 @@ static void vt_sysfs_publish(void)
 			continue;
 		(void)sysfs_reg_attr(d, "dev", 0444, vt_sysfs_dev_show, 0,
 				     (void *)(usize)i, 0);
-		(void)sysfs_reg_attr(d, "uevent", 0444, vt_sysfs_uevent_show, 0,
-				     (void *)(usize)i, 0);
+		(void)sysfs_reg_attr(d, "uevent", 0644, vt_sysfs_uevent_show,
+				     vt_sysfs_uevent_store, (void *)(usize)i, 0);
 	}
 }
 

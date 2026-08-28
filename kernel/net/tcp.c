@@ -123,6 +123,11 @@ struct tcp_header {
  * its bookkeeping cannot make forward progress. */
 #define TCP_RCVBUF_MIN (2u * TCP_MSS)
 #define TCP_TIME_WAIT_TICKS 200
+/* How long a completed-but-unaccepted connection is kept. Generous on purpose:
+ * socket activation starts a program that may take seconds to reach its first
+ * accept(), and dropping the connection under it is exactly the failure this
+ * latch exists to remove. */
+#define TCP_ACCEPT_PENDING_TICKS (60 * TCP_TICKS_PER_SEC)
 
 /* ── M84: TCP options ──────────────────────────────────────────────────────
  * Before this the stack neither sent nor parsed a single option: every SYN
@@ -331,6 +336,23 @@ struct tcp_conn {
   u32 ooo_bytes;
   u32 ooo_segs;
   int handed_to_user;
+  /* Passively opened: this connection was created by a SYN arriving at a
+   * listener, not by a connect(2) of ours. A locally initiated connection can
+   * share a listener's port number (tcp_alloc_port hands out ephemerals from
+   * the same table), and without this an accept() on that listener would hand
+   * back the caller's own outbound connection. */
+  int passive;
+  /* The handshake completed and nobody has accepted it yet.
+   *
+   * This is a LATCH, and it has to be: "is there a connection to accept" used
+   * to be re-derived from state == TCP_ESTABLISHED on every poll and every
+   * accept, so a client that connected, wrote and closed — which is every
+   * one-shot client, and exactly what systemd's socket activation is tested
+   * with — left ESTABLISHED for CLOSE_WAIT before the server was scheduled,
+   * and the connection became invisible to both. The server saw nothing to
+   * accept and the client's data was thrown away with the slot. */
+  int accept_pending;
+  u64 accept_since;
   u64 time_wait_since;
   struct tcp_retransmit_pkt *retransmit_queue;
 };
@@ -1340,12 +1362,29 @@ struct tcp_conn *tcp_listen(u16 local_port, int backlog) {
 }
 
 /* ── Check for pending connections (for poll) ── */
-int tcp_pending_connections(u16 local_port) {
+/* Readable-for-accept, asked with the listener's own family so the answer
+ * matches what accept(2) would actually hand over. Reporting a connection the
+ * accept path then refuses turns one poll into a spin, or into a block on a
+ * socket the poller was just told was ready. */
+int tcp_pending_connections_af(u16 local_port, int family, int v6only) {
   u64 irq = irq_save();
   tcp_lock();
   for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
-    if (tcp_conns[i].used && tcp_conns[i].state == TCP_ESTABLISHED &&
-        tcp_conns[i].local_port == local_port && !tcp_conns[i].handed_to_user) {
+    /* Acceptability is LATCHED (accept_pending), not re-derived from
+     * ESTABLISHED: a completed connection whose peer has already closed is
+     * still there to accept, and testing the state would lose it -- which is
+     * exactly the socket-activation shape. The family test is separate: a
+     * dual-stack (non-v6only) IPv6 listener also accepts IPv4 connections, and
+     * answering readable for one the accept path then refuses turns a poll
+     * into a spin. */
+    int family_ok =
+        family == B1NIX_AF_INET6
+            ? (tcp_conns[i].family == B1NIX_AF_INET6 ||
+               (!v6only && tcp_conns[i].family == B1NIX_AF_INET))
+            : (tcp_conns[i].family == B1NIX_AF_INET);
+    if (tcp_conns[i].used && tcp_conns[i].accept_pending &&
+        tcp_conns[i].local_port == local_port && family_ok &&
+        !tcp_conns[i].handed_to_user) {
       tcp_unlock();
       irq_restore(irq);
       return 1;
@@ -1355,17 +1394,22 @@ int tcp_pending_connections(u16 local_port) {
   irq_restore(irq);
   return 0;
 }
+
+int tcp_pending_connections(u16 local_port) {
+  return tcp_pending_connections_af(local_port, B1NIX_AF_INET, 0);
+}
 /* ── TCP Accept ── */
 struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip,
                             u16 *client_port) {
   u64 irq = irq_save();
   tcp_lock();
   for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
-    if (tcp_conns[i].used && tcp_conns[i].state == TCP_ESTABLISHED &&
+    if (tcp_conns[i].used && tcp_conns[i].accept_pending &&
         tcp_conns[i].local_port == local_port &&
         tcp_conns[i].family == B1NIX_AF_INET &&
         !tcp_conns[i].handed_to_user) {
       tcp_conns[i].handed_to_user = 1;
+      tcp_conns[i].accept_pending = 0;
       if (client_ip)
         *client_ip = tcp_conns[i].remote_ip;
       if (client_port)
@@ -1381,18 +1425,42 @@ struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip,
   return 0;
 }
 
+/* `v6only` is the socket's IPV6_V6ONLY. A dual-stack listener — the default on
+ * Linux, and what a `ListenStream=<port>` with no address gives you — must hand
+ * over an IPv4 connection too, reporting its peer as ::ffff:a.b.c.d. The
+ * passive-open path matches a SYN on port alone, so an IPv4 SYN to a dual-stack
+ * listener already created an AF_INET connection here; refusing it at accept
+ * left the listener reporting itself readable and then blocking for ever, which
+ * is the worst of both answers. */
 struct tcp_conn *tcp_accept6(u16 local_port, struct in6_addr_k *client_ip6,
-                             u16 *client_port) {
+                             u16 *client_port, int v6only) {
   u64 irq = irq_save();
   tcp_lock();
   for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
-    if (tcp_conns[i].used && tcp_conns[i].state == TCP_ESTABLISHED &&
-        tcp_conns[i].local_port == local_port &&
-        tcp_conns[i].family == B1NIX_AF_INET6 &&
+    /* Latched acceptability, plus the dual-stack family rule: a non-v6only
+     * IPv6 listener accepts IPv4 connections too, and reports their peer as an
+     * IPv4-mapped IPv6 address, which is what the caller's sockaddr_in6
+     * expects. */
+    int family_ok = tcp_conns[i].family == B1NIX_AF_INET6 ||
+                    (!v6only && tcp_conns[i].family == B1NIX_AF_INET);
+    if (tcp_conns[i].used && tcp_conns[i].accept_pending &&
+        tcp_conns[i].local_port == local_port && family_ok &&
         !tcp_conns[i].handed_to_user) {
       tcp_conns[i].handed_to_user = 1;
-      if (client_ip6)
-        *client_ip6 = tcp_conns[i].remote_ip6;
+      tcp_conns[i].accept_pending = 0;
+      if (client_ip6) {
+        if (tcp_conns[i].family == B1NIX_AF_INET) {
+          struct in6_addr_k m;
+          memset(m.bytes, 0, 16);
+          m.bytes[10] = 0xff;
+          m.bytes[11] = 0xff;
+          for (int b = 0; b < 4; b++)
+            m.bytes[12 + b] = tcp_conns[i].remote_ip.bytes[b];
+          *client_ip6 = m;
+        } else {
+          *client_ip6 = tcp_conns[i].remote_ip6;
+        }
+      }
       if (client_port)
         *client_port = tcp_conns[i].remote_port;
       struct tcp_conn *res = &tcp_conns[i];
@@ -1909,6 +1977,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           new_conn->keepcnt = TCP_KEEPCNT_DEFAULT;
           new_conn->last_activity = scheduler_get_uptime_ticks();
           new_conn->state = TCP_SYN_RECEIVED;
+          new_conn->passive = 1;
           new_conn->family = family;
           new_conn->remote_ip = v4src;
           new_conn->remote_ip6 = v6src;
@@ -2075,6 +2144,13 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         conn->snd_una = ack;
         conn->snd_nxt = ack;
         conn->state = TCP_ESTABLISHED;
+        /* Acceptable from here until someone accepts it, whatever the peer
+         * does next. Set before the wake below, so a server that runs the
+         * instant it is woken already sees it. */
+        if (conn->passive) {
+          conn->accept_pending = 1;
+          conn->accept_since = scheduler_get_uptime_ticks();
+        }
 
         /* The SYN-ACK acknowledges our SYN, so drop it from the retransmit
          * queue.
@@ -2482,6 +2558,28 @@ void tcp_timer_tick(void) {
         tcp_lock();
         conn->used = 0;
       }
+      tcp_unlock();
+      irq_restore(irq);
+      continue;
+    }
+
+    /* A connection that completed its handshake and was never accepted holds
+     * a slot in this table for as long as it stays there, and the table is
+     * capped (resource_caps_tcp_max). A listener that has gone away, or one
+     * that never accepts, would otherwise burn one slot per client until the
+     * machine could open no more connections at all. Linux bounds the same
+     * thing with the accept queue's depth; this bounds it in time. */
+    if (conn->accept_pending && !conn->handed_to_user &&
+        now - conn->accept_since >= TCP_ACCEPT_PENDING_TICKS) {
+      tcp_unlock();
+      irq_restore(irq);
+      tcp_clear_retransmit_queue(conn);
+      tcp_clear_ooo_queue(conn);
+      tcp_free_recv_buf(conn);
+      irq = irq_save();
+      tcp_lock();
+      conn->accept_pending = 0;
+      conn->used = 0;
       tcp_unlock();
       irq_restore(irq);
       continue;

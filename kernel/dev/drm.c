@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <b1nix/drm.h>
 #include <b1nix/sysfs_attr.h>
+#include <b1nix/uevent.h>
 #include <b1nix/errno.h>
 #include <b1nix/fb.h>
 #include <b1nix/mm.h>
@@ -680,10 +681,92 @@ static void drm_sysfs_slotname(const struct drm_pci_ident *id, char *buf,
 	         id ? id->slot : 2, id ? id->func : 0u);
 }
 
+/*
+ * `uevent`, writable, because that is how a coldplug replay reaches a device.
+ *
+ * udevd learns about a device either from a netlink announcement it was
+ * listening for, or -- for everything that already existed when it started --
+ * from `udevadm trigger`, which walks /sys and writes "add" to every uevent
+ * file. With the DRM minors' uevent read-only that walk answered "Permission
+ * denied" on each card, no announcement was ever made for them, and no rule
+ * ran: /run/udev/data/c226:N was never written, the card carried no seat tag,
+ * and logind refused to hand it to a compositor. PCI already learned this
+ * (kernel/dev/pci.c); the graphics minors had not.
+ *
+ * The write re-announces the device for real. Accepting it and doing nothing
+ * would be exactly the silently-discarded write the sysfs registry's contract
+ * forbids, and it would leave the same hole with a file that looks fixed.
+ */
+struct drm_sysfs_uevent {
+	char devpath[96];
+	char devname[32];
+	char text[128];
+	int minor;
+};
+
+static isize drm_sysfs_uevent_show(void *ctx, char *buf, usize cap) {
+	struct drm_sysfs_uevent *u = (struct drm_sysfs_uevent *)ctx;
+
+	return drm_sysfs_text_show(u ? u->text : "", buf, cap);
+}
+
+static isize drm_sysfs_uevent_store(void *ctx, const char *buf, usize len) {
+	struct drm_sysfs_uevent *u = (struct drm_sysfs_uevent *)ctx;
+	char action[16];
+	usize n = 0;
+
+	if (!u || !buf)
+		return -EINVAL;
+	/* The first word is the action; udev appends a synthetic-event UUID after
+	 * it, which nothing here needs. */
+	while (n < len && n < sizeof(action) - 1 && buf[n] != ' ' &&
+	       buf[n] != '\n' && buf[n] != '\0')
+		n++;
+	memcpy(action, buf, n);
+	action[n] = '\0';
+
+	static const char *const known[] = {"add",    "remove", "change",
+	                                    "move",   "online", "offline",
+	                                    "bind",   "unbind"};
+	int ok = 0;
+	for (usize i = 0; i < sizeof(known) / sizeof(known[0]); i++)
+		if (strcmp(action, known[i]) == 0) { ok = 1; break; }
+	if (!ok)
+		return -EINVAL;
+
+	/* DEVTYPE matters here: udev seals an sd_device built from a netlink
+	 * announcement, so a rule that asks for drm_minor gets no answer at all
+	 * unless the announcement carries it. */
+	uevent_post(action, u->devpath, "drm", "drm_minor", u->devname, 226,
+	            u->minor);
+	return (isize)len;
+}
+
+/* Register the minor's uevent file, writable, with the properties Linux puts
+ * in it. `slot` is the PCI slot the minor hangs off, which is what makes the
+ * DEVPATH the announcement carries the same path udev finds in /sys. */
+static void drm_sysfs_reg_uevent(struct sysfs_dir *minor, const char *slot,
+                                 const char *nodename, unsigned minor_num) {
+	struct drm_sysfs_uevent *u = kzalloc(sizeof(*u));
+
+	if (!u)
+		return;
+	snprintf(u->devpath, sizeof(u->devpath), "/devices/pci0000:00/%s/drm/%s",
+	         slot, nodename);
+	snprintf(u->devname, sizeof(u->devname), "dri/%s", nodename);
+	snprintf(u->text, sizeof(u->text),
+	         "MAJOR=226\nMINOR=%u\nDEVNAME=dri/%s\nDEVTYPE=drm_minor\n",
+	         minor_num, nodename);
+	u->minor = (int)minor_num;
+	if (sysfs_reg_attr(minor, "uevent", 0644, drm_sysfs_uevent_show,
+	                   drm_sysfs_uevent_store, u, drm_sysfs_text_free) != 0)
+		kfree(u);
+}
+
 void drm_sysfs_publish_card(unsigned num) { drm_sysfs_publish_card_id(num, 0); }
 
 void drm_sysfs_publish_card_id(unsigned num, const struct drm_pci_ident *id) {
-	char card[16], node[24], minordir[64], *uevent, *devtext;
+	char card[16], node[24], minordir[64], *devtext;
 
 	snprintf(card, sizeof(card), "card%u", num);
 	snprintf(node, sizeof(node), "226:%u", num);
@@ -698,16 +781,15 @@ void drm_sysfs_publish_card_id(unsigned num, const struct drm_pci_ident *id) {
 	if (!minor)
 		return;
 
-	/* uevent is where udev reads the device node's name and numbers from. A
-	 * card with no uevent is enumerated and then discarded as having no node. */
-	uevent = kmalloc(96);
-	if (uevent) {
-		snprintf(uevent, 96,
-		         "MAJOR=226\nMINOR=%u\nDEVNAME=dri/card%u\nDEVTYPE=drm_minor\n",
-		         num, num);
-		if (sysfs_reg_attr(minor, "uevent", 0444, drm_sysfs_text_show, 0, uevent,
-		                   drm_sysfs_text_free) != 0)
-			kfree(uevent);
+	/* uevent is where udev reads the device node's name and numbers from -- and
+	 * where `udevadm trigger` writes to have the device announced again. A card
+	 * with no uevent is enumerated and then discarded as having no node; one
+	 * that cannot be written to is never coldplugged at all. */
+	{
+		char slot[16];
+
+		drm_sysfs_slotname(id, slot, sizeof(slot));
+		drm_sysfs_reg_uevent(minor, slot, card, num);
 	}
 	devtext = kmalloc(16);
 	if (devtext) {
@@ -720,13 +802,20 @@ void drm_sysfs_publish_card_id(unsigned num, const struct drm_pci_ident *id) {
 	/*
 	 * Relative targets, because that is what a sysfs link is.
 	 *
+	 * One "../" per component between the link and /sys, which for a minor
+	 * under /sys/devices/pci0000:00/<slot>/drm/card<N> is five. Six was one
+	 * too many: it walks past the mount point, and a resolver that clamps
+	 * ".." at the root answers "/class/drm", a path that exists nowhere,
+	 * while one that splices by counting is left with a fragment. Linux
+	 * writes the exact count, and so does this.
+	 *
 	 * libudev resolves these by hand rather than with realpath: it counts the
 	 * leading "../" and splices the remainder onto the directory the link lives
 	 * in. An absolute target survives that as nonsense — "/sys/class/drm" with
 	 * "/sys/devices/..." glued to the end — and the device is silently dropped,
 	 * which is how a card that was plainly in /sys came back as "Found 0 GPUs".
 	 */
-	(void)sysfs_reg_link(minor, "subsystem", "../../../../../../class/drm");
+	(void)sysfs_reg_link(minor, "subsystem", "../../../../../class/drm");
 	(void)sysfs_reg_link(minor, "device", "../..");
 
 	{
@@ -880,7 +969,7 @@ void drm_sysfs_publish_render(unsigned gpu_num, unsigned minor_num)
 
 void drm_sysfs_publish_render_id(unsigned gpu_num, unsigned minor_num,
                                  const struct drm_pci_ident *id) {
-	char name[16], node[24], minordir[72], *uevent, *devtext;
+	char name[16], node[24], minordir[72], *devtext;
 
 	snprintf(name, sizeof(name), "renderD%u", minor_num);
 	snprintf(node, sizeof(node), "226:%u", minor_num);
@@ -893,14 +982,11 @@ void drm_sysfs_publish_render_id(unsigned gpu_num, unsigned minor_num,
 	if (!minor)
 		return;
 
-	uevent = kmalloc(96);
-	if (uevent) {
-		snprintf(uevent, 96,
-		         "MAJOR=226\nMINOR=%u\nDEVNAME=dri/renderD%u\nDEVTYPE=drm_minor\n",
-		         minor_num, minor_num);
-		if (sysfs_reg_attr(minor, "uevent", 0444, drm_sysfs_text_show, 0, uevent,
-		                   drm_sysfs_text_free) != 0)
-			kfree(uevent);
+	{
+		char slot[16];
+
+		drm_sysfs_slotname(id, slot, sizeof(slot));
+		drm_sysfs_reg_uevent(minor, slot, name, minor_num);
 	}
 	devtext = kmalloc(16);
 	if (devtext) {
@@ -912,7 +998,7 @@ void drm_sysfs_publish_render_id(unsigned gpu_num, unsigned minor_num,
 
 	/* Up to the PCI device, which is what drmGetDevices2 reads the identity
 	 * from; and out to the class, which is how it finds minors at all. */
-	(void)sysfs_reg_link(minor, "subsystem", "../../../../../../class/drm");
+	(void)sysfs_reg_link(minor, "subsystem", "../../../../../class/drm");
 	(void)sysfs_reg_link(minor, "device", "../..");
 
 	{

@@ -1138,6 +1138,7 @@ void kernel_main(usize arg0, usize arg1)
 		virtio_gpu_irq_selftest(); /* the scanout's completion interrupt */
 		drm_import_selftest(); /* M101: the imported DRM core actually runs */
 		drm_kms_selftest();    /* M101: a device on it, rendering to the scanout */
+		kheap_selftest();      /* the allocator splits blocks it reuses */
 		sysfs_attr_selftest(); /* M101: its /sys and debugfs files, read back */
 	}
 

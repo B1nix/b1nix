@@ -19,6 +19,7 @@
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
 #include <b1nix/serial_tty.h>
+#include <stdio.h>
 
 /* Drain cross-CPU TLB shootdowns while spin-waiting with IRQs disabled (these
  * stack_released hand-off spins run inside scheduler_yield, IRQs off). Without
@@ -1052,6 +1053,115 @@ static struct task *pick_next_task(void) {
     return (struct task *)pcpu->idle_task;
 
   return 0;
+}
+
+static int sig_default_is_ignore(int sig);
+static int sched_wake_for_signal_inner(struct task *t, int sig,
+                                       int allow_stopped);
+
+/* Will this signal make the target do anything?
+ *
+ * The question is only asked before cutting a TIMED sleep short. A sleeper
+ * that wakes checks `pending & ~blocked` and ends its sleep on any bit it
+ * finds, so waking it for a signal it ignores would turn `sleep 60` into
+ * `sleep 0.1` the first time a SIGCHLD or SIGWINCH arrived. Linux never queues
+ * an ignored signal at all; this is the same rule applied at the wake instead.
+ */
+static int sig_wakes_target(struct task *t, int sig) {
+  if (sig <= 0 || sig >= NSIG)
+    return 0;
+  if (sig == SIGKILL || sig == SIGSTOP)
+    return 1;
+  if (t->blocked_signals & (1ULL << (sig - 1)))
+    return 0;
+  sighandler_t h = t->sigactions[sig - 1].sa_handler;
+  if (h == SIG_IGN)
+    return 0;
+  if (h == SIG_DFL && sig_default_is_ignore(sig))
+    return 0;
+  return 1;
+}
+
+/* Promote a task out of an interruptible wait so it can act on a signal just
+ * posted to it. Returns 1 if it was enqueued.
+ *
+ * Per-state CAS, never a bare store: a target running on another CPU can go
+ * DEAD/REAPING between the read and the write, and resurrecting it re-queues a
+ * task whose stack is being freed.
+ *
+ * TASK_SLEEPING is the state this existed without, and it was not a corner:
+ * a task in nanosleep is asleep, not blocked, and every kill path here woke
+ * only BLOCKED and STOPPED. A signal sent to it therefore sat in
+ * `pending_signals` until the sleep's own deadline expired — which is
+ * `timeout 3 sleep 60` returning 124 on time and taking sixty seconds, because
+ * the SIGTERM that was supposed to end it reached a task nothing would run.
+ */
+static void sched_trace_signal_wake(const struct task *t, int sig, int state,
+                                    int woke);
+
+/* The wake, with the trace around it.
+ *
+ * `allow_stopped` is not a detail: promoting a STOPPED task to READY RESUMES
+ * it, and only the two kill paths that always did so may. A group stop must not
+ * un-stop a sibling that is already stopped, and a signal posted through ptrace
+ * must not resume a tracee parked in a ptrace stop — either would be job
+ * control and debugging silently undone. */
+static int sched_wake_for_signal_ex(struct task *t, int sig,
+                                    int allow_stopped) {
+  int state_before = (int)__atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
+  int woke = sched_wake_for_signal_inner(t, sig, allow_stopped);
+  sched_trace_signal_wake(t, sig, state_before, woke);
+  return woke;
+}
+
+static int sched_wake_for_signal(struct task *t, int sig) {
+  return sched_wake_for_signal_ex(t, sig, 1);
+}
+
+static int sched_wake_for_signal_inner(struct task *t, int sig,
+                                       int allow_stopped) {
+  enum task_state expected = TASK_BLOCKED;
+  if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY, 0,
+                                  __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    sched_rq_enqueue_current(t);
+    return 1;
+  }
+  if (sig_wakes_target(t, sig)) {
+    expected = TASK_SLEEPING;
+    if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY, 0,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      sched_rq_enqueue_current(t);
+      return 1;
+    }
+  }
+  if (allow_stopped) {
+    expected = TASK_STOPPED;
+    if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY, 0,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      sched_rq_enqueue_current(t);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Why a signal did or did not move its target, for `b1nix.debug=signal`. A
+ * signal that reaches a task which then does nothing is invisible from
+ * userspace -- the process simply carries on -- and the difference between
+ * "not posted", "posted to a task that was already running" and "posted to a
+ * sleeper nothing woke" is the whole diagnosis. */
+static void sched_trace_signal_wake(const struct task *t, int sig, int state,
+                                    int woke) {
+  if (!klog_debug_enabled("signal"))
+    return;
+  int in_range = (sig > 0 && sig < NSIG);
+  char line[160];
+  snprintf(line, sizeof(line),
+           "wake id=%lu sig=%d state=%d woke=%d blocked=%d handler=%p",
+           (unsigned long)t->id, sig, state, woke,
+           in_range ? (int)((t->blocked_signals >> (sig - 1)) & 1ULL) : 0,
+           in_range ? (void *)t->sigactions[sig - 1].sa_handler : (void *)0);
+  klog_debug_category("signal", line);
 }
 
 static void wake_sleepers(void) {
@@ -2231,6 +2341,36 @@ u64 task_rss_sample(struct task *t, int force) {
   return g_task_maxrss_pages[idx];
 }
 
+/* The resident set as it is NOW, rather than the peak.
+ *
+ * getrusage wants the high-water mark, so that is what task_rss_sample folds
+ * and returns; /proc/<pid>/status VmRSS wants the current figure, and reporting
+ * the peak there would say a process still holds memory it has already given
+ * back. Same page-table walk, without the max. */
+u64 task_rss_current_pages(struct task *t) {
+  if (!t)
+    return 0;
+  u64 resident = 0;
+  if (t->pml4_phys) {
+    for (struct vm_area *v = t->vma_list; v; v = v->next)
+      resident += paging_user_resident(t->pml4_phys, v->start, v->end);
+  }
+  usize idx = task_index(t);
+  if (resident > g_task_maxrss_pages[idx])
+    g_task_maxrss_pages[idx] = resident;
+  return resident;
+}
+
+/* Total address space the task has mapped, resident or not -- VmSize. */
+u64 task_vsize_bytes(const struct task *t) {
+  if (!t)
+    return 0;
+  u64 total = 0;
+  for (struct vm_area *v = t->vma_list; v; v = v->next)
+    total += v->end > v->start ? v->end - v->start : 0;
+  return total;
+}
+
 u64 task_maxrss_pages(const struct task *t) {
   if (!t)
     return 0;
@@ -2263,12 +2403,9 @@ int scheduler_post_signal(usize pid, int sig) {
       continue;
     __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                       __ATOMIC_RELEASE);
-    /* A blocked task must run to notice it; a running one will see it on its
-     * next return to userspace. */
-    enum task_state expected = TASK_BLOCKED;
-    if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
-                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
-      sched_rq_enqueue_current(T(i));
+    /* A waiting task must run to notice it; a running one will see it on its
+     * next return to userspace. A tracee already in a ptrace stop stays in it. */
+    (void)sched_wake_for_signal_ex(T(i), sig, 0);
     interrupts_restore(flags);
     return 0;
   }
@@ -6039,23 +6176,9 @@ int scheduler_kill(usize task_id, int sig) {
         scheduler_notify_wait_event(T(i)->parent_id);
         flags = interrupts_save();
       }
-      /* CAS BLOCKED/STOPPED -> READY so a kill racing the target's exit on
-       * another CPU cannot resurrect a DEAD/REAPING task into the runqueue
-       * (R3-12, mirrors wake_sleepers). */
-      {
-        enum task_state expected = TASK_BLOCKED;
-        if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
-                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-          sched_rq_enqueue_current(T(i));
-        } else {
-          expected = TASK_STOPPED;
-          if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
-                                          0, __ATOMIC_ACQUIRE,
-                                          __ATOMIC_RELAXED)) {
-            sched_rq_enqueue_current(T(i));
-          }
-        }
-      }
+      /* Out of any interruptible wait — blocked, asleep or stopped — so the
+       * target runs and acts on what was just posted to it. */
+      (void)sched_wake_for_signal(T(i), sig);
       interrupts_restore(flags);
       return 0;
     }
@@ -6130,10 +6253,7 @@ static void group_stop_sibling(struct task *t, int sig) {
    * the signal now; the interrupted syscall restarts (SA_RESTART) or returns
    * EINTR through the usual path. Same per-state CAS scheduler_kill uses, so a
    * task that is concurrently dying on another CPU cannot be resurrected. */
-  enum task_state expected = TASK_BLOCKED;
-  if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY, 0,
-                                  __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
-    sched_rq_enqueue_current(t);
+  (void)sched_wake_for_signal_ex(t, sig, 0);
 }
 
 /* kill(2) with a positive pid targets a PROCESS, not a thread: POSIX lets the
@@ -6235,15 +6355,12 @@ int scheduler_sigqueue(usize task_id, int sig, union sigval value, int si_code) 
       __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                         __ATOMIC_RELEASE);
       spin_unlock(&g_rt_lock);
-      /* Wake a blocked/stopped target so it re-checks pending signals. Mirrors
-       * scheduler_kill's CAS so a kill racing the target's exit cannot resurrect
-       * a DEAD/REAPING task. Done outside g_rt_lock to avoid nesting it under the
-       * runqueue lock. */
-      enum task_state expected = TASK_BLOCKED;
-      if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
-                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-        sched_rq_enqueue_current(T(i));
-      }
+      /* Wake a blocked or sleeping target so it re-checks pending signals.
+       * Mirrors scheduler_kill's CAS so a kill racing the target's exit cannot
+       * resurrect a DEAD/REAPING task. Done outside g_rt_lock to avoid nesting
+       * it under the runqueue lock. A stopped target stays stopped, as it did
+       * before this had a shared helper. */
+      (void)sched_wake_for_signal_ex(T(i), sig, 0);
       interrupts_restore(flags);
       return 0;
     }
@@ -6497,23 +6614,9 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
         scheduler_notify_wait_event(T(i)->parent_id);
         flags = interrupts_save();
       }
-      /* CAS BLOCKED/STOPPED -> READY so a kill racing the target's exit on
-       * another CPU cannot resurrect a DEAD/REAPING task into the runqueue
-       * (R3-12, mirrors wake_sleepers). */
-      {
-        enum task_state expected = TASK_BLOCKED;
-        if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
-                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-          sched_rq_enqueue_current(T(i));
-        } else {
-          expected = TASK_STOPPED;
-          if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
-                                          0, __ATOMIC_ACQUIRE,
-                                          __ATOMIC_RELAXED)) {
-            sched_rq_enqueue_current(T(i));
-          }
-        }
-      }
+      /* Out of any interruptible wait — blocked, asleep or stopped — so the
+       * target runs and acts on what was just posted to it. */
+      (void)sched_wake_for_signal(T(i), sig);
       sent++;
     }
   }

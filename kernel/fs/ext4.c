@@ -507,6 +507,7 @@ static isize ext4_vfs_write(struct vfs_node *node, u64 offset, const char *buffe
     kfree(block_buf);
     if (done > 0) {
         node->inode->mtime = vfs_get_unix_time();
+        node->inode->mtime_nsec = 0;
         node->inode->ctime = vfs_get_unix_time();
         
         u64 disk_sz = ext4_get_inode_size(fs, &inode);
@@ -688,6 +689,7 @@ static int ext4_vfs_truncate(struct vfs_node *node, u64 length) {
     }
     node->inode->size = (usize)length;
     node->inode->mtime = vfs_get_unix_time();
+    node->inode->mtime_nsec = 0;
     node->inode->ctime = node->inode->mtime;
     inode.i_mtime = node->inode->mtime;
     inode.i_ctime = node->inode->ctime;
@@ -1408,6 +1410,7 @@ static void ext4_populate_vfs(struct ext4_fs *fs, u32 ino, const char *base_path
                         n->inode->gid = ci.i_gid;
                         n->inode->atime = ci.i_atime;
                         n->inode->mtime = ci.i_mtime;
+                        n->inode->mtime_nsec = 0;
                         n->inode->ctime = ci.i_ctime;
                         n->inode->nlink = ci.i_links_count;
                         n->inode->fs_id = n->parent->inode->fs_id;

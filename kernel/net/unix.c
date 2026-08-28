@@ -71,10 +71,20 @@ static u64 unix_wallclock_usec(void) { return rtc_now_unix_nanos() / 1000ull; }
 struct unix_control {
   int used;
   u64 seq;
+  /* Send order, so two control blocks that start at the same byte offset are
+   * still handed over in the order they were sent. Only a zero-length message
+   * can share an offset with the message after it. */
+  u64 order;
   struct vfs_handle *handles[VFS_SCM_MAX_FDS];
   usize nhandles;
   struct b1nix_ucred cred;
   int has_cred;
+  /* The credentials were attached by the kernel rather than named by the
+   * sender. Those are reported only to a receiver that set SO_PASSCRED —
+   * handing an unasked-for SCM_CREDENTIALS to a caller with a small control
+   * buffer truncates its ancillary data instead. A sender that put the
+   * credentials there itself is answering a question that was asked. */
+  int cred_implicit;
   /* Wall-clock microseconds at which this message was placed in the receive
    * buffer, for SO_TIMESTAMP. Zero when the receiver had not asked. */
   u64 stamp_usec;
@@ -134,6 +144,9 @@ struct unix_socket_data {
    * the ring as an undivided byte stream. */
   u32 msg_len[UNIX_MSG_SLOTS];
   u8 msg_head, msg_tail, msg_count;
+  /* Monotonic counter stamped into every control block queued on this socket.
+   * See struct unix_control::order. */
+  u64 ctl_order;
 
   /* The peer called shutdown(SHUT_WR): it will send nothing more, so this
    * socket must report end-of-file once the bytes already in the ring have
@@ -445,7 +458,18 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
    * for NULL, and the credential copy read freed memory. */
   unix_data_get(peer_u);
 
-  if (s->type == B1NIX_SOCK_STREAM) {
+  /* SOCK_SEQPACKET is connection-oriented: it has a listener, a backlog and an
+   * accept, and differs from a stream only in that it keeps message
+   * boundaries. Every other type test in this file already says so; this one
+   * did not, so a seqpacket connect fell through to the datagram branch — it
+   * never checked that the peer was listening, never queued an endpoint for
+   * accept(), and pointed the client straight at the LISTENING socket. The
+   * client's message then landed in the listener's own ring buffer, its
+   * shutdown(SHUT_WR) marked the listener, and the listener reported POLLIN
+   * for ever while accept() answered EAGAIN. That is `udevadm control --ping`:
+   * it writes its message, waits for the daemon to close the connection, and
+   * waits out its timeout against a daemon that never received one. */
+  if (s->type == B1NIX_SOCK_STREAM || s->type == B1NIX_SOCK_SEQPACKET) {
     if (!peer_s->listening) { vfs_node_put(peer_node); unix_data_put(peer_u); return -ECONNREFUSED; }
 
     /*
@@ -708,7 +732,12 @@ static isize unix_send_to(struct vfs_socket_state *s, const void *buf,
     return (isize)len;
   }
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
-  if ((nhandles || cred) && len == 0)
+  /* Ancillary data needs a byte to ride on only where there is no message to
+   * carry it: a datagram or seqpacket socket delivers the empty message
+   * itself, so ancillary data on one has somewhere to go. */
+  int msg_boundaries =
+      (s->type == B1NIX_SOCK_SEQPACKET || s->type == B1NIX_SOCK_DGRAM);
+  if ((nhandles || cred) && len == 0 && !msg_boundaries)
     return -EINVAL;
 
 retry:;
@@ -734,8 +763,18 @@ retry:;
   }
 
   unix_lock(peer_u);
+  /* A zero-length write on a byte stream moves no bytes and is not an event:
+   * Linux returns 0 without disturbing the connection. Falling through queued
+   * an ancillary block for a message that would never arrive, and could block
+   * on a full ring for a write that needs no room at all. */
+  if (len == 0 && !msg_boundaries && !nhandles) {
+    unix_unlock(peer_u);
+    unix_data_put(peer_u);
+    return 0;
+  }
   usize free_space = peer_u->rb_size - peer_u->rb_count;
-  if (free_space == 0) {
+  /* A zero-length datagram needs a message slot, not room in the ring. */
+  if (free_space == 0 && !(len == 0 && msg_boundaries)) {
     /* Buffer full. POSIX: a blocking socket waits for the reader to drain;
      * only O_NONBLOCK returns EAGAIN. Block on the peer (buffer-owner) socket:
      * unix_recv_control wakes peer_u->socket after draining, and unix_free_state
@@ -775,15 +814,30 @@ retry:;
     goto retry;
   }
 
-  /* SO_PASSCRED on the receiving end: attach this sender's credentials even
-   * though the sender did not ask to send any. */
+  /* Attach this sender's credentials even though the sender did not ask to
+   * send any. Linux's maybe_add_creds(), rule for rule: either end asking for
+   * them is reason enough — and so is the receiving endpoint having NO socket
+   * yet, which is the case that matters.
+   *
+   * An endpoint sitting in a listener's backlog has not been accepted, so it
+   * has no socket and therefore no SO_PASSCRED to read. A client that writes
+   * immediately after connect(2) — which is every request/response protocol
+   * with a one-shot connection — would then be quoting a flag the server has
+   * not had the chance to set. Linux stamps the message in that window;
+   * requiring the flag meant `udevadm control` sent a message that arrived
+   * with no credentials, and systemd-udevd answered "No sender credentials
+   * received, ignoring message": the ping connected, was delivered, and did
+   * nothing. */
   struct b1nix_ucred auto_cred;
-  if (!cred && peer_u->socket && peer_u->socket->so_passcred) {
+  int cred_implicit = 0;
+  if (!cred && (!peer_u->socket || peer_u->socket->so_passcred ||
+                s->so_passcred)) {
     auto_cred.pid = (int)scheduler_get_pid();
     const struct cred *c = scheduler_get_current_cred();
     auto_cred.uid = c ? c->uid : 0;
     auto_cred.gid = c ? c->gid : 0;
     cred = &auto_cred;
+    cred_implicit = 1;
   }
 
   /* SO_TIMESTAMP on the receiving end: the arrival time belongs to the moment
@@ -829,7 +883,7 @@ retry:;
    * undivided byte stream, so two messages queued back to back arrived as one
    * — which is not a smaller difference for a protocol like journald's or
    * sd_notify's, it is a different protocol. */
-  int seqpacket = (s->type == B1NIX_SOCK_SEQPACKET || s->type == B1NIX_SOCK_DGRAM);
+  int seqpacket = msg_boundaries;
   if (seqpacket) {
     /* A SOCK_SEQPACKET write is all-or-nothing: a message that cannot fit
      * whole is either too large ever (EMSGSIZE) or has to wait for the reader
@@ -863,12 +917,14 @@ retry:;
     memset(ctl, 0, sizeof(*ctl));
     ctl->used = 1;
     ctl->seq = peer_u->write_seq;
+    ctl->order = ++peer_u->ctl_order;
     ctl->nhandles = nhandles;
     for (usize i = 0; i < nhandles; i++)
       ctl->handles[i] = handles[i];
     if (cred) {
       ctl->cred = *cred;
       ctl->has_cred = 1;
+      ctl->cred_implicit = cred_implicit;
     }
     ctl->stamp_usec = stamp_usec;
   }
@@ -916,11 +972,21 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
 
   u64 rcv_deadline = unix_deadline(s->so_rcvtimeo_ms);
 
+  int msg_boundaries =
+      (s->type == B1NIX_SOCK_SEQPACKET || s->type == B1NIX_SOCK_DGRAM);
+
   while (1) {
     unix_lock(u);
-    if (u->rb_count > 0) {
-      int seqpacket =
-          (s->type == B1NIX_SOCK_SEQPACKET || s->type == B1NIX_SOCK_DGRAM);
+    /* A queued message with no bytes in it is still a message: Linux delivers
+     * a zero-length datagram, and the ancillary data attached to it is
+     * sometimes the whole content. Gating readability on bytes alone made such
+     * a send succeed and never arrive -- it sat in the queue with the reader
+     * parked in poll. (This was written while chasing systemd-udevd's stalled
+     * worker queue; that turned out to be the netlink source address instead,
+     * and no zero-length AF_UNIX datagram is sent in that boot at all. The
+     * behaviour is still wrong, and is still fixed here.) */
+    if (u->rb_count > 0 || (msg_boundaries && u->msg_count > 0)) {
+      int seqpacket = msg_boundaries;
       usize avail = u->rb_count;
       if (seqpacket) {
         /* Exactly one message is visible to this call, and anything the caller
@@ -936,7 +1002,11 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
         if (candidate->seq > u->read_seq &&
             candidate->seq < u->read_seq + to_copy)
           to_copy = (usize)(candidate->seq - u->read_seq);
-        if (candidate->seq == u->read_seq)
+        /* Several control blocks can share an offset once a zero-length
+         * message is in the queue; the oldest is the one this message
+         * carries. */
+        if (candidate->seq == u->read_seq &&
+            (!ctl || candidate->order < ctl->order))
           ctl = candidate;
       }
       for (usize i = 0; i < to_copy; i++) {
@@ -967,7 +1037,8 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
               if (ctl->handles[i])
                 vfs_handle_release(ctl->handles[i]);
           }
-          if (ctl->has_cred && cred && has_cred) {
+          if (ctl->has_cred && cred && has_cred &&
+              (!ctl->cred_implicit || s->so_passcred)) {
             *cred = ctl->cred;
             *has_cred = 1;
           }
@@ -1016,7 +1087,8 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
     else
       scheduler_wait_prepare(s);
     unix_lock(u);
-    int have_data = (u->rb_count > 0);
+    int have_data =
+        (u->rb_count > 0 || (msg_boundaries && u->msg_count > 0));
     int disconnected =
         ((s->type == B1NIX_SOCK_STREAM || s->type == B1NIX_SOCK_SEQPACKET) &&
          !s->connected) ||
@@ -1041,7 +1113,11 @@ isize unix_recv(struct vfs_socket_state *s, void *buf, usize len) {
 int unix_poll(struct vfs_socket_state *s, struct b1nix_pollfd *pfd) {
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
   pfd->revents = 0;
-  if (u->rb_count > 0) pfd->revents |= B1NIX_POLLIN;
+  /* Bytes, or a message that has none (see unix_recv_control). */
+  if (u->rb_count > 0 ||
+      ((s->type == B1NIX_SOCK_SEQPACKET || s->type == B1NIX_SOCK_DGRAM) &&
+       u->msg_count > 0))
+    pfd->revents |= B1NIX_POLLIN;
   /* POLLHUP means a peer that WAS there is gone. SOCK_SEQPACKET is
    * connection-oriented too, and its hangup is the whole protocol for
    * `udevadm control`: the client sends its message and then waits for

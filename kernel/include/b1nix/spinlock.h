@@ -2,6 +2,7 @@
 #define B1NIX_SPINLOCK_H
 
 #include <b1nix/types.h>
+#include <b1nix/lockdep.h>
 
 /* Spinlock: simple ticket lock / test-and-set lock
  * For UP (single-core) builds the lock is a no-op.
@@ -84,9 +85,15 @@ static inline void spin_lock(spinlock_t *lock) {
         else if (spin_rdtsc() > deadline)
             spin_lock_stuck(lock, (u64)(usize)__builtin_return_address(0));
     }
+    /* Held now. Under LOCKDEP this records who to blame when another CPU spins
+     * on it; in the default build it compiles to nothing. */
+    LOCKDEP_NOTE_SPIN_ACQUIRE(lock, (u64)(usize)__builtin_return_address(0));
 }
 
 static inline void spin_unlock(spinlock_t *lock) {
+    /* Drop the holder record before the lock itself, so no window exists in
+     * which the lock is free but still attributed to this CPU. */
+    LOCKDEP_NOTE_SPIN_RELEASE(lock);
     /* Store 0 with a release barrier so all previous writes are visible
      * before the lock is released. */
     __asm__ volatile("" : : : "memory");

@@ -283,8 +283,9 @@ void vfs_socket_push_raw_icmp(struct ipv4_addr src, const void *icmp, usize len)
 /* TCP over IPv6 (loopback ::1). */
 void tcp6_receive(struct in6_addr_k src, const void *data, usize size);
 struct tcp_conn *tcp_connect6(struct in6_addr_k dst_ip6, u16 dst_port);
-struct tcp_conn *tcp_accept6(u16 local_port, struct in6_addr_k *client_ip6, u16 *client_port);
+struct tcp_conn *tcp_accept6(u16 local_port, struct in6_addr_k *client_ip6, u16 *client_port, int v6only);
 int tcp_pending_connections(u16 local_port);
+int tcp_pending_connections_af(u16 local_port, int family, int v6only);
 int tcp_network_ready(void);
 void tcp_timer_tick(void);
 u32 tcp_debug_peek_iss(struct ipv4_addr remote_ip, u16 remote_port,

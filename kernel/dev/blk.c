@@ -371,8 +371,13 @@ static void blk_announce(struct block_device *dev, usize index,
     return;
   char devpath[96];
   blk_devpath(dev, devpath, sizeof(devpath));
-  uevent_post(action, devpath, "block", dev->name, BLK_SYSFS_MAJOR,
-              (int)index);
+  /* DEVTYPE is what tells udev a disk from a partition, and it is the property
+   * systemd-udevd looks for FIRST: a device whose message omits it is one
+   * whose whole-disk question has no answer, and the worker drops the event
+   * before a single rule runs. */
+  uevent_post(action, devpath, "block",
+              blk_is_partition(dev) ? "partition" : "disk", dev->name,
+              BLK_SYSFS_MAJOR, (int)index);
 }
 
 static void blk_register_internal(struct block_device *dev,

@@ -24,6 +24,11 @@ struct lockdep_cpu_state {
     int levels[LOCKDEP_STACK_DEPTH];
     const char *names[LOCKDEP_STACK_DEPTH];
     int depth;
+    /* Plain spinlocks this CPU currently holds, and where it took each. A
+     * spinlock_t has no room for an owner, so the record lives beside the CPU
+     * instead of inside the lock. */
+    const void *spin_held[LOCKDEP_STACK_DEPTH];
+    u64 spin_site[LOCKDEP_STACK_DEPTH];
 };
 
 /* Per-CPU state lives in a static array sized for the compile-time MAX_CPUS
@@ -178,6 +183,53 @@ void lockdep_dump_cpu(int cpu) {
     }
 }
 
+void lockdep_note_spin_acquire(const void *lock, u64 site) {
+    int cpu = lockdep_self_cpu();
+
+    if (cpu < 0 || cpu >= (int)MAX_CPUS)
+        return;
+    struct lockdep_cpu_state *st = &g_lockdep[cpu];
+    for (int i = 0; i < LOCKDEP_STACK_DEPTH; i++) {
+        if (!st->spin_held[i]) {
+            st->spin_held[i] = lock;
+            st->spin_site[i] = site;
+            return;
+        }
+    }
+    /* More nested spinlocks than there are slots: the oldest is the one most
+     * likely still to matter, so drop this one rather than evict it. */
+}
+
+void lockdep_note_spin_release(const void *lock) {
+    int cpu = lockdep_self_cpu();
+
+    if (cpu < 0 || cpu >= (int)MAX_CPUS)
+        return;
+    struct lockdep_cpu_state *st = &g_lockdep[cpu];
+    for (int i = 0; i < LOCKDEP_STACK_DEPTH; i++) {
+        if (st->spin_held[i] == lock) {
+            st->spin_held[i] = 0;
+            st->spin_site[i] = 0;
+            return;
+        }
+    }
+}
+
+int lockdep_spin_holder(const void *lock, int *cpu_out, u64 *site_out) {
+    for (int c = 0; c < (int)MAX_CPUS; c++) {
+        for (int i = 0; i < LOCKDEP_STACK_DEPTH; i++) {
+            if (g_lockdep[c].spin_held[i] == lock) {
+                if (cpu_out)
+                    *cpu_out = c;
+                if (site_out)
+                    *site_out = g_lockdep[c].spin_site[i];
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 void lockdep_dump_all(void) {
     for (int i = 0; i < g_max_cpus && i < MAX_CPUS; i++) {
         lockdep_dump_cpu(i);
@@ -210,9 +262,21 @@ static int spin_owner_report_lkpi(volatile int *lock) {
 }
 
 static void spin_owner_report(volatile int *lock) {
+	int cpu = -1;
+	u64 site = 0;
+
 	if (spin_owner_report_lkpi(lock))
 		return;
-	console_write("\n  holder: not recorded (not a driver lock)");
+	if (lockdep_spin_holder((const void *)lock, &cpu, &site)) {
+		console_write("\n  holder: cpu ");
+		console_write_dec((u64)cpu);
+		console_write(" took it at 0x");
+		console_write_hex64(site);
+		ksym_print(site);
+		return;
+	}
+	console_write("\n  holder: not recorded (not a driver lock;"
+	              " rebuild with LOCKDEP=1 to record plain spinlocks)");
 }
 
 

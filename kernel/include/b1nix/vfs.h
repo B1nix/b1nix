@@ -222,6 +222,14 @@ struct vfs_inode {
   u64 atime;
   u64 mtime;
   u64 ctime;
+  /* Sub-second halves of the three above. Linux reports nanoseconds and
+   * userspace leans on them: systemd re-reads a unit directory only when its
+   * mtime differs from the one its last scan recorded, so with whole-second
+   * stamps every unit file written in the same second as that scan stayed
+   * invisible -- "Unit x.service not found" for a file that is sitting there. */
+  u32 atime_nsec;
+  u32 mtime_nsec;
+  u32 ctime_nsec;
 
   /* Named pipe (FIFO) backing buffer, non-NULL only while a VFS_FIFO node has
    * at least one opener. Allocated on first open and dropped when the last
@@ -546,6 +554,9 @@ void vfs_set_currently_mounting_root(struct vfs_node *root);
 void vfs_populate_dev(void);
 isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries);
 isize vfs_mounts_info(struct vfs_mount_info *out, usize max_entries);
+/* The mount id of the mount a path lives on — the first field of that mount's
+ * /proc/<pid>/mountinfo row. 0 when no mount matches. */
+int vfs_mount_id_for_path(const char *path);
 /* mount(2) with a propagation flag: change how mount events cross this
  * mountpoint. No filesystem is mounted. */
 int vfs_set_propagation(const char *target, u64 flags);
@@ -603,6 +614,12 @@ int vfs_listen(int fd, int backlog);
 int vfs_accept(int fd, void *addr, usize *addrlen);
 int vfs_connect(int fd, const void *addr, usize addrlen);
 isize vfs_socket_send(int fd, const void *buf, usize len, int flags);
+/* Does a zero-length write on this descriptor put a message on the wire?
+ * True only for a message-oriented AF_UNIX socket, where an empty datagram is
+ * a real event carrying whatever ancillary data is attached to it — and false
+ * for a byte stream, a pipe or a file, where a zero-length write moves
+ * nothing. See sys_write and unix_send_control. */
+int vfs_socket_sends_empty_messages(int fd);
 isize vfs_socket_recv(int fd, void *buf, usize len, int flags);
 isize vfs_socket_sendto(int fd, const void *buf, usize len, int flags,
                         const void *addr, usize addrlen);
@@ -867,10 +884,21 @@ struct vfs_socket_state {
   /* The multicast group each queued netlink message arrived on, reported back
    * in recvmsg's msg_name as sockaddr_nl.nl_groups. */
   u32 udp_q_nlgroups[SOCK_DGRAM_Q_SLOTS];
-  /* The credentials, and the group, of the message the last receive handed
-   * over. */
+  /* The port id of the SOCKET that sent each queued message -- which is what
+   * sockaddr_nl.nl_pid means, and is not the sender's process id. A task may
+   * hold several netlink sockets and they have different port ids; reporting
+   * the pid instead named a socket that had not sent the message. systemd's
+   * device monitor trusts exactly one sender address, obtained with
+   * getsockname on the manager's own monitor, so every device the manager
+   * handed to an already-running udev worker was discarded as "Unicast
+   * netlink message ignored" -- the worker sat idle and the queue never
+   * drained. Zero means the kernel. */
+  u32 udp_q_nlportid[SOCK_DGRAM_Q_SLOTS];
+  /* The credentials, the group, and the sending socket of the message the
+   * last receive handed over. */
   u32 nl_last_cred[3];
   u32 nl_last_groups;
+  u32 nl_last_portid;
   int nl_have_cred;
   u8 udp_last_src_ip[16];
   u16 udp_last_src_port;

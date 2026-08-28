@@ -1708,8 +1708,15 @@ toolchain:
 # for it for nothing, on every build of every smoke run. The inputs are the
 # config and the applet manifest; if the binary is newer than both, there is
 # nothing to do.
+# The STAGED copy is part of the test, not only the built one: the port
+# installs into the sysroot, and a sysroot that has been cleared (or was never
+# populated on this machine) leaves the build tree looking up to date while
+# /opt/busybox/bin/busybox -- which /sbin/init is a symlink to -- is absent.
+# Every instance then boots to nothing, and the suite reports its checks as
+# blocked by a wedged instance rather than as a missing file.
 busybox-package: toolchain
 	@if [ -x $(BUILD_DIR)/ports/busybox/busybox ] && \
+	   [ -x $(BUILD_DIR)/rootfs/opt/busybox/bin/busybox ] && \
 	   [ -z "$$(find tools/configs tools/ports/build-busybox.sh -newer $(BUILD_DIR)/ports/busybox/busybox -print -quit 2>/dev/null)" ]; then \
 		echo "  busybox up to date"; \
 	else \

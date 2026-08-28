@@ -581,8 +581,25 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 	 * did not — and the number of the call that was actually refused is the
 	 * difference between a guess and a fix. Behind the debug flag, because a
 	 * working session issues thousands of these per second. */
-	if (ret < 0 && lkpi_bootflag("b1nix.drm-debug"))
+	if (ret < 0 && lkpi_bootflag("b1nix.drm-debug")) {
 		pr_info("drm: ioctl 0x%08x -> %d\n", (unsigned)request, (int)ret);
+		/* SET_CLIENT_CAP names the capability in its argument, and which one
+		 * was refused is the whole content of the failure: a compositor probes
+		 * several, and a refusal of UNIVERSAL_PLANES costs it every plane
+		 * while a refusal of one it merely asked about costs nothing. The
+		 * number alone cannot tell those apart. */
+		if ((request & 0xffffffffu) == 0x4010640du && user_arg) {
+			struct {
+				u64 capability;
+				u64 value;
+			} cap;
+
+			if (lkpi_copy_from_user(&cap, user_arg, sizeof(cap)) == 0)
+				pr_info("drm:   set_client_cap %llu = %llu refused\n",
+				        (unsigned long long)cap.capability,
+				        (unsigned long long)cap.value);
+		}
+	}
 	return ret;
 }
 

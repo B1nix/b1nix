@@ -139,7 +139,20 @@ struct vfs_mount_entry {
    * namespace too. */
   u32 propagation;
   u32 peer_group;
+  /* Creation order, monotonic and never reused. Several entries can name the
+   * same node — a bind mount records its SOURCE as the mount's root, so
+   * `ReadOnlyPaths=` and `ProtectSystem=`, which bind a path onto itself and
+   * then remount it read-only, leave two entries rooted at one node. Linux
+   * consults the mount stacked LAST at that point; scanning the array picked
+   * the lowest free slot instead, which is the OLDEST, so the read-only
+   * remount was recorded and then never consulted. A slot index cannot answer
+   * this because slots are reused (a namespace clone lands in freed ones). */
+  u64 seq;
 };
+/* Monotonic mount counter — see vfs_mount_entry::seq. Never reset, never
+ * reused. */
+static u64 mount_seq_next = 1;
+
 /* Sized at vfs_init() from RAM, never reallocated — see MAX_MOUNTS in vfs.h for
  * the floor, the ceiling, and why this one is sized rather than grown. Until
  * then the capacity reads as zero, so the scans below are no-ops rather than
@@ -216,14 +229,22 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   struct vfs_node *curr = node;
   struct vfs_mount_entry *res = 0;
   while (curr) {
+    /* The deepest ancestor that is some mount's root wins; among the entries
+     * rooted at THAT node, the one mounted last does (see ::seq). */
     for (int i = 0; i < (int)mount_slots; i++) {
-      if (mount_visible(i) && curr == mounts[i].root_node) {
+      if (mount_visible(i) && curr == mounts[i].root_node &&
+          (!res || mounts[i].seq > res->seq))
         res = &mounts[i];
-        goto out;
-      }
     }
+    if (res)
+      goto out;
     curr = curr->parent;
   }
+  /* Nothing in the chain is a mount root: fall back to the root mount, first
+   * match as before. "Newest wins" answers "which mount is stacked on this
+   * node"; it is not a rule about a node that is on no mount at all, and
+   * applying it here changed which filesystem's flags an unattached node was
+   * judged by. */
   for (int i = 0; i < (int)mount_slots; i++) {
     if (mount_visible(i) && strcmp(mounts[i].target, "/") == 0) {
       res = &mounts[i];
@@ -1085,13 +1106,49 @@ static u16 scheduler_get_current_umask(void) {
 static void vfs_update_times(struct vfs_inode *inode, u32 mask) {
   if (!inode)
     return;
-  u64 now = vfs_get_unix_time();
-  if (mask & VFS_ATIME)
+  /* One clock read for all three, and both halves of it. A whole second is
+   * too coarse to answer "has this changed since I last looked" — see
+   * vfs_inode::mtime_nsec. */
+  u64 ns = rtc_now_unix_nanos();
+  u64 now = ns / 1000000000ull;
+  u32 sub = (u32)(ns % 1000000000ull);
+  if (mask & VFS_ATIME) {
     inode->atime = now;
-  if (mask & VFS_MTIME)
+    inode->atime_nsec = sub;
+  }
+  if (mask & VFS_MTIME) {
     inode->mtime = now;
-  if (mask & VFS_CTIME)
+    inode->mtime_nsec = sub;
+  }
+  if (mask & VFS_CTIME) {
     inode->ctime = now;
+    inode->ctime_nsec = sub;
+  }
+}
+
+/* All three timestamps set to now — what a freshly created inode gets. */
+static void vfs_init_times(struct vfs_inode *inode) {
+  vfs_update_times(inode, VFS_ATIME | VFS_MTIME | VFS_CTIME);
+}
+
+/* A directory whose set of entries changed.
+ *
+ * POSIX requires that creating, removing or renaming an entry mark the
+ * containing directory as modified — the last-data-modification and
+ * last-status-change times both move. Nothing here did that, so a directory's
+ * mtime was fixed at the moment it was created and never moved again.
+ *
+ * The consumer that made this visible is systemd's unit cache: a `systemctl
+ * start` of a unit the manager has not loaded re-scans the unit directories
+ * only when their mtimes differ from the ones the last scan recorded. With a
+ * directory whose mtime never moves, a unit file written after the first
+ * `daemon-reload` is invisible forever — "Unit b1nix-notify.service not
+ * found" for a file sitting in /run/systemd/system. Every tool that decides
+ * whether to re-read a directory this way (make, ccache, package managers)
+ * has the same blind spot. */
+static void vfs_dir_changed(struct vfs_node *dir) {
+  if (dir)
+    vfs_update_times(dir->inode, VFS_MTIME | VFS_CTIME);
 }
 
 static usize node_count = 0;
@@ -1889,8 +1946,7 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
     root_node->name[1] = '\0';
     root_node->inode->type = VFS_DIRECTORY;
     root_node->inode->mode = 0755;
-    root_node->inode->atime = root_node->inode->mtime =
-        root_node->inode->ctime = vfs_get_unix_time();
+    vfs_init_times(root_node->inode);
   }
 
   char part[VFS_NAME_MAX];
@@ -1989,8 +2045,7 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         if (flags & INITRAMFS_SETUID)
           child->inode->mode |= 04000;
 
-        child->inode->atime = child->inode->mtime = child->inode->ctime =
-            vfs_get_unix_time();
+        vfs_init_times(child->inode);
       } else if (data != 0 || size != 0 || flags != 0) {
         child->inode->type = type;
         if (data != 0)
@@ -1998,7 +2053,7 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         if (size != 0)
           child->inode->size = size;
         child->inode->flags = flags;
-        child->inode->mtime = child->inode->ctime = vfs_get_unix_time();
+        vfs_update_times(child->inode, VFS_MTIME | VFS_CTIME);
       }
       struct vfs_node *ret = child;
       vfs_node_put(current);
@@ -2028,8 +2083,7 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
 
         u16 umask = scheduler_get_current_umask();
         child->inode->mode = 0777 & ~umask;
-        child->inode->atime = child->inode->mtime = child->inode->ctime =
-            vfs_get_unix_time();
+        vfs_init_times(child->inode);
 
         child->parent = current;
         vfs_inode_lock_write(current->inode);
@@ -2706,8 +2760,7 @@ void vfs_init(void) {
   strcpy(root_node->name, "/");
   root_node->inode->type = VFS_DIRECTORY;
   root_node->inode->mode = 0755;
-  root_node->inode->atime = root_node->inode->mtime = root_node->inode->ctime =
-      vfs_get_unix_time();
+  vfs_init_times(root_node->inode);
   root_node->inode->fs_id = 1;
   root_node->inode->dev = 1; /* anonymous device for the initial RAM root */
   next_fs_id = 2;
@@ -3342,7 +3395,10 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
     }
   }
 
-  struct vfs_node *node = vfs_find_node_internal(resolved, 1, 0);
+  /* O_NOFOLLOW stops at the last component; every component before it is still
+   * followed, which is what the flag means. */
+  const int follow_final = (flags & B1NIX_O_NOFOLLOW) ? 0 : 1;
+  struct vfs_node *node = vfs_find_node_internal(resolved, follow_final, 0);
   if (IS_ERR(node)) {
     if (PTR_ERR(node) == -ENOENT && (flags & B1NIX_O_CREAT)) {
       /* Use internal version to avoid redundant resolution/logging */
@@ -3402,7 +3458,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
         res = err;
         goto out;
       }
-      node = vfs_find_node_internal(resolved, 1, 0);
+      node = vfs_find_node_internal(resolved, follow_final, 0);
       if (IS_ERR(node)) {
         res = (int)PTR_ERR(node);
         goto out;
@@ -3430,11 +3486,30 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
     }
   }
 
+  /*
+   * The last component is a symlink and the caller said not to follow it.
+   *
+   * Plain O_NOFOLLOW is an error -- there is nothing to open, since the file
+   * the caller asked for is the link's target and it declined to go there.
+   * O_PATH changes that: the descriptor then refers to the LINK, which is the
+   * only way to fstat one without a race, and it is how a path is walked by
+   * hand. Everything below this point -- the access check, O_TRUNC, the
+   * driver's open callback -- is about the file's contents, and an O_PATH
+   * descriptor has none, so it skips all of it.
+   */
+  const int path_only = (flags & B1NIX_O_PATH) ? 1 : 0;
+  if (!follow_final && node->inode->type == VFS_SYMLINK && !path_only) {
+    res = -ELOOP;
+    vfs_node_put(node);
+    goto out;
+  }
   if ((flags & B1NIX_O_DIRECTORY) && node->inode->type != VFS_DIRECTORY) {
     res = -ENOTDIR;
     vfs_node_put(node);
     goto out;
   }
+  if (path_only)
+    goto make_handle;
   /* POSIX: writing to a directory descriptor is not permitted */
   if (node->inode->type == VFS_DIRECTORY &&
       (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))) {
@@ -3448,6 +3523,21 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
     access_mask |= W_OK;
   if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
     access_mask |= R_OK;
+
+  /* A read-only mount refuses the OPEN, not the first write. Linux answers
+   * EROFS here, and programs act on it: a unit under systemd's
+   * `ProtectSystem=strict` expects `open(..., O_WRONLY)` to fail rather than
+   * succeed and then hand back a descriptor that cannot be written. Worse,
+   * O_TRUNC took effect below with no check at all, so a sandboxed process
+   * could empty a file on a filesystem the kernel believed was read-only. */
+  if (access_mask & W_OK) {
+    struct vfs_mount_entry *wmnt = vfs_get_mount_for_node(node);
+    if (wmnt && (wmnt->flags & MS_RDONLY)) {
+      res = -EROFS;
+      vfs_node_put(node);
+      goto out;
+    }
+  }
 
   res = vfs_check_access(node, access_mask);
   if (res != 0) {
@@ -3497,6 +3587,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
     vfs_inode_unlock(node->inode);
   }
 
+make_handle:;
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_NODE);
   if (!h) {
     res = -ENFILE;
@@ -3518,7 +3609,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   h->flags = flags;
   h->offset = (flags & B1NIX_O_APPEND) ? node->inode->size : 0;
 
-  if (node->inode->open_cb) {
+  if (node->inode->open_cb && !path_only) {
     int orc = node->inode->open_cb(node, h);
     if (orc < 0) {
       vfs_handle_release(h);
@@ -3557,6 +3648,11 @@ out:
 static isize node_read_impl(struct vfs_handle *h, char *buf, usize size,
                             u64 *posp) {
   if (!h->node)
+    return -EBADF;
+  /* An O_PATH descriptor names a file without opening its contents; reading or
+   * writing one is EBADF, which is what tells a caller the difference between
+   * a reference and an open file. */
+  if (h->flags & B1NIX_O_PATH)
     return -EBADF;
   struct vfs_node *node = vfs_node_get(h->node);
   u64 offset = posp ? *posp : h->offset;
@@ -3605,7 +3701,15 @@ static isize node_read_impl(struct vfs_handle *h, char *buf, usize size,
             break;
           }
         } else {
+          /* The add succeeded, which does not mean the page is still there:
+           * an evictor on another CPU can take it back before this lookup, and
+           * the result was dereferenced unchecked. Treat a miss the way the
+           * failed-add path above does. */
           page = page_cache_get_page(node->inode, page_aligned);
+          if (!page) {
+            if (total_read == 0) res = -ENOMEM;
+            break;
+          }
         }
       }
 
@@ -3693,6 +3797,8 @@ static isize node_read(struct vfs_handle *h, char *buf, usize size) {
  * position (POSIX: append always goes to EOF). */
 static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
                              u64 *posp) {
+  if (h->flags & B1NIX_O_PATH)
+    return -EBADF;
   if (!h->node)
     return -EBADF;
   struct vfs_node *node = vfs_node_get(h->node);
@@ -3759,7 +3865,15 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
             break;
           }
         } else {
+          /* The add succeeded, which does not mean the page is still there:
+           * an evictor on another CPU can take it back before this lookup, and
+           * the result was dereferenced unchecked. Treat a miss the way the
+           * failed-add path above does. */
           page = page_cache_get_page(node->inode, page_aligned);
+          if (!page) {
+            if (total_written == 0) res = -ENOMEM;
+            break;
+          }
         }
       }
 
@@ -4138,8 +4252,7 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
   node->inode->mode = mode & ~umask;
   node->inode->uid = cred ? cred->euid : ROOT_UID;
   node->inode->gid = cred ? cred->egid : ROOT_GID;
-  node->inode->atime = node->inode->mtime = node->inode->ctime =
-      vfs_get_unix_time();
+  vfs_init_times(node->inode);
 
   {
     u64 _tlflags;
@@ -4170,6 +4283,7 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
     node->inode->link_cb = parent->inode->link_cb;
     node->inode->poll_cb = parent->inode->poll_cb;
   }
+  vfs_dir_changed(parent);
   goto out_unlock;
 
 out_node_put:
@@ -4309,8 +4423,7 @@ int vfs_mknod(const char *path, u32 mode, u64 dev) {
   node->inode->uid = cred ? cred->euid : ROOT_UID;
   node->inode->gid = cred ? cred->egid : ROOT_GID;
   node->inode->nlink = 1;
-  node->inode->atime = node->inode->mtime = node->inode->ctime =
-      vfs_get_unix_time();
+  vfs_init_times(node->inode);
   node->inode->blk_dev = parent->inode->blk_dev;
   if (is_dev) {
     /* A special file IS a device; it does not live on the parent's. */
@@ -4354,6 +4467,8 @@ int vfs_mknod(const char *path, u32 mode, u64 dev) {
   }
 
 out_unlock:
+  if (res == 0 && node)
+    vfs_dir_changed(parent);
   vfs_inode_unlock(parent->inode);
   if (res == 0 && node)
     vfs_inotify_notify(parent, IN_CREATE, name);
@@ -4444,8 +4559,7 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
   node->inode->mode = mode & ~umask;
   node->inode->uid = cred ? cred->euid : ROOT_UID;
   node->inode->gid = cred ? cred->egid : ROOT_GID;
-  node->inode->atime = node->inode->mtime = node->inode->ctime =
-      vfs_get_unix_time();
+  vfs_init_times(node->inode);
 
   {
     u64 _tlflags;
@@ -4475,6 +4589,7 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
     node->inode->link_cb = parent->inode->link_cb;
     node->inode->poll_cb = parent->inode->poll_cb;
   }
+  vfs_dir_changed(parent);
   goto out_unlock;
 
 out_node_put:
@@ -4595,8 +4710,11 @@ static int vfs_stat_node(struct vfs_node *node, struct b1nix_stat *st) {
   st->st_mode = vfs_node_type_mode(node) | (inode->mode & 07777);
 
   st->st_atim.tv_sec = inode->atime;
+  st->st_atim.tv_nsec = inode->atime_nsec;
   st->st_mtim.tv_sec = inode->mtime;
+  st->st_mtim.tv_nsec = inode->mtime_nsec;
   st->st_ctim.tv_sec = inode->ctime;
+  st->st_ctim.tv_nsec = inode->ctime_nsec;
 
   /* vfs_node_dev, not a raw field read: a filesystem that populated its tree
    * inside its own mount callback left these nodes unstamped. */
@@ -4843,6 +4961,7 @@ static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
       }
       vfs_node_put(child);
       dcache_invalidate(parent, name);
+      vfs_dir_changed(parent);
       return 0;
     }
     prev = child;
@@ -4927,6 +5046,14 @@ int vfs_link(const char *target, const char *link_path) {
   }
 
   vfs_inode_lock(parent->inode);
+  {
+    struct vfs_mount_entry *lmnt = vfs_get_mount_for_node(parent);
+    if (lmnt && (lmnt->flags & MS_RDONLY)) {
+      vfs_inode_unlock(parent->inode);
+      res = -EROFS;
+      goto out;
+    }
+  }
   res = vfs_check_access(parent, W_OK);
   if (res != 0) {
     vfs_inode_unlock(parent->inode);
@@ -4969,6 +5096,8 @@ int vfs_link(const char *target, const char *link_path) {
       vfs_node_put(new_node);
     }
   }
+  if (res == 0)
+    vfs_dir_changed(parent);
   vfs_inode_unlock(parent->inode);
 
 out:
@@ -5005,6 +5134,13 @@ int vfs_symlink(const char *target, const char *link_path) {
     goto out_unlock;
   }
 
+  {
+    struct vfs_mount_entry *smnt = vfs_get_mount_for_node(parent);
+    if (smnt && (smnt->flags & MS_RDONLY)) {
+      res = -EROFS;
+      goto out_unlock;
+    }
+  }
   const struct cred *cred = get_current_cred();
   if (cred && !vfs_get_node_perm(parent, cred, 2)) {
     res = -EACCES;
@@ -5046,8 +5182,7 @@ int vfs_symlink(const char *target, const char *link_path) {
   node->inode->mode = 0777;
   node->inode->uid = cred ? cred->euid : ROOT_UID;
   node->inode->gid = cred ? cred->egid : ROOT_GID;
-  node->inode->atime = node->inode->mtime = node->inode->ctime =
-      vfs_get_unix_time();
+  vfs_init_times(node->inode);
   node->parent = parent;
   {
     u64 _tlflags;
@@ -5075,6 +5210,8 @@ int vfs_symlink(const char *target, const char *link_path) {
   }
 
 out_unlock:
+  if (res == 0)
+    vfs_dir_changed(parent);
   vfs_inode_unlock(parent->inode);
   vfs_node_put(parent);
   return res;
@@ -5295,7 +5432,14 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
     }
   }
 
-  copy_path(node->name, 64, new_n);
+  /* The whole name. A directory entry here holds VFS_NAME_MAX-1 characters and
+   * every other creation path stores that many; rename alone capped the copy
+   * at 64, so `rename(a, b)` with a `b` longer than 63 characters silently
+   * renamed the entry to a shorter, different name — the file then existed
+   * under a name nobody would ever look up, and the intended one was ENOENT.
+   * Atomic "write to a temporary, rename over the target" is how systemd,
+   * dpkg and glibc all replace a file, and their temporary names are long. */
+  copy_path(node->name, VFS_NAME_MAX, new_n);
   node->parent = new_parent;
   {
     u64 _tlflags;
@@ -5308,6 +5452,9 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
     icache_invalidate(node->inode->fs_id, node->inode->ino);
   dcache_invalidate(old_parent, old_n);
   dcache_invalidate(new_parent, new_n);
+  vfs_dir_changed(old_parent);
+  if (new_parent != old_parent)
+    vfs_dir_changed(new_parent);
 
 out_unlock:
   if (p1 != p2)
@@ -5595,6 +5742,7 @@ static void vfs_mount_propagate(int midx) {
     mounts[slot] = mounts[midx];
     mounts[slot].mnt_ns = mounts[i].mnt_ns;
     mounts[slot].peer_group = child_group;
+    mounts[slot].seq = mount_seq_next++;
     mounts[slot].used = 1;
     if (mounts[slot].root_node)
       vfs_node_get(mounts[slot].root_node);
@@ -5689,6 +5837,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   mounts[midx].peer_group = 0;
   mounts[midx].owner = fs->owner;
   mounts[midx].mnt_ns = vfs_current_mnt_ns();
+  mounts[midx].seq = mount_seq_next++;
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   if (bootinfo_has_flag("b1nix.trace-mount")) {
     char ml[192];
@@ -5971,6 +6120,7 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
   mounts[midx].flags = flags & ~(u64)(MS_BIND | MS_REC | MS_PROPAGATION_MASK);
   mounts[midx].owner = 0;
   mounts[midx].mnt_ns = vfs_current_mnt_ns();
+  mounts[midx].seq = mount_seq_next++;
   mounts[midx].propagation = MS_PRIVATE;
   mounts[midx].peer_group = 0;
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
@@ -6515,6 +6665,53 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries) {
     count++;
   }
   return (isize)count;
+}
+
+/* The mount id of the mount a path lives on: the number /proc/<pid>/mountinfo
+ * prints in its first field for that mount, which is the only thing a mount id
+ * means to userspace.
+ *
+ * Reporting a constant — this used to answer 0 for every path, on the grounds
+ * that there is one mount namespace — is not a simplification, it is an answer
+ * no line of mountinfo carries. systemd asks for the mount id of /dev and then
+ * looks for the mountinfo row with that id to read its filesystem type; with 0
+ * it finds no row, concludes /dev is not a devtmpfs, and (with udev not yet
+ * running) DISABLES its device monitor for the rest of the boot. No .device
+ * unit can activate after that, whatever udev goes on to do.
+ *
+ * The id is the mount's position in the visible list, +1, exactly as
+ * r_mountinfo numbers the rows it prints. The mount a path lives on is the
+ * visible mount whose target is the longest prefix of it, latest wins.
+ * Returns 0 when nothing matches, which cannot happen once / is mounted. */
+int vfs_mount_id_for_path(const char *path) {
+  if (!path || path[0] != '/')
+    return 0;
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(path, resolved);
+
+  int best_id = 0;
+  usize best_len = 0;
+  usize index = 0;
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mount_visible(i))
+      continue;
+    index++;
+    const char *tgt = mounts[i].target;
+    usize tlen = strlen(tgt);
+    if (tlen == 0)
+      continue;
+    if (strncmp(resolved, tgt, tlen) != 0)
+      continue;
+    /* "/devices" is not under "/dev": a prefix match must end on a component
+     * boundary. The root is the one target that ends in '/' already. */
+    if (tlen > 1 && resolved[tlen] != '\0' && resolved[tlen] != '/')
+      continue;
+    if (tlen >= best_len) {
+      best_len = tlen;
+      best_id = (int)index;
+    }
+  }
+  return best_id;
 }
 
 /* Directory cursor, high bit: the filesystem's half of a merged listing is
@@ -7301,8 +7498,7 @@ int vfs_memfd_create(const char *name, u32 flags) {
   /* write_cb stays, because write(2) still has to work; the flag is what tells
    * reclaim not to call it for a page it already holds. */
   node->inode->flags |= VFS_NODE_MEMORY_BACKED;
-  node->inode->atime = node->inode->mtime = node->inode->ctime =
-      vfs_get_unix_time();
+  vfs_init_times(node->inode);
 
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_NODE);
   if (!h) {
@@ -7878,9 +8074,13 @@ int vfs_utime(const char *path, u64 atime, u64 mtime) {
     }
   }
 
+  /* utimes(2) names whole seconds; the sub-second halves it does not name are
+   * zeroed rather than left over from the last write. */
   node->inode->atime = atime;
+  node->inode->atime_nsec = 0;
   node->inode->mtime = mtime;
-  node->inode->ctime = vfs_get_unix_time();
+  node->inode->mtime_nsec = 0;
+  vfs_update_times(node->inode, VFS_CTIME);
   vfs_inotify_notify(node, IN_ATTRIB, 0); /* M107 */
   if (node->inode->setattr_cb) {
     res = node->inode->setattr_cb(node);

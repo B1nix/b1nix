@@ -387,6 +387,11 @@ u64  task_start_ticks(const struct task *t);
  * the once-per-tick rate limit. */
 u64  task_rss_sample(struct task *t, int force);
 u64  task_maxrss_pages(const struct task *t);
+/* Resident set right now (procfs VmRSS), and total mapped span (VmSize).
+ * task_rss_sample reports the PEAK, which is what getrusage wants and what
+ * /proc/<pid>/status must not report. */
+u64  task_rss_current_pages(struct task *t);
+u64  task_vsize_bytes(const struct task *t);
 /* Voluntary / involuntary context-switch counts (getrusage ru_nvcsw/ru_nivcsw). */
 u64  task_nvcsw(const struct task *t);
 u64  task_nivcsw(const struct task *t);

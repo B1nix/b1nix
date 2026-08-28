@@ -465,6 +465,16 @@ static isize sys_write(int fd, const void *buf, usize count) {
   isize total_written = 0;
   char kbuf[4096];
 
+  /* write(fd, buf, 0) moves no bytes — except on a message-oriented socket,
+   * where Linux puts an empty message on the wire. Returning 0 without sending
+   * anything loses a message the receiver is waiting for. */
+  if (count == 0) {
+    if (!vfs_socket_sends_empty_messages(fd))
+      return 0;
+    isize res = vfs_write(fd, kbuf, 0);
+    return res < 0 ? res : 0;
+  }
+
   while (count > 0) {
     usize chunk = count > 4096 ? 4096 : count;
     if (copy_from_user(kbuf, (const char *)buf + total_written, chunk) < 0)
@@ -1161,6 +1171,9 @@ static u64 sys_selfhost_status(struct b1nix_selfhost_status *status) {
  *   - Linux O_NONBLOCK (04000 = 0x800) == b1nix O_CLOEXEC (0x800)
  *   - Linux O_CLOEXEC  (02000000 = 0x80000) != b1nix O_CLOEXEC
  *   - Linux O_DIRECT   (040000 = 0x4000) == b1nix O_NONBLOCK (0x4000)
+ * O_NOFOLLOW and O_PATH do not diverge -- b1nix uses Linux's values for both --
+ * and they carry meaning a path walker depends on, so they are translated
+ * rather than dropped.
  * Build the b1nix flag set from recognized Linux bits only; unknown Linux bits
  * (O_NOCTTY/O_SYNC/O_DIRECT/O_NOFOLLOW/...) are dropped so they cannot set an
  * unrelated b1nix flag. The low two bits (O_RDONLY/O_WRONLY/O_RDWR) are
@@ -1181,6 +1194,8 @@ static int linux_open_flags_to_b1nix(int lf) {
   if (lf & (04000 | 040000))
     flags |= B1NIX_O_NONBLOCK;
   if (lf & 0200000)  flags |= B1NIX_O_DIRECTORY; /* Linux 0x10000 (shared) */
+  if (lf & 0400000)  flags |= B1NIX_O_NOFOLLOW;  /* Linux 0x20000 (shared) */
+  if (lf & 010000000) flags |= B1NIX_O_PATH;     /* Linux 0x200000 (shared) */
   if (lf & 02000000) flags |= B1NIX_O_CLOEXEC;   /* Linux 0x80000 -> 0x800 */
   return flags;
 }
@@ -1394,14 +1409,30 @@ static isize sys_utime(const char *user_path, u64 atime, u64 mtime) {
 static isize sys_linux_utimensat(int dirfd, const char *user_path,
                                  u64 times_ptr, int is_nsec) {
   char kpath[VFS_MAX_PATH];
-  if (!user_path)
-    return -EINVAL; /* futimens (path-less) form not supported */
-  if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
-    return -EFAULT;
-  if (dirfd != AT_FDCWD && kpath[0] != '/')
-    return -EBADF;
   char resolved[VFS_MAX_PATH];
-  vfs_resolve_path(kpath, resolved);
+
+  /*
+   * The path-less form IS futimens(3).
+   *
+   * utimensat(fd, NULL, ...) is how the C library implements futimens, so
+   * refusing it with EINVAL refuses every futimens in every program. eudev's
+   * udevd touches /run/udev/queue after each event that way; the refusal was
+   * not fatal to it, so it retried -- forever, at the top of its event loop,
+   * printing "could not touch /run/udev/queue: Invalid argument" and starving
+   * everything else on the machine. A daemon spinning is what an unimplemented
+   * syscall looks like from the outside.
+   */
+  if (!user_path) {
+    if (vfs_fd_abspath(dirfd, resolved, sizeof(resolved)) < 0)
+      return -EBADF;
+  } else {
+    if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
+      return -EFAULT;
+    /* And a relative path against a directory descriptor, which is what the
+     * *at() family exists for -- it used to be EBADF. */
+    if (syscall_resolve_at(dirfd, kpath, resolved, sizeof(resolved)) < 0)
+      return -EBADF;
+  }
 
   u64 now = vfs_get_unix_time();
   u64 atime = now, mtime = now;
@@ -2897,7 +2928,9 @@ static isize sys_linux_name_to_handle_at(int dirfd, const char *user_path,
   if (syscall_copyout((void *)(usize)user_handle, &out, sizeof(out)) < 0)
     return -EFAULT;
   if (user_mount_id) {
-    i32 mount_id = 0; /* one namespace, one mount id */
+    /* The real id of the mount this path lives on, which is what mountinfo's
+     * first field carries: a caller asks for it in order to find that row. */
+    i32 mount_id = (i32)vfs_mount_id_for_path(resolved);
     if (syscall_copyout((void *)(usize)user_mount_id, &mount_id,
                         sizeof(mount_id)) < 0)
       return -EFAULT;
@@ -3236,8 +3269,13 @@ static u64 sys_connect(int fd, const void *user_addr, usize addrlen) {
 
 static u64 sys_send(int fd, const void *user_buf, usize len, int flags) {
   enum { SOCKET_IO_MAX = 64 * 1024 };
-  if (len == 0)
-    return 0;
+  if (len == 0) {
+    /* See sys_write: an empty datagram is a message, not a no-op. */
+    if (!vfs_socket_sends_empty_messages(fd))
+      return 0;
+    isize rc0 = vfs_socket_send(fd, "", 0, flags);
+    return (u64)(rc0 < 0 ? rc0 : 0);
+  }
   /* A buffer larger than one transfer chunk is legal; send up to the cap and
    * report how many bytes were taken (the caller loops for the rest). */
   if (len > SOCKET_IO_MAX)
@@ -3293,8 +3331,14 @@ static u64 sys_sendto(int fd, const void *user_buf, usize len, int flags,
       return (u64)-EFAULT;
     kaddrlen = addrlen;
   }
-  if (len == 0)
-    return 0;
+  if (len == 0) {
+    /* See sys_write: an empty datagram is a message, not a no-op. */
+    if (!vfs_socket_sends_empty_messages(fd))
+      return 0;
+    isize rc0 = vfs_socket_sendto(fd, "", 0, flags,
+                                  kaddrlen ? (const void *)kaddr : 0, kaddrlen);
+    return (u64)(rc0 < 0 ? rc0 : 0);
+  }
   if (len > SOCKET_IO_MAX)
     len = SOCKET_IO_MAX;
   if (!user_buf)
@@ -3418,8 +3462,16 @@ static int copyin_message(const struct syscall_msghdr *user_msg,
       return -EMSGSIZE;
     total += iov[i].iov_len;
   }
-  if (total == 0)
-    return -EINVAL;
+  /* A message with no bytes in it is a message. Linux sends and receives
+   * zero-length datagrams, and the ancillary data they carry is the whole
+   * point of some of them -- a receiver takes the sender's identity from the
+   * SCM_CREDENTIALS attached to an empty message. Refusing an iovec of total
+   * length zero with EINVAL made that impossible to express. */
+  if (total == 0) {
+    *payload = 0;
+    *payload_len = 0;
+    return 0;
+  }
   char *buf = kmalloc(total);
   if (!buf)
     return -ENOMEM;

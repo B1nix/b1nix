@@ -1419,29 +1419,12 @@ static isize pci_sysfs_uevent_show(void *ctx, char *buf, usize cap) {
 
 static isize pci_sysfs_uevent_store(void *ctx, const char *buf, usize len) {
 	struct pci_sysfs_uevent *u = (struct pci_sysfs_uevent *)ctx;
-	char action[16];
-	usize n = 0;
 
-	if (!u || !buf)
+	if (!u)
 		return -EINVAL;
-	while (n < len && n < sizeof(action) - 1 && buf[n] != ' ' &&
-	       buf[n] != '\n' && buf[n] != '\0')
-		n++;
-	memcpy(action, buf, n);
-	action[n] = '\0';
-
-	static const char *const known[] = {"add",    "remove", "change",
-	                                    "move",   "online", "offline",
-	                                    "bind",   "unbind"};
-	int ok = 0;
-	for (usize i = 0; i < sizeof(known) / sizeof(known[0]); i++)
-		if (strcmp(action, known[i]) == 0) { ok = 1; break; }
-	if (!ok)
-		return -EINVAL;
-
-	/* No device node behind a PCI function: no DEVNAME, no major/minor. */
-	uevent_post(action, u->devpath, "pci", 0, -1, -1);
-	return (isize)len;
+	/* No device node behind a PCI function: no DEVTYPE, no DEVNAME, no
+	 * major/minor. */
+	return uevent_store_write(buf, len, u->devpath, "pci", 0, 0, -1, -1);
 }
 
 static void pci_sysfs_attr(struct sysfs_dir *dir, const char *name,

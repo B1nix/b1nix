@@ -29,7 +29,7 @@ ACCEL=
 qemu-system-x86_64 $ACCEL \
 	-m "${KDE_MEM_MB:-4096}" -smp "${KDE_SMP:-4}" \
 	-cdrom "$DIR/build/x86_64/${KDE_ISO:-b1nix.iso}" \
-	-device virtio-gpu-pci \
+	-device virtio-gpu-pci,id=vgpu \
 	-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
 	-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
 	-device virtio-tablet-pci,id=vtablet \
@@ -57,7 +57,18 @@ while [ "$i" -lt "$RUN_SECONDS" ]; do
 	if [ "$ready" = 1 ] || grep -aq "ok drm-card\|ok nested-socket" "$LOG" 2>/dev/null; then
 		if [ $((i % 5)) -eq 0 ]; then
 			shot=$((shot + 1))
-			mon "screendump $OUT/frame-$(printf %03d $shot).ppm" || true
+			#
+			# Name the device, because there is more than one.
+			#
+			# QEMU adds a standard VGA adapter of its own alongside the
+			# virtio-gpu asked for here, and a bare `screendump` takes the
+			# first one -- so every picture was of the VGA console the
+			# compositor does not draw on, while kwin was modesetting the
+			# virtio-gpu. Frames came back 94% black with one other colour and
+			# looked exactly like a desktop that never painted. Ask for the
+			# device kwin actually programmed.
+			mon "screendump $OUT/frame-$(printf %03d $shot).ppm vgpu" ||
+				mon "screendump $OUT/frame-$(printf %03d $shot).ppm" || true
 		fi
 	fi
 	grep -aq "SCANOUT-END\|KDE: done" "$LOG" 2>/dev/null && break

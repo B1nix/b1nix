@@ -306,11 +306,20 @@ struct tracked_alloc {
   u64 caller;
 };
 
-#define MAX_TRACKED_BLOCKS 1024
+#define MAX_TRACKED_BLOCKS 8192
+/* 64 KB, not 1 MB.
+ *
+ * The gate decides which allocations can ever be attributed to a caller, and
+ * at 1 MB it answered nothing about a heap that grew by ~5 MB a second in
+ * blocks of 64 KB to 512 KB -- every one of them was below the gate, so the
+ * table stayed empty while a gigabyte leaked. These are still rare enough
+ * (single figures per second) that the linear scan below costs nothing on the
+ * paths that matter. */
+#define TRACK_MIN_SIZE (64u * 1024u)
 static struct tracked_alloc tracked_blocks[MAX_TRACKED_BLOCKS];
 
 static void track_alloc(u64 addr, usize size, u64 caller) {
-  if (size < 1024 * 1024) return;
+  if (size < TRACK_MIN_SIZE) return;
   for (int i = 0; i < MAX_TRACKED_BLOCKS; i++) {
     if (tracked_blocks[i].addr == 0) {
       tracked_blocks[i].addr = addr;
@@ -329,7 +338,7 @@ static void track_alloc(u64 addr, usize size, u64 caller) {
  * hottest kernel path — which also lengthened the critical section and worsened
  * cross-core heap_lock contention. */
 static void track_free(u64 addr, usize size) {
-  if (size < 1024 * 1024) return;
+  if (size < TRACK_MIN_SIZE) return;
   for (int i = 0; i < MAX_TRACKED_BLOCKS; i++) {
     if (tracked_blocks[i].addr == addr) {
       tracked_blocks[i].addr = 0;
@@ -337,6 +346,230 @@ static void track_free(u64 addr, usize size) {
       tracked_blocks[i].caller = 0;
       break;
     }
+  }
+}
+
+/*
+ * What the heap is actually holding, by size class.
+ *
+ * kheap_mapped_bytes says how far the heap has grown; it does not say whether
+ * that is live data or a high-water mark left by fragmentation, and it never
+ * says WHAT. When the heap climbs by megabytes a second on an idle desktop,
+ * the shape of the live blocks is the first real evidence: a million objects
+ * of one size names the structure, while a mapped span far above the live
+ * total names fragmentation instead.
+ *
+ * Walks the whole heap once, so it is on demand only (reading
+ * /proc/b1nix-kheap), never on a timer.
+ */
+/*
+ * The allocator gives back what a request does not use.
+ *
+ * This is a regression test for a bug that was invisible from userspace and
+ * cost a desktop its machine: reuse handed out whole free blocks, so a small
+ * allocation landing on a large free block consumed all of it forever, and the
+ * heap climbed by megabytes a second at a constant object count. Nothing
+ * failed, nothing was corrupted, and the only symptom was running out of
+ * memory much later -- which is why it has a check of its own rather than
+ * being left to the suites that merely allocate.
+ *
+ * Freeing a large block and then asking for a small one must NOT consume the
+ * large block: the remainder has to come back as free space, which is measured
+ * here as the heap's mapped high-water not moving across the second request.
+ */
+/* The size the allocator recorded for a live allocation, which is what the
+ * split test has to look at: the request is 64 bytes either way, and the
+ * question is whether the BLOCK behind it is still half a megabyte. */
+usize kmalloc_reuse_probe_size(void *ptr) {
+  if (!ptr)
+    return 0;
+  u64 p = (u64)(usize)ptr;
+  if (p >= KLARGE_START && p < KLARGE_END)
+    return 0;
+  struct kheap_block *b =
+      (struct kheap_block *)((u8 *)ptr - KHEAP_HEADER_SIZE);
+  return b->magic == KHEAP_MAGIC ? b->size : 0;
+}
+
+void kheap_selftest(void) {
+  const usize big = 512u * 1024u;
+  void *a = kmalloc(big);
+
+  if (!a) {
+    console_write("KHEAP-SELFTEST: FAIL big-alloc\n");
+    return;
+  }
+  kfree(a);
+
+  /* The small request should be carved out of the block just freed, and the
+   * rest of it left free -- so the heap must not have to grow to serve it. */
+  u64 before = kheap_mapped_bytes();
+  void *small = kmalloc(64);
+  if (!small) {
+    console_write("KHEAP-SELFTEST: FAIL small-alloc\n");
+    return;
+  }
+  u64 after = kmalloc_reuse_probe_size(small);
+
+  if (after > 4096) {
+    console_write("KHEAP-SELFTEST: FAIL split block size ");
+    console_write_dec(after);
+    console_write("\n");
+    kfree(small);
+    return;
+  }
+  console_write("KHEAP-SELFTEST: ok split-on-reuse\n");
+
+  /* And the remainder is usable: several more small requests must still fit
+   * without the heap growing, which is what "given back" has to mean. */
+  void *more[8];
+  for (int i = 0; i < 8; i++)
+    more[i] = kmalloc(1024);
+  u64 grew = kheap_mapped_bytes();
+
+  for (int i = 0; i < 8; i++)
+    kfree(more[i]);
+  kfree(small);
+
+  if (grew > before) {
+    console_write("KHEAP-SELFTEST: FAIL remainder-unusable grew ");
+    console_write_dec((grew - before) / 1024);
+    console_write(" kB\n");
+    return;
+  }
+  console_write("KHEAP-SELFTEST: ok remainder-reusable\n");
+}
+
+void kheap_dump_histogram(void) {
+  /* Size classes by power of two, 16 bytes to 1 MB and a tail. */
+  u64 live_count[24] = {0};
+  u64 live_bytes[24] = {0};
+  u64 free_count[24] = {0};
+  u64 free_bytes[24] = {0};
+  u64 total_live = 0, total_free = 0, blocks = 0;
+  u64 flags;
+
+  heap_acquire(&flags);
+  u64 addr = heap.base;
+  while (addr + KHEAP_HEADER_SIZE <= heap.current) {
+    struct kheap_block *b = (struct kheap_block *)(usize)addr;
+
+    if (b->magic != KHEAP_MAGIC && b->magic != KHEAP_FREED_MAGIC)
+      break; /* the walk has lost the chain; report what was counted */
+    if (b->size == 0 || b->size > (heap.current - addr))
+      break;
+    int cls = 0;
+    usize sz = b->size;
+    while (sz > 16 && cls < 23) {
+      sz >>= 1;
+      cls++;
+    }
+    if (b->magic == KHEAP_MAGIC) {
+      live_count[cls]++;
+      live_bytes[cls] += b->size;
+      total_live += b->size;
+    } else {
+      free_count[cls]++;
+      free_bytes[cls] += b->size;
+      total_free += b->size;
+    }
+    blocks++;
+    addr += KHEAP_HEADER_SIZE + b->size;
+  }
+  u64 mapped = heap.current > heap.base ? heap.current - heap.base : 0;
+  heap_release(flags);
+
+  console_write("kheap: mapped ");
+  console_write_dec(mapped / 1024);
+  console_write(" kB, live ");
+  console_write_dec(total_live / 1024);
+  console_write(" kB, free ");
+  console_write_dec(total_free / 1024);
+  console_write(" kB, blocks ");
+  console_write_dec(blocks);
+  console_write("\n");
+  for (int i = 0; i < 24; i++) {
+    if (!live_count[i] && !free_count[i])
+      continue;
+    console_write("kheap:  <=");
+    console_write_dec(16ull << i);
+    console_write("B live ");
+    console_write_dec(live_count[i]);
+    console_write(" (");
+    console_write_dec(live_bytes[i] / 1024);
+    console_write(" kB) free ");
+    console_write_dec(free_count[i]);
+    console_write(" (");
+    console_write_dec(free_bytes[i] / 1024);
+    console_write(" kB)\n");
+  }
+}
+
+/*
+ * Live tracked allocations, aggregated by the code that made them.
+ *
+ * Listing every block names nothing when there are thousands of them; the
+ * question is which call site is holding the memory, and that is a total per
+ * caller. Sizes are the reason a caller matters, so both the count and the
+ * bytes are reported and the list is scanned in place rather than sorted --
+ * the caller with megabytes against it is obvious in the output.
+ */
+void kheap_dump_tracked_by_caller(void) {
+  struct {
+    u64 caller;
+    u64 count;
+    u64 bytes;
+  } agg[64];
+  int naggs = 0;
+  u64 flags;
+  u64 untracked = 0, total = 0;
+
+  if (spin_is_locked(&heap_lock)) {
+    k_info(NULL, "kheap: caller dump skipped, heap_lock held");
+    return;
+  }
+  heap_acquire(&flags);
+  for (int i = 0; i < MAX_TRACKED_BLOCKS; i++) {
+    if (!tracked_blocks[i].addr)
+      continue;
+    total += tracked_blocks[i].size;
+    int j = 0;
+    for (; j < naggs; j++)
+      if (agg[j].caller == tracked_blocks[i].caller)
+        break;
+    if (j == naggs) {
+      if (naggs == 64) {
+        untracked += tracked_blocks[i].size;
+        continue;
+      }
+      agg[naggs].caller = tracked_blocks[i].caller;
+      agg[naggs].count = 0;
+      agg[naggs].bytes = 0;
+      naggs++;
+    }
+    agg[j].count++;
+    agg[j].bytes += tracked_blocks[i].size;
+  }
+  heap_release(flags);
+
+  console_write("kheap: live blocks >=64kB total ");
+  console_write_dec(total / 1024);
+  console_write(" kB across ");
+  console_write_dec((u64)naggs);
+  console_write(" callers\n");
+  for (int i = 0; i < naggs; i++) {
+    console_write("kheap:  caller 0x");
+    console_write_hex64(agg[i].caller);
+    console_write(" count ");
+    console_write_dec(agg[i].count);
+    console_write(" bytes ");
+    console_write_dec(agg[i].bytes / 1024);
+    console_write(" kB\n");
+  }
+  if (untracked) {
+    console_write("kheap:  (callers beyond the 64 listed: ");
+    console_write_dec(untracked / 1024);
+    console_write(" kB)\n");
   }
 }
 
@@ -477,6 +710,17 @@ static void kheap_dump(void) {
  * wild kernel rip/cr2 inside the heap apart from a legitimate pointer — a
  * 64 KiB live block is a task kernel stack, a freed block means a use-after-
  * free. Read-only, bounded walk; safe to call from the exception path. */
+/* How much address space the general heap has mapped.
+ *
+ * This is the kernel's own footprint as far as /proc/meminfo is concerned --
+ * the closest honest analogue of Slab. It is a high-water figure, not live
+ * use: the bump heap returns pages to the pmm only when coalescing leaves a
+ * large free tail (KHEAP_SHRINK_MIN), so what it reports is what the kernel is
+ * still holding, which is exactly the question asked of it. */
+u64 kheap_mapped_bytes(void) {
+  return heap.current > heap.base ? heap.current - heap.base : 0;
+}
+
 void kheap_describe(u64 addr, const char *label) {
   console_write(label);
   console_write(" 0x");
@@ -775,6 +1019,65 @@ static void klarge_free(void *ptr) {
   heap_release(flags);
 }
 
+/*
+ * Carve the unused tail of a reused free block back into a free block.
+ *
+ * Without this the allocator hands out whole blocks: the search below takes
+ * the first free block whose size is >= the request and returns it unchanged,
+ * so a 64-byte allocation that lands on a 512 KB free block consumes all 512
+ * KB, and `block->size` stays 512 KB forever. Coalescing makes it a ratchet
+ * rather than a one-off -- adjacent frees merge into ever larger blocks, each
+ * of which is then swallowed whole by whatever small allocation reaches it
+ * next -- so the heap's live bytes climb without bound at a constant object
+ * count. On an idle Plasma desktop that was ~5 MB a second, and it is why a
+ * 4 GB guest ran out of memory: live 1483 MB across 301387 blocks, an average
+ * of 4.9 kB per object in a kernel whose objects are mostly tens of bytes.
+ *
+ * The boundary tags have to stay true across the split: the tail records the
+ * head's new size as its prev_size, the block physically after the tail
+ * records the tail's, and if there is no such block then the tail is the new
+ * topmost block. Those are exactly the invariants kheap_validate checks and
+ * that coalescing reads.
+ *
+ * Called with heap_lock held and `want` already 16-aligned.
+ */
+#define KHEAP_MIN_SPLIT_PAYLOAD 32u
+
+static void kheap_split_block(struct kheap_block *blk, usize want) {
+  if (blk->size <= want)
+    return;
+  usize rest = blk->size - want;
+
+  /* A remainder too small to hold a header plus a usable payload cannot become
+   * a block; leave it as slack inside the allocation, which is what any
+   * allocator does with the last few bytes. */
+  if (rest < KHEAP_HEADER_SIZE + KHEAP_MIN_SPLIT_PAYLOAD)
+    return;
+
+  usize tail_payload = rest - KHEAP_HEADER_SIZE;
+  struct kheap_block *tail =
+      (struct kheap_block *)((u8 *)blk + KHEAP_HEADER_SIZE + want);
+
+  tail->size = tail_payload;
+  tail->prev_size = want;
+  tail->magic = KHEAP_FREED_MAGIC;
+  tail->padding = 0;
+  tail->next = 0;
+
+  struct kheap_block *after =
+      (struct kheap_block *)((u8 *)tail + KHEAP_HEADER_SIZE + tail->size);
+  if ((u64)(usize)after < heap.current)
+    after->prev_size = tail->size;
+  else
+    heap.last_block = tail;
+
+  blk->size = want;
+
+  int bkt = size_to_bucket(tail->size);
+  tail->next = free_lists[bkt];
+  free_lists[bkt] = tail;
+}
+
 static void *kmalloc_internal(usize size, u64 caller) {
   if (size == 0) {
     return 0;
@@ -831,6 +1134,9 @@ static void *kmalloc_internal(usize size, u64 caller) {
   }
 
   if (block) {
+    /* Give back whatever of the block this request does not need, before it is
+     * accounted for or handed out. */
+    kheap_split_block(block, size);
     void *ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
     track_alloc((u64)(usize)ptr, block->size, caller);
     kheap_validate("kmalloc_end_reuse");

@@ -47,6 +47,7 @@ start_system_bus() {
 		return 1
 	fi
 	echo "KDE: ok system-bus t=$(up)"
+	start_udev
 	start_logind
 }
 
@@ -59,6 +60,53 @@ start_system_bus() {
 # activation either -- Alpine's OpenRC service runs exactly this command -- so
 # run it, and then verify the NAME is on the bus rather than assuming the
 # process implies it.
+# udev, because a seat is something udev builds.
+#
+# logind hands a graphics device to a session only when that device belongs to
+# the session's seat, and it decides that from the udev database: the tag
+# "seat" on /run/udev/data/c226:N. Nothing in this image was writing that file,
+# so every card was catalogued as belonging to no seat and TakeDevice answered
+# ENODEV without ever opening anything.
+#
+# The database entry is not something to write by hand. It is produced by
+# elogind's own 71-seat.rules matching SUBSYSTEM=="drm", KERNEL=="card*" --
+# rules already installed under /lib/udev/rules.d -- when udevd processes an
+# "add" for the device. Devices that existed before udevd started are replayed
+# by `udevadm trigger`, which writes "add" to each /sys/**/uevent, so the DRM
+# minors' uevent files have to be writable for the replay to reach them (they
+# now are; see kernel/dev/drm.c).
+start_udev() {
+	__udevd=""
+	for u in /sbin/udevd /lib/udev/udevd /usr/sbin/udevd /usr/lib/udev/udevd; do
+		[ -x "$u" ] && { __udevd="$u"; break; }
+	done
+	if [ -z "$__udevd" ]; then
+		echo "KDE: fail no-udevd t=$(up)"
+		return 1
+	fi
+	mkdir -p /run/udev
+	pgrep -f "[u]devd" > /dev/null 2>&1 || 		setsid "$__udevd" --daemon > /tmp/kde-udevd.log 2>&1
+	__i=0
+	while [ $__i -lt 10 ]; do
+		[ -e /run/udev/control ] && break
+		__i=$((__i + 1)); sleep 1
+	done
+	# The coldplug replay. Bounded, because udevadm settle waits on a queue
+	# that a udevd which never started would never drain, and an unbounded wait
+	# there is a boot that never continues.
+	udevadm trigger --action=add --subsystem-match=drm > /tmp/kde-trigger.log 2>&1
+	udevadm trigger --action=add --subsystem-match=input >> /tmp/kde-trigger.log 2>&1
+	udevadm settle --timeout=20 >> /tmp/kde-trigger.log 2>&1
+	echo "KDE: udev db after trigger: [$(ls /run/udev/data 2>&1 | tr '\n' ' ' | cut -c1-160)]"
+	if [ -e /run/udev/data/c226:1 ]; then
+		echo "KDE: ok udev-tagged-card t=$(up)"
+		return 0
+	fi
+	echo "KDE: fail udev-tagged-card t=$(up): $(tail -4 /tmp/kde-trigger.log 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+	echo "KDE: udevd said: $(tail -6 /tmp/kde-udevd.log 2>/dev/null | tr '\n' ' ' | cut -c1-240)"
+	return 1
+}
+
 start_logind() {
 	__el=""
 	for e in /usr/libexec/elogind/elogind /usr/lib/elogind/elogind \
@@ -187,6 +235,89 @@ has_flag() {
 }
 
 up() { cut -d' ' -f1 /proc/uptime; }
+
+# Everything logind inspects before it opens a graphics device.
+#
+# TakeDevice(226,1) answers ENODEV while logind never opens the node, so the
+# refusal happens while it is resolving the device. That resolution is
+# sd-device's, and udevadm runs the same library: if udevadm can describe the
+# card, logind's lookup of it is not what fails, and if it cannot, its error
+# names the step. Ask both, plus the pieces sd-device reads by hand, and call
+# the method itself so the answer is the daemon's own.
+probe_logind_device() {
+	__sp=$1
+	echo "KDE: --- logind device probe ---"
+	for __c in /sys/class/drm/card[0-9]*; do
+		__n=$(basename "$__c" 2>/dev/null)
+		case "$__n" in *-*) continue ;; esac
+		__syspath=$(readlink -f "$__c" 2>/dev/null)
+		echo "KDE: probe $__n syspath=[$__syspath]"
+		echo "KDE: probe $__n dev=[$(cat "$__c/dev" 2>&1 | tr -d '\n')] subsystem-link=[$(readlink "$__c/subsystem" 2>&1)]"
+		echo "KDE: probe $__n subsystem-resolves=[$(readlink -f "$__c/subsystem" 2>&1)]"
+		echo "KDE: probe $__n uevent=[$(cat "$__c/uevent" 2>&1 | tr '\n' ' ')]"
+		echo "KDE: probe $__n entries=[$(ls "$__c/" 2>&1 | tr '\n' ' ' | cut -c1-160)]"
+	done
+	# The udev database, which is where the seat tags live. A card with no
+	# entry has no ID_SEAT and no master-of-seat tag, and logind decides both
+	# from there.
+	echo "KDE: probe udev-db=[$(ls /run/udev/data 2>&1 | tr '\n' ' ' | cut -c1-200)]"
+	for __d in c226:0 c226:1 c226:128; do
+		[ -e "/run/udev/data/$__d" ] || continue
+		echo "KDE: probe db $__d=[$(cat "/run/udev/data/$__d" 2>&1 | tr '\n' ' ' | cut -c1-200)]"
+	done
+	# sd-device's own answer, from the tool that links the same library.
+	for __u in /bin/udevadm /sbin/udevadm /usr/bin/udevadm /usr/sbin/udevadm; do
+		[ -x "$__u" ] || continue
+		echo "KDE: probe udevadm-by-name=[$("$__u" info --query=all --name=/dev/dri/card1 2>&1 | tr '\n' ' ' | cut -c1-260)]"
+		echo "KDE: probe udevadm-by-path=[$("$__u" info --query=all --path=/sys/dev/char/226:1 2>&1 | tr '\n' ' ' | cut -c1-260)]"
+		echo "KDE: probe udevadm-drm-enum=[$("$__u" info --export-db 2>/dev/null | grep -c . )] lines"
+		break
+	done
+	# The seat logind believes this session sits on, and what it believes that
+	# seat can do. A seat with no graphical device is a seat no compositor is
+	# given a card by.
+	for __lc in /usr/bin/loginctl /bin/loginctl /usr/sbin/loginctl; do
+		[ -x "$__lc" ] || continue
+		echo "KDE: probe seat-status=[$("$__lc" seat-status seat0 2>&1 | tr '\n' ' ' | cut -c1-260)]"
+		break
+	done
+	# And the method itself, so the error is logind's rather than inferred.
+	for __mm in 226:1 226:0 226:128; do
+		__maj=${__mm%%:*}; __min=${__mm##*:}
+		[ -e "/sys/dev/char/$__mm" ] || continue
+		echo "KDE: probe TakeDevice($__maj,$__min)=[$(dbus-send --system --print-reply \
+			--dest=org.freedesktop.login1 "$__sp" \
+			org.freedesktop.login1.Session.TakeDevice \
+			uint32:"$__maj" uint32:"$__min" 2>&1 | tr '\n' ' ' | cut -c1-200)]"
+	done
+	# Can the seat draw, as logind sees it?
+	#
+	# CanGraphical is read straight out of logind's own device map: it is true
+	# only when a device tagged master-of-seat has been attached to the seat.
+	# False says the refusal is about how logind catalogues the card, not about
+	# the file descriptor it would hand over.
+	for __bc in /usr/bin/busctl /bin/busctl; do
+		[ -x "$__bc" ] || continue
+		echo "KDE: probe CanGraphical=[$("$__bc" get-property org.freedesktop.login1 \
+			/org/freedesktop/login1/seat/seat0 \
+			org.freedesktop.login1.Seat CanGraphical 2>&1 | tr '\n' ' ' | cut -c1-100)]"
+		break
+	done
+	# What udev made of the card, which is what logind reads.
+	#
+	# The database entry is the whole of the seat association: no entry, no
+	# "seat" tag, and logind drops the device while cataloguing it and reports
+	# that as ENODEV without opening anything. This used to be written here by
+	# hand to prove that was the cause; it is written by udevd now, and this
+	# only reports what is there.
+	for __mm in 226:1 226:0; do
+		[ -e "/run/udev/data/c$__mm" ] || continue
+		echo "KDE: probe udev-entry c$__mm=[$(cat "/run/udev/data/c$__mm" 2>&1 | tr '\n' ' ' | cut -c1-200)]"
+	done
+	echo "KDE: probe logind-tail=[$(tail -25 /tmp/kde-elogind.log 2>/dev/null | tr '\n' ' ' | cut -c1-900)]"
+	echo "KDE: --- end logind device probe ---"
+}
+
 
 echo "KDE: start t=$(up)"
 
@@ -494,6 +625,54 @@ CONF
 	export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
 }
 
+# Where the memory and the seconds go.
+#
+# Plasma exhausts a 4 GB guest before it paints and needs 8; and it takes tens
+# of seconds to get there. Neither number means anything on its own -- the
+# question is whether the kernel is holding memory it should give back, and
+# whether the time is spent in the kernel or in Qt. So sample the breakdown
+# /proc/meminfo now reports (Cached is the page cache, Slab the kernel heap,
+# AnonPages everything else) alongside the biggest resident processes, and
+# stamp every sample with the uptime so the samples can be read as a curve.
+#
+# Cheap enough to leave running: one read of /proc/meminfo and one pass over
+# /proc/*/status every few seconds.
+memsnap() {
+	__tag=$1
+	__mi=$(cat /proc/meminfo 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g')
+	echo "KDE: MEM[$__tag] t=$(up) $__mi"
+	# What the heap is holding, at a few chosen moments. Two samples far apart
+	# are what separates a leak (one size class growing) from a high-water mark
+	# left by fragmentation (mapped far above live).
+	case "$__tag" in
+	kwin-up|t5|t20|scanout-end)
+		echo "KDE: KHEAP[$__tag] t=$(up)"
+		cat /proc/b1nix-kheap > /dev/null 2>&1
+		;;
+	esac
+	# The five largest resident processes, which is where an answer of the
+	# form "Plasma simply wants this much" would show itself.
+	for __p in /proc/[0-9]*; do
+		__n=$(cat "$__p/comm" 2>/dev/null) || continue
+		__r=$(awk '/^VmRSS:/{print $2}' "$__p/status" 2>/dev/null)
+		[ -n "$__r" ] || continue
+		echo "$__r $(basename "$__p") $__n"
+	done 2>/dev/null | sort -rn | head -6 | while read -r __kb __pid __nm; do
+		echo "KDE: RSS[$__tag] ${__kb}kB pid=$__pid $__nm"
+	done
+}
+
+# A sampler that keeps going while the desktop starts, so the curve covers the
+# part nobody is watching.
+memsnap_loop() {
+	__i=0
+	while [ $__i -lt 40 ]; do
+		sleep 5
+		__i=$((__i + 1))
+		memsnap "t$__i"
+	done
+}
+
 start_plasma() {
 if [ -x /usr/bin/plasmashell ]; then
 
@@ -573,21 +752,31 @@ if [ -x /usr/bin/plasmashell ]; then
 	plasma_running() { prog_alive plasmashell $PLASMAPID; }
 	# Wait for evidence that it PAINTED, not for the loop to run out.
 	#
-	# The four strings this used to look for ("Loading the desktop", "panel",
-	# "Plasma Shell startup", "shell surface") appear nowhere in this build's
-	# output, so the loop always ran its full forty iterations and the marker
-	# reported "after 40s" every time -- a measurement of this script's
-	# patience that was then read as plasmashell taking forty seconds to
-	# start. A backingstore update is the shell actually drawing, and it does
-	# occur here, so it can be waited for and the count means something.
-	while [ $i -lt 90 ]; do
+	# This has now been wrong twice in the same way, and each time the number
+	# it produced was read as Plasma being slow. The first set of strings
+	# ("Loading the desktop", "panel", ...) appears nowhere in this build; the
+	# second set (backingstore, QQuickWindow) does not either, so the loop ran
+	# its full ninety seconds while the desktop was on screen the whole time --
+	# the photograph taken from the host proves it painted. Ninety seconds of a
+	# three-minute start-up were this wait.
+	#
+	# Ask the compositor instead of the client. kwin logs the interfaces it
+	# offers each client BY EXECUTABLE as that client binds them, so
+	# `of "/bin/plasmashell"` in kwin's own log is kwin saying plasmashell is
+	# connected and binding globals -- one process observing another, which is
+	# what makes it worth more than plasmashell's own account of itself. The
+	# cap is 45s because it now measures something that really happens.
+	while [ $i -lt 45 ]; do
 		plasma_running || break
+		grep -aq 'of "/bin/plasmashell"' /tmp/kde-kwin.log 2>/dev/null && break
 		grep -aq "backingstore\|QQuickWindow\|Loading the desktop" \
 			/tmp/kde-plasmashell.log 2>/dev/null && break
 		i=$((i + 1)); sleep 1
 	done
-	if [ $i -ge 90 ]; then
+	if [ $i -ge 45 ]; then
 		echo "KDE: plasmashell-no-paint-within ${i}s t=$(up)"
+	else
+		echo "KDE: ok plasmashell-bound t=$(up) after ${i}s"
 	fi
 	if plasma_running; then
 		echo "KDE: ok plasmashell-alive t=$(up) after ${i}s"
@@ -821,6 +1010,7 @@ if [ -n "${XDG_SESSION_ID:-}" ]; then
 		for d in 226:0 226:1 226:128; do
 			echo "KDE: char $d -> $(readlink -f /sys/dev/char/$d 2>&1 | cut -c1-70) uevent=[$(cat /sys/dev/char/$d/uevent 2>&1 | tr '\n' ' ' | cut -c1-80)]"
 		done
+		probe_logind_device "/org/freedesktop/login1/session/${XDG_SESSION_ID:-c1}"
 		echo "KDE: logind log: $(tail -12 /tmp/kde-elogind.log 2>/dev/null | tr '\n' ' ' | cut -c1-320)"
 		echo "KDE: TakeControl says: $(dbus-send --system --print-reply \
 			--dest=org.freedesktop.login1 \
@@ -958,19 +1148,36 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 	# of the socket kwin just created.
 	KWIN_SOCK=wayland-1
 	wait_kwin_socket
+	memsnap "kwin-up"
+	memsnap_loop &
+	__memloop=$!
 	start_plasma
+	memsnap "plasma-started"
 
 	# The picture is taken from OUTSIDE, with the QEMU monitor's screendump on
 	# the scanout kwin programmed. Nothing in the guest produces it, so nothing
 	# in the guest can fake it -- and it sees exactly what a monitor would.
 	# These two markers bracket the window in which the framebuffer is worth
 	# capturing; the host watches the serial log for them.
+	memsnap "scanout-ready"
 	echo "KDE: SCANOUT-READY t=$(up)"
 	sleep 90
 	echo "KDE: SCANOUT-END t=$(up)"
+	memsnap "scanout-end"
+	kill $__memloop 2>/dev/null
 	# All of it, minus the plugin loader's inventory. Every previous run of this
 	# printed a grep, and every time the line that explained the refusal was one
 	# the pattern did not match.
+	# The DRM backend's own account, first and in full.
+	#
+	# The generic dump below is the head of the file, and the head of the file
+	# is Qt's plugin inventory -- hundreds of lines of metadata that push every
+	# line about outputs, connectors and page flips past the cut. Whether the
+	# compositor programmed a scanout is the whole question here, so ask for
+	# those lines by name before anything else.
+	echo "--- kwin drm ---"
+	grep -a "kwin_wayland_drm\|kwin_scene\|kwin_screencast\|DrmGpu\|drmMode\|kwin_core: Failed\|No suitable\|connector\|Connector\|modeset\|page flip\|pageflip" \
+		/tmp/kde-kwin.log 2>/dev/null | tail -60
 	echo "--- kwin log ---"
 	grep -av "MetaData\|Keys\|IID\|qt.qpa.plugin: Found\|ELF load\|elf: load" \
 		/tmp/kde-kwin.log 2>/dev/null | head -60

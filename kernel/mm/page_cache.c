@@ -256,6 +256,15 @@ static void unlock_pc(void) {
   scheduler_preempt_enable();
 }
 
+/* Pages this cache is holding, so /proc/meminfo can say Cached.
+ *
+ * Without it "where did the memory go" has no answer at all: MemFree falling
+ * to zero says nothing about whether the kernel is caching file data it would
+ * give back under pressure, or whether something is genuinely leaked. Counted
+ * where the entries are created and destroyed, which is the only place that
+ * sees every one of them. */
+static volatile u64 g_pc_resident_pages;
+
 static void page_cache_process_deferred_free(void) {
   lock_pc();
   struct page_cache_entry *curr = to_free_list;
@@ -264,6 +273,7 @@ static void page_cache_process_deferred_free(void) {
   
   while (curr) {
     struct page_cache_entry *next = curr->hash_next;
+    __atomic_sub_fetch(&g_pc_resident_pages, 1, __ATOMIC_RELAXED);
     kfree(curr);
     curr = next;
   }
@@ -392,6 +402,10 @@ void page_cache_init(void) {
 static volatile u64 g_pc_dirty_pages;
 
 u64 page_cache_dirty_pages(void) { return g_pc_dirty_pages; }
+
+u64 page_cache_resident_pages(void) {
+  return __atomic_load_n(&g_pc_resident_pages, __ATOMIC_RELAXED);
+}
 
 /* ── File-level sequential readahead ────────────────────────────────────────
  * A small per-inode cursor table detects a sequential access pattern in
@@ -686,7 +700,12 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
      * libOSMesa got another file's cached page" class of bug this struct's
      * key_ino field exists to prevent — see page_cache_invalidate_inode). */
     if (pc_key_eq(curr, inode, offset)) {
-      curr->refcount++;
+      /* Atomic, because this is the one refcount update made under the bucket
+       * lock while every other one is made under pc_lock: the two do not
+       * exclude each other, so a plain ++ here loses updates against a
+       * concurrent put. A lost increment is the same use-after-free as an
+       * unchecked eviction; a lost decrement leaks the entry. */
+      __atomic_add_fetch(&curr->refcount, 1, __ATOMIC_ACQ_REL);
       /* Mark it touched and leave the lists alone.
        *
        * Promoting on every hit meant unlinking and re-linking the entry — four
@@ -695,7 +714,7 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
        * eviction, which is the only code that needs to know, and it costs one
        * store. Entries still reach the active list: eviction promotes the ones
        * it finds referenced instead of taking them. */
-      curr->flags |= PAGE_CACHE_REFERENCED;
+      __atomic_fetch_or(&curr->flags, PAGE_CACHE_REFERENCED, __ATOMIC_RELAXED);
       /* Hit: a sequential reader landing on an already-prefetched page advances
        * the cursor (so the next burst fires at the right place) without
        * scheduling — the earlier burst already filled this window. */
@@ -793,6 +812,8 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   u32 h = pc_hash(inode, offset);
 
   struct page_cache_entry *new_entry = kmalloc(sizeof(struct page_cache_entry));
+  if (new_entry)
+    __atomic_add_fetch(&g_pc_resident_pages, 1, __ATOMIC_RELAXED);
   if (!new_entry) return -ENOMEM;
 
   new_entry->inode = inode;
@@ -815,6 +836,7 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
     if (pc_key_eq(curr, inode, offset)) {
       unlock_bucket(h, bflags_h);
       unlock_pc();
+      __atomic_sub_fetch(&g_pc_resident_pages, 1, __ATOMIC_RELAXED);
       kfree(new_entry);
       return -EEXIST;
     }
@@ -1028,6 +1050,50 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
   }
 }
 
+/*
+ * Take a victim off its hash chain, or refuse because a reader holds it.
+ *
+ * A reader takes its reference in page_cache_get_page under the entry's BUCKET
+ * lock and nothing else -- it never touches pc_lock. So an evictor holding
+ * pc_lock has no exclusion against that increment at all, and testing
+ * refcount during the LRU scan proves nothing by the time the entry is
+ * unlinked: between the two, a reader can find the entry, pin it, and return
+ * the pointer, after which this code frees the frame and defers the entry to
+ * kfree while that reader is still dereferencing it. That is a real
+ * use-after-free -- it was observed as a #GP in node_read_impl's memcpy with a
+ * source address that was not an address at all but the reused bytes of the
+ * freed entry.
+ *
+ * The test has to happen under the same lock the increment does. Once this
+ * holds the bucket, either the reader's increment is already visible (refuse,
+ * and let the caller move on) or it cannot happen: a reader that has not yet
+ * walked the chain will not find the entry after this unlinks it.
+ *
+ * Returns 1 with the entry off the chain and owned by the caller, 0 to leave
+ * it alone. pc_lock must be held.
+ */
+static int pc_unlink_unreferenced(struct page_cache_entry *victim) {
+  u32 h = pc_hash(victim->inode, victim->offset);
+  u64 bflags_h = lock_bucket(h);
+
+  if (__atomic_load_n(&victim->refcount, __ATOMIC_ACQUIRE) != 0) {
+    unlock_bucket(h, bflags_h);
+    return 0;
+  }
+  struct page_cache_entry **prev = &hash_table[h];
+  struct page_cache_entry *hcurr = *prev;
+  while (hcurr) {
+    if (hcurr == victim) {
+      *prev = hcurr->hash_next;
+      break;
+    }
+    prev = &hcurr->hash_next;
+    hcurr = hcurr->hash_next;
+  }
+  unlock_bucket(h, bflags_h);
+  return 1;
+}
+
 void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
   /* Nothing of this file is cached, so there is nothing for the walk over
    * every cached page in the machine to find. A browser sizing its shared
@@ -1050,25 +1116,21 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
         /* Page lies fully beyond the new EOF. Drop it so a later re-grow
          * reads zeros instead of resurrecting pre-truncate contents. If a
          * reader still holds a reference, neutralize in place instead. */
-        if (curr->refcount == 0) {
-          u32 h = pc_hash(curr->inode, curr->offset);
-          u64 bflags_h = lock_bucket(h);
-          struct page_cache_entry **prev = &hash_table[h];
-          struct page_cache_entry *hcurr = *prev;
-          while (hcurr) {
-            if (hcurr == curr) {
-              *prev = hcurr->hash_next;
-              break;
-            }
-            prev = &hcurr->hash_next;
-            hcurr = hcurr->hash_next;
-          }
-          unlock_bucket(h, bflags_h);
+        /* The claim decides it, not a refcount read taken before the bucket
+         * lock: a reader can pin the page in between, and dropping it then is
+         * the same use-after-free the evictors had. A refusal falls through to
+         * neutralising the page in place, which is what a pinned page needs
+         * anyway. */
+        if (pc_unlink_unreferenced(curr)) {
           lru_remove(curr);
           pmm_free_frame(curr->frame);
-          curr->inode = 0;
+          /* Before clearing the owner, not after: the old order read
+           * curr->inode when it had just been set to 0, so the inode's page
+           * count was never decremented and the cache looked permanently
+           * populated to every fast path that checks it. */
           if (curr->inode && curr->inode->cached_pages)
             __atomic_sub_fetch(&curr->inode->cached_pages, 1, __ATOMIC_RELEASE);
+          curr->inode = 0;
           curr->hash_next = to_free_list;
           to_free_list = curr;
         } else {
@@ -1094,10 +1156,10 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
 
 void page_cache_put_page(struct page_cache_entry *page) {
   lock_pc();
-  if (page->refcount > 0) {
-    page->refcount--;
-  }
-  if (page->refcount == 0 && (page->flags & PAGE_CACHE_ORPHAN)) {
+  if (__atomic_load_n(&page->refcount, __ATOMIC_ACQUIRE) > 0)
+    __atomic_sub_fetch(&page->refcount, 1, __ATOMIC_ACQ_REL);
+  if (__atomic_load_n(&page->refcount, __ATOMIC_ACQUIRE) == 0 &&
+      (page->flags & PAGE_CACHE_ORPHAN)) {
     /* Inode was destroyed while we held the reference; the entry is already
      * off the hash and LRU — finish its teardown now. */
     pmm_free_frame(page->frame);
@@ -1126,14 +1188,24 @@ usize page_cache_evict_clean(usize target_pages) {
   usize evicted = 0;
   while (evicted < target_pages) {
     struct page_cache_entry *victim = 0;
-    /* Inactive list only — the cold pages. */
-    for (struct page_cache_entry *curr = lru_head; curr; curr = curr->lru_next) {
-      if (curr->refcount != 0)
+    /* Inactive list only — the cold pages.
+     *
+     * The page is claimed here, inside the walk, rather than after it: the
+     * claim can fail (a reader pinned the entry in the window between the scan
+     * and the bucket lock) and the walk has to continue from where it was
+     * instead of restarting and choosing the same page again. */
+    for (struct page_cache_entry *curr = lru_head; curr;) {
+      struct page_cache_entry *next = curr->lru_next;
+
+      if (curr->refcount != 0 || (curr->flags & PAGE_CACHE_DIRTY)) {
+        curr = next; /* clean-only: never write back here */
         continue;
-      if (curr->flags & PAGE_CACHE_DIRTY)
-        continue; /* clean-only: never write back here */
-      victim = curr;
-      break;
+      }
+      if (pc_unlink_unreferenced(curr)) {
+        victim = curr;
+        break;
+      }
+      curr = next;
     }
     if (!victim) {
       /* Inactive is exhausted of clean victims: demote a batch of the oldest
@@ -1144,19 +1216,8 @@ usize page_cache_evict_clean(usize target_pages) {
         break;
       continue;
     }
-    u32 h = pc_hash(victim->inode, victim->offset);
-    u64 bflags_h = lock_bucket(h);
-    struct page_cache_entry **prev = &hash_table[h];
-    struct page_cache_entry *hcurr = *prev;
-    while (hcurr) {
-      if (hcurr == victim) {
-        *prev = hcurr->hash_next;
-        break;
-      }
-      prev = &hcurr->hash_next;
-      hcurr = hcurr->hash_next;
-    }
-    unlock_bucket(h, bflags_h);
+    /* Already off the hash chain: pc_unlink_unreferenced did that as part of
+     * claiming it. */
     lru_remove(victim);
     pc_refault_record(victim->key_ino, victim->offset);
     pmm_free_frame(victim->frame);
@@ -1235,8 +1296,14 @@ usize page_cache_evict(usize target_pages) {
         curr = next;
         continue;
       }
-      victim = curr; /* oldest clean, untouched page */
-      break;
+      /* Claimed here, for the same reason evict_clean claims inside its walk:
+       * a reader can pin the entry between this scan and the bucket lock, and
+       * the walk must then move past it rather than choose it again. */
+      if (pc_unlink_unreferenced(curr)) {
+        victim = curr; /* oldest clean, untouched page */
+        break;
+      }
+      curr = next;
     }
 
     if (flush) {
@@ -1253,21 +1320,9 @@ usize page_cache_evict(usize target_pages) {
       continue;
     }
 
-    /* Evict the clean victim: unlink from the hash chain + LRU, free its frame,
-     * and defer the entry's kfree. */
-    u32 h = pc_hash(victim->inode, victim->offset);
-    u64 bflags_h = lock_bucket(h);
-    struct page_cache_entry **prev = &hash_table[h];
-    struct page_cache_entry *hcurr = *prev;
-    while (hcurr) {
-      if (hcurr == victim) {
-        *prev = hcurr->hash_next;
-        break;
-      }
-      prev = &hcurr->hash_next;
-      hcurr = hcurr->hash_next;
-    }
-    unlock_bucket(h, bflags_h);
+    /* Evict the clean victim: it is already off the hash chain (claimed in the
+     * walk above), so unlink it from the LRU, free its frame, and defer the
+     * entry's kfree. */
     lru_remove(victim);
     pc_refault_record(victim->key_ino, victim->offset);
     pmm_free_frame(victim->frame);

@@ -62,7 +62,7 @@ CACHE_ROOT="$ROOT_DIR/build/$ARCH/pkgcache"
 INSTALLED="$(mktemp)"
 # The package names installed by this run, for the dependency passes below.
 PKGS_SEEN="$(mktemp)"
-trap 'rm -f "$INSTALLED" "$PKGS_SEEN"' EXIT
+trap 'rm -f "$INSTALLED" "$PKGS_SEEN" "$PRESENT"' EXIT
 
 #
 # Dependencies that must not be followed into this image.
@@ -165,8 +165,20 @@ pkg_for_soname_in() {
 pkg_for_soname() {
 	for r in $REPOS; do
 		n="$(pkg_for_soname_in "$r" "$1")"
-		[ -n "$n" ] && { echo "$n"; return; }
+		[ -n "$n" ] && { echo "$n"; return 0; }
 	done
+	#
+	# "Nothing provides it" is an answer, not a failure.
+	#
+	# Without this the function ended on a false test, so it returned 1, and
+	# the caller's `provider="$(pkg_for_soname ...)"` took the whole script
+	# down under `set -eu` before it could reach the branch that reports the
+	# name and carries on -- silently, since the exit carried no message. The
+	# caller already handles an empty answer, and the comment above the closure
+	# says an unresolvable SONAME is deliberately not fatal, because the image
+	# supplies several libraries under names Alpine also packages.
+	#
+	return 0
 }
 
 #
@@ -482,9 +494,22 @@ done
 # absent.
 #
 round=0
+PRESENT="$(mktemp)"
 while [ "$round" -lt 16 ]; do
 	round=$((round + 1))
 	missing=""
+	#
+	# One index of what the destination already holds, built once per round.
+	#
+	# The test below used to be a `find "$PREFIX" -name "$need"` per SONAME.
+	# That is a full walk of the staging root for every library every binary
+	# names, and the KDE group's staging root is 1.2 GB: on a rebuild, where
+	# almost every SONAME is already present and so every walk runs to
+	# completion, the pass ran for over an hour and pulled nothing. Basenames
+	# are all the test ever looked at, so collect them once and ask a sorted
+	# file instead.
+	find "$PREFIX" \( -type f -o -type l \) 2>/dev/null |
+		sed 's|.*/||' | sort -u > "$PRESENT"
 	while IFS= read -r so; do
 		[ -f "$so" ] || continue
 		#
@@ -505,8 +530,7 @@ while [ "$round" -lt 16 ]; do
 		for need in $(readelf -dW "$so" 2>/dev/null |
 		              sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
 			case "$need" in libc.musl-*|ld-musl-*) continue ;; esac
-			if find "$PREFIX" -name "$need" 2>/dev/null | head -1 | grep -q .
-			then
+			if grep -qxF -- "$need" "$PRESENT"; then
 				continue
 			fi
 			case " $missing " in *" $need "*) continue ;; esac

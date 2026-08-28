@@ -1160,7 +1160,8 @@ written. Detail in [applet parity](applet-parity.md).
       system bus, `systemd-run --pipe` starting a transient unit through it, and
       agetty's login prompt on the serial console. `make systemd-image` builds
       the image (dependency closure resolved from the suite index, 23 packages);
-      `make systemd-smoke` boots it and checks 29 markers, 15 of which pass.
+      `make systemd-smoke` boots it and checks 31 markers, **29 of which pass**
+      (15 when the suite was written, 22 before this round).
 - [x] **cgroup v2** (`kernel/fs/cgroup.c`): a real unified hierarchy with
       `cgroup.procs`/`threads`/`events`/`subtree_control`, mkdir/rmdir as the
       creation API, inotify on `cgroup.events`, `/proc/<pid>/cgroup`, and one
@@ -1182,28 +1183,56 @@ written. Detail in [applet parity](applet-parity.md).
       five different mounts landed on one node), no `/proc/<pid>/cgroup` or
       `/proc/cgroups`, no `oom_score_adj`, and a procfs writer returning 0 for a
       successful write — which glibc's stdio spins on forever.
-- [ ] `partial` udev: `systemd-udevd` runs, receives the kernel's uevents,
-      forks a worker per device and now **processes and tags** them — `vda:
-      Failed to process device` is gone, the rule set runs to completion,
-      `TAGS=:systemd:` is set and `/run/udev/data/b8:0` is written. What it
-      needed was `/sys/block/<disk>/queue`: systemd tells a whole disk from a
-      partition by looking for `queue` and then `partition`, and vda had
-      neither, so it was neither and the event was abandoned before a single
-      rule ran. Still open: no `.device` unit is created from the tagged
-      device, `udevadm control --ping` times out, and `loop0`–`loop6` still
-      fail to process where vda no longer does.
+- [x] `done` udev: `systemd-udevd` runs, receives the kernel's uevents and
+      forks workers, and its **event queue drains again**. A worker takes its
+      first device across the fork and every later one over a unicast netlink
+      message, which it accepts only when the message's source `nl_pid` is the
+      manager's monitor port id — and this kernel reported the sending TASK's
+      pid there instead of the sending SOCKET's port id, so every later device
+      was discarded (`Unicast netlink message ignored`) and udevd sat at its
+      child limit. Fixed; one worker now processes several devices in turn,
+      `.device` units are created and `udevadm control --ping` is answered.
 - [x] `done` **systemd-logind** reaches active and answers `loginctl`. It was
       not a logind defect at all: every unit with `PrivateTmp=` failed at
       `start` with `Result=resources`, because a path component longer than 63
       characters resolved to nothing (see M119).
-- [ ] `partial` **`daemon-reload` takes ~90 s and then loses the bus**, which
-      is what most of the remaining red in `systemd-smoke` sits behind.
-      Measured: not per-unit work (61% more units moved the time 1.2%), not a
-      hanging generator (all twelve finish in ~1.2 s; `wait4` is 1 s of the
-      91), not work at all (203 `openat` across the whole window), and not a
-      kernel-side disconnect (one AF_UNIX teardown in the window, the client's,
-      after the call returned). What is left is that the Reload request never
-      reaches PID 1's event loop. Details and the refuted hypotheses in
+- [x] `done` **The boot reaches `graphical.target`**, and the 90-second
+      `daemon-reload` is retracted: it takes 0.6-0.7 s here, and the graphical
+      target was never *not reached* — the harness boots
+      `systemd.unit=multi-user.target`, so the manager was never asked for it.
+      Asked, it reaches active in one step.
+- [x] `done` **The unit cache could not see a new unit file.** POSIX requires
+      that creating or removing an entry mark the containing directory
+      modified, and nothing here did; timestamps also had whole-second
+      resolution. systemd re-reads a unit directory only when its mtime differs
+      from the one its last scan recorded, so a unit written after the first
+      reload was invisible for ever. Directories are now stamped on
+      create/unlink/rename and inodes carry nanoseconds. Four checks came back
+      with it: `notify-ready`, `private-tmp`, `timer-fires`,
+      `restart-on-failure`.
+- [x] `done` **A signal could not end a sleep.** `kill(2)` woke a target that
+      was blocked on a wait channel or stopped, and left one sleeping on the
+      clock where it was, so a process in `nanosleep(2)` carried the signal
+      until its sleep ran out — `kill -TERM` on `sleep 30` landed thirty
+      seconds later, and `timeout(1)` returned the right answer while bounding
+      nothing. Every bound in every harness here was that.
+- [x] `done` Four more Linux-ABI defects: `rename(2)` truncated a destination
+      name at 63 characters (atomic replace-by-rename uses long temporary
+      names); `open(2)` never consulted a mount's `MS_RDONLY`, so `O_WRONLY`
+      succeeded and `O_TRUNC` emptied files on a read-only mount; the mount
+      lookup answered with the oldest mount at a node rather than the newest,
+      which is what a self-bind + read-only remount depends on; and a
+      zero-length datagram was dropped on send, refused on receive and never
+      made a socket readable.
+- [x] `done` **All 32 systemd checks pass**, `graphical.target` included, on a
+      stock Debian userspace booted on this kernel: kernel 1.87 s + userspace
+      19.6 s. The four that were still red were measured against a **stale
+      image** — `tests/systemd-smoke.sh` does not rebuild
+      `debian-systemd.ext4`, so a harness change does not reach the guest until
+      `PROFILE=systemd tools/images/mk-debian-image.sh` runs again. Rebuilt,
+      with this round's kernel fixes in place, the whole-disk lookup, the
+      `.device` unit, `udevadm --ping`, `ProtectSystem=strict`, both socket
+      activations and `notify-ready` all pass. Details in
       [`debian-systemd-boot.md`](debian-systemd-boot.md).
 
 ## M113: KDE Plasma
@@ -1226,13 +1255,47 @@ wlroots never made. The ones it breaks on are ours.
       shared by every process, so the per-descriptor nodes under it were shared
       too; and the signal frame reserved 424 bytes for a 936-byte `ucontext_t`,
       overlapping the frame it interrupted.
-- [ ] `partial` kwin's **DRM backend** finds no device, and it never calls
-      `open` on `/dev/dri` at all — so it refuses before the kernel is
-      involved. The cause is the absent **logind session**, not device
-      enumeration: the KDE image ships elogind but no PAM modules, and its
-      BusyBox `login` does not use PAM, so no session is ever created. The
-      nested backend, which is how KDE itself is developed, is what the
-      screenshot above is taken from.
+- [x] `done` **Plasma on the real DRM path**, with no compositor underneath:
+      kwin_wayland modesets `/dev/dri/card1` at 1280x800 and plasmashell paints
+      the panel and wallpaper on it —
+      [photograph](images/m113-plasma-drm.png), taken from the HOST with the
+      QEMU monitor's `screendump` on the virtio-gpu scanout, so nothing in the
+      guest takes part in producing it. `tests/kde-smoke.sh` asserts on the
+      frame's distinct-colour count (a display that never drew dumps a solid
+      rectangle; this one holds ~45000 colours), on `kwin`/`elogind` opening
+      the card in the kernel's own trace, and on the udev entry below.
+- [x] `done` The device chain kwin needs, end to end and with nothing written
+      by hand: the image now ships **eudev**, whose udevd runs elogind's own
+      `71-seat.rules` and writes `/run/udev/data/c226:1` with the `seat` and
+      `master-of-seat` tags. logind then reports `CanGraphical=true`, attaches
+      `[MASTER] drm:card1` to seat0, and answers `TakeDevice`. Details in
+      [docs/kde-plasma-drm.md](kde-plasma-drm.md).
+- [x] `done` **Plasma's memory appetite was the kernel's, and it was an
+      allocator bug.** The heap never split a free block on reuse: a 64-byte
+      allocation landing on a 512 KB free block consumed all 512 KB forever,
+      and coalescing made it a ratchet. On an idle desktop the kernel heap
+      climbed ~5 MB/s and never fell — 621 MB at kwin start, 1516 MB three
+      minutes later, live (not fragmented: live 1483 MB against 11 MB free).
+      With split-on-reuse the same workload holds **104 MB and stops growing**,
+      and Plasma runs in 4 GB again. Covered by `KHEAP-SELFTEST`.
+- [x] `done` The instruments that made it answerable, all absent before:
+      `/proc/meminfo` now reports Cached/Dirty/AnonPages/Slab/MemAvailable
+      rather than four numbers of which "available" was a copy of "free";
+      `/proc/<pid>/status` reports `VmRSS`/`VmSize`/`VmHWM`, the field every
+      memory tool reads; and `/proc/b1nix-kheap` prints the heap's live and
+      free blocks by size class and totals live allocations per calling site.
+- [x] `done` **Start-up: 165s → 63s.** Ninety of those seconds were this
+      harness waiting for strings in plasmashell's log that the build never
+      prints, while the desktop was already on screen — the second time that
+      check has been wrong in the same way, and both times its number was read
+      as Plasma being slow. It now keys on kwin's own log of plasmashell
+      binding globals. Of what remains, ~20s is `udevadm settle` timing out on
+      the udev worker stall (M112).
+- [ ] `partial` **kwin falls back to the legacy modeset path**: it asks for
+      `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` (capability 6), which Linux added
+      in 6.7 and the imported core is 6.6, so the refusal is correct and kwin
+      handles it. Atomic modesetting is separately disabled by kwin itself in
+      virtual machines. Legacy works; universal planes are not yet offered.
 - [x] `done` `kioworker`'s **detected stack smash** (`SIGSEGV` at
       `__stack_chk_fail`), which left Plasma's desktop containment blank. The
       `ucontext_t` reservation above was one writer past the end of a stack

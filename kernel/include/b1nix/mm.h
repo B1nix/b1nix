@@ -169,6 +169,15 @@ void kheap_use_direct_map(void);
 /* Fault-dump helper: print which general-heap block (if any) an address falls
  * in, and whether that block is live or freed. */
 void kheap_describe(u64 addr, const char *label);
+/* Address space the general kernel heap has mapped (its high-water). */
+u64 kheap_mapped_bytes(void);
+/* Live/free blocks by size class, to the console. On demand only. */
+void kheap_dump_histogram(void);
+/* Live allocations >=64 kB, totalled per calling site. On demand only. */
+void kheap_dump_tracked_by_caller(void);
+/* Test mode: the allocator hands back the unused tail of a reused block. */
+void kheap_selftest(void);
+usize kmalloc_reuse_probe_size(void *ptr);
 void *kmalloc(usize size);
 void *kzalloc(usize size);
 void kfree(void *ptr);

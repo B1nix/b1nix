@@ -89,6 +89,18 @@
 #define B1NIX_O_CLOEXEC 0x0800
 #define B1NIX_O_NONBLOCK 0x4000
 #define B1NIX_O_DIRECTORY 0x10000
+/* Both share Linux's numeric value, so a program that passes its own O_* set
+ * through the Linux path and one that uses b1nix's headers mean the same bit.
+ *
+ * These two are what a path walker done by hand needs. systemd's chase() --
+ * and so every sd-device lookup, and so logind -- opens each component with
+ * O_PATH|O_NOFOLLOW and asks fstat what it got: a symlink is read with
+ * readlinkat and spliced into the walk, anything else is descended into. With
+ * the flags dropped the open followed the link and fstat reported the
+ * directory behind it, so the walk ended at the link's own path and the device
+ * it named was never reached. */
+#define B1NIX_O_NOFOLLOW 0x20000
+#define B1NIX_O_PATH 0x200000
 
 #define B1NIX_TCGETS 0x5401
 #define B1NIX_TCSETS 0x5402

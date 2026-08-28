@@ -29,6 +29,7 @@
 #include <b1nix/kmsg.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+#include <b1nix/page_cache.h>
 #include <b1nix/module.h>
 #include <b1nix/namespace.h>
 #include <b1nix/ptrace.h>
@@ -386,14 +387,59 @@ static struct vfs_node *procfs_mkchild_writable(struct vfs_node *parent,
  * System files
  * ────────────────────────────────────────────────────────────────────────── */
 
+/*
+ * /proc/meminfo, with the breakdown that makes it answerable.
+ *
+ * It used to report four numbers -- total, free, available, used -- and
+ * "available" was simply "free". That is not enough to answer the only
+ * question anyone asks of this file: memory is gone, WHERE did it go? Free
+ * falling to zero says nothing about whether the kernel is holding file data
+ * it would hand back under pressure or whether something is genuinely leaked,
+ * and every tool that reads this file (free(1), systemd, a desktop's memory
+ * widget) reads the fields below, not MemUsed, which Linux does not have.
+ *
+ * Cached is the page cache's own count of resident pages; Dirty is the subset
+ * it must write back before those can be dropped. Slab is what the kernel heap
+ * has mapped. MemAvailable is free plus the clean part of the cache, because
+ * that is the part reclaim can actually take back.
+ */
 static int r_meminfo(usize pid, struct sbuf *s) {
   (void)pid;
   u64 total = pmm_total_usable_memory();
   u64 freeb = pmm_free_memory_estimate();
   u64 used = total > freeb ? total - freeb : 0;
+  u64 cached = page_cache_resident_pages() * PAGE_SIZE;
+  u64 dirty = page_cache_dirty_pages() * PAGE_SIZE;
+  u64 slab = kheap_mapped_bytes();
+  u64 reclaimable = cached > dirty ? cached - dirty : 0;
+  u64 avail = freeb + reclaimable;
+  /* Everything accounted for that is neither the page cache nor the kernel's
+   * own heap: anonymous memory, page tables and driver allocations. Reported
+   * rather than left as a gap between numbers that do not add up. */
+  u64 anon = used;
+  if (anon > cached)
+    anon -= cached;
+  else
+    anon = 0;
+  if (anon > slab)
+    anon -= slab;
+  else
+    anon = 0;
+
+  if (avail > total)
+    avail = total;
+
   sb_addf(s, "MemTotal:       %lu kB\n", (unsigned long)(total / 1024));
   sb_addf(s, "MemFree:        %lu kB\n", (unsigned long)(freeb / 1024));
-  sb_addf(s, "MemAvailable:   %lu kB\n", (unsigned long)(freeb / 1024));
+  sb_addf(s, "MemAvailable:   %lu kB\n", (unsigned long)(avail / 1024));
+  sb_addf(s, "Buffers:        %lu kB\n", 0UL);
+  sb_addf(s, "Cached:         %lu kB\n", (unsigned long)(cached / 1024));
+  sb_addf(s, "Dirty:          %lu kB\n", (unsigned long)(dirty / 1024));
+  sb_addf(s, "Writeback:      %lu kB\n", 0UL);
+  sb_addf(s, "AnonPages:      %lu kB\n", (unsigned long)(anon / 1024));
+  sb_addf(s, "Slab:           %lu kB\n", (unsigned long)(slab / 1024));
+  sb_addf(s, "SReclaimable:   %lu kB\n", 0UL);
+  sb_addf(s, "SUnreclaim:     %lu kB\n", (unsigned long)(slab / 1024));
   sb_addf(s, "MemUsed:        %lu kB\n", (unsigned long)(used / 1024));
   return 0;
 }
@@ -926,6 +972,18 @@ static int r_b1nix_tasks(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/b1nix-kheap — reading it prints the kernel heap's live/free blocks by
+ * size class to the console. The counterpart to b1nix-tasks: that one answers
+ * "what is every task waiting on", this one answers "what is the heap holding",
+ * which is the question a machine whose Slab grows on an idle desktop asks. */
+static int r_b1nix_kheap(usize pid, struct sbuf *s) {
+  (void)pid;
+  kheap_dump_histogram();
+  kheap_dump_tracked_by_caller();
+  sb_puts(s, "kheap histogram written to console\n");
+  return 0;
+}
+
 static int r_cmdline(usize pid, struct sbuf *s) {
   (void)pid;
   const char *cmd = bootinfo_cmdline();
@@ -1043,8 +1101,22 @@ static int r_pid_status(usize pid, struct sbuf *s) {
     }
     sb_addf(s, "Threads:\t%lu\n", (unsigned long)(nthreads ? nthreads : 1));
   }
-  /* Heap span as a rough VmSize. */
+  /* Heap span as VmData; the mapped span and the resident set as VmSize and
+   * VmRSS.
+   *
+   * VmRSS is the field every memory tool reads -- ps, top, a desktop's system
+   * monitor, and anything asking "which process is holding this machine's
+   * memory". Its absence made that question unanswerable from inside the
+   * guest, so the only account of where memory went was a kernel task dump.
+   * The figures come from the same page-table walk getrusage uses, except
+   * current rather than peak: reporting the peak here would claim a process
+   * still holds memory it has already returned. */
   u64 vm = t->user_brk > t->heap_start ? t->user_brk - t->heap_start : 0;
+  u64 rss = task_rss_current_pages(t) * PAGE_SIZE;
+  u64 hwm = task_maxrss_pages(t) * PAGE_SIZE;
+  sb_addf(s, "VmSize:\t%lu kB\n", (unsigned long)(task_vsize_bytes(t) / 1024));
+  sb_addf(s, "VmRSS:\t%lu kB\n", (unsigned long)(rss / 1024));
+  sb_addf(s, "VmHWM:\t%lu kB\n", (unsigned long)(hwm / 1024));
   sb_addf(s, "VmData:\t%lu kB\n", (unsigned long)(vm / 1024));
   return 0;
 }
@@ -1754,6 +1826,152 @@ static void procfs_fd_resolve(struct procfs_fd_snap *snap) {
   snap->node = 0;
 }
 
+/* ── /proc/<pid>/fdinfo/<fd> ───────────────────────────────────────────────
+ *
+ * The three lines every reader of this file wants: where the descriptor is
+ * positioned, the flags it was opened with, and the id of the mount the file
+ * lives on. The last one is not decoration — it is the documented fallback for
+ * learning a mount id when name_to_handle_at(2) is unavailable, and systemd
+ * uses it exactly that way (fd_fdinfo_mnt_id). A missing file is answered
+ * ENOENT, which a caller reads as "this kernel cannot tell me", so the whole
+ * question goes unanswered rather than answered wrongly. */
+struct procfs_fdinfo {
+  usize pid;
+  int fd;
+};
+
+static isize procfs_fdinfo_read(struct vfs_node *node, u64 offset, char *buffer,
+                                usize size, int flags) {
+  (void)flags;
+  struct procfs_fdinfo *fi =
+      node && node->inode ? (struct procfs_fdinfo *)node->inode->data : 0;
+  if (!fi)
+    return 0;
+  struct task *t = scheduler_task_by_pid(fi->pid);
+  if (!t)
+    return -ENOENT;
+
+  u64 pos = 0;
+  u32 oflags = 0;
+  char path[VFS_MAX_PATH];
+  int open_fd = 0;
+  path[0] = '\0';
+  u64 irq;
+  spin_lock_irqsave(&t->fd_lock, &irq);
+  struct vfs_handle *h =
+      (t->fd_table && (usize)fi->fd < t->fd_capacity) ? t->fd_table[fi->fd] : 0;
+  if (h && h->used) {
+    open_fd = 1;
+    pos = h->offset;
+    oflags = (u32)h->flags;
+    if (h->open_path && h->open_path[0])
+      snprintf(path, sizeof(path), "%s", h->open_path);
+  }
+  spin_unlock_irqrestore(&t->fd_lock, irq);
+  if (!open_fd)
+    return -ENOENT;
+
+  /* The mount id is resolved after the lock is dropped: the resolver walks the
+   * mount table and must not run with interrupts disabled. */
+  int mnt_id = path[0] ? vfs_mount_id_for_path(path) : 0;
+
+  char text[128];
+  int n = snprintf(text, sizeof(text), "pos:\t%lu\nflags:\t0%o\nmnt_id:\t%d\n",
+                   (unsigned long)pos, (unsigned)oflags, mnt_id);
+  if (n < 0)
+    return 0;
+  usize len = (usize)n;
+  if (offset >= len)
+    return 0;
+  usize avail = len - (usize)offset;
+  usize give = avail < size ? avail : size;
+  memcpy(buffer, text + offset, give);
+  return (isize)give;
+}
+
+/* One fdinfo file, created on demand and idempotent. */
+static void procfs_fdinfo_child(struct vfs_node *dir, usize pid, int fd) {
+  char name[16];
+  snprintf(name, sizeof(name), "%d", fd);
+  if (find_child(dir, name))
+    return;
+  struct vfs_node *n = vfs_create_node(VFS_DEVICE);
+  if (!n)
+    return;
+  usize nl = strlen(name);
+  memcpy(n->name, name, nl);
+  n->name[nl] = '\0';
+  struct procfs_fdinfo *fi = kzalloc(sizeof(*fi));
+  if (!fi) {
+    vfs_node_put(n);
+    return;
+  }
+  fi->pid = pid;
+  fi->fd = fd;
+  n->inode->data = fi;
+  n->inode->flags |= VFS_NODE_OWNS_DATA | VFS_NODE_PSEUDO_REG;
+  n->inode->mode = 0400;
+  n->inode->nlink = 1;
+  n->inode->read_cb = procfs_fdinfo_read;
+  n->parent = dir;
+  n->refcount++;
+  vfs_attach_child(dir, n);
+}
+
+static int procfs_fdinfo_lookup(struct vfs_node *dir, const char *name) {
+  int fd = 0;
+  for (const char *q = name; *q; q++) {
+    if (*q < '0' || *q > '9')
+      return -1;
+    fd = fd * 10 + (*q - '0');
+  }
+  usize pid = pid_from_parent(dir);
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -1;
+  int open_fd = 0;
+  u64 irq;
+  spin_lock_irqsave(&t->fd_lock, &irq);
+  struct vfs_handle *h =
+      (t->fd_table && (usize)fd < t->fd_capacity) ? t->fd_table[fd] : 0;
+  open_fd = (h && h->used) ? 1 : 0;
+  spin_unlock_irqrestore(&t->fd_lock, irq);
+  if (!open_fd)
+    return -1;
+  procfs_fdinfo_child(dir, pid, fd);
+  return 0;
+}
+
+static isize procfs_fdinfo_readdir(struct vfs_node *dir, usize offset,
+                                   struct dirent *buf, usize max_entries) {
+  usize pid = pid_from_parent(dir);
+  struct task *t = scheduler_task_by_pid(pid);
+  if (t && offset == 0) {
+    usize want = t->fd_capacity;
+    if (want < 8)
+      want = 8;
+    int *open_fds = kmalloc(want * sizeof(int));
+    if (open_fds) {
+      usize count = 0;
+      u64 irq;
+      spin_lock_irqsave(&t->fd_lock, &irq);
+      usize cap = t->fd_capacity;
+      if (cap > want)
+        cap = want;
+      for (usize i = 0; i < cap && count < want; i++) {
+        struct vfs_handle *h = t->fd_table ? t->fd_table[i] : 0;
+        if (h && h->used)
+          open_fds[count++] = (int)i;
+      }
+      spin_unlock_irqrestore(&t->fd_lock, irq);
+      for (usize i = 0; i < count; i++)
+        procfs_fdinfo_child(dir, pid, open_fds[i]);
+      kfree(open_fds);
+    }
+  }
+  return vfs_readdir_children(dir, offset, buf, max_entries);
+}
+
 static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
                                struct dirent *buf, usize max_entries) {
   usize pid = pid_from_parent(dir); /* dir->parent is the /proc/<pid> dir */
@@ -2315,6 +2533,12 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
      * append the in-memory children a second time. */
     fddir->inode->readdir_lists_children = 1;
   }
+  struct vfs_node *fdinfodir = procfs_mkchild(d, "fdinfo", VFS_DIRECTORY, 0, 0);
+  if (fdinfodir) {
+    fdinfodir->inode->readdir_cb = procfs_fdinfo_readdir;
+    fdinfodir->inode->lookup_cb = procfs_fdinfo_lookup;
+    fdinfodir->inode->readdir_lists_children = 1;
+  }
   /* M80: auxv/mem carry binary content, so they take a read_cb of their own
    * instead of the text-rendering procfs_read_cb. */
   struct vfs_node *auxv = procfs_mkchild(d, "auxv", VFS_DEVICE, 0, pid);
@@ -2749,6 +2973,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
   procfs_mkchild(root, "b1nix-prof", VFS_DEVICE, r_b1nix_prof, 0);
   procfs_mkchild(root, "b1nix-tasks", VFS_DEVICE, r_b1nix_tasks, 0);
+  procfs_mkchild(root, "b1nix-kheap", VFS_DEVICE, r_b1nix_kheap, 0);
   /* M107: /proc/kmsg — the same record stream as /dev/kmsg. klogd reads this
    * one and expects it to block until a message arrives. */
   {

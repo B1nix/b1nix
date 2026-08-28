@@ -33,6 +33,10 @@ typedef int (*sysfs_render)(char *buf, usize cap);
 struct sysfs_uevent {
   char devpath[96];
   char subsystem[24];
+  /* What the device calls itself inside its subsystem. Recorded here because a
+   * `udevadm trigger` re-announcement must be indistinguishable from the
+   * driver's own — and a message without DEVTYPE is one udevd throws away. */
+  char devtype[24];
   char devname[40];
   int major;
   int minor;
@@ -367,6 +371,7 @@ static isize sysfs_uevent_write_cb(struct vfs_node *node, u64 offset,
     return -EINVAL;
 
   uevent_post(action, sn->ue->devpath, sn->ue->subsystem,
+              sn->ue->devtype[0] ? sn->ue->devtype : 0,
               sn->ue->devname[0] ? sn->ue->devname : 0, sn->ue->major,
               sn->ue->minor);
   return (isize)size;
@@ -391,6 +396,8 @@ static void sysfs_mk_uevent_at(struct vfs_node *dir, const char *devpath,
     return;
   strncpy(ue->devpath, devpath, sizeof(ue->devpath) - 1);
   strncpy(ue->subsystem, subsystem, sizeof(ue->subsystem) - 1);
+  if (devtype)
+    strncpy(ue->devtype, devtype, sizeof(ue->devtype) - 1);
   strncpy(ue->devname, name, sizeof(ue->devname) - 1);
   ue->major = BLK_SYSFS_MAJOR;
   ue->minor = (int)index;

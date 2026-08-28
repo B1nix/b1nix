@@ -17,8 +17,15 @@ case "$BUILD_DIR" in /*) ;; *) BUILD_DIR="$PROJECT_DIR/$BUILD_DIR" ;; esac
 
 IMG="$BUILD_DIR/debian-systemd.ext4"
 IMG_LABEL="${IMG_LABEL:-b1nix-systemd}"
-LOG="$PROJECT_DIR/smoke_run/b1nix-systemd-boot.log"
-BUILD_LOG="$PROJECT_DIR/smoke_run/b1nix-systemd-build.log"
+# One log per run, written straight to its own path rather than copied there
+# afterwards. A run that is killed, or one that overlaps another, used to
+# truncate the single shared path and destroy the evidence for the boot it was
+# being compared against -- and a snapshot taken at the end never exists for the
+# run that did not reach the end. RUN_TAG names the run; set SYSTEMD_LOG to
+# choose the path outright.
+RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)-$$}"
+LOG="${SYSTEMD_LOG:-$PROJECT_DIR/smoke_run/b1nix-systemd-boot-$RUN_TAG.log}"
+BUILD_LOG="${SYSTEMD_BUILD_LOG:-$PROJECT_DIR/smoke_run/b1nix-systemd-build-$RUN_TAG.log}"
 ISO="$BUILD_DIR/${B1NIX_ISO_NAME:-b1nix-systemd.iso}"
 # systemd's boot is not a shell script: it starts units in parallel and waits
 # on timers. 240 s is a deliberately longer bound than the 120 s of the normal
@@ -182,6 +189,7 @@ check_output "SYSTEMD-SMOKE: ok unit-active systemd-journald.service" "journald 
 check_output "SYSTEMD-SMOKE: ok unit-active sysinit.target" "sysinit.target reached"
 check_output "SYSTEMD-SMOKE: ok unit-active basic.target" "basic.target reached"
 check_output "SYSTEMD-SMOKE: ok unit-active multi-user.target" "multi-user.target reached"
+check_output "SYSTEMD-SMOKE: ok unit-active graphical.target" "graphical.target reached - the boot gets past multi-user"
 check_output "SYSTEMD-SMOKE: ok journalctl" "journalctl reads the journal back"
 check_output "SYSTEMD-SMOKE: ok systemd-run" "systemd-run starts a transient unit"
 check_output "SYSTEMD-SMOKE: ok unit-active systemd-udevd.service" "systemd-udevd active"
@@ -234,10 +242,7 @@ fi
 # snapshot is timestamped and the newest is also linked as -last.log; set
 # SYSTEMD_KEEP_LOGS=0 to opt out.
 if [ "${SYSTEMD_KEEP_LOGS:-1}" != "0" ] && [ -s "$LOG" ]; then
-	SNAP="$PROJECT_DIR/smoke_run/b1nix-systemd-boot-$(date +%Y%m%d-%H%M%S).log"
-	cp "$LOG" "$SNAP" 2>/dev/null &&
-		cp "$LOG" "$PROJECT_DIR/smoke_run/b1nix-systemd-boot-last.log" 2>/dev/null
-	echo "Kept: $SNAP"
+	ln -sf "$LOG" "$PROJECT_DIR/smoke_run/b1nix-systemd-boot-last.log" 2>/dev/null
 fi
 
 echo ""

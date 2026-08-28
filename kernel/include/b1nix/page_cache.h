@@ -50,6 +50,11 @@ struct page_cache_entry {
 
 void page_cache_init(void);
 
+/* Pages the cache is holding right now, and of those, how many are dirty.
+ * /proc/meminfo reports them as Cached and Dirty. */
+u64 page_cache_resident_pages(void);
+u64 page_cache_dirty_pages(void);
+
 // Returns a referenced page cache entry. The caller must unref it when done.
 struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset);
 

@@ -416,6 +416,7 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     s->nl_last_cred[1] = s->udp_q_cred[slot][1];
     s->nl_last_cred[2] = s->udp_q_cred[slot][2];
     s->nl_last_groups = s->udp_q_nlgroups[slot];
+    s->nl_last_portid = s->udp_q_nlportid[slot];
     s->nl_have_cred = 1;
     if (!(flags & B1NIX_MSG_PEEK)) {
       s->udp_q_head = (u8)((s->udp_q_head + 1) % SOCK_DGRAM_Q_SLOTS);
@@ -677,7 +678,9 @@ usize vfs_socket_last_srcaddr(int fd, void *addr, usize cap) {
     struct b1nix_sockaddr_nl nl;
     memset(&nl, 0, sizeof(nl));
     nl.nl_family = B1NIX_AF_NETLINK;
-    nl.nl_pid = s->nl_last_cred[0]; /* 0 when the kernel sent it */
+    /* The SENDING SOCKET's port id, not the sending task's pid -- see
+     * vfs_socket_state::udp_q_nlportid. 0 when the kernel sent it. */
+    nl.nl_pid = s->nl_last_portid;
     nl.nl_groups = s->nl_last_groups;
     usize n = cap < sizeof(nl) ? cap : sizeof(nl);
     memcpy(addr, &nl, n);
@@ -745,7 +748,7 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
       }
     } else if (s->listening) {
       u16 port = ntoh16(s->local.in.sin_port);
-      if (tcp_pending_connections(port)) {
+      if (tcp_pending_connections_af(port, s->domain, s->ipv6_v6only)) {
         pfd->revents |= B1NIX_POLLIN;
       }
     }
@@ -1672,7 +1675,7 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
     u16 client_port;
     struct tcp_conn *conn = 0;
     while (1) {
-      conn = tcp_accept6(local_port, &client_ip6, &client_port);
+      conn = tcp_accept6(local_port, &client_ip6, &client_port, s->ipv6_v6only);
       if (conn) break;
       if (h->flags & B1NIX_O_NONBLOCK) {
         kfree(new_s);
@@ -1681,7 +1684,7 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
       }
       /* SMP-safe wait — see the IPv4 accept path above. */
       scheduler_wait_prepare(vfs_poll_chan);
-      conn = tcp_accept6(local_port, &client_ip6, &client_port);
+      conn = tcp_accept6(local_port, &client_ip6, &client_port, s->ipv6_v6only);
       if (conn) {
         scheduler_wait_cancel();
         break;
@@ -1819,6 +1822,16 @@ isize vfs_socket_send(int fd, const void *buf, usize len, int flags) {
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   return vfs_socket_send_h(h, buf, len, flags);
+}
+
+int vfs_socket_sends_empty_messages(int fd) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h || h->kind != VFS_HANDLE_SOCKET)
+    return 0;
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  if (!s || s->domain != B1NIX_AF_UNIX)
+    return 0;
+  return s->type == B1NIX_SOCK_DGRAM || s->type == B1NIX_SOCK_SEQPACKET;
 }
 
 isize vfs_socket_recv(int fd, void *buf, usize len, int flags) {

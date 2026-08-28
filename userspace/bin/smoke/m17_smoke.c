@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static void marker(const char *s) {
@@ -180,6 +181,100 @@ int main(void) {
     (void)close(dup_fd);
     (void)unlink("/tmp/m17_dup2_test");
     marker("M17-SMOKE: ok dup2");
+  }
+
+  /* Test 8: O_NOFOLLOW and O_PATH.
+   *
+   * A path walker done by hand -- systemd's chase(), and so every sd-device
+   * lookup and so logind -- opens each component O_PATH|O_NOFOLLOW and asks
+   * fstat what it got: a symlink is read with readlink and spliced into the
+   * walk, anything else is descended into. Both flags used to be dropped, so
+   * the open followed the link and fstat described the target; a walk of
+   * /sys/dev/char/226:1 therefore ended at the link's own path and the device
+   * it named was never reached. These four checks are that behaviour, stated
+   * the way the standard does. */
+  {
+    const char *target = "/tmp/m17_nofollow_target";
+    const char *link = "/tmp/m17_nofollow_link";
+
+    (void)unlink(target);
+    (void)unlink(link);
+    int fd = open(target, O_CREAT | O_RDWR, 0644);
+    if (fd < 0) {
+      fail_marker("nofollow-setup", errno, 0);
+      return 1;
+    }
+    (void)write(fd, "x", 1);
+    (void)close(fd);
+    if (symlink(target, link) != 0) {
+      fail_marker("nofollow-symlink", errno, 0);
+      return 1;
+    }
+
+    /* Without the flag the link is followed and the target opens. */
+    fd = open(link, O_RDONLY);
+    if (fd < 0) {
+      fail_marker("nofollow-plain-open", errno, 0);
+      return 1;
+    }
+    (void)close(fd);
+
+    /* With it, and nothing else, there is no file to open: ELOOP. */
+    fd = open(link, O_RDONLY | O_NOFOLLOW);
+    if (fd >= 0 || errno != ELOOP) {
+      fail_marker("nofollow-eloop", fd >= 0 ? 0 : errno, ELOOP);
+      (void)close(fd);
+      return 1;
+    }
+    marker("M17-SMOKE: ok o-nofollow-eloop");
+
+    /* With O_PATH as well, the descriptor refers to the LINK itself -- which
+     * is what fstat has to say, or a walker cannot tell a link from what it
+     * points at. */
+    fd = open(link, O_RDONLY | O_NOFOLLOW | O_PATH);
+    if (fd < 0) {
+      fail_marker("opath-open", errno, 0);
+      return 1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISLNK(st.st_mode)) {
+      fail_marker("opath-fstat-islnk", errno, 0);
+      (void)close(fd);
+      return 1;
+    }
+    marker("M17-SMOKE: ok o-path-symlink");
+
+    /* An O_PATH descriptor names a file without opening its contents, so a
+     * read of one is EBADF. A descriptor that reads happily is not O_PATH. */
+    char one[4];
+    ssize_t rn = read(fd, one, sizeof(one));
+    if (rn >= 0 || errno != EBADF) {
+      fail_marker("opath-read-ebadf", rn >= 0 ? 0 : errno, EBADF);
+      (void)close(fd);
+      return 1;
+    }
+    (void)close(fd);
+    marker("M17-SMOKE: ok o-path-read-ebadf");
+
+    /* O_PATH on a directory still yields a usable *at() anchor: the walker
+     * descends through exactly such descriptors. */
+    int dfd = open("/tmp", O_RDONLY | O_PATH | O_DIRECTORY);
+    if (dfd < 0) {
+      fail_marker("opath-dir", errno, 0);
+      return 1;
+    }
+    int leaf = openat(dfd, "m17_nofollow_target", O_RDONLY);
+    if (leaf < 0) {
+      fail_marker("opath-dirfd-openat", errno, 0);
+      (void)close(dfd);
+      return 1;
+    }
+    (void)close(leaf);
+    (void)close(dfd);
+    marker("M17-SMOKE: ok o-path-dirfd");
+
+    (void)unlink(link);
+    (void)unlink(target);
   }
 
   marker("M17-SMOKE: done");

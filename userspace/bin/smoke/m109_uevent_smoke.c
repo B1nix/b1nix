@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -212,6 +213,7 @@ struct uev {
   char action[32];
   char devpath[128];
   char subsystem[32];
+  char devtype[32];
   char devname[64];
   int major;
   int minor;
@@ -237,6 +239,8 @@ static void uev_parse(const char *buf, int len, struct uev *e) {
       snprintf(e->devpath, sizeof(e->devpath), "%s", p + 8);
     else if (strncmp(p, "SUBSYSTEM=", 10) == 0)
       snprintf(e->subsystem, sizeof(e->subsystem), "%s", p + 10);
+    else if (strncmp(p, "DEVTYPE=", 8) == 0)
+      snprintf(e->devtype, sizeof(e->devtype), "%s", p + 8);
     else if (strncmp(p, "DEVNAME=", 8) == 0)
       snprintf(e->devname, sizeof(e->devname), "%s", p + 8);
     else if (strncmp(p, "MAJOR=", 6) == 0)
@@ -299,14 +303,61 @@ static void test_uevent_trigger(int nlfd) {
     failm("uevent-trigger", "no add@/block/loop0 arrived on the socket");
     return;
   }
+  /* DEVTYPE is checked as strictly as the rest, because a listener cannot
+   * make up for its absence. An sd_device built from a netlink message is
+   * SEALED: libsystemd answers sd_device_get_devtype() out of the message and
+   * never falls back to the `uevent` file, so a re-announcement without it is
+   * one systemd-udevd abandons ("Failed to get whole disk device") before a
+   * single rule runs — and a device no rule ran on is never tagged, which is
+   * why no .device unit could activate on this kernel. */
   if (strcmp(e.action, "add") != 0 || strcmp(e.subsystem, "block") != 0 ||
-      strcmp(e.devname, "loop0") != 0 || !e.have_seqnum) {
-    note("action='%s' subsystem='%s' devname='%s' seqnum=%d", e.action,
-         e.subsystem, e.devname, e.have_seqnum);
+      strcmp(e.devname, "loop0") != 0 || strcmp(e.devtype, "disk") != 0 ||
+      !e.have_seqnum) {
+    note("action='%s' subsystem='%s' devtype='%s' devname='%s' seqnum=%d",
+         e.action, e.subsystem, e.devtype, e.devname, e.have_seqnum);
     failm("uevent-trigger", "the re-announcement is not the device's own");
     return;
   }
   ok("uevent-trigger");
+}
+
+/*
+ * A coldplug replay reaches every device, not only the block devices.
+ *
+ * `udevadm trigger` walks /sys and writes "add" to each `uevent` file it
+ * finds. The tty class published its files read-only, so every VT answered
+ * "Permission denied" and no terminal was ever re-announced to a manager that
+ * started after the kernel did. A write that is refused is the whole failure:
+ * there is no second route by which the device could be announced.
+ */
+static void test_uevent_trigger_tty(int nlfd) {
+  const char *path = "/sys/class/tty/tty1/uevent";
+  int fd = open(path, O_WRONLY);
+  if (fd < 0) {
+    failm("uevent-trigger-tty", "cannot open /sys/class/tty/tty1/uevent for writing");
+    return;
+  }
+  ssize_t w = write(fd, "add", 3);
+  close(fd);
+  if (w != 3) {
+    failm("uevent-trigger-tty", "the write was not accepted");
+    return;
+  }
+
+  struct uev e;
+  if (uev_wait(nlfd, "add@/class/tty/tty1", &e) != 0) {
+    failm("uevent-trigger-tty", "no add@/class/tty/tty1 arrived on the socket");
+    return;
+  }
+  if (strcmp(e.action, "add") != 0 || strcmp(e.subsystem, "tty") != 0 ||
+      strcmp(e.devname, "tty1") != 0 || e.major != 4 || e.minor != 1 ||
+      !e.have_seqnum) {
+    note("action='%s' subsystem='%s' devname='%s' %d:%d", e.action,
+         e.subsystem, e.devname, e.major, e.minor);
+    failm("uevent-trigger-tty", "the re-announcement is not the terminal's own");
+    return;
+  }
+  ok("uevent-trigger-tty");
 }
 
 /* udev learns the subsystem of a device it found by scanning /sys from the
@@ -627,9 +678,10 @@ static void test_hotplug_add(int nlfd) {
     return;
   }
   if (strcmp(e.action, "add") != 0 || strcmp(e.subsystem, "block") != 0 ||
-      strcmp(e.devname, HOT_NAME) != 0 || strcmp(e.devpath, "/block/" HOT_NAME) != 0) {
-    note("action=%s subsystem=%s devname=%s devpath=%s", e.action, e.subsystem,
-         e.devname, e.devpath);
+      strcmp(e.devname, HOT_NAME) != 0 || strcmp(e.devtype, "disk") != 0 ||
+      strcmp(e.devpath, "/block/" HOT_NAME) != 0) {
+    note("action=%s subsystem=%s devtype=%s devname=%s devpath=%s", e.action,
+         e.subsystem, e.devtype, e.devname, e.devpath);
     failm("uevent-hotplug-add", "the event is missing a property mdev needs");
     return;
   }
@@ -805,6 +857,121 @@ static void test_mdev_daemon(void) {
   ok("mdev-daemon");
 }
 
+
+/* ── A netlink source address names the SOCKET, not the process ───────────
+ *
+ * sockaddr_nl.nl_pid is a port id: a task that holds two netlink sockets has
+ * two of them, and getsockname is how a program learns its own. systemd-udevd
+ * builds its whole worker protocol on that -- the worker calls
+ * device_monitor_allow_unicast_sender() with the manager's monitor address and
+ * then discards ("Unicast netlink message ignored") every message whose source
+ * nl_pid is not that exact value.
+ *
+ * This kernel reported the sending TASK's pid instead. The manager holds
+ * several netlink sockets, so its monitor's port id is not its pid, and every
+ * device it handed to an already-running worker was thrown away: udevd forked
+ * up to its child limit, each worker went idle after its first device, and the
+ * event queue never drained again.
+ *
+ * Two sockets in ONE process is the shape that separates the two answers. */
+static void test_netlink_source_is_socket(void) {
+  int a = -1, b = -1;
+  struct nlsa sa, sb, from;
+  socklen_t alen = sizeof(sa), blen = sizeof(sb);
+  char payload[] = "add@/b1nix-portid-probe";
+  char buf[128];
+  struct iovec iov = { buf, sizeof(buf) };
+  struct msghdr m;
+  struct nlsa dest;
+  struct pollfd pf;
+  int n;
+
+  a = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
+  b = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
+  if (a < 0 || b < 0) {
+    failm("netlink-source-portid", "socket");
+    goto out;
+  }
+  /* nl_pid 0 asks the kernel to allocate, which is what a udev worker's
+   * monitor does. The first gets the pid (Linux's starting point), the second
+   * has to get something else. */
+  memset(&sa, 0, sizeof(sa));
+  sa.nl_family = AF_NETLINK;
+  memset(&sb, 0, sizeof(sb));
+  sb.nl_family = AF_NETLINK;
+  if (bind(a, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
+      bind(b, (struct sockaddr *)&sb, sizeof(sb)) != 0) {
+    failm("netlink-source-portid", "bind");
+    goto out;
+  }
+  if (getsockname(a, (struct sockaddr *)&sa, &alen) != 0 ||
+      getsockname(b, (struct sockaddr *)&sb, &blen) != 0) {
+    failm("netlink-source-portid", "getsockname");
+    goto out;
+  }
+  /* Two sockets in one process must not share a port id -- otherwise a
+   * message addressed to either is delivered to whichever bound first. */
+  if (sa.nl_pid == sb.nl_pid) {
+    failm("netlink-source-portid", "two sockets share one port id");
+    goto out;
+  }
+
+  /* Send from the SECOND socket: the first took the pid as its port id (that
+   * is what Linux does when it is free), so only the second has a port id that
+   * differs from the process id -- and telling those two apart is the whole
+   * question. */
+  if (sb.nl_pid == (unsigned int)getpid()) {
+    failm("netlink-source-portid",
+          "second socket kept the pid as its port id");
+    goto out;
+  }
+  memset(&dest, 0, sizeof(dest));
+  dest.nl_family = AF_NETLINK;
+  dest.nl_pid = sa.nl_pid;
+  if (sendto(b, payload, sizeof(payload), 0, (struct sockaddr *)&dest,
+             sizeof(dest)) < 0) {
+    failm("netlink-source-portid", "sendto");
+    goto out;
+  }
+
+  pf.fd = a;
+  pf.events = POLLIN;
+  pf.revents = 0;
+  if (poll(&pf, 1, 3000) <= 0) {
+    failm("netlink-source-portid", "unicast never arrived");
+    goto out;
+  }
+
+  memset(&m, 0, sizeof(m));
+  memset(&from, 0xff, sizeof(from));
+  m.msg_name = &from;
+  m.msg_namelen = sizeof(from);
+  m.msg_iov = &iov;
+  m.msg_iovlen = 1;
+  n = (int)recvmsg(a, &m, 0);
+  if (n <= 0) {
+    failm("netlink-source-portid", "recvmsg");
+    goto out;
+  }
+  if (from.nl_family != AF_NETLINK) {
+    failm("netlink-source-portid", "source address is not AF_NETLINK");
+    goto out;
+  }
+  if (from.nl_pid != sb.nl_pid) {
+    note("source nl_pid=%u sender socket=%u pid=%u", (unsigned)from.nl_pid,
+         (unsigned)sb.nl_pid, (unsigned)getpid());
+    failm("netlink-source-portid",
+          "source nl_pid is not the sending socket's port id");
+    goto out;
+  }
+  ok("netlink-source-portid");
+out:
+  if (a >= 0)
+    close(a);
+  if (b >= 0)
+    close(b);
+}
+
 int main(void) {
   marker("M109-UEVENT: start");
 
@@ -816,14 +983,17 @@ int main(void) {
 
   test_subsystem_link();
   test_bpf_filter();
+  test_netlink_source_is_socket();
 
   int nlfd = uevent_socket();
   if (nlfd < 0) {
     failm("uevent-trigger", "could not bind NETLINK_KOBJECT_UEVENT");
+    failm("uevent-trigger-tty", "could not bind NETLINK_KOBJECT_UEVENT");
     failm("uevent-hotplug-add", "could not bind NETLINK_KOBJECT_UEVENT");
     failm("uevent-hotplug-remove", "could not bind NETLINK_KOBJECT_UEVENT");
   } else {
     test_uevent_trigger(nlfd);
+    test_uevent_trigger_tty(nlfd);
     test_hotplug_add(nlfd);
     test_mdev_scan();
     test_hotplug_remove(nlfd);

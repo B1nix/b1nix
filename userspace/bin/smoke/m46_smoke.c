@@ -16,6 +16,10 @@
 #include <stdlib.h>
 #include <sched.h>
 #include <unistd.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/mount.h>
+#include <sys/time.h>
 
 static int g_fail;
 
@@ -569,6 +573,350 @@ static void test_nice_biasing(void) {
   }
 }
 
+
+/* ── Directory timestamps ──────────────────────────────────────────────────
+ * POSIX: creating, removing or renaming an entry marks the CONTAINING
+ * directory modified. Nothing here did, so a directory's mtime was fixed at
+ * the moment it was created. systemd re-reads a unit directory only when its
+ * mtime differs from the one its last scan recorded, so a unit file written
+ * afterwards was invisible for ever -- and the second half of that is
+ * resolution: whole seconds are too coarse to separate two writes, so the
+ * check below makes both changes inside one second on purpose. */
+static int dir_stamp(const char *path, long long *sec, long *nsec) {
+  struct stat st;
+  if (stat(path, &st) != 0)
+    return -1;
+  *sec = (long long)st.st_mtime;
+  *nsec = (long)st.st_mtim.tv_nsec;
+  return 0;
+}
+
+static void test_dir_mtime(void) {
+  const char *dir = "/tmp/m46dirmtime";
+  char f1[64], f2[64];
+  long long s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+  long n0 = 0, n1 = 0, n2 = 0, n3 = 0;
+
+  snprintf(f1, sizeof(f1), "%s/a", dir);
+  snprintf(f2, sizeof(f2), "%s/b", dir);
+  unlink(f1);
+  unlink(f2);
+  rmdir(dir);
+  if (mkdir(dir, 0755) != 0) {
+    fail("dir-mtime-create", errno, 0);
+    return;
+  }
+  if (dir_stamp(dir, &s0, &n0) != 0) {
+    fail("dir-mtime-create", errno, 1);
+    return;
+  }
+
+  int fd = open(f1, O_CREAT | O_WRONLY, 0644);
+  if (fd < 0) {
+    fail("dir-mtime-create", errno, 2);
+    return;
+  }
+  close(fd);
+  if (dir_stamp(dir, &s1, &n1) != 0 || (s1 == s0 && n1 == n0)) {
+    fail("dir-mtime-create", (int)(s1 - s0), (int)(n1 - n0));
+  } else {
+    ok("dir-mtime-create");
+  }
+
+  /* A second change inside the same second must still be visible: this is the
+   * sub-second half, and it is the half systemd depends on. */
+  fd = open(f2, O_CREAT | O_WRONLY, 0644);
+  if (fd >= 0)
+    close(fd);
+  if (dir_stamp(dir, &s2, &n2) != 0 || (s2 == s1 && n2 == n1)) {
+    fail("dir-mtime-subsecond", (int)(s2 - s1), (int)(n2 - n1));
+  } else {
+    ok("dir-mtime-subsecond");
+  }
+
+  unlink(f2);
+  if (dir_stamp(dir, &s3, &n3) != 0 || (s3 == s2 && n3 == n2)) {
+    fail("dir-mtime-unlink", (int)(s3 - s2), (int)(n3 - n2));
+  } else {
+    ok("dir-mtime-unlink");
+  }
+
+  unlink(f1);
+  rmdir(dir);
+}
+
+/* ── rename(2) keeps the WHOLE name ────────────────────────────────────────
+ * The rename path copied the new name into a 64-byte field while every other
+ * creation path stores VFS_NAME_MAX-1, so a destination longer than 63
+ * characters was silently renamed to a shorter, different name: the file
+ * existed under a name nobody would look up, and the intended one was ENOENT.
+ * "Write to a temporary, rename over the target" is how systemd, dpkg and
+ * glibc all replace a file, and their temporary names are long. */
+static void test_rename_long_name(void) {
+  char src[80], dst[200];
+  char longname[130];
+  struct stat st;
+  int fd;
+
+  for (size_t i = 0; i < sizeof(longname) - 1; i++)
+    longname[i] = 'n';
+  longname[sizeof(longname) - 1] = '\0';
+  snprintf(src, sizeof(src), "/tmp/m46ren-src");
+  snprintf(dst, sizeof(dst), "/tmp/%s", longname);
+  unlink(src);
+  unlink(dst);
+
+  fd = open(src, O_CREAT | O_WRONLY, 0644);
+  if (fd < 0) {
+    fail("rename-long-name", errno, 0);
+    return;
+  }
+  write(fd, "x", 1);
+  close(fd);
+
+  if (rename(src, dst) != 0) {
+    fail("rename-long-name", errno, 1);
+    unlink(src);
+    return;
+  }
+  if (stat(dst, &st) != 0) {
+    fail("rename-long-name", errno, 2);
+  } else if (stat(src, &st) == 0) {
+    fail("rename-long-name", 0, 3); /* the old name must be gone */
+  } else {
+    ok("rename-long-name");
+  }
+  unlink(dst);
+  unlink(src);
+}
+
+/* ── A datagram with no bytes in it is still a datagram ────────────────────
+ * Linux delivers a zero-length datagram and the ancillary data attached to it,
+ * and a program can send one over a socketpair purely to be identified by the
+ * SCM_CREDENTIALS its peer's SO_PASSCRED attaches. Three halves of that were
+ * missing: the send was a no-op, the receive refused a zero-length iovec with
+ * EINVAL, and a queued empty message never made the socket readable. The
+ * existing credentials check uses a STREAM socket and a four-byte message,
+ * which is why it passed throughout. */
+static void test_empty_datagram(void) {
+  int sv[2];
+  int on = 1;
+  pid_t pid;
+  struct msghdr m;
+  struct iovec iov;
+  char cbuf[CMSG_SPACE(sizeof(struct ucred))];
+  struct cmsghdr *c;
+  struct ucred cred;
+  struct pollfd p;
+  int n, status = 0;
+  char dummy = 0;
+
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) {
+    fail("empty-datagram", errno, 0);
+    return;
+  }
+  if (setsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) != 0) {
+    fail("empty-datagram", errno, 1);
+    close(sv[0]);
+    close(sv[1]);
+    return;
+  }
+
+  pid = fork();
+  if (pid < 0) {
+    fail("empty-datagram", errno, 2);
+    close(sv[0]);
+    close(sv[1]);
+    return;
+  }
+  if (pid == 0) {
+    close(sv[0]);
+    /* A write of zero bytes on a datagram socket: an empty message. */
+    _exit(write(sv[1], &dummy, 0) == 0 ? 0 : 1);
+  }
+  close(sv[1]);
+
+  p.fd = sv[0];
+  p.events = POLLIN;
+  if (poll(&p, 1, 5000) <= 0) {
+    fail("empty-datagram", errno, 3); /* never became readable */
+    waitpid(pid, &status, 0);
+    close(sv[0]);
+    return;
+  }
+
+  memset(&m, 0, sizeof(m));
+  iov.iov_base = &dummy;
+  iov.iov_len = 0; /* a zero-length iovec, as the manager uses */
+  m.msg_iov = &iov;
+  m.msg_iovlen = 1;
+  m.msg_control = cbuf;
+  m.msg_controllen = sizeof(cbuf);
+  n = (int)recvmsg(sv[0], &m, 0);
+  waitpid(pid, &status, 0);
+
+  if (n != 0) {
+    fail("empty-datagram", n, errno);
+    close(sv[0]);
+    return;
+  }
+  c = CMSG_FIRSTHDR(&m);
+  if (!c || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_CREDENTIALS) {
+    fail("empty-datagram", 4, 0); /* arrived carrying no identity */
+    close(sv[0]);
+    return;
+  }
+  memcpy(&cred, CMSG_DATA(c), sizeof(cred));
+  if ((pid_t)cred.pid != pid) {
+    fail("empty-datagram", (int)cred.pid, (int)pid);
+    close(sv[0]);
+    return;
+  }
+  ok("empty-datagram-cred");
+  close(sv[0]);
+}
+
+/* ── A read-only mount refuses the OPEN ────────────────────────────────────
+ * `ProtectSystem=strict` binds a path onto itself and remounts it read-only.
+ * Two things were wrong: the mount lookup returned the OLDEST entry rooted at
+ * a node rather than the newest, so the read-only remount was recorded and
+ * never consulted; and open(2) never checked the mount at all, so O_WRONLY
+ * succeeded and O_TRUNC emptied a file on a filesystem the kernel believed
+ * was read-only.
+ *
+ * Run inside its own mount namespace so a failure cannot leave the rest of
+ * the suite looking at a read-only /tmp. */
+static void test_readonly_mount(void) {
+  pid_t pid = fork();
+  int status = 0;
+
+  if (pid < 0) {
+    fail("rdonly-mount-open", errno, 0);
+    return;
+  }
+  if (pid == 0) {
+    const char *dir = "/tmp/m46ro";
+    char file[64];
+    int fd;
+
+    snprintf(file, sizeof(file), "%s/f", dir);
+    mkdir(dir, 0755);
+    fd = open(file, O_CREAT | O_WRONLY, 0644);
+    if (fd < 0)
+      _exit(11);
+    if (write(fd, "keepme", 6) != 6)
+      _exit(12);
+    close(fd);
+
+    if (unshare(CLONE_NEWNS) != 0)
+      _exit(13);
+    if (mount(dir, dir, NULL, MS_BIND, NULL) != 0)
+      _exit(14);
+    if (mount(NULL, dir, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0)
+      _exit(15);
+
+    /* Reading is still allowed. */
+    fd = open(file, O_RDONLY);
+    if (fd < 0)
+      _exit(16);
+    close(fd);
+
+    if (open(file, O_WRONLY) >= 0)
+      _exit(17);
+    if (errno != EROFS)
+      _exit(18);
+    if (open(file, O_WRONLY | O_TRUNC) >= 0)
+      _exit(19);
+    if (errno != EROFS)
+      _exit(20);
+    if (open("/tmp/m46ro/new", O_CREAT | O_WRONLY, 0644) >= 0)
+      _exit(21);
+    if (errno != EROFS)
+      _exit(22);
+
+    /* And the file it was told not to touch still has its contents. */
+    {
+      struct stat st;
+      if (stat(file, &st) != 0 || st.st_size != 6)
+        _exit(23);
+    }
+    _exit(0);
+  }
+
+  waitpid(pid, &status, 0);
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    ok("rdonly-mount-open");
+  } else {
+    fail("rdonly-mount-open", WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+         status);
+  }
+  unlink("/tmp/m46ro/f");
+  rmdir("/tmp/m46ro");
+}
+
+
+/* ── A signal ends a sleep ─────────────────────────────────────────────────
+ * SIGTERM's default action is to terminate, and a process parked in
+ * nanosleep(2) is not exempt: `kill` reaches it and it dies there. Anything
+ * that bounds a command depends on this — `timeout(1)` sends its child a
+ * signal and expects the child to be gone — and a bound that returns the right
+ * answer without bounding anything is worse than no bound at all.
+ *
+ * The check measures elapsed time as well as the exit status, because a child
+ * that slept its full thirty seconds and then exited normally would satisfy a
+ * status check made afterwards. */
+static void test_signal_ends_sleep(void) {
+  struct timespec t0, t1;
+  pid_t pid;
+  int status = 0;
+  long elapsed_ms;
+
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  pid = fork();
+  if (pid < 0) {
+    fail("signal-ends-sleep", errno, 0);
+    return;
+  }
+  if (pid == 0) {
+    struct timespec s = { 5, 0 };
+    sigset_t none;
+    /* An IGNORED disposition survives fork AND exec, and the shell that
+     * launches this suite runs `trap '' TERM`, so the default has to be put
+     * back explicitly — otherwise this measures the trap, not the kernel.
+     * Same for the mask. */
+    signal(SIGTERM, SIG_DFL);
+    sigemptyset(&none);
+    sigprocmask(SIG_SETMASK, &none, NULL);
+    nanosleep(&s, NULL);
+    _exit(7); /* reached only if the sleep ran to completion */
+  }
+
+  /* Long enough that the child is certainly inside the sleep. */
+  {
+    struct timespec w = { 0, 200 * 1000 * 1000 };
+    nanosleep(&w, NULL);
+  }
+  if (kill(pid, SIGTERM) != 0) {
+    fail("signal-ends-sleep", errno, 1);
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    return;
+  }
+  waitpid(pid, &status, 0);
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  elapsed_ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 +
+                      (t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+  if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGTERM) {
+    fail("signal-ends-sleep", status, (int)elapsed_ms);
+  } else if (elapsed_ms > 2000) {
+    /* Signalled, but only after the five-second sleep had all but finished. */
+    fail("signal-ends-sleep", -1, (int)elapsed_ms);
+  } else {
+    ok("signal-ends-sleep");
+  }
+}
+
 int main(void) {
   marker("M46-SMOKE: start");
   test_exit_status();
@@ -588,6 +936,11 @@ int main(void) {
   test_times_rusage();
   test_orphaned_pgrp();
   test_nice_biasing();
+  test_dir_mtime();
+  test_rename_long_name();
+  test_empty_datagram();
+  test_readonly_mount();
+  test_signal_ends_sleep();
   /* The failure string must not contain "M46-SMOKE: done" — the host-side
    * grep is a substring match. */
   marker(g_fail ? "M46-SMOKE: completed-with-failures" : "M46-SMOKE: done");

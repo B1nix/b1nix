@@ -650,6 +650,7 @@ static isize ext2_vfs_write(struct vfs_node *node, u64 offset,
 
   if (bytes_written > 0) {
     node->inode->mtime = vfs_get_unix_time();
+    node->inode->mtime_nsec = 0;
     node->inode->ctime = vfs_get_unix_time();
     if (offset + bytes_written > inode.i_size) {
       inode.i_size = (u32)(offset + bytes_written);
@@ -757,6 +758,7 @@ static int ext2_vfs_truncate(struct vfs_node *node, u64 length) {
   inode.i_size = (u32)length;
   node->inode->size = (usize)length;
   node->inode->mtime = vfs_get_unix_time();
+  node->inode->mtime_nsec = 0;
   node->inode->ctime = node->inode->mtime;
   inode.i_mtime = node->inode->mtime;
   inode.i_ctime = node->inode->ctime;
@@ -1559,6 +1561,7 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
               dir_node->inode->gid = child_inode.i_gid;
               dir_node->inode->atime = child_inode.i_atime;
               dir_node->inode->mtime = child_inode.i_mtime;
+              dir_node->inode->mtime_nsec = 0;
               dir_node->inode->ctime = child_inode.i_ctime;
               dir_node->inode->nlink = child_inode.i_links_count;
               /* Inherit the filesystem id from the parent — but only if there
@@ -1613,6 +1616,7 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
               node->inode->gid = child_inode.i_gid;
               node->inode->atime = child_inode.i_atime;
               node->inode->mtime = child_inode.i_mtime;
+              node->inode->mtime_nsec = 0;
               node->inode->ctime = child_inode.i_ctime;
               node->inode->nlink = child_inode.i_links_count;
               if (node->parent && node->parent->inode) {
