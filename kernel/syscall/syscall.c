@@ -4367,9 +4367,7 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   }
 
   // Allocate and map physical frames
-  u64 vmm_flags = VMM_USER;
-  if (prot & PROT_WRITE)
-    vmm_flags |= VMM_WRITABLE;
+  u64 vmm_flags = vmm_user_flags_from_prot(prot);
 
   /* Anonymous memory is faulted in, not handed over.
    *
@@ -4945,9 +4943,7 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
   if (end < start || end > USER_SPACE_LIMIT)
     return -EINVAL;
 
-  u64 flags = VMM_USER;
-  if (prot & PROT_WRITE)
-    flags |= VMM_WRITABLE;
+  u64 flags = vmm_user_flags_from_prot(prot);
 
   // 1. Update hardware page tables
   {
@@ -5084,9 +5080,7 @@ static isize sys_madvise(void *addr, usize length, int advice) {
       continue;
     }
 
-    u64 vmm_flags = VMM_USER;
-    if (cover->prot & PROT_WRITE)
-      vmm_flags |= VMM_WRITABLE;
+    u64 vmm_flags = vmm_user_flags_from_prot((int)cover->prot);
 
     while (v < seg_end) {
       usize n = (usize)((seg_end - v) / PAGE_SIZE);
@@ -5290,7 +5284,10 @@ static u64 sys_brk(u64 addr) {
       u64 direct_base = vmm_direct_map_base();
       memset((void *)(usize)(frame + direct_base), 0, PAGE_SIZE);
 
-      vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE | VMM_PRESENT);
+      /* The heap is data: writable, never executable. */
+      vmm_map_page(v, frame,
+                   vmm_user_flags_from_prot(PROT_READ | PROT_WRITE) |
+                       VMM_PRESENT);
     }
   } else if (addr < t->user_brk) {
     u64 old_brk_page_end = (t->user_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -6317,6 +6314,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_pidfd_open      434
 #define LX_pidfd_send_signal 424
 #define LX_renameat2       316
+/* renameat2 flags (Linux uapi/linux/fs.h). */
+#define RENAME_NOREPLACE (1u << 0)
+#define RENAME_EXCHANGE  (1u << 1)
+#define RENAME_WHITEOUT  (1u << 2)
 #define LX_renameat        264
 #define LX_pipe2           293
 #define LX_dup3            292
@@ -6669,8 +6670,40 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           }
           char new_resolved[VFS_MAX_PATH];
           vfs_resolve_path(new_kpath, new_resolved);
-          /* arg4=flags: RENAME_NOREPLACE(1), RENAME_EXCHANGE(2).
-           * b1nix doesn't support these — silently ignore for now. */
+          /* arg4=flags. These used to be ignored and the plain rename run
+           * anyway, which is the one outcome a caller must never get: a
+           * program that asks NOT to clobber the destination was told the
+           * rename succeeded, having just destroyed the file it was
+           * protecting. renameat(264) carries no flags argument at all, so it
+           * is only read for renameat2. */
+          if (number == LX_renameat2) {
+            u32 rflags = (u32)arg4;
+
+            if (rflags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE |
+                           RENAME_WHITEOUT))
+              return (u64)-EINVAL;
+            /* NOREPLACE and EXCHANGE are mutually exclusive by definition:
+             * one requires the destination to be absent, the other requires it
+             * to be present. */
+            if ((rflags & RENAME_NOREPLACE) && (rflags & RENAME_EXCHANGE))
+              return (u64)-EINVAL;
+            if (rflags & RENAME_NOREPLACE) {
+              struct vfs_node *existing = vfs_find_node(new_resolved);
+
+              if (existing) {
+                vfs_node_put(existing);
+                return (u64)-EEXIST;
+              }
+            }
+            /* EXCHANGE has to be atomic — swapping by hand through two renames
+             * is exactly the non-atomicity callers use it to avoid — and
+             * WHITEOUT needs an overlay layer this kernel has no notion of.
+             * EINVAL is what Linux returns for a filesystem that does not
+             * implement them, and it is what makes the caller fall back
+             * instead of trusting a swap that never happened. */
+            if (rflags & (RENAME_EXCHANGE | RENAME_WHITEOUT))
+              return (u64)-EINVAL;
+          }
           return (u64)vfs_rename(resolved, new_resolved);
         }
         default:

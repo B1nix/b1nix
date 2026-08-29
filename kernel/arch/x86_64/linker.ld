@@ -17,10 +17,12 @@ SECTIONS
 	. = 1M;
 	__kernel_phys_start = .;
 
+	__boot_start = .;
 	.boot ALIGN(8) : {
 		KEEP(*(.multiboot2))
 		*(.boot)
 	}
+	__boot_end = .;
 
 	/* Everything else is linked HIGH (VMA) but still LOADED low (LMA via AT). */
 	. += KERNEL_VMA;
@@ -31,23 +33,33 @@ SECTIONS
 		*(.text .text.*)
 	}
 	__kernel_text_end = .;
-	. = ALIGN(512K);  /* Pad .text to 512K boundary — stabilises layout for TCC */
+
+	/* No section padding here. Each of .text/.rodata/.data used to be padded to
+	 * a 512K boundary so that adding a few hundred bytes of kernel code could
+	 * not shift the layout — TinyCC was a non-PIE ET_EXEC linked at a fixed
+	 * address and hung whenever it did. That compiler is gone: the in-guest
+	 * compiler is b1cc, which ships as a position-independent ET_DYN loaded
+	 * through musl's ld.so, and the kernel has been higher-half since M52, so
+	 * its addresses cannot collide with a userspace image at all. Padding a
+	 * layout to hide an address-space bug was treating the symptom; nothing
+	 * depends on frozen section addresses now. (kallsyms' two-pass link does
+	 * need .text addresses to be identical between the passes — that is why the
+	 * blob is placed after .text/.rodata/.data below, which holds with or
+	 * without padding.) */
 
 	.rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VMA) {
 		*(.rodata .rodata.*)
 	}
-	. = ALIGN(512K);  /* Pad .rodata to 512K boundary — stabilises layout */
 
 	.data ALIGN(4K) : AT(ADDR(.data) - KERNEL_VMA) {
 		*(.data .data.*)
 	}
-	. = ALIGN(512K);  /* Pad .data to 512K boundary — stabilises layout */
 
 	/* M95: EXPORT_SYMBOL table — one { u64 value; const char *name; } record
 	 * per exported kernel symbol, plus the name strings. The module loader
 	 * walks __ksymtab_start..__ksymtab_end to resolve a .ko's undefined
-	 * symbols. Placed after the 512K-padded .text/.rodata/.data so growing it
-	 * never shifts a function address. */
+	 * symbols. Placed after .text/.rodata/.data so growing it never shifts a
+	 * function address. */
 	.ksymtab ALIGN(8) : AT(ADDR(.ksymtab) - KERNEL_VMA) {
 		__ksymtab_start = .;
 		KEEP(*(.ksymtab))
@@ -57,8 +69,8 @@ SECTIONS
 	. = ALIGN(4K);
 
 	/* M35: kallsyms symbol blob, generated post-link and appended on a second
-	 * link pass. Placed AFTER .text/.rodata/.data (whose addresses are frozen
-	 * by the 512K padding above) so adding it never shifts a function address. */
+	 * link pass. Placed AFTER .text/.rodata/.data so appending it on the second
+	 * pass never shifts a function address the first pass already recorded. */
 	.kallsyms ALIGN(8) : AT(ADDR(.kallsyms) - KERNEL_VMA) {
 		__kallsyms_start = .;
 		KEEP(*(.kallsyms))

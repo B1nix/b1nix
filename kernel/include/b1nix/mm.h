@@ -92,6 +92,31 @@ extern u64 g_direct_map_size;
 #define PROT_WRITE 0x2
 #define PROT_EXEC 0x4
 
+/* Page-table flags for a userspace mapping with these PROT_* bits.
+ *
+ * W^X lives here: a mapping that did not ask for PROT_EXEC gets the NX bit, so
+ * a data page cannot be jumped into and a text page cannot be written through.
+ * Every user mapping used to be created RWX regardless of what the caller
+ * asked for — NX was implemented and used for MMIO and for module images, but
+ * no process page ever carried it.
+ *
+ * NX is only applied when the CPU has it and EFER.NXE is programmed
+ * (arch_nx_enabled()): with NXE clear, bit 63 is reserved and setting it faults
+ * on access rather than protecting anything.
+ *
+ * PROT_NONE keeps VMM_USER without VMM_PRESENT handling here — the caller
+ * decides presence; this only translates the protection bits. */
+int arch_nx_enabled(void);
+
+static inline u64 vmm_user_flags_from_prot(int prot) {
+  u64 flags = VMM_USER;
+  if (prot & PROT_WRITE)
+    flags |= VMM_WRITABLE;
+  if (!(prot & PROT_EXEC) && arch_nx_enabled())
+    flags |= VMM_NO_EXECUTE;
+  return flags;
+}
+
 /* mmap flags */
 #define MAP_SHARED 0x01
 #define MAP_PRIVATE 0x02

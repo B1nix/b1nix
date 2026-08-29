@@ -1643,6 +1643,10 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     u64 vaddr_start = segment->vaddr & ~(PAGE_SIZE - 1);
     u64 vaddr_end =
         (segment->vaddr + segment->memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    /* The protection this segment asked for. PT_LOAD without PF_R does not
+     * occur in practice and would be unreadable, so read is implied. */
+    int seg_prot = PROT_READ | ((segment->flags & PF_W) ? PROT_WRITE : 0) |
+                   ((segment->flags & PF_X) ? PROT_EXEC : 0);
 
     /* Demand-paged read-only segment (survived the relocation pass): map it
      * file-backed lazy instead of pinning private frames, then free the staging.
@@ -1657,8 +1661,10 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       for (u64 v = vaddr_start; v < vaddr_end; v += PAGE_SIZE) {
         vmm_set_lazy(v);
         /* RO + user: no VMM_WRITABLE, so the shared cache frame can't be written
-         * through this mapping; the fault handler honours the saved bits. */
-        paging_mprotect_page(v, VMM_USER);
+         * through this mapping; the fault handler honours the saved bits. The
+         * NX bit comes from the segment's own p_flags, same as the eager path
+         * below — a demand-paged .rodata must not be executable either. */
+        paging_mprotect_page(v, vmm_user_flags_from_prot(seg_prot));
       }
       struct vm_area *fvma = kzalloc(sizeof(struct vm_area));
       if (fvma) {
@@ -1694,7 +1700,13 @@ static int user_run_elf_image(struct user_loaded_image *image) {
           kfree(mapped_frame);
           return -ENOMEM;
         }
-        u64 flags = VMM_USER | VMM_WRITABLE;
+        /* The segment's own p_flags decide, not a blanket RWX. The pages are
+         * filled through the direct map below, so a read-only segment never
+         * needs to be writable in the user address space; and a data segment
+         * gets the NX bit. Until this honoured p_flags, a process's .text was
+         * writable and its stack and heap were executable — W^X existed for
+         * modules and MMIO but not for a single userspace page. */
+        u64 flags = vmm_user_flags_from_prot(seg_prot);
         vmm_map_page(v, frame, flags);
         memset((void *)(usize)(direct_base + frame), 0, PAGE_SIZE);
         /* At least one slot must stay empty or the probe above would not
@@ -1737,7 +1749,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     if (vma) {
       vma->start = vaddr_start;
       vma->end = vaddr_end;
-      vma->prot = PROT_READ | PROT_WRITE | PROT_EXEC; // Simplify for now
+      vma->prot = (u32)seg_prot;
       vma->flags = MAP_PRIVATE;
       vma_insert(current_task, vma);
     }
@@ -1790,7 +1802,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     if (!frame) {
       return -ENOMEM;
     }
-    vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE);
+    vmm_map_page(v, frame, vmm_user_flags_from_prot(PROT_READ | PROT_WRITE));
 
     /* Clear stack page */
     u64 direct_v = direct_base + frame;
@@ -1859,7 +1871,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       u64 frame = pmm_alloc_frame();
       if (!frame)
         return -ENOMEM;
-      vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE);
+      vmm_map_page(v, frame, vmm_user_flags_from_prot(PROT_READ | PROT_WRITE));
       u64 direct_v = db + frame;
       memset((void *)(usize)direct_v, 0, PAGE_SIZE);
 
@@ -1907,7 +1919,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
 
     u64 frame = pmm_alloc_frame();
     if (frame) {
-      vmm_map_page(region, frame, VMM_USER | VMM_WRITABLE);
+      vmm_map_page(region, frame, vmm_user_flags_from_prot(PROT_READ | PROT_WRITE));
       u64 direct_v = db + frame;
       memset((void *)(usize)direct_v, 0, PAGE_SIZE);
       /* Self pointer: TCB[0] = TP */

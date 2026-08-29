@@ -1190,6 +1190,9 @@ check_output "$LOG" "M17-SMOKE: ok o-nofollow-eloop" "M17 O_NOFOLLOW refuses a s
 check_output "$LOG" "M17-SMOKE: ok o-path-symlink" "M17 O_PATH|O_NOFOLLOW opens the symlink itself and fstat reports S_IFLNK"
 check_output "$LOG" "M17-SMOKE: ok o-path-read-ebadf" "M17 an O_PATH descriptor has no contents to read (EBADF)"
 check_output "$LOG" "M17-SMOKE: ok o-path-dirfd" "M17 an O_PATH directory descriptor still anchors openat()"
+check_output "$LOG" "M17-SMOKE: ok renameat2-noreplace" "M17 renameat2(RENAME_NOREPLACE) refuses with EEXIST and leaves both files intact, instead of ignoring the flag and clobbering the destination"
+check_output "$LOG" "M17-SMOKE: ok renameat2-einval" "M17 renameat2 rejects RENAME_EXCHANGE and unknown flags with EINVAL rather than silently doing a plain rename"
+check_output "$LOG" "M17-SMOKE: ok renameat2-plain" "M17 renameat2 with no flags is still an ordinary rename"
 check_output "$LOG" "M17-SMOKE: done" "M17 smoke completes successfully"
 
 # ── M8 AIO / completion queues ──
@@ -1274,6 +1277,9 @@ check_output "$LOG" "MM-SMOKE: ok copyout-readonly" "a syscall asked to write in
 check_output "$LOG" "MM-SMOKE: ok file-map-privacy" "a store into a MAP_PRIVATE file page the process never faulted itself stays out of the file, and the same store through MAP_SHARED reaches it (the pages a read fault maps AROUND itself come straight from the page cache, so the protection they are installed with decides whether one process's writes are served to the next)"
 check_output "$LOG" "MM-SMOKE: ok rseq-after-sigkill" "a task SIGKILLed while it holds an rseq(2) registration gives it back, so a later process can still register (glibc registers one per thread and treats a refusal as fatal, so a leaked entry kills programs rather than slowing them)"
 check_output "$LOG" "MM-SMOKE: ok mmap-after-sigkill" "a task SIGKILLed inside mmap hands back the address-space lock, so unrelated processes can still map memory (a leaked slot blocks every process hashing to it, for ever, with no error and no panic)"
+check_output "$LOG" "MM-SMOKE: ok wx-data-noexec" "W^X: an anonymous PROT_READ|PROT_WRITE mapping is not executable — jumping into it raises SIGSEGV"
+check_output "$LOG" "MM-SMOKE: ok wx-exec-after-mprotect" "W^X: mprotect(PROT_READ|PROT_EXEC) still grants execute, so the JIT flip every runtime performs keeps working"
+check_output "$LOG" "MM-SMOKE: ok wx-text-readonly" "W^X: a process's own .text is not writable"
 check_output "$LOG" "MM-SMOKE: done" "MM smoke completes"
 
 # ── M40 Linux ABI compatibility (x86_64 only: it runs a Linux x86_64 ELF) ──
@@ -2102,6 +2108,10 @@ check_output "$LOG" "M46-SMOKE: ok setpgid-eperm-pgrp" "setpgid into a nonexiste
 check_output "$LOG" "M46-SMOKE: ok getpgid" "getpgid(0) matches getpgrp()"
 check_output "$LOG" "M46-SMOKE: ok getpgid-esrch" "getpgid on a nonexistent pid returns ESRCH"
 check_output "$LOG" "M46-SMOKE: ok nice-roundtrip" "nice() and getpriority() round-trip"
+check_output "$LOG" "M46-SCHED: ok stride-values" "the nice weighting is the stride it promises: -20 = 25, 0 = 50, 19 = 1000 (checked in-kernel, where the numbers are, not inferred from how often processes ran)"
+check_output "$LOG" "M46-SCHED: ok stride-clamped" "a nice value outside -20..19 clamps instead of dividing by zero or going negative"
+check_output "$LOG" "M46-SCHED: ok stride-monotonic" "a higher nice is never scheduled more often, at every step of the range"
+check_output "$LOG" "M46-SCHED: ok stride-selection" "running the smallest pass and advancing it by that task's stride picks nice -20 exactly twice as often as nice 0"
 check_output "$LOG" "M46-SMOKE: ok fork-sigmask" "fork child inherits the blocked-signal mask"
 check_output "$LOG" "M46-SMOKE: ok append-atomic" "concurrent O_APPEND writers never overwrite each other"
 check_output "$LOG" "M46-SMOKE: ok truncate-zeros" "shrink-then-grow truncate reads back zeros"
@@ -2420,15 +2430,15 @@ check_output "$LOG" "M96-SMOKE: ok lsmod" "lsmod's output agrees with /proc/modu
 check_output "$LOG" "M96-SMOKE: done" "M96 protocol-module and module-parameter suite completes"
 
 # ── M98: GNU-free in-guest build tools (bmake + samurai replaced GNU Make) ──
-check_output "$LOG" "M98-SMOKE: ok make-is-bmake" "/bin/make answers bmake's -V (GNU Make rejects it), so it is the BSD make"
-check_output "$LOG" "M98-SMOKE: ok make-not-gnu" "/bin/make identifies as something other than GNU Make"
-check_output "$LOG" "M98-SMOKE: ok make-build" "bmake parses a Makefile, expands a variable and runs the recipe that creates the target"
-check_output "$LOG" "M98-SMOKE: ok make-uptodate" "a second bmake run does not re-run the recipe (target newer than its prerequisites)"
-check_output "$LOG" "M98-SMOKE: ok samu-version" "/bin/samu reports the Ninja file-format version it implements"
-check_output "$LOG" "M98-SMOKE: ok ninja-alias" "/bin/ninja is the samurai binary and runs"
-check_output "$LOG" "M98-SMOKE: ok samu-build" "samurai executes a build.ninja edge and produces the declared output"
-check_output "$LOG" "M98-SMOKE: ok samu-uptodate" "re-running a satisfied build graph is a no-op"
-check_output "$LOG" "M98-SMOKE: done" "M98 GNU-free build-tool suite completes"
+check_output "$LOG" "M97-TOOLS: ok make-is-bmake" "/bin/make answers bmake's -V (GNU Make rejects it), so it is the BSD make"
+check_output "$LOG" "M97-TOOLS: ok make-not-gnu" "/bin/make identifies as something other than GNU Make"
+check_output "$LOG" "M97-TOOLS: ok make-build" "bmake parses a Makefile, expands a variable and runs the recipe that creates the target"
+check_output "$LOG" "M97-TOOLS: ok make-uptodate" "a second bmake run does not re-run the recipe (target newer than its prerequisites)"
+check_output "$LOG" "M97-TOOLS: ok samu-version" "/bin/samu reports the Ninja file-format version it implements"
+check_output "$LOG" "M97-TOOLS: ok ninja-alias" "/bin/ninja is the samurai binary and runs"
+check_output "$LOG" "M97-TOOLS: ok samu-build" "samurai executes a build.ninja edge and produces the declared output"
+check_output "$LOG" "M97-TOOLS: ok samu-uptodate" "re-running a satisfied build graph is a no-op"
+check_output "$LOG" "M97-TOOLS: done" "M98 GNU-free build-tool suite completes"
 # ── M104: Linux-PAM (real libpam.so.0 + pam_unix.so authenticating against
 # /etc/shadow via musl crypt(3)) — userspace/bin/smoke/m104_pam_smoke.c.
 check_output "$LOG" "M104-PAM: ok libpam-linked" "libpam loaded and its API is callable"
@@ -2695,6 +2705,14 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M98-DRV-SMOKE: ok wbinvd-fallback" "M98: the CLFLUSH-less wbinvd path runs and a completed store survives it"
 	check_output "$LOG" "M98-DRV-SMOKE: ok msi-delivery" "M98: an MSI-X message the NVMe controller raises is delivered to the vector the driver owns"
 	check_output "$LOG" "nvme: MSI-X completions on vector" "M98: NVMe drives its completions over MSI-X, not the legacy INTx line"
+
+	# ── Wall clock: civil-date conversion, known answers ──
+	check_output "$LOG" "M118-RTC: ok epoch" "the RTC conversion places 1970-01-01T00:00:00Z at 0"
+	check_output "$LOG" "M118-RTC: ok billennium" "a mid-range date converts exactly (2001-09-09T01:46:40Z = 1e9)"
+	check_output "$LOG" "M118-RTC: ok leap-2000" "2000 is a leap year (the 400-year rule), so Feb 29 exists"
+	check_output "$LOG" "M118-RTC: ok leap-year-january" "January of a leap year is not shifted a day (the old estimate was)"
+	check_output "$LOG" "M118-RTC: ok leap-2024" "Feb 29 of an ordinary leap year converts exactly"
+	check_output "$LOG" "M118-RTC: ok century-2100" "2100 is NOT a leap year (the 100-year rule)"
 
 	# ── M99: linuxkpi compatibility layer (in-kernel) ──
 	check_output "$LOG" "M99-SMOKE: ok idr" "M99: idr allocates unique ids, looks up the exact pointers, and reuses freed ids"

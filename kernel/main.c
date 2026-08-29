@@ -1077,6 +1077,11 @@ void kernel_main(usize arg0, usize arg1)
 		 * stolen memory) and the netconsole UDP log path. */
 		memtype_selftest();
 		pci_selftest();
+		/* The wall clock's civil-date conversion, against known answers. */
+		rtc_selftest();
+		/* The nice/stride weighting, where the numbers live: the M46
+		 * userspace test can only observe the bias statistically. */
+		sched_nice_selftest();
 		netconsole_selftest();
 		/* M32 IPv6 self-tests: loopback (::1) ICMPv6 + MLD, and real-link
 		 * SLAAC + ping over QEMU usernet.  Both were in kernel/user/

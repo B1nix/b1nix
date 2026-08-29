@@ -1700,6 +1700,9 @@ void x86_exception_handler(struct interrupt_frame *frame) {
 
 extern char __kernel_text_start[];
 extern char __kernel_text_end[];
+/* .boot: the low-address entry stub, bounds from the linker script. */
+extern char __boot_start[];
+extern char __boot_end[];
 
 static int addr_is_kernel_text(u64 addr) {
   /* The kernel is linked higher-half (KERNEL_VMA), so its .text lives at
@@ -1707,13 +1710,24 @@ static int addr_is_kernel_text(u64 addr) {
    * matched the pre-relocation .boot stub, which is why every supervisor-mode
    * fault printed an EMPTY "fault-stack callers:" line and resolved every
    * address to long_mode_low. Use the linker-provided bounds instead.
-   * The low window is kept for the .boot stub, and the 0x2000000-0x3000000
-   * userspace window for backtracing non-PIE user binaries. */
+   *
+   * The .boot stub is the one piece of kernel code that executes at its LOW
+   * physical address (32-bit protected mode, paging off), so a return address
+   * captured there is low. Its extent comes from the linker too — the window
+   * used to be written out as 0x100000-0x200000, which is the load address
+   * plus a guess at the size.
+   *
+   * A user address is NOT kernel text and never belonged here: this predicate
+   * gates the kernel backtrace and the fault-stack scan, both of which
+   * symbolicate through kallsyms. A leftover userspace value on the kernel
+   * stack that happened to land in the old 0x2000000-0x3000000 window was
+   * printed as a kernel frame and resolved to whatever kernel symbol precedes
+   * it. Ring-3 frames have their own walker (arch_user_backtrace below), which
+   * reads the faulting task's own mappings rather than a fixed window. */
   if ((u64)(usize)__kernel_text_start && addr >= (u64)(usize)__kernel_text_start &&
       addr < (u64)(usize)__kernel_text_end)
     return 1;
-  return (addr >= 0x100000ULL && addr <= 0x200000ULL) ||
-         (addr >= 0x2000000ULL && addr <= 0x3000000ULL);
+  return addr >= (u64)(usize)__boot_start && addr < (u64)(usize)__boot_end;
 }
 
 /* A frame pointer is safe to dereference only if it is canonical and lands in a

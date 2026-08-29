@@ -287,6 +287,30 @@ static int  g_task_execed[MAX_TASKS];
 /* POSIX nice value (-20..19, 0 default) — see scheduler_set_priority for why
  * this is NOT task->priority. Inherited across fork. */
 static int  g_task_nice[MAX_TASKS];
+
+/* Stride for one nice value: how far a task's pass advances each time it gives
+ * the CPU up. The scheduler then always picks the smallest pass among equal
+ * priorities, so a task with a smaller stride comes up more often — the whole
+ * of what nice means here.
+ *
+ * Tickets are 20 - nice, so nice -20 buys 40 tickets and nice 19 buys one; the
+ * stride is the reciprocal scaled by 1000. Out-of-range values clamp rather
+ * than divide by zero or go negative.
+ *
+ * Extracted from schedule() so the contract can be tested directly. From ring 3
+ * it can only be inferred from how often each of several spinning processes got
+ * to run, which is a statistical argument about a loaded machine — the M46
+ * userspace test makes it, and it cannot say whether a particular nice value
+ * produced the stride it should. */
+int sched_stride_for_nice(int nice) {
+  if (nice < -20) nice = -20;
+  if (nice > 19) nice = 19;
+
+  int tickets = 20 - nice;
+
+  return 1000 / tickets;
+}
+
 static struct rlimit g_task_rlimits[MAX_TASKS][16];
 static usize g_task_tgid[MAX_TASKS];
 /* How far into exit a task has got.
@@ -3335,11 +3359,7 @@ int scheduler_yield(void) {
   if (old_task->state == TASK_RUNNING) {
     /* Stride Scheduler: increment pass of yielding task by its stride */
     usize old_idx = task_index(old_task);
-    int nice = g_task_nice[old_idx];
-    if (nice < -20) nice = -20;
-    if (nice > 19) nice = 19;
-    int tickets = 20 - nice;
-    int stride = 1000 / tickets;
+    int stride = sched_stride_for_nice(g_task_nice[old_idx]);
     g_task_pass[old_idx] += stride;
 
     /* M28 T4: claim the kernel stack BEFORE publishing state=READY. Under T4
@@ -7805,4 +7825,99 @@ int scheduler_consume_pending_signal(int sig) {
   u64 prev = __atomic_fetch_and(&current_task->pending_signals, ~bit,
                                 __ATOMIC_ACQ_REL);
   return (prev & bit) ? 1 : 0;
+}
+
+/* ── Nice / stride contract, checked in test mode ────────────────────────────
+ *
+ * The userspace half of this (M46's nice-biasing test) forks spinning workers
+ * at nice -20 and 19 and compares how many iterations each completed. That is
+ * the right test for "does nice change behaviour", and the wrong instrument for
+ * "does nice produce the weighting it promises": it measures a loaded machine
+ * over a 250 ms window, so it can tell a bias from no bias and little else.
+ * Where it wanted more, it read /proc/b1nix-tasks and dropped the bytes on the
+ * floor — the file prints the scheduler's dump to the console, so the values
+ * went to the log and no assertion was ever made about them.
+ *
+ * These checks are made where the numbers live. Nothing here touches the live
+ * runqueue: the selection rule is replayed against the same stride function the
+ * scheduler uses, which is what makes the expected counts exact rather than
+ * statistical. */
+void sched_nice_selftest(void) {
+  /* 1. The stride each nice value buys, at both ends and the default. */
+  {
+    int s_min = sched_stride_for_nice(-20); /* 40 tickets */
+    int s_def = sched_stride_for_nice(0);   /* 20 tickets */
+    int s_max = sched_stride_for_nice(19);  /* 1 ticket   */
+
+    if (s_min == 25 && s_def == 50 && s_max == 1000) {
+      console_write("M46-SCHED: ok stride-values\n");
+    } else {
+      console_write("M46-SCHED: FAIL stride-values -20=");
+      console_write_dec((u64)s_min);
+      console_write(" 0=");
+      console_write_dec((u64)s_def);
+      console_write(" 19=");
+      console_write_dec((u64)s_max);
+      console_write("\n");
+    }
+  }
+
+  /* 2. Out-of-range nice clamps instead of dividing by zero or going negative.
+   * setpriority(2) clamps at the syscall, so these values reach the scheduler
+   * only through a kernel-internal caller — which is exactly the caller no
+   * userspace test can stand in for. */
+  {
+    int lo = sched_stride_for_nice(-1000);
+    int hi = sched_stride_for_nice(1000);
+
+    if (lo == sched_stride_for_nice(-20) && hi == sched_stride_for_nice(19))
+      console_write("M46-SCHED: ok stride-clamped\n");
+    else
+      console_write("M46-SCHED: FAIL stride-clamped\n");
+  }
+
+  /* 3. Monotonicity: a higher nice is never scheduled more often. Every
+   * adjacent pair, so a sign error anywhere in the range is caught rather than
+   * just at the ends. */
+  {
+    int ok = 1;
+
+    for (int n = -20; n < 19; n++) {
+      if (sched_stride_for_nice(n) > sched_stride_for_nice(n + 1)) {
+        ok = 0;
+        break;
+      }
+    }
+    if (ok)
+      console_write("M46-SCHED: ok stride-monotonic\n");
+    else
+      console_write("M46-SCHED: FAIL stride-monotonic\n");
+  }
+
+  /* 4. The rule the strides feed: always run the smallest pass, then advance it
+   * by that task's stride. Replayed here for two tasks at nice -20 and nice 0,
+   * whose strides are 25 and 50 — so over any run the nicer-to-others task must
+   * be picked exactly twice as often. The scheduler's own pick adds priority
+   * ordering and runnability on top; the weighting between equals is this. */
+  {
+    u64 pass[2] = {0, 0};
+    int stride[2] = {sched_stride_for_nice(-20), sched_stride_for_nice(0)};
+    unsigned picks[2] = {0, 0};
+
+    for (unsigned i = 0; i < 300; i++) {
+      int win = (pass[1] < pass[0]) ? 1 : 0; /* ties go to the first, as the
+                                              * scheduler's strict < does */
+      picks[win]++;
+      pass[win] += (u64)stride[win];
+    }
+    if (picks[0] == 2 * picks[1]) {
+      console_write("M46-SCHED: ok stride-selection\n");
+    } else {
+      console_write("M46-SCHED: FAIL stride-selection high=");
+      console_write_dec((u64)picks[0]);
+      console_write(" low=");
+      console_write_dec((u64)picks[1]);
+      console_write("\n");
+    }
+  }
 }

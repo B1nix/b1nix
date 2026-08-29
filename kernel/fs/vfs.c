@@ -45,7 +45,25 @@
 #include <string.h>
 
 /* VFS_NODE_OWNS_DATA now lives in <b1nix/vfs.h> so other filesystems can use it. */
-#define MAX_FILE_SIZE (1024 * 1024 * 1024) /* 1 GB limit for now */
+
+/* Ceiling on an in-memory file (tmpfs/ramfs-style nodes, whose data lives in
+ * the kernel heap and doubles as it grows). It used to be a flat 1 GB "for
+ * now", which is both too large for a small machine — a single file could take
+ * the whole of a 512 MiB guest before anything else noticed — and arbitrarily
+ * small for a large one.
+ *
+ * The real constraint is RAM, so that is what it is derived from: half of
+ * usable physical memory, so one file cannot starve everything else, with a
+ * floor that keeps small guests usable. Disk-backed files do not come through
+ * here at all; their size limit is their filesystem's. */
+#define MAX_INMEMORY_FILE_FLOOR (64ull * 1024 * 1024)
+
+static u64 max_inmemory_file_size(void) {
+  u64 ram = pmm_total_usable_memory();
+  u64 half = ram / 2;
+
+  return half > MAX_INMEMORY_FILE_FLOOR ? half : MAX_INMEMORY_FILE_FLOOR;
+}
 
 /* VFS time update masks */
 #define VFS_ATIME 0x01
@@ -3988,7 +4006,7 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
       if (posp) *posp += (usize)res; else h->offset += (usize)res;
     }
   } else if (node->inode->type == VFS_FILE) {
-    if (offset + size > MAX_FILE_SIZE) {
+    if (offset + size > max_inmemory_file_size()) {
       vfs_inode_unlock(node->inode);
       vfs_node_put(node);
       return -EFBIG;
@@ -7291,7 +7309,12 @@ int vfs_ftruncate(int fd, u64 length) {
     return -EPERM;
   }
 
-  if (length > MAX_FILE_SIZE) {
+  /* Only an in-memory file is bounded here — one that has no filesystem of its
+   * own behind it, so its bytes are kernel heap. A disk-backed file's limit is
+   * its filesystem's business, and capping it against RAM would refuse a
+   * perfectly legal ftruncate on ext4. */
+  if (!inode->truncate_cb && !inode->write_cb &&
+      length > max_inmemory_file_size()) {
     vfs_inode_unlock(inode);
     return -EFBIG;
   }

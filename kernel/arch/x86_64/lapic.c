@@ -7,6 +7,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/runqueue.h>
 #include <b1nix/acpi.h>
+#include <b1nix/ktime.h>
 #include <string.h>
 
 /* Cleared at boot; the BSP sets it after the SMP self-test so APs leave the
@@ -637,6 +638,35 @@ u64 ap_stack_peak(u64 *total_out) {
   return worst;
 }
 
+/* INIT must stay asserted for 10 ms (Intel SDM, universal start-up algorithm),
+ * and a CPU that is going to answer a SIPI does so in well under a millisecond
+ * — 100 ms is a generous ceiling that keeps a machine with a candidate APIC ID
+ * that does not exist (the no-ACPI path guesses those) from spending seconds
+ * per miss. */
+#define SMP_INIT_HOLD_NS  (10ull * 1000 * 1000)
+#define SMP_SIPI_WAIT_NS  (100ull * 1000 * 1000)
+
+static void smp_delay_ns(u64 ns) {
+    u64 deadline = ktime_monotonic_ns() + ns;
+
+    while (ktime_monotonic_ns() < deadline)
+        __asm__ volatile("pause");
+}
+
+/* Poll the trampoline's ready flag until it is set or the deadline passes.
+ * Returns 1 if the AP reported in. */
+static int smp_wait_ready(u64 flag_addr, u64 timeout_ns) {
+    u64 deadline = ktime_monotonic_ns() + timeout_ns;
+
+    do {
+        if (*(volatile u32 *)(usize)flag_addr)
+            return 1;
+        __asm__ volatile("pause");
+    } while (ktime_monotonic_ns() < deadline);
+
+    return *(volatile u32 *)(usize)flag_addr ? 1 : 0;
+}
+
 /* Bring up Application Processors.
  * Returns number of CPUs successfully brought up (including BSP). */
 int smp_boot_aps(void) {
@@ -665,6 +695,12 @@ int smp_boot_aps(void) {
     u32 bsp_apic = lapic_id();
     u32 ap_apic_ids[MAX_CPUS];
     u32 ap_to_bring_up = 0;
+    /* How many CPUs this machine is believed to have, when that is known
+     * independently of the candidate list. The no-ACPI path probes more
+     * candidates than there are CPUs (it cannot know which APIC IDs are real),
+     * and each candidate that never answers costs two SIPI timeouts — so the
+     * bring-up loop stops as soon as this many CPUs are online. */
+    u32 expected_cpus = 0;
 
     if (acpi_ready() && acpi_cpu_count() > 0) {
         int total = acpi_cpu_count();
@@ -715,15 +751,56 @@ int smp_boot_aps(void) {
             }
         }
         if (cpu_count > MAX_CPUS) cpu_count = MAX_CPUS;
+        expected_cpus = cpu_count;
         console_write("smp: CPUID reports ");
         console_write_dec(cpu_count);
         console_write(" logical processors (ACPI absent)\n");
 
-        /* Assume APIC IDs are 0..cpu_count-1 (true on QEMU and most desktops). */
-        for (u32 id = 0; id < cpu_count && ap_to_bring_up < MAX_CPUS - 1; id++) {
+        /* Candidate APIC IDs, spaced the way this CPU's topology actually
+         * numbers them rather than assumed to be 0..cpu_count-1.
+         *
+         * An APIC ID is a packed field: the low `smt_shift` bits select the
+         * thread within a core, the next `core_shift - smt_shift` bits the core
+         * within a package, and the rest the package. Leaf 0x0B reports each
+         * level's shift width in EAX[4:0]. When every thread is enabled the IDs
+         * do come out contiguous — which is why the old assumption held on QEMU
+         * — but they are sparse the moment a level is partly populated: with
+         * SMT disabled in firmware, a 4-core part answers on 0, 2, 4, 6 and the
+         * contiguous list asked for 1, 2, 3, missing two real CPUs and probing
+         * two that do not exist.
+         *
+         * Both spacings are tried, closest-first, and the list is bounded: a
+         * candidate that is not there simply fails to set the trampoline's
+         * ready flag and is skipped by the bring-up loop below, so a wrong
+         * guess costs time, never correctness. */
+        u32 smt_shift = 0;
+        if (max_leaf >= 0x0B) {
+            u32 eax, ebx, ecx, edx;
+            __asm__ volatile("cpuid"
+                             : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                             : "a"(0x0B), "c"(0));
+            if (((ecx >> 8) & 0xFF) == 1) /* level type 1 = SMT */
+                smt_shift = eax & 0x1F;
+        }
+        u32 stride = 1u << smt_shift;
+        u32 max_id = cpu_count * stride;
+        if (max_id > 256) max_id = 256;
+
+        for (u32 id = 0; id < max_id && ap_to_bring_up < MAX_CPUS - 1; id++) {
             if (id == bsp_apic) continue;
+            /* Contiguous IDs first (every thread enabled), then the stride-
+             * spaced ones a partly-populated SMT level produces. Skipping the
+             * duplicates keeps the list to at most cpu_count-1 entries when the
+             * two spacings agree, i.e. stride == 1. */
+            if (stride > 1 && (id % stride) != 0 && id >= cpu_count)
+                continue;
             ap_apic_ids[ap_to_bring_up++] = id;
         }
+        console_write("smp: APIC ID stride ");
+        console_write_dec(stride);
+        console_write(", ");
+        console_write_dec(ap_to_bring_up);
+        console_write(" candidates to probe\n");
     }
 
     /* If only BSP, nothing to do */
@@ -736,6 +813,8 @@ int smp_boot_aps(void) {
      * order APs successfully come online; apic_id is the firmware-discovered
      * physical APIC ID (the value the LAPIC ICR/MMIO actually wants). */
     for (u32 i = 0; i < ap_to_bring_up; i++) {
+        if (expected_cpus && (u32)(ap_count + 1) >= expected_cpus)
+            break; /* every CPU this machine has is up; the rest are guesses */
         u32 apic_id = ap_apic_ids[i];
         int cpu_id = (int)(i + 1);
         console_write("smp: bringing up AP apic_id=");
@@ -780,10 +859,19 @@ int smp_boot_aps(void) {
         /* Setup trampoline at 0x8000 */
         smp_setup_trampoline(pml4_phys, stack_top, (u64)(usize)pcpu, cpu_id);
 
-        /* Step 1: Send INIT IPI */
+        /* Step 1: Send INIT IPI, then hold it asserted for the 10 ms the
+         * Intel MP spec's universal start-up algorithm requires.
+         *
+         * The hold and both waits below used to be `for (volatile int i = 0;
+         * i < 5000000; i++) pause` — a number with no unit, whose real
+         * duration depended on the host's clock and on how the compiler felt
+         * about the loop. Same class of defect M118 removed from the drivers.
+         * The monotonic clock is calibrated long before smp_boot_aps runs
+         * (lapic_init hands it to the TSC at main.c), so these are real
+         * durations. */
         console_write("smp: sending INIT...\n");
         lapic_send_ipi(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL_ASSERT | LAPIC_ICR_TRIGGER_LEVEL);
-        for (volatile int i = 0; i < 5000000; i++) __asm__ volatile("pause");
+        smp_delay_ns(SMP_INIT_HOLD_NS);
         lapic_send_ipi(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL_DEASSERT | LAPIC_ICR_TRIGGER_LEVEL);
 
         /* Step 2: Send SIPI. The start-up vector is the trampoline page number:
@@ -795,29 +883,23 @@ int smp_boot_aps(void) {
 
         /* Wait for ready flag */
         u64 tv = 0xFFFF800000000000ULL + 0x8000;
-        for (volatile int wait = 0; wait < 50000000; wait++) {
-            if (*(volatile u32 *)(tv + TRAMP_READY_OFF)) {
-                console_write("smp: AP ");
-                console_write_dec(apic_id);
-                console_write(" ready!\n");
-                ap_count++;
-                goto ap_done;
-            }
-            __asm__ volatile("pause");
+        if (smp_wait_ready(tv + TRAMP_READY_OFF, SMP_SIPI_WAIT_NS)) {
+            console_write("smp: AP ");
+            console_write_dec(apic_id);
+            console_write(" ready!\n");
+            ap_count++;
+            goto ap_done;
         }
 
         /* If first SIPI didn't work, try a second */
         console_write("smp: retrying SIPI...\n");
         lapic_send_ipi(apic_id, LAPIC_ICR_STARTUP | 0x08);
-        for (volatile int wait = 0; wait < 50000000; wait++) {
-            if (*(volatile u32 *)(tv + TRAMP_READY_OFF)) {
-                console_write("smp: AP ");
-                console_write_dec(apic_id);
-                console_write(" ready!\n");
-                ap_count++;
-                goto ap_done;
-            }
-            __asm__ volatile("pause");
+        if (smp_wait_ready(tv + TRAMP_READY_OFF, SMP_SIPI_WAIT_NS)) {
+            console_write("smp: AP ");
+            console_write_dec(apic_id);
+            console_write(" ready!\n");
+            ap_count++;
+            goto ap_done;
         }
 
         console_write("smp: AP failed to start\n");

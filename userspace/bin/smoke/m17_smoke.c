@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/syscall.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -275,6 +276,98 @@ int main(void) {
 
     (void)unlink(link);
     (void)unlink(target);
+  }
+
+  /* renameat2 flags. The kernel used to accept the flag word and ignore it,
+   * running a plain rename: a caller asking NOT to clobber the destination was
+   * told the rename succeeded, having just destroyed the file it was
+   * protecting. NOREPLACE must refuse with EEXIST, and a flag this kernel
+   * cannot honour atomically must say so with EINVAL rather than pretend. */
+  {
+    const char *src = "/tmp/m17_r2_src";
+    const char *dst = "/tmp/m17_r2_dst";
+    int fd = open(src, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+
+    if (fd < 0) {
+      fail_marker("renameat2-setup", errno, 0);
+      return 1;
+    }
+    (void)write(fd, "src", 3);
+    (void)close(fd);
+
+    fd = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+      fail_marker("renameat2-setup-dst", errno, 0);
+      return 1;
+    }
+    (void)write(fd, "dst", 3);
+    (void)close(fd);
+
+    /* 1 = RENAME_NOREPLACE: destination exists, so this must fail with EEXIST
+     * and leave both files alone. */
+    errno = 0;
+    long rc = syscall(SYS_renameat2, AT_FDCWD, src, AT_FDCWD, dst, 1u);
+    if (rc != -1 || errno != EEXIST) {
+      fail_marker("renameat2-noreplace", errno, EEXIST);
+      return 1;
+    }
+
+    /* The refusal must have been a refusal: the source is still there and the
+     * destination still holds its own bytes. */
+    char buf[8];
+    fd = open(dst, O_RDONLY);
+    if (fd < 0) {
+      fail_marker("renameat2-dst-gone", errno, 0);
+      return 1;
+    }
+    ssize_t n = read(fd, buf, sizeof(buf));
+    (void)close(fd);
+    if (n != 3 || memcmp(buf, "dst", 3) != 0) {
+      fail_marker("renameat2-dst-clobbered", (int)n, 3);
+      return 1;
+    }
+    if (access(src, F_OK) != 0) {
+      fail_marker("renameat2-src-gone", errno, 0);
+      return 1;
+    }
+    marker("M17-SMOKE: ok renameat2-noreplace");
+
+    /* 2 = RENAME_EXCHANGE: not implementable atomically here, so EINVAL —
+     * which is what makes a caller fall back instead of trusting a swap that
+     * never happened. */
+    errno = 0;
+    rc = syscall(SYS_renameat2, AT_FDCWD, src, AT_FDCWD, dst, 2u);
+    if (rc != -1 || errno != EINVAL) {
+      fail_marker("renameat2-exchange", errno, EINVAL);
+      return 1;
+    }
+    /* An unknown flag is EINVAL too, not a silent plain rename. */
+    errno = 0;
+    rc = syscall(SYS_renameat2, AT_FDCWD, src, AT_FDCWD, dst, 0x40u);
+    if (rc != -1 || errno != EINVAL) {
+      fail_marker("renameat2-unknown-flag", errno, EINVAL);
+      return 1;
+    }
+    marker("M17-SMOKE: ok renameat2-einval");
+
+    /* With no flags it is an ordinary rename, and must still work. */
+    if (syscall(SYS_renameat2, AT_FDCWD, src, AT_FDCWD, dst, 0u) != 0) {
+      fail_marker("renameat2-plain", errno, 0);
+      return 1;
+    }
+    fd = open(dst, O_RDONLY);
+    if (fd < 0) {
+      fail_marker("renameat2-plain-open", errno, 0);
+      return 1;
+    }
+    n = read(fd, buf, sizeof(buf));
+    (void)close(fd);
+    if (n != 3 || memcmp(buf, "src", 3) != 0) {
+      fail_marker("renameat2-plain-content", (int)n, 3);
+      return 1;
+    }
+    marker("M17-SMOKE: ok renameat2-plain");
+    (void)unlink(dst);
   }
 
   marker("M17-SMOKE: done");

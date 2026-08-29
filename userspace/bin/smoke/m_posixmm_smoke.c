@@ -15,6 +15,9 @@
  *   MM-SMOKE: ok file-map-privacy
  *   MM-SMOKE: ok rseq-after-sigkill
  *   MM-SMOKE: ok mmap-after-sigkill
+ *   MM-SMOKE: ok wx-data-noexec
+ *   MM-SMOKE: ok wx-exec-after-mprotect
+ *   MM-SMOKE: ok wx-text-readonly
  *   MM-SMOKE: done
  */
 #include <signal.h>
@@ -770,6 +773,103 @@ static int test_rseq_after_sigkill(void)
 	return 0;
 }
 
+/* ---- W^X: a mapping is executable only if it asked to be ----------------
+ *
+ * Every userspace page used to be mapped RWX no matter what PROT_* the caller
+ * passed: mmap and mprotect translated PROT_WRITE and nothing else, and the
+ * ELF loader recorded every segment as RWX outright. NX was implemented and
+ * used for MMIO and module images, so the bit worked — no process page ever
+ * carried it.
+ *
+ * Each half runs in a child, because the passing outcome is a fatal signal. */
+
+/* `ret` — the shortest thing that proves control reached the buffer. */
+#define RET_OPCODE 0xC3
+
+static int child_status(int (*body)(void *), void *arg) {
+	pid_t pid = fork();
+
+	if (pid < 0)
+		return -1;
+	if (pid == 0)
+		_exit(body(arg) & 0x7F);
+
+	int status = 0;
+	if (waitpid(pid, &status, 0) != pid)
+		return -1;
+	return status;
+}
+
+static int child_call_buffer(void *p) {
+	void (*fn)(void) = (void (*)(void))p;
+
+	fn();
+	return 42; /* reached only if the page really was executable */
+}
+
+static int child_write_text(void *p) {
+	volatile unsigned char *code = (volatile unsigned char *)p;
+
+	*code = RET_OPCODE;
+	return 42; /* reached only if the text page really was writable */
+}
+
+/* A data mapping (PROT_READ|PROT_WRITE) must not be executable. */
+static int test_wx_data_noexec(void) {
+	size_t len = 4096;
+	unsigned char *p = mmap(0, len, PROT_READ | PROT_WRITE,
+	                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	if (p == MAP_FAILED)
+		return 1;
+	p[0] = RET_OPCODE;
+
+	int status = child_status(child_call_buffer, p);
+
+	munmap(p, len);
+	if (status < 0)
+		return 2;
+	if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGSEGV)
+		return 3; /* it ran, or died some other way */
+	return 0;
+}
+
+/* ...and mprotect must still be able to grant execute, dropping write: that is
+ * the W^X flip every JIT performs, and breaking it would break V8 and rustc. */
+static int test_wx_exec_after_mprotect(void) {
+	size_t len = 4096;
+	unsigned char *p = mmap(0, len, PROT_READ | PROT_WRITE,
+	                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	if (p == MAP_FAILED)
+		return 1;
+	p[0] = RET_OPCODE;
+	if (mprotect(p, len, PROT_READ | PROT_EXEC) != 0) {
+		munmap(p, len);
+		return 2;
+	}
+
+	int status = child_status(child_call_buffer, p);
+
+	munmap(p, len);
+	if (status < 0)
+		return 3;
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 42)
+		return 4; /* the call did not return normally */
+	return 0;
+}
+
+/* This program's own .text must not be writable. */
+static int test_wx_text_readonly(void) {
+	int status = child_status(child_write_text, (void *)(uintptr_t)&marker);
+
+	if (status < 0)
+		return 1;
+	if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGSEGV)
+		return 2;
+	return 0;
+}
+
 int main(void) {
 	marker("MM-SMOKE: start\n");
 
@@ -856,6 +956,27 @@ int main(void) {
 		return 100 + rc;
 	}
 	marker("MM-SMOKE: ok mmap-after-sigkill\n");
+
+	rc = test_wx_data_noexec();
+	if (rc != 0) {
+		marker("MM-SMOKE: fail wx-data-noexec\n");
+		return 130 + rc;
+	}
+	marker("MM-SMOKE: ok wx-data-noexec\n");
+
+	rc = test_wx_exec_after_mprotect();
+	if (rc != 0) {
+		marker("MM-SMOKE: fail wx-exec-after-mprotect\n");
+		return 140 + rc;
+	}
+	marker("MM-SMOKE: ok wx-exec-after-mprotect\n");
+
+	rc = test_wx_text_readonly();
+	if (rc != 0) {
+		marker("MM-SMOKE: fail wx-text-readonly\n");
+		return 150 + rc;
+	}
+	marker("MM-SMOKE: ok wx-text-readonly\n");
 
 	marker("MM-SMOKE: done\n");
 	return 0;
