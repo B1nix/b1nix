@@ -212,5 +212,24 @@ if [ "$SMOKE_SYS" = "1" ]; then
     done
 fi
 
+# Where the run's CPU time went, sampled by the timer tick on every core
+# (kernel/lib/kprof.c). Reading /proc/b1nix-prof is what prints it -- the
+# counters are kept all along and nothing else in the tree asks for them, so
+# they were collected every run and read none. The user/kernel/idle
+# distribution costs one increment per tick and is always on; the per-function
+# histogram needs b1nix.sysprof on the kernel command line.
+# Not guarded by [ -r ]: that test was false here (the node is a VFS_DEVICE)
+# and the read silently did not happen, which looks exactly like a profile of
+# zero. Let a missing file say so instead.
+cat /proc/b1nix-prof || echo "SMOKE: /proc/b1nix-prof unreadable — no CPU profile"
+
 echo "B1NIX-TEST: done"
+
+# Powering off is how a QEMU instance ends: the host has the serial log already,
+# so there is nothing left to read on the guest. A board whose only console is
+# its own panel is the opposite case — switching it off is what destroys the
+# results. `b1nix.keep-running` leaves the machine up with the last screenful of
+# markers still on it.
+grep -q 'b1nix.keep-running' /proc/cmdline 2>/dev/null && exit 0
+
 ( sleep 1; /bin/poweroff -f || /bin/halt -f || /sbin/openrc-shutdown --no-write --poweroff now ) &

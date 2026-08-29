@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -479,9 +480,22 @@ int netdev_set_admin_up(struct netdev *nd, int up)
 		return 0; /* already in the requested state */
 	nd->admin_down = up ? 0 : 1;
 
-	console_write("net: ");
-	console_write(nd->name);
-	console_write(up ? " administratively up\n" : " administratively down\n");
+	/* One call, not three.
+	 *
+	 * Interrupts are masked inside console_write but not BETWEEN calls, so a
+	 * record assembled from several of them can be cut in half by a handler
+	 * that prints -- and the tail then lands in the middle of somebody else's
+	 * line while the next line starts with no timestamp, because the console
+	 * believes it is still finishing this one. Six of these eight lines came
+	 * out unstamped for exactly that reason. A log record is a record: build
+	 * it, then write it. */
+	{
+		char line[96];
+
+		snprintf(line, sizeof(line), "net: %s administratively %s\n",
+		         nd->name, up ? "up" : "down");
+		console_write(line);
+	}
 
 	if (!up && nd == g_netdev) {
 		dhcp_stop();

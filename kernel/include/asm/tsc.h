@@ -6,9 +6,15 @@
  * clock in <linux/sched/clock.h> is far too coarse. */
 static inline u64 rdtsc(void)
 {
+#ifdef __aarch64__
+	u64 v;
+	__asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
+	return v;
+#else
 	u32 lo, hi;
 	__asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
 	return ((u64)hi << 32) | lo;
+#endif
 }
 
 /* The TSC's frequency in kHz, as b1nix calibrated it at boot. Zero would mean

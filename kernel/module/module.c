@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <b1nix/bootmark.h>
 
 /* ── ELF64 relocatable-object structures ─────────────────────────────────── */
 
@@ -1311,6 +1312,19 @@ static int module_resolve_alias(const char *alias, char *out, usize cap) {
   return found;
 }
 
+/* Bring-up tracing for the module loader.
+ *
+ * This kernel reaches its console through the framebuffer on a board with no
+ * serial port, so a line of text costs a full-screen scroll — but it carries a
+ * name, and a boot that stops inside a recursive loader needs to say WHICH
+ * module and WHICH step, which a single number cannot. Off unless the phone
+ * build asks for it. */
+#ifdef B1NIX_FB_BOOT_MARKERS
+#define MODTRACE(msg, arg) do { console_write(msg); console_write(arg); console_write("\n"); } while (0)
+#else
+#define MODTRACE(msg, arg) ((void)0)
+#endif
+
 int request_module(const char *name) {
   if (!name || !name[0])
     return -EINVAL;
@@ -1321,11 +1335,15 @@ int request_module(const char *name) {
   if (module_find(real))
     return 0;
 
+  MODTRACE("mod: request ", real);
+
   /* An alias only resolves when no module of that name exists. */
   char aliased[MODULE_NAME_MAX];
   char path[128];
   module_path_for(real, path, sizeof(path));
+  MODTRACE("mod: probe ", path);
   struct vfs_node *probe = vfs_find_node(path);
+  MODTRACE("mod: probed ", path);
   if (!probe || IS_ERR(probe)) {
     if (module_resolve_alias(real, aliased, sizeof(aliased)) == 0) {
       strncpy(real, aliased, sizeof(real) - 1);
@@ -1343,6 +1361,7 @@ int request_module(const char *name) {
   char deps[192];
   char depkey[MODULE_NAME_MAX + 4];
   snprintf(depkey, sizeof(depkey), "%s.ko", real);
+  MODTRACE("mod: deps ", depkey);
   if (module_lookup_line(MODULE_DIR "/modules.dep", depkey, deps,
                          sizeof(deps)) == 0) {
     char *p = deps;
@@ -1378,7 +1397,12 @@ int request_module(const char *name) {
   }
 
   module_path_for(real, path, sizeof(path));
-  return module_load_path(path, "");
+  MODTRACE("mod: load ", path);
+  {
+    int rc = module_load_path(path, "");
+    MODTRACE("mod: loaded ", real);
+    return rc;
+  }
 }
 
 /* ── boot-time bring-up ──────────────────────────────────────────────────── */
@@ -1393,6 +1417,9 @@ static const char *const module_boot_list[] = {
 void module_init_builtin_deps(void) {
   for (usize i = 0; i < sizeof(module_boot_list) / sizeof(module_boot_list[0]);
        i++) {
+    /* 60 + index, so a boot that stops in here names the module: 60 isofs,
+     * 61 ntfs, 62 btrfs, 63 hda, 64 ndp, 65 ipv6, 66 ntp. */
+    BOOTMARK(60 + (int)i);
     int rc = request_module(module_boot_list[i]);
     if (rc != 0 && rc != -EEXIST) {
       char buf[96];

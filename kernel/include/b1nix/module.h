@@ -31,7 +31,17 @@
  * and its frames are reserved in the pmm: giving it arbitrary frames would put
  * a second name on physical memory the allocator can also hand to somebody
  * else, which is exactly the aliasing that used to corrupt the kernel heap. */
-#define MODULE_REGION_BASE 0x41000000ULL
+/* Derived from where this kernel actually ended up, not written down.
+ *
+ * 0x41000000 was this constant for as long as the only arm64 board was QEMU
+ * virt, whose kernel links at 0x40080000 — so it really was "16 MiB above the
+ * load address", exactly as described. Linked for a board whose DRAM starts at
+ * 0x80000000 the same number is not above the kernel, it is not memory at all;
+ * and because this region is handed out IDENTITY-MAPPED, a module was written
+ * into nothing and then called there. Computing it from __kernel_end keeps the
+ * property the comment above actually depends on. */
+u64 module_region_base(void);
+#define MODULE_REGION_BASE module_region_base()
 #define MODULE_REGION_SIZE (16ULL * 1024ULL * 1024ULL)
 #else
 #define MODULE_REGION_BASE 0xFFFFFFFFC0000000ULL

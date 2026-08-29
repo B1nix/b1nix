@@ -165,6 +165,17 @@ struct page **shmem_alloc_pages(usize count)
 			return 0;
 		}
 	}
+	/* The allocator is free to hand out adjacent frames (the ARM64 per-CPU
+	 * cache commonly does exactly that).  Shmem's page-array contract is
+	 * intentionally independent of allocation order: callers must use the
+	 * page references, never infer a physical run from neighbouring entries.
+	 * Pairwise permutation preserves every allocation while making a run of
+	 * individually allocated frames visibly non-contiguous to such callers. */
+	for (usize i = 0; i + 1 < count; i += 2) {
+		struct page *tmp = pages[i];
+		pages[i] = pages[i + 1];
+		pages[i + 1] = tmp;
+	}
 	return pages;
 }
 

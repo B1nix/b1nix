@@ -56,6 +56,21 @@ static inline void interrupts_enable_and_wait(void) {
 #endif
 }
 
+/* Free-running cycle counter, for timing short intervals. x86_64's TSC and
+ * aarch64's virtual counter differ wildly in rate, so this is only ever valid
+ * for comparing two reads on the same machine — never as a unit of time. */
+static inline u64 arch_cycles(void) {
+#ifdef __aarch64__
+  u64 v;
+  __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
+  return v;
+#else
+  u32 lo, hi;
+  __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+  return ((u64)hi << 32) | lo;
+#endif
+}
+
 static inline int interrupts_enabled(void) {
 #ifdef __aarch64__
   u64 daif;

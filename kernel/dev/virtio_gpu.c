@@ -367,7 +367,7 @@ static inline u64 gpu_rdtsc(void)
 {
 #if defined(__x86_64__)
     u32 lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    { u64 c_ = arch_cycles(); lo = (u32)c_; hi = (u32)(c_ >> 32); }
     return ((u64)hi << 32) | lo;
 #elif defined(__aarch64__)
     u64 val;
@@ -2209,7 +2209,7 @@ static u64 g_gpu_transfer_cycles, g_gpu_flush_cycles;
 
 static inline u64 gpu_tsc(void) {
     unsigned lo, hi;
-    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    { u64 c_ = arch_cycles(); lo = (u32)c_; hi = (u32)(c_ >> 32); }
     return ((u64)hi << 32) | lo;
 }
 

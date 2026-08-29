@@ -27,6 +27,7 @@
 #include <b1nix/types.h>
 #include <b1nix/virtio.h>
 #include <string.h>
+#include <b1nix/platform.h>
 
 #define VIRTIO_MMIO_BASE   0x0a000000ULL
 #define VIRTIO_MMIO_STRIDE 0x200ULL
@@ -90,10 +91,22 @@ struct virtio_mmio_regs {
 #define VIRTIO_BLK_T_IN  0
 #define VIRTIO_BLK_T_OUT 1
 #define VIRTIO_BLK_T_FLUSH 4
+#define VIRTIO_BLK_T_DISCARD 11
+#define VIRTIO_BLK_T_WRITE_ZEROES 13
 /* The device has a write-back cache and will accept a flush command. Without
  * this bit negotiated, fsync(2) on this disk only reached the host's page
  * cache. */
 #define VIRTIO_BLK_F_FLUSH (1u << 9)
+/* M109 BLKDISCARD / BLKZEROOUT. The PCI driver has negotiated both since M109;
+ * this transport never asked for either, so on aarch64 every discard reached a
+ * device with no such command and the whole M109 discard group failed. */
+#define VIRTIO_BLK_F_DISCARD (1u << 13)
+#define VIRTIO_BLK_F_WRITE_ZEROES (1u << 14)
+
+/* Config-space offsets, in bytes from the start of the device config window
+ * (virtio-mmio exposes it at 0x100; `regs->config` is that window). */
+#define VBLK_CFG_MAX_DISCARD_SECTORS 36
+#define VBLK_CFG_MAX_WZ_SECTORS 48
 #define MAX_VIRTIO_BLK_MMIO 8
 
 struct virtio_blk_req {
@@ -102,8 +115,17 @@ struct virtio_blk_req {
   u64 sector;
 } __attribute__((packed));
 
+/* Payload of a DISCARD / WRITE ZEROES request — the device reads it the way it
+ * reads the data of an ordinary write. */
+struct virtio_blk_zero_range {
+  u64 sector;
+  u32 num_sectors;
+  u32 flags;
+} __attribute__((packed));
+
 struct virtio_blk_dma_req {
   struct virtio_blk_req req;
+  struct virtio_blk_zero_range zero;
   volatile u8 status;
 } __attribute__((packed));
 
@@ -113,6 +135,9 @@ struct vblk_mmio_instance {
   struct block_device blk;
   volatile int busy;
   u8 irq;
+  /* 0 when the device stated no limit — then one request carries the range. */
+  u32 max_discard_sectors;
+  u32 max_write_zeroes_sectors;
 };
 
 static struct vblk_mmio_instance instances[MAX_VIRTIO_BLK_MMIO];
@@ -178,22 +203,37 @@ static int do_vblk_req(struct vblk_mmio_instance *inst, u64 lba, u32 count,
   vblk_lock(inst);
   dma->req.type = type;
   dma->req.reserved = 0;
-  dma->req.sector = lba;
+  /* DISCARD and WRITE ZEROES name their range in the payload, not the header;
+   * the header sector must be 0 for them. */
+  dma->req.sector = (type == VIRTIO_BLK_T_IN || type == VIRTIO_BLK_T_OUT) ? lba : 0;
   dma->status = 0xFF;
 
   /* A flush carries no data at all — header and status only. Handing the
    * device a zero-length data descriptor is not the same thing and it will
    * reject the request. */
   int has_data = (type != VIRTIO_BLK_T_FLUSH);
+  void *data = buffer;
+  u64 data_len = (u64)count * 512;
+  u16 data_flags = (type == VIRTIO_BLK_T_IN) ? VRING_DESC_F_WRITE : 0;
+  if (type == VIRTIO_BLK_T_DISCARD || type == VIRTIO_BLK_T_WRITE_ZEROES) {
+    dma->zero.sector = lba;
+    dma->zero.num_sectors = count;
+    /* flags: bit 0 (unmap) is defined for WRITE ZEROES only, and asking for it
+     * would let the blocks read back as something other than zeroes. DISCARD
+     * defines no flags at all, so 0 is right for both. */
+    dma->zero.flags = 0;
+    data = &dma->zero;
+    data_len = sizeof(dma->zero);
+    data_flags = 0;
+  }
 
   u16 next_desc = 0;
   u16 prev = 0xFFFF;
   if (vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)&dma->req,
                       sizeof(struct virtio_blk_req), 0) < 0 ||
       (has_data &&
-       vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)buffer,
-                       (u64)count * 512,
-                       type == VIRTIO_BLK_T_IN ? VRING_DESC_F_WRITE : 0) < 0) ||
+       vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)data,
+                       data_len, data_flags) < 0) ||
       vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)&dma->status,
                       1, VRING_DESC_F_WRITE) < 0) {
     vblk_unlock(inst);
@@ -286,6 +326,37 @@ static int vblk_mmio_write(struct block_device *dev, u64 lba, u32 count,
                      (void *)(usize)buffer, VIRTIO_BLK_T_OUT);
 }
 
+/* M109: only installed when the device offered the matching feature bit. Both
+ * are chunked to the device's stated maximum, exactly like the PCI driver. */
+static int vblk_mmio_discard(struct block_device *dev, u64 lba, u32 count) {
+  struct vblk_mmio_instance *inst = (struct vblk_mmio_instance *)dev->priv;
+  u32 done = 0;
+  while (done < count) {
+    u32 chunk = count - done;
+    if (inst->max_discard_sectors && chunk > inst->max_discard_sectors)
+      chunk = inst->max_discard_sectors;
+    if (do_vblk_req(inst, lba + done, chunk, 0, VIRTIO_BLK_T_DISCARD) < 0)
+      return -1;
+    done += chunk;
+  }
+  return 0;
+}
+
+static int vblk_mmio_write_zeroes(struct block_device *dev, u64 lba, u32 count) {
+  struct vblk_mmio_instance *inst = (struct vblk_mmio_instance *)dev->priv;
+  u32 done = 0;
+  while (done < count) {
+    u32 chunk = count - done;
+    if (inst->max_write_zeroes_sectors &&
+        chunk > inst->max_write_zeroes_sectors)
+      chunk = inst->max_write_zeroes_sectors;
+    if (do_vblk_req(inst, lba + done, chunk, 0, VIRTIO_BLK_T_WRITE_ZEROES) < 0)
+      return -1;
+    done += chunk;
+  }
+  return 0;
+}
+
 static int vblk_setup_queue(volatile struct virtio_mmio_regs *regs,
                             struct virtqueue *vq, int legacy) {
   regs->queue_sel = 0;
@@ -339,7 +410,24 @@ static int vblk_setup_queue(volatile struct virtio_mmio_regs *regs,
   return 0;
 }
 
+
+/* The virtio-mmio transport window is QEMU virt's, and only QEMU virt's.
+ *
+ * These slots are probed by reading them, with no mapping call, because the
+ * low MMIO region is identity-mapped from boot. That is safe on a board that
+ * has this window and nothing else: on a Snapdragon 855 0x0a000000 belongs to
+ * unrelated Qualcomm peripherals, and a read of an unclocked one does not
+ * return a magic value that fails the check below — it does not return at all.
+ * Probing by poking fixed addresses is only ever valid on a machine already
+ * known to have them there. */
+static int virtio_mmio_window_present(void)
+{
+	return platform_type() == PLATFORM_QEMU_VIRT;
+}
+
 void virtio_blk_mmio_init(void) {
+  if (!virtio_mmio_window_present())
+    return;
   instance_count = 0;
 
   for (int slot = 0; slot < VIRTIO_MMIO_SLOTS &&
@@ -380,7 +468,8 @@ void virtio_blk_mmio_init(void) {
      * issue, so "durable" meant "in the host's cache". */
     regs->device_features_sel = 0;
     u32 host_features = regs->device_features;
-    u32 want = host_features & VIRTIO_BLK_F_FLUSH;
+    u32 want = host_features & (VIRTIO_BLK_F_FLUSH | VIRTIO_BLK_F_DISCARD |
+                                VIRTIO_BLK_F_WRITE_ZEROES);
 
     if (legacy) {
       regs->guest_page_size = PAGE_SIZE;
@@ -426,6 +515,18 @@ void virtio_blk_mmio_init(void) {
     inst->blk.write_blocks = vblk_mmio_write;
     if (want & VIRTIO_BLK_F_FLUSH)
       inst->blk.flush = vblk_mmio_flush;
+    if (want & VIRTIO_BLK_F_DISCARD) {
+      memcpy(&inst->max_discard_sectors,
+             (const void *)(regs->config + VBLK_CFG_MAX_DISCARD_SECTORS),
+             sizeof(u32));
+      inst->blk.discard = vblk_mmio_discard;
+    }
+    if (want & VIRTIO_BLK_F_WRITE_ZEROES) {
+      memcpy(&inst->max_write_zeroes_sectors,
+             (const void *)(regs->config + VBLK_CFG_MAX_WZ_SECTORS),
+             sizeof(u32));
+      inst->blk.write_zeroes = vblk_mmio_write_zeroes;
+    }
     inst->blk.priv = inst;
     /* The same "vd" sequence the PCI virtio-blk driver takes its names from:
      * a disk is vda, vdb, ... whatever transport it arrived on, which is what
@@ -436,6 +537,8 @@ void virtio_blk_mmio_init(void) {
 
     console_write("virtio-blk-mmio: ");
     console_write((want & VIRTIO_BLK_F_FLUSH) ? "flush=yes " : "flush=no ");
+    console_write((want & VIRTIO_BLK_F_DISCARD) ? "discard=yes "
+                                                : "discard=no ");
     console_write("registered ");
     console_write(inst->blk.name);
     console_write(" (slot ");

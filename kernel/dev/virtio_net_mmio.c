@@ -22,6 +22,7 @@
 #include <b1nix/types.h>
 #include <b1nix/virtio.h>
 #include <string.h>
+#include <b1nix/platform.h>
 
 #define VIRTIO_MMIO_BASE   0x0a000000ULL
 #define VIRTIO_MMIO_STRIDE 0x200ULL
@@ -326,7 +327,24 @@ static int vnet_mmio_irq(void *ctx) {
   return 1;
 }
 
+
+/* The virtio-mmio transport window is QEMU virt's, and only QEMU virt's.
+ *
+ * These slots are probed by reading them, with no mapping call, because the
+ * low MMIO region is identity-mapped from boot. That is safe on a board that
+ * has this window and nothing else: on a Snapdragon 855 0x0a000000 belongs to
+ * unrelated Qualcomm peripherals, and a read of an unclocked one does not
+ * return a magic value that fails the check below — it does not return at all.
+ * Probing by poking fixed addresses is only ever valid on a machine already
+ * known to have them there. */
+static int virtio_mmio_window_present(void)
+{
+	return platform_type() == PLATFORM_QEMU_VIRT;
+}
+
 int virtio_net_mmio_init(void) {
+  if (!virtio_mmio_window_present())
+    return 0;
   for (int slot = 0; slot < VIRTIO_MMIO_SLOTS; slot++) {
     u64 phys = VIRTIO_MMIO_BASE + (u64)slot * VIRTIO_MMIO_STRIDE;
     /* The low MMIO window is identity-mapped by boot.S, same as the GIC and

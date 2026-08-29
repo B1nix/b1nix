@@ -69,27 +69,10 @@ OWN="$IMAGE.own"
 "$DEBUGFS" -w -f "$OWN" "$IMAGE" >/dev/null 2>&1 || true
 rm -f "$OWN"
 
-# The setuid inodes, and the one file that must not be world-readable.
-#
-# M108: /bin/{su,passwd,login} are symlinks onto the BusyBox multicall ELF, so
-# the setuid bit belongs on the inode they resolve to -- the dedicated
-# busybox-suid copy -- and NOT on the symlinks (stamping a mode on a symlink
-# inode would only corrupt it). The plain /opt/busybox/bin/busybox that every
-# other applet resolves to is deliberately left non-setuid.
-for cmd in \
-	"sif /bin/m31_setuid uid 0" \
-	"sif /bin/m31_setuid mode 0104755" \
-	"sif /opt/busybox/bin/busybox-suid uid 0" \
-	"sif /opt/busybox/bin/busybox-suid gid 0" \
-	"sif /opt/busybox/bin/busybox-suid mode 0104755" \
-	"sif /sbin/unix_chkpwd uid 0" \
-	"sif /sbin/unix_chkpwd gid 0" \
-	"sif /sbin/unix_chkpwd mode 0104755" \
-	"sif /etc/shadow uid 0" \
-	"sif /etc/shadow mode 0100400" \
-; do
-	"$DEBUGFS" -w -R "$cmd" "$IMAGE" 2>/dev/null || true
-done
+# The setuid inodes, and the one file that must not be world-readable. Shared
+# with _mkimg in tests/smoke.sh, which builds the per-lane disks the aarch64
+# instances boot from the same staging tree.
+DEBUGFS="$DEBUGFS" sh "$(dirname "$0")/stamp-root-modes.sh" "$IMAGE"
 
 printf 'created %s (%s)\n' "$IMAGE" "$(du -sh "$IMAGE" | cut -f1)"
 

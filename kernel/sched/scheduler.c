@@ -13,6 +13,7 @@
 #include <b1nix/ptrace.h>
 #include <b1nix/rseq.h>
 #include <b1nix/sysv_ipc.h>
+#include <b1nix/kmsg.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
@@ -198,7 +199,7 @@ static int g_clean_fpu_ready = 0;
  * is not yet allocated). Slot indices i map as (i >> 6) -> chunk, (i & 63) ->
  * offset within chunk. */
 static struct task *g_task_chunks[TASK_MAX_CHUNKS];
-static usize        g_task_hwm = 0;  /* one past highest slot ever used */
+static _Atomic usize g_task_hwm = 0; /* one past highest slot ever used */
 
 /* M29: per-task thread metadata kept in parallel arrays (NOT in struct task
  * — see comment in sched.h). Indexed by the slot in g_task_chunks computed
@@ -531,6 +532,21 @@ struct task *scheduler_setup_ap_idle(int cpu, u64 kstack_top) {
   t->priority = 0;
   t->pml4_phys = 0; /* kernel address space */
   t->kernel_stack_ptr = kstack_top;
+  /* The base of that stack, which every other task carries and this one did
+   * not. scheduler_yield's stack-pointer guard is written as
+   * `if (new_task->stack)`, so a task with none was the one thing it never
+   * checked -- and this is the task that ends up running whenever a CPU has
+   * nothing else to do. A switch into it with a corrupted context therefore
+   * went straight through to arch_context_switch, which `ret`s to the saved
+   * lr: zero, on a stack belonging to somebody else, reported as an EL1
+   * instruction abort at address 0 with no backtrace worth reading. */
+  t->stack = (void *)(usize)(kstack_top - KERNEL_STACK_SIZE);
+  /* ...and the canary that goes with it. Every other kernel stack is painted
+   * by whoever allocates it; this one is the AP's boot stack, handed over by
+   * the SMP bring-up, so nothing had ever written the marker the overflow
+   * check reads. Safe to write here: this is the far end of the stack, and
+   * the CPU running on it is nowhere near the base. */
+  *(u64 *)(usize)t->stack = KSTACK_CANARY;
   t->cwd[0] = '/';
   t->cwd[1] = '\0';
   return t;
@@ -703,8 +719,19 @@ static struct task *find_unused_task(void) {
        * CPU means somebody reaped a live task; memsetting it here would turn
        * that into an unexplainable crash somewhere else entirely. Fail at the
        * point where the corruption would be created instead. */
-      if (T(i) == current_task)
+      /* ...on ANY CPU, not just this one. The old test compared against this
+       * CPU's cur_task, so a slot freed while its task was still executing on
+       * another core was handed straight to a new task -- which then shares the
+       * previous occupant's kernel_stack_ptr and saved context, i.e. two CPUs
+       * on one stack, with the corruption surfacing far from here. */
+      if (T(i) == current_task || task_running_somewhere(T(i))) {
+        console_write("sched: recycling slot of a live task: pid ");
+        console_write_dec((u64)T(i)->id);
+        console_write(" name=");
+        console_write(T(i)->name ? T(i)->name : "(none)");
+        console_write("\n");
         panic("sched: reusing the slot of the task that is running");
+      }
       memset(T(i), 0, sizeof(struct task));
       /* M29: clear side-table metadata so the reused slot starts clean. */
       g_task_is_thread[i] = 0;
@@ -787,10 +814,11 @@ static struct task *find_unused_task(void) {
     tasks_unlock(flags);
     return 0;
   }
-  usize i = g_task_hwm++;
+  usize i = g_task_hwm;
   /* Chunk was kzalloc'd, but be explicit so a slot that gets reused after
    * free_task_slot starts from a clean state too (same as the old path). */
   memset(T(i), 0, sizeof(struct task));
+  g_task_hwm = i + 1;
   g_task_is_thread[i] = 0;
   g_task_tls_base[i] = 0;
   g_task_child_tid_clear[i] = 0;
@@ -1462,6 +1490,18 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->kernel_stack_ptr = stack_top;
 #ifdef __x86_64__
   u64 initial_rsp = stack_top - 16;
+#elif defined(__aarch64__)
+  /* No slot to reserve, and nothing to subtract.
+   *
+   * The `- 8` below is 32-bit x86's return-address slot. AAPCS64 keeps the
+   * return address in x30 rather than on the stack, and requires SP to be
+   * 16-byte aligned at every instruction that uses it — so subtracting eight
+   * here left SP 8 mod 16 for the entire life of every kernel thread. That is
+   * invisible under QEMU, whose SCTLR_EL1.SA comes up clear, and an immediate
+   * SP-alignment fault (ESR EC 0x26) on a Cortex-A76, which has that check
+   * enabled out of reset — which is how net_task died on the first real
+   * arm64 hardware this kernel ran on. */
+  u64 initial_rsp = stack_top;
 #else
   u64 initial_rsp = stack_top - 8;
 #endif
@@ -1872,33 +1912,27 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
     *(u64 *)(usize)child->context.rsp = (u64)x86_fork_kernel_trampoline;
   }
 #elif defined(__aarch64__)
-  if (is_user && frame) {
-    /* Unlike x86_64 (TSS.rsp0 hardware-pins every EL0->EL1 entry to a fixed
-     * address == kernel_stack_ptr), aarch64's SP_EL1 is just whatever the
-     * general kernel "sp" was left at by the last context switch — it drifts
-     * with call depth and is NOT reliably kernel_stack_ptr - sizeof(frame).
-     * `frame` (passed down from isr.S's sync_el0, which set it to `sp` right
-     * after SAVE_REGS) is the one thing that DOES point at the real live
-     * frame. Relocate it into the child's copied stack by the same byte
-     * offset every other parent-stack pointer in this function uses, force
-     * x0=0 (fork's child return value), and let the child continue there. */
+  if (is_user) {
+    /* Every EL0->EL1 entry runs EL0_KSTACK_RESET before SAVE_REGS, so the
+     * frame sits at a fixed address — the task's kernel_stack_ptr, which the
+     * scheduler publishes into this CPU's block on each switch — exactly the
+     * way TSS.rsp0 pins it on x86_64. Take the child's copy of that frame,
+     * force x0=0 (fork's child return value), and resume there. */
     struct interrupt_frame *child_frame =
-        (struct interrupt_frame *)((u64)(usize)frame + stack_offset);
+        (struct interrupt_frame *)(usize)(child->kernel_stack_ptr -
+                                          sizeof(struct interrupt_frame));
     child_frame->x0 = 0;
 
     extern void aarch64_fork_child_trampoline(void);
     child->context.sp = (u64)(usize)child_frame;
     child->context.fp = 0;
     child->context.lr = (u64)(usize)aarch64_fork_child_trampoline;
-  } else if (is_user) {
-    /* No frame (shouldn't happen for a real EL0 fork, but fail safe rather
-     * than resume with a garbage/uninitialized frame). */
-    free_task_slot(child);
-    kfree(child_stack);
-    interrupts_enable();
-    return -1;
   } else {
-    child->context.sp = (u64)(usize)child_stack + KERNEL_STACK_SIZE;
+    /* Aligned explicitly: SP has to be a multiple of 16 on this arch (see the
+     * note on initial_rsp above), and the allocator's alignment is not a
+     * promise this code should be leaning on. */
+    child->context.sp =
+        align_down_u64((u64)(usize)child_stack + KERNEL_STACK_SIZE, 16);
     child->context.fp = 0;
     child->context.lr = (u64)(usize)arch_halt;
   }
@@ -1944,10 +1978,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   if (parent == current_task) {
     extern void paging_reload_cr3(void);
     extern void tlb_shootdown_all(void);
-    u64 rf;
-
-    __asm__ volatile("pushfq\n\tpop %0" : "=r"(rf));
-    if (rf & (1ULL << 9))
+    if (interrupts_enabled())
       tlb_shootdown_all();
     else
       paging_reload_cr3();
@@ -2707,7 +2738,8 @@ struct clone_thread_args {
 #endif
 };
 
-extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv);
+extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv,
+                          usize kstack_top);
 
 static void clone_thread_kentry(void *arg) {
   struct clone_thread_args *cta = (struct clone_thread_args *)arg;
@@ -2724,6 +2756,7 @@ static void clone_thread_kentry(void *arg) {
   int have_uframe = cta->have_uframe;
 #endif
   kfree(cta);
+#ifndef __aarch64__
   if (have_uregs) {
     /* Linux hands the child the caller's register file. Anything else breaks
      * a libc that carries the thread entry point in a register across the
@@ -2734,6 +2767,13 @@ static void clone_thread_kentry(void *arg) {
     sched_acct_leave_kernel();
     x86_clone_thread_jump_regs(entry, stack, &uregs);
   }
+#else
+  /* aarch64 carries the whole interrupt frame instead (have_uframe below),
+   * which is strictly more than this path restores — scheduler_clone_thread
+   * never sets have_uregs on this arch. */
+  (void)have_uregs;
+  (void)uregs;
+#endif
   if (start_func) {
     /* M92 musl pthread: child continues at parent's RIP (after syscall in
      * musl __clone), with the new user stack and r9 = start_routine. The
@@ -2756,7 +2796,12 @@ static void clone_thread_kentry(void *arg) {
   u64 sp = ((u64)stack & ~0xFUL) - 8;
   *(volatile u64 *)(usize)sp = 0; /* return address: threads exit via SYS_EXIT_THREAD, never ret */
   sched_acct_leave_kernel(); /* M86: kernel-time interval ends at the ring-3 jump */
-  x86_user_jump((usize)entry, (usize)sp, (usize)user_arg, 0);
+  /* The kernel stack top goes with the jump. This runs part-way down the
+   * task's own C frames and erets from there, so SP_EL1 has to be put back
+   * explicitly -- by the caller that knows whose task this is, rather than out
+   * of a per-CPU slot that is only right until something publishes another. */
+  x86_user_jump((usize)entry, (usize)sp, (usize)user_arg, 0,
+                (usize)current_task->kernel_stack_ptr);
 #elif defined(__aarch64__)
   /* AAPCS64: SP stays 16-byte aligned and there is no return address on the
    * stack (x30 holds it), so no dummy slot to build. x0 carries the argument;
@@ -2764,7 +2809,8 @@ static void clone_thread_kentry(void *arg) {
    * value the child must see — musl's __clone branches on it and then picks
    * fn/arg back off the new stack itself. */
   {
-    extern void aarch64_user_thread_jump(u64 entry, u64 sp, u64 arg, u64 lr);
+    extern void aarch64_user_thread_jump(u64 entry, u64 sp, u64 arg, u64 lr,
+                                         u64 kstack_top);
     extern void aarch64_eret_frame(struct interrupt_frame *f);
     u64 sp = stack & ~0xFULL;
     sched_acct_leave_kernel();
@@ -2784,9 +2830,24 @@ static void clone_thread_kentry(void *arg) {
       if (task_tls_base(current_task))
         f.tpidr_el0 = task_tls_base(current_task);
       f.spsr &= 0xF0000000ULL; /* EL0t, IRQs unmasked, keep NZCV */
-      aarch64_eret_frame(&f);
+      /* Return through a frame placed AT the top of this task's kernel stack,
+       * not through the local one.
+       *
+       * aarch64_eret_frame does `mov sp, x0` then RESTORE_REGS, so SP_EL1 ends
+       * up sizeof(frame) above wherever the frame sat. From a local that is
+       * the middle of a C frame, which is why this path used to be followed by
+       * a global stack reset. Put the frame where SAVE_REGS would have put it
+       * and the arithmetic lands on the stack top by itself -- the same thing
+       * fork's child frame already does. Nothing above this point on the stack
+       * is live: this path erets and never returns. */
+      struct interrupt_frame *top =
+          (struct interrupt_frame *)(usize)(current_task->kernel_stack_ptr -
+                                            sizeof(struct interrupt_frame));
+      *top = f;
+      aarch64_eret_frame(top);
     }
-    aarch64_user_thread_jump(entry, sp, user_arg, user_lr);
+    aarch64_user_thread_jump(entry, sp, user_arg, user_lr,
+                             current_task->kernel_stack_ptr);
   }
 #endif
 }
@@ -2947,6 +3008,18 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   child->kernel_stack_ptr = stack_top;
 #ifdef __x86_64__
   u64 initial_rsp = stack_top - 16;
+#elif defined(__aarch64__)
+  /* No slot to reserve, and nothing to subtract.
+   *
+   * The `- 8` below is 32-bit x86's return-address slot. AAPCS64 keeps the
+   * return address in x30 rather than on the stack, and requires SP to be
+   * 16-byte aligned at every instruction that uses it — so subtracting eight
+   * here left SP 8 mod 16 for the entire life of every kernel thread. That is
+   * invisible under QEMU, whose SCTLR_EL1.SA comes up clear, and an immediate
+   * SP-alignment fault (ESR EC 0x26) on a Cortex-A76, which has that check
+   * enabled out of reset — which is how net_task died on the first real
+   * arm64 hardware this kernel ran on. */
+  u64 initial_rsp = stack_top;
 #else
   u64 initial_rsp = stack_top - 8;
 #endif
@@ -3020,10 +3093,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
      * interrupts enabled; with them masked there are no siblings running to
      * worry about and the local reload is what is safe. */
     if (parent == current_task) {
-      u64 rf;
-
-      __asm__ volatile("pushfq\n\tpop %0" : "=r"(rf));
-      if (rf & (1ULL << 9))
+      if (interrupts_enabled())
         tlb_shootdown_all();
       else
         paging_reload_cr3();
@@ -3241,11 +3311,18 @@ void scheduler_reap_dead_threads(void) {
    * hold pml4 refs (mm_release_user returns 0 for it), so without this
    * last-user teardown the whole address space — pml4, page tables, vmas —
    * leaked on every unjoined multithreaded exit until PMM OOM. */
-  for (usize i = 0; i < g_task_hwm; i++) {
+  usize task_hwm = g_task_hwm;
+  for (usize i = 0; i < task_hwm; i++) {
     struct task *t = T(i);
     if (t == current_task) continue;
     if (t->state != TASK_DEAD) continue;
     if (!task_is_thread(t)) continue;
+    /* stack_released only says that the task's saved SP no longer names the
+     * outgoing CPU's stack. It does not say that another CPU has stopped
+     * executing the task: a task can be marked DEAD by that CPU while its
+     * exit-side scheduler_yield is still unwinding. Never clear the slot
+     * until no CPU identifies it as current. */
+    if (task_running_somewhere(t)) continue;
     if (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) continue;
 
     /* Claim DEAD->REAPING first. Load-bearing twice over: (a) a racing
@@ -3324,16 +3401,18 @@ static int g_have_proc_zombies = 0;
  * scheduler_reap_dead_threads. */
 void scheduler_reap_orphan_zombies(void) {
   int still_have = 0;
-  for (usize i = 0; i < g_task_hwm; i++) {
+  usize task_hwm = g_task_hwm;
+  for (usize i = 0; i < task_hwm; i++) {
     struct task *t = T(i);
     if (t == current_task) continue;
     if (t->state != TASK_DEAD) continue;
     if (task_is_thread(t)) continue; /* threads: scheduler_reap_dead_threads */
+    if (task_running_somewhere(t)) continue;
     still_have = 1;
     if (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) continue;
 
     int has_live_parent = 0;
-    for (usize p = 0; p < g_task_hwm; p++) {
+    for (usize p = 0; p < task_hwm; p++) {
       struct task *pt = T(p);
       if (pt->id == t->parent_id && pt->state != TASK_UNUSED &&
           pt->state != TASK_DEAD && pt->state != TASK_REAPING) {
@@ -3383,6 +3462,12 @@ void scheduler_reap_orphan_zombies(void) {
 
 
 int scheduler_yield(void) {
+  /* An interrupt handler may yield and resume later on this same C frame.
+   * IRQ entry is masked, and enabling interrupts before the handler's
+   * RESTORE_REGS/eret lets the next timer interrupt nest on top of that live
+   * frame. Preserve the caller's state across every return, including the
+   * return after arch_context_switch resumes this task. */
+  int restore_irqs = interrupts_enabled();
   interrupts_disable();
   wake_sleepers();
 
@@ -3445,7 +3530,8 @@ int scheduler_yield(void) {
       }
     }
 
-    interrupts_enable();
+    if (restore_irqs)
+      interrupts_enable();
     return 0; /* nothing runnable — caller's idle loop may drop the BKL */
   }
 
@@ -3507,6 +3593,25 @@ int scheduler_yield(void) {
       console_write(" stack=0x");
       console_write_hex64(lo);
       console_write("\n");
+
+      /* Name the neighbour, because "overflow" is usually a lie here.
+       *
+       * A stack grows DOWN toward this word, so its own overflow is one way to
+       * clobber it -- but the threads this keeps firing on (m47-input-inject,
+       * lkpi-events) have bodies that are a sleep loop and a work queue, and
+       * cannot have spent 128 KiB. The other way in is a write running FORWARD
+       * off the end of whatever block sits immediately below, and the heap
+       * knows what that is. Print the value that replaced the canary too: a
+       * small integer, a pointer or ASCII each point somewhere different. */
+      console_write("  was=0x");
+      console_write_hex64(*(u64 *)(usize)lo);
+      console_write("\n");
+      kheap_describe(lo, "  this block:");
+      kheap_describe(lo - 1, "  block below:");
+      {
+        extern void kheap_validate(const char *func);
+        kheap_validate("kstack-canary");
+      }
       panic("kernel stack overflow");
     }
   }
@@ -3567,10 +3672,35 @@ int scheduler_yield(void) {
       } else {
         old_task->state = TASK_RUNNING;
       }
-      interrupts_enable();
+      if (restore_irqs)
+        interrupts_enable();
       return 0;
     }
   }
+  /* The invariant this whole hand-off protocol exists to keep: nobody else is
+   * running the task we are about to resume.
+   *
+   * Checked HERE, before this CPU's cur_task is reassigned, so
+   * task_running_somewhere() still answers about the other CPUs only -- a task
+   * re-picking itself is a legitimate no-op switch and is excluded explicitly.
+   *
+   * Without it, two CPUs loading one saved context is not a fault: both run on
+   * the same kernel stack, overwrite each other's register spills, and the
+   * machine dies later somewhere unrelated -- a data abort on a task pointer
+   * that reads back as a small integer, in pick_next_task or on an IRQ return,
+   * with nothing left to say where it came from. Name it at the switch. */
+  if (new_task != old_task && task_running_somewhere(new_task)) {
+    console_write("sched: about to resume a task another CPU is running: pid ");
+    console_write_dec((u64)new_task->id);
+    console_write(" name=");
+    console_write(new_task->name ? new_task->name : "(none)");
+    console_write(" stack_released=");
+    console_write_dec((u64)__atomic_load_n(&new_task->stack_released,
+                                           __ATOMIC_ACQUIRE));
+    console_write("\n");
+    panic("sched: two CPUs claimed one task");
+  }
+
   new_task->state = TASK_RUNNING;
   current_task = new_task;
 
@@ -3607,7 +3737,25 @@ int scheduler_yield(void) {
 
   arch_context_switch(&old_task->context, &new_task->context,
                       &old_task->stack_released);
-  interrupts_enable();
+#ifdef __aarch64__
+  /* arch_context_switch returns only when this task is resumed. The outgoing
+   * task was published before the switch so other CPUs cannot claim it while
+   * its context is live; on resume, publish this CPU's task and its
+   * per-task architectural state again before any C code observes it. Without
+   * this, the resumed stack runs with current_task, SP_EL1's published top,
+   * TTBR0 and TLS still naming the task we switched to. */
+  current_task = old_task;
+  arch_set_kernel_stack(old_task->kernel_stack_ptr);
+  paging_switch_address_space(old_task->pml4_phys);
+  {
+    u64 fsbase = task_tls_base(old_task);
+    extern void arch_set_fs_base(u64 base);
+    arch_set_fs_base(fsbase);
+  }
+  task_fpu_restore(old_task);
+#endif
+  if (restore_irqs)
+    interrupts_enable();
   return 1; /* we switched out and have since been resumed */
 }
 
@@ -4109,6 +4257,20 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
 #define SILENCE_WATCHDOG_TICKS (60 * 100) /* 60s at the 100 Hz timer tick */
 #define SILENCE_WATCHDOG_MAX_DUMPS 3
 extern volatile u64 g_console_write_seq;
+
+static const char *task_state_name(enum task_state st) {
+  switch (st) {
+  case TASK_RUNNING:  return "RUNNING";
+  case TASK_READY:    return "READY";
+  case TASK_BLOCKED:  return "BLOCKED";
+  case TASK_SLEEPING: return "SLEEPING";
+  case TASK_STOPPED:  return "STOPPED";
+  case TASK_DEAD:     return "DEAD";
+  case TASK_REAPING:  return "REAPING";
+  default:            return "UNKNOWN";
+  }
+}
+
 static void serial_silence_watchdog(void) {
   static u64 last_seq;
   static u64 last_change_tick;
@@ -4129,8 +4291,125 @@ static void serial_silence_watchdog(void) {
     return;
   last_change_tick = scheduler_ticks;
   dumps++;
+  /* Before the dump: it lands in the same ring and would otherwise be all the
+   * tail has left in it. */
+  kmsg_capture_tail();
+
   console_write("\nSMOKE-GUEST-WATCHDOG: no console output for 60s — task dump:\n");
   scheduler_dump_tasks();
+
+  /* The same answer in one line per task, printed after the dump rather than
+   * before it.
+   *
+   * The dump is longer than a phone panel is tall, so on a board whose console
+   * is that panel everything worth reading scrolls off the top the moment it
+   * runs — including the marker naming the test that stalled. What lands last
+   * is what survives, so the short form goes here: who is alive, what state
+   * they are in, and what they are waiting on. */
+  /* Replayed before the alive list, not after: both are short enough to share
+   * the panel, and this one is the longer of the two. */
+  kmsg_print_captured();
+
+  /* How close the boot task came to the end of its stack. It is the one stack
+   * with no canary on it -- the check below is guarded by task->stack, which is
+   * 0 for a region that is not a heap block -- so this figure, read late, is
+   * the only evidence that it did or did not overflow. */
+  {
+    extern u64 boot_stack_peak_bytes(void);
+    extern u64 boot_stack_size_bytes(void);
+    u64 total = boot_stack_size_bytes();
+    u64 peak = boot_stack_peak_bytes();
+
+    console_write("SMOKE-GUEST-WATCHDOG: boot stack peak=");
+    console_write_dec(peak);
+    console_write(" of ");
+    console_write_dec(total);
+    if (total)
+      {
+        console_write(" (");
+        console_write_dec(peak * 100 / total);
+        console_write("%)");
+      }
+    console_write("\n");
+  }
+
+  console_write("SMOKE-GUEST-WATCHDOG: alive tasks (pid state chan comm):\n");
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+
+    if (t->state == TASK_UNUSED || t->state == TASK_DEAD ||
+        t->state == TASK_REAPING)
+      continue;
+    console_write("  ");
+    console_write_dec(t->id);
+    console_write(" ");
+    console_write(task_state_name(t->state));
+    console_write(" 0x");
+    console_write_hex64((u64)(usize)t->wait_chan);
+    console_write(" ");
+    console_write(t->name);
+    console_write("\n");
+  }
+
+  /* Where PID 1 went.
+   *
+   * The alive list above skips UNUSED/DEAD/REAPING, so an init that is missing
+   * from it says only "not running" — and "never scheduled", "exited" and
+   * "already reaped" need different fixes. This looks the slot up by id and
+   * reports whatever state it is in, including the states the list hides, or
+   * says plainly that no slot carries that id any more. */
+  {
+    usize init_pid = scheduler_get_init_pid();
+    struct task *found = 0;
+
+    for (usize i = 0; i < g_task_hwm && !found; i++)
+      if (T(i)->id == init_pid && T(i)->state != TASK_UNUSED)
+        found = T(i);
+
+    console_write("SMOKE-GUEST-WATCHDOG: init pid=");
+    console_write_dec((u64)init_pid);
+    if (found) {
+      console_write(" state=");
+      console_write(task_state_name(found->state));
+      console_write(" comm=");
+      console_write(found->name);
+    } else {
+      console_write(" has no live task slot (hwm=");
+      console_write_dec((u64)g_task_hwm);
+      console_write(")");
+    }
+    console_write("\n");
+  }
+
+  /* What the boot settled on, reprinted where it is still readable.
+   *
+   * Both facts are announced when they happen, near the top of the boot -- and
+   * on a board whose only console is a scrolling panel that is exactly where
+   * nobody can see them by the time something goes wrong. "root=initramfs" is
+   * the entire diagnosis for a machine that came up with none of its userspace:
+   * the real root never mounted, so PID 1 came out of the embedded file set and
+   * every service that lives in the image was never there to start. */
+  {
+    extern const char *boot_summary_root(void);
+    extern const char *boot_summary_init(void);
+
+    console_write("SMOKE-GUEST-WATCHDOG: root=");
+    console_write(boot_summary_root());
+    console_write(" init=");
+    console_write(boot_summary_init());
+    console_write("\n");
+  }
+
+  /* Sentinel. Everything above can be pushed off the top of a phone panel, and
+   * "the new dump did not print" and "the phone is running the old build" look
+   * identical from the outside. This line is the last thing the watchdog says,
+   * so its absence is an answer rather than a guess. */
+  console_write("SMOKE-GUEST-WATCHDOG: end (dump ");
+  console_write_dec((u64)dumps);
+  console_write(" of ");
+  console_write_dec((u64)SILENCE_WATCHDOG_MAX_DUMPS);
+  console_write(")\n");
+
   last_seq = g_console_write_seq;
 }
 
@@ -5663,6 +5942,8 @@ static void scheduler_dump_sysring(usize idx) {
     console_write("\n");
 }
 
+static int g_dump_dead;
+
 void scheduler_dump_tasks(void) {
   extern void futex_dump_waiters(void);
   {
@@ -5689,38 +5970,43 @@ void scheduler_dump_tasks(void) {
   scheduler_dump_thread_exits();
   console_write("tick=");
   console_write_dec(scheduler_ticks);
+
+  /* Corpses are counted, not listed.
+   *
+   * A stalled run has one interesting task in it — the one that is not
+   * finishing — and dozens of DEAD/REAPING slots that finished perfectly well.
+   * Listed in full they are most of the dump, which on a host serial log is
+   * merely noisy but on a board whose console is a 45-column panel pushes the
+   * live tasks, and the marker that says which test stalled, off the top of the
+   * screen before anyone can read them. A run chasing a reaping bug wants them
+   * back: b1nix.dump-dead. */
+  {
+    static int dump_dead = -1;
+    usize corpses = 0;
+
+    if (dump_dead < 0)
+      dump_dead = bootinfo_has_flag("b1nix.dump-dead") ? 1 : 0;
+    if (!dump_dead) {
+      for (usize i = 0; i < g_task_hwm; i++)
+        if (T(i)->state == TASK_DEAD || T(i)->state == TASK_REAPING)
+          corpses++;
+      console_write(" dead/reaping=");
+      console_write_dec(corpses);
+      console_write(" (listed with b1nix.dump-dead)");
+    }
+    g_dump_dead = dump_dead;
+  }
+
   console_write("\nID\tSTATE\tNAME\n");
   for (usize i = 0; i < g_task_hwm; i++) {
+    if (!g_dump_dead &&
+        (T(i)->state == TASK_DEAD || T(i)->state == TASK_REAPING))
+      continue;
     if (T(i)->state != TASK_UNUSED) {
       console_write_hex64(T(i)->id);
       console_write("\t");
 
-      const char *state_str = "UNKNOWN";
-      switch (T(i)->state) {
-      case TASK_RUNNING:
-        state_str = "RUNNING";
-        break;
-      case TASK_READY:
-        state_str = "READY";
-        break;
-      case TASK_BLOCKED:
-        state_str = "BLOCKED";
-        break;
-      case TASK_SLEEPING:
-        state_str = "SLEEPING";
-        break;
-      case TASK_STOPPED:
-        state_str = "STOPPED";
-        break;
-      case TASK_DEAD:
-        state_str = "DEAD";
-        break;
-      case TASK_REAPING:
-        state_str = "REAPING";
-        break;
-      default:
-        break;
-      }
+      const char *state_str = task_state_name(T(i)->state);
 
       console_write(state_str);
       console_write("\tppid=0x");

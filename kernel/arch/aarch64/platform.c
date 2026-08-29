@@ -14,6 +14,15 @@ struct platform_desc {
 static const struct platform_desc platforms[] = {
 	{ "brcm,bcm2711",     "Raspberry Pi 4", PLATFORM_RPI4,      0xFE201000ULL, 0xFE215000ULL, 0xFF841000ULL, 0xFF842000ULL },
 	{ "linux,dummy-virt", "QEMU virt",     PLATFORM_QEMU_VIRT, 0x09000000ULL, 0ULL,          0x08000000ULL, 0x08010000ULL },
+	/* Snapdragon 855. No console UART base: the SoC tree marks every GENI
+	 * serial engine `status = "disabled"`, and this kernel has no clock or
+	 * pinctrl driver to bring one up. A zero here means serial.c prints
+	 * nowhere, which on this board is correct — the console is the panel the
+	 * bootloader left scanning. Guessing a base instead spins tens of
+	 * thousands of MMIO reads per character against a block that never
+	 * answers. The GIC is a v3, so "gicc" names the redistributor region
+	 * rather than a CPU interface. */
+	{ "qcom,sm8150",      "Qualcomm SM8150", PLATFORM_SM8150,  0ULL,          0ULL,          0x17A00000ULL, 0x17A60000ULL },
 };
 
 #define DEFAULT_PLATFORM_INDEX 1 /* QEMU virt fallback */
@@ -34,6 +43,21 @@ static u32 fdt32_to_cpu(u32 val)
 	       ((val & 0x000000FFu) << 24);
 }
 
+static u64 find_valid_fdt(u64 dtb_addr)
+{
+	if (dtb_addr && fdt32_to_cpu(*(const u32 *)dtb_addr) == 0xd00dfeed)
+		return dtb_addr;
+	if (fdt32_to_cpu(*(const u32 *)0x81F00000ULL) == 0xd00dfeed)
+		return 0x81F00000ULL;
+	if (fdt32_to_cpu(*(const u32 *)0x81E00000ULL) == 0xd00dfeed)
+		return 0x81E00000ULL;
+	for (u64 cand = 0x80000000ULL; cand <= 0x85000000ULL; cand += 0x100000ULL) {
+		if (fdt32_to_cpu(*(const u32 *)cand) == 0xd00dfeed)
+			return cand;
+	}
+	return 0;
+}
+
 void platform_detect(u64 dtb_addr)
 {
 	if (g_platform_detected)
@@ -46,10 +70,12 @@ void platform_detect(u64 dtb_addr)
 	g_platform_name = platforms[DEFAULT_PLATFORM_INDEX].name;
 	g_platform_type = platforms[DEFAULT_PLATFORM_INDEX].type;
 
-	if (!dtb_addr) {
+	u64 valid_dtb = find_valid_fdt(dtb_addr);
+	if (!valid_dtb) {
 		g_platform_detected = 1;
 		return;
 	}
+	dtb_addr = valid_dtb;
 
 	const u32 *fdt = (const u32 *)dtb_addr;
 	if (fdt32_to_cpu(fdt[0]) != 0xd00dfeed) {

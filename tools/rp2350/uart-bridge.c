@@ -25,8 +25,10 @@
 #endif
 
 /* Hardware Pinout for Raspberry Pi 4 HIL */
-#define RESET_PIN           10  /* GP10: Target Hardware Reset (Active LOW) -> RPi4 GLOBAL_EN / Pin 39 */
-#define POWER_SENSE_PIN     11  /* GP11: Target 3.3V Power Sense (Input with pull-down) -> RPi4 Pin 1 */
+#define RESET_PIN           22  /* GP22: Target Hardware Reset (Active LOW) */
+#define RESET_PIN_SIDE       2  /* GP2: Convenient side header pin on Waveshare USB-A / Zero */
+#define POWER_SENSE_PIN     21  /* GP21: Target 3.3V Power Sense */
+#define POWER_SENSE_SIDE     3  /* GP3: Convenient side header pin on Waveshare USB-A / Zero */
 
 
 #define BUFFER_SIZE 2560
@@ -117,9 +119,26 @@ static inline uint stopbits_usb2uart(uint8_t stop_bits)
 	}
 }
 
+static inline void set_reset_line(bool assert_reset)
+{
+	if (assert_reset) {
+		/* Pull LOW to GND during active reset */
+		gpio_set_dir(RESET_PIN, GPIO_OUT);
+		gpio_put(RESET_PIN, 0);
+		gpio_set_dir(RESET_PIN_SIDE, GPIO_OUT);
+		gpio_put(RESET_PIN_SIDE, 0);
+	} else {
+		/* High-Z (Open-Drain): let target pull itself up and run freely */
+		gpio_set_dir(RESET_PIN, GPIO_IN);
+		gpio_disable_pulls(RESET_PIN);
+		gpio_set_dir(RESET_PIN_SIDE, GPIO_IN);
+		gpio_disable_pulls(RESET_PIN_SIDE);
+	}
+}
+
 void trigger_hardware_reset(void)
 {
-	gpio_put(RESET_PIN, 0); /* Pull LOW */
+	set_reset_line(true);
 	g_reset_pulse_active = true;
 	g_reset_until_ms = to_ms_since_boot(get_absolute_time()) + 100;
 }
@@ -127,7 +146,7 @@ void trigger_hardware_reset(void)
 void update_hardware_reset_state(uint32_t now_ms)
 {
 	if (g_reset_pulse_active && now_ms >= g_reset_until_ms) {
-		gpio_put(RESET_PIN, 1); /* Release HIGH */
+		set_reset_line(false);
 		g_reset_pulse_active = false;
 	}
 }
@@ -395,15 +414,18 @@ int main(void)
 	led_init();
 	led_set_state(LED_STATE_BOOTING);
 
-	/* Configure Target Hardware Reset Pin (GP22: Output, Default High) */
+	/* Configure Target Hardware Reset Pins as Open-Drain (Default: High-Z / Input) */
 	gpio_init(RESET_PIN);
-	gpio_set_dir(RESET_PIN, GPIO_OUT);
-	gpio_put(RESET_PIN, 1);
+	gpio_init(RESET_PIN_SIDE);
+	set_reset_line(false);
 
-	/* Configure Target Power Sense Pin (GP21: Input with Pull-Down) */
+	/* Configure Target Power Sense Pins (GP21 & GP3: Input with Pull-Down) */
 	gpio_init(POWER_SENSE_PIN);
 	gpio_set_dir(POWER_SENSE_PIN, GPIO_IN);
 	gpio_pull_down(POWER_SENSE_PIN);
+	gpio_init(POWER_SENSE_SIDE);
+	gpio_set_dir(POWER_SENSE_SIDE, GPIO_IN);
+	gpio_pull_down(POWER_SENSE_SIDE);
 
 	for (itf = 0; itf < CFG_TUD_CDC; itf++)
 		init_uart_data(itf);

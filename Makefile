@@ -1,6 +1,9 @@
 .DEFAULT_GOAL := all
 ARCH ?= x86_64
 export B1NIX_ARCH := $(ARCH)
+
+# Which committed Linux ELF blob pair M40 stages (see the rootfs staging rule).
+M40_BLOB_SUFFIX := $(if $(filter aarch64,$(ARCH)),_aarch64,)
 export B1NIX_HEADERS_INSTALLED := 1
 # BUILD_ROOT isolates the per-task kernel/initramfs/ISO output. Override it to
 # build a second task (e.g. an M40 agent) without touching the main build:
@@ -11,11 +14,18 @@ export B1NIX_HEADERS_INSTALLED := 1
 BUILD_ROOT ?= build
 BUILD_DIR := $(BUILD_ROOT)/$(ARCH)
 INC_DIR := $(BUILD_DIR)/inc
+# The compiled-in fallback kernel command line, delivered as a generated header
+# (see the rule below for why it is not a -D).
+KERNEL_CMDLINE_INC := $(INC_DIR)/kernel_cmdline.h
 USERSPACE_HDR_DEPS := $(BUILD_DIR)/.userspace-headers-installed
 USERSPACE_DEPS := $(BUILD_DIR)/.userspace-bins-built
 # Host triplet for the ported userspace toolchain + programs.
 # Keep this mapping in sync with tools/toolchain/env.sh.
+ifeq ($(ARCH),aarch64)
+B1NIX_TRIPLET := aarch64-b1nix
+else
 B1NIX_TRIPLET := x86_64-b1nix
+endif
 
 # Port library targets. Defined here at the top so they can be referenced in
 # dependency lists of targets further down (e.g. .userspace-bins-built).
@@ -163,6 +173,12 @@ ifdef MUSL_INSTALLED
 ifneq ($(MUSL_INSTALLED),)
 CXX_RUNTIME_READY := $(BUILD_DIR)/.libcxx-musl-built
 MUSL_LIBCXX_STAMP := $(BUILD_DIR)/.libcxx-musl-built
+# build-libcxx-musl.sh installs the link-time C++ runtimes in the flat musl
+# port tree (ports/musl/install/lib), not in LIBC_ROOT (pkg/musl).  Keep the
+# actual outputs as prerequisites: an old stamp must not hide missing .so
+# files and let userspace reach ld.lld with an empty -L directory.
+MUSL_LIBCXX_SO := build/$(ARCH)/ports/musl/install/lib/libc++.so.1
+MUSL_LIBCXXABI_SO := build/$(ARCH)/ports/musl/install/lib/libc++abi.so.1
 CFLAGS_EXTRA += -DB1NIX_MUSL
 endif
 endif
@@ -232,8 +248,10 @@ INITRAMFS_INCS := \
 	$(INC_DIR)/initramfs_m31_smoke.inc \
 	$(INC_DIR)/initramfs_m31_setuid.inc \
 	$(INC_DIR)/initramfs_m32_smoke.inc \
-	$(INC_DIR)/initramfs_m56_smoke.inc
-GENERATED_INCS := $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
+	$(INC_DIR)/initramfs_m56_smoke.inc \
+	$(INITRAMFS_M109_SWITCHROOT_INC)
+GENERATED_INCS := $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC) \
+	$(KERNEL_CMDLINE_INC)
 else
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
@@ -443,7 +461,7 @@ ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -m
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
 ASM_SOURCES := kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
-ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_panel.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c kernel/arch/x86_64/kprof.c
+ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_panel.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c
 else ifeq ($(ARCH),aarch64)
 TARGET := aarch64-unknown-elf
 ARCH_CFLAGS := --target=$(TARGET) -mcpu=cortex-a53 -mgeneral-regs-only -DAARCH64
@@ -451,9 +469,16 @@ ARCH_CFLAGS := --target=$(TARGET) -mcpu=cortex-a53 -mgeneral-regs-only -DAARCH64
 # DTB /chosen/bootargs QEMU builds from -append (that works now the image
 # carries an arm64 Linux Image header — see kernel/arch/aarch64/boot.S); this
 # is what bootinfo.c uses when it boots with no device tree at all.
-ifneq ($(KERNEL_CMDLINE),)
-ARCH_CFLAGS += -DAARCH64_DEFAULT_CMDLINE='"$(KERNEL_CMDLINE)"'
-endif
+#
+# Delivered as a GENERATED HEADER rather than a -D, because the kernel build
+# tracks header dependencies and does not track compiler flags: changing
+# KERNEL_CMDLINE left bootinfo.o untouched, so a phone image kept booting the
+# cmdline of whatever build happened to compile that object first. On the
+# Xperia that meant `init=/bin/m12_smoke` from an old bring-up run -- PID 1 was
+# a single smoke binary that ran, passed and exited, and the machine looked
+# like it had died after M12. The header is rewritten only when the string
+# actually changes, so this costs no rebuilds of its own.
+
 # Bring-up aid: UART_AUTOBAUD=1 makes the kernel do nothing but transmit 'U'
 # (0x55) forever, from its first instruction, on both the PL011 and the
 # mini-UART. 0x55 alternates every bit, so a host can sweep baud rates against
@@ -461,6 +486,34 @@ endif
 # rate guess. Never on by default: such a kernel does not boot.
 ifeq ($(UART_AUTOBAUD),1)
 ARCH_CFLAGS += -DB1NIX_UART_AUTOBAUD
+endif
+# Bring-up aid, Raspberry Pi only: boot.S strobes single characters straight at
+# the Pi's PL011 and mini-UART from its first instructions, before any platform
+# detection, so a board that dies before the console exists still says how far
+# it got. Off by default because those are RAW STORES TO FIXED ADDRESSES: on a
+# board that is not a Pi they land on whatever happens to sit there, and a
+# Qualcomm fabric answers an unclaimed write with a NoC error rather than
+# ignoring it. QEMU swallows them, real silicon resets.
+ifeq ($(PI_EARLY_UART),1)
+ARCH_CFLAGS += -DB1NIX_PI_EARLY_UART
+endif
+# The same idea for a board with no serial cable but a live framebuffer: paint
+# one coloured band per boot stage into the buffer the bootloader is already
+# scanning out. Value is the framebuffer's physical address; see FBMARK in
+# kernel/arch/aarch64/boot.S. Unset everywhere except the phone build.
+ifneq ($(FB_BOOT_MARKERS),)
+ARCH_CFLAGS += -DB1NIX_FB_BOOT_MARKERS=$(FB_BOOT_MARKERS)
+endif
+# Screen font magnification for the framebuffer console. Unset means 1, which
+# is right for a monitor and unreadable on a phone panel.
+#
+# COMMON_CFLAGS, not ARCH_CFLAGS: the console this configures is kernel/dev/fb_console.c,
+# a shared source built with COMMON_CFLAGS, so the define never reached the one file
+# that reads it. The setting looked like it worked only because the boot splash
+# happened to call fb_console_set_font_scale(3) on its way out -- so the moment
+# the splash stopped being drawn, the phone's log came up at scale 1.
+ifneq ($(FB_FONT_SCALE),)
+COMMON_CFLAGS += -DFB_CONSOLE_FONT_SCALE=$(FB_FONT_SCALE)
 endif
 ARCH_LDFLAGS := -m aarch64elf
 # Where the kernel is linked, and so where a raw Image has to end up. A board's
@@ -484,6 +537,7 @@ KERNEL_SOURCES := \
 	kernel/main.c \
 	kernel/lib/string.c \
 	kernel/lib/klog.c \
+	kernel/lib/kprof.c \
 	kernel/lib/kprintf.c \
 	kernel/lib/ktime.c \
 	kernel/lib/termios_abi.c \
@@ -498,6 +552,7 @@ KERNEL_SOURCES := \
 	kernel/mm/module_alloc.c \
 	kernel/module/module.c \
 	kernel/module/ksyms.c \
+	kernel/dev/demon_splash.c \
 	kernel/mm/pmm.c \
 	kernel/mm/page_cache.c \
 	kernel/mm/swap.c \
@@ -662,6 +717,7 @@ ifeq ($(ARCH),aarch64)
 # the virtio-mmio transport, and the console/tty/net/display subsystems the
 # x86_64 block pulls in behind PCI devices are still needed.
 KERNEL_SOURCES += \
+	kernel/net/sock_filter.c \
 	kernel/dev/bcm2711_emmc.c \
 	kernel/dev/bcm2835_mbox.c \
 	kernel/dev/bcm2835_gpio.c \
@@ -723,6 +779,13 @@ KERNEL_SOURCES += \
 	kernel/net/net.c \
 	kernel/net/socket.c \
 	kernel/net/netlink.c \
+	kernel/net/packet.c \
+	kernel/net/vlan.c \
+	kernel/net/bridge.c \
+	kernel/net/bond.c \
+	kernel/net/gre.c \
+	kernel/net/vnet.c \
+	kernel/net/veth.c \
 	kernel/net/unix.c \
 	kernel/net/arp.c \
 	kernel/net/ethernet.c \
@@ -1096,6 +1159,7 @@ $(INITRAMFS_MODULES_INC): $(MODULE_KOS) tools/kernel/gen_modules_initramfs.sh \
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
 $(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC) $(AP_TRAMPOLINE_OFFSETS)
+$(BUILD_DIR)/kernel/arch/aarch64/bootinfo.o: $(KERNEL_CMDLINE_INC)
 $(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC)
 
 # programs.c includes the generated applet registration .inc
@@ -1202,12 +1266,23 @@ $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(MBEDTLS_LIB) \
 	$(PAM_LIB) \
 	$(MUSL_LIBCXX_STAMP) \
+	$(MUSL_LIBCXX_SO) \
+	$(MUSL_LIBCXXABI_SO) \
 	$(BUILD_DIR)/compiler-rt-builtins/libclang_rt.builtins-$(ARCH).a
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
 	@touch $@
 
 $(BUILD_DIR)/compiler-rt-builtins/libclang_rt.builtins-$(ARCH).a:
 	@ARCH=$(ARCH) sh tools/ports/build-compiler-rt-builtins.sh
+
+ifdef MUSL_INSTALLED
+# The stamp records that the C++ build was attempted, while these two targets
+# are the files the userspace linker actually consumes.  This separate rule
+# repairs a stale stamp after a partial cleanup or an interrupted staging
+# step.
+$(MUSL_LIBCXX_SO) $(MUSL_LIBCXXABI_SO): $(MUSL_LIBCXX_STAMP)
+	@B1NIX_ARCH=$(ARCH) sh tools/ports/build-libcxx-musl.sh
+endif
 
 
 
@@ -1216,6 +1291,18 @@ $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/helpers/native_smoke.S $(USERSPACE_
 	@$(MAKE) -C userspace build/$(ARCH)/bin/native_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_native_smoke_elf userspace/build/$(ARCH)/bin/native_smoke > $@
+
+# The compiled-in fallback command line, as a header so a changed KERNEL_CMDLINE
+# rebuilds what reads it. .PHONY so the recipe runs every build; the file is
+# only touched when the contents differ, so nothing downstream rebuilds unless
+# the string really changed.
+.PHONY: force-cmdline-header
+force-cmdline-header:
+$(KERNEL_CMDLINE_INC): force-cmdline-header
+	@mkdir -p $(dir $@)
+	@printf '/* generated from KERNEL_CMDLINE — do not edit */\n#define AARCH64_DEFAULT_CMDLINE "%s"\n' '$(KERNEL_CMDLINE)' > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
 
 $(INITRAMFS_M109_SWITCHROOT_INC): userspace/bin/helpers/m109_switchroot_init.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m109_switchroot_init
@@ -2067,6 +2154,88 @@ run-aarch64: $(KERNEL_ELF)
 	@command -v qemu-system-aarch64 >/dev/null || (echo "missing qemu-system-aarch64"; exit 1)
 	qemu-system-aarch64 -machine virt -cpu cortex-a53 -nographic -kernel $(KERNEL_ELF)
 
+# Sony Xperia 5 (bahamut). The link address is the only thing that differs from
+# an ordinary aarch64 build, and it is not optional: this kernel is not
+# position-independent, so boot.S copies the image to its link address and
+# jumps there. Qualcomm's ABL puts an arm64 Image at the SoC's DDR base plus the
+# header's text_offset, and SM8150's DRAM starts at 0x80000000 — so 0x80080000.
+# Linked for QEMU virt's 0x40080000 instead, that copy writes the whole kernel
+# to an address this board has no memory at and branches into it.
+BAHAMUT_KERNEL_BASE ?= 0x80080000
+# cont_splash_region from the SM8150 tree — the buffer the panel is scanning.
+BAHAMUT_SPLASH_FB ?= 0x9c000000
+# An ordinary boot, not the smoke lane. The compiled-in aarch64 default is the
+# test cmdline (init=/bin/m12_smoke b1nix.test=1 ...), which on a phone means
+# PID 1 is a smoke-test binary and every in-kernel self-test and benchmark runs
+# on the way there — none of which is what this board is being brought up for.
+# No init= at all, so PID 1 is the normal /sbin/init.
+# THIS is the cmdline the kernel actually gets on this board — verified by the
+# `cmdline:` line the kernel prints next to its init spawn. The bootloader hands
+# over a device tree with no /chosen/bootargs, so neither a bootargs written
+# into our own tree nor the boot image header's cmdline reaches the kernel, and
+# the compiled-in default wins. (The packer still writes both, harmlessly, in
+# case a future bootloader honours them.)
+#
+# /bin/sh and /sbin/init live in the ext4 rootfs, which needs a block device
+# this board does not have — so PID 1 is a smoke binary from the initramfs,
+# which is the only userspace present here.
+# PID 1 is the default /sbin/init — BusyBox init, which reads /etc/inittab and
+# hands the service graph to OpenRC, exactly as on every other b1nix boot.
+#
+# It used to be b1nix.single, which maps to init=/bin/sh. A shell as PID 1 reads
+# its commands from stdin, and this board's stdin is a panel with no keyboard
+# attached — so the boot ran to completion and then stopped dead at a prompt
+# nobody could type into. That is the "hang" this board showed; nothing was
+# actually stuck.
+BAHAMUT_CMDLINE ?= "b1nix.loglevel=6"
+# 8x8 glyphs at 3x = 24 px per character: 45 columns on this panel, legible in
+# the hand rather than merely present.
+BAHAMUT_FONT_SCALE ?= 3
+# The same board, booted into the smoke suite.
+#
+# The suite is not driven by `init=` — it is driven by /etc/local.d/00-smoke.start,
+# which OpenRC runs in the `default` runlevel under BusyBox init, gated on
+# b1nix.test=1 plus a lane name. So PID 1 stays /sbin/init and the lane is
+# selected here; `sys` is the large one (processes, signals, IPC, VFS, mm).
+# The other lanes are blk, gfx, posix and init.
+#
+# Every marker goes to the panel, since that is this board's console. There is
+# no host script reading it, so the verdict is read off the screen.
+BAHAMUT_SMOKE_LANE ?= sys
+# b1nix.keep-running: the suite ends by powering the machine off, which on a
+# board whose console is its own panel throws the results away before anyone
+# can read them.
+BAHAMUT_TEST_CMDLINE ?= "b1nix.loglevel=6 b1nix.test=1 b1nix.keep-running b1nix.smoke=$(BAHAMUT_SMOKE_LANE)"
+.PHONY: bahamut bahamut-fast bahamut-test
+bahamut-test:
+	$(MAKE) ARCH=aarch64 KERNEL_BASE=$(BAHAMUT_KERNEL_BASE) \
+		FB_BOOT_MARKERS=$(BAHAMUT_SPLASH_FB) \
+		KERNEL_CMDLINE=$(BAHAMUT_TEST_CMDLINE) \
+		FB_FONT_SCALE=$(BAHAMUT_FONT_SCALE) build/aarch64/kernel.elf
+	sh tools/sony-xperia-5/mkramdisk_bahamut.sh
+	BAHAMUT_BOOTARGS=$(BAHAMUT_TEST_CMDLINE) python3 tools/sony-xperia-5/mkbootimg_bahamut.py
+
+bahamut:
+	@rm -f build/aarch64/kernel.elf build/aarch64/Image
+	$(MAKE) ARCH=aarch64 KERNEL_BASE=$(BAHAMUT_KERNEL_BASE) \
+		FB_BOOT_MARKERS=$(BAHAMUT_SPLASH_FB) \
+		KERNEL_CMDLINE=$(BAHAMUT_CMDLINE) \
+		FB_FONT_SCALE=$(BAHAMUT_FONT_SCALE) all
+	@# The ext4 ramdisk carries the only userspace this board has: /sbin/init,
+	@# BusyBox, musl and the test binaries all live in the rootfs, which needs a
+	@# block device the phone does not provide. Built here so `make bahamut`
+	@# produces a bootable image.
+	sh tools/sony-xperia-5/mkramdisk_bahamut.sh
+	BAHAMUT_BOOTARGS=$(BAHAMUT_CMDLINE) python3 tools/sony-xperia-5/mkbootimg_bahamut.py
+
+bahamut-fast:
+	$(MAKE) ARCH=aarch64 KERNEL_BASE=$(BAHAMUT_KERNEL_BASE) \
+		FB_BOOT_MARKERS=$(BAHAMUT_SPLASH_FB) \
+		KERNEL_CMDLINE=$(BAHAMUT_CMDLINE) \
+		FB_FONT_SCALE=$(BAHAMUT_FONT_SCALE) build/aarch64/kernel.elf
+	sh tools/sony-xperia-5/mkramdisk_bahamut.sh
+	python3 tools/sony-xperia-5/mkbootimg_bahamut.py
+
 run-rpi4: $(BUILD_DIR)/Image
 	@command -v qemu-system-aarch64 >/dev/null || (echo "missing qemu-system-aarch64"; exit 1)
 	qemu-system-aarch64 -machine raspi4b -m 2G -kernel $(BUILD_DIR)/Image -dtb tools/dts/bcm2711-rpi-4-b.dtb -serial stdio -serial null -display none
@@ -2398,19 +2567,19 @@ endif
 	@for n in dropbear dbclient dropbearkey dropbearconvert; do \
 		[ -L $(BUILD_DIR)/rootfs/bin/$$n ] && rm -f $(BUILD_DIR)/rootfs/bin/$$n; \
 	done; true
-	@cmp -s $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/make 2>/dev/null || cp -f --remove-destination $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/make
-	@cmp -s $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/bmake 2>/dev/null || cp -f --remove-destination $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/bmake
-	@cmp -s $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/samu 2>/dev/null || cp -f --remove-destination $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/samu
-	@cmp -s $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/ninja 2>/dev/null || cp -f --remove-destination $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/ninja
-	@cmp -s $(CURL_ELF) $(BUILD_DIR)/rootfs/bin/curl 2>/dev/null || cp -f --remove-destination $(CURL_ELF) $(BUILD_DIR)/rootfs/bin/curl
-	@cmp -s $(DROPBEAR_ELF) $(BUILD_DIR)/rootfs/bin/dropbear 2>/dev/null || cp -f --remove-destination $(DROPBEAR_ELF) $(BUILD_DIR)/rootfs/bin/dropbear
+	@cmp -s $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/make 2>/dev/null || { rm -f $(BUILD_DIR)/rootfs/bin/make; cp -f $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/make; }
+	@cmp -s $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/bmake 2>/dev/null || { rm -f $(BUILD_DIR)/rootfs/bin/bmake; cp -f $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/bmake; }
+	@cmp -s $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/samu 2>/dev/null || { rm -f $(BUILD_DIR)/rootfs/bin/samu; cp -f $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/samu; }
+	@cmp -s $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/ninja 2>/dev/null || { rm -f $(BUILD_DIR)/rootfs/bin/ninja; cp -f $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/ninja; }
+	@cmp -s $(CURL_ELF) $(BUILD_DIR)/rootfs/bin/curl 2>/dev/null || { rm -f $(BUILD_DIR)/rootfs/bin/curl; cp -f $(CURL_ELF) $(BUILD_DIR)/rootfs/bin/curl; }
+	@cmp -s $(DROPBEAR_ELF) $(BUILD_DIR)/rootfs/bin/dropbear 2>/dev/null || { rm -f $(BUILD_DIR)/rootfs/bin/dropbear; cp -f $(DROPBEAR_ELF) $(BUILD_DIR)/rootfs/bin/dropbear; }
 	@# The comparison here named no destination -- `cmp -s SRC \ 2>/dev/null`
 	@# left cmp with one operand and a stray word, so it failed every time and
 	@# the copy always ran.
 	@for n in dbclient dropbearkey scp ssh; do \
 		[ -f $(PKGROOT)/usr/bin/$$n ] || continue; \
 		cmp -s $(PKGROOT)/usr/bin/$$n $(BUILD_DIR)/rootfs/bin/$$n 2>/dev/null || \
-			cp -f --remove-destination $(PKGROOT)/usr/bin/$$n $(BUILD_DIR)/rootfs/bin/$$n; \
+			{ rm -f $(BUILD_DIR)/rootfs/bin/$$n; cp -f $(PKGROOT)/usr/bin/$$n $(BUILD_DIR)/rootfs/bin/$$n; }; \
 	done; true
 	@chmod +x $(BUILD_DIR)/rootfs/bin/make $(BUILD_DIR)/rootfs/bin/bmake \
 		$(BUILD_DIR)/rootfs/bin/samu $(BUILD_DIR)/rootfs/bin/ninja \
@@ -2426,12 +2595,17 @@ endif
 	@# migration made that path bootstrap-only) — stage them into rootfs/bin
 	@# directly, so /bin/init's discovery loop picks
 	@# them up.
-	@if [ -f tools/blobs/linux_hello.bin ]; then \
-		$(CIC) tools/blobs/linux_hello.bin $(BUILD_DIR)/rootfs/bin/m40-linux-hello; \
+	@# The blobs are per-architecture: a stock Linux binary is the subject of
+	@# the test, so it has to be a binary for the machine running it. Staging
+	@# the x86_64 pair everywhere made the aarch64 loader refuse both with
+	@# "ARCH MISMATCH", the shell then tried to run them as scripts, and all
+	@# 27 M40 checks failed for want of the file that was sitting right there.
+	@if [ -f tools/blobs/linux_hello$(M40_BLOB_SUFFIX).bin ]; then \
+		$(CIC) tools/blobs/linux_hello$(M40_BLOB_SUFFIX).bin $(BUILD_DIR)/rootfs/bin/m40-linux-hello; \
 		chmod +x $(BUILD_DIR)/rootfs/bin/m40-linux-hello; \
 	fi
-	@if [ -f tools/blobs/linux_abi_test.bin ]; then \
-		$(CIC) tools/blobs/linux_abi_test.bin $(BUILD_DIR)/rootfs/bin/m40-linux-abi; \
+	@if [ -f tools/blobs/linux_abi_test$(M40_BLOB_SUFFIX).bin ]; then \
+		$(CIC) tools/blobs/linux_abi_test$(M40_BLOB_SUFFIX).bin $(BUILD_DIR)/rootfs/bin/m40-linux-abi; \
 		chmod +x $(BUILD_DIR)/rootfs/bin/m40-linux-abi; \
 	fi
 	@if [ -f tools/blobs/hello_b1nix.elf ]; then \

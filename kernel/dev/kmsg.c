@@ -158,6 +158,65 @@ static usize kmsg_next(u64 *cursor, char *out, usize cap) {
   return n;
 }
 
+/* Snapshot the tail of the ring, then print it later.
+ *
+ * For a board whose only console is its own panel. When the stall watchdog
+ * fires, what everyone wants is the handful of lines printed just before the
+ * silence — and those have already scrolled off the top, with no serial log and
+ * no shell to run `dmesg` from.
+ *
+ * Why this is two calls and not one: the watchdog prints a long task dump, and
+ * that dump goes into this same ring. Reading the tail afterwards therefore
+ * replays the dump's own output and nothing else — which is exactly what the
+ * single-call version did. So the capture happens before the dump and the
+ * printing after it, which is also the order that leaves the interesting lines
+ * at the bottom of the screen, where they survive.
+ */
+#define KMSG_TAIL_LINES 16
+#define KMSG_TAIL_TEXT 128
+static char g_tail[KMSG_TAIL_LINES][KMSG_TAIL_TEXT];
+static unsigned g_tail_count;
+
+void kmsg_capture_tail(void) {
+  u64 flags, cursor, next, first;
+
+  spin_lock_irqsave(&kmsg_lock, &flags);
+  next = g_next_seq;
+  first = g_first_seq;
+  spin_unlock_irqrestore(&kmsg_lock, flags);
+
+  cursor = (next > KMSG_TAIL_LINES) ? next - KMSG_TAIL_LINES : first;
+  if (cursor < first)
+    cursor = first;
+
+  g_tail_count = 0;
+  while (cursor < next && g_tail_count < KMSG_TAIL_LINES) {
+    spin_lock_irqsave(&kmsg_lock, &flags);
+    if (cursor < g_first_seq)
+      cursor = g_first_seq;
+    if (cursor >= g_next_seq) {
+      spin_unlock_irqrestore(&kmsg_lock, flags);
+      break;
+    }
+    /* Text only — the "6,123,456,-;" prefix /dev/kmsg readers parse costs a
+     * third of a 45-column line here and says nothing a person needs. */
+    strncpy(g_tail[g_tail_count], g_ring[cursor % KMSG_RECORDS].text,
+            KMSG_TAIL_TEXT - 1);
+    g_tail[g_tail_count][KMSG_TAIL_TEXT - 1] = '\0';
+    g_tail_count++;
+    cursor++;
+    spin_unlock_irqrestore(&kmsg_lock, flags);
+  }
+}
+
+void kmsg_print_captured(void) {
+  console_write("--- last log lines before the stall ---\n");
+  for (unsigned i = 0; i < g_tail_count; i++) {
+    console_write(g_tail[i]);
+    console_write("\n");
+  }
+}
+
 static int kmsg_pending(u64 cursor) {
   u64 flags;
   int p;

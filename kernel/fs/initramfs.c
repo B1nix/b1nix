@@ -33,6 +33,7 @@
 #include "initramfs_m31_setuid.inc"
 #include "initramfs_m32_smoke.inc"
 #include "initramfs_m56_smoke.inc"
+#include "initramfs_m109_switchroot.inc"
 #ifdef B1NIX_MUSL
 #include "initramfs_ld_musl_aarch64_so_1.inc"
 #endif
@@ -66,6 +67,12 @@ static const struct initramfs_file files[] = {
      * not the ext4 rootfs — request_module() runs during early boot, long
      * before a real root is mounted. */
     B1NIX_MODULE_INITRAMFS_FILES
+    /* M109: root=initramfs boots this as PID 1 via the /init-shebang
+     * interpreter line; it mounts the real root and hands over to
+     * switch_root. Same pair the x86_64 file set carries below. */
+    {"/init", (const char *)vfs_m109_switchroot_elf,
+     sizeof(vfs_m109_switchroot_elf), INITRAMFS_EXECUTABLE},
+    {"/init-shebang", "#!/init\n", 8, INITRAMFS_EXECUTABLE},
     {"/sbin/.keep", "", 0, 0},
     {"/etc/init.d/.keep", "", 0, 0},
     {"/etc/conf.d/.keep", "", 0, 0},

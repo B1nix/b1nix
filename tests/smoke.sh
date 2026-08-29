@@ -289,6 +289,14 @@ run_qemu() {
 			local lane_cmdline="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.e1000-subnet=3 b1nix.smoke=$lane ${SMOKE_EXTRA_CMDLINE:-}"
 			[ "$lane" = "openrc" ] && lane_cmdline="init=/sbin/openrc-init b1nix.test=1 b1nix.e1000-subnet=3 b1nix.openrc-ctltest"
 			[ "$lane" = "init" ] && lane_cmdline="b1nix.test=1 b1nix.e1000-subnet=3 b1nix.smoke=init"
+			# SMOKE_CMDLINE_switchroot in the Makefile, which the other arches
+			# bake into iso-switchroot. Without it this lane booted like any
+			# other -- ordinary root on the disk, PID 1 the usual init -- and
+			# then failed five checks for not having switched a root it was
+			# never asked to switch. root=initramfs keeps / on the RAM
+			# filesystem so the disk is a second one to move onto, which is
+			# the whole point of the instance.
+			[ "$lane" = "switchroot" ] && lane_cmdline="b1nix.test=1 b1nix.smoke=switchroot root=initramfs init=/init-shebang"
 			kernel_args="-kernel $PROJECT_DIR/build/aarch64/Image"
 			if [ "$(uname)" = "Darwin" ]; then
 				accel_args="-accel hvf -cpu host"
@@ -683,7 +691,25 @@ fi
 pass "kernel builds without errors"
 echo "  build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso} ready"
 if [ -z "$MKE2FS" ] || [ ! -x "$MKE2FS" ]; then
-    MKE2FS=$(command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || command printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
+    # Both tools from the SAME e2fsprogs, and preferably not from PATH.
+    #
+    # Homebrew keeps e2fsprogs keg-only: it links mke2fs and nothing else, and
+    # on a machine with android-platform-tools installed even that one is
+    # theirs. So `command -v mke2fs` answered /opt/homebrew/bin/mke2fs, its
+    # directory holds no debugfs, and the ownership pass below silently did
+    # nothing -- the guest rootfs kept the build host's uid, /bin/su elevated
+    # to 501 instead of root, and six checks failed with no visible cause but
+    # one warning line in a three-thousand-line log.
+    _e2fsdir=""
+    for _d in /opt/homebrew/opt/e2fsprogs/sbin /usr/local/opt/e2fsprogs/sbin /sbin /usr/sbin; do
+        if [ -x "$_d/mke2fs" ] && [ -x "$_d/debugfs" ]; then _e2fsdir="$_d"; break; fi
+    done
+    if [ -n "$_e2fsdir" ]; then
+        MKE2FS="$_e2fsdir/mke2fs"; DEBUGFS="$_e2fsdir/debugfs"
+    else
+        MKE2FS=$(command -v mke2fs 2>/dev/null || printf '%s' /sbin/mke2fs)
+        DEBUGFS=$(command -v debugfs 2>/dev/null || printf '%s' /sbin/debugfs)
+    fi
 fi
 if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
     echo "Error: mke2fs utility not found. Please install e2fsprogs."
@@ -704,8 +730,13 @@ _mkimg() {  # mkimg <instance-suffix>
         dd if=/dev/zero of="$_usb" bs=1M count=2 2>/dev/null
         dd if=/dev/zero of="$(disk_img vblk "$1")" bs=1M count=4 2>/dev/null
         rm -f "$_sata"
+        # -L b1nix-root, the same label mk-root-image.sh stamps. Without it the
+        # aarch64 root disk had no volume name at all: `findfs LABEL=` answered
+        # ENOENT, and the kernel's own find_device_by_label() path -- the one it
+        # prefers when the command line names no root -- could not match either,
+        # so the root was found only by the bare-first-disk fallback.
         "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q \
-            -d "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512m || {
+            -L b1nix-root -d "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512m || {
             echo "Error: Failed to build aarch64 rootfs image."; exit 1
         }
         # mke2fs -d copies each file's ownership from the build host, so on a
@@ -717,15 +748,25 @@ _mkimg() {  # mkimg <instance-suffix>
         # one sif pair per path; it is a single invocation over the staging
         # tree, which takes a couple of seconds.
         _debugfs="$DEBUGFS"
-        [ -n "$_debugfs" ] || _debugfs=$(command -v debugfs 2>/dev/null || true)
-        [ -n "$_debugfs" ] || _debugfs="$(dirname "$MKE2FS")/debugfs"
         if [ -x "$_debugfs" ]; then
             ( cd "$PROJECT_DIR/build/$ARCH/rootfs" && find . -mindepth 1 ) |
                 sed 's|^\.||' |
                 awk '{ printf "sif %s uid 0\nsif %s gid 0\n", $0, $0 }' |
                 "$_debugfs" -w -f - "$_sata" >/dev/null 2>&1 || true
+            # ...and the setuid inodes, from the same list root.ext4 uses.
+            # Copying ownership and stopping there is what left unix_chkpwd
+            # non-setuid and /etc/shadow world-readable on every aarch64 lane.
+            DEBUGFS="$_debugfs" sh "$PROJECT_DIR/tools/images/stamp-root-modes.sh" "$_sata"
         else
-            echo "  (no debugfs — guest rootfs keeps build-host ownership)"
+            # Not a warning. Without this pass every file in the guest root is
+            # owned by the build host's uid, so every setuid-root binary
+            # elevates to a user that does not exist and the security checks
+            # fail for a reason nothing in their output names. A run that
+            # cannot be trusted should not start.
+            echo "Error: debugfs not found ($DEBUGFS) — the guest rootfs would"
+            echo "       keep the build host's ownership and the setuid checks"
+            echo "       would fail for that reason alone. brew install e2fsprogs"
+            exit 1
         fi
         "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_nvme" 2>/dev/null
         # A separate image for the AHCI controller: on this arch $_sata is the
@@ -1148,8 +1189,20 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
 	_inst_list="sys blk posix gfx openrc init switchroot iommu amdvi"
-	# The Raspberry Pi lane exists only where QEMU can model the board.
-	if [ "$ARCH" = "aarch64" ] &&
+	# The Raspberry Pi lane is off by default, and not because it is broken.
+	#
+	# It is the one instance no accelerator can take: HVF needs -cpu host and
+	# raspi4b is a fixed Cortex-A72, so it runs four emulated cores under TCG
+	# while every other lane runs at native speed. That is the whole of the
+	# difference between this suite taking five minutes and taking twenty --
+	# its own stall allowance is 900 s, which is most of the wall clock of a
+	# green run.
+	#
+	# The board is not currently working anyway, and the same argument the
+	# x86_64 suite already makes applies here: emulate the drivers, confirm the
+	# machine on the machine. AArch64 is verified on QEMU virt and then on the
+	# Xperia 5. Set SMOKE_RASPI_LANE=1 when the board itself is the subject.
+	if [ "${SMOKE_RASPI_LANE:-0}" = "1" ] && [ "$ARCH" = "aarch64" ] &&
 	   qemu-system-aarch64 -machine help 2>/dev/null | grep -q "^raspi4b "; then
 		_inst_list="$_inst_list raspi"
 	fi
@@ -2535,7 +2588,7 @@ check_output "$GFX_LOG" "M107-FB: ok render" "a character written to the kernel 
 # cores brought up from a spin table rather than PSCI. Everything checked
 # here is answered by the board's firmware or its hardware, so a driver that
 # quietly stops driving anything fails instead of printing nothing.
-if [ "$ARCH" = "aarch64" ]; then
+if [ "$ARCH" = "aarch64" ] && [ "${SMOKE_RASPI_LANE:-0}" = "1" ]; then
 	if qemu-system-aarch64 -machine help 2>/dev/null | grep -q "^raspi4b "; then
 		check_output "$RASPI_LOG" "platform: Raspberry Pi 4" "the board is identified from its device tree"
 		check_output "$RASPI_LOG" "emmc2: mmcblka" "the SD host controller enumerates the card"
@@ -2559,6 +2612,9 @@ if [ "$ARCH" = "aarch64" ]; then
 		pass "Raspberry Pi 4 lane (skipped — this QEMU has no raspi4b machine)"
 	fi
 fi
+# Nothing is reported when the lane is off. Not a pass and not a BLOCKED row:
+# the checks did not run, the board was not exercised, and a suite that prints
+# a line either way trains everyone to stop reading it. SMOKE_RASPI_LANE=1.
 check_output "$LOG" "M107-SMOKE: ok vt-state" "VT_GETSTATE and VT_OPENQRY agree about which virtual terminals are allocated"
 check_output "$LOG" "M107-SMOKE: ok vt-switch" "VT_ACTIVATE/VT_WAITACTIVE move the console and a background VT keeps its screen"
 check_output "$LOG" "M107-SMOKE: ok vt-disallocate" "VT_DISALLOCATE refuses the active VT and frees an idle one"
@@ -2590,13 +2646,22 @@ check_output "$LOG" "M107-SMOKE: ok applet-chvt" "BusyBox chvt switches the acti
 check_output "$LOG" "M107-SMOKE: done" "M107 subsystem suite completes"
 # ── M109: AF_PACKET, pivot_root(2), volume identity ──
 check_output "$BLK_LOG" "M109-SMOKE: ok packet-socket" "an AF_PACKET socket binds to an interface and getsockname reports a 20-byte sockaddr_ll"
-check_output "$BLK_LOG" "MTD-SMOKE: ok erase-all" "flash_eraseall erases the CFI NOR chip QEMU provides through -drive if=pflash"
-check_output "$BLK_LOG" "MTD-SMOKE: ok erase-yields-ones" "an erased flash block reads back as all-ones"
-check_output "$BLK_LOG" "MTD-SMOKE: ok program" "a pattern written to /dev/mtd0 reads back byte for byte"
-check_output "$BLK_LOG" "MTD-SMOKE: ok program-command-path" "the CFI program sequence (clear status, program, data, poll) completes on the chip"
-check_output "$BLK_LOG" "MTD-SMOKE: ok erase-restores-ones" "erasing lifts those bits back to one"
-check_output "$BLK_LOG" "MTD-SMOKE: ok mtdblock-node" "the same chip is reachable as a block device for a filesystem"
-check_output "$BLK_LOG" "MTD-SMOKE: done" "the flash wave completes"
+# The CFI NOR chip reaches the guest only through `-drive if=pflash`, and QEMU
+# offers pflash on x86_64 by pairing it with the machine's firmware in unit 0.
+# QEMU virt has no such pairing here, so this arch is given no flash at all --
+# the checks below would be asking about a chip that is not plugged in, and a
+# failure that says nothing about the kernel is worse than an honest absence.
+if [ "$ARCH" = "aarch64" ]; then
+	skipped "MTD: the CFI NOR flash wave" "no pflash chip on this machine — QEMU virt is not given one"
+else
+	check_output "$BLK_LOG" "MTD-SMOKE: ok erase-all" "flash_eraseall erases the CFI NOR chip QEMU provides through -drive if=pflash"
+	check_output "$BLK_LOG" "MTD-SMOKE: ok erase-yields-ones" "an erased flash block reads back as all-ones"
+	check_output "$BLK_LOG" "MTD-SMOKE: ok program" "a pattern written to /dev/mtd0 reads back byte for byte"
+	check_output "$BLK_LOG" "MTD-SMOKE: ok program-command-path" "the CFI program sequence (clear status, program, data, poll) completes on the chip"
+	check_output "$BLK_LOG" "MTD-SMOKE: ok erase-restores-ones" "erasing lifts those bits back to one"
+	check_output "$BLK_LOG" "MTD-SMOKE: ok mtdblock-node" "the same chip is reachable as a block device for a filesystem"
+	check_output "$BLK_LOG" "MTD-SMOKE: done" "the flash wave completes"
+fi
 check_output "$BLK_LOG" "M109-SMOKE: ok packet-tx-rx" "a frame sent on one packet socket arrives byte-for-byte on another, with its MAC, ethertype and ifindex"
 check_output "$BLK_LOG" "M109-SMOKE: ok packet-filter" "a socket bound to one ethertype does not see another's frames, while ETH_P_ALL sees both"
 check_output "$BLK_LOG" "M109-SMOKE: ok packet-dgram" "AF_PACKET SOCK_DGRAM strips the header on receive and builds it from the sockaddr_ll on send"
@@ -2898,10 +2963,17 @@ check_output "$BLK_LOG" "M109-SMOKE: ok fstrim-keeps-data" "a file written befor
 check_output "$BLK_LOG" "M109-SMOKE: ok fstrim-applet" "BusyBox fstrim runs on the mount point"
 check_output "$BLK_LOG" "M109-SMOKE: ok ioprio-roundtrip" "ioprio_set/ioprio_get round-trip a class and level, and refuse a class that does not exist"
 check_output "$BLK_LOG" "M109-SMOKE: ok ioprio-applet" "BusyBox ionice sets a process's I/O class and reads it back"
-check_output "$BLK_LOG" "M109-SMOKE: ok serial-line" "tcsetattr reprograms COM2's baud, word length, parity and stop bits, and tcgetattr reports the chip"
-check_output "$BLK_LOG" "M109-SMOKE: ok serial-badbaud" "a baud rate the divisor cannot express is refused, leaving the line as it was"
-check_output "$BLK_LOG" "M109-SMOKE: ok serial-modem" "TIOCMGET reads the real modem lines and TIOCMBIC/TIOCMBIS change one"
-check_output "$BLK_LOG" "M109-SMOKE: ok serial-setserial" "TIOCGSERIAL reports COM2's actual port, IRQ and clock, and TIOCSSERIAL refuses to fake changing them"
+# These four drive COM2 -- a SECOND 16550, which is an x86 PC thing. QEMU virt
+# gives this arch one PL011 and it is the console, so there is no second line to
+# reprogram, and nothing here is about a kernel defect.
+if [ "$ARCH" = "aarch64" ]; then
+	skipped "M109: the COM2 termios/modem/setserial wave" "no second UART on this machine — virt has one PL011 and it is the console"
+else
+	check_output "$BLK_LOG" "M109-SMOKE: ok serial-line" "tcsetattr reprograms COM2's baud, word length, parity and stop bits, and tcgetattr reports the chip"
+	check_output "$BLK_LOG" "M109-SMOKE: ok serial-badbaud" "a baud rate the divisor cannot express is refused, leaving the line as it was"
+	check_output "$BLK_LOG" "M109-SMOKE: ok serial-modem" "TIOCMGET reads the real modem lines and TIOCMBIC/TIOCMBIS change one"
+	check_output "$BLK_LOG" "M109-SMOKE: ok serial-setserial" "TIOCGSERIAL reports COM2's actual port, IRQ and clock, and TIOCSSERIAL refuses to fake changing them"
+fi
 
 # Limits that used to be compiled in. Both checks deliberately exceed the old
 # constant, so they can only pass on a kernel that derives the limit at runtime.

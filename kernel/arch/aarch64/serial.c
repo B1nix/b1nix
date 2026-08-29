@@ -64,8 +64,83 @@
 #define MU_CORE_CLOCK_HZ 500000000u
 #define MU_FALLBACK_BAUD 115200u
 
+
+/* ── Qualcomm GENI QUP UART (Snapdragon 855 / SM8150 ttyMSM0) ────────────────
+ *
+ * Neither a PL011 nor an 8250: bytes are not stored into a data register, they
+ * are handed to a serial engine that runs a TX *command* over a FIFO. The
+ * bootloader has already clocked, pinmuxed and configured the port (it prints
+ * its own log through it), so none of that is repeated here - this only issues
+ * commands, which is all a console needs.
+ */
+#define GENI_STATUS            0x040
+#define GENI_STATUS_M_ACTIVE   (1u << 0)
+#define GENI_M_CMD0            0x600
+#define GENI_M_IRQ_STATUS      0x610
+#define GENI_M_IRQ_CLEAR       0x618
+#define GENI_TX_FIFO           0x700
+#define GENI_RX_FIFO           0x780
+#define GENI_RX_FIFO_STATUS    0x804
+#define GENI_TX_WATERMARK      0x80c
+#define GENI_UART_TX_TRANS_LEN 0x270
+#define GENI_M_CMD_DONE        (1u << 0)
+#define GENI_M_TX_WATERMARK    (1u << 30)
+#define GENI_UART_START_TX     (1u << 27) /* opcode 1, M_OPCODE_SHFT = 27 */
+
+/* Set by bootinfo when the tree's console node is a "qcom,msm-geni-console". */
+int g_aarch64_uart_is_geni;
+
+#define GENI_REG(off) (*(volatile u32 *)(UART_BASE + (off)))
+
+/* Bounded spin: a wedged serial engine must not wedge the kernel with it. */
+static int geni_wait(u32 off, u32 mask, int set)
+{
+	for (u32 i = 0; i < 100000; i++) {
+		u32 v = GENI_REG(off);
+
+		if (set ? (v & mask) : !(v & mask))
+			return 1;
+	}
+	return 0;
+}
+
+/* ponytail: one command per byte. A console is not a throughput path, and
+ * batching means tracking a partially-drained FIFO across calls. */
+static void geni_putc(char c)
+{
+	geni_wait(GENI_STATUS, GENI_STATUS_M_ACTIVE, 0);
+	GENI_REG(GENI_UART_TX_TRANS_LEN) = 1;
+	GENI_REG(GENI_TX_WATERMARK) = 1;
+	GENI_REG(GENI_M_CMD0) = GENI_UART_START_TX;
+
+	if (!geni_wait(GENI_M_IRQ_STATUS, GENI_M_TX_WATERMARK, 1))
+		return;
+	GENI_REG(GENI_TX_FIFO) = (u32)(u8)c;
+	GENI_REG(GENI_M_IRQ_CLEAR) = GENI_M_TX_WATERMARK;
+
+	if (geni_wait(GENI_M_IRQ_STATUS, GENI_M_CMD_DONE, 1))
+		GENI_REG(GENI_M_IRQ_CLEAR) = GENI_M_CMD_DONE;
+}
+
+/* Some boards have no console UART this kernel can drive: every serial engine
+ * the tree describes is marked disabled, and bringing one up needs the clock
+ * and pinctrl drivers this port does not have. platform_uart_base() is zero
+ * there, and every entry point below turns into a no-op rather than reading
+ * and writing a register window that belongs to a powered-down block. */
+static inline int serial_absent(void)
+{
+	return UART_BASE == 0;
+}
+
 void serial_init(void)
 {
+	if (serial_absent())
+		return;
+
+	/* The GENI engine is left exactly as the bootloader configured it. */
+	if (g_aarch64_uart_is_geni)
+		return;
+
 	/* Always initialize PL011 on QEMU and RPi4 */
 	volatile u32 *pl011_cr = (volatile u32 *)((platform_type() == PLATFORM_RPI4 ? 0xfe201000ULL : UART_BASE) + 0x30);
 	*pl011_cr |= (1u << 0) | (1u << 8) | (1u << 9);
@@ -113,6 +188,9 @@ void serial_init(void)
 
 void serial_putc(char c)
 {
+	if (serial_absent())
+		return;
+
 	if (platform_type() == PLATFORM_RPI4) {
 		/* Dual-write to both PL011 and Mini-UART on RPi4 */
 		volatile u32 *pl011_fr = (volatile u32 *)(0xfe201000ULL + 0x18);
@@ -130,6 +208,11 @@ void serial_putc(char c)
 				break;
 		}
 		*mu_io = (u32)(u8)c;
+		return;
+	}
+
+	if (g_aarch64_uart_is_geni) {
+		geni_putc(c);
 		return;
 	}
 
@@ -161,6 +244,13 @@ void serial_write(const char *text)
 
 int serial_has_data(void)
 {
+	if (serial_absent())
+		return 0;
+	/* GENI receive needs its own RX command sequence; a phone has no serial
+	 * cable attached anyway, so the console there is output-only.
+	 * ponytail: add the RX path when something actually types into it. */
+	if (g_aarch64_uart_is_geni)
+		return 0;
 	if (g_aarch64_uart_is_mini)
 		return (MU_LSR & MU_LSR_RX_READY) != 0;
 	return !(PL011_FR & PL011_FR_RXFE);
@@ -177,7 +267,7 @@ char serial_getc(void)
 
 int serial_port_present(int idx)
 {
-	return (idx == 0);
+	return (idx == 0) && !serial_absent();
 }
 
 void serial_port_putc(int idx, char ch)
@@ -194,3 +284,40 @@ int serial_port_has_data(int idx)
 {
 	return (idx == 0) ? serial_has_data() : 0;
 }
+
+/*
+ * The tty layer's chip-level knobs. Every one of them is an 8250 idea — a
+ * divisor latch, a modem control register, an I/O port number — and none of
+ * the three controllers here has any of them: a PL011 has no port address, the
+ * mini-UART's divisor follows a clock this kernel cannot read, and a GENI's
+ * line settings live behind the serial engine's own command interface.
+ *
+ * ponytail: report "not configurable" rather than invent registers. The tty
+ * layer already handles a port that refuses, and nothing on these boards has a
+ * modem attached to the other end of the line.
+ */
+int serial_port_set_line(int idx, u32 baud, u8 data_bits, u8 parity,
+                         u8 stop_bits)
+{
+	(void)idx; (void)baud; (void)data_bits; (void)parity; (void)stop_bits;
+	return -1;
+}
+
+int serial_port_get_line(int idx, u32 *baud, u8 *data_bits, u8 *parity,
+                         u8 *stop_bits)
+{
+	if (idx != 0)
+		return -1;
+	if (baud) *baud = 115200;
+	if (data_bits) *data_bits = 8;
+	if (parity) *parity = 0;
+	if (stop_bits) *stop_bits = 1;
+	return 0;
+}
+
+u8 serial_port_get_mcr(int idx) { (void)idx; return 0; }
+void serial_port_set_mcr(int idx, u8 mcr) { (void)idx; (void)mcr; }
+u8 serial_port_get_msr(int idx) { (void)idx; return 0; }
+
+/* TIOCGSERIAL's port field. There is no I/O port space on arm64. */
+u16 serial_port_base(int idx) { (void)idx; return 0; }

@@ -425,10 +425,25 @@ CROSS_AS_PROBE := clang --target=$(B1NIX_ARCH)-unknown-elf -c
 B1CC_TARGET_OK := $(shell [ -x $(B1CC) ] && printf 'int g;const char*s="x";int main(void){g=1;return s[0]+g;}\n' > $(BUILD)/.b1cc_probe.c && \
   $(B1CC) --target=$(B1NIX_ARCH)-b1nix -S $(BUILD)/.b1cc_probe.c -o $(BUILD)/.b1cc_probe.s >/dev/null 2>&1 && \
   $(CROSS_AS_PROBE) $(BUILD)/.b1cc_probe.s -o $(BUILD)/.b1cc_probe.o >/dev/null 2>&1 && echo yes)
+# WARNING, and it is not a style point: on aarch64 this gate is the only reason
+# /bin/b1cc works at all.
+#
+# The b1cc submodule's arm64 backend emits Mach-O assembly syntax only (21
+# @PAGE references, no :lo12:), so a b1cc built from it cannot produce an ELF
+# object for this target -- rebuilding it makes even `compile-hello` fail with
+# "elf_write_object: failed to produce ELF object". The compiler that does work
+# here was built from a tree carrying an aarch64 ELF flavour that is NOT in the
+# submodule's main, and it survives only because this gate has been skipping
+# the rebuild. Ungating it ships a compiler that cannot compile.
+#
+# So: do not "fix" this by moving $(BUILD)/bin/b1cc out of the conditional. The
+# fix is to land the aarch64 ELF backend in the b1cc repository; until then the
+# binary in the rootfs is an artifact no one can reproduce from source, which
+# is worth saying out loud.
 ifeq ($(B1CC_TARGET_OK),yes)
 BINARIES += $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke
 else
-$(info b1cc: cannot yet produce $(B1NIX_ARCH)-b1nix objects (arm64 codegen works; its assembly is still Mach-O syntax) — M5/M7/M32-M34 b1cc corpus not built)
+$(info b1cc: cannot yet produce $(B1NIX_ARCH)-b1nix objects (arm64 codegen works; its assembly is still Mach-O syntax) — M5/M7/M32-M34 b1cc corpus not built, and /bin/b1cc is NOT rebuilt: the copy in the rootfs is the last one that could)
 endif
 
 ifeq ($(B1NIX_ARCH),x86_64)

@@ -29,6 +29,7 @@
 #include <b1nix/panic.h>
 #include <b1nix/runqueue.h>
 #include <b1nix/sched.h>
+#include <b1nix/bootmark.h>
 
 /* PSCI 0.2+ 64-bit calls. CPU_ON takes (target MPIDR, entry point, context id)
  * and returns 0 on success; the entry point is physical, since the CPU it
@@ -200,14 +201,24 @@ static long psci_cpu_on(u64 target_mpidr, u64 entry_phys, u64 context_id)
 	register u64 x2 __asm__("x2") = entry_phys;
 	register u64 x3 __asm__("x3") = context_id;
 
-	/* HVC is QEMU virt's conduit, and the only one this port has met. A board
-	 * that uses SMC reports so in its device tree's psci node; when one turns
-	 * up, read `method` there rather than trying both — an unimplemented HVC
-	 * at EL1 is an exception, not a return value. */
-	__asm__ volatile("hvc #0"
-	                 : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
-	                 :
-	                 : "memory");
+	/* The conduit comes from the tree's /psci node, exactly as the previous
+	 * comment here said it would have to once a second board turned up. QEMU
+	 * virt answers on HVC; a Snapdragon runs ATF at EL3 and declares
+	 * method = "smc". Trying both is not an option: an HVC at EL1 with no
+	 * hypervisor behind it raises an exception rather than returning an error,
+	 * so guessing wrong does not fail, it kills the boot. */
+	extern int fdt_psci_use_smc(void);
+
+	if (fdt_psci_use_smc())
+		__asm__ volatile("smc #0"
+		                 : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
+		                 :
+		                 : "memory");
+	else
+		__asm__ volatile("hvc #0"
+		                 : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
+		                 :
+		                 : "memory");
 	return (long)x0;
 }
 
@@ -404,7 +415,13 @@ int smp_boot_aps(void)
 		if (fdt_cpu_enable_method() == FDT_ENABLE_METHOD_SPIN_TABLE) {
 			spin_table_release(target, fdt_cpu_release_addr(i));
 		} else {
+			/* 80 + cpu while the firmware call is in flight, 90 + cpu once
+			 * it has returned. An SMC that never comes back leaves the
+			 * first of those on screen, which is the one thing the return
+			 * code cannot tell us. */
+			BOOTMARK(80 + index);
 			long rc = psci_cpu_on(target, (u64)(usize)&_ap_start, index);
+			BOOTMARK(90 + index);
 
 			if (rc != PSCI_SUCCESS) {
 				console_write("smp: CPU_ON refused for cpu ");

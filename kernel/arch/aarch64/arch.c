@@ -165,6 +165,97 @@ u64 arch_tsc_monotonic_ns(void)
 	return (t / f) * 1000000000ull + ((t % f) * 1000000000ull) / f;
 }
 
+/* Busy-wait a real number of microseconds against the generic timer.
+ *
+ * The x86 counterpart counts port-0x80 reads when it has no calibrated clock;
+ * there are no I/O ports here and CNTFRQ_EL0 is architecturally constant, so
+ * this is exact whenever the counter exists at all. */
+void arch_udelay(u32 us)
+{
+	u64 f = cntfrq();
+
+	if (!f) {
+		/* No counter: spin a fixed number of relax hints per microsecond.
+		 * Unmeasured, and deliberately so — the alternative is not waiting. */
+		for (u32 i = 0; i < us * 50u; i++)
+			cpu_relax();
+		return;
+	}
+
+	u64 start = cntvct();
+	u64 want = ((u64)us * f) / 1000000ull;
+
+	while (cntvct() - start < want)
+		cpu_relax();
+}
+
+/* The scheduler tick, as this arch programs it: kernel/arch/aarch64/interrupts.c
+ * reloads CNTV_TVAL_EL0 with CNTFRQ_EL0/100 every time, so the rate is not a
+ * guess here the way it is on x86 when the LAPIC will not calibrate. */
+u32 sched_tick_hz(void) { return 100u; }
+
+/* ── Boot-stack accounting ──────────────────────────────────────────────────
+ *
+ * boot.S reserves one 64 KiB stack for the boot CPU between stack_bottom and
+ * stack_top. Only stack_top is global, so the far end is named by subtraction.
+ * Painting must leave the frames already in use alone: this is called from
+ * kernel_main, which is itself on this stack. */
+#define BOOT_STACK_PAINT 0x5Au
+
+/* Both ends, so the size is boot.S's alone. It used to be repeated here as a
+ * literal, which is a second place to forget. */
+extern u8 stack_bottom[];
+extern u8 stack_top[];
+
+static u64 boot_stack_size(void)
+{
+	return (u64)(usize)stack_top - (u64)(usize)stack_bottom;
+}
+
+void boot_stack_paint(void)
+{
+	u8 *bottom = stack_bottom;
+	/* A margin below the current frame, so painting cannot reach into the
+	 * frame doing the painting. */
+	u64 limit = (u64)(usize)__builtin_frame_address(0) - 256;
+
+	for (u8 *p = bottom; (u64)(usize)p < limit; p++)
+		*p = BOOT_STACK_PAINT;
+}
+
+u64 boot_stack_size_bytes(void) { return boot_stack_size(); }
+
+u64 boot_stack_peak_bytes(void)
+{
+	const u8 *b = stack_bottom;
+	u64 size = boot_stack_size();
+	u64 clean = 0;
+
+	while (clean < size && b[clean] == BOOT_STACK_PAINT)
+		clean++;
+	return size - clean;
+}
+
+/* Secondary-CPU stack usage is not instrumented on this arch: the APs here do
+ * not get painted stacks the way the x86 trampoline paints them. Reporting a
+ * zero total is how the caller learns the figure is absent rather than small. */
+u64 ap_stack_peak(u64 *total_out)
+{
+	if (total_out)
+		*total_out = 0;
+	return 0;
+}
+
+/* The address-space edit ring is x86-only for now: its storage and its two
+ * dump functions live in kernel/arch/x86_64/paging.c. Recording is called from
+ * shared code, so it needs a definition here; there is nowhere to put the
+ * entry yet, and inventing a second ring that nothing prints would be worse
+ * than an honest gap. */
+void vma_trace_record(const char *what, u64 start, u64 end)
+{
+	(void)what; (void)start; (void)end;
+}
+
 /* MIDR_EL1 — the processor's own identity register (ARM ARM D17.2.100):
  * Implementer[31:24], Variant[23:20], Architecture[19:16], PartNum[15:4],
  * Revision[3:0]. There is nothing to measure or guess here. */
@@ -292,6 +383,7 @@ static void psci_call(u32 fn)
 }
 
 #include <b1nix/bcm2835.h>
+#include "platform.h"
 
 void arch_psci_poweroff(void)
 {
@@ -451,3 +543,183 @@ void iommu_fault_last(u64 *addr, u16 *source, u8 *reason) {
  * set/way whole-hierarchy flush. The version here hardcoded a 64-byte line;
  * that one reads CTR_EL0.DminLine. */
 
+
+/*
+ * x86_64-only diagnostics, answered here so the shared callers link.
+ *
+ * acpi_cpu_count: no board this kernel runs on arm64 boots via ACPI — CPUs come
+ * from the device tree, and bootinfo_cpu_count() already reports them.
+ * pf_prof_dump: the page-fault profiler is built on x86_64's fault frame and
+ * has no arm64 counterpart yet. kprof is no longer among these — it moved to
+ * kernel/lib/kprof.c and samples ELR_EL1 off the CNTV tick.
+ */
+int acpi_cpu_count(void) { return 0; }
+void pf_prof_dump(void) {}
+
+/* ── Visual boot markers, C side ─────────────────────────────────────────────
+ *
+ * The companion to FBMARK in boot.S. Those five bands prove the assembly
+ * prologue ran; this carries the same signal through kernel_main, which is
+ * where a board with no serial cable otherwise goes dark.
+ *
+ * It draws ONE number, very large, overwriting the previous one: the index of
+ * the last milestone reached. Bands and coloured squares were the first two
+ * attempts and both failed the same way — reporting the result meant counting
+ * shapes and naming colours, which is exactly the kind of question a person
+ * standing over a phone should not have to answer precisely. A number is read,
+ * not counted.
+ *
+ * The framebuffer is the one the bootloader was scanning out of, reached
+ * through the direct map (identity mapped) — no driver, no allocation, nothing
+ * that can itself fail. Compiled out unless the phone build defines
+ * B1NIX_FB_BOOT_MARKERS.
+ */
+#ifdef B1NIX_FB_BOOT_MARKERS
+#define FBD_PITCH  4320
+#define FBD_PX     (FBD_PITCH / 4)
+#define FBD_X      80   /* top-left of the readout */
+#define FBD_Y      1400 /* well above screen bottom so all 4 rows are 100% visible */
+#define FBD_SCALE  10   /* one font pixel becomes 10 screen pixels */
+#define FBD_GLYPH_W 5
+#define FBD_GLYPH_H 7
+
+/* 5x7 digits, one byte per row, five significant bits. */
+static const u8 fbd_digits[10][FBD_GLYPH_H] = {
+	{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, /* 0 */
+	{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, /* 1 */
+	{0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, /* 2 */
+	{0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}, /* 3 */
+	{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, /* 4 */
+	{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}, /* 5 */
+	{0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, /* 6 */
+	{0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, /* 7 */
+	{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, /* 8 */
+	{0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, /* 9 */
+};
+
+static void fbd_fill(u32 x0, u32 y0, u32 w, u32 h, u32 colour)
+{
+	volatile u32 *fb = (volatile u32 *)(usize)(B1NIX_FB_BOOT_MARKERS);
+
+	for (u32 y = y0; y < y0 + h; y++)
+		for (u32 x = x0; x < x0 + w; x++)
+			fb[(u64)y * FBD_PX + x] = colour;
+}
+
+static void fbd_digit(u32 x0, u32 y0, int d, u32 colour)
+{
+	for (u32 row = 0; row < FBD_GLYPH_H; row++)
+		for (u32 col = 0; col < FBD_GLYPH_W; col++)
+			if (fbd_digits[d][row] & (1u << (FBD_GLYPH_W - 1 - col)))
+				fbd_fill(x0 + col * FBD_SCALE, y0 + row * FBD_SCALE,
+				         FBD_SCALE, FBD_SCALE, colour);
+}
+
+/* Draw `value` (0..999) as digits on row `row`. Row 0 is the boot milestone;
+ * the rows below carry facts that must stay on screen next to it, because a
+ * milestone alone cannot say whether the kernel understood the machine it is
+ * running on.
+ *
+ * Every row is repainted on every call. The facts are written once, very
+ * early, and fb_console_init() later clears the whole framebuffer — so a
+ * write-once readout is erased long before anyone reads it. Repainting from a
+ * cached copy costs nothing and survives anything else that paints over the
+ * screen. */
+#define FBD_ROWS_MAX 4
+static int fbd_value[FBD_ROWS_MAX];
+static int fbd_shown[FBD_ROWS_MAX];
+
+static void fbd_paint(int row, int value)
+{
+	u32 gw = FBD_GLYPH_W * FBD_SCALE;
+	u32 gh = FBD_GLYPH_H * FBD_SCALE;
+	u32 y = FBD_Y + (u32)row * (gh + FBD_SCALE * 2);
+	int d[3];
+
+	if (value < 0)
+		value = 0;
+	if (value > 999)
+		value = 999;
+	d[0] = (value / 100) % 10;
+	d[1] = (value / 10) % 10;
+	d[2] = value % 10;
+
+	fbd_fill(FBD_X, y, (gw + FBD_SCALE) * 3, gh, 0xFF000000u);
+	for (int i = 0; i < 3; i++) {
+		if (i == 0 && value < 100)
+			continue;
+		if (i == 1 && value < 10)
+			continue;
+		fbd_digit(FBD_X + (u32)i * (gw + FBD_SCALE), y, d[i], 0xFFFFFFFFu);
+	}
+}
+
+void fb_boot_num(int row, int value)
+{
+	if (row < 0 || row >= FBD_ROWS_MAX)
+		return;
+	fbd_value[row] = value;
+	fbd_shown[row] = 1;
+	for (int r = 0; r < FBD_ROWS_MAX; r++)
+		if (fbd_shown[r])
+			fbd_paint(r, fbd_value[r]);
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+void fb_boot_mark(int slot)
+{
+	fb_boot_num(0, slot);
+}
+
+#else
+void fb_boot_mark(int slot) { (void)slot; }
+/* Stubbed too: main.c reports the platform and memory facts through this on
+ * every aarch64 build, not only the phone one. */
+void fb_boot_num(int row, int value) { (void)row; (void)value; }
+#endif
+
+/* ── Qualcomm APSS watchdog ──────────────────────────────────────────────────
+ *
+ * The Snapdragon bootloader arms this before it hands over and expects the OS
+ * to pet it forever after: the SM8150 tree asks for a pet every 9.36 s
+ * (qcom,pet-time), barks at 11 s (qcom,bark-time) and bites shortly after.
+ * Nothing in this kernel pets it, so the board reset itself roughly twenty
+ * seconds into every boot — which during bring-up is indistinguishable from a
+ * hang, and worse, it turns "where did it stop" into "how far did it get in
+ * twenty seconds".
+ *
+ * ponytail: disabled outright rather than petted. Petting means a timer
+ * callback and a real watchdog driver, and a watchdog is only worth having once
+ * there is something for it to recover. Wire it to the existing
+ * kernel/dev/watchdog.c when this board runs long enough to need one.
+ */
+#define QCOM_WDT_BASE 0x17C10000ULL
+#define QCOM_WDT_EN   0x08
+
+#define QCOM_WDT_RST  0x04
+#define QCOM_WDT_BARK 0x10
+#define QCOM_WDT_BITE 0x14
+
+/* Returns what WDT_EN reads back afterwards: 0 means this kernel owns the
+ * watchdog and it is off, 1 means the write was swallowed — on this SoC the
+ * block can belong to TrustZone, and then it cannot be disabled from EL1 at
+ * all and the only way to survive is to keep petting it. 999 means the board
+ * is not one that has this device. */
+u32 aarch64_platform_watchdog_disable(void)
+{
+	volatile u32 *wdt = (volatile u32 *)(usize)QCOM_WDT_BASE;
+
+	if (platform_type() != PLATFORM_SM8150)
+		return 999;
+
+	/* Pet first, so the deadline moves away before anything else is touched,
+	 * then push bark and bite as far out as the counters go, and only then
+	 * try to disable. Each step alone is enough; together they survive a
+	 * register the firmware only partly lets go of. */
+	wdt[QCOM_WDT_RST / 4] = 1;
+	wdt[QCOM_WDT_BARK / 4] = 0x7FFFFFFFu;
+	wdt[QCOM_WDT_BITE / 4] = 0x7FFFFFFFu;
+	wdt[QCOM_WDT_EN / 4] = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+	return wdt[QCOM_WDT_EN / 4];
+}

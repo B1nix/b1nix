@@ -15,7 +15,8 @@
 #include <stdio.h>
 #include <string.h>
 
-extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv);
+extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv,
+                          usize kstack_top);
 extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 
 /* All user programs are Ring 3 ELFs loaded from VFS. The legacy C-level
@@ -822,13 +823,12 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * translated at dispatch time. */
   if (elf64_is_linux_binary(fd, ehdr, phdrs)) {
     image->personality = PERSONALITY_LINUX;
-    /* Compose the whole line before writing: console_write() locks/unlocks
-     * per call, so multiple calls here would let another CPU's log line
-     * interleave mid-sentence (observed corrupting BusyBox test markers
-     * under SMP exec churn). */
-    char line[VFS_MAX_PATH + 64];
-    snprintf(line, sizeof(line), "ELF load: Linux personality detected: %s\n", path);
-    console_write(line);
+    /* Debug level, not unconditional. One line per exec is one line per
+     * `grep` a shell script forks, which on a board whose console is a
+     * 45-column panel is most of what is on the screen. kprintf composes the
+     * whole line before writing it, so the interleaving this used to avoid by
+     * hand is still avoided. */
+    k_dbg("elf", "Linux personality detected: %s", path);
   } else {
     image->personality = PERSONALITY_B1NIX;
   }
@@ -1294,13 +1294,7 @@ void user_address_space_cleanup(struct task *t) {
    * tick counter stands still and reports every teardown as instant. */
   u64 td_t0;
 
-  __asm__ volatile("rdtsc" : "=A"(td_t0));
-  {
-    u32 lo, hi;
-
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    td_t0 = ((u64)hi << 32) | lo;
-  }
+  td_t0 = arch_cycles();
   u64 td_pages = 0, td_vmas = 0;
 
   /* Release this task's shm bookkeeping (shm_nattch + per-process attach slot)
@@ -1372,7 +1366,7 @@ void user_address_space_cleanup(struct task *t) {
     console_write_dec(td_pages);
     u32 lo1, hi1;
 
-    __asm__ volatile("rdtsc" : "=a"(lo1), "=d"(hi1));
+    { u64 c_ = arch_cycles(); lo1 = (u32)c_; hi1 = (u32)(c_ >> 32); }
     console_write(" kcycles=");
     console_write_dec((((u64)hi1 << 32) | lo1) - td_t0) ;
     console_write("\n");
@@ -1898,7 +1892,8 @@ static int user_run_elf_image(struct user_loaded_image *image) {
 
   x86_user_jump((usize)image->entry, (usize)image->address_space.stack_base,
                 (usize)image->argc,
-                (usize)(image->address_space.stack_base + sizeof(usize)));
+                (usize)(image->address_space.stack_base + sizeof(usize)),
+                (usize)current_task->kernel_stack_ptr);
 
   return 0; // Should not reach here
 }
@@ -2043,7 +2038,10 @@ int user_spawn_env(const char *path, int argc, const char **argv,
 
   struct vfs_node *node = vfs_find_node(path);
   if (!node || IS_ERR(node)) {
-    return -1;
+    /* -ENOENT, not -1: the caller that matters here is the init spawn, and
+     * "could not spawn PID 1" has to say which of the two silent failures it
+     * was — the file is not there, or it is there and not executable by us. */
+    return -ENOENT;
   }
 
   const struct cred *cred = scheduler_get_current_cred();

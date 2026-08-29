@@ -7,6 +7,7 @@
  * and the BCD/12-hour encodings, plus the alarm registers `rtcwake` sets.
  */
 
+#include <b1nix/ktime.h>
 #include <b1nix/errno.h>
 #include <b1nix/io.h>
 #include <b1nix/posix.h>
@@ -19,6 +20,7 @@
 #include <b1nix/syscall.h>
 #include <b1nix/vfs.h>
 #include <string.h>
+#include <b1nix/platform.h>
 
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
@@ -110,7 +112,27 @@ static int days_in_month(int year, int mon /* 0-11 */) {
 #define PL031_RIS  0x014 /* raw interrupt status */
 #define PL031_ICR  0x01c /* interrupt clear */
 
+/* QEMU virt has a PL031 at this address. Nothing else does.
+ *
+ * A Raspberry Pi has no battery-backed clock at all, and on a Snapdragon 855
+ * 0x09010000 is not an RTC — it is an unclaimed window in the Qualcomm
+ * peripheral space, where a load does not return a wrong value, it does not
+ * return. vfs_get_unix_time() calls rtc_now_unix_seconds() on every VFS node
+ * creation, so on that board this single hardcoded read wedged the boot inside
+ * the first vfs_add_node() after the initramfs, with no output and no fault. */
+static int pl031_present(void) {
+  return platform_type() == PLATFORM_QEMU_VIRT;
+}
+
+/* Registers on a board that has the device; a scratch word per offset on one
+ * that does not, so every caller below keeps working and nothing reaches a bus
+ * that will not answer. */
+static u32 pl031_absent_regs[8];
+static u64 g_rtc_soft_seconds; /* the settable clock a board with no RTC gets */
+
 static volatile u32 *pl031_reg(u32 off) {
+  if (!pl031_present())
+    return &pl031_absent_regs[(off / 4) & 7];
   return (volatile u32 *)(usize)(PL031_BASE + off);
 }
 
@@ -156,7 +178,7 @@ static void rtc_epoch_to_tm(u64 secs, struct rtc_time_k *out) {
 }
 
 static int rtc_hw_read(struct rtc_time_k *out) {
-  rtc_epoch_to_tm(*pl031_reg(PL031_DR), out);
+  rtc_epoch_to_tm(rtc_now_unix_seconds(), out);
   return 0;
 }
 
@@ -225,13 +247,56 @@ static int rtc_set_status_b(u8 bit, int on) {
   return 0;
 }
 
-u64 rtc_now_unix_seconds(void) { return *pl031_reg(PL031_DR); }
+u64 rtc_now_unix_seconds(void) {
+  if (!pl031_present())
+    return g_rtc_soft_seconds;
+  return *pl031_reg(PL031_DR);
+}
+
+/* The wall clock in nanoseconds, with a sub-second part that actually moves.
+ *
+ * This used to be the seconds reading multiplied by a billion, so every
+ * timestamp on this arch had nanoseconds of exactly zero. Two changes inside
+ * one second were then indistinguishable, which is precisely what a directory
+ * mtime is asked to distinguish: anything that re-reads a directory only when
+ * its mtime moved (make, ccache, systemd's unit cache, package managers) was
+ * blind to a second write in the same second.
+ *
+ * Built the way x86_64 builds it: ONE monotonic source carries the sub-second
+ * part, anchored to the seconds the RTC read at boot, so the composite never
+ * walks backwards. The RTC is re-read only when it ticks a new second, which
+ * keeps long-run drift bounded to the hardware's own. */
+u64 rtc_now_unix_nanos(void) {
+  static u64 anchor_sec;      /* RTC seconds at the last resync */
+  static u64 anchor_mono_ns;  /* monotonic reading at that moment */
+  static int anchored;
+
+  u64 sec = rtc_now_unix_seconds();
+  u64 mono = ktime_monotonic_ns();
+
+  if (!anchored || sec != anchor_sec) {
+    /* First call, or the RTC moved on: re-anchor so the sub-second part
+     * restarts from zero exactly when the second changes. */
+    anchor_sec = sec;
+    anchor_mono_ns = mono;
+    anchored = 1;
+  }
+
+  u64 sub = mono - anchor_mono_ns;
+  if (sub > 999999999ull)
+    sub = 999999999ull; /* the RTC is late; hold at the end of the second */
+  return sec * 1000000000ull + sub;
+}
 
 void rtc_set_unix_time(u64 sec) {
   u64 flags;
   spin_lock_irqsave(&rtc_lock, &flags);
-  *pl031_reg(PL031_LR) = (u32)sec;
-  *pl031_reg(PL031_CR) = 1;
+  if (pl031_present()) {
+    *pl031_reg(PL031_LR) = (u32)sec;
+    *pl031_reg(PL031_CR) = 1;
+  } else {
+    g_rtc_soft_seconds = sec;
+  }
   spin_unlock_irqrestore(&rtc_lock, flags);
 }
 

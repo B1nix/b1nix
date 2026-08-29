@@ -39,7 +39,7 @@ LD="$(command -v ld.lld 2>/dev/null || echo ld.lld)"
 # symbol that musl's libc.so does not export, so a libc++.so.1 folded from them
 # fails to relocate at load time ("Error relocating: errno: symbol not found").
 # Use TOOLCHAIN_BUILD_HOME (set by env.sh) which points to build/<arch>/toolchain/.
-TBH="${TOOLCHAIN_BUILD_HOME:-$ROOT/build/x86_64/toolchain}"
+TBH="${TOOLCHAIN_BUILD_HOME:-$ROOT/build/$ARCH/toolchain}"
 RT_INSTALL="$TBH/llvm-runtimes-build/libcxx-install/lib"
 RT_MUSL="$TBH/llvm-runtimes-build-musl/libcxx-install/lib"
 if [ -f "$RT_MUSL/libc++.a" ]; then
@@ -56,7 +56,14 @@ for f in "$CXXABI_A" "$UNWIND_A" "$CXX_A" "$CRT_A"; do
     [ -f "$f" ] || { echo "missing $f — run tools/toolchain/build-libcxx.sh first" >&2; exit 1; }
 done
 
-CROSSLIB="$(ls -d "$ROOT/build/x86_64/ports/musl/install/lib" "$TBH/cross/$TRIPLET/lib" 2>/dev/null | head -1)"
+# This arch's musl, in the order the tree can produce it. The first candidate
+# used to be build/x86_64/... unconditionally -- correct by accident on x86_64,
+# and on aarch64 it named a directory that does not exist, so the search fell
+# through to a cross/lib that the Alpine-package musl no longer populates and
+# the build stopped with "missing libc.so" on a tree that had just built one.
+CROSSLIB="$(ls -d "$ROOT/build/$ARCH/ports/musl/install/lib" \
+                  "$ROOT/build/$ARCH/pkg/musl/lib" \
+                  "$TBH/cross/$TRIPLET/lib" 2>/dev/null | head -1)"
 LIBC_SO="$CROSSLIB/libc.so"
 [ -f "$LIBC_SO" ] || B1NIX_ARCH="$ARCH" sh "$ROOT/tools/ports/build-musl.sh" >/dev/null 2>&1 || true
 [ -f "$LIBC_SO" ] || { echo "missing libc.so in $CROSSLIB — run tools/ports/build-musl.sh first" >&2; exit 1; }
@@ -102,7 +109,9 @@ EOF
 # path). -c only: malloc / pthread_* resolve at load time against libc.so.
 SHIM_C="$ROOT/tools/toolchain/cxa_thread_atexit_shim.c"
 SHIM_O="$(mktemp).o"
-MUSL_INC="$ROOT/build/x86_64/ports/musl/install/include"
+# Same story as CROSSLIB above: this arch's musl, wherever the tree put it.
+MUSL_INC="$(ls -d "$ROOT/build/$ARCH/ports/musl/install/include" \
+                  "$ROOT/build/$ARCH/pkg/musl/include" 2>/dev/null | head -1)"
 CLANG_RES="$(clang -print-resource-dir 2>/dev/null || true)"
 # The shim is MANDATORY: without __cxa_thread_atexit_impl defined here, every
 # libc++ consumer fails to relocate at load ("symbol not found", exit 127).
@@ -158,7 +167,7 @@ fi
 # libc++{,abi}.so.1 from there and the initramfs .inc is generated from it, so a
 # stale sysroot copy (without the __cxa_thread_atexit_impl shim) would overwrite
 # the freshly-linked .so in the ISO.
-MUSL_USR_LIB="$ROOT/build/x86_64/ports/musl/install/lib"
+MUSL_USR_LIB="$CROSSLIB"
 for d in "$ROOT/build/$ARCH/rootfs/lib" "$ROOT/build/$ARCH/rootfs/usr/lib" \
          "$MUSL_USR_LIB"; do
     [ -d "$d" ] || mkdir -p "$d"

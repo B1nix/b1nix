@@ -54,13 +54,26 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#if defined(__aarch64__)
-/* Mirrors MODULE_REGION_BASE in kernel/include/b1nix/module.h: this port has no
- * higher half, so modules live just above the kernel image instead. */
-#define MODULE_REGION_BASE 0x41000000ULL
-#else
-#define MODULE_REGION_BASE 0xffffffffc0000000ULL
-#endif
+/* Read from the kernel rather than mirrored here.
+ *
+ * The base is a compile-time constant only on x86_64; on aarch64 it is the
+ * first 2 MiB boundary past the kernel image, so it moves every time the kernel
+ * changes size. The constant that used to live here said 0x41000000 while the
+ * kernel had long since moved to 0x40c00000, and the check failed on a kernel
+ * that was doing exactly the right thing. Falls back to 0 -- "any address
+ * passes" -- only if the attribute is missing, so an older kernel does not turn
+ * this into a spurious failure. */
+static unsigned long long module_region_base(void) {
+  FILE *f = fopen("/sys/kernel/module_region", "r");
+  unsigned long long base = 0, size = 0;
+
+  if (!f)
+    return 0;
+  if (fscanf(f, "%llx %llu", &base, &size) != 2)
+    base = 0;
+  fclose(f);
+  return base;
+}
 
 static int failures;
 
@@ -292,6 +305,8 @@ static void t_proc_modules(void) {
     fail("proc-modules", "row count differs from /lib/modules");
     return;
   }
+  unsigned long long region_base = module_region_base();
+
   for (int i = 0; i < nfiles; i++) {
     const struct modrow *r = find_mod(rows, n, names[i]);
     if (!r) {
@@ -306,7 +321,7 @@ static void t_proc_modules(void) {
       fail("proc-modules", "zero core size");
       return;
     }
-    if (r->addr < MODULE_REGION_BASE) {
+    if (region_base && r->addr < region_base) {
       /* Name the module and its address: "not in the region" alone says
        * nothing about which one, and the answer differs between a module that
        * fell back to the general heap and one whose address was mis-parsed. */

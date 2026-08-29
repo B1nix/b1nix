@@ -1,8 +1,8 @@
 /* kprof — where the kernel's CPU time actually goes.
  *
- * The scheduler tick (LAPIC vector 64, one per CPU) already interrupts every
- * core a hundred times a second. That is a ready-made sampling clock: record
- * the instruction pointer it interrupted and, over a run, the histogram is the
+ * The scheduler tick (LAPIC vector 64 on x86_64, the CNTV PPI on aarch64 — one
+ * per CPU either way) already interrupts every core a hundred times a second. That is a ready-made sampling clock: record
+ * the instruction pointer it interrupted (RIP or ELR_EL1) and, over a run, the histogram is the
  * kernel's own profile. Nothing else in the tree could answer "which function
  * burns the CPU-seconds a browser start-up spends in ring 0" — the system-call
  * profile times whole calls including the blocking, so it names a syscall,
@@ -23,7 +23,6 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/klog.h>
-#include <b1nix/lapic.h>
 #include <b1nix/types.h>
 
 #define KPROF_SLOTS 8192u
@@ -38,8 +37,14 @@ static struct kprof_slot g_kprof[KPROF_SLOTS];
 static u64 g_kprof_samples; /* kernel-mode ticks offered to the histogram */
 static u64 g_kprof_dropped; /* histogram full — samples lost */
 
+/* Its own ceiling rather than the interrupt controller's MAX_CPUS: that
+ * constant lives in the x86 LAPIC header, and this file is shared. The array
+ * is indexed by cpu id and bounds-checked, so a wider machine loses samples
+ * from the extra cores rather than corrupting anything. */
+#define KPROF_MAX_CPUS 64
+
 /* Tick distribution: [cpu][0]=user [cpu][1]=kernel [cpu][2]=idle. */
-static u64 g_tick_mode[MAX_CPUS][3];
+static u64 g_tick_mode[KPROF_MAX_CPUS][3];
 static u64 g_tick_total;
 
 static int kprof_enabled(void) {
@@ -55,7 +60,7 @@ static int kprof_enabled(void) {
 void kprof_tick(u64 rip, int in_user, int in_idle, int cpu) {
   int mode = in_user ? 0 : (in_idle ? 2 : 1);
 
-  if (cpu >= 0 && cpu < MAX_CPUS)
+  if (cpu >= 0 && cpu < KPROF_MAX_CPUS)
     __atomic_fetch_add(&g_tick_mode[cpu][mode], 1, __ATOMIC_RELAXED);
   __atomic_fetch_add(&g_tick_total, 1, __ATOMIC_RELAXED);
 
@@ -208,7 +213,7 @@ void kprof_dump(void) {
   u64 u = 0, k = 0, idl = 0;
 
   console_write("ticks (cpu user/kernel/idle):");
-  for (int c = 0; c < MAX_CPUS; c++) {
+  for (int c = 0; c < KPROF_MAX_CPUS; c++) {
     u64 cu = __atomic_load_n(&g_tick_mode[c][0], __ATOMIC_RELAXED);
     u64 ck = __atomic_load_n(&g_tick_mode[c][1], __ATOMIC_RELAXED);
     u64 ci = __atomic_load_n(&g_tick_mode[c][2], __ATOMIC_RELAXED);

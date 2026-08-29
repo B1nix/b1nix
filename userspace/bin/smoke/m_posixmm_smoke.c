@@ -35,6 +35,17 @@
 
 static void marker(const char *s) { write(1, s, strlen(s)); }
 
+/* A bare "fail <name>" says only that the machine is wrong somewhere in a
+ * forty-line test. Print the step that returned instead: the number is the
+ * test's own return code, and it names the assertion. */
+static void marker_fail(const char *name, int rc)
+{
+	char line[96];
+	int n = snprintf(line, sizeof(line), "MM-SMOKE: fail %s rc=%d\n", name, rc);
+	if (n > 0)
+		write(1, line, (size_t)n);
+}
+
 /* ---- test 1: madvise(MADV_DONTNEED) zeroes an anonymous page on refault ---- */
 static int test_madvise(void) {
 	size_t len = 4096 * 4;
@@ -368,8 +379,24 @@ static int test_kernel_write_cow(void)
 		_exit(0);
 	}
 	int st = 0;
-	if (waitpid(pid, &st, 0) != pid)
-		return 4;
+	/* Distinguish WHY the wait did not return this child: a bare "4" said only
+	 * that it did not, which reads as a COW failure the test never reached. */
+	pid_t w = waitpid(pid, &st, 0);
+	if (w != pid) {
+		if (w >= 0)
+			return 40; /* some other pid came back */
+		if (errno == EINTR)
+			return 41;
+		if (errno == ECHILD)
+			return 42;
+		return 43;
+	}
+	/* The child never got to write its verdict: it died on the uname(), which
+	 * is the kernel write into the copy-on-write page this test is about.
+	 * Report how it died -- a bare arithmetic code on a -1 verdict read as a
+	 * waitpid failure for as long as this test existed. */
+	if (*verdict == -1)
+		return WIFSIGNALED(st) ? 20 + WTERMSIG(st) : 19;
 	if (*verdict != 0)
 		return 5 + (*verdict % 10);
 	/* The child's write must not have reached the parent's copy. */
@@ -705,7 +732,14 @@ static int test_file_map_privacy(void)
  * process. With the leak the table is full (or the recycled slot conflicts)
  * and the registration is refused.
  */
+/* rseq's number is per-architecture: 334 on x86_64, 293 on the asm-generic
+ * table aarch64 uses. Hardcoding the x86 one made every aarch64 run report
+ * "rseq is not implemented" for a kernel that implements it. */
+#if defined(__aarch64__)
+#define RSEQ_SYS 293
+#else
 #define RSEQ_SYS 334
+#endif
 #define RSEQ_KILLS 200
 #define RSEQ_SIG 0x53053053u
 
@@ -775,84 +809,84 @@ int main(void) {
 
 	int overlaprc = test_mmap_no_overlap();
 	if (overlaprc != 0) {
-		marker("MM-SMOKE: fail mmap-no-overlap\n");
+		marker_fail("mmap-no-overlap", overlaprc);
 		return 60 + overlaprc;
 	}
 	marker("MM-SMOKE: ok mmap-no-overlap\n");
 
 	int rdrc = test_readdir_terminates();
 	if (rdrc != 0) {
-		marker("MM-SMOKE: fail readdir-terminates\n");
+		marker_fail("readdir-terminates", rdrc);
 		return 50 + rdrc;
 	}
 	marker("MM-SMOKE: ok readdir-terminates\n");
 
 	int shmrc = test_shm_open();
 	if (shmrc != 0) {
-		marker("MM-SMOKE: fail shm-open\n");
+		marker_fail("shm-open", shmrc);
 		return 40 + shmrc;
 	}
 	marker("MM-SMOKE: ok shm-open\n");
 
 	int rc = test_madvise();
 	if (rc != 0) {
-		marker("MM-SMOKE: fail madvise\n");
+		marker_fail("madvise", rc);
 		return 10 + rc;
 	}
 	marker("MM-SMOKE: ok madvise\n");
 
 	rc = test_noreserve();
 	if (rc != 0) {
-		marker("MM-SMOKE: fail noreserve\n");
+		marker_fail("noreserve", rc);
 		return 20 + rc;
 	}
 	marker("MM-SMOKE: ok noreserve\n");
 
 	rc = test_sigaltstack();
 	if (rc != 0) {
-		marker("MM-SMOKE: fail sigaltstack\n");
+		marker_fail("sigaltstack", rc);
 		return 30 + rc;
 	}
 	marker("MM-SMOKE: ok sigaltstack\n");
 
 	rc = test_kernel_write_cow();
 	if (rc != 0) {
-		marker("MM-SMOKE: fail copyout-cow\n");
+		marker_fail("copyout-cow", rc);
 		return 70 + rc;
 	}
 	marker("MM-SMOKE: ok copyout-cow\n");
 
 	rc = test_ucontext_size();
 	if (rc != 0) {
-		marker("MM-SMOKE: fail ucontext-size\n");
+		marker_fail("ucontext-size", rc);
 		return 90 + rc;
 	}
 	marker("MM-SMOKE: ok ucontext-size\n");
 
 	rc = test_kernel_write_readonly();
 	if (rc != 0) {
-		marker("MM-SMOKE: fail copyout-readonly\n");
+		marker_fail("copyout-readonly", rc);
 		return 80 + rc;
 	}
 	marker("MM-SMOKE: ok copyout-readonly\n");
 
 	rc = test_file_map_privacy();
 	if (rc != 0) {
-		marker("MM-SMOKE: fail file-map-privacy\n");
+		marker_fail("file-map-privacy", rc);
 		return 110 + rc;
 	}
 	marker("MM-SMOKE: ok file-map-privacy\n");
 
 	rc = test_rseq_after_sigkill();
 	if (rc != 0) {
-		marker("MM-SMOKE: fail rseq-after-sigkill\n");
+		marker_fail("rseq-after-sigkill", rc);
 		return 120 + rc;
 	}
 	marker("MM-SMOKE: ok rseq-after-sigkill\n");
 
 	rc = test_mmap_lock_after_sigkill();
 	if (rc != 0) {
-		marker("MM-SMOKE: fail mmap-after-sigkill\n");
+		marker_fail("mmap-after-sigkill", rc);
 		return 100 + rc;
 	}
 	marker("MM-SMOKE: ok mmap-after-sigkill\n");

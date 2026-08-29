@@ -7,8 +7,17 @@
 
 static struct boot_info global_bootinfo;
 
+/* The build writes KERNEL_CMDLINE here (build/<arch>/inc/kernel_cmdline.h).
+ * A generated header rather than a -D so that changing the command line
+ * actually rebuilds this file: the kernel build tracks headers and not flags,
+ * and a stale object here is invisible until a board boots someone else's
+ * cmdline. */
+#if __has_include(<kernel_cmdline.h>)
+#include <kernel_cmdline.h>
+#endif
 #ifndef AARCH64_DEFAULT_CMDLINE
-#define AARCH64_DEFAULT_CMDLINE "init=/bin/m12_smoke b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1"
+/* No KERNEL_CMDLINE given: boot the machine, run nothing in particular. */
+#define AARCH64_DEFAULT_CMDLINE ""
 #endif
 static char aarch64_cmdline_buf[512] = AARCH64_DEFAULT_CMDLINE;
 
@@ -37,10 +46,27 @@ static int g_gic_is_v3;
 u64 g_aarch64_uart_base;
 static int g_uart_from_fdt;
 static int g_gic_from_fdt;
+/* INTID the architected virtual timer signals on. 27 (PPI 11) is the
+ * conventional wiring and QEMU virt's; a Snapdragon wires the four timer
+ * outputs to PPIs 1/2/3/0 instead, so its virtual timer is INTID 19. Which one
+ * a board uses is not a convention to assume, it is in its device tree — and
+ * unmasking the wrong one is silent: no interrupt ever arrives, so every sleep
+ * and every timeout in the kernel simply never ends. */
+static u32 g_timer_virt_irq = 27;
+u32 fdt_timer_virt_irq(void) { return g_timer_virt_irq; }
+
+static int g_psci_use_smc;
+static int g_psci_from_fdt;
+
+int fdt_psci_use_smc(void) { return g_psci_use_smc; }
+int fdt_psci_from_fdt(void) { return g_psci_from_fdt; }
 /* The board's console is a BCM2835 mini-UART ("aux" UART) rather than a PL011.
  * The two share no register at all, so serial.c reads this to pick which set of
  * offsets g_aarch64_uart_base names. */
 int g_aarch64_uart_is_mini;
+/* Defined in serial.c: the console is a Qualcomm GENI serial engine, which
+ * shares no register with either of the other two. */
+extern int g_aarch64_uart_is_geni;
 /* The AUX block the mini-UART lives in. Its three peripherals (the mini-UART
  * and two SPI masters) share one enable register at AUX_ENABLES, block + 0x04,
  * and nothing in the mini-UART's own window answers until the bit for it is
@@ -293,6 +319,12 @@ struct fdt_node {
 	const char *compatible;
 	u32 compatible_len;
 	const char *device_type;
+	/* "okay"/"ok" or absent means usable; anything else (in practice
+	 * "disabled") means the board does not have this block powered, clocked
+	 * or pinmuxed, and touching its registers is not a read that returns
+	 * garbage — it is a read that does not come back. */
+	const char *status;
+	const char *method;        /* /psci: "smc" or "hvc" */
 	const char *enable_method;
 	const u32 *release_addr;
 	u32 release_addr_len;
@@ -336,6 +368,7 @@ struct fdt_uart {
 	char path[FDT_PATH_MAX];
 	u64 base;
 	int is_pl011;
+	int is_geni;   /* Qualcomm GENI QUP serial engine (SM8150 ttyMSM0) */
 };
 static struct fdt_uart g_uarts[FDT_MAX_UARTS];
 static u32 g_uart_count;
@@ -484,9 +517,27 @@ static void fdt_pci_read_windows(const struct fdt_node *node, int depth)
 	}
 }
 
-static void fdt_note_uart(const struct fdt_node *node, u64 base, int is_pl011)
+/* A node the board has actually enabled. Absent `status` means enabled — most
+ * trees only spell it out to turn something off. */
+static int fdt_node_enabled(const struct fdt_node *node)
+{
+	if (!node || !node->status)
+		return 1;
+	return strcmp(node->status, "okay") == 0 || strcmp(node->status, "ok") == 0;
+}
+
+static void fdt_note_uart(const struct fdt_node *node, u64 base, int is_pl011,
+                          int is_geni)
 {
 	if (g_uart_count >= FDT_MAX_UARTS)
+		return;
+	/* Registering a disabled port is not harmless. /chosen names this node as
+	 * stdout on SM8150 even though the SoC tree marks it `status =
+	 * "disabled"`, so it was picked as the console — and then every character
+	 * spun out three bounded waits of 100000 MMIO reads against a serial
+	 * engine that never answers. At Device-memory latency that is tens of
+	 * milliseconds per character: the boot did not hang, it printed. */
+	if (!fdt_node_enabled(node))
 		return;
 
 	struct fdt_uart *u = &g_uarts[g_uart_count++];
@@ -498,6 +549,7 @@ static void fdt_note_uart(const struct fdt_node *node, u64 base, int is_pl011)
 	u->path[len] = '\0';
 	u->base = base;
 	u->is_pl011 = is_pl011;
+	u->is_geni = is_geni;
 	(void)node;
 }
 
@@ -615,17 +667,53 @@ static void fdt_finish_node(struct fdt_node *node, int depth)
 		}
 	}
 
+	/* The architected timer's interrupts: four <type, number, flags> triples,
+	 * in the order secure-physical, non-secure-physical, VIRTUAL, hypervisor.
+	 * This kernel drives CNTV, so the third is the one it needs. A PPI (type
+	 * 1) numbers from INTID 16. */
+	if (fdt_compatible_is(node->compatible, node->compatible_len,
+	                      "arm,armv8-timer") &&
+	    node->interrupts && node->interrupts_len >= 9 * 4) {
+		u32 type = fdt32_to_cpu(node->interrupts[6]);
+		u32 num = fdt32_to_cpu(node->interrupts[7]);
+
+		if (type == 1)
+			g_timer_virt_irq = num + 16;
+		else
+			g_timer_virt_irq = num + 32;
+	}
+
+	/* How to call the firmware's PSCI implementation. QEMU virt answers on
+	 * HVC; a phone runs ATF at EL3 and answers on SMC, and an HVC issued at
+	 * EL1 with no hypervisor behind it is an exception, not a failed call —
+	 * which is why this has to be read rather than guessed. */
+	if (depth == 1 && strcmp(node->name, "psci") == 0 && node->method) {
+		g_psci_use_smc = strcmp(node->method, "smc") == 0;
+		g_psci_from_fdt = 1;
+	}
+
 	if (fdt_compatible_is(node->compatible, node->compatible_len, "arm,pl011")) {
 		u64 base;
 
 		if (fdt_reg_entry(node, depth, 0, &base, 0) && base)
-			fdt_note_uart(node, base, 1);
+			fdt_note_uart(node, base, 1, 0);
 	} else if (fdt_compatible_is(node->compatible, node->compatible_len,
 	                             "brcm,bcm2835-aux-uart")) {
 		u64 base;
 
 		if (fdt_reg_entry(node, depth, 0, &base, 0))
-			fdt_note_uart(node, base, 0);
+			fdt_note_uart(node, base, 0, 0);
+	} else if (fdt_compatible_is(node->compatible, node->compatible_len,
+	                             "qcom,msm-geni-console") ||
+	           fdt_compatible_is(node->compatible, node->compatible_len,
+	                             "qcom,geni-debug-uart")) {
+		u64 base;
+
+		/* The SM8150 console node is `status = "disabled"` in the SoC tree —
+		 * the bootloader still runs its own log through the port, which is
+		 * exactly why this kernel can use it without configuring anything. */
+		if (fdt_reg_entry(node, depth, 0, &base, 0) && base)
+			fdt_note_uart(node, base, 0, 1);
 	}
 
 	/* A CPU: its `reg` is the MPIDR affinity value PSCI's CPU_ON targets, and
@@ -740,6 +828,58 @@ static void fdt_finish_node(struct fdt_node *node, int depth)
 
 /* Resolve /chosen's stdout-path (possibly through /aliases) to one of the UART
  * nodes the walk found, and pick the register base the console will use. */
+/* What the device tree said about the ramdisk, before any of it is believed.
+ * See the note at the property parse and bootinfo_apply_initrd(). */
+static u64 g_initrd_start, g_initrd_end;
+static int g_initrd_have;
+
+/* Believe the tree only about a range that could actually be a ramdisk.
+ *
+ * pmm_init reserves the ramdisk by walking it a page at a time, so a bogus
+ * range is not a wrong answer, it is a boot that never finishes — which is what
+ * an unvalidated version of this did, wedging between BOOTMARK(1) and (2). The
+ * bounds below are deliberately loose: they exist to keep that loop finite and
+ * to reject a partially-written pair, not to second-guess a loader that knows
+ * where it put the thing.
+ */
+static int bootinfo_apply_initrd(void)
+{
+	u64 size;
+
+	if (g_initrd_have != 3)
+		return 0;
+	if (g_initrd_end <= g_initrd_start || g_initrd_start == 0)
+		return 0;
+
+	size = g_initrd_end - g_initrd_start;
+	/* A ramdisk this kernel can hold, inside the 32-bit physical window every
+	 * board it runs on puts DRAM in. */
+	if (size > (256ULL * 1024 * 1024) || g_initrd_end > 0x100000000ULL)
+		return 0;
+
+	global_bootinfo.ramdisk_addr = g_initrd_start;
+	global_bootinfo.ramdisk_size = size;
+	global_bootinfo.has_ramdisk = 1;
+	return 1;
+}
+
+/* Report the tree's claim next to whatever was used. The boot-time line has
+ * scrolled off a phone panel long before a mount failure is noticed. */
+void bootinfo_report_initrd(void)
+{
+	console_write("initrd: tree ");
+	if (g_initrd_have != 3) {
+		console_write(g_initrd_have ? "gave only half a range\n"
+		                            : "carries no linux,initrd-start/-end\n");
+		return;
+	}
+	console_write("start=0x");
+	console_write_hex64(g_initrd_start);
+	console_write(" end=0x");
+	console_write_hex64(g_initrd_end);
+	console_write(bootinfo_apply_initrd() ? " (accepted)\n" : " (rejected)\n");
+}
+
 static void fdt_pick_console(void)
 {
 	const struct fdt_uart *chosen = 0;
@@ -775,7 +915,7 @@ static void fdt_pick_console(void)
 
 	if (!chosen) {
 		for (u32 i = 0; i < g_uart_count; i++) {
-			if (g_uarts[i].is_pl011) {
+			if (g_uarts[i].is_pl011 || g_uarts[i].is_geni) {
 				chosen = &g_uarts[i];
 				break;
 			}
@@ -783,8 +923,10 @@ static void fdt_pick_console(void)
 	}
 	if (chosen) {
 		g_aarch64_uart_base = chosen->base;
+		platform_set_uart_base(g_aarch64_uart_base);
 		g_uart_from_fdt = 1;
-		g_aarch64_uart_is_mini = !chosen->is_pl011;
+		g_aarch64_uart_is_geni = chosen->is_geni;
+		g_aarch64_uart_is_mini = !chosen->is_pl011 && !chosen->is_geni;
 		if (g_aarch64_uart_is_mini) {
 			/* Two conventions are in the wild for what a
 			 * "brcm,bcm2835-aux-uart" node's `reg` names. The Raspberry Pi
@@ -829,10 +971,26 @@ void bootinfo_fdt_scan(u64 dtb_address)
 	global_bootinfo.memory_regions[0].length = 256 * 1024 * 1024;
 	global_bootinfo.memory_regions[0].type = BOOT_MEMORY_AVAILABLE;
 
-	global_bootinfo.has_framebuffer = 0; // Disable framebuffer for now
+	static u64 (*find_dtb_fn)(u64) = 0;
+	u64 valid_dtb = 0;
+	if (dtb_address && fdt32_to_cpu(*(const u32 *)dtb_address) == 0xd00dfeed)
+		valid_dtb = dtb_address;
+	else if (fdt32_to_cpu(*(const u32 *)0x81F00000ULL) == 0xd00dfeed)
+		valid_dtb = 0x81F00000ULL;
+	else if (fdt32_to_cpu(*(const u32 *)0x81E00000ULL) == 0xd00dfeed)
+		valid_dtb = 0x81E00000ULL;
+	else {
+		for (u64 cand = 0x80000000ULL; cand <= 0x85000000ULL; cand += 0x100000ULL) {
+			if (fdt32_to_cpu(*(const u32 *)cand) == 0xd00dfeed) {
+				valid_dtb = cand;
+				break;
+			}
+		}
+	}
 
-	if (!dtb_address)
+	if (!valid_dtb)
 		return;
+	dtb_address = valid_dtb;
 
 	const u32 *fdt = (const u32 *)dtb_address;
 	if (fdt32_to_cpu(fdt[0]) != 0xd00dfeed)
@@ -895,7 +1053,32 @@ void bootinfo_fdt_scan(u64 dtb_address)
 			struct fdt_node *node =
 			    depth < FDT_MAX_DEPTH ? &g_nodes[depth] : (struct fdt_node *)0;
 
-			if (strcmp(prop_name, "bootargs") == 0 && len > 0 &&
+			/* The ramdisk the bootloader loaded, if it loaded one. This is
+			 * how an Android boot image's ramdisk slot reaches the kernel:
+			 * the loader puts the image in memory and writes its bounds
+			 * here. On a Qualcomm phone this is the ONLY way — ABL ignores
+			 * the boot header's ramdisk address (BOARD_KERNEL_BASE is 0 in
+			 * the vendor tree, so those fields are offsets it fills in from
+			 * its own layout) and reports where it actually went here.
+			 *
+			 * Recorded raw and applied after the scan. Writing straight into
+			 * boot_info made the result depend on property order: an -end seen
+			 * before its -start was subtracted from zero, and the resulting
+			 * size sent pmm_init's page-by-page reservation loop off for
+			 * essentially ever. */
+			if (strcmp(prop_name, "linux,initrd-start") == 0 &&
+			    (len == 4 || len == 8)) {
+				g_initrd_start = len == 8
+				    ? fdt_read_cells((const u32 *)val, 2)
+				    : fdt32_to_cpu(*(const u32 *)val);
+				g_initrd_have |= 1;
+			} else if (strcmp(prop_name, "linux,initrd-end") == 0 &&
+			           (len == 4 || len == 8)) {
+				g_initrd_end = len == 8
+				    ? fdt_read_cells((const u32 *)val, 2)
+				    : fdt32_to_cpu(*(const u32 *)val);
+				g_initrd_have |= 2;
+			} else if (strcmp(prop_name, "bootargs") == 0 && len > 0 &&
 			    len < sizeof(aarch64_cmdline_buf)) {
 				if (val[0]) {
 					strncpy(aarch64_cmdline_buf, val, sizeof(aarch64_cmdline_buf) - 1);
@@ -919,7 +1102,11 @@ void bootinfo_fdt_scan(u64 dtb_address)
 				} else if (strcmp(prop_name, "compatible") == 0) {
 					node->compatible = val;
 					node->compatible_len = len;
-				} else if (strcmp(prop_name, "device_type") == 0) {
+				} else if (strcmp(prop_name, "status") == 0) {
+					node->status = val;
+				} else if (strcmp(prop_name, "method") == 0) {
+					node->method = val;
+} else if (strcmp(prop_name, "device_type") == 0) {
 					node->device_type = val;
 				} else if (strcmp(prop_name, "enable-method") == 0) {
 					node->enable_method = val;
@@ -967,6 +1154,53 @@ void bootinfo_fdt_scan(u64 dtb_address)
 	}
 
 	fdt_pick_console();
+
+	/*
+	 * A Snapdragon 855 phone's RAM is not the kernel's to use.
+	 *
+	 * The bootloader hands over 6 GiB starting at 0x80000000, but the bottom
+	 * ~680 MiB of it is carved up between TrustZone, the hypervisor, SMEM and
+	 * the firmware images the modem, ADSP, CDSP, WLAN and video cores are
+	 * still executing out of - plus the 36 MiB continuous-splash framebuffer
+	 * the display controller is scanning right now. Handing any of that to the
+	 * page allocator does not fault, it silently overwrites a running
+	 * co-processor and the phone resets seconds later.
+	 *
+	 * ponytail: rather than parse `reserved-memory` and subtract, take the one
+	 * large hole above every carveout - 0xa8800000 to 0xffb00000, per the
+	 * SM8150 tree - and use a gigabyte of it. Parse the carveouts when this
+	 * kernel needs more than a gigabyte on a phone.
+	 */
+	if (platform_type() == PLATFORM_SM8150) {
+		global_bootinfo.memory_region_count = 1;
+		global_bootinfo.memory_regions[0].base = 0xa9000000ULL;
+		global_bootinfo.memory_regions[0].length = 0x40000000ULL;
+		global_bootinfo.memory_regions[0].type = BOOT_MEMORY_AVAILABLE;
+
+		/* The framebuffer the bootloader left lit. Its address is the
+		 * cont_splash_region carveout; the panel is the Xperia 5's 1080x2520
+		 * OLED, which no tree in the boot image describes. */
+		global_bootinfo.framebuffer.address = 0x9c000000ULL;
+		global_bootinfo.framebuffer.width = 1080;
+		global_bootinfo.framebuffer.height = 2520;
+		global_bootinfo.framebuffer.pitch = 1080 * 4;
+		global_bootinfo.framebuffer.bpp = 32;
+		global_bootinfo.has_framebuffer = 1;
+
+		/* Where the ext4 ramdisk ended up.
+		 *
+		 * ABL does not honour the boot image header's ramdisk address on this
+		 * board — reading 0x82000000, the address the header asks for, returns
+		 * all-ones, i.e. a carveout EL1 cannot see. It reports the real
+		 * location in the device tree instead, so that is what is used when it
+		 * survives validation. The header's address stays as the fallback for
+		 * a loader that does honour it. */
+		if (!bootinfo_apply_initrd()) {
+			global_bootinfo.ramdisk_addr = 0x82000000ULL;
+			global_bootinfo.ramdisk_size = 44ULL * 1024ULL * 1024ULL;
+			global_bootinfo.has_ramdisk = 1;
+		}
+	}
 }
 
 void bootinfo_init_from_fdt(u64 dtb_address)
@@ -1058,6 +1292,22 @@ int bootinfo_has_flag(const char *flag)
 		while (*p && *p != ' ') p++;
 	}
 	return 0;
+}
+
+u32 bootinfo_get_u32(const char *key, u32 fallback)
+{
+	char buf[24];
+
+	if (!bootinfo_get_kv(key, buf, sizeof(buf)) || !buf[0])
+		return fallback;
+	if (buf[0] < '0' || buf[0] > '9')
+		return fallback;
+
+	u32 v = 0;
+
+	for (const char *p = buf; *p >= '0' && *p <= '9'; p++)
+		v = v * 10u + (u32)(*p - '0');
+	return v;
 }
 
 int bootinfo_get_kv(const char *key, char *out, usize out_size)

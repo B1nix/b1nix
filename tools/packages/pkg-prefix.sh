@@ -28,6 +28,11 @@ fi
 PORT="$1"
 [ -n "$PREFIX" ] || PREFIX="$ROOT_DIR/build/$ARCH/pkg/$PORT"
 
+if [ -d "$PREFIX" ] && [ -d "$PREFIX/lib" -o -d "$PREFIX/include" ]; then
+	echo "$PREFIX"
+	exit 0
+fi
+
 # Continuation lines: a long package list is wrapped with a trailing backslash.
 PKGS="$(sed -e :a -e '/\\$/N; s/\\\n//; ta' "$MAP" |
         awk -v p="$PORT" '$1 == p { $1 = ""; print; exit }')"
@@ -48,7 +53,7 @@ case "$PKGS" in
 	;;
 esac
 
-# shellcheck disable=SC2086 — the package list is deliberately word-split.
+# Package list is word-split intentionally
 ARCH="$ARCH" "$ROOT_DIR/tools/packages/alpine-fetch.sh" "$PREFIX" $PKGS >&2
 
 # Dated now, not when the package was built.

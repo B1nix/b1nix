@@ -279,7 +279,7 @@ static int ahci_packet_command(struct ahci_port_state *port, const u8 *acmd,
 
   int timeout = 1000000;
   while ((p->tfd & 0x88) && timeout > 0) {
-    __asm__ volatile("pause");
+    cpu_relax();
     timeout--;
   }
   if (timeout == 0) {
@@ -555,7 +555,7 @@ static int ahci_port_trim(struct ahci_port_state *port, u64 lba, u32 count) {
 
     int timeout = 1000000;
     while ((p->tfd & 0x88) && timeout > 0) {
-      __asm__ volatile("pause");
+      cpu_relax();
       timeout--;
     }
     if (timeout == 0) {
@@ -749,7 +749,7 @@ static int ahci_wait_ci_clear_bounded(volatile struct ahci_port *p,
   u64 deadline = arch_tsc_monotonic_ns() + timeout_ms * 1000000ull;
   while (p->ci & slot_mask) {
     for (int i = 0; i < 256; i++)
-      __asm__ volatile("pause");
+      cpu_relax();
     if (arch_tsc_monotonic_ns() >= deadline)
       return (p->ci & slot_mask) ? -1 : 0;
   }

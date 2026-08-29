@@ -163,4 +163,9 @@ u64 fdt_pci_mmio_size(void);
 u64 fdt_emmc2_base(void);
 #endif
 
+/* Print what the device tree claimed about the ramdisk and whether it was
+ * accepted. Repeatable: the boot-time line has scrolled off a panel-only
+ * console long before a mount failure is noticed. */
+void bootinfo_report_initrd(void);
+
 #endif

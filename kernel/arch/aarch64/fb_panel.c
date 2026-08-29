@@ -2,6 +2,7 @@
 #include <b1nix/fb_panel.h>
 #include <b1nix/mm.h>
 #include <b1nix/virtio_gpu.h>
+#include "platform.h"
 
 /*
  * A QEMU virt machine has no bootloader-set framebuffer: the display is a
@@ -17,6 +18,16 @@ int fb_panel_probe(struct boot_framebuffer *out, int *in_ram)
 {
 	u32 w = 0, h = 0;
 	usize bytes;
+
+	/* A board whose bootloader left a framebuffer scanning - a phone's
+	 * continuous splash - needs none of the below: the display controller is
+	 * already reading that memory, so the console draws straight into it and
+	 * every write is on screen with no present step. */
+	if (bootinfo_get()->has_framebuffer) {
+		*out = bootinfo_get()->framebuffer;
+		*in_ram = 0;   /* physical, outside the direct map: needs an MMIO map */
+		return 0;
+	}
 
 	if (!virtio_gpu_ready())
 		return -1;

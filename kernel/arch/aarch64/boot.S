@@ -1,4 +1,45 @@
 .section .text.boot
+
+// ── Visual boot markers ─────────────────────────────────────────────────────
+//
+// The Pi strobes below say how far the boot got over a serial cable. A phone
+// has no cable, so on a board whose bootloader leaves a framebuffer scanning
+// the same information is painted into it instead: one coloured band per
+// stage, stacked down the top of the screen. The panel is already live — the
+// bootloader's splash is being scanned out of this very buffer — so a band
+// appears the instant the store retires, with no driver, no clock and no
+// display init of any kind.
+//
+// Enabled by -DB1NIX_FB_BOOT_MARKERS=<phys addr> (see the `bahamut` target).
+// Off everywhere else: it is a raw store to a fixed physical address.
+//
+// Clobbers x9-x12 only, which are dead at every call site (x19 holds the DTB
+// pointer and x20 the CPU id — neither is touched).
+// Xperia 5 panel: 1080x2520, 32bpp, so 4320 bytes per row. 40-row bands leave
+// the marker column well clear of anything the console later draws.
+#define FBMARK_WIDTH  1080
+#define FBMARK_PITCH  4320
+#define FBMARK_ROWS   40
+
+.macro FBMARK slot, colour
+#ifdef B1NIX_FB_BOOT_MARKERS
+	ldr	x9, =B1NIX_FB_BOOT_MARKERS
+	// Byte offset of this band, built with a multiply: the product does not
+	// fit a single MOV immediate, and `ldr =(expr)` is not a relocatable
+	// expression the assembler will take.
+	mov	x10, #(\slot * FBMARK_ROWS)
+	mov	x11, #FBMARK_PITCH
+	mul	x10, x10, x11
+	add	x9, x9, x10
+	ldr	w11, =\colour
+	mov	x12, #(FBMARK_ROWS * FBMARK_WIDTH)
+9990:	str	w11, [x9], #4
+	subs	x12, x12, #1
+	b.ne	9990b
+	dsb	sy
+#endif
+.endm
+
 .global _start
 .type _start, %function
 
@@ -30,7 +71,10 @@ _start_kernel:
 	// Save DTB address from x0 to x19 FIRST (before any register clobber)
 	mov x19, x0
 
+	FBMARK 0, 0xFFFF0000		// red:    reached _start_kernel
+
 	// Early raw UART strobe directly in assembly (PL011 & Mini UART)
+#ifdef B1NIX_PI_EARLY_UART
 	ldr x1, =0xfe201000
 	mov w2, #'B'
 	str w2, [x1]
@@ -42,6 +86,7 @@ _start_kernel:
 	str w2, [x1]
 	mov w2, #'1'
 	str w2, [x1]
+#endif
 
 #ifdef B1NIX_UART_AUTOBAUD
 	// Transmit 'U' forever on both ports (see UART_AUTOBAUD in the Makefile).
@@ -49,11 +94,13 @@ _start_kernel:
 	// stream whose bit pattern is unambiguous at any sample rate, not
 	// throughput.
 .autobaud_loop:
+#ifdef B1NIX_PI_EARLY_UART
 	ldr x1, =0xfe201000
 	mov w2, #'U'
 	str w2, [x1]
 	ldr x1, =0xfe215040
 	str w2, [x1]
+#endif
 	mov x3, #0x2000
 .autobaud_delay:
 	subs x3, x3, #1
@@ -64,12 +111,16 @@ _start_kernel:
 	// Down to EL1, whichever level this CPU was handed to us at.
 	bl .drop_to_el1
 
+	FBMARK 1, 0xFFFFFF00		// yellow: running at EL1
+
 	// Marker 'E' = EL1 drop completed
+#ifdef B1NIX_PI_EARLY_UART
 	ldr x1, =0xfe201000
 	mov w2, #'E'
 	str w2, [x1]
 	ldr x1, =0xfe215040
 	str w2, [x1]
+#endif
 
 	// ── One boot CPU ────────────────────────────────────────────────────────
 	mrs x0, mpidr_el1
@@ -77,11 +128,13 @@ _start_kernel:
 	cbnz x20, .park_secondary
 
 	// Marker 'P' = Primary CPU confirmed
+#ifdef B1NIX_PI_EARLY_UART
 	ldr x1, =0xfe201000
 	mov w2, #'P'
 	str w2, [x1]
 	ldr x1, =0xfe215040
 	str w2, [x1]
+#endif
 
 	adr x4, _start			// where the loader actually put us
 	ldr x5, =__kernel_start		// where the linker put us
@@ -104,12 +157,16 @@ _start_kernel:
 	br x8
 .relocated:
 
+	FBMARK 2, 0xFF00FF00		// green:  link address matches load address
+
 	// Marker 'R' = Relocation step done
+#ifdef B1NIX_PI_EARLY_UART
 	ldr x1, =0xfe201000
 	mov w2, #'R'
 	str w2, [x1]
 	ldr x1, =0xfe215040
 	str w2, [x1]
+#endif
 
 
 	// Disable alignment check in SCTLR_EL1
@@ -203,23 +260,35 @@ _start_kernel:
 	dsb ish
 	isb
 
-	// Enable MMU only (M=1, C=0, I=0, WXN=0) — clean slate
+	// Enable the MMU *and* the caches.
+	//
+	// C=0/I=0 was a bring-up shortcut and it costs nothing under QEMU, which
+	// does not model cache behaviour at all. On real silicon it is the whole
+	// performance envelope: every instruction fetch and every load goes to
+	// DRAM, and a boot that takes a second takes minutes. The mappings this
+	// kernel installs already carry the right memory types (MAIR slot 1 for
+	// RAM, 0 for registers, 2 for write-combining), which is the precondition
+	// for turning them on.
 	mrs x0, sctlr_el1
 	bic x0, x0, #(1 << 1)   // A = 0 (alignment check off)
-	bic x0, x0, #(1 << 2)   // C = 0
-	bic x0, x0, #(1 << 12)  // I = 0
+	orr x0, x0, #(1 << 2)   // C = 1 (data cache)
+	orr x0, x0, #(1 << 12)  // I = 1 (instruction cache)
 	bic x0, x0, #(1 << 19)  // WXN = 0 (writable ≠ XN)
 	bic x0, x0, #(1 << 25)  // EE = 0 (little-endian)
 	orr x0, x0, #(1 << 0)   // M = 1
 	msr sctlr_el1, x0
 	isb
 
+	FBMARK 3, 0xFF00FFFF		// cyan:   MMU on, this store went through a page table
+
 	// Marker 'M' = MMU enabled!
+#ifdef B1NIX_PI_EARLY_UART
 	ldr x1, =0xfe201000
 	mov w2, #'M'
 	str w2, [x1]
 	ldr x1, =0xfe215040
 	str w2, [x1]
+#endif
 
 	// Set up stack
 	ldr x0, =stack_top
@@ -236,17 +305,20 @@ _start_kernel:
 .bss_cleared:
 
 	// Marker 'S' = Stack & BSS ready!
+#ifdef B1NIX_PI_EARLY_UART
 	ldr x1, =0xfe201000
 	mov w2, #'S'
 	str w2, [x1]
 	ldr x1, =0xfe215040
 	str w2, [x1]
+#endif
 
 	// Restore DTB address to x0, arg1 to x1
 	mov x0, x19
 	mov x1, #0
 
 	// Marker 'K' = Jumping to kernel_main!
+#ifdef B1NIX_PI_EARLY_UART
 	ldr x2, =0xfe201000
 	mov w3, #'K'
 	str w3, [x2]
@@ -256,7 +328,10 @@ _start_kernel:
 	str w3, [x2]
 	mov w3, #'\n'
 	str w3, [x2]
+#endif
 	
+	FBMARK 4, 0xFF0000FF		// blue:   stack and BSS ready, entering C
+
 	// Jump to kernel_main
 	bl kernel_main
 
@@ -295,9 +370,11 @@ _start_kernel:
 	b.ne .already_el1
 .drop_from_el2:
 	// Marker '2' = In EL2 drop handler
+#ifdef B1NIX_PI_EARLY_UART
 	ldr x1, =0xfe201000
 	mov w2, #'2'
 	str w2, [x1]
+#endif
 
 	// EL1's execution state has to be set explicitly: HCR_EL2.RW = 1 (AArch64)
 	movz x0, #0x8000, lsl #16
@@ -325,9 +402,11 @@ _start_kernel:
 
 .already_el1:
 	// Marker '1' = Already in EL1
+#ifdef B1NIX_PI_EARLY_UART
 	ldr x1, =0xfe201000
 	mov w2, #'1'
 	str w2, [x1]
+#endif
 	ret
 
 
@@ -428,10 +507,23 @@ _ap_start:
 
 .section .bss
 .align 12
+.global stack_bottom
 stack_bottom:
-	.skip 65536 // matches x86_64 boot.S / KERNEL_STACK_SIZE — 16KB was not
-	            // enough for the ELF+interpreter-loading call chain userspace_init
-	            // runs on this stack before any task switch (wild-jump crash).
+	// 128 KiB, which is KERNEL_STACK_SIZE on this arch (kernel/sched/scheduler.c).
+	//
+	// It was 64 KiB, half of what every other kernel stack here gets. That
+	// number is not arbitrary: the size was doubled for aarch64 because a task
+	// was measured using ~64 KiB inside a single syscall, RESTORE_REGS and this
+	// build's codegen making each frame bigger than x86_64's. The boot task runs
+	// the same code -- it is what brings up VFS, loads ELFs and runs the whole
+	// pre-init sequence -- on half the room.
+	//
+	// And it is the one stack with no detection on it at all: the canary check
+	// in scheduler_yield is guarded by `if (new_task->stack)`, and the boot
+	// task's stack pointer is 0 because this region is not a heap block. An
+	// overflow here does not trip anything; it writes into whatever .bss sits
+	// below and surfaces later as an unrelated corruption.
+	.skip 131072
 .global stack_top
 stack_top:
 

@@ -967,7 +967,7 @@ static const void *g_inode_wait_worst_site;
 
 static inline u64 vfs_lock_tsc(void) {
   unsigned lo, hi;
-  __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+  { u64 c_ = arch_cycles(); lo = (u32)c_; hi = (u32)(c_ >> 32); }
   return ((u64)hi << 32) | lo;
 }
 
@@ -7278,7 +7278,7 @@ int vfs_get_node_path(struct vfs_node *node, char *buf, usize buf_len) {
 static inline u64 ftr_now(void) {
   u32 lo, hi;
 
-  __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+  { u64 c_ = arch_cycles(); lo = (u32)c_; hi = (u32)(c_ >> 32); }
   return ((u64)hi << 32) | lo;
 }
 
@@ -7574,7 +7574,7 @@ static int memfd_reserve(struct vfs_inode *inode, u64 length) {
      * `b1nix.trace-memfd`. */
     u32 t_lo, t_hi;
 
-    __asm__ volatile("rdtsc" : "=a"(t_lo), "=d"(t_hi));
+    { u64 c_ = arch_cycles(); t_lo = (u32)c_; t_hi = (u32)(c_ >> 32); }
     u64 t0 = ((u64)t_hi << 32) | t_lo;
     void *new_data = kzalloc(new_cap);
     if (!new_data)
@@ -7582,7 +7582,7 @@ static int memfd_reserve(struct vfs_inode *inode, u64 length) {
     if (new_cap >= (1u << 20) && bootinfo_has_flag("b1nix.trace-memfd")) {
       u32 e_lo, e_hi;
 
-      __asm__ volatile("rdtsc" : "=a"(e_lo), "=d"(e_hi));
+      { u64 c_ = arch_cycles(); e_lo = (u32)c_; e_hi = (u32)(c_ >> 32); }
       console_write("memfd: grew to ");
       console_write_dec(new_cap / 1024);
       console_write(" KiB in ");

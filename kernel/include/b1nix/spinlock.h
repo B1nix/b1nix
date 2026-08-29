@@ -53,6 +53,7 @@ void spin_lock_stuck(volatile int *lock, u64 caller) __attribute__((noreturn));
  * A cycle deadline measures the thing the check is actually about. Ten seconds
  * is far beyond any legitimate hold and still reports a real deadlock long
  * before a human gives up on the machine. */
+#if defined(__x86_64__)
 #define SPIN_LOCK_STUCK_CYCLES 30000000000ULL /* ~10 s at 3 GHz */
 
 static inline u64 spin_rdtsc(void) {
@@ -60,6 +61,26 @@ static inline u64 spin_rdtsc(void) {
     __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
     return ((u64)hi << 32) | lo;
 }
+#elif defined(__aarch64__)
+/* The virtual counter is the architectural free-running clock; unlike the TSC
+ * its rate is discoverable, so the deadline is ten real seconds on any board
+ * rather than ten seconds at an assumed 3 GHz. */
+static inline u64 spin_rdtsc(void) {
+    u64 v;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+}
+
+static inline u64 spin_stuck_cycles(void) {
+    u64 f;
+    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(f));
+    return f * 10;
+}
+#define SPIN_LOCK_STUCK_CYCLES spin_stuck_cycles()
+#else
+#define SPIN_LOCK_STUCK_CYCLES 0ULL
+static inline u64 spin_rdtsc(void) { return 0; }
+#endif
 
 static inline void spin_lock(spinlock_t *lock) {
     /* Spin until we successfully exchange 1 (locked) with the old value.
@@ -106,6 +127,43 @@ static inline void spin_unlock(spinlock_t *lock) {
      * before the lock is released. */
     __asm__ volatile("" : : : "memory");
     *lock = 0;
+}
+
+/* One attempt, no spinning: 1 if this CPU now holds the lock, 0 if somebody
+ * else does. For callers that must not wait on a holder who may never release
+ * -- the panic path, which needs the console but cannot afford to hang on a
+ * CPU that died holding it. */
+static inline int spin_trylock(spinlock_t *lock) {
+    if (spin_xchg(lock, 1) != 0)
+        return 0;
+    LOCKDEP_NOTE_SPIN_ACQUIRE(lock, (u64)(usize)__builtin_return_address(0));
+    return 1;
+}
+
+static inline int spin_trylock_irqsave(spinlock_t *lock, u64 *flags) {
+    u64 saved;
+#ifdef __x86_64__
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved) : : "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("mrs %0, daif; msr daifset, #2" : "=r"(saved) : : "memory");
+#else
+    u32 f32;
+    __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
+    saved = f32;
+#endif
+    if (spin_trylock(lock)) {
+        *flags = saved;
+        return 1;
+    }
+    /* Not taken: restore the caller's interrupt state rather than leaving it
+     * masked on a failed attempt. */
+#ifdef __x86_64__
+    if (saved & 0x200ULL)
+        __asm__ volatile("sti" : : : "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("msr daif, %0" : : "r"(saved) : "memory");
+#endif
+    return 0;
 }
 
 static inline int spin_is_locked(spinlock_t *lock) {

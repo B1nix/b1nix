@@ -215,6 +215,8 @@
 #define LX_llistxattr      12
 #define LX_removexattr     14
 #define LX_lremovexattr    15
+#define LX_pivot_root      41
+#define LX_readahead      213
 #else
 /* Linux x86_64 syscall numbers (subset). Named to mirror __NR_* so the table is
  * auditable against asm/unistd_64.h. */

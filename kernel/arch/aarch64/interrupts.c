@@ -38,7 +38,12 @@ static u64 g_gicc = 0;
 #define GICC_IAR         (*(volatile u32 *)(GICC_BASE + 0x00c))
 #define GICC_EOIR        (*(volatile u32 *)(GICC_BASE + 0x010))
 
-#define TIMER_IRQ 27
+/* The virtual timer's INTID, from the board's device tree — see
+ * fdt_timer_virt_irq(). The old constant was QEMU virt's PPI 11; a Snapdragon
+ * wires its timers to PPIs 1/2/3/0, so the same timer is INTID 19 there and
+ * nothing ever arrived on 27. */
+u32 fdt_timer_virt_irq(void);
+#define TIMER_IRQ (fdt_timer_virt_irq())
 
 extern void vector_table_el1(void);
 
@@ -294,6 +299,22 @@ void aarch64_irq_handler(struct interrupt_frame *frame)
 		 * immediately, then run the (preemptible) tick work. */
 		gic_eoi(iar);
 
+		/* Where this tick landed. The user/kernel/idle distribution is always
+		 * kept; the kernel-ELR histogram only under b1nix.sysprof. Every core
+		 * takes its own CNTV interrupt, so every core contributes — unlike the
+		 * housekeeping below, which is deliberately the boot CPU's alone. */
+		{
+			extern void kprof_tick(u64 pc, int in_user, int in_idle, int cpu);
+			struct percpu *pc = get_percpu();
+			int in_user = (frame->spsr & 0xFULL) == 0; /* EL0t */
+			int in_idle = pc && pc->idle_task &&
+			              (struct task *)pc->cur_task ==
+			                  (struct task *)pc->idle_task;
+
+			kprof_tick(frame->elr, in_user, in_idle,
+			           pc ? (int)pc->cpu_id : 0);
+		}
+
 		/* Only the boot CPU runs the housekeeping half of the tick: the
 		 * watchdog counts wall time once, the serial drain owns a device, and
 		 * scheduler_on_timer_tick advances the machine's tick counter — run it
@@ -358,6 +379,32 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 	int from_el0 = (frame->spsr & 0xFULL) == 0;
 	int is_abort = (ec == EC_INSN_ABORT_LOWER || ec == EC_DATA_ABORT_LOWER ||
 	                ec == EC_INSN_ABORT_SAME || ec == EC_DATA_ABORT_SAME);
+
+	/* Did this entry land on the stack it should have?
+	 *
+	 * SAVE_REGS builds the frame immediately below SP_EL1, so on an EL0 entry
+	 * the top of the frame must be exactly the task's kernel_stack_ptr. That is
+	 * the invariant the old per-CPU stack reset enforced by overwriting SP on
+	 * every boundary; with the reset gone the invariant has to hold on its own,
+	 * so it is checked instead of assumed. A mismatch means a task's frame is
+	 * being written somewhere other than its own stack, which is the corruption
+	 * this branch has been chasing -- caught here, at the moment it happens,
+	 * rather than deduced from a garbled saved register three switches later. */
+	if (from_el0 && current_task && current_task->kernel_stack_ptr) {
+		u64 frame_top = (u64)(usize)frame + sizeof(*frame);
+
+		if (frame_top != current_task->kernel_stack_ptr) {
+			console_write("KSTACK-MISMATCH: entry for pid ");
+			console_write_dec((u64)current_task->id);
+			console_write(" name=");
+			console_write(current_task->name ? current_task->name : "(none)");
+			console_write(" frame_top=0x");
+			console_write_hex64(frame_top);
+			console_write(" kernel_stack_ptr=0x");
+			console_write_hex64(current_task->kernel_stack_ptr);
+			console_write("\n");
+		}
+	}
 
 	/* M36: BRK is this arch's int3 — route it to the GDB serial stub when the
 	 * kernel was booted with b1nix.gdb. Off by default, so an ordinary or test

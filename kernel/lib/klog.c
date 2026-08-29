@@ -3,6 +3,7 @@
 #include <b1nix/console.h>
 #include <b1nix/serial.h>
 #include <b1nix/klog.h>
+#include <b1nix/lapic.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/bootinfo.h>
 
@@ -347,10 +348,80 @@ void panic_backtrace(void)
 
 void panic(const char *message)
 {
+	/* One panicking CPU owns the console; the rest stop without printing.
+	 *
+	 * A panic busts the console lock -- it has to, since the holder may be the
+	 * CPU that just died -- so when two CPUs panic together their dumps came
+	 * out interleaved character by character: two register sets and two
+	 * backtraces shuffled into gibberish. That is the one output that has to
+	 * survive, and the failures worth reading are exactly the ones that take
+	 * more than one CPU down. Whoever claims this first prints the whole dump;
+	 * the others halt quietly and are accounted for by the first CPU's task
+	 * list. */
+	{
+		static volatile int panic_owner; /* cpu_id + 1, 0 = unclaimed */
+		struct percpu *pc = get_percpu();
+		int me = (pc ? pc->cpu_id : 0) + 1;
+		int unclaimed = 0;
+
+		if (!__atomic_compare_exchange_n(&panic_owner, &unclaimed, me, 0,
+		                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+			if (panic_owner != me)
+				arch_halt(); /* somebody else is printing; stay out of it */
+		}
+	}
+
+	/* Own the console for the whole dump.
+	 *
+	 * Claiming panic_owner above only stops a SECOND panic from interleaving.
+	 * A CPU that is still running normally goes on printing, and its output
+	 * lands character by character inside the register dump -- which is how
+	 * "sched: corrupt kernel stack pointer for pid ..." arrived shredded, with
+	 * the pid and the two pointers, the whole point of the message, unreadable.
+	 *
+	 * Take the lock rather than busting it. Busting is only right when the
+	 * holder is the CPU that just died, and that is what the bounded spin
+	 * decides: whoever holds it has a few million cycles to finish a line, and
+	 * if they do not they are gone and the lock is taken anyway. Held for the
+	 * rest of this function, which never returns -- console_write sees
+	 * console_lock_held_here() and prints straight through. */
+	{
+		u64 spins = 0;
+		u64 cflags;
+
+		while (!console_lock_try_acquire_irqsave(&cflags)) {
+			if (++spins > 8000000ull) {
+				console_bust_lock();
+				console_lock_acquire_irqsave(&cflags);
+				break;
+			}
+		}
+	}
+
 	/* If we are dying before the command line was parsed, the console is
 	 * still holding every line of the boot back; release them, or the panic
 	 * arrives without the context that explains it. */
 	console_log_panic_flush();
+
+	/* The marker every harness looks for, emitted before anything else.
+	 *
+	 * tests/smoke.sh ends an instance on "KERNEL PANIC" or "[PANIC]", CLAUDE.md
+	 * documents both, and this function printed neither -- klog_write maps
+	 * KLOG_PANIC to LOGLEVEL_EMERG, so a panic came out as "<0>message" and
+	 * nothing matched. The string did exist, in kernel/lib/panic.c, which is
+	 * not in the build; that dead copy is why everyone believed it was there.
+	 *
+	 * The cost was not cosmetic: a panicking instance stopped writing and the
+	 * runner then waited out its full 320-second silence allowance before
+	 * killing it. Three such lanes is most of the wall clock of a failing run.
+	 */
+	console_write("\nKERNEL PANIC: ");
+	console_write(message ? message : "(no message)");
+	console_write("\n");
+	serial_write("\nKERNEL PANIC: ");
+	serial_write(message ? message : "(no message)");
+	serial_write("\n");
+
 	klog_write(KLOG_PANIC, message);
 	panic_backtrace();
 	arch_halt();

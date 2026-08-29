@@ -23,60 +23,30 @@
 // field-for-field: x0..x30, esr, elr, spsr, far, sp_el0, tpidr_el0, pad — so
 // `sp` right after SAVE_REGS can be handed to C as a real
 // `struct interrupt_frame *`, not NULL.
-// Entering EL1 from EL0: put SP_EL1 back at the top of THIS task's kernel
-// stack before anything is pushed on it. x86_64 gets this from hardware (the
-// TSS pins RSP0 on every ring3->ring0 entry); AArch64 does not — SP_EL1 is
-// simply whatever the last EL1 code on this CPU left it at, so without this the
-// entry frame lands wherever the previous kernel activity happened to stop.
-// Nothing on the kernel stack is live while the task runs at EL0 (a task inside
-// a syscall is by definition not at EL0), so resetting to the top is always
-// safe — and skipping it let a task's frames drift onto memory outside its own
-// stack, which the scheduler's stack-pointer sanity check caught as
-// "corrupt kernel stack pointer" in the middle of an unrelated syscall.
-// tpidr_el1 is otherwise unused by b1nix, so it serves as the scratch register
-// needed before any GPR can be clobbered.
-// Applied on the way OUT to EL0 as well as on the way in. Nothing on the
-// kernel stack is live while a task runs at EL0, so SP_EL1 should be exactly
-// the top of that task's stack at every EL0 boundary, in both directions.
-// Only the entry side used to do this, which left SP_EL1 wherever the exit
-// path happened to stop — and every path that erets without a matching
-// SAVE_REGS (the clone-child frame return, the first jump to EL0) leaves it
-// somewhere else again. Making it absolute on exit too means SP_EL1 can never
-// drift, whatever a handler did with it.
-// Per-CPU block, reached through TPIDR_EL1 (kernel/arch/aarch64/smp.c fills it
-// in and installs the pointer, one per CPU). Offsets must match struct
-// aarch64_pcpu_asm, which asserts them.
-//
-//   +0   kernel stack top of the task running on this CPU
-//   +8   top of this CPU's EL1 fault stack
-//   +16  the SP_EL1 that this CPU's current EL1 fault interrupted
+// Per-CPU block offsets, reached through TPIDR_EL1 (kernel/arch/aarch64/smp.c
+// fills it in, one per CPU). Must match struct aarch64_pcpu_asm, which asserts
+// them. Slot 0 is dead weight now -- see the note below -- and stays only so the
+// two fault-stack offsets keep the values the struct gives them.
 .equ PCPU_KSTACK_TOP, 0
 .equ PCPU_FAULT_TOP,  8
 .equ PCPU_FAULT_SP,   16
 
-// TPIDRRO_EL0 is the scratch for parking x0, in both this macro and sync_el1.
+// SP_EL1 belongs to the task, not to the CPU.
 //
-// NOT PAR_EL1, which this file used to park x0 in and which cannot hold an
-// arbitrary value: it is a status register whose reserved fields the hardware
-// enforces on write. Measured on this port's target, writing 0xdeadbeef reads
-// back 0xdeadbaef, 0x7 reads back 0x807, and 0x700000029968 reads back
-// 0x29968. On the EL0 exit path x0 is the syscall's return value, so mangling
-// it hands userspace a corrupted result — a mapping address that came back
-// with its high bits cut, in the case that found this.
+// There used to be an EL0_KSTACK_RESET here, applied on every EL0 boundary in
+// both directions: it read a kernel stack top out of a per-CPU slot and wrote
+// it into SP. That was x86_64's TSS.rsp0 transplanted onto an architecture that
+// does not need it -- EL1 has its own SP, it survives an eret to EL0 and the
+// next exception back, and arch_context_switch already carries it with the
+// task. What the reset actually bought was cover for the two paths that eret
+// WITHOUT a matching SAVE_REGS (the first jump to EL0, and the clone child's
+// frame return); those now put SP_EL1 where it belongs themselves, from a value
+// their caller supplies, so nothing has to be repaired globally afterwards.
 //
-// TPIDRRO_EL0 is banked per CPU, round-trips every value, and nothing in this
-// kernel gives it a meaning: b1nix has no vDSO, and userspace TLS is
-// TPIDR_EL0, which SAVE_REGS/RESTORE_REGS carry in the frame.
-.macro EL0_KSTACK_RESET
-	msr tpidrro_el0, x0
-	mrs x0, tpidr_el1
-	cbz x0, 8f            // per-CPU block not installed yet
-	ldr x0, [x0, #PCPU_KSTACK_TOP]
-	cbz x0, 8f            // no task scheduled yet — keep the current sp
-	mov sp, x0
-8:
-	mrs x0, tpidrro_el0
-.endm
+// The cost of the reset was not theoretical: a stale per-CPU value writes the
+// entering task's register frame into ANOTHER task's kernel stack. It also
+// borrowed TPIDRRO_EL0 -- architecturally the user-visible read-only thread
+// pointer -- as a scratch register between two instructions.
 
 .macro SAVE_REGS
 	sub sp, sp, #304
@@ -111,8 +81,7 @@
 .macro RESTORE_REGS
 	// IRQs off for the whole return sequence. Everything below is per-task
 	// CPU state that lives in single registers -- ELR_EL1, SPSR_EL1, SP_EL0,
-	// TPIDR_EL0, and the x0 that EL0_KSTACK_RESET parks in TPIDR_EL1 between
-	// two instructions. A timer tick landing anywhere in here reschedules,
+	// TPIDR_EL0. A timer tick landing anywhere in here reschedules,
 	// and the task that runs next overwrites every one of them; when this one
 	// resumes it erets with another task's values. TPIDR_EL1 is the worst of
 	// them because no frame saves it. The eret restores PSTATE from SPSR_EL1,
@@ -199,7 +168,7 @@ vector_table_el1:
 // Single-CPU only, which this arch is (g_max_cpus == 1). A nested EL1 abort
 // clobbers the saved pointer, but by then the machine is already dying.
 sync_el1:
-	// Same scratch as EL0_KSTACK_RESET, and safe for the same reason: the only
+	// TPIDRRO_EL0 as scratch, safe here because the only
 	// memory that macro touches is the per-CPU block, kernel .bss mapped since
 	// boot, so an EL1 fault cannot nest inside its window and find the parked
 	// x0 gone.
@@ -243,7 +212,6 @@ irq_el1:
 	eret
 
 sync_el0:
-	EL0_KSTACK_RESET
 	SAVE_REGS
 	mrs x0, esr_el1
 	mrs x1, elr_el1
@@ -295,7 +263,6 @@ sync_el0:
 	// instead of its signo — OpenRC reported "caught unknown signal 0" and
 	// "caught unknown signal -4" (-EINTR).
 	RESTORE_REGS
-	EL0_KSTACK_RESET
 	eret
 
 1:
@@ -304,17 +271,14 @@ sync_el0:
 	                             // 4th arg must be the interrupt frame.
 	bl aarch64_sync_handler
 	RESTORE_REGS
-	EL0_KSTACK_RESET
 	eret
 
 irq_el0:
-	EL0_KSTACK_RESET
 	SAVE_REGS
 	mov x0, sp                  // frame: the handler delivers a pending signal
 	                            // through it on the way back to EL0
 	bl aarch64_irq_handler
 	RESTORE_REGS
-	EL0_KSTACK_RESET
 	eret
 
 // fork(2) resume: scheduler_fork_current() (kernel/sched/scheduler.c) builds
@@ -329,16 +293,21 @@ irq_el0:
 .type aarch64_fork_child_trampoline, %function
 aarch64_fork_child_trampoline:
 	RESTORE_REGS
-	EL0_KSTACK_RESET
 	eret
 
 x86_user_jump:
-	// x0 = entry, x1 = stack, x2 = argc, x3 = argv
+	// x0 = entry, x1 = stack, x2 = argc, x3 = argv, x4 = kernel stack top
 	// IRQs off across the ELR/SPSR write + eret — see the note in
 	// aarch64_user_thread_jump.
 	msr daifset, #2
 	msr sp_el0, x1
 	msr elr_el1, x0
+	// This runs on the task's own kernel stack, part-way down its C frames, and
+	// erets from there — so SP_EL1 has to be put back at the top explicitly.
+	// The value comes from the caller, which knows whose task this is; it used
+	// to be read out of a per-CPU slot, which is the same value only as long as
+	// nothing has published a different one since.
+	mov sp, x4
 	mov x4, #0
 	msr spsr_el1, x4
 
@@ -373,7 +342,6 @@ x86_user_jump:
 	mov x28, #0
 	mov x29, #0
 	mov x30, #0
-	EL0_KSTACK_RESET
 	eret
 
 
@@ -389,6 +357,10 @@ x86_user_jump:
 .global aarch64_user_thread_jump
 .type aarch64_user_thread_jump, %function
 aarch64_user_thread_jump:
+	// x4 = kernel stack top. Same reason as x86_user_jump: this runs on the
+	// task's own kernel stack, part-way down its C frames, and erets from
+	// there, so SP_EL1 is put back at the top from a value the caller supplies.
+	mov sp, x4
 	// Mask IRQs first: ELR_EL1/SPSR_EL1 are shared system registers, so a
 	// timer tick landing between the msr's and the eret reschedules, and the
 	// task that eventually resumes this code erets with whatever ELR another
@@ -436,7 +408,6 @@ aarch64_user_thread_jump:
 	// immediately branches to __syscall_ret, which returns through it.
 	mov x30, x1
 	mov x1, #0
-	EL0_KSTACK_RESET
 	eret
 
 // aarch64_eret_frame(struct interrupt_frame *f) — return to EL0 through a
@@ -452,7 +423,6 @@ aarch64_eret_frame:
 	msr daifset, #2
 	mov sp, x0
 	RESTORE_REGS
-	EL0_KSTACK_RESET
 	eret
 
 /* Dedicated stack for synchronous exceptions taken at EL1 (see sync_el1), plus

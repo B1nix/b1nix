@@ -2862,6 +2862,7 @@ static isize sys_linux_uname(u64 arg0) {
 
 /* The caller's user registers, for a clone(2) child that must resume with them
  * (see struct clone_user_regs). */
+#if !defined(__aarch64__)
 static void clone_regs_from_frame(struct clone_user_regs *r,
                                   const struct interrupt_frame *f) {
   memset(r, 0, sizeof(*r));
@@ -2882,6 +2883,7 @@ static void clone_regs_from_frame(struct clone_user_regs *r,
   r->r14 = f->r14;
   r->r15 = f->r15;
 }
+#endif
 
 /* Map a b1nix dirent type (1=file, 2=device, 3=directory) to a Linux d_type. */
 static u8 lx_dirent_type(const struct dirent *d) {
@@ -4381,7 +4383,7 @@ static u64 syscall_sleep_timespec(const struct timespec *ts, u64 *ticks_asked) {
       break;
     u64 rest_ticks = (deadline_ns - now_ns) / tick_ns;
     if (!rest_ticks) {
-      __asm__ volatile("pause");
+      cpu_relax();
       continue;
     }
     /* Ask the scheduler to sleep and let IT decide whether this task may:
@@ -4598,6 +4600,15 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   u64 vmm_flags = VMM_USER;
   if (prot & PROT_WRITE)
     vmm_flags |= VMM_WRITABLE;
+  /* MAP_SHARED|MAP_ANONYMOUS has no name and no file, so the only processes
+   * that can ever see it are this one and its children — which makes fork the
+   * whole point of the mapping. Without the shared bit its leaves look like
+   * ordinary private anonymous pages, so fork marks them copy-on-write and the
+   * child's stores land in a private copy the parent never sees. Every
+   * fork-and-report-back pattern then reads as if the child had never run.
+   * File-backed MAP_SHARED already gets the bit where its frames are mapped. */
+  if ((flags & MAP_SHARED) && (flags & MAP_ANONYMOUS))
+    vmm_flags |= VMM_SHARED;
 
   /* Anonymous memory is faulted in, not handed over.
    *
@@ -5710,10 +5721,17 @@ static u64 g_sysprof_count[SYSPROF_SLOTS];
 static u64 g_sysprof_cycles[SYSPROF_SLOTS];
 
 static inline u64 syscall_prof_now(void) {
+#if defined(__aarch64__)
+  u64 v;
+
+  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+  return v;
+#else
   u32 lo, hi;
 
-  __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+  { u64 c_ = arch_cycles(); lo = (u32)c_; hi = (u32)(c_ >> 32); }
   return ((u64)hi << 32) | lo;
+#endif
 }
 
 static int syscall_prof_enabled(void) {
@@ -6464,6 +6482,27 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * the x86_64 values made aarch64 route mmap(222) into timer_create and
        * fail every allocation in userspace ("out of memory" from busybox and
        * openrc, malloc returning NULL in musl). */
+/* Same number on x86_64 and asm-generic, and the clone3 flag bits are
+ * architecture-independent — used by the shared code below both arch blocks. */
+#define LX_clone3          435
+#define LX_epoll_pwait2    441
+/* Added to Linux after the asm-generic table settled, so these carry the same
+ * number on both arches. */
+#define LX_pidfd_send_signal 424
+#define LX_pidfd_open      434
+#define LX_close_range     436
+#define LX_fchmodat2       452
+/* epoll_pwait is NOT one of the shared numbers: asm-generic gives it 22. */
+#if defined(__aarch64__)
+#define LX_epoll_pwait      22
+#else
+#define LX_epoll_pwait     281
+#endif
+/* clone3 flags this kernel does not model, in the high word of clone_args. */
+#define LX_CLONE_PIDFD        0x00001000ULL
+#define LX_CLONE_DETACHED     0x00400000ULL
+#define LX_CLONE_INTO_CGROUP  0x200000000ULL
+
 #if defined(__aarch64__)
 #define LXN_MQ_OPEN          180
 #define LXN_MQ_UNLINK        181
@@ -6768,13 +6807,6 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_FUTEX           202
 #define LX_ioctl           16
 #define LX_nanosleep       35
-#define LX_clone3          435
-#define LX_epoll_pwait     281
-#define LX_epoll_pwait2    441
-/* clone3 flags this kernel does not model, in the high word of clone_args. */
-#define LX_CLONE_PIDFD        0x00001000ULL
-#define LX_CLONE_DETACHED     0x00400000ULL
-#define LX_CLONE_INTO_CGROUP  0x200000000ULL
 #define LX_close           3
 #define LX_mq_open         240
 #define LX_mq_unlink       241
@@ -7635,6 +7667,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           }
           return ns_pid_out((u64)kid);
         }
+#if defined(__aarch64__)
+        u64 child_entry = frame ? frame->elr : child_sp;
+        u64 user_lr = frame ? frame->x30 : 0;
+        return (u64)scheduler_clone_thread(flags, child_entry, child_sp, 0,
+                                           ca.tls, ca.child_tid, ca.parent_tid,
+                                           ca.child_tid, arg5, user_lr, frame);
+#else
         u64 child_entry = frame ? frame->rip : child_sp;
         struct clone_user_regs uregs;
         clone_regs_from_frame(&uregs, frame);
@@ -7642,6 +7681,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                                            ca.tls, ca.child_tid, ca.parent_tid,
                                            ca.child_tid, arg5,
                                            frame ? &uregs : 0);
+#endif
       }
       /* Linux clone(2) has a different argument layout than b1nix SYS_CLONE:
        *   Linux: clone(flags, user_stack, parent_tidptr, child_tidptr, tls)

@@ -3226,9 +3226,38 @@ static void test_attr_applets(void) {
 
 /* ── 2. discard ─────────────────────────────────────────────────────────── */
 
+/* Is this device carrying a live filesystem right now?
+ *
+ * A probe is a real BLKDISCARD, so it destroys half a megabyte of whatever it
+ * lands on. That was harmless only for as long as none of the candidates below
+ * had the command: the moment virtio-blk started negotiating DISCARD, the
+ * fallback list's /dev/vdb -- which is the root disk on the machines that boot
+ * from virtio -- got a hole punched in it mid-run, and the instance wedged in
+ * a later filesystem test with no hint of why. */
+static int dev_is_mounted(const char *dev) {
+  FILE *f = fopen("/proc/mounts", "r");
+  char line[512];
+  int hit = 0;
+
+  if (!f)
+    return 1; /* cannot tell -> assume it is, and leave it alone */
+  while (!hit && fgets(line, sizeof(line), f)) {
+    char *sp = strchr(line, ' ');
+
+    if (!sp)
+      continue;
+    *sp = '\0';
+    hit = strcmp(line, dev) == 0;
+  }
+  fclose(f);
+  return hit;
+}
+
 /* One place that decides what a device should do, so the two markers below
  * cannot disagree about it. */
 static int discard_probe(const char *dev, int *supported) {
+  if (dev_is_mounted(dev))
+    return -1;
   int fd = open(dev, O_RDWR);
   if (fd < 0)
     return -1;
@@ -3274,7 +3303,7 @@ static void test_discard_support(void) {
    * discard support serves — and the run is only inconclusive if every device
    * on the machine happens to have it. */
   static const char *const plain[] = { "/dev/ram0", "/dev/sata1", "/dev/sata0",
-                                       "/dev/vdb" };
+                                       "/dev/vdb", "/dev/sdc" };
   int checked = 0;
 
   for (unsigned i = 0; i < sizeof(plain) / sizeof(plain[0]) && !checked; i++) {

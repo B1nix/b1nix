@@ -11,6 +11,7 @@
 #include <string.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/module.h>
+#include <b1nix/bootmark.h>
 
 #define BITS_PER_BYTE 8
 

@@ -32,3 +32,23 @@ tools/rp2350/build-*/
 tools/rp2350/pico-sdk/
 
 
+
+# ── Android / LineageOS device tree ──────────────────────────────────────────
+# Extracted vendor blobs: ~800 MB of proprietary Sony/Qualcomm binaries that
+# belong on the device, not in this history. Regenerate them from a running
+# phone with device/sony/bahamut/extract-files.sh.
+tools/sony-xperia-5/android_device_tree/vendor/
+tools/sony-xperia-5/android_device_tree/**/proprietary/
+
+# AOSP/LineageOS build trees and output (hundreds of GB, all regenerable).
+/.repo/
+/out/
+tools/sony-xperia-5/out/
+tools/sony-xperia-5/lineage/
+
+# Intermediate device-tree blobs kept only while splitting a multi-SoC bundle.
+*.dtb.orig
+
+# The Xperia 5 device tree ships as tools/sony-xperia-5/android_device_tree.tar.gz.
+# The unpacked copy also holds ~810 MiB of vendor blobs that are not ours to carry.
+tools/sony-xperia-5/android_device_tree/

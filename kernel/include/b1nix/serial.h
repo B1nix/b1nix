@@ -1,6 +1,8 @@
 #ifndef B1NIX_SERIAL_H
 #define B1NIX_SERIAL_H
 
+#include <b1nix/types.h>
+
 /* Number of UART lines the driver knows about: 0 = COM1 (console mirror),
  * 1 = COM2 (optional second line, probed at boot). */
 #define SERIAL_NPORTS 2

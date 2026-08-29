@@ -275,7 +275,7 @@ static u32 hda_corb_send_wait(u32 verb) {
 		 * before. */
 		if ((i & 0xff) == 0xff && scheduler_get_uptime_ticks() - start > 10)
 			break;
-		__asm__ volatile("pause");
+		cpu_relax();
 	}
 	return 0;
 }

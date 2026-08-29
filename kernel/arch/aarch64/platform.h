@@ -6,6 +6,7 @@
 #define PLATFORM_UNKNOWN   0
 #define PLATFORM_QEMU_VIRT 1
 #define PLATFORM_RPI4      2
+#define PLATFORM_SM8150    3
 
 void platform_detect(u64 dtb_addr);
 u64 platform_uart_base(void);

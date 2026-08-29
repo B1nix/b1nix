@@ -390,7 +390,7 @@ static void build_direct_map(u64 *l1, u64 limit, u64 *(*alloc_l2)(void),
  * unmapped first 2 MiB, and one GiB shared between RAM and registers); a board
  * needing more keeps the coarser 1 GiB mapping for the rest, which is what it
  * had before this existed. */
-#define BOOT_L2_POOL 2
+#define BOOT_L2_POOL 8
 static u64 boot_l2_pool[BOOT_L2_POOL][512] __attribute__((aligned(PAGE_SIZE)));
 static usize boot_l2_used;
 
@@ -987,8 +987,7 @@ u64 paging_user_phys(u64 pml4_phys, u64 vaddr) {
   return frame | (vaddr & (PAGE_SIZE - 1));
 }
 
-void paging_mprotect_page(u64 virtual_address, u64 flags) {
-  u64 *l0 = get_current_l0();
+static void mprotect_page_in_l0(u64 *l0, u64 virtual_address, u64 flags) {
   usize i0 = l0_index(virtual_address);
   if ((l0[i0] & 0x3ULL) != D_TABLE) return;
   u64 *l1 = table_from_entry(l0[i0]);
@@ -1025,8 +1024,163 @@ void paging_mprotect_page(u64 virtual_address, u64 flags) {
     l3[i3] = encode_leaf(frame, flags | VMM_PRESENT) | keep;
     tlb_flush_page(virtual_address);
   } else if (entry & VMM_LAZY) {
-    l3[i3] = (entry & ~(u64)(VMM_WRITABLE | VMM_USER)) | (flags & (VMM_WRITABLE | VMM_USER)) | VMM_LAZY;
+    /* VMM_SHARED belongs in this set too: a lazily committed MAP_SHARED
+     * anonymous mapping records the bit here and nowhere else, and the fault
+     * that materialises the page copies the marker's flags verbatim. Dropping
+     * it left the page looking private, so fork marked it copy-on-write and a
+     * child's stores never reached the parent. */
+    const u64 mutable_bits = VMM_WRITABLE | VMM_USER | VMM_SHARED;
+    l3[i3] = (entry & ~mutable_bits) | (flags & mutable_bits) | VMM_LAZY;
   }
+}
+
+void paging_mprotect_page(u64 virtual_address, u64 flags) {
+  mprotect_page_in_l0(get_current_l0(), virtual_address, flags);
+}
+
+/* The same, in an address space that is not the one currently installed —
+ * futex's watch page pokes a sleeping task's mapping. A kernel address always
+ * lives in the shared kernel L0 no matter whose space was named. */
+void paging_mprotect_page_in_space(u64 pml4_phys, u64 vaddr, u64 flags) {
+  u64 *l0 = (vaddr >= 0x8000000000000000ULL || !pml4_phys) ? kernel_l0_virt
+                                                           : phys_to_virt(pml4_phys);
+  u64 f;
+
+  vmm_write_acquire(&f);
+  mprotect_page_in_l0(l0, vaddr, flags);
+  vmm_write_release(f);
+}
+
+void paging_mprotect_range(u64 start, u64 end, u64 flags) {
+  u64 f;
+  u64 *l0 = get_current_l0();
+
+  vmm_write_acquire(&f);
+  for (u64 va = start & ~(u64)(PAGE_SIZE - 1); va < end; va += PAGE_SIZE)
+    mprotect_page_in_l0(l0, va, flags);
+  vmm_write_release(f);
+}
+
+void paging_unmap_range_from_space(u64 pml4_phys, u64 base, usize npages) {
+  u64 f;
+
+  /* One critical section for the whole range rather than npages of them: exit
+   * tears down thousands of pages and the lock round-trip dominated. */
+  vmm_write_acquire(&f);
+  for (usize i = 0; i < npages; i++)
+    unmap_from_space_locked(pml4_phys, base + i * PAGE_SIZE);
+  vmm_write_release(f);
+}
+
+void vmm_map_range(u64 base, const u64 *frames, usize n, u64 flags) {
+  u64 f;
+
+  vmm_write_acquire(&f);
+  for (usize i = 0; i < n; i++)
+    map_page_locked(base + i * PAGE_SIZE, frames[i], flags);
+  vmm_write_release(f);
+}
+
+/* Unmap a range and hand back the frames the caller now owns.
+ *
+ * NOT vmm_unmap_range_nosync with a different name, which is what this was.
+ * The two have different contracts and the difference is not cosmetic: nosync
+ * fills one slot per page, holes included, and reports npages, while this one
+ * returns a packed array and a count of it. Forwarding to nosync therefore told
+ * sys_munmap to free every hole -- pmm_free_frame(0x0) on every unmapped page
+ * in the range, which the allocator refused and reported, eight times before it
+ * gave up counting.
+ *
+ * Freeing the zeros was the visible half. The other half is that nosync reports
+ * every present frame, and munmap freed those too: a page-cache page or a
+ * shared segment mapped into this address space would have been handed back to
+ * the allocator while its owner still held it. unmap_from_space_locked has
+ * always tested SW_USER before freeing; so does this now, matching x86_64.
+ *
+ * Two things x86_64's version does that were missing entirely: a frame going
+ * back to the allocator leaves the eviction registry first, and a leaf holding
+ * a swap slot rather than a frame releases the slot instead of leaking it.
+ *
+ * No shootdown IPI: aarch64 broadcasts TLB maintenance across the
+ * inner-shareable domain in hardware (TLBI ...IS), so the unmap is complete
+ * when the instruction retires.
+ */
+usize vmm_unmap_range_collect(u64 base, usize npages, u64 *frames_out) {
+  extern void eviction_unregister_page(u64 frame);
+  extern void swap_free_slot_index(u32 slot);
+  u64 pml4_phys = current_task ? current_task->pml4_phys : 0;
+  usize nframes = 0;
+  u64 _vmflags;
+
+  vmm_write_acquire(&_vmflags);
+  for (usize i = 0; i < npages; i++) {
+    u64 va = base + i * PAGE_SIZE;
+    u64 *l0 = (va >= 0x8000000000000000ULL || !pml4_phys)
+                  ? kernel_l0_virt
+                  : phys_to_virt(pml4_phys);
+    usize i0 = l0_index(va);
+
+    if ((l0[i0] & 0x3ULL) != D_TABLE)
+      continue;
+    u64 *l1 = table_from_entry(l0[i0]);
+    usize i1 = l1_index(va);
+    if ((l1[i1] & 0x3ULL) != D_TABLE)
+      continue;
+    u64 *l2 = table_from_entry(l1[i1]);
+    usize i2 = l2_index(va);
+    if ((l2[i2] & 0x3ULL) != D_TABLE)
+      continue;
+    u64 *l3 = table_from_entry(l2[i2]);
+    usize i3 = l3_index(va);
+    u64 entry = l3[i3];
+
+    if (!entry)
+      continue;
+    if ((entry & 0x3ULL) == D_PAGE) {
+      u64 frame = entry & ADDR_MASK;
+
+      if (frame && (entry & SW_USER)) {
+        eviction_unregister_page(frame);
+        frames_out[nframes++] = frame;
+      }
+    } else if (entry & VMM_SWAPPED) {
+      swap_free_slot_index((u32)((entry & ADDR_MASK) >> 12));
+    }
+    l3[i3] = 0;
+    tlb_flush_page(va);
+  }
+  vmm_write_release(_vmflags);
+  return nframes;
+}
+
+void vmm_set_lazy_flags(u64 virtual_address, u64 flags) {
+  u64 f;
+
+  vmm_write_acquire(&f);
+  set_lazy_locked(virtual_address);
+  {
+    u64 *l0 = get_l0_for_va(virtual_address);
+    u64 *l1 = ensure_child(l0, l0_index(virtual_address), 0);
+    u64 *l2 = ensure_child(l1, l1_index(virtual_address), 1);
+    u64 *l3 = ensure_child(l2, l2_index(virtual_address), 2);
+    usize i3 = l3_index(virtual_address);
+
+    /* set_lazy_locked plants USER|WRITABLE; keep the marker bit and take the
+     * permissions the caller actually asked for (a read-only file mapping must
+     * not fault in writable). */
+    l3[i3] = VMM_LAZY | (flags & ~(u64)VMM_PRESENT);
+  }
+  vmm_write_release(f);
+}
+
+/* x86_64 counts the COW shootdowns it had to send; aarch64 sends none — see
+ * vmm_unmap_range_collect. Reported as zero rather than left undefined so
+ * /proc's futex diagnostics read the same on both. */
+void cow_shootdown_stats(u64 *done, u64 *skipped) {
+  if (done)
+    *done = 0;
+  if (skipped)
+    *skipped = 0;
 }
 
 u64 paging_create_address_space(void) {
@@ -1417,7 +1571,39 @@ static u64 *leaf_pte_ptr(u64 virtual_address) {
 
 /* Same reading as paging_leaf_pte — the fault reporter wants the entry itself,
  * because "absent" and "present but not writable" are different faults. */
-u64 vmm_query_leaf_pte(u64 vaddr) { return paging_leaf_pte(vaddr); }
+/* The leaf as the ARCH-NEUTRAL callers expect it: generic VMM_* flags, not the
+ * raw ARM descriptor.
+ *
+ * Returning the descriptor was silently wrong on every one of them, because
+ * the two encodings overlap in exactly the bits they test. A page descriptor
+ * always has bits 0 and 1 set, so VMM_PRESENT AND VMM_WRITABLE read as true
+ * for a page that is in fact read-only, and VMM_USER lands on an attribute
+ * index bit. syscall_copyout's pre-check therefore passed every read-only user
+ * page straight through to the memcpy, which took an unfixable EL1 abort and
+ * panicked the machine instead of returning EFAULT. futex's shared-key test
+ * read a memory-attribute bit as VMM_SHARED for the same reason.
+ *
+ * Non-present entries are the kernel's own markers (VMM_LAZY, VMM_SWAPPED),
+ * which are stored in the generic encoding already, so they pass through. */
+u64 vmm_query_leaf_pte(u64 vaddr) {
+  u64 entry = paging_leaf_pte(vaddr);
+
+  if ((entry & 0x3ULL) != D_PAGE)
+    return entry;
+
+  u64 ap = entry & (3ULL << 6);
+  u64 out = (entry & ADDR_MASK) | VMM_PRESENT;
+
+  if (ap == AP_EL1_RW || ap == AP_EL1_EL0_RW)
+    out |= VMM_WRITABLE;
+  if (entry & SW_USER)
+    out |= VMM_USER;
+  if (entry & SW_SHARED)
+    out |= VMM_SHARED;
+  if (entry & SW_COW)
+    out |= VMM_COW;
+  return out;
+}
 
 /* The leaf descriptor for `vaddr` in the space rooted at `pml4_phys` (the L0
  * table here), 0 when nothing 4 KiB-mapped is there. */
@@ -1461,4 +1647,53 @@ void paging_move_range(u64 old_start, u64 new_start, u64 len) {
       tlb_flush_page(to);
     }
   }
+}
+
+/* Pages actually resident in one user VA range — /proc/<pid>/statm's RSS and
+ * the scheduler's RSS sampler. Absent entries skip their whole span rather
+ * than being stepped page by page, so a sparse 4 GiB mapping costs a handful
+ * of reads. Lazy markers do not count: no frame is backing them yet. */
+u64 paging_user_resident(u64 pml4_phys, u64 start, u64 end) {
+  if (end <= start)
+    return 0;
+
+  u64 *l0 = pml4_phys ? phys_to_virt(pml4_phys) : kernel_l0_virt;
+  const u64 l0_span = 1ULL << 39;
+  const u64 l1_span = 1ULL << 30;
+  const u64 l2_span = 1ULL << 21;
+  u64 count = 0;
+  u64 va = start & ~(u64)(PAGE_SIZE - 1);
+
+  while (va < end) {
+    u64 next_l0 = (va & ~(l0_span - 1)) + l0_span;
+    u64 next_l1 = (va & ~(l1_span - 1)) + l1_span;
+    u64 next_l2 = (va & ~(l2_span - 1)) + l2_span;
+
+    u64 e0 = l0[l0_index(va)];
+    if ((e0 & 0x3ULL) != D_TABLE) { va = next_l0; continue; }
+
+    u64 *l1 = table_from_entry(e0);
+    u64 e1 = l1[l1_index(va)];
+    if ((e1 & 0x3ULL) == D_BLOCK) {
+      count += (next_l1 - va) / PAGE_SIZE;
+      va = next_l1;
+      continue;
+    }
+    if ((e1 & 0x3ULL) != D_TABLE) { va = next_l1; continue; }
+
+    u64 *l2 = table_from_entry(e1);
+    u64 e2 = l2[l2_index(va)];
+    if ((e2 & 0x3ULL) == D_BLOCK) {
+      count += (next_l2 - va) / PAGE_SIZE;
+      va = next_l2;
+      continue;
+    }
+    if ((e2 & 0x3ULL) != D_TABLE) { va = next_l2; continue; }
+
+    u64 *l3 = table_from_entry(e2);
+    if ((l3[l3_index(va)] & 0x3ULL) == D_PAGE)
+      count++;
+    va += PAGE_SIZE;
+  }
+  return count;
 }
