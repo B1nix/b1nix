@@ -441,6 +441,7 @@ KERNEL_SOURCES := \
 	kernel/fs/procfs.c \
 	kernel/fs/tmpfs.c \
 	kernel/fs/mount_api.c \
+	kernel/fs/btrfs_selftest.c \
 	kernel/fs/cgroup.c \
 	kernel/fs/sysfs.c \
 	kernel/fs/sysfs_attr.c \
@@ -1897,6 +1898,17 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@# rootfs the test actually runs against.
 	@$(MAKE) --no-print-directory $(INITRAMFS_TESTWAV_INC)
 	@$(CIC) $(BUILD_DIR)/test.wav $(BUILD_DIR)/rootfs/test.wav
+	@# A real btrfs filesystem, for the module-in-use check.
+	@#
+	@# The check used to fabricate one by writing the btrfs magic into an
+	@# otherwise empty file, which worked only while the driver looked at
+	@# nothing but the magic. It reads the filesystem now, so the test needs a
+	@# filesystem -- and one built by mkfs.btrfs is a better subject anyway.
+	@# 16 MiB is the smallest mkfs.btrfs will make (mixed block groups, 4 KiB
+	@# nodes). Built here rather than committed: a binary blob in the tree is a
+	@# thing nobody can review.
+	@sh tools/images/mk-btrfs-test-image.sh $(BUILD_DIR) || true
+	@if [ -f $(BUILD_DIR)/btrfs-test.img ]; then $(CIC) $(BUILD_DIR)/btrfs-test.img $(BUILD_DIR)/rootfs/btrfs-test.img; fi
 	@# Self-contained TLS test PKI. The loopback HTTPS smokes (M32 curl, M53
 	@# NetSurf-over-TLS) verify the server cert against this CA, so the PEMs
 	@# have to exist in the rootfs the tests actually run against.

@@ -1079,6 +1079,9 @@ void kernel_main(usize arg0, usize arg1)
 		pci_selftest();
 		/* The wall clock's civil-date conversion, against known answers. */
 		rtc_selftest();
+		/* btrfs, when a disk carrying one is attached: read a filesystem
+		 * mkfs.btrfs wrote and check what comes back. */
+		btrfs_selftest();
 		/* The nice/stride weighting, where the numbers live: the M46
 		 * userspace test can only observe the bias statistically. */
 		sched_nice_selftest();

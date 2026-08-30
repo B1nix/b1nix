@@ -647,8 +647,50 @@ launch_blk() {
 		for _b in /usr/share/qemu/bios-256k.bin /usr/share/seabios/bios-256k.bin; do
 			[ -f "$_b" ] && { _bios="$_b"; break; }
 		done
+		# A btrfs filesystem made by mkfs.btrfs, with known content. The
+		# point is that it is NOT made by us: the read path is checked
+		# against a filesystem another implementation wrote, which is the
+		# only way to find out whether the on-disk format was read or
+		# merely reproduced. Skipped, not faked, where btrfs-progs is
+		# absent -- the checks below are keyed off the same condition.
+		BTRFS_IMG=$(disk_img btrfs blk)
+		BTRFS_READY=0
+		if command -v mkfs.btrfs >/dev/null 2>&1; then
+			_bdir="$PROJECT_DIR/smoke_run/btrfs-root-$$"
+			rm -rf "$_bdir"; mkdir -p "$_bdir/dir/sub"
+			# `command printf`, not printf: this script overrides printf
+			# to prefix every line with the architecture label, which is
+			# right for progress output and wrong for file content — the
+			# label ended up INSIDE the test files, and the guest was
+			# marked wrong for reading exactly what was written.
+			command printf 'hello from btrfs\n' > "$_bdir/hello.txt"
+			# Large enough to need a regular extent rather than an
+			# inline one, so both kinds are exercised. The content is
+			# a formula rather than random bytes so the guest can
+			# check what it read without being handed the answer:
+			# byte N of the file is derivable from N alone.
+			python3 -c "
+import sys
+with open('$_bdir/big.bin','wb') as f:
+    for i in range(192*1024//16):
+        f.write(b'%014d\n' % i)
+" 2>/dev/null || command printf 'skip' > "$_bdir/big.bin"
+			command printf 'nested\n' > "$_bdir/dir/sub/deep.txt"
+			ln -s hello.txt "$_bdir/link.txt"
+			rm -f "$BTRFS_IMG"; truncate -s 512M "$BTRFS_IMG"
+			if mkfs.btrfs -q -L B1NIX-BTRFS -m single -d single \
+				--nodesize 16384 --rootdir "$_bdir" "$BTRFS_IMG" 2>/dev/null; then
+				BTRFS_READY=1
+			fi
+			rm -rf "$_bdir"
+		fi
 		EXTRA_QEMU_ARGS="-drive file=$(disk_img usb blk),if=none,id=usbdisk,format=raw -device usb-storage,bus=xhci.0,drive=usbdisk \
 			-drive file=$(disk_img vblk blk),if=none,id=vblkdisk,format=raw,discard=unmap -device virtio-blk-pci,drive=vblkdisk"
+		if [ "$BTRFS_READY" = 1 ]; then
+			EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS \
+			-drive file=$BTRFS_IMG,if=none,id=btrfsdisk,format=raw -device virtio-blk-pci,drive=btrfsdisk"
+		fi
+		export BTRFS_READY
 		if [ -n "$_bios" ]; then
 			EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS \
 			-drive if=pflash,format=raw,readonly=on,file=$_bios,unit=0 \
@@ -2569,6 +2611,25 @@ check_output "$BLK_LOG" "M109-SMOKE: ok mounts-past-64" "96 filesystems mount at
 check_output "$BLK_LOG" "M109-SMOKE: ok fs-run-past-64" "a 512 KiB file on ext4 reads back byte-for-byte after a remount, in one read(2) spanning far more than the 64 blocks the coalescer used to fold into a request"
 
 check_output "$BLK_LOG" "M109-SMOKE: done" "M109 suite completes"
+
+# ── btrfs: a filesystem another implementation wrote ──────────────────────
+# Skipped rather than failed where btrfs-progs is absent: without mkfs.btrfs
+# there is no disk to read, and a check that cannot run must not be reported
+# as one that passed.
+# Decided here rather than carried from the lane: the lane runs in a subshell,
+# so a variable exported there never reaches this point, and the checks were
+# silently skipped on every run.
+if command -v mkfs.btrfs >/dev/null 2>&1; then
+	check_output "$BLK_LOG" "M119-BTRFS: ok mount" "btrfs: the chunk tree maps logical addresses, the root tree names the FS tree, and the mount stands up"
+	check_output "$BLK_LOG" "M119-BTRFS: ok inline-file" "btrfs: a small file, whose bytes btrfs keeps inline in the tree leaf"
+	check_output "$BLK_LOG" "M119-BTRFS: ok nested-dir" "btrfs: a file two directories down, so the directory walk descended"
+	check_output "$BLK_LOG" "M119-BTRFS: ok symlink" "btrfs: a symlink, whose target is the file's own content"
+	check_output "$BLK_LOG" "M119-BTRFS: ok regular-size" "btrfs: a 192 KiB file reports its real size from its inode"
+	check_output "$BLK_LOG" "M119-BTRFS: ok regular-extent" "btrfs: bytes read from a regular extent at a 64 KiB offset are the bytes mkfs.btrfs wrote there"
+	check_output "$BLK_LOG" "M119-BTRFS: done" "btrfs read checks complete"
+else
+	skipped "btrfs read path" "mkfs.btrfs not on the host: no filesystem to read"
+fi
 
 # Network tests are only wired for the current x86_64/x86 QEMU path.
 if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then

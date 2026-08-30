@@ -703,11 +703,18 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
 
   if (ehdr->e_ident[0] != ELF_MAGIC0 || ehdr->e_ident[1] != ELF_MAGIC1 ||
       ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3) {
-    char line[160];
+    /* The size comes with it, because the two failures look identical in a
+     * log and are not the same bug: a file the filesystem reports as empty was
+     * never read, while a file with a real size whose bytes come back as zeros
+     * WAS read and the read is wrong. */
+    struct b1nix_stat est;
+    u64 esize = vfs_fstat(fd, &est) == 0 ? (u64)est.st_size : 0;
+    char line[192];
+
     snprintf(line, sizeof(line),
-             "ELF load: bad magic %02x %02x %02x %02x in %s\n",
+             "ELF load: bad magic %02x %02x %02x %02x in %s (size=%llu)\n",
              ehdr->e_ident[0], ehdr->e_ident[1], ehdr->e_ident[2],
-             ehdr->e_ident[3], path);
+             ehdr->e_ident[3], path, (unsigned long long)esize);
     console_write(line);
     goto cleanup;
   }

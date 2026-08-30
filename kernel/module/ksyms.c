@@ -89,6 +89,13 @@ EXPORT_SYMBOL(vfs_register_fs);
 EXPORT_SYMBOL(vfs_unregister_fs);
 EXPORT_SYMBOL(vfs_create_node);
 EXPORT_SYMBOL(vfs_add_node);
+/* A filesystem module builds the tree it found on disk, and a symlink is one
+ * of the things it finds; btrfs stores a link's target as the file's own
+ * content, so reading one is ordinary and creating the node must be too. */
+EXPORT_SYMBOL(vfs_symlink);
+/* Diagnostics. A module that cannot say why it refused a mount leaves the
+ * caller with an errno and no reason. */
+EXPORT_SYMBOL(klog_info);
 EXPORT_SYMBOL(vfs_find_node);
 EXPORT_SYMBOL(vfs_node_get);
 EXPORT_SYMBOL(vfs_node_put);
