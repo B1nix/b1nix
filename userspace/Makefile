@@ -436,7 +436,27 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 # the sub-make command line keeps that checkout clean for check-b1cc-sync.
 B1CC_HOST_CFLAGS ?= -std=c23 -D_DEFAULT_SOURCE -Wall -Wextra -O3 -flto -march=native $(B1CC_INCS_HOST)
 
-$(B1CC): $(B1CC_DIR)/Makefile $(wildcard $(B1CC_SRC_GLOB))
+# The revision the submodule is checked out at. b1cc's own build rebuilds an
+# object only when its .c file is newer, so switching revisions — which changes
+# headers and sources at once and can leave objects NEWER than the sources they
+# came from — links a binary built from two different versions of the compiler.
+# That does not fail loudly: it produced a b1cc that segfaulted in codegen on
+# hello world and reported "unknown IR op load", which reads as a compiler
+# regression rather than as a build that never happened. Recording the revision
+# and wiping the object tree when it changes costs one full rebuild per
+# submodule bump and removes the whole class.
+B1CC_REV_STAMP := $(BUILD)/b1cc-revision
+B1CC_REV := $(shell git -C $(B1CC_DIR) rev-parse HEAD 2>/dev/null)
+
+$(B1CC_REV_STAMP): $(B1CC_DIR)/.git
+	@mkdir -p $(dir $@)
+	@if [ "$$(cat $@ 2>/dev/null)" != "$(B1CC_REV)" ]; then \
+	    rm -rf $(B1CC_DIR)/build; \
+	    printf '%s' '$(B1CC_REV)' > $@; \
+	fi
+	@touch $@
+
+$(B1CC): $(B1CC_REV_STAMP) $(B1CC_DIR)/Makefile $(wildcard $(B1CC_SRC_GLOB))
 	$(MAKE) -C $(B1CC_DIR) CC="$(HOST_CC)" CFLAGS="$(B1CC_HOST_CFLAGS)"
 
 # ── Source layout ──

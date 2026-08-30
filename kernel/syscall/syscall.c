@@ -5767,16 +5767,58 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
             ((struct user_loaded_image *)current_task->user_image)
                     ->personality == PERSONALITY_LINUX)
           cname = linux_syscall_name(number);
+        /* The descriptor, where the call has one. EBADF from a call that takes
+         * an fd says a descriptor the caller believes it holds is not in its
+         * table, and WHICH descriptor is the whole answer — without it the
+         * trace names the syscall and leaves the interesting half out. The
+         * argument is chosen per call for the same reason the path is. */
+        int ufd = -1;
+        switch (number) {
+        case 0:   /* read */
+        case 1:   /* write */
+        case 3:   /* close */
+        case 5:   /* fstat */
+        case 8:   /* lseek */
+        case 16:  /* ioctl */
+        case 32:  /* dup */
+        case 33:  /* dup2 */
+        case 72:  /* fcntl */
+        case 74:  /* fsync */
+        case 77:  /* ftruncate */
+        case 78:  /* getdents */
+        case 217: /* getdents64 */
+        case 257: /* openat (dirfd) */
+        case 262: /* newfstatat (dirfd) */
+        case 263: /* unlinkat (dirfd) */
+        case 428: /* open_tree */
+        case 429: /* move_mount */
+        case 431: /* fsconfig */
+        case 432: /* fsmount */
+        case 442: /* mount_setattr */
+          ufd = (int)arg0;
+          break;
+        case 247: /* waitid: the id is a descriptor when idtype is P_PIDFD */
+          if (arg0 == 3)
+            ufd = (int)arg1;
+          break;
+        default:
+          break;
+        }
+
         char el[256];
+        char fdbuf[24];
+        fdbuf[0] = '\0';
+        if (ufd >= 0)
+          snprintf(fdbuf, sizeof(fdbuf), " fd=%d", ufd);
         if (pbuf[0])
           snprintf(el, sizeof(el),
-                   "errno %u from syscall %llu %s (pid %u) path=%s",
+                   "errno %u from syscall %llu %s (pid %u)%s path=%s",
                    (unsigned)e, (unsigned long long)number, cname,
-                   (unsigned)pid, pbuf);
+                   (unsigned)pid, fdbuf, pbuf);
         else
-          snprintf(el, sizeof(el), "errno %u from syscall %llu %s (pid %u)",
+          snprintf(el, sizeof(el), "errno %u from syscall %llu %s (pid %u)%s",
                    (unsigned)e, (unsigned long long)number, cname,
-                   (unsigned)pid);
+                   (unsigned)pid, fdbuf);
         klog_info(el);
       }
     }
