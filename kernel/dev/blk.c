@@ -2445,6 +2445,35 @@ void blk_durability_selftest(void) {
   kfree(in);
 }
 
+/* Drop a range of cached blocks without writing them back.
+ *
+ * For a caller that has just put the authoritative contents on the medium
+ * itself and only needs the cache to stop claiming otherwise. Dirty entries in
+ * the range are discarded rather than flushed: they hold what the caller has
+ * already superseded, and writing them would put the OLD bytes back. */
+void blk_cache_invalidate_range(struct block_device *dev, u64 lba, u32 count) {
+  if (!dev || !count)
+    return;
+  if (blk_is_partition(dev)) {
+    struct partition_device *part = (struct partition_device *)dev->priv;
+
+    if (!part || !part->parent)
+      return;
+    lba += part->start_lba;
+    dev = part->parent;
+  }
+  for (u32 i = 0; i < count; i++) {
+    u64 flags = bcache_acquire();
+    struct block_buffer *e = bcache_find(dev, lba + i);
+
+    if (e && !(e->flags & BLK_CACHE_BUSY)) {
+      bcache_hash_remove((i32)(e - block_cache));
+      e->flags &= ~(BLK_CACHE_VALID | BLK_CACHE_DIRTY);
+    }
+    bcache_release(flags);
+  }
+}
+
 void blk_cache_invalidate(struct block_device *dev) {
   if (!dev) return;
   u64 first = 0;

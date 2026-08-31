@@ -857,15 +857,31 @@ $(BUILD_DIR)/kernel/main.o: $(B1NIX_I915_STAMP)
 # vermagic stamp in <b1nix/module.h>.
 MODULE_CFLAGS := $(COMMON_CFLAGS) $(ARCH_CFLAGS) -DMODULE
 
+# A module may be built from more than one source file: the parts are compiled
+# separately and combined with a relocatable link, the same way the kernel's own
+# multi-file objects are. A single-source module still produces exactly one
+# compile and no link.
 define B1NIX_MODULE_RULE
 $$(MODULE_OUT_DIR)/$(1).ko: $(2)
 	@mkdir -p $$(dir $$@)
-	$$(CC) $$(MODULE_CFLAGS) -c $$< -o $$@
+	@set -e; objs=""; \
+	for src in $(2); do \
+		obj="$$(MODULE_OUT_DIR)/$(1)-$$$$(basename $$$$src .c).o"; \
+		echo "$$(CC) $$(MODULE_CFLAGS) -c $$$$src -o $$$$obj"; \
+		$$(CC) $$(MODULE_CFLAGS) -c $$$$src -o $$$$obj; \
+		objs="$$$$objs $$$$obj"; \
+	done; \
+	if [ $$$$(echo $$$$objs | wc -w) -eq 1 ]; then \
+		mv $$$$objs $$@; \
+	else \
+		$$(LD) -r -o $$@ $$$$objs; \
+		rm -f $$$$objs; \
+	fi
 endef
 
 $(eval $(call B1NIX_MODULE_RULE,isofs,kernel/fs/isofs.c))
 $(eval $(call B1NIX_MODULE_RULE,ntfs,kernel/fs/ntfs.c))
-$(eval $(call B1NIX_MODULE_RULE,btrfs,kernel/fs/btrfs.c))
+$(eval $(call B1NIX_MODULE_RULE,btrfs,kernel/fs/btrfs.c kernel/fs/btrfs_write.c))
 $(eval $(call B1NIX_MODULE_RULE,hda,kernel/dev/hda.c))
 $(eval $(call B1NIX_MODULE_RULE,ipv6,kernel/net/ipv6.c))
 $(eval $(call B1NIX_MODULE_RULE,ndp,kernel/net/ndp.c))
@@ -1477,7 +1493,7 @@ SMOKE_CMDLINE_posix=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1ni
 # (tests/smoke.sh passes the pflash pair), and probing WRITES a query command
 # to a physical address, so it stays behind a flag rather than running on every
 # boot -- on real hardware that address space belongs to the firmware.
-SMOKE_CMDLINE_blk=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.mtd b1nix.smoke=blk
+SMOKE_CMDLINE_blk=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.mtd b1nix.btrfs-rw b1nix.smoke=blk
 # OpenRC ctltest: boots the real init system as PID 1 and drives sysinit/boot/default,
 # then a local.d hook asks PID 1 to power off through /run/openrc/init.ctl — the
 # control-FIFO path openrc-shutdown and telinit use. A clean poweroff proves the channel works.

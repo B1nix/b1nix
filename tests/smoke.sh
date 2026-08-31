@@ -678,6 +678,10 @@ with open('$_bdir/big.bin','wb') as f:
 			command printf 'nested\n' > "$_bdir/dir/sub/deep.txt"
 			ln -s hello.txt "$_bdir/link.txt"
 			rm -f "$BTRFS_IMG"; truncate -s 512M "$BTRFS_IMG"
+			# mkfs's own defaults, free-space tree included: that
+			# tree is what a real disk carries, and the driver has
+			# to keep it right rather than being handed a
+			# filesystem shaped to suit it.
 			if mkfs.btrfs -q -L B1NIX-BTRFS -m single -d single \
 				--nodesize 16384 --rootdir "$_bdir" "$BTRFS_IMG" 2>/dev/null; then
 				BTRFS_READY=1
@@ -2626,7 +2630,35 @@ if command -v mkfs.btrfs >/dev/null 2>&1; then
 	check_output "$BLK_LOG" "M119-BTRFS: ok symlink" "btrfs: a symlink, whose target is the file's own content"
 	check_output "$BLK_LOG" "M119-BTRFS: ok regular-size" "btrfs: a 192 KiB file reports its real size from its inode"
 	check_output "$BLK_LOG" "M119-BTRFS: ok regular-extent" "btrfs: bytes read from a regular extent at a 64 KiB offset are the bytes mkfs.btrfs wrote there"
-	check_output "$BLK_LOG" "M119-BTRFS: done" "btrfs read checks complete"
+	check_output "$BLK_LOG" "M119-BTRFS: ok write" "btrfs: a sector written into the middle of a regular extent is accepted, checksummed and committed"
+	check_output "$BLK_LOG" "M119-BTRFS: ok write-persists" "btrfs: the written sector reads back as the bytes the guest put there"
+	check_output "$BLK_LOG" "M119-BTRFS: ok create" "btrfs: open(O_CREAT) makes an inode, its directory entries and its back-reference, and the file reads back"
+	check_output "$BLK_LOG" "M119-BTRFS: ok mkdir" "btrfs: a new directory accepts a file created inside it"
+	check_output "$BLK_LOG" "M119-BTRFS: ok rename" "btrfs: rename moves the entries and leaves nothing at the old name"
+	check_output "$BLK_LOG" "M119-BTRFS: ok truncate" "btrfs: truncate shortens a file and frees the extents past its new end"
+	check_output "$BLK_LOG" "M119-BTRFS: ok unlink-rmdir" "btrfs: a non-empty directory refuses to go, and unlink then rmdir remove both"
+	check_output "$BLK_LOG" "M119-BTRFS: done" "btrfs read and write checks complete"
+	# The judge that was not written here. btrfs check walks the extent tree,
+	# the checksum tree and the back-references and says whether the
+	# filesystem this kernel wrote is one that btrfs-progs still recognises.
+	# Reading our own writes back proves far less: a driver consistent with
+	# itself agrees with itself and with nothing else.
+	if command -v btrfs >/dev/null 2>&1; then
+		_bchk="$PROJECT_DIR/smoke_run/btrfs-check-blk.log"
+		if btrfs check --readonly "$(disk_img btrfs blk)" >"$_bchk" 2>&1; then
+			pass "btrfs check accepts the filesystem after the guest wrote to it"
+		else
+			fail "btrfs check accepts the filesystem after the guest wrote to it" \
+			     "$(tail -5 "$_bchk" | tr '\n' ' ')"
+		fi
+		if btrfs check --readonly --check-data-csum "$(disk_img btrfs blk)" \
+			>"$_bchk.csum" 2>&1; then
+			pass "btrfs check verifies every data checksum the guest wrote"
+		else
+			fail "btrfs check verifies every data checksum the guest wrote" \
+			     "$(tail -5 "$_bchk.csum" | tr '\n' ' ')"
+		fi
+	fi
 else
 	skipped "btrfs read path" "mkfs.btrfs not on the host: no filesystem to read"
 fi

@@ -260,6 +260,9 @@ void blk_cache_flush(struct block_device *dev);
 void blk_flush_buffer(struct block_buffer *buf);
 void blk_sync_all(void);
 void blk_cache_invalidate(struct block_device *dev);
+/* Forget a range, without writing it back — for a caller that has already put
+ * the authoritative bytes on the medium. */
+void blk_cache_invalidate_range(struct block_device *dev, u64 lba, u32 count);
 int blk_cache_lock_is_held(void);
 
 /* M14 self-test (b1nix.test=1 only): every disk that claims a cache-flush

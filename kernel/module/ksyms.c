@@ -111,7 +111,11 @@ EXPORT_SYMBOL(vfs_close);
 /* ── block layer ─────────────────────────────────────────────────────────── */
 EXPORT_SYMBOL(blk_get);
 EXPORT_SYMBOL(blk_at);
+EXPORT_SYMBOL(find_child);
 EXPORT_SYMBOL(blk_read_cached);
+EXPORT_SYMBOL(blk_write_cached);
+EXPORT_SYMBOL(blk_cache_flush);
+EXPORT_SYMBOL(blk_cache_invalidate_range);
 
 /* ── PCI / port I/O ──────────────────────────────────────────────────────── */
 EXPORT_SYMBOL(pci_find_class);

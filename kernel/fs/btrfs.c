@@ -25,6 +25,7 @@
  * full is not mounted at all.
  */
 
+#include <b1nix/bootinfo.h>
 #include <b1nix/btrfs.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
@@ -54,16 +55,27 @@ static void crc32c_init(void) {
     crc32c_ready = 1;
 }
 
-static u32 crc32c(const void *data, usize len) {
+/* crc32c with an explicit seed and no final inversion.
+ *
+ * Two callers want two different conventions, and both are btrfs's own: a
+ * block checksum is seeded with ~0 and inverted at the end, while a directory
+ * name hash is seeded with ~1 and used raw. Writing a name hash with the
+ * checksum's convention produces keys that are perfectly self-consistent and
+ * that no other btrfs implementation can find. */
+u32 btrfs_crc32c_seed(u32 seed, const void *data, usize len) {
     if (!crc32c_ready)
         crc32c_init();
 
     const u8 *p = data;
-    u32 crc = 0xFFFFFFFFu;
+    u32 crc = seed;
 
     while (len--)
         crc = crc32c_table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
-    return crc ^ 0xFFFFFFFFu;
+    return crc;
+}
+
+u32 btrfs_crc32c(const void *data, usize len) {
+    return btrfs_crc32c_seed(0xFFFFFFFFu, data, len) ^ 0xFFFFFFFFu;
 }
 
 /* ── Logical addressing ────────────────────────────────────────────────────*/
@@ -71,7 +83,7 @@ static u32 crc32c(const void *data, usize len) {
 /* Where a logical address lives on the device, or 0 when nothing maps it.
  * Zero is not a valid answer for real data — the first megabyte of a btrfs
  * device is never mapped — so the caller can treat it as "no mapping". */
-static u64 btrfs_map(struct btrfs_fs_info *fs, u64 logical) {
+u64 btrfs_map(struct btrfs_fs_info *fs, u64 logical) {
     for (u32 i = 0; i < fs->nchunks; i++) {
         struct btrfs_chunk_map *m = &fs->chunks[i];
 
@@ -146,7 +158,7 @@ static int btrfs_read_sys_chunks(struct btrfs_fs_info *fs) {
  * previous transaction has a perfectly good checksum. What says "this is the
  * block you asked for" is its own recorded bytenr, which is why btrfs stores
  * it inside the block. The caller owns the returned buffer. */
-static u8 *btrfs_read_block(struct btrfs_fs_info *fs, u64 logical) {
+u8 *btrfs_read_block(struct btrfs_fs_info *fs, u64 logical) {
     u64 physical = btrfs_map(fs, logical);
 
     if (!physical)
@@ -176,7 +188,7 @@ static u8 *btrfs_read_block(struct btrfs_fs_info *fs, u64 logical) {
     u32 want;
 
     memcpy(&want, h->csum, sizeof(want));
-    if (crc32c(buf + sizeof(h->csum), nodesize - sizeof(h->csum)) != want) {
+    if (btrfs_crc32c(buf + sizeof(h->csum), nodesize - sizeof(h->csum)) != want) {
         kfree(buf);
         return 0;
     }
@@ -188,8 +200,8 @@ static u8 *btrfs_read_block(struct btrfs_fs_info *fs, u64 logical) {
 }
 
 /* btrfs key order: objectid, then type, then offset. Returns <0, 0, >0. */
-static int btrfs_key_cmp(const struct btrfs_disk_key *a, u64 objectid, u8 type,
-                         u64 offset) {
+int btrfs_key_cmp(const struct btrfs_disk_key *a, u64 objectid, u8 type,
+                  u64 offset) {
     if (a->objectid != objectid)
         return a->objectid < objectid ? -1 : 1;
     if (a->type != type)
@@ -199,12 +211,12 @@ static int btrfs_key_cmp(const struct btrfs_disk_key *a, u64 objectid, u8 type,
     return 0;
 }
 
-static const struct btrfs_item *btrfs_leaf_item(const u8 *leaf, u32 i) {
+const struct btrfs_item *btrfs_leaf_item(const u8 *leaf, u32 i) {
     return (const struct btrfs_item *)(leaf + sizeof(struct btrfs_header) +
                                        (usize)i * sizeof(struct btrfs_item));
 }
 
-static const u8 *btrfs_item_data(const u8 *leaf, const struct btrfs_item *it) {
+const u8 *btrfs_item_data(const u8 *leaf, const struct btrfs_item *it) {
     return leaf + sizeof(struct btrfs_header) + it->offset;
 }
 
@@ -514,6 +526,40 @@ static isize btrfs_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
 
 /* ── Building the tree the VFS shows ───────────────────────────────────────*/
 
+/* ── Writing ───────────────────────────────────────────────────────────────
+ *
+ * A writable btrfs mount is off unless it was asked for: this driver is young,
+ * and the disks it might be pointed at on real hardware hold other people's
+ * filesystems. `b1nix.btrfs-rw` on the kernel command line is the whole of the
+ * opt-in; without it every btrfs mount is read-only no matter what flags the
+ * mount call carried. */
+static isize btrfs_vfs_write(struct vfs_node *node, u64 offset,
+                             const char *buffer, usize size, int flags) {
+    (void)flags;
+    struct btrfs_file_info *fi = (struct btrfs_file_info *)node->inode->data;
+
+    if (!fi || !fi->fs)
+        return -EIO;
+    u64 new_size = fi->size;
+    isize rc = btrfs_file_write(fi->fs, fi->objectid, offset, buffer, size,
+                                &new_size);
+
+    if (rc < 0)
+        return rc;
+    fi->size = new_size;
+    if (node->inode->size < new_size)
+        node->inode->size = new_size;
+    return rc;
+}
+
+static int btrfs_vfs_fsync(struct vfs_node *node) {
+    struct btrfs_file_info *fi = (struct btrfs_file_info *)node->inode->data;
+
+    if (!fi || !fi->fs)
+        return -EIO;
+    return btrfs_commit(fi->fs);
+}
+
 static int btrfs_inode_of(struct btrfs_fs_info *fs, u64 objectid,
                           struct btrfs_inode_item *out) {
     u32 slot = 0;
@@ -545,6 +591,166 @@ static int btrfs_inode_of(struct btrfs_fs_info *fs, u64 objectid,
 static void btrfs_populate_dir(struct btrfs_fs_info *fs, u64 dir_objectid,
                                const char *dir_path, int depth);
 
+static int btrfs_vfs_truncate(struct vfs_node *node, u64 length) {
+    struct btrfs_file_info *fi = (struct btrfs_file_info *)node->inode->data;
+
+    if (!fi || !fi->fs)
+        return -EIO;
+
+    int rc = btrfs_truncate_file(fi->fs, fi->objectid, length);
+
+    if (rc == 0) {
+        fi->size = length;
+        node->inode->size = length;
+    }
+    return rc;
+}
+
+static int btrfs_vfs_setattr(struct vfs_node *node) {
+    struct btrfs_file_info *fi = (struct btrfs_file_info *)node->inode->data;
+
+    if (!fi || !fi->fs)
+        return -EIO;
+    return btrfs_setattr_inode(fi->fs, fi->objectid, node->inode->mode,
+                               node->inode->uid, node->inode->gid);
+}
+
+/* Attach this driver's per-inode state. Directories get it too: every
+ * namespace operation below is addressed by the parent's objectid, and a
+ * directory node without it could only be looked up by walking the tree from
+ * the root again. */
+static struct btrfs_file_info *btrfs_attach_info(struct vfs_node *node,
+                                                 struct btrfs_fs_info *fs,
+                                                 u64 objectid, u64 size) {
+    struct btrfs_file_info *fi = kzalloc(sizeof(*fi));
+
+    if (!fi)
+        return 0;
+    fi->fs = fs;
+    fi->objectid = objectid;
+    fi->size = size;
+    node->inode->data = fi;
+    return fi;
+}
+
+static struct btrfs_file_info *btrfs_info_of(struct vfs_node *node) {
+    return node && node->inode ? (struct btrfs_file_info *)node->inode->data
+                               : 0;
+}
+
+/* The child VFS node the caller has already linked into `dir`. */
+static void btrfs_attach_child_dir(struct vfs_node *node,
+                                   struct btrfs_fs_info *fs, u64 objectid);
+static void btrfs_enable_writes(struct vfs_node *node,
+                                struct btrfs_fs_info *fs);
+
+static struct vfs_node *btrfs_child_node(struct vfs_node *dir,
+                                         const char *name) {
+    return find_child(dir, name);
+}
+
+static int btrfs_vfs_create(struct vfs_node *dir, const char *name,
+                            const char *full_path, u32 mode) {
+    (void)full_path;
+    struct btrfs_file_info *dfi = btrfs_info_of(dir);
+
+    if (!dfi || !dfi->fs)
+        return -EIO;
+
+    u64 objectid = 0;
+    int rc = btrfs_create_entry(dfi->fs, dfi->objectid, name,
+                                0100000 | (mode & 07777), 0, &objectid);
+
+    if (rc < 0)
+        return rc;
+
+    struct vfs_node *child = btrfs_child_node(dir, name);
+
+    if (child) {
+        btrfs_attach_info(child, dfi->fs, objectid, 0);
+        btrfs_enable_writes(child, dfi->fs);
+    }
+    return 0;
+}
+
+static int btrfs_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
+    struct btrfs_file_info *dfi = btrfs_info_of(dir);
+
+    if (!dfi || !dfi->fs)
+        return -EIO;
+
+    u64 objectid = 0;
+    int rc = btrfs_create_entry(dfi->fs, dfi->objectid, name,
+                                0040000 | (mode & 07777), 0, &objectid);
+
+    if (rc < 0)
+        return rc;
+
+    struct vfs_node *child = btrfs_child_node(dir, name);
+
+    if (child) {
+        btrfs_attach_child_dir(child, dfi->fs, objectid);
+        btrfs_enable_writes(child, dfi->fs);
+    }
+    return 0;
+}
+
+static int btrfs_vfs_symlink(struct vfs_node *dir, const char *name,
+                             const char *target) {
+    struct btrfs_file_info *dfi = btrfs_info_of(dir);
+
+    if (!dfi || !dfi->fs)
+        return -EIO;
+    return btrfs_create_entry(dfi->fs, dfi->objectid, name, 0120777, target,
+                              0);
+}
+
+static int btrfs_vfs_unlink(struct vfs_node *dir, const char *name) {
+    struct btrfs_file_info *dfi = btrfs_info_of(dir);
+
+    if (!dfi || !dfi->fs)
+        return -EIO;
+    return btrfs_unlink_entry(dfi->fs, dfi->objectid, name, 0);
+}
+
+static int btrfs_vfs_rmdir(struct vfs_node *dir, const char *name) {
+    struct btrfs_file_info *dfi = btrfs_info_of(dir);
+
+    if (!dfi || !dfi->fs)
+        return -EIO;
+    return btrfs_unlink_entry(dfi->fs, dfi->objectid, name, 1);
+}
+
+static int btrfs_vfs_rename(struct vfs_node *old_dir, const char *old_name,
+                            struct vfs_node *new_dir, const char *new_name) {
+    struct btrfs_file_info *ofi = btrfs_info_of(old_dir);
+    struct btrfs_file_info *nfi = btrfs_info_of(new_dir);
+
+    if (!ofi || !nfi || ofi->fs != nfi->fs || !ofi->fs)
+        return -EXDEV;
+    return btrfs_rename_entry(ofi->fs, ofi->objectid, old_name, nfi->objectid,
+                              new_name);
+}
+
+static int btrfs_vfs_link(struct vfs_node *target, struct vfs_node *dir,
+                          const char *name) {
+    struct btrfs_file_info *tfi = btrfs_info_of(target);
+    struct btrfs_file_info *dfi = btrfs_info_of(dir);
+
+    if (!tfi || !dfi || tfi->fs != dfi->fs || !dfi->fs)
+        return -EXDEV;
+    return btrfs_link_entry(dfi->fs, dfi->objectid, name, tfi->objectid);
+}
+
+/* Per-inode state for a directory node. The write operations are NOT attached
+ * here: during the mount-time walk they must stay off, or building the tree
+ * would try to create on disk the very entries it is reading. btrfs_enable_writes
+ * attaches them afterwards, and mkdir attaches them to the one node it made. */
+static void btrfs_attach_child_dir(struct vfs_node *node,
+                                   struct btrfs_fs_info *fs, u64 objectid) {
+    btrfs_attach_info(node, fs, objectid, 0);
+}
+
 /* One directory entry becomes one VFS node. */
 static void btrfs_add_entry(struct btrfs_fs_info *fs, const char *dir_path,
                             const char *name, u8 ftype, u64 objectid,
@@ -573,6 +779,7 @@ static void btrfs_add_entry(struct btrfs_fs_info *fs, const char *dir_path,
             node->inode->uid = inode.uid;
             node->inode->gid = inode.gid;
             node->inode->mtime = inode.mtime.sec;
+            btrfs_attach_child_dir(node, fs, objectid);
         }
         btrfs_populate_dir(fs, objectid, path, depth + 1);
         return;
@@ -617,6 +824,12 @@ static void btrfs_add_entry(struct btrfs_fs_info *fs, const char *dir_path,
     fi->size = inode.size;
     node->inode->data = fi;
     node->inode->read_cb = btrfs_vfs_read;
+    if (fs->rw) {
+        node->inode->write_cb = btrfs_vfs_write;
+        node->inode->fsync_cb = btrfs_vfs_fsync;
+        node->inode->truncate_cb = btrfs_vfs_truncate;
+        node->inode->setattr_cb = btrfs_vfs_setattr;
+    }
     node->inode->mode = (u16)(inode.mode & 07777);
     node->inode->uid = inode.uid;
     node->inode->gid = inode.gid;
@@ -710,7 +923,6 @@ static int btrfs_check_features(struct btrfs_fs_info *fs) {
 
 static struct vfs_node *btrfs_vfs_mount_cb(const char *source, u64 flags,
                                            void *data) {
-    (void)flags;
     const char *target = (const char *)data;
     struct block_device *dev = blk_get(source);
 
@@ -756,15 +968,24 @@ static struct vfs_node *btrfs_vfs_mount_cb(const char *source, u64 flags,
         return ERR_PTR(rc);
     }
 
+    /* Writable only when the machine's owner asked for it, and even then only
+     * when the mount itself is not read-only. A refusal inside btrfs_rw_setup
+     * (an unsupported feature, an extent tree too large to map) leaves a
+     * perfectly good read-only mount rather than failing the mount. */
+    if (!(flags & MS_RDONLY) && bootinfo_has_flag("b1nix.btrfs-rw")) {
+        if (btrfs_rw_setup(fs) == 0)
+            klog_info("btrfs: mounted read-write (b1nix.btrfs-rw)");
+    }
+
     {
         char line[160];
 
         snprintf(line, sizeof(line),
                  "btrfs: %s label=\"%s\" nodesize=%u chunks=%u fs-root=%llu "
-                 "level=%u", source, fs->sb.label[0] ? fs->sb.label : "(none)",
+                 "level=%u%s", source, fs->sb.label[0] ? fs->sb.label : "(none)",
                  (unsigned)fs->sb.nodesize, (unsigned)fs->nchunks,
                  (unsigned long long)fs->fs_root_bytenr,
-                 (unsigned)fs->fs_root_level);
+                 (unsigned)fs->fs_root_level, fs->rw ? " rw" : " ro");
         klog_info(line);
     }
 
@@ -774,19 +995,76 @@ static struct vfs_node *btrfs_vfs_mount_cb(const char *source, u64 flags,
         kfree(fs);
         return ERR_PTR(-ENOMEM);
     }
-    root->inode->data = fs;
     root->inode->blk_dev = dev;
     root->inode->mode = 0755;
+    /* The mount point IS the subvolume's root directory, and that directory's
+     * objectid comes from the FS tree's ROOT_ITEM (256 on every filesystem
+     * mkfs makes). The super block's root_dir_objectid is a different number
+     * entirely — 6, the id of the root tree's own directory — and using it
+     * made every create fail ENOENT looking for an inode that is not there. */
+    btrfs_attach_child_dir(root, fs,
+                           fs->fs_root_dirid ? fs->fs_root_dirid
+                                             : BTRFS_FIRST_FREE_OBJECTID);
 
     /* The tree is built now rather than on demand: the mount point has to be
      * published before paths under it resolve, which is what
      * vfs_set_currently_mounting_root does, and every node below is created by
-     * absolute path. */
+     * absolute path.
+     *
+     * The write operations stay off for the duration. Building the tree calls
+     * vfs_symlink for every symlink it finds, and with symlink_cb already in
+     * place that would try to CREATE each one on the disk it just read them
+     * from — the second one fails EEXIST and the node never appears. The
+     * operations are attached afterwards, to the tree as a whole. */
+    int want_rw = fs->rw;
+
+    fs->rw = 0;
     vfs_set_currently_mounting_root(root);
     btrfs_populate_dir(fs, BTRFS_FIRST_FREE_OBJECTID,
                        target && target[0] ? target : "/", 0);
+    if (want_rw) {
+        fs->rw = 1;
+        btrfs_enable_writes(root, fs);
+    }
 
     return root;
+}
+
+/* Attach the write operations to a whole subtree, once the mount-time walk has
+ * finished building it. */
+static void btrfs_enable_writes(struct vfs_node *node,
+                                struct btrfs_fs_info *fs) {
+    if (!node || !node->inode)
+        return;
+
+    struct btrfs_file_info *fi = btrfs_info_of(node);
+
+    if (fi && fi->fs == fs) {
+        /* The file operations go on directories too, and not by accident:
+         * after a create_cb returns, the VFS copies the PARENT's read_cb and
+         * write_cb onto the new node. A directory that carried no write_cb
+         * therefore handed every file created under it a null one, the write
+         * fell through to the in-memory path, and the buffer it allocated
+         * replaced this driver's own per-inode state — which the next
+         * truncate then followed straight into a #GP. A directory is never
+         * read or written as a file; the VFS dispatches on its type. */
+        node->inode->read_cb = btrfs_vfs_read;
+        node->inode->write_cb = btrfs_vfs_write;
+        node->inode->fsync_cb = btrfs_vfs_fsync;
+        node->inode->truncate_cb = btrfs_vfs_truncate;
+        node->inode->setattr_cb = btrfs_vfs_setattr;
+        if (node->inode->type == VFS_DIRECTORY) {
+            node->inode->create_cb = btrfs_vfs_create;
+            node->inode->mkdir_cb = btrfs_vfs_mkdir;
+            node->inode->unlink_cb = btrfs_vfs_unlink;
+            node->inode->rmdir_cb = btrfs_vfs_rmdir;
+            node->inode->rename_cb = btrfs_vfs_rename;
+            node->inode->link_cb = btrfs_vfs_link;
+            node->inode->symlink_cb = btrfs_vfs_symlink;
+        }
+    }
+    for (struct vfs_node *c = node->first_child; c; c = c->next_sibling)
+        btrfs_enable_writes(c, fs);
 }
 
 static struct vfs_fs btrfs_vfs = {
