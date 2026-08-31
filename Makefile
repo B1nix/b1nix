@@ -440,6 +440,7 @@ KERNEL_SOURCES := \
 	kernel/fs/ext4.c \
 	kernel/fs/procfs.c \
 	kernel/fs/tmpfs.c \
+	kernel/fs/mount_api.c \
 	kernel/fs/cgroup.c \
 	kernel/fs/sysfs.c \
 	kernel/fs/sysfs_attr.c \

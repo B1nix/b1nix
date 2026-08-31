@@ -178,7 +178,24 @@ static u64 mount_seq_next = 1;
 static struct vfs_mount_entry *mounts;
 static usize mount_slots;
 
-usize vfs_mount_capacity(void) { return mount_slots; }
+/* One past the highest slot ever used.
+ *
+ * The table is sized from RAM — a slot per MiB, so ~1000 on this machine — and
+ * every scan below walked all of it. A machine runs a few dozen mounts, so
+ * better than 95% of each walk was over slots that have never held anything,
+ * and the walks are not rare: crossing a mount root is a scan, and path
+ * resolution does it per component. Bounding by this makes the cost
+ * proportional to the mounts that exist rather than to the size of the guest.
+ *
+ * Only ever grows: a freed slot is reused, and the bound stays correct because
+ * it is an upper bound, not a count. */
+static usize mount_hwm;
+
+/* The number of entries a caller must be able to hold to read the whole table.
+ * Reported as the high-water mark rather than the table size: /proc/mounts and
+ * mountinfo allocate a buffer of this many entries on EVERY read, and at ~850
+ * bytes an entry that was most of a megabyte per read of a file systemd polls. */
+usize vfs_mount_capacity(void) { return mount_hwm ? mount_hwm : 1; }
 
 /* Allocate the mount table. Called from vfs_init() before any mount happens. */
 static void mounts_init_table(void) {
@@ -223,7 +240,7 @@ static int mount_visible(usize i) {
  * against that count rather than against 1. */
 static usize mount_root_refs(struct vfs_node *root) {
   usize n = 0;
-  for (usize i = 0; i < mount_slots; i++)
+  for (usize i = 0; i < mount_hwm; i++)
     if (mounts[i].used && mounts[i].root_node == root)
       n++;
   return n;
@@ -249,7 +266,7 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   while (curr) {
     /* The deepest ancestor that is some mount's root wins; among the entries
      * rooted at THAT node, the one mounted last does (see ::seq). */
-    for (int i = 0; i < (int)mount_slots; i++) {
+    for (int i = 0; i < (int)mount_hwm; i++) {
       if (mount_visible(i) && curr == mounts[i].root_node &&
           (!res || mounts[i].seq > res->seq))
         res = &mounts[i];
@@ -263,7 +280,7 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
    * node"; it is not a rule about a node that is on no mount at all, and
    * applying it here changed which filesystem's flags an unattached node was
    * judged by. */
-  for (int i = 0; i < (int)mount_slots; i++) {
+  for (int i = 0; i < (int)mount_hwm; i++) {
     if (mount_visible(i) && strcmp(mounts[i].target, "/") == 0) {
       res = &mounts[i];
       goto out;
@@ -309,7 +326,7 @@ static void mount_record_target(const char *target, struct vfs_node *node,
 static struct vfs_node *vfs_mount_point_of(const struct vfs_node *node) {
   if (!node || node == root_node || node->parent)
     return 0;
-  for (int i = 0; i < (int)mount_slots; i++) {
+  for (int i = 0; i < (int)mount_hwm; i++) {
     if (!mount_visible(i) || mounts[i].root_node != node)
       continue;
     /* The FIRST mount of this root is the one that gives it its name; a later
@@ -1180,7 +1197,7 @@ static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node) {
     return node;
 
   struct vfs_node *mounted_root = 0;
-  for (int i = 0; i < (int)mount_slots; i++) {
+  for (int i = 0; i < (int)mount_hwm; i++) {
     if (mount_visible(i) && mounts[i].root_node &&
         strcmp(mounts[i].target, "/") == 0) {
       mounted_root = mounts[i].root_node;
@@ -1700,7 +1717,7 @@ restart_traversal:
     if (strcmp(part, "..") == 0) {
       while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
         scheduler_yield();
-      for (int i = 0; i < (int)mount_slots; i++) {
+      for (int i = 0; i < (int)mount_hwm; i++) {
         if (mount_visible(i) && current == mounts[i].root_node) {
           struct vfs_node *mp = vfs_node_get(mounts[i].mount_point);
           __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
@@ -1776,7 +1793,7 @@ restart_traversal:
 
     /* find_child() already returns with refcount incremented */
     /* DOWNWARD MOUNT CROSSING */
-    for (int i = 0; i < (int)mount_slots; i++) {
+    for (int i = 0; i < (int)mount_hwm; i++) {
       if (mount_visible(i) && child == mounts[i].mount_point) {
         struct vfs_node *root = vfs_node_get(mounts[i].root_node);
         vfs_node_put(child);
@@ -1997,7 +2014,7 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
     }
     int child_was_found = (child != NULL);
     if (child) {
-      for (int i = 0; i < (int)mount_slots; i++) {
+      for (int i = 0; i < (int)mount_hwm; i++) {
         if (mount_visible(i) && child == mounts[i].mount_point) {
           vfs_node_put(child); /* Drop ref from find_child */
           child = vfs_node_get(mounts[i].root_node);
@@ -4989,7 +5006,7 @@ static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
     return -EACCES;
 
   /* Защита точек монтирования */
-  for (int i = 0; i < (int)mount_slots; i++) {
+  for (int i = 0; i < (int)mount_hwm; i++) {
     if (mount_visible(i) && strcmp(mounts[i].target, r_path) == 0) {
       if (bootinfo_has_flag("b1nix.trace-mount")) {
         char bl[320];
@@ -5651,6 +5668,8 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
     case VFS_HANDLE_EPOLL:
     case VFS_HANDLE_INOTIFY:
     case VFS_HANDLE_PIDFD:
+    case VFS_HANDLE_FSCTX:
+    case VFS_HANDLE_MOUNTFD:
       /* Linux backs these with an anonymous inode, reported as a regular
        * file with no name and no size. */
       anon_mode = B1NIX_S_IFREG | 0600;
@@ -5811,7 +5830,7 @@ static void vfs_mount_propagate(int midx) {
   u32 ns = mounts[midx].mnt_ns;
   int parent = -1;
   usize best = 0;
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (!mounts[i].used || (int)i == midx || mounts[i].mnt_ns != ns)
       continue;
     if (!path_is_under(mounts[midx].target, mounts[i].target))
@@ -5833,7 +5852,7 @@ static void vfs_mount_propagate(int midx) {
   mounts[midx].propagation = MS_SHARED;
   mounts[midx].peer_group = child_group;
 
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (!mounts[i].used || mounts[i].peer_group != group ||
         mounts[i].mnt_ns == ns)
       continue;
@@ -5849,6 +5868,12 @@ static void vfs_mount_propagate(int midx) {
     mounts[slot].mnt_ns = mounts[i].mnt_ns;
     mounts[slot].peer_group = child_group;
     mounts[slot].seq = mount_seq_next++;
+    /* The bound goes up BEFORE the slot is published: a scan reads the bound
+     * and then the entries, so with the two in the other order a reader could
+     * take the old bound, skip this slot and conclude the mount is not there —
+     * where seeing `used` still clear would merely have been a moment early. */
+    if ((usize)slot + 1 > mount_hwm)
+      mount_hwm = (usize)slot + 1;
     mounts[slot].used = 1;
     if (mounts[slot].root_node)
       vfs_node_get(mounts[slot].root_node);
@@ -5925,6 +5950,12 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   }
 
   // Pre-register slot so mount crossing works during populate_vfs
+  /* The bound goes up BEFORE the slot is published: a scan reads the bound
+   * and then the entries, so with the two in the other order a reader could
+   * take the old bound, skip this slot and conclude the mount is not there —
+   * where seeing `used` still clear would merely have been a moment early. */
+  if ((usize)midx + 1 > mount_hwm)
+    mount_hwm = (usize)midx + 1;
   mounts[midx].used = 1;
   mounts[midx].mount_point = target_node;
   mounts[midx].root_node = NULL;
@@ -6048,7 +6079,7 @@ int vfs_set_propagation(const char *target, u64 flags) {
 
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i))
       continue;
     if (recursive ? !path_is_under(mounts[i].target, canon)
@@ -6081,7 +6112,7 @@ int vfs_remount(const char *target, u64 flags) {
   int found = 0;
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i) || strcmp(mounts[i].target, canon) != 0)
       continue;
     /* MS_REMOUNT changes the mount's flags and nothing else. The propagation
@@ -6217,6 +6248,12 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
     vfs_node_put(tgt);
     return -ENOMEM;
   }
+  /* The bound goes up BEFORE the slot is published: a scan reads the bound
+   * and then the entries, so with the two in the other order a reader could
+   * take the old bound, skip this slot and conclude the mount is not there —
+   * where seeing `used` still clear would merely have been a moment early. */
+  if ((usize)midx + 1 > mount_hwm)
+    mount_hwm = (usize)midx + 1;
   mounts[midx].used = 1;
   mounts[midx].mount_point = tgt;   /* reference kept by the mount */
   mounts[midx].root_node = src;     /* reference kept by the mount */
@@ -6237,8 +6274,14 @@ isize vfs_mounts_info(struct vfs_mount_info *out, usize max_entries) {
   if (!out && max_entries > 0)
     return -EFAULT;
   usize count = 0;
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i))
+      continue;
+    /* A mount that has not been given a place yet is not part of the machine's
+     * mount topology. systemd reads /proc/self/mountinfo to decide what is
+     * already mounted, and a half-built sandbox appearing there would be
+     * answered as if it were the real thing. */
+    if (mount_is_detached(mounts[i].target))
       continue;
     if (count < max_entries) {
       copy_path(out[count].source, sizeof(out[count].source), mounts[i].source);
@@ -6318,7 +6361,7 @@ int vfs_move_mount(const char *source, const char *target) {
     scheduler_yield();
 
   int midx = -1;
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (mounts[i].used && mounts[i].root_node == src_node) {
       midx = (int)i;
       break;
@@ -6338,7 +6381,7 @@ int vfs_move_mount(const char *source, const char *target) {
    * crosses into it changes — this entry's mountpoint, and the recorded target
    * of every mount nested inside it, whose own mountpoint nodes travel with
    * the subtree and so need no fixing. */
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (!mounts[i].used || (int)i == midx)
       continue;
     retarget_under(mounts[i].target, sizeof(mounts[i].target), src, dst);
@@ -6373,7 +6416,7 @@ int vfs_umount(const char *target) {
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (mount_visible(i) && strcmp(mounts[i].target, target) == 0) {
       if (strcmp(target, "/") == 0) {
         __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
@@ -6560,7 +6603,7 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
     return -ENOMEM;
   }
 
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (!mounts[i].used || (int)i == nidx || (int)i == oidx)
       continue;
     if (strcmp(mounts[i].target, new_abs) == 0) {
@@ -6600,6 +6643,12 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
   } else if (freeidx >= 0) {
     /* Booted on the initramfs: the old root is the synthetic root_node and has
      * no entry. Give it one so it stays reachable at put_old. */
+    /* The bound goes up BEFORE the slot is published: a scan reads the bound
+     * and then the entries, so with the two in the other order a reader could
+     * take the old bound, skip this slot and conclude the mount is not there —
+     * where seeing `used` still clear would merely have been a moment early. */
+    if ((usize)freeidx + 1 > mount_hwm)
+      mount_hwm = (usize)freeidx + 1;
     mounts[freeidx].used = 1;
     strncpy(mounts[freeidx].source, "rootfs", sizeof(mounts[freeidx].source) - 1);
     mounts[freeidx].source[sizeof(mounts[freeidx].source) - 1] = '\0';
@@ -6651,8 +6700,8 @@ int vfs_mnt_ns_clone(u32 from_ns, u32 to_ns) {
 
   /* Count first: a partially copied namespace would be a namespace missing its
    * root, so the copy is all-or-nothing. */
-  usize need = 0, have = 0;
-  for (usize i = 0; i < mount_slots; i++) {
+  usize need = 0, have = mount_slots - mount_hwm; /* everything above is free */
+  for (usize i = 0; i < mount_hwm; i++) {
     if (mounts[i].used && mounts[i].mnt_ns == from_ns)
       need++;
     else if (!mounts[i].used)
@@ -6663,12 +6712,18 @@ int vfs_mnt_ns_clone(u32 from_ns, u32 to_ns) {
     return -ENOMEM;
   }
 
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (!mounts[i].used || mounts[i].mnt_ns != from_ns)
       continue;
+    /* The destination is any free slot in the WHOLE table, not just below the
+     * high-water mark: a namespace clone is exactly the case that grows the
+     * table past every slot used so far, and searching only the used region
+     * reported ENOMEM with a thousand slots free. */
     for (usize j = 0; j < mount_slots; j++) {
       if (mounts[j].used)
         continue;
+      if (j + 1 > mount_hwm)
+        mount_hwm = j + 1;
       mounts[j] = mounts[i];
       mounts[j].mnt_ns = to_ns;
       /* A shared mount's copy is its PEER: that is what "shared" means, and it
@@ -6716,7 +6771,7 @@ void vfs_mnt_ns_destroy(u32 ns) {
     while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
       scheduler_yield();
 
-    for (usize i = 0; i < mount_slots && n < MNT_RELEASE_BATCH; i++) {
+    for (usize i = 0; i < mount_hwm && n < MNT_RELEASE_BATCH; i++) {
       if (!mounts[i].used || mounts[i].mnt_ns != ns)
         continue;
       /* Last entry anywhere for this filesystem: let it shut down properly, the
@@ -6759,7 +6814,7 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries) {
     return -EFAULT;
 
   usize count = 0;
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i))
       continue;
     if (count < max_entries) {
@@ -6798,7 +6853,7 @@ int vfs_mount_id_for_path(const char *path) {
   int best_id = 0;
   usize best_len = 0;
   usize index = 0;
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i))
       continue;
     index++;
@@ -6840,7 +6895,7 @@ int vfs_path_is_mount_root(const char *path) {
   while (rlen > 1 && resolved[rlen - 1] == '/')
     resolved[--rlen] = '\0';
 
-  for (usize i = 0; i < mount_slots; i++) {
+  for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i))
       continue;
     if (strcmp(mounts[i].target, resolved) == 0)
@@ -8595,4 +8650,326 @@ int vfs_syncfs(int fd) {
   if (!handle || !handle->used)
     return -EBADF;
   return vfs_sync();
+}
+
+/* ── Detached mounts: the new mount API's mounts with nowhere to be ─────────
+ *
+ * See the note in <b1nix/vfs.h>. fsmount(2) produces a mount that is attached
+ * NOWHERE, and move_mount(2) later gives it a place. b1nix's mount table is
+ * keyed by path, so a mount with no path cannot be expressed — which is why
+ * this whole family answered ENOSYS until now.
+ *
+ * What it CAN express is a mount at a path nothing else will ever name. A
+ * detached mount is therefore a real mount under a private directory, and
+ * move_mount is the MS_MOVE this kernel already implements. The consequences
+ * are the reason this shape was chosen over a second, parallel mount table:
+ *
+ *   - the descriptor fsmount hands back is an ordinary O_PATH directory
+ *     descriptor, so `openat(mfd, ".", ...)` works. systemd does exactly that
+ *     to populate a credentials directory before moving it into place, and a
+ *     descriptor with no path behind it answered EBADF — which is how the
+ *     first attempt at this failed.
+ *   - every filesystem type can be instantiated, not only the ones whose mount
+ *     callback ignores its target: the callback gets a real directory.
+ *   - unmounting, propagation, mountinfo and namespace cloning all keep
+ *     working on it, because it is not a special case.
+ *
+ * The private directory is hidden from mountinfo and /proc/mounts
+ * (see mount_is_detached below): a mount in the middle of being set up is not
+ * part of the machine's mount topology, and systemd reads those files to
+ * decide what is already mounted.
+ */
+#define DETACHED_MOUNT_DIR "/.b1nix-detached"
+#define MAX_DETACHED_MOUNTS 64
+
+struct vfs_detached_mount {
+  int used;
+  char path[VFS_MAX_PATH]; /* DETACHED_MOUNT_DIR/<id> */
+  int cloned;              /* open_tree(OPEN_TREE_CLONE), i.e. a bind */
+};
+
+static struct vfs_detached_mount detached_mounts[MAX_DETACHED_MOUNTS];
+static volatile int detached_lock = 0;
+
+static void detached_acquire(void) {
+  while (__atomic_test_and_set(&detached_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+}
+
+static void detached_release_lock(void) {
+  __atomic_clear(&detached_lock, __ATOMIC_RELEASE);
+}
+
+/* Is this mount one that has not been given a place yet? Such a mount is real
+ * and usable through its descriptor, but it is not part of the machine's mount
+ * topology and must not be reported as if it were. */
+int mount_is_detached(const char *target) {
+  usize n = sizeof(DETACHED_MOUNT_DIR) - 1;
+
+  return target && strncmp(target, DETACHED_MOUNT_DIR, n) == 0 &&
+         (target[n] == '\0' || target[n] == '/');
+}
+
+/* MOUNT_ATTR_* bits that map onto an MS_* mount flag. The rest of the Linux
+ * set (idmapping, atime policies) is accepted and has no effect here, which is
+ * the same answer a filesystem that does not implement them gives. */
+static u64 mount_attr_to_ms(u64 attr) {
+  u64 ms = 0;
+
+  if (attr & MOUNT_ATTR_RDONLY)
+    ms |= MS_RDONLY;
+  if (attr & MOUNT_ATTR_NOSUID)
+    ms |= MS_NOSUID;
+  if (attr & MOUNT_ATTR_NODEV)
+    ms |= MS_NODEV;
+  if (attr & MOUNT_ATTR_NOEXEC)
+    ms |= MS_NOEXEC;
+  return ms;
+}
+
+/* Claim a slot and build its private directory. Returns the id or -errno. */
+static int detached_claim(char *path_out, usize path_len) {
+  detached_acquire();
+  int id = -1;
+  for (int i = 0; i < MAX_DETACHED_MOUNTS; i++) {
+    if (!detached_mounts[i].used) {
+      memset(&detached_mounts[i], 0, sizeof(detached_mounts[i]));
+      detached_mounts[i].used = 1;
+      id = i;
+      break;
+    }
+  }
+  detached_release_lock();
+  if (id < 0)
+    return -EMFILE;
+
+  /* The parent is created on first use rather than at boot: a machine that
+   * never touches the new mount API never grows the directory. */
+  (void)vfs_mkdir(DETACHED_MOUNT_DIR, 0700);
+
+  char path[VFS_MAX_PATH];
+  snprintf(path, sizeof(path), "%s/%d", DETACHED_MOUNT_DIR, id);
+  int rc = vfs_mkdir(path, 0700);
+  if (rc < 0 && rc != -EEXIST) {
+    detached_acquire();
+    detached_mounts[id].used = 0;
+    detached_release_lock();
+    return rc;
+  }
+
+  detached_acquire();
+  copy_path(detached_mounts[id].path, sizeof(detached_mounts[id].path), path);
+  detached_release_lock();
+  if (path_out)
+    copy_path(path_out, path_len, path);
+  return id;
+}
+
+static void detached_free_slot(int id) {
+  char path[VFS_MAX_PATH];
+
+  detached_acquire();
+  if (!detached_mounts[id].used) {
+    detached_release_lock();
+    return;
+  }
+  copy_path(path, sizeof(path), detached_mounts[id].path);
+  detached_mounts[id].used = 0;
+  detached_release_lock();
+  (void)vfs_rmdir(path);
+}
+
+int vfs_detached_create(const char *fstype, const char *source, u64 flags) {
+  if (!fstype || !fstype[0])
+    return -EINVAL;
+
+  char path[VFS_MAX_PATH];
+  int id = detached_claim(path, sizeof(path));
+  if (id < 0)
+    return id;
+
+  int rc = vfs_mount(source, path, fstype, flags);
+  if (rc < 0) {
+    detached_free_slot(id);
+    return rc;
+  }
+  return id;
+}
+
+/* Is anything mounted strictly below this path? A bind here attaches one
+ * subtree, so the answer decides whether a recursive clone would differ from a
+ * plain one. */
+static int mounts_below(const char *canon) {
+  int found = 0;
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  for (usize i = 0; i < mount_hwm; i++) {
+    if (!mount_visible(i))
+      continue;
+    if (strcmp(mounts[i].target, canon) == 0)
+      continue;
+    if (path_is_under(mounts[i].target, canon)) {
+      found = 1;
+      break;
+    }
+  }
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  return found;
+}
+
+/* open_tree(OPEN_TREE_CLONE): a detached copy of an existing subtree, which is
+ * a bind mount of it onto a private directory.
+ *
+ * AT_RECURSIVE asks for the mounts UNDER the path to come along. A bind here
+ * attaches one subtree, so the two are the same call whenever nothing is
+ * mounted below — which is the case every caller of this actually hits, a
+ * freshly created directory or a fresh tmpfs. When something IS mounted below,
+ * the difference is real and the request is refused rather than answered with
+ * a tree that quietly lost its submounts. */
+int vfs_detached_clone_path(const char *path, int recursive) {
+  if (!path || !path[0])
+    return -EINVAL;
+  if (recursive) {
+    char canon[VFS_MAX_PATH];
+    struct vfs_node *n = vfs_find_node(path);
+
+    if (IS_ERR(n))
+      return (int)PTR_ERR(n);
+    mount_record_target(path, n, canon, sizeof(canon));
+    vfs_node_put(n);
+    if (mounts_below(canon))
+      return -EOPNOTSUPP;
+  }
+
+  char hidden[VFS_MAX_PATH];
+  int id = detached_claim(hidden, sizeof(hidden));
+  if (id < 0)
+    return id;
+
+  int rc = vfs_bind_mount(path, hidden, 0);
+  if (rc < 0) {
+    detached_free_slot(id);
+    return rc;
+  }
+  detached_acquire();
+  detached_mounts[id].cloned = 1;
+  detached_release_lock();
+  return id;
+}
+
+/* The path a detached mount currently lives at, so the descriptor layer can
+ * open it. Returns 0 or -EINVAL. */
+int vfs_detached_path(int id, char *out, usize out_len) {
+  if (id < 0 || id >= MAX_DETACHED_MOUNTS || !out)
+    return -EINVAL;
+
+  detached_acquire();
+  if (!detached_mounts[id].used) {
+    detached_release_lock();
+    return -EINVAL;
+  }
+  copy_path(out, out_len, detached_mounts[id].path);
+  detached_release_lock();
+  return 0;
+}
+
+int vfs_detached_set_attr(int id, u64 attr_set, u64 attr_clr) {
+  char path[VFS_MAX_PATH];
+  int rc = vfs_detached_path(id, path, sizeof(path));
+
+  if (rc < 0)
+    return rc;
+
+  /* Matched by the exact target this mount was created with, not by resolving
+   * the path again. Resolution answers with the canonical name of the mount
+   * POINT, which for a private directory holding a freshly created filesystem
+   * is not the string the entry was recorded under — so the generic
+   * path-matching version found nothing and reported EINVAL, one step from the
+   * end of systemd's credentials sequence. The id knows which mount this is;
+   * there is no reason to ask the path walker. */
+  u64 set = mount_attr_to_ms(attr_set);
+  u64 clr = mount_attr_to_ms(attr_clr);
+  int touched = 0;
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  for (usize i = 0; i < mount_hwm; i++) {
+    if (!mounts[i].used)
+      continue;
+    if (strcmp(mounts[i].target, path) != 0)
+      continue;
+    mounts[i].flags |= set;
+    mounts[i].flags &= ~clr;
+    touched = 1;
+  }
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  return touched ? 0 : -EINVAL;
+}
+
+/* move_mount: the mount stops being detached. MS_MOVE does the work; the
+ * private directory goes away with the slot. */
+int vfs_detached_attach(int id, const char *target) {
+  char path[VFS_MAX_PATH];
+  int rc = vfs_detached_path(id, path, sizeof(path));
+
+  if (rc < 0)
+    return rc;
+  if (!target || !target[0])
+    return -EINVAL;
+
+  rc = vfs_move_mount(path, target);
+  if (rc < 0)
+    return rc;
+  detached_free_slot(id);
+  return 0;
+}
+
+/* The descriptor was closed without the mount ever being attached. */
+void vfs_detached_release(int id) {
+  char path[VFS_MAX_PATH];
+
+  if (vfs_detached_path(id, path, sizeof(path)) < 0)
+    return;
+  (void)vfs_umount(path);
+  detached_free_slot(id);
+}
+
+/* mount_setattr(2) on a mount that has a place. Applies to the mount whose
+ * target IS this path (and, with AT_RECURSIVE, everything under it) — the same
+ * set vfs_set_propagation walks. */
+int vfs_mount_setattr_path(const char *path, u64 attr_set, u64 attr_clr,
+                           int recursive) {
+  if (!path || !path[0])
+    return -EINVAL;
+
+  struct vfs_node *node = vfs_find_node(path);
+  if (IS_ERR(node))
+    return (int)PTR_ERR(node);
+  char canon[VFS_MAX_PATH];
+  mount_record_target(path, node, canon, sizeof(canon));
+  vfs_node_put(node);
+
+  u64 set = mount_attr_to_ms(attr_set);
+  u64 clr = mount_attr_to_ms(attr_clr);
+  int touched = 0;
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  for (usize i = 0; i < mount_hwm; i++) {
+    if (!mount_visible(i))
+      continue;
+    if (recursive ? !path_is_under(mounts[i].target, canon)
+                  : strcmp(mounts[i].target, canon) != 0)
+      continue;
+    mounts[i].flags |= set;
+    mounts[i].flags &= ~clr;
+    touched = 1;
+  }
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+
+  /* Nothing is mounted at this path. Linux applies the attributes to the mount
+   * the path is ON in that case; b1nix has no per-path attribute store, so
+   * saying so is better than reporting a change that did not happen. */
+  return touched ? 0 : -EINVAL;
 }

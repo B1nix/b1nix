@@ -27,9 +27,10 @@ systemd-journald.service: Failed at step CREDENTIALS spawning \
     /usr/lib/systemd/systemd-journald: Function not implemented
 ```
 
-**`tests/arch-smoke.sh` does not pass.** Of its 31 checks two are green (the
-kernel builds; no panic); the rest need daemons that never start. The reason is
-one missing piece of kernel, named in [Where it stops](#where-it-stops).
+**`tests/arch-smoke.sh` does not pass yet.** Of its 33 checks two are green
+(the kernel builds; no panic). The mount API that used to stop the boot is
+implemented and journald now starts; what ends the run is a separate PID 1
+abort, described in [Where it stops](#where-it-stops).
 
 One measurement worth recording because it is better than the one above and was
 not reproduced: on an intermediate tree — after ambient capabilities and
@@ -285,33 +286,62 @@ handed out again.
 
 ## Where it stops
 
-**journald, logind, udevd and dbus-broker fail at step `CREDENTIALS` with
-`ENOSYS`.** systemd's per-unit credentials directory is built with the mount
-API that came after `mount(2)` — `fsopen`/`fsconfig`/`fsmount` to make a
-superblock, `open_tree`/`move_mount` to attach it, `mount_setattr` to seal it
-read-only — and b1nix implements none of it.
+**The new mount API is implemented, and the CREDENTIALS wall is gone.**
+journald now starts: it parses its configuration, reports "Collecting audit
+messages is disabled" and runs. `fsopen`, `fsconfig`, `fsmount`, `open_tree`,
+`move_mount` and `mount_setattr` all answer for real — see
+`kernel/fs/mount_api.c` and the detached-mount table in `kernel/fs/vfs.c`.
 
-That is a decision, not an omission, and it was reached the expensive way:
-every part of that family was written, measured, and then **withdrawn**.
+The design question this file used to end on — "teaching the VFS to hold a
+mount that is attached nowhere" — was answered by NOT adding a second mount
+table. A detached mount is a real mount under a private directory
+(`/.b1nix-detached/<id>`) that is hidden from `/proc/mounts` and mountinfo, and
+`move_mount` is the MS_MOVE this kernel already had. Three consequences made it
+the right shape rather than merely the cheap one:
 
-- `open_tree(2)` and `move_mount(2)` were implemented by modelling
-  `OPEN_TREE_CLONE` as "a bind of the path the descriptor was opened under".
-  Arch's journald got one step further with them — past `CREDENTIALS`, to
-  `RUNTIME_DIRECTORY` — and **Debian's systemd suite fell from 32 of 32 to 18**:
-  systemd 252 found the calls present, took the new mount API for its unit
-  sandboxing, and lost socket activation, the readiness protocol and its device
-  units. A guess about what a caller meant is not an implementation.
-- `mount_setattr(2)` was implemented correctly and on its own terms, and it was
-  withdrawn too. With it, systemd's credentials setup gets far enough in to
-  *wedge the boot transaction* at journald instead of failing fast, and the run
-  never reaches `multi-user.target` at all. One member of a family whose absence
-  is detected as a unit is a trap: it is strictly worse than the whole family
-  being absent, which is the case every caller's fallback is written for.
+- the descriptor `fsmount` returns is an ordinary O_PATH directory descriptor,
+  so `openat(mfd, "cred", O_CREAT)` works. systemd fills a credentials
+  directory that way *before* the mount has a place, and the first attempt at
+  this — a descriptor with no path behind it — answered EBADF at exactly that
+  step;
+- every filesystem type can be instantiated, not only the ones whose mount
+  callback ignores its target;
+- unmount, propagation, mountinfo and namespace cloning keep working on it,
+  because it is not a special case.
 
-So the whole family answers `ENOSYS`. Doing it properly means teaching the VFS
-to hold a mount that is attached nowhere — b1nix's mount table is keyed by path
-and cannot express a detached mount — and that is a VFS change, not a syscall
-one.
+Four defects were found by walking the error one layer at a time, and each is
+worth recording because none of them is guessable from the specification:
+
+| Symptom | Cause |
+|---|---|
+| `CREDENTIALS ... Function not implemented` | the family was absent |
+| `... Bad file descriptor` | the mount descriptor was an anonymous object; systemd uses it as a **dirfd** |
+| `... Operation not supported` | `fsconfig(FSCONFIG_CMD_RECONFIGURE)` was refused. systemd creates the tmpfs, writes into it, sets `ro` and reconfigures — the refusal was one call from the end |
+| `... Invalid argument` | after `fsmount`, the fs context dropped its reference to the filesystem, so the reconfigure that follows had nothing to act on. In Linux the context keeps referring to the superblock; ownership and reference are different things |
+
+systemd also **probes**: it calls `fsconfig` with a deliberately absent option
+(`adefinitelynotexistingmountoption`) to find out whether the kernel validates
+options at all. An implementation that accepts everything tells it the wrong
+thing about every option afterwards, so an unknown parameter is EINVAL here and
+only a filesystem's own hints (`size`, `mode`, `nr_inodes`, …) are accepted.
+
+### What stops the boot now
+
+PID 1 aborts, and it is not the mount API — the same abort is in the *baseline*
+log from before this work:
+
+```
+Assertion 'fclose_nointr(f) != -EBADF' failed at src/basic/fd-util.c:133
+```
+
+`close(2)` answered EBADF for a descriptor systemd believes it holds. The
+errno trace shows `waitid` (247) returning EBADF in PID 1 shortly before it,
+which points at the pidfd path — a pidfd whose process has been reaped, or a
+descriptor closed under the manager's feet. That is the next thing to chase.
+
+Two smaller items in the same log, neither a kernel defect:
+`tmp.mount` fails because the image has no `/usr/bin/mount`, and three
+syscalls are still absent — `openat2` (437), `keyctl` (250) and `bpf` (321).
 
 ## Open
 

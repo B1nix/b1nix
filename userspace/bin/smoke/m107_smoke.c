@@ -71,6 +71,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -2030,6 +2031,131 @@ static void test_applet_chvt(void) {
         (long)(rc * 100 + moved * 10 + restored));
 }
 
+/* ══════════════════════ the new mount API ═══════════════════════════════
+ *
+ * fsopen/fsconfig/fsmount/move_mount/mount_setattr — the sequence systemd 254+
+ * builds every unit sandbox with. It answered ENOSYS until this kernel grew a
+ * mount that can exist while attached nowhere, which is where Arch's systemd
+ * 261 stopped ("Failed at step CREDENTIALS ... Function not implemented").
+ *
+ * Every step is checked by its RESULT, not by its return value: the filesystem
+ * has to be absent from the target until move_mount, present after it, and
+ * genuinely read-only once mount_setattr says so.
+ */
+#ifndef SYS_fsopen
+#define SYS_fsopen 430
+#endif
+#ifndef SYS_fsconfig
+#define SYS_fsconfig 431
+#endif
+#ifndef SYS_fsmount
+#define SYS_fsmount 432
+#endif
+#ifndef SYS_move_mount
+#define SYS_move_mount 429
+#endif
+#ifndef SYS_mount_setattr
+#define SYS_mount_setattr 442
+#endif
+
+#define FSCONFIG_SET_STRING  1
+#define FSCONFIG_CMD_CREATE  6
+#define MOVE_MOUNT_F_EMPTY_PATH 4
+#define MOUNT_ATTR_RDONLY_   0x00000001
+
+struct test_mount_attr {
+  unsigned long long attr_set, attr_clr, propagation, userns_fd;
+};
+
+static void test_mount_api(void) {
+  const char *target = "/tmp/m107-mountapi";
+
+  (void)mkdir(target, 0755);
+
+  int fsfd = (int)syscall(SYS_fsopen, "tmpfs", 0);
+  if (fsfd < 0) {
+    fail("mount-api-fsopen", fsfd);
+    return;
+  }
+  ok("mount-api-fsopen");
+
+  /* An option the filesystem does not have must be refused, or a caller
+   * probing for option support (systemd does exactly this) is told the kernel
+   * validates nothing. */
+  errno = 0;
+  long bad = syscall(SYS_fsconfig, fsfd, FSCONFIG_SET_STRING,
+                     "adefinitelynotexistingmountoption", "1", 0);
+  check("mount-api-rejects-unknown-option", bad == -1 && errno == EINVAL, bad);
+
+  if (syscall(SYS_fsconfig, fsfd, FSCONFIG_SET_STRING, "mode", "0700", 0) != 0) {
+    fail("mount-api-fsconfig", -1);
+    close(fsfd);
+    return;
+  }
+  if (syscall(SYS_fsconfig, fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) != 0) {
+    fail("mount-api-create", -1);
+    close(fsfd);
+    return;
+  }
+  ok("mount-api-create");
+
+  int mfd = (int)syscall(SYS_fsmount, fsfd, 0, 0);
+  if (mfd < 0) {
+    fail("mount-api-fsmount", mfd);
+    close(fsfd);
+    return;
+  }
+  ok("mount-api-fsmount");
+
+  /* The descriptor is a directory descriptor: this is what systemd fills a
+   * credentials directory through, before the mount has a place at all. */
+  int wfd = openat(mfd, "cred", O_CREAT | O_WRONLY, 0600);
+  if (wfd < 0) {
+    fail("mount-api-openat-detached", wfd);
+  } else {
+    ssize_t n = write(wfd, "secret", 6);
+    close(wfd);
+    check("mount-api-openat-detached", n == 6, n);
+  }
+
+  /* Nothing is at the target yet — the mount exists and is attached nowhere. */
+  check("mount-api-not-attached-yet", access("/tmp/m107-mountapi/cred", F_OK) != 0,
+        0);
+
+  if (syscall(SYS_move_mount, mfd, "", AT_FDCWD, target,
+              MOVE_MOUNT_F_EMPTY_PATH) != 0) {
+    fail("mount-api-move-mount", -1);
+    close(mfd);
+    close(fsfd);
+    return;
+  }
+  /* ...and now it is somewhere, with the file written through the descriptor
+   * before it had a place. */
+  int rfd = open("/tmp/m107-mountapi/cred", O_RDONLY);
+  char buf[8] = {0};
+  ssize_t rn = rfd >= 0 ? read(rfd, buf, sizeof(buf) - 1) : -1;
+  if (rfd >= 0)
+    close(rfd);
+  check("mount-api-move-mount", rn == 6 && memcmp(buf, "secret", 6) == 0, rn);
+
+  /* mount_setattr seals it: a write must now be refused, which is the whole
+   * point of the call for a credentials directory. */
+  struct test_mount_attr attr;
+  memset(&attr, 0, sizeof(attr));
+  attr.attr_set = MOUNT_ATTR_RDONLY_;
+  if (syscall(SYS_mount_setattr, AT_FDCWD, target, 0, &attr, sizeof(attr)) != 0) {
+    fail("mount-api-setattr", -1);
+  } else {
+    int denied = open("/tmp/m107-mountapi/other", O_CREAT | O_WRONLY, 0600);
+    if (denied >= 0)
+      close(denied);
+    check("mount-api-setattr", denied < 0 && errno == EROFS, denied);
+  }
+
+  close(mfd);
+  close(fsfd);
+}
+
 int main(void) {
   marker("M107-SMOKE: start");
 
@@ -2073,6 +2199,8 @@ int main(void) {
   test_applet_hwclock();
   test_applet_lsof();
   test_applet_chvt();
+
+  test_mount_api();
 
   marker(g_fail ? "M107-SMOKE: done with failures" : "M107-SMOKE: done");
   return g_fail ? 1 : 0;

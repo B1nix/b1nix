@@ -26,6 +26,30 @@
 #define MS_SHARED (1u << 20)
 #define MS_PROPAGATION_MASK (MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED)
 
+/* mount_setattr(2) / fsmount(2) attributes (Linux uapi/linux/mount.h). The
+ * first four are the MS_* flags under another name; the atime policies and the
+ * idmapping bits have no counterpart here and are accepted without effect,
+ * which is what a filesystem that does not implement them reports. */
+#define MOUNT_ATTR_RDONLY      0x00000001
+#define MOUNT_ATTR_NOSUID      0x00000002
+#define MOUNT_ATTR_NODEV       0x00000004
+#define MOUNT_ATTR_NOEXEC      0x00000008
+#define MOUNT_ATTR__ATIME      0x00000070
+#define MOUNT_ATTR_RELATIME    0x00000000
+#define MOUNT_ATTR_NOATIME     0x00000010
+#define MOUNT_ATTR_STRICTATIME 0x00000020
+#define MOUNT_ATTR_NODIRATIME  0x00000080
+#define MOUNT_ATTR_IDMAP       0x00100000
+#define MOUNT_ATTR_NOSYMFOLLOW 0x00200000
+
+/* The argument mount_setattr(2) takes by pointer and size. */
+struct b1nix_mount_attr {
+  u64 attr_set;
+  u64 attr_clr;
+  u64 propagation;
+  u64 userns_fd;
+};
+
 /* One row of the mount table, for /proc/<pid>/mountinfo. Separate from
  * struct b1nix_mount_entry, which is the userspace ABI of the mounts syscall
  * and therefore cannot grow. */
@@ -417,6 +441,14 @@ struct vfs_node {
 /* A filesystem that needs no block device (procfs, sysfs, tmpfs, ...). Only
  * affects how /proc/filesystems labels the entry, exactly as Linux does. */
 #define VFS_FS_NODEV 0x1
+/* This type's mount callback can build a superblock with no mountpoint: it
+ * ignores the `data` argument (the target path) and populates nothing by
+ * absolute path. The new mount API (fsopen/fsconfig/fsmount) creates a
+ * filesystem BEFORE deciding where it goes, so only a type that says so here
+ * can be instantiated that way — devtmpfs, for instance, creates its device
+ * nodes by path from inside its callback and would build them in the wrong
+ * place. */
+#define VFS_FS_DETACHABLE 0x2
 
 struct module;
 
@@ -432,6 +464,47 @@ struct vfs_fs {
   struct module *owner;
   struct vfs_fs *next;
 };
+
+/* ── The new mount API's detached mounts ───────────────────────────────────
+ *
+ * mount(2) names a filesystem and a place for it in one call. The API systemd
+ * 25x and later uses splits the two: fsopen/fsconfig build a superblock,
+ * fsmount turns it into a mount that is attached NOWHERE, mount_setattr seals
+ * it, and move_mount finally puts it somewhere. open_tree(OPEN_TREE_CLONE)
+ * detaches a copy of an existing subtree the same way.
+ *
+ * b1nix's mount table is keyed by path, so it cannot hold a mount with no
+ * path. Detached mounts therefore live in their own small table, referenced by
+ * descriptor, and only enter the path-keyed table when move_mount attaches
+ * them — which is also why nothing in path resolution had to learn about them.
+ *
+ * The id these return is an index into that table, valid until released. */
+int vfs_detached_create(const char *fstype, const char *source, u64 flags);
+/* Where that mount currently lives — a private path nothing else names. The
+ * descriptor layer opens it, so a mount descriptor is an ordinary directory
+ * descriptor and openat(mfd, ".") works. */
+int vfs_detached_path(int id, char *out, usize out_len);
+/* True for a mount that has not been given a place yet: real, usable through
+ * its descriptor, and deliberately absent from /proc/mounts and mountinfo. */
+int mount_is_detached(const char *target);
+int vfs_detached_clone_path(const char *path, int recursive);
+int vfs_detached_attach(int id, const char *target);
+int vfs_detached_set_attr(int id, u64 attr_set, u64 attr_clr);
+void vfs_detached_release(int id);
+
+/* The new mount API, descriptor side. Implemented in kernel/fs/mount_api.c. */
+int vfs_fsopen(const char *fstype, u32 flags);
+int vfs_fsconfig(int fd, u32 cmd, const char *key, const char *value, int aux);
+int vfs_fsmount(int fsfd, u32 flags, u32 attr_flags);
+int vfs_open_tree(const char *path, u32 flags);
+int vfs_move_mount_fd(int from_fd, const char *from_path, const char *to_path,
+                      u32 flags);
+int vfs_mount_setattr_fd(int fd, const char *path, u32 flags,
+                         const struct b1nix_mount_attr *attr);
+
+/* mount_setattr(2) on a mount that is already attached. */
+int vfs_mount_setattr_path(const char *path, u64 attr_set, u64 attr_clr,
+                           int recursive);
 
 /* Snapshot of the registered filesystem types, in registration order (newest
  * first, the order find_fs searches). Fills up to `max` entries and returns the
@@ -741,7 +814,11 @@ enum vfs_handle_kind {
   /* pidfd_open(2): a descriptor that refers to a process rather than to a
    * name for it, so a caller can signal or wait for exactly that process with
    * no risk of the pid having been reused underneath it. */
-  VFS_HANDLE_PIDFD
+  VFS_HANDLE_PIDFD,
+  /* fsopen(2): a filesystem being configured, before it exists. */
+  VFS_HANDLE_FSCTX,
+  /* fsmount(2) / open_tree(2): a mount that is attached nowhere. */
+  VFS_HANDLE_MOUNTFD
 };
 
 struct vfs_file_ops {

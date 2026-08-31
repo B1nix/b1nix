@@ -76,10 +76,14 @@ static struct vfs_node *tmpfs_mount_cb(const char *source, u64 flags,
   return root;
 }
 
+/* Detachable: the callback above ignores source, flags and the target path, so
+ * a superblock built with no mountpoint is the same superblock. This is the
+ * type systemd builds through fsopen/fsmount for a unit's credentials and
+ * runtime directories. */
 static struct vfs_fs tmpfs_fs = {.name = "tmpfs", .mount = tmpfs_mount_cb,
-                                 .flags = VFS_FS_NODEV};
+                                 .flags = VFS_FS_NODEV | VFS_FS_DETACHABLE};
 static struct vfs_fs ramfs_fs = {.name = "ramfs", .mount = tmpfs_mount_cb,
-                                 .flags = VFS_FS_NODEV};
+                                 .flags = VFS_FS_NODEV | VFS_FS_DETACHABLE};
 static struct vfs_node *devtmpfs_mount_cb(const char *source, u64 flags,
                                           void *data) {
   struct vfs_node *root = tmpfs_mount_cb(source, flags, data);

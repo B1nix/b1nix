@@ -797,6 +797,35 @@ static int syscall_resolve_at(int dirfd, const char *kpath, char *out,
   return 0;
 }
 
+/* AT_RECURSIVE — mount_setattr(2) and open_tree(2) apply to everything under
+ * the path, not just the mount at it. */
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE 0x8000
+#endif
+
+/* The same resolution for a path that is still in userspace, plus the
+ * AT_EMPTY_PATH form the mount API uses to name a descriptor with no path of
+ * its own. Returns 0 with `out` filled, or -errno; an empty path without
+ * AT_EMPTY_PATH is -ENOENT, as Linux has it. */
+static int linux_at_path(int dirfd, const char *user_path, u32 flags, char *out,
+                         usize outsz) {
+  char kpath[VFS_MAX_PATH];
+
+  kpath[0] = '\0';
+  if (user_path && strncpy_from_user(kpath, user_path, sizeof(kpath)) < 0)
+    return -EFAULT;
+
+  if (kpath[0] == '\0') {
+    if (!(flags & AT_EMPTY_PATH))
+      return -ENOENT;
+    /* The descriptor itself is the subject. A detached mount has no path, and
+     * the caller of this helper falls back to the descriptor in that case. */
+    int rc = vfs_fd_abspath(dirfd, out, outsz);
+    return rc < 0 ? rc : 0;
+  }
+  return syscall_resolve_at(dirfd, kpath, out, outsz);
+}
+
 static int sys_statx(int dirfd, const char *user_path, int flags,
                      unsigned int mask, struct statx *user_buf) {
   struct b1nix_stat st;
@@ -6308,6 +6337,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
  * descriptors it does not want a child to inherit; without it both walk
  * /proc/self/fd instead, which is a directory read per exec. */
 #define LX_close_range     436
+/* The new mount API (Linux 5.2 and 5.12). systemd 254+ builds every unit
+ * sandbox with these and only falls back to mount(2) when the whole family is
+ * missing — so they are implemented together or not at all. */
+#define LX_open_tree       428
+#define LX_move_mount      429
+#define LX_fsopen          430
+#define LX_fsconfig        431
+#define LX_fsmount         432
+#define LX_fspick          433
+#define LX_mount_setattr   442
 /* pidfd_open(pid, flags) and pidfd_send_signal(pidfd, sig, info, flags). A
  * descriptor that names a process rather than a number that identifies one
  * today; see vfs_pidfd_open. */
@@ -6390,6 +6429,115 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * is accepted. CLOSE_RANGE_CLOEXEC (bit 2) marks rather than closes.
        * A descriptor that is not open is not an error -- the range is a range,
        * not a list. */
+      /* ── The new mount API ────────────────────────────────────────────
+       *
+       * fsopen builds a filesystem before it has a place; fsmount turns it
+       * into a mount attached nowhere; move_mount gives it one. The mount that
+       * exists while attached to nothing is the part b1nix's path-keyed mount
+       * table could not express, and is why this family answered ENOSYS until
+       * now — which is where Arch's systemd 261 stopped, at "Failed at step
+       * CREDENTIALS ... Function not implemented". See kernel/fs/mount_api.c.
+       */
+      if (number == LX_fsopen) {
+        char fstype[64];
+
+        if (strncpy_from_user(fstype, (const char *)(usize)arg0,
+                              sizeof(fstype)) < 0)
+          return (u64)-EFAULT;
+        return (u64)(isize)vfs_fsopen(fstype, (u32)arg1);
+      }
+
+      if (number == LX_fsconfig) {
+        char key[128];
+        char value[VFS_MAX_PATH];
+        const char *keyp = 0;
+        const char *valp = 0;
+
+        if (arg2) {
+          if (strncpy_from_user(key, (const char *)(usize)arg2, sizeof(key)) < 0)
+            return (u64)-EFAULT;
+          keyp = key;
+        }
+        if (arg3) {
+          if (strncpy_from_user(value, (const char *)(usize)arg3,
+                                sizeof(value)) < 0)
+            return (u64)-EFAULT;
+          valp = value;
+        }
+        return (u64)(isize)vfs_fsconfig((int)arg0, (u32)arg1, keyp, valp,
+                                        (int)arg4);
+      }
+
+      if (number == LX_fsmount)
+        return (u64)(isize)vfs_fsmount((int)arg0, (u32)arg1, (u32)arg2);
+
+      if (number == LX_open_tree) {
+        char kpath[VFS_MAX_PATH];
+        char resolved_tree[VFS_MAX_PATH];
+        int rc = linux_at_path((int)arg0, (const char *)(usize)arg1,
+                               (u32)arg2, kpath, sizeof(kpath));
+
+        if (rc < 0)
+          return (u64)rc;
+        vfs_resolve_path(kpath, resolved_tree);
+        return (u64)(isize)vfs_open_tree(resolved_tree, (u32)arg2);
+      }
+
+      if (number == LX_move_mount) {
+        char fpath[VFS_MAX_PATH];
+        char tpath[VFS_MAX_PATH];
+        char resolved_to[VFS_MAX_PATH];
+        int have_from = 0;
+        /* MOVE_MOUNT_F_EMPTY_PATH (4): the source is the descriptor itself,
+         * with an empty path — which is exactly how a detached mount is named,
+         * and what systemd passes. */
+        int rc = linux_at_path((int)arg0, (const char *)(usize)arg1,
+                               (u32)arg4 & 4u ? AT_EMPTY_PATH : 0, fpath,
+                               sizeof(fpath));
+
+        if (rc == 0)
+          have_from = 1;
+        rc = linux_at_path((int)arg2, (const char *)(usize)arg3, 0, tpath,
+                           sizeof(tpath));
+        if (rc < 0)
+          return (u64)rc;
+        vfs_resolve_path(tpath, resolved_to);
+        return (u64)(isize)vfs_move_mount_fd((int)arg0,
+                                             have_from ? fpath : 0,
+                                             resolved_to, (u32)arg4);
+      }
+
+      if (number == LX_mount_setattr) {
+        struct b1nix_mount_attr attr;
+        char kpath[VFS_MAX_PATH];
+        char resolved_attr[VFS_MAX_PATH];
+        int have_path = 0;
+
+        /* Linux takes the size so the structure can grow; a caller passing a
+         * shorter one means the fields it omits are zero, and a longer one
+         * means it wants something this kernel does not have. */
+        if ((usize)arg4 < sizeof(attr))
+          return (u64)-EINVAL;
+        memset(&attr, 0, sizeof(attr));
+        if (syscall_copyin(&attr, (const void *)(usize)arg3, sizeof(attr)) < 0)
+          return (u64)-EFAULT;
+
+        if (linux_at_path((int)arg0, (const char *)(usize)arg1, (u32)arg2,
+                          kpath, sizeof(kpath)) == 0) {
+          vfs_resolve_path(kpath, resolved_attr);
+          have_path = 1;
+        }
+        return (u64)(isize)vfs_mount_setattr_fd(
+            (int)arg0, have_path ? resolved_attr : 0, (u32)arg2, &attr);
+      }
+
+      /* fspick(2) reconfigures a mount that already exists, which needs the
+       * live-superblock reconfiguration fsconfig(CMD_RECONFIGURE) also
+       * refuses. Every caller reaches it through a fallback to
+       * mount(MS_REMOUNT), which works. */
+      if (number == LX_fspick)
+        return (u64)-EOPNOTSUPP;
+
       /* pidfd_open(pid, flags): take a reference to a process. */
       if (number == LX_pidfd_open)
         return (u64)(isize)vfs_pidfd_open((usize)arg0, (int)arg1);
