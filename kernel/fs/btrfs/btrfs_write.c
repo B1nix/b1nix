@@ -370,32 +370,15 @@ static int range_kind_ok(struct btrfs_fs_info *fs, u64 logical, u64 len,
     return (bg->flags & BTRFS_BLOCK_GROUP_DATA) != 0;
 }
 
-/* Put bytes on the medium, by logical address.
- *
- * Straight to the device, not through the block cache, and the cache is told
- * to forget the range afterwards so later reads pick the new contents up.
- *
- * This is what Linux's btrfs does too — it owns its I/O rather than going
- * through a buffer cache — but here there is a second reason. b1nix's block
- * cache loses part of a multi-sector write under this workload: a 16 KiB tree
- * block rewritten several times in one commit came back with its new header
- * and an older tail, so the checksum matched nothing. Reading and writing the
- * same ranges through the device directly makes the filesystem this driver
- * writes pass btrfs check; through the cache it does not. The cache defect is
- * real and outlives this driver — ext4 writes through the same path — and is
- * recorded as its own problem rather than worked around silently here. */
+/* Put bytes on the medium, by logical address. */
 static int btrfs_write_raw(struct btrfs_fs_info *fs, u64 logical,
                            const void *buf, u32 len) {
     u64 physical = btrfs_map(fs, logical);
 
     if (!physical || (len % 512))
         return -EIO;
-    if (!fs->bdev->write_blocks)
+    if (blk_write_cached(fs->bdev, physical / 512, len / 512, buf) < 0)
         return -EIO;
-    if (fs->bdev->write_blocks(fs->bdev, physical / 512, len / 512,
-                               (void *)buf) < 0)
-        return -EIO;
-    blk_cache_invalidate_range(fs->bdev, physical / 512, len / 512);
     return 0;
 }
 

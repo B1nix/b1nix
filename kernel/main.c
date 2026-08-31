@@ -1154,6 +1154,7 @@ void kernel_main(usize arg0, usize arg1)
 		 * a full block-cache drop. Needs the full scheduler because the
 		 * flush command blocks on its completion. */
 		blk_durability_selftest();
+		blk_cache_torture_test();
 		iommu_selftest();     /* M100b/M100c: VT-d, domains, groups, IR */
 		amdvi_selftest();     /* M100d: AMD-Vi */
 		/* Whichever unit came up, put a real device behind it and move data

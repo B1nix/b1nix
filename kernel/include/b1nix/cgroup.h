@@ -4,7 +4,7 @@
 #include <b1nix/types.h>
 
 /*
- * cgroup v2 — the unified hierarchy (kernel/fs/cgroup.c).
+ * cgroup v2 — the unified hierarchy (kernel/fs/cgroup/cgroup.c).
  *
  * systemd will not boot without it: it mounts "cgroup2" on /sys/fs/cgroup,
  * creates a directory per unit, and moves each unit's processes into it by

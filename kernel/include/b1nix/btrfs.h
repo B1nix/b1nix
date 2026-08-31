@@ -462,7 +462,7 @@ int btrfs_key_cmp(const struct btrfs_disk_key *a, u64 objectid, u8 type,
 const struct btrfs_item *btrfs_leaf_item(const u8 *leaf, u32 i);
 const u8 *btrfs_item_data(const u8 *leaf, const struct btrfs_item *it);
 
-/* ── Write path (kernel/fs/btrfs_write.c) ────────────────────────────────── */
+/* ── Write path (kernel/fs/btrfs/btrfs_write.c) ────────────────────────────────── */
 
 /* Bring up the allocator and the write-side roots for a mount that asked to be
  * writable. Returns 0 when the mount may be written to, or a negative errno —

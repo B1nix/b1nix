@@ -518,7 +518,7 @@ usize vfs_list_filesystems(struct vfs_fs_info *out, usize max);
 
 u64 vfs_get_unix_time(void);
 void vfs_init(void);
-/* tmpfs/ramfs/devtmpfs: RAM-backed mounts (see kernel/fs/tmpfs.c). */
+/* tmpfs/ramfs/devtmpfs: RAM-backed mounts (see kernel/fs/ramfs/tmpfs.c). */
 void tmpfs_init(void);
 /* Sleeping mutex for filesystem-wide metadata (allocator bitmaps, superblock
  * counters). Legal to hold across block I/O — never a spinlock. */

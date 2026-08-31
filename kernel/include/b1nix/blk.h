@@ -188,7 +188,7 @@ int blk_unregister(struct block_device *dev);
  * from instead of rebuilding on every readdir. */
 u32 blk_generation(void);
 
-/* Tell sysfs the registry changed (implemented in kernel/fs/sysfs.c). The
+/* Tell sysfs the registry changed (implemented in kernel/fs/sysfs/sysfs.c). The
  * block layer has to push: the path resolver only calls a directory's
  * lookup_cb when the name MISSES, so a stale /sys/block/<device> would keep
  * resolving and no readdir-time refresh could ever retire it. No-op before
@@ -260,6 +260,9 @@ void blk_cache_flush(struct block_device *dev);
 void blk_flush_buffer(struct block_buffer *buf);
 void blk_sync_all(void);
 void blk_cache_invalidate(struct block_device *dev);
+/* `b1nix.blk-torture`: rewrite one multi-sector range repeatedly and check the
+ * medium keeps up. Test mode only; silent unless asked for. */
+void blk_cache_torture_test(void);
 /* Forget a range, without writing it back — for a caller that has already put
  * the authoritative bytes on the medium. */
 void blk_cache_invalidate_range(struct block_device *dev, u64 lba, u32 count);

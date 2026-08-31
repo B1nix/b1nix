@@ -4,7 +4,7 @@
  * (SHMMAX) and the core-dump byte cap were compile-time #defines. They now live
  * in `g_resource_caps`, sized from usable RAM at boot and adjustable at runtime
  * through the writable /proc/sys/kernel/{tcp-max-conns,pipe-max-count,shmmax,
- * coredump-max-bytes} sysctl entries (see kernel/fs/procfs.c).
+ * coredump-max-bytes} sysctl entries (see kernel/fs/proc/procfs.c).
  *
  * The write helpers clamp to [MIN, CEIL] and reject values outside the range
  * with -EINVAL; a cap reduction takes effect against FUTURE allocations only,

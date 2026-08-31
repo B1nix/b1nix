@@ -1847,6 +1847,19 @@ void blk_flush_buffer(struct block_buffer *buf) {
   }
 }
 
+/* Give back the claims blk_flush_matching took, clearing DIRTY on the ones the
+ * device accepted. */
+static void blk_flush_release(struct block_buffer **set, usize n, int written) {
+  u64 flags = bcache_acquire();
+
+  for (usize i = 0; i < n; i++) {
+    if (written)
+      set[i]->flags &= ~BLK_CACHE_DIRTY;
+    set[i]->flags &= ~BLK_CACHE_BUSY;
+  }
+  bcache_release(flags);
+}
+
 /* Forget every cached copy of [lba, lba+count) on `target`. Used before a
  * command that changes the medium behind the cache's back (WRITE ZEROES,
  * DISCARD): a stale entry that is still dirty would otherwise be written back
@@ -1963,21 +1976,34 @@ static void blk_flush_run(struct block_buffer **run, usize n, u8 **bounce) {
   if (n == 0)
     return;
   if (n == 1) {
-    blk_flush_buffer(run[0]);
+    struct block_buffer *b = run[0];
+
+    if (b->bdev && b->bdev->write_blocks &&
+        b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) == 0)
+      blk_flush_release(run, 1, 1);
+    else
+      blk_flush_release(run, 1, 0);
     return;
   }
 
   struct block_device *dev = run[0]->bdev;
 
-  if (!dev || !dev->write_blocks)
+  if (!dev || !dev->write_blocks) {
+    blk_flush_release(run, n, 0);
     return;
+  }
   if (!*bounce) {
     /* Sized to the longest run the flusher will ever assemble, which is the
      * same device-derived bound. */
     *bounce = (u8 *)kmalloc(BCACHE_FLUSH_RUN * sizeof(run[0]->data));
     if (!*bounce) {
-      for (usize i = 0; i < n; i++)
-        blk_flush_buffer(run[i]);
+      for (usize i = 0; i < n; i++) {
+        struct block_buffer *b = run[i];
+        int ok = b->bdev && b->bdev->write_blocks &&
+                 b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) == 0;
+
+        blk_flush_release(&run[i], 1, ok);
+      }
       return;
     }
   }
@@ -1985,11 +2011,14 @@ static void blk_flush_run(struct block_buffer **run, usize n, u8 **bounce) {
     memcpy(*bounce + i * sizeof(run[i]->data), run[i]->data,
            sizeof(run[i]->data));
   if (dev->write_blocks(dev, run[0]->block_no, (u32)n, *bounce) == 0) {
-    for (usize i = 0; i < n; i++)
-      run[i]->flags &= ~BLK_CACHE_DIRTY;
+    blk_flush_release(run, n, 1);
   } else {
-    for (usize i = 0; i < n; i++)
-      blk_flush_buffer(run[i]);
+    for (usize i = 0; i < n; i++) {
+      struct block_buffer *b = run[i];
+      int ok = b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) == 0;
+
+      blk_flush_release(&run[i], 1, ok);
+    }
   }
 }
 
@@ -2059,9 +2088,11 @@ static void bcache_drain_all(void) {
   struct block_buffer **set = (struct block_buffer **)kmalloc(cap * sizeof(*set));
   usize n = 0;
   u8 *bounce = 0;
+  usize base = 0;
 
-  for (usize base = 0; base < block_cache_n; base += SCAN_CHUNK) {
+  while (base < block_cache_n) {
     usize stop = base + SCAN_CHUNK;
+    usize resume = stop;
 
     if (stop > block_cache_n)
       stop = block_cache_n;
@@ -2070,18 +2101,28 @@ static void bcache_drain_all(void) {
     for (usize i = base; i < stop; i++) {
       struct block_buffer *b = &block_cache[i];
 
-      if (!((b->flags & BLK_CACHE_VALID) && (b->flags & BLK_CACHE_DIRTY)))
+      if (!((b->flags & BLK_CACHE_VALID) && (b->flags & BLK_CACHE_DIRTY)) ||
+          !b->bdev || !b->bdev->write_blocks)
         continue;
-      if (set && n < cap)
-        set[n++] = b;
-      else if (!set)
+      if (b->flags & BLK_CACHE_BUSY)
+        continue;
+      if (!set) {
         blk_flush_buffer(b);
+        continue;
+      }
+      if (n == cap) {
+        resume = i;
+        break;
+      }
+      b->flags |= BLK_CACHE_BUSY;
+      set[n++] = b;
     }
     bcache_release(flags);
-    if (set && n == cap) {
+    if (set && n) {
       blk_flush_sorted(set, n, &bounce);
       n = 0;
     }
+    base = resume;
   }
   if (set) {
     blk_flush_sorted(set, n, &bounce);
@@ -2149,9 +2190,11 @@ static void blk_flush_matching(struct block_device *dev, u64 first, u64 last,
   struct block_buffer **set = (struct block_buffer **)kmalloc(cap * sizeof(*set));
   usize n = 0;
   u8 *bounce = 0;
+  usize base = 0;
 
-  for (usize base = 0; base < block_cache_n; base += SCAN_CHUNK) {
+  while (base < block_cache_n) {
     usize stop = base + SCAN_CHUNK;
+    usize resume = stop;
 
     if (stop > block_cache_n)
       stop = block_cache_n;
@@ -2168,16 +2211,44 @@ static void blk_flush_matching(struct block_device *dev, u64 first, u64 last,
       if (ino && !(b->dirty_ino == 0 ||
                    (b->dirty_ino == ino && b->dirty_fsid == fsid)))
         continue;
-      if (set && n < cap)
-        set[n++] = b;
-      else if (!set)
+      /* Already in flight somewhere else — leave it to whoever claimed it. */
+      if (b->flags & BLK_CACHE_BUSY)
+        continue;
+      if (!set) {
         blk_flush_buffer(b); /* no memory for the set: the old behaviour */
+        continue;
+      }
+      if (n == cap) {
+        /* The set is full. Come back to THIS slot after draining rather than
+         * skipping it.
+         *
+         * A skipped block stays dirty and reaches the medium later, whenever
+         * its slot is recycled. For a filesystem that flushes its metadata
+         * and only then writes the super block, that means the super block
+         * can land first, naming blocks that are not on the disk yet — and
+         * the filesystem it leaves behind is one no other implementation can
+         * open. The cache held more than 512 dirty blocks of one device only
+         * under a heavy writer, which is why this went unseen. */
+        resume = i;
+        break;
+      }
+      /* CLAIM the slot for the duration of the write.
+       *
+       * The set is written after the cache lock is dropped, and a device
+       * write can yield. Without a claim, a slot collected here could be
+       * evicted and refilled with a different (device, block) before its turn
+       * came — and since a run is sorted by the block_no read at write time,
+       * the writer would then put a run of good data at the wrong addresses.
+       * BUSY is the same claim eviction uses. */
+      b->flags |= BLK_CACHE_BUSY;
+      set[n++] = b;
     }
     bcache_release(flags);
-    if (set && n == cap) {
+    if (set && n) {
       blk_flush_sorted(set, n, &bounce);
       n = 0;
     }
+    base = resume;
   }
   if (set) {
     blk_flush_sorted(set, n, &bounce);
@@ -2472,6 +2543,90 @@ void blk_cache_invalidate_range(struct block_device *dev, u64 lba, u32 count) {
     }
     bcache_release(flags);
   }
+}
+
+/* Does a multi-sector write survive the cache?
+ *
+ * Rewrite one 16 KiB range many times, flushing between rounds, and read it
+ * back past the cache each time. The btrfs write path found a case where the
+ * medium ended up with the newest first sector and an older tail; this asks
+ * the same question directly, with no filesystem in the way, so the answer
+ * cannot be blamed on the caller. Runs only when asked, on a disk whose test
+ * range is provably unused. */
+void blk_cache_torture_test(void) {
+    if (!bootinfo_has_flag("b1nix.blk-torture"))
+        return;
+
+    struct block_device *dev = blk_find_scratch(BLK_BUS_VIRTIO);
+
+    if (!dev || !dev->read_blocks || !dev->write_blocks) {
+        k_info(NULL, "BLK-TORTURE: skip reason=no-scratch-device");
+        return;
+    }
+
+    const u32 sectors = 32; /* 16 KiB, the size a btrfs node is written in */
+    u8 *out = kmalloc((usize)sectors * CACHE_BLOCK_SIZE);
+    u8 *back = kmalloc((usize)sectors * CACHE_BLOCK_SIZE);
+
+    if (!out || !back) {
+        if (out) kfree(out);
+        if (back) kfree(back);
+        k_info(NULL, "BLK-TORTURE: skip reason=out-of-memory");
+        return;
+    }
+
+    unsigned mismatches = 0;
+    unsigned rounds = 200;
+    /* Enough other traffic between rounds to make the cache evict: an idle
+     * cache never recycles a slot, and recycling is where the interesting
+     * failures live. */
+    u8 *filler = kmalloc(CACHE_BLOCK_SIZE);
+
+    for (unsigned r = 0; r < rounds; r++) {
+        for (u32 i = 0; i < sectors * CACHE_BLOCK_SIZE; i++)
+            out[i] = (u8)(i * 31 + r * 7);
+        if (blk_write_cached(dev, BLK_SELFTEST_LBA, sectors, out) < 0) {
+            mismatches = rounds; /* a failed write is a failure of its own */
+            break;
+        }
+        if (filler) {
+            u64 span = dev->block_count > BLK_SELFTEST_LBA + 4096
+                           ? 2048
+                           : 0;
+
+            for (u64 k = 0; k < span; k++) {
+                memset(filler, (int)(k + r), CACHE_BLOCK_SIZE);
+                blk_write_cached(dev, BLK_SELFTEST_LBA + sectors + k, 1,
+                                 filler);
+            }
+        }
+        blk_cache_flush(dev);
+        memset(back, 0, (usize)sectors * CACHE_BLOCK_SIZE);
+        if (dev->read_blocks(dev, BLK_SELFTEST_LBA, sectors, back) < 0) {
+            mismatches = rounds;
+            break;
+        }
+        for (u32 i = 0; i < sectors * CACHE_BLOCK_SIZE; i++) {
+            if (back[i] != out[i]) {
+                char line[160];
+
+                snprintf(line, sizeof(line),
+                         "BLK-TORTURE: round %u differs at byte %u (sector %u)",
+                         r, i, i / CACHE_BLOCK_SIZE);
+                if (mismatches < 4)
+                    k_info(NULL, line);
+                mismatches++;
+                break;
+            }
+        }
+    }
+    kfree(out);
+    kfree(back);
+    if (filler)
+        kfree(filler);
+
+    console_write(mismatches ? "BLK-TORTURE: FAIL multi-sector-write\n"
+                             : "BLK-TORTURE: ok multi-sector-write\n");
 }
 
 void blk_cache_invalidate(struct block_device *dev) {

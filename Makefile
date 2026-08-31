@@ -152,7 +152,7 @@ endif
 endif
 ifdef LIBC_SO
 # The selected libc replaces the retired b1nix shared libc: /lib/$(LIBC_LDSO_NAME)
-# is the blob and /lib/libc.so is a symlink onto it (see kernel/fs/initramfs.c).
+# is the blob and /lib/libc.so is a symlink onto it (see kernel/fs/ramfs/initramfs.c).
 INITRAMFS_SHARED_LIBC_INC :=
 INITRAMFS_LD_MUSL_INC := $(INC_DIR)/$(LIBC_INC_NAME)
 else
@@ -425,29 +425,29 @@ KERNEL_SOURCES := \
 	kernel/syscall/syscall.c \
 	kernel/syscall/linux_abi.c \
 	kernel/syscall/resource_caps.c \
-	kernel/fs/initramfs.c \
+	kernel/fs/ramfs/initramfs.c \
 	kernel/fs/vfs.c \
 	kernel/fs/aio.c \
 	kernel/fs/vfs_slab.c \
 	kernel/fs/pipe.c \
 	kernel/fs/eventpoll.c \
 	kernel/fs/inotify.c \
-	kernel/fs/fat32.c \
-	kernel/fs/exfat.c \
-	kernel/fs/ext2.c \
-	kernel/fs/ext1.c \
-	kernel/fs/ext3.c \
-	kernel/fs/ext4.c \
-	kernel/fs/procfs.c \
-	kernel/fs/tmpfs.c \
+	kernel/fs/fat/fat32.c \
+	kernel/fs/fat/exfat.c \
+	kernel/fs/ext4/ext2.c \
+	kernel/fs/ext4/ext1.c \
+	kernel/fs/ext4/ext3.c \
+	kernel/fs/ext4/ext4.c \
+	kernel/fs/proc/procfs.c \
+	kernel/fs/ramfs/tmpfs.c \
 	kernel/fs/mount_api.c \
-	kernel/fs/btrfs_selftest.c \
-	kernel/fs/cgroup.c \
-	kernel/fs/sysfs.c \
-	kernel/fs/sysfs_attr.c \
-	kernel/fs/journal.c \
+	kernel/fs/btrfs/btrfs_selftest.c \
+	kernel/fs/cgroup/cgroup.c \
+	kernel/fs/sysfs/sysfs.c \
+	kernel/fs/sysfs/sysfs_attr.c \
+	kernel/fs/ext4/journal.c \
 	kernel/fs/filelock.c \
-	kernel/fs/fuse.c \
+	kernel/fs/fuse/fuse.c \
 	kernel/dev/acpi.c \
 	kernel/dev/ioapic.c \
 	kernel/dev/blk.c \
@@ -879,9 +879,9 @@ $$(MODULE_OUT_DIR)/$(1).ko: $(2)
 	fi
 endef
 
-$(eval $(call B1NIX_MODULE_RULE,isofs,kernel/fs/isofs.c))
-$(eval $(call B1NIX_MODULE_RULE,ntfs,kernel/fs/ntfs.c))
-$(eval $(call B1NIX_MODULE_RULE,btrfs,kernel/fs/btrfs.c kernel/fs/btrfs_write.c))
+$(eval $(call B1NIX_MODULE_RULE,isofs,kernel/fs/isofs/isofs.c))
+$(eval $(call B1NIX_MODULE_RULE,ntfs,kernel/fs/ntfs/ntfs.c))
+$(eval $(call B1NIX_MODULE_RULE,btrfs,kernel/fs/btrfs/btrfs.c kernel/fs/btrfs/btrfs_write.c))
 $(eval $(call B1NIX_MODULE_RULE,hda,kernel/dev/hda.c))
 $(eval $(call B1NIX_MODULE_RULE,ipv6,kernel/net/ipv6.c))
 $(eval $(call B1NIX_MODULE_RULE,ndp,kernel/net/ndp.c))

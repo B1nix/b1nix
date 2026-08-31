@@ -72,15 +72,15 @@ SRCS = \
   kernel/dev/virtio_gpu.c \
   kernel/dev/virtio.c \
   kernel/fs/aio.c \
-  kernel/fs/btrfs.c \
-  kernel/fs/ext1.c \
-  kernel/fs/ext2.c \
-  kernel/fs/ext3.c \
-  kernel/fs/ext4.c \
-  kernel/fs/fat32.c \
+  kernel/fs/btrfs/btrfs.c \
+  kernel/fs/ext4/ext1.c \
+  kernel/fs/ext4/ext2.c \
+  kernel/fs/ext4/ext3.c \
+  kernel/fs/ext4/ext4.c \
+  kernel/fs/fat/fat32.c \
   kernel/fs/filelock.c \
-  kernel/fs/initramfs.c \
-  kernel/fs/journal.c \
+  kernel/fs/ramfs/initramfs.c \
+  kernel/fs/ext4/journal.c \
   kernel/fs/pipe.c \
   kernel/fs/vfs.c \
   kernel/fs/vfs_slab.c \
@@ -131,8 +131,8 @@ SRCS = \
   kernel/sched/smp_test.c \
   kernel/arch/x86_64/coredump.c \
   kernel/arch/x86_64/gdbstub.c \
-  kernel/fs/procfs.c \
-  kernel/fs/sysfs.c \
+  kernel/fs/proc/procfs.c \
+  kernel/fs/sysfs/sysfs.c \
   kernel/lib/ftrace.c \
   kernel/lib/ftrace_demo.c
 
