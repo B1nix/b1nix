@@ -286,7 +286,13 @@ int vfs_pidfd_open(usize pid, int flags) {
   if (!p)
     return -ENOMEM;
   p->pid = pid;
-  p->id = pidfd_alloc_id();
+  /* The identity of the PROCESS, not of this descriptor: two pidfds for one
+   * process must report the same inode, which is what a caller compares to
+   * decide the descriptor still names what it named before. The per-descriptor
+   * counter is the fallback for a task that has already gone. */
+  p->id = scheduler_task_pidfs_ino(pid);
+  if (!p->id)
+    p->id = pidfd_alloc_id();
 
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_PIDFD);
   if (!h) {
@@ -916,13 +922,35 @@ int vfs_epoll_ctl(int epfd, int op, int fd, struct b1nix_epoll_event *event) {
   while (__atomic_test_and_set(&ep->lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 
-  /* Find an existing registration for fd. */
+  /* Find an existing registration for fd.
+   *
+   * A registration is keyed by the descriptor AND the file behind it, as it is
+   * in Linux — not by the descriptor number alone. The number is reused the
+   * moment the program closes something, and a watch left over from the
+   * PREVIOUS occupant made the next EPOLL_CTL_ADD on that number answer
+   * EEXIST: systemd-udevd creates and closes descriptors while it builds its
+   * event loop, and died on "Failed to create SIGTERM event source: File
+   * exists" every single boot.
+   *
+   * A stale watch — same number, different file — is dropped here rather than
+   * reported. Closing the descriptor is what ended that registration; this is
+   * simply where the kernel notices, since nothing else holds a back-pointer
+   * from a handle to the epoll sets watching it. */
   int existing = -1, free_slot = -1;
   for (int i = 0; i < ep->capacity; i++) {
     if (ep->watch[i].used) {
       if (ep->watch[i].fd == fd) {
-        existing = i;
-        break;
+        if (ep->watch[i].file == th) {
+          existing = i;
+          break;
+        }
+        /* Stale: this number names something else now. */
+        if (ep->watch[i].file)
+          vfs_handle_release(ep->watch[i].file);
+        ep->watch[i].used = 0;
+        ep->watch[i].file = 0;
+        if (free_slot < 0)
+          free_slot = i;
       }
     } else if (free_slot < 0) {
       free_slot = i;

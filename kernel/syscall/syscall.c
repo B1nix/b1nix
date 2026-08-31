@@ -1504,14 +1504,27 @@ static isize sys_linux_utimensat(int dirfd, const char *user_path,
    * everything else on the machine. A daemon spinning is what an unimplemented
    * syscall looks like from the outside.
    */
-  if (!user_path) {
+  kpath[0] = '\0';
+  if (user_path && syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
+    return -EFAULT;
+
+  if (!user_path || kpath[0] == '\0') {
+    /* Both spellings of "the file this descriptor names": a null path, which
+     * is how a C library writes futimens(3), and an EMPTY path, which is how
+     * systemd writes it — utimensat(fd, "", ts, AT_EMPTY_PATH), because that
+     * form also works on an O_PATH descriptor.
+     *
+     * The empty one used to be treated as a relative path and joined onto the
+     * descriptor's own, producing "<file>/" — a trailing slash on a regular
+     * file, which resolves to ENOTDIR. systemd's touch() falls back to
+     * /proc/self/fd only on EINVAL, so it took the ENOTDIR at face value:
+     * systemd-udevd reported "Failed to touch /run/udev/queue: Not a
+     * directory" after every event it processed, and never finished a run. */
     if (vfs_fd_abspath(dirfd, resolved, sizeof(resolved)) < 0)
       return -EBADF;
   } else {
-    if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
-      return -EFAULT;
-    /* And a relative path against a directory descriptor, which is what the
-     * *at() family exists for -- it used to be EBADF. */
+    /* A relative path against a directory descriptor, which is what the *at()
+     * family exists for -- it used to be EBADF. */
     if (syscall_resolve_at(dirfd, kpath, resolved, sizeof(resolved)) < 0)
       return -EBADF;
   }
@@ -3550,6 +3563,10 @@ struct syscall_cmsghdr {
 #define K_SOL_SOCKET 1
 #define K_SCM_RIGHTS 1
 #define K_SCM_CREDENTIALS 2
+/* SCM_PIDFD (Linux 6.5): the sender's pidfd, delivered when the receiver set
+ * SO_PASSPIDFD. A pid can name a different process by the time it is read; a
+ * descriptor cannot, which is the whole reason this exists. */
+#define K_SCM_PIDFD 4
 #define K_SCM_TIMESTAMP 29
 #define K_SCM_TIMESTAMPNS 35
 #define K_MSG_CTRUNC 0x08
@@ -3863,6 +3880,37 @@ static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
       ctrunc = 1;
     }
   }
+  /* SCM_PIDFD: a descriptor for the process that sent this message. Attached
+   * only when the receiver asked (SO_PASSPIDFD) and only when the sender is
+   * known — which is the same information SCM_CREDENTIALS carries, so the two
+   * are decided together. It comes AFTER the credentials, as it does in Linux:
+   * a receiver walks the control messages in order and the order is part of
+   * what it expects. */
+  if (has_cred && cred.pid > 0 && vfs_socket_wants_peer_pidfd(fd)) {
+    int peer_fd = vfs_pidfd_open((usize)cred.pid, 0);
+
+    if (peer_fd >= 0) {
+      usize cmsg_len = header_space + sizeof(int);
+      usize space = header_space + K_CMSG_ALIGN(sizeof(int));
+
+      if (control_len + space <= msg.msg_controllen &&
+          control_len + space <= sizeof(control)) {
+        struct syscall_cmsghdr *c =
+            (struct syscall_cmsghdr *)(control + control_len);
+        c->cmsg_len = cmsg_len;
+        c->cmsg_level = K_SOL_SOCKET;
+        c->cmsg_type = K_SCM_PIDFD;
+        memcpy((u8 *)c + sizeof(*c), &peer_fd, sizeof(peer_fd));
+        control_len += space;
+      } else {
+        /* No room. The descriptor is closed rather than leaked, and the
+         * message is NOT marked truncated: SCM_PIDFD is an addition to what
+         * the receiver asked for, and a receiver that treats MSG_CTRUNC as a
+         * failure would drop a message it could otherwise read in full. */
+        vfs_close(peer_fd);
+      }
+    }
+  }
   if (control_len && syscall_copyout(msg.msg_control, control, control_len) < 0)
     return (u64)-EFAULT;
 
@@ -4037,14 +4085,45 @@ static u64 sys_getsockopt(int fd, int level, int optname, void *user_optval,
     return (u64)-EINVAL;
   if (socklen_copyin(&klen, user_optlen) != 0)
     return (u64)-EFAULT;
-  u8 kopt[64];
-  if (klen == 0 || klen > sizeof(kopt))
+  /* The caller's buffer size decides how much is copied back, and it is NOT
+   * bounded by what fits in a small kernel array: SO_PEERSEC takes a label
+   * buffer (dbus-broker passes 256 bytes) and SO_PEERGROUPS a group list. A
+   * fixed 64-byte scratch that answered EINVAL to anything larger refused
+   * those options before the option code ever saw them — dbus-broker read the
+   * EINVAL as fatal and the system bus never started.
+   *
+   * Bounded, because the size is the caller's to choose: a page is far beyond
+   * any option this kernel answers and keeps a bad value from asking for an
+   * arbitrary allocation. */
+  u8 kopt_stack[64];
+  u8 *kopt = kopt_stack;
+  u8 *kopt_heap = 0;
+
+  if (klen == 0)
     return (u64)-EINVAL;
+  if (klen > 4096)
+    return (u64)-EINVAL;
+  if (klen > sizeof(kopt_stack)) {
+    kopt_heap = kzalloc(klen);
+    if (!kopt_heap)
+      return (u64)-ENOMEM;
+    kopt = kopt_heap;
+  }
+
   int rc = vfs_getsockopt(fd, level, optname, kopt, &klen);
-  if (rc < 0)
+  if (rc < 0) {
+    /* ERANGE carries the size the option needs, and the caller reads it back
+     * from optlen to size a second call. */
+    if (rc == -ERANGE)
+      (void)socklen_copyout(user_optlen, klen);
+    kfree(kopt_heap);
     return (u64)rc;
-  if (user_optval && klen > 0 && syscall_copyout(user_optval, kopt, klen) < 0)
+  }
+  if (user_optval && klen > 0 && syscall_copyout(user_optval, kopt, klen) < 0) {
+    kfree(kopt_heap);
     return (u64)-EFAULT;
+  }
+  kfree(kopt_heap);
   if (socklen_copyout(user_optlen, klen) != 0)
     return (u64)-EFAULT;
   return 0;
@@ -5477,6 +5556,20 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
  * report what they wrote without each of them re-reading the command line. */
 static int g_trace_in_call;
 
+/* The syscall this CPU is currently executing, for diagnostics that fire deep
+ * below the dispatcher and need to name the caller. `b1nix.trace-fd` uses it:
+ * "descriptor 0 was taken" is half an answer, "close(2) took descriptor 0" is
+ * the whole one. Per-CPU rather than global so two CPUs in the kernel at once
+ * do not overwrite each other's answer. */
+static u64 g_current_syscall[MAX_CPUS];
+
+u64 syscall_current_number(void) {
+  struct percpu *p = get_percpu();
+  int cpu = p ? p->cpu_id : 0;
+
+  return (cpu >= 0 && cpu < MAX_CPUS) ? g_current_syscall[cpu] : 0;
+}
+
 int syscall_trace_active(void) { return g_trace_in_call; }
 
 static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
@@ -5579,6 +5672,15 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
 static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
                                    u64 arg3, u64 arg4, u64 arg5,
                                    struct interrupt_frame *frame) {
+  /* Which call this CPU is in, for diagnostics that fire far below here. */
+  {
+    struct percpu *pc = get_percpu();
+    int cpu = pc ? pc->cpu_id : 0;
+
+    if (cpu >= 0 && cpu < MAX_CPUS)
+      g_current_syscall[cpu] = number;
+  }
+
   /* M80: PTRACE_SYSCALL entry stop. The plain-load ptrace_any_traced() gate
    * keeps an untraced system at one memory read per syscall. A tracer that
    * rewrites registers during the stop is obeyed: the number and arguments are
@@ -5681,6 +5783,39 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
    * only when b1nix.sysprof asked for it. */
   u64 prof_t0 = syscall_prof_enabled() ? syscall_prof_now() : 0;
   u64 ret = syscall_dispatch_impl_inner(number, arg0, arg1, arg2, arg3, arg4, arg5, frame);
+
+  /* `b1nix.strace-pid=<pid>`: every call one task makes, with its arguments and
+   * its answer.
+   *
+   * The errno trace shows failures, which is the right default — but a failure
+   * is not always where a story goes wrong. A descriptor that a manager closes
+   * ITSELF, successfully, and then uses again is invisible to a trace of
+   * errors: every call in the sequence succeeded. This prints the successful
+   * ones too, for one task, which is the smallest instrument that can answer
+   * "what did it do just before". */
+  {
+    static u32 strace_pid = (u32)-1;
+
+    if (strace_pid == (u32)-1)
+      strace_pid = bootinfo_get_u32("b1nix.strace-pid", 0);
+    if (strace_pid && current_task && current_task->id == strace_pid) {
+      const char *nm = "";
+
+      if (current_task->user_image &&
+          ((struct user_loaded_image *)current_task->user_image)->personality ==
+              PERSONALITY_LINUX)
+        nm = linux_syscall_name(number);
+
+      char sl[224];
+      snprintf(sl, sizeof(sl),
+               "strace %u: %llu %s(0x%llx, 0x%llx, 0x%llx, 0x%llx) = %lld",
+               (unsigned)strace_pid, (unsigned long long)number, nm,
+               (unsigned long long)arg0, (unsigned long long)arg1,
+               (unsigned long long)arg2, (unsigned long long)arg3,
+               (long long)(isize)ret);
+      klog_info(sl);
+    }
+  }
   if (prof_t0)
     syscall_prof_account((u32)number, syscall_prof_now() - prof_t0);
   /* Which call answered a given errno, when a program reports one and does not
@@ -5806,10 +5941,16 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
         }
 
         char el[256];
-        char fdbuf[24];
+        char fdbuf[64];
         fdbuf[0] = '\0';
         if (ufd >= 0)
           snprintf(fdbuf, sizeof(fdbuf), " fd=%d", ufd);
+        /* For the socket-option calls, WHICH option is the entire question: a
+         * refusal names the syscall, and every socket option in the machine
+         * goes through the same one. */
+        if (number == 54 || number == 55)
+          snprintf(fdbuf, sizeof(fdbuf), " fd=%d level=%d optname=%d",
+                   (int)arg0, (int)arg1, (int)arg2);
         if (pbuf[0])
           snprintf(el, sizeof(el),
                    "errno %u from syscall %llu %s (pid %u)%s path=%s",
@@ -7315,10 +7456,35 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         u64 child_entry = frame ? frame->rip : child_sp;
         struct clone_user_regs uregs;
         clone_regs_from_frame(&uregs, frame);
-        return (u64)scheduler_clone_thread(flags, child_entry, child_sp, 0,
-                                           ca.tls, ca.child_tid, ca.parent_tid,
-                                           ca.child_tid, arg5,
-                                           frame ? &uregs : 0);
+        isize tkid = scheduler_clone_thread(flags, child_entry, child_sp, 0,
+                                            ca.tls, ca.child_tid, ca.parent_tid,
+                                            ca.child_tid, arg5,
+                                            frame ? &uregs : 0);
+
+        /* CLONE_PIDFD on THIS path too.
+         *
+         * The descriptor was written only where the child is made like a fork
+         * (no stack, no CLONE_VM). A caller that hands clone3 a stack — which
+         * is every posix_spawn, and so every service systemd 254+ starts —
+         * took this path instead and got NOTHING written, leaving its variable
+         * at whatever it was initialised to. systemd's was zero, so it went on
+         * to use descriptor 0 as the child's pidfd: ioctl(0, PIDFD_GET_INFO)
+         * answered ENOTTY ("Failed to spawn executor: Inappropriate ioctl for
+         * device"), and when it later released the pidref it closed descriptor
+         * 0 — /dev/null, its own stdin. Every open after that landed on 0, and
+         * the first fclose of a stream bound to it aborted PID 1 on
+         * `fclose_nointr(f) != -EBADF`. One unwritten descriptor, four
+         * symptoms, none of them near the cause. */
+        if ((ca.flags & LX_CLONE_PIDFD) && tkid > 0) {
+          int pfd = vfs_pidfd_open((usize)tkid, 0);
+          i32 pfd32 = pfd < 0 ? -1 : (i32)pfd;
+
+          if (syscall_copyout((void *)(usize)ca.pidfd, &pfd32,
+                              sizeof(pfd32)) < 0 &&
+              pfd >= 0)
+            vfs_close(pfd); /* the caller will never learn of it */
+        }
+        return (u64)tkid;
       }
       /* Linux clone(2) has a different argument layout than b1nix SYS_CLONE:
        *   Linux: clone(flags, user_stack, parent_tidptr, child_tidptr, tls)

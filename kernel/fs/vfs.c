@@ -4861,6 +4861,42 @@ int vfs_stat(const char *path, struct b1nix_stat *st) {
  * comparing f_type; an ENOSYS there sends it down the cgroup v1 path, which
  * this kernel does not have, and PID 1 freezes. Resolve the node's mount and
  * ask its root. */
+/* The magic number a filesystem type reports in statfs's f_type.
+ *
+ * These are the values in Linux's uapi/linux/magic.h, and they are an
+ * interface: callers switch on them. systemd asks what KIND of filesystem a
+ * descriptor is on far more often than it asks how full it is — whether a path
+ * is on a temporary filesystem, whether /proc really is procfs, whether the fd
+ * it was handed is a memfd. */
+static u64 fs_magic_for_type(const char *fstype) {
+  if (!fstype || !fstype[0])
+    return 0;
+  if (strcmp(fstype, "tmpfs") == 0 || strcmp(fstype, "ramfs") == 0 ||
+      strcmp(fstype, "devtmpfs") == 0 || strcmp(fstype, "shm") == 0)
+    return 0x01021994ull; /* TMPFS_MAGIC */
+  if (strcmp(fstype, "proc") == 0 || strcmp(fstype, "procfs") == 0)
+    return 0x9fa0ull; /* PROC_SUPER_MAGIC */
+  if (strcmp(fstype, "sysfs") == 0)
+    return 0x62656572ull;
+  if (strcmp(fstype, "cgroup2") == 0)
+    return 0x63677270ull;
+  if (strcmp(fstype, "devpts") == 0)
+    return 0x1cd1ull;
+  if (strcmp(fstype, "ext4") == 0 || strcmp(fstype, "ext2") == 0)
+    return 0xEF53ull;
+  if (strcmp(fstype, "vfat") == 0 || strcmp(fstype, "fat32") == 0)
+    return 0x4d44ull; /* MSDOS_SUPER_MAGIC */
+  if (strcmp(fstype, "iso9660") == 0)
+    return 0x9660ull;
+  if (strcmp(fstype, "btrfs") == 0)
+    return 0x9123683Eull;
+  if (strcmp(fstype, "ntfs") == 0)
+    return 0x5346544eull;
+  if (strcmp(fstype, "initramfs") == 0)
+    return 0x858458f6ull; /* RAMFS_MAGIC */
+  return 0;
+}
+
 static int vfs_statfs_node(struct vfs_node *node, struct b1nix_statfs *st) {
   if (node->inode->statfs_cb)
     return node->inode->statfs_cb(node, st);
@@ -4868,7 +4904,19 @@ static int vfs_statfs_node(struct vfs_node *node, struct b1nix_statfs *st) {
   if (mnt && mnt->root_node && mnt->root_node->inode &&
       mnt->root_node->inode->statfs_cb)
     return mnt->root_node->inode->statfs_cb(mnt->root_node, st);
-  return -ENOSYS;
+
+  /* No filesystem-specific answer. ENOSYS is the wrong one: it says "this
+   * kernel cannot statfs", which is false and which callers act on — systemd
+   * classifies a descriptor by its f_type and rejects one it cannot classify
+   * ("StandardOutputFileDescriptor passed is of incompatible type"). What IS
+   * known is which filesystem the node is on, so report that: the type, a
+   * block size, and zeroed counts, which is what Linux's pseudo filesystems
+   * report for themselves. */
+  memset(st, 0, sizeof(*st));
+  st->f_type = (i64)fs_magic_for_type(mnt ? mnt->fstype : 0);
+  st->f_bsize = 4096;
+  st->f_namelen = 255;
+  return 0;
 }
 
 int vfs_statfs(const char *path, struct b1nix_statfs *st) {
@@ -7901,6 +7949,42 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
   if (h && h->ops && h->ops->ioctl)
     return h->ops->ioctl(h, request, arg);
 
+  /* An anonymous object — a pidfd, eventfd, epoll set, signalfd — is a real
+   * descriptor with no node behind it. Falling through to the node lookup
+   * answered EBADF, which says "that is not a descriptor" about a descriptor
+   * the caller is holding. ENOTTY is the answer Linux gives for an ioctl a
+   * file does not implement, and callers are written for it: systemd probes a
+   * pidfd with PIDFD_GET_INFO and falls back to /proc when the kernel does not
+   * know it, but treats EBADF as its own bug — "Failed to spawn executor: Bad
+   * file descriptor", once per service. */
+  if (h && !h->node)
+    switch (h->kind) {
+    case VFS_HANDLE_PIDFD:
+    case VFS_HANDLE_FSCTX:
+    case VFS_HANDLE_MOUNTFD:
+    case VFS_HANDLE_EVENTFD:
+    case VFS_HANDLE_TIMERFD:
+    case VFS_HANDLE_SIGNALFD:
+    case VFS_HANDLE_EPOLL:
+    case VFS_HANDLE_INOTIFY:
+    /* A pipe answers ioctls it does not implement the same way, and isatty(3)
+     * IS such an ioctl: glibc reads ENOTTY as "not a terminal" and EBADF as
+     * "that descriptor is not open". systemd asserts on the difference —
+     * `errno != EBADF || IN_SET(fd, STDIN, STDOUT, STDERR)` in isatty_safe() —
+     * so a pipe handed to a service as stdio aborted the service the moment it
+     * asked whether it was a terminal. That is what killed every unit started
+     * with `systemd-run --pipe`. */
+    case VFS_HANDLE_PIPE_READ:
+    case VFS_HANDLE_PIPE_WRITE:
+      return -ENOTTY;
+    default:
+      /* Everything else with no node — a socket above all — has its own ioctl
+       * surface further down. Answering ENOTTY for the whole class swallowed
+       * every socket ioctl in the machine, which dbus-broker reported as
+       * "Inappropriate ioctl for device" from its write path. */
+      break;
+    }
+
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
@@ -8639,8 +8723,43 @@ int vfs_fstatfs(int fd, struct b1nix_statfs *st) {
   struct vfs_handle *handle = get_handle(fd);
   if (!handle || !handle->used)
     return -EBADF;
-  if (handle->kind != VFS_HANDLE_NODE || !handle->node)
-    return -EINVAL;
+
+  /* A descriptor with no node is still ON a filesystem in Linux's model: a
+   * pipe lives on pipefs, a socket on sockfs, an anonymous object on
+   * anon_inodefs, and each reports its own magic. Callers CHECK that magic —
+   * systemd-run --pipe hands PID 1 a pipe and systemd verifies what it was
+   * given ("StandardOutputFileDescriptor passed is of incompatible type"), so
+   * an EINVAL here reads as "that is not the kind of thing you claimed". */
+  if (handle->kind != VFS_HANDLE_NODE || !handle->node) {
+    u64 magic;
+
+    switch (handle->kind) {
+    case VFS_HANDLE_PIPE_READ:
+    case VFS_HANDLE_PIPE_WRITE:
+      magic = 0x50495045ull; /* PIPEFS_MAGIC */
+      break;
+    case VFS_HANDLE_SOCKET:
+      magic = 0x534F434Bull; /* SOCKFS_MAGIC */
+      break;
+    case VFS_HANDLE_EVENTFD:
+    case VFS_HANDLE_TIMERFD:
+    case VFS_HANDLE_SIGNALFD:
+    case VFS_HANDLE_EPOLL:
+    case VFS_HANDLE_INOTIFY:
+    case VFS_HANDLE_PIDFD:
+    case VFS_HANDLE_FSCTX:
+    case VFS_HANDLE_MOUNTFD:
+      magic = 0x09041934ull; /* ANON_INODE_FS_MAGIC */
+      break;
+    default:
+      return -EINVAL;
+    }
+    memset(st, 0, sizeof(*st));
+    st->f_type = (i64)magic;
+    st->f_bsize = 4096;
+    st->f_namelen = 255;
+    return 0;
+  }
 
   return vfs_statfs_node(handle->node, st);
 }
@@ -8727,8 +8846,14 @@ static u64 mount_attr_to_ms(u64 attr) {
   return ms;
 }
 
-/* Claim a slot and build its private directory. Returns the id or -errno. */
-static int detached_claim(char *path_out, usize path_len) {
+/* Claim a slot and build the private place its mount will sit on.
+ *
+ * A mount point has to be the same KIND as what is mounted on it, and a
+ * detached bind of a FILE is ordinary: `ReadOnlyPaths=` and
+ * `ProtectKernelTunables=` are files bound over files, and systemd clones
+ * /proc/sys/kernel/domainname exactly that way. So the private place is a
+ * directory or an empty file depending on what is going onto it. */
+static int detached_claim(char *path_out, usize path_len, int as_dir) {
   detached_acquire();
   int id = -1;
   for (int i = 0; i < MAX_DETACHED_MOUNTS; i++) {
@@ -8749,7 +8874,7 @@ static int detached_claim(char *path_out, usize path_len) {
 
   char path[VFS_MAX_PATH];
   snprintf(path, sizeof(path), "%s/%d", DETACHED_MOUNT_DIR, id);
-  int rc = vfs_mkdir(path, 0700);
+  int rc = as_dir ? vfs_mkdir(path, 0700) : vfs_create(path, 0600);
   if (rc < 0 && rc != -EEXIST) {
     detached_acquire();
     detached_mounts[id].used = 0;
@@ -8776,7 +8901,9 @@ static void detached_free_slot(int id) {
   copy_path(path, sizeof(path), detached_mounts[id].path);
   detached_mounts[id].used = 0;
   detached_release_lock();
-  (void)vfs_rmdir(path);
+  /* Whichever kind it was created as — one of the two removes it. */
+  if (vfs_rmdir(path) < 0)
+    (void)vfs_unlink(path);
 }
 
 int vfs_detached_create(const char *fstype, const char *source, u64 flags) {
@@ -8784,7 +8911,7 @@ int vfs_detached_create(const char *fstype, const char *source, u64 flags) {
     return -EINVAL;
 
   char path[VFS_MAX_PATH];
-  int id = detached_claim(path, sizeof(path));
+  int id = detached_claim(path, sizeof(path), 1); /* a filesystem needs a dir */
   if (id < 0)
     return id;
 
@@ -8842,8 +8969,24 @@ int vfs_detached_clone_path(const char *path, int recursive) {
       return -EOPNOTSUPP;
   }
 
+  /* The private place must be the same kind as what is going onto it. A file
+   * is the common case here, not an exotic one: every ReadOnlyPaths= and
+   * ProtectKernelTunables= entry is a file bound over a file, and requiring a
+   * directory answered ENOTDIR to systemd's clone of
+   * /proc/sys/kernel/domainname — which failed the NAMESPACE step and with it
+   * udevd, logind and everything that waits on them. */
+  int src_is_dir;
+  {
+    struct vfs_node *node = vfs_find_node(path);
+
+    if (IS_ERR(node))
+      return (int)PTR_ERR(node);
+    src_is_dir = node->inode->type == VFS_DIRECTORY;
+    vfs_node_put(node);
+  }
+
   char hidden[VFS_MAX_PATH];
-  int id = detached_claim(hidden, sizeof(hidden));
+  int id = detached_claim(hidden, sizeof(hidden), src_is_dir);
   if (id < 0)
     return id;
 
@@ -8966,10 +9109,41 @@ int vfs_mount_setattr_path(const char *path, u64 attr_set, u64 attr_clr,
     mounts[i].flags &= ~clr;
     touched = 1;
   }
+
+  /* Nothing is mounted AT this path. Linux applies the attributes to the mount
+   * the path is ON, and callers depend on it: systemd seals a unit's /dev with
+   * mount_setattr after building it, and refusing that with EINVAL failed the
+   * NAMESPACE step for every service with PrivateDevices= — dbus-broker among
+   * them, which took the whole system bus with it.
+   *
+   * The mount a path is on is the one whose target is its longest prefix. */
+  if (!touched) {
+    isize best = -1;
+    usize best_len = 0;
+
+    for (usize i = 0; i < mount_hwm; i++) {
+      if (!mount_visible(i))
+        continue;
+      if (!path_is_under(canon, mounts[i].target))
+        continue;
+
+      usize len = strlen(mounts[i].target);
+
+      /* Later mount wins a tie: it is the one stacked on top, and therefore
+       * the one a walk to this path arrives at. */
+      if (best < 0 || len > best_len ||
+          (len == best_len && mounts[i].seq > mounts[best].seq)) {
+        best = (isize)i;
+        best_len = len;
+      }
+    }
+    if (best >= 0) {
+      mounts[best].flags |= set;
+      mounts[best].flags &= ~clr;
+      touched = 1;
+    }
+  }
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
-  /* Nothing is mounted at this path. Linux applies the attributes to the mount
-   * the path is ON in that case; b1nix has no per-path attribute store, so
-   * saying so is better than reporting a change that did not happen. */
   return touched ? 0 : -EINVAL;
 }

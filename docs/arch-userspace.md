@@ -27,10 +27,12 @@ systemd-journald.service: Failed at step CREDENTIALS spawning \
     /usr/lib/systemd/systemd-journald: Function not implemented
 ```
 
-**`tests/arch-smoke.sh` does not pass yet.** Of its 33 checks two are green
-(the kernel builds; no panic). The mount API that used to stop the boot is
-implemented and journald now starts; what ends the run is a separate PID 1
-abort, described in [Where it stops](#where-it-stops).
+**`tests/arch-smoke.sh` passes all 33 checks.** The boot reaches
+`multi-user.target` and `graphical.target`; journald, udevd, logind, the system
+bus, socket activation, timers, `Restart=`, the notify protocol, `PrivateTmp=`,
+`ProtectSystem=strict`, device units, transient units and the console getty all
+work. A stock Arch userspace with systemd 261 on glibc 2.44 runs on this
+kernel.
 
 One measurement worth recording because it is better than the one above and was
 not reproduced: on an intermediate tree — after ambient capabilities and
@@ -325,23 +327,51 @@ options at all. An implementation that accepts everything tells it the wrong
 thing about every option afterwards, so an unknown parameter is EINVAL here and
 only a filesystem's own hints (`size`, `mode`, `nr_inodes`, …) are accepted.
 
+### PID 1's standard descriptors
+
+Found while chasing the abort below, and a real difference from Linux rather
+than a systemd quirk: **b1nix started its first process with an empty
+descriptor table.** Linux's `kernel_init` opens `/dev/console` and dups it onto
+0, 1 and 2, and every process inherits its stdio from there.
+
+The consequence is not "no output". A manager's stdio `FILE*` refers to
+descriptor 0 whether or not anything is open on it, so the first transient
+descriptor the process opens lands ON 0 — the `b1nix.trace-fd=0` trace shows
+every `openat` in PID 1 returning 0, over and over — and the next `close(2)` of
+that transient silently closes what libc still calls stdin.
+
+PID 1 now gets `/dev/console` on 0, 1 and 2. The trace confirms it arrives:
+systemd's first act on descriptor 0 is a `dup2` over it, which is what a
+manager does with a console it has been given.
+
 ### What stops the boot now
 
-PID 1 aborts, and it is not the mount API — the same abort is in the *baseline*
-log from before this work:
+Nothing. The boot completes and every check passes.
 
-```
-Assertion 'fclose_nointr(f) != -EBADF' failed at src/basic/fd-util.c:133
-```
+### How the boot got the rest of the way
 
-`close(2)` answered EBADF for a descriptor systemd believes it holds. The
-errno trace shows `waitid` (247) returning EBADF in PID 1 shortly before it,
-which points at the pidfd path — a pidfd whose process has been reaped, or a
-descriptor closed under the manager's feet. That is the next thing to chase.
+Each of these was found by following one error at a time, and none of them is
+guessable from the specification:
 
-Two smaller items in the same log, neither a kernel defect:
-`tmp.mount` fails because the image has no `/usr/bin/mount`, and three
-syscalls are still absent — `openat2` (437), `keyctl` (250) and `bpf` (321).
+| What systemd reported | What it actually was |
+|---|---|
+| `Failed to spawn executor: Inappropriate ioctl for device` | clone3 wrote the CLONE_PIDFD descriptor only on its fork-like path, so a posix_spawn (which passes a stack) got nothing written and systemd used descriptor 0 — its own stdin — as the child's pidfd |
+| `... Bad file descriptor` | ioctl on an anonymous object answered EBADF, which says "that is not a descriptor" about one the caller holds |
+| `... Object is remote` | a pidfd's inode numbered the DESCRIPTOR; on Linux it identifies the PROCESS, so two pidfds for one process compare equal |
+| `Failed to set up mount namespacing: /proc/sys/kernel/domainname: Not a directory` | open_tree forced O_DIRECTORY; a file is the ordinary case, since every ReadOnlyPaths= entry is a file bound over a file |
+| `Failed to set up mount namespacing: /dev: Invalid argument` | mount_setattr on a path that is not a mount root refused, where Linux applies the attributes to the mount the path is ON |
+| `Failed to create SIGTERM event source: File exists` | an epoll registration was keyed by descriptor NUMBER rather than by the file behind it, so a watch left by a closed descriptor blocked the next one to reuse the number |
+| `ERROR sockopt_get_peersec: Invalid argument` | getsockopt's kernel buffer was a fixed 64 bytes; anything larger was refused before the option code ran |
+| `ERROR socket_dispatch_write: Inappropriate ioctl for device` | SIOCOUTQ was unimplemented, and dbus-broker asks on every write |
+| `StandardOutputFileDescriptor passed is of incompatible type` | fcntl(F_GETFL) reported O_RDONLY for BOTH ends of a pipe, so a pipe handed over as stdout read as unwritable |
+| `Failed to touch /run/udev/queue: Not a directory` | `utimensat(fd, "", AT_EMPTY_PATH)` — how systemd spells futimens on an O_PATH descriptor — was treated as a relative path and joined onto the file's own, producing a trailing slash. udevd hit it after every event and never finished a run, which is why no `.device` unit ever appeared |
+| `Assertion 'errno != EBADF \|\| IN_SET(fd, STDIN, STDOUT, STDERR)' failed ... isatty_safe()` | ioctl on a PIPE answered EBADF, and isatty(3) is an ioctl. glibc reads ENOTTY as "not a terminal" and EBADF as "that descriptor is not open"; systemd asserts on the difference, so a pipe handed to a service as its stdio aborted the service the moment it asked whether it was a terminal. Every unit started with `systemd-run --pipe` died on it |
+
+The descriptor relay behind the last one is worth recording because it was
+cleared as a suspect rather than guessed at: `b1nix.trace-scm` showed
+`systemd-run` sending three descriptors, dbus-broker receiving and installing
+three, and PID 1 receiving and installing three. The passing worked; the
+service died after it had them.
 
 ## Open
 

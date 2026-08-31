@@ -388,6 +388,18 @@ static u64   g_task_cstime_ns[MAX_TASKS];
 /* Scheduler tick at which the slot's current occupant was created — /proc's
  * starttime field, and the base for a task's wall-clock age. */
 static u64   g_task_start_tick[MAX_TASKS];
+
+/* The number a pidfd reports as its inode.
+ *
+ * On Linux this is a pidfs inode: it identifies the PROCESS, so two pidfds for
+ * the same process share it and a recycled pid never reuses it. b1nix gave
+ * each DESCRIPTOR its own number, which is a different claim — systemd takes
+ * a pidfd, records the number, opens the process again later and compares, and
+ * concluded every time that the descriptor now referred to something else
+ * ("Failed to spawn executor: Object is remote", EREMOTE from
+ * pidref_verify()). Assigned per task at creation and never reused. */
+static u64   g_task_pidfs_ino[MAX_TASKS];
+static u64   g_pidfs_ino_next = 1;
 /* Context-switch counts: voluntary (the task blocked/slept/exited of its own
  * accord) and involuntary (it was still runnable when preempted). getrusage's
  * ru_nvcsw/ru_nivcsw. */
@@ -723,6 +735,7 @@ static struct task *find_unused_task(void) {
       g_task_cutime_ns[i] = 0;
       g_task_cstime_ns[i] = 0;
       g_task_start_tick[i] = scheduler_ticks;
+      g_task_pidfs_ino[i] = g_pidfs_ino_next++;
       g_task_nvcsw[i] = 0;
       g_task_nivcsw[i] = 0;
       g_task_gone_utime_ns[i] = 0;
@@ -779,6 +792,7 @@ static struct task *find_unused_task(void) {
   g_task_cutime_ns[i] = 0;
   g_task_cstime_ns[i] = 0;
   g_task_start_tick[i] = scheduler_ticks;
+  g_task_pidfs_ino[i] = g_pidfs_ino_next++;
   g_task_nvcsw[i] = 0;
   g_task_nivcsw[i] = 0;
   g_task_gone_utime_ns[i] = 0;
@@ -2344,6 +2358,15 @@ u64 task_cutime(const struct task *t) {
 u64 task_cstime(const struct task *t) {
   return task_cstime_ns(t) / NS_PER_USER_TICK;
 }
+/* The pidfs inode for a pid: the same number for every pidfd that names this
+ * process, and never issued again once the process is gone. Zero when there is
+ * no such task. */
+u64 scheduler_task_pidfs_ino(usize pid) {
+  struct task *t = scheduler_task_by_pid(pid);
+
+  return t ? g_task_pidfs_ino[task_index(t)] : 0;
+}
+
 u64 task_start_ticks(const struct task *t) {
   if (!t) return 0;
   return g_task_start_tick[task_index(t)];
@@ -5963,6 +5986,62 @@ usize sched_fd_limit(void) {
   return cached;
 }
 
+/* `b1nix.trace-fd=<n>`: report every task that installs or removes descriptor
+ * <n>, with the pid.
+ *
+ * "A descriptor the caller believes it holds is not in its table" is a whole
+ * class of bug — systemd aborts on it (`fclose_nointr(f) != -EBADF`) and the
+ * failing call names the syscall, not the moment the descriptor went away. The
+ * moment is what is missing, so this reports it: the trace shows who took the
+ * slot and who gave it back, in order. Off unless the flag is given. */
+static int fd_trace_target(void) {
+  static int target = -2; /* -2 = not read yet, -1 = off */
+
+  if (target == -2) {
+    u32 v = bootinfo_get_u32("b1nix.trace-fd", (u32)-1);
+    target = (v == (u32)-1) ? -1 : (int)v;
+  }
+  return target;
+}
+
+static void fd_trace(const char *what, int fd, const void *handle) {
+  if (fd != fd_trace_target())
+    return;
+
+  extern u64 syscall_current_number(void);
+  /* What the descriptor refers to, not just that it moved. "descriptor 0 was
+   * closed" and "the machine's /dev/null was closed" are different findings,
+   * and only the second one says whether a kernel replaced a descriptor behind
+   * the caller's back. */
+  const struct vfs_handle *h = handle;
+  const char *what_it_is = "?";
+
+  if (h) {
+    if (h->node && h->node->name[0])
+      what_it_is = h->node->name;
+    else
+      switch (h->kind) {
+      case VFS_HANDLE_PIPE_READ:  what_it_is = "pipe:r"; break;
+      case VFS_HANDLE_PIPE_WRITE: what_it_is = "pipe:w"; break;
+      case VFS_HANDLE_SOCKET:     what_it_is = "socket"; break;
+      case VFS_HANDLE_EPOLL:      what_it_is = "epoll"; break;
+      case VFS_HANDLE_SIGNALFD:   what_it_is = "signalfd"; break;
+      case VFS_HANDLE_TIMERFD:    what_it_is = "timerfd"; break;
+      case VFS_HANDLE_EVENTFD:    what_it_is = "eventfd"; break;
+      case VFS_HANDLE_INOTIFY:    what_it_is = "inotify"; break;
+      case VFS_HANDLE_PIDFD:      what_it_is = "pidfd"; break;
+      default:                    what_it_is = "anon"; break;
+      }
+  }
+
+  char line[200];
+  snprintf(line, sizeof(line),
+           "fd-trace: %s fd=%d pid=%u syscall=%llu handle=%p (%s)", what, fd,
+           (unsigned)(current_task ? current_task->id : 0),
+           (unsigned long long)syscall_current_number(), handle, what_it_is);
+  klog_info(line);
+}
+
 int scheduler_fd_alloc(struct vfs_handle *handle) {
   if (!current_task || !handle)
     return -1;
@@ -5981,6 +6060,7 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
       current_task->fd_table[i] = handle;
       current_task->fd_flags[i] = 0;
       fd_lock_release();
+      fd_trace("alloc", (int)i, handle);
       return (int)i;
     }
   }
@@ -6082,6 +6162,7 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
 
   current_task->fd_table[fd] = handle;
   current_task->fd_flags[fd] = 0;
+  fd_trace("set", fd, handle);
   fd_lock_release();
   return fd;
 }
@@ -6093,6 +6174,7 @@ int scheduler_fd_close(int fd) {
   current_task->fd_table[fd] = 0;
   current_task->fd_flags[fd] = 0;
   fd_lock_release();
+  fd_trace("close", fd, 0);
   return 0;
 }
 
@@ -6108,6 +6190,8 @@ struct vfs_handle *scheduler_fd_take(int fd) {
   current_task->fd_table[fd] = 0;
   current_task->fd_flags[fd] = 0;
   fd_lock_release();
+  if (h)
+    fd_trace("take", fd, h);
   return h;
 }
 

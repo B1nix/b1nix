@@ -202,6 +202,14 @@ void vfs_pipe_init_handle(struct vfs_handle *h, struct vfs_pipe *pipe, int is_wr
   h->private_data = pipe;
   h->ops = is_write ? &pipe_write_ops : &pipe_read_ops;
   h->kind = is_write ? VFS_HANDLE_PIPE_WRITE : VFS_HANDLE_PIPE_READ;
+  /* The access mode, because F_GETFL is asked and the answer is acted on: a
+   * pipe end is read-only or write-only, never both. Leaving it zero made
+   * fcntl(F_GETFL) report O_RDONLY for BOTH ends, and systemd — handed a pipe
+   * by `systemd-run --pipe` — read that as a stdout it cannot write to and
+   * refused the unit ("StandardOutputFileDescriptor passed is of incompatible
+   * type"). The flag word is otherwise preserved, so O_NONBLOCK set later is
+   * unaffected. */
+  h->flags = (h->flags & ~(int)3) | (is_write ? B1NIX_O_WRONLY : B1NIX_O_RDONLY);
 }
 
 /* Atomically find a free pipes[] slot and CLAIM it before releasing the pool

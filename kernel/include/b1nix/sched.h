@@ -835,3 +835,5 @@ void sched_nice_selftest(void);
 
 
 #endif
+
+u64 scheduler_task_pidfs_ino(usize pid);

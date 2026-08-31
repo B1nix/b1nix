@@ -735,6 +735,10 @@ struct b1nix_ucred {
 isize vfs_socket_sendmsg(int fd, const void *buf, usize len, int flags,
                          struct vfs_handle **handles, usize nhandles,
                          const struct b1nix_ucred *cred);
+/* True when SO_PASSPIDFD is set on this AF_UNIX socket, so recvmsg should
+ * attach the sender's pidfd as SCM_PIDFD. */
+int vfs_socket_wants_peer_pidfd(int fd);
+
 isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
                          int *received_fds, usize fd_capacity,
                          usize *received_count, struct b1nix_ucred *cred,
@@ -945,6 +949,22 @@ struct vfs_socket_state {
   int so_timestamp;
   int so_timestampns;
   int so_passsec;
+  /* SO_PASSPIDFD: attach the SENDER's pidfd to each received message as
+   * SCM_PIDFD. A receiver uses it to identify who is on the other end in a way
+   * a pid cannot promise — the pid may already name a different process by the
+   * time it is read, and the descriptor cannot. systemd 254+ and dbus-broker
+   * ask for it on every bus socket. */
+  int so_passpidfd;
+  /* SO_PASSRIGHTS, stored INVERTED: nonzero means the socket refuses
+   * descriptors. Linux defaults the option ON, and a receiver clears it to say
+   * "never hand me descriptors" — a hardening measure, since SCM_RIGHTS on a
+   * socket that did not expect it is how a confused deputy is built.
+   *
+   * Inverted so that a zero-initialised socket accepts descriptors no matter
+   * which path created it. Storing it the other way round meant every creation
+   * path had to remember to set the default, and socketpair(2) and accept(2)
+   * did not: every SCM_RIGHTS in the machine was silently discarded. */
+  int so_no_passrights;
   /* SO_ATTACH_FILTER: a classic-BPF program run over every datagram before it
    * is queued (struct sock_filter_prog *, kmalloc'd, freed on close). NULL is
    * an unfiltered socket, which is what one starts as. */

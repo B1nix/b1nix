@@ -2066,12 +2066,52 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   return 0; // Should not reach here
 }
 
+/* PID 1's standard descriptors.
+ *
+ * Linux's kernel_init opens /dev/console and dups it onto 0, 1 and 2 before
+ * handing control to init, and every process on the machine inherits its stdio
+ * from there. b1nix started its first process with an EMPTY descriptor table,
+ * which is not a small difference:
+ *
+ *   - a manager's stdio FILE* refers to descriptor 0 whether or not anything
+ *     is open on it, so the first transient descriptor the process opens LANDS
+ *     ON 0 and the next close(2) of that transient silently closes "stdin";
+ *   - systemd asserts on exactly that (`fclose_nointr(f) != -EBADF` in
+ *     safe_fclose) and PID 1 aborts, which ends the boot. Arch's systemd 261
+ *     died there; Debian's 252 happened not to reach the same call.
+ *
+ * Failure is not fatal, for the same reason it is not fatal in Linux: a
+ * machine whose console cannot be opened should still get to run init and say
+ * so. */
+static void init_open_console_stdio(void) {
+  if (!current_task || task_tgid(current_task) != 1)
+    return; /* only the init process; everyone else inherits */
+  if (scheduler_fd_get(0) || scheduler_fd_get(1) || scheduler_fd_get(2))
+    return; /* already set up */
+
+  int fd = vfs_open_flags("/dev/console", B1NIX_O_RDWR);
+  if (fd < 0) {
+    console_write("init: /dev/console could not be opened for stdio\n");
+    return;
+  }
+  /* The table is empty, so the open landed on 0; 1 and 2 follow from it. If it
+   * did not, say so rather than leaving a half-built stdio behind. */
+  if (fd != 0) {
+    console_write("init: console did not land on descriptor 0\n");
+    vfs_close(fd);
+    return;
+  }
+  if (vfs_dup2(0, 1) < 0 || vfs_dup2(0, 2) < 0)
+    console_write("init: stdout/stderr could not be duplicated from console\n");
+}
+
 static void user_process_thread(void *arg) {
   struct process_start *start = arg;
   struct user_loaded_image *image = start ? start->image : 0;
 
   scheduler_set_user_image(image);
   kfree(start);
+  init_open_console_stdio();
 
   int code = 0;
   /* All user programs are Ring 3 ELFs — no built-in fallback path remains. */

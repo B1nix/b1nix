@@ -386,9 +386,14 @@ int vfs_open_tree(const char *path, u32 flags) {
     return -EINVAL;
 
   /* Without OPEN_TREE_CLONE the call is a path-reference descriptor — exactly
-   * open(O_PATH), which this kernel already has. */
+   * open(O_PATH), which this kernel already has. NOT O_DIRECTORY: open_tree
+   * names whatever the path names, and a file is the ordinary case here —
+   * every ReadOnlyPaths= and ProtectKernelTunables= entry is a file. Forcing
+   * the flag answered ENOTDIR for /proc/sys/kernel/domainname, which failed
+   * systemd's NAMESPACE step and with it udevd, logind and everything waiting
+   * on them. */
   if (!(flags & OPEN_TREE_CLONE))
-    return vfs_open_flags(path, B1NIX_O_PATH | B1NIX_O_DIRECTORY);
+    return vfs_open_flags(path, B1NIX_O_PATH);
 
   int id = vfs_detached_clone_path(path, (flags & AT_RECURSIVE) ? 1 : 0);
   if (id < 0)
