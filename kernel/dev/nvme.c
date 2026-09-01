@@ -321,6 +321,43 @@ static int nvme_create_io_sq(struct nvme_device *dev)
  * guest watchdog, tell them apart. */
 u64 g_nvme_io_submits;
 u64 g_nvme_io_completions;
+u64 g_nvme_wait_start_tick; /* tick the in-flight command's wait began, 0 = idle */
+
+/* Controller and queue state, printed by the guest watchdog.
+ *
+ * The in-loop deadline report inside nvme_io_submit does not appear in the log
+ * even when a command has been outstanding for a minute, and the reason for
+ * that is itself unknown -- so this asks the same questions from a print path
+ * that provably works. */
+void nvme_debug_dump(void)
+{
+	struct nvme_device *dev = &nvme;
+
+	if (!dev->regs)
+		return;
+	console_write("  nvme: csts=0x");
+	console_write_hex32(dev->regs->csts);
+	console_write(" sq_tail=");
+	console_write_dec(dev->io_sq_tail);
+	console_write(" cq_head=");
+	console_write_dec(dev->io_cq_head);
+	console_write(" irq_hits=");
+	console_write_dec(dev->irq_hits);
+	console_write(" msix=");
+	console_write_dec((u64)dev->use_msix);
+	console_write(" busy=");
+	console_write_dec((u64)dev->io_busy);
+	console_write(" wait_since_tick=");
+	console_write_dec(g_nvme_wait_start_tick);
+	console_write(" now=");
+	console_write_dec(scheduler_get_uptime_ticks());
+	console_write("\n  nvme cq[0..7]:");
+	for (u16 q = 0; q < dev->queue_size && q < 8; q++) {
+		console_write(" 0x");
+		console_write_hex32(dev->io_cq[q].status);
+	}
+	console_write("\n");
+}
 
 static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
 {
@@ -348,6 +385,8 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     u64 wait_start_tick = scheduler_get_uptime_ticks();
     int reported = 0;
 
+    g_nvme_wait_start_tick = wait_start_tick;
+
     __atomic_fetch_add(&g_nvme_io_submits, 1, __ATOMIC_RELAXED);
     for (;;) {
         u16 cq_head = dev->io_cq_head;
@@ -371,6 +410,7 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
                 dev->regs->intmc = (1u << 0); // re-enable vector 0 for the next I/O
 
             __atomic_fetch_add(&g_nvme_io_completions, 1, __ATOMIC_RELAXED);
+            g_nvme_wait_start_tick = 0;
             if ((status & 0xFFFE) != 0) {
                 console_write("nvme: io cmd error status=0x");
                 console_write_hex32(status);
@@ -416,6 +456,23 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
             if (!reported &&
                 scheduler_get_uptime_ticks() - wait_start_tick > 500 /* 5 s */) {
                 reported = 1;
+                /* Re-ring the submission doorbell before reporting.
+                 *
+                 * A doorbell write is idempotent: it tells the controller where
+                 * the producer index is, so writing the same tail again is a
+                 * no-op for a controller that already saw it and a wake-up for
+                 * one that did not. The failure being recovered from here is a
+                 * command that was submitted and never completed, with the
+                 * queue serialised so nothing else can be in flight -- a
+                 * missed doorbell is the one explanation that leaves the CQ
+                 * empty and the controller idle rather than faulted. Costs one
+                 * MMIO write, five seconds into a wait that would otherwise
+                 * never end. */
+                {
+                    volatile u32 *sq_again = nvme_doorbell(dev, 1, 0);
+                    __sync_synchronize();
+                    *sq_again = dev->io_sq_tail;
+                }
                 nvme_wait_note("io");
                 {
                     u16 last = (u16)((dev->io_sq_tail + dev->queue_size - 1) %

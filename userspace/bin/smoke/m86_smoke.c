@@ -124,7 +124,7 @@ static void burn_ms(int ms) {
 
   clock_gettime(CLOCK_MONOTONIC, &wall0);
   long long last_cpu = cpu0;
-  long long last_progress_ms = 0;
+  int advanced = 0;
   for (;;) {
     for (int i = 0; i < 200000; i++)
       acc = acc * 1103515245UL + 12345UL;
@@ -153,10 +153,18 @@ static void burn_ms(int ms) {
      * test wanted 150. As long as the clock advances, keep burning. */
     if (cpu > last_cpu) {
       last_cpu = cpu;
-      last_progress_ms = wall;
-    } else if (wall - last_progress_ms > 5000) {
-      return; /* no advance in five seconds of wall time: the clock is broken */
+      advanced = 1;
     }
+    /* "Broken" means the thread clock NEVER advances, not that it advances
+     * slowly. Both threads in this test burn at once, so on one vCPU under host
+     * contention either of them can go many seconds without being scheduled --
+     * and a 5 s no-progress rule cut the sibling's burn short, leaving the
+     * caller to measure the shortfall (25 ms of sibling time where the test
+     * wanted 150). Once the clock has moved at all it is working; keep burning
+     * until the target, under a generous absolute ceiling so a wedge is still
+     * bounded. */
+    if ((!advanced && wall > 10000) || wall > 60000)
+      return;
   }
 }
 

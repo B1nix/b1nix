@@ -4783,6 +4783,10 @@ static void serial_silence_watchdog(void) {
     console_write(" completions=");
     console_write_dec(g_nvme_io_completions);
     console_write("\n");
+    if (g_nvme_io_submits != g_nvme_io_completions) {
+      extern void nvme_debug_dump(void);
+      nvme_debug_dump();
+    }
   }
   console_write("SMOKE-GUEST-WATCHDOG: alive tasks (pid state chan comm):\n");
   for (usize i = 0; i < g_task_hwm; i++) {
