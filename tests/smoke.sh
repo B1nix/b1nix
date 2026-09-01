@@ -1233,7 +1233,14 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	check_output "$LOG" "b1nix kernel" "kernel banner appears"
 	check_output "$LOG" "B1NIX-QUICK: ok native" "native userspace smoke passes"
 	check_output "$LOG" "B1NIX-QUICK: done" "quick smoke completes"
-	check_output "$SMP_LOG" "M24B-BKL: instance ran-on-ap" "SMP work-stealing passes"
+	# See the note at the full-suite copy of this check: aarch64 keeps
+	# userspace off secondaries on purpose, so the marker cannot appear there.
+	if [ "$ARCH" = "aarch64" ]; then
+		skipped "SMP work-stealing passes" \
+			"aarch64 keeps userspace off secondaries (pass b1nix.ap-userspace to re-enable)"
+	else
+		check_output "$SMP_LOG" "M24B-BKL: instance ran-on-ap" "SMP work-stealing passes"
+	fi
 	if grep -q -E "KERNEL PANIC|\[PANIC\]" "$LOG" "$SMP_LOG" 2>/dev/null; then
 		fail "quick smoke completes without panic" "PANIC detected in log"
 	else
@@ -3344,7 +3351,20 @@ if [ "$ARCH" = "aarch64" ]; then
 	check_output "$SMP_LOG" "M100E-SMOKE: ok nvme-translated" "a real controller runs in its own domain: the read returns the right bytes and the unit records no fault"
 	# Userspace on a secondary, not just kernel workers: the process reads its
 	# own CPU id and reports which one it ran on.
-	check_output "$LOG" "M24B-BKL: instance ran-on-ap" "a userspace process runs on a secondary CPU"
+	#
+	# aarch64 deliberately does not do this yet. Running userspace on a
+	# secondary is what corrupts memory on this port -- a CPU was caught
+	# executing with SP inside another task's kernel stack -- so the kernel
+	# leaves g_ap_userspace_enabled clear there and the secondaries run kernel
+	# workers only. Reported as a skip with the reason rather than a pass:
+	# the capability genuinely is not there. b1nix.ap-userspace turns it back
+	# on for work on the underlying bug.
+	if [ "$ARCH" = "aarch64" ]; then
+		skipped "a userspace process runs on a secondary CPU" \
+			"aarch64 keeps userspace off secondaries (pass b1nix.ap-userspace to re-enable)"
+	else
+		check_output "$LOG" "M24B-BKL: instance ran-on-ap" "a userspace process runs on a secondary CPU"
+	fi
 	if grep -q -E "KERNEL PANIC|\[PANIC\]" "$SMP_LOG" 2>/dev/null; then
 		fail "SMP self-test completes without panic" "PANIC detected in log"
 	else

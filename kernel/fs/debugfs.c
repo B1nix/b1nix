@@ -147,11 +147,42 @@ static isize debugfs_vfs_mounts_read(struct vfs_node *node, u64 offset,
                                      char *buf, usize size, int flags)
 {
 	(void)node; (void)flags;
-	char *page = kmalloc(DEBUGFS_BUF_SIZE);
-	if (!page)
-		return -ENOMEM;
+	/* Size the page from the number of mounts, not from a fixed 4 KiB.
+	 *
+	 * A mount line is source + target + fstype + flags, and source and target
+	 * are VFS_MAX_PATH each, so a fixed buffer silently stopped listing once
+	 * enough filesystems were mounted -- and the entries it dropped were the
+	 * NEWEST ones, which is precisely what M119 looks for: the test mounts
+	 * debugfs and then expects to find it here. */
+	isize total = vfs_mounts_info(NULL, 0);
+	usize want = total > 0 ? (usize)total : 0;
+	if (want > 256)
+		want = 256;
+	/* Budget by a typical line, not by the worst case. Sources and targets are
+	 * VFS_MAX_PATH-sized fields but hold short strings; reserving 2*256 per
+	 * mount asked the heap for well over a hundred kilobytes, and a read that
+	 * fails with -ENOMEM tells the caller nothing at all. */
+	usize line_max = 96;
+	usize page_size = 128 + want * line_max;
+	if (page_size < DEBUGFS_BUF_SIZE)
+		page_size = DEBUGFS_BUF_SIZE;
+	if (page_size > 32768)
+		page_size = 32768;
 
-	int pos = snprintf(page, DEBUGFS_BUF_SIZE,
+	char *page = kmalloc(page_size);
+	if (!page) {
+		static volatile int oom_reported;
+		if (!__atomic_exchange_n(&oom_reported, 1, __ATOMIC_ACQ_REL)) {
+			console_write("debugfs/mounts: no memory for ");
+			console_write_dec((u64)page_size);
+			console_write(" bytes (total=");
+			console_write_dec((u64)total);
+			console_write(")\n");
+		}
+		return -ENOMEM;
+	}
+
+	int pos = snprintf(page, page_size,
 	                   "%-16s %-24s %-12s %s\n",
 	                   "SOURCE", "TARGET", "FSTYPE", "FLAGS");
 
@@ -165,18 +196,24 @@ static isize debugfs_vfs_mounts_read(struct vfs_node *node, u64 offset,
 	 * followed it in the heap. It also meant the newest mounts were simply
 	 * absent from the listing, which is what made M119 fail: the test mounts
 	 * debugfs and then looks for it here, and its own entry is the last one. */
-	isize total = vfs_mounts_info(NULL, 0);
-	usize want = total > 0 ? (usize)total : 0;
-	if (want > 256)
-		want = 256; /* the buffer runs out long before this does */
 	struct vfs_mount_info *info =
 	    want ? kmalloc(sizeof(struct vfs_mount_info) * want) : NULL;
+	if (!info) {
+		static volatile int info_reported;
+		if (!__atomic_exchange_n(&info_reported, 1, __ATOMIC_ACQ_REL)) {
+			console_write("debugfs/mounts: no memory for ");
+			console_write_dec((u64)(sizeof(struct vfs_mount_info) * want));
+			console_write(" bytes of mount info (total=");
+			console_write_dec((u64)total);
+			console_write(")\n");
+		}
+	}
 	if (info) {
 		isize count = vfs_mounts_info(info, want);
 		if (count > (isize)want)
 			count = (isize)want;
-		for (isize i = 0; i < count && pos < (int)(DEBUGFS_BUF_SIZE - 128); i++) {
-			pos += snprintf(page + pos, DEBUGFS_BUF_SIZE - pos,
+		for (isize i = 0; i < count && pos < (int)(page_size - 640); i++) {
+			pos += snprintf(page + pos, page_size - pos,
 			                "%-16s %-24s %-12s 0x%lx\n",
 			                info[i].source[0] ? info[i].source : "none",
 			                info[i].target,
@@ -185,6 +222,7 @@ static isize debugfs_vfs_mounts_read(struct vfs_node *node, u64 offset,
 		}
 		kfree(info);
 	}
+
 
 	isize ret = debugfs_serve_buf(page, (usize)pos, offset, buf, size);
 	kfree(page);
