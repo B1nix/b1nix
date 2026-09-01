@@ -155,9 +155,26 @@ static isize debugfs_vfs_mounts_read(struct vfs_node *node, u64 offset,
 	                   "%-16s %-24s %-12s %s\n",
 	                   "SOURCE", "TARGET", "FSTYPE", "FLAGS");
 
-	struct vfs_mount_info *info = kmalloc(sizeof(struct vfs_mount_info) * 64);
+	/* Size the array from the answer, and never iterate past what was
+	 * actually filled in.
+	 *
+	 * vfs_mounts_info() returns the TOTAL number of visible mounts, not how
+	 * many it wrote -- snprintf's convention. This read asked for 64 and then
+	 * looped over the returned count, so on a system with more than 64 mounts
+	 * it walked straight off the end of the array and formatted whatever
+	 * followed it in the heap. It also meant the newest mounts were simply
+	 * absent from the listing, which is what made M119 fail: the test mounts
+	 * debugfs and then looks for it here, and its own entry is the last one. */
+	isize total = vfs_mounts_info(NULL, 0);
+	usize want = total > 0 ? (usize)total : 0;
+	if (want > 256)
+		want = 256; /* the buffer runs out long before this does */
+	struct vfs_mount_info *info =
+	    want ? kmalloc(sizeof(struct vfs_mount_info) * want) : NULL;
 	if (info) {
-		isize count = vfs_mounts_info(info, 64);
+		isize count = vfs_mounts_info(info, want);
+		if (count > (isize)want)
+			count = (isize)want;
 		for (isize i = 0; i < count && pos < (int)(DEBUGFS_BUF_SIZE - 128); i++) {
 			pos += snprintf(page + pos, DEBUGFS_BUF_SIZE - pos,
 			                "%-16s %-24s %-12s 0x%lx\n",

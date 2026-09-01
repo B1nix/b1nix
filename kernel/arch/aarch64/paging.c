@@ -834,32 +834,6 @@ static int handle_page_fault_locked(u64 fault_addr, u64 error_code,
                                     u64 *swap_entry) {
   u64 va = fault_addr & ~(PAGE_SIZE - 1);
 
-  /* A fault the handler "services" without actually changing anything retries
-   * forever: the task never leaves the kernel, burns the CPU, and looks like a
-   * hang rather than a fault. Catch the loop and name the address and leaf
-   * instead of letting it wedge the machine. */
-  {
-    static u64 last_va;
-    static u64 repeat;
-    if (va == last_va && ++repeat > 4096) {
-      u64 *l3 = leaf_table_for(current_task ? current_task->pml4_phys : 0, va);
-      console_write("pf: fault loop at 0x");
-      console_write_hex64(va);
-      console_write(" err=0x");
-      console_write_hex64(error_code);
-      console_write(" leaf=0x");
-      console_write_hex64(l3 ? l3[l3_index(va)] : 0);
-      console_write(" task='");
-      console_write(current_task && current_task->name ? current_task->name
-                                                       : "?");
-      console_write("'\n");
-      panic("page-fault loop");
-    }
-    if (va != last_va) {
-      last_va = va;
-      repeat = 0;
-    }
-  }
   u64 *l0 = get_l0_for_va(va);
   usize i0 = l0_index(va);
   u64 entry = 0;
@@ -981,6 +955,46 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   rc = handle_page_fault_locked(fault_addr, error_code, &swap_l3, &swap_i3,
                                &swap_entry);
   vmm_write_release(f);
+
+  /* Loop detection, on the way OUT and only for faults that made no progress.
+   *
+   * A handler that reports success while leaving the address still unmapped is
+   * re-entered on the same instruction for ever: the task never returns to
+   * userspace, burns the CPU, and reads as a hang rather than a fault. That is
+   * the condition -- rc == 0 with the leaf still not present -- and it is the
+   * only thing worth counting.
+   *
+   * This used to count every fault at the same address, from a static shared by
+   * all tasks, and that is not the same question at all. mmap(NULL, ...) hands
+   * back the same base address each time once the previous mapping is gone, so
+   * a plain `mmap / touch one page / munmap` loop faults the identical address
+   * on every iteration -- 100,000 times in m_posixmm_smoke's SIGKILL test --
+   * all of it forward progress. It panicked the machine for it. */
+  if (rc == 0) {
+    static u64 stuck_va;
+    static u64 stuck_count;
+    u64 va = fault_addr & ~(PAGE_SIZE - 1);
+
+    if (paging_user_frame(current_task ? current_task->pml4_phys : 0, va)) {
+      stuck_count = 0; /* mapped: real progress */
+    } else if (va == stuck_va && ++stuck_count > 4096) {
+      u64 *l3 = leaf_table_for(current_task ? current_task->pml4_phys : 0, va);
+      console_write("pf: serviced but still unmapped at 0x");
+      console_write_hex64(va);
+      console_write(" err=0x");
+      console_write_hex64(error_code);
+      console_write(" leaf=0x");
+      console_write_hex64(l3 ? l3[l3_index(va)] : 0);
+      console_write(" task='");
+      console_write(current_task && current_task->name ? current_task->name
+                                                       : "?");
+      console_write("'\n");
+      panic("page-fault loop");
+    } else if (va != stuck_va) {
+      stuck_va = va;
+      stuck_count = 0;
+    }
+  }
 
   if (rc == PF_NEEDS_SWAP_IN)
     return swap_in_fault(swap_l3, swap_i3, fault_addr & ~(PAGE_SIZE - 1),
