@@ -462,8 +462,21 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 	 * rather than deduced from a garbled saved register three switches later. */
 	if (from_el0 && current_task && current_task->kernel_stack_ptr) {
 		u64 frame_top = (u64)(usize)frame + sizeof(*frame);
+		/* Two questions, and the weaker one is the interesting one.
+		 *
+		 * Exact equality says the entry landed exactly where SAVE_REGS should
+		 * have put it, and a drift of one frame is a real defect. But the
+		 * failure this is hunting is coarser and much more damaging: the frame
+		 * is not on this task's stack AT ALL. That has been seen directly --
+		 * `/bin/m32_smoke`, whose own stack is 0x1001034490..0x1001054450,
+		 * entering with SP_EL1 at 0x1000b15890, inside the AP idle task's
+		 * stack. Checking containment catches the first such entry rather than
+		 * the rare moment the drift happens to become visible. */
+		u64 own_lo = (u64)(usize)current_task->stack;
+		u64 own_hi = current_task->kernel_stack_ptr;
+		int foreign = own_lo && (frame_top <= own_lo || frame_top > own_hi);
 
-		if (frame_top != current_task->kernel_stack_ptr) {
+		if (foreign || frame_top != current_task->kernel_stack_ptr) {
 			console_write("KSTACK-MISMATCH: entry for pid ");
 			console_write_dec((u64)current_task->id);
 			console_write(" name=");
@@ -472,7 +485,31 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 			console_write_hex64(frame_top);
 			console_write(" kernel_stack_ptr=0x");
 			console_write_hex64(current_task->kernel_stack_ptr);
+			/* TEMPPROBE: which CPU, and what was actually at EL0. */
+			{
+				struct percpu *mp = get_percpu();
+				console_write(" cpu=");
+				console_write_dec(mp ? (u64)mp->cpu_id : 99);
+				console_write(" idle=");
+				console_write_dec(mp && mp->idle_task == (void *)current_task ? 1 : 0);
+				console_write(" ec=0x");
+				console_write_hex64((u64)ec);
+				console_write(" user_pc=0x");
+				console_write_hex64(frame->elr);
+				console_write(" user_sp=0x");
+				console_write_hex64(frame->sp_el0);
+				console_write(" stack=0x");
+				console_write_hex64((u64)(usize)current_task->stack);
+			}
 			console_write("\n");
+			/* Take the dump HERE. The frame this entry just built is sitting on
+			 * top of live C frames belonging to whatever really owns this
+			 * stack; letting it run on only buys a `ret` into a spilled
+			 * boolean somewhere else entirely (observed: ELR=0x1, the return
+			 * value of scheduler_yield in the AP idle loop). Panic while the
+			 * task table and the per-CPU state still describe the moment. */
+			if (foreign)
+				panic("kstack mismatch: EL0 frame built on another task's stack");
 		}
 	}
 

@@ -696,14 +696,63 @@ static u64 align_down_u64(u64 value, u64 alignment) {
 /* Lazily allocate task chunk `c` from the kernel heap. Called only with
  * g_tasks_lock held. Returns 0 if kmalloc fails (then the caller must report
  * "no free slot" — same as the old hard-cap behaviour). */
+/* Poison either side of a task chunk.
+ *
+ * A task's saved kernel stack pointer has been seen turning into another task's
+ * stack without either scheduler boundary putting it there: the EL0-entry
+ * containment assert never fires, the switch-out guard never fires, and yet the
+ * switch-IN guard catches a context.sp pointing into somebody else's stack. The
+ * remaining way for that to happen is a write through the task struct itself,
+ * and task chunks are ordinary kzalloc'd heap blocks sitting next to other
+ * allocations -- kernel stacks among them. Bracket them and say so, with the
+ * neighbouring block named, instead of discovering it three context switches
+ * later as a `ret` into a spilled boolean. */
+#define TASK_CHUNK_GUARD 0xC0DEFACEF00DBEEFULL
+#define TASK_CHUNK_PAD   16 /* keeps the chunk itself 16-byte aligned */
+
 static int ensure_task_chunk(usize c) {
   if (c >= TASK_MAX_CHUNKS) return 0;
   if (g_task_chunks[c]) return 1;
-  struct task *chunk = kzalloc(TASK_CHUNK_SIZE * sizeof(struct task));
-  if (!chunk) return 0;
+  u8 *raw = kzalloc(TASK_CHUNK_PAD + TASK_CHUNK_SIZE * sizeof(struct task) +
+                    TASK_CHUNK_PAD);
+  if (!raw) return 0;
+  struct task *chunk = (struct task *)(raw + TASK_CHUNK_PAD);
+  *(u64 *)raw = TASK_CHUNK_GUARD;
+  *(u64 *)((u8 *)chunk + TASK_CHUNK_SIZE * sizeof(struct task)) =
+      TASK_CHUNK_GUARD;
   /* kzalloc already zeros the chunk -> all slots are TASK_UNUSED. */
   g_task_chunks[c] = chunk;
   return 1;
+}
+
+/* Verify every chunk's poison. Called from the timer tick, so the report lands
+ * within a tick of the write rather than at whatever later moment the damaged
+ * field is next used. */
+void task_chunks_verify(const char *where) {
+  for (usize c = 0; c < TASK_MAX_CHUNKS; c++) {
+    struct task *chunk = g_task_chunks[c];
+    if (!chunk)
+      continue;
+    u64 *lo = (u64 *)((u8 *)chunk - TASK_CHUNK_PAD);
+    u64 *hi = (u64 *)((u8 *)chunk + TASK_CHUNK_SIZE * sizeof(struct task));
+    if (*lo == TASK_CHUNK_GUARD && *hi == TASK_CHUNK_GUARD)
+      continue;
+    console_write("TASK-CHUNK-CORRUPT: chunk ");
+    console_write_dec((u64)c);
+    console_write(" at 0x");
+    console_write_hex64((u64)(usize)chunk);
+    console_write(" from ");
+    console_write(where ? where : "?");
+    console_write("\n  below=0x");
+    console_write_hex64(*lo);
+    console_write(" above=0x");
+    console_write_hex64(*hi);
+    console_write("\n");
+    kheap_describe((u64)(usize)chunk - TASK_CHUNK_PAD, "  this block:");
+    kheap_describe((u64)(usize)chunk - TASK_CHUNK_PAD - 1, "  block below:");
+    kheap_describe((u64)(usize)hi + 8, "  block above:");
+    panic("task chunk overwritten by a heap neighbour");
+  }
 }
 
 /* Atomically claim a free task slot, zero it, mark it BLOCKED (reserved),
@@ -4564,6 +4613,8 @@ void scheduler_on_timer_tick(void) {
   if (!scheduler_started || current_task == 0) {
     return;
   }
+
+  task_chunks_verify("timer-tick");
 
   scheduler_ticks++;
 

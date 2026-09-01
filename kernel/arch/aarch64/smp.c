@@ -318,7 +318,12 @@ void aarch64_ap_main(u64 cpu)
 
 	pcpu->idle_task = idle;
 	pcpu->cur_task = idle;
-	pcpu->sched_return_ctx = 0;
+	/* Keep the phase-1 return context. `idle_ctx` is a local of this function
+	 * and this function never returns, so it stays valid for as long as the
+	 * CPU runs -- and a stealable worker that was still on this CPU when the
+	 * phase flipped has to have somewhere to switch back to. Clearing it left
+	 * ap_worker_trampoline restoring a context from address 0. */
+	pcpu->sched_return_ctx = &idle_ctx;
 
 	for (;;) {
 		int switched = scheduler_yield();
@@ -347,6 +352,19 @@ void ap_worker_trampoline(void)
 		 * the task as finished while the switch below is still on its stack. */
 		t->stack_released = 0;
 		t->state = TASK_DEAD;
+	}
+
+	/* Switching through a null return context restores SP/LR from address 0:
+	 * the task comes back with lr=0, a junk SP and a frame nobody filled in,
+	 * and dies at a PC that has nothing to do with where it went wrong. If
+	 * this CPU has no context to go back to, say so here. */
+	if (!pcpu || !pcpu->sched_return_ctx) {
+		console_write("ap: worker ");
+		console_write(t && t->name ? t->name : "(none)");
+		console_write(" finished with no return context on cpu ");
+		console_write_dec(pcpu ? (u64)pcpu->cpu_id : 99);
+		console_write("\n");
+		panic("ap: worker return context missing");
 	}
 
 	arch_context_switch(&t->context, (struct cpu_context *)pcpu->sched_return_ctx,
