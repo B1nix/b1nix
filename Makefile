@@ -1618,7 +1618,8 @@ ifdef LIBC_SO
 $(LIBC_SO) $(LIBM_LIB): $(PKG_DEPS)
 	@B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh musl >/dev/null
 	@mkdir -p build/$(ARCH)/ports/musl
-	@ln -sfn ../../pkg/musl build/$(ARCH)/ports/musl/install
+	@rm -rf build/$(ARCH)/ports/musl/install
+	@ln -sf ../../pkg/musl build/$(ARCH)/ports/musl/install
 
 $(INITRAMFS_LD_MUSL_INC): $(LIBC_SO)
 	@mkdir -p $(dir $@)

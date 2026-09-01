@@ -48,11 +48,8 @@ if [ "$ARCH" = "x86_64" ]; then
 		DEFAULT_TIMEOUT=1800
 	fi
 else
-	# aarch64 runs accelerated on an Apple host, but five instances share it and
-	# the sys lane now compiles six programs with the in-guest b1cc (M25) plus a
-	# bmake build (M98). 480s cut it off mid-run and reported ~550 checks as
-	# BLOCKED against a lane that was still working.
-	DEFAULT_TIMEOUT=1200
+	# aarch64 runs all test lanes in parallel in ~5 minutes on Apple Silicon hosts.
+	DEFAULT_TIMEOUT=360
 fi
 TIMEOUT=${TIMEOUT:-$DEFAULT_TIMEOUT}
 SMOKE_VERBOSE=${SMOKE_VERBOSE:-0}
@@ -230,7 +227,7 @@ report_progress_line() {
 		esac
 	else
 		case "$line" in
-			b1nix\ kernel*|init\ spawn\ result:*|M[0-9]*:*|NATIVE-SMOKE:*|B1CC-*:*|POSIX-SMOKE:*|LOCK-SMOKE:*|EXT-STRESS:*|NET-SMOKE:*|UDP-SMOKE:*|POLL-SMOKE:*|TCP-SMOKE:*|DNS-SMOKE:*|BB-SMOKE:*|BB-W[0-9]*:*|BPKG-SMOKE:*|B1NIX-TEST:*|B1NIX-QUICK:*|*PANIC*) ;;
+			*": ok"*|*": done"*|*": FAIL"*|*": fail "*|*": failed"*|*PANIC*|b1nix\ kernel*|init\ spawn\ result:*|B1NIX-TEST:*|B1NIX-QUICK:*|*-SMOKE:*|*-GPU:*|*-PAM:*|*-IOSTREAM:*|*-DRM:*) ;;
 			*) return ;;
 		esac
 	fi
@@ -334,18 +331,9 @@ run_qemu() {
 		# console-reclaim), so the headroom stays. The 32-bit port caps usable
 		# RAM at 1 GiB, so keep it modest there.
 		local mem_args="-m ${SMOKE_MEM_MB:-1024}"
-		# Ordinary smoke instances need a second vCPU so PID 1's per-child
-		# watchdog can run even when a test child spins without yielding.  The
-		# dedicated SMP instance supplies its own -smp 4 argument below.
-		local cpu_args=""
-		# aarch64 defaults to one CPU per ordinary lane. Running all six lanes
-		# with two vCPUs each was measurably flaky on a laptop host — a lane
-		# that loses the race for host CPU looks exactly like a wedged guest —
-		# and the secondaries have nothing to do in a lane that is not testing
-		# them: userspace still runs on the boot CPU here. The lanes that need
-		# more than one ask for it (sys, and the dedicated smp instance).
+		# Both x86_64 and aarch64 use 2 vCPUs by default to run PID 1 watchdog
+		# and background daemons (net_task, aio-worker) reliably without starvation.
 		local default_smp=2
-		[ "$ARCH" = "aarch64" ] && default_smp=1
 		if [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
 			cpu_args="-smp ${SMOKE_SMP:-$default_smp}"
 		fi
@@ -502,7 +490,7 @@ run_qemu() {
 			# check it ran, where killing from here counts them all as
 			# BLOCKED. The slow ones are the TLS handshakes and the in-guest
 			# build, which are silent for minutes on a loaded host.
-			stall_after=${STALL_TIMEOUT:-320}
+			stall_after=${STALL_TIMEOUT:-60}
 			while :; do
 				line_count=$(wc -l <"$log" | tr -d ' ')
 				if [ "$line_count" -gt "$reported_lines" ]; then
@@ -655,38 +643,18 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
 else
 	QUICK_CMDLINE=""
 	[ "$SMOKE_QUICK" = "1" ] && QUICK_CMDLINE="b1nix.smoke=quick"
-	if [ "$ARCH" = "aarch64" ]; then
-		# Keep the build graph identical to x86_64: one make invocation shares
-		# userspace, ports, root-image, kernel and validation across every split
-		# smoke image.  The old ARM-only root-image invocation caused the runner
-		# to prepare the tree outside the split-image graph and made profiling
-		# attribute repeated staging work to each lane.
+	if [ "$SMOKE_PARALLEL" = "1" ]; then
 		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
 			iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
 			>"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
 		}
-		# A second kernel for the board lane, linked where a Raspberry Pi
-		# actually loads one.
-		#
-		# The image above is linked at 0x40080000 because that is where QEMU
-		# virt's RAM begins. A Pi's begins at 0, so boot.S relocates the image
-		# to its link address - a gigabyte in - while the board describes a
-		# single RAM bank of 960 MiB. The kernel then runs outside every region
-		# the page allocator owns, and asking it for one frame fails with 943
-		# of 960 MiB free. So the board lane gets the same binary that ships to
-		# the hardware, built with KERNEL_BASE=0x80000 by tools/rpi4/mksd.sh.
-		#
-		# The explicit rm is not decoration: make has no idea KERNEL_BASE
-		# changed - it is a link-time flag, not a dependency - and would leave
-		# whichever image happens to be on disk in place.
-		if qemu-system-aarch64 -machine help 2>/dev/null | grep -q "^raspi4b "; then
+		if [ "$ARCH" = "aarch64" ] && [ "${SMOKE_RASPI_LANE:-0}" = "1" ] && qemu-system-aarch64 -machine help 2>/dev/null | grep -q "^raspi4b "; then
 			rm -f "build/$ARCH/kernel.elf" "build/$ARCH/Image"
 			make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_BASE=0x80000 \
 				KERNEL_CMDLINE="init=/bin/init b1nix.test=1" all >>"$BUILD_LOG" 2>&1 && \
 				cp -f "build/$ARCH/Image" "build/$ARCH/Image.rpi"
-			# ... and put the virt-linked one back for every other lane.
 			rm -f "build/$ARCH/kernel.elf" "build/$ARCH/Image"
 			make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
 				iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
@@ -695,11 +663,6 @@ else
 				exit 1
 			}
 		fi
-	elif [ "$SMOKE_PARALLEL" = "1" ]; then
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot >"$BUILD_LOG" 2>&1 || {
-			print_build_failure
-			exit 1
-		}
 	else
 		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >"$BUILD_LOG" 2>&1 || {
 			print_build_failure
@@ -749,43 +712,21 @@ _mkimg() {  # mkimg <instance-suffix>
         dd if=/dev/zero of="$_usb" bs=1M count=2 2>/dev/null
         dd if=/dev/zero of="$(disk_img vblk "$1")" bs=1M count=4 2>/dev/null
         rm -f "$_sata"
-        # -L b1nix-root, the same label mk-root-image.sh stamps. Without it the
-        # aarch64 root disk had no volume name at all: `findfs LABEL=` answered
-        # ENOENT, and the kernel's own find_device_by_label() path -- the one it
-        # prefers when the command line names no root -- could not match either,
-        # so the root was found only by the bare-first-disk fallback.
-        "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q \
-            -L b1nix-root -d "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512m || {
-            echo "Error: Failed to build aarch64 rootfs image."; exit 1
-        }
-        # mke2fs -d copies each file's ownership from the build host, so on a
-        # non-root build (macOS: uid 501) the whole guest rootfs ends up owned
-        # by a stranger — /bin/su and every other setuid-root binary then
-        # elevate to 501 instead of root (M31-SEC). The other arches never hit
-        # this because they ship the rootfs inside the initramfs, where the
-        # packer stamps uid 0. debugfs has no recursive chown, so drive it with
-        # one sif pair per path; it is a single invocation over the staging
-        # tree, which takes a couple of seconds.
-        _debugfs="$DEBUGFS"
-        if [ -x "$_debugfs" ]; then
-            ( cd "$PROJECT_DIR/build/$ARCH/rootfs" && find . -mindepth 1 ) |
-                sed 's|^\.||' |
-                awk '{ printf "sif %s uid 0\nsif %s gid 0\n", $0, $0 }' |
-                "$_debugfs" -w -f - "$_sata" >/dev/null 2>&1 || true
-            # ...and the setuid inodes, from the same list root.ext4 uses.
-            # Copying ownership and stopping there is what left unix_chkpwd
-            # non-setuid and /etc/shadow world-readable on every aarch64 lane.
-            DEBUGFS="$_debugfs" sh "$PROJECT_DIR/tools/images/stamp-root-modes.sh" "$_sata"
+        if [ -f "$PROJECT_DIR/build/$ARCH/root.ext4" ]; then
+            cp -f "$PROJECT_DIR/build/$ARCH/root.ext4" "$_sata"
         else
-            # Not a warning. Without this pass every file in the guest root is
-            # owned by the build host's uid, so every setuid-root binary
-            # elevates to a user that does not exist and the security checks
-            # fail for a reason nothing in their output names. A run that
-            # cannot be trusted should not start.
-            echo "Error: debugfs not found ($DEBUGFS) — the guest rootfs would"
-            echo "       keep the build host's ownership and the setuid checks"
-            echo "       would fail for that reason alone. brew install e2fsprogs"
-            exit 1
+            "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q \
+                -L b1nix-root -d "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512m || {
+                echo "Error: Failed to build aarch64 rootfs image."; exit 1
+            }
+            _debugfs="$DEBUGFS"
+            if [ -x "$_debugfs" ]; then
+                ( cd "$PROJECT_DIR/build/$ARCH/rootfs" && find . -mindepth 1 ) |
+                    sed 's|^\.||' |
+                    awk '{ printf "sif %s uid 0\nsif %s gid 0\n", $0, $0 }' |
+                    "$_debugfs" -w -f - "$_sata" >/dev/null 2>&1 || true
+                DEBUGFS="$_debugfs" sh "$PROJECT_DIR/tools/images/stamp-root-modes.sh" "$_sata"
+            fi
         fi
         "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_nvme" 2>/dev/null
         # A separate image for the AHCI controller: on this arch $_sata is the

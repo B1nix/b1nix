@@ -127,6 +127,7 @@ static void test_fwcfgfs(void) {
 	while ((de = readdir(dir)) != NULL) {
 		entries++;
 	}
+	(void)entries;
 	closedir(dir);
 
 	if (umount("/mnt/fwcfg") != 0) {
