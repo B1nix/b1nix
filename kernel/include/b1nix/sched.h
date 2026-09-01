@@ -10,6 +10,25 @@ struct vfs_handle;
 struct task;
 struct cred;
 
+/* Every kernel stack is this big, including the ones the SMP bring-up hands to
+ * secondaries: scheduler_setup_ap_idle derives an idle task's stack base by
+ * subtracting this from the top it is given, and the switch validates saved
+ * stack pointers against that range. A stack allocated any smaller is not a
+ * smaller stack -- it is a stack whose recorded base lies in somebody else's
+ * memory. */
+#if defined(__aarch64__)
+#define KERNEL_STACK_SIZE (128 * 1024)
+#else
+#define KERNEL_STACK_SIZE (64 * 1024)
+#endif
+
+/* First word of every kernel stack. scheduler_yield checks it before switching
+ * in, so an overflow (or a write running forward off the block below) is named
+ * at the switch instead of surfacing as a wild jump. Shared with the boot
+ * stack's painter in arch.c, which owns the one stack the kernel does not
+ * allocate. */
+#define KSTACK_CANARY 0xC0FFEE5713579BDFULL
+
 enum task_state {
   TASK_UNUSED = 0,
   TASK_RUNNING,

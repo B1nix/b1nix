@@ -395,9 +395,24 @@ int smp_boot_aps(void)
 		if (index >= MAX_CPUS)
 			break;
 
-		/* 16 KiB of kernel stack, the same size the BSP's is. Allocated
-		 * before the call, because the CPU it wakes runs on it immediately. */
-		void *stack = kmalloc(16384);
+		/* A full KERNEL_STACK_SIZE, allocated before the call because the CPU
+		 * it wakes runs on it immediately.
+		 *
+		 * This used to be 16 KiB, described as "the same size the BSP's is" --
+		 * the BSP's is 128 KiB (stack_bottom..stack_top), and so is every
+		 * kernel stack the scheduler allocates. Two things followed. The idle
+		 * task set up on it takes its base as top - KERNEL_STACK_SIZE, so
+		 * scheduler_setup_ap_idle wrote that task's stack canary 112 KiB below
+		 * the allocation, into an unrelated heap block, and the switch
+		 * validated saved stack pointers against a range that was mostly
+		 * somebody else's memory. And a secondary running anything deeper than
+		 * 16 KiB simply ran off the bottom: the comment on KERNEL_STACK_SIZE
+		 * records a task reaching ~64 KiB inside a single syscall. What it
+		 * spilled were the pointers it happened to be holding, over whatever
+		 * lay below -- which is exactly how a foreign pointer (&g_percpu[1],
+		 * &bcache_lock) ended up in another task's saved return-address slot
+		 * and the kernel branched into .bss. */
+		void *stack = kmalloc(KERNEL_STACK_SIZE);
 		if (!stack) {
 			console_write("smp: out of memory for a secondary stack\n");
 			break;
@@ -406,7 +421,7 @@ int smp_boot_aps(void)
 		g_percpu[index].cpu_id = index;
 		g_percpu[index].cur_task = 0;
 		g_percpu[index].cpu_online = 0;
-		g_ap_sp[index] = (u64)(usize)stack + 16384;
+		g_ap_sp[index] = (u64)(usize)stack + KERNEL_STACK_SIZE;
 		/* The same stack, recorded for scheduler_setup_ap_idle: this CPU's
 		 * idle task runs on it. */
 		g_percpu[index].kernel_stack_virt = g_ap_sp[index];

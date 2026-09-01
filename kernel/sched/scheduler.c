@@ -88,16 +88,10 @@ _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
  * ext4/ELF-load call chains, and openrc-init's boot sequence was observed
  * driving a task to ~64 KB of usage on a single syscall (real overflow into
  * adjacent kheap memory, not just a tight fit) before ever calling fork(). */
-#if defined(__aarch64__)
-#define KERNEL_STACK_SIZE (128 * 1024)
-#else
-#define KERNEL_STACK_SIZE (64 * 1024)
-#endif
 /* Written at the lowest address of every kernel stack and verified on each
  * context switch. A kernel stack is an ordinary heap block, so an overflow
  * silently corrupts whatever object sits below it and only surfaces later,
  * somewhere unrelated — this turns that into an immediate, named panic. */
-#define KSTACK_CANARY 0xC0FFEE5713579BDFULL
 #define TASK_ENV_MAX 16
 #define TASK_ENV_VALUE_MAX 64
 
@@ -1447,7 +1441,22 @@ void scheduler_init(void) {
    * stack megabytes away. Give it the address it is actually running on. */
   {
     extern u8 stack_top[];
+    extern u8 stack_bottom[];
+
     boot->kernel_stack_ptr = (u64)(usize)stack_top;
+    /* ...and the base of it, so the switch actually validates this task.
+     *
+     * The guard below is written `if (new_task->stack)`, and slot 0 was the
+     * one task that never carried a base -- the same gap ap-idle used to have
+     * (see scheduler_setup_ap_idle). A corrupted saved context on the boot
+     * stack therefore went straight through to arch_context_switch and `ret`ed
+     * to whatever the stack held: observed as a data abort writing through a
+     * register that a healthy path cannot leave null, from an ELR in the
+     * middle of scheduler_yield's own resume sequence. Give it the range, and
+     * the canary that goes with it (boot_stack_paint writes the same word;
+     * either order is fine). */
+    boot->stack = (void *)(usize)stack_bottom;
+    *(u64 *)(usize)stack_bottom = KSTACK_CANARY;
   }
 #else
   boot->kernel_stack_ptr = 0;
@@ -3814,6 +3823,39 @@ int scheduler_yield(void) {
     new_task->fpu_initialized = 1;
   }
 
+  /* The switch is about to save THIS CPU's stack pointer into old_task's
+   * context. If we are not actually on old_task's stack, that write hands one
+   * task another's stack for good: the next resume of old_task runs on it, and
+   * the failure surfaces later as a wild jump with nothing left to say where
+   * it came from. Name it here, where both identities are still known. */
+  if (old_task->stack) {
+    u64 sp_now;
+#ifdef __aarch64__
+    __asm__ volatile("mov %0, sp" : "=r"(sp_now));
+#else
+    __asm__ volatile("movq %%rsp, %0" : "=r"(sp_now));
+#endif
+    u64 slo = (u64)(usize)old_task->stack;
+    u64 shi = slo + KERNEL_STACK_SIZE;
+    if (sp_now < slo || sp_now > shi) {
+      console_write("sched: switching out pid ");
+      console_write_dec((u64)old_task->id);
+      console_write(" name=");
+      console_write(old_task->name ? old_task->name : "(none)");
+      console_write(" while running on somebody else's stack: sp=0x");
+      console_write_hex64(sp_now);
+      console_write(" own stack=0x");
+      console_write_hex64(slo);
+      console_write("..0x");
+      console_write_hex64(shi);
+      console_write(" incoming pid ");
+      console_write_dec((u64)new_task->id);
+      console_write(" name=");
+      console_write(new_task->name ? new_task->name : "(none)");
+      console_write("\n");
+      panic("sched: context switch on a foreign kernel stack");
+    }
+  }
   arch_context_switch(&old_task->context, &new_task->context,
                       &old_task->stack_released);
 #ifdef __aarch64__
@@ -3839,6 +3881,20 @@ int scheduler_yield(void) {
 }
 
 void scheduler_block_current(void) {
+  /* Preserve the caller's interrupt state, the way scheduler_yield does.
+   *
+   * This used to unmask unconditionally on the way out, so a caller that
+   * already had interrupts masked -- an IRQ handler, or any section that
+   * disabled them for a reason -- got them back on behind its own back. The
+   * next interrupt then nested on top of a live frame, which is exactly the
+   * hazard the comment at the top of scheduler_yield describes: the handler's
+   * RESTORE_REGS/eret is still pending on that stack, and a frame the compiler
+   * believes it owns gets written through. It surfaced as a `ret` into a
+   * garbage x30 -- a kernel .bss address, a heap address, a small integer --
+   * with a backtrace that says only sync_el1, in whichever test happened to be
+   * running. */
+  int restore_irqs = interrupts_enabled();
+
   interrupts_disable();
 
   if (current_task == 0) {
@@ -3863,7 +3919,8 @@ void scheduler_block_current(void) {
   task_lease_clear(current_task, __func__);
   current_task->state = TASK_BLOCKED;
   scheduler_yield();
-  interrupts_enable();
+  if (restore_irqs)
+    interrupts_enable();
 }
 
 void scheduler_wake_task(usize task_id) {
@@ -3909,6 +3966,9 @@ void scheduler_wake_task(usize task_id) {
 }
 
 void scheduler_block_on(void *chan) {
+  /* Caller's interrupt state is preserved — see scheduler_block_current. */
+  int restore_irqs = interrupts_enabled();
+
   interrupts_disable();
 
   if (current_task == 0) {
@@ -3918,7 +3978,8 @@ void scheduler_block_on(void *chan) {
   if (current_task->state == TASK_READY) {
     current_task->state = TASK_RUNNING;
     current_task->wait_chan = 0;
-    interrupts_enable();
+    if (restore_irqs)
+      interrupts_enable();
     return;
   }
 
@@ -3934,7 +3995,8 @@ void scheduler_block_on(void *chan) {
   task_lease_clear(current_task, __func__);
   current_task->state = TASK_BLOCKED;
   scheduler_yield();
-  interrupts_enable();
+  if (restore_irqs)
+    interrupts_enable();
 }
 
 /* Like scheduler_block_on but arms a timer deadline: wake_sleepers() (run from
@@ -3948,6 +4010,9 @@ u64 scheduler_get_ticks(void) {
 }
 
 void scheduler_block_on_timeout(void *chan, u64 timeout_ticks) {
+  /* Caller's interrupt state is preserved — see scheduler_block_current. */
+  int restore_irqs = interrupts_enabled();
+
   interrupts_disable();
 
   if (current_task == 0) {
@@ -3958,7 +4023,8 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks) {
     current_task->state = TASK_RUNNING;
     current_task->wait_chan = 0;
     current_task->wake_tick = 0;
-    interrupts_enable();
+    if (restore_irqs)
+      interrupts_enable();
     return;
   }
 
@@ -3978,7 +4044,8 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks) {
   scheduler_yield();
   /* Drop any unfired deadline: an explicit wake may have resumed us early. */
   current_task->wake_tick = 0;
-  interrupts_enable();
+  if (restore_irqs)
+    interrupts_enable();
 }
 
 /* SMP-safe condition wait, split into three steps so the caller can re-test its

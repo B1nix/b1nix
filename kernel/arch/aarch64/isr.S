@@ -156,35 +156,40 @@ vector_table_el1:
 	VECT_EMPTY
 	VECT_EMPTY
 
-// A synchronous exception taken at EL1 runs on whatever SP_EL1 the interrupted
-// kernel code was using. If that pointer is bad, SAVE_REGS faults while
-// building its own frame, and the nested exception overwrites ESR/ELR/FAR — so
-// the dump describes the second fault and the first one, the only interesting
-// one, is lost. Take these on a dedicated stack instead and stash the
-// interrupted SP_EL1 where the handler can report it. SP_EL1 is put back before
-// `eret`, because this path legitimately returns: a kernel access to a user
-// address (syscall_copyin/copyout) faults here and is serviced normally.
+// Synchronous exceptions taken at EL1 run on the stack the interrupted kernel
+// code was using -- the same shape as irq_el1 -- because this path legitimately
+// RETURNS and legitimately BLOCKS: a kernel access to a user address
+// (syscall_copyin/copyout, demand paging, COW) faults here and is serviced
+// normally, and aarch64_sync_handler is free to sleep or reschedule while doing
+// it.
 //
-// Single-CPU only, which this arch is (g_max_cpus == 1). A nested EL1 abort
-// clobbers the saved pointer, but by then the machine is already dying.
+// It used to switch to a per-CPU "fault stack" and park the interrupted SP_EL1
+// in a single per-CPU word, so a bad SP could not turn SAVE_REGS itself into a
+// nested fault that overwrote ESR/ELR/FAR. That is a real diagnostic win for
+// the unrecoverable case and a correctness disaster for the ordinary one: the
+// handler can context-switch, so a task would leave with its saved kernel SP
+// pointing INTO the shared fault stack, the next task to fault on the same CPU
+// would write over those frames, and the single saved-SP word would be
+// restored into the wrong task. Observed as a task whose context.sp lay inside
+// another task's stack, and as a garbage x29 in scheduler_yield right after
+// pick_next_task -- a `str` through a frame pointer that no longer existed.
+//
+// A genuinely bad SP_EL1 still gets the dedicated stack, chosen by an
+// alignment test below, so the dump for the fatal case is unchanged.
+
 sync_el1:
-	// TPIDRRO_EL0 as scratch, safe here because the only
-	// memory that macro touches is the per-CPU block, kernel .bss mapped since
-	// boot, so an EL1 fault cannot nest inside its window and find the parked
-	// x0 gone.
+	// Decide, before touching memory, whether the interrupted SP is usable.
+	// Every kernel stack pointer is 16-byte aligned; the corrupt ones this is
+	// here for are not (an SP of 0x400a68e4 -- a text address -- is what a
+	// clobbered context.sp looks like). Cheap, needs no constant, and it is
+	// the difference between "servicing an ordinary fault" and "SAVE_REGS
+	// faults while building its own frame and the nested exception overwrites
+	// the ESR/ELR/FAR that describe the first one".
 	msr tpidrro_el0, x0          // free up x0
-	mrs x0, tpidr_el1
-	cbz x0, 7f                   // no per-CPU block yet: stay on this stack
-	ldr x0, [x0, #PCPU_FAULT_TOP]
-	cbz x0, 7f
-	sub x0, x0, #16
-	str x1, [x0]                 // park x1 on this CPU's fault stack
-	mov x1, sp                   // x1 = the interrupted SP_EL1
-	mov sp, x0
-	mrs x0, tpidr_el1
-	str x1, [x0, #PCPU_FAULT_SP]
-	ldr x1, [sp]                 // x1 restored
-7:
+	mov x0, sp
+	tst x0, #15
+	b.ne 8f                      // unusable SP: take the dedicated stack
+
 	mrs x0, tpidrro_el0          // x0 restored
 	SAVE_REGS
 	mrs x0, esr_el1
@@ -193,14 +198,27 @@ sync_el1:
 	mov x3, sp
 	bl aarch64_sync_handler
 	RESTORE_REGS
-	msr tpidrro_el0, x0
+	eret
+
+	// Unusable SP. Switch to this CPU's fault stack purely so the dump is
+	// readable; this path does not return -- a kernel fault whose stack
+	// pointer is gone is already fatal, and not restoring SP is what keeps
+	// the switch off the ordinary, recoverable path.
+8:
 	mrs x0, tpidr_el1
-	cbz x0, 6f
-	ldr x0, [x0, #PCPU_FAULT_SP]
-	cbz x0, 6f
+	cbz x0, 9f                   // no per-CPU block yet: nothing better to do
+	ldr x0, [x0, #PCPU_FAULT_TOP]
+	cbz x0, 9f
 	mov sp, x0
-6:
-	mrs x0, tpidrro_el0
+9:
+	mrs x0, tpidrro_el0          // x0 restored
+	SAVE_REGS
+	mrs x0, esr_el1
+	mrs x1, elr_el1
+	mrs x2, far_el1
+	mov x3, sp
+	bl aarch64_sync_handler
+	RESTORE_REGS
 	eret
 
 irq_el1:

@@ -212,7 +212,18 @@ void boot_stack_paint(void)
 	 * frame doing the painting. */
 	u64 limit = (u64)(usize)__builtin_frame_address(0) - 256;
 
-	for (u8 *p = bottom; (u64)(usize)p < limit; p++)
+	/* The first word is the scheduler's stack canary, not paint.
+	 *
+	 * Every kernel stack carries one and scheduler_yield checks it before
+	 * switching a task in -- except the boot task's, which is this stack,
+	 * handed over by boot.S rather than allocated, so nothing had ever
+	 * written the marker. That made slot 0 the one task the switch never
+	 * validated at all, and a corrupted saved context there resumed straight
+	 * into a wild jump: an EL1 abort on a small integer with a backtrace that
+	 * says only kernel_main. Written here and in scheduler_init, in either
+	 * order, so the two cannot disagree. */
+	*(u64 *)bottom = KSTACK_CANARY;
+	for (u8 *p = bottom + sizeof(u64); (u64)(usize)p < limit; p++)
 		*p = BOOT_STACK_PAINT;
 }
 
@@ -222,7 +233,9 @@ u64 boot_stack_peak_bytes(void)
 {
 	const u8 *b = stack_bottom;
 	u64 size = boot_stack_size();
-	u64 clean = 0;
+	/* Skip the canary word: it is not paint, and counting it as dirty would
+	 * report the whole stack used. */
+	u64 clean = sizeof(u64);
 
 	while (clean < size && b[clean] == BOOT_STACK_PAINT)
 		clean++;

@@ -499,8 +499,13 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 		arch_halt();
 	}
 
+	/* The interrupted SP_EL1 is where SAVE_REGS started, i.e. just above the
+	 * frame it built. Derived rather than parked in a per-CPU word: the
+	 * parking is what used to hand one task another task's stack (see the
+	 * note on sync_el1 in isr.S). */
 	console_write("\ninterrupted SP_EL1: 0x");
-	console_write_hex64(aarch64_el1_fault_sp());
+	console_write_hex64(frame ? (u64)(usize)frame + sizeof(struct interrupt_frame)
+	                          : aarch64_el1_fault_sp());
 	console_write(" task='");
 	console_write(current_task && current_task->name ? current_task->name : "?");
 	console_write("' stack=0x");
