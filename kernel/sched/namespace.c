@@ -288,6 +288,33 @@ void namespace_fork_inherit(usize parent_pid, usize child_pid) {
     return;
   u64 flags;
   spin_lock_irqsave(&ns_lock, &flags);
+
+  /* Whatever this pid used to belong to, it does not any more.
+   *
+   * Rows are keyed by pid, and pids are reused. This function only ever WROTE
+   * the child's row, and only when the parent had one -- so a child forked by
+   * an un-namespaced parent silently kept the row of whichever dead task last
+   * held its number. Every pid the caller then named was translated through a
+   * namespace it was not in, and the translation returned 0: kill(2) answered
+   * ESRCH for a process that was alive and blocked. Seen as
+   * "kill: no pid 190 for caller 191 (translation); slot state=3".
+   *
+   * Cleared before the inherit below, so a genuine inheritance still lands. */
+  {
+    struct ns_row *stale = ns_find_locked(child_pid);
+
+    if (stale) {
+      stale->used = 0;
+      stale->pid = 0;
+      stale->pid_children = 0;
+      for (int k = 0; k < NS_KIND_COUNT; k++) {
+        stale->id[k] = 0;
+        stale->child_ns[k] = 0;
+      }
+    }
+    pidns_leave_locked(child_pid);
+  }
+
   struct ns_row *p = ns_find_locked(parent_pid);
   if (p) {
     u32 copy[NS_KIND_COUNT];
@@ -315,6 +342,7 @@ void namespace_fork_inherit(usize parent_pid, usize child_pid) {
         pidns_enter_locked(copy[NS_PID], child_pid);
     }
   }
+  ns_recompute_any_locked();
   spin_unlock_irqrestore(&ns_lock, flags);
 }
 

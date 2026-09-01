@@ -9819,24 +9819,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
      * a process group by the numbers its namespace uses. */
     if (target > 0) {
       usize t = ns_pid_in((u64)target);
-      if (!t) {
-        /* Which of the three ways this can fail? A pid the caller's namespace
-         * cannot name, a task that has exited and not been reaped, or a task
-         * that is genuinely gone -- they need different fixes and the errno
-         * alone does not tell them apart. */
-        static volatile int reported;
-        if (!__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL)) {
-          struct task *ex = scheduler_task_by_pid((usize)target);
-          console_write("kill: no pid ");
-          console_write_dec((u64)target);
-          console_write(" for caller ");
-          console_write_dec((u64)scheduler_get_pid());
-          console_write(" (translation); slot state=");
-          console_write_dec(ex ? (u64)ex->state : 99);
-          console_write("\n");
-        }
+      if (!t)
         return (u64)-ESRCH;
-      }
       target = (isize)t;
     } else if (target < -1) {
       usize t = ns_pid_in((u64)(-target));

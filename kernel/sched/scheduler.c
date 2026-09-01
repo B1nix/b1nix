@@ -1037,6 +1037,13 @@ static void free_task_slot(struct task *t) {
    * than at exit, where the task is still a zombie its parent must be able to
    * name. */
   namespace_task_reaped(t->id);
+  /* And the namespace row itself, for the same reason and at the same moment.
+   * namespace_task_exit() only runs on the scheduler_exit_current path, so a
+   * task reaped by any other route left its row behind -- keyed by pid, which
+   * is about to be handed to somebody else. The next owner then translated
+   * every pid it named through a namespace it was not in and got ESRCH for
+   * live processes. */
+  namespace_task_exit(t->id);
   /* M63: drop the task's seccomp filter chain (unref; frees at zero) BEFORE
    * taking tasks_lock — filter_unref calls kfree and tasks_lock is a leaf lock
    * that must not nest the heap lock. Idempotent: clears the side-table slot. */
@@ -7229,28 +7236,6 @@ int scheduler_oom_kill_current(void) {
 int scheduler_kill(usize task_id, int sig) {
   if (sig < 0 || sig > NSIG_MAX)
     return -EINVAL;
-  /* One-shot: name the state of a target this call is about to refuse. A
-   * zombie is not "no such process" to POSIX -- the pid is still taken until
-   * it is reaped -- so if that is what this keeps hitting, the refusal is the
-   * bug rather than the caller. */
-  {
-    struct task *ex = scheduler_task_by_pid(task_id);
-    if (!ex || ex->state == TASK_UNUSED || ex->state == TASK_DEAD ||
-        ex->state == TASK_REAPING) {
-      static volatile int reported;
-      if (!__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL)) {
-        console_write("kill: refusing pid ");
-        console_write_dec((u64)task_id);
-        console_write(" sig ");
-        console_write_dec((u64)sig);
-        console_write(" state=");
-        console_write_dec(ex ? (u64)ex->state : 99);
-        console_write(" caller=");
-        console_write_dec((u64)scheduler_get_pid());
-        console_write("\n");
-      }
-    }
-  }
   /* M74: kill(2)/raise(3) of an RT signal QUEUES one instance with a zero
    * payload (si_code SI_USER == 0), rather than coalescing into a single bit. */
   if (SIG_IS_RT(sig)) {
