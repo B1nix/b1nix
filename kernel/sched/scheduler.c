@@ -417,6 +417,10 @@ static int   g_task_parked_code[MAX_TASKS];
  * parks without posting its own SIGCHLD/stop report (see the delivery path). */
 static u8    g_task_stop_quiet[MAX_TASKS];
 static u64   g_task_pass[MAX_TASKS];
+/* sched_setaffinity's per-task CPU mask. Defined here, beside the other slot
+ * side tables, because find_unused_task must clear it when it recycles a
+ * slot. 0 means "any CPU". */
+static u64 g_task_affinity[MAX_TASKS];
 static u64   g_min_pass = 0;
 /* Last userspace RIP of each task, captured by the LAPIC timer tick when it
  * preempts a ring-3 task (see task_set_user_rip). Consumed by the silence
@@ -712,6 +716,45 @@ static int ensure_task_chunk(usize c) {
  * and assign its id — all under g_tasks_lock so two CPUs can never claim the
  * same slot. Scans the in-use range first (cheap), then grows by one chunk
  * (TASK_CHUNK_SIZE slots) on demand up to the MAX_TASKS ceiling. */
+/* The stride value a brand-new task starts life with.
+ *
+ * This used to be g_min_pass, whose name promises a minimum but whose value is
+ * whatever pick_next_task last selected -- and the runqueue fast path assigns
+ * it from the dequeued task without comparing passes at all. So one freshly
+ * woken userspace process with a long history was enough to leave g_min_pass
+ * far above every runnable kernel thread, and the next task created inherited
+ * that as its birth pass.
+ *
+ * A task that starts behind never catches up: pick_next_task takes the LOWEST
+ * pass among the highest priority, a task only advances its pass by running,
+ * and a task that is never picked never runs. The AIO worker was born at
+ * 662650 while net_task and m47-input-inject sat at 65450 and climbed ~60000 a
+ * minute -- ten minutes behind, against a 60-second stall watchdog. It stayed
+ * READY for the entire instance, so io_getevents blocked on a completion that
+ * nobody was ever going to produce and the sys lane died with ~900 checks
+ * unrun.
+ *
+ * So take the real minimum over the tasks that can actually be picked. It is
+ * one pass over the table, paid once per task creation, and it is the value
+ * g_min_pass was always meant to be. Called with the task lock held. */
+static u64 sched_birth_pass(void) {
+  u64 min = 0;
+  int seen = 0;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+    if (!t)
+      continue;
+    if (t->state != TASK_READY && t->state != TASK_RUNNING)
+      continue;
+    u64 p = g_task_pass[i];
+    if (!seen || p < min) {
+      min = p;
+      seen = 1;
+    }
+  }
+  return seen ? min : g_min_pass;
+}
+
 static struct task *find_unused_task(void) {
   u64 flags;
   tasks_lock(&flags);
@@ -770,6 +813,22 @@ static struct task *find_unused_task(void) {
       g_task_exiting[i] = 0;
       g_task_tgid[i] = 0;
       g_task_exit_stage[i] = 0; /* a recycled slot must not inherit a stage */
+      /* ...nor a CPU affinity mask. This one is cleared in
+       * scheduler_exit_current, so a task that leaves by any other route --
+       * killed, reaped as a thread, or dropped on a create error path --
+       * hands its pinning to whoever gets the slot next.
+       *
+       * A kernel thread inherits it silently and is then unschedulable for
+       * good: kthreads have ap_runnable == 0, so every AP skips them, and a
+       * stale mask naming only an AP denies them the BSP as well. The task
+       * sits READY for ever while the picker walks past it. That is what hung
+       * the sys lane in m8_aio_test -- the AIO worker was created, queued and
+       * never once ran its first statement, so every io_getevents blocked
+       * against a completion nobody would ever produce.
+       *
+       * fork's own inheritance (see scheduler_fork_current) copies the parent's
+       * mask after this point, so clearing here does not weaken it. */
+      g_task_affinity[i] = 0;
       if (g_task_cmdline[i]) {
         kfree(g_task_cmdline[i]);
         g_task_cmdline[i] = 0;
@@ -791,7 +850,7 @@ static struct task *find_unused_task(void) {
       g_task_parked_leader[i] = 0;
       g_task_parked_override[i] = 0;
       g_task_stop_quiet[i] = 0;
-      g_task_pass[i] = g_min_pass;
+      g_task_pass[i] = sched_birth_pass();
       g_task_vfork_pending[i] = 0;
       for (int r = 0; r < 16; r++) {
         g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
@@ -824,6 +883,8 @@ static struct task *find_unused_task(void) {
    * free_task_slot starts from a clean state too (same as the old path). */
   memset(T(i), 0, sizeof(struct task));
   g_task_hwm = i + 1;
+  g_task_pass[i] = sched_birth_pass();
+  g_task_affinity[i] = 0;
   g_task_is_thread[i] = 0;
   g_task_tls_base[i] = 0;
   g_task_child_tid_clear[i] = 0;
@@ -1087,22 +1148,23 @@ static struct task *pick_next_task(void) {
   for (usize offset = 1; offset <= g_task_hwm; offset++) {
     usize index = (start + offset) % g_task_hwm;
 
-    if (T(index)->state != TASK_READY)
+    struct task *t = T(index);
+    if (!t || t->state != TASK_READY)
       continue;
-    if (T(index)->stealable)
+    if (t->stealable)
       continue;
-    if (on_ap && !T(index)->ap_runnable)
+    if (on_ap && !t->ap_runnable)
       continue; /* APs run only userspace ELF processes */
-    if (pcpu && !sched_task_allowed_on_cpu(T(index), pcpu->cpu_id))
+    if (pcpu && !sched_task_allowed_on_cpu(t, pcpu->cpu_id))
       continue; /* pinned elsewhere by sched_setaffinity */
 
-    int priority = T(index)->priority;
+    int priority = t->priority;
     u64 pass = g_task_pass[index];
     if (priority > max_priority ||
         (priority == max_priority && pass < min_pass)) {
       max_priority = priority;
       min_pass = pass;
-      best_task = T(index);
+      best_task = t;
     }
   }
 
@@ -1272,23 +1334,25 @@ static void sched_trace_signal_wake(const struct task *t, int sig, int state,
 static void wake_sleepers(void) {
   int woken = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+    if (!t) continue;
     /* F4 (M28 #7): atomic CAS SLEEPING/BLOCKED -> READY so only one CPU wins when
      * two timer ticks (or a tick + an explicit wake) race for the same
      * task. */
-    if (T(i)->wake_tick != 0 && T(i)->wake_tick <= scheduler_ticks) {
+    if (t->wake_tick != 0 && t->wake_tick <= scheduler_ticks) {
       enum task_state expected = TASK_SLEEPING;
-      if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+      if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY,
                                       0, __ATOMIC_ACQUIRE,
                                       __ATOMIC_RELAXED)) {
-        T(i)->wake_tick = 0;
-        sched_rq_enqueue_current(T(i));
+        t->wake_tick = 0;
+        sched_rq_enqueue_current(t);
         woken++;
       } else {
         expected = TASK_BLOCKED;
-        if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+        if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY,
                                         0, __ATOMIC_ACQUIRE,
                                         __ATOMIC_RELAXED)) {
-          sched_rq_enqueue_current(T(i));
+          sched_rq_enqueue_current(t);
           woken++;
         }
       }
@@ -1701,7 +1765,6 @@ extern void x86_fork_child_trampoline(void);
 static void scheduler_root_inherit(struct task *child, struct task *parent);
 static void scheduler_root_clear(struct task *t);
 /* Defined with the other sched_setaffinity state below; fork needs it here. */
-static u64 g_task_affinity[MAX_TASKS];
 
 /* fork(2), plus the two tid side effects Linux's clone(2) can ask for.
  *
@@ -4108,17 +4171,13 @@ void scheduler_wake_all(void *chan) {
 
   int woken = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
-    /* F4 (M28 #7): atomic CAS BLOCKED -> READY so two CPUs both trying
-     * to wake the same channel can't both enqueue. Reading wait_chan
-     * outside the CAS is fine — it's written only by scheduler_block_on
-     * under the task's own context (the task itself sets it before
-     * yielding), so the value is stable while the task is BLOCKED. */
-    if (T(i)->wait_chan != chan) continue;
+    struct task *t = T(i);
+    if (!t || t->wait_chan != chan) continue;
     enum task_state expected = TASK_BLOCKED;
-    if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+    if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY,
                                     0, __ATOMIC_ACQUIRE,
                                     __ATOMIC_RELAXED)) {
-      sched_rq_enqueue_current(T(i));
+      sched_rq_enqueue_current(t);
       woken++;
     }
   }
