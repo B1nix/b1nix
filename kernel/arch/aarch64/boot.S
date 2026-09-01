@@ -482,9 +482,18 @@ _ap_start:
 	dsb nsh
 	isb
 
+	// Caches ON, matching the boot CPU. This is not a performance preference:
+	// the BSP runs with C=1, so it accesses shared memory as Normal cacheable,
+	// and a secondary running the same memory with C=0 accesses it as Normal
+	// non-cacheable. Mismatched memory attributes for one location are
+	// architecturally unpredictable -- the secondary can read a value the BSP
+	// still holds dirty in its cache, and a later clean of that line can put
+	// the old bytes back over what the secondary wrote. Every shared structure
+	// in this kernel (the task table, the runqueues, kernel stacks) is exposed
+	// to it. QEMU models no cache at all, which is exactly why this survived.
 	mrs x0, sctlr_el1
-	bic x0, x0, #(1 << 2)		// C = 0
-	bic x0, x0, #(1 << 12)		// I = 0
+	orr x0, x0, #(1 << 2)		// C = 1 (data cache), as on the BSP
+	orr x0, x0, #(1 << 12)		// I = 1 (instruction cache), as on the BSP
 	bic x0, x0, #(1 << 19)		// WXN = 0
 	bic x0, x0, #(1 << 25)		// EE = 0
 	orr x0, x0, #(1 << 0)		// M = 1
