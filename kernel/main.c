@@ -1425,6 +1425,15 @@ void kernel_main(usize arg0, usize arg1)
 		 * bus-level half of the test applies to both arches. The Intel-only
 		 * parts detect their own absence and say so. */
 		pci_selftest();
+		/* The wall clock's civil-date conversion, against known answers.
+		 * Calendar arithmetic, so it runs on both arches (kernel/dev/rtc_dev.c). */
+		rtc_selftest();
+		/* btrfs, when a disk carrying one is attached: read a filesystem
+		 * mkfs.btrfs wrote and check what comes back. */
+		btrfs_selftest();
+		/* The nice/stride weighting, where the numbers live: the M46
+		 * userspace test can only observe the bias statistically. */
+		sched_nice_selftest();
 		/* netconsole is the klog ring over UDP — protocol, not hardware.
 		 * It only sat behind the x86_64 guard because it was written next
 		 * to the PAT/PCI tests above. */
@@ -1546,6 +1555,8 @@ void kernel_main(usize arg0, usize arg1)
 		 * already implements, and the scratch write now picks a disk nothing
 		 * has mounted (see blk_durability_selftest). */
 		blk_durability_selftest();
+		/* The block cache under concurrent readers, writers and evictions. */
+		blk_cache_torture_test();
 		/* linuxkpi and the DRM core are shim layers over this kernel's own
 		 * allocator, scheduler and VMM — there is nothing x86 in an idr, a
 		 * workqueue, a dma-fence or the GPU scheduler, and their sources are

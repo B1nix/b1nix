@@ -1,5 +1,11 @@
 /*
- * M98 — GNU-free build tools.
+ * M97 — GNU-free build tools.
+ *
+ * Numbered M97 ("GNU-Free ISO: Limine bootloader + BSD build tools") because
+ * that is the milestone this covers. It was M98 for a while, which is the
+ * driver-infrastructure milestone — whose own checks are in-kernel and emit
+ * M98-DRV-SMOKE, so two unrelated things answered to the same number in the
+ * same log.
  *
  * b1nix used to carry GNU Make (GPLv3) as /bin/make. It is now bmake (the
  * portable NetBSD make, BSD 3-clause) with samurai (a 0BSD reimplementation of
@@ -92,13 +98,13 @@ int main(void) {
   char out[1024];
   int rc;
 
-  marker("M98-SMOKE: start\n");
+  marker("M97-TOOLS: start\n");
 
   /* ── /bin/make is bmake, and it is not GNU Make ───────────────────────── */
   /* An empty regular file, not /dev/null: bmake opens its makefile as a file
    * and a character device is not one. */
   if (write_file("/tmp/m98-empty.mk", "") != 0) {
-    marker("M98-SMOKE: fail make-write-empty\n");
+    marker("M97-TOOLS: fail make-write-empty\n");
     return 1;
   }
   {
@@ -116,21 +122,21 @@ int main(void) {
         break;
       }
     if (rc == 0 && has_digit) {
-      marker("M98-SMOKE: ok make-is-bmake\n");
+      marker("M97-TOOLS: ok make-is-bmake\n");
     } else {
       char diag[256];
-      snprintf(diag, sizeof(diag), "M98-DEBUG: make -V rc=%d out=[%.160s]\n", rc, out);
+      snprintf(diag, sizeof(diag), "M97-TOOLS-DEBUG: make -V rc=%d out=[%.160s]\n", rc, out);
       marker(diag);
-      marker("M98-SMOKE: fail make-is-bmake\n");
+      marker("M97-TOOLS: fail make-is-bmake\n");
     }
   }
   {
     char *const argv[] = {(char *)"/bin/make", (char *)"--version", NULL};
     run_capture(argv, out, sizeof(out));
     if (strstr(out, "GNU Make") == NULL)
-      marker("M98-SMOKE: ok make-not-gnu\n");
+      marker("M97-TOOLS: ok make-not-gnu\n");
     else
-      marker("M98-SMOKE: fail make-not-gnu\n");
+      marker("M97-TOOLS: fail make-not-gnu\n");
   }
 
   /* ── bmake actually interprets a Makefile ─────────────────────────────── */
@@ -140,7 +146,7 @@ int main(void) {
                  "all: /tmp/m98-make.out\n"
                  "/tmp/m98-make.out:\n"
                  "\techo ${GREETING} > /tmp/m98-make.out\n") != 0) {
-    marker("M98-SMOKE: fail make-write-makefile\n");
+    marker("M97-TOOLS: fail make-write-makefile\n");
     return 1;
   }
   {
@@ -151,9 +157,9 @@ int main(void) {
      * command line first. Both the echo and the resulting file must be there. */
     if (rc == 0 && strstr(out, "b1nix-bmake-built") != NULL &&
         built_ok("/tmp/m98-make.out", "b1nix-bmake-built"))
-      marker("M98-SMOKE: ok make-build\n");
+      marker("M97-TOOLS: ok make-build\n");
     else
-      marker("M98-SMOKE: fail make-build\n");
+      marker("M97-TOOLS: fail make-build\n");
   }
   /* A second run must NOT re-run the recipe: the target is newer than its
    * prerequisites. That timestamp logic is the whole reason to ship a make
@@ -164,9 +170,9 @@ int main(void) {
                           (char *)"all", NULL};
     rc = run_capture(argv, out, sizeof(out));
     if (rc == 0 && strstr(out, "b1nix-bmake-built") == NULL)
-      marker("M98-SMOKE: ok make-uptodate\n");
+      marker("M97-TOOLS: ok make-uptodate\n");
     else
-      marker("M98-SMOKE: fail make-uptodate\n");
+      marker("M97-TOOLS: fail make-uptodate\n");
   }
 
   /* ── samurai runs, as /bin/samu and under the /bin/ninja alias ─────────── */
@@ -174,17 +180,17 @@ int main(void) {
     char *const argv[] = {(char *)"/bin/samu", (char *)"--version", NULL};
     rc = run_capture(argv, out, sizeof(out));
     if (rc == 0 && out[0] >= '0' && out[0] <= '9')
-      marker("M98-SMOKE: ok samu-version\n");
+      marker("M97-TOOLS: ok samu-version\n");
     else
-      marker("M98-SMOKE: fail samu-version\n");
+      marker("M97-TOOLS: fail samu-version\n");
   }
   {
     char *const argv[] = {(char *)"/bin/ninja", (char *)"--version", NULL};
     rc = run_capture(argv, out, sizeof(out));
     if (rc == 0)
-      marker("M98-SMOKE: ok ninja-alias\n");
+      marker("M97-TOOLS: ok ninja-alias\n");
     else
-      marker("M98-SMOKE: fail ninja-alias\n");
+      marker("M97-TOOLS: fail ninja-alias\n");
   }
 
   /* ── samurai actually executes a build graph ──────────────────────────── */
@@ -194,7 +200,7 @@ int main(void) {
                  "  command = echo b1nix-samu-built > $out\n"
                  "  description = GEN $out\n"
                  "build /tmp/m98-ninja.out: gen\n") != 0) {
-    marker("M98-SMOKE: fail samu-write-graph\n");
+    marker("M97-TOOLS: fail samu-write-graph\n");
     return 1;
   }
   {
@@ -202,9 +208,9 @@ int main(void) {
                           (char *)"/tmp/m98-ninja.out", NULL};
     rc = run_capture(argv, out, sizeof(out));
     if (rc == 0 && built_ok("/tmp/m98-ninja.out", "b1nix-samu-built"))
-      marker("M98-SMOKE: ok samu-build\n");
+      marker("M97-TOOLS: ok samu-build\n");
     else
-      marker("M98-SMOKE: fail samu-build\n");
+      marker("M97-TOOLS: fail samu-build\n");
   }
   /* Re-running a satisfied graph must be a no-op ("nothing to do"). */
   {
@@ -212,11 +218,11 @@ int main(void) {
                           (char *)"/tmp/m98-ninja.out", NULL};
     rc = run_capture(argv, out, sizeof(out));
     if (rc == 0 && strstr(out, "nothing to do") != NULL)
-      marker("M98-SMOKE: ok samu-uptodate\n");
+      marker("M97-TOOLS: ok samu-uptodate\n");
     else
-      marker("M98-SMOKE: fail samu-uptodate\n");
+      marker("M97-TOOLS: fail samu-uptodate\n");
   }
 
-  marker("M98-SMOKE: done\n");
+  marker("M97-TOOLS: done\n");
   return 0;
 }

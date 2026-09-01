@@ -2,6 +2,7 @@
 #include <b1nix/rtc.h>
 #include <b1nix/ktime.h>
 #include <b1nix/sched.h>
+#include <b1nix/console.h>
 
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
@@ -20,6 +21,7 @@ static int is_updating() {
   return (inb(CMOS_DATA) & 0x80);
 }
 
+
 void rtc_init(void) {
   /* Bounded UIP wait: a dead/absent RTC or a wedged southbridge can leave the
    * update-in-progress bit stuck forever; an unbounded spin here would hang the
@@ -34,6 +36,13 @@ void rtc_init(void) {
   u8 day = read_cmos(0x07);
   u8 month = read_cmos(0x08);
   u16 year = read_cmos(0x09);
+  /* CMOS 0x32 is the century register on every PC-compatible southbridge
+   * (QEMU included) and is what the FADT's century index points at when
+   * firmware declares one. It is read here rather than through ACPI because
+   * rtc_init runs from arch_init, before acpi_init has parsed any table. A
+   * value outside 19..21 means the register is absent or holding something
+   * else, and the two-digit year is then windowed the usual way below. */
+  u8 century = read_cmos(0x32);
 
   u8 registerB = read_cmos(0x0B);
 
@@ -45,29 +54,38 @@ void rtc_init(void) {
     day = (day & 0x0F) + ((day / 16) * 10);
     month = (month & 0x0F) + ((month / 16) * 10);
     year = (year & 0x0F) + ((year / 16) * 10);
+    century = (u8)((century & 0x0F) + ((century / 16) * 10));
   }
 
   // Convert 12 hour clock to 24 hour clock if necessary
   if (!(registerB & 0x02) && (hour & 0x80)) {
     hour = ((hour & 0x7F) + 12) % 24;
   }
+  hour &= 0x7F; /* the PM flag is not part of the hour in either mode */
 
-  // Calculate year
-  year += 2000;
+  /* A dead or torn RTC read must not drive the civil-date arithmetic with
+   * nonsense: fall back to the epoch date. The century is dropped along with
+   * the rest, so the windowing below reads 70 as 1970 rather than 2070. */
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 ||
+      minute > 59 || second > 60) {
+    month = 1;
+    day = 1;
+    hour = minute = second = 0;
+    year = 70;
+    century = 0;
+  }
 
-  // Simple Unix time calculation (seconds since 1970-01-01 00:00:00)
-  // This is a simplified version, not accounting for all leap years correctly
-  // but good enough for boot time offset.
-  u64 y = year - 1970;
-  u64 d = y * 365 + (y + 2) / 4; // approximate leap years since 1970
-  
-  static const u16 month_days[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
-  d += month_days[month - 1];
-  if (month > 2 && (year % 4 == 0)) d++;
-  d += day - 1;
+  /* Full year. The CMOS year register holds two digits; the century comes from
+   * 0x32 when that register is populated, and from the standard 1970 window
+   * (69 → 2069, 70 → 1970) when it is not. */
+  if (century >= 19 && century <= 21)
+    year = (u16)(century * 100 + year);
+  else
+    year = (u16)(year < 70 ? year + 2000 : year + 1900);
 
-  rtc_boot_time_seconds = d * 86400 + hour * 3600 + minute * 60 + second;
+  rtc_boot_time_seconds = rtc_civil_to_unix(year, month, day, hour, minute, second);
 }
+
 
 /* The wall clock, in nanoseconds since the epoch.
  *

@@ -1,6 +1,8 @@
 #include <b1nix/vfs.h>
 #include <b1nix/namespace.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/klog.h>
+#include <stdio.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
@@ -912,10 +914,34 @@ static u32 net_ip_as_be(struct ipv4_addr a) {
  * client it fails for, which is exactly what it did here while the socket
  * ioctl path answered ENODEV for anything that was not an ifreq command. */
 #define SOCK_FIONREAD 0x541B
+/* SIOCOUTQ (TIOCOUTQ's number): bytes this socket has accepted but not yet
+ * handed to the peer. dbus-broker asks on every write to decide whether it may
+ * queue more, and treats a refusal as fatal — "Inappropriate ioctl for device"
+ * out of its write path, which is where the system bus stopped. */
+#define SOCK_SIOCOUTQ 0x5411
 
 static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   if (!arg)
     return -EFAULT;
+
+  if (request == SOCK_SIOCOUTQ) {
+    struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+
+    if (!s)
+      return -ENOTSOCK;
+    /* Zero, and that is the honest answer rather than a placeholder: a send on
+     * this kernel copies into the destination before it returns — into the
+     * peer's receive buffer for AF_UNIX, into the TCP transmit path for a
+     * stream — so no bytes are ever left sitting on the sending side waiting
+     * for the caller to be told about them. A caller uses this to decide
+     * whether it may queue more; the answer here is always "yes". */
+    (void)s;
+    int v = 0;
+
+    if (syscall_copyout(arg, &v, sizeof(v)) != 0)
+      return -EFAULT;
+    return 0;
+  }
 
   if (request == SOCK_FIONREAD) {
     struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
@@ -1599,6 +1625,9 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
   new_s->type = s->type;
   /* An accepted socket inherits the listener's buffer sizes, as on Linux. */
   new_s->so_rcvbuf = s->so_rcvbuf;
+  /* An accepted connection inherits what the listening socket asked for. */
+  new_s->so_passpidfd = s->so_passpidfd;
+  new_s->so_no_passrights = s->so_no_passrights;
   new_s->so_sndbuf = s->so_sndbuf;
   /* An accepted connection inherits the listener's keepalive settings, as on
    * Linux — a server that asks for keepalive means the connections it serves,
@@ -1841,6 +1870,28 @@ isize vfs_socket_recv(int fd, void *buf, usize len, int flags) {
   return vfs_socket_recv_h(h, buf, len, flags);
 }
 
+/* `b1nix.trace-scm`: every descriptor handed across an AF_UNIX socket, on both
+ * sides of the transfer.
+ *
+ * Descriptor passing is a THREE-party affair in a bus system — a client makes
+ * the descriptor, the broker forwards it, the manager installs it — and a
+ * descriptor that goes missing shows up as none of the three reporting an
+ * error. Naming who sent how many, and who received how many, is the only way
+ * to see which hop dropped it. */
+static void scm_trace(const char *what, usize count) {
+  static int on = -1;
+
+  if (on < 0)
+    on = bootinfo_has_flag("b1nix.trace-scm") ? 1 : 0;
+  if (!on || !count)
+    return;
+
+  char line[128];
+  snprintf(line, sizeof(line), "scm: %s %u fd(s) pid=%u", what,
+           (unsigned)count, (unsigned)(current_task ? current_task->id : 0));
+  klog_info(line);
+}
+
 isize vfs_socket_sendmsg(int fd, const void *buf, usize len, int flags,
                          struct vfs_handle **handles, usize nhandles,
                          const struct b1nix_ucred *cred) {
@@ -1855,6 +1906,7 @@ isize vfs_socket_sendmsg(int fd, const void *buf, usize len, int flags,
       return -EOPNOTSUPP;
     if (nhandles > VFS_SCM_MAX_FDS)
       return -EINVAL;
+    scm_trace("send", nhandles);
     return unix_send_control(s, buf, len, handles, nhandles, cred,
                              (h->flags & B1NIX_O_NONBLOCK) ||
                                  (flags & B1NIX_MSG_DONTWAIT));
@@ -1913,6 +1965,15 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
 
   usize installed = 0;
   for (usize i = 0; i < nhandles; i++) {
+    /* SO_PASSRIGHTS cleared: this socket does not accept descriptors. Linux
+     * discards them rather than delivering them, and the sender is not told —
+     * the point of the option is that a receiver can guarantee it will never
+     * be handed one. */
+    if (s->so_no_passrights) {
+      vfs_handle_release(handles[i]);
+      handles[i] = 0;
+      continue;
+    }
     if (installed < fd_capacity) {
       int newfd = scheduler_fd_alloc(handles[i]);
       if (newfd >= 0) {
@@ -1930,7 +1991,21 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
   }
   if (received_count)
     *received_count = installed;
+  scm_trace("recv", nhandles);
+  scm_trace("installed", installed);
   return rc;
+}
+
+/* Does this socket want the sender's pidfd attached to each message? */
+int vfs_socket_wants_peer_pidfd(int fd) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+
+  if (!h || h->kind != VFS_HANDLE_SOCKET)
+    return 0;
+
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+
+  return s && s->domain == B1NIX_AF_UNIX && s->so_passpidfd;
 }
 
 /* ---- M32b: socket option / address / shutdown API ----
@@ -1949,8 +2024,28 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
 #define SOCK_SO_SNDTIMEO  21
 #define SOCK_SO_REUSEPORT 15
 #define SOCK_SO_PASSCRED  16
+/* Linux 6.5 and 6.16 respectively. A kernel that refuses them outright fails
+ * callers that treat the refusal as fatal: dbus-broker validates its
+ * controller socket with SO_PASSPIDFD and exits ("Protocol not available"),
+ * taking the system bus and everything on it with it. */
+#define SOCK_SO_PASSPIDFD 76
+#define SOCK_SO_PASSRIGHTS 83
 #define SOCK_SO_PEERCRED  17
+#define SOCK_SO_PEERSEC   31
+#define SOCK_SO_PEERGROUPS 59
+/* SO_PEERPIDFD (Linux 6.5): a DESCRIPTOR for the process on the other end,
+ * where SO_PEERCRED gives its pid. The difference is the point: by the time a
+ * pid is acted on it may name a different process, and a descriptor cannot.
+ * dbus-broker identifies every client this way. */
+#define SOCK_SO_PEERPIDFD 77
 #define SOCK_SO_ACCEPTCONN 30
+/* What KIND of socket this is, as three separate questions. A program handed a
+ * descriptor it did not create asks them before trusting it: dbus-broker
+ * validates the controller socket systemd passes it and exits with "Protocol
+ * not available" when the kernel cannot answer, which took the system bus and
+ * everything on it down with it. */
+#define SOCK_SO_PROTOCOL  38
+#define SOCK_SO_DOMAIN    39
 #define SOCK_SO_TIMESTAMP 29
 #define SOCK_SO_SNDBUFFORCE 32
 #define SOCK_SO_RCVBUFFORCE 33
@@ -2076,6 +2171,15 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     case SOCK_SO_PASSSEC:
       s->so_passsec = v ? 1 : 0;
       return 0;
+    /* SO_PASSPIDFD: every received message carries the sender's pidfd as
+     * SCM_PIDFD. Only AF_UNIX ever attaches one, which is also true on Linux. */
+    case SOCK_SO_PASSPIDFD:
+      s->so_passpidfd = v ? 1 : 0;
+      return 0;
+    /* SO_PASSRIGHTS: clearing it makes the socket refuse descriptors. */
+    case SOCK_SO_PASSRIGHTS:
+      s->so_no_passrights = v ? 0 : 1;
+      return 0;
     /* SO_TIMESTAMP / SO_TIMESTAMPNS: stamp each received message with the
      * moment it arrived and hand that back as an SCM_TIMESTAMP control
      * message. systemd-journald sets it on its native socket and treats the
@@ -2145,6 +2249,15 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
   int err;
   struct vfs_socket_state *s = socket_state_for_fd(fd, &err);
   if (!s) return err;
+
+  /* SO_PEERSEC: the peer's LSM label. There is none here, and the answer does
+   * not depend on the buffer — a caller sizing one passes a null pointer or a
+   * zero length, and the check below would refuse it with EINVAL. dbus-broker
+   * tolerates ENOPROTOOPT (a kernel built without SELinux or SMACK gives
+   * exactly that) and treats anything else as fatal. */
+  if (level == SOCK_SOL_SOCKET && optname == SOCK_SO_PEERSEC)
+    return -ENOPROTOOPT;
+
   if (!optval || !optlen) return -EINVAL;
 
   /* SO_PEERCRED is the one option whose value is not an int: it returns a
@@ -2160,6 +2273,67 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     *optlen = need;
     return 0;
   }
+
+  /* SO_PEERGROUPS: the peer's supplementary groups, as an array of gid_t. A
+   * bus checks them to decide what a client may ask for, so the honest answer
+   * matters — this reads the peer task's own credentials rather than inventing
+   * a list. ERANGE with the required size is what Linux answers a buffer that
+   * is too small, and callers use it to size a second call. */
+  if (level == SOCK_SOL_SOCKET && optname == SOCK_SO_PEERGROUPS) {
+    if (s->domain != B1NIX_AF_UNIX)
+      return -ENOPROTOOPT;
+
+    struct b1nix_ucred pc;
+    int rc = unix_peer_cred(s, &pc);
+
+    if (rc < 0)
+      return rc;
+
+    struct task *peer = pc.pid > 0 ? scheduler_task_by_pid((usize)pc.pid) : 0;
+    const struct cred *pcred = peer ? peer->cred : 0;
+
+    if (!pcred)
+      return -ESRCH;
+
+    usize count = (usize)(pcred->ngroups > 0 ? pcred->ngroups : 0);
+    usize need = count * sizeof(u32);
+
+    if (*optlen < need) {
+      *optlen = need;
+      return -ERANGE;
+    }
+    for (usize i = 0; i < count; i++)
+      ((u32 *)optval)[i] = (u32)pcred->groups[i];
+    *optlen = need;
+    return 0;
+  }
+
+  /* SO_PEERPIDFD: like SO_PEERCRED, but the answer is a descriptor. The value
+   * is an int (the descriptor), and it belongs to the caller from here — it is
+   * a new open file, exactly as accept(2) hands one back. */
+  if (level == SOCK_SOL_SOCKET && optname == SOCK_SO_PEERPIDFD) {
+    if (s->domain != B1NIX_AF_UNIX)
+      return -ENOPROTOOPT;
+
+    struct b1nix_ucred cred;
+    int rc = unix_peer_cred(s, &cred);
+
+    if (rc < 0)
+      return rc;
+    if (cred.pid <= 0)
+      return -ESRCH; /* the peer is gone; there is nothing to name */
+    if (*optlen < sizeof(int))
+      return -EINVAL;
+
+    int peer_fd = vfs_pidfd_open((usize)cred.pid, 0);
+
+    if (peer_fd < 0)
+      return peer_fd;
+    memcpy(optval, &peer_fd, sizeof(peer_fd));
+    *optlen = sizeof(int);
+    return 0;
+  }
+
 
   if (level == SOCK_SOL_SOCKET &&
       (optname == SOCK_SO_RCVTIMEO || optname == SOCK_SO_SNDTIMEO)) {
@@ -2187,7 +2361,13 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     case SOCK_SO_SNDBUF:    v = s->so_sndbuf; break;
     case SOCK_SO_RCVBUF:    v = s->so_rcvbuf; break;
     case SOCK_SO_ACCEPTCONN: v = s->listening; break;
+    case SOCK_SO_DOMAIN:    v = s->domain; break;
+    /* The protocol within the family. Every socket b1nix creates is its
+     * family's default, which is what 0 means to the caller asking. */
+    case SOCK_SO_PROTOCOL:  v = s->protocol; break;
     case SOCK_SO_PASSCRED:  v = s->so_passcred; break;
+    case SOCK_SO_PASSPIDFD: v = s->so_passpidfd; break;
+    case SOCK_SO_PASSRIGHTS: v = s->so_no_passrights ? 0 : 1; break;
     case SOCK_SO_TIMESTAMP: v = s->so_timestamp; break;
     case SOCK_SO_TIMESTAMPNS: v = s->so_timestampns; break;
     case SOCK_SO_PASSSEC:   v = s->so_passsec; break;

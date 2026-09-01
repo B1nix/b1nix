@@ -97,6 +97,12 @@ static void fail(const char *name, const char *why) {
   printf("M95-SMOKE: FAIL %s (%s)\n", name, why);
   failures++;
 }
+/* A check that could not run at all. Neither a pass nor a failure — and said
+ * out loud, because a check quietly omitted is indistinguishable from one that
+ * succeeded. */
+static void skip(const char *name, const char *why) {
+  printf("M95-SMOKE: skip %s (%s)\n", name, why);
+}
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
@@ -638,24 +644,25 @@ static void t_unpriv(void) {
 /* A mounted filesystem pins the module that provides it. Built by hand: the
  * btrfs mount path only needs the superblock magic at BTRFS_SUPER_INFO_OFFSET,
  * so a sparse file plus eight bytes is a mountable image. */
-#define BTRFS_IMG   "/tmp/m95-btrfs.img"
+/* A real btrfs filesystem, built by mkfs.btrfs at image-build time. It used to
+ * be fabricated here by writing the btrfs magic into an empty file, which the
+ * driver accepted only while it read nothing but the magic; it reads the
+ * filesystem now, so a made-up one is correctly refused. */
+#define BTRFS_IMG   "/btrfs-test.img"
 #define BTRFS_MNT   "/tmp/m95-btrfs-mnt"
-#define BTRFS_SB_AT (65536 + 0x40)
 
 #define LOOP_SET_FD       0x4C00
 #define LOOP_CLR_FD       0x4C01
 #define LOOP_CTL_GET_FREE 0x4C82
 
 static void t_fs_in_use(void) {
-  int img = open(BTRFS_IMG, O_RDWR | O_CREAT | O_TRUNC, 0644);
+  int img = open(BTRFS_IMG, O_RDWR);
+
   if (img < 0) {
-    fail("fs-in-use", "cannot create the backing file");
-    return;
-  }
-  if (ftruncate(img, 256 * 1024) != 0 ||
-      pwrite(img, "_BHRfS_M", 8, BTRFS_SB_AT) != 8) {
-    fail("fs-in-use", "cannot write the superblock magic");
-    close(img);
+    /* No image means btrfs-progs was absent when the machine was built. Said
+     * out loud rather than passed: a check that could not run is not a check
+     * that succeeded. */
+    skip("fs-in-use", "no btrfs image in the machine (btrfs-progs absent at build time)");
     return;
   }
 
@@ -724,7 +731,8 @@ out_loop:
   ioctl(loop, LOOP_CLR_FD, 0);
   close(loop);
   rmdir(BTRFS_MNT);
-  unlink(BTRFS_IMG);
+  /* The image belongs to the machine, not to this run: it is built into the
+   * root filesystem and the next test to want a btrfs needs it too. */
 }
 
 /* /proc/filesystems labels a type "nodev" exactly when it needs no block

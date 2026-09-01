@@ -627,6 +627,12 @@ static int fault_anon_user_page(u64 va) {
   /* Honour the mapping's protection instead of always mapping writable. */
   if (!hit || (hit->prot & PROT_WRITE))
     flags |= VMM_WRITABLE;
+  /* ... and its execute permission, for the same reason: an anonymous mapping
+   * that did not ask for PROT_EXEC gets UXN, so a heap or stack page cannot be
+   * jumped into. Without a VMA to consult the old permissive behaviour stands
+   * rather than guessing, which is what the x86_64 pager does here too. */
+  if (hit && !(hit->prot & PROT_EXEC))
+    flags |= VMM_NO_EXECUTE;
   map_page_locked(va, frame, flags); /* invalidates the page itself */
   return 0;
 }
@@ -812,6 +818,11 @@ static int file_fill_fault(u64 *l3, usize i3, u64 va, u64 lazy_entry) {
   u64 flags = VMM_PRESENT | VMM_USER;
   if (lazy_entry & VMM_WRITABLE)
     flags |= VMM_WRITABLE;
+  /* A file mapping is executable only if it asked to be: this is the path that
+   * faults in a program's own segments, so it decides whether its data is
+   * jumpable. */
+  if (vma && !(vma->prot & PROT_EXEC))
+    flags |= VMM_NO_EXECUTE;
   if (vma_shared)
     flags |= VMM_SHARED;
   if (cache_frame && !vma_shared && (flags & VMM_WRITABLE)) {

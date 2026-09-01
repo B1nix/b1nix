@@ -27,9 +27,12 @@ systemd-journald.service: Failed at step CREDENTIALS spawning \
     /usr/lib/systemd/systemd-journald: Function not implemented
 ```
 
-**`tests/arch-smoke.sh` does not pass.** Of its 31 checks two are green (the
-kernel builds; no panic); the rest need daemons that never start. The reason is
-one missing piece of kernel, named in [Where it stops](#where-it-stops).
+**`tests/arch-smoke.sh` passes all 33 checks.** The boot reaches
+`multi-user.target` and `graphical.target`; journald, udevd, logind, the system
+bus, socket activation, timers, `Restart=`, the notify protocol, `PrivateTmp=`,
+`ProtectSystem=strict`, device units, transient units and the console getty all
+work. A stock Arch userspace with systemd 261 on glibc 2.44 runs on this
+kernel.
 
 One measurement worth recording because it is better than the one above and was
 not reproduced: on an intermediate tree — after ambient capabilities and
@@ -285,33 +288,90 @@ handed out again.
 
 ## Where it stops
 
-**journald, logind, udevd and dbus-broker fail at step `CREDENTIALS` with
-`ENOSYS`.** systemd's per-unit credentials directory is built with the mount
-API that came after `mount(2)` — `fsopen`/`fsconfig`/`fsmount` to make a
-superblock, `open_tree`/`move_mount` to attach it, `mount_setattr` to seal it
-read-only — and b1nix implements none of it.
+**The new mount API is implemented, and the CREDENTIALS wall is gone.**
+journald now starts: it parses its configuration, reports "Collecting audit
+messages is disabled" and runs. `fsopen`, `fsconfig`, `fsmount`, `open_tree`,
+`move_mount` and `mount_setattr` all answer for real — see
+`kernel/fs/mount_api.c` and the detached-mount table in `kernel/fs/vfs.c`.
 
-That is a decision, not an omission, and it was reached the expensive way:
-every part of that family was written, measured, and then **withdrawn**.
+The design question this file used to end on — "teaching the VFS to hold a
+mount that is attached nowhere" — was answered by NOT adding a second mount
+table. A detached mount is a real mount under a private directory
+(`/.b1nix-detached/<id>`) that is hidden from `/proc/mounts` and mountinfo, and
+`move_mount` is the MS_MOVE this kernel already had. Three consequences made it
+the right shape rather than merely the cheap one:
 
-- `open_tree(2)` and `move_mount(2)` were implemented by modelling
-  `OPEN_TREE_CLONE` as "a bind of the path the descriptor was opened under".
-  Arch's journald got one step further with them — past `CREDENTIALS`, to
-  `RUNTIME_DIRECTORY` — and **Debian's systemd suite fell from 32 of 32 to 18**:
-  systemd 252 found the calls present, took the new mount API for its unit
-  sandboxing, and lost socket activation, the readiness protocol and its device
-  units. A guess about what a caller meant is not an implementation.
-- `mount_setattr(2)` was implemented correctly and on its own terms, and it was
-  withdrawn too. With it, systemd's credentials setup gets far enough in to
-  *wedge the boot transaction* at journald instead of failing fast, and the run
-  never reaches `multi-user.target` at all. One member of a family whose absence
-  is detected as a unit is a trap: it is strictly worse than the whole family
-  being absent, which is the case every caller's fallback is written for.
+- the descriptor `fsmount` returns is an ordinary O_PATH directory descriptor,
+  so `openat(mfd, "cred", O_CREAT)` works. systemd fills a credentials
+  directory that way *before* the mount has a place, and the first attempt at
+  this — a descriptor with no path behind it — answered EBADF at exactly that
+  step;
+- every filesystem type can be instantiated, not only the ones whose mount
+  callback ignores its target;
+- unmount, propagation, mountinfo and namespace cloning keep working on it,
+  because it is not a special case.
 
-So the whole family answers `ENOSYS`. Doing it properly means teaching the VFS
-to hold a mount that is attached nowhere — b1nix's mount table is keyed by path
-and cannot express a detached mount — and that is a VFS change, not a syscall
-one.
+Four defects were found by walking the error one layer at a time, and each is
+worth recording because none of them is guessable from the specification:
+
+| Symptom | Cause |
+|---|---|
+| `CREDENTIALS ... Function not implemented` | the family was absent |
+| `... Bad file descriptor` | the mount descriptor was an anonymous object; systemd uses it as a **dirfd** |
+| `... Operation not supported` | `fsconfig(FSCONFIG_CMD_RECONFIGURE)` was refused. systemd creates the tmpfs, writes into it, sets `ro` and reconfigures — the refusal was one call from the end |
+| `... Invalid argument` | after `fsmount`, the fs context dropped its reference to the filesystem, so the reconfigure that follows had nothing to act on. In Linux the context keeps referring to the superblock; ownership and reference are different things |
+
+systemd also **probes**: it calls `fsconfig` with a deliberately absent option
+(`adefinitelynotexistingmountoption`) to find out whether the kernel validates
+options at all. An implementation that accepts everything tells it the wrong
+thing about every option afterwards, so an unknown parameter is EINVAL here and
+only a filesystem's own hints (`size`, `mode`, `nr_inodes`, …) are accepted.
+
+### PID 1's standard descriptors
+
+Found while chasing the abort below, and a real difference from Linux rather
+than a systemd quirk: **b1nix started its first process with an empty
+descriptor table.** Linux's `kernel_init` opens `/dev/console` and dups it onto
+0, 1 and 2, and every process inherits its stdio from there.
+
+The consequence is not "no output". A manager's stdio `FILE*` refers to
+descriptor 0 whether or not anything is open on it, so the first transient
+descriptor the process opens lands ON 0 — the `b1nix.trace-fd=0` trace shows
+every `openat` in PID 1 returning 0, over and over — and the next `close(2)` of
+that transient silently closes what libc still calls stdin.
+
+PID 1 now gets `/dev/console` on 0, 1 and 2. The trace confirms it arrives:
+systemd's first act on descriptor 0 is a `dup2` over it, which is what a
+manager does with a console it has been given.
+
+### What stops the boot now
+
+Nothing. The boot completes and every check passes.
+
+### How the boot got the rest of the way
+
+Each of these was found by following one error at a time, and none of them is
+guessable from the specification:
+
+| What systemd reported | What it actually was |
+|---|---|
+| `Failed to spawn executor: Inappropriate ioctl for device` | clone3 wrote the CLONE_PIDFD descriptor only on its fork-like path, so a posix_spawn (which passes a stack) got nothing written and systemd used descriptor 0 — its own stdin — as the child's pidfd |
+| `... Bad file descriptor` | ioctl on an anonymous object answered EBADF, which says "that is not a descriptor" about one the caller holds |
+| `... Object is remote` | a pidfd's inode numbered the DESCRIPTOR; on Linux it identifies the PROCESS, so two pidfds for one process compare equal |
+| `Failed to set up mount namespacing: /proc/sys/kernel/domainname: Not a directory` | open_tree forced O_DIRECTORY; a file is the ordinary case, since every ReadOnlyPaths= entry is a file bound over a file |
+| `Failed to set up mount namespacing: /dev: Invalid argument` | mount_setattr on a path that is not a mount root refused, where Linux applies the attributes to the mount the path is ON |
+| `Failed to create SIGTERM event source: File exists` | an epoll registration was keyed by descriptor NUMBER rather than by the file behind it, so a watch left by a closed descriptor blocked the next one to reuse the number |
+| `ERROR sockopt_get_peersec: Invalid argument` | getsockopt's kernel buffer was a fixed 64 bytes; anything larger was refused before the option code ran |
+| `ERROR socket_dispatch_write: Inappropriate ioctl for device` | SIOCOUTQ was unimplemented, and dbus-broker asks on every write |
+| `StandardOutputFileDescriptor passed is of incompatible type` | fcntl(F_GETFL) reported O_RDONLY for BOTH ends of a pipe, so a pipe handed over as stdout read as unwritable |
+| `Failed to touch /run/udev/queue: Not a directory` | `utimensat(fd, "", AT_EMPTY_PATH)` — how systemd spells futimens on an O_PATH descriptor — was treated as a relative path and joined onto the file's own, producing a trailing slash. udevd hit it after every event and never finished a run, which is why no `.device` unit ever appeared |
+| `Assertion 'errno != EBADF \|\| IN_SET(fd, STDIN, STDOUT, STDERR)' failed ... isatty_safe()` | ioctl on a PIPE answered EBADF, and isatty(3) is an ioctl. glibc reads ENOTTY as "not a terminal" and EBADF as "that descriptor is not open"; systemd asserts on the difference, so a pipe handed to a service as its stdio aborted the service the moment it asked whether it was a terminal. Every unit started with `systemd-run --pipe` died on it |
+
+The descriptor relay behind the last one is worth recording because it was
+cleared as a suspect rather than guessed at: `b1nix.trace-scm` showed
+`systemd-run` sending three descriptors, dbus-broker receiving and installing
+three, and PID 1 receiving and installing three. The passing worked; the
+service died after it had them.
 
 ## Open
 

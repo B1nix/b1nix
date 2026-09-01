@@ -220,7 +220,7 @@ During `load_module()`:
 
 ### 7.1 `/proc/modules` Format
 
-`/proc/modules` (implemented in `kernel/fs/procfs.c`) outputs line-by-line:
+`/proc/modules` (implemented in `kernel/fs/proc/procfs.c`) outputs line-by-line:
 ```
 <module_name> <size_bytes> <refcount> <state> <dependencies>
 ntfs 65536 1 Live -

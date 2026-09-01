@@ -271,7 +271,6 @@ BINARIES := \
 	$(M53_PORT_SMOKES) \
 	$(BUILD)/bin/m34_smoke \
 	$(BUILD)/bin/m35_smoke \
-	$(BUILD)/bin/m36_smoke \
 	$(BUILD)/bin/diskbench \
 	$(BUILD)/bin/mdcreate \
 	$(BUILD)/bin/telinit \
@@ -368,7 +367,8 @@ BINARIES += $(BUILD)/bin/m109_smoke
 # M109: the uevent hot-plug channel - netlink uevents, /sys/dev/block, mdev.
 BINARIES += $(BUILD)/bin/m109_uevent_smoke
 # M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
-BINARIES += $(BUILD)/bin/m98_smoke
+BINARIES += $(BUILD)/bin/m97_tools_smoke
+# M100: DRM core -- scatter-gather GEM objects through /dev/dri/card0.
 BINARIES += $(BUILD)/bin/m100_smoke
 # M119: Developer-Centric Filesystems (fwcfgfs, debugfs, tarfs)
 BINARIES += $(BUILD)/bin/m119_smoke
@@ -485,7 +485,27 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 # the sub-make command line keeps that checkout clean for check-b1cc-sync.
 B1CC_HOST_CFLAGS ?= -std=c23 -D_DEFAULT_SOURCE -Wall -Wextra -O3 -flto -march=native $(B1CC_INCS_HOST)
 
-$(B1CC): $(B1CC_DIR)/Makefile $(wildcard $(B1CC_SRC_GLOB))
+# The revision the submodule is checked out at. b1cc's own build rebuilds an
+# object only when its .c file is newer, so switching revisions — which changes
+# headers and sources at once and can leave objects NEWER than the sources they
+# came from — links a binary built from two different versions of the compiler.
+# That does not fail loudly: it produced a b1cc that segfaulted in codegen on
+# hello world and reported "unknown IR op load", which reads as a compiler
+# regression rather than as a build that never happened. Recording the revision
+# and wiping the object tree when it changes costs one full rebuild per
+# submodule bump and removes the whole class.
+B1CC_REV_STAMP := $(BUILD)/b1cc-revision
+B1CC_REV := $(shell git -C $(B1CC_DIR) rev-parse HEAD 2>/dev/null)
+
+$(B1CC_REV_STAMP): $(B1CC_DIR)/.git
+	@mkdir -p $(dir $@)
+	@if [ "$$(cat $@ 2>/dev/null)" != "$(B1CC_REV)" ]; then \
+	    rm -rf $(B1CC_DIR)/build; \
+	    printf '%s' '$(B1CC_REV)' > $@; \
+	fi
+	@touch $@
+
+$(B1CC): $(B1CC_REV_STAMP) $(B1CC_DIR)/Makefile $(wildcard $(B1CC_SRC_GLOB))
 	$(MAKE) -C $(B1CC_DIR) CC="$(HOST_CC)" CFLAGS="$(B1CC_HOST_CFLAGS)"
 
 # ── Source layout ──
@@ -1120,7 +1140,7 @@ endif
 		*) rm -f $(ROOTFS)/bin/$$n ;; \
 		esac; \
 	done
-	@for b in m12_smoke:m12-smoke m13_smoke:m13-smoke m13_job_control:m13-job-control m14_smoke:m14-smoke m15_smoke:m15-smoke m17_smoke:m17-smoke m24b_smoke:m24b-smoke m25_smoke:m25-smoke m26_smoke:m26-smoke m27_smoke:m27-smoke m29_smoke:m29-smoke m31_smoke:m31-smoke m31_setuid:m31-setuid m32_smoke:m32-smoke m34_smoke:m34-smoke m35_smoke:m35-smoke m36_smoke:m36-smoke m47_smoke:m47-smoke m48_smoke:m48-smoke  m50_smoke:m50-smoke m51_smoke:m51-smoke  m57_smoke:m57-smoke m75_smoke:m75-smoke; do \
+	@for b in m12_smoke:m12-smoke m13_smoke:m13-smoke m13_job_control:m13-job-control m14_smoke:m14-smoke m15_smoke:m15-smoke m17_smoke:m17-smoke m24b_smoke:m24b-smoke m25_smoke:m25-smoke m26_smoke:m26-smoke m27_smoke:m27-smoke m29_smoke:m29-smoke m31_smoke:m31-smoke m31_setuid:m31-setuid m32_smoke:m32-smoke m34_smoke:m34-smoke m35_smoke:m35-smoke m47_smoke:m47-smoke m48_smoke:m48-smoke  m50_smoke:m50-smoke m51_smoke:m51-smoke  m57_smoke:m57-smoke m75_smoke:m75-smoke; do \
 		src=$${b%%:*}; dst=$${b##*:}; \
 		[ "$$(readlink $(ROOTFS)/bin/$$dst 2>/dev/null)" = "$$src" ] || \
 			ln -sfn $$src $(ROOTFS)/bin/$$dst; \

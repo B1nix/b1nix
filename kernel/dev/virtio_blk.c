@@ -133,6 +133,12 @@ static void virtio_blk_unlock(struct virtio_blk_instance *inst) {
  * so the stall report prints them. */
 static volatile u64 vblk_irq_completions;
 static volatile u64 vblk_irq_foreign;
+/* Stall reports already printed, and the two limits that bound them: a report
+ * is worth making once the wait is clearly not ordinary latency, and worth
+ * making only a handful of times. */
+static volatile u64 vblk_stall_reports;
+#define VIRTIO_BLK_STALL_REPORT_TICKS 200 /* 2 s at 10 ms a tick */
+#define VIRTIO_BLK_STALL_REPORT_MAX   8
 
 static int virtio_blk_irq(void *ctx) {
   struct virtio_blk_instance *inst = (struct virtio_blk_instance *)ctx;
@@ -394,7 +400,17 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
      * the whole system stops on one descriptor chain. The watchdog re-poll
      * alone cannot say why, so once the wait is clearly not ordinary latency,
      * describe the request and the queue indices that should have moved. */
-    if (++waits == 32) {
+    /* Report by ELAPSED TIME, not by poll count, and only a few times.
+     *
+     * In a context that cannot block, the loop below spins on yield, so a
+     * request that takes a few milliseconds racks up dozens of "waits" and
+     * printed a stall report for each one. Six thousand of those reports went
+     * out of a 115200-baud serial port during one btrfs commit — the printing
+     * itself then WAS the delay, and the message that exists to explain a
+     * stall was manufacturing one. A real stall still says so. */
+    if (scheduler_get_ticks() - wait_start > VIRTIO_BLK_STALL_REPORT_TICKS &&
+        vblk_stall_reports < VIRTIO_BLK_STALL_REPORT_MAX && ++waits == 1) {
+      vblk_stall_reports++;
       console_write("virtio-blk: request not completing: type ");
       console_write_dec(type);
       console_write(" lba ");

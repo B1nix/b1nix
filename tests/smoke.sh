@@ -926,8 +926,79 @@ launch_blk() {
 		# driver is the legacy port-I/O one, which aarch64 cannot speak).
 		vblk_device=virtio-blk-pci
 		[ "$ARCH" = "aarch64" ] && vblk_device=virtio-blk-device
+		# ... and a CFI NOR flash chip, which is what MTD is for.
+		#
+		# QEMU gives x86_64 raw flash only through `-drive if=pflash`, and
+		# pflash unit 1 requires unit 0, which is the machine's firmware.
+		# Putting SeaBIOS there rather than OVMF keeps the ordinary BIOS
+		# boot working -- under OVMF the kernel does not load at all
+		# ("multiboot2: Could not find viable load address"), so a UEFI
+		# firmware would have traded flash for the ability to boot.
+		#
+		# The chip is emulated hardware, not a RAM pretence: the driver
+		# probes it with a CFI query and reads its size and erase-block
+		# layout out of the chip's own table.
+		_flash="$PROJECT_DIR/smoke_run/flash-blk.img"
+		_bios=""
+		if [ "$ARCH" != "aarch64" ]; then
+			dd if=/dev/zero of="$_flash" bs=1M count=4 2>/dev/null
+			for _b in /usr/share/qemu/bios-256k.bin /usr/share/seabios/bios-256k.bin; do
+				[ -f "$_b" ] && { _bios="$_b"; break; }
+			done
+		fi
+		# A btrfs filesystem made by mkfs.btrfs, with known content. The
+		# point is that it is NOT made by us: the read path is checked
+		# against a filesystem another implementation wrote, which is the
+		# only way to find out whether the on-disk format was read or
+		# merely reproduced. Skipped, not faked, where btrfs-progs is
+		# absent -- the checks below are keyed off the same condition.
+		BTRFS_IMG=$(disk_img btrfs blk)
+		BTRFS_READY=0
+		if command -v mkfs.btrfs >/dev/null 2>&1; then
+			_bdir="$PROJECT_DIR/smoke_run/btrfs-root-$$"
+			rm -rf "$_bdir"; mkdir -p "$_bdir/dir/sub"
+			# `command printf`, not printf: this script overrides printf
+			# to prefix every line with the architecture label, which is
+			# right for progress output and wrong for file content — the
+			# label ended up INSIDE the test files, and the guest was
+			# marked wrong for reading exactly what was written.
+			command printf 'hello from btrfs\n' > "$_bdir/hello.txt"
+			# Large enough to need a regular extent rather than an
+			# inline one, so both kinds are exercised. The content is
+			# a formula rather than random bytes so the guest can
+			# check what it read without being handed the answer:
+			# byte N of the file is derivable from N alone.
+			python3 -c "
+import sys
+with open('$_bdir/big.bin','wb') as f:
+    for i in range(192*1024//16):
+        f.write(b'%014d\n' % i)
+" 2>/dev/null || command printf 'skip' > "$_bdir/big.bin"
+			command printf 'nested\n' > "$_bdir/dir/sub/deep.txt"
+			ln -s hello.txt "$_bdir/link.txt"
+			rm -f "$BTRFS_IMG"; truncate -s 512M "$BTRFS_IMG"
+			# mkfs's own defaults, free-space tree included: that
+			# tree is what a real disk carries, and the driver has
+			# to keep it right rather than being handed a
+			# filesystem shaped to suit it.
+			if mkfs.btrfs -q -L B1NIX-BTRFS -m single -d single \
+				--nodesize 16384 --rootdir "$_bdir" "$BTRFS_IMG" 2>/dev/null; then
+				BTRFS_READY=1
+			fi
+			rm -rf "$_bdir"
+		fi
 		EXTRA_QEMU_ARGS="-drive file=$(disk_img usb blk),if=none,id=usbdisk,format=raw -device usb-storage,bus=xhci.0,drive=usbdisk \
 			-drive file=$(disk_img vblk blk),if=none,id=vblkdisk,format=raw,discard=unmap -device $vblk_device,drive=vblkdisk"
+		if [ "$BTRFS_READY" = 1 ]; then
+			EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS \
+			-drive file=$BTRFS_IMG,if=none,id=btrfsdisk,format=raw -device $vblk_device,drive=btrfsdisk"
+		fi
+		export BTRFS_READY
+		if [ -n "$_bios" ]; then
+			EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS \
+			-drive if=pflash,format=raw,readonly=on,file=$_bios,unit=0 \
+			-drive if=pflash,format=raw,file=$_flash,unit=1"
+		fi
 		export EXTRA_QEMU_ARGS
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[blk]   "
@@ -1545,6 +1616,9 @@ check_output "$LOG" "M17-SMOKE: ok o-nofollow-eloop" "M17 O_NOFOLLOW refuses a s
 check_output "$LOG" "M17-SMOKE: ok o-path-symlink" "M17 O_PATH|O_NOFOLLOW opens the symlink itself and fstat reports S_IFLNK"
 check_output "$LOG" "M17-SMOKE: ok o-path-read-ebadf" "M17 an O_PATH descriptor has no contents to read (EBADF)"
 check_output "$LOG" "M17-SMOKE: ok o-path-dirfd" "M17 an O_PATH directory descriptor still anchors openat()"
+check_output "$LOG" "M17-SMOKE: ok renameat2-noreplace" "M17 renameat2(RENAME_NOREPLACE) refuses with EEXIST and leaves both files intact, instead of ignoring the flag and clobbering the destination"
+check_output "$LOG" "M17-SMOKE: ok renameat2-einval" "M17 renameat2 rejects RENAME_EXCHANGE and unknown flags with EINVAL rather than silently doing a plain rename"
+check_output "$LOG" "M17-SMOKE: ok renameat2-plain" "M17 renameat2 with no flags is still an ordinary rename"
 check_output "$LOG" "M17-SMOKE: done" "M17 smoke completes successfully"
 
 # ── M8 AIO / completion queues ──
@@ -1638,6 +1712,9 @@ check_output "$LOG" "MM-SMOKE: ok copyout-readonly" "a syscall asked to write in
 check_output "$LOG" "MM-SMOKE: ok file-map-privacy" "a store into a MAP_PRIVATE file page the process never faulted itself stays out of the file, and the same store through MAP_SHARED reaches it (the pages a read fault maps AROUND itself come straight from the page cache, so the protection they are installed with decides whether one process's writes are served to the next)"
 check_output "$LOG" "MM-SMOKE: ok rseq-after-sigkill" "a task SIGKILLed while it holds an rseq(2) registration gives it back, so a later process can still register (glibc registers one per thread and treats a refusal as fatal, so a leaked entry kills programs rather than slowing them)"
 check_output "$LOG" "MM-SMOKE: ok mmap-after-sigkill" "a task SIGKILLed inside mmap hands back the address-space lock, so unrelated processes can still map memory (a leaked slot blocks every process hashing to it, for ever, with no error and no panic)"
+check_output "$LOG" "MM-SMOKE: ok wx-data-noexec" "W^X: an anonymous PROT_READ|PROT_WRITE mapping is not executable — jumping into it raises SIGSEGV"
+check_output "$LOG" "MM-SMOKE: ok wx-exec-after-mprotect" "W^X: mprotect(PROT_READ|PROT_EXEC) still grants execute, so the JIT flip every runtime performs keeps working"
+check_output "$LOG" "MM-SMOKE: ok wx-text-readonly" "W^X: a process's own .text is not writable"
 check_output "$LOG" "MM-SMOKE: done" "MM smoke completes"
 
 # ── M40 Linux ABI compatibility ──
@@ -2479,6 +2556,10 @@ check_output "$LOG" "M46-SMOKE: ok setpgid-eperm-pgrp" "setpgid into a nonexiste
 check_output "$LOG" "M46-SMOKE: ok getpgid" "getpgid(0) matches getpgrp()"
 check_output "$LOG" "M46-SMOKE: ok getpgid-esrch" "getpgid on a nonexistent pid returns ESRCH"
 check_output "$LOG" "M46-SMOKE: ok nice-roundtrip" "nice() and getpriority() round-trip"
+check_output "$LOG" "M46-SCHED: ok stride-values" "the nice weighting is the stride it promises: -20 = 25, 0 = 50, 19 = 1000 (checked in-kernel, where the numbers are, not inferred from how often processes ran)"
+check_output "$LOG" "M46-SCHED: ok stride-clamped" "a nice value outside -20..19 clamps instead of dividing by zero or going negative"
+check_output "$LOG" "M46-SCHED: ok stride-monotonic" "a higher nice is never scheduled more often, at every step of the range"
+check_output "$LOG" "M46-SCHED: ok stride-selection" "running the smallest pass and advancing it by that task's stride picks nice -20 exactly twice as often as nice 0"
 check_output "$LOG" "M46-SMOKE: ok fork-sigmask" "fork child inherits the blocked-signal mask"
 check_output "$LOG" "M46-SMOKE: ok append-atomic" "concurrent O_APPEND writers never overwrite each other"
 check_output "$LOG" "M46-SMOKE: ok truncate-zeros" "shrink-then-grow truncate reads back zeros"
@@ -2662,6 +2743,14 @@ check_output "$LOG" "M107-SMOKE: ok applet-losetup" "BusyBox losetup attaches, l
 check_output "$LOG" "M107-SMOKE: ok applet-hwclock" "BusyBox hwclock -r reads the hardware clock"
 check_output "$LOG" "M107-SMOKE: ok applet-lsof" "BusyBox lsof lists an open file by its full path"
 check_output "$LOG" "M107-SMOKE: ok applet-chvt" "BusyBox chvt switches the active virtual terminal"
+check_output "$LOG" "M107-SMOKE: ok mount-api-fsopen" "the new mount API: fsopen(2) opens a filesystem context"
+check_output "$LOG" "M107-SMOKE: ok mount-api-rejects-unknown-option" "fsconfig refuses a parameter the filesystem does not have, so a caller probing for option support is not misled"
+check_output "$LOG" "M107-SMOKE: ok mount-api-create" "fsconfig(FSCONFIG_CMD_CREATE) builds the superblock before it has anywhere to be"
+check_output "$LOG" "M107-SMOKE: ok mount-api-fsmount" "fsmount(2) turns it into a mount attached nowhere"
+check_output "$LOG" "M107-SMOKE: ok mount-api-openat-detached" "the mount descriptor is a directory descriptor: a file can be written into the mount before it has a place (this is how systemd fills a credentials directory)"
+check_output "$LOG" "M107-SMOKE: ok mount-api-not-attached-yet" "and it is genuinely not reachable at the target until move_mount"
+check_output "$LOG" "M107-SMOKE: ok mount-api-move-mount" "move_mount(2) attaches it, with the bytes written before attachment intact"
+check_output "$LOG" "M107-SMOKE: ok mount-api-setattr" "mount_setattr(MOUNT_ATTR_RDONLY) really seals it: a write is refused with EROFS"
 check_output "$LOG" "M107-SMOKE: done" "M107 subsystem suite completes"
 # ── M109: AF_PACKET, pivot_root(2), volume identity ──
 check_output "$BLK_LOG" "M109-SMOKE: ok packet-socket" "an AF_PACKET socket binds to an interface and getsockname reports a 20-byte sockaddr_ll"
@@ -2855,15 +2944,15 @@ check_output "$LOG" "M96-SMOKE: ok lsmod" "lsmod's output agrees with /proc/modu
 check_output "$LOG" "M96-SMOKE: done" "M96 protocol-module and module-parameter suite completes"
 
 # ── M98: GNU-free in-guest build tools (bmake + samurai replaced GNU Make) ──
-check_output "$LOG" "M98-SMOKE: ok make-is-bmake" "/bin/make answers bmake's -V (GNU Make rejects it), so it is the BSD make"
-check_output "$LOG" "M98-SMOKE: ok make-not-gnu" "/bin/make identifies as something other than GNU Make"
-check_output "$LOG" "M98-SMOKE: ok make-build" "bmake parses a Makefile, expands a variable and runs the recipe that creates the target"
-check_output "$LOG" "M98-SMOKE: ok make-uptodate" "a second bmake run does not re-run the recipe (target newer than its prerequisites)"
-check_output "$LOG" "M98-SMOKE: ok samu-version" "/bin/samu reports the Ninja file-format version it implements"
-check_output "$LOG" "M98-SMOKE: ok ninja-alias" "/bin/ninja is the samurai binary and runs"
-check_output "$LOG" "M98-SMOKE: ok samu-build" "samurai executes a build.ninja edge and produces the declared output"
-check_output "$LOG" "M98-SMOKE: ok samu-uptodate" "re-running a satisfied build graph is a no-op"
-check_output "$LOG" "M98-SMOKE: done" "M98 GNU-free build-tool suite completes"
+check_output "$LOG" "M97-TOOLS: ok make-is-bmake" "/bin/make answers bmake's -V (GNU Make rejects it), so it is the BSD make"
+check_output "$LOG" "M97-TOOLS: ok make-not-gnu" "/bin/make identifies as something other than GNU Make"
+check_output "$LOG" "M97-TOOLS: ok make-build" "bmake parses a Makefile, expands a variable and runs the recipe that creates the target"
+check_output "$LOG" "M97-TOOLS: ok make-uptodate" "a second bmake run does not re-run the recipe (target newer than its prerequisites)"
+check_output "$LOG" "M97-TOOLS: ok samu-version" "/bin/samu reports the Ninja file-format version it implements"
+check_output "$LOG" "M97-TOOLS: ok ninja-alias" "/bin/ninja is the samurai binary and runs"
+check_output "$LOG" "M97-TOOLS: ok samu-build" "samurai executes a build.ninja edge and produces the declared output"
+check_output "$LOG" "M97-TOOLS: ok samu-uptodate" "re-running a satisfied build graph is a no-op"
+check_output "$LOG" "M97-TOOLS: done" "M98 GNU-free build-tool suite completes"
 # ── M104: Linux-PAM (real libpam.so.0 + pam_unix.so authenticating against
 # /etc/shadow via musl crypt(3)) — userspace/bin/smoke/m104_pam_smoke.c.
 check_output "$LOG" "M104-PAM: ok libpam-linked" "libpam loaded and its API is callable"
@@ -3000,6 +3089,53 @@ check_output "$BLK_LOG" "M109-SMOKE: ok mounts-past-64" "96 filesystems mount at
 check_output "$BLK_LOG" "M109-SMOKE: ok fs-run-past-64" "a 512 KiB file on ext4 reads back byte-for-byte after a remount, in one read(2) spanning far more than the 64 blocks the coalescer used to fold into a request"
 
 check_output "$BLK_LOG" "M109-SMOKE: done" "M109 suite completes"
+
+# ── btrfs: a filesystem another implementation wrote ──────────────────────
+# Skipped rather than failed where btrfs-progs is absent: without mkfs.btrfs
+# there is no disk to read, and a check that cannot run must not be reported
+# as one that passed.
+# Decided here rather than carried from the lane: the lane runs in a subshell,
+# so a variable exported there never reaches this point, and the checks were
+# silently skipped on every run.
+if command -v mkfs.btrfs >/dev/null 2>&1; then
+	check_output "$BLK_LOG" "M119-BTRFS: ok mount" "btrfs: the chunk tree maps logical addresses, the root tree names the FS tree, and the mount stands up"
+	check_output "$BLK_LOG" "M119-BTRFS: ok inline-file" "btrfs: a small file, whose bytes btrfs keeps inline in the tree leaf"
+	check_output "$BLK_LOG" "M119-BTRFS: ok nested-dir" "btrfs: a file two directories down, so the directory walk descended"
+	check_output "$BLK_LOG" "M119-BTRFS: ok symlink" "btrfs: a symlink, whose target is the file's own content"
+	check_output "$BLK_LOG" "M119-BTRFS: ok regular-size" "btrfs: a 192 KiB file reports its real size from its inode"
+	check_output "$BLK_LOG" "M119-BTRFS: ok regular-extent" "btrfs: bytes read from a regular extent at a 64 KiB offset are the bytes mkfs.btrfs wrote there"
+	check_output "$BLK_LOG" "M119-BTRFS: ok write" "btrfs: a sector written into the middle of a regular extent is accepted, checksummed and committed"
+	check_output "$BLK_LOG" "M119-BTRFS: ok write-persists" "btrfs: the written sector reads back as the bytes the guest put there"
+	check_output "$BLK_LOG" "M119-BTRFS: ok create" "btrfs: open(O_CREAT) makes an inode, its directory entries and its back-reference, and the file reads back"
+	check_output "$BLK_LOG" "M119-BTRFS: ok mkdir" "btrfs: a new directory accepts a file created inside it"
+	check_output "$BLK_LOG" "M119-BTRFS: ok rename" "btrfs: rename moves the entries and leaves nothing at the old name"
+	check_output "$BLK_LOG" "M119-BTRFS: ok truncate" "btrfs: truncate shortens a file and frees the extents past its new end"
+	check_output "$BLK_LOG" "M119-BTRFS: ok unlink-rmdir" "btrfs: a non-empty directory refuses to go, and unlink then rmdir remove both"
+	check_output "$BLK_LOG" "M119-BTRFS: done" "btrfs read and write checks complete"
+	# The judge that was not written here. btrfs check walks the extent tree,
+	# the checksum tree and the back-references and says whether the
+	# filesystem this kernel wrote is one that btrfs-progs still recognises.
+	# Reading our own writes back proves far less: a driver consistent with
+	# itself agrees with itself and with nothing else.
+	if command -v btrfs >/dev/null 2>&1; then
+		_bchk="$PROJECT_DIR/smoke_run/btrfs-check-blk.log"
+		if btrfs check --readonly "$(disk_img btrfs blk)" >"$_bchk" 2>&1; then
+			pass "btrfs check accepts the filesystem after the guest wrote to it"
+		else
+			fail "btrfs check accepts the filesystem after the guest wrote to it" \
+			     "$(tail -5 "$_bchk" | tr '\n' ' ')"
+		fi
+		if btrfs check --readonly --check-data-csum "$(disk_img btrfs blk)" \
+			>"$_bchk.csum" 2>&1; then
+			pass "btrfs check verifies every data checksum the guest wrote"
+		else
+			fail "btrfs check verifies every data checksum the guest wrote" \
+			     "$(tail -5 "$_bchk.csum" | tr '\n' ' ')"
+		fi
+	fi
+else
+	skipped "btrfs read path" "mkfs.btrfs not on the host: no filesystem to read"
+fi
 
 # Network tests are only wired for the current x86_64/x86 QEMU path.
 # The NIC arrives over virtio-mmio on aarch64 and virtio-pci on x86_64; the
@@ -3181,6 +3317,14 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 		check_output "$LOG" "M98-DRV-SMOKE: ok msi-delivery" "M98: an MSI-X message the NVMe controller raises is delivered to the vector the driver owns"
 		check_output "$LOG" "nvme: MSI-X completions on vector" "M98: NVMe drives its completions over MSI-X, not the legacy INTx line"
 	fi
+
+	# ── Wall clock: civil-date conversion, known answers ──
+	check_output "$LOG" "M118-RTC: ok epoch" "the RTC conversion places 1970-01-01T00:00:00Z at 0"
+	check_output "$LOG" "M118-RTC: ok billennium" "a mid-range date converts exactly (2001-09-09T01:46:40Z = 1e9)"
+	check_output "$LOG" "M118-RTC: ok leap-2000" "2000 is a leap year (the 400-year rule), so Feb 29 exists"
+	check_output "$LOG" "M118-RTC: ok leap-year-january" "January of a leap year is not shifted a day (the old estimate was)"
+	check_output "$LOG" "M118-RTC: ok leap-2024" "Feb 29 of an ordinary leap year converts exactly"
+	check_output "$LOG" "M118-RTC: ok century-2100" "2100 is NOT a leap year (the 100-year rule)"
 
 	# ── M99: linuxkpi compatibility layer (in-kernel) ──
 	check_output "$LOG" "M99-SMOKE: ok idr" "M99: idr allocates unique ids, looks up the exact pointers, and reuses freed ids"

@@ -722,24 +722,17 @@ static void test_nice_biasing(void) {
     write(barrier[1], &deadline_us, sizeof(deadline_us));
   close(barrier[1]);
 
-  /* The kernel's own view of these tasks, while they are still alive.
+  /* What this test can and cannot say.
    *
-   * Every part of the userspace story checks out on paper -- affinity is
-   * honoured, the workers share a priority, and the stride the scheduler adds
-   * is 25 against 1000 -- and the counts still come out the wrong way round.
-   * /proc/b1nix-tasks prints each task's nice and pass to the console, which
-   * is the only place the two can be compared against what was asked for.
-   * Read once, from the parent, after they have all been running a while. */
-  {
-    struct timespec half = {0, 120000000L};
-    nanosleep(&half, NULL);
-    int pfd = open("/proc/b1nix-tasks", O_RDONLY);
-    if (pfd >= 0) {
-      char sink[64];
-      read(pfd, sink, sizeof(sink));
-      close(pfd);
-    }
-  }
+   * From here the nice weighting is only observable as "the -20 workers got
+   * more iterations than the 19 workers did", measured on a loaded machine over
+   * a fixed window — enough to prove there IS a bias, not that a given nice
+   * value produces the stride it promises. This used to reach for more by
+   * opening /proc/b1nix-tasks and discarding the bytes: that file prints the
+   * scheduler's dump to the CONSOLE, so the numbers went to the log and nothing
+   * here ever asserted on them. The stride values, the clamping and the
+   * min-pass selection rule are checked exactly, in the kernel, by
+   * sched_nice_selftest() (M46-SCHED markers). */
 
   int st = 0;
   for (int i = 0; i < NICE_WORKERS * 2; i++) {

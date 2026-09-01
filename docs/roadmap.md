@@ -699,7 +699,7 @@ a mechanism across is in [aarch64-parity.md](aarch64-parity.md).
 ## M88: Kernel correctness fixes (ext4 indirect-block, PROT_NONE guard)
 
 - [x] Enforce `sys_mmap(PROT_NONE)` guard pages in page-fault handler.
-- [x] Ext4 single and double-indirect block traversal and allocation for block-mapped inodes in `kernel/fs/ext2.c`.
+- [x] Ext4 single and double-indirect block traversal and allocation for block-mapped inodes in `kernel/fs/ext4/ext2.c`.
 
 ## M89: Migrate the C++ standard library to LLVM libc++ (shared)
 
@@ -1126,7 +1126,7 @@ Debian's systemd 252 runs as PID 1 on this kernel. **All 32 checks pass**,
 `make systemd-image` builds it, `make systemd-smoke` boots it.
 
 - [x] `done` The subsystems it needs: **cgroup v2** as a real unified hierarchy
-      (`kernel/fs/cgroup.c`, `pids` enforced; `memory`/`cpu`/`io` deliberately
+      (`kernel/fs/cgroup/cgroup.c`, `pids` enforced; `memory`/`cpu`/`io` deliberately
       not advertised — a limit nothing enforces is worse than an absent one);
       **mount propagation, bind mounts and remount** reported in
       `/proc/self/mountinfo`; devtmpfs as a real device filesystem; journald,

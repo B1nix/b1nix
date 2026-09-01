@@ -3,7 +3,7 @@
  * Exposes kernel configuration and hardware topology as read-on-demand
  * pseudo-files, mirroring the Linux /sys hierarchy closely enough for tools
  * like `sysctl` and `free`/`top` to probe. Same VFS_DEVICE + read_cb pattern
- * as procfs (see kernel/fs/procfs.c for the rationale on node type).
+ * as procfs (see kernel/fs/proc/procfs.c for the rationale on node type).
  */
 
 #include <b1nix/blk.h>

@@ -729,3 +729,13 @@ u32 aarch64_platform_watchdog_disable(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 	return wdt[QCOM_WDT_EN / 4];
 }
+
+/* Is no-execute available for user mappings?
+ *
+ * On x86_64 this is a question worth asking: NX is a CPUID feature and stays
+ * inert until EFER.NXE is programmed, so a kernel that sets bit 63 without it
+ * faults on access instead of protecting anything. AArch64 has no such gate --
+ * UXN and PXN are ordinary translation-table bits, present in every revision
+ * of the architecture this port runs on, and encode_leaf() already sets UXN
+ * for VMM_NO_EXECUTE. So the answer here is simply yes. */
+int arch_nx_enabled(void) { return 1; }

@@ -71,7 +71,7 @@ if [ ! -f "$ROOTFS/bin/zsh" ]; then
   [ -f "$ZSH_BIN" ] || { echo "missing zsh — run: make ARCH=$ARCH root-image"; exit 1; }
   cp -f "$ZSH_BIN" "$ROOTFS/bin/zsh"
 fi
-# Core symlinks (mirror kernel/fs/initramfs.c) + every upstream applet.
+# Core symlinks (mirror kernel/fs/ramfs/initramfs.c) + every upstream applet.
 for s in sh busybox getty "["; do ln -sf /opt/busybox/bin/busybox "$ROOTFS/bin/$s"; done
 ln -sf /opt/busybox/bin/busybox "$ROOTFS/sbin/getty"
 awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/[[:space:]]/,"",$1); gsub(/[[:space:]]/,"",$2);

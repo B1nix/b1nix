@@ -2,7 +2,7 @@
  *
  * Runtime-registered /sys attribute files (M101).
  *
- * The rest of /sys (kernel/fs/sysfs.c) is a tree built once at mount from
+ * The rest of /sys (kernel/fs/sysfs/sysfs.c) is a tree built once at mount from
  * render callbacks. This is the other half: entries a driver publishes when it
  * registers, which is necessarily after the kernel decided what /sys looks
  * like — and, just as often, before /sys is mounted at all.

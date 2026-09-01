@@ -855,6 +855,35 @@ static int syscall_resolve_at(int dirfd, const char *kpath, char *out,
   return 0;
 }
 
+/* AT_RECURSIVE — mount_setattr(2) and open_tree(2) apply to everything under
+ * the path, not just the mount at it. */
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE 0x8000
+#endif
+
+/* The same resolution for a path that is still in userspace, plus the
+ * AT_EMPTY_PATH form the mount API uses to name a descriptor with no path of
+ * its own. Returns 0 with `out` filled, or -errno; an empty path without
+ * AT_EMPTY_PATH is -ENOENT, as Linux has it. */
+static int linux_at_path(int dirfd, const char *user_path, u32 flags, char *out,
+                         usize outsz) {
+  char kpath[VFS_MAX_PATH];
+
+  kpath[0] = '\0';
+  if (user_path && strncpy_from_user(kpath, user_path, sizeof(kpath)) < 0)
+    return -EFAULT;
+
+  if (kpath[0] == '\0') {
+    if (!(flags & AT_EMPTY_PATH))
+      return -ENOENT;
+    /* The descriptor itself is the subject. A detached mount has no path, and
+     * the caller of this helper falls back to the descriptor in that case. */
+    int rc = vfs_fd_abspath(dirfd, out, outsz);
+    return rc < 0 ? rc : 0;
+  }
+  return syscall_resolve_at(dirfd, kpath, out, outsz);
+}
+
 static int sys_statx(int dirfd, const char *user_path, int flags,
                      unsigned int mask, struct statx *user_buf) {
   struct b1nix_stat st;
@@ -1570,14 +1599,27 @@ static isize sys_linux_utimensat(int dirfd, const char *user_path,
    * everything else on the machine. A daemon spinning is what an unimplemented
    * syscall looks like from the outside.
    */
-  if (!user_path) {
+  kpath[0] = '\0';
+  if (user_path && syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
+    return -EFAULT;
+
+  if (!user_path || kpath[0] == '\0') {
+    /* Both spellings of "the file this descriptor names": a null path, which
+     * is how a C library writes futimens(3), and an EMPTY path, which is how
+     * systemd writes it — utimensat(fd, "", ts, AT_EMPTY_PATH), because that
+     * form also works on an O_PATH descriptor.
+     *
+     * The empty one used to be treated as a relative path and joined onto the
+     * descriptor's own, producing "<file>/" — a trailing slash on a regular
+     * file, which resolves to ENOTDIR. systemd's touch() falls back to
+     * /proc/self/fd only on EINVAL, so it took the ENOTDIR at face value:
+     * systemd-udevd reported "Failed to touch /run/udev/queue: Not a
+     * directory" after every event it processed, and never finished a run. */
     if (vfs_fd_abspath(dirfd, resolved, sizeof(resolved)) < 0)
       return -EBADF;
   } else {
-    if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
-      return -EFAULT;
-    /* And a relative path against a directory descriptor, which is what the
-     * *at() family exists for -- it used to be EBADF. */
+    /* A relative path against a directory descriptor, which is what the *at()
+     * family exists for -- it used to be EBADF. */
     if (syscall_resolve_at(dirfd, kpath, resolved, sizeof(resolved)) < 0)
       return -EBADF;
   }
@@ -3633,6 +3675,10 @@ struct syscall_cmsghdr {
 #define K_SOL_SOCKET 1
 #define K_SCM_RIGHTS 1
 #define K_SCM_CREDENTIALS 2
+/* SCM_PIDFD (Linux 6.5): the sender's pidfd, delivered when the receiver set
+ * SO_PASSPIDFD. A pid can name a different process by the time it is read; a
+ * descriptor cannot, which is the whole reason this exists. */
+#define K_SCM_PIDFD 4
 #define K_SCM_TIMESTAMP 29
 #define K_SCM_TIMESTAMPNS 35
 #define K_MSG_CTRUNC 0x08
@@ -3946,6 +3992,37 @@ static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
       ctrunc = 1;
     }
   }
+  /* SCM_PIDFD: a descriptor for the process that sent this message. Attached
+   * only when the receiver asked (SO_PASSPIDFD) and only when the sender is
+   * known — which is the same information SCM_CREDENTIALS carries, so the two
+   * are decided together. It comes AFTER the credentials, as it does in Linux:
+   * a receiver walks the control messages in order and the order is part of
+   * what it expects. */
+  if (has_cred && cred.pid > 0 && vfs_socket_wants_peer_pidfd(fd)) {
+    int peer_fd = vfs_pidfd_open((usize)cred.pid, 0);
+
+    if (peer_fd >= 0) {
+      usize cmsg_len = header_space + sizeof(int);
+      usize space = header_space + K_CMSG_ALIGN(sizeof(int));
+
+      if (control_len + space <= msg.msg_controllen &&
+          control_len + space <= sizeof(control)) {
+        struct syscall_cmsghdr *c =
+            (struct syscall_cmsghdr *)(control + control_len);
+        c->cmsg_len = cmsg_len;
+        c->cmsg_level = K_SOL_SOCKET;
+        c->cmsg_type = K_SCM_PIDFD;
+        memcpy((u8 *)c + sizeof(*c), &peer_fd, sizeof(peer_fd));
+        control_len += space;
+      } else {
+        /* No room. The descriptor is closed rather than leaked, and the
+         * message is NOT marked truncated: SCM_PIDFD is an addition to what
+         * the receiver asked for, and a receiver that treats MSG_CTRUNC as a
+         * failure would drop a message it could otherwise read in full. */
+        vfs_close(peer_fd);
+      }
+    }
+  }
   if (control_len && syscall_copyout(msg.msg_control, control, control_len) < 0)
     return (u64)-EFAULT;
 
@@ -4120,14 +4197,45 @@ static u64 sys_getsockopt(int fd, int level, int optname, void *user_optval,
     return (u64)-EINVAL;
   if (socklen_copyin(&klen, user_optlen) != 0)
     return (u64)-EFAULT;
-  u8 kopt[64];
-  if (klen == 0 || klen > sizeof(kopt))
+  /* The caller's buffer size decides how much is copied back, and it is NOT
+   * bounded by what fits in a small kernel array: SO_PEERSEC takes a label
+   * buffer (dbus-broker passes 256 bytes) and SO_PEERGROUPS a group list. A
+   * fixed 64-byte scratch that answered EINVAL to anything larger refused
+   * those options before the option code ever saw them — dbus-broker read the
+   * EINVAL as fatal and the system bus never started.
+   *
+   * Bounded, because the size is the caller's to choose: a page is far beyond
+   * any option this kernel answers and keeps a bad value from asking for an
+   * arbitrary allocation. */
+  u8 kopt_stack[64];
+  u8 *kopt = kopt_stack;
+  u8 *kopt_heap = 0;
+
+  if (klen == 0)
     return (u64)-EINVAL;
+  if (klen > 4096)
+    return (u64)-EINVAL;
+  if (klen > sizeof(kopt_stack)) {
+    kopt_heap = kzalloc(klen);
+    if (!kopt_heap)
+      return (u64)-ENOMEM;
+    kopt = kopt_heap;
+  }
+
   int rc = vfs_getsockopt(fd, level, optname, kopt, &klen);
-  if (rc < 0)
+  if (rc < 0) {
+    /* ERANGE carries the size the option needs, and the caller reads it back
+     * from optlen to size a second call. */
+    if (rc == -ERANGE)
+      (void)socklen_copyout(user_optlen, klen);
+    kfree(kopt_heap);
     return (u64)rc;
-  if (user_optval && klen > 0 && syscall_copyout(user_optval, kopt, klen) < 0)
+  }
+  if (user_optval && klen > 0 && syscall_copyout(user_optval, kopt, klen) < 0) {
+    kfree(kopt_heap);
     return (u64)-EFAULT;
+  }
+  kfree(kopt_heap);
   if (socklen_copyout(user_optlen, klen) != 0)
     return (u64)-EFAULT;
   return 0;
@@ -4597,9 +4705,7 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   }
 
   // Allocate and map physical frames
-  u64 vmm_flags = VMM_USER;
-  if (prot & PROT_WRITE)
-    vmm_flags |= VMM_WRITABLE;
+  u64 vmm_flags = vmm_user_flags_from_prot(prot);
   /* MAP_SHARED|MAP_ANONYMOUS has no name and no file, so the only processes
    * that can ever see it are this one and its children — which makes fork the
    * whole point of the mapping. Without the shared bit its leaves look like
@@ -5199,9 +5305,7 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
   if (end < start || end > USER_SPACE_LIMIT)
     return -EINVAL;
 
-  u64 flags = VMM_USER;
-  if (prot & PROT_WRITE)
-    flags |= VMM_WRITABLE;
+  u64 flags = vmm_user_flags_from_prot(prot);
 
   // 1. Update hardware page tables
   {
@@ -5338,9 +5442,7 @@ static isize sys_madvise(void *addr, usize length, int advice) {
       continue;
     }
 
-    u64 vmm_flags = VMM_USER;
-    if (cover->prot & PROT_WRITE)
-      vmm_flags |= VMM_WRITABLE;
+    u64 vmm_flags = vmm_user_flags_from_prot((int)cover->prot);
 
     while (v < seg_end) {
       usize n = (usize)((seg_end - v) / PAGE_SIZE);
@@ -5544,7 +5646,10 @@ static u64 sys_brk(u64 addr) {
       u64 direct_base = vmm_direct_map_base();
       memset((void *)(usize)(frame + direct_base), 0, PAGE_SIZE);
 
-      vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE | VMM_PRESENT);
+      /* The heap is data: writable, never executable. */
+      vmm_map_page(v, frame,
+                   vmm_user_flags_from_prot(PROT_READ | PROT_WRITE) |
+                       VMM_PRESENT);
     }
   } else if (addr < t->user_brk) {
     u64 old_brk_page_end = (t->user_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -5704,6 +5809,20 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 /* Set while a traced task is inside a system call, so the copy helpers can
  * report what they wrote without each of them re-reading the command line. */
 static int g_trace_in_call;
+
+/* The syscall this CPU is currently executing, for diagnostics that fire deep
+ * below the dispatcher and need to name the caller. `b1nix.trace-fd` uses it:
+ * "descriptor 0 was taken" is half an answer, "close(2) took descriptor 0" is
+ * the whole one. Per-CPU rather than global so two CPUs in the kernel at once
+ * do not overwrite each other's answer. */
+static u64 g_current_syscall[MAX_CPUS];
+
+u64 syscall_current_number(void) {
+  struct percpu *p = get_percpu();
+  int cpu = p ? p->cpu_id : 0;
+
+  return (cpu >= 0 && cpu < MAX_CPUS) ? g_current_syscall[cpu] : 0;
+}
 
 int syscall_trace_active(void) { return g_trace_in_call; }
 
@@ -5887,6 +6006,15 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
 static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
                                    u64 arg3, u64 arg4, u64 arg5,
                                    struct interrupt_frame *frame) {
+  /* Which call this CPU is in, for diagnostics that fire far below here. */
+  {
+    struct percpu *pc = get_percpu();
+    int cpu = pc ? pc->cpu_id : 0;
+
+    if (cpu >= 0 && cpu < MAX_CPUS)
+      g_current_syscall[cpu] = number;
+  }
+
   /* M80: PTRACE_SYSCALL entry stop. The plain-load ptrace_any_traced() gate
    * keeps an untraced system at one memory read per syscall. A tracer that
    * rewrites registers during the stop is obeyed: the number and arguments are
@@ -6013,6 +6141,39 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
   }
 #endif
   u64 ret = syscall_dispatch_impl_inner(number, arg0, arg1, arg2, arg3, arg4, arg5, frame);
+
+  /* `b1nix.strace-pid=<pid>`: every call one task makes, with its arguments and
+   * its answer.
+   *
+   * The errno trace shows failures, which is the right default — but a failure
+   * is not always where a story goes wrong. A descriptor that a manager closes
+   * ITSELF, successfully, and then uses again is invisible to a trace of
+   * errors: every call in the sequence succeeded. This prints the successful
+   * ones too, for one task, which is the smallest instrument that can answer
+   * "what did it do just before". */
+  {
+    static u32 strace_pid = (u32)-1;
+
+    if (strace_pid == (u32)-1)
+      strace_pid = bootinfo_get_u32("b1nix.strace-pid", 0);
+    if (strace_pid && current_task && current_task->id == strace_pid) {
+      const char *nm = "";
+
+      if (current_task->user_image &&
+          ((struct user_loaded_image *)current_task->user_image)->personality ==
+              PERSONALITY_LINUX)
+        nm = linux_syscall_name(number);
+
+      char sl[224];
+      snprintf(sl, sizeof(sl),
+               "strace %u: %llu %s(0x%llx, 0x%llx, 0x%llx, 0x%llx) = %lld",
+               (unsigned)strace_pid, (unsigned long long)number, nm,
+               (unsigned long long)arg0, (unsigned long long)arg1,
+               (unsigned long long)arg2, (unsigned long long)arg3,
+               (long long)(isize)ret);
+      klog_info(sl);
+    }
+  }
   if (prof_t0)
     syscall_prof_account((u32)number, syscall_prof_now() - prof_t0);
   /* Which call answered a given errno, when a program reports one and does not
@@ -6099,16 +6260,64 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
             ((struct user_loaded_image *)current_task->user_image)
                     ->personality == PERSONALITY_LINUX)
           cname = linux_syscall_name(number);
+        /* The descriptor, where the call has one. EBADF from a call that takes
+         * an fd says a descriptor the caller believes it holds is not in its
+         * table, and WHICH descriptor is the whole answer — without it the
+         * trace names the syscall and leaves the interesting half out. The
+         * argument is chosen per call for the same reason the path is. */
+        int ufd = -1;
+        switch (number) {
+        case 0:   /* read */
+        case 1:   /* write */
+        case 3:   /* close */
+        case 5:   /* fstat */
+        case 8:   /* lseek */
+        case 16:  /* ioctl */
+        case 32:  /* dup */
+        case 33:  /* dup2 */
+        case 72:  /* fcntl */
+        case 74:  /* fsync */
+        case 77:  /* ftruncate */
+        case 78:  /* getdents */
+        case 217: /* getdents64 */
+        case 257: /* openat (dirfd) */
+        case 262: /* newfstatat (dirfd) */
+        case 263: /* unlinkat (dirfd) */
+        case 428: /* open_tree */
+        case 429: /* move_mount */
+        case 431: /* fsconfig */
+        case 432: /* fsmount */
+        case 442: /* mount_setattr */
+          ufd = (int)arg0;
+          break;
+        case 247: /* waitid: the id is a descriptor when idtype is P_PIDFD */
+          if (arg0 == 3)
+            ufd = (int)arg1;
+          break;
+        default:
+          break;
+        }
+
         char el[256];
+        char fdbuf[64];
+        fdbuf[0] = '\0';
+        if (ufd >= 0)
+          snprintf(fdbuf, sizeof(fdbuf), " fd=%d", ufd);
+        /* For the socket-option calls, WHICH option is the entire question: a
+         * refusal names the syscall, and every socket option in the machine
+         * goes through the same one. */
+        if (number == 54 || number == 55)
+          snprintf(fdbuf, sizeof(fdbuf), " fd=%d level=%d optname=%d",
+                   (int)arg0, (int)arg1, (int)arg2);
         if (pbuf[0])
           snprintf(el, sizeof(el),
-                   "errno %u from syscall %llu %s (pid %u) path=%s",
+                   "errno %u from syscall %llu %s (pid %u)%s path=%s",
                    (unsigned)e, (unsigned long long)number, cname,
-                   (unsigned)pid, pbuf);
+                   (unsigned)pid, fdbuf, pbuf);
         else
-          snprintf(el, sizeof(el), "errno %u from syscall %llu %s (pid %u)",
+          snprintf(el, sizeof(el), "errno %u from syscall %llu %s (pid %u)%s",
                    (unsigned)e, (unsigned long long)number, cname,
-                   (unsigned)pid);
+                   (unsigned)pid, fdbuf);
         klog_info(el);
       }
     }
@@ -6835,6 +7044,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_process_vm_writev 271
 #define LX_ptrace          117
 #define LX_clone2          220
+/* The new mount API (Linux 5.2 and 5.12), and close_range. Allocated from the
+ * shared list every architecture draws from since 424, so these are the same
+ * numbers the x86_64 table below carries. */
+#define LX_open_tree       428
+#define LX_move_mount      429
+#define LX_fsopen          430
+#define LX_fsconfig        431
+#define LX_fsmount         432
+#define LX_fspick          433
+#define LX_mount_setattr   442
 #else
 #define LX_openat          257
 #define LX_newfstatat      262
@@ -6858,6 +7077,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
  * descriptors it does not want a child to inherit; without it both walk
  * /proc/self/fd instead, which is a directory read per exec. */
 #define LX_close_range     436
+/* The new mount API (Linux 5.2 and 5.12). systemd 254+ builds every unit
+ * sandbox with these and only falls back to mount(2) when the whole family is
+ * missing — so they are implemented together or not at all. */
+#define LX_open_tree       428
+#define LX_move_mount      429
+#define LX_fsopen          430
+#define LX_fsconfig        431
+#define LX_fsmount         432
+#define LX_fspick          433
+#define LX_mount_setattr   442
 /* pidfd_open(pid, flags) and pidfd_send_signal(pidfd, sig, info, flags). A
  * descriptor that names a process rather than a number that identifies one
  * today; see vfs_pidfd_open. */
@@ -6959,6 +7188,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_ptrace          101
 #define LX_clone2          56
 #endif
+
+/* renameat2 flags (Linux uapi/linux/fs.h). */
+#define RENAME_NOREPLACE (1u << 0)
+#define RENAME_EXCHANGE  (1u << 1)
+#define RENAME_WHITEOUT  (1u << 2)
 
       /* POSIX mq (musl): mq_open(240), mq_unlink(241), mq_timedsend(242),
        * mq_timedreceive(243). b1nix mqds are small table indices that would
@@ -7149,6 +7383,115 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * is accepted. CLOSE_RANGE_CLOEXEC (bit 2) marks rather than closes.
        * A descriptor that is not open is not an error -- the range is a range,
        * not a list. */
+      /* ── The new mount API ────────────────────────────────────────────
+       *
+       * fsopen builds a filesystem before it has a place; fsmount turns it
+       * into a mount attached nowhere; move_mount gives it one. The mount that
+       * exists while attached to nothing is the part b1nix's path-keyed mount
+       * table could not express, and is why this family answered ENOSYS until
+       * now — which is where Arch's systemd 261 stopped, at "Failed at step
+       * CREDENTIALS ... Function not implemented". See kernel/fs/mount_api.c.
+       */
+      if (number == LX_fsopen) {
+        char fstype[64];
+
+        if (strncpy_from_user(fstype, (const char *)(usize)arg0,
+                              sizeof(fstype)) < 0)
+          return (u64)-EFAULT;
+        return (u64)(isize)vfs_fsopen(fstype, (u32)arg1);
+      }
+
+      if (number == LX_fsconfig) {
+        char key[128];
+        char value[VFS_MAX_PATH];
+        const char *keyp = 0;
+        const char *valp = 0;
+
+        if (arg2) {
+          if (strncpy_from_user(key, (const char *)(usize)arg2, sizeof(key)) < 0)
+            return (u64)-EFAULT;
+          keyp = key;
+        }
+        if (arg3) {
+          if (strncpy_from_user(value, (const char *)(usize)arg3,
+                                sizeof(value)) < 0)
+            return (u64)-EFAULT;
+          valp = value;
+        }
+        return (u64)(isize)vfs_fsconfig((int)arg0, (u32)arg1, keyp, valp,
+                                        (int)arg4);
+      }
+
+      if (number == LX_fsmount)
+        return (u64)(isize)vfs_fsmount((int)arg0, (u32)arg1, (u32)arg2);
+
+      if (number == LX_open_tree) {
+        char kpath[VFS_MAX_PATH];
+        char resolved_tree[VFS_MAX_PATH];
+        int rc = linux_at_path((int)arg0, (const char *)(usize)arg1,
+                               (u32)arg2, kpath, sizeof(kpath));
+
+        if (rc < 0)
+          return (u64)rc;
+        vfs_resolve_path(kpath, resolved_tree);
+        return (u64)(isize)vfs_open_tree(resolved_tree, (u32)arg2);
+      }
+
+      if (number == LX_move_mount) {
+        char fpath[VFS_MAX_PATH];
+        char tpath[VFS_MAX_PATH];
+        char resolved_to[VFS_MAX_PATH];
+        int have_from = 0;
+        /* MOVE_MOUNT_F_EMPTY_PATH (4): the source is the descriptor itself,
+         * with an empty path — which is exactly how a detached mount is named,
+         * and what systemd passes. */
+        int rc = linux_at_path((int)arg0, (const char *)(usize)arg1,
+                               (u32)arg4 & 4u ? AT_EMPTY_PATH : 0, fpath,
+                               sizeof(fpath));
+
+        if (rc == 0)
+          have_from = 1;
+        rc = linux_at_path((int)arg2, (const char *)(usize)arg3, 0, tpath,
+                           sizeof(tpath));
+        if (rc < 0)
+          return (u64)rc;
+        vfs_resolve_path(tpath, resolved_to);
+        return (u64)(isize)vfs_move_mount_fd((int)arg0,
+                                             have_from ? fpath : 0,
+                                             resolved_to, (u32)arg4);
+      }
+
+      if (number == LX_mount_setattr) {
+        struct b1nix_mount_attr attr;
+        char kpath[VFS_MAX_PATH];
+        char resolved_attr[VFS_MAX_PATH];
+        int have_path = 0;
+
+        /* Linux takes the size so the structure can grow; a caller passing a
+         * shorter one means the fields it omits are zero, and a longer one
+         * means it wants something this kernel does not have. */
+        if ((usize)arg4 < sizeof(attr))
+          return (u64)-EINVAL;
+        memset(&attr, 0, sizeof(attr));
+        if (syscall_copyin(&attr, (const void *)(usize)arg3, sizeof(attr)) < 0)
+          return (u64)-EFAULT;
+
+        if (linux_at_path((int)arg0, (const char *)(usize)arg1, (u32)arg2,
+                          kpath, sizeof(kpath)) == 0) {
+          vfs_resolve_path(kpath, resolved_attr);
+          have_path = 1;
+        }
+        return (u64)(isize)vfs_mount_setattr_fd(
+            (int)arg0, have_path ? resolved_attr : 0, (u32)arg2, &attr);
+      }
+
+      /* fspick(2) reconfigures a mount that already exists, which needs the
+       * live-superblock reconfiguration fsconfig(CMD_RECONFIGURE) also
+       * refuses. Every caller reaches it through a fallback to
+       * mount(MS_REMOUNT), which works. */
+      if (number == LX_fspick)
+        return (u64)-EOPNOTSUPP;
+
       /* pidfd_open(pid, flags): take a reference to a process. */
       if (number == LX_pidfd_open)
         return (u64)(isize)vfs_pidfd_open((usize)arg0, (int)arg1);
@@ -7431,8 +7774,40 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           }
           char new_resolved[VFS_MAX_PATH];
           vfs_resolve_path(new_kpath, new_resolved);
-          /* arg4=flags: RENAME_NOREPLACE(1), RENAME_EXCHANGE(2).
-           * b1nix doesn't support these — silently ignore for now. */
+          /* arg4=flags. These used to be ignored and the plain rename run
+           * anyway, which is the one outcome a caller must never get: a
+           * program that asks NOT to clobber the destination was told the
+           * rename succeeded, having just destroyed the file it was
+           * protecting. renameat(264) carries no flags argument at all, so it
+           * is only read for renameat2. */
+          if (number == LX_renameat2) {
+            u32 rflags = (u32)arg4;
+
+            if (rflags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE |
+                           RENAME_WHITEOUT))
+              return (u64)-EINVAL;
+            /* NOREPLACE and EXCHANGE are mutually exclusive by definition:
+             * one requires the destination to be absent, the other requires it
+             * to be present. */
+            if ((rflags & RENAME_NOREPLACE) && (rflags & RENAME_EXCHANGE))
+              return (u64)-EINVAL;
+            if (rflags & RENAME_NOREPLACE) {
+              struct vfs_node *existing = vfs_find_node(new_resolved);
+
+              if (existing) {
+                vfs_node_put(existing);
+                return (u64)-EEXIST;
+              }
+            }
+            /* EXCHANGE has to be atomic — swapping by hand through two renames
+             * is exactly the non-atomicity callers use it to avoid — and
+             * WHITEOUT needs an overlay layer this kernel has no notion of.
+             * EINVAL is what Linux returns for a filesystem that does not
+             * implement them, and it is what makes the caller fall back
+             * instead of trusting a swap that never happened. */
+            if (rflags & (RENAME_EXCHANGE | RENAME_WHITEOUT))
+              return (u64)-EINVAL;
+          }
           return (u64)vfs_rename(resolved, new_resolved);
         }
         default:
@@ -7741,18 +8116,43 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #if defined(__aarch64__)
         u64 child_entry = frame ? frame->elr : child_sp;
         u64 user_lr = frame ? frame->x30 : 0;
-        return (u64)scheduler_clone_thread(flags, child_entry, child_sp, 0,
-                                           ca.tls, ca.child_tid, ca.parent_tid,
-                                           ca.child_tid, arg5, user_lr, frame);
+        isize tkid = scheduler_clone_thread(flags, child_entry, child_sp, 0,
+                                            ca.tls, ca.child_tid, ca.parent_tid,
+                                            ca.child_tid, arg5, user_lr, frame);
 #else
         u64 child_entry = frame ? frame->rip : child_sp;
         struct clone_user_regs uregs;
         clone_regs_from_frame(&uregs, frame);
-        return (u64)scheduler_clone_thread(flags, child_entry, child_sp, 0,
-                                           ca.tls, ca.child_tid, ca.parent_tid,
-                                           ca.child_tid, arg5,
-                                           frame ? &uregs : 0);
+        isize tkid = scheduler_clone_thread(flags, child_entry, child_sp, 0,
+                                            ca.tls, ca.child_tid, ca.parent_tid,
+                                            ca.child_tid, arg5,
+                                            frame ? &uregs : 0);
 #endif
+
+        /* CLONE_PIDFD on THIS path too.
+         *
+         * The descriptor was written only where the child is made like a fork
+         * (no stack, no CLONE_VM). A caller that hands clone3 a stack — which
+         * is every posix_spawn, and so every service systemd 254+ starts —
+         * took this path instead and got NOTHING written, leaving its variable
+         * at whatever it was initialised to. systemd's was zero, so it went on
+         * to use descriptor 0 as the child's pidfd: ioctl(0, PIDFD_GET_INFO)
+         * answered ENOTTY ("Failed to spawn executor: Inappropriate ioctl for
+         * device"), and when it later released the pidref it closed descriptor
+         * 0 — /dev/null, its own stdin. Every open after that landed on 0, and
+         * the first fclose of a stream bound to it aborted PID 1 on
+         * `fclose_nointr(f) != -EBADF`. One unwritten descriptor, four
+         * symptoms, none of them near the cause. */
+        if ((ca.flags & LX_CLONE_PIDFD) && tkid > 0) {
+          int pfd = vfs_pidfd_open((usize)tkid, 0);
+          i32 pfd32 = pfd < 0 ? -1 : (i32)pfd;
+
+          if (syscall_copyout((void *)(usize)ca.pidfd, &pfd32,
+                              sizeof(pfd32)) < 0 &&
+              pfd >= 0)
+            vfs_close(pfd); /* the caller will never learn of it */
+        }
+        return (u64)tkid;
       }
       /* Linux clone(2) has a different argument layout than b1nix SYS_CLONE:
        *   Linux: clone(flags, user_stack, parent_tidptr, child_tidptr, tls)

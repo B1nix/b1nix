@@ -1847,6 +1847,19 @@ void blk_flush_buffer(struct block_buffer *buf) {
   }
 }
 
+/* Give back the claims blk_flush_matching took, clearing DIRTY on the ones the
+ * device accepted. */
+static void blk_flush_release(struct block_buffer **set, usize n, int written) {
+  u64 flags = bcache_acquire();
+
+  for (usize i = 0; i < n; i++) {
+    if (written)
+      set[i]->flags &= ~BLK_CACHE_DIRTY;
+    set[i]->flags &= ~BLK_CACHE_BUSY;
+  }
+  bcache_release(flags);
+}
+
 /* Forget every cached copy of [lba, lba+count) on `target`. Used before a
  * command that changes the medium behind the cache's back (WRITE ZEROES,
  * DISCARD): a stale entry that is still dirty would otherwise be written back
@@ -1963,21 +1976,34 @@ static void blk_flush_run(struct block_buffer **run, usize n, u8 **bounce) {
   if (n == 0)
     return;
   if (n == 1) {
-    blk_flush_buffer(run[0]);
+    struct block_buffer *b = run[0];
+
+    if (b->bdev && b->bdev->write_blocks &&
+        b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) == 0)
+      blk_flush_release(run, 1, 1);
+    else
+      blk_flush_release(run, 1, 0);
     return;
   }
 
   struct block_device *dev = run[0]->bdev;
 
-  if (!dev || !dev->write_blocks)
+  if (!dev || !dev->write_blocks) {
+    blk_flush_release(run, n, 0);
     return;
+  }
   if (!*bounce) {
     /* Sized to the longest run the flusher will ever assemble, which is the
      * same device-derived bound. */
     *bounce = (u8 *)kmalloc(BCACHE_FLUSH_RUN * sizeof(run[0]->data));
     if (!*bounce) {
-      for (usize i = 0; i < n; i++)
-        blk_flush_buffer(run[i]);
+      for (usize i = 0; i < n; i++) {
+        struct block_buffer *b = run[i];
+        int ok = b->bdev && b->bdev->write_blocks &&
+                 b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) == 0;
+
+        blk_flush_release(&run[i], 1, ok);
+      }
       return;
     }
   }
@@ -1985,11 +2011,14 @@ static void blk_flush_run(struct block_buffer **run, usize n, u8 **bounce) {
     memcpy(*bounce + i * sizeof(run[i]->data), run[i]->data,
            sizeof(run[i]->data));
   if (dev->write_blocks(dev, run[0]->block_no, (u32)n, *bounce) == 0) {
-    for (usize i = 0; i < n; i++)
-      run[i]->flags &= ~BLK_CACHE_DIRTY;
+    blk_flush_release(run, n, 1);
   } else {
-    for (usize i = 0; i < n; i++)
-      blk_flush_buffer(run[i]);
+    for (usize i = 0; i < n; i++) {
+      struct block_buffer *b = run[i];
+      int ok = b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) == 0;
+
+      blk_flush_release(&run[i], 1, ok);
+    }
   }
 }
 
@@ -2059,9 +2088,11 @@ static void bcache_drain_all(void) {
   struct block_buffer **set = (struct block_buffer **)kmalloc(cap * sizeof(*set));
   usize n = 0;
   u8 *bounce = 0;
+  usize base = 0;
 
-  for (usize base = 0; base < block_cache_n; base += SCAN_CHUNK) {
+  while (base < block_cache_n) {
     usize stop = base + SCAN_CHUNK;
+    usize resume = stop;
 
     if (stop > block_cache_n)
       stop = block_cache_n;
@@ -2070,18 +2101,28 @@ static void bcache_drain_all(void) {
     for (usize i = base; i < stop; i++) {
       struct block_buffer *b = &block_cache[i];
 
-      if (!((b->flags & BLK_CACHE_VALID) && (b->flags & BLK_CACHE_DIRTY)))
+      if (!((b->flags & BLK_CACHE_VALID) && (b->flags & BLK_CACHE_DIRTY)) ||
+          !b->bdev || !b->bdev->write_blocks)
         continue;
-      if (set && n < cap)
-        set[n++] = b;
-      else if (!set)
+      if (b->flags & BLK_CACHE_BUSY)
+        continue;
+      if (!set) {
         blk_flush_buffer(b);
+        continue;
+      }
+      if (n == cap) {
+        resume = i;
+        break;
+      }
+      b->flags |= BLK_CACHE_BUSY;
+      set[n++] = b;
     }
     bcache_release(flags);
-    if (set && n == cap) {
+    if (set && n) {
       blk_flush_sorted(set, n, &bounce);
       n = 0;
     }
+    base = resume;
   }
   if (set) {
     blk_flush_sorted(set, n, &bounce);
@@ -2149,9 +2190,11 @@ static void blk_flush_matching(struct block_device *dev, u64 first, u64 last,
   struct block_buffer **set = (struct block_buffer **)kmalloc(cap * sizeof(*set));
   usize n = 0;
   u8 *bounce = 0;
+  usize base = 0;
 
-  for (usize base = 0; base < block_cache_n; base += SCAN_CHUNK) {
+  while (base < block_cache_n) {
     usize stop = base + SCAN_CHUNK;
+    usize resume = stop;
 
     if (stop > block_cache_n)
       stop = block_cache_n;
@@ -2168,16 +2211,44 @@ static void blk_flush_matching(struct block_device *dev, u64 first, u64 last,
       if (ino && !(b->dirty_ino == 0 ||
                    (b->dirty_ino == ino && b->dirty_fsid == fsid)))
         continue;
-      if (set && n < cap)
-        set[n++] = b;
-      else if (!set)
+      /* Already in flight somewhere else — leave it to whoever claimed it. */
+      if (b->flags & BLK_CACHE_BUSY)
+        continue;
+      if (!set) {
         blk_flush_buffer(b); /* no memory for the set: the old behaviour */
+        continue;
+      }
+      if (n == cap) {
+        /* The set is full. Come back to THIS slot after draining rather than
+         * skipping it.
+         *
+         * A skipped block stays dirty and reaches the medium later, whenever
+         * its slot is recycled. For a filesystem that flushes its metadata
+         * and only then writes the super block, that means the super block
+         * can land first, naming blocks that are not on the disk yet — and
+         * the filesystem it leaves behind is one no other implementation can
+         * open. The cache held more than 512 dirty blocks of one device only
+         * under a heavy writer, which is why this went unseen. */
+        resume = i;
+        break;
+      }
+      /* CLAIM the slot for the duration of the write.
+       *
+       * The set is written after the cache lock is dropped, and a device
+       * write can yield. Without a claim, a slot collected here could be
+       * evicted and refilled with a different (device, block) before its turn
+       * came — and since a run is sorted by the block_no read at write time,
+       * the writer would then put a run of good data at the wrong addresses.
+       * BUSY is the same claim eviction uses. */
+      b->flags |= BLK_CACHE_BUSY;
+      set[n++] = b;
     }
     bcache_release(flags);
-    if (set && n == cap) {
+    if (set && n) {
       blk_flush_sorted(set, n, &bounce);
       n = 0;
     }
+    base = resume;
   }
   if (set) {
     blk_flush_sorted(set, n, &bounce);
@@ -2253,14 +2324,125 @@ void blk_cache_flush(struct block_device *dev) {
  *     the ATA FLUSH CACHE EXT / NVMe FLUSH / virtio FLUSH that used to be
  *     absent from fsync(2) altogether (AHCI issued one after every write
  *     instead, which is a different thing entirely, and NVMe issued none).
- *  2. On a scratch virtio disk — the only device here that nothing else owns —
- *     a written pattern survives a flush plus a full cache drop, and
+ *  2. On a scratch virtio disk — one whose test range is proven unused, see
+ *     blk_scratch_range_is_free() — a written pattern survives a flush plus a
+ *     full cache drop, and
  *     blk_zero_blocks() really leaves zeroes behind, whether the device did
  *     the zeroing itself or the block layer wrote them.
  * Reads go through blk_cache_invalidate() first, so a pass means the bytes came
  * back from the medium, not from the cache entry the write left behind. */
 #define BLK_SELFTEST_LBA 2048
 #define BLK_SELFTEST_BLOCKS 8
+
+
+/* Does this disk already hold something? A signature check, on the medium
+ * rather than on the mount table.
+ *
+ * The durability self-test below destroys the range it tests: it writes a
+ * pattern there and then zeroes it. It used to take "the first virtio disk" as
+ * its scratch device on the stated assumption that nothing else owned it —
+ * true in the block lane, where that disk is four megabytes of zeroes attached
+ * for exactly this purpose, and false in every other lane, where the root
+ * filesystem is attached with `if=virtio` and therefore IS the first virtio
+ * disk. LBA 2048 on a 4 KiB-block ext4 is inside the first group's inode
+ * table, so each boot quietly zeroed a block of live inodes; the files whose
+ * inodes lived there read back as the right length and all zero bytes.
+ *
+ * So the rule is the one a disk deserves: write only where nothing is. A
+ * signature we recognise means the disk is somebody's, and an unrecognised
+ * one that is not empty means we do not know whose it is — both refuse.
+ * Reads go straight to the driver so this never disturbs the block cache. */
+static int blk_scratch_range_is_free(struct block_device *dev) {
+  /* Read in small pieces rather than one 68 KiB slab: the signatures sit at
+   * four widely separated offsets, and a single allocation big enough to span
+   * them all is both wasteful and the kind of request a loaded heap declines. */
+  const u32 head_sectors = 16; /* 8 KiB: partition table, ext superblock, swap */
+  u8 *buf;
+  int claimed = 0;
+
+  if (!dev->read_blocks || dev->block_size != CACHE_BLOCK_SIZE)
+    return 0;
+  if (dev->block_count &&
+      dev->block_count < BLK_SELFTEST_LBA + BLK_SELFTEST_BLOCKS)
+    return 0;
+
+  buf = (u8 *)kmalloc((usize)head_sectors * CACHE_BLOCK_SIZE);
+  if (!buf)
+    return 0;
+  if (blk_dev_read(dev, 0, head_sectors, buf) < 0) {
+    kfree(buf);
+    return 0;
+  }
+
+  /* MBR/GPT partition table, or any boot sector (FAT, NTFS, exFAT). */
+  if (buf[510] == 0x55 && buf[511] == 0xAA)
+    claimed = 1;
+  /* GPT header in LBA 1. */
+  if (!claimed && memcmp(buf + 512, "EFI PART", 8) == 0)
+    claimed = 1;
+  /* ext2/3/4 superblock at 1024, s_magic at +56. */
+  if (!claimed && buf[1024 + 56] == 0x53 && buf[1024 + 57] == 0xEF)
+    claimed = 1;
+  /* A swap area names itself in the last ten bytes of its first page. */
+  if (!claimed && memcmp(buf + 4096 - 10, "SWAPSPACE2", 10) == 0)
+    claimed = 1;
+
+  /* ISO 9660 descriptor at 32 KiB, btrfs superblock at 64 KiB — one sector
+   * each, and only if the disk is long enough to hold them. */
+  if (!claimed) {
+    static const struct {
+      u64 lba;
+      u32 off;
+      const char *magic;
+      u32 len;
+    } far[] = {
+        {64, 1, "CD001", 5},
+        {128, 64, "_BHRfS_M", 8},
+    };
+
+    for (unsigned k = 0; k < sizeof(far) / sizeof(far[0]) && !claimed; k++) {
+      if (dev->block_count && far[k].lba >= dev->block_count)
+        continue;
+      if (blk_dev_read(dev, far[k].lba, 1, buf) < 0)
+        continue;
+      if (memcmp(buf + far[k].off, far[k].magic, far[k].len) == 0)
+        claimed = 1;
+    }
+  }
+
+  /* No signature we know. Insist the target range is blank anyway: a
+   * filesystem this kernel cannot name is still somebody's data. */
+  if (!claimed) {
+    for (u32 b = 0; b < BLK_SELFTEST_BLOCKS && !claimed; b++) {
+      if (blk_dev_read(dev, BLK_SELFTEST_LBA + b, 1, buf) < 0) {
+        claimed = 1;
+        break;
+      }
+      for (u32 i = 0; i < CACHE_BLOCK_SIZE; i++) {
+        if (buf[i]) {
+          claimed = 1;
+          break;
+        }
+      }
+    }
+  }
+
+  kfree(buf);
+  return !claimed;
+}
+
+/* The first whole disk on `bus` whose test range is provably unused. */
+static struct block_device *blk_find_scratch(u8 bus) {
+  for (usize i = 0; i < blk_device_count; i++) {
+    struct block_device *dev = blk_devices[i];
+
+    if (!dev || dev->bus != bus || blk_is_partition(dev) || !dev->write_blocks)
+      continue;
+    if (blk_scratch_range_is_free(dev))
+      return dev;
+  }
+  return 0;
+}
 
 void blk_durability_selftest(void) {
   for (usize i = 0; i < blk_device_count; i++) {
@@ -2273,31 +2455,14 @@ void blk_durability_selftest(void) {
     console_write("\n");
   }
 
-  /* The first virtio disk that nothing has mounted. Taking index 0 blindly is
-   * only safe on a board where the root filesystem arrives some other way: on
-   * aarch64 the root IS the first virtio disk, and this test writes a pattern
-   * at LBA 2048 — a megabyte into whatever it picks. */
-  struct block_device *dev = 0;
-  for (usize n = 0; n < blk_device_count; n++) {
-    struct block_device *cand = blk_nth_on_bus(BLK_BUS_VIRTIO, n);
-    if (!cand)
-      break;
-    if (cand->write_blocks && !vfs_device_is_mounted(cand->name)) {
-      dev = cand;
-      break;
-    }
-  }
+  struct block_device *dev = blk_find_scratch(BLK_BUS_VIRTIO);
   /* A Raspberry Pi has no virtio disk at all; there the SD card is the only
    * block device the test can use. */
-  for (usize n = 0; !dev; n++) {
-    struct block_device *cand = blk_nth_on_bus(BLK_BUS_MMC, n);
-    if (!cand)
-      break;
-    if (cand->write_blocks && !vfs_device_is_mounted(cand->name))
-      dev = cand;
-  }
-  if (!dev) {
-    k_info(NULL, "M14-BLK: no unmounted virtio-blk scratch device");
+  if (!dev)
+    dev = blk_find_scratch(BLK_BUS_MMC);
+  if (!dev || !dev->write_blocks) {
+    k_info(NULL, "M14-BLK: skip durable-roundtrip reason=no-scratch-device");
+    k_info(NULL, "M14-BLK: skip zero-blocks reason=no-scratch-device");
     return;
   }
 
@@ -2353,6 +2518,119 @@ void blk_durability_selftest(void) {
 
   kfree(out);
   kfree(in);
+}
+
+/* Drop a range of cached blocks without writing them back.
+ *
+ * For a caller that has just put the authoritative contents on the medium
+ * itself and only needs the cache to stop claiming otherwise. Dirty entries in
+ * the range are discarded rather than flushed: they hold what the caller has
+ * already superseded, and writing them would put the OLD bytes back. */
+void blk_cache_invalidate_range(struct block_device *dev, u64 lba, u32 count) {
+  if (!dev || !count)
+    return;
+  if (blk_is_partition(dev)) {
+    struct partition_device *part = (struct partition_device *)dev->priv;
+
+    if (!part || !part->parent)
+      return;
+    lba += part->start_lba;
+    dev = part->parent;
+  }
+  for (u32 i = 0; i < count; i++) {
+    u64 flags = bcache_acquire();
+    struct block_buffer *e = bcache_find(dev, lba + i);
+
+    if (e && !(e->flags & BLK_CACHE_BUSY)) {
+      bcache_hash_remove((i32)(e - block_cache));
+      e->flags &= ~(BLK_CACHE_VALID | BLK_CACHE_DIRTY);
+    }
+    bcache_release(flags);
+  }
+}
+
+/* Does a multi-sector write survive the cache?
+ *
+ * Rewrite one 16 KiB range many times, flushing between rounds, and read it
+ * back past the cache each time. The btrfs write path found a case where the
+ * medium ended up with the newest first sector and an older tail; this asks
+ * the same question directly, with no filesystem in the way, so the answer
+ * cannot be blamed on the caller. Runs only when asked, on a disk whose test
+ * range is provably unused. */
+void blk_cache_torture_test(void) {
+    if (!bootinfo_has_flag("b1nix.blk-torture"))
+        return;
+
+    struct block_device *dev = blk_find_scratch(BLK_BUS_VIRTIO);
+
+    if (!dev || !dev->read_blocks || !dev->write_blocks) {
+        k_info(NULL, "BLK-TORTURE: skip reason=no-scratch-device");
+        return;
+    }
+
+    const u32 sectors = 32; /* 16 KiB, the size a btrfs node is written in */
+    u8 *out = kmalloc((usize)sectors * CACHE_BLOCK_SIZE);
+    u8 *back = kmalloc((usize)sectors * CACHE_BLOCK_SIZE);
+
+    if (!out || !back) {
+        if (out) kfree(out);
+        if (back) kfree(back);
+        k_info(NULL, "BLK-TORTURE: skip reason=out-of-memory");
+        return;
+    }
+
+    unsigned mismatches = 0;
+    unsigned rounds = 200;
+    /* Enough other traffic between rounds to make the cache evict: an idle
+     * cache never recycles a slot, and recycling is where the interesting
+     * failures live. */
+    u8 *filler = kmalloc(CACHE_BLOCK_SIZE);
+
+    for (unsigned r = 0; r < rounds; r++) {
+        for (u32 i = 0; i < sectors * CACHE_BLOCK_SIZE; i++)
+            out[i] = (u8)(i * 31 + r * 7);
+        if (blk_write_cached(dev, BLK_SELFTEST_LBA, sectors, out) < 0) {
+            mismatches = rounds; /* a failed write is a failure of its own */
+            break;
+        }
+        if (filler) {
+            u64 span = dev->block_count > BLK_SELFTEST_LBA + 4096
+                           ? 2048
+                           : 0;
+
+            for (u64 k = 0; k < span; k++) {
+                memset(filler, (int)(k + r), CACHE_BLOCK_SIZE);
+                blk_write_cached(dev, BLK_SELFTEST_LBA + sectors + k, 1,
+                                 filler);
+            }
+        }
+        blk_cache_flush(dev);
+        memset(back, 0, (usize)sectors * CACHE_BLOCK_SIZE);
+        if (dev->read_blocks(dev, BLK_SELFTEST_LBA, sectors, back) < 0) {
+            mismatches = rounds;
+            break;
+        }
+        for (u32 i = 0; i < sectors * CACHE_BLOCK_SIZE; i++) {
+            if (back[i] != out[i]) {
+                char line[160];
+
+                snprintf(line, sizeof(line),
+                         "BLK-TORTURE: round %u differs at byte %u (sector %u)",
+                         r, i, i / CACHE_BLOCK_SIZE);
+                if (mismatches < 4)
+                    k_info(NULL, "%s", line);
+                mismatches++;
+                break;
+            }
+        }
+    }
+    kfree(out);
+    kfree(back);
+    if (filler)
+        kfree(filler);
+
+    console_write(mismatches ? "BLK-TORTURE: FAIL multi-sector-write\n"
+                             : "BLK-TORTURE: ok multi-sector-write\n");
 }
 
 void blk_cache_invalidate(struct block_device *dev) {

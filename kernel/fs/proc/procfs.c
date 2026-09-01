@@ -1891,9 +1891,16 @@ static isize procfs_fdinfo_read(struct vfs_node *node, u64 offset, char *buffer,
      * systemd's pidfd_get_pid() parses exactly this file, and uses the answer
      * to check that the pid it remembers still belongs to the process the
      * descriptor holds. */
+    /* `ino:` is the pidfs inode — the identity of the PROCESS, the same number
+     * fstat(2) on the descriptor reports. Linux prints it and callers read it
+     * from here when they cannot stat: it is how a pidfd is compared against
+     * another pidfd for the same process. Printed alongside Pid/NSpid, in
+     * Linux's order. */
     n = snprintf(text, sizeof(text),
-                 "pos:\t%lu\nflags:\t0%o\nmnt_id:\t%d\nPid:\t%lu\nNSpid:\t%lu\n",
+                 "pos:\t%lu\nflags:\t0%o\nmnt_id:\t%d\nino:\t%lu\n"
+                 "Pid:\t%lu\nNSpid:\t%lu\n",
                  (unsigned long)pos, (unsigned)oflags, mnt_id,
+                 (unsigned long)scheduler_task_pidfs_ino(pidfd_pid),
                  (unsigned long)pidfd_pid, (unsigned long)pidfd_pid);
   } else {
     n = snprintf(text, sizeof(text), "pos:\t%lu\nflags:\t0%o\nmnt_id:\t%d\n",

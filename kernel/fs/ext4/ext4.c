@@ -5,6 +5,9 @@
 #include <b1nix/errno.h>
 #include <b1nix/ext2.h>
 #include <b1nix/ext4.h>
+#include <b1nix/bootinfo.h>
+#include <b1nix/klog.h>
+#include <stdio.h>
 #include <b1nix/journal.h>
 #include <b1nix/mm.h>
 #include <b1nix/vfs.h>
@@ -166,8 +169,10 @@ static int ext4_read_inode(struct ext4_fs *fs, u32 inode_num, struct ext2_inode 
   u32 itable = ext4_bgd_inode_table(fs, &bgd);
   u32 inode_offset = ((inode_num - 1) % fs->inodes_per_group) * fs->inode_size;
   u32 block_idx = itable + (inode_offset / fs->block_size);
-  u8 *buf = kmalloc(fs->block_size); ext4_read_block(fs, block_idx, buf);
-  memcpy(inode, buf + (inode_offset % fs->block_size), sizeof(struct ext2_inode)); kfree(buf);
+  u8 *buf = kmalloc(fs->block_size);
+  ext4_read_block(fs, block_idx, buf);
+  memcpy(inode, buf + (inode_offset % fs->block_size), sizeof(struct ext2_inode));
+  kfree(buf);
   return 0;
 }
 
@@ -402,14 +407,45 @@ static isize ext4_vfs_read(struct vfs_node *node, u64 offset, char *buffer, usiz
     (void)flags; struct ext4_inode_info *info = (struct ext4_inode_info *)node->inode->data;
     struct ext4_fs *fs = info->fs; struct ext2_inode inode;
     if (ext4_read_inode(fs, info->inode_num, &inode) < 0) return -1;
-    u64 inode_sz = ext4_get_inode_size(fs, &inode); if (offset >= inode_sz) return 0;
+    u64 inode_sz = ext4_get_inode_size(fs, &inode);
+    if (offset >= inode_sz) return 0;
     usize remaining = (usize)(inode_sz - offset); usize to_read = size < remaining ? size : remaining;
     usize done = 0; u8 *block_buf = kmalloc(fs->block_size);
     usize run_max = blk_run_blocks(fs->bdev, fs->block_size);
+    /* `b1nix.trace-ext4-ino=<n>`: the logical-to-physical mapping this driver
+     * resolves for one file. A file that reads as zeros with a correct size
+     * and a correct inode number has failed somewhere between the extent tree
+     * and the disk, and the mapping is the only place that distinguishes "the
+     * extents were not understood" from "the blocks were not read". */
+    int trace_ino = 0;
+    {
+        static u32 want_ino = (u32)-1;
+
+        if (want_ino == (u32)-1)
+            want_ino = bootinfo_get_u32("b1nix.trace-ext4-ino", 0);
+        trace_ino = want_ino && info->inode_num == want_ino;
+    }
+    if (trace_ino) {
+        char line[160];
+
+        snprintf(line, sizeof(line),
+                 "ext4-trace: ino=%u size=%llu flags=0x%x off=%llu len=%lu",
+                 (unsigned)info->inode_num, (unsigned long long)inode_sz,
+                 (unsigned)inode.i_flags, (unsigned long long)offset,
+                 (unsigned long)size);
+        klog_info(line);
+    }
     while (done < to_read) {
         u32 b_idx = (u32)((offset + done) / fs->block_size); u32 b_off = (u32)((offset + done) % fs->block_size);
         u32 phys = ext4_get_block(fs, &inode, b_idx); usize chunk = fs->block_size - b_off;
         if (chunk > to_read - done) chunk = to_read - done;
+        if (trace_ino && b_idx < 4) {
+            char line[128];
+
+            snprintf(line, sizeof(line), "ext4-trace: block %u -> phys %u",
+                     (unsigned)b_idx, (unsigned)phys);
+            klog_info(line);
+        }
 
         /* Whole blocks that lie next to each other on the disk go in ONE
          * request, straight into the caller's buffer — the same coalescing the

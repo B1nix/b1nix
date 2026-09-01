@@ -873,4 +873,16 @@ void vma_retire_poll(void);
 struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr);
 void vma_delete_range(struct task *t, u64 start, u64 end);
 
+/* Stride for a nice value: how far a task's pass advances each time it yields.
+ * Exposed so the nice weighting can be checked directly instead of inferred
+ * from how often spinning processes happened to run. */
+int sched_stride_for_nice(int nice);
+
+/* Known-answer checks for that contract and for the min-pass selection rule it
+ * feeds. Emits M46-SCHED markers; test mode only. */
+void sched_nice_selftest(void);
+
+
 #endif
+
+u64 scheduler_task_pidfs_ino(usize pid);

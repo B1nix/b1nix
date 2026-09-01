@@ -209,6 +209,14 @@ void arch_set_fs_base(u64 base) {
 }
 
 
+/* Set once NXE is programmed: PTE bit 63 means "no execute" rather than a
+ * reserved bit that must stay zero. Every mapping that wants to be
+ * non-executable has to ask this first — on a CPU without NX support, setting
+ * bit 63 faults on access instead of protecting anything. */
+static volatile int g_nx_enabled = 0;
+
+int arch_nx_enabled(void) { return g_nx_enabled; }
+
 void x86_syscall_init(void) {
   u32 lo, hi;
   /* Enable syscall/sysret by setting the SCE bit in the EFER MSR. */
@@ -230,8 +238,10 @@ void x86_syscall_init(void) {
       __asm__ volatile("cpuid"
                        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
                        : "a"(0x80000001u));
-      if (edx & (1u << 20))
+      if (edx & (1u << 20)) {
         lo |= (1u << 11); /* NXE */
+        g_nx_enabled = 1;
+      }
     }
   }
   __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000080));

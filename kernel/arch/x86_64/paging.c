@@ -2313,6 +2313,14 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
      * store faults again, and the copy path allocates the frame that could
      * have been installed straight away. Measured on a heap-churn run: 2.3 s
      * of work took 5 s. A write fault gets its own frame here. */
+    /* Protection for the page about to be installed. An anonymous mapping that
+     * did not ask for PROT_EXEC gets the NX bit, so a heap or stack page cannot
+     * be jumped into; without a VMA to consult (a few legacy kernel-side
+     * mappings) the old permissive behaviour stands rather than guessing. */
+    u64 anon_user_flags =
+        anon_vma ? vmm_user_flags_from_prot((int)anon_vma->prot) : VMM_USER;
+    u64 anon_exec_bits = anon_user_flags & VMM_NO_EXECUTE;
+
     u64 zero_pg = (error_code & PF_WRITE) ? 0 : pmm_zero_page();
     if (zero_pg) {
       u64 cflags;
@@ -2323,7 +2331,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
         return 0; /* already serviced concurrently */
       }
       vmm_map_page_locked(page_aligned, zero_pg,
-                          VMM_PRESENT | VMM_COW | VMM_USER);
+                          VMM_PRESENT | VMM_COW | VMM_USER | anon_exec_bits);
       /* Point the neighbours at the same shared zero page while the tables are
        * open. Anonymous memory is touched in runs — a heap grows, a thread
        * stack is written down — and each of those pages otherwise costs a
@@ -2347,7 +2355,8 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
           if (!nslot || (*nslot & VMM_PRESENT) ||
               (*nslot & (VMM_LAZY | VMM_SWAPPED)))
             break;
-          vmm_map_page_locked(va, zero_pg, VMM_PRESENT | VMM_COW | VMM_USER);
+          vmm_map_page_locked(va, zero_pg,
+                              VMM_PRESENT | VMM_COW | VMM_USER | anon_exec_bits);
         }
       }
       vmm_write_release(cflags);
@@ -2390,7 +2399,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       return 0; // already serviced concurrently
     }
     vmm_map_page_locked(page_aligned, frame,
-                        VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+                        VMM_PRESENT | VMM_WRITABLE | VMM_USER | anon_exec_bits);
     vmm_write_release(cflags);
     eviction_register_page(current_task, page_aligned, frame);
 
@@ -2646,6 +2655,12 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     u64 flags = VMM_PRESENT;
     if (*slot & VMM_WRITABLE) flags |= VMM_WRITABLE;
     if (*slot & VMM_USER) flags |= VMM_USER;
+    /* The lazy marker also carries the execute permission the mapping was
+     * created with. Rebuilding the entry from a whitelist that omitted it made
+     * every lazily-faulted page executable no matter what the caller asked
+     * for — which is most of userspace, mmap being lazy for anonymous and
+     * file-backed alike. */
+    if (*slot & VMM_NO_EXECUTE) flags |= VMM_NO_EXECUTE;
     /* A fault raised in ring 3 must produce a page ring 3 can use.
      *
      * The user bit was recovered from the previous entry alone, so an entry

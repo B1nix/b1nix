@@ -8,7 +8,7 @@
  * Attribute files registered at runtime, under /sys and /sys/kernel/debug.
  *
  * b1nix's /sys is otherwise a tree built once at mount from lookup callbacks
- * (kernel/fs/sysfs.c). That is the right shape for facts the kernel always
+ * (kernel/fs/sysfs/sysfs.c). That is the right shape for facts the kernel always
  * knows — the CPU list, the block topology — and the wrong shape for a driver
  * that appears later and wants to publish its own files. A DRM device does
  * exactly that: registering it creates /sys/class/drm/card0 with attributes

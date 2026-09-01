@@ -184,7 +184,7 @@ endif
 endif
 ifdef LIBC_SO
 # The selected libc replaces the retired b1nix shared libc: /lib/$(LIBC_LDSO_NAME)
-# is the blob and /lib/libc.so is a symlink onto it (see kernel/fs/initramfs.c).
+# is the blob and /lib/libc.so is a symlink onto it (see kernel/fs/ramfs/initramfs.c).
 INITRAMFS_SHARED_LIBC_INC :=
 INITRAMFS_LD_MUSL_INC := $(INC_DIR)/$(LIBC_INC_NAME)
 else
@@ -577,27 +577,29 @@ KERNEL_SOURCES := \
 	kernel/syscall/syscall.c \
 	kernel/syscall/linux_abi.c \
 	kernel/syscall/resource_caps.c \
-	kernel/fs/initramfs.c \
+	kernel/fs/ramfs/initramfs.c \
 	kernel/fs/vfs.c \
 	kernel/fs/aio.c \
 	kernel/fs/vfs_slab.c \
 	kernel/fs/pipe.c \
 	kernel/fs/eventpoll.c \
 	kernel/fs/inotify.c \
-	kernel/fs/fat32.c \
-	kernel/fs/exfat.c \
-	kernel/fs/ext2.c \
-	kernel/fs/ext1.c \
-	kernel/fs/ext3.c \
-	kernel/fs/ext4.c \
-	kernel/fs/procfs.c \
-	kernel/fs/tmpfs.c \
-	kernel/fs/cgroup.c \
-	kernel/fs/sysfs.c \
-	kernel/fs/sysfs_attr.c \
-	kernel/fs/journal.c \
+	kernel/fs/fat/fat32.c \
+	kernel/fs/fat/exfat.c \
+	kernel/fs/ext4/ext2.c \
+	kernel/fs/ext4/ext1.c \
+	kernel/fs/ext4/ext3.c \
+	kernel/fs/ext4/ext4.c \
+	kernel/fs/proc/procfs.c \
+	kernel/fs/ramfs/tmpfs.c \
+	kernel/fs/mount_api.c \
+	kernel/fs/btrfs/btrfs_selftest.c \
+	kernel/fs/cgroup/cgroup.c \
+	kernel/fs/sysfs/sysfs.c \
+	kernel/fs/sysfs/sysfs_attr.c \
+	kernel/fs/ext4/journal.c \
 	kernel/fs/filelock.c \
-	kernel/fs/fuse.c \
+	kernel/fs/fuse/fuse.c \
 	kernel/fs/9p.c \
 	kernel/dev/virtio_9p.c \
 	kernel/fs/fwcfgfs.c \
@@ -1140,15 +1142,31 @@ $(BUILD_DIR)/kernel/main.o: $(B1NIX_I915_STAMP)
 # vermagic stamp in <b1nix/module.h>.
 MODULE_CFLAGS := $(COMMON_CFLAGS) $(ARCH_CFLAGS) -DMODULE
 
+# A module may be built from more than one source file: the parts are compiled
+# separately and combined with a relocatable link, the same way the kernel's own
+# multi-file objects are. A single-source module still produces exactly one
+# compile and no link.
 define B1NIX_MODULE_RULE
 $$(MODULE_OUT_DIR)/$(1).ko: $(2)
 	@mkdir -p $$(dir $$@)
-	$$(CC) $$(MODULE_CFLAGS) -c $$< -o $$@
+	@set -e; objs=""; \
+	for src in $(2); do \
+		obj="$$(MODULE_OUT_DIR)/$(1)-$$$$(basename $$$$src .c).o"; \
+		echo "$$(CC) $$(MODULE_CFLAGS) -c $$$$src -o $$$$obj"; \
+		$$(CC) $$(MODULE_CFLAGS) -c $$$$src -o $$$$obj; \
+		objs="$$$$objs $$$$obj"; \
+	done; \
+	if [ $$$$(echo $$$$objs | wc -w) -eq 1 ]; then \
+		mv $$$$objs $$@; \
+	else \
+		$$(LD) -r -o $$@ $$$$objs; \
+		rm -f $$$$objs; \
+	fi
 endef
 
-$(eval $(call B1NIX_MODULE_RULE,isofs,kernel/fs/isofs.c))
-$(eval $(call B1NIX_MODULE_RULE,ntfs,kernel/fs/ntfs.c))
-$(eval $(call B1NIX_MODULE_RULE,btrfs,kernel/fs/btrfs.c))
+$(eval $(call B1NIX_MODULE_RULE,isofs,kernel/fs/isofs/isofs.c))
+$(eval $(call B1NIX_MODULE_RULE,ntfs,kernel/fs/ntfs/ntfs.c))
+$(eval $(call B1NIX_MODULE_RULE,btrfs,kernel/fs/btrfs/btrfs.c kernel/fs/btrfs/btrfs_write.c))
 $(eval $(call B1NIX_MODULE_RULE,hda,kernel/dev/hda.c))
 $(eval $(call B1NIX_MODULE_RULE,ipv6,kernel/net/ipv6.c))
 $(eval $(call B1NIX_MODULE_RULE,ndp,kernel/net/ndp.c))
@@ -1815,7 +1833,7 @@ SMOKE_CMDLINE_posix=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1ni
 # (tests/smoke.sh passes the pflash pair), and probing WRITES a query command
 # to a physical address, so it stays behind a flag rather than running on every
 # boot -- on real hardware that address space belongs to the firmware.
-SMOKE_CMDLINE_blk=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.mtd b1nix.smoke=blk
+SMOKE_CMDLINE_blk=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.mtd b1nix.btrfs-rw b1nix.smoke=blk
 # OpenRC ctltest: boots the real init system as PID 1 and drives sysinit/boot/default,
 # then a local.d hook asks PID 1 to power off through /run/openrc/init.ctl — the
 # control-FIFO path openrc-shutdown and telinit use. A clean poweroff proves the channel works.
@@ -2336,6 +2354,17 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@# rootfs the test actually runs against.
 	@$(MAKE) --no-print-directory $(INITRAMFS_TESTWAV_INC)
 	@$(CIC) $(BUILD_DIR)/test.wav $(BUILD_DIR)/rootfs/test.wav
+	@# A real btrfs filesystem, for the module-in-use check.
+	@#
+	@# The check used to fabricate one by writing the btrfs magic into an
+	@# otherwise empty file, which worked only while the driver looked at
+	@# nothing but the magic. It reads the filesystem now, so the test needs a
+	@# filesystem -- and one built by mkfs.btrfs is a better subject anyway.
+	@# 16 MiB is the smallest mkfs.btrfs will make (mixed block groups, 4 KiB
+	@# nodes). Built here rather than committed: a binary blob in the tree is a
+	@# thing nobody can review.
+	@sh tools/images/mk-btrfs-test-image.sh $(BUILD_DIR) || true
+	@if [ -f $(BUILD_DIR)/btrfs-test.img ]; then $(CIC) $(BUILD_DIR)/btrfs-test.img $(BUILD_DIR)/rootfs/btrfs-test.img; fi
 	@# Self-contained TLS test PKI. The loopback HTTPS smokes (M32 curl, M53
 	@# NetSurf-over-TLS) verify the server cert against this CA, so the PEMs
 	@# have to exist in the rootfs the tests actually run against.

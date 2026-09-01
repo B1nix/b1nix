@@ -114,7 +114,7 @@ void ps2_kbd_init(void)
 	 * first-port clock enabled. */
 	kbd_ctrl_cmd(0x20);
 	u8 cfg = kbd_dev_read();
-	cfg &= ~0x01u;  /* first-port interrupt off (for now) */
+	cfg &= ~0x01u;  /* first-port interrupt off for the duration of init */
 	cfg |=  0x40u;  /* scancode translation set2 -> set1 */
 	cfg &= ~0x10u;  /* first-port clock enabled */
 	kbd_ctrl_cmd(0x60);

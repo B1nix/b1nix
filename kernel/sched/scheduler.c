@@ -313,6 +313,30 @@ static int  g_task_execed[MAX_TASKS];
 /* POSIX nice value (-20..19, 0 default) — see scheduler_set_priority for why
  * this is NOT task->priority. Inherited across fork. */
 static int  g_task_nice[MAX_TASKS];
+
+/* Stride for one nice value: how far a task's pass advances each time it gives
+ * the CPU up. The scheduler then always picks the smallest pass among equal
+ * priorities, so a task with a smaller stride comes up more often — the whole
+ * of what nice means here.
+ *
+ * Tickets are 20 - nice, so nice -20 buys 40 tickets and nice 19 buys one; the
+ * stride is the reciprocal scaled by 1000. Out-of-range values clamp rather
+ * than divide by zero or go negative.
+ *
+ * Extracted from schedule() so the contract can be tested directly. From ring 3
+ * it can only be inferred from how often each of several spinning processes got
+ * to run, which is a statistical argument about a loaded machine — the M46
+ * userspace test makes it, and it cannot say whether a particular nice value
+ * produced the stride it should. */
+int sched_stride_for_nice(int nice) {
+  if (nice < -20) nice = -20;
+  if (nice > 19) nice = 19;
+
+  int tickets = 20 - nice;
+
+  return 1000 / tickets;
+}
+
 static struct rlimit g_task_rlimits[MAX_TASKS][16];
 static usize g_task_tgid[MAX_TASKS];
 /* How far into exit a task has got.
@@ -390,6 +414,18 @@ static u64   g_task_cstime_ns[MAX_TASKS];
 /* Scheduler tick at which the slot's current occupant was created — /proc's
  * starttime field, and the base for a task's wall-clock age. */
 static u64   g_task_start_tick[MAX_TASKS];
+
+/* The number a pidfd reports as its inode.
+ *
+ * On Linux this is a pidfs inode: it identifies the PROCESS, so two pidfds for
+ * the same process share it and a recycled pid never reuses it. b1nix gave
+ * each DESCRIPTOR its own number, which is a different claim — systemd takes
+ * a pidfd, records the number, opens the process again later and compares, and
+ * concluded every time that the descriptor now referred to something else
+ * ("Failed to spawn executor: Object is remote", EREMOTE from
+ * pidref_verify()). Assigned per task at creation and never reused. */
+static u64   g_task_pidfs_ino[MAX_TASKS];
+static u64   g_pidfs_ino_next = 1;
 /* Context-switch counts: voluntary (the task blocked/slept/exited of its own
  * accord) and involuntary (it was still runnable when preempted). getrusage's
  * ru_nvcsw/ru_nivcsw. */
@@ -566,6 +602,15 @@ static struct task *g_ap_idle_tasks[MAX_CPUS];
 static struct task *find_unused_task(void);
 static usize task_index(const struct task *task);
 extern u64 g_task_affinity_fwd_unused;
+
+/* A suspended task's stack pointer, wherever the arch parked it. */
+#if defined(__x86_64__)
+#define TASK_CTX_SP(t) ((t)->context.rsp)
+#elif defined(__aarch64__)
+#define TASK_CTX_SP(t) ((t)->context.sp)
+#else
+#define TASK_CTX_SP(t) ((t)->context.esp)
+#endif
 
 struct task *scheduler_setup_ap_idle(int cpu, u64 kstack_top) {
   if (cpu < 0 || cpu >= MAX_CPUS)
@@ -946,6 +991,7 @@ static struct task *find_unused_task(void) {
       g_task_cutime_ns[i] = 0;
       g_task_cstime_ns[i] = 0;
       g_task_start_tick[i] = scheduler_ticks;
+      g_task_pidfs_ino[i] = g_pidfs_ino_next++;
       g_task_nvcsw[i] = 0;
       g_task_nivcsw[i] = 0;
       g_task_gone_utime_ns[i] = 0;
@@ -1005,6 +1051,7 @@ static struct task *find_unused_task(void) {
   g_task_cutime_ns[i] = 0;
   g_task_cstime_ns[i] = 0;
   g_task_start_tick[i] = scheduler_ticks;
+  g_task_pidfs_ino[i] = g_pidfs_ino_next++;
   g_task_nvcsw[i] = 0;
   g_task_nivcsw[i] = 0;
   g_task_gone_utime_ns[i] = 0;
@@ -1201,7 +1248,7 @@ void sched_note_boot_task_on_secondary(struct task *t, const char *where) {
   console_write(" stealable=");
   console_write_dec((u64)t->stealable);
   console_write(" ctxsp=0x");
-  console_write_hex64(t->context.sp);
+  console_write_hex64(TASK_CTX_SP(t));
   console_write("\n");
 }
 
@@ -2704,6 +2751,15 @@ u64 task_cutime(const struct task *t) {
 u64 task_cstime(const struct task *t) {
   return task_cstime_ns(t) / NS_PER_USER_TICK;
 }
+/* The pidfs inode for a pid: the same number for every pidfd that names this
+ * process, and never issued again once the process is gone. Zero when there is
+ * no such task. */
+u64 scheduler_task_pidfs_ino(usize pid) {
+  struct task *t = scheduler_task_by_pid(pid);
+
+  return t ? g_task_pidfs_ino[task_index(t)] : 0;
+}
+
 u64 task_start_ticks(const struct task *t) {
   if (!t) return 0;
   return g_task_start_tick[task_index(t)];
@@ -3827,11 +3883,7 @@ int scheduler_yield(void) {
   if (old_task->state == TASK_RUNNING) {
     /* Stride Scheduler: increment pass of yielding task by its stride */
     usize old_idx = task_index(old_task);
-    int nice = g_task_nice[old_idx];
-    if (nice < -20) nice = -20;
-    if (nice > 19) nice = 19;
-    int tickets = 20 - nice;
-    int stride = 1000 / tickets;
+    int stride = sched_stride_for_nice(g_task_nice[old_idx]);
     g_task_pass[old_idx] += stride;
 
     /* M28 T4: claim the kernel stack BEFORE publishing state=READY. Under T4
@@ -4814,11 +4866,20 @@ static void serial_silence_watchdog(void) {
     if (t != current_task && t->stack) {
       u64 lo = (u64)(usize)t->stack;
       u64 hi = lo + KERNEL_STACK_SIZE;
+#if defined(__aarch64__)
       u64 fp = t->context.fp;
 
       console_write("\n      at 0x");
       console_write_hex64(t->context.lr);
       ksym_print(t->context.lr);
+#else
+      /* x86_64 has no link register: the resume address sits on the stack
+       * rather than in the saved context, so the walk starts one frame in
+       * and there is no "at" line to print. */
+      u64 fp = t->context.rbp;
+
+      console_write("\n      at");
+#endif
       for (int d = 0; d < 14; d++) {
         u64 *frame;
 
@@ -6867,13 +6928,6 @@ void scheduler_dump_tasks(void) {
       /* The kernel return addresses still on the task's stack. A blocked task
        * left them there, so they name the path that put it to sleep — which is
        * the one thing state and wait channel together still do not say. */
-#if defined(__x86_64__)
-#define TASK_CTX_SP(t) ((t)->context.rsp)
-#elif defined(__aarch64__)
-#define TASK_CTX_SP(t) ((t)->context.sp)
-#else
-#define TASK_CTX_SP(t) ((t)->context.esp)
-#endif
       if (T(i) != current_task && TASK_CTX_SP(T(i))) {
         extern char __kernel_text_start[], __kernel_text_end[];
         u64 lo = (u64)(usize)__kernel_text_start;
@@ -7000,6 +7054,62 @@ usize sched_fd_limit(void) {
   return cached;
 }
 
+/* `b1nix.trace-fd=<n>`: report every task that installs or removes descriptor
+ * <n>, with the pid.
+ *
+ * "A descriptor the caller believes it holds is not in its table" is a whole
+ * class of bug — systemd aborts on it (`fclose_nointr(f) != -EBADF`) and the
+ * failing call names the syscall, not the moment the descriptor went away. The
+ * moment is what is missing, so this reports it: the trace shows who took the
+ * slot and who gave it back, in order. Off unless the flag is given. */
+static int fd_trace_target(void) {
+  static int target = -2; /* -2 = not read yet, -1 = off */
+
+  if (target == -2) {
+    u32 v = bootinfo_get_u32("b1nix.trace-fd", (u32)-1);
+    target = (v == (u32)-1) ? -1 : (int)v;
+  }
+  return target;
+}
+
+static void fd_trace(const char *what, int fd, const void *handle) {
+  if (fd != fd_trace_target())
+    return;
+
+  extern u64 syscall_current_number(void);
+  /* What the descriptor refers to, not just that it moved. "descriptor 0 was
+   * closed" and "the machine's /dev/null was closed" are different findings,
+   * and only the second one says whether a kernel replaced a descriptor behind
+   * the caller's back. */
+  const struct vfs_handle *h = handle;
+  const char *what_it_is = "?";
+
+  if (h) {
+    if (h->node && h->node->name[0])
+      what_it_is = h->node->name;
+    else
+      switch (h->kind) {
+      case VFS_HANDLE_PIPE_READ:  what_it_is = "pipe:r"; break;
+      case VFS_HANDLE_PIPE_WRITE: what_it_is = "pipe:w"; break;
+      case VFS_HANDLE_SOCKET:     what_it_is = "socket"; break;
+      case VFS_HANDLE_EPOLL:      what_it_is = "epoll"; break;
+      case VFS_HANDLE_SIGNALFD:   what_it_is = "signalfd"; break;
+      case VFS_HANDLE_TIMERFD:    what_it_is = "timerfd"; break;
+      case VFS_HANDLE_EVENTFD:    what_it_is = "eventfd"; break;
+      case VFS_HANDLE_INOTIFY:    what_it_is = "inotify"; break;
+      case VFS_HANDLE_PIDFD:      what_it_is = "pidfd"; break;
+      default:                    what_it_is = "anon"; break;
+      }
+  }
+
+  char line[200];
+  snprintf(line, sizeof(line),
+           "fd-trace: %s fd=%d pid=%u syscall=%llu handle=%p (%s)", what, fd,
+           (unsigned)(current_task ? current_task->id : 0),
+           (unsigned long long)syscall_current_number(), handle, what_it_is);
+  klog_info(line);
+}
+
 int scheduler_fd_alloc(struct vfs_handle *handle) {
   if (!current_task || !handle)
     return -1;
@@ -7018,6 +7128,7 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
       current_task->fd_table[i] = handle;
       current_task->fd_flags[i] = 0;
       fd_lock_release();
+      fd_trace("alloc", (int)i, handle);
       return (int)i;
     }
   }
@@ -7119,6 +7230,7 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
 
   current_task->fd_table[fd] = handle;
   current_task->fd_flags[fd] = 0;
+  fd_trace("set", fd, handle);
   fd_lock_release();
   return fd;
 }
@@ -7130,6 +7242,7 @@ int scheduler_fd_close(int fd) {
   current_task->fd_table[fd] = 0;
   current_task->fd_flags[fd] = 0;
   fd_lock_release();
+  fd_trace("close", fd, 0);
   return 0;
 }
 
@@ -7145,6 +7258,8 @@ struct vfs_handle *scheduler_fd_take(int fd) {
   current_task->fd_table[fd] = 0;
   current_task->fd_flags[fd] = 0;
   fd_lock_release();
+  if (h)
+    fd_trace("take", fd, h);
   return h;
 }
 
@@ -8913,4 +9028,99 @@ int scheduler_consume_pending_signal(int sig) {
   u64 prev = __atomic_fetch_and(&current_task->pending_signals, ~bit,
                                 __ATOMIC_ACQ_REL);
   return (prev & bit) ? 1 : 0;
+}
+
+/* ── Nice / stride contract, checked in test mode ────────────────────────────
+ *
+ * The userspace half of this (M46's nice-biasing test) forks spinning workers
+ * at nice -20 and 19 and compares how many iterations each completed. That is
+ * the right test for "does nice change behaviour", and the wrong instrument for
+ * "does nice produce the weighting it promises": it measures a loaded machine
+ * over a 250 ms window, so it can tell a bias from no bias and little else.
+ * Where it wanted more, it read /proc/b1nix-tasks and dropped the bytes on the
+ * floor — the file prints the scheduler's dump to the console, so the values
+ * went to the log and no assertion was ever made about them.
+ *
+ * These checks are made where the numbers live. Nothing here touches the live
+ * runqueue: the selection rule is replayed against the same stride function the
+ * scheduler uses, which is what makes the expected counts exact rather than
+ * statistical. */
+void sched_nice_selftest(void) {
+  /* 1. The stride each nice value buys, at both ends and the default. */
+  {
+    int s_min = sched_stride_for_nice(-20); /* 40 tickets */
+    int s_def = sched_stride_for_nice(0);   /* 20 tickets */
+    int s_max = sched_stride_for_nice(19);  /* 1 ticket   */
+
+    if (s_min == 25 && s_def == 50 && s_max == 1000) {
+      console_write("M46-SCHED: ok stride-values\n");
+    } else {
+      console_write("M46-SCHED: FAIL stride-values -20=");
+      console_write_dec((u64)s_min);
+      console_write(" 0=");
+      console_write_dec((u64)s_def);
+      console_write(" 19=");
+      console_write_dec((u64)s_max);
+      console_write("\n");
+    }
+  }
+
+  /* 2. Out-of-range nice clamps instead of dividing by zero or going negative.
+   * setpriority(2) clamps at the syscall, so these values reach the scheduler
+   * only through a kernel-internal caller — which is exactly the caller no
+   * userspace test can stand in for. */
+  {
+    int lo = sched_stride_for_nice(-1000);
+    int hi = sched_stride_for_nice(1000);
+
+    if (lo == sched_stride_for_nice(-20) && hi == sched_stride_for_nice(19))
+      console_write("M46-SCHED: ok stride-clamped\n");
+    else
+      console_write("M46-SCHED: FAIL stride-clamped\n");
+  }
+
+  /* 3. Monotonicity: a higher nice is never scheduled more often. Every
+   * adjacent pair, so a sign error anywhere in the range is caught rather than
+   * just at the ends. */
+  {
+    int ok = 1;
+
+    for (int n = -20; n < 19; n++) {
+      if (sched_stride_for_nice(n) > sched_stride_for_nice(n + 1)) {
+        ok = 0;
+        break;
+      }
+    }
+    if (ok)
+      console_write("M46-SCHED: ok stride-monotonic\n");
+    else
+      console_write("M46-SCHED: FAIL stride-monotonic\n");
+  }
+
+  /* 4. The rule the strides feed: always run the smallest pass, then advance it
+   * by that task's stride. Replayed here for two tasks at nice -20 and nice 0,
+   * whose strides are 25 and 50 — so over any run the nicer-to-others task must
+   * be picked exactly twice as often. The scheduler's own pick adds priority
+   * ordering and runnability on top; the weighting between equals is this. */
+  {
+    u64 pass[2] = {0, 0};
+    int stride[2] = {sched_stride_for_nice(-20), sched_stride_for_nice(0)};
+    unsigned picks[2] = {0, 0};
+
+    for (unsigned i = 0; i < 300; i++) {
+      int win = (pass[1] < pass[0]) ? 1 : 0; /* ties go to the first, as the
+                                              * scheduler's strict < does */
+      picks[win]++;
+      pass[win] += (u64)stride[win];
+    }
+    if (picks[0] == 2 * picks[1]) {
+      console_write("M46-SCHED: ok stride-selection\n");
+    } else {
+      console_write("M46-SCHED: FAIL stride-selection high=");
+      console_write_dec((u64)picks[0]);
+      console_write(" low=");
+      console_write_dec((u64)picks[1]);
+      console_write("\n");
+    }
+  }
 }

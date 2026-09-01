@@ -551,11 +551,40 @@ static u64 find_early_mem(const struct boot_info *boot_info, usize size) {
       search_addr = k_end;
     }
 
-    if (boot_info->has_ramdisk) {
-      u64 rd_start = align_down_u64(boot_info->ramdisk_addr, PAGE_SIZE);
-      u64 rd_end = align_up_u64(boot_info->ramdisk_addr + boot_info->ramdisk_size, PAGE_SIZE);
-      if (search_addr < rd_end && search_addr + size > rd_start) {
-        search_addr = rd_end;
+    /* Step past everything that already owns memory here. Repeated, because
+     * moving clear of one reservation can land on the next. */
+    for (int pass = 0; pass < 4; pass++) {
+      u64 before = search_addr;
+
+      if (boot_info->has_ramdisk) {
+        u64 rd_start = align_down_u64(boot_info->ramdisk_addr, PAGE_SIZE);
+        u64 rd_end = align_up_u64(boot_info->ramdisk_addr + boot_info->ramdisk_size, PAGE_SIZE);
+        if (search_addr < rd_end && search_addr + size > rd_start) {
+          search_addr = rd_end;
+        }
+      }
+
+#if defined(__aarch64__)
+      /* The loadable-module region is identity-mapped RAM starting at the first
+       * 2 MiB boundary past the kernel image. It is reserved in the frame
+       * allocator below -- but that happens after this allocation, so nothing
+       * else keeps the early bitmaps out of it, and they sit immediately below
+       * it. Two bitmaps plus the refcounts fit in that gap; a third did not,
+       * and the module loader wrote isofs, ntfs and btrfs straight over one of
+       * them. The bits that came back were not page-table claims at all, which
+       * is why the frame the handout gate refused had no history behind it. */
+      {
+        u64 mod_start = MODULE_REGION_BASE;
+        u64 mod_end = mod_start + MODULE_REGION_SIZE;
+
+        if (search_addr < mod_end && search_addr + size > mod_start) {
+          search_addr = mod_end;
+        }
+      }
+#endif
+
+      if (search_addr == before) {
+        break;
       }
     }
 

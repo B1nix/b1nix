@@ -88,7 +88,7 @@ broke. They are listed so they are not re-investigated.
    node's mount and asks its root, and procfs/sysfs/cgroup2 report their real
    magic numbers.
 
-4. **No cgroup v2 filesystem.** Implemented: `kernel/fs/cgroup.c`, see below.
+4. **No cgroup v2 filesystem.** Implemented: `kernel/fs/cgroup/cgroup.c`, see below.
 
 5. **`devtmpfs` was an alias for tmpfs.** Mounting it on /dev — which systemd
    does early — replaced every device node in the machine with an empty
@@ -443,7 +443,7 @@ broke. They are listed so they are not re-investigated.
 
 ## cgroup v2
 
-`kernel/fs/cgroup.c`. A mount is a directory tree in the VFS's own in-memory
+`kernel/fs/cgroup/cgroup.c`. A mount is a directory tree in the VFS's own in-memory
 node graph, the way tmpfs is: each directory **is** a cgroup and carries the
 control files that describe it, `mkdir(2)` creates one and `rmdir(2)` destroys
 one. Membership lives in a side table keyed by task id — `struct task` must not
