@@ -4636,6 +4636,7 @@ void scheduler_on_timer_tick(void) {
 
   task_chunks_verify("timer-tick");
 
+
   scheduler_ticks++;
 
   for (usize i = 0; i < g_task_hwm; i++) {

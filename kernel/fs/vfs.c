@@ -1409,6 +1409,21 @@ void vfs_node_put(struct vfs_node *node) {
     if (node->inode && node->inode->release_cb) {
       node->inode->release_cb(node);
     }
+    /* The node is about to drop its inode reference. If the inode has none
+     * left, this node never owned one -- name it, because "inode refcount
+     * underflow" alone does not say which of the nodes sharing that inode is
+     * the one accounting for it wrongly. */
+    if (node->inode &&
+        __atomic_load_n(&node->inode->refcount, __ATOMIC_RELAXED) <= 0) {
+      console_write("vfs: node '");
+      console_write(node->name[0] ? node->name : "(unnamed)");
+      console_write("' releasing an inode it does not hold: ino=");
+      console_write_dec(node->inode->ino);
+      console_write(" parent='");
+      console_write(node->parent && node->parent->name[0] ? node->parent->name
+                                                          : "/");
+      console_write("'\n");
+    }
     vfs_inode_put(node->inode);
     /* Purge any dcache entry that references this node before its memory is
      * returned to the slab pool — otherwise dcache_lookup can resurrect a

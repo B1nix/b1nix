@@ -486,6 +486,21 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 			console_write_hex64(own_hi);
 			console_write(" elr=0x");
 			console_write_hex64(frame->elr);
+			{
+				struct percpu *fp = get_percpu();
+				console_write(" cpu=");
+				console_write_dec(fp ? (u64)fp->cpu_id : 99);
+				console_write(" cur=0x");
+				console_write_hex64((u64)(usize)(fp ? fp->cur_task : 0));
+				console_write(" task=0x");
+				console_write_hex64((u64)(usize)current_task);
+				console_write(" ksp=0x");
+				console_write_hex64(current_task->kernel_stack_ptr);
+				console_write(" ctxsp=0x");
+				console_write_hex64(current_task->context.sp);
+				console_write(" idle=0x");
+				console_write_hex64((u64)(usize)(fp ? fp->idle_task : 0));
+			}
 			console_write("\n");
 			panic("EL1 exception taken on another task's kernel stack");
 		}

@@ -174,11 +174,17 @@ static u64 *table_from_entry(u64 entry) {
  * anything, or NULL if any level is absent or is a block. `space` of 0 means
  * the kernel's own table. */
 static u64 *leaf_table_for(u64 space, u64 vaddr) {
+  /* "NULL if any level is absent" includes the root: `space` can name an
+   * address space that is being torn down, and kernel_l0_virt is null until
+   * paging_init builds it. Reading through one is a data abort, not an answer. */
   u64 *l0 = space ? phys_to_virt(space) : kernel_l0_virt;
+  if (!l0) return 0;
   if ((l0[l0_index(vaddr)] & 0x3ULL) != D_TABLE) return 0;
   u64 *l1 = table_from_entry(l0[l0_index(vaddr)]);
+  if (!l1) return 0;
   if ((l1[l1_index(vaddr)] & 0x3ULL) != D_TABLE) return 0;
   u64 *l2 = table_from_entry(l1[l1_index(vaddr)]);
+  if (!l2) return 0;
   if ((l2[l2_index(vaddr)] & 0x3ULL) != D_TABLE) return 0;
   return table_from_entry(l2[l2_index(vaddr)]);
 }
@@ -1557,38 +1563,62 @@ u64 paging_pml4_entry_in(u64 pml4_phys, u64 virtual_address) {
 /* The raw leaf (L3) descriptor backing `virtual_address`, or 0 when the range
  * is unmapped or mapped by a block descriptor rather than a 4 KiB page. */
 u64 paging_leaf_pte(u64 virtual_address) {
+  /* A walk answers "no mapping" for a table that does not exist; it does not
+   * fault. get_l0_for_va can hand back a null root -- a task whose address
+   * space is gone, or the kernel root before paging_init has built it -- and
+   * every level below can be absent for the same reason. Reading through one
+   * was a data abort at a small offset (FAR 0x7f8 = entry 255 of a null table),
+   * reported as a kernel crash in whatever happened to be walking. */
   u64 *l0 = get_l0_for_va(virtual_address);
+  if (!l0)
+    return 0;
   u64 l0e = l0[l0_index(virtual_address)];
   if ((l0e & 0x3ULL) != D_TABLE)
     return 0;
   u64 *l1 = table_from_entry(l0e);
+  if (!l1)
+    return 0;
   u64 l1e = l1[l1_index(virtual_address)];
   if ((l1e & 0x3ULL) != D_TABLE)
     return 0;
   u64 *l2 = table_from_entry(l1e);
+  if (!l2)
+    return 0;
   u64 l2e = l2[l2_index(virtual_address)];
   if ((l2e & 0x3ULL) != D_TABLE)
     return 0;
   u64 *l3 = table_from_entry(l2e);
+  if (!l3)
+    return 0;
   return l3[l3_index(virtual_address)];
 }
 
 /* Pointer to the leaf (L3) descriptor for `virtual_address`, or 0 when no
  * table describes it. Walks, never allocates. */
 static u64 *leaf_pte_ptr(u64 virtual_address) {
+  /* Same null-table rule as paging_leaf_pte. */
   u64 *l0 = get_l0_for_va(virtual_address);
+  if (!l0)
+    return 0;
   u64 l0e = l0[l0_index(virtual_address)];
   if ((l0e & 0x3ULL) != D_TABLE)
     return 0;
   u64 *l1 = table_from_entry(l0e);
+  if (!l1)
+    return 0;
   u64 l1e = l1[l1_index(virtual_address)];
   if ((l1e & 0x3ULL) != D_TABLE)
     return 0;
   u64 *l2 = table_from_entry(l1e);
+  if (!l2)
+    return 0;
   u64 l2e = l2[l2_index(virtual_address)];
   if ((l2e & 0x3ULL) != D_TABLE)
     return 0;
-  return &table_from_entry(l2e)[l3_index(virtual_address)];
+  u64 *l3 = table_from_entry(l2e);
+  if (!l3)
+    return 0;
+  return &l3[l3_index(virtual_address)];
 }
 
 /* Same reading as paging_leaf_pte — the fault reporter wants the entry itself,
