@@ -1,5 +1,6 @@
 #include <b1nix/panic.h>
 #include <b1nix/console.h>
+#include <b1nix/sched.h>
 #include <stdlib.h>
 #include <string.h>
 #include <b1nix/syscall.h>
@@ -109,10 +110,51 @@ unsigned long __stack_chk_guard = 0xC0FFEE5713579BDFUL;
 
 void __stack_chk_fail(void);
 void __stack_chk_fail(void) {
-  /* Name the frame that smashed. The panic backtrace starts here, so without
-   * the return address the report says only that *something* overflowed. */
+  /* Everything needed to tell the three candidates apart, because the panic
+   * header alone cannot: (a) the frame really overflowed its own array,
+   * (b) something else wrote over a live frame, (c) __stack_chk_guard itself
+   * was clobbered, which would make every subsequent check fail and send the
+   * hunt after innocent functions. Printing the guard settles (c) on the spot;
+   * SP against the task's own stack range settles whether we are even on the
+   * right stack. */
+  u64 sp;
+#ifdef __aarch64__
+  __asm__ volatile("mov %0, sp" : "=r"(sp));
+#elif defined(__x86_64__)
+  __asm__ volatile("movq %%rsp, %0" : "=r"(sp));
+#else
+  sp = 0;
+#endif
   console_write("stack smashing detected in the frame that returned to 0x");
   console_write_hex64((u64)(usize)__builtin_return_address(0));
+  console_write("\n  sp=0x");
+  console_write_hex64(sp);
+  console_write(" guard=0x");
+  console_write_hex64(__stack_chk_guard);
+  console_write(" (expected 0xC0FFEE5713579BDF)\n");
+  {
+    struct task *t = current_task;
+    console_write("  task=");
+    console_write(t && t->name ? t->name : "(none)");
+    console_write("/");
+    console_write_dec(t ? (u64)t->id : 0);
+    console_write(" stack=0x");
+    console_write_hex64(t ? (u64)(usize)t->stack : 0);
+    console_write("..0x");
+    console_write_hex64(t ? t->kernel_stack_ptr : 0);
+    console_write("\n");
+  }
+  /* The words around the smashed frame. The canary sits between the locals and
+   * the saved x29/x30, so whatever overwrote it is very likely still visible
+   * here -- and its VALUE is what names the writer. */
+  console_write("  frame:");
+  {
+    const u64 *w = (const u64 *)(usize)(sp & ~7ULL);
+    for (int i = 0; i < 20; i++) {
+      console_write(" 0x");
+      console_write_hex64(w[i]);
+    }
+  }
   console_write("\n");
   panic("stack smashing detected");
 }

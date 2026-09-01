@@ -195,6 +195,19 @@ static int g_clean_fpu_ready = 0;
 static struct task *g_task_chunks[TASK_MAX_CHUNKS];
 static _Atomic usize g_task_hwm = 0; /* one past highest slot ever used */
 
+/* Tick at which a context switch last actually happened; the stall detector
+ * in scheduler_on_timer_tick measures against it. */
+static u64 g_last_switch_tick;
+
+/* What pick_next_task actually decides. Three tasks sitting READY, passing
+ * every gate, never scheduled, while context switches happen every tick, is
+ * only explicable if the picker keeps choosing something else -- and no dump so
+ * far could say what it chose. */
+static u64 g_pick_calls, g_pick_rq, g_pick_scan, g_pick_idle, g_pick_null;
+static u64 g_scan_seen, g_scan_rej_lease, g_scan_rej_running, g_scan_rej_cas;
+static usize g_scan_best_id = (usize)-1;
+static usize g_last_pick_id = (usize)-1;
+
 /* M29: per-task thread metadata kept in parallel arrays (NOT in struct task
  * — see comment in sched.h). Indexed by the slot in g_task_chunks computed
  * via task_index(). */
@@ -1122,8 +1135,43 @@ static void sched_handoff_recover(struct task *t, const char *where) {
  * the aarch64 re-publication after arch_context_switch returns -- and a dump
  * that shows `cur_task = boot` on cpu 1 cannot say which of them wrote it.
  * Say so once, from whichever one does. */
+/* Which CPU's idle task this is, or -1. The per-CPU idle tasks live outside the
+ * task table on purpose (see scheduler_setup_ap_idle), so no table walk finds
+ * them -- and one of them turning up as ANOTHER CPU's cur_task means two CPUs
+ * are on one kernel stack, which is the failure this branch keeps landing on.
+ * Observed directly: with -smp 2 there is exactly one such task, and a dump
+ * showed BOTH CPUs holding it. */
+static int sched_ap_idle_cpu_of(const struct task *t) {
+  if (!t)
+    return -1;
+  for (int c = 0; c < MAX_CPUS; c++)
+    if (g_ap_idle_tasks[c] == t)
+      return c;
+  return -1;
+}
+
 void sched_note_boot_task_on_secondary(struct task *t, const char *where) {
   struct percpu *chk = get_percpu();
+  int idle_of = sched_ap_idle_cpu_of(t);
+
+  /* Two separate impossibilities, one report. */
+  if (idle_of >= 0 && chk && idle_of != (int)chk->cpu_id) {
+    static volatile int idle_reported;
+    if (!__atomic_exchange_n(&idle_reported, 1, __ATOMIC_ACQ_REL)) {
+      console_write("sched: cpu ");
+      console_write_dec((u64)chk->cpu_id);
+      console_write(" took cpu ");
+      console_write_dec((u64)idle_of);
+      console_write("'s idle task via ");
+      console_write(where);
+      console_write("; its stack is 0x");
+      console_write_hex64((u64)(usize)t->stack);
+      console_write("..0x");
+      console_write_hex64(t->kernel_stack_ptr);
+      console_write("\n");
+    }
+    return;
+  }
 
   if (!chk || chk->cpu_id == 0 || t != T(0))
     return;
@@ -1153,6 +1201,7 @@ static struct task *pick_next_task(void) {
   if (current_task == 0) {
     return 0;
   }
+  g_pick_calls++;
 
   struct percpu *pcpu = get_percpu();
   int on_ap = (pcpu && pcpu->cpu_id != 0);
@@ -1248,6 +1297,7 @@ static struct task *pick_next_task(void) {
         /* The stack is this CPU's again from here on. */
         __atomic_store_n(&t->stack_released, 0, __ATOMIC_RELEASE);
         g_min_pass = g_task_pass[task_index(t)];
+        g_pick_rq++; g_last_pick_id = t->id;
         return t;
       }
       /* Lost the CAS (someone else already picked, or task transitioned to
@@ -1284,6 +1334,7 @@ static struct task *pick_next_task(void) {
 
     int priority = t->priority;
     u64 pass = g_task_pass[index];
+    g_scan_seen++;
     if (priority > max_priority ||
         (priority == max_priority && pass < min_pass)) {
       max_priority = priority;
@@ -1293,6 +1344,7 @@ static struct task *pick_next_task(void) {
   }
 
   if (best_task) {
+    g_scan_best_id = best_task->id;
     /* M28 T4: see global-rq comment — wait for the outgoing CPU to publish
      * stack_released==1 before claiming, otherwise we could resume on a
      * kernel stack the other CPU is still saving to. Skip for our own task
@@ -1318,6 +1370,11 @@ static struct task *pick_next_task(void) {
      * Treat as no-work; the next pick re-finds it once it has switched out. */
     /* Same gate as the runqueue path: a task that is some CPU's current task
      * is executing, whatever its state and lease say. */
+    if (best_task != current_task &&
+        !__atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE))
+      g_scan_rej_lease++;
+    else if (best_task != current_task && task_running_somewhere(best_task))
+      g_scan_rej_running++;
     if ((best_task == current_task ||
          __atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE)) &&
         (best_task == current_task || !task_running_somewhere(best_task))) {
@@ -1331,8 +1388,10 @@ static struct task *pick_next_task(void) {
                                       __ATOMIC_RELAXED)) {
         __atomic_store_n(&best_task->stack_released, 0, __ATOMIC_RELEASE);
         g_min_pass = g_task_pass[task_index(best_task)];
+        g_pick_scan++; g_last_pick_id = best_task->id;
         return best_task;
       }
+      g_scan_rej_cas++;
     }
   }
 
@@ -1340,9 +1399,13 @@ static struct task *pick_next_task(void) {
    * which lets the AP cooperative loop regain control and drop the BKL. NULL on
    * the BSP (its boot task handles idling), and skipped when the idle task is
    * already current (so scheduler_yield returns 0 and the loop parks). */
-  if (pcpu && pcpu->idle_task && current_task != (struct task *)pcpu->idle_task)
+  if (pcpu && pcpu->idle_task && current_task != (struct task *)pcpu->idle_task) {
+    g_pick_idle++;
+    g_last_pick_id = ((struct task *)pcpu->idle_task)->id;
     return (struct task *)pcpu->idle_task;
+  }
 
+  g_pick_null++;
   return 0;
 }
 
@@ -3988,6 +4051,7 @@ int scheduler_yield(void) {
       panic("sched: context switch on a foreign kernel stack");
     }
   }
+  g_last_switch_tick = scheduler_ticks;
   arch_context_switch(&old_task->context, &new_task->context,
                       &old_task->stack_released);
 #ifdef __aarch64__
@@ -4608,6 +4672,88 @@ static void serial_silence_watchdog(void) {
     console_write("\n");
   }
 
+  /* Is the machine's clock still running? Everything above sleeps on
+   * scheduler_ticks, which only the boot CPU advances; if it has stopped, every
+   * sleep(2) hangs for ever, wake_sleepers never runs, and the system looks
+   * alive (interrupts, context switches, console) while making no progress --
+   * exactly the shape of this stall. The hardware counter in the line prefix is
+   * independent of it, so the two together say which of the machine and the
+   * tick stopped. */
+  {
+    console_write("SMOKE-GUEST-WATCHDOG: scheduler_ticks=");
+    console_write_dec(scheduler_ticks);
+    console_write(" (");
+    console_write_dec(scheduler_ticks / 100);
+    console_write("s of ticks) last_switch_tick=");
+    console_write_dec(g_last_switch_tick);
+    console_write("\n");
+  }
+  /* For every READY task, the reason the picker will not take it. A stall where
+   * runnable tasks are never scheduled and the idle task runs for ever is
+   * always one of these gates saying no; without them printed, "3 tasks READY,
+   * boot RUNNING, clock healthy" is a dead end. */
+  {
+    {
+    console_write("SMOKE-GUEST-WATCHDOG: picks calls=");
+    console_write_dec(g_pick_calls);
+    console_write(" rq=");
+    console_write_dec(g_pick_rq);
+    console_write(" scan=");
+    console_write_dec(g_pick_scan);
+    console_write(" idle=");
+    console_write_dec(g_pick_idle);
+    console_write(" none=");
+    console_write_dec(g_pick_null);
+    console_write(" last=");
+    console_write_dec((u64)g_last_pick_id);
+    console_write("\n  scan seen=");
+    console_write_dec(g_scan_seen);
+    console_write(" best_id=");
+    console_write_dec((u64)g_scan_best_id);
+    console_write(" rej_lease=");
+    console_write_dec(g_scan_rej_lease);
+    console_write(" rej_running=");
+    console_write_dec(g_scan_rej_running);
+    console_write(" rej_cas=");
+    console_write_dec(g_scan_rej_cas);
+    console_write(" boot_pass=");
+    console_write_dec(g_task_pass[0]);
+    console_write("\n  current=");
+    console_write_dec(current_task ? (u64)current_task->id : 9999);
+    console_write(" state=");
+    console_write_dec(current_task ? (u64)current_task->state : 99);
+    console_write("\n");
+  }
+  console_write("SMOKE-GUEST-WATCHDOG: why READY tasks are not picked:\n");
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *t = T(i);
+
+      if (!t || t->state != TASK_READY)
+        continue;
+      console_write("  pid ");
+      console_write_dec((u64)t->id);
+      console_write(" '");
+      console_write(t->name ? t->name : "(none)");
+      console_write("' lease=");
+      console_write_dec((u64)__atomic_load_n(&t->stack_released,
+                                             __ATOMIC_ACQUIRE));
+      console_write(" stealable=");
+      console_write_dec((u64)t->stealable);
+      console_write(" ap_runnable=");
+      console_write_dec((u64)t->ap_runnable);
+      console_write(" affinity=0x");
+      console_write_hex64(g_task_affinity[task_index(t)]);
+      console_write(" running_somewhere=");
+      console_write_dec((u64)task_running_somewhere(t));
+      console_write(" allowed_on_cpu0=");
+      console_write_dec((u64)sched_task_allowed_on_cpu(t, 0));
+      console_write(" prio=");
+      console_write_dec((u64)t->priority);
+      console_write(" pass=");
+      console_write_dec(g_task_pass[task_index(t)]);
+      console_write("\n");
+    }
+  }
   console_write("SMOKE-GUEST-WATCHDOG: alive tasks (pid state chan comm):\n");
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *t = T(i);
@@ -4711,6 +4857,77 @@ void scheduler_on_timer_tick(void) {
                                   ? scheduler_ticks + g_task_alarm_interval_ticks[i]
                                   : 0;
       scheduler_kill(T(i)->id, SIGALRM);
+    }
+  }
+
+  /* Per-CPU block integrity. Every writer of cur_task is probed and none of
+   * them ever publishes another CPU's idle task, yet a dump caught g_percpu[0]
+   * holding g_ap_idle_tasks[1] -- with -smp 2 there is exactly one such task,
+   * so both CPUs were pointing at one struct and one kernel stack. Nobody wrote
+   * it there, which makes it corruption of the per-CPU array itself. Catch it
+   * on the tick, where "when" and "what it became" are still answerable. */
+  {
+    static volatile int pcpu_reported;
+
+    for (int c = 0; c < g_max_cpus; c++) {
+      struct percpu *pc = get_percpu_n(c);
+      struct task *ct = pc ? (struct task *)pc->cur_task : 0;
+      int owner;
+
+      if (!pc || !pc->cpu_online || !ct)
+        continue;
+      owner = sched_ap_idle_cpu_of(ct);
+      if (owner == c || (owner < 0 && sched_task_ptr_valid(ct)))
+        continue; /* its own idle task, or a real table slot */
+      if (__atomic_exchange_n(&pcpu_reported, 1, __ATOMIC_ACQ_REL))
+        break;
+      console_write("sched: percpu[");
+      console_write_dec((u64)c);
+      console_write("].cur_task is 0x");
+      console_write_hex64((u64)(usize)ct);
+      console_write(" at tick ");
+      console_write_dec(scheduler_ticks);
+      console_write(" — ");
+      if (owner >= 0) {
+        console_write("that is cpu ");
+        console_write_dec((u64)owner);
+        console_write("'s idle task");
+      } else {
+        console_write("not a task slot at all");
+      }
+      console_write(", name='");
+      console_write(ct->name ? ct->name : "(none)");
+      console_write("' stack=0x");
+      console_write_hex64((u64)(usize)ct->stack);
+      console_write("\n");
+      scheduler_dump_tasks();
+      break;
+    }
+  }
+
+  /* Stall detector. This kernel had none, and the cost of that is a lane that
+   * goes silent for the harness's whole 180 s window and says nothing at all
+   * about why -- the difference between "the timer died" and "everything is
+   * blocked on a lost wake-up" is invisible from outside. A healthy system
+   * switches tasks many times a second, so this stays quiet; when it does fire
+   * the machine is already wedged, so dumping from the tick costs nothing.
+   * Reported at most once a minute so a wedge cannot bury its own evidence. */
+  {
+    static u64 last_report_tick;
+    u64 quiet = scheduler_ticks - g_last_switch_tick;
+
+    if (quiet > 3000 /* 30 s at 100 Hz */ &&
+        (last_report_tick == 0 || scheduler_ticks - last_report_tick > 6000)) {
+      last_report_tick = scheduler_ticks;
+      console_write("sched: STALL — no context switch for ");
+      console_write_dec(quiet / 100);
+      console_write("s (tick ");
+      console_write_dec(scheduler_ticks);
+      console_write(", current '");
+      console_write(current_task->name ? current_task->name : "(none)");
+      console_write("'). The timer is alive; every task below is where it "
+                    "stopped.\n");
+      scheduler_dump_tasks();
     }
   }
 

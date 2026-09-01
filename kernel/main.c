@@ -1477,8 +1477,27 @@ void kernel_main(usize arg0, usize arg1)
 	/* The work-stealing self-test is done; let APs leave the work-stealing-only
 	 * loop and run the full cooperative scheduler (ordinary userspace processes)
 	 * under the Big Kernel Lock. From here, userspace runs on Application
-	 * Processors too. */
+	 * Processors too.
+	 *
+	 * Not on aarch64 yet. Two CPUs executing kernel paths in parallel is what
+	 * this port has not made safe: the surviving failure is a secondary found
+	 * running with SP inside ANOTHER task's kernel stack (caught directly:
+	 * cpu 1, task 'ap-idle', sp owned by 'boot'), after which it returns
+	 * through whatever that frame holds. A secondary still boots, still takes
+	 * its own timer interrupts and still runs stealable kernel workers, so the
+	 * M101 RCU grace-period check -- which needs a reader on a second core --
+	 * still has one. Set b1nix.ap-userspace to opt back in while working on it.
+	 *
+	 * x86_64 is unchanged: it has run userspace on APs since M28. */
+#if defined(__aarch64__)
+	if (bootinfo_has_flag("b1nix.ap-userspace"))
+		g_ap_userspace_enabled = 1;
+	else
+		console_write("smp: secondaries stay on kernel workers "
+		              "(pass b1nix.ap-userspace to run userspace on them)\n");
+#else
 	g_ap_userspace_enabled = 1;
+#endif
 
 	/* Variant B: start background reclaim now that the scheduler, page cache and
 	 * filesystems are up — kswapd keeps a free-frame headroom so userspace

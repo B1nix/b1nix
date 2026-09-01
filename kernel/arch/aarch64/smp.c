@@ -167,6 +167,9 @@ static struct percpu g_percpu[MAX_CPUS];
  * would need the full affinity value, and would land on entry 0 rather than
  * silently on a stranger's data — which is why the BSP claims entry 0 first. */
 u8 g_aff0_to_cpu[256];
+/* aff0<<16 | resolved index, one per secondary; reported from the BSP once the
+ * CPU is up, so the print does not race the boot log. */
+u32 g_ap_percpu_selfcheck[8];
 
 static u64 mpidr(void)
 {
@@ -277,6 +280,16 @@ void aarch64_ap_main(u64 cpu)
 	 * this project a marker before. */
 	pcpu->cpu_id = (u32)cpu;
 	pcpu->scheduler_started = 1;
+	/* Does this CPU agree with the table about who it is? aarch64_get_percpu()
+	 * resolves mpidr's affinity-0 field through g_aff0_to_cpu on EVERY percpu
+	 * access, so if that lookup answered 0 here, this CPU would spend its life
+	 * reading and writing the BOOT CPU's per-CPU block -- including cur_task.
+	 * Printed once per CPU at bring-up, where it is free. */
+	{
+		u64 aff0 = mpidr() & 0xff;
+		g_ap_percpu_selfcheck[cpu & 7] =
+		    (u32)((aff0 << 16) | (u32)g_aff0_to_cpu[aff0]);
+	}
 	__atomic_store_n(&pcpu->cpu_online, 1, __ATOMIC_RELEASE);
 
 	/* The idle context this CPU parks back into when a stolen worker
@@ -462,6 +475,7 @@ int smp_boot_aps(void)
 		 * idle task runs on it. */
 		g_percpu[index].kernel_stack_virt = g_ap_sp[index];
 		g_aff0_to_cpu[target & 0xff] = (u8)index;
+		g_ap_percpu_selfcheck[index & 7] = 0xffffffffu;
 
 		if (fdt_cpu_enable_method() == FDT_ENABLE_METHOD_SPIN_TABLE) {
 			spin_table_release(target, fdt_cpu_release_addr(i));
@@ -501,6 +515,23 @@ int smp_boot_aps(void)
 			console_write_dec(index);
 			console_write(" never reported online\n");
 			continue;
+		}
+
+		/* What that CPU resolved its own identity to. aarch64_get_percpu()
+		 * maps mpidr's affinity-0 field through g_aff0_to_cpu on every single
+		 * per-CPU access, so a secondary whose lookup answers 0 spends its life
+		 * reading and writing the BOOT CPU's block -- cur_task included -- and
+		 * two CPUs then run one task on one kernel stack. Printed here, from
+		 * the boot CPU, so it cannot interleave with the secondary's own log. */
+		{
+			u32 sc = g_ap_percpu_selfcheck[index & 7];
+			console_write("smp: cpu ");
+			console_write_dec(index);
+			console_write(" aff0=");
+			console_write_dec((u64)(sc >> 16));
+			console_write(" resolves to percpu index ");
+			console_write_dec((u64)(sc & 0xffffu));
+			console_write("\n");
 		}
 
 		if ((int)(index + 1) > g_max_cpus)
