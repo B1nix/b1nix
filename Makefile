@@ -1723,7 +1723,7 @@ $(INC_DIR)/initramfs_openrc_init.inc: $(LIBC_SO)
 	xxd -i -n vfs_openrc_init_elf build/$(ARCH)/rootfs/sbin/openrc-init > $@
 endif
 
-$(INITRAMFS_BUSYBOX_INC): tools/ports/build-busybox.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)
+$(INITRAMFS_BUSYBOX_INC): tools/ports/build-busybox.sh tools/patches/busybox/b1nix-config.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-busybox.sh
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_upstream_busybox_elf build/$(ARCH)/ports/busybox/busybox > $@
@@ -2064,7 +2064,7 @@ toolchain:
 busybox-package: toolchain
 	@if [ -x $(BUILD_DIR)/ports/busybox/busybox ] && \
 	   [ -x $(BUILD_DIR)/rootfs/opt/busybox/bin/busybox ] && \
-	   [ -z "$$(find tools/configs tools/ports/build-busybox.sh -newer $(BUILD_DIR)/ports/busybox/busybox -print -quit 2>/dev/null)" ]; then \
+	   [ -z "$$(find tools/configs tools/ports/build-busybox.sh tools/patches/busybox -newer $(BUILD_DIR)/ports/busybox/busybox -print -quit 2>/dev/null)" ]; then \
 		echo "  busybox up to date"; \
 	else \
 		B1NIX_ARCH=$(ARCH) tools/ports/build-busybox.sh; \

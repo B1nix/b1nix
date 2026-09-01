@@ -4776,6 +4776,14 @@ static void serial_silence_watchdog(void) {
       console_write("\n");
     }
   }
+  {
+    extern u64 g_nvme_io_submits, g_nvme_io_completions;
+    console_write("SMOKE-GUEST-WATCHDOG: nvme submits=");
+    console_write_dec(g_nvme_io_submits);
+    console_write(" completions=");
+    console_write_dec(g_nvme_io_completions);
+    console_write("\n");
+  }
   console_write("SMOKE-GUEST-WATCHDOG: alive tasks (pid state chan comm):\n");
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *t = T(i);

@@ -315,6 +315,13 @@ static int nvme_create_io_sq(struct nvme_device *dev)
     return nvme_admin_submit(dev, &sqe);
 }
 
+/* How much I/O this controller has actually done. A flush that is merely SLOW
+ * and one that is stuck on a lost completion look identical from outside -- the
+ * lane goes quiet either way -- and these two counters, sampled twice by the
+ * guest watchdog, tell them apart. */
+u64 g_nvme_io_submits;
+u64 g_nvme_io_completions;
+
 static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
 {
     u16 tail = dev->io_sq_tail;
@@ -338,7 +345,10 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     // avoid a level-triggered storm; we unmask it (intmc) right after ringing
     // the head doorbell on consume. Early boot / IRQs-off callers yield-poll.
     volatile u32 *cq_hdb = nvme_doorbell(dev, 1, 1); // CQ1
-    u64 spins = 0;
+    u64 wait_start_tick = scheduler_get_uptime_ticks();
+    int reported = 0;
+
+    __atomic_fetch_add(&g_nvme_io_submits, 1, __ATOMIC_RELAXED);
     for (;;) {
         u16 cq_head = dev->io_cq_head;
         struct nvme_cqe *cqe = &dev->io_cq[cq_head];
@@ -360,6 +370,7 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
             if (!dev->use_msix)
                 dev->regs->intmc = (1u << 0); // re-enable vector 0 for the next I/O
 
+            __atomic_fetch_add(&g_nvme_io_completions, 1, __ATOMIC_RELAXED);
             if ((status & 0xFFFE) != 0) {
                 console_write("nvme: io cmd error status=0x");
                 console_write_hex32(status);
@@ -386,8 +397,44 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
              * faulted (CSTS.CFS), the command was never fetched (SQ tail vs a
              * quiet controller), or a completion landed somewhere other than
              * the head we are watching. */
-            if (++spins == 200000ULL) {
+            /* Report on WALL CLOCK, not on a spin count.
+             *
+             * A count cannot describe this loop: every iteration ends in
+             * scheduler_yield(), which costs a whole tick once the scheduler is
+             * up (so 200,000 meant ~2000 seconds, twenty times the harness's
+             * patience -- the lane always died with this never printed) and
+             * costs nothing at all before it is (so a low count fires during
+             * boot, when the completion is simply a few microseconds away).
+             * Five seconds is far beyond any honest NVMe command and means the
+             * same thing in both regimes.
+             *
+             * Measured in scheduler TICKS, not in arch_tsc_monotonic_ns(): that
+             * clock is already known to advance slower than the tick on this
+             * platform (see the ceiling syscall_sleep_timespec has to carry for
+             * exactly that reason), and a deadline built on it never arrived --
+             * the task sat here 65 seconds with this check silent. */
+            if (!reported &&
+                scheduler_get_uptime_ticks() - wait_start_tick > 500 /* 5 s */) {
+                reported = 1;
                 nvme_wait_note("io");
+                {
+                    u16 last = (u16)((dev->io_sq_tail + dev->queue_size - 1) %
+                                     dev->queue_size);
+                    struct nvme_sqe *out = &dev->io_sq[last];
+                    console_write("nvme: outstanding opc=0x");
+                    console_write_hex32(out->cdw0 & 0xff);
+                    console_write(" nsid=");
+                    console_write_dec(out->nsid);
+                    console_write(" slba=");
+                    console_write_dec(((u64)out->cdw11 << 32) | out->cdw10);
+                    console_write(" nlb=");
+                    console_write_dec((u64)out->cdw12 + 1);
+                    console_write(" prp1=0x");
+                    console_write_hex64(out->prp1);
+                    console_write(" prp2=0x");
+                    console_write_hex64(out->prp2);
+                    console_write("\n");
+                }
                 console_write("nvme: csts=0x");
                 console_write_hex32(dev->regs->csts);
                 console_write(" sq_tail=");

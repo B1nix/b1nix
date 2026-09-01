@@ -100,24 +100,63 @@ static long long clock_ns(clockid_t id) {
   return ns_of(&ts);
 }
 
-/* Burn CPU for at least `ms` milliseconds of WALL time, doing work the compiler
- * cannot fold away. Wall time is the right bound here: the point of the test is
- * that CPU time tracks work, so it must not be measured with the clock under
- * test. */
 static volatile unsigned long g_sink;
+
+/* Burn at least `ms` milliseconds of this thread's own CPU TIME, doing work the
+ * compiler cannot fold away.
+ *
+ * It used to bound the loop by wall time, and that is not the same quantity on
+ * a machine that is sharing a host. The suite runs four QEMU instances at once
+ * under TCG, so a thread can spend 120 ms of wall clock and be given four
+ * milliseconds of CPU -- which is exactly what getrusage(RUSAGE_THREAD) then
+ * honestly reported, and what the >= 50 ms assertion below read as a kernel
+ * bug. Bounding by the thread clock makes the burn mean what its name says and
+ * the assertion sound at any host load.
+ *
+ * The wall-clock backstop is not a bound on the burn, it is a bound on the
+ * damage if CLOCK_THREAD_CPUTIME_ID never advances: without it a broken thread
+ * clock would hang the instance instead of failing the check that is here to
+ * catch it. */
 static void burn_ms(int ms) {
-  struct timespec start, now;
-  clock_gettime(CLOCK_MONOTONIC, &start);
+  struct timespec wall0, now;
+  long long cpu0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
   unsigned long acc = 1;
+
+  clock_gettime(CLOCK_MONOTONIC, &wall0);
+  long long last_cpu = cpu0;
+  long long last_progress_ms = 0;
   for (;;) {
     for (int i = 0; i < 200000; i++)
       acc = acc * 1103515245UL + 12345UL;
     g_sink = acc;
+
     clock_gettime(CLOCK_MONOTONIC, &now);
-    long long elapsed = (now.tv_sec - start.tv_sec) * 1000LL +
-                        (now.tv_nsec - start.tv_nsec) / 1000000LL;
-    if (elapsed >= ms)
+    long long wall = (now.tv_sec - wall0.tv_sec) * 1000LL +
+                     (now.tv_nsec - wall0.tv_nsec) / 1000000LL;
+    if (cpu0 < 0) {
+      /* No thread clock at all: fall back to wall time so the check that is
+       * about to fail still gets to run. */
+      if (wall >= ms)
+        return;
+      continue;
+    }
+
+    long long cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+    if (cpu >= 0 && cpu - cpu0 >= (long long)ms * 1000000LL)
       return;
+
+    /* Give up only if the thread clock is STUCK, never merely because it is
+     * slow. A fixed wall-clock ceiling looked like the safe thing and was not:
+     * with four QEMU instances on one host a thread can be given a few percent
+     * of a CPU, so the ceiling cut the burn short and the caller then measured
+     * the shortfall rather than the kernel -- 29 ms of sibling time where the
+     * test wanted 150. As long as the clock advances, keep burning. */
+    if (cpu > last_cpu) {
+      last_cpu = cpu;
+      last_progress_ms = wall;
+    } else if (wall - last_progress_ms > 5000) {
+      return; /* no advance in five seconds of wall time: the clock is broken */
+    }
   }
 }
 

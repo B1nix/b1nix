@@ -617,11 +617,27 @@ static volatile int g_cancel_completed = 0;
 static void *t_cancel_loop(void *arg) {
   (void)arg;
   __atomic_store_n(&g_cancel_started, 1, __ATOMIC_RELEASE);
-  /* Bounded so a missed cancellation fails deterministically instead of
-   * hanging: when cancellation is honored the thread exits long before the
-   * cap at the testcancel point below. */
-  for (long i = 0; i < 50000000L; i++) {
-    pthread_testcancel();             /* cancellation point */
+  /* Bounded by TIME, not by a fixed iteration count.
+   *
+   * The bound exists so a missed cancellation fails deterministically instead
+   * of hanging, and a count cannot do that job: "long enough" on one machine is
+   * not long enough on another. Under the suite's four parallel QEMU instances
+   * the canceller can be descheduled for longer than this worker needs to burn
+   * a fixed 50 million iterations, so the worker ran to the end on its own and
+   * the check below read a LATE cancellation as an IGNORED one.
+   *
+   * Thirty seconds is far beyond any honoured cancellation -- those exit at the
+   * first testcancel -- and still fails deterministically when none arrives. */
+  struct timespec t0, now;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  for (;;) {
+    for (int i = 0; i < 100000; i++)
+      pthread_testcancel();           /* cancellation point */
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long ms = (now.tv_sec - t0.tv_sec) * 1000LL +
+                   (now.tv_nsec - t0.tv_nsec) / 1000000LL;
+    if (ms >= 30000)
+      break;
   }
   g_cancel_completed = 1;             /* reached only if never cancelled */
   return (void *)0xABCD;
