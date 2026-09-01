@@ -30,6 +30,7 @@
 .equ PCPU_KSTACK_TOP, 0
 .equ PCPU_FAULT_TOP,  8
 .equ PCPU_FAULT_SP,   16
+.equ PCPU_FAULT_X1,   24
 
 // SP_EL1 belongs to the task, not to the CPU.
 //
@@ -207,6 +208,14 @@ sync_el1:
 8:
 	mrs x0, tpidr_el1
 	cbz x0, 9f                   // no per-CPU block yet: nothing better to do
+	// Park the bad SP itself. Once we move off it the frame no longer says
+	// what it was, and that value is the whole content of the report. x1 is
+	// still the interrupted context's, so it goes and comes back through the
+	// per-CPU block rather than being clobbered out of the register dump.
+	str x1, [x0, #PCPU_FAULT_X1]
+	mov x1, sp
+	str x1, [x0, #PCPU_FAULT_SP]
+	ldr x1, [x0, #PCPU_FAULT_X1]
 	ldr x0, [x0, #PCPU_FAULT_TOP]
 	cbz x0, 9f
 	mov sp, x0

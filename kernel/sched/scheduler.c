@@ -442,12 +442,40 @@ static usize g_task_cmdline_len[MAX_TASKS];
  * (opaque to the scheduler; defined in seccomp.c); g_task_nnp is no_new_privs. */
 static void *g_task_seccomp[MAX_TASKS];
 static int   g_task_nnp[MAX_TASKS];
+/* Stand-in for a slot below the high-water mark whose chunk is not there.
+ *
+ * Every walker in this file reads T(i)->state and skips TASK_UNUSED, and almost
+ * none of them checked for NULL first -- scheduler_reap_orphan_zombies died on
+ * exactly that, a kernel data abort reading ->state with FAR 0x10, taking a
+ * whole lane with it. A permanently-unused sentinel makes all of them correct
+ * without sixteen identical call-site edits and leaves no site that can still
+ * dereference nothing. Its id is deliberately not a real pid, so a search by
+ * pid (which has no state check) cannot match it. */
+static struct task g_task_absent_slot = { .id = (usize)-1,
+                                          .state = TASK_UNUSED };
+
+/* Recorded, not printed. T() is reached from interrupt context and from the
+ * middle of the scheduler, where console_write is neither safe nor
+ * timestamped -- an untimestamped line here failed the smoke check that every
+ * kernel log line carries a monotonic timestamp. scheduler_dump_tasks reports
+ * the tally, which is where anybody looking for it will be. */
+static usize g_task_absent_hits;
+static usize g_task_absent_last_index;
+static usize g_task_absent_last_hwm;
+
+static struct task *task_absent(usize i) {
+  __atomic_fetch_add(&g_task_absent_hits, 1, __ATOMIC_RELAXED);
+  g_task_absent_last_index = i;
+  g_task_absent_last_hwm = g_task_hwm;
+  return &g_task_absent_slot;
+}
+
 static inline struct task *T(usize i) {
   if (i >= MAX_TASKS)
-    return 0;
+    return task_absent(i);
   struct task *chunk = g_task_chunks[i >> 6];
   if (!chunk)
-    return 0;
+    return task_absent(i);
   return &chunk[i & 63];
 }
 
@@ -1086,6 +1114,39 @@ static void sched_handoff_recover(struct task *t, const char *where) {
   }
   if (t)
     __atomic_store_n(&t->stack_released, 1, __ATOMIC_RELEASE);
+}
+
+/* A secondary must never end up owning the boot task: it is the BSP's idle task
+ * AND slot 0 of the table, and two CPUs on its .bss stack is the failure this
+ * branch keeps landing on. Two places publish this CPU's task -- the pick, and
+ * the aarch64 re-publication after arch_context_switch returns -- and a dump
+ * that shows `cur_task = boot` on cpu 1 cannot say which of them wrote it.
+ * Say so once, from whichever one does. */
+void sched_note_boot_task_on_secondary(struct task *t, const char *where) {
+  struct percpu *chk = get_percpu();
+
+  if (!chk || chk->cpu_id == 0 || t != T(0))
+    return;
+  {
+    static volatile int reported;
+    if (__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL))
+      return;
+  }
+  console_write("sched: secondary cpu ");
+  console_write_dec((u64)chk->cpu_id);
+  console_write(" took the boot task via ");
+  console_write(where);
+  console_write(": idle=");
+  console_write(chk->idle_task && ((struct task *)chk->idle_task)->name
+                    ? ((struct task *)chk->idle_task)->name
+                    : "(none)");
+  console_write(" ap_runnable=");
+  console_write_dec((u64)t->ap_runnable);
+  console_write(" stealable=");
+  console_write_dec((u64)t->stealable);
+  console_write(" ctxsp=0x");
+  console_write_hex64(t->context.sp);
+  console_write("\n");
 }
 
 static struct task *pick_next_task(void) {
@@ -3858,6 +3919,8 @@ int scheduler_yield(void) {
     panic("sched: two CPUs claimed one task");
   }
 
+  sched_note_boot_task_on_secondary(new_task, "pick");
+
   new_task->state = TASK_RUNNING;
   current_task = new_task;
 
@@ -3934,6 +3997,7 @@ int scheduler_yield(void) {
    * per-task architectural state again before any C code observes it. Without
    * this, the resumed stack runs with current_task, SP_EL1's published top,
    * TTBR0 and TLS still naming the task we switched to. */
+  sched_note_boot_task_on_secondary(old_task, "resume");
   current_task = old_task;
   arch_set_kernel_stack(old_task->kernel_stack_ptr);
   paging_switch_address_space(old_task->pml4_phys);
@@ -6095,6 +6159,22 @@ struct task *scheduler_task_slot(usize index) {
   return t;
 }
 
+/* Which task owns the kernel stack `sp` lies in, or 0. The diagnostics that
+ * catch an exception taken on a foreign stack can say WHICH stack it is only by
+ * asking the table -- and "whose stack was the CPU actually on" is the fact that
+ * separates a stale `cur_task` from a genuinely corrupted SP. */
+struct task *scheduler_task_owning_stack(u64 sp) {
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = scheduler_task_slot(i);
+    if (!t || !t->stack)
+      continue;
+    u64 lo = (u64)(usize)t->stack;
+    if (sp >= lo && sp <= lo + KERNEL_STACK_SIZE)
+      return t;
+  }
+  return 0;
+}
+
 struct task *scheduler_task_by_pid(usize pid) {
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *t = scheduler_task_slot(i);
@@ -6519,6 +6599,15 @@ void scheduler_dump_tasks(void) {
   /* A dump that stops half way looks exactly like a dump that had nothing more
    * to say, and one run was read as "the machine went quiet" when in fact the
    * dump itself had wedged. This line is the proof it finished. */
+  if (g_task_absent_hits) {
+    console_write("TASK-DUMP: absent-slot hits=");
+    console_write_dec((u64)g_task_absent_hits);
+    console_write(" last_index=");
+    console_write_dec((u64)g_task_absent_last_index);
+    console_write(" hwm=");
+    console_write_dec((u64)g_task_absent_last_hwm);
+    console_write("\n");
+  }
   console_write("TASK-DUMP: end\n");
 }
 

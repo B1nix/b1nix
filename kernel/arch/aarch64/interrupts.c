@@ -463,17 +463,47 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 	/* The same question for an EL1 exception, which is the half the EL0 check
 	 * cannot see. irq_el1/sync_el1 build their frame at whatever SP_EL1 holds,
 	 * so if SP is already on somebody else's stack the frame lands there and
-	 * overwrites live locals -- which is how `index` in pick_next_task came to
-	 * read 0x100000090 (144, with bit 32 set) out of its own frame slot. Catch
-	 * the first exception taken on a foreign stack, while the task table and
-	 * the flight recorder still describe how it got there. */
+	 * overwrites live locals. Report the first exception taken on a foreign
+	 * stack, while the task table and the flight recorder still describe how it
+	 * got there.
+	 *
+	 * REPORT ONLY -- this must not panic, and the reason is not caution.
+	 * scheduler_yield publishes `current_task = new_task` BEFORE calling
+	 * arch_context_switch, deliberately, so no other CPU can claim the incoming
+	 * task while its context is being loaded. Between those two points SP still
+	 * belongs to the OUTGOING task, so "SP is not current_task's stack" is a
+	 * legitimate, transient state and every synchronous EL1 fault landing in
+	 * that window (paging_switch_address_space, the FPU save/restore, demand
+	 * paging under any of them) trips it. Measured: the check panicked three
+	 * lanes a run, each report naming the CPU's own idle task's stack a few
+	 * hundred bytes below its top -- i.e. the idle loop's own frame, mid-switch.
+	 * A real overlap still surfaces as its own fault; this one was manufacturing
+	 * panics out of a correct scheduler. */
 	if (!from_el0 && current_task && current_task->stack &&
 	    current_task->kernel_stack_ptr) {
 		u64 sp_now = (u64)(usize)frame;
 		u64 own_lo = (u64)(usize)current_task->stack;
 		u64 own_hi = current_task->kernel_stack_ptr;
 
+		/* A frame on this CPU's EL1 fault stack is not a task running on
+		 * somebody else's stack -- sync_el1 put it there precisely BECAUSE
+		 * SP_EL1 was unusable. Reporting the fault stack as "foreign" hid the
+		 * one number that matters (the SP that went bad, which is parked) and
+		 * cost a run to work out. Report the parked SP instead. */
+		if (aarch64_on_el1_fault_stack(sp_now))
+			sp_now = aarch64_el1_fault_sp();
+
 		if (sp_now < own_lo || sp_now > own_hi) {
+			/* Report once. This report runs ON the foreign stack, and the
+			 * console it calls faults there too -- each fault re-enters here,
+			 * re-reports, and recurses ~0x430 of stack per turn until the log
+			 * is gigabytes of interleaved half-lines and the lane wedges on the
+			 * watchdog with no readable dump at all. The first report is the
+			 * only one worth anything; everything after it is this check
+			 * tripping over its own output. */
+			static volatile int reported;
+			if (__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL))
+				goto el1_stack_checked;
 			console_write("EL1-FOREIGN-STACK: pid ");
 			console_write_dec((u64)current_task->id);
 			console_write(" name=");
@@ -500,11 +530,20 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 				console_write_hex64(current_task->context.sp);
 				console_write(" idle=0x");
 				console_write_hex64((u64)(usize)(fp ? fp->idle_task : 0));
+				/* Whose stack is this really? A stale cur_task and a corrupted
+				 * SP look identical from here; the owner tells them apart. */
+				{
+					struct task *ow = scheduler_task_owning_stack(sp_now);
+					console_write(" sp_owner=");
+					console_write(ow ? (ow->name ? ow->name : "(none)") : "(unowned)");
+					console_write("/");
+					console_write_dec(ow ? (u64)ow->id : 0);
+				}
 			}
 			console_write("\n");
-			panic("EL1 exception taken on another task's kernel stack");
 		}
 	}
+el1_stack_checked:
 
 	if (from_el0 && current_task && current_task->kernel_stack_ptr) {
 		u64 frame_top = (u64)(usize)frame + sizeof(*frame);
@@ -546,6 +585,17 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 				console_write_hex64(frame->sp_el0);
 				console_write(" stack=0x");
 				console_write_hex64((u64)(usize)current_task->stack);
+				{
+					struct task *ow = scheduler_task_owning_stack(frame_top - 8);
+					console_write(" sp_owner=");
+					console_write(ow ? (ow->name ? ow->name : "(none)") : "(unowned)");
+					console_write("/");
+					console_write_dec(ow ? (u64)ow->id : 0);
+					console_write(" owner_ksp=0x");
+					console_write_hex64(ow ? ow->kernel_stack_ptr : 0);
+					console_write(" owner_state=");
+					console_write_dec(ow ? (u64)ow->state : 99);
+				}
 			}
 			console_write("\n");
 			/* Take the dump HERE. The frame this entry just built is sitting on

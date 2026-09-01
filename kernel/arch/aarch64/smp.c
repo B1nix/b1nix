@@ -51,10 +51,12 @@ struct aarch64_pcpu_asm {
 	u64 kstack_top;  /* +0  task kernel stack top, for the SP_EL1 reset */
 	u64 fault_top;   /* +8  top of this CPU's EL1 fault stack */
 	u64 fault_sp;    /* +16 SP_EL1 the current EL1 fault interrupted */
+	u64 fault_x1;    /* +24 scratch: isr.S borrows x1 to read SP, puts it back */
 };
 _Static_assert(__builtin_offsetof(struct aarch64_pcpu_asm, kstack_top) == 0, "PCPU_KSTACK_TOP");
 _Static_assert(__builtin_offsetof(struct aarch64_pcpu_asm, fault_top) == 8, "PCPU_FAULT_TOP");
 _Static_assert(__builtin_offsetof(struct aarch64_pcpu_asm, fault_sp) == 16, "PCPU_FAULT_SP");
+_Static_assert(__builtin_offsetof(struct aarch64_pcpu_asm, fault_x1) == 24, "PCPU_FAULT_X1");
 
 #define AARCH64_ASM_CPUS 8
 #define EL1_FAULT_STACK_SIZE 16384
@@ -77,6 +79,7 @@ void aarch64_pcpu_asm_init(u32 cpu)
 	g_pcpu_asm[cpu].fault_top =
 	    (u64)(usize)g_el1_fault_stacks[cpu] + EL1_FAULT_STACK_SIZE;
 	g_pcpu_asm[cpu].fault_sp = 0;
+	g_pcpu_asm[cpu].fault_x1 = 0;
 
 	__asm__ volatile("msr tpidr_el1, %0" : : "r"(&g_pcpu_asm[cpu]) : "memory");
 }
@@ -117,6 +120,19 @@ u64 aarch64_kstack_top(void)
 	struct aarch64_pcpu_asm *p = pcpu_asm_self();
 
 	return p ? p->kstack_top : 0;
+}
+
+/* Is `sp` inside this CPU's dedicated EL1 fault stack? sync_el1 moves there
+ * when the interrupted SP_EL1 is unusable, so a frame sitting here is not a
+ * task running on a foreign stack -- it is the diagnostic path, and the SP
+ * worth reporting is the parked one, not this frame's. */
+int aarch64_on_el1_fault_stack(u64 sp)
+{
+	struct aarch64_pcpu_asm *p = pcpu_asm_self();
+
+	if (!p || !p->fault_top)
+		return 0;
+	return sp <= p->fault_top && sp > p->fault_top - EL1_FAULT_STACK_SIZE;
 }
 
 u64 aarch64_el1_fault_sp(void)
@@ -287,6 +303,7 @@ void aarch64_ap_main(u64 cpu)
 
 		if (t) {
 			t->state = TASK_RUNNING;
+			sched_note_boot_task_on_secondary(t, "ap-phase1");
 			pcpu->cur_task = t;
 			pcpu->sched_return_ctx = &idle_ctx;
 			arch_context_switch(&idle_ctx, &t->context, (volatile int *)0);
@@ -317,6 +334,7 @@ void aarch64_ap_main(u64 cpu)
 	struct task *idle = scheduler_setup_ap_idle((int)cpu, pcpu->kernel_stack_virt);
 
 	pcpu->idle_task = idle;
+	sched_note_boot_task_on_secondary(idle, "ap-phase2-idle");
 	pcpu->cur_task = idle;
 	/* Keep the phase-1 return context. `idle_ctx` is a local of this function
 	 * and this function never returns, so it stays valid for as long as the

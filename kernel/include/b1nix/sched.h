@@ -726,6 +726,10 @@ void scheduler_wake_task_norq(usize task_id);
 usize scheduler_max_task_slots(void);
 struct task *scheduler_task_slot(usize index);
 struct task *scheduler_task_by_pid(usize pid);
+/* One-shot report when a secondary CPU comes to own the boot task. */
+void sched_note_boot_task_on_secondary(struct task *t, const char *where);
+/* The task whose kernel stack contains `sp`, or 0. See the definition. */
+struct task *scheduler_task_owning_stack(u64 sp);
 const char *scheduler_state_name(int state);
 void scheduler_get_ctty(int *type, int *index);
 void scheduler_set_ctty(struct task *t, int type, int index);

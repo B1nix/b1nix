@@ -1,4 +1,5 @@
 #include <b1nix/panic.h>
+#include <b1nix/console.h>
 #include <stdlib.h>
 #include <string.h>
 #include <b1nix/syscall.h>
@@ -108,5 +109,10 @@ unsigned long __stack_chk_guard = 0xC0FFEE5713579BDFUL;
 
 void __stack_chk_fail(void);
 void __stack_chk_fail(void) {
+  /* Name the frame that smashed. The panic backtrace starts here, so without
+   * the return address the report says only that *something* overflowed. */
+  console_write("stack smashing detected in the frame that returned to 0x");
+  console_write_hex64((u64)(usize)__builtin_return_address(0));
+  console_write("\n");
   panic("stack smashing detected");
 }

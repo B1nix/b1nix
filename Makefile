@@ -436,13 +436,29 @@ export CCACHE_NOHASHDIR ?= 1
 # would make every worktree rebuild the imported DRM objects it could share.
 FILE_PREFIX_MAP := -ffile-prefix-map=$(CURDIR)=/b1nix
 
+# Stack protector. `make STACK_PROTECTOR=1` builds the kernel with
+# -fstack-protector-strong, which is a diagnostic, not a hardening measure: the
+# corruption this branch has been chasing writes an 8-byte kernel stack slot at
+# a 4-byte offset, leaving a return address with a correct low half and the low
+# half of a USER pointer (0x500...) in its high half. That is the signature of a
+# copy from user memory overrunning an on-stack buffer, and a canary names the
+# function it happens in instead of leaving a wild jump three switches later.
+# The runtime (__stack_chk_guard / __stack_chk_fail) is always compiled in --
+# see kernel/lib/stdlib.c -- so this is a flag flip and nothing else.
+STACK_PROTECTOR ?= 0
+ifeq ($(STACK_PROTECTOR),1)
+STACK_PROTECTOR_FLAG := -fstack-protector-strong
+else
+STACK_PROTECTOR_FLAG := -fno-stack-protector
+endif
+
 COMMON_CFLAGS := \
 	-std=c11 \
 	-g \
 	$(FILE_PREFIX_MAP) \
 	-ffreestanding \
 	-fno-builtin \
-	-fno-stack-protector \
+	$(STACK_PROTECTOR_FLAG) \
 	-fno-pic \
 	-mno-red-zone \
 	-MMD \

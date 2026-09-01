@@ -35,6 +35,8 @@ void aarch64_pcpu_asm_init(u32 cpu);
 void aarch64_set_kstack_top(u64 top);
 u64 aarch64_kstack_top(void);
 u64 aarch64_el1_fault_sp(void);
+/* True if `sp` lies in this CPU's EL1 fault stack (see the definition). */
+int aarch64_on_el1_fault_stack(u64 sp);
 
 void arch_check_and_deliver_signals(struct interrupt_frame *frame);
 u64 sys_sigreturn(struct interrupt_frame *frame);

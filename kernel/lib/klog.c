@@ -560,6 +560,15 @@ void dump_smp_cpus_state(void) {
 		} else {
 			console_write(": [IDLE / NO TASK]");
 		}
+		/* Which task this CPU parks into. Two CPUs reading `cur_task = boot`
+		 * is indistinguishable from one CPU whose idle task simply IS boot
+		 * without this. */
+		{
+			struct task *it = (struct task *)pc->idle_task;
+			console_write(" idle='");
+			console_write(it ? (it->name ? it->name : "none") : "-");
+			console_write("'");
+		}
 		console_write("\n");
 	}
 	console_write("--- End SMP Snapshot ---\n");
