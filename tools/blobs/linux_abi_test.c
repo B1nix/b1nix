@@ -1246,7 +1246,18 @@ static void test_setfsuid(void) {
  * to a grandchild, whose parent is the intermediate child. */
 static void test_ptrace_nonparent(void) {
   int pipefd[2];
+  int holdfd[2];
   if (sys2(SYS_pipe2, pipefd, 0) < 0) {
+    fail("ptrace-nonparent", -1);
+    return;
+  }
+  /* A SECOND pipe, for the tracee to park on. It must not be the pid channel:
+   * both the grandchild and the main process would then be readers of the same
+   * pipe, and the grandchild — blocked first — wins the wakeup, eats a byte of
+   * the pid and exits before anyone can attach to it. Nobody ever writes to
+   * this one, and every process keeps its write end open, so the read blocks
+   * until a signal interrupts it. */
+  if (sys2(SYS_pipe2, holdfd, 0) < 0) {
     fail("ptrace-nonparent", -1);
     return;
   }
@@ -1254,15 +1265,15 @@ static void test_ptrace_nonparent(void) {
   if (child == 0) {
     long grand = t_fork();
     if (grand == 0) {
-      /* Grandchild: spin until someone stops us, then exit. */
-      for (long i = 0; i < 200000000L; i++)
-        __asm__ volatile(
-#if defined(__aarch64__)
-            "yield"
-#else
-            "pause"
-#endif
-            );
+      /* Grandchild: park in an interruptible syscall until the non-parent
+       * tracer attaches and stops us. A finite busy loop is timing-dependent
+       * on emulators and can exit before the attach lands. */
+      char hold;
+      for (;;) {
+        long rc = sys3(SYS_read, holdfd[0], &hold, sizeof(hold));
+        if (rc >= 0)
+          break;
+      }
       sys1(SYS_exit_group, 0);
       for (;;)
         ;
@@ -1285,11 +1296,15 @@ static void test_ptrace_nonparent(void) {
                     : -1;
   int stopped = (w == grandpid) && ((status & 0xff) == 0x7f);
   long kill_rc = sys4(SYS_ptrace, 8 /* PTRACE_KILL */, grandpid, 0, 0);
+  if (att != 0)
+    sys2(SYS_kill, grandpid, 9 /* SIGKILL */);
 
   int cst = 0;
   sys4(SYS_wait4, child, &cst, 0, 0);
   sys1(SYS_close, pipefd[0]);
   sys1(SYS_close, pipefd[1]);
+  sys1(SYS_close, holdfd[0]);
+  sys1(SYS_close, holdfd[1]);
   check("ptrace-nonparent",
         n == (long)sizeof(grandpid) && att == 0 && stopped && kill_rc == 0,
         att);

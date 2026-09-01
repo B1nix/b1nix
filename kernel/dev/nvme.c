@@ -205,7 +205,14 @@ static int nvme_admin_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     tail = (u16)((tail + 1) % dev->queue_size);
     dev->admin_sq_tail = tail;
     
-    // Ring the doorbell
+    /* The submission entry must be visible to the controller BEFORE the
+     * doorbell that tells it to go and read it. Nothing ordered the two on this
+     * driver, which is invisible on x86 (stores are ordered) and on TCG (one
+     * thread), and is a hang on aarch64 under a real hypervisor: the device
+     * thread sees the doorbell, reads a stale queue slot, and no completion is
+     * ever posted — the waiter then polls a CQE that will never arrive. Same
+     * barrier virtio's notify path has taken since it was written. */
+    __sync_synchronize();
     volatile u32 *sq_tdb = nvme_doorbell(dev, 0, 0);
     *sq_tdb = tail;
     
@@ -219,6 +226,9 @@ static int nvme_admin_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
         // Check if there's a completion
         struct nvme_cqe *cqe = &dev->admin_cq[cq_head];
         if (cqe->status != 0xFFFF) {
+            /* The status word is the flag; the rest of the entry (and whatever
+             * the command DMA'd) must not be read from before it. */
+            __sync_synchronize();
             u16 status = cqe->status;
             cqe->status = 0xFFFF; // Reset status on consume
             
@@ -296,7 +306,8 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     tail = (u16)((tail + 1) % dev->queue_size);
     dev->io_sq_tail = tail;
     
-    // Ring SQ1 doorbell
+    // Ring SQ1 doorbell (see nvme_admin_submit for why the barrier is here)
+    __sync_synchronize();
     volatile u32 *sq_tdb = nvme_doorbell(dev, 1, 0); // SQ1
     *sq_tdb = tail;
     
@@ -323,6 +334,7 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
         for (int s = 0; s < 4096 && cqe->status == 0xFFFF; s++)
             cpu_relax();
         if (cqe->status != 0xFFFF) {
+            __sync_synchronize(); /* same acquire as the admin queue */
             u16 status = cqe->status;
             cqe->status = 0xFFFF; // Reset status on consume
 

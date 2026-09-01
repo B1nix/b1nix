@@ -828,7 +828,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
      * 45-column panel is most of what is on the screen. kprintf composes the
      * whole line before writing it, so the interleaving this used to avoid by
      * hand is still avoided. */
-    k_dbg("elf", "Linux personality detected: %s", path);
+    k_info("elf", "Linux personality detected: %s", path);
   } else {
     image->personality = PERSONALITY_B1NIX;
   }
@@ -881,10 +881,10 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
      * line above stays at the default level because a smoke check asserts it,
      * and a test must not depend on how verbose the console is. */
     if (load_base)
-      k_dbg("elf", "load: %s entry=0x%lx (PIE base=0x%lx)", path,
+      k_info("elf", "load: %s entry=0x%lx (PIE base=0x%lx)", path,
             (unsigned long)image->entry, (unsigned long)load_base);
     else
-      k_dbg("elf", "load: %s entry=0x%lx", path, (unsigned long)image->entry);
+      k_info("elf", "load: %s entry=0x%lx", path, (unsigned long)image->entry);
   }
   image->address_space = user_address_space_create();
 

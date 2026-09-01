@@ -492,9 +492,9 @@ int netdev_set_admin_up(struct netdev *nd, int up)
 	{
 		char line[96];
 
-		snprintf(line, sizeof(line), "net: %s administratively %s\n",
+		snprintf(line, sizeof(line), "%s administratively %s",
 		         nd->name, up ? "up" : "down");
-		console_write(line);
+		k_info("net", "%s", line);
 	}
 
 	if (!up && nd == g_netdev) {

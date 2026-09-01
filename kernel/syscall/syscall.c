@@ -5104,7 +5104,7 @@ static volatile int g_vma_mutex[VMA_LOCK_SLOTS];
  * vma_mutator_lock forever, which is a guest that goes silent with no panic
  * and no clue. Recording the owner makes the leak both reportable and
  * repairable: the exit path hands back whatever the task still holds. */
-static struct task *g_vma_mutex_owner[VMA_LOCK_SLOTS];
+static struct task *volatile g_vma_mutex_owner[VMA_LOCK_SLOTS];
 
 static unsigned vma_lock_slot(void) {
   u64 space = current_task ? current_task->pml4_phys : 0;
@@ -5155,11 +5155,11 @@ static unsigned vma_mutator_lock(void) {
       scheduler_dump_tasks();
     }
   }
-  g_vma_mutex_owner[slot] = current_task;
+  __atomic_store_n(&g_vma_mutex_owner[slot], current_task, __ATOMIC_RELEASE);
   return slot;
 }
 static void vma_mutator_unlock(unsigned slot) {
-  g_vma_mutex_owner[slot] = 0;
+  __atomic_store_n(&g_vma_mutex_owner[slot], 0, __ATOMIC_RELEASE);
   __sync_lock_release(&g_vma_mutex[slot]);
 }
 
@@ -5172,9 +5172,11 @@ void syscall_release_vma_locks(struct task *t) {
   if (!t)
     return;
   for (unsigned i = 0; i < VMA_LOCK_SLOTS; i++) {
-    if (g_vma_mutex_owner[i] != t)
+    struct task *owner =
+        __atomic_load_n(&g_vma_mutex_owner[i], __ATOMIC_ACQUIRE);
+    if (owner != t)
       continue;
-    g_vma_mutex_owner[i] = 0;
+    __atomic_store_n(&g_vma_mutex_owner[i], 0, __ATOMIC_RELEASE);
     __sync_lock_release(&g_vma_mutex[i]);
     console_write("vma: released a mutator lock left held by a dying task, pid ");
     console_write_dec(t->id);

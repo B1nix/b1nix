@@ -1,4 +1,5 @@
 #include <b1nix/console.h>
+#include <stdio.h>
 #include <b1nix/kmsg.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/kprintf.h>
@@ -24,7 +25,13 @@ static int console_this_cpu(void)
 }
 
 struct console_state console;
-u64 g_console_write_seq = 0;
+/* Bumped by every console_write / console_write_raw, exactly as on x86_64: the
+ * in-guest silence watchdog decides a lane has wedged by watching this counter
+ * stand still. It was defined here but never incremented, so on aarch64 the
+ * watchdog fired every 60 s of a perfectly healthy run and dumped the task
+ * table straight through whatever userspace was printing — which is how whole
+ * markers ("BB-W6: ok passwd-unlock") came out cut in half and failed. */
+volatile u64 g_console_write_seq = 0;
 
 void console_init(void)
 {
@@ -82,6 +89,7 @@ extern void kmsg_putc(char c);
  * this VT owns the display and no display server has claimed /dev/fb0, and
  * always echoed to serial - that is the boot and test transcript. */
 int vt_console_putc(char c);
+int vt_repaint_in_progress(void);
 int fb_dev_claimed(void);
 int fb_console_ready(void);
 void fb_console_putchar(char c);
@@ -261,6 +269,7 @@ void console_write(const char *str)
 	g_last_console_tick = scheduler_get_uptime_ticks();
 	if (!str)
 		return;
+	g_console_write_seq++;
 	if (console_lock_held_here()) {
 		/* Already inside somebody's explicit console_lock_acquire_irqsave
 		 * section -- pmm's fault reports and serial_tty do that to keep a
@@ -319,13 +328,22 @@ void console_putc_raw(char ch)
 	klog_putc(ch);
 	kmsg_putc(ch);
 	console_draw(ch);
-	serial_putc(ch);
+	/* Everything except a VT repaint. A switch repaints the incoming VT's
+	 * saved cell buffer through this primitive, and on this arch the serial
+	 * port IS the log: the replay put a hundred already-logged lines back
+	 * into it, with no timestamp, because a repainted screen is not a log
+	 * record. Three VT switches in the M107 suite put three copies of the log
+	 * inside the log. x86_64 never had this because its console_putc_raw
+	 * paints the display device only. */
+	if (!vt_repaint_in_progress())
+		serial_putc(ch);
 }
 
 void console_write_raw(const char *text)
 {
 	if (!text)
 		return;
+	g_console_write_seq++;
 	for (const char *p = text; *p; p++)
 		console_putc_raw(*p);
 }

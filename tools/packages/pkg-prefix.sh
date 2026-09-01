@@ -21,14 +21,29 @@ MAP="$ROOT_DIR/tools/packages/alpine-ports.map"
 # putting a program on the image means: paired with ALPINE_LAYOUT=native it
 # unpacks the package where it expects to live.
 PREFIX=""
+EXPLICIT_PREFIX=0
 if [ "${1:-}" = "--into" ]; then
 	PREFIX="$2"; shift 2
+	EXPLICIT_PREFIX=1
 fi
 [ $# -eq 1 ] || { echo "usage: $0 [--into <dir>] <port>" >&2; exit 2; }
 PORT="$1"
 [ -n "$PREFIX" ] || PREFIX="$ROOT_DIR/build/$ARCH/pkg/$PORT"
 
-if [ -d "$PREFIX" ] && [ -d "$PREFIX/lib" -o -d "$PREFIX/include" ]; then
+# Explicit installs target the shared rootfs, so the directory itself cannot
+# tell us whether this particular port has already been unpacked.  Keep a
+# small stamp per port and include the map checksum: changing the package map
+# invalidates the stamp without forcing a full clean of the rootfs.
+MAP_SIG="$(cksum "$MAP" | awk '{print $1 ":" $2}')"
+STAMP="$PREFIX/.b1nix-pkg-$PORT.stamp"
+
+if [ "$EXPLICIT_PREFIX" -eq 0 ] && [ -d "$PREFIX" ] && [ -d "$PREFIX/lib" -o -d "$PREFIX/include" ]; then
+	echo "$PREFIX"
+	exit 0
+fi
+
+if [ "$EXPLICIT_PREFIX" -eq 1 ] && [ -f "$STAMP" ] &&
+	[ "$(sed -n '1p' "$STAMP")" = "$MAP_SIG" ]; then
 	echo "$PREFIX"
 	exit 0
 fi
@@ -65,5 +80,9 @@ ARCH="$ARCH" "$ROOT_DIR/tools/packages/alpine-fetch.sh" "$PREFIX" $PKGS >&2
 # time and, through the stamp they feed, drag a five-minute Skia/Dawn rebuild
 # along with them.
 find "$PREFIX" -exec touch {} + 2>/dev/null || true
+
+if [ "$EXPLICIT_PREFIX" -eq 1 ]; then
+	printf '%s\n' "$MAP_SIG" > "$STAMP"
+fi
 
 echo "$PREFIX"

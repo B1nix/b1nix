@@ -248,6 +248,16 @@ report_progress_line() {
 	esac
 }
 
+_prepare_hostshare() {
+	mkdir -p "$PROJECT_DIR/smoke_run/hostshare/bin"
+	echo "Hello from Host through VirtIO-9P!" > "$PROJECT_DIR/smoke_run/hostshare/hello_from_host.txt"
+	if [ -d "$PROJECT_DIR/build/$ARCH/bin" ]; then
+		for _bf in "$PROJECT_DIR/build/$ARCH/bin"/*; do
+			[ -f "$_bf" ] && ln -sf "$_bf" "$PROJECT_DIR/smoke_run/hostshare/bin/$(basename "$_bf")" 2>/dev/null || true
+		done
+	fi
+}
+
 # Run QEMU and capture output
 run_qemu() {
 	local log="$1"
@@ -417,6 +427,10 @@ run_qemu() {
 					-drive if=none,file="$NVME_IMG",format=raw,id=nvm0 \
 					-device nvme,drive=nvm0,serial=b1nixnvme
 			fi
+			_prepare_hostshare
+			set -- "$@" \
+				-fsdev local,path="$PROJECT_DIR/smoke_run/hostshare",security_model=none,id=fsdev9p \
+				-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare
 			set -- "$@" ${EXTRA_QEMU_ARGS:-}
 		elif [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
 			# restrict=off by default: the NET-SMOKE ping-gateway and BusyBox
@@ -425,6 +439,7 @@ run_qemu() {
 			# restrict=on (guest fully isolated) — so those checks can only pass
 			# with restrict=off. The b1nix net stack itself is fine (they pass here).
 			# Set B1NIX_NET_RESTRICT=on for a hermetic, network-isolated run.
+			_prepare_hostshare
 			set -- "$@" \
 				-device ${GPU_DEVICE:-virtio-gpu-pci} \
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-off} -device virtio-net-pci,netdev=net0 \
@@ -443,6 +458,8 @@ run_qemu() {
 				-device ide-hd,drive=swapdrive,bus=ahci.1 \
 				-drive file="$NVME_IMG",if=none,id=nvmedrive,format=raw,discard=unmap \
 				-device nvme,serial=deadbeef,drive=nvmedrive \
+				-fsdev local,path="$PROJECT_DIR/smoke_run/hostshare",security_model=none,id=fsdev9p \
+				-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 				${EXTRA_QEMU_ARGS:-}
 		else
 			set -- "$@" -nic none -vga none ${EXTRA_QEMU_ARGS:-}
@@ -639,14 +656,14 @@ else
 	QUICK_CMDLINE=""
 	[ "$SMOKE_QUICK" = "1" ] && QUICK_CMDLINE="b1nix.smoke=quick"
 	if [ "$ARCH" = "aarch64" ]; then
-		# root-image, not just kernel.elf: this lane delivers the rootfs on the
-		# virtio-blk disk built from build/aarch64/rootfs, and it is root-image
-		# that stages the ported binaries (zsh, and the in-guest build tools as
-		# they start cross-building) into that tree. Building only the kernel
-		# left every port out of the image however well it cross-compiled — and
-		# left the lane running against whatever a previous build had staged,
-		# which is not reproducible.
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" root-image >"$BUILD_LOG" 2>&1 || {
+		# Keep the build graph identical to x86_64: one make invocation shares
+		# userspace, ports, root-image, kernel and validation across every split
+		# smoke image.  The old ARM-only root-image invocation caused the runner
+		# to prepare the tree outside the split-image graph and made profiling
+		# attribute repeated staging work to each lane.
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
+			iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
+			>"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
 		}
@@ -671,7 +688,9 @@ else
 				cp -f "build/$ARCH/Image" "build/$ARCH/Image.rpi"
 			# ... and put the virt-linked one back for every other lane.
 			rm -f "build/$ARCH/kernel.elf" "build/$ARCH/Image"
-			make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" all >>"$BUILD_LOG" 2>&1 || {
+			make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
+				iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
+				>>"$BUILD_LOG" 2>&1 || {
 				print_build_failure
 				exit 1
 			}
@@ -1570,6 +1589,15 @@ check_output "$LOG" "M14-SMOKE: ok VFS-normalization" "VFS path normalization wo
 check_output "$LOG" "M14-SMOKE: ok mmap-durable" "M72: a writable MAP_SHARED mmap store survives forced page-cache reclaim (drop_caches) and is read back from disk"
 check_output "$LOG" "M14-SMOKE: done" "M14 smoke completes successfully"
 
+# ── VirtIO-9P (9P2000.L) ──
+section "VirtIO-9P / Host-Guest File Sharing"
+check_output "$LOG" "M110-9P: start" "M110 VirtIO-9P smoke starts"
+check_output "$LOG" "M110-9P: ok mount" "VirtIO-9P mount successful"
+check_output "$LOG" "M110-9P: ok read-host-file" "VirtIO-9P read file from host verified"
+check_output "$LOG" "M110-9P: ok write-guest-file" "VirtIO-9P write file from guest verified"
+check_output "$LOG" "M110-9P: ok readdir" "VirtIO-9P directory traversal verified"
+check_output "$LOG" "M110-9P: done" "VirtIO-9P smoke complete"
+
 # ── M15 IPC, Security & Standard OS Features ──
 section "M15 IPC, security, and OS baseline"
 check_output "$LOG" "M15-SMOKE: start" "M15 smoke starts"
@@ -1638,7 +1666,7 @@ check_output "$LOG" "MM-SMOKE: done" "MM smoke completes"
 if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 	section "M40 Linux ABI Compatibility"
 	check_output "$LOG" "M40-LINUX: start" "M40 Linux ABI smoke starts"
-	check_output "$LOG" "ELF load: Linux personality detected: /bin/m40-linux-hello" "loader tags the static Linux binary with the Linux personality"
+	check_output "$LOG" "elf: Linux personality detected: /bin/m40-linux-hello" "loader tags the static Linux binary with the Linux personality"
 	check_output "$LOG" "M40-LINUX: hello from a static linux binary" "translated Linux write(1,...) reached the console"
 	check_output "$LOG" "M40-LINUX: ok fstat" "Linux fstat(2) result is translated to the Linux struct stat layout (st_mode at offset 24)"
 	check_output "$LOG" "M40-LINUX: ok uname" "Linux uname(2) result is translated to the Linux struct utsname layout (machine at offset 260)"
@@ -1728,6 +1756,14 @@ if [ "$ARCH" = "x86_64" ]; then
 	check_output "$LOG" "M67-RUST: ok run-std" "static Rust ELF ran and exited 0"
 	check_output "$LOG" "M67-RUST: done" "M67 Rust smoke completes"
 fi
+
+# ── M119 Developer-Centric Filesystems (fwcfgfs, debugfs, tarfs) ──
+section "M119 Developer-Centric Filesystems"
+check_output "$LOG" "M119-SMOKE: start" "M119 developer filesystems smoke starts"
+check_output "$LOG" "M119-SMOKE: ok debugfs" "debugfs virtual diagnostic filesystem mounted and read back"
+check_output "$LOG" "M119-SMOKE: ok fwcfgfs" "fwcfgfs QEMU fw_cfg directory and files inspected"
+check_output "$LOG" "M119-SMOKE: ok tarfs" "tarfs ustar archive filesystem mount and error handling verified"
+check_output "$LOG" "M119-SMOKE: done" "M119 developer filesystems smoke completes"
 
 # ── M25 Native C compiler (b1cc) ──
 section "M94 Linux ABI conformance (through musl)"

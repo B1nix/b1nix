@@ -3846,35 +3846,48 @@ static isize node_read_impl(struct vfs_handle *h, char *buf, usize size,
   } else if (node->inode->type == VFS_FILE) {
     usize rem = node->inode->size > offset ? node->inode->size - offset : 0;
     usize to_r = size < rem ? size : rem;
-    usize done = 0;
-    /* An in-memory file may also be mapped. A mapping is served from a
-     * page-cache frame seeded from inode->data, and stores through it never
-     * come back here — so a read that only looked at inode->data would report
-     * what the file held before anyone wrote to the mapping. Where a page is
-     * cached, it is the newer of the two, and it is what a reader must see. */
-    while (done < to_r) {
-      u64 cur = offset + done;
-      u64 page_aligned = cur & ~((u64)PAGE_SIZE - 1);
-      usize page_off = (usize)(cur & ((u64)PAGE_SIZE - 1));
-      usize chunk = PAGE_SIZE - page_off;
-      if (chunk > to_r - done)
-        chunk = to_r - done;
-      struct page_cache_entry *pe =
-          page_cache_get_page(node->inode, page_aligned);
-      if (pe) {
-        const char *src =
-            (const char *)(usize)(pe->frame + vmm_direct_map_base());
-        memcpy(buf + done, src + page_off, chunk);
-        page_cache_put_page(pe);
+    if (to_r > 0) {
+      if (node->inode->cached_pages == 0) {
+        if (node->inode->data)
+          memcpy(buf, (const char *)node->inode->data + offset, to_r);
+        else
+          memset(buf, 0, to_r);
+        res = (isize)to_r;
       } else {
-        memcpy(buf + done, (const char *)node->inode->data + cur, chunk);
+        usize done = 0;
+        /* An in-memory file may also be mapped. A mapping is served from a
+         * page-cache frame seeded from inode->data, and stores through it never
+         * come back here — so a read that only looked at inode->data would report
+         * what the file held before anyone wrote to the mapping. Where a page is
+         * cached, it is the newer of the two, and it is what a reader must see. */
+        while (done < to_r) {
+          u64 cur = offset + done;
+          u64 page_aligned = cur & ~((u64)PAGE_SIZE - 1);
+          usize page_off = (usize)(cur & ((u64)PAGE_SIZE - 1));
+          usize chunk = PAGE_SIZE - page_off;
+          if (chunk > to_r - done)
+            chunk = to_r - done;
+          struct page_cache_entry *pe =
+              page_cache_get_page(node->inode, page_aligned);
+          if (pe) {
+            const char *src =
+                (const char *)(usize)(pe->frame + vmm_direct_map_base());
+            memcpy(buf + done, src + page_off, chunk);
+            page_cache_put_page(pe);
+          } else {
+            if (node->inode->data)
+              memcpy(buf + done, (const char *)node->inode->data + cur, chunk);
+            else
+              memset(buf + done, 0, chunk);
+          }
+          done += chunk;
+        }
+        res = (isize)done;
       }
-      done += chunk;
+      if (posp) *posp += (usize)res; else h->offset += (usize)res;
+    } else {
+      res = 0;
     }
-    if (done > 0) {
-      if (posp) *posp += done; else h->offset += done;
-    }
-    res = (isize)done;
   }
   vfs_inode_unlock(node->inode);
   vfs_node_put(node);
@@ -4037,21 +4050,23 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
      * from the page cache, so a write that only touched inode->data would be
      * invisible through the mapping — the same divergence, in the other
      * direction, that the read path above closes. */
-    for (u64 cur = offset; cur < offset + size;) {
-      u64 page_aligned = cur & ~((u64)PAGE_SIZE - 1);
-      usize page_off = (usize)(cur & ((u64)PAGE_SIZE - 1));
-      usize chunk = PAGE_SIZE - page_off;
-      if (chunk > (usize)(offset + size - cur))
-        chunk = (usize)(offset + size - cur);
-      struct page_cache_entry *pe =
-          page_cache_get_page(node->inode, page_aligned);
-      if (pe) {
-        char *dst = (char *)(usize)(pe->frame + vmm_direct_map_base());
-        memcpy(dst + page_off, buf + (usize)(cur - offset), chunk);
-        page_cache_mark_dirty(pe);
-        page_cache_put_page(pe);
+    if (node->inode->cached_pages > 0) {
+      for (u64 cur = offset; cur < offset + size;) {
+        u64 page_aligned = cur & ~((u64)PAGE_SIZE - 1);
+        usize page_off = (usize)(cur & ((u64)PAGE_SIZE - 1));
+        usize chunk = PAGE_SIZE - page_off;
+        if (chunk > (usize)(offset + size - cur))
+          chunk = (usize)(offset + size - cur);
+        struct page_cache_entry *pe =
+            page_cache_get_page(node->inode, page_aligned);
+        if (pe) {
+          char *dst = (char *)(usize)(pe->frame + vmm_direct_map_base());
+          memcpy(dst + page_off, buf + (usize)(cur - offset), chunk);
+          page_cache_mark_dirty(pe);
+          page_cache_put_page(pe);
+        }
+        cur += chunk;
       }
-      cur += chunk;
     }
     if (offset + size > node->inode->size)
       node->inode->size = (usize)(offset + size);
@@ -6985,9 +7000,8 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     u64 seq_above = (cookie > 2) ? (cookie - 2) : 0; /* 0 = no bound */
     u64 tflags;
     vfs_tree_read_acquire(&tflags);
-    for (struct vfs_node *child = next_child_by_seq(dir, seq_above);
-         child && count < max_entries;
-         child = next_child_by_seq(dir, seq_above)) {
+    struct vfs_node *child = next_child_by_seq(dir, seq_above);
+    while (child && count < max_entries) {
       copy_path(buf[count].name, 64, child->name);
       buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
@@ -6997,6 +7011,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
       count++;
       seq_above = child->dir_seq;
       cookie = child->dir_seq + 2;
+      child = next_child_by_seq(dir, seq_above);
     }
     vfs_tree_read_release(tflags);
     if (count > 0)
@@ -7060,9 +7075,8 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     usize count = 0;
     u64 tflags;
     vfs_tree_read_acquire(&tflags);
-    for (struct vfs_node *child = next_child_by_seq(dir, seq_above);
-         child && count < max_entries;
-         child = next_child_by_seq(dir, seq_above)) {
+    struct vfs_node *child = next_child_by_seq(dir, seq_above);
+    while (child && count < max_entries) {
       copy_path(buf[count].name, 64, child->name);
       buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
@@ -7072,6 +7086,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
       count++;
       seq_above = child->dir_seq;
       h->offset = VFS_DIR_MEM_CURSOR | (usize)seq_above;
+      child = next_child_by_seq(dir, seq_above);
     }
     vfs_tree_read_release(tflags);
     res = (isize)count;

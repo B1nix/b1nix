@@ -65,7 +65,7 @@ static void append_char(char *str, size_t size, int *pos, char ch)
 
 static void append_string(char *str, size_t size, int *pos, const char *s)
 {
-	if (!s) s = "(null)";
+	if (!s || (uintptr_t)s < 4096) s = "(null)";
 	while (*s) {
 		append_char(str, size, pos, *s++);
 	}

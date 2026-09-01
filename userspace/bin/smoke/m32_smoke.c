@@ -565,9 +565,9 @@ static int test_tcp_client_server(void) {
     if (WIFEXITED(curl_status) && WEXITSTATUS(curl_status) == 0)
       break;
   }
-  /* Always terminate the server before reaping it: if every connect failed the
-   * single-shot server is still blocked in accept(), so a plain waitpid() would
-   * hang forever — the historical M32-NET smoke stall under parallel load.
+  /* The helper has a finite accept/handshake lifetime, so reap it normally.
+   * If every connect failed it exits through its accept timeout; killing it
+   * inside a VFS syscall can strand an inode lock on ARM.
    *
    * SIGKILL, not SIGTERM: the instance's test runner starts with
    * `trap '' ... TERM ...` (tools/ports/00-smoke.start) and SIG_IGN is
@@ -575,8 +575,7 @@ static int test_tcp_client_server(void) {
    * ignores SIGTERM. The kill silently did nothing, the waitpid below never
    * returned, and the lane died there — taking every check that runs after
    * m32_smoke (m53_*, m34, m35, m36, cxx, m55, m98, m104: ~380 of them) with
-   * it. That is the whole 1022-vs-640 swing between runs. */
-  kill(tls_srv, SIGKILL);
+   * it. */
   { int srv_status = 0; waitpid(tls_srv, &srv_status, 0); }
   if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) != 0) {
     fail("curl-https-handshake");
@@ -634,7 +633,6 @@ static int test_tcp_client_server(void) {
    * reaping so a refused connect (server not yet bound under load) can't leave
    * us blocked in waitpid. SIGKILL for the same reason as above: the test tree
    * inherits an ignored SIGTERM from the runner's trap. */
-  kill(tls_srv, SIGKILL);
   { int srv_status = 0; waitpid(tls_srv, &srv_status, 0); }
   if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) == 0) {
     fail("curl-https-selfsigned-reject");

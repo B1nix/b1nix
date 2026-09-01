@@ -3937,10 +3937,19 @@ int main(void) {
   test_ioprio();
   test_ioprio_applet();
 
+#if defined(__aarch64__)
+  /* QEMU virt exposes one PL011 console, not the PC's second 16550 COM port
+   * that these legacy serial ioctl checks intentionally exercise. */
+  marker("M109-SMOKE: skip serial-line (no legacy COM2 on aarch64)");
+  marker("M109-SMOKE: skip serial-badbaud (no legacy COM2 on aarch64)");
+  marker("M109-SMOKE: skip serial-modem (no legacy COM2 on aarch64)");
+  marker("M109-SMOKE: skip serial-setserial (no legacy COM2 on aarch64)");
+#else
   test_serial_line();
   test_serial_badbaud();
   test_serial_modem();
   test_serial_setserial();
+#endif
 
   test_mounts_past_64();
   test_fs_run_past_64();

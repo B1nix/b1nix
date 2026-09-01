@@ -96,7 +96,8 @@ CACHE_ROOT="$ROOT_DIR/build/$ARCH/pkgcache"
 INSTALLED="$(mktemp)"
 # The package names installed by this run, for the dependency passes below.
 PKGS_SEEN="$(mktemp)"
-trap 'rm -f "$INSTALLED" "$PKGS_SEEN" "$PRESENT"' EXIT
+PRESENT=""
+trap 'rm -f "$INSTALLED" "$PKGS_SEEN" ${PRESENT:+"$PRESENT"}' EXIT
 
 #
 # Dependencies that must not be followed into this image.

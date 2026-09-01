@@ -39,6 +39,9 @@
 #include <b1nix/ext4.h>
 #include <b1nix/btrfs.h>
 #include <b1nix/fuse.h>
+#include <b1nix/fwcfgfs.h>
+#include <b1nix/debugfs.h>
+#include <b1nix/tarfs.h>
 #include <b1nix/procfs.h>
 #include <b1nix/ahci.h>
 #include <b1nix/amdvi.h>
@@ -74,6 +77,7 @@
 #include <b1nix/ramdisk.h>
 #include <b1nix/sound.h>
 #include <b1nix/virtio_gpu.h>
+#include <b1nix/virtio_9p.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -297,7 +301,7 @@ static struct block_device *find_root_device(const char *root_val) {
  * its only caller. */
 static unsigned g_port_watch_period;
 
-static void port_watch_thread(void *arg)
+static void __attribute__((unused)) port_watch_thread(void *arg)
 {
 	extern void lkpi_i915_dump_port_state_pub(void) __attribute__((weak));
 
@@ -328,7 +332,7 @@ static void task_watch_thread(void *arg)
 	}
 }
 
-static void drm_stuck_watch_thread(void *arg)
+static void __attribute__((unused)) drm_stuck_watch_thread(void *arg)
 {
 	extern int lkpi_diag_watch_report(u64 min_ms) __attribute__((weak));
 
@@ -697,6 +701,11 @@ void kernel_main(usize arg0, usize arg1)
 	cgroup_init();   /* cgroup v2 — systemd mounts it before anything else */
 	procfs_init();
 	sysfs_init();
+	virtio_9p_init();
+	p9_fs_init();
+	fwcfgfs_init();
+	b1nix_debugfs_init();
+	tarfs_init();
 	BOOTMARK(17);	/* sysfs */
 	/* module_init_builtin_deps() used to be called here. It now runs after the
 	 * root is mounted (see the note at its remaining call site): the modules
@@ -1084,54 +1093,81 @@ void kernel_main(usize arg0, usize arg1)
 					}
 				}
 			} else {
-				struct block_device *root_dev = find_root_device(root_val);
-				if (!root_dev) {
-					console_write("rootfs: waiting for root device ");
-					console_write(root_val);
-					console_write("...\n");
-					int retries = 0;
-					while (retries < 50) {
-						scheduler_sleep_ticks(SCHED_MS_TO_TICKS(100));
-						root_dev = find_root_device(root_val);
-						if (root_dev) {
-							break;
-						}
-						retries++;
+				char fstype_val[32] = {0};
+				bootinfo_get_kv("rootfstype", fstype_val, sizeof(fstype_val));
+
+				if (strcmp(root_val, "9p") == 0 || strcmp(root_val, "hostshare") == 0 || strcmp(fstype_val, "9p") == 0) {
+					rc = vfs_mount(root_val[0] ? root_val : "hostshare", "/", "9p", 0);
+					if (rc == 0) {
+						console_write("rootfs: mounted on / as 9p (fast host pass-through)\n");
+						boot_summary_set_root("hostshare (9p)");
+						vfs_repopulate_after_root_mount();
 					}
-				}
-				if (root_dev) {
-					const char *fs_types[] = {"ext4", "ext3", "ext2"};
-					for (int i = 0; i < 3; i++) {
-						rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
-						if (rc == 0) {
-							char mounted_buf[96];
-							snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, fs_types[i]);
-							console_write(mounted_buf);
-							vfs_repopulate_after_root_mount();
-							break;
+				} else {
+					struct block_device *root_dev = find_root_device(root_val);
+					if (!root_dev) {
+						console_write("rootfs: waiting for root device ");
+						console_write(root_val);
+						console_write("...\n");
+						int retries = 0;
+						while (retries < 50) {
+							scheduler_sleep_ticks(SCHED_MS_TO_TICKS(100));
+							root_dev = find_root_device(root_val);
+							if (root_dev) {
+								break;
+							}
+							retries++;
 						}
 					}
-				}
-				if (rc != 0) {
-					char mount_err_buf[96];
-					snprintf(mount_err_buf, sizeof(mount_err_buf), "rootfs: staying on initramfs, failed to mount root: %s\n", root_val);
-					console_write(mount_err_buf);
-					vfs_repopulate_after_root_mount();
+					if (root_dev) {
+						if (fstype_val[0]) {
+							rc = vfs_mount(root_dev->name, "/", fstype_val, 0);
+							if (rc == 0) {
+								char mounted_buf[96];
+								snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, fstype_val);
+								console_write(mounted_buf);
+								vfs_repopulate_after_root_mount();
+							}
+						}
+						if (rc != 0) {
+							const char *fs_types[] = {"ext4", "ext3", "ext2", "tarfs"};
+							for (int i = 0; i < 4; i++) {
+								rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
+								if (rc == 0) {
+									char mounted_buf[96];
+									snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, fs_types[i]);
+									console_write(mounted_buf);
+									vfs_repopulate_after_root_mount();
+									break;
+								}
+							}
+						}
+					}
+					if (rc != 0) {
+						char mount_err_buf[96];
+						snprintf(mount_err_buf, sizeof(mount_err_buf), "rootfs: staying on initramfs, failed to mount root: %s\n", root_val);
+						console_write(mount_err_buf);
+						vfs_repopulate_after_root_mount();
+					}
 				}
 			}
 		} else {
 			/*
-			 * No root= on the command line: choose by what the filesystem says
-			 * it is, not by where it happens to be plugged in.
-			 *
-			 * Taking the first virtio disk unconditionally meant any disk attached for
-			 * any other purpose became the root — a package cache handed to the
-			 * guest for speed was mounted at / and the real filesystem never
-			 * appeared. The label comes first, then the image the boot loader
-			 * handed us, and only then a bare disk.
+			 * No root= on the command line: default to fast 9P hostshare if present,
+			 * otherwise fall back to ext4 disk by label 'b1nix-root', ram0, or virtio block.
 			 */
 			rc = -1;
-			{
+
+			/* 1. Fast 9P hostshare rootfs by default */
+			rc = vfs_mount("hostshare", "/", "9p", 0);
+			if (rc == 0) {
+				console_write("rootfs: hostshare mounted at / as 9p (default fast pass-through)\n");
+				boot_summary_set_root("hostshare (9p)");
+				vfs_repopulate_after_root_mount();
+			}
+
+			/* 2. Fallback to ext4 labelled disk */
+			if (rc != 0) {
 				struct block_device *labelled = find_device_by_label("b1nix-root");
 
 				if (labelled) {

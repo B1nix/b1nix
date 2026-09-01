@@ -107,6 +107,11 @@ render_run_case() {
 	export WAYLAND_DISPLAY="$_sock"
 	SWAYSOCK=$(ls -1 "$XDG_RUNTIME_DIR"/sway-ipc.*.sock 2>/dev/null | head -1)
 	export SWAYSOCK
+	# The clipboard check needs a live compositor and therefore runs after the
+	# socket is ready, not before render-smoke starts sway.
+	if [ "$_label" = "software" ] && [ -x /bin/m51_clipboard_smoke ]; then
+		/bin/m51_clipboard_smoke
+	fi
 
 	for _c in "$_c1" "$_c2"; do
 		# The compositor repaints on its own clock, so the frame carrying

@@ -60,10 +60,22 @@ else
     SMOKE_BLK=1
 fi
 
+# Auto-mount 9P host share if present for zero-rebuild fast iteration
+mkdir -p /mnt/host 2>/dev/null || true
+mount -t 9p hostshare /mnt/host 2>/dev/null || true
+
 run_test() {
     bin="$1"
     inst="$2"
-    if [ ! -x "$bin" ]; then return; fi
+
+    # Prefer latest binary directly from host share if available
+    bname="${bin##*/}"
+    if [ -x "/mnt/host/bin/$bname" ]; then
+        bin="/mnt/host/bin/$bname"
+    elif [ ! -x "$bin" ]; then
+        return
+    fi
+
     case "$inst" in
         sys) [ "$SMOKE_SYS" = "1" ] && "$bin" ;;
         blk) [ "$SMOKE_BLK" = "1" ] && "$bin" ;;
@@ -125,6 +137,8 @@ run_test /bin/b1cc_selfsmoke sys
 run_test /bin/m30_dynamic sys
 run_test /bin/m24_stress sys
 run_test /bin/m39_smoke sys
+run_test /bin/m110_9p_smoke sys
+run_test /bin/m119_smoke sys
 
 # ---- blk (storage) ----
 run_test /bin/m14_smoke blk
@@ -158,8 +172,6 @@ run_test /bin/m51_cairo_smoke gfx
 run_test /bin/m51_xkb_smoke gfx
 run_test /bin/m51_harfbuzz_smoke gfx
 run_test /bin/m51_fontconfig_smoke gfx
-run_test /bin/m51_clipboard_smoke gfx
-
 # Composition, both paths. Software (pixman) and accelerated (GLES on a DRM
 # render node) are separate supported configurations, so each is run on purpose
 # and each carries its own marker — see /etc/render-smoke.sh. A shell script

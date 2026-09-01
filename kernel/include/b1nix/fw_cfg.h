@@ -4,8 +4,18 @@
 
 #include <b1nix/types.h>
 
+#define FW_CFG_PORT_SEL  0x510
+#define FW_CFG_PORT_DATA 0x511
+
+#define FW_CFG_SIGNATURE 0x0000
+#define FW_CFG_FILE_DIR  0x0019
+
 /* Is QEMU's fw_cfg channel there? */
 int fw_cfg_present(void);
+
+/* Low-level access functions */
+void fw_cfg_select(u16 key);
+void fw_cfg_read(void *buf, usize len);
 
 /*
  * Place the graphics OpRegion QEMU offers into memory and point the device at

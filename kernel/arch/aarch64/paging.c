@@ -121,7 +121,12 @@ static inline u64 *phys_to_virt(u64 phys) { return (u64 *)(usize)phys; }
 static inline u64 virt_to_phys(void *ptr) { return (u64)(usize)ptr; }
 
 static u64 *get_l0_for_va(u64 va) {
-  if (va >= 0x8000000000000000ULL) {
+  /* AArch64 keeps the kernel text and MMIO window in the low address space;
+   * user ELFs (including ASLR placements) live far above it.  The old
+   * x86-style sign-bit test selected the current process table for kernel heap
+   * buffers.  Conversely, treating everything below the fixed interpreter
+   * base as kernel breaks ASLR user mappings around 0x500000000000. */
+  if (va >= 0x0000000040000000ULL && va < 0x0000007000000000ULL) {
     return kernel_l0_virt;
   }
   if (current_task && current_task->pml4_phys) {
@@ -886,13 +891,36 @@ static int handle_page_fault_locked(u64 fault_addr, u64 error_code,
            * protection violation. */
           if ((error_code & 2) && (entry & SW_COW))
             return cow_fault(l3, i3, va);
-          /* Temporary: a present leaf that is not serviceable. */
+          /* The hardware found no translation, yet the tables hold a valid
+           * leaf with its access flag set: another CPU serviced this very
+           * fault while we were on our way here. Threads share one address
+           * space, so two of them faulting on the same page at the same
+           * moment is ordinary — and killing the process for it is not.
+           * Publish the entry to this CPU's walker and let the instruction
+           * retry; the fault-loop detector above still catches a page that
+           * genuinely cannot be serviced. (Only a *permission* fault,
+           * error_code bit 0, is a real violation here.) */
+          if (!(error_code & 1)) {
+            tlb_flush_page(va);
+            return 0;
+          }
+          /* A present leaf that is not serviceable. */
           console_write("pf-prot: va=0x");
           console_write_hex64(va);
           console_write(" leaf=0x");
           console_write_hex64(entry);
           console_write(" err=0x");
           console_write_hex64(error_code);
+          {
+            u64 ttbr0;
+            __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+            console_write(" ttbr0=0x");
+            console_write_hex64(ttbr0);
+            console_write(" pml4=0x");
+            console_write_hex64(current_task ? current_task->pml4_phys : 0);
+            console_write(" task=");
+            console_write(current_task && current_task->name ? current_task->name : "?");
+          }
           console_write("\n");
           return -1;
         }
@@ -1475,6 +1503,8 @@ u64 vmm_virt_to_phys(void *virt) {
   u64 va = (u64)(usize)virt;
   u64 page_off = va & (PAGE_SIZE - 1);
   u64 *l0 = get_l0_for_va(va);
+  if (!l0)
+    return 0;
   usize i0 = l0_index(va);
   if ((l0[i0] & 0x3ULL) != D_TABLE) return va; /* untouched: identity */
   u64 *l1 = table_from_entry(l0[i0]);

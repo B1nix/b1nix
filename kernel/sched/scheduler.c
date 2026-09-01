@@ -882,6 +882,12 @@ static void free_task_slot(struct task *t) {
     extern void scheduler_clear_comm_internal(usize pid);
     scheduler_clear_comm_internal(t->id);
   }
+  /* Last chance to take the slot out of the run lists. Once state is
+   * TASK_UNUSED the slot is claimable, and the next occupant overwrites
+   * next_run in place — through a link the chain is still following. See
+   * sched_rq_remove_task_all(). Done before tasks_lock: the runqueue lock is
+   * the outermost level, and a leaf lock must not nest it. */
+  sched_rq_remove_task_all(t);
   u64 flags;
   tasks_lock(&flags);
   t->state = TASK_UNUSED;
@@ -1767,10 +1773,15 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   /* find_unused_task assigned the id under g_tasks_lock; preserve it across the
    * struct copy below (memcpy from the parent would otherwise clobber it). */
   usize claimed_id = child->id;
+  /* The runqueue link is the slot's, never the parent's: copying it would
+   * splice the child into the chain the parent sits in (and, when the parent
+   * is one hop ahead, into itself). Preserved like the id. */
+  struct task *claimed_next_run = child->next_run;
 
   // 1. Copy the task structure
   memcpy(child, parent, sizeof(struct task));
   child->id = claimed_id;
+  child->next_run = claimed_next_run;
   /* The memcpy copied the parent's fpu_state SAVE-AREA, which is only refreshed
    * on a context switch-out and may lag the parent's live FPU. Capture the
    * parent's current (live) FPU directly so the child inherits the real FP

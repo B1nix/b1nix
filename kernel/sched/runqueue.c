@@ -244,6 +244,30 @@ void sched_rq_enqueue_current(struct task *t) {
     }
 }
 
+/* Scrub a task slot out of EVERY runqueue, whatever its stealable flag says.
+ *
+ * Called when a slot is released back to the task table. A slot that is still
+ * linked in a runqueue when it is recycled is not a stale entry that gets
+ * dropped later — the next occupant WRITES THROUGH the link: find_unused_task
+ * memsets the slot (truncating the chain) and fork's
+ * `memcpy(child, parent, sizeof *child)` then stores the *parent's* next_run
+ * into a node that is still in the chain. With the parent one hop ahead of the
+ * recycled slot that stores the slot's own address into its own next_run — a
+ * self cycle, reached from the head, which is exactly the "runqueue list is
+ * cyclic" panic seen on aarch64: a chain of identical /bin/sh entries, hit by
+ * the very fork whose memcpy had just built it.
+ *
+ * sched_rq_remove_task cannot be used here: it picks the queue from
+ * t->stealable, and a slot being torn down is precisely where that field is no
+ * longer trustworthy. Sweep them all. */
+void sched_rq_remove_task_all(struct task *t) {
+    rq_remove(sched_global_rq(), t);
+    for (int i = 0; i < g_max_cpus; i++) {
+        struct percpu *pcpu = get_percpu_n(i);
+        if (pcpu) rq_remove(&pcpu->runqueue, t);
+    }
+}
+
 void sched_rq_remove_task(struct task *t) {
     if (t->stealable) {
         for (int i = 0; i < g_max_cpus; i++) {

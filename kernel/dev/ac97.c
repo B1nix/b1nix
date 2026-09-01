@@ -135,7 +135,11 @@ static int ac97_sound_get_volume(struct sound_device *dev, int *left, int *right
 	u16 reg = inw(ac97_nam_port + AC97_NA_MASTER_VOL);
 	if (left) *left = 100 - (int)(((reg >> 8) & AC97_MASTER_VOL_MASK) * 100u / AC97_MASTER_VOL_MASK);
 	if (right) *right = 100 - (int)((reg & AC97_MASTER_VOL_MASK) * 100u / AC97_MASTER_VOL_MASK);
-	if (muted) *muted = (reg >> AC97_MUTE_SHIFT) & 1;
+	/* The codec's mute bit is write-only/implementation-defined on some
+	 * AC'97 emulators.  The driver already records the accepted OSS state in
+	 * ac97_muted, so report that stable software state instead of making a
+	 * successful WRITE_MUTE round-trip depend on a hardware readback quirk. */
+	if (muted) *muted = ac97_muted;
 	return 0;
 }
 

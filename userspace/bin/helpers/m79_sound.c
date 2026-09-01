@@ -13,7 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/soundcard.h>
+#include "../../include/linux/soundcard.h"
 #include <unistd.h>
 
 #ifndef VOLUME_PACK

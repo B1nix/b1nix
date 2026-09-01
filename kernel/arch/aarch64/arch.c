@@ -111,13 +111,6 @@ int virtio_net_probe(void *dev)
 	return -1;
 }
 
-int virtio_init_device(void *dev) { (void)dev; return -1; }
-void virtio_set_guest_features(void *dev, u64 features) { (void)dev; (void)features; }
-void virtio_set_status(void *dev, u8 status) { (void)dev; (void)status; }
-u8 virtio_get_status(void *dev) { (void)dev; return 0; }
-int virtq_init(void *dev, int qidx, void *vq) { (void)dev; (void)qidx; (void)vq; return -1; }
-void virtq_kick(void *vq) { (void)vq; }
-
 void arch_init(void)
 {
 	console_write("aarch64: arch_init\n");

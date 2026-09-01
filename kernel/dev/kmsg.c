@@ -212,6 +212,16 @@ void kmsg_capture_tail(void) {
 void kmsg_print_captured(void) {
   console_write("--- last log lines before the stall ---\n");
   for (unsigned i = 0; i < g_tail_count; i++) {
+    /* Quoted, not re-emitted.
+     *
+     * These lines are a replay of what the ring already holds, and printing
+     * them bare put text into the log that is indistinguishable from live
+     * kernel output -- three watchdog dumps turned one "net: e1000
+     * administratively down" into four, three of them with no timestamp,
+     * because the stored line does not carry the console's stamp. Anything
+     * reading the log then sees kernel records that appear to have been
+     * emitted without one. The marker says whose words these are. */
+    console_write("| ");
     console_write(g_tail[i]);
     console_write("\n");
   }

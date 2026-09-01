@@ -52,12 +52,12 @@ static u32 be32(u32 v)
 	       ((v >> 24) & 0xff);
 }
 
-static void fw_cfg_select(u16 key)
+void fw_cfg_select(u16 key)
 {
 	outw(FW_CFG_PORT_SEL, key);
 }
 
-static void fw_cfg_read(void *buf, usize len)
+void fw_cfg_read(void *buf, usize len)
 {
 	u8 *out = buf;
 

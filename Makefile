@@ -582,6 +582,12 @@ KERNEL_SOURCES := \
 	kernel/fs/journal.c \
 	kernel/fs/filelock.c \
 	kernel/fs/fuse.c \
+	kernel/fs/9p.c \
+	kernel/dev/virtio_9p.c \
+	kernel/fs/fwcfgfs.c \
+	kernel/dev/fw_cfg.c \
+	kernel/fs/debugfs.c \
+	kernel/fs/tarfs.c \
 	kernel/dev/blk.c \
 	kernel/dev/loop.c \
 	kernel/dev/uevent.c \
@@ -615,6 +621,7 @@ ifneq ($(filter $(ARCH),aarch64),)
 # AHCI and NVMe are PCI devices driven entirely through MMIO — nothing in them
 # is x86-specific — so with a working PCI bus they belong here too.
 KERNEL_SOURCES += kernel/dev/pci.c kernel/dev/ahci.c kernel/dev/nvme.c \
+	kernel/dev/virtio.c \
 	kernel/dev/r8169.c \
 	kernel/dev/smmuv3.c
 endif
@@ -650,7 +657,6 @@ KERNEL_SOURCES += \
  	kernel/dev/virtio_input.c \
 	kernel/dev/drm.c \
 	kernel/dev/drm_card1.c \
-	kernel/dev/fw_cfg.c \
 	kernel/dev/netconsole.c \
 	kernel/lkpi/lkpi_core.c \
 	kernel/lkpi/idr.c \
@@ -1008,6 +1014,8 @@ $(BUILD_DIR)/$(I915_IMPORT_DIR)/%.o: $(I915_IMPORT_DIR)/%.c $(DRM_FLAGS_STAMP)
 $(I915_SHIM_OBJECTS): $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(filter-out -w,$(I915_IMPORT_CFLAGS)) -Wall -Wextra $(ARCH_CFLAGS) -c $< -o $@
+else
+I915_IMPORT_OBJECTS :=
 endif
 else
 I915_IMPORT_OBJECTS :=
@@ -1479,6 +1487,10 @@ PKGROOT_STAMP := $(PKGROOT)/.installed
 $(PKGROOT_STAMP): $(PKG_DEPS)
 	B1NIX_ARCH=$(ARCH) ALPINE_LAYOUT=native \
 		tools/packages/pkg-prefix.sh --into $(PKGROOT) programs >/dev/null
+	@# libidn2 and libpsl are pulled in by curl, but their libunistring
+	@# runtime dependency is not included transitively by this package list.
+	B1NIX_ARCH=$(ARCH) ALPINE_LAYOUT=native \
+		tools/packages/pkg-prefix.sh --into $(PKGROOT) libunistring-runtime >/dev/null
 	@# B1NIX_BROWSER=1 bakes chromium and its closure into the image. Installing
 	@# it inside the guest instead does not fit: 175 packages and 618 MB, which
 	@# outlasted the hour a passthrough run gets and ran the root filesystem out

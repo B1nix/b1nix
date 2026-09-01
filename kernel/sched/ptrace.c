@@ -1166,12 +1166,20 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
     return 0;
   }
   case PTRACE_KILL:
+    /* Resume the stopped tracee through the normal signal wake path before
+     * dropping the link. Clearing the link first leaves a task parked in the
+     * ptrace stop with SIGKILL pending; its real parent can then wait forever
+     * because the tracee never reaches exit_current(). */
     spin_lock_irqsave(&g_ptrace_lock, &flags);
     l->stopped = 0;
-    l->used = 0;
-    __atomic_fetch_sub(&g_link_count, 1, __ATOMIC_RELAXED);
     spin_unlock_irqrestore(&g_ptrace_lock, flags);
     scheduler_kill(pid, SIGKILL);
+    spin_lock_irqsave(&g_ptrace_lock, &flags);
+    if (l->used) {
+      l->used = 0;
+      __atomic_fetch_sub(&g_link_count, 1, __ATOMIC_RELAXED);
+    }
+    spin_unlock_irqrestore(&g_ptrace_lock, flags);
     return 0;
   default:
     return -EIO;

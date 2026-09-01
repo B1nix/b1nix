@@ -143,6 +143,14 @@ static spinlock_t vt_lock = SPINLOCK_INIT;
 /* Set while repainting so the console_putc hook does not re-record the very
  * characters it is replaying. */
 static volatile int g_replaying;
+
+/* True while vt_repaint is painting a saved screen — NOT the same thing as
+ * g_replaying, which the ordinary write path also raises (to stop the paint it
+ * does from being recorded twice) and which is therefore set for live output.
+ * The console asks this one so it can keep a repaint off the serial port,
+ * which on aarch64 is the log itself. */
+static volatile int g_repainting;
+int vt_repaint_in_progress(void) { return g_repainting; }
 static int g_inited;
 
 /* Keymap + font state. */
@@ -274,6 +282,7 @@ static void vt_repaint(struct vt_screen *v) {
   u64 clk;
   console_lock_acquire_irqsave(&clk);
   g_replaying = 1;
+  g_repainting = 1;
   console_clear();
   if (v->cells) {
     for (u16 r = 0; r < g_rows; r++) {
@@ -291,6 +300,7 @@ static void vt_repaint(struct vt_screen *v) {
         break;
     }
   }
+  g_repainting = 0;
   g_replaying = 0;
   console_lock_release_irqrestore(clk);
 }

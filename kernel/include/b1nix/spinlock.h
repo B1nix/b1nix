@@ -124,9 +124,15 @@ static inline void spin_unlock(spinlock_t *lock) {
      * which the lock is free but still attributed to this CPU. */
     LOCKDEP_NOTE_SPIN_RELEASE(lock);
     /* Store 0 with a release barrier so all previous writes are visible
-     * before the lock is released. */
+     * before the lock is released. A compiler-only barrier is insufficient
+     * on AArch64: another CPU may observe the unlocked word before the
+     * runqueue links (or other protected state) have become visible. */
+#if defined(__aarch64__)
+    __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
+#else
     __asm__ volatile("" : : : "memory");
     *lock = 0;
+#endif
 }
 
 /* One attempt, no spinning: 1 if this CPU now holds the lock, 0 if somebody

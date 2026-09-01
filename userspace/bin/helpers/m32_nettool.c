@@ -296,6 +296,18 @@ static int tls_server(int argc, char **argv) {
     return 1;
   }
 
+  /* Keep the single-shot helper self-terminating.  The smoke parent may have
+   * to abandon a client after a TLS setup error; a blocking accept here would
+   * then force it to SIGKILL the server, which can strand a sleeping VFS lock
+   * if the signal arrives inside a syscall. */
+  struct pollfd accept_pfd;
+  accept_pfd.fd = lfd;
+  accept_pfd.events = POLLIN;
+  accept_pfd.revents = 0;
+  if (poll(&accept_pfd, 1, 20000) <= 0) {
+    close(lfd);
+    return 1;
+  }
   int cfd = accept(lfd, 0, 0);
   if (cfd < 0) {
     close(lfd);

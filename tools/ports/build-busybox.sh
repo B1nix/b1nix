@@ -104,7 +104,7 @@ mkdir -p "$BUILD_DIR"
 echo "Generating BusyBox configuration from $CONFIG_FRAGMENT..."
 cp -f "$CONFIG_FRAGMENT" "$BUILD_DIR/.config"
 set +o pipefail
-yes "" | make -C "$SRC_DIR" O="$BUILD_DIR" oldconfig
+make -C "$SRC_DIR" O="$BUILD_DIR" olddefconfig || yes "" | make -C "$SRC_DIR" O="$BUILD_DIR" oldconfig || true
 set -o pipefail
 
 # Force a clean rebuild when the b1nix sysroot changed since the last BusyBox

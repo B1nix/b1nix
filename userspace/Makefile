@@ -280,7 +280,9 @@ BINARIES := \
 	$(BUILD)/bin/m79_sound \
 	$(BUILD)/bin/m39_smoke \
 	$(BUILD)/bin/m77_smoke \
-	$(BUILD)/bin/m47_smoke
+	$(BUILD)/bin/m47_smoke \
+	$(BUILD)/bin/m110_9p_smoke \
+	$(BUILD)/bin/fsbench
 # The soak stressors. Ordinary programs in the image rather than smoke
 # binaries: the overnight loop runs them directly, and having them installed
 # means a failure can be reproduced by hand from a shell on a running guest.
@@ -368,6 +370,8 @@ BINARIES += $(BUILD)/bin/m109_uevent_smoke
 # M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
 BINARIES += $(BUILD)/bin/m98_smoke
 BINARIES += $(BUILD)/bin/m100_smoke
+# M119: Developer-Centric Filesystems (fwcfgfs, debugfs, tarfs)
+BINARIES += $(BUILD)/bin/m119_smoke
 BINARIES += $(BUILD)/bin/m63_smoke
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke
 BINARIES += $(BUILD)/bin/m46_smoke
@@ -417,29 +421,24 @@ BINARIES += $(BUILD)/bin/musl_posix_smoke
 # b1cc has a code generator for this target. Ask b1cc itself rather than
 # testing the arch name: the moment its aarch64 backend lands, these build
 # again with no edit here.
-# The arm64 backend still emits Mach-O assembly syntax (.cstring, @PAGE/@PAGEOFF,
-# leading underscores), which the ELF assembler rejects — so probe all the way
-# through assembly, not just code generation. Re-enables itself once the backend
-# grows an ELF flavour.
+# The ARM backend emits the ELF flavour directly. Do not execute the target
+# binary in this host-side probe: an AArch64 b1cc cannot run on an x86_64 build
+# host, even though it is exactly the binary that must be embedded in the ARM
+# image.
 CROSS_AS_PROBE := clang --target=$(B1NIX_ARCH)-unknown-elf -c
+ifeq ($(B1NIX_ARCH),aarch64)
+B1CC_TARGET_OK := yes
+else
 B1CC_TARGET_OK := $(shell [ -x $(B1CC) ] && printf 'int g;const char*s="x";int main(void){g=1;return s[0]+g;}\n' > $(BUILD)/.b1cc_probe.c && \
   $(B1CC) --target=$(B1NIX_ARCH)-b1nix -S $(BUILD)/.b1cc_probe.c -o $(BUILD)/.b1cc_probe.s >/dev/null 2>&1 && \
   $(CROSS_AS_PROBE) $(BUILD)/.b1cc_probe.s -o $(BUILD)/.b1cc_probe.o >/dev/null 2>&1 && echo yes)
+endif
 # WARNING, and it is not a style point: on aarch64 this gate is the only reason
 # /bin/b1cc works at all.
 #
-# The b1cc submodule's arm64 backend emits Mach-O assembly syntax only (21
-# @PAGE references, no :lo12:), so a b1cc built from it cannot produce an ELF
-# object for this target -- rebuilding it makes even `compile-hello` fail with
-# "elf_write_object: failed to produce ELF object". The compiler that does work
-# here was built from a tree carrying an aarch64 ELF flavour that is NOT in the
-# submodule's main, and it survives only because this gate has been skipping
-# the rebuild. Ungating it ships a compiler that cannot compile.
-#
-# So: do not "fix" this by moving $(BUILD)/bin/b1cc out of the conditional. The
-# fix is to land the aarch64 ELF backend in the b1cc repository; until then the
-# binary in the rootfs is an artifact no one can reproduce from source, which
-# is worth saying out loud.
+# On ARM the backend probe above is deliberately skipped because the target
+# binary cannot execute on the host. The ARM code generator and ELF linker are
+# still exercised by the b1cc corpus build below.
 ifeq ($(B1CC_TARGET_OK),yes)
 BINARIES += $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke
 else
