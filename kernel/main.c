@@ -1153,21 +1153,11 @@ void kernel_main(usize arg0, usize arg1)
 			}
 		} else {
 			/*
-			 * No root= on the command line: default to fast 9P hostshare if present,
-			 * otherwise fall back to ext4 disk by label 'b1nix-root', ram0, or virtio block.
+			 * No root= on the command line: choose by what the filesystem says
+			 * it is (labelled disk 'b1nix-root'), ram0, or virtio block.
 			 */
 			rc = -1;
-
-			/* 1. Fast 9P hostshare rootfs by default */
-			rc = vfs_mount("hostshare", "/", "9p", 0);
-			if (rc == 0) {
-				console_write("rootfs: hostshare mounted at / as 9p (default fast pass-through)\n");
-				boot_summary_set_root("hostshare (9p)");
-				vfs_repopulate_after_root_mount();
-			}
-
-			/* 2. Fallback to ext4 labelled disk */
-			if (rc != 0) {
+			{
 				struct block_device *labelled = find_device_by_label("b1nix-root");
 
 				if (labelled) {

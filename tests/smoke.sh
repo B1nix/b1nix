@@ -245,14 +245,33 @@ report_progress_line() {
 	esac
 }
 
+# The point of the share is that a rebuilt test binary reaches the guest without
+# repacking half a gigabyte of root.ext4: 00-smoke.start's run_test prefers
+# /mnt/host/bin/<name> over the rootfs copy.
+#
+# It was doing neither. The source was build/<arch>/bin, which this tree has
+# never produced -- the staged binaries live in build/<arch>/rootfs/bin -- so
+# bin/ in the share stayed empty and every run_test silently fell back to the
+# rootfs, i.e. to whatever root.ext4 happened to hold. And the entries were
+# SYMLINKS to absolute host paths: QEMU's 9p with security_model=none hands the
+# guest the link itself, and /Users/... does not resolve inside the guest, so
+# they would not have worked even with the right source.
+#
+# Hard links, refreshed each run: same inode, no copy, and the guest sees a
+# plain file.
 _prepare_hostshare() {
-	mkdir -p "$PROJECT_DIR/smoke_run/hostshare/bin"
-	echo "Hello from Host through VirtIO-9P!" > "$PROJECT_DIR/smoke_run/hostshare/hello_from_host.txt"
-	if [ -d "$PROJECT_DIR/build/$ARCH/bin" ]; then
-		for _bf in "$PROJECT_DIR/build/$ARCH/bin"/*; do
-			[ -f "$_bf" ] && ln -sf "$_bf" "$PROJECT_DIR/smoke_run/hostshare/bin/$(basename "$_bf")" 2>/dev/null || true
-		done
-	fi
+	_hs="$PROJECT_DIR/smoke_run/hostshare"
+	echo "Hello from Host through VirtIO-9P!" > "$_hs/hello_from_host.txt" 2>/dev/null ||
+		{ mkdir -p "$_hs"; echo "Hello from Host through VirtIO-9P!" > "$_hs/hello_from_host.txt"; }
+	_src="$PROJECT_DIR/build/$ARCH/rootfs/bin"
+	[ -d "$_src" ] || return 0
+	rm -rf "$_hs/bin"
+	mkdir -p "$_hs/bin"
+	for _bf in "$_src"/*; do
+		[ -f "$_bf" ] || continue
+		ln -f "$_bf" "$_hs/bin/${_bf##*/}" 2>/dev/null ||
+			cp -f "$_bf" "$_hs/bin/${_bf##*/}" 2>/dev/null || true
+	done
 }
 
 # Run QEMU and capture output
@@ -490,7 +509,7 @@ run_qemu() {
 			# check it ran, where killing from here counts them all as
 			# BLOCKED. The slow ones are the TLS handshakes and the in-guest
 			# build, which are silent for minutes on a loaded host.
-			stall_after=${STALL_TIMEOUT:-60}
+			stall_after=${STALL_TIMEOUT:-180}
 			while :; do
 				line_count=$(wc -l <"$log" | tr -d ' ')
 				if [ "$line_count" -gt "$reported_lines" ]; then

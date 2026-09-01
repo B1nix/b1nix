@@ -445,7 +445,12 @@ static usize g_task_cmdline_len[MAX_TASKS];
 static void *g_task_seccomp[MAX_TASKS];
 static int   g_task_nnp[MAX_TASKS];
 static inline struct task *T(usize i) {
-  return &g_task_chunks[i >> 6][i & 63];
+  if (i >= MAX_TASKS)
+    return 0;
+  struct task *chunk = g_task_chunks[i >> 6];
+  if (!chunk)
+    return 0;
+  return &chunk[i & 63];
 }
 
 /*
@@ -3325,7 +3330,7 @@ void scheduler_reap_dead_threads(void) {
   usize task_hwm = g_task_hwm;
   for (usize i = 0; i < task_hwm; i++) {
     struct task *t = T(i);
-    if (t == current_task) continue;
+    if (!t || t == current_task) continue;
     if (t->state != TASK_DEAD) continue;
     if (!task_is_thread(t)) continue;
     /* stack_released only says that the task's saved SP no longer names the

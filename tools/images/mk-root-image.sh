@@ -20,7 +20,7 @@ ROOTFS="$1"; IMAGE="$2"; SIZE_MB="$3"
 MKE2FS="${MKE2FS:-mke2fs}"
 DEBUGFS="${DEBUGFS:-debugfs}"
 
-# Stale by CONTENT, not by any timestamp in the tree.
+# Stale by what actually goes into the image, not by any directory timestamp.
 #
 # The test used to be "is anything under the staging root newer than the
 # image", which counts directories -- and a directory's mtime moves when an
@@ -30,19 +30,27 @@ DEBUGFS="${DEBUGFS:-debugfs}"
 # half a minute was CPU: the rest was the disk. On an SSD that is wear, paid
 # for nothing, on every build.
 #
-# So describe what actually goes in -- every path with its type, size, mode and
-# link target -- and rebuild only when that description changes. Contents are
-# covered because a changed file changes its size or its mtime; mtime is kept
-# in the manifest for files, where it means something, and left out for
-# directories, where it does not.
+# So: the set of paths (catches additions and deletions, directories included)
+# plus a -newer test restricted to files and symlinks (catches edits without
+# the directory false positive).
+#
+# This used to describe the tree with `find -printf`, which BSD find (macOS)
+# does not have. The manifest came out EMPTY, and an empty manifest compares
+# equal to the equally empty one already on disk -- so root.ext4 was written
+# once and then reported "up to date" forever, and every aarch64 lane booted
+# whatever rootfs happened to exist that first time. Hence the -s test below:
+# an empty manifest is never a match.
 MANIFEST="$IMAGE.manifest"
 current_manifest() {
-	(cd "$ROOTFS" && find . \( -type f -o -type l \) -printf '%p %y %s %m %T@ %l\n' \
-		2>/dev/null | LC_ALL=C sort)
-	(cd "$ROOTFS" && find . -type d -printf '%p d %m\n' 2>/dev/null | LC_ALL=C sort)
+	(cd "$ROOTFS" && find . \( -type f -o -type l -o -type d \) -print) |
+		LC_ALL=C sort
 }
-if [ "${ROOT_IMAGE_FORCE:-0}" != "1" ] && [ -f "$IMAGE" ] && [ -f "$MANIFEST" ] &&
-   current_manifest | cmp -s - "$MANIFEST"; then
+edited_since_image() {
+	(cd "$ROOTFS" && find . \( -type f -o -type l \) -newer "$IMAGE" -print) |
+		head -n 1
+}
+if [ "${ROOT_IMAGE_FORCE:-0}" != "1" ] && [ -f "$IMAGE" ] && [ -s "$MANIFEST" ] &&
+   current_manifest | cmp -s - "$MANIFEST" && [ -z "$(edited_since_image)" ]; then
 	printf 'up to date %s (%s)\n' "$IMAGE" "$(du -sh "$IMAGE" | cut -f1)"
 	exit 0
 fi
