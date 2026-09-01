@@ -15,6 +15,7 @@
 #include <b1nix/sysv_ipc.h>
 #include <b1nix/kmsg.h>
 #include <b1nix/sched.h>
+#include <b1nix/klog.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
@@ -4407,7 +4408,21 @@ void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks) {
  * IRQ can actually wake us. Drivers that block on I/O completion fall back to a
  * cooperative poll loop when this is false (early boot, IRQs-off callers). */
 int scheduler_can_block(void) {
-  return scheduler_started && current_task != 0 && interrupts_enabled();
+  /* "May I give up the CPU and expect to get it back?" -- which is what every
+   * caller uses this for, driver completion loops above all. A task that is not
+   * RUNNING must answer no: scheduler_yield republishes READY only for a
+   * RUNNING task, so yielding while BLOCKED switches the task out for good, and
+   * a loop that was relying on being rescheduled to check its own timeout never
+   * checks it again.
+   *
+   * Reachable from more places than it looks: scheduler_yield's prologue runs
+   * the thread and zombie reapers, and those close file handles, which write
+   * back through the filesystem to the block device -- all inheriting whatever
+   * state the caller had, including the BLOCKED a wait_prepare just published.
+   * Callers spin instead, bounded by their own timeouts, which is survivable
+   * where being stranded is not. */
+  return scheduler_started && current_task != 0 && interrupts_enabled() &&
+         current_task->state == TASK_RUNNING;
 }
 
 /* The waker does not touch the woken task's wait_chan or wake_tick.
@@ -4769,6 +4784,34 @@ static void serial_silence_watchdog(void) {
     console_write_hex64((u64)(usize)t->wait_chan);
     console_write(" ");
     console_write(t->name);
+    /* WHERE it is parked, which is the one thing every dump so far has left
+     * out. A task that is not on a CPU has its resume point in context.lr and
+     * its frame chain in context.fp, so a few frames of that chain say which
+     * kernel call each task stopped inside -- the difference between "blocked
+     * in poll" and "blocked in the socket receive path" is the whole
+     * investigation. Every dereference is bounds-checked against the task's own
+     * stack, so a corrupt frame pointer prints nothing instead of faulting the
+     * dump. */
+    if (t != current_task && t->stack) {
+      u64 lo = (u64)(usize)t->stack;
+      u64 hi = lo + KERNEL_STACK_SIZE;
+      u64 fp = t->context.fp;
+
+      console_write("\n      at 0x");
+      console_write_hex64(t->context.lr);
+      ksym_print(t->context.lr);
+      for (int d = 0; d < 14; d++) {
+        u64 *frame;
+
+        if (fp < lo || fp + 16 > hi || (fp & 7))
+          break;
+        frame = (u64 *)(usize)fp;
+        console_write("\n       <- 0x");
+        console_write_hex64(frame[1]);
+        ksym_print(frame[1]);
+        fp = frame[0];
+      }
+    }
     console_write("\n");
   }
 
@@ -5932,6 +5975,28 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               tlb_shootdown_poll();
             }
 
+            /* Reclaim RUNNING here, BEFORE any of the teardown below, not
+             * after it.
+             *
+             * This waitpid published TASK_BLOCKED to wait for a child. Having
+             * found one, it goes on to tear the child down -- and that teardown
+             * sleeps: vfs_close_handle flushes the page cache, which writes
+             * through ext4 to the block device, which waits for the request to
+             * complete. A yield anywhere in there switches this task out while
+             * it is still BLOCKED, and scheduler_yield only republishes READY
+             * for a RUNNING task, so it leaves with wait_chan == 0 and nothing
+             * in the kernel can ever wake it again.
+             *
+             * That is not hypothetical: it is what wedged the sys lane. init
+             * sat BLOCKED for ever with its resume point inside
+             * do_vblk_req's wait loop, the ext4 writeback of a reaped child's
+             * fd unfinished, and the whole machine idle behind it -- openrc,
+             * dropbear and the SSH test all waiting on an I/O that had no
+             * runnable task left to collect it. The call was already here, ten
+             * lines further down, on the other side of the sleeping part. */
+            if (may_block)
+              scheduler_waitpid_fast_return();
+
             int code = T(i)->exit_code;
             int child_id = T(i)->id;
             /* Accumulate child times in parent */
@@ -5985,8 +6050,6 @@ int scheduler_waitpid(usize pid, int *status, int options) {
             if (T(i) == current_task)
               panic("sched: freeing the kernel stack we are running on");
             kfree(T(i)->stack);
-            if (may_block)
-              scheduler_waitpid_fast_return();
             interrupts_enable();
             free_task_slot(T(i));
             if (status) {
@@ -6174,6 +6237,12 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
                 } else {
                   child->vma_list = 0;
                 }
+                /* RUNNING before the sleeping part, not after it -- same
+                 * reason as the other reap site above: closing the child's
+                 * handles writes back through the filesystem, and a yield
+                 * taken while this task is still BLOCKED strands it for good. */
+                if (may_block)
+                  scheduler_waitpid_fast_return();
                 {
                   int *fl = 0;
                   usize cap = 0;
@@ -6196,8 +6265,6 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
                 if (child == current_task)
                   panic("sched: freeing the kernel stack we are running on");
                 kfree(child->stack);
-                if (may_block)
-                  scheduler_waitpid_fast_return();
                 interrupts_enable();
                 free_task_slot(child);
 

@@ -274,6 +274,27 @@ static int do_vblk_req(struct vblk_mmio_instance *inst, u64 lba, u32 count,
     /* Give the CPU back while waiting once there is a scheduler to give it
      * to. Hard-spinning for the whole budget starved every other task on this
      * single-CPU port whenever the host was busy. */
+    /* Yielding a task that is not RUNNING strands it: scheduler_yield only
+     * republishes READY for a RUNNING task, so a caller that arrives here
+     * already BLOCKED is switched out with wait_chan == 0 and nothing can ever
+     * wake it -- not even this loop's own 10 s timeout, which needs the task to
+     * run again to be evaluated. Caught exactly that: init BLOCKED with its
+     * resume point inside this yield, the whole machine idle behind one
+     * unfinished ext4 writeback. Name the caller once. */
+    if (current_task && current_task->state != TASK_RUNNING) {
+      static volatile int reported;
+      if (!__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL)) {
+        console_write("virtio-blk-mmio: waiting in state ");
+        console_write_dec((u64)current_task->state);
+        console_write(" (not RUNNING) as '");
+        console_write(current_task->name ? current_task->name : "?");
+        console_write("' pid ");
+        console_write_dec((u64)current_task->id);
+        console_write(" chan=0x");
+        console_write_hex64((u64)(usize)current_task->wait_chan);
+        console_write(" — a yield here would strand it\n");
+      }
+    }
     if (scheduler_can_block())
       scheduler_yield();
   }
