@@ -96,6 +96,7 @@ struct nvme_device {
     char blk_name[16];
     u16 cid_counter;
     volatile int io_busy; // yield-safe I/O-path mutex (see nvme_io_lock)
+    volatile u64 io_owner; // pid holding io_busy, for the stall report
 
     /* M98: message-signalled completions. use_msix is set once the controller's
      * MSI-X table entry 0 is programmed with msix_vector; until then the driver
@@ -122,12 +123,27 @@ static usize nvme_controller_count;
  * tracking. Mirrors virtio_blk's and AHCI's busy-flag mutex: spin with
  * scheduler_yield() so no real spinlock is held across the DMA wait. */
 static void nvme_io_lock(struct nvme_device *dev) {
+    u64 waits = 0;
+
     while (__sync_lock_test_and_set(&dev->io_busy, 1)) {
+        /* A yield-spin on a flag nothing ever releases is indistinguishable
+         * from a wedged machine: the waiter stays READY, prints nothing, and
+         * the lane dies on the harness timeout with no evidence at all. Name
+         * the task that took it and never gave it back. */
+        if (++waits == 200000ULL) {
+            console_write("nvme: io mutex held by pid ");
+            console_write_dec(dev->io_owner);
+            console_write(" for too long; waiter pid ");
+            console_write_dec(current_task ? (u64)current_task->id : 0);
+            console_write("\n");
+        }
         scheduler_yield();
     }
+    dev->io_owner = current_task ? (u64)current_task->id : 0;
 }
 
 static void nvme_io_unlock(struct nvme_device *dev) {
+    dev->io_owner = 0;
     __sync_lock_release(&dev->io_busy);
 }
 
@@ -363,6 +379,31 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
                 cpu_relax();
             if (dev->io_cq[dev->io_cq_head].status != 0xFFFF)
                 break;
+            /* A completion that never arrives is an unbounded yield-poll: the
+             * task stays READY forever and the whole lane looks wedged with no
+             * evidence at all. Say who we are waiting for, once, with the state
+             * that distinguishes the three ways this ends: the controller
+             * faulted (CSTS.CFS), the command was never fetched (SQ tail vs a
+             * quiet controller), or a completion landed somewhere other than
+             * the head we are watching. */
+            if (++spins == 200000ULL) {
+                nvme_wait_note("io");
+                console_write("nvme: csts=0x");
+                console_write_hex32(dev->regs->csts);
+                console_write(" sq_tail=");
+                console_write_dec(dev->io_sq_tail);
+                console_write(" cq_head=");
+                console_write_dec(dev->io_cq_head);
+                console_write(" irq_hits=");
+                console_write_dec(dev->irq_hits);
+                console_write(" cq_status=");
+                for (u16 q = 0; q < dev->queue_size && q < 8; q++) {
+                    console_write("0x");
+                    console_write_hex32(dev->io_cq[q].status);
+                    console_write(" ");
+                }
+                console_write("\n");
+            }
             scheduler_yield();
         }
     }

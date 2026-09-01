@@ -68,13 +68,18 @@ run_test() {
     bin="$1"
     inst="$2"
 
-    # Prefer latest binary directly from host share if available
+    # Refresh the rootfs copy from the host share, then run it from its own
+    # path. The share exists so a rebuilt binary reaches the guest without
+    # repacking half a gigabyte of root.ext4 -- but EXECUTING off the 9P mount
+    # is not the same thing: m13_smoke, m24_stress and native_smoke all loaded
+    # from /mnt/host/bin and then emitted not one marker, not even their start
+    # line. Copying keeps the delivery path and drops the exec path, and leaves
+    # argv[0] as the canonical /bin/... the tests were written against.
     bname="${bin##*/}"
     if [ -x "/mnt/host/bin/$bname" ]; then
-        bin="/mnt/host/bin/$bname"
-    elif [ ! -x "$bin" ]; then
-        return
+        cp -f "/mnt/host/bin/$bname" "$bin" 2>/dev/null || bin="/mnt/host/bin/$bname"
     fi
+    [ -x "$bin" ] || return
 
     case "$inst" in
         sys) [ "$SMOKE_SYS" = "1" ] && "$bin" ;;

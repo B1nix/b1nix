@@ -4383,7 +4383,7 @@ static u64 syscall_sleep_timespec(const struct timespec *ts, u64 *ticks_asked) {
       break;
     u64 rest_ticks = (deadline_ns - now_ns) / tick_ns;
     if (!rest_ticks) {
-      cpu_relax();
+      scheduler_yield();
       continue;
     }
     /* Ask the scheduler to sleep and let IT decide whether this task may:

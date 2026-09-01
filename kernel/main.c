@@ -1821,7 +1821,7 @@ void kernel_main(usize arg0, usize arg1)
 	/* BSP idle loop. The BKL is fully retired (M28 #7): kernel entry runs
 	 * BKL-free and scheduler_yield no longer hands a lock across the context
 	 * switch, so the idle loop just yields and parks when there is no work. */
-	while (scheduler_task_count() > 1) {
+	while (1) {
 		int switched = scheduler_yield();
 		if (!switched) {
 #if defined(__x86_64__)
@@ -1830,53 +1830,5 @@ void kernel_main(usize arg0, usize arg1)
 			__asm__ volatile("msr daifclr, #2; wfi" : : : "memory");
 #endif
 		}
-#ifdef __aarch64__
-		/* This arch reports the end of a test instance from here, which means
-		 * waiting for every task to exit — but getty, dropbear and openrc are
-		 * daemons and never do. Whether the instance ever finished was
-		 * therefore decided by whether those happened to be gone, and when
-		 * they were not the harness saw silence, killed the instance, and
-		 * reported every check it had already passed as BLOCKED.
-		 *
-		 * Stop waiting once nothing is left but tasks that will not exit:
-		 * track how long the count has been unchanged and give up on it. The
-		 * tests have all run by then — this only bounds the shutdown wait. */
-		if (bootinfo_has_flag("b1nix.test=1")) {
-			extern volatile u64 g_last_console_tick;
-			u64 now = scheduler_get_uptime_ticks();
-			/* Gate on SILENCE, not on elapsed time: userspace tests are still
-			 * running when this loop is reached and a plain deadline truncates
-			 * them. Silence is exactly the signal the harness uses to decide an
-			 * instance has hung — acting on it here means the instance ends
-			 * itself and reports, instead of being killed with every check it
-			 * had already passed counted as BLOCKED. Shorter than the harness's
-			 * 120s so we always win the race. */
-			/* 110s was too tight for what this arch actually runs: the TLS
-			 * handshakes and the in-guest build are legitimately silent for
-			 * longer than that on a loaded host, and the instance ended in the
-			 * middle of the suite — the same tree produced a 66 KB log one run
-			 * and 222 KB the next, purely on host load. Still shorter than the
-			 * harness's own stall timer so this side always wins the race and
-			 * reports rather than being killed. */
-			if (g_last_console_tick &&
-			    now - g_last_console_tick > 28000 /* 280s of silence */) {
-				console_write("\nb1nix: ");
-				console_write_dec((u64)scheduler_task_count());
-				console_write(" task(s) still running after the tests "
-				              "(daemons) — ending the test instance\n");
-				break;
-			}
-		}
-#endif
 	}
-
-	k_info(NULL, "\nM6 network layer demo complete");
-#ifdef __aarch64__
-	/* aarch64 has no working rc script yet, so the kernel itself closes the
-	 * test instance here. x86_64 emits this marker from the rc run instead —
-	 * printing it here would end that instance before its tests ran. */
-	if (bootinfo_has_flag("b1nix.test=1"))
-		console_write("B1NIX-TEST: done\n");
-#endif
-	arch_halt();
 }

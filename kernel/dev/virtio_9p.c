@@ -120,7 +120,20 @@ static int init_one_9p_device(struct pci_device_info *pci) {
   cmd |= 0x0001; /* I/O space */
   cmd |= 0x0002; /* memory space */
   cmd |= 0x0004; /* bus master */
-  cmd &= (u16)~PCI_CMD_INTX_DISABLE;
+  /* This driver polls its virtqueue: it installs no interrupt handler and
+   * never reads the ISR. So INTx must stay DISABLED -- clearing that bit was
+   * arming a level-triggered line nothing would ever deassert.
+   *
+   * The line is shared (GIC 37 on QEMU virt, with virtio-gpu), so the effect
+   * was not confined to this device: every 9P completion left the line
+   * asserted, the CPU re-entered aarch64_irq_handler immediately, virtio-gpu's
+   * handler read its own clean ISR and correctly answered "not mine", and
+   * nothing acknowledged anything. Measured on the sys lane: ~155000
+   * unclaimed interrupts a second on the boot CPU against a correct 100 Hz
+   * timer tick on the other one, with handlers nested seven deep. The boot CPU
+   * stopped making forward progress at the first 9P access and the lane died
+   * on the harness stall timer with ~900 checks unrun. */
+  cmd |= PCI_CMD_INTX_DISABLE;
   pci_config_write16(pci->bus, pci->slot, pci->func, 0x04, cmd);
 
   u32 bar0 = pci_config_read32(pci->bus, pci->slot, pci->func, 0x10);

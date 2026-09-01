@@ -121,15 +121,7 @@ static inline u64 *phys_to_virt(u64 phys) { return (u64 *)(usize)phys; }
 static inline u64 virt_to_phys(void *ptr) { return (u64)(usize)ptr; }
 
 static u64 *get_l0_for_va(u64 va) {
-  /* AArch64 keeps the kernel text and MMIO window in the low address space;
-   * user ELFs (including ASLR placements) live far above it.  The old
-   * x86-style sign-bit test selected the current process table for kernel heap
-   * buffers.  Conversely, treating everything below the fixed interpreter
-   * base as kernel breaks ASLR user mappings around 0x500000000000. */
-  if (va >= 0x0000000040000000ULL && va < 0x0000007000000000ULL) {
-    return kernel_l0_virt;
-  }
-  if (current_task && current_task->pml4_phys) {
+  if (current_task && current_task->pml4_phys && va >= 0x0000000002000000ULL) {
     return phys_to_virt(current_task->pml4_phys);
   }
   return kernel_l0_virt;
