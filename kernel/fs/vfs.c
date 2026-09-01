@@ -1319,7 +1319,15 @@ u32 vfs_mounting_fs_id(void) { return g_mounting_fs_id; }
 static struct vfs_inode *alloc_inode(void) {
   struct vfs_inode *inode = vfs_alloc_inode();
   if (inode) {
-    inode->refcount = 0;
+    /* One reference: the node this inode is about to be attached to. Every
+     * caller here hangs the inode off a fresh vfs_node, and vfs_node_put()
+     * releases exactly one inode reference when that node is finally freed --
+     * so an inode born at 0 makes its own node's free an underflow. Only
+     * vfs_create_node() used to set this, which is why the panic came from the
+     * paths that build a node by hand (create/mkdir/mknod/symlink): a
+     * `rename(new, existing)` frees the target node and drops an inode
+     * reference nobody ever took. */
+    inode->refcount = 1;
     inode->fs_id = g_mounting_fs_id;
   }
   return inode;
@@ -5243,7 +5251,9 @@ int vfs_link(const char *target, const char *link_path) {
   }
 
   copy_path(new_node->name, VFS_NAME_MAX, name);
-  new_node->inode = target_node->inode;
+  /* A hard link is a second node over one inode, and each node releases one
+   * inode reference when it is freed -- so the second node has to take one. */
+  new_node->inode = vfs_inode_get(target_node->inode);
   new_node->inode->nlink++;
   new_node->parent = parent;
   {
@@ -5262,6 +5272,7 @@ int vfs_link(const char *target, const char *link_path) {
       parent->first_child = new_node->next_sibling;
       vfs_tree_write_release(_tlflags);
       new_node->inode->nlink--;
+      vfs_inode_put(new_node->inode); /* the ref taken just above */
       new_node->inode = 0;
       /* The fresh node was allocated with refcount 0; give it the reference
        * we are about to drop and mark it deleted so vfs_node_put's 0+deleted
