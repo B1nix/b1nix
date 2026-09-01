@@ -460,6 +460,37 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 	 * being written somewhere other than its own stack, which is the corruption
 	 * this branch has been chasing -- caught here, at the moment it happens,
 	 * rather than deduced from a garbled saved register three switches later. */
+	/* The same question for an EL1 exception, which is the half the EL0 check
+	 * cannot see. irq_el1/sync_el1 build their frame at whatever SP_EL1 holds,
+	 * so if SP is already on somebody else's stack the frame lands there and
+	 * overwrites live locals -- which is how `index` in pick_next_task came to
+	 * read 0x100000090 (144, with bit 32 set) out of its own frame slot. Catch
+	 * the first exception taken on a foreign stack, while the task table and
+	 * the flight recorder still describe how it got there. */
+	if (!from_el0 && current_task && current_task->stack &&
+	    current_task->kernel_stack_ptr) {
+		u64 sp_now = (u64)(usize)frame;
+		u64 own_lo = (u64)(usize)current_task->stack;
+		u64 own_hi = current_task->kernel_stack_ptr;
+
+		if (sp_now < own_lo || sp_now > own_hi) {
+			console_write("EL1-FOREIGN-STACK: pid ");
+			console_write_dec((u64)current_task->id);
+			console_write(" name=");
+			console_write(current_task->name ? current_task->name : "(none)");
+			console_write(" sp=0x");
+			console_write_hex64(sp_now);
+			console_write(" own=0x");
+			console_write_hex64(own_lo);
+			console_write("..0x");
+			console_write_hex64(own_hi);
+			console_write(" elr=0x");
+			console_write_hex64(frame->elr);
+			console_write("\n");
+			panic("EL1 exception taken on another task's kernel stack");
+		}
+	}
+
 	if (from_el0 && current_task && current_task->kernel_stack_ptr) {
 		u64 frame_top = (u64)(usize)frame + sizeof(*frame);
 		/* Two questions, and the weaker one is the interesting one.

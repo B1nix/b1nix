@@ -521,9 +521,29 @@ struct runqueue *sched_global_rq(void) { return &g_global_rq; }
  * ~256 KiB BSS for slots that may never run. Pointer table costs 512 B. */
 static struct task *g_ap_idle_tasks[MAX_CPUS];
 
+static struct task *find_unused_task(void);
+static usize task_index(const struct task *task);
+extern u64 g_task_affinity_fwd_unused;
+
 struct task *scheduler_setup_ap_idle(int cpu, u64 kstack_top) {
   if (cpu < 0 || cpu >= MAX_CPUS)
     return 0;
+  /* Its own allocation, deliberately outside the task table.
+   *
+   * Putting these in the table was tried and reverted: a slot is visible to
+   * every picker, and scheduler_yield marks a task READY when it switches away
+   * from it, so an idle task became schedulable material for other CPUs. Even
+   * pinned by an affinity mask the suite collapsed -- 123 passed, then 8,
+   * against ~750 -- so whatever else reads the table does not tolerate them
+   * either.
+   *
+   * The known cost of staying outside it: task_index() answers 0 for a task it
+   * cannot find in a chunk, so every idle task ALIASES SLOT 0 (the boot task)
+   * in every per-task side table -- g_task_pass, g_task_xsave, g_task_nice,
+   * g_task_affinity, g_task_syscall. That is a real cross-CPU hazard, and it is
+   * why every dump of one reads `pid 0 name=ap-idle`, indistinguishable from
+   * the boot task. Fixing it means giving these tasks their own index space,
+   * not borrowing the table's. */
   if (!g_ap_idle_tasks[cpu]) {
     g_ap_idle_tasks[cpu] = kzalloc(sizeof(struct task));
     if (!g_ap_idle_tasks[cpu]) return 0;

@@ -797,6 +797,22 @@ IOMMU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-iommu-$ARCH.log"
 AMDVI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-amdvi-$ARCH.log"
 RASPI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-raspi-$ARCH.log"
 
+# Prune leftovers from earlier runs.
+#
+# Every per-lane disk image is named with the runner's PID (see disk_img), so a
+# run never reuses the previous run's files -- it just adds another full set
+# beside them, and half a gigabyte a time adds up until the disk is gone. The
+# same goes for the QEMU logs of lanes that this invocation is not running: a
+# wedged instance can leave a multi-gigabyte log behind.
+#
+# An hour is well clear of any single run, so this cannot touch the files of a
+# concurrent suite, and every image is rebuilt from scratch by _mkimg anyway.
+if [ -d "$PROJECT_DIR/smoke_run" ]; then
+	find "$PROJECT_DIR/smoke_run" -maxdepth 1 -type f \
+		\( -name '*.img' -o -name '*.pcap' -o -name '*.log' \) \
+		-mmin +60 -delete 2>/dev/null || true
+fi
+
 # Start every lane's log empty.
 #
 # Without this, a lane that never launches leaves the previous run's log in

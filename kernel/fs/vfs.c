@@ -1336,6 +1336,24 @@ void vfs_inode_put(struct vfs_inode *inode) {
     return;
   int new_ref = __atomic_sub_fetch(&inode->refcount, 1, __ATOMIC_RELAXED);
   if (new_ref < 0) {
+    /* Name the inode. "refcount underflow" on its own says a reference was
+     * dropped that nobody held, but not which object, and the same call site
+     * runs for every file in the system. */
+    console_write("vfs: inode underflow ino=");
+    console_write_dec(inode->ino);
+    console_write(" fs_id=");
+    console_write_dec((u64)inode->fs_id);
+    console_write(" type=");
+    console_write_dec((u64)inode->type);
+    console_write(" nlink=");
+    console_write_dec((u64)inode->nlink);
+    console_write(" size=");
+    console_write_dec((u64)inode->size);
+    console_write(" refcount=");
+    console_write_dec((u64)(u32)new_ref);
+    console_write(" caller=0x");
+    console_write_hex64((u64)(usize)__builtin_return_address(0));
+    console_write("\n");
     panic("vfs: inode refcount underflow");
   }
   if (new_ref == 0 && inode->nlink == 0) {

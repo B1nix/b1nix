@@ -35,6 +35,12 @@
  * express the wait in time, not in a count of port reads that means something
  * different on every machine — so it needs to be able to read a clock. */
 EXPORT_SYMBOL(arch_tsc_monotonic_ns);
+/* A module compiled with the stack protector needs the runtime the kernel
+ * provides (see kernel/lib/stdlib.c). */
+extern unsigned long __stack_chk_guard;
+void __stack_chk_fail(void);
+EXPORT_SYMBOL(__stack_chk_guard);
+EXPORT_SYMBOL(__stack_chk_fail);
 EXPORT_SYMBOL(memcpy);
 EXPORT_SYMBOL(memset);
 EXPORT_SYMBOL(memcmp);

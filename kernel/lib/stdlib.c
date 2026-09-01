@@ -1,3 +1,4 @@
+#include <b1nix/panic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <b1nix/syscall.h>
@@ -87,3 +88,25 @@ u64 __udivmoddi4(u64 num, u64 den, u64 *rem) {
 
 u64 __udivdi3(u64 num, u64 den) { return __udivmoddi4(num, den, NULL); }
 u64 __umoddi3(u64 num, u64 den) { u64 rem; __udivmoddi4(num, den, &rem); return rem; }
+
+
+/* Stack-protector runtime.
+ *
+ * The kernel is built -fno-stack-protector, so nothing should reference these
+ * -- but "should" is a property of every translation unit's command line, and
+ * the build has more than one path that compiles kernel sources (ports, module
+ * rules, the analyzer pass). A single object built with the protector on turns
+ * into `ld.lld: undefined symbol: __stack_chk_guard` at the very end of a
+ * multi-minute build, which is a bad way to find out. Provide the runtime
+ * instead: it costs two symbols, and if a guard ever does fire it reports a
+ * smashed stack by name rather than failing to link.
+ *
+ * The canary is a fixed value: this kernel has no entropy source at the point
+ * the first guarded frame could run, and a predictable canary still catches the
+ * accidental overflows this is here for. */
+unsigned long __stack_chk_guard = 0xC0FFEE5713579BDFUL;
+
+void __stack_chk_fail(void);
+void __stack_chk_fail(void) {
+  panic("stack smashing detected");
+}
