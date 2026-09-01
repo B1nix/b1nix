@@ -884,6 +884,14 @@ void kernel_main(usize arg0, usize arg1)
 	}
 #endif
 	virtio_input_init(); /* absolute pointer (virtio-tablet) — grab-free mouse */
+
+
+
+
+
+
+
+
 	fb_dev_init(); /* M47: /dev/fb0 mmap-able framebuffer (needs fb_console) */
 	nbd_init();    /* /dev/nbd0.. present and empty until a client attaches */
 	md_init();     /* /dev/md0.. present and empty until raidautorun fills one */

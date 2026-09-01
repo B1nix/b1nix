@@ -4397,7 +4397,7 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
  * after it in the lane) then produced no dump at all and had to be chased
  * blind. Output resuming means the instance moved on, so the budget resets. */
 #define SILENCE_WATCHDOG_TICKS (60 * 100) /* 60s at the 100 Hz timer tick */
-#define SILENCE_WATCHDOG_MAX_DUMPS 3
+#define SILENCE_WATCHDOG_MAX_DUMPS 2
 extern volatile u64 g_console_write_seq;
 
 static const char *task_state_name(enum task_state st) {
@@ -4553,7 +4553,12 @@ static void serial_silence_watchdog(void) {
   console_write(")\n");
 
   last_seq = g_console_write_seq;
+
+  if (dumps >= SILENCE_WATCHDOG_MAX_DUMPS) {
+    panic("watchdog: deadlock or hang detected (silence for >120s)");
+  }
 }
+
 
 void scheduler_on_timer_tick(void) {
   if (!scheduler_started || current_task == 0) {

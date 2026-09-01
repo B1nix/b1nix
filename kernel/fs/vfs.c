@@ -211,6 +211,29 @@ static usize mount_root_refs(struct vfs_node *root) {
   return n;
 }
 
+void vfs_dump_mounts(void) {
+  console_write("\n--- Mounted Filesystems ---\n");
+  if (!mounts || mount_slots == 0) {
+    console_write("  (no mounts initialized)\n");
+    console_write("--- End Mounts ---\n");
+    return;
+  }
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mounts[i].used) continue;
+    console_write("  ");
+    console_write(mounts[i].target[0] ? mounts[i].target : "/");
+    console_write(" on ");
+    console_write(mounts[i].fstype[0] ? mounts[i].fstype : "unknown");
+    console_write(" (dev=");
+    console_write(mounts[i].source[0] ? mounts[i].source : "none");
+    console_write(", flags=0x");
+    console_write_hex64(mounts[i].flags);
+    console_write(")\n");
+  }
+  console_write("--- End Mounts ---\n");
+}
+
+
 static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   if (!node)
     return 0;
@@ -1152,6 +1175,11 @@ static void vfs_dir_changed(struct vfs_node *dir) {
 }
 
 static usize node_count = 0;
+
+usize vfs_active_node_count(void) {
+  return node_count;
+}
+
 static struct vfs_node *root_node = 0;
 static char tty_line[TTY_INPUT_SIZE];
 static usize tty_line_pos;
@@ -1306,8 +1334,11 @@ struct vfs_inode *vfs_inode_get(struct vfs_inode *inode) {
 void vfs_inode_put(struct vfs_inode *inode) {
   if (!inode)
     return;
-  if (__atomic_sub_fetch(&inode->refcount, 1, __ATOMIC_RELAXED) == 0 &&
-      inode->nlink == 0) {
+  int new_ref = __atomic_sub_fetch(&inode->refcount, 1, __ATOMIC_RELAXED);
+  if (new_ref < 0) {
+    panic("vfs: inode refcount underflow");
+  }
+  if (new_ref == 0 && inode->nlink == 0) {
     page_cache_invalidate_inode(inode);
     /* IC-1: drop any icache entry that maps to this inode BEFORE freeing it,
      * so a later icache_get(fs_id, ino) can't resurrect a dangling pointer
@@ -1352,8 +1383,11 @@ struct vfs_node *vfs_node_get(struct vfs_node *node) {
 void vfs_node_put(struct vfs_node *node) {
   if (!node)
     return;
-  if (__atomic_sub_fetch(&node->refcount, 1, __ATOMIC_RELAXED) == 0 &&
-      node->deleted) {
+  int new_ref = __atomic_sub_fetch(&node->refcount, 1, __ATOMIC_RELAXED);
+  if (new_ref < 0) {
+    panic("vfs: node refcount underflow");
+  }
+  if (new_ref == 0 && node->deleted) {
     if (node->inode && node->inode->release_cb) {
       node->inode->release_cb(node);
     }
@@ -1366,6 +1400,7 @@ void vfs_node_put(struct vfs_node *node) {
     __atomic_sub_fetch(&node_count, 1, __ATOMIC_RELAXED);
   }
 }
+
 
 /* Peel the first component off `path`.
  *
@@ -1964,10 +1999,9 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
       return ERR_PTR(-ENAMETOOLONG);
     }
     if (part[0] == '\0') {
-      struct vfs_node *ret = current;
-      vfs_node_put(current);
-      return ret;
+      return current;
     }
+
 
     if (current->inode && current->inode->lookup_cb &&
         current->inode->lookup_refresh)
@@ -2055,9 +2089,10 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         child->inode->flags = flags;
         vfs_update_times(child->inode, VFS_MTIME | VFS_CTIME);
       }
-      struct vfs_node *ret = child;
+      struct vfs_node *ret = vfs_node_get(child);
       vfs_node_put(current);
       return ret;
+
     } else {
       if (!child) {
         child = alloc_node();
@@ -2312,16 +2347,15 @@ static void copy_path(char *dst, usize dst_size, const char *src) {
 }
 
 void vfs_handle_release(struct vfs_handle *h) {
-  if (!h || h->used != 1 || h->refcount <= 0)
+  if (!h || h->used != 1)
     return;
-  /* SMP-safe dec-and-test: a fork'd parent and child closing a shared socket
-   * fd on different CPUs both release the same handle. A non-atomic
-   * "if (refcount > 1) refcount--" lost the update under that race, so both
-   * fell through to ->release → kfree(socket_state) twice → kheap double-free
-   * ("bucket_unlink ... magic 0x...dead110c"). The atomic sub-and-test makes
-   * exactly one releaser observe 0 and run teardown. */
-  if (__atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL) > 0)
+  int new_ref = __atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL);
+  if (new_ref < 0) {
+    panic("vfs: handle refcount underflow");
+  }
+  if (new_ref > 0)
     return;
+
 
   h->used = 0;
   if (h->ops && h->ops->release) {
@@ -3567,7 +3601,6 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   } else {
     if ((flags & B1NIX_O_CREAT) && (flags & B1NIX_O_EXCL)) {
       res = -EEXIST;
-      vfs_node_put(node);
       goto out;
     }
   }
@@ -3593,12 +3626,10 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   const int path_only = (flags & B1NIX_O_PATH) ? 1 : 0;
   if (!follow_final && node->inode->type == VFS_SYMLINK && !path_only) {
     res = -ELOOP;
-    vfs_node_put(node);
     goto out;
   }
   if ((flags & B1NIX_O_DIRECTORY) && node->inode->type != VFS_DIRECTORY) {
     res = -ENOTDIR;
-    vfs_node_put(node);
     goto out;
   }
   if (path_only)
@@ -3607,7 +3638,6 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   if (node->inode->type == VFS_DIRECTORY &&
       (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))) {
     res = -EISDIR;
-    vfs_node_put(node);
     goto out;
   }
 
@@ -3627,14 +3657,12 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
     struct vfs_mount_entry *wmnt = vfs_get_mount_for_node(node);
     if (wmnt && (wmnt->flags & MS_RDONLY)) {
       res = -EROFS;
-      vfs_node_put(node);
       goto out;
     }
   }
 
   res = vfs_check_access(node, access_mask);
   if (res != 0) {
-    vfs_node_put(node);
     goto out;
   }
 
@@ -3652,16 +3680,15 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
     /* O_TRUNC requires write permission regardless of open mode */
     res = vfs_check_access(node, W_OK);
     if (res != 0) {
-      vfs_node_put(node);
       goto out;
     }
     /* M109 chattr: same rule as ftruncate — neither an immutable nor an
      * append-only file may be emptied by an open(). */
     if (node->inode->attr & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND)) {
       res = -EPERM;
-      vfs_node_put(node);
       goto out;
     }
+
     vfs_inode_lock(node->inode);
     /* Drop cached pages first: dirty pages of the discarded content must not
      * be written back, and a later re-grow must read zeros, not stale data. */

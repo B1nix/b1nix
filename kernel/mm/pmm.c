@@ -1352,15 +1352,12 @@ void pmm_free_frame(u64 frame) {
    * time — two owners of the same physical page, which surfaces much later as
    * unrelated memory turning to garbage. Name the caller. */
   if (was_zero) {
-    static unsigned zr_reported;
-    if (zr_reported < 8) {
-      console_write("pmm_free_frame: frame 0x");
-      console_write_hex64(frame);
-      console_write(" was already unreferenced — refusing the free\n");
-      zr_reported++;
-    }
-    return; /* never re-park a frame we do not own */
+    console_write("pmm_free_frame: frame 0x");
+    console_write_hex64(frame);
+    console_write(" was already unreferenced — double free!\n");
+    panic("pmm_free_frame: double-free of physical frame");
   }
+
 
   if (!now_zero) return;  /* still referenced elsewhere (CoW sibling) */
 

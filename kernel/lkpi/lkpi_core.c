@@ -10,7 +10,9 @@
 #include <b1nix/iommu.h>
 #include <b1nix/memtype.h>
 #include <b1nix/mm.h>
+#include <b1nix/klog.h>
 #include <b1nix/sched.h>
+
 #include <lkpi/dma-mapping.h>
 #include <lkpi/io.h>
 #include <lkpi/lock.h>
@@ -960,11 +962,16 @@ void lkpi_mutex_unlock(struct lkpi_mutex *m)
 		return;
 	u64 flags;
 	spin_lock_irqsave(&m->guard, &flags);
+	if (!m->locked || m->owner != lkpi_current_id()) {
+		spin_unlock_irqrestore(&m->guard, flags);
+		panic("mutex_unlock: unlocking unheld mutex or caller is not lock owner");
+	}
 	m->locked = 0;
 	m->owner = 0;
 	spin_unlock_irqrestore(&m->guard, flags);
 	scheduler_wake_all(m);
 }
+
 
 int lkpi_mutex_is_locked_by_current(struct lkpi_mutex *m)
 {

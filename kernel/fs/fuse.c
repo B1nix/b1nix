@@ -43,3 +43,5 @@ void fuse_init(void) {
   BOOTMARK(44); /* node published */
   klog_info("FUSE: /dev/fuse character device registered (Ring 3 user-space filesystems enabled)\n");
 }
+
+

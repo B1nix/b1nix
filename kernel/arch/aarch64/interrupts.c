@@ -368,6 +368,76 @@ void aarch64_irq_handler(struct interrupt_frame *frame)
 #define EC_DATA_ABORT_SAME  0x25
 #define EC_BRK              0x3c
 
+static void decode_aarch64_exception(u64 esr, u64 elr, u64 far)
+{
+	u32 ec = (u32)((esr >> 26) & 0x3f);
+	u32 iss = (u32)(esr & 0x1ffffff);
+	u32 dfsc = iss & 0x3f;
+	int wnr = (iss >> 6) & 1;
+
+	console_write("\n=== AArch64 Exception Decode ===\n");
+
+	const char *ec_name = "Unknown Reason";
+	switch (ec) {
+	case 0x00: ec_name = "Unknown Reason"; break;
+	case 0x01: ec_name = "Trapped WFI/WFE Instruction"; break;
+	case 0x0e: ec_name = "Illegal Execution State"; break;
+	case 0x15: ec_name = "SVC (Syscall)"; break;
+	case 0x20: ec_name = "Instruction Abort (User EL0)"; break;
+	case 0x21: ec_name = "Instruction Abort (Kernel EL1)"; break;
+	case 0x22: ec_name = "PC Alignment Fault"; break;
+	case 0x24: ec_name = "Data Abort (User EL0)"; break;
+	case 0x25: ec_name = "Data Abort (Kernel EL1 Crash)"; break;
+	case 0x26: ec_name = "SP Alignment Fault"; break;
+	case 0x3c: ec_name = "BRK Instruction (Breakpoint)"; break;
+	}
+
+	console_write("  Type: ");
+	console_write(ec_name);
+	console_write(" (EC=0x");
+	console_write_hex64(ec);
+	console_write(" ESR=0x");
+	console_write_hex64(esr);
+	console_write(")\n");
+
+	if (ec == 0x20 || ec == 0x21 || ec == 0x24 || ec == 0x25) {
+		const char *fault_desc = "Unknown Fault";
+		switch (dfsc & 0x3c) {
+		case 0x00: fault_desc = "Address Size Fault"; break;
+		case 0x04: fault_desc = "Translation Fault (Page Unmapped/Missing)"; break;
+		case 0x08: fault_desc = "Access Flag Fault"; break;
+		case 0x0c: fault_desc = "Permission Fault (Access Denied / Read-Only)"; break;
+		}
+		if (dfsc == 0x10) fault_desc = "Synchronous External Abort";
+		else if (dfsc == 0x21) fault_desc = "Alignment Fault";
+
+		console_write("  Cause: ");
+		console_write(fault_desc);
+		console_write(" (DFSC=0x");
+		console_write_hex64(dfsc);
+		console_write(")");
+
+		if (ec == 0x24 || ec == 0x25) {
+			console_write(wnr ? " [Write]" : " [Read]");
+		}
+		console_write("\n");
+	}
+
+	console_write("  Fault Address (FAR): 0x");
+	console_write_hex64(far);
+	describe_address(far);
+	console_write("\n");
+
+	console_write("  Crash Site (ELR): 0x");
+	console_write_hex64(elr);
+	ksym_print(elr);
+	console_write("\n");
+
+	dump_code_around_pc(elr);
+}
+
+
+
 void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 {
 	struct interrupt_frame *frame = (struct interrupt_frame *)saved_regs;
@@ -545,26 +615,26 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 		console_write("\n");
 	}
 
-	console_write("\nException!\nESR: ");
-	console_write_hex64(esr);
-	console_write("\nELR: ");
-	console_write_hex64(elr);
-	console_write("\nFAR: ");
-	console_write_hex64(far);
-	console_write("\n");
+	decode_aarch64_exception(esr, elr, far);
+
+	console_write("\nRegisters (x0..x30):\n");
 	for (int i = 0; i < 30; i += 2) {
-		console_write("x");
+		console_write("  x");
 		console_write_dec((u32)i);
-		console_write("=");
+		console_write("=0x");
 		console_write_hex64(saved_regs[i]);
-		console_write(" x");
+		console_write("  x");
 		console_write_dec((u32)(i + 1));
-		console_write("=");
+		console_write("=0x");
 		console_write_hex64(saved_regs[i + 1]);
 		console_write("\n");
 	}
-	console_write("lr(x30)=");
+	console_write("  lr(x30)=0x");
 	console_write_hex64(saved_regs[30]);
+	ksym_print(saved_regs[30]);
 	console_write("\n");
-	panic("unhandled synchronous exception");
+
+	panic_at("unhandled synchronous exception", __FILE__, __LINE__);
 }
+
+

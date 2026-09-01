@@ -40,8 +40,10 @@ fi
 # convention (usr/lib, usr/include), so bridge the two with symlinks rather
 # than duplicating the flat install under usr/.
 mkdir -p "$MUSL_SYSROOT/usr"
-ln -sfn ../lib "$MUSL_SYSROOT/usr/lib"
-ln -sfn ../include "$MUSL_SYSROOT/usr/include"
+[ -e "$MUSL_SYSROOT/usr/lib" ] || ln -sfn ../lib "$MUSL_SYSROOT/usr/lib" 2>/dev/null || true
+[ -e "$MUSL_SYSROOT/usr/include" ] || ln -sfn ../include "$MUSL_SYSROOT/usr/include" 2>/dev/null || true
+
+
 
 [ -f "$MUSL_SYSROOT/usr/lib/libc.a" ] || { echo "musl libc not built — run build-musl.sh first" >&2; exit 1; }
 
@@ -194,14 +196,16 @@ echo "Linking shared libc++abi.so.1..."
     --version-script "$VSCRIPT" \
     --allow-shlib-undefined
 rm -f "$VSCRIPT"
-ln -sf libc++abi.so.1 "$MUSL_SYSROOT/usr/lib/libc++abi.so"
+rm -f "$MUSL_SYSROOT/usr/lib/libc++abi.so" 2>/dev/null || true
+ln -s libc++abi.so.1 "$MUSL_SYSROOT/usr/lib/libc++abi.so" 2>/dev/null || true
 
 echo "Linking shared libc++.so.1..."
 "$LD_BIN" -shared --hash-style=sysv -soname libc++.so.1 --eh-frame-hdr -o "$CXX_SO" \
     --whole-archive "$MUSL_SYSROOT/usr/lib/libc++.a" --no-whole-archive \
     -L"$MUSL_SYSROOT/usr/lib" -l:libc++abi.so.1 -l:libc.so "$CRT_A" \
     --allow-shlib-undefined
-ln -sf libc++.so.1 "$MUSL_SYSROOT/usr/lib/libc++.so"
+rm -f "$MUSL_SYSROOT/usr/lib/libc++.so" 2>/dev/null || true
+ln -s libc++.so.1 "$MUSL_SYSROOT/usr/lib/libc++.so" 2>/dev/null || true
 
 # Rewrite absolute-path DT_NEEDED entries to bare basenames.
 # ld.lld with `-l:libc.so` (full filename) records the *resolved input path*
@@ -254,8 +258,14 @@ done
 # stage to rootfs
 for d in "$PROJECT_DIR/build/$B1NIX_ARCH/rootfs/lib"; do
     mkdir -p "$d"
-    cp -f "$ABI_SO" "$d/libc++abi.so.1"; ln -sf libc++abi.so.1 "$d/libc++abi.so"
-    cp -f "$CXX_SO"  "$d/libc++.so.1";   ln -sf libc++.so.1    "$d/libc++.so"
+    cp -f "$ABI_SO" "$d/libc++abi.so.1"
+    rm -f "$d/libc++abi.so" 2>/dev/null || true
+    ln -s libc++abi.so.1 "$d/libc++abi.so" 2>/dev/null || true
+    cp -f "$CXX_SO"  "$d/libc++.so.1"
+    rm -f "$d/libc++.so" 2>/dev/null || true
+    ln -s libc++.so.1    "$d/libc++.so" 2>/dev/null || true
 done
+
+
 
 echo "build-libcxx-musl.sh: libc++ built and installed successfully for musl!"

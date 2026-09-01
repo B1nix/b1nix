@@ -1317,10 +1317,15 @@ void kfree(void *ptr) {
 
   struct kheap_block *block =
       (struct kheap_block *)((u8 *)ptr - KHEAP_HEADER_SIZE);
+  if (block->magic == KHEAP_FREED_MAGIC) {
+    heap_release(flags);
+    panic("kheap: double-free detected on block");
+  }
   if (block->magic != KHEAP_MAGIC) {
     heap_release(flags);
-    return;
+    panic("kheap: freeing unallocated or corrupted block");
   }
+
 #if KHEAP_REUSE_MIN_SIZE > 0
   if (block->size < KHEAP_REUSE_MIN_SIZE) {
     heap_release(flags);

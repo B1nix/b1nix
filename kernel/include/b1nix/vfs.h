@@ -461,7 +461,11 @@ struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
                               void *data, usize size, u32 flags);
 struct vfs_node *vfs_node_get(struct vfs_node *node);
 void vfs_node_put(struct vfs_node *node);
+usize vfs_active_node_count(void);
+void vfs_dump_mounts(void);
 u32 vfs_mounting_fs_id(void);
+
+
 
 struct vfs_node *vfs_create_node(enum vfs_node_type type);
 void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child);

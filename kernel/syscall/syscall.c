@@ -5794,6 +5794,55 @@ void syscall_prof_dump(void) {
   console_write("\n");
 }
 
+struct syscall_flight_entry {
+    u32 pid;
+    u32 sysno;
+    u64 arg0, arg1, arg2;
+    u64 ret;
+    int in_flight;
+    char comm[16];
+};
+
+#define SYSCALL_FLIGHT_SIZE 8
+static struct syscall_flight_entry g_syscall_flight[SYSCALL_FLIGHT_SIZE];
+static u32 g_syscall_flight_head = 0;
+
+void dump_recent_syscalls(void) {
+    console_write("\n--- Recent Syscall Flight Recorder ---\n");
+    u32 head = __atomic_load_n(&g_syscall_flight_head, __ATOMIC_RELAXED);
+    int count = 0;
+    for (int i = 0; i < SYSCALL_FLIGHT_SIZE; i++) {
+        u32 idx = (head + i) % SYSCALL_FLIGHT_SIZE;
+        struct syscall_flight_entry *e = &g_syscall_flight[idx];
+        if (e->pid == 0 && e->sysno == 0) continue;
+        count++;
+        console_write("  pid=");
+        console_write_dec((u64)e->pid);
+        console_write(" ('");
+        console_write(e->comm[0] ? e->comm : "none");
+        console_write("') sys=");
+        console_write_dec((u64)e->sysno);
+        console_write(" args=(0x");
+        console_write_hex64(e->arg0);
+        console_write(", 0x");
+        console_write_hex64(e->arg1);
+        console_write(", 0x");
+        console_write_hex64(e->arg2);
+        console_write(")");
+        if (e->in_flight) {
+            console_write(" -> [IN-FLIGHT / CRASHED]\n");
+        } else {
+            console_write(" -> ret=0x");
+            console_write_hex64(e->ret);
+            console_write("\n");
+        }
+    }
+    if (!count) {
+        console_write("  (no recorded syscalls)\n");
+    }
+    console_write("--- End Syscall History ---\n");
+}
+
 u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                           u64 arg4, u64 arg5, struct interrupt_frame *frame) {
   if (!frame)
@@ -5808,12 +5857,32 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
 #else
     task_set_syscall_entry(current_task, frame->rip, frame->rbp);
 #endif
+
+  u32 s_idx = __atomic_fetch_add(&g_syscall_flight_head, 1, __ATOMIC_RELAXED) % SYSCALL_FLIGHT_SIZE;
+  struct syscall_flight_entry *entry = &g_syscall_flight[s_idx];
+  entry->pid = current_task ? current_task->id : 0;
+  entry->sysno = (u32)number;
+  entry->arg0 = arg0;
+  entry->arg1 = arg1;
+  entry->arg2 = arg2;
+  entry->in_flight = 1;
+  if (current_task && current_task->name) {
+    strncpy(entry->comm, current_task->name, sizeof(entry->comm) - 1);
+    entry->comm[sizeof(entry->comm) - 1] = '\0';
+  } else {
+    entry->comm[0] = '\0';
+  }
+
   sched_acct_enter_kernel();
   u64 r = syscall_dispatch_traced(number, arg0, arg1, arg2, arg3, arg4, arg5,
                                   frame);
   sched_acct_leave_kernel();
+
+  entry->ret = r;
+  entry->in_flight = 0;
   return r;
 }
+
 
 static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
                                    u64 arg3, u64 arg4, u64 arg5,
