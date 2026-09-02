@@ -17,10 +17,20 @@
 set -eu
 
 ROOTFS="$1"; IMAGE="$2"; SIZE_MB="$3"
+
+# Absolute, because the staleness test below runs `find` from INSIDE $ROOTFS.
+# With the relative path make passes ("build/x86_64/root.ext4") that find said
+# "No such file or directory", printed nothing, and the empty output read as
+# "nothing was edited" -- so an image whose files had all changed was reported
+# up to date, and the guest booted the previous build's modules.
+case "$IMAGE" in
+	/*) ;;
+	*) IMAGE="$(pwd)/$IMAGE" ;;
+esac
 MKE2FS="${MKE2FS:-mke2fs}"
 DEBUGFS="${DEBUGFS:-debugfs}"
 
-# Stale by CONTENT, not by any timestamp in the tree.
+# Stale by what actually goes into the image, not by any directory timestamp.
 #
 # The test used to be "is anything under the staging root newer than the
 # image", which counts directories -- and a directory's mtime moves when an
@@ -30,19 +40,27 @@ DEBUGFS="${DEBUGFS:-debugfs}"
 # half a minute was CPU: the rest was the disk. On an SSD that is wear, paid
 # for nothing, on every build.
 #
-# So describe what actually goes in -- every path with its type, size, mode and
-# link target -- and rebuild only when that description changes. Contents are
-# covered because a changed file changes its size or its mtime; mtime is kept
-# in the manifest for files, where it means something, and left out for
-# directories, where it does not.
+# So: the set of paths (catches additions and deletions, directories included)
+# plus a -newer test restricted to files and symlinks (catches edits without
+# the directory false positive).
+#
+# This used to describe the tree with `find -printf`, which BSD find (macOS)
+# does not have. The manifest came out EMPTY, and an empty manifest compares
+# equal to the equally empty one already on disk -- so root.ext4 was written
+# once and then reported "up to date" forever, and every aarch64 lane booted
+# whatever rootfs happened to exist that first time. Hence the -s test below:
+# an empty manifest is never a match.
 MANIFEST="$IMAGE.manifest"
 current_manifest() {
-	(cd "$ROOTFS" && find . \( -type f -o -type l \) -printf '%p %y %s %m %T@ %l\n' \
-		2>/dev/null | LC_ALL=C sort)
-	(cd "$ROOTFS" && find . -type d -printf '%p d %m\n' 2>/dev/null | LC_ALL=C sort)
+	(cd "$ROOTFS" && find . \( -type f -o -type l -o -type d \) -print) |
+		LC_ALL=C sort
 }
-if [ "${ROOT_IMAGE_FORCE:-0}" != "1" ] && [ -f "$IMAGE" ] && [ -f "$MANIFEST" ] &&
-   current_manifest | cmp -s - "$MANIFEST"; then
+edited_since_image() {
+	(cd "$ROOTFS" && find . \( -type f -o -type l \) -newer "$IMAGE" -print) |
+		head -n 1
+}
+if [ "${ROOT_IMAGE_FORCE:-0}" != "1" ] && [ -f "$IMAGE" ] && [ -s "$MANIFEST" ] &&
+   current_manifest | cmp -s - "$MANIFEST" && [ -z "$(edited_since_image)" ]; then
 	printf 'up to date %s (%s)\n' "$IMAGE" "$(du -sh "$IMAGE" | cut -f1)"
 	exit 0
 fi
@@ -69,27 +87,10 @@ OWN="$IMAGE.own"
 "$DEBUGFS" -w -f "$OWN" "$IMAGE" >/dev/null 2>&1 || true
 rm -f "$OWN"
 
-# The setuid inodes, and the one file that must not be world-readable.
-#
-# M108: /bin/{su,passwd,login} are symlinks onto the BusyBox multicall ELF, so
-# the setuid bit belongs on the inode they resolve to -- the dedicated
-# busybox-suid copy -- and NOT on the symlinks (stamping a mode on a symlink
-# inode would only corrupt it). The plain /opt/busybox/bin/busybox that every
-# other applet resolves to is deliberately left non-setuid.
-for cmd in \
-	"sif /bin/m31_setuid uid 0" \
-	"sif /bin/m31_setuid mode 0104755" \
-	"sif /opt/busybox/bin/busybox-suid uid 0" \
-	"sif /opt/busybox/bin/busybox-suid gid 0" \
-	"sif /opt/busybox/bin/busybox-suid mode 0104755" \
-	"sif /sbin/unix_chkpwd uid 0" \
-	"sif /sbin/unix_chkpwd gid 0" \
-	"sif /sbin/unix_chkpwd mode 0104755" \
-	"sif /etc/shadow uid 0" \
-	"sif /etc/shadow mode 0100400" \
-; do
-	"$DEBUGFS" -w -R "$cmd" "$IMAGE" 2>/dev/null || true
-done
+# The setuid inodes, and the one file that must not be world-readable. Shared
+# with _mkimg in tests/smoke.sh, which builds the per-lane disks the aarch64
+# instances boot from the same staging tree.
+DEBUGFS="$DEBUGFS" sh "$(dirname "$0")/stamp-root-modes.sh" "$IMAGE"
 
 printf 'created %s (%s)\n' "$IMAGE" "$(du -sh "$IMAGE" | cut -f1)"
 

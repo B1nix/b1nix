@@ -60,10 +60,27 @@ else
     SMOKE_BLK=1
 fi
 
+# Auto-mount 9P host share if present for zero-rebuild fast iteration
+mkdir -p /mnt/host 2>/dev/null || true
+mount -t 9p hostshare /mnt/host 2>/dev/null || true
+
 run_test() {
     bin="$1"
     inst="$2"
-    if [ ! -x "$bin" ]; then return; fi
+
+    # Refresh the rootfs copy from the host share, then run it from its own
+    # path. The share exists so a rebuilt binary reaches the guest without
+    # repacking half a gigabyte of root.ext4 -- but EXECUTING off the 9P mount
+    # is not the same thing: m13_smoke, m24_stress and native_smoke all loaded
+    # from /mnt/host/bin and then emitted not one marker, not even their start
+    # line. Copying keeps the delivery path and drops the exec path, and leaves
+    # argv[0] as the canonical /bin/... the tests were written against.
+    bname="${bin##*/}"
+    if [ -x "/mnt/host/bin/$bname" ]; then
+        cp -f "/mnt/host/bin/$bname" "$bin" 2>/dev/null || bin="/mnt/host/bin/$bname"
+    fi
+    [ -x "$bin" ] || return
+
     case "$inst" in
         sys) [ "$SMOKE_SYS" = "1" ] && "$bin" ;;
         blk) [ "$SMOKE_BLK" = "1" ] && "$bin" ;;
@@ -124,6 +141,8 @@ run_test /bin/b1cc_selfsmoke sys
 run_test /bin/m30_dynamic sys
 run_test /bin/m24_stress sys
 run_test /bin/m39_smoke sys
+run_test /bin/m110_9p_smoke sys
+run_test /bin/m119_smoke sys
 
 # ---- blk (storage) ----
 run_test /bin/m14_smoke blk
@@ -157,8 +176,6 @@ run_test /bin/m51_cairo_smoke gfx
 run_test /bin/m51_xkb_smoke gfx
 run_test /bin/m51_harfbuzz_smoke gfx
 run_test /bin/m51_fontconfig_smoke gfx
-run_test /bin/m51_clipboard_smoke gfx
-
 # Composition, both paths. Software (pixman) and accelerated (GLES on a DRM
 # render node) are separate supported configurations, so each is run on purpose
 # and each carries its own marker — see /etc/render-smoke.sh. A shell script
@@ -211,5 +228,24 @@ if [ "$SMOKE_SYS" = "1" ]; then
     done
 fi
 
+# Where the run's CPU time went, sampled by the timer tick on every core
+# (kernel/lib/kprof.c). Reading /proc/b1nix-prof is what prints it -- the
+# counters are kept all along and nothing else in the tree asks for them, so
+# they were collected every run and read none. The user/kernel/idle
+# distribution costs one increment per tick and is always on; the per-function
+# histogram needs b1nix.sysprof on the kernel command line.
+# Not guarded by [ -r ]: that test was false here (the node is a VFS_DEVICE)
+# and the read silently did not happen, which looks exactly like a profile of
+# zero. Let a missing file say so instead.
+cat /proc/b1nix-prof || echo "SMOKE: /proc/b1nix-prof unreadable — no CPU profile"
+
 echo "B1NIX-TEST: done"
+
+# Powering off is how a QEMU instance ends: the host has the serial log already,
+# so there is nothing left to read on the guest. A board whose only console is
+# its own panel is the opposite case — switching it off is what destroys the
+# results. `b1nix.keep-running` leaves the machine up with the last screenful of
+# markers still on it.
+grep -q 'b1nix.keep-running' /proc/cmdline 2>/dev/null && exit 0
+
 ( sleep 1; /bin/poweroff -f || /bin/halt -f || /sbin/openrc-shutdown --no-write --poweroff now ) &

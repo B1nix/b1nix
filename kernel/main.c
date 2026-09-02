@@ -2,6 +2,11 @@
 #include <b1nix/fw_cfg.h>
 #include <b1nix/io.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/platform.h>
+#include <b1nix/bcm2835.h>
+#if defined(__aarch64__)
+#include <b1nix/gicv3.h>
+#endif
 #include <b1nix/console.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/ktime.h>
@@ -34,10 +39,14 @@
 #include <b1nix/ext4.h>
 #include <b1nix/btrfs.h>
 #include <b1nix/fuse.h>
+#include <b1nix/fwcfgfs.h>
+#include <b1nix/debugfs.h>
+#include <b1nix/tarfs.h>
 #include <b1nix/procfs.h>
 #include <b1nix/ahci.h>
 #include <b1nix/amdvi.h>
 #include <b1nix/iommu.h>
+#include <b1nix/smmuv3.h>
 #include <b1nix/nvme.h>
 #include <lkpi/dma-mapping.h>
 #include <b1nix/filelock.h>
@@ -68,6 +77,7 @@
 #include <b1nix/ramdisk.h>
 #include <b1nix/sound.h>
 #include <b1nix/virtio_gpu.h>
+#include <b1nix/virtio_9p.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -128,7 +138,18 @@ static void i915_module_init(void)
 #endif
 extern void virtio_gpu_dev_init(void);
 extern void virtio_input_init(void);
+
+/* Visual boot markers — see b1nix/bootmark.h. */
+#include <b1nix/bootmark.h>
+
+/* Matches the console's own default; the phone build overrides both. */
+#ifndef FB_CONSOLE_FONT_SCALE
+#define FB_CONSOLE_FONT_SCALE 1
+#endif
+#define FB_CONSOLE_FONT_SCALE_DEFAULT FB_CONSOLE_FONT_SCALE
+
 extern void fb_console_init(void);
+extern int fb_console_ready(void);
 extern void ac97_init(void);
 extern void ac97_selftest(void);
 extern void input_init(void);
@@ -145,7 +166,6 @@ extern void lkpi_cpuinfo_init(void);
 #include <b1nix/pci.h>
 #include <lkpi/lkpi.h>
 
-extern void bootinfo_init_from_fdt(u64 dtb_address);
 
 /* Case-insensitive compare for a UUID: the cmdline may spell it either way,
  * and blk_probe_uuid always prints lower case. */
@@ -225,6 +245,26 @@ static struct block_device *blk_first_removable(void) {
 	return 0;
 }
 
+/* What the boot actually settled on: which filesystem became /, and which
+ * program became PID 1.
+ *
+ * Both are printed when they happen, near the top of a boot -- which on a board
+ * whose only console is a scrolling panel means they are gone by the time
+ * anything goes wrong. The stall watchdog reprints this at the bottom of its
+ * dump, where it is still readable. "root=initramfs" there is the whole
+ * diagnosis for a machine that came up with none of its userspace: the real
+ * root never mounted and PID 1 came out of the embedded file set. */
+static char g_boot_root[64] = "initramfs";
+static char g_boot_init[80] = "(not spawned)";
+
+void boot_summary_set_root(const char *what) {
+  strncpy(g_boot_root, what, sizeof(g_boot_root) - 1);
+  g_boot_root[sizeof(g_boot_root) - 1] = '\0';
+}
+
+const char *boot_summary_root(void) { return g_boot_root; }
+const char *boot_summary_init(void) { return g_boot_init; }
+
 static struct block_device *find_device_by_label(const char *expected_label) {
 	char label[64];
 	for (usize i = 0; i < blk_count(); i++) {
@@ -261,7 +301,7 @@ static struct block_device *find_root_device(const char *root_val) {
  * its only caller. */
 static unsigned g_port_watch_period;
 
-static void port_watch_thread(void *arg)
+static void __attribute__((unused)) port_watch_thread(void *arg)
 {
 	extern void lkpi_i915_dump_port_state_pub(void) __attribute__((weak));
 
@@ -292,7 +332,7 @@ static void task_watch_thread(void *arg)
 	}
 }
 
-static void drm_stuck_watch_thread(void *arg)
+static void __attribute__((unused)) drm_stuck_watch_thread(void *arg)
 {
 	extern int lkpi_diag_watch_report(u64 min_ms) __attribute__((weak));
 
@@ -323,6 +363,32 @@ static void drm_stuck_watch_thread(void *arg)
 	}
 }
 
+/* Mount the first virtio disk that carries a filesystem.
+ *
+ * "vda" used to be hardcoded here, which held only while a board had exactly
+ * one virtio disk. Attach a second one and QEMU may well give the newcomer the
+ * lower mmio slot — the scratch disk became vda, the root became vdb, and the
+ * machine booted onto the initramfs with a perfectly good rootfs sitting one
+ * letter away. Try each in turn instead; a disk with no filesystem simply
+ * fails to mount, which is the same answer by a shorter route. */
+static int mount_first_virtio_root(void)
+{
+	for (usize i = 0;; i++) {
+		struct block_device *dev = blk_nth_on_bus(BLK_BUS_VIRTIO, i);
+
+		if (!dev || !dev->name)
+			return -1;
+		if (vfs_mount(dev->name, "/", "ext4", 0) == 0) {
+			char buf[64];
+
+			snprintf(buf, sizeof(buf), "rootfs: %s mounted at /\n", dev->name);
+			console_write(buf);
+			vfs_repopulate_after_root_mount();
+			return 0;
+		}
+	}
+}
+
 void kernel_main(usize arg0, usize arg1)
 {
 	/* Before anything else that can go deep: the boot stack is still shallow
@@ -330,9 +396,50 @@ void kernel_main(usize arg0, usize arg1)
 	 * painted and its high-water mark made measurable. */
 	boot_stack_paint();
 
+#ifdef __aarch64__
+	/* And before anything can print: this is what fills in the UART and GIC
+	 * base addresses for the board actually underneath us. */
+	platform_detect(arg0);
+#endif
+
 	serial_init();
 	serial_tty_init();
 	console_init();
+	console_write("\n========================================\n");
+	/* Name the machine that was actually detected. This line said "on RPi4!"
+	 * unconditionally, so every QEMU virt boot claimed to be a Raspberry Pi -
+	 * and the harness check that greps for "b1nix kernel" stopped matching. */
+	console_write(" b1nix kernel booting on ");
+#ifdef __aarch64__
+	console_write(platform_name());
+#else
+	console_write("PC");
+#endif
+	console_write("\n========================================\n");
+
+#ifdef __aarch64__
+	console_write("[boot] Scanning FDT at 0x");
+	console_write_hex64(arg0);
+	console_write("...\n");
+	bootinfo_fdt_scan(arg0);
+	console_write("[boot] Rebuilding page tables...\n");
+	aarch64_boot_map_rebuild();
+	console_write("[boot] Boot map rebuild done!\n");
+#endif
+
+
+#ifndef __aarch64__
+	console_write("arg0 (magic): 0x");
+	console_write_hex32((u32)arg0);
+	console_write("\n");
+	console_write("arg1 (info):  0x");
+	console_write_hex32((u32)arg1);
+	console_write("\n");
+
+	if (arg0 != 0x36d76289) {
+		console_write("Warning: Multiboot2 magic mismatch\n");
+	}
+#endif
 
 	/* The command line is parsed before the first line is printed, because it
 	 * is what decides whether that line is printed at all: `loglevel=` and
@@ -342,10 +449,34 @@ void kernel_main(usize arg0, usize arg1)
 	 * point and the panic path releases it. */
 #ifdef __aarch64__
 	bootinfo_init_from_fdt(arg0);
+	/* Before anything else can take longer than the bark timeout: a board
+	 * whose bootloader left a watchdog armed resets mid-boot otherwise. */
+	{
+		extern u32 aarch64_platform_watchdog_disable(void);
+		extern void fb_boot_num(int row, int value);
+		const struct boot_info *bi = bootinfo_get();
+		u32 wdt_en = aarch64_platform_watchdog_disable();
+
+		/* Ground truth, kept on screen next to the milestone: did the kernel
+		 * recognise this machine at all? Row 1 is platform_type() (1 = QEMU
+		 * virt, 2 = RPi4, 3 = SM8150); row 2 is the top byte of the first RAM
+		 * bank (0x40 = 64 is QEMU virt's fallback, 0xa9 = 169 is the window
+		 * chosen for this phone, 0x80 = 128 means the bootloader's own map got
+		 * through). Every platform-specific decision this kernel makes hangs
+		 * off the first of those, and nothing else on screen reports it. */
+		fb_boot_num(1, platform_type());
+		fb_boot_num(2, bi->memory_region_count ?
+		                   (int)(bi->memory_regions[0].base >> 24) : 0);
+		/* Row 3: WDT_EN read back after being cleared. 0 = the watchdog is
+		 * ours and off; 1 = the write was ignored, so the reset that ends
+		 * every boot is firmware's and not something this kernel did. */
+		fb_boot_num(3, (int)wdt_en);
+	}
 #else
 	bootinfo_init_from_multiboot2((u32)arg0, (u32)arg1);
 #endif
 	console_log_init();
+	BOOTMARK(0);	/* white:   kernel_main entered */
 
 	k_info(NULL, "b1nix kernel starting...");
 	k_info(NULL, "boot: multiboot2 magic 0x%08x, info at 0x%08x", (u32)arg0,
@@ -368,9 +499,11 @@ void kernel_main(usize arg0, usize arg1)
 	 * now a per-CPU accessor (get_percpu()->cur_task), and pmm/kheap diagnostics
 	 * read current_task, so GS must be valid before any of that runs. */
 	percpu_init();
+	BOOTMARK(1);	/* red:     per-CPU areas up */
 
 	pmm_init(bootinfo_get());
 	k_info(NULL, "Step 2: PMM initialized");
+	BOOTMARK(2);	/* orange:  PMM initialised */
 
 	/* M77: runtime-tunable global resource caps (TCP slots, pipes, SHMMAX,
 	 * coredump). Sized from usable RAM here, after PMM knows how much memory
@@ -384,9 +517,11 @@ void kernel_main(usize arg0, usize arg1)
 
 	vmm_init();
 	k_info(NULL, "Step 3.5: VMM initialized");
+	BOOTMARK(3);	/* yellow:  VMM initialised */
 
 	kheap_init();
 	k_info(NULL, "Step 4: KHeap initialized");
+	BOOTMARK(4);	/* green:   kernel heap up */
 
 	void *heap_probe = kzalloc(64);
 	console_write("Step 5: KHeap probe allocation: 0x");
@@ -397,18 +532,55 @@ void kernel_main(usize arg0, usize arg1)
 	kheap_use_direct_map();
 	k_info(NULL, "Step 7: KHeap switched to direct map");
 
-#ifndef __aarch64__
-	if (bootinfo_get()->has_framebuffer) {
-		fb_console_init();
+	/* Machines whose framebuffer the bootloader already set up. On one whose
+	 * display is a device this finds nothing and the second call, after
+	 * virtio_gpu_init(), is the one that takes. */
+	fb_console_init();
+	if (fb_console_ready())
 		k_info(NULL, "Step 8: FB Console initialized");
+
+	/* The splash goes HERE, not at the top of kernel_main where it used to
+	 * live: up there the framebuffer console does not exist yet, so every
+	 * character went to the log ring and the serial port and none of it was
+	 * ever drawn. On a board whose only console is the panel that made the
+	 * banner invisible on the one machine it was drawn for.
+	 *
+	 * It is ~100 columns of ASCII art, so it is rendered at scale 1 and the
+	 * console put back afterwards — at the magnification that makes a phone's
+	 * log readable the panel holds 45 columns and the art wraps into noise. */
+	/* Opt-in, via b1nix.splash.
+	 *
+	 * The art is ~30 rows and is never scrolled away -- the console starts
+	 * below it -- so on a panel that holds 45 columns and about 70 rows it
+	 * costs nearly half the readable surface, permanently, while the output
+	 * that says whether the machine works scrolls past underneath. It goes
+	 * back to being the default once this board boots clean; until then the
+	 * panel is a diagnostic instrument, not a banner. */
+	if (bootinfo_has_flag("b1nix.splash")) {
+		extern void demon_splash_show(void);
+		demon_splash_show();
 	}
-#endif
+	BOOTMARK(5);	/* cyan:    past fb_console_init */
 
 	scheduler_init();
 	k_info(NULL, "Step 9: Scheduler initialized");
+	BOOTMARK(6);	/* blue:    scheduler initialised */
 
 	uidgid_init();
 	arch_init();
+	BOOTMARK(7);	/* arch_init */
+	/* Hand the monotonic clock over to the architecture's fine counter as soon
+	 * as one exists. This lived inside the x86_64 block below, next to the
+	 * lapic_init that calibrates the TSC -- so on aarch64, where CNTVCT_EL0
+	 * needs no calibration at all and arch_tsc_clock_ready() had been
+	 * answering yes since boot, the clock stayed on the 100 Hz tick for the
+	 * life of the machine. Every timestamp was a multiple of 10 ms, which is
+	 * not a cosmetic problem: two directory changes inside one tick got
+	 * identical mtimes, and anything that re-reads a directory only when its
+	 * mtime moved could not see the second one. No-ops where the counter is
+	 * not ready yet; x86_64 calls it again after lapic_init calibrates. */
+	ktime_switch_to_tsc();
+#if defined(__x86_64__)
 	/* Discover CPU + interrupt topology from ACPI (RSDP -> RSDT/XSDT -> MADT)
 	 * before LAPIC bring-up: smp_boot_aps prefers the MADT CPU list to the
 	 * CPUID guess. Silently no-ops on platforms without ACPI. */
@@ -457,67 +629,151 @@ void kernel_main(usize arg0, usize arg1)
 	} else {
 		k_warn("timer", "LAPIC calibration unavailable, keeping PIT IRQ0 active");
 	}
+#endif
 	blk_cache_init();
+	BOOTMARK(8);	/* block cache */
 	/* Before initramfs and the filesystems, not after: the page cache's hash
 	 * and bucket locks are allocated here now rather than being static arrays,
 	 * so anything that reads a file has to run after this point. It needs only
 	 * the PMM and the heap, both of which are already up. */
 	page_cache_init();
+	BOOTMARK(9);	/* page cache */
 
 	initramfs_init();
+	BOOTMARK(10);	/* initramfs */
 	fuse_init();
+	BOOTMARK(40);	/* fuse_init returned */
 	k_info(NULL, "Step 10: Initramfs & FUSE initialized");
+	BOOTMARK(41);	/* one console line printed — proves printing is not the wall */
 
-#ifndef __aarch64__
 	/* M100a: reserve the DMA bounce pool here — early, while nothing has
 	 * fragmented the free lists. A bounce block must be physically contiguous,
 	 * and taking it at map time would make a mapping's success depend on what
 	 * every other allocation did. Needs kheap (for the frame map) and nothing
-	 * else, and must precede every driver that could map for DMA. */
+	 * else, and must precede every driver that could map for DMA. Nothing in
+	 * it is x86: a device whose address window misses its buffer needs the
+	 * same copy on either arch. */
 	dma_bounce_pool_init();
+	BOOTMARK(11);	/* DMA bounce pool */
 
+#if defined(__x86_64__)
 	/* M100b: bring up DMA remapping before any driver programs a device. Every
 	 * function starts in pass-through, so this changes nothing for a driver
 	 * that has not asked for translation. */
 	iommu_init();
 	amdvi_init();
+#elif defined(__aarch64__)
+	/* M100e: the same thing this board's architecture spells SMMUv3. Same
+	 * placement and the same reason — every stream starts bypassing, so a
+	 * driver that has not asked for translation sees no difference. Silent
+	 * (well, one line) on a machine whose device tree has no such unit, which
+	 * is plain `virt` without `iommu=smmuv3`. */
+	smmuv3_init();
+	BOOTMARK(12);	/* SMMUv3 */
+#endif
 
 	vfs_init();
+	BOOTMARK(13);	/* VFS */
 	ext2_init();
 	ext1_init();
 	ext3_init();
 	fat32_init();
 	ext4_init();
+#ifdef __aarch64__
+	/* Walk the bus and give every device an address before any driver looks
+	 * for one. On a PC the firmware has already done this; nothing runs
+	 * before the kernel on QEMU virt, so every BAR reads zero until we
+	 * program it — which a driver reports as "the register block is at 0",
+	 * not as "nobody assigned me an address". */
+	pci_init();
+	BOOTMARK(14);	/* PCI BUS SCAN (aarch64) */
+#endif
+	/* Both are PCI devices driven through MMIO, and this port has a PCI bus
+	 * now (kernel/dev/pci.c over the ECAM window), so they probe on every
+	 * arch. On a machine that has no such controller the probe simply finds
+	 * nothing. */
 	ahci_init();
+	BOOTMARK(15);	/* AHCI */
 	nvme_init();
+	BOOTMARK(16);	/* NVMe */
 	exfat_init();
 	tmpfs_init();
 	cgroup_init();   /* cgroup v2 — systemd mounts it before anything else */
 	procfs_init();
 	sysfs_init();
+	virtio_9p_init();
+	p9_fs_init();
+	fwcfgfs_init();
+	b1nix_debugfs_init();
+	tarfs_init();
+	BOOTMARK(17);	/* sysfs */
+	/* module_init_builtin_deps() used to be called here. It now runs after the
+	 * root is mounted (see the note at its remaining call site): the modules
+	 * live in /lib/modules, which is only readable once that root is there. */
+	BOOTMARK(50);
 	filelock_init();
+	BOOTMARK(51);
 	mqueue_init();
+	BOOTMARK(52);
 	shm_init();
+	BOOTMARK(53);
 	sysv_ipc_init(); /* SysV semaphores + message queues */
+	BOOTMARK(54);
 	swap_init();
+	BOOTMARK(55);
 	net_init();
-	netconsole_init(); /* M98: klog over UDP, b1nix.netconsole=<ip>:<port> */
+	BOOTMARK(18);	/* net */
+	/* klog over UDP (b1nix.netconsole=<ip>:<port>): a network interface and a
+	 * UDP socket, nothing architectural. */
+	netconsole_init();
+	/* M79: the Intel 82801AA AC'97 controller (/dev/dsp1). A PCI card, so it
+	 * is not an x86 device even though its registers sit behind an I/O BAR:
+	 * on a machine with no port-I/O instructions those accesses go through
+	 * the host bridge's I/O window instead (kernel/arch/aarch64/io.c). */
+	ac97_init();
+	BOOTMARK(19);	/* ac97 */
+#if defined(__x86_64__)
 	ps2_kbd_init();
 	ps2_mouse_init();
+	/* M102a: the boot CPU's family/model and cache geometry, read before any
+	 * driver probes — a quirk keyed on model must not match a zeroed struct,
+	 * and the cache line size is a divisor in imported flush loops. This used
+	 * to run after the GPU drivers and the flush loops spun on a zero. It reads
+	 * CPUID, so it lives inside this guard with the rest. */
+	lkpi_cpuinfo_init();
+	video_init();
+#elif defined(__aarch64__)
+	bcm2835_mbox_init();
+	bcm2835_gpio_init();
+	bcm2835_systimer_init();
+	bcm2835_pm_init();
+	BOOTMARK(20);	/* bcm2835 block */
+#endif
+	/* M37: the xHCI controller is PCI + MMIO, and this arch reaches PCI through
+	 * its ECAM window, so the USB stack is not x86-only; its HID keys go
+	 * through the same scancode translation the PS/2 driver owns.
+	 *
+	 * It probes HERE, not with ahci/nvme before sysfs_init(). Moving it earlier
+	 * did put the USB stick into /sys/block, but on the one lane that has a USB
+	 * *disk* the early registration walked into an unfinished block layer and
+	 * took the machine down with an unknown-EC fault in module space. A
+	 * removable disk missing from /sys/block is a reporting gap; this was a
+	 * dead lane. */
+	xhci_probe();
+	BOOTMARK(21);	/* xHCI probe */
 	input_init(); /* M47: /dev/input/event* (PS/2 kbd + mouse event streams) */
+	BOOTMARK(22);	/* input */
 	if (bootinfo_has_flag("b1nix.gfxtest=1"))
 		input_gfxtest_start(); /* diagnostic: headless window-drag injector */
 	if (bootinfo_has_flag("b1nix.test=1"))
 		input_m47_inject_start(); /* M47 smoke: mouse event burst for readers */
-	xhci_probe(); /* M37: USB xHCI controller + HID boot keyboard (real-HW input) */
-	ac97_init();  /* M79: Intel 82801AA AC'97 controller (/dev/dsp1) */
-	/* M102a: the boot CPU's family/model and cache geometry, read before any
-	 * driver probes — a quirk keyed on model must not match a zeroed struct,
-	 * and the cache line size is a divisor in imported flush loops. This used
-	 * to run after the GPU drivers and the flush loops spun on a zero. */
-	lkpi_cpuinfo_init();
-	video_init();
 	virtio_gpu_init();
+	BOOTMARK(23);	/* virtio-gpu */
+	fb_console_init(); /* a virtio-gpu display can carry the text console */
+	if (bootinfo_has_flag("b1nix.test=1")) {
+		extern void fb_console_selftest(void);
+		fb_console_selftest();
+	}
 #if defined(B1NIX_I915) && B1NIX_I915
 	/*
 	 * M102a: Intel i915. The driver's module init registers its PCI driver,
@@ -628,20 +884,37 @@ void kernel_main(usize arg0, usize arg1)
 	}
 #endif
 	virtio_input_init(); /* absolute pointer (virtio-tablet) — grab-free mouse */
+
+
+
+
+
+
+
+
 	fb_dev_init(); /* M47: /dev/fb0 mmap-able framebuffer (needs fb_console) */
 	nbd_init();    /* /dev/nbd0.. present and empty until a client attaches */
 	md_init();     /* /dev/md0.. present and empty until raidautorun fills one */
 	mtd_init();    /* CFI NOR flash, when b1nix.mtd asks for the probe */
+	BOOTMARK(24);	/* /dev/fb0 */
 	drm_dev_init(); /* M50: minimal DRM/KMS dumb-buffer device over virtio-gpu */
+	BOOTMARK(25);	/* DRM */
 	/* M101t: the imported core comes up here rather than in the test block —
 	 * /dev/dri/card1 is a device userspace opens, not a self-test. The order
-	 * matters: the node is only registered once a device exists behind it. */
+	 * matters: the node is only registered once a device exists behind it.
+	 */
 	drm_kms_device_init();
+	BOOTMARK(26);	/* drm_kms_device_init */
 	drm_card1_init();
+	BOOTMARK(27);	/* drm_card1_init */
 	virtio_gpu_dev_init(); /* M53: /dev/virtio-gpu userspace VirGL 3D transport */
+	BOOTMARK(28);	/* virtio_gpu_dev_init */
 	ramdisk_init();
+	BOOTMARK(29);	/* ramdisk_init */
 	loop_init();            /* loop block devices + /dev/loop-control */
+	BOOTMARK(30);	/* loop_init */
 	vt_init();              /* M107 virtual terminals + console font/keymap */
+	BOOTMARK(31);	/* magenta: device init survived, VTs up */
 	kmsg_init();            /* M107 /dev/kmsg record ring */
 	rtc_dev_init();         /* M107 /dev/rtc0 */
 	watchdog_init();        /* M107 /dev/watchdog */
@@ -651,7 +924,6 @@ void kernel_main(usize arg0, usize arg1)
 		const char *db_argv[] = {"diskbench", 0};
 		user_spawn("/bin/diskbench", 1, db_argv);
 	}
-#endif
 
 	/* M92 musl smoke test: must run BEFORE rootfs mount because the binary
 	 * lives in the initramfs which gets hidden when ram0 ext4 is mounted at /.
@@ -729,9 +1001,9 @@ void kernel_main(usize arg0, usize arg1)
 		}
 	}
 
-#ifndef __aarch64__
 	/* Prefer a real ext4 root over the bootstrap initramfs.  Native runs use
-	 * vda; Live CD boots use the multiboot ramdisk block device ram0.
+	 * vda (aarch64 registers its virtio-mmio disk under the same name);
+	 * Live CD boots use the multiboot ramdisk block device ram0.
 	 * In test mode the smoke suite owns the drives, so keep initramfs as /. */
 	{
 		int rc = -1;
@@ -829,51 +1101,68 @@ void kernel_main(usize arg0, usize arg1)
 					}
 				}
 			} else {
-				struct block_device *root_dev = find_root_device(root_val);
-				if (!root_dev) {
-					console_write("rootfs: waiting for root device ");
-					console_write(root_val);
-					console_write("...\n");
-					int retries = 0;
-					while (retries < 50) {
-						scheduler_sleep_ticks(SCHED_MS_TO_TICKS(100));
-						root_dev = find_root_device(root_val);
-						if (root_dev) {
-							break;
-						}
-						retries++;
+				char fstype_val[32] = {0};
+				bootinfo_get_kv("rootfstype", fstype_val, sizeof(fstype_val));
+
+				if (strcmp(root_val, "9p") == 0 || strcmp(root_val, "hostshare") == 0 || strcmp(fstype_val, "9p") == 0) {
+					rc = vfs_mount(root_val[0] ? root_val : "hostshare", "/", "9p", 0);
+					if (rc == 0) {
+						console_write("rootfs: mounted on / as 9p (fast host pass-through)\n");
+						boot_summary_set_root("hostshare (9p)");
+						vfs_repopulate_after_root_mount();
 					}
-				}
-				if (root_dev) {
-					const char *fs_types[] = {"ext4", "ext3", "ext2"};
-					for (int i = 0; i < 3; i++) {
-						rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
-						if (rc == 0) {
-							char mounted_buf[96];
-							snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, fs_types[i]);
-							console_write(mounted_buf);
-							vfs_repopulate_after_root_mount();
-							break;
+				} else {
+					struct block_device *root_dev = find_root_device(root_val);
+					if (!root_dev) {
+						console_write("rootfs: waiting for root device ");
+						console_write(root_val);
+						console_write("...\n");
+						int retries = 0;
+						while (retries < 50) {
+							scheduler_sleep_ticks(SCHED_MS_TO_TICKS(100));
+							root_dev = find_root_device(root_val);
+							if (root_dev) {
+								break;
+							}
+							retries++;
 						}
 					}
-				}
-				if (rc != 0) {
-					char mount_err_buf[96];
-					snprintf(mount_err_buf, sizeof(mount_err_buf), "rootfs: staying on initramfs, failed to mount root: %s\n", root_val);
-					console_write(mount_err_buf);
-					vfs_repopulate_after_root_mount();
+					if (root_dev) {
+						if (fstype_val[0]) {
+							rc = vfs_mount(root_dev->name, "/", fstype_val, 0);
+							if (rc == 0) {
+								char mounted_buf[96];
+								snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, fstype_val);
+								console_write(mounted_buf);
+								vfs_repopulate_after_root_mount();
+							}
+						}
+						if (rc != 0) {
+							const char *fs_types[] = {"ext4", "ext3", "ext2", "tarfs"};
+							for (int i = 0; i < 4; i++) {
+								rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
+								if (rc == 0) {
+									char mounted_buf[96];
+									snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, fs_types[i]);
+									console_write(mounted_buf);
+									vfs_repopulate_after_root_mount();
+									break;
+								}
+							}
+						}
+					}
+					if (rc != 0) {
+						char mount_err_buf[96];
+						snprintf(mount_err_buf, sizeof(mount_err_buf), "rootfs: staying on initramfs, failed to mount root: %s\n", root_val);
+						console_write(mount_err_buf);
+						vfs_repopulate_after_root_mount();
+					}
 				}
 			}
 		} else {
 			/*
 			 * No root= on the command line: choose by what the filesystem says
-			 * it is, not by where it happens to be plugged in.
-			 *
-			 * Taking the first virtio disk unconditionally meant any disk attached for
-			 * any other purpose became the root — a package cache handed to the
-			 * guest for speed was mounted at / and the real filesystem never
-			 * appeared. The label comes first, then the image the boot loader
-			 * handed us, and only then a bare disk.
+			 * it is (labelled disk 'b1nix-root'), ram0, or virtio block.
 			 */
 			rc = -1;
 			{
@@ -891,6 +1180,7 @@ void kernel_main(usize arg0, usize arg1)
 						         "rootfs: %s (label b1nix-root) mounted at /\n",
 						         labelled->name);
 						console_write(buf);
+						boot_summary_set_root(labelled->name);
 						vfs_repopulate_after_root_mount();
 					}
 				}
@@ -899,14 +1189,14 @@ void kernel_main(usize arg0, usize arg1)
 				rc = vfs_mount("ram0", "/", "ext4", 0);
 				if (rc == 0) {
 					console_write("rootfs: ram0 mounted at / as ext4\n");
+					boot_summary_set_root("ram0");
 					vfs_repopulate_after_root_mount();
 				}
 			}
 			if (rc == 0) {
 				/* mounted above */
-			} else if ((rc = vfs_mount("vda", "/", "ext4", 0)) == 0) {
-				k_info("rootfs", "vda mounted at /");
-				vfs_repopulate_after_root_mount();
+			} else if ((rc = mount_first_virtio_root()) == 0) {
+				/* named inside the helper */
 			} else {
 				/* Try finding a block device by default label 'b1nix-root' (e.g. USB flash drive) */
 				struct block_device *root_dev = find_device_by_label("b1nix-root");
@@ -927,6 +1217,7 @@ void kernel_main(usize arg0, usize arg1)
 					rc = vfs_mount("ram0", "/", "ext4", 0);
 					if (rc == 0) {
 						console_write("rootfs: ram0 mounted at / as ext4\n");
+						boot_summary_set_root("ram0");
 						vfs_repopulate_after_root_mount();
 					} else {
 						char mount_err_buf[64];
@@ -950,7 +1241,6 @@ void kernel_main(usize arg0, usize arg1)
 	/* BusyBox sysctl chdirs to /proc/sys; point at /sys where the actual
 	 * files live (kernel.osrelease → /sys/kernel/osrelease). */
 	vfs_symlink("/sys", "/proc/sys");
-#endif
 	if (bootinfo_has_flag("b1nix.task-watch") &&
 	    kthread_create("task-watch", task_watch_thread, 0) < 0)
 		k_err("task-watch", "thread refused");
@@ -969,6 +1259,35 @@ void kernel_main(usize arg0, usize arg1)
 
 	k_info(NULL, "Step 11: Drivers initialized");
 
+#if defined(__aarch64__)
+	/* The secondary CPUs, over PSCI. They run stealable kernel workers only
+	 * for now (kernel/arch/aarch64/smp.c says what is still missing before
+	 * userspace can run on one), which is what the M24b work-stealing and
+	 * M28 heap-benchmark checks exercise. */
+	/* Secondary CPUs are off on this board until PSCI works there.
+	 *
+	 * The Snapdragon's firmware declares method = "smc" and this kernel now
+	 * issues one, with the MPIDR its own device tree gives (0x100 for the
+	 * second core, read with the /cpus node's two address cells — verified).
+	 * The call does not return. Not "returns an error": control never comes
+	 * back from EL3, so there is no status to report and nothing to retry.
+	 * Why is genuinely open — the entry point, the power-domain state ATF
+	 * expects, and whether it dislikes being called with caches on are all
+	 * still unexamined.
+	 *
+	 * A machine with one core is a working machine, and everything after this
+	 * point is what the board is actually being brought up for. Pass
+	 * b1nix.smp to try anyway. */
+	BOOTMARK(69);
+	if (platform_type() != PLATFORM_SM8150 || bootinfo_has_flag("b1nix.smp"))
+		smp_boot_aps();
+	else
+		console_write("smp: AP bring-up skipped on this board "
+		              "(PSCI CPU_ON does not return; pass b1nix.smp to try)\n");
+	BOOTMARK(70);
+#endif
+
+#if defined(__x86_64__)
 	/* Bring up Application Processors */
 	smp_boot_aps();
 
@@ -1008,14 +1327,25 @@ void kernel_main(usize arg0, usize arg1)
 	 * write hit the freed-and-reused physical frame. Safe to enable here
 	 * because all APs have come up and have functional LAPICs to ACK IPIs. */
 	tlb_shootdown_set_enabled(1);
+#endif
 
 	/* M101: reserve the lkpi vmap window's page-table path. Must happen before
 	 * any process is created, so every address space inherits the entry. */
 	lkpi_page_init();
+	BOOTMARK(71);
 
 	/* M101: start RCU's deferred-callback thread. After the APs are up, since
 	 * it creates a worker thread, and before any driver can call call_rcu. */
 	rcu_init();
+	BOOTMARK(72);
+
+	/* Both linuxkpi work pools, here rather than on first use. Created lazily,
+	 * the second one is allocated from inside a work item that is already
+	 * waiting on it, and its thread never gets to run — see the note in
+	 * kernel/lkpi/workqueue.c. Starting them from ordinary kernel context is
+	 * also what Linux does. */
+	(void)lkpi_system_wq();
+	(void)lkpi_system_unbound_wq();
 
 	/* In-kernel SMP self-tests. These run BEFORE g_ap_userspace_enabled: they
 	 * need the APs still parked in the work-stealing-only loop (that loop is
@@ -1025,8 +1355,11 @@ void kernel_main(usize arg0, usize arg1)
 	 * to match and ran the whole suite until the host stall watchdog shot it.
 	 * All three are no-ops outside b1nix.test=1 / on single-CPU systems. */
 	smp_selftest_run();
+	BOOTMARK(73);
 	m28_heapbench_run();
+	BOOTMARK(74);
 	m28_ctxbench_run();
+	BOOTMARK(75);
 	/* M101: the RCU grace-period proof belongs here for the same reason. It
 	 * needs a reader running on another CPU at the same moment as the writer,
 	 * and a stealable worker picked up by a parked AP is the only placement
@@ -1034,6 +1367,7 @@ void kernel_main(usize arg0, usize arg1)
 	 * the reader lands wherever it lands — in practice back on the BSP, where
 	 * it cannot overlap the writer at all. */
 	lkpi_rcu_smp_selftest();
+	BOOTMARK(76);
 
 	/* M37 device self-tests. Their only caller used to be the in-kernel test
 	 * driver in kernel/user/programs.c, deleted with the ring-3 migration —
@@ -1042,19 +1376,25 @@ void kernel_main(usize arg0, usize arg1)
 	 * driver's own probe, not from this test). Both are no-ops outside
 	 * b1nix.test=1 / without the hardware. */
 	if (bootinfo_has_flag("b1nix.test=1")) {
+		/* Both drivers are MMIO over PCI and both come up on this arch now
+		 * (M37), so their self-tests belong to both. Each is a no-op when its
+		 * device is absent. */
 		e1000_selftest();
 		usb_selftest();
-		/* M38/M79 audio device self-tests. Dropped with the ring-3
-		 * migration's kernel/user/programs.c test driver, which silenced
-		 * the whole M38-SOUND marker set; revived here. Both are no-ops
-		 * outside b1nix.test=1 / without the device.  Re-register the
-		 * /dev/dsp* nodes here too: the nodes created at early boot land
-		 * on the initramfs root which becomes unreachable after the ext4
-		 * root is mounted, so a second vfs_add_node here (on the live
-		 * root) is what makes /dev/dsp /dev/dsp1 visible to userspace. */
+		/* M38/M79 audio device self-tests. Both are no-ops outside
+		 * b1nix.test=1 / without the device. Re-register the /dev/dsp*
+		 * nodes here too: the nodes created at early boot land on the
+		 * initramfs root, which becomes unreachable once the ext4 root is
+		 * mounted, so this second registration is what makes /dev/dsp and
+		 * /dev/dsp1 visible to userspace.
+		 *
+		 * Both run on both arches. AC'97 reaches its registers through I/O
+		 * ports, which an AArch64 CPU does not have - so there they are
+		 * accesses into the host bridge's I/O window instead
+		 * (kernel/arch/aarch64/io.c), and the card answers the same. */
 		sound_module_dev_init();
-		ac97_dev_init();
 		sound_module_selftest();
+		ac97_dev_init();
 		ac97_selftest();
 		/* ioprio(2): the block layer's admission policy — better priority
 		 * first, and a starving idle-class request ages past a stream of
@@ -1072,12 +1412,21 @@ void kernel_main(usize arg0, usize arg1)
 		}
 		m36_gdb_selftest();
 		m36_ftrace_selftest();
-		/* M98 driver infrastructure: PAT/write-combining, modern PCI
-		 * (BAR sizing, capability walk, bus master, MSI/MSI-X, Intel
-		 * stolen memory) and the netconsole UDP log path. */
+		/* M98 memory typing and cache maintenance. Both arches implement it,
+		 * spelled differently (IA32_PAT + CLFLUSH vs an MAIR slot + DC CIVAC /
+		 * a set/way walk) — see kernel/arch/aarch64/memtype.c. The PAT-MSR
+		 * readback is the one check with no counterpart there, and the harness
+		 * skips that one alone rather than the whole group. */
 		memtype_selftest();
+		/* M98 modern PCI: BAR sizing, capability walk, bus master, MSI/MSI-X,
+		 * Intel stolen memory. This used to sit behind the x86_64 guard above
+		 * because "this port has no PCI host bridge" — it has one now (ECAM on
+		 * QEMU virt, which is how e1000/xHCI/NVMe are found here), so the
+		 * bus-level half of the test applies to both arches. The Intel-only
+		 * parts detect their own absence and say so. */
 		pci_selftest();
-		/* The wall clock's civil-date conversion, against known answers. */
+		/* The wall clock's civil-date conversion, against known answers.
+		 * Calendar arithmetic, so it runs on both arches (kernel/dev/rtc_dev.c). */
 		rtc_selftest();
 		/* btrfs, when a disk carrying one is attached: read a filesystem
 		 * mkfs.btrfs wrote and check what comes back. */
@@ -1085,22 +1434,27 @@ void kernel_main(usize arg0, usize arg1)
 		/* The nice/stride weighting, where the numbers live: the M46
 		 * userspace test can only observe the bias statistically. */
 		sched_nice_selftest();
+		/* netconsole is the klog ring over UDP — protocol, not hardware.
+		 * It only sat behind the x86_64 guard because it was written next
+		 * to the PAT/PCI tests above. */
 		netconsole_selftest();
-		/* M32 IPv6 self-tests: loopback (::1) ICMPv6 + MLD, and real-link
-		 * SLAAC + ping over QEMU usernet.  Both were in kernel/user/
-		 * programs.c before the ring-3 migration; with that file gone
-		 * they run here alongside the other hardware self-tests. */
-		/* M96: run through the protocol registry — the IPv6 self-tests
-		 * live in ipv6.ko and are absent when it is not loaded. */
-		net_proto_selftest();
 
-		/* M84: IPv4 FIB (longest-prefix-match, host routes, metric
-		 * tie-break) and TCP robustness (option parsing, window
-		 * scaling, out-of-order reassembly). */
 		/* Boot-log format: timestamps, the severity filter and the
 		 * agreement between the console and the dmesg ring. */
 		log_format_selftest();
 
+		/* The rest of this group is protocol logic, not hardware, and
+		 * belongs on every arch — it was only ever inside the x86_64
+		 * guard because it was written next to the PCI/PAT tests above.
+		 * On aarch64 that silently dropped every M84 marker.
+		 *
+		 * M32/M96: IPv6 self-tests (loopback ::1 ICMPv6 + MLD, SLAAC and
+		 * ping over usernet) run through the protocol registry — they
+		 * live in ipv6.ko and are absent when it is not loaded.
+		 * M84: IPv4 FIB (longest-prefix-match, host routes, metric
+		 * tie-break) and TCP robustness (option parsing, window scaling,
+		 * out-of-order reassembly). */
+		net_proto_selftest();
 		route_smoke();
 		tcp_robustness_smoke();
 		dhcpv6_smoke();
@@ -1132,8 +1486,34 @@ void kernel_main(usize arg0, usize arg1)
 	/* The work-stealing self-test is done; let APs leave the work-stealing-only
 	 * loop and run the full cooperative scheduler (ordinary userspace processes)
 	 * under the Big Kernel Lock. From here, userspace runs on Application
-	 * Processors too. */
+	 * Processors too.
+	 *
+	 * Not on aarch64 yet. Two CPUs executing kernel paths in parallel is what
+	 * this port has not made safe: the surviving failure is a secondary found
+	 * running with SP inside ANOTHER task's kernel stack (caught directly:
+	 * cpu 1, task 'ap-idle', sp owned by 'boot'), after which it returns
+	 * through whatever that frame holds. A secondary still boots, still takes
+	 * its own timer interrupts and still runs stealable kernel workers, so the
+	 * M101 RCU grace-period check -- which needs a reader on a second core --
+	 * still has one. Set b1nix.ap-userspace to opt back in while working on it.
+	 *
+	 * x86_64 is unchanged: it has run userspace on APs since M28. */
+	/* Userspace on the secondaries is still off HERE, and the reason is
+	 * measured rather than assumed: with it on the suite scores 900-1300 of
+	 * ~1370 with wide variance, against 1369 and no blocked checks with it
+	 * off. The corruption behind that is characterised in
+	 * docs/aarch64-ap-userspace.md -- what it is not has been narrowed a long
+	 * way, what it is has not been found. b1nix.ap-userspace turns it on for
+	 * work on the bug. */
+#if defined(__aarch64__)
+	if (bootinfo_has_flag("b1nix.ap-userspace"))
+		g_ap_userspace_enabled = 1;
+	else
+		console_write("smp: secondaries stay on kernel workers "
+		              "(pass b1nix.ap-userspace to run userspace on them)\n");
+#else
 	g_ap_userspace_enabled = 1;
+#endif
 
 	/* Variant B: start background reclaim now that the scheduler, page cache and
 	 * filesystems are up — kswapd keeps a free-frame headroom so userspace
@@ -1147,23 +1527,52 @@ void kernel_main(usize arg0, usize arg1)
 	if (bootinfo_has_flag("b1nix.test=1")) {
 		/* M98: MSI-X delivery. Needs the full scheduler (the completion wait
 		 * blocks) and a controller that has finished initialising, so it runs
-		 * here rather than in the early self-test block with the rest of M98. */
+		 * here rather than in the early self-test block with the rest of M98.
+		 * Not x86-only any more: aarch64 delivers a message interrupt through
+		 * the GICv3 ITS (kernel/arch/aarch64/gicv3_its.c). The test itself
+		 * reports "skip" on a board whose controller has no MSI-X, which is
+		 * what a GICv2 machine looks like from here. */
+#if defined(__aarch64__)
+		/* The controller's own half of an MSI, before any device is involved:
+		 * see kernel/arch/aarch64/gicv3_its.c. */
+		its_selftest();
+		bcm2835_mbox_selftest();
+		bcm2835_gpio_selftest();
+		bcm2835_systimer_selftest();
+#endif
 		nvme_msix_selftest();
-		/* M14: the fsync/sync durability path — the device cache-flush
-		 * command each disk claims, and a write that survives a flush plus
-		 * a full block-cache drop. Needs the full scheduler because the
-		 * flush command blocks on its completion. */
-		blk_durability_selftest();
-		blk_cache_torture_test();
+#if defined(__x86_64__)
 		iommu_selftest();     /* M100b/M100c: VT-d, domains, groups, IR */
 		amdvi_selftest();     /* M100d: AMD-Vi */
 		/* Whichever unit came up, put a real device behind it and move data
 		 * through its own domain. The check names the unit's milestone. */
 		nvme_iommu_selftest();
+#elif defined(__aarch64__)
+		/* M100e: the aarch64 half of the same claim — the unit comes up, a
+		 * translation is installed and read back out of its own tables, and
+		 * a real device runs in a domain that only holds what it was granted
+		 * (nvme_iommu_selftest, below). */
+		smmuv3_selftest();
+		nvme_iommu_selftest();
+#endif
+		/* M14: the fsync/sync durability path — the device cache-flush command
+		 * each disk claims, and a write that survives a flush plus a full
+		 * block-cache drop. Needs the full scheduler because the flush blocks
+		 * on its completion. Not x86-only: the flush is a command each driver
+		 * already implements, and the scratch write now picks a disk nothing
+		 * has mounted (see blk_durability_selftest). */
+		blk_durability_selftest();
+		/* The block cache under concurrent readers, writers and evictions. */
+		blk_cache_torture_test();
+		/* linuxkpi and the DRM core are shim layers over this kernel's own
+		 * allocator, scheduler and VMM — there is nothing x86 in an idr, a
+		 * workqueue, a dma-fence or the GPU scheduler, and their sources are
+		 * built for both arches. They were only inside the guard above
+		 * because the IOMMU tests they sat next to are genuinely x86. */
 		lkpi_selftest();      /* M99: idr, completion, workqueue, sg, dma, fw */
-		lkpi_selftest_m101(); /* M101: kref, waitqueue, ww_mutex, rbtree, RCU */
 		dma_fence_selftest(); /* M100: dma-fence */
 		drm_sched_selftest(); /* M100: GPU scheduler + scatter-gather BOs */
+		lkpi_selftest_m101(); /* M101: kref, waitqueue, ww_mutex, rbtree, RCU */
 		virtio_gpu_irq_selftest(); /* the scanout's completion interrupt */
 		drm_import_selftest(); /* M101: the imported DRM core actually runs */
 		drm_kms_selftest();    /* M101: a device on it, rendering to the scanout */
@@ -1241,9 +1650,55 @@ void kernel_main(usize arg0, usize arg1)
 	int init_pid = user_spawn(init_path, 0, 0);
 	if (init_pid > 0)
 		scheduler_set_init_pid((usize)init_pid);
-	snprintf(init_log, sizeof(init_log), "init: %s pid=%d\n",
-	         init_path, init_pid);
+	/* The cmdline is echoed again here, next to the spawn it decided. It is
+	 * printed once near the top of the boot too, but that has long scrolled
+	 * away by now — and on a board where the only console is a panel, "which
+	 * cmdline actually won" is exactly the question this line answers. The
+	 * bootloader replaces /chosen/bootargs with the boot image header's copy,
+	 * so neither the compiled-in default nor the tree's own property is
+	 * necessarily what got through. */
+	snprintf(init_log, sizeof(init_log), "init: %s pid=%d\ncmdline: %s\n",
+	         init_path, init_pid,
+	         bootinfo_cmdline() ? bootinfo_cmdline() : "(none)");
 	console_write(init_log);
+	snprintf(g_boot_init, sizeof(g_boot_init), "%s pid=%d", init_path, init_pid);
+
+	/* A PID 1 that never started must say so, loudly, right here.
+	 *
+	 * Both early failures inside user_spawn return a bare error and print
+	 * nothing: the file is missing, or it is not executable by us. The boot
+	 * then continues, the machine goes quiet with no userspace on it at all,
+	 * and from the outside that is indistinguishable from a userspace program
+	 * that hung — which is exactly how this board was read for several rounds.
+	 *
+	 * The most likely cause is also the one the message can settle on the spot:
+	 * when the real root fails to mount, / is still the bootstrap initramfs,
+	 * which carries smoke binaries and no init and no shell. So report whether
+	 * the usual suspects exist, rather than only that the spawn failed. */
+	if (init_pid <= 0) {
+		static const char *probe[] = {"/sbin/init", "/bin/sh", "/bin/busybox",
+		                              "/lib/libc.so", 0};
+
+		snprintf(init_log, sizeof(init_log),
+		         "init: SPAWN FAILED rc=%d — no userspace will run\n", init_pid);
+		console_write(init_log);
+		console_write("init: present:");
+		for (int i = 0; probe[i]; i++) {
+			struct vfs_node *n = vfs_find_node(probe[i]);
+			int here = n && !IS_ERR(n);
+
+			if (here)
+				vfs_node_put(n);
+			console_write(" ");
+			console_write(probe[i]);
+			console_write(here ? "=yes" : "=NO");
+		}
+		console_write("\n");
+		/* Almost always the same story: the real root did not mount, so / is
+		 * still the initramfs. Print what ram0 actually holds, next to the
+		 * failure it caused. */
+		ramdisk_report();
+	}
 
 	/* M68 native-Rust proof: the rustc ELF + librustc_driver.so (LLVM folded in) +
 	 * the std sysroot (~hundreds of MB) are far too big for the
@@ -1411,13 +1866,14 @@ void kernel_main(usize arg0, usize arg1)
 	/* BSP idle loop. The BKL is fully retired (M28 #7): kernel entry runs
 	 * BKL-free and scheduler_yield no longer hands a lock across the context
 	 * switch, so the idle loop just yields and parks when there is no work. */
-	while (scheduler_task_count() > 1) {
+	while (1) {
 		int switched = scheduler_yield();
 		if (!switched) {
+#if defined(__x86_64__)
 			__asm__ volatile("sti; hlt" : : : "memory");
+#elif defined(__aarch64__)
+			__asm__ volatile("msr daifclr, #2; wfi" : : : "memory");
+#endif
 		}
 	}
-
-	k_info(NULL, "\nM6 network layer demo complete");
-	arch_halt();
 }

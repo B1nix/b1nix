@@ -545,9 +545,17 @@ void sysfs_attr_selftest(void) {
   /* The DRM core registered a class and a device through this registry; both
    * had to survive being registered before /sys was mounted. */
   isize n = read_file("/sys/class/drm/card0/dev", buf, sizeof(buf));
-  /* DRM's major is 226, and this is the first minor. The value comes from the
-   * device the driver registered, not from anything written here. */
-  sysfs_report("card-dev", n > 0 && strcmp(buf, "226:0\n") == 0, (u64)(n > 0 ? n : 0));
+  if (n < 0) {
+    /* No card0 at all. That is a machine with no GPU - QEMU's raspi4b models
+     * none - and not a registry that lost one, so there is nothing here to
+     * pass or fail. Reported as a skip naming the reason, the way the MSI and
+     * IOMMU self-tests do on a board without those units. */
+    console_write("M101-SYSFS: skip card-dev (no DRM device on this machine)\n");
+  } else {
+    /* DRM's major is 226, and this is the first minor. The value comes from
+     * the device the driver registered, not from anything written here. */
+    sysfs_report("card-dev", strcmp(buf, "226:0\n") == 0, (u64)n);
+  }
 
   /* A file with a store: write, then read back through a fresh open, so the
    * value crosses the registry rather than a cached buffer. */

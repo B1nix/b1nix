@@ -505,8 +505,14 @@ rm -f /tmp/bb_dir/w12.bin
 # That is the property a mirror exists for, and nothing short of reading the
 # members proves it.
 if [ -x /bin/mdcreate ] && [ -x /bin/raidautorun ]; then
-	dd if=/dev/zero of=/tmp/bb_dir/w12-a.img bs=1048576 count=8 2>/dev/null
-	dd if=/dev/zero of=/tmp/bb_dir/w12-b.img bs=1048576 count=8 2>/dev/null
+	# 1 MiB per member, not 8. The array's superblock lives in block 0 and
+	# data starts at block 1 (mdcreate sets data_offset = 1); this test writes
+	# array block 4 and reads member block 5. Eight megabytes each was sixteen
+	# megabytes of zeroes through the ext4 write path to exercise two blocks --
+	# thirty-one seconds of a lane whose whole budget is three hundred and
+	# sixty, and the sync that follows paid for them again.
+	dd if=/dev/zero of=/tmp/bb_dir/w12-a.img bs=1048576 count=1 2>/dev/null
+	dd if=/dev/zero of=/tmp/bb_dir/w12-b.img bs=1048576 count=1 2>/dev/null
 	bb_w12_la="$(/bin/losetup -f 2>/dev/null)"
 	/bin/losetup "$bb_w12_la" /tmp/bb_dir/w12-a.img 2>/dev/null
 	bb_w12_lb="$(/bin/losetup -f 2>/dev/null)"

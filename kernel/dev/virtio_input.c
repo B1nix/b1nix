@@ -268,7 +268,7 @@ static int vi_find_nth(int index, struct pci_device_info *info)
                     info->class_code = pci_config_read8((u8)bus, slot, func, 0x0B);
                     info->subclass = pci_config_read8((u8)bus, slot, func, 0x0A);
                     info->prog_if = pci_config_read8((u8)bus, slot, func, 0x09);
-                    info->irq_line = pci_config_read8((u8)bus, slot, func, 0x3C);
+                    info->irq_line = pci_intx_line((u8)bus, slot, func);
                 }
                 return 1;
             }

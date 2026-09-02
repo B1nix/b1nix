@@ -3,8 +3,16 @@
 #include <b1nix/console.h>
 #include <b1nix/serial.h>
 #include <b1nix/klog.h>
+#include <b1nix/lapic.h>
+#include <b1nix/sched.h>
+#include <b1nix/lockdep.h>
 #include <b1nix/kprintf.h>
+#include <b1nix/vfs.h>
+#include <b1nix/mm.h>
+#include <b1nix/ftrace.h>
 #include <b1nix/bootinfo.h>
+
+
 
 /* Kernel log ring buffer — KLOG_BUF_SIZE comes from <b1nix/klog.h> (64 KiB) so
  * the whole boot (PCI/driver/dhcp output, fed in via klog_putc from
@@ -16,44 +24,7 @@ static usize klog_read_pos;
 static int klog_overflow;
 
 /* ── Symbol table for backtraces ── */
-#define MAX_SYMBOLS 2048
 
-struct kernel_symbol {
-	u64 address;
-	char name[64];
-};
-
-static struct kernel_symbol symbol_table[MAX_SYMBOLS];
-static int symbol_count;
-
-void klog_register_symbol(u64 address, const char *name)
-{
-	if (symbol_count >= MAX_SYMBOLS) return;
-	symbol_table[symbol_count].address = address;
-	usize len = strlen(name);
-	if (len > 63) len = 63;
-	memcpy(symbol_table[symbol_count].name, name, len);
-	symbol_table[symbol_count].name[len] = '\0';
-	symbol_count++;
-}
-
-static const char *klog_lookup_symbol(u64 address)
-{
-	const char *best_name = 0;
-	u64 best_diff = (u64)-1;
-
-	for (int i = 0; i < symbol_count; i++) {
-		if (symbol_table[i].address <= address) {
-			u64 diff = address - symbol_table[i].address;
-			if (diff < best_diff) {
-				best_diff = diff;
-				best_name = symbol_table[i].name;
-			}
-		}
-	}
-
-	return best_name;
-}
 
 /* ── kallsyms: post-link symbol blob (M35) ──
  * Walks the packed [u64 addr][asciz name] records the two-pass link emitted
@@ -89,7 +60,7 @@ const char *ksym_lookup(u64 addr, u64 *off)
 	return best_name;
 }
 
-/* Print " <symbol+0xoff>" to console and serial if `addr` resolves. */
+/* Print " <symbol+0xoff>" to console if `addr` resolves. */
 void ksym_print(u64 addr)
 {
 	u64 off = 0;
@@ -98,15 +69,11 @@ void ksym_print(u64 addr)
 		return;
 	console_write(" <");
 	console_write(name);
-	serial_write(" <");
-	serial_write(name);
 	if (off) {
 		console_write("+0x");
 		console_write_hex64(off);
-		serial_write("+0x");
 	}
 	console_write(">");
-	serial_write(">");
 }
 
 static void klog_ring_put(char ch)
@@ -301,7 +268,12 @@ usize klog_size(void)
 	return KLOG_BUF_SIZE - klog_read_pos + klog_write_pos;
 }
 
-/* ── Enhanced panic with backtrace ── */
+/* ── Enhanced panic with backtrace ──
+ * Symbolication goes through ksym_print/ksym_lookup, i.e. the kallsyms blob the
+ * two-pass link appends. It used to use klog_lookup_symbol, which reads a small
+ * table that code has to register into by hand and which is empty in practice —
+ * so every kernel panic on every arch printed a bare address list, and aarch64
+ * (no gdbstub here) had nothing else to go on. */
 void panic_backtrace(void)
 {
 	int depth = 0;
@@ -321,22 +293,7 @@ void panic_backtrace(void)
 		console_write(" 0x");
 		console_write_hex64(lr);
 
-		const char *name = klog_lookup_symbol(lr);
-		if (name) {
-			console_write(" <");
-			console_write(name);
-			u64 sym_addr = 0;
-			for (int i = 0; i < symbol_count; i++) {
-				if (symbol_table[i].address <= lr &&
-				    symbol_table[i].address > sym_addr)
-					sym_addr = symbol_table[i].address;
-			}
-			if (sym_addr && lr > sym_addr) {
-				console_write("+0x");
-				console_write_hex64(lr - sym_addr);
-			}
-			console_write(">");
-		}
+		ksym_print(lr);
 		console_write("\n");
 
 		if (fp == 0 || fp <= (u64)(usize)rbp) break;
@@ -359,12 +316,7 @@ void panic_backtrace(void)
 		console_write(" 0x");
 		console_write_hex64(rip);
 
-		const char *name = klog_lookup_symbol(rip);
-		if (name) {
-			console_write(" <");
-			console_write(name);
-			console_write(">");
-		}
+		ksym_print(rip);
 		console_write("\n");
 
 		rbp = (u64 *)(usize)new_rbp;
@@ -386,12 +338,7 @@ void panic_backtrace(void)
 		console_write(" 0x");
 		console_write_hex64(eip);
 
-		const char *name = klog_lookup_symbol(eip);
-		if (name) {
-			console_write(" <");
-			console_write(name);
-			console_write(">");
-		}
+		ksym_print(eip);
 		console_write("\n");
 
 		ebp = (u32 *)(usize)new_ebp;
@@ -402,13 +349,519 @@ void panic_backtrace(void)
 	console_write("--- End Backtrace ---\n\n");
 }
 
+void klog_dump_recent(usize max_bytes)
+{
+	if (klog_write_pos == 0 && !klog_overflow)
+		return;
+	usize available = klog_overflow ? KLOG_BUF_SIZE : klog_write_pos;
+	if (max_bytes > available)
+		max_bytes = available;
+	if (max_bytes == 0)
+		return;
+
+	console_write("\n--- Recent Kernel Log Messages ---\n");
+	serial_write("\n--- Recent Kernel Log Messages ---\n");
+
+	char tmp[128];
+	usize tmp_idx = 0;
+	usize start_pos = (klog_write_pos + KLOG_BUF_SIZE - max_bytes) % KLOG_BUF_SIZE;
+
+	for (usize i = 0; i < max_bytes; i++) {
+		char ch = klog_buf[(start_pos + i) % KLOG_BUF_SIZE];
+		if (ch) {
+			tmp[tmp_idx++] = ch;
+			if (tmp_idx == sizeof(tmp) - 1) {
+				tmp[tmp_idx] = '\0';
+				console_write(tmp);
+				serial_write(tmp);
+				tmp_idx = 0;
+			}
+		}
+	}
+	if (tmp_idx > 0) {
+		tmp[tmp_idx] = '\0';
+		console_write(tmp);
+		serial_write(tmp);
+	}
+	console_write("\n--- End Recent Log ---\n\n");
+	serial_write("\n--- End Recent Log ---\n\n");
+}
+
+static const char *klog_task_state_str(int st)
+{
+	switch (st) {
+	case 0: return "RUNNING";
+	case 1: return "READY";
+	case 2: return "BLOCKED";
+	case 3: return "SLEEPING";
+	case 4: return "STOPPED";
+	case 5: return "DEAD";
+	case 6: return "REAPING";
+	default: return "UNKNOWN";
+	}
+}
+
+extern char __kernel_text_start[], __kernel_text_end[];
+extern char __kernel_start[], __kernel_end[];
+
+void describe_address(u64 addr) {
+	if (addr == 0) {
+		console_write(" -> NULL POINTER (0x0)");
+		return;
+	}
+	if (addr < 0x1000) {
+		console_write(" -> NULL POINTER DEREFERENCE (+0x");
+		console_write_hex64(addr);
+		console_write(" struct offset)");
+		return;
+	}
+	if (addr >= (u64)(usize)__kernel_text_start && addr < (u64)(usize)__kernel_text_end) {
+		console_write(" -> [Kernel Text .text] ");
+		ksym_print(addr);
+		return;
+	}
+	if (addr >= (u64)(usize)__kernel_start && addr < (u64)(usize)__kernel_end) {
+		console_write(" -> [Kernel Image .rodata/.data/.bss]");
+		return;
+	}
+	struct task *t = current_task;
+	if (t && t->stack) {
+		u64 sbase = (u64)(usize)t->stack;
+		if (addr >= sbase && addr < sbase + 131072) {
+			console_write(" -> [Kernel Stack of pid=");
+			console_write_dec((u64)t->id);
+			console_write(" '");
+			console_write(t->name ? t->name : "none");
+			console_write("']");
+			return;
+		}
+	}
+	if (addr >= 0x1000000000ULL && addr < 0x4000000000ULL) {
+		console_write(" -> [Kernel Heap (kheap/arena)]");
+		return;
+	}
+#ifdef __x86_64__
+	if (addr >= 0xffffc00000000000ULL) {
+		console_write(" -> [Kernel Heap (kheap)]");
+		return;
+	}
+	if (addr >= 0xffff800000000000ULL) {
+		console_write(" -> [Kernel Direct Map]");
+		return;
+	}
+#endif
+	if (addr >= 0x40000000ULL && addr < 0x100000000ULL) {
+		console_write(" -> [Physical RAM Window]");
+		return;
+	}
+	if (addr >= 0x08000000ULL && addr < 0x40000000ULL) {
+		console_write(" -> [Device MMIO Space]");
+		return;
+	}
+	if (addr < 0x0000800000000000ULL) {
+		console_write(" -> [User Space Virtual Address]");
+		return;
+	}
+	console_write(" -> [High Kernel Address]");
+}
+
+void dump_code_around_pc(u64 pc) {
+	if (pc < (u64)(usize)__kernel_text_start || pc >= (u64)(usize)__kernel_text_end) {
+		return;
+	}
+	console_write("\nCode around PC (0x");
+	console_write_hex64(pc);
+	ksym_print(pc);
+	console_write("):\n  ");
+
+#if defined(__aarch64__)
+	/* AArch64: 32-bit instructions (4-byte aligned) */
+	u32 *ptr = (u32 *)(usize)(pc & ~3ULL);
+	u32 *start = ptr - 4;
+	u32 *end = ptr + 5;
+	if ((u64)(usize)start < (u64)(usize)__kernel_text_start) start = (u32 *)(usize)__kernel_text_start;
+	if ((u64)(usize)end > (u64)(usize)__kernel_text_end) end = (u32 *)(usize)__kernel_text_end;
+
+	for (u32 *p = start; p < end; p++) {
+		if (p == ptr) {
+			console_write(" <0x");
+			console_write_hex64(*p);
+			console_write(">");
+		} else {
+			console_write(" 0x");
+			console_write_hex64(*p);
+		}
+	}
+#else
+	/* x86_64: variable length bytes */
+	u8 *ptr = (u8 *)(usize)pc;
+	u8 *start = ptr - 16;
+	u8 *end = ptr + 16;
+	if ((u64)(usize)start < (u64)(usize)__kernel_text_start) start = (u8 *)(usize)__kernel_text_start;
+	if ((u64)(usize)end > (u64)(usize)__kernel_text_end) end = (u8 *)(usize)__kernel_text_end;
+
+	for (u8 *p = start; p < end; p++) {
+		if (p == ptr) {
+			console_write(" <0x");
+			console_write_hex64(*p);
+			console_write(">");
+		} else {
+			console_write(" 0x");
+			console_write_hex64(*p);
+		}
+	}
+#endif
+	console_write("\n");
+}
+
+void dump_raw_stack_with_symbols(u64 sp, usize num_words) {
+	if (sp < 0x1000 || (sp & 7) != 0)
+		return;
+
+	console_write("\n--- Raw Kernel Stack (SP=0x");
+	console_write_hex64(sp);
+	console_write(") ---\n");
+
+	u64 *stack_words = (u64 *)(usize)sp;
+	for (usize i = 0; i < num_words; i++) {
+		u64 val = stack_words[i];
+		console_write("  [SP+0x");
+		console_write_hex64((u64)(i * 8));
+		console_write("] 0x");
+		console_write_hex64(val);
+		if (val >= (u64)(usize)__kernel_text_start && val < (u64)(usize)__kernel_text_end) {
+			ksym_print(val);
+		}
+		console_write("\n");
+	}
+	console_write("--- End Stack ---\n");
+}
+
+void dump_smp_cpus_state(void) {
+	console_write("\n--- SMP CPU State Snapshot ---\n");
+	for (int i = 0; i < MAX_CPUS; i++) {
+		struct percpu *pc = get_percpu_n(i);
+		if (!pc || !pc->cpu_online) continue;
+		console_write("  CPU ");
+		console_write_dec((u64)pc->cpu_id);
+		struct task *t = pc->cur_task;
+		if (t) {
+			console_write(": pid=");
+			console_write_dec((u64)t->id);
+			console_write(" ('");
+			console_write(t->name ? t->name : "none");
+			console_write("') state=");
+			console_write(klog_task_state_str((int)t->state));
+			if (t->wait_chan) {
+				console_write(" wait=0x");
+				console_write_hex64((u64)(usize)t->wait_chan);
+				ksym_print((u64)(usize)t->wait_chan);
+			}
+		} else {
+			console_write(": [IDLE / NO TASK]");
+		}
+		/* Which task this CPU parks into. Two CPUs reading `cur_task = boot`
+		 * is indistinguishable from one CPU whose idle task simply IS boot
+		 * without this. */
+		{
+			struct task *it = (struct task *)pc->idle_task;
+			console_write(" idle='");
+			console_write(it ? (it->name ? it->name : "none") : "-");
+			console_write("'");
+		}
+		console_write("\n");
+	}
+	console_write("--- End SMP Snapshot ---\n");
+}
+
+void dump_memory_summary(void) {
+	console_write("\n--- Memory & Resource Snapshot ---\n");
+	usize free_f = pmm_free_frame_count();
+	console_write("  PMM Free Frames: ");
+	console_write_dec((u64)free_f);
+	console_write(" (");
+	console_write_dec((u64)(free_f * PAGE_SIZE / (1024 * 1024)));
+	console_write(" MB free)\n");
+
+	u64 kh_mapped = kheap_mapped_bytes();
+	console_write("  KHeap Footprint: ");
+	console_write_dec(kh_mapped / 1024);
+	console_write(" kB\n");
+
+	console_write("  Active VFS Inodes/Nodes: ");
+	console_write_dec((u64)vfs_active_node_count());
+	console_write("\n");
+	console_write("--- End Memory Snapshot ---\n");
+}
+
+
+void dump_task_fds(struct task *t) {
+	if (!t || !t->fd_table) return;
+	console_write("\n--- Task Open File Descriptors (pid=");
+	console_write_dec((u64)t->id);
+	console_write(") ---\n");
+	int printed = 0;
+	for (u32 fd = 0; fd < t->fd_capacity && fd < 32; fd++) {
+		struct vfs_handle *h = t->fd_table[fd];
+		if (!h || !h->used) continue;
+		printed++;
+		console_write("  fd ");
+		console_write_dec((u64)fd);
+		console_write(": ");
+		if (h->open_path) {
+			console_write(h->open_path);
+		} else if (h->node && h->node->name[0]) {
+			console_write(h->node->name);
+		} else {
+			switch (h->kind) {
+			case VFS_HANDLE_PIPE_READ: console_write("pipe:[r]"); break;
+			case VFS_HANDLE_PIPE_WRITE: console_write("pipe:[w]"); break;
+			case VFS_HANDLE_SOCKET: console_write("socket:[]"); break;
+			case VFS_HANDLE_EVENTFD: console_write("eventfd:[]"); break;
+			case VFS_HANDLE_TIMERFD: console_write("timerfd:[]"); break;
+			case VFS_HANDLE_SIGNALFD: console_write("signalfd:[]"); break;
+			case VFS_HANDLE_EPOLL: console_write("epoll:[]"); break;
+			case VFS_HANDLE_INOTIFY: console_write("inotify:[]"); break;
+			default: console_write("anon:[]"); break;
+			}
+		}
+		console_write(" (ref=");
+		console_write_dec((u64)h->refcount);
+		console_write(" off=");
+		console_write_dec((u64)h->offset);
+		console_write(")\n");
+	}
+	if (!printed) {
+		console_write("  (no open files)\n");
+	}
+	console_write("--- End FD Table ---\n");
+}
+
+void dump_task_vmas(struct task *t) {
+	if (!t || !t->vma_list) return;
+	console_write("\n--- Task Memory Map VMAs (pid=");
+	console_write_dec((u64)t->id);
+	console_write(") ---\n");
+	int count = 0;
+	for (struct vm_area *vma = t->vma_list; vma && count < 16; vma = vma->next, count++) {
+		console_write("  0x");
+		console_write_hex64(vma->start);
+		console_write(" - 0x");
+		console_write_hex64(vma->end);
+		console_write(" ");
+		console_write((vma->prot & 1) ? "r" : "-");
+		console_write((vma->prot & 2) ? "w" : "-");
+		console_write((vma->prot & 4) ? "x" : "-");
+		console_write((vma->flags & 0x02) ? "p" : "s");
+		if (vma->node && vma->node->name[0]) {
+			console_write(" ");
+			console_write(vma->node->name);
+		}
+		console_write("\n");
+	}
+	console_write("--- End Memory Map ---\n");
+}
+
+
+void dump_task_signals(struct task *t) {
+	if (!t) return;
+	console_write("\n--- Task Signal State (pid=");
+	console_write_dec((u64)t->id);
+	console_write(") ---\n");
+	console_write("  Pending: 0x");
+	console_write_hex64(t->pending_signals);
+	console_write(" | Mask/Blocked: 0x");
+	console_write_hex64(t->blocked_signals);
+	if (t->last_stop_signal) {
+		console_write(" | Last Stop Signal: ");
+		console_write_dec((u64)t->last_stop_signal);
+	}
+	console_write("\n--- End Task Signals ---\n");
+}
+
+void dump_uptime_summary(void) {
+	console_write("\n--- System Uptime ---\n");
+	u64 ticks = scheduler_get_ticks();
+	u64 hz = sched_tick_hz();
+	console_write("  Uptime: ");
+	console_write_dec(ticks / hz);
+	console_write(".");
+	/* Milliseconds of the partial second, at whatever rate the timer was
+	 * armed with -- dividing by a hardcoded 100 reported ten times the real
+	 * uptime once the tick moved to 1 kHz. */
+	u64 ms = hz ? (ticks % hz) * 1000ull / hz : 0;
+	if (ms < 100) console_write("0");
+	if (ms < 10) console_write("0");
+	console_write_dec(ms);
+	console_write("s (");
+	console_write_dec(ticks);
+	console_write(" ticks, HZ=");
+	console_write_dec(hz);
+	console_write(")\n");
+	console_write("--- End Uptime ---\n");
+}
+
+
+#undef panic
+
 void panic(const char *message)
 {
+	panic_at(message, 0, 0);
+}
+
+void panic_at(const char *message, const char *file, int line)
+{
+	/* One panicking CPU owns the console; the rest stop without printing. */
+	{
+		static volatile int panic_owner; /* cpu_id + 1, 0 = unclaimed */
+		struct percpu *pc = get_percpu();
+		int me = (pc ? pc->cpu_id : 0) + 1;
+		int unclaimed = 0;
+
+		if (!__atomic_compare_exchange_n(&panic_owner, &unclaimed, me, 0,
+		                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+			if (panic_owner != me)
+				arch_halt(); /* somebody else is printing; stay out of it */
+		}
+	}
+
+	/* Own the console for the whole dump.
+	 *
+	 * Claiming panic_owner above only stops a SECOND panic from interleaving.
+	 * A CPU that is still running normally goes on printing, and its output
+	 * lands character by character inside the register dump -- which is how
+	 * "sched: corrupt kernel stack pointer for pid ..." arrived shredded, with
+	 * the pid and the two pointers, the whole point of the message, unreadable.
+	 *
+	 * Take the lock rather than busting it. Busting is only right when the
+	 * holder is the CPU that just died, and that is what the bounded spin
+	 * decides: whoever holds it has a few million cycles to finish a line, and
+	 * if they do not they are gone and the lock is taken anyway. Held for the
+	 * rest of this function, which never returns -- console_write sees
+	 * console_lock_held_here() and prints straight through. */
+	{
+		u64 spins = 0;
+		u64 cflags;
+
+		while (!console_lock_try_acquire_irqsave(&cflags)) {
+			if (++spins > 8000000ull) {
+				console_bust_lock();
+				console_lock_acquire_irqsave(&cflags);
+				break;
+			}
+		}
+	}
+
 	/* If we are dying before the command line was parsed, the console is
 	 * still holding every line of the boot back; release them, or the panic
 	 * arrives without the context that explains it. */
 	console_log_panic_flush();
+
+	/* The marker every harness looks for, emitted before anything else.
+	 *
+	 * tests/smoke.sh ends an instance on "KERNEL PANIC" or "[PANIC]", CLAUDE.md
+	 * documents both, and this function printed neither -- klog_write maps
+	 * KLOG_PANIC to LOGLEVEL_EMERG, so a panic came out as "<0>message" and
+	 * nothing matched. The string did exist, in kernel/lib/panic.c, which is
+	 * not in the build; that dead copy is why everyone believed it was there.
+	 *
+	 * The cost was not cosmetic: a panicking instance stopped writing and the
+	 * runner then waited out its full 320-second silence allowance before
+	 * killing it. Three such lanes is most of the wall clock of a failing run.
+	 */
+	console_write("\nKERNEL PANIC: ");
+	console_write(message ? message : "(no message)");
+	serial_write("\nKERNEL PANIC: ");
+	serial_write(message ? message : "(no message)");
+
+	if (file && file[0]) {
+		console_write(" at ");
+		console_write(file);
+		console_write(":");
+		console_write_dec((u64)line);
+
+		serial_write(" at ");
+		serial_write(file);
+	}
+	console_write("\n");
+	serial_write("\n");
+
+	/* Print current CPU & Task state */
+	struct percpu *pc = get_percpu();
+	u32 cpu = pc ? pc->cpu_id : 0;
+	console_write("  CPU: ");
+	console_write_dec((u64)cpu);
+
+	struct task *t = pc ? pc->cur_task : NULL;
+	if (t) {
+		console_write(" | Task: pid=");
+		console_write_dec((u64)t->id);
+		console_write(" ('");
+		console_write(t->name ? t->name : "none");
+		console_write("') state=");
+		console_write(klog_task_state_str((int)t->state));
+
+		if (t->wait_chan) {
+			console_write(" wait_chan=0x");
+			console_write_hex64((u64)(usize)t->wait_chan);
+			ksym_print((u64)(usize)t->wait_chan);
+		}
+
+		console_write("\n  Stack: base=0x");
+		console_write_hex64((u64)(usize)t->stack);
+		console_write(" ksp=0x");
+		console_write_hex64(t->kernel_stack_ptr);
+	}
+	console_write("\n");
+
 	klog_write(KLOG_PANIC, message);
+
+	/* Dump recent klog ring messages for crash context */
+	klog_dump_recent(1024);
+
+	/* Dump backtrace */
 	panic_backtrace();
+
+	/* Dump raw stack words with symbol lookup */
+	dump_raw_stack_with_symbols((u64)(usize)__builtin_frame_address(0), 16);
+
+	/* Dump task resources & signals if task available */
+	if (t) {
+		dump_task_signals(t);
+		dump_task_fds(t);
+		dump_task_vmas(t);
+	}
+
+	/* Dump recent syscall flight recorder */
+	dump_recent_syscalls();
+
+	/* Dump ftrace history if active */
+	if (ftrace_count() > 0) {
+		ftrace_dump();
+	}
+
+	/* Dump all active tasks in system */
+	scheduler_dump_tasks();
+
+	/* Dump mounted filesystems */
+	vfs_dump_mounts();
+
+	/* Dump SMP other CPUs state */
+	dump_smp_cpus_state();
+
+	/* Dump memory & resource summary */
+	dump_memory_summary();
+
+	/* Dump system uptime */
+	dump_uptime_summary();
+
+	/* Dump held locks if lockdep enabled */
+	lockdep_dump_all();
+
 	arch_halt();
 }
+
+
+
+
+

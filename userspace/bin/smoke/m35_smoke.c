@@ -46,6 +46,11 @@ static void fail(const char *name) {
 #define OFF_E_PHOFF   32 /* Elf64_Ehdr.e_phoff */
 #define OFF_E_PHNUM   56 /* Elf64_Ehdr.e_phnum */
 #define PHDR_SIZE     56 /* sizeof(Elf64_Phdr) */
+#elif defined(__aarch64__)
+#define CORE_EM       183 /* EM_AARCH64 */
+#define OFF_E_PHOFF   32  /* Elf64_Ehdr.e_phoff */
+#define OFF_E_PHNUM   56  /* Elf64_Ehdr.e_phnum */
+#define PHDR_SIZE     56  /* sizeof(Elf64_Phdr) */
 #else
 #define CORE_EM       3  /* EM_386 */
 #define OFF_E_PHOFF   28 /* Elf32_Ehdr.e_phoff */

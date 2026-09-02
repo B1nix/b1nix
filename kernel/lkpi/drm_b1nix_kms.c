@@ -103,7 +103,17 @@ static void b1nix_gem_free(struct drm_gem_object *obj)
 {
 	struct b1nix_gem *bo = to_b1nix_gem(obj);
 
-	drm_gem_private_object_fini(obj);
+	/* release(), not private_object_fini().
+	 *
+	 * fini() only tears down the reservation object. The object also owns an
+	 * mmap offset -- a drm_mm node living INSIDE this struct, linked into the
+	 * device's offset manager -- and release() is what takes it back out
+	 * (drm_gem_free_mmap_offset), along with the LRU entry. Freeing the object
+	 * without it left a node of freed memory in the manager's tree: the next
+	 * object to ask for an offset descended into it, read a pointer out of
+	 * reused heap, and took a #GP inside drm_mm's hole-size tree. That is the
+	 * "second mmap offset faults" defect this driver was gated behind. */
+	drm_gem_object_release(obj);
 	/* Tell the host before the pages go: the resource points at them, and
 	 * freeing the memory a live resource is attached to leaves the host
 	 * writing into whatever takes their place. */
@@ -458,24 +468,29 @@ static int virgl_trace(void)
 /*
  * Is the accelerated path offered at all?
  *
- * It is complete up to one defect that is NOT in this file: the first real use
- * of upstream's drm_mm range allocator -- inserting a SECOND mmap offset --
- * faults inside drm_mm_insert_node_in_range, in the shim's augmented rbtree.
- * Until that is fixed, a client that takes this path renders one object and
- * then takes the machine down with it.
+ * Yes, wherever the host actually offers 3D: lkpi_virgl_available() is what
+ * decides, and on a plain virtio-gpu with no virglrenderer behind it the answer
+ * is no, GETPARAM reports no 3D, and Mesa picks software cleanly.
  *
- * So the offer is behind b1nix.virgl-drm. Off, GETPARAM answers "no 3D" and
- * Mesa falls back to software cleanly, which is the designed behaviour and is
- * safe. On, the path runs for whoever is working on it. Answering "yes" by
- * default while knowing it crashes would be the worst of the three.
+ * This used to be gated behind b1nix.virgl-drm because the path took the
+ * machine down after one object. Three defects, none of them in drm_mm:
+ * this driver freed a GEM object without drm_gem_object_release(), leaving its
+ * mmap-offset node in the manager's tree pointing at freed heap; the host-side
+ * resource unref freed the GEM object's pages a second time; and execbuffer
+ * ignored VIRTGPU_EXECBUF_FENCE_FD_OUT, so Mesa waited on a fence that was
+ * never created. With those fixed the path renders and reads back correctly
+ * (RENDER-SMOKE: ok accel-frame), so it is offered by default.
+ *
+ * b1nix.no-virgl-drm forces it off — for bisecting a rendering fault against
+ * the software path without rebuilding.
  */
 static int b1nix_virgl_offered(void)
 {
-	static int on = -1;
+	static int off = -1;
 
-	if (on < 0)
-		on = lkpi_bootflag("b1nix.virgl-drm");
-	return on && lkpi_virgl_available();
+	if (off < 0)
+		off = lkpi_bootflag("b1nix.no-virgl-drm");
+	return !off && lkpi_virgl_available();
 }
 
 static int b1nix_virgl_ctx_ready(void)
@@ -756,6 +771,17 @@ static int b1nix_ioctl_execbuffer(struct drm_device *dev, void *data,
 		return -EINVAL;
 	if (args->size > 512u * 1024u)
 		return -EINVAL;
+	/* Refuse what is not implemented instead of returning success for it.
+	 * Ignoring an unknown flag and answering 0 is how a client ends up
+	 * waiting on a fence nobody ever created. */
+	if (args->flags & ~(u32)(VIRTGPU_EXECBUF_FENCE_FD_IN |
+				 VIRTGPU_EXECBUF_FENCE_FD_OUT |
+				 VIRTGPU_EXECBUF_RING_IDX))
+		return -EINVAL;
+	/* FENCE_FD_IN names work this submission must follow. Every submission on
+	 * this transport is already complete when its ioctl returns, so anything
+	 * the client could name is finished before we are called and there is
+	 * nothing to wait for. */
 
 	cmd = kzalloc(args->size, GFP_KERNEL);
 	if (!cmd)
@@ -765,11 +791,22 @@ static int b1nix_ioctl_execbuffer(struct drm_device *dev, void *data,
 		kfree(cmd);
 		return -EFAULT;
 	}
-	VIRGL_TRACE("execbuffer %u bytes, %u bo handles", args->size,
-		    args->num_bo_handles);
+	VIRGL_TRACE("execbuffer %u bytes, %u bo handles, flags=0x%x fence_fd=%d",
+		    args->size, args->num_bo_handles, args->flags,
+		    args->fence_fd);
 	ret = lkpi_virgl_submit(B1NIX_VIRGL_CTX, cmd, args->size) < 0 ? -EIO : 0;
-	VIRGL_TRACE("execbuffer -> %d", ret);
 	kfree(cmd);
+	if (ret == 0 && (args->flags & VIRTGPU_EXECBUF_FENCE_FD_OUT)) {
+		/* The work is done; hand back a fence that says so. */
+		int fd = lkpi_fence_fd_signalled();
+
+		if (fd < 0)
+			return fd;
+		args->fence_fd = fd;
+	}
+	VIRGL_TRACE("execbuffer -> %d fence_out=%d", ret,
+		    (args->flags & VIRTGPU_EXECBUF_FENCE_FD_OUT) ? args->fence_fd
+								 : -1);
 	return ret;
 }
 

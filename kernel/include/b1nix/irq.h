@@ -68,3 +68,17 @@ void msi_free_vector(int vector);
 
 /* Call the owner of `vector` (arch IRQ entry). Returns 1 if a handler ran. */
 int msi_dispatch(int vector);
+
+/* Build the address/data pair a device must write to raise `vector`, and do
+ * whatever the interrupt controller needs first (on aarch64 that is the ITS
+ * mapping commands). Called from pci_msi_enable/pci_msix_enable. */
+int arch_msi_prepare(u8 bus, u8 slot, u8 func, int vector, u64 *addr_out,
+                     u32 *data_out);
+
+/* Can this machine deliver a message-signalled interrupt at all? x86 always
+ * can; aarch64 needs a GICv3 with an ITS. */
+int arch_msi_supported(void);
+
+/* What arch_msi_prepare programmed for `vector`, for a self-test that checks a
+ * device is armed for the interrupt it thinks it is. */
+int arch_msi_expected(int vector, u64 *addr_out, u32 *data_out);

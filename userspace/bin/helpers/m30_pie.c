@@ -33,7 +33,7 @@ static long raw_syscall(long n, long a, long b, long c) {
                    : "rcx", "r11", "memory");
   return ret;
 }
-#else
+#elif defined(__i386__)
 static long raw_syscall(long n, long a, long b, long c) {
   long ret;
   register long ebx __asm__("ebx") = a;
@@ -45,6 +45,18 @@ static long raw_syscall(long n, long a, long b, long c) {
                    : "r"(eax), "r"(ebx), "r"(ecx), "r"(edx)
                    : "memory");
   return ret;
+}
+#elif defined(__aarch64__)
+static long raw_syscall(long n, long a, long b, long c) {
+  register long x8 __asm__("x8") = n;
+  register long x0 __asm__("x0") = a;
+  register long x1 __asm__("x1") = b;
+  register long x2 __asm__("x2") = c;
+  __asm__ volatile("svc 0"
+                   : "+r"(x0)
+                   : "r"(x8), "r"(x1), "r"(x2)
+                   : "memory");
+  return x0;
 }
 #endif
 

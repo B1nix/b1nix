@@ -53,8 +53,8 @@ extern "C" {
  * _IOWR('M', dev, int) under the Linux _IOC layout. Volume values are packed
  * as `left | (right << 8)`, 0..100 per channel; MUTE is a 0/1 flag. Writes
  * echo the accepted value back to the caller. */
-#define MIXER_READ(dev)   (0x80004D00U | ((dev) & 0xFF))
-#define MIXER_WRITE(dev)  (0xC0004D00U | ((dev) & 0xFF))
+#define MIXER_READ(dev)   (0x80044D00U | ((dev) & 0xFF))
+#define MIXER_WRITE(dev)  (0xC0044D00U | ((dev) & 0xFF))
 
 #define SOUND_MIXER_READ_VOLUME     MIXER_READ(SOUND_MIXER_VOLUME)
 #define SOUND_MIXER_WRITE_VOLUME    MIXER_WRITE(SOUND_MIXER_VOLUME)

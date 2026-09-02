@@ -84,7 +84,14 @@ render_run_case() {
 
 	echo "RENDER-SMOKE: $_label starting sway renderer=$WLR_RENDERER" \
 	     "device=${WLR_RENDER_DRM_DEVICE:-none}"
-	sway -c /etc/sway/render-smoke.conf > "/tmp/render-$_label-sway.log" 2>&1 &
+	# -d on the accelerated case only: that is the path still being brought
+	# up, and "the colour never arrived" says nothing about which half — the
+	# compositor's render or the client's buffer — did not happen. The other
+	# two cases stay quiet so their logs remain readable.
+	_swayargs=""
+	[ "$_label" = accel ] && _swayargs="-d"
+	sway $_swayargs -c /etc/sway/render-smoke.conf \
+		> "/tmp/render-$_label-sway.log" 2>&1 &
 	_swaypid=$!
 
 	_i=0
@@ -107,6 +114,11 @@ render_run_case() {
 	export WAYLAND_DISPLAY="$_sock"
 	SWAYSOCK=$(ls -1 "$XDG_RUNTIME_DIR"/sway-ipc.*.sock 2>/dev/null | head -1)
 	export SWAYSOCK
+	# The clipboard check needs a live compositor and therefore runs after the
+	# socket is ready, not before render-smoke starts sway.
+	if [ "$_label" = "software" ] && [ -x /bin/m51_clipboard_smoke ]; then
+		/bin/m51_clipboard_smoke
+	fi
 
 	for _c in "$_c1" "$_c2"; do
 		# The compositor repaints on its own clock, so the frame carrying
@@ -156,6 +168,8 @@ render_run_case() {
 		if [ $_shot -ne 1 ]; then
 			_ok=0
 			echo "RENDER-SMOKE: $_label colour=$_c never-arrived; sway log:"
+			grep -iE 'error|fail|renderer|texture|shm|dmabuf|swaybg' \
+				"/tmp/render-$_label-sway.log" | tail -30
 			tail -10 "/tmp/render-$_label-sway.log"
 		fi
 	done

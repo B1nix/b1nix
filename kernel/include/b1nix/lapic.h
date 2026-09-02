@@ -183,6 +183,9 @@ static inline struct percpu *get_percpu(void) {
 #ifdef __x86_64__
     u64 gs = arch_get_gs_base();
     return gs ? (struct percpu *)gs : (struct percpu *)0;
+#elif defined(__aarch64__)
+    extern struct percpu *aarch64_get_percpu(void);
+    return aarch64_get_percpu();
 #else
     u32 fs = arch_get_fs_base_percpu();
     return fs ? (struct percpu *)fs : (struct percpu *)0;

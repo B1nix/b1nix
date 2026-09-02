@@ -1,14 +1,41 @@
+#include <b1nix/ktime.h>
+#include <b1nix/arch.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/blk.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/amdvi.h>
 #include <b1nix/iommu.h>
+#if defined(__aarch64__)
+#include <b1nix/smmuv3.h>
+#else
+/* The SMMUv3 is an arm64 unit and kernel/dev/smmuv3.c is not built for x86_64.
+ * These stand in for it so the unit indirection below reads the same on both
+ * arches. Every one of them is unreachable here: unit_smmu_active() is a
+ * compile-time zero on this arch. */
+static inline int smmuv3_active(void) { return 0; }
+static inline int smmuv3_map(u64 iova, u64 phys, usize size, int writable)
+{ (void)iova; (void)phys; (void)size; (void)writable; return -1; }
+static inline int smmuv3_unmap(u64 iova, usize size)
+{ (void)iova; (void)size; return -1; }
+static inline u64 smmuv3_translate(u64 iova) { (void)iova; return 0; }
+static inline u32 smmuv3_fault_count(void) { return 0; }
+static inline void smmuv3_fault_clear(void) {}
+static inline int smmuv3_attach_device(u8 bus, u8 slot, u8 func)
+{ (void)bus; (void)slot; (void)func; return -1; }
+static inline void smmuv3_detach_device(u8 bus, u8 slot, u8 func)
+{ (void)bus; (void)slot; (void)func; }
+static inline void smmuv3_fault_last(u64 *addr, u32 *sid, u8 *type)
+{ if (addr) *addr = 0; if (sid) *sid = 0; if (type) *type = 0; }
+#endif
 #include <b1nix/irq.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/nvme.h>
 #include <b1nix/pci.h>
+#if defined(__aarch64__)
+#include <b1nix/gicv3.h>
+#endif
 #include <lkpi/dma-mapping.h>
 #include <b1nix/sched.h>
 #include <string.h>
@@ -70,6 +97,7 @@ struct nvme_device {
     char blk_name[16];
     u16 cid_counter;
     volatile int io_busy; // yield-safe I/O-path mutex (see nvme_io_lock)
+    volatile u64 io_owner; // pid holding io_busy, for the stall report
 
     /* M98: message-signalled completions. use_msix is set once the controller's
      * MSI-X table entry 0 is programmed with msix_vector; until then the driver
@@ -95,14 +123,80 @@ static usize nvme_controller_count;
  * re-enters nvme_io_transfer() and corrupts the in-flight queue entry / head
  * tracking. Mirrors virtio_blk's and AHCI's busy-flag mutex: spin with
  * scheduler_yield() so no real spinlock is held across the DMA wait. */
+extern u64 g_nvme_io_submits, g_nvme_io_completions;
+
 static void nvme_io_lock(struct nvme_device *dev) {
+    u64 start_ns = ktime_monotonic_ns();
+    int reported = 0;
+
     while (__sync_lock_test_and_set(&dev->io_busy, 1)) {
+        /* A yield-spin on a flag nothing ever releases is indistinguishable
+         * from a wedged machine: the waiter stays READY, prints nothing, and
+         * the lane dies on the harness timeout with no evidence at all. Name
+         * the task that took it and never gave it back.
+         *
+         * On WALL CLOCK, not on a spin count -- the same correction the
+         * completion wait below already carries, and for the same reason. Every
+         * iteration here ends in scheduler_yield(), which costs a whole tick
+         * once the scheduler is up, so the old count of 200,000 meant something
+         * like 2000 seconds: twenty times the harness's patience, so the report
+         * could never fire and every wedge involving this mutex arrived with no
+         * evidence. Five seconds is far beyond any honest NVMe command. */
+        if (!reported && ktime_monotonic_ns() - start_ns > 5000000000ull) {
+            reported = 1;
+            console_write("nvme: io mutex held by pid ");
+            console_write_dec(dev->io_owner);
+            console_write(" for over 5s; waiter pid ");
+            console_write_dec(current_task ? (u64)current_task->id : 0);
+            console_write(" submits=");
+            console_write_dec(g_nvme_io_submits);
+            console_write(" completions=");
+            console_write_dec(g_nvme_io_completions);
+            console_write("\n");
+        }
         scheduler_yield();
     }
+    dev->io_owner = current_task ? (u64)current_task->id : 0;
 }
 
 static void nvme_io_unlock(struct nvme_device *dev) {
+    dev->io_owner = 0;
     __sync_lock_release(&dev->io_busy);
+}
+
+/* Called from the exit path with the dying task's id.
+ *
+ * A task that goes away between nvme_io_lock() and nvme_io_unlock() leaves
+ * io_busy set for ever. Every later I/O to this device then yield-spins in
+ * nvme_io_lock, and the lane dies on the harness timeout with the device idle
+ * and no fault anywhere. This is the same leak vfs_release_inode_locks_of
+ * exists for, in the same shape, and it was caught the same way: a wedged lane
+ * whose dump said submits=399 completions=398 busy=1, with the command
+ * outstanding for over sixty seconds -- and with NEITHER five-second report
+ * firing, which is the part that names it. The one inside the completion wait
+ * cannot fire unless somebody is executing that loop, and the one in
+ * nvme_io_lock cannot fire unless somebody is waiting for the mutex. Both
+ * silent means the owner is gone.
+ *
+ * The command it left in flight is not recovered: the controller either
+ * completes it into a queue slot nobody is watching or it never fetched it, and
+ * the driver has no way to tell which. Releasing the mutex is what keeps the
+ * rest of the system alive; the report says a command was lost rather than
+ * letting it look like a clean hand-back. */
+void nvme_release_io_lock_of(u64 pid)
+{
+    struct nvme_device *dev = &nvme;
+
+    if (!pid || !dev->io_busy || dev->io_owner != pid)
+        return;
+    console_write("nvme: task ");
+    console_write_dec(pid);
+    console_write(" exited holding the io mutex (submits=");
+    console_write_dec(g_nvme_io_submits);
+    console_write(" completions=");
+    console_write_dec(g_nvme_io_completions);
+    console_write("); releasing it\n");
+    nvme_io_unlock(dev);
 }
 
 /* M70: I/O completion interrupt handler. Runs in IRQ context. The controller's
@@ -153,7 +247,7 @@ static int nvme_wait_ready(volatile struct nvme_registers *regs, int ready)
         u32 csts = regs->csts;
         int rdy = (csts & NVME_CSTS_RDY) ? 1 : 0;
         if (rdy == ready) return 0;
-        __asm__ volatile("pause");
+        cpu_relax();
         timeout--;
     }
     return -1; // Timeout
@@ -179,7 +273,14 @@ static int nvme_admin_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     tail = (u16)((tail + 1) % dev->queue_size);
     dev->admin_sq_tail = tail;
     
-    // Ring the doorbell
+    /* The submission entry must be visible to the controller BEFORE the
+     * doorbell that tells it to go and read it. Nothing ordered the two on this
+     * driver, which is invisible on x86 (stores are ordered) and on TCG (one
+     * thread), and is a hang on aarch64 under a real hypervisor: the device
+     * thread sees the doorbell, reads a stale queue slot, and no completion is
+     * ever posted — the waiter then polls a CQE that will never arrive. Same
+     * barrier virtio's notify path has taken since it was written. */
+    __sync_synchronize();
     volatile u32 *sq_tdb = nvme_doorbell(dev, 0, 0);
     *sq_tdb = tail;
     
@@ -193,6 +294,9 @@ static int nvme_admin_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
         // Check if there's a completion
         struct nvme_cqe *cqe = &dev->admin_cq[cq_head];
         if (cqe->status != 0xFFFF) {
+            /* The status word is the flag; the rest of the entry (and whatever
+             * the command DMA'd) must not be read from before it. */
+            __sync_synchronize();
             u16 status = cqe->status;
             cqe->status = 0xFFFF; // Reset status on consume
             
@@ -263,6 +367,52 @@ static int nvme_create_io_sq(struct nvme_device *dev)
     return nvme_admin_submit(dev, &sqe);
 }
 
+/* How much I/O this controller has actually done. A flush that is merely SLOW
+ * and one that is stuck on a lost completion look identical from outside -- the
+ * lane goes quiet either way -- and these two counters, sampled twice by the
+ * guest watchdog, tell them apart. */
+u64 g_nvme_io_submits;
+u64 g_nvme_io_completions;
+u64 g_nvme_wait_start_ns; /* when the in-flight command's wait began, 0 = idle */
+
+/* Controller and queue state, printed by the guest watchdog.
+ *
+ * The in-loop deadline report inside nvme_io_submit does not appear in the log
+ * even when a command has been outstanding for a minute, and the reason for
+ * that is itself unknown -- so this asks the same questions from a print path
+ * that provably works. */
+void nvme_debug_dump(void)
+{
+	struct nvme_device *dev = &nvme;
+
+	if (!dev->regs)
+		return;
+	console_write("  nvme: csts=0x");
+	console_write_hex32(dev->regs->csts);
+	console_write(" sq_tail=");
+	console_write_dec(dev->io_sq_tail);
+	console_write(" cq_head=");
+	console_write_dec(dev->io_cq_head);
+	console_write(" irq_hits=");
+	console_write_dec(dev->irq_hits);
+	console_write(" msix=");
+	console_write_dec((u64)dev->use_msix);
+	console_write(" busy=");
+	console_write_dec((u64)dev->io_busy);
+	console_write(" owner=");
+	console_write_dec(dev->io_owner);
+	console_write(" wait_since_ms=");
+	console_write_dec(g_nvme_wait_start_ns / 1000000ull);
+	console_write(" now_ms=");
+	console_write_dec(ktime_monotonic_ns() / 1000000ull);
+	console_write("\n  nvme cq[0..7]:");
+	for (u16 q = 0; q < dev->queue_size && q < 8; q++) {
+		console_write(" 0x");
+		console_write_hex32(dev->io_cq[q].status);
+	}
+	console_write("\n");
+}
+
 static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
 {
     u16 tail = dev->io_sq_tail;
@@ -270,7 +420,8 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     tail = (u16)((tail + 1) % dev->queue_size);
     dev->io_sq_tail = tail;
     
-    // Ring SQ1 doorbell
+    // Ring SQ1 doorbell (see nvme_admin_submit for why the barrier is here)
+    __sync_synchronize();
     volatile u32 *sq_tdb = nvme_doorbell(dev, 1, 0); // SQ1
     *sq_tdb = tail;
     
@@ -285,7 +436,12 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     // avoid a level-triggered storm; we unmask it (intmc) right after ringing
     // the head doorbell on consume. Early boot / IRQs-off callers yield-poll.
     volatile u32 *cq_hdb = nvme_doorbell(dev, 1, 1); // CQ1
-    u64 spins = 0;
+    u64 wait_start_ns = ktime_monotonic_ns();
+    int reported = 0;
+
+    g_nvme_wait_start_ns = wait_start_ns;
+
+    __atomic_fetch_add(&g_nvme_io_submits, 1, __ATOMIC_RELAXED);
     for (;;) {
         u16 cq_head = dev->io_cq_head;
         struct nvme_cqe *cqe = &dev->io_cq[cq_head];
@@ -295,8 +451,9 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
          * microseconds, and yielding on the first not-done pays a full scheduler
          * round-trip per command, capping throughput far below the device. */
         for (int s = 0; s < 4096 && cqe->status == 0xFFFF; s++)
-            __asm__ volatile("pause");
+            cpu_relax();
         if (cqe->status != 0xFFFF) {
+            __sync_synchronize(); /* same acquire as the admin queue */
             u16 status = cqe->status;
             cqe->status = 0xFFFF; // Reset status on consume
 
@@ -306,6 +463,8 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
             if (!dev->use_msix)
                 dev->regs->intmc = (1u << 0); // re-enable vector 0 for the next I/O
 
+            __atomic_fetch_add(&g_nvme_io_completions, 1, __ATOMIC_RELAXED);
+            g_nvme_wait_start_ns = 0;
             if ((status & 0xFFFE) != 0) {
                 console_write("nvme: io cmd error status=0x");
                 console_write_hex32(status);
@@ -315,28 +474,122 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
             return 0;
         }
 
-        // Fast path: brief in-RAM spin (no MMIO) to catch a quick completion.
         for (int i = 0; i < 4000; i++) {
             if (dev->io_cq[dev->io_cq_head].status != 0xFFFF)
                 break;
-            __asm__ volatile("pause");
+            cpu_relax();
         }
-        if (dev->io_cq[dev->io_cq_head].status != 0xFFFF)
-            continue;
-
-        if (!scheduler_can_block()) {
-            if (spins == 10000000ULL)
+        while (dev->io_cq[dev->io_cq_head].status == 0xFFFF) {
+            for (int i = 0; i < 256; i++)
+                cpu_relax();
+            if (dev->io_cq[dev->io_cq_head].status != 0xFFFF)
+                break;
+            /* A completion that never arrives is an unbounded yield-poll: the
+             * task stays READY forever and the whole lane looks wedged with no
+             * evidence at all. Say who we are waiting for, once, with the state
+             * that distinguishes the three ways this ends: the controller
+             * faulted (CSTS.CFS), the command was never fetched (SQ tail vs a
+             * quiet controller), or a completion landed somewhere other than
+             * the head we are watching. */
+            /* Report on WALL CLOCK, not on a spin count.
+             *
+             * A count cannot describe this loop: every iteration ends in
+             * scheduler_yield(), which costs a whole tick once the scheduler is
+             * up (so 200,000 meant ~2000 seconds, twenty times the harness's
+             * patience -- the lane always died with this never printed) and
+             * costs nothing at all before it is (so a low count fires during
+             * boot, when the completion is simply a few microseconds away).
+             * Five seconds is far beyond any honest NVMe command and means the
+             * same thing in both regimes.
+             *
+             * Measured in scheduler TICKS, not in arch_tsc_monotonic_ns(): that
+             * clock is already known to advance slower than the tick on this
+             * platform (see the ceiling syscall_sleep_timespec has to carry for
+             * exactly that reason), and a deadline built on it never arrived --
+             * the task sat here 65 seconds with this check silent. */
+            /* Repeats, on a deadline that advances, instead of reporting once.
+             *
+             * A wedge that reports once and then goes quiet is nearly as hard
+             * to read as one that never reports: there is no way to tell a
+             * command that eventually completed from one the machine sat on
+             * for two minutes, and no second sample to compare the queue state
+             * against. Every five seconds, for as long as it is stuck --
+             * counted with SCHED_TICKS_PER_SEC, never a hardcoded number of
+             * ticks: the tick has been 1 kHz since the LAPIC took it over, so a
+             * literal 500 here would mean half a second, not five. */
+            if (ktime_monotonic_ns() - wait_start_ns > 5000000000ull) {
+                wait_start_ns = ktime_monotonic_ns();
+                reported++;
+                /* Re-ring the submission doorbell before reporting.
+                 *
+                 * A doorbell write is idempotent: writing the same tail again
+                 * is a no-op for a controller that already saw it and a
+                 * wake-up for one that did not, so it costs one MMIO write
+                 * five seconds into a wait that would otherwise never end.
+                 *
+                 * Kept, but no longer the leading explanation. The submission
+                 * already places a full barrier between the SQ entry and this
+                 * doorbell, and this wait reads the CQ entry directly rather
+                 * than depending on an interrupt -- so neither a missed
+                 * doorbell nor a lost IRQ should be able to strand a command.
+                 * What COULD stand it, and has since been fixed, is the poll
+                 * itself: cpu_relax() carried no memory clobber and
+                 * struct nvme_cqe::status was not volatile, so the completion
+                 * spin was free to read that word once and spin on a register
+                 * while the controller had long since posted. This is
+                 * belt-and-braces against a cause nobody has reproduced since;
+                 * if it is ever seen to fire and help, that is worth knowing. */
+                {
+                    volatile u32 *sq_again = nvme_doorbell(dev, 1, 0);
+                    __sync_synchronize();
+                    *sq_again = dev->io_sq_tail;
+                }
                 nvme_wait_note("io");
+                console_write("nvme: report #");
+                console_write_dec((u64)reported);
+                console_write(" cq_head=");
+                console_write_dec(dev->io_cq_head);
+                console_write(" cq[head].status=0x");
+                console_write_hex32(dev->io_cq[dev->io_cq_head].status);
+                console_write(" queue_size=");
+                console_write_dec(dev->queue_size);
+                console_write("\n");
+                {
+                    u16 last = (u16)((dev->io_sq_tail + dev->queue_size - 1) %
+                                     dev->queue_size);
+                    struct nvme_sqe *out = &dev->io_sq[last];
+                    console_write("nvme: outstanding opc=0x");
+                    console_write_hex32(out->cdw0 & 0xff);
+                    console_write(" nsid=");
+                    console_write_dec(out->nsid);
+                    console_write(" slba=");
+                    console_write_dec(((u64)out->cdw11 << 32) | out->cdw10);
+                    console_write(" nlb=");
+                    console_write_dec((u64)out->cdw12 + 1);
+                    console_write(" prp1=0x");
+                    console_write_hex64(out->prp1);
+                    console_write(" prp2=0x");
+                    console_write_hex64(out->prp2);
+                    console_write("\n");
+                }
+                console_write("nvme: csts=0x");
+                console_write_hex32(dev->regs->csts);
+                console_write(" sq_tail=");
+                console_write_dec(dev->io_sq_tail);
+                console_write(" cq_head=");
+                console_write_dec(dev->io_cq_head);
+                console_write(" irq_hits=");
+                console_write_dec(dev->irq_hits);
+                console_write(" cq_status=");
+                for (u16 q = 0; q < dev->queue_size && q < 8; q++) {
+                    console_write("0x");
+                    console_write_hex32(dev->io_cq[q].status);
+                    console_write(" ");
+                }
+                console_write("\n");
+            }
             scheduler_yield();
-            spins++;
-            continue;
         }
-        scheduler_wait_prepare_timeout(&dev->io_cq, NVME_IO_WATCHDOG_TICKS);
-        if (dev->io_cq[dev->io_cq_head].status != 0xFFFF) {
-            scheduler_wait_cancel();
-            continue;
-        }
-        scheduler_wait_commit();
     }
 }
 
@@ -510,7 +763,7 @@ void nvme_init(void)
     pci_config_write16(pci_info.bus, pci_info.slot, pci_info.func, 0x04, command);
 
     // Legacy interrupt line for the controller (M70: completion IRQ).
-    u8 nvme_irq_line = pci_config_read8(pci_info.bus, pci_info.slot, pci_info.func, 0x3C);
+    u8 nvme_irq_line = pci_intx_line(pci_info.bus, pci_info.slot, pci_info.func);
     
     // Read BAR0 (64-bit MMIO base)
     u32 bar0_low = pci_config_read32(pci_info.bus, pci_info.slot, pci_info.func, 0x10);
@@ -523,8 +776,12 @@ void nvme_init(void)
     console_write("\n");
     
     // Map the controller registers.
-#ifdef __x86_64__
-    // x86_64: the direct map already covers PCI MMIO BARs.
+#if defined(__x86_64__) || defined(__aarch64__)
+    /* x86_64: the direct map already covers PCI MMIO BARs. aarch64: the same
+     * is true — build_kernel_half maps the board's PCIe MMIO window as Device
+     * memory, and vmm_direct_map_base() is 0 there, so this is the identity
+     * address. Going through vmm_map_mmio instead returned NULL (it is a stub
+     * on that arch) and the first register read faulted at address 0. */
     u64 regs_virt = vmm_direct_map_base() + bar0;
 #else
     // 32-bit: BAR0 lives at ~4 GB of MMIO space, above the 1 GB direct map, so
@@ -891,7 +1148,14 @@ void nvme_msix_selftest(void)
                 iommu_ir_entry_read(nvme.ir_handle, &entry_vector, 0, 0) == 0 &&
                 entry_vector == (u8)nvme.msix_vector;
     } else {
-        armed = rb == 0 && data == (u32)nvme.msix_vector && (vctrl & 1u) == 0;
+        /* The data word is the vector on x86 and an ITS EventID on aarch64, so
+         * ask the arch what it programmed rather than assuming either. */
+        u64 want_addr = 0;
+        u32 want_data = 0;
+
+        armed = rb == 0 && (vctrl & 1u) == 0 &&
+                arch_msi_expected(nvme.msix_vector, &want_addr, &want_data) == 0 &&
+                addr == want_addr && data == want_data;
     }
     if (!armed) {
         console_write("M98-DRV-SMOKE: FAIL msi-delivery (entry 0 not armed for vector ");
@@ -907,6 +1171,7 @@ void nvme_msix_selftest(void)
     }
 
     u32 before = __atomic_load_n(&nvme.irq_hits, __ATOMIC_RELAXED);
+
     /* read_blocks returns the block count it transferred, not 0. */
     int rc = nvme_blk_read(&nvme.blk_dev, 0, 1, buf);
     /* The handler runs on this CPU in interrupt context; by the time the read
@@ -964,64 +1229,123 @@ void nvme_msix_selftest(void)
  * through this thin indirection rather than being written twice — and the
  * marker they print names the milestone the active unit belongs to.
  */
-static int unit_active(void) { return iommu_active() || amdvi_active(); }
+#if defined(__aarch64__)
+/* The third unit is this architecture's own: an ARM SMMUv3 (kernel/dev/smmuv3.c).
+ * It is reached through the same indirection and answers the same questions —
+ * only the milestone the marker names changes, because the hardware being
+ * proven is not VT-d and must not claim VT-d's marker. */
+#define unit_iommu_active() 0
+#define unit_amdvi_active() 0
+#define unit_smmu_active()  smmuv3_active()
+#else
+#define unit_iommu_active() iommu_active()
+#define unit_amdvi_active() amdvi_active()
+#define unit_smmu_active()  0
+#endif
+
+static int unit_active(void)
+{
+	return unit_iommu_active() || unit_amdvi_active() || unit_smmu_active();
+}
 
 static const char *unit_suite(void)
 {
-	return iommu_active() ? "M100B-SMOKE" : "M100D-SMOKE";
+	if (unit_smmu_active())
+		return "M100E-SMOKE";
+	return unit_iommu_active() ? "M100B-SMOKE" : "M100D-SMOKE";
 }
 
 static int unit_map_identity(u64 phys, usize size, int writable)
 {
-	if (iommu_active())
-		return iommu_map_identity(phys, size, writable);
 	u64 base = phys & ~(u64)(NVME_PAGE_SIZE - 1);
+
+	if (unit_iommu_active())
+		return iommu_map_identity(phys, size, writable);
+	if (unit_smmu_active())
+		return smmuv3_map(base, base, (usize)((phys - base) + size), writable);
 	return amdvi_map(base, base, (usize)((phys - base) + size), writable);
 }
 
 static int unit_unmap(u64 base, usize size)
 {
-	if (iommu_active())
+	if (unit_iommu_active())
 		return iommu_unmap(base, size);
+	if (unit_smmu_active())
+		return smmuv3_unmap(base, size);
 	return amdvi_unmap(base, size);
 }
 
 static u64 unit_translate(u64 iova)
 {
-	return iommu_active() ? iommu_translate(iova) : amdvi_translate(iova);
+	if (unit_iommu_active())
+		return iommu_translate(iova);
+	if (unit_smmu_active())
+		return smmuv3_translate(iova);
+	return amdvi_translate(iova);
 }
 
 static u32 unit_fault_count(void)
 {
-	return iommu_active() ? iommu_fault_count() : amdvi_fault_count();
+	if (unit_iommu_active())
+		return iommu_fault_count();
+	if (unit_smmu_active())
+		return smmuv3_fault_count();
+	return amdvi_fault_count();
 }
 
 static void unit_fault_clear(void)
 {
-	if (iommu_active())
+	if (unit_iommu_active())
 		iommu_fault_clear();
+	else if (unit_smmu_active())
+		smmuv3_fault_clear();
 	else
 		amdvi_fault_clear();
 }
 
 static int unit_attach(void)
 {
-	if (iommu_active())
-		return iommu_attach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
 	u16 bdf = (u16)((nvme.pci_bus << 8) | ((nvme.pci_slot & 0x1F) << 3) |
 	                (nvme.pci_func & 7));
+
+	if (unit_iommu_active())
+		return iommu_attach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
+	if (unit_smmu_active())
+		return smmuv3_attach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
 	return amdvi_attach_device(bdf);
 }
 
 static void unit_detach(void)
 {
-	if (iommu_active()) {
+	u16 bdf = (u16)((nvme.pci_bus << 8) | ((nvme.pci_slot & 0x1F) << 3) |
+	                (nvme.pci_func & 7));
+
+	if (unit_iommu_active()) {
 		iommu_detach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
 		return;
 	}
-	u16 bdf = (u16)((nvme.pci_bus << 8) | ((nvme.pci_slot & 0x1F) << 3) |
-	                (nvme.pci_func & 7));
+	if (unit_smmu_active()) {
+		smmuv3_detach_device(nvme.pci_bus, nvme.pci_slot, nvme.pci_func);
+		return;
+	}
 	amdvi_detach_device(bdf);
+}
+
+/* The last fault the active unit recorded, however it spells one. */
+static void unit_fault_last(u64 *addr, u16 *src, u8 *reason)
+{
+	if (unit_smmu_active()) {
+		u32 sid = 0;
+		u8 type = 0;
+
+		smmuv3_fault_last(addr, &sid, &type);
+		if (src)
+			*src = (u16)sid;
+		if (reason)
+			*reason = type;
+		return;
+	}
+	iommu_fault_last(addr, src, reason);
 }
 
 static int nvme_iommu_map_own_pages(void)
@@ -1034,6 +1358,21 @@ static int nvme_iommu_map_own_pages(void)
         unit_map_identity(nvme.phys_io_cq, cq_bytes, 1) != 0 ||
         unit_map_identity(nvme.phys_identify_buf, NVME_PAGE_SIZE, 1) != 0)
         return -1;
+#if defined(__aarch64__)
+    /* The device's interrupt is a memory write too, and behind an SMMU it is
+     * translated like any other: the ITS's translation register has to be in
+     * the domain or the MSI faults instead of arriving. x86 has no equivalent
+     * line here because its message goes to the local APIC, which is not
+     * behind the DMA remapping unit. */
+    if (unit_smmu_active() && its_ready()) {
+        u64 doorbell = its_translater_phys();
+
+        if (doorbell &&
+            unit_map_identity(doorbell & ~(u64)(NVME_PAGE_SIZE - 1),
+                              NVME_PAGE_SIZE, 1) != 0)
+            return -1;
+    }
+#endif
     return 0;
 }
 
@@ -1158,7 +1497,7 @@ void nvme_iommu_selftest(void)
         console_write(unit_suite()); console_write(": ok nvme-translated (read through its own domain, no faults)\n");
     } else {
         u64 fa = 0; u16 fs = 0; u8 fr = 0;
-        iommu_fault_last(&fa, &fs, &fr);
+        unit_fault_last(&fa, &fs, &fr);
         console_write(unit_suite()); console_write(": FAIL nvme-translated rc=");
         console_write_dec((u64)(i64)rc);
         console_write(" faults=");

@@ -2,8 +2,14 @@
 #include <b1nix/ktime.h>
 #include <b1nix/sched.h>
 
-/* Nanoseconds per scheduler tick (the scheduler runs at 100 Hz). */
-#define KTIME_NS_PER_TICK 10000000ull
+/* Nanoseconds per scheduler tick, at whatever rate the timer was armed with.
+ * Hardcoding 10 ms here dated from a 100 Hz tick and made the pre-TSC clock
+ * report ten times the elapsed time once the LAPIC took the tick to 1 kHz. */
+static inline u64 ktime_ns_per_tick(void)
+{
+	u32 hz = sched_tick_hz();
+	return hz ? 1000000000ull / hz : 10000000ull;
+}
 
 /* Handover state: the clock reads the tick counter until ktime_switch_to_tsc()
  * publishes a base, from which point it reads the TSC and adds the base so the
@@ -15,7 +21,7 @@ static volatile int ktime_tsc_active;
 
 static u64 ktime_tick_ns(void)
 {
-	return scheduler_get_uptime_ticks() * KTIME_NS_PER_TICK;
+	return scheduler_get_uptime_ticks() * ktime_ns_per_tick();
 }
 
 void ktime_switch_to_tsc(void)

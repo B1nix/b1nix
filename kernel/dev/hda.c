@@ -192,7 +192,7 @@ static void hda_delay_ms(int ms) {
 		 * access is a VM exit under virtualisation -- paying one per
 		 * iteration to mark time is the cost this loop is trying to avoid. */
 		while (arch_tsc_monotonic_ns() < deadline)
-			__asm__ volatile("pause");
+			cpu_relax(); /* not a bare `pause`: x86-only mnemonic */
 		return;
 	}
 	while (arch_tsc_monotonic_ns() < deadline) {
@@ -273,9 +273,10 @@ static u32 hda_corb_send_wait(u32 verb) {
 		/* Ten ticks is a tenth of a second — four orders of magnitude more
 		 * than a working codec needs, and a fiftieth of what this cost
 		 * before. */
-		if ((i & 0xff) == 0xff && scheduler_get_uptime_ticks() - start > 10)
+		if ((i & 0xff) == 0xff &&
+		    scheduler_get_uptime_ticks() - start > SCHED_TICKS_PER_SEC / 10)
 			break;
-		__asm__ volatile("pause");
+		cpu_relax();
 	}
 	return 0;
 }

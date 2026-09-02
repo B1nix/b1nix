@@ -65,9 +65,39 @@ static void append_char(char *str, size_t size, int *pos, char ch)
 
 static void append_string(char *str, size_t size, int *pos, const char *s)
 {
-	if (!s) s = "(null)";
+	if (!s || (uintptr_t)s < 4096) s = "(null)";
 	while (*s) {
 		append_char(str, size, pos, *s++);
+	}
+}
+
+/* %s with a field width, left- or right-justified.
+ *
+ * Without this the conversion was not merely unpadded: the flag parser did not
+ * recognise '-' at all, so "%-16s" matched no conversion, the spec was copied
+ * to the output verbatim, and its argument was never consumed -- which slid
+ * every later argument in the call down by one. debugfs's mount listing is
+ * "%-16s %-24s %-12s 0x%lx" and came out as the literal text followed by a
+ * pointer where the flags should be, so M119 could not find the filesystem it
+ * had just mounted. Any kernel message using a column layout was silently
+ * wrong the same way. */
+static void append_string_padded(char *str, size_t size, int *pos,
+                                 const char *s, int width, int left_align)
+{
+	int len = 0;
+
+	if (!s || (uintptr_t)s < 4096) s = "(null)";
+	while (s[len])
+		len++;
+	if (!left_align) {
+		for (int p = len; p < width; p++)
+			append_char(str, size, pos, ' ');
+	}
+	for (int k = 0; k < len; k++)
+		append_char(str, size, pos, s[k]);
+	if (left_align) {
+		for (int p = len; p < width; p++)
+			append_char(str, size, pos, ' ');
 	}
 }
 
@@ -108,11 +138,23 @@ static int vsnprintf_impl(char *str, size_t size, const char *fmt, va_list args)
 
 		i++;
 		int zero_pad = 0;
+		int left_align = 0;
 		int width = 0;
-		if (fmt[i] == '0') {
-			zero_pad = 1;
-			i++;
+		/* Flags in any order, the way printf(3) allows. '-' used to fall
+		 * through as an unknown conversion. */
+		for (;;) {
+			if (fmt[i] == '-') {
+				left_align = 1;
+				i++;
+			} else if (fmt[i] == '0') {
+				zero_pad = 1;
+				i++;
+			} else {
+				break;
+			}
 		}
+		if (left_align)
+			zero_pad = 0; /* '-' overrides '0', as in printf(3) */
 		while (fmt[i] >= '0' && fmt[i] <= '9') {
 			width = width * 10 + (fmt[i] - '0');
 			i++;
@@ -150,7 +192,8 @@ static int vsnprintf_impl(char *str, size_t size, const char *fmt, va_list args)
 			break;
 		}
 		case 's':
-			append_string(str, size, &pos, va_arg(args, const char *));
+			append_string_padded(str, size, &pos, va_arg(args, const char *),
+			                     width, left_align);
 			break;
 		case 'c':
 			append_char(str, size, &pos, (char)va_arg(args, int));

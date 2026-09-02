@@ -1,5 +1,6 @@
 #include <b1nix/io.h>
 #include <b1nix/serial.h>
+#include <b1nix/errno.h>
 
 /* 16550 UART bases: COM1 backs the boot console/log, COM2 is an optional
  * second line (M39 serial getty). */
@@ -113,15 +114,15 @@ int serial_port_set_line(int idx, u32 baud, u8 data_bits, u8 parity,
                          u8 stop_bits)
 {
 	if (idx < 0 || idx >= SERIAL_NPORTS || !serial_detected[idx])
-		return -1;
+		return -ENODEV;
 	if (baud == 0 || UART_CLOCK % baud != 0)
-		return -1;
+		return -EINVAL;
 	u32 divisor = UART_CLOCK / baud;
 	if (divisor == 0 || divisor > 0xFFFF)
-		return -1;
+		return -EINVAL;
 	if (data_bits < 5 || data_bits > 8 || parity > 2 ||
 	    (stop_bits != 1 && stop_bits != 2))
-		return -1;
+		return -EINVAL;
 
 	u8 lcr = (u8)(data_bits - 5);
 	if (stop_bits == 2)

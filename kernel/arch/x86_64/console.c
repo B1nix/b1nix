@@ -8,6 +8,7 @@
 #include <b1nix/kmsg.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/ktime.h>
+#include <b1nix/lapic.h>
 #include <b1nix/vt.h>
 #include <b1nix/serial.h>
 #include <b1nix/spinlock.h>
@@ -518,6 +519,39 @@ void console_write(const char *text)
  * the lock (e.g. a log/backtrace mid-print), and the handler's own
  * console_write would then self-deadlock. Best-effort — only used when we are
  * already crashing, so a momentarily garbled line on another CPU is acceptable. */
+static volatile int console_lock_owner;
+
+static int console_this_cpu(void)
+{
+	struct percpu *pc = get_percpu();
+	return pc ? pc->cpu_id : 0;
+}
+
+int console_lock_held_here(void)
+{
+	return __atomic_load_n(&console_lock_owner, __ATOMIC_ACQUIRE) ==
+	       console_this_cpu() + 1;
+}
+
+int console_lock_try_acquire_irqsave(u64 *flags)
+{
+	*flags = interrupts_save();
+	u32 owner = __atomic_load_n(&console_lock.owner, __ATOMIC_ACQUIRE);
+	u32 next = __atomic_load_n(&console_lock.next, __ATOMIC_ACQUIRE);
+	if (owner == next) {
+		u32 expected = owner;
+		if (__atomic_compare_exchange_n(&console_lock.next, &expected, owner + 1u, 0,
+		                                __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+			console_lock_held_ticket = owner;
+			__atomic_store_n(&console_lock_owner, console_this_cpu() + 1,
+			                 __ATOMIC_RELEASE);
+			return 1;
+		}
+	}
+	interrupts_restore(*flags);
+	return 0;
+}
+
 void console_bust_lock(void)
 {
 	/* Hand the queue to whoever is next rather than zeroing it: with a ticket
@@ -526,6 +560,7 @@ void console_bust_lock(void)
 	__atomic_store_n(&console_lock.owner,
 	                 __atomic_load_n(&console_lock.next, __ATOMIC_ACQUIRE),
 	                 __ATOMIC_RELEASE);
+	__atomic_store_n(&console_lock_owner, 0, __ATOMIC_RELEASE);
 	console_log_panic_flush();
 }
 
@@ -533,10 +568,13 @@ void console_lock_acquire_irqsave(u64 *flags)
 {
 	*flags = interrupts_save();
 	console_lock_acquire();
+	__atomic_store_n(&console_lock_owner, console_this_cpu() + 1,
+	                 __ATOMIC_RELEASE);
 }
 
 void console_lock_release_irqrestore(u64 flags)
 {
+	__atomic_store_n(&console_lock_owner, 0, __ATOMIC_RELEASE);
 	console_lock_release();
 	interrupts_restore(flags);
 }

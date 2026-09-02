@@ -8,6 +8,10 @@ void fb_console_clear(void);
 void fb_console_putchar(char c);
 void fb_console_write(const char *str);
 void fb_console_blink_cursor(void);
+void fb_console_flush(void);
+void fb_console_set_font_scale(u32 scale);
+void fb_console_freeze_top(void);
+void fb_console_set_top(u32 top_y);
 
 int fb_console_ready(void);
 u32 fb_console_width(void);

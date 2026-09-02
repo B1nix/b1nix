@@ -57,7 +57,11 @@
  * leave the CPU that sent one waiting forever. Declared rather than inlined
  * because the servicing lives on b1nix's side of the boundary. */
 void lkpi_cpu_relax(void);
+/* See b1nix/arch.h: one sentinel, whichever header lands first. */
+#ifndef B1NIX_CPU_RELAX_DEFINED
+#define B1NIX_CPU_RELAX_DEFINED 1
 static inline void cpu_relax(void) { lkpi_cpu_relax(); }
+#endif
 
 
 /*

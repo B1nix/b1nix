@@ -35,6 +35,12 @@
  * express the wait in time, not in a count of port reads that means something
  * different on every machine — so it needs to be able to read a clock. */
 EXPORT_SYMBOL(arch_tsc_monotonic_ns);
+/* A module compiled with the stack protector needs the runtime the kernel
+ * provides (see kernel/lib/stdlib.c). */
+extern unsigned long __stack_chk_guard;
+void __stack_chk_fail(void);
+EXPORT_SYMBOL(__stack_chk_guard);
+EXPORT_SYMBOL(__stack_chk_fail);
 EXPORT_SYMBOL(memcpy);
 EXPORT_SYMBOL(memset);
 EXPORT_SYMBOL(memcmp);
@@ -81,6 +87,9 @@ EXPORT_SYMBOL(vmm_virt_to_phys);
 EXPORT_SYMBOL(scheduler_yield);
 EXPORT_SYMBOL(scheduler_sleep_ticks);
 EXPORT_SYMBOL(scheduler_get_uptime_ticks);
+/* A module that converts between time and ticks needs the rate the timer was
+ * actually armed with, the same as the kernel does. */
+EXPORT_SYMBOL(sched_tick_hz);
 EXPORT_SYMBOL(rtc_now_unix_seconds);
 EXPORT_SYMBOL(rtc_set_unix_time);
 
@@ -122,8 +131,11 @@ EXPORT_SYMBOL(pci_find_class);
 EXPORT_SYMBOL(pci_config_read16);
 EXPORT_SYMBOL(pci_config_read32);
 EXPORT_SYMBOL(pci_config_write16);
+#if defined(__x86_64__)
+/* Port I/O exists only on x86; AArch64 modules use MMIO. */
 EXPORT_SYMBOL(inb);
 EXPORT_SYMBOL(outb);
+#endif
 
 /* ── sound core ──────────────────────────────────────────────────────────── */
 EXPORT_SYMBOL(sound_register);

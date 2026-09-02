@@ -314,6 +314,52 @@ void arch_udelay(u32 us) {
 
 u32 arch_cpu_khz(void) { return g_cpu_khz; }
 
+/* Vendor string, CPUID leaf 0 (EBX:EDX:ECX — that order, not EBX:ECX:EDX). */
+void arch_cpu_vendor(char *buf, usize len) {
+  if (!buf || len == 0)
+    return;
+  u32 a, b, c, d;
+  cpuid_count(0, 0, &a, &b, &c, &d);
+  char v[13];
+  *(u32 *)&v[0] = b;
+  *(u32 *)&v[4] = d;
+  *(u32 *)&v[8] = c;
+  v[12] = 0;
+  usize i = 0;
+  for (; i + 1 < len && v[i]; i++)
+    buf[i] = v[i];
+  buf[i] = 0;
+}
+
+/* Brand string, CPUID leaves 80000002h-80000004h: 48 bytes of the marketing
+ * name the processor carries itself. Leading spaces are part of the encoding
+ * (the string is right-aligned in its 48 bytes on many parts), so trim them. */
+void arch_cpu_model(char *buf, usize len) {
+  if (!buf || len == 0)
+    return;
+  buf[0] = 0;
+  u32 a, b, c, d;
+  cpuid_count(0x80000000u, 0, &a, &b, &c, &d);
+  if (a < 0x80000004u)
+    return;
+  char brand[49];
+  for (int leaf = 0; leaf < 3; leaf++) {
+    cpuid_count(0x80000002u + (u32)leaf, 0, &a, &b, &c, &d);
+    *(u32 *)&brand[leaf * 16 + 0] = a;
+    *(u32 *)&brand[leaf * 16 + 4] = b;
+    *(u32 *)&brand[leaf * 16 + 8] = c;
+    *(u32 *)&brand[leaf * 16 + 12] = d;
+  }
+  brand[48] = 0;
+  const char *p = brand;
+  while (*p == ' ')
+    p++;
+  usize i = 0;
+  for (; i + 1 < len && p[i]; i++)
+    buf[i] = p[i];
+  buf[i] = 0;
+}
+
 /* ── A clock with better than 10 ms resolution ──────────────────────────────
  *
  * clock_gettime was derived from the 100 Hz tick, so every reading landed on a

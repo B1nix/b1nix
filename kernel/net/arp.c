@@ -25,6 +25,12 @@ struct arp_packet {
 	struct ipv4_addr target_ip;
 } __attribute__((packed));
 
+_Static_assert(sizeof(struct arp_packet) == 28, "arp wire size");
+_Static_assert(__builtin_offsetof(struct arp_packet, sender_mac) == 8, "arp sender_mac");
+_Static_assert(__builtin_offsetof(struct arp_packet, sender_ip) == 14, "arp sender_ip");
+_Static_assert(__builtin_offsetof(struct arp_packet, target_mac) == 18, "arp target_mac");
+_Static_assert(__builtin_offsetof(struct arp_packet, target_ip) == 24, "arp target_ip");
+
 static u16 bswap16(u16 value)
 {
 	return (u16)((value << 8) | (value >> 8));

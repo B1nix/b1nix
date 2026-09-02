@@ -286,8 +286,22 @@ static void test_scheduler(void)
 
 /* Scratch kernel window used to give a deliberately discontiguous page list a
  * linear view, exactly as drm_bo_alloc does for a real buffer object. Sits a
- * terabyte above the DRM object windows. */
+ * terabyte above the DRM object windows.
+ *
+ * aarch64 cannot use that address, and not merely because it is x86-shaped:
+ * every process there shares the kernel half as the single top-level entry
+ * L0[0], which spans 0..512 GiB. A window above that lands in an entry a fresh
+ * address space never copies, so the sharing this test exists to prove would
+ * be false by construction. Sit above the large-allocation arena (which ends
+ * at 320 GiB) and below 512 GiB, and keep the second window inside that span
+ * too rather than a terabyte up. */
+#if defined(__aarch64__)
+#define SG_TEST_VA        0x6000000000ULL /* 384 GiB */
+#define SG_TEST_SCRATCH_OFF 0x1000000000ULL /* +64 GiB → 448 GiB */
+#else
 #define SG_TEST_VA 0xffffa11000000000ULL
+#define SG_TEST_SCRATCH_OFF (1ULL << 40)
+#endif
 #define SG_TEST_PAGES 8
 
 static void test_gem_sg(void)
@@ -426,7 +440,7 @@ static void test_gem_vmap_shared(void)
 	 * is no skip here any more. An instance with no DRM device used to report
 	 * nothing at all, leaving the mechanism untested exactly where the
 	 * scheduler and page tables differ most (the SMP instance). */
-	u64 scratch = SG_TEST_VA + (1ULL << 40);
+	u64 scratch = SG_TEST_VA + SG_TEST_SCRATCH_OFF;
 	if (paging_reserve_kernel_path(scratch, 2ULL << 30) != 0 ||
 	    !vmap_window_is_shared(scratch, 2ULL << 30)) {
 		drm_report("gem-vmap-shared", 0, 1);

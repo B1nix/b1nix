@@ -34,6 +34,19 @@ static struct module_alloc_rec module_allocs[MODULE_ALLOC_MAX];
 static usize module_alloc_pages_used;
 static spinlock_t module_alloc_lock = SPINLOCK_INIT;
 
+
+/* The first 2 MiB-aligned address past the kernel image. Well inside the
+ * ±128 MiB that R_AARCH64_CALL26/JUMP26 can reach from kernel text, so module
+ * calls into the kernel still need no PLT veneers, and inside the identity map
+ * boot.S builds. */
+u64 module_region_base(void)
+{
+	extern char __kernel_end[];
+	u64 end = (u64)(usize)__kernel_end;
+
+	return (end + 0x1FFFFFULL) & ~0x1FFFFFULL;
+}
+
 static int bitmap_test(usize page) {
   return (module_bitmap[page / 64] >> (page % 64)) & 1ULL;
 }
@@ -108,9 +121,15 @@ void *module_alloc(usize size) {
    * executable. */
   usize mapped = 0;
   for (usize i = 0; i < pages; i++) {
+#if defined(__aarch64__)
+    /* Identity: the region IS reserved physical memory (b1nix/module.h), so a
+     * page is backed by the frame at its own address. */
+    u64 frame = base + (u64)i * PAGE_SIZE;
+#else
     u64 frame = pmm_alloc_frame();
     if (!frame)
       break;
+#endif
     vmm_map_page(base + (u64)i * PAGE_SIZE, frame,
                  VMM_PRESENT | VMM_WRITABLE | VMM_NO_EXECUTE);
     mapped++;
@@ -121,8 +140,12 @@ void *module_alloc(usize size) {
       u64 va = base + (u64)i * PAGE_SIZE;
       u64 frame = vmm_virt_to_phys((void *)(usize)va);
       vmm_unmap_page(va);
+#if !defined(__aarch64__)
       if (frame)
         pmm_free_frame(frame);
+#else
+      (void)frame; /* reserved region: the frames are not the pmm's to take back */
+#endif
     }
     spin_lock_irqsave(&module_alloc_lock, &flags);
     for (usize j = start; j < start + pages; j++)
@@ -195,7 +218,18 @@ void module_free(void *addr) {
     paging_mprotect_page(va, VMM_PRESENT | VMM_WRITABLE | VMM_NO_EXECUTE);
     u64 frame = vmm_virt_to_phys((void *)(usize)va);
     vmm_unmap_page(va);
+#if defined(__aarch64__)
+    /* Reserved identity-mapped RAM, exactly as on the allocation path above:
+     * these frames were never handed out by the allocator, so they are not its
+     * to take back. pmm_init marks the whole region used, so the free was
+     * refused with "already unreferenced" -- three lines of noise per module
+     * load, and a real hazard the day that refusal stops being there, because
+     * the region would then be handed to somebody else while a module is
+     * executing out of it. */
+    (void)frame;
+#else
     if (frame)
       pmm_free_frame(frame);
+#endif
   }
 }

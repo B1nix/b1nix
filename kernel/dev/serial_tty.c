@@ -62,15 +62,21 @@ static struct serial_tty sttys[SERIAL_NPORTS];
 
 static usize rb_next(usize i) { return (i + 1) % STTY_BUF; }
 
-static int rb_empty(struct serial_tty *t) { return t->in_head == t->in_tail; }
+static int rb_empty(struct serial_tty *t) {
+  usize head = __atomic_load_n(&t->in_head, __ATOMIC_RELAXED);
+  usize tail = __atomic_load_n(&t->in_tail, __ATOMIC_ACQUIRE);
+  return head == tail;
+}
 
 /* Producer side: returns 0 (drops the byte) when the ring is full. */
 static int rb_put(struct serial_tty *t, u8 c) {
-  usize next = rb_next(t->in_tail);
-  if (next == t->in_head)
+  usize tail = __atomic_load_n(&t->in_tail, __ATOMIC_RELAXED);
+  usize head = __atomic_load_n(&t->in_head, __ATOMIC_ACQUIRE);
+  usize next = rb_next(tail);
+  if (next == head)
     return 0;
-  t->in[t->in_tail] = c;
-  t->in_tail = next;
+  t->in[tail] = c;
+  __atomic_store_n(&t->in_tail, next, __ATOMIC_RELEASE);
   return 1;
 }
 
@@ -198,10 +204,22 @@ static isize stty_read(struct vfs_handle *h, char *buf, usize size) {
     spin_lock_irqsave(&t->read_lock, &irqf);
     if (!rb_empty(t)) {
       usize n = 0;
-      while (n < size && !rb_empty(t)) {
-        buf[n++] = (char)t->in[t->in_head];
-        t->in_head = rb_next(t->in_head);
+      usize head = __atomic_load_n(&t->in_head, __ATOMIC_RELAXED);
+      usize tail = __atomic_load_n(&t->in_tail, __ATOMIC_ACQUIRE);
+
+      /* Against the LOCAL cursor, not rb_empty(t).
+       *
+       * rb_empty() compares t->in_head, which this loop does not touch until
+       * it is over -- so the ring never looked empty, the loop ran to `size`,
+       * and every read returned the whole buffer: the bytes that were there
+       * followed by whatever the ring held past them, which is zeroes. A
+       * canonical read of "m39ldisc\n" came back as 32 bytes, EOF came back as
+       * 32 bytes, and a raw read of two characters came back as 32. */
+      while (n < size && head != tail) {
+        buf[n++] = (char)t->in[head];
+        head = rb_next(head);
       }
+      __atomic_store_n(&t->in_head, head, __ATOMIC_RELEASE);
       spin_unlock_irqrestore(&t->read_lock, irqf);
       return (isize)n;
     }
@@ -333,9 +351,7 @@ static int stty_apply_cflag(struct serial_tty *t, u32 cflag) {
   u8 parity = 0;
   if (cflag & STTY_PARENB)
     parity = (cflag & STTY_PARODD) ? 1 : 2;
-  if (serial_port_set_line(t->com, rate, bits, parity, stop) < 0)
-    return -EINVAL;
-  return 0;
+  return serial_port_set_line(t->com, rate, bits, parity, stop);
 }
 
 /* Linux TIOCM_* bits, and where each one lives in the 16550. */
@@ -429,10 +445,32 @@ static int stty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     }
     struct b1nix_termios saved = t->termios;
     t->termios = want;
-    int rc = stty_apply_cflag(t, want.c_cflag);
-    if (rc < 0) {
-      t->termios = saved;
-      return rc;
+    /* Only c_cflag is the chip's business. A controller that cannot be
+     * reprogrammed -- a PL011 has no divisor latch this kernel can reach, a
+     * mini-UART's divisor follows a clock it cannot read -- keeps the rate it
+     * has; the line discipline is software and applies regardless.
+     *
+     * Throwing the whole structure away on that refusal is what made ttyS0
+     * permanently canonical on this arch: every tcsetattr, including the one
+     * that only wanted to clear ICANON and ECHO, was undone because the UART
+     * would not change its baud rate. A raw read then waited forever for a
+     * newline that a raw writer was never going to send, and the smoke lane
+     * sat there for 400 seconds.
+     *
+     * POSIX agrees: tcsetattr succeeds if it applied any of what was asked,
+     * and the caller is expected to tcgetattr to see what stuck -- which is
+     * exactly what stty_cflag_from_hw makes truthful below. */
+    int crc = stty_apply_cflag(t, want.c_cflag);
+    if (crc < 0)
+      t->termios.c_cflag = saved.c_cflag;
+    /* A rate this UART cannot produce is the caller's error and has to be
+     * reported: tcsetattr(B230400) on a 16550 whose clock is 115200 returns
+     * EINVAL with the line untouched. A controller that cannot be reprogrammed
+     * at all answers -ENOSYS instead, and that is the case the partial apply
+     * above is for. */
+    if (crc == -EINVAL) {
+      stty_cflag_from_hw(t);
+      return -EINVAL;
     }
     /* Report the line as the chip now holds it — a rate the divisor rounded
      * or a field this UART ignores must not come back as if it had stuck. */
@@ -667,8 +705,9 @@ void serial_tty_init(void) {
   for (int i = 0; i < SERIAL_NPORTS; i++) {
     struct serial_tty *t = &sttys[i];
     t->com = i;
-    strcpy(t->name, "ttyS0");
+    t->name[0] = 't'; t->name[1] = 't'; t->name[2] = 'y'; t->name[3] = 'S';
     t->name[4] = (char)('0' + i);
+    t->name[5] = '\0';
     stty_reset(t);
     if (serial_port_present(i))
       t->registered = 1;

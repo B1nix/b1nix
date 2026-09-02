@@ -49,6 +49,14 @@ void kmsg_set_line_prio(int priority);
 /* Emit a complete record with an explicit syslog priority (0..7). */
 void kmsg_emit(int priority, const char *text);
 
+/* Snapshot the tail of the ring, and print the snapshot. Two calls because the
+ * caller (the stall watchdog) prints a long dump between them, and that dump
+ * lands in this same ring — reading the tail afterwards would replay the dump
+ * instead of what preceded the stall. For a console-only board, where those
+ * lines have scrolled off and there is no serial log and no shell for dmesg. */
+void kmsg_capture_tail(void);
+void kmsg_print_captured(void);
+
 /* syslog(2)/klogctl. `ubuf` is a user pointer; returns the byte count read, a
  * size for the SIZE_* actions, 0 for the accepted no-ops, or -errno. */
 isize kmsg_syslog(int type, char *ubuf, int len);

@@ -298,6 +298,9 @@ int lkpi_virgl_submit(u32 ctx_id, const u32 *cmd, u32 bytes);
 int lkpi_virgl_transfer(int to_host, u32 ctx_id, u32 res_id, u32 level,
 			const u32 *box6, u64 offset);
 int lkpi_virgl_unref(u32 res_id);
+/* A file descriptor that is already signalled, for an out-fence on a transport
+ * whose submissions complete before the ioctl returns. Negative on failure. */
+int lkpi_fence_fd_signalled(void);
 /* Read a capset blob into `out`; *len is the buffer size in and the blob
  * length out. Mesa cannot create a virgl screen without this. */
 int lkpi_virgl_capset(u32 index, u32 want_id, u32 want_ver, void *out, u32 *len);

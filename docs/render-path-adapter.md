@@ -1,4 +1,4 @@
-# The virtgpu adapter: what Mesa now reaches, and what stops it
+# The virtgpu adapter: Mesa on the host GPU, through our DRM node
 
 M101's accelerated path. `docs/render-path.md` describes what was missing: an
 adapter putting b1nix's working VirGL transport behind the Linux DRM ioctl
@@ -7,8 +7,7 @@ something. That adapter now exists.
 
 ## What works, proved by the machine
 
-With `b1nix.virgl-drm` on the command line and a `virtio-gpu-gl-pci` device,
-`/bin/gl_probe` gets this far:
+With a `virtio-gpu-gl-pci` device, `/bin/gl_probe` gets this far:
 
 ```
 GL-PROBE: renderer virgl (AMD Radeon RX 6600 (radeonsi, navi23, ACO, ...))
@@ -25,7 +24,7 @@ and a virgl command stream submitted and accepted by the host. The probe's own
 `hardware-renderer` check rejects llvmpipe and swrast, so the renderer string
 is evidence rather than decoration.
 
-## Four defects found on the way, all fixed
+## Four defects found bringing it up, all fixed
 
 **GETPARAM writes THROUGH the pointer.** `drm_virtgpu_getparam.value` is a user
 pointer and the kernel copies a 4-byte `int` to it; filling the struct field
@@ -53,34 +52,70 @@ the timer could not tick, and the guest stopped dead after the first command it
 actually executed. Serialisation on the shared submit buffer now yields instead
 of masking interrupts.
 
-## What stops it, precisely
+## Three more defects, and the flag is gone
 
-`drm_gem_create_mmap_offset()` on the **second** GEM object faults:
+**A GEM object was freed without releasing its mmap offset.** The driver's
+`free` called `drm_gem_private_object_fini()`, which only tears down the
+reservation object. The object also owns a `drm_mm` node — its mmap offset —
+living *inside* the struct and linked into the device's offset manager, and
+`drm_gem_object_release()` is what takes it back out. Freeing without it left a
+node of freed heap in the manager's tree; the next object to ask for an offset
+descended into it, read a pointer out of reused memory and took a #GP inside
+`drm_mm`'s hole-size tree.
 
-```
-#EXC vec=0xd  rip=drm_mm.c:314 best_hole
-                <- first_hole (drm_mm.c:363)
-                <- drm_mm_insert_node_in_range (drm_mm.c:540)
-```
+That is what "the second mmap offset faults" was. The fault was in imported
+code and the cause was in the driver, exactly as the standing rule says — but
+it was NOT the augmented rbtree: `drm_mm` and the offset manager are both
+exercised at boot now (`M101-IMPORT: ok drm-mm`, `ok drm-vma-manager`) and both
+were correct all along.
 
-A general protection fault — a non-canonical pointer read out of the tree, not
-a missing page. The first insert cannot expose it, because an empty tree is
-never traversed.
+**The host-side unref freed the object's pages a second time.** A resource
+created for the DRM node is backed by a GEM object's scattered shmem pages;
+`vgpu_res_unref_id()` freed `size / PAGE_SIZE` frames starting at the first
+one, which both double-freed the pages the object still owned and handed the
+allocator frames belonging to somebody else — a heap corruption that surfaced
+minutes later as a broken free-list link. The resource table now records who
+owns the frames: the character device owns the contiguous run it allocates, a
+DRM resource does not.
 
-This is the **first real use of upstream's `drm_mm`** in b1nix: nothing else
-inserts more than one node into the range allocator, which is why it has stood
-until now. By the project's standing rule a fault inside imported code is a
-defect in the shim, so the fix belongs in the augmented rbtree
-(`RB_DECLARE_CALLBACKS_MAX`, `rb_insert_augmented`, `rb_root_cached`), not in
-`drm_mm.c`.
+**`execbuffer` ignored `VIRTGPU_EXECBUF_FENCE_FD_OUT`.** It answered 0 and left
+`fence_fd` as userspace passed it in, so Mesa waited on a descriptor that was
+never a fence. Submission here is synchronous — the command carries a fence and
+the transport waits for the host to retire it — so the out-fence is signalled
+the moment it exists, and that is what is handed back. Unknown flags are now
+refused rather than silently accepted.
 
-## Why the path is behind a flag
+## The flag
 
-`b1nix.virgl-drm` gates the whole adapter. With it off, `GETPARAM` answers "no
-3D" and Mesa falls back to software cleanly — the designed behaviour, and safe.
-With it on, the path runs for whoever is working on it. Answering "yes" by
-default while knowing the second buffer takes the machine down would be the
-worst of the three, and a green smoke run bought that way would be a lie.
+The adapter is on by default: `lkpi_virgl_available()` decides, and a plain
+virtio-gpu with no virglrenderer behind it still reports "no 3D" and gets a
+clean software fallback. `b1nix.no-virgl-drm` forces it off, for bisecting a
+rendering fault against the software path without rebuilding.
 
 `b1nix.virgl-trace` prints each ioctl and its answer, because a client reports
 one line for a dozen possible causes.
+
+## Proved end to end
+
+With a `virtio-gpu-gl-pci` device and an image carrying a Mesa DRI driver
+(`make B1NIX_GPU_DRV=1 iso-gfx`), the renderer smoke selects the accelerated
+path on its own and the compositor's frames come back through wlr-screencopy
+with the colours it was told to paint:
+
+```
+RENDER-SMOKE: accel-status available device=/dev/dri/renderD128
+              gl=virgl (AMD Radeon RX 6600 (radeonsi, navi23, ACO, ...))
+RENDER-SMOKE: ok selection renderer=gles2 mode=accelerated reason=gl-probe-passed
+RENDER-SMOKE: ok accel-frame
+```
+
+Run it with:
+
+```sh
+make B1NIX_GPU_DRV=1 iso-gfx
+SKIP_BUILD=1 SMOKE_INSTANCES=gfx GPU_DEVICE=virtio-gpu-gl-pci \
+    GPU_DISPLAY=egl-headless sh tests/smoke.sh x86_64
+```
+
+The ordinary image carries no DRI driver (mesa-dri-gallium is 184 MB), so the
+default suite reports `accel-frame` as a skip with the reason on the record.

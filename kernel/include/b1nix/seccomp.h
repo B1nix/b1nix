@@ -61,6 +61,7 @@ struct seccomp_data {
 /* AUDIT_ARCH for the seccomp_data.arch field. */
 #define AUDIT_ARCH_X86_64 0xC000003Eu
 #define AUDIT_ARCH_I386   0x40000003u
+#define AUDIT_ARCH_AARCH64 0xC00000B7u
 
 /* struct sock_fprog passed by userspace to install a filter. */
 struct sock_fprog {

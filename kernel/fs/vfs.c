@@ -246,6 +246,29 @@ static usize mount_root_refs(struct vfs_node *root) {
   return n;
 }
 
+void vfs_dump_mounts(void) {
+  console_write("\n--- Mounted Filesystems ---\n");
+  if (!mounts || mount_slots == 0) {
+    console_write("  (no mounts initialized)\n");
+    console_write("--- End Mounts ---\n");
+    return;
+  }
+  for (usize i = 0; i < mount_slots; i++) {
+    if (!mounts[i].used) continue;
+    console_write("  ");
+    console_write(mounts[i].target[0] ? mounts[i].target : "/");
+    console_write(" on ");
+    console_write(mounts[i].fstype[0] ? mounts[i].fstype : "unknown");
+    console_write(" (dev=");
+    console_write(mounts[i].source[0] ? mounts[i].source : "none");
+    console_write(", flags=0x");
+    console_write_hex64(mounts[i].flags);
+    console_write(")\n");
+  }
+  console_write("--- End Mounts ---\n");
+}
+
+
 static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   if (!node)
     return 0;
@@ -430,7 +453,7 @@ static volatile int dcache_lock = 0;
 static void dcache_acquire(u64 *flags) {
   *flags = interrupts_save();
   while (__atomic_test_and_set(&dcache_lock, __ATOMIC_ACQUIRE))
-    __asm__ volatile("pause" ::: "memory");
+    cpu_relax();
 }
 
 static void dcache_release(u64 flags) {
@@ -941,7 +964,25 @@ static void vfs_inode_lock_clear_note(struct vfs_inode *inode) {
   inode->rw_site = 0;
 }
 
+__attribute__((noinline))
 static void vfs_inode_lock_read(struct vfs_inode *inode) {
+  /* Same trap as the write side: a task holding the write lock cannot take the
+   * read lock, so asking is a wait on itself. */
+  if (current_task &&
+      __atomic_load_n(&inode->rw_lock, __ATOMIC_ACQUIRE) < 0 &&
+      __atomic_load_n(&inode->rw_owner, __ATOMIC_RELAXED) ==
+          (u64)current_task->id) {
+    console_write("[LOCK] inode ");
+    console_write_dec((u64)inode->ino);
+    console_write(" read-locked by its own writer, pid ");
+    console_write_dec((u64)current_task->id);
+    console_write(": held from 0x");
+    console_write_hex64((u64)(usize)inode->rw_site);
+    console_write(", asked again from 0x");
+    console_write_hex64((u64)(usize)__builtin_return_address(0));
+    console_write("\n");
+    panic("vfs: inode read-lock under its own write-lock");
+  }
   if (blk_cache_lock_is_held()) {
     /* Walking the frame pointer chain into panic() shows just the
      * vfs_inode_lock_read frame; print our caller's return address up-front
@@ -1002,7 +1043,7 @@ static const void *g_inode_wait_worst_site;
 
 static inline u64 vfs_lock_tsc(void) {
   unsigned lo, hi;
-  __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+  { u64 c_ = arch_cycles(); lo = (u32)c_; hi = (u32)(c_ >> 32); }
   return ((u64)hi << 32) | lo;
 }
 
@@ -1029,7 +1070,117 @@ void vfs_inode_wait_reset(void) {
   __atomic_store_n(&g_inode_wait_worst, 0, __ATOMIC_RELAXED);
 }
 
+/* Write-locked inodes, so a task that dies holding one does not strand every
+ * waiter behind it for ever.
+ *
+ * Seen directly: inode 89 write-locked (rw_lock = -1) with rw_owner = 189, a
+ * pid that was no longer in the task table, and /bin/m13 blocked in write(2)
+ * behind it. Above that sat a whole process chain -- openrc-run polling, then
+ * openrc, then init in waitpid -- so one leaked inode lock wedges a smoke lane
+ * for the harness's entire window.
+ *
+ * A write lock is held across short critical sections and there are only ever a
+ * handful outstanding, so a small fixed table costs nothing to keep and can be
+ * scanned on exit. Readers are not tracked: a reader count cannot pin the lock
+ * against a writer for ever the way a lost write lock does, and tracking them
+ * would need an entry per reader per inode. */
+#define VFS_WLOCK_TRACK 64
+static struct {
+  struct vfs_inode *inode;
+  u64 owner;
+} g_vfs_wlocks[VFS_WLOCK_TRACK];
+static spinlock_t g_vfs_wlocks_lock = SPINLOCK_INIT;
+
+static void vfs_wlock_track(struct vfs_inode *inode, u64 owner) {
+  u64 flags;
+  spin_lock_irqsave(&g_vfs_wlocks_lock, &flags);
+  for (int i = 0; i < VFS_WLOCK_TRACK; i++) {
+    if (!g_vfs_wlocks[i].inode) {
+      g_vfs_wlocks[i].inode = inode;
+      g_vfs_wlocks[i].owner = owner;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&g_vfs_wlocks_lock, flags);
+}
+
+static void vfs_wlock_untrack(struct vfs_inode *inode) {
+  u64 flags;
+  spin_lock_irqsave(&g_vfs_wlocks_lock, &flags);
+  for (int i = 0; i < VFS_WLOCK_TRACK; i++) {
+    if (g_vfs_wlocks[i].inode == inode) {
+      g_vfs_wlocks[i].inode = 0;
+      g_vfs_wlocks[i].owner = 0;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&g_vfs_wlocks_lock, flags);
+}
+
+/* Called from the exit path with the dying task's id. Anything it still holds
+ * is released and reported: the release keeps the lane alive, the report names
+ * the site so the path that leaked it can be fixed rather than tolerated. */
+void vfs_release_inode_locks_of(u64 owner) {
+  u64 flags;
+
+  if (!owner)
+    return;
+  spin_lock_irqsave(&g_vfs_wlocks_lock, &flags);
+  for (int i = 0; i < VFS_WLOCK_TRACK; i++) {
+    struct vfs_inode *inode = g_vfs_wlocks[i].inode;
+
+    if (!inode || g_vfs_wlocks[i].owner != owner)
+      continue;
+    g_vfs_wlocks[i].inode = 0;
+    g_vfs_wlocks[i].owner = 0;
+    spin_unlock_irqrestore(&g_vfs_wlocks_lock, flags);
+
+    console_write("vfs: task ");
+    console_write_dec(owner);
+    console_write(" exited holding the write lock on inode ");
+    console_write_dec(inode->ino);
+    console_write(" taken at 0x");
+    console_write_hex64((u64)(usize)inode->rw_site);
+    console_write("; releasing it\n");
+
+    vfs_inode_lock_clear_note(inode);
+    __atomic_store_n(&inode->rw_lock, 0, __ATOMIC_RELEASE);
+    scheduler_wake_all((void *)&inode->rw_lock);
+
+    spin_lock_irqsave(&g_vfs_wlocks_lock, &flags);
+  }
+  spin_unlock_irqrestore(&g_vfs_wlocks_lock, flags);
+}
+
+/* noinline, deliberately: vfs_inode_lock_note records
+ * __builtin_return_address(0) as the acquiring site, and that address is only
+ * the caller's while this function has a frame of its own. Inlined, every
+ * report named whoever called the caller. */
+__attribute__((noinline))
 static void vfs_inode_lock_write(struct vfs_inode *inode) {
+  /* Self-deadlock: this rwlock is not recursive, so a task that already holds
+   * it for writing and asks again waits for itself for ever. That is not a
+   * hang to be discovered 120 seconds later from a watchdog dump -- by then
+   * the acquiring site is long gone from the stack and the whole lane, plus
+   * every process waiting on it, has been lost. Name it here, where both
+   * sites are still known. */
+  if (current_task &&
+      __atomic_load_n(&inode->rw_lock, __ATOMIC_ACQUIRE) < 0 &&
+      __atomic_load_n(&inode->rw_owner, __ATOMIC_RELAXED) ==
+          (u64)current_task->id) {
+    console_write("[LOCK] inode ");
+    console_write_dec((u64)inode->ino);
+    console_write(" write-locked recursively by pid ");
+    console_write_dec((u64)current_task->id);
+    console_write(" ('");
+    console_write(current_task->name ? current_task->name : "?");
+    console_write("'): held from 0x");
+    console_write_hex64((u64)(usize)inode->rw_site);
+    console_write(", asked again from 0x");
+    console_write_hex64((u64)(usize)__builtin_return_address(0));
+    console_write("\n");
+    panic("vfs: recursive inode write-lock");
+  }
   if (blk_cache_lock_is_held()) {
     console_write("[LOCK ORDER] vfs_inode_lock_write called by 0x");
     console_write_hex64((u64)(usize)__builtin_return_address(0));
@@ -1041,6 +1192,7 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
     int val = 0;
     if (__atomic_compare_exchange_n(&inode->rw_lock, &val, -1, 0,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      vfs_wlock_track(inode, current_task ? (u64)current_task->id : 0);
       if (wait_start)
         vfs_inode_wait_note(vfs_lock_tsc() - wait_start, inode->rw_site);
       break;
@@ -1064,6 +1216,7 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
 }
 
 static void vfs_inode_unlock_write(struct vfs_inode *inode) {
+  vfs_wlock_untrack(inode);
   LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_INODE);
   vfs_inode_lock_clear_note(inode);
   __atomic_store_n(&inode->rw_lock, 0, __ATOMIC_RELEASE);
@@ -1091,11 +1244,16 @@ void vfs_inode_chan_report(u64 chan, u64 payload_base, usize block_size) {
   console_write("\n");
 }
 
-/* Compatibility wrappers */
-static void vfs_inode_lock(struct vfs_inode *inode) {
+/* Compatibility wrappers. always_inline so the acquiring site recorded by
+ * vfs_inode_lock_write is the caller of THIS, not this wrapper -- every
+ * report used to name the same address inside the wrapper, which said
+ * nothing about which of its thirty callers had taken the lock. */
+__attribute__((always_inline))
+static inline void vfs_inode_lock(struct vfs_inode *inode) {
   vfs_inode_lock_write(inode);
 }
-static void vfs_inode_unlock(struct vfs_inode *inode) {
+__attribute__((always_inline))
+static inline void vfs_inode_unlock(struct vfs_inode *inode) {
   vfs_inode_unlock_write(inode);
 }
 
@@ -1187,6 +1345,11 @@ static void vfs_dir_changed(struct vfs_node *dir) {
 }
 
 static usize node_count = 0;
+
+usize vfs_active_node_count(void) {
+  return node_count;
+}
+
 static struct vfs_node *root_node = 0;
 static char tty_line[TTY_INPUT_SIZE];
 static usize tty_line_pos;
@@ -1213,10 +1376,10 @@ static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node) {
 }
 
 void virtio_blk_init(void);
-#ifndef __aarch64__
+void virtio_blk_mmio_init(void);
+void bcm2711_emmc_init(void);
 extern char ps2_kbd_getc(void);
 extern int ps2_kbd_has_data(void);
-#endif
 int serial_has_data(void);
 
 int vfs_mount(const char *source, const char *target, const char *fstype,
@@ -1326,7 +1489,15 @@ u32 vfs_mounting_fs_id(void) { return g_mounting_fs_id; }
 static struct vfs_inode *alloc_inode(void) {
   struct vfs_inode *inode = vfs_alloc_inode();
   if (inode) {
-    inode->refcount = 0;
+    /* One reference: the node this inode is about to be attached to. Every
+     * caller here hangs the inode off a fresh vfs_node, and vfs_node_put()
+     * releases exactly one inode reference when that node is finally freed --
+     * so an inode born at 0 makes its own node's free an underflow. Only
+     * vfs_create_node() used to set this, which is why the panic came from the
+     * paths that build a node by hand (create/mkdir/mknod/symlink): a
+     * `rename(new, existing)` frees the target node and drops an inode
+     * reference nobody ever took. */
+    inode->refcount = 1;
     inode->fs_id = g_mounting_fs_id;
   }
   return inode;
@@ -1341,8 +1512,29 @@ struct vfs_inode *vfs_inode_get(struct vfs_inode *inode) {
 void vfs_inode_put(struct vfs_inode *inode) {
   if (!inode)
     return;
-  if (__atomic_sub_fetch(&inode->refcount, 1, __ATOMIC_RELAXED) == 0 &&
-      inode->nlink == 0) {
+  int new_ref = __atomic_sub_fetch(&inode->refcount, 1, __ATOMIC_RELAXED);
+  if (new_ref < 0) {
+    /* Name the inode. "refcount underflow" on its own says a reference was
+     * dropped that nobody held, but not which object, and the same call site
+     * runs for every file in the system. */
+    console_write("vfs: inode underflow ino=");
+    console_write_dec(inode->ino);
+    console_write(" fs_id=");
+    console_write_dec((u64)inode->fs_id);
+    console_write(" type=");
+    console_write_dec((u64)inode->type);
+    console_write(" nlink=");
+    console_write_dec((u64)inode->nlink);
+    console_write(" size=");
+    console_write_dec((u64)inode->size);
+    console_write(" refcount=");
+    console_write_dec((u64)(u32)new_ref);
+    console_write(" caller=0x");
+    console_write_hex64((u64)(usize)__builtin_return_address(0));
+    console_write("\n");
+    panic("vfs: inode refcount underflow");
+  }
+  if (new_ref == 0 && inode->nlink == 0) {
     page_cache_invalidate_inode(inode);
     /* IC-1: drop any icache entry that maps to this inode BEFORE freeing it,
      * so a later icache_get(fs_id, ino) can't resurrect a dangling pointer
@@ -1387,10 +1579,28 @@ struct vfs_node *vfs_node_get(struct vfs_node *node) {
 void vfs_node_put(struct vfs_node *node) {
   if (!node)
     return;
-  if (__atomic_sub_fetch(&node->refcount, 1, __ATOMIC_RELAXED) == 0 &&
-      node->deleted) {
+  int new_ref = __atomic_sub_fetch(&node->refcount, 1, __ATOMIC_RELAXED);
+  if (new_ref < 0) {
+    panic("vfs: node refcount underflow");
+  }
+  if (new_ref == 0 && node->deleted) {
     if (node->inode && node->inode->release_cb) {
       node->inode->release_cb(node);
+    }
+    /* The node is about to drop its inode reference. If the inode has none
+     * left, this node never owned one -- name it, because "inode refcount
+     * underflow" alone does not say which of the nodes sharing that inode is
+     * the one accounting for it wrongly. */
+    if (node->inode &&
+        __atomic_load_n(&node->inode->refcount, __ATOMIC_RELAXED) <= 0) {
+      console_write("vfs: node '");
+      console_write(node->name[0] ? node->name : "(unnamed)");
+      console_write("' releasing an inode it does not hold: ino=");
+      console_write_dec(node->inode->ino);
+      console_write(" parent='");
+      console_write(node->parent && node->parent->name[0] ? node->parent->name
+                                                          : "/");
+      console_write("'\n");
     }
     vfs_inode_put(node->inode);
     /* Purge any dcache entry that references this node before its memory is
@@ -1401,6 +1611,7 @@ void vfs_node_put(struct vfs_node *node) {
     __atomic_sub_fetch(&node_count, 1, __ATOMIC_RELAXED);
   }
 }
+
 
 /* Peel the first component off `path`.
  *
@@ -1999,10 +2210,9 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
       return ERR_PTR(-ENAMETOOLONG);
     }
     if (part[0] == '\0') {
-      struct vfs_node *ret = current;
-      vfs_node_put(current);
-      return ret;
+      return current;
     }
+
 
     if (current->inode && current->inode->lookup_cb &&
         current->inode->lookup_refresh)
@@ -2090,9 +2300,10 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         child->inode->flags = flags;
         vfs_update_times(child->inode, VFS_MTIME | VFS_CTIME);
       }
-      struct vfs_node *ret = child;
+      struct vfs_node *ret = vfs_node_get(child);
       vfs_node_put(current);
       return ret;
+
     } else {
       if (!child) {
         child = alloc_node();
@@ -2347,16 +2558,15 @@ static void copy_path(char *dst, usize dst_size, const char *src) {
 }
 
 void vfs_handle_release(struct vfs_handle *h) {
-  if (!h || h->used != 1 || h->refcount <= 0)
+  if (!h || h->used != 1)
     return;
-  /* SMP-safe dec-and-test: a fork'd parent and child closing a shared socket
-   * fd on different CPUs both release the same handle. A non-atomic
-   * "if (refcount > 1) refcount--" lost the update under that race, so both
-   * fell through to ->release → kfree(socket_state) twice → kheap double-free
-   * ("bucket_unlink ... magic 0x...dead110c"). The atomic sub-and-test makes
-   * exactly one releaser observe 0 and run teardown. */
-  if (__atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL) > 0)
+  int new_ref = __atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL);
+  if (new_ref < 0) {
+    panic("vfs: handle refcount underflow");
+  }
+  if (new_ref > 0)
     return;
+
 
   h->used = 0;
   if (h->ops && h->ops->release) {
@@ -2861,6 +3071,12 @@ void vfs_init(void) {
 
 #ifndef __aarch64__
   virtio_blk_init();
+#else
+  virtio_blk_mmio_init();
+  /* The SD card a Raspberry Pi 4 boots from. Returns immediately on a board
+   * whose device tree describes no such controller, which is every other one
+   * this port runs on. */
+  bcm2711_emmc_init();
 #endif
 
   for (usize i = 0; i < blk_count(); i++) {
@@ -3029,9 +3245,15 @@ void vfs_populate_dev(void) {
   virtio_gpu_dev_init();
 
   /* Sound device nodes (/dev/dsp, /dev/dsp1) created by hda_init/ac97_init
-   * land on the initramfs root and are re-registered here, like fb/input. */
+   * land on the initramfs root and are re-registered here, like fb/input.
+   *
+   * HDA is a PCI device driven entirely through MMIO, so it belongs on every
+   * arch that has a PCI bus — which this port does now. AC'97 stays x86: its
+   * register file is reached through I/O ports, which do not exist here. */
   sound_module_dev_init();
+#if defined(__x86_64__)
   ac97_dev_init();
+#endif
 
   /* M107 device nodes — virtual terminals, /dev/kmsg, /dev/rtc*, /dev/watchdog,
    * /dev/loop-control and the SMBus adapter. Same reason as everything above:
@@ -3590,7 +3812,6 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   } else {
     if ((flags & B1NIX_O_CREAT) && (flags & B1NIX_O_EXCL)) {
       res = -EEXIST;
-      vfs_node_put(node);
       goto out;
     }
   }
@@ -3616,12 +3837,10 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   const int path_only = (flags & B1NIX_O_PATH) ? 1 : 0;
   if (!follow_final && node->inode->type == VFS_SYMLINK && !path_only) {
     res = -ELOOP;
-    vfs_node_put(node);
     goto out;
   }
   if ((flags & B1NIX_O_DIRECTORY) && node->inode->type != VFS_DIRECTORY) {
     res = -ENOTDIR;
-    vfs_node_put(node);
     goto out;
   }
   if (path_only)
@@ -3630,7 +3849,6 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   if (node->inode->type == VFS_DIRECTORY &&
       (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))) {
     res = -EISDIR;
-    vfs_node_put(node);
     goto out;
   }
 
@@ -3650,14 +3868,12 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
     struct vfs_mount_entry *wmnt = vfs_get_mount_for_node(node);
     if (wmnt && (wmnt->flags & MS_RDONLY)) {
       res = -EROFS;
-      vfs_node_put(node);
       goto out;
     }
   }
 
   res = vfs_check_access(node, access_mask);
   if (res != 0) {
-    vfs_node_put(node);
     goto out;
   }
 
@@ -3675,16 +3891,15 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
     /* O_TRUNC requires write permission regardless of open mode */
     res = vfs_check_access(node, W_OK);
     if (res != 0) {
-      vfs_node_put(node);
       goto out;
     }
     /* M109 chattr: same rule as ftruncate — neither an immutable nor an
      * append-only file may be emptied by an open(). */
     if (node->inode->attr & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND)) {
       res = -EPERM;
-      vfs_node_put(node);
       goto out;
     }
+
     vfs_inode_lock(node->inode);
     /* Drop cached pages first: dirty pages of the discarded content must not
      * be written back, and a later re-grow must read zeros, not stale data. */
@@ -3869,35 +4084,48 @@ static isize node_read_impl(struct vfs_handle *h, char *buf, usize size,
   } else if (node->inode->type == VFS_FILE) {
     usize rem = node->inode->size > offset ? node->inode->size - offset : 0;
     usize to_r = size < rem ? size : rem;
-    usize done = 0;
-    /* An in-memory file may also be mapped. A mapping is served from a
-     * page-cache frame seeded from inode->data, and stores through it never
-     * come back here — so a read that only looked at inode->data would report
-     * what the file held before anyone wrote to the mapping. Where a page is
-     * cached, it is the newer of the two, and it is what a reader must see. */
-    while (done < to_r) {
-      u64 cur = offset + done;
-      u64 page_aligned = cur & ~((u64)PAGE_SIZE - 1);
-      usize page_off = (usize)(cur & ((u64)PAGE_SIZE - 1));
-      usize chunk = PAGE_SIZE - page_off;
-      if (chunk > to_r - done)
-        chunk = to_r - done;
-      struct page_cache_entry *pe =
-          page_cache_get_page(node->inode, page_aligned);
-      if (pe) {
-        const char *src =
-            (const char *)(usize)(pe->frame + vmm_direct_map_base());
-        memcpy(buf + done, src + page_off, chunk);
-        page_cache_put_page(pe);
+    if (to_r > 0) {
+      if (node->inode->cached_pages == 0) {
+        if (node->inode->data)
+          memcpy(buf, (const char *)node->inode->data + offset, to_r);
+        else
+          memset(buf, 0, to_r);
+        res = (isize)to_r;
       } else {
-        memcpy(buf + done, (const char *)node->inode->data + cur, chunk);
+        usize done = 0;
+        /* An in-memory file may also be mapped. A mapping is served from a
+         * page-cache frame seeded from inode->data, and stores through it never
+         * come back here — so a read that only looked at inode->data would report
+         * what the file held before anyone wrote to the mapping. Where a page is
+         * cached, it is the newer of the two, and it is what a reader must see. */
+        while (done < to_r) {
+          u64 cur = offset + done;
+          u64 page_aligned = cur & ~((u64)PAGE_SIZE - 1);
+          usize page_off = (usize)(cur & ((u64)PAGE_SIZE - 1));
+          usize chunk = PAGE_SIZE - page_off;
+          if (chunk > to_r - done)
+            chunk = to_r - done;
+          struct page_cache_entry *pe =
+              page_cache_get_page(node->inode, page_aligned);
+          if (pe) {
+            const char *src =
+                (const char *)(usize)(pe->frame + vmm_direct_map_base());
+            memcpy(buf + done, src + page_off, chunk);
+            page_cache_put_page(pe);
+          } else {
+            if (node->inode->data)
+              memcpy(buf + done, (const char *)node->inode->data + cur, chunk);
+            else
+              memset(buf + done, 0, chunk);
+          }
+          done += chunk;
+        }
+        res = (isize)done;
       }
-      done += chunk;
+      if (posp) *posp += (usize)res; else h->offset += (usize)res;
+    } else {
+      res = 0;
     }
-    if (done > 0) {
-      if (posp) *posp += done; else h->offset += done;
-    }
-    res = (isize)done;
   }
   vfs_inode_unlock(node->inode);
   vfs_node_put(node);
@@ -4040,7 +4268,14 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
         return -ENOMEM;
       }
       if (node->inode->data) {
-        memcpy(new_data, node->inode->data, node->inode->size);
+        /* Preserve what the old buffer held, but never more than the new one
+         * can take: a node whose data came from the initramfs carries a real
+         * size with capacity 0, and copying that whole file into a buffer
+         * sized for the incoming write alone overruns the kernel heap. */
+        usize keep = node->inode->size;
+        if (keep > new_cap)
+          keep = new_cap;
+        memcpy(new_data, node->inode->data, keep);
         if (node->inode->flags & VFS_NODE_OWNS_DATA)
           kfree(node->inode->data);
       }
@@ -4053,21 +4288,23 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
      * from the page cache, so a write that only touched inode->data would be
      * invisible through the mapping — the same divergence, in the other
      * direction, that the read path above closes. */
-    for (u64 cur = offset; cur < offset + size;) {
-      u64 page_aligned = cur & ~((u64)PAGE_SIZE - 1);
-      usize page_off = (usize)(cur & ((u64)PAGE_SIZE - 1));
-      usize chunk = PAGE_SIZE - page_off;
-      if (chunk > (usize)(offset + size - cur))
-        chunk = (usize)(offset + size - cur);
-      struct page_cache_entry *pe =
-          page_cache_get_page(node->inode, page_aligned);
-      if (pe) {
-        char *dst = (char *)(usize)(pe->frame + vmm_direct_map_base());
-        memcpy(dst + page_off, buf + (usize)(cur - offset), chunk);
-        page_cache_mark_dirty(pe);
-        page_cache_put_page(pe);
+    if (node->inode->cached_pages > 0) {
+      for (u64 cur = offset; cur < offset + size;) {
+        u64 page_aligned = cur & ~((u64)PAGE_SIZE - 1);
+        usize page_off = (usize)(cur & ((u64)PAGE_SIZE - 1));
+        usize chunk = PAGE_SIZE - page_off;
+        if (chunk > (usize)(offset + size - cur))
+          chunk = (usize)(offset + size - cur);
+        struct page_cache_entry *pe =
+            page_cache_get_page(node->inode, page_aligned);
+        if (pe) {
+          char *dst = (char *)(usize)(pe->frame + vmm_direct_map_base());
+          memcpy(dst + page_off, buf + (usize)(cur - offset), chunk);
+          page_cache_mark_dirty(pe);
+          page_cache_put_page(pe);
+        }
+        cur += chunk;
       }
-      cur += chunk;
     }
     if (offset + size > node->inode->size)
       node->inode->size = (usize)(offset + size);
@@ -5232,7 +5469,9 @@ int vfs_link(const char *target, const char *link_path) {
   }
 
   copy_path(new_node->name, VFS_NAME_MAX, name);
-  new_node->inode = target_node->inode;
+  /* A hard link is a second node over one inode, and each node releases one
+   * inode reference when it is freed -- so the second node has to take one. */
+  new_node->inode = vfs_inode_get(target_node->inode);
   new_node->inode->nlink++;
   new_node->parent = parent;
   {
@@ -5251,6 +5490,7 @@ int vfs_link(const char *target, const char *link_path) {
       parent->first_child = new_node->next_sibling;
       vfs_tree_write_release(_tlflags);
       new_node->inode->nlink--;
+      vfs_inode_put(new_node->inode); /* the ref taken just above */
       new_node->inode = 0;
       /* The fresh node was allocated with refcount 0; give it the reference
        * we are about to drop and mark it deleted so vfs_node_put's 0+deleted
@@ -5840,19 +6080,49 @@ int vfs_fsync(int fd) {
     return -EBADF;
   struct vfs_node *node = h->node;
 
-  /* Inode lock across the flush — see vfs_close_handle (flush vs a concurrent
-   * truncate's in-place page zeroing). */
-  int err = vfs_node_fsync(node);
-  if (err < 0)
-    return err;
+  /* Everything this file owns reaches the medium first, and the device barrier
+   * is issued once, at the end.
+   *
+   * This used to call the filesystem's fsync_cb -- which writes the super block
+   * and issues a cache-flush command -- and only THEN write the file's own
+   * dirty blocks back, followed by a second flush. So the first barrier came
+   * before the writeback it existed to make durable (ext4_vfs_fsync's comment
+   * describes the correct order; the code did not implement it), and every
+   * fsync paid for two barriers where one would do.
+   *
+   * It is worth real time: on the aarch64 sys lane, fsync was 47 s of a 176 s
+   * run across 19 calls, ~2.5 s each, and a barrier is most of that.
+   *
+   * Inode lock across the page-cache flush -- see vfs_close_handle (flush vs a
+   * concurrent truncate's in-place page zeroing). */
+  vfs_inode_lock(node->inode);
+  page_cache_flush_inode(node->inode);
+  vfs_inode_unlock(node->inode);
 
   if (node->inode->blk_dev) {
-    /* Persist THIS file, then flush the device — fsync is about one file, and
-     * draining every dirty block in a RAM-sized cache is what made a single
-     * call cost seconds. Blocks carry the inode that dirtied them, so the rest
-     * stays for the background drain. */
-    blk_cache_flush_inode(node->inode->blk_dev, node->inode->fs_id,
-                          node->inode->ino);
+    /* Persist THIS file, not the machine: fsync is about one file, and draining
+     * every dirty block in a RAM-sized cache is what made a single call cost
+     * seconds. Blocks carry the inode that dirtied them, so the rest stays for
+     * the background drain. No barrier here — fsync_cb below issues it. */
+    blk_cache_writeback_inode(node->inode->blk_dev, node->inode->fs_id,
+                              node->inode->ino);
+  }
+
+  if (node->inode->fsync_cb) {
+    int err = node->inode->fsync_cb(node);
+
+    if (err < 0)
+      return err;
+  } else if (node->inode->blk_dev && node->inode->blk_dev->flush) {
+    /* No filesystem callback to issue the barrier, so issue it here. */
+    struct block_device *d = node->inode->blk_dev;
+
+    struct block_device *parent = blk_partition_parent(d);
+
+    if (parent)
+      d = parent;
+    if (d->flush)
+      d->flush(d);
   }
   return 0;
 }
@@ -6454,6 +6724,21 @@ int vfs_move_mount(const char *source, const char *target) {
   dcache_invalidate_node(dst_node);
   vfs_node_put(old_mp);
   vfs_node_put(src_node);
+  return 0;
+}
+
+/* Is this block device the source of a live mount? A self-test that wants a
+ * disk nothing else owns has no other way to ask: on one board the first
+ * virtio disk is a scratch image, on another it is the root filesystem, and
+ * writing test patterns into the running root is not a mistake worth making
+ * twice. */
+int vfs_device_is_mounted(const char *name) {
+  if (!name || !name[0] || !mounts)
+    return 0;
+  for (usize i = 0; i < mount_slots; i++) {
+    if (mounts[i].used && strcmp(mounts[i].source, name) == 0)
+      return 1;
+  }
   return 0;
 }
 
@@ -7072,9 +7357,8 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     u64 seq_above = (cookie > 2) ? (cookie - 2) : 0; /* 0 = no bound */
     u64 tflags;
     vfs_tree_read_acquire(&tflags);
-    for (struct vfs_node *child = next_child_by_seq(dir, seq_above);
-         child && count < max_entries;
-         child = next_child_by_seq(dir, seq_above)) {
+    struct vfs_node *child = next_child_by_seq(dir, seq_above);
+    while (child && count < max_entries) {
       copy_path(buf[count].name, 64, child->name);
       buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
@@ -7084,6 +7368,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
       count++;
       seq_above = child->dir_seq;
       cookie = child->dir_seq + 2;
+      child = next_child_by_seq(dir, seq_above);
     }
     vfs_tree_read_release(tflags);
     if (count > 0)
@@ -7147,9 +7432,8 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     usize count = 0;
     u64 tflags;
     vfs_tree_read_acquire(&tflags);
-    for (struct vfs_node *child = next_child_by_seq(dir, seq_above);
-         child && count < max_entries;
-         child = next_child_by_seq(dir, seq_above)) {
+    struct vfs_node *child = next_child_by_seq(dir, seq_above);
+    while (child && count < max_entries) {
       copy_path(buf[count].name, 64, child->name);
       buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
@@ -7159,6 +7443,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
       count++;
       seq_above = child->dir_seq;
       h->offset = VFS_DIR_MEM_CURSOR | (usize)seq_above;
+      child = next_child_by_seq(dir, seq_above);
     }
     vfs_tree_read_release(tflags);
     res = (isize)count;
@@ -7365,7 +7650,7 @@ int vfs_get_node_path(struct vfs_node *node, char *buf, usize buf_len) {
 static inline u64 ftr_now(void) {
   u32 lo, hi;
 
-  __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+  { u64 c_ = arch_cycles(); lo = (u32)c_; hi = (u32)(c_ >> 32); }
   return ((u64)hi << 32) | lo;
 }
 
@@ -7524,7 +7809,11 @@ int vfs_ftruncate(int fd, u64 length) {
       return -ENOMEM;
     }
     if (inode->data) {
-      memcpy(new_data, inode->data, inode->size);
+      /* Same clamp as vfs_write: copy no more than the new buffer holds. */
+      usize keep = inode->size;
+      if (keep > new_cap)
+        keep = new_cap;
+      memcpy(new_data, inode->data, keep);
       if (inode->flags & VFS_NODE_OWNS_DATA)
         kfree(inode->data);
     }
@@ -7662,7 +7951,7 @@ static int memfd_reserve(struct vfs_inode *inode, u64 length) {
      * `b1nix.trace-memfd`. */
     u32 t_lo, t_hi;
 
-    __asm__ volatile("rdtsc" : "=a"(t_lo), "=d"(t_hi));
+    { u64 c_ = arch_cycles(); t_lo = (u32)c_; t_hi = (u32)(c_ >> 32); }
     u64 t0 = ((u64)t_hi << 32) | t_lo;
     void *new_data = kzalloc(new_cap);
     if (!new_data)
@@ -7670,7 +7959,7 @@ static int memfd_reserve(struct vfs_inode *inode, u64 length) {
     if (new_cap >= (1u << 20) && bootinfo_has_flag("b1nix.trace-memfd")) {
       u32 e_lo, e_hi;
 
-      __asm__ volatile("rdtsc" : "=a"(e_lo), "=d"(e_hi));
+      { u64 c_ = arch_cycles(); e_lo = (u32)c_; e_hi = (u32)(c_ >> 32); }
       console_write("memfd: grew to ");
       console_write_dec(new_cap / 1024);
       console_write(" KiB in ");

@@ -190,6 +190,7 @@ struct vfs_xattr {
 #define XATTR_VALUE_MAX 4096
 
 /* Name the holder of an inode rwlock a task is parked on (watchdog dump). */
+void vfs_release_inode_locks_of(u64 owner);
 void vfs_inode_chan_report(u64 chan, u64 payload_base, usize block_size);
 
 struct vfs_inode {
@@ -534,7 +535,11 @@ struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
                               void *data, usize size, u32 flags);
 struct vfs_node *vfs_node_get(struct vfs_node *node);
 void vfs_node_put(struct vfs_node *node);
+usize vfs_active_node_count(void);
+void vfs_dump_mounts(void);
 u32 vfs_mounting_fs_id(void);
+
+
 
 struct vfs_node *vfs_create_node(enum vfs_node_type type);
 void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child);
@@ -616,6 +621,8 @@ int vfs_pivot_root(const char *new_root, const char *put_old);
  * inside it along. Neither filesystem is unmounted, so open files on the moved
  * mount stay open — this is what switch_root does with the new root. */
 int vfs_move_mount(const char *source, const char *target);
+/* 1 when `name` (a block device name, e.g. "vda") backs a live mount. */
+int vfs_device_is_mounted(const char *name);
 void vfs_register_fs(struct vfs_fs *fs);
 /* Withdraw a filesystem type. A module that registered a filesystem must call
  * this from its exit path, or the VFS keeps a pointer into freed module text. */
@@ -896,6 +903,13 @@ struct vfs_pipe {
   usize write_pos;
   int readers;
   int writers;
+  /* Monotonic open counts for the FIFO rendezvous. A blocking open must
+   * return once the opposite end HAS opened — checking the live reader/writer
+   * count instead loses the race when the peer opens, transfers and closes
+   * before the sleeper is scheduled, which left the reader blocked forever
+   * (M11's fifo-rendezvous on a single-CPU guest). Reset with the slot. */
+  u32 reader_opens;
+  u32 writer_opens;
   volatile int lock;
 };
 

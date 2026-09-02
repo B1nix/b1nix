@@ -13,6 +13,7 @@
  * thread. Nothing here can reorder them.
  */
 
+#include <b1nix/arch.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/tlb.h>
@@ -155,7 +156,7 @@ static int kthread_wait_until_idle(struct kthread_worker *worker,
 			/* Cannot park: spin, and keep servicing shootdowns. Flushing from
 			 * such a context is a caller bug, but wedging the CPU reports it
 			 * worse than making progress does. */
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}
@@ -206,7 +207,7 @@ void kthread_destroy_worker(struct kthread_worker *worker)
 
 	while (!worker->exited) {
 		if (!scheduler_can_block()) {
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}

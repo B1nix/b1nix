@@ -15,6 +15,7 @@
  */
 
 #include <b1nix/acpi.h>
+#include <b1nix/arch.h>
 #include <b1nix/amdvi.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
@@ -156,7 +157,7 @@ static void amdvi_completion_wait(void)
 	                   ((u32)(sem_phys >> 32) & 0xFFFFFu)),
 	             1u, 0u);
 	for (int i = 0; i < 1000000 && *sem == 0; i++)
-		__asm__ volatile("pause");
+		cpu_relax();
 }
 
 static void amdvi_invalidate_device(u16 bdf)

@@ -239,6 +239,26 @@ void kill_anon_super(struct super_block *sb)
 	 * mounts anything, so there is no superblock to destroy. */
 }
 
+/*
+ * A mount for callers that only read a field out of it.
+ *
+ * Anonymous inodes here are allocated directly rather than from a mounted
+ * pseudo-filesystem, so there is nothing to pin — but "nothing" cannot be a
+ * null pointer. drm_fs_inode_new() reads drm_fs_mnt->mnt_sb to hand it to
+ * alloc_anon_inode, which then ignores the value; handing back NULL made that
+ * read a null dereference. It went unnoticed on x86_64 only because the low
+ * identity map makes address 0 readable there, so the load returned garbage
+ * that was never used. aarch64 does not map page zero and faulted at once.
+ */
+/* struct super_block is deliberately incomplete in this shim — nothing here
+ * has fields to offer — so the mount points at a valid address rather than at
+ * an object. That is all the contract needs: the value is passed on and
+ * ignored, never dereferenced. */
+static char lkpi_anon_sb_storage[1];
+static struct vfsmount lkpi_anon_mnt = {
+	.mnt_sb = (struct super_block *)lkpi_anon_sb_storage,
+};
+
 int simple_pin_fs(struct file_system_type *type, struct vfsmount **mount,
                   int *count)
 {
@@ -246,13 +266,7 @@ int simple_pin_fs(struct file_system_type *type, struct vfsmount **mount,
 	if (count)
 		(*count)++;
 	if (mount)
-		*mount = 0;
-	/*
-	 * Anonymous inodes here are allocated directly rather than from a mounted
-	 * pseudo-filesystem, so there is nothing to pin. Success is reported
-	 * because the caller's only use of the mount is to pass it to
-	 * alloc_anon_inode, which ignores it.
-	 */
+		*mount = &lkpi_anon_mnt;
 	return 0;
 }
 
@@ -262,6 +276,7 @@ void simple_release_fs(struct vfsmount **mount, int *count)
 		(*count)--;
 	if (mount)
 		*mount = 0;
+	/* The mount above is static; there is nothing to free. */
 }
 
 /* ── shmem ──────────────────────────────────────────────────────── */

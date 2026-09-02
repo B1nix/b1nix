@@ -1,3 +1,5 @@
+#include <b1nix/blk.h>
+#include <b1nix/arch.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/vfs.h>
 #include <b1nix/mm.h>
@@ -128,7 +130,7 @@ static u64 lock_bucket(u32 h) {
   scheduler_preempt_disable();
   while (__sync_lock_test_and_set(&pc_bucket[h], 1)) {
     while (pc_bucket[h]) {
-      __asm__ volatile("pause");
+      cpu_relax();
       tlb_shootdown_poll();
     }
   }
@@ -240,7 +242,9 @@ static void lock_pc(void) {
   while (__atomic_load_n(&pc_lock_owner, __ATOMIC_ACQUIRE) != me) {
     /* Drain TLB shootdowns while spinning — a waiter with interrupts masked
      * cannot ACK the initiator's IPI, and the initiator waits masked too. */
-    __asm__ volatile("pause");
+    /* cpu_relax(), not a bare `pause`: that mnemonic exists only on x86 and
+     * this file is built for both arches again. */
+    cpu_relax();
     tlb_shootdown_poll();
     if (++spins == PC_LOCK_STUCK_SPINS)
       pc_lock_report_stuck("lock_pc", ra);
@@ -896,7 +900,20 @@ static void writeback_page_locked(struct page_cache_entry *page) {
       page->refcount++;
       unlock_pc();
       void *virt_addr = (void *)(usize)(page->frame + vmm_direct_map_base());
+      /* Say whose blocks these are before the filesystem turns the page into
+       * block writes, so a later fsync of this file can find them.
+       *
+       * vfs_write already stamps the owner, but only on the branch that calls
+       * write_cb directly. A write that lands in this cache is finished HERE,
+       * from a flush, and left every block it produced unowned -- so the
+       * per-inode filter in blk_flush_matching matched nothing it was meant to
+       * exclude, and, because an unowned block is written rather than risked,
+       * every fsync drained the whole dirty cache. Measured on the aarch64 sys
+       * lane: 234 blocks written per fsync, all 234 of them unowned, whichever
+       * file was being synced -- 47 s across 19 calls. */
+      blk_set_dirty_owner(page->inode->fs_id, page->inode->ino);
       page->inode->write_cb(&dummy, page->offset, virt_addr, size, 0);
+      blk_clear_dirty_owner();
       lock_pc();
       page->refcount--;
       if (page->refcount == 0 && (page->flags & PAGE_CACHE_ORPHAN)) {

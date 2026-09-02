@@ -30,6 +30,13 @@ void console_log_panic_flush(void);
  * through the other's. */
 void console_lock_acquire_irqsave(u64 *flags);
 void console_lock_release_irqrestore(u64 flags);
+/* True when THIS CPU is already inside a console_lock_acquire_irqsave section,
+ * so a nested console_write must print without retaking the lock. */
+int console_lock_held_here(void);
+/* Non-blocking acquire: 1 and *flags set when taken, 0 when somebody else has
+ * it. The panic path uses this to own the console without deadlocking on a
+ * holder that will never release. */
+int console_lock_try_acquire_irqsave(u64 *flags);
 void console_write_hex32(u32 value);
 void console_write_hex64(u64 value);
 void console_write_dec(u64 value);

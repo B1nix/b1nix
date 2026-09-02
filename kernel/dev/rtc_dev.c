@@ -7,6 +7,8 @@
  * and the BCD/12-hour encodings, plus the alarm registers `rtcwake` sets.
  */
 
+#include <b1nix/ktime.h>
+#include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/io.h>
 #include <b1nix/posix.h>
@@ -19,6 +21,7 @@
 #include <b1nix/syscall.h>
 #include <b1nix/vfs.h>
 #include <string.h>
+#include <b1nix/platform.h>
 
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
@@ -77,6 +80,316 @@ struct rtc_wkalrm_k {
 static spinlock_t rtc_lock = SPINLOCK_INIT;
 static u32 g_irq_freq = 2;
 
+/* Calendar helpers, shared by both backends. */
+static int is_leap(int year) {
+  return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+static int days_in_month(int year, int mon /* 0-11 */) {
+  static const int d[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (mon == 1 && is_leap(year))
+    return 29;
+  return d[mon];
+}
+
+/* The civil-date conversion and its known-answer test used to live in
+ * kernel/arch/x86_64/rtc.c beside the CMOS reader that calls it. Nothing in
+ * either is x86: it is calendar arithmetic, and this port needs the same
+ * answers from its own PL031 backend below. Leaving them there meant the
+ * self-test simply did not exist on aarch64 -- every M118-RTC check reported a
+ * missing marker rather than a wrong one. */
+/* Seconds since 1970-01-01 00:00:00 UTC for a proleptic-Gregorian civil date.
+ *
+ * Exact, century rule included. The version this replaced counted leap days as
+ * (y + 2) / 4 and tested February with `year % 4 == 0`, which is right only
+ * between 1901 and 2099 and even there only outside January and February of a
+ * leap year — it reported those two months a day late, every leap year. Every
+ * file timestamp, every timeout and every certificate validity check on the
+ * machine is derived from this number, so "good enough for a boot offset" was
+ * not good enough.
+ *
+ * The shift-to-March algorithm (Howard Hinnant's days_from_civil) does it in
+ * closed form: numbering March as month 1 puts the leap day at the END of the
+ * year, which makes the month-length pattern the exact linear (153m + 2) / 5
+ * and leaves the leap-day count to plain integer division over a 400-year era.
+ * A date before the epoch returns 0 — the callers here (a boot-time clock read
+ * and its self-test) have nothing useful to do with a negative wall clock. */
+u64 rtc_civil_to_unix(u16 year, u32 month, u32 day, u32 hour, u32 minute,
+                      u32 second) {
+  i64 y = (i64)year;
+  u32 m = month;
+  if (m <= 2) {
+    y -= 1;
+    m += 12;
+  }
+  i64 era = (y >= 0 ? y : y - 399) / 400;
+  u64 yoe = (u64)(y - era * 400);                  /* year of era, 0..399 */
+  u64 doy = (153u * (m - 3) + 2) / 5 + day - 1;    /* day of year, Mar 1 = 0 */
+  u64 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; /* day of era, 0..146096 */
+  i64 days = era * 146097 + (i64)doe - 719468;     /* 719468 = 1970-01-01 */
+
+  if (days < 0)
+    return 0;
+
+  return (u64)days * 86400ull + (u64)hour * 3600ull + (u64)minute * 60ull +
+         second;
+}
+
+/* Known-answer test for the civil-date conversion, run in test mode.
+ *
+ * The vectors are the cases the old approximation got wrong, plus the two
+ * boundaries it could never have reached: 2000 is a leap year (divisible by
+ * 400) while 2100 is not (divisible by 100 but not 400), and February of a leap
+ * year is where the (y + 2) / 4 estimate slipped a day. Values cross-checked
+ * against `date -u -d … +%s`. */
+void rtc_selftest(void) {
+  static const struct {
+    u16 year;
+    u32 month, day, hour, minute, second;
+    u64 expect;
+    const char *name;
+  } vectors[] = {
+      {1970, 1, 1, 0, 0, 0, 0ull, "epoch"},
+      {2001, 9, 9, 1, 46, 40, 1000000000ull, "billennium"},
+      /* Feb 29 exists only because 2000 is a 400-year leap year. */
+      {2000, 2, 29, 0, 0, 0, 951782400ull, "leap-2000"},
+      /* January of a leap year — the month the old estimate reported late. */
+      {2024, 1, 31, 12, 0, 0, 1706702400ull, "leap-year-january"},
+      {2024, 2, 29, 23, 59, 59, 1709251199ull, "leap-2024"},
+      /* 2100 is NOT a leap year: March 1 follows February 28. */
+      {2100, 3, 1, 0, 0, 0, 4107542400ull, "century-2100"},
+  };
+
+  for (unsigned i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++) {
+    u64 got = rtc_civil_to_unix(vectors[i].year, vectors[i].month, vectors[i].day,
+                                vectors[i].hour, vectors[i].minute,
+                                vectors[i].second);
+    if (got == vectors[i].expect) {
+      console_write("M118-RTC: ok ");
+      console_write(vectors[i].name);
+      console_write("\n");
+    } else {
+      console_write("M118-RTC: FAIL ");
+      console_write(vectors[i].name);
+      console_write(" got=");
+      console_write_dec(got);
+      console_write(" want=");
+      console_write_dec(vectors[i].expect);
+      console_write("\n");
+    }
+  }
+}
+
+/* Read the hardware clock. Retries until two consecutive reads agree and the
+ * update-in-progress flag is clear, which is the only way to avoid a torn
+ * value across a second boundary. */
+
+#if defined(__aarch64__)
+/* ── PL031 backend (QEMU virt) ───────────────────────────────────────────
+ * The ARM PrimeCell RTC is a plain 32-bit seconds-since-epoch counter with one
+ * match register for the alarm — no BCD, no update-in-progress window, and no
+ * periodic interrupt. Everything below the node/ioctl layer is therefore much
+ * simpler than the CMOS backend it replaces on this arch. QEMU maps it at
+ * 0x09010000, inside the identity-mapped low MMIO window the GIC and UART also
+ * live in, so no mapping call is needed. */
+#define PL031_BASE 0x09010000ULL
+#define PL031_DR   0x000 /* data: current value, seconds */
+#define PL031_MR   0x004 /* match: alarm */
+#define PL031_LR   0x008 /* load: set the counter */
+#define PL031_CR   0x00c /* control: bit 0 enables */
+#define PL031_IMSC 0x010 /* interrupt mask set/clear */
+#define PL031_RIS  0x014 /* raw interrupt status */
+#define PL031_ICR  0x01c /* interrupt clear */
+
+/* QEMU virt has a PL031 at this address. Nothing else does.
+ *
+ * A Raspberry Pi has no battery-backed clock at all, and on a Snapdragon 855
+ * 0x09010000 is not an RTC — it is an unclaimed window in the Qualcomm
+ * peripheral space, where a load does not return a wrong value, it does not
+ * return. vfs_get_unix_time() calls rtc_now_unix_seconds() on every VFS node
+ * creation, so on that board this single hardcoded read wedged the boot inside
+ * the first vfs_add_node() after the initramfs, with no output and no fault. */
+static int pl031_present(void) {
+  return platform_type() == PLATFORM_QEMU_VIRT;
+}
+
+/* Registers on a board that has the device; a scratch word per offset on one
+ * that does not, so every caller below keeps working and nothing reaches a bus
+ * that will not answer. */
+static u32 pl031_absent_regs[8];
+static u64 g_rtc_soft_seconds; /* the settable clock a board with no RTC gets */
+
+static volatile u32 *pl031_reg(u32 off) {
+  if (!pl031_present())
+    return &pl031_absent_regs[(off / 4) & 7];
+  return (volatile u32 *)(usize)(PL031_BASE + off);
+}
+
+/* Days since the epoch for a Gregorian date, then the usual 86400 scaling. */
+static u64 rtc_tm_to_epoch(const struct rtc_time_k *t) {
+  int year = t->tm_year + 1900;
+  i64 days = 0;
+  for (int y = 1970; y < year; y++)
+    days += is_leap(y) ? 366 : 365;
+  for (int m = 0; m < t->tm_mon; m++)
+    days += days_in_month(year, m);
+  days += t->tm_mday - 1;
+  return (u64)days * 86400ULL + (u64)t->tm_hour * 3600ULL +
+         (u64)t->tm_min * 60ULL + (u64)t->tm_sec;
+}
+
+static void rtc_epoch_to_tm(u64 secs, struct rtc_time_k *out) {
+  memset(out, 0, sizeof(*out));
+  u64 days = secs / 86400ULL;
+  u32 rem = (u32)(secs % 86400ULL);
+  out->tm_hour = (int)(rem / 3600);
+  out->tm_min = (int)((rem % 3600) / 60);
+  out->tm_sec = (int)(rem % 60);
+  out->tm_wday = (int)((days + 4) % 7); /* 1970-01-01 was a Thursday */
+  int year = 1970;
+  while (1) {
+    u64 ylen = is_leap(year) ? 366 : 365;
+    if (days < ylen)
+      break;
+    days -= ylen;
+    year++;
+  }
+  out->tm_year = year - 1900;
+  out->tm_yday = (int)days;
+  int mon = 0;
+  while (mon < 11 && days >= (u64)days_in_month(year, mon)) {
+    days -= (u64)days_in_month(year, mon);
+    mon++;
+  }
+  out->tm_mon = mon;
+  out->tm_mday = (int)days + 1;
+  out->tm_isdst = -1;
+}
+
+static int rtc_hw_read(struct rtc_time_k *out) {
+  rtc_epoch_to_tm(rtc_now_unix_seconds(), out);
+  return 0;
+}
+
+static int rtc_hw_write(const struct rtc_time_k *t) {
+  int year = t->tm_year + 1900;
+  if (t->tm_mon < 0 || t->tm_mon > 11 || t->tm_mday < 1 ||
+      t->tm_mday > days_in_month(year, t->tm_mon) || t->tm_hour < 0 ||
+      t->tm_hour > 23 || t->tm_min < 0 || t->tm_min > 59 || t->tm_sec < 0 ||
+      t->tm_sec > 59 || year < 1970 || year > 3000)
+    return -EINVAL;
+  u64 flags;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  *pl031_reg(PL031_LR) = (u32)rtc_tm_to_epoch(t);
+  *pl031_reg(PL031_CR) = 1;
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  return 0;
+}
+
+static int rtc_alarm_read(struct rtc_wkalrm_k *out) {
+  u64 flags;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  u32 match = *pl031_reg(PL031_MR);
+  u32 mask = *pl031_reg(PL031_IMSC);
+  u32 ris = *pl031_reg(PL031_RIS);
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  memset(out, 0, sizeof(*out));
+  rtc_epoch_to_tm(match, &out->time);
+  out->enabled = (mask & 1) ? 1 : 0;
+  out->pending = (ris & 1) ? 1 : 0;
+  return 0;
+}
+
+/* The alarm register holds a full timestamp, but RTC_ALM_SET only carries
+ * hour/min/sec — the same "next time those hands come round" semantics the
+ * CMOS backend has. Build it from today's date and roll to tomorrow when the
+ * time of day has already passed. */
+static int rtc_alarm_write(const struct rtc_time_k *t, int enable) {
+  if (t->tm_sec < 0 || t->tm_sec > 59 || t->tm_min < 0 || t->tm_min > 59 ||
+      t->tm_hour < 0 || t->tm_hour > 23)
+    return -EINVAL;
+  u64 flags;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  u64 now = *pl031_reg(PL031_DR);
+  u64 midnight = (now / 86400ULL) * 86400ULL;
+  u64 when = midnight + (u64)t->tm_hour * 3600ULL + (u64)t->tm_min * 60ULL +
+             (u64)t->tm_sec;
+  if (when <= now)
+    when += 86400ULL;
+  *pl031_reg(PL031_MR) = (u32)when;
+  *pl031_reg(PL031_ICR) = 1;
+  *pl031_reg(PL031_IMSC) = enable ? 1u : 0u;
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  return 0;
+}
+
+/* Only the alarm interrupt exists on PL031; there is no update-done or
+ * periodic source to switch on, so those are reported as unsupported rather
+ * than silently accepted. */
+static int rtc_set_status_b(u8 bit, int on) {
+  if (bit != RTC_B_AIE)
+    return -EINVAL;
+  u64 flags;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  *pl031_reg(PL031_IMSC) = on ? 1u : 0u;
+  spin_unlock_irqrestore(&rtc_lock, flags);
+  return 0;
+}
+
+u64 rtc_now_unix_seconds(void) {
+  if (!pl031_present())
+    return g_rtc_soft_seconds;
+  return *pl031_reg(PL031_DR);
+}
+
+/* The wall clock in nanoseconds, with a sub-second part that actually moves.
+ *
+ * This used to be the seconds reading multiplied by a billion, so every
+ * timestamp on this arch had nanoseconds of exactly zero. Two changes inside
+ * one second were then indistinguishable, which is precisely what a directory
+ * mtime is asked to distinguish: anything that re-reads a directory only when
+ * its mtime moved (make, ccache, systemd's unit cache, package managers) was
+ * blind to a second write in the same second.
+ *
+ * Built the way x86_64 builds it: ONE monotonic source carries the sub-second
+ * part, anchored to the seconds the RTC read at boot, so the composite never
+ * walks backwards. The RTC is re-read only when it ticks a new second, which
+ * keeps long-run drift bounded to the hardware's own. */
+u64 rtc_now_unix_nanos(void) {
+  static u64 anchor_sec;      /* RTC seconds at the last resync */
+  static u64 anchor_mono_ns;  /* monotonic reading at that moment */
+  static int anchored;
+
+  u64 sec = rtc_now_unix_seconds();
+  u64 mono = ktime_monotonic_ns();
+
+  if (!anchored || sec != anchor_sec) {
+    /* First call, or the RTC moved on: re-anchor so the sub-second part
+     * restarts from zero exactly when the second changes. */
+    anchor_sec = sec;
+    anchor_mono_ns = mono;
+    anchored = 1;
+  }
+
+  u64 sub = mono - anchor_mono_ns;
+  if (sub > 999999999ull)
+    sub = 999999999ull; /* the RTC is late; hold at the end of the second */
+  return sec * 1000000000ull + sub;
+}
+
+void rtc_set_unix_time(u64 sec) {
+  u64 flags;
+  spin_lock_irqsave(&rtc_lock, &flags);
+  if (pl031_present()) {
+    *pl031_reg(PL031_LR) = (u32)sec;
+    *pl031_reg(PL031_CR) = 1;
+  } else {
+    g_rtc_soft_seconds = sec;
+  }
+  spin_unlock_irqrestore(&rtc_lock, flags);
+}
+
+#else
 static u8 cmos_read(u8 reg) {
   outb(CMOS_ADDR, reg);
   return inb(CMOS_DATA);
@@ -93,20 +406,6 @@ static int bcd_to_bin(u8 v) { return (v & 0x0F) + ((v >> 4) * 10); }
 static u8 bin_to_bcd(int v) { return (u8)(((v / 10) << 4) | (v % 10)); }
 
 /* Days in a month, honouring the proleptic Gregorian leap rule. */
-static int is_leap(int year) {
-  return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-}
-
-static int days_in_month(int year, int mon /* 0-11 */) {
-  static const int d[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-  if (mon == 1 && is_leap(year))
-    return 29;
-  return d[mon];
-}
-
-/* Read the hardware clock. Retries until two consecutive reads agree and the
- * update-in-progress flag is clear, which is the only way to avoid a torn
- * value across a second boundary. */
 static int rtc_hw_read(struct rtc_time_k *out) {
   u8 s1[7], s2[7];
   u8 b;
@@ -301,6 +600,8 @@ static int rtc_set_status_b(u8 bit, int on) {
   return 0;
 }
 
+#endif /* CMOS vs PL031 backend */
+
 /* Reading /dev/rtc0 blocks for an interrupt in Linux; there is no RTC IRQ
  * consumer here, so a read reports the current time as text instead of lying
  * about an interrupt that will never arrive. */
@@ -406,6 +707,11 @@ static int rtc_ioctl(struct vfs_node *node, u64 request, void *arg) {
       rate++;
     if (rate >= 16)
       return -EINVAL;
+#if defined(__aarch64__)
+    /* PL031 has no periodic interrupt source at all — only the alarm match. */
+    (void)rate;
+    return -EINVAL;
+#else
     u64 flags;
     spin_lock_irqsave(&rtc_lock, &flags);
     u8 a = cmos_read(CMOS_STATUS_A);
@@ -413,6 +719,7 @@ static int rtc_ioctl(struct vfs_node *node, u64 request, void *arg) {
     spin_unlock_irqrestore(&rtc_lock, flags);
     g_irq_freq = (u32)f;
     return 0;
+#endif
   }
   default:
     return -ENOTTY;

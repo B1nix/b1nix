@@ -1,4 +1,5 @@
 #include <b1nix/bootinfo.h>
+#include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/dma_fence.h>
 #include <b1nix/errno.h>
@@ -364,9 +365,17 @@ static void virtio_gpu_reap_used(struct virtqueue *vq)
 
 static inline u64 gpu_rdtsc(void)
 {
+#if defined(__x86_64__)
     u32 lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    { u64 c_ = arch_cycles(); lo = (u32)c_; hi = (u32)(c_ >> 32); }
     return ((u64)hi << 32) | lo;
+#elif defined(__aarch64__)
+    u64 val;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+#else
+    return 0;
+#endif
 }
 
 /* One watchdog period is what a lost interrupt costs before the wait notices
@@ -420,7 +429,7 @@ static int virtio_gpu_wait_used(struct virtqueue *vq, u16 target_used)
     if (!gpu_wait_no_spin) {
         for (int round = 0; round < 16; round++) {
             for (int i = 0; i < 256; i++)
-                __asm__ volatile("pause");
+                cpu_relax();
             if (vq->used->idx == target_used) {
                 gpu_wait_spun++;
                 vq->last_used_idx = vq->used->idx;
@@ -1199,6 +1208,12 @@ struct b1nix_virgl_submit_abi {
 
 struct vgpu_udev_res {
     int used;
+    /* Who owns the frames behind this resource. The character device allocates
+     * a contiguous run and owns it; a resource created for the DRM node is
+     * backed by a GEM object's scattered shmem pages, which that object frees.
+     * Freeing those here both double-freed them and, because the run is not
+     * contiguous, handed the allocator frames belonging to somebody else. */
+    int owns_pages;
     u32 res_id;
     u64 phys;
     u64 size;
@@ -1531,12 +1546,15 @@ static struct vgpu_udev_res *vgpu_udev_find(u32 res_id)
 static int vgpu_res_unref_id(u32 res_id)
 {
     u64 flags, phys = 0, size = 0;
+    int owns = 0;
     spin_lock_irqsave(&vgpu_udev_lock, &flags);
     struct vgpu_udev_res *r = vgpu_udev_find(res_id);
     if (r) {
         phys = r->phys;
         size = r->size;
+        owns = r->owns_pages;
         r->used = 0;
+        r->owns_pages = 0;
         r->res_id = 0;
         r->phys = 0;
     }
@@ -1553,8 +1571,10 @@ static int vgpu_res_unref_id(u32 res_id)
     unref.resource_id = res_id;
     (void)virtio_gpu_send_cmd(&unref, sizeof(unref), &resp, sizeof(resp));
 
-    for (u64 f = 0; f < (size + PAGE_SIZE - 1) / PAGE_SIZE; f++)
-        pmm_free_frame(phys + f * PAGE_SIZE);
+    if (owns) {
+        for (u64 f = 0; f < (size + PAGE_SIZE - 1) / PAGE_SIZE; f++)
+            pmm_free_frame(phys + f * PAGE_SIZE);
+    }
     return 0;
 }
 
@@ -1675,6 +1695,7 @@ static int vgpu_udev_ioctl(struct vfs_node *node, u64 request, void *arg)
             return -EIO;
         }
         vgpu_udev_res_tab[slot].res_id = p.res_id;
+        vgpu_udev_res_tab[slot].owns_pages = 1; /* allocated right here */
         vgpu_udev_res_tab[slot].phys = phys;
         vgpu_udev_res_tab[slot].size = pages * PAGE_SIZE;
         vgpu_udev_res_tab[slot].mmap_offset = (u64)slot * VGPU_UDEV_SLOT;
@@ -2042,7 +2063,7 @@ void virtio_gpu_init(void)
             }
         }
         if (!gpu_irq_ready && gpu_isr_cfg) {
-            gpu_irq_line = pci_config_read8(pci.bus, pci.slot, pci.func, 0x3C);
+            gpu_irq_line = pci_intx_line(pci.bus, pci.slot, pci.func);
             if (gpu_irq_line != 0 && gpu_irq_line != 0xff &&
                 irq_register_handler(gpu_irq_line, virtio_gpu_irq, 0) == 0) {
                 irq_unmask(gpu_irq_line);
@@ -2160,8 +2181,21 @@ void virtio_gpu_irq_selftest(void)
      * counts are printed instead: a driver that stopped receiving interrupts
      * altogether fails on the count above, which is the property that matters.
      */
-    if (gpu_irq_count - irqs0 == VGPU_IRQ_SELFTEST_CMDS &&
-        gpu_wait_parked > parks0) {
+    /*
+     * A message per completion is exact; a level-triggered line is not. INTx
+     * stays asserted until the cause is read, so one trip through the handler
+     * can retire two completions and the count comes out short — legitimately,
+     * and it did on aarch64, where the GIC delivers 6 for 8 commands. What
+     * must hold on both is that interrupts arrive at all and never exceed one
+     * per command; MSI-X, which cannot coalesce, is still held to the exact
+     * number.
+     */
+    u64 irqs = gpu_irq_count - irqs0;
+    int count_ok = (gpu_msix_vector >= 0)
+                       ? (irqs == VGPU_IRQ_SELFTEST_CMDS)
+                       : (irqs > 0 && irqs <= VGPU_IRQ_SELFTEST_CMDS);
+
+    if (count_ok && gpu_wait_parked > parks0) {
         console_write("M52-GFX: ok gpu-irq\n");
     } else {
         console_write("M52-GFX: fail gpu-irq not-interrupt-driven\n");
@@ -2187,7 +2221,7 @@ static u64 g_gpu_transfer_cycles, g_gpu_flush_cycles;
 
 static inline u64 gpu_tsc(void) {
     unsigned lo, hi;
-    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    { u64 c_ = arch_cycles(); lo = (u32)c_; hi = (u32)(c_ >> 32); }
     return ((u64)hi << 32) | lo;
 }
 
@@ -2610,6 +2644,9 @@ int virtio_gpu_virgl_res_create(u32 ctx_id, const struct virtio_gpu_res_params *
 	slot->format = p->format;
 	slot->bind = p->bind;
 	slot->size = (u64)npages * PAGE_SIZE;
+	/* Recorded for diagnostics only: the pages are the GEM object's, they are
+	 * scattered, and it frees them. */
+	slot->owns_pages = 0;
 	slot->phys = phys[0];
 	return 0;
 }

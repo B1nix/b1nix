@@ -22,8 +22,31 @@
  * 0xFFFFFFFFC0000000 .. 0xFFFFFFFFC8000000 (128 MiB). Below the kernel image
  * (0xFFFFFFFF80000000) in the same PML4 slot 511 / PDPT slot 511, so the page
  * tables backing it are shared by every address space automatically. */
+#if defined(__aarch64__)
+/* aarch64 has no higher half to borrow: translation runs through TTBR0 with
+ * bit 47 clear, so the x86 address below is not even representable. The region
+ * sits 16 MiB above the kernel load address instead, which keeps it inside the
+ * ±128 MiB reach of R_AARCH64_CALL26/JUMP26 (no PLT stubs needed) and inside
+ * the identity map boot.S builds. It is handed out IDENTITY-MAPPED (VA == PA)
+ * and its frames are reserved in the pmm: giving it arbitrary frames would put
+ * a second name on physical memory the allocator can also hand to somebody
+ * else, which is exactly the aliasing that used to corrupt the kernel heap. */
+/* Derived from where this kernel actually ended up, not written down.
+ *
+ * 0x41000000 was this constant for as long as the only arm64 board was QEMU
+ * virt, whose kernel links at 0x40080000 — so it really was "16 MiB above the
+ * load address", exactly as described. Linked for a board whose DRAM starts at
+ * 0x80000000 the same number is not above the kernel, it is not memory at all;
+ * and because this region is handed out IDENTITY-MAPPED, a module was written
+ * into nothing and then called there. Computing it from __kernel_end keeps the
+ * property the comment above actually depends on. */
+u64 module_region_base(void);
+#define MODULE_REGION_BASE module_region_base()
+#define MODULE_REGION_SIZE (16ULL * 1024ULL * 1024ULL)
+#else
 #define MODULE_REGION_BASE 0xFFFFFFFFC0000000ULL
 #define MODULE_REGION_SIZE (128ULL * 1024ULL * 1024ULL)
+#endif
 
 /* Text is mapped RX, everything else RW+NX: W^X inside a module image. */
 #define MODULE_PROT_RX 0x1
@@ -66,7 +89,16 @@ struct kernel_symbol {
  * loader parses that section before it touches anything else, which is how a
  * .ko built for a different kernel is rejected (vermagic) and how modinfo(8)
  * reports a module it has not loaded. */
-#define MODULE_VERMAGIC_STRING B1NIX_RELEASE_STR " x86_64 SMP"
+/* The vermagic must describe the kernel a module was built against, and the
+ * architecture is part of that: an aarch64 build used to stamp "x86_64" into
+ * every .ko, so the one check that exists to stop a foreign module from being
+ * loaded could not have caught one. */
+#if defined(__aarch64__)
+#define MODULE_VERMAGIC_ARCH " aarch64 SMP"
+#else
+#define MODULE_VERMAGIC_ARCH " x86_64 SMP"
+#endif
+#define MODULE_VERMAGIC_STRING B1NIX_RELEASE_STR MODULE_VERMAGIC_ARCH
 
 #define __MODULE_INFO_CAT2(a, b) a##b
 #define __MODULE_INFO_CAT(a, b) __MODULE_INFO_CAT2(a, b)

@@ -16,6 +16,8 @@ int rq_remove(struct runqueue *rq, struct task *t);
 /* Per-CPU enqueue + work stealing */
 void sched_rq_enqueue_current(struct task *t);
 void sched_rq_remove_task(struct task *t);
+/* Unlink from every runqueue (used when a task slot is recycled). */
+void sched_rq_remove_task_all(struct task *t);
 struct task *sched_steal_task(void);
 
 #endif

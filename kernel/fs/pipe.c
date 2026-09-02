@@ -384,10 +384,14 @@ int vfs_fifo_open(struct vfs_node *node, int flags) {
       spare->used = 0;
     return -ENXIO;
   }
-  if (want_read)
+  if (want_read) {
     fifo->readers++;
-  if (want_write)
+    fifo->reader_opens++;
+  }
+  if (want_write) {
     fifo->writers++;
+    fifo->writer_opens++;
+  }
   spin_unlock_irqrestore(&fifo_attach_lock, irq);
   if (spare)
     spare->used = 0;
@@ -398,7 +402,7 @@ int vfs_fifo_open(struct vfs_node *node, int flags) {
   /* Rendezvous: a blocking open waits for the opposite end. O_RDWR is its own
    * peer and never waits. */
   if (!(flags & B1NIX_O_NONBLOCK) && acc != B1NIX_O_RDWR) {
-    while (want_read ? fifo->writers == 0 : fifo->readers == 0) {
+    while (want_read ? fifo->writer_opens == 0 : fifo->reader_opens == 0) {
       if (scheduler_signal_pending()) {
         fifo_detach(node->inode, fifo, want_read, want_write);
         return -ERESTARTSYS;

@@ -81,6 +81,9 @@ void flush_workqueue(struct workqueue_struct *wq);
 /* The shared queue every driver may use for short, non-blocking work. Created
  * lazily on first use; NULL only if the kthread could not be created. */
 struct workqueue_struct *lkpi_system_wq(void);
+/* The second pool: see the note in kernel/lkpi/workqueue.c. Work that queues
+ * more work and waits for it needs the two names to be two queues. */
+struct workqueue_struct *lkpi_system_unbound_wq(void);
 static inline int schedule_work(struct work_struct *work)
 {
 	struct workqueue_struct *wq = lkpi_system_wq();

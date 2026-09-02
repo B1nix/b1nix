@@ -10,6 +10,8 @@
 #include <b1nix/lapic.h>   /* struct percpu + MAX_CPUS for the per-CPU PCP cache */
 #include <string.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/module.h>
+#include <b1nix/bootmark.h>
 
 #define BITS_PER_BYTE 8
 
@@ -516,11 +518,13 @@ static void mark_frames_free_range(usize start_idx, usize end_idx) {
 }
 
 static void mark_frame_used(u64 frame) {
+  if (frame >= pmm.max_address) return;
   usize index = frame_index(frame);
 
   if (!bitmap_get(index)) {
     bitmap_set(index);
-    pmm.free_frames--;
+    if (pmm.free_frames > 0)
+      pmm.free_frames--;
   }
 }
 
@@ -529,11 +533,8 @@ static int region_contains(u64 base, u64 length, u64 address, u64 size) {
 }
 
 static u64 find_early_mem(const struct boot_info *boot_info, usize size) {
-  /* __kernel_end is a (possibly higher-half) virtual symbol; the PMM works in
-   * physical addresses, so convert via KERNEL_VMA (0 on the identity-mapped
-   * 32-bit port). */
-  u64 search_addr =
-      align_up_u64((u64)(usize)__kernel_end - KERNEL_VMA, PAGE_SIZE);
+  u64 k_start = (u64)(usize)__kernel_start - KERNEL_VMA;
+  u64 k_end = align_up_u64((u64)(usize)__kernel_end - KERNEL_VMA, PAGE_SIZE);
 
   for (usize i = 0; i < boot_info->memory_region_count; i++) {
     const struct boot_memory_region *region = &boot_info->memory_regions[i];
@@ -544,16 +545,46 @@ static u64 find_early_mem(const struct boot_info *boot_info, usize size) {
 
     u64 start = align_up_u64(region->base, PAGE_SIZE);
     u64 end = align_down_u64(region->base + region->length, PAGE_SIZE);
+    u64 search_addr = start;
 
-    if (search_addr < start) {
-      search_addr = start;
+    if (k_end > start && k_start < end) {
+      search_addr = k_end;
     }
 
-    if (boot_info->has_ramdisk) {
-      u64 rd_start = align_down_u64(boot_info->ramdisk_addr, PAGE_SIZE);
-      u64 rd_end = align_up_u64(boot_info->ramdisk_addr + boot_info->ramdisk_size, PAGE_SIZE);
-      if (!(search_addr + size <= rd_start || search_addr >= rd_end)) {
-        search_addr = rd_end;
+    /* Step past everything that already owns memory here. Repeated, because
+     * moving clear of one reservation can land on the next. */
+    for (int pass = 0; pass < 4; pass++) {
+      u64 before = search_addr;
+
+      if (boot_info->has_ramdisk) {
+        u64 rd_start = align_down_u64(boot_info->ramdisk_addr, PAGE_SIZE);
+        u64 rd_end = align_up_u64(boot_info->ramdisk_addr + boot_info->ramdisk_size, PAGE_SIZE);
+        if (search_addr < rd_end && search_addr + size > rd_start) {
+          search_addr = rd_end;
+        }
+      }
+
+#if defined(__aarch64__)
+      /* The loadable-module region is identity-mapped RAM starting at the first
+       * 2 MiB boundary past the kernel image. It is reserved in the frame
+       * allocator below -- but that happens after this allocation, so nothing
+       * else keeps the early bitmaps out of it, and they sit immediately below
+       * it. Two bitmaps plus the refcounts fit in that gap; a third did not,
+       * and the module loader wrote isofs, ntfs and btrfs straight over one of
+       * them. The bits that came back were not page-table claims at all, which
+       * is why the frame the handout gate refused had no history behind it. */
+      {
+        u64 mod_start = MODULE_REGION_BASE;
+        u64 mod_end = mod_start + MODULE_REGION_SIZE;
+
+        if (search_addr < mod_end && search_addr + size > mod_start) {
+          search_addr = mod_end;
+        }
+      }
+#endif
+
+      if (search_addr == before) {
+        break;
       }
     }
 
@@ -694,14 +725,30 @@ void pmm_init(const struct boot_info *boot_info) {
     console_write("\n");
   }
 
-  for (u64 frame = pmm.kernel_start; frame < pmm.kernel_end;
-       frame += PAGE_SIZE) {
-    mark_frame_used(frame);
+  if (pmm.kernel_start < pmm.max_address) {
+    u64 k_end = pmm.kernel_end < pmm.max_address ? pmm.kernel_end : pmm.max_address;
+    for (u64 frame = pmm.kernel_start; frame < k_end; frame += PAGE_SIZE) {
+      mark_frame_used(frame);
+    }
+    for (u64 frame = 0; frame < pmm.kernel_start; frame += PAGE_SIZE) {
+      mark_frame_used(frame);
+    }
+  } else {
+    u64 low_res = 0x200000ULL < pmm.max_address ? 0x200000ULL : pmm.max_address;
+    for (u64 frame = 0; frame < low_res; frame += PAGE_SIZE) {
+      mark_frame_used(frame);
+    }
   }
 
-  for (u64 frame = 0; frame < pmm.kernel_start; frame += PAGE_SIZE) {
+#if defined(__aarch64__)
+  /* The loadable-module region is identity-mapped RAM (see b1nix/module.h):
+   * reserve it so the frame allocator never hands the same pages to anyone
+   * else. */
+  for (u64 frame = MODULE_REGION_BASE;
+       frame < MODULE_REGION_BASE + MODULE_REGION_SIZE; frame += PAGE_SIZE) {
     mark_frame_used(frame);
   }
+#endif
 
   for (u64 frame = (u64)(usize)pmm.bitmap;
        frame < (u64)(usize)pmm.bitmap + pmm.bitmap_bytes; frame += PAGE_SIZE) {
@@ -1317,13 +1364,29 @@ void pmm_free_frame(u64 frame) {
   u64 flags;
   pmm_acquire(&flags);
   int now_zero = 1;
+  int was_zero = 0;
   if (pmm.frame_refcounts) {
     if (pmm.frame_refcounts[idx] > 0) {
       pmm.frame_refcounts[idx]--;
+    } else {
+      was_zero = 1;
     }
     now_zero = (pmm.frame_refcounts[idx] == 0);
   }
   pmm_release(flags);
+
+  /* Freeing a frame whose refcount is already 0 means somebody is handing back
+   * a page they no longer own. If that page has since been re-allocated, this
+   * pushes a live frame onto the free cache and it gets handed out a second
+   * time — two owners of the same physical page, which surfaces much later as
+   * unrelated memory turning to garbage. Name the caller. */
+  if (was_zero) {
+    console_write("pmm_free_frame: frame 0x");
+    console_write_hex64(frame);
+    console_write(" was already unreferenced — double free!\n");
+    panic("pmm_free_frame: double-free of physical frame");
+  }
+
 
   if (!now_zero) return;  /* still referenced elsewhere (CoW sibling) */
 

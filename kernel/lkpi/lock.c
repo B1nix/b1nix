@@ -13,6 +13,7 @@
  * build error instead of a silent layout mismatch.
  */
 
+#include <b1nix/arch.h>
 #include <lkpi/env.h>
 #include <b1nix/console.h>
 #include <b1nix/klog.h>
@@ -131,21 +132,13 @@ int lkpi_spin_trylock(struct lkpi_spinlock *l)
 	 * holds. On failure they are restored, because we are not returning as
 	 * the holder.
 	 */
-	u64 f;
-#ifdef __x86_64__
-	__asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
-#else
-	u32 f32;
-	__asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
-	f = f32;
-#endif
+	/* interrupts_save/restore are the tree's per-arch spelling of this — the
+	 * old #else arm was the dead 32-bit x86 path, which on aarch64 became a
+	 * `pushfd` the assembler rejects. */
+	u64 f = interrupts_save();
+
 	if (__atomic_exchange_n(&l->raw, 1, __ATOMIC_ACQUIRE) != 0) {
-#ifdef __x86_64__
-		__asm__ volatile("pushq %0; popfq" : : "r"(f) : "memory");
-#else
-		u32 r32 = (u32)f;
-		__asm__ volatile("pushl %0; popfd" : : "r"(r32) : "memory");
-#endif
+		interrupts_restore(f);
 		return 0;
 	}
 	l->flags = f;

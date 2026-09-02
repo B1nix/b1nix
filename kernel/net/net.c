@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -479,9 +480,22 @@ int netdev_set_admin_up(struct netdev *nd, int up)
 		return 0; /* already in the requested state */
 	nd->admin_down = up ? 0 : 1;
 
-	console_write("net: ");
-	console_write(nd->name);
-	console_write(up ? " administratively up\n" : " administratively down\n");
+	/* One call, not three.
+	 *
+	 * Interrupts are masked inside console_write but not BETWEEN calls, so a
+	 * record assembled from several of them can be cut in half by a handler
+	 * that prints -- and the tail then lands in the middle of somebody else's
+	 * line while the next line starts with no timestamp, because the console
+	 * believes it is still finishing this one. Six of these eight lines came
+	 * out unstamped for exactly that reason. A log record is a record: build
+	 * it, then write it. */
+	{
+		char line[96];
+
+		snprintf(line, sizeof(line), "%s administratively %s",
+		         nd->name, up ? "up" : "down");
+		k_info("net", "%s", line);
+	}
 
 	if (!up && nd == g_netdev) {
 		dhcp_stop();
@@ -801,6 +815,14 @@ void net_init(void)
 	net_scan_pci_adapters();
 
 	/* Probe every supported NIC, then prefer one whose PHY reports carrier. */
+#if defined(__aarch64__)
+	/* QEMU virt has no PCI host bridge wired up here: the NIC arrives over the
+	 * virtio-mmio transport, same as the block device. */
+	{
+		extern int virtio_net_mmio_init(void);
+		virtio_net_mmio_init();
+	}
+#endif
 	virtio_net_probe();
 	e1000_probe();
 	r8169_probe();   /* Realtek RTL8169/8168/8111/810x family (e.g. ZG5 RTL8102E) */
@@ -820,6 +842,15 @@ void net_init(void)
 		net_proto_reset();
 	}
 
+	/* The pump runs even with no NIC: loopback delivery is deferred onto a
+	 * queue that only net_poll() drains, so without this daemon every
+	 * 127.0.0.1 connect/accept blocks forever. x86_64 never noticed because
+	 * the smoke instances always have a virtio-net/e1000 attached; aarch64
+	 * (QEMU virt, no PCI NIC) hung in net_smoke's TCP loopback test. */
+	if (!nd) {
+		net_task_id = kthread_create("net_task", net_task, 0);
+		return;
+	}
 	/* Networking is on by default: bring the link up via DHCP whenever a NIC is
 	 * present. Opt out with b1nix.net=off (or b1nix.nonet) for an isolated boot;
 	 * b1nix.net=dhcp is still accepted as an explicit no-op for back-compat. */

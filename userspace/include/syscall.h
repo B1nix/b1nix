@@ -310,6 +310,21 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
                    : "r"(rax), "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9)
                    : "rcx", "r11", "memory");
   return ret;
+#elif defined(__aarch64__)
+  long ret;
+  register long x8 __asm__("x8") = num;
+  register long x0 __asm__("x0") = a0;
+  register long x1 __asm__("x1") = a1;
+  register long x2 __asm__("x2") = a2;
+  register long x3 __asm__("x3") = a3;
+  register long x4 __asm__("x4") = a4;
+  register long x5 __asm__("x5") = a5;
+
+  __asm__ volatile("svc #0"
+                   : "=r"(ret)
+                   : "r"(x8), "r"(x0), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                   : "memory");
+  return ret;
 #else
   long ret;
   register long ebx __asm__("ebx") = a0;
@@ -865,170 +880,498 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
  * One alias per b1nix enum entry; they map onto the matching b1nix syscall so
  * the raw syscall() hits the correct entry. Kept complete so this whole error
  * category never recurs — regenerate from the enum if you add a syscall. */
+#ifndef SYS_accept
 #define SYS_accept SYS_ACCEPT
+#endif
+#ifndef SYS_access
 #define SYS_access SYS_ACCESS
+#endif
+#ifndef SYS_alarm
 #define SYS_alarm SYS_ALARM
+#endif
+#ifndef SYS_bind
 #define SYS_bind SYS_BIND
+#endif
+#ifndef SYS_brk
 #define SYS_brk SYS_BRK
+#endif
+#ifndef SYS_chdir
 #define SYS_chdir SYS_CHDIR
+#endif
+#ifndef SYS_chmod
 #define SYS_chmod SYS_CHMOD
+#endif
+#ifndef SYS_chown
 #define SYS_chown SYS_CHOWN
+#endif
+#ifndef SYS_clear
 #define SYS_clear SYS_CLEAR
+#endif
+#ifndef SYS_clock_gettime
 #define SYS_clock_gettime SYS_CLOCK_GETTIME
+#endif
+#ifndef SYS_clone
 #define SYS_clone SYS_CLONE
+#endif
+#ifndef SYS_close
 #define SYS_close SYS_CLOSE
+#endif
+#ifndef SYS_connect
 #define SYS_connect SYS_CONNECT
+#endif
+#ifndef SYS_create
 #define SYS_create SYS_CREATE
+#endif
+#ifndef SYS_dmesg
 #define SYS_dmesg SYS_DMESG
+#endif
+#ifndef SYS_dup
 #define SYS_dup SYS_DUP
+#endif
+#ifndef SYS_dup2
 #define SYS_dup2 SYS_DUP2
+#endif
+#ifndef SYS_epoll_create1
 #define SYS_epoll_create1 SYS_EPOLL_CREATE1
+#endif
+#ifndef SYS_epoll_ctl
 #define SYS_epoll_ctl SYS_EPOLL_CTL
+#endif
+#ifndef SYS_epoll_wait
 #define SYS_epoll_wait SYS_EPOLL_WAIT
+#endif
+#ifndef SYS_eventfd2
 #define SYS_eventfd2 SYS_EVENTFD2
+#endif
+#ifndef SYS_exec
 #define SYS_exec SYS_EXEC
+#endif
+#ifndef SYS_execve
 #define SYS_execve SYS_EXECVE
+#endif
+#ifndef SYS_exit
 #define SYS_exit SYS_EXIT
+#endif
+#ifndef SYS_exit_thread
 #define SYS_exit_thread SYS_EXIT_THREAD
+#endif
+#ifndef SYS_fchdir
 #define SYS_fchdir SYS_FCHDIR
+#endif
+#ifndef SYS_fchmod
 #define SYS_fchmod SYS_FCHMOD
+#endif
+#ifndef SYS_fchown
 #define SYS_fchown SYS_FCHOWN
+#endif
+#ifndef SYS_fcntl
 #define SYS_fcntl SYS_FCNTL
+#endif
+#ifndef SYS_fork
 #define SYS_fork SYS_FORK
+#endif
+#ifndef SYS_fstat
 #define SYS_fstat SYS_FSTAT
+#endif
+#ifndef SYS_fstatfs
 #define SYS_fstatfs SYS_FSTATFS
+#endif
+#ifndef SYS_fsync
 #define SYS_fsync SYS_FSYNC
+#endif
+#ifndef SYS_ftruncate
 #define SYS_ftruncate SYS_FTRUNCATE
+#endif
+#ifndef SYS_futex
 #define SYS_futex SYS_FUTEX
+#endif
+#ifndef SYS_getcpu
 #define SYS_getcpu SYS_GETCPU
+#endif
+#ifndef SYS_getcwd
 #define SYS_getcwd SYS_GETCWD
+#endif
+#ifndef SYS_getdents
 #define SYS_getdents SYS_GETDENTS
+#endif
+#ifndef SYS_getdents64
 #define SYS_getdents64 SYS_GETDENTS64
+#endif
+#ifndef SYS_mincore
 #define SYS_mincore SYS_MINCORE
+#endif
+#ifndef SYS_getegid
 #define SYS_getegid SYS_GETEGID
+#endif
+#ifndef SYS_geteuid
 #define SYS_geteuid SYS_GETEUID
+#endif
+#ifndef SYS_getgid
 #define SYS_getgid SYS_GETGID
+#endif
+#ifndef SYS_getgroups
 #define SYS_getgroups SYS_GETGROUPS
+#endif
+#ifndef SYS_getpeername
 #define SYS_getpeername SYS_GETPEERNAME
+#endif
+#ifndef SYS_getpgid
 #define SYS_getpgid SYS_GETPGID
+#endif
+#ifndef SYS_getpgrp
 #define SYS_getpgrp SYS_GETPGRP
+#endif
+#ifndef SYS_getpid
 #define SYS_getpid SYS_GETPID
+#endif
+#ifndef SYS_getppid
 #define SYS_getppid SYS_GETPPID
+#endif
+#ifndef SYS_getpriority
 #define SYS_getpriority SYS_GETPRIORITY
+#endif
+#ifndef SYS_getrandom
 #define SYS_getrandom SYS_GETRANDOM
+#endif
+#ifndef SYS_getrlimit
 #define SYS_getrlimit SYS_GETRLIMIT
+#endif
+#ifndef SYS_getrusage
 #define SYS_getrusage SYS_GETRUSAGE
+#endif
+#ifndef SYS_getsid
 #define SYS_getsid SYS_GETSID
+#endif
+#ifndef SYS_getsockname
 #define SYS_getsockname SYS_GETSOCKNAME
+#endif
+#ifndef SYS_getsockopt
 #define SYS_getsockopt SYS_GETSOCKOPT
+#endif
+#ifndef SYS_gettid
 #define SYS_gettid SYS_GETTID
+#endif
+#ifndef SYS_get_tls_info
 #define SYS_get_tls_info SYS_GET_TLS_INFO
+#endif
+#ifndef SYS_getuid
 #define SYS_getuid SYS_GETUID
+#endif
+#ifndef SYS_getxattr
 #define SYS_getxattr SYS_GETXATTR
+#endif
+#ifndef SYS_ioctl
 #define SYS_ioctl SYS_IOCTL
+#endif
+#ifndef SYS_io_getevents
 #define SYS_io_getevents SYS_IO_GETEVENTS
+#endif
+#ifndef SYS_io_setup
 #define SYS_io_setup SYS_IO_SETUP
+#endif
+#ifndef SYS_io_submit
 #define SYS_io_submit SYS_IO_SUBMIT
+#endif
+#ifndef SYS_kill
 #define SYS_kill SYS_KILL
+#endif
+#ifndef SYS_link
 #define SYS_link SYS_LINK
+#endif
+#ifndef SYS_list
 #define SYS_list SYS_LIST
+#endif
+#ifndef SYS_listen
 #define SYS_listen SYS_LISTEN
+#endif
+#ifndef SYS_listxattr
 #define SYS_listxattr SYS_LISTXATTR
+#endif
+#ifndef SYS_lseek
 #define SYS_lseek SYS_LSEEK
+#endif
+#ifndef SYS_lstat
 #define SYS_lstat SYS_LSTAT
+#endif
+#ifndef SYS_madvise
 #define SYS_madvise SYS_MADVISE
+#endif
+#ifndef SYS_mem
 #define SYS_mem SYS_MEM
+#endif
+#ifndef SYS_memfd_create
 #define SYS_memfd_create SYS_MEMFD_CREATE
+#endif
+#ifndef SYS_mkdir
 #define SYS_mkdir SYS_MKDIR
+#endif
+#ifndef SYS_mmap
 #define SYS_mmap SYS_MMAP
+#endif
+#ifndef SYS_mount
 #define SYS_mount SYS_MOUNT
+#endif
+#ifndef SYS_mounts
 #define SYS_mounts SYS_MOUNTS
+#endif
+#ifndef SYS_mprotect
 #define SYS_mprotect SYS_MPROTECT
+#endif
+#ifndef SYS_mq_close
 #define SYS_mq_close SYS_MQ_CLOSE
+#endif
+#ifndef SYS_mq_open
 #define SYS_mq_open SYS_MQ_OPEN
+#endif
+#ifndef SYS_mq_receive
 #define SYS_mq_receive SYS_MQ_RECEIVE
+#endif
+#ifndef SYS_mq_send
 #define SYS_mq_send SYS_MQ_SEND
+#endif
+#ifndef SYS_mq_unlink
 #define SYS_mq_unlink SYS_MQ_UNLINK
+#endif
+#ifndef SYS_munmap
 #define SYS_munmap SYS_MUNMAP
+#endif
+#ifndef SYS_net_dns
 #define SYS_net_dns SYS_NET_DNS
+#endif
+#ifndef SYS_net_info
 #define SYS_net_info SYS_NET_INFO
+#endif
+#ifndef SYS_net_ping
 #define SYS_net_ping SYS_NET_PING
+#endif
+#ifndef SYS_open
 #define SYS_open SYS_OPEN
+#endif
+#ifndef SYS_pipe
 #define SYS_pipe SYS_PIPE
+#endif
+#ifndef SYS_poll
 #define SYS_poll SYS_POLL
+#endif
+#ifndef SYS_ps
 #define SYS_ps SYS_PS
+#endif
+#ifndef SYS_read
 #define SYS_read SYS_READ
+#endif
+#ifndef SYS_readdir
 #define SYS_readdir SYS_READDIR
+#endif
+#ifndef SYS_read_file
 #define SYS_read_file SYS_READ_FILE
+#endif
+#ifndef SYS_read_kbd
 #define SYS_read_kbd SYS_READ_KBD
+#endif
+#ifndef SYS_readlink
 #define SYS_readlink SYS_READLINK
+#endif
+#ifndef SYS_reboot
 #define SYS_reboot SYS_REBOOT
+#endif
+#ifndef SYS_recv
 #define SYS_recv SYS_RECV
+#endif
+#ifndef SYS_recvmsg
 #define SYS_recvmsg SYS_RECVMSG
+#endif
+#ifndef SYS_removexattr
 #define SYS_removexattr SYS_REMOVEXATTR
+#endif
+#ifndef SYS_rename
 #define SYS_rename SYS_RENAME
+#endif
+#ifndef SYS_rmdir
 #define SYS_rmdir SYS_RMDIR
+#endif
+#ifndef SYS_rt_tgsigqueueinfo
 #define SYS_rt_tgsigqueueinfo SYS_RT_TGSIGQUEUEINFO
+#endif
+#ifndef SYS_sched_getaffinity
 #define SYS_sched_getaffinity SYS_SCHED_GETAFFINITY
+#endif
+#ifndef SYS_select
 #define SYS_select SYS_SELECT
+#endif
+#ifndef SYS_selfhost_status
 #define SYS_selfhost_status SYS_SELFHOST_STATUS
+#endif
+#ifndef SYS_send
 #define SYS_send SYS_SEND
+#endif
+#ifndef SYS_sendmsg
 #define SYS_sendmsg SYS_SENDMSG
+#endif
+#ifndef SYS_setegid
 #define SYS_setegid SYS_SETEGID
+#endif
+#ifndef SYS_seteuid
 #define SYS_seteuid SYS_SETEUID
+#endif
+#ifndef SYS_setgid
 #define SYS_setgid SYS_SETGID
+#endif
+#ifndef SYS_setgroups
 #define SYS_setgroups SYS_SETGROUPS
+#endif
+#ifndef SYS_setpgrp
 #define SYS_setpgrp SYS_SETPGRP
+#endif
+#ifndef SYS_setpriority
 #define SYS_setpriority SYS_SETPRIORITY
+#endif
+#ifndef SYS_setregid
 #define SYS_setregid SYS_SETREGID
+#endif
+#ifndef SYS_setresgid
 #define SYS_setresgid SYS_SETRESGID
+#endif
+#ifndef SYS_setresuid
 #define SYS_setresuid SYS_SETRESUID
+#endif
+#ifndef SYS_setreuid
 #define SYS_setreuid SYS_SETREUID
+#endif
+#ifndef SYS_setrlimit
 #define SYS_setrlimit SYS_SETRLIMIT
+#endif
+#ifndef SYS_setsid
 #define SYS_setsid SYS_SETSID
+#endif
+#ifndef SYS_setsockopt
 #define SYS_setsockopt SYS_SETSOCKOPT
+#endif
+#ifndef SYS_set_stdout
 #define SYS_set_stdout SYS_SET_STDOUT
+#endif
+#ifndef SYS_settimeofday
 #define SYS_settimeofday SYS_SETTIMEOFDAY
+#endif
+#ifndef SYS_set_tls
 #define SYS_set_tls SYS_SET_TLS
+#endif
+#ifndef SYS_setuid
 #define SYS_setuid SYS_SETUID
+#endif
+#ifndef SYS_setxattr
 #define SYS_setxattr SYS_SETXATTR
+#endif
+#ifndef SYS_shmat
 #define SYS_shmat SYS_SHMAT
+#endif
+#ifndef SYS_shmctl
 #define SYS_shmctl SYS_SHMCTL
+#endif
+#ifndef SYS_shmdt
 #define SYS_shmdt SYS_SHMDT
+#endif
+#ifndef SYS_shmget
 #define SYS_shmget SYS_SHMGET
+#endif
+#ifndef SYS_shutdown
 #define SYS_shutdown SYS_SHUTDOWN
+#endif
+#ifndef SYS_sigaltstack
 #define SYS_sigaltstack SYS_SIGALTSTACK
+#endif
+#ifndef SYS_signalfd4
 #define SYS_signalfd4 SYS_SIGNALFD4
+#endif
+#ifndef SYS_sigprocmask
 #define SYS_sigprocmask SYS_SIGPROCMASK
+#endif
+#ifndef SYS_sigreturn
 #define SYS_sigreturn SYS_SIGRETURN
+#endif
+#ifndef SYS_sigsuspend
 #define SYS_sigsuspend SYS_SIGSUSPEND
+#endif
+#ifndef SYS_sleep
 #define SYS_sleep SYS_SLEEP
+#endif
+#ifndef SYS_nanosleep
 #define SYS_nanosleep SYS_NANOSLEEP
+#endif
+#ifndef SYS_socket
 #define SYS_socket SYS_SOCKET
+#endif
+#ifndef SYS_socketpair
 #define SYS_socketpair SYS_SOCKETPAIR
+#endif
+#ifndef SYS_spawn
 #define SYS_spawn SYS_SPAWN
+#endif
+#ifndef SYS_stat
 #define SYS_stat SYS_STAT
+#endif
+#ifndef SYS_statfs
 #define SYS_statfs SYS_STATFS
+#endif
+#ifndef SYS_symlink
 #define SYS_symlink SYS_SYMLINK
+#endif
+#ifndef SYS_sync
 #define SYS_sync SYS_SYNC
+#endif
+#ifndef SYS_syncfs
 #define SYS_syncfs SYS_SYNCFS
+#endif
+#ifndef SYS_sysinfo
 #define SYS_sysinfo SYS_SYSINFO
+#endif
+#ifndef SYS_termios_get
 #define SYS_termios_get SYS_TERMIOS_GET
+#endif
+#ifndef SYS_termios_set
 #define SYS_termios_set SYS_TERMIOS_SET
+#endif
+#ifndef SYS_time
 #define SYS_time SYS_TIME
+#endif
+#ifndef SYS_timerfd_create
 #define SYS_timerfd_create SYS_TIMERFD_CREATE
+#endif
+#ifndef SYS_timerfd_settime
 #define SYS_timerfd_settime SYS_TIMERFD_SETTIME
+#endif
+#ifndef SYS_times
 #define SYS_times SYS_TIMES
+#endif
+#ifndef SYS_umask
 #define SYS_umask SYS_UMASK
+#endif
+#ifndef SYS_umount
 #define SYS_umount SYS_UMOUNT
+#endif
+#ifndef SYS_uname
 #define SYS_uname SYS_UNAME
+#endif
+#ifndef SYS_unlink
 #define SYS_unlink SYS_UNLINK
+#endif
+#ifndef SYS_utime
 #define SYS_utime SYS_UTIME
+#endif
+#ifndef SYS_wait
 #define SYS_wait SYS_WAIT
+#endif
+#ifndef SYS_waitid
 #define SYS_waitid SYS_WAITID
+#endif
+#ifndef SYS_waitpid
 #define SYS_waitpid SYS_WAITPID
+#endif
+#ifndef SYS_write
 #define SYS_write SYS_WRITE
+#endif
+#ifndef SYS_yield
 #define SYS_yield SYS_YIELD
+#endif
 
 /* Linux-only syscall names that b1nix lacks: map to the closest b1nix call, or
  * to an out-of-range sentinel that the kernel rejects with -ENOSYS so the

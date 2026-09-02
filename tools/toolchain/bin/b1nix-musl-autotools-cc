@@ -24,12 +24,14 @@ if [ -z "$PROJECT_DIR" ]; then
 fi
 
 B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
-if [ "$B1NIX_ARCH" = "x86" ]; then
-  TARGET="i686-b1nix";   B1NIX_TRIPLET="${B1NIX_TRIPLET:-i686-b1nix}"
-  LD_EMULATION="elf_i386"
+if [ "$B1NIX_ARCH" = "aarch64" ]; then
+  TARGET="aarch64-b1nix"; B1NIX_TRIPLET="${B1NIX_TRIPLET:-aarch64-b1nix}"
+  LD_EMULATION="aarch64elf"
+  MUSL_ARCH="aarch64"
 else
   TARGET="x86_64-b1nix"; B1NIX_TRIPLET="${B1NIX_TRIPLET:-x86_64-b1nix}"
   LD_EMULATION="elf_x86_64"
+  MUSL_ARCH="x86_64"
 fi
 
 MUSL_INSTALL="$PROJECT_DIR/build/$B1NIX_ARCH/ports/musl/install"
@@ -40,7 +42,7 @@ MUSL_LIB="$MUSL_INSTALL/lib"
 # no DT_SONAME it records DT_NEEDED=libc.so, exactly what musl's ld.so expects.
 MUSL_LIBSO="$PROJECT_DIR/build/src/musl/$B1NIX_TRIPLET/musl-1.2.5/lib/libc.so"
 MUSL_LIBSO_DIR="$(dirname "$MUSL_LIBSO")"
-DYN_LINKER="/lib/ld-musl-x86_64.so.1"
+DYN_LINKER="/lib/ld-musl-$MUSL_ARCH.so.1"
 
 CCACHE=""
 [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1 && CCACHE="ccache"
@@ -52,7 +54,7 @@ LD="$(command -v ld.lld 2>/dev/null || echo ld.lld)"
 CLANG_RES_DIR="$(clang -print-resource-dir 2>/dev/null || true)"
 RES_INC=""
 [ -n "$CLANG_RES_DIR" ] && RES_INC="-isystem $CLANG_RES_DIR/include"
-if [ "$B1NIX_ARCH" = "x86" ]; then _RT_ARCH="i386"; else _RT_ARCH="x86_64"; fi
+_RT_ARCH="$MUSL_ARCH"
 BUILTINS=""
 if [ -n "$CLANG_RES_DIR" ]; then
   for _b in \
@@ -87,7 +89,7 @@ for arg in "$@"; do
         esac
         r_args+=("$_rarg")
       done
-      exec $LD -m "$LD_EMULATION" "${r_args[@]}"
+      exec $LD -m "$LD_EMULATION" --allow-shlib-undefined "${r_args[@]}"
       ;;
   esac
 done
@@ -169,14 +171,14 @@ done
 musl_fixup() {  # rewrite DT_NEEDED soname -> libc.so, set EI_OSABI=Linux(3)
   python3 -c "\
 import sys; f=sys.argv[1]; d=open(f,'rb').read(); \
-d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
+d=d.replace(b'\x00ld-musl-'+sys.argv[2].encode()+b'.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
 open(f,'wb').write(d); \
-fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" "$1" 2>/dev/null || true
+fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" "$1" "$MUSL_ARCH" 2>/dev/null || true
 }
 
 if [ "$is_shared" -eq 1 ]; then
   # shellcheck disable=SC2086
-  $LD -m "$LD_EMULATION" -shared -z norelro --hash-style=sysv \
+  $LD -m "$LD_EMULATION" --allow-shlib-undefined -shared -z norelro --hash-style=sysv \
     -o "$output" "${objs[@]}" -L"$MUSL_LIBSO_DIR" -L"$MUSL_LIB" "${linkline[@]}" -l:libc.so $BUILTINS
   musl_fixup "$output"
   exit 0
@@ -198,7 +200,7 @@ if [ "${B1NIX_MUSL_NO_PIE:-0}" = "1" ]; then
 else
   PIE_FLAGS="-pie"
 fi
-$LD -m "$LD_EMULATION" $PIE_FLAGS -z norelro --hash-style=sysv \
+$LD -m "$LD_EMULATION" --allow-shlib-undefined $PIE_FLAGS -z norelro --hash-style=sysv \
   --dynamic-linker "$DYN_LINKER" \
   -o "$output" \
   "$MUSL_LIB/Scrt1.o" "$MUSL_LIB/crti.o" "${objs[@]}" -L"$MUSL_LIBSO_DIR" -L"$MUSL_LIB" "${linkline[@]}" \

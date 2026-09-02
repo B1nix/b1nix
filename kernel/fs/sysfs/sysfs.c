@@ -852,6 +852,18 @@ static void sysfs_build_block(struct vfs_node *root) {
 /* ── content generators ── */
 static int g_ostype(char *b, usize c) { return snprintf(b, c, "B1NIX\n"); }
 static int g_osrelease(char *b, usize c) { return snprintf(b, c, "%s\n", B1NIX_RELEASE_STR); }
+/* Where loadable modules are mapped, as "<base> <size>".
+ *
+ * On x86_64 the region is a compile-time constant, but on aarch64 it is the
+ * first 2 MiB boundary past the kernel image, so it moves whenever the kernel
+ * grows. Anything checking that a module really landed in the region had to
+ * mirror that constant and go stale the next time the kernel changed size --
+ * which is exactly what happened to the M95 check. Publish the fact instead. */
+static int g_module_region(char *b, usize c) {
+  return snprintf(b, c, "0x%llx %llu\n",
+                  (unsigned long long)MODULE_REGION_BASE,
+                  (unsigned long long)MODULE_REGION_SIZE);
+}
 static int g_hostname(char *b, usize c) {
   char h[65];
   kernel_hostname_get(h, sizeof(h));
@@ -1028,6 +1040,7 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
   }
   sysfs_mkchild(kern, "ostype", VFS_DEVICE, g_ostype);
   sysfs_mkchild(kern, "osrelease", VFS_DEVICE, g_osrelease);
+  sysfs_mkchild(kern, "module_region", VFS_DEVICE, g_module_region);
   sysfs_mkchild(kern, "hostname", VFS_DEVICE, g_hostname);
   sysfs_mkchild(kern, "version", VFS_DEVICE, g_kversion);
   sysfs_mkchild(kern, "domainname", VFS_DEVICE, g_domainname);

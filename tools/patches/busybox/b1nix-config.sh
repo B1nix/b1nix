@@ -131,3 +131,28 @@ src = src.replace(label, '\n\tfclose(old_fp);\n', 1)
 open(path, "w").write(src)
 PY
 fi
+
+# The "<file>+" lock is held across a SHA-512 crypt(3) and a full rewrite of
+# /etc/shadow. BusyBox waits 30 * 0.1 s = 3 s for it to clear, which is generous
+# on the hardware it was written for and far too short here: under the smoke
+# suite's four parallel QEMU instances a single passwd takes about five seconds
+# (the crypt is deliberately expensive and the guest has a fraction of a core),
+# so the third and fourth of four concurrent writers time out and exit 1 having
+# changed nothing -- "passwd: can't create '/etc/shadow+': File exists".
+#
+# Wait a minute instead. The applet stays bounded; it just no longer gives up
+# faster than its own work takes.
+if [ -f "$UP" ] && ! grep -q "__b1nix_lockwait__" "$UP"; then
+  python3 - "$UP" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+old = "\ti = 30;\n"
+assert src.count(old) == 1, "update_passwd.c: lock retry count not found"
+src = src.replace(old,
+                  "\t/* __b1nix_lockwait__: 60 s, not 3 -- see\n"
+                  "\t * tools/patches/busybox/b1nix-config.sh for why. */\n"
+                  "\ti = 600;\n", 1)
+open(path, "w").write(src)
+PY
+fi

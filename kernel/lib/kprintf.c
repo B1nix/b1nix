@@ -87,10 +87,18 @@ void log_format_selftest(void)
 	else
 		k_err(NULL, "M110-LOG: FAIL clock-monotonic");
 
-	/* The log stamp and /proc/uptime read one clock, so they can differ only
-	 * by the tick the coarse source is quantised to plus whatever
-	 * elapsed between the two reads. One second is a generous bound that
-	 * still catches "these are two unrelated counters". */
+	/* The scheduler's tick count and the monotonic clock the log stamps (and
+	 * /proc/uptime) read must describe the same timeline. They are genuinely
+	 * different sources -- one counts interrupts, the other reads a counter --
+	 * so this is a real check, not a restatement: it fails the moment ticks
+	 * stop keeping pace.
+	 *
+	 * It DID fail, on the busiest lane, by more than a second. The virtual
+	 * timer was re-armed through TVAL, which sets the deadline to "now +
+	 * interval", so every tick serviced late lost its lateness for ever. The
+	 * re-arm accumulates CVAL now (kernel/arch/aarch64/interrupts.c), and
+	 * /proc/uptime reads the clock rather than the tick count. One second is a
+	 * generous bound that still catches "these are two unrelated counters". */
 	u64 diff = t1 > ticks_ns ? t1 - ticks_ns : ticks_ns - t1;
 	if (diff < 1000000000ull)
 		k_info(NULL, "M110-LOG: ok clock-uptime-agree");

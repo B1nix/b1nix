@@ -1,3 +1,4 @@
+#include <b1nix/ktime.h>
 #include <b1nix/console.h>
 /* procfs — synthetic /proc filesystem (M34).
  *
@@ -446,17 +447,23 @@ static int r_meminfo(usize pid, struct sbuf *s) {
 
 static int r_uptime(usize pid, struct sbuf *s) {
   (void)pid;
-  u64 ticks = scheduler_get_uptime_ticks();
-  u64 hz = PROCFS_HZ;
-  u64 sec = ticks / hz;
-  /* Hundredths, derived from the tick rate rather than assuming it.
+  /* The monotonic clock, not the tick count.
    *
-   * This printed `ticks % 100` and called the result centiseconds, which is
-   * true at one rate and at no other: at a kilohertz tick the remainder counts
-   * milliseconds, and printed without padding it also lost them — five
-   * milliseconds past the second came out as ".5", i.e. half a second. Linux
-   * prints two digits here and so does this. */
-  u64 cs = (ticks % hz) * 100u / hz;
+   * A tick count is not a measure of elapsed time: a tick serviced late is a
+   * tick, and one never delivered at all is nothing, so the count only ever
+   * falls behind the counter it is supposed to track. Linux reads a real
+   * clocksource here for the same reason. This is also the clock every log
+   * line is stamped with, which is what log_format_selftest's
+   * clock-uptime-agree asserts -- and what it was failing on the busiest lane,
+   * by more than a second.
+   *
+   * Hundredths are printed as two digits, derived rather than assumed: this
+   * once printed `ticks % 100` and called it centiseconds, which is true at
+   * one tick rate and no other, and unpadded it turned five milliseconds past
+   * the second into ".5", i.e. half a second. */
+  u64 ns = ktime_monotonic_ns();
+  u64 sec = ns / 1000000000ull;
+  u64 cs = (ns % 1000000000ull) / 10000000ull;
 
   sb_addf(s, "%lu.%lu%lu %lu.%lu%lu\n", (unsigned long)sec,
           (unsigned long)(cs / 10), (unsigned long)(cs % 10),
@@ -484,8 +491,14 @@ static int r_cpuinfo(usize pid, struct sbuf *s) {
   usize n = (g_max_cpus > 0) ? (usize)g_max_cpus : 1;
   for (usize i = 0; i < n; i++) {
     sb_addf(s, "processor\t: %lu\n", (unsigned long)i);
-    sb_puts(s, "vendor_id\t: B1NIX\n");
-    sb_puts(s, "model name\t: b1nix virtual CPU\n");
+    /* Ask the processor who it is (CPUID brand string / MIDR_EL1) instead of
+     * printing a constant: lscpu, and anything else that reads this file to
+     * decide what the machine is, was being told "b1nix virtual CPU". */
+    char vendor[16], model[64];
+    arch_cpu_vendor(vendor, sizeof(vendor));
+    arch_cpu_model(model, sizeof(model));
+    sb_addf(s, "vendor_id\t: %s\n", vendor[0] ? vendor : "unknown");
+    sb_addf(s, "model name\t: %s\n", model[0] ? model : "unknown");
     {
       u32 khz = arch_cpu_khz();
       if (khz)
@@ -2967,6 +2980,24 @@ static int r_partitions(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/diskstats: Linux block-device I/O statistics.  BusyBox lsblk and
+ * iostat read this to enumerate physical block devices.  We emit zero
+ * counters — the name field is what matters for enumeration. */
+static int r_diskstats(usize pid, struct sbuf *s) {
+  (void)pid;
+  usize n = blk_count();
+  for (usize i = 0; i < n; i++) {
+    struct block_device *d = blk_at(i);
+    if (!d || !d->name)
+      continue;
+    /* 14 fields: maj min name reads_c reads_m sectors_r ms_r
+     *            writes_c writes_m sectors_w ms_w io_prog io_ms io_ms_w */
+    sb_addf(s, "%4d %7lu %-12s  0  0  0  0  0  0  0  0  0  0  0\n",
+            8, (unsigned long)i, d->name);
+  }
+  return 0;
+}
+
 static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
                                         void *data) {
   (void)source;
@@ -3009,6 +3040,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   }
   procfs_mkchild(root, "kallsyms", VFS_DEVICE, r_kallsyms, 0);
   procfs_mkchild(root, "partitions", VFS_DEVICE, r_partitions, 0);
+  procfs_mkchild(root, "diskstats", VFS_DEVICE, r_diskstats, 0);
   procfs_mkchild(root, "swaps", VFS_DEVICE, r_swaps, 0);
   procfs_mkchild(root, "modules", VFS_DEVICE, r_modules, 0);
 

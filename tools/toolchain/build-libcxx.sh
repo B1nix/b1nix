@@ -68,7 +68,20 @@ RANLIB_BIN="$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/
 # b1nix's own triple has no OS component, which makes clang's driver fall
 # back to the Darwin toolchain for anything that links (see
 # build-llvm-runtimes.sh). Use a real ELF/Linux triple for codegen instead.
-CLANG_TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+#
+# Per architecture, like build-llvm-runtimes.sh alongside. This was pinned to
+# the x86_64 triple, so an aarch64 build configured its runtimes for x86_64 and
+# then compiled them with no --target at all: CMake writes the flag from
+# CMAKE_<LANG>_COMPILER_TARGET, and the host clang it fell back to reads the
+# musl sysroot's headers with Darwin's own idea of the ABI. It surfaced as
+# "typedef redefinition ('int' vs 'unsigned int')" on wchar_t -- musl says
+# unsigned, which is right for aarch64, and macOS says int -- and it blocked
+# the whole aarch64 toolchain from ever being rebuilt from a clean tree.
+if [ "${B1NIX_ARCH:-x86_64}" = "aarch64" ]; then
+    CLANG_TARGET_TRIPLE="aarch64-unknown-linux-gnu"
+else
+    CLANG_TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+fi
 LLD_PATH="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/ld.lld)"
 
 # b1nix-specific defines needed by libc++/libc++abi/libunwind:

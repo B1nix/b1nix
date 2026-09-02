@@ -21,6 +21,8 @@
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/pci.h>
+#include <b1nix/irq.h>
+#include <b1nix/arch.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/arch.h>
@@ -135,7 +137,7 @@ static void r_udelay(int us) { arch_udelay((u32)us); }
 /* Hint the CPU (and the hypervisor) that this is a spin-wait. A bare
  * `while (test_and_set()) ;` loop pegs the core and, under virtualisation,
  * keeps the vCPU from being descheduled in favour of the lock holder. */
-static inline void r8169_relax(void) { __asm__ volatile("pause" ::: "memory"); }
+static inline void r8169_relax(void) { cpu_relax(); }
 
 /* ~10 ms budget: one iteration is a pause plus a single ~1 us port access. */
 #define R8169_TX_WAIT_LOOPS 10000
@@ -445,7 +447,10 @@ int r8169_probe(void)
 	r8169_print_mac(r8169_mac);
 	console_write("\n");
 
-	if (r8169_netdev.irq >= 0)
-		x86_pic_unmask((u16)r8169_netdev.irq);
+	/* Through the arch-neutral unmask, not the legacy PIC directly: the line
+	 * number comes from pci_intx_line(), which is config space on x86 and the
+	 * device tree's interrupt-map on aarch64. */
+	if (r8169_netdev.irq >= 0 && r8169_netdev.irq != 0xFF)
+		irq_unmask((u8)r8169_netdev.irq);
 	return 1;
 }

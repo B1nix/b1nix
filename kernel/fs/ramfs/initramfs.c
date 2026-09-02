@@ -12,6 +12,74 @@
 #include <b1nix/mm.h>
 #include <b1nix/vfs.h>
 #include <string.h>
+#ifdef __aarch64__
+#include "initramfs_modules.inc"
+#include "initramfs_openrc_init.inc"
+#include "initramfs_hello.inc"
+#include "initramfs_m8_aio_test.inc"
+#include "initramfs_m12_smoke.inc"
+#include "initramfs_m13_smoke.inc"
+#include "initramfs_m13_job_control.inc"
+#include "initramfs_m14_smoke.inc"
+#include "initramfs_m15_smoke.inc"
+#include "initramfs_m17_smoke.inc"
+#include "initramfs_m24b_smoke.inc"
+#include "initramfs_m25_smoke.inc"
+#include "initramfs_m26_smoke.inc"
+#include "initramfs_m27_smoke.inc"
+#include "initramfs_m29_smoke.inc"
+#include "initramfs_m30_pie.inc"
+#include "initramfs_m31_smoke.inc"
+#include "initramfs_m31_setuid.inc"
+#include "initramfs_m32_smoke.inc"
+#include "initramfs_m56_smoke.inc"
+#include "initramfs_m109_switchroot.inc"
+#ifdef B1NIX_MUSL
+#include "initramfs_ld_musl_aarch64_so_1.inc"
+#endif
+
+static const struct initramfs_file files[] = {
+    {"/sbin/openrc-init", (const char *)vfs_openrc_init_elf, sizeof(vfs_openrc_init_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/hello", (const char *)vfs_hello_elf, sizeof(vfs_hello_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m8_aio_test", (const char *)vfs_m8_aio_test_elf, sizeof(vfs_m8_aio_test_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m12_smoke", (const char *)vfs_m12_smoke_elf, sizeof(vfs_m12_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m13_smoke", (const char *)vfs_m13_smoke_elf, sizeof(vfs_m13_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m13_job_control", (const char *)vfs_m13_job_control_elf, sizeof(vfs_m13_job_control_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m14_smoke", (const char *)vfs_m14_smoke_elf, sizeof(vfs_m14_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m15_smoke", (const char *)vfs_m15_smoke_elf, sizeof(vfs_m15_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m17_smoke", (const char *)vfs_m17_smoke_elf, sizeof(vfs_m17_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m24b_smoke", (const char *)vfs_m24b_smoke_elf, sizeof(vfs_m24b_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m25_smoke", (const char *)vfs_m25_smoke_elf, sizeof(vfs_m25_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m26_smoke", (const char *)vfs_m26_smoke_elf, sizeof(vfs_m26_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m27_smoke", (const char *)vfs_m27_smoke_elf, sizeof(vfs_m27_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m29_smoke", (const char *)vfs_m29_smoke_elf, sizeof(vfs_m29_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m30_pie", (const char *)vfs_m30_pie_elf, sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m31_smoke", (const char *)vfs_m31_smoke_elf, sizeof(vfs_m31_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m31_setuid", (const char *)vfs_m31_setuid_elf, sizeof(vfs_m31_setuid_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m32_smoke", (const char *)vfs_m32_smoke_elf, sizeof(vfs_m32_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m56_smoke", (const char *)vfs_m56_smoke_elf, sizeof(vfs_m56_smoke_elf), INITRAMFS_EXECUTABLE},
+#ifdef B1NIX_MUSL
+    {"/lib/ld-musl-aarch64.so.1", (const char *)vfs_ld_musl_aarch64_so_1,
+     sizeof(vfs_ld_musl_aarch64_so_1), INITRAMFS_EXECUTABLE},
+    {"/lib/libc.so", "/lib/ld-musl-aarch64.so.1", 26, INITRAMFS_SYMLINK},
+#endif
+    /* M95: the .ko images + modules.dep/alias. They must be in the initramfs,
+     * not the ext4 rootfs — request_module() runs during early boot, long
+     * before a real root is mounted. */
+    B1NIX_MODULE_INITRAMFS_FILES
+    /* M109: root=initramfs boots this as PID 1 via the /init-shebang
+     * interpreter line; it mounts the real root and hands over to
+     * switch_root. Same pair the x86_64 file set carries below. */
+    {"/init", (const char *)vfs_m109_switchroot_elf,
+     sizeof(vfs_m109_switchroot_elf), INITRAMFS_EXECUTABLE},
+    {"/init-shebang", "#!/init\n", 8, INITRAMFS_EXECUTABLE},
+    {"/sbin/.keep", "", 0, 0},
+    {"/etc/init.d/.keep", "", 0, 0},
+    {"/etc/conf.d/.keep", "", 0, 0},
+    {"/mnt/iso/.keep", "", 0, 0},
+    {"/mnt/root/.keep", "", 0, 0},
+};
+#else
 #include "initramfs_native_smoke.inc"
 /* M95: the .ko images plus the generated modules.dep / modules.alias. Modules
  * must live in the initramfs, not the ext4 rootfs: the kernel loads the
@@ -46,7 +114,7 @@
 #endif
 
 static const struct initramfs_file files[] = {
-    {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
+    {"/bin/native_smoke", (const char *)vfs_native_smoke_elf,
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},
 #ifdef B1NIX_MUSL
     {"/lib/ld-musl-x86_64.so.1", (const char *)vfs_ld_musl_x86_64_so_1,
@@ -61,6 +129,7 @@ static const struct initramfs_file files[] = {
     {"/mnt/iso/.keep", "", 0, 0},
     {"/mnt/root/.keep", "", 0, 0},
 };
+#endif
 
 static int initramfs_vfs_statfs(struct vfs_node *node,
                                 struct b1nix_statfs *st) {
@@ -105,7 +174,7 @@ static struct vfs_node *initramfs_mount_cb(const char *source, u64 flags,
     struct vfs_node *node =
         vfs_add_node(files[i].path, type, (void *)files[i].data,
                      files[i].size, files[i].flags);
-    if (node) {
+    if (node && !IS_ERR(node)) {
       node->inode->statfs_cb = initramfs_vfs_statfs;
     }
   }

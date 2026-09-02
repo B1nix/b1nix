@@ -29,6 +29,13 @@ struct kheap_state {
 
 #define KHEAP_MAGIC 0xB1A110C
 #define KHEAP_FREED_MAGIC 0xDEAD110C
+/* A block parked in a per-CPU magazine. Distinct from both of the above on
+ * purpose: coalescing must not claim it (it only merges KHEAP_FREED_MAGIC), and
+ * kfree() must not cache it a second time. It used to keep KHEAP_MAGIC, so a
+ * double kfree() of a small block pushed the SAME block into the magazine
+ * twice and the allocator then handed one piece of memory to two owners —
+ * whichever of them zeroed it destroyed the other's data. */
+#define KHEAP_MAG_MAGIC 0xB1A6A21E
 #define KHEAP_HEADER_SIZE 32
 #define KHEAP_REUSE_MIN_SIZE 0
 
@@ -47,7 +54,17 @@ struct kheap_state {
  * KHEAP_VALIDATE is enabled. Flip either to 0 to bisect against the no-coalesce
  * baseline. */
 #define KHEAP_ENABLE_COALESCE 1
+#if defined(__aarch64__)
+/* Returning a freed tail to the pmm is the only thing that ever UNMAPS heap
+ * memory, and kernel stacks (128 KiB) are ordinary heap blocks. Runs on this
+ * arch kept dying with a write fault at exception-entry to an unmapped heap
+ * page — i.e. a live task's kernel stack inside a range the shrink had handed
+ * back. Until that is understood, keep the pages mapped here: the cost is
+ * heap high-water only, which is what the optimisation exists to reduce. */
+#define KHEAP_ENABLE_PAGE_RETURN 0
+#else
 #define KHEAP_ENABLE_PAGE_RETURN 1
+#endif
 
 /* -----------------------------------------------------------------------
  * Large-allocation arena (returns whole pages to the pmm on free)
@@ -73,6 +90,13 @@ struct kheap_state {
 #ifdef __x86_64__
 #define KLARGE_START     (KHEAP_START + 0x1000000000ULL) /* +64 GB, same PML4[384] */
 #define KLARGE_END       (KHEAP_START + 0x8000000000ULL) /* +512 GB (PML4[384] top) */
+#elif defined(__aarch64__)
+/* Same reasoning as KHEAP_START (see b1nix/mm.h): keep the arena out of the
+ * identity-mapped RAM window, and inside L0[0] so its page tables stay shared
+ * with every process. 128 GiB .. 320 GiB, both well under the 512 GiB that
+ * L0[0] spans. */
+#define KLARGE_START     (KHEAP_START + 0x1000000000ULL)
+#define KLARGE_END       (KHEAP_START + 0x4000000000ULL)
 #else
 /* 32-bit: the +64 GB offset above overflows the 32-bit virtual address space and
  * aliases straight back onto the general kheap
@@ -234,11 +258,56 @@ static int kheap_mag_free(struct kheap_block *block) {
   int cached = 0;
   if (m->count[cls] < MAG_DEPTH) {
     block->next = 0;
+    block->magic = KHEAP_MAG_MAGIC;
     m->slot[cls][m->count[cls]++] = block;
     cached = 1;
   }
   kheap_irq_restore(f);
   return cached;
+}
+
+/* Drop every cached block that lives in [lo, hi) from all magazines. The tail
+ * page-return is about to unmap that range, and a magazine entry is a free
+ * block that coalescing never saw (cached blocks keep KHEAP_MAGIC on purpose so
+ * a concurrent merge cannot claim them). Without this the allocator happily
+ * hands out a pointer into address space the heap no longer maps, and the
+ * caller faults on its first write with nothing in the backtrace to explain
+ * it. The blocks are free, so forgetting them loses nothing — the memory is
+ * going back to the pmm either way. */
+/* Physically topmost block, found by walking the boundary tags from the base.
+ * Returns 0 if the chain does not check out (a corrupted header means nothing
+ * here can be trusted, and the caller must not shrink on that basis). */
+static struct kheap_block *kheap_walk_topmost(void) {
+  u64 p = heap.base;
+  struct kheap_block *last = 0;
+  while (p + KHEAP_HEADER_SIZE <= heap.current) {
+    struct kheap_block *b = (struct kheap_block *)(usize)p;
+    if ((b->magic != KHEAP_MAGIC && b->magic != KHEAP_FREED_MAGIC &&
+         b->magic != KHEAP_MAG_MAGIC) ||
+        b->size == 0)
+      return 0;
+    last = b;
+    p += KHEAP_HEADER_SIZE + b->size;
+  }
+  return (p == heap.current) ? last : 0;
+}
+
+static void kheap_mag_evict_range(u64 lo, u64 hi) {
+  for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+    struct kheap_magazine *m = &kheap_mag[cpu];
+    for (int cls = 0; cls < MAG_NCLASS; cls++) {
+      u16 keep = 0;
+      for (u16 i = 0; i < m->count[cls]; i++) {
+        struct kheap_block *b = m->slot[cls][i];
+        u64 start = (u64)(usize)b;
+        u64 end = start + KHEAP_HEADER_SIZE + b->size;
+        if (end > lo && start < hi)
+          continue; /* overlaps the range being unmapped — forget it */
+        m->slot[cls][keep++] = b;
+      }
+      m->count[cls] = keep;
+    }
+  }
 }
 
 #include <b1nix/lockdep.h>
@@ -601,8 +670,14 @@ static u64 align_up_u64(u64 value, u64 alignment) {
 }
 
 static int is_canonical_addr(u64 addr) {
-#ifdef __x86_64__
+#if defined(__x86_64__)
   return ((isize)addr >> 47) == 0 || ((isize)addr >> 47) == -1;
+#elif defined(__aarch64__)
+  /* TCR_EL1.T0SZ=16 (kernel/arch/aarch64/boot.S) — 48-bit VAs through TTBR0,
+   * bit 47 upwards clear. The 32-bit test below would reject every kernel
+   * pointer above 4GB, which silently turns kfree() of such a pointer into a
+   * no-op leak. */
+  return (addr >> 48) == 0;
 #else
   return (addr >> 32) == 0;
 #endif
@@ -637,6 +712,27 @@ static void heap_grow(usize minimum_bytes) {
     }
 
     u64 vaddr = heap.end;
+    /* Growing must only ever map fresh address space. If this VA already
+     * translates to a frame, heap.end has moved backwards over live heap and
+     * the fresh (zeroed) frame we are about to install would replace the one
+     * holding real objects — which reads exactly like "my data turned into
+     * zeros" much later, with nothing pointing back here. */
+    /* "Already translates" has two spellings: x86_64's vmm_virt_to_phys reports
+     * an absent page as 0, aarch64's reports it as the address itself (it has
+     * nothing better to say about an identity-mapped arch). Accept both, or
+     * this fires on every single growth on one arch and never on the other —
+     * as it did on x86_64, which panicked at the first kheap growth of boot. */
+    u64 existing = vmm_virt_to_phys((void *)(usize)vaddr);
+    if (existing != 0 && existing != vaddr) {
+      console_write("kheap: growth would remap live page 0x");
+      console_write_hex64(vaddr);
+      console_write(" (already at 0x");
+      console_write_hex64(existing);
+      console_write("), heap.current=0x");
+      console_write_hex64(heap.current);
+      console_write("\n");
+      panic("kheap: heap.end moved backwards over live memory");
+    }
     vmm_map_page(vaddr, frame, VMM_PRESENT | VMM_WRITABLE);
 
     heap.end += PAGE_SIZE;
@@ -721,6 +817,12 @@ u64 kheap_mapped_bytes(void) {
   return heap.current > heap.base ? heap.current - heap.base : 0;
 }
 
+void kheap_bounds(u64 *base, u64 *current, u64 *end) {
+  if (base) *base = heap.base;
+  if (current) *current = heap.current;
+  if (end) *end = heap.end;
+}
+
 void kheap_describe(u64 addr, const char *label) {
   console_write(label);
   console_write(" 0x");
@@ -771,7 +873,8 @@ void kheap_validate(const char *func) {
   struct kheap_block *prev_block = 0;
   while (addr < heap.current) {
     struct kheap_block *block = (struct kheap_block *)(usize)addr;
-    if (block->magic != KHEAP_MAGIC && block->magic != KHEAP_FREED_MAGIC) {
+    if (block->magic != KHEAP_MAGIC && block->magic != KHEAP_FREED_MAGIC &&
+        block->magic != KHEAP_MAG_MAGIC) {
       console_write("kheap_validate (from ");
       console_write(func);
       console_write("): block at 0x");
@@ -898,20 +1001,6 @@ static void *klarge_alloc(usize size, u64 caller) {
   for (usize i = 0; i < npages; i++) {
     u64 frame = pmm_alloc_frame();
     if (!frame) {
-      /* True OOM partway through mapping. Do NOT panic the kernel for one
-       * greedy allocation (e.g. 8 parallel cc1 each grabbing ~38 MB on a
-       * 512 MB guest). Roll back cleanly and return NULL; kmalloc propagates
-       * NULL so the offending userspace allocation fails while the system
-       * survives.
-       *
-       * CRITICAL: the unmap/free MUST run WITHOUT heap_lock, exactly like the
-       * Phase 2 mapping loop above. vmm_unmap_page issues a cross-CPU TLB
-       * shootdown that spins (IRQs off) until every other CPU ACKs; holding
-       * heap_lock across it deadlocks under SMP — a core spinning to acquire
-       * heap_lock with IRQs off can never service the shootdown IPI. (This is
-       * why klarge_alloc's Phase 2 deliberately maps with the lock released.)
-       * The span is reserved exclusively to us, so no lock is needed to touch
-       * its pages; only the bookkeeping at the end takes heap_lock briefly. */
       for (usize j = 0; j < i; j++) {
         u64 vaddr = base + j * PAGE_SIZE;
         u64 fr = vmm_virt_to_phys((void *)(usize)vaddr);
@@ -1115,7 +1204,7 @@ static void *kmalloc_internal(usize size, u64 caller) {
         if (!is_canonical_addr(bp) ||
             (bp & 0xF) != 0 ||
             bp < heap.base + KHEAP_HEADER_SIZE ||
-            bp + KHEAP_HEADER_SIZE > heap.end ||
+            bp + KHEAP_HEADER_SIZE + cur->size > heap.end ||
             cur->magic != KHEAP_FREED_MAGIC) {
           *prev = 0;
           break;
@@ -1152,6 +1241,12 @@ static void *kmalloc_internal(usize size, u64 caller) {
     heap_grow(KHEAP_HEADER_SIZE + size);
     aligned_current = align_up_u64(heap.current, 16);
     next = aligned_current + KHEAP_HEADER_SIZE + size;
+  }
+  /* The block must lie entirely inside mapped heap. Handing out its tail past
+   * heap.end reads back as a fault at exactly heap.end much later, from
+   * whatever code happens to touch the end of that object. */
+  if (next > heap.end) {
+    panic("kheap: bump allocation past mapped end");
   }
 
   heap.current = next;
@@ -1222,10 +1317,15 @@ void kfree(void *ptr) {
 
   struct kheap_block *block =
       (struct kheap_block *)((u8 *)ptr - KHEAP_HEADER_SIZE);
+  if (block->magic == KHEAP_FREED_MAGIC) {
+    heap_release(flags);
+    panic("kheap: double-free detected on block");
+  }
   if (block->magic != KHEAP_MAGIC) {
     heap_release(flags);
-    return;
+    panic("kheap: freeing unallocated or corrupted block");
   }
+
 #if KHEAP_REUSE_MIN_SIZE > 0
   if (block->size < KHEAP_REUSE_MIN_SIZE) {
     heap_release(flags);
@@ -1280,11 +1380,35 @@ void kfree(void *ptr) {
    * unmapped; the header page always stays mapped. KHEAP_SHRINK_MIN sits above
    * KLARGE_THRESHOLD, so this only triggers when coalescing has merged many
    * small frees into a large contiguous tail. */
+  /* heap.last_block must really be the physically topmost block: the shrink
+   * below unmaps everything from the end of this block up to heap.end and
+   * rewinds the bump pointer there, so a stale last_block hands live memory
+   * back to the pmm and then re-allocates it — which surfaces much later as an
+   * unrelated live object full of zeros. Walk the boundary tags and check,
+   * rather than trusting the cached pointer; the walk only runs on the rare
+   * >=512 KB tail free. */
   if (KHEAP_ENABLE_PAGE_RETURN && heap.last_block == block &&
       block->size >= KHEAP_SHRINK_MIN) {
+    struct kheap_block *top = kheap_walk_topmost();
+    if (top != block) {
+      static unsigned lb_reported;
+      if (lb_reported < 8) {
+        console_write("kheap: last_block 0x");
+        console_write_hex64((u64)(usize)block);
+        console_write(" is not the topmost block (walk says 0x");
+        console_write_hex64((u64)(usize)top);
+        console_write(") — skipping tail return\n");
+        lb_reported++;
+      }
+    }
+  }
+  if (KHEAP_ENABLE_PAGE_RETURN && heap.last_block == block &&
+      block->size >= KHEAP_SHRINK_MIN &&
+      kheap_walk_topmost() == block) {
     u64 free_start =
         align_up_u64((u64)(usize)block + KHEAP_HEADER_SIZE + 16, PAGE_SIZE);
     if (free_start < heap.end) {
+      kheap_mag_evict_range(free_start, heap.end);
       for (u64 vaddr = free_start; vaddr < heap.end; vaddr += PAGE_SIZE) {
         u64 frame = vmm_virt_to_phys((void *)(usize)vaddr);
         vmm_unmap_page(vaddr);

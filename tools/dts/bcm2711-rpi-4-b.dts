@@ -1,0 +1,260 @@
+/dts-v1/;
+
+/*
+ * Raspberry Pi 4 B (BCM2711) device tree, cut down to what b1nix reads.
+ *
+ * Where this came from: the node addresses, `compatible` strings and the /soc
+ * `ranges` below are the ones the Raspberry Pi firmware's own tree uses —
+ * upstream Linux arch/arm/boot/dts/broadcom/bcm2711.dtsi and
+ * bcm2711-rpi-4-b.dts (GPL-2.0), reduced here to the handful of nodes this
+ * kernel actually looks at. Nothing is invented: every address is the legacy
+ * 0x7exxxxxx bus address the datasheet prints, translated by /soc's ranges to
+ * the 0xfexxxxxx the CPU issues, exactly as the real tree does it.
+ *
+ * Why it exists: QEMU's raspi machines carry no device tree of their own, so a
+ * `-machine raspi4b` run has to be handed one with -dtb. On real hardware the
+ * firmware passes its own, richer tree and this file is not used.
+ *
+ *   qemu-system-aarch64 -machine raspi4b -m 2G \
+ *       -kernel build/aarch64/Image -dtb tools/dts/bcm2711-rpi-4-b.dtb \
+ *       -serial null -serial file:pi.log -display none \
+ *       -append "b1nix.test=1 b1nix.smoke=sys"
+ *
+ * (raspi4b's first -serial is the PL011 and its second the mini-UART, which is
+ * the console this tree names — the same way the stock firmware config does.)
+ *
+ * Build it with:  dtc -I dts -O dtb -o tools/dts/bcm2711-rpi-4-b.dtb \
+ *                     tools/dts/bcm2711-rpi-4-b.dts
+ */
+
+/ {
+	compatible = "raspberrypi,4-model-b", "brcm,bcm2711";
+	model = "Raspberry Pi 4 Model B";
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&gicv2>;
+
+	chosen {
+		/*
+		 * The mini-UART, which is what the stock firmware's config.txt
+		 * leaves as the console on a Pi 4: the PL011 is wired to the
+		 * Bluetooth controller there, so ttyS0 is the port a serial cable
+		 * sees. QEMU appends bootargs here itself from -append.
+		 */
+		stdout-path = "serial0:115200n8";
+	};
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+	};
+
+	/* QEMU rewrites this from -m; a real Pi's firmware writes the size the
+	 * board has. 2 GiB is the only size raspi4b accepts. */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x00000000 0x0 0x80000000>;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a72";
+			reg = <0x0>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0x0 0x000000d8>;
+		};
+		cpu1: cpu@1 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a72";
+			reg = <0x1>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0x0 0x000000e0>;
+		};
+		cpu2: cpu@2 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a72";
+			reg = <0x2>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0x0 0x000000e8>;
+		};
+		cpu3: cpu@3 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a72";
+			reg = <0x3>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0x0 0x000000f0>;
+		};
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <1 13 0xf08>,
+			     <1 14 0xf08>,
+			     <1 11 0xf08>,
+			     <1 10 0xf08>;
+		always-on;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		/*
+		 * The three windows a BCM2711 exposes. Programming an untranslated
+		 * 0x7e______ address writes into RAM, so every peripheral below is
+		 * declared at its bus address and reached through these.
+		 */
+		ranges = <0x7e000000 0x0 0xfe000000 0x01800000>,
+			 <0x7c000000 0x0 0xfc000000 0x02000000>,
+			 <0x40000000 0x0 0xff800000 0x00800000>;
+		dma-ranges = <0xc0000000 0x0 0x00000000 0x40000000>;
+
+		/* GIC-400: reg[0] distributor (0xff841000), reg[1] CPU interface
+		 * (0xff842000), then the hypervisor and virtual interfaces. */
+		gicv2: interrupt-controller@40041000 {
+			compatible = "arm,gic-400";
+			interrupt-controller;
+			#interrupt-cells = <3>;
+			reg = <0x40041000 0x1000>,
+			      <0x40042000 0x2000>,
+			      <0x40044000 0x2000>,
+			      <0x40046000 0x2000>;
+		};
+
+		/* The PL011. On a stock Pi 4 this one belongs to Bluetooth. */
+		uart0: serial@7e201000 {
+			compatible = "arm,pl011", "arm,primecell";
+			reg = <0x7e201000 0x200>;
+			interrupts = <0 121 4>;
+		};
+
+		/* The AUX block's three peripherals share one register page and one
+		 * enable register; the mini-UART is the first of them. Its `reg`
+		 * starts at the mini-UART's own registers, 0x40 into the block, which
+		 * is where AUX_MU_IO_REG sits — the AUX_ENABLES this driver has to
+		 * set is 0x3c below it. */
+		aux: aux@7e215000 {
+			compatible = "brcm,bcm2835-aux";
+			reg = <0x7e215000 0x8>;
+			interrupts = <0 93 4>;
+		};
+
+		uart1: serial@7e215040 {
+			compatible = "brcm,bcm2835-aux-uart";
+			reg = <0x7e215040 0x40>;
+			interrupts = <0 93 4>;
+		};
+
+		/* The SD card controller a Pi 4 boots from. */
+		emmc2: mmc@7e340000 {
+			compatible = "brcm,bcm2711-emmc2";
+			reg = <0x7e340000 0x100>;
+			interrupts = <0 126 4>;
+		};
+
+		/* The VideoCore mailbox, which the firmware answers on. */
+		mailbox: mailbox@7e00b880 {
+			compatible = "brcm,bcm2835-mbox";
+			reg = <0x7e00b880 0x40>;
+			interrupts = <0 33 4>;
+			#mbox-cells = <0>;
+		};
+
+		/*
+		 * The free-running 1 MHz counter. Four compare registers follow it;
+		 * this kernel reads the counter and leaves the compares to the ARM
+		 * generic timer, which is what drives its tick.
+		 */
+		systimer: timer@7e003000 {
+			compatible = "brcm,bcm2835-system-timer";
+			reg = <0x7e003000 0x1000>;
+			interrupts = <0 96 4>, <0 97 4>, <0 98 4>, <0 99 4>;
+		};
+
+		/*
+		 * Power management. The only way to reset this SoC is to arm the
+		 * watchdog in here and let it expire, so this block is what reboot(2)
+		 * ends up in on a Pi.
+		 */
+		pm: watchdog@7e100000 {
+			compatible = "brcm,bcm2835-pm-wdt";
+			reg = <0x7e100000 0x114>;
+		};
+
+		/* 54 pins, eight functions each. */
+		gpio: gpio@7e200000 {
+			compatible = "brcm,bcm2711-gpio";
+			reg = <0x7e200000 0xb4>;
+			interrupts = <0 113 4>, <0 114 4>, <0 115 4>, <0 116 4>;
+			gpio-controller;
+			#gpio-cells = <2>;
+
+			uart0_pins: uart0_pins {
+				brcm,pins = <14 15>;
+				brcm,function = <4>; /* BCM2835_FSEL_ALT0 */
+				brcm,pull = <0 2>;
+			};
+
+			uart1_pins: uart1_pins {
+				brcm,pins = <14 15>;
+				brcm,function = <2>; /* BCM2835_FSEL_ALT5 */
+				brcm,pull = <0 2>;
+			};
+		};
+
+
+	};
+
+	/*
+	 * The second bus a BCM2711 has: GENET and the PCIe root complex live at
+	 * 0x7d______, which /soc's window does not cover, and the PCIe outbound
+	 * window sits above 4 GiB — so this bus needs two address cells where
+	 * /soc needs one. Upstream calls it `scb` and so does this.
+	 */
+	scb {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <1>;
+		ranges = <0x0 0x7c000000  0x0 0xfc000000  0x03800000>,
+			 <0x0 0x40000000  0x0 0xff800000  0x00800000>,
+			 <0x6 0x00000000  0x6 0x00000000  0x40000000>;
+		dma-ranges = <0x0 0xc0000000  0x0 0x00000000  0x40000000>;
+
+		/* GENET v5, the Pi 4's on-board gigabit Ethernet, at 0xfd580000. */
+		genet: ethernet@7d580000 {
+			compatible = "brcm,bcm2711-genet-v5";
+			reg = <0x0 0x7d580000 0x10000>;
+			interrupts = <0 157 4>, <0 158 4>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+		};
+
+		/* The PCIe root complex the VL805 xHCI sits behind, at 0xfd500000.
+		 * Not ECAM: the controller has to be brought up — bridge out of
+		 * reset, link trained, inbound and outbound windows programmed —
+		 * before its config space answers at all. */
+		pcie0: pcie@7d500000 {
+			compatible = "brcm,bcm2711-pcie";
+			reg = <0x0 0x7d500000 0x9310>;
+			device_type = "pci";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			interrupts = <0 148 4>, <0 148 4>;
+			interrupt-names = "pcie", "msi";
+			bus-range = <0x0 0x01>;
+			/* One 64 MiB non-prefetchable window: PCI 0xf8000000 seen
+			 * by the CPU at 0x6_00000000. */
+			ranges = <0x02000000 0x0 0xf8000000
+				  0x6 0x00000000
+				  0x0 0x04000000>;
+			/* Inbound: the first 3 GiB of RAM, at the same addresses. */
+			dma-ranges = <0x02000000 0x0 0x00000000
+				      0x0 0x00000000
+				      0x0 0xc0000000>;
+		};
+	};
+};

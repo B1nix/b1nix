@@ -4,7 +4,7 @@
 #include <b1nix/types.h>
 
 #ifdef __aarch64__
-// aarch64 headers
+#include <b1nix/arch_aarch64.h>
 #elif defined(__x86_64__)
 #include <b1nix/arch_x86_64.h>
 #else
@@ -13,6 +13,16 @@
 
 void arch_init(void);
 void arch_halt(void) __attribute__((noreturn));
+#if defined(__aarch64__)
+/* PSCI SYSTEM_OFF / SYSTEM_RESET (kernel/arch/aarch64/arch.c). */
+void arch_psci_poweroff(void);
+void arch_psci_reset(void);
+/* Rebuild boot.S's identity map from the RAM banks the device tree reported:
+ * RAM as Normal memory, everything else as Device. Runs immediately after the
+ * tree is walked and before the console, the pmm or the heap
+ * (kernel/arch/aarch64/paging.c). */
+void aarch64_boot_map_rebuild(void);
+#endif
 void arch_set_kernel_stack(u64 stack_top);
 #ifdef __x86_64__
 /* TSS.rsp0 of a CPU: the stack a ring-3 exception frame is pushed on. */
@@ -35,20 +45,43 @@ static inline void interrupts_enable(void) {
 #endif
 }
 
+/* Unmask interrupts and idle until one arrives — the two must be one step, or
+ * a wakeup delivered in between is lost and the CPU waits for the next one.
+ * x86_64 spells it `sti; hlt`, and this arch `msr daifclr, #2; wfi`. */
+static inline void interrupts_enable_and_wait(void) {
+#ifdef __aarch64__
+  __asm__ volatile("msr daifclr, #2; wfi" : : : "memory");
+#else
+  __asm__ volatile("sti; hlt" : : : "memory");
+#endif
+}
+
+/* Free-running cycle counter, for timing short intervals. x86_64's TSC and
+ * aarch64's virtual counter differ wildly in rate, so this is only ever valid
+ * for comparing two reads on the same machine — never as a unit of time. */
+static inline u64 arch_cycles(void) {
+#ifdef __aarch64__
+  u64 v;
+  __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
+  return v;
+#else
+  u32 lo, hi;
+  __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+  return ((u64)hi << 32) | lo;
+#endif
+}
+
 static inline int interrupts_enabled(void) {
 #ifdef __aarch64__
   u64 daif;
   __asm__ volatile("mrs %0, daif" : "=r"(daif));
   return (daif & (1ULL << 7)) == 0;
 #else
+  /* x86_64. The 32-bit `pushfd; popl` arm this used to carry could not be
+   * reached once the i686 port was removed -- the outer #else already means
+   * "not aarch64", and the only other target is x86_64. */
   u64 rflags;
-#ifdef __x86_64__
   __asm__ volatile("pushfq; popq %0" : "=r"(rflags));
-#else
-  u32 rflags32;
-  __asm__ volatile("pushfd; popl %0" : "=r"(rflags32));
-  rflags = rflags32;
-#endif
   return (rflags & 0x200) != 0;
 #endif
 }
@@ -61,9 +94,7 @@ static inline u64 interrupts_save(void) {
 #elif defined(__x86_64__)
   __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
 #else
-  u32 f32;
-  __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
-  f = f32;
+#error "unsupported architecture"
 #endif
   return f;
 }
@@ -74,11 +105,9 @@ static inline void interrupts_restore(u64 f) {
 #elif defined(__x86_64__)
   __asm__ volatile("pushq %0; popfq" : : "r"(f) : "memory", "cc");
 #else
-  u32 f32 = (u32)f;
-  __asm__ volatile("pushl %0; popfd" : : "r"(f32) : "memory", "cc");
+#error "unsupported architecture"
 #endif
 }
-
 
 /* ── FPU / XSAVE state management (M80) ──────────────────────────────────────
  * The kernel saves userspace FPU state on every context switch. With XSAVE
@@ -136,8 +165,45 @@ u64 boot_stack_peak_bytes(void);
 u64 boot_stack_size_bytes(void);
 int boot_stack_is_guard_addr(u64 addr);
 
+/* Who the processor says it is, for /proc/cpuinfo. Both come from the CPU
+ * itself — the CPUID brand string on x86_64, MIDR_EL1 on aarch64 — rather than
+ * from a constant compiled into the kernel. Always NUL-terminated. */
+void arch_cpu_vendor(char *buf, usize len);
+void arch_cpu_model(char *buf, usize len);
+
 int arch_xsave_enabled(void);
 u64 arch_xsave_mask(void);
 usize arch_xsave_area_size(void);
+
+/* linuxkpi (<linux/compiler.h>) defines a cpu_relax() of its own that also
+ * services TLB shootdowns, and a TU pulling both headers failed to compile on
+ * either arch. Whichever lands first now wins; inside imported code include
+ * the linuxkpi one first, so the shootdown servicing is kept. */
+#ifndef B1NIX_CPU_RELAX_DEFINED
+#define B1NIX_CPU_RELAX_DEFINED 1
+/* A spin-wait hint AND a compiler barrier.
+ *
+ * The "memory" clobber is not decoration. Without it this is a pure hint the
+ * optimiser may schedule around, so a loop like
+ *
+ *     while (p->flag == 0) cpu_relax();
+ *
+ * over ordinary memory -- memory another CPU or a DMA engine writes -- is
+ * entitled to load p->flag ONCE and spin forever on the register. That is the
+ * shape of every polling loop in this kernel: the NVMe completion wait, the
+ * scheduler's stack hand-off spins, the block layer's readiness waits. The ones
+ * that go through __atomic_load_n were safe already; the ones that read a plain
+ * struct field were not, and nvme's completion queue is exactly that -- a
+ * struct the controller fills by DMA, polled in a bounded spin.
+ *
+ * Linux spells the same requirement barrier() inside its own cpu_relax(). */
+static inline void cpu_relax(void) {
+#if defined(__x86_64__)
+  __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+  __asm__ volatile("yield" ::: "memory");
+#endif
+}
+#endif
 
 #endif

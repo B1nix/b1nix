@@ -365,7 +365,7 @@ int dma_fence_wait_uninterruptible(struct dma_fence *f)
 		if (!scheduler_can_block()) {
 			/* Interrupt context or pre-scheduler boot: poll. The signaller is
 			 * another CPU or an interrupt on this one, so this terminates. */
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}
@@ -380,13 +380,40 @@ int dma_fence_wait_uninterruptible(struct dma_fence *f)
 	return f->error;
 }
 
-/* The cycle counter, which advances whether or not interrupts are enabled. */
+/* The cycle counter, which advances whether or not interrupts are enabled.
+ * x86_64 spells that the TSC; aarch64 spells it CNTVCT_EL0. */
 static inline u64 lkpi_rdtsc(void)
 {
+#if defined(__x86_64__)
 	u32 lo, hi;
 
 	__asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi));
 	return ((u64)hi << 32) | lo;
+#elif defined(__aarch64__)
+	u64 v;
+
+	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+	return v;
+#else
+	return 0;
+#endif
+}
+
+/* Cycles that counter advances in one 10 ms scheduler tick, or 0 when there is
+ * no usable rate. On aarch64 the counter has its own frequency (CNTFRQ_EL0)
+ * and the CPU's calibrated kHz would be the wrong scale. */
+static inline u64 lkpi_cycles_per_tick(void)
+{
+#if defined(__aarch64__)
+	u64 hz;
+
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+	return hz ? hz / 100ull : 0;
+#else
+	u32 khz = arch_cpu_khz();
+
+	return khz ? (u64)khz * 10ull : 0;
+#endif
 }
 
 i64 dma_fence_wait_timeout(struct dma_fence *f, int intr, u64 timeout_ticks)
@@ -405,10 +432,10 @@ i64 dma_fence_wait_timeout(struct dma_fence *f, int intr, u64 timeout_ticks)
 	 */
 	u64 tsc_deadline = 0;
 	{
-		u32 khz = arch_cpu_khz();
+		u64 per_tick = lkpi_cycles_per_tick();
 
-		if (khz)
-			tsc_deadline = lkpi_rdtsc() + timeout_ticks * (u64)khz * 10ull;
+		if (per_tick)
+			tsc_deadline = lkpi_rdtsc() + timeout_ticks * per_tick;
 	}
 	for (;;) {
 		if (fence_signaled(f))
@@ -419,7 +446,7 @@ i64 dma_fence_wait_timeout(struct dma_fence *f, int intr, u64 timeout_ticks)
 		if (!scheduler_can_block()) {
 			if (tsc_deadline && lkpi_rdtsc() >= tsc_deadline)
 				return 0;
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}

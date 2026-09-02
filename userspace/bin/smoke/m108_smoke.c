@@ -716,18 +716,35 @@ static void check_shadow_concurrent(void)
 	close(gate[1]);
 	close(gate[0]);
 
+	int bad_status = 0;
+	pid_t bad_pid = 0;
 	for (i = 0; i < started; i++) {
 		int status = -1;
-		if (waitpid(kid[i], &status, 0) != kid[i] || !exited_zero(status))
+		if (waitpid(kid[i], &status, 0) != kid[i] || !exited_zero(status)) {
 			bad = 1;
+			/* Keep the FIRST one: "a passwd exited non-zero" does not say
+			 * whether the applet refused the change, could not read its
+			 * stdin, or was killed -- and those are three different bugs. */
+			if (!bad_pid) {
+				bad_pid = kid[i];
+				bad_status = status;
+			}
+		}
 	}
 	if (started != CONC_N) {
 		fail("shadow-concurrent-passwd", "could not start all writers");
 		return;
 	}
 	if (bad) {
-		fail("shadow-concurrent-passwd",
-		     "a concurrent passwd exited non-zero");
+		char why_buf[128];
+
+		snprintf(why_buf, sizeof(why_buf),
+		         "a concurrent passwd exited non-zero: pid %d status 0x%x "
+		         "(exit %d, signal %d)",
+		         (int)bad_pid, (unsigned)bad_status,
+		         WIFEXITED(bad_status) ? WEXITSTATUS(bad_status) : -1,
+		         WIFSIGNALED(bad_status) ? WTERMSIG(bad_status) : 0);
+		fail("shadow-concurrent-passwd", why_buf);
 		return;
 	}
 

@@ -1,7 +1,9 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/fb_console.h>
+#include <b1nix/fb_panel.h>
 #include <b1nix/mm.h>
+#include <b1nix/sched.h>
 #include <b1nix/types.h>
 #include <string.h>
 #include "font8x8.h"
@@ -15,6 +17,10 @@ int fb_dev_claimed(void);
 static struct boot_framebuffer fb;
 static u32 cursor_x;
 static u32 cursor_y;
+/* First row the console may use. Everything above it is frozen — the boot
+ * splash is drawn once and then stays put while the log scrolls underneath.
+ * Zero, and the console owns the whole panel as it always did. */
+static u32 fb_top;
 static u32 fg_color = 0x00FFFFFF;
 static u32 bg_color = 0x00000000;
 volatile u8 *fb_ptr = 0;
@@ -35,9 +41,43 @@ static inline void put_pixel(u32 x, u32 y, u32 color)
 	}
 }
 
+/* Hand a touched rectangle to the panel. Nothing happens on a machine whose
+ * framebuffer is the scanout; on one whose display is a device, this is what
+ * makes the characters appear. */
+static u32 dirty_x0, dirty_y0, dirty_x1, dirty_y1;
+
+static void fb_present_rect(u32 x, u32 y, u32 w, u32 h)
+{
+	if (!fb_ptr || !w || !h)
+		return;
+	if (dirty_x1 == 0 && dirty_y1 == 0) {
+		dirty_x0 = x; dirty_y0 = y;
+		dirty_x1 = x + w; dirty_y1 = y + h;
+		return;
+	}
+	if (x < dirty_x0) dirty_x0 = x;
+	if (y < dirty_y0) dirty_y0 = y;
+	if (x + w > dirty_x1) dirty_x1 = x + w;
+	if (y + h > dirty_y1) dirty_y1 = y + h;
+}
+
+/* Send whatever has been drawn since the last flush. A panel that has to hand
+ * frames to a device pays one command per flush rather than one per glyph,
+ * which is the difference between a console and a slideshow. */
+void fb_console_flush(void)
+{
+	if (!fb_ptr || dirty_x1 == 0)
+		return;
+	fb_panel_present((const void *)fb_ptr, fb.pitch, fb.width, fb.height,
+	                 dirty_x0, dirty_y0, dirty_x1 - dirty_x0,
+	                 dirty_y1 - dirty_y0);
+	dirty_x0 = dirty_y0 = dirty_x1 = dirty_y1 = 0;
+}
+
 static void fb_flush_rect(u32 x, u32 y, u32 w, u32 h)
 {
 	if (!fb_ptr || !fb_shadow || w == 0 || h == 0) return;
+	if ((const volatile u8 *)fb_shadow == fb_ptr) return; /* one buffer, nothing to copy */
 	if (x >= fb.width || y >= fb.height) return;
 	if (x + w > fb.width) w = fb.width - x;
 	if (y + h > fb.height) h = fb.height - y;
@@ -54,12 +94,13 @@ static void fb_flush_rect(u32 x, u32 y, u32 w, u32 h)
 
 void fb_console_init(void)
 {
-	const struct boot_info *info = bootinfo_get();
-	if (!info->has_framebuffer) {
-		return;
-	}
+	int in_ram = 0;
 
-	fb = info->framebuffer;
+	if (fb_ptr)
+		return; /* already up */
+	if (fb_panel_probe(&fb, &in_ram) != 0)
+		return;
+
 	if (fb.bpp != 32 && fb.bpp != 24) {
 		return; /* Unsupported color depth */
 	}
@@ -77,16 +118,40 @@ void fb_console_init(void)
 	console_write("\n");
 
 	u64 fb_size = (u64)fb.height * fb.pitch;
-	fb_ptr = (volatile u8 *)vmm_map_mmio(fb.address, (usize)fb_size, VMM_WRITABLE | VMM_PCD);
+	/* Write-combining, not Device.
+	 *
+	 * A scanout buffer is the textbook write-combining surface: nothing in it
+	 * is a register, no write has a side effect, and the order two pixels land
+	 * in does not matter. Mapped Device (which is what vmm_map_mmio gives a
+	 * caller that does not ask for WC) every single pixel becomes its own
+	 * strongly-ordered, uncombinable bus transaction — on a 1080x2520 panel a
+	 * full-screen clear is 2.7 million of them, and the console does not
+	 * scroll so much as crawl. VMM_WC is Normal-NC on arm64 and a PAT WC slot
+	 * on x86: writes merge into bursts, and the panel sees the same bytes. */
+	fb_ptr = in_ram ? (volatile u8 *)(usize)fb.address
+	                : (volatile u8 *)vmm_map_mmio(fb.address, (usize)fb_size,
+	                                              VMM_WRITABLE | VMM_WC);
 	if (!fb_ptr) {
 		console_write("fb: mmio map failed\n");
 		return;
 	}
 	fb_shadow_size = (usize)fb_size;
-	fb_shadow_frames = (fb_shadow_size + PAGE_SIZE - 1) / PAGE_SIZE;
-	u64 fb_shadow_phys = pmm_alloc_frames(fb_shadow_frames);
-	if (fb_shadow_phys) {
-		fb_shadow = (u8 *)vmm_map_mmio(fb_shadow_phys, fb_shadow_size, VMM_WRITABLE);
+	if (in_ram) {
+		/* The panel's buffer already IS memory: scrolling can move rows
+		 * around in place, and a second copy of it would buy nothing. */
+		fb_shadow = (u8 *)(usize)fb.address;
+	} else {
+		fb_shadow_frames = (fb_shadow_size + PAGE_SIZE - 1) / PAGE_SIZE;
+		u64 fb_shadow_phys = pmm_alloc_frames(fb_shadow_frames);
+		if (fb_shadow_phys) {
+			/* Reached through the direct map, not the MMIO window. These are
+			 * ordinary frames from the page allocator — the console memsets
+			 * and memmoves them like the normal memory they are — but
+			 * vmm_map_mmio hands out Device mappings to any caller that does
+			 * not ask for write-combining, so the shadow was uncacheable and
+			 * every glyph was drawn at bus speed before it was ever blitted. */
+			fb_shadow = (u8 *)(usize)(vmm_direct_map_base() + fb_shadow_phys);
+		}
 	}
 	if (!fb_shadow) {
 		console_write("fb: shadow alloc failed (using direct mmio)\n");
@@ -97,14 +162,19 @@ void fb_console_init(void)
 	}
 
 	cursor_x = 0;
-	cursor_y = 0;
+	cursor_y = fb_top;
 
-	// Clear screen
-	for (u32 y = 0; y < fb.height; y++) {
+	// Clear screen (below anything frozen)
+	for (u32 y = fb_top; y < fb.height; y++) {
 		for (u32 x = 0; x < fb.width; x++) {
 			put_pixel(x, y, bg_color);
 		}
 	}
+	/* Push it to the panel. put_pixel writes the shadow, and only regions
+	 * something later draws over get presented — so every part of the screen
+	 * the splash and the log never touch kept whatever the bootloader (and
+	 * boot.S's FBMARK bands) left there, for the life of the boot. */
+	fb_present_rect(0, 0, fb.width, fb.height);
 }
 
 void fb_console_clear(void)
@@ -112,18 +182,59 @@ void fb_console_clear(void)
     if (!fb_ptr) return;
 
 	cursor_x = 0;
-	cursor_y = 0;
+	cursor_y = fb_top;
 
 	if (fb_dev_claimed()) return;
 
-	for (u32 y = 0; y < fb.height; y++) {
+	for (u32 y = fb_top; y < fb.height; y++) {
 		for (u32 x = 0; x < fb.width; x++) {
 			put_pixel(x, y, bg_color);
 		}
 	}
+	fb_present_rect(0, 0, fb.width, fb.height);
+	fb_console_flush();
 }
 
-static const u32 FONT_SCALE = 1;
+/* Each font pixel becomes this many screen pixels. One is right for a monitor;
+ * a 1080x2520 phone panel at that scale is 135 columns of 8-pixel text, which
+ * is present on screen but not readable by a person holding it. The phone
+ * build passes 3. */
+#ifndef FB_CONSOLE_FONT_SCALE
+#define FB_CONSOLE_FONT_SCALE 1
+#endif
+static u32 FONT_SCALE = FB_CONSOLE_FONT_SCALE;
+
+/* Change the magnification at runtime. The boot splash is ~100 columns of
+ * ASCII art: at the scale that makes the log readable on a phone the panel
+ * only holds 45, so it wraps into noise. Draw it at 1, then go back. Resets
+ * the cursor, since a cell that changed size makes the old position
+ * meaningless. */
+void fb_console_set_font_scale(u32 scale)
+{
+	if (scale < 1)
+		scale = 1;
+	if (scale > 8)
+		scale = 8;
+	FONT_SCALE = scale;
+	cursor_x = 0;
+	cursor_y = fb_top;
+}
+
+/* Keep everything drawn so far. The console starts on the next line and never
+ * touches anything above it again — not when it scrolls, not when it clears.
+ * This is what leaves the boot splash on screen for the life of the boot. */
+void fb_console_freeze_top(void)
+{
+	fb_top = cursor_y;
+	cursor_x = 0;
+}
+
+void fb_console_set_top(u32 top_y)
+{
+	fb_top = top_y;
+	cursor_x = 0;
+	cursor_y = top_y;
+}
 
 /* M107: the console face is replaceable at runtime (setfont / PIO_FONT /
  * KDFONTOP). The builtin 8x8 bitmap is the default; a loaded face is 8 pixels
@@ -200,11 +311,12 @@ static void fb_console_scroll(void)
     if (fb.height < line_height) return;
 
     u32 bytes_per_line = fb.pitch;
-    u32 scroll_height = fb.height - line_height;
+    if (fb.height < fb_top + line_height) return;
+    u32 scroll_height = fb.height - line_height - fb_top;
 
     if (fb_shadow) {
-        u8 *dst = fb_shadow;
-        u8 *src = fb_shadow + (line_height * bytes_per_line);
+        u8 *dst = fb_shadow + ((u64)fb_top * bytes_per_line);
+        u8 *src = dst + (line_height * bytes_per_line);
         memmove(dst, src, scroll_height * bytes_per_line);
 
         u8 *tail = dst + scroll_height * bytes_per_line;
@@ -212,7 +324,8 @@ static void fb_console_scroll(void)
         u64 *tail64 = (u64 *)(void *)tail;
         u32 words = (line_height * bytes_per_line) / 8;
         for (u32 i = 0; i < words; i++) tail64[i] = bg64;
-        fb_flush_rect(0, 0, fb.width, fb.height);
+        fb_flush_rect(0, fb_top, fb.width, fb.height - fb_top);
+        fb_present_rect(0, fb_top, fb.width, fb.height - fb_top);
     } else {
         /* Safety fallback: avoid MMIO readback scrolling when no RAM shadow exists. */
         fb_console_clear();
@@ -265,6 +378,8 @@ void fb_console_blink_cursor(void)
             }
         }
     }
+    fb_present_rect(cursor_x, y_base, 8 * FONT_SCALE, FONT_SCALE);
+    fb_console_flush();
 }
 
 void fb_console_putchar(char c)
@@ -296,7 +411,7 @@ void fb_console_putchar(char c)
             } else if (c == 'H') {
                 int row = ansi_params[0] > 0 ? ansi_params[0] - 1 : 0;
                 int col = ansi_params[1] > 0 ? ansi_params[1] - 1 : 0;
-                cursor_y = row * FB_CELL_H;
+                cursor_y = fb_top + row * FB_CELL_H;
                 cursor_x = col * 8 * FONT_SCALE;
             } else if (c == 'm') {
                 for (int i = 0; i <= ansi_param_idx; i++) {
@@ -344,6 +459,7 @@ void fb_console_putchar(char c)
         }
     } else {
         fb_draw_char(c, cursor_x, cursor_y);
+        fb_present_rect(cursor_x, cursor_y, 8 * FONT_SCALE, FB_CELL_H);
         cursor_x += 8 * FONT_SCALE;
         if (cursor_x >= fb.width) {
             cursor_x = 0;
@@ -373,3 +489,49 @@ u32 fb_console_height(void) { return fb.height; }
 u32 fb_console_pitch(void) { return fb.pitch; }
 u8 fb_console_bpp(void) { return fb.bpp; }
 volatile void *fb_console_frontbuffer(void) { return (volatile void *)fb_ptr; }
+
+/*
+ * Test mode: prove that a character written to the console really lands in the
+ * framebuffer. Draws one glyph and counts the pixels in its cell that are not
+ * the background — a console that is wired up but drawing nothing (which is
+ * what a stubbed-out fb_console_putchar looks like from the outside) leaves
+ * the cell empty and fails here.
+ */
+void fb_console_selftest(void)
+{
+	u32 cx, cy, lit = 0;
+	u32 bytes_per_px;
+
+	if (!fb_ptr || fb_dev_claimed()) {
+		console_write("M107-FB: skip render (no framebuffer console)\n");
+		return;
+	}
+
+	cx = cursor_x;
+	cy = cursor_y;
+	bytes_per_px = fb.bpp / 8;
+	fb_console_putchar('X');
+	fb_console_flush();
+
+	for (u32 py = cy; py < cy + FB_CELL_H && py < fb.height; py++) {
+		for (u32 px = cx; px < cx + 8 * FONT_SCALE && px < fb.width; px++) {
+			u64 off = (u64)py * fb.pitch + (u64)px * bytes_per_px;
+
+			if ((*(volatile u32 *)(void *)(fb_ptr + off) & 0x00ffffffu) !=
+			    (bg_color & 0x00ffffffu))
+				lit++;
+		}
+	}
+	fb_console_putchar('\n');
+	console_write(lit ? "M107-FB: ok render\n" : "M107-FB: FAIL render\n");
+}
+
+/*
+ * Note on the aarch64 panel: the drawing above is cheap (stores into a RAM
+ * frame) but fb_panel_present hands that frame to virtio-gpu, and the device's
+ * queue has other users - the DRM layer and a userspace display server. Mirror
+ * every line of kernel log through it and those two fight over the same queue,
+ * which is why console_putc on that architecture writes to serial and the VT
+ * buffer only. The console renders and presents on demand (fb_console_selftest
+ * proves the whole path); it is not a second, unsynchronised writer to the GPU.
+ */

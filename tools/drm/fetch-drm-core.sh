@@ -71,10 +71,27 @@ tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
 # drivers/gpu/drm/i915/*.c as well and stages 478 MiB of vendor drivers that
 # nothing builds.
 mkdir -p "$STAGE_DIR.tmp/drivers/gpu/drm"
-tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
-	--wildcards --no-wildcards-match-slash \
-	"linux-${LINUX_VERSION}/drivers/gpu/drm/*.c" \
-	"linux-${LINUX_VERSION}/drivers/gpu/drm/*.h"
+# --wildcards/--no-wildcards-match-slash are GNU tar's. bsdtar (macOS) has
+# neither, and its `*` crosses `/` with no way to say otherwise — which would
+# stage the vendor drivers this is written to avoid. There, name the members
+# explicitly instead: one pass over the archive index, filtered to exactly the
+# top-level .c/.h, and fed back through --files-from.
+if tar --version 2>/dev/null | grep -qi "GNU tar"; then
+	tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
+		--wildcards --no-wildcards-match-slash \
+		"linux-${LINUX_VERSION}/drivers/gpu/drm/*.c" \
+		"linux-${LINUX_VERSION}/drivers/gpu/drm/*.h"
+else
+	_members="$STAGE_DIR.tmp/.drm-core-members"
+	tar -tf "$TAR_PATH" |
+		grep -E "^linux-${LINUX_VERSION}/drivers/gpu/drm/[^/]+\.(c|h)$" > "$_members"
+	[ -s "$_members" ] || {
+		echo "fetch-drm-core: no top-level drm sources matched in $TAR_PATH" >&2
+		exit 1
+	}
+	tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 -T "$_members"
+	rm -f "$_members"
+fi
 
 # The display helpers (DisplayPort, DSC, HDCP, SCDC, HDMI) and TTM. Both are
 # separate modules upstream — drm_display_helper.ko and ttm.ko — and both are

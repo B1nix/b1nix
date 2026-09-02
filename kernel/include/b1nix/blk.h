@@ -19,6 +19,7 @@ enum blk_bus {
 	BLK_BUS_MD,      /* software RAID — an array over other block devices */
 	BLK_BUS_NBD,     /* a remote export reached over TCP */
 	BLK_BUS_MTD,     /* raw flash, through the MTD layer */
+	BLK_BUS_MMC,     /* SD/MMC — named mmcblk* */
 };
 
 /* What one command to this device may carry. Linux keeps the same three
@@ -120,6 +121,7 @@ void blk_clear_dirty_owner(void);
 /* Write back only the dirty blocks stamped with this owner (plus unstamped
  * ones), then flush the device. */
 int blk_cache_flush_inode(struct block_device *dev, u32 fsid, u64 ino);
+int blk_cache_writeback_inode(struct block_device *dev, u32 fsid, u64 ino);
 
 #define BLK_CACHE_DIRTY 0x01
 #define BLK_CACHE_VALID 0x02

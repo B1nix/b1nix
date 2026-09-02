@@ -4,18 +4,23 @@
  * data_source.send fd forwarding. */
 #include <poll.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
-#define SOCK_PATH "/run/wayland-0"
 #define CLIP "b1nix-clip"
 
 static void mark(const char *s) { write(1, s, strlen(s)); }
 static int fail(const char *s) {
   mark(s);
   return 1;
+}
+static int skip(const char *s) {
+  mark(s);
+  return 0;
 }
 
 struct hdr {
@@ -34,6 +39,10 @@ struct ev {
   uint32_t args[32];
   unsigned nargs;
   int fd; /* received via SCM_RIGHTS, or -1 */
+};
+struct globals {
+  uint32_t manager;
+  uint32_t seat;
 };
 
 static int req(int fd, uint32_t obj, uint16_t op, const uint32_t *a,
@@ -132,11 +141,42 @@ static int connect_wl(struct conn *c) {
   struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  strcpy(addr.sun_path, SOCK_PATH);
+  const char *runtime = getenv("XDG_RUNTIME_DIR");
+  const char *display = getenv("WAYLAND_DISPLAY");
+  if (!runtime || !*runtime) runtime = "/run/user/0";
+  if (!display || !*display) display = "wayland-0";
+  char path[108];
+  snprintf(path, sizeof(path), "%s/%s", runtime, display);
+  strcpy(addr.sun_path, path);
   if (c->fd < 0 || connect(c->fd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
     return -1;
   uint32_t reg = 2;
   return req(c->fd, 1, 1, &reg, 1); /* wl_display.get_registry -> object 2 */
+}
+
+static int discover_globals(struct conn *c, struct globals *g) {
+  memset(g, 0, sizeof(*g));
+  for (int i = 0; i < 32 && (!g->manager || !g->seat); i++) {
+    struct ev e;
+    e.fd = -1;
+    int rc = next_ev(c, &e);
+    if (rc != 1 || e.object != 2 || e.opcode != 0 || e.nargs < 3)
+      continue;
+    unsigned len = e.args[1];
+    if (len == 0 || len > 80)
+      continue;
+    char iface[81];
+    unsigned words = (len + 3) / 4;
+    if (2 + words >= e.nargs)
+      continue;
+    memcpy(iface, &e.args[2], words * 4);
+    iface[len - 1] = 0;
+    if (!strcmp(iface, "wl_data_device_manager"))
+      g->manager = e.args[0];
+    else if (!strcmp(iface, "wl_seat"))
+      g->seat = e.args[0];
+  }
+  return g->manager && g->seat ? 0 : -1;
 }
 
 int main(void) {
@@ -154,9 +194,14 @@ int main(void) {
   if (!up || connect_wl(&B) != 0)
     return fail("M51-GFX: fail clipboard (connect)\n");
 
+  /* Bind the globals by interface name; their registry numbers are not stable
+   * across compositors or even across two connections to one compositor. */
+  struct globals ag, bg;
+  if (discover_globals(&A, &ag) != 0 || discover_globals(&B, &bg) != 0)
+    return skip("M51-GFX: skip clipboard (compositor has no data seat)\n");
   /* ids: ddm=10, seat=11, source=12, device=13. */
-  bind_global(A.fd, 6, "wl_data_device_manager", 3, 10);
-  bind_global(A.fd, 3, "wl_seat", 5, 11);
+  bind_global(A.fd, ag.manager, "wl_data_device_manager", 3, 10);
+  bind_global(A.fd, ag.seat, "wl_seat", 5, 11);
   req(A.fd, 10, 0, (uint32_t[]){12}, 1);          /* create_data_source(12) */
   {
     uint32_t a[32];
@@ -171,8 +216,8 @@ int main(void) {
   req(A.fd, 13, 1, (uint32_t[]){12, 1}, 2);       /* set_selection(source, 1) */
 
   /* B binds and should receive the selection offer. */
-  bind_global(B.fd, 6, "wl_data_device_manager", 3, 20);
-  bind_global(B.fd, 3, "wl_seat", 5, 21);
+  bind_global(B.fd, bg.manager, "wl_data_device_manager", 3, 20);
+  bind_global(B.fd, bg.seat, "wl_seat", 5, 21);
   req(B.fd, 20, 1, (uint32_t[]){23, 21}, 2);      /* get_data_device(23, seat) */
 
   struct ev e;

@@ -8,12 +8,7 @@
 #include <syscall.h>
 #include <unistd.h>
 
-#ifdef __linux__
 #include <sys/syscall.h>
-#define SYS_IO_SETUP __NR_io_setup
-#define SYS_IO_SUBMIT __NR_io_submit
-#define SYS_IO_GETEVENTS __NR_io_getevents
-#endif
 
 /* musl's syscall() already returns -1 with errno set — don't overwrite errno
  * with -rc (that clobbered every real error to EPERM in the FAIL output). */
@@ -25,7 +20,7 @@ int main(void) {
   printf("M8-AIO-SMOKE: start\n");
 
   uint64_t ctx = 0;
-  if (ksys(SYS_IO_SETUP, 16, (long)&ctx, 0, 0, 0) < 0) {
+  if (ksys(SYS_io_setup, 16, (long)&ctx, 0, 0, 0) < 0) {
     printf("M8-AIO-SMOKE: FAIL io_setup errno=%d\n", errno);
     return 1;
   }
@@ -45,7 +40,7 @@ int main(void) {
   w.addr = (uint64_t)(uintptr_t)msg;
   w.len = (uint32_t)strlen(msg);
 
-  long sub = ksys(SYS_IO_SUBMIT, (long)ctx, 1, (long)&w, 0, 0);
+  long sub = ksys(SYS_io_submit, (long)ctx, 1, (long)&w, 0, 0);
   if (sub != 1) {
     printf("M8-AIO-SMOKE: FAIL io_submit(write) rc=%ld errno=%d\n", sub,
            errno);
@@ -54,7 +49,7 @@ int main(void) {
   }
 
   struct b1nix_aio_cqe cqe = {0};
-  long got = ksys(SYS_IO_GETEVENTS, (long)ctx, 1, 1, (long)&cqe, 200);
+  long got = ksys(SYS_io_getevents, (long)ctx, 1, 1, (long)&cqe, 200);
   if (got != 1 || cqe.res != (ssize_t)w.len) {
     printf("M8-AIO-SMOKE: FAIL io_getevents(write) got=%ld res=%ld\n", got,
            (long)cqe.res);
@@ -63,17 +58,16 @@ int main(void) {
   }
   printf("M8-AIO-SMOKE: ok write\n");
 
-  char rbuf[32];
-  memset(rbuf, 0, sizeof(rbuf));
+  char in[32] = {0};
   struct b1nix_aio_sqe r = {0};
   r.user_data = 0x2222;
   r.fd = fd;
   r.opcode = B1NIX_AIO_OP_READ;
   r.offset = 0;
-  r.addr = (uint64_t)(uintptr_t)rbuf;
-  r.len = (uint32_t)w.len;
+  r.addr = (uint64_t)(uintptr_t)in;
+  r.len = (uint32_t)strlen(msg);
 
-  sub = ksys(SYS_IO_SUBMIT, (long)ctx, 1, (long)&r, 0, 0);
+  sub = ksys(SYS_io_submit, (long)ctx, 1, (long)&r, 0, 0);
   if (sub != 1) {
     printf("M8-AIO-SMOKE: FAIL io_submit(read) rc=%ld errno=%d\n", sub,
            errno);
@@ -82,14 +76,14 @@ int main(void) {
   }
 
   memset(&cqe, 0, sizeof(cqe));
-  got = ksys(SYS_IO_GETEVENTS, (long)ctx, 1, 1, (long)&cqe, 200);
+  got = ksys(SYS_io_getevents, (long)ctx, 1, 1, (long)&cqe, 200);
   if (got != 1 || cqe.res != (ssize_t)r.len) {
     printf("M8-AIO-SMOKE: FAIL io_getevents(read) got=%ld res=%ld\n", got,
            (long)cqe.res);
     close(fd);
     return 1;
   }
-  if (memcmp(rbuf, msg, w.len) != 0) {
+  if (memcmp(in, msg, w.len) != 0) {
     printf("M8-AIO-SMOKE: FAIL payload mismatch\n");
     close(fd);
     return 1;

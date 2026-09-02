@@ -69,6 +69,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h> /* musl's per-arch numbers, before any b1nix fallback */
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/syscall.h>
@@ -1310,9 +1311,12 @@ static void test_proc_maps_labels(void) {
    * increment outright (it is a stub that returns ENOMEM by design), so the
    * break has to be grown through the syscall — otherwise there is no brk
    * region for [heap] to describe and this would test the libc, not b1nix. */
-  unsigned long base = (unsigned long)syscall(12 /* SYS_brk */, 0);
+  /* __NR_brk, not a hardcoded 12: that is the x86_64 number, and on aarch64 it
+   * names something else entirely, so the break never grew and [heap] had
+   * nothing to describe. */
+  unsigned long base = (unsigned long)syscall(__NR_brk, 0);
   unsigned long want = base + 2 * 4096;
-  unsigned long got = (unsigned long)syscall(12, want);
+  unsigned long got = (unsigned long)syscall(__NR_brk, want);
   unsigned long heap_addr = (got == want) ? base : 0;
 
   FILE *f = fopen("/proc/self/maps", "r");

@@ -4,12 +4,15 @@
  * M99 linuxkpi: allocator shims, ioremap, dma-mapping, sleeping mutex.
  */
 
+#include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/iommu.h>
 #include <b1nix/memtype.h>
 #include <b1nix/mm.h>
+#include <b1nix/klog.h>
 #include <b1nix/sched.h>
+
 #include <lkpi/dma-mapping.h>
 #include <lkpi/io.h>
 #include <lkpi/lock.h>
@@ -937,7 +940,7 @@ void lkpi_mutex_lock(struct lkpi_mutex *m)
 			/* Early boot / interrupt context: spin instead of parking. A
 			 * driver taking a mutex there is a bug, but hanging the machine
 			 * is a worse way to report it than making progress. */
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}
@@ -959,11 +962,16 @@ void lkpi_mutex_unlock(struct lkpi_mutex *m)
 		return;
 	u64 flags;
 	spin_lock_irqsave(&m->guard, &flags);
+	if (!m->locked || m->owner != lkpi_current_id()) {
+		spin_unlock_irqrestore(&m->guard, flags);
+		panic("mutex_unlock: unlocking unheld mutex or caller is not lock owner");
+	}
 	m->locked = 0;
 	m->owner = 0;
 	spin_unlock_irqrestore(&m->guard, flags);
 	scheduler_wake_all(m);
 }
+
 
 int lkpi_mutex_is_locked_by_current(struct lkpi_mutex *m)
 {

@@ -24,7 +24,7 @@ SRC_DIR="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/llvm-project-${LLVM_VER}.src"
 INSTALL_DIR="$BUILD_HOME/libcxx-install"
 RT_BUILD="$BUILD_HOME/build-runtimes"
 
-MUSL_SYSROOT="$PROJECT_DIR/build/x86_64/ports/musl/install"
+MUSL_SYSROOT="$PROJECT_DIR/build/${B1NIX_ARCH:-x86_64}/ports/musl/install"
 
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then NPROC=$(sysctl -n hw.ncpu); else NPROC=$(nproc); fi
@@ -40,8 +40,10 @@ fi
 # convention (usr/lib, usr/include), so bridge the two with symlinks rather
 # than duplicating the flat install under usr/.
 mkdir -p "$MUSL_SYSROOT/usr"
-ln -sfn ../lib "$MUSL_SYSROOT/usr/lib"
-ln -sfn ../include "$MUSL_SYSROOT/usr/include"
+[ -e "$MUSL_SYSROOT/usr/lib" ] || ln -sfn ../lib "$MUSL_SYSROOT/usr/lib" 2>/dev/null || true
+[ -e "$MUSL_SYSROOT/usr/include" ] || ln -sfn ../include "$MUSL_SYSROOT/usr/include" 2>/dev/null || true
+
+
 
 [ -f "$MUSL_SYSROOT/usr/lib/libc.a" ] || { echo "musl libc not built — run build-musl.sh first" >&2; exit 1; }
 
@@ -194,14 +196,16 @@ echo "Linking shared libc++abi.so.1..."
     --version-script "$VSCRIPT" \
     --allow-shlib-undefined
 rm -f "$VSCRIPT"
-ln -sf libc++abi.so.1 "$MUSL_SYSROOT/usr/lib/libc++abi.so"
+rm -f "$MUSL_SYSROOT/usr/lib/libc++abi.so" 2>/dev/null || true
+ln -s libc++abi.so.1 "$MUSL_SYSROOT/usr/lib/libc++abi.so" 2>/dev/null || true
 
 echo "Linking shared libc++.so.1..."
 "$LD_BIN" -shared --hash-style=sysv -soname libc++.so.1 --eh-frame-hdr -o "$CXX_SO" \
     --whole-archive "$MUSL_SYSROOT/usr/lib/libc++.a" --no-whole-archive \
     -L"$MUSL_SYSROOT/usr/lib" -l:libc++abi.so.1 -l:libc.so "$CRT_A" \
     --allow-shlib-undefined
-ln -sf libc++.so.1 "$MUSL_SYSROOT/usr/lib/libc++.so"
+rm -f "$MUSL_SYSROOT/usr/lib/libc++.so" 2>/dev/null || true
+ln -s libc++.so.1 "$MUSL_SYSROOT/usr/lib/libc++.so" 2>/dev/null || true
 
 # Rewrite absolute-path DT_NEEDED entries to bare basenames.
 # ld.lld with `-l:libc.so` (full filename) records the *resolved input path*
@@ -224,9 +228,11 @@ rewrite_needed() {
     fi
 }
 
+READELF_BIN="$(command -v readelf 2>/dev/null || command -v llvm-readelf 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-readelf)"
+
 for so in "$ABI_SO" "$CXX_SO"; do
     # Collect current DT_NEEDED entries that look like absolute paths.
-    needed_list=$("$READELF" -d "$so" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p')
+    needed_list=$("$READELF_BIN" -d "$so" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p')
     for n in $needed_list; do
         case "$n" in
             */libc.so)
@@ -242,9 +248,9 @@ done
 # Verify: no absolute-path DT_NEEDED survived (a silent miss here breaks every
 # dynamically-linked C++ binary at load time — better to fail the build).
 for so in "$ABI_SO" "$CXX_SO"; do
-    if "$READELF" -d "$so" 2>/dev/null | grep -q 'NEEDED.*\[/'; then
+    if "$READELF_BIN" -d "$so" 2>/dev/null | grep -q 'NEEDED.*\[/'; then
         echo "build-libcxx-musl.sh: ERROR — absolute-path DT_NEEDED remains in $so:" >&2
-        "$READELF" -d "$so" 2>/dev/null | grep 'NEEDED.*\[/' >&2
+        "$READELF_BIN" -d "$so" 2>/dev/null | grep 'NEEDED.*\[/' >&2
         exit 1
     fi
 done
@@ -252,8 +258,14 @@ done
 # stage to rootfs
 for d in "$PROJECT_DIR/build/$B1NIX_ARCH/rootfs/lib"; do
     mkdir -p "$d"
-    cp -f "$ABI_SO" "$d/libc++abi.so.1"; ln -sf libc++abi.so.1 "$d/libc++abi.so"
-    cp -f "$CXX_SO"  "$d/libc++.so.1";   ln -sf libc++.so.1    "$d/libc++.so"
+    cp -f "$ABI_SO" "$d/libc++abi.so.1"
+    rm -f "$d/libc++abi.so" 2>/dev/null || true
+    ln -s libc++abi.so.1 "$d/libc++abi.so" 2>/dev/null || true
+    cp -f "$CXX_SO"  "$d/libc++.so.1"
+    rm -f "$d/libc++.so" 2>/dev/null || true
+    ln -s libc++.so.1    "$d/libc++.so" 2>/dev/null || true
 done
+
+
 
 echo "build-libcxx-musl.sh: libc++ built and installed successfully for musl!"

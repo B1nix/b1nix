@@ -366,9 +366,17 @@ struct timespec {
 #define B1NIX_EPOLLET  (1u << 31)
 #define B1NIX_EPOLLONESHOT (1u << 30)
 
-/* Packed to match the Linux x86_64 ABI (12 bytes: no padding between the
- * 4-byte events word and the 8-byte data union). The same layout is used on
- * i386 where the struct is naturally 12 bytes. */
+/* The packing is x86_64's, not epoll's. Linux packs this struct on x86_64 alone
+ * (EPOLL_PACKED in arch/x86's uapi, so a 32-bit process sees the same 12 bytes
+ * as a 64-bit one); every other architecture leaves it naturally aligned, and
+ * musl's <sys/epoll.h> says exactly the same thing with `#ifdef __x86_64__`.
+ *
+ * Packing it everywhere put `data` at offset 4 for a kernel that talks to an
+ * aarch64 userspace expecting it at offset 8: epoll_wait handed back events
+ * whose data word was half the events mask and half the caller's pointer.
+ * Crashpad's exception server dereferences `data.ptr` straight out of that
+ * array, so its handler process died with SIGSEGV on a garbage address the
+ * moment a client connected — and the minidump was never written. */
 struct b1nix_epoll_event {
   u32 events;
   union {
@@ -377,7 +385,11 @@ struct b1nix_epoll_event {
     int fd;
     u32 u32;
   } data;
-} __attribute__((packed));
+}
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((packed))
+#endif
+;
 
 struct b1nix_itimerspec {
   struct timespec it_interval; /* period for repeating timers */

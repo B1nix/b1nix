@@ -16,6 +16,7 @@
  * that never takes another lock is not a bug — it simply completes.
  */
 
+#include <b1nix/arch.h>
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
 #include <b1nix/sched.h>
@@ -148,7 +149,7 @@ int ww_mutex_lock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 			/* Cannot park (early boot or interrupt context). Spinning is wrong
 			 * for a submission path but right here: the alternative is wedging
 			 * the CPU, and TLB shootdowns still have to be serviced. */
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}
@@ -188,7 +189,7 @@ void ww_mutex_lock_slow(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 			return;
 
 		if (!scheduler_can_block()) {
-			__asm__ volatile("pause");
+			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
 		}

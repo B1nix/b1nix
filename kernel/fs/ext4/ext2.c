@@ -1722,7 +1722,17 @@ int ext2_mount_root(const char *device_name, const char *mount_point) {
 
 void ext2_init(void) {
   vfs_register_fs(&ext2_fs);
+#if !defined(__aarch64__)
   /* The vfs_mount calls will trigger ext2_vfs_mount_cb which handles allocation */
   if (vfs_mount("vda", "/", "ext2", 0) == 0) return;
   if (vfs_mount("vdb", "/mnt/ext2", "ext2", 0) == 0) return;
+#else
+  /* aarch64: vda IS the root disk, and an ext4 image made without
+   * metadata_csum/64bit mounts happily through the ext2 driver — so this
+   * bootstrap grabbed "/" here, replacing the initramfs before the kernel had
+   * loaded its modules from it (request_module then failed with -ENOENT for
+   * every one) and running the whole system on the ext2 driver instead of
+   * ext4. main.c owns the root mount on this arch; registering the filesystem
+   * is all that belongs here. */
+#endif
 }

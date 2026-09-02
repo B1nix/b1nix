@@ -100,23 +100,70 @@ static long long clock_ns(clockid_t id) {
   return ns_of(&ts);
 }
 
-/* Burn CPU for at least `ms` milliseconds of WALL time, doing work the compiler
- * cannot fold away. Wall time is the right bound here: the point of the test is
- * that CPU time tracks work, so it must not be measured with the clock under
- * test. */
 static volatile unsigned long g_sink;
+
+/* Burn at least `ms` milliseconds of this thread's own CPU TIME, doing work the
+ * compiler cannot fold away.
+ *
+ * It used to bound the loop by wall time, and that is not the same quantity on
+ * a machine that is sharing a host. The suite runs four QEMU instances at once
+ * under TCG, so a thread can spend 120 ms of wall clock and be given four
+ * milliseconds of CPU -- which is exactly what getrusage(RUSAGE_THREAD) then
+ * honestly reported, and what the >= 50 ms assertion below read as a kernel
+ * bug. Bounding by the thread clock makes the burn mean what its name says and
+ * the assertion sound at any host load.
+ *
+ * The wall-clock backstop is not a bound on the burn, it is a bound on the
+ * damage if CLOCK_THREAD_CPUTIME_ID never advances: without it a broken thread
+ * clock would hang the instance instead of failing the check that is here to
+ * catch it. */
 static void burn_ms(int ms) {
-  struct timespec start, now;
-  clock_gettime(CLOCK_MONOTONIC, &start);
+  struct timespec wall0, now;
+  long long cpu0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
   unsigned long acc = 1;
+
+  clock_gettime(CLOCK_MONOTONIC, &wall0);
+  long long last_cpu = cpu0;
+  int advanced = 0;
   for (;;) {
     for (int i = 0; i < 200000; i++)
       acc = acc * 1103515245UL + 12345UL;
     g_sink = acc;
+
     clock_gettime(CLOCK_MONOTONIC, &now);
-    long long elapsed = (now.tv_sec - start.tv_sec) * 1000LL +
-                        (now.tv_nsec - start.tv_nsec) / 1000000LL;
-    if (elapsed >= ms)
+    long long wall = (now.tv_sec - wall0.tv_sec) * 1000LL +
+                     (now.tv_nsec - wall0.tv_nsec) / 1000000LL;
+    if (cpu0 < 0) {
+      /* No thread clock at all: fall back to wall time so the check that is
+       * about to fail still gets to run. */
+      if (wall >= ms)
+        return;
+      continue;
+    }
+
+    long long cpu = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+    if (cpu >= 0 && cpu - cpu0 >= (long long)ms * 1000000LL)
+      return;
+
+    /* Give up only if the thread clock is STUCK, never merely because it is
+     * slow. A fixed wall-clock ceiling looked like the safe thing and was not:
+     * with four QEMU instances on one host a thread can be given a few percent
+     * of a CPU, so the ceiling cut the burn short and the caller then measured
+     * the shortfall rather than the kernel -- 29 ms of sibling time where the
+     * test wanted 150. As long as the clock advances, keep burning. */
+    if (cpu > last_cpu) {
+      last_cpu = cpu;
+      advanced = 1;
+    }
+    /* "Broken" means the thread clock NEVER advances, not that it advances
+     * slowly. Both threads in this test burn at once, so on one vCPU under host
+     * contention either of them can go many seconds without being scheduled --
+     * and a 5 s no-progress rule cut the sibling's burn short, leaving the
+     * caller to measure the shortfall (25 ms of sibling time where the test
+     * wanted 150). Once the clock has moved at all it is working; keep burning
+     * until the target, under a generous absolute ceiling so a wedge is still
+     * bounded. */
+    if ((!advanced && wall > 10000) || wall > 60000)
       return;
   }
 }
@@ -155,6 +202,8 @@ static void test_thread_cputime(void) {
 struct burner_arg {
   int ms;
   long long cpu_ns;   /* thread's own CPU time, filled in by the thread */
+  long long own_u_us; /* ...split into user and system, by the same thread */
+  long long own_s_us;
   pid_t tid;
   clockid_t clk;
   volatile int started;
@@ -165,8 +214,22 @@ static void *burner_entry(void *p) {
   a->tid = my_tid();
   a->started = 1;
   long long t0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+  struct rusage r0;
+  if (getrusage(RUSAGE_THREAD, &r0) != 0)
+    memset(&r0, 0, sizeof(r0));
   burn_ms(a->ms);
   a->cpu_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID) - t0;
+  /* This thread's own view of the time it just burned, split into user and
+   * system. The group total is assembled from exactly these numbers, so when
+   * the two disagree the diagnostic in test_rusage_and_times can say which
+   * side lost them. */
+  struct rusage r1;
+  if (getrusage(RUSAGE_THREAD, &r1) == 0) {
+    a->own_u_us = (long long)(r1.ru_utime.tv_sec - r0.ru_utime.tv_sec) * 1000000LL +
+                  (r1.ru_utime.tv_usec - r0.ru_utime.tv_usec);
+    a->own_s_us = (long long)(r1.ru_stime.tv_sec - r0.ru_stime.tv_sec) * 1000000LL +
+                  (r1.ru_stime.tv_usec - r0.ru_stime.tv_usec);
+  }
   return (void *)0x8686;
 }
 
@@ -288,6 +351,16 @@ static void test_rusage_and_times(void) {
     return;
   }
   burn_ms(120);
+  /* The group total with the sibling STILL ALIVE, so its time is being summed
+   * from its live slot rather than from whatever the exit path folded into the
+   * leader. If this already falls short, the loss is in the live accounting; if
+   * only the post-join figure does, the loss is in the fold. */
+  struct rusage self_live;
+  long long live_us = 0;
+  if (getrusage(RUSAGE_SELF, &self_live) == 0)
+    live_us = (long long)(self_live.ru_utime.tv_sec - self0.ru_utime.tv_sec) *
+                  1000000LL +
+              (self_live.ru_utime.tv_usec - self0.ru_utime.tv_usec);
   pthread_join(th, 0);
 
   struct rusage self1, thr1;
@@ -310,6 +383,36 @@ static void test_rusage_and_times(void) {
   /* RUSAGE_SELF covers this thread AND the sibling, so it must exceed the
    * calling thread's own time by roughly the sibling's burn. */
   if (self_us < thr_us + 50000) {
+    /* Say WHICH half is short. The sibling burns until its thread clock --
+     * user PLUS system -- has advanced 150 ms, but this check reads ru_utime
+     * alone, so a kernel that credits a compute loop's time to the wrong half
+     * fails here with no hint that the split is the problem rather than the
+     * total. Report both. */
+    long long self_sys =
+        (long long)(self1.ru_stime.tv_sec - self0.ru_stime.tv_sec) * 1000000LL +
+        (self1.ru_stime.tv_usec - self0.ru_stime.tv_usec);
+    long long thr_sys =
+        (long long)(thr1.ru_stime.tv_sec - thr0.ru_stime.tv_sec) * 1000000LL +
+        (thr1.ru_stime.tv_usec - thr0.ru_stime.tv_usec);
+    char d[160];
+    snprintf(d, sizeof(d),
+             "M86-SMOKE: note rusage-split d_self_u=%ldms d_thr_u=%ldms "
+             "d_live_u=%ldms sib_cpu=%ldms sib_u=%ldms sib_s=%ldms "
+             "abs self0=%ldms self1=%ldms thr0=%ldms thr1=%ldms "
+             "self_s=%ldms thr_s=%ldms",
+             (long)(self_us / 1000), (long)(thr_us / 1000),
+             (long)(live_us / 1000), (long)(a.cpu_ns / 1000000),
+             (long)(a.own_u_us / 1000), (long)(a.own_s_us / 1000),
+             (long)(self0.ru_utime.tv_sec * 1000 +
+                    self0.ru_utime.tv_usec / 1000),
+             (long)(self1.ru_utime.tv_sec * 1000 +
+                    self1.ru_utime.tv_usec / 1000),
+             (long)(thr0.ru_utime.tv_sec * 1000 +
+                    thr0.ru_utime.tv_usec / 1000),
+             (long)(thr1.ru_utime.tv_sec * 1000 +
+                    thr1.ru_utime.tv_usec / 1000),
+             (long)(self_sys / 1000), (long)(thr_sys / 1000));
+    marker(d);
     fail("rusage-self-group", (long)((self_us - thr_us) / 1000));
     return;
   }
@@ -849,6 +952,86 @@ static void test_kill_unblocked(void) {
   check("kill-unblocked", handled == (int)tid, (long)handled);
 }
 
+/* A signal HANDLER must also run in a task that is making no syscalls at all.
+ * Every other check here signals a target inside a syscall or about to enter
+ * one, so they pass on a kernel whose only delivery points are the syscall and
+ * fault paths. That was exactly aarch64: its IRQ handler took no register
+ * frame and never looked at pending signals, while x86_64 delivers from its
+ * timer vector. Default-action *termination* hides the gap, because the
+ * scheduler kills such a task itself on the next switch without needing a user
+ * frame — running a handler is the part that cannot be faked, since it has to
+ * rewrite the interrupted userspace context.
+ *
+ * The child's loop is finite on purpose: a kernel that never delivers must fail
+ * this check, not hang the instance. It also has to OUTLAST the parent, which
+ * is the half that was wrong -- at four billion iterations the child finished
+ * its loop and became a zombie inside the parent's 100 ms sleep on a loaded
+ * host, and the check then failed on a kill to a pid that no longer had a live
+ * task rather than on anything about signal delivery. The bound is now far
+ * beyond any run's patience; what actually ends the child is the parent's
+ * SIGKILL below, after its own bounded wait. */
+static volatile sig_atomic_t g_compute_hit;
+
+static void compute_loop_handler(int sig) {
+  (void)sig;
+  g_compute_hit = 1;
+  _exit(7); /* the handler ran — report it through the exit status */
+}
+
+static void test_signal_compute_loop(void) {
+  pid_t pid = fork();
+  if (pid < 0) {
+    fail("signal-compute-loop-fork", -1);
+    return;
+  }
+  if (pid == 0) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = compute_loop_handler;
+    sigaction(SIGUSR1, &sa, 0);
+    /* No syscalls past this point, deliberately. */
+    volatile unsigned long acc = 1;
+    for (unsigned long i = 0; i < 400000000000UL; i++)
+      acc = acc * 1103515245UL + 12345UL;
+    _exit(g_compute_hit ? 7 : 0); /* 0 = the handler never ran */
+  }
+
+  usleep(100000); /* let the child leave fork bookkeeping for the loop */
+  if (kill(pid, SIGUSR1) != 0) {
+    /* Say what became of the child. A failed kill is almost never about the
+     * kill: on a loaded host the child can finish its (deliberately finite)
+     * loop and become a zombie before the parent's 100 ms sleep returns, and
+     * "kill failed with errno 3" then hides the one fact that explains the
+     * run -- whether the child exited on its own or died of something. */
+    int s = 0;
+    kill(pid, SIGKILL);
+    if (waitpid(pid, &s, 0) == pid) {
+      char d[128];
+      snprintf(d, sizeof(d),
+               "M86-SMOKE: note compute-loop child already gone: %s %d",
+               WIFEXITED(s) ? "exited" : "signalled",
+               WIFEXITED(s) ? WEXITSTATUS(s) : WTERMSIG(s));
+      marker(d);
+    }
+    fail("signal-compute-loop-kill", -1);
+    return;
+  }
+
+  int status = 0;
+  for (int i = 0; i < 600; i++) { /* up to ~60 s; a working kernel takes one tick */
+    if (waitpid(pid, &status, WNOHANG) == pid) {
+      check("signal-compute-loop", WIFEXITED(status) && WEXITSTATUS(status) == 7,
+            WIFEXITED(status) ? (long)WEXITSTATUS(status)
+                              : -(long)WTERMSIG(status));
+      return;
+    }
+    usleep(100000);
+  }
+  kill(pid, SIGKILL);
+  { int s = 0; waitpid(pid, &s, 0); }
+  fail("signal-compute-loop", -2);
+}
+
 /* ── 4: pthread_exit ────────────────────────────────────────────────────── */
 
 static volatile int g_cleanup_ran;
@@ -963,6 +1146,7 @@ int main(void) {
   test_tkill_self();
   test_tgkill_thread();
   test_kill_unblocked();
+  test_signal_compute_loop();
 
   test_pthread_exit_retval();
   test_pthread_exit_main();

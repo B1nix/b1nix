@@ -191,7 +191,8 @@ int sysv_semop(int semid, const struct sysv_sembuf *ops, usize nops,
   usize pid = scheduler_get_pid();
   u64 deadline = 0;
   if (timeout_ms >= 0)
-    deadline = scheduler_get_uptime_ticks() + (u64)(timeout_ms / 10) + 1;
+    deadline = scheduler_get_uptime_ticks() +
+               (u64)timeout_ms * SCHED_TICKS_PER_SEC / 1000 + 1;
 
   while (1) {
     u64 flags;

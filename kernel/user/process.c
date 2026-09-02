@@ -1,3 +1,4 @@
+#include <b1nix/page_cache.h>
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
@@ -15,7 +16,8 @@
 #include <stdio.h>
 #include <string.h>
 
-extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv);
+extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv,
+                          usize kstack_top);
 extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 
 /* All user programs are Ring 3 ELFs loaded from VFS. The legacy C-level
@@ -106,8 +108,14 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define R_X86_64_64       1
 #define R_X86_64_COPY     5
 #define R_X86_64_GLOB_DAT 6
+#if defined(__aarch64__)
+#define ELF_R_RELATIVE 1027
+#else
+#define ELF_R_RELATIVE 8
+#endif
+
+/* PT_INTERP: the string we look for is /lib/ld-musl-x86_64.so.1 or similar */
 #define R_X86_64_JUMP_SLOT 7
-#define R_X86_64_RELATIVE 8
 #define R_X86_64_DTPMOD64 16
 #define R_X86_64_DTPOFF64 17
 #define R_X86_64_TPOFF64  18
@@ -133,7 +141,7 @@ static u8 *_vaddr_to_stage(struct user_loaded_image *image, u64 va, usize n) {
  * above the standard 0x400000 ET_EXEC load base and below the user
  * stack top (0x800000000000) so a PIE binary and the existing static
  * binaries don't collide. */
-#ifdef __x86_64__
+#if defined(__x86_64__) || defined(__aarch64__)
 #define PIE_LOAD_BASE 0x0000500000000000ULL
 #else
 #define PIE_LOAD_BASE 0x40000000ULL
@@ -149,12 +157,10 @@ static u8 *_vaddr_to_stage(struct user_loaded_image *image, u64 va, usize n) {
  * 0x600000000000 (1 TiB above the base). ET_EXEC images (load_base 0 — the
  * fixed-base toolchain/V8/rustc links) are never randomized. */
 static u64 aslr_pie_base(void) {
-#ifdef __x86_64__
   if (bootinfo_has_flag("b1nix.aslr")) {
     u64 slots = kernel_random_u64() & 0x7fff; /* 15 bits */
     return PIE_LOAD_BASE + slots * 0x200000ULL;
   }
-#endif
   return PIE_LOAD_BASE;
 }
 
@@ -248,11 +254,25 @@ static int elf64_load_interpreter(struct user_loaded_image *image,
   if (ehdr->e_ident[0] != ELF_MAGIC0 || ehdr->e_ident[1] != ELF_MAGIC1 ||
       ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3 ||
       ehdr->e_ident[4] != ELF_CLASS_64 || ehdr->e_type != ELF_TYPE_DYN ||
-      ehdr->e_machine != ELF_MACHINE_X86_64 ||
+      (ehdr->e_machine != ELF_MACHINE_X86_64 &&
+       ehdr->e_machine != ELF_MACHINE_AARCH64) ||
       ehdr->e_phentsize != sizeof(struct elf64_phdr) ||
       ehdr->e_phoff + (u64)ehdr->e_phnum * ehdr->e_phentsize > size) {
     kfree(data);
     return -1;
+  }
+  /* The node its text is shared from. Only a disk-backed file with a read_cb
+   * has page-cache pages to share; an initramfs ld.so has none and stays
+   * eager. */
+  if (!image->interp_node) {
+    struct vfs_node *in = vfs_find_node(path);
+
+    if (in && !IS_ERR(in)) {
+      if (in->inode && in->inode->read_cb)
+        image->interp_node = in;
+      else
+        vfs_node_put(in);
+    }
   }
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
     const struct elf64_phdr *ph =
@@ -272,7 +292,32 @@ static int elf64_load_interpreter(struct user_loaded_image *image,
     seg->filesz = ph->p_filesz;
     seg->flags = ph->p_flags;
     seg->file_offset = ph->p_offset;
-    seg->demand_ok = 0;
+    seg->from_interp = 1;
+    /* Read-only, page-congruent, and backed by a file the page cache can
+     * serve: share the cache's frames instead of staging a private copy.
+     *
+     * This is the most-loaded file on the system. Every dynamically linked
+     * program maps it, it is the same 723 KiB file every time, and the kernel
+     * does nothing to it -- the comment above this function says so: the
+     * interpreter self-relocates at its own entry point and the in-kernel
+     * linker plays no further part. Staging it privately cost about 1.4 MiB of
+     * allocate-zero-and-copy on every exec, and the aarch64 sys lane spends
+     * 72 of its ~180 seconds inside 401 busybox spawns alone.
+     *
+     * Note it is mapped EAGERLY from the cache, not demand-paged. Demand
+     * paging was tried and measured: it trades one bulk copy for ~180 page
+     * faults per exec on a file whose text is executed almost end to end, and
+     * the lane went from 177 s to 204 s. Sharing the frames wins; faulting for
+     * them does not. */
+    int interp_share = !(ph->p_flags & PF_W) && ph->p_filesz == ph->p_memsz &&
+                       (ph->p_vaddr & (PAGE_SIZE - 1)) ==
+                           (ph->p_offset & (PAGE_SIZE - 1)) &&
+                       image->interp_node != 0;
+    seg->demand_ok = (u8)interp_share;
+    if (interp_share) {
+      seg->data = 0; /* nothing to stage: the frames come from the cache */
+      continue;
+    }
     seg->data = kzalloc(ph->p_memsz ? ph->p_memsz : 1);
     if (!seg->data) {
       kfree(data);
@@ -517,13 +562,25 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
 
 static int user_image_read_vfs_file(const char *path, char **out_data,
                                     usize *out_size) {
+  /* Every failure here surfaces three frames up as a bare "failed to load
+   * <path>", which says nothing about which step broke — name the step. */
+#define READ_VFS_FAIL(reason, val)                                             \
+  do {                                                                         \
+    char _l[192];                                                              \
+    snprintf(_l, sizeof(_l), "user_image_read_vfs_file: %s (%s, rc=%ld)\n",    \
+             path, reason, (long)(val));                                       \
+    console_write(_l);                                                         \
+    return -1;                                                                 \
+  } while (0)
+
   struct vfs_node *node = vfs_find_node(path);
   if (!node || IS_ERR(node)) {
-    return -1;
+    READ_VFS_FAIL("vfs_find_node", node ? PTR_ERR(node) : 0);
   }
   if (node->inode->type != VFS_FILE || node->inode->size == 0) {
+    int t = node->inode->type;
     vfs_node_put(node);
-    return -1;
+    READ_VFS_FAIL("not a regular file / empty", t);
   }
 
   usize file_size = node->inode->size;
@@ -531,13 +588,13 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
 
   int fd = vfs_open(path);
   if (fd < 0) {
-    return -1;
+    READ_VFS_FAIL("vfs_open", fd);
   }
 
   char *data = kmalloc(file_size);
   if (!data) {
     vfs_close(fd);
-    return -1;
+    READ_VFS_FAIL("kmalloc", (long)file_size);
   }
 
   usize total_read = 0;
@@ -550,7 +607,7 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
       }
       vfs_close(fd);
       kfree(data);
-      return -1;
+      READ_VFS_FAIL("vfs_read", got);
     }
     if (got == 0)
       break; /* EOF */
@@ -560,8 +617,9 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
 
   if (total_read != file_size) {
     kfree(data);
-    return -1;
+    READ_VFS_FAIL("short read", (long)total_read);
   }
+#undef READ_VFS_FAIL
 
   *out_data = data;
   *out_size = total_read;
@@ -580,8 +638,14 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
 static int user_read_at(int fd, u64 off, void *buf, usize n) {
   if (n == 0)
     return 0;
-  if (vfs_lseek(fd, (isize)off, 0 /* SEEK_SET */) < 0)
+  isize sk = vfs_lseek(fd, (isize)off, 0 /* SEEK_SET */);
+  if (sk < 0) {
+    char _l[160];
+    snprintf(_l, sizeof(_l), "user_read_at: lseek fd=%d off=%lu failed rc=%ld\n",
+             fd, (unsigned long)off, (long)sk);
+    console_write(_l);
     return -1;
+  }
   usize done = 0;
   char *p = (char *)buf;
   while (done < n) {
@@ -631,7 +695,9 @@ static int elf64_is_linux_binary(int fd, const struct elf64_ehdr *ehdr,
     if (ilen == 0 || user_read_at(fd, ph->p_offset, interp, (usize)ilen) != 0)
       continue;
     interp[ilen - 1] = '\0'; /* the on-disk string is NUL-terminated */
-    if (strcmp(interp, "/lib/ld-musl-x86_64.so.1") == 0)
+    if (strcmp(interp, "/lib/ld-musl-x86_64.so.1") == 0 ||
+        strcmp(interp, "/lib/ld-musl-aarch64.so.1") == 0 ||
+        strcmp(interp, "/lib/ld-musl-i386.so.1") == 0)
       return 1;
   }
 
@@ -681,8 +747,12 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   int rc = -1;
   struct elf64_phdr *phdrs = 0;
   int fd = vfs_open(path);
-  if (fd < 0)
+  if (fd < 0) {
+    char _l[160];
+    snprintf(_l, sizeof(_l), "ELF load: vfs_open(%s) failed rc=%d\n", path, fd);
+    console_write(_l);
     return -1;
+  }
 
   /* Stream the image instead of slurping the whole file into the heap: read the
    * ELF header, then the program-header table, then copy each PT_LOAD straight
@@ -739,12 +809,15 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     console_write("\n");
     goto cleanup;
   }
-#else
-  console_write("ELF load: ARCH MISMATCH — 64-bit binary on 32-bit kernel, "
-                "refusing: ");
-  console_write(path);
-  console_write("\n");
-  goto cleanup;
+#elif defined(__aarch64__)
+  if (ehdr->e_machine != ELF_MACHINE_AARCH64) {
+    console_write("ELF load: ARCH MISMATCH — non-aarch64 binary (e_machine=0x");
+    console_write_hex64(ehdr->e_machine);
+    console_write(") on aarch64 kernel, refusing: ");
+    console_write(path);
+    console_write("\n");
+    goto cleanup;
+  }
 #endif
   /* phentsize must match so phdr-table reads and `&phdrs[i]` indexing are
    * well-formed; e_phnum must be non-zero for an executable. */
@@ -790,13 +863,12 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * translated at dispatch time. */
   if (elf64_is_linux_binary(fd, ehdr, phdrs)) {
     image->personality = PERSONALITY_LINUX;
-    /* Compose the whole line before writing: console_write() locks/unlocks
-     * per call, so multiple calls here would let another CPU's log line
-     * interleave mid-sentence (observed corrupting BusyBox test markers
-     * under SMP exec churn). */
-    char line[VFS_MAX_PATH + 64];
-    snprintf(line, sizeof(line), "ELF load: Linux personality detected: %s\n", path);
-    console_write(line);
+    /* Debug level, not unconditional. One line per exec is one line per
+     * `grep` a shell script forks, which on a board whose console is a
+     * 45-column panel is most of what is on the screen. kprintf composes the
+     * whole line before writing it, so the interleaving this used to avoid by
+     * hand is still avoided. */
+    k_info("elf", "Linux personality detected: %s", path);
   } else {
     image->personality = PERSONALITY_B1NIX;
   }
@@ -849,10 +921,10 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
      * line above stays at the default level because a smoke check asserts it,
      * and a test must not depend on how verbose the console is. */
     if (load_base)
-      k_dbg("elf", "load: %s entry=0x%lx (PIE base=0x%lx)", path,
+      k_info("elf", "load: %s entry=0x%lx (PIE base=0x%lx)", path,
             (unsigned long)image->entry, (unsigned long)load_base);
     else
-      k_dbg("elf", "load: %s entry=0x%lx", path, (unsigned long)image->entry);
+      k_info("elf", "load: %s entry=0x%lx", path, (unsigned long)image->entry);
   }
   image->address_space = user_address_space_create();
 
@@ -935,7 +1007,17 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * Without this, a 220 MB dynamic PIE was staged with one kzalloc of its whole
    * text and then copied page by page into private frames, per process, shared
    * with nobody. */
-  int demand_page = (load_base == 0);
+  /* ...and the code now does what that paragraph says. It read
+   * `(load_base == 0)`, which excludes EVERY PIE -- including the ones with an
+   * interpreter the comment above says to include. So every dynamically linked
+   * program was staged with a kzalloc of its whole text and a page-by-page copy
+   * into private frames, on every exec, shared with nobody.
+   *
+   * Measured on the aarch64 sys lane: 403 spawns of /opt/busybox/bin/busybox
+   * cost 72 seconds, about 0.18 s each, for a binary that is the same file
+   * every time and should come from the page cache after the first. That is a
+   * fifth of a lane whose whole budget is 360 s. */
+  int demand_page = (load_base == 0) || image->interp_base != 0;
   for (u16 i = 0; demand_page && i < ehdr->e_phnum; i++) {
     struct elf64_phdr *a = &phdrs[i];
     if (a->p_type != PT_LOAD)
@@ -1081,7 +1163,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
       for (u64 off = 0; off + sizeof(struct elf64_rela) <= rela_size;
            off += rela_ent) {
         struct elf64_rela *r = (struct elf64_rela *)(rela + off);
-        if ((r->r_info & 0xFFFFFFFFULL) != R_X86_64_RELATIVE)
+        if ((r->r_info & 0xFFFFFFFFULL) != ELF_R_RELATIVE)
           continue;
         u64 *target =
             (u64 *)_vaddr_to_stage(image, r->r_offset + load_base, sizeof(u64));
@@ -1154,227 +1236,30 @@ void user_image_free(struct user_loaded_image *image) {
    * user_address_space_cleanup); this is the loader's own reference. */
   if (image->exe_node)
     vfs_node_put(image->exe_node);
+  if (image->interp_node)
+    vfs_node_put(image->interp_node);
 
   kfree(image);
 }
 
+/* A 32-bit binary cannot run here: this kernel is 64-bit only and has no
+ * compat mode. Recognise the class byte so exec fails with a clear message
+ * instead of the useless "failed to load". (The full ELF32 loader is gone
+ * with the 32-bit port — it was dead code whose failure path re-opened the
+ * file through the VFS and panicked the kernel when the ELF64 attempt had
+ * already failed.) */
 #define ELF_CLASS_32 1
-#define ELF_MACHINE_386 3
-#define DT_REL 17
-#define DT_RELSZ 18
-#define R_386_RELATIVE 8
-
-struct elf32_ehdr {
-  u8 e_ident[16];
-  u16 e_type;
-  u16 e_machine;
-  u32 e_version;
-  u32 e_entry;
-  u32 e_phoff;
-  u32 e_shoff;
-  u32 e_flags;
-  u16 e_ehsize;
-  u16 e_phentsize;
-  u16 e_phnum;
-  u16 e_shentsize;
-  u16 e_shnum;
-  u16 e_shstrndx;
-} __attribute__((packed));
-
-struct elf32_phdr {
-  u32 p_type;
-  u32 p_offset;
-  u32 p_vaddr;
-  u32 p_paddr;
-  u32 p_filesz;
-  u32 p_memsz;
-  u32 p_flags;
-  u32 p_align;
-} __attribute__((packed));
-
-struct elf32_rel {
-  u32 r_offset;
-  u32 r_info;
-} __attribute__((packed));
-
-struct elf32_dyn {
-  i32 d_tag;
-  u32 d_val;
-} __attribute__((packed));
-
-static int user_load_elf32(struct user_loaded_image *image, const char *path) {
-  char *file_data = 0;
-  usize file_size = 0;
-  if (user_image_read_vfs_file(path, &file_data, &file_size) != 0)
-    return -1;
-  if (file_size < sizeof(struct elf32_ehdr)) {
-    kfree(file_data);
-    return -1;
-  }
-
-  struct elf32_ehdr *ehdr = (struct elf32_ehdr *)file_data;
-  if (ehdr->e_ident[0] != ELF_MAGIC0 || ehdr->e_ident[1] != ELF_MAGIC1 ||
-      ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3) {
-    kfree(file_data);
-    return -1;
-  }
-  if (ehdr->e_ident[4] != ELF_CLASS_32 || ehdr->e_ident[5] != ELF_DATA_LE) {
-    kfree(file_data);
-    return -1;
-  }
-  if (ehdr->e_type != ELF_TYPE_EXEC && ehdr->e_type != ELF_TYPE_DYN) {
-    kfree(file_data);
-    return -1;
-  }
-  if (ehdr->e_machine != ELF_MACHINE_386) {
-    kfree(file_data);
-    return -1;
-  }
-  /* See user_load_elf64: report an architecture mismatch clearly. A 32-bit i386
-   * binary cannot run on the 64-bit kernel (no compat mode). */
-#ifdef __x86_64__
-  console_write("ELF32 load: ARCH MISMATCH — i386 binary on x86_64 kernel, "
-                "refusing: ");
-  console_write(path);
-  console_write("\n");
-  kfree(file_data);
-  return -1;
-#endif
-  /* Validate e_phentsize and use subtraction-form bounds — see user_load_elf64
-   * (R4-4). */
-  if (ehdr->e_phentsize != sizeof(struct elf32_phdr)) {
-    kfree(file_data);
-    return -1;
-  }
-  if (ehdr->e_phoff > file_size ||
-      (u64)ehdr->e_phentsize * ehdr->e_phnum > file_size - ehdr->e_phoff) {
-    kfree(file_data);
-    return -1;
-  }
-
-  image->kind = USER_IMAGE_ELF32;
-  image->path = kernel_strdup(path);
-  {
-    char real[VFS_MAX_PATH];
-    user_exec_realpath(path, real, sizeof(real));
-    image->real_path = kernel_strdup(real);
-  }
-
-  u64 load_base = (ehdr->e_type == ELF_TYPE_DYN) ? PIE_LOAD_BASE : 0;
-
-  image->entry = ehdr->e_entry + load_base;
-  /* M92: record program header location for AT_PHDR / AT_PHNUM auxv. */
-  image->phdr_vaddr = load_base + ehdr->e_phoff;
-  image->phnum = ehdr->e_phnum;
-  {
-    char line[VFS_MAX_PATH + 64];
-    if (load_base)
-      snprintf(line, sizeof(line), "ELF32 load: %s entry=0x%lx (PIE base=0x%lx)\n",
-               path, (unsigned long)image->entry, (unsigned long)load_base);
-    else
-      snprintf(line, sizeof(line), "ELF32 load: %s entry=0x%lx\n", path,
-               (unsigned long)image->entry);
-    console_write(line);
-  }
-  image->address_space = user_address_space_create();
-
-  /* PT_INTERP */
-  for (u16 j = 0; j < ehdr->e_phnum; j++) {
-    struct elf32_phdr *p =
-        (struct elf32_phdr *)(file_data + ehdr->e_phoff +
-                              ((u64)j * ehdr->e_phentsize));
-    if (p->p_type != PT_INTERP) continue;
-    if (p->p_offset + p->p_filesz < p->p_offset ||
-        p->p_offset + p->p_filesz > file_size) continue;
-    char interp[64];
-    usize ilen = p->p_filesz < sizeof(interp) ? p->p_filesz
-                                              : sizeof(interp) - 1;
-    memcpy(interp, file_data + p->p_offset, ilen);
-    interp[ilen] = '\0';
-    char line[64 + sizeof(interp)];
-    snprintf(line, sizeof(line),
-             "ELF32 load: PT_INTERP=%s (b1nix applies RELATIVE relocs in-kernel — no separate ld.so handoff)\n",
-             interp);
-    console_write(line);
-  }
-
-  /* First pass: PT_LOAD segments */
-  for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    struct elf32_phdr *phdr =
-        (struct elf32_phdr *)(file_data + ehdr->e_phoff +
-                              ((u64)i * ehdr->e_phentsize));
-    if (phdr->p_type != PT_LOAD)
-      continue;
-    if (image->segment_count >= USER_MAX_IMAGE_SEGMENTS) {
-      kfree(file_data);
-      return -1;
-    }
-    if (phdr->p_offset + phdr->p_filesz < phdr->p_offset ||
-        phdr->p_offset + phdr->p_filesz > file_size ||
-        phdr->p_filesz > phdr->p_memsz) {
-      kfree(file_data);
-      return -1;
-    }
-    u64 reloc_vaddr = phdr->p_vaddr + load_base;
-    if (reloc_vaddr + phdr->p_memsz < reloc_vaddr ||
-        reloc_vaddr + phdr->p_memsz > USER_SPACE_LIMIT) {
-      kfree(file_data);
-      return -1;
-    }
-    /* Cap p_memsz before allocating — see user_load_elf64 (R4-10). */
-    if (phdr->p_memsz > USER_IMAGE_MAX_SEGMENT) {
-      kfree(file_data);
-      return -1;
-    }
-
-    struct user_image_segment *segment =
-        &image->segments[image->segment_count++];
-    segment->vaddr = reloc_vaddr;
-    segment->memsz = phdr->p_memsz;
-    segment->filesz = phdr->p_filesz;
-    segment->flags = phdr->p_flags;
-
-    if (phdr->p_filesz > 0) {
-      segment->data = kzalloc(phdr->p_filesz);
-      if (!segment->data) {
-        kfree(file_data);
-        return -1;
-      }
-      memcpy(segment->data, file_data + phdr->p_offset, phdr->p_filesz);
-    } else {
-      segment->data = 0;
-    }
-  }
-
-  /* Capture PT_TLS so user_run_elf_image sets up the main thread's TLS block +
-   * GS base (i686 variant II). Without it, a binary using __thread / call_once
-   * (Mesa) derefs a zero GS base and SIGSEGVs. Mirrors the elf64 path. */
-  for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    struct elf32_phdr *phdr =
-        (struct elf32_phdr *)(file_data + ehdr->e_phoff +
-                              ((u64)i * ehdr->e_phentsize));
-    if (phdr->p_type != PT_TLS)
-      continue;
-    if (phdr->p_filesz > phdr->p_memsz ||
-        phdr->p_offset + phdr->p_filesz < phdr->p_offset ||
-        phdr->p_offset + phdr->p_filesz > file_size ||
-        phdr->p_memsz > USER_IMAGE_MAX_SEGMENT)
-      break;
-    image->tls_memsz = phdr->p_memsz;
-    image->tls_filesz = phdr->p_filesz;
-    image->tls_align = phdr->p_align ? phdr->p_align : 8;
-    if (phdr->p_filesz) {
-      image->tls_data = kmalloc(phdr->p_filesz);
-      if (image->tls_data)
-        memcpy(image->tls_data, file_data + phdr->p_offset, phdr->p_filesz);
-    }
-    break;
-  }
-
-  /* In-kernel dynamic relocation pass removed: dynamic relocations are handled in userspace (ld-musl). */
-
-  kfree(file_data);
-  return 0;
+static int user_image_is_elf32(const char *path) {
+  int fd = vfs_open(path);
+  if (fd < 0)
+    return 0;
+  u8 ident[16];
+  int is32 = (user_read_at(fd, 0, ident, sizeof(ident)) == 0 &&
+              ident[0] == ELF_MAGIC0 && ident[1] == ELF_MAGIC1 &&
+              ident[2] == ELF_MAGIC2 && ident[3] == ELF_MAGIC3 &&
+              ident[4] == ELF_CLASS_32);
+  vfs_close(fd);
+  return is32;
 }
 
 /* cred_override != 0: the caller (execve) already knows the effective ids the
@@ -1427,13 +1312,12 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
     return image;
   }
 
-  if (user_load_elf32(image, path) == 0) {
-    if (user_build_initial_stack(image) != 0) {
-      console_write("user_load_image: user_build_initial_stack ELF32 failed\n");
-      user_image_free(image);
-      return 0;
-    }
-    return image;
+  if (user_image_is_elf32(path)) {
+    console_write("user_load_image: 32-bit ELF cannot run on this kernel: ");
+    console_write(path);
+    console_write("\n");
+    user_image_free(image);
+    return 0;
   }
 
   /* Report how much memory was left: an image that loads in one boot and not in
@@ -1462,13 +1346,7 @@ void user_address_space_cleanup(struct task *t) {
    * tick counter stands still and reports every teardown as instant. */
   u64 td_t0;
 
-  __asm__ volatile("rdtsc" : "=A"(td_t0));
-  {
-    u32 lo, hi;
-
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    td_t0 = ((u64)hi << 32) | lo;
-  }
+  td_t0 = arch_cycles();
   u64 td_pages = 0, td_vmas = 0;
 
   /* Release this task's shm bookkeeping (shm_nattch + per-process attach slot)
@@ -1540,7 +1418,7 @@ void user_address_space_cleanup(struct task *t) {
     console_write_dec(td_pages);
     u32 lo1, hi1;
 
-    __asm__ volatile("rdtsc" : "=a"(lo1), "=d"(hi1));
+    { u64 c_ = arch_cycles(); lo1 = (u32)c_; hi1 = (u32)(c_ >> 32); }
     console_write(" kcycles=");
     console_write_dec((((u64)hi1 << 32) | lo1) - td_t0) ;
     console_write("\n");
@@ -1662,6 +1540,48 @@ static int user_run_elf_image(struct user_loaded_image *image) {
      * refcounted across every mapper — so only the working set is resident and
      * untouched pages stay reclaimable. vmm_set_lazy splits the low-4GB identity
      * huge page covering the load base so the lazy PTE is installed correctly. */
+    /* An interpreter segment shares the page cache's frames outright: mapped
+     * here and now, read-only, refcounted, with no private copy and no faults
+     * to take later. Every process on the system maps the same pages. */
+    if (segment->from_interp && segment->demand_ok && image->interp_node &&
+        image->interp_node->inode) {
+      struct vfs_inode *in = image->interp_node->inode;
+      u64 seg_file_base = segment->file_offset & ~(PAGE_SIZE - 1);
+      u64 flags = vmm_user_flags_from_prot(seg_prot) | VMM_PRESENT;
+      int ok = 1;
+
+      for (u64 v = vaddr_start; v < vaddr_end && ok; v += PAGE_SIZE) {
+        u64 fpage = seg_file_base + (v - vaddr_start);
+        struct page_cache_entry *pe = page_cache_get_page(in, fpage);
+
+        if (!pe) {
+          page_cache_read_cluster(in, fpage, page_cache_cluster_pages());
+          pe = page_cache_get_page(in, fpage);
+        }
+        if (!pe) {
+          ok = 0; /* fall through to the eager copy below */
+          break;
+        }
+        vmm_map_page(v, pe->frame, flags);
+        pmm_ref_frame(pe->frame);
+        page_cache_put_page(pe);
+      }
+      if (ok) {
+        struct vm_area *fvma = kzalloc(sizeof(struct vm_area));
+
+        if (fvma) {
+          fvma->start = vaddr_start;
+          fvma->end = vaddr_end;
+          fvma->prot = PROT_READ | ((segment->flags & PF_X) ? PROT_EXEC : 0);
+          fvma->flags = MAP_PRIVATE;
+          fvma->node = vfs_node_get(image->interp_node);
+          fvma->offset = (isize)seg_file_base;
+          vma_insert(current_task, fvma);
+        }
+        continue;
+      }
+    }
+
     if (image->demand_paged && segment->demand_ok && image->exe_node &&
         segment->data) {
       u64 seg_file_base = segment->file_offset & ~(PAGE_SIZE - 1);
@@ -1843,7 +1763,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
    * page below this, where the upward-growing brk heap cannot reach it. */
   u64 low_reserved = image->address_space.stack_top - USER_STACK_MAX_SIZE;
 
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__)
   /* Main-thread TLS (x86 variant II). Layout: [ tdata | tbss ][ TCB ], with the
    * thread pointer (TP) at the TCB and TCB[0] = TP (the self pointer that
    * `mov %fs:0` (x86_64) / `mov %gs:0` (i686) reads). Thread-local variables
@@ -1961,6 +1881,27 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     u64 tframe = pmm_alloc_frame();
     if (tframe) {
       vmm_map_page(tva, tframe, VMM_USER); /* RO (no WRITABLE) + executable */
+      /* And record it, or mmap(2) will hand this very page out.
+       *
+       * vm_find_free_area walks the VMA list to find a gap; a page that is
+       * mapped but has no VMA is invisible to it. On this arch the search
+       * starts at 0x10000000000, which is exactly where this trampoline lands,
+       * so the first anonymous mmap got the trampoline's address back -- and
+       * with it the trampoline's read-only EXECUTABLE leaf. A test that asked
+       * for PROT_READ|PROT_WRITE and jumped into the result then ran it
+       * instead of taking SIGSEGV, which is the W^X check failing for a reason
+       * that has nothing to do with W^X. */
+      {
+        struct vm_area *tvma = kzalloc(sizeof(struct vm_area));
+
+        if (tvma) {
+          tvma->start = tva;
+          tvma->end = tva + PAGE_SIZE;
+          tvma->prot = PROT_READ | PROT_EXEC;
+          tvma->flags = MAP_PRIVATE;
+          vma_insert(current_task, tvma);
+        }
+      }
       u8 *code = (u8 *)(usize)(vmm_direct_map_base() + tframe);
       memset(code, 0, PAGE_SIZE);
       /* A Linux-personality task's syscalls are number-translated, so the
@@ -1970,17 +1911,19 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       u32 sigret_nr = (image->personality == PERSONALITY_LINUX)
                           ? LINUX_NR_RT_SIGRETURN
                           : (u32)SYS_SIGRETURN;
+#if defined(__aarch64__)
+      /* movz x8, #sigret_nr ; svc #0 — the syscall number register on
+       * aarch64 is x8, and the handler returns here through x30. */
+      u32 insns[2] = {0xD2800008u | ((sigret_nr & 0xFFFFu) << 5), 0xD4000001u};
+      memcpy(code, insns, sizeof(insns));
+#elif defined(__x86_64__)
       code[0] = 0xB8; /* mov $imm32, %eax */
       code[1] = (u8)(sigret_nr & 0xff);
       code[2] = (u8)((sigret_nr >> 8) & 0xff);
       code[3] = (u8)((sigret_nr >> 16) & 0xff);
       code[4] = (u8)((sigret_nr >> 24) & 0xff);
-#ifdef __x86_64__
       code[5] = 0x0F;
       code[6] = 0x05; /* syscall */
-#else
-      code[5] = 0xCD;
-      code[6] = 0x80; /* int $0x80 */
 #endif
       struct vm_area *tvma = kzalloc(sizeof(struct vm_area));
       if (tvma) {
@@ -2068,7 +2011,8 @@ static int user_run_elf_image(struct user_loaded_image *image) {
 
   x86_user_jump((usize)image->entry, (usize)image->address_space.stack_base,
                 (usize)image->argc,
-                (usize)(image->address_space.stack_base + sizeof(usize)));
+                (usize)(image->address_space.stack_base + sizeof(usize)),
+                (usize)current_task->kernel_stack_ptr);
 
   return 0; // Should not reach here
 }
@@ -2253,7 +2197,10 @@ int user_spawn_env(const char *path, int argc, const char **argv,
 
   struct vfs_node *node = vfs_find_node(path);
   if (!node || IS_ERR(node)) {
-    return -1;
+    /* -ENOENT, not -1: the caller that matters here is the init spawn, and
+     * "could not spawn PID 1" has to say which of the two silent failures it
+     * was — the file is not there, or it is there and not executable by us. */
+    return -ENOENT;
   }
 
   const struct cred *cred = scheduler_get_current_cred();

@@ -119,7 +119,7 @@ void synchronize_rcu(void)
 		if (scheduler_can_block())
 			scheduler_sleep_ticks(1);
 		else
-			__asm__ volatile("pause");
+			cpu_relax();
 	}
 
 	__atomic_fetch_add(&g_rcu_gps, 1ull, __ATOMIC_ACQ_REL);
