@@ -20,7 +20,18 @@ case "$ARCH" in
   *)       CLANG_TARGET="x86_64-unknown-elf" ;;
 esac
 
-SRC="$(find "$ROOT_DIR/build" -type d -path '*llvm-project*/compiler-rt/lib/builtins' 2>/dev/null | head -1)"
+# Trailing slash: build/ is commonly a symlink to a scratch volume, and find
+# does not descend into a symlinked start directory without it.
+SRC=""
+for d in $(find "$ROOT_DIR/build/" -type d -path '*llvm-project*/compiler-rt/lib/builtins' 2>/dev/null); do
+    # llvm-project also carries a sourceless GN build description at
+    # llvm/utils/gn/secondary/compiler-rt/lib/builtins; take the tree that
+    # actually holds the C sources.
+    if ls "$d"/*.c >/dev/null 2>&1; then
+        SRC="$d"
+        break
+    fi
+done
 if [ -z "$SRC" ]; then
     echo "compiler-rt source not found under $ROOT_DIR/build (expected a vendored llvm-project checkout)" >&2
     exit 1

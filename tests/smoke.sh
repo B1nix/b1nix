@@ -362,6 +362,31 @@ run_qemu() {
 				-cdrom "$PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}" \
 				-serial stdio -serial null -display ${GPU_DISPLAY:-none} -monitor none -no-reboot \
 				-device isa-debug-exit,iobase=0xf4,iosize=0x04
+
+			# The root filesystem, as a disk rather than inside the image.
+			#
+			# The x86_64 smoke images stopped carrying root.ext4 as a boot
+			# module (SMOKE_ROOT_MODULE in the Makefile): it is copied into
+			# memory in full before the kernel starts, which costs half a
+			# gigabyte per lane. The kernel finds the disk by its b1nix-root
+			# label, so the device name does not matter.
+			#
+			# snapshot=on: every write lands in a temporary overlay QEMU
+			# discards on exit, so the lanes share one file, cannot corrupt it
+			# and cannot see each other's writes.
+			#
+			# Two instances keep the module-borne root and get no disk: blk
+			# needs the RAM disk it produces as a device with no discard
+			# command, and switchroot needs a second filesystem to switch INTO,
+			# distinct from the initramfs it starts on. Giving them the disk as
+			# well would put two filesystems with the same label in front of
+			# them.
+			if [ -z "${SMOKE_ROOT_MODULE:-}" ] &&
+			   [ "${B1NIX_ISO_NAME:-}" != "b1nix-blk.iso" ] &&
+			   [ "${B1NIX_ISO_NAME:-}" != "b1nix-switchroot.iso" ] &&
+			   [ -f "$PROJECT_DIR/build/$ARCH/root.ext4" ]; then
+				set -- "$@" -drive file="$PROJECT_DIR/build/$ARCH/root.ext4",format=raw,if=virtio,snapshot=on
+			fi
 		else
 			set -- ${qemu_bin} ${machine_args} ${accel_args} ${mem_args} ${cpu_args} \
 				${kernel_args} \
@@ -1151,6 +1176,12 @@ launch_iommu() {
 		NVME_IMG=$(disk_img nvme iommu)
 		SWAP_IMG=$(disk_img swap iommu)
 		B1NIX_ISO_NAME=b1nix-openrc.iso
+		# iommurp2 is pinned at 00:1b.0 because b1nix.acs-keep names it by BDF
+		# (SMOKE_CMDLINE_openrc). Left to QEMU's automatic assignment its address
+		# moves whenever a device is added ahead of it -- adding the 9P device to
+		# this lane pushed it from 00:0e.0 to 00:0f.0, the exception then named a
+		# legacy pci-bridge with no ACS capability at all, and the check failed
+		# reporting zero named ports.
 		EXTRA_QEMU_ARGS="-machine q35,kernel-irqchip=split -device intel-iommu,intremap=on \
 			-device pcie-root-port,id=iommurp,chassis=9 \
 			-device x3130-upstream,id=iommusw,bus=iommurp \
@@ -1161,7 +1192,7 @@ launch_iommu() {
 			-device pci-bridge,id=iommulegacy,chassis_nr=3 \
 			-device virtio-tablet-pci,id=iommulegacy0,bus=iommulegacy,addr=1 \
 			-device virtio-tablet-pci,id=iommulegacy1,bus=iommulegacy,addr=2 \
-			-device pcie-root-port,id=iommurp2,chassis=12 \
+			-device pcie-root-port,id=iommurp2,chassis=12,addr=0x1b \
 			-device nvme-subsys,id=iommusubsys,nqn=b1nix-iommu \
 			-device nvme,id=iommunvme,serial=deadbee2,subsys=iommusubsys,sriov_max_vfs=1,sriov_vq_flexible=2,sriov_vi_flexible=1,bus=iommurp2"
 		SMOKE_DONE_PATTERN="reboot: powering off|KERNEL PANIC|\[PANIC\]"
@@ -1823,6 +1854,7 @@ check_output "$LOG" "M119-SMOKE: start" "M119 developer filesystems smoke starts
 check_output "$LOG" "M119-SMOKE: ok debugfs" "debugfs virtual diagnostic filesystem mounted and read back"
 check_output "$LOG" "M119-SMOKE: ok fwcfgfs" "fwcfgfs QEMU fw_cfg directory and files inspected"
 check_output "$LOG" "M119-SMOKE: ok tarfs" "tarfs ustar archive filesystem mount and error handling verified"
+check_output "$LOG" "M119-SMOKE: ok tick-tracks-clock" "the scheduler tick keeps time: /proc/uptime and CLOCK_MONOTONIC agree late in the run"
 check_output "$LOG" "M119-SMOKE: done" "M119 developer filesystems smoke completes"
 
 # ── M25 Native C compiler (b1cc) ──

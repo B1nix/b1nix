@@ -17,6 +17,16 @@
 set -eu
 
 ROOTFS="$1"; IMAGE="$2"; SIZE_MB="$3"
+
+# Absolute, because the staleness test below runs `find` from INSIDE $ROOTFS.
+# With the relative path make passes ("build/x86_64/root.ext4") that find said
+# "No such file or directory", printed nothing, and the empty output read as
+# "nothing was edited" -- so an image whose files had all changed was reported
+# up to date, and the guest booted the previous build's modules.
+case "$IMAGE" in
+	/*) ;;
+	*) IMAGE="$(pwd)/$IMAGE" ;;
+esac
 MKE2FS="${MKE2FS:-mke2fs}"
 DEBUGFS="${DEBUGFS:-debugfs}"
 

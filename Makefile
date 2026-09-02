@@ -1146,8 +1146,15 @@ MODULE_CFLAGS := $(COMMON_CFLAGS) $(ARCH_CFLAGS) -DMODULE
 # separately and combined with a relocatable link, the same way the kernel's own
 # multi-file objects are. A single-source module still produces exactly one
 # compile and no link.
+#
+# The two headers are named explicitly rather than left to the generated .d
+# file: the vermagic a module is stamped with comes from <b1nix/version.h>
+# through <b1nix/module.h>, and on the build that first creates a .ko there is
+# no .d yet to record that. A version bump then left ndp.ko and ntp.ko stamped
+# with the previous release, the loader rejected them (-8), and six module
+# checks failed against modules that were simply never recompiled.
 define B1NIX_MODULE_RULE
-$$(MODULE_OUT_DIR)/$(1).ko: $(2)
+$$(MODULE_OUT_DIR)/$(1).ko: $(2) kernel/include/b1nix/module.h kernel/include/b1nix/version.h
 	@mkdir -p $$(dir $$@)
 	@set -e; objs=""; \
 	for src in $(2); do \
@@ -1837,7 +1844,7 @@ SMOKE_CMDLINE_blk=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.
 # OpenRC ctltest: boots the real init system as PID 1 and drives sysinit/boot/default,
 # then a local.d hook asks PID 1 to power off through /run/openrc/init.ctl — the
 # control-FIFO path openrc-shutdown and telinit use. A clean poweroff proves the channel works.
-SMOKE_CMDLINE_openrc=init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest b1nix.acs-keep=00:0e.0
+SMOKE_CMDLINE_openrc=init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest b1nix.acs-keep=00:1b.0
 # M108 init: the default boot, checked as such. PID 1 is /sbin/init (BusyBox
 # init, no `init=` needed) and /etc/inittab drives OpenRC's runlevels under it.
 # This instance runs no part of the ordinary suite — it exists to prove the
