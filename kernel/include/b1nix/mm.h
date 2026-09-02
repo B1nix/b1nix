@@ -362,6 +362,14 @@ u64 paging_user_phys(u64 pml4_phys, u64 vaddr);
 
 // Demand Paging / Swap
 void vmm_set_lazy(u64 virtual_address);
+
+/* Address-space edit ring (kernel/mm/vma_trace.c). Records the last few
+ * mmap/munmap/mremap ranges with the thread that made them, so a page found
+ * where none should be can name the call that left it. */
+void vma_trace_record(const char *what, u64 start, u64 end);
+void vma_trace_dump(u64 start, u64 end);
+void vma_trace_dump_addr(u64 va);
+int vma_trace_faults_enabled(void);
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code);
 
 /* What the last page fault on THIS CPU decided, recorded as it was decided.

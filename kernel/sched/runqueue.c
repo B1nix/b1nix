@@ -206,8 +206,35 @@ int rq_remove(struct runqueue *rq, struct task *t) {
     LOCKDEP_ACQUIRE(LOCKDEP_LVL_RUNQUEUE);
     struct task *prev = 0;
     struct task *cur = rq->head;
+    u32 rwalked = 0;
+    /* Bounded and validated, exactly as rq_enqueue and rq_dequeue already are.
+     *
+     * This walk had neither, and it is the one that runs with the lock HELD and
+     * interrupts DISABLED for its whole length. A cyclic next_run chain -- a
+     * real, observed condition on this arch, which is why the other two walks
+     * check for it and why sched_rq_remove_task_all exists to prevent it -- made
+     * this loop spin for ever holding the runqueue lock. Every other CPU then
+     * piles up behind it, and what the machine prints is
+     *
+     *   SPINLOCK LOCKUP on cpu 1: lock=<g_global_rq> value=1
+     *   holder: not recorded
+     *
+     * with no clue that a corrupt list is behind it: the holder cannot report
+     * because it never leaves the loop, and the spinners have nothing to name.
+     * The two sibling walks turn the same corruption into an immediate, named
+     * panic. This one now does too. */
     while (cur) {
         struct task *next = cur->next_run;
+
+        if (++rwalked > RQ_WALK_LIMIT) {
+            rq_report_cycle(rq);
+            panic("runqueue list is cyclic");
+        }
+        if (next && !sched_task_ptr_valid(next)) {
+            rq_report_bad(rq, "next_run is not a task slot", next);
+            rq_report_cycle(rq);
+            panic("runqueue list is corrupt");
+        }
         if (cur == t) {
             if (prev) prev->next_run = next;
             else rq->head = next;

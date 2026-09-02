@@ -252,16 +252,6 @@ u64 ap_stack_peak(u64 *total_out)
 	return 0;
 }
 
-/* The address-space edit ring is x86-only for now: its storage and its two
- * dump functions live in kernel/arch/x86_64/paging.c. Recording is called from
- * shared code, so it needs a definition here; there is nowhere to put the
- * entry yet, and inventing a second ring that nothing prints would be worse
- * than an honest gap. */
-void vma_trace_record(const char *what, u64 start, u64 end)
-{
-	(void)what; (void)start; (void)end;
-}
-
 /* MIDR_EL1 — the processor's own identity register (ARM ARM D17.2.100):
  * Implementer[31:24], Variant[23:20], Architecture[19:16], PartNum[15:4],
  * Revision[3:0]. There is nothing to measure or guess here. */

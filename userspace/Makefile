@@ -421,28 +421,27 @@ BINARIES += $(BUILD)/bin/musl_posix_smoke
 # b1cc has a code generator for this target. Ask b1cc itself rather than
 # testing the arch name: the moment its aarch64 backend lands, these build
 # again with no edit here.
-# The ARM backend emits the ELF flavour directly. Do not execute the target
-# binary in this host-side probe: an AArch64 b1cc cannot run on an x86_64 build
-# host, even though it is exactly the binary that must be embedded in the ARM
-# image.
-CROSS_AS_PROBE := clang --target=$(B1NIX_ARCH)-unknown-elf -c
-ifeq ($(B1NIX_ARCH),aarch64)
-B1CC_TARGET_OK := yes
-else
-B1CC_TARGET_OK := $(shell [ -x $(B1CC) ] && printf 'int g;const char*s="x";int main(void){g=1;return s[0]+g;}\n' > $(BUILD)/.b1cc_probe.c && \
-  $(B1CC) --target=$(B1NIX_ARCH)-b1nix -S $(BUILD)/.b1cc_probe.c -o $(BUILD)/.b1cc_probe.s >/dev/null 2>&1 && \
-  $(CROSS_AS_PROBE) $(BUILD)/.b1cc_probe.s -o $(BUILD)/.b1cc_probe.o >/dev/null 2>&1 && echo yes)
-endif
-# WARNING, and it is not a style point: on aarch64 this gate is the only reason
-# /bin/b1cc works at all.
+# Probe by asking b1cc for an OBJECT and reading the ELF header it produced.
+# Nothing here executes a target binary -- an AArch64 b1cc cannot run on an
+# x86_64 build host -- so the same probe is valid for every target, and the
+# aarch64 case no longer has to be asserted. (It was: `B1CC_TARGET_OK := yes`,
+# unconditionally, which is why a broken ARM backend would have gone unnoticed
+# until the guest tried to run /bin/b1cc.) The old probe went through `-S` plus
+# a host assembler, which the ARM backend cannot satisfy -- it assembles to ELF
+# itself and never emits GNU-syntax .s -- so `-c` is both the honest question
+# and the one this compiler answers on every target.
 #
-# On ARM the backend probe above is deliberately skipped because the target
-# binary cannot execute on the host. The ARM code generator and ELF linker are
-# still exercised by the b1cc corpus build below.
+# The header check is the point: a compiler that silently produced an object for
+# the WRONG machine would pass a bare exit-status probe and then fail to link.
+B1CC_E_MACHINE_x86_64 := 3e 00
+B1CC_E_MACHINE_aarch64 := b7 00
+B1CC_TARGET_OK := $(shell [ -x $(B1CC) ] && printf 'int g;const char*s="x";int main(void){g=1;return s[0]+g;}\n' > $(BUILD)/.b1cc_probe.c && \
+  $(B1CC) --target=$(B1NIX_ARCH)-b1nix -c $(BUILD)/.b1cc_probe.c -o $(BUILD)/.b1cc_probe.o >/dev/null 2>&1 && \
+  [ "$$(od -An -tx1 -j18 -N2 $(BUILD)/.b1cc_probe.o | tr -s ' ' | sed 's/^ //;s/ $$//')" = "$(B1CC_E_MACHINE_$(B1NIX_ARCH))" ] && echo yes)
 ifeq ($(B1CC_TARGET_OK),yes)
 BINARIES += $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke
 else
-$(info b1cc: cannot yet produce $(B1NIX_ARCH)-b1nix objects (arm64 codegen works; its assembly is still Mach-O syntax) — M5/M7/M32-M34 b1cc corpus not built, and /bin/b1cc is NOT rebuilt: the copy in the rootfs is the last one that could)
+$(info b1cc: cannot produce $(B1NIX_ARCH)-b1nix objects — M5/M7/M32-M34 b1cc corpus not built, and /bin/b1cc is NOT rebuilt: the copy in the rootfs is the last one that could)
 endif
 
 ifeq ($(B1NIX_ARCH),x86_64)

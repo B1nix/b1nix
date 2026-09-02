@@ -1,3 +1,4 @@
+#include <b1nix/page_cache.h>
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
@@ -260,6 +261,19 @@ static int elf64_load_interpreter(struct user_loaded_image *image,
     kfree(data);
     return -1;
   }
+  /* The node its text is shared from. Only a disk-backed file with a read_cb
+   * has page-cache pages to share; an initramfs ld.so has none and stays
+   * eager. */
+  if (!image->interp_node) {
+    struct vfs_node *in = vfs_find_node(path);
+
+    if (in && !IS_ERR(in)) {
+      if (in->inode && in->inode->read_cb)
+        image->interp_node = in;
+      else
+        vfs_node_put(in);
+    }
+  }
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
     const struct elf64_phdr *ph =
         (const struct elf64_phdr *)(data + ehdr->e_phoff +
@@ -278,7 +292,32 @@ static int elf64_load_interpreter(struct user_loaded_image *image,
     seg->filesz = ph->p_filesz;
     seg->flags = ph->p_flags;
     seg->file_offset = ph->p_offset;
-    seg->demand_ok = 0;
+    seg->from_interp = 1;
+    /* Read-only, page-congruent, and backed by a file the page cache can
+     * serve: share the cache's frames instead of staging a private copy.
+     *
+     * This is the most-loaded file on the system. Every dynamically linked
+     * program maps it, it is the same 723 KiB file every time, and the kernel
+     * does nothing to it -- the comment above this function says so: the
+     * interpreter self-relocates at its own entry point and the in-kernel
+     * linker plays no further part. Staging it privately cost about 1.4 MiB of
+     * allocate-zero-and-copy on every exec, and the aarch64 sys lane spends
+     * 72 of its ~180 seconds inside 401 busybox spawns alone.
+     *
+     * Note it is mapped EAGERLY from the cache, not demand-paged. Demand
+     * paging was tried and measured: it trades one bulk copy for ~180 page
+     * faults per exec on a file whose text is executed almost end to end, and
+     * the lane went from 177 s to 204 s. Sharing the frames wins; faulting for
+     * them does not. */
+    int interp_share = !(ph->p_flags & PF_W) && ph->p_filesz == ph->p_memsz &&
+                       (ph->p_vaddr & (PAGE_SIZE - 1)) ==
+                           (ph->p_offset & (PAGE_SIZE - 1)) &&
+                       image->interp_node != 0;
+    seg->demand_ok = (u8)interp_share;
+    if (interp_share) {
+      seg->data = 0; /* nothing to stage: the frames come from the cache */
+      continue;
+    }
     seg->data = kzalloc(ph->p_memsz ? ph->p_memsz : 1);
     if (!seg->data) {
       kfree(data);
@@ -779,12 +818,6 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     console_write("\n");
     goto cleanup;
   }
-#else
-  console_write("ELF load: ARCH MISMATCH — 64-bit binary on 32-bit kernel, "
-                "refusing: ");
-  console_write(path);
-  console_write("\n");
-  goto cleanup;
 #endif
   /* phentsize must match so phdr-table reads and `&phdrs[i]` indexing are
    * well-formed; e_phnum must be non-zero for an executable. */
@@ -974,7 +1007,17 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * Without this, a 220 MB dynamic PIE was staged with one kzalloc of its whole
    * text and then copied page by page into private frames, per process, shared
    * with nobody. */
-  int demand_page = (load_base == 0);
+  /* ...and the code now does what that paragraph says. It read
+   * `(load_base == 0)`, which excludes EVERY PIE -- including the ones with an
+   * interpreter the comment above says to include. So every dynamically linked
+   * program was staged with a kzalloc of its whole text and a page-by-page copy
+   * into private frames, on every exec, shared with nobody.
+   *
+   * Measured on the aarch64 sys lane: 403 spawns of /opt/busybox/bin/busybox
+   * cost 72 seconds, about 0.18 s each, for a binary that is the same file
+   * every time and should come from the page cache after the first. That is a
+   * fifth of a lane whose whole budget is 360 s. */
+  int demand_page = (load_base == 0) || image->interp_base != 0;
   for (u16 i = 0; demand_page && i < ehdr->e_phnum; i++) {
     struct elf64_phdr *a = &phdrs[i];
     if (a->p_type != PT_LOAD)
@@ -1193,6 +1236,8 @@ void user_image_free(struct user_loaded_image *image) {
    * user_address_space_cleanup); this is the loader's own reference. */
   if (image->exe_node)
     vfs_node_put(image->exe_node);
+  if (image->interp_node)
+    vfs_node_put(image->interp_node);
 
   kfree(image);
 }
@@ -1495,6 +1540,48 @@ static int user_run_elf_image(struct user_loaded_image *image) {
      * refcounted across every mapper — so only the working set is resident and
      * untouched pages stay reclaimable. vmm_set_lazy splits the low-4GB identity
      * huge page covering the load base so the lazy PTE is installed correctly. */
+    /* An interpreter segment shares the page cache's frames outright: mapped
+     * here and now, read-only, refcounted, with no private copy and no faults
+     * to take later. Every process on the system maps the same pages. */
+    if (segment->from_interp && segment->demand_ok && image->interp_node &&
+        image->interp_node->inode) {
+      struct vfs_inode *in = image->interp_node->inode;
+      u64 seg_file_base = segment->file_offset & ~(PAGE_SIZE - 1);
+      u64 flags = vmm_user_flags_from_prot(seg_prot) | VMM_PRESENT;
+      int ok = 1;
+
+      for (u64 v = vaddr_start; v < vaddr_end && ok; v += PAGE_SIZE) {
+        u64 fpage = seg_file_base + (v - vaddr_start);
+        struct page_cache_entry *pe = page_cache_get_page(in, fpage);
+
+        if (!pe) {
+          page_cache_read_cluster(in, fpage, page_cache_cluster_pages());
+          pe = page_cache_get_page(in, fpage);
+        }
+        if (!pe) {
+          ok = 0; /* fall through to the eager copy below */
+          break;
+        }
+        vmm_map_page(v, pe->frame, flags);
+        pmm_ref_frame(pe->frame);
+        page_cache_put_page(pe);
+      }
+      if (ok) {
+        struct vm_area *fvma = kzalloc(sizeof(struct vm_area));
+
+        if (fvma) {
+          fvma->start = vaddr_start;
+          fvma->end = vaddr_end;
+          fvma->prot = PROT_READ | ((segment->flags & PF_X) ? PROT_EXEC : 0);
+          fvma->flags = MAP_PRIVATE;
+          fvma->node = vfs_node_get(image->interp_node);
+          fvma->offset = (isize)seg_file_base;
+          vma_insert(current_task, fvma);
+        }
+        continue;
+      }
+    }
+
     if (image->demand_paged && segment->demand_ok && image->exe_node &&
         segment->data) {
       u64 seg_file_base = segment->file_offset & ~(PAGE_SIZE - 1);
@@ -1794,6 +1881,27 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     u64 tframe = pmm_alloc_frame();
     if (tframe) {
       vmm_map_page(tva, tframe, VMM_USER); /* RO (no WRITABLE) + executable */
+      /* And record it, or mmap(2) will hand this very page out.
+       *
+       * vm_find_free_area walks the VMA list to find a gap; a page that is
+       * mapped but has no VMA is invisible to it. On this arch the search
+       * starts at 0x10000000000, which is exactly where this trampoline lands,
+       * so the first anonymous mmap got the trampoline's address back -- and
+       * with it the trampoline's read-only EXECUTABLE leaf. A test that asked
+       * for PROT_READ|PROT_WRITE and jumped into the result then ran it
+       * instead of taking SIGSEGV, which is the W^X check failing for a reason
+       * that has nothing to do with W^X. */
+      {
+        struct vm_area *tvma = kzalloc(sizeof(struct vm_area));
+
+        if (tvma) {
+          tvma->start = tva;
+          tvma->end = tva + PAGE_SIZE;
+          tvma->prot = PROT_READ | PROT_EXEC;
+          tvma->flags = MAP_PRIVATE;
+          vma_insert(current_task, tvma);
+        }
+      }
       u8 *code = (u8 *)(usize)(vmm_direct_map_base() + tframe);
       memset(code, 0, PAGE_SIZE);
       /* A Linux-personality task's syscalls are number-translated, so the
@@ -1816,14 +1924,6 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       code[4] = (u8)((sigret_nr >> 24) & 0xff);
       code[5] = 0x0F;
       code[6] = 0x05; /* syscall */
-#else
-      code[0] = 0xB8; /* mov $imm32, %eax */
-      code[1] = (u8)(sigret_nr & 0xff);
-      code[2] = (u8)((sigret_nr >> 8) & 0xff);
-      code[3] = (u8)((sigret_nr >> 16) & 0xff);
-      code[4] = (u8)((sigret_nr >> 24) & 0xff);
-      code[5] = 0xCD;
-      code[6] = 0x80; /* int $0x80 */
 #endif
       struct vm_area *tvma = kzalloc(sizeof(struct vm_area));
       if (tvma) {

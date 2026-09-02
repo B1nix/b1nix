@@ -817,8 +817,27 @@ static int test_rseq_after_sigkill(void)
  *
  * Each half runs in a child, because the passing outcome is a fatal signal. */
 
-/* `ret` — the shortest thing that proves control reached the buffer. */
-#define RET_OPCODE 0xC3
+/* `ret` — the shortest thing that proves control reached the buffer.
+ *
+ * It is an INSTRUCTION, so it is per-architecture. 0xC3 is x86's one-byte ret;
+ * writing that single byte on aarch64 leaves the buffer holding one stray byte
+ * and then zeros, which decodes as neither a return nor anything else useful.
+ * The no-execute half still passed by accident -- the page faults before the
+ * bytes matter -- but the mprotect half genuinely needs the buffer to run and
+ * return, and it cannot with the wrong architecture's opcode in it. */
+#if defined(__aarch64__)
+#define RET_LEN 4
+static const unsigned char RET_BYTES[RET_LEN] = {0xC0, 0x03, 0x5F, 0xD6}; /* ret */
+#else
+#define RET_LEN 1
+static const unsigned char RET_BYTES[RET_LEN] = {0xC3}; /* ret */
+#endif
+
+static void write_ret(volatile unsigned char *p)
+{
+	for (int i = 0; i < RET_LEN; i++)
+		p[i] = RET_BYTES[i];
+}
 
 static int child_status(int (*body)(void *), void *arg) {
 	pid_t pid = fork();
@@ -844,7 +863,7 @@ static int child_call_buffer(void *p) {
 static int child_write_text(void *p) {
 	volatile unsigned char *code = (volatile unsigned char *)p;
 
-	*code = RET_OPCODE;
+	write_ret(code);
 	return 42; /* reached only if the text page really was writable */
 }
 
@@ -856,7 +875,7 @@ static int test_wx_data_noexec(void) {
 
 	if (p == MAP_FAILED)
 		return 1;
-	p[0] = RET_OPCODE;
+	write_ret(p);
 
 	int status = child_status(child_call_buffer, p);
 
@@ -877,7 +896,7 @@ static int test_wx_exec_after_mprotect(void) {
 
 	if (p == MAP_FAILED)
 		return 1;
-	p[0] = RET_OPCODE;
+	write_ret(p);
 	if (mprotect(p, len, PROT_READ | PROT_EXEC) != 0) {
 		munmap(p, len);
 		return 2;
@@ -993,7 +1012,7 @@ int main(void) {
 
 	rc = test_wx_data_noexec();
 	if (rc != 0) {
-		marker("MM-SMOKE: fail wx-data-noexec\n");
+		marker_fail("wx-data-noexec", rc);
 		return 130 + rc;
 	}
 	marker("MM-SMOKE: ok wx-data-noexec\n");

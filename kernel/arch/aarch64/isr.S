@@ -137,9 +137,9 @@ vector_table_el1:
 	.align 7
 	b irq_el1
 	.align 7
-	VECT_EMPTY
+	b fiq_entry
 	.align 7
-	VECT_EMPTY
+	b serror_entry
 
 	// Lower EL using AArch64
 	.align 7
@@ -147,9 +147,9 @@ vector_table_el1:
 	.align 7
 	b irq_el0
 	.align 7
-	VECT_EMPTY
+	b fiq_entry
 	.align 7
-	VECT_EMPTY
+	b serror_entry
 
 	// Lower EL using AArch32
 	VECT_EMPTY
@@ -307,6 +307,43 @@ irq_el0:
 	bl aarch64_irq_handler
 	RESTORE_REGS
 	eret
+
+// FIQ and SError used to be VECT_EMPTY, i.e. `b .`.
+//
+// That is not "unused": an SError is how a CPU is told about an asynchronous
+// external abort, and an FIQ can be routed to EL1 by firmware. Spinning in
+// place on either parks that CPU for ever, holding whatever it held, with
+// nothing printed -- indistinguishable from the corruption this port has been
+// chasing, and the reason those two entries had to stop being a guess. Report
+// which one it was and what the syndrome says, then panic.
+// Neither builds a register frame, and that is the point: these can arrive with
+// SP_EL1 pointing anywhere (an SError is asynchronous, so it is not related to
+// what the CPU was doing), and SAVE_REGS on a bad SP faults while building its
+// own frame -- which is what the first attempt did, producing a QEMU-level
+// exception storm and a 1.1 GB log with nothing printed. Move to this CPU's
+// dedicated fault stack first, the same way sync_el1 does for an unusable SP,
+// then call C. Nothing returns from here.
+fiq_entry:
+	mrs x0, tpidr_el1
+	cbz x0, 1f
+	ldr x0, [x0, #PCPU_FAULT_TOP]
+	cbz x0, 1f
+	mov sp, x0
+1:
+	mov x0, #0
+	bl aarch64_async_vector
+	b .
+
+serror_entry:
+	mrs x0, tpidr_el1
+	cbz x0, 2f
+	ldr x0, [x0, #PCPU_FAULT_TOP]
+	cbz x0, 2f
+	mov sp, x0
+2:
+	mov x0, #1
+	bl aarch64_async_vector
+	b .
 
 // fork(2) resume: scheduler_fork_current() (kernel/sched/scheduler.c) builds
 // a full struct interrupt_frame at the same fixed offset from the child's

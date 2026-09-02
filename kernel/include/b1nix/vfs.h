@@ -190,6 +190,7 @@ struct vfs_xattr {
 #define XATTR_VALUE_MAX 4096
 
 /* Name the holder of an inode rwlock a task is parked on (watchdog dump). */
+void vfs_release_inode_locks_of(u64 owner);
 void vfs_inode_chan_report(u64 chan, u64 payload_base, usize block_size);
 
 struct vfs_inode {

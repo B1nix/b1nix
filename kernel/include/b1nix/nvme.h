@@ -76,7 +76,11 @@ struct nvme_cqe {
     u16 sq_head;
     u16 sq_id;
     u16 cid;
-    u16 status;
+    /* Written by the controller over DMA and polled by the driver, so every
+     * read of it has to be a real load. It was a plain u16: combined with a
+     * cpu_relax() that carried no memory clobber, the completion spin was
+     * free to read it once and spin on a register. */
+    volatile u16 status;
 } __attribute__((packed));
 
 // NVMe command opcodes

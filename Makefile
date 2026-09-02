@@ -570,6 +570,7 @@ KERNEL_SOURCES := \
 	kernel/module/ksyms.c \
 	kernel/dev/demon_splash.c \
 	kernel/mm/pmm.c \
+	kernel/mm/vma_trace.c \
 	kernel/mm/page_cache.c \
 	kernel/mm/swap.c \
 	kernel/mm/eviction.c \
@@ -1209,7 +1210,12 @@ $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-function
 
 $(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC) $(AP_TRAMPOLINE_OFFSETS)
 $(BUILD_DIR)/kernel/arch/aarch64/bootinfo.o: $(KERNEL_CMDLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC)
+# initramfs.c moved under ramfs/ with the filesystem reorganisation; this rule
+# kept the old path and so matched nothing, which left the generated .inc files
+# with no prerequisite to build them. It survived only where they already
+# existed from an earlier build -- a fresh tree, or a second architecture, hit
+# "initramfs_native_smoke.inc: file not found" instead.
+$(BUILD_DIR)/kernel/fs/ramfs/initramfs.o: $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC)
 
 # programs.c includes the generated applet registration .inc
 $(BUILD_DIR)/kernel/user/programs.o: $(APPLET_REGISTRATION_INC)
@@ -1660,7 +1666,11 @@ $(LIBC_SO) $(LIBM_LIB): $(PKG_DEPS)
 	@B1NIX_ARCH=$(ARCH) tools/packages/pkg-prefix.sh musl >/dev/null
 	@mkdir -p build/$(ARCH)/ports/musl
 	@rm -rf build/$(ARCH)/ports/musl/install
-	@ln -sf ../../pkg/musl build/$(ARCH)/ports/musl/install
+	@# -sfn, not -sf: the target is a symlink to a DIRECTORY, and without
+	@# -n a relink either descends into it or fails outright with "File
+	@# exists" when a parallel job has re-created it between the rm above
+	@# and here. tools/ports/build-musl.sh already spells it this way.
+	@ln -sfn ../../pkg/musl build/$(ARCH)/ports/musl/install
 
 $(INITRAMFS_LD_MUSL_INC): $(LIBC_SO)
 	@mkdir -p $(dir $@)

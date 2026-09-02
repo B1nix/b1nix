@@ -727,7 +727,6 @@ usize scheduler_max_task_slots(void);
 struct task *scheduler_task_slot(usize index);
 struct task *scheduler_task_by_pid(usize pid);
 /* One-shot report when a secondary CPU comes to own the boot task. */
-void sched_note_boot_task_on_secondary(struct task *t, const char *where);
 /* The task whose kernel stack contains `sp`, or 0. See the definition. */
 struct task *scheduler_task_owning_stack(u64 sp);
 const char *scheduler_state_name(int state);
@@ -864,6 +863,10 @@ void vma_cache_forget(struct task *t);
  * can mark a live task READY, and the lease stays published for as long as it
  * runs. Every path that claims a task to run must consult this. */
 int task_running_somewhere(struct task *t);
+/* The task this CPU was running immediately before the one it is switching to,
+ * or NULL outside that window. SP still belongs to it until
+ * arch_context_switch loads the incoming stack pointer. */
+struct task *sched_prev_task_this_cpu(void);
 
 
 void vma_cache_invalidate_all(void);

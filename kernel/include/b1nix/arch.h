@@ -77,14 +77,11 @@ static inline int interrupts_enabled(void) {
   __asm__ volatile("mrs %0, daif" : "=r"(daif));
   return (daif & (1ULL << 7)) == 0;
 #else
+  /* x86_64. The 32-bit `pushfd; popl` arm this used to carry could not be
+   * reached once the i686 port was removed -- the outer #else already means
+   * "not aarch64", and the only other target is x86_64. */
   u64 rflags;
-#ifdef __x86_64__
   __asm__ volatile("pushfq; popq %0" : "=r"(rflags));
-#else
-  u32 rflags32;
-  __asm__ volatile("pushfd; popl %0" : "=r"(rflags32));
-  rflags = rflags32;
-#endif
   return (rflags & 0x200) != 0;
 #endif
 }
@@ -97,9 +94,7 @@ static inline u64 interrupts_save(void) {
 #elif defined(__x86_64__)
   __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
 #else
-  u32 f32;
-  __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
-  f = f32;
+#error "unsupported architecture"
 #endif
   return f;
 }
@@ -110,8 +105,7 @@ static inline void interrupts_restore(u64 f) {
 #elif defined(__x86_64__)
   __asm__ volatile("pushq %0; popfq" : : "r"(f) : "memory", "cc");
 #else
-  u32 f32 = (u32)f;
-  __asm__ volatile("pushl %0; popfd" : : "r"(f32) : "memory", "cc");
+#error "unsupported architecture"
 #endif
 }
 
@@ -187,11 +181,27 @@ usize arch_xsave_area_size(void);
  * the linuxkpi one first, so the shootdown servicing is kept. */
 #ifndef B1NIX_CPU_RELAX_DEFINED
 #define B1NIX_CPU_RELAX_DEFINED 1
+/* A spin-wait hint AND a compiler barrier.
+ *
+ * The "memory" clobber is not decoration. Without it this is a pure hint the
+ * optimiser may schedule around, so a loop like
+ *
+ *     while (p->flag == 0) cpu_relax();
+ *
+ * over ordinary memory -- memory another CPU or a DMA engine writes -- is
+ * entitled to load p->flag ONCE and spin forever on the register. That is the
+ * shape of every polling loop in this kernel: the NVMe completion wait, the
+ * scheduler's stack hand-off spins, the block layer's readiness waits. The ones
+ * that go through __atomic_load_n were safe already; the ones that read a plain
+ * struct field were not, and nvme's completion queue is exactly that -- a
+ * struct the controller fills by DMA, polled in a bounded spin.
+ *
+ * Linux spells the same requirement barrier() inside its own cpu_relax(). */
 static inline void cpu_relax(void) {
 #if defined(__x86_64__)
-  __asm__ volatile("pause");
+  __asm__ volatile("pause" ::: "memory");
 #elif defined(__aarch64__)
-  __asm__ volatile("yield");
+  __asm__ volatile("yield" ::: "memory");
 #endif
 }
 #endif

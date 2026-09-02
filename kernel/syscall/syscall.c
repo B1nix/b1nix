@@ -1,3 +1,4 @@
+#include <b1nix/ktime.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/cgroup.h>
@@ -4310,115 +4311,6 @@ static void vma_audit(const char *where) {
   }
 }
 #if defined(__aarch64__)
-/* Eager population of a file-backed mapping.
- *
- * x86_64 marks these pages VMM_LAZY and lets vmm_handle_page_fault read the
- * file on first touch. This arch's fault handler has no file-backed case — it
- * treats a lazy marker as "the page is zero" — so every mmap of a file used to
- * read back blank, which is what made ld.so parse an empty dynamic section and
- * die in find_sym. Teaching the fault handler to read would mean blocking I/O
- * inside the exception vectors, which enter with IRQs masked (see
- * docs/aarch64-parity.md); do the read here instead, in syscall context, where
- * blocking is legal.
- *
- * ponytail: eager, so the whole mapped range is resident even if the process
- * touches one page of it. Move it into the fault handler when a real workload
- * maps more than it reads. */
-static int populate_file_mapping(struct vfs_node *node, u64 vaddr, u64 length,
-                                 isize offset, int shared, int writable,
-                                 u64 vmm_flags) {
-  struct vfs_inode *in = node->inode;
-  if (!in)
-    return -EINVAL;
-  u64 direct_base = vmm_direct_map_base();
-
-  for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
-    u64 file_page = ((u64)offset + (v - vaddr)) & ~(u64)(PAGE_SIZE - 1);
-
-    /* Regular files go through the page cache so mmap, read() and write() all
-     * see the same bytes. Anything else (device/procfs-style nodes) is served
-     * straight from its read callback below.
-     *
-     * Ownership rule: page_cache_add_page TAKES the frame on success, so the
-     * only frame this block may ever free is one the cache refused. */
-    struct page_cache_entry *pg = 0;
-    if (in->type == VFS_FILE && (in->read_cb || in->data)) {
-      pg = page_cache_get_page(in, file_page);
-      if (!pg) {
-        u64 frame = pmm_alloc_frame();
-        if (!frame)
-          goto oom;
-        void *dst = (void *)(usize)(frame + direct_base);
-        memset(dst, 0, PAGE_SIZE);
-        if (in->read_cb) {
-          if (in->read_cb(node, file_page, (char *)dst, PAGE_SIZE, 0) < 0) {
-            pmm_free_frame(frame);
-            goto fail;
-          }
-        } else if (file_page < in->size) {
-          usize n = in->size - file_page;
-          if (n > PAGE_SIZE)
-            n = PAGE_SIZE;
-          memcpy(dst, (const char *)in->data + file_page, n);
-        }
-        if (page_cache_add_page(in, file_page, frame) == 0)
-          pg = page_cache_get_page(in, file_page); /* cache owns `frame` now */
-        else
-          pmm_free_frame(frame); /* refused: still ours, drop it and read below */
-      }
-    }
-    u64 cached = pg ? pg->frame : 0;
-
-    if (cached) {
-      /* Never copy. MAP_SHARED maps the cache frame outright, because sharing
-       * is the point. MAP_PRIVATE maps the very same frame read-only, plus the
-       * copy-on-write marker if the mapping is writable — the first store then
-       * takes the ordinary COW fault and gets its private copy, so only pages
-       * a process actually writes cost a frame. That matters most for exactly
-       * the case this whole function exists for: every process maps the same
-       * libc and ld.so, almost entirely read-only.
-       *
-       * Either way the frame is now referenced by this mapping and must
-       * outlive both fork and address-space teardown, so take a reference. */
-      u64 flags = vmm_flags | VMM_PRESENT;
-      if (shared) {
-        flags |= VMM_SHARED;
-      } else if (writable) {
-        flags = (flags & ~(u64)VMM_WRITABLE) | VMM_COW;
-      }
-      vmm_map_page(v, cached, flags);
-      pmm_ref_frame(cached);
-      if (shared && writable)
-        page_cache_mark_dirty(pg);
-      page_cache_put_page(pg);
-      continue;
-    }
-
-    /* No page cache for this node (a device or procfs-style file): read it
-     * into a private frame. */
-    u64 frame = pmm_alloc_frame();
-    if (!frame)
-      goto oom;
-    void *dst = (void *)(usize)(frame + direct_base);
-    memset(dst, 0, PAGE_SIZE);
-    if (in->read_cb && in->read_cb(node, (u64)offset + (v - vaddr), (char *)dst,
-                                   PAGE_SIZE, 0) < 0) {
-      pmm_free_frame(frame);
-      goto fail;
-    }
-    vmm_map_page(v, frame, vmm_flags | VMM_PRESENT);
-  }
-  return 0;
-
-oom:
-  for (u64 u = vaddr; u < vaddr + length; u += PAGE_SIZE)
-    vmm_unmap_page(u);
-  return -ENOMEM;
-fail:
-  for (u64 u = vaddr; u < vaddr + length; u += PAGE_SIZE)
-    vmm_unmap_page(u);
-  return -EIO;
-}
 #endif /* __aarch64__ */
 
 /* Sleep for exactly as long as asked, to the precision the clock allows.
@@ -4839,27 +4731,21 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
       pmm_ref_frame(frame);
     }
   } else {
-#if defined(__aarch64__)
-    /* No file-backed case in this arch's fault handler — fill the pages now.
-     * See populate_file_mapping above. */
-    if (node) {
-      int rc = populate_file_mapping(node, vaddr, length, offset,
-                                     (flags & MAP_SHARED) != 0,
-                                     (prot & PROT_WRITE) != 0, vmm_flags);
-      /* node is borrowed from the fd table — nothing to put. */
-      if (rc < 0)
-        return (u64)rc;
-    }
-#else
-    // For file-backed, we use lazy allocation.
-    // Connect to VFS by setting VMM_LAZY flag.
-    // The page fault handler will read the file contents on demand.
+    /* File-backed: lazy on both arches. The page-fault handler reads the file
+     * contents on demand.
+     *
+     * This used to branch, filling the whole range eagerly on aarch64, because
+     * that arch's fault handler had no file-backed case. It has one --
+     * file_fill_fault, reached through PF_NEEDS_FILE_FILL, which does the read
+     * outside the page-table lock exactly as the swap-in path does -- so the
+     * branch was making every mmap of a library resident in full whether or not
+     * a page of it was ever touched. */
     for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
-      vmm_set_lazy(v);
-      // Ensure the PTE also has the correct user/writable bits saved
-      paging_mprotect_page(v, vmm_flags);
+      /* One call, not two: the marker carries the protection the fault handler
+       * should use, so vmm_set_lazy followed by paging_mprotect_page would walk
+       * four levels twice to say the same thing. */
+      vmm_set_lazy_flags(v, vmm_flags);
     }
-#endif
   }
 
   // Create and link a new VMA
@@ -4931,8 +4817,6 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   return vaddr;
 }
 
-void vma_trace_record(const char *what, u64 start, u64 end);
-int vma_trace_faults_enabled(void);
 
 
 static isize sys_munmap(void *addr, usize length) {
@@ -5863,6 +5747,21 @@ static int syscall_prof_enabled(void) {
   return on;
 }
 
+/* `b1nix.slowcall=<ms>`: name any single syscall that takes longer than that.
+ *
+ * sysprof answers "where does the machine spend its life", which is the wrong
+ * question when one call in a thousand is the whole delay: its cycles vanish
+ * into the same bucket as the fast ones. This prints the call, the task and
+ * how long it took, so a lane that sits still for eight seconds says what it
+ * was sitting in. Off unless the flag is given; one load and a branch then. */
+static u32 slowcall_ms(void) {
+  static u32 ms = (u32)-1;
+
+  if (ms == (u32)-1)
+    ms = bootinfo_get_u32("b1nix.slowcall", 0);
+  return ms;
+}
+
 static void syscall_prof_account(u32 nr, u64 cycles) {
   if (nr >= SYSPROF_SLOTS)
     return;
@@ -6140,7 +6039,28 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
     }
   }
 #endif
+  u32 slow_ms = slowcall_ms();
+  u64 slow_t0 = slow_ms ? ktime_monotonic_ns() : 0;
+
   u64 ret = syscall_dispatch_impl_inner(number, arg0, arg1, arg2, arg3, arg4, arg5, frame);
+
+  if (slow_ms) {
+    u64 took = ktime_monotonic_ns() - slow_t0;
+
+    if (took >= (u64)slow_ms * 1000000ull) {
+      struct task *t = current_task;
+
+      console_write("slowcall: nr=");
+      console_write_dec((u32)number);
+      console_write(" ms=");
+      console_write_dec((u32)(took / 1000000ull));
+      console_write(" pid=");
+      console_write_dec(t ? (u32)t->id : 0);
+      console_write(" ");
+      console_write(t ? t->name : "?");
+      console_write("\n");
+    }
+  }
 
   /* `b1nix.strace-pid=<pid>`: every call one task makes, with its arguments and
    * its answer.

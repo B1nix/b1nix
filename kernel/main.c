@@ -1498,6 +1498,13 @@ void kernel_main(usize arg0, usize arg1)
 	 * still has one. Set b1nix.ap-userspace to opt back in while working on it.
 	 *
 	 * x86_64 is unchanged: it has run userspace on APs since M28. */
+	/* Userspace on the secondaries is still off HERE, and the reason is
+	 * measured rather than assumed: with it on the suite scores 900-1300 of
+	 * ~1370 with wide variance, against 1369 and no blocked checks with it
+	 * off. The corruption behind that is characterised in
+	 * docs/aarch64-ap-userspace.md -- what it is not has been narrowed a long
+	 * way, what it is has not been found. b1nix.ap-userspace turns it on for
+	 * work on the bug. */
 #if defined(__aarch64__)
 	if (bootinfo_has_flag("b1nix.ap-userspace"))
 		g_ap_userspace_enabled = 1;

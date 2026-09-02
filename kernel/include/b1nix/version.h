@@ -1,7 +1,7 @@
 #ifndef B1NIX_VERSION_H
 #define B1NIX_VERSION_H
 
-#define B1NIX_VERSION_STR "0.114.66"
+#define B1NIX_VERSION_STR "0.114.70"
 
 /* The Linux kernel version b1nix's Linux ABI layer claims to implement.
  *

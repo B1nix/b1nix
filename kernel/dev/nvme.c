@@ -1,3 +1,4 @@
+#include <b1nix/ktime.h>
 #include <b1nix/arch.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/blk.h>
@@ -122,19 +123,35 @@ static usize nvme_controller_count;
  * re-enters nvme_io_transfer() and corrupts the in-flight queue entry / head
  * tracking. Mirrors virtio_blk's and AHCI's busy-flag mutex: spin with
  * scheduler_yield() so no real spinlock is held across the DMA wait. */
+extern u64 g_nvme_io_submits, g_nvme_io_completions;
+
 static void nvme_io_lock(struct nvme_device *dev) {
-    u64 waits = 0;
+    u64 start_ns = ktime_monotonic_ns();
+    int reported = 0;
 
     while (__sync_lock_test_and_set(&dev->io_busy, 1)) {
         /* A yield-spin on a flag nothing ever releases is indistinguishable
          * from a wedged machine: the waiter stays READY, prints nothing, and
          * the lane dies on the harness timeout with no evidence at all. Name
-         * the task that took it and never gave it back. */
-        if (++waits == 200000ULL) {
+         * the task that took it and never gave it back.
+         *
+         * On WALL CLOCK, not on a spin count -- the same correction the
+         * completion wait below already carries, and for the same reason. Every
+         * iteration here ends in scheduler_yield(), which costs a whole tick
+         * once the scheduler is up, so the old count of 200,000 meant something
+         * like 2000 seconds: twenty times the harness's patience, so the report
+         * could never fire and every wedge involving this mutex arrived with no
+         * evidence. Five seconds is far beyond any honest NVMe command. */
+        if (!reported && ktime_monotonic_ns() - start_ns > 5000000000ull) {
+            reported = 1;
             console_write("nvme: io mutex held by pid ");
             console_write_dec(dev->io_owner);
-            console_write(" for too long; waiter pid ");
+            console_write(" for over 5s; waiter pid ");
             console_write_dec(current_task ? (u64)current_task->id : 0);
+            console_write(" submits=");
+            console_write_dec(g_nvme_io_submits);
+            console_write(" completions=");
+            console_write_dec(g_nvme_io_completions);
             console_write("\n");
         }
         scheduler_yield();
@@ -145,6 +162,41 @@ static void nvme_io_lock(struct nvme_device *dev) {
 static void nvme_io_unlock(struct nvme_device *dev) {
     dev->io_owner = 0;
     __sync_lock_release(&dev->io_busy);
+}
+
+/* Called from the exit path with the dying task's id.
+ *
+ * A task that goes away between nvme_io_lock() and nvme_io_unlock() leaves
+ * io_busy set for ever. Every later I/O to this device then yield-spins in
+ * nvme_io_lock, and the lane dies on the harness timeout with the device idle
+ * and no fault anywhere. This is the same leak vfs_release_inode_locks_of
+ * exists for, in the same shape, and it was caught the same way: a wedged lane
+ * whose dump said submits=399 completions=398 busy=1, with the command
+ * outstanding for over sixty seconds -- and with NEITHER five-second report
+ * firing, which is the part that names it. The one inside the completion wait
+ * cannot fire unless somebody is executing that loop, and the one in
+ * nvme_io_lock cannot fire unless somebody is waiting for the mutex. Both
+ * silent means the owner is gone.
+ *
+ * The command it left in flight is not recovered: the controller either
+ * completes it into a queue slot nobody is watching or it never fetched it, and
+ * the driver has no way to tell which. Releasing the mutex is what keeps the
+ * rest of the system alive; the report says a command was lost rather than
+ * letting it look like a clean hand-back. */
+void nvme_release_io_lock_of(u64 pid)
+{
+    struct nvme_device *dev = &nvme;
+
+    if (!pid || !dev->io_busy || dev->io_owner != pid)
+        return;
+    console_write("nvme: task ");
+    console_write_dec(pid);
+    console_write(" exited holding the io mutex (submits=");
+    console_write_dec(g_nvme_io_submits);
+    console_write(" completions=");
+    console_write_dec(g_nvme_io_completions);
+    console_write("); releasing it\n");
+    nvme_io_unlock(dev);
 }
 
 /* M70: I/O completion interrupt handler. Runs in IRQ context. The controller's
@@ -321,7 +373,7 @@ static int nvme_create_io_sq(struct nvme_device *dev)
  * guest watchdog, tell them apart. */
 u64 g_nvme_io_submits;
 u64 g_nvme_io_completions;
-u64 g_nvme_wait_start_tick; /* tick the in-flight command's wait began, 0 = idle */
+u64 g_nvme_wait_start_ns; /* when the in-flight command's wait began, 0 = idle */
 
 /* Controller and queue state, printed by the guest watchdog.
  *
@@ -347,10 +399,12 @@ void nvme_debug_dump(void)
 	console_write_dec((u64)dev->use_msix);
 	console_write(" busy=");
 	console_write_dec((u64)dev->io_busy);
-	console_write(" wait_since_tick=");
-	console_write_dec(g_nvme_wait_start_tick);
-	console_write(" now=");
-	console_write_dec(scheduler_get_uptime_ticks());
+	console_write(" owner=");
+	console_write_dec(dev->io_owner);
+	console_write(" wait_since_ms=");
+	console_write_dec(g_nvme_wait_start_ns / 1000000ull);
+	console_write(" now_ms=");
+	console_write_dec(ktime_monotonic_ns() / 1000000ull);
 	console_write("\n  nvme cq[0..7]:");
 	for (u16 q = 0; q < dev->queue_size && q < 8; q++) {
 		console_write(" 0x");
@@ -382,10 +436,10 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     // avoid a level-triggered storm; we unmask it (intmc) right after ringing
     // the head doorbell on consume. Early boot / IRQs-off callers yield-poll.
     volatile u32 *cq_hdb = nvme_doorbell(dev, 1, 1); // CQ1
-    u64 wait_start_tick = scheduler_get_uptime_ticks();
+    u64 wait_start_ns = ktime_monotonic_ns();
     int reported = 0;
 
-    g_nvme_wait_start_tick = wait_start_tick;
+    g_nvme_wait_start_ns = wait_start_ns;
 
     __atomic_fetch_add(&g_nvme_io_submits, 1, __ATOMIC_RELAXED);
     for (;;) {
@@ -410,7 +464,7 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
                 dev->regs->intmc = (1u << 0); // re-enable vector 0 for the next I/O
 
             __atomic_fetch_add(&g_nvme_io_completions, 1, __ATOMIC_RELAXED);
-            g_nvme_wait_start_tick = 0;
+            g_nvme_wait_start_ns = 0;
             if ((status & 0xFFFE) != 0) {
                 console_write("nvme: io cmd error status=0x");
                 console_write_hex32(status);
@@ -453,28 +507,53 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
              * platform (see the ceiling syscall_sleep_timespec has to carry for
              * exactly that reason), and a deadline built on it never arrived --
              * the task sat here 65 seconds with this check silent. */
-            if (!reported &&
-                scheduler_get_uptime_ticks() - wait_start_tick >
-                    5 * SCHED_TICKS_PER_SEC) {
-                reported = 1;
+            /* Repeats, on a deadline that advances, instead of reporting once.
+             *
+             * A wedge that reports once and then goes quiet is nearly as hard
+             * to read as one that never reports: there is no way to tell a
+             * command that eventually completed from one the machine sat on
+             * for two minutes, and no second sample to compare the queue state
+             * against. Every five seconds, for as long as it is stuck --
+             * counted with SCHED_TICKS_PER_SEC, never a hardcoded number of
+             * ticks: the tick has been 1 kHz since the LAPIC took it over, so a
+             * literal 500 here would mean half a second, not five. */
+            if (ktime_monotonic_ns() - wait_start_ns > 5000000000ull) {
+                wait_start_ns = ktime_monotonic_ns();
+                reported++;
                 /* Re-ring the submission doorbell before reporting.
                  *
-                 * A doorbell write is idempotent: it tells the controller where
-                 * the producer index is, so writing the same tail again is a
-                 * no-op for a controller that already saw it and a wake-up for
-                 * one that did not. The failure being recovered from here is a
-                 * command that was submitted and never completed, with the
-                 * queue serialised so nothing else can be in flight -- a
-                 * missed doorbell is the one explanation that leaves the CQ
-                 * empty and the controller idle rather than faulted. Costs one
-                 * MMIO write, five seconds into a wait that would otherwise
-                 * never end. */
+                 * A doorbell write is idempotent: writing the same tail again
+                 * is a no-op for a controller that already saw it and a
+                 * wake-up for one that did not, so it costs one MMIO write
+                 * five seconds into a wait that would otherwise never end.
+                 *
+                 * Kept, but no longer the leading explanation. The submission
+                 * already places a full barrier between the SQ entry and this
+                 * doorbell, and this wait reads the CQ entry directly rather
+                 * than depending on an interrupt -- so neither a missed
+                 * doorbell nor a lost IRQ should be able to strand a command.
+                 * What COULD stand it, and has since been fixed, is the poll
+                 * itself: cpu_relax() carried no memory clobber and
+                 * struct nvme_cqe::status was not volatile, so the completion
+                 * spin was free to read that word once and spin on a register
+                 * while the controller had long since posted. This is
+                 * belt-and-braces against a cause nobody has reproduced since;
+                 * if it is ever seen to fire and help, that is worth knowing. */
                 {
                     volatile u32 *sq_again = nvme_doorbell(dev, 1, 0);
                     __sync_synchronize();
                     *sq_again = dev->io_sq_tail;
                 }
                 nvme_wait_note("io");
+                console_write("nvme: report #");
+                console_write_dec((u64)reported);
+                console_write(" cq_head=");
+                console_write_dec(dev->io_cq_head);
+                console_write(" cq[head].status=0x");
+                console_write_hex32(dev->io_cq[dev->io_cq_head].status);
+                console_write(" queue_size=");
+                console_write_dec(dev->queue_size);
+                console_write("\n");
                 {
                     u16 last = (u16)((dev->io_sq_tail + dev->queue_size - 1) %
                                      dev->queue_size);

@@ -121,6 +121,7 @@ void blk_clear_dirty_owner(void);
 /* Write back only the dirty blocks stamped with this owner (plus unstamped
  * ones), then flush the device. */
 int blk_cache_flush_inode(struct block_device *dev, u32 fsid, u64 ino);
+int blk_cache_writeback_inode(struct block_device *dev, u32 fsid, u64 ino);
 
 #define BLK_CACHE_DIRTY 0x01
 #define BLK_CACHE_VALID 0x02

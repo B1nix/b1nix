@@ -108,10 +108,24 @@ static void workqueue_thread(void *arg)
 		wq_arm_due(wq);
 		struct work_struct *w = wq_dequeue(wq);
 		if (!w) {
-			/* Nothing to do. Park on the queue itself; queue_work wakes it.
-			 * The short timeout also services delayed items. */
+			/* Nothing to run. Park on the queue itself; queue_work wakes
+			 * it, and the one-tick timeout brings it back to arm whatever
+			 * delayed item has come due in the meantime.
+			 *
+			 * A pending delayed item is NOT a reason to cancel the wait. It
+			 * used to be, and since wq_arm_due had already found nothing due,
+			 * the cancel put the thread straight back into a loop with no
+			 * sleep in it at all: arm nothing, dequeue nothing, prepare,
+			 * cancel, again. One delayed work with a deadline in the future
+			 * was enough to make this thread spin on the boot CPU until that
+			 * deadline arrived -- and on this arch userspace runs only on the
+			 * boot CPU, so everything else on the machine stopped. It showed
+			 * up as ordinary commands taking nine seconds, and, when the
+			 * deadline was far enough out, as the watchdog calling the
+			 * instance deadlocked. The timeout already services delayed
+			 * items; sleeping through it is the point. */
 			scheduler_wait_prepare_timeout(wq, 1);
-			if (wq->head || wq->delayed || wq->stop)
+			if (wq->head || wq->stop)
 				scheduler_wait_cancel();
 			else
 				scheduler_wait_commit();

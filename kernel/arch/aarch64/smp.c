@@ -96,15 +96,16 @@ void aarch64_set_kstack_top(u64 top)
 {
 	struct aarch64_pcpu_asm *p = pcpu_asm_self();
 
-	/* Temporary: whoever clobbers TPIDR_EL1 gets named here rather than
-	 * surfacing as a corrupt stack pointer three context switches later. */
-	if (p && (p < &g_pcpu_asm[0] || p >= &g_pcpu_asm[AARCH64_ASM_CPUS])) {
-		console_write("pcpu: TPIDR_EL1 clobbered: 0x");
-		console_write_hex64((u64)(usize)p);
-		console_write("\n");
-		panic("aarch64: per-CPU block pointer lost");
-	}
-
+	/* The range check that used to stand here -- "is TPIDR_EL1 still inside
+	 * g_pcpu_asm?" -- is gone. It was added while a corruption hunt was live
+	 * and labelled temporary; it never fired, and the invariant it asserted is
+	 * structural rather than something to test on every context switch:
+	 * TPIDR_EL1 is written in exactly one place in the tree
+	 * (aarch64_pcpu_asm_init, just above), always with the address of a fixed
+	 * static array, and isr.S only ever reads it.
+	 *
+	 * The zero case below is a different thing and stays: it is not a
+	 * corruption check but a bootstrap, and it is load-bearing. */
 	if (!p) {
 		/* Before aarch64_pcpu_asm_init: install the boot CPU's block now
 		 * rather than dropping the value. Losing the first publish is not a
@@ -184,6 +185,45 @@ struct percpu *aarch64_get_percpu(void)
 	return &g_percpu[g_aff0_to_cpu[mpidr() & 0xff]];
 }
 
+/* Which affinity-0 value each CPU index actually booted with.
+ *
+ * aarch64_get_percpu() maps MPIDR through g_aff0_to_cpu on EVERY per-CPU
+ * access, so that one table decides which block a CPU reads -- including
+ * cur_task, and including pcpu->cpu_id, which pick_next_task turns into
+ * `on_ap`. A CPU that resolved to index 0 would believe it is the boot
+ * processor: it would drain the global runqueue and scan the task table with
+ * no ap_runnable filter, which is the only way a secondary can reach the boot
+ * task at all. Every foreign-stack report this port has produced names the
+ * boot task, so the question is worth answering rather than assuming.
+ *
+ * The bring-up self-check could not answer it: it compares the table against
+ * itself. This records the ground truth each CPU knows about itself, so the
+ * check below compares the block a CPU resolves to against the CPU it IS. */
+static u8 g_cpu_aff0[AARCH64_ASM_CPUS];
+static u8 g_cpu_aff0_valid[AARCH64_ASM_CPUS];
+
+void aarch64_percpu_record_self(u32 cpu)
+{
+	if (cpu >= AARCH64_ASM_CPUS)
+		return;
+	g_cpu_aff0[cpu] = (u8)(mpidr() & 0xff);
+	__atomic_store_n(&g_cpu_aff0_valid[cpu], 1, __ATOMIC_RELEASE);
+}
+
+/* 0 = consistent (or not yet recorded), 1 = this CPU is reading somebody
+ * else's per-CPU block. Cheap: one system register read and two loads. */
+int aarch64_percpu_self_mismatch(void)
+{
+	u64 aff0 = mpidr() & 0xff;
+	u32 idx = g_aff0_to_cpu[aff0];
+
+	if (idx >= AARCH64_ASM_CPUS)
+		return 1;
+	if (!__atomic_load_n(&g_cpu_aff0_valid[idx], __ATOMIC_ACQUIRE))
+		return 0; /* that CPU has not introduced itself yet */
+	return g_cpu_aff0[idx] != (u8)aff0;
+}
+
 struct percpu *get_percpu_n(int idx)
 {
 	if (idx < 0 || idx >= g_max_cpus)
@@ -200,6 +240,7 @@ void percpu_init(void)
 	g_percpu[0].cur_task = 0;
 	g_percpu[0].cpu_online = 1;
 	g_aff0_to_cpu[mpidr() & 0xff] = 0;
+	aarch64_percpu_record_self(0);
 }
 
 int get_online_cpu_count(void)
@@ -280,6 +321,9 @@ void aarch64_ap_main(u64 cpu)
 	 * this project a marker before. */
 	pcpu->cpu_id = (u32)cpu;
 	pcpu->scheduler_started = 1;
+	/* Ground truth for aarch64_percpu_self_mismatch(): the affinity this CPU
+	 * actually has, recorded under the index it was told to use. */
+	aarch64_percpu_record_self((u32)cpu);
 	/* Does this CPU agree with the table about who it is? aarch64_get_percpu()
 	 * resolves mpidr's affinity-0 field through g_aff0_to_cpu on EVERY percpu
 	 * access, so if that lookup answered 0 here, this CPU would spend its life
@@ -307,16 +351,50 @@ void aarch64_ap_main(u64 cpu)
 
 		struct task *t = rq_dequeue(&pcpu->runqueue);
 
-		if (t && !(t->state == TASK_READY && t->stealable)) {
-			rq_enqueue(&pcpu->runqueue, t);
-			t = 0;
+		if (t) {
+			/* Claim it the way every other picker does.
+			 *
+			 * This branch took a task on a plain `state == READY &&
+			 * stealable` read and then published TASK_RUNNING with a plain
+			 * store: no wait for the outgoing CPU to publish its stack
+			 * hand-off, no check that the task is not already some CPU's
+			 * current task, and no atomic claim. sched_steal_task, three lines
+			 * below, carries a comment describing exactly that bug and the
+			 * protocol that fixes it -- "a task that a waker had marked READY
+			 * while it went on executing was stolen out from under the CPU
+			 * running it, and two CPUs ended up returning through one kernel
+			 * stack" -- but only the steal path was ever converted. This one
+			 * dequeues from THIS CPU's own runqueue, which is fed by wakers on
+			 * any CPU, so it can meet the same task in the same state.
+			 *
+			 * Same four conditions, same CAS. Losing the CAS means somebody
+			 * else has it: drop the entry rather than re-queueing a task that
+			 * is now RUNNING elsewhere. */
+			int claimable =
+			    t->state == TASK_READY && t->stealable &&
+			    __atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE) &&
+			    !task_running_somewhere(t);
+			enum task_state expected = TASK_READY;
+
+			if (!claimable) {
+				rq_enqueue(&pcpu->runqueue, t);
+				t = 0;
+			} else if (__atomic_compare_exchange_n(&t->state, &expected,
+			                                       TASK_RUNNING, 0,
+			                                       __ATOMIC_ACQUIRE,
+			                                       __ATOMIC_RELAXED)) {
+				/* The stack belongs to this CPU from here on. */
+				__atomic_store_n(&t->stack_released, 0, __ATOMIC_RELEASE);
+			} else {
+				t = 0;
+			}
 		}
 		if (!t)
 			t = sched_steal_task(); /* READY stealable workers only */
 
 		if (t) {
-			t->state = TASK_RUNNING;
-			sched_note_boot_task_on_secondary(t, "ap-phase1");
+			/* state is already TASK_RUNNING, published by whichever claim
+			 * above won it. */
 			pcpu->cur_task = t;
 			pcpu->sched_return_ctx = &idle_ctx;
 			arch_context_switch(&idle_ctx, &t->context, (volatile int *)0);
@@ -347,14 +425,23 @@ void aarch64_ap_main(u64 cpu)
 	struct task *idle = scheduler_setup_ap_idle((int)cpu, pcpu->kernel_stack_virt);
 
 	pcpu->idle_task = idle;
-	sched_note_boot_task_on_secondary(idle, "ap-phase2-idle");
 	pcpu->cur_task = idle;
-	/* Keep the phase-1 return context. `idle_ctx` is a local of this function
-	 * and this function never returns, so it stays valid for as long as the
-	 * CPU runs -- and a stealable worker that was still on this CPU when the
-	 * phase flipped has to have somewhere to switch back to. Clearing it left
-	 * ap_worker_trampoline restoring a context from address 0. */
-	pcpu->sched_return_ctx = &idle_ctx;
+	/* Phase 2 owns no return context, exactly as x86_64 does it
+	 * (kernel/arch/x86_64/lapic.c clears the same field at this transition).
+	 *
+	 * `idle_ctx` is a local of this function, so it names a frame on THIS
+	 * CPU's boot stack. In phase 1 that is what a finished stealable worker
+	 * switches back into, and it is correct: the worker is on this CPU. In
+	 * phase 2 the full scheduler picks tasks and switches them itself, and a
+	 * pointer to one CPU's stack frame left lying in per-CPU state is a way
+	 * for a second CPU to end up executing on it -- which is the corruption
+	 * this arch keeps landing on (a struct task* turning up in a saved LR).
+	 *
+	 * Clearing it used to be silent: ap_worker_trampoline restored a context
+	 * from address 0 and the task died at a PC unrelated to the fault. That
+	 * case now panics by name, so if a worker really does return here the
+	 * failure says so instead of corrupting a stack. */
+	pcpu->sched_return_ctx = 0;
 
 	for (;;) {
 		int switched = scheduler_yield();

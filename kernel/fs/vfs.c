@@ -964,7 +964,25 @@ static void vfs_inode_lock_clear_note(struct vfs_inode *inode) {
   inode->rw_site = 0;
 }
 
+__attribute__((noinline))
 static void vfs_inode_lock_read(struct vfs_inode *inode) {
+  /* Same trap as the write side: a task holding the write lock cannot take the
+   * read lock, so asking is a wait on itself. */
+  if (current_task &&
+      __atomic_load_n(&inode->rw_lock, __ATOMIC_ACQUIRE) < 0 &&
+      __atomic_load_n(&inode->rw_owner, __ATOMIC_RELAXED) ==
+          (u64)current_task->id) {
+    console_write("[LOCK] inode ");
+    console_write_dec((u64)inode->ino);
+    console_write(" read-locked by its own writer, pid ");
+    console_write_dec((u64)current_task->id);
+    console_write(": held from 0x");
+    console_write_hex64((u64)(usize)inode->rw_site);
+    console_write(", asked again from 0x");
+    console_write_hex64((u64)(usize)__builtin_return_address(0));
+    console_write("\n");
+    panic("vfs: inode read-lock under its own write-lock");
+  }
   if (blk_cache_lock_is_held()) {
     /* Walking the frame pointer chain into panic() shows just the
      * vfs_inode_lock_read frame; print our caller's return address up-front
@@ -1052,7 +1070,117 @@ void vfs_inode_wait_reset(void) {
   __atomic_store_n(&g_inode_wait_worst, 0, __ATOMIC_RELAXED);
 }
 
+/* Write-locked inodes, so a task that dies holding one does not strand every
+ * waiter behind it for ever.
+ *
+ * Seen directly: inode 89 write-locked (rw_lock = -1) with rw_owner = 189, a
+ * pid that was no longer in the task table, and /bin/m13 blocked in write(2)
+ * behind it. Above that sat a whole process chain -- openrc-run polling, then
+ * openrc, then init in waitpid -- so one leaked inode lock wedges a smoke lane
+ * for the harness's entire window.
+ *
+ * A write lock is held across short critical sections and there are only ever a
+ * handful outstanding, so a small fixed table costs nothing to keep and can be
+ * scanned on exit. Readers are not tracked: a reader count cannot pin the lock
+ * against a writer for ever the way a lost write lock does, and tracking them
+ * would need an entry per reader per inode. */
+#define VFS_WLOCK_TRACK 64
+static struct {
+  struct vfs_inode *inode;
+  u64 owner;
+} g_vfs_wlocks[VFS_WLOCK_TRACK];
+static spinlock_t g_vfs_wlocks_lock = SPINLOCK_INIT;
+
+static void vfs_wlock_track(struct vfs_inode *inode, u64 owner) {
+  u64 flags;
+  spin_lock_irqsave(&g_vfs_wlocks_lock, &flags);
+  for (int i = 0; i < VFS_WLOCK_TRACK; i++) {
+    if (!g_vfs_wlocks[i].inode) {
+      g_vfs_wlocks[i].inode = inode;
+      g_vfs_wlocks[i].owner = owner;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&g_vfs_wlocks_lock, flags);
+}
+
+static void vfs_wlock_untrack(struct vfs_inode *inode) {
+  u64 flags;
+  spin_lock_irqsave(&g_vfs_wlocks_lock, &flags);
+  for (int i = 0; i < VFS_WLOCK_TRACK; i++) {
+    if (g_vfs_wlocks[i].inode == inode) {
+      g_vfs_wlocks[i].inode = 0;
+      g_vfs_wlocks[i].owner = 0;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&g_vfs_wlocks_lock, flags);
+}
+
+/* Called from the exit path with the dying task's id. Anything it still holds
+ * is released and reported: the release keeps the lane alive, the report names
+ * the site so the path that leaked it can be fixed rather than tolerated. */
+void vfs_release_inode_locks_of(u64 owner) {
+  u64 flags;
+
+  if (!owner)
+    return;
+  spin_lock_irqsave(&g_vfs_wlocks_lock, &flags);
+  for (int i = 0; i < VFS_WLOCK_TRACK; i++) {
+    struct vfs_inode *inode = g_vfs_wlocks[i].inode;
+
+    if (!inode || g_vfs_wlocks[i].owner != owner)
+      continue;
+    g_vfs_wlocks[i].inode = 0;
+    g_vfs_wlocks[i].owner = 0;
+    spin_unlock_irqrestore(&g_vfs_wlocks_lock, flags);
+
+    console_write("vfs: task ");
+    console_write_dec(owner);
+    console_write(" exited holding the write lock on inode ");
+    console_write_dec(inode->ino);
+    console_write(" taken at 0x");
+    console_write_hex64((u64)(usize)inode->rw_site);
+    console_write("; releasing it\n");
+
+    vfs_inode_lock_clear_note(inode);
+    __atomic_store_n(&inode->rw_lock, 0, __ATOMIC_RELEASE);
+    scheduler_wake_all((void *)&inode->rw_lock);
+
+    spin_lock_irqsave(&g_vfs_wlocks_lock, &flags);
+  }
+  spin_unlock_irqrestore(&g_vfs_wlocks_lock, flags);
+}
+
+/* noinline, deliberately: vfs_inode_lock_note records
+ * __builtin_return_address(0) as the acquiring site, and that address is only
+ * the caller's while this function has a frame of its own. Inlined, every
+ * report named whoever called the caller. */
+__attribute__((noinline))
 static void vfs_inode_lock_write(struct vfs_inode *inode) {
+  /* Self-deadlock: this rwlock is not recursive, so a task that already holds
+   * it for writing and asks again waits for itself for ever. That is not a
+   * hang to be discovered 120 seconds later from a watchdog dump -- by then
+   * the acquiring site is long gone from the stack and the whole lane, plus
+   * every process waiting on it, has been lost. Name it here, where both
+   * sites are still known. */
+  if (current_task &&
+      __atomic_load_n(&inode->rw_lock, __ATOMIC_ACQUIRE) < 0 &&
+      __atomic_load_n(&inode->rw_owner, __ATOMIC_RELAXED) ==
+          (u64)current_task->id) {
+    console_write("[LOCK] inode ");
+    console_write_dec((u64)inode->ino);
+    console_write(" write-locked recursively by pid ");
+    console_write_dec((u64)current_task->id);
+    console_write(" ('");
+    console_write(current_task->name ? current_task->name : "?");
+    console_write("'): held from 0x");
+    console_write_hex64((u64)(usize)inode->rw_site);
+    console_write(", asked again from 0x");
+    console_write_hex64((u64)(usize)__builtin_return_address(0));
+    console_write("\n");
+    panic("vfs: recursive inode write-lock");
+  }
   if (blk_cache_lock_is_held()) {
     console_write("[LOCK ORDER] vfs_inode_lock_write called by 0x");
     console_write_hex64((u64)(usize)__builtin_return_address(0));
@@ -1064,6 +1192,7 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
     int val = 0;
     if (__atomic_compare_exchange_n(&inode->rw_lock, &val, -1, 0,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      vfs_wlock_track(inode, current_task ? (u64)current_task->id : 0);
       if (wait_start)
         vfs_inode_wait_note(vfs_lock_tsc() - wait_start, inode->rw_site);
       break;
@@ -1087,6 +1216,7 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
 }
 
 static void vfs_inode_unlock_write(struct vfs_inode *inode) {
+  vfs_wlock_untrack(inode);
   LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_INODE);
   vfs_inode_lock_clear_note(inode);
   __atomic_store_n(&inode->rw_lock, 0, __ATOMIC_RELEASE);
@@ -1114,11 +1244,16 @@ void vfs_inode_chan_report(u64 chan, u64 payload_base, usize block_size) {
   console_write("\n");
 }
 
-/* Compatibility wrappers */
-static void vfs_inode_lock(struct vfs_inode *inode) {
+/* Compatibility wrappers. always_inline so the acquiring site recorded by
+ * vfs_inode_lock_write is the caller of THIS, not this wrapper -- every
+ * report used to name the same address inside the wrapper, which said
+ * nothing about which of its thirty callers had taken the lock. */
+__attribute__((always_inline))
+static inline void vfs_inode_lock(struct vfs_inode *inode) {
   vfs_inode_lock_write(inode);
 }
-static void vfs_inode_unlock(struct vfs_inode *inode) {
+__attribute__((always_inline))
+static inline void vfs_inode_unlock(struct vfs_inode *inode) {
   vfs_inode_unlock_write(inode);
 }
 
@@ -5945,19 +6080,49 @@ int vfs_fsync(int fd) {
     return -EBADF;
   struct vfs_node *node = h->node;
 
-  /* Inode lock across the flush — see vfs_close_handle (flush vs a concurrent
-   * truncate's in-place page zeroing). */
-  int err = vfs_node_fsync(node);
-  if (err < 0)
-    return err;
+  /* Everything this file owns reaches the medium first, and the device barrier
+   * is issued once, at the end.
+   *
+   * This used to call the filesystem's fsync_cb -- which writes the super block
+   * and issues a cache-flush command -- and only THEN write the file's own
+   * dirty blocks back, followed by a second flush. So the first barrier came
+   * before the writeback it existed to make durable (ext4_vfs_fsync's comment
+   * describes the correct order; the code did not implement it), and every
+   * fsync paid for two barriers where one would do.
+   *
+   * It is worth real time: on the aarch64 sys lane, fsync was 47 s of a 176 s
+   * run across 19 calls, ~2.5 s each, and a barrier is most of that.
+   *
+   * Inode lock across the page-cache flush -- see vfs_close_handle (flush vs a
+   * concurrent truncate's in-place page zeroing). */
+  vfs_inode_lock(node->inode);
+  page_cache_flush_inode(node->inode);
+  vfs_inode_unlock(node->inode);
 
   if (node->inode->blk_dev) {
-    /* Persist THIS file, then flush the device — fsync is about one file, and
-     * draining every dirty block in a RAM-sized cache is what made a single
-     * call cost seconds. Blocks carry the inode that dirtied them, so the rest
-     * stays for the background drain. */
-    blk_cache_flush_inode(node->inode->blk_dev, node->inode->fs_id,
-                          node->inode->ino);
+    /* Persist THIS file, not the machine: fsync is about one file, and draining
+     * every dirty block in a RAM-sized cache is what made a single call cost
+     * seconds. Blocks carry the inode that dirtied them, so the rest stays for
+     * the background drain. No barrier here — fsync_cb below issues it. */
+    blk_cache_writeback_inode(node->inode->blk_dev, node->inode->fs_id,
+                              node->inode->ino);
+  }
+
+  if (node->inode->fsync_cb) {
+    int err = node->inode->fsync_cb(node);
+
+    if (err < 0)
+      return err;
+  } else if (node->inode->blk_dev && node->inode->blk_dev->flush) {
+    /* No filesystem callback to issue the barrier, so issue it here. */
+    struct block_device *d = node->inode->blk_dev;
+
+    struct block_device *parent = blk_partition_parent(d);
+
+    if (parent)
+      d = parent;
+    if (d->flush)
+      d->flush(d);
   }
   return 0;
 }

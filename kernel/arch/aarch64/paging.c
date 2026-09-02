@@ -41,10 +41,12 @@ extern u8 __kernel_end[];
  * Swapped-out pages are recorded as a non-present SW leaf carrying the swap
  * slot, and faulted back in by swap_in_fault.
  *
- * ponytail: still no file-backed demand paging here — the fault handler runs
- * from the exception vectors with IRQs masked, so it cannot do the blocking
- * read x86_64's handler does. Every case implemented above is allocation and
- * memcpy only. See docs/aarch64-parity.md.
+ * File-backed pages ARE demand-paged. The fault handler cannot do the blocking
+ * read inline -- the exception vectors enter with IRQs masked -- so it does not
+ * try: handle_page_fault_locked classifies the fault and returns
+ * PF_NEEDS_FILE_FILL, and file_fill_fault does the read outside the page-table
+ * lock and installs the leaf only if the marker is still there. That is the
+ * same shape the swap-in case uses, for the same reason.
  */
 
 #define IDX_MASK 0x1ffULL
@@ -1080,7 +1082,16 @@ static void mprotect_page_in_l0(u64 *l0, u64 virtual_address, u64 flags) {
      * that materialises the page copies the marker's flags verbatim. Dropping
      * it left the page looking private, so fork marked it copy-on-write and a
      * child's stores never reached the parent. */
-    const u64 mutable_bits = VMM_WRITABLE | VMM_USER | VMM_SHARED;
+    /* VMM_NO_EXECUTE belongs in this set for the same reason VMM_WRITABLE
+     * does: it IS a protection bit, and this function's whole job is to apply
+     * the caller's protection. Leaving it out meant a lazily committed
+     * mapping's marker never recorded "no execute" -- vmm_set_lazy plants
+     * USER|WRITABLE and nothing else, and the fault that materialises the page
+     * feeds the marker's flags straight to encode_leaf -- so every page of a
+     * MAP_NORESERVE data mapping came back EXECUTABLE however it was
+     * mprotect()ed. */
+    const u64 mutable_bits =
+        VMM_WRITABLE | VMM_USER | VMM_SHARED | VMM_NO_EXECUTE;
     l3[i3] = (entry & ~mutable_bits) | (flags & mutable_bits) | VMM_LAZY;
   }
 }

@@ -76,6 +76,14 @@ _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
 #define TASK_CHUNK_SIZE   64
 #define TASK_MAX_CHUNKS   64
 #define MAX_TASKS         (TASK_CHUNK_SIZE * TASK_MAX_CHUNKS)  /* 4096 */
+/* Side tables are indexed by task_index(), and the per-CPU idle tasks are NOT
+ * in the task table -- see scheduler_setup_ap_idle for why putting them there
+ * was tried and reverted. task_index() used to answer 0 for anything it could
+ * not find in a chunk, so every idle task aliased slot 0, the boot task, in
+ * every one of these arrays at once: two CPUs sharing one task's FPU area,
+ * stride pass, nice, affinity and syscall ring. Give them slots of their own
+ * above the table instead. */
+#define TASK_SLOTS        (MAX_TASKS + MAX_CPUS)
 /* The kernel stack is a kmalloc'd block in the shared kheap, so an overflow
  * silently corrupts the adjacent heap block (e.g. a vfs_node) instead of
  * faulting. b1nix runs the busybox coreutils builtins in kernel mode on this
@@ -114,7 +122,43 @@ extern void arch_fpu_capture_clean(void *area);
  * allocation per concurrently-live slot and removes any chance of freeing an
  * area a context switch is still using. Kernel threads never touch the FPU and
  * so never get one — they keep using the 512-byte FXSAVE area in struct task. */
-static void *g_task_xsave[MAX_TASKS];
+static void *g_task_xsave[TASK_SLOTS];
+
+/* Is this task inside its switch-OUT window?
+ *
+ * Set just before arch_context_switch and cleared by whichever pick next
+ * claims the task. Between those two points the task has already stopped being
+ * any CPU's cur_task (scheduler_yield publishes the incoming task first, on
+ * purpose) while arch_context_switch is still writing its callee-saved state
+ * into ->context and has not yet published the stack lease. Nothing else can
+ * tell that state apart from a task whose lease is genuinely stale, and the
+ * difference decides whether another CPU may load ->context and run on that
+ * stack. See sched_handoff_recover.
+ *
+ * A side table, not a field: adding to struct task is its own hazard here (see
+ * the M29 note on g_task_is_thread and friends), and the idle tasks have slots
+ * above MAX_TASKS which TASK_SLOTS already covers. */
+static volatile int g_task_switching_out[TASK_SLOTS];
+
+/* The task this CPU was running just before the one it is switching to. Only
+ * meaningful between scheduler_yield's cur_task publish and the SP load inside
+ * arch_context_switch; see the note at its assignment. */
+static struct task *volatile g_cpu_prev_task[MAX_CPUS];
+
+static void sched_set_prev_task(struct task *t) {
+  struct percpu *pcpu = get_percpu();
+
+  if (pcpu && pcpu->cpu_id < MAX_CPUS)
+    g_cpu_prev_task[pcpu->cpu_id] = t;
+}
+
+struct task *sched_prev_task_this_cpu(void) {
+  struct percpu *pcpu = get_percpu();
+
+  if (!pcpu || pcpu->cpu_id >= MAX_CPUS)
+    return 0;
+  return g_cpu_prev_task[pcpu->cpu_id];
+}
 
 /* The last calls each thread made.
  *
@@ -126,9 +170,9 @@ static void *g_task_xsave[MAX_TASKS];
  * two stores per system call and 128 KB, and the watchdog prints them beside
  * the thread that stopped. */
 #define SYSRING_DEPTH 64
-static u16 g_sysring[MAX_TASKS][SYSRING_DEPTH];
-static u8 g_sysring_pos[MAX_TASKS];
-static void *g_task_xsave_raw[MAX_TASKS];
+static u16 g_sysring[TASK_SLOTS][SYSRING_DEPTH];
+static u8 g_sysring_pos[TASK_SLOTS];
+static void *g_task_xsave_raw[TASK_SLOTS];
 
 
 
@@ -213,8 +257,8 @@ static usize g_last_pick_id = (usize)-1;
 /* M29: per-task thread metadata kept in parallel arrays (NOT in struct task
  * — see comment in sched.h). Indexed by the slot in g_task_chunks computed
  * via task_index(). */
-static int  g_task_is_thread[MAX_TASKS];
-static u64  g_task_tls_base[MAX_TASKS];
+static int  g_task_is_thread[TASK_SLOTS];
+static u64  g_task_tls_base[TASK_SLOTS];
 
 /* Non-preemptible depth, per CPU. Imported drivers ask for this around short
  * register polls; see lkpi_preempt_disable. Interrupts stay on, so the only
@@ -238,14 +282,14 @@ void scheduler_preempt_enable(void) {
     g_preempt_depth[cpu]--;
   interrupts_restore(flags);
 }
-static u64  g_task_child_tid_clear[MAX_TASKS];
-static u64  g_task_saved_sigmask[MAX_TASKS];
-static int  g_task_has_saved_sigmask[MAX_TASKS];
+static u64  g_task_child_tid_clear[TASK_SLOTS];
+static u64  g_task_saved_sigmask[TASK_SLOTS];
+static int  g_task_has_saved_sigmask[TASK_SLOTS];
 /* sigaltstack side-table (per-task alternate signal stack). Kept here, NOT in
  * struct task, to preserve the M29 paging invariant. ss_size == 0 means no alt
  * stack is registered. */
-static u64  g_task_altstack_sp[MAX_TASKS];
-static u64  g_task_altstack_size[MAX_TASKS];
+static u64  g_task_altstack_sp[TASK_SLOTS];
+static u64  g_task_altstack_size[TASK_SLOTS];
 
 /* M74 RT signals (SIGRTMIN..SIGRTMAX). Per-task RT sigactions + a FIFO of queued
  * (signo, code, value) payloads, lazily allocated (most tasks never use RT
@@ -264,7 +308,7 @@ struct rt_state {
   int qhead;  /* index of oldest entry */
   int qcount; /* live entries */
 };
-static struct rt_state *g_rt_state[MAX_TASKS];
+static struct rt_state *g_rt_state[TASK_SLOTS];
 /* SMP: with the BKL gone, two CPUs can sigqueue to the same task (or the timer
  * ISR can fire) concurrently. interrupts_save() only masks the local CPU, so it
  * does NOT serialise across cores. g_rt_lock guards every RT-queue / RT-sigaction
@@ -304,16 +348,16 @@ struct posix_timer {
 static struct posix_timer g_posix_timers[MAX_POSIX_TIMERS];
 static void posix_timers_tick(void); /* fire expired timers (defined below) */
 
-static u64  g_task_alarm_ticks[MAX_TASKS];
+static u64  g_task_alarm_ticks[TASK_SLOTS];
 /* setitimer(ITIMER_REAL) repeat period; 0 = one-shot (plain alarm(2)). */
-static u64  g_task_alarm_interval_ticks[MAX_TASKS];
+static u64  g_task_alarm_interval_ticks[TASK_SLOTS];
 /* Set once the task has successfully execve()d. POSIX setpgid: changing a
  * CHILD's process group after it exec'd is EACCES. Deliberately NOT copied
  * by fork — the fresh child has not exec'd yet. */
-static int  g_task_execed[MAX_TASKS];
+static int  g_task_execed[TASK_SLOTS];
 /* POSIX nice value (-20..19, 0 default) — see scheduler_set_priority for why
  * this is NOT task->priority. Inherited across fork. */
-static int  g_task_nice[MAX_TASKS];
+static int  g_task_nice[TASK_SLOTS];
 
 /* Stride for one nice value: how far a task's pass advances each time it gives
  * the CPU up. The scheduler then always picks the smallest pass among equal
@@ -338,8 +382,8 @@ int sched_stride_for_nice(int nice) {
   return 1000 / tickets;
 }
 
-static struct rlimit g_task_rlimits[MAX_TASKS][16];
-static usize g_task_tgid[MAX_TASKS];
+static struct rlimit g_task_rlimits[TASK_SLOTS][16];
+static usize g_task_tgid[TASK_SLOTS];
 /* How far into exit a task has got.
  *
  * A task observed READY with its exiting flag set is looping somewhere in the
@@ -347,7 +391,7 @@ static usize g_task_tgid[MAX_TASKS];
  * release, reparenting, the leader's wait for its threads. A single number per
  * task, printed beside it in the watchdog dump, turns "stuck in exit" into a
  * line of code. */
-static u8 g_task_exit_stage[MAX_TASKS];
+static u8 g_task_exit_stage[TASK_SLOTS];
 #define EXIT_STAGE(n) do { \
     if (current_task) g_task_exit_stage[task_index(current_task)] = (n); \
   } while (0)
@@ -358,7 +402,7 @@ static u8 g_task_exit_stage[MAX_TASKS];
  * leader would process that pending SIGKILL in scheduler_deliver_pending_signals
  * and overwrite its exit_group(0) code with SIGNALED|SIGKILL, so waitpid reports
  * a spurious signalled death (M29 stress-exit-code). */
-static u8    g_task_exiting[MAX_TASKS];
+static u8    g_task_exiting[TASK_SLOTS];
 
 /*
  * Depth of kernel critical sections a task is inside — sections it must be
@@ -377,7 +421,7 @@ static u8    g_task_exiting[MAX_TASKS];
  * counter: while it is non-zero the kill is left pending, and the section's own
  * exit path delivers it.
  */
-static u8    g_task_kcrit[MAX_TASKS];
+static u8    g_task_kcrit[TASK_SLOTS];
 
 void scheduler_kcrit_enter(void) {
   if (!current_task)
@@ -399,8 +443,8 @@ static int task_in_kcrit(struct task *t) {
   usize idx = task_index(t);
   return idx < MAX_TASKS && g_task_kcrit[idx] != 0;
 }
-static int   g_task_ctty_type[MAX_TASKS];
-static int   g_task_ctty_index[MAX_TASKS];
+static int   g_task_ctty_type[TASK_SLOTS];
+static int   g_task_ctty_index[TASK_SLOTS];
 /* M86: per-thread CPU accounting, in NANOSECONDS. The counters are advanced by
  * acct_flush() from the four boundaries where a CPU changes what it is running
  * or which mode it runs in (ring-3 entry/exit and context switch), so they are
@@ -408,13 +452,13 @@ static int   g_task_ctty_index[MAX_TASKS];
  * a thread that always blocks before the tick used to account as 0. Per-task
  * counters are only ever written by the CPU currently running that task, so
  * plain adds are SMP-safe. */
-static u64   g_task_utime_ns[MAX_TASKS];
-static u64   g_task_stime_ns[MAX_TASKS];
-static u64   g_task_cutime_ns[MAX_TASKS];
-static u64   g_task_cstime_ns[MAX_TASKS];
+static u64   g_task_utime_ns[TASK_SLOTS];
+static u64   g_task_stime_ns[TASK_SLOTS];
+static u64   g_task_cutime_ns[TASK_SLOTS];
+static u64   g_task_cstime_ns[TASK_SLOTS];
 /* Scheduler tick at which the slot's current occupant was created — /proc's
  * starttime field, and the base for a task's wall-clock age. */
-static u64   g_task_start_tick[MAX_TASKS];
+static u64   g_task_start_tick[TASK_SLOTS];
 
 /* The number a pidfd reports as its inode.
  *
@@ -425,19 +469,19 @@ static u64   g_task_start_tick[MAX_TASKS];
  * concluded every time that the descriptor now referred to something else
  * ("Failed to spawn executor: Object is remote", EREMOTE from
  * pidref_verify()). Assigned per task at creation and never reused. */
-static u64   g_task_pidfs_ino[MAX_TASKS];
+static u64   g_task_pidfs_ino[TASK_SLOTS];
 static u64   g_pidfs_ino_next = 1;
 /* Context-switch counts: voluntary (the task blocked/slept/exited of its own
  * accord) and involuntary (it was still runnable when preempted). getrusage's
  * ru_nvcsw/ru_nivcsw. */
-static u64   g_task_nvcsw[MAX_TASKS];
-static u64   g_task_nivcsw[MAX_TASKS];
+static u64   g_task_nvcsw[TASK_SLOTS];
+static u64   g_task_nivcsw[TASK_SLOTS];
 /* CPU time of threads that have already exited, folded into their thread-group
  * leader's slot. Without it a process's own CPU time would SHRINK as its
  * threads finish — times(2), getrusage(RUSAGE_SELF) and
  * CLOCK_PROCESS_CPUTIME_ID all have to keep counting work that is done. */
-static u64   g_task_gone_utime_ns[MAX_TASKS];
-static u64   g_task_gone_stime_ns[MAX_TASKS];
+static u64   g_task_gone_utime_ns[TASK_SLOTS];
+static u64   g_task_gone_stime_ns[TASK_SLOTS];
 /* M86: set while a thread-group leader that called exit(2) waits for its
  * remaining threads (scheduler_exit_thread). Such a leader is already dead as
  * far as userspace is concerned, so a group teardown must not SIGKILL it — it
@@ -453,25 +497,25 @@ static u64   g_task_gone_stime_ns[MAX_TASKS];
  * and swap-out, so sampling immediately before each of those, plus on every
  * read, sees every peak; the sample is rate-limited to one per scheduler tick
  * so a munmap-heavy process does not pay for a page-table walk per call. */
-static u64   g_task_maxrss_pages[MAX_TASKS];
-static u64   g_task_rss_sample_tick[MAX_TASKS];
-static u8    g_task_parked_leader[MAX_TASKS];
-static u8    g_task_parked_override[MAX_TASKS];
-static int   g_task_parked_code[MAX_TASKS];
+static u64   g_task_maxrss_pages[TASK_SLOTS];
+static u64   g_task_rss_sample_tick[TASK_SLOTS];
+static u8    g_task_parked_leader[TASK_SLOTS];
+static u8    g_task_parked_override[TASK_SLOTS];
+static int   g_task_parked_code[TASK_SLOTS];
 /* Set on a thread pulled into a group stop by a signal sent to its leader: it
  * parks without posting its own SIGCHLD/stop report (see the delivery path). */
-static u8    g_task_stop_quiet[MAX_TASKS];
-static u64   g_task_pass[MAX_TASKS];
+static u8    g_task_stop_quiet[TASK_SLOTS];
+static u64   g_task_pass[TASK_SLOTS];
 /* sched_setaffinity's per-task CPU mask. Defined here, beside the other slot
  * side tables, because find_unused_task must clear it when it recycles a
  * slot. 0 means "any CPU". */
-static u64 g_task_affinity[MAX_TASKS];
+static u64 g_task_affinity[TASK_SLOTS];
 static u64   g_min_pass = 0;
 /* Last userspace RIP of each task, captured by the LAPIC timer tick when it
  * preempts a ring-3 task (see task_set_user_rip). Consumed by the silence
  * watchdog task dump to name the user function a wedged thread group spins
  * in. */
-static u64   g_task_user_rip[MAX_TASKS];
+static u64   g_task_user_rip[TASK_SLOTS];
 /* Scratch: which address the dump above decided to show for the current
  * thread — the sampled one or the syscall entry — so the mapping lookup that
  * follows describes the address actually printed. */
@@ -486,49 +530,55 @@ static u64   g_task_user_rip_shown;
  * arguments at all: `ps` showed a column of identical paths, and a browser's
  * helper processes — which are the same binary as the browser and differ only
  * in their flags — were indistinguishable from it and from each other. */
-static char *g_task_cmdline[MAX_TASKS];
-static usize g_task_cmdline_len[MAX_TASKS];
+static char *g_task_cmdline[TASK_SLOTS];
+static usize g_task_cmdline_len[TASK_SLOTS];
 /* M63: seccomp-bpf per-task state (side-tables — struct task cannot grow, see
  * the M29 LAPIC-PT note). g_task_seccomp holds the installed filter chain
  * (opaque to the scheduler; defined in seccomp.c); g_task_nnp is no_new_privs. */
-static void *g_task_seccomp[MAX_TASKS];
-static int   g_task_nnp[MAX_TASKS];
-/* Stand-in for a slot below the high-water mark whose chunk is not there.
+static void *g_task_seccomp[TASK_SLOTS];
+static int   g_task_nnp[TASK_SLOTS];
+/* Every index handed to T() is bounded before it gets here.
  *
- * Every walker in this file reads T(i)->state and skips TASK_UNUSED, and almost
- * none of them checked for NULL first -- scheduler_reap_orphan_zombies died on
- * exactly that, a kernel data abort reading ->state with FAR 0x10, taking a
- * whole lane with it. A permanently-unused sentinel makes all of them correct
- * without sixteen identical call-site edits and leaves no site that can still
- * dereference nothing. Its id is deliberately not a real pid, so a search by
- * pid (which has no state check) cannot match it. */
-static struct task g_task_absent_slot = { .id = (usize)-1,
-                                          .state = TASK_UNUSED };
-
-/* Recorded, not printed. T() is reached from interrupt context and from the
- * middle of the scheduler, where console_write is neither safe nor
- * timestamped -- an untimestamped line here failed the smoke check that every
- * kernel log line carries a monotonic timestamp. scheduler_dump_tasks reports
- * the tally, which is where anybody looking for it will be. */
-static usize g_task_absent_hits;
-static usize g_task_absent_last_index;
-static usize g_task_absent_last_hwm;
-
-static struct task *task_absent(usize i) {
-  __atomic_fetch_add(&g_task_absent_hits, 1, __ATOMIC_RELAXED);
-  g_task_absent_last_index = i;
-  g_task_absent_last_hwm = g_task_hwm;
-  return &g_task_absent_slot;
-}
+ * This used to return a permanently-unused stand-in slot for an index it could
+ * not resolve, so that a walker reading ->state on it would find TASK_UNUSED
+ * and skip it. That was added after scheduler_reap_orphan_zombies took a kernel
+ * data abort reading ->state with FAR 0x10 -- a NULL chunk -- and it did stop
+ * the crash, but by turning a kernel bug into a task that quietly does not
+ * exist, which is exactly the shape of bug that is impossible to find later.
+ *
+ * The cause is fixed at the source instead, and the two conditions below are
+ * now unreachable:
+ *   - allocate_task_slot calls ensure_task_chunk BEFORE it advances
+ *     g_task_hwm, holding the task lock, and g_task_hwm is _Atomic -- so a
+ *     chunk exists for every index below the mark that any walker can observe;
+ *   - every caller in this file bounds its index by g_task_hwm (the walks) or
+ *     range-checks it explicitly (scheduler_task_slot), and g_task_hwm never
+ *     exceeds MAX_TASKS.
+ * Reaching either one means one of those two invariants has broken, which is
+ * worth a name and a stop rather than a task-shaped hole in a walk. */
+static struct task *T(usize i);
 
 static inline struct task *T(usize i) {
-  if (i >= MAX_TASKS)
-    return task_absent(i);
-  struct task *chunk = g_task_chunks[i >> 6];
-  if (!chunk)
-    return task_absent(i);
+  if (i >= MAX_TASKS) {
+    console_write("task: slot index ");
+    console_write_dec((u64)i);
+    console_write(" past MAX_TASKS, hwm=");
+    console_write_dec((u64)g_task_hwm);
+    console_write("\n");
+    panic("scheduler: task slot index out of range");
+  }
+  struct task *chunk = __atomic_load_n(&g_task_chunks[i >> 6], __ATOMIC_ACQUIRE);
+  if (!chunk) {
+    console_write("task: slot ");
+    console_write_dec((u64)i);
+    console_write(" has no chunk, hwm=");
+    console_write_dec((u64)g_task_hwm);
+    console_write("\n");
+    panic("scheduler: task slot below the high-water mark has no chunk");
+  }
   return &chunk[i & 63];
 }
+
 
 /*
  * Is this a pointer to a real task slot?
@@ -541,20 +591,41 @@ static inline struct task *T(usize i) {
  * epilogue with a FAR of -3, for instance). Checking here names the problem
  * where it can still be attributed.
  */
+/* The per-CPU idle tasks, allocated outside the chunked task table. */
+static struct task *g_ap_idle_tasks[MAX_CPUS];
+
 int sched_task_ptr_valid(const struct task *t) {
   if (!t)
     return 0;
   for (usize c = 0; c < TASK_MAX_CHUNKS; c++) {
-    const struct task *base = g_task_chunks[c];
+    const struct task *base =
+        __atomic_load_n(&g_task_chunks[c], __ATOMIC_ACQUIRE);
 
+    /* Chunks are allocated in order, so the first empty slot ends the search.
+     * This used to `continue`, walking all 64 entries on every call -- and this
+     * predicate sits on the runqueue paths. */
     if (!base)
-      continue;
+      break;
     if (t >= base && t < base + TASK_CHUNK_SIZE) {
       usize off = (usize)((const char *)t - (const char *)base);
 
       return (off % sizeof(struct task)) == 0;
     }
   }
+  /* The per-CPU idle tasks are real tasks that are deliberately NOT in the
+   * chunked table (scheduler_setup_ap_idle explains why), so a chunk-only
+   * answer called every one of them invalid.
+   *
+   * That is not a cosmetic gap. This function is the guard rq_enqueue and
+   * rq_dequeue panic on ("runqueue list is corrupt"), and it is the check that
+   * was tried at the context switch and reverted as "never fired, worst score"
+   * -- of course it scored badly: on a kernel with secondaries it rejects the
+   * one task every idle CPU switches through. An always-false guard cannot
+   * catch anything, which is why the pointer that has been corrupting saved
+   * registers went unnoticed by it. */
+  for (int c = 0; c < MAX_CPUS; c++)
+    if (g_ap_idle_tasks[c] == t)
+      return 1;
   return 0;
 }
 /* current_task is per-CPU now (a macro -> get_percpu()->cur_task, see sched.h). */
@@ -565,8 +636,8 @@ int sched_task_ptr_valid(const struct task *t) {
  * exit immediately otherwise. See scheduler_reserve_init_pid(). */
 static usize next_task_id = 2;
 
-static int g_task_vfork_pending[MAX_TASKS];
-static usize g_task_vfork_id[MAX_TASKS];
+static int g_task_vfork_pending[TASK_SLOTS];
+static usize g_task_vfork_id[TASK_SLOTS];
 
 static int g_reserve_init_pid = 0;
 
@@ -598,7 +669,7 @@ struct runqueue *sched_global_rq(void) { return &g_global_rq; }
  *
  * C3 audit: lazy-allocate from the kheap so MAX_CPUS=64 doesn't reserve
  * ~256 KiB BSS for slots that may never run. Pointer table costs 512 B. */
-static struct task *g_ap_idle_tasks[MAX_CPUS];
+
 
 static struct task *find_unused_task(void);
 static usize task_index(const struct task *task);
@@ -625,13 +696,13 @@ struct task *scheduler_setup_ap_idle(int cpu, u64 kstack_top) {
    * against ~750 -- so whatever else reads the table does not tolerate them
    * either.
    *
-   * The known cost of staying outside it: task_index() answers 0 for a task it
-   * cannot find in a chunk, so every idle task ALIASES SLOT 0 (the boot task)
-   * in every per-task side table -- g_task_pass, g_task_xsave, g_task_nice,
-   * g_task_affinity, g_task_syscall. That is a real cross-CPU hazard, and it is
-   * why every dump of one reads `pid 0 name=ap-idle`, indistinguishable from
-   * the boot task. Fixing it means giving these tasks their own index space,
-   * not borrowing the table's. */
+   * Staying outside it used to cost an aliasing bug: task_index() answered 0
+   * for a task it could not find in a chunk, so every idle task shared SLOT 0
+   * -- the boot task's row -- in every per-task side table (g_task_pass,
+   * g_task_xsave, g_task_nice, g_task_affinity, g_task_syscall). These tasks
+   * now have their own index space above the table (see TASK_SLOTS and
+   * task_index), so nothing is shared. Dumps still read `pid 0 name=ap-idle`,
+   * because the id is genuinely 0; that is a naming artefact, not the alias. */
   if (!g_ap_idle_tasks[cpu]) {
     g_ap_idle_tasks[cpu] = kzalloc(sizeof(struct task));
     if (!g_ap_idle_tasks[cpu]) return 0;
@@ -712,11 +783,11 @@ void scheduler_reserve_init_pid(void) {
  * is never freed, so a stale owner pointer after the leader is reaped degrades
  * to harmless lock sharing with whatever reuses the slot, not a dangling ref. */
 static usize task_index(const struct task *task);
-static struct task *g_task_fdlock_owner[MAX_TASKS];
+static struct task *g_task_fdlock_owner[TASK_SLOTS];
 /* Where each task last cleared its kernel-stack lease (stack_released = 0).
  * A task found READY with the lease still cleared and running on no CPU is
  * unschedulable forever; this names the code path that stranded it. */
-static const char *g_task_lease_site[MAX_TASKS];
+static const char *g_task_lease_site[TASK_SLOTS];
 static usize task_index(const struct task *task);
 static inline void task_lease_clear(struct task *t, const char *site) {
   g_task_lease_site[task_index(t)] = site;
@@ -729,8 +800,8 @@ static inline struct task *fd_lock_task(void) {
 /* Who holds each task's fd_lock, and from which function. A lockup on fd_lock
  * names only the SPINNER in the panic dump; without this the holder (possibly
  * a CLONE_FILES sibling or a task blocked mid-critical-section) is invisible. */
-static usize g_task_fdlock_holder[MAX_TASKS];
-static const char *g_task_fdlock_site[MAX_TASKS];
+static usize g_task_fdlock_holder[TASK_SLOTS];
+static const char *g_task_fdlock_site[TASK_SLOTS];
 /* Observed failure this hardens against: a task span-locked on an fd_lock that
  * the dump attributed to ITSELF (holder id == spinner id, acquired in
  * scheduler_fd_get) — i.e. some earlier critical section released a different
@@ -745,8 +816,8 @@ static const char *g_task_fdlock_site[MAX_TASKS];
  *
  * The sections are a handful of array accesses (plus one kzalloc on table
  * growth), so the IRQ-off cost is negligible. */
-static struct task *g_task_fdlock_on[MAX_TASKS];
-static u64 g_task_fdlock_flags[MAX_TASKS];
+static struct task *g_task_fdlock_on[TASK_SLOTS];
+static u64 g_task_fdlock_flags[TASK_SLOTS];
 static inline void fd_lock_acquire_at(const char *site) {
   struct task *owner = fd_lock_task();
   u64 flags = interrupts_save();
@@ -828,8 +899,26 @@ static int ensure_task_chunk(usize c) {
   *(u64 *)raw = TASK_CHUNK_GUARD;
   *(u64 *)((u8 *)chunk + TASK_CHUNK_SIZE * sizeof(struct task)) =
       TASK_CHUNK_GUARD;
-  /* kzalloc already zeros the chunk -> all slots are TASK_UNUSED. */
-  g_task_chunks[c] = chunk;
+  /* Published with a RELEASE store, and read back with acquire everywhere.
+   *
+   * This was a plain store paired with plain loads, on a weakly-ordered machine
+   * with real secondaries. Every reader of this array -- T(), task_index(),
+   * sched_task_ptr_valid() -- could therefore observe the slot's chunk as still
+   * NULL after another CPU had installed it, and each of them turns that into a
+   * different disaster:
+   *
+   *   T()                   -> "task slot below the high-water mark has no chunk"
+   *   sched_task_ptr_valid  -> a live task declared not-a-task, which
+   *                            rq_enqueue/rq_dequeue panic on as a corrupt list
+   *                            and the context-switch guard panics on as a bad
+   *                            pointer
+   *
+   * Caught red-handed: the switch guard panicked, and its own report -- which
+   * re-reads both pointers a few instructions later -- printed `valid=1` for
+   * BOTH of them. A pointer cannot be invalid in the test and valid in the
+   * message unless what the test consults is changing underneath it, and the
+   * only thing it consults is this array. */
+  __atomic_store_n(&g_task_chunks[c], chunk, __ATOMIC_RELEASE);
   return 1;
 }
 
@@ -1126,13 +1215,35 @@ static void free_task_slot(struct task *t) {
  * one of ours — e.g., an AP's idle task lives outside the chunked table. */
 static usize task_index(const struct task *task) {
   for (usize c = 0; c < TASK_MAX_CHUNKS; c++) {
-    const struct task *chunk = g_task_chunks[c];
+    const struct task *chunk =
+        __atomic_load_n(&g_task_chunks[c], __ATOMIC_ACQUIRE);
     if (!chunk) break;
     if (task >= chunk && task < chunk + TASK_CHUNK_SIZE) {
       return (c << 6) | (usize)(task - chunk);
     }
   }
+  /* The per-CPU idle tasks are deliberately outside the table. They get their
+   * own slots rather than all answering 0, which handed every one of them the
+   * boot task's row in every side table -- a cross-CPU hazard the comment in
+   * scheduler_setup_ap_idle has described for as long as it has existed. */
+  for (int c = 0; c < MAX_CPUS; c++) {
+    if (g_ap_idle_tasks[c] == task) {
+      return (usize)MAX_TASKS + (usize)c;
+    }
+  }
   return 0;
+}
+
+/* Which CPU's idle task this is, or -1. The per-CPU idle tasks live outside the
+ * task table on purpose (see scheduler_setup_ap_idle), so no table walk finds
+ * them, and a dump that meets one otherwise has no way to name it. */
+static int sched_ap_idle_cpu_of(const struct task *t) {
+  if (!t)
+    return -1;
+  for (int c = 0; c < MAX_CPUS; c++)
+    if (g_ap_idle_tasks[c] == t)
+      return c;
+  return -1;
 }
 
 /* True if `t` is the live current task on some CPU — i.e. it is executing
@@ -1167,10 +1278,35 @@ int task_running_somewhere(struct task *t) {
  * silent whole-machine hang. A task that is not current anywhere is provably
  * not mid-save, so once the grace period expires its saved context is safe to
  * load: publish the lease ourselves and schedule it. */
-#define SCHED_HANDOFF_GRACE_SPINS 5000000ULL
+/* A real hand-off is a handful of instructions, so the bound only has to
+ * outlast that. Five million was chosen when expiry meant "claim it anyway"
+ * and a false expiry was catastrophic; now that expiry means "do not claim it
+ * this time, try again", a long spin buys nothing and is paid on every pick
+ * that meets a task mid-switch. */
+#define SCHED_HANDOFF_GRACE_SPINS 200000ULL
 
 static void sched_handoff_recover(struct task *t, const char *where) {
   static int reported;
+  /* Never claim a task that is genuinely mid-switch.
+   *
+   * The grace period above is a SPIN COUNT, and a spin count cannot measure
+   * how long another CPU has had. Under round-robin TCG it measures nothing at
+   * all: the spinning vCPU holds the emulator's thread for its whole slice, so
+   * the vCPU being waited on does not execute a single instruction while the
+   * count runs out -- the "grace period" always expires, every time, and the
+   * recovery then publishes a lease for a task whose arch_context_switch is
+   * still writing its callee-saved state. Another CPU loads that half-written
+   * ->context and resumes on that task's kernel stack, which is exactly the
+   * "secondary running with SP inside ANOTHER task's kernel stack" this port
+   * has been chasing, and why userspace on secondaries is still gated off.
+   *
+   * The state the recovery legitimately exists for -- a waker CASing a task
+   * READY inside its prepare/commit window, so it never reaches
+   * arch_context_switch at all -- never sets this flag, and is still
+   * recovered. So ask the fact instead of the clock. */
+  if (t && __atomic_load_n(&g_task_switching_out[task_index(t)],
+                           __ATOMIC_ACQUIRE))
+    return;
   if (!reported) {
     reported = 1;
     console_write("sched: stale kernel-stack lease (");
@@ -1191,67 +1327,6 @@ static void sched_handoff_recover(struct task *t, const char *where) {
  * the aarch64 re-publication after arch_context_switch returns -- and a dump
  * that shows `cur_task = boot` on cpu 1 cannot say which of them wrote it.
  * Say so once, from whichever one does. */
-/* Which CPU's idle task this is, or -1. The per-CPU idle tasks live outside the
- * task table on purpose (see scheduler_setup_ap_idle), so no table walk finds
- * them -- and one of them turning up as ANOTHER CPU's cur_task means two CPUs
- * are on one kernel stack, which is the failure this branch keeps landing on.
- * Observed directly: with -smp 2 there is exactly one such task, and a dump
- * showed BOTH CPUs holding it. */
-static int sched_ap_idle_cpu_of(const struct task *t) {
-  if (!t)
-    return -1;
-  for (int c = 0; c < MAX_CPUS; c++)
-    if (g_ap_idle_tasks[c] == t)
-      return c;
-  return -1;
-}
-
-void sched_note_boot_task_on_secondary(struct task *t, const char *where) {
-  struct percpu *chk = get_percpu();
-  int idle_of = sched_ap_idle_cpu_of(t);
-
-  /* Two separate impossibilities, one report. */
-  if (idle_of >= 0 && chk && idle_of != (int)chk->cpu_id) {
-    static volatile int idle_reported;
-    if (!__atomic_exchange_n(&idle_reported, 1, __ATOMIC_ACQ_REL)) {
-      console_write("sched: cpu ");
-      console_write_dec((u64)chk->cpu_id);
-      console_write(" took cpu ");
-      console_write_dec((u64)idle_of);
-      console_write("'s idle task via ");
-      console_write(where);
-      console_write("; its stack is 0x");
-      console_write_hex64((u64)(usize)t->stack);
-      console_write("..0x");
-      console_write_hex64(t->kernel_stack_ptr);
-      console_write("\n");
-    }
-    return;
-  }
-
-  if (!chk || chk->cpu_id == 0 || t != T(0))
-    return;
-  {
-    static volatile int reported;
-    if (__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL))
-      return;
-  }
-  console_write("sched: secondary cpu ");
-  console_write_dec((u64)chk->cpu_id);
-  console_write(" took the boot task via ");
-  console_write(where);
-  console_write(": idle=");
-  console_write(chk->idle_task && ((struct task *)chk->idle_task)->name
-                    ? ((struct task *)chk->idle_task)->name
-                    : "(none)");
-  console_write(" ap_runnable=");
-  console_write_dec((u64)t->ap_runnable);
-  console_write(" stealable=");
-  console_write_dec((u64)t->stealable);
-  console_write(" ctxsp=0x");
-  console_write_hex64(TASK_CTX_SP(t));
-  console_write("\n");
-}
 
 static struct task *pick_next_task(void) {
   if (current_task == 0) {
@@ -1261,6 +1336,38 @@ static struct task *pick_next_task(void) {
 
   struct percpu *pcpu = get_percpu();
   int on_ap = (pcpu && pcpu->cpu_id != 0);
+
+#if defined(__aarch64__)
+  /* `on_ap` is the whole of the filter that keeps a secondary off kernel
+   * threads: get it wrong and this CPU drains the global runqueue and scans the
+   * task table with no ap_runnable filter, which is the only route by which a
+   * secondary can reach the BOOT task -- and the boot task is what every
+   * foreign-stack report on this arch has named. It is derived from
+   * pcpu->cpu_id, and pcpu comes from a table lookup on MPIDR that happens on
+   * every per-CPU access, so "this CPU is reading the right block" is an
+   * assumption worth checking rather than one to keep asserting.
+   *
+   * Reported once, not panicked: if it ever fires it explains the corruption,
+   * and a report on the way past leaves the machine able to say so. */
+  {
+    extern int aarch64_percpu_self_mismatch(void);
+
+    if (aarch64_percpu_self_mismatch()) {
+      static volatile int reported;
+
+      if (!__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL)) {
+        console_write("PERCPU-MISMATCH: this CPU resolves to block cpu_id=");
+        console_write_dec(pcpu ? (u64)pcpu->cpu_id : 99);
+        console_write(" on_ap=");
+        console_write_dec((u64)on_ap);
+        console_write(" cur=");
+        console_write(current_task && current_task->name ? current_task->name
+                                                         : "(none)");
+        console_write("\n");
+      }
+    }
+  }
+#endif
 
   /* On the BSP, drain the global runqueue first (fast path for freshly woken /
    * created tasks). APs skip the rq dequeue and rely on the scan below with the
@@ -1352,6 +1459,8 @@ static struct task *pick_next_task(void) {
                                       __ATOMIC_RELAXED)) {
         /* The stack is this CPU's again from here on. */
         __atomic_store_n(&t->stack_released, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_task_switching_out[task_index(t)], 0,
+                         __ATOMIC_RELEASE);
         g_min_pass = g_task_pass[task_index(t)];
         g_pick_rq++; g_last_pick_id = t->id;
         return t;
@@ -1443,6 +1552,8 @@ static struct task *pick_next_task(void) {
                                       TASK_RUNNING, 0, __ATOMIC_ACQUIRE,
                                       __ATOMIC_RELAXED)) {
         __atomic_store_n(&best_task->stack_released, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_task_switching_out[task_index(best_task)], 0,
+                         __ATOMIC_RELEASE);
         g_min_pass = g_task_pass[task_index(best_task)];
         g_pick_scan++; g_last_pick_id = best_task->id;
         return best_task;
@@ -1456,6 +1567,15 @@ static struct task *pick_next_task(void) {
    * the BSP (its boot task handles idling), and skipped when the idle task is
    * already current (so scheduler_yield returns 0 and the loop parks). */
   if (pcpu && pcpu->idle_task && current_task != (struct task *)pcpu->idle_task) {
+    /* This path hands back the idle task without the CAS the two paths above
+     * use, so it must clear the switch-out marker itself -- otherwise the idle
+     * task carries a stale 1 from its last switch-out for the rest of the
+     * boot. Nothing else can pick an AP's idle task (it is not in the table),
+     * so this is hygiene rather than a live bug, and the marker is only
+     * meaningful while it is true. */
+    __atomic_store_n(
+        &g_task_switching_out[task_index((struct task *)pcpu->idle_task)], 0,
+        __ATOMIC_RELEASE);
     g_pick_idle++;
     g_last_pick_id = ((struct task *)pcpu->idle_task)->id;
     return (struct task *)pcpu->idle_task;
@@ -1528,19 +1648,52 @@ static int sched_wake_for_signal(struct task *t, int sig) {
   return sched_wake_for_signal_ex(t, sig, 1);
 }
 
+/* A task that was not runnable does not bank credit for the time it was away.
+ *
+ * pick_next_task takes the LOWEST pass among the highest priority, and a task
+ * only advances its pass by running. sched_birth_pass already applies this to
+ * a NEWBORN, for the reason written above it -- a task that starts behind
+ * never catches up. A task that wakes is in exactly the same position, and
+ * nothing was doing it: its pass was frozen while it slept, so it came back
+ * holding credit for every tick it was not competing for the CPU, and every
+ * task that HAD been running was now hopelessly ahead of it.
+ *
+ * Measured, on the wedge this fixes: /bin/m109_smoke sat READY at pass
+ * 7,691,600 while net_task, kswapd and the lkpi workers -- all of them
+ * sleepers -- woke back at ~84,000 and climbed by one stride per yield. To
+ * reach m109's pass each of them needed something like 150,000 turns, so the
+ * lane ran, picked tasks 1.4 million times, and produced no output for two
+ * minutes because the one task with work to do was behind all of them. The
+ * watchdog called it a deadlock; it was starvation.
+ *
+ * g_min_pass is the pass of the last task the picker chose, i.e. the current
+ * virtual time, and raising a waker to it is the stride form of CFS's
+ * vruntime = max(vruntime, min_vruntime). Never lowers a pass, so a task that
+ * is genuinely ahead keeps its position and a task that has legitimately run
+ * less keeps its advantage. */
+static void sched_wake_enqueue(struct task *t) {
+  if (t) {
+    usize i = task_index(t);
+
+    if (g_task_pass[i] < g_min_pass)
+      g_task_pass[i] = g_min_pass;
+  }
+  sched_rq_enqueue_current(t);
+}
+
 static int sched_wake_for_signal_inner(struct task *t, int sig,
                                        int allow_stopped) {
   enum task_state expected = TASK_BLOCKED;
   if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY, 0,
                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-    sched_rq_enqueue_current(t);
+    sched_wake_enqueue(t);
     return 1;
   }
   if (sig_wakes_target(t, sig)) {
     expected = TASK_SLEEPING;
     if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY, 0,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-      sched_rq_enqueue_current(t);
+      sched_wake_enqueue(t);
       return 1;
     }
   }
@@ -1548,7 +1701,7 @@ static int sched_wake_for_signal_inner(struct task *t, int sig,
     expected = TASK_STOPPED;
     if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY, 0,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-      sched_rq_enqueue_current(t);
+      sched_wake_enqueue(t);
       return 1;
     }
   }
@@ -1588,14 +1741,14 @@ static void wake_sleepers(void) {
                                       0, __ATOMIC_ACQUIRE,
                                       __ATOMIC_RELAXED)) {
         t->wake_tick = 0;
-        sched_rq_enqueue_current(t);
+        sched_wake_enqueue(t);
         woken++;
       } else {
         expected = TASK_BLOCKED;
         if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY,
                                         0, __ATOMIC_ACQUIRE,
                                         __ATOMIC_RELAXED)) {
-          sched_rq_enqueue_current(t);
+          sched_wake_enqueue(t);
           woken++;
         }
       }
@@ -1618,7 +1771,7 @@ static int scheduler_wake_blocked_parent(usize parent_id) {
                                     TASK_READY, 0,
                                     __ATOMIC_RELEASE,
                                     __ATOMIC_RELAXED)) {
-      sched_rq_enqueue_current(T(i));
+      sched_wake_enqueue(T(i));
       return 1;
     }
     return 0;
@@ -2639,8 +2792,8 @@ void task_set_user_rip(struct task *t, u64 rip) {
  * on. Keeping the caller's rip and rbp here makes a blocked thread's user
  * stack walkable from the watchdog dump — which is the difference between
  * "everything is waiting" and knowing what it waits for. */
-static u64 g_task_entry_rip[MAX_TASKS];
-static u64 g_task_entry_rbp[MAX_TASKS];
+static u64 g_task_entry_rip[TASK_SLOTS];
+static u64 g_task_entry_rbp[TASK_SLOTS];
 
 void task_set_syscall_entry(struct task *t, u64 rip, u64 rbp) {
   if (!t) return;
@@ -2689,7 +2842,7 @@ static void sched_name_user_addr(struct task *t, u64 addr) {
  * same reason: a thread that is RUNNING with an unchanging RIP is either
  * looping in one call or making the same call over and over, and the dump
  * cannot tell those apart without the number. */
-static u64 g_task_syscall[MAX_TASKS];
+static u64 g_task_syscall[TASK_SLOTS];
 void task_note_syscall(u64 number) {
   if (current_task)
     g_task_syscall[task_index(current_task)] = number;
@@ -2874,7 +3027,7 @@ int scheduler_post_signal(usize pid, int sig) {
  * time, and the block layer's admission gate (kernel/dev/blk.c) hands a busy
  * device to the waiting request with the best priority — so this value really
  * does decide who goes first, with ageing so nothing starves. */
-static u16 g_task_ioprio[MAX_TASKS];
+static u16 g_task_ioprio[TASK_SLOTS];
 
 int scheduler_set_ioprio(usize pid, int ioprio) {
   struct task *t = pid ? scheduler_task_by_pid(pid) : current_task;
@@ -2938,8 +3091,8 @@ u64 scheduler_get_affinity(usize pid) {
  * fork, released at exit), which is what keeps the directory alive under the
  * chrooted task even if it is unlinked from the parent tree. Path resolution
  * starts here and clamps ".." at it — see vfs_find_node_internal. */
-static struct vfs_node *g_task_root_node[MAX_TASKS];
-static char g_task_root_path[MAX_TASKS][VFS_MAX_PATH];
+static struct vfs_node *g_task_root_node[TASK_SLOTS];
+static char g_task_root_path[TASK_SLOTS][VFS_MAX_PATH];
 
 struct vfs_node *scheduler_get_root_node(void) {
   if (!current_task)
@@ -4000,9 +4153,59 @@ int scheduler_yield(void) {
         console_write_dec((u64)new_task->id);
         console_write(" (");
         console_write(new_task->name ? new_task->name : "(none)");
-        console_write("): still the current task of another cpu\n");
+        console_write("): still the current task of another cpu");
+        /* Which CPU, which task, and how this CPU could have chosen it.
+         *
+         * "another cpu" alone cannot distinguish the two ways this happens: a
+         * pick that reached across (which would mean the per-CPU resolution or
+         * the runqueue handed over a task it should not have), or this CPU's
+         * OWN idle task being recorded as current somewhere else. Print every
+         * CPU's cur_task and idle_task next to the culprit and the answer is
+         * one line of log instead of a run. */
+        console_write(" me=");
+        console_write_dec(me ? (u64)me->cpu_id : 99);
+        console_write(" new=0x");
+        console_write_hex64((u64)(usize)new_task);
+        console_write(" state=");
+        console_write_dec((u64)__atomic_load_n(&new_task->state,
+                                               __ATOMIC_ACQUIRE));
+        for (int c2 = 0; c2 < g_max_cpus; c2++) {
+          struct percpu *pc2 = get_percpu_n(c2);
+
+          if (!pc2)
+            continue;
+          console_write(" [");
+          console_write_dec((u64)c2);
+          console_write(" cur=0x");
+          console_write_hex64((u64)(usize)pc2->cur_task);
+          console_write(" idle=0x");
+          console_write_hex64((u64)(usize)pc2->idle_task);
+          console_write("]");
+        }
+        console_write("\n");
       }
-      /* Hand it back rather than stranding it in RUNNING with no CPU. */
+      /* Hand it back. This CPU owns the task -- pick_next_task CAS'd it
+       * READY -> RUNNING before returning it -- so declining without releasing
+       * strands it in RUNNING with no CPU running it, and nothing ever picks it
+       * again.
+       *
+       * Removing this store was tried, on the reasoning that the branch had
+       * just established the task is another CPU's current task, so RUNNING is
+       * the truthful state and publishing READY over it invites a third
+       * claimer. That reasoning is wrong for a simpler reason than the race:
+       * whatever another CPU is doing, THIS CPU holds the task, and a holder
+       * that declines must release. If the other CPU really is running it, it
+       * publishes READY itself on the way out and this store is redundant; if
+       * it is not, this store is the only thing that puts the task back in
+       * circulation. Leaving it RUNNING lost it for good -- the flag-on suite
+       * fell to 914/1/469.
+       *
+       * (The report below prints every CPU's cur_task, and in one run neither
+       * held the declined task: `pid 1170 /opt/busybox/bin/busybox me=1
+       * new=0x1000013070 state=1 [0 cur=0x1000000090] [1 cur=0x1000b32920]`.
+       * That is suggestive of a racy scan but does not prove it -- the dump is
+       * taken several console writes after the decision, so the owner may
+       * simply have moved on. It is recorded, not concluded.) */
       __atomic_store_n(&new_task->state, TASK_READY, __ATOMIC_RELEASE);
       /* The outgoing task keeps running: this CPU simply did not switch. It
        * was marked READY a moment ago and may have been enqueued; reclaim it
@@ -4043,7 +4246,87 @@ int scheduler_yield(void) {
     panic("sched: two CPUs claimed one task");
   }
 
-  sched_note_boot_task_on_secondary(new_task, "pick");
+
+  /* The outgoing task enters its switch-out window HERE, before this CPU's
+   * cur_task stops naming it.
+   *
+   * From this store until arch_context_switch publishes its stack lease, the
+   * outgoing task is in the one state nothing else can recognise: it is no
+   * longer cur_task on any CPU, its lease is not yet published, and its
+   * ->context still holds the values from its PREVIOUS switch-out. A picker
+   * that meets it sees exactly what a parked task looks like. That is what
+   * sched_handoff_recover acted on -- and a run with b1nix.ap-userspace showed
+   * it doing so by name, one second before the machine died:
+   *
+   *   sched: stale kernel-stack lease (scan) on pid 169 /bin/m14_smoke
+   *   EL1-FOREIGN-STACK: pid 0 name=boot sp=0x1000e8ded0 ...
+   *                      sp_owner=/bin/m14_smoke/169
+   *
+   * -- the boot CPU running on m14_smoke's kernel stack, which is the
+   * corruption this port has been chasing.
+   *
+   * It has to be here and not in the `state == TASK_RUNNING` branch above,
+   * which is where it was first put and why it did not help: a task that
+   * BLOCKS takes neither that branch nor its lease-clear (the block paths
+   * clear their own lease before yielding), so every blocking switch left the
+   * window unmarked -- and a waker CASing that task BLOCKED->READY inside its
+   * prepare/commit window is precisely the case the recovery exists for. Both
+   * paths reach this line. */
+  if (new_task != old_task) {
+    /* THE invariant that makes the whole hand-off protocol work, checked
+     * instead of assumed.
+     *
+     * arch_context_switch is about to WRITE into old_task->context. Another CPU
+     * may claim old_task the moment it sees stack_released == 1, and it then
+     * READS that same context. So the lease must already be down here -- if it
+     * is not, two CPUs are in old_task->context at once, one saving and one
+     * loading, and the loader gets a half-written register file. That is
+     * exactly the corruption signature this port keeps meeting: a saved slot
+     * with one 32-bit half updated and the other stale, which is how a kernel
+     * address acquires bit 32.
+     *
+     * scheduler_yield clears the lease itself only on the RUNNING path; every
+     * other state relies on "the block paths clear the lease before yielding",
+     * which is an assumption spread across a dozen call sites rather than
+     * something the switch enforces. Enforce it here, where it is one line, and
+     * name the state and the last clearing site if it was ever violated. */
+    if (__atomic_load_n(&old_task->stack_released, __ATOMIC_ACQUIRE)) {
+      static volatile int reported;
+
+      if (!__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL)) {
+        console_write("LEASE-UP-AT-SWITCH: pid ");
+        console_write_dec((u64)old_task->id);
+        console_write(" name=");
+        console_write(old_task->name ? old_task->name : "(none)");
+        console_write(" state=");
+        console_write_dec((u64)old_task->state);
+        console_write(" last_clear=");
+        console_write(g_task_lease_site[task_index(old_task)]
+                          ? g_task_lease_site[task_index(old_task)]
+                          : "(never)");
+        console_write(" incoming=");
+        console_write(new_task->name ? new_task->name : "(none)");
+        console_write("\n");
+      }
+      /* Down it goes regardless: this CPU is about to write that context, so
+       * the stack is emphatically not released. */
+      task_lease_clear(old_task, "switch-enforced");
+    }
+    __atomic_store_n(&g_task_switching_out[task_index(old_task)], 1,
+                     __ATOMIC_RELEASE);
+  }
+
+  /* Who this CPU was running immediately before the incoming task.
+   *
+   * cur_task is reassigned on the next line, but SP still belongs to old_task
+   * until arch_context_switch loads the new one -- a real, deliberate window
+   * (the publish happens first so no other CPU can claim the incoming task
+   * while its context is being loaded). Anything checking "is SP the current
+   * task's stack?" in that window sees a legitimate mismatch, which is why
+   * EL1-FOREIGN-STACK had to be downgraded from a panic to a one-shot report.
+   * Recording the outgoing task lets that check tell the window apart from a
+   * genuine overlap, so it can be a panic again. */
+  sched_set_prev_task(new_task == old_task ? 0 : old_task);
 
   new_task->state = TASK_RUNNING;
   current_task = new_task;
@@ -4112,9 +4395,125 @@ int scheduler_yield(void) {
       panic("sched: context switch on a foreign kernel stack");
     }
   }
+#ifdef __aarch64__
+  /* The incoming context's resume address, before it is loaded into x30 and
+   * ret'd through.
+   *
+   * The corruption this branch keeps landing on ends as `ret` to a value that
+   * was never a return address -- seen as a struct task * (KHEAP_START+0x90,
+   * the boot task) and as &g_percpu[1], a per-CPU block pointer. By the time
+   * the CPU faults, the frame that held it is gone and the dump names the
+   * wrong function. Catch it here, where the task whose context it is and the
+   * task handing over are both still known.
+   *
+   * A context that has never run is exempt: its lr is a trampoline set at
+   * creation, which is in text, so nothing legitimate is excluded. */
+  {
+    extern char __kernel_text_start[], __kernel_text_end[];
+    u64 tlo = (u64)(usize)__kernel_text_start;
+    u64 thi = (u64)(usize)__kernel_text_end;
+    u64 nlr = new_task->context.lr;
+
+    if (nlr && (nlr < tlo || nlr >= thi)) {
+      console_write("sched: incoming pid ");
+      console_write_dec((u64)new_task->id);
+      console_write(" name=");
+      console_write(new_task->name ? new_task->name : "(none)");
+      console_write(" has context.lr=0x");
+      console_write_hex64(nlr);
+      console_write(" outside kernel text 0x");
+      console_write_hex64(tlo);
+      console_write("..0x");
+      console_write_hex64(thi);
+      console_write(" ctx.sp=0x");
+      console_write_hex64(new_task->context.sp);
+      console_write(" ctx.fp=0x");
+      console_write_hex64(new_task->context.fp);
+      console_write(" stack=0x");
+      console_write_hex64((u64)(usize)new_task->stack);
+      console_write(" outgoing pid ");
+      console_write_dec((u64)old_task->id);
+      console_write(" name=");
+      console_write(old_task->name ? old_task->name : "(none)");
+      console_write(" cpu=");
+      {
+        struct percpu *pc = get_percpu();
+        console_write_dec(pc ? (u64)pc->cpu_id : 99);
+      }
+      console_write("\n");
+      panic("sched: incoming context.lr is not a return address");
+    }
+
+    /* And the stack it will resume on. A task must come back on its OWN
+     * stack: the failure being hunted is the boot/idle task found running
+     * pick_next_task on a userspace task's kernel stack, which is this field
+     * having become somebody else's. Checked here rather than at the fault,
+     * where the frame is already gone and the backtrace names the wrong
+     * function. */
+    u64 nsp = new_task->context.sp;
+
+    if (new_task->stack && nsp) {
+      u64 nlo = (u64)(usize)new_task->stack;
+      u64 nhi = nlo + KERNEL_STACK_SIZE;
+
+      if (nsp <= nlo || nsp > nhi) {
+        struct task *ow = scheduler_task_owning_stack(nsp);
+
+        console_write("sched: incoming pid ");
+        console_write_dec((u64)new_task->id);
+        console_write(" name=");
+        console_write(new_task->name ? new_task->name : "(none)");
+        console_write(" would resume on ctx.sp=0x");
+        console_write_hex64(nsp);
+        console_write(" outside its own stack 0x");
+        console_write_hex64(nlo);
+        console_write("..0x");
+        console_write_hex64(nhi);
+        console_write(" sp_owner=");
+        console_write(ow ? (ow->name ? ow->name : "(none)") : "(unowned)");
+        console_write("/");
+        console_write_dec(ow ? (u64)ow->id : 0);
+        console_write(" ctx.lr=0x");
+        console_write_hex64(nlr);
+        ksym_print(nlr);
+        console_write(" outgoing pid ");
+        console_write_dec((u64)old_task->id);
+        console_write(" name=");
+        console_write(old_task->name ? old_task->name : "(none)");
+        console_write(" cpu=");
+        {
+          struct percpu *pc = get_percpu();
+          console_write_dec(pc ? (u64)pc->cpu_id : 99);
+        }
+        console_write("\n");
+        panic("sched: incoming context.sp is another task's stack");
+      }
+    }
+  }
+#endif
+
   g_last_switch_tick = scheduler_ticks;
   arch_context_switch(&old_task->context, &new_task->context,
                       &old_task->stack_released);
+
+  /* Switched in: SP now belongs to whoever is running here, so the window in
+   * which SP legitimately still names the OUTGOING task is over. */
+  sched_set_prev_task(0);
+
+  /* Resumed: this task is executing again, so it is no longer switching out.
+   *
+   * Clearing it HERE and not only where a picker claims the task is what makes
+   * the marker safe to consult. The two claim sites are CAS paths, and not
+   * every resume goes through one -- a stealable worker started from
+   * aarch64_ap_main's phase-1 loop is switched to directly, and a task
+   * re-picking itself never wins a CAS at all -- so tasks accumulated a marker
+   * that was never taken down, and sched_handoff_recover then refused to help
+   * any of them for the rest of the boot. Measured: with the marker set and
+   * never cleared, the ap-userspace suite fell from 1112 passed to 584, with
+   * 797 blocked. The window the marker describes ends when execution resumes,
+   * and this is that point. */
+  __atomic_store_n(&g_task_switching_out[task_index(old_task)], 0,
+                   __ATOMIC_RELEASE);
 #ifdef __aarch64__
   /* arch_context_switch returns only when this task is resumed. The outgoing
    * task was published before the switch so other CPUs cannot claim it while
@@ -4122,7 +4521,6 @@ int scheduler_yield(void) {
    * per-task architectural state again before any C code observes it. Without
    * this, the resumed stack runs with current_task, SP_EL1's published top,
    * TTBR0 and TLS still naming the task we switched to. */
-  sched_note_boot_task_on_secondary(old_task, "resume");
   current_task = old_task;
   arch_set_kernel_stack(old_task->kernel_stack_ptr);
   paging_switch_address_space(old_task->pml4_phys);
@@ -4197,7 +4595,7 @@ void scheduler_wake_task(usize task_id) {
     if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
                                     0, __ATOMIC_ACQUIRE,
                                     __ATOMIC_RELAXED)) {
-      sched_rq_enqueue_current(T(i));
+      sched_wake_enqueue(T(i));
       woke = 1;
       break;
     }
@@ -4206,7 +4604,7 @@ void scheduler_wake_task(usize task_id) {
     if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
                                     0, __ATOMIC_ACQUIRE,
                                     __ATOMIC_RELAXED)) {
-      sched_rq_enqueue_current(T(i));
+      sched_wake_enqueue(T(i));
       woke = 1;
       break;
     }
@@ -4516,7 +4914,7 @@ void scheduler_wake_all(void *chan) {
     if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY,
                                     0, __ATOMIC_ACQUIRE,
                                     __ATOMIC_RELAXED)) {
-      sched_rq_enqueue_current(t);
+      sched_wake_enqueue(t);
       woken++;
     }
   }
@@ -4978,6 +5376,11 @@ static void serial_silence_watchdog(void) {
 
 
 void scheduler_on_timer_tick(void) {
+  /* Cheapest possible net over the whole kernel: if this CPU's cur_task ever
+   * stops being a task, every `current_task->field = ...` in the tree is
+   * writing into whatever it points at instead. Checked once per tick per CPU,
+   * which bounds the damage to one tick rather than to whenever the wreckage
+   * finally faults somewhere unrelated. */
   if (!scheduler_started || current_task == 0) {
     return;
   }
@@ -5466,7 +5869,7 @@ static void terminate_group_siblings(struct task *t) {
                                            __ATOMIC_RELAXED);
       }
       if (woke) {
-        sched_rq_enqueue_current(sibling);
+        sched_wake_enqueue(sibling);
       }
     }
   }
@@ -5737,6 +6140,22 @@ static void acct_release_to_group(struct task *t) {
     if (T(i)->id == tgid && T(i)->state != TASK_UNUSED) {
       g_task_gone_utime_ns[i] += g_task_utime_ns[idx];
       g_task_gone_stime_ns[i] += g_task_stime_ns[idx];
+      /* Hand the time over, do not copy it.
+       *
+       * task_group_cputime_ns walks every slot that is not TASK_UNUSED, and a
+       * thread that has exited sits at TASK_DEAD until something reaps it --
+       * so between this fold and that reap its time was counted twice, once
+       * from its own row and once from the leader's `gone` row, and then the
+       * total DROPPED by that amount when the slot was finally freed. A
+       * process's CPU time going backwards is wrong on its own; what it looked
+       * like from userspace was M86's rusage-self-group failing intermittently
+       * with the group's user time (146 ms) short of the sum of its two
+       * threads, and its SYSTEM time (2 ms) below the calling thread's own
+       * (3 ms) -- a total that cannot include the thread reading it. Whether
+       * the reap landed between two getrusage calls is pure timing, which is
+       * why it came and went with host load. */
+      g_task_utime_ns[idx] = 0;
+      g_task_stime_ns[idx] = 0;
       return;
     }
   }
@@ -5895,6 +6314,16 @@ void scheduler_exit_current(int exit_code) {
     interrupts_disable();
     current_task->exit_code = exit_code;
     task_lease_clear(current_task, __func__);
+    /* A dying task must not leave an inode write-locked: every waiter
+     * behind it blocks for ever, and above them a whole process chain.
+     * See vfs_release_inode_locks_of. */
+    vfs_release_inode_locks_of((u64)current_task->id);
+    /* Same class of leak, same place to catch it: a task that dies holding the
+     * NVMe I/O mutex wedges every later I/O to that device. */
+    {
+      extern void nvme_release_io_lock_of(u64 pid);
+      nvme_release_io_lock_of((u64)current_task->id);
+    }
     current_task->state = TASK_DEAD;
     scheduler_yield();
     panic("dead thread resumed");
@@ -5947,6 +6376,16 @@ void scheduler_exit_current(int exit_code) {
    * stack_released flag until arch_context_switch publishes 1 after the
    * RSP swap below. See struct task::stack_released in sched.h. */
   task_lease_clear(current_task, __func__);
+  /* A dying task must not leave an inode write-locked: every waiter
+   * behind it blocks for ever, and above them a whole process chain.
+   * See vfs_release_inode_locks_of. */
+  vfs_release_inode_locks_of((u64)current_task->id);
+    /* Same class of leak, same place to catch it: a task that dies holding the
+     * NVMe I/O mutex wedges every later I/O to that device. */
+    {
+      extern void nvme_release_io_lock_of(u64 pid);
+      nvme_release_io_lock_of((u64)current_task->id);
+    }
   current_task->state = TASK_DEAD;
   g_have_proc_zombies = 1; /* arm the orphan sweep in scheduler_yield */
 
@@ -6994,15 +7433,6 @@ void scheduler_dump_tasks(void) {
   /* A dump that stops half way looks exactly like a dump that had nothing more
    * to say, and one run was read as "the machine went quiet" when in fact the
    * dump itself had wedged. This line is the proof it finished. */
-  if (g_task_absent_hits) {
-    console_write("TASK-DUMP: absent-slot hits=");
-    console_write_dec((u64)g_task_absent_hits);
-    console_write(" last_index=");
-    console_write_dec((u64)g_task_absent_last_index);
-    console_write(" hwm=");
-    console_write_dec((u64)g_task_absent_last_hwm);
-    console_write("\n");
-  }
   console_write("TASK-DUMP: end\n");
 }
 
@@ -7509,7 +7939,7 @@ static void group_stop_sibling(struct task *t, int sig) {
     enum task_state expected = TASK_STOPPED;
     if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY, 0,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
-      sched_rq_enqueue_current(t);
+      sched_wake_enqueue(t);
     return;
   }
   /* Post the stop and let the sibling park itself on its next return to ring 3.
@@ -7929,8 +8359,33 @@ int scheduler_kill_thread_group_user(usize pid, int sig) {
   struct task *t = find_live_task(pid);
   int allowed = t ? signal_permitted(t, sig) : -1;
   interrupts_restore(flags);
-  if (allowed < 0)
-    return -ESRCH;
+  if (allowed < 0) {
+    /* A zombie is still a process. POSIX (and Linux) let kill(2) name a child
+     * that has exited but not been reaped: the signal has nowhere to go and is
+     * discarded, but the call SUCCEEDS -- the pid is valid until it is waited
+     * for, which is the whole point of leaving the entry behind.
+     *
+     * find_live_task above refuses DEAD and REAPING, so every such kill came
+     * back ESRCH. What that looked like from userspace was a parent that had
+     * signalled a child a moment too late being told the child had never
+     * existed, instead of being told nothing at all: M86's compute-loop check
+     * reported a failed kill (errno 3) rather than the child's real exit
+     * status, which is the only thing that could have explained the run.
+     *
+     * Reaping is what ends the pid, so REAPING counts as gone. */
+    u64 zflags = interrupts_save();
+    int zombie = 0;
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *z = T(i);
+
+      if (z->id == pid && z->state == TASK_DEAD && !task_is_thread(z)) {
+        zombie = 1;
+        break;
+      }
+    }
+    interrupts_restore(zflags);
+    return zombie ? 0 : -ESRCH;
+  }
   if (!allowed)
     return -EPERM;
   return scheduler_kill_thread_group(pid, sig);
@@ -8207,7 +8662,7 @@ void vma_insert(struct task *t, struct vm_area *vma) {
  * the mapping just used — into a pointer comparison. chromium runs with
  * thousands of mappings, and every fault used to walk them.
  */
-static struct vm_area *g_vma_cache[MAX_TASKS];
+static struct vm_area *g_vma_cache[TASK_SLOTS];
 
 /* The cache is stamped, not merely cleared.
  *
@@ -8224,7 +8679,7 @@ static struct vm_area *g_vma_cache[MAX_TASKS];
  * the cost of one atomic on a path that already frees memory and shoots down
  * TLBs. Per-address-space stamping would keep more of the cache alive, but
  * unlinking is rare and correctness here is worth more than the hit rate. */
-static u64 g_vma_cache_gen[MAX_TASKS];
+static u64 g_vma_cache_gen[TASK_SLOTS];
 static u64 g_vma_gen;
 
 void vma_cache_invalidate_all(void) {
@@ -8841,6 +9296,16 @@ void scheduler_deliver_pending_signals(void) {
   scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
       ptrace_task_cleanup(current_task); /* M80: never leave a stale tracee link */
       task_lease_clear(current_task, __func__);
+      /* A dying task must not leave an inode write-locked: every waiter
+       * behind it blocks for ever, and above them a whole process chain.
+       * See vfs_release_inode_locks_of. */
+      vfs_release_inode_locks_of((u64)current_task->id);
+    /* Same class of leak, same place to catch it: a task that dies holding the
+     * NVMe I/O mutex wedges every later I/O to that device. */
+    {
+      extern void nvme_release_io_lock_of(u64 pid);
+      nvme_release_io_lock_of((u64)current_task->id);
+    }
       current_task->state = TASK_DEAD;
       g_have_proc_zombies = 1;
       post_sigchld_to_parent(current_task->parent_id, 0);
@@ -8893,6 +9358,16 @@ void scheduler_deliver_pending_signals(void) {
   scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
         ptrace_task_cleanup(current_task); /* M80: never leave a stale tracee link */
         task_lease_clear(current_task, __func__);
+        /* A dying task must not leave an inode write-locked: every waiter
+         * behind it blocks for ever, and above them a whole process chain.
+         * See vfs_release_inode_locks_of. */
+        vfs_release_inode_locks_of((u64)current_task->id);
+    /* Same class of leak, same place to catch it: a task that dies holding the
+     * NVMe I/O mutex wedges every later I/O to that device. */
+    {
+      extern void nvme_release_io_lock_of(u64 pid);
+      nvme_release_io_lock_of((u64)current_task->id);
+    }
         current_task->state = TASK_DEAD;
         g_have_proc_zombies = 1;
         post_sigchld_to_parent(current_task->parent_id, 0);

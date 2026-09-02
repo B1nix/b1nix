@@ -179,6 +179,58 @@ void gic_cpu_init(void)
 	GICC_CTLR = 1;
 }
 
+/* Re-arm the virtual timer for the NEXT tick.
+ *
+ * CVAL, not TVAL. Writing TVAL sets the deadline to "now + interval", so every
+ * tick serviced late loses the lateness for ever and the tick count drifts
+ * below real time without bound -- which is exactly what M110's
+ * clock-uptime-agree caught on the busiest lane, where /proc/uptime (a tick
+ * count) had fallen more than a second behind the monotonic clock the log
+ * stamps use. Advancing the previous DEADLINE by one interval keeps the
+ * period anchored to the counter, so lateness is absorbed by the next tick
+ * instead of accumulating.
+ *
+ * The catch-up guard matters as much as the accumulation: after a long stall
+ * (a host that descheduled the whole vCPU, a debugger) the accumulated
+ * deadline can be many intervals in the past, and re-arming to it would
+ * deliver that whole backlog back to back with no time to make progress
+ * between them. Past a backlog of one interval, resynchronise to the counter
+ * and drop the missed ticks -- losing them knowingly rather than servicing a
+ * storm. */
+/* The virtual timer's interval, derived from the rate the scheduler says it
+ * ticks at rather than from a literal.
+ *
+ * There were three copies of `freq / 100` in this file, and the scheduler
+ * separately reports 100 through sched_tick_hz(). Two independent statements of
+ * the same constant is how a tick rate goes wrong quietly: everything built on
+ * SCHED_TICKS_PER_SEC (sleeps, timeouts, the silence watchdog) is scaled by the
+ * scheduler's number, while the hardware is armed with this one, and nothing
+ * checks that they agree. Ask once, here. */
+static u64 timer_interval_ticks(u64 freq)
+{
+	u32 hz = sched_tick_hz();
+
+	return hz ? freq / hz : freq / 100;
+}
+
+static void timer_rearm(void)
+{
+	u64 freq, cval, now;
+
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+	if (!freq)
+		return;
+
+	u64 interval = timer_interval_ticks(freq);
+
+	__asm__ volatile("mrs %0, cntv_cval_el0" : "=r"(cval));
+	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(now));
+	cval += interval;
+	if (cval <= now)
+		cval = now + interval;
+	__asm__ volatile("msr cntv_cval_el0, %0" : : "r"(cval));
+}
+
 static void timer_init(void)
 {
 	irq_unmask(TIMER_IRQ);
@@ -186,7 +238,7 @@ static void timer_init(void)
 	u64 freq;
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
 
-	u64 interval = freq / 100;
+	u64 interval = timer_interval_ticks(freq);
 	__asm__ volatile("msr cntv_tval_el0, %0" : : "r"(interval));
 
 	__asm__ volatile("msr cntv_ctl_el0, %0" : : "r"(1ULL));
@@ -205,7 +257,7 @@ void timer_init_cpu(void)
 	if (!freq)
 		return;
 	irq_unmask(TIMER_IRQ);
-	__asm__ volatile("msr cntv_tval_el0, %0" : : "r"(freq / 100));
+	__asm__ volatile("msr cntv_tval_el0, %0" : : "r"(timer_interval_ticks(freq)));
 	__asm__ volatile("msr cntv_ctl_el0, %0" : : "r"(1ULL));
 }
 
@@ -257,6 +309,37 @@ void interrupts_init(void)
  * and took every check after it in the lane down with it. */
 static void irq_return_to_user(struct interrupt_frame *frame)
 {
+	/* `frame` is the interrupt frame SAVE_REGS built, so it is a kernel stack
+	 * pointer: 16-byte aligned, and above the base of RAM (this port runs
+	 * identity-mapped, so stacks are ordinary low addresses). A null check
+	 * alone is not
+	 * enough -- this has arrived as the integer 0x1A, small enough to be an
+	 * interrupt ID and non-zero enough to pass `!frame`, and the read of
+	 * frame->spsr at +0x108 then faulted on 0x122. The caller loads it from
+	 * [x29,#-0x8], four bytes above where it keeps `irq`, so the shape of the
+	 * corruption is a slot written at the wrong offset. Report it here, where
+	 * the value and the CPU that produced it are both still in hand. */
+	if (frame && ((u64)(usize)frame < 0x40000000ULL ||
+	              ((u64)(usize)frame & 15))) {
+		static volatile int reported;
+
+		if (!__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL)) {
+			struct percpu *pc = get_percpu();
+
+			console_write("IRQ-FRAME-BOGUS: frame=0x");
+			console_write_hex64((u64)(usize)frame);
+			console_write(" cpu=");
+			console_write_dec(pc ? (u64)pc->cpu_id : 99);
+			console_write(" task=");
+			console_write(current_task && current_task->name
+			                  ? current_task->name
+			                  : "(none)");
+			console_write(" pid=");
+			console_write_dec(current_task ? (u64)current_task->id : 0);
+			console_write("\n");
+		}
+		return;
+	}
 	if (!frame || (frame->spsr & 0xFULL) != 0)
 		return; /* interrupted EL1 — no user frame to deliver through */
 	/* rseq(2): the tick may have preempted the task, which is exactly when a
@@ -268,7 +351,75 @@ static void irq_return_to_user(struct interrupt_frame *frame)
 	arch_check_and_deliver_signals(frame);
 }
 
+/* M86: an exception taken at EL0 closes that task's user-time interval; the
+ * handler's own cost is charged to it as system time, exactly as x86_64 does in
+ * x86_irq_handler / x86_exception_handler. Without these two boundaries the
+ * ONLY accounting stamp on this arch was the syscall path, so a compute-bound
+ * thread that makes no syscalls had every one of its intervals closed by the
+ * context switch instead -- and sched_acct_on_switch credits an interval it
+ * ends to SYSTEM time. A thread that spent 150 ms burning CPU in userspace
+ * therefore reported almost no utime at all, which is what failed M86's
+ * rusage-self-group and times-process. Both handlers have several early
+ * returns, so the boundary lives in a wrapper rather than being repeated. */
+static void aarch64_irq_handler_inner(struct interrupt_frame *frame);
+
+/* FIQ (kind 0) and SError (kind 1), which the vector table used to answer with
+ * an infinite loop. Both are fatal here -- this kernel routes no FIQ and has no
+ * recovery for an asynchronous external abort -- but they must SAY so: a CPU
+ * spinning silently in a vector looks exactly like a CPU corrupted by something
+ * else, and telling those two apart is most of the work. ESR_EL1 carries the
+ * SError syndrome (with ISV/IDS set when the implementation provides one), so
+ * print it before stopping. */
+void aarch64_async_vector(u64 kind)
+{
+	u64 esr = 0, elr = 0, far = 0;
+
+	__asm__ volatile("mrs %0, esr_el1" : "=r"(esr));
+	__asm__ volatile("mrs %0, elr_el1" : "=r"(elr));
+	__asm__ volatile("mrs %0, far_el1" : "=r"(far));
+
+	console_write(kind ? "SERROR: " : "FIQ: ");
+	console_write("esr=0x");
+	console_write_hex64(esr);
+	console_write(" elr=0x");
+	console_write_hex64(elr);
+	ksym_print(elr);
+	console_write(" far=0x");
+	console_write_hex64(far);
+	{
+		u64 spsr = 0;
+
+		__asm__ volatile("mrs %0, spsr_el1" : "=r"(spsr));
+		console_write(" spsr=0x");
+		console_write_hex64(spsr);
+	}
+	{
+		struct percpu *pc = get_percpu();
+
+		console_write(" cpu=");
+		console_write_dec(pc ? (u64)pc->cpu_id : 99);
+	}
+	console_write(" task=");
+	console_write(current_task && current_task->name ? current_task->name
+	                                                 : "(none)");
+	console_write("/");
+	console_write_dec(current_task ? (u64)current_task->id : 0);
+	console_write("\n");
+	panic(kind ? "aarch64: SError" : "aarch64: unexpected FIQ");
+}
+
 void aarch64_irq_handler(struct interrupt_frame *frame)
+{
+	int from_el0 = (frame->spsr & 0xFULL) == 0;
+
+	if (from_el0)
+		sched_acct_enter_kernel();
+	aarch64_irq_handler_inner(frame);
+	if (from_el0)
+		sched_acct_leave_kernel();
+}
+
+static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 {
 	u32 iar = gicv3_present() ? gicv3_ack() : GICC_IAR;
 	/* v3 acknowledges a 24-bit INTID; v2's is 10 bits and the rest of the
@@ -282,10 +433,7 @@ void aarch64_irq_handler(struct interrupt_frame *frame)
 	}
 
 	if (irq == TIMER_IRQ) {
-		u64 freq;
-		__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
-		u64 interval = freq / 100;
-		__asm__ volatile("msr cntv_tval_el0, %0" : : "r"(interval));
+		timer_rearm();
 
 		/* EOI BEFORE scheduler_on_timer_tick, mirroring the x86_64 LAPIC
 		 * fix (M28 #8, kernel/arch/x86_64/interrupts.c). scheduler_on_timer_tick
@@ -438,7 +586,23 @@ static void decode_aarch64_exception(u64 esr, u64 elr, u64 far)
 
 
 
+static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
+                                      u64 *saved_regs);
+
 void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
+{
+	struct interrupt_frame *frame = (struct interrupt_frame *)saved_regs;
+	int from_el0 = (frame->spsr & 0xFULL) == 0;
+
+	if (from_el0)
+		sched_acct_enter_kernel();
+	aarch64_sync_handler_inner(esr, elr, far, saved_regs);
+	if (from_el0)
+		sched_acct_leave_kernel();
+}
+
+static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
+                                       u64 *saved_regs)
 {
 	struct interrupt_frame *frame = (struct interrupt_frame *)saved_regs;
 	u32 ec = (u32)(esr >> 26) & 0x3f;
@@ -467,18 +631,22 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 	 * stack, while the task table and the flight recorder still describe how it
 	 * got there.
 	 *
-	 * REPORT ONLY -- this must not panic, and the reason is not caution.
+	 * This USED to be report-only, and the reason was not caution:
 	 * scheduler_yield publishes `current_task = new_task` BEFORE calling
 	 * arch_context_switch, deliberately, so no other CPU can claim the incoming
 	 * task while its context is being loaded. Between those two points SP still
-	 * belongs to the OUTGOING task, so "SP is not current_task's stack" is a
-	 * legitimate, transient state and every synchronous EL1 fault landing in
-	 * that window (paging_switch_address_space, the FPU save/restore, demand
-	 * paging under any of them) trips it. Measured: the check panicked three
-	 * lanes a run, each report naming the CPU's own idle task's stack a few
-	 * hundred bytes below its top -- i.e. the idle loop's own frame, mid-switch.
-	 * A real overlap still surfaces as its own fault; this one was manufacturing
-	 * panics out of a correct scheduler. */
+	 * belongs to the OUTGOING task, so "SP is not current_task's stack" was a
+	 * legitimate, transient state, and panicking on it manufactured three
+	 * panics a run out of a correct scheduler.
+	 *
+	 * The window is now a FACT rather than something to tolerate:
+	 * sched_prev_task_this_cpu() names the task SP still belongs to for exactly
+	 * that span and NULL outside it. An SP inside that task's stack is the
+	 * known window; an SP anywhere else is the corruption this check exists
+	 * for, and it panics again -- at the moment it happens, while the task
+	 * table still describes how it got there, instead of surfacing three
+	 * context switches later as a garbled register.
+	 */
 	if (!from_el0 && current_task && current_task->stack &&
 	    current_task->kernel_stack_ptr) {
 		u64 sp_now = (u64)(usize)frame;
@@ -493,7 +661,18 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 		if (aarch64_on_el1_fault_stack(sp_now))
 			sp_now = aarch64_el1_fault_sp();
 
-		if (sp_now < own_lo || sp_now > own_hi) {
+		/* The mid-switch window: SP still names the outgoing task. */
+		struct task *prev = sched_prev_task_this_cpu();
+		int in_switch_window = 0;
+
+		if (prev && prev->stack && prev->kernel_stack_ptr) {
+			u64 plo = (u64)(usize)prev->stack;
+			u64 phi = prev->kernel_stack_ptr;
+
+			in_switch_window = (sp_now >= plo && sp_now <= phi);
+		}
+
+		if (!in_switch_window && (sp_now < own_lo || sp_now > own_hi)) {
 			/* Report once. This report runs ON the foreign stack, and the
 			 * console it calls faults there too -- each fault re-enters here,
 			 * re-reports, and recurses ~0x430 of stack per turn until the log
@@ -501,9 +680,6 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 			 * watchdog with no readable dump at all. The first report is the
 			 * only one worth anything; everything after it is this check
 			 * tripping over its own output. */
-			static volatile int reported;
-			if (__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL))
-				goto el1_stack_checked;
 			console_write("EL1-FOREIGN-STACK: pid ");
 			console_write_dec((u64)current_task->id);
 			console_write(" name=");
@@ -538,12 +714,49 @@ void aarch64_sync_handler(u64 esr, u64 elr, u64 far, u64 *saved_regs)
 					console_write(ow ? (ow->name ? ow->name : "(none)") : "(unowned)");
 					console_write("/");
 					console_write_dec(ow ? (u64)ow->id : 0);
+					/* THE question this report could not answer.
+					 *
+					 * Two families explain a CPU on another task's stack, and
+					 * they need opposite fixes: either that task is running
+					 * RIGHT NOW on another CPU (two claimers of one task, so
+					 * look at the claim paths), or it is running nowhere and
+					 * this CPU resumed a stale saved context (so look at what
+					 * writes ->context). Every CPU's cur_task, printed here,
+					 * decides it -- and the owner's own state and lease say
+					 * whether anything could legitimately have claimed it. */
+					console_write(" owner_state=");
+					console_write_dec(ow ? (u64)ow->state : 99);
+					console_write(" owner_lease=");
+					console_write_dec(ow ? (u64)__atomic_load_n(
+					                           &ow->stack_released,
+					                           __ATOMIC_ACQUIRE)
+					                     : 99);
+					console_write(" cur[");
+					for (int c = 0; c < MAX_CPUS; c++) {
+						struct percpu *pc = get_percpu_n(c);
+						struct task *ct = pc ? (struct task *)pc->cur_task : 0;
+
+						if (!pc)
+							continue;
+						if (c)
+							console_write(",");
+						console_write_dec((u64)c);
+						console_write("=");
+						console_write(ct ? (ct->name ? ct->name : "(none)")
+						                 : "(none)");
+						console_write("/");
+						console_write_dec(ct ? (u64)ct->id : 0);
+					}
+					console_write("]");
 				}
+				console_write(" prev=");
+				console_write(prev ? (prev->name ? prev->name : "(none)")
+				                   : "(none)");
 			}
 			console_write("\n");
+			panic("sched: EL1 exception on a foreign kernel stack");
 		}
 	}
-el1_stack_checked:
 
 	if (from_el0 && current_task && current_task->kernel_stack_ptr) {
 		u64 frame_top = (u64)(usize)frame + sizeof(*frame);

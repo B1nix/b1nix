@@ -352,7 +352,20 @@ run_qemu() {
 			# never asked to switch. root=initramfs keeps / on the RAM
 			# filesystem so the disk is a second one to move onto, which is
 			# the whole point of the instance.
-			[ "$lane" = "switchroot" ] && lane_cmdline="b1nix.test=1 b1nix.smoke=switchroot root=initramfs init=/init-shebang"
+			# b1nix.e1000-subnet=3 belongs here too, and its absence is why
+			# this lane -- and only this lane -- failed M37's rx-arp and
+			# rx-irq on every single run. Each of the three overrides below
+			# REPLACES the default cmdline rather than adding to it, and this
+			# one dropped the flag: the kernel then defaults to subnet 2 and
+			# ARPs for 10.0.2.2, while run_qemu puts this NIC on 10.0.3.0/24
+			# with its gateway at 10.0.3.2. Nothing on that segment answers,
+			# so the reply never comes and no RX interrupt is ever raised --
+			# precisely the failure the comment above the default cmdline
+			# describes. It read as a timing race (this lane reaches the
+			# self-test at 1.19 s, the lanes that pass reach it at 2.5 s) and
+			# it was never about time: the passing lanes get their reply in
+			# one millisecond.
+			[ "$lane" = "switchroot" ] && lane_cmdline="b1nix.test=1 b1nix.e1000-subnet=3 b1nix.smoke=switchroot root=initramfs init=/init-shebang"
 			kernel_args="-kernel $PROJECT_DIR/build/aarch64/Image"
 			if [ "$(uname)" = "Darwin" ]; then
 				accel_args="-accel hvf -cpu host"
@@ -411,6 +424,14 @@ run_qemu() {
 			# distinct from the initramfs it starts on. Giving them the disk as
 			# well would put two filesystems with the same label in front of
 			# them.
+			#
+			# aarch64 does not take this: there the root image is copied into
+			# the lane's own $_sata and attached as the virtio-blk root, so
+			# adding it again would show the guest two b1nix-root labels.
+			# Dropping this line for both arches is what left x86_64 with no
+			# root at all -- "virtio-blk: no device found", then "staying on
+			# initramfs", then init failing ENOENT because /sbin/init lives on
+			# the root that never arrived.
 			if [ -z "${SMOKE_ROOT_MODULE:-}" ] &&
 			   [ "${B1NIX_ISO_NAME:-}" != "b1nix-blk.iso" ] &&
 			   [ "${B1NIX_ISO_NAME:-}" != "b1nix-switchroot.iso" ] &&
@@ -542,6 +563,21 @@ run_qemu() {
 				-append "b1nix.test=1 b1nix.smoke=init"
 		fi
 
+		# Two attempts, and the second only ever happens for a launch failure.
+		#
+		# An instance that produced NOTHING did not fail a test -- it failed to
+		# start. QEMU's own stderr lands in this log, so a refused accelerator
+		# or a bad argument would be visible in it; zero bytes means the process
+		# never got far enough to say anything, which on this host happens under
+		# memory pressure with several HVF guests already up. The checks that
+		# read the log are then reported BLOCKED, which is honest but describes
+		# the harness rather than the kernel, and it is the whole of the
+		# residual `Blocked: 6` an otherwise green run still shows.
+		#
+		# A lane that genuinely wedges still produces output, so it is never
+		# retried; only silence is.
+		local _attempt=1
+		while :; do
 		"$@" >"$log" 2>&1 &
 		pid=$!
 
@@ -576,6 +612,27 @@ run_qemu() {
 					last_progress_ts=$(date +%s)
 				fi
 				if grep -qa -E "$done_pattern" "$log" 2>/dev/null; then
+					# Some lanes are read for markers the guest prints AFTER the
+					# one that ends them, and killing QEMU is not instant, so
+					# whether those markers make it out is a race the harness
+					# wins only on an unloaded host. SMOKE_DONE_SETTLE gives the
+					# instance a bounded extra window to finish speaking; the
+					# progress reporting above keeps running through it, and the
+					# stall/timeout guards still apply. A lane that does not set
+					# it stops exactly as before.
+					settle=${SMOKE_DONE_SETTLE:-0}
+					while [ "$settle" -gt 0 ]; do
+						sleep 1
+						settle=$((settle - 1))
+						line_count=$(wc -l <"$log" | tr -d ' ')
+						if [ "$line_count" -gt "$reported_lines" ]; then
+							sed -n "$((reported_lines + 1)),${line_count}p" "$log" |
+								while IFS= read -r line; do
+									report_progress_line "$line"
+								done
+							reported_lines=$line_count
+						fi
+					done
 					break
 				fi
 				if ! kill -0 "$pid" 2>/dev/null; then
@@ -620,6 +677,13 @@ run_qemu() {
 		wait "$watcher_pid" 2>/dev/null || true
 		kill -9 "$pid" 2>/dev/null || true
 		wait "$pid" 2>/dev/null || true
+
+		[ -s "$log" ] && break
+		[ "$_attempt" -ge 2 ] && break
+		_attempt=$((_attempt + 1))
+		command echo "[smoke] $log: no output at all — retrying (launch failure, not a test result)" >&2
+		done
+
 	else
 		echo "Unknown ARCH: $ARCH"
 		exit 1
@@ -929,8 +993,18 @@ if [ "$SMOKE_PARALLEL" = "1" ] && { [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMO
 		# aarch64 has no userspace-on-AP phase yet (kernel/arch/aarch64/smp.c
 		# says what is missing), so the work-stealing verdict is where this
 		# instance ends rather than the BKL proof the x86_64 pattern waits for.
-		[ "$ARCH" = "aarch64" ] &&
+		# smp_selftest_run() is called at kernel/main.c:1357, while
+		# pci_selftest (1427), its_selftest (1538), smmuv3_selftest (1555) and
+		# nvme_iommu_selftest (1556) all come later -- so eleven of the twelve
+		# markers this lane is read for are printed AFTER the one that ends it.
+		# Waiting for the last of them instead was tried and reverted: the lane
+		# does not reach it inside its window, runs to the stall timeout, and
+		# starves every instance queued behind it. Give it a few seconds to
+		# finish speaking instead.
+		[ "$ARCH" = "aarch64" ] && {
 			SMOKE_DONE_PATTERN="M24B-SMP: ok work-stealing|M24B-SMP: skip single-cpu|$SMOKE_DONE_PATTERN"
+			SMOKE_DONE_SETTLE=${SMOKE_DONE_SETTLE:-8}
+		}
 		SMOKE_PROGRESS_MODE=smp
 		PROGRESS_PREFIX="[smp]  "
 		run_qemu "$SMP_LOG"
@@ -1266,8 +1340,10 @@ launch_smp_solo() {
 		# init, long after the selftest marker, so cutting the instance at the
 		# selftest made that check permanently unreachable (reported BLOCKED).
 		SMOKE_DONE_PATTERN="M24B-BKL: instance ran-on-ap|M24B-SMP: fail work-stealing|KERNEL PANIC|\[PANIC\]"
-		[ "$ARCH" = "aarch64" ] &&
+		[ "$ARCH" = "aarch64" ] && {
 			SMOKE_DONE_PATTERN="M24B-SMP: skip single-cpu|$SMOKE_DONE_PATTERN"
+			SMOKE_DONE_SETTLE=${SMOKE_DONE_SETTLE:-8}
+		}
 		SMOKE_PROGRESS_MODE=smp
 		PROGRESS_PREFIX="[smp]  "
 		run_qemu "$SMP_LOG"
@@ -1279,14 +1355,32 @@ launch_smp_solo() {
 # Polls finished PIDs every second (POSIX-sh compatible) rather than waiting
 # on full batches, so a fast instance exiting early makes room for the next one
 # without blocking on the others.
+# Start one instance and report its pid, or nothing if it did not start one.
+#
+# `$!` is the wrong thing to read here: launch_iommu and launch_amdvi return
+# early on aarch64 without backgrounding anything, so `$!` still names the
+# PREVIOUS instance and the pool recorded a duplicate of a pid it was already
+# tracking. When that pid exited, the removal loop stripped BOTH copies -- so
+# the pool's idea of how many slots were busy drifted away from the truth, and
+# with enough of them it could empty its list while instances were still queued
+# and sit in the wait loop for ever. Each launcher sets its own pid_<name> after
+# backgrounding, so ask that instead: unset means nothing was started.
+launch_slot() {
+	eval "pid_$1="
+	"launch_$1"
+	eval "_slot_pid=\$pid_$1"
+}
+
 run_slot_pool() {
 	_max=$1; shift
 	_pids="" _queue="" _idx=0
 	for _n; do
 		if [ "$_idx" -lt "$_max" ]; then
-			"launch_$_n"
-			_pids="$_pids $!"
-			_idx=$((_idx + 1))
+			launch_slot "$_n"
+			if [ -n "$_slot_pid" ]; then
+				_pids="$_pids $_slot_pid"
+				_idx=$((_idx + 1))
+			fi
 		else
 			_queue="$_queue $_n"
 		fi
@@ -1306,8 +1400,8 @@ run_slot_pool() {
 			done
 			[ "$_done" = "0" ] && sleep 1
 		done
-		"launch_$_n"
-		_pids="$_pids $!"
+		launch_slot "$_n"
+		[ -n "$_slot_pid" ] && _pids="$_pids $_slot_pid"
 	done
 	for _p in $_pids; do wait "$_p" 2>/dev/null || true; done
 }
@@ -2989,7 +3083,18 @@ check_output "$LOG" "M95-SMOKE: ok dup-load" "loading an already-loaded module r
 check_output "$LOG" "M95-SMOKE: ok vermagic-reject" "a .ko whose vermagic was corrupted is refused with ENOEXEC while the intact one still loads"
 check_output "$LOG" "M95-SMOKE: ok init-module" "init_module(2) loads a module image straight out of process memory"
 check_output "$LOG" "M95-SMOKE: ok unpriv" "an unprivileged process cannot delete a module (EPERM) and the module survives"
-check_output "$LOG" "M95-SMOKE: ok fs-in-use" "a module providing a mounted filesystem cannot be unloaded (EBUSY), and can again once it is unmounted"
+# The guest proves this by mounting the btrfs image and then trying to unload
+# btrfs.ko, so it needs an image -- and there is none when mkfs.btrfs was absent
+# when the disks were made. The guest already reports that case as a skip with
+# the reason; without the same condition here the harness demanded an "ok" the
+# guest had correctly declined to print, and a host without btrfs-progs failed a
+# check about module reference counting.
+if command -v mkfs.btrfs >/dev/null 2>&1; then
+	check_output "$LOG" "M95-SMOKE: ok fs-in-use" "a module providing a mounted filesystem cannot be unloaded (EBUSY), and can again once it is unmounted"
+else
+	skipped "a module providing a mounted filesystem cannot be unloaded (EBUSY)" \
+		"no btrfs image on this host (mkfs.btrfs absent), so there is no mounted module-backed filesystem to pin"
+fi
 check_output "$LOG" "M95-SMOKE: ok filesystems-nodev" "/proc/filesystems marks every pseudo filesystem nodev and no block-backed one"
 check_output "$LOG" "M95-SMOKE: done" "M95 loadable-kernel-module suite completes"
 # ── M96: network protocol modules, module parameters, modprobe ──

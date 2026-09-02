@@ -64,6 +64,9 @@ struct user_image_segment {
 	 * file-backed lazy instead of pinning private frames, so the resident set is
 	 * the touched working set and the rest stays reclaimable. */
 	u8 demand_ok;
+	/* 1 = this segment came from the PT_INTERP image, so its file backing is
+	 * interp_node rather than exe_node. */
+	u8 from_interp;
 };
 
 struct user_address_space {
@@ -111,6 +114,10 @@ struct user_loaded_image {
 	 * VFS node of a disk-backed (read_cb) executable whose read-only segments are
 	 * demand-paged from the page cache; 0 = fully eager (initramfs / ineligible). */
 	struct vfs_node *exe_node;
+	/* The same, for the program interpreter. ld.so is the most-loaded file on
+	 * the system: every dynamically linked exec maps it, and it is the same
+	 * 723 KiB file every time. */
+	struct vfs_node *interp_node;
 	int demand_paged;
 	/* M92: executable's program header table info for AT_PHDR/AT_PHNUM auxv.
 	 * phdr_vaddr is the in-process VA where the ELF program headers are mapped;

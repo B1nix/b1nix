@@ -2258,6 +2258,36 @@ static void blk_flush_matching(struct block_device *dev, u64 first, u64 last,
     kfree(bounce);
 }
 
+/* The writeback half of blk_cache_flush_inode, without the device barrier.
+ *
+ * fsync issued two barriers per call: one from the filesystem's fsync_cb and
+ * one from here. Two is one too many, and the first of them was issued BEFORE
+ * the writeback it was supposed to make durable -- ext4_vfs_fsync's own comment
+ * describes the order the code did not have. Splitting the barrier off lets
+ * vfs_fsync put the writeback first and pay for exactly one. */
+int blk_cache_writeback_inode(struct block_device *dev, u32 fsid, u64 ino) {
+  if (!dev)
+    return -1;
+  if (!dev->write_blocks)
+    return 0;
+
+  u64 first = 0;
+  u64 last = ~0ULL;
+
+  if (blk_is_partition(dev)) {
+    struct partition_device *part = (struct partition_device *)dev->priv;
+
+    if (!part || !part->parent)
+      return -1;
+    first = part->start_lba;
+    last = part->start_lba + dev->block_count;
+    dev = part->parent;
+  }
+
+  blk_flush_matching(dev, first, last, fsid, ino);
+  return 0;
+}
+
 int blk_cache_flush_inode(struct block_device *dev, u32 fsid, u64 ino) {
   if (!dev)
     return -1;

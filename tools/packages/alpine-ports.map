@@ -95,7 +95,8 @@ programs      zsh curl libcurl samurai bmake dropbear dropbear-ssh \
               seatd sway swaybg grim foot foot-extra-terminfo cage \
               font-dejavu xkeyboard-config xwayland \
               mesa-egl mesa-gles mesa-gbm mesa-gl mesa-glapi \
-              mtdev fribidi libdisplay-info libxft
+              mtdev fribidi libdisplay-info libxft \
+              libseat vulkan-loader xcb-util-renderutil tiff libpciaccess
 
 # The browser. Baked into the image at build time rather than installed in the
 # guest: the closure is ~175 packages and installing it over the network inside

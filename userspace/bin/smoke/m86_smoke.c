@@ -202,6 +202,8 @@ static void test_thread_cputime(void) {
 struct burner_arg {
   int ms;
   long long cpu_ns;   /* thread's own CPU time, filled in by the thread */
+  long long own_u_us; /* ...split into user and system, by the same thread */
+  long long own_s_us;
   pid_t tid;
   clockid_t clk;
   volatile int started;
@@ -212,8 +214,22 @@ static void *burner_entry(void *p) {
   a->tid = my_tid();
   a->started = 1;
   long long t0 = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+  struct rusage r0;
+  if (getrusage(RUSAGE_THREAD, &r0) != 0)
+    memset(&r0, 0, sizeof(r0));
   burn_ms(a->ms);
   a->cpu_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID) - t0;
+  /* This thread's own view of the time it just burned, split into user and
+   * system. The group total is assembled from exactly these numbers, so when
+   * the two disagree the diagnostic in test_rusage_and_times can say which
+   * side lost them. */
+  struct rusage r1;
+  if (getrusage(RUSAGE_THREAD, &r1) == 0) {
+    a->own_u_us = (long long)(r1.ru_utime.tv_sec - r0.ru_utime.tv_sec) * 1000000LL +
+                  (r1.ru_utime.tv_usec - r0.ru_utime.tv_usec);
+    a->own_s_us = (long long)(r1.ru_stime.tv_sec - r0.ru_stime.tv_sec) * 1000000LL +
+                  (r1.ru_stime.tv_usec - r0.ru_stime.tv_usec);
+  }
   return (void *)0x8686;
 }
 
@@ -335,6 +351,16 @@ static void test_rusage_and_times(void) {
     return;
   }
   burn_ms(120);
+  /* The group total with the sibling STILL ALIVE, so its time is being summed
+   * from its live slot rather than from whatever the exit path folded into the
+   * leader. If this already falls short, the loss is in the live accounting; if
+   * only the post-join figure does, the loss is in the fold. */
+  struct rusage self_live;
+  long long live_us = 0;
+  if (getrusage(RUSAGE_SELF, &self_live) == 0)
+    live_us = (long long)(self_live.ru_utime.tv_sec - self0.ru_utime.tv_sec) *
+                  1000000LL +
+              (self_live.ru_utime.tv_usec - self0.ru_utime.tv_usec);
   pthread_join(th, 0);
 
   struct rusage self1, thr1;
@@ -357,6 +383,36 @@ static void test_rusage_and_times(void) {
   /* RUSAGE_SELF covers this thread AND the sibling, so it must exceed the
    * calling thread's own time by roughly the sibling's burn. */
   if (self_us < thr_us + 50000) {
+    /* Say WHICH half is short. The sibling burns until its thread clock --
+     * user PLUS system -- has advanced 150 ms, but this check reads ru_utime
+     * alone, so a kernel that credits a compute loop's time to the wrong half
+     * fails here with no hint that the split is the problem rather than the
+     * total. Report both. */
+    long long self_sys =
+        (long long)(self1.ru_stime.tv_sec - self0.ru_stime.tv_sec) * 1000000LL +
+        (self1.ru_stime.tv_usec - self0.ru_stime.tv_usec);
+    long long thr_sys =
+        (long long)(thr1.ru_stime.tv_sec - thr0.ru_stime.tv_sec) * 1000000LL +
+        (thr1.ru_stime.tv_usec - thr0.ru_stime.tv_usec);
+    char d[160];
+    snprintf(d, sizeof(d),
+             "M86-SMOKE: note rusage-split d_self_u=%ldms d_thr_u=%ldms "
+             "d_live_u=%ldms sib_cpu=%ldms sib_u=%ldms sib_s=%ldms "
+             "abs self0=%ldms self1=%ldms thr0=%ldms thr1=%ldms "
+             "self_s=%ldms thr_s=%ldms",
+             (long)(self_us / 1000), (long)(thr_us / 1000),
+             (long)(live_us / 1000), (long)(a.cpu_ns / 1000000),
+             (long)(a.own_u_us / 1000), (long)(a.own_s_us / 1000),
+             (long)(self0.ru_utime.tv_sec * 1000 +
+                    self0.ru_utime.tv_usec / 1000),
+             (long)(self1.ru_utime.tv_sec * 1000 +
+                    self1.ru_utime.tv_usec / 1000),
+             (long)(thr0.ru_utime.tv_sec * 1000 +
+                    thr0.ru_utime.tv_usec / 1000),
+             (long)(thr1.ru_utime.tv_sec * 1000 +
+                    thr1.ru_utime.tv_usec / 1000),
+             (long)(self_sys / 1000), (long)(thr_sys / 1000));
+    marker(d);
     fail("rusage-self-group", (long)((self_us - thr_us) / 1000));
     return;
   }
@@ -907,7 +963,13 @@ static void test_kill_unblocked(void) {
  * rewrite the interrupted userspace context.
  *
  * The child's loop is finite on purpose: a kernel that never delivers must fail
- * this check, not hang the instance. */
+ * this check, not hang the instance. It also has to OUTLAST the parent, which
+ * is the half that was wrong -- at four billion iterations the child finished
+ * its loop and became a zombie inside the parent's 100 ms sleep on a loaded
+ * host, and the check then failed on a kill to a pid that no longer had a live
+ * task rather than on anything about signal delivery. The bound is now far
+ * beyond any run's patience; what actually ends the child is the parent's
+ * SIGKILL below, after its own bounded wait. */
 static volatile sig_atomic_t g_compute_hit;
 
 static void compute_loop_handler(int sig) {
@@ -929,16 +991,29 @@ static void test_signal_compute_loop(void) {
     sigaction(SIGUSR1, &sa, 0);
     /* No syscalls past this point, deliberately. */
     volatile unsigned long acc = 1;
-    for (unsigned long i = 0; i < 4000000000UL; i++)
+    for (unsigned long i = 0; i < 400000000000UL; i++)
       acc = acc * 1103515245UL + 12345UL;
     _exit(g_compute_hit ? 7 : 0); /* 0 = the handler never ran */
   }
 
   usleep(100000); /* let the child leave fork bookkeeping for the loop */
   if (kill(pid, SIGUSR1) != 0) {
-    fail("signal-compute-loop-kill", -1);
+    /* Say what became of the child. A failed kill is almost never about the
+     * kill: on a loaded host the child can finish its (deliberately finite)
+     * loop and become a zombie before the parent's 100 ms sleep returns, and
+     * "kill failed with errno 3" then hides the one fact that explains the
+     * run -- whether the child exited on its own or died of something. */
+    int s = 0;
     kill(pid, SIGKILL);
-    { int s = 0; waitpid(pid, &s, 0); }
+    if (waitpid(pid, &s, 0) == pid) {
+      char d[128];
+      snprintf(d, sizeof(d),
+               "M86-SMOKE: note compute-loop child already gone: %s %d",
+               WIFEXITED(s) ? "exited" : "signalled",
+               WIFEXITED(s) ? WEXITSTATUS(s) : WTERMSIG(s));
+      marker(d);
+    }
+    fail("signal-compute-loop-kill", -1);
     return;
   }
 
