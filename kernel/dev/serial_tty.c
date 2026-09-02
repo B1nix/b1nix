@@ -351,9 +351,7 @@ static int stty_apply_cflag(struct serial_tty *t, u32 cflag) {
   u8 parity = 0;
   if (cflag & STTY_PARENB)
     parity = (cflag & STTY_PARODD) ? 1 : 2;
-  if (serial_port_set_line(t->com, rate, bits, parity, stop) < 0)
-    return -EINVAL;
-  return 0;
+  return serial_port_set_line(t->com, rate, bits, parity, stop);
 }
 
 /* Linux TIOCM_* bits, and where each one lives in the 16550. */
@@ -462,8 +460,18 @@ static int stty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
      * POSIX agrees: tcsetattr succeeds if it applied any of what was asked,
      * and the caller is expected to tcgetattr to see what stuck -- which is
      * exactly what stty_cflag_from_hw makes truthful below. */
-    if (stty_apply_cflag(t, want.c_cflag) < 0)
+    int crc = stty_apply_cflag(t, want.c_cflag);
+    if (crc < 0)
       t->termios.c_cflag = saved.c_cflag;
+    /* A rate this UART cannot produce is the caller's error and has to be
+     * reported: tcsetattr(B230400) on a 16550 whose clock is 115200 returns
+     * EINVAL with the line untouched. A controller that cannot be reprogrammed
+     * at all answers -ENOSYS instead, and that is the case the partial apply
+     * above is for. */
+    if (crc == -EINVAL) {
+      stty_cflag_from_hw(t);
+      return -EINVAL;
+    }
     /* Report the line as the chip now holds it — a rate the divisor rounded
      * or a field this UART ignores must not come back as if it had stuck. */
     stty_cflag_from_hw(t);

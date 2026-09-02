@@ -273,7 +273,8 @@ static u32 hda_corb_send_wait(u32 verb) {
 		/* Ten ticks is a tenth of a second — four orders of magnitude more
 		 * than a working codec needs, and a fiftieth of what this cost
 		 * before. */
-		if ((i & 0xff) == 0xff && scheduler_get_uptime_ticks() - start > 10)
+		if ((i & 0xff) == 0xff &&
+		    scheduler_get_uptime_ticks() - start > SCHED_TICKS_PER_SEC / 10)
 			break;
 		cpu_relax();
 	}

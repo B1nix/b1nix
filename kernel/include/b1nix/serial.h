@@ -25,8 +25,15 @@ int serial_port_present(int idx);
  * reports is what the UART is actually doing.
  *
  * baud must divide 115200; data_bits 5..8; parity 0=none 1=odd 2=even;
- * stop_bits 1 or 2. Returns 0, or -1 for an absent port or a rate the divisor
- * cannot express. */
+ * stop_bits 1 or 2. Returns 0, -ENODEV for an absent port, -EINVAL for a rate
+ * the divisor cannot express (or any other unusable parameter), and -ENOSYS on
+ * a controller whose line this kernel cannot reprogram at all.
+ *
+ * The last two are distinct on purpose: a rate this UART cannot produce is the
+ * caller's error and tcsetattr must report it, while a controller with no
+ * reachable divisor (PL011) is not an error in what was asked -- the rest of
+ * the termios still applies. Collapsing both onto -1 made tcsetattr accept a
+ * baud rate the 16550 refused. */
 int serial_port_set_line(int idx, u32 baud, u8 data_bits, u8 parity,
                          u8 stop_bits);
 /* What the divisor latch and LCR currently say, read back from the chip. Any

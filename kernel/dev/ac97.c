@@ -11,6 +11,7 @@
  * hw/audio/ac97.c). AC'97 mixer volume fields are attenuation: 0 = full
  * volume; bit 15 of each volume register is the mute flag.
  */
+#include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -55,8 +56,13 @@
 #define AC97_GLOB_CNT 0x2C /* global control (32-bit)                 */
 
 #define AC97_CR_RPBM  0x0001 /* run/pause bus master */
+#define AC97_CR_RR    0x0002 /* reset registers (self-clearing) */
 #define AC97_SR_DCH   0x0001 /* DMA controller halted */
+#define AC97_SR_LVBCI 0x0004 /* last valid buffer completion interrupt */
 #define AC97_SR_BCIS  0x0008 /* buffer completion interrupt status */
+#define AC97_SR_FIFOE 0x0010 /* FIFO error */
+/* The three write-one-to-clear status bits, cleared together before a start. */
+#define AC97_SR_WC    (AC97_SR_LVBCI | AC97_SR_BCIS | AC97_SR_FIFOE)
 
 #define AC97_GC_CR    0x0002 /* cold reset request */
 
@@ -80,7 +86,6 @@ static u64 ac97_dma_buf_phys;
 static u8  *ac97_dma_buf;
 static u32 ac97_dma_buf_sz;
 static u64 ac97_bdl_phys;
-static u32 ac97_bd_idx;        /* descriptor index QEMU will fetch next */
 
 static volatile int ac97_play_lock;
 
@@ -162,6 +167,14 @@ static int ac97_setup_dma(u32 buf_size) {
 	ac97_bdl_phys = pmm_alloc_frames(1);
 	if (!ac97_bdl_phys)
 		return -1;
+	/* BDBAR and a descriptor's address field are 32 bits wide: memory above
+	 * 4 GiB is not addressable by this controller at all, and truncating to
+	 * 32 bits would point it at somebody else's page. */
+	if ((ac97_bdl_phys + PAGE_SIZE) > 0xFFFFFFFFull ||
+	    (ac97_dma_buf_phys + ac97_dma_buf_sz) > 0xFFFFFFFFull) {
+		console_write("ac97: DMA memory above 4 GiB, unusable by this controller\n");
+		return -1;
+	}
 	memset((void *)(usize)(ac97_bdl_phys + vmm_direct_map_base()), 0, PAGE_SIZE);
 
 	/* Bring the codec out of reset and select a fixed 48 kHz rate. */
@@ -176,36 +189,61 @@ static int ac97_setup_dma(u32 buf_size) {
 	return 0;
 }
 
+/* Reset the PCM-out channel and point it at our descriptor list.
+ *
+ * The BDBAR write is the whole reason playback never ran: the base address of
+ * the descriptor list was never given to the controller, so it fetched
+ * descriptors from physical address zero and the channel sat halted forever.
+ * The self-test could not see that, because ac97_play_bytes returned success
+ * whether or not the DMA had done anything.
+ *
+ * The reset (CR.RR, self-clearing) is what makes a start repeatable: it zeroes
+ * CIV, PIV and LVI, so every playback begins at descriptor 0 instead of chasing
+ * a rotating index the controller might not agree about. */
+static void ac97_channel_arm(void) {
+	outb(ac97_nabm_port + AC97_PO_CR, 0); /* stop before resetting */
+	outb(ac97_nabm_port + AC97_PO_CR, AC97_CR_RR);
+	for (int i = 0; i < 10000; i++) {
+		if (!(inb(ac97_nabm_port + AC97_PO_CR) & AC97_CR_RR))
+			break;
+		cpu_relax();
+	}
+	outl(ac97_nabm_port + AC97_PO_BDBAR, (u32)ac97_bdl_phys);
+	outw(ac97_nabm_port + AC97_PO_SR, AC97_SR_WC);
+}
+
 /* Start playback of `bytes` from the DMA buffer and wait for completion. */
 static int ac97_play_bytes(u32 bytes) {
 	struct ac97_bd *bdl =
 		(struct ac97_bd *)(usize)(ac97_bdl_phys + vmm_direct_map_base());
-	u32 idx = ac97_bd_idx & 31;
 
-	bdl[idx].addr = (u32)ac97_dma_buf_phys;
-	bdl[idx].ctl_len = (bytes / 2) | AC97_BD_IOC;
-	outw(ac97_nabm_port + AC97_PO_SR, AC97_SR_BCIS); /* clear BCIS */
-
-	/* LVI must match the descriptor that will be fetched so the channel
-	 * halts (DCH) once it is consumed instead of advancing to a stale
-	 * descriptor. QEMU sets civ = piv and fetches bd[civ] on start. */
-	outb(ac97_nabm_port + AC97_PO_LVI, (u8)(idx & 0xFF));
+	ac97_channel_arm();
+	bdl[0].addr = (u32)ac97_dma_buf_phys;
+	bdl[0].ctl_len = (bytes / 2) | AC97_BD_IOC;
+	outb(ac97_nabm_port + AC97_PO_LVI, 0);
 	outb(ac97_nabm_port + AC97_PO_CR, AC97_CR_RPBM);
-	ac97_bd_idx++;
 
 	u64 start = scheduler_get_ticks();
-	int done = 0;
+	int running = 0, done = 0;
 
-	while (!done) {
-		if (inw(ac97_nabm_port + AC97_PO_SR) & AC97_SR_DCH) {
+	/* Two phases, not one. A channel that has just been reset reports DCH
+	 * (halted) until the first sample is fetched, so a single "wait for DCH"
+	 * loop would return success immediately having played nothing. Wait for
+	 * the channel to start, then for it to halt again. */
+	while (scheduler_get_ticks() - start <= 5 * SCHED_TICKS_PER_SEC) {
+		u16 sr = inw(ac97_nabm_port + AC97_PO_SR);
+
+		if (!running) {
+			if (!(sr & AC97_SR_DCH))
+				running = 1;
+		} else if (sr & AC97_SR_DCH) {
 			done = 1;
 			break;
 		}
-		if (scheduler_get_ticks() - start > 500) /* 5 s */
-			break;
 		scheduler_yield();
 	}
 	outb(ac97_nabm_port + AC97_PO_CR, 0); /* pause */
+	outw(ac97_nabm_port + AC97_PO_SR, AC97_SR_WC);
 	/* A timeout is a failure and says so. Returning success here regardless
 	 * meant the self-test's "ok play-tone" printed for a channel that had
 	 * never consumed its descriptor, and a write(2) of a few chunks sat for
@@ -466,23 +504,21 @@ int ac97_iommu_violation_probe(void)
 	if (mapped) {
 		struct ac97_bd *bdl =
 			(struct ac97_bd *)(usize)(ac97_bdl_phys + vmm_direct_map_base());
-		u32 idx = ac97_bd_idx & 31;
-		bdl[idx].addr = (u32)ac97_dma_buf_phys;
-		bdl[idx].ctl_len = (4096 / 2) | AC97_BD_IOC;
-		outw(ac97_nabm_port + AC97_PO_SR, AC97_SR_BCIS);
-		outb(ac97_nabm_port + AC97_PO_LVI, (u8)(idx & 0xFF));
+		ac97_channel_arm();
+		bdl[0].addr = (u32)ac97_dma_buf_phys;
+		bdl[0].ctl_len = (4096 / 2) | AC97_BD_IOC;
+		outb(ac97_nabm_port + AC97_PO_LVI, 0);
 		outb(ac97_nabm_port + AC97_PO_CR, AC97_CR_RPBM);
-		ac97_bd_idx++;
 
 		u64 start = scheduler_get_ticks();
-		while (scheduler_get_ticks() - start < 50) { /* up to 0.5 s */
+		while (scheduler_get_ticks() - start < SCHED_TICKS_PER_SEC / 2) { /* up to 0.5 s */
 			faults = iommu_fault_count();
 			if (faults)
 				break;
 			scheduler_yield();
 		}
 		outb(ac97_nabm_port + AC97_PO_CR, 0); /* stop the channel */
-		outw(ac97_nabm_port + AC97_PO_SR, AC97_SR_BCIS);
+		outw(ac97_nabm_port + AC97_PO_SR, AC97_SR_WC);
 	}
 
 	iommu_unmap(ac97_bdl_phys & ~(u64)(PAGE_SIZE - 1), PAGE_SIZE);

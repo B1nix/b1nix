@@ -1,4 +1,5 @@
 #include <b1nix/serial.h>
+#include <b1nix/errno.h>
 #include <b1nix/types.h>
 #include <b1nix/bootinfo.h>
 #include "platform.h"
@@ -300,7 +301,11 @@ int serial_port_set_line(int idx, u32 baud, u8 data_bits, u8 parity,
                          u8 stop_bits)
 {
 	(void)idx; (void)baud; (void)data_bits; (void)parity; (void)stop_bits;
-	return -1;
+	/* -ENOSYS, not -EINVAL: nothing is wrong with what was asked, this
+	 * controller simply has no divisor this kernel can reach. The tty layer
+	 * keeps the rest of the termios on this code and fails the call on
+	 * -EINVAL. */
+	return -ENOSYS;
 }
 
 int serial_port_get_line(int idx, u32 *baud, u8 *data_bits, u8 *parity,

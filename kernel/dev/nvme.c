@@ -454,7 +454,8 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
              * exactly that reason), and a deadline built on it never arrived --
              * the task sat here 65 seconds with this check silent. */
             if (!reported &&
-                scheduler_get_uptime_ticks() - wait_start_tick > 500 /* 5 s */) {
+                scheduler_get_uptime_ticks() - wait_start_tick >
+                    5 * SCHED_TICKS_PER_SEC) {
                 reported = 1;
                 /* Re-ring the submission doorbell before reporting.
                  *
