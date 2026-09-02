@@ -261,17 +261,47 @@ report_progress_line() {
 # plain file.
 _prepare_hostshare() {
 	_hs="$PROJECT_DIR/smoke_run/hostshare"
-	echo "Hello from Host through VirtIO-9P!" > "$_hs/hello_from_host.txt" 2>/dev/null ||
-		{ mkdir -p "$_hs"; echo "Hello from Host through VirtIO-9P!" > "$_hs/hello_from_host.txt"; }
+	mkdir -p "$_hs"
+	echo "Hello from Host through VirtIO-9P!" > "$_hs/hello_from_host.txt" 2>/dev/null || true
 	_src="$PROJECT_DIR/build/$ARCH/rootfs/bin"
 	[ -d "$_src" ] || return 0
-	rm -rf "$_hs/bin"
+
+	# One lane at a time, and never fatal.
+	#
+	# Every instance prepares the same directory, and they start together: one
+	# lane's `rm -rf` ran against a tree another had just repopulated, failed
+	# with "Directory not empty", and `set -e` then killed that lane's subshell
+	# before QEMU was ever started. The log stayed empty and the run reported a
+	# wedged instance, which says nothing about a race in the harness.
+	#
+	# The lock is a directory because mkdir is atomic everywhere this runs. A
+	# lane that cannot take it does not wait forever: the share is refreshed
+	# from the same source every time, so the loser can use what the winner
+	# just wrote.
+	_lock="$_hs/.refresh.lock"
+	_tries=0
+	while ! mkdir "$_lock" 2>/dev/null; do
+		_tries=$((_tries + 1))
+		[ "$_tries" -ge 30 ] && return 0
+		sleep 1
+	done
+
+	# Refreshed in place rather than rebuilt: `ln -f` replaces an entry that is
+	# already there, so nothing has to be removed first. Stale names left by an
+	# earlier build are cleared out afterwards, when nothing is racing us.
 	mkdir -p "$_hs/bin"
 	for _bf in "$_src"/*; do
 		[ -f "$_bf" ] || continue
 		ln -f "$_bf" "$_hs/bin/${_bf##*/}" 2>/dev/null ||
 			cp -f "$_bf" "$_hs/bin/${_bf##*/}" 2>/dev/null || true
 	done
+	for _hf in "$_hs/bin"/*; do
+		[ -e "$_hf" ] || continue
+		[ -e "$_src/${_hf##*/}" ] || rm -f "$_hf" 2>/dev/null || true
+	done
+
+	rmdir "$_lock" 2>/dev/null || true
+	return 0
 }
 
 # Run QEMU and capture output
