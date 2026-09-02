@@ -87,6 +87,9 @@ EXPORT_SYMBOL(vmm_virt_to_phys);
 EXPORT_SYMBOL(scheduler_yield);
 EXPORT_SYMBOL(scheduler_sleep_ticks);
 EXPORT_SYMBOL(scheduler_get_uptime_ticks);
+/* A module that converts between time and ticks needs the rate the timer was
+ * actually armed with, the same as the kernel does. */
+EXPORT_SYMBOL(sched_tick_hz);
 EXPORT_SYMBOL(rtc_now_unix_seconds);
 EXPORT_SYMBOL(rtc_set_unix_time);
 

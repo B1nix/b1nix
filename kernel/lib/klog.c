@@ -682,16 +682,22 @@ void dump_task_signals(struct task *t) {
 void dump_uptime_summary(void) {
 	console_write("\n--- System Uptime ---\n");
 	u64 ticks = scheduler_get_ticks();
+	u64 hz = sched_tick_hz();
 	console_write("  Uptime: ");
-	console_write_dec(ticks / 100);
+	console_write_dec(ticks / hz);
 	console_write(".");
-	u64 ms = (ticks % 100) * 10;
+	/* Milliseconds of the partial second, at whatever rate the timer was
+	 * armed with -- dividing by a hardcoded 100 reported ten times the real
+	 * uptime once the tick moved to 1 kHz. */
+	u64 ms = hz ? (ticks % hz) * 1000ull / hz : 0;
 	if (ms < 100) console_write("0");
 	if (ms < 10) console_write("0");
 	console_write_dec(ms);
 	console_write("s (");
 	console_write_dec(ticks);
-	console_write(" ticks, HZ=100)\n");
+	console_write(" ticks, HZ=");
+	console_write_dec(hz);
+	console_write(")\n");
 	console_write("--- End Uptime ---\n");
 }
 

@@ -46,7 +46,8 @@
 #define WD_MAX_TIMEOUT 600
 #define WD_DEFAULT_TIMEOUT 60
 
-/* The scheduler tick is 100 Hz. */
+/* Whatever rate the scheduler tick was armed with (1 kHz since the LAPIC
+ * timer took it over). */
 #define WD_TICKS_PER_SEC SCHED_TICKS_PER_SEC /* see sched.h */
 
 struct watchdog_info_k {

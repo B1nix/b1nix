@@ -14,6 +14,7 @@
 #include <b1nix/rseq.h>
 #include <b1nix/sysv_ipc.h>
 #include <b1nix/kmsg.h>
+#include <b1nix/ktime.h>
 #include <b1nix/sched.h>
 #include <b1nix/klog.h>
 #include <b1nix/syscall.h>
@@ -4667,7 +4668,13 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
  * actually ended the run (m32_smoke's TLS section, which costs every check
  * after it in the lane) then produced no dump at all and had to be chased
  * blind. Output resuming means the instance moved on, so the budget resets. */
-#define SILENCE_WATCHDOG_TICKS (60 * 100) /* 60s at the 100 Hz timer tick */
+/* 60 seconds of silence, in ticks. NOT a constant: the scheduler tick has been
+ * programmed at 1 kHz since the LAPIC timer took it over, and the 100 that used
+ * to be written here made this a SIX second watchdog -- short enough that an
+ * ordinary slow test (a bounded probe loop, a TLS handshake) read as a wedge and
+ * took the rest of the lane down with it. sched_tick_hz() reports what the timer
+ * was actually armed with. */
+#define SILENCE_WATCHDOG_TICKS (60ull * sched_tick_hz())
 #define SILENCE_WATCHDOG_MAX_DUMPS 2
 extern volatile u64 g_console_write_seq;
 
@@ -4757,7 +4764,7 @@ static void serial_silence_watchdog(void) {
     console_write("SMOKE-GUEST-WATCHDOG: scheduler_ticks=");
     console_write_dec(scheduler_ticks);
     console_write(" (");
-    console_write_dec(scheduler_ticks / 100);
+    console_write_dec(scheduler_ticks / sched_tick_hz());
     console_write("s of ticks) last_switch_tick=");
     console_write_dec(g_last_switch_tick);
     console_write("\n");
@@ -4856,8 +4863,8 @@ static void serial_silence_watchdog(void) {
     console_write(" ");
     console_write(t->name);
     /* WHERE it is parked, which is the one thing every dump so far has left
-     * out. A task that is not on a CPU has its resume point in context.lr and
-     * its frame chain in context.fp, so a few frames of that chain say which
+     * out. A task that is not on a CPU has its resume point on top of the
+     * saved context.rsp and its frame chain in context.rbp, so a few frames of that chain say which
      * kernel call each task stopped inside -- the difference between "blocked
      * in poll" and "blocked in the socket receive path" is the whole
      * investigation. Every dereference is bounds-checked against the task's own
@@ -4873,12 +4880,20 @@ static void serial_silence_watchdog(void) {
       console_write_hex64(t->context.lr);
       ksym_print(t->context.lr);
 #else
-      /* x86_64 has no link register: the resume address sits on the stack
-       * rather than in the saved context, so the walk starts one frame in
-       * and there is no "at" line to print. */
+      /* x86_64 has no link register, but the resume address is not lost: it is
+       * the return address arch_context_switch will pop, i.e. the word at the
+       * saved RSP. Bounds-checked against this task's own stack, so a corrupt
+       * context prints nothing instead of faulting the dump. */
       u64 fp = t->context.rbp;
+      u64 sp = TASK_CTX_SP(t);
+      u64 pc = 0;
 
-      console_write("\n      at");
+      if (sp >= lo && sp + 8 <= hi && !(sp & 7))
+        pc = *(u64 *)(usize)sp;
+
+      console_write("\n      at 0x");
+      console_write_hex64(pc);
+      ksym_print(pc);
 #endif
       for (int d = 0; d < 14; d++) {
         u64 *frame;
@@ -4969,8 +4984,30 @@ void scheduler_on_timer_tick(void) {
 
   task_chunks_verify("timer-tick");
 
+  /* The tick counter follows the CLOCK, not the number of timer interrupts
+   * that were delivered.
+   *
+   * A periodic LAPIC timer latches one pending interrupt, no more: every
+   * window this kernel spends with interrupts masked, and every window KVM
+   * spends not running the vCPU, costs whole ticks. Measured under KVM at
+   * 1 kHz, about a third of them never arrived -- so every sleep, timeout and
+   * alarm built on this counter ran about half as long again as it asked for,
+   * while the log timestamps (which read the TSC) disagreed with it by the
+   * same factor.
+   *
+   * So: advance to where the monotonic clock says we are, and fall back to a
+   * plain increment when it cannot be ahead -- which is exactly the case
+   * before the TSC handover, when that clock is itself derived from this
+   * counter. */
+  {
+    u64 ns_per_tick = 1000000000ull / sched_tick_hz();
+    u64 want = ns_per_tick ? ktime_monotonic_ns() / ns_per_tick : 0;
 
-  scheduler_ticks++;
+    if (want > scheduler_ticks)
+      scheduler_ticks = want;
+    else
+      scheduler_ticks++;
+  }
 
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state != TASK_UNUSED && g_task_alarm_ticks[i] != 0 && g_task_alarm_ticks[i] <= scheduler_ticks) {
@@ -5039,11 +5076,12 @@ void scheduler_on_timer_tick(void) {
     static u64 last_report_tick;
     u64 quiet = scheduler_ticks - g_last_switch_tick;
 
-    if (quiet > 3000 /* 30 s at 100 Hz */ &&
-        (last_report_tick == 0 || scheduler_ticks - last_report_tick > 6000)) {
+    if (quiet > 30ull * sched_tick_hz() &&
+        (last_report_tick == 0 ||
+         scheduler_ticks - last_report_tick > 60ull * sched_tick_hz())) {
       last_report_tick = scheduler_ticks;
       console_write("sched: STALL — no context switch for ");
-      console_write_dec(quiet / 100);
+      console_write_dec(quiet / sched_tick_hz());
       console_write("s (tick ");
       console_write_dec(scheduler_ticks);
       console_write(", current '");

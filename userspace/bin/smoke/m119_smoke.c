@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static void marker(const char *text) {
@@ -157,6 +158,64 @@ static void test_tarfs(void) {
 	marker("M119-SMOKE: ok tarfs\n");
 }
 
+/*
+ * The tick counter has to keep time, not just count interrupts.
+ *
+ * /proc/uptime is derived from the scheduler tick; CLOCK_MONOTONIC is derived
+ * from the TSC. A periodic timer latches at most one pending interrupt, so
+ * every window with interrupts masked -- and, under KVM, every window the host
+ * does not run the vCPU -- costs whole ticks. Measured at 1 kHz, a third of
+ * them never arrived: sleeps and timeouts built on the tick ran half again as
+ * long as they asked for, and the two clocks disagreed by minutes.
+ *
+ * Checked here rather than at boot because that is the point: a fraction lost
+ * per second is invisible in the first two seconds and obvious after fifty.
+ */
+static void test_tick_tracks_clock(void) {
+	char buf[64];
+	struct timespec ts;
+
+	if (read_all("/proc/uptime", buf, sizeof(buf)) <= 0 ||
+	    clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		marker("M119-SMOKE: fail tick-tracks-clock read\n");
+		return;
+	}
+
+	/* "SSSS.CC rest" — seconds and hundredths, parsed as integers so this
+	 * stays free of floating point. */
+	long up_ms = 0;
+	const char *p = buf;
+	while (*p >= '0' && *p <= '9')
+		up_ms = up_ms * 10 + (*p++ - '0');
+	up_ms *= 1000;
+	if (*p == '.') {
+		p++;
+		if (p[0] >= '0' && p[0] <= '9')
+			up_ms += (p[0] - '0') * 100;
+		if (p[1] >= '0' && p[1] <= '9')
+			up_ms += (p[1] - '0') * 10;
+	}
+	long mono_ms = (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+	if (up_ms <= 0 || mono_ms <= 0) {
+		marker("M119-SMOKE: fail tick-tracks-clock zero\n");
+		return;
+	}
+
+	/* Within 2%: quantisation to one tick plus the gap between the two reads
+	 * is milliseconds, while a lost-tick counter drifts by tens of percent. */
+	long drift = up_ms > mono_ms ? up_ms - mono_ms : mono_ms - up_ms;
+	if (drift > mono_ms / 50) {
+		char msg[160];
+		int n = snprintf(msg, sizeof(msg),
+		                 "M119-SMOKE: fail tick-tracks-clock uptime=%ldms monotonic=%ldms\n",
+		                 up_ms, mono_ms);
+		if (n > 0)
+			write(1, msg, (size_t)n);
+		return;
+	}
+	marker("M119-SMOKE: ok tick-tracks-clock\n");
+}
+
 int main(int argc, char **argv) {
 	(void)argc;
 	(void)argv;
@@ -165,6 +224,7 @@ int main(int argc, char **argv) {
 	test_debugfs();
 	test_fwcfgfs();
 	test_tarfs();
+	test_tick_tracks_clock();
 	marker("M119-SMOKE: done\n");
 	return 0;
 }
