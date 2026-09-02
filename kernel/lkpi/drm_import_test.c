@@ -182,6 +182,64 @@ static void test_drm_mm(void)
 	import_report("drm-mm", ok, allocated);
 }
 
+/* ── drm_vma_manager: the mmap-offset allocator every GEM driver uses ──
+ *
+ * drm_mm above is exercised with nodes this file owns. The path a driver
+ * actually takes is one level up: drm_gem_create_mmap_offset hands a node
+ * embedded in a GEM object to drm_vma_offset_add, which inserts it into the
+ * manager's own drm_mm. That is where the accelerated path faulted -- on an
+ * insert, inside the hole-size tree -- so the manager is driven here, at boot,
+ * rather than only through a compositor. */
+
+#define VMA_NODES 8
+
+static struct drm_vma_offset_manager g_vma_mgr;
+static struct drm_vma_offset_node g_vma_nodes[VMA_NODES];
+
+static void test_drm_vma_manager(void)
+{
+	int ok = 1;
+	usize added = 0;
+
+	memset(&g_vma_mgr, 0, sizeof(g_vma_mgr));
+	memset(g_vma_nodes, 0, sizeof(g_vma_nodes));
+	drm_vma_offset_manager_init(&g_vma_mgr, DRM_FILE_PAGE_OFFSET_START,
+	                            DRM_FILE_PAGE_OFFSET_SIZE);
+
+	for (usize i = 0; i < VMA_NODES; i++) {
+		/* One page each, the size a dumb buffer's offset reservation asks
+		 * for most often. */
+		if (drm_vma_offset_add(&g_vma_mgr, &g_vma_nodes[i], 1) != 0) {
+			ok = 0;
+			break;
+		}
+		added++;
+	}
+
+	/* Every offset handed out must be findable again, and distinct: the
+	 * lookup is how mmap resolves a fake offset back to an object, so two
+	 * nodes sharing one offset would hand a client someone else's buffer. */
+	for (usize i = 0; ok && i < added; i++) {
+		unsigned long off = drm_vma_node_start(&g_vma_nodes[i]);
+		struct drm_vma_offset_node *found =
+			drm_vma_offset_lookup_locked(&g_vma_mgr, off, 1);
+
+		if (found != &g_vma_nodes[i])
+			ok = 0;
+		for (usize j = 0; ok && j < i; j++)
+			if (drm_vma_node_start(&g_vma_nodes[j]) == off)
+				ok = 0;
+	}
+	if (added != VMA_NODES)
+		ok = 0;
+
+	for (usize i = 0; i < added; i++)
+		drm_vma_offset_remove(&g_vma_mgr, &g_vma_nodes[i]);
+	drm_vma_offset_manager_destroy(&g_vma_mgr);
+
+	import_report("drm-vma-manager", ok, (u64)added);
+}
+
 /* ── drm_rect: upstream's rectangle maths ───────────────────────── */
 
 static void test_drm_rect(void)
@@ -255,6 +313,7 @@ void drm_import_selftest(void)
 		return;
 
 	test_drm_mm();
+	test_drm_vma_manager();
 	test_drm_rect();
 	test_drm_fourcc();
 	lkpi_printk("M101-IMPORT: done\n");

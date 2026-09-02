@@ -684,6 +684,23 @@ int lkpi_virgl_transfer(int to_host, u32 ctx_id, u32 res_id, u32 level,
 
 int lkpi_virgl_unref(u32 res_id) { return virtio_gpu_virgl_unref(res_id); }
 
+int lkpi_fence_fd_signalled(void)
+{
+  /* An out-fence for work that is already finished.
+   *
+   * Submission on this transport is synchronous: the command carries a fence
+   * and virtio_gpu_send_cmd does not return until the host retires it. So the
+   * fence a client asks for is signalled the moment it exists, and an eventfd
+   * created with a non-zero count is exactly that — readable and pollable
+   * immediately, which is all a client does with a sync fd (poll it, then
+   * close it).
+   *
+   * The alternative was to refuse VIRTGPU_EXECBUF_FENCE_FD_OUT, and Mesa's
+   * answer to that refusal is "got error from kernel - expect bad rendering":
+   * it carries on and reads back an empty framebuffer. */
+  return vfs_eventfd(1, 0);
+}
+
 int lkpi_virgl_capset(u32 index, u32 want_id, u32 want_ver, void *out, u32 *len)
 {
   return virtio_gpu_virgl_capset(index, want_id, want_ver, out, len);

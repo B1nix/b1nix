@@ -84,7 +84,14 @@ render_run_case() {
 
 	echo "RENDER-SMOKE: $_label starting sway renderer=$WLR_RENDERER" \
 	     "device=${WLR_RENDER_DRM_DEVICE:-none}"
-	sway -c /etc/sway/render-smoke.conf > "/tmp/render-$_label-sway.log" 2>&1 &
+	# -d on the accelerated case only: that is the path still being brought
+	# up, and "the colour never arrived" says nothing about which half — the
+	# compositor's render or the client's buffer — did not happen. The other
+	# two cases stay quiet so their logs remain readable.
+	_swayargs=""
+	[ "$_label" = accel ] && _swayargs="-d"
+	sway $_swayargs -c /etc/sway/render-smoke.conf \
+		> "/tmp/render-$_label-sway.log" 2>&1 &
 	_swaypid=$!
 
 	_i=0
@@ -161,6 +168,8 @@ render_run_case() {
 		if [ $_shot -ne 1 ]; then
 			_ok=0
 			echo "RENDER-SMOKE: $_label colour=$_c never-arrived; sway log:"
+			grep -iE 'error|fail|renderer|texture|shm|dmabuf|swaybg' \
+				"/tmp/render-$_label-sway.log" | tail -30
 			tail -10 "/tmp/render-$_label-sway.log"
 		fi
 	done

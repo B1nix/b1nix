@@ -1208,6 +1208,12 @@ struct b1nix_virgl_submit_abi {
 
 struct vgpu_udev_res {
     int used;
+    /* Who owns the frames behind this resource. The character device allocates
+     * a contiguous run and owns it; a resource created for the DRM node is
+     * backed by a GEM object's scattered shmem pages, which that object frees.
+     * Freeing those here both double-freed them and, because the run is not
+     * contiguous, handed the allocator frames belonging to somebody else. */
+    int owns_pages;
     u32 res_id;
     u64 phys;
     u64 size;
@@ -1540,12 +1546,15 @@ static struct vgpu_udev_res *vgpu_udev_find(u32 res_id)
 static int vgpu_res_unref_id(u32 res_id)
 {
     u64 flags, phys = 0, size = 0;
+    int owns = 0;
     spin_lock_irqsave(&vgpu_udev_lock, &flags);
     struct vgpu_udev_res *r = vgpu_udev_find(res_id);
     if (r) {
         phys = r->phys;
         size = r->size;
+        owns = r->owns_pages;
         r->used = 0;
+        r->owns_pages = 0;
         r->res_id = 0;
         r->phys = 0;
     }
@@ -1562,8 +1571,10 @@ static int vgpu_res_unref_id(u32 res_id)
     unref.resource_id = res_id;
     (void)virtio_gpu_send_cmd(&unref, sizeof(unref), &resp, sizeof(resp));
 
-    for (u64 f = 0; f < (size + PAGE_SIZE - 1) / PAGE_SIZE; f++)
-        pmm_free_frame(phys + f * PAGE_SIZE);
+    if (owns) {
+        for (u64 f = 0; f < (size + PAGE_SIZE - 1) / PAGE_SIZE; f++)
+            pmm_free_frame(phys + f * PAGE_SIZE);
+    }
     return 0;
 }
 
@@ -1684,6 +1695,7 @@ static int vgpu_udev_ioctl(struct vfs_node *node, u64 request, void *arg)
             return -EIO;
         }
         vgpu_udev_res_tab[slot].res_id = p.res_id;
+        vgpu_udev_res_tab[slot].owns_pages = 1; /* allocated right here */
         vgpu_udev_res_tab[slot].phys = phys;
         vgpu_udev_res_tab[slot].size = pages * PAGE_SIZE;
         vgpu_udev_res_tab[slot].mmap_offset = (u64)slot * VGPU_UDEV_SLOT;
@@ -2632,6 +2644,9 @@ int virtio_gpu_virgl_res_create(u32 ctx_id, const struct virtio_gpu_res_params *
 	slot->format = p->format;
 	slot->bind = p->bind;
 	slot->size = (u64)npages * PAGE_SIZE;
+	/* Recorded for diagnostics only: the pages are the GEM object's, they are
+	 * scattered, and it frees them. */
+	slot->owns_pages = 0;
 	slot->phys = phys[0];
 	return 0;
 }
