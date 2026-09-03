@@ -7160,6 +7160,12 @@ void scheduler_dump_tasks(void) {
        * something" and "waiting on something that was freed". */
       if (T(i)->wait_chan)
         kheap_describe((u64)(usize)T(i)->wait_chan, " chan->");
+      /* Queued anywhere? Note that `queued=NO` is ordinary -- a yielding task
+       * is READY without being enqueued and the picker scans the table. See
+       * sched_rq_contains_task before drawing a conclusion from this. */
+      if (T(i)->state == TASK_READY) {
+        console_write(sched_rq_contains_task(T(i)) ? " queued=yes" : " queued=NO");
+      }
       console_write(" rel=");
       console_write_dec(T(i)->stack_released);
       console_write(" ap=");

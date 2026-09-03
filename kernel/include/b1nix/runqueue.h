@@ -19,5 +19,7 @@ void sched_rq_remove_task(struct task *t);
 /* Unlink from every runqueue (used when a task slot is recycled). */
 void sched_rq_remove_task_all(struct task *t);
 struct task *sched_steal_task(void);
+/* 1 if `t` is present in any runqueue right now. Diagnostic; bounded walk. */
+int sched_rq_contains_task(struct task *t);
 
 #endif

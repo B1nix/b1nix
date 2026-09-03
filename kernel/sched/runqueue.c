@@ -287,6 +287,50 @@ void sched_rq_enqueue_current(struct task *t) {
  * sched_rq_remove_task cannot be used here: it picks the queue from
  * t->stealable, and a slot being torn down is precisely where that field is no
  * longer trustworthy. Sweep them all. */
+/* Is this task queued anywhere right now?
+ *
+ * Read this with care, because the obvious reading is wrong: `queued=NO` is
+ * the NORMAL state for a task that yielded. scheduler_yield publishes
+ * state=READY without enqueueing, and pick_next_task scans the task table
+ * rather than relying on the queues -- so a task no queue holds is still
+ * perfectly findable. Measured: on a healthy boot, `boot`, `net_task` and both
+ * lkpi workers all report queued=NO while running normally.
+ *
+ * What it is good for is the opposite direction. It was added to test the
+ * theory that a task stuck READY for a minute had been lost by the runqueue,
+ * and it disproved that theory in one run. Walks the global queue and every
+ * per-CPU one, bounded exactly as the other walks in this file are. */
+int sched_rq_contains_task(struct task *t)
+{
+	if (!t)
+		return 0;
+	for (int cpu = -1; cpu < (int)MAX_CPUS; cpu++) {
+		struct runqueue *rq = 0;
+
+		if (cpu < 0) {
+			rq = sched_global_rq();
+		} else {
+			struct percpu *p = get_percpu_n((u32)cpu);
+
+			rq = p ? &p->runqueue : 0;
+		}
+		if (!rq)
+			continue;
+
+		u32 walked = 0;
+
+		for (struct task *c = rq->head; c; c = c->next_run) {
+			if (c == t)
+				return 1;
+			if (++walked > RQ_WALK_LIMIT)
+				break;
+			if (c->next_run && !sched_task_ptr_valid(c->next_run))
+				break;
+		}
+	}
+	return 0;
+}
+
 void sched_rq_remove_task_all(struct task *t) {
     rq_remove(sched_global_rq(), t);
     for (int i = 0; i < g_max_cpus; i++) {

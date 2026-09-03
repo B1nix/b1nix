@@ -1011,6 +1011,8 @@ int blk_probe_label(struct block_device *dev, char *out, usize cap) {
   return out[0] ? 0 : -1;
 }
 
+static u64 blk_stat_hits, blk_stat_misses, blk_stat_evict_dirty;
+
 /* ── Write-Back Cache Implementation ── */
 
 static void blk_io_gate_init(void);
@@ -1151,6 +1153,7 @@ static struct block_buffer *bcache_evict(u64 *flags_inout) {
 
   /* 3. Write-Back: flush a dirty entry to disk OUTSIDE the bcache_lock. */
   if ((entry->flags & BLK_CACHE_DIRTY) && entry->bdev && entry->bdev->write_blocks) {
+    blk_stat_evict_dirty++; /* a reader paying for a writer: see the stats dump */
     entry->flags |= BLK_CACHE_BUSY;          /* lock the slot across the drop */
     struct block_device *wb_dev = entry->bdev;
     u64 wb_lba = entry->block_no;
@@ -1493,6 +1496,30 @@ static struct block_device *blk_cache_target(struct block_device *dev,
   return dev;
 }
 
+/* What the block cache is actually doing, reported on demand.
+ *
+ * The pool is sized from RAM and read(2) goes through it rather than the file
+ * page cache, so whether it is big enough is a question about this workload,
+ * not a constant anyone can pick in advance -- and there was no way to ask.
+ * `b1nix.bcache-stats` prints the counters when the test run ends. */
+void blk_cache_stats_dump(void) {
+  if (!bootinfo_has_flag("b1nix.bcache-stats"))
+    return;
+  u64 total = blk_stat_hits + blk_stat_misses;
+
+  console_write("bcache: entries ");
+  console_write_dec((u32)block_cache_n);
+  console_write(" hits ");
+  console_write_dec((u32)blk_stat_hits);
+  console_write(" misses ");
+  console_write_dec((u32)blk_stat_misses);
+  console_write(" hit-pct ");
+  console_write_dec((u32)(total ? blk_stat_hits * 100 / total : 0));
+  console_write(" dirty-evictions ");
+  console_write_dec((u32)blk_stat_evict_dirty);
+  console_write("\n");
+}
+
 int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
                     void *buffer) {
   if (!dev || !dev->read_blocks) {
@@ -1534,8 +1561,10 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
         }
         memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
         bcache_release(flags);
+        blk_stat_hits++;
         break;
       }
+      blk_stat_misses++;
 
       entry = bcache_evict(&flags);
       if (!entry) {
