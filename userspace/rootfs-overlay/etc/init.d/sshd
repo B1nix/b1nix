@@ -32,9 +32,18 @@ case $1 in
 
     echo "sshd: starting daemon (bind: ${BIND_ADDR}22)..."
     /bin/dropbear -r $HOSTKEY -p ${BIND_ADDR}22 $HARDEN -E -F >$LOGFILE 2>&1 &
-    sleep 1
-    $PIDOF pidof dropbear > $PIDFILE
-    read pid < $PIDFILE
+    # Poll for the daemon rather than waiting a blind second. Every smoke lane
+    # starts sshd, and the network lane starts and stops it several times, so
+    # this wait was seconds of the suite spent asleep next to a running daemon.
+    i=0
+    pid=
+    while [ $i -lt 40 ]; do
+      $PIDOF pidof dropbear > $PIDFILE
+      read pid < $PIDFILE
+      [ -n "$pid" ] && break
+      i=$((i + 1))
+      usleep 50000
+    done
     echo "sshd: started (PID: $pid)"
     ;;
   stop)
@@ -42,15 +51,17 @@ case $1 in
     read pid < $PIDFILE
     echo "sshd: stopping daemon (PID: $pid)..."
     kill $pid 2>/dev/null
-    sleep 1
-    kill -0 $pid 2>/dev/null && sleep 1
+    i=0
+    while [ $i -lt 40 ] && kill -0 $pid 2>/dev/null; do
+      i=$((i + 1))
+      usleep 50000
+    done
     kill -0 $pid 2>/dev/null && kill -9 $pid 2>/dev/null
     rm -f $PIDFILE
     echo "sshd: stopped"
     ;;
   restart)
     /bin/sh $0 stop
-    sleep 1
     /bin/sh $0 start
     ;;
   status)
