@@ -20,6 +20,7 @@
  * The sample counter is printed unconditionally: a profile of zero must be
  * distinguishable from a probe that never ran.
  */
+#include <b1nix/ktime.h>
 #include <b1nix/sched.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
@@ -66,12 +67,36 @@ static int waitprof_enabled(void) {
   return on;
 }
 
+/* How much time this interrupt stands for, in nominal ticks.
+ *
+ * Counting interrupts and calling the result "ticks" is only right while the
+ * timer is periodic. With one-shot ticks (b1nix.dynticks) an interrupt can
+ * stand for one tick or for twenty, so counting them would report an idle
+ * machine as busy: the long sleeps are exactly the intervals that get dropped
+ * to one count each. Weigh every sample by the time it actually covers, read
+ * from the monotonic clock, and the figures keep meaning what their names say
+ * under either mode. */
+static u64 kprof_weight(int cpu) {
+  static u64 last_ns[KPROF_MAX_CPUS];
+  u64 ns_per_tick = 1000000000ull / (sched_tick_hz() ? sched_tick_hz() : 100);
+  u64 now = ktime_monotonic_ns();
+  u64 w = 1;
+
+  if (cpu < 0 || cpu >= KPROF_MAX_CPUS || !ns_per_tick)
+    return 1;
+  if (last_ns[cpu] && now > last_ns[cpu])
+    w = (now - last_ns[cpu]) / ns_per_tick;
+  last_ns[cpu] = now;
+  return w ? w : 1;
+}
+
 void kprof_tick(u64 rip, int in_user, int in_idle, int cpu) {
   int mode = in_user ? 0 : (in_idle ? 2 : 1);
+  u64 weight = kprof_weight(cpu);
 
   if (cpu >= 0 && cpu < KPROF_MAX_CPUS)
-    __atomic_fetch_add(&g_tick_mode[cpu][mode], 1, __ATOMIC_RELAXED);
-  __atomic_fetch_add(&g_tick_total, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_tick_mode[cpu][mode], weight, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_tick_total, weight, __ATOMIC_RELAXED);
 
   if (waitprof_enabled() && cpu == 0)
     sched_waitprof_tick(mode == 2);
@@ -79,7 +104,7 @@ void kprof_tick(u64 rip, int in_user, int in_idle, int cpu) {
   if (mode != 1 || !kprof_enabled())
     return;
 
-  __atomic_fetch_add(&g_kprof_samples, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_kprof_samples, weight, __ATOMIC_RELAXED);
 
   u64 key = rip & ~(u64)(KPROF_GRAIN - 1);
   /* Fibonacci hash of the bucket address; linear probe over a short window so
@@ -91,7 +116,7 @@ void kprof_tick(u64 rip, int in_user, int in_idle, int cpu) {
     u64 cur = __atomic_load_n(&g_kprof[i].addr, __ATOMIC_RELAXED);
 
     if (cur == key) {
-      __atomic_fetch_add(&g_kprof[i].hits, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&g_kprof[i].hits, weight, __ATOMIC_RELAXED);
       return;
     }
     if (cur == 0) {
@@ -100,7 +125,7 @@ void kprof_tick(u64 rip, int in_user, int in_idle, int cpu) {
       if (__atomic_compare_exchange_n(&g_kprof[i].addr, &expect, key, 0,
                                       __ATOMIC_RELAXED, __ATOMIC_RELAXED) ||
           expect == key) {
-        __atomic_fetch_add(&g_kprof[i].hits, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_kprof[i].hits, weight, __ATOMIC_RELAXED);
         return;
       }
     }

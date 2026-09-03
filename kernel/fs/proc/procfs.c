@@ -967,6 +967,7 @@ static int r_b1nix_prof(usize pid, struct sbuf *s) {
   }
   blk_cache_stats_dump();
   sched_waitprof_dump();
+  { extern void net_beat_dump(void); net_beat_dump(); }
   syscall_prof_reset();
   sb_puts(s, "profile written to console\n");
   return 0;

@@ -349,6 +349,11 @@ static struct posix_timer g_posix_timers[MAX_POSIX_TIMERS];
 static void posix_timers_tick(void); /* fire expired timers (defined below) */
 
 static u64  g_task_alarm_ticks[TASK_SLOTS];
+/* The signal set a task is parked in sigtimedwait() for, or 0.
+ *
+ * A side table, not a struct task field: adding fields to that struct has a
+ * history of moving something the LAPIC page tables care about (see M29). */
+static u64  g_task_sigwait_set[TASK_SLOTS];
 /* setitimer(ITIMER_REAL) repeat period; 0 = one-shot (plain alarm(2)). */
 static u64  g_task_alarm_interval_ticks[TASK_SLOTS];
 /* Set once the task has successfully execve()d. POSIX setpgid: changing a
@@ -810,22 +815,55 @@ static const char *g_task_lease_site[TASK_SLOTS];
  * pointer aims into the task's own argv/env pages, which are recycled, so the
  * buckets filled up with fragments of somebody's environment. The site is a
  * __func__ literal and stays put; a name is COPIED in for context. */
-static struct { const char *site; char name[16]; u64 ticks; u64 spans; }
+static struct { const char *site; char name[16]; u64 ticks; u64 spans; u64 timer; }
     g_waitprof[WAITPROF_SLOTS];
 static u64 g_waitprof_idle, g_waitprof_run;
+/* Set while wake_sleepers is promoting tasks, so waitprof can tell a wake that
+ * a deadline caused from one an event caused. The difference is the whole
+ * point: an idle stretch ended by a packet is the machine doing its job, and
+ * one ended by a timer that found nothing is the waste worth removing. */
+static int g_wake_from_timer;
 
+static int waitprof_same_name(const char *a, const char *b)
+{
+	for (int i = 0; i < 15; i++) {
+		char ca = a[i];
+		char cb = b ? b[i] : 0;
+
+		if (cb < 32 || cb >= 127)
+			cb = 0;
+		if (ca != cb)
+			return 0;
+		if (!ca)
+			return 1;
+	}
+	return 1;
+}
+
+/* Keyed by site AND task name.
+ *
+ * Keying by site alone merged every task that blocks at the same place into
+ * one bucket, labelled with whichever name happened to create it -- so a
+ * bucket reading "net_task @scheduler_sleep_ticks_state" was really every task
+ * in the machine that sleeps by ticks, and I read a beat into it that net_task
+ * did not have. Fixing the key is what found the real one: a test-support
+ * thread polling for a mouse open. The name has to be part of the key, not
+ * decoration. */
 static void waitprof_charge(const char *name, const char *site, u64 ticks)
 {
 	for (usize k = 0; k < WAITPROF_SLOTS; k++) {
-		if (g_waitprof[k].site == site && g_waitprof[k].ticks) {
+		if (g_waitprof[k].site == site && g_waitprof[k].ticks &&
+		    waitprof_same_name(g_waitprof[k].name, name)) {
 			g_waitprof[k].ticks += ticks;
 			g_waitprof[k].spans++;
+			g_waitprof[k].timer += (u64)(g_wake_from_timer != 0);
 			return;
 		}
 		if (!g_waitprof[k].ticks) {
 			g_waitprof[k].site = site;
 			g_waitprof[k].ticks = ticks;
 			g_waitprof[k].spans = 1;
+			g_waitprof[k].timer = (u64)(g_wake_from_timer != 0);
 			for (int c = 0; c < 15; c++) {
 				char ch = name ? name[c] : 0;
 
@@ -882,7 +920,9 @@ void sched_waitprof_dump(void)
 		console_write_dec(g_waitprof[k].ticks);
 		console_write(" ticks over ");
 		console_write_dec(g_waitprof[k].spans);
-		console_write(" waits ");
+		console_write(" waits, ");
+		console_write_dec(g_waitprof[k].timer);
+		console_write(" by timer, ");
 		console_write(g_waitprof[k].name[0] ? g_waitprof[k].name : "?");
 		console_write(" @");
 		console_write(g_waitprof[k].site ? g_waitprof[k].site : "-");
@@ -1772,6 +1812,42 @@ static int sched_wake_for_signal(struct task *t, int sig) {
  * vruntime = max(vruntime, min_vruntime). Never lowers a pass, so a task that
  * is genuinely ahead keeps its position and a task that has legitimately run
  * less keeps its advantage. */
+/* sigtimedwait() parks on &task->pending_signals. Nothing woke that channel, so
+ * its one-tick timeout was the delivery mechanism rather than a safety net: a
+ * signal took up to a tick to be seen, and an init parked there ended 2,453
+ * idle stretches in a 63 s run -- the last of this kernel's heartbeats.
+ *
+ * The wake has to be NARROW. Waking that channel from every posting site was
+ * tried and broke eight checks, because which waits a signal may interrupt is
+ * policy this kernel implements deliberately (SIGCHLD must not cut waitpid
+ * short). So wake only a task that asked, by name, for exactly this signal --
+ * which changes no policy, because such a task is going to return this signal
+ * the moment it looks. */
+void sched_sigwait_arm(u64 set)
+{
+	if (current_task)
+		__atomic_store_n(&g_task_sigwait_set[task_index(current_task)], set,
+		                 __ATOMIC_RELEASE);
+}
+
+void sched_sigwait_disarm(void)
+{
+	if (current_task)
+		__atomic_store_n(&g_task_sigwait_set[task_index(current_task)], 0,
+		                 __ATOMIC_RELEASE);
+}
+
+static void sched_sigwait_notify(struct task *t, int sig)
+{
+	if (!t || sig < 1 || sig >= NSIG)
+		return;
+	u64 set = __atomic_load_n(&g_task_sigwait_set[task_index(t)],
+	                          __ATOMIC_ACQUIRE);
+
+	if (set & (1ULL << (sig - 1)))
+		scheduler_wake_all(&t->pending_signals);
+}
+
 static void sched_wake_enqueue(struct task *t) {
   if (t) {
     usize i = task_index(t);
@@ -1830,14 +1906,79 @@ static void sched_trace_signal_wake(const struct task *t, int sig, int state,
   klog_debug_category("signal", line);
 }
 
+/* The earliest armed wake_tick, as a LOWER BOUND, plus a generation counter.
+ *
+ * wake_sleepers() walked the whole task table looking for an elapsed deadline,
+ * and it is called from every scheduler_yield(), not just from the tick -- so
+ * an O(tasks) walk was paid on every context switch. Almost every one of those
+ * walks found nothing: within a single tick, scheduler_ticks does not change,
+ * so if the first walk of a tick found nothing due, no later one can either.
+ *
+ * Arming only ever LOWERS this value, so `now < g_wake_deadline` proves
+ * nothing is due and the walk can be skipped. Stale-low merely costs a walk
+ * that finds nothing; stale-high would lose a wakeup, which is why raising it
+ * is done only from a full scan, and only if no arming raced with that scan
+ * (the generation check). This is the cheap half of what a callout wheel gives
+ * FreeBSD -- and it is also the "when is the next event" query that one-shot
+ * timer programming needs. */
+static u64 g_wake_deadline;
+static u64 g_wake_deadline_gen;
+
+/* Every place that arms task->wake_tick must call this. Missing one is a lost
+ * wakeup, not a slowdown: the bound stays above the armed deadline and
+ * wake_sleepers skips the scan that would have fired it. Three sites outside
+ * this file (epoll_wait and two in syscall.c) were missed on the first attempt
+ * and cost 78 checks. */
+void sched_note_deadline(u64 tick)
+{
+	u64 cur = __atomic_load_n(&g_wake_deadline, __ATOMIC_RELAXED);
+
+	if (!tick)
+		return; /* 0 is the "nobody is waiting" sentinel, not a deadline */
+
+	__atomic_fetch_add(&g_wake_deadline_gen, 1, __ATOMIC_RELEASE);
+	while (cur == 0 || tick < cur) {
+		if (__atomic_compare_exchange_n(&g_wake_deadline, &cur, tick, 1,
+		                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+			return;
+	}
+}
+
+/* The earliest deadline anyone is waiting on, or 0 if nobody is. */
+u64 sched_next_deadline_tick(void)
+{
+	return __atomic_load_n(&g_wake_deadline, __ATOMIC_ACQUIRE);
+}
+
 static void wake_sleepers(void) {
   int woken = 0;
+  u64 due = __atomic_load_n(&g_wake_deadline, __ATOMIC_ACQUIRE);
+  u64 gen = __atomic_load_n(&g_wake_deadline_gen, __ATOMIC_ACQUIRE);
+  u64 next = 0;
+
+  if (due == 0 || scheduler_ticks < due)
+    return; /* nothing can be due: see g_wake_deadline */
+
+  g_wake_from_timer = 1;
+
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *t = T(i);
     if (!t) continue;
     /* F4 (M28 #7): atomic CAS SLEEPING/BLOCKED -> READY so only one CPU wins when
      * two timer ticks (or a tick + an explicit wake) race for the same
      * task. */
+    /* Alarms share the bound with sleepers: this walk is already here, so
+     * folding them in costs one comparison and keeps the bound exact for
+     * both. */
+    if (g_task_alarm_ticks[i] > scheduler_ticks &&
+        (next == 0 || g_task_alarm_ticks[i] < next))
+      next = g_task_alarm_ticks[i];
+    if (t->wake_tick != 0 && t->wake_tick > scheduler_ticks) {
+      /* Not due: it is a candidate for the next deadline. */
+      if (next == 0 || t->wake_tick < next)
+        next = t->wake_tick;
+      continue;
+    }
     if (t->wake_tick != 0 && t->wake_tick <= scheduler_ticks) {
       enum task_state expected = TASK_SLEEPING;
       if (__atomic_compare_exchange_n(&t->state, &expected, TASK_READY,
@@ -1857,6 +1998,16 @@ static void wake_sleepers(void) {
       }
     }
   }
+  g_wake_from_timer = 0;
+
+  /* Publish the exact minimum this scan found -- but only if nobody armed a
+   * new deadline while we were scanning. An arming that raced with us may have
+   * lowered the bound below `next`, and raising it over that would lose the
+   * wakeup. Leaving the armed (lower) value costs one extra scan, which is the
+   * safe direction. */
+  if (__atomic_load_n(&g_wake_deadline_gen, __ATOMIC_ACQUIRE) == gen)
+    __atomic_store_n(&g_wake_deadline, next, __ATOMIC_RELEASE);
+
   /* M28 #6: if we promoted at least one task, kick the other CPUs out of
    * `sti; hlt` so they re-poll the global runqueue. We are called from the
    * timer ISR (T3) which now runs WITHOUT the BKL. The IPI is a fire-and-
@@ -2812,6 +2963,9 @@ void task_set_alarm_interval_ticks(struct task *t, u64 ticks) {
 void task_set_alarm_ticks(struct task *t, u64 ticks) {
   if (!t) return;
   g_task_alarm_ticks[task_index(t)] = ticks;
+  /* Alarms are the second set of deadlines in this kernel, and the one-shot
+   * timer has to see both or it would sleep straight through an alarm(2). */
+  sched_note_deadline(ticks);
 }
 usize task_tgid(const struct task *t) {
   if (!t) return 0;
@@ -3115,6 +3269,7 @@ int scheduler_post_signal(usize pid, int sig) {
       continue;
     __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                       __ATOMIC_RELEASE);
+sched_sigwait_notify(T(i), sig);
     /* A waiting task must run to notice it; a running one will see it on its
      * next return to userspace. A tracee already in a ptrace stop stays in it. */
     (void)sched_wake_for_signal_ex(T(i), sig, 0);
@@ -4794,8 +4949,10 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks) {
   }
 
   current_task->wait_chan = chan;
-  if (timeout_ticks)
+  if (timeout_ticks) {
     current_task->wake_tick = scheduler_ticks + timeout_ticks;
+    sched_note_deadline(current_task->wake_tick);
+  }
   /* M28 T4: claim the stack lease before publishing BLOCKED — see
    * scheduler_block_current for the full race. */
   task_lease_clear(current_task, __func__);
@@ -4956,8 +5113,10 @@ void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks) {
   if (current_task == 0)
     panic("scheduler_wait_prepare_timeout without running task");
   current_task->wait_chan = chan;
-  if (timeout_ticks)
+  if (timeout_ticks) {
     current_task->wake_tick = scheduler_ticks + timeout_ticks;
+    sched_note_deadline(current_task->wake_tick);
+  }
   task_lease_clear(current_task, __func__);
   __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -5095,6 +5254,7 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
   }
 
   current_task->wake_tick = scheduler_ticks + ticks;
+  sched_note_deadline(current_task->wake_tick);
   /* A timed sleep waits on the clock, not on a channel. Leaving the previous
    * wait's channel in place invites a wake meant for that channel to cut this
    * sleep short, now that wakers no longer clear it. */
@@ -5949,6 +6109,7 @@ static void terminate_group_siblings(struct task *t) {
         continue;
       /* Post SIGKILL to sibling */
       __atomic_fetch_or(&sibling->pending_signals, (1ULL << (SIGKILL - 1)), __ATOMIC_RELEASE);
+sched_sigwait_notify(sibling, SIGKILL);
       /* Wake them if they are blocked/sleeping/stopped. Use a per-state CAS,
        * NOT a plain store: a sibling running on another AP can transition to
        * DEAD/REAPING between the read and the write, and a bare
@@ -7910,6 +8071,7 @@ static void post_sigchld_to_parent(usize parent_id, int job_control_event) {
         return;
       __atomic_fetch_or(&T(p)->pending_signals, (1ULL << (SIGCHLD - 1)),
                         __ATOMIC_RELEASE);
+sched_sigwait_notify(T(p), SIGCHLD);
       return;
     }
   }
@@ -7963,6 +8125,7 @@ int scheduler_kill(usize task_id, int sig) {
        * pending bits, so a plain |= would drop a racing update. */
       __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                         __ATOMIC_RELEASE);
+sched_sigwait_notify(T(i), sig);
 
       if (T(i) != current_task && !ptrace_is_traced(T(i)) &&
           (sig == SIGSTOP || sig == SIGTSTP ||
@@ -8057,6 +8220,7 @@ static void group_stop_sibling(struct task *t, int sig) {
    * half-written frame (the M40 lesson). */
   g_task_stop_quiet[task_index(t)] = 1;
   __atomic_fetch_or(&t->pending_signals, (1ULL << (sig - 1)), __ATOMIC_RELEASE);
+sched_sigwait_notify(t, sig);
   /* A sibling asleep in an interruptible wait would otherwise ignore the group
    * stop until its syscall happened to finish — a thread blocked on a read that
    * never completes would keep the job "running" forever. Wake it so it takes
@@ -8164,6 +8328,7 @@ int scheduler_sigqueue(usize task_id, int sig, union sigval value, int si_code) 
       rs->qcount++;
       __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                         __ATOMIC_RELEASE);
+sched_sigwait_notify(T(i), sig);
       spin_unlock(&g_rt_lock);
       /* Wake a blocked or sleeping target so it re-checks pending signals.
        * Mirrors scheduler_kill's CAS so a kill racing the target's exit cannot
@@ -8399,6 +8564,7 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
       }
       __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                         __ATOMIC_RELEASE);
+sched_sigwait_notify(T(i), sig);
 
       if (T(i) != current_task && !ptrace_is_traced(T(i)) &&
           (sig == SIGSTOP || sig == SIGTSTP ||

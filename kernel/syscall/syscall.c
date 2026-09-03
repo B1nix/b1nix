@@ -2043,6 +2043,10 @@ static isize sys_sigtimedwait_kernel(u64 set, const struct timespec *user_ts) {
                sc_time_to_ticks((u64)ts.tv_sec, (u64)ts.tv_nsec, 1000000000ull);
   }
 
+  /* Say what we are parked for, so posting one of these wakes us instead of
+   * leaving the timeout below to notice. Every return from this loop goes
+   * through sigwait_out, which withdraws it. */
+  sched_sigwait_arm(set);
   for (;;) {
     u64 pending =
         __atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE);
@@ -2053,16 +2057,23 @@ static isize sys_sigtimedwait_kernel(u64 set, const struct timespec *user_ts) {
           continue;
         __atomic_fetch_and(&current_task->pending_signals,
                            ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
+        sched_sigwait_disarm();
         return sig;
       }
     }
     /* A deliverable signal that is NOT in the set aborts the wait so its
      * handler can run. */
-    if (pending & ~current_task->blocked_signals & ~set)
+    if (pending & ~current_task->blocked_signals & ~set) {
+      sched_sigwait_disarm();
       return -EINTR;
-    if (has_timeout && scheduler_get_ticks() >= deadline)
+    }
+    if (has_timeout && scheduler_get_ticks() >= deadline) {
+      sched_sigwait_disarm();
       return -EAGAIN;
-    scheduler_block_on_timeout(&current_task->pending_signals, 1);
+    }
+    /* Ten ticks: the arm above makes the wake the mechanism, so this is a net
+     * again rather than the delivery path. */
+    scheduler_block_on_timeout(&current_task->pending_signals, 10);
   }
 }
 
@@ -3488,6 +3499,7 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
       if (ticks == 0)
         ticks = 1;
       current_task->wake_tick = scheduler_get_uptime_ticks() + ticks;
+      sched_note_deadline(current_task->wake_tick);
     }
 
     scheduler_wait_commit();
@@ -11307,6 +11319,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     if (timeout_ms != (u64)-1 && timeout_ms != 0) {
       u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
       current_task->wake_tick = start_ticks + ticks;
+      sched_note_deadline(current_task->wake_tick);
     }
 
     extern void *vfs_poll_chan;

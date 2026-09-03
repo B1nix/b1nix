@@ -213,6 +213,62 @@ static u64 timer_interval_ticks(u64 freq)
 	return hz ? freq / hz : freq / 100;
 }
 
+/* `b1nix.dynticks[=<max-idle-ticks>]`: program the next timer interrupt for the
+ * next deadline anyone actually has, instead of one fixed period from now.
+ *
+ * CNTV_CVAL_EL0 is an absolute compare register, so this needs no new hardware
+ * support -- it is the same one-shot mode FreeBSD's eventtimer(9) and Linux's
+ * clockevent use. What made it safe here is that scheduler_ticks already
+ * follows the monotonic clock rather than counting interrupts (see
+ * scheduler_on_timer_tick), so a skipped interrupt does not lose time: the next
+ * one advances the counter to wherever the clock says we are.
+ *
+ * The sleep is capped anyway. Some periodic work does not register a deadline
+ * with anybody -- the guest watchdog, the serial receive drain -- and the cap
+ * bounds how late that gets rather than requiring every such site to be found
+ * first. Default 10 ticks (100 ms); `b1nix.dynticks=1` gives back the fixed
+ * periodic beat, which is what a bisect wants. */
+static u64 dynticks_cap(void)
+{
+	static u64 cap = ~0ull;
+
+	if (cap == ~0ull) {
+		char buf[24];
+
+		/* OFF by default, and the reason is worth keeping.
+		 *
+		 * It was on for exactly one commit. Two full suites passed with it,
+		 * and both were lying: a test-support thread (m47-input-inject) was
+		 * polling every 2 ticks and its beat kept the timer programmed often
+		 * enough to hide what one-shot costs. The moment that poller was fixed
+		 * to wait for an event, six checks failed reproducibly -- all of them
+		 * signal latency: a signal to a task asleep in nanosleep, ppoll's
+		 * sub-millisecond timeout, waitpid's EINTR.
+		 *
+		 * That is the real precondition, and it is not "find the pollers": a
+		 * task asleep on a deadline must be woken when a signal is POSTED, not
+		 * when its own timer happens to fire. Waking &task->pending_signals
+		 * from the posting sites was tried and broke eight other checks,
+		 * because which waits a signal may interrupt is a policy this kernel
+		 * already implements carefully (SIGCHLD must not cut waitpid short).
+		 * Until signal posting wakes sleepers through THAT policy, one-shot
+		 * ticks are not correct here. */
+		cap = 0;
+		if (bootinfo_has_flag("b1nix.dynticks"))
+			cap = 10;
+		if (bootinfo_get_kv("b1nix.dynticks", buf, sizeof(buf)) == 0) {
+			u64 v = 0;
+			const char *p = buf;
+
+			while (*p >= '0' && *p <= '9')
+				v = v * 10 + (u64)(*p++ - '0');
+			if (v)
+				cap = v;
+		}
+	}
+	return cap;
+}
+
 static void timer_rearm(void)
 {
 	u64 freq, cval, now;
@@ -222,9 +278,50 @@ static void timer_rearm(void)
 		return;
 
 	u64 interval = timer_interval_ticks(freq);
+	u64 cap = dynticks_cap();
 
 	__asm__ volatile("mrs %0, cntv_cval_el0" : "=r"(cval));
 	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(now));
+
+	if (cap) {
+		u64 next = sched_next_deadline_tick();
+		u64 nowt = scheduler_get_ticks();
+		u64 skip = cap;
+		int capped = 1;
+
+		if (next > nowt && next - nowt < skip) {
+			skip = next - nowt;
+			capped = 0;
+		}
+		if (!skip)
+			skip = 1;
+		/* Jitter the idle interval, and only the idle one.
+		 *
+		 * This is what BSD gets from running statclock at a frequency
+		 * deliberately not commensurate with hz: if the sampling instant sits
+		 * on a fixed grid, periodic work aliases against it and the profile
+		 * lies. It already bit us -- a 100 Hz sampler could not see net_task
+		 * wake, poll and sleep inside one tick, and two versions of the idle
+		 * profiler drew confident conclusions from that blind spot.
+		 *
+		 * Applied only when nothing is due, so a real deadline is never moved.
+		 * xorshift on the counter: cheap, and its exact quality does not
+		 * matter -- any irregularity breaks the harmonic. */
+		if (capped && skip > 2) {
+			static u64 seed = 0x9e3779b97f4a7c15ull;
+
+			seed ^= seed << 13;
+			seed ^= seed >> 7;
+			seed ^= seed << 17;
+			skip -= seed % (skip / 2);
+		}
+		cval += interval * skip;
+		if (cval <= now)
+			cval = now + interval * skip;
+		__asm__ volatile("msr cntv_cval_el0, %0" : : "r"(cval));
+		return;
+	}
+
 	cval += interval;
 	if (cval <= now)
 		cval = now + interval;

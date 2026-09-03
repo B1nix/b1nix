@@ -640,6 +640,15 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks);
  * the interrupt controller for, so both are things to read rather than assume.
  * sched_tick_hz() returns what the timer was armed with. */
 u32 sched_tick_hz(void);
+/* Tell the scheduler a wake_tick deadline was armed. MUST be called by every
+ * site that assigns task->wake_tick a future tick. */
+void sched_note_deadline(u64 tick);
+/* sigtimedwait(): declare/withdraw the set this task is parked for, so posting
+ * one of those signals can wake it instead of leaving it to poll. */
+void sched_sigwait_arm(u64 set);
+void sched_sigwait_disarm(void);
+/* Earliest armed deadline (a lower bound), or 0 when nobody is waiting. */
+u64 sched_next_deadline_tick(void);
 #define SCHED_TICKS_PER_SEC ((u64)sched_tick_hz())
 /* Milliseconds to ticks, rounded up so a wait is never shorter than asked.
  * Every "sleep N ticks" that means a duration has to go through this: written

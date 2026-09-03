@@ -333,6 +333,68 @@ int netdev_is_admin_up(const struct netdev *nd)
 /* ── Interface address state ────────────────────────────────────────────── */
 static volatile int net_irq_pending = 0;
 static volatile int net_task_id = -1;
+
+/* Why does the poll interval keep going back to one tick?
+ *
+ * Two explanations were tried and both were wrong -- traffic resetting the
+ * backoff (disproved: 1,679 of 1,688 wakes were this task's own timer finding
+ * nothing) and an imprecise reset test (replaced with the exact one; the
+ * numbers did not move). So stop guessing and count the causes. Under
+ * b1nix.waitprof only. */
+static u64 g_beat_early, g_beat_irq, g_beat_lb, g_beat_calm;
+static u64 g_beat_level[8]; /* how often each backoff level was in force */
+
+static void net_beat_count(int early, int irq, int lb, u64 level)
+{
+	if (early)
+		g_beat_early++;
+	if (irq)
+		g_beat_irq++;
+	if (lb)
+		g_beat_lb++;
+	if (!early && !irq && !lb)
+		g_beat_calm++;
+	for (unsigned i = 0; i < 8; i++) {
+		if (level <= (1ull << i) || i == 7) {
+			g_beat_level[i]++;
+			break;
+		}
+	}
+}
+
+void net_beat_dump(void)
+{
+	if (!bootinfo_has_flag("b1nix.waitprof"))
+		return;
+	console_write("net-beat: early ");
+	console_write_dec(g_beat_early);
+	console_write(" irq ");
+	console_write_dec(g_beat_irq);
+	console_write(" loopback ");
+	console_write_dec(g_beat_lb);
+	console_write(" calm ");
+	console_write_dec(g_beat_calm);
+	console_write(" | levels");
+	for (unsigned i = 0; i < 8; i++) {
+		console_write(" ");
+		console_write_dec(g_beat_level[i]);
+	}
+	console_write("\n");
+}
+
+/* Is a loopback packet queued? Defined with the queue further down. */
+static int net_loopback_pending(void);
+
+/* How long net_task may sleep when there is no traffic, in scheduler ticks.
+ * `b1nix.net-idle-ticks=N`, default 10; 1 restores the old fixed 100 Hz beat. */
+static u64 net_idle_tick_cap(void)
+{
+	static u64 cap = ~0ull;
+
+	if (cap == ~0ull)
+		cap = bootinfo_get_u32("b1nix.net-idle-ticks", 10);
+	return cap ? cap : 1;
+}
 static int networking_enabled;
 static int last_link_state = -2;
 
@@ -756,6 +818,8 @@ void net_dump_info(void)
 
 static void net_task(void *arg)
 {
+	u64 idle_ticks = 1;
+
 	(void)arg;
 	while (1) {
 		struct netdev *best = netdev_best();
@@ -788,13 +852,53 @@ static void net_task(void *arg)
 		 * DHCPv6 is still built into the kernel, so it keeps its direct call. */
 		net_proto_tick(scheduler_get_uptime_ticks());
 		dhcpv6_tick(scheduler_get_uptime_ticks());
-		/* Sleep a tick between polls rather than busy-yielding. As a perpetually
+		/* Sleep between polls rather than busy-yielding. As a perpetually
 		 * runnable kernel daemon, busy-yielding would keep net_task READY and —
 		 * under the Big Kernel Lock — let it monopolise the lock across its
 		 * cooperative yields (it never enters ring 3 to release it), starving
-		 * userspace on the other cores. Sleeping makes it BLOCKED between ~100Hz
-		 * polls, which the DHCP/ARP/ICMP/UDP smoke paths tolerate. */
-		scheduler_sleep_ticks(1);
+		 * userspace on the other cores.
+		 *
+		 * The interval backs off when there is no traffic. A fixed one-tick
+		 * sleep made this daemon the machine's heartbeat: measured on the
+		 * aarch64 sys lane, 4,431 of 4,438 idle ticks were ended by this wake,
+		 * over 4,422 separate ~10 ms waits, and it kept the one-shot timer from
+		 * ever programming a longer sleep because there was always a deadline
+		 * one tick out.
+		 *
+		 * Backing off is safe because nothing here is the packet path: both the
+		 * NIC interrupt (M70) and net_loopback_enqueue wake this task
+		 * explicitly. What the beat is actually for is the protocol
+		 * housekeeping below -- DHCP, NDP, NTP, TCP retransmit -- and those
+		 * work in seconds and check their own deadlines. This is Linux's
+		 * TIMER_DEFERRABLE in spirit: a timer that must not be the reason an
+		 * idle machine wakes up. */
+		u64 until = scheduler_get_ticks() + idle_ticks;
+
+		scheduler_sleep_ticks(idle_ticks);
+
+		/* Reset the backoff only when something actually woke us EARLY, or
+		 * there is work waiting -- not merely because a flag happened to be
+		 * set when the loop came round.
+		 *
+		 * Waking before the deadline is the exact signal for "an event, not my
+		 * timer", and it needs no new plumbing to ask, so this is the right
+		 * test to be making.
+		 *
+		 * It is NOT, however, the fix it looks like: measured, it changed
+		 * nothing. net_task still averages 2.3 ticks a sleep and 1,679 of its
+		 * 1,688 wakes are its own timer finding no work, exactly as before.
+		 * Something resets this backoff that is neither an early wake nor a
+		 * pending packet, and what that is has not been established yet. Do not
+		 * read this comment as saying the beat was fixed. */
+		int early = scheduler_get_ticks() < until;
+		int irq = net_irq_pending != 0;
+		int lb = net_loopback_pending();
+
+		net_beat_count(early, irq, lb, idle_ticks);
+		if (early || irq || lb)
+			idle_ticks = 1;
+		else if (idle_ticks < net_idle_tick_cap())
+			idle_ticks *= 2;
 	}
 }
 
@@ -964,6 +1068,12 @@ struct net_loopback_pkt { u8 *data; usize len; int is_v6; };
 static struct net_loopback_pkt net_loopback_q[NET_LOOPBACK_Q];
 static volatile u32 net_lb_head; /* consumer */
 static volatile u32 net_lb_tail; /* producer */
+
+static int net_loopback_pending(void)
+{
+	return __atomic_load_n(&net_lb_head, __ATOMIC_RELAXED) !=
+	       __atomic_load_n(&net_lb_tail, __ATOMIC_RELAXED);
+}
 static volatile int net_lb_lock;
 static volatile int net_lb_draining = 0;
 

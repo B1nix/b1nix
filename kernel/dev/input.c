@@ -269,6 +269,9 @@ int input_dev_open(int idx, int flags) {
   if (flags & B1NIX_O_CLOEXEC)
     scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
   __atomic_add_fetch(&dev_open_seq[idx], 1, __ATOMIC_RELEASE);
+  /* Tell the M47 injector an open happened, instead of leaving it to notice on
+   * its next poll. */
+  scheduler_wake_all(&dev_open_seq[0]);
   return fd;
 }
 
@@ -346,7 +349,19 @@ static void m47_inject_thread(void *arg) {
      * forever. */
     u32 seq = input_dev_open_seq(INPUT_DEV_MOUSE);
     if (seq == served || !input_dev_has_clients(INPUT_DEV_MOUSE)) {
-      scheduler_sleep_ticks(2);
+      /* Wait for an open rather than polling for one.
+       *
+       * This polled every 2 ticks for the whole run, and measured, that made a
+       * test-support thread the machine's heartbeat: it ended 1,237 idle
+       * stretches and accounted for 3,004 of the aarch64 sys lane's 3,438 idle
+       * ticks -- 87% of all the time the machine spent idle, to watch a counter
+       * that changes a handful of times in a run.
+       *
+       * The open path now wakes this thread, so the seq comparison above still
+       * catches an open/close/open faster than any poll period (which is why it
+       * counts opens rather than watching for a client edge). The timeout is a
+       * safety net, not the mechanism. */
+      scheduler_block_on_timeout(&dev_open_seq[0], 100);
       continue;
     }
     served = seq;
