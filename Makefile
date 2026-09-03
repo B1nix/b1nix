@@ -1991,16 +1991,26 @@ iso-pass-chromium-disk-impl: root-image check-dynamic $(KERNEL_ELF)
 # the larger image costs build time and no wall-clock.
 SMOKE_ROOT_MODULE ?=
 
+# The two lanes that receive the root filesystem as a boot module get a trimmed
+# copy of it. The module is read off the emulated CD and copied into memory
+# before the kernel starts: 512 MB takes 33 s that way, against 4 s of actual
+# work in the switchroot lane. The image is that large because it is a
+# comfortable writable root on a disk, and 317 MB of it is free space these
+# lanes never touch. Same contents, room left to write in, a third of the read.
+ROOT_MODULE_SIZE ?= 288
+ROOT_MODULE = $(BUILD_DIR)/root-module.ext4
+
 iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
 	@# The stage directory is reused between builds, so a module staged by an
 	@# earlier one is still sitting in it and lands in the image whether this
 	@# build asked for it or not. That is how images meant to be forty
 	@# megabytes kept coming out at five hundred and fifty.
 	@$(if $(or $(SMOKE_ROOT_MODULE),$(filter iso-blk iso-switchroot,$@)),,rm -f $(BUILD_DIR)/$@/boot/rootfs.img)
+	@$(if $(filter iso-blk iso-switchroot,$@),sh tools/images/trim-root-module.sh $(BUILD_DIR)/root.ext4 $(ROOT_MODULE) $(ROOT_MODULE_SIZE),)
 	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
-	    $(if $(or $(SMOKE_ROOT_MODULE),$(filter iso-blk iso-switchroot,$@)),--module $(BUILD_DIR)/root.ext4:rootfs.img,)
+	    $(if $(SMOKE_ROOT_MODULE),--module $(BUILD_DIR)/root.ext4:rootfs.img,$(if $(filter iso-blk iso-switchroot,$@),--module $(ROOT_MODULE):rootfs.img,))
 
 # Display bring-up instance: the kernel and nothing else.
 #

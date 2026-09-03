@@ -477,6 +477,19 @@ run_qemu() {
 				-device virtio-blk-device,drive=vblk0 \
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-off} \
 				-device virtio-net-device,netdev=net0
+			# Swap, as the SECOND virtio disk.
+			#
+			# This arch had no swap device at all: the disk is handed over on
+			# the ATA or NVMe bus, and QEMU virt has neither, so every path
+			# behind swap_active() went untested here. The kernel now also
+			# takes the second virtio disk (kernel/mm/swap.c), and second is
+			# what this has to stay -- the first one is the root, and giving
+			# that to swap would overwrite the filesystem.
+			if [ -n "${SWAP_IMG:-}" ] && [ -f "${SWAP_IMG:-}" ]; then
+				set -- "$@" \
+					-drive if=none,file="$SWAP_IMG",format=raw,id=vswap0 \
+					-device virtio-blk-device,drive=vswap0
+			fi
 			# Straight onto the root complex, NOT behind pcie-root-ports:
 			# nothing assigns bus numbers to bridges on this board (no
 			# firmware runs before the kernel), so a device behind a bridge
@@ -1487,7 +1500,14 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	# going wider; it simply no longer costs correctness to try.
 	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
-	_inst_list="sys sysnet blk posix gfx openrc init switchroot iommu amdvi"
+	# Longest first, measured by WALL time rather than by the guest clock.
+	#
+	# The pool is only ever as short as its worst tail, and the two lanes that
+	# carry the root filesystem as a boot module spend most of their wall clock
+	# in the bootloader, before the guest clock starts: switchroot does 4 s of
+	# work and takes 37 s. Ordered by guest time they started last and the whole
+	# suite ended when they did.
+	_inst_list="switchroot blk sysnet posix sys gfx iommu init amdvi openrc"
 	# The Raspberry Pi lane is off by default, and not because it is broken.
 	#
 	# It is the one instance no accelerator can take: HVF needs -cpu host and
