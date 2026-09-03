@@ -59,6 +59,11 @@ struct ww_acquire_ctx {
 	volatile u32 wounded;  /* an older context wants this one to back off */
 	u32 acquired;          /* locks currently held under this context */
 	u32 done;              /* ww_acquire_done was called */
+	/* The lock this context is parked on, or NULL when it is running. A
+	 * context wounded while it sleeps holds locks an older context is waiting
+	 * behind, and nothing but a wake makes it re-test the flag and back off —
+	 * so the wounder needs to know where to send that wake. */
+	void *volatile parked_on;
 };
 
 /* Errors come back as negative b1nix errno values: -EDEADLK and -EALREADY,

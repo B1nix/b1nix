@@ -58,6 +58,7 @@ void ww_acquire_init(struct ww_acquire_ctx *ctx)
 	ctx->wounded = 0;
 	ctx->acquired = 0;
 	ctx->done = 0;
+	ctx->parked_on = 0;
 }
 
 void ww_acquire_done(struct ww_acquire_ctx *ctx)
@@ -78,6 +79,7 @@ void ww_acquire_fini(struct ww_acquire_ctx *ctx)
 	ctx->stamp = 0;
 	ctx->wounded = 0;
 	ctx->done = 0;
+	ctx->parked_on = 0;
 }
 
 /* Take the lock if free. Caller holds `guard`. */
@@ -131,12 +133,18 @@ int ww_mutex_lock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 		 * smaller. Wound it: it keeps running and keeps its locks, but the next
 		 * lock it asks for will be refused, which frees this one. */
 		struct ww_acquire_ctx *holder = lock->ctx;
+		void *wake_wounded = 0;
 		if (ctx && holder && holder != ctx && ctx->stamp < holder->stamp &&
 		    !holder->wounded) {
-			holder->wounded = 1;
+			__atomic_store_n(&holder->wounded, 1u, __ATOMIC_SEQ_CST);
 			__atomic_fetch_add(&g_ww_wounds, 1ull, __ATOMIC_RELAXED);
+			/* If the holder is itself asleep behind another lock, it will
+			 * never look at the flag on its own: wake it where it parked. */
+			wake_wounded = __atomic_load_n(&holder->parked_on, __ATOMIC_SEQ_CST);
 		}
 		spin_unlock_irqrestore((spinlock_t *)&lock->guard, flags);
+		if (wake_wounded)
+			scheduler_wake_all(wake_wounded);
 
 		/* Someone older wounded us while we were getting here. Back off before
 		 * parking — sleeping now is exactly the cycle we are avoiding. */
@@ -159,14 +167,23 @@ int ww_mutex_lock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 		 * landing in this window would be lost. The wound flag is re-tested too,
 		 * so a wound delivered here is collected on the next pass instead of
 		 * being slept through. */
+		/* Publish where we are about to sleep before the last look at the
+		 * wound flag. Both sides use sequentially-consistent accesses, so a
+		 * wound raced against this park is either seen here or answered by a
+		 * wake to this channel — it cannot fall between the two. */
+		if (ctx)
+			__atomic_store_n(&ctx->parked_on, lock, __ATOMIC_SEQ_CST);
 		scheduler_wait_prepare(lock);
 		spin_lock_irqsave((spinlock_t *)&lock->guard, &flags);
 		int still_held = lock->locked;
 		spin_unlock_irqrestore((spinlock_t *)&lock->guard, flags);
-		if (still_held && !(ctx && ctx->wounded))
+		if (still_held &&
+		    !(ctx && __atomic_load_n(&ctx->wounded, __ATOMIC_SEQ_CST)))
 			scheduler_wait_commit();
 		else
 			scheduler_wait_cancel();
+		if (ctx)
+			__atomic_store_n(&ctx->parked_on, 0, __ATOMIC_SEQ_CST);
 	}
 }
 
