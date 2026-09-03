@@ -11,10 +11,25 @@ trap '' USR2 HUP TERM INT ALRM
 [ -x /etc/rc ] && /bin/sh /etc/rc
 
 SMOKE_SYS=0
+SMOKE_SYSNET=0
 SMOKE_BLK=0
 SMOKE_GFX=0
 SMOKE_POSIX=0
-if grep -q 'b1nix.smoke=sys' /proc/cmdline 2>/dev/null; then
+if grep -q 'b1nix.smoke=sysnet' /proc/cmdline 2>/dev/null; then
+    # The network half of what used to be one `sys` lane.
+    #
+    # sys was 67 s while the next longest lane was 31 s, and the pool runs three
+    # at a time -- so every other lane sat waiting for this one and the whole
+    # suite was exactly as long as it. Splitting it is the only lever left that
+    # does not touch the kernel.
+    #
+    # The cut is along the network suite because that is where the time is
+    # (dropbear, TLS via curl, ping, unix_chkpwd) and because it keeps a
+    # coherent set together rather than slicing by stopwatch. The two
+    # deliberate five-second sleeps in m32_smoke -- TCP keepalive probes, which
+    # are the property under test -- move here with it.
+    SMOKE_SYSNET=1
+elif grep -q 'b1nix.smoke=sys' /proc/cmdline 2>/dev/null; then
     SMOKE_SYS=1
 elif grep -q 'b1nix.smoke=gfx' /proc/cmdline 2>/dev/null; then
     SMOKE_GFX=1
@@ -55,6 +70,7 @@ elif grep -q 'b1nix.openrc-ctltest' /proc/cmdline 2>/dev/null; then
     exit 0
 else
     SMOKE_SYS=1
+    SMOKE_SYSNET=1
     SMOKE_GFX=1
     SMOKE_POSIX=1
     SMOKE_BLK=1
@@ -83,6 +99,7 @@ run_test() {
 
     case "$inst" in
         sys) [ "$SMOKE_SYS" = "1" ] && "$bin" ;;
+        sysnet) [ "$SMOKE_SYSNET" = "1" ] && "$bin" ;;
         blk) [ "$SMOKE_BLK" = "1" ] && "$bin" ;;
         posix) [ "$SMOKE_POSIX" = "1" ] && "$bin" ;;
         gfx) [ "$SMOKE_GFX" = "1" ] && "$bin" ;;
@@ -110,9 +127,9 @@ run_test /bin/test_sync sys
 run_test /bin/m25_smoke sys
 run_test /bin/m26_smoke sys
 run_test /bin/m27_smoke sys
-run_test /bin/m32_smoke sys
-run_test /bin/m32_nettool sys
-run_test /bin/m32_pcre2_smoke sys
+run_test /bin/m32_smoke sysnet
+run_test /bin/m32_nettool sysnet
+run_test /bin/m32_pcre2_smoke sysnet
 run_test /bin/m53_zlib_smoke sys
 run_test /bin/m53_libpng_smoke sys
 run_test /bin/m53_libjpeg_smoke sys
@@ -132,8 +149,8 @@ run_test /bin/cxx_smoke sys
 run_test /bin/m55_iostream sys
 run_test /bin/m64_clang_smoke sys
 run_test /bin/m97_tools_smoke sys
-run_test /bin/m104_pam_smoke sys
-run_test /bin/net_smoke sys
+run_test /bin/m104_pam_smoke sysnet
+run_test /bin/net_smoke sysnet
 run_test /bin/m_posixmm_smoke sys
 run_test /bin/shmshare_smoke sys
 run_test /bin/musl_posix_smoke sys

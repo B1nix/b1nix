@@ -332,6 +332,14 @@ run_qemu() {
 			local lane="${B1NIX_ISO_NAME:-b1nix.iso}"
 			lane="${lane#b1nix-}"; lane="${lane%.iso}"
 			[ "$lane" = "b1nix" ] && lane="sys"
+			# A lane that shares another lane's image says so explicitly. The
+			# name is otherwise derived from B1NIX_ISO_NAME, which is fine while
+			# every lane has its own image -- sysnet does not: it is the same
+			# system as sys, told to run a different half of the tests. Without
+			# this it silently became a second sys lane, and the network checks
+			# it was supposed to run were then run by nobody: 91 failures, all
+			# of them missing markers.
+			[ -n "${SMOKE_LANE:-}" ] && lane="$SMOKE_LANE"
 			# Same strings the Makefile bakes into each iso-<lane> (see
 			# SMOKE_CMDLINE_*): no `init=` on the ordinary lanes, so PID 1 is
 			# the default /sbin/init (BusyBox init) with /etc/inittab driving
@@ -851,7 +859,15 @@ _mkimg() {  # mkimg <instance-suffix>
         dd if=/dev/zero of="$(disk_img vblk "$1")" bs=1M count=4 2>/dev/null
         rm -f "$_sata"
         if [ -f "$PROJECT_DIR/build/$ARCH/root.ext4" ]; then
-            cp -f "$PROJECT_DIR/build/$ARCH/root.ext4" "$_sata"
+            # Clone, do not copy. Every lane gets its own writable root, and
+            # that root is half a gigabyte -- ten lanes meant five gigabytes
+            # moved before a single instance booted, which is most of the gap
+            # between "iso ready" and the first lane starting. APFS (and Linux
+            # on btrfs/xfs) can give each lane a copy-on-write clone instead,
+            # which costs nothing until something writes. `cp -c` fails on a
+            # filesystem that cannot do it, so fall back to the real copy.
+            cp -c "$PROJECT_DIR/build/$ARCH/root.ext4" "$_sata" 2>/dev/null ||
+                cp -f "$PROJECT_DIR/build/$ARCH/root.ext4" "$_sata"
         else
             "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q \
                 -L b1nix-root -d "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512m || {
@@ -899,13 +915,14 @@ _mkimg() {  # mkimg <instance-suffix>
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
-    _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg smp; _mkimg switchroot
+    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg smp; _mkimg switchroot
 }
 
 # Define logs
 LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-$ARCH.log"
 SMP_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-smp-$ARCH.log"
 SYS_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-sys-$ARCH.log"
+SYSNET_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-sysnet-$ARCH.log"
 BLK_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-blk-$ARCH.log"
 POSIX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-posix-$ARCH.log"
 GFX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-gfx-$ARCH.log"
@@ -1033,6 +1050,24 @@ launch_sys() {
 		run_qemu "$SYS_LOG"
 	) &
 	pid_sys=$!
+}
+
+# The network half of the old `sys` lane. Same machine, same networking; the
+# only difference is which tests the guest driver runs (b1nix.smoke=sysnet).
+launch_sysnet() {
+	(
+		[ "$ARCH" = "aarch64" ] && SMOKE_SMP=2
+		SATA_IMG=$(disk_img sata sysnet)
+		AHCI_IMG=$(disk_img ahci sysnet)
+		NVME_IMG=$(disk_img nvme sysnet)
+		SWAP_IMG=$(disk_img swap sysnet)
+		B1NIX_ISO_NAME=b1nix-sys.iso
+		SMOKE_LANE=sysnet
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[sysnet]"
+		run_qemu "$SYSNET_LOG"
+	) &
+	pid_sysnet=$!
 }
 
 launch_blk() {
@@ -1407,9 +1442,16 @@ run_slot_pool() {
 }
 
 if [ "$SMOKE_PARALLEL" = "1" ]; then
+	# Three, and four is not better -- it is ruinous. Measured on an 8-core
+	# host after the sys/sysnet split had removed the one dominant lane, which
+	# is the only situation where raising this could have helped: 3 gave 113 s
+	# and 1385/0/0, 4 gave 232 s with 90 checks BLOCKED. Each lane runs 2 vCPUs,
+	# so four of them claim every core and leave nothing for QEMU's own I/O
+	# threads; the lanes then miss their deadlines and their markers read as
+	# missing. Same failure the staggered SMP launch above exists to avoid.
 	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
-	_inst_list="sys blk posix gfx openrc init switchroot iommu amdvi"
+	_inst_list="sys sysnet blk posix gfx openrc init switchroot iommu amdvi"
 	# The Raspberry Pi lane is off by default, and not because it is broken.
 	#
 	# It is the one instance no accelerator can take: HVF needs -cpu host and
@@ -1438,14 +1480,14 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	if [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMOKE_INSTANCES " | grep -q " smp "; then
 		_ran_list="$_ran_list smp"
 	fi
-	for _known in sys blk posix gfx openrc init switchroot iommu amdvi raspi smp; do
+	for _known in sys sysnet blk posix gfx openrc init switchroot iommu amdvi raspi smp; do
 		case " $_ran_list " in
 		*" $_known "*) continue ;;
 		esac
 		rm -f "$PROJECT_DIR/smoke_run/b1nix-smoke-$_known-$ARCH.log"
 	done
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
-	cat "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$OPENRC_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$RASPI_LOG" 2>/dev/null >"$LOG" || true
+	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$OPENRC_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$RASPI_LOG" 2>/dev/null >"$LOG" || true
 else
 	launch_sys
 	launch_smp_solo
