@@ -5339,6 +5339,11 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
 #define SILENCE_WATCHDOG_MAX_DUMPS 2
 extern volatile u64 g_console_write_seq;
 
+/* Ticks the clock advanced without this vCPU running. See the timer tick. */
+static u64 g_stolen_ticks;
+
+u64 sched_stolen_ticks(void) { return __atomic_load_n(&g_stolen_ticks, __ATOMIC_RELAXED); }
+
 static const char *task_state_name(enum task_state st) {
   switch (st) {
   case TASK_RUNNING:  return "RUNNING";
@@ -5352,9 +5357,23 @@ static const char *task_state_name(enum task_state st) {
   }
 }
 
+/* Silence is measured in time this machine was actually given.
+ *
+ * It used to be measured in wall time, and that made the watchdog fire on a
+ * healthy guest whenever the HOST was busy: running the suite four lanes at a
+ * time instead of three put 90 checks into BLOCKED and panicked two lanes with
+ * "deadlock or hang detected", when nothing had deadlocked at all -- each vCPU
+ * was simply getting a quarter of a core, so sixty seconds of wall clock held
+ * fifteen seconds of guest.
+ *
+ * Subtracting the stolen ticks keeps the check honest in both directions. A
+ * machine that is genuinely wedged still takes its timer interrupts, still
+ * accrues no steal, and is still caught on the same budget. A machine that is
+ * merely starved is no longer accused of a deadlock it does not have. */
 static void serial_silence_watchdog(void) {
   static u64 last_seq;
   static u64 last_change_tick;
+  static u64 last_change_steal;
   static int dumps;
   static int test_mode = -1;
   if (test_mode < 0)
@@ -5365,12 +5384,20 @@ static void serial_silence_watchdog(void) {
   if (seq != last_seq) {
     last_seq = seq;
     last_change_tick = scheduler_ticks;
+    last_change_steal = g_stolen_ticks;
     dumps = 0;
     return;
   }
-  if (scheduler_ticks - last_change_tick < SILENCE_WATCHDOG_TICKS)
-    return;
+  {
+    u64 elapsed = scheduler_ticks - last_change_tick;
+    u64 stolen = g_stolen_ticks - last_change_steal;
+
+    if (elapsed - (stolen < elapsed ? stolen : elapsed) <
+        SILENCE_WATCHDOG_TICKS)
+      return;
+  }
   last_change_tick = scheduler_ticks;
+  last_change_steal = g_stolen_ticks;
   dumps++;
   /* Before the dump: it lands in the same ring and would otherwise be all the
    * tail has left in it. */
@@ -5613,6 +5640,15 @@ static void serial_silence_watchdog(void) {
     extern const char *boot_summary_root(void);
     extern const char *boot_summary_init(void);
 
+    /* How much of that silence was this machine not being given the CPU. A
+     * large number here means the host was oversubscribed and the dump below
+     * is unlikely to show a real wedge. */
+    console_write("SMOKE-GUEST-WATCHDOG: stolen-ticks ");
+    console_write_dec(g_stolen_ticks);
+    console_write(" of ");
+    console_write_dec(scheduler_ticks);
+    console_write("\n");
+
     console_write("SMOKE-GUEST-WATCHDOG: root=");
     console_write(boot_summary_root());
     console_write(" init=");
@@ -5669,10 +5705,22 @@ void scheduler_on_timer_tick(void) {
     u64 ns_per_tick = 1000000000ull / sched_tick_hz();
     u64 want = ns_per_tick ? ktime_monotonic_ns() / ns_per_tick : 0;
 
-    if (want > scheduler_ticks)
+    if (want > scheduler_ticks) {
+      /* The size of that jump is time this vCPU did not get to run.
+       *
+       * The clock moved and we did not: either the host was running somebody
+       * else, or this kernel sat with interrupts masked. Counting it is what
+       * lets the hang watchdog tell "wedged" from "starved" -- see
+       * serial_silence_watchdog. Gaps of one tick are ordinary rounding and
+       * are not counted; real starvation arrives in tens. */
+      u64 jump = want - scheduler_ticks;
+
+      if (jump > 2)
+        g_stolen_ticks += jump - 1;
       scheduler_ticks = want;
-    else
+    } else {
       scheduler_ticks++;
+    }
   }
 
   for (usize i = 0; i < g_task_hwm; i++) {

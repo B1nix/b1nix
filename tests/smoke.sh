@@ -1442,13 +1442,17 @@ run_slot_pool() {
 }
 
 if [ "$SMOKE_PARALLEL" = "1" ]; then
-	# Three, and four is not better -- it is ruinous. Measured on an 8-core
-	# host after the sys/sysnet split had removed the one dominant lane, which
-	# is the only situation where raising this could have helped: 3 gave 113 s
-	# and 1385/0/0, 4 gave 232 s with 90 checks BLOCKED. Each lane runs 2 vCPUs,
-	# so four of them claim every core and leave nothing for QEMU's own I/O
-	# threads; the lanes then miss their deadlines and their markers read as
-	# missing. Same failure the staggered SMP launch above exists to avoid.
+	# Three, because four is not faster -- not because four breaks.
+	#
+	# It did break, once: 232 s with 90 checks BLOCKED and two lanes panicking
+	# "deadlock or hang detected". That turned out to be the GUEST's own
+	# silence watchdog measuring wall time, so a starved-but-healthy machine
+	# accused itself of a deadlock. The watchdog now discounts the time the
+	# host did not give it (see serial_silence_watchdog), and four lanes come
+	# out at 114 s and 1385/0/0 -- against 112 s at three.
+	#
+	# So the host really is saturated at three and there is nothing to win by
+	# going wider; it simply no longer costs correctness to try.
 	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
 	_inst_list="sys sysnet blk posix gfx openrc init switchroot iommu amdvi"
