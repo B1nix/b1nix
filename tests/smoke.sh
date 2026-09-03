@@ -485,10 +485,23 @@ run_qemu() {
 			# takes the second virtio disk (kernel/mm/swap.c), and second is
 			# what this has to stay -- the first one is the root, and giving
 			# that to swap would overwrite the filesystem.
-			if [ -n "${SWAP_IMG:-}" ] && [ -f "${SWAP_IMG:-}" ]; then
-				set -- "$@" \
-					-drive if=none,file="$SWAP_IMG",format=raw,id=vswap0 \
-					-device virtio-blk-device,drive=vswap0
+			#
+			# Only when this lane has no AHCI disk. kernel/mm/swap.c takes the
+			# virtio disk exactly then -- where ATA exists it takes the second
+			# ATA disk, and the checks assert that name (`swap: device=sdb`).
+			# Handing the same file to both buses is not a second chance at
+			# swap: QEMU will not open one file for writing twice and refuses
+			# to start, reporting `Failed to get "write" lock / Is another
+			# process using the image?`. That reads like a stray QEMU from an
+			# earlier run rather than this same command line naming the file
+			# on two buses, and it killed every lane that got here -- the
+			# suite finished in 28s with ~1200 checks BLOCKED.
+			if [ -z "${AHCI_IMG:-}" ] || [ ! -f "${AHCI_IMG:-}" ]; then
+				if [ -n "${SWAP_IMG:-}" ] && [ -f "${SWAP_IMG:-}" ]; then
+					set -- "$@" \
+						-drive if=none,file="$SWAP_IMG",format=raw,id=vswap0 \
+						-device virtio-blk-device,drive=vswap0
+				fi
 			fi
 			# Straight onto the root complex, NOT behind pcie-root-ports:
 			# nothing assigns bus numbers to bridges on this board (no
