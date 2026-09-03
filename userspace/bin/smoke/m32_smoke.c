@@ -1079,7 +1079,9 @@ static int test_idle_connection(void) {
   int sfd = accept(lfd, 0, 0);
   if (sfd < 0) { fail("idle-connection"); close(fd); close(lfd); return -1; }
 
-  sleep(5);
+  /* Three seconds, not five: with keepalive off nothing is due to happen
+     here at all, and this wait is on the network lane's critical path. */
+  sleep(3);
 
   const char *msg = "idle-still-here";
   if (send(fd, msg, strlen(msg), 0) < 0) {
@@ -1166,8 +1168,11 @@ static int test_tcp_keepalive(void) {
   int sfd = accept(lfd, 0, 0);
   if (sfd < 0) { fail("keepalive-live"); close(fd); close(lfd); return -1; }
 
-  /* Idle for long enough that several probes are due. */
-  sleep(5);
+  /* Idle for long enough that several probes are due: the idle time and the
+     interval above are both one second, so three seconds owes two probes and
+     an answer to each. Five bought nothing the third second had not already
+     proved, and this is the network lane's critical path. */
+  sleep(3);
 
   const char *msg = "keepalive-still-here";
   if (send(fd, msg, strlen(msg), 0) < 0) {
