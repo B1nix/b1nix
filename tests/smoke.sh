@@ -687,6 +687,18 @@ run_qemu() {
 		kill -9 "$pid" 2>/dev/null || true
 		wait "$pid" 2>/dev/null || true
 
+		# Keep the evidence of a wedge. Lane logs are overwritten by the next
+		# run, and the interesting ones are rare: the blk-lane hang reproduces
+		# about once in nine runs, and its first two dumps were lost to exactly
+		# this before anyone thought to save them by hand. A panic is the only
+		# thing worth keeping, and since the watchdog stopped counting stolen
+		# time a panic means a real wedge rather than a busy host.
+		if grep -qa "KERNEL PANIC" "$log" 2>/dev/null; then
+			_keep="${log%.log}-wedge-$(date +%Y%m%d-%H%M%S).log"
+			cp "$log" "$_keep" 2>/dev/null &&
+				command echo "[smoke] wedge log kept: $_keep" >&2
+		fi
+
 		[ -s "$log" ] && break
 		[ "$_attempt" -ge 2 ] && break
 		_attempt=$((_attempt + 1))

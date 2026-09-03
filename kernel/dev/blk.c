@@ -1815,12 +1815,30 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
          * for a concurrently-filled entry to avoid a duplicate (dev,lba). */
         struct block_buffer *raced = bcache_find(dev, current_lba);
         if (raced) {
+          /* Give the evicted slot back before abandoning it.
+           *
+           * bcache_evict returns its slot marked BLK_CACHE_BUSY -- that is the
+           * claim it holds across the lock drop -- and only the else branch
+           * below ever cleared it. Both paths here walk away from that slot,
+           * so it stayed BUSY for the rest of the boot. Nothing frees a BUSY
+           * slot and nothing writes it back; what a later reader does with it
+           * is spin: `if (BUSY) { release; yield; continue; }`, for ever.
+           *
+           * That is the blk-lane hang. m14_smoke's sync(2) sat in exactly that
+           * loop -- READY, same rsp in three dumps a minute apart, stolen-ticks
+           * 2 of 6736, so not a starved guest but a real one. It needs another
+           * CPU to fill this same (dev,lba) while the lock was dropped, which
+           * is why it took about one run in nine to see.
+           *
+           * The comment that used to be on the line below said the slot stays
+           * free. It did not; that is what made this hard to see. */
+          entry->flags &= ~BLK_CACHE_BUSY;
           if (raced->flags & BLK_CACHE_BUSY) {
             bcache_release(flags);
             scheduler_yield();
             continue;
           }
-          entry = raced; /* our evicted slot stays free; write into the winner */
+          entry = raced; /* write into the winner */
         } else {
           entry->bdev = dev;
           entry->block_no = current_lba;
