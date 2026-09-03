@@ -52,3 +52,4 @@ tools/sony-xperia-5/lineage/
 # The Xperia 5 device tree ships as tools/sony-xperia-5/android_device_tree.tar.gz.
 # The unpacked copy also holds ~810 MiB of vendor blobs that are not ours to carry.
 tools/sony-xperia-5/android_device_tree/
+tests/.smoke-frozen.sh

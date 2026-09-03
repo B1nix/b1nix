@@ -914,6 +914,15 @@ _mkimg() {  # mkimg <instance-suffix>
             # filesystem that cannot do it, so fall back to the real copy.
             cp -c "$PROJECT_DIR/build/$ARCH/root.ext4" "$_sata" 2>/dev/null ||
                 cp -f "$PROJECT_DIR/build/$ARCH/root.ext4" "$_sata"
+            # Stamp it with THIS run's time. A clone carries the source's
+            # mtime, and the prune below deletes anything in smoke_run older
+            # than an hour -- so once the build stopped rebuilding root.ext4
+            # every run (the stamps in the Makefile), the clone inherited an
+            # mtime from hours ago and was deleted before QEMU could open it.
+            # Every lane then died with "Could not open ... No such file or
+            # directory", 1343 checks BLOCKED, in under thirty seconds --
+            # from two separate changes that were each correct alone.
+            touch "$_sata"
         else
             "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q \
                 -L b1nix-root -d "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512m || {
@@ -1004,8 +1013,9 @@ fi
 # and three consecutive "runs" reported the same numbers off the same stale
 # files. An empty log makes the checks report missing markers, which is the
 # truth.
-for _l in "$LOG" "$SMP_LOG" "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" \
-          "$OPENRC_LOG" "$INIT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$RASPI_LOG"; do
+for _l in "$LOG" "$SMP_LOG" "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" \
+          "$GFX_LOG" "$OPENRC_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" \
+          "$AMDVI_LOG" "$RASPI_LOG"; do
 	: > "$_l" 2>/dev/null || true
 done
 
