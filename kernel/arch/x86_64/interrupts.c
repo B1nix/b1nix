@@ -586,6 +586,10 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
      * service and never delivers another tick. Issue EOI first so the
      * LAPIC unblocks immediately, then run the (preemptible) tick work. */
     lapic_eoi();
+    /* Re-arm before the (preemptible) tick work below: that work may context
+     * switch away, and a one-shot timer left unarmed across the switch is a
+     * timer that never fires again. No-op unless b1nix.dynticks is on. */
+    lapic_timer_rearm();
     /* Record the user RIP the tick preempted, so the silence watchdog's task
      * dump can name the exact user function a wedged thread group spins in
      * (a thread group burning CPU in the same address forever is a lockup;

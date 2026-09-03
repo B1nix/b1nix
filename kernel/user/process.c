@@ -919,12 +919,41 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     /* Debug level: two lines per exec, and a shell execs constantly — these
      * were most of the console traffic of a whole browser run. The personality
      * line above stays at the default level because a smoke check asserts it,
-     * and a test must not depend on how verbose the console is. */
-    if (load_base)
-      k_info("elf", "load: %s entry=0x%lx (PIE base=0x%lx)", path,
-            (unsigned long)image->entry, (unsigned long)load_base);
-    else
-      k_info("elf", "load: %s entry=0x%lx", path, (unsigned long)image->entry);
+     * and a test must not depend on how verbose the console is.
+     *
+     * The comment said "debug level" but the code printed at info, so all of
+     * them went out on every run: 928 of the aarch64 sys lane's 3,617 console
+     * lines. Console output is not cheap here -- serial_putc polls a device
+     * register per character and every one of those accesses is a VM exit --
+     * and kprintf was 22% of all kernel-mode CPU samples in that lane.
+     *
+     * Demoting the lot to k_dbg was tried and reverted: `check_output "PIE
+     * base="` asserts that musl PIEs are placed by the loader, and silently
+     * removing the line it greps turned a real check into BLOCKED. So the
+     * FIRST load of each kind still prints at info -- the property is a static
+     * fact about the loader, which one line evidences as well as 928 do -- and
+     * the rest are debug. loglevel=7 brings them all back. */
+    static int pie_reported, exec_reported;
+
+    if (load_base) {
+      if (!pie_reported) {
+        pie_reported = 1;
+        k_info("elf", "load: %s entry=0x%lx (PIE base=0x%lx)", path,
+               (unsigned long)image->entry, (unsigned long)load_base);
+      } else {
+        k_dbg("elf", "load: %s entry=0x%lx (PIE base=0x%lx)", path,
+              (unsigned long)image->entry, (unsigned long)load_base);
+      }
+    } else {
+      if (!exec_reported) {
+        exec_reported = 1;
+        k_info("elf", "load: %s entry=0x%lx", path,
+               (unsigned long)image->entry);
+      } else {
+        k_dbg("elf", "load: %s entry=0x%lx", path,
+              (unsigned long)image->entry);
+      }
+    }
   }
   image->address_space = user_address_space_create();
 

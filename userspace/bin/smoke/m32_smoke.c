@@ -539,7 +539,11 @@ static int test_tcp_client_server(void) {
    * earlier refused attempts don't consume it. */
   curl_status = -1;
   for (int attempt = 0; attempt < 4; attempt++) {
-    sleep(1);
+    /* Back off AFTER a refused attempt, not before the first one. The server
+     * is usually listening by the time we get here, and the unconditional
+     * leading second was paid on every run for the case where it is not. */
+    if (attempt)
+      usleep(250000 << (attempt - 1));
     curl_pid = fork();
     if (curl_pid < 0) {
       fail("curl-https-fork");
@@ -1075,7 +1079,9 @@ static int test_idle_connection(void) {
   int sfd = accept(lfd, 0, 0);
   if (sfd < 0) { fail("idle-connection"); close(fd); close(lfd); return -1; }
 
-  sleep(5);
+  /* Three seconds, not five: with keepalive off nothing is due to happen
+     here at all, and this wait is on the network lane's critical path. */
+  sleep(3);
 
   const char *msg = "idle-still-here";
   if (send(fd, msg, strlen(msg), 0) < 0) {
@@ -1162,8 +1168,11 @@ static int test_tcp_keepalive(void) {
   int sfd = accept(lfd, 0, 0);
   if (sfd < 0) { fail("keepalive-live"); close(fd); close(lfd); return -1; }
 
-  /* Idle for long enough that several probes are due. */
-  sleep(5);
+  /* Idle for long enough that several probes are due: the idle time and the
+     interval above are both one second, so three seconds owes two probes and
+     an answer to each. Five bought nothing the third second had not already
+     proved, and this is the network lane's critical path. */
+  sleep(3);
 
   const char *msg = "keepalive-still-here";
   if (send(fd, msg, strlen(msg), 0) < 0) {
@@ -1595,8 +1604,61 @@ static int ssh_start_server(const char *portspec) {
     execve("/bin/dropbear", av, ev);
     _exit(127);
   }
-  sleep(3); /* let the server load the key and bind */
+  /* Wait until it is actually accepting, rather than guessing three seconds.
+   *
+   * The guess was wrong in both directions: under the parallel smoke's load a
+   * dropbear that needed longer than three seconds produced a connection
+   * refused and a spurious failure, and on an idle machine it was ready in a
+   * fraction of that and the suite waited anyway. A connect that succeeds is
+   * the definition of "bound and listening"; closing it straight away leaves
+   * dropbear with one dropped connection, which it is entitled to see. */
+  {
+    unsigned short port = (unsigned short)atoi(portspec);
+
+    for (int waited = 0; waited < 5000; waited += 50) {
+      int probe = socket(AF_INET, SOCK_STREAM, 0);
+
+      if (probe >= 0) {
+        struct sockaddr_in pa;
+
+        make_loopback_addr(port, &pa);
+        if (connect(probe, (struct sockaddr *)&pa, sizeof(pa)) == 0) {
+          close(probe);
+          break;
+        }
+        close(probe);
+      }
+      usleep(50000);
+    }
+  }
   return srv;
+}
+
+/* Wait for a file to appear, rather than guessing how long that takes.
+ *
+ * These checks were `sleep(1); open(...)`. A fixed sleep is wrong in both
+ * directions: too short under the parallel smoke's load and the check fails
+ * for a service that was merely slow, too long when the service was ready
+ * immediately -- and every run pays the full second either way. Polling to the
+ * same deadline fails no later than the sleep did and returns the moment the
+ * file is there.
+ *
+ * Be generous with the deadline. A bound is still a guess, and a guess that is
+ * too small is a flake: 2000 ms here was enough until the sys lane was split
+ * and sshd started under a different load, and then service-lifecycle failed
+ * about one run in ten. Waiting longer costs nothing when the file appears at
+ * once, which is the case this is written for. */
+static int wait_for_file(const char *path, int timeout_ms) {
+  for (int waited = 0; waited < timeout_ms; waited += 50) {
+    int fd = open(path, O_RDONLY);
+
+    if (fd >= 0) {
+      close(fd);
+      return 1;
+    }
+    usleep(50000);
+  }
+  return 0;
 }
 
 /* Reap a client without ever blocking the suite. The loopback handshake is
@@ -1604,17 +1666,25 @@ static int ssh_start_server(const char *portspec) {
  * sleep between checks, give up after ~20s, and SIGKILL a stuck client.
  * Returns 1 if the client exited on its own, 0 if it had to be killed. */
 static int ssh_reap_client(int cli, int *status) {
-  for (int i = 0; i < 20; i++) {
+  /* Poll every 100 ms, not every second, over the same ~20 s bound. The client
+   * usually exits within a couple of hundred milliseconds and the suite then
+   * waited out the rest of the second for nothing. Same deadline, same
+   * outcome, a fraction of the wait. */
+  for (int i = 0; i < 200; i++) {
     int r = (int)waitpid(cli, status, WNOHANG);
     if (r == cli) return 1;
     if (r < 0) return 0;
     /* Progress trace: the whole suite has been killed here by the init
      * watchdog before (sleep never returning), and without a per-poll line the
-     * log cannot tell "client still running" from "parent stuck in sleep". */
-    char dbg[64];
-    snprintf(dbg, sizeof(dbg), "M32B-SSH: dbg reap poll=%d\n", i);
-    emit(dbg);
-    sleep(1);
+     * log cannot tell "client still running" from "parent stuck in sleep".
+     * Once a second, as before -- ten times that would be the serial port
+     * making the stall it is meant to report. */
+    if (i % 10 == 0) {
+      char dbg[64];
+      snprintf(dbg, sizeof(dbg), "M32B-SSH: dbg reap poll=%d\n", i / 10);
+      emit(dbg);
+    }
+    usleep(100000);
   }
   kill(cli, SIGKILL);
   return 0;
@@ -1664,7 +1734,9 @@ static int ssh_test_login(void) {
   int cst = 0, done = 0;
   char buf[256];
   int n = -1;
-  for (int i = 0; i < 90; i++) {
+  /* 100 ms polls over the same 90 s bound: the login lands as soon as it
+   * lands, instead of on the next whole second after it. */
+  for (int i = 0; i < 900; i++) {
     int fd = open("/tmp/ssh_out", O_RDONLY);
     n = fd >= 0 ? (int)read(fd, buf, sizeof(buf) - 1) : -1;
     if (fd >= 0) close(fd);
@@ -1676,13 +1748,13 @@ static int ssh_test_login(void) {
       break;
     }
     /* Progress trace: the harness kills an instance that goes quiet, and this
-     * wait is the longest silent stretch in the suite. */
-    if (i % 5 == 0) {
+     * wait is the longest silent stretch in the suite. Every 5 s, as before. */
+    if (i % 50 == 0) {
       char dbg[64];
-      snprintf(dbg, sizeof(dbg), "M32B-SSH: dbg login wait=%d\n", i);
+      snprintf(dbg, sizeof(dbg), "M32B-SSH: dbg login wait=%d\n", i / 10);
       emit(dbg);
     }
-    sleep(1);
+    usleep(100000);
   }
   if (!done && waitpid(cli, &cst, WNOHANG) != cli)
     kill(cli, SIGKILL);
@@ -1837,8 +1909,7 @@ static int test_sshd_service(void) {
   close(fd);
 
   /* 2. Since init ran it, check if pid file exists. */
-  /* Wait a little for it to start up from init. */
-  sleep(1);
+  wait_for_file("/var/run/sshd.pid", 10000);
   int pid_fd = open("/var/run/sshd.pid", O_RDONLY);
   if (pid_fd < 0) {
     emit("M32B-SSH: FAIL service-pid-missing\n");
@@ -1933,7 +2004,7 @@ static int test_sshd_service(void) {
     return -1;
   }
   
-  sleep(1);
+  wait_for_file("/var/run/sshd.pid", 10000);
   pid_fd = open("/var/run/sshd.pid", O_RDONLY);
   if (pid_fd < 0) {
     emit("M32B-SSH: FAIL service-restart-pid-missing\n");

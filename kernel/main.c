@@ -1869,6 +1869,9 @@ void kernel_main(usize arg0, usize arg1)
 	while (1) {
 		int switched = scheduler_yield();
 		if (!switched) {
+			extern u64 g_idle_halts;
+
+			g_idle_halts++;
 #if defined(__x86_64__)
 			__asm__ volatile("sti; hlt" : : : "memory");
 #elif defined(__aarch64__)

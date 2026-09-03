@@ -1077,7 +1077,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 print-%:
 	@echo '$($*)'
 
-.PHONY: all analyze objects FORCE iso iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot iso-live iso-test iso-full check-dynamic iso-pass-chromium-disk iso-pass-chromium-disk-impl \
+.PHONY: all analyze objects FORCE iso iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot iso-live iso-test iso-full check-dynamic iso-pass-chromium-disk iso-pass-chromium-disk-impl \
 	iso-chromium-min-disk iso-chromium-min-disk-impl \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
@@ -1844,6 +1844,15 @@ iso: check-b1cc-sync root-image check-dynamic $(KERNEL_ELF)
 SMOKE_EXTRA_CMDLINE ?=
 
 SMOKE_CMDLINE_sys=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=sys
+# The network half of the sys lane. Same system, same image contents; the only
+# difference is which tests the guest driver runs — and on x86_64 that choice
+# has to be baked into an image of its own, because the cmdline comes from the
+# ISO's bootloader config and nothing at launch can override it. aarch64 passes
+# it as DTB bootargs and needs no second image; giving the lane one here is what
+# makes rule 2 of docs/build-conventions.md ("a lane names itself") true on
+# both arches. Without it the lane booted with b1nix.smoke=sys, ran the sys half
+# a second time, and the 91 network checks were run by nobody.
+SMOKE_CMDLINE_sysnet=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=sysnet
 SMOKE_CMDLINE_gfx=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=gfx
 SMOKE_CMDLINE_posix=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=posix
 # b1nix.mtd: probe for the CFI NOR chip. Only this instance is given one
@@ -1982,16 +1991,26 @@ iso-pass-chromium-disk-impl: root-image check-dynamic $(KERNEL_ELF)
 # the larger image costs build time and no wall-clock.
 SMOKE_ROOT_MODULE ?=
 
-iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
+# The two lanes that receive the root filesystem as a boot module get a trimmed
+# copy of it. The module is read off the emulated CD and copied into memory
+# before the kernel starts: 512 MB takes 33 s that way, against 4 s of actual
+# work in the switchroot lane. The image is that large because it is a
+# comfortable writable root on a disk, and 317 MB of it is free space these
+# lanes never touch. Same contents, room left to write in, a third of the read.
+ROOT_MODULE_SIZE ?= 288
+ROOT_MODULE = $(BUILD_DIR)/root-module.ext4
+
+iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
 	@# The stage directory is reused between builds, so a module staged by an
 	@# earlier one is still sitting in it and lands in the image whether this
 	@# build asked for it or not. That is how images meant to be forty
 	@# megabytes kept coming out at five hundred and fifty.
 	@$(if $(or $(SMOKE_ROOT_MODULE),$(filter iso-blk iso-switchroot,$@)),,rm -f $(BUILD_DIR)/$@/boot/rootfs.img)
+	@$(if $(filter iso-blk iso-switchroot,$@),sh tools/images/trim-root-module.sh $(BUILD_DIR)/root.ext4 $(ROOT_MODULE) $(ROOT_MODULE_SIZE),)
 	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
-	    $(if $(or $(SMOKE_ROOT_MODULE),$(filter iso-blk iso-switchroot,$@)),--module $(BUILD_DIR)/root.ext4:rootfs.img,)
+	    $(if $(SMOKE_ROOT_MODULE),--module $(BUILD_DIR)/root.ext4:rootfs.img,$(if $(filter iso-blk iso-switchroot,$@),--module $(ROOT_MODULE):rootfs.img,))
 
 # Display bring-up instance: the kernel and nothing else.
 #
@@ -2421,7 +2440,21 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@# again is what the two steps did between them, ninety-seven libraries at a
 	@# time, on every build; the image came out identical either way, but the
 	@# staging tree looked changed and was repacked for it.
-	@for so in build/$(ARCH)/pkg/*/lib/lib*.so.*; do \
+	@# Skipped whole when no packaged library has changed since last time.
+	@#
+	@# The loop below spawns readelf once per library to read its SONAME, and
+	@# there are about a hundred of them: measured on aarch64, seventeen
+	@# seconds of a twenty-eight second no-op build, spent every single time to
+	@# re-derive an answer that only changes when a package does. The stamp
+	@# lives under BUILD_DIR, so a wiped build tree loses it too and the work is
+	@# redone; and if the destination is missing the skip does not apply.
+	@stamp="$(BUILD_DIR)/.pkg-libs.stamp"; \
+	newest=$$(ls -t build/$(ARCH)/pkg/*/lib/lib*.so.* 2>/dev/null | head -1); \
+	if [ -n "$$newest" ] && [ -f "$$stamp" ] && [ -d "$(BUILD_DIR)/rootfs/lib" ] && \
+	   [ ! "$$newest" -nt "$$stamp" ]; then \
+		exit 0; \
+	fi; \
+	for so in build/$(ARCH)/pkg/*/lib/lib*.so.*; do \
 		if [ -f "$$so" ] && ! [ -L "$$so" ]; then \
 			soname=$$($(READELF) -d "$$so" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//'); \
 			versioned=1; \
@@ -2437,7 +2470,8 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 				$(CIC) "$$so" "$(BUILD_DIR)/rootfs/lib/$$soname"; \
 			fi; \
 		fi; \
-	done
+	done; \
+	touch "$$stamp"
 	@# Mesa is Alpine's (mesa-egl/-gles/-gbm/-gl/-glapi, tools/packages/
 	@# alpine-ports.map), so it arrives through $(PKGROOT) with everything else
 	@# on the image — there is no Mesa staging of its own here any more.
@@ -2561,13 +2595,23 @@ ifdef LIBC_SO
 	done
 endif
 	@# Create SONAME hard copies for any .so.N.M files in rootfs/lib
-	@for f in $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.*; do \
+	@# Same skip as the packaged-library loop above, for the same reason: a
+	@# readelf spawn per file, several hundred files, an answer that changes
+	@# only when the staged libraries do. One convention, applied everywhere it
+	@# applies -- see docs/build-conventions.md.
+	@stamp="$(BUILD_DIR)/.soname-copies.stamp"; \
+	newest=$$(ls -t $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.* 2>/dev/null | head -1); \
+	if [ -n "$$newest" ] && [ -f "$$stamp" ] && [ ! "$$newest" -nt "$$stamp" ]; then \
+		exit 0; \
+	fi; \
+	for f in $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.*; do \
 		[ -f "$$f" ] || continue; \
 		soname=$$($(READELF) -d "$$f" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//'); \
 		if [ -n "$$soname" ] && ! [ -e "$(BUILD_DIR)/rootfs/lib/$$soname" ]; then \
 			$(CIC) "$$f" "$(BUILD_DIR)/rootfs/lib/$$soname"; \
 		fi; \
-	done
+	done; \
+	touch "$$stamp"
 	@# Every program on the image that is not ours and not part of how it boots:
 	@# zsh, curl, dropbear, bmake and samurai, all Alpine packages. Unpacked with
 	@# their own paths — a program looks for its files where it was compiled to
@@ -2696,7 +2740,16 @@ endif
 	@# the file then leaves the link pointing at nothing — which the loader
 	@# reports as a library full of missing symbols rather than as an absent
 	@# file, and cost an afternoon on Alpine's libcurl.
-	@for f in $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.*; do \
+	@# Same skip as the packaged-library loop above, for the same reason: a
+	@# readelf spawn per file, several hundred files, an answer that changes
+	@# only when the staged libraries do. One convention, applied everywhere it
+	@# applies -- see docs/build-conventions.md.
+	@stamp="$(BUILD_DIR)/.soname-prune.stamp"; \
+	newest=$$(ls -t $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.* 2>/dev/null | head -1); \
+	if [ -n "$$newest" ] && [ -f "$$stamp" ] && [ ! "$$newest" -nt "$$stamp" ]; then \
+		exit 0; \
+	fi; \
+	for f in $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.*; do \
 		[ -f "$$f" ] || continue; \
 		soname=$$($(READELF) -d "$$f" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//'); \
 		if [ -n "$$soname" ] && [ "$$soname" != "$$(basename $$f)" ] && \
@@ -2704,7 +2757,8 @@ endif
 		   ! [ -L "$(BUILD_DIR)/rootfs/lib/$$soname" ]; then \
 			rm -f "$$f"; \
 		fi; \
-	done
+	done; \
+	touch "$$stamp"
 	@# The ext4 driver does not follow a symlink, so a .so link is a name the
 	@# image does not have. Replace it with a copy of what it pointed at rather
 	@# than deleting it: Alpine's nss is staged as libnss3.so -> libnss3.so.105

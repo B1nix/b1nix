@@ -332,6 +332,15 @@ run_qemu() {
 			local lane="${B1NIX_ISO_NAME:-b1nix.iso}"
 			lane="${lane#b1nix-}"; lane="${lane%.iso}"
 			[ "$lane" = "b1nix" ] && lane="sys"
+			# A lane that shares another lane's image says so explicitly --
+			# rule 2 in docs/build-conventions.md. The
+			# name is otherwise derived from B1NIX_ISO_NAME, which is fine while
+			# every lane has its own image -- sysnet does not: it is the same
+			# system as sys, told to run a different half of the tests. Without
+			# this it silently became a second sys lane, and the network checks
+			# it was supposed to run were then run by nobody: 91 failures, all
+			# of them missing markers.
+			[ -n "${SMOKE_LANE:-}" ] && lane="$SMOKE_LANE"
 			# Same strings the Makefile bakes into each iso-<lane> (see
 			# SMOKE_CMDLINE_*): no `init=` on the ordinary lanes, so PID 1 is
 			# the default /sbin/init (BusyBox init) with /etc/inittab driving
@@ -468,6 +477,32 @@ run_qemu() {
 				-device virtio-blk-device,drive=vblk0 \
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-off} \
 				-device virtio-net-device,netdev=net0
+			# Swap, as the SECOND virtio disk.
+			#
+			# This arch had no swap device at all: the disk is handed over on
+			# the ATA or NVMe bus, and QEMU virt has neither, so every path
+			# behind swap_active() went untested here. The kernel now also
+			# takes the second virtio disk (kernel/mm/swap.c), and second is
+			# what this has to stay -- the first one is the root, and giving
+			# that to swap would overwrite the filesystem.
+			#
+			# Only when this lane has no AHCI disk. kernel/mm/swap.c takes the
+			# virtio disk exactly then -- where ATA exists it takes the second
+			# ATA disk, and the checks assert that name (`swap: device=sdb`).
+			# Handing the same file to both buses is not a second chance at
+			# swap: QEMU will not open one file for writing twice and refuses
+			# to start, reporting `Failed to get "write" lock / Is another
+			# process using the image?`. That reads like a stray QEMU from an
+			# earlier run rather than this same command line naming the file
+			# on two buses, and it killed every lane that got here -- the
+			# suite finished in 28s with ~1200 checks BLOCKED.
+			if [ -z "${AHCI_IMG:-}" ] || [ ! -f "${AHCI_IMG:-}" ]; then
+				if [ -n "${SWAP_IMG:-}" ] && [ -f "${SWAP_IMG:-}" ]; then
+					set -- "$@" \
+						-drive if=none,file="$SWAP_IMG",format=raw,id=vswap0 \
+						-device virtio-blk-device,drive=vswap0
+				fi
+			fi
 			# Straight onto the root complex, NOT behind pcie-root-ports:
 			# nothing assigns bus numbers to bridges on this board (no
 			# firmware runs before the kernel), so a device behind a bridge
@@ -678,6 +713,18 @@ run_qemu() {
 		kill -9 "$pid" 2>/dev/null || true
 		wait "$pid" 2>/dev/null || true
 
+		# Keep the evidence of a wedge. Lane logs are overwritten by the next
+		# run, and the interesting ones are rare: the blk-lane hang reproduces
+		# about once in nine runs, and its first two dumps were lost to exactly
+		# this before anyone thought to save them by hand. A panic is the only
+		# thing worth keeping, and since the watchdog stopped counting stolen
+		# time a panic means a real wedge rather than a busy host.
+		if grep -qa "KERNEL PANIC" "$log" 2>/dev/null; then
+			_keep="${log%.log}-wedge-$(date +%Y%m%d-%H%M%S).log"
+			cp "$log" "$_keep" 2>/dev/null &&
+				command echo "[smoke] wedge log kept: $_keep" >&2
+		fi
+
 		[ -s "$log" ] && break
 		[ "$_attempt" -ge 2 ] && break
 		_attempt=$((_attempt + 1))
@@ -782,8 +829,15 @@ else
 	QUICK_CMDLINE=""
 	[ "$SMOKE_QUICK" = "1" ] && QUICK_CMDLINE="b1nix.smoke=quick"
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
+		# iso-sysnet only where it is needed: see launch_sysnet. aarch64 boots
+		# the sys image with different bootargs and would repack forty
+		# megabytes for nothing.
+		SYSNET_ISO_TARGET=""
+		if [ "$ARCH" != "aarch64" ]; then
+			SYSNET_ISO_TARGET="iso-sysnet"
+		fi
 		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
-			iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
+			iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
 			>"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
@@ -795,7 +849,7 @@ else
 				cp -f "build/$ARCH/Image" "build/$ARCH/Image.rpi"
 			rm -f "build/$ARCH/kernel.elf" "build/$ARCH/Image"
 			make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
-				iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
+				iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
 				>>"$BUILD_LOG" 2>&1 || {
 				print_build_failure
 				exit 1
@@ -851,7 +905,24 @@ _mkimg() {  # mkimg <instance-suffix>
         dd if=/dev/zero of="$(disk_img vblk "$1")" bs=1M count=4 2>/dev/null
         rm -f "$_sata"
         if [ -f "$PROJECT_DIR/build/$ARCH/root.ext4" ]; then
-            cp -f "$PROJECT_DIR/build/$ARCH/root.ext4" "$_sata"
+            # Clone, do not copy. Every lane gets its own writable root, and
+            # that root is half a gigabyte -- ten lanes meant five gigabytes
+            # moved before a single instance booted, which is most of the gap
+            # between "iso ready" and the first lane starting. APFS (and Linux
+            # on btrfs/xfs) can give each lane a copy-on-write clone instead,
+            # which costs nothing until something writes. `cp -c` fails on a
+            # filesystem that cannot do it, so fall back to the real copy.
+            cp -c "$PROJECT_DIR/build/$ARCH/root.ext4" "$_sata" 2>/dev/null ||
+                cp -f "$PROJECT_DIR/build/$ARCH/root.ext4" "$_sata"
+            # Stamp it with THIS run's time. A clone carries the source's
+            # mtime, and the prune below deletes anything in smoke_run older
+            # than an hour -- so once the build stopped rebuilding root.ext4
+            # every run (the stamps in the Makefile), the clone inherited an
+            # mtime from hours ago and was deleted before QEMU could open it.
+            # Every lane then died with "Could not open ... No such file or
+            # directory", 1343 checks BLOCKED, in under thirty seconds --
+            # from two separate changes that were each correct alone.
+            touch "$_sata"
         else
             "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q \
                 -L b1nix-root -d "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512m || {
@@ -899,13 +970,14 @@ _mkimg() {  # mkimg <instance-suffix>
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
-    _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg smp; _mkimg switchroot
+    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg smp; _mkimg switchroot
 }
 
 # Define logs
 LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-$ARCH.log"
 SMP_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-smp-$ARCH.log"
 SYS_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-sys-$ARCH.log"
+SYSNET_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-sysnet-$ARCH.log"
 BLK_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-blk-$ARCH.log"
 POSIX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-posix-$ARCH.log"
 GFX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-gfx-$ARCH.log"
@@ -941,8 +1013,9 @@ fi
 # and three consecutive "runs" reported the same numbers off the same stale
 # files. An empty log makes the checks report missing markers, which is the
 # truth.
-for _l in "$LOG" "$SMP_LOG" "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" \
-          "$OPENRC_LOG" "$INIT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$RASPI_LOG"; do
+for _l in "$LOG" "$SMP_LOG" "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" \
+          "$GFX_LOG" "$OPENRC_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" \
+          "$AMDVI_LOG" "$RASPI_LOG"; do
 	: > "$_l" 2>/dev/null || true
 done
 
@@ -1033,6 +1106,36 @@ launch_sys() {
 		run_qemu "$SYS_LOG"
 	) &
 	pid_sys=$!
+}
+
+# The network half of the old `sys` lane. Same machine, same networking; the
+# only difference is which tests the guest driver runs (b1nix.smoke=sysnet).
+launch_sysnet() {
+	(
+		[ "$ARCH" = "aarch64" ] && SMOKE_SMP=2
+		SATA_IMG=$(disk_img sata sysnet)
+		AHCI_IMG=$(disk_img ahci sysnet)
+		NVME_IMG=$(disk_img nvme sysnet)
+		SWAP_IMG=$(disk_img swap sysnet)
+		# Its own image on x86_64, the sys image on aarch64.
+		#
+		# The lane differs from sys only in which half of the tests the guest
+		# runs, and that comes from the kernel cmdline. aarch64 passes the
+		# cmdline as DTB bootargs at launch, so one image serves both; x86_64
+		# takes it from the ISO's bootloader config, where nothing at launch
+		# can reach it — booting the sys image here ran the sys half twice and
+		# left the 91 network checks to nobody.
+		if [ "$ARCH" = "aarch64" ]; then
+			B1NIX_ISO_NAME=b1nix-sys.iso
+		else
+			B1NIX_ISO_NAME=b1nix-sysnet.iso
+		fi
+		SMOKE_LANE=sysnet
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[sysnet]"
+		run_qemu "$SYSNET_LOG"
+	) &
+	pid_sysnet=$!
 }
 
 launch_blk() {
@@ -1407,9 +1510,27 @@ run_slot_pool() {
 }
 
 if [ "$SMOKE_PARALLEL" = "1" ]; then
+	# Three, because four is not faster -- not because four breaks.
+	#
+	# It did break, once: 232 s with 90 checks BLOCKED and two lanes panicking
+	# "deadlock or hang detected". That turned out to be the GUEST's own
+	# silence watchdog measuring wall time, so a starved-but-healthy machine
+	# accused itself of a deadlock. The watchdog now discounts the time the
+	# host did not give it (see serial_silence_watchdog), and four lanes come
+	# out at 114 s and 1385/0/0 -- against 112 s at three.
+	#
+	# So the host really is saturated at three and there is nothing to win by
+	# going wider; it simply no longer costs correctness to try.
 	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
-	_inst_list="sys blk posix gfx openrc init switchroot iommu amdvi"
+	# Longest first, measured by WALL time rather than by the guest clock.
+	#
+	# The pool is only ever as short as its worst tail, and the two lanes that
+	# carry the root filesystem as a boot module spend most of their wall clock
+	# in the bootloader, before the guest clock starts: switchroot does 4 s of
+	# work and takes 37 s. Ordered by guest time they started last and the whole
+	# suite ended when they did.
+	_inst_list="switchroot blk sysnet posix sys gfx iommu init amdvi openrc"
 	# The Raspberry Pi lane is off by default, and not because it is broken.
 	#
 	# It is the one instance no accelerator can take: HVF needs -cpu host and
@@ -1438,14 +1559,14 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	if [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMOKE_INSTANCES " | grep -q " smp "; then
 		_ran_list="$_ran_list smp"
 	fi
-	for _known in sys blk posix gfx openrc init switchroot iommu amdvi raspi smp; do
+	for _known in sys sysnet blk posix gfx openrc init switchroot iommu amdvi raspi smp; do
 		case " $_ran_list " in
 		*" $_known "*) continue ;;
 		esac
 		rm -f "$PROJECT_DIR/smoke_run/b1nix-smoke-$_known-$ARCH.log"
 	done
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
-	cat "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$OPENRC_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$RASPI_LOG" 2>/dev/null >"$LOG" || true
+	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$OPENRC_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$RASPI_LOG" 2>/dev/null >"$LOG" || true
 else
 	launch_sys
 	launch_smp_solo

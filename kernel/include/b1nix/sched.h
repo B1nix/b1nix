@@ -250,6 +250,14 @@ struct task {
   u64 kernel_stack_ptr;
   u64 saved_user_rsp;
   u64 wake_tick;
+  /* Were interrupts on when this task armed its wait?
+   *
+   * scheduler_wait_commit parks the CPU when nothing else can run, and parking
+   * means enabling interrupts. That is only safe if the caller had them on
+   * before arming: a caller inside an interrupt-disabling lock would otherwise
+   * sit halted with interrupts open while a handler spins on the lock it still
+   * holds — silence, and the hang watchdog reporting it sixty seconds later. */
+  int wait_irq_was_on;
   void *wait_chan;
   int stdout_fd;
   struct vfs_handle **fd_table;
@@ -640,6 +648,15 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks);
  * the interrupt controller for, so both are things to read rather than assume.
  * sched_tick_hz() returns what the timer was armed with. */
 u32 sched_tick_hz(void);
+/* Tell the scheduler a wake_tick deadline was armed. MUST be called by every
+ * site that assigns task->wake_tick a future tick. */
+void sched_note_deadline(u64 tick);
+/* sigtimedwait(): declare/withdraw the set this task is parked for, so posting
+ * one of those signals can wake it instead of leaving it to poll. */
+void sched_sigwait_arm(u64 set);
+void sched_sigwait_disarm(void);
+/* Earliest armed deadline (a lower bound), or 0 when nobody is waiting. */
+u64 sched_next_deadline_tick(void);
 #define SCHED_TICKS_PER_SEC ((u64)sched_tick_hz())
 /* Milliseconds to ticks, rounded up so a wait is never shorter than asked.
  * Every "sleep N ticks" that means a duration has to go through this: written
@@ -707,6 +724,10 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options);
 usize scheduler_task_count(void);
 void scheduler_dump_tasks(void);
 void scheduler_lease_clear_here(const char *site);
+/* Idle-time attribution, under b1nix.waitprof. See sched_waitprof_idle_tick. */
+void sched_waitprof_tick(int in_idle);
+void sched_waitprof_wake(struct task *t);
+void sched_waitprof_dump(void);
 /* M34: read-only task-table introspection for procfs / ps / top. */
 usize scheduler_task_slots(void);
 /* The running task's index in that table, and the table's fixed upper bound.

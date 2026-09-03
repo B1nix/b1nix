@@ -61,6 +61,10 @@ static struct work_struct *wq_dequeue(struct workqueue_struct *wq)
 	return w;
 }
 
+/* A queue with nothing delayed still wakes this often, so a wake that went
+ * missing costs a fraction of a second rather than the machine. */
+#define WQ_IDLE_MAX_TICKS 20
+
 /* Move every delayed item whose deadline has passed onto the run queue. */
 static void wq_arm_due(struct workqueue_struct *wq)
 {
@@ -100,6 +104,39 @@ static void wq_arm_due(struct workqueue_struct *wq)
 	}
 }
 
+/* How long this thread may sleep with nothing to run.
+ *
+ * It used to be one tick, unconditionally, which made this thread a second
+ * 100 Hz heartbeat: measured on the aarch64 sys lane, once net_task stopped
+ * waking the machine every tick, lkpi-events took over and ended 1,832 idle
+ * stretches of exactly one tick each. A timer that fires only to discover it
+ * has nothing to do is the thing dynamic ticks exist to remove.
+ *
+ * So sleep until the earliest delayed item is actually due. Queued work does
+ * not come through here at all -- queue_work wakes this thread -- so the
+ * timeout is only ever about the delayed list. Capped, because a queue with no
+ * delayed work at all should still come back occasionally rather than park for
+ * ever on a wake it might miss. */
+static u64 wq_idle_timeout(struct workqueue_struct *wq)
+{
+	u64 now = scheduler_get_ticks();
+	u64 best = 0;
+	u64 flags;
+
+	spin_lock_irqsave((spinlock_t *)&wq->lock, &flags);
+	for (struct delayed_work *d = wq->delayed; d; d = d->next) {
+		u64 wait = d->due_tick > now ? d->due_tick - now : 1;
+
+		if (!best || wait < best)
+			best = wait;
+	}
+	spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
+
+	if (!best || best > WQ_IDLE_MAX_TICKS)
+		best = WQ_IDLE_MAX_TICKS;
+	return best;
+}
+
 static void workqueue_thread(void *arg)
 {
 	struct workqueue_struct *wq = arg;
@@ -124,7 +161,7 @@ static void workqueue_thread(void *arg)
 			 * deadline was far enough out, as the watchdog calling the
 			 * instance deadlocked. The timeout already services delayed
 			 * items; sleeping through it is the point. */
-			scheduler_wait_prepare_timeout(wq, 1);
+			scheduler_wait_prepare_timeout(wq, wq_idle_timeout(wq));
 			if (wq->head || wq->stop)
 				scheduler_wait_cancel();
 			else

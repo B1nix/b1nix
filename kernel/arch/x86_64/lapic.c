@@ -1,3 +1,4 @@
+#include <b1nix/bootinfo.h>
 #include <b1nix/arch.h>
 #include <b1nix/lapic.h>
 #include <b1nix/console.h>
@@ -116,6 +117,97 @@ int lapic_timer_start_periodic_ms(u32 ms) {
 
     g_lapic_timer_periodic_active = 1;
     return 1;
+}
+
+/* One-shot scheduler tick: program the next interrupt for the next deadline
+ * anybody actually has, instead of a fixed period.
+ *
+ * The mirror of the aarch64 path (kernel/arch/aarch64/interrupts.c). Here the
+ * LAPIC timer is the periodic source and the LVT already knows the mode, so
+ * this only swaps LAPIC_LVT_PERIODIC for LAPIC_LVT_ONESHOT and reloads the
+ * count each tick. g_tick_period_ms is deliberately NOT touched: it records the
+ * nominal tick the rest of the kernel converts time with, not whatever delay
+ * this particular interrupt was programmed for.
+ *
+ * Safe to skip interrupts because scheduler_ticks follows the monotonic clock
+ * rather than counting them (see scheduler_on_timer_tick): a tick that never
+ * arrives is not time lost, it is time the next tick catches up on.
+ *
+ * `b1nix.dynticks[=<max-idle-ticks>]`, default OFF -- and off for a reason that
+ * is not x86-specific. On aarch64 it was on for exactly one commit: two full
+ * suites passed and both were lying, because a test thread polling every two
+ * ticks kept the timer programmed often enough to hide the cost. With that
+ * poller fixed, six checks failed reproducibly, all of them signal latency. The
+ * precondition is that a task asleep on a deadline is woken when a signal is
+ * POSTED, through this kernel's existing interrupt policy rather than around
+ * it. Until that holds, this is a measurement tool, not a default. */
+static u64 lapic_dynticks_cap(void)
+{
+    static u64 cap = ~0ull;
+
+    if (cap == ~0ull) {
+        char buf[24];
+
+        cap = 0;
+        if (bootinfo_has_flag("b1nix.dynticks"))
+            cap = 10;
+        if (bootinfo_get_kv("b1nix.dynticks", buf, sizeof(buf)) == 0) {
+            u64 v = 0;
+            const char *c = buf;
+
+            while (*c >= '0' && *c <= '9')
+                v = v * 10 + (u64)(*c++ - '0');
+            if (v)
+                cap = v;
+        }
+    }
+    return cap;
+}
+
+void lapic_timer_rearm(void)
+{
+    u64 cap = lapic_dynticks_cap();
+    u32 tpms;
+    u64 count;
+
+    if (!cap || !g_lapic_timer_periodic_active || !g_tick_period_ms)
+        return;
+
+    tpms = lapic_ticks_per_ms();
+    if (!tpms)
+        return;
+
+    {
+        u64 next = sched_next_deadline_tick();
+        u64 now = scheduler_get_ticks();
+        u64 skip = cap;
+        int capped = 1;
+
+        if (next > now && next - now < skip) {
+            skip = next - now;
+            capped = 0;
+        }
+        if (!skip)
+            skip = 1;
+        /* Jitter the idle interval, and only the idle one: a sampling instant
+         * on a fixed grid aliases against periodic work, which is why BSD runs
+         * statclock at a frequency not commensurate with hz. Never moves a real
+         * deadline. */
+        if (capped && skip > 2) {
+            static u64 seed = 0x9e3779b97f4a7c15ull;
+
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            skip -= seed % (skip / 2);
+        }
+        count = (u64)tpms * (u64)g_tick_period_ms * skip;
+    }
+    if (!count || count > 0xFFFFFFFFULL)
+        return; /* leave the timer as it is rather than program a bogus count */
+
+    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LAPIC_LVT_ONESHOT);
+    lapic_write(LAPIC_TIMER_INITCNT, (u32)count);
 }
 
 int lapic_timer_periodic_active(void) { return g_lapic_timer_periodic_active; }
@@ -491,6 +583,9 @@ void ap_main(u32 cpu_id) {
     for (;;) {
         int switched = scheduler_yield();
         if (!switched) {
+            extern u64 g_idle_halts;
+
+            g_idle_halts++;
             __asm__ volatile("sti; hlt" : : : "memory");
         }
     }

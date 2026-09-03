@@ -137,6 +137,38 @@ static volatile u64 vblk_irq_foreign;
  * is worth making once the wait is clearly not ordinary latency, and worth
  * making only a handful of times. */
 static volatile u64 vblk_stall_reports;
+/* Spin budgets, in nanoseconds, from `b1nix.vblk-spin-us=<read>[,<write>]`. */
+static u64 vblk_spin_ns(int is_read) {
+  static u64 read_ns = ~0ull, write_ns = ~0ull;
+
+  if (read_ns == ~0ull) {
+    char buf[32];
+    u64 r = 1000000ull, w = 15000ull;
+
+    if (bootinfo_get_kv("b1nix.vblk-spin-us", buf, sizeof(buf)) == 0) {
+      const char *p = buf;
+      u64 v = 0;
+
+      while (*p >= '0' && *p <= '9')
+        v = v * 10 + (u64)(*p++ - '0');
+      r = v * 1000ull;
+      if (*p == ',') {
+        p++;
+        v = 0;
+        while (*p >= '0' && *p <= '9')
+          v = v * 10 + (u64)(*p++ - '0');
+        w = v * 1000ull;
+      }
+    }
+    write_ns = w;
+    read_ns = r;
+  }
+  return is_read ? read_ns : write_ns;
+}
+
+static u64 vblk_read_spin_ns(void) { return vblk_spin_ns(1); }
+static u64 vblk_write_spin_ns(void) { return vblk_spin_ns(0); }
+
 #define VIRTIO_BLK_STALL_REPORT_TICKS 200 /* 2 s at 10 ms a tick */
 #define VIRTIO_BLK_STALL_REPORT_MAX   8
 
@@ -336,7 +368,16 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
    * flush, which is nobody's critical path and whose long spin made fdatasync
    * markedly worse. */
   {
-    u64 budget_ns = (type == VIRTIO_BLK_T_IN) ? 1000000ull : 15000ull;
+    /* `b1nix.vblk-spin-us=<read>[,<write>]` overrides both budgets.
+     *
+     * The spin is not free: it is the single largest consumer of kernel CPU in
+     * the aarch64 sys lane (54% of all kernel-mode samples land in this
+     * function), and on a host running three QEMU instances at once that is
+     * host CPU taken from the other two. Whether trading it back for one
+     * scheduler sleep is a win depends on the host, so it is measurable
+     * instead of fixed. */
+    u64 budget_ns = (type == VIRTIO_BLK_T_IN) ? vblk_read_spin_ns()
+                                              : vblk_write_spin_ns();
     u64 spin_start = arch_tsc_monotonic_ns();
 
     for (;;) {

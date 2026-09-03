@@ -219,6 +219,8 @@ int lapic_timer_start_periodic_ms(u32 ms);
 /* Non-zero once any CPU has armed the periodic LAPIC timer. main.c uses this
  * to decide whether it can safely mask PIT IRQ0 (the previous tick source). */
 int lapic_timer_periodic_active(void);
+/* Re-arm the tick for the next real deadline (b1nix.dynticks). No-op when off. */
+void lapic_timer_rearm(void);
 u32 lapic_read(u32 reg);
 void lapic_write(u32 reg, u32 val);
 u32 lapic_id(void);

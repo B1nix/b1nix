@@ -321,6 +321,17 @@ static struct block_device *swap_find_dedicated_disk(void)
     struct block_device *dev = blk_nth_on_bus(BLK_BUS_ATA, SWAP_DISK_INDEX);
     if (!dev)
         dev = blk_nth_on_bus(BLK_BUS_NVME, SWAP_DISK_INDEX);
+    /* virtio, but only on a machine that has no ATA and no NVMe disk AT ALL.
+     *
+     * QEMU virt is such a machine: every disk arrives over virtio-mmio, so
+     * there was no way to give that board a swap disk and every path behind
+     * swap_active() went untested on it. The condition is "no such disk
+     * anywhere" rather than "no second one" on purpose — where those buses do
+     * exist, the second virtio disk is a scratch disk something else owns, and
+     * handing it to swap would overwrite a filesystem under its user. The
+     * first virtio disk is skipped for the same reason: it is the root. */
+    if (!dev && !blk_nth_on_bus(BLK_BUS_ATA, 0) && !blk_nth_on_bus(BLK_BUS_NVME, 0))
+        dev = blk_nth_on_bus(BLK_BUS_VIRTIO, SWAP_DISK_INDEX);
     return dev;
 }
 

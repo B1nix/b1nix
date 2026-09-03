@@ -1049,6 +1049,7 @@ int vfs_epoll_wait(int epfd, struct b1nix_epoll_event *events, int maxevents,
   if (timeout > 0) {
     u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
     current_task->wake_tick = start_ticks + ticks;
+    sched_note_deadline(current_task->wake_tick);
   }
 
   while (1) {
