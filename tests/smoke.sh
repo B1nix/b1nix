@@ -803,8 +803,15 @@ else
 	QUICK_CMDLINE=""
 	[ "$SMOKE_QUICK" = "1" ] && QUICK_CMDLINE="b1nix.smoke=quick"
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
+		# iso-sysnet only where it is needed: see launch_sysnet. aarch64 boots
+		# the sys image with different bootargs and would repack forty
+		# megabytes for nothing.
+		SYSNET_ISO_TARGET=""
+		if [ "$ARCH" != "aarch64" ]; then
+			SYSNET_ISO_TARGET="iso-sysnet"
+		fi
 		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
-			iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
+			iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
 			>"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
@@ -816,7 +823,7 @@ else
 				cp -f "build/$ARCH/Image" "build/$ARCH/Image.rpi"
 			rm -f "build/$ARCH/kernel.elf" "build/$ARCH/Image"
 			make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
-				iso-sys iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
+				iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
 				>>"$BUILD_LOG" 2>&1 || {
 				print_build_failure
 				exit 1
@@ -1074,7 +1081,19 @@ launch_sysnet() {
 		AHCI_IMG=$(disk_img ahci sysnet)
 		NVME_IMG=$(disk_img nvme sysnet)
 		SWAP_IMG=$(disk_img swap sysnet)
-		B1NIX_ISO_NAME=b1nix-sys.iso
+		# Its own image on x86_64, the sys image on aarch64.
+		#
+		# The lane differs from sys only in which half of the tests the guest
+		# runs, and that comes from the kernel cmdline. aarch64 passes the
+		# cmdline as DTB bootargs at launch, so one image serves both; x86_64
+		# takes it from the ISO's bootloader config, where nothing at launch
+		# can reach it — booting the sys image here ran the sys half twice and
+		# left the 91 network checks to nobody.
+		if [ "$ARCH" = "aarch64" ]; then
+			B1NIX_ISO_NAME=b1nix-sys.iso
+		else
+			B1NIX_ISO_NAME=b1nix-sysnet.iso
+		fi
 		SMOKE_LANE=sysnet
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[sysnet]"

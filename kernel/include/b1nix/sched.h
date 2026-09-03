@@ -250,6 +250,14 @@ struct task {
   u64 kernel_stack_ptr;
   u64 saved_user_rsp;
   u64 wake_tick;
+  /* Were interrupts on when this task armed its wait?
+   *
+   * scheduler_wait_commit parks the CPU when nothing else can run, and parking
+   * means enabling interrupts. That is only safe if the caller had them on
+   * before arming: a caller inside an interrupt-disabling lock would otherwise
+   * sit halted with interrupts open while a handler spins on the lock it still
+   * holds — silence, and the hang watchdog reporting it sixty seconds later. */
+  int wait_irq_was_on;
   void *wait_chan;
   int stdout_fd;
   struct vfs_handle **fd_table;

@@ -1077,7 +1077,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 print-%:
 	@echo '$($*)'
 
-.PHONY: all analyze objects FORCE iso iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot iso-live iso-test iso-full check-dynamic iso-pass-chromium-disk iso-pass-chromium-disk-impl \
+.PHONY: all analyze objects FORCE iso iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot iso-live iso-test iso-full check-dynamic iso-pass-chromium-disk iso-pass-chromium-disk-impl \
 	iso-chromium-min-disk iso-chromium-min-disk-impl \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
@@ -1844,6 +1844,15 @@ iso: check-b1cc-sync root-image check-dynamic $(KERNEL_ELF)
 SMOKE_EXTRA_CMDLINE ?=
 
 SMOKE_CMDLINE_sys=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=sys
+# The network half of the sys lane. Same system, same image contents; the only
+# difference is which tests the guest driver runs — and on x86_64 that choice
+# has to be baked into an image of its own, because the cmdline comes from the
+# ISO's bootloader config and nothing at launch can override it. aarch64 passes
+# it as DTB bootargs and needs no second image; giving the lane one here is what
+# makes rule 2 of docs/build-conventions.md ("a lane names itself") true on
+# both arches. Without it the lane booted with b1nix.smoke=sys, ran the sys half
+# a second time, and the 91 network checks were run by nobody.
+SMOKE_CMDLINE_sysnet=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=sysnet
 SMOKE_CMDLINE_gfx=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=gfx
 SMOKE_CMDLINE_posix=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=posix
 # b1nix.mtd: probe for the CFI NOR chip. Only this instance is given one
@@ -1982,7 +1991,7 @@ iso-pass-chromium-disk-impl: root-image check-dynamic $(KERNEL_ELF)
 # the larger image costs build time and no wall-clock.
 SMOKE_ROOT_MODULE ?=
 
-iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
+iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
 	@# The stage directory is reused between builds, so a module staged by an
 	@# earlier one is still sitting in it and lands in the image whether this
 	@# build asked for it or not. That is how images meant to be forty

@@ -250,6 +250,41 @@ static u64 g_last_switch_tick;
  * only explicable if the picker keeps choosing something else -- and no dump so
  * far could say what it chose. */
 static u64 g_pick_calls, g_pick_rq, g_pick_scan, g_pick_idle, g_pick_null;
+/*
+ * How often an idle loop actually parked the CPU.
+ *
+ * Counted because "the picker ran 380 million times and found nothing" has two
+ * possible causes and the fix differs: either scheduler_yield reported a switch
+ * that did not happen, so the loop never reached its halt, or the halt returned
+ * at once because something keeps interrupting. The ratio of halts to picks
+ * says which.
+ */
+u64 g_idle_halts;
+
+/*
+ * Who keeps asking for a task when there is none.
+ *
+ * The picker running millions of times a second with nothing to hand out means
+ * some loop is calling yield and coming straight back. The loop is the bug, not
+ * the picker, and the only thing that names it is the return address of the
+ * caller — a spinning task's stack is otherwise identical on every sample.
+ * Four slots is enough: there is never a fourth spinner worth chasing.
+ */
+#define SCHED_YIELD_SITES 4
+static u64 g_yield_site_pc[SCHED_YIELD_SITES];
+static u64 g_yield_site_n[SCHED_YIELD_SITES];
+
+static void sched_note_empty_yield(u64 pc)
+{
+	for (int i = 0; i < SCHED_YIELD_SITES; i++) {
+		if (g_yield_site_pc[i] == pc) { g_yield_site_n[i]++; return; }
+		if (g_yield_site_pc[i] == 0) {
+			g_yield_site_pc[i] = pc;
+			g_yield_site_n[i] = 1;
+			return;
+		}
+	}
+}
 static u64 g_scan_seen, g_scan_rej_lease, g_scan_rej_running, g_scan_rej_cas;
 static usize g_scan_best_id = (usize)-1;
 static usize g_last_pick_id = (usize)-1;
@@ -4219,6 +4254,7 @@ void scheduler_reap_orphan_zombies(void) {
 
 
 int scheduler_yield(void) {
+  const u64 yield_caller_pc = (u64)(usize)__builtin_return_address(0);
   /* An interrupt handler may yield and resume later on this same C frame.
    * IRQ entry is masked, and enabling interrupts before the handler's
    * RESTORE_REGS/eret lets the next timer interrupt nest on top of that live
@@ -4289,6 +4325,7 @@ int scheduler_yield(void) {
 
     if (restore_irqs)
       interrupts_enable();
+    sched_note_empty_yield(yield_caller_pc);
     return 0; /* nothing runnable — caller's idle loop may drop the BKL */
   }
 
@@ -4984,17 +5021,48 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks) {
  * barrier) or (b) observes our BLOCKED state and wakes us. Interrupts stay
  * disabled between prepare and commit/cancel. */
 void scheduler_wait_prepare(void *chan) {
+  int irq_was_on = interrupts_enabled();
+
   interrupts_disable();
   if (current_task == 0)
     panic("scheduler_wait_prepare without running task");
   current_task->wait_chan = chan;
+  current_task->wait_irq_was_on = irq_was_on;
   task_lease_clear(current_task, __func__);
   __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
 void scheduler_wait_commit(void) {
-  scheduler_yield();
+  int switched = scheduler_yield();
+
+  /*
+   * Park the CPU when the yield had nowhere to go.
+   *
+   * A task that arms a wait and commits it expects to stop running. When some
+   * other task is runnable that happens by switching to it; when none is, the
+   * yield reclaims RUNNING and returns here at once — and every caller of this
+   * function is a loop that re-checks its condition and commits again. The
+   * result is a wait implemented as a spin: on x86_64 the `sys` lane burned
+   * 198,669,426 empty yields in 123 seconds, one whole CPU, while the thing it
+   * was waiting for was an interrupt.
+   *
+   * Halting is what waiting means here. The wake arrives as an interrupt — a
+   * device completion, an IPI from another CPU's wake, or the 1 kHz tick — so
+   * the halt cannot outlast a millisecond even if the wake is missed entirely,
+   * and the caller re-checks its condition the moment we return.
+   *
+   * Callers must not hold an interrupt-disabling lock across this: the
+   * `interrupts_enable()` below already required that, and the halt only makes
+   * the existing rule visible.
+   */
+  if (!switched && current_task && current_task->wait_irq_was_on) {
+#if defined(__x86_64__)
+    __asm__ volatile("sti; hlt" : : : "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("msr daifclr, #2; wfi" : : : "memory");
+#endif
+  }
   /* Drop any unfired deadline armed by scheduler_wait_prepare_timeout: an
    * explicit wake_all may have resumed us before it elapsed, and a stale
    * wake_tick would otherwise leak into a later untimed block (scheduler_block_on
@@ -5474,6 +5542,15 @@ static void serial_silence_watchdog(void) {
     console_write_dec(g_pick_idle);
     console_write(" none=");
     console_write_dec(g_pick_null);
+    console_write(" halts=");
+    console_write_dec(g_idle_halts);
+    for (int i = 0; i < SCHED_YIELD_SITES && g_yield_site_pc[i]; i++) {
+      console_write("\n  empty-yield from 0x");
+      console_write_hex64(g_yield_site_pc[i]);
+      ksym_print(g_yield_site_pc[i]);
+      console_write(" x");
+      console_write_dec(g_yield_site_n[i]);
+    }
     console_write(" last=");
     console_write_dec((u64)g_last_pick_id);
     console_write("\n  scan seen=");

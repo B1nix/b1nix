@@ -583,6 +583,9 @@ void ap_main(u32 cpu_id) {
     for (;;) {
         int switched = scheduler_yield();
         if (!switched) {
+            extern u64 g_idle_halts;
+
+            g_idle_halts++;
             __asm__ volatile("sti; hlt" : : : "memory");
         }
     }
