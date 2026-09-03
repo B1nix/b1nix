@@ -707,6 +707,10 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options);
 usize scheduler_task_count(void);
 void scheduler_dump_tasks(void);
 void scheduler_lease_clear_here(const char *site);
+/* Idle-time attribution, under b1nix.waitprof. See sched_waitprof_idle_tick. */
+void sched_waitprof_tick(int in_idle);
+void sched_waitprof_wake(struct task *t);
+void sched_waitprof_dump(void);
 /* M34: read-only task-table introspection for procfs / ps / top. */
 usize scheduler_task_slots(void);
 /* The running task's index in that table, and the table's fixed upper bound.

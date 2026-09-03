@@ -966,6 +966,7 @@ static int r_b1nix_prof(usize pid, struct sbuf *s) {
     vfs_inode_wait_reset();
   }
   blk_cache_stats_dump();
+  sched_waitprof_dump();
   syscall_prof_reset();
   sb_puts(s, "profile written to console\n");
   return 0;

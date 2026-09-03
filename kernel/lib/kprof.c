@@ -20,6 +20,7 @@
  * The sample counter is printed unconditionally: a profile of zero must be
  * distinguishable from a probe that never ran.
  */
+#include <b1nix/sched.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/klog.h>
@@ -57,12 +58,23 @@ static int kprof_enabled(void) {
 
 /* Called from the vector-64 handler with interrupts off. Must be cheap: it
  * runs on every core at every tick. */
+static int waitprof_enabled(void) {
+  static int on = -1;
+
+  if (on < 0)
+    on = bootinfo_has_flag("b1nix.waitprof") ? 1 : 0;
+  return on;
+}
+
 void kprof_tick(u64 rip, int in_user, int in_idle, int cpu) {
   int mode = in_user ? 0 : (in_idle ? 2 : 1);
 
   if (cpu >= 0 && cpu < KPROF_MAX_CPUS)
     __atomic_fetch_add(&g_tick_mode[cpu][mode], 1, __ATOMIC_RELAXED);
   __atomic_fetch_add(&g_tick_total, 1, __ATOMIC_RELAXED);
+
+  if (waitprof_enabled() && cpu == 0)
+    sched_waitprof_tick(mode == 2);
 
   if (mode != 1 || !kprof_enabled())
     return;

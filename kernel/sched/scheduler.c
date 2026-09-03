@@ -788,6 +788,107 @@ static struct task *g_task_fdlock_owner[TASK_SLOTS];
  * A task found READY with the lease still cleared and running on no CPU is
  * unschedulable forever; this names the code path that stranded it. */
 static const char *g_task_lease_site[TASK_SLOTS];
+
+/* What was the machine waiting for, when it was waiting?
+ *
+ * The aarch64 sys lane spends two thirds of its ticks in the idle task, so
+ * what limits it is waiting, not computing -- and the CPU profile cannot say
+ * what for.
+ *
+ * The first version of this asked "which timer is nearest" on each idle tick.
+ * That was the wrong question and gave a confidently wrong answer: net_task
+ * polls at 100 Hz, so its deadline is nearest almost always, and it collected
+ * 92% of the idle time while having nothing to do with what the lane was
+ * blocked on.
+ *
+ * So attribute causally instead. Count consecutive idle ticks, and when the
+ * machine stops being idle, charge that whole stretch to the task that is now
+ * running -- the one whose wake ended the wait. That names what the suite
+ * actually waits for. `b1nix.waitprof` turns it on. */
+#define WAITPROF_SLOTS 64
+/* Keyed by lease_site only. Keying by task->name was tried and is wrong: that
+ * pointer aims into the task's own argv/env pages, which are recycled, so the
+ * buckets filled up with fragments of somebody's environment. The site is a
+ * __func__ literal and stays put; a name is COPIED in for context. */
+static struct { const char *site; char name[16]; u64 ticks; u64 spans; }
+    g_waitprof[WAITPROF_SLOTS];
+static u64 g_waitprof_idle, g_waitprof_run;
+
+static void waitprof_charge(const char *name, const char *site, u64 ticks)
+{
+	for (usize k = 0; k < WAITPROF_SLOTS; k++) {
+		if (g_waitprof[k].site == site && g_waitprof[k].ticks) {
+			g_waitprof[k].ticks += ticks;
+			g_waitprof[k].spans++;
+			return;
+		}
+		if (!g_waitprof[k].ticks) {
+			g_waitprof[k].site = site;
+			g_waitprof[k].ticks = ticks;
+			g_waitprof[k].spans = 1;
+			for (int c = 0; c < 15; c++) {
+				char ch = name ? name[c] : 0;
+
+				g_waitprof[k].name[c] = (ch >= 32 && ch < 127) ? ch : 0;
+				if (!ch)
+					break;
+			}
+			g_waitprof[k].name[15] = 0;
+			return;
+		}
+	}
+}
+
+/* The tick only decides WHETHER the machine is idle. Who ended the wait is
+ * charged from the wake itself (sched_waitprof_wake), because a 100 Hz sampler
+ * cannot see it: net_task wakes, polls and sleeps again inside a single tick,
+ * so sampling caught it at the end of nearly every idle stretch and charged it
+ * 22 of the lane's 44 idle seconds it had nothing to do with. */
+void sched_waitprof_tick(int in_idle)
+{
+	if (in_idle) {
+		g_waitprof_idle++;
+		if (!g_waitprof_run)
+			g_waitprof_run = scheduler_ticks ? scheduler_ticks : 1;
+	}
+}
+
+/* A task just became runnable. If the machine was idle, this wake is what
+ * ended the wait, so the whole stretch belongs to it. */
+void sched_waitprof_wake(struct task *t)
+{
+	if (!g_waitprof_run || !t)
+		return;
+
+	u64 began = g_waitprof_run;
+
+	g_waitprof_run = 0;
+	if (scheduler_ticks > began)
+		waitprof_charge(t->name, g_task_lease_site[task_index(t)],
+		                scheduler_ticks - began);
+}
+
+void sched_waitprof_dump(void)
+{
+	if (!bootinfo_has_flag("b1nix.waitprof"))
+		return;
+	console_write("waitprof: idle-ticks ");
+	console_write_dec(g_waitprof_idle);
+	console_write(" (10 ms each), charged to the task whose wake ended each wait\n");
+	for (usize k = 0; k < WAITPROF_SLOTS; k++) {
+		if (!g_waitprof[k].ticks)
+			continue;
+		console_write("  waitprof ");
+		console_write_dec(g_waitprof[k].ticks);
+		console_write(" ticks over ");
+		console_write_dec(g_waitprof[k].spans);
+		console_write(" waits ");
+		console_write(g_waitprof[k].name[0] ? g_waitprof[k].name : "?");
+		console_write(" @");
+		console_write(g_waitprof[k].site ? g_waitprof[k].site : "-");
+		console_write("\n");
+	}
+}
 static usize task_index(const struct task *task);
 static inline void task_lease_clear(struct task *t, const char *site) {
   g_task_lease_site[task_index(t)] = site;
@@ -1674,6 +1775,8 @@ static int sched_wake_for_signal(struct task *t, int sig) {
 static void sched_wake_enqueue(struct task *t) {
   if (t) {
     usize i = task_index(t);
+
+    sched_waitprof_wake(t);
 
     if (g_task_pass[i] < g_min_pass)
       g_task_pass[i] = g_min_pass;
