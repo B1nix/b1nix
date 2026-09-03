@@ -1636,7 +1636,13 @@ static int ssh_start_server(const char *portspec) {
  * for a service that was merely slow, too long when the service was ready
  * immediately -- and every run pays the full second either way. Polling to the
  * same deadline fails no later than the sleep did and returns the moment the
- * file is there. */
+ * file is there.
+ *
+ * Be generous with the deadline. A bound is still a guess, and a guess that is
+ * too small is a flake: 2000 ms here was enough until the sys lane was split
+ * and sshd started under a different load, and then service-lifecycle failed
+ * about one run in ten. Waiting longer costs nothing when the file appears at
+ * once, which is the case this is written for. */
 static int wait_for_file(const char *path, int timeout_ms) {
   for (int waited = 0; waited < timeout_ms; waited += 50) {
     int fd = open(path, O_RDONLY);
@@ -1898,7 +1904,7 @@ static int test_sshd_service(void) {
   close(fd);
 
   /* 2. Since init ran it, check if pid file exists. */
-  wait_for_file("/var/run/sshd.pid", 2000);
+  wait_for_file("/var/run/sshd.pid", 10000);
   int pid_fd = open("/var/run/sshd.pid", O_RDONLY);
   if (pid_fd < 0) {
     emit("M32B-SSH: FAIL service-pid-missing\n");
@@ -1993,7 +1999,7 @@ static int test_sshd_service(void) {
     return -1;
   }
   
-  wait_for_file("/var/run/sshd.pid", 2000);
+  wait_for_file("/var/run/sshd.pid", 10000);
   pid_fd = open("/var/run/sshd.pid", O_RDONLY);
   if (pid_fd < 0) {
     emit("M32B-SSH: FAIL service-restart-pid-missing\n");

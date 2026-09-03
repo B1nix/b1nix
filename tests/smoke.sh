@@ -332,7 +332,8 @@ run_qemu() {
 			local lane="${B1NIX_ISO_NAME:-b1nix.iso}"
 			lane="${lane#b1nix-}"; lane="${lane%.iso}"
 			[ "$lane" = "b1nix" ] && lane="sys"
-			# A lane that shares another lane's image says so explicitly. The
+			# A lane that shares another lane's image says so explicitly --
+			# rule 2 in docs/build-conventions.md. The
 			# name is otherwise derived from B1NIX_ISO_NAME, which is fine while
 			# every lane has its own image -- sysnet does not: it is the same
 			# system as sys, told to run a different half of the tests. Without

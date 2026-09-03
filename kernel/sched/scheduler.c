@@ -5366,6 +5366,7 @@ static const char *task_state_name(enum task_state st) {
  * was simply getting a quarter of a core, so sixty seconds of wall clock held
  * fifteen seconds of guest.
  *
+ * Rule 3 in docs/build-conventions.md: nothing here bounds a wait in wall time.
  * Subtracting the stolen ticks keeps the check honest in both directions. A
  * machine that is genuinely wedged still takes its timer interrupts, still
  * accrues no steal, and is still caught on the same budget. A machine that is
