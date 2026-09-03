@@ -268,14 +268,18 @@ u64 g_idle_halts;
  * some loop is calling yield and coming straight back. The loop is the bug, not
  * the picker, and the only thing that names it is the return address of the
  * caller — a spinning task's stack is otherwise identical on every sample.
- * Four slots is enough: there is never a fourth spinner worth chasing.
+ * The slots hold the HOTTEST sites, not the first ones seen: filling them in
+ * arrival order recorded four sites that between them accounted for 98,000 of
+ * 190,000,000 empty yields and dropped the one that mattered.
  */
-#define SCHED_YIELD_SITES 4
+#define SCHED_YIELD_SITES 8
 static u64 g_yield_site_pc[SCHED_YIELD_SITES];
 static u64 g_yield_site_n[SCHED_YIELD_SITES];
 
 static void sched_note_empty_yield(u64 pc)
 {
+	int coldest = 0;
+
 	for (int i = 0; i < SCHED_YIELD_SITES; i++) {
 		if (g_yield_site_pc[i] == pc) { g_yield_site_n[i]++; return; }
 		if (g_yield_site_pc[i] == 0) {
@@ -283,7 +287,18 @@ static void sched_note_empty_yield(u64 pc)
 			g_yield_site_n[i] = 1;
 			return;
 		}
+		if (g_yield_site_n[i] < g_yield_site_n[coldest])
+			coldest = i;
 	}
+	/* Full: take over the least active slot. A site that is spinning wins it
+	 * back within microseconds, and one that fired twice at boot loses
+	 * nothing worth keeping. */
+	if (g_yield_site_n[coldest] > 1) {
+		g_yield_site_n[coldest]--;   /* decay, so a burst cannot evict a spinner */
+		return;
+	}
+	g_yield_site_pc[coldest] = pc;
+	g_yield_site_n[coldest] = 1;
 }
 static u64 g_scan_seen, g_scan_rej_lease, g_scan_rej_running, g_scan_rej_cas;
 static usize g_scan_best_id = (usize)-1;
