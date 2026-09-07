@@ -87,12 +87,15 @@ static unsigned g_drm_count;
  * the one a test that just brought a device up means. */
 static struct drm_device *g_dev;
 
+extern int drm_console_attach(struct drm_device *dev);
 void lkpi_drm_register_device(struct drm_device *dev, lkpi_drm_page_fn resolver)
 {
 	unsigned i;
 
 	if (!dev)
 		return;
+	/* The boot log onto this device's display, if nothing else draws one. */
+	(void)drm_console_attach(dev);
 	for (i = 0; i < g_drm_count; i++) {
 		if (g_drm[i].dev == dev) {
 			g_drm[i].resolver = resolver;

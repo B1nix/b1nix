@@ -21,7 +21,9 @@ struct module;
  * to reach a subsystem's init without editing the source it lives in, which is
  * the rule the whole import rests on.
  */
+#undef module_init /* defined by another shim header too; this copy is the one that took effect */
 #define module_init(fn) int lkpi_initcall_##fn(void) { return fn(); }
+#undef module_exit /* defined by another shim header too; this copy is the one that took effect */
 #define module_exit(fn) void lkpi_exitcall_##fn(void) { fn(); }
 #define module_param_named(name, var, type, perm) struct lkpi_mp_##name##_unused
 #define module_param_unsafe(name, type, perm) struct lkpi_mpu_##name##_unused

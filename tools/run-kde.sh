@@ -42,6 +42,9 @@ if [ "${KDE_ROOT:-disk}" = disk ]; then
 	STAGE=${STAGE%.iso}
 	[ "$STAGE" = "$DIR/build/x86_64/b1nix" ] && STAGE=$DIR/build/x86_64/iso
 	CMDLINE=$(sed -n 's/^ *cmdline: //p' "$STAGE/boot/limine/limine.conf" | head -1)
+	# KDE_CMDLINE replaces the whole line, so the KDE loop needs no ISO build
+	# at all: `B1NIX_KDE=1 make root-image` for the root and this for the boot.
+	[ -n "${KDE_CMDLINE:-}" ] && CMDLINE="$KDE_CMDLINE"
 	CMDLINE="$CMDLINE${KDE_EXTRA_CMDLINE:+ $KDE_EXTRA_CMDLINE}"
 	sh "$DIR/tools/images/mkiso.sh" --stage "$DIR/build/x86_64/kde-run-iso" \
 		--out "$DIR/build/x86_64/b1nix-kde-run.iso" --arch x86_64 \

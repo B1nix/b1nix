@@ -5,9 +5,6 @@
 #define __initdata
 #define __initconst
 #define __exitdata
-#define subsys_initcall(fn)   struct lkpi_initcall_subsys_unused
-#define late_initcall(fn)     struct lkpi_initcall_late_unused
-#define postcore_initcall(fn) struct lkpi_initcall_postcore_unused
 /*
  * Initcalls.
  *

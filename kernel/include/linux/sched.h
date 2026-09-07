@@ -95,6 +95,7 @@ static inline long schedule_timeout_killable(long timeout)
  * through the same log a caller would look at.
  */
 void lkpi_might_sleep(const char *where);
+#undef might_sleep /* defined by another shim header too; this copy is the one that took effect */
 #define might_sleep() lkpi_might_sleep(__func__)
 #define might_sleep_if(cond) do { if (cond) might_sleep(); } while (0)
 

@@ -868,7 +868,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
      * 45-column panel is most of what is on the screen. kprintf composes the
      * whole line before writing it, so the interleaving this used to avoid by
      * hand is still avoided. */
-    k_info("elf", "Linux personality detected: %s", path);
+    k_debug("elf", "Linux personality detected: %s", path);
   } else {
     image->personality = PERSONALITY_B1NIX;
   }
@@ -2112,6 +2112,21 @@ int user_spawn(const char *path, int argc, const char **argv) {
   return user_spawn_env(path, argc, argv, default_env);
 }
 
+/* The first bytes of a file, through the VFS.
+ *
+ * Not inode->read_cb: that is the filesystem's own read and sees the disk,
+ * and a file written a moment ago is in the page cache, not yet on the disk
+ * (writeback is deferred). A script a test had just created executed as
+ * empty that way, and exec fell through to the ELF loader. */
+static isize user_read_head_cached(const char *path, char *head, usize n) {
+  int fd = vfs_open(path);
+  if (fd < 0)
+    return 0;
+  isize got = vfs_read(fd, head, n);
+  vfs_close(fd);
+  return got < 0 ? 0 : got;
+}
+
 /* Read a `#!` interpreter line, if the file has one.
  *
  * Returns 1 and fills `interp` (and `opt`, empty when the line names no
@@ -2146,7 +2161,7 @@ static int user_read_shebang(const char *path, char *interp, usize interp_sz,
   char head[128];
   isize hn = 0;
   if (node->inode->read_cb) {
-    hn = node->inode->read_cb(node, 0, head, sizeof(head) - 1, 0);
+    hn = user_read_head_cached(path, head, sizeof(head) - 1);
   } else if (node->inode->data) {
     hn = node->inode->size < sizeof(head) - 1 ? (isize)node->inode->size
                                               : (isize)(sizeof(head) - 1);
@@ -2395,7 +2410,7 @@ resolve:
     char head[128];
     isize hn = 0;
     if (node->inode->read_cb) {
-      hn = node->inode->read_cb(node, 0, head, sizeof(head) - 1, 0);
+      hn = user_read_head_cached(path, head, sizeof(head) - 1);
     } else if (node->inode->data) {
       hn = node->inode->size < sizeof(head) - 1 ? (isize)node->inode->size
                                                 : (isize)(sizeof(head) - 1);

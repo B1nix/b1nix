@@ -7800,7 +7800,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
          * shared block above. */
         case LX_fchmodat2:
         case LX_fchmodat:
-          klog_info("audit: chmod called");
+          klog_debug("audit: chmod called");
           return (u64)vfs_chmod(resolved, (u16)arg2);
         case LX_fchownat:
           return (u64)vfs_chown(resolved, (u16)arg2, (u16)arg3);
@@ -9856,7 +9856,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_UMASK:
     return (u64)sys_umask((u16)arg0);
   case SYS_CHMOD:
-    klog_info("audit: chmod called");
+    klog_debug("audit: chmod called");
     return (u64)sys_chmod((const char *)(usize)arg0, (u16)arg1);
   case SYS_FCHMOD:
     return (u64)sys_fchmod((int)arg0, (u16)arg1);
@@ -9894,7 +9894,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)done;
   }
   case SYS_CHOWN:
-    klog_info("audit: chown called");
+    klog_debug("audit: chown called");
     return (u64)sys_chown((const char *)(usize)arg0, (u16)arg1, (u16)arg2);
   case SYS_FCHOWN:
     return (u64)sys_fchown((int)arg0, (u16)arg1, (u16)arg2);

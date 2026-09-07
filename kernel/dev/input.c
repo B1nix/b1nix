@@ -19,6 +19,12 @@
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/vfs.h>
+#include <b1nix/bootinfo.h>
+#include <b1nix/syscall.h>
+#include <b1nix/sysfs_attr.h>
+#include <b1nix/uevent.h>
+#include <b1nix/user.h>
+#include <stdio.h>
 #include <string.h>
 
 #define INPUT_MAX_CLIENTS 4
@@ -45,6 +51,115 @@ static struct input_device devs[INPUT_NDEVS] = {
   [INPUT_DEV_TOUCH] = {.name = "event2"},
 };
 static spinlock_t input_lock;
+
+/* ── The Linux evdev view of these devices ──────────────────────────────
+ *
+ * libinput, and udev's input_id builtin before it, see a device through
+ * three things: the sysfs capabilities/ files (what udev reads to say
+ * ID_INPUT_MOUSE or ID_INPUT_KEYBOARD), the EVIOCG* ioctls (what libinput
+ * asks the open descriptor), and 24-byte `struct input_event` records with a
+ * timeval in front. b1nix's own readers get the 16-byte native record; a task
+ * running under the Linux personality gets the Linux one. Nothing in the
+ * event source changes.
+ *
+ * The absolute pointer (virtio-tablet) is described the way QEMU's usb-tablet
+ * is on Linux: ABS_X/ABS_Y plus BTN_LEFT/RIGHT/MIDDLE and no BTN_TOUCH, which
+ * udev classifies as ID_INPUT_MOUSE and libinput drives as a pointer with
+ * absolute coordinates. The PS/2 mouse also publishes its cursor position as
+ * ABS events for the kernel's own consumers; those are not part of a
+ * relative mouse's contract and are left out of the Linux stream. */
+#define EVDEV_BITS(n) (((n) + 63) / 64)
+#define EV_MAX_BITS 0x20
+#define KEY_MAX_BITS 0x300
+#define REL_MAX_BITS 0x10
+#define ABS_MAX_BITS 0x40
+#define MSC_MAX_BITS 0x08
+#define LED_MAX_BITS 0x10
+#define SW_MAX_BITS 0x11
+#define FF_MAX_BITS 0x80
+#define PROP_MAX_BITS 0x20
+
+#define LX_EV_SYN 0x00
+#define LX_EV_KEY 0x01
+#define LX_EV_REL 0x02
+#define LX_EV_ABS 0x03
+#define LX_EV_MSC 0x04
+#define LX_EV_LED 0x11
+#define LX_EV_REP 0x14
+#define LX_REL_WHEEL 0x08
+#define LX_MSC_SCAN 0x04
+#define LX_BUS_I8042 0x11
+#define LX_BUS_VIRTUAL 0x06
+
+struct evdev_view {
+  const char *name;
+  u16 bustype, vendor, product, version;
+  u64 ev[EVDEV_BITS(EV_MAX_BITS)];
+  u64 key[EVDEV_BITS(KEY_MAX_BITS)];
+  u64 rel[EVDEV_BITS(REL_MAX_BITS)];
+  u64 abs[EVDEV_BITS(ABS_MAX_BITS)];
+  u64 msc[EVDEV_BITS(MSC_MAX_BITS)];
+  u64 led[EVDEV_BITS(LED_MAX_BITS)];
+  i32 abs_max; /* ABS_X/ABS_Y range, when EV_ABS is offered */
+};
+static struct evdev_view g_view[INPUT_NDEVS];
+
+static void view_set(u64 *bits, unsigned n) { bits[n / 64] |= 1ull << (n % 64); }
+static int view_test(const u64 *bits, unsigned n) { return (bits[n / 64] >> (n % 64)) & 1; }
+
+static void evdev_view_init(void) {
+  struct evdev_view *k = &g_view[INPUT_DEV_KBD];
+  k->name = "b1nix PS/2 Keyboard";
+  k->bustype = LX_BUS_I8042; k->vendor = 1; k->product = 1; k->version = 0xab41;
+  view_set(k->ev, LX_EV_SYN); view_set(k->ev, LX_EV_KEY); view_set(k->ev, LX_EV_MSC);
+  view_set(k->ev, LX_EV_LED); view_set(k->ev, LX_EV_REP);
+  for (unsigned c = 1; c <= 0xff; c++) view_set(k->key, c); /* the AT set */
+  view_set(k->msc, LX_MSC_SCAN);
+  for (unsigned l = 0; l < 3; l++) view_set(k->led, l);
+
+  struct evdev_view *m = &g_view[INPUT_DEV_MOUSE];
+  m->name = "b1nix PS/2 Mouse";
+  m->bustype = LX_BUS_I8042; m->vendor = 2; m->product = 1; m->version = 0;
+  view_set(m->ev, LX_EV_SYN); view_set(m->ev, LX_EV_KEY); view_set(m->ev, LX_EV_REL);
+  view_set(m->key, B1NIX_BTN_LEFT); view_set(m->key, B1NIX_BTN_RIGHT); view_set(m->key, B1NIX_BTN_MIDDLE);
+  view_set(m->rel, B1NIX_REL_X); view_set(m->rel, B1NIX_REL_Y); view_set(m->rel, LX_REL_WHEEL);
+
+  struct evdev_view *t = &g_view[INPUT_DEV_TOUCH];
+  t->name = "b1nix Absolute Pointer";
+  t->bustype = LX_BUS_VIRTUAL; t->vendor = 0x627; t->product = 0x10; t->version = 1;
+  view_set(t->ev, LX_EV_SYN); view_set(t->ev, LX_EV_KEY); view_set(t->ev, LX_EV_ABS);
+  view_set(t->key, B1NIX_BTN_LEFT); view_set(t->key, B1NIX_BTN_RIGHT); view_set(t->key, B1NIX_BTN_MIDDLE);
+  view_set(t->abs, B1NIX_ABS_X); view_set(t->abs, B1NIX_ABS_Y);
+  t->abs_max = 32767;
+}
+
+/* Under the Linux personality: the 24-byte record, and only the events the
+ * device's capabilities announce. */
+static int linux_reader(void) {
+  struct task *t = current_task;
+  return t && t->user_image &&
+         ((struct user_loaded_image *)t->user_image)->personality == PERSONALITY_LINUX;
+}
+
+static int view_offers(int dev, u16 type, u16 code) {
+  const struct evdev_view *v = &g_view[dev];
+  if (type >= EV_MAX_BITS || !view_test(v->ev, type))
+    return 0;
+  switch (type) {
+  case LX_EV_KEY: return code < KEY_MAX_BITS && view_test(v->key, code);
+  case LX_EV_REL: return code < REL_MAX_BITS && view_test(v->rel, code);
+  case LX_EV_ABS: return code < ABS_MAX_BITS && view_test(v->abs, code);
+  default: return 1;
+  }
+}
+
+struct linux_input_event {
+  i64 tv_sec;
+  i64 tv_usec;
+  u16 type;
+  u16 code;
+  i32 value;
+};
 
 static u32 ring_next(u32 v) { return (v + 1) % INPUT_QUEUE_EVENTS; }
 
@@ -99,6 +214,15 @@ static u32 input_dev_open_seq(int dev) {
   return __atomic_load_n(&dev_open_seq[dev], __ATOMIC_ACQUIRE);
 }
 
+/* The event index (0=kbd,1=mouse,2=touch) behind an input handle, or -1.
+ * fstat(2) on the fd needs it to report the char-device number 13:64+idx;
+ * libinput fstats every device it opens and treats a failure as "not a
+ * device", so a mouse fd that could not be fstat'd was invisible to it. */
+int input_handle_index(struct vfs_handle *h) {
+  struct input_client *c = h ? (struct input_client *)h->private_data : 0;
+  return c ? c->dev : -1;
+}
+
 int input_dev_has_clients(int dev) {
   if (dev < 0 || dev >= INPUT_NDEVS)
     return 0;
@@ -113,34 +237,48 @@ int input_dev_has_clients(int dev) {
 
 static isize input_read(struct vfs_handle *h, char *buf, usize size) {
   struct input_client *c = (struct input_client *)h->private_data;
-  if (!c)
+  if (!c) return -EINVAL;
+  int lx = linux_reader();
+  usize rec = lx ? sizeof(struct linux_input_event) : sizeof(struct b1nix_input_event);
+  if (size < rec)
     return -EINVAL;
-  if (size < sizeof(struct b1nix_input_event))
-    return -EINVAL;
-
   for (;;) {
-    u64 flags;
-    spin_lock_irqsave(&input_lock, &flags);
-    if (c->head != c->tail) {
-      usize n = 0;
-      while (c->head != c->tail &&
-             n + sizeof(struct b1nix_input_event) <= size) {
-        memcpy(buf + n, &c->ring[c->head], sizeof(struct b1nix_input_event));
-        c->head = ring_next(c->head);
-        n += sizeof(struct b1nix_input_event);
+    usize n = 0;
+    u64 irqf;
+    spin_lock_irqsave(&input_lock, &irqf);
+    while (c->head != c->tail && n + rec <= size) {
+      const struct b1nix_input_event *e = &c->ring[c->head];
+      c->head = ring_next(c->head);
+      if (!lx) {
+        memcpy(buf + n, e, sizeof(*e));
+        n += rec;
+        continue;
       }
-      spin_unlock_irqrestore(&input_lock, flags);
-      return (isize)n;
+      if (!view_offers(c->dev, e->type, e->code))
+        continue; /* not part of this device's Linux contract */
+      struct linux_input_event le;
+      u32 hz = sched_tick_hz() ? sched_tick_hz() : 100;
+      le.tv_sec = (i64)(e->time_ticks / hz);
+      le.tv_usec = (i64)((e->time_ticks % hz) * (1000000ull / hz));
+      le.type = e->type;
+      le.code = e->code;
+      le.value = e->value;
+      memcpy(buf + n, &le, sizeof(le));
+      n += rec;
     }
-    spin_unlock_irqrestore(&input_lock, flags);
-
-    /* musl's b1nix compatibility headers may retain its O_NONBLOCK bit
-     * (0x8000) on raw device opens; accept it alongside the native VFS bit. */
-    if (h->flags & (B1NIX_O_NONBLOCK | 0x8000))
+    spin_unlock_irqrestore(&input_lock, irqf);
+    if (n > 0)
+      return (isize)n;
+    if (h->flags & B1NIX_O_NONBLOCK)
       return -EAGAIN;
     if (scheduler_signal_pending())
-      return -ERESTARTSYS;
-    scheduler_yield();
+      return -EINTR;
+    scheduler_wait_prepare(&devs[c->dev]);
+    if (c->head != c->tail) {
+      scheduler_wait_cancel();
+      continue;
+    }
+    scheduler_wait_commit();
   }
 }
 
@@ -154,15 +292,30 @@ static isize input_write(struct vfs_handle *h, const char *buf, usize len) {
   struct input_client *c = (struct input_client *)h->private_data;
   if (!c)
     return -EINVAL;
-  if (len == 0 || (len % sizeof(struct b1nix_input_event)) != 0)
+  /* The record size matches the reader: a Linux-personality task writes the
+   * 24-byte struct input_event, a native one the 16-byte b1nix record. Only
+   * type/code/value are used; the kernel stamps the time. Reading one size
+   * and writing another (input_read converts, input_write did not) meant a
+   * Linux program's event injection -- what a uinput-style writer or a test
+   * does -- was rejected with EINVAL for a length that was never a multiple
+   * of the native size. */
+  int lx = linux_reader();
+  usize rec = lx ? sizeof(struct linux_input_event) : sizeof(struct b1nix_input_event);
+  if (len == 0 || (len % rec) != 0)
     return -EINVAL;
-  usize count = len / sizeof(struct b1nix_input_event);
+  usize count = len / rec;
   for (usize i = 0; i < count; i++) {
-    struct b1nix_input_event ev;
-    memcpy(&ev, buf + i * sizeof(ev), sizeof(ev));
-    /* Timestamps are the kernel's to assign (input_event_push stamps them),
-     * so only type/code/value are taken from the caller. */
-    input_event_push(c->dev, ev.type, ev.code, ev.value);
+    u16 type, code; i32 value;
+    if (lx) {
+      struct linux_input_event le;
+      memcpy(&le, buf + i * rec, sizeof(le));
+      type = le.type; code = le.code; value = le.value;
+    } else {
+      struct b1nix_input_event ev;
+      memcpy(&ev, buf + i * rec, sizeof(ev));
+      type = ev.type; code = ev.code; value = ev.value;
+    }
+    input_event_push(c->dev, type, code, value);
   }
   return (isize)len;
 }
@@ -197,8 +350,105 @@ static void input_release(struct vfs_handle *h) {
   h->private_data = 0;
 }
 
+/* The EVIOCG* ioctls libinput and libevdev ask of an event device. The
+ * request encodes (dir, 'E', nr, size); the size is the caller's buffer and
+ * the answer is truncated to it, as Linux does. Writes that carry no meaning
+ * here -- grab, revoke, clock, key repeat -- succeed. */
+#define EVIOC_TYPE(r) (((r) >> 8) & 0xff)
+#define EVIOC_NR(r) ((r) & 0xff)
+#define EVIOC_SIZE(r) (((r) >> 16) & 0x3fff)
+#define EVIOC_DIR(r) (((r) >> 30) & 3)
+struct linux_input_id { u16 bustype, vendor, product, version; };
+struct linux_input_absinfo { i32 value, minimum, maximum, fuzz, flat, resolution; };
+
+static int evdev_put(void *arg, const void *src, usize have, usize want) {
+  usize n = have < want ? have : want;
+  if (n && syscall_copyout(arg, src, n) < 0)
+    return -EFAULT;
+  return (int)n;
+}
+
+static int input_ioctl_impl(struct vfs_handle *h, u64 request, void *arg);
+static int input_ioctl(struct vfs_handle *h, u64 request, void *arg) {
+  int rc = input_ioctl_impl(h, request, arg);
+  if (bootinfo_has_flag("b1nix.trace-evioc")) {
+    static unsigned n;
+    if (n < 200) {
+      n++;
+      char line[96];
+      snprintf(line, sizeof(line),
+               "evioc: dir=%u type=%c nr=0x%02x size=%u rc=%d by %s\n",
+               (unsigned)EVIOC_DIR(request), (char)EVIOC_TYPE(request),
+               (unsigned)EVIOC_NR(request), (unsigned)EVIOC_SIZE(request), rc,
+               current_task && current_task->name ? current_task->name : "?");
+      console_write(line);
+    }
+  }
+  return rc;
+}
+static int input_ioctl_impl(struct vfs_handle *h, u64 request, void *arg) {
+  struct input_client *c = (struct input_client *)h->private_data;
+  if (!c || EVIOC_TYPE(request) != 'E')
+    return -ENOTTY;
+  const struct evdev_view *v = &g_view[c->dev];
+  unsigned nr = EVIOC_NR(request);
+  usize len = EVIOC_SIZE(request);
+  if (nr >= 0x20 && nr < 0x40) { /* EVIOCGBIT(ev, len) */
+    unsigned ev = nr - 0x20;
+    const u64 *bits = 0; usize bytes = 0;
+    switch (ev) {
+    case 0: bits = v->ev; bytes = sizeof(v->ev); break;
+    case LX_EV_KEY: bits = v->key; bytes = sizeof(v->key); break;
+    case LX_EV_REL: bits = v->rel; bytes = sizeof(v->rel); break;
+    case LX_EV_ABS: bits = v->abs; bytes = sizeof(v->abs); break;
+    case LX_EV_MSC: bits = v->msc; bytes = sizeof(v->msc); break;
+    case LX_EV_LED: bits = v->led; bytes = sizeof(v->led); break;
+    default: break;
+    }
+    if (!bits) {
+      static const u64 none[EVDEV_BITS(FF_MAX_BITS)];
+      bits = none; bytes = sizeof(none);
+    }
+    return evdev_put(arg, bits, bytes, len);
+  }
+  if (nr >= 0x40 && nr < 0x80) { /* EVIOCGABS(axis) */
+    unsigned axis = nr - 0x40;
+    struct linux_input_absinfo ai = {0, 0, 0, 0, 0, 0};
+    if (axis < ABS_MAX_BITS && view_test(v->abs, axis))
+      ai.maximum = v->abs_max;
+    return evdev_put(arg, &ai, sizeof(ai), len) < 0 ? -EFAULT : 0;
+  }
+  if (nr >= 0xc0) /* EVIOCSABS */
+    return 0;
+  switch (nr) {
+  case 0x01: { u32 ver = 0x010001; return evdev_put(arg, &ver, sizeof(ver), len) < 0 ? -EFAULT : 0; }
+  case 0x02: { struct linux_input_id id = {v->bustype, v->vendor, v->product, v->version};
+               return evdev_put(arg, &id, sizeof(id), len) < 0 ? -EFAULT : 0; }
+  case 0x03: { u32 rep[2] = {250, 33}; return evdev_put(arg, rep, sizeof(rep), len) < 0 ? -EFAULT : 0; }
+  case 0x06: { /* EVIOCGNAME */
+    usize l = strlen(v->name) + 1;
+    return evdev_put(arg, v->name, l, len);
+  }
+  case 0x07: case 0x08: /* PHYS, UNIQ: none */
+    return -ENOENT;
+  case 0x09: { static const u64 props[EVDEV_BITS(PROP_MAX_BITS)]; return evdev_put(arg, props, sizeof(props), len); }
+  case 0x0a: /* EVIOCGMTSLOTS */
+    return -EINVAL;
+  case 0x18: case 0x19: case 0x1a: case 0x1b: { /* current KEY/LED/SND/SW state: nothing held */
+    static const u64 zero[EVDEV_BITS(KEY_MAX_BITS)]; return evdev_put(arg, zero, sizeof(zero), len);
+  }
+  case 0x90: case 0x91: case 0xa0: case 0x93: /* GRAB, REVOKE, SCLOCKID, SMASK */
+    return 0;
+  case 0x92: /* EVIOCGMASK */
+    return -EINVAL;
+  default:
+    return -ENOTTY;
+  }
+}
+
 static const struct vfs_file_ops input_ops = {
   .read = input_read,
+  .ioctl = input_ioctl,
   .write = input_write,
   .poll = input_poll,
   .release = input_release,
@@ -383,7 +633,162 @@ void input_gfxtest_start(void) {
 
 /* ── init ── */
 
+/* ── sysfs: /sys/class/input, the way udev expects it ─────────────────────
+ *
+ * /sys/devices/virtual/input/inputN/         name, uevent, id/, capabilities/
+ * /sys/devices/virtual/input/inputN/eventN/  dev, uevent
+ * /sys/class/input/{inputN,eventN}           links to the two
+ * /sys/dev/char/13:64+N                      link to eventN
+ *
+ * udev's input_id builtin reads capabilities/{ev,key,rel,abs} and writes
+ * ID_INPUT_MOUSE / ID_INPUT_KEYBOARD into /run/udev/data, which is where
+ * libinput (through elogind's seat) finds out what to open. `udevadm
+ * trigger` writes "add" to the uevent files; the store posts the event. */
+struct input_sysfs_text {
+  char text[512];
+  char devpath[96];
+  char devname[24];
+  int minor; /* -1: the inputN device, no node */
+};
+static isize input_sysfs_show(void *ctx, char *buf, usize cap) {
+  const char *t = ctx ? ((struct input_sysfs_text *)ctx)->text : "";
+  usize n = strlen(t);
+  if (n > cap) n = cap;
+  memcpy(buf, t, n);
+  return (isize)n;
+}
+static isize input_sysfs_uevent_store(void *ctx, const char *buf, usize len) {
+  struct input_sysfs_text *u = (struct input_sysfs_text *)ctx;
+  char action[16];
+  usize n = 0;
+  if (!u || !buf) return -EINVAL;
+  while (n < len && n < sizeof(action) - 1 && buf[n] != ' ' && buf[n] != '\n' && buf[n] != '\0')
+    n++;
+  memcpy(action, buf, n);
+  action[n] = '\0';
+  if (strcmp(action, "add") && strcmp(action, "change") && strcmp(action, "remove"))
+    return -EINVAL;
+  uevent_post(action, u->devpath, "input", 0, u->minor >= 0 ? u->devname : 0,
+              u->minor >= 0 ? 13 : 0, u->minor >= 0 ? u->minor : 0);
+  return (isize)len;
+}
+static void input_sysfs_free(void *ctx) { kfree(ctx); }
+
+/* Hex words, most significant first, no leading zero words: the format of
+ * every capabilities/ file and of the EV=/KEY= lines in uevent. */
+static usize bits_hex(char *out, usize cap, const u64 *bits, usize words) {
+  usize pos = 0;
+  usize first = words;
+  for (usize w = words; w-- > 0;)
+    if (bits[w]) { first = w; break; }
+  if (first == words)
+    return (usize)snprintf(out, cap, "0");
+  for (usize w = first + 1; w-- > 0;) {
+    pos += (usize)snprintf(out + pos, cap > pos ? cap - pos : 0, "%s%lx", w == first ? "" : " ",
+                           (unsigned long)bits[w]);
+  }
+  return pos;
+}
+
+static int input_sysfs_text_attr(struct sysfs_dir *d, const char *name, const char *text) {
+  struct input_sysfs_text *t = kzalloc(sizeof(*t));
+  if (!t) return -ENOMEM;
+  snprintf(t->text, sizeof(t->text), "%s", text);
+  t->minor = -1;
+  if (sysfs_reg_attr(d, name, 0444, input_sysfs_show, 0, t, input_sysfs_free) != 0) {
+    kfree(t);
+    return -1;
+  }
+  return 0;
+}
+
+static void input_sysfs_publish(int i) {
+  const struct evdev_view *v = &g_view[i];
+  char inputN[16], eventN[16], node[16], tmp[256];
+  snprintf(inputN, sizeof(inputN), "input%d", i);
+  snprintf(eventN, sizeof(eventN), "event%d", i);
+  snprintf(node, sizeof(node), "13:%d", 64 + i);
+  struct sysfs_dir *virt = sysfs_reg_dir(sysfs_reg_dir(sysfs_reg_dir(0, "devices"), "virtual"), "input");
+  struct sysfs_dir *dev = virt ? sysfs_reg_dir(virt, inputN) : 0;
+  if (!dev)
+    return;
+  snprintf(tmp, sizeof(tmp), "%s\n", v->name);
+  input_sysfs_text_attr(dev, "name", tmp);
+  input_sysfs_text_attr(dev, "phys", "\n");
+  input_sysfs_text_attr(dev, "uniq", "\n");
+  input_sysfs_text_attr(dev, "properties", "0\n");
+  struct sysfs_dir *id = sysfs_reg_dir(dev, "id");
+  if (id) {
+    snprintf(tmp, sizeof(tmp), "%04x\n", v->bustype); input_sysfs_text_attr(id, "bustype", tmp);
+    snprintf(tmp, sizeof(tmp), "%04x\n", v->vendor);  input_sysfs_text_attr(id, "vendor", tmp);
+    snprintf(tmp, sizeof(tmp), "%04x\n", v->product); input_sysfs_text_attr(id, "product", tmp);
+    snprintf(tmp, sizeof(tmp), "%04x\n", v->version); input_sysfs_text_attr(id, "version", tmp);
+  }
+  char ev[64], key[256], rel[32], abs[64], msc[32], led[32];
+  bits_hex(ev, sizeof(ev), v->ev, EVDEV_BITS(EV_MAX_BITS));
+  bits_hex(key, sizeof(key), v->key, EVDEV_BITS(KEY_MAX_BITS));
+  bits_hex(rel, sizeof(rel), v->rel, EVDEV_BITS(REL_MAX_BITS));
+  bits_hex(abs, sizeof(abs), v->abs, EVDEV_BITS(ABS_MAX_BITS));
+  bits_hex(msc, sizeof(msc), v->msc, EVDEV_BITS(MSC_MAX_BITS));
+  bits_hex(led, sizeof(led), v->led, EVDEV_BITS(LED_MAX_BITS));
+  struct sysfs_dir *caps = sysfs_reg_dir(dev, "capabilities");
+  if (caps) {
+    snprintf(tmp, sizeof(tmp), "%s\n", ev);  input_sysfs_text_attr(caps, "ev", tmp);
+    snprintf(tmp, sizeof(tmp), "%s\n", key); input_sysfs_text_attr(caps, "key", tmp);
+    snprintf(tmp, sizeof(tmp), "%s\n", rel); input_sysfs_text_attr(caps, "rel", tmp);
+    snprintf(tmp, sizeof(tmp), "%s\n", abs); input_sysfs_text_attr(caps, "abs", tmp);
+    snprintf(tmp, sizeof(tmp), "%s\n", msc); input_sysfs_text_attr(caps, "msc", tmp);
+    snprintf(tmp, sizeof(tmp), "%s\n", led); input_sysfs_text_attr(caps, "led", tmp);
+    input_sysfs_text_attr(caps, "sw", "0\n");
+    input_sysfs_text_attr(caps, "ff", "0\n");
+    input_sysfs_text_attr(caps, "snd", "0\n");
+  }
+  /* inputN/uevent: what a hotplug event for the device itself carries. */
+  struct input_sysfs_text *u = kzalloc(sizeof(*u));
+  if (u) {
+    snprintf(u->devpath, sizeof(u->devpath), "/devices/virtual/input/%s", inputN);
+    u->minor = -1;
+    snprintf(u->text, sizeof(u->text),
+             "PRODUCT=%x/%x/%x/%x\nNAME=\"%s\"\nPROP=0\nEV=%s\nKEY=%s\nREL=%s\nABS=%s\nMSC=%s\nLED=%s\n",
+             v->bustype, v->vendor, v->product, v->version, v->name, ev, key, rel, abs, msc, led);
+    if (sysfs_reg_attr(dev, "uevent", 0644, input_sysfs_show, input_sysfs_uevent_store, u, input_sysfs_free) != 0)
+      kfree(u);
+  }
+  (void)sysfs_reg_link(dev, "subsystem", "../../../../class/input");
+  /* eventN: the character device. */
+  struct sysfs_dir *evd = sysfs_reg_dir(dev, eventN);
+  if (evd) {
+    snprintf(tmp, sizeof(tmp), "%s\n", node);
+    input_sysfs_text_attr(evd, "dev", tmp);
+    struct input_sysfs_text *ue = kzalloc(sizeof(*ue));
+    if (ue) {
+      snprintf(ue->devpath, sizeof(ue->devpath), "/devices/virtual/input/%s/%s", inputN, eventN);
+      snprintf(ue->devname, sizeof(ue->devname), "input/%s", eventN);
+      ue->minor = 64 + i;
+      snprintf(ue->text, sizeof(ue->text), "MAJOR=13\nMINOR=%d\nDEVNAME=input/%s\n", 64 + i, eventN);
+      if (sysfs_reg_attr(evd, "uevent", 0644, input_sysfs_show, input_sysfs_uevent_store, ue, input_sysfs_free) != 0)
+        kfree(ue);
+    }
+    (void)sysfs_reg_link(evd, "subsystem", "../../../../../class/input");
+    (void)sysfs_reg_link(evd, "device", "..");
+  }
+  struct sysfs_dir *cls = sysfs_reg_dir(sysfs_reg_dir(0, "class"), "input");
+  char target[96];
+  if (cls) {
+    snprintf(target, sizeof(target), "../../devices/virtual/input/%s", inputN);
+    (void)sysfs_reg_link(cls, inputN, target);
+    snprintf(target, sizeof(target), "../../devices/virtual/input/%s/%s", inputN, eventN);
+    (void)sysfs_reg_link(cls, eventN, target);
+  }
+  struct sysfs_dir *chr = sysfs_reg_dir(sysfs_reg_dir(0, "dev"), "char");
+  if (chr) {
+    snprintf(target, sizeof(target), "../../devices/virtual/input/%s/%s", inputN, eventN);
+    (void)sysfs_reg_link(chr, node, target);
+  }
+}
+
 void input_init(void) {
+  evdev_view_init();
   struct vfs_node *dir = vfs_add_node("/dev/input", VFS_DIRECTORY, 0, 0, 0);
   if (!IS_ERR(dir) && dir)
     vfs_node_put(dir);
@@ -399,8 +804,12 @@ void input_init(void) {
     }
     /* Input events are sensitive (keystrokes): root-only access. */
     node->inode->mode = 0600;
+    /* char 13:64+N, the numbers Linux gives event devices: elogind's
+     * TakeDevice and udev's /run/udev/data/c13:N key both go by them. */
+    node->inode->rdev = ((u64)13 << 8) | (u64)(64 + i);
     devs[i].registered = 1;
     vfs_node_put(node);
+    input_sysfs_publish(i);
   }
   console_write("input: /dev/input/event0 (kbd) + event1 (mouse) + event2 "
                 "(touch) ready\n");

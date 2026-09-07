@@ -92,13 +92,14 @@ static int ps2_mouse_command(u8 command)
 void ps2_mouse_init(void)
 {
     const struct boot_info *bi = bootinfo_get();
-    if (!bi->has_framebuffer) {
-        return;
-    }
+    /* No framebuffer (a passed-through GPU, -vga none) is not "no mouse":
+     * the cursor coordinates below are only for the kernel's own consumers,
+     * and a compositor reads the relative stream. Bounds fall back to a
+     * screen-sized box. */
 
     packet_index = 0;
-    mouse_state.x = (int)(bi->framebuffer.width / 2);
-    mouse_state.y = (int)(bi->framebuffer.height / 2);
+    mouse_state.x = bi->has_framebuffer ? (int)(bi->framebuffer.width / 2) : 640;
+    mouse_state.y = bi->has_framebuffer ? (int)(bi->framebuffer.height / 2) : 400;
     mouse_state.buttons = 0;
 
     /* The init handshake polls the i8042 output buffer for each command's
@@ -187,8 +188,8 @@ void ps2_mouse_handle_byte(u8 data)
     mouse_state.y -= dy;
 
     const struct boot_info *bi = bootinfo_get();
-    int max_x = (int)bi->framebuffer.width - 1;
-    int max_y = (int)bi->framebuffer.height - 1;
+    int max_x = bi->has_framebuffer ? (int)bi->framebuffer.width - 1 : 1279;
+    int max_y = bi->has_framebuffer ? (int)bi->framebuffer.height - 1 : 799;
     if (mouse_state.x < 0) mouse_state.x = 0;
     if (mouse_state.y < 0) mouse_state.y = 0;
     if (mouse_state.x > max_x) mouse_state.x = max_x;

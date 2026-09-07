@@ -39,7 +39,6 @@ enum dma_data_direction {
  * slower — whereas honouring the hint wrongly would corrupt data. */
 #define DMA_ATTR_SKIP_CPU_SYNC     (1UL << 0)
 #define DMA_ATTR_WRITE_COMBINE     (1UL << 1)
-#define DMA_ATTR_NO_KERNEL_MAPPING (1UL << 2)
 #define DMA_ATTR_FORCE_CONTIGUOUS  (1UL << 3)
 
 /* Largest single mapping a device can be given. b1nix's bounce pool has a

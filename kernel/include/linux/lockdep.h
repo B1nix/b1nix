@@ -9,10 +9,8 @@
  * compile away and the assertions report "not checked" instead of "checked and
  * fine" — the difference matters when reading a bug report. */
 struct lock_class_key { int unused; };
-#define lockdep_set_class(lock, key) do { (void)(lock); (void)(key); } while (0)
 #define lockdep_assert_held(l)       do { (void)(l); } while (0)
 #define lockdep_assert_none_held_once() do { } while (0)
-#define lockdep_is_held(l) (1)
 /* Lock-class annotations the ww_mutex headers emit. Nothing is recorded — see
  * the note above on why they are not claimed to have been checked. */
 #define lock_acquire_shared_recursive(l, s, t, n, i) do { } while (0)

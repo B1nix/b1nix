@@ -1236,7 +1236,17 @@ Details, and the traps this cost, in [`kde-plasma-drm.md`](kde-plasma-drm.md).
       run no longer destroys the KDE image. Left: close() writes dirty pages
       synchronously (no writeback thread) and the flush walks the whole LRU;
       dbus/elogind second-long stalls in session setup; vmm read-lock per
-      copyin; 25 duplicate-macro warnings in the lkpi headers.
+      copyin; duplicate-macro warnings in the lkpi headers.
+- [x] `done` **Input and the console on the real panel.** Event devices carry
+      the Linux evdev view (24-byte records, `EVIOCG*`, `/sys/class/input`
+      with capabilities), udev tags them and logind hands them to the
+      session: a mouse and keyboard reach kwin. An in-kernel DRM client puts
+      the framebuffer console on the first display before any compositor —
+      on i915 through the GGTT aperture as intel_fbdev does — so a GPU passed
+      through VFIO shows the boot log at 4 s instead of black until kwin.
+      `mk-root-image.sh` writes a handful of changed files into the image in
+      place (24 s instead of a repack). Recipe in `tools/drm/run-i915-passthrough.sh`
+      (`NO_VIRTIO_GPU`, `ROOT_IMG`, `EXTRA_QEMU_ARGS` with `input-linux`).
 
 ## M114: The layers under the missing applets
 

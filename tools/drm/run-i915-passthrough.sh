@@ -302,8 +302,14 @@ DEV_ARGS="$DEV_ARGS -drive file=$CACHE_IMG,format=raw,if=virtio"
 # instead, and start-up stops paying for the parts no one touches.
 if [ -n "${ROOT_IMG:-}" ]; then
 	[ -f "$ROOT_IMG" ] || { echo "no such root image: $ROOT_IMG" >&2; exit 1; }
-	DEV_ARGS="$DEV_ARGS -drive file=$ROOT_IMG,format=raw,if=virtio"
+	# snapshot=on: the build's image is not a scratch disk. A desktop writes
+	# its caches into it within seconds, and the writes were landing in the
+	# file the next `make iso` compares against its manifest.
+	DEV_ARGS="$DEV_ARGS -drive file=$ROOT_IMG,format=raw,if=virtio,snapshot=on"
 fi
+# Anything else for QEMU, verbatim: `-object input-linux,evdev=/dev/input/eventN,grab_all=on`
+# hands the guest a host keyboard or mouse (both Ctrl keys toggle the grab).
+DEV_ARGS="$DEV_ARGS ${EXTRA_QEMU_ARGS:-}"
 
 
 echo "b1nix + $IGD_BDF via VFIO ($MACHINE), ${MEM_MB}M, log: $LOG"

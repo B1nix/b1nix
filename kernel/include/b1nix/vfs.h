@@ -281,6 +281,11 @@ struct vfs_inode {
    * first and skips the walk when the file it is closing has nothing to
    * write. */
   u32 dirty_pages;
+  /* Membership in the page cache's list of inodes with dirty pages, which
+   * the writeback thread drains. Both under the page-cache lock. The list
+   * holds a reference (vfs_inode_get) for as long as the inode is on it. */
+  struct vfs_inode *dirty_next;
+  u8 on_dirty_list;
   /* Pages of this inode currently in the page cache. Truncating or
    * invalidating a file walks every cached page in the machine to find its
    * own; a file with none can skip the walk entirely, which is the common
@@ -665,6 +670,14 @@ int vfs_remount(const char *target, u64 flags);
  * vfs_mounts() should ask for this rather than assume MAX_MOUNTS, and must
  * heap-allocate it. */
 usize vfs_mount_capacity(void);
+/* Inode references: the inode is freed at the last put when unlinked. */
+struct vfs_inode *vfs_inode_get(struct vfs_inode *inode);
+void vfs_inode_put(struct vfs_inode *inode);
+/* Write back the inodes the page cache reports dirty; sync, syncfs, umount
+ * and the pcflush thread call it. Returns how many inodes were flushed. */
+int vfs_writeback_dirty_inodes(void);
+/* Start the pcflush thread (needs the scheduler). */
+void vfs_start_writeback(void);
 int vfs_sync(void);
 isize vfs_getdents(int handle, struct dirent *buf, usize max_entries);
 int vfs_pipe(int pipefd[2]);

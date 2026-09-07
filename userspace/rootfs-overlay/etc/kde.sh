@@ -69,10 +69,50 @@ start_udev() {
 	done
 	# The coldplug replay, bounded: `udevadm settle` waits on a queue that a
 	# udevd which never started would never drain.
-	udevadm trigger --action=add --subsystem-match=drm > /tmp/kde-trigger.log 2>&1
+	# The daemon's own trace of the input events, on the console via syslog:
+	# `udevadm test` says the rules tag the mouse, the daemon's database says
+	# they did not, and only the daemon can say why.
+	udevadm control --log-priority=debug 2>/dev/null
+	udevadm trigger --action=add --subsystem-match=drm --subsystem-match=input > /tmp/kde-trigger.log 2>&1
 	udevadm trigger --action=add --subsystem-match=input >> /tmp/kde-trigger.log 2>&1
 	udevadm settle --timeout=20 >> /tmp/kde-trigger.log 2>&1
 	echo "KDE: udev db after trigger: [$(ls /run/udev/data 2>&1 | tr '\n' ' ' | cut -c1-160)]"
+	# What udev made of the input devices: ID_INPUT_MOUSE / ID_INPUT_KEYBOARD
+	# is what libinput (through the seat) goes by, and a device without them
+	# is invisible to the desktop however many events it produces.
+	# After the queue drains: trigger returns before udevd has run the rules,
+	# and a database read at once shows DEVNAME and nothing else.
+	# Wait for the rules to have run on the mouse, not merely for the queue:
+	# elogind enumerates the seat's devices when it starts and only learns of
+	# later ones from the daemon's broadcasts, so an input device tagged after
+	# elogind came up is one the session never gets.
+	__i=0
+	while [ $__i -lt 50 ] && ! udevadm info -q property -n /dev/input/event1 2>/dev/null | grep -q '^ID_INPUT='; do
+		__i=$((__i + 1)); usleep 200000
+	done
+	udevadm control --log-priority=err 2>/dev/null
+	for d in /dev/input/event*; do
+		echo "KDE: udev $d: $(udevadm info -q property -n $d 2>/dev/null | grep -E '^ID_INPUT|^ID_SEAT|^DEVNAME' | tr '\n' ' ')"
+	done
+	# The rule engine's own account of one device, when the mouse carries no
+	# ID_INPUT_MOUSE: which rules ran and what the input_id builtin saw.
+	if ! udevadm info -q property -n /dev/input/event1 2>/dev/null | grep -q ID_INPUT_MOUSE; then
+		echo "--- udev db files ---"
+		for f in /run/udev/data/c13:65 /run/udev/data/+input:input1 /run/udev/data/c226:1; do
+			echo "$f: $(tr '\n' '|' < $f 2>/dev/null | cut -c1-300)"
+		done
+		echo "--- seat tags: $(ls /run/udev/tags/seat/ 2>&1 | tr '\n' ' ')"
+		echo "--- char 13:65 -> $(readlink /sys/dev/char/13:65 2>&1) | 226:1 -> $(readlink /sys/dev/char/226:1 2>&1); path: $(udevadm info -q path -n /dev/input/event1 2>&1)"
+		echo "--- ls /sys/dev/char: $(ls -l /sys/dev/char/ 2>&1 | tr '\n' ' ' | cut -c1-300)"
+		echo "--- udevadm info by syspath ---"
+		udevadm info -q property -p /sys/class/input/event1 2>&1 | tr '\n' ' ' | cut -c1-300; echo
+		echo "--- udevadm test event1 ---"
+		udevadm test --action=add /sys/class/input/event1 2>&1 | grep -v "^$" | tail -20
+		echo "--- /sys/class/input/input1 ---"
+		ls -l /sys/class/input/ 2>&1 | head -8
+		cat /sys/class/input/input1/capabilities/ev /sys/class/input/input1/capabilities/rel /sys/class/input/input1/capabilities/key 2>&1
+		echo "--- end udev test ---"
+	fi
 	if [ -e /run/udev/data/c226:1 ]; then
 		echo "KDE: ok udev-tagged-card t=$(up)"
 		return 0
@@ -195,6 +235,13 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export XDG_RUNTIME_DIR=/run/user/0
 export XDG_SESSION_TYPE=wayland
 export XDG_CURRENT_DESKTOP=KDE
+# The cursor image. kwin defaults to a theme named "default", which the image
+# does not ship ("Failed to load cursor theme default", and no pointer is
+# drawn); breeze_cursors is what a KDE install carries. XCURSOR_PATH names
+# where the .../cursors directories live, as on any Linux desktop.
+export XCURSOR_THEME=breeze_cursors
+export XCURSOR_SIZE=24
+export XCURSOR_PATH=/usr/share/icons:/usr/share/pixmaps
 mkdir -p /run/user/0 /tmp /root /var/lib/kwin
 chmod 700 /run/user/0
 
@@ -371,6 +418,9 @@ wait_kwin_socket() {
 	done
 	if [ -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; then
 		echo "KDE: ok kwin-socket t=$(up) after $((__i / 5))s"
+		echo "--- kwin input (libinput) ---"
+		grep -a -i "libinput\|input device\|Adding\|seat" /tmp/kde-kwin.log 2>/dev/null | head -20
+		echo "--- end kwin input ---"
 		return 0
 	fi
 	echo "KDE: fail kwin-socket t=$(up) (no $XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1})"
@@ -492,9 +542,13 @@ if [ -x /usr/bin/plasmashell ]; then
 	# client picks the wayland-egl buffer integration by default; with no GL
 	# driver Mesa falls through to zink, Vulkan is absent and EGL init faults at a
 	# null pointer inside Mesa. shm keeps Qt off that path entirely.
+	# org.kde.plasma.shell at info level, for the one line that says the
+	# desktop is up: "Plasma Shell startup completed". Nothing else marks it
+	# from inside the guest, and the terminal below must not open before it.
 	WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" QT_QPA_PLATFORM=wayland \
 	QT_QUICK_BACKEND=software LIBGL_ALWAYS_SOFTWARE=1 \
 	QT_WAYLAND_CLIENT_BUFFER_INTEGRATION=shm \
+	QT_LOGGING_RULES="org.kde.plasma.shell.info=true" \
 		timeout 900 plasmashell --no-respawn \
 			> /tmp/kde-plasmashell.log 2>&1 &
 	PLASMAPID=$!
@@ -527,6 +581,25 @@ if [ -x /usr/bin/plasmashell ]; then
 	# A witness window, so a black picture can be read. Black inside kwin but not
 	# on the host compositor puts the fault in kwin's nested presentation; black
 	# in both means client content is reaching no compositor at all.
+	# The shell first, then programs: a terminal that opens while plasmashell
+	# is still compiling its QML is what a person sees for ten seconds before
+	# the desktop, and it is the wrong order. Wait for plasmashell's own word.
+	# plasmashell's own word, over its bus interface: a panel exists once the
+	# shell has loaded its containments, which is when there is a desktop to
+	# look at. (The "startup completed" log line never showed under the
+	# logging rule; the bus does not depend on logging.)
+	i=0
+	__panels=0
+	while [ $i -lt 150 ]; do
+		__panels=$(qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "print(panels().length)" 2>/dev/null | tr -dc '0-9')
+		[ -n "$__panels" ] && [ "$__panels" -gt 0 ] && break
+		i=$((i + 1)); usleep 200000
+	done
+	if [ -n "$__panels" ] && [ "$__panels" -gt 0 ]; then
+		echo "KDE: ok plasma-panels=$__panels t=$(up) after $((i / 5))s"
+	else
+		echo "KDE: plasma-panels not reported in 30s t=$(up)"
+	fi
 	if [ -x /usr/bin/foot ]; then
 		WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" foot > /tmp/kde-foot.log 2>&1 &
 		[ -n "${HOST_SOCK:-}" ] && \
@@ -580,7 +653,7 @@ CFG
 	# 600 s, because the screenshot is taken past t=240 with plasmashell in the
 	# sequence; a compositor killed earlier leaves the host's background in the
 	# picture.
-	WAYLAND_DISPLAY=wayland-1 timeout 600 kwin_wayland \
+	WAYLAND_DISPLAY=wayland-1 QT_LOGGING_RULES="kwin_libinput.debug=true" timeout 600 kwin_wayland \
 		--wayland-display wayland-1 \
 		--width 1280 --height 720 --socket wayland-2 --no-lockscreen \
 		${CLIENT:+"$CLIENT"} > /tmp/kde-kwin.log 2>&1 &
@@ -693,7 +766,7 @@ fi
 # terminal: it opens /dev/tty0 and puts it in graphics mode. b1nix has no VTs,
 # so no session object is created and every device open is refused before it
 # reaches the driver. Any other seat name skips the VT dance entirely.
-export XDG_SEAT=seat1
+export XDG_SEAT=seat0
 echo "KDE: tty0 present: $([ -e /dev/tty0 ] && echo yes || echo no)"
 
 export QT_PLUGIN_PATH=/usr/lib/qt6/plugins
@@ -721,6 +794,9 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 		# leftover socket makes the next one look successful.
 		rm -f /run/user/0/wayland-1
 		export QT_LOGGING_RULES="kwin_*.debug=true"
+		# env -u WAYLAND_DISPLAY/DISPLAY: KWin's usesLibinput() takes a set
+		# WAYLAND_DISPLAY to mean it is a nested client and skips libinput.
+		env -u WAYLAND_DISPLAY -u DISPLAY \
 		timeout 900 /usr/bin/kwin_wayland --drm --socket wayland-1 \
 			--no-lockscreen > /tmp/kde-kwin.log 2>&1 &
 		KWINPID=$!

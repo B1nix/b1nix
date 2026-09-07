@@ -964,6 +964,7 @@ LKPI_IMPORT_SOURCES := \
 	kernel/lkpi/sysfs.c \
 	kernel/lkpi/drm_b1nix_kms.c \
 	kernel/lkpi/drm_chardev.c \
+	kernel/lkpi/drm_console.c \
 	kernel/lkpi/linux_support.c
 
 LKPI_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(LKPI_IMPORT_SOURCES))
@@ -1027,7 +1028,8 @@ I915_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(I915_IMPORT_SOURCES))
 # driver's include roots, so it is built with the driver's flags — minus -w,
 # because this file is ours and stays warning-clean.
 I915_SHIM_SOURCES := kernel/lkpi/i915_acpi.c kernel/lkpi/i915_display_probe.c \
-                     kernel/lkpi/i915_gt_probe.c kernel/lkpi/i915_gmch.c
+                     kernel/lkpi/i915_gt_probe.c kernel/lkpi/i915_gmch.c \
+                     kernel/lkpi/i915_console.c
 I915_SHIM_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(I915_SHIM_SOURCES))
 I915_IMPORT_OBJECTS += $(I915_SHIM_OBJECTS)
 

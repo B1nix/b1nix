@@ -161,7 +161,6 @@ void kmem_cache_shrink(struct kmem_cache *c);
 #define SLAB_MEM_SPREAD      0x00080000u
 #define SLAB_ACCOUNT         0x00100000u
 #define SLAB_NOLEAKTRACE     0x00200000u
-#define SLAB_TYPESAFE_BY_RCU 0x00400000u
 #define SLAB_CONSISTENCY_CHECKS 0x00800000u
 #define SLAB_STORE_USER      0x01000000u
 #define SLAB_PANIC           0x02000000u

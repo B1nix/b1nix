@@ -56,6 +56,8 @@ void input_kbd_scancode(u8 scancode, int extended);
 /* True when at least one client has the device open (used by the smoke-test
  * injector to know a reader is listening). */
 int input_dev_has_clients(int dev);
+struct vfs_handle;
+int input_handle_index(struct vfs_handle *h);
 
 /* vfs_open() intercept support, mirroring serial_tty: returns an fd or
  * -errno; `resolved_path` form is /dev/input/event<N>. */

@@ -36,6 +36,7 @@ struct kernel_param {
 #define module_param_cb_unsafe(name, ops, arg, perm)     struct lkpi_mpcbu_##name##_unused
 #define module_param_array(name, type, nump, perm)       struct lkpi_mpa_##name##_unused
 #define module_param_string(name, str, len, perm)        struct lkpi_mps_##name##_unused
+#undef MODULE_PARM_DESC /* defined by another shim header too; this copy is the one that took effect */
 #define MODULE_PARM_DESC(name, desc)
 #define kernel_param_lock(mod)   do { (void)(mod); } while (0)
 #define kernel_param_unlock(mod) do { (void)(mod); } while (0)

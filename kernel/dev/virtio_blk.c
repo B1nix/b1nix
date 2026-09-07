@@ -477,6 +477,11 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
       console_write_dec(vblk_irq_foreign);
       console_write("\n");
     }
+    /* A tick with no progress: kick the queue again before sleeping on
+     * it. A notification the device missed is the one way a request can
+     * sit in the ring with nothing in flight, and it is cheaper to repeat
+     * the kick than to find out. */
+    virtq_kick(&inst->dev, &inst->vq);
     scheduler_wait_prepare_timeout(inst, VIRTIO_BLK_IO_WATCHDOG_TICKS);
     if (inst->vq.used->idx != inst->vq.last_used_idx) {
       scheduler_wait_cancel();

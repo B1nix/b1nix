@@ -1,4 +1,5 @@
 #include <b1nix/console.h>
+#include <stdio.h>
 #include <b1nix/vfs.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/ktime.h>
@@ -903,9 +904,21 @@ static isize unix_send_to(struct vfs_socket_state *s, const void *buf,
     while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
       n--;
     line[n] = '\0';
-    serial_write("/dev/log: ");
-    serial_write(line);
-    serial_write("\n");
+    /* Through the console, with the datagram's own severity: "<39>" is
+     * daemon.debug, and a desktop's console does not show debug -- elogind
+     * alone sent a hundred lines a second of it to the screen. The text is
+     * kept whole after the prefix, so the serial log reads as before. */
+    {
+      int sev = 6;
+      if (line[0] == '<') {
+        usize k = 1; int pri = 0;
+        while (line[k] >= '0' && line[k] <= '9') pri = pri * 10 + (line[k++] - '0');
+        if (line[k] == '>') sev = pri & 7;
+      }
+      char out[sizeof(line) + 16];
+      snprintf(out, sizeof(out), "<%d>/dev/log: %s\n", sev, line);
+      console_write(out);
+    }
     return (isize)len;
   }
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;

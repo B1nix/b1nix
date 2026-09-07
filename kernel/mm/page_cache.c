@@ -2,10 +2,10 @@
 #include <b1nix/arch.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/vfs.h>
+#include <b1nix/sched.h>
 #include <b1nix/mm.h>
 #include <b1nix/errno.h>
 #include <b1nix/console.h>
-#include <b1nix/sched.h>
 #include <string.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/klog.h>
@@ -867,6 +867,20 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   return 0;
 }
 
+/* Inodes with dirty pages, for the writeback thread.
+ *
+ * Dirty pages used to reach the disk only when the file was closed: close(2)
+ * held the inode lock and wrote every dirty page out before it returned, and
+ * sync(2) did not look at the page cache at all. A desktop start-up writes
+ * a hundred megabytes of caches that way, each close waiting for its file's
+ * pages to hit the disk on the program's own critical path -- 1.6 s of
+ * close(2) while Plasma started -- and every one of those flushes walks the
+ * whole LRU per dirty page. Now a file that dirties a page joins this list,
+ * the writeback thread drains the list twice a second, and sync, syncfs and
+ * umount drain it first. Memory-backed inodes (tmpfs, memfd) never join:
+ * nothing of theirs is ever written anywhere. */
+static struct vfs_inode *g_dirty_inodes;
+
 void page_cache_mark_dirty(struct page_cache_entry *page) {
   lock_pc();
   if (!(page->flags & PAGE_CACHE_DIRTY)) {
@@ -875,7 +889,24 @@ void page_cache_mark_dirty(struct page_cache_entry *page) {
       __atomic_add_fetch(&page->inode->dirty_pages, 1, __ATOMIC_RELEASE);
   }
   page->flags |= PAGE_CACHE_DIRTY;
+  struct vfs_inode *inode = page->inode;
+  if (inode && !inode->on_dirty_list && !(inode->flags & VFS_NODE_MEMORY_BACKED)) {
+    vfs_inode_get(inode);
+    inode->on_dirty_list = 1;
+    inode->dirty_next = g_dirty_inodes;
+    g_dirty_inodes = inode;
+  }
   unlock_pc();
+}
+
+struct vfs_inode *page_cache_take_dirty_inodes(void) {
+  lock_pc();
+  struct vfs_inode *list = g_dirty_inodes;
+  g_dirty_inodes = 0;
+  for (struct vfs_inode *in = list; in; in = in->dirty_next)
+    in->on_dirty_list = 0; /* a page dirtied from here on re-links it */
+  unlock_pc();
+  return list;
 }
 
 static void writeback_page_locked(struct page_cache_entry *page) {

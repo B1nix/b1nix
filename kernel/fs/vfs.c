@@ -4508,16 +4508,9 @@ void vfs_close_handle(struct vfs_handle *h, int owner_pid) {
 
   if (h->kind == VFS_HANDLE_NODE && h->node && h->node->inode) {
     filelock_release_all_by_pid_inode(owner_pid, h->node->inode);
-
-    if (h->flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR)) {
-      /* Hold the inode lock across the flush: writeback drops the page-cache
-       * lock around write_cb while reading the frame, and a concurrent
-       * ftruncate's page_cache_truncate_inode would otherwise memset that live
-       * frame mid-DMA. read/write/truncate all serialize on this same lock. */
-      vfs_inode_lock(h->node->inode);
-      page_cache_flush_inode(h->node->inode);
-      vfs_inode_unlock(h->node->inode);
-    }
+    /* Dirty pages are no longer written here: the writeback thread does it
+     * (page_cache_flush_dirty_inodes), and fsync, sync and umount force it.
+     * close(2) waiting for the disk was 1.6 s of a desktop start-up. */
   }
 
   if (h->ops && h->ops->close)
@@ -5981,6 +5974,24 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
     }
   }
 
+  /* Input event devices (/dev/input/eventN): raw handles with no node, but
+   * libinput fstat(2)s every fd it opens right after open() and, on anything
+   * that is not a character device, treats it as "not a device" and drops it.
+   * That is why a mouse present, tagged and openable still never reached a
+   * cursor. Report the char-device identity the node carries, 13:64+index. */
+  if (ph && ph->kind == VFS_HANDLE_INPUT) {
+    extern int input_handle_index(struct vfs_handle *h);
+    int idx = input_handle_index(ph);
+    if (idx < 0)
+      return -EBADF;
+    memset(st, 0, sizeof(*st));
+    st->st_mode = B1NIX_S_IFCHR | 0600;
+    st->st_nlink = 1;
+    st->st_rdev = ((u64)13 << 8) | (u64)(64 + idx);
+    st->st_ino = (u64)(64 + idx);
+    st->st_blksize = 512;
+    return 0;
+  }
   /* Descriptors with no node of their own — the imported DRM core's objects,
    * which Linux backs with an anonymous inode. fstat on one has to work: a
    * compositor stats every descriptor it is handed, and an error here reads as
@@ -6794,6 +6805,7 @@ int vfs_umount(const char *target) {
       module_put(owner);
 
       if (last_ref && root && root->inode && root->inode->blk_dev) {
+        vfs_writeback_dirty_inodes();
         blk_cache_flush(root->inode->blk_dev);
         blk_cache_invalidate(root->inode->blk_dev);
       }
@@ -7518,7 +7530,49 @@ out:
   return res;
 }
 
+/* Dirty pages used to reach the disk only when the file was closed: close(2)
+ * held the inode lock and wrote every dirty page out before returning, and
+ * sync(2) did not look at the page cache at all. A desktop start-up writes a
+ * hundred megabytes of caches that way, each close waiting for the disk on
+ * the program's own critical path -- 1.6 s of close(2) while Plasma started.
+ * The page cache now lists the inodes that dirtied a page; this drains the
+ * list, the pcflush thread calls it twice a second, and sync, syncfs and
+ * umount call it first. */
+int vfs_writeback_dirty_inodes(void) {
+  struct vfs_inode *list = page_cache_take_dirty_inodes();
+  int n = 0;
+  while (list) {
+    struct vfs_inode *in = list;
+    list = in->dirty_next;
+    in->dirty_next = 0;
+    /* The inode lock across the flush, as close(2) held it: writeback drops
+     * the page-cache lock around write_cb, and a concurrent truncate would
+     * otherwise zero a frame that is mid-DMA. */
+    vfs_inode_lock(in);
+    page_cache_flush_inode(in);
+    vfs_inode_unlock(in);
+    vfs_inode_put(in);
+    n++;
+  }
+  return n;
+}
+
+static void writeback_thread(void *arg) {
+  (void)arg;
+  for (;;) {
+    scheduler_sleep_ticks(sched_tick_hz() / 2);
+    vfs_writeback_dirty_inodes();
+  }
+}
+
+void vfs_start_writeback(void) {
+  kthread_create("pcflush", writeback_thread, 0);
+}
+
 int vfs_sync(void) {
+  /* Dirty file pages first: they only reach the block cache through here,
+   * fsync, umount or the writeback thread. */
+  vfs_writeback_dirty_inodes();
   /* Flush in-memory filesystem structures to block cache first */
   ext2_sync_all_fs();
   fat32_sync_all_fs();
@@ -9079,6 +9133,7 @@ int vfs_fstatfs(int fd, struct b1nix_statfs *st) {
 }
 
 int vfs_syncfs(int fd) {
+  vfs_writeback_dirty_inodes();
   struct vfs_handle *handle = get_handle(fd);
   if (!handle || !handle->used)
     return -EBADF;

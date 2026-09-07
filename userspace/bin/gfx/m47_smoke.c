@@ -21,6 +21,17 @@
 #include <b1nix/fb.h>
 #include <linux/fb.h>
 #include <b1nix/input.h>
+
+/* What a Linux-ABI program reads from /dev/input/eventN: the 24-byte
+ * struct input_event, timeval first. The kernel's native 16-byte record is
+ * for its own readers; this program is a musl binary and gets the Linux one. */
+struct lx_input_event {
+	long tv_sec;
+	long tv_usec;
+	uint16_t type;
+	uint16_t code;
+	int32_t value;
+};
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -287,7 +298,7 @@ static int test_input_open(void) {
 
 	/* No one is typing during the smoke run: an empty nonblocking read must
 	 * say EAGAIN, and poll must not report readiness on the keyboard. */
-	struct b1nix_input_event ev;
+	struct lx_input_event ev;
 	int n = (int)read(kfd, &ev, sizeof(ev));
 	if (n >= 0 || errno != EAGAIN) {
 		marker("M47-GFX: fail input-eagain\n");
@@ -313,15 +324,15 @@ static int test_input_events(void) {
 	int saw_rel_x = 0, saw_rel_y = 0, saw_btn = 0, saw_syn = 0;
 	/* Read until SYN or ~5 s of nonblocking retries. */
 	for (int spins = 0; spins < 100000 && !saw_syn; spins++) {
-		struct b1nix_input_event evs[8];
+		struct lx_input_event evs[8];
 		int n = (int)read(fd, evs, sizeof(evs));
 		if (n < 0 && errno == EAGAIN) {
 			sched_yield();
 			continue;
 		}
-		if (n <= 0 || (n % (int)sizeof(struct b1nix_input_event)) != 0)
+		if (n <= 0 || (n % (int)sizeof(struct lx_input_event)) != 0)
 			break;
-		int count = n / (int)sizeof(struct b1nix_input_event);
+		int count = n / (int)sizeof(struct lx_input_event);
 		for (int i = 0; i < count; i++) {
 			if (evs[i].type == B1NIX_EV_REL && evs[i].code == B1NIX_REL_X &&
 			    evs[i].value == 7)

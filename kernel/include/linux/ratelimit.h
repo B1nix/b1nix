@@ -20,7 +20,6 @@ struct ratelimit_state {
 #define DEFINE_RATELIMIT_STATE(name, intv, brst) \
 	struct ratelimit_state name = RATELIMIT_STATE_INIT(name, intv, brst)
 #ifndef DEFAULT_RATELIMIT_INTERVAL
-#define DEFAULT_RATELIMIT_INTERVAL (5 * HZ)
 #endif
 #ifndef DEFAULT_RATELIMIT_BURST
 #define DEFAULT_RATELIMIT_BURST 10

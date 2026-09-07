@@ -141,6 +141,7 @@ extern void virtio_input_init(void);
 
 /* Visual boot markers — see b1nix/bootmark.h. */
 #include <b1nix/bootmark.h>
+#include <b1nix/fb_console.h>
 
 /* Matches the console's own default; the phone build overrides both. */
 #ifndef FB_CONSOLE_FONT_SCALE
@@ -1670,6 +1671,8 @@ void kernel_main(usize arg0, usize arg1)
 	 * filesystems are up — kswapd keeps a free-frame headroom so userspace
 	 * allocations rarely stall in synchronous reclaim. */
 	kswapd_init();
+	vfs_start_writeback();
+	fb_console_start_flusher();
 
 	/* M99/M100 self-tests run here rather than in the block above: they create
 	 * kernel threads and park on wait channels, which needs the full

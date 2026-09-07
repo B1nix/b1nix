@@ -739,6 +739,12 @@ static void sysfs_char_publish(struct vfs_node *devnode, const char *name) {
    * which is worse than not publishing the entry at all. */
   if (major == 226)
     return;
+  /* Input (13) publishes its own too: /sys/dev/char/13:N is a link to
+   * /sys/devices/virtual/input/inputN/eventN, whose parent carries the
+   * capabilities udev classifies the device by. A directory here shadowed
+   * that link, and logind's TakeDevice for the mouse answered ENODEV. */
+  if (major == 13)
+    return;
 
   char majmin[24];
   snprintf(majmin, sizeof(majmin), "%u:%u", (unsigned)major, (unsigned)minor);

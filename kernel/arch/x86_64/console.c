@@ -176,7 +176,7 @@ static void console_dev_putc(char ch)
 		serial_putc(ch);
 		return;
 	}
-	if (bootinfo_get()->has_framebuffer) {
+	if (bootinfo_get()->has_framebuffer || fb_console_ready()) {
 		/* A machine with a framebuffer is in a graphics mode: the VGA text
 		 * buffer below is not on any screen. It was still written to once a
 		 * DRM client had claimed the display -- and each of its cells is an
@@ -447,6 +447,11 @@ void console_log_init(void)
 	 * an explicit `loglevel=` always wins over it. */
 	if (bootinfo_has_flag("quiet"))
 		level = CONSOLE_LOGLEVEL_QUIET;
+	/* The smoke lanes grade the serial log and some of what they grade is
+	 * debug-level tracing (which binary got which personality); they see
+	 * everything. A desktop's console shows info and worse, as Linux does. */
+	if (bootinfo_has_flag("b1nix.test=1"))
+		level = LOGLEVEL_DEBUG;
 	if (bootinfo_get_kv("loglevel", value, sizeof(value)) && value[0])
 		level = (int)bootinfo_get_u32("loglevel", (u32)level);
 	if (level < 0)
@@ -514,6 +519,9 @@ void console_write(const char *text)
 	for (usize i = 0; text[i] != '\0'; i++) {
 		console_putc(text[i]);
 	}
+	/* A display that has to be told (a DRM framebuffer) is told by the
+	 * fbflush thread, not from under this lock. */
+	fb_console_request_flush();
 	console_lock_release();
 	interrupts_restore(flags);
 	/* ... and, when TIOCCONS has pointed the console at a terminal, a copy

@@ -1,3 +1,4 @@
+#include <b1nix/lapic.h>
 #include <b1nix/io.h>
 #include <b1nix/serial.h>
 #include <b1nix/errno.h>
@@ -207,23 +208,40 @@ u16 serial_port_base(int idx)
  * duration of its line (it holds the console lock with interrupts off, which
  * is what makes one static buffer enough) and every console_lock_release
  * flushes; a caller outside that window writes byte by byte as before. */
-static int serial_batch_on;
+/* The batch belongs to ONE CPU: the one inside console_write, which holds
+ * the console lock with interrupts off. serial_putc is also called with no
+ * lock at all -- the panic path, the gdb stub, the VFS console fallback --
+ * and while the batch was a plain global flag those callers appended to
+ * the same sixteen bytes from another CPU. The index ran past the buffer
+ * into the variables behind it in .bss: rtc_boot_time_seconds, lapic_base,
+ * ap_cpu_data[]. That was a #GP in lapic_write from the interrupt path, a
+ * page-table frame "allocated twice", and a heap list link holding text.
+ * Now only the owner batches; everyone else writes the byte straight out. */
+static int serial_batch_owner; /* cpu_id + 1, 0 = nobody */
 static char serial_batch[16];
-static int serial_batch_n;
+static unsigned serial_batch_n;
+
+static int serial_this_cpu(void)
+{
+	struct percpu *p = get_percpu();
+	return p ? (int)p->cpu_id + 1 : 0;
+}
 
 static void serial_batch_flush(void)
 {
-	if (!serial_batch_n)
+	unsigned n = serial_batch_n;
+	if (!n)
 		return;
-	int idx = 0;
-	int n = serial_batch_n;
+	if (n > sizeof(serial_batch))
+		n = sizeof(serial_batch);
 	serial_batch_n = 0;
+	int idx = 0;
 	if (!serial_detected[idx])
 		return;
 	u64 deadline = serial_tsc() + SERIAL_TX_WAIT_CYCLES;
 	do {
 		if (!serial_line_busy[idx] && (inb(serial_base[idx] + 5) & 0x20)) {
-			for (int i = 0; i < n; i++)
+			for (unsigned i = 0; i < n; i++)
 				outb(serial_base[idx], (u8)serial_batch[i]);
 			return;
 		}
@@ -232,23 +250,30 @@ static void serial_batch_flush(void)
 
 void serial_batch_begin(void)
 {
-	serial_batch_on = 1;
+	int me = serial_this_cpu();
+	if (!me)
+		return; /* no per-CPU data yet: nothing to own, bytes go straight out */
+	serial_batch_owner = me;
 }
 
 void serial_batch_end(void)
 {
-	serial_batch_flush();
-	serial_batch_on = 0;
+	if (serial_batch_owner && serial_batch_owner == serial_this_cpu()) {
+		serial_batch_flush();
+		serial_batch_owner = 0;
+	}
 }
 
 void serial_putc(char ch)
 {
-	if (!serial_batch_on) {
+	if (!serial_batch_owner || serial_batch_owner != serial_this_cpu()) {
 		serial_port_putc(0, ch);
 		return;
 	}
+	if (serial_batch_n >= sizeof(serial_batch))
+		serial_batch_flush();
 	serial_batch[serial_batch_n++] = ch;
-	if (serial_batch_n == (int)sizeof(serial_batch))
+	if (serial_batch_n == sizeof(serial_batch))
 		serial_batch_flush();
 }
 

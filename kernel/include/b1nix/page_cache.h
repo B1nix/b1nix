@@ -57,6 +57,10 @@ u64 page_cache_dirty_pages(void);
 
 // Returns a referenced page cache entry. The caller must unref it when done.
 struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset);
+/* Detach the list of inodes that dirtied a page since the last call (linked
+ * through dirty_next, each holding a reference). vfs_writeback_dirty_inodes()
+ * is the caller: the flush needs the inode lock, which lives in vfs.c. */
+struct vfs_inode *page_cache_take_dirty_inodes(void);
 
 // Adds a new page cache entry. Takes ownership of the frame if successful.
 // Returns 0 on success, < 0 on error.
