@@ -690,6 +690,7 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 		static unsigned seen_fb_id, seen_commits;
 		static u64 prim_a, prim_b;
 		static unsigned prim_a_n, prim_b_n, prim_other;
+		(void)prim_b_n;
 
 		if (lkpi_copy_from_user(&req, user_arg, sizeof(req)) == 0 &&
 		    req.count_objs && req.count_objs < 64) {
@@ -736,18 +737,21 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 						 * reusing one buffer or a sample taken during
 						 * start-up; a tally over the whole run cannot be
 						 * mistaken for either. */
-						if (val == prim_a) {
+						/* Two fixed slots latched onto whatever the first
+						 * two ids happened to be -- start-up buffers, in
+						 * every run -- and every later frame fell into
+						 * "others", so a compositor alternating two buffers
+						 * per frame read as one buffer plus noise. What the
+						 * question needs is only whether consecutive commits
+						 * name the SAME buffer. */
+						if (val == prim_a)
 							prim_a_n++;
-						} else if (val == prim_b) {
-							prim_b_n++;
-						} else if (!prim_a) {
-							prim_a = val;
-							prim_a_n = 1;
-						} else if (!prim_b) {
-							prim_b = val;
-							prim_b_n = 1;
-						} else {
+						else
 							prim_other++;
+						if (val != prim_a) {
+							prim_b = prim_a;
+							prim_b_n++;
+							prim_a = val;
 						}
 						drm_want_fb = val;
 					}
@@ -755,9 +759,9 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 			}
 done_props:;
 			if ((seen_commits % 120u) == 0)
-				pr_info("drm: primary plane asked for fb %llu x%u, fb %llu x%u, others x%u\n",
-				        (unsigned long long)prim_a, prim_a_n,
-				        (unsigned long long)prim_b, prim_b_n, prim_other);
+				pr_info("drm: primary plane: %u commit(s) repeated the buffer, %u changed it (now fb %llu, was fb %llu)\n",
+				        prim_a_n, prim_other, (unsigned long long)prim_a,
+				        (unsigned long long)prim_b);
 		}
 	}
 

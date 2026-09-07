@@ -925,6 +925,20 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 			"$(flag_value b1nix.inputload-dev /dev/input/event1)" \
 			"$__load" &
 	fi
+	# b1nix.kde-damage keeps something on screen actually changing.
+	#
+	# A pointer moving over a still desktop damages nothing the compositor has
+	# to redraw -- the cursor rides its own plane -- so a run driven by the
+	# input load alone can show the primary plane holding one buffer for the
+	# whole test and say nothing about whether the compositor rotates its
+	# swapchain. A terminal printing the time does damage a window, every
+	# frame, which is the load the buffer question needs.
+	if has_flag b1nix.kde-damage && [ -x /usr/bin/foot ]; then
+		echo "KDE: damage load t=$(up)"
+		WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" \
+			foot sh -c 'while :; do date +%H:%M:%S.%N; usleep 30000; done' \
+			> /tmp/kde-foot-damage.log 2>&1 &
+	fi
 	if has_flag b1nix.sysprof; then
 		__left=$__hold
 		while [ "$__left" -gt 0 ]; do

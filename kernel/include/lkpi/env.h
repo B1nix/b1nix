@@ -406,4 +406,11 @@ int lkpi_display_present(const u32 *pixels, u32 width, u32 height);
 /* A kernel command-line flag, by name. 1 when present. */
 int lkpi_bootflag(const char *flag);
 
+/* A "key=value" kernel command-line option, as a number. def when absent or
+ * unparsable. */
+u32 lkpi_bootopt_u32(const char *key, u32 def);
+
+/* The same, as text. 1 when the key is on the command line. */
+int lkpi_bootopt_str(const char *key, char *out, unsigned out_size);
+
 #endif

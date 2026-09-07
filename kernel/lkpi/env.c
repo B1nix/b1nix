@@ -987,6 +987,27 @@ int lkpi_bootflag(const char *flag)
 	return bootinfo_has_flag(flag);
 }
 
+int lkpi_bootopt_str(const char *key, char *out, unsigned out_size)
+{
+	return bootinfo_get_kv(key, out, out_size);
+}
+
+u32 lkpi_bootopt_u32(const char *key, u32 def)
+{
+	char buf[32];
+	u32 val = 0;
+	const char *p = buf;
+
+	if (!bootinfo_get_kv(key, buf, sizeof(buf)) || !buf[0])
+		return def;
+	for (; *p; p++) {
+		if (*p < '0' || *p > '9')
+			return def;
+		val = val * 10u + (u32)(*p - '0');
+	}
+	return val;
+}
+
 /*
  * Monotonic nanoseconds, from the TSC.
  *
