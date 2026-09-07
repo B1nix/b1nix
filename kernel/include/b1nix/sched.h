@@ -393,6 +393,15 @@ void task_clear_cmdline(struct task *t);
  * then keeps working with x87+SSE only. */
 void *task_xsave_area(const struct task *t);
 int task_fpu_alloc(struct task *t);
+/* The task table has SCHED_MAX_TASKS rows and every side table the scheduler
+ * keeps (FPU area, nice, affinity, ...) is indexed by a task's row in it.
+ * task_slot_index() hands that row out so another subsystem can keep a
+ * per-task entry of its own without growing struct task. The per-CPU idle
+ * tasks live outside the table and answer with a row at or above
+ * SCHED_MAX_TASKS; they never return to userspace, so a table sized to the
+ * real tasks only needs to bounds-check. */
+#define SCHED_MAX_TASKS 4096
+usize task_slot_index(const struct task *t);
 /* ── M86: per-thread CPU time ─────────────────────────────────────────────── */
 /* USER_HZ: times(2) and /proc report CPU time in 10 ms clock ticks. The kernel
  * keeps nanoseconds and converts at the edge. */

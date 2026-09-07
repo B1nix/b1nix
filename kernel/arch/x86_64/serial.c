@@ -196,9 +196,60 @@ u16 serial_port_base(int idx)
 	return serial_base[idx];
 }
 
+/* Console lines go out sixteen bytes at a time.
+ *
+ * serial_port_putc reads the line status before every byte, and under a
+ * hypervisor each of those reads is an exit: a line of the boot log was
+ * 0.6 ms with interrupts off, the console lock held, and 22% of all the
+ * interrupts-off time of a desktop start-up. The transmit FIFO is sixteen
+ * bytes deep and the "holding register empty" bit means it is empty, so one
+ * status read covers sixteen bytes. console_write turns this on for the
+ * duration of its line (it holds the console lock with interrupts off, which
+ * is what makes one static buffer enough) and every console_lock_release
+ * flushes; a caller outside that window writes byte by byte as before. */
+static int serial_batch_on;
+static char serial_batch[16];
+static int serial_batch_n;
+
+static void serial_batch_flush(void)
+{
+	if (!serial_batch_n)
+		return;
+	int idx = 0;
+	int n = serial_batch_n;
+	serial_batch_n = 0;
+	if (!serial_detected[idx])
+		return;
+	u64 deadline = serial_tsc() + SERIAL_TX_WAIT_CYCLES;
+	do {
+		if (!serial_line_busy[idx] && (inb(serial_base[idx] + 5) & 0x20)) {
+			for (int i = 0; i < n; i++)
+				outb(serial_base[idx], (u8)serial_batch[i]);
+			return;
+		}
+	} while (serial_tsc() < deadline);
+}
+
+void serial_batch_begin(void)
+{
+	serial_batch_on = 1;
+}
+
+void serial_batch_end(void)
+{
+	serial_batch_flush();
+	serial_batch_on = 0;
+}
+
 void serial_putc(char ch)
 {
-	serial_port_putc(0, ch);
+	if (!serial_batch_on) {
+		serial_port_putc(0, ch);
+		return;
+	}
+	serial_batch[serial_batch_n++] = ch;
+	if (serial_batch_n == (int)sizeof(serial_batch))
+		serial_batch_flush();
 }
 
 int serial_has_data(void)

@@ -18,10 +18,10 @@ cd "$DIR"
 # no refresh: the image builds, boots, and behaves as though the edit was never
 # made. userspace/Makefile stages the same directory the same way.
 cp -R userspace/rootfs-overlay/. build/x86_64/rootfs/
-dd if=/dev/zero of=build/x86_64/root.ext4 bs=1048576 count=2560 2>/dev/null
+dd if=/dev/zero of=build/x86_64/root-kde.ext4 bs=1048576 count=2560 2>/dev/null
 mke2fs -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q -L b1nix-root \
-	-E root_owner=0:0 -d build/x86_64/rootfs build/x86_64/root.ext4
+	-E root_owner=0:0 -d build/x86_64/rootfs build/x86_64/root-kde.ext4
 sh tools/mkiso.sh --stage build/x86_64/iso --out "build/x86_64/$OUT" \
 	--arch x86_64 --kernel build/x86_64/kernel.elf --timeout 0 \
-	--cmdline "$CMDLINE" --module build/x86_64/root.ext4:rootfs.img
+	--cmdline "$CMDLINE" --module build/x86_64/root-kde.ext4:rootfs.img
 echo "kde-refresh: build/x86_64/$OUT cmdline=[$CMDLINE]"

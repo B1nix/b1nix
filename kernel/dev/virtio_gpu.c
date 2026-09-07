@@ -1,6 +1,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
+#include <b1nix/ktime.h>
 #include <b1nix/dma_fence.h>
 #include <b1nix/errno.h>
 #include <b1nix/gpu_scheduler.h>
@@ -2258,13 +2259,13 @@ static int gfx_prof_on(void)
 
 static u64 gfx_prof_now(void)
 {
-	return gfx_prof_on() ? arch_tsc_monotonic_ns() : 0;
+	return gfx_prof_on() ? ktime_monotonic_ns() : 0;
 }
 
 static void gfx_prof_add(u64 *acc, u64 t0)
 {
 	if (t0)
-		*acc += arch_tsc_monotonic_ns() - t0;
+		*acc += ktime_monotonic_ns() - t0;
 }
 
 void virtio_gpu_prof_report(void)

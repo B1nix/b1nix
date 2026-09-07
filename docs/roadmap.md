@@ -1215,6 +1215,29 @@ input and session handling, so it breaks on assumptions wlroots never made.
 
 Details, and the traps this cost, in [`kde-plasma-drm.md`](kde-plasma-drm.md).
 
+- [x] `done` **Boot time profiled** (`tools/run-kde.sh`, `b1nix.sysprof`,
+      `/proc/b1nix-prof` dumped by `/etc/kde.sh`): QEMU start to a painted
+      desktop 194 s → ~16 s. 160 s was the bootloader copying the 2.5 GB root
+      module off the emulated CD — the runner boots a module-less ISO with
+      root.ext4 as a virtio disk, mounted by label. In the kernel: the rseq
+      return-to-user hook took a global lock with IRQs off and scanned 4096
+      entries on every tick (53% of kernel samples); pipes had no FIONREAD, so
+      kioworker spun at 110 000 poll+ioctl a second; `get_percpu()` read an
+      MSR; command-line flags and the Linux syscall map were scanned per
+      syscall; console lines went to the UART one status read per byte. New
+      instruments: interrupts-off time by caller (`kprof-irqoff`) and syscalls
+      by task (`sysprof by task`), poll answers with descriptor kinds
+      (`b1nix.trace-poll`). Found with them: kactivitymanagerd spun at
+      110 000 poll+ioctl a second on an inotify descriptor because FIONREAD
+      was ENOTTY there; TLB shootdowns went to every CPU (now only to those
+      with the address space loaded); every log line after DRM took the
+      display scrolled the unseen VGA text buffer through 4000 MMIO exits.
+      One packed root image per package group (`root-kde.ext4`), so a smoke
+      run no longer destroys the KDE image. Left: close() writes dirty pages
+      synchronously (no writeback thread) and the flush walks the whole LRU;
+      dbus/elogind second-long stalls in session setup; vmm read-lock per
+      copyin; 25 duplicate-macro warnings in the lkpi headers.
+
 ## M114: The layers under the missing applets
 
 Alpine's BusyBox builds 304 applets and ours built 287. Most of the difference

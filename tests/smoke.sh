@@ -399,7 +399,11 @@ run_qemu() {
 				# guest cannot trust the counter and falls back to the 100 Hz
 				# tick — so the TSC clock path, which is what real runs use, was
 				# never exercised by the smoke suite at all.
-				accel_args="-accel kvm -cpu host,+invtsc"
+				# SMOKE_CPU overrides the model: SMOKE_CPU=host is the machine
+				# without an invariant TSC, which is what every QEMU that is not
+				# told otherwise looks like, and a whole class of "the clock
+				# read zero for ever" hangs only shows up there.
+				accel_args="-accel kvm -cpu ${SMOKE_CPU:-host,+invtsc}"
 			elif [ "$(uname)" = "Darwin" ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw hvf; then
 				accel_args="-accel hvf -cpu host"
 			fi

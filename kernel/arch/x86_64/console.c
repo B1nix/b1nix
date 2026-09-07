@@ -91,6 +91,7 @@ static void console_lock_acquire(void)
 
 static void console_lock_release(void)
 {
+	serial_batch_end();
 	/* Advance the queue only if it is still standing where this section
 	 * left it. A bust (or a bypass) moves `owner` on without us, and an
 	 * unconditional increment would then run the turn past waiters that
@@ -175,9 +176,15 @@ static void console_dev_putc(char ch)
 		serial_putc(ch);
 		return;
 	}
-	if (bootinfo_get()->has_framebuffer && fb_console_ready() &&
-	    !fb_dev_claimed()) {
-		fb_console_putchar(ch);
+	if (bootinfo_get()->has_framebuffer) {
+		/* A machine with a framebuffer is in a graphics mode: the VGA text
+		 * buffer below is not on any screen. It was still written to once a
+		 * DRM client had claimed the display -- and each of its cells is an
+		 * MMIO exit under a hypervisor, four thousand of them per scroll, so
+		 * every line of the log cost half a millisecond with interrupts off
+		 * while a desktop started. Serial only, then. */
+		if (fb_console_ready() && !fb_dev_claimed())
+			fb_console_putchar(ch);
 		serial_putc(ch);
 		return;
 	}
@@ -503,6 +510,7 @@ void console_write(const char *text)
 	g_console_write_seq++;
 	flags = interrupts_save();
 	console_lock_acquire();
+	serial_batch_begin();
 	for (usize i = 0; text[i] != '\0'; i++) {
 		console_putc(text[i]);
 	}

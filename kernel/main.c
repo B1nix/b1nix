@@ -391,6 +391,11 @@ static int mount_first_virtio_root(void)
 
 void kernel_main(usize arg0, usize arg1)
 {
+#ifdef __x86_64__
+	/* Before the first console_write or frame allocation: both ask which CPU
+	 * they are on, and the answer must be "none yet", not a stray word. */
+	arch_gs_base_early();
+#endif
 	/* Before anything else that can go deep: the boot stack is still shallow
 	 * here, so this is the only point at which the unused part of it can be
 	 * painted and its high-water mark made measurable. */

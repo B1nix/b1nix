@@ -28,8 +28,8 @@ start_system_bus() {
 		mkdir -p /run/dbus
 		dbus-daemon --system --fork > /tmp/kde-systembus.log 2>&1
 		__i=0
-		while [ $__i -lt 15 ] && [ ! -S /run/dbus/system_bus_socket ]; do
-			__i=$((__i + 1)); sleep 1
+		while [ $__i -lt 75 ] && [ ! -S /run/dbus/system_bus_socket ]; do
+			__i=$((__i + 1)); usleep 200000
 		done
 	fi
 	if [ ! -S /run/dbus/system_bus_socket ]; then
@@ -63,9 +63,9 @@ start_udev() {
 	mkdir -p /run/udev
 	pgrep -f "[u]devd" > /dev/null 2>&1 || 		setsid "$__udevd" --daemon > /tmp/kde-udevd.log 2>&1
 	__i=0
-	while [ $__i -lt 10 ]; do
+	while [ $__i -lt 50 ]; do
 		[ -e /run/udev/control ] && break
-		__i=$((__i + 1)); sleep 1
+		__i=$((__i + 1)); usleep 200000
 	done
 	# The coldplug replay, bounded: `udevadm settle` waits on a queue that a
 	# udevd which never started would never drain.
@@ -106,10 +106,10 @@ start_logind() {
 			--type=method_call --print-reply /org/freedesktop/DBus \
 			org.freedesktop.DBus.ListNames 2>/dev/null \
 			| grep -q org.freedesktop.login1; then
-			echo "KDE: ok logind t=$(up) after ${__i}s"
+			echo "KDE: ok logind t=$(up) after $((__i / 5))s"
 			return 0
 		fi
-		__i=$((__i + 1)); sleep 1
+		__i=$((__i + 1)); usleep 200000
 	done
 	echo "KDE: fail logind t=$(up): $(tail -3 /tmp/kde-elogind.log 2>/dev/null | tr '\n' ' ')"
 	return 1
@@ -133,7 +133,7 @@ enter_session() {
 	if pgrep -f "[g]etty.*tty1" > /dev/null 2>&1; then
 		echo "KDE: getty holds tty1, stopping it t=$(up)"
 		pkill -f "[g]etty.*tty1" 2>/dev/null
-		sleep 1
+		usleep 200000
 	fi
 	echo "KDE: tty1 held by: $(fuser /dev/tty1 2>&1 | tr '\n' ' ' | cut -c1-60)"
 
@@ -167,9 +167,28 @@ has_flag() {
 	return 1
 }
 
+# Polls tick every 200 ms (busybox usleep; this sleep has no fractions), and
+# a loop bound is in ticks: "-lt 75" is fifteen seconds. Waiting a whole
+# second between checks cost the desktop three to four seconds of pure
+# granularity across the dozen things this script waits for.
 up() { cut -d' ' -f1 /proc/uptime; }
 
+#
+# The kernel's own profile, when asked for.
+#
+# b1nix.sysprof keeps a histogram of kernel instruction pointers sampled from
+# the timer tick; reading /proc/b1nix-prof dumps it to the serial line. Once
+# here, so it covers the boot up to this point (bootloader hand-off, root
+# mount, init), and once more when the desktop reports itself, so the two can
+# be subtracted.
+#
+kprof() {
+	has_flag b1nix.sysprof || return 0
+	echo "KDE: kprof $1 t=$(up)"
+	cat /proc/b1nix-prof > /dev/null 2>&1
+}
 echo "KDE: start t=$(up)"
+kprof boot
 
 export HOME=/root
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
@@ -271,8 +290,8 @@ CONF
 		setsid dbus-daemon --config-file=/etc/dbus-1/b1nix-system.conf --fork \
 			> /tmp/kde-dbus.log 2>&1
 		i=0
-		while [ $i -lt 15 ] && [ ! -S /run/dbus/system_bus_socket ]; do
-			i=$((i + 1)); sleep 1
+		while [ $i -lt 75 ] && [ ! -S /run/dbus/system_bus_socket ]; do
+			i=$((i + 1)); usleep 200000
 		done
 		if [ -S /run/dbus/system_bus_socket ]; then
 			echo "KDE: ok dbus t=$(up)"
@@ -291,7 +310,7 @@ if [ -x /usr/sbin/seatd ] || [ -x /usr/bin/seatd ]; then
 	export LIBSEAT_BACKEND=seatd
 	SEATD_VTBOUND=0 seatd -g root > /tmp/kde-seatd.log 2>&1 &
 	i=0
-	while [ $i -lt 20 ] && [ ! -S /run/seatd.sock ]; do i=$((i + 1)); sleep 1; done
+	while [ $i -lt 100 ] && [ ! -S /run/seatd.sock ]; do i=$((i + 1)); usleep 200000; done
 	[ -S /run/seatd.sock ] && echo "KDE: ok seatd t=$(up)" \
 	                       || echo "KDE: no seatd socket t=$(up)"
 	echo "KDE: seatd says: $(tail -3 /tmp/kde-seatd.log 2>/dev/null | tr '\n' ' ')"
@@ -337,8 +356,8 @@ stop_session() {
 		pkill -TERM -x "$c" 2>/dev/null
 	done
 	i=0
-	while [ $i -lt 5 ] && pgrep -x plasmashell > /dev/null 2>&1; do
-		i=$((i + 1)); sleep 1
+	while [ $i -lt 25 ] && pgrep -x plasmashell > /dev/null 2>&1; do
+		i=$((i + 1)); usleep 200000
 	done
 	kill "$@" 2>/dev/null
 }
@@ -346,12 +365,12 @@ stop_session() {
 wait_kwin_socket() {
 	export XDG_RUNTIME_DIR=/run/user/0
 	__i=0
-	while [ $__i -lt 40 ] && [ ! -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; do
+	while [ $__i -lt 200 ] && [ ! -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; do
 		__i=$((__i + 1))
-		sleep 1
+		usleep 200000
 	done
 	if [ -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; then
-		echo "KDE: ok kwin-socket t=$(up) after ${__i}s"
+		echo "KDE: ok kwin-socket t=$(up) after $((__i / 5))s"
 		return 0
 	fi
 	echo "KDE: fail kwin-socket t=$(up) (no $XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1})"
@@ -384,8 +403,8 @@ CONF
 	setsid dbus-daemon --config-file=/etc/dbus-1/b1nix-session.conf --fork \
 		> /tmp/kde-sessionbus.log 2>&1
 	i=0
-	while [ $i -lt 15 ] && [ ! -S /run/user/0/bus ]; do
-		i=$((i + 1)); sleep 1
+	while [ $i -lt 75 ] && [ ! -S /run/user/0/bus ]; do
+		i=$((i + 1)); usleep 200000
 	done
 	if [ -S /run/user/0/bus ]; then
 		echo "KDE: ok session-bus t=$(up)"
@@ -452,16 +471,16 @@ if [ -x /usr/bin/plasmashell ]; then
 		QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
 		LIBGL_ALWAYS_SOFTWARE=1 "$KAMD" > /tmp/kde-kamd.log 2>&1 &
 		i=0
-		while [ $i -lt 20 ]; do
+		while [ $i -lt 100 ]; do
 			dbus-send --session --dest=org.freedesktop.DBus \
 				--type=method_call --print-reply \
 				/org/freedesktop/DBus \
 				org.freedesktop.DBus.ListNames 2>/dev/null \
 				| grep -q org.kde.ActivityManager && break
-			i=$((i + 1)); sleep 1
+			i=$((i + 1)); usleep 200000
 		done
 		if [ $i -lt 20 ]; then
-			echo "KDE: ok activity-manager t=$(up) after ${i}s"
+			echo "KDE: ok activity-manager t=$(up) after $((i / 5))s"
 		else
 			echo "KDE: fail activity-manager t=$(up): $(tail -3 /tmp/kde-kamd.log 2>/dev/null | tr '\n' ' ')"
 		fi
@@ -486,20 +505,20 @@ if [ -x /usr/bin/plasmashell ]; then
 	# binds them, so `of "/bin/plasmashell"` in kwin's log is one process
 	# observing another. The plasmashell-side strings are kept only as a
 	# fallback; they do not appear in this build.
-	while [ $i -lt 45 ]; do
+	while [ $i -lt 225 ]; do
 		plasma_running || break
 		grep -aq 'of "/bin/plasmashell"' /tmp/kde-kwin.log 2>/dev/null && break
 		grep -aq "backingstore\|QQuickWindow\|Loading the desktop" \
 			/tmp/kde-plasmashell.log 2>/dev/null && break
-		i=$((i + 1)); sleep 1
+		i=$((i + 1)); usleep 200000
 	done
 	if [ $i -ge 45 ]; then
 		echo "KDE: plasmashell-no-paint-within ${i}s t=$(up)"
 	else
-		echo "KDE: ok plasmashell-bound t=$(up) after ${i}s"
+		echo "KDE: ok plasmashell-bound t=$(up) after $((i / 5))s"
 	fi
 	if plasma_running; then
-		echo "KDE: ok plasmashell-alive t=$(up) after ${i}s"
+		echo "KDE: ok plasmashell-alive t=$(up) after $((i / 5))s"
 	else
 		echo "KDE: fail plasmashell-died t=$(up)"
 		echo "--- plasmashell log ---"
@@ -512,7 +531,7 @@ if [ -x /usr/bin/plasmashell ]; then
 		WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" foot > /tmp/kde-foot.log 2>&1 &
 		[ -n "${HOST_SOCK:-}" ] && \
 			WAYLAND_DISPLAY="$HOST_SOCK" foot > /tmp/kde-foot-host.log 2>&1 &
-		sleep 8
+		sleep 3
 	fi
 	# Print what the shell said either way: logging it only on death is how a run
 	# that produced a black window told us nothing.
@@ -521,7 +540,7 @@ if [ -x /usr/bin/plasmashell ]; then
 	echo "--- kwin log (last 15) ---"
 	tail -15 /tmp/kde-kwin.log 2>/dev/null
 	echo "--- end logs ---"
-	sleep 10
+	sleep 3
 else
 	echo "KDE: no plasmashell in the image t=$(up)"
 fi
@@ -544,7 +563,7 @@ CFG
 		sway > /tmp/kde-sway.log 2>&1 &
 	SWAYPID=$!
 	i=0
-	while [ $i -lt 25 ] && [ ! -S /run/user/0/wayland-1 ]; do i=$((i+1)); sleep 1; done
+	while [ $i -lt 125 ] && [ ! -S /run/user/0/wayland-1 ]; do i=$((i+1)); usleep 200000; done
 	if [ ! -S /run/user/0/wayland-1 ]; then
 		echo "KDE: fail no-host-compositor t=$(up)"
 		echo "  sway said: $(tail -3 /tmp/kde-sway.log 2>/dev/null | tr '\n' ' ')"
@@ -567,7 +586,7 @@ CFG
 		${CLIENT:+"$CLIENT"} > /tmp/kde-kwin.log 2>&1 &
 	KWINPID=$!
 	i=0
-	while [ $i -lt 40 ] && [ ! -S /run/user/0/wayland-2 ]; do i=$((i+1)); sleep 1; done
+	while [ $i -lt 200 ] && [ ! -S /run/user/0/wayland-2 ]; do i=$((i+1)); usleep 200000; done
 	if [ -S /run/user/0/wayland-2 ]; then
 		echo "KDE: ok nested-socket t=$(up)"
 	else
@@ -706,10 +725,10 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 			--no-lockscreen > /tmp/kde-kwin.log 2>&1 &
 		KWINPID=$!
 		w=0
-		while [ $w -lt 15 ]; do
+		while [ $w -lt 75 ]; do
 			[ -S /run/user/0/wayland-1 ] && break
 			kill -0 $KWINPID 2>/dev/null || break
-			sleep 1
+			usleep 200000
 			w=$((w + 1))
 		done
 		if [ -S /run/user/0/wayland-1 ] && kill -0 $KWINPID 2>/dev/null &&
@@ -731,7 +750,13 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 		echo "KDE: done t=$(up)"
 		exit 0
 	fi
-	sleep 5
+	# Up to 5 s for the socket, not a flat 5 s: the fixed sleeps on this
+	# path added 24 s to a desktop that is up in 17.
+	__i=0
+	while [ $__i -lt 25 ] && [ ! -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; do
+		__i=$((__i + 1))
+		usleep 200000
+	done
 	prog_alive kwin_wayland $KWINPID && echo "KDE: ok alive t=$(up)" \
 	                                 || echo "KDE: fail died t=$(up)"
 
@@ -759,6 +784,7 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 	# framebuffer is worth capturing; the host watches the serial log for them.
 	has_flag b1nix.kde-memprof && memsnap "scanout-ready"
 	echo "KDE: SCANOUT-READY t=$(up)"
+	kprof scanout
 	sleep 90
 	echo "KDE: SCANOUT-END t=$(up)"
 	has_flag b1nix.kde-memprof && memsnap "scanout-end"
@@ -792,9 +818,9 @@ fi
 KWINPID=$!
 
 w=0
-while [ $w -lt 60 ]; do
+while [ $w -lt 300 ]; do
 	[ -S /run/user/0/wayland-1 ] && break
-	sleep 1
+	usleep 200000
 	w=$((w + 1))
 done
 

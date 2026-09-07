@@ -165,13 +165,26 @@ struct percpu {
     u64 loaded_pml4_phys;
     u64 loaded_addrspace_epoch;
 
-    u8 __pad[3800];  /* pad to 4KB total */
+    /* Its own address, so get_percpu() is one %gs-relative load. The base
+     * lives in IA32_GS_BASE and reading that MSR back costs a serialising
+     * rdmsr: 5% of the kernel's tick samples while Plasma started, from
+     * current_task alone. The kernel never runs with any other GS base (no
+     * swapgs), so %gs:offset is always this structure. Kept at the end
+     * because syscall_entry.S addresses the fields above by hand. */
+    struct percpu *self;
+    /* Outermost interrupts-off section in progress (b1nix.sysprof only). */
+    u64 irqoff_t0;
+    void *irqoff_site;
+    u8 __pad[3776];  /* pad to 4KB total */
 } __attribute__((aligned(4096)));
 
 /* Segment base management */
 #ifdef __x86_64__
 void arch_set_gs_base(u64 base);
 u64 arch_get_gs_base(void);
+void arch_gs_base_early(void);
+/* Another CPU's structure, or 0 before it exists. */
+struct percpu *percpu_for_cpu(int cpu);
 #else
 void arch_set_fs_base_percpu(u32 base);
 u32 arch_get_fs_base_percpu(void);
@@ -181,8 +194,11 @@ u32 arch_get_fs_base_percpu(void);
  * Returns NULL if not yet initialized. */
 static inline struct percpu *get_percpu(void) {
 #ifdef __x86_64__
-    u64 gs = arch_get_gs_base();
-    return gs ? (struct percpu *)gs : (struct percpu *)0;
+    struct percpu *self;
+    __asm__ volatile("movq %%gs:%c1, %0"
+                     : "=r"(self)
+                     : "i"(__builtin_offsetof(struct percpu, self)));
+    return self;
 #elif defined(__aarch64__)
     extern struct percpu *aarch64_get_percpu(void);
     return aarch64_get_percpu();

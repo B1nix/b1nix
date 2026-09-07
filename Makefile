@@ -294,18 +294,32 @@ I915_SOURCE_MARKER := $(BUILD_DIR)/../src/i915-6.6/B1NIX-OBJECTS
 DRM_CORE_MARKER := $(BUILD_DIR)/../src/drm-core-6.6/include/drm/drm_device.h
 
 PKGROOT := build/$(ARCH)/pkgroot-browser
+ROOT_VARIANT := -browser
 else ifeq ($(B1NIX_KDE),1)
 # KDE brings Qt6 and KF6 with it; same separation as the browser and the driver
 # stack, for the same reason.
 PKGROOT := build/$(ARCH)/pkgroot-kde
+ROOT_VARIANT := -kde
 else ifeq ($(B1NIX_GPU_DRV),1)
 # Same reasoning as the browser above, for the same reason it was written down:
 # the driver stack is 184 MB that an ordinary image must not inherit, and a
 # shared staging root is how it would.
 PKGROOT := build/$(ARCH)/pkgroot-gpudrv
+ROOT_VARIANT := -gpudrv
 else
 PKGROOT := build/$(ARCH)/pkgroot
+ROOT_VARIANT :=
 endif
+# The packed root, one per package group. The staging tree is shared (it is
+# also the sysroot every port links against), so switching groups restages it
+# and the manifest test in mk-root-image.sh sees a different tree -- with one
+# image that meant a fresh 2.5 GB mke2fs on every switch between a smoke run
+# and a KDE build, in each direction. Each group's image is compared with its
+# own manifest instead, and a group restaged from its package root comes back
+# with the archive timestamps it left with, so the image is found up to date.
+# It also means a KDE image survives a smoke run: tools/run-kde.sh boots it as
+# a disk with no rebuild.
+ROOT_IMAGE := $(BUILD_DIR)/root$(ROOT_VARIANT).ext4
 CURL_ELF := $(PKGROOT)/usr/bin/curl
 DROPBEAR_ELF := $(PKGROOT)/usr/sbin/dropbear
 BMAKE_ELF := $(PKGROOT)/usr/bin/bmake
@@ -2049,7 +2063,7 @@ kernel-dist: $(KERNEL_ELF)
 iso: check-b1cc-sync root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/iso --out $(BUILD_DIR)/b1nix.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "$(KERNEL_CMDLINE)" --module $(BUILD_DIR)/root.ext4:rootfs.img
+	    --cmdline "$(KERNEL_CMDLINE)" --module $(ROOT_IMAGE):rootfs.img
 	@echo "============================================================"
 	@echo " b1nix build summary ($(ARCH))"
 	@echo " ISO: $(BUILD_DIR)/b1nix.iso"
@@ -2233,11 +2247,11 @@ iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-openrc iso-init iso-switchroot 
 	@# build asked for it or not. That is how images meant to be forty
 	@# megabytes kept coming out at five hundred and fifty.
 	@$(if $(or $(SMOKE_ROOT_MODULE),$(filter iso-blk iso-switchroot,$@)),,rm -f $(BUILD_DIR)/$@/boot/rootfs.img)
-	@$(if $(filter iso-blk iso-switchroot,$@),sh tools/images/trim-root-module.sh $(BUILD_DIR)/root.ext4 $(ROOT_MODULE) $(ROOT_MODULE_SIZE),)
+	@$(if $(filter iso-blk iso-switchroot,$@),sh tools/images/trim-root-module.sh $(ROOT_IMAGE) $(ROOT_MODULE) $(ROOT_MODULE_SIZE),)
 	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
-	    $(if $(SMOKE_ROOT_MODULE),--module $(BUILD_DIR)/root.ext4:rootfs.img,$(if $(filter iso-blk iso-switchroot,$@),--module $(ROOT_MODULE):rootfs.img,))
+	    $(if $(SMOKE_ROOT_MODULE),--module $(ROOT_IMAGE):rootfs.img,$(if $(filter iso-blk iso-switchroot,$@),--module $(ROOT_MODULE):rootfs.img,))
 
 # Display bring-up instance: the kernel and nothing else.
 #
@@ -2288,7 +2302,7 @@ iso-i915: $(KERNEL_ELF)
 iso-live: root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/iso-live --out $(BUILD_DIR)/b1nix-live.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "$(KERNEL_CMDLINE)" --module $(BUILD_DIR)/root.ext4:rootfs.img
+	    --cmdline "$(KERNEL_CMDLINE)" --module $(ROOT_IMAGE):rootfs.img
 
 # Installer ISO: a live ISO that ALSO carries b1nix-disk.img so that, after
 # booting it, `b1nix_install /dev/<disk>` installs b1nix to that disk (the
@@ -2299,14 +2313,14 @@ disk-iso: disk-image iso-live
 	cp $(BUILD_DIR)/b1nix-disk.img $(BUILD_DIR)/iso-live/boot/b1nix-disk.img
 	@$(MKISO) --stage $(BUILD_DIR)/iso-live --out $(BUILD_DIR)/b1nix-installer.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "$(KERNEL_CMDLINE)" --module $(BUILD_DIR)/root.ext4:rootfs.img
+	    --cmdline "$(KERNEL_CMDLINE)" --module $(ROOT_IMAGE):rootfs.img
 	@printf 'boot it, then run:  b1nix_install /dev/<target-disk>\n'
 
 iso-test: root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/iso-test --out $(BUILD_DIR)/b1nix-test.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(KERNEL_CMDLINE) b1nix.test=1" \
-	    --module $(BUILD_DIR)/root.ext4:rootfs.img
+	    --module $(ROOT_IMAGE):rootfs.img
 
 userspace: $(USERSPACE_DEPS)
 
@@ -2559,7 +2573,7 @@ run-x86_64: run
 run-root: iso userspace-install root-image
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
 	$(QEMU_X86_64) -cdrom $(BUILD_DIR)/b1nix.iso -serial stdio -no-reboot -boot d \
-		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
+		-drive file=$(ROOT_IMAGE),format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
 root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_INC)
@@ -3026,7 +3040,7 @@ endif
 	@# Repacked, and stamped with the ownership every file in it must have,
 	@# only when the staged tree actually changed. See the script.
 	@MKE2FS='$(MKE2FS)' DEBUGFS='$(DEBUGFS)' ROOT_IMAGE_FORCE='$(ROOT_IMAGE_FORCE)' \
-		sh tools/images/mk-root-image.sh $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4 $(ROOT_IMAGE_SIZE)
+		sh tools/images/mk-root-image.sh $(BUILD_DIR)/rootfs $(ROOT_IMAGE) $(ROOT_IMAGE_SIZE)
 
 # Everything in the rootfs links dynamically against /lib/libc.so. This gate
 # fails the build on a statically linked executable that is not listed (with a

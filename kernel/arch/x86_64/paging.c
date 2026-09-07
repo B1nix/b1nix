@@ -183,9 +183,14 @@ void paging_switch_address_space(u64 pml4_phys) {
       return;
     }
 
-    __asm__ volatile("mov %0, %%cr3" : : "r"(target_phys) : "memory");
+    /* Recorded BEFORE the load: a TLB shootdown for this space reads the
+     * record on other CPUs to decide whom to interrupt, and a CPU whose
+     * record still names another space is taken to have no translation of
+     * this one -- true only if its load of it has not happened yet. The CR3
+     * write serialises, so the record is visible before the load completes. */
     pc->loaded_pml4_phys = target_phys;
     pc->loaded_addrspace_epoch = epoch;
+    __asm__ volatile("mov %0, %%cr3" : : "r"(target_phys) : "memory");
   } else {
     /* Before per-CPU data exists (vmm_init on the BSP) there is nowhere to
      * record the load, so never skip. */
@@ -992,7 +997,7 @@ void paging_unmap_page(u64 virtual_address) { vmm_unmap_page(virtual_address); }
  * once, skips whole 512 GiB / 1 GiB / 2 MiB spans that have nothing mapped in
  * them, and announces the change once at the end. */
 void paging_mprotect_range(u64 start, u64 end, u64 flags) {
-  extern void tlb_shootdown_all(void);
+  extern void tlb_shootdown_current_mm(void);
   u64 _vmflags;
   u64 *pml4 = get_current_pml4();
   int touched = 0;
@@ -1083,7 +1088,7 @@ void paging_mprotect_range(u64 start, u64 end, u64 flags) {
     /* One announcement for the range, not one per page. */
     addrspace_note_replaced(VMM_PRESENT);
     if (irqs_are_enabled())
-      tlb_shootdown_all();
+      tlb_shootdown_current_mm();
   }
 }
 
@@ -1604,7 +1609,7 @@ static unsigned move_leftovers_reported;
  * with the VMM write lock held. The move itself is then a pair of stores.
  */
 void paging_move_range(u64 old_start, u64 new_start, u64 len) {
-  extern void tlb_shootdown_all(void);
+  extern void tlb_shootdown_current_mm(void);
   u64 flags;
 
   /* Recorded after the destination has been inspected, not before: an entry
@@ -1683,7 +1688,7 @@ void paging_move_range(u64 old_start, u64 new_start, u64 len) {
         n = MOVE_CLEAR_BATCH;
       usize nf = vmm_unmap_range_collect(v, n, frames);
       if (nf) {
-        tlb_shootdown_all();
+        tlb_shootdown_current_mm();
         for (usize k = 0; k < nf; k++)
           pmm_free_frame(frames[k]);
         cleared += nf;
@@ -1793,7 +1798,7 @@ void paging_move_range(u64 old_start, u64 new_start, u64 len) {
    * case: broadcasting a full flush for two pages throws away every other
    * CPU's TLB, so name the pages instead. */
   if (len > 64 * PAGE_SIZE) {
-    tlb_shootdown_all();
+    tlb_shootdown_current_mm();
   } else {
     extern void tlb_shootdown_page(u64);
 
@@ -2998,10 +3003,10 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
    * this space at all. */
   addrspace_epoch_bump();
   {
-    extern void tlb_shootdown_all(void);
+    extern void tlb_shootdown_current_mm(void);
 
     if (irqs_are_enabled())
-      tlb_shootdown_all();
+      tlb_shootdown_current_mm();
   }
 
   return dst_pml4_phys;

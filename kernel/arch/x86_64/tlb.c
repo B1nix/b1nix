@@ -37,6 +37,9 @@ static spinlock_t      g_tlb_lock    = SPINLOCK_INIT;
 static volatile int    g_tlb_op      = TLB_OP_NONE;
 static volatile u64    g_tlb_vaddr   = 0;
 static volatile int    g_tlb_pending = 0;
+/* Which CPUs the round in flight is for, by cpu_id. A CPU not in the mask
+ * neither applies the operation nor counts it down. */
+static volatile u64    g_tlb_targets = 0;
 
 /* Per-shootdown generation + per-CPU "last generation this CPU has ACKed".
  *
@@ -102,6 +105,8 @@ static void tlb_service_current(void) {
     int cpu = tlb_this_cpu();
     if (cpu < 0 || cpu >= MAX_CPUS)
         return;
+    if (!((__atomic_load_n(&g_tlb_targets, __ATOMIC_ACQUIRE) >> cpu) & 1))
+        return; /* not addressed to this CPU */
     u64 gen = __atomic_load_n(&g_tlb_gen, __ATOMIC_ACQUIRE);
 
     /* Claim this generation for this CPU via CAS before doing the work. Only
@@ -144,12 +149,43 @@ void tlb_shootdown_poll(void) {
 
 /* Generic dispatch: publish op/vaddr + pending, send IPI to all-but-self,
  * wait for ACKs. Caller must hold g_tlb_lock + IRQs disabled. */
-static void tlb_shootdown_dispatch(int op, u64 vaddr) {
-    int others = online_cpu_count() - 1;
-    if (others <= 0) {
-        /* Single CPU — nothing to shoot down. */
-        return;
+static inline u64 read_cr3(void) {
+    u64 cr3;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
+    return cr3;
+}
+
+/* One round, to the CPUs it concerns.
+ *
+ * pml4 names the address space whose translations changed, or 0 for a change
+ * to the kernel's own mappings, which every address space shares. A CPU can
+ * only hold a stale translation of a user mapping if that address space is
+ * the one loaded in its CR3: loading a different one flushes every non-global
+ * entry, and the switch code writes loaded_pml4_phys BEFORE the CR3 load, so
+ * a CPU seen here without the space loaded is a CPU whose load, if any, is
+ * still ahead of it and will read the tables as they are now. The fence
+ * orders our page-table stores before that read. Every round used to go to
+ * every CPU and wait for all of them: 21 000 rounds at 150 000 cycles each
+ * while Plasma started, almost all for a process running on one CPU. */
+static void tlb_shootdown_dispatch(int op, u64 vaddr, u64 pml4) {
+    int self = tlb_this_cpu();
+    int n = online_cpu_count();
+    u64 targets = 0;
+    int count = 0;
+    __asm__ volatile("mfence" ::: "memory");
+    for (int c = 0; c < n && c < MAX_CPUS; c++) {
+        if (c == self)
+            continue;
+        struct percpu *p = percpu_for_cpu(c);
+        if (!p)
+            continue;
+        if (pml4 && __atomic_load_n(&p->loaded_pml4_phys, __ATOMIC_ACQUIRE) != pml4)
+            continue;
+        targets |= 1ull << c;
+        count++;
     }
+    if (count == 0)
+        return;
 
     /* Open a new generation so targets (via IPI or poll) ACK it exactly once.
      * Bumped before the op release so a handler that observes op != NONE also
@@ -158,12 +194,16 @@ static void tlb_shootdown_dispatch(int op, u64 vaddr) {
     g_tlb_vaddr = vaddr;
     /* The pending counter must be visible to handlers BEFORE the IPI lands,
      * and the op publish must precede pending. Strict ordering via release. */
-    __atomic_store_n(&g_tlb_pending, others, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_tlb_targets, targets, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_tlb_pending, count, __ATOMIC_RELAXED);
     __atomic_store_n(&g_tlb_op, op, __ATOMIC_RELEASE);
 
-    /* Fire the IPI. lapic_send_ipi_allbutself targets every LAPIC except this
-     * one, with vector TLB_SHOOTDOWN_VECTOR + FIXED delivery. */
-    lapic_send_ipi_allbutself(TLB_SHOOTDOWN_VECTOR | LAPIC_ICR_FIXED);
+    for (int c = 0; c < n && c < MAX_CPUS; c++) {
+        if (!((targets >> c) & 1))
+            continue;
+        lapic_send_ipi(percpu_for_cpu(c)->apic_id,
+                       TLB_SHOOTDOWN_VECTOR | LAPIC_ICR_FIXED);
+    }
 
     /* Wait for ACKs with a generous runaway guard. A stuck target means a CPU
      * has IRQs disabled forever — a real bug we want to surface, not hide. */
@@ -211,7 +251,9 @@ void tlb_shootdown_page(u64 vaddr) {
     if (!__atomic_load_n(&g_tlb_enabled, __ATOMIC_ACQUIRE)) return;
     u64 flags;
     spin_lock_irqsave(&g_tlb_lock, &flags);
-    tlb_shootdown_dispatch(TLB_OP_PAGE, vaddr);
+    /* A kernel address is in every address space; a user one only in the
+     * current. */
+    tlb_shootdown_dispatch(TLB_OP_PAGE, vaddr, (vaddr >> 63) ? 0 : read_cr3());
     spin_unlock_irqrestore(&g_tlb_lock, flags);
 }
 
@@ -221,7 +263,21 @@ void tlb_shootdown_all(void) {
     if (!__atomic_load_n(&g_tlb_enabled, __ATOMIC_ACQUIRE)) return;
     u64 flags;
     spin_lock_irqsave(&g_tlb_lock, &flags);
-    tlb_shootdown_dispatch(TLB_OP_ALL, 0);
+    tlb_shootdown_dispatch(TLB_OP_ALL, 0, 0);
+    spin_unlock_irqrestore(&g_tlb_lock, flags);
+}
+
+/* The current address space's mappings changed: flush here and on the CPUs
+ * that have it loaded, nowhere else. For munmap, mprotect, mremap, madvise
+ * and the fork-time COW downgrade; execve and exit keep the everyone-flush,
+ * because the low identity huge pages an image replaces are global. */
+void tlb_shootdown_current_mm(void) {
+    cr3_reload();
+    if (g_max_cpus <= 1) return;
+    if (!__atomic_load_n(&g_tlb_enabled, __ATOMIC_ACQUIRE)) return;
+    u64 flags;
+    spin_lock_irqsave(&g_tlb_lock, &flags);
+    tlb_shootdown_dispatch(TLB_OP_ALL, 0, read_cr3());
     spin_unlock_irqrestore(&g_tlb_lock, flags);
 }
 

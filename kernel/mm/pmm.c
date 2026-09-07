@@ -1310,6 +1310,12 @@ static void pmm_check_handout(u64 frame) {
                   " (caller 0x");
     console_write_hex64((u64)(usize)__builtin_return_address(0));
     console_write(")\n");
+    /* The history is the whole point of this report and it is about to be
+     * followed by a panic anyway: take the console the way the panic path
+     * does. Once it printed its header and nothing else for 38 seconds --
+     * the lock was held by a CPU waiting, in turn, on the allocator this
+     * CPU is holding. */
+    console_bust_lock();
     pmm_report_page_table_history(frame);
   }
   panic("pmm: page-table frame allocated twice");

@@ -2,6 +2,7 @@
 #include <b1nix/blk.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
+#include <b1nix/ktime.h>
 #include <b1nix/io.h>
 #include <b1nix/irq.h>
 #include <b1nix/klog.h>
@@ -378,7 +379,7 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
      * instead of fixed. */
     u64 budget_ns = (type == VIRTIO_BLK_T_IN) ? vblk_read_spin_ns()
                                               : vblk_write_spin_ns();
-    u64 spin_start = arch_tsc_monotonic_ns();
+    u64 spin_start = ktime_monotonic_ns();
 
     for (;;) {
       if (inst->vq.used->idx != inst->vq.last_used_idx)
@@ -392,7 +393,7 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
       if (++since_check < check_every)
         continue;
       since_check = 0;
-      if (arch_tsc_monotonic_ns() - spin_start >= budget_ns)
+      if (ktime_monotonic_ns() - spin_start >= budget_ns)
         break;
     }
   }

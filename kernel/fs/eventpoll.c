@@ -1,3 +1,4 @@
+#include <b1nix/ktime.h>
 #include <b1nix/lapic.h>
 /* M56 — Event-loop and IPC primitives: eventfd, timerfd, signalfd and epoll,
  * plus memfd file sealing.
@@ -530,8 +531,7 @@ int vfs_timerfd_settime(int fd, int flags,
 
       value = value > now_clock ? value - now_clock : 1;
     } else {
-      extern u64 arch_tsc_monotonic_ns(void);
-      u64 now_ns = arch_tsc_monotonic_ns();
+      u64 now_ns = ktime_monotonic_ns();
       u64 want_ns = (u64)new_value->it_value.tv_sec * 1000000000ull +
                     (u64)new_value->it_value.tv_nsec;
       u64 tick_ns = 1000000000ull / TICKS_PER_SEC;

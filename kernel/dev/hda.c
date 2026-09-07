@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <b1nix/console.h>
+#include <b1nix/ktime.h>
 #include <b1nix/sound.h>
 #include <b1nix/pci.h>
 #include <b1nix/mm.h>
@@ -241,15 +242,14 @@ static void hda_delay_ms(int ms) {
 	 * delay should be expressed in the unit it asks for and measured with
 	 * that.
 	 *
-	 * Except that arch_tsc_monotonic_ns() answers ZERO on a machine whose TSC
-	 * the kernel does not trust — no invariant TSC, which is every QEMU
-	 * without `-cpu host,+invtsc` and a fair amount of older hardware. A
-	 * deadline computed from zero is never reached by a clock that never
-	 * moves, and the boot spun here for ever, right after "hda: BAR0". The
-	 * tick is the clock to use then; before the tick runs, a bounded spin is
-	 * all there is — generous, because a reset delay that is too long costs
-	 * milliseconds of boot and one that is too short costs the device. */
-	u64 t0 = arch_tsc_monotonic_ns();
+	 * The kernel's monotonic clock falls back to the tick when the TSC is not
+	 * trusted (no invariant TSC — every QEMU without `+invtsc`, and older
+	 * hardware). Before the tick runs it reads zero, and a bounded spin is
+	 * all there is then — generous, because a reset delay that is too long
+	 * costs milliseconds of boot and one that is too short costs the device.
+	 * The raw TSC clock was read here once and answered zero for ever on
+	 * such a machine, and the boot spun right after "hda: BAR0". */
+	u64 t0 = ktime_monotonic_ns();
 	u32 start = hda_wallclock();
 
 	if (t0 == 0) {
@@ -269,11 +269,11 @@ static void hda_delay_ms(int ms) {
 		/* `pause`, not a port read: this is a spin hint, and an I/O-port
 		 * access is a VM exit under virtualisation -- paying one per
 		 * iteration to mark time is the cost this loop is trying to avoid. */
-		while (arch_tsc_monotonic_ns() < deadline)
+		while (ktime_monotonic_ns() < deadline)
 			cpu_relax(); /* not a bare `pause`: x86-only mnemonic */
 		return;
 	}
-	while (arch_tsc_monotonic_ns() < deadline) {
+	while (ktime_monotonic_ns() < deadline) {
 		u32 now = hda_wallclock();
 
 		if ((u32)(now - start) >= (u32)ms)

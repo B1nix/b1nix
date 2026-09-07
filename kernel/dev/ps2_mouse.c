@@ -17,8 +17,6 @@ static struct ps2_mouse_state mouse_state;
 static u8 packet[3];
 static int packet_index;
 static int mouse_ready;
-static volatile int mouse_event_pending;
-static int mouse_worker_started;
 
 static int ps2_wait_input_clear(void)
 {
@@ -90,19 +88,6 @@ static int ps2_mouse_command(u8 command)
     return 0;
 }
 
-static void ps2_mouse_event_worker(void *arg)
-{
-    (void)arg;
-    mouse_worker_started = 1;
-    while (1) {
-        /* IRQ (producer, possibly another CPU once the device-IRQ path runs
-         * BKL-free) sets this; consume it atomically so a set racing with our
-         * clear is never lost. mouse_state itself is only a cursor coordinate —
-         * a torn read there is cosmetic, so it is left unlocked. */
-        __atomic_exchange_n(&mouse_event_pending, 0, __ATOMIC_ACQUIRE);
-        scheduler_sleep_ticks(1);
-    }
-}
 
 void ps2_mouse_init(void)
 {
@@ -165,7 +150,6 @@ void ps2_mouse_init(void)
     }
 
     x86_pic_unmask(12);
-    (void)kthread_create("ps2-mouse-ev", ps2_mouse_event_worker, 0);
     mouse_ready = 1;
     console_write("ps2_mouse: initialized on irq12\n");
 }
@@ -210,9 +194,6 @@ void ps2_mouse_handle_byte(u8 data)
     if (mouse_state.x > max_x) mouse_state.x = max_x;
     if (mouse_state.y > max_y) mouse_state.y = max_y;
 
-    if (mouse_state.x != old_x || mouse_state.y != old_y || mouse_state.buttons != old_buttons) {
-        __atomic_store_n(&mouse_event_pending, 1, __ATOMIC_RELEASE);
-    }
 
     /* M47: mirror the decoded packet to /dev/input/event1 — relative motion,
      * button edges, plus the kernel-clamped absolute cursor position. */

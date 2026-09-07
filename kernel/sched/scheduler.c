@@ -76,6 +76,7 @@ _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
 #define TASK_CHUNK_SIZE   64
 #define TASK_MAX_CHUNKS   64
 #define MAX_TASKS         (TASK_CHUNK_SIZE * TASK_MAX_CHUNKS)  /* 4096 */
+_Static_assert(MAX_TASKS == SCHED_MAX_TASKS, "sched.h names the table size");
 /* Side tables are indexed by task_index(), and the per-CPU idle tasks are NOT
  * in the task table -- see scheduler_setup_ap_idle for why putting them there
  * was tried and reverted. task_index() used to answer 0 for anything it could
@@ -962,7 +963,9 @@ void sched_waitprof_dump(void)
 		return;
 	console_write("waitprof: idle-ticks ");
 	console_write_dec(g_waitprof_idle);
-	console_write(" (10 ms each), charged to the task whose wake ended each wait\n");
+	console_write(" (");
+	console_write_dec(1000 / (sched_tick_hz() ? sched_tick_hz() : 100));
+	console_write(" ms each), charged to the task whose wake ended each wait\n");
 	for (usize k = 0; k < WAITPROF_SLOTS; k++) {
 		if (!g_waitprof[k].ticks)
 			continue;
@@ -1405,11 +1408,20 @@ static void free_task_slot(struct task *t) {
  * walk is fine. Returns 0 (a safe default scan origin) if the pointer is not
  * one of ours — e.g., an AP's idle task lives outside the chunked table. */
 static usize task_index(const struct task *task) {
+  /* The chunk that answered last time answers first: lookups come in runs
+   * for the same task, and the walk below was 4% of kernel time while a
+   * desktop started. A stale hint only costs the walk. */
+  static usize last_chunk;
+  usize lc = __atomic_load_n(&last_chunk, __ATOMIC_RELAXED);
+  const struct task *hint = __atomic_load_n(&g_task_chunks[lc], __ATOMIC_ACQUIRE);
+  if (hint && task >= hint && task < hint + TASK_CHUNK_SIZE)
+    return (lc << 6) | (usize)(task - hint);
   for (usize c = 0; c < TASK_MAX_CHUNKS; c++) {
     const struct task *chunk =
         __atomic_load_n(&g_task_chunks[c], __ATOMIC_ACQUIRE);
     if (!chunk) break;
     if (task >= chunk && task < chunk + TASK_CHUNK_SIZE) {
+      __atomic_store_n(&last_chunk, c, __ATOMIC_RELAXED);
       return (c << 6) | (usize)(task - chunk);
     }
   }
@@ -1424,6 +1436,8 @@ static usize task_index(const struct task *task) {
   }
   return 0;
 }
+
+usize task_slot_index(const struct task *t) { return task_index(t); }
 
 /* Which CPU's idle task this is, or -1. The per-CPU idle tasks live outside the
  * task table on purpose (see scheduler_setup_ap_idle), so no table walk finds
@@ -2771,9 +2785,9 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
    * and a fork from such a context has no running siblings to worry about. */
   if (parent == current_task) {
     extern void paging_reload_cr3(void);
-    extern void tlb_shootdown_all(void);
+    extern void tlb_shootdown_current_mm(void);
     if (interrupts_enabled())
-      tlb_shootdown_all();
+      tlb_shootdown_current_mm();
     else
       paging_reload_cr3();
   }
@@ -3878,7 +3892,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
      * userspace relies on is preserved. */
     extern u64 paging_clone_address_space(u64 pml4_phys);
     extern void paging_reload_cr3(void);
-    extern void tlb_shootdown_all(void);
+    extern void tlb_shootdown_current_mm(void);
     child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
     /* The clone flipped the parent's writable user pages to COW in place, and
      * every CPU that has one of those translations cached must be told —
@@ -3901,7 +3915,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
      * worry about and the local reload is what is safe. */
     if (parent == current_task) {
       if (interrupts_enabled())
-        tlb_shootdown_all();
+        tlb_shootdown_current_mm();
       else
         paging_reload_cr3();
     }

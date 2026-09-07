@@ -48,17 +48,18 @@ struct rseq_cs_desc {
   u64 abort_ip;
 };
 
-/* One entry per task the scheduler can hold, so this table can never be the
- * thing that refuses a registration.
+/* One row per task-table slot, indexed by task_slot_index(): finding a task's
+ * registration is one load, and the row is cleared when the slot changes
+ * hands (scheduler.c, where a recycled slot is handed to a new task).
  *
- * It was 64. glibc registers rseq for every thread it creates and treats a
- * refusal on a thread as fatal -- "Fatal glibc error: rseq registration
- * failed", which is a killed process and not a degraded one -- so a desktop
- * with more than 64 threads alive at once could not run. (The leak fixed
- * alongside this made it worse, but 64 was too few regardless.) At 32 bytes an
- * entry the whole table is 128 KiB of BSS. */
-#define RSEQ_MAX_TASKS 4096
-
+ * This used to be a list of 4096 entries searched from the top under a global
+ * spinlock, interrupts off, on EVERY timer tick that returned to userspace --
+ * on every CPU, whether anything was registered or not. Under b1nix.sysprof
+ * that one unlock was where 53% of the kernel's weighted tick samples landed
+ * while Plasma started: four CPUs' ticks fire together and queued on the
+ * lock, each holding interrupts off for the whole scan. At 32 bytes a row the
+ * table is 128 KiB of BSS, as before. */
+#define RSEQ_MAX_TASKS SCHED_MAX_TASKS
 struct rseq_reg {
   struct task *task;
   u64 uptr; /* user address of struct rseq */
@@ -66,15 +67,26 @@ struct rseq_reg {
   u32 sig; /* signature that must precede abort_ip */
   int used;
 };
-
 static struct rseq_reg g_rseq[RSEQ_MAX_TASKS];
+/* Taken by registration and cleanup only. The return-to-user path reads the
+ * row without it: the row is written by the task itself (its own rseq(2)
+ * call) and cleared once the task is gone or its slot is handed to a newcomer
+ * that has not run yet -- and a task returning to userspace is neither. */
 static spinlock_t g_rseq_lock = SPINLOCK_INIT;
+/* Registrations alive. musl registers nothing, so on most images this stays
+ * 0 and the tick path returns before it has to find the task's row. */
+static u64 g_rseq_live;
+
+static struct rseq_reg *rseq_row(struct task *t) {
+  usize i = task_slot_index(t);
+  return i < RSEQ_MAX_TASKS ? &g_rseq[i] : 0;
+}
 
 static struct rseq_reg *rseq_find(struct task *t) {
-  for (usize i = 0; i < RSEQ_MAX_TASKS; i++)
-    if (g_rseq[i].used && g_rseq[i].task == t)
-      return &g_rseq[i];
-  return 0;
+  struct rseq_reg *r = rseq_row(t);
+  if (!r || !__atomic_load_n(&r->used, __ATOMIC_ACQUIRE) || r->task != t)
+    return 0;
+  return r;
 }
 
 /* Name the refusal.
@@ -122,7 +134,8 @@ int rseq_register(struct task *t, u64 uptr, u32 len, u32 sig, int unregister) {
       spin_unlock_irqrestore(&g_rseq_lock, flags);
       return r ? -EINVAL : -EINVAL;
     }
-    r->used = 0;
+    __atomic_store_n(&r->used, 0, __ATOMIC_RELEASE);
+    __atomic_fetch_sub(&g_rseq_live, 1, __ATOMIC_RELEASE);
     spin_unlock_irqrestore(&g_rseq_lock, flags);
     /* Leave cpu_id as "unregistered" so a stale reader notices. */
     u32 uninit = RSEQ_CPU_ID_UNINITIALIZED;
@@ -144,33 +157,39 @@ int rseq_register(struct task *t, u64 uptr, u32 len, u32 sig, int unregister) {
     return same ? -EBUSY : -EINVAL;
   }
 
-  for (usize i = 0; i < RSEQ_MAX_TASKS; i++) {
-    if (g_rseq[i].used)
-      continue;
-    g_rseq[i].task = t;
-    g_rseq[i].uptr = uptr;
-    g_rseq[i].len = len;
-    g_rseq[i].sig = sig;
-    g_rseq[i].used = 1;
+  r = rseq_row(t);
+  if (!r) {
     spin_unlock_irqrestore(&g_rseq_lock, flags);
-    /* Publish the current CPU immediately: the ABI says a successful
-     * registration leaves cpu_id valid, before any further syscall. */
-    rseq_on_return_to_user(0);
-    return 0;
+    rseq_refused("task has no table row", uptr, len, sig);
+    return -ENOMEM;
   }
+  r->task = t;
+  r->uptr = uptr;
+  r->len = len;
+  r->sig = sig;
+  __atomic_store_n(&r->used, 1, __ATOMIC_RELEASE);
+  __atomic_fetch_add(&g_rseq_live, 1, __ATOMIC_RELEASE);
   spin_unlock_irqrestore(&g_rseq_lock, flags);
-  rseq_refused("registration table full", uptr, len, sig);
-  return -ENOMEM;
+  /* Publish the current CPU immediately: the ABI says a successful
+   * registration leaves cpu_id valid, before any further syscall. */
+  rseq_on_return_to_user(0);
+  return 0;
 }
 
 void rseq_task_cleanup(struct task *t) {
   if (!t)
     return;
+  struct rseq_reg *r = rseq_row(t);
+  if (!r)
+    return;
   u64 flags;
   spin_lock_irqsave(&g_rseq_lock, &flags);
-  for (usize i = 0; i < RSEQ_MAX_TASKS; i++)
-    if (g_rseq[i].used && g_rseq[i].task == t)
-      g_rseq[i].used = 0;
+  if (__atomic_load_n(&r->used, __ATOMIC_ACQUIRE) && r->task == t) {
+    __atomic_store_n(&r->used, 0, __ATOMIC_RELEASE);
+    __atomic_fetch_sub(&g_rseq_live, 1, __ATOMIC_RELEASE);
+  }
+  r->task = 0;
+  r->uptr = 0;
   spin_unlock_irqrestore(&g_rseq_lock, flags);
 }
 
@@ -181,16 +200,13 @@ void rseq_fork_clear(struct task *child) { rseq_task_cleanup(child); }
 
 void rseq_on_return_to_user(struct interrupt_frame *frame) {
   struct task *t = current_task;
-  if (!t)
+  if (!t || !__atomic_load_n(&g_rseq_live, __ATOMIC_ACQUIRE))
     return;
-  u64 flags;
-  spin_lock_irqsave(&g_rseq_lock, &flags);
   struct rseq_reg *r = rseq_find(t);
-  u64 uptr = r ? r->uptr : 0;
-  u32 sig = r ? r->sig : 0;
-  spin_unlock_irqrestore(&g_rseq_lock, flags);
-  if (!uptr)
+  if (!r || !r->uptr)
     return;
+  u64 uptr = r->uptr;
+  u32 sig = r->sig;
 
   struct percpu *pcpu = get_percpu();
   u32 cpu = pcpu ? (u32)pcpu->cpu_id : 0;
@@ -256,10 +272,4 @@ void rseq_on_return_to_user(struct interrupt_frame *frame) {
 #endif
 }
 
-int rseq_is_registered(struct task *t) {
-  u64 flags;
-  spin_lock_irqsave(&g_rseq_lock, &flags);
-  int reg = rseq_find(t) != 0;
-  spin_unlock_irqrestore(&g_rseq_lock, flags);
-  return reg;
-}
+int rseq_is_registered(struct task *t) { return rseq_find(t) != 0; }

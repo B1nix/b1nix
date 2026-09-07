@@ -8,6 +8,7 @@
  * than an insmod failure.
  */
 
+#include <b1nix/ktime.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/blk.h>
 #include <b1nix/bootinfo.h>
@@ -35,6 +36,9 @@
  * express the wait in time, not in a count of port reads that means something
  * different on every machine — so it needs to be able to read a clock. */
 EXPORT_SYMBOL(arch_tsc_monotonic_ns);
+/* The clock a module should actually wait on: the raw TSC one above answers
+ * zero on a machine without an invariant TSC, this one falls back to the tick. */
+EXPORT_SYMBOL(ktime_monotonic_ns);
 /* A module compiled with the stack protector needs the runtime the kernel
  * provides (see kernel/lib/stdlib.c). */
 extern unsigned long __stack_chk_guard;

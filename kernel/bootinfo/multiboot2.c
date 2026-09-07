@@ -191,7 +191,62 @@ const char *bootinfo_cmdline(void)
 	return current_boot_info.command_line;
 }
 
-int bootinfo_has_flag(const char *flag)
+/* Answers, remembered by the address of the question.
+ *
+ * The command line never changes after boot, and the callers ask with string
+ * literals, so the key's address identifies the question. Several of these
+ * sit on the system-call path -- trace filters, the anonymous-mmap policy --
+ * and each was a token-by-token scan of the command line: together 9% of the
+ * kernel's tick samples while Plasma started. A key seen before is answered
+ * from a small open-addressed table; a value is only remembered as absent,
+ * since the scan copies it out and its callers are not the hot ones. Slots
+ * are claimed with a compare-and-swap and the answer is written before the
+ * key is published, so a reader that sees the key sees the answer. */
+#define BOOTINFO_MEMO 256
+struct bootinfo_memo { const char *key; int rc; int ready; };
+static struct bootinfo_memo memo_flag[BOOTINFO_MEMO];
+static struct bootinfo_memo memo_absent[BOOTINFO_MEMO];
+
+static int memo_get(struct bootinfo_memo *t, const char *key, int *rc)
+{
+	u32 h = (u32)(((usize)key * 0x9e3779b97f4a7c15ULL) >> 56);
+	for (u32 probe = 0; probe < 8; probe++) {
+		struct bootinfo_memo *m = &t[(h + probe) & (BOOTINFO_MEMO - 1)];
+		const char *k = __atomic_load_n(&m->key, __ATOMIC_ACQUIRE);
+		if (k == key) {
+			/* Claimed but not yet answered: a miss, and the claimant
+			 * finishes the entry. */
+			if (!__atomic_load_n(&m->ready, __ATOMIC_ACQUIRE))
+				return 0;
+			*rc = m->rc;
+			return 1;
+		}
+		if (!k)
+			return 0;
+	}
+	return 0;
+}
+
+static void memo_put(struct bootinfo_memo *t, const char *key, int rc)
+{
+	u32 h = (u32)(((usize)key * 0x9e3779b97f4a7c15ULL) >> 56);
+	for (u32 probe = 0; probe < 8; probe++) {
+		struct bootinfo_memo *m = &t[(h + probe) & (BOOTINFO_MEMO - 1)];
+		const char *expect = 0;
+		/* Claim the slot first, then fill it: the key is the claim, and
+		 * only the claimant writes the answer. */
+		if (__atomic_compare_exchange_n(&m->key, &expect, key, 0,
+		                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+			m->rc = rc;
+			__atomic_store_n(&m->ready, 1, __ATOMIC_RELEASE);
+			return;
+		}
+		if (expect == key)
+			return;
+	}
+}
+
+static int flag_scan(const char *flag)
 {
 	const char *cmd = current_boot_info.command_line;
 	usize flag_len = 0;
@@ -223,7 +278,7 @@ int bootinfo_has_flag(const char *flag)
 	return 0;
 }
 
-int bootinfo_get_kv(const char *key, char *out, usize out_size)
+static int kv_scan(const char *key, char *out, usize out_size)
 {
 	const char *cmd = current_boot_info.command_line;
 	usize key_len = 0;
@@ -265,6 +320,27 @@ int bootinfo_get_kv(const char *key, char *out, usize out_size)
 	}
 
 	return 0;
+}
+
+int bootinfo_has_flag(const char *flag)
+{
+	int rc;
+	if (memo_get(memo_flag, flag, &rc))
+		return rc;
+	rc = flag_scan(flag);
+	memo_put(memo_flag, flag, rc);
+	return rc;
+}
+
+int bootinfo_get_kv(const char *key, char *out, usize out_size)
+{
+	int rc;
+	if (memo_get(memo_absent, key, &rc))
+		return 0;
+	rc = kv_scan(key, out, out_size);
+	if (!rc)
+		memo_put(memo_absent, key, 0);
+	return rc;
 }
 
 /* Decimal `key=N` from the command line, or `fallback` when the key is absent,

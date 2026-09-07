@@ -1,3 +1,4 @@
+#include <b1nix/kprof.h>
 #ifndef B1NIX_SPINLOCK_H
 #define B1NIX_SPINLOCK_H
 
@@ -159,6 +160,8 @@ static inline int spin_trylock_irqsave(spinlock_t *lock, u64 *flags) {
 #endif
     if (spin_trylock(lock)) {
         *flags = saved;
+        if (__builtin_expect(kprof_irqoff_on, 0) && KPROF_IRQ_WAS_ON(saved))
+            kprof_irqoff_begin(__builtin_return_address(0));
         return 1;
     }
     /* Not taken: restore the caller's interrupt state rather than leaving it
@@ -191,11 +194,15 @@ static inline void spin_lock_irqsave(spinlock_t *lock, u64 *flags) {
     __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
     *flags = f32;
 #endif
+    if (__builtin_expect(kprof_irqoff_on, 0) && KPROF_IRQ_WAS_ON(*flags))
+        kprof_irqoff_begin(__builtin_return_address(0));
     spin_lock(lock);
 }
 
 static inline void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
     spin_unlock(lock);
+    if (__builtin_expect(kprof_irqoff_on, 0) && KPROF_IRQ_WAS_ON(flags))
+        kprof_irqoff_end();
 #ifdef __x86_64__
     __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
 #elif defined(__aarch64__)

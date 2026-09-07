@@ -1,5 +1,6 @@
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
+#include <b1nix/ktime.h>
 #include <b1nix/input.h>
 #include <b1nix/io.h>
 #include <b1nix/sched.h>
@@ -39,9 +40,9 @@ static int kbd_debug_enabled;
 #if defined(__x86_64__)
 static int kbd_wait_input_clear(void)
 {
-	u64 deadline = arch_tsc_monotonic_ns() + 20000000ull; /* 20 ms */
+	u64 deadline = ktime_monotonic_ns() + 20000000ull; /* 20 ms */
 
-	while (arch_tsc_monotonic_ns() < deadline)
+	while (ktime_monotonic_ns() < deadline)
 		if (!(inb(0x64) & 0x02))
 			return 0;
 	return -1;
@@ -49,9 +50,9 @@ static int kbd_wait_input_clear(void)
 
 static int kbd_wait_output_full(void)
 {
-	u64 deadline = arch_tsc_monotonic_ns() + 20000000ull; /* 20 ms */
+	u64 deadline = ktime_monotonic_ns() + 20000000ull; /* 20 ms */
 
-	while (arch_tsc_monotonic_ns() < deadline)
+	while (ktime_monotonic_ns() < deadline)
 		if (inb(0x64) & 0x01)
 			return 0;
 	return -1;

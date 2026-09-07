@@ -22,13 +22,49 @@ RUN_SECONDS=${RUN_SECONDS:-420}
 rm -rf "$OUT"; mkdir -p "$OUT"
 rm -f "$MON" "$LOG"
 
+#
+# The root filesystem is a disk, not a boot module.
+#
+# The image's ISO carries root.ext4 as a Multiboot2 module: the bootloader
+# copies all of it into memory before the kernel starts, and the KDE root is
+# 2.5 GB. Off the emulated CD that took 160 of the 194 seconds between QEMU
+# starting and the desktop reporting itself; off a virtio disk, 28. Here the
+# kernel is booted from a module-less ISO built on the spot from the same
+# kernel and command line, and root.ext4 is attached as a virtio disk, which
+# the kernel mounts by its label (b1nix-root): the bootloader has 50 MB to
+# read and the guest gets its memory back. snapshot=on keeps the build's
+# image unchanged. KDE_ROOT=module keeps the old shape, with the ISO on a
+# virtio disk (KDE_BOOT=cdrom for the CD).
+#
+ISO=$DIR/build/x86_64/${KDE_ISO:-b1nix.iso}
+if [ "${KDE_ROOT:-disk}" = disk ]; then
+	STAGE=$DIR/build/x86_64/${KDE_ISO:-b1nix.iso}
+	STAGE=${STAGE%.iso}
+	[ "$STAGE" = "$DIR/build/x86_64/b1nix" ] && STAGE=$DIR/build/x86_64/iso
+	CMDLINE=$(sed -n 's/^ *cmdline: //p' "$STAGE/boot/limine/limine.conf" | head -1)
+	CMDLINE="$CMDLINE${KDE_EXTRA_CMDLINE:+ $KDE_EXTRA_CMDLINE}"
+	sh "$DIR/tools/images/mkiso.sh" --stage "$DIR/build/x86_64/kde-run-iso" \
+		--out "$DIR/build/x86_64/b1nix-kde-run.iso" --arch x86_64 \
+		--kernel "$DIR/build/x86_64/kernel.elf" --timeout 0 \
+		--cmdline "$CMDLINE" > /dev/null
+	# The KDE group packs its own image (Makefile: ROOT_IMAGE); an older tree
+	# packed it under the shared name.
+	ROOT=$DIR/build/x86_64/root-kde.ext4
+	[ -f "$ROOT" ] || ROOT=$DIR/build/x86_64/root.ext4
+	BOOT_MEDIA="-cdrom $DIR/build/x86_64/b1nix-kde-run.iso \
+		-drive file=$ROOT,if=virtio,format=raw,snapshot=on"
+elif [ "${KDE_BOOT:-virtio}" = cdrom ]; then
+	BOOT_MEDIA="-cdrom $ISO"
+else
+	BOOT_MEDIA="-drive file=$ISO,if=virtio,format=raw,readonly=on"
+fi
 ACCEL=
 [ -w /dev/kvm ] && ACCEL="-accel kvm -cpu host,+invtsc"
 
 # shellcheck disable=SC2086
 qemu-system-x86_64 $ACCEL \
 	-m "${KDE_MEM_MB:-4096}" -smp "${KDE_SMP:-4}" \
-	-cdrom "$DIR/build/x86_64/${KDE_ISO:-b1nix.iso}" \
+	$BOOT_MEDIA \
 	-device virtio-gpu-pci,id=vgpu \
 	-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
 	-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
@@ -55,7 +91,7 @@ while [ "$i" -lt "$RUN_SECONDS" ]; do
 	# Frames are taken from the moment the compositor is up, not only after
 	# the desktop reports itself: a run that dies early still leaves evidence.
 	if [ "$ready" = 1 ] || grep -aq "ok drm-card\|ok nested-socket" "$LOG" 2>/dev/null; then
-		if [ $((i % 5)) -eq 0 ]; then
+		if [ $((i % ${KDE_SHOT_EVERY:-5})) -eq 0 ]; then
 			shot=$((shot + 1))
 			#
 			# Name the device, because there is more than one.
@@ -78,5 +114,10 @@ done
 
 mon "quit" || kill $QPID 2>/dev/null || true
 wait $QPID 2>/dev/null || true
+# The monitor accepted "quit" and the shell's child is gone, and a QEMU was
+# still running afterwards -- twice in one afternoon. Whatever the reason,
+# the process that writes this run's serial log has no business outliving
+# the run: name it by that log and make sure.
+pkill -9 -f -- "-serial file:$LOG" 2>/dev/null || true
 echo "[run-kde] log: $LOG"
 echo "[run-kde] frames: $(ls -1 "$OUT" 2>/dev/null | wc -l) in $OUT"

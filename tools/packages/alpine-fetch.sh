@@ -397,9 +397,25 @@ install_one() {
 		# the behaviour wanted: the package's files land wherever that link
 		# already goes.
 		#
-		(cd "$tmp" && find . -type d -exec mkdir -p "$PREFIX/{}" \;)
-		(cd "$tmp" && find . ! -type d -exec sh -c \
-			'rm -f "$2/$1"; cp -R -p "$1" "$2/$1"' _ "{}" "$PREFIX" \;)
+		# One rm and one cp per directory, not a shell per file.
+		#
+		# This used to be `find -exec sh -c 'rm; cp'` on every file: three
+		# processes each, and breeze alone brings 30 000 icons, which is how a
+		# rebuild of the KDE group spent two hours here. The names are gathered
+		# by a glob, which costs no process at all; rm first, because a copy
+		# onto a symlink writes through it.
+		#
+		(cd "$tmp" && find . -type d) | while IFS= read -r d; do
+			mkdir -p "$PREFIX/$d"
+			(cd "$tmp/$d" && set -- && for f in * .[!.]* ..?*; do
+				[ -e "$f" ] || [ -L "$f" ] || continue
+				[ -d "$f" ] && [ ! -L "$f" ] && continue
+				set -- "$@" "$f"
+			done
+			[ $# -gt 0 ] || exit 0
+			(cd "$PREFIX/$d" && rm -f -- "$@")
+			cp -R -p -- "$@" "$PREFIX/$d/")
+		done
 		(cd "$tmp" && find . ! -type d) | sed "s|^\.|$PREFIX|" >> "$INSTALLED"
 		rm -rf "$tmp"
 		echo "$name" >> "$PKGS_SEEN"
@@ -568,33 +584,38 @@ while [ "$round" -lt 16 ]; do
 	# file instead.
 	find "$PREFIX" \( -type f -o -type l \) 2>/dev/null |
 		sed 's|.*/||' | sort -u > "$PRESENT"
+	#
+	# One readelf per batch, not two per file.
+	#
+	# This loop used to run `readelf -h | grep` and then `readelf -d` on every
+	# path in the install list, one process each. The KDE group installs 43 000
+	# files, most of them breeze's SVG icons, and the pass took two hours on a
+	# rebuild that then pulled nothing. readelf takes many files at once and
+	# labels each with a "File:" line; whatever is not an ELF is an error on
+	# stderr and nothing on stdout, and only EXEC and DYN have a dynamic
+	# section, so there is no need to ask the type first. /dev/null is passed
+	# with every batch because readelf prints the "File:" label only when given
+	# more than one operand, and the last batch may hold a single file.
+	#
+	# Programs name their libraries the same way libraries do: every ELF is
+	# examined, not only *.so*, because a package whose point is an executable
+	# (sway) otherwise arrived without what it links against.
+	#
+	# Symlinks are left out: their targets are in the list under their own
+	# names, and one with an absolute target -- sbin/udevadm -> /bin/udevadm --
+	# resolves on the HOST, whose udevadm needs libc.so.6 and
+	# libsystemd-shared, neither of which any Alpine index provides.
+	#
 	while IFS= read -r so; do
-		[ -f "$so" ] || continue
-		#
-		# Programs name their libraries the same way libraries do.
-		#
-		# Only files called *.so* used to be examined, so a package whose whole
-		# point is an executable brought none of what it links against: sway
-		# arrived without wlroots, wayland, pixman or libinput, and the first
-		# sign of it was a compositor that could not start. An ELF is an ELF —
-		# what matters is DT_NEEDED, not the suffix.
-		case "$so" in
-		*.so|*.so.*) ;;
-		*)
-			"$READELF" -hW "$so" 2>/dev/null |
-				grep -qE 'Type:[[:space:]]+(EXEC|DYN)' || continue
-			;;
-		esac
-		for need in $("$READELF" -dW "$so" 2>/dev/null |
-		              sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
-			case "$need" in libc.musl-*|ld-musl-*) continue ;; esac
-			if grep -qxF -- "$need" "$PRESENT"; then
-				continue
-			fi
-			case " $missing " in *" $need "*) continue ;; esac
-			missing="$missing $need"
-		done
-	done < "$INSTALLED"
+		[ -f "$so" ] && [ ! -L "$so" ] && printf '%s\n' "$so"
+	done < "$INSTALLED" |
+		sed "s/'/'\\\\''/g; s/.*/'&'/" |
+		xargs "$READELF" -dW /dev/null 2>/dev/null |
+		sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' |
+		grep -v '^libc\.musl-\|^ld-musl-' | sort -u |
+		comm -23 - "$PRESENT" > "$PRESENT.missing"
+	missing="$(tr '\n' ' ' < "$PRESENT.missing")"
+	rm -f "$PRESENT.missing"
 
 	[ -n "$missing" ] || break
 

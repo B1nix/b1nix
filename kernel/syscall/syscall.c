@@ -24,6 +24,7 @@ void tlb_shootdown_all(void);
 #include <b1nix/rtc.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/rseq.h>
+#include <b1nix/tlb.h>
 #include <b1nix/sched.h>
 #include <b1nix/blk.h>
 #include <b1nix/shm.h>
@@ -1250,16 +1251,32 @@ static u64 sys_ioctl(int fd, u64 request, void *arg) {
    * request code and the descriptor are the whole question, and neither the
    * errno trace nor the VT layer's own trace could answer it once the refusal
    * came from somewhere other than the VT. `b1nix.trace-ioctl`. */
-  if (rc == -ENOTTY && bootinfo_has_flag("b1nix.trace-ioctl")) {
-    console_write("ioctl: ENOTTY req=0x");
-    console_write_hex64(request);
-    console_write(" fd=");
-    console_write_dec((u64)(u32)fd);
-    if (current_task) {
-      console_write(" by ");
-      console_write(current_task->name);
+  /* Which request on which descriptor, and what the descriptor IS.
+   *
+   * "errno 25 from syscall 16" names ioctl and no more; "fd 9" names nothing
+   * either once the descriptor was inherited. The kind (enum vfs_handle_kind)
+   * is what says which handler answered. The first 32 calls of each program
+   * name, refused or not: an event loop that retries a refused FIONREAD asks
+   * a hundred thousand times a second, and the interesting program starts
+   * after a hundred that are not. `b1nix.trace-ioctl`. */
+  if (bootinfo_has_flag("b1nix.trace-ioctl")) {
+    static char seen_name[16][16];
+    static unsigned seen_count[16];
+    const char *nm = current_task && current_task->name ? current_task->name : "?";
+    int slot = -1;
+    for (int k = 0; k < 16; k++) {
+      if (seen_name[k][0] && strncmp(seen_name[k], nm, 15) == 0) { slot = k; break; }
+      if (!seen_name[k][0]) { strncpy(seen_name[k], nm, 15); slot = k; break; }
     }
-    console_write("\n");
+    if (slot >= 0 && seen_count[slot] < 32) {
+      seen_count[slot]++;
+      struct vfs_handle *h = scheduler_fd_get(fd);
+      char line[192];
+      snprintf(line, sizeof(line), "ioctl: req=0x%lx fd=%d kind=%d node=%s rc=%d by %s\n",
+               (unsigned long)request, fd, h ? (int)h->kind : -1,
+               h && h->node ? h->node->name : "-", rc, nm);
+      console_write(line);
+    }
   }
   return (u64)rc;
 }
@@ -3430,7 +3447,7 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
   }
 
   u64 tick_ns = 1000000000ull / (u64)sched_tick_hz();
-  u64 deadline_ns = infinite ? 0 : arch_tsc_monotonic_ns() + timeout_ns;
+  u64 deadline_ns = infinite ? 0 : ktime_monotonic_ns() + timeout_ns;
 
   extern void *vfs_poll_chan;
 
@@ -3463,13 +3480,43 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
 
     int timed_out = 0;
     if (ready == 0 && !infinite && timeout_ns != 0 &&
-        arch_tsc_monotonic_ns() >= deadline_ns)
+        ktime_monotonic_ns() >= deadline_ns)
       timed_out = 1;
 
     if (ready > 0 || (!infinite && timeout_ns == 0) || timed_out) {
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
       syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
+      /* What poll answered, and about what kind of descriptor: an event
+       * loop that is told "readable" about something it then cannot read
+       * asks again at once, and the syscall trace shows only the pollfd
+       * pointer. First 32 answers per program name. `b1nix.trace-poll`. */
+      if (ready > 0 && bootinfo_has_flag("b1nix.trace-poll")) {
+        static char seen_name[16][16];
+        static unsigned seen_count[16];
+        const char *nm = current_task->name ? current_task->name : "?";
+        int slot = -1;
+        for (int k = 0; k < 16; k++) {
+          if (seen_name[k][0] && strncmp(seen_name[k], nm, 15) == 0) { slot = k; break; }
+          if (!seen_name[k][0]) { strncpy(seen_name[k], nm, 15); slot = k; break; }
+        }
+        if (slot >= 0 && seen_count[slot] < 32) {
+          seen_count[slot]++;
+          char line[256];
+          usize pos = (usize)snprintf(line, sizeof(line), "poll: %s nfds=%lu ready=%d:",
+                                      nm, (unsigned long)nfds, ready);
+          for (u64 i = 0; i < nfds && pos < sizeof(line) - 40; i++) {
+            if (!fds[i].revents)
+              continue;
+            struct vfs_handle *h = scheduler_fd_get(fds[i].fd);
+            pos += (usize)snprintf(line + pos, sizeof(line) - pos, " fd%d/k%d ev=%x re=%x",
+                                   fds[i].fd, h ? (int)h->kind : -1,
+                                   (unsigned)fds[i].events, (unsigned)fds[i].revents);
+          }
+          snprintf(line + pos, sizeof(line) - pos, "\n");
+          console_write(line);
+        }
+      }
       kfree(heap_fds);
       return (u64)ready;
     }
@@ -3493,7 +3540,7 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
      * seconds until unrelated traffic kicked the chan (netd's reactor wedge,
      * every socket() timing out with ETIMEDOUT meanwhile). */
     if (!infinite && timeout_ns != 0) {
-      u64 now_ns = arch_tsc_monotonic_ns();
+      u64 now_ns = ktime_monotonic_ns();
       u64 rest_ns = deadline_ns > now_ns ? deadline_ns - now_ns : 0;
       u64 ticks = (rest_ns + tick_ns - 1) / tick_ns;
       if (ticks == 0)
@@ -4348,7 +4395,7 @@ static u64 syscall_sleep_timespec(const struct timespec *ts, u64 *ticks_asked) {
   u64 tick_ns = 1000000000ULL / (u64)sched_tick_hz();
   u64 total_ns = (u64)ts->tv_sec * 1000000000ULL + (u64)ts->tv_nsec;
   u64 start_ticks = scheduler_get_uptime_ticks();
-  u64 deadline_ns = arch_tsc_monotonic_ns() + total_ns;
+  u64 deadline_ns = ktime_monotonic_ns() + total_ns;
   u64 asked_ticks = (total_ns + tick_ns - 1) / tick_ns;
   /* A sleep is bounded by BOTH clocks, and by whichever says "enough" first.
    *
@@ -4386,7 +4433,7 @@ static u64 syscall_sleep_timespec(const struct timespec *ts, u64 *ticks_asked) {
    * programs — is spun. Whether re-entry is allowed at all is the scheduler's
    * answer, not ours: see scheduler_sleep_ticks_state. */
   for (;;) {
-    u64 now_ns = arch_tsc_monotonic_ns();
+    u64 now_ns = ktime_monotonic_ns();
     if (now_ns >= deadline_ns)
       break;
     if (scheduler_get_uptime_ticks() >= tick_deadline)
@@ -4488,7 +4535,7 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
         if (n > FIXED_BATCH)
           n = FIXED_BATCH;
         usize nframes = vmm_unmap_range_collect(v, n, frames);
-        tlb_shootdown_all();
+        tlb_shootdown_current_mm();
         for (usize k = 0; k < nframes; k++)
           pmm_free_frame(frames[k]);
         v += (u64)n * PAGE_SIZE;
@@ -4895,7 +4942,7 @@ static isize sys_munmap(void *addr, usize length) {
       if (n > batch)
         n = batch;
       usize nframes = vmm_unmap_range_collect(v, n, frames);
-      tlb_shootdown_all();
+      tlb_shootdown_current_mm();
       for (usize i = 0; i < nframes; i++)
         pmm_free_frame(frames[i]);
       v += (u64)n * PAGE_SIZE;
@@ -5346,7 +5393,7 @@ static isize sys_madvise(void *addr, usize length, int advice) {
       if (n > MADV_BATCH)
         n = MADV_BATCH;
       usize nframes = vmm_unmap_range_collect(v, n, frames);
-      tlb_shootdown_all();
+      tlb_shootdown_current_mm();
       for (usize i = 0; i < nframes; i++)
         pmm_free_frame(frames[i]);
       /* Re-arm each page as lazy so the next touch refaults to a fresh zeroed
@@ -5774,11 +5821,65 @@ static u32 slowcall_ms(void) {
   return ms;
 }
 
+/* The same totals by (task name, call number): the per-number table said
+ * poll(2) was made two million times while a desktop started and could not
+ * say by whom. Keyed by the name's characters, not the task pointer, so a
+ * program's threads and its re-executions add up under one line. 4096 rows:
+ * a boot runs a few hundred distinct programs and each brings a dozen call
+ * numbers, and with 256 rows the table was full before the desktop's own
+ * processes existed (7.7 million calls dropped). */
+#define SYSPROF_PAIRS 4096
+struct sysprof_pair {
+  char name[16];
+  u32 nr;
+  u32 used;
+  u64 count;
+  u64 cycles;
+};
+static struct sysprof_pair g_sysprof_pair[SYSPROF_PAIRS];
+static u64 g_sysprof_pair_dropped;
+
+static void syscall_prof_account_task(u32 nr, u64 cycles) {
+  const char *nm = current_task && current_task->name ? current_task->name : "?";
+  char key[16];
+  u64 h = 1469598103934665603ull ^ nr;
+  usize n = 0;
+  for (; n < sizeof(key) - 1 && nm[n]; n++) {
+    key[n] = nm[n];
+    h = (h ^ (u8)nm[n]) * 1099511628211ull;
+  }
+  key[n] = 0;
+  for (u32 probe = 0; probe < 8; probe++) {
+    struct sysprof_pair *e = &g_sysprof_pair[(u32)(h >> 40) + probe & (SYSPROF_PAIRS - 1)];
+    u32 used = __atomic_load_n(&e->used, __ATOMIC_ACQUIRE);
+    if (!used) {
+      u32 expect = 0;
+      /* Claim, then fill; a reader that sees used==2 sees the name. */
+      if (__atomic_compare_exchange_n(&e->used, &expect, 1, 0,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        memcpy(e->name, key, sizeof(key));
+        e->nr = nr;
+        __atomic_store_n(&e->used, 2, __ATOMIC_RELEASE);
+        used = 2;
+      } else {
+        continue;
+      }
+    }
+    if (used == 2 && e->nr == nr && strcmp(e->name, key) == 0) {
+      __atomic_fetch_add(&e->count, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&e->cycles, cycles, __ATOMIC_RELAXED);
+      return;
+    }
+  }
+  __atomic_fetch_add(&g_sysprof_pair_dropped, 1, __ATOMIC_RELAXED);
+}
+
 static void syscall_prof_account(u32 nr, u64 cycles) {
   if (nr >= SYSPROF_SLOTS)
     return;
   __atomic_fetch_add(&g_sysprof_count[nr], 1, __ATOMIC_RELAXED);
   __atomic_fetch_add(&g_sysprof_cycles[nr], cycles, __ATOMIC_RELAXED);
+  syscall_prof_account_task(nr, cycles);
 }
 
 /* The ten call numbers that have cost the most, newest totals each time. A
@@ -5795,8 +5896,13 @@ void syscall_prof_reset(void) {
 void syscall_prof_dump(void) {
   if (!syscall_prof_enabled())
     return;
-  console_write("sysprof (nr count Mcycles):");
-  for (int rank = 0; rank < 12; rank++) {
+  /* Each line is built whole and written once: the console lock covers one
+   * console_write, and a line assembled from thirty of them came out with
+   * another CPU's message in the middle. */
+  char line[640];
+  usize pos = 0;
+  pos += (usize)snprintf(line + pos, sizeof(line) - pos, "sysprof (nr count Mcycles):");
+  for (int rank = 0; rank < 12 && pos < sizeof(line) - 48; rank++) {
     u32 best = 0;
     u64 bestc = 0;
 
@@ -5810,18 +5916,43 @@ void syscall_prof_dump(void) {
     }
     if (!bestc)
       break;
-    console_write(" ");
-    console_write_dec(best);
-    console_write(":");
-    console_write_dec(__atomic_load_n(&g_sysprof_count[best], __ATOMIC_RELAXED));
-    console_write(":");
-    console_write_dec(bestc / 1000000);
+    pos += (usize)snprintf(line + pos, sizeof(line) - pos, " %u:%lu:%lu", best,
+                           (unsigned long)(__atomic_load_n(&g_sysprof_count[best], __ATOMIC_RELAXED) & ~(1ull << 63)),
+                           (unsigned long)(bestc / 1000000));
     /* Mark it consumed for this pass, then restore below. */
     __atomic_fetch_or(&g_sysprof_count[best], 1ull << 63, __ATOMIC_RELAXED);
   }
   for (u32 n = 0; n < SYSPROF_SLOTS; n++)
     __atomic_fetch_and(&g_sysprof_count[n], ~(1ull << 63), __ATOMIC_RELAXED);
-  console_write("\n");
+  snprintf(line + pos, sizeof(line) - pos, "\n");
+  console_write(line);
+
+  pos = 0;
+  pos += (usize)snprintf(line + pos, sizeof(line) - pos, "sysprof by task (name/nr count Mcycles):");
+  u64 floor = ~0ull;
+  for (int rank = 0; rank < 12 && pos < sizeof(line) - 64; rank++) {
+    struct sysprof_pair *best = 0;
+    u64 bestc = 0;
+    for (u32 i = 0; i < SYSPROF_PAIRS; i++) {
+      struct sysprof_pair *e = &g_sysprof_pair[i];
+      u64 c = __atomic_load_n(&e->count, __ATOMIC_RELAXED);
+      if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) == 2 && c < floor && c > bestc) {
+        bestc = c;
+        best = e;
+      }
+    }
+    if (!best)
+      break;
+    floor = bestc;
+    pos += (usize)snprintf(line + pos, sizeof(line) - pos, " %s/%u:%lu:%lu", best->name, best->nr,
+                           (unsigned long)bestc,
+                           (unsigned long)(__atomic_load_n(&best->cycles, __ATOMIC_RELAXED) / 1000000));
+  }
+  if (g_sysprof_pair_dropped)
+    pos += (usize)snprintf(line + pos, sizeof(line) - pos, " dropped=%lu",
+                           (unsigned long)g_sysprof_pair_dropped);
+  snprintf(line + pos, sizeof(line) - pos, "\n");
+  console_write(line);
 }
 
 struct syscall_flight_entry {
@@ -9653,7 +9784,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* ioctl request codes are 32-bit; _IOR codes with the top bit set (e.g.
      * TIOCGPTN=0x80045430) arrive sign-extended through musl's `int request`.
      * Truncate so handlers' `case 0x80045430:` labels match. */
-    return (u64)vfs_ioctl((int)arg0, (u32)arg1, (void *)(usize)arg2);
+    /* Through sys_ioctl, not straight to the VFS: that is where the ioctl
+     * trace lives, and going around it meant no musl program's ioctl was
+     * ever traced -- the flag answered only the built-in programs. */
+    return sys_ioctl((int)arg0, (u32)arg1, (void *)(usize)arg2);
   case SYS_FCNTL:
     return (u64)sys_fcntl((int)arg0, (int)arg1, arg2);
   case SYS_DUP2:

@@ -1,3 +1,4 @@
+#include <b1nix/syscall.h>
 #include <b1nix/vfs.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
@@ -195,8 +196,24 @@ static void pipe_release(struct vfs_handle *h) {
   scheduler_wake_all(vfs_poll_chan);
 }
 
-const struct vfs_file_ops pipe_read_ops = { .read = pipe_read, .poll = pipe_poll, .release = pipe_release };
-const struct vfs_file_ops pipe_write_ops = { .write = pipe_write, .poll = pipe_poll, .release = pipe_release };
+/* FIONREAD: what a read would return right now, for either end.
+ *
+ * Qt asks it after poll(2) has said "readable" and, answered ENOTTY, takes
+ * the count to be zero and reads nothing -- so the descriptor stays readable
+ * and the event loop spins: kioworker made 110 000 poll+ioctl+clock_gettime
+ * rounds a second while Plasma started, a third of the kernel's time. Every
+ * other request is still ENOTTY, which isatty(3) relies on to mean "not a
+ * terminal" rather than "not open" (see vfs_ioctl). */
+#define PIPE_FIONREAD 0x541B
+static int pipe_ioctl(struct vfs_handle *h, u64 request, void *arg) {
+  if (request != PIPE_FIONREAD) return -ENOTTY;
+  struct vfs_pipe *pipe = (struct vfs_pipe *)h->private_data;
+  int n = (pipe && pipe->used) ? (int)pipe->size : 0;
+  return syscall_copyout(arg, &n, sizeof(n)) == 0 ? 0 : -EFAULT;
+}
+
+const struct vfs_file_ops pipe_read_ops = { .read = pipe_read, .poll = pipe_poll, .release = pipe_release, .ioctl = pipe_ioctl };
+const struct vfs_file_ops pipe_write_ops = { .write = pipe_write, .poll = pipe_poll, .release = pipe_release, .ioctl = pipe_ioctl };
 
 void vfs_pipe_init_handle(struct vfs_handle *h, struct vfs_pipe *pipe, int is_write) {
   h->private_data = pipe;
@@ -335,7 +352,7 @@ static void fifo_release(struct vfs_handle *h) {
 }
 
 static const struct vfs_file_ops fifo_read_ops = {
-    .read = pipe_read, .poll = pipe_poll, .release = fifo_release};
+    .read = pipe_read, .poll = pipe_poll, .release = fifo_release, .ioctl = pipe_ioctl};
 static const struct vfs_file_ops fifo_write_ops = {
     .write = pipe_write, .poll = pipe_poll, .release = fifo_release};
 /* O_RDWR on a FIFO is legal on Linux and never blocks — the opener is its own

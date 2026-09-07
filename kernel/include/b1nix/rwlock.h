@@ -1,3 +1,4 @@
+#include <b1nix/kprof.h>
 #ifndef B1NIX_RWLOCK_H
 #define B1NIX_RWLOCK_H
 
@@ -96,11 +97,15 @@ static inline void rw_read_lock_irqsave(rwlock_t *lock, u64 *flags) {
     __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
     *flags = f32;
 #endif
+    if (__builtin_expect(kprof_irqoff_on, 0) && KPROF_IRQ_WAS_ON(*flags))
+        kprof_irqoff_begin(__builtin_return_address(0));
     rw_read_lock(lock);
 }
 
 static inline void rw_read_unlock_irqrestore(rwlock_t *lock, u64 flags) {
     rw_read_unlock(lock);
+    if (__builtin_expect(kprof_irqoff_on, 0) && KPROF_IRQ_WAS_ON(flags))
+        kprof_irqoff_end();
 #ifdef __x86_64__
     __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
 #elif defined(__aarch64__)
@@ -123,11 +128,15 @@ static inline void rw_write_lock_irqsave(rwlock_t *lock, u64 *flags) {
     __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
     *flags = f32;
 #endif
+    if (__builtin_expect(kprof_irqoff_on, 0) && KPROF_IRQ_WAS_ON(*flags))
+        kprof_irqoff_begin(__builtin_return_address(0));
     rw_write_lock(lock);
 }
 
 static inline void rw_write_unlock_irqrestore(rwlock_t *lock, u64 flags) {
     rw_write_unlock(lock);
+    if (__builtin_expect(kprof_irqoff_on, 0) && KPROF_IRQ_WAS_ON(flags))
+        kprof_irqoff_end();
 #ifdef __x86_64__
     __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
 #elif defined(__aarch64__)
