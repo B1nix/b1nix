@@ -226,13 +226,26 @@ static u32 vfs_current_mnt_ns(void) {
   return namespace_current_id(NS_MNT);
 }
 
-/* Is mounts[i] a live entry the caller can see? */
-static int mount_visible(usize i) {
+/* Is mounts[i] a live entry a caller in mount namespace `ns` can see?
+ *
+ * The namespace is passed in because the answer is the same for every slot in
+ * one walk, and asking for it per slot is what made this the hottest lock in
+ * the kernel on a systemd guest: an Arch boot called namespace_id_of fourteen
+ * million times in nine seconds -- once per mount slot per path resolution --
+ * and each call took a global spinlock with interrupts off. A namespace
+ * cannot change under a task in the middle of its own syscall (setns only
+ * ever moves the caller), so one read per walk is exactly as correct as one
+ * per slot. */
+static int mount_visible_in(usize i, u32 ns) {
   if (!mounts[i].used)
     return 0;
   if (!namespace_active())
     return 1;
-  return mounts[i].mnt_ns == vfs_current_mnt_ns();
+  return mounts[i].mnt_ns == ns;
+}
+
+static int mount_visible(usize i) {
+  return mount_visible_in(i, vfs_current_mnt_ns());
 }
 
 /* How many mount entries (in any namespace) point at this root node? A cloned
@@ -286,11 +299,12 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   vfs_tree_read_acquire(&flags);
   struct vfs_node *curr = node;
   struct vfs_mount_entry *res = 0;
+  u32 walk_ns = vfs_current_mnt_ns(); /* once per walk, see mount_visible_in */
   while (curr) {
     /* The deepest ancestor that is some mount's root wins; among the entries
      * rooted at THAT node, the one mounted last does (see ::seq). */
     for (int i = 0; i < (int)mount_hwm; i++) {
-      if (mount_visible(i) && curr == mounts[i].root_node &&
+      if (mount_visible_in(i, walk_ns) && curr == mounts[i].root_node &&
           (!res || mounts[i].seq > res->seq))
         res = &mounts[i];
     }
@@ -304,7 +318,7 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
    * applying it here changed which filesystem's flags an unattached node was
    * judged by. */
   for (int i = 0; i < (int)mount_hwm; i++) {
-    if (mount_visible(i) && strcmp(mounts[i].target, "/") == 0) {
+    if (mount_visible_in(i, walk_ns) && strcmp(mounts[i].target, "/") == 0) {
       res = &mounts[i];
       goto out;
     }
@@ -349,8 +363,10 @@ static void mount_record_target(const char *target, struct vfs_node *node,
 static struct vfs_node *vfs_mount_point_of(const struct vfs_node *node) {
   if (!node || node == root_node || node->parent)
     return 0;
+  u32 walk_ns = vfs_current_mnt_ns();
+
   for (int i = 0; i < (int)mount_hwm; i++) {
-    if (!mount_visible(i) || mounts[i].root_node != node)
+    if (!mount_visible_in(i, walk_ns) || mounts[i].root_node != node)
       continue;
     /* The FIRST mount of this root is the one that gives it its name; a later
      * bind of the same filesystem somewhere else does not rename it. Taking a
@@ -1360,8 +1376,10 @@ static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node) {
     return node;
 
   struct vfs_node *mounted_root = 0;
+  u32 walk_ns = vfs_current_mnt_ns();
+
   for (int i = 0; i < (int)mount_hwm; i++) {
-    if (mount_visible(i) && mounts[i].root_node &&
+    if (mount_visible_in(i, walk_ns) && mounts[i].root_node &&
         strcmp(mounts[i].target, "/") == 0) {
       mounted_root = mounts[i].root_node;
     }
@@ -1928,8 +1946,10 @@ restart_traversal:
     if (strcmp(part, "..") == 0) {
       while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
         scheduler_yield();
+      u32 walk_ns = vfs_current_mnt_ns();
+
       for (int i = 0; i < (int)mount_hwm; i++) {
-        if (mount_visible(i) && current == mounts[i].root_node) {
+        if (mount_visible_in(i, walk_ns) && current == mounts[i].root_node) {
           struct vfs_node *mp = vfs_node_get(mounts[i].mount_point);
           __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
           vfs_inode_unlock_read(current->inode);
@@ -2004,8 +2024,10 @@ restart_traversal:
 
     /* find_child() already returns with refcount incremented */
     /* DOWNWARD MOUNT CROSSING */
+    u32 walk_ns = vfs_current_mnt_ns();
+
     for (int i = 0; i < (int)mount_hwm; i++) {
-      if (mount_visible(i) && child == mounts[i].mount_point) {
+      if (mount_visible_in(i, walk_ns) && child == mounts[i].mount_point) {
         struct vfs_node *root = vfs_node_get(mounts[i].root_node);
         vfs_node_put(child);
         child = root;
@@ -2224,8 +2246,10 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
     }
     int child_was_found = (child != NULL);
     if (child) {
+      u32 walk_ns = vfs_current_mnt_ns();
+
       for (int i = 0; i < (int)mount_hwm; i++) {
-        if (mount_visible(i) && child == mounts[i].mount_point) {
+        if (mount_visible_in(i, walk_ns) && child == mounts[i].mount_point) {
           vfs_node_put(child); /* Drop ref from find_child */
           child = vfs_node_get(mounts[i].root_node);
           break;

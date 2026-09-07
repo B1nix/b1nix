@@ -956,6 +956,20 @@ static int r_b1nix_kprof(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/*
+ * The same dump, without a reader.
+ *
+ * Reading /proc/b1nix-prof is how the profile comes out, and that needs a
+ * guest that will read it -- fine for the KDE image, useless for a stock
+ * distribution whose init has never heard of this file. `b1nix.prof-at=<sec>`
+ * has the kernel print it once, by itself, that many seconds after boot.
+ */
+static int r_b1nix_prof(usize pid, struct sbuf *s);
+
+void b1nix_prof_dump_all(void) {
+  r_b1nix_prof(0, 0);
+}
+
 static int r_b1nix_prof(usize pid, struct sbuf *s) {
   (void)pid;
   extern void syscall_prof_dump(void);

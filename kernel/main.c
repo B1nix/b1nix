@@ -400,6 +400,17 @@ static int mount_first_virtio_root(void)
 	}
 }
 
+/* See b1nix.prof-at. */
+static void prof_dump_thread(void *arg)
+{
+	extern void b1nix_prof_dump_all(void);
+	u32 seconds = (u32)(usize)arg;
+
+	scheduler_sleep_ticks((u64)seconds * (u64)sched_tick_hz());
+	console_write("prof: dump at b1nix.prof-at\n");
+	b1nix_prof_dump_all();
+}
+
 void kernel_main(usize arg0, usize arg1)
 {
 #ifdef __x86_64__
@@ -1689,6 +1700,15 @@ void kernel_main(usize arg0, usize arg1)
 	 * allocations rarely stall in synchronous reclaim. */
 	kswapd_init();
 	vfs_start_writeback();
+	/* b1nix.prof-at=<seconds>: print the profile once, by itself, for a guest
+	 * that will never read /proc/b1nix-prof. */
+	{
+		u32 at = bootinfo_get_u32("b1nix.prof-at", 0);
+
+		if (at)
+			kthread_create("profdump", prof_dump_thread,
+			               (void *)(usize)at);
+	}
 	fb_console_start_flusher();
 
 	/* M99/M100 self-tests run here rather than in the block above: they create
