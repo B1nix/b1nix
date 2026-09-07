@@ -2917,6 +2917,24 @@ endif
 			esac; \
 			ln -sf /opt/busybox/bin/$$bb "$(BUILD_DIR)/rootfs/bin/$$ap"; \
 		done
+	@# Resolve the bare *.so symlinks in the package staging root to real
+	@# copies ONCE here, not in the image root on every build. The ext4 driver
+	@# cannot follow a symlink, so a .so link has to become a copy of what it
+	@# points at; doing that in the image root meant the copy below re-created
+	@# the link from the (symlinked) staging root every build and the image
+	@# root's own dedup converted it right back -- a fresh timestamp on every
+	@# such library (libltdl, the PAM libs, every Gallium DRI driver) that
+	@# repacked the whole 2.5 GB image when nothing had changed. Converted in
+	@# the staging root, the copy sees a real file whose bytes do not move, so
+	@# it is written once and the image is left alone. Idempotent: a second run
+	@# finds no link left to convert. A dangling link is dropped.
+	@find $(PKGROOT)/lib -type l -name '*.so' 2>/dev/null | while read -r l; do \
+		if [ -f "$$l" ]; then \
+			t=$$(readlink -f "$$l"); rm -f "$$l"; cp -f "$$t" "$$l"; \
+		else \
+			rm -f "$$l"; \
+		fi; \
+	done 2>/dev/null || true
 	@# One process for the whole staging root, not one `cp` per file: this is
 	@# several thousand entries, and forking a copy for each of them cost more
 	@# than the copying did.

@@ -246,11 +246,11 @@ legacy)
 	# is where legacy IGD mode has to place the real device. Neither is wanted
 	# here — this run is about the GPU.
 	MACHINE_ARGS="-machine pc,accel=kvm -vga none $NET_ARGS"
-	DEV_ARGS="-device vfio-pci,host=$IGD_BDF,addr=02.0,x-igd-opregion=on,rombar=0"
+	DEV_ARGS="-device vfio-pci,host=$IGD_BDF,addr=02.0,x-igd-opregion=on,rombar=0${IGD_DEV_EXTRA:+,$IGD_DEV_EXTRA}"
 	;;
 q35)
 	MACHINE_ARGS="-machine q35,accel=kvm -vga none $NET_ARGS"
-	DEV_ARGS="-device vfio-pci,host=$IGD_BDF,rombar=0"
+	DEV_ARGS="-device vfio-pci,host=$IGD_BDF,rombar=0${IGD_DEV_EXTRA:+,$IGD_DEV_EXTRA}"
 	;;
 *)
 	echo "MACHINE must be 'legacy' or 'q35'" >&2

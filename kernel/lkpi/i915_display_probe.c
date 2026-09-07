@@ -1003,3 +1003,91 @@ void lkpi_i915_register_card(struct drm_device *dev)
 
 	lkpi_drm_register_device(dev, i915_gem_page_phys);
 }
+
+/*
+ * Pin the display power-saving module parameters off before the driver probes.
+ *
+ * The vblank-evasion critical section (intel_pipe_update_start ..
+ * intel_pipe_update_end) programs the flip registers with interrupts disabled
+ * and must finish within the window just before vblank. A commit that arrives
+ * after a power well has entered a deep DC state stalls inside that section
+ * waking the well; under legacy IGD passthrough the wake is slow enough that
+ * the section overruns the window, misses the flip and tears the frame -- seen
+ * as "Atomic update failure on pipe A time 1548 us, min 1073". PSR and FBC add
+ * their own commit-time handshakes for the same reason.
+ *
+ * Setting enable_dc/enable_psr/enable_fbc to 0 keeps the wells up: a little
+ * more idle power for a commit that always meets the vblank deadline. The
+ * imported defaults are -1 (auto, on for this generation); this only writes
+ * i915_modparams, which i915_params_copy() folds into i915->params at probe.
+ * Reachable because i915_drv.h declares the extern; nothing imported changes.
+ */
+void lkpi_i915_disable_display_power_saving(void)
+{
+	i915_modparams.enable_dc = 0;
+	i915_modparams.enable_psr = 0;
+	i915_modparams.enable_fbc = 0;
+	pr_info("i915-probe: display power saving pinned off (DC/PSR/FBC) "
+	        "for vblank-evasion determinism\n");
+}
+
+/*
+ * Time a raw MMIO read of a display register, to tell a direct-mapped BAR
+ * (KVM memslot, tens of ns per access) from a trapped one (a VM exit and a
+ * VFIO round-trip per access, microseconds). The vblank-evasion critical
+ * section writes a handful of double-buffered registers with interrupts off;
+ * if each access is microseconds the section overruns its ~1 ms budget and
+ * the frame tears. PIPEDSL is read-only and always live on an enabled pipe,
+ * so hammering it changes nothing. b1nix.i915-mmio-bench.
+ */
+void lkpi_i915_mmio_bench(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = to_i915_checked(dev);
+	const unsigned iters = 4000;
+	volatile u32 sink = 0;
+	u64 t0, t1;
+	unsigned i;
+
+	if (!dev_priv)
+		return;
+
+	/* Warm the mapping, then time the read loop with interrupts disabled so
+	 * nothing else is charged to it. */
+	sink += intel_uncore_read_fw(&dev_priv->uncore, PIPEDSL(PIPE_A));
+
+	t0 = lkpi_monotonic_ns();
+	for (i = 0; i < iters; i++)
+		sink += intel_uncore_read_fw(&dev_priv->uncore, PIPEDSL(PIPE_A));
+	t1 = lkpi_monotonic_ns();
+
+	pr_info("i915-probe: mmio-bench %u raw reads in %llu ns = %llu ns/read "
+	        "(sink %08x)\n",
+	        iters, (unsigned long long)(t1 - t0),
+	        (unsigned long long)((t1 - t0) / iters), (unsigned)sink);
+
+	/*
+	 * Reads are non-posted and cost a PCIe round-trip even on bare metal, so
+	 * they cannot tell a trapped BAR from a direct one. Posted WRITES can: a
+	 * direct write retires locally (~100 ns), a trapped one takes a VM exit
+	 * and a VFIO round-trip (~1 us). SWF1 is a display scratch register i915
+	 * saves and restores across suspend -- no hardware side effect -- so it is
+	 * safe to hammer once its value is put back.
+	 */
+	{
+		u32 orig = intel_uncore_read_fw(&dev_priv->uncore, SWF1(0));
+		u64 w0, w1;
+
+		w0 = lkpi_monotonic_ns();
+		for (i = 0; i < iters; i++)
+			intel_uncore_write_fw(&dev_priv->uncore, SWF1(0),
+			                      0xb1000000u | i);
+		w1 = lkpi_monotonic_ns();
+
+		intel_uncore_write_fw(&dev_priv->uncore, SWF1(0), orig);
+
+		pr_info("i915-probe: mmio-bench %u raw writes in %llu ns = %llu "
+		        "ns/write\n",
+		        iters, (unsigned long long)(w1 - w0),
+		        (unsigned long long)((w1 - w0) / iters));
+	}
+}

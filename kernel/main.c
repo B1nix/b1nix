@@ -119,8 +119,18 @@ void lkpi_i915_register_card(struct drm_device *dev);
 extern int lkpi_initcall_drm_buddy_module_init(void);
 extern int lkpi_initcall_drm_display_helper_module_init(void);
 extern int lkpi_initcall_i915_init(void);
+extern void lkpi_i915_disable_display_power_saving(void);
 static void i915_module_init(void)
 {
+	/*
+	 * Keep the display power wells up so a commit never stalls waking one
+	 * inside the vblank-evasion critical section. See the note on
+	 * lkpi_i915_disable_display_power_saving(). Opt-in with b1nix.i915-no-dc
+	 * until it is proven on the panel; it must run before the initcall below,
+	 * which copies i915_modparams into the device.
+	 */
+	if (bootinfo_has_flag("b1nix.i915-no-dc"))
+		lkpi_i915_disable_display_power_saving();
 	/*
 	 * The OpRegion first, because the driver reads it during probe and there is
 	 * no second chance: the VBT inside is where the board's port wiring and
@@ -925,6 +935,10 @@ void kernel_main(usize arg0, usize arg1)
 
 		if (card)
 			lkpi_i915_register_card(card);
+		if (card && bootinfo_has_flag("b1nix.i915-mmio-bench")) {
+			extern void lkpi_i915_mmio_bench(struct drm_device *d);
+			lkpi_i915_mmio_bench(card);
+		}
 		/* And, when asked, whether the GT behind that card will run
 		 * anything: engines, address space, and one empty request per
 		 * engine taken to retirement. Costs nothing when the flag is
