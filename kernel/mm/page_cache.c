@@ -478,8 +478,64 @@ static struct ra_stream *ra_streams;
 static u32 ra_streams_n = RA_STREAMS_MIN; /* always a power of two */
 static u32 ra_streams_mask = RA_STREAMS_MIN - 1;
 static u32 ra_win_max = 16; /* pages; the pre-scaling value, see ra_init */
-static int ra_in_prefetch; /* re-entrancy guard (best-effort, mirrors the
-                              proactive-evict guard) */
+/* Counted for the profile: see page_cache_read_stats. */
+static u64 g_pc_readahead_pages;
+static void pc_top_note(const struct vfs_inode *inode, u64 pages);
+/*
+ * "Am *I* inside a prefetch?", not "is anyone".
+ *
+ * The guard was a single global, which is right only while the prefetch runs
+ * on the thread that scheduled it: read one CPU deep, it also silences
+ * read-ahead for every other CPU that happens to fault while a prefetch is in
+ * progress. That is what made the prefetch worker slower than no worker at
+ * all. A small table of the tasks currently prefetching answers the question
+ * the recursion check actually asks, and survives the task moving CPU.
+ */
+#define RA_PREFETCHERS 8u
+
+static void *ra_prefetchers[RA_PREFETCHERS];
+
+static int ra_prefetch_active(void) {
+  void *me = (void *)current_task;
+  unsigned i;
+
+  for (i = 0; i < RA_PREFETCHERS; i++)
+    if (__atomic_load_n(&ra_prefetchers[i], __ATOMIC_ACQUIRE) == me)
+      return 1;
+  return 0;
+}
+
+/* 1 when this thread now owns a slot; the caller must release it. A full
+ * table means "too many prefetches at once": the caller skips its burst,
+ * which is what the old guard did on re-entry anyway. */
+static int ra_prefetch_enter(void) {
+  void *me = (void *)current_task;
+  unsigned i;
+
+  if (!me || ra_prefetch_active())
+    return 0;
+  for (i = 0; i < RA_PREFETCHERS; i++) {
+    void *expect = 0;
+
+    if (__atomic_compare_exchange_n(&ra_prefetchers[i], &expect, me, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+      return 1;
+  }
+  return 0;
+}
+
+static void ra_prefetch_leave(void) {
+  void *me = (void *)current_task;
+  unsigned i;
+
+  for (i = 0; i < RA_PREFETCHERS; i++) {
+    void *expect = me;
+
+    if (__atomic_compare_exchange_n(&ra_prefetchers[i], &expect, 0, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+      return;
+  }
+}
 
 static u32 ra_hash(const struct vfs_inode *inode) {
   u32 h = (u32)(inode->ino ^ (inode->ino >> 32));
@@ -491,11 +547,57 @@ static u32 ra_hash(const struct vfs_inode *inode) {
 /* Smallest burst, in pages. Linux starts its ondemand window at 16 KiB too. */
 #define RA_MIN 4
 
+/* What a fault that missed reads when it knows nothing about the stream.
+ *
+ * Measured on a KDE start-up, varying only this: 64 pages read 885 MB and had
+ * the desktop up in 13.1 s, 16 pages read 430 MB and 12.3 s, 8 pages read
+ * 334 MB and 12.4 s. Reading a quarter of a megabyte to use four kilobytes of
+ * it is what the ceiling did on every scattered mapping -- and a desktop's
+ * mappings are scattered. Sixty-four kilobytes is the floor; a stream that
+ * proves itself sequential still climbs to the ceiling, one doubling per
+ * sequential miss, in page_cache_get_page. */
+#define RA_FAULT_MIN 16u
+
 /* The largest cluster any caller may ask page_cache_read_cluster for, in pages.
  * It is the same number as the read-ahead ceiling because the cluster reader
  * kmallocs `pages * PAGE_SIZE` in one go: an unclamped `pages` would turn a
  * tunable into an arbitrary contiguous allocation. */
 unsigned page_cache_cluster_pages(void) { return ra_win_max; }
+
+/*
+ * How much to read on a fault that missed, for THIS stream.
+ *
+ * The page-fault handler used to ask for the ceiling every time -- 256 KiB on
+ * a 4 GiB guest -- so a scattered mapping read a quarter of a megabyte to use
+ * four kilobytes of it. A desktop start-up takes twenty-one thousand
+ * file-backed faults and that was 112 us apiece, the largest single cost left
+ * in it.
+ *
+ * The window a stream has earned is the right size: a random reader gets the
+ * minimum, and a sequential one still reaches the ceiling within a few faults
+ * because page_cache_get_page doubles it on every sequential miss. This only
+ * reads that state; the growing is where it always was.
+ */
+unsigned page_cache_fault_cluster(const struct vfs_inode *inode, u64 offset) {
+  const struct ra_stream *r;
+  u32 win;
+
+  if (!inode || !ra_streams)
+    return RA_FAULT_MIN;
+  r = &ra_streams[ra_hash(inode)];
+  if (r->ino != inode->ino || r->fsid != inode->fs_id)
+    return RA_FAULT_MIN;
+  /* One page past the cursor is still this stream: the fault that missed is
+   * the one the cursor was waiting for. */
+  if (offset / PAGE_SIZE + 1 < r->next || offset / PAGE_SIZE > r->next)
+    return RA_FAULT_MIN;
+  win = r->win ? r->win : RA_FAULT_MIN;
+  if (win < RA_FAULT_MIN)
+    win = RA_FAULT_MIN;
+  if (win > ra_win_max)
+    win = ra_win_max;
+  return win;
+}
 
 static void ra_init(void) {
   u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
@@ -533,14 +635,33 @@ static void ra_init(void) {
   ra_win_max = win;
 }
 
+/*
+ * Read-ahead stays on the faulting thread. Twice measured, twice reverted.
+ *
+ * The idea is sound on its face: a start-up is 77% idle, so the machine has a
+ * spare CPU while a process waits for a window of pages it did not ask for.
+ * The first attempt was much slower because the re-entrancy guard was a
+ * single global and a worker silenced read-ahead for every other CPU. With
+ * the guard made per-thread (see ra_prefetch_enter) the worker behaved, and
+ * it was still slower: 12.9 s to a desktop against 12.4 s, and the average
+ * disk wait rose from 90 us to 102 us. The reason is in the same profile --
+ * the device is found busy 33 times in 15741 requests, so it answers one
+ * request at a time, and every page the worker prefetches is a request the
+ * faulting thread's own read now queues behind.
+ *
+ * A worker pays only once the driver can keep several requests in flight.
+ * Until then the prefetch belongs on the thread that will want the pages.
+ */
+
 /* Prefetch `pages` pages starting at (offset+1). Must be called with
  * pc_lock RELEASED: it allocates frames and issues blocking read_cb I/O. It
  * re-enters page_cache_get_page/page_cache_add_page; those re-entries observe
  * ra_in_prefetch and never schedule a nested burst. */
 static void pc_readahead(struct vfs_inode *inode, u64 offset, u32 pages) {
-  if (ra_in_prefetch || !inode->read_cb || pages == 0)
+  if (!inode->read_cb || pages == 0 || !ra_prefetch_enter())
     return;
-  ra_in_prefetch = 1;
+  __atomic_fetch_add(&g_pc_readahead_pages, pages, __ATOMIC_RELAXED);
+  pc_top_note(inode, pages);
   struct vfs_node dummy;
   memset(&dummy, 0, sizeof(dummy));
   dummy.inode = inode;
@@ -557,9 +678,10 @@ static void pc_readahead(struct vfs_inode *inode, u64 offset, u32 pages) {
   /* One filesystem read for the whole burst, not one per page: the same
    * economy the page-fault path gets from page_cache_read_cluster. A burst of
    * separate 4 KiB reads is one disk round trip per page; this is one. */
-  ra_in_prefetch = 0; /* the cluster reader has its own guard */
+  ra_prefetch_leave(); /* the cluster reader takes the slot itself */
   page_cache_read_cluster(inode, (base + 1) * PAGE_SIZE, pages);
-  ra_in_prefetch = 1;
+  if (!ra_prefetch_enter())
+    return;
   for (u64 po = base + 1; po <= base + pages; po++) {
     u64 poff = po * PAGE_SIZE;
     if (poff >= inode->size)
@@ -581,7 +703,7 @@ static void pc_readahead(struct vfs_inode *inode, u64 offset, u32 pages) {
     if (page_cache_add_page(inode, poff, frame) < 0)
       pmm_free_frame(frame); /* raced with another reader — keep their page */
   }
-  ra_in_prefetch = 0;
+  ra_prefetch_leave();
 }
 
 /* Read a run of pages in ONE call to the filesystem.
@@ -600,10 +722,98 @@ static void pc_readahead(struct vfs_inode *inode, u64 offset, u32 pages) {
  * Best effort throughout: no buffer, no read_cb, a short read or memory
  * pressure simply stops the burst. Must be called with pc_lock RELEASED — it
  * both allocates and does blocking I/O. */
+/* How much this run actually read from disk, and in how many requests.
+ *
+ * "Twenty thousand file faults costing seven G cycles" does not say whether
+ * the disk moved three hundred megabytes or five gigabytes, and the two want
+ * opposite fixes -- a wider window, or a narrower one. */
+static u64 g_pc_cluster_calls, g_pc_cluster_pages;
+
+/* Which files the run reads, by inode.
+ *
+ * Half a gigabyte read to put a desktop on the screen is either what KDE
+ * needs or a file this kernel reads more than once; the total cannot tell
+ * them apart, and a per-inode tally can -- the numbers resolve to paths with
+ * `debugfs -R "ncheck <ino>"` against the image on the host. A fixed table:
+ * the busiest files are few, and a full one simply stops recording. */
+#define PC_TOP_SLOTS 64u
+
+struct pc_top {
+  u64 ino;
+  u32 fsid;
+  u64 pages;
+};
+
+static struct pc_top g_pc_top[PC_TOP_SLOTS];
+static spinlock_t pc_top_lock = SPINLOCK_INIT;
+
+static void pc_top_note(const struct vfs_inode *inode, u64 pages) {
+  u64 flags;
+  unsigned i;
+
+  if (!inode)
+    return;
+  spin_lock_irqsave(&pc_top_lock, &flags);
+  for (i = 0; i < PC_TOP_SLOTS; i++) {
+    if (g_pc_top[i].pages && (g_pc_top[i].ino != inode->ino ||
+                              g_pc_top[i].fsid != inode->fs_id))
+      continue;
+    g_pc_top[i].ino = inode->ino;
+    g_pc_top[i].fsid = inode->fs_id;
+    g_pc_top[i].pages += pages;
+    break;
+  }
+  spin_unlock_irqrestore(&pc_top_lock, flags);
+}
+
+void page_cache_read_top(unsigned n, u64 *ino_out, u64 *pages_out) {
+  u64 flags;
+  unsigned want, i, j;
+
+  spin_lock_irqsave(&pc_top_lock, &flags);
+  for (want = 0; want < n; want++) {
+    unsigned best = PC_TOP_SLOTS;
+
+    for (i = 0; i < PC_TOP_SLOTS; i++) {
+      if (!g_pc_top[i].pages)
+        continue;
+      for (j = 0; j < want; j++)
+        if (ino_out[j] == g_pc_top[i].ino)
+          break;
+      if (j < want)
+        continue;
+      if (best == PC_TOP_SLOTS || g_pc_top[i].pages > g_pc_top[best].pages)
+        best = i;
+    }
+    if (best == PC_TOP_SLOTS)
+      break;
+    ino_out[want] = g_pc_top[best].ino;
+    pages_out[want] = g_pc_top[best].pages;
+  }
+  spin_unlock_irqrestore(&pc_top_lock, flags);
+  for (i = want; i < n; i++) {
+    ino_out[i] = 0;
+    pages_out[i] = 0;
+  }
+}
+
+void page_cache_read_stats(u64 *cluster_calls, u64 *cluster_pages,
+                           u64 *readahead_pages) {
+  if (cluster_calls)
+    *cluster_calls = __atomic_load_n(&g_pc_cluster_calls, __ATOMIC_RELAXED);
+  if (cluster_pages)
+    *cluster_pages = __atomic_load_n(&g_pc_cluster_pages, __ATOMIC_RELAXED);
+  if (readahead_pages)
+    *readahead_pages = __atomic_load_n(&g_pc_readahead_pages, __ATOMIC_RELAXED);
+}
+
 void page_cache_read_cluster(struct vfs_inode *inode, u64 offset,
                              unsigned pages) {
-  if (ra_in_prefetch || !inode || !inode->read_cb || pages < 2)
+  if (!inode || !inode->read_cb || pages < 2 || ra_prefetch_active())
     return;
+  __atomic_fetch_add(&g_pc_cluster_calls, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_pc_cluster_pages, pages, __ATOMIC_RELAXED);
+  pc_top_note(inode, pages);
   /* Hard clamp: `pages` reaches the kmalloc below unchanged, so an unbounded
    * caller would turn a tuning knob into an arbitrary contiguous allocation.
    * The ceiling is the configured window — nothing may ask for more in one
@@ -638,7 +848,10 @@ void page_cache_read_cluster(struct vfs_inode *inode, u64 offset,
 
   if (!buf)
     return;
-  ra_in_prefetch = 1;
+  if (!ra_prefetch_enter()) {
+    kfree(buf);
+    return;
+  }
   struct vfs_node dummy;
 
   memset(&dummy, 0, sizeof(dummy));
@@ -681,7 +894,7 @@ void page_cache_read_cluster(struct vfs_inode *inode, u64 offset,
       break; /* short read, EOF or pressure — nothing more to stage */
     done += chunk;
   }
-  ra_in_prefetch = 0;
+  ra_prefetch_leave();
   kfree(buf);
 }
 
@@ -722,7 +935,7 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
       /* Hit: a sequential reader landing on an already-prefetched page advances
        * the cursor (so the next burst fires at the right place) without
        * scheduling — the earlier burst already filled this window. */
-      if (!ra_in_prefetch && inode->read_cb && inode->type == VFS_FILE) {
+      if (!ra_prefetch_active() && inode->read_cb && inode->type == VFS_FILE) {
         struct ra_stream *r = &ra_streams[ra_hash(inode)];
         if (r->ino == inode->ino && r->fsid == inode->fs_id &&
             offset / PAGE_SIZE == r->next)
@@ -739,7 +952,7 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
    * are a heuristic — a rare race between two buckets costs one mispredicted
    * burst, never correctness. */
   u32 ra_pages = 0;
-  if (!ra_in_prefetch && inode->read_cb && inode->type == VFS_FILE) {
+  if (!ra_prefetch_active() && inode->read_cb && inode->type == VFS_FILE) {
     struct ra_stream *r = &ra_streams[ra_hash(inode)];
     if (r->ino == inode->ino && r->fsid == inode->fs_id &&
         offset / PAGE_SIZE == r->next) {

@@ -5093,8 +5093,34 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks) {
  * re-test (it set the predicate before its wake_all's CAS, which is a full
  * barrier) or (b) observes our BLOCKED state and wakes us. Interrupts stay
  * disabled between prepare and commit/cancel. */
+/*
+ * Where each task last parked, by task id.
+ *
+ * A thread that stops shows in the dump as BLOCKED on a channel and nothing
+ * else: the channel is a heap address and the code that parked on it is long
+ * out of the frame. One word per task, written on the way in, turns that into
+ * a return address the build can resolve -- which is the difference between
+ * "a thread is stuck" and knowing which wait it is stuck in.
+ */
+static void *g_park_site[SCHED_MAX_TASKS];
+
+void scheduler_dump_park_sites(void) {
+  for (usize i = 0; i < SCHED_MAX_TASKS; i++) {
+    char line[96];
+
+    if (!g_park_site[i])
+      continue;
+    snprintf(line, sizeof(line), "task %lu last parked at %p", (unsigned long)i,
+             g_park_site[i]);
+    klog_info(line);
+  }
+}
+
 void scheduler_wait_prepare(void *chan) {
   int irq_was_on = interrupts_enabled();
+
+  if (current_task && (usize)current_task->id < SCHED_MAX_TASKS)
+    g_park_site[current_task->id] = __builtin_return_address(0);
 
   interrupts_disable();
   if (current_task == 0)

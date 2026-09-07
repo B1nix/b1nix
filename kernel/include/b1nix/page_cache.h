@@ -73,6 +73,15 @@ void page_cache_read_cluster(struct vfs_inode *inode, u64 offset,
  * "as much as is worth reading at once" should ask for this rather than name a
  * constant; page_cache_read_cluster clamps to it either way. */
 unsigned page_cache_cluster_pages(void);
+/* What the run has read from disk through the cache: cluster calls, pages
+ * asked for in them, and pages the read-ahead fetched. */
+void page_cache_read_stats(u64 *cluster_calls, u64 *cluster_pages,
+                           u64 *readahead_pages);
+/* The n files that were read most, by inode number and pages. */
+void page_cache_read_top(unsigned n, u64 *ino_out, u64 *pages_out);
+/* What a faulting read should ask for on this stream: the window the pattern
+ * has earned, not the ceiling. */
+unsigned page_cache_fault_cluster(const struct vfs_inode *inode, u64 offset);
 
 // Marks the page as dirty, meaning it needs to be written to disk.
 void page_cache_mark_dirty(struct page_cache_entry *page);

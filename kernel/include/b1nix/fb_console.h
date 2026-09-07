@@ -5,6 +5,10 @@
 
 void fb_console_init(void);
 void fb_console_clear(void);
+/* Stop drawing while a compositor owns the display, and redraw the log from
+ * the ring when it lets go. */
+void fb_console_set_hidden(int hidden);
+void fb_console_replay(void);
 void fb_console_putchar(char c);
 void fb_console_write(const char *str);
 void fb_console_blink_cursor(void);

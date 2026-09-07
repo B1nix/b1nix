@@ -700,6 +700,9 @@ usize scheduler_address_space_users(u64 pml4_phys, usize *first_id,
  * addresses still on its stack. For a run that stalls with nothing to read:
  * started as a thread by b1nix.task-watch. */
 void scheduler_dump_tasks(void);
+/* Where each task last parked, by task id: the return address recorded on the
+ * way into scheduler_wait_prepare. */
+void scheduler_dump_park_sites(void);
 /* Record the system call this task just entered, for that dump. */
 void task_note_syscall(u64 number);
 /* True when the current context may park on a wait channel (scheduler live, real

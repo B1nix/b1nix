@@ -123,6 +123,28 @@ void fb_console_start_flusher(void)
 	kthread_create("fbflush", fb_console_flusher, 0);
 }
 
+/* The log so far, redrawn onto a console that was hidden while a compositor
+ * had the display. Same replay fb_console_attach does for a display that
+ * arrived after boot. */
+void fb_console_replay(void)
+{
+	char *log;
+
+	if (!fb_ptr)
+		return;
+	cursor_x = 0;
+	cursor_y = fb_top;
+	fb_console_clear();
+	log = kmalloc(65536);
+	if (log) {
+		usize n = klog_read(log, 65536);
+		for (usize i = 0; i < n; i++)
+			fb_console_putchar(log[i]);
+		kfree(log);
+	}
+	fb_console_request_flush();
+}
+
 /* Everything, for a display that just came back (a compositor exited). */
 void fb_console_present_all(void)
 {
@@ -411,34 +433,47 @@ static void fb_draw_char(char c, u32 x, u32 y)
     }
 }
 
-static void fb_console_scroll(void)
+/*
+ * No scrolling: at the bottom the screen starts again from the top.
+ *
+ * Scrolling moved the whole screen down in the shadow and then copied the
+ * whole screen out to the device -- about eight megabytes on a 1280x800
+ * panel -- and it did that from console_write, with interrupts off and the
+ * console lock held. One scroll per printed line made it the single largest
+ * interrupts-off cost in the kernel: 28 G cycles over 3832 lines of a
+ * desktop start-up, 87% of all the time this kernel spent with interrupts
+ * disabled. Batching the scroll into groups of lines cut that by two thirds
+ * and it was still the top entry.
+ *
+ * A kernel console is not a terminal with scrollback -- the whole log is in
+ * the ring and on the serial line -- so the cheap answer is to stop moving
+ * pixels at all: clear and continue from the top, one screen-sized fill per
+ * screenful of text instead of a copy per line.
+ */
+static void fb_console_wrap(void)
 {
-    u32 line_height = FB_CELL_H;
-    if (fb.height < line_height) return;
-
     u32 bytes_per_line = fb.pitch;
-    if (fb.height < fb_top + line_height) return;
-    u32 scroll_height = fb.height - line_height - fb_top;
+    u32 rows;
+
+    if (fb.height < fb_top + FB_CELL_H)
+        return;
+    rows = fb.height - fb_top;
 
     if (fb_shadow) {
         u8 *dst = fb_shadow + ((u64)fb_top * bytes_per_line);
-        u8 *src = dst + (line_height * bytes_per_line);
-        memmove(dst, src, scroll_height * bytes_per_line);
-
-        u8 *tail = dst + scroll_height * bytes_per_line;
         u64 bg64 = ((u64)bg_color << 32) | bg_color;
-        u64 *tail64 = (u64 *)(void *)tail;
-        u32 words = (line_height * bytes_per_line) / 8;
-        for (u32 i = 0; i < words; i++) tail64[i] = bg64;
-        fb_flush_rect(0, fb_top, fb.width, fb.height - fb_top);
-        fb_present_rect(0, fb_top, fb.width, fb.height - fb_top);
-    } else {
-        /* Safety fallback: avoid MMIO readback scrolling when no RAM shadow exists. */
-        fb_console_clear();
-        return;
-    }
+        u64 *w = (u64 *)(void *)dst;
+        u64 words = ((u64)rows * bytes_per_line) / 8;
 
-    cursor_y -= line_height;
+        for (u64 i = 0; i < words; i++)
+            w[i] = bg64;
+        fb_flush_rect(0, fb_top, fb.width, rows);
+        fb_present_rect(0, fb_top, fb.width, rows);
+    } else {
+        fb_console_clear();
+    }
+    cursor_x = 0;
+    cursor_y = fb_top;
 }
 
 static int cursor_visible = 0;
@@ -488,9 +523,30 @@ void fb_console_blink_cursor(void)
     fb_console_request_flush(); /* from the tick: never present here */
 }
 
+/*
+ * Nobody is looking: a compositor owns the display.
+ *
+ * The text console kept drawing every character and scrolling the whole
+ * screen while a desktop was on the panel -- work that costs about a
+ * megabyte of copying per line, under the console lock with interrupts off,
+ * for pixels no one can see. The log still reaches the serial line and the
+ * ring; only the drawing stops, and the ring is replayed when the display
+ * comes back.
+ */
+static int fb_console_hidden;
+
+void fb_console_set_hidden(int hidden)
+{
+    if (fb_console_hidden == !!hidden)
+        return;
+    fb_console_hidden = !!hidden;
+    if (!fb_console_hidden)
+        fb_console_replay();
+}
+
 void fb_console_putchar(char c)
 {
-    if (!fb_ptr || fb_dev_claimed()) return;
+    if (!fb_ptr || fb_dev_claimed() || fb_console_hidden) return;
 
     if (ansi_state == 1) {
         if (c == '[') {
@@ -573,9 +629,8 @@ void fb_console_putchar(char c)
         }
     }
 
-    while (cursor_y + FB_CELL_H > fb.height) {
-        fb_console_scroll();
-    }
+    if (cursor_y + FB_CELL_H > fb.height)
+        fb_console_wrap();
 }
 
 void fb_console_write(const char *str)

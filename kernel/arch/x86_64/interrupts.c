@@ -52,9 +52,35 @@ static int pf_prof_enabled(void) {
   return on;
 }
 
+/* What the fault turned out to be, so the total can be attributed.
+ *
+ * "A hundred and ten thousand faults costing sixteen G cycles" says nothing
+ * about what to fix: a file mapping wants a wider read-ahead, an anonymous
+ * page wants a cheaper zero-fill, a copy-on-write fault wants fewer copies.
+ * The handler names the case it took and the accounting adds it up. */
+#define PF_CLASS_MAX 7
+static u64 g_pf_class_count[PF_CLASS_MAX];
+static u64 g_pf_class_cycles[PF_CLASS_MAX];
+static int g_pf_class_cur[64];
+
+void pf_prof_class(int cpu, int cls) {
+  if (cpu >= 0 && cpu < (int)(sizeof(g_pf_class_cur) / sizeof(g_pf_class_cur[0])))
+    g_pf_class_cur[cpu] = cls;
+}
+
 static void pf_prof_account(u64 cycles) {
+  struct percpu *pc = get_percpu();
+  int cpu = pc ? (int)pc->cpu_id : 0;
+  int cls = (cpu >= 0 && cpu < 64) ? g_pf_class_cur[cpu] : PF_CLASS_OTHER;
+
+  if (cls < 0 || cls >= PF_CLASS_MAX)
+    cls = PF_CLASS_OTHER;
   __atomic_fetch_add(&g_pf_count, 1, __ATOMIC_RELAXED);
   __atomic_fetch_add(&g_pf_cycles, cycles, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_pf_class_count[cls], 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_pf_class_cycles[cls], cycles, __ATOMIC_RELAXED);
+  if (cpu >= 0 && cpu < 64)
+    g_pf_class_cur[cpu] = PF_CLASS_OTHER;
 }
 
 void pf_prof_dump(void) {
@@ -64,6 +90,25 @@ void pf_prof_dump(void) {
   console_write_dec(__atomic_load_n(&g_pf_count, __ATOMIC_RELAXED));
   console_write(" Mcycles=");
   console_write_dec(__atomic_load_n(&g_pf_cycles, __ATOMIC_RELAXED) / 1000000);
+  {
+    static const char *const names[PF_CLASS_MAX] = {
+        "other", "anon", "file", "cow", "swap", "stack", "kernel",
+    };
+    for (int i = 0; i < PF_CLASS_MAX; i++) {
+      u64 n = __atomic_load_n(&g_pf_class_count[i], __ATOMIC_RELAXED);
+
+      if (!n)
+        continue;
+      console_write(" ");
+      console_write(names[i]);
+      console_write("=");
+      console_write_dec(n);
+      console_write("/");
+      console_write_dec(__atomic_load_n(&g_pf_class_cycles[i],
+                                        __ATOMIC_RELAXED) / 1000000);
+      console_write("Mc");
+    }
+  }
   console_write("\n");
 }
 

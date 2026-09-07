@@ -13,6 +13,7 @@
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/klog.h>
+#include <linux/printk.h>
 #include <b1nix/lapic.h>
 #include <b1nix/memtype.h>
 #include <b1nix/mm.h>
@@ -363,7 +364,30 @@ void lkpi_irq_enable(void)
 
 int lkpi_irqs_enabled(void) { return interrupts_enabled(); }
 
-void lkpi_wait_prepare(void *chan) { scheduler_wait_prepare(chan); }
+/*
+ * Where each task last parked, by task id.
+ *
+ * A thread that stops shows up in the task dump as BLOCKED on a channel and
+ * nothing more: the channel is a heap address, and the code that parked on it
+ * is gone from the frame by then. One word per task, written on the way into
+ * the park, turns that into a return address the build can resolve.
+ */
+static void *g_wait_site[256];
+
+void lkpi_note_wait_site(void *site)
+{
+	struct task *t = current_task;
+	usize id = t ? (usize)t->id : 0;
+
+	if (id < sizeof(g_wait_site) / sizeof(g_wait_site[0]))
+		g_wait_site[id] = site;
+}
+
+void lkpi_wait_prepare(void *chan)
+{
+	lkpi_note_wait_site(__builtin_return_address(0));
+	scheduler_wait_prepare(chan);
+}
 
 void lkpi_wait_prepare_timeout(void *chan, u64 timeout_ticks)
 {
@@ -990,6 +1014,30 @@ int lkpi_bootflag(const char *flag)
 int lkpi_bootopt_str(const char *key, char *out, unsigned out_size)
 {
 	return bootinfo_get_kv(key, out, out_size);
+}
+
+void lkpi_dump_tasks(void)
+{
+	usize i;
+
+	(void)i;
+	scheduler_dump_tasks();
+	scheduler_dump_park_sites();
+}
+
+/*
+ * A wait that never ends used to be a thread that vanished.
+ *
+ * wait_event() is the shape imported code uses where it knows the other side
+ * will get there -- an atomic commit stalling on the previous one, a fence
+ * that will signal. When that does not hold on this kernel the thread parks
+ * for good and the machine only looks quiet. The macro is the one place with
+ * the waiter's file and line, so this is called from there.
+ */
+void lkpi_wait_stall_report(const char *where, u64 seconds)
+{
+	lkpi_printk("lkpi: wait at %s has not finished in %llu s\n", where,
+	            (unsigned long long)seconds);
 }
 
 u32 lkpi_bootopt_u32(const char *key, u32 def)

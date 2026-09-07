@@ -413,4 +413,12 @@ u32 lkpi_bootopt_u32(const char *key, u32 def);
 /* The same, as text. 1 when the key is on the command line. */
 int lkpi_bootopt_str(const char *key, char *out, unsigned out_size);
 
+/* Every task, with its state and where it parked. b1nix's own dump, reached
+ * from imported-side code that has found a thread that is not moving. */
+void lkpi_dump_tasks(void);
+
+/* "This wait has not finished in a long time", from the wait_event macro,
+ * which is the only place that knows the source line of the waiter. */
+void lkpi_wait_stall_report(const char *where, u64 seconds);
+
 #endif

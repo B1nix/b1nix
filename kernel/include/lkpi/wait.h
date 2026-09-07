@@ -153,13 +153,26 @@ void lkpi_wait_relax(void);
  * `condition` is an expression re-evaluated on every pass, exactly as in the
  * Linux macro, so it must be cheap and free of side effects.
  */
+#define LKPI_WAIT_STR_(x) #x
+#define LKPI_WAIT_STR(x) LKPI_WAIT_STR_(x)
+
 #define wait_event(wq, condition)                                              \
 	do {                                                                       \
 		if (!(condition)) {                                                    \
+			u64 lkpi__t0 = lkpi_ticks();                                       \
+			u64 lkpi__next = lkpi__t0 + 5ull * 100ull /* lkpi_ticks() is jiffies, 100 a second */;   \
 			lkpi_wait_enter(&(wq));                                            \
 			for (;;) {                                                         \
 				if (condition)                                                 \
 					break;                                                     \
+				if (lkpi_ticks() >= lkpi__next) {                              \
+					lkpi_wait_stall_report(                                    \
+					    __FILE__ ":" LKPI_WAIT_STR(__LINE__),                  \
+					    (lkpi_ticks() - lkpi__t0) /                            \
+					        100ull);                     \
+					lkpi__next = lkpi_ticks() +                                \
+					             5ull * 100ull /* lkpi_ticks() is jiffies, 100 a second */;          \
+				}                                                              \
 				if (!lkpi_wait_may_block()) {                                  \
 					lkpi_wait_relax();                                         \
 					continue;                                                  \

@@ -1887,6 +1887,13 @@ static void cow_publish_page(u64 va) {
   tlb_shootdown_page(va);
 }
 
+static inline void pf_note_class(int cls)
+{
+	struct percpu *pc = get_percpu();
+
+	pf_prof_class(pc ? (int)pc->cpu_id : 0, cls);
+}
+
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
   u64 page_aligned = fault_addr & ~(PAGE_SIZE - 1);
@@ -2275,24 +2282,48 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   vmm_read_release(rflags);
 
   // Case 1: Lazy page (VMM_LAZY leaf, not present) — anonymous or file-backed.
+  //
+  // Named for the profile: a fault's cost means different things depending on
+  // what it was, and the total alone says nothing about what to fix.
+  pf_note_class(PF_CLASS_ANON);
   if (!(pte & VMM_PRESENT) && (pte & VMM_LAZY)) {
     /* Zero-page dedup: classify the faulting address up front. If it is
      * anonymous (no covering file-backed VMA), map the single shared zero
      * page read-only (+COW when the mapping is writable) instead of allocating
      * a frame — the first store materialises a private page via the COW path.
      * File-backed faults skip this and run the normal allocate+fill below. */
+    /* Through the cache, not down the list.
+     *
+     * This walked current_task->vma_list from the head on every anonymous
+     * fault, and a desktop process maps hundreds of regions: the walk was
+     * most of the 32 us an anonymous fault cost, sixty-five thousand times
+     * during a KDE start-up. vma_lookup() answers the same question and
+     * remembers its last hit, which is exactly the locality a fault stream
+     * has. */
     int anon_page = 1;
-    struct vm_area *va = current_task->vma_list;
-    while (va) {
-      if (page_aligned >= va->start && page_aligned < va->end) {
-        if (va->node && va->node->inode) {
-          struct vfs_inode *in = va->node->inode;
-          if (in->type == VFS_FILE || in->read_cb || in->data)
-            anon_page = 0;
+    struct vm_area *va = vma_lookup(current_task, page_aligned);
+
+    /* vma_lookup() stops at the first mapping that starts after the address,
+     * so it answers only for a list that is sorted by start. Where that does
+     * not hold it reports "no mapping", and treating a file-backed page as
+     * anonymous maps the shared zero page over it -- the desktop's shell read
+     * its own binary as zeros and never started. So the walk stays as the
+     * fallback for a miss; the hit path is what the sixty-five thousand
+     * anonymous faults of a start-up actually take. */
+    if (!va) {
+      for (struct vm_area *v = current_task->vma_list; v; v = v->next) {
+        if (page_aligned >= v->start && page_aligned < v->end) {
+          va = v;
+          break;
         }
-        break;
       }
-      va = va->next;
+    }
+    if (va && page_aligned >= va->start && page_aligned < va->end &&
+        va->node && va->node->inode) {
+      struct vfs_inode *in = va->node->inode;
+
+      if (in->type == VFS_FILE || in->read_cb || in->data)
+        anon_page = 0;
     }
     /* Not for a store. See the note on the same decision in the no-leaf path
      * above: a page whose first access is a write pays two faults for the
@@ -2355,6 +2386,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
          * silently de-sharing the mapping. */
         vma_shared = (vma->flags & MAP_SHARED) != 0;
         if (vma->node && vma->node->inode) {
+          pf_note_class(PF_CLASS_FILE);
           u64 file_offset = vma->offset + (page_aligned - vma->start);
           u64 file_page = file_offset & ~(PAGE_SIZE - 1);
 
@@ -2383,8 +2415,11 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
              * writable page must not be filled from a shared cache entry it
              * would then copy. */
             if (!page && !mark_dirty && vma->node->inode->read_cb) {
+              /* As much as this stream has earned, not the ceiling: see
+               * page_cache_fault_cluster. */
               page_cache_read_cluster(vma->node->inode, file_page,
-                                      page_cache_cluster_pages());
+                                      page_cache_fault_cluster(
+                                          vma->node->inode, file_page));
               page = page_cache_get_page(vma->node->inode, file_page);
             }
             if (page) {
@@ -2580,76 +2615,103 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     if (vma && vma->node && vma->node->inode && !(error_code & PF_WRITE)) {
       const u64 table_span = 512 * PAGE_SIZE;
       u64 stop = (page_aligned + table_span) & ~(table_span - 1);
+      /* As wide as the read-ahead cluster, not sixteen pages.
+       *
+       * Every page this maps is a fault that never happens, and a fault on
+       * this kernel costs about 47 us of the desktop's start-up -- a hundred
+       * and ten thousand of them during one KDE bring-up. The read-ahead
+       * already filled the cluster, so the window that matches it is the one
+       * that turns those cache hits into mappings. */
+      unsigned window = page_cache_cluster_pages();
+      struct {
+        u64 va;
+        struct page_cache_entry *entry;
+        int installed;
+      } around[64];
+      unsigned n = 0, i;
+      u64 nflags;
 
+      if (window < 16u)
+        window = 16u;
+      if (window > 64u)
+        window = 64u;
       if (stop > vma->end)
         stop = vma->end;
-      if (stop > page_aligned + 16 * PAGE_SIZE)
-        stop = page_aligned + 16 * PAGE_SIZE;
+      if (stop > page_aligned + (u64)window * PAGE_SIZE)
+        stop = page_aligned + (u64)window * PAGE_SIZE;
 
-      for (u64 va = page_aligned + PAGE_SIZE; va < stop; va += PAGE_SIZE) {
+      /* Look the neighbours up first, then install them in one pass.
+       *
+       * The lookup takes the page cache's lock and the install takes the page
+       * tables': doing them alternately meant one interrupts-off section per
+       * neighbour, ninety-five thousand of them in a start-up. Separating the
+       * two phases keeps the same lock order and pays for the page-table lock
+       * once per fault instead of once per page. */
+      for (u64 va = page_aligned + PAGE_SIZE; va < stop && n < window;
+           va += PAGE_SIZE) {
         u64 off = vma->offset + (va - vma->start);
         struct page_cache_entry *near =
             page_cache_get_page(vma->node->inode, off & ~(PAGE_SIZE - 1));
 
         if (!near)
           break; /* not cached: leave it to its own fault */
+        around[n].va = va;
+        around[n].entry = near;
+        around[n].installed = 0;
+        n++;
+      }
 
-        u64 nflags;
+      if (n) {
         vmm_write_acquire(&nflags);
-        u64 *nslot = pf_leaf_pte_ptr(va);
-        int installed = 0;
+        for (i = 0; i < n; i++) {
+          u64 *nslot = pf_leaf_pte_ptr(around[i].va);
 
-        if (nslot && !(*nslot & VMM_PRESENT) && !(*nslot & VMM_SWAPPED)) {
+          if (!nslot || (*nslot & VMM_PRESENT) || (*nslot & VMM_SWAPPED))
+            break; /* something else owns this page now */
           /* A neighbour is ALWAYS a page-cache frame -- it came out of the
-           * cache two lines up -- but `flags` was decided for the faulting
-           * page, whose frame need not have been. The COW downgrade above
-           * fires on `shared_cache_frame`, and that is 0 whenever the faulting
-           * page could not be added to the cache: a duplicate insert lost to
-           * another CPU, or an allocation refused under pressure. `flags` then
-           * still carries VMM_WRITABLE, and copying it here maps a shared
-           * cache page writable into a MAP_PRIVATE mapping.
-           *
-           * That is the libpam.so.2 corruption again, arriving by a different
-           * road: ld.so's relocation stores land in the page cache instead of
-           * in a private copy, every later mapper of the library gets the
-           * relocated bytes, and the one that executes them dies on a #UD.
-           *
-           * Found while chasing exactly such a #UD, which this did NOT fix --
-           * the bytes at that faulting instruction turned out to be correct.
-           * It is a real hole regardless: a private mapping must never be able
-           * to write into the cache.
-           *
-           * The neighbour's own protection is what decides this, and the
-           * neighbour's frame is shared by construction. */
+           * cache above -- but `flags` was decided for the faulting page,
+           * whose frame need not have been. The COW downgrade above fires on
+           * `shared_cache_frame`, and that is 0 whenever the faulting page
+           * could not be added to the cache: a duplicate insert lost to
+           * another CPU, or an allocation refused under pressure. `flags`
+           * then still carries VMM_WRITABLE, and copying it here would map a
+           * shared cache page writable into a MAP_PRIVATE mapping -- ld.so's
+           * relocations landing in the page cache for every later mapper of
+           * the library. The neighbour's own protection is what decides this,
+           * and the neighbour's frame is shared by construction. */
           u64 f = flags;
 
           if (!vma_shared && (f & VMM_WRITABLE)) {
             f &= ~VMM_WRITABLE;
             f |= VMM_COW;
           }
-          pmm_ref_frame(near->frame);
-          *nslot = near->frame | f;
-          invalidate_page(va);
-          installed = 1;
+          pmm_ref_frame(around[i].entry->frame);
+          *nslot = around[i].entry->frame | f;
+          invalidate_page(around[i].va);
+          around[i].installed = 1;
         }
         vmm_write_release(nflags);
-        /* A writable shared mapping can be stored through without faulting
-         * again, so the entry is potentially dirty from the moment it is
-         * mapped -- the same reason the faulting page above is marked. Outside
-         * the page-table lock: this takes the cache's own lock. */
-        if (installed && vma_shared && (flags & VMM_WRITABLE))
-          page_cache_mark_dirty(near);
-        page_cache_put_page(near);
-        if (!installed)
-          break;
+
+        for (i = 0; i < n; i++) {
+          /* A writable shared mapping can be stored through without faulting
+           * again, so the entry is potentially dirty from the moment it is
+           * mapped -- the same reason the faulting page above is marked.
+           * Outside the page-table lock: this takes the cache's own lock. */
+          if (around[i].installed && vma_shared && (flags & VMM_WRITABLE))
+            page_cache_mark_dirty(around[i].entry);
+          page_cache_put_page(around[i].entry);
+        }
       }
     }
     return 0;
   }
 
   // Case 2: Swapped page (VMM_SWAPPED leaf, not present). The swap slot index is
+  //
+  // (see pf_note_class above)
   // encoded in the PTE's address field — read it directly, no reverse-map scan.
   if (!(pte & VMM_PRESENT) && (pte & VMM_SWAPPED)) {
+    pf_note_class(PF_CLASS_SWAP);
     // swap_in allocates a frame and does blocking disk I/O — outside the lock.
     u64 new_frame = 0;
     u32 swslot = (u32)((pte & PAGE_ENTRY_ADDRESS_MASK) >> 12);
@@ -2682,6 +2744,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   }
 
   // Case 3: Copy-on-Write (write to a cloned private page).
+  pf_note_class(PF_CLASS_COW);
   if ((error_code & PF_WRITE) && (pte & VMM_PRESENT) && (pte & VMM_COW)) {
     // Pre-allocate a copy frame outside the lock (we may not need it if we are
     // the last sharer, but allocating speculatively keeps the commit section

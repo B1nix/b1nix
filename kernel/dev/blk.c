@@ -294,6 +294,12 @@ usize blk_run_blocks(struct block_device *dev, u32 block_size) {
  * ceiling is the configured window (itself `b1nix.read-ahead-kb`) scaled by how
  * much memory there is to hold what it reads, and clamped to what one command
  * to this device can carry: read-ahead that cannot be cached is read twice. */
+/* What a miss reads when nothing says more.
+ *
+ * Measured against 32 KiB, which is the size that would carry an inode
+ * block's neighbours with it: the request count fell from 15.2k to 12.1k and
+ * the total wait from 1.41 s to 1.27 s, but the disk moved 70 MB more and the
+ * desktop was up no sooner. The floor stays where the volume is. */
 #define BCACHE_RA_MIN_SECTORS 16u /* 8 KiB */
 
 static u32 blk_readahead_ceiling(struct block_device *dev) {
@@ -1622,6 +1628,17 @@ void blk_cache_stats_dump(void) {
   console_write("\n");
 }
 
+/* Hits and misses, so "the cache is 64 MB against 327 MB of reads" can be
+ * answered with a number instead of a guess. */
+static volatile u64 g_bcache_hits, g_bcache_misses;
+
+void blk_cache_stats(u64 *hits, u64 *misses) {
+  if (hits)
+    *hits = g_bcache_hits;
+  if (misses)
+    *misses = g_bcache_misses;
+}
+
 int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
                     void *buffer) {
   if (!dev || !dev->read_blocks) {
@@ -1662,6 +1679,7 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
           continue;
         }
         memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
+        g_bcache_hits++;
         bcache_release(flags);
         blk_stat_hits++;
         break;
@@ -1681,6 +1699,7 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
         bcache_release(flags);
         continue;
       }
+      g_bcache_misses++;
       entry->bdev = dev;
       entry->block_no = current_lba;
       /* Claim the slot AND publish it in the hash as in-progress (BUSY, not yet
@@ -1697,7 +1716,23 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
        * covers current_lba; the remaining sectors of the run are inserted into
        * the cache below from the buffer we already have — no extra DMA. Falls
        * back to a single-sector read if the run buffer can't be allocated. */
+      /* At least the rest of THIS request, in one command.
+       *
+       * The caller has already told us how many contiguous sectors it wants --
+       * ext4 coalesces a file read into a run of up to a megabyte -- and this
+       * loop then went sector by sector, sizing each device command from a
+       * read-ahead heuristic that knows nothing about the request. A KDE
+       * start-up read 298 MB in 18264 commands: 16.7 KB apiece, four commands
+       * for every 64 KB the page cache asked for, each paying its own 87 us of
+       * round trip. Reading the remainder of the request is not a guess; it is
+       * what was asked for. */
       u32 run = blk_readahead_for(dev, current_lba);
+      u32 want = count - i;
+
+      if (run < want)
+        run = want;
+      if (run > blk_max_sectors(dev))
+        run = blk_max_sectors(dev);
       if (dev->block_count > 0 && current_lba + run > dev->block_count)
         run = (u32)(dev->block_count - current_lba);
       if (run == 0)

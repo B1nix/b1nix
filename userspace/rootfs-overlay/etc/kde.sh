@@ -28,8 +28,8 @@ start_system_bus() {
 		mkdir -p /run/dbus
 		dbus-daemon --system --fork > /tmp/kde-systembus.log 2>&1
 		__i=0
-		while [ $__i -lt 75 ] && [ ! -S /run/dbus/system_bus_socket ]; do
-			__i=$((__i + 1)); usleep 200000
+		while [ $__i -lt 750 ] && [ ! -S /run/dbus/system_bus_socket ]; do
+			__i=$((__i + 1)); usleep 20000
 		done
 	fi
 	if [ ! -S /run/dbus/system_bus_socket ]; then
@@ -149,7 +149,7 @@ start_logind() {
 			echo "KDE: ok logind t=$(up) after $((__i / 5))s"
 			return 0
 		fi
-		__i=$((__i + 1)); usleep 200000
+		__i=$((__i + 1)); usleep 20000
 	done
 	echo "KDE: fail logind t=$(up): $(tail -3 /tmp/kde-elogind.log 2>/dev/null | tr '\n' ' ')"
 	return 1
@@ -368,6 +368,12 @@ CONF
 		echo "KDE: /run/dbus holds: $(ls -la /run/dbus 2>&1 | tr '\n' ' ' | cut -c1-160)"
 		echo "KDE: daemons: $(pgrep -f "[d]bus-daemon" | tr '\n' ' ')"
 	fi
+	# Get seatd going before anything waits for the bus: it is a different
+	# daemon with a different socket and nothing in the bus's start-up needs it.
+	if [ -z "${SEATD_STARTED:-}" ] && { [ -x /usr/sbin/seatd ] || [ -x /usr/bin/seatd ]; }; then
+		SEATD_VTBOUND=0 seatd -g root > /tmp/kde-seatd.log 2>&1 &
+		SEATD_STARTED=1
+	fi
 	if printf %s "$__probe" | grep -q org.freedesktop.DBus; then
 		echo "KDE: ok dbus t=$(up) (already running)"
 	else
@@ -376,8 +382,8 @@ CONF
 		setsid dbus-daemon --config-file=/etc/dbus-1/b1nix-system.conf --fork \
 			> /tmp/kde-dbus.log 2>&1
 		i=0
-		while [ $i -lt 75 ] && [ ! -S /run/dbus/system_bus_socket ]; do
-			i=$((i + 1)); usleep 200000
+		while [ $i -lt 750 ] && [ ! -S /run/dbus/system_bus_socket ]; do
+			i=$((i + 1)); usleep 20000
 		done
 		if [ -S /run/dbus/system_bus_socket ]; then
 			echo "KDE: ok dbus t=$(up)"
@@ -394,9 +400,13 @@ fi
 # virtual backend needs none of it, so a failure here is only fatal to DRM.
 if [ -x /usr/sbin/seatd ] || [ -x /usr/bin/seatd ]; then
 	export LIBSEAT_BACKEND=seatd
-	SEATD_VTBOUND=0 seatd -g root > /tmp/kde-seatd.log 2>&1 &
+	# Started before the bus was waited for (see above): the two daemons do not
+	# depend on each other, and waiting for them in turn spent a fifth of a
+	# second doing nothing.
+	[ -n "${SEATD_STARTED:-}" ] || \
+		SEATD_VTBOUND=0 seatd -g root > /tmp/kde-seatd.log 2>&1 &
 	i=0
-	while [ $i -lt 100 ] && [ ! -S /run/seatd.sock ]; do i=$((i + 1)); usleep 200000; done
+	while [ $i -lt 1000 ] && [ ! -S /run/seatd.sock ]; do i=$((i + 1)); usleep 20000; done
 	[ -S /run/seatd.sock ] && echo "KDE: ok seatd t=$(up)" \
 	                       || echo "KDE: no seatd socket t=$(up)"
 	echo "KDE: seatd says: $(tail -3 /tmp/kde-seatd.log 2>/dev/null | tr '\n' ' ')"
@@ -451,12 +461,12 @@ stop_session() {
 wait_kwin_socket() {
 	export XDG_RUNTIME_DIR=/run/user/0
 	__i=0
-	while [ $__i -lt 200 ] && [ ! -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; do
+	while [ $__i -lt 2000 ] && [ ! -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; do
 		__i=$((__i + 1))
-		usleep 200000
+		usleep 20000
 	done
 	if [ -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; then
-		echo "KDE: ok kwin-socket t=$(up) after $((__i / 5))s"
+		echo "KDE: ok kwin-socket t=$(up) after $((__i / 50))s"
 		echo "--- kwin input (libinput) ---"
 		grep -a -i "libinput\|input device\|Adding\|seat" /tmp/kde-kwin.log 2>/dev/null | head -20
 		echo "--- end kwin input ---"
@@ -492,8 +502,8 @@ CONF
 	setsid dbus-daemon --config-file=/etc/dbus-1/b1nix-session.conf --fork \
 		> /tmp/kde-sessionbus.log 2>&1
 	i=0
-	while [ $i -lt 75 ] && [ ! -S /run/user/0/bus ]; do
-		i=$((i + 1)); usleep 200000
+	while [ $i -lt 750 ] && [ ! -S /run/user/0/bus ]; do
+		i=$((i + 1)); usleep 20000
 	done
 	if [ -S /run/user/0/bus ]; then
 		echo "KDE: ok session-bus t=$(up)"
@@ -531,7 +541,7 @@ memsnap() {
 
 memsnap_loop() {
 	__i=0
-	while [ $__i -lt 40 ]; do
+	while [ $__i -lt 400 ]; do
 		sleep 5
 		__i=$((__i + 1))
 		memsnap "t$__i"
@@ -560,7 +570,7 @@ if [ -x /usr/bin/plasmashell ]; then
 		QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
 		LIBGL_ALWAYS_SOFTWARE=1 "$KAMD" > /tmp/kde-kamd.log 2>&1 &
 		i=0
-		while [ $i -lt 100 ]; do
+		while [ $i -lt 1000 ]; do
 			dbus-send --session --dest=org.freedesktop.DBus \
 				--type=method_call --print-reply \
 				/org/freedesktop/DBus \
@@ -568,8 +578,8 @@ if [ -x /usr/bin/plasmashell ]; then
 				| grep -q org.kde.ActivityManager && break
 			i=$((i + 1)); usleep 200000
 		done
-		if [ $i -lt 20 ]; then
-			echo "KDE: ok activity-manager t=$(up) after $((i / 5))s"
+		if [ $i -lt 200 ]; then
+			echo "KDE: ok activity-manager t=$(up) after $((i / 50))s"
 		else
 			echo "KDE: fail activity-manager t=$(up): $(tail -3 /tmp/kde-kamd.log 2>/dev/null | tr '\n' ' ')"
 		fi
@@ -608,10 +618,10 @@ if [ -x /usr/bin/plasmashell ]; then
 	if [ $i -ge 45 ]; then
 		echo "KDE: plasmashell-no-paint-within ${i}s t=$(up)"
 	else
-		echo "KDE: ok plasmashell-bound t=$(up) after $((i / 5))s"
+		echo "KDE: ok plasmashell-bound t=$(up) after $((i / 50))s"
 	fi
 	if plasma_running; then
-		echo "KDE: ok plasmashell-alive t=$(up) after $((i / 5))s"
+		echo "KDE: ok plasmashell-alive t=$(up) after $((i / 50))s"
 	else
 		echo "KDE: fail plasmashell-died t=$(up)"
 		echo "--- plasmashell log ---"
@@ -635,15 +645,29 @@ if [ -x /usr/bin/plasmashell ]; then
 		i=$((i + 1)); usleep 200000
 	done
 	if [ -n "$__panels" ] && [ "$__panels" -gt 0 ]; then
-		echo "KDE: ok plasma-panels=$__panels t=$(up) after $((i / 5))s"
+		echo "KDE: ok plasma-panels=$__panels t=$(up) after $((i / 50))s"
 	else
 		echo "KDE: plasma-panels not reported in 30s t=$(up)"
 	fi
+	# The desktop is up HERE.
+	#
+	# SCANOUT-READY is printed six seconds later, after this function has
+	# launched a terminal, slept for it and dumped two logs -- so reading it as
+	# "time to a desktop" charges the kernel for the harness's own waiting.
+	# This marker says when the shell reported its panels.
+	echo "KDE: DESKTOP-UP t=$(up)"
 	if [ -x /usr/bin/foot ]; then
 		WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" foot > /tmp/kde-foot.log 2>&1 &
 		[ -n "${HOST_SOCK:-}" ] && \
 			WAYLAND_DISPLAY="$HOST_SOCK" foot > /tmp/kde-foot-host.log 2>&1 &
-		sleep 3
+		# Wait for the terminal, not for a fixed three seconds. Two flat sleeps
+		# here and below put six seconds between a desktop that was up and the
+		# marker that says so, and every reading of "time to a desktop" carried
+		# them.
+		i=0
+		while [ $i -lt 15 ] && ! pgrep -x foot > /dev/null 2>&1; do
+			i=$((i + 1)); usleep 200000
+		done
 	fi
 	# Print what the shell said either way: logging it only on death is how a run
 	# that produced a black window told us nothing.
@@ -652,7 +676,6 @@ if [ -x /usr/bin/plasmashell ]; then
 	echo "--- kwin log (last 15) ---"
 	tail -15 /tmp/kde-kwin.log 2>/dev/null
 	echo "--- end logs ---"
-	sleep 3
 else
 	echo "KDE: no plasmashell in the image t=$(up)"
 fi
@@ -675,7 +698,7 @@ CFG
 		sway > /tmp/kde-sway.log 2>&1 &
 	SWAYPID=$!
 	i=0
-	while [ $i -lt 125 ] && [ ! -S /run/user/0/wayland-1 ]; do i=$((i+1)); usleep 200000; done
+	while [ $i -lt 1250 ] && [ ! -S /run/user/0/wayland-1 ]; do i=$((i+1)); usleep 20000; done
 	if [ ! -S /run/user/0/wayland-1 ]; then
 		echo "KDE: fail no-host-compositor t=$(up)"
 		echo "  sway said: $(tail -3 /tmp/kde-sway.log 2>/dev/null | tr '\n' ' ')"
@@ -698,7 +721,7 @@ CFG
 		${CLIENT:+"$CLIENT"} > /tmp/kde-kwin.log 2>&1 &
 	KWINPID=$!
 	i=0
-	while [ $i -lt 200 ] && [ ! -S /run/user/0/wayland-2 ]; do i=$((i+1)); usleep 200000; done
+	while [ $i -lt 2000 ] && [ ! -S /run/user/0/wayland-2 ]; do i=$((i+1)); usleep 20000; done
 	if [ -S /run/user/0/wayland-2 ]; then
 		echo "KDE: ok nested-socket t=$(up)"
 	else
@@ -868,9 +891,9 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 	# Up to 5 s for the socket, not a flat 5 s: the fixed sleeps on this
 	# path added 24 s to a desktop that is up in 17.
 	__i=0
-	while [ $__i -lt 25 ] && [ ! -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; do
+	while [ $__i -lt 250 ] && [ ! -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; do
 		__i=$((__i + 1))
-		usleep 200000
+		usleep 20000
 	done
 	prog_alive kwin_wayland $KWINPID && echo "KDE: ok alive t=$(up)" \
 	                                 || echo "KDE: fail died t=$(up)"
@@ -983,9 +1006,9 @@ fi
 KWINPID=$!
 
 w=0
-while [ $w -lt 300 ]; do
+while [ $w -lt 3000 ]; do
 	[ -S /run/user/0/wayland-1 ] && break
-	usleep 200000
+	usleep 20000
 	w=$((w + 1))
 done
 

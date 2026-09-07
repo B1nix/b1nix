@@ -105,6 +105,23 @@ struct virtio_blk_dma_req {
  * killed while it holds the device never releases it, and every other task then
  * spins here forever. Tell the scheduler to keep a fatal signal pending until
  * the request is done — that is the whole reason the counter exists. */
+/* How often a request finds the device busy.
+ *
+ * The driver keeps one request in flight, and whether that costs anything
+ * depends entirely on how often a second thread wants the disk while the
+ * first is waiting -- which is a number, not a guess, and the one that says
+ * whether a deeper queue is worth the rewrite. */
+volatile u64 vblk_lock_uncontended, vblk_lock_waited, vblk_lock_yields;
+
+void virtio_blk_lock_stats(u64 *free_now, u64 *waited, u64 *yields) {
+  if (free_now)
+    *free_now = vblk_lock_uncontended;
+  if (waited)
+    *waited = vblk_lock_waited;
+  if (yields)
+    *yields = vblk_lock_yields;
+}
+
 static void virtio_blk_lock(struct virtio_blk_instance *inst) {
   /* The guard goes up AFTER the lock is held, not before.
    *
@@ -113,9 +130,16 @@ static void virtio_blk_lock(struct virtio_blk_instance *inst) {
    * instead made a task that merely wanted the disk unkillable for as long as
    * somebody else had it: the fatal signal stayed pending, the loop kept
    * yielding, and `timeout` could not end the process it was watching. */
-  while (__sync_lock_test_and_set(&inst->busy, 1)) {
-    scheduler_yield();
+  if (!__sync_lock_test_and_set(&inst->busy, 1)) {
+    vblk_lock_uncontended++;
+    scheduler_kcrit_enter();
+    return;
   }
+  vblk_lock_waited++;
+  do {
+    vblk_lock_yields++;
+    scheduler_yield();
+  } while (__sync_lock_test_and_set(&inst->busy, 1));
   scheduler_kcrit_enter();
 }
 
@@ -262,6 +286,19 @@ static int vblk_add_region(struct virtqueue *vq, u16 *next_desc, u16 *prev,
   return 0;
 }
 
+volatile u64 vblk_total_wait_ns, vblk_total_reqs;
+
+void virtio_blk_stats(u64 *reqs, u64 *read_sectors, u64 *wait_ns) {
+  extern volatile u64 vblk_read_sectors;
+
+  if (reqs)
+    *reqs = vblk_total_reqs;
+  if (read_sectors)
+    *read_sectors = vblk_read_sectors;
+  if (wait_ns)
+    *wait_ns = vblk_total_wait_ns;
+}
+
 volatile u64 vblk_reads, vblk_read_sectors, vblk_writes, vblk_write_sectors,
     vblk_flushes;
 
@@ -406,6 +443,7 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
    * waiting for those — printed periodically so the cost of the disk can be
    * compared between runs instead of guessed at. */
   static volatile u64 vblk_reqs, vblk_slow, vblk_wait_ticks, vblk_sectors;
+  u64 wait_ns_start = ktime_monotonic_ns();
   u64 wait_start = scheduler_get_ticks();
 
   vblk_reqs++;
@@ -494,6 +532,12 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
   inst->vq.last_used_idx++;
 
   vblk_wait_ticks += scheduler_get_ticks() - wait_start;
+  /* In nanoseconds as well as ticks: a request takes a few hundred
+   * microseconds and the tick is a millisecond, so the tick counter can only
+   * say "fast" or "one whole tick" -- which is how a queue depth of one looked
+   * like nothing at all. */
+  vblk_total_wait_ns += ktime_monotonic_ns() - wait_ns_start;
+  vblk_total_reqs++;
   if ((vblk_reqs % 20000) == 0) {
     console_write("virtio-blk: ");
     console_write_dec(vblk_reqs);

@@ -546,6 +546,9 @@ void kernel_main(usize arg0, usize arg1)
 
 
 	kheap_use_direct_map();
+	/* Symbol lookups stop scanning the whole table now that they can index it:
+	 * every %p in a kernel printf used to walk tens of thousands of bytes. */
+	ksym_index_init();
 	k_info(NULL, "Step 7: KHeap switched to direct map");
 
 	/* Machines whose framebuffer the bootloader already set up. On one whose

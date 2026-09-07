@@ -964,6 +964,73 @@ static int r_b1nix_prof(usize pid, struct sbuf *s) {
   extern void kprof_dump(void);
   syscall_prof_dump();
   pf_prof_dump();
+  {
+    /* What the disk actually moved for those faults. */
+    u64 calls = 0, cpages = 0, rapages = 0;
+
+    page_cache_read_stats(&calls, &cpages, &rapages);
+    console_write("pcread: clusters=");
+    console_write_dec(calls);
+    console_write(" cluster-pages=");
+    console_write_dec(cpages);
+    console_write(" readahead-pages=");
+    console_write_dec(rapages);
+    console_write("\n");
+    {
+      u64 ino[8], pg[8];
+      unsigned i;
+
+      page_cache_read_top(8, ino, pg);
+      console_write("pcread top (ino:pages):");
+      for (i = 0; i < 8 && pg[i]; i++) {
+        console_write(" ");
+        console_write_dec(ino[i]);
+        console_write(":");
+        console_write_dec(pg[i]);
+      }
+      console_write("\n");
+    }
+    {
+      /* What the disk gave back for it: one request at a time, so this is
+       * latency times count, not bandwidth. */
+      extern void virtio_blk_stats(u64 *reqs, u64 *read_sectors, u64 *wait_ns);
+      u64 reqs = 0, sectors = 0, wait_ns = 0;
+
+      virtio_blk_stats(&reqs, &sectors, &wait_ns);
+      console_write("vblk: reqs=");
+      console_write_dec(reqs);
+      console_write(" read-MB=");
+      console_write_dec(sectors / 2048);
+      console_write(" wait-ms=");
+      console_write_dec(wait_ns / 1000000);
+      console_write(" avg-us=");
+      console_write_dec(reqs ? (wait_ns / reqs) / 1000 : 0);
+      {
+        extern void blk_cache_stats(u64 *hits, u64 *misses);
+        u64 hits = 0, misses = 0;
+
+        blk_cache_stats(&hits, &misses);
+        console_write(" bcache-hits=");
+        console_write_dec(hits);
+        console_write(" misses=");
+        console_write_dec(misses);
+      }
+      {
+        extern void virtio_blk_lock_stats(u64 *free_now, u64 *waited,
+                                          u64 *yields);
+        u64 freen = 0, waited = 0, yields = 0;
+
+        virtio_blk_lock_stats(&freen, &waited, &yields);
+        console_write(" dev-free=");
+        console_write_dec(freen);
+        console_write(" dev-busy=");
+        console_write_dec(waited);
+        console_write(" busy-yields=");
+        console_write_dec(yields);
+      }
+      console_write("\n");
+    }
+  }
   kprof_dump();
   {
     extern void vfs_inode_wait_stats(u64 *, u64 *, u64 *, const void **);

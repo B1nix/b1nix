@@ -55,6 +55,7 @@ extern void fb_console_attach(void *pixels, unsigned pitch, unsigned width,
                               void (*present)(unsigned x, unsigned y,
                                               unsigned w, unsigned h));
 extern void fb_console_present_all(void);
+extern void fb_console_set_hidden(int hidden);
 
 /* A driver with no generic vmap maps its own: i915 (kernel/lkpi/i915_console.c). */
 int __attribute__((weak)) drm_console_driver_map(struct drm_framebuffer *fb, void **vaddr)
@@ -119,8 +120,12 @@ static void console_present(unsigned x, unsigned y, unsigned w, unsigned h)
 	struct console_slot *s = g_cur >= 0 ? &g_slot[g_cur] : NULL;
 	if (!s || !s->buf || !s->client.dev)
 		return;
-	if (!drm_master_internal_acquire(s->client.dev))
-		return; /* a compositor owns the display */
+	if (!drm_master_internal_acquire(s->client.dev)) {
+		/* A compositor owns the display: the text console is invisible from
+		 * here until it lets go, and drawing into it is pure cost. */
+		fb_console_set_hidden(1);
+		return;
+	}
 	if (!console_present_seen) {
 		console_present_seen = 1;
 		pr_info("drm: console: first present %ux%u+%u+%u\n", w, h, x, y);
@@ -155,6 +160,15 @@ static void console_present(unsigned x, unsigned y, unsigned w, unsigned h)
  * b1nix.drm-fliptest-wait=<s>  how long to wait for a connected display (30)
  * b1nix.drm-fliptest-hold=<ms> how long each buffer stays up (1000)
  * b1nix.drm-fliptest-cycles=<n> how many flips (6)
+ * b1nix.drm-fliptest-bar      a moving bar instead of two flat colours
+ *
+ * The bar is what a camera can read. Two flat colours say nothing about
+ * tearing through a lens: a rolling-shutter sensor reads its rows over a
+ * thirtieth of a second, so a panel that changes colour mid-readout gives the
+ * same horizontal split as a torn frame. A bar that moves a fixed step per
+ * frame separates them -- the sensor shears a whole bar smoothly, while a
+ * flip that lands mid-scanout breaks it into two offset pieces with a hard
+ * edge between them.
  */
 struct fliptest {
 	struct drm_client_dev client;
@@ -175,6 +189,25 @@ static int fliptest_map(struct drm_client_buffer *b, void **vaddr)
 		return 0;
 	}
 	return drm_console_driver_map(b->fb, vaddr);
+}
+
+/* A vertical bar at x, on black. Only the columns that change are touched:
+ * the buffers live in an aperture mapping, where writing all eight megabytes
+ * costs more than the frame it is meant to fit in. */
+static void fliptest_bar(struct fliptest *f, int i, unsigned x, unsigned old_x,
+                         unsigned bar_w)
+{
+	unsigned y, c;
+
+	for (y = 0; y < f->height; y++) {
+		u32 *row = (u32 *)((u8 *)f->pix[i] + (size_t)y * f->pitch);
+		for (c = 0; c < bar_w; c++) {
+			if (old_x + c < f->width)
+				row[old_x + c] = 0x00000000u;
+			if (x + c < f->width)
+				row[x + c] = 0x00ffffffu;
+		}
+	}
 }
 
 static void fliptest_fill(struct fliptest *f, int i, u32 colour)
@@ -270,9 +303,14 @@ static struct drm_crtc *fliptest_setup(struct fliptest *f, struct drm_device *de
 	}
 	f->pitch = f->buf[0]->fb->pitches[0];
 	pr_info("drm: fliptest: both framebuffers mapped, filling\n");
-	/* Two colours a person can name across a room. */
-	fliptest_fill(f, 0, 0x00ff0000u); /* red   */
-	fliptest_fill(f, 1, 0x0000ff00u); /* green */
+	if (lkpi_bootflag("b1nix.drm-fliptest-bar")) {
+		fliptest_fill(f, 0, 0x00000000u);
+		fliptest_fill(f, 1, 0x00000000u);
+	} else {
+		/* Two colours a person can name across a room. */
+		fliptest_fill(f, 0, 0x00ff0000u); /* red   */
+		fliptest_fill(f, 1, 0x0000ff00u); /* green */
+	}
 
 	mutex_lock(&f->client.modeset_mutex);
 	drm_client_for_each_modeset(ms, &f->client)
@@ -320,6 +358,14 @@ static u32 fliptest_plane_fb(struct drm_crtc *crtc)
  * caller is holding. The test thread hung on its first flip and printed
  * nothing. The locking here is now exactly what drm_mode_page_flip_ioctl does.
  */
+/* Where the test thread is, for the watchdog: 0 sleeping between frames,
+ * 1 about to take the modeset locks, 3 inside the driver's page flip, 2 back
+ * out of it. A flip rate above the vertical blank stops the thread dead and
+ * printing anything from the loop slows it enough to hide the stall, so the
+ * observer has to be another thread. */
+static volatile int fliptest_where;
+static volatile unsigned fliptest_cycle;
+
 static int fliptest_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
                          u32 *plane)
 {
@@ -328,6 +374,7 @@ static int fliptest_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	int ret = 0, flip = -EOPNOTSUPP;
 
 	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
+	fliptest_where = 3;
 	if (crtc->funcs && crtc->funcs->page_flip)
 		flip = crtc->funcs->page_flip(crtc, fb, NULL, 0, &ctx);
 	*plane = fliptest_plane_fb(crtc);
@@ -355,6 +402,8 @@ static int fliptest_thread(void *arg)
 	unsigned cycles = lkpi_bootopt_u32("b1nix.drm-fliptest-cycles", 6);
 	unsigned tries;
 	unsigned i;
+	int bar = lkpi_bootflag("b1nix.drm-fliptest-bar");
+	unsigned bar_w = 120;
 
 	pr_info("drm: fliptest: wait %u s, hold %u ms, %u cycles\n", wait_s, hold_ms,
 	        cycles);
@@ -394,47 +443,80 @@ static int fliptest_thread(void *arg)
 
 	for (i = 0; i < cycles; i++) {
 		struct drm_framebuffer *want = f->buf[i & 1]->fb;
-		u32 got_flip = 0, got_commit = 0;
-		int flip = -EINVAL, commit = -EINVAL, tried_commit = 0;
-		struct drm_mode_set *ms;
+		u32 got_flip = 0, got_settled = 0;
+		int flip;
 
+		/* Draw into the buffer that is NOT on screen, then show it: the
+		 * order a compositor uses, and the one that puts a tear on the flip
+		 * rather than on the drawing. */
+		if (bar) {
+			unsigned step = f->width / 24 ? f->width / 24 : 1;
+			unsigned x = (i * step) % (f->width - bar_w);
+			unsigned old = ((i >= 2 ? i - 2 : 0) * step) % (f->width - bar_w);
+
+			fliptest_bar(f, (int)(i & 1), x, old, bar_w);
+		}
+
+		/* The master check is a check, not a lock to hold work under.
+		 *
+		 * This used to keep dev->master_mutex from before the flip until
+		 * after the commit -- and drm_client_modeset_commit() takes that
+		 * same mutex itself, so the thread waited for a lock it was holding
+		 * and stopped for good. It only showed above about fifty flips a
+		 * second, because only then did the plane sample lag far enough
+		 * behind to send the test down the commit path at all. */
 		if (!drm_master_internal_acquire(dev)) {
 			pr_info("drm: fliptest: a master took the device mid-test\n");
 			break;
 		}
+		drm_master_internal_release(dev);
+
 		/* The driver's own page flip, which is what a legacy client's ioctl
 		 * reaches. No event and no flags: this asks only whether the plane
 		 * ends up holding what was asked for. */
+		fliptest_where = 1;
 		flip = fliptest_flip(crtc, want, &got_flip);
+		fliptest_where = 2;
 
-		/* And the same buffer through a full modeset commit, so a driver
-		 * that ignores page flips is told apart from one that will not
-		 * change its scanout at all. */
-		if (flip || got_flip != want->base.id) {
-			mutex_lock(&f->client.modeset_mutex);
-			drm_client_for_each_modeset(ms, &f->client)
-				if (ms->crtc == crtc)
-					ms->fb = want;
-			mutex_unlock(&f->client.modeset_mutex);
-			tried_commit = 1;
-			commit = drm_client_modeset_commit(&f->client);
-			got_commit = fliptest_plane_fb_locked(crtc);
-		}
-		drm_master_internal_release(dev);
-
-		if (tried_commit)
-			pr_info("drm: fliptest: %u asked for %u (%s), page_flip -> %d plane %u, commit -> %d plane %u\n",
-			        i, want->base.id, (i & 1) ? "green" : "red", flip,
-			        got_flip, commit, got_commit);
-		else
-			pr_info("drm: fliptest: %u asked for %u (%s), page_flip -> %d plane %u\n",
-			        i, want->base.id, (i & 1) ? "green" : "red", flip,
-			        got_flip);
+		fliptest_where = 0;
+		fliptest_cycle = i;
 		console_sleep_jiffies(hold_ms / 10 ? hold_ms / 10 : 1);
+
+		/* A flip lands at the next vertical blank, so the plane is read
+		 * again after the hold: sampling it the instant the ioctl returns
+		 * reports the buffer that is still on screen and says nothing. */
+		got_settled = fliptest_plane_fb_locked(crtc);
+		if (i < 8 || got_settled != want->base.id)
+			pr_info("drm: fliptest: %u asked for %u (%s), page_flip -> %d, "
+			        "plane %u at once, %u after %u ms\n",
+			        i, want->base.id, (i & 1) ? "green" : "red", flip,
+			        got_flip, got_settled, hold_ms);
 	}
 	pr_info("drm: fliptest: done -- the panel should have alternated red and green\n");
 	/* The buffers stay up: tearing them down would leave the panel pointing
 	 * at freed pages, and this test is the last thing a fliptest boot does. */
+	return 0;
+}
+
+static int fliptest_watchdog(void *arg)
+{
+	unsigned last = ~0u;
+	int stuck = 0;
+
+	(void)arg;
+	for (;;) {
+		console_sleep_jiffies(100); /* a second */
+		if (fliptest_cycle == last) {
+			stuck++;
+			pr_info("drm: fliptest: watchdog: still on cycle %u after %d s, "
+			        "thread at %d\n", fliptest_cycle, stuck, fliptest_where);
+			if (stuck == 3)
+				lkpi_dump_tasks(); /* who holds what, once */
+		} else {
+			last = fliptest_cycle;
+			stuck = 0;
+		}
+	}
 	return 0;
 }
 
@@ -444,6 +526,7 @@ static void fliptest_start(struct drm_device *dev)
 		return;
 	fliptest_dev = dev;
 	lkpi_fs_kthread_run(fliptest_thread, dev, "drm-fliptest");
+	lkpi_fs_kthread_run(fliptest_watchdog, NULL, "drm-fliptest-wd");
 }
 
 static int console_restore(struct drm_client_dev *client)
@@ -452,8 +535,10 @@ static int console_restore(struct drm_client_dev *client)
 	if (g_cur < 0 || client != &g_slot[g_cur].client)
 		return 0; /* a display the console has moved away from */
 	ret = drm_client_modeset_commit(client);
-	if (ret == 0)
+	if (ret == 0) {
+		fb_console_set_hidden(0); /* the master let go: draw again */
 		fb_console_present_all();
+	}
 	return ret;
 }
 

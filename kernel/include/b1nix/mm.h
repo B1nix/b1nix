@@ -406,3 +406,14 @@ void eviction_unlock_range(struct task *task, u64 start, u64 end);
 void eviction_unlock_all(struct task *task);
 
 #endif
+
+/* What a page fault turned out to be, for the profile in pf_prof_dump().
+ * The handler names its case; the accounting adds the cycles up per class. */
+#define PF_CLASS_OTHER 0
+#define PF_CLASS_ANON 1
+#define PF_CLASS_FILE 2
+#define PF_CLASS_COW 3
+#define PF_CLASS_SWAP 4
+#define PF_CLASS_STACK 5
+#define PF_CLASS_KERNEL 6
+void pf_prof_class(int cpu, int cls);
