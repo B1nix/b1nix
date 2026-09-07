@@ -1424,3 +1424,37 @@ measuring instead of reading.
       publishes it, and keep the PIT calibration in `lapic.c` as the fallback.
 - [ ] `planned` Publish a `flags` / `Features` line in `/proc/cpuinfo` from the
       CPUID feature words and the `ID_AA64ISAR*`/`ID_AA64PFR*` registers.
+
+## M120: Linux's own filesystems, through linuxkpi
+
+The bargain M101 struck for the DRM core, applied to storage: `fs/btrfs`,
+`fs/ext4` and `fs/jbd2` compiled exactly as upstream wrote them, on b1nix's own
+MIT/GPL shim. Detail in [`docs/linuxkpi-fs.md`](linuxkpi-fs.md).
+
+- [x] 105 imported translation units from a pinned Linux 6.6 compile and link
+      into the kernel (`B1NIX_FS_IMPORT=btrfs`, or `=1` for ext4 as well);
+      nothing under the staged tree is patched.
+- [x] `initial` **btrfs mounts and unmounts read-only.** The imported code opens
+      the device through b1nix's block layer, verifies the superblock checksum,
+      reads the chunk, root and free-space trees, publishes sysfs, starts its
+      cleaner and transaction kthreads, produces the root dentry (inode 256) and
+      tears the whole thing down again.
+- [x] `initial` **Reading through the mount**: the root listed, names looked up,
+      an inline file and a file with real extents read and checked byte for byte
+      against what `mkfs.btrfs --rootdir` wrote, two directories walked and a
+      symlink followed.
+- [x] `initial` **Writing through the mount**: a file and a directory created,
+      written, fsynced, a page overwritten inside an existing extent, appended,
+      truncated, renamed, hard-linked, symlinked and unlinked — with the host's
+      `btrfs check` reporting no error and `btrfs restore` reading back what
+      b1nix wrote. The image is built by `tools/fs/make-lkpi-btrfs-image.sh`.
+- [x] Two SMP defects in b1nix's own sysfs, found by mounting from a kthread
+      while the boot CPU was still registering devices: the registry's lists had
+      no lock, and `kobject_create_and_add()` left the kobject's `sysfs` pointer
+      as heap garbage.
+- [x] `initial` **The bridge**: `mount -t btrfs-lkpi` mounts through b1nix's own
+      VFS and every path under it is served by the imported code — read, write,
+      readdir, create, mkdir, rename, link, symlink, unlink, truncate, fsync.
+      Run the proof with `b1nix.lkpi-bridge-test=<device>`.
+- [ ] `planned` ext4 and jbd2 (`B1NIX_FS_IMPORT=1`), which need the buffer-head
+      write helpers that are still `-EOPNOTSUPP`.

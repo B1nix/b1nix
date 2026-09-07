@@ -3196,7 +3196,7 @@ check_output "$LOG" "M86-SMOKE: done" "M86 CPU-accounting/signal-targeting suite
 # ── M95: loadable kernel modules — framework, filesystem and device modules ──
 check_output "$LOG" "M95-SMOKE: ok proc-modules" "/proc/modules lists every .ko in /lib/modules, all Live and mapped in the 0xffffffffc0000000 module region"
 check_output "$LOG" "M95-SMOKE: ok modinfo" "a .ko's .modinfo carries name/license and a vermagic matching the running kernel release"
-check_output "$LOG" "M95-SMOKE: ok fs-modules" "isofs, ntfs and btrfs arrived as modules and registered themselves in /proc/filesystems"
+check_output "$LOG" "M95-SMOKE: ok fs-modules" "isofs and ntfs arrived as modules and btrfs is built in; all three registered themselves in /proc/filesystems"
 check_output "$LOG" "M95-SMOKE: ok sound-module" "the HDA driver is a live module and its sysfs coresize matches /proc/modules"
 check_output "$LOG" "M95-SMOKE: ok rmmod-insmod" "unloading ntfs withdraws the filesystem type; loading it back restores it"
 check_output "$LOG" "M95-SMOKE: ok refcount" "ipv6 is referenced by ndp, sysfs refcnt agrees, and removing it reports EBUSY"

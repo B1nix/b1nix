@@ -125,6 +125,9 @@ bool io_mapping_init_wc(struct io_mapping *iomap, resource_size_t base,
 	iomap->base = base;
 	iomap->size = size;
 	iomap->iomem = ioremap_wc(base, size);
+	/* Write-combining, since that is what was asked for: the caching bits
+	 * here are what i915 carries into a userspace mapping of this region. */
+	iomap->prot = pgprot_writecombine(PAGE_KERNEL_IO);
 	return iomap->iomem != 0;
 }
 
@@ -1198,12 +1201,20 @@ const struct sysfs_ops kobj_sysfs_ops = {
  */
 int i2c_add_adapter(struct i2c_adapter *adap)
 {
+	static int next_nr;
+
 	if (!adap)
 		return -EINVAL;
 	/* An adapter with no algorithm cannot transfer, and accepting it would
 	 * turn every later read into a NULL call rather than a refused probe. */
 	if (!adap->algo)
 		return -EINVAL;
+	/* Numbered and named, the way i2c_register_adapter does it upstream.
+	 * The number is what the name is built from, and the name is what other
+	 * subsystems refer to the adapter by — i915 links each HDMI connector to
+	 * its adapter under that name. */
+	adap->nr = next_nr++;
+	dev_set_name(&adap->dev, "i2c-%d", adap->nr);
 	return 0;
 }
 
@@ -1629,16 +1640,21 @@ unsigned long __get_free_page(gfp_t gfp)
 /*
  * Free a page named by its address.
  *
- * Needs the inverse lookup b1nix does not have — see virt_to_page() above — so
- * it stops rather than freeing the wrong frame or silently leaking. The single
- * caller here is i915's GuC log, on a path only reached when its allocation
- * succeeded through __get_free_page above.
+ * The inverse lookup exists now: struct page carries its frame and the page
+ * registry is indexed by pfn, so a direct-map address resolves. This used to
+ * stop the machine instead, which was right while nothing could answer it —
+ * ext4 calls it on a scratch page in ext4_calculate_overhead and mounting
+ * panicked on a page that had just been allocated one line above.
  */
 void free_page(unsigned long addr)
 {
-	(void)addr;
-	lkpi_panic("free_page: b1nix has no address-to-page map; "
-	           "free the struct page instead");
+	struct page *page;
+
+	if (!addr)
+		return;
+	page = virt_to_page((const void *)(usize)addr);
+	if (page)
+		__free_page(page);
 }
 
 /* ── page tables ──────────────────────────────────────────────────── */
@@ -1720,11 +1736,29 @@ void *vmap_pfn(unsigned long *pfns, unsigned int count, pgprot_t prot)
 
 /* ── files a driver would like to have ────────────────────────────── */
 
+/*
+ * Two stand-ins for the build without the imported filesystems.
+ *
+ * i915 references both whatever is in the link, while the real ones live in
+ * the fs shim (find_lock_page in fs_filemap.c, kern_unmount in fs_super.c),
+ * which is compiled only with B1NIX_FS_IMPORT — so without these the ordinary
+ * kernel does not link. Weak rather than #ifdef'd: make does not watch
+ * compiler flags, and an #ifdef on one would leave a stale object behind on
+ * every switch between the two configurations.
+ */
+__attribute__((weak))
 struct page *find_lock_page(struct address_space *mapping, unsigned long index)
 {
 	(void)mapping; (void)index;
 	return 0;
 }
+
+__attribute__((weak))
+void kern_unmount(struct vfsmount *mnt) { (void)mnt; }
+
+/* find_lock_page is implemented in kernel/lkpi/fs_filemap.c now, over a real
+ * page cache. The stub here answered "not cached" for every index, which was
+ * true while nothing populated a mapping and is not any more. */
 
 /*
  * b1nix's file table is not RCU-protected — see the note in <linux/fs.h> — so
@@ -1745,20 +1779,15 @@ struct file *get_file_rcu(struct file *f)
 
 /* shmem_truncate_range() is in linux_file.c, next to the pages it frees. */
 
-void kern_unmount(struct vfsmount *mnt) { (void)mnt; }
+/* kern_unmount is implemented in kernel/lkpi/fs_super.c, next to the mount it
+ * undoes. */
 
-struct file_system_type *get_fs_type(const char *name)
-{
-	(void)name;
-	return 0;
-}
+/* get_fs_type is implemented in kernel/lkpi/fs_super.c now, over the registry
+ * the imported filesystems register into. The stub here answered "no such
+ * filesystem" for every name. */
 
-struct vfsmount *vfs_kern_mount(struct file_system_type *type, int flags,
-                                const char *name, void *data)
-{
-	(void)type; (void)flags; (void)name; (void)data;
-	return ERR_PTR(-ENODEV);
-}
+/* vfs_kern_mount is implemented in kernel/lkpi/fs_super.c now: btrfs mounts
+ * its device's root through it, so it had to become real. */
 
 /* ── tasks ────────────────────────────────────────────────────────── */
 

@@ -24,6 +24,7 @@ static inline void srcu_read_unlock(struct srcu_struct *s, int idx)
 /* A file-scope srcu domain. One global instance per name; nothing here is
  * per-domain, so the object exists only to be addressable. */
 #define DEFINE_STATIC_SRCU(name) static struct srcu_struct name
+#define DEFINE_SRCU(name)        struct srcu_struct name
 
 static inline void synchronize_srcu(struct srcu_struct *s)
 { (void)s; synchronize_rcu(); }

@@ -29,7 +29,10 @@ typedef struct {
 } atomic_t;
 
 typedef struct {
-	volatile long counter;
+	/* i64, matching what the 64-bit atomics take and return: a `long`
+	 * counter made &v->counter the wrong pointer type for every one of them
+	 * even though the width is identical. */
+	volatile i64 counter;
 } atomic64_t;
 
 #define ATOMIC_INIT(i) { (i) }
@@ -143,32 +146,32 @@ static inline int atomic_add_unless(atomic_t *v, int a, int u)
 
 #define atomic_inc_not_zero(v) atomic_add_unless((v), 1, 0)
 
-static inline long atomic64_read(const atomic64_t *v)
+static inline i64 atomic64_read(const atomic64_t *v)
 {
 	return __atomic_load_n(&v->counter, __ATOMIC_RELAXED);
 }
 
-static inline void atomic64_set(atomic64_t *v, long i)
+static inline void atomic64_set(atomic64_t *v, i64 i)
 {
 	__atomic_store_n(&v->counter, i, __ATOMIC_RELAXED);
 }
 
-static inline long atomic64_inc_return(atomic64_t *v)
+static inline i64 atomic64_inc_return(atomic64_t *v)
 {
 	return __atomic_add_fetch(&v->counter, 1, __ATOMIC_SEQ_CST);
 }
 
-static inline long atomic64_add_return(long i, atomic64_t *v)
+static inline i64 atomic64_add_return(i64 i, atomic64_t *v)
 {
 	return __atomic_add_fetch(&v->counter, i, __ATOMIC_SEQ_CST);
 }
 
-static inline void atomic64_add(long i, atomic64_t *v)
+static inline void atomic64_add(i64 i, atomic64_t *v)
 {
 	__atomic_fetch_add(&v->counter, i, __ATOMIC_RELAXED);
 }
 
-static inline void atomic64_sub(long i, atomic64_t *v)
+static inline void atomic64_sub(i64 i, atomic64_t *v)
 {
 	__atomic_fetch_sub(&v->counter, i, __ATOMIC_RELAXED);
 }
@@ -257,7 +260,43 @@ static inline int atomic_fetch_or(int i, atomic_t *v)
 #define cmpxchg64(ptr, old_val, new_val) cmpxchg(ptr, old_val, new_val)
 
 
-static inline long atomic64_sub_return(long i, atomic64_t *v)
+static inline i64 atomic64_sub_return(i64 i, atomic64_t *v)
 { return __atomic_sub_fetch(&v->counter, i, __ATOMIC_ACQ_REL); }
+
+/*
+ * Compare-and-exchange on the 64-bit counter, returning the value that was
+ * there — not a success flag. Callers loop on it: they compare the return
+ * against what they expected and retry when another CPU got in first, which is
+ * how percpu_counter_limited_add and the i_version update stay single.
+ */
+static inline i64 atomic64_cmpxchg(atomic64_t *v, i64 old, i64 new)
+{
+	__atomic_compare_exchange_n(&v->counter, &old, new, 0, __ATOMIC_SEQ_CST,
+	                            __ATOMIC_SEQ_CST);
+	/* __atomic_compare_exchange_n writes the observed value back into `old`
+	 * whether it succeeded or not, which is exactly the return contract. */
+	return old;
+}
+
+static inline i64 atomic64_xchg(atomic64_t *v, i64 new)
+{
+	return __atomic_exchange_n(&v->counter, new, __ATOMIC_SEQ_CST);
+}
+
+/* Decrement unless the value is already zero or negative, returning the value
+ * BEFORE the decrement. The "unless" is why it cannot be a plain dec: a caller
+ * uses it to consume from a budget and must be able to see that the budget was
+ * empty. */
+static inline int atomic_dec_if_positive(atomic_t *v)
+{
+	for (;;) {
+		int c = atomic_read(v);
+
+		if (c <= 0)
+			return c - 1;
+		if (atomic_cmpxchg(v, c, c - 1) == c)
+			return c - 1;
+	}
+}
 
 #endif

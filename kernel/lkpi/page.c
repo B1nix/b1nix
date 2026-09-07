@@ -507,3 +507,11 @@ struct page *virt_to_page(const void *addr)
 		return 0;
 	return pfn_to_page((va - base) / PAGE_SIZE);
 }
+
+/* lkpi_page_from_virt is the same lookup virt_to_page above performs; it is
+ * named separately because the Linux-side files reach it through a name that
+ * cannot collide with the one in <linux/mm.h>. */
+struct page *lkpi_page_from_virt(const void *addr)
+{
+	return virt_to_page(addr);
+}

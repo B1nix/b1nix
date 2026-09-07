@@ -70,4 +70,45 @@ static inline bool gfpflags_allow_blocking(gfp_t flags)
 #define __GFP_NOMEMALLOC 0x00020000u
 #endif
 
+/*
+ * The reclaim-recursion flags. __GFP_FS says the allocator MAY call back into a
+ * filesystem to free memory; a filesystem holding a transaction open must clear
+ * it (GFP_NOFS) or reclaim re-enters underneath it and deadlocks on the lock it
+ * already holds. __GFP_IO is the same statement one layer down.
+ *
+ * b1nix's reclaim does not call into a filesystem today, so clearing the flag
+ * changes nothing yet. The values still have to be distinct bits: the
+ * filesystems mask them in and out and compare the results.
+ */
+#ifndef __GFP_IO
+#define __GFP_IO   0x0040u
+#endif
+#ifndef __GFP_FS
+#define __GFP_FS   0x0080u
+#endif
+#ifndef __GFP_HIGHMEM
+#define __GFP_HIGHMEM 0x0002u
+#endif
+#ifndef __GFP_MOVABLE
+#define __GFP_MOVABLE 0x0008u
+#endif
+#ifndef __GFP_HARDWALL
+#define __GFP_HARDWALL 0x100000u
+#endif
+#ifndef GFP_NOFS
+#define GFP_NOFS   (GFP_KERNEL & ~__GFP_FS)
+#endif
+#ifndef GFP_NOIO
+#define GFP_NOIO   (GFP_KERNEL & ~(__GFP_FS | __GFP_IO))
+#endif
+#ifndef GFP_NOWAIT
+#define GFP_NOWAIT (__GFP_NOWARN)
+#endif
+#ifndef GFP_HIGHUSER
+#define GFP_HIGHUSER (GFP_KERNEL | __GFP_HIGHMEM)
+#endif
+#ifndef GFP_HIGHUSER_MOVABLE
+#define GFP_HIGHUSER_MOVABLE (GFP_HIGHUSER | __GFP_MOVABLE)
+#endif
+
 #endif

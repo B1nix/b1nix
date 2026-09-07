@@ -8829,6 +8829,12 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
   if (ret != 0)
     goto out;
 
+  /* A filesystem that keeps its own attributes takes it from here. */
+  if (node->inode->setxattr_cb) {
+    ret = node->inode->setxattr_cb(node, name, value, size, flags);
+    goto out;
+  }
+
   /* Exclusive inode lock: the xattr list is shared mutable inode state; a
    * concurrent setxattr/removexattr on another CPU would corrupt the list and
    * a concurrent getxattr could walk a freed node (UAF). */
@@ -8900,6 +8906,13 @@ isize vfs_getxattr(const char *path, const char *name, void *value,
   if (IS_ERR(node))
     return (isize)PTR_ERR(node);
 
+  if (node->inode->getxattr_cb) {
+    isize cb = node->inode->getxattr_cb(node, name, value, size);
+
+    vfs_node_put(node);
+    return cb;
+  }
+
   isize ret = -ENODATA;
   vfs_inode_lock_read(node->inode);
   for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next) {
@@ -8925,6 +8938,13 @@ isize vfs_listxattr(const char *path, char *list, usize size, int nofollow) {
   struct vfs_node *node = xattr_lookup(path, nofollow);
   if (IS_ERR(node))
     return (isize)PTR_ERR(node);
+
+  if (node->inode->listxattr_cb) {
+    isize cb = node->inode->listxattr_cb(node, list, size);
+
+    vfs_node_put(node);
+    return cb;
+  }
 
   vfs_inode_lock_read(node->inode);
   usize total = 0;
@@ -8960,6 +8980,11 @@ isize vfs_removexattr(const char *path, const char *name, int nofollow) {
   isize ret = xattr_check_write(node);
   if (ret != 0)
     goto out;
+
+  if (node->inode->removexattr_cb) {
+    ret = node->inode->removexattr_cb(node, name);
+    goto out;
+  }
 
   ret = -ENODATA;
   vfs_inode_lock(node->inode);

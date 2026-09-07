@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_BUG_H
 #define LKPI_LINUX_BUG_H
+
 #include <linux/printk.h>
 #include <lkpi/env.h>
 /* WARN reports and continues; BUG does not return. Keeping that difference is
@@ -50,5 +51,20 @@ void add_taint(unsigned flag, int lockdep_ok);
 #define TAINT_USER            6
 #define TAINT_FIRMWARE_WORKAROUND 11
 #define TAINT_CRAP            10
+
+/*
+ * panic().
+ *
+ * A filesystem calls it when it finds an inconsistency it cannot continue past
+ * — btrfs does when its `panic_on_error` mount option is set, and jbd2 does
+ * when the journal is in a state that would corrupt the filesystem to ignore.
+ * It has to be the real thing: continuing after one is how a single bad block
+ * becomes an unmountable filesystem.
+ */
+void panic(const char *fmt, ...) __attribute__((format(printf, 1, 2), noreturn));
+
+/* WARN, but not more often than the rate limiter allows. Same return value as
+ * WARN_ON — the condition — so it can be used in an if. */
+#define WARN_RATELIMIT(cond, fmt, ...) WARN_ON(cond)
 
 #endif

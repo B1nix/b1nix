@@ -243,6 +243,18 @@ struct vfs_inode {
    * list of name/value pairs; NULL when the inode has no xattrs. */
   struct vfs_xattr *xattrs;
 
+  /* A filesystem that stores extended attributes ITSELF supplies these, and
+   * the in-memory list above is then unused for its inodes: an attribute set
+   * on an ext4 file has to reach ext4, not a list that dies with the mount.
+   * All four are optional; without them the list is the whole story, which is
+   * what tmpfs and the initramfs want. */
+  isize (*getxattr_cb)(struct vfs_node *node, const char *name, void *value,
+                       usize size);
+  int (*setxattr_cb)(struct vfs_node *node, const char *name,
+                     const void *value, usize size, int flags);
+  int (*removexattr_cb)(struct vfs_node *node, const char *name);
+  isize (*listxattr_cb)(struct vfs_node *node, char *list, usize size);
+
   /* Timestamps */
   u64 atime;
   u64 mtime;

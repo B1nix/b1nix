@@ -73,6 +73,43 @@
 #define EREMOTEIO      121
 #define ENOTSUP        EOPNOTSUPP
 #define EDEADLOCK      EDEADLK
+/*
+ * Filesystem errors. EUCLEAN is the one that matters: btrfs returns it for a
+ * checksum mismatch and ext4 for a corrupt structure, and userspace maps it to
+ * "Structure needs cleaning" — a distinct answer from EIO, which means the
+ * device failed. Collapsing the two tells a user their disk is dying when their
+ * filesystem needs fsck, or the reverse.
+ */
+#define ENOTCONN       107
+#define ESHUTDOWN      108
+/* "Invalid request descriptor" — what fiemap returns for a flag it does not
+ * support, which userspace distinguishes from EINVAL. */
+#define EBADR           53
+#define ECANCELED      125
+#define EUCLEAN        117
+/* "This parameter is not mine." The mount-option parser returns it for a name
+ * that is not in the filesystem's table, and every caller treats it as "ask
+ * the next parser", not as a failure. */
+#define ENOPARAM       519
+#define ENOTNAM        118
+#define ENAVAIL        119
+#define EISNAM         120
+#define EDQUOT          122
+#define ENOKEY          126
+#define EKEYEXPIRED     127
+#define EKEYREVOKED     128
+#define EKEYREJECTED    129
+#define EOWNERDEAD      130
+#define ENOTRECOVERABLE 131
+#define ERFKILL         132
+#define EHWPOISON       133
+#define EXDEV            18
+#define EMLINK           31
+#define ETXTBSY          26
+#define EFBIG            27
+#define ENOSPC           28
+#define ESPIPE           29
+#define EROFS            30
 
 /* Kernel-internal, never returned to userspace. Linux keeps these above the
  * POSIX range for exactly that reason. */

@@ -31,6 +31,12 @@ static inline struct ctl_table_header *register_sysctl(const char *path,
 { (void)path; (void)table; return NULL; }
 static inline void unregister_sysctl_table(struct ctl_table_header *h)
 { (void)h; }
+/* The init-time form, whose result upstream deliberately ignores. */
+static inline void register_sysctl_init(const char *path,
+                                        struct ctl_table *table)
+{ (void)path; (void)table; }
+
+int proc_doulongvec_minmax(struct ctl_table *, int, void *, size_t *, loff_t *);
 
 extern int sysctl_zero_value;
 extern int sysctl_one_value;

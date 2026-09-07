@@ -15,8 +15,16 @@ struct ratelimit_state {
 	 * zero — and a caller reporting it says "none swallowed", which is true. */
 	int missed;
 };
+#define RATELIMIT_STATE_INIT(name, intv, brst) \
+	{ .begin = 0, .burst = (brst), .printed = 0, .interval = (intv), .missed = 0 }
 #define DEFINE_RATELIMIT_STATE(name, intv, brst) \
-	struct ratelimit_state name = { 0, brst, 0, intv }
+	struct ratelimit_state name = RATELIMIT_STATE_INIT(name, intv, brst)
+#ifndef DEFAULT_RATELIMIT_INTERVAL
+#define DEFAULT_RATELIMIT_INTERVAL (5 * HZ)
+#endif
+#ifndef DEFAULT_RATELIMIT_BURST
+#define DEFAULT_RATELIMIT_BURST 10
+#endif
 static inline int __ratelimit(struct ratelimit_state *rs)
 {
 	unsigned long now = jiffies;
@@ -42,5 +50,26 @@ static inline int __ratelimit(struct ratelimit_state *rs)
 	     (rs)->begin = 0; } while (0)
 #define ratelimit_set_flags(rs, f) do { (void)(rs); (void)(f); } while (0)
 #define RATELIMIT_MSG_ON_RELEASE 0
+
+/*
+ * The rate limiter's decision function: true when this event may be printed.
+ *
+ * It is a real decision here, not always-true: a filesystem that has started
+ * finding corruption prints per BLOCK, and an unlimited version turns a bad
+ * disk into a serial console that never stops long enough to show the first
+ * message.
+ */
+/* ratelimit_state_init, ratelimit_set_flags and the DEFAULT_RATELIMIT_*
+ * constants are defined above as macros; only the decision function was
+ * missing. */
+struct ratelimit_state;
+int ___ratelimit(struct ratelimit_state *rs, const char *func);
+#ifndef RATELIMIT_MSG_ON_RELEASE
+#define RATELIMIT_MSG_ON_RELEASE (1 << 0)
+#endif
+
+#ifndef pr_notice_ratelimited
+#define pr_notice_ratelimited(fmt, ...) pr_notice(fmt, ##__VA_ARGS__)
+#endif
 
 #endif

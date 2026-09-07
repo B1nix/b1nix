@@ -43,6 +43,18 @@ struct radix_tree_iter {
 #define xa_unlock_irqrestore(xa, flags) do { (void)(xa); lkpi_irq_restore(flags); } while (0)
 #define xa_lock(xa)                     do { (void)(xa); } while (0)
 #define xa_unlock(xa)                   do { (void)(xa); } while (0)
+/*
+ * The interrupt-disabling forms.
+ *
+ * The unlock ENABLES interrupts rather than restoring a saved state — that is
+ * what the `_irq` suffix means, as against `_irqsave`, and a caller uses it
+ * only where it knows they were on. The first version of this pair disabled
+ * them in the lock and did nothing in the unlock, which left them off for good:
+ * the timer stopped, and the whole machine froze at the first page-cache
+ * insertion inside a mount.
+ */
+#define xa_lock_irq(xa)                 do { (void)(xa); (void)lkpi_irq_save(); } while (0)
+#define xa_unlock_irq(xa)               do { (void)(xa); lkpi_irq_enable(); } while (0)
 
 
 /*
@@ -149,5 +161,77 @@ void *xa_find_next(struct xarray *xa, u64 *index);
 		int __err = lkpi_xa_store((xa_), (index_), (entry_));                \
 		__err ? xa_mk_err(__err) : __old;                                    \
 	})
+
+/*
+ * Internal entries.
+ *
+ * An xarray slot can hold a pointer to a user object, or one of several
+ * INTERNAL values the array uses for its own bookkeeping — a node pointer, a
+ * retry marker, a zero entry. They are distinguished by their low bits, which
+ * is why a user pointer must be at least 4-byte aligned.
+ *
+ * Imported code tests for them while walking an array it holds a raw slot
+ * pointer into: `xa_is_node` before descending, `xa_is_zero` to tell "reserved
+ * but empty" from "absent". Answering the wrong one dereferences a tag as a
+ * pointer.
+ */
+static inline bool xa_is_internal(const void *entry)
+{ return ((unsigned long)entry & 3) == 2; }
+static inline bool xa_is_node(const void *entry)
+{ return xa_is_internal(entry) && (unsigned long)entry > 4096; }
+static inline bool xa_is_zero(const void *entry)
+{ return (unsigned long)entry == 0x406; }
+static inline bool xa_is_retry(const void *entry)
+{ return (unsigned long)entry == 0x402; }
+static inline bool xa_is_advanced(const void *entry)
+{ return xa_is_internal(entry) && (unsigned long)entry <= 0x406; }
+
+/*
+ * Marks: a few bits of per-entry state the array itself indexes.
+ *
+ * The page cache uses them for DIRTY and WRITEBACK, so that a writeback pass
+ * can walk only the dirty entries instead of every entry in the file. That is
+ * the whole reason they exist inside the array rather than in the objects: the
+ * search is what has to be fast.
+ */
+typedef struct { unsigned int v; } xa_mark_t;
+
+#define XA_MARK_0 ((xa_mark_t){ 0 })
+#define XA_MARK_1 ((xa_mark_t){ 1 })
+#define XA_MARK_2 ((xa_mark_t){ 2 })
+#define XA_MARK_MAX XA_MARK_2
+#define XA_PRESENT  ((xa_mark_t){ 8 })
+
+void xa_set_mark(struct xarray *xa, unsigned long index, xa_mark_t mark);
+void xa_clear_mark(struct xarray *xa, unsigned long index, xa_mark_t mark);
+bool xa_get_mark(struct xarray *xa, unsigned long index, xa_mark_t mark);
+bool xa_marked(const struct xarray *xa, xa_mark_t mark);
+void __xa_set_mark(struct xarray *xa, unsigned long index, xa_mark_t mark);
+void __xa_clear_mark(struct xarray *xa, unsigned long index, xa_mark_t mark);
+
+/*
+ * The radix-tree spellings that have no xarray equivalent.
+ *
+ * Declared here rather than in <linux/radix-tree.h> because btrfs reaches them
+ * from files that include only this header — the tree and the array are the
+ * same structure, so this is where the whole interface lives.
+ */
+struct radix_tree_root;
+unsigned int radix_tree_gang_lookup(const struct radix_tree_root *root,
+                                    void **results, unsigned long first_index,
+                                    unsigned int max_items);
+unsigned int radix_tree_gang_lookup_tag(const struct radix_tree_root *root,
+                                        void **results,
+                                        unsigned long first_index,
+                                        unsigned int max_items,
+                                        unsigned int tag);
+void *radix_tree_tag_set(struct radix_tree_root *root, unsigned long index,
+                         unsigned int tag);
+void *radix_tree_tag_clear(struct radix_tree_root *root, unsigned long index,
+                           unsigned int tag);
+int radix_tree_tagged(const struct radix_tree_root *root, unsigned int tag);
+/* A pairing discipline rather than a reservation — see <linux/radix-tree.h>. */
+int radix_tree_preload(gfp_t gfp_mask);
+void radix_tree_preload_end(void);
 
 #endif

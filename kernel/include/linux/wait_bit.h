@@ -96,4 +96,59 @@ static inline struct wait_queue_head *__var_waitqueue(void *p)
 void __init_waitqueue_head(struct wait_queue_head *wq, const char *name,
                            void *key);
 
+/* The same wait, marked as waiting for I/O. jbd2 and btrfs use this spelling
+ * where the bit is cleared by a completion; the distinction is accounting
+ * b1nix does not keep. */
+static inline int wait_on_bit_io(unsigned long *word, int bit, unsigned mode)
+{ return wait_on_bit(word, bit, mode); }
+static inline int wait_on_bit_lock_io(unsigned long *word, int bit,
+                                      unsigned mode)
+{
+	/*
+	 * Take the bit as a lock: wait for it to clear, then set it, and repeat
+	 * if somebody else set it first. wait_on_bit alone only waits.
+	 *
+	 * The set is open-coded on __atomic rather than calling
+	 * test_and_set_bit_lock, for the reason at the top of this header: by the
+	 * time this file is reached, <linux/bitops.h>'s include guard is set but
+	 * its bodies are not yet defined.
+	 */
+	unsigned long mask = 1ul << (bit % (8 * sizeof(long)));
+	unsigned long *w = &word[bit / (8 * sizeof(long))];
+
+	while (__atomic_fetch_or(w, mask, __ATOMIC_ACQUIRE) & mask)
+		wait_on_bit(word, bit, mode);
+	return 0;
+}
+
+/*
+ * A named waiter on one bit.
+ *
+ * Upstream this declares a wait_bit_queue_entry with the word and bit filled
+ * in, for the `__wait_on_bit`-style loops that take the queue explicitly. The
+ * waits here are keyed on the word's address directly (see the note at the top
+ * of this header), so the structure carries the same two values and the loops
+ * that use it read them back.
+ */
+struct wait_bit_key {
+	void *flags;
+	int bit_nr;
+	unsigned long timeout;
+};
+
+struct wait_bit_queue_entry {
+	struct wait_bit_key key;
+	struct wait_queue_entry wq_entry;
+};
+
+#define DEFINE_WAIT_BIT(name, word, bit)                                      \
+	struct wait_bit_queue_entry name = {                                      \
+		.key = { .flags = (word), .bit_nr = (bit) },                          \
+	}
+
+int __wait_on_bit(struct wait_queue_head *wq, struct wait_bit_queue_entry *q,
+                  int (*action)(struct wait_bit_key *, int), unsigned mode);
+int bit_wait_io(struct wait_bit_key *key, int mode);
+int bit_wait(struct wait_bit_key *key, int mode);
+
 #endif

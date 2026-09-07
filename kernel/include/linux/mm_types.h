@@ -41,6 +41,23 @@ struct vm_operations_struct {
 	vm_fault_t (*fault)(struct vm_fault *vmf);
 	int (*access)(struct vm_area_struct *vma, unsigned long addr, void *buf,
 	              int len, int write);
+	/*
+	 * A write is about to happen to a page mapped read-only.
+	 *
+	 * This is where a filesystem allocates the blocks behind a shared
+	 * mapping — a page can be mapped long before anything is written to it. A
+	 * NULL here means "writes need no preparation", which for a file-backed
+	 * mapping is how a write ends up with nowhere to go.
+	 */
+	vm_fault_t (*page_mkwrite)(struct vm_fault *vmf);
+	vm_fault_t (*pfn_mkwrite)(struct vm_fault *vmf);
+	/*
+	 * Map the pages around a fault in one go, so a sequential walk does not
+	 * fault per page. Purely an optimisation: a NULL costs faults, not
+	 * correctness.
+	 */
+	vm_fault_t (*map_pages)(struct vm_fault *vmf, pgoff_t start_pgoff,
+	                        pgoff_t end_pgoff);
 };
 struct mm_struct;
 #endif

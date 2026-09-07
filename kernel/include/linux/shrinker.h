@@ -54,4 +54,14 @@ static inline void unregister_shrinker(struct shrinker *s) { (void)s; }
  * the time an unregister has completed. */
 static inline void synchronize_shrinkers(void) { }
 
+/* The shrinker has been handed to the reclaim machinery. btrfs checks it before
+ * unregistering, because unregistering one that was never registered walks a
+ * list it is not on. */
+#define SHRINKER_REGISTERED (1 << 0)
+#define SHRINKER_NUMA_AWARE (1 << 1)
+#define SHRINKER_MEMCG_AWARE (1 << 2)
+#define SHRINKER_NONSLAB    (1 << 3)
+
+int shrinker_debugfs_rename(struct shrinker *shrinker, const char *fmt, ...);
+
 #endif

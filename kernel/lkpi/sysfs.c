@@ -19,6 +19,11 @@
  * be a filesystem's worth of code for no behaviour a driver can tell apart.
  */
 
+/* The VFS objects this file builds on. It used to arrive through
+ * <linux/types.h> -> <linux/poll.h>; that path was removed when fs.h became
+ * the full VFS, because pulling it in from types.h compiled it before
+ * spinlock_t existed. */
+#include <linux/fs.h>
 #include <linux/debugfs.h>
 #include <linux/device.h>
 #include <linux/err.h>

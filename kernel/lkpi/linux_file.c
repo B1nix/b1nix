@@ -50,17 +50,31 @@ struct inode *alloc_anon_inode(struct super_block *sb)
 	 * value only has to be unique, not meaningful. */
 	inode->i_ino = (unsigned long)__atomic_add_fetch(&g_anon_ino, 1ull,
 	                                                 __ATOMIC_ACQ_REL);
+	/*
+	 * One reference, because iput() is the real VFS one now
+	 * (kernel/lkpi/fs_inode.c) and it frees on the last put. It used to be a
+	 * bare kfree here, which needed no count — an anonymous inode allocated
+	 * with a zero count would never be freed by it.
+	 */
+	atomic_set(&inode->i_count, 1);
+	inode->i_mapping = &inode->i_data;
+	inode->i_data.host = inode;
+	xa_init(&inode->i_data.i_pages);
+	INIT_HLIST_NODE(&inode->i_hash);
+	INIT_LIST_HEAD(&inode->i_sb_list);
+	INIT_LIST_HEAD(&inode->i_io_list);
+	INIT_LIST_HEAD(&inode->i_lru);
+	INIT_LIST_HEAD(&inode->i_wb_list);
+	INIT_LIST_HEAD(&inode->i_devices);
+	spin_lock_init(&inode->i_lock);
+	init_rwsem(&inode->i_rwsem);
+	init_rwsem(&inode->i_data.invalidate_lock);
 	return inode;
 }
 
-void iput(struct inode *inode)
-{
-	/* NULL is not an error: a file whose release owns the inode's storage
-	 * clears the pointer, precisely so this does not free into the middle of
-	 * someone else's allocation. */
-	if (inode)
-		lkpi_kfree(inode);
-}
+/* iput() is implemented in kernel/lkpi/fs_inode.c: an inode's last put has to
+ * run the filesystem's eviction, which a bare free cannot. An anonymous inode
+ * has no superblock, so it takes the short path through the same function. */
 
 /* ── files ──────────────────────────────────────────────────────── */
 
@@ -88,6 +102,31 @@ struct file *anon_inode_getfile(const char *name,
 	f->f_mode = FMODE_READ | FMODE_WRITE;
 	atomic64_set(&f->f_count, 1);
 	return f;
+}
+
+/*
+ * Stand-ins for the build without the imported filesystems, weak so the real
+ * ones (fs_super.c, fs_inode.c) win when they are in the link. Freeing the
+ * inode outright is right only while nothing else owns inodes; the imported
+ * filesystems do, and their iput runs eviction first.
+ */
+__attribute__((weak))
+void kill_anon_super(struct super_block *sb)
+{
+	(void)sb;
+	/* Nothing allocated one: init_pseudo returns NULL and simple_pin_fs never
+	 * mounts anything, so there is no superblock to destroy. The real one is
+	 * in fs_super.c, in the link only with the imported filesystems. */
+}
+
+__attribute__((weak))
+void iput(struct inode *inode)
+{
+	/* NULL is not an error: a file whose release owns the inode's storage
+	 * clears the pointer, precisely so this does not free into the middle of
+	 * someone else's allocation. */
+	if (inode)
+		lkpi_kfree(inode);
 }
 
 void fput(struct file *f)
@@ -232,12 +271,8 @@ void unmap_mapping_range(struct address_space *mapping, loff_t const holebegin,
 
 /* ── superblock ─────────────────────────────────────────────────── */
 
-void kill_anon_super(struct super_block *sb)
-{
-	(void)sb;
-	/* Nothing allocated one: init_pseudo returns NULL and simple_pin_fs never
-	 * mounts anything, so there is no superblock to destroy. */
-}
+/* kill_anon_super is implemented in kernel/lkpi/fs_super.c now, next to the
+ * superblock allocation it undoes. */
 
 /*
  * A mount for callers that only read a field out of it.

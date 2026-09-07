@@ -141,6 +141,47 @@ struct lkpi_task {
 	 * <linux/mm.h> — so this is always NULL and exists because imported code
 	 * passes current->mm along to a function that must fail to link. */
 	struct mm_struct *mm;
+	/*
+	 * The filesystem transaction this task currently has open.
+	 *
+	 * It lives on the task rather than being passed down because the code
+	 * that must know — an allocator deciding whether it may start a second
+	 * transaction, a writeback path deciding whether it may block — is called
+	 * from far below the code that opened one. jbd2 and both filesystems use
+	 * it exactly this way, and a shim that dropped it would let a nested
+	 * transaction start and deadlock against its own outer one.
+	 */
+	void *journal_info;
+	/*
+	 * Per-task flags. Only the allocation-scope bits are used here — a
+	 * filesystem tests PF_MEMALLOC_NOFS directly to decide whether it is
+	 * already inside a no-reclaim region rather than opening a nested one.
+	 * The bit values are in <linux/sched.h> with the rest of the PF_* set.
+	 */
+	unsigned int flags;
+	/*
+	 * Dirty-page throttling state.
+	 *
+	 * `nr_dirtied` counts pages this task has dirtied since it was last made
+	 * to wait, and `nr_dirtied_pause` is the count at which it must. btrfs
+	 * reads and resets both directly, around the writes it makes on a
+	 * caller's behalf. b1nix does not throttle dirtiers yet, so nothing acts
+	 * on them — but they are real fields, because the day it does, this is
+	 * the state it acts on.
+	 */
+	int nr_dirtied;
+	int nr_dirtied_pause;
+	/*
+	 * The I/O scheduling context.
+	 *
+	 * There is no I/O scheduler here, so nothing acts on it — but ext4 READS
+	 * the priority out of it to give its journal thread the same one as the
+	 * task that started the transaction, so it has to be a structure with
+	 * that field rather than an opaque pointer.
+	 */
+	struct io_context {
+		unsigned short ioprio;
+	} *io_context;
 };
 
 struct lkpi_task *lkpi_current(void);

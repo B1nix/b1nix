@@ -20,7 +20,10 @@ struct io_mapping {
 	resource_size_t base;
 	unsigned long size;
 	void __iomem *iomem;
-	unsigned long prot;
+	/* The caching this region is mapped with. A pgprot_t and not a bare
+	 * word: i915 masks the cache bits out of it and the rest out of the
+	 * VMA's, and both sides have to be the same type to do that. */
+	pgprot_t prot;
 };
 
 struct io_mapping *io_mapping_create_wc(resource_size_t base, unsigned long size);

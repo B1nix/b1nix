@@ -47,6 +47,28 @@ struct kobject {
 	 * a uevent, and the only property a hotplug helper matches on before it
 	 * has looked at anything else. Set when the device is added. */
 	const char *subsystem;
+	/*
+	 * The type this object was created with.
+	 *
+	 * `release` above is the same function reached the short way, and it stays
+	 * because the device code sets it directly. This member exists because
+	 * imported filesystem code reads `kobj->ktype` — btrfs dispatches its
+	 * sysfs attribute shows through it — and a release function alone cannot
+	 * answer that.
+	 */
+	const struct kobj_type *ktype;
+	/*
+	 * Whether this object has been initialised and whether it is published.
+	 *
+	 * btrfs reads both directly: it tears down a partially built sysfs tree on
+	 * a failed mount and must not put a kobject that was never initialised,
+	 * which would run a release function on uninitialised memory.
+	 */
+	unsigned int state_initialized : 1;
+	unsigned int state_in_sysfs : 1;
+	/* The set this object belongs to, which is also its parent directory.
+	 * btrfs assigns it directly when adding a filesystem under /sys/fs/btrfs. */
+	struct kset *kset;
 };
 
 /*
@@ -157,5 +179,10 @@ int lkpi_pm_runtime_put_sync(struct lkpi_device *dev);
 i32 lkpi_pm_runtime_usage(struct lkpi_device *dev);
 int lkpi_pm_runtime_suspended(struct lkpi_device *dev);
 
+
+/* Unpublish an object without dropping the caller's reference: the directory
+ * goes away, the object does not. ext4 does this on unmount before the final
+ * put, so that nothing can open a file under it while it is being torn down. */
+void kobject_del(struct kobject *kobj);
 
 #endif

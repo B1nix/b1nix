@@ -4,6 +4,10 @@
 
 #include <b1nix/types.h>
 #include <linux/compiler.h>
+/* The memory barriers. Reached from here because <linux/types.h> is what every
+ * imported translation unit force-includes, and imported code uses smp_rmb()
+ * from headers that include neither <linux/smp.h> nor <linux/atomic.h>. */
+#include <asm/barrier.h>
 #include <linux/stddef.h>
 
 /* The __-prefixed spellings the uapi headers use. b1nix's own u8/u32/... come
@@ -49,6 +53,9 @@ typedef _Bool bool;
 #define false 0
 
 typedef unsigned short umode_t;
+/* The userspace spelling of the same thing, which ext4 uses in an internal
+ * helper's signature. */
+typedef unsigned int mode_t;
 typedef u64 resource_size_t;
 typedef unsigned int gfp_t;
 typedef int atomic_t_placeholder;
@@ -68,6 +75,33 @@ typedef __kernel_loff_t loff_t;
 typedef unsigned long pgoff_t;
 typedef int pid_t;
 typedef u64 phys_addr_t;
+
+/*
+ * Filesystem and block-layer scalars.
+ *
+ * `sector_t` is 64-bit unconditionally. Upstream makes it depend on
+ * CONFIG_LBDAF on 32-bit machines; here it never does, because a 32-bit
+ * sector_t caps a device at 2 TiB and silently wraps past it — and the wrap is
+ * not an error, it is a write to the wrong place.
+ *
+ * `blkcnt_t` counts blocks of a filesystem's own size, not sectors. They are
+ * different units and the distinction is what `i_blocks` (always 512-byte
+ * units) versus `i_blkbits` exists to keep straight.
+ */
+typedef u64 sector_t;
+typedef u64 blkcnt_t;
+#ifndef LKPI_TIME64_T_DEFINED
+#define LKPI_TIME64_T_DEFINED
+typedef long long time64_t;
+#endif
+typedef unsigned int uid_t;
+typedef unsigned int gid_t;
+/* The third id class, used by the quota code for project quotas. */
+typedef unsigned int projid_t;
+typedef unsigned int dev_t;
+/* pfn_t is defined in <linux/pfn_t.h>, which is where the DAX interfaces that
+ * use it look for it; it was briefly defined here too, which is a redefinition
+ * rather than a second spelling. */
 
 /* Alignment a DMA buffer must have for cache maintenance to be safe on this
  * architecture. x86 is cache-coherent for DMA, so the constraint is only the
@@ -97,6 +131,9 @@ typedef u64 phys_addr_t;
 #include <linux/overflow.h>
 #include <lkpi/rcu.h>
 #include <linux/fcntl.h>
+/* Late, not with the scalars above: it defines kuid_t/kgid_t as structs over
+ * uid_t/gid_t, so those typedefs have to be in scope first. */
+#include <linux/uidgid.h>
 #include <linux/capability.h>
 #include <linux/stringify.h>
 #include <linux/io.h>
@@ -110,7 +147,39 @@ typedef u64 phys_addr_t;
 #include <linux/dma-mapping.h>
 #include <linux/kdev_t.h>
 #include <linux/string_helpers.h>
-#include <linux/poll.h>
+/*
+ * NOT <linux/poll.h>.
+ *
+ * It includes <linux/fs.h>, and this header is reached from
+ * <linux/spinlock.h> — so pulling fs.h in here means fs.h is compiled before
+ * `spinlock_t` exists, and every lock member in it is an unknown type. It was
+ * harmless while fs.h was a handful of anonymous-inode declarations; it stopped
+ * being harmless when fs.h became the VFS. A driver that needs poll includes it
+ * itself, which is what upstream expects anyway.
+ *
+ * What that include was quietly providing, besides poll: file-scope
+ * declarations of the VFS types. Imported headers name them inside function
+ * POINTER members, where a first mention creates a type local to that
+ * prototype — which then refuses to match the real one, and is reported as
+ * "incompatible function pointer types" between two spellings that look
+ * identical. They are declared here instead, which costs nothing and does not
+ * pull the VFS in.
+ */
+struct file;
+struct inode;
+struct dentry;
+struct super_block;
+struct address_space;
+struct vfsmount;
+struct path;
+struct kiocb;
+struct iov_iter;
+struct seq_file;
+struct kstat;
+struct iattr;
+struct file_operations;
+struct vm_area_struct;
+struct vm_fault;
 #include <linux/sizes.h>
 #include <linux/uaccess.h>
 #include <linux/sched.h>

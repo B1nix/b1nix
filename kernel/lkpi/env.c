@@ -144,9 +144,9 @@ int lkpi_diag_watch_report(u64 min_ms)
  * because the wait for it lasted 200 ms instead of two seconds. */
 /* Wake a task that parked in schedule_timeout, named by the snapshot above.
  *
- * The pid in that snapshot is b1nix's task id, and waking by id is safe against
- * the task having exited in the meantime: the scheduler finds no live task and
- * does nothing. */
+ * The pid in that snapshot is b1nix's task id plus one (see lkpi_current), and
+ * waking by id is safe against the task having exited in the meantime: the
+ * scheduler finds no live task and does nothing. */
 void lkpi_prepare_to_sleep(void)
 {
 	lkpi_current()->wake_pending = 0;
@@ -162,7 +162,8 @@ int lkpi_wake_task(struct lkpi_task *t)
 	t->wake_pending = 1;
 	/* Without the runqueue: this runs from fence callbacks, and those run from
 	 * interrupt handlers. See scheduler_wake_task_norq. */
-	scheduler_wake_task_norq((usize)t->pid);
+	/* Back to b1nix's numbering; see the note in lkpi_current(). */
+	scheduler_wake_task_norq((usize)(t->pid - 1));
 	return 1;
 }
 
@@ -407,8 +408,21 @@ struct lkpi_task *lkpi_current(void)
 
 	struct task *cur = current_task;
 	if (cur) {
-		t->pid = (int)cur->id;
-		t->tgid = (int)cur->id;
+		/*
+		 * b1nix's task id PLUS ONE.
+		 *
+		 * Imported code treats the pid as an identity it can compare, and
+		 * zero is not one: btrfs stores the locking task's pid in a tree
+		 * block and reports "already locked by pid=0, extent tree corruption
+		 * detected" when a later lock finds its own pid there — which for the
+		 * boot task, whose id is 0, is every buffer that has just been
+		 * unlocked. Linux has no pid 0 for anything doing filesystem work
+		 * either; it is the idle task.
+		 *
+		 * lkpi_wake_task subtracts the one again.
+		 */
+		t->pid = (int)cur->id + 1;
+		t->tgid = (int)cur->id + 1;
 		const char *name = cur->name;
 		usize i = 0;
 		for (; name && name[i] && i < sizeof(t->comm) - 1; i++)

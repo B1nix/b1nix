@@ -52,4 +52,12 @@ static inline int request_module(const char *fmt, ...) { (void)fmt; return -1; }
 #define symbol_get(x) ((typeof(&x))NULL)
 #define symbol_put(x) do { } while (0)
 
+/* A filesystem's module alias, which userspace uses to autoload it by name.
+ * Nothing autoloads here — the filesystems are linked in — so it records
+ * nothing, but it appears at file scope and its absence is a syntax error. */
+#define MODULE_ALIAS_FS(name)
+#define MODULE_ALIAS(name)
+#define MODULE_ALIAS_MISCDEV(minor)
+#define MODULE_SOFTDEP(x)
+
 #endif

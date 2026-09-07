@@ -93,4 +93,48 @@ static inline u64 ktime_get_raw_ns(void) { return lkpi_ticks() * 10000000ull; }
 #define NSEC_PER_MSEC 1000000LL
 #endif
 
+/*
+ * NOT <linux/time64.h>: that header reaches <linux/types.h>, which reaches
+ * <linux/spinlock.h> — and this header is included directly by b1nix-side code
+ * that has already defined its own spinlock_t. The one type needed here is
+ * declared locally, guarded so whichever header is reached first wins.
+ */
+#ifndef LKPI_TIME64_T_DEFINED
+#define LKPI_TIME64_T_DEFINED
+typedef long long time64_t;
+#endif
+
+/* Declared, not defined: the full structure is in <linux/time64.h>, which this
+ * header must not reach (see above). Callers that pass one already have it. */
+struct timespec64;
+
+/*
+ * Wall-clock and monotonic reads a filesystem needs.
+ *
+ * `ktime_get_real_seconds` is wall clock — it goes into an inode timestamp and
+ * onto the disk, so it must be the real time and not the monotonic one, which
+ * starts at zero every boot. `ktime_get_ns` is monotonic and is for measuring
+ * intervals; using the wall clock there would make a commit interval jump when
+ * the clock is set.
+ */
+time64_t ktime_get_real_seconds(void);
+u64 ktime_get_ns(void);
+u64 ktime_get_seconds(void);
+void ktime_get_coarse_real_ts64(struct timespec64 *ts);
+void ktime_get_real_ts64(struct timespec64 *ts);
+
+/* Wall clock in nanoseconds, and a cycle counter for measuring short
+ * intervals. `get_cycles` is a raw counter with no fixed unit — btrfs uses it
+ * only as a source of entropy for its allocator's hashing, never as a time. */
+
+u64 ktime_get_real_ns(void);
+u64 get_cycles(void);
+
+/* timespec64_equal is in <linux/time64.h>, with the type it compares: this
+ * header is reached before that one in the include chain, so the struct is only
+ * a forward declaration here. */
+
+/* Sleep until a deadline, with the slack the caller can tolerate. */
+int schedule_hrtimeout(ktime_t *expires, int mode);
+
 #endif

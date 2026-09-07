@@ -4,6 +4,7 @@
  * M99 linuxkpi: completions. See kernel/include/lkpi/completion.h.
  */
 
+#include <lkpi/env.h>
 #include <b1nix/arch.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>

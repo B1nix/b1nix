@@ -84,4 +84,17 @@ static inline void bitmap_release_region(unsigned long *bitmap, unsigned int pos
 	for ((bit) = 0; (bit) < (size); (bit)++)                     \
 		if (test_bit((bit), (addr))) { } else
 
+/*
+ * Remove a range from a bitmap and shift what follows down over it, and find
+ * the next run of set bits.
+ *
+ * `bitmap_next_set_region` reports a RUN — first and last — rather than a
+ * single bit, which is what makes btrfs's subpage bitmap scan proportional to
+ * the number of runs rather than to the number of bits.
+ */
+void bitmap_cut(const unsigned long *src, unsigned long *dst,
+                unsigned int first, unsigned int cut, unsigned int nbits);
+void bitmap_next_set_region(unsigned long *bitmap, unsigned int *rs,
+                            unsigned int *re, unsigned int end);
+
 #endif

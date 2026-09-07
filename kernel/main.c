@@ -706,6 +706,72 @@ void kernel_main(usize arg0, usize arg1)
 	fwcfgfs_init();
 	b1nix_debugfs_init();
 	tarfs_init();
+#ifdef B1NIX_FS_IMPORT
+	/*
+	 * The imported btrfs.
+	 *
+	 * Its own entry point is `static` and reachable only through the wrapper
+	 * <linux/init.h> emits from its late_initcall — see the note there. It
+	 * registers the filesystem type, allocates its caches and creates
+	 * /sys/fs/btrfs; nothing is mounted by it.
+	 *
+	 * After sysfs_init, because it publishes into /sys, and after
+	 * blk_cache_init, because a mount will read through the block cache.
+	 */
+	{
+		extern int lkpi_initcall_init_btrfs_fs(void);
+		int rc = lkpi_initcall_init_btrfs_fs();
+
+#if B1NIX_FS_IMPORT_EXT4
+		/*
+		 * ext4, and the two things it stands on: jbd2 (its journal) and
+		 * mbcache (the xattr block deduplication its own registration
+		 * expects to be there). Order matters — ext4's init registers with
+		 * both.
+		 */
+		{
+			extern int lkpi_initcall_journal_init(void);
+			extern int lkpi_initcall_mbcache_init(void);
+			extern int lkpi_initcall_ext4_init_fs(void);
+			extern int lkpi_initcall_dquot_init(void);
+			extern int lkpi_initcall_init_v2_quota_format(void);
+			int jrc = lkpi_initcall_journal_init();
+			int mrc = lkpi_initcall_mbcache_init();
+
+			/*
+			 * Quotas, before ext4: a filesystem with the quota feature turns
+			 * them on during its own mount, and it can only find the v2
+			 * format if that format has already registered itself.
+			 */
+			{
+				int qrc = lkpi_initcall_dquot_init();
+				int frc = lkpi_initcall_init_v2_quota_format();
+
+				if (qrc != 0 || frc != 0)
+					klog_warn("lkpi-fs: quota core init failed");
+			}
+			int erc = (jrc == 0 && mrc == 0) ? lkpi_initcall_ext4_init_fs()
+			                                 : -22;
+
+			if (erc != 0)
+				klog_error("lkpi-fs: imported ext4 failed to initialise");
+			else
+				klog_info("lkpi-fs: imported ext4 registered");
+		}
+#endif
+
+		if (rc != 0) {
+			klog_error("lkpi-fs: imported btrfs failed to initialise");
+		} else {
+			extern void lkpifs_init(void);
+
+			klog_info("lkpi-fs: imported btrfs registered");
+			/* And the bridge, which is what lets an ordinary
+			 * `mount -t btrfs` serve paths from it. */
+			lkpifs_init();
+		}
+	}
+#endif
 	BOOTMARK(17);	/* sysfs */
 	/* module_init_builtin_deps() used to be called here. It now runs after the
 	 * root is mounted (see the note at its remaining call site): the modules
@@ -774,6 +840,52 @@ void kernel_main(usize arg0, usize arg1)
 		extern void fb_console_selftest(void);
 		fb_console_selftest();
 	}
+#ifdef B1NIX_FS_IMPORT
+	/*
+	 * The imported filesystem's proof: mount a real btrfs image.
+	 *
+	 * Here rather than beside the registration above because it needs the
+	 * block devices, and those are probed later in this function. The device
+	 * is named on the command line so the harness can attach whichever disk
+	 * it made — hard-coding one would tie the test to the harness's ordering.
+	 */
+	{
+		static char lkpi_fs_dev[32];
+
+		/* Returns 1 on a match, not 0: the value is copied only then. */
+		if (bootinfo_get_kv("b1nix.lkpi-btrfs-test", lkpi_fs_dev,
+		                    sizeof(lkpi_fs_dev)) == 1) {
+			extern void lkpi_btrfs_mount_test_thread(void *arg);
+			extern void lkpi_btrfs_mount_watch_thread(void *arg);
+
+			/*
+			 * In a thread, not inline.
+			 *
+			 * Mounting a btrfs filesystem starts its worker threads and waits
+			 * for them — open_ctree reads the chunk tree through its own
+			 * workers — and nothing can wait for a thread before the
+			 * scheduler is running. Called from here directly, the mount
+			 * reached the superblock and then stopped forever.
+			 *
+			 * The buffer is static for the same reason: the thread outlives
+			 * this stack frame.
+			 */
+			if (kthread_create("lkpi-btrfs-test",
+			                   lkpi_btrfs_mount_test_thread,
+			                   lkpi_fs_dev) < 0)
+				klog_error("lkpi-fs: could not start the btrfs mount test");
+			/*
+			 * A watchdog beside it: if the mount has not finished after
+			 * twenty seconds it is wedged, and the profile says where. A
+			 * wedged mount otherwise reports nothing at all — the thread is
+			 * running, so no wait shows up in the task dump.
+			 */
+			if (kthread_create("lkpi-btrfs-watch",
+			                   lkpi_btrfs_mount_watch_thread, 0) < 0)
+				klog_error("lkpi-fs: could not start the mount watchdog");
+		}
+	}
+#endif
 #if defined(B1NIX_I915) && B1NIX_I915
 	/*
 	 * M102a: Intel i915. The driver's module init registers its PCI driver,
@@ -1431,6 +1543,40 @@ void kernel_main(usize arg0, usize arg1)
 		/* btrfs, when a disk carrying one is attached: read a filesystem
 		 * mkfs.btrfs wrote and check what comes back. */
 		btrfs_selftest();
+#ifdef B1NIX_FS_IMPORT
+		/* The same thing through the bridge: b1nix's VFS mounting an
+		 * imported filesystem and serving paths from it. Here rather than
+		 * beside the import's own registration because it mounts by PATH,
+		 * and there is no /mnt until the root filesystem is up. */
+		{
+			static char lkpi_bridge_dev[32];
+
+			if (bootinfo_get_kv("b1nix.lkpi-bridge-test", lkpi_bridge_dev,
+			                    sizeof(lkpi_bridge_dev)) == 1) {
+				extern void lkpifs_selftest(const char *dev);
+
+				lkpifs_selftest(lkpi_bridge_dev);
+			}
+#if B1NIX_FS_IMPORT_EXT4
+			/* And the same over ext4, on its own device. */
+			if (bootinfo_get_kv("b1nix.lkpi-ext4-test", lkpi_bridge_dev,
+			                    sizeof(lkpi_bridge_dev)) == 1) {
+				extern void lkpifs_selftest_type(const char *dev,
+				                                 const char *fstype,
+				                                 const char *mnt);
+				extern void lkpi_btrfs_mount_watch_thread(void *arg);
+
+				/* The same watchdog the btrfs self-test uses: a mount that
+				 * wedges reports nothing on its own, and this turns "it
+				 * hangs" into a function name. */
+				kthread_create("lkpi-mount-watch",
+				               lkpi_btrfs_mount_watch_thread, 0);
+				lkpifs_selftest_type(lkpi_bridge_dev, "ext4-lkpi",
+				                     "/mnt/lkpi-ext4");
+			}
+#endif
+		}
+#endif
 		/* The nice/stride weighting, where the numbers live: the M46
 		 * userspace test can only observe the bias statistically. */
 		sched_nice_selftest();

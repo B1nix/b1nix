@@ -65,9 +65,13 @@ static inline void writeq(u64 v, volatile void *addr)
 	*(volatile u64 *)addr = v;
 }
 
-/* Ordering helpers with the names driver code uses. */
-static inline void wmb(void) { mem_sfence(); }
-static inline void rmb(void) { __asm__ volatile("lfence" ::: "memory"); }
-static inline void mb(void) { mem_mfence(); }
+/*
+ * The ordering helpers used to be defined here as functions — wmb(), rmb(),
+ * mb(). They are macros in <asm/barrier.h> now, which is where the
+ * architecture's answer belongs and which is also where the aarch64 spellings
+ * are; two definitions of the same three names, one of them x86-only, is a
+ * conflict waiting for whichever header is included second.
+ */
+#include <asm/barrier.h>
 
 #endif

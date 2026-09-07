@@ -89,9 +89,17 @@ MODULE_OUT_DIR := $(BUILD_DIR)/modules
 # port I/O, none of which exist on the aarch64 port (QEMU virt exposes no HDA
 # and this kernel has no PCI driver there). Shipping a module that can never
 # load just leaves a permanently unloadable file in /lib/modules.
-MODULE_NAMES := isofs ntfs btrfs hda ipv6 ndp ntp
+MODULE_NAMES := isofs ntfs hda ipv6 ndp ntp
 MODULE_KOS := $(patsubst %,$(MODULE_OUT_DIR)/%.ko,$(MODULE_NAMES))
 INITRAMFS_MODULES_INC := $(INC_DIR)/initramfs_modules.inc
+
+# The i915 display microcontroller's firmware, carried by the INITRAMFS and not
+# by the root filesystem: i915 probes at about one second and asks for it
+# there and then, while the root is not mounted until the second. Always
+# generated, because whether the build machine has the blob is not something
+# make can be told through a -D it does not watch — the generated file records
+# its own answer, and <kernel/fs/ramfs/initramfs.c> tests that.
+INITRAMFS_I915_DMC_INC := $(INC_DIR)/initramfs_i915_dmc.inc
 # M109: the initramfs /init of the switchroot instance — the PID 1 that mounts
 # the real root below / and hands over to BusyBox's switch_root.
 INITRAMFS_M109_SWITCHROOT_INC := $(INC_DIR)/initramfs_m109_switchroot.inc
@@ -257,6 +265,7 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_MODULES_INC) \
 	$(INITRAMFS_M109_SWITCHROOT_INC) \
+	$(INITRAMFS_I915_DMC_INC) \
 	$(INITRAMFS_LD_MUSL_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(AP_TRAMPOLINE_OFFSETS) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 endif
@@ -695,6 +704,13 @@ KERNEL_SOURCES += \
 	kernel/lkpi/devres.c \
 	kernel/lkpi/ida.c \
 	kernel/lkpi/lock.c \
+	kernel/lkpi/rwsem.c \
+	kernel/lkpi/crc32.c \
+	kernel/lkpi/filemap.c \
+	kernel/lkpi/fs_util.c \
+	kernel/lkpi/bio.c \
+	kernel/lkpi/fs_misc.c \
+	kernel/lkpi/iov_iter.c \
 	kernel/lkpi/env.c \
 	kernel/lkpi/dma_resv.c \
 	kernel/lkpi/linux_compat.c \
@@ -994,7 +1010,7 @@ I915_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(I915_IMPORT_SOURCES))
 # driver's include roots, so it is built with the driver's flags — minus -w,
 # because this file is ours and stays warning-clean.
 I915_SHIM_SOURCES := kernel/lkpi/i915_acpi.c kernel/lkpi/i915_display_probe.c \
-                     kernel/lkpi/i915_gt_probe.c
+                     kernel/lkpi/i915_gt_probe.c kernel/lkpi/i915_gmch.c
 I915_SHIM_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(I915_SHIM_SOURCES))
 I915_IMPORT_OBJECTS += $(I915_SHIM_OBJECTS)
 
@@ -1040,18 +1056,199 @@ else
 I915_IMPORT_OBJECTS :=
 endif
 
+# The two files whose CODE changes with the filesystem-import flags — main.c
+# runs the imported filesystems' entry points, and lkpifs.c registers a type per
+# filesystem in the link.
+#
+# Their own stamp rather than DRM_FLAGS_STAMP: that hash is computed near the
+# top of this file, before the import block appends -DB1NIX_FS_IMPORT* to
+# COMMON_CFLAGS, so it cannot see them. Without a stamp that does, switching
+# B1NIX_FS_IMPORT leaves a stale object behind and the link fails on a missing
+# initcall — or, worse, succeeds against the wrong one.
+FS_IMPORT_FLAGS_HASH := $(firstword $(shell printf '%s' \
+	'$(B1NIX_FS_IMPORT)' | cksum))
+FS_IMPORT_FLAGS_STAMP := $(BUILD_DIR)/.fs-import-flags-$(FS_IMPORT_FLAGS_HASH)
+
+$(FS_IMPORT_FLAGS_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(BUILD_DIR)/.fs-import-flags-*
+	@touch $@
+
+$(BUILD_DIR)/kernel/main.o: $(FS_IMPORT_FLAGS_STAMP)
+$(BUILD_DIR)/kernel/fs/lkpifs.o: $(FS_IMPORT_FLAGS_STAMP)
+
+
 .PHONY: kernel-dist i915-fetch bootstrap
 i915-fetch:
 	@sh tools/drm/fetch-i915.sh
+
+
+# ── linuxkpi-fs: btrfs, ext4 and jbd2, imported ───────────────────────────
+#
+# The imported filesystems, staged by tools/fs/fetch-linux-fs.sh and never
+# edited, exactly as the DRM import is.
+#
+# btrfs is ON by default on x86_64 when that tree is present, because it IS
+# b1nix's btrfs now: the driver that used to be here was 5000 lines of our own
+# reading of the on-disk format, and the imported one is the format's own
+# implementation, checked by the same self-test and by the host's btrfs check
+# afterwards. A machine without the staged sources builds without it and says
+# so at mount, the same way it does without the staged i915.
+FS_IMPORT_DIR := build/src/fs-6.6
+FS_IMPORT_GEN := build/src/fs-6.6-gen
+ifeq ($(ARCH),x86_64)
+ifneq ($(wildcard $(FS_IMPORT_DIR)/B1NIX-OBJECTS),)
+B1NIX_FS_IMPORT ?= btrfs
+endif
+endif
+B1NIX_FS_IMPORT ?= 0
+
+# B1NIX_FS_IMPORT=btrfs builds btrfs and what it stands on; =1 adds ext4 and
+# jbd2. The split is not arbitrary: btrfs needs the VFS, the page cache and the
+# bio layer, while ext4 and jbd2 additionally need buffer heads — a whole
+# subsystem of their own. Bringing btrfs up first means the shim is proven
+# against one filesystem before a second is added to the same link.
+ifneq ($(filter $(B1NIX_FS_IMPORT),1 btrfs),)
+# main.c is compiled with -DB1NIX_FS_IMPORT so it calls the filesystem's entry
+# point. make cannot see a -D change, so the stamp below is what rebuilds it.
+COMMON_CFLAGS += -DB1NIX_FS_IMPORT
+# The imported subsystems' own headers (jbd2, iomap, quota, ...) come last on
+# the include path, so a shim header of the same name still wins. It is added
+# for the WHOLE kernel, not just the imported files: <linux/fs.h> names
+# struct quota_info by value, and a super_block with two different layouts in
+# one link is not a thing to leave to luck.
+COMMON_CFLAGS += -I $(FS_IMPORT_DIR)/include -I $(FS_IMPORT_DIR)/include/uapi
+ifeq ($(B1NIX_FS_IMPORT),1)
+# ext4 and jbd2 are in this link as well, so main.c runs their entry points too.
+COMMON_CFLAGS += -DB1NIX_FS_IMPORT_EXT4=1
+else
+COMMON_CFLAGS += -DB1NIX_FS_IMPORT_EXT4=0
+endif
+# The b1nix side of the bridge (kernel/fs/lkpifs.c) calls into the imported
+# filesystem, so it is only built when that filesystem is in the link.
+KERNEL_SOURCES += kernel/fs/lkpifs.c
+FS_IMPORT_ALL_NAMES := $(shell cat $(FS_IMPORT_DIR)/B1NIX-OBJECTS 2>/dev/null)
+ifeq ($(B1NIX_FS_IMPORT),btrfs)
+# lib/maple_tree.c stays: btrfs uses it too, so it is not part of what ext4
+# brings with it.
+FS_IMPORT_NAMES := $(filter-out fs/ext4/% fs/jbd2/% fs/mbcache.c,$(FS_IMPORT_ALL_NAMES))
+else
+FS_IMPORT_NAMES := $(FS_IMPORT_ALL_NAMES)
+endif
+FS_IMPORT_SOURCES := $(foreach n,$(FS_IMPORT_NAMES),$(FS_IMPORT_DIR)/$(n))
+FS_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(FS_IMPORT_SOURCES))
+
+# The two pointer diagnostics are demoted here and nowhere else. Upstream builds
+# these filesystems with GCC, where both are warnings, and relies on it: a
+# `u64 *` handed a `loff_t *`, and a struct first named inside a
+# function-pointer parameter list. Both are upstream's own code and neither can
+# be fixed without editing it. See docs/linuxkpi-fs.md.
+#
+# The two generated headers are force-included: the tracepoint no-ops the
+# generator derived from the pinned source, and the forward declarations for
+# structs the imported headers name before defining.
+FS_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
+	-fno-stack-protector -fno-pic -mno-red-zone -w -g -MMD -MP \
+	-Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types \
+	$(FILE_PREFIX_MAP) \
+	-D__KERNEL__ -D__linux__ -DKBUILD_MODNAME='"b1nixfs"' \
+	-DCONFIG_X86=1 -DCONFIG_X86_64=1 \
+	-DCONFIG_PRINTK=1 \
+	-DCONFIG_QUOTA=1 -DCONFIG_QUOTA_TREE=1 -DCONFIG_QFMT_V2=1 \
+	-DCONFIG_QUOTACTL=1 \
+	-DB1NIX_FS_IMPORT=1 \
+	-DCONFIG_CPU_LITTLE_ENDIAN=1 -D__LITTLE_ENDIAN=1234 \
+	-D__BYTE_ORDER=1234 \
+	-isystem $(CLANG_RESOURCE_INC) \
+	-I kernel/include -I kernel/include/uapi \
+	-I $(FS_IMPORT_GEN) \
+	-I $(FS_IMPORT_DIR)/include -I $(FS_IMPORT_DIR)/include/uapi \
+	-I $(FS_IMPORT_DIR)/fs \
+	-include linux/compiler_types.h -include linux/types.h \
+	-include trace/events/b1nix-pasted.h -include b1nix-fwd.h
+
+# The imported filesystems' own flag stamp.
+#
+# DRM_FLAGS_STAMP is computed near the top of this file, before FS_IMPORT_CFLAGS
+# exists, so it cannot see a change to them — and make does not watch compiler
+# flags. Turning CONFIG_QUOTA on left every ext4 object built without it, and
+# ext4 said so at mount: "The kernel was not built with CONFIG_QUOTA".
+FS_IMPORT_CFLAGS_HASH := $(firstword $(shell printf '%s' \
+	'$(filter-out $(FILE_PREFIX_MAP),$(FS_IMPORT_CFLAGS))' | cksum))
+FS_IMPORT_CFLAGS_STAMP := $(BUILD_DIR)/.fs-import-cflags-$(FS_IMPORT_CFLAGS_HASH)
+
+$(FS_IMPORT_CFLAGS_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(BUILD_DIR)/.fs-import-cflags-*
+	@touch $@
+
+$(BUILD_DIR)/$(FS_IMPORT_DIR)/%.o: $(FS_IMPORT_DIR)/%.c $(DRM_FLAGS_STAMP) \
+                                   $(FS_IMPORT_CFLAGS_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(FS_IMPORT_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+
+# The compression libraries get a prelude that undefines `current` — see
+# <lkpi/fs-lib-prelude.h> for why it cannot be done with -U.
+# Our own code that implements the shim ON the Linux side.
+#
+# These files use `struct inode`, `struct address_space` and `struct folio`
+# directly, so they are compiled with the imported flags — the same headers the
+# filesystems see. That is what makes them able to implement the VFS rather
+# than mirror it.
+#
+# The rule for them is the boundary in <lkpi/env.h> read the other way: they
+# may include <linux/*> and <lkpi/*>, and never <b1nix/*>. Where they need a
+# b1nix service they call an lkpi_ function, which is declared in an lkpi
+# header and defined on the other side.
+#
+# -w is dropped for these: they ARE ours, and stay warning-clean.
+FS_LKPI_SOURCES := \
+	kernel/lkpi/fs_xattr.c \
+	kernel/lkpi/fs_quota.c \
+	kernel/lkpi/crypto_shash.c \
+	kernel/lkpi/fs_abi_check.c \
+	kernel/lkpi/fs_filemap.c \
+	kernel/lkpi/fs_inode.c \
+	kernel/lkpi/fs_dentry.c \
+	kernel/lkpi/fs_super.c \
+	kernel/lkpi/fs_file.c \
+	kernel/lkpi/fs_bdev.c \
+	kernel/lkpi/fs_support.c \
+	kernel/lkpi/fs_mount_test.c \
+	kernel/lkpi/fs_bridge.c \
+	kernel/lkpi/fs_buffer.c \
+	kernel/lkpi/fs_params.c
+
+FS_LKPI_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(FS_LKPI_SOURCES))
+FS_IMPORT_OBJECTS += $(FS_LKPI_OBJECTS)
+
+$(FS_LKPI_OBJECTS): $(BUILD_DIR)/%.o: %.c $(DRM_FLAGS_STAMP) \
+                                       $(FS_IMPORT_CFLAGS_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -w,$(FS_IMPORT_CFLAGS)) -Wall -Wextra $(ARCH_CFLAGS) \
+		-c $< -o $@
+
+$(BUILD_DIR)/$(FS_IMPORT_DIR)/lib/%.o: \
+	FS_IMPORT_CFLAGS := $(subst -include linux/types.h,-include lkpi/fs-lib-prelude.h,$(FS_IMPORT_CFLAGS))
+endif
+
+.PHONY: fs-fetch fs-probe
+fs-fetch:
+	@sh tools/fs/fetch-linux-fs.sh
+	@sh tools/fs/gen-shim-headers.sh
+fs-probe:
+	@sh tools/fs/probe-headers.sh --syntax
 
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES)) \
 	$(DRM_IMPORT_OBJECTS) \
+	$(FS_IMPORT_OBJECTS) \
 	$(I915_IMPORT_OBJECTS)
 KERNEL_DEPS := $(patsubst %.c,$(BUILD_DIR)/%.d,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.d,$(ASM_SOURCES)) $(MODULE_KOS:.ko=.d) \
-	$(DRM_IMPORT_OBJECTS:.o=.d) $(I915_IMPORT_OBJECTS:.o=.d)
+	$(DRM_IMPORT_OBJECTS:.o=.d) $(I915_IMPORT_OBJECTS:.o=.d) \
+	$(FS_IMPORT_OBJECTS:.o=.d)
 
 -include $(KERNEL_DEPS)
 
@@ -1112,7 +1309,7 @@ KALLSYMS_O := $(BUILD_DIR)/kallsyms.o
 # pass-1 addresses it records remain correct in the final image.
 $(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT) tools/kernel/gen_kallsyms.sh
 	@mkdir -p $(dir $@)
-	$(LD) $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -o $@.stage1 $(OBJECTS)
+	$(LD) $(ARCH_LDFLAGS) $(LD_ERROR_LIMIT) -T $(LINKER_SCRIPT) -o $@.stage1 $(OBJECTS)
 	NM='$(NM)' sh tools/kernel/gen_kallsyms.sh $@.stage1 > $(KALLSYMS_S)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $(KALLSYMS_S) -o $(KALLSYMS_O)
 	$(LD) $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $(OBJECTS) $(KALLSYMS_O)
@@ -1134,6 +1331,9 @@ $(B1NIX_I915_STAMP):
 	@mkdir -p $(dir $@)
 	@rm -f $(BUILD_DIR)/.b1nix-i915-*
 	@touch $@
+# main.c calls the imported filesystem's entry point only when it is in the
+# build, so it has to be rebuilt when that changes — the same reason the i915
+# stamp exists.
 $(BUILD_DIR)/kernel/main.o: $(B1NIX_I915_STAMP)
 
 # ── M95/M96: loadable kernel modules ──────────────────────────────────────
@@ -1148,14 +1348,19 @@ MODULE_CFLAGS := $(COMMON_CFLAGS) $(ARCH_CFLAGS) -DMODULE
 # multi-file objects are. A single-source module still produces exactly one
 # compile and no link.
 #
-# The two headers are named explicitly rather than left to the generated .d
+# The three headers are named explicitly rather than left to the generated .d
 # file: the vermagic a module is stamped with comes from <b1nix/version.h>
 # through <b1nix/module.h>, and on the build that first creates a .ko there is
 # no .d yet to record that. A version bump then left ndp.ko and ntp.ko stamped
 # with the previous release, the loader rejected them (-8), and six module
 # checks failed against modules that were simply never recompiled.
+#
+# <b1nix/vfs.h> is there for the same reason and a worse failure: a module
+# filesystem embeds struct vfs_inode, so a field added to it changes a layout
+# the module was compiled against. Without this the btrfs module kept its old
+# layout and the blk lane died in mkdir inside the module.
 define B1NIX_MODULE_RULE
-$$(MODULE_OUT_DIR)/$(1).ko: $(2) kernel/include/b1nix/module.h kernel/include/b1nix/version.h
+$$(MODULE_OUT_DIR)/$(1).ko: $(2) kernel/include/b1nix/module.h kernel/include/b1nix/version.h kernel/include/b1nix/vfs.h
 	@mkdir -p $$(dir $$@)
 	@set -e; objs=""; \
 	for src in $(2); do \
@@ -1174,7 +1379,6 @@ endef
 
 $(eval $(call B1NIX_MODULE_RULE,isofs,kernel/fs/isofs/isofs.c))
 $(eval $(call B1NIX_MODULE_RULE,ntfs,kernel/fs/ntfs/ntfs.c))
-$(eval $(call B1NIX_MODULE_RULE,btrfs,kernel/fs/btrfs/btrfs.c kernel/fs/btrfs/btrfs_write.c))
 $(eval $(call B1NIX_MODULE_RULE,hda,kernel/dev/hda.c))
 $(eval $(call B1NIX_MODULE_RULE,ipv6,kernel/net/ipv6.c))
 $(eval $(call B1NIX_MODULE_RULE,ndp,kernel/net/ndp.c))
@@ -1618,6 +1822,19 @@ $(CACERT_PEM): tools/images/fetch-cacert.sh
 $(INITRAMFS_CACERT_INC): $(CACERT_PEM)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_cacert_pem $(CACERT_PEM) > $@
+
+$(INITRAMFS_I915_DMC_INC): tools/drm/stage-i915-firmware.sh
+	@mkdir -p $(dir $@) $(BUILD_DIR)/fw
+	@sh tools/drm/stage-i915-firmware.sh $(BUILD_DIR)/fw
+	@if [ -f $(BUILD_DIR)/fw/lib/firmware/i915/kbl_dmc_ver1_04.bin ]; then \
+		xxd -i -n vfs_i915_dmc \
+			$(BUILD_DIR)/fw/lib/firmware/i915/kbl_dmc_ver1_04.bin > $@.tmp; \
+		echo '#define B1NIX_I915_DMC_PRESENT 1' >> $@.tmp; \
+	else \
+		printf 'static const unsigned char vfs_i915_dmc[1] = {0};\n' > $@.tmp; \
+		printf '/* no i915 firmware on the build machine */\n' >> $@.tmp; \
+	fi
+	@mv -f $@.tmp $@
 
 $(INITRAMFS_TESTWAV_INC): tools/images/gen_test_wav.py
 	@mkdir -p $(dir $@)
@@ -2401,6 +2618,11 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@# thing nobody can review.
 	@sh tools/images/mk-btrfs-test-image.sh $(BUILD_DIR) || true
 	@if [ -f $(BUILD_DIR)/btrfs-test.img ]; then $(CIC) $(BUILD_DIR)/btrfs-test.img $(BUILD_DIR)/rootfs/btrfs-test.img; fi
+	@# And an ISO 9660 one, for the module tests: what they check is that a
+	@# mounted filesystem pins the module providing it, and btrfs stopped being
+	@# a module when the imported implementation replaced ours.
+	@sh tools/images/mk-isofs-test-image.sh $(BUILD_DIR) || true
+	@if [ -f $(BUILD_DIR)/isofs-test.img ]; then $(CIC) $(BUILD_DIR)/isofs-test.img $(BUILD_DIR)/rootfs/isofs-test.img; fi
 	@# Self-contained TLS test PKI. The loopback HTTPS smokes (M32 curl, M53
 	@# NetSurf-over-TLS) verify the server cert against this CA, so the PEMs
 	@# have to exist in the rootfs the tests actually run against.
@@ -2488,10 +2710,27 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@if [ -f userspace/build/$(ARCH)/bin/m69_plugin.so ]; then \
 		$(CIC) userspace/build/$(ARCH)/bin/m69_plugin.so $(BUILD_DIR)/rootfs/lib/m69_plugin.so; \
 	fi
-	@# M104: Linux-PAM (from Alpine packages) — libpam.so.0 is staged by the
-	@# generic pkg loop above. Stage security/*.so modules into rootfs/lib/security
-	@# and write PAM policy files.
+	@# The i915 display microcontroller's firmware, when the build machine has
+	@# it. Without it the driver disables runtime power management at probe and
+	@# says so; the blobs are Intel's and are taken from the host rather than
+	@# committed here (see the script).
+ifeq ($(B1NIX_I915),1)
+	@sh tools/drm/stage-i915-firmware.sh $(BUILD_DIR)/rootfs
+endif
+	@# M104: Linux-PAM (from Alpine packages). The library itself is staged
+	@# HERE, beside its modules, and not left to the generic pkg loop: that loop
+	@# copies from the package root of the image being built, and pam belongs to
+	@# no group's root, so libpam.so.0 only ever reached the rootfs as a leftover
+	@# from a KDE build — and prune-optional-roots.sh took it back out again the
+	@# moment the roots were re-staged, leaving every pam module and
+	@# /sbin/unix_chkpwd in the image with nothing to link against.
 	@mkdir -p $(BUILD_DIR)/rootfs/lib/security $(BUILD_DIR)/rootfs/etc/pam.d $(BUILD_DIR)/rootfs/include/security
+	@if [ -d build/$(ARCH)/pkg/pam/lib ]; then \
+		for f in build/$(ARCH)/pkg/pam/lib/lib*.so*; do \
+			[ -e "$$f" ] || continue; \
+			$(CIC) "$$f" $(BUILD_DIR)/rootfs/lib/; \
+		done; \
+	fi
 	@if [ -d build/$(ARCH)/pkg/pam/lib/security ]; then \
 		$(CIC) build/$(ARCH)/pkg/pam/lib/security/*.so $(BUILD_DIR)/rootfs/lib/security/; \
 	fi

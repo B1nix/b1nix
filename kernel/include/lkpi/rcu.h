@@ -113,4 +113,9 @@ void rcu_init(void);
 	do { synchronize_rcu(); lkpi_kfree(ptr); } while (0)
 #define kvfree_rcu(ptr, rcu_member) kfree_rcu(ptr, rcu_member)
 
+/* The single-argument form: free after a grace period, from a context that may
+ * sleep, without the object having to carry an rcu_head. Upstream can wait for
+ * the grace period inline here, and so does this. */
+#define kfree_rcu_mightsleep(ptr) do { synchronize_rcu(); lkpi_kfree(ptr); } while (0)
+
 #endif

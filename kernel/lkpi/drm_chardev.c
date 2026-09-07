@@ -27,6 +27,10 @@
  * its own without this file changing.
  */
 
+/* poll(2) constants and poll_table. They used to arrive through
+ * <linux/types.h>; that include was removed when fs.h became the full VFS —
+ * see the note there — so the users name it themselves now. */
+#include <linux/poll.h>
 #include <linux/pci.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>

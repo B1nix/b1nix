@@ -8,8 +8,12 @@
  * firmware left it. */
 struct pci_dev;
 enum vga_switcheroo_state { VGA_SWITCHEROO_OFF, VGA_SWITCHEROO_ON };
+/* Zero, which is what upstream returns when VGA switcheroo is not configured:
+ * there is no mux, so registering with it is a no-op rather than a failure.
+ * Reporting -ENODEV made i915 print "Failed to register vga switcheroo!" on a
+ * machine that has nothing to switch. */
 static inline int vga_switcheroo_register_client(struct pci_dev *d, const void *o, bool m)
-{ (void)d; (void)o; (void)m; return -ENODEV; }
+{ (void)d; (void)o; (void)m; return 0; }
 static inline void vga_switcheroo_unregister_client(struct pci_dev *d) { (void)d; }
 static inline void vga_switcheroo_client_fb_set(struct pci_dev *d, void *i)
 { (void)d; (void)i; }

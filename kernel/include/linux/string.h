@@ -128,4 +128,43 @@ usize strnlen(const char *s, usize maxlen);
 /* Append with a total-size bound, returning the length it tried to build. */
 usize strlcat(char *dst, const char *src, usize size);
 
+/* Advance past leading whitespace, returning a pointer into the SAME string —
+ * not a copy. Both filesystems use it while walking a mount-option list they
+ * are also writing NULs into. */
+char *skip_spaces(const char *str);
+size_t strcspn(const char *s, const char *reject);
+size_t strspn(const char *s, const char *accept);
+char *strpbrk(const char *cs, const char *ct);
+char *strsep(char **s, const char *ct);
+char *strim(char *s);
+char *strreplace(char *str, char old, char new);
+/* Copy with truncation, returning the length of the SOURCE — so a caller can
+ * tell that truncation happened. strscpy returns the copied length or -E2BIG,
+ * which is the interface to prefer for exactly that reason. */
+size_t strlcpy(char *dest, const char *src, size_t size);
+ssize_t strscpy(char *dest, const char *src, size_t count);
+void *kmemdup(const void *src, size_t len, gfp_t gfp);
+char *kstrdup(const char *s, gfp_t gfp);
+char *kstrndup(const char *s, size_t max, gfp_t gfp);
+int match_string(const char * const *array, size_t n, const char *string);
+
+#include <linux/kstrtox.h>
+
+/* The base name of a path, without copying: a pointer into the SAME string. */
+const char *kbasename(const char *path);
+/* Duplicate at most `len` bytes and always NUL-terminate — which is the
+ * difference from kmemdup, and the reason it exists: an on-disk name is not
+ * terminated, and treating it as if it were reads past the record. */
+char *kmemdup_nul(const char *s, size_t len, gfp_t gfp);
+
+/* Zero from a member to the end of a struct. The point is that it is computed
+ * from the type, so adding a field at the end is covered automatically — a
+ * hand-written sizeof would silently stop covering it. */
+#define memset_startat(obj, v, member)                                        \
+	memset((char *)(obj) + offsetof(__typeof__(*(obj)), member), (v),         \
+	       sizeof(*(obj)) - offsetof(__typeof__(*(obj)), member))
+#define memset_after(obj, v, member)                                          \
+	memset((char *)(obj) + offsetofend(__typeof__(*(obj)), member), (v),      \
+	       sizeof(*(obj)) - offsetofend(__typeof__(*(obj)), member))
+
 #endif

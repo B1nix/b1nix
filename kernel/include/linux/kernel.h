@@ -2,6 +2,7 @@
 #ifndef LKPI_LINUX_KERNEL_H
 #define LKPI_LINUX_KERNEL_H
 
+#include <linux/cache.h>
 #include <b1nix/types.h>
 #include <linux/atomic.h>
 #include <linux/bitops.h>
@@ -25,18 +26,30 @@
  */
 
 /*
- * Kconfig tests. b1nix has no Kconfig, so every option imported source asks
- * about is off. That is a statement about the build, not a stub: an option
- * reported on that is not implemented would be far worse than one reported off.
+ * Kconfig tests.
+ *
+ * b1nix has no Kconfig file; what it has is the -D list in the Makefile, and
+ * an option is on exactly when that list defines it as 1. This is upstream's
+ * own trick for asking that question in the preprocessor, and it is here
+ * because answering 0 to everything is not honest once the build really does
+ * turn options on: ext4 refused to mount a filesystem with quotas saying "the
+ * kernel was not built with CONFIG_QUOTA" while dquot.c sat in the same image.
  */
-#define IS_ENABLED(cfg)  0
+#define __ARG_PLACEHOLDER_1 0,
+#define __take_second_arg(__ignored, val, ...) val
+#define ____is_defined(arg1_or_junk) __take_second_arg(arg1_or_junk 1, 0)
+#define ___is_defined(val) ____is_defined(__ARG_PLACEHOLDER_##val)
+#define __is_defined(x) ___is_defined(x)
+
+#define IS_ENABLED(cfg)  __is_defined(cfg)
 
 /* Kconfig values imported code reads directly rather than through IS_ENABLED.
  * The defaults are upstream's own. */
 #define CONFIG_DRM_FBDEV_OVERALLOC 100
-#define IS_BUILTIN(cfg)  0
+/* Everything b1nix builds is built in; nothing imported is a module here. */
+#define IS_BUILTIN(cfg)  IS_ENABLED(cfg)
 #define IS_MODULE(cfg)   0
-#define IS_REACHABLE(cfg) 0
+#define IS_REACHABLE(cfg) IS_ENABLED(cfg)
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -46,6 +59,13 @@
 		__typeof__(b) __b = (b);     \
 		__a < __b ? __a : __b;       \
 	})
+
+/* The smaller of two values, ignoring a zero — "no limit" is spelled 0 in the
+ * quota code, and a plain min() would make it the tightest limit there is. */
+#define min_not_zero(x, y) ({            \
+	typeof(x) __x = (x);                 \
+	typeof(y) __y = (y);                 \
+	__x == 0 ? __y : (__y == 0 ? __x : min(__x, __y)); })
 
 #define max(a, b)                    \
 	({                               \
@@ -274,5 +294,66 @@ static inline bool test_taint(unsigned flag) { (void)flag; return false; }
 /* Static keys travel with the kernel interface for the sources that use them;
  * i915_memcpy.c defines one without including <linux/jump_label.h> itself. */
 #include <linux/jump_label.h>
+
+/*
+ * Is [val, val+len) inside [start, start+size)?
+ *
+ * Written as one helper because the by-hand form is where an off-by-one lives:
+ * the end of a range is start+size, exclusive, and a `<=` there admits one
+ * element past it. btrfs checks every on-disk offset it reads through this.
+ */
+static inline bool in_range64(u64 val, u64 start, u64 len)
+{
+	return val >= start && val < start + len;
+}
+#define in_range(val, start, len) in_range64((u64)(val), (u64)(start), (u64)(len))
+
+/*
+ * A size with an optional K/M/G/T suffix, as a mount option or a sysfs write
+ * spells it. Returns the value and, through `retptr`, where it stopped — a
+ * caller checks that to reject trailing junk, which is the difference between
+ * accepting "16M" and accepting "16Mb-please".
+ */
+unsigned long long memparse(const char *ptr, char **retptr);
+
+#ifndef ULLONG_MAX
+#define ULLONG_MAX (~0ULL)
+#endif
+#ifndef ULONG_MAX
+#define ULONG_MAX  (~0UL)
+#endif
+
+#define high_16_bits(x) (((x) & 0xFFFF0000) >> 16)
+#define low_16_bits(x)  ((x) & 0xFFFF)
+
+/* Set some bits and clear others in one atomic step, returning whether the
+ * word changed. Two separate operations would let a concurrent reader see the
+ * half-updated value — which for an inode's flags is a file that is briefly
+ * neither immutable nor mutable. */
+bool set_mask_bits(unsigned long *ptr, unsigned long mask, unsigned long bits);
+
+/* Print the current call stack. Real: it is what a filesystem calls when it
+ * finds an inconsistency it is going to continue past, and a silent version
+ * would throw away the only evidence. */
+void dump_stack(void);
+
+/* How the machine is doing overall, so a filesystem can tell an ordinary
+ * unmount from one during shutdown and skip work that only matters if the
+ * machine keeps running. */
+enum system_states {
+	SYSTEM_BOOTING,
+	SYSTEM_SCHEDULING,
+	SYSTEM_FREEING_INITMEM,
+	SYSTEM_RUNNING,
+	SYSTEM_HALT,
+	SYSTEM_POWER_OFF,
+	SYSTEM_RESTART,
+	SYSTEM_SUSPEND,
+};
+extern enum system_states system_state;
+
+/* Unaligned loads and stores. Declared here as well as in <asm/unaligned.h>
+ * because btrfs reads on-disk fields from files that include neither. */
+#include <asm/unaligned.h>
 
 #endif

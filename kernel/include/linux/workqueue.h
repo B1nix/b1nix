@@ -36,6 +36,12 @@
 /* A work item living on the caller's stack. b1nix tracks no per-item debug
  * state, so it initialises exactly like any other. */
 #define INIT_WORK_ONSTACK(w, f)      INIT_WORK(w, f)
+/* A work item defined at file scope with its function already set. */
+#define DECLARE_WORK(name, function)  struct work_struct name = { .func = (function) }
+/* The delayed form, likewise defined where it stands. The timer half is set up
+ * on the first schedule, so only the function has to be recorded here. */
+#define DECLARE_DELAYED_WORK(name, function) \
+	struct delayed_work name = { .work = { .func = (function) } }
 #define destroy_work_on_stack(w)     do { (void)(w); } while (0)
 #define cancel_work_sync(w)         flush_work(w)
 #define cancel_delayed_work_sync(d) (cancel_delayed_work(d), flush_work(&(d)->work))
@@ -61,7 +67,11 @@ static inline struct work_struct *current_work(void) { return 0; }
  * caller depends on that property. */
 /* Every queue here owns one thread and runs its items in order, so "ordered" is
  * what they all already are. */
-#define alloc_ordered_workqueue(fmt, flags, ...) alloc_workqueue(fmt, flags, 1)
+/* The name is a FORMAT here too, and its arguments have to reach it: dropping
+ * them left vsnprintf reading whatever followed on the stack, and two of
+ * btrfs's queues came out with binary names. */
+#define alloc_ordered_workqueue(fmt, flags, ...) \
+	alloc_workqueue(fmt, flags, 1, ##__VA_ARGS__)
 #define WQ_MEM_RECLAIM 0
 #define WQ_HIGHPRI     0
 #define WQ_FREEZABLE   0
@@ -104,5 +114,46 @@ bool queue_rcu_work(struct workqueue_struct *wq, struct rcu_work *rwork);
 #define INIT_DELAYED_WORK_ONSTACK(dwork, func) INIT_DELAYED_WORK(dwork, func)
 static inline void destroy_delayed_work_on_stack(struct delayed_work *work)
 { (void)work; }
+
+/*
+ * `alloc_workqueue` takes a FORMAT string upstream — btrfs names its queues
+ * "btrfs-%s" and passes the subsystem — so the call has more arguments than
+ * lkpi's three. The name is formatted rather than dropped: it is what a queue
+ * dump identifies a stuck queue by, and fourteen queues all called "btrfs-%s"
+ * identify nothing.
+ */
+struct workqueue_struct *lkpi_alloc_workqueue(const char *fmt,
+                                              unsigned int flags,
+                                              int max_active, ...);
+#define alloc_workqueue(fmt, flags, max_active, ...) \
+	lkpi_alloc_workqueue((fmt), (flags), (max_active), ##__VA_ARGS__)
+
+/* Raise or lower how many items may run at once. btrfs tunes this as its
+ * thread pools grow, so it changes behaviour rather than being advisory. */
+void workqueue_set_max_active(struct workqueue_struct *wq, int max_active);
+/* Is this work item queued or running anywhere? */
+unsigned int work_busy(struct work_struct *work);
+
+/*
+ * Queue flags.
+ *
+ * WQ_MEM_RECLAIM is the one that is not a hint: it promises a rescuer thread so
+ * that work on this queue can run even when the allocator cannot make progress
+ * — which is exactly the situation a filesystem's writeback queue exists to get
+ * out of. lkpi's workqueue runs items on threads that are already created, so
+ * the promise holds for the same reason rather than through a rescuer.
+ */
+#ifndef WQ_UNBOUND
+#define WQ_UNBOUND     (1 << 1)
+#define WQ_FREEZABLE   (1 << 2)
+#define WQ_MEM_RECLAIM (1 << 3)
+#define WQ_HIGHPRI     (1 << 4)
+#define WQ_CPU_INTENSIVE (1 << 5)
+#define WQ_SYSFS       (1 << 6)
+#define WQ_POWER_EFFICIENT (1 << 7)
+#endif
+
+#define system_unbound_wq  lkpi_system_wq()
+#define system_freezable_wq lkpi_system_wq()
 
 #endif

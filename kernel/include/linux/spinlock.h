@@ -127,4 +127,34 @@ static inline bool refcount_dec_and_lock_irqsave(refcount_t *r, spinlock_t *lock
 	return false;
 }
 
+/*
+ * Reader/writer spinlocks.
+ *
+ * `rwlock_t` is the same underlying lock as `spinlock_t` here (see the typedef
+ * above), so a read lock excludes other readers too. That is stricter than
+ * Linux, never weaker — the guarded state is always safe — and it costs
+ * concurrency on ext4's extent-status tree, which is where it would be worth
+ * paying for a real one.
+ *
+ * `write_trylock` must be able to FAIL: ext4 uses it to bail out of a shrink
+ * pass rather than wait, and a version that always succeeded would take a lock
+ * the caller expected not to get.
+ */
+/*
+ * Macros, not functions: `rwlock_t` is the same type as `spinlock_t` above, so
+ * a function taking one would have the same signature as the spinlock
+ * operation it forwards to — a redefinition rather than a wrapper.
+ */
+#define rwlock_init(l)   spin_lock_init(l)
+#define read_lock(l)     spin_lock(l)
+#define read_unlock(l)   spin_unlock(l)
+#define write_lock(l)    spin_lock(l)
+#define write_unlock(l)  spin_unlock(l)
+#define write_trylock(l) spin_trylock(l)
+#define read_trylock(l)  spin_trylock(l)
+#define read_lock_irqsave(l, f)       spin_lock_irqsave(l, &(f))
+#define read_unlock_irqrestore(l, f)  spin_unlock_irqrestore(l, f)
+#define write_lock_irqsave(l, f)      spin_lock_irqsave(l, &(f))
+#define write_unlock_irqrestore(l, f) spin_unlock_irqrestore(l, f)
+
 #endif

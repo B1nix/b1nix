@@ -57,4 +57,40 @@ struct pin_cookie { int unused; };
 #define lockdep_set_class(lock, key)      do { } while (0)
 #define lockdep_set_class_and_name(l, k, n) do { } while (0)
 
+/*
+ * How many nesting classes a lock may be given. b1nix has no lockdep, so a
+ * subclass records nothing — but btrfs derives ARRAY SIZES from this constant
+ * (its tree-lock nesting levels are checked against it), so the value has to be
+ * upstream's rather than convenient.
+ */
+#ifndef MAX_LOCKDEP_SUBCLASSES
+#define MAX_LOCKDEP_SUBCLASSES 8UL
+#endif
+
+/*
+ * The lockdep annotations a filesystem makes by hand.
+ *
+ * jbd2 hands the journal's "transaction is open" state to lockdep as if it were
+ * a rwsem, so a deadlock through it is reported like any other. There is no
+ * lockdep here, so the annotations record nothing — but they must exist,
+ * because they appear on paths that are compiled either way and an
+ * implicitly-declared one links against nothing.
+ */
+#define rwsem_acquire(l, s, t, i)      do { } while (0)
+#define rwsem_acquire_read(l, s, t, i) do { } while (0)
+#define rwsem_release(l, i)            do { } while (0)
+#define lock_map_acquire(l)            do { } while (0)
+#define lock_map_release(l)            do { } while (0)
+#define lockdep_assert_held_write(l)   do { (void)(l); } while (0)
+#define lockdep_assert_held_read(l)    do { (void)(l); } while (0)
+#define lockdep_assert_not_held(l)     do { (void)(l); } while (0)
+#define lockdep_is_held(l)             1
+#define lockdep_is_held_type(l, r)     1
+
+/* Whether the caller holds a given lock. With no lockdep there is nothing to
+ * consult, and the answer is the one that makes an assertion pass rather than
+ * fail — a false negative here would abort a correct caller. */
+#define lock_is_held(l)      1
+#define lock_is_held_type(l, r) 1
+
 #endif

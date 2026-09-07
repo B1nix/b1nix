@@ -359,6 +359,15 @@ struct kobject *kobject_create_and_add(const char *name, struct kobject *parent)
 
 	if (!kobj)
 		return 0;
+	/*
+	 * Zero it. kobject_init() below sets the name, the parent and the
+	 * refcount, and leaves everything else as it found it — which on a plain
+	 * allocation is whatever the heap last held there. `sysfs` is the one
+	 * that matters: a garbage directory pointer there sends the very next
+	 * sysfs_remove_link() into freed memory, and btrfs's unmount took a
+	 * general-protection fault in it about one run in four.
+	 */
+	memset(kobj, 0, sizeof(*kobj));
 	lkpi_kobject_init_and_add(kobj, name, parent, kobject_dynamic_release);
 	return kobj;
 }
