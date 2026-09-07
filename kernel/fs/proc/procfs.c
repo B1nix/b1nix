@@ -937,6 +937,25 @@ static int r_mountinfo(usize pid, struct sbuf *s) {
  * to report (a browser start-up that takes 95 s took 337 s with it on). A
  * reader that asks for the numbers when it wants them costs nothing in
  * between, so a script can take one sample per run and compare runs. */
+/* /proc/b1nix-kprof — the kernel-RIP histogram alone.
+ *
+ * b1nix-prof prints everything: the syscall table, the page-fault profile, the
+ * interrupts-off sections, the inode waits. That is the right thing to read
+ * once, and the wrong thing to sample repeatedly while something is running --
+ * the read itself took over a minute through the console and changed the
+ * behaviour being measured. This one is thirty lines and can be taken every
+ * few seconds. */
+static int r_b1nix_kprof(usize pid, struct sbuf *s) {
+  (void)pid;
+  (void)s;
+  {
+    extern void kprof_dump_histogram_pub(void);
+
+    kprof_dump_histogram_pub();
+  }
+  return 0;
+}
+
 static int r_b1nix_prof(usize pid, struct sbuf *s) {
   (void)pid;
   extern void syscall_prof_dump(void);
@@ -3028,6 +3047,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
   procfs_mkchild(root, "b1nix-prof", VFS_DEVICE, r_b1nix_prof, 0);
+  procfs_mkchild(root, "b1nix-kprof", VFS_DEVICE, r_b1nix_kprof, 0);
   procfs_mkchild(root, "b1nix-tasks", VFS_DEVICE, r_b1nix_tasks, 0);
   procfs_mkchild(root, "b1nix-kheap", VFS_DEVICE, r_b1nix_kheap, 0);
   /* M107: /proc/kmsg — the same record stream as /dev/kmsg. klogd reads this

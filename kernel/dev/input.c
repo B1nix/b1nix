@@ -10,10 +10,12 @@
  * queue (evdev semantics: concurrent readers each see the full stream);
  * pushes fan out to all open clients and drop the oldest event on overflow.
  * Blocking reads use the stty yield-loop pattern (signal-interruptible);
- * blocking poll() is woken by the periodic vfs_poll_chan tick wake. */
+ * blocking poll() is woken by input_event_push, like every other device that
+ * feeds poll(). */
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/input.h>
+#include <b1nix/ktime.h>
 #include <b1nix/mm.h>
 #include <b1nix/posix.h>
 #include <b1nix/sched.h>
@@ -165,9 +167,29 @@ static u32 ring_next(u32 v) { return (v + 1) % INPUT_QUEUE_EVENTS; }
 
 /* ── producer side ── */
 
+/* Events that arrived, and how many found a reader.
+ *
+ * "The desktop is frozen" and "the desktop never heard the mouse" look
+ * identical from in front of the monitor, and the difference decides where to
+ * look next. QEMU's input-linux objects only forward the host's devices while
+ * the grab is on, so a run with no events at all is a grab that was never
+ * taken, not a stall. */
+static u64 input_stat_pushed, input_stat_delivered, input_stat_dropped;
+
+void input_event_counts(u64 *pushed, u64 *delivered, u64 *dropped) {
+  if (pushed)
+    *pushed = __atomic_load_n(&input_stat_pushed, __ATOMIC_RELAXED);
+  if (delivered)
+    *delivered = __atomic_load_n(&input_stat_delivered, __ATOMIC_RELAXED);
+  if (dropped)
+    *dropped = __atomic_load_n(&input_stat_dropped, __ATOMIC_RELAXED);
+}
+
 void input_event_push(int dev, u16 type, u16 code, i32 value) {
   if (dev < 0 || dev >= INPUT_NDEVS || !devs[dev].registered)
     return;
+
+  __atomic_fetch_add(&input_stat_pushed, 1u, __ATOMIC_RELAXED);
 
   struct b1nix_input_event ev;
   ev.time_ticks = scheduler_get_uptime_ticks();
@@ -175,20 +197,78 @@ void input_event_push(int dev, u16 type, u16 code, i32 value) {
   ev.code = code;
   ev.value = value;
 
+  /* A key or a button is a decision and must reach its reader now. Pointer
+   * motion is not: the screen cannot show more than one position per frame,
+   * and a client redraws once per frame however many times it was told the
+   * pointer moved. So motion wakes are spaced, and everything else is not.
+   *
+   * The number is a frame at 120 Hz -- twice the panel's rate, so no frame can
+   * be built from a stale position, and still eight times fewer wakes than a
+   * gaming mouse's report rate produces. */
+#define INPUT_MOTION_WAKE_MS 8
+  static u64 last_motion_wake_ms;
+  static int report_has_key; /* set by a key/button, read by its SYN */
+  int urgent;
+
+  if (type == B1NIX_EV_KEY)
+    report_has_key = 1;
+  urgent = (type == B1NIX_EV_SYN) ? report_has_key : 0;
+  if (type == B1NIX_EV_SYN)
+    report_has_key = 0;
+  u64 now_ms = ktime_monotonic_ns() / 1000000ull;
   u64 flags;
+  int was_empty = 0;
+
   spin_lock_irqsave(&input_lock, &flags);
   for (int i = 0; i < INPUT_MAX_CLIENTS; i++) {
     struct input_client *c = devs[dev].clients[i];
     if (!c)
       continue;
+    if (c->head == c->tail)
+      was_empty = 1; /* this client has nothing pending: a wake will be needed */
     if (ring_next(c->tail) == c->head) { /* full: drop oldest */
       c->head = ring_next(c->head);
       c->dropped++;
+      input_stat_dropped++;
     }
     c->ring[c->tail] = ev;
     c->tail = ring_next(c->tail);
+    input_stat_delivered++;
   }
   spin_unlock_irqrestore(&input_lock, flags);
+
+  /* Wake whoever is polling, once per finished report.
+   *
+   * Every other device that feeds poll() wakes on new data -- pipes, the DRM
+   * event queue, the vts, kmsg, inotify -- and input did not: the comment at
+   * the top of this file described a reader as being woken by "the periodic
+   * vfs_poll_chan tick wake" instead. A compositor blocked in poll() on
+   * /dev/input/eventN therefore slept until something unrelated happened to
+   * wake that channel. Measured on the panel: 1713 events arrived in a second
+   * of which 1351 were dropped for a full ring, with the machine 97% idle and
+   * the screen not updating for three seconds.
+   *
+   * The wake belongs on EV_SYN and not on every event: a mouse in motion
+   * sends an axis event per axis and then the SYN that ends the report, and a
+   * reader cannot act on half a report.
+   *
+   * It also belongs only on the edge where a client's queue stops being empty.
+   * b1nix parks every poller on one channel, so a wake is a rescan for all of
+   * them; a client that already has unread events has a reader that is awake
+   * or about to be, and waking again buys nothing. Without the edge, synthetic
+   * motion at 1800 events a second cost 560 kernel ticks a second -- 0.3 ms of
+   * kernel per event -- and held the desktop at 25 frames. Readiness is still
+   * level-triggered: a poll that runs while the queue is non-empty returns
+   * immediately, so no reader can be left asleep on data it has not seen.
+   *
+   * Outside the lock: scheduler_wake_all takes its own, and this one is held
+   * by interrupt handlers. */
+  if (type == B1NIX_EV_SYN && (was_empty || urgent) &&
+      (urgent || now_ms - last_motion_wake_ms >= INPUT_MOTION_WAKE_MS)) {
+    if (!urgent)
+      last_motion_wake_ms = now_ms;
+    scheduler_wake_all(vfs_poll_chan);
+  }
 }
 
 void input_event_sync(int dev) {

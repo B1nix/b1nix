@@ -610,6 +610,76 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 	return ret;
 }
 
+/*
+ * How the output actually behaves, once a second.
+ *
+ * "Torn" and "it froze" are the only descriptions available from the far side
+ * of a monitor, and neither says how often a frame landed or how long the
+ * longest stall was. Every completed page flip reaches the compositor as an
+ * event read from this fd, so counting the reads counts presented frames, and
+ * the largest gap between two of them is the freeze the eye saw.
+ */
+static void drm_fps_note(void)
+{
+	static u64 window_start_ns;
+	static u64 last_ns;
+	static u32 frames;
+	static u64 max_gap_ns;
+	u64 now = lkpi_monotonic_ns();
+
+	if (!window_start_ns) {
+		window_start_ns = now;
+		last_ns = now;
+		return;
+	}
+	if (last_ns && now - last_ns > max_gap_ns)
+		max_gap_ns = now - last_ns;
+	/* A gap this long is a stall, not a still picture. Print who was asleep
+	 * and on what while it lasted -- the wait channel and the site that
+	 * parked each task is the only thing that names the waiter; the counters
+	 * above can only say that nobody was running. */
+	if (last_ns && now - last_ns > 1500000000ull) {
+		extern void scheduler_dump_tasks(void);
+		static unsigned dumped;
+
+		if (dumped < 3) {
+			dumped++;
+			pr_info("drm: %u ms without a frame — tasks:\n",
+			        (unsigned)((now - last_ns) / 1000000ull));
+			scheduler_dump_tasks();
+		}
+	}
+	last_ns = now;
+	frames++;
+
+	if (now - window_start_ns >= 1000000000ull) {
+		/* What the gap was made of. A second with a long gap and a high
+		 * user count is a compositor that was busy drawing; the same gap
+		 * against an idle count is something the system was waiting for. */
+		extern void kprof_tick_totals(u64 *user, u64 *kernel, u64 *idle);
+		extern void input_event_counts(u64 *pushed, u64 *delivered,
+		                               u64 *dropped);
+		static u64 last_u, last_k, last_i, last_in, last_drop;
+		u64 u = 0, k = 0, i = 0, in = 0, deliv = 0, drop = 0;
+
+		kprof_tick_totals(&u, &k, &i);
+		input_event_counts(&in, &deliv, &drop);
+		pr_info("drm: fps %u, longest gap %u ms, ticks user %u kernel %u idle %u, input %u (dropped %u)\n",
+		        frames, (unsigned)(max_gap_ns / 1000000ull),
+		        (unsigned)(u - last_u), (unsigned)(k - last_k),
+		        (unsigned)(i - last_i), (unsigned)(in - last_in),
+		        (unsigned)(drop - last_drop));
+		last_u = u;
+		last_k = k;
+		last_i = i;
+		last_in = in;
+		last_drop = drop;
+		window_start_ns = now;
+		frames = 0;
+		max_gap_ns = 0;
+	}
+}
+
 isize lkpi_drm_read(void *file, void *user_buf, usize len)
 {
 	struct file *filp = file;
@@ -619,6 +689,8 @@ isize lkpi_drm_read(void *file, void *user_buf, usize len)
 	if (!filp)
 		return -EBADF;
 	ret = (isize)drm_read(filp, (char __user *)user_buf, (size_t)len, &pos);
+	if (ret > 0 && lkpi_bootflag("b1nix.drm-fps"))
+		drm_fps_note();
 	/* What a compositor's event loop actually receives. A page-flip completion
 	 * that is queued but never read leaves it waiting for a frame that, as far
 	 * as it can tell, never landed — and it tears the output down again. */

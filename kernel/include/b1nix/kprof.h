@@ -11,7 +11,10 @@
  * Off (the default) this is one load and a predicted branch per helper. */
 #pragma once
 
+#include <b1nix/types.h>
+
 extern int kprof_irqoff_on;
+void kprof_tick_totals(u64 *user, u64 *kernel, u64 *idle);
 void kprof_irqoff_begin(void *site);
 void kprof_irqoff_end(void);
 

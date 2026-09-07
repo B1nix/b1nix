@@ -207,6 +207,18 @@ has_flag() {
 	return 1
 }
 
+# The value of a `name=value` token on the kernel command line, or $2 if the
+# token is absent. Two arguments so a caller states its own default rather than
+# testing for an empty string it then has to interpret.
+flag_value() {
+	for tok in $(cat /proc/cmdline 2>/dev/null); do
+		case "$tok" in
+		"$1"=*) echo "${tok#*=}"; return 0;;
+		esac
+	done
+	echo "$2"
+}
+
 # Polls tick every 200 ms (busybox usleep; this sleep has no fractions), and
 # a loop bound is in ticks: "-lt 75" is fifteen seconds. Waiting a whole
 # second between checks cost the desktop three to four seconds of pure
@@ -226,6 +238,15 @@ kprof() {
 	has_flag b1nix.sysprof || return 0
 	echo "KDE: kprof $1 t=$(up)"
 	cat /proc/b1nix-prof > /dev/null 2>&1
+}
+
+# The histogram alone, cheap enough to take while something is running. The
+# full profile above prints for over a minute through the console, which is
+# both a wait and a distortion of whatever it was meant to measure.
+kprof_hist() {
+	has_flag b1nix.sysprof || return 0
+	echo "KDE: kprof-hist $1 t=$(up)"
+	cat /proc/b1nix-kprof > /dev/null 2>&1
 }
 echo "KDE: start t=$(up)"
 kprof boot
@@ -861,7 +882,43 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 	has_flag b1nix.kde-memprof && memsnap "scanout-ready"
 	echo "KDE: SCANOUT-READY t=$(up)"
 	kprof scanout
-	sleep 90
+	# How long the desktop stays up. Ninety seconds is enough for the host to
+	# take its picture, and far too short for someone sitting in front of the
+	# panel with a mouse: the session used to close under them mid-test.
+	# b1nix.kde-hold=<seconds> on the kernel command line sets it.
+	# Under b1nix.sysprof, sample the kernel profile through the hold instead
+	# of once before it: what a desktop costs while someone is USING it is not
+	# what it costs sitting still, and the single dump at scanout only ever
+	# saw the latter.
+	__hold=$(flag_value b1nix.kde-hold 90)
+	# b1nix.inputload=<seconds> drives the pointer from inside the guest for
+	# that long, so a graphics load test does not need a person with a hand on
+	# the mouse. The counters that matter (frames, longest gap, events, drops)
+	# are printed by the kernel either way, so a run with this flag is
+	# comparable to one driven by hand and repeatable in a way that one is not.
+	__load=$(flag_value b1nix.inputload 0)
+	if [ "$__load" -gt 0 ] 2>/dev/null; then
+		echo "KDE: inputload ${__load}s t=$(up)"
+		# b1nix.inputload-dev names where the events go. Pointing it at
+		# /dev/null runs the identical harness -- same forks, same writes,
+		# same pacing -- without touching the input path, which is the
+		# control the measurement needs to separate the two costs.
+		/usr/bin/b1nix-inputload \
+			"$(flag_value b1nix.inputload-dev /dev/input/event1)" \
+			"$__load" &
+	fi
+	if has_flag b1nix.sysprof; then
+		__left=$__hold
+		while [ "$__left" -gt 0 ]; do
+			__step=30
+			[ "$__left" -lt 30 ] && __step=$__left
+			sleep "$__step"
+			__left=$((__left - __step))
+			kprof_hist "hold-$((__hold - __left))s"
+		done
+	else
+		sleep "$__hold"
+	fi
 	echo "KDE: SCANOUT-END t=$(up)"
 	has_flag b1nix.kde-memprof && memsnap "scanout-end"
 	[ -n "${__memloop:-}" ] && kill $__memloop 2>/dev/null

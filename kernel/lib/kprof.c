@@ -155,6 +155,11 @@ static void kprof_dump_irqoff(void) {
     console_write_dec(g_irqoff[bi].count);
     console_write(" 0x");
     console_write_hex64(g_irqoff[bi].site);
+    /* Name it here, the way the histogram does. An address alone has to be
+     * resolved against the exact kernel that produced it, and reading it back
+     * later against a rebuilt one -- as happened while chasing this -- names
+     * the wrong function with no sign that it did. */
+    ksym_print(g_irqoff[bi].site);
     console_write("\n");
   }
 }
@@ -190,6 +195,25 @@ static u64 kprof_weight(int cpu) {
     w = (now - last_ns[cpu]) / ns_per_tick;
   last_ns[cpu] = now;
   return w ? w : 1;
+}
+
+/* Where the machine's time went, summed over every CPU. For a caller that
+ * wants to say what a stall was made of: busy in userspace, busy in the
+ * kernel, or idle waiting for something. */
+void kprof_tick_totals(u64 *user, u64 *kernel, u64 *idle) {
+  u64 u = 0, k = 0, i = 0;
+
+  for (unsigned c = 0; c < KPROF_MAX_CPUS; c++) {
+    u += __atomic_load_n(&g_tick_mode[c][0], __ATOMIC_RELAXED);
+    k += __atomic_load_n(&g_tick_mode[c][1], __ATOMIC_RELAXED);
+    i += __atomic_load_n(&g_tick_mode[c][2], __ATOMIC_RELAXED);
+  }
+  if (user)
+    *user = u;
+  if (kernel)
+    *kernel = k;
+  if (idle)
+    *idle = i;
 }
 
 void kprof_tick(u64 rip, int in_user, int in_idle, int cpu) {
@@ -347,6 +371,8 @@ static void kprof_dump_raw(void) {
     console_write("\n");
   }
 }
+
+void kprof_dump_histogram_pub(void) { kprof_dump_histogram(); }
 
 void kprof_dump(void) {
   u64 u = 0, k = 0, idl = 0;

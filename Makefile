@@ -134,6 +134,12 @@ APPLET_SYMLINKS_INC := $(INC_DIR)/initramfs_applet_symlinks.inc
 APPLET_REGISTRATION_INC := $(INC_DIR)/initramfs_applet_registration.inc
 
 # The list of userspace programs that used to be embedded in the kernel image as
+# `xxd -i` is a vim binary, and a host without vim fails every .inc rule with
+# "xxd: command not found" -- an error that names a generated file and not the
+# missing package. tools/xxd-i.sh produces byte-identical output, so the build
+# uses whichever is present and needs neither documented as a prerequisite.
+XXD := $(shell command -v xxd 2>/dev/null || echo 'sh tools/xxd-i.sh')
+
 # xxd byte arrays lived here, together with one .inc rule per program. Under
 # musl every one of them ships in the ext4 rootfs instead, and the variable that
 # collected those rules was never named by any target — so the rules had not run
@@ -1572,7 +1578,7 @@ endif
 $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/helpers/native_smoke.S $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/native_smoke
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_native_smoke_elf userspace/build/$(ARCH)/bin/native_smoke > $@
+	$(XXD) -i -n vfs_native_smoke_elf userspace/build/$(ARCH)/bin/native_smoke > $@
 
 # The compiled-in fallback command line, as a header so a changed KERNEL_CMDLINE
 # rebuilds what reads it. .PHONY so the recipe runs every build; the file is
@@ -1589,7 +1595,7 @@ $(KERNEL_CMDLINE_INC): force-cmdline-header
 $(INITRAMFS_M109_SWITCHROOT_INC): userspace/bin/helpers/m109_switchroot_init.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m109_switchroot_init
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m109_switchroot_elf userspace/build/$(ARCH)/bin/m109_switchroot_init > $@
+	$(XXD) -i -n vfs_m109_switchroot_elf userspace/build/$(ARCH)/bin/m109_switchroot_init > $@
 
 $(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/compiler/b1cc_m34_corpus.c userspace/Makefile $(wildcard userspace/b1cc/tests/*.c) $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
@@ -1604,7 +1610,7 @@ user_bin_src = $(firstword $(wildcard $(addsuffix /$(1).c,$(addprefix userspace/
 $(INC_DIR)/initramfs_%.inc: $$(call user_bin_src,$$*) $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/$*
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_$*_elf userspace/build/$(ARCH)/bin/$* > $@
+	$(XXD) -i -n vfs_$*_elf userspace/build/$(ARCH)/bin/$* > $@
 
 # M32/M33: bundle the on-device b1cc + its static-link inputs into one .inc.
 # b1cc is a multi-source binary built from the separate b1cc repo via b1nix-cc
@@ -1619,10 +1625,10 @@ B1CC_SELFHOST_SRCS := $(wildcard $(or $(B1CC_SRCDIR),userspace/b1cc/src)/*.c \
 $(INC_DIR)/initramfs_b1cc_selfhost.inc: $(USERSPACE_DEPS) $(B1CC_SELFHOST_SRCS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/b1cc
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_b1cc_elf userspace/build/$(ARCH)/bin/b1cc > $@
-	xxd -i -n vfs_b1cc_crt0 userspace/build/$(ARCH)/crt/crt0.o >> $@
-	xxd -i -n vfs_b1cc_libc userspace/build/$(ARCH)/libb1nix.a >> $@
-	xxd -i -n vfs_b1cc_crt0dyn userspace/build/$(ARCH)/crt/crt0-dynamic.o >> $@
+	$(XXD) -i -n vfs_b1cc_elf userspace/build/$(ARCH)/bin/b1cc > $@
+	$(XXD) -i -n vfs_b1cc_crt0 userspace/build/$(ARCH)/crt/crt0.o >> $@
+	$(XXD) -i -n vfs_b1cc_libc userspace/build/$(ARCH)/libb1nix.a >> $@
+	$(XXD) -i -n vfs_b1cc_crt0dyn userspace/build/$(ARCH)/crt/crt0-dynamic.o >> $@
 
 # Depends on $(CURL_ELF): building curl (with B1NIX_TLS=mbedtls) produces the
 # static mbedTLS archives that m32_nettool's tls-server links against, so curl
@@ -1801,14 +1807,14 @@ $(CURL_ELF) $(DROPBEAR_ELF) $(BMAKE_ELF) $(SAMU_ELF): $(PKGROOT_STAMP)
 
 $(INITRAMFS_CURL_INC): $(CURL_ELF)
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_curl_elf $(CURL_ELF) > $@
+	$(XXD) -i -n vfs_curl_elf $(CURL_ELF) > $@
 
 # Dropbear SSH server (dropbearmulti: server + dropbearkey + dropbearconvert,
 # dispatched by argv[0]). Built static against the b1nix userspace libc.
 
 $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_dropbear_elf $(DROPBEAR_ELF) > $@
+	$(XXD) -i -n vfs_dropbear_elf $(DROPBEAR_ELF) > $@
 
 # In-guest build tools, both GNU-free (M98): bmake (BSD 3-clause NetBSD make)
 # ships as /bin/make and samurai (0BSD Ninja reimplementation) as /bin/samu with
@@ -1844,13 +1850,13 @@ $(CACERT_PEM): tools/images/fetch-cacert.sh
 
 $(INITRAMFS_CACERT_INC): $(CACERT_PEM)
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_cacert_pem $(CACERT_PEM) > $@
+	$(XXD) -i -n vfs_cacert_pem $(CACERT_PEM) > $@
 
 $(BUILTIN_FW_I915_DMC_INC): tools/drm/stage-i915-firmware.sh
 	@mkdir -p $(dir $@) $(BUILD_DIR)/fw
 	@sh tools/drm/stage-i915-firmware.sh $(BUILD_DIR)/fw
 	@if [ -f $(BUILD_DIR)/fw/lib/firmware/i915/kbl_dmc_ver1_04.bin ]; then \
-		xxd -i -n vfs_i915_dmc \
+		$(XXD) -i -n vfs_i915_dmc \
 			$(BUILD_DIR)/fw/lib/firmware/i915/kbl_dmc_ver1_04.bin > $@.tmp; \
 		echo '#define B1NIX_I915_DMC_PRESENT 1' >> $@.tmp; \
 	else \
@@ -1862,27 +1868,27 @@ $(BUILTIN_FW_I915_DMC_INC): tools/drm/stage-i915-firmware.sh
 $(INITRAMFS_TESTWAV_INC): tools/images/gen_test_wav.py
 	@mkdir -p $(dir $@)
 	python3 tools/images/gen_test_wav.py $(BUILD_DIR)/test.wav
-	xxd -i -n vfs_testwav $(BUILD_DIR)/test.wav > $@
+	$(XXD) -i -n vfs_testwav $(BUILD_DIR)/test.wav > $@
 
 # M51: the project's own scalable font (B1nix Mono) used by the
 # FreeType/Cairo/HarfBuzz smokes. Mounted at /share/fonts/B1nixMono-Regular.ttf.
 $(INITRAMFS_TESTFONT_INC): userspace/share/fonts/B1nixMono-Regular.ttf
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_testfont userspace/share/fonts/B1nixMono-Regular.ttf > $@
+	$(XXD) -i -n vfs_testfont userspace/share/fonts/B1nixMono-Regular.ttf > $@
 
 # M40: embed the committed static Linux x86_64 ELF blob. The blob is checked in
 # (regenerated by hand via tools/blobs/build-linux-hello.sh) so the kernel build
 # does not require a Linux assembler on the build host.
 $(INITRAMFS_M40_LINUX_INC): tools/blobs/linux_hello.bin
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m40_linux_hello tools/blobs/linux_hello.bin > $@
+	$(XXD) -i -n vfs_m40_linux_hello tools/blobs/linux_hello.bin > $@
 
 # M67: embed the committed prebuilt static Rust ELF blob. Checked in (regenerated
 # by hand via tools/blobs/build-rust-hello.sh) so the kernel build needs no Rust
 # toolchain. Same pattern as the M40 Linux blob above.
 $(INITRAMFS_M67_RUST_INC): tools/blobs/hello_b1nix.elf
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m67_rust_elf tools/blobs/hello_b1nix.elf > $@
+	$(XXD) -i -n vfs_m67_rust_elf tools/blobs/hello_b1nix.elf > $@
 
 # Self-contained TLS test PKI (CA + server cert/key) embedded under
 # /etc/tls-test for the M32 loopback HTTPS smoke. No network dependency.
@@ -1894,9 +1900,9 @@ $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem $(TLS_TEST_DIR)/server-ke
 
 $(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem $(TLS_TEST_DIR)/server-key.pem
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_tls_ca_pem $(TLS_TEST_DIR)/ca.pem > $@
-	xxd -i -n vfs_tls_server_cert_pem $(TLS_TEST_DIR)/server-cert.pem >> $@
-	xxd -i -n vfs_tls_server_key_pem $(TLS_TEST_DIR)/server-key.pem >> $@
+	$(XXD) -i -n vfs_tls_ca_pem $(TLS_TEST_DIR)/ca.pem > $@
+	$(XXD) -i -n vfs_tls_server_cert_pem $(TLS_TEST_DIR)/server-cert.pem >> $@
+	$(XXD) -i -n vfs_tls_server_key_pem $(TLS_TEST_DIR)/server-key.pem >> $@
 
 # (no arch gate here: these rules are driven by LIBC_SO/MUSL_INSTALLED, which
 #  are set per-arch above, and aarch64 needs every one of them.)
@@ -1914,38 +1920,38 @@ $(LIBC_SO) $(LIBM_LIB): $(PKG_DEPS)
 
 $(INITRAMFS_LD_MUSL_INC): $(LIBC_SO)
 	@mkdir -p $(dir $@)
-	xxd -i -n $(LIBC_INC_SYM) $(LIBC_SO) > $@
+	$(XXD) -i -n $(LIBC_INC_SYM) $(LIBC_SO) > $@
 endif
 
 $(INC_DIR)/initramfs_m92_musl_dyn_smoke.inc: userspace/bin/helpers/m92_musl_dyn_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-dyn-smoke
-	xxd -i -n vfs_m92_musl_dyn_smoke_elf $(BUILD_DIR)/m92-musl-dyn-smoke > $@
+	$(XXD) -i -n vfs_m92_musl_dyn_smoke_elf $(BUILD_DIR)/m92-musl-dyn-smoke > $@
 
 $(INC_DIR)/initramfs_m92_musl_ldso_smoke.inc: userspace/bin/helpers/m92_musl_ldso_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -ldso $< -o $(BUILD_DIR)/m92-musl-ldso-smoke
-	xxd -i -n vfs_m92_musl_ldso_smoke_elf $(BUILD_DIR)/m92-musl-ldso-smoke > $@
+	$(XXD) -i -n vfs_m92_musl_ldso_smoke_elf $(BUILD_DIR)/m92-musl-ldso-smoke > $@
 
 $(INC_DIR)/initramfs_musl_posix_smoke.inc: userspace/bin/smoke/musl_posix_smoke.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/musl-posix-smoke
-	xxd -i -n vfs_musl_posix_smoke_elf $(BUILD_DIR)/musl-posix-smoke > $@
+	$(XXD) -i -n vfs_musl_posix_smoke_elf $(BUILD_DIR)/musl-posix-smoke > $@
 
 $(INC_DIR)/initramfs_m92_musl_hello.inc: userspace/bin/helpers/m92_musl_hello.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-hello
-	xxd -i -n vfs_m92_musl_hello_elf $(BUILD_DIR)/m92-musl-hello > $@
+	$(XXD) -i -n vfs_m92_musl_hello_elf $(BUILD_DIR)/m92-musl-hello > $@
 
 $(INC_DIR)/initramfs_m92_musl_step2.inc: userspace/bin/helpers/m92_musl_step2.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-step2
-	xxd -i -n vfs_m92_musl_step2_elf $(BUILD_DIR)/m92-musl-step2 > $@
+	$(XXD) -i -n vfs_m92_musl_step2_elf $(BUILD_DIR)/m92-musl-step2 > $@
 
 $(INC_DIR)/initramfs_m92_musl_raw_diag.inc: userspace/bin/helpers/m92_musl_raw_diag.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
 	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-raw-diag
-	xxd -i -n vfs_m92_musl_raw_diag_elf $(BUILD_DIR)/m92-musl-raw-diag > $@
+	$(XXD) -i -n vfs_m92_musl_raw_diag_elf $(BUILD_DIR)/m92-musl-raw-diag > $@
 
 # /lib/libc++.so.1 + /lib/libc++abi.so.1 — shared LLVM C++ stdlib (M89). One
 # build-libcxx-shared.sh run links BOTH .so from the PIC libc++.a/libc++abi.a; the
@@ -1954,11 +1960,11 @@ ifndef MUSL_INSTALLED
 $(INITRAMFS_LIBCXX_INC): tools/toolchain/build-libcxx-shared.sh $(dir $(CROSS_TOOLCHAIN_ROOT))llvm-runtimes-build/libcxx-install/lib/libc++.a $(INITRAMFS_SHARED_LIBC_INC)
 	@mkdir -p $(dir $@)
 	ARCH=$(ARCH) tools/toolchain/build-libcxx-shared.sh >/dev/null
-	xxd -i -n vfs_libcxx_elf $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libc++.so.1 > $@
+	$(XXD) -i -n vfs_libcxx_elf $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libc++.so.1 > $@
 
 $(INITRAMFS_LIBCXXABI_INC): $(INITRAMFS_LIBCXX_INC)
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_libcxxabi_so1 $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libc++abi.so.1 > $@
+	$(XXD) -i -n vfs_libcxxabi_so1 $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libc++abi.so.1 > $@
 endif # !MUSL_INSTALLED
 ifdef MUSL_INSTALLED
 # Under musl the C++ shared runtime is the version built against musl libc.
@@ -1981,11 +1987,11 @@ $(LIBC_ROOT)/lib/libc++.so.1 $(LIBC_ROOT)/lib/libc++abi.so.1: $(MUSL_LIBCXX_STAM
 
 $(INITRAMFS_LIBCXX_INC): $(LIBC_ROOT)/lib/libc++.so.1
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_libcxx_elf $< > $@
+	$(XXD) -i -n vfs_libcxx_elf $< > $@
 
 $(INITRAMFS_LIBCXXABI_INC): $(LIBC_ROOT)/lib/libc++abi.so.1
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_libcxxabi_so1 $< > $@
+	$(XXD) -i -n vfs_libcxxabi_so1 $< > $@
 endif # MUSL_INSTALLED
 
 ifeq ($(ARCH),aarch64)
@@ -1995,13 +2001,13 @@ ifeq ($(ARCH),aarch64)
 $(INC_DIR)/initramfs_openrc_init.inc: $(LIBC_SO)
 	@ARCH=$(ARCH) B1NIX_TRIPLET=aarch64-b1nix tools/ports/build-openrc.sh
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_openrc_init_elf build/$(ARCH)/rootfs/sbin/openrc-init > $@
+	$(XXD) -i -n vfs_openrc_init_elf build/$(ARCH)/rootfs/sbin/openrc-init > $@
 endif
 
 $(INITRAMFS_BUSYBOX_INC): tools/ports/build-busybox.sh tools/patches/busybox/b1nix-config.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-busybox.sh
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_upstream_busybox_elf build/$(ARCH)/ports/busybox/busybox > $@
+	$(XXD) -i -n vfs_upstream_busybox_elf build/$(ARCH)/ports/busybox/busybox > $@
 
 
 
@@ -2025,7 +2031,7 @@ $(AP_TRAMP_BIN): $(AP_TRAMP_OBJ)
 
 $(AP_TRAMPOLINE_INC): $(AP_TRAMP_BIN)
 	@mkdir -p $(dir $@)
-	xxd -i -n ap_trampoline_bin $< > $@
+	$(XXD) -i -n ap_trampoline_bin $< > $@
 
 # One #define per data field, straight out of the symbol table: the offsets can
 # no longer disagree with the assembly, because they ARE the assembly's.

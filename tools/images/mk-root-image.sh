@@ -82,8 +82,17 @@ if [ "${ROOT_IMAGE_FORCE:-0}" != "1" ] && [ -f "$IMAGE" ] && [ -s "$MANIFEST" ];
 	CAME="$IMAGE.came"
 	CMDS="$IMAGE.debugfs"
 	: > "$CMDS"
-	comm -23 "$MANIFEST" "$NEWM" > "$GONE"
-	comm -13 "$MANIFEST" "$NEWM" > "$CAME"
+	# Both manifests are sorted with LC_ALL=C, so comm has to compare in the
+	# same collation. Left to the caller's locale it judged C-sorted input
+	# out of order, exited non-zero and failed the whole target with "input is
+	# not in sorted order" -- while the image and the manifest were both fine.
+	# The stored one is re-sorted as well, so a file written by an older
+	# version of this script cannot poison the fast path either.
+	OLDM="$IMAGE.manifest.sorted"
+	LC_ALL=C sort "$MANIFEST" > "$OLDM"
+	LC_ALL=C comm -23 "$OLDM" "$NEWM" > "$GONE"
+	LC_ALL=C comm -13 "$OLDM" "$NEWM" > "$CAME"
+	rm -f "$OLDM"
 	EDITED="$IMAGE.edited"
 	(cd "$ROOTFS" && find . \( -type f -o -type l \) -newer "$IMAGE" -print) |
 		LC_ALL=C sort > "$EDITED"

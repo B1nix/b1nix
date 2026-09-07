@@ -307,8 +307,45 @@ if [ -n "${ROOT_IMG:-}" ]; then
 	# file the next `make iso` compares against its manifest.
 	DEV_ARGS="$DEV_ARGS -drive file=$ROOT_IMG,format=raw,if=virtio,snapshot=on"
 fi
-# Anything else for QEMU, verbatim: `-object input-linux,evdev=/dev/input/eventN,grab_all=on`
-# hands the guest a host keyboard or mouse (both Ctrl keys toggle the grab).
+# The host's keyboard and mouse, handed to the guest by default.
+#
+# A run on the physical panel is only worth looking at if it can be driven, and
+# naming the event nodes by hand gets them wrong: on this machine the mouse's
+# dongle also presents a keyboard interface, so /dev/input/eventN numbering puts
+# a second keyboard where the mouse looks like it should be. by-path says what a
+# node IS, so that is what is matched here. Set INPUT_EVDEVS to override the
+# choice, or to empty to attach nothing; anything already passed in
+# EXTRA_QEMU_ARGS wins and this adds nothing.
+#
+# Both Ctrl keys together toggle the grab, which is the way back to the host.
+if [ -z "${INPUT_EVDEVS+set}" ]; then
+	INPUT_EVDEVS=""
+	for link in /dev/input/by-path/*-event-mouse /dev/input/by-path/*-event-kbd; do
+		[ -e "$link" ] || continue
+		node=$(readlink -f "$link")
+		[ -r "$node" ] || continue
+		case " $INPUT_EVDEVS " in *" $node "*) continue;; esac
+		INPUT_EVDEVS="$INPUT_EVDEVS $node"
+	done
+fi
+case "${EXTRA_QEMU_ARGS:-}" in
+*input-linux*) ;;
+*)
+	i=0
+	for node in $INPUT_EVDEVS; do
+		i=$((i + 1))
+		DEV_ARGS="$DEV_ARGS -object input-linux,id=hostin$i,evdev=$node,grab_all=on"
+	done
+	if [ "$i" -eq 0 ]; then
+		echo "warning: no readable keyboard/mouse evdev found — the guest gets no input." >&2
+		echo "         grant access with: sudo setfacl -m u:$USER:rw /dev/input/eventN" >&2
+	else
+		echo "input: attached$INPUT_EVDEVS"
+	fi
+	;;
+esac
+
+# Anything else for QEMU, verbatim.
 DEV_ARGS="$DEV_ARGS ${EXTRA_QEMU_ARGS:-}"
 
 

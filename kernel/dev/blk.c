@@ -1109,6 +1109,108 @@ static struct block_buffer *bcache_find(struct block_device *dev, u64 lba) {
  * claimed via BLK_CACHE_BUSY for the duration so a concurrent evict on
  * another CPU skips it. flags_inout lets us release/reacquire with the
  * caller's saved IRQ state preserved. */
+
+/* Ceiling on the sectors coalesced into one writeback command (512 = 256 KiB,
+ * the same order as a Linux writeback chunk). The actual run is this clamped to
+ * the device's own max_sectors, so a device that cannot describe 256 KiB in one
+ * command never gets asked to. The ceiling itself stays here because the index
+ * array below lives on the kernel stack: 512 entries is 2 KiB, and a stack
+ * buffer is the one thing that must not grow with a device's appetite. */
+#define BCACHE_FLUSH_RUN     512
+
+/*
+ * Write back the whole contiguous dirty run that one slot belongs to, in a
+ * single device command.
+ *
+ * Both writeback paths need this. The background drain always did it; eviction
+ * did not, and eviction is the path that runs when the pool is entirely dirty
+ * — every read miss then wrote back exactly one 512-byte block and waited for
+ * it. Measured during a KDE start-up: 207387 of 228133 write commands were a
+ * single sector, and with one request in flight at a time the compositor was
+ * behind all of them.
+ *
+ * The caller holds the cache lock; it is dropped around the device write and
+ * reacquired, with the caller's IRQ state carried in *flags_inout. Every block
+ * in the run is claimed BUSY across the drop, so a concurrent write to those
+ * LBAs waits rather than racing the copy. Returns blocks written (0 on a device
+ * error, which leaves them dirty for a later retry).
+ */
+static usize bcache_writeback_run(usize anchor, u64 *flags_inout) {
+  struct block_buffer *a = &block_cache[anchor];
+  struct block_device *wdev = a->bdev;
+  u64 base;
+  i32 idxs[BCACHE_FLUSH_RUN];
+  usize run_max, run = 0;
+  u8 *tmp = 0;
+  const void *src;
+  int wr;
+
+  if (!wdev || !wdev->write_blocks || !(a->flags & BLK_CACHE_DIRTY) ||
+      (a->flags & BLK_CACHE_BUSY))
+    return 0;
+
+  base = a->block_no;
+  run_max = blk_max_sectors(wdev);
+  if (run_max > BCACHE_FLUSH_RUN)
+    run_max = BCACHE_FLUSH_RUN;
+  if (run_max == 0)
+    run_max = 1;
+
+  /* Walk back to the first block of the contiguous dirty region before
+   * extending forward. The anchor is whichever slot the caller landed on,
+   * which is usually the MIDDLE of a run: starting the command there splits
+   * one filesystem block into two device writes. */
+  for (usize back = 0; back < run_max && base > 0; back++) {
+    struct block_buffer *e = bcache_find(wdev, base - 1);
+
+    if (!e || !(e->flags & BLK_CACHE_DIRTY) || (e->flags & BLK_CACHE_BUSY))
+      break;
+    base--;
+  }
+
+  for (u64 l = base; run < run_max; l++) {
+    struct block_buffer *e = bcache_find(wdev, l);
+
+    if (!e || !(e->flags & BLK_CACHE_DIRTY) || (e->flags & BLK_CACHE_BUSY))
+      break;
+    e->flags |= BLK_CACHE_BUSY;
+    idxs[run++] = (i32)(e - block_cache);
+  }
+  if (run == 0)
+    return 0;
+
+  if (run > 1) {
+    tmp = (u8 *)kmalloc(run * CACHE_BLOCK_SIZE);
+    if (!tmp) {
+      /* No memory to coalesce: write the anchor's own block rather than give
+       * up entirely, and let the rest stay dirty for the next pass. */
+      for (usize k = 1; k < run; k++)
+        block_cache[idxs[k]].flags &= ~BLK_CACHE_BUSY;
+      run = 1;
+    } else {
+      for (usize k = 0; k < run; k++)
+        memcpy(tmp + k * CACHE_BLOCK_SIZE, block_cache[idxs[k]].data,
+               CACHE_BLOCK_SIZE);
+    }
+  }
+  src = tmp ? (const void *)tmp : (const void *)block_cache[idxs[0]].data;
+
+  bcache_release(*flags_inout); /* write_blocks may yield — slots stay BUSY */
+  wr = blk_dev_write(wdev, base, (u32)run, src);
+  if (tmp)
+    kfree(tmp);
+  *flags_inout = bcache_acquire();
+
+  for (usize k = 0; k < run; k++) {
+    struct block_buffer *e = &block_cache[idxs[k]];
+
+    e->flags &= ~BLK_CACHE_BUSY;
+    if (wr >= 0)
+      e->flags &= ~BLK_CACHE_DIRTY; /* persisted; keep DIRTY on failure (R3-13) */
+  }
+  return wr >= 0 ? run : 0;
+}
+
 /* CLOCK eviction hand — rotates across block_cache[] so victim selection is
  * O(1) amortized instead of two full-pool scans per miss. */
 static usize bcache_hand = 0;
@@ -1154,17 +1256,17 @@ static struct block_buffer *bcache_evict(u64 *flags_inout) {
   /* 3. Write-Back: flush a dirty entry to disk OUTSIDE the bcache_lock. */
   if ((entry->flags & BLK_CACHE_DIRTY) && entry->bdev && entry->bdev->write_blocks) {
     blk_stat_evict_dirty++; /* a reader paying for a writer: see the stats dump */
-    entry->flags |= BLK_CACHE_BUSY;          /* lock the slot across the drop */
-    struct block_device *wb_dev = entry->bdev;
-    u64 wb_lba = entry->block_no;
-    bcache_release(*flags_inout);            /* RELEASE — write_blocks may yield */
-    /* Eviction write-back: the slot is recycled regardless (the caller resets
+    /* Write back the run this block sits in, not the block alone. The pool is
+     * entirely dirty whenever this path is taken (a clean victim is always
+     * preferred), so its neighbours are dirty too and would each come back
+     * here for a device command of their own.
+     *
+     * Eviction write-back: the slot is recycled regardless (the caller resets
      * its flags below), so a failed write here loses the data under memory
      * pressure — a documented limitation. The sync/fsync path in
      * blk_flush_buffer keeps DIRTY on failure so explicit syncs don't lose
      * data silently (R3-13). */
-    blk_dev_write(wb_dev, wb_lba, 1, entry->data);
-    *flags_inout = bcache_acquire();         /* REACQUIRE before returning */
+    bcache_writeback_run((usize)oldest_idx, flags_inout);
     entry->flags &= ~(BLK_CACHE_DIRTY | BLK_CACHE_BUSY);
   }
   /* Unlink from its old hash chain — its (bdev, block_no) is about to be
@@ -1674,13 +1776,6 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
  * per-command cost — and blk_write_cached calls it every N dirty writes so dirty
  * blocks never pile up unbounded (the writer is throttled by doing some of the
  * writeback itself, like Linux balance_dirty_pages). */
-/* Ceiling on the sectors coalesced into one writeback command (512 = 256 KiB,
- * the same order as a Linux writeback chunk). The actual run is this clamped to
- * the device's own max_sectors, so a device that cannot describe 256 KiB in one
- * command never gets asked to. The ceiling itself stays here because the index
- * array below lives on the kernel stack: 512 entries is 2 KiB, and a stack
- * buffer is the one thing that must not grow with a device's appetite. */
-#define BCACHE_FLUSH_RUN     512
 /* Dirty writes between proactive drains — a FRACTION of the pool, not a fixed
  * count. 256 was chosen against an 8192-entry cache (3% of it); left constant
  * after the pool grew to 65536 it throttles the writer eight times more often
@@ -1707,65 +1802,38 @@ static usize bcache_flush_some(usize target) {
   usize flushed = 0;
   u64 flags = bcache_acquire();
   while (flushed < target) {
-    /* Find a dirty, non-busy, writable block to anchor a run. */
+    /* Find a dirty, non-busy, writable block to anchor a run.
+     *
+     * The sweep resumes where the last one stopped instead of restarting at
+     * slot zero. Restarting made this quadratic: every run re-walked the same
+     * prefix of clean slots before reaching the next dirty one, with the cache
+     * lock held, so draining a few thousand blocks out of a 65536-entry pool
+     * cost hundreds of millions of iterations that no one could take the lock
+     * during. The cursor is a hint only -- it is bounded to one full sweep, so
+     * a stale value costs at most one extra lap and never a missed block. */
+    static usize flush_cursor;
     int start = -1;
-    for (usize i = 0; i < block_cache_n; i++) {
+    for (usize n = 0; n < block_cache_n; n++) {
+      usize i = (flush_cursor + n) % block_cache_n;
       struct block_buffer *e = &block_cache[i];
       if ((e->flags & (BLK_CACHE_VALID | BLK_CACHE_DIRTY)) ==
               (BLK_CACHE_VALID | BLK_CACHE_DIRTY) &&
           !(e->flags & BLK_CACHE_BUSY) && e->bdev && e->bdev->write_blocks) {
         start = (int)i;
+        flush_cursor = (i + 1) % block_cache_n;
         break;
       }
     }
     if (start < 0)
       break; /* nothing dirty to flush */
 
-    struct block_device *wdev = block_cache[start].bdev;
-    u64 base = block_cache[start].block_no;
-    /* Extend a contiguous run [base, base+run) of dirty, non-busy blocks on the
-     * same device; claim each BUSY so a concurrent write to those LBAs waits. */
-    i32 idxs[BCACHE_FLUSH_RUN];
-    usize run_max = blk_max_sectors(wdev);
-    if (run_max > BCACHE_FLUSH_RUN)
-      run_max = BCACHE_FLUSH_RUN;
-    usize run = 0;
-    for (u64 l = base; run < run_max; l++) {
-      struct block_buffer *e = bcache_find(wdev, l);
-      if (!e || !(e->flags & BLK_CACHE_DIRTY) || (e->flags & BLK_CACHE_BUSY))
-        break;
-      e->flags |= BLK_CACHE_BUSY;
-      idxs[run++] = (i32)(e - block_cache);
-    }
-    if (run == 0)
-      break;
+    {
+      usize n = bcache_writeback_run((usize)start, &flags);
 
-    u8 *tmp = (u8 *)kmalloc(run * CACHE_BLOCK_SIZE);
-    if (!tmp) {
-      /* No memory to coalesce — unbusy and bail (eviction-time writeback still
-       * handles these later). */
-      for (usize k = 0; k < run; k++)
-        block_cache[idxs[k]].flags &= ~BLK_CACHE_BUSY;
-      break;
+      if (n == 0)
+        break; /* nothing writable there, or the device refused it */
+      flushed += n;
     }
-    for (usize k = 0; k < run; k++)
-      memcpy(tmp + k * CACHE_BLOCK_SIZE, block_cache[idxs[k]].data,
-             CACHE_BLOCK_SIZE);
-
-    bcache_release(flags); /* write_blocks may yield — lock dropped, slots BUSY */
-    int wr = blk_dev_write(wdev, base, (u32)run, tmp);
-    kfree(tmp);
-    flags = bcache_acquire();
-
-    for (usize k = 0; k < run; k++) {
-      struct block_buffer *e = &block_cache[idxs[k]];
-      e->flags &= ~BLK_CACHE_BUSY;
-      if (wr == 0)
-        e->flags &= ~BLK_CACHE_DIRTY; /* persisted; keep DIRTY on failure (R3-13) */
-    }
-    if (wr != 0)
-      break; /* device error — stop, leave the rest dirty for a later retry */
-    flushed += run;
   }
   bcache_release(flags);
   __sync_lock_release(&bcache_flushing);
@@ -1889,7 +1957,16 @@ void blk_flush_buffer(struct block_buffer *buf) {
     /* Only clear DIRTY when the device actually accepted the write. Clearing it
      * unconditionally on a failed write silently loses the data and lets
      * blk_sync_all()/umount report success (R3-13). Leave it dirty for retry. */
-    if (buf->bdev->write_blocks(buf->bdev, buf->block_no, 1, buf->data) == 0)
+    /* Success is a non-negative return, not a zero one.
+     *
+     * write_blocks answers with the number of blocks it wrote — ahci and
+     * virtio-blk both `return (int)count` — and only a negative value is an
+     * error. Testing for zero declared every successful multi-block write a
+     * failure: the blocks stayed DIRTY and were written again on the next
+     * pass, and each coalesced run was followed by a per-block retry loop
+     * that "failed" in the same way. Measured on a KDE start-up, 211587 of
+     * 228027 write commands were a single block and nothing ever came clean. */
+    if (buf->bdev->write_blocks(buf->bdev, buf->block_no, 1, buf->data) >= 0)
       buf->flags &= ~BLK_CACHE_DIRTY;
   }
 }
@@ -2026,7 +2103,7 @@ static void blk_flush_run(struct block_buffer **run, usize n, u8 **bounce) {
     struct block_buffer *b = run[0];
 
     if (b->bdev && b->bdev->write_blocks &&
-        b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) == 0)
+        b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) >= 0)
       blk_flush_release(run, 1, 1);
     else
       blk_flush_release(run, 1, 0);
@@ -2047,7 +2124,7 @@ static void blk_flush_run(struct block_buffer **run, usize n, u8 **bounce) {
       for (usize i = 0; i < n; i++) {
         struct block_buffer *b = run[i];
         int ok = b->bdev && b->bdev->write_blocks &&
-                 b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) == 0;
+                 b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) >= 0;
 
         blk_flush_release(&run[i], 1, ok);
       }
@@ -2057,12 +2134,12 @@ static void blk_flush_run(struct block_buffer **run, usize n, u8 **bounce) {
   for (usize i = 0; i < n; i++)
     memcpy(*bounce + i * sizeof(run[i]->data), run[i]->data,
            sizeof(run[i]->data));
-  if (dev->write_blocks(dev, run[0]->block_no, (u32)n, *bounce) == 0) {
+  if (dev->write_blocks(dev, run[0]->block_no, (u32)n, *bounce) >= 0) {
     blk_flush_release(run, n, 1);
   } else {
     for (usize i = 0; i < n; i++) {
       struct block_buffer *b = run[i];
-      int ok = b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) == 0;
+      int ok = b->bdev->write_blocks(b->bdev, b->block_no, 1, b->data) >= 0;
 
       blk_flush_release(&run[i], 1, ok);
     }
@@ -2133,6 +2210,7 @@ static void bcache_drain_all(void) {
   enum { SCAN_CHUNK = 256 };
   usize cap = 512;
   struct block_buffer **set = (struct block_buffer **)kmalloc(cap * sizeof(*set));
+
   usize n = 0;
   u8 *bounce = 0;
   usize base = 0;
@@ -2165,14 +2243,18 @@ static void bcache_drain_all(void) {
       set[n++] = b;
     }
     bcache_release(flags);
-    if (set && n) {
+    /* Full set only — see the note in blk_flush_matching: a chunk is a window
+     * over the cache array, not over the disk, so flushing per chunk cuts
+     * every run down to whatever happened to land in that window. */
+    if (set && n == cap) {
       blk_flush_sorted(set, n, &bounce);
       n = 0;
     }
     base = resume;
   }
   if (set) {
-    blk_flush_sorted(set, n, &bounce);
+    if (n)
+      blk_flush_sorted(set, n, &bounce);
     kfree(set);
   }
   if (bounce)
@@ -2291,14 +2373,25 @@ static void blk_flush_matching(struct block_device *dev, u64 first, u64 last,
       set[n++] = b;
     }
     bcache_release(flags);
-    if (set && n) {
+    /* Flush only when the set is FULL, not once per scanned chunk.
+     *
+     * The chunk is a window over the cache ARRAY; a file's consecutive blocks
+     * are scattered across it by the hash, so a window holds a handful of them
+     * and almost never two that are adjacent on the disk. Sorting and writing
+     * per window therefore produced runs of one or two blocks: measured on a
+     * KDE start-up, this path issued 29243 write commands for 52859 blocks,
+     * 1.8 blocks each, and with one request in flight at a time the desktop
+     * waited behind every one of them. Accumulating across the whole sweep and
+     * sorting the full set is what makes a run a run. */
+    if (set && n == cap) {
       blk_flush_sorted(set, n, &bounce);
       n = 0;
     }
     base = resume;
   }
   if (set) {
-    blk_flush_sorted(set, n, &bounce);
+    if (n)
+      blk_flush_sorted(set, n, &bounce);
     kfree(set);
   }
   if (bounce)
