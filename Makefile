@@ -93,13 +93,17 @@ MODULE_NAMES := isofs ntfs hda ipv6 ndp ntp
 MODULE_KOS := $(patsubst %,$(MODULE_OUT_DIR)/%.ko,$(MODULE_NAMES))
 INITRAMFS_MODULES_INC := $(INC_DIR)/initramfs_modules.inc
 
-# The i915 display microcontroller's firmware, carried by the INITRAMFS and not
-# by the root filesystem: i915 probes at about one second and asks for it
-# there and then, while the root is not mounted until the second. Always
-# generated, because whether the build machine has the blob is not something
-# make can be told through a -D it does not watch — the generated file records
-# its own answer, and <kernel/fs/ramfs/initramfs.c> tests that.
-INITRAMFS_I915_DMC_INC := $(INC_DIR)/initramfs_i915_dmc.inc
+# The i915 display microcontroller's firmware, compiled INTO the kernel.
+#
+# Not into a filesystem: i915 probes before anything is mounted — at that
+# point not even /lib/ld-musl-x86_64.so.1 resolves — so a blob in the
+# initramfs or the root is a blob the driver cannot reach. Linux has the same
+# problem and the same answer, CONFIG_EXTRA_FIRMWARE.
+#
+# Always generated, because whether the build machine has the blob is not
+# something make can be told through a -D it does not watch: the generated
+# file records its own answer and <kernel/lkpi/firmware.c> tests that.
+BUILTIN_FW_I915_DMC_INC := $(INC_DIR)/builtin_fw_i915_dmc.inc
 # M109: the initramfs /init of the switchroot instance — the PID 1 that mounts
 # the real root below / and hands over to BusyBox's switch_root.
 INITRAMFS_M109_SWITCHROOT_INC := $(INC_DIR)/initramfs_m109_switchroot.inc
@@ -265,8 +269,7 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_MODULES_INC) \
 	$(INITRAMFS_M109_SWITCHROOT_INC) \
-	$(INITRAMFS_I915_DMC_INC) \
-	$(INITRAMFS_LD_MUSL_INC)
+		$(INITRAMFS_LD_MUSL_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(AP_TRAMPOLINE_OFFSETS) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 endif
 
@@ -1421,6 +1424,10 @@ $(BUILD_DIR)/kernel/arch/aarch64/bootinfo.o: $(KERNEL_CMDLINE_INC)
 # "initramfs_native_smoke.inc: file not found" instead.
 $(BUILD_DIR)/kernel/fs/ramfs/initramfs.o: $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC)
 
+# The built-in firmware blob is generated; without this the object that
+# carries it is not rebuilt when the blob appears or changes.
+$(BUILD_DIR)/kernel/lkpi/firmware.o: $(BUILTIN_FW_I915_DMC_INC)
+
 # programs.c includes the generated applet registration .inc
 $(BUILD_DIR)/kernel/user/programs.o: $(APPLET_REGISTRATION_INC)
 
@@ -1823,7 +1830,7 @@ $(INITRAMFS_CACERT_INC): $(CACERT_PEM)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_cacert_pem $(CACERT_PEM) > $@
 
-$(INITRAMFS_I915_DMC_INC): tools/drm/stage-i915-firmware.sh
+$(BUILTIN_FW_I915_DMC_INC): tools/drm/stage-i915-firmware.sh
 	@mkdir -p $(dir $@) $(BUILD_DIR)/fw
 	@sh tools/drm/stage-i915-firmware.sh $(BUILD_DIR)/fw
 	@if [ -f $(BUILD_DIR)/fw/lib/firmware/i915/kbl_dmc_ver1_04.bin ]; then \
@@ -2070,7 +2077,10 @@ SMOKE_CMDLINE_sys=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.
 # both arches. Without it the lane booted with b1nix.smoke=sys, ran the sys half
 # a second time, and the 91 network checks were run by nobody.
 SMOKE_CMDLINE_sysnet=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=sysnet
-SMOKE_CMDLINE_gfx=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=gfx
+# b1nix.hda-tone-ms: this is the instance whose audio is captured and checked
+# on the host, and a tone has to last long enough to be measured — ten
+# milliseconds is four cycles of 440 Hz.
+SMOKE_CMDLINE_gfx=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=gfx b1nix.hda-tone-ms=250
 SMOKE_CMDLINE_posix=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=posix
 # b1nix.mtd: probe for the CFI NOR chip. Only this instance is given one
 # (tests/smoke.sh passes the pflash pair), and probing WRITES a query command

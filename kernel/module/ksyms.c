@@ -69,6 +69,10 @@ EXPORT_SYMBOL(console_write_hex32);
 EXPORT_SYMBOL(console_write_hex64);
 EXPORT_SYMBOL(panic);
 EXPORT_SYMBOL(bootinfo_has_flag);
+/* The key=value form beside it: a module reads its own tunables from the
+ * command line the same way the kernel does — the HDA driver takes the length
+ * of its test tone from b1nix.hda-tone-ms. */
+EXPORT_SYMBOL(bootinfo_get_kv);
 
 /* ── memory ──────────────────────────────────────────────────────────────── */
 EXPORT_SYMBOL(kmalloc);

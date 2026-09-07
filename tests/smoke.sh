@@ -310,6 +310,13 @@ run_qemu() {
 	shift
 	local pid
 	local done_pattern="${SMOKE_DONE_PATTERN:-B1NIX-TEST: done|KERNEL PANIC|\[PANIC\]}"
+	# What the emulated sound card played, written by QEMU's wav backend. It is
+	# named after the instance and truncated first, so a check reads this run's
+	# audio and not the last one's — the same rule the logs follow. Silence
+	# costs about 170 KiB a second, which is why only the instance that plays
+	# anything gets the device at all.
+	AUDIO_WAV="${AUDIO_WAV:-${log%.log}-audio.wav}"
+	rm -f "$AUDIO_WAV"
   
 	if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 		local filter_dump_args=""
@@ -523,7 +530,7 @@ run_qemu() {
 				-netdev user,id=net1,net=10.0.3.0/24,host=10.0.3.2,restrict=${B1NIX_NET_RESTRICT:-off} \
 				-device ${E1000_MODEL:-e1000},netdev=net1 \
 				-device ${GPU_DEVICE:-virtio-gpu-pci} \
-				-audiodev none,id=audio0 \
+				-audiodev wav,id=audio0,path="$AUDIO_WAV" \
 				-device intel-hda,id=hda -device hda-duplex,bus=hda.0,audiodev=audio0 \
 				-device AC97,audiodev=audio0 \
 				-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
@@ -566,7 +573,7 @@ run_qemu() {
 			-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
 			-device virtio-tablet-pci,id=vtablet \
 			-device virtio-tablet-pci,id=vtouch \
-			-audiodev none,id=audio0 \
+			-audiodev wav,id=audio0,path="$AUDIO_WAV" \
 			-device intel-hda,id=hda -device hda-duplex,bus=hda.0,audiodev=audio0 \
 			-device AC97,audiodev=audio0 \
 			-device ich9-ahci,id=ahci \
@@ -3477,6 +3484,33 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 	# ── M38: Intel HDA sound controller + /dev/dsp ──
 	if grep -q "M38-SOUND: ok probe" "$LOG" 2>/dev/null; then
 		pass "HDA controller probed"
+		check_output "$LOG" "M38-SOUND: ok controller" \
+			"the HDA controller identifies itself (vendor and device, so a passed-through card is distinguishable from the emulated one in the log)"
+		check_output "$LOG" "M38-SOUND: ok codec" \
+			"a codec answered a Get Parameter verb with its vendor id — the verb round trip through the controller works"
+		# And what actually came out, which is the only check here that does
+		# not take the driver's word for anything: QEMU's wav backend wrote
+		# every sample the emulated card was given, and the tone has to be in
+		# it at the frequency the guest said it was playing.
+		_audio_wav="${GFX_LOG%.log}-audio.wav"
+		if [ -f "$_audio_wav" ]; then
+			_audio_out="$(python3 "$PROJECT_DIR/tools/check/verify-tone-wav.py" "$_audio_wav" 440 2>&1)"
+			# A `case`, not a pipe into grep: `echo` in this script is a
+			# function that prefixes the instance name, which would put text
+			# in front of the anchor and never match.
+			case "$_audio_out" in
+			"AUDIO-WAV: ok"*)
+				pass "the host can hear it: the samples QEMU captured hold a 440 Hz tone ($_audio_out)"
+				;;
+			*)
+				fail "audio-capture" "$_audio_out"
+				;;
+			esac
+		else
+			skipped "audio-capture" "no capture file — this QEMU has no wav audio backend"
+		fi
+		check_output "$LOG" "M38-SOUND: ok stream-advanced" \
+			"the stream's position register moved while the tone played: the controller really fetched the samples rather than accepting the registers and doing nothing"
 		check_output "$LOG" "M38-SOUND: ok dma-buf" "HDA DMA buffer accessible"
 		check_output "$LOG" "M38-SOUND: ok dev-dsp" "HDA /dev/dsp device node"
 		check_output "$LOG" "M38-SOUND: ok sound-api" "HDA sound device API"

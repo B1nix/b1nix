@@ -112,9 +112,7 @@ static const struct initramfs_file files[] = {
 #ifdef B1NIX_MUSL
 #include "initramfs_ld_musl_x86_64_so_1.inc"
 #endif
-/* Defines vfs_i915_dmc[], and B1NIX_I915_DMC_PRESENT when it is the real
- * firmware rather than the placeholder for a build machine that has none. */
-#include "initramfs_i915_dmc.inc"
+
 
 static const struct initramfs_file files[] = {
     {"/bin/native_smoke", (const char *)vfs_native_smoke_elf,
@@ -126,16 +124,6 @@ static const struct initramfs_file files[] = {
 #endif
     B1NIX_MODULE_INITRAMFS_FILES
     B1NIX_SWITCHROOT_INIT_FILE
-#ifdef B1NIX_I915_DMC_PRESENT
-    /* Where request_firmware looks, and it looks during i915's probe — which
-     * is why this is here and not in the root filesystem. The two directories
-     * are named first, the way every other directory in this table is: a file
-     * whose parents do not exist yet is not created. */
-    {"/lib/firmware/.keep", "", 0, 0},
-    {"/lib/firmware/i915/.keep", "", 0, 0},
-    {"/lib/firmware/i915/kbl_dmc_ver1_04.bin", (const char *)vfs_i915_dmc,
-     sizeof(vfs_i915_dmc), 0},
-#endif
     {"/sbin/.keep", "", 0, 0},
     {"/etc/init.d/.keep", "", 0, 0},
     {"/etc/conf.d/.keep", "", 0, 0},
