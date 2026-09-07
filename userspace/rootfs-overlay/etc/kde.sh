@@ -186,10 +186,16 @@ enter_session() {
 	# talks to /run/utmps/.utmpd-socket; the s6 IPC server behind that socket is
 	# not in this image, and login takes the failure as a length and faults in a
 	# memset. It stays as the fallback: a session without a seat beats none.
+	# The rule has to travel INSIDE the command runuser runs: `-l` builds a
+	# fresh environment, so anything exported out here is gone by the time the
+	# compositor starts, and a file in the home directory was not read either.
+	__kwin_dbg=
+	has_flag b1nix.kwin-debug && __kwin_dbg=1
 	if [ -x /sbin/runuser ]; then
 		echo "KDE: entering session via runuser (seat0, vt1) t=$(up)"
 		exec setsid env XDG_SEAT=seat0 XDG_VTNR=1 \
-			/sbin/runuser -l root -c "/bin/sh /etc/kde.sh" \
+			/sbin/runuser -l root -c \
+			  "${__kwin_dbg:+QT_LOGGING_RULES='kwin_*.debug=true' }/bin/sh /etc/kde.sh" \
 			> /dev/console 2>&1
 	fi
 	if [ -x /sbin/login-pam ]; then
@@ -250,6 +256,18 @@ kprof_hist() {
 }
 echo "KDE: start t=$(up)"
 kprof boot
+
+# b1nix.kwin-debug turns on the compositor's own logging. Its DRM backend is
+# the only thing that can say why a swapchain stops rotating -- from the kernel
+# side all that is visible is a client asking for the same framebuffer again.
+if has_flag b1nix.kwin-debug; then
+	# Through a file, not the environment: the session is entered with
+	# `runuser -l`, which builds a fresh environment and drops anything
+	# exported here. Qt reads this path on its own.
+	mkdir -p /root/.config/QtProject
+	printf '[Rules]\nkwin_*.debug=true\n' > /root/.config/QtProject/qtlogging.ini
+	export QT_LOGGING_RULES="kwin_*.debug=true"
+fi
 
 export HOME=/root
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin

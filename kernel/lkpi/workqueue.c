@@ -370,12 +370,29 @@ int queue_work(struct workqueue_struct *wq, struct work_struct *work)
 }
 
 int queue_delayed_work(struct workqueue_struct *wq, struct delayed_work *dwork,
-                       u64 delay_ticks)
+                       u64 delay_jiffies)
 {
+	u64 delay_ticks;
+
 	if (!wq || !dwork || !dwork->work.func)
 		return 0;
-	if (delay_ticks == 0)
+	if (delay_jiffies == 0)
 		return queue_work(wq, &dwork->work);
+
+	/* The caller counts in jiffies, this queue counts in scheduler ticks, and
+	 * they are not the same unit: <linux/jiffies.h> fixes HZ at 100 for the
+	 * imported tree while the tick runs at 1 kHz. Taking one for the other
+	 * fired every delayed work ten times too early -- a console retry meant to
+	 * span six seconds finished in seven hundred milliseconds, and every
+	 * timeout in the imported drivers was short by the same factor. */
+	{
+		u32 hz = sched_tick_hz();
+		u32 per_jiffy = hz / 100u;
+
+		if (per_jiffy < 1u)
+			per_jiffy = 1u;
+		delay_ticks = delay_jiffies * per_jiffy;
+	}
 
 	u64 flags;
 	spin_lock_irqsave((spinlock_t *)&wq->lock, &flags);

@@ -138,6 +138,18 @@ int put_page(struct page *page)
 	if (!page)
 		return 0;
 	if (__atomic_fetch_sub(&page->count, 1, __ATOMIC_ACQ_REL) == 1) {
+		/* Off the frame-to-page registry first, exactly as __free_page does.
+		 *
+		 * Dropping the frame while leaving the page in the hash left an entry
+		 * that nothing could ever remove: the slot's phys is zeroed here, so
+		 * lkpi_pagevec_release's own unregister became a no-op for it. The
+		 * chain then only grew -- and when the page struct's memory was later
+		 * reused for another page, registering that one found itself already
+		 * in the bucket and linked it to itself. Every later walk of that
+		 * bucket went round for ever holding g_pfn_hash_lock, which is how
+		 * this showed up: a lockup on that lock with kwin_wayland spinning on
+		 * it and no holder to name. */
+		lkpi_page_unregister(page);
 		pmm_free_frame(page->phys);
 		page->phys = 0;
 		return 1;
@@ -429,6 +441,9 @@ void lkpi_pagevec_free(struct page *pv, usize count)
  */
 #define LKPI_PFN_HASH_BITS  12
 #define LKPI_PFN_HASH_SLOTS (1u << LKPI_PFN_HASH_BITS)
+/* Longest chain a healthy bucket can have. Generous by a wide margin: the
+ * whole machine's page structs would have to hash to one bucket to reach it. */
+#define LKPI_PFN_HASH_MAX_CHAIN 1000000ul
 
 static struct page *g_pfn_hash[LKPI_PFN_HASH_SLOTS];
 static spinlock_t g_pfn_hash_lock = SPINLOCK_INIT;
@@ -448,6 +463,37 @@ void lkpi_page_register(struct page *page)
 	u64 flags;
 
 	spin_lock_irqsave(&g_pfn_hash_lock, &flags);
+	/* Registering a page that is already in its bucket would link it to
+	 * itself -- the head IS the page, so hash_next would point at the page --
+	 * and every later walk of that bucket spins forever holding this lock.
+	 * Seen as a lockup on g_pfn_hash_lock with kwin_wayland spinning on it and
+	 * no holder to name, because the holder was going round a cycle.
+	 *
+	 * A double registration is a bookkeeping bug wherever it comes from, so
+	 * it is reported rather than quietly tolerated; the link is left alone so
+	 * the chain stays walkable and the machine keeps running to say so. */
+	for (struct page *p = g_pfn_hash[b]; p; p = p->hash_next) {
+		if (p != page)
+			continue;
+		spin_unlock_irqrestore(&g_pfn_hash_lock, flags);
+		{
+			static unsigned reported;
+
+			if (reported < 8) {
+				reported++;
+				console_write("lkpi: page 0x");
+				console_write_hex64((u64)(usize)page);
+				console_write(" (pfn 0x");
+				console_write_hex64(page->phys / PAGE_SIZE);
+				console_write(") registered twice, from 0x");
+				console_write_hex64(
+				    (u64)(usize)__builtin_return_address(0));
+				ksym_print((u64)(usize)__builtin_return_address(0));
+				console_write("\n");
+			}
+		}
+		return;
+	}
 	page->hash_next = g_pfn_hash[b];
 	g_pfn_hash[b] = page;
 	spin_unlock_irqrestore(&g_pfn_hash_lock, flags);
@@ -484,9 +530,26 @@ struct page *pfn_to_page(unsigned long pfn)
 	struct page *p;
 
 	spin_lock_irqsave(&g_pfn_hash_lock, &flags);
-	for (p = g_pfn_hash[b]; p; p = p->hash_next) {
-		if (p->phys == phys)
-			break;
+	/* Bounded, because an unbounded walk of a corrupted chain is a hang with
+	 * this lock held and nothing to say why. No bucket can legitimately hold
+	 * more pages than the hash has slots' worth of frames; anything past that
+	 * is a cycle, and stopping on it names the bucket instead of the machine. */
+	{
+		unsigned long steps = 0;
+
+		for (p = g_pfn_hash[b]; p; p = p->hash_next) {
+			if (p->phys == phys)
+				break;
+			if (++steps > LKPI_PFN_HASH_MAX_CHAIN) {
+				spin_unlock_irqrestore(&g_pfn_hash_lock, flags);
+				console_write("lkpi: pfn hash bucket ");
+				console_write_dec(b);
+				console_write(" does not end -- chain longer than ");
+				console_write_dec(LKPI_PFN_HASH_MAX_CHAIN);
+				console_write("\n");
+				panic("lkpi pfn hash chain is a cycle");
+			}
+		}
 	}
 	spin_unlock_irqrestore(&g_pfn_hash_lock, flags);
 	return p;

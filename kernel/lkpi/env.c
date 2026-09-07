@@ -9,6 +9,7 @@
  * meet. See <lkpi/env.h> for why that matters.
  */
 
+#include <b1nix/ktime.h>
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/klog.h>
@@ -51,8 +52,35 @@
  * simply rounds; a rate below it cannot happen (the timer is never programmed
  * slower than the PIT's 100 Hz), and the max() keeps the divisor sane if it
  * ever were. */
+/*
+ * jiffies, taken from a clock rather than from the timer tick.
+ *
+ * The tick counter only advances when a timer interrupt is delivered, so
+ * inside a section that masked interrupts it stands still -- and every wait in
+ * the imported tree that is written in milliseconds watches jiffies. i915's
+ * register read takes uncore->lock with spin_lock_irqsave and then waits for a
+ * forcewake ack; with the clock frozen by its own lock, that wait cannot time
+ * out, and the machine hung there in roughly one boot in five, reported as a
+ * spinlock lockup on a lock whose holder was inside fwtable_read32.
+ *
+ * The same trap is described for preempt_disable further down: the reading
+ * there is that a region which stops the clock must not exist. A counter that
+ * keeps running is the other half of that, and it is the half that a genuine
+ * irqsave region needs, since such a region legitimately cannot take the tick.
+ *
+ * The tick remains the fallback for as long as the TSC is not yet a clock --
+ * early boot, where interrupts are on and the tick does arrive.
+ */
+unsigned long lkpi_mmio_reads;
+unsigned long lkpi_mmio_writes;
+
 u64 lkpi_ticks(void)
 {
+	u64 ns = ktime_monotonic_ns();
+
+	if (ns)
+		return ns / 10000000ull; /* linux/jiffies.h fixes HZ at 100 */
+
 	u32 hz = sched_tick_hz();
 	u32 per_jiffy = hz / 100u;
 

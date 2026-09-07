@@ -49,7 +49,18 @@ static inline void interrupts_disable(void) {
 #endif
 }
 
+/* Turning interrupts back on while a linuxkpi spinlock is held is the state
+ * that precedes the i915 probe hang: the holder can then be preempted, and
+ * everything waiting on the lock waits for a task that is not running. The
+ * acquire took them off, so something between the two puts them back, and the
+ * point of this hook is to name it at the instruction that does it.
+ *
+ * Defined out of line (kernel/lkpi/lock.c) so this header stays free of the
+ * lock bookkeeping; a load and a predicted branch when the count is zero. */
+void lkpi_lock_irq_on_check(u64 site);
+
 static inline void interrupts_enable(void) {
+  lkpi_lock_irq_on_check((u64)(usize)__builtin_return_address(0));
   if (__builtin_expect(kprof_irqoff_on, 0))
     kprof_irqoff_end();
 #ifdef __aarch64__
@@ -118,6 +129,8 @@ static inline u64 interrupts_save(void) {
 }
 
 static inline void interrupts_restore(u64 f) {
+  if (KPROF_IRQ_WAS_ON(f))
+    lkpi_lock_irq_on_check((u64)(usize)__builtin_return_address(0));
   if (__builtin_expect(kprof_irqoff_on, 0) && KPROF_IRQ_WAS_ON(f))
     kprof_irqoff_end();
 #ifdef __aarch64__

@@ -2264,12 +2264,20 @@ extern void ap_worker_trampoline(void);
 static int kthread_create_impl(const char *name, kernel_thread_entry entry,
                                void *arg, void (*trampoline)(void),
                                int stealable, int ap_runnable) {
-  interrupts_disable();
+  /* Save and restore, never a bare enable.
+   *
+   * This turned interrupts ON for whatever called it, whatever state that
+   * caller was in. A driver creating a worker from inside a section that
+   * masked them -- i915 does, during probe, with uncore->lock held -- came
+   * back out with them on, was then preempted by the timer while still
+   * holding the lock, and every waiter on that lock waited for a task that
+   * was no longer running. That is the probe hang. */
+  u64 irqflags = interrupts_save();
   struct task *parent_task = current_task;
   /* find_unused_task atomically claims the slot, marks it BLOCKED (reserved
    * until fully initialized), and assigns its id. */
   struct task *task = find_unused_task();
-  interrupts_enable();
+  interrupts_restore(irqflags);
 
   if (task == 0) {
     return -1;
@@ -2430,7 +2438,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   if (!stealable)
     task_init_cred(task);
 
-  interrupts_disable();
+  irqflags = interrupts_save();
   /* M28 T4: fresh task has never been context-switched out, so its kernel
    * stack is fully set up (context.rsp points at a manually-initialised
    * frame). pick_next_task waits for stack_released==1 before claiming;
@@ -2438,7 +2446,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->stack_released = 1;
   task->state = TASK_READY;
   sched_rq_enqueue_current(task);
-  interrupts_enable();
+  interrupts_restore(irqflags);
 
   return (int)task->id;
 }
@@ -4284,6 +4292,42 @@ void scheduler_reap_orphan_zombies(void) {
 
 int scheduler_yield(void) {
   const u64 yield_caller_pc = (u64)(usize)__builtin_return_address(0);
+  {
+    /* Giving up the CPU while holding a linuxkpi spinlock strands every waiter
+     * on it, including this CPU once something else runs here -- the rule the
+     * tree already states as never sleeping under a spinlock.
+     *
+     * It is reported and not refused. Refusing was tried: it turned a hang in
+     * one boot in five into a hang in ten boots out of ten, because the paths
+     * that do this are load-bearing, not rare. So the report names the first
+     * one to do it and the machine keeps its old behaviour; the fix belongs in
+     * whichever path the name points at, not here. */
+    extern int lkpi_holding_spinlock(void);
+
+    /* Giving up the CPU with one of these held strands every waiter on it,
+     * and it is the state that precedes the i915 probe hang every time it is
+     * seen. It cannot happen by accident: these locks are taken with
+     * interrupts off, so the holder can be neither preempted nor migrated.
+     *
+     * So it panics, here, with the acquire that is still outstanding named --
+     * rather than leaving a machine that appears to run and then wedges nine
+     * seconds later on a lock whose holder is not running. A loud stop at the
+     * violation is worth more than a quiet one at the consequence. */
+    int held = lkpi_holding_spinlock();
+
+    if (held) {
+      extern void lkpi_lock_report_held(void);
+
+      console_write("\nsched: yield with ");
+      console_write_dec((u64)held);
+      console_write(" lkpi spinlock(s) held, from 0x");
+      console_write_hex64(yield_caller_pc);
+      ksym_print(yield_caller_pc);
+      console_write("\n");
+      lkpi_lock_report_held();
+      panic("yield while holding an lkpi spinlock");
+    }
+  }
   /* An interrupt handler may yield and resume later on this same C frame.
    * IRQ entry is masked, and enabling interrupts before the handler's
    * RESTORE_REGS/eret lets the next timer interrupt nest on top of that live
@@ -5968,8 +6012,18 @@ void scheduler_on_timer_tick(void) {
    * the next syscall on the resumed task). */
   /* A task inside a non-preemptible region keeps the CPU. The tick still ran:
    * time advances, accounting is done, and a driver polling a register with a
-   * timeout can still observe that timeout expire. */
-  if (current_task->state == TASK_RUNNING && g_preempt_depth[(u32)percpu_read(cpu_id) % MAX_CPUS] == 0) {
+   * timeout can still observe that timeout expire.
+   *
+   * A held linuxkpi spinlock ought to be such a region -- Linux keeps exactly
+   * that rule with preempt_count -- and making it one was tried here. It does
+   * not work with the counter available: that counter can be left positive on
+   * a CPU (a lock acquired and released through paths that do not pair on the
+   * same CPU id), and a CPU that is wrongly believed to hold a lock then never
+   * preempts again. kwin_wayland kept a core to itself and a TLB shootdown
+   * stalled behind it -- a worse failure than the one being chased. The
+   * counter stays a diagnostic until the leak that makes it lie is found. */
+  if (current_task->state == TASK_RUNNING &&
+      g_preempt_depth[(u32)percpu_read(cpu_id) % MAX_CPUS] == 0) {
     scheduler_yield();
   }
 }

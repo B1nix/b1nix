@@ -186,9 +186,32 @@ static const struct vfs_file_ops card1_ops = {
  * does is carry the question across. */
 static int card1_mmap_page_phys(struct vfs_handle *handle, u64 offset,
                                 u64 *out_phys) {
+  int rc;
+
   if (!handle || !handle->private_data || !out_phys)
     return -EINVAL;
-  return lkpi_drm_mmap_page_phys(handle->private_data, offset, out_phys);
+  rc = lkpi_drm_mmap_page_phys(handle->private_data, offset, out_phys);
+  {
+    /* The first pages of each mapping, and every refusal.
+     *
+     * A compositor builds its swapchain by allocating a buffer and mapping
+     * it, and stops at the first one it cannot map -- leaving a swapchain of
+     * one, which has nowhere to draw but the buffer on screen. A refusal here
+     * is invisible from userspace's side of the call, so it is said here. */
+    static unsigned shown;
+    static u64 last_base;
+
+    if (rc < 0 || ((offset & ~0xfffull) != last_base && shown < 12)) {
+      last_base = offset & ~0xfffull;
+      shown++;
+      console_write("drm-card1: mmap offset 0x");
+      console_write_hex64(offset);
+      console_write(" -> ");
+      console_write_dec((u64)(rc < 0 ? -rc : rc));
+      console_write(rc < 0 ? " (REFUSED)\n" : "\n");
+    }
+  }
+  return rc;
 }
 
 /* ── open ───────────────────────────────────────────────────────── */

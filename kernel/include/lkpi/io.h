@@ -36,12 +36,23 @@ static inline u8 readb(const volatile void *addr)
 {
 	return *(const volatile u8 *)addr;
 }
+/* How much MMIO the drivers actually do.
+ *
+ * A register access on an assigned device can be a trap to the hypervisor, and
+ * whether that matters depends entirely on how many of them a frame costs --
+ * which nothing here could say. Two counters, incremented without atomics
+ * because they are a rate and not a ledger: the cost of making them exact
+ * would be larger than what they measure. */
+extern unsigned long lkpi_mmio_reads;
+extern unsigned long lkpi_mmio_writes;
+
 static inline u16 readw(const volatile void *addr)
 {
 	return *(const volatile u16 *)addr;
 }
 static inline u32 readl(const volatile void *addr)
 {
+	lkpi_mmio_reads++;
 	return *(const volatile u32 *)addr;
 }
 static inline u64 readq(const volatile void *addr)
@@ -58,6 +69,7 @@ static inline void writew(u16 v, volatile void *addr)
 }
 static inline void writel(u32 v, volatile void *addr)
 {
+	lkpi_mmio_writes++;
 	*(volatile u32 *)addr = v;
 }
 static inline void writeq(u64 v, volatile void *addr)
