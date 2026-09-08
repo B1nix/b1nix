@@ -49,6 +49,7 @@
 #include <drm/drm_crtc.h>
 #include <drm/drm_plane.h>
 #include <drm/drm_framebuffer.h>
+#include <linux/kthread.h>
 #include <asm/ioctl.h>
 #include <linux/atomic.h>
 #include <uapi/drm/i915_drm.h>
@@ -1159,6 +1160,38 @@ static void drm_fps_note_flip(struct file *filp)
 	drm_fps_fb_alive = 0;
 	drm_fps_fb_fullscreen = 0;
 	mutex_lock(&dev->mode_config.fb_lock);
+	{
+		/* Do the two full-screen buffers actually hold different memory?
+		 *
+		 * Everything else about the flip path checks out, and drawing into a
+		 * "back" buffer that shares pages with the front tears on every
+		 * change while looking, from the outside, exactly like a swapchain
+		 * that alternates. The GEM handle behind each framebuffer says it in
+		 * one line. Printed once. */
+		static int aliased_checked;
+
+		if (!aliased_checked && lkpi_bootflag("b1nix.drm-tearwatch")) {
+			struct drm_framebuffer *a = 0, *b = 0;
+			struct drm_framebuffer *f;
+
+			list_for_each_entry(f, &dev->mode_config.fb_list, head) {
+				if (f->width < 1024)
+					continue;
+				if (!a)
+					a = f;
+				else if (!b)
+					b = f;
+			}
+			if (a && b) {
+				aliased_checked = 1;
+				pr_info("drm: fb %u obj %p vs fb %u obj %p: %s\n",
+				        a->base.id, (void *)a->obj[0], b->base.id,
+				        (void *)b->obj[0],
+				        a->obj[0] == b->obj[0] ? "SAME OBJECT"
+				                               : "different objects");
+			}
+		}
+	}
 	list_for_each_entry(fb, &dev->mode_config.fb_list, head) {
 		drm_fps_fb_alive++;
 		/* Full-screen ones only are the swapchain. Counting every framebuffer
@@ -1197,6 +1230,86 @@ static void drm_fps_note_flip(struct file *filp)
  * passed in. An event with the wrong user_data, or a sequence that never
  * advances, is one it cannot account for -- and a swapchain whose buffers are
  * never released has nothing to rotate to, which is what the plane shows. */
+/*
+ * Where the beam is when the compositor is handed a flip completion.
+ *
+ * A completion says "the buffer you flipped away from is yours again". If it
+ * arrives before the hardware has actually latched the new surface, the
+ * compositor starts repainting the buffer the display is still reading, and
+ * the picture tears however well the flip itself was timed. Delivered right
+ * after the vertical blank, the beam is at the top of the frame; spread over
+ * the frame, the events are not vblank-locked at all.
+ */
+extern u32 lkpi_i915_scanline(void);
+
+static void drm_event_scanline_note(void)
+{
+	static u64 events, early, late;
+	static u32 lo = 0xffffffff, hi;
+	u32 line;
+
+	if (!lkpi_bootflag("b1nix.drm-tearwatch") &&
+	    !lkpi_bootflag("b1nix.drm-eventwatch"))
+		return;
+	/*
+	 * The completion the compositor is reading right now: has the flip it
+	 * reports actually landed?
+	 *
+	 * PLANE_SURF holds the address the driver armed, PLANE_SURFLIVE the one
+	 * the display engine is reading. While a flip is pending they differ, so
+	 * an event handed over in that state tells the compositor a frame is on
+	 * screen that is not, and the buffer it then considers free is the one
+	 * still being scanned.
+	 */
+	{
+		extern u32 lkpi_i915_live_surface(void);
+		extern u32 lkpi_i915_armed_surface(void);
+		static u64 seen, pending;
+		u32 live = lkpi_i915_live_surface();
+		u32 armed = lkpi_i915_armed_surface();
+
+		if (live || armed) {
+			seen++;
+			/*
+			 * Page granularity, because the two registers do not agree in
+			 * their low bits: PLANE_SURFLIVE reads back the address with the
+			 * plane's own offset folded in (a constant 0x20 here), so a raw
+			 * comparison calls every completion late and proves nothing.
+			 * What matters is whether the display engine is fetching the
+			 * page the flip armed.
+			 */
+			if ((live >> 12) != (armed >> 12))
+				pending++;
+			if ((seen % 60) == 0)
+				pr_info("drm: flip completions: %llu handed to the "
+				        "compositor, %llu of them while the hardware had "
+				        "NOT yet latched the new address\n",
+				        (unsigned long long)seen,
+				        (unsigned long long)pending);
+		}
+	}
+	line = lkpi_i915_scanline();
+	if (line == 0xffffffff)
+		return;
+	events++;
+	if (line < lo)
+		lo = line;
+	if (line > hi)
+		hi = line;
+	if (line < 100 || line >= 1080)
+		early++; /* at the top of the frame or in blanking: vblank-locked */
+	else
+		late++;
+	if ((events % 60) == 0) {
+		pr_info("drm: flip events: %llu at the top or in blanking, %llu in "
+		        "mid-frame (lines %u..%u)\n", (unsigned long long)early,
+		        (unsigned long long)late, lo, hi);
+		early = late = 0;
+		lo = 0xffffffff;
+		hi = 0;
+	}
+}
+
 static void drm_fps_note_event(const void *user_buf, isize len)
 {
 	struct {
@@ -1316,6 +1429,20 @@ isize lkpi_drm_read(void *file, void *user_buf, usize len)
 	if (!filp)
 		return -EBADF;
 	ret = (isize)drm_read(filp, (char __user *)user_buf, (size_t)len, &pos);
+	/* The completion check stands on its own.
+	 *
+	 * It used to sit inside the frame-rate block, so asking only for it got
+	 * a silent run: the question "was the flip finished when the compositor
+	 * was told" has nothing to do with counting frames per second. */
+	if (ret > 0 && lkpi_bootflag("b1nix.drm-eventwatch"))
+		drm_event_scanline_note();
+	/* The per-commit note is about which memory a framebuffer is made of,
+	 * which the binding watch needs and the frame-rate counter does not. */
+	if (ret > 0 && lkpi_bootflag("b1nix.drm-bindwatch")) {
+		extern void lkpi_i915_note_commit(void);
+
+		lkpi_i915_note_commit();
+	}
 	if (ret > 0 && lkpi_bootflag("b1nix.drm-fps")) {
 		/* Events, counted by the bytes they occupy rather than by reads: one
 		 * read can carry several. A compositor that submits more flips than
@@ -1333,6 +1460,12 @@ isize lkpi_drm_read(void *file, void *user_buf, usize len)
 		 * flips alternate between framebuffers or keep naming the same one. */
 		drm_fps_note_flip(filp);
 		drm_fps_note_event(user_buf, ret);
+		drm_event_scanline_note();
+		{
+			extern void lkpi_i915_note_commit(void);
+
+			lkpi_i915_note_commit();
+		}
 		drm_fps_note();
 	}
 	/* What a compositor's event loop actually receives. A page-flip completion

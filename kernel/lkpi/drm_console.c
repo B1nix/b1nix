@@ -322,6 +322,14 @@ static struct drm_crtc *fliptest_setup(struct fliptest *f, struct drm_device *de
 		pr_info("drm: fliptest: own modeset failed (%d)\n", ret);
 		return NULL;
 	}
+	/* Tiling turns a straight column into stripes.
+	 *
+	 * A solid fill looks the same whatever the layout, which is why the
+	 * red/green test passed while a moving bar came out as a zebra: linear
+	 * writes into a tiled buffer land in scattered places on screen. */
+	pr_info("drm: fliptest: modifier %llx, pitch %u, format %.4s\n",
+	        (unsigned long long)f->buf[0]->fb->modifier, f->pitch,
+	        (const char *)&f->buf[0]->fb->format->format);
 	pr_info("drm: fliptest: %ux%u on crtc %u, framebuffers %u (red) and %u (green)\n",
 	        f->width, f->height, crtc->base.id, f->buf[0]->fb->base.id,
 	        f->buf[1]->fb->base.id);
@@ -404,6 +412,7 @@ static int fliptest_thread(void *arg)
 	unsigned i;
 	int bar = lkpi_bootflag("b1nix.drm-fliptest-bar");
 	unsigned bar_w = 120;
+	unsigned last_x[2] = { 0, 0 };
 
 	pr_info("drm: fliptest: wait %u s, hold %u ms, %u cycles\n", wait_s, hold_ms,
 	        cycles);
@@ -450,11 +459,22 @@ static int fliptest_thread(void *arg)
 		 * order a compositor uses, and the one that puts a tear on the flip
 		 * rather than on the drawing. */
 		if (bar) {
-			unsigned step = f->width / 24 ? f->width / 24 : 1;
-			unsigned x = (i * step) % (f->width - bar_w);
-			unsigned old = ((i >= 2 ? i - 2 : 0) * step) % (f->width - bar_w);
+			/* How far the bar jumps between frames. A big jump is what makes
+			 * a tear unmistakable: the torn frame shows the bar in two
+			 * places at once, one above the seam and one below. */
+			unsigned step = lkpi_bootopt_u32("b1nix.drm-fliptest-step",
+			                                 f->width / 24 ? f->width / 24 : 1);
 
-			fliptest_bar(f, (int)(i & 1), x, old, bar_w);
+			if (!step)
+				step = 1;
+			unsigned x = (i * step) % (f->width - bar_w);
+
+			/* Where this buffer's own bar was left, not where the bar was two
+			 * frames ago: with a step that does not divide the width the two
+			 * part company after the first wrap, the old bars are never
+			 * cleared, and the screen fills with stripes. */
+			fliptest_bar(f, (int)(i & 1), x, last_x[i & 1], bar_w);
+			last_x[i & 1] = x;
 		}
 
 		/* The master check is a check, not a lock to hold work under.
@@ -473,7 +493,12 @@ static int fliptest_thread(void *arg)
 
 		/* The driver's own page flip, which is what a legacy client's ioctl
 		 * reaches. No event and no flags: this asks only whether the plane
-		 * ends up holding what was asked for. */
+		 * ends up holding what was asked for -- and "holding" here is the
+		 * driver's own atomic state, not a display register. What the
+		 * hardware is actually scanning out is a different question, and
+		 * b1nix.drm-tearwatch is what asks it (PLANE_SURFLIVE). Read this
+		 * test as "the software path carries the buffer through", nothing
+		 * more. */
 		fliptest_where = 1;
 		flip = fliptest_flip(crtc, want, &got_flip);
 		fliptest_where = 2;

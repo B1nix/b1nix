@@ -1854,6 +1854,43 @@ void kernel_main(usize arg0, usize arg1)
 	console_write(init_log);
 	snprintf(g_boot_init, sizeof(g_boot_init), "%s pid=%d", init_path, init_pid);
 
+	/*
+	 * PID 1 is up: the kernel stops being the printer.
+	 *
+	 * Linux keeps its messages in a ring and lets userspace read them
+	 * (/dev/kmsg, journald, dmesg); the console is for what someone must see
+	 * even when nothing else runs. This kernel instead drew every info line
+	 * itself, on the console and, when the console lives on a DRM display,
+	 * into the same panel a compositor is using -- 1.8 M cycles a line with
+	 * interrupts off, for output the guest's own init is already collecting.
+	 *
+	 * From here the console carries warnings and worse. Everything is still
+	 * in the ring, /dev/kmsg still serves it, panics still print, and
+	 * `loglevel=` or a test boot (b1nix.test=1, whose whole grading is the
+	 * serial log) keeps whatever it asked for.
+	 */
+	/* A measurement asked for on the command line is output someone is
+	 * waiting to read, so those flags keep the console as it was. */
+	if (init_pid > 0 && !bootinfo_has_flag("b1nix.test=1") &&
+	    !bootinfo_get_kv("loglevel", 0, 0) &&
+	    !bootinfo_has_flag("b1nix.console-verbose") &&
+	    !bootinfo_has_flag("b1nix.drm-fps") &&
+	    !bootinfo_has_flag("b1nix.drm-tearwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-paintwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-crcwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-bandwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-scanwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-eventwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-bindwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-gsmtrap") &&
+	    !bootinfo_has_flag("b1nix.drm-cadence") &&
+	    !bootinfo_get_u32("b1nix.drm-framedump", 0) &&
+	    !bootinfo_has_flag("b1nix.sysprof")) {
+		console_write("init: the console is userspace's now; the kernel keeps "
+		              "warnings (b1nix.console-verbose keeps it all)\n");
+		console_loglevel_set(CONSOLE_LOGLEVEL_QUIET);
+	}
+
 	/* A PID 1 that never started must say so, loudly, right here.
 	 *
 	 * Both early failures inside user_spawn return a bare error and print

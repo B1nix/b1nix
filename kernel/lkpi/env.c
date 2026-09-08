@@ -196,6 +196,14 @@ int lkpi_wake_task(struct lkpi_task *t)
 	return 1;
 }
 
+void lkpi_sleep_ms(unsigned ms)
+{
+	u64 deadline = scheduler_get_ticks() + ((u64)ms * (u64)sched_tick_hz()) / 1000u;
+
+	while (scheduler_get_ticks() < deadline)
+		scheduler_sleep_ticks(1);
+}
+
 u64 lkpi_sleep_jiffies(u64 jiffies_count)
 {
 	u32 hz = sched_tick_hz();
@@ -1014,6 +1022,11 @@ int lkpi_bootflag(const char *flag)
 int lkpi_bootopt_str(const char *key, char *out, unsigned out_size)
 {
 	return bootinfo_get_kv(key, out, out_size);
+}
+
+void *lkpi_phys_to_virt(u64 phys)
+{
+	return (void *)(usize)(vmm_direct_map_base() + phys);
 }
 
 void lkpi_dump_tasks(void)

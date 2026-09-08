@@ -318,16 +318,13 @@ fi
 # EXTRA_QEMU_ARGS wins and this adds nothing.
 #
 # Both Ctrl keys together toggle the grab, which is the way back to the host.
-if [ -z "${INPUT_EVDEVS+set}" ]; then
-	INPUT_EVDEVS=""
-	for link in /dev/input/by-path/*-event-mouse /dev/input/by-path/*-event-kbd; do
-		[ -e "$link" ] || continue
-		node=$(readlink -f "$link")
-		[ -r "$node" ] || continue
-		case " $INPUT_EVDEVS " in *" $node "*) continue;; esac
-		INPUT_EVDEVS="$INPUT_EVDEVS $node"
-	done
-fi
+#
+# Opt-in, because grab_all takes the devices away from the host for as long as
+# the guest runs. Discovering them automatically meant every run -- including
+# the ones that only read registers and print numbers -- left the person at the
+# machine with a dead keyboard and mouse. Name them to hand them over:
+#   INPUT_EVDEVS="/dev/input/event10 /dev/input/event11" tools/drm/run-...
+: "${INPUT_EVDEVS:=}"
 case "${EXTRA_QEMU_ARGS:-}" in
 *input-linux*) ;;
 *)
@@ -337,8 +334,8 @@ case "${EXTRA_QEMU_ARGS:-}" in
 		DEV_ARGS="$DEV_ARGS -object input-linux,id=hostin$i,evdev=$node,grab_all=on"
 	done
 	if [ "$i" -eq 0 ]; then
-		echo "warning: no readable keyboard/mouse evdev found — the guest gets no input." >&2
-		echo "         grant access with: sudo setfacl -m u:$USER:rw /dev/input/eventN" >&2
+		echo "input: none attached (set INPUT_EVDEVS to hand the guest a keyboard" >&2
+		echo "       and mouse; access comes from: sudo setfacl -m u:$USER:rw /dev/input/eventN)" >&2
 	else
 		echo "input: attached$INPUT_EVDEVS"
 	fi
@@ -348,6 +345,23 @@ esac
 # Anything else for QEMU, verbatim.
 DEV_ARGS="$DEV_ARGS ${EXTRA_QEMU_ARGS:-}"
 
+
+# Keyboard and mouse, when the run is meant to be used rather than watched.
+#
+# QEMU's input-linux objects hand a host evdev node straight to the guest, so
+# the compositor sees a real device rather than a synthesised one. Named by
+# INPUT_KBD / INPUT_MOUSE because the event numbers move across host reboots.
+# No grab_all: it takes the host's OTHER input devices too, so the machine
+# running the test stops answering its own keyboard and looks hung. The guest
+# still receives everything from the node it is given.
+if [ -n "${INPUT_KBD:-}" ]; then
+	[ -r "$INPUT_KBD" ] || { echo "cannot read $INPUT_KBD (setfacl?)" >&2; exit 1; }
+	DEV_ARGS="$DEV_ARGS -object input-linux,id=kbd0,evdev=$INPUT_KBD,repeat=on"
+fi
+if [ -n "${INPUT_MOUSE:-}" ]; then
+	[ -r "$INPUT_MOUSE" ] || { echo "cannot read $INPUT_MOUSE (setfacl?)" >&2; exit 1; }
+	DEV_ARGS="$DEV_ARGS -object input-linux,id=mouse0,evdev=$INPUT_MOUSE"
+fi
 
 echo "b1nix + $IGD_BDF via VFIO ($MACHINE), ${MEM_MB}M, log: $LOG"
 
@@ -386,6 +400,23 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
 	-no-reboot \
 	> "$LOG" 2>&1 &
 qemu_pid=$!
+
+# Stop when the run says it is finished, rather than sitting out the timeout.
+#
+# The guest prints a marker when its session ends; waiting for TIMEOUT after
+# that spends a minute a run watching a shut-down desktop and an idle console.
+# The timeout stays as the ceiling for a run that never gets there.
+(
+	while kill -0 "$qemu_pid" 2>/dev/null; do
+		if grep -aq "KDE: done\|B1NIX-TEST: done\|KERNEL PANIC" "$LOG" 2>/dev/null; then
+			sleep 1        # let the last lines land
+			kill "$qemu_pid" 2>/dev/null
+			exit 0
+		fi
+		sleep 1
+	done
+) &
+done_watch=$!
 
 # Capture once the guest says it has mirrored a frame, or give up when QEMU
 # does. Polling the log rather than sleeping a fixed time: the modeset happens

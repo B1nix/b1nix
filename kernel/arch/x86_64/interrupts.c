@@ -214,6 +214,70 @@ extern void isr255(void);  /* LAPIC spurious — no-EOI no-op */
 
 static volatile u64 timer_ticks;
 
+/*
+ * A hardware watchpoint on one kernel address.
+ *
+ * Some corruption has no plausible author in the code you own: the display's
+ * page-table entry is rewritten while the beam is inside the picture, and
+ * every candidate in reach has been ruled out. A data breakpoint answers who
+ * wrote it without guessing and without decoding instructions -- the CPU traps
+ * after the store and hands over the instruction pointer.
+ *
+ * The debug registers are per-CPU, so arming has to reach every CPU. Rather
+ * than an IPI, each CPU picks the request up on its next scheduler tick: the
+ * writer is a thread that runs for milliseconds, and a tick is a millisecond
+ * away.
+ */
+static volatile u64 watch_addr;      /* address to watch, 0 = disarmed */
+static volatile u64 watch_generation;/* bumped on every change */
+static volatile u64 watch_hits;
+
+void x86_watchpoint_write(u64 addr)
+{
+  watch_addr = addr;
+  watch_generation++;
+}
+
+u64 x86_watchpoint_hits(void) { return watch_hits; }
+
+/* Arm this CPU if it has not seen the current request. */
+static u64 watch_seen[64];   /* per CPU: the request this CPU has armed */
+
+static void watchpoint_arm_this_cpu(void)
+{
+  /* Indexed by CPU, not thread-local: this runs from an interrupt, where the
+   * kernel's TLS base is not the one a __thread variable would resolve
+   * through -- reading one faulted before the first watchpoint was ever set. */
+  struct percpu *pc = get_percpu();
+  unsigned cpu = pc ? (unsigned)pc->cpu_id : 0;
+  u64 *seen_slot;
+  u64 gen = watch_generation;
+  u64 addr = watch_addr;
+  u64 dr7;
+
+  if (cpu >= 64)
+    return;
+  seen_slot = &watch_seen[cpu];
+  /* Re-armed on every tick rather than once per request.
+   *
+   * Arming once and trusting it to stick assumes nothing else touches DR7 --
+   * and something does: the first run armed the register and never trapped a
+   * single write, while another instrument watched the same address change
+   * eight times. Writing it every tick costs two register stores and removes
+   * the assumption. */
+  (void)seen_slot;
+  *seen_slot = gen;
+  if (!addr) {
+    __asm__ volatile("mov %0, %%dr7" :: "r"((u64)0));
+    return;
+  }
+  __asm__ volatile("mov %0, %%dr0" :: "r"(addr));
+  /* L0 enabled, RW0 = 01 (data writes), LEN0 = 10 (eight bytes). */
+  dr7 = (1ull << 0) | (0x1ull << 16) | (0x2ull << 18);
+  __asm__ volatile("mov %0, %%dr7" :: "r"(dr7));
+}
+
+
 static u64 read_cr2(void) {
   u64 value;
 
@@ -622,6 +686,10 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
    * still gated on the VFS chain-walk rwlock audit, M28 item 3). */
   if (frame->vector == 64) {
     struct percpu *pcpu = get_percpu();
+
+    /* Pick up (and re-assert) a watchpoint request. */
+    if (watch_addr)
+      watchpoint_arm_this_cpu();
     int is_bsp = pcpu ? (pcpu->cpu_id == 0) : 1;
     /* T8 (M28 #8): EOI BEFORE scheduler_on_timer_tick. With preemptive
      * yields enabled, scheduler_on_timer_tick may context-switch away —
@@ -821,6 +889,35 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   if (frame->vector == 1 && (frame->cs == 0x1B || frame->cs == 0x23) &&
       ptrace_handle_debug_trap(frame))
     return;
+
+  /*
+   * A watchpoint hit in kernel code: report where the store came from and
+   * carry on. DR6's B0 says it was breakpoint 0 rather than a single step,
+   * and it has to be cleared by hand or the next trap reports stale bits.
+   */
+  if (frame->vector == 1 && watch_addr) {
+    u64 dr6;
+
+    __asm__ volatile("mov %%dr6, %0" : "=r"(dr6));
+    if (dr6 & 1ull) {
+      __asm__ volatile("mov %0, %%dr6" :: "r"(dr6 & ~0xfull));
+      if (watch_hits++ < 12) {
+        console_write("watchpoint: ");
+        console_write_hex64(watch_addr);
+        console_write(" written from ");
+        console_write_hex64(frame->rip);
+        console_write(" (");
+        {
+          u64 off = 0;
+          const char *sym = ksym_lookup(frame->rip, &off);
+
+          console_write(sym ? sym : "?");
+        }
+        console_write(")\n");
+      }
+      return;
+    }
+  }
 
   if ((frame->vector == 3 || frame->vector == 1) &&
       bootinfo_has_flag("b1nix.gdb")) {

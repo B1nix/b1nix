@@ -858,6 +858,31 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 		export QT_LOGGING_RULES="kwin_*.debug=true"
 		# env -u WAYLAND_DISPLAY/DISPLAY: KWin's usesLibinput() takes a set
 		# WAYLAND_DISPLAY to mean it is a nested client and skips libinput.
+		# b1nix.kde-fullrepaint: repaint the whole screen every frame.
+		#
+		# KWin normally repaints only what changed, and to do that it has to
+		# know how old the buffer it is drawing into is -- with two buffers,
+		# the damage of the last two frames. A wrong buffer age assembles a
+		# frame out of two, which on a moving picture is indistinguishable
+		# from a scanout tear by eye. The kernel's own flips are provably
+		# whole (b1nix.drm-fliptest with a moving bar), so this is the next
+		# thing to rule out, and KWIN_USE_BUFFER_AGE=0 is how.
+		# b1nix.kde-noscanout: composite everything, never hand a client's own
+		# buffer to the display.
+		#
+		# With direct scanout the picture on the glass IS the application's
+		# buffer, so an application that keeps drawing into it -- because it
+		# was told the buffer was free again -- paints into the frame being
+		# scanned. That looks exactly like a scanout tear while every flip in
+		# the kernel is correct, which is the state the measurements are in.
+		if has_flag b1nix.kde-noscanout; then
+			echo "KDE: direct scanout off (compositing every frame)"
+			export KWIN_DRM_NO_DIRECT_SCANOUT=1
+		fi
+		if has_flag b1nix.kde-fullrepaint; then
+			echo "KDE: full repaint per frame (buffer age off)"
+			export KWIN_USE_BUFFER_AGE=0
+		fi
 		env -u WAYLAND_DISPLAY -u DISPLAY \
 		timeout 900 /usr/bin/kwin_wayland --drm --socket wayland-1 \
 			--no-lockscreen > /tmp/kde-kwin.log 2>&1 &
@@ -958,9 +983,25 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 	# frame, which is the load the buffer question needs.
 	if has_flag b1nix.kde-damage && [ -x /usr/bin/foot ]; then
 		echo "KDE: damage load t=$(up)"
-		WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" \
-			foot sh -c 'while :; do date +%H:%M:%S.%N; usleep 30000; done' \
-			> /tmp/kde-foot-damage.log 2>&1 &
+		# Two loads, because they answer different questions.
+		#
+		# b1nix.kde-damage prints a scrolling line: content that MOVES, which
+		# is what a partial repaint can seam. b1nix.kde-damage-flat alternates
+		# two full-screen colours instead, which is what catches a frame
+		# assembled out of two whole states.
+		if has_flag b1nix.kde-damage-flat; then
+			WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" \
+				foot sh -c 'while :; do
+					printf "\033[41m\033[2J"; usleep 40000
+					printf "\033[44m\033[2J"; usleep 40000
+				done' > /tmp/kde-foot-damage.log 2>&1 &
+		else
+			WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" \
+				foot sh -c 'i=0; while :; do
+					i=$((i+1)); echo "line $i ============================"
+					usleep 30000
+				done' > /tmp/kde-foot-damage.log 2>&1 &
+		fi
 	fi
 	if has_flag b1nix.sysprof; then
 		__left=$__hold

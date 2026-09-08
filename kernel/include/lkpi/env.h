@@ -26,6 +26,9 @@ u64 lkpi_ticks(void);            /* jiffies: 10 ms each, whatever the tick rate 
 /* Park for a number of jiffies; returns the jiffies left when woken early,
  * zero when the whole sleep elapsed. Not from atomic context. */
 u64 lkpi_sleep_jiffies(u64 jiffies_count);
+/* A sleep in milliseconds, for code that needs a finer step than the imported
+ * jiffy (10 ms). Sleeps the whole time asked for. */
+void lkpi_sleep_ms(unsigned ms);
 
 /* ── scheduling ─────────────────────────────────────────────────── */
 void lkpi_yield(void);
@@ -416,6 +419,10 @@ int lkpi_bootopt_str(const char *key, char *out, unsigned out_size);
 /* Every task, with its state and where it parked. b1nix's own dump, reached
  * from imported-side code that has found a thread that is not moving. */
 void lkpi_dump_tasks(void);
+
+/* A physical address as a kernel pointer, through the direct map. For imported
+ * code that has a DMA address and needs to look at the bytes behind it. */
+void *lkpi_phys_to_virt(u64 phys);
 
 /* "This wait has not finished in a long time", from the wait_event macro,
  * which is the only place that knows the source line of the waiter. */
