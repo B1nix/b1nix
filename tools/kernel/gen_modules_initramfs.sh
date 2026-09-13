@@ -9,6 +9,8 @@
 #                  is EXPORT_SYMBOL'd by B.
 #   modules.alias  "<alias>: <module>"       — every MODULE_ALIAS() tag found
 #                  in the module's .modinfo section.
+#   modules.builtin one path per module compiled into the kernel image, from
+#                  $BUILTIN (names); depmod refuses to run without the file.
 #
 # Both are derived from the objects themselves, never from a hand-written list,
 # so a new dependency or alias in the source shows up without touching a
@@ -91,6 +93,12 @@ for name in $MODULES; do
     done
 done
 
+# ── modules.builtin ──
+: > "$WORK/modules.builtin"
+for name in ${BUILTIN:-}; do
+    printf 'kernel/%s.ko\n' "$name" >> "$WORK/modules.builtin"
+done
+
 # ── the .inc ──
 mkdir -p "$(dirname "$OUT")"
 : > "$OUT"
@@ -101,6 +109,7 @@ for ko in "$@"; do
 done
 $XXD_I -i -n vfs_modules_dep "$WORK/modules.dep" >> "$OUT"
 $XXD_I -i -n vfs_modules_alias "$WORK/modules.alias" >> "$OUT"
+$XXD_I -i -n vfs_modules_builtin "$WORK/modules.builtin" >> "$OUT"
 
 printf '%s\n' '#define B1NIX_MODULE_INITRAMFS_FILES \' >> "$OUT"
 for ko in "$@"; do
@@ -111,4 +120,6 @@ for ko in "$@"; do
 done
 printf '    {"/lib/modules/%s/modules.dep", (const char *)vfs_modules_dep, sizeof(vfs_modules_dep), 0},' "$RELEASE" >> "$OUT"
 printf '\\\n' >> "$OUT"
-printf '    {"/lib/modules/%s/modules.alias", (const char *)vfs_modules_alias, sizeof(vfs_modules_alias), 0},\n' "$RELEASE" >> "$OUT"
+printf '    {"/lib/modules/%s/modules.alias", (const char *)vfs_modules_alias, sizeof(vfs_modules_alias), 0},' "$RELEASE" >> "$OUT"
+printf '\\\n' >> "$OUT"
+printf '    {"/lib/modules/%s/modules.builtin", (const char *)vfs_modules_builtin, sizeof(vfs_modules_builtin), 0},\n' "$RELEASE" >> "$OUT"

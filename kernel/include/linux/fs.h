@@ -484,7 +484,6 @@ static inline void mapping_set_error(struct address_space *mapping, int error)
 #define S_CASEFOLD  (1 << 15)
 #define S_VERITY    (1 << 16)
 #define S_KERNEL_FILE (1 << 17)
-#define S_NOSEC       (1 << 18)
 
 /* i_opflags */
 #define IOP_FASTPERM  0x0001

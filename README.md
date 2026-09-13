@@ -1,360 +1,109 @@
 # B1NIX
 
-B1NIX is an experimental Unix-like monolithic operating system written mostly
-in C. It boots through Multiboot2, runs native ELF programs in ring 3, provides
-its own kernel, libc, shell, filesystems, network stack, drivers, and native
-development toolchain, and can rebuild its kernel from inside B1NIX.
-
-The active target is `x86_64`. The old 32-bit `i686` port is archived after its
-last green smoke run (`804/0`, 2026-06-23). The AArch64 (`ARCH=aarch64`) port is under
-active restoration and development on the `feature/aarch64` branch.
+B1NIX is an experimental Unix-like monolithic kernel written in C11. It boots
+through Limine (Multiboot2, BIOS and UEFI) and runs unmodified Linux userspace
+through a Linux-compatible syscall ABI. The test images are assembled from
+pinned Alpine packages (BusyBox, sway, foot, Mesa, Chromium, ...); a Debian
+image checks the glibc side. Graphics and filesystem drivers are imported
+unmodified from Linux through an in-tree linuxkpi layer.
 
 > B1NIX is a research and hobby operating system, not a production system.
-> Interfaces, disk formats, security behavior, and build workflows may change.
+> Interfaces, disk formats, security behavior and build workflows may change.
 
-## Current Capabilities
+Implementation status per milestone is tracked in
+[docs/roadmap.md](docs/roadmap.md).
 
-- Multiboot2 boot through the Limine bootloader on BIOS and UEFI systems.
-- 64-bit x86 kernel selected with `ARCH=x86_64`.
-- Preemptive SMP scheduling, per-CPU state, process groups, job control,
-  signals, futexes, pthreads, and copy-on-write `fork()`.
-- Native ELF64 userspace targeting **musl libc 1.2.5** and **LLVM libc++** with isolated page tables, `mmap`, shared file mappings, PIE loading, core dumps, and a POSIX-oriented syscall ABI.
-- VFS with dynamic descriptor tables, pipes, PTYs, file locking, AIO,
-  `/proc`, `/sys`, initramfs, a page cache, and persistent root filesystems.
-- Read/write ext2, ext3, and ext4; FAT32 and ext1 support; read-only ISO9660,
-  exFAT, NTFS, and Btrfs metadata probing.
-- VirtIO block, network, and GPU; AHCI, NVMe, Intel e1000/e1000e, Realtek
-  r8169, PS/2 input, xHCI USB keyboard and mass-storage paths.
-- IPv4 and IPv6, ARP, NDP, ICMP, UDP, TCP, Unix sockets, DHCP, DNS, NTP,
-  `select`/`poll`, and passive TCP services.
-- Framebuffer console, Mesa 3D graphics renderer, NetSurf FB web browser, a small compositor, a text editor, and a two-panel file manager.
-- A shell (`zsh` interactive, `ash` `/bin/sh`) with pipelines, redirection, scripts, globbing, command and arithmetic substitution, here-documents, functions, loops, `case`, arrays, traps, and foreground/background job control.
-- Native utilities plus musl libc, LLVM libc++, zsh, curl, Dropbear SSH, TinyCC, Duktape, bmake, samurai, Mesa 3D, and BusyBox 1.38.0.
-- Ported LLVM/Clang toolchain, bmake, samurai, b1cc, and native build environment. The x86_64 kernel can be compiled and linked from inside B1NIX.
-- Automated QEMU coverage for boot, SMP, memory, storage, filesystems,
-  networking, SSH, graphics, libc, shell, and userspace behavior.
+## Architectures
 
-See [docs/roadmap.md](docs/roadmap.md) for the detailed implementation status.
-
-## Quick Start
-
-### Requirements
-
-The basic build expects:
-
-- GNU Make
-- Clang
-- LLVM `ld.lld`, `llvm-ar`, and related tools
-- `xxd`
-- Limine (`limine`) and `xorriso`
-- QEMU `qemu-system-x86_64`
-- `mke2fs` from e2fsprogs
-- `curl` for downloading third-party source archives
-
-On macOS with Homebrew:
-
-```sh
-brew install llvm lld qemu limine xorriso e2fsprogs
-export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
-```
-
-Check the detected tools:
-
-```sh
-make check-tools
-```
-
-### Build And Run
-
-Build the default x86_64 kernel:
-
-```sh
-make
-```
-
-The result is:
-
-```text
-build/x86_64/kernel.elf
-```
-
-Build an ISO:
-
-```sh
-make iso
-```
-
-Boot the self-contained ISO in QEMU with user-mode networking:
-
-```sh
-make run
-```
-
-Boot directly into graphical runlevel 5 with a virtio GPU:
-
-```sh
-make run-graphics
-```
-
-Use the separately built persistent ext4 root image when needed:
-
-```sh
-make run-root
-```
-
-Persistent and disk images download matching packages from `b1nix-pkgs` by
-default. Build the ports locally instead with:
-
-```sh
-make PORTS_SOURCE=local root-image
-```
-
-Override `PACKAGE_INDEX_URL` to use another package repository.
-Downloaded packages are recorded in `/var/lib/bpkg`, so the installed disk can
-list, update, and remove them normally with `bpkg`.
-
-The first complete build downloads and cross-builds several userspace
-components, so it is substantially slower than an incremental kernel build.
-
-Build output is architecture-qualified under `build/x86_64/`.
-
-## Image Types
-
-| Target | Output | Purpose |
-| --- | --- | --- |
-| `make iso` | `build/<arch>/b1nix.iso` | Kernel and built-in initramfs |
-| `make root-image` | `build/<arch>/root.ext4` | 512 MiB persistent root image |
-| `make iso-live` | `build/<arch>/b1nix-live.iso` | ISO with a RAM-backed ext4 root image |
-| `make iso-test` | `build/<arch>/b1nix-test.iso` | Live image with the test mode enabled |
-| `make iso-full` | `build/<arch>/b1nix-live.iso` | Full live-image workflow |
-
-Build and boot the installer ISO, then install to a whole target disk:
-
-```sh
-make disk-iso
-b1nix_install /dev/sda
-```
-
-Disks carry the names the rest of Unix uses, so the target above is the one you
-would type on any other system:
-
-| Class | Disk | First partition |
-| --- | --- | --- |
-| SATA/AHCI and USB storage | `sda`, `sdb`, … | `sda1` |
-| virtio-blk | `vda`, `vdb`, … | `vda1` |
-| NVMe | `nvme0n1`, `nvme1n1`, … | `nvme0n1p1` |
-| Ramdisk / loop | `ram0`, `loop0`, … | — |
-
-SATA and USB disks share one `sd` sequence, as they do on Linux — both are SCSI
-disks — so the letter follows the order the disks were registered, not the bus
-they arrived on. A fifth disk is `sde` whichever bus delivered it. Boot entries should still name the root filesystem by what it is
-(`root=LABEL=…` or `root=UUID=…`) rather than by which port it sits on.
-
-The installer writes the bootable base, mounts its root partition, and installs
-all matching packages from `b1nix-pkgs`. Use `--no-packages` for an offline
-installation with the versions already included in the image.
-
-Override the root image size when needed:
-
-```sh
-make ROOT_IMAGE_SIZE=1024 root-image
-```
-
-## Using B1NIX
-
-A normal boot starts `/bin/init`, runs `/etc/rc`, starts networking when a NIC
-is present, launches Dropbear bound to loopback, and opens the B1NIX shell.
-
-Useful commands include:
-
-```text
-help        b1fetch     uname       dmesg      meminfo
-ls          cat         grep        find       mount
-ps          top         free        sysctl     ifconfig
-ping        nc          curl        wget       b1cc
-mc          ne          shutdown    reboot
-```
-
-b1nix's own C compiler is installed as `/bin/b1cc`; it compiles and links on the
-target, producing musl PIEs like every other binary in the image. When a
-persistent root image is attached, headers and the start files are installed
-under `/include` and `/lib`.
-Work under `/persist` to retain files across boots.
-
-Common kernel command-line options:
-
-| Option | Effect |
+| `ARCH=` | Status |
 | --- | --- |
-| `b1nix.single` | Start an emergency root shell |
-| `b1nix.login` | Start the login prompt instead of a direct shell |
-| `b1nix.ui=1` | Start the two-panel UI |
-| `b1nix.nographics` | Force the text console |
-| `init=/path` | Override the program launched by init |
-| `b1nix.net=off` | Disable networking |
-| `b1nix.ssh-external` | Bind SSH to all interfaces instead of loopback |
-| `b1nix.ssh-no-root` | Disable SSH root login |
-| `b1nix.ssh-pubkey-only` | Disable SSH password authentication |
-| `b1nix.gdb` | Wait for the serial GDB remote stub on a breakpoint |
-| `root=LABEL=name` | Select a root block device by filesystem label |
+| `x86_64` (default) | Primary target: QEMU (KVM) and real hardware |
+| `aarch64` | Second target of the same kernel: QEMU `virt`, Raspberry Pi 4, Sony Xperia 5 ([tools/sony-xperia-5](tools/sony-xperia-5/README.md)); gaps in [docs/aarch64-parity.md](docs/aarch64-parity.md) |
 
-The development image currently includes `root/root` and `user/user`
-credentials for login and SSH testing. Do not expose it to an untrusted
-network without changing the credentials and SSH policy.
+## Host Requirements
 
-## SSH From The Host
+Linux with KVM is the supported development host. The build uses a pure
+LLVM toolchain; there is no GCC anywhere in it.
 
-The automated host-to-guest test builds an externally reachable image,
-forwards host port 2222, logs in, and executes a command:
+- GNU Make, `clang`, `ld.lld`, `llvm-ar`/`llvm-ranlib`, `xxd`, `curl`
+- `limine` and `xorriso` for ISOs
+- `qemu-system-x86_64` (and `qemu-system-aarch64` for `ARCH=aarch64`)
+- `mke2fs` from e2fsprogs
+
+`tests/smoke.sh` also runs on macOS (HVF acceleration, Homebrew's keg-only
+e2fsprogs), but it is not the primary host and gets less coverage.
 
 ```sh
-sh tests/ssh-hostfwd.sh x86_64
+make check-tools                     # report missing tools
+tools/toolchain/build-toolchain.sh   # one-time: musl sysroot, compiler-rt, libc++
 ```
 
-It requires the host OpenSSH client, `nc`, and `expect`. For a manual run:
+The toolchain is cached under `build/<arch>/toolchain/`; `make clean` keeps it,
+`make distclean` removes it.
+
+## Build And Run
 
 ```sh
-make ARCH=x86_64 KERNEL_CMDLINE="b1nix.ssh-external=1" iso
-
-qemu-system-x86_64 \
-  -cdrom build/x86_64/b1nix.iso \
-  -serial stdio -display none \
-  -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 \
-  -device virtio-net-pci,netdev=n0
+make                 # kernel only: build/x86_64/kernel.elf
+make iso             # bootable ISO: build/x86_64/b1nix.iso
+make run             # boot the ISO in QEMU with user-mode networking
+make run-graphics    # boot to runlevel 5 on a virtio GPU
+make run-root        # boot with the persistent ext4 root image attached
+make ARCH=aarch64 run-aarch64
 ```
 
-Then connect from another terminal:
+Other images:
 
-```sh
-ssh -p 2222 root@127.0.0.1
-```
+| Target | Output |
+| --- | --- |
+| `make root-image` | `build/<arch>/root.ext4`, persistent root filesystem |
+| `make iso-live` | `build/<arch>/b1nix-live.iso`, ISO with a RAM-backed root |
+| `make iso-test` | `build/<arch>/b1nix-test.iso`, live image with test mode on |
+
+Root images fetch prebuilt packages by default; `make PORTS_SOURCE=local
+root-image` builds the ports locally instead. `ROOT_IMAGE_SIZE=<MiB>` overrides
+the image size.
+
+`make iso` produces a hybrid BIOS/UEFI image that can be written to a USB drive
+with `dd` (Secure Boot must be off). Hardware coverage is limited.
+
+The development image has `root/root` and `user/user` credentials; do not expose
+it to an untrusted network.
 
 ## Testing
 
-Run the full smoke suite across three parallel test VMs plus a short SMP VM:
+All testing is integration testing in QEMU. The kernel runs in-kernel self-tests
+and smoke binaries when booted with `b1nix.test=1`, and the host scripts grep
+the serial log for their markers.
 
 ```sh
-make smoke
-# equivalent:
-sh tests/smoke.sh
-```
-
-Other useful targets:
-
-```sh
-make smoke-quick
+make smoke            # full suite (sh tests/smoke.sh $(ARCH))
+make smoke-quick      # reduced suite
+make smoke-b1cc       # in-guest C compiler only
 make graphics-smoke
 make memory-smoke
-make analyze
+make analyze          # clang static analyzer over the kernel
+make debian-smoke     # Debian (glibc) userspace on the b1nix kernel
+sh tests/ssh-hostfwd.sh x86_64   # SSH into the guest from the host
 ```
 
-Run the former two-VM full smoke explicitly with:
+Logs and temporary disk images go to `smoke_run/`. `SMOKE_VERBOSE=1` prints
+every assertion; `SMOKE_PCAP=1` captures network traffic.
 
-```sh
-SMOKE_LEGACY=1 sh tests/smoke.sh
-```
-
-Smoke logs and temporary disk images are written to `smoke_run/`. Set
-`SMOKE_PCAP=1` when a network packet capture is needed. The default output
-follows milestone markers live while QEMU is running. Set `SMOKE_VERBOSE=1` to
-also print every post-run assertion:
-
-```sh
-SMOKE_VERBOSE=1 make smoke
-```
-
-## Native Toolchain And Self-Hosting
-
-Build the cross and in-guest toolchains:
-
-```sh
-tools/toolchain/build-toolchain.sh          # cross toolchain (LLVM + musl sysroot)
-tools/build-native-clang.sh --b1nix-elf     # the clang that runs inside b1nix
-```
-
-The toolchain build is large and is cached under `build/<arch>/toolchain/`;
-`make clean` preserves it, while `make distclean` removes it.
-
-The root-image workflow installs the matching native toolchain when available
-and stages the B1NIX source tree at:
+## Layout
 
 ```text
-/usr/src/b1nix
+kernel/      kernel core, arch code, drivers, VFS, networking, linuxkpi
+userspace/   headers, rootfs overlay, b1cc, native programs and smoke tests
+boot/        Limine configuration
+tools/       toolchain, ports, packaging, image and device scripts
+tests/       host-side QEMU test drivers
+docs/        roadmap and subsystem notes
 ```
-
-Detailed ABI notes are in [docs/abi.md](docs/abi.md).
-
-## Real Hardware
-
-`make ARCH=x86_64 iso` produces a hybrid BIOS/UEFI image that can be written
-directly to a USB drive:
-
-```sh
-sudo dd if=build/x86_64/b1nix.iso of=/dev/sdX bs=4M conv=fsync status=progress
-```
-
-This destroys the selected drive. Secure Boot must be disabled.
-
-The boot path, framebuffer, e1000-family NIC, AHCI/NVMe, and xHCI keyboard
-drivers are designed for physical x86_64 machines, but hardware coverage is
-still limited and some controller-specific quirks remain unverified.
-
-## Project Layout
-
-```text
-kernel/             kernel core, architecture code, drivers, VFS, networking
-userspace/          headers, rootfs overlay, b1cc, and the native programs
-boot/               Limine bootloader configuration
-tools/              build, porting, packaging, and self-hosting tools
-tests/              QEMU smoke and persistence tests
-docs/               roadmap, ABI, porting notes, and subsystem documentation
-build/              generated artifacts and downloaded upstream sources
-smoke_run/          generated test logs, captures, and temporary images
-```
-
-## Known Limitations
-
-- B1NIX is not fully POSIX conformant and does not run Linux binaries.
-- The shell and libc support substantial real workflows but remain incomplete.
-- PIE/`ET_DYN` binaries and relative relocations work, but a full userspace
-  dynamic linker with `DT_NEEDED`, GOT/PLT, and cross-module symbol resolution
-  is not implemented. Linux ABI compatibility is also not implemented.
-- The upstream BusyBox migration is optional and native `/bin` commands remain
-  the default.
-- The ext-family drivers cover the tested B1NIX workflows but are not complete
-  replacements for Linux filesystem implementations. Generated development
-  images use a conservative ext4 feature set; exFAT and NTFS are read-only.
-- x86_64 has been tested with a 16 GiB QEMU memory map.
-- Audio, a configurable SysV-style mode for the native B1NIX init, multiple
-  virtual consoles, Wi-Fi, and general USB device support are not implemented.
-- Security hardening has not reached production quality.
-
-## Documentation
-
-- [Roadmap and status](docs/roadmap.md)
-- [Toolchain setup](docs/toolchain.md)
-- [Userspace ABI](docs/abi.md)
-- [Architecture porting guide](docs/porting-guide.md)
-- [POSIX requirements](docs/posix-requirements.md)
 
 ## License
 
-Original b1nix code — the kernel, the userspace, the linuxkpi layer, the build
-tooling and b1cc — is licensed under the
-[GNU General Public License, version 2 only](LICENSE) (`GPL-2.0-only`).
-
-Version 2 *only*, not "or later": the terms cannot be widened by a future
-publication, and in exchange nothing here reaches past distribution — running
-b1nix to serve others over a network obliges you to publish nothing. Note what
-version 2 does not carry: the installation-information (anti-tivoization) terms
-are a version 3 addition, so this license does not require a device shipping
-b1nix to let its owner install a modified copy.
-
-This is also the license Linux itself uses, which makes the imported DRM and
-i915 sources a straightforward fit rather than a compatibility question.
-
-Third-party components keep their own licenses. The imported Linux DRM and i915
-sources are still taken under their MIT option and the fetch scripts still
-refuse anything `GPL-2.0`-only — that is now a scoping decision about what we
-import rather than a licence requirement, and it stays because a narrow import
-is easier to carry. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
-each component and its terms.
+Original b1nix code is licensed under the
+[GNU General Public License, version 2 only](LICENSE). Third-party components
+keep their own licenses; imported Linux DRM/i915 sources are taken under their
+MIT option. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

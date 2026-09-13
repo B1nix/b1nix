@@ -574,7 +574,7 @@ static int test_iconv(void) {
 }
 
 /* Regression guard for the NetSurf fb-scheduler workaround: hammering
- * gettimeofday()/clock_gettime() in a tight loop was reported to crash i686
+ * gettimeofday()/clock_gettime() in a tight loop was reported to crash
  * intermittently. Drive both hard and check the clocks stay sane — if this
  * survives, the busy-poll path is safe and the nanosleep pacing in the NetSurf
  * test pump is pacing only, not papering over a kernel fault. */

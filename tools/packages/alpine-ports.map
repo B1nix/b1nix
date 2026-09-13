@@ -64,17 +64,18 @@ openssl       openssl libssl3 libcrypto3 openssl-dev openssl-libs-static
 # M104 PAM (Linux-PAM + pam_unix.so).
 pam           linux-pam linux-pam-dev
 
+# The C++ runtime and the compiler builtins the userspace tests link against.
+libcxx        repo:community libc++ libc++-dev llvm-libunwind
+compiler-rt   compiler-rt
+
 # Programs installed onto the image rather than linked against. Used with
 # ALPINE_LAYOUT=native, so they keep their own paths, into one staging root that
 # the root-image rule copies over the image.
 #
 # dropbear is four packages because Alpine ships each tool separately rather
 # than as one multi-call binary; busybox-binsh is the /bin/sh symlink.
-# openrc and runit are deliberately absent. Alpine's openrc brings its own
-# /lib/rc, /etc/init.d and runlevels, which replaced this image's and took the
-# boot straight to poweroff; and their runit is statically linked, which the
-# rootfs gate rejects outright (tools/check-dynamic.sh). Both keep their ports:
-# what they do is the running system's behaviour, not a build artefact.
+# runit is absent: Alpine links it statically, which the rootfs gate rejects
+# (tools/check-dynamic.sh). OpenRC is staged by tools/packages/stage-openrc.sh.
 #
 # Mesa's userspace is named here rather than left to the SONAME closure, which
 # is what used to drag it in: wlroots records libEGL.so.1, libgbm.so.1 and
@@ -96,7 +97,8 @@ programs      zsh curl libcurl samurai bmake dropbear dropbear-ssh \
               font-dejavu xkeyboard-config xwayland \
               mesa-egl mesa-gles mesa-gbm mesa-gl mesa-glapi \
               mtdev fribidi libdisplay-info libxft \
-              libseat vulkan-loader xcb-util-renderutil tiff libpciaccess
+              libseat vulkan-loader xcb-util-renderutil tiff libpciaccess \
+              attr lsblk uuidgen mtd-utils-flash
 
 # The browser. Baked into the image at build time rather than installed in the
 # guest: the closure is ~175 packages and installing it over the network inside

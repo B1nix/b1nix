@@ -131,7 +131,7 @@ static spinlock_t bcache_lock = SPINLOCK_INIT;
  * an index into block_cache[] (or -1 for empty); collisions chain through
  * block_buffer.hash_next. Without this, bcache_find linearly scanned the
  * entire cache on every block read — at 4 GiB guests that's 8K comparisons
- * per cache lookup, and dominated gcc execve wall-clock (turning a 5 s
+ * per cache lookup, and dominated compiler execve wall-clock (turning a 5 s
  * binary load into a 30 s one). Hash sized so average chain length stays
  * below ~8 even at CACHE_ENTRIES_MAX. */
 /* Sized from the pool it actually indexes, not from the pool's ceiling. The

@@ -42,6 +42,7 @@
 #include <b1nix/netdev.h>
 #include <b1nix/vnet.h>
 #include <b1nix/blk.h>
+#include <b1nix/mtd.h>
 #include <b1nix/pci.h>
 #include <b1nix/version.h>
 #include <stdarg.h>
@@ -1007,11 +1008,14 @@ static int r_b1nix_prof(usize pid, struct sbuf *s) {
     {
       /* What the disk gave back for it: one request at a time, so this is
        * latency times count, not bandwidth. */
+      console_write("vblk:");
+#if defined(__x86_64__)
+      /* virtio-blk over PCI; the aarch64 virtio-mmio driver keeps no counters. */
       extern void virtio_blk_stats(u64 *reqs, u64 *read_sectors, u64 *wait_ns);
       u64 reqs = 0, sectors = 0, wait_ns = 0;
 
       virtio_blk_stats(&reqs, &sectors, &wait_ns);
-      console_write("vblk: reqs=");
+      console_write(" reqs=");
       console_write_dec(reqs);
       console_write(" read-MB=");
       console_write_dec(sectors / 2048);
@@ -1019,6 +1023,7 @@ static int r_b1nix_prof(usize pid, struct sbuf *s) {
       console_write_dec(wait_ns / 1000000);
       console_write(" avg-us=");
       console_write_dec(reqs ? (wait_ns / reqs) / 1000 : 0);
+#endif
       {
         extern void blk_cache_stats(u64 *hits, u64 *misses);
         u64 hits = 0, misses = 0;
@@ -1029,6 +1034,7 @@ static int r_b1nix_prof(usize pid, struct sbuf *s) {
         console_write(" misses=");
         console_write_dec(misses);
       }
+#if defined(__x86_64__)
       {
         extern void virtio_blk_lock_stats(u64 *free_now, u64 *waited,
                                           u64 *yields);
@@ -1042,6 +1048,7 @@ static int r_b1nix_prof(usize pid, struct sbuf *s) {
         console_write(" busy-yields=");
         console_write_dec(yields);
       }
+#endif
       console_write("\n");
     }
   }
@@ -1133,7 +1140,7 @@ static int r_kallsyms(usize pid, struct sbuf *s) {
 /* Linux /proc/<pid>/stat and /proc/<pid>/comm expose the process "comm": the
  * basename of the executable, truncated to TASK_COMM_LEN-1 (15) chars — NOT the
  * full exec path. b1nix stores the exec path in t->name (e.g.
- * "/opt/busybox/bin/busybox"), so derive comm here. BusyBox procps
+ * "/bin/busybox"), so derive comm here. BusyBox procps
  * (pidof/pgrep/pkill/ps) match on this field, so getting it wrong silently
  * breaks process lookup by name. `out` must hold at least 16 bytes. */
 #define PROC_COMM_LEN 16
@@ -3083,6 +3090,21 @@ static int r_partitions(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/mtd: the MTD devices, as libmtd reads them when there is no
+ * /sys/class/mtd. Size and erase size in hex, the name quoted. */
+static int r_mtd(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "dev:    size   erasesize  name\n");
+  for (unsigned i = 0; i < MTD_MAX_DEVICES; i++) {
+    struct mtd_device *d = mtd_device_at(i);
+    if (!d || !d->present)
+      continue;
+    sb_addf(s, "mtd%u: %08x %08x \"%s\"\n", i, (unsigned)d->size,
+            (unsigned)d->erase_size, d->name);
+  }
+  return 0;
+}
+
 /* /proc/diskstats: Linux block-device I/O statistics.  BusyBox lsblk and
  * iostat read this to enumerate physical block devices.  We emit zero
  * counters — the name field is what matters for enumeration. */
@@ -3144,6 +3166,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   }
   procfs_mkchild(root, "kallsyms", VFS_DEVICE, r_kallsyms, 0);
   procfs_mkchild(root, "partitions", VFS_DEVICE, r_partitions, 0);
+  procfs_mkchild(root, "mtd", VFS_DEVICE, r_mtd, 0);
   procfs_mkchild(root, "diskstats", VFS_DEVICE, r_diskstats, 0);
   procfs_mkchild(root, "swaps", VFS_DEVICE, r_swaps, 0);
   procfs_mkchild(root, "modules", VFS_DEVICE, r_modules, 0);

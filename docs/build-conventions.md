@@ -1,19 +1,9 @@
 # Build and smoke conventions
 
-Three rules, each of which exists because breaking it cost real time. They are
-written down because the same mistake kept reappearing in a different shape:
-one place stamped its work, the next redid it; one lane named itself, the next
-was guessed at.
+## 1. A per-file tool loop must be skippable
 
-## 1. A build step that spawns a tool per file must be skippable
-
-Recipes that loop over hundreds of files and run `readelf`, `nm` or similar on
-each one are the dominant cost of a build that has nothing to do. Measured on
-aarch64: **496 libraries, one `readelf` each, 17 s of a 28 s no-op build**,
-spent every single run to re-derive an answer that changes only when a package
-changes.
-
-Guard them with a stamp:
+Recipes that run `readelf`/`nm`/etc. once per file over hundreds of files
+dominate no-op build time. Guard them with a stamp:
 
 ```make
 	@stamp="$(BUILD_DIR)/.my-step.stamp"; \
@@ -26,42 +16,24 @@ Guard them with a stamp:
 	touch "$$stamp"
 ```
 
-Three properties matter and all three are load-bearing:
+- Stamp under `$(BUILD_DIR)`, so wiping the build tree redoes the work.
+- Check the destination exists, so removed output is regenerated.
+- Compare only the newest input (`ls -t | head -1`): one stat sweep.
 
-- the stamp lives under `$(BUILD_DIR)`, so a wiped build tree loses it too and
-  the work is redone rather than wrongly skipped;
-- the destination is checked, so a step whose output was removed still runs;
-- `ls -t | head -1` compares against the newest input only, which is one
-  `stat` sweep rather than one per file.
+Existing examples: `$(PKGROOT)/.installed`, `.pkg-libs.stamp`,
+`.soname-copies.stamp`, `.soname-prune.stamp`.
 
-`build/$(ARCH)/pkgroot/.installed` is the older example of the same idea, and
-`.pkg-libs.stamp`, `.soname-copies.stamp` and `.soname-prune.stamp` are the
-ones added when this was written down. No-op build: **28 s -> 9 s**.
+## 2. A smoke lane states its identity
 
-## 2. A smoke lane states its identity; it is never inferred
+Lane names default to `B1NIX_ISO_NAME`, which only works when each lane has its
+own image. A lane that reuses another's image (e.g. `sysnet` on `sys`'s) must
+set `SMOKE_LANE` explicitly; otherwise its markers are graded as the other lane
+and its own checks all appear "missing".
 
-The lane name used to be derived from `B1NIX_ISO_NAME`, which works only while
-every lane has its own image. `sysnet` reuses `sys`'s image and differs solely
-in which half of the tests the guest driver runs — it silently became a second
-`sys` lane, the network tests ran nowhere, and **91 checks failed as missing
-markers**.
+## 3. No kernel wait is bounded in wall-clock time
 
-A lane that shares another's image sets `SMOKE_LANE` explicitly. A lane that
-produces no output looks exactly like a lane whose tests all vanished, so this
-is not a class of bug the suite can catch for you.
-
-## 3. Nothing in the kernel bounds a wait in wall-clock time
-
-Under a busy host a guest vCPU gets a fraction of a core, so wall time and
-guest progress come apart. `serial_silence_watchdog()` measured silence in wall
-time and **panicked a perfectly healthy machine with "deadlock or hang
-detected"**: running four lanes instead of three gave 232 s and 90 blocked
-checks, none of which was a real failure.
-
-The timer tick knows how far the clock ran ahead of its own interrupts; that
-jump is time this vCPU did not get. Subtract it. The check stays honest in both
-directions — a genuinely wedged machine still takes its interrupts, accrues no
-steal, and is caught on the same budget.
-
-Before blaming flakiness on "the host was busy", check whether the thing that
-fired was measuring wall time. This one was.
+On a busy host, guest vCPUs get a fraction of a core. Timeouts in the kernel
+must subtract stolen time: `serial_silence_watchdog()`
+(`kernel/sched/scheduler.c`) measures silence as ticks minus `g_stolen_ticks`.
+A genuinely wedged guest accrues no steal and is still caught. Before calling a
+failure "host flakiness", check whether the check measured wall time.

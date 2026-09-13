@@ -64,7 +64,7 @@ int lkpi_vprintk(const char *fmt, va_list args)
 /* Referenced by imported code; see the headers that declare them for why each
  * is what it is. */
 int oops_in_progress = 0;
-struct resource iomem_resource = { 0, ~0ull, "iomem", 0, 0, 0, 0 };
+struct resource iomem_resource = { .start = 0, .end = ~0ull, .name = "iomem" };
 
 /* One acquire class for every reservation lock: ordering comes from the stamp,
  * so a second class would distinguish nothing. */

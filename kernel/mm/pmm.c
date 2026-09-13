@@ -629,8 +629,7 @@ static void size_direct_map(const struct boot_info *boot_info) {
 
 void pmm_init(const struct boot_info *boot_info) {
   /* Convert the (higher-half) kernel symbols to physical addresses; the two
-   * reservation loops below then cover [0, kernel_end_phys). KERNEL_VMA is 0 on
-   * the identity-mapped 32-bit port, so this is a no-op there. */
+   * reservation loops below then cover [0, kernel_end_phys). */
   pmm.kernel_start = (u64)(usize)__kernel_start - KERNEL_VMA;
   pmm.kernel_end = align_up_u64((u64)(usize)__kernel_end - KERNEL_VMA, PAGE_SIZE);
   pmm.max_address = 0;

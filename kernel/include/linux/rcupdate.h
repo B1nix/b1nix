@@ -33,8 +33,6 @@ static inline void cond_synchronize_rcu(unsigned long oldstate)
  * the name still records which promise the caller is making.
  */
 #define rcu_dereference_check(p, c) ({ (void)(c); rcu_dereference(p); })
-#define rcu_dereference_protected(p, c) ({ (void)(c); (p); })
-#define rcu_dereference_raw(p) (p)
 extern struct lockdep_map rcu_callback_map;
 
 #endif

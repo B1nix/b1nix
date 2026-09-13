@@ -12,8 +12,8 @@
 # result. Everything after that is unprivileged.
 #
 # Usage:
-#   sh tools/run-i915-passthrough.sh --preflight     # what is missing, and how
-#   sh tools/run-i915-passthrough.sh                 # run, once bound
+#   sh tools/drm/run-i915-passthrough.sh --preflight     # what is missing, and how
+#   sh tools/drm/run-i915-passthrough.sh                 # run, once bound
 #
 # What the guest proves is decided by the cmdline baked into the ISO:
 #   make B1NIX_I915=1 KERNEL_CMDLINE="b1nix.i915-gt-probe" iso
@@ -193,7 +193,7 @@ fi
 drv="$(current_driver)"
 if [ "$drv" != "vfio-pci" ]; then
 	echo "$IGD_BDF is bound to '$drv', not vfio-pci." >&2
-	echo "Run: sh tools/run-i915-passthrough.sh --preflight" >&2
+	echo "Run: sh tools/drm/run-i915-passthrough.sh --preflight" >&2
 	exit 1
 fi
 [ -f "$ISO" ] || { echo "no ISO at $ISO — run: make B1NIX_I915=1 iso" >&2; exit 1; }
@@ -277,21 +277,6 @@ rm -f "$SHOT" "$MON"
 [ "${NO_VIRTIO_GPU:-0}" = "1" ] ||
 	DEV_ARGS="$DEV_ARGS -device virtio-gpu-pci"
 MON_ARGS="-monitor unix:$MON,server,nowait"
-
-# A disk that survives the run, holding downloaded Alpine packages.
-#
-# Every boot that installs a compositor spends minutes fetching the same
-# megabytes again; bpkg keeps what it downloads under /var/cache/bpkg, and this
-# is where that directory lives between runs. Created once, empty, and never
-# read by anything but the guest.
-CACHE_IMG="$OUT_DIR/pkgcache.img"
-if [ ! -f "$CACHE_IMG" ]; then
-	dd if=/dev/zero of="$CACHE_IMG" bs=1M count=512 2>/dev/null
-	mke2fs -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q \
-		-L b1nix-pkgcache "$CACHE_IMG" 2>/dev/null ||
-		mke2fs -t ext4 -q -L b1nix-pkgcache "$CACHE_IMG"
-fi
-DEV_ARGS="$DEV_ARGS -drive file=$CACHE_IMG,format=raw,if=virtio"
 
 # The root filesystem as a disk, when asked for it.
 #

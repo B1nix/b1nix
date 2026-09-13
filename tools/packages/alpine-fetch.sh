@@ -6,9 +6,8 @@
 # linked. Fetching their binary costs a download and removes both the build
 # script and the obligation to keep it working — see docs/ports-migration-plan.md.
 #
-# What this is NOT is a package manager. bpkg is that, it runs in the guest, and
-# it verifies Alpine's RSA signatures (docs/bpkg-package-manager.md). This is the
-# host-side, image-build-time path, and it pins instead of verifying signatures:
+# This is the host-side, image-build-time path, and it pins instead of verifying
+# signatures:
 # every package's sha256 is recorded in tools/packages/alpine.lock and checked on
 # every later fetch. A build therefore either gets the exact bytes an earlier
 # build got, or fails — and adding a package is a reviewable diff to that file,
@@ -176,7 +175,7 @@ record_sha() {
 #
 # Every record in the index lists what it provides, and a shared library shows
 # up there as `so:libfoo.so.1=version`. That is how a DT_NEEDED entry is turned
-# back into something installable — the same lookup bpkg does in the guest.
+# back into something installable.
 #
 pkg_for_soname_in() {
 	awk -v want="$2" -v RS= '

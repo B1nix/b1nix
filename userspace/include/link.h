@@ -3,9 +3,9 @@
 
 /* <link.h>. b1nix links shared objects eagerly in-kernel (no userspace ld.so),
  * but the kernel records the executable + every loaded shared library, so
- * dl_iterate_phdr reports them all. This is what lets the libgcc_s.so DWARF
+ * dl_iterate_phdr reports them all. This is what lets the libunwind DWARF
  * unwinder find each module's PT_GNU_EH_FRAME — required for C++ exceptions to
- * unwind across the shared-libstdc++/exe boundary. */
+ * unwind across the shared-libc++/exe boundary. */
 #include <elf.h>
 #include <stddef.h>
 

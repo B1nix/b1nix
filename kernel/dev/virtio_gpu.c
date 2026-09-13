@@ -1203,7 +1203,7 @@ struct b1nix_virgl_submit_abi {
  * draw state) far exceed one page; size it to hold a real draw. */
 #define VGPU_SUBMIT_BUF_BYTES (64u * 1024)
 /* mmap window per resource. Kept small enough that MAX_RES windows stay under
- * 2 GiB so the offset fits the 32-bit mmap offset arg on the i686 port. */
+ * 2 GiB of mmap offset space. */
 #define VGPU_UDEV_SLOT (64ull * 1024 * 1024)
 #define VGPU_UDEV_MAX_DIM 4096 /* 4096*4096*4 == one 64 MiB slot */
 

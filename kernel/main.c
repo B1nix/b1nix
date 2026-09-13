@@ -1445,11 +1445,13 @@ void kernel_main(usize arg0, usize arg1)
 		extern int arch_smep_cpu_count(void);
 		int smep_cpus = arch_smep_cpu_count();
 
-		console_write("smep: active on ");
-		console_write_dec((u32)smep_cpus);
-		console_write(" of ");
-		console_write_dec((u32)get_online_cpu_count());
-		console_write(" CPUs\n");
+		char smep_line[64];
+
+		/* One write: an AP's message printed between the pieces of a
+		 * multi-call line ended up in the middle of it. */
+		snprintf(smep_line, sizeof(smep_line), "smep: active on %d of %d CPUs\n",
+		         smep_cpus, (int)get_online_cpu_count());
+		console_write(smep_line);
 	}
 
 	/* Do the cores agree about what a page-table entry means?
@@ -1681,10 +1683,9 @@ void kernel_main(usize arg0, usize arg1)
 	/* Userspace on the secondaries is still off HERE, and the reason is
 	 * measured rather than assumed: with it on the suite scores 900-1300 of
 	 * ~1370 with wide variance, against 1369 and no blocked checks with it
-	 * off. The corruption behind that is characterised in
-	 * docs/aarch64-ap-userspace.md -- what it is not has been narrowed a long
-	 * way, what it is has not been found. b1nix.ap-userspace turns it on for
-	 * work on the bug. */
+	 * off. The corruption behind that has not been found (open item in
+	 * docs/aarch64-parity.md). b1nix.ap-userspace turns it on for work on
+	 * the bug. */
 #if defined(__aarch64__)
 	if (bootinfo_has_flag("b1nix.ap-userspace"))
 		g_ap_userspace_enabled = 1;
@@ -1814,14 +1815,11 @@ void kernel_main(usize arg0, usize arg1)
 
 	/* M94: Generic init path — honour `init=/path` from kernel cmdline.
 	 * Default PID 1 is /sbin/init, which is BusyBox's `init` applet (the
-	 * symlink is stamped by tools/ports/build-busybox.sh) — Alpine's layout.
+	 * symlink is stamped by tools/packages/stage-busybox.sh) — Alpine's layout.
 	 * BusyBox init supervises (reaps orphans, respawns getty, runs the
 	 * sysinit/shutdown phases) and /etc/inittab hands the service graph to
 	 * OpenRC, which stays the high-level init: `openrc sysinit`, `openrc boot`,
-	 * `openrc default`. OpenRC's own PID 1, /sbin/openrc-init, remains a
-	 * bootable configuration through `init=/sbin/openrc-init` (it owns the
-	 * /run/openrc/init.ctl control channel that openrc-shutdown and telinit
-	 * talk to), and is exercised by the `openrc` smoke instance.
+	 * `openrc default`.
 	 * `b1nix.single` maps to `init=/bin/sh` (standard single-user mode).
 	 * The old test orchestrator `/bin/init` can be selected via `init=/bin/init`. */
 	char init_path_buf[128];

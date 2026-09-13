@@ -138,12 +138,11 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
       if (ptrace_fault_info(t, &fsig, &faddr, &fcode) && fsig == sig)
         uc->uc_mcontext.fault_address = faddr;
     }
-    /* x0-x30 are consecutive u64 fields of the frame, in register order. */
-    {
-      const u64 *gp = &frame->x0;
-      for (int i = 0; i < 31; i++)
-        uc->uc_mcontext.regs[i] = gp[i];
-    }
+    /* x0-x30 are consecutive u64 fields of the frame, in register order. The
+     * frame is packed, so copy bytes rather than take a u64 pointer into it. */
+    memcpy(uc->uc_mcontext.regs,
+           (const u8 *)frame + __builtin_offsetof(struct interrupt_frame, x0),
+           31 * sizeof(u64));
     uc->uc_mcontext.sp = frame->sp_el0;
     uc->uc_mcontext.pc = frame->elr;
     uc->uc_mcontext.pstate = frame->spsr;

@@ -2897,10 +2897,8 @@ static void fill_b1nix_utsname(struct b1nix_utsname *uts) {
   copy_cstr(uts->version, sizeof(uts->version), "#1 SMP");
 #if defined(__aarch64__)
   copy_cstr(uts->machine, sizeof(uts->machine), "aarch64");
-#elif defined(__x86_64__)
-  copy_cstr(uts->machine, sizeof(uts->machine), "x86_64");
 #else
-  copy_cstr(uts->machine, sizeof(uts->machine), "i686");
+  copy_cstr(uts->machine, sizeof(uts->machine), "x86_64");
 #endif
 }
 
@@ -11104,8 +11102,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)copied;
   case SYS_SYSINFO: {
     /* Linux struct sysinfo (sysinfo(2)). Mirror byte-for-byte the userspace
-     * <sys/sysinfo.h>: native `unsigned long` on both sides (32-bit i686 /
-     * 64-bit x86_64). b1nix has no per-buffer-cache accounting or swap-size
+     * <sys/sysinfo.h>: native 64-bit `unsigned long` on both sides. b1nix has no per-buffer-cache accounting or swap-size
      * API, so bufferram/sharedram/swap are 0; mem_unit stays 1 (bytes) so
      * BusyBox free does no scaling. */
     struct k_sysinfo {

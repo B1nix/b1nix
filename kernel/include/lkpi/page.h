@@ -7,9 +7,10 @@
 #include <linux/list.h>
 
 /* The page size, defined on this side of the boundary so <linux/mm.h> does not
- * have to reach into <b1nix/mm.h> for it. */
+ * have to reach into <b1nix/mm.h> for it. unsigned long, as on Linux: masks
+ * built from it must be as wide as the addresses they are applied to. */
 #ifndef PAGE_SIZE
-#define PAGE_SIZE 4096u
+#define PAGE_SIZE 4096UL
 #endif
 
 /*

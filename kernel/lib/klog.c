@@ -431,28 +431,6 @@ void panic_backtrace(void)
 		rbp = (u64 *)(usize)new_rbp;
 		depth++;
 	}
-#else
-	u32 *ebp = 0;
-	__asm__ volatile("movl %%ebp, %0" : "=r"(ebp));
-	/* x86 32-bit: walk frame pointer chain */
-	while (ebp && depth < 16) {
-		u32 eip = ebp[1];
-		u32 new_ebp = ebp[0];
-
-		if (eip == 0) break;
-		if (new_ebp != 0 && new_ebp <= (u32)(usize)ebp) break;
-
-		console_write("  #");
-		console_write_dec(depth);
-		console_write(" 0x");
-		console_write_hex64(eip);
-
-		ksym_print(eip);
-		console_write("\n");
-
-		ebp = (u32 *)(usize)new_ebp;
-		depth++;
-	}
 #endif
 
 	console_write("--- End Backtrace ---\n\n");

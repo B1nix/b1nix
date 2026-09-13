@@ -83,8 +83,6 @@ static u8 kbd_dev_read(void)
 	return 0;
 }
 #else
-static int kbd_wait_input_clear(void) { return -1; }
-static int kbd_wait_output_full(void) { return -1; }
 static void kbd_flush(void) {}
 static void kbd_ctrl_cmd(u8 cmd) { (void)cmd; }
 static void kbd_dev_write(u8 data) { (void)data; }

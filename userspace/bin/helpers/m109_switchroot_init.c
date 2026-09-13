@@ -23,7 +23,7 @@
 #define TMPFS_MAGIC 0x01021994
 
 #define NEWROOT "/newroot"
-#define BUSYBOX NEWROOT "/opt/busybox/bin/busybox"
+#define BUSYBOX NEWROOT "/bin/busybox"
 
 /* The shell that runs as init in the new root. It reports on two files: the
  * witness this process wrote into the new root before the switch (which must

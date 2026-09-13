@@ -17,10 +17,8 @@ FLOAT_FLAGS := -msoft-float -mno-implicit-float
 endif
 # Prefix ccache when present so userspace ELFs recompile from cache after a
 # `make clean` (explicit `make CC=...` still wins — command-line beats `:=`).
-# Apple's /usr/bin/clang only implements the Darwin link driver and its
-# `-print-resource-dir` has no lib/linux/ subdirectory (see build-llvm-
-# runtimes.sh for the fuller writeup) — prefer the real Homebrew LLVM clang
-# so BUILTINS_LIB below actually resolves to a usable compiler-rt archive.
+# Apple's /usr/bin/clang only implements the Darwin link driver; prefer the
+# real Homebrew LLVM clang there.
 CLANG_BIN := $(shell command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo clang)
 CCACHE   := $(shell command -v ccache 2>/dev/null)
 CC       := $(if $(CCACHE),$(CCACHE) $(CLANG_BIN),$(CLANG_BIN))
@@ -28,7 +26,6 @@ LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.l
 AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo ar)
 LINK ?= musl
 HOST_CC  ?= cc
-B1NIX_CXX ?= ../tools/toolchain/bin/b1nix-c++
 # The on-device b1cc bundle is compiled against musl (the old in-house
 # libc + its static b1nix-cc/crt0.o path were removed in the M92 migration).
 MUSL_CC := ../tools/b1nix-musl-cc
@@ -43,8 +40,7 @@ B1CC_BINS_CC := $(realpath ../tools/b1nix-musl-cc)
 # every binary here compiles against musl's headers (see CFLAGS below), and
 # this tree exists solely because b1cc's parser cannot read musl's. Deleting
 # it as a duplicate broke b1cc on its own corpus, with the parser stopping on
-# a musl typedef -- so it lives with the compiler that needs it, the way tcc
-# ships its own include directory, and userspace/include is left holding only
+# a musl typedef -- so it lives with the compiler that needs it, and userspace/include is left holding only
 # what describes this kernel's interfaces.
 B1CC_SYSROOT_INCLUDE := $(realpath include)
 B1CC_DIR := b1cc
@@ -75,34 +71,20 @@ MUSL_LIBSO   := $(MUSL_LIB)/libc.so
 MUSL_CRT1    := $(MUSL_LIB)/Scrt1.o
 MUSL_CRTI    := $(MUSL_LIB)/crti.o
 MUSL_CRTN    := $(MUSL_LIB)/crtn.o
-LIBCXX_INCLUDE := $(firstword $(wildcard \
-  ../build/$(B1NIX_ARCH)/ports/musl/install/include/c++/v1 \
-  ../build/$(B1NIX_ARCH)/toolchain/llvm-runtimes-build-musl/libcxx-install/include/c++/v1 \
-  ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/llvm-runtimes-build-musl/libcxx-install/include/c++/v1))
-# compiler-rt builtins: the helpers the compiler emits calls to but no library
-# defines (128-bit division __udivti3 and friends). Linking through ld.lld
-# directly means nothing supplies them implicitly, so name the archive.
-# `clang -print-resource-dir` used to pin this to whichever compiler is in
-# use, but that only works when the compiler's own resource dir actually
-# ships a builtins archive for our *target* — Homebrew's LLVM resource dir
-# ships none at all (it's built for compiling for the host, arm64-apple-
-# darwin, not our x86_64-linux cross target). Use our own cross-built
-# compiler-rt directly instead (see tools/toolchain/build-llvm-runtimes.sh).
-BUILTINS_LIB  := $(firstword $(wildcard \
-                   ../build/$(B1NIX_ARCH)/compiler-rt-builtins/libclang_rt.builtins-$(B1NIX_ARCH).a \
-                   ../build/$(B1NIX_ARCH)/toolchain/sysroot/usr/lib/libcompiler_rt.a \
-                   ../build/$(B1NIX_ARCH)/toolchain/llvm-runtimes-build/install/lib/libcompiler_rt.a \
-                   ../build/$(B1NIX_ARCH)/toolchain/cross/$(B1NIX_TRIPLET)/lib/libcompiler_rt.a \
-                   $(MUSL_LIB)/libclang_rt.builtins-$(B1NIX_ARCH).a \
-                   $(MUSL_LIB)/libcompiler_rt.a \
-                   $(CLANG_RES_DIR)/lib/*/libclang_rt.builtins-$(B1NIX_ARCH).a \
-                   $(CLANG_RES_DIR)/lib/libclang_rt.builtins-$(B1NIX_ARCH).a))
+# Alpine's libc++ and compiler-rt, staged by the top-level Makefile as build
+# prefixes (tools/packages/alpine-ports.map: libcxx, compiler-rt). Linking goes
+# through ld.lld directly, so nothing supplies the builtins implicitly.
+LIBCXX_PREFIX  := ../build/$(B1NIX_ARCH)/pkg/libcxx
+LIBCXX_INCLUDE := $(LIBCXX_PREFIX)/include/c++/v1
+LIBCXX_LINK    := -L$(LIBCXX_PREFIX)/lib -l:libc++.so.1 -l:libc++abi.so.1
+BUILTINS_LIB   := $(firstword $(wildcard \
+                   ../build/$(B1NIX_ARCH)/pkg/compiler-rt/lib/llvm*/lib/clang/*/lib/linux/libclang_rt.builtins-$(B1NIX_ARCH).a))
 
 # NOTE: -MD (not -MMD). Our headers live under `include/`, pulled in via
 # `-isystem include`, which makes them *system* headers — and -MMD omits system
 # headers from the generated .d files. With -MMD, editing a header in
 # userspace/include/ would NOT trigger a recompile (observed: a struct-size
-# change to <unistd.h> left a stale statvfs.o, crashing BusyBox df on i686).
+# change to <unistd.h> left a stale statvfs.o, crashing BusyBox df).
 # -MD records every header so header edits rebuild the affected objects.
 CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 $(FLOAT_FLAGS) -Db1nix -fno-pic -fno-pie -fdirect-access-external-data -MD -MP
 # When LINK=musl, add musl headers (preferred for standard POSIX) and
@@ -273,7 +255,6 @@ BINARIES := \
 	$(BUILD)/bin/m35_smoke \
 	$(BUILD)/bin/diskbench \
 	$(BUILD)/bin/mdcreate \
-	$(BUILD)/bin/telinit \
 	$(BUILD)/bin/m30_pie \
 	$(BUILD)/bin/m38_sound \
 	$(BUILD)/bin/m79_sound \
@@ -394,24 +375,12 @@ BINARIES += $(BUILD)/bin/m11_pipe_smoke
 BINARIES += $(BUILD)/bin/m22_smoke
 BINARIES += $(BUILD)/bin/net_smoke
 BINARIES += $(BUILD)/bin/m51_clipboard_smoke
-BINARIES += $(BUILD)/bin/b1fetch
 BINARIES += $(BUILD)/bin/gpuinfo
-BINARIES += $(BUILD)/bin/mc
-BINARIES += $(BUILD)/bin/ne
-# M16 driver: runs mc/ne out-of-process and covers the rest of the TUI surface.
-BINARIES += $(BUILD)/bin/m16_smoke
 # POSIX memory/signal primitives: madvise, MAP_NORESERVE, sigaltstack
 BINARIES += $(BUILD)/bin/m_posixmm_smoke
 # Is a shared mapping actually shared between two processes? Every Wayland
 # client depends on it and nothing else asserts it.
 BINARIES += $(BUILD)/bin/shmshare_smoke
-# M104: native package manager (Alpine APKINDEX/.apk + house flat-index repos).
-# Its smoke coverage is the shell-driven /etc/bpkg-smoke.sh (see rootfs-
-# overlay/etc/rc), matching the existing posix-smoke.sh/zsh-smoke.sh pattern,
-# not a dedicated ELF -- bpkg's CLI already speaks a stable, testable
-# interface (update/install/list/remove) so there's nothing an in-process
-# smoke binary would exercise that the shell script doesn't.
-BINARIES += $(BUILD)/bin/bpkg
 # M92: native ABI smoke test (raw b1nix syscalls, no libc)
 BINARIES += $(BUILD)/bin/m92_abi_smoke
 # M92: musl POSIX smoke test (built with LINK=musl)
@@ -449,7 +418,7 @@ BINARIES += $(BUILD)/bin/m30_dynamic
 endif
 
 # the generic single-source BIN_OBJS pattern.
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m57_smoke $(BUILD)/bin/m104_pam_smoke $(BUILD)/bin/m108_smoke,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(addprefix $(BUILD)/bin/,$(B1CC_BINS))  $(BUILD)/bin/m57_smoke $(BUILD)/bin/m104_pam_smoke $(BUILD)/bin/m108_smoke,$(BINARIES)))
 DEPS := $(BIN_OBJS:.o=.d)
 
 .PHONY: all clean install install-headers-libs
@@ -576,35 +545,6 @@ ifeq ($(GEN_MUSL_POSTLINK),1)
 	$(call stamp_linux_osabi,$@)
 endif
 
-$(BUILD)/src/tui_common.o: src/tui_common.c include/tui.h
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $@
-
-$(BUILD)/bin/mc: bin/tools/mc.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/tools/mc.c -o $(BUILD)/bin/mc.o
-	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/mc.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
-ifeq ($(GEN_MUSL_POSTLINK),1)
-	$(call stamp_linux_osabi,$@)
-endif
-
-$(BUILD)/bin/ne: bin/tools/ne.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/tools/ne.c -o $(BUILD)/bin/ne.o
-	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/ne.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
-ifeq ($(GEN_MUSL_POSTLINK),1)
-	$(call stamp_linux_osabi,$@)
-endif
-
-# M16 driver links tui_common.o for the shared key-sequence decoder it checks.
-$(BUILD)/bin/m16_smoke: bin/smoke/m16_smoke.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/smoke/m16_smoke.c -o $(BUILD)/bin/m16_smoke.o
-	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/m16_smoke.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
-ifeq ($(GEN_MUSL_POSTLINK),1)
-	$(call stamp_linux_osabi,$@)
-endif
-
 $(BUILD)/src/mojo_core.o: src/mojo_core.c include/mojo/mojo.h include/mojo.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $@
@@ -628,30 +568,6 @@ ifeq ($(GEN_MUSL_POSTLINK),1)
 endif
 
 MBEDTLS_DIR := ../build/$(B1NIX_ARCH)/pkg/mbedtls
-
-# M104: bpkg gains HTTPS when the static mbedTLS archives are present. Every
-# real package repository is HTTPS-only, so without TLS the package manager can
-# only reach a local file:// index. The TLS code in bpkg.c is behind
-# B1NIX_HAVE_MBEDTLS; a B1NIX_TLS=none build still produces a working
-# HTTP/file-only bpkg that rejects https:// URLs with an explicit error.
-$(BUILD)/bin/bpkg: bin/tools/bpkg.c $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
-	@mkdir -p $(dir $@)
-	@if [ -f $(MBEDTLS_DIR)/lib/libmbedtls.a ]; then \
-	  echo "  CC+TLS  bpkg"; \
-	  $(CC) $(CFLAGS) $(GEN_PIC) -DB1NIX_HAVE_MBEDTLS -I $(MBEDTLS_DIR)/include -c $< -o $(BUILD)/bin/bpkg.o; \
-	  $(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) $(if $(GEN_LINKER),-T $(GEN_LINKER)) -o $@ $(GEN_CRT0) $(BUILD)/bin/bpkg.o \
-	    --start-group \
-	    $(MBEDTLS_DIR)/lib/libmbedtls.a $(MBEDTLS_DIR)/lib/libmbedx509.a $(MBEDTLS_DIR)/lib/libmbedcrypto.a \
-	    $(GEN_LINK_LIBS) \
-	    --end-group; \
-	else \
-	  echo "  CC      bpkg (HTTP/file only, no mbedTLS)"; \
-	  $(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $(BUILD)/bin/bpkg.o; \
-	  $(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) $(if $(GEN_LINKER),-T $(GEN_LINKER)) -o $@ $(GEN_CRT0) $(BUILD)/bin/bpkg.o $(GEN_LINK_LIBS); \
-	fi
-ifeq ($(GEN_MUSL_POSTLINK),1)
-	$(call stamp_linux_osabi,$@)
-endif
 
 # M49: upstream libwayland, Alpine's shared build, with libffi for protocol
 # dispatch. Shared rather than static on both counts: Alpine's libffi.a is not
@@ -695,7 +611,6 @@ $(BUILD)/bin/native_smoke: bin/helpers/native_smoke.S
 	$(LD) $(LDFLAGS) $(if $(LINKER),-T $(LINKER)) -o $@ $(BUILD)/bin/native_smoke.o
 	python3 -c "import sys; f=sys.argv[1]; fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
 
-# M104: OpenPAM smoke — the one binary in this tree that links a THIRD-PARTY
 # M104: Linux-PAM smoke. Links libpam.so.0 as DT_NEEDED.
 PAM_DIR := ../build/$(B1NIX_ARCH)/pkg/pam
 $(BUILD)/bin/m104_pam_smoke: bin/smoke/m104_pam_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(PAM_DIR)/lib/libpam.so
@@ -800,7 +715,7 @@ $(BUILD)/bin/cxx_smoke: bin/smoke/cxx_smoke.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBC
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/bin/cxx_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(BESPOKE_CXX_EXTRA) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/cxx_smoke.o \
-	  -l:libc++.so.1 -l:libc++abi.so.1 $(BESPOKE_LIBCXX_EXTRA) $(BESPOKE_LIBC)
+	  $(LIBCXX_LINK) $(BESPOKE_LIBCXX_EXTRA) $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  $(call stamp_linux_osabi,$@) \
 	)
@@ -809,13 +724,13 @@ $(BUILD)/bin/m64_clang_smoke: bin/smoke/m64_clang_smoke.cpp $(BESPOKE_LIBDEP) $(
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/bin/m64_clang_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(BESPOKE_CXX_EXTRA) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m64_clang_smoke.o \
-	  -l:libc++.so.1 -l:libc++abi.so.1 $(BESPOKE_LIBCXX_EXTRA) $(BESPOKE_LIBC)
+	  $(LIBCXX_LINK) $(BESPOKE_LIBCXX_EXTRA) $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  $(call stamp_linux_osabi,$@) \
 	)
 
 # M55: std::iostream (std::cout/cerr + locale facets) + std::filesystem over the
-# b1nix VFS, built against LLVM libc++ via tools/toolchain/bin/b1nix-c++.
+# b1nix VFS, built against LLVM libc++ (Alpine's).
 # -ffreestanding (in $(CXXFLAGS), inherited from the kernel's own build flags)
 # makes clang define __STDC_HOSTED__=0, which makes libc++ define
 # _LIBCPP_FREESTANDING and compile <filesystem> down to an empty namespace —
@@ -830,7 +745,7 @@ $(BUILD)/bin/m55_iostream: bin/smoke/m55_iostream.cpp $(BESPOKE_LIBDEP) $(BESPOK
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -U__STDC_HOSTED__ -D__STDC_HOSTED__=1 -c $< -o $(BUILD)/bin/m55_iostream.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(BESPOKE_CXX_EXTRA) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m55_iostream.o \
-	  -l:libc++.so.1 -l:libc++abi.so.1 $(BESPOKE_LIBCXX_EXTRA) $(BESPOKE_LIBC)
+	  $(LIBCXX_LINK) $(BESPOKE_LIBCXX_EXTRA) $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  $(call stamp_linux_osabi,$@) \
 	)
@@ -839,13 +754,12 @@ $(BUILD)/bin/m55_iostream: bin/smoke/m55_iostream.cpp $(BESPOKE_LIBDEP) $(BESPOK
 # for integer builtins). HarfBuzz is C++ but -fno-exceptions/-rtti keep it off
 # libc++.
 HB_DIR := ../build/$(B1NIX_ARCH)/pkg/harfbuzz
-LLVM_RT := $(firstword $(wildcard ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/sysroot/usr/lib/libcompiler_rt.a ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/llvm-runtimes-build/install/lib/libcompiler_rt.a ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/cross/$(B1NIX_TRIPLET)/lib/libcompiler_rt.a))
 $(BUILD)/bin/m51_harfbuzz_smoke: bin/gfx/m51_harfbuzz_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(HB_DIR)/include/harfbuzz -c $< -o $(BUILD)/bin/m51_harfbuzz_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_harfbuzz_smoke.o \
 	  -L$(HB_DIR)/lib -lharfbuzz $(PKG_RPATH) $(LIBM_DIR)/lib/libm.a \
-	  $(BESPOKE_LIBC) $(LLVM_RT)
+	  $(BESPOKE_LIBC)
 
 # M51: m51_fontconfig_smoke links Fontconfig + expat + FreeType + libm.
 FC_DIR := ../build/$(B1NIX_ARCH)/pkg/fontconfig
@@ -1126,7 +1040,7 @@ install: all install-headers-libs
 ifneq (,)
 endif
 	@# M108: /bin/su and /bin/passwd are no longer ELFs of their own — they are
-	@# BusyBox applet symlinks onto /opt/busybox/bin/busybox-suid, which carries
+	@# BusyBox applet symlinks onto /bin/busybox-suid, which carries
 	@# the setuid bit (see the symlink block at the end of this target). Drop any
 	@# stale copies an older tree installed here, otherwise `cp` would keep an
 	@# unmaintained setuid-root binary alive in the image forever.
@@ -1135,7 +1049,7 @@ endif
 	@# them.
 	@for n in su passwd; do \
 		case "$$(readlink $(ROOTFS)/bin/$$n 2>/dev/null)" in \
-		/opt/busybox/bin/busybox*) ;; \
+		/bin/busybox*) ;; \
 		*) rm -f $(ROOTFS)/bin/$$n ;; \
 		esac; \
 	done
@@ -1151,8 +1065,8 @@ endif
 	@rm -f $(ROOTFS)/bin/kmod
 	@mkdir -p $(ROOTFS)/sbin
 	@for b in insmod rmmod lsmod modprobe depmod; do \
-		[ "$$(readlink $(ROOTFS)/sbin/$$b 2>/dev/null)" = "/opt/busybox/bin/busybox" ] || \
-			ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/sbin/$$b; \
+		[ "$$(readlink $(ROOTFS)/sbin/$$b 2>/dev/null)" = "/bin/busybox" ] || \
+			ln -sfn /bin/busybox $(ROOTFS)/sbin/$$b; \
 	done
 	@mkdir -p $(ROOTFS)/home
 	$(CIC) hello_native.c $(ROOTFS)/home/
@@ -1193,11 +1107,6 @@ endif
 	@#   m108pw    the account whose password `passwd` rewrites.
 	@printf "m108user:x:1002:1002:M108 su caller:/home/m108user:/bin/m108shell\nm108peer:x:1003:1003:M108 su target:/home/m108peer:/bin/sh\nm108pw:x:1004:1004:M108 passwd target:/home/m108pw:/bin/sh\n" >> $(ETCSTAGE)/passwd
 	@mkdir -p $(ROOTFS)/home/m108user $(ROOTFS)/home/m108peer $(ROOTFS)/home/m108pw
-	@# M108: four accounts whose passwords are rewritten SIMULTANEOUSLY, to
-	@# prove /etc/shadow locking. Separate from m108pw so the concurrent run and
-	@# the single-writer passwd test never touch the same record.
-	@printf "m108c0:x:1010:1010:M108 concurrent passwd 0:/home/m108c0:/bin/sh\nm108c1:x:1011:1011:M108 concurrent passwd 1:/home/m108c1:/bin/sh\nm108c2:x:1012:1012:M108 concurrent passwd 2:/home/m108c2:/bin/sh\nm108c3:x:1013:1013:M108 concurrent passwd 3:/home/m108c3:/bin/sh\n" >> $(ETCSTAGE)/passwd
-	@mkdir -p $(ROOTFS)/home/m108c0 $(ROOTFS)/home/m108c1 $(ROOTFS)/home/m108c2 $(ROOTFS)/home/m108c3
 	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:20000:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:20000:0:99999:7:::\n' > $(ETCSTAGE)/shadow
 	@# M104: dedicated /etc/shadow entry for the PAM smoke test
 	@# (userspace/bin/smoke/m104_pam_smoke.c) — a real SHA-512 "$$6$$" hash of the
@@ -1215,29 +1124,21 @@ endif
 	@printf 'm108user:$$6$$m108usersalt$$U7uuAPJyfx58AT26qAudu8PvVKsmO6jTB5EiK/pag6OV8oGNxzS9DPtQlEhTAc4URuN2oMFLgarPW2Utx3DGA1:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
 	@printf 'm108peer:$$6$$m108peersalt$$TCl.o4K5Iw7SlNXrk9dNp4NHfvT0JPCUmyk9otIuGpjRuq8d0trvLR6DDBava0iQY5MBTlU6kRnSNF4XOZXPF/:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
 	@printf 'm108pw:$$6$$m108pwsalt$$YvQPFIRKzF9l53ejsICs/u66sJBq6NfeOai7reDJDsOGog0q.k7t7bHAfGgVrOs3Ni0rrwKmaEwEWvZv3Tl9V1:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
-	@# The four concurrent-passwd accounts. Plaintexts (host:
-	@# `openssl passwd -6 -salt m108cNsalt 'M108concN!'`):
-	@#   m108c0 = M108conc0!   m108c1 = M108conc1!
-	@#   m108c2 = M108conc2!   m108c3 = M108conc3!
-	@printf 'm108c0:$$6$$m108c0salt$$HuyPuTI9qFa/FoKggrJeCwtFkHsDDJlaoFORwM3kqCOFoGZc95vIxua/wd6tNJcFpVnh72HFmSPBF8.dxCdMe0:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
-	@printf 'm108c1:$$6$$m108c1salt$$V7SApmUI/.YLU4jynPO7G0q4cD6Vfy2RXg.lKfo7M4ME8Xh5WJ1Zr0R1YuU.dyIZA.DHfHFJzj.aqXlb9JN5I0:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
-	@printf 'm108c2:$$6$$m108c2salt$$yeLeTxwP6LfUNDPRWwuqy4bN1qaSxaFIBljpDoNwzqgBiBfxzuWgL2dF9dtUjKqxFDG.wZIp1w1uQqOcyeByN/:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
-	@printf 'm108c3:$$6$$m108c3salt$$k3HI/VMOXhcyVakp9WNAJfC0k9a1FvB2LdRLDC64bMRgkeQkSnxa.MF0p/ZCY/4tUzpNeM5Ecd6uyn6ngxCB.1:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
-	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\npamtest:x:1001:pamtest\nm108user:x:1002:\nm108peer:x:1003:\nm108pw:x:1004:\nm108c0:x:1010:\nm108c1:x:1011:\nm108c2:x:1012:\nm108c3:x:1013:\n" > $(ETCSTAGE)/group
-	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/bin/m108shell\n/opt/busybox/bin/busybox\n" > $(ETCSTAGE)/shells
+	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\npamtest:x:1001:pamtest\nm108user:x:1002:\nm108peer:x:1003:\nm108pw:x:1004:\n" > $(ETCSTAGE)/group
+	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/bin/m108shell\n/bin/busybox\n" > $(ETCSTAGE)/shells
 	@$(CIC) $(ETCSTAGE)/passwd $(ETCSTAGE)/shadow $(ETCSTAGE)/group $(ETCSTAGE)/shells $(ROOTFS)/etc/
-	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/zsh/bpkg-smoke.sh,
+	@# rootfs-overlay: /etc/rc, posix/zsh smoke scripts,
 	@# sshd init.d, bb-w6/bb-w2b fixtures — real files (not embedded kernel C
 	@# strings) copied verbatim onto the ext4 root. cp -R preserves the tree
 	@# structure and creates /etc, /bin, /pkgs subdirs as needed.
 	@# --skip-if-in: a path the package staging root also provides is left to
 	@# the merge in root-image, which runs after this and wins anyway. Writing
 	@# ours here first only for it to be overwritten a moment later put a fresh
-	@# timestamp on the tree every build (etc/fonts/fonts.conf, etc/bpkg.conf).
+	@# timestamp on the tree every build (etc/fonts/fonts.conf).
 	@$(CIC) --skip-if-in ../build/$(B1NIX_ARCH)/pkgroot -r rootfs-overlay/. $(ROOTFS)/
 	@# BusyBox applet symlinks: every command in applet-manifest.conf (M42) is
 	@# "upstream" (native in-kernel dispatch was retired with the Ring 3 init
-	@# rewrite), so they become /bin/<cmd> -> /opt/busybox/bin/busybox.
+	@# rewrite), so they become /bin/<cmd> -> /bin/busybox.
 	@# 'sh'/'ash' aren't in the manifest (it only covers coreutils) but every
 	@# script here execve()s /bin/sh directly, so add them explicitly.
 	@# M108: there is no exception list any more. Every name the manifest claims
@@ -1252,7 +1153,7 @@ endif
 	@for n in id whoami groups chmod chown halt setfattr meminfo \
 	          useradd userdel groupadd; do \
 		case "$$(readlink $(ROOTFS)/bin/$$n 2>/dev/null)" in \
-		/opt/busybox/bin/busybox*) ;; \
+		/bin/busybox*) ;; \
 		*) rm -f $(ROOTFS)/bin/$$n ;; \
 		esac; \
 	done
@@ -1260,29 +1161,29 @@ endif
 	@awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$1); gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); if ($$2 == "upstream") print $$1; }' ../tools/configs/applet-manifest.conf | \
 		grep -vE '^(su|passwd|login)$$' | \
 		while read -r cmd; do \
-			[ "$$(readlink "$(ROOTFS)/bin/$$cmd" 2>/dev/null)" = "/opt/busybox/bin/busybox" ] || \
-				ln -sfn /opt/busybox/bin/busybox "$(ROOTFS)/bin/$$cmd"; \
+			[ "$$(readlink "$(ROOTFS)/bin/$$cmd" 2>/dev/null)" = "/bin/busybox" ] || \
+				ln -sfn /bin/busybox "$(ROOTFS)/bin/$$cmd"; \
 		done
-	@$(call link_if_changed,/opt/busybox/bin/busybox,$(ROOTFS)/bin/sh)
-	@$(call link_if_changed,/opt/busybox/bin/busybox,$(ROOTFS)/bin/ash)
+	@$(call link_if_changed,/bin/busybox,$(ROOTFS)/bin/sh)
+	@$(call link_if_changed,/bin/busybox,$(ROOTFS)/bin/ash)
 	@# /usr/bin/env: every third-party script starts "#!/usr/bin/env something",
 	@# and the kernel resolves that path literally — without this entry the
 	@# script fails with ENOENT and the shell reports "not found", which reads
 	@# like the script itself is missing. Alpine (and every distro) ships it.
 	@mkdir -p $(ROOTFS)/usr/bin
-	@$(call link_if_changed,/opt/busybox/bin/busybox,$(ROOTFS)/usr/bin/env)
+	@$(call link_if_changed,/bin/busybox,$(ROOTFS)/usr/bin/env)
 	@# M108: su, passwd and login are BusyBox's three BB_SUID_REQUIRE applets —
 	@# they need euid 0 to read /etc/shadow and to change identity, so they get
-	@# the setuid copy of the multicall ELF (build-busybox.sh installs
+	@# the setuid copy of the multicall ELF (stage-busybox.sh installs
 	@# busybox-suid mode 4755 root; the top-level Makefile stamps that mode onto
 	@# the ext4 image). Everything else above keeps the plain, non-setuid copy,
 	@# so the setuid inode is reachable under exactly three names. Combined with
 	@# CONFIG_FEATURE_SUID=y (libbb check_suid() drops euid for every applet
 	@# that is not BB_SUID_REQUIRE), even a hand-made symlink from `sh` to
 	@# busybox-suid yields no privilege.
-	@$(call link_if_changed,/opt/busybox/bin/busybox-suid,$(ROOTFS)/bin/su)
-	@$(call link_if_changed,/opt/busybox/bin/busybox-suid,$(ROOTFS)/bin/passwd)
-	@$(call link_if_changed,/opt/busybox/bin/busybox-suid,$(ROOTFS)/bin/login)
+	@$(call link_if_changed,/bin/busybox-suid,$(ROOTFS)/bin/su)
+	@$(call link_if_changed,/bin/busybox-suid,$(ROOTFS)/bin/passwd)
+	@$(call link_if_changed,/bin/busybox-suid,$(ROOTFS)/bin/login)
 
 
 clean:

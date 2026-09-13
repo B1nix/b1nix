@@ -1,5 +1,5 @@
 /* Hosted C++ runtime smoke: proves b1nix can RUN (not just link) C++ built
- * against the cross GCC's libstdc++ — STL containers, a global constructor via
+ * against LLVM libc++ — STL containers, a global constructor via
  * crt0's .init_array, exception throw/catch across a frame (DWARF unwind
  * registered by crt0), RTTI (dynamic_cast/typeid), thread-safe function-local
  * statics (__cxa_guard over the kernel futex), and std::thread/mutex/atomic

@@ -46,27 +46,11 @@ elif grep -q 'b1nix.smoke=init' /proc/cmdline 2>/dev/null; then
     # never written on any other instance.
     : > /tmp/m108-openrc-local-ran
     exit 0
-elif grep -q 'b1nix.openrc-ctltest' /proc/cmdline 2>/dev/null; then
-    # The openrc instance: openrc-init is PID 1 and the control-FIFO test runs
-    # for real from /etc/local.d/zz-ctltest.start -> /etc/openrc-ctltest.sh,
-    # which waits for /run/openrc/init.ctl and asks PID 1 to power the machine
-    # off through it. Nothing to do here.
-    #
-    # This branch used to echo "M94-OPENRC: ok init-fifo-present",
-    # "/etc/init.d/killprocs start" and "reboot: powering off" and then call
-    # `poweroff -f` — it forged every marker of the test AND powered the machine
-    # off before the real path could run, so the check could not fail. The
-    # markers now come from the FIFO waiter, from OpenRC's shutdown runlevel and
-    # from the kernel's own poweroff path respectively.
-    #
-    # What does belong here: the PID 1 questions only a process running under
-    # this init can answer — is PID 1 really the openrc-init ELF, does it reap
-    # an orphan, does the system it brought up run a shell. They are the same
-    # checks the BusyBox-init instance makes, so both inits carry the same
-    # evidence. This runs to completion before zz-ctltest.start's waiter can
-    # power the machine off (local.d hooks run in name order, and the FIFO only
-    # appears once every runlevel is done).
-    [ -x /bin/m108_smoke ] && /bin/m108_smoke openrccheck
+elif grep -q 'b1nix.smoke=iommu' /proc/cmdline 2>/dev/null; then
+    # The IOMMU instances: the kernel's self-tests are the whole check and they
+    # have run by the time userspace is up. Power off through the real syscall;
+    # the kernel prints "reboot: powering off" itself.
+    ( sleep 1; /bin/poweroff -f ) &
     exit 0
 else
     SMOKE_SYS=1
@@ -230,13 +214,12 @@ run_test /bin/yield_fairness posix
 run_test /bin/m27_cmdline posix
 run_test /bin/m11_pipe_smoke posix
 run_test /bin/m22_smoke posix
-run_test /bin/m16_smoke posix
 run_test /bin/m58_smoke posix
 run_test /bin/m92_abi_smoke posix
 
 if [ "$SMOKE_SYS" = "1" ]; then
     for s in /etc/posix-smoke.sh /etc/initctl-smoke.sh /etc/zsh-smoke.sh \
-             /etc/bpkg-smoke.sh /etc/m40-smoke.sh /etc/m67-smoke.sh; do
+             /etc/m40-smoke.sh /etc/m67-smoke.sh; do
         [ -x "$s" ] || continue
         case "$s" in
             /etc/zsh-smoke.sh) /bin/zsh "$s" ;;
@@ -265,4 +248,4 @@ echo "B1NIX-TEST: done"
 # markers still on it.
 grep -q 'b1nix.keep-running' /proc/cmdline 2>/dev/null && exit 0
 
-( sleep 1; /bin/poweroff -f || /bin/halt -f || /sbin/openrc-shutdown --no-write --poweroff now ) &
+( sleep 1; /bin/poweroff -f || /bin/halt -f ) &

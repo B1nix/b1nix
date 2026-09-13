@@ -688,7 +688,7 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 			u64 reserved;
 			u64 user_data;
 		} req;
-		static unsigned seen_fb_id, seen_commits;
+		static unsigned seen_commits;
 		static u64 prim_a, prim_b;
 		static unsigned prim_a_n, prim_b_n, prim_other;
 		(void)prim_b_n;
@@ -696,7 +696,6 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 		if (lkpi_copy_from_user(&req, user_arg, sizeof(req)) == 0 &&
 		    req.count_objs && req.count_objs < 64) {
 			u32 nprops[64];
-			u32 total = 0;
 
 			seen_commits++;
 			u32 objs[64];
@@ -707,8 +706,6 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 			                        req.count_objs * sizeof(u32)) == 0) {
 				u32 flat = 0;
 
-				for (u32 i = 0; i < req.count_objs; i++)
-					total += nprops[i];
 				/* Walk per object, so a property can be attributed to the
 				 * plane that carries it: FB_ID = 0 on the planes a
 				 * compositor leaves off says nothing, and printing those
@@ -729,7 +726,6 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 							goto done_props;
 						if (pid != drm_fb_id_prop(file) || !val)
 							continue;
-						seen_fb_id++;
 						if (objs[o] != drm_primary_plane_id(file))
 							continue;
 						/* Every distinct buffer the primary plane is asked
@@ -1240,7 +1236,13 @@ static void drm_fps_note_flip(struct file *filp)
  * after the vertical blank, the beam is at the top of the frame; spread over
  * the frame, the events are not vblank-locked at all.
  */
-extern u32 lkpi_i915_scanline(void);
+/* Supplied by the i915 display probe when that driver is in the link. A build
+ * without it (aarch64, or B1NIX_I915=0) has no display registers to read, so
+ * the watches that call these report nothing rather than fail to link. */
+__attribute__((weak)) u32 lkpi_i915_scanline(void) { return 0; }
+__attribute__((weak)) u32 lkpi_i915_live_surface(void) { return 0; }
+__attribute__((weak)) u32 lkpi_i915_armed_surface(void) { return 0; }
+__attribute__((weak)) void lkpi_i915_note_commit(void) { }
 
 static void drm_event_scanline_note(void)
 {

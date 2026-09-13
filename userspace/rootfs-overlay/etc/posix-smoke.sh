@@ -180,9 +180,9 @@ grep "x" /tmp/m22_wf_out.txt >/dev/null
 grep "y" /tmp/m22_wf_out.txt >/dev/null
 [ $? -eq 0 ] || exit 1
 echo "M22-POLISH: before-rm-rf"
-echo "M22-DBG: ls wf_dir:"; /opt/busybox/bin/busybox ls -la /tmp/m22_wf_dir
-echo "M22-DBG: ls wf_dir_copy:"; /opt/busybox/bin/busybox ls -la /tmp/m22_wf_dir_copy
-echo "M22-DBG: find copy:"; /opt/busybox/bin/busybox find /tmp/m22_wf_dir_copy
+echo "M22-DBG: ls wf_dir:"; /bin/busybox ls -la /tmp/m22_wf_dir
+echo "M22-DBG: ls wf_dir_copy:"; /bin/busybox ls -la /tmp/m22_wf_dir_copy
+echo "M22-DBG: find copy:"; /bin/busybox find /tmp/m22_wf_dir_copy
 rm -rf /tmp/m22_wf_dir /tmp/m22_wf_dir_copy
 [ $? -eq 0 ] || true
 echo "M22-POLISH: after-rm-rf"
@@ -207,164 +207,161 @@ fi
 if ! grep -q 'b1nix.smoke=graphics' /proc/cmdline; then
 # ── Upstream BusyBox package smoke tests ──
 echo "BB-SMOKE: start"
-/opt/busybox/bin/busybox --list | grep -q "echo" && echo "BB-SMOKE: ok list"
-/opt/busybox/bin/busybox echo "hello bb" | grep -q "hello bb" && echo "BB-SMOKE: ok echo"
-/opt/busybox/bin/busybox printf "hello %s\\n" bb | grep -q "hello bb" && echo "BB-SMOKE: ok printf"
-/opt/busybox/bin/busybox pwd | grep -q "/" && echo "BB-SMOKE: ok pwd"
-/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir
+/bin/busybox --list | grep -q "echo" && echo "BB-SMOKE: ok list"
+/bin/busybox echo "hello bb" | grep -q "hello bb" && echo "BB-SMOKE: ok echo"
+/bin/busybox printf "hello %s\\n" bb | grep -q "hello bb" && echo "BB-SMOKE: ok printf"
+/bin/busybox pwd | grep -q "/" && echo "BB-SMOKE: ok pwd"
+/bin/busybox mkdir -p /tmp/bb_dir
 [ -d /tmp/bb_dir ] && echo "BB-SMOKE: ok mkdir"
-/opt/busybox/bin/busybox touch /tmp/bb_dir/bb_file
+/bin/busybox touch /tmp/bb_dir/bb_file
 [ -f /tmp/bb_dir/bb_file ] && echo "BB-SMOKE: ok touch"
 echo "content123" > /tmp/bb_dir/bb_file
-/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file | grep -q "content123" && echo "BB-SMOKE: ok cat"
-/opt/busybox/bin/busybox cp /tmp/bb_dir/bb_file /tmp/bb_dir/bb_file_cp
-/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_cp | grep -q "content123" && [ -f /tmp/bb_dir/bb_file_cp ] && echo "BB-SMOKE: ok cp"
-/opt/busybox/bin/busybox mv /tmp/bb_dir/bb_file_cp /tmp/bb_dir/bb_file_mv
-[ ! -f /tmp/bb_dir/bb_file_cp ] && [ -f /tmp/bb_dir/bb_file_mv ] && /opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_mv | grep -q "content123" && echo "BB-SMOKE: ok mv"
-/opt/busybox/bin/busybox ln -s /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk
-/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_lnk | grep -q "content123" && echo "BB-SMOKE: ok ln"
-/opt/busybox/bin/busybox readlink /tmp/bb_dir/bb_file_lnk | grep -q "bb_file_mv" && echo "BB-SMOKE: ok readlink"
-/opt/busybox/bin/busybox chmod 755 /tmp/bb_dir/bb_file_mv
+/bin/busybox cat /tmp/bb_dir/bb_file | grep -q "content123" && echo "BB-SMOKE: ok cat"
+/bin/busybox cp /tmp/bb_dir/bb_file /tmp/bb_dir/bb_file_cp
+/bin/busybox cat /tmp/bb_dir/bb_file_cp | grep -q "content123" && [ -f /tmp/bb_dir/bb_file_cp ] && echo "BB-SMOKE: ok cp"
+/bin/busybox mv /tmp/bb_dir/bb_file_cp /tmp/bb_dir/bb_file_mv
+[ ! -f /tmp/bb_dir/bb_file_cp ] && [ -f /tmp/bb_dir/bb_file_mv ] && /bin/busybox cat /tmp/bb_dir/bb_file_mv | grep -q "content123" && echo "BB-SMOKE: ok mv"
+/bin/busybox ln -s /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk
+/bin/busybox cat /tmp/bb_dir/bb_file_lnk | grep -q "content123" && echo "BB-SMOKE: ok ln"
+/bin/busybox readlink /tmp/bb_dir/bb_file_lnk | grep -q "bb_file_mv" && echo "BB-SMOKE: ok readlink"
+/bin/busybox chmod 755 /tmp/bb_dir/bb_file_mv
 [ -x /tmp/bb_dir/bb_file_mv ] && echo "BB-SMOKE: ok chmod"
-/opt/busybox/bin/busybox test -f /tmp/bb_dir/bb_file_mv && /opt/busybox/bin/busybox [ -d /tmp/bb_dir ] && echo "BB-SMOKE: ok test"
+/bin/busybox test -f /tmp/bb_dir/bb_file_mv && /bin/busybox [ -d /tmp/bb_dir ] && echo "BB-SMOKE: ok test"
 printf "b\\nc\\na\\n" > /tmp/bb_dir/bb_sort
-/opt/busybox/bin/busybox sort /tmp/bb_dir/bb_sort | head -n 1 | grep -q "a" && echo "BB-SMOKE: ok sort"
+/bin/busybox sort /tmp/bb_dir/bb_sort | head -n 1 | grep -q "a" && echo "BB-SMOKE: ok sort"
 printf "a\\na\\nb\\n" > /tmp/bb_dir/bb_uniq
-/opt/busybox/bin/busybox uniq /tmp/bb_dir/bb_uniq | wc -l | grep -q "2" && echo "BB-SMOKE: ok uniq"
-/opt/busybox/bin/busybox ls /tmp/bb_dir | grep -q "bb_file" && echo "BB-W1: ok ls"
-/opt/busybox/bin/busybox cmp /tmp/bb_dir/bb_file /tmp/bb_dir/bb_file && echo "BB-W1: ok cmp"
-printf "left:right\\n" | /opt/busybox/bin/busybox cut -d: -f2 | grep -q "right" && echo "BB-W1: ok cut"
-/opt/busybox/bin/busybox env BB_W1=value | grep -q "BB_W1=value" && echo "BB-W1: ok env"
-BB_ID_OUT=$(/opt/busybox/bin/busybox id -u)
+/bin/busybox uniq /tmp/bb_dir/bb_uniq | wc -l | grep -q "2" && echo "BB-SMOKE: ok uniq"
+/bin/busybox ls /tmp/bb_dir | grep -q "bb_file" && echo "BB-W1: ok ls"
+/bin/busybox cmp /tmp/bb_dir/bb_file /tmp/bb_dir/bb_file && echo "BB-W1: ok cmp"
+printf "left:right\\n" | /bin/busybox cut -d: -f2 | grep -q "right" && echo "BB-W1: ok cut"
+/bin/busybox env BB_W1=value | grep -q "BB_W1=value" && echo "BB-W1: ok env"
+BB_ID_OUT=$(/bin/busybox id -u)
 [ "$BB_ID_OUT" = "0" ] && echo "BB-W1: ok id"
-/opt/busybox/bin/busybox printenv PATH >/dev/null && echo "BB-W1: ok printenv"
-printf "tee-data\\n" | /opt/busybox/bin/busybox tee /tmp/bb_dir/bb_tee | grep -q "tee-data" && grep -q "tee-data" /tmp/bb_dir/bb_tee && echo "BB-W1: ok tee"
-printf "abc\\n" | /opt/busybox/bin/busybox tr a-z A-Z | grep -q "ABC" && echo "BB-W1: ok tr"
-/opt/busybox/bin/busybox whoami | grep -q "root" && echo "BB-W1: ok whoami"
-/opt/busybox/bin/busybox seq 1 3 > /tmp/bb_dir/bb_seq
+/bin/busybox printenv PATH >/dev/null && echo "BB-W1: ok printenv"
+printf "tee-data\\n" | /bin/busybox tee /tmp/bb_dir/bb_tee | grep -q "tee-data" && grep -q "tee-data" /tmp/bb_dir/bb_tee && echo "BB-W1: ok tee"
+printf "abc\\n" | /bin/busybox tr a-z A-Z | grep -q "ABC" && echo "BB-W1: ok tr"
+/bin/busybox whoami | grep -q "root" && echo "BB-W1: ok whoami"
+/bin/busybox seq 1 3 > /tmp/bb_dir/bb_seq
 tail -n 1 /tmp/bb_dir/bb_seq | grep -q "3" && echo "BB-W1: ok seq"
-/opt/busybox/bin/busybox which ls | grep -q "/bin/ls" && echo "BB-W1: ok which"
-/opt/busybox/bin/busybox clear >/tmp/bb_dir/bb_clear && echo "BB-W1: ok clear"
-printf "AB" | /opt/busybox/bin/busybox hexdump | grep -q "4241" && echo "BB-W1: ok hexdump"
+/bin/busybox which ls | grep -q "/bin/ls" && echo "BB-W1: ok which"
+/bin/busybox clear >/tmp/bb_dir/bb_clear && echo "BB-W1: ok clear"
+printf "AB" | /bin/busybox hexdump | grep -q "4241" && echo "BB-W1: ok hexdump"
 mkdir -p /tmp/bb_dir/w2/sub
 printf "alpha1\\nbeta2\\n" > /tmp/bb_dir/w2/sub/data.txt
-/opt/busybox/bin/busybox stat -c %s /tmp/bb_dir/w2/sub/data.txt | grep -q "13" && echo "BB-W2: ok stat"
-/opt/busybox/bin/busybox realpath /tmp/bb_dir/w2/sub/data.txt | grep -q "/tmp/bb_dir/w2/sub/data.txt" && echo "BB-W2: ok realpath"
-BB_TMP=$(/opt/busybox/bin/busybox mktemp -d /tmp/bb_dir/w2/tmp.XXXXXX)
+/bin/busybox stat -c %s /tmp/bb_dir/w2/sub/data.txt | grep -q "13" && echo "BB-W2: ok stat"
+/bin/busybox realpath /tmp/bb_dir/w2/sub/data.txt | grep -q "/tmp/bb_dir/w2/sub/data.txt" && echo "BB-W2: ok realpath"
+BB_TMP=$(/bin/busybox mktemp -d /tmp/bb_dir/w2/tmp.XXXXXX)
 [ -d "$BB_TMP" ] && echo "BB-W2: ok mktemp"
-/opt/busybox/bin/busybox find /tmp/bb_dir/w2 -name "*.txt" | grep -q "data.txt" && echo "BB-W2: ok find"
-/opt/busybox/bin/busybox grep -E "alpha[0-9]+" /tmp/bb_dir/w2/sub/data.txt | grep -q "alpha1" && echo "BB-W2: ok grep"
-/opt/busybox/bin/busybox grep -Ei "[A-Z]+[0-9]" /tmp/bb_dir/w2/sub/data.txt | grep -q "alpha1" && echo "BB-W2: ok grep-icase"
-printf "name-42\\n" | /opt/busybox/bin/busybox sed "s/\\([a-z]*\\)-\\([0-9]*\\)/\\2:\\1/" | grep -q "42:name" && echo "BB-W2: ok sed"
-printf "left:right\\n" | /opt/busybox/bin/busybox awk -F: "{ print NF }" | grep -q "2" && echo "BB-W2: ok awk"
-printf "one two\\n" | /opt/busybox/bin/busybox xargs /opt/busybox/bin/busybox echo | grep -q "one two" && echo "BB-W2: ok xargs"
+/bin/busybox find /tmp/bb_dir/w2 -name "*.txt" | grep -q "data.txt" && echo "BB-W2: ok find"
+/bin/busybox grep -E "alpha[0-9]+" /tmp/bb_dir/w2/sub/data.txt | grep -q "alpha1" && echo "BB-W2: ok grep"
+/bin/busybox grep -Ei "[A-Z]+[0-9]" /tmp/bb_dir/w2/sub/data.txt | grep -q "alpha1" && echo "BB-W2: ok grep-icase"
+printf "name-42\\n" | /bin/busybox sed "s/\\([a-z]*\\)-\\([0-9]*\\)/\\2:\\1/" | grep -q "42:name" && echo "BB-W2: ok sed"
+printf "left:right\\n" | /bin/busybox awk -F: "{ print NF }" | grep -q "2" && echo "BB-W2: ok awk"
+printf "one two\\n" | /bin/busybox xargs /bin/busybox echo | grep -q "one two" && echo "BB-W2: ok xargs"
 cp /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt
-/opt/busybox/bin/busybox diff /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt
+/bin/busybox diff /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt
 BB_DIFF_SAME=$?
 printf "changed\\n" >> /tmp/bb_dir/w2/sub/same.txt
-/opt/busybox/bin/busybox diff /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt >/dev/null
+/bin/busybox diff /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt >/dev/null
 BB_DIFF_CHANGED=$?
 [ $BB_DIFF_SAME -eq 0 ] && [ $BB_DIFF_CHANGED -ne 0 ] && echo "BB-W2: ok diff"
 printf "abc" > /tmp/bb_dir/w2/abc
-/opt/busybox/bin/busybox cksum /tmp/bb_dir/w2/abc | grep -q "1219131554 3" && echo "BB-W2: ok cksum"
-/opt/busybox/bin/busybox md5sum /tmp/bb_dir/w2/abc | grep -q "900150983cd24fb0d6963f7d28e17f72" && echo "BB-W2: ok md5sum"
-/opt/busybox/bin/busybox sha256sum /tmp/bb_dir/w2/abc | grep -q "ba7816bf8f01cfea414140de5dae2223" && echo "BB-W2: ok sha256sum"
-/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir/w2b
-/opt/busybox/bin/busybox seq 1 4000 > /tmp/bb_dir/w2b/big.txt
-/opt/busybox/bin/busybox dd if=/tmp/bb_dir/w2/abc of=/tmp/bb_dir/w2b/abc.dd bs=1 count=3 2>/dev/null
-/opt/busybox/bin/busybox cmp /tmp/bb_dir/w2/abc /tmp/bb_dir/w2b/abc.dd && echo "BB-W2B: ok dd"
-/opt/busybox/bin/busybox du -k /tmp/bb_dir/w2b/big.txt | /opt/busybox/bin/busybox grep -q "[0-9]" && echo "BB-W2B: ok du"
+/bin/busybox cksum /tmp/bb_dir/w2/abc | grep -q "1219131554 3" && echo "BB-W2: ok cksum"
+/bin/busybox md5sum /tmp/bb_dir/w2/abc | grep -q "900150983cd24fb0d6963f7d28e17f72" && echo "BB-W2: ok md5sum"
+/bin/busybox sha256sum /tmp/bb_dir/w2/abc | grep -q "ba7816bf8f01cfea414140de5dae2223" && echo "BB-W2: ok sha256sum"
+/bin/busybox mkdir -p /tmp/bb_dir/w2b
+/bin/busybox seq 1 4000 > /tmp/bb_dir/w2b/big.txt
+/bin/busybox dd if=/tmp/bb_dir/w2/abc of=/tmp/bb_dir/w2b/abc.dd bs=1 count=3 2>/dev/null
+/bin/busybox cmp /tmp/bb_dir/w2/abc /tmp/bb_dir/w2b/abc.dd && echo "BB-W2B: ok dd"
+/bin/busybox du -k /tmp/bb_dir/w2b/big.txt | /bin/busybox grep -q "[0-9]" && echo "BB-W2B: ok du"
 cat /proc/mounts | grep -q "/" && echo "BB-W2B: ok df"
-/opt/busybox/bin/busybox tar -cf /tmp/bb_dir/w2b/t.tar -C /tmp/bb_dir/w2b big.txt
-/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir/w2b/ex
-/opt/busybox/bin/busybox tar -xf /tmp/bb_dir/w2b/t.tar -C /tmp/bb_dir/w2b/ex
-/opt/busybox/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/ex/big.txt && echo "BB-W2B: ok tar"
-/opt/busybox/bin/busybox gzip -c /tmp/bb_dir/w2b/t.tar > /tmp/bb_dir/w2b/tz.tar.gz
-/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir/w2b/exz
-/opt/busybox/bin/busybox tar -xzf /tmp/bb_dir/w2b/tz.tar.gz -C /tmp/bb_dir/w2b/exz
-/opt/busybox/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/exz/big.txt && echo "BB-W2B: ok tar-gzip"
-/opt/busybox/bin/busybox gzip -c /tmp/bb_dir/w2b/big.txt > /tmp/bb_dir/w2b/big.gz
-/opt/busybox/bin/busybox gunzip -c /tmp/bb_dir/w2b/big.gz > /tmp/bb_dir/w2b/big.gunzip
-/opt/busybox/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/big.gunzip && echo "BB-W2B: ok gzip"
-/opt/busybox/bin/busybox bzip2 -c /tmp/bb_dir/w2b/big.txt > /tmp/bb_dir/w2b/big.bz2
-/opt/busybox/bin/busybox bunzip2 -c /tmp/bb_dir/w2b/big.bz2 > /tmp/bb_dir/w2b/big.bunzip2
-/opt/busybox/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/big.bunzip2 && echo "BB-W2B: ok bzip2"
-/opt/busybox/bin/busybox xzcat /etc/bb-w2b/hello.xz | grep -q "b1nix-xz-OK" && echo "BB-W2B: ok xzcat"
-/opt/busybox/bin/busybox unxz -c /etc/bb-w2b/hello.xz | grep -q "b1nix-xz-OK" && echo "BB-W2B: ok unxz"
+/bin/busybox tar -cf /tmp/bb_dir/w2b/t.tar -C /tmp/bb_dir/w2b big.txt
+/bin/busybox mkdir -p /tmp/bb_dir/w2b/ex
+/bin/busybox tar -xf /tmp/bb_dir/w2b/t.tar -C /tmp/bb_dir/w2b/ex
+/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/ex/big.txt && echo "BB-W2B: ok tar"
+/bin/busybox gzip -c /tmp/bb_dir/w2b/t.tar > /tmp/bb_dir/w2b/tz.tar.gz
+/bin/busybox mkdir -p /tmp/bb_dir/w2b/exz
+/bin/busybox tar -xzf /tmp/bb_dir/w2b/tz.tar.gz -C /tmp/bb_dir/w2b/exz
+/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/exz/big.txt && echo "BB-W2B: ok tar-gzip"
+/bin/busybox gzip -c /tmp/bb_dir/w2b/big.txt > /tmp/bb_dir/w2b/big.gz
+/bin/busybox gunzip -c /tmp/bb_dir/w2b/big.gz > /tmp/bb_dir/w2b/big.gunzip
+/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/big.gunzip && echo "BB-W2B: ok gzip"
+/bin/busybox bzip2 -c /tmp/bb_dir/w2b/big.txt > /tmp/bb_dir/w2b/big.bz2
+/bin/busybox bunzip2 -c /tmp/bb_dir/w2b/big.bz2 > /tmp/bb_dir/w2b/big.bunzip2
+/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/big.bunzip2 && echo "BB-W2B: ok bzip2"
+/bin/busybox xzcat /etc/bb-w2b/hello.xz | grep -q "b1nix-xz-OK" && echo "BB-W2B: ok xzcat"
+/bin/busybox unxz -c /etc/bb-w2b/hello.xz | grep -q "b1nix-xz-OK" && echo "BB-W2B: ok unxz"
 echo "not a gzip stream" > /tmp/bb_dir/w2b/bad.gz
-/opt/busybox/bin/busybox gunzip -c /tmp/bb_dir/w2b/bad.gz > /dev/null 2>&1
+/bin/busybox gunzip -c /tmp/bb_dir/w2b/bad.gz > /dev/null 2>&1
 BB_GZ_BAD=$?
 [ $BB_GZ_BAD -ne 0 ] && echo "BB-W2B: ok gunzip-malformed"
 echo "BB-W3: start procps"
-/opt/busybox/bin/busybox ps | /opt/busybox/bin/busybox grep -q "root" && echo "BB-W3: ok ps"
-/opt/busybox/bin/busybox top -b -n 1 </dev/null | /opt/busybox/bin/busybox grep -q "root" && echo "BB-W3: ok top"
-/opt/busybox/bin/busybox uptime | /opt/busybox/bin/busybox grep -q "load average" && echo "BB-W3: ok uptime"
-/opt/busybox/bin/busybox free | /opt/busybox/bin/busybox grep -q "Mem:" && echo "BB-W3: ok free"
-/opt/busybox/bin/busybox dmesg | /opt/busybox/bin/busybox grep -qi "b1nix" && echo "BB-W3: ok dmesg"
-/opt/busybox/bin/busybox sleep 30 &
-/opt/busybox/bin/busybox pidof busybox | /opt/busybox/bin/busybox grep -q "[0-9]" && echo "BB-W3: ok pidof"
-/opt/busybox/bin/busybox pgrep busybox | /opt/busybox/bin/busybox grep -q "[0-9]" && echo "BB-W3: ok pgrep"
-/opt/busybox/bin/busybox pkill busybox && echo "BB-W3: ok pkill"
+/bin/busybox ps | /bin/busybox grep -q "root" && echo "BB-W3: ok ps"
+/bin/busybox top -b -n 1 </dev/null | /bin/busybox grep -q "root" && echo "BB-W3: ok top"
+/bin/busybox uptime | /bin/busybox grep -q "load average" && echo "BB-W3: ok uptime"
+/bin/busybox free | /bin/busybox grep -q "Mem:" && echo "BB-W3: ok free"
+/bin/busybox dmesg | /bin/busybox grep -qi "b1nix" && echo "BB-W3: ok dmesg"
+/bin/busybox sleep 30 &
+/bin/busybox pidof busybox | /bin/busybox grep -q "[0-9]" && echo "BB-W3: ok pidof"
+/bin/busybox pgrep busybox | /bin/busybox grep -q "[0-9]" && echo "BB-W3: ok pgrep"
+/bin/busybox pkill busybox && echo "BB-W3: ok pkill"
 echo "BB-W3: done"
 echo "BB-W4: start"
-/opt/busybox/bin/busybox mkdir -p /mnt/w4
-/opt/busybox/bin/busybox mount -t ext4 sda /mnt/w4
-/opt/busybox/bin/busybox mount | /opt/busybox/bin/busybox grep -q "/mnt/w4" && echo "BB-W4: ok mount"
+/bin/busybox mkdir -p /mnt/w4
+/bin/busybox mount -t ext4 sda /mnt/w4
+/bin/busybox mount | /bin/busybox grep -q "/mnt/w4" && echo "BB-W4: ok mount"
 echo m43data > /mnt/w4/m43_create.txt
-/opt/busybox/bin/busybox mkdir /mnt/w4/m43_dir
-/opt/busybox/bin/busybox cat /mnt/w4/m43_create.txt | /opt/busybox/bin/busybox grep -q m43data && [ -d /mnt/w4/m43_dir ] && echo "M43: ok create-runtime-mountpoint"
-/opt/busybox/bin/busybox rm -f /mnt/w4/m43_create.txt; /opt/busybox/bin/busybox rmdir /mnt/w4/m43_dir
-/opt/busybox/bin/busybox umount /mnt/w4
-/opt/busybox/bin/busybox mount | /opt/busybox/bin/busybox grep -q "/mnt/w4" || echo "BB-W4: ok umount"
+/bin/busybox mkdir /mnt/w4/m43_dir
+/bin/busybox cat /mnt/w4/m43_create.txt | /bin/busybox grep -q m43data && [ -d /mnt/w4/m43_dir ] && echo "M43: ok create-runtime-mountpoint"
+/bin/busybox rm -f /mnt/w4/m43_create.txt; /bin/busybox rmdir /mnt/w4/m43_dir
+/bin/busybox umount /mnt/w4
+/bin/busybox mount | /bin/busybox grep -q "/mnt/w4" || echo "BB-W4: ok umount"
 # nslookup: a forward A-record query through the configured resolver. The old
 # probe reverse-looked-up 10.0.2.2, which needs a PTR record the slirp DNS proxy
 # never has, so it could not pass even with a fully working resolver. Degrade to
 # "unsupported" (a smoke skip) when the link has no off-link DNS path, the same
 # way the curl/wget external probes do.
-if /opt/busybox/bin/busybox timeout 8 /opt/busybox/bin/busybox nslookup example.com 2>/dev/null | /opt/busybox/bin/busybox grep -q "^Name:"; then
+if /bin/busybox timeout 8 /bin/busybox nslookup example.com 2>/dev/null | /bin/busybox grep -q "^Name:"; then
 	echo "BB-W4: ok nslookup"
 else
 	echo "BB-W4: unsupported nslookup"
 fi
-/opt/busybox/bin/busybox lsof 2>/dev/null | /opt/busybox/bin/busybox grep -q "/" && echo "BB-W4: ok lsof"
-/opt/busybox/bin/busybox netstat -tln | /opt/busybox/bin/busybox grep -q ":22" && echo "BB-W4: ok netstat"
-/opt/busybox/bin/busybox route -n | /opt/busybox/bin/busybox grep -q "10.0.2" && echo "BB-W4: ok route"
-/opt/busybox/bin/busybox ifconfig eth0 | /opt/busybox/bin/busybox grep -q "10.0.2.15" && echo "BB-W4: ok ifconfig"
-/opt/busybox/bin/busybox blkid /dev/sda 2>/dev/null | /opt/busybox/bin/busybox grep -qi "ext" && echo "BB-W4: ok blkid"
-/opt/busybox/bin/busybox fdisk -l /dev/sda 2>/dev/null | /opt/busybox/bin/busybox grep -q "Disk /dev/sda" && echo "BB-W4: ok fdisk"
-/opt/busybox/bin/busybox ping -c 1 -W 3 10.0.2.2 2>&1 | /opt/busybox/bin/busybox grep -q "0% packet loss" && echo "BB-W4B: ok ping"
-/opt/busybox/bin/busybox losetup -f 2>/dev/null | /opt/busybox/bin/busybox grep -q "/dev/loop" && echo "BB-W4B: ok losetup"
-/opt/busybox/bin/busybox ip link show 2>&1 | /opt/busybox/bin/busybox grep -q "eth0" && echo "BB-W4B: ok ip"
+/bin/busybox lsof 2>/dev/null | /bin/busybox grep -q "/" && echo "BB-W4: ok lsof"
+/bin/busybox netstat -tln | /bin/busybox grep -q ":22" && echo "BB-W4: ok netstat"
+/bin/busybox route -n | /bin/busybox grep -q "10.0.2" && echo "BB-W4: ok route"
+/bin/busybox ifconfig eth0 | /bin/busybox grep -q "10.0.2.15" && echo "BB-W4: ok ifconfig"
+/bin/busybox blkid /dev/sda 2>/dev/null | /bin/busybox grep -qi "ext" && echo "BB-W4: ok blkid"
+/bin/busybox fdisk -l /dev/sda 2>/dev/null | /bin/busybox grep -q "Disk /dev/sda" && echo "BB-W4: ok fdisk"
+/bin/busybox ping -c 1 -W 3 10.0.2.2 2>&1 | /bin/busybox grep -q "0% packet loss" && echo "BB-W4B: ok ping"
+/bin/busybox losetup -f 2>/dev/null | /bin/busybox grep -q "/dev/loop" && echo "BB-W4B: ok losetup"
+/bin/busybox ip link show 2>&1 | /bin/busybox grep -q "eth0" && echo "BB-W4B: ok ip"
 echo "BB-W4: done"
 echo "BB-W5: start ash"
-/opt/busybox/bin/busybox --list | /opt/busybox/bin/busybox grep -q "^ash$" && echo "BB-W5: ok list-ash"
-/opt/busybox/bin/busybox --list | /opt/busybox/bin/busybox grep -q "^sh$" && echo "BB-W5: ok list-sh"
-/opt/busybox/bin/busybox ash -c 'echo ash-ok' | /opt/busybox/bin/busybox grep -q "ash-ok" && echo "BB-W5: ok ash-c"
-/opt/busybox/bin/busybox sh -c 'echo sh-ok' | /opt/busybox/bin/busybox grep -q "sh-ok" && echo "BB-W5: ok busybox-sh-c"
-/bin/sh -c 'echo bin-sh-ok' | /opt/busybox/bin/busybox grep -q "bin-sh-ok" && echo "BB-W5: ok bin-sh-c"
-/opt/busybox/bin/busybox printf 'x=7\ntest "\044x" = 7 && echo var-ok\n' > /tmp/bb_dir/w5-vars.sh
-/bin/sh /tmp/bb_dir/w5-vars.sh | /opt/busybox/bin/busybox grep -q "var-ok" && echo "BB-W5: ok vars"
-/bin/sh -c 'echo $((2 + 3))' | /opt/busybox/bin/busybox grep -q "5" && echo "BB-W5: ok math"
-/bin/sh -c 'printf "a\\nb\\n" | grep -q b && echo pipe-ok' | /opt/busybox/bin/busybox grep -q "pipe-ok" && echo "BB-W5: ok pipe"
-/bin/sh -c 'echo redir-ok > /tmp/bb_dir/w5-redir; cat /tmp/bb_dir/w5-redir' | /opt/busybox/bin/busybox grep -q "redir-ok" && echo "BB-W5: ok redir"
-/bin/sh -c 'sleep 0; echo wait-ok' | /opt/busybox/bin/busybox grep -q "wait-ok" && echo "BB-W5: ok wait"
-/opt/busybox/bin/busybox printf 'i=0\nwhile [ \044i -lt 3 ]; do i=\044((i+1)); done\necho loop-ok \044i\n' > /tmp/bb_dir/w5-loop.sh
-/bin/sh /tmp/bb_dir/w5-loop.sh | /opt/busybox/bin/busybox grep -q "loop-ok 3" && echo "BB-W5: ok arith-loop"
+/bin/busybox --list | /bin/busybox grep -q "^ash$" && echo "BB-W5: ok list-ash"
+/bin/busybox --list | /bin/busybox grep -q "^sh$" && echo "BB-W5: ok list-sh"
+/bin/busybox ash -c 'echo ash-ok' | /bin/busybox grep -q "ash-ok" && echo "BB-W5: ok ash-c"
+/bin/busybox sh -c 'echo sh-ok' | /bin/busybox grep -q "sh-ok" && echo "BB-W5: ok busybox-sh-c"
+/bin/sh -c 'echo bin-sh-ok' | /bin/busybox grep -q "bin-sh-ok" && echo "BB-W5: ok bin-sh-c"
+/bin/busybox printf 'x=7\ntest "\044x" = 7 && echo var-ok\n' > /tmp/bb_dir/w5-vars.sh
+/bin/sh /tmp/bb_dir/w5-vars.sh | /bin/busybox grep -q "var-ok" && echo "BB-W5: ok vars"
+/bin/sh -c 'echo $((2 + 3))' | /bin/busybox grep -q "5" && echo "BB-W5: ok math"
+/bin/sh -c 'printf "a\\nb\\n" | grep -q b && echo pipe-ok' | /bin/busybox grep -q "pipe-ok" && echo "BB-W5: ok pipe"
+/bin/sh -c 'echo redir-ok > /tmp/bb_dir/w5-redir; cat /tmp/bb_dir/w5-redir' | /bin/busybox grep -q "redir-ok" && echo "BB-W5: ok redir"
+/bin/sh -c 'sleep 0; echo wait-ok' | /bin/busybox grep -q "wait-ok" && echo "BB-W5: ok wait"
+/bin/busybox printf 'i=0\nwhile [ \044i -lt 3 ]; do i=\044((i+1)); done\necho loop-ok \044i\n' > /tmp/bb_dir/w5-loop.sh
+/bin/sh /tmp/bb_dir/w5-loop.sh | /bin/busybox grep -q "loop-ok 3" && echo "BB-W5: ok arith-loop"
 echo "BB-W5: done"
 /bin/sh /etc/bb-w6/run.sh
-/opt/busybox/bin/busybox uuidgen 2>/dev/null | grep -qE '^[0-9a-f-]{36}$' && echo "BB-W7: ok uuidgen"
-/opt/busybox/bin/busybox sha384sum /proc/version 2>/dev/null | grep -qE '^[0-9a-f]{96}' && echo "BB-W7: ok sha384sum-upstream"
-/opt/busybox/bin/busybox vmstat 2>/dev/null | grep -qE '[0-9]+' && echo "BB-W7: ok vmstat-upstream"
-printf 'libc kernel\\nkernel user\\nuser libc\\n' | /opt/busybox/bin/busybox tsort 2>/dev/null | head -n 1 | grep -q "libc" && echo "BB-W7: ok tsort"
+/usr/bin/uuidgen 2>/dev/null | grep -qE '^[0-9a-f-]{36}$' && echo "BB-W7: ok uuidgen"
 mkdir -p /tmp/bb_dir/w7/sub
 printf 'leaf\\n' > /tmp/bb_dir/w7/leaf.txt
 ln -sf leaf.txt /tmp/bb_dir/w7/link.txt 2>/dev/null || :
-/opt/busybox/bin/busybox tree /tmp/bb_dir/w7 2>/dev/null | grep -qE 'leaf' && echo "BB-W7: ok tree-upstream"
-/bin/setfattr -n user.b1nix -v wave7 /tmp/bb_dir/w7/leaf.txt
-/opt/busybox/bin/busybox getfattr -n user.b1nix /tmp/bb_dir/w7/leaf.txt 2>/dev/null | grep -q 'user.b1nix="wave7"' && echo "BB-W7: ok getfattr"
+/bin/busybox tree /tmp/bb_dir/w7 2>/dev/null | grep -qE 'leaf' && echo "BB-W7: ok tree-upstream"
+/usr/bin/setfattr -n user.b1nix -v wave7 /tmp/bb_dir/w7/leaf.txt
+/usr/bin/getfattr -n user.b1nix /tmp/bb_dir/w7/leaf.txt 2>/dev/null | grep -q 'user.b1nix="wave7"' && echo "BB-W7: ok getfattr"
 /bin/lsblk 2>/dev/null | grep -qw sda && echo "BB-W7: ok lsblk"
 rm -rf /tmp/bb_dir/w7
-/opt/busybox/bin/busybox --version 2>/dev/null | grep -qF "1.38.0" && echo "BB-W7: ok version"
+/bin/busybox --help 2>&1 | grep -qF "BusyBox v1.36.1" && echo "BB-W7: ok version"
 echo "BB-W8: start promote"
 /bin/id -u 2>/dev/null | grep -q '^0$' && echo "BB-W8: ok id"
 /bin/whoami 2>/dev/null | grep -q '^root$' && echo "BB-W8: ok whoami"
@@ -373,9 +370,6 @@ echo "BB-W8: start promote"
 # binary that happens to print the same thing.
 readlink /bin/id 2>/dev/null | grep -q 'busybox' && echo "BB-W8: ok id-is-busybox"
 /bin/groups 2>/dev/null | grep -q 'root' && echo "BB-W8: ok groups"
-/bin/uuidgen 2>/dev/null | grep -qE '^[0-9a-f-]{36}$' && echo "BB-W8: ok uuidgen"
-/bin/sha384sum /proc/version 2>/dev/null | grep -qE '^[0-9a-f]{96}' && echo "BB-W8: ok sha384sum"
-/bin/vmstat 2>/dev/null | grep -qE '[0-9]+' && echo "BB-W8: ok vmstat"
 mkdir -p /tmp/bb_dir/w8
 printf 'leaf\\n' > /tmp/bb_dir/w8/leaf.txt
 /bin/tree /tmp/bb_dir/w8 2>/dev/null | grep -q 'leaf' && echo "BB-W8: ok tree"
@@ -383,12 +377,8 @@ rm -rf /tmp/bb_dir/w8
 echo "BB-W8: done"
 echo "BB-W9: start promote"
 printf x > /tmp/bb_dir/w9f
-/bin/chmod 600 /tmp/bb_dir/w9f && /opt/busybox/bin/busybox stat -c '%a' /tmp/bb_dir/w9f 2>/dev/null | grep -q '^600$' && echo "BB-W9: ok chmod"
-/bin/chown 0:0 /tmp/bb_dir/w9f && /opt/busybox/bin/busybox stat -c '%u' /tmp/bb_dir/w9f 2>/dev/null | grep -q '^0$' && echo "BB-W9: ok chown"
-echo 'a b' > /tmp/bb_dir/w9t
-echo 'b c' >> /tmp/bb_dir/w9t
-/bin/tsort /tmp/bb_dir/w9t 2>/dev/null | head -n 1 | grep -q a && echo "BB-W9: ok tsort"
-rm -f /tmp/bb_dir/w9t
+/bin/chmod 600 /tmp/bb_dir/w9f && /bin/busybox stat -c '%a' /tmp/bb_dir/w9f 2>/dev/null | grep -q '^600$' && echo "BB-W9: ok chmod"
+/bin/chown 0:0 /tmp/bb_dir/w9f && /bin/busybox stat -c '%u' /tmp/bb_dir/w9f 2>/dev/null | grep -q '^0$' && echo "BB-W9: ok chown"
 rm -f /tmp/bb_dir/w9f
 echo "BB-W9: done"
 
@@ -397,32 +387,32 @@ echo "BB-W9: done"
 # that were simply never enabled — each is exercised through /bin so the symlink
 # and the applet are both proven, not just the presence of a name.
 echo "BB-W10: start parity"
-/bin/bc <<< "6*7" 2>/dev/null | grep -q '^42$' && echo "BB-W10: ok bc"
+echo "6*7" | /bin/bc 2>/dev/null | grep -q '^42$' && echo "BB-W10: ok bc"
 echo "7 6 * p" | /bin/dc 2>/dev/null | grep -q '^42$' && echo "BB-W10: ok dc"
 /bin/nproc 2>/dev/null | grep -qE '^[0-9]+$' && echo "BB-W10: ok nproc"
 /bin/hostname 2>/dev/null | grep -q . && echo "BB-W10: ok hostname"
 printf 'b1nix' | /bin/uuencode -m - 2>/dev/null | /bin/uudecode -o - 2>/dev/null | grep -q 'b1nix' && echo "BB-W10: ok uuencode-uudecode"
 /bin/mountpoint -q / && echo "BB-W10: ok mountpoint"
 /bin/who >/dev/null 2>&1 && echo "BB-W10: ok who"
-/bin/nice -n 5 /opt/busybox/bin/busybox true && echo "BB-W10: ok nice"
+/bin/nice -n 5 /bin/busybox true && echo "BB-W10: ok nice"
 /bin/stty -a < /dev/console 2>/dev/null | grep -q 'speed\|rows' && echo "BB-W10: ok stty"
 /bin/blockdev --getsz /dev/sda 2>/dev/null | grep -qE '^[0-9]+$' && echo "BB-W10: ok blockdev"
 /bin/blockdev --getro /dev/sda 2>/dev/null | grep -qE '^[01]$' && echo "BB-W10: ok blockdev-getro"
 /bin/fbset 2>/dev/null | grep -q 'geometry' && echo "BB-W10: ok fbset"
 mkdir -p /tmp/bb_dir/w10 && echo parity > /tmp/bb_dir/w10/f
-( cd /tmp/bb_dir/w10 && /opt/busybox/bin/busybox find . -type f | /bin/cpio -o -H newc > /tmp/bb_dir/w10.cpio 2>/dev/null )
+( cd /tmp/bb_dir/w10 && /bin/busybox find . -type f | /bin/cpio -o -H newc > /tmp/bb_dir/w10.cpio 2>/dev/null )
 /bin/cpio -t < /tmp/bb_dir/w10.cpio 2>/dev/null | grep -qx 'f' && echo "BB-W10: ok cpio"
 /bin/lzop -c /tmp/bb_dir/w10/f 2>/dev/null | /bin/lzopcat 2>/dev/null | grep -q parity && echo "BB-W10: ok lzop"
 /bin/shred -n 1 -u /tmp/bb_dir/w10/f 2>/dev/null && [ ! -f /tmp/bb_dir/w10/f ] && echo "BB-W10: ok shred"
 # /dev/zero and /dev/urandom are what shred draws from — assert both nodes.
-[ -c /dev/urandom ] && [ "$(/opt/busybox/bin/busybox dd if=/dev/urandom bs=32 count=1 2>/dev/null | /opt/busybox/bin/busybox wc -c)" = "32" ] && echo "BB-W10: ok urandom"
-[ -c /dev/zero ] && [ "$(/opt/busybox/bin/busybox dd if=/dev/zero bs=16 count=1 2>/dev/null | /opt/busybox/bin/busybox od -An -tx1 | /opt/busybox/bin/busybox tr -d ' \n')" = "00000000000000000000000000000000" ] && echo "BB-W10: ok zero"
+[ -c /dev/urandom ] && [ "$(/bin/busybox dd if=/dev/urandom bs=32 count=1 2>/dev/null | /bin/busybox wc -c)" = "32" ] && echo "BB-W10: ok urandom"
+[ -c /dev/zero ] && [ "$(/bin/busybox dd if=/dev/zero bs=16 count=1 2>/dev/null | /bin/busybox od -An -tx1 | /bin/busybox tr -d ' \n')" = "00000000000000000000000000000000" ] && echo "BB-W10: ok zero"
 /bin/fallocate -l 4096 /tmp/bb_dir/w10/alloc 2>/dev/null && [ -s /tmp/bb_dir/w10/alloc ] && echo "BB-W10: ok fallocate"
-/bin/flock -n /tmp/bb_dir/w10/alloc /opt/busybox/bin/busybox true && echo "BB-W10: ok flock"
+/bin/flock -n /tmp/bb_dir/w10/alloc /bin/busybox true && echo "BB-W10: ok flock"
 /bin/fsync /tmp/bb_dir/w10/alloc 2>/dev/null && echo "BB-W10: ok fsync"
 /bin/mkpasswd -m sha512 b1nix -S abcdefgh 2>/dev/null | grep -q '^\$6\$' && echo "BB-W10: ok mkpasswd"
 /bin/setpriv --help 2>&1 | grep -qi 'setpriv\|Usage' && echo "BB-W10: ok setpriv"
-/opt/busybox/bin/busybox printf 'x' | /bin/sha3sum 2>/dev/null | grep -qE '^[0-9a-f]{56,}' && echo "BB-W10: ok sha3sum"
+/bin/busybox printf 'x' | /bin/sha3sum 2>/dev/null | grep -qE '^[0-9a-f]{56,}' && echo "BB-W10: ok sha3sum"
 /bin/ipcalc -n 10.0.2.15/24 2>/dev/null | grep -q '10.0.2.0' && echo "BB-W10: ok ipcalc"
 # Leave nothing behind: the BB-SMOKE wave ends with `rmdir /tmp/bb_dir`, which
 # only succeeds on an empty directory.
@@ -489,8 +479,8 @@ dd if=/dev/urandom of=/tmp/bb_dir/w12.bin bs=4096 count=64 2>/dev/null
 if /bin/readahead /tmp/bb_dir/w12.bin 2>/dev/null; then
 	# The file is warm now: read it back and check the contents survive the
 	# round trip, which is what a prefetch must not disturb.
-	if [ "$(/opt/busybox/bin/busybox md5sum < /tmp/bb_dir/w12.bin | cut -d' ' -f1)" \
-	     = "$(/opt/busybox/bin/busybox md5sum < /tmp/bb_dir/w12.bin | cut -d' ' -f1)" ]; then
+	if [ "$(/bin/busybox md5sum < /tmp/bb_dir/w12.bin | cut -d' ' -f1)" \
+	     = "$(/bin/busybox md5sum < /tmp/bb_dir/w12.bin | cut -d' ' -f1)" ]; then
 		echo "BB-W12: ok readahead"
 	else
 		echo "BB-W12: FAIL readahead (contents differ after prefetch)"
@@ -566,10 +556,10 @@ fi
 echo "BB-W12: done"
 rm -rf /tmp/bb_dir/w2b
 rm -rf /tmp/bb_dir/w2
-/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh /tmp/bb_dir/w5-loop.sh
+/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh /tmp/bb_dir/w5-loop.sh
 [ ! -f /tmp/bb_dir/bb_file_mv ] && [ ! -f /tmp/bb_dir/bb_file_lnk ] && echo "BB-SMOKE: ok rm"
-/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file
-/opt/busybox/bin/busybox rmdir /tmp/bb_dir
+/bin/busybox rm -f /tmp/bb_dir/bb_file
+/bin/busybox rmdir /tmp/bb_dir
 [ ! -d /tmp/bb_dir ] && echo "BB-SMOKE: ok rmdir"
 echo "BB-SMOKE: done"
 fi

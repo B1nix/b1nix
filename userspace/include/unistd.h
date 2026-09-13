@@ -118,8 +118,8 @@ int stat(const char *path, struct stat *st);
 
 /* Must mirror the kernel `struct b1nix_statfs` (all u64) byte-for-byte: the
  * SYS_STATFS handler copies sizeof(b1nix_statfs) bytes into this buffer. Using
- * `unsigned long` would be 32-bit on i686 and the kernel's 64-bit fields would
- * overflow the struct (observed: BusyBox `df` crashed on i686). */
+ * fixed 64-bit fields keep the layout independent of the width of `long` (a
+ * 32-bit `long` once overflowed the struct and crashed BusyBox `df`). */
 struct statfs {
   unsigned long long f_type;
   unsigned long long f_bsize;

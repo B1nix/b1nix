@@ -2,8 +2,7 @@
 # M26 native-Clang kernel self-host: build the ext4 ram0 module that lets b1nix
 # compile its OWN kernel, in-guest, with its own clang + ld.lld.
 #
-# Unlike the legacy run-build.py path (which needs a full bootable rootfs with
-# busybox/getty/login/make), this is driven SHELL-FREE by a kernel handler
+# This is driven SHELL-FREE by a kernel handler
 # (b1nix.selfhostbuild in kernel/main.c): the kernel mounts this module as
 # /mnt/build, spawns `clang -c` once per kernel TU, then links with `ld.lld @rsp`
 # and checks the produced kernel.elf — mirroring the proven tools/inguest/clang-proof.sh.

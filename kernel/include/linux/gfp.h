@@ -10,7 +10,6 @@
  * honoured because it changes the result. */
 #define __GFP_NOFAIL  0x1000u
 #define __GFP_ZERO_ALIAS __GFP_ZERO
-#define __GFP_COMP    0x2000u
 #define __GFP_NOFAIL  0x1000u
 #define __GFP_HIGHMEM 0x0800u
 #define __GFP_DMA32   0x1000u

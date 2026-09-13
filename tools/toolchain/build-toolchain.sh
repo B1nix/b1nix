@@ -53,15 +53,13 @@ fi
 # 3. Create the LLVM/Clang compiler wrappers and tool symlinks in PREFIX/bin
 echo "Creating compiler shims and tool symlinks..."
 
-# Compile wrappers: SYMLINK the host-side b1nix-autotools-cc / b1nix-c++ wrappers
+# Compile wrappers: SYMLINK the host-side b1nix-autotools-cc wrapper
 # (not cp) so edits to the wrappers always take effect without re-running this
-# script — copying left a stale x86_64-b1nix-gcc that missed wrapper fixes. The
+# script — copying left stale shims that missed wrapper fixes. The
 # wrappers locate the project root by walking up from their own path (Makefile +
 # kernel/), which resolves correctly through the symlink.
 ln -sf "$PROJECT_DIR/tools/toolchain/bin/b1nix-autotools-cc" "$PREFIX/bin/${B1NIX_TRIPLET}-cc"
-ln -sf "$PROJECT_DIR/tools/toolchain/bin/b1nix-c++" "$PREFIX/bin/${B1NIX_TRIPLET}-c++"
 ln -sf "$PROJECT_DIR/tools/toolchain/bin/b1nix-autotools-cc" "$PREFIX/bin/${B1NIX_TRIPLET}-clang"
-ln -sf "$PROJECT_DIR/tools/toolchain/bin/b1nix-c++" "$PREFIX/bin/${B1NIX_TRIPLET}-clang++"
 
 # Direct symlinks for standard LLVM toolchain utilities
 HOST_LLVM_AR="$(command -v llvm-ar 2>/dev/null || echo ar)"
@@ -110,16 +108,7 @@ for stubdir in "$SYSROOT/usr/lib" "$SYSROOT/lib" "$PREFIX/$B1NIX_TRIPLET/lib"; d
     done
 done
 
-# 5. Build the compiler-rt runtimes (builtins + libunwind)
-echo "Building compiler-rt and libunwind..."
-sh "$PROJECT_DIR/tools/toolchain/build-llvm-runtimes.sh"
-
-# 6. Build the C++ runtimes (libc++ and libc++abi)
-echo "Building libc++ and libc++abi..."
-sh "$PROJECT_DIR/tools/toolchain/build-libcxx.sh"
-
-# 7. Build the shared C++ runtimes
-echo "Building shared C++ runtime (libc++.so.1 + libc++abi.so.1)..."
-sh "$PROJECT_DIR/tools/toolchain/build-libcxx-shared.sh"
+# The C++ runtime and compiler-rt come from Alpine packages at build time
+# (tools/packages/alpine-ports.map: libcxx, compiler-rt).
 
 echo "=== Cross-toolchain setup complete ==="

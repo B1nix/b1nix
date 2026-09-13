@@ -488,6 +488,7 @@ typedef struct b1nix_user_pt_regs native_regs_t;
 static void frame_to_uregs(const struct interrupt_frame *f, struct task *t,
                            native_regs_t *u) {
   memset(u, 0, sizeof(*u));
+  (void)t;
 #if defined(__x86_64__)
   /* fs_base is the tracee's TLS pointer. A crash reporter needs it to find the
    * thread's own bookkeeping (it is where the thread pointer lives on x86_64),

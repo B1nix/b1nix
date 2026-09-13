@@ -215,6 +215,8 @@ static inline int atomic_read_acquire(const atomic_t *v)
  * are all sequentially consistent, so the ordering these ask for is already
  * there — but they are spelled out rather than left empty, because a compiler
  * barrier is still needed to stop the surrounding accesses being reordered. */
+#undef smp_mb__before_atomic
+#undef smp_mb__after_atomic
 #define smp_mb__before_atomic() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define smp_mb__after_atomic()  __atomic_thread_fence(__ATOMIC_SEQ_CST)
 

@@ -4569,7 +4569,7 @@ int scheduler_yield(void) {
        * fell to 914/1/469.
        *
        * (The report below prints every CPU's cur_task, and in one run neither
-       * held the declined task: `pid 1170 /opt/busybox/bin/busybox me=1
+       * held the declined task: `pid 1170 /bin/busybox me=1
        * new=0x1000013070 state=1 [0 cur=0x1000000090] [1 cur=0x1000b32920]`.
        * That is suggestive of a racy scan but does not prove it -- the dump is
        * taken several console writes after the decision, so the owner may
@@ -6033,7 +6033,7 @@ void scheduler_on_timer_tick(void) {
    * sound under T4: the per-CPU current_task / runqueue mutations made by
    * scheduler_yield are already SMP-safe via F-tier atomic CASes, and
    * adding a tick-side bkl_lock around scheduler_yield wedges the
-   * userspace → exit path (M25 TCC-compiled binaries hang after their last
+   * userspace → exit path (M25 natively compiled binaries hung after their last
    * printf because the timer-acquired BKL is never observed released by
    * the next syscall on the resumed task). */
   /* A task inside a non-preemptible region keeps the CPU. The tick still ran:

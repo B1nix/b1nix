@@ -2197,6 +2197,8 @@ struct resource *devm_request_mem_region(struct device *dev,
  * is the only caller, and it reports the failure and carries on without the
  * sub-device — which is the same outcome as not having a driver for it.
  */
+struct irq_chip;
+struct irq_desc;
 int irq_alloc_desc(int node) { (void)node; return -ENOSYS; }
 void irq_free_desc(unsigned int irq) { (void)irq; }
 int irq_set_chip_and_handler_name(unsigned int irq, const struct irq_chip *chip,
@@ -2223,6 +2225,8 @@ int generic_handle_irq(unsigned int irq) { (void)irq; return -ENOSYS; }
  * -ENODEV and i915 carries on without that half of the hardware — rather than
  * creating a device that sits unclaimed forever.
  */
+struct auxiliary_device;
+struct platform_device_info;
 int auxiliary_device_init(struct auxiliary_device *auxdev)
 { (void)auxdev; return -ENODEV; }
 int auxiliary_device_add(struct auxiliary_device *auxdev)

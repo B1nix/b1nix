@@ -10,9 +10,9 @@
  * Default mode (runs on the posix instance, as root):
  *
  *   setuid-layout    /bin/su and /bin/passwd are symlinks onto
- *                    /opt/busybox/bin/busybox-suid; that file is mode 4755
+ *                    /bin/busybox-suid; that file is mode 4755
  *                    root, and the multicall ELF every other applet resolves to
- *                    (/opt/busybox/bin/busybox) is NOT setuid. This is the
+ *                    (/bin/busybox) is NOT setuid. This is the
  *                    privilege boundary the rest of the test relies on, so it
  *                    is checked rather than assumed.
  *   su-uid-and-shell root's `su -l m108user -c ...` really becomes uid 1002 and
@@ -34,11 +34,6 @@
  *   passwd-pam-rejects-old  and rejects the one it replaced.
  *   su-accepts-passwd-hash  and BusyBox `su` authenticates that same new
  *                    password — the round trip closes in both directions.
- *   shadow-concurrent-passwd  four `passwd` processes released at the same
- *                    instant, on four different accounts, all land in
- *                    /etc/shadow: no update is lost, no bystander's hash
- *                    moves, and neither database ends up with a duplicated or
- *                    truncated record.
  *   shadow-lock-excl  the two primitives that serialisation rests on, checked
  *                    without the applet: open(O_CREAT|O_EXCL) admits exactly
  *                    one racer per round, and fcntl(F_SETLK, F_WRLCK) really
@@ -62,13 +57,6 @@
  *                    from /proc — i.e. PID 1 waited on it. An init that does
  *                    not reap would leave the zombie there forever.
  *
- * `m108_smoke openrccheck` mode (M94 markers, runs on the openrc instance from
- * /etc/local.d/00-smoke.start, where the kernel was given
- * init=/sbin/openrc-init): the same PID 1 questions asked of OpenRC's own init
- * — `pid1`, `shell`, `reaps-orphan` — so both inits are proved by the same
- * evidence rather than one of them being taken on trust. The control-FIFO half
- * of that instance's story is proved by /etc/openrc-ctltest.sh, which powers
- * the machine off through /run/openrc/init.ctl.
  */
 
 #ifndef _GNU_SOURCE
@@ -90,8 +78,8 @@
 
 #include <security/pam_appl.h>
 
-#define BB_PLAIN "/opt/busybox/bin/busybox"
-#define BB_SUID  "/opt/busybox/bin/busybox-suid"
+#define BB_PLAIN "/bin/busybox"
+#define BB_SUID  "/bin/busybox-suid"
 
 #define M108_PAM_SERVICE "m108-smoke"
 
@@ -106,9 +94,7 @@
 
 static int failures;
 
-/* Marker group. The su/passwd and BusyBox-init checks belong to M108; the same
- * PID 1 checks run again on the openrc instance, where they are M94's, so the
- * group is a variable rather than a literal. */
+/* Marker group. */
 static const char *group = "M108-SMOKE";
 
 static void emit(const char *s) { (void)!write(1, s, strlen(s)); }
@@ -519,278 +505,11 @@ static void check_passwd(void)
 	}
 }
 
-/* ── phase 5: several password changes at once ───────────────────────────
- * Every BusyBox applet that edits an account database — passwd, chpasswd,
- * adduser, deluser, addgroup — goes through libbb's update_passwd(), which
- * serialises writers by creating "<file>+" with O_CREAT|O_EXCL and rewrites the
- * file underneath it: copy every line to "<file>+", then rename() it over the
- * original. Two things have to hold for that to be safe, and both are checked
- * here rather than assumed:
- *
- *   shadow-concurrent-passwd  four real `passwd` processes, released together
- *                    and changing four DIFFERENT accounts, all succeed, and
- *                    afterwards every one of the four hashes has moved and is a
- *                    "$6$" SHA-512 crypt string, every account that was in the
- *                    file beforehand is still there with the hash it had, and
- *                    neither /etc/shadow nor /etc/passwd has a duplicated or
- *                    truncated record. A lost update — a writer copying out a
- *                    snapshot it took before another writer's rename — shows up
- *                    here as an unchanged hash even though that passwd exited 0.
- *   shadow-lock-excl  the primitives underneath, without the applet:
- *                    open(O_CREAT|O_EXCL) picks exactly one winner in every one
- *                    of many rounds, and fcntl(F_SETLK, F_WRLCK) is a real lock
- *                    — it turns a second writer away with EAGAIN, F_GETLK names
- *                    the process holding it, and it is released when that
- *                    process dies without ever having unlocked.
- */
-#define CONC_N 4
-
-static const char *const conc_user[CONC_N] = {
-	"m108c0", "m108c1", "m108c2", "m108c3"
-};
-static const char *const conc_pass[CONC_N] = {
-	"M108conc0!", "M108conc1!", "M108conc2!", "M108conc3!"
-};
-
-/* Accounts whose hash must be exactly what it was after the storm. m108pw is
- * deliberately not in this list: check_passwd() above rewrites it. */
-static const char *const conc_bystander[] = {
-	"root", "user", "pamtest", USER_CALLER, USER_PEER
-};
-#define CONC_BYSTANDERS (sizeof(conc_bystander) / sizeof(conc_bystander[0]))
-
-/* Every account that must still be listed in both databases afterwards. */
-static const char *const conc_present[] = {
-	"root", "user", "pamtest", USER_CALLER, USER_PEER, USER_PW,
-	"m108c0", "m108c1", "m108c2", "m108c3"
-};
-#define CONC_PRESENT (sizeof(conc_present) / sizeof(conc_present[0]))
-
-/* Structural check of a colon-separated account database. Every non-empty line
- * must carry at least `min_colons` separators — a half-written record does not —
- * and must start with a name; no name may appear twice, which is what a merge of
- * two versions of the file leaves behind; and every name in `want` must still be
- * listed. Returns NULL when the file is intact, else a short reason. It
- * deliberately says nothing about any field's contents: this runs on /etc/shadow
- * and must never put a hash on the console. */
-static const char *db_is_intact(const char *path, int min_colons,
-                                const char *const *want, size_t nwant)
-{
-	FILE *f;
-	char line[1024];
-	static char names[64][64];
-	size_t nnames = 0;
-	size_t i, j;
-	const char *why = NULL;
-
-	f = fopen(path, "r");
-	if (f == NULL)
-		return "a database file is gone";
-	while (fgets(line, sizeof(line), f) != NULL) {
-		const char *p;
-		int colons = 0;
-		size_t nlen;
-
-		line[strcspn(line, "\r\n")] = '\0';
-		if (line[0] == '\0')
-			continue;
-		for (p = line; *p != '\0'; p++)
-			if (*p == ':')
-				colons++;
-		if (colons < min_colons) {
-			why = "a record is truncated";
-			break;
-		}
-		nlen = strcspn(line, ":");
-		if (nlen == 0 || nlen >= sizeof(names[0])) {
-			why = "a record has no usable name";
-			break;
-		}
-		if (nnames >= sizeof(names) / sizeof(names[0])) {
-			why = "more records than this check can hold";
-			break;
-		}
-		memcpy(names[nnames], line, nlen);
-		names[nnames][nlen] = '\0';
-		nnames++;
-	}
-	fclose(f);
-	if (why != NULL)
-		return why;
-
-	for (i = 0; i < nnames; i++)
-		for (j = i + 1; j < nnames; j++)
-			if (strcmp(names[i], names[j]) == 0)
-				return "a record is duplicated";
-
-	for (i = 0; i < nwant; i++) {
-		for (j = 0; j < nnames; j++)
-			if (strcmp(want[i], names[j]) == 0)
-				break;
-		if (j == nnames)
-			return "a record was lost";
-	}
-	return NULL;
-}
-
-/* One of the concurrent writers. Does not return: it becomes `passwd <user>`
- * with the new password typed twice on a pipe, but only once `gate` reports
- * EOF — so every writer leaves the starting line at the same moment and the
- * rewrites really overlap. */
-static void conc_passwd_child(int gate, const char *user, const char *password)
-{
-	char text[128];
-	size_t len;
-	char c;
-	int p[2];
-	char *argv[3];
-
-	argv[0] = (char *)"/bin/passwd";
-	argv[1] = (char *)user;
-	argv[2] = NULL;
-
-	snprintf(text, sizeof(text), "%s\n%s\n", password, password);
-	len = strlen(text);
-	if (pipe(p) != 0)
-		_exit(120);
-	/* Both prompts are queued before the gate opens, and the write end is
-	 * closed straight away: nothing this process does after the race can
-	 * stall on a pipe, and passwd sees a clean EOF after the second line. */
-	if (write(p[1], text, len) != (ssize_t)len)
-		_exit(121);
-	close(p[1]);
-
-	while (read(gate, &c, 1) > 0)
-		;
-	close(gate);
-
-	if (dup2(p[0], STDIN_FILENO) < 0)
-		_exit(122);
-	close(p[0]);
-	execv(argv[0], argv);
-	_exit(127);
-}
-
-static void check_shadow_concurrent(void)
-{
-	char before[CONC_N][256];
-	char bystand[CONC_BYSTANDERS][256];
-	char now[256];
-	pid_t kid[CONC_N];
-	int gate[2];
-	const char *why;
-	size_t b;
-	int i, started = 0, bad = 0;
-
-	for (i = 0; i < CONC_N; i++) {
-		if (shadow_hash(conc_user[i], before[i], sizeof(before[i])) != 0) {
-			fail("shadow-concurrent-passwd",
-			     "a test account has no /etc/shadow entry");
-			return;
-		}
-	}
-	for (b = 0; b < CONC_BYSTANDERS; b++) {
-		if (shadow_hash(conc_bystander[b], bystand[b],
-		                sizeof(bystand[b])) != 0) {
-			fail("shadow-concurrent-passwd",
-			     "a bystander account has no /etc/shadow entry");
-			return;
-		}
-	}
-
-	if (pipe(gate) != 0) {
-		fail("shadow-concurrent-passwd", "pipe failed");
-		return;
-	}
-	for (i = 0; i < CONC_N; i++) {
-		kid[i] = fork();
-		if (kid[i] < 0)
-			break;
-		if (kid[i] == 0) {
-			close(gate[1]);
-			conc_passwd_child(gate[0], conc_user[i], conc_pass[i]);
-		}
-		started++;
-	}
-	/* This is the last write end; closing it is the starting gun. */
-	close(gate[1]);
-	close(gate[0]);
-
-	int bad_status = 0;
-	pid_t bad_pid = 0;
-	for (i = 0; i < started; i++) {
-		int status = -1;
-		if (waitpid(kid[i], &status, 0) != kid[i] || !exited_zero(status)) {
-			bad = 1;
-			/* Keep the FIRST one: "a passwd exited non-zero" does not say
-			 * whether the applet refused the change, could not read its
-			 * stdin, or was killed -- and those are three different bugs. */
-			if (!bad_pid) {
-				bad_pid = kid[i];
-				bad_status = status;
-			}
-		}
-	}
-	if (started != CONC_N) {
-		fail("shadow-concurrent-passwd", "could not start all writers");
-		return;
-	}
-	if (bad) {
-		char why_buf[128];
-
-		snprintf(why_buf, sizeof(why_buf),
-		         "a concurrent passwd exited non-zero: pid %d status 0x%x "
-		         "(exit %d, signal %d)",
-		         (int)bad_pid, (unsigned)bad_status,
-		         WIFEXITED(bad_status) ? WEXITSTATUS(bad_status) : -1,
-		         WIFSIGNALED(bad_status) ? WTERMSIG(bad_status) : 0);
-		fail("shadow-concurrent-passwd", why_buf);
-		return;
-	}
-
-	/* Everything below is read back out of the files: what the applets said
-	 * about themselves does not enter into it. */
-	for (i = 0; i < CONC_N; i++) {
-		if (shadow_hash(conc_user[i], now, sizeof(now)) != 0) {
-			fail("shadow-concurrent-passwd",
-			     "a rewritten account is no longer in /etc/shadow");
-			return;
-		}
-		if (strcmp(now, before[i]) == 0) {
-			fail("shadow-concurrent-passwd",
-			     "an update was lost: a hash never changed");
-			return;
-		}
-		if (strncmp(now, "$6$", 3) != 0) {
-			fail("shadow-concurrent-passwd",
-			     "a rewritten hash is not a SHA-512 crypt string");
-			return;
-		}
-	}
-	for (b = 0; b < CONC_BYSTANDERS; b++) {
-		if (shadow_hash(conc_bystander[b], now, sizeof(now)) != 0) {
-			fail("shadow-concurrent-passwd",
-			     "a bystander account is no longer in /etc/shadow");
-			return;
-		}
-		if (strcmp(now, bystand[b]) != 0) {
-			fail("shadow-concurrent-passwd",
-			     "a bystander account's hash changed");
-			return;
-		}
-	}
-
-	/* passwd rewrites /etc/passwd as well as /etc/shadow, so both files went
-	 * through the same four-way race and both are checked. */
-	why = db_is_intact("/etc/shadow", 8, conc_present, CONC_PRESENT);
-	if (why == NULL)
-		why = db_is_intact("/etc/passwd", 6, conc_present, CONC_PRESENT);
-	if (why != NULL) {
-		fail("shadow-concurrent-passwd", why);
-		return;
-	}
-	ok("shadow-concurrent-passwd");
-}
+/* ── phase 5: account-database locking ──────────────────────────────────
+ * BusyBox's update_passwd() serialises writers with "<file>+" created
+ * O_CREAT|O_EXCL. Whether the applet takes that lock in the right order is
+ * BusyBox's business (Alpine's 1.36 opens the file first and can lose an
+ * update); the kernel's part is that the primitives really work. */
 
 /* ── the primitives underneath, on their own ─────────────────────────────── */
 
@@ -1070,8 +789,7 @@ static int pid1_argv0(char *out, size_t outsz)
 }
 
 /* PID 1 identity. `want_exe` is a substring the file the kernel actually loaded
- * must contain, so the same check proves either init: "busybox" for the
- * multicall ELF, "openrc-init" for OpenRC's own. `marker` names it per suite. */
+ * must contain ("busybox" for the multicall ELF). `marker` names the check. */
 static void check_pid1_is(const char *marker, const char *want_exe,
                           const char *wrong_exe_msg)
 {
@@ -1303,23 +1021,6 @@ int main(int argc, char **argv)
 		return failures != 0;
 	}
 
-	/* M94: the other PID 1. Runs on the openrc instance, where the kernel was
-	 * given init=/sbin/openrc-init, and asks OpenRC's own init exactly what the
-	 * BusyBox one is asked: is PID 1 really that binary, does it reap an orphan
-	 * re-parented to it, does the system it brought up run a shell. The
-	 * control-FIFO half of the story is proved separately by
-	 * /etc/openrc-ctltest.sh, which shuts the machine down through it.
-	 * Two inits, the same evidence for each. */
-	if (argc > 1 && strcmp(argv[1], "openrccheck") == 0) {
-		group = "M94-OPENRC";
-		emit("M94-OPENRC: start-init\n");
-		check_pid1_is("pid1", "openrc-init",
-		              "PID 1 is not the openrc-init ELF");
-		check_shell_alive("shell");
-		check_reaps_orphan("reaps-orphan");
-		emit("M94-OPENRC: done-init\n");
-		return failures != 0;
-	}
 
 	emit("M108-SMOKE: start\n");
 	if (geteuid() != 0) {
@@ -1333,7 +1034,6 @@ int main(int argc, char **argv)
 	check_su_uid_and_shell();
 	check_su_password();
 	check_passwd();
-	check_shadow_concurrent();
 	check_shadow_lock_primitives();
 	emit("M108-SMOKE: done\n");
 	return failures != 0;

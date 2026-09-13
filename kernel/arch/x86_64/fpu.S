@@ -1,7 +1,7 @@
 /* kernel/arch/x86_64/fpu.S — x86_64 FPU/SSE state helpers.
  *
  * The kernel itself is built with -mno-sse and never touches the FPU, but
- * userspace (e.g. the natively-ported GCC's cc1) uses SSE/x87 heavily. The
+ * userspace (e.g. the native clang) uses SSE/x87 heavily. The
  * kernel must therefore save/restore the FPU+SSE register file (x87, MXCSR,
  * XMM0-15) across context switches and start each new program with a clean
  * FPU state. fxsave/fxrstor cannot be emitted from -mno-sse C, so the actual

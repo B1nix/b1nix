@@ -128,9 +128,9 @@ struct user_loaded_image {
 	u16 phnum;
 	/* dl_iterate_phdr support: one descriptor per loaded module (the executable
 	 * plus every DT_NEEDED shared object), recorded during eager linking. The
-	 * shared libgcc_s.so DWARF unwinder finds each module's PT_GNU_EH_FRAME
+	 * libunwind DWARF unwinder finds each module's PT_GNU_EH_FRAME
 	 * (.eh_frame_hdr -> .eh_frame) via dl_iterate_phdr; this is what lets a C++
-	 * exception thrown inside libstdc++.so.6 unwind back across the .so/exe
+	 * exception thrown inside a shared C++ library unwind back across the .so/exe
 	 * boundary (otherwise the throw frame has no FDE -> std::terminate). base is the
 	 * load bias (dlpi_addr), phdr_vaddr the in-process address of the program
 	 * header table (dlpi_phdr), phnum its entry count. */

@@ -93,7 +93,9 @@ struct lockdep_map { int unused; };
 #define mutex_release(map, ip)                    do { } while (0)
 #define lock_acquire(map, subclass, trylock, read, check, nest, ip) \
 	do { } while (0)
+#ifndef lock_release
 #define lock_release(map, ip) do { } while (0)
+#endif
 
 
 /* The raw initialiser, which upstream's mutex_init macro expands to. */

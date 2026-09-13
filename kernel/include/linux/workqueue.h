@@ -153,7 +153,6 @@ unsigned int work_busy(struct work_struct *work);
 #define WQ_POWER_EFFICIENT (1 << 7)
 #endif
 
-#define system_unbound_wq  lkpi_system_wq()
 #define system_freezable_wq lkpi_system_wq()
 
 #endif

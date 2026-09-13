@@ -1,7 +1,6 @@
 /* m39_smoke — M39 serial-tty half of the configurable-init self-test.
  *
- * The inittab/telinit/getty checks live in /bin/init (PID 1 owns that state);
- * this binary exercises /dev/ttyS0 as an independent tty: line discipline,
+ * Exercises /dev/ttyS0 as an independent tty: line discipline,
  * termios and job-control state separate from the boot console. Input is
  * injected with TIOCSTI (Linux semantics: byte enters the input queue as if
  * typed, travelling the full canonical/ISIG path).
@@ -42,12 +41,6 @@ int main(void) {
   setsid(); /* session leader, for the TIOCSCTTY check below */
 
   puts("M39-INIT: start");
-  mark(1, "parse-inittab");
-  mark(1, "initdefault");
-  mark(1, "runlevel-match");
-  mark(1, "telinit");
-  mark(1, "getty-applet");
-  puts("reboot: restarting");
 
   int sfd = open("/dev/ttyS0", O_RDWR);
   mark(sfd >= 0, "ttys0-open");

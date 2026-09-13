@@ -4,14 +4,15 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/types.h>
 
+/* Also defined by <lkpi/page.h>, with the same 64-bit width. */
+#ifndef PAGE_SIZE
 #define PAGE_SIZE 4096ULL
+#endif
 
 /* KERNEL_VMA: the offset between a kernel symbol's virtual address and its
  * physical load address. Both kernels are higher-half (linked high, loaded at
  * 1M); subtract KERNEL_VMA to turn a kernel symbol into a physical address.
- * x86_64 uses the canonical -2GB window; x86 (32-bit) links into the direct map
- * (0x80000000) — the kernel's symbols are simply the direct-map view of its own
- * physical image, so no separate high window is needed. */
+ * x86_64 uses the canonical -2GB window. */
 #ifdef __x86_64__
 #define KERNEL_VMA 0xFFFFFFFF80000000ULL
 #elif defined(__aarch64__)

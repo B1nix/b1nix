@@ -823,6 +823,11 @@ static int capture(const char *path, char *const argv[], char *out,
   while (got < cap - 1 && (r = read(fds[0], out + got, cap - 1 - got)) > 0)
     got += (size_t)r;
   out[got] = '\0';
+  /* Drain what did not fit: closing the pipe early kills a chatty child with
+   * SIGPIPE, and the check would blame the program for the buffer's size. */
+  char sink[512];
+  while (read(fds[0], sink, sizeof(sink)) > 0)
+    ;
   close(fds[0]);
   int status = 0;
   if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status))
@@ -897,8 +902,14 @@ static void t_bb_modutils(void) {
    * that shipped — otherwise running depmod on the target would quietly
    * rewrite modules.dep into something modprobe reads differently. */
   char *const dm[] = {(char *)"depmod", (char *)"-n", 0};
-  if (capture("/sbin/depmod", dm, out, sizeof(out)) != 0) {
-    fail("bb-modutils", "depmod -n failed");
+  int dm_rc = capture("/sbin/depmod", dm, out, sizeof(out));
+  if (dm_rc != 0) {
+    char why[160];
+    char *nl = strchr(out, '\n');
+    if (nl)
+      *nl = '\0';
+    snprintf(why, sizeof(why), "depmod -n exited %d: %.100s", dm_rc, out);
+    fail("bb-modutils", why);
     return;
   }
   if (strstr(out, "ndp.ko: ipv6.ko") == 0) {

@@ -137,42 +137,15 @@ if has_flag b1nix.glprobe; then
 	exit 0
 fi
 
-# Card-only mode: enumerate the display and stop. Fetching a compositor costs
-# four minutes of every run, and a question about registers, EDID or connectors
-# does not need one.
+# Card-only mode: enumerate the display and stop. A question about registers,
+# EDID or connectors does not need a compositor.
 if grep -q "b1nix.drm-probe-only" /proc/cmdline 2>/dev/null; then
 	echo "I915-SWAY: probe only, done"
 	exit 0
 fi
 
-# The package cache disk, when the runner attached one. None of these bytes
-# change between runs, and downloading them is the slowest part of a test boot.
-if [ -e /dev/vda ]; then
-	mkdir -p /var/cache/bpkg
-	if mount -t ext4 /dev/vda /var/cache/bpkg 2>/dev/null; then
-		echo "I915-SWAY: package cache mounted ($(ls /var/cache/bpkg | wc -l) files)"
-		# The index too -- 2.3 MB otherwise fetched every boot. Only the index:
-		# the installed-package metadata beside it must not survive, or bpkg would
-		# believe packages are present that this boot's ramdisk has never seen.
-		mkdir -p /var/lib/bpkg
-		ln -sf /var/cache/bpkg/index /var/lib/bpkg/index
-	else
-		echo "I915-SWAY: package cache not mounted"
-	fi
-fi
-
-# http, not https -- the same choice apk makes. Every package carries an RSA
-# signature over a control block carrying the payload's sha256, so transport
-# encryption adds nothing and costs a great deal: the cipher runs in software on
-# one core in front of a quarter-gigabyte download.
-cat > /etc/bpkg.conf <<'EOF'
-INDEX_URL=http://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz http://dl-cdn.alpinelinux.org/alpine/v3.20/community/x86_64/APKINDEX.tar.gz
-EOF
-
 # What the image is missing, if anything. The compositor and its dependencies
-# are installed into the root filesystem at build time from the same Alpine
-# packages; when nothing is missing the network is not touched at all, which is
-# the difference between a minute and half an hour.
+# are installed into the root filesystem at build time from Alpine packages.
 #
 # cage is the control: a kiosk compositor on the same wlroots, a fraction of
 # sway's code. font-dejavu because foot dies on "failed to match font", which
@@ -189,44 +162,11 @@ fi
 [ -d /usr/share/fonts/dejavu ] || NEED="$NEED font-dejavu"
 
 if [ -n "$NEED" ]; then
-	echo "I915-SWAY: missing from the image:$NEED"
-	echo "I915-SWAY: updating index"
-	if bpkg update; then
-		echo "I915-SWAY: ok update"
-	else
-		echo "I915-SWAY: fail update"
-		echo "I915-SWAY: done"
-		exit 0
-	fi
-else
-	echo "I915-SWAY: ok update (nothing to fetch) t=$(up)"
+	echo "I915-SWAY: fail missing from the image:$NEED (rebuild the image with them)"
+	echo "I915-SWAY: done"
+	exit 0
 fi
-
-for pkg in $NEED; do
-	echo "I915-SWAY: installing $pkg"
-	if bpkg install "$pkg"; then
-		echo "I915-SWAY: ok install-$pkg"
-	else
-		echo "I915-SWAY: fail install-$pkg"
-	fi
-	# Flush every eighth package, not every one: a run cut off part-way must not
-	# lose what it fetched, but each sync writes the whole dirty block cache.
-	pkg_n=$((${pkg_n:-0} + 1))
-	[ $((pkg_n % 8)) -eq 0 ] && sync
-done
-
-# Push the cache to the disk while there is still something to push it with:
-# the block cache is write-back and the run ends by killing the machine, so a
-# cache that had seen thirty packages came back holding none of them. Nothing
-# after this point installs anything.
-if mountpoint -q /var/cache/bpkg 2>/dev/null || grep -q " /var/cache/bpkg " /proc/mounts 2>/dev/null; then
-	sync
-	if umount /var/cache/bpkg 2>/dev/null; then
-		echo "I915-SWAY: package cache flushed"
-	else
-		echo "I915-SWAY: package cache still busy, synced only"
-	fi
-fi
+echo "I915-SWAY: ok packages present t=$(up)"
 
 # Fontconfig has no cache on a freshly built image, and a compositor that cannot
 # resolve a font does not draw text.

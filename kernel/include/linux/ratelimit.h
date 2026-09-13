@@ -36,7 +36,6 @@ static inline int __ratelimit(struct ratelimit_state *rs)
 #define printk_ratelimited(fmt, ...) lkpi_printk(fmt, ##__VA_ARGS__)
 #define pr_warn_ratelimited(fmt, ...) lkpi_printk("drm: " fmt, ##__VA_ARGS__)
 #define pr_err_ratelimited(fmt, ...)  lkpi_printk("drm: " fmt, ##__VA_ARGS__)
-#define DRM_ERROR_RATELIMITED(fmt, ...) lkpi_printk("drm: " fmt, ##__VA_ARGS__)
 
 
 /* The pieces imported code uses that the original set here did not carry.

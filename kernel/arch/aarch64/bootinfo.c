@@ -971,7 +971,6 @@ void bootinfo_fdt_scan(u64 dtb_address)
 	global_bootinfo.memory_regions[0].length = 256 * 1024 * 1024;
 	global_bootinfo.memory_regions[0].type = BOOT_MEMORY_AVAILABLE;
 
-	static u64 (*find_dtb_fn)(u64) = 0;
 	u64 valid_dtb = 0;
 	if (dtb_address && fdt32_to_cpu(*(const u32 *)dtb_address) == 0xd00dfeed)
 		valid_dtb = dtb_address;

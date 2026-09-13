@@ -13,7 +13,7 @@
 # M108: /bin/{su,passwd,login} are symlinks onto the BusyBox multicall ELF, so
 # the setuid bit belongs on the inode they resolve to -- the dedicated
 # busybox-suid copy -- and NOT on the symlinks (stamping a mode on a symlink
-# inode would only corrupt it). The plain /opt/busybox/bin/busybox that every
+# inode would only corrupt it). The plain /bin/busybox that every
 # other applet resolves to is deliberately left non-setuid.
 set -eu
 
@@ -23,9 +23,9 @@ DEBUGFS="${DEBUGFS:-debugfs}"
 for cmd in \
 	"sif /bin/m31_setuid uid 0" \
 	"sif /bin/m31_setuid mode 0104755" \
-	"sif /opt/busybox/bin/busybox-suid uid 0" \
-	"sif /opt/busybox/bin/busybox-suid gid 0" \
-	"sif /opt/busybox/bin/busybox-suid mode 0104755" \
+	"sif /bin/busybox-suid uid 0" \
+	"sif /bin/busybox-suid gid 0" \
+	"sif /bin/busybox-suid mode 0104755" \
 	"sif /sbin/unix_chkpwd uid 0" \
 	"sif /sbin/unix_chkpwd gid 0" \
 	"sif /sbin/unix_chkpwd mode 0104755" \

@@ -278,8 +278,7 @@ struct task {
 
   /* Signal handling. pending_signals is updated with 8-byte __atomic ops from
    * ISR/signal/scheduler paths; force 8-byte alignment so those atomics are
-   * naturally aligned on i686 (where a bare u64 field is only 4-byte aligned —
-   * the lock-prefixed op stays correct but warns and pays a cache penalty).
+   * naturally aligned regardless of the surrounding field layout.
    * Tasks are kmalloc'd in chunks, so the small sizeof bump is harmless. */
   __attribute__((aligned(8))) u64 pending_signals; /* bitmask of pending signals */
   u64 blocked_signals;             /* bitmask of blocked signals */

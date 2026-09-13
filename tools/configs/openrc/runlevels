@@ -1,0 +1,7 @@
+# <runlevel> <service> -- linked into /etc/runlevels by stage-openrc.sh.
+# The kernel mounts /proc, /sys and /dev itself, so sysinit needs only procfs.
+sysinit procfs
+boot hostname
+default local
+shutdown killprocs
+shutdown savecache

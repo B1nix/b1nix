@@ -13,8 +13,7 @@
 /* newlib-compatible character classification table. libstdc++'s generic
  * (newlib) ctype config reads classic_table() as `_ctype_ + 1`, so index 0 is
  * the EOF slot and indices 1..256 classify chars 0..255 using the _U/_L/_N/...
- * bit masks above. Defined in libc/ctype.c. Required for the native GCC port's
- * C++ runtime. */
+ * bit masks above. Defined in libc/ctype.c. */
 #ifdef __cplusplus
 extern "C" {
 #endif

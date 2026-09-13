@@ -18,6 +18,7 @@
 #include <b1nix/types.h>
 
 #define MTD_MAX_DEVICES 2
+#define MTD_CHAR_MAJOR  90
 
 /* MTD_NORFLASH, as the MEMGETINFO ioctl reports it. */
 #define MTD_TYPE_NORFLASH 3

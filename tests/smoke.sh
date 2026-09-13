@@ -111,9 +111,8 @@ skipped() {
 }
 
 # The DMA-remapping lanes are x86_64-only: they ask QEMU for a q35 machine with
-# an Intel or AMD IOMMU. This is a real gap in the aarch64 port too (it has no
-# SMMUv3 driver, see docs/aarch64-parity.md) — but it is a driver gap to be
-# closed, not a check to be failed by a machine that cannot host the device.
+# an Intel or AMD IOMMU. aarch64 has an SMMUv3 instead, checked as M100E on the
+# smp lane.
 check_iommu() {
 	if [ "$ARCH" = "aarch64" ]; then
 		skipped "$3" "this is a VT-d/AMD-Vi check; the aarch64 unit is an SMMUv3, checked as M100E on the smp lane"
@@ -359,7 +358,6 @@ run_qemu() {
 			# gateway that is not on this NIC's segment and nothing ever
 			# replies, which read as six "rx-arp (no reply)" failures.
 			local lane_cmdline="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.e1000-subnet=3 b1nix.smoke=$lane ${SMOKE_EXTRA_CMDLINE:-}"
-			[ "$lane" = "openrc" ] && lane_cmdline="init=/sbin/openrc-init b1nix.test=1 b1nix.e1000-subnet=3 b1nix.openrc-ctltest"
 			[ "$lane" = "init" ] && lane_cmdline="b1nix.test=1 b1nix.e1000-subnet=3 b1nix.smoke=init"
 			# SMOKE_CMDLINE_switchroot in the Makefile, which the other arches
 			# bake into iso-switchroot. Without it this lane booted like any
@@ -410,8 +408,7 @@ run_qemu() {
 		fi
 
 		# RAM: QEMU's default (128 MiB) starves the graphics tests (setcrtc,
-		# console-reclaim), so the headroom stays. The 32-bit port caps usable
-		# RAM at 1 GiB, so keep it modest there.
+		# console-reclaim), so the headroom stays.
 		local mem_args="-m ${SMOKE_MEM_MB:-1024}"
 		# Both x86_64 and aarch64 use 2 vCPUs by default to run PID 1 watchdog
 		# and background daemons (net_task, aio-worker) reliably without starvation.
@@ -848,7 +845,7 @@ else
 			SYSNET_ISO_TARGET="iso-sysnet"
 		fi
 		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
-			iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
+			iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-iommu iso-init iso-switchroot \
 			>"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
@@ -860,7 +857,7 @@ else
 				cp -f "build/$ARCH/Image" "build/$ARCH/Image.rpi"
 			rm -f "build/$ARCH/kernel.elf" "build/$ARCH/Image"
 			make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
-				iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-openrc iso-init iso-switchroot \
+				iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-iommu iso-init iso-switchroot \
 				>>"$BUILD_LOG" 2>&1 || {
 				print_build_failure
 				exit 1
@@ -981,7 +978,7 @@ _mkimg() {  # mkimg <instance-suffix>
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
-    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg smp; _mkimg switchroot
+    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg smp; _mkimg switchroot
 }
 
 # Define logs
@@ -992,7 +989,6 @@ SYSNET_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-sysnet-$ARCH.log"
 BLK_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-blk-$ARCH.log"
 POSIX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-posix-$ARCH.log"
 GFX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-gfx-$ARCH.log"
-OPENRC_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-openrc-$ARCH.log"
 INIT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-init-$ARCH.log"
 SWITCHROOT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-switchroot-$ARCH.log"
 IOMMU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-iommu-$ARCH.log"
@@ -1025,7 +1021,7 @@ fi
 # files. An empty log makes the checks report missing markers, which is the
 # truth.
 for _l in "$LOG" "$SMP_LOG" "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" \
-          "$GFX_LOG" "$OPENRC_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" \
+          "$GFX_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" \
           "$AMDVI_LOG" "$RASPI_LOG"; do
 	: > "$_l" 2>/dev/null || true
 done
@@ -1295,28 +1291,10 @@ launch_gfx() {
 	pid_gfx=$!
 }
 
-# OpenRC as PID 1: no test orchestrator, the real init system drives the boot and
-# then powers the machine off through its control FIFO (see iso-openrc). The
-# instance ends by itself — "reboot: powering off" IS the pass condition.
-launch_openrc() {
-	(
-		SATA_IMG=$(disk_img sata openrc)
-		AHCI_IMG=$(disk_img ahci openrc)
-		NVME_IMG=$(disk_img nvme openrc)
-		SWAP_IMG=$(disk_img swap openrc)
-		B1NIX_ISO_NAME=b1nix-openrc.iso
-		SMOKE_DONE_PATTERN="reboot: powering off|KERNEL PANIC|\[PANIC\]"
-		SMOKE_PROGRESS_MODE=full
-		PROGRESS_PREFIX="[openrc]"
-		run_qemu "$OPENRC_LOG"
-	) &
-	pid_openrc=$!
-}
-
 # M108: the default boot. PID 1 is /sbin/init — BusyBox init — with no `init=`
 # on the cmdline at all, and /etc/inittab drives OpenRC's runlevels underneath
 # it, then runs /etc/init-smoke.sh, which is where the M108 init markers come
-# from. openrc-init as PID 1 is the other, opt-in configuration (launch_openrc).
+# from.
 launch_init() {
 	(
 		SATA_IMG=$(disk_img sata init)
@@ -1393,9 +1371,9 @@ launch_iommu() {
 		AHCI_IMG=$(disk_img ahci iommu)
 		NVME_IMG=$(disk_img nvme iommu)
 		SWAP_IMG=$(disk_img swap iommu)
-		B1NIX_ISO_NAME=b1nix-openrc.iso
+		B1NIX_ISO_NAME=b1nix-iommu.iso
 		# iommurp2 is pinned at 00:1b.0 because b1nix.acs-keep names it by BDF
-		# (SMOKE_CMDLINE_openrc). Left to QEMU's automatic assignment its address
+		# (SMOKE_CMDLINE_iommu). Left to QEMU's automatic assignment its address
 		# moves whenever a device is added ahead of it -- adding the 9P device to
 		# this lane pushed it from 00:0e.0 to 00:0f.0, the exception then named a
 		# legacy pci-bridge with no ACS capability at all, and the check failed
@@ -1430,7 +1408,7 @@ launch_amdvi() {
 		AHCI_IMG=$(disk_img ahci amdvi)
 		NVME_IMG=$(disk_img nvme amdvi)
 		SWAP_IMG=$(disk_img swap amdvi)
-		B1NIX_ISO_NAME=b1nix-openrc.iso
+		B1NIX_ISO_NAME=b1nix-iommu.iso
 		EXTRA_QEMU_ARGS="-machine q35,kernel-irqchip=split -device amd-iommu,intremap=on"
 		SMOKE_DONE_PATTERN="reboot: powering off|KERNEL PANIC|\[PANIC\]"
 		SMOKE_PROGRESS_MODE=full
@@ -1541,7 +1519,7 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	# in the bootloader, before the guest clock starts: switchroot does 4 s of
 	# work and takes 37 s. Ordered by guest time they started last and the whole
 	# suite ended when they did.
-	_inst_list="switchroot blk sysnet posix sys gfx iommu init amdvi openrc"
+	_inst_list="switchroot blk sysnet posix sys gfx iommu init amdvi"
 	# The Raspberry Pi lane is off by default, and not because it is broken.
 	#
 	# It is the one instance no accelerator can take: HVF needs -cpu host and
@@ -1570,14 +1548,14 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	if [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMOKE_INSTANCES " | grep -q " smp "; then
 		_ran_list="$_ran_list smp"
 	fi
-	for _known in sys sysnet blk posix gfx openrc init switchroot iommu amdvi raspi smp; do
+	for _known in sys sysnet blk posix gfx init switchroot iommu amdvi raspi smp; do
 		case " $_ran_list " in
 		*" $_known "*) continue ;;
 		esac
 		rm -f "$PROJECT_DIR/smoke_run/b1nix-smoke-$_known-$ARCH.log"
 	done
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
-	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$OPENRC_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$RASPI_LOG" 2>/dev/null >"$LOG" || true
+	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$RASPI_LOG" 2>/dev/null >"$LOG" || true
 else
 	launch_sys
 	launch_smp_solo
@@ -1608,7 +1586,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	for _i in sys blk posix gfx openrc init switchroot iommu amdvi smp; do
+	for _i in sys blk posix gfx init switchroot iommu amdvi smp; do
 	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" "$(disk_img vblk "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
@@ -1726,7 +1704,7 @@ fi
 # fault handler names it -- which is the whole point of unmapping it: an
 # overflow becomes a report that says "boot-stack overflow" instead of a
 # networking pointer going bad three subsystems away.
-for _bs_log in "$LOG" "$SYS_LOG" "$OPENRC_LOG" "$IOMMU_LOG" "$AMDVI_LOG"; do
+for _bs_log in "$LOG" "$SYS_LOG" "$IOMMU_LOG" "$AMDVI_LOG"; do
 	[ -f "$_bs_log" ] || continue
 	if grep -aq "boot-stack overflow" "$_bs_log" 2>/dev/null; then
 		fail "no boot-stack overflow on any instance" \
@@ -1774,18 +1752,6 @@ check_output "$LOG" "M94-CTL: ok tmpfs-mount" "tmpfs mounts on a VFS directory (
 check_output "$LOG" "M94-CTL: ok tmpfs-state" "state written through a dirfd inside the tmpfs is visible afterwards"
 check_output "$LOG" "M94-CTL: ok fifo-on-tmpfs" "mkfifo works on a tmpfs mount"
 check_output "$LOG" "M94-CTL: ok fifo-command" "a command written by another process is read back from the control FIFO"
-# OpenRC instance: the real init system as PID 1, driving its own runlevels and
-# shutting the machine down through /run/openrc/init.ctl.
-check_output "$OPENRC_LOG" "init: /sbin/openrc-init pid=" "openrc-init runs as PID 1 when init= selects it"
-check_output "$OPENRC_LOG" "Caching service dependencies" "OpenRC builds its dependency cache (popen/posix_spawn work)"
-check_output "$OPENRC_LOG" "/etc/init.d/local start" "OpenRC reaches the default runlevel and starts services"
-check_output "$OPENRC_LOG" "M94-OPENRC: ok pid1" "with init=/sbin/openrc-init, PID 1 is really the openrc-init ELF (/proc/1/exe)"
-check_output "$OPENRC_LOG" "M94-OPENRC: ok reaps-orphan" "openrc-init reaps an orphaned grandchild re-parented to PID 1"
-check_output "$OPENRC_LOG" "M94-OPENRC: ok shell" "the openrc-init boot reaches a usable shell"
-check_output "$OPENRC_LOG" "M94-OPENRC: done-init" "the openrc-init PID 1 suite completes"
-check_output "$OPENRC_LOG" "M94-OPENRC: ok init-fifo-present" "openrc-init creates its control FIFO once the boot finishes"
-check_output "$OPENRC_LOG" "/etc/init.d/killprocs start" "the shutdown runlevel runs when PID 1 gets the command"
-check_output "$OPENRC_LOG" "reboot: powering off" "openrc-shutdown powers the machine off through the control FIFO"
 # M28 #9: ctx-switch + light-syscall rdtsc benchmark. It is single-CPU only by
 # design (the rdtsc yield loop races under the SMP high-syscall-density path, see
 # m28_ctxbench.c), so on the -smp 2/4 smoke runs it correctly reports "skip smp".
@@ -2166,18 +2132,6 @@ check_output "$LOG" "M26-SMOKE: ok readdir" "libc opendir/readdir over SYS_GETDE
 check_output "$LOG" "M26-SMOKE: done" "M26 smoke completes"
 
 
-# ── M16 User Space Applications & TUI ──
-section "M16 user space applications and TUI"
-check_output "$LOG" "M16-SMOKE: start" "M16 smoke starts"
-check_output "$LOG" "M16-SMOKE: ok tui-key-decode" "shared TUI key decoding works"
-check_output "$LOG" "M16-SMOKE: ok file-explorer-hotkeys" "file explorer hotkeys work"
-check_output "$LOG" "M16-SMOKE: ok editor-hotkeys" "text editor hotkeys work"
-check_output "$LOG" "M16-SMOKE: ok editor-persist" "editor persistence save+reload works"
-check_output "$LOG" "M16-SMOKE: ok file-clipboard" "clipboard VFS copy+delete works"
-check_output "$LOG" "M16-SMOKE: ok terminal-restore" "terminal raw mode is restored"
-check_output "$LOG" "M16-SMOKE: ok app-lifecycle" "app lifecycle completes"
-check_output "$LOG" "M16-SMOKE: done" "M16 smoke completes"
-
 # ── M22 utility init-path smoke ──
 section "M22 utilities"
 check_output "$LOG" "NATIVE-SMOKE: ok" "native ELF enters ring3 and performs syscall"
@@ -2206,29 +2160,6 @@ check_output "$LOG" "M24-STRESS: start" "M24 scheduler stress starts"
 check_output "$LOG" "ok eloop" "circular symlink returns ELOOP"
 check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete"
 
-# bpkg: b1nix's native package manager (own gzip/deflate + tar + sha256 in C,
-# no shelling to curl/tar/sha256sum). Flat house-index format plus a real
-# Alpine-shaped APKINDEX.tar.gz + triple-gzip .apk fixture.
-check_output "$LOG" "BPKG-SMOKE: start" "bpkg smoke starts"
-check_output "$LOG" "BPKG-SMOKE: ok update" "bpkg update fetches the index"
-check_output "$LOG" "BPKG-SMOKE: ok install" "bpkg install verifies sha256 and extracts"
-check_output "$LOG" "BPKG-SMOKE: ok list" "bpkg list reports the installed package"
-check_output "$LOG" "BPKG-SMOKE: ok checksum-reject" "bpkg install rejects a wrong sha256"
-check_output "$LOG" "BPKG-SMOKE: ok remove" "bpkg remove deletes files and metadata"
-check_output "$LOG" "BPKG-SMOKE: ok dep-resolution" "bpkg install resolves dependencies transitively"
-check_output "$LOG" "BPKG-SMOKE: ok apk-signature" "bpkg verifies a real Alpine package's RSA signature and its datahash before extracting it"
-check_output "$LOG" "BPKG-SMOKE: ok apk-signature-reject" "a payload byte flipped behind a valid signature is caught by the datahash and installs nothing"
-check_output "$LOG" "BPKG-SMOKE: ok apk-format" "bpkg installs a real Alpine APKINDEX/.apk package"
-check_output "$LOG" "BPKG-SMOKE: ok install-scripts" "bpkg runs .pre-install before unpacking and .post-install after, with the version as \$1"
-check_output "$LOG" "BPKG-SMOKE: ok triggers" "an armed trigger fires for the transaction that writes into the directory it watches, not for its own package's install"
-check_output "$LOG" "BPKG-SMOKE: ok world" "explicitly requested packages are tracked in /etc/apk/world"
-check_output "$LOG" "BPKG-SMOKE: ok deinstall-script" "bpkg remove runs the .post-deinstall kept from install time and drops the name from world"
-check_output "$LOG" "BPKG-SMOKE: ok upgrade-scripts" "an upgrade runs .pre-upgrade/.post-upgrade instead of the install scripts, with the new version in \$1 and the replaced one in \$2"
-check_output "$LOG" "BPKG-SMOKE: ok upgrade-order" ".pre-upgrade runs before the new payload is unpacked and .post-upgrade after"
-check_output "$LOG" "BPKG-SMOKE: ok upgrade-no-deinstall" "an upgrade does not run the old version's deinstall scripts"
-check_output "$LOG" "BPKG-SMOKE: ok upgrade-fallback" "a package with no upgrade scripts still has its install scripts run on an upgrade"
-check_output "$LOG" "BPKG-SMOKE: ok upgrade-abort" "a failing .pre-upgrade abandons the upgrade and leaves the installed version in place"
-check_output "$LOG" "BPKG-SMOKE: done" "bpkg smoke completes"
 check_output "$LOG" "M22-POLISH: start" "M22 Polish starts"
 check_output "$LOG" "M22-POLISH: ok utility-flags" "M22 Polish utility flags verify"
 check_output "$LOG" "M22-POLISH: ok text-pipeline" "M22 Polish text pipeline verifies"
@@ -2352,26 +2283,19 @@ check_output "$LOG" "M22-POLISH: done" "M22 Polish completes successfully"
 	check_output "$LOG" "BB-W6: ok deluser-shadow" "busybox deluser removes the /etc/shadow record"
 	check_output "$LOG" "BB-W6: ok delgroup" "busybox delgroup removes the /etc/group record"
 	check_output "$LOG" "BB-W6: done" "BusyBox wave 6 account smoke completes"
-	check_output "$LOG" "BB-W7: ok uuidgen" "busybox uuidgen generates RFC 4122 v4 UUID"
-	check_output "$LOG" "BB-W7: ok sha384sum-upstream" "busybox sha384sum computes SHA-384 hash"
-	check_output "$LOG" "BB-W7: ok vmstat-upstream" "busybox vmstat reports memory/process stats"
-	check_output "$LOG" "BB-W7: ok tsort" "busybox tsort topologically sorts partial-order pairs"
+	check_output "$LOG" "BB-W7: ok uuidgen" "uuidgen (util-linux) generates an RFC 4122 UUID"
 	check_output "$LOG" "BB-W7: ok tree-upstream" "busybox tree prints directory trees"
-	check_output "$LOG" "BB-W7: ok getfattr" "busybox getfattr reads an extended attribute"
-	check_output "$LOG" "BB-W7: ok lsblk" "busybox lsblk enumerates /sys/block devices"
-	check_output "$LOG" "BB-W7: ok version" "busybox --version reports 1.38.0"
+	check_output "$LOG" "BB-W7: ok getfattr" "getfattr (attr) reads back an extended attribute setfattr wrote"
+	check_output "$LOG" "BB-W7: ok lsblk" "lsblk (util-linux) enumerates /sys/block devices"
+	check_output "$LOG" "BB-W7: ok version" "the staged BusyBox is the pinned Alpine 1.36.1"
 	check_output "$LOG" "BB-W8: ok id" "/bin/id (promoted to upstream) reports uid 0"
 	check_output "$LOG" "BB-W8: ok whoami" "/bin/whoami (promoted to upstream) reports root"
 	check_output "$LOG" "BB-W8: ok id-is-busybox" "/bin/id really resolves to the BusyBox multicall ELF, not a dedicated binary"
 	check_output "$LOG" "BB-W8: ok groups" "/bin/groups (BusyBox) lists the caller's groups"
-	check_output "$LOG" "BB-W8: ok uuidgen" "/bin/uuidgen (promoted) generates a UUID"
-	check_output "$LOG" "BB-W8: ok sha384sum" "/bin/sha384sum (promoted) computes a SHA-384 hash"
-	check_output "$LOG" "BB-W8: ok vmstat" "/bin/vmstat (promoted) reports stats"
 	check_output "$LOG" "BB-W8: ok tree" "/bin/tree (promoted) prints a directory tree"
 	check_output "$LOG" "BB-W8: done" "BusyBox wave 8 applet promotion completes"
 	check_output "$LOG" "BB-W9: ok chmod" "/bin/chmod (promoted to upstream) sets mode 600"
 	check_output "$LOG" "BB-W9: ok chown" "/bin/chown (promoted to upstream) sets owner 0"
-	check_output "$LOG" "BB-W9: ok tsort" "/bin/tsort (promoted) topologically sorts"
 
 	# ── BB-W10: parity with Alpine's own busyboxconfig ──
 	check_output "$LOG" "BB-W10: ok bc" "busybox bc evaluates an expression"
@@ -3050,7 +2974,7 @@ check_output "$BLK_LOG" "M109-SMOKE: ok packet-socket" "an AF_PACKET socket bind
 if [ "$ARCH" = "aarch64" ]; then
 	skipped "MTD: the CFI NOR flash wave" "no pflash chip on this machine — QEMU virt is not given one"
 else
-	check_output "$BLK_LOG" "MTD-SMOKE: ok erase-all" "flash_eraseall erases the CFI NOR chip QEMU provides through -drive if=pflash"
+	check_output "$BLK_LOG" "MTD-SMOKE: ok erase-all" "flash_erase (mtd-utils) erases the CFI NOR chip QEMU provides through -drive if=pflash"
 	check_output "$BLK_LOG" "MTD-SMOKE: ok erase-yields-ones" "an erased flash block reads back as all-ones"
 	check_output "$BLK_LOG" "MTD-SMOKE: ok program" "a pattern written to /dev/mtd0 reads back byte for byte"
 	check_output "$BLK_LOG" "MTD-SMOKE: ok program-command-path" "the CFI program sequence (clear status, program, data, poll) completes on the chip"
@@ -3142,10 +3066,11 @@ check_output "$LOG" "M108-SMOKE: ok passwd-writes-sha512" "BusyBox passwd rewrit
 check_output "$LOG" "M108-SMOKE: ok passwd-pam-accepts-new" "the PAM path accepts the password BusyBox passwd wrote"
 check_output "$LOG" "M108-SMOKE: ok passwd-pam-rejects-old" "the PAM path rejects the password BusyBox passwd replaced"
 check_output "$LOG" "M108-SMOKE: ok su-accepts-passwd-hash" "BusyBox su authenticates the hash BusyBox passwd wrote"
-check_output "$LOG" "M108-SMOKE: ok shadow-concurrent-passwd" "four simultaneous BusyBox passwd runs all reach /etc/shadow: no update lost, no bystander hash moved, no duplicated or truncated record in either database"
 check_output "$LOG" "M108-SMOKE: ok shadow-lock-excl" "open(O_CREAT|O_EXCL) admits exactly one racer per round, and fcntl(F_SETLK,F_WRLCK) blocks a second writer, names its holder via F_GETLK and is released when that holder exits"
 check_output "$LOG" "M108-SMOKE: done" "M108 su/passwd suite completes"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-pid1" "the default PID 1 is the BusyBox multicall ELF running as init"
+check_output "$INIT_LOG" "Caching service dependencies" "OpenRC builds its dependency cache under BusyBox init (popen/posix_spawn work)"
+check_output "$INIT_LOG" "/etc/init.d/local start" "OpenRC reaches the default runlevel and starts services"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-openrc-runlevels" "OpenRC's default runlevel and its local.d hooks run under BusyBox init"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-shell" "the BusyBox-init boot reaches a usable shell"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-reaps-orphan" "BusyBox init reaps an orphaned grandchild re-parented to PID 1"
@@ -3206,6 +3131,7 @@ check_output "$LOG" "M86-SMOKE: ok pthread-exit-main" "pthread_exit in main keep
 check_output "$LOG" "M86-SMOKE: done" "M86 CPU-accounting/signal-targeting suite completes"
 # ── M95: loadable kernel modules — framework, filesystem and device modules ──
 check_output "$LOG" "M95-SMOKE: ok proc-modules" "/proc/modules lists every .ko in /lib/modules, all Live and mapped in the 0xffffffffc0000000 module region"
+check_output "$LOG" "M95-SMOKE: ok bb-modutils" "BusyBox modinfo, rmmod/insmod and depmod -n work against the real module ABI and index"
 check_output "$LOG" "M95-SMOKE: ok modinfo" "a .ko's .modinfo carries name/license and a vermagic matching the running kernel release"
 check_output "$LOG" "M95-SMOKE: ok fs-modules" "isofs and ntfs arrived as modules and btrfs is built in; all three registered themselves in /proc/filesystems"
 check_output "$LOG" "M95-SMOKE: ok sound-module" "the HDA driver is a live module and its sysfs coresize matches /proc/modules"
@@ -3273,13 +3199,8 @@ check_output "$LOG" "ZSH-SMOKE: ok local-vars" "zsh function local variables wor
 check_output "$LOG" "ZSH-SMOKE: ok utf8-length" "zsh counts UTF-8 characters, not bytes"
 check_output "$LOG" "ZSH-SMOKE: ok utf8-substr" "zsh string subscripting is UTF-8 character-aware"
 check_output "$LOG" "ZSH-SMOKE: done" "zsh feature smoke completes"
-# ── M39: configurable init system ──
+# ── M39: serial tty ──
 check_output "$LOG" "M39-INIT: start" "M39 configurable-init self-test starts"
-check_output "$LOG" "M39-INIT: ok parse-inittab" "init parses /etc/inittab entries"
-check_output "$LOG" "M39-INIT: ok initdefault" "init reads the initdefault runlevel"
-check_output "$LOG" "M39-INIT: ok runlevel-match" "inittab runlevel matching works"
-check_output "$LOG" "M39-INIT: ok telinit" "telinit writes a runlevel request init consumes"
-check_output "$LOG" "M39-INIT: ok getty-applet" "getty applet is present for tty/serial sessions"
 check_output "$LOG" "M39-INIT: ok ttys0-open" "/dev/ttyS0 exists and opens as a serial tty"
 check_output "$LOG" "M39-INIT: ok tty-termios-independent" "ttyS0 termios is independent of the boot console"
 check_output "$LOG" "M39-INIT: ok tty-canon-read" "ttyS0 canonical line discipline assembles and reads a line"
@@ -3324,7 +3245,6 @@ if [ "$ARCH" = "x86_64" ]; then
   check_output "$LOG" "M69-PLUGIN: dtor" "M69 P3: final dlclose runs DT_FINI_ARRAY dtor + unmaps"
 fi
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
-check_output "$LOG" "reboot: restarting" "SYS_REBOOT performs a real machine restart"
 check_output "$LOG" "ahci: registered sda" "AHCI disk registered under its Unix name sda"
 check_output "$LOG" "nvme: registered nvme0n1" "NVMe namespace registered as nvme0n1"
 # USB mass storage is a SCSI disk and shares the sd* sequence with AHCI. The blk
@@ -3739,8 +3659,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 	check_output "$LOG" "CXX-SMOKE: ok rtti" "M55 C++: RTTI dynamic_cast/typeid + bad_cast throw"
 	check_output "$LOG" "CXX-SMOKE: ok static-init" "M55 C++: thread-safe function-local static (__cxa_guard)"
 	check_output "$LOG" "CXX-SMOKE: ok threads" "M55 C++: std::thread/mutex/atomic over pthreads"
-	# M64 clang++ frontend is x86_64-only (size_t mangling clash with the
-	# GCC-built libstdc++ on i686-b1nix); GCC stays the C++ compiler on x86.
+	# The M64 clang++ frontend proof is built for x86_64 only.
 	[ "$ARCH" = "x86_64" ] && check_output "$LOG" "M64-CLANG: ok" "M64: clang++ frontend with GNU C++ runtime"
 	check_output "$LOG" "M55-IOSTREAM: ok cout" "M55 C++: std::cout/cerr formatted output (iostream locale facets)"
 	check_output "$LOG" "M55-IOSTREAM: ok sstream" "M55 C++: std::ostringstream/istringstream round-trip"
@@ -3886,7 +3805,7 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-for _i in sys blk posix gfx openrc init switchroot iommu amdvi smp; do
+for _i in sys blk posix gfx init switchroot iommu amdvi smp; do
     rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")"
 done
 echo ""

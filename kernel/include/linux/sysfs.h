@@ -28,8 +28,12 @@ struct class_attribute_string {
 };
 #define CLASS_ATTR_STRING(_name, _mode, _str) \
 	struct class_attribute_string class_attr_##_name = { { #_name, _mode }, _str }
+#ifndef S_IRUGO
 #define S_IRUGO 0444
-#define S_IWUSR 0200
+#endif
+#ifndef S_IWUSR
+#define S_IWUSR 00200
+#endif
 struct attribute;
 /*
  * `is_visible` returns a MODE, not a boolean: zero hides the attribute and any

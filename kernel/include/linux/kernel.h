@@ -237,7 +237,7 @@
 })
 
 /* 64x32/32 without overflowing the product and without a 128-bit divide — the
- * compiler lowers one of those to __udivti3, which is in libgcc and the kernel
+ * compiler lowers one of those to __udivti3, which is in compiler-rt and the kernel
  * does not link. Split the numerator against the divisor first, so both halves
  * stay inside 64 bits. */
 static inline u64 mul_u64_u32_div(u64 a, u32 mul, u32 divisor)

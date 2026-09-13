@@ -1042,7 +1042,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * program was staged with a kzalloc of its whole text and a page-by-page copy
    * into private frames, on every exec, shared with nobody.
    *
-   * Measured on the aarch64 sys lane: 403 spawns of /opt/busybox/bin/busybox
+   * Measured on the aarch64 sys lane: 403 spawns of /bin/busybox
    * cost 72 seconds, about 0.18 s each, for a binary that is the same file
    * every time and should come from the page cache after the first. That is a
    * fifth of a lane whose whole budget is 360 s. */
@@ -1795,9 +1795,8 @@ static int user_run_elf_image(struct user_loaded_image *image) {
 #if defined(__x86_64__)
   /* Main-thread TLS (x86 variant II). Layout: [ tdata | tbss ][ TCB ], with the
    * thread pointer (TP) at the TCB and TCB[0] = TP (the self pointer that
-   * `mov %fs:0` (x86_64) / `mov %gs:0` (i686) reads). Thread-local variables
-   * live at negative offsets from TP. arch_set_fs_base() abstracts the register
-   * (FS MSR on x86_64, a GS GDT entry on i686). Only binaries with a PT_TLS
+   * `mov %fs:0` reads). Thread-local variables
+   * live at negative offsets from TP. arch_set_fs_base() sets the FS MSR. Only binaries with a PT_TLS
    * segment need this; others keep the base 0 (set at exec). */
   if (image->tls_memsz > 0) {
     u64 align = image->tls_align < 8 ? 8 : image->tls_align;
@@ -2270,8 +2269,8 @@ int user_spawn_env(const char *path, int argc, const char **argv,
   /* Thread name = the executable's basename, truncated to 15 chars (Linux
    * TASK_COMM_LEN-1). This is the process "comm" that /proc/<pid>/stat and
    * /proc/<pid>/comm expose and that BusyBox procps (ps/pidof/pgrep/pkill)
-   * match on. Truncating the full PATH instead (e.g. "/opt/busybox/bin/busybox"
-   * -> "/opt/busybox/bi") yields a useless comm "bi" and breaks process lookup
+   * match on. Truncating the full PATH instead (e.g. "/usr/libexec/kf6/kioworker"
+   * -> "/usr/libexec/kf") yields a useless comm and breaks process lookup
    * by name; take the basename first. */
   char safe_name[16];
   const char *base = strrchr(path, '/');
@@ -2310,7 +2309,7 @@ int user_spawn_env(const char *path, int argc, const char **argv,
  * /proc/<pid>/exe must name that file, not the name used to reach it: on Linux
  * the symlink resolves to the executable's inode, so a PID 1 started as
  * /sbin/init (a symlink onto the BusyBox multicall ELF) reads back as
- * /opt/busybox/bin/busybox. Follow the final symlink chain — bounded, since a
+ * /bin/busybox. Follow the final symlink chain — bounded, since a
  * loop would otherwise spin here — and hand back the destination. Anything that
  * is not a symlink (or a link we cannot resolve) is copied through unchanged.
  */

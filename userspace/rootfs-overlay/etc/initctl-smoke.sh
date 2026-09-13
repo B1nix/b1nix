@@ -12,10 +12,9 @@ if mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/rundir 2>/dev/null; then
 else
 	echo "M94-CTL: fail tmpfs-mount"
 fi
-# checkpath is OpenRC's own static binary; it creates $RC_SVCDIR the way
-# init.sh does, which is the case that caught the mount-seam path bug (a
+# checkpath is OpenRC's own helper; it creates $RC_SVCDIR the way init.sh does, which is the case that caught the mount-seam path bug (a
 # directory created through a dirfd inside a mount landed at the root).
-/sbin/checkpath -d /mnt/rundir/openrc >/dev/null 2>&1
+/lib/rc/bin/checkpath -d /mnt/rundir/openrc >/dev/null 2>&1
 if : > /mnt/rundir/openrc/softlevel 2>/dev/null && [ -f /mnt/rundir/openrc/softlevel ]; then
 	echo "M94-CTL: ok tmpfs-state"
 else

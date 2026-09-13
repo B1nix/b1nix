@@ -1532,6 +1532,7 @@ int paging_test_and_clear_dirty(u64 space, u64 vaddr) {
 void tlb_shootdown_all(void) { tlb_flush_all(); }
 
 void tlb_shootdown_page(u64 vaddr) { tlb_flush_page(vaddr); }
+void tlb_shootdown_current_mm(void) { tlb_flush_all(); }
 
 u64 vmm_virt_to_phys(void *virt) {
   u64 va = (u64)(usize)virt;

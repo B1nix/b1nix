@@ -95,7 +95,6 @@ static int tearwatch_pipe(void)
 	return -1;
 }
 
-static u64 tearwatch_hash_fb(struct drm_framebuffer *fb);
 static int i915_framedump_thread(void *arg);
 static void *fd_map_ggtt(struct i915_ggtt *ggtt, u32 ggtt_addr);
 
@@ -1056,49 +1055,6 @@ u32 lkpi_i915_scanline(void)
  * hardware was told, and PLANE_SURFLIVE what it is reading. Three numbers
  * that should agree, printed together, so a disagreement names itself.
  */
-/*
- * Is the compositor painting the buffer the display is reading?
- *
- * Everything measured so far says the flip path is right: two buffers of
- * their own memory, the hardware reprogrammed on every flip, the latch
- * landing at the frame boundary, the completion arriving in the blanking.
- * A picture that tears anyway leaves one possibility this side can test --
- * that the buffer on screen is being written while it is on screen. This
- * reads a few of its pages twice inside one frame; content that changes
- * between the two reads changed under the display.
- */
-static u64 tearwatch_hash_fb(struct drm_framebuffer *fb)
-{
-	struct drm_i915_gem_object *bo;
-	u64 h = 1469598103934665603ull;
-	unsigned i;
-
-	if (!fb || !fb->obj[0])
-		return 0;
-	bo = to_intel_bo(fb->obj[0]);
-	if (!bo || i915_gem_object_pin_pages_unlocked(bo))
-		return 0;
-	/* Sixteen pages spread through the buffer, four words from each: enough
-	 * to notice a repaint, cheap enough to do four times a frame. */
-	for (i = 0; i < 16; i++) {
-		pgoff_t idx = (pgoff_t)((bo->base.size >> PAGE_SHIFT) / 16u) * i;
-		dma_addr_t pa = i915_gem_object_get_dma_address(bo, idx);
-		const u32 *p;
-
-		if (!pa)
-			continue;
-		p = (const u32 *)(uintptr_t)lkpi_phys_to_virt((u64)pa);
-		if (!p)
-			continue;
-		h = (h ^ p[0]) * 1099511628211ull;
-		h = (h ^ p[256]) * 1099511628211ull;
-		h = (h ^ p[512]) * 1099511628211ull;
-		h = (h ^ p[1000]) * 1099511628211ull;
-	}
-	i915_gem_object_unpin_pages(bo);
-	return h;
-}
-
 void lkpi_i915_note_commit(void)
 {
 	static unsigned n;
@@ -1333,7 +1289,7 @@ static int i915_crcwatch_thread(void *arg)
 	struct drm_i915_private *dev_priv = i915;
 	u32 seen[64], count[64];
 	unsigned n_seen = 0;
-	u64 frames = 0, mixed = 0, reports = 0;
+	u64 frames = 0, reports = 0;
 	u32 prev_dsl = 0;
 	unsigned waited = 0;
 	u32 prev_crc = 0;
@@ -1528,10 +1484,6 @@ static int i915_crcwatch_thread(void *arg)
 			} else {
 				overflow++;
 			}
-			/* Anything past the first two distinct values on a two-colour
-			 * flip test is a frame that was not either buffer. */
-			if (n_seen > 2)
-				mixed++;
 		} else {
 			count[i]++;
 		}
@@ -1604,7 +1556,6 @@ static int i915_crcwatch_thread(void *arg)
 				        (imr & GEN8_PIPE_FIFO_UNDERRUN) ? "masked, none seen"
 				                                        : "none");
 			}
-			mixed += others;
 			/* The table only holds 64 values, so a window that fills it
 			 * hides every later value behind one counter. Both numbers
 			 * are printed because "62 were neither" means nothing on its
@@ -1850,7 +1801,7 @@ void lkpi_i915_dump_plane_surface(struct drm_device *dev)
 	}
 
 	pr_info("i915-probe: PLANE_CTL %08x SURF %08x STRIDE %08x GGTT[%u]=%llx present=%d\n",
-	        ctl, surf, stride, surf >> 12, pte, (int)(pte & 1));
+	        ctl, surf, stride, surf >> 12, (unsigned long long)pte, (int)(pte & 1));
 	/*
 	 * How much of the frame is actually mapped.
 	 *

@@ -3827,7 +3827,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
       }
     } else {
       /* Plain ENOENT (or any other open error without O_CREAT) is a *normal*
-       * userspace event — gcc/cc1, init scripts, and shells probe many paths
+       * userspace event — compilers, init scripts, and shells probe many paths
        * that may not exist. Linux doesn't log it; neither should we. The
        * errno reaches userspace via the syscall return, that's enough. */
       res = (int)PTR_ERR(node);
