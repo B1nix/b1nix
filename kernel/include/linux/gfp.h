@@ -47,16 +47,12 @@ static inline unsigned int get_order(unsigned long size)
 #define __GFP_KSWAPD_RECLAIM 0
 
 
-#ifndef __GFP_ATOMIC
-#define __GFP_ATOMIC 0x80u
-#endif
-
-
-/* Whether an allocation with these flags may sleep. Everything here can except
- * GFP_ATOMIC, and callers use the answer to decide whether to take a lock
- * first — so getting it wrong is a deadlock, not a slowdown. */
+/* Whether an allocation with these flags may sleep: all but GFP_ATOMIC and
+ * GFP_NOWAIT. Callers use the answer to decide whether to cond_resched() or
+ * take a sleeping lock while a spinlock is held -- getting it wrong is a
+ * deadlock, not a slowdown. */
 static inline bool gfpflags_allow_blocking(gfp_t flags)
-{ return (flags & __GFP_ATOMIC) == 0; }
+{ return (flags & (GFP_ATOMIC | GFP_NOWAIT)) == 0; }
 
 
 /* Do not dip into emergency reserves for this allocation. b1nix's allocator
@@ -95,9 +91,6 @@ static inline bool gfpflags_allow_blocking(gfp_t flags)
 #endif
 #ifndef GFP_NOIO
 #define GFP_NOIO   (GFP_KERNEL & ~(__GFP_FS | __GFP_IO))
-#endif
-#ifndef GFP_NOWAIT
-#define GFP_NOWAIT (__GFP_NOWARN)
 #endif
 #ifndef GFP_HIGHUSER
 #define GFP_HIGHUSER (GFP_KERNEL | __GFP_HIGHMEM)

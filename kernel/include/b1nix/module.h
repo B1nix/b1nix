@@ -129,7 +129,7 @@ struct kernel_symbol {
 /* Comma-separated module names this one needs loaded first, exactly the tag
  * depmod(8) reads to build modules.dep. It is declared rather than inferred so
  * the applet can regenerate the index from the .ko files alone — but it is not
- * trusted: tools/kernel/gen_modules_initramfs.sh recomputes the real
+ * trusted: tools/build/kernel/gen_modules_initramfs.sh recomputes the real
  * dependencies from the symbol graph and fails the build when the two
  * disagree, so a stale tag cannot ship. */
 #define MODULE_DEPENDS(v) MODULE_INFO(depends, v)

@@ -28,8 +28,8 @@ LINK ?= musl
 HOST_CC  ?= cc
 # The on-device b1cc bundle is compiled against musl (the old in-house
 # libc + its static b1nix-cc/crt0.o path were removed in the M92 migration).
-MUSL_CC := ../tools/b1nix-musl-cc
-B1CC_BINS_CC := $(realpath ../tools/b1nix-musl-cc)
+MUSL_CC := ../tools/toolchain/bin/b1nix-musl-cc
+B1CC_BINS_CC := $(realpath ../tools/toolchain/bin/b1nix-musl-cc)
 # b1cc otherwise locates the target headers through cwd-relative guesses, which
 # only resolve when it is invoked from the repository root. Hand it the sysroot
 # explicitly so every invocation works from any directory.
@@ -101,7 +101,7 @@ ROOTFS   := ../build/$(B1NIX_ARCH)/rootfs
 # fresh mtime on identical content, and the root image is repacked whenever
 # anything in the tree is newer than it -- so unconditional copies here cost a
 # full dd + mke2fs on every build, including the ones that changed nothing.
-CIC      := ../tools/copy-if-changed.sh
+CIC      := ../tools/build/copy-if-changed.sh
 # The account files are built by a chain of appends; assembling them here and
 # copying the result keeps that shape while still leaving the image alone when
 # it comes out identical.
@@ -151,13 +151,13 @@ GEN_MUSL_POSTLINK := 1
 # The kernel decides which syscall ABI a program gets from EI_OSABI, and every
 # binary here talks the Linux ABI (musl's arch_prctl, set_tid_address, clone3).
 # ld.lld has no flag for the byte, so we stamp it. Same thing the loader itself
-# gets in the top-level Makefile and the same thing tools/b1nix-musl-cc does.
+# gets in the top-level Makefile and the same thing tools/toolchain/bin/b1nix-musl-cc does.
 #
 # Each call site used to carry a copy of this that ALSO rewrote the DT_NEEDED
 # string in .dynstr from "ld-musl-x86_64.so.1" to "libc.so". That rewrite was a
 # workaround for libc.so having no DT_SONAME, which made lld record the file
 # name we happened to link through. musl's real soname is set at build time now
-# (tools/ports/build-musl.sh), so the linker writes "libc.so" itself and there
+# (tools/toolchain/build-musl.sh), so the linker writes "libc.so" itself and there
 # is nothing left to rewrite — patching the bytes of a produced ELF should be
 # the last resort it sounds like, not the routine step it had become.
 #
@@ -484,7 +484,7 @@ $(B1CC): $(B1CC_REV_STAMP) $(B1CC_DIR)/Makefile $(wildcard $(B1CC_SRC_GLOB))
 #                  target ELFs, tiny servers, the musl bring-up diagnostics)
 #   bin/tools/     b1nix-specific utilities that ship in the image
 #   bin/stress/    the soak stressors: bounded, self-verifying load generators
-#                  driven by /etc/soak.sh (see tools/soak/)
+#                  driven by /etc/soak.sh (see tools/run/soak/)
 #   bin/gui/       the GUI demo applications
 #   bin/compiler/  the b1cc corpus
 # Rules refer to a source through $(call bin_src,NAME) so a program can move

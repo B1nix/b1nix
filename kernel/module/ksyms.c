@@ -3,7 +3,7 @@
  * This is the module ABI: every name here is resolvable from a .ko, nothing
  * else is. Keeping the whole table in one translation unit makes the surface
  * auditable — `grep EXPORT_SYMBOL kernel/module/ksyms.c` is the exhaustive
- * list, and tools/kernel/check-module-syms.sh diffs each built module's
+ * list, and tools/build/kernel/check-module-syms.sh diffs each built module's
  * undefined symbols against it so a missing export is a build failure rather
  * than an insmod failure.
  */

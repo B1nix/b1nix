@@ -1002,6 +1002,16 @@ int blk_probe_label(struct block_device *dev, char *out, usize cap) {
     return out[0] ? 0 : -1;
   }
 
+  /* btrfs: the primary superblock at 64 KiB, label at 0x12b (256 bytes). */
+  {
+    u8 bsb[0x12b + 256];
+    if (blk_read_bytes(dev, 65536, bsb, sizeof(bsb)) == 0 &&
+        memcmp(bsb + 0x40, "_BHRfS_M", 8) == 0) {
+      label_copy(out, cap, (const char *)(bsb + 0x12b), 256);
+      return out[0] ? 0 : -1;
+    }
+  }
+
   u8 boot[512];
   if (blk_read_bytes(dev, 0, boot, sizeof(boot)) < 0)
     return -1;

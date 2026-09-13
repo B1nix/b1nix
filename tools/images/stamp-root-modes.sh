@@ -1,36 +1,29 @@
 #!/bin/sh
-# tools/images/stamp-root-modes.sh - the setuid inodes a b1nix root image needs.
+# tools/images/stamp-root-modes.sh - the setuid and private modes a root needs.
 #
-#   DEBUGFS=... stamp-root-modes.sh IMAGE
+#   stamp-root-modes.sh ROOTFS
 #
-# Two things build a bootable root: tools/images/mk-root-image.sh (build/<arch>/
-# root.ext4) and _mkimg in tests/smoke.sh (the per-lane disks the aarch64
-# instances boot). They drifted -- the second copied ownership and stopped
-# there, so unix_chkpwd was not setuid and /etc/shadow was world-readable on
-# every aarch64 lane, while the same tree packed by the first was correct. One
-# list, called from both, is the only way that stays fixed.
+# Applied to the staging tree right before it is packed, by every script that
+# packs one (mk-root-image.sh, _mkimg in tests/smoke.sh), so the lists cannot
+# drift. Ownership is not set here: the tree is packed inside `unshare -r`,
+# where the building user's files read as uid 0.
 #
-# M108: /bin/{su,passwd,login} are symlinks onto the BusyBox multicall ELF, so
-# the setuid bit belongs on the inode they resolve to -- the dedicated
-# busybox-suid copy -- and NOT on the symlinks (stamping a mode on a symlink
-# inode would only corrupt it). The plain /bin/busybox that every
-# other applet resolves to is deliberately left non-setuid.
+# /bin/{su,passwd,login} are symlinks onto /bin/busybox-suid, so the setuid bit
+# belongs on that copy; the plain /bin/busybox stays non-setuid.
 set -eu
 
-IMAGE="$1"
-DEBUGFS="${DEBUGFS:-debugfs}"
-
-for cmd in \
-	"sif /bin/m31_setuid uid 0" \
-	"sif /bin/m31_setuid mode 0104755" \
-	"sif /bin/busybox-suid uid 0" \
-	"sif /bin/busybox-suid gid 0" \
-	"sif /bin/busybox-suid mode 0104755" \
-	"sif /sbin/unix_chkpwd uid 0" \
-	"sif /sbin/unix_chkpwd gid 0" \
-	"sif /sbin/unix_chkpwd mode 0104755" \
-	"sif /etc/shadow uid 0" \
-	"sif /etc/shadow mode 0100400" \
+ROOTFS="$1"
+# The image root takes the staging directory's own mode.
+chmod 0755 "$ROOTFS"
+for spec in \
+	"4755 bin/m31_setuid" \
+	"4755 bin/busybox-suid" \
+	"4755 sbin/unix_chkpwd" \
+	"0400 etc/shadow" \
+	"1777 tmp" \
+	"1777 var/tmp" \
 ; do
-	"$DEBUGFS" -w -R "$cmd" "$IMAGE" 2>/dev/null || true
+	f="$ROOTFS/${spec#* }"
+	[ -e "$f" ] && [ ! -L "$f" ] && chmod "${spec%% *}" "$f"
 done
+exit 0

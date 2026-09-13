@@ -10,8 +10,8 @@ mechanism.
 | `kernel/module/module.c` | loader, relocations, unload, params, sysfs, `request_module` |
 | `kernel/module/ksyms.c` | kernel `EXPORT_SYMBOL` list (single source of truth) |
 | `kernel/mm/module_alloc.c` | module VA region allocator |
-| `tools/kernel/gen_modules_initramfs.sh` | packs `.ko`s + generated `modules.dep`/`modules.alias` into the initramfs |
-| `tools/kernel/check-module-syms.sh` | build fails if a module has an undefined symbol no kernel/module export provides |
+| `tools/build/kernel/gen_modules_initramfs.sh` | packs `.ko`s + generated `modules.dep`/`modules.alias` into the initramfs |
+| `tools/build/kernel/check-module-syms.sh` | build fails if a module has an undefined symbol no kernel/module export provides |
 
 ## Building
 

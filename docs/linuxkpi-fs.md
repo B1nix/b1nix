@@ -49,7 +49,27 @@ The bridge is split because the two VFS models cannot share a translation unit:
 `struct vfs_fs`; `kernel/lkpi/fs_bridge.h` is the plain-C interface between
 them. Nodes are materialised lazily via `lookup_cb`. Supported: open, read,
 write, readdir, create, mkdir, rename, link, symlink, unlink, truncate, fsync,
-xattrs.
+xattrs, chattr flags, statfs, chmod/chown/utime.
+
+## As the root filesystem
+
+The root image is btrfs (`tools/images/mk-root-image.sh`, `ROOT_FS=ext4` for
+the old one); the kernel mounts root by the probed type. Rules the bridge and
+shim follow because a root exercised them:
+
+- The VFS page cache holds writes until writeback, so getattr, setattr and
+  rename flush the file first; otherwise btrfs's older size or mtime wins.
+- Namespace ops take the directory locks the VFS would (`inode_lock`, shared
+  for readdir — btrfs readdir upgrades and downgrades it).
+- lkpi spinlocks save the IRQ state per CPU at the outermost acquire: Linux
+  code releases locks out of order.
+- `set_current_state(); schedule()` sleeps (bounded, woken by
+  `wake_up_process`); it is not a yield.
+- `iput` keeps an inode with links cached at zero references; unmount evicts.
+- Lookup nodes inherit the mount's `fs_id` (the page-cache key) and are
+  attached only if no node of that name exists.
+- Kernel threads started inside a syscall are not the caller's children and
+  hold no descriptors.
 
 ## Tests
 
@@ -59,7 +79,7 @@ xattrs.
 | `b1nix.lkpi-bridge-test=<dev>` | `lkpifs_selftest()`: the same through b1nix paths under `/mnt/lkpi` |
 | `b1nix.lkpi-ext4-test=<dev>` | bridge self-test over `ext4-lkpi` |
 
-Images: `tools/fs/make-lkpi-btrfs-image.sh`, `tools/fs/make-lkpi-ext4-image.sh`
+Images: `tools/fs/make-lkpi-image.sh btrfs|ext4`
 (ext4 keeps features the native driver cannot read). The judge is the host:
 `btrfs check` / `btrfs restore`, `e2fsck -fn`. The smoke `blk` lane mounts a
 `mkfs.btrfs` image through the imported driver (`M119-BTRFS:` markers).

@@ -78,11 +78,16 @@ int main(void) {
    * candidates in turn rather than naming one. */
   static const char *const roots[] = { "/dev/ram0", "/dev/vda", "/dev/vdb",
                                        "/dev/sata0" };
+  /* The root image is btrfs by default and ext4 when built with ROOT_FS=ext4;
+   * what an init does is try the types it knows, as busybox mount does. */
+  static const char *const types[] = { "btrfs", "ext4" };
   int mounted = 0;
 
   for (unsigned i = 0; i < sizeof(roots) / sizeof(roots[0]) && !mounted; i++) {
-    if (mount(roots[i], NEWROOT, "ext4", 0, NULL) == 0)
-      mounted = 1;
+    for (unsigned t = 0; t < sizeof(types) / sizeof(types[0]) && !mounted; t++) {
+      if (mount(roots[i], NEWROOT, types[t], 0, NULL) == 0)
+        mounted = 1;
+    }
   }
   if (!mounted) {
     marker("M109-SMOKE: FAIL switchroot-mount-newroot");

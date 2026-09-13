@@ -269,7 +269,9 @@ Upstream Linux 6.6 `fs/btrfs`, `fs/ext4`, `fs/jbd2` built unpatched on our shim.
 
 - [x] 105 imported TUs link (`B1NIX_FS_IMPORT=btrfs`, `=1` adds ext4).
 - [x] `initial` btrfs mount/read/write verified by host `btrfs check`; `mount -t btrfs-lkpi` bridges b1nix VFS to it.
-- [ ] `planned` ext4 and jbd2, needing buffer-head write helpers (still `-EOPNOTSUPP`).
+- [x] The root filesystem is the imported btrfs (`mkfs.btrfs --rootdir`; `ROOT_FS=ext4` still builds the old image). x86_64 smoke 1419/1 on it. Bugs a real root exposed: out-of-order spinlock release re-enabled IRQs, `schedule()` spun instead of sleeping, linked inodes evicted with their delalloc data, lookup nodes shared page-cache keys, preempt count per CPU. Detail in [linuxkpi-fs.md](linuxkpi-fs.md).
+- [ ] `partial` aarch64 root on the imported btrfs: user page faults now read with IRQs on, but three lanes still hit memory corruption (page-cache LRU, `end_bio_extent_readpage` NULL, `set_mask_bits` alignment). aarch64 keeps an ext4 root meanwhile (1359/3).
+- [ ] `planned` Move ext4 to Linux's ext4 through lkpi and retire the native driver (the M14 data disks and `ROOT_FS=ext4`); needs buffer-head write helpers (`block_page_mkwrite` is still `-EOPNOTSUPP`).
 
 ## M121: Kernel only
 
@@ -281,7 +283,7 @@ Upstream Linux 6.6 `fs/btrfs`, `fs/ext4`, `fs/jbd2` built unpatched on our shim.
 - [x] Own native clang/Rust toolchain builds and the `b1nix-pkgs` download removed; nothing third-party is built from source.
 - [x] Self-host (M26) on Alpine's clang17/lld with the host build's own per-TU commands: 653/653 compile and the link succeeds in-guest.
 - [x] execve no longer drops arguments past 256 (a 684-argument link ran on the first 256 objects); oversized vectors are E2BIG.
-- [ ] `partial` The self-hosted kernel.elf does not boot: native ext4 loses data written into a file extended by ftruncate (`M14-SMOKE: ext4-shared-mmap-durable` fails the same way with plain write()). Fix by moving to Linux's ext4 through lkpi.
+- [ ] `partial` The self-hosted kernel.elf did not boot: native ext4 lost data written into a file extended by ftruncate (`M14-SMOKE: ext4-shared-mmap-durable` still fails on the native-ext4 data disk). The build disk is btrfs now; boot of the guest-built kernel not yet re-run.
 - [x] aarch64 builds the imported btrfs and prints debug tracing on test boots (the M40 personality line).
 - [ ] `partial` aarch64 smoke 1357/0, but one run in two wedged sys/posix: READY tasks not picked and futex wakes missed under TCG; not yet traced.
 - [x] Wall clock no longer runs backwards: NTP slewed by stepping whole seconds; now one monotonic-based wall clock on both arches, NTP offset in ns, slew at <=500 ppm.

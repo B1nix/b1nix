@@ -426,6 +426,18 @@ int set_blocksize(struct block_device *bdev, int size)
 		return -EINVAL;
 	if (bdev && size < (int)bdev_logical_block_size(bdev))
 		return -EINVAL;
+	if (bdev && bdev->bd_block_size != (unsigned int)size) {
+		/*
+		 * Drop the device's cached folios, as upstream's kill_bdev does.
+		 * They are divided into buffers of the old size, and a buffer lookup
+		 * at the new size refuses such a folio: ext4 reads its superblock at
+		 * 1 KiB, switches to the filesystem's 4 KiB and read it again, and
+		 * the second read failed ("Can't read superblock on 2nd try").
+		 */
+		sync_blockdev(bdev);
+		if (bdev->bd_inode)
+			invalidate_mapping_pages(bdev->bd_inode->i_mapping, 0, (pgoff_t)-1);
+	}
 	if (bdev)
 		bdev->bd_block_size = (unsigned int)size;
 	return 0;

@@ -22,6 +22,8 @@
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
+#include <b1nix/page_cache.h>
+#include <b1nix/posix.h>
 #include <b1nix/vfs.h>
 #include <stdio.h>
 #include <string.h>
@@ -34,9 +36,19 @@ struct lkpifs_node {
 	const char *linux_name;   /* which type, for diagnostics */
 };
 
+static void lkpifs_release(struct vfs_node *node);
+
+/*
+ * Only a node whose ops this file installed carries a lkpifs_node. The VFS
+ * gives a node it creates its own data first -- a new symlink holds its
+ * target string there -- and reading that as a handle dereferenced the
+ * string's bytes.
+ */
 static struct lkpifs_node *node_info(struct vfs_node *node)
 {
-	return node && node->inode ? (struct lkpifs_node *)node->inode->data : 0;
+	if (!node || !node->inode || node->inode->release_cb != lkpifs_release)
+		return 0;
+	return (struct lkpifs_node *)node->inode->data;
 }
 
 /*
@@ -112,6 +124,7 @@ static int lkpifs_symlink(struct vfs_node *dir, const char *name,
                           const char *target);
 static int lkpifs_truncate(struct vfs_node *node, u64 length);
 static int lkpifs_setattr(struct vfs_node *node);
+static int lkpifs_statfs(struct vfs_node *node, struct b1nix_statfs *st);
 static int lkpifs_fsync(struct vfs_node *node);
 /* ── extended attributes ────────────────────────────────────────── */
 
@@ -196,6 +209,19 @@ static void apply_attr(struct vfs_node *node, const struct lkpi_bridge_attr *a)
 	node->inode->atime = a->atime;
 	node->inode->mtime = a->mtime;
 	node->inode->ctime = a->ctime;
+	/* The attribute byte the VFS enforces (immutable, append-only) is the
+	 * filesystem's; keep the rest of attr, which the VFS owns. */
+	node->inode->attr = (node->inode->attr & ~VFS_ATTR_USER_MASK) |
+	                    (a->flags & VFS_ATTR_USER_MASK);
+}
+
+static int lkpifs_setflags(struct vfs_node *node, u32 attr)
+{
+	void *handle = node_handle(node);
+
+	if (!handle)
+		return -EINVAL;
+	return lkpi_bridge_set_flags(handle, attr & VFS_ATTR_USER_MASK);
 }
 
 static void install_ops(struct vfs_node *node, void *handle,
@@ -228,6 +254,8 @@ static void install_ops(struct vfs_node *node, void *handle,
 	node->inode->fsync_cb = lkpifs_fsync;
 	node->inode->release_cb = lkpifs_release;
 	node->inode->getattr_cb = lkpifs_getattr;
+	node->inode->setflags_cb = lkpifs_setflags;
+	node->inode->statfs_cb = lkpifs_statfs;
 	node->inode->getxattr_cb = lkpifs_getxattr;
 	node->inode->setxattr_cb = lkpifs_setxattr;
 	node->inode->removexattr_cb = lkpifs_removexattr;
@@ -369,8 +397,25 @@ static isize lkpifs_read(struct vfs_node *node, u64 offset, char *buffer,
 	 * read_cb, which is how a filesystem with no in-memory target string
 	 * answers readlink.
 	 */
-	if (node->inode->type == VFS_SYMLINK)
-		return lkpi_bridge_readlink(handle, buffer, size);
+	if (node->inode->type == VFS_SYMLINK) {
+		/* Honour the offset: a reader looping until 0 got the target
+		 * again at every offset. */
+		char *target = kmalloc(VFS_MAX_PATH);
+		int n;
+
+		if (!target)
+			return -ENOMEM;
+		n = lkpi_bridge_readlink(handle, target, VFS_MAX_PATH);
+		if (n < 0 || offset >= (u64)n) {
+			kfree(target);
+			return n < 0 ? n : 0;
+		}
+		if (size > (usize)n - (usize)offset)
+			size = (usize)n - (usize)offset;
+		memcpy(buffer, target + offset, size);
+		kfree(target);
+		return (isize)size;
+	}
 	ret = lkpi_bridge_read(handle, offset, buffer, size);
 	return (isize)ret;
 }
@@ -466,7 +511,17 @@ static int lkpifs_lookup(struct vfs_node *dir, const char *name)
 	child = make_node(handle, name, info->linux_name);
 	if (!child)
 		return -ENOMEM;
-	vfs_attach_child(dir, child);
+	/* The page cache keys pages by (fs_id, ino). A node made on lookup is
+	 * allocated after the mount, with fs_id 0 -- which it then shared with
+	 * every in-memory filesystem, and a btrfs file whose inode number matched
+	 * a tmpfs one read that file's cached pages. */
+	child->inode->fs_id = dir->inode->fs_id;
+	if (!vfs_attach_child_unique(dir, child)) {
+		/* Someone else's node for the name got there first. */
+		child->deleted = 1;
+		__atomic_store_n(&child->refcount, 1, __ATOMIC_RELAXED);
+		vfs_node_put(child);
+	}
 	return 0;
 }
 
@@ -500,6 +555,10 @@ static int lkpifs_create(struct vfs_node *dir, const char *name,
 			install_ops(child, handle, info->linux_name);
 		}
 	}
+	if (child) {
+		child->inode->fs_id = dir->inode->fs_id; /* see lkpifs_lookup */
+		vfs_node_put(child);
+	}
 	return 0;
 }
 
@@ -515,11 +574,16 @@ static int lkpifs_mkdir(struct vfs_node *dir, const char *name, u32 mode)
 	if (rc)
 		return rc;
 	child = find_child(dir, name);
-	if (child && child->inode && !child->inode->data) {
+	if (child && child->inode && !node_info(child)) {
 		void *handle = lkpi_bridge_lookup(info->handle, name);
 
-		if (handle)
+		if (handle) {
 			install_ops(child, handle, info->linux_name);
+		}
+	}
+	if (child) {
+		child->inode->fs_id = dir->inode->fs_id; /* see lkpifs_lookup */
+		vfs_node_put(child);
 	}
 	return 0;
 }
@@ -596,6 +660,17 @@ static int lkpifs_rename(struct vfs_node *old_dir, const char *old_name,
 
 	if (!from || !to || !from->handle || !to->handle)
 		return -EINVAL;
+	/* The source's handle is dropped below, and writeback finds a file's
+	 * handle only through it: a page still dirty after the rename had no
+	 * way back to the filesystem, and `cp a b; mv b c` left c empty. */
+	{
+		struct vfs_node *src = find_child(old_dir, old_name);
+
+		if (src) {
+			page_cache_flush_inode(src->inode);
+			vfs_node_put(src);
+		}
+	}
 	ret = lkpi_bridge_rename(from->handle, old_name, to->handle, new_name);
 	if (ret == 0) {
 		/* Both names change hands: the source stops existing, and anything
@@ -630,11 +705,23 @@ static int lkpifs_symlink(struct vfs_node *dir, const char *name,
 	if (rc)
 		return rc;
 	child = find_child(dir, name);
-	if (child && child->inode && !child->inode->data) {
+	if (child && child->inode && !node_info(child)) {
 		void *handle = lkpi_bridge_lookup(info->handle, name);
 
-		if (handle)
+		if (handle) {
+			/* The VFS stored the target itself; the filesystem owns it now
+			 * and read_cb answers readlink from there. */
+			if (child->inode->flags & VFS_NODE_OWNS_DATA) {
+				kfree(child->inode->data);
+				child->inode->flags &= ~VFS_NODE_OWNS_DATA;
+			}
+			child->inode->data = 0;
 			install_ops(child, handle, info->linux_name);
+		}
+	}
+	if (child) {
+		child->inode->fs_id = dir->inode->fs_id; /* see lkpifs_lookup */
+		vfs_node_put(child);
 	}
 	return 0;
 }
@@ -658,10 +745,39 @@ static int lkpifs_setattr(struct vfs_node *node)
 
 	if (!handle)
 		return -EINVAL;
-	/* Only the mode is pushed back: b1nix's setattr_cb says "the inode has
-	 * changed", and the permission bits are the part the imported filesystem
-	 * stores on disk. */
-	return lkpi_bridge_chmod(handle, node->inode->mode);
+	/* b1nix's setattr_cb says "the inode has changed": push what the
+	 * filesystem stores -- mode, owner, timestamps. Pending writes go first,
+	 * or reaching the filesystem afterwards they would stamp a new mtime over
+	 * the one set here (utime after write). */
+	page_cache_flush_inode(node->inode);
+	return lkpi_bridge_setattr(handle, node->inode->mode, node->inode->uid,
+	                           node->inode->gid, node->inode->atime,
+	                           node->inode->mtime);
+}
+
+static int lkpifs_statfs(struct vfs_node *node, struct b1nix_statfs *st)
+{
+	struct lkpi_bridge_statfs b;
+	void *handle = node_handle(node);
+	int rc;
+
+	if (!handle || !st)
+		return -EINVAL;
+	rc = lkpi_bridge_statfs(handle, &b);
+	if (rc)
+		return rc;
+	st->f_type = b.type;
+	st->f_bsize = b.bsize;
+	st->f_blocks = b.blocks;
+	st->f_bfree = b.bfree;
+	st->f_bavail = b.bavail;
+	st->f_files = b.files;
+	st->f_ffree = b.ffree;
+	st->f_fsid = b.fsid;
+	st->f_namelen = b.namelen;
+	st->f_frsize = b.frsize;
+	st->f_flags = b.flags;
+	return 0;
 }
 
 static int lkpifs_fsync(struct vfs_node *node)
@@ -683,7 +799,16 @@ static void lkpifs_getattr(struct vfs_node *node)
 	/* The imported filesystem owns these: a size or a link count that changed
 	 * behind the VFS's back (another name for the same inode, a write through
 	 * a second path) is read here rather than remembered from the lookup. */
-	if (handle && lkpi_bridge_attr(handle, &a) == 0)
+	if (!handle)
+		return;
+	/*
+	 * Writes land in the VFS page cache first and reach the filesystem at
+	 * writeback. Until then its size is the old one, and copying that over the
+	 * VFS inode made writeback and every read stop at it: a file written and
+	 * then stat'ed came out empty. Hand the dirty pages over before asking.
+	 */
+	page_cache_flush_inode(node->inode);
+	if (lkpi_bridge_attr(handle, &a) == 0)
 		apply_attr(node, &a);
 }
 

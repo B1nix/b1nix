@@ -1,7 +1,7 @@
 # Executables allowed to be statically linked in the rootfs.
 #
 # Everything in b1nix links dynamically against /lib/libc.so — see
-# tools/check-dynamic.sh, which fails the build for anything not listed here.
+# tools/check/check-dynamic.sh, which fails the build for anything not listed here.
 # One path per line, relative to the rootfs root, followed by '#' and the reason
 # the binary cannot be dynamic. An entry with no reason is an error: static
 # linking has to be an argued, reviewed decision, not a quiet `-static` in a

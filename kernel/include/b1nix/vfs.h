@@ -560,6 +560,7 @@ u32 vfs_mounting_fs_id(void);
 
 struct vfs_node *vfs_create_node(enum vfs_node_type type);
 void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child);
+int vfs_attach_child_unique(struct vfs_node *parent, struct vfs_node *child);
 /* Unlink `child` from `parent`'s sibling list. Used by synthetic filesystems
  * whose tree changes at runtime (a module removing its /sys/module entry).
  * The caller still owns its reference on the child. */

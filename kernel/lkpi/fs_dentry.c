@@ -318,10 +318,15 @@ void d_delete(struct dentry *dentry)
 	 * does not exist.
 	 */
 	if (dentry->d_inode) {
-		iput(dentry->d_inode);
-		dentry->d_inode = NULL;
+		struct inode *inode = dentry->d_inode;
+
+		/* Off the alias list before the reference goes: the iput may be
+		 * the last one, and btrfs warns on destroying an inode that still
+		 * lists a dentry. */
 		if (!hlist_unhashed(&dentry->d_u))
 			hlist_del_init(&dentry->d_u);
+		dentry->d_inode = NULL;
+		iput(inode);
 	}
 }
 

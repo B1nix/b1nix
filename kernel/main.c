@@ -276,6 +276,37 @@ void boot_summary_set_root(const char *what) {
 const char *boot_summary_root(void) { return g_boot_root; }
 const char *boot_summary_init(void) { return g_boot_init; }
 
+/* Mount `dev` at / as whatever its superblock says it is: the root image is
+ * btrfs, older images and the boot modules are ext4. */
+static int mount_root_as_probed(const char *dev_name, const char **type_out)
+{
+	static const char *const fallback[] = {"ext4", "ext3", "ext2"};
+	struct block_device *dev = blk_get(dev_name);
+	const char *probed = dev ? blk_probe_fstype(dev) : "-";
+
+#if B1NIX_FS_IMPORT_EXT4
+	/* An ext2/3/4 root goes to Linux's own ext4 when it is built in;
+	 * b1nix.native-ext4 keeps the native driver. */
+	if (strncmp(probed, "ext", 3) == 0 && !bootinfo_has_flag("b1nix.native-ext4") &&
+	    vfs_mount(dev_name, "/", "ext4-lkpi", 0) == 0) {
+		*type_out = "ext4-lkpi";
+		return 0;
+	}
+#endif
+	if (probed[0] != '-' && vfs_mount(dev_name, "/", probed, 0) == 0) {
+		*type_out = probed;
+		return 0;
+	}
+	for (usize i = 0; i < sizeof(fallback) / sizeof(fallback[0]); i++) {
+		if (strcmp(fallback[i], probed) != 0 &&
+		    vfs_mount(dev_name, "/", fallback[i], 0) == 0) {
+			*type_out = fallback[i];
+			return 0;
+		}
+	}
+	return -1;
+}
+
 static struct block_device *find_device_by_label(const char *expected_label) {
 	char label[64];
 	for (usize i = 0; i < blk_count(); i++) {
@@ -389,10 +420,12 @@ static int mount_first_virtio_root(void)
 
 		if (!dev || !dev->name)
 			return -1;
-		if (vfs_mount(dev->name, "/", "ext4", 0) == 0) {
+		const char *type;
+
+		if (mount_root_as_probed(dev->name, &type) == 0) {
 			char buf[64];
 
-			snprintf(buf, sizeof(buf), "rootfs: %s mounted at /\n", dev->name);
+			snprintf(buf, sizeof(buf), "rootfs: %s mounted at / as %s\n", dev->name, type);
 			console_write(buf);
 			vfs_repopulate_after_root_mount();
 			return 0;
@@ -1203,9 +1236,9 @@ void kernel_main(usize arg0, usize arg1)
 						 * to keep the bootstrap initramfs as active root.
 						 * Otherwise (on real hardware or normal boots), we mount
 						 * loop0 as the primary rootfs at /. */
-						rc = vfs_mount(loop_dev->name, "/", "ext4", 0);
+						{ const char *loop_type; rc = mount_root_as_probed(loop_dev->name, &loop_type); }
 						if (rc == 0) {
-							snprintf(loop_buf, sizeof(loop_buf), "rootfs: %s mounted at / as ext4\n", loop_dev->name);
+							snprintf(loop_buf, sizeof(loop_buf), "rootfs: %s mounted at /\n", loop_dev->name);
 							console_write(loop_buf);
 							vfs_repopulate_after_root_mount();
 								if (mounted_iso_name[0] != '\0') {
@@ -1235,7 +1268,7 @@ void kernel_main(usize arg0, usize arg1)
 
 				if (rc != 0) {
 					k_err("rootfs", "liveiso mount failed, falling back to ram0...");
-					rc = vfs_mount("ram0", "/", "ext4", 0);
+					{ const char *ram_type; rc = mount_root_as_probed("ram0", &ram_type); }
 					if (rc == 0) {
 						k_warn("rootfs", "ram0 mounted at / (Live CD fallback)");
 						vfs_repopulate_after_root_mount();
@@ -1284,16 +1317,16 @@ void kernel_main(usize arg0, usize arg1)
 							}
 						}
 						if (rc != 0) {
-							const char *fs_types[] = {"ext4", "ext3", "ext2", "tarfs"};
-							for (int i = 0; i < 4; i++) {
-								rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
-								if (rc == 0) {
-									char mounted_buf[96];
-									snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, fs_types[i]);
-									console_write(mounted_buf);
-									vfs_repopulate_after_root_mount();
-									break;
-								}
+							const char *type = "tarfs";
+
+							rc = mount_root_as_probed(root_dev->name, &type);
+							if (rc != 0)
+								rc = vfs_mount(root_dev->name, "/", "tarfs", 0);
+							if (rc == 0) {
+								char mounted_buf[96];
+								snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, type);
+								console_write(mounted_buf);
+								vfs_repopulate_after_root_mount();
 							}
 						}
 					}
@@ -1315,16 +1348,15 @@ void kernel_main(usize arg0, usize arg1)
 				struct block_device *labelled = find_device_by_label("b1nix-root");
 
 				if (labelled) {
-					const char *fs_types[] = {"ext4", "ext3", "ext2"};
+					const char *type = "?";
 
-					for (int i = 0; i < 3 && rc != 0; i++)
-						rc = vfs_mount(labelled->name, "/", fs_types[i], 0);
+					rc = mount_root_as_probed(labelled->name, &type);
 					if (rc == 0) {
 						char buf[96];
 
 						snprintf(buf, sizeof(buf),
-						         "rootfs: %s (label b1nix-root) mounted at /\n",
-						         labelled->name);
+						         "rootfs: %s (label b1nix-root) mounted at / as %s\n",
+						         labelled->name, type);
 						console_write(buf);
 						boot_summary_set_root(labelled->name);
 						vfs_repopulate_after_root_mount();
@@ -1332,9 +1364,9 @@ void kernel_main(usize arg0, usize arg1)
 				}
 			}
 			if (rc != 0) {
-				rc = vfs_mount("ram0", "/", "ext4", 0);
+				{ const char *ram_type; rc = mount_root_as_probed("ram0", &ram_type); }
 				if (rc == 0) {
-					console_write("rootfs: ram0 mounted at / as ext4\n");
+					console_write("rootfs: ram0 mounted at /\n");
 					boot_summary_set_root("ram0");
 					vfs_repopulate_after_root_mount();
 				}
@@ -1347,22 +1379,20 @@ void kernel_main(usize arg0, usize arg1)
 				/* Try finding a block device by default label 'b1nix-root' (e.g. USB flash drive) */
 				struct block_device *root_dev = find_device_by_label("b1nix-root");
 				if (root_dev) {
-					const char *fs_types[] = {"ext4", "ext3", "ext2"};
-					for (int i = 0; i < 3; i++) {
-						rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
-						if (rc == 0) {
-							char mounted_buf[96];
-							snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s (label b1nix-root) mounted at / as %s\n", root_dev->name, fs_types[i]);
-							console_write(mounted_buf);
-							vfs_repopulate_after_root_mount();
-							break;
-						}
+					const char *type = "?";
+
+					rc = mount_root_as_probed(root_dev->name, &type);
+					if (rc == 0) {
+						char mounted_buf[96];
+						snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s (label b1nix-root) mounted at / as %s\n", root_dev->name, type);
+						console_write(mounted_buf);
+						vfs_repopulate_after_root_mount();
 					}
 				}
 				if (rc != 0) {
-					rc = vfs_mount("ram0", "/", "ext4", 0);
+					{ const char *ram_type; rc = mount_root_as_probed("ram0", &ram_type); }
 					if (rc == 0) {
-						console_write("rootfs: ram0 mounted at / as ext4\n");
+						console_write("rootfs: ram0 mounted at /\n");
 						boot_summary_set_root("ram0");
 						vfs_repopulate_after_root_mount();
 					} else {
@@ -1700,6 +1730,7 @@ void kernel_main(usize arg0, usize arg1)
 	 * filesystems are up — kswapd keeps a free-frame headroom so userspace
 	 * allocations rarely stall in synchronous reclaim. */
 	kswapd_init();
+	scheduler_start_reaper();
 	vfs_start_writeback();
 	/* b1nix.prof-at=<seconds>: print the profile once, by itself, for a guest
 	 * that will never read /proc/b1nix-prof. */
@@ -2064,7 +2095,9 @@ void kernel_main(usize arg0, usize arg1)
 		 * cache — so the self-host fits in far less RAM. */
 		const char *sh_src =
 		    bootinfo_has_flag("b1nix.selfhostdisk") ? "sda" : "ram0";
-		int sh_mrc = vfs_mount(sh_src, "/mnt/build", "ext4", 0);
+		struct block_device *sh_dev = blk_get(sh_src);
+		const char *sh_type = sh_dev ? blk_probe_fstype(sh_dev) : "ext4";
+		int sh_mrc = vfs_mount(sh_src, "/mnt/build", sh_type[0] == '-' ? "ext4" : sh_type, 0);
 		char sh_buf[80];
 		snprintf(sh_buf, sizeof(sh_buf), "selfhost: mount %s -> /mnt/build: %d\n",
 		         sh_src, sh_mrc);

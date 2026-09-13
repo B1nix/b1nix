@@ -42,10 +42,44 @@ _Static_assert(sizeof(spinlock_t) == sizeof(int),
  * interrupts off, so the holder can neither migrate nor be preempted; whoever
  * is running on this CPU is the holder. */
 static int lkpi_locks_held[MAX_CPUS];
+/*
+ * The interrupt state from before this CPU's outermost lkpi lock, restored
+ * when its last one is released.
+ *
+ * Per CPU, not per lock. Linux lets locks be released in any order -- take A,
+ * take B, drop A, drop B: btrfs's extent tree and every wait queue do -- and
+ * Linux's spin_lock does not touch interrupts at all. With the state kept per
+ * lock, dropping A restored "interrupts on" while B was still held, the timer
+ * preempted the holder, and the task resumed on another CPU with B taken.
+ */
+static u64 lkpi_irq_saved[MAX_CPUS];
 /* Where this CPU's outermost lock was taken, and which lock it is. Kept so a
  * violation can name the acquire that is still outstanding rather than only
  * the code that tripped over it. */
 static u64 lkpi_locks_entry_site[MAX_CPUS];
+/* The two frames above the acquire, by frame-pointer walk: spin_lock is an
+ * out-of-line wrapper in imported code, so its own return address names the
+ * wrapper and not the code that took the lock. */
+static u64 lkpi_locks_entry_callers[MAX_CPUS][2];
+
+static void lkpi_note_callers(u32 cpu)
+{
+	u64 *fp = (u64 *)__builtin_frame_address(0);
+
+	lkpi_locks_entry_callers[cpu][0] = 0;
+	lkpi_locks_entry_callers[cpu][1] = 0;
+	/* Frame 1 is lkpi_spin_lock's return into the wrapper, already recorded
+	 * as the site; frames 2 and 3 are the code above it. */
+	for (int i = 0; i < 3; i++) {
+		if (!fp || (u64)(usize)fp < 0xffff800000000000ull)
+			return;
+		fp = (u64 *)(usize)fp[0];
+		if (!fp || (u64)(usize)fp < 0xffff800000000000ull)
+			return;
+		if (i > 0)
+			lkpi_locks_entry_callers[cpu][i - 1] = fp[1];
+	}
+}
 static const void *lkpi_locks_entry_lock[MAX_CPUS];
 static u64 lkpi_locks_entry_task[MAX_CPUS];
 /* Off until the first lkpi lock is taken. Before that the check would run on
@@ -68,6 +102,11 @@ void lkpi_lock_irq_on_check(u64 site)
 	u32 cpu;
 
 	if (!lkpi_lock_check_armed)
+		return;
+	/* Only the off->on transition means anything. Already on, the caller
+	 * can migrate between reading its CPU and that CPU's count, and a lock
+	 * another task holds there reads as this caller's. */
+	if (interrupts_enabled())
 		return;
 	cpu = percpu_read(cpu_id);
 	if (cpu >= MAX_CPUS || lkpi_locks_held[cpu] == 0)
@@ -98,6 +137,10 @@ void lkpi_lock_report_held(void)
 	console_write(" taken at 0x");
 	console_write_hex64(lkpi_locks_entry_site[cpu]);
 	ksym_print(lkpi_locks_entry_site[cpu]);
+	for (int i = 0; i < 2 && lkpi_locks_entry_callers[cpu][i]; i++) {
+		console_write(" <- ");
+		ksym_print(lkpi_locks_entry_callers[cpu][i]);
+	}
 	/* Whose lock it is, against who is running here now. A CPU whose id is not
 	 * yet its own -- an AP still using the boot CPU's percpu block -- would
 	 * account its locks to cpu 0 and make this count belong to two CPUs at
@@ -203,6 +246,9 @@ void lkpi_spin_lock(struct lkpi_spinlock *l)
 	int was_on = lkpi_irqs_enabled();
 
 	spin_lock_irqsave((spinlock_t *)&l->raw, &f);
+	/* Read again with interrupts off: the value above was taken before,
+	 * when the task could still move. */
+	cpu = percpu_read(cpu_id);
 	l->flags = f;
 	if (was_on)
 		lkpi_note_irq_off((u64)(usize)__builtin_return_address(0));
@@ -210,7 +256,9 @@ void lkpi_spin_lock(struct lkpi_spinlock *l)
 	l->owner_cpu = cpu;
 	l->owner_task = current_task ? (u64)current_task->id : LKPI_LOCK_NO_TASK;
 	if ((u32)cpu < MAX_CPUS && lkpi_locks_held[cpu]++ == 0) {
+		lkpi_irq_saved[cpu] = f;
 		lkpi_locks_entry_site[cpu] = l->acquired_at;
+		lkpi_note_callers(cpu);
 		lkpi_locks_entry_lock[cpu] = l;
 		lkpi_locks_entry_task[cpu] = l->owner_task;
 		lkpi_lock_check_armed = 1;
@@ -242,7 +290,9 @@ int lkpi_spin_trylock(struct lkpi_spinlock *l)
 	l->acquired_at = (u64)(usize)__builtin_return_address(0);
 	l->owner_cpu = (int)percpu_read(cpu_id);
 	if ((u32)l->owner_cpu < MAX_CPUS && lkpi_locks_held[l->owner_cpu]++ == 0) {
+		lkpi_irq_saved[l->owner_cpu] = f;
 		lkpi_locks_entry_site[l->owner_cpu] = l->acquired_at;
+		lkpi_note_callers((u32)l->owner_cpu);
 		lkpi_locks_entry_lock[l->owner_cpu] = l;
 		lkpi_locks_entry_task[l->owner_cpu] = l->owner_task;
 	}
@@ -291,12 +341,24 @@ void lkpi_spin_unlock(struct lkpi_spinlock *l)
 		console_write_dec((u64)percpu_read(cpu_id));
 		console_write("\n");
 	}
-	if ((u32)cpu < MAX_CPUS && lkpi_locks_held[cpu] > 0)
-		lkpi_locks_held[cpu]--;
+	/* Counted on the CPU releasing it: interrupts have been off since the
+	 * outermost acquire, so that is the CPU that took it. */
+	u32 here = percpu_read(cpu_id);
+	int last = 1;
+
+	if (here < MAX_CPUS && lkpi_locks_held[here] > 0) {
+		lkpi_locks_held[here]--;
+		last = lkpi_locks_held[here] == 0;
+		f = last ? lkpi_irq_saved[here] : 0;
+	}
 	l->flags = 0;
 	l->owner_cpu = -1;
 	l->owner_task = 0;
 	l->acquired_at = 0;
+	if (!last) {
+		spin_unlock((spinlock_t *)&l->raw);
+		return;
+	}
 	/*
 	 * Each lock restores the interrupt state its own acquire saw.
 	 *

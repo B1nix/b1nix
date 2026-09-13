@@ -14,7 +14,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 ARCH="${B1NIX_ARCH:-x86_64}"
 ROOTFS="$ROOT_DIR/build/$ARCH/rootfs"
 OUT="$ROOT_DIR/build/$ARCH/ports/busybox"
-CIC="$ROOT_DIR/tools/copy-if-changed.sh"
+CIC="$ROOT_DIR/tools/build/copy-if-changed.sh"
 
 rm -rf "$OUT/pkg"
 mkdir -p "$OUT/pkg"

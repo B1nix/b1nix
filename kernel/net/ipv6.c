@@ -162,10 +162,14 @@ void ipv6_receive(const void *data, usize size)
 
 	const void *payload = (const u8 *)data + sizeof(struct ipv6_header);
 
+	/* Unaligned copies: the header is packed, and its address members cannot
+	 * be passed by pointer. */
+	struct in6_addr_k src = hdr->src, dst = hdr->dst;
+
 	if (hdr->next_header == IP6_NH_ICMPV6) {
 		if (payload_len < 1)
 			return;
-		if (icmpv6_checksum(&hdr->src, &hdr->dst, IP6_NH_ICMPV6, payload,
+		if (icmpv6_checksum(&src, &dst, IP6_NH_ICMPV6, payload,
 		                    payload_len) != 0)
 			return;
 		u8 type = ((const u8 *)payload)[0];
@@ -177,7 +181,7 @@ void ipv6_receive(const void *data, usize size)
 			ndp_dispatch_receive(hdr->src, hdr->dst, type, payload,
 			                     payload_len);
 		} else {
-			icmpv6_receive(&hdr->src, &hdr->dst, payload, payload_len);
+			icmpv6_receive(&src, &dst, payload, payload_len);
 		}
 	} else if (hdr->next_header == IP6_NH_UDP) {
 		udp6_receive(hdr->src, hdr->dst, payload, payload_len);

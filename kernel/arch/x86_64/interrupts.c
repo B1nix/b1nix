@@ -1835,6 +1835,10 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
      * is torn down (its address space is still live here). */
     if (sig == SIGSEGV || sig == SIGABRT || sig == SIGILL || sig == SIGFPE ||
         sig == SIGBUS) {
+      /* The fault came from ring 3, so this is process context: the core
+       * is written through the filesystem, which may sleep, and an imported
+       * one refuses to with interrupts still masked from the exception. */
+      interrupts_enable();
       coredump_write(frame, sig);
       console_write("coredump: wrote /tmp/core\n");
     }

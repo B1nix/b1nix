@@ -348,6 +348,10 @@ void generic_shutdown_super(struct super_block *sb)
 		 */
 		dput(sb->s_root);
 		sb->s_root = NULL;
+		/* Cached inodes kept past their last reference: write, then evict,
+		 * as upstream's sync_filesystem + evict_inodes do here. */
+		sync_inodes_sb(sb);
+		evict_inodes(sb);
 		/*
 		 * put_super belongs inside this branch, exactly as upstream has it.
 		 * A superblock with no root never finished being filled — its

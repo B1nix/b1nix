@@ -15,7 +15,7 @@ device) and the guest drives the physical HDMI panel.
 - The iGPU must be alone in its IOMMU group.
 - QEMU needs `memlock` unlimited.
 
-`sh tools/drm/run-i915-passthrough.sh --preflight` prints the missing steps for
+`sh tools/run/run-i915-passthrough.sh --preflight` prints the missing steps for
 this machine; without arguments it runs the guest (env: `IGD_BDF`, `MEM_MB`,
 `TIMEOUT`, `MACHINE=legacy|q35`, `ISO`; log in `smoke_run/i915-passthrough.log`).
 
@@ -38,7 +38,7 @@ inittab under `b1nix.i915sway`.
 - **Display.** sway (wlroots, pixman) at the EDID's 1920x1080 with swaybg and
   foot, atomic modeset and page flips:
   [`images/m102a-sway-on-monitor.jpg`](images/m102a-sway-on-monitor.jpg).
-  Survives client start/quit/kill churn (workload in `tools/soak/`).
+  Survives client start/quit/kill churn (workload in `tools/run/soak/`).
 - **GT.** Four engines (rcs0, bcs0, vcs0, vecs0) on execlists, 4 GiB GGTT, full
   48-bit PPGTT; requests execute and retire, waiters are woken by the completion
   interrupt.

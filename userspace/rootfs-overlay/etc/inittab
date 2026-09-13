@@ -32,7 +32,7 @@
 ::wait:/bin/sh /etc/kde.sh
 
 # Soak hook: only does anything when the kernel cmdline carries b1nix.soak=<list>
-# — the overnight stress instance (see /etc/soak.sh and tools/soak/).
+# — the overnight stress instance (see /etc/soak.sh and tools/run/soak/).
 ::wait:/bin/sh /etc/soak.sh
 
 # Diagnostic hook: only does anything when the kernel cmdline carries

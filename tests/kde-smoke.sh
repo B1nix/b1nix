@@ -49,7 +49,7 @@ if [ "${KDE_NO_BUILD:-0}" != "1" ]; then
 fi
 
 mkdir -p "$DIR/smoke_run"
-flock "$DIR/smoke_run/.qemu.lock" sh "$DIR/tools/run-kde.sh" "$TAG" || true
+flock "$DIR/smoke_run/.qemu.lock" sh "$DIR/tools/run/run-kde.sh" "$TAG" || true
 
 if [ ! -f "$LOG" ]; then
 	echo "KDE-SMOKE: FAIL no log at $LOG"
@@ -103,7 +103,7 @@ bestf=
 if [ -d "$FRAMES" ]; then
 	for f in "$FRAMES"/frame-*.ppm; do
 		[ -f "$f" ] || continue
-		line=$(python3 "$DIR/tools/ppm-colours.py" "$f" 2>/dev/null) || continue
+		line=$(python3 "$DIR/tools/run/ppm-colours.py" "$f" 2>/dev/null) || continue
 		n=$(echo "$line" | sed -n 's/.*unique=\([0-9]*\).*/\1/p')
 		[ -n "$n" ] || continue
 		if [ "$n" -gt "$best" ]; then best=$n; bestf=$f; fi

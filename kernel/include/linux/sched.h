@@ -22,6 +22,8 @@ static inline void set_current_state(int state)
 {
 	if (state != TASK_RUNNING)
 		lkpi_prepare_to_sleep();
+	else
+		lkpi_cancel_sleep();
 }
 static inline void __set_current_state(int state) { set_current_state(state); }
 /* Sleep, and say how much of the sleep was left.
@@ -111,7 +113,7 @@ static inline int signal_pending_state(unsigned int state, void *task)
 /* An assertion that this context may allocate. GFP_ATOMIC never sleeps, so it
  * is always allowed; anything else may, and is checked the same way a sleeping
  * call is. */
-#define might_alloc(gfp) do { if (!((gfp) & __GFP_ATOMIC)) might_sleep(); } while (0)
+#define might_alloc(gfp) do { if (!((gfp) & (GFP_ATOMIC | GFP_NOWAIT))) might_sleep(); } while (0)
 
 
 /* Yield if something else is waiting. b1nix's scheduler is preemptive, so a

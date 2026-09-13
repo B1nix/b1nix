@@ -1,1 +1,0 @@
-check/check-b1cc-sync.sh

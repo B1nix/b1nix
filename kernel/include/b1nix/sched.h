@@ -851,6 +851,7 @@ u64  scheduler_peek_pending_signals(u64 mask);
 int  scheduler_consume_pending_signal(int sig);
 sighandler_t scheduler_get_sighandler(int sig);
 usize scheduler_get_pid(void);
+void scheduler_start_reaper(void);
 
 /* Reserve PID 1 for the next task created (the userspace init process). The
  * boot/idle task is PID 0, so 1 is otherwise never handed out. */

@@ -936,9 +936,12 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 		 * not a missing translation), bit1 = write, bit2 = from userspace. */
 		u32 dfsc = (u32)esr & 0x3f;
 		int translation_fault = (dfsc & 0x3c) == 0x04; /* 0b0001xx */
+		/* bit3: the interrupted context had IRQs unmasked (SPSR.I clear),
+		 * so the fault may do work that sleeps. */
 		u64 error_code = (translation_fault ? 0 : 1) |
 		                 ((esr & (1ULL << 6)) ? 2 : 0) |
-		                 (from_el0 ? 4 : 0);
+		                 (from_el0 ? 4 : 0) |
+		                 ((frame->spsr & (1ULL << 7)) ? 0 : 8);
 		if (vmm_handle_page_fault(far, error_code) == 0) {
 			if (from_el0)
 				arch_check_and_deliver_signals(frame);
@@ -1005,6 +1008,8 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 		 * before the task is torn down (same point x86_64 does it). */
 		{
 			extern void coredump_write(struct interrupt_frame *frame, int sig);
+			/* From EL0, so process context: the filesystem may sleep. */
+			interrupts_enable();
 			coredump_write(frame, sig);
 			console_write("coredump: wrote /tmp/core\n");
 		}

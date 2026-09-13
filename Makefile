@@ -79,8 +79,11 @@ INITRAMFS_NATIVE_SMOKE_INC := $(INC_DIR)/initramfs_native_smoke.inc
 # /lib/modules/$(B1NIX_RELEASE), together with the generated modules.dep /
 # modules.alias. The release subdirectory is what BusyBox's modprobe/modinfo/
 # depmod expect ($(uname -r), i.e. B1NIX_RELEASE_STR).
-B1NIX_VERSION := $(shell awk -F'"' '/^\#define B1NIX_VERSION_STR/{print $$2}' kernel/include/b1nix/version.h)
-B1NIX_ABI_RELEASE := $(shell awk -F'"' '/^\#define B1NIX_LINUX_ABI_RELEASE/{print $$2}' kernel/include/b1nix/version.h)
+# A literal '#' for awk: written as \# on the line itself, awk received the
+# backslash too and warned about it on every make.
+HASH := \#
+B1NIX_VERSION := $(shell awk -F'"' '/^$(HASH)define B1NIX_VERSION_STR/{print $$2}' kernel/include/b1nix/version.h)
+B1NIX_ABI_RELEASE := $(shell awk -F'"' '/^$(HASH)define B1NIX_LINUX_ABI_RELEASE/{print $$2}' kernel/include/b1nix/version.h)
 # Must match B1NIX_RELEASE_STR in <b1nix/version.h> exactly: it names the
 # /lib/modules directory the kernel looks in and the vermagic it checks.
 B1NIX_RELEASE := $(B1NIX_ABI_RELEASE)-b1nix-$(B1NIX_VERSION)
@@ -133,9 +136,9 @@ BB_SUID_APPLETS := su passwd login
 # The list of userspace programs that used to be embedded in the kernel image as
 # `xxd -i` is a vim binary, and a host without vim fails every .inc rule with
 # "xxd: command not found" -- an error that names a generated file and not the
-# missing package. tools/xxd-i.sh produces byte-identical output, so the build
+# missing package. tools/build/xxd-i.sh produces byte-identical output, so the build
 # uses whichever is present and needs neither documented as a prerequisite.
-XXD := $(shell command -v xxd 2>/dev/null || echo 'sh tools/xxd-i.sh')
+XXD := $(shell command -v xxd 2>/dev/null || echo 'sh tools/build/xxd-i.sh')
 
 # xxd byte arrays lived here, together with one .inc rule per program. Under
 # musl every one of them ships in the ext4 rootfs instead, and the variable that
@@ -298,9 +301,16 @@ endif
 # and a KDE build, in each direction. Each group's image is compared with its
 # own manifest instead, and a group restaged from its package root comes back
 # with the archive timestamps it left with, so the image is found up to date.
-# It also means a KDE image survives a smoke run: tools/run-kde.sh boots it as
+# It also means a KDE image survives a smoke run: tools/run/run-kde.sh boots it as
 # a disk with no rebuild.
-ROOT_IMAGE := $(BUILD_DIR)/root$(ROOT_VARIANT).ext4
+# Root filesystem type: btrfs (imported) or ext4. aarch64 stays on ext4 until
+# the imported btrfs is stable there (docs/roadmap.md M120).
+ifeq ($(ARCH),aarch64)
+ROOT_FS ?= ext4
+else
+ROOT_FS ?= btrfs
+endif
+ROOT_IMAGE := $(BUILD_DIR)/root$(ROOT_VARIANT).img
 CURL_ELF := $(PKGROOT)/usr/bin/curl
 DROPBEAR_ELF := $(PKGROOT)/usr/sbin/dropbear
 BMAKE_ELF := $(PKGROOT)/usr/bin/bmake
@@ -309,14 +319,9 @@ B1NIX_TLS ?= mbedtls
 
 # Kernel build toolchain selector (Clang/LLVM).
 TOOLCHAIN ?= clang
-MKE2FS := $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
-# Same resolution as MKE2FS: macOS ships neither, and a bare `debugfs` silently
-# resolved to nothing here — every `debugfs ... || true` below (the setuid bits,
-# /etc/shadow's mode, and the root-ownership pass) was quietly skipped.
-DEBUGFS := $(shell command -v debugfs 2>/dev/null || command -v /sbin/debugfs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/debugfs)
 # ISO builder. Limine (BSD-2-Clause) + xorriso replaced GRUB's grub-mkrescue
-# (GPLv3) — see tools/mkiso.sh and boot/limine/limine.conf.in.
-MKISO := tools/mkiso.sh
+# (GPLv3) — see tools/images/mkiso.sh and boot/limine/limine.conf.in.
+MKISO := tools/images/mkiso.sh
 # Copy into the staging root only where the bytes differ.
 #
 # The root image is repacked whenever anything under the staging tree is newer
@@ -324,7 +329,7 @@ MKISO := tools/mkiso.sh
 # `cp` of identical content still stamps a new mtime, so that test answered
 # "changed" on every build and the image was rewritten every time, including
 # the builds where only the kernel moved.
-CIC := tools/copy-if-changed.sh
+CIC := tools/build/copy-if-changed.sh
 # The PAM policies are written out and then copied, for the same reason.
 PAMSTAGE := $(BUILD_DIR)/.pam-stage
 LIMINE := $(shell command -v limine 2>/dev/null)
@@ -1285,7 +1290,7 @@ print-%:
 	iso-chromium-min-disk iso-chromium-min-disk-impl \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
-	install-kernel-source install-ports root-image disk-image \
+	install-kernel-source install-ports root-image \
 	run run-graphics run-x86_64 run-root check-tools clean distclean \
 	smoke smoke-quick graphics-smoke memory-smoke test-b1cc
 
@@ -1306,10 +1311,10 @@ KALLSYMS_O := $(BUILD_DIR)/kallsyms.o
 #   pass 2 → final kernel.elf with the blob appended into .kallsyms
 # The blob lands after .text/.rodata/.data, so the pass-1 addresses it records
 # remain correct in the final image.
-$(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT) tools/kernel/gen_kallsyms.sh
+$(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT) tools/build/kernel/gen_kallsyms.sh
 	@mkdir -p $(dir $@)
 	$(LD) $(ARCH_LDFLAGS) $(LD_ERROR_LIMIT) -T $(LINKER_SCRIPT) -o $@.stage1 $(OBJECTS)
-	NM='$(NM)' sh tools/kernel/gen_kallsyms.sh $@.stage1 > $(KALLSYMS_S)
+	NM='$(NM)' sh tools/build/kernel/gen_kallsyms.sh $@.stage1 > $(KALLSYMS_S)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $(KALLSYMS_S) -o $(KALLSYMS_O)
 	$(LD) $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $(OBJECTS) $(KALLSYMS_O)
 ifeq ($(ARCH),aarch64)
@@ -1385,15 +1390,15 @@ $(eval $(call B1NIX_MODULE_RULE,ntp,kernel/net/ntp.c))
 
 .PHONY: modules
 modules: $(MODULE_KOS)
-	sh tools/kernel/check-module-syms.sh $(MODULE_KOS)
+	sh tools/build/kernel/check-module-syms.sh $(MODULE_KOS)
 
 # Packaging also runs the symbol gate: a module with a symbol neither the
 # kernel nor another module exports fails the build instead of failing insmod.
-$(INITRAMFS_MODULES_INC): $(MODULE_KOS) tools/kernel/gen_modules_initramfs.sh \
+$(INITRAMFS_MODULES_INC): $(MODULE_KOS) tools/build/kernel/gen_modules_initramfs.sh \
                           kernel/module/ksyms.c kernel/include/b1nix/version.h
 	@mkdir -p $(dir $@)
-	sh tools/kernel/check-module-syms.sh $(MODULE_KOS)
-	NM='$(NM)' RELEASE='$(B1NIX_RELEASE)' BUILTIN='$(MODULES_BUILTIN)' sh tools/kernel/gen_modules_initramfs.sh $@ $(MODULE_KOS)
+	sh tools/build/kernel/check-module-syms.sh $(MODULE_KOS)
+	NM='$(NM)' RELEASE='$(B1NIX_RELEASE)' BUILTIN='$(MODULES_BUILTIN)' sh tools/build/kernel/gen_modules_initramfs.sh $@ $(MODULE_KOS)
 	@# Stage the same images into the rootfs under the CURRENT release. The
 	@# x86_64 flow gets this from root-image, but the aarch64 smoke lane only
 	@# builds kernel.elf and boots an ext4 image made straight from
@@ -1848,7 +1853,7 @@ $(LIBC_SO) $(LIBM_LIB): $(PKG_DEPS)
 	@# -sfn, not -sf: the target is a symlink to a DIRECTORY, and without
 	@# -n a relink either descends into it or fails outright with "File
 	@# exists" when a parallel job has re-created it between the rm above
-	@# and here. tools/ports/build-musl.sh already spells it this way.
+	@# and here. tools/toolchain/build-musl.sh already spells it this way.
 	@ln -sfn ../../pkg/musl build/$(ARCH)/ports/musl/install
 
 $(INITRAMFS_LD_MUSL_INC): $(LIBC_SO)
@@ -1858,32 +1863,32 @@ endif
 
 $(INC_DIR)/initramfs_m92_musl_dyn_smoke.inc: userspace/bin/helpers/m92_musl_dyn_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
-	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-dyn-smoke
+	tools/toolchain/bin/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-dyn-smoke
 	$(XXD) -i -n vfs_m92_musl_dyn_smoke_elf $(BUILD_DIR)/m92-musl-dyn-smoke > $@
 
 $(INC_DIR)/initramfs_m92_musl_ldso_smoke.inc: userspace/bin/helpers/m92_musl_ldso_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
-	tools/b1nix-musl-cc -ldso $< -o $(BUILD_DIR)/m92-musl-ldso-smoke
+	tools/toolchain/bin/b1nix-musl-cc -ldso $< -o $(BUILD_DIR)/m92-musl-ldso-smoke
 	$(XXD) -i -n vfs_m92_musl_ldso_smoke_elf $(BUILD_DIR)/m92-musl-ldso-smoke > $@
 
 $(INC_DIR)/initramfs_musl_posix_smoke.inc: userspace/bin/smoke/musl_posix_smoke.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
-	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/musl-posix-smoke
+	tools/toolchain/bin/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/musl-posix-smoke
 	$(XXD) -i -n vfs_musl_posix_smoke_elf $(BUILD_DIR)/musl-posix-smoke > $@
 
 $(INC_DIR)/initramfs_m92_musl_hello.inc: userspace/bin/helpers/m92_musl_hello.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
-	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-hello
+	tools/toolchain/bin/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-hello
 	$(XXD) -i -n vfs_m92_musl_hello_elf $(BUILD_DIR)/m92-musl-hello > $@
 
 $(INC_DIR)/initramfs_m92_musl_step2.inc: userspace/bin/helpers/m92_musl_step2.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
-	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-step2
+	tools/toolchain/bin/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-step2
 	$(XXD) -i -n vfs_m92_musl_step2_elf $(BUILD_DIR)/m92-musl-step2 > $@
 
 $(INC_DIR)/initramfs_m92_musl_raw_diag.inc: userspace/bin/helpers/m92_musl_raw_diag.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
-	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-raw-diag
+	tools/toolchain/bin/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-raw-diag
 	$(XXD) -i -n vfs_m92_musl_raw_diag_elf $(BUILD_DIR)/m92-musl-raw-diag > $@
 
 
@@ -1961,7 +1966,7 @@ iso: check-b1cc-sync root-image check-dynamic $(KERNEL_ELF)
 	@echo "============================================================"
 
 # Smoke-suite ISOs: single pattern rule for all categories.
-# Each suite gets its own cmdline; kernel ELF + root.ext4 are shared.
+# Each suite gets its own cmdline; kernel ELF + root.img are shared.
 # No `init=` on these: they boot the DEFAULT PID 1, /sbin/init (BusyBox init),
 # with /etc/inittab handing the runlevels to OpenRC — the configuration an
 # ordinary boot uses, so the whole suite runs on it rather than on a variant.
@@ -2015,7 +2020,7 @@ SMOKE_CMDLINE_switchroot=b1nix.test=1 b1nix.smoke=switchroot root=initramfs init
 # ran last decided which cmdline the other's run booted with — a wrong-image
 # trap that costs a whole passthrough boot to notice. This has its own name, so
 # one make invocation can produce the passthrough image and the smoke images
-# from the same kernel and the same root.ext4.
+# from the same kernel and the same root.img.
 SMOKE_CMDLINE_pass=b1nix.i915sway b1nix.use-cage b1nix.drm-debug b1nix.drm-debug-atomic
 # The same run under sway rather than cage, for the questions only the
 # compositor can answer. cage 0.1.5 has no debug switch at all — its -d means
@@ -2043,7 +2048,7 @@ SMOKE_CMDLINE_pass-bright=b1nix.i915sway b1nix.use-cage b1nix.bright b1nix.drm-d
 
 # The browser image without the root filesystem inside it.
 #
-# Carried as a boot module, root.ext4 is read off the emulated drive and copied
+# Carried as a boot module, root.img is read off the emulated drive and copied
 # into memory in full before the kernel even starts — 1.5 GB of it for the
 # browser build, which is the single largest part of a run's start-up. The
 # kernel already looks for a disk labelled b1nix-root before it considers the
@@ -2125,7 +2130,7 @@ SMOKE_ROOT_MODULE ?=
 # comfortable writable root on a disk, and 317 MB of it is free space these
 # lanes never touch. Same contents, room left to write in, a third of the read.
 ROOT_MODULE_SIZE ?= 288
-ROOT_MODULE = $(BUILD_DIR)/root-module.ext4
+ROOT_MODULE = $(BUILD_DIR)/root-module.img
 
 iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
 	@# The stage directory is reused between builds, so a module staged by an
@@ -2133,7 +2138,7 @@ iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-init iso-switchroot i
 	@# build asked for it or not. That is how images meant to be forty
 	@# megabytes kept coming out at five hundred and fifty.
 	@$(if $(or $(SMOKE_ROOT_MODULE),$(filter iso-blk iso-switchroot,$@)),,rm -f $(BUILD_DIR)/$@/boot/rootfs.img)
-	@$(if $(filter iso-blk iso-switchroot,$@),sh tools/images/trim-root-module.sh $(ROOT_IMAGE) $(ROOT_MODULE) $(ROOT_MODULE_SIZE),)
+	@$(if $(filter iso-blk iso-switchroot,$@),sh tools/images/trim-root-module.sh $(BUILD_DIR)/rootfs $(ROOT_IMAGE) $(ROOT_MODULE) $(ROOT_MODULE_SIZE),)
 	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
@@ -2151,13 +2156,13 @@ iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-init iso-switchroot i
 # relinks, instead of rebuilding userspace and repacking a filesystem image.
 # The soak instance: stressors, and nothing else.
 #
-# No rootfs module. Carried as a Multiboot2 module, root.ext4 is read off the
+# No rootfs module. Carried as a Multiboot2 module, root.img is read off the
 # emulated drive and copied into memory in full before the kernel starts, which
 # is half a gigabyte of start-up cost paid by every one of the hundreds of runs
 # an overnight soak makes. The kernel prefers a disk labelled b1nix-root, so the
 # runner attaches the same file as a virtio disk and it is read on demand — the
 # ISO drops from 577 MB to about 40 MB and the boot from tens of seconds to a
-# few. See tools/soak/run-soak.sh, which also attaches it read-only through a
+# few. See tools/run/soak/run-soak.sh, which also attaches it read-only through a
 # QEMU snapshot so parallel runs cannot tread on each other.
 #
 # SOAK_SPEC picks the workloads, SOAK_EXTRA carries the budget and scale. Both
@@ -2201,7 +2206,7 @@ userspace: $(USERSPACE_DEPS)
 .PHONY: iso-soak iso-soak-quick
 .PHONY: check-b1cc-sync
 check-b1cc-sync:
-	@tools/check-b1cc-sync.sh
+	@tools/check/check-b1cc-sync.sh
 
 userspace-install: userspace
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
@@ -2285,12 +2290,6 @@ install-kernel-source:
 # built the toolchain and then omitted it from the resulting image.
 iso-full: iso-live
 
-# Standalone-bootable disk image (MBR + Limine + ext4 root), excluding
-# V8/Chromium, for writing onto a real disk. Runs entirely unprivileged: `limine bios-install` writes the boot
-# stages straight into the image file, so no losetup/mount/root is involved.
-disk-image: root-image $(KERNEL_ELF)
-	sh tools/images/mk-disk-image.sh $(ARCH) $(BUILD_DIR)/b1nix-disk.img
-
 run: iso
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
 	$(QEMU_X86_64) -m $(RUN_MEM) -cdrom $(BUILD_DIR)/b1nix.iso -serial stdio -no-reboot -boot d \
@@ -2365,8 +2364,8 @@ bahamut-test:
 		FB_BOOT_MARKERS=$(BAHAMUT_SPLASH_FB) \
 		KERNEL_CMDLINE=$(BAHAMUT_TEST_CMDLINE) \
 		FB_FONT_SCALE=$(BAHAMUT_FONT_SCALE) build/aarch64/kernel.elf
-	sh tools/sony-xperia-5/mkramdisk_bahamut.sh
-	BAHAMUT_BOOTARGS=$(BAHAMUT_TEST_CMDLINE) python3 tools/sony-xperia-5/mkbootimg_bahamut.py
+	sh tools/boards/sony-xperia-5/mkramdisk_bahamut.sh
+	BAHAMUT_BOOTARGS=$(BAHAMUT_TEST_CMDLINE) python3 tools/boards/sony-xperia-5/mkbootimg_bahamut.py
 
 bahamut:
 	@rm -f build/aarch64/kernel.elf build/aarch64/Image
@@ -2378,24 +2377,24 @@ bahamut:
 	@# BusyBox, musl and the test binaries all live in the rootfs, which needs a
 	@# block device the phone does not provide. Built here so `make bahamut`
 	@# produces a bootable image.
-	sh tools/sony-xperia-5/mkramdisk_bahamut.sh
-	BAHAMUT_BOOTARGS=$(BAHAMUT_CMDLINE) python3 tools/sony-xperia-5/mkbootimg_bahamut.py
+	sh tools/boards/sony-xperia-5/mkramdisk_bahamut.sh
+	BAHAMUT_BOOTARGS=$(BAHAMUT_CMDLINE) python3 tools/boards/sony-xperia-5/mkbootimg_bahamut.py
 
 bahamut-fast:
 	$(MAKE) ARCH=aarch64 KERNEL_BASE=$(BAHAMUT_KERNEL_BASE) \
 		FB_BOOT_MARKERS=$(BAHAMUT_SPLASH_FB) \
 		KERNEL_CMDLINE=$(BAHAMUT_CMDLINE) \
 		FB_FONT_SCALE=$(BAHAMUT_FONT_SCALE) build/aarch64/kernel.elf
-	sh tools/sony-xperia-5/mkramdisk_bahamut.sh
-	python3 tools/sony-xperia-5/mkbootimg_bahamut.py
+	sh tools/boards/sony-xperia-5/mkramdisk_bahamut.sh
+	python3 tools/boards/sony-xperia-5/mkbootimg_bahamut.py
 
 run-rpi4: $(BUILD_DIR)/Image
 	@command -v qemu-system-aarch64 >/dev/null || (echo "missing qemu-system-aarch64"; exit 1)
-	qemu-system-aarch64 -machine raspi4b -m 2G -kernel $(BUILD_DIR)/Image -dtb tools/dts/bcm2711-rpi-4-b.dtb -serial stdio -serial null -display none
+	qemu-system-aarch64 -machine raspi4b -m 2G -kernel $(BUILD_DIR)/Image -dtb tools/boards/dts/bcm2711-rpi-4-b.dtb -serial stdio -serial null -display none
 
 run-rpi4-test: $(BUILD_DIR)/Image
 	@command -v qemu-system-aarch64 >/dev/null || (echo "missing qemu-system-aarch64"; exit 1)
-	qemu-system-aarch64 -machine raspi4b -m 2G -kernel $(BUILD_DIR)/Image -dtb tools/dts/bcm2711-rpi-4-b.dtb -serial stdio -serial null -display none -append "init=/bin/m12_smoke b1nix.test=1"
+	qemu-system-aarch64 -machine raspi4b -m 2G -kernel $(BUILD_DIR)/Image -dtb tools/boards/dts/bcm2711-rpi-4-b.dtb -serial stdio -serial null -display none -append "init=/bin/m12_smoke b1nix.test=1"
 
 run-x86_64: run
 
@@ -2443,12 +2442,12 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@# whenever anything in the tree is.
 	@printf '%s\n' "b1nix persistent root" | cmp -s - $(BUILD_DIR)/rootfs/etc/motd 2>/dev/null || \
 		printf '%s\n' "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
-	@# Smoke test runner (static file, not generated — edit tools/ports/00-smoke.start)
+	@# Smoke test runner (static file, not generated — edit tools/images/00-smoke.start)
 	@mkdir -p $(BUILD_DIR)/rootfs/etc/local.d
 	@# --mode rather than a chmod afterwards: a mode set after the copy leaves
 	@# the destination permanently unequal to its source, so it is copied again
 	@# on every build.
-	@$(CIC) --mode 755 tools/ports/00-smoke.start $(BUILD_DIR)/rootfs/etc/local.d/00-smoke.start
+	@$(CIC) --mode 755 tools/images/00-smoke.start $(BUILD_DIR)/rootfs/etc/local.d/00-smoke.start
 	@# M51 test font. The FreeType/HarfBuzz/Cairo/Fontconfig smokes open
 	@# /share/fonts/B1nixMono-Regular.ttf; it used to arrive via the xxd
 	@# initramfs (bootstrap-only since the ext4-root migration), so stage it
@@ -2656,7 +2655,7 @@ ifdef LIBC_SO
 	@# as a Linux binary. Its arch_prctl(ARCH_SET_FS) then went untranslated,
 	@# __init_tp() failed, and musl did what it does on that path: executed
 	@# `hlt`, which #GPs in ring 3. Every other musl binary is stamped the same
-	@# way (tools/b1nix-musl-cc); the loader was the one that was not. The copy
+	@# way (tools/toolchain/bin/b1nix-musl-cc); the loader was the one that was not. The copy
 	@# ignores that byte when comparing, so a loader already stamped is left
 	@# alone instead of being rewritten on every build.
 	@$(CIC) --osabi-linux $(LIBC_SO) $(BUILD_DIR)/rootfs/lib/$(LIBC_LDSO_NAME)
@@ -2886,7 +2885,7 @@ endif
 	done 2>/dev/null || true
 	@# Repacked, and stamped with the ownership every file in it must have,
 	@# only when the staged tree actually changed. See the script.
-	@MKE2FS='$(MKE2FS)' DEBUGFS='$(DEBUGFS)' ROOT_IMAGE_FORCE='$(ROOT_IMAGE_FORCE)' \
+	@ROOT_IMAGE_FORCE='$(ROOT_IMAGE_FORCE)' ROOT_FS='$(ROOT_FS)' \
 		sh tools/images/mk-root-image.sh $(BUILD_DIR)/rootfs $(ROOT_IMAGE) $(ROOT_IMAGE_SIZE)
 
 # Everything in the rootfs links dynamically against /lib/libc.so. This gate
@@ -2906,8 +2905,8 @@ endif
 # the torn-copy failure this script's own header warns about, arriving from our
 # own build rather than from a second one.
 check-dynamic: root-image
-	@sh tools/check-dynamic.sh $(BUILD_DIR)/rootfs
-	@sh tools/check-rootfs-links.sh $(BUILD_DIR)/rootfs
+	@sh tools/check/check-dynamic.sh $(BUILD_DIR)/rootfs
+	@sh tools/check/check-rootfs-links.sh $(BUILD_DIR)/rootfs
 
 check-ports:
 	@leaked=0; \
@@ -2977,7 +2976,7 @@ test-b1cc:
 # Needs build/native-clang/b1nix (clang + ld.lld) and a host kernel build (make
 # ARCH=x86_64 iso) for the staged .S/kallsyms objects. Wants >=16GB guest RAM.
 selfhost-clang:
-	sh tools/inguest/selfhost-proof.sh
+	sh tools/selfhost/selfhost-proof.sh
 
 graphics-smoke:
 	sh tests/graphics-smoke.sh $(ARCH)

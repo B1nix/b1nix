@@ -34,7 +34,7 @@ mkdir -p "$LOG_DIR"
 if [ "$RUN_ONLY" = "0" ]; then
   echo "[M92-MUSL] Building musl..."
   if [ ! -f "$MUSL_INSTALL/lib/libc.a" ]; then
-    tools/ports/build-musl.sh 2>&1
+    tools/toolchain/build-musl.sh 2>&1
   else
     echo "  musl already built at $MUSL_INSTALL"
   fi
@@ -47,7 +47,7 @@ if [ "$RUN_ONLY" = "0" ]; then
 
   # --- Step 2: Compile dynamic smoke test against musl -------------------------
   echo "[M92-MUSL] Compiling dynamic smoke test against musl..."
-  tools/b1nix-musl-cc -dynamic userspace/bin/helpers/m92_musl_dyn_test.c -o "$SMOKE_DYN_BIN" 2>&1
+  tools/toolchain/bin/b1nix-musl-cc -dynamic userspace/bin/helpers/m92_musl_dyn_test.c -o "$SMOKE_DYN_BIN" 2>&1
 
   if [ ! -f "$SMOKE_DYN_BIN" ]; then
     echo "[M92-MUSL] FAILED — dynamic smoke test compilation failed" >&2
@@ -59,7 +59,7 @@ if [ "$RUN_ONLY" = "0" ]; then
   echo "[M92-MUSL] Compiling userspace-ld.so smoke test against musl..."
   SMOKE_LDSO_BIN="build/m92-musl-ldso-smoke"
   SMOKE_LDSO_INC="build/x86_64/initramfs_m92_musl_ldso_smoke.inc"
-  tools/b1nix-musl-cc -ldso userspace/bin/helpers/m92_musl_ldso_test.c -o "$SMOKE_LDSO_BIN" 2>&1
+  tools/toolchain/bin/b1nix-musl-cc -ldso userspace/bin/helpers/m92_musl_ldso_test.c -o "$SMOKE_LDSO_BIN" 2>&1
 
   if [ ! -f "$SMOKE_LDSO_BIN" ]; then
     echo "[M92-MUSL] FAILED — ld.so smoke test compilation failed" >&2

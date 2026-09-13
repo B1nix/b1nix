@@ -2,7 +2,7 @@
  *
  * /mnt/build/cmds.txt holds one compile per line and /mnt/build/link.txt the
  * final link, each a tab-separated argv produced from the host build by
- * tools/inguest/build-selfhost-module.sh. Paths in them are relative to
+ * tools/selfhost/build-selfhost-module.sh. Paths in them are relative to
  * /mnt/build/src, and the toolchain is Alpine's clang and ld.lld under
  * /mnt/build/usr, whose libraries are found through LD_LIBRARY_PATH. */
 #include <errno.h>

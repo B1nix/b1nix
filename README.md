@@ -18,7 +18,7 @@ Implementation status per milestone is tracked in
 | `ARCH=` | Status |
 | --- | --- |
 | `x86_64` (default) | Primary target: QEMU (KVM) and real hardware |
-| `aarch64` | Second target of the same kernel: QEMU `virt`, Raspberry Pi 4, Sony Xperia 5 ([tools/sony-xperia-5](tools/sony-xperia-5/README.md)); gaps in [docs/aarch64-parity.md](docs/aarch64-parity.md) |
+| `aarch64` | Second target of the same kernel: QEMU `virt`, Raspberry Pi 4, Sony Xperia 5 ([tools/boards/sony-xperia-5](tools/boards/sony-xperia-5/README.md)); gaps in [docs/aarch64-parity.md](docs/aarch64-parity.md) |
 
 ## Host Requirements
 
@@ -56,7 +56,7 @@ Other images:
 
 | Target | Output |
 | --- | --- |
-| `make root-image` | `build/<arch>/root.ext4`, persistent root filesystem |
+| `make root-image` | `build/<arch>/root.img`, persistent root filesystem |
 | `make iso-live` | `build/<arch>/b1nix-live.iso`, ISO with a RAM-backed root |
 | `make iso-test` | `build/<arch>/b1nix-test.iso`, live image with test mode on |
 

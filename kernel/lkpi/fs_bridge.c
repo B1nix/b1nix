@@ -15,6 +15,8 @@
  */
 
 #include <linux/fs.h>
+#include <linux/fileattr.h>
+#include <linux/statfs.h>
 #include <linux/fs_context.h>
 #include <linux/namei.h>
 #include <linux/dcache.h>
@@ -213,7 +215,35 @@ int lkpi_bridge_attr(void *nodep, struct lkpi_bridge_attr *out)
 	out->mtime = (unsigned long long)inode->i_mtime.tv_sec;
 	out->ctime = (unsigned long long)inode_get_ctime(inode).tv_sec;
 	out->blocks = (unsigned long long)inode->i_blocks;
+	out->flags = 0;
+	if (inode->i_op && inode->i_op->fileattr_get) {
+		struct fileattr fa;
+
+		memset(&fa, 0, sizeof(fa));
+		if (inode->i_op->fileattr_get(d, &fa) == 0)
+			out->flags = fa.flags;
+	}
 	return 0;
+}
+
+int lkpi_bridge_set_flags(void *nodep, unsigned int flags)
+{
+	struct dentry *d = nodep;
+	struct inode *inode;
+	struct fileattr fa;
+	int ret;
+
+	if (!d || !d->d_inode)
+		return -EINVAL;
+	inode = d->d_inode;
+	if (!inode->i_op || !inode->i_op->fileattr_set)
+		return -EOPNOTSUPP;
+	fileattr_fill_flags(&fa, flags);
+	/* vfs_fileattr_set holds the inode lock around the call. */
+	inode_lock(inode);
+	ret = inode->i_op->fileattr_set(&nop_mnt_idmap, d, &fa);
+	inode_unlock(inode);
+	return ret;
 }
 
 /* ── data ───────────────────────────────────────────────────────── */
@@ -352,7 +382,14 @@ int lkpi_bridge_iterate(void *dirp, unsigned long long cookie,
 		bridge_close(&f);
 		return -ENOTDIR;
 	}
+	/*
+	 * Held shared, as iterate_dir() holds it: btrfs's readdir drops it,
+	 * retakes it exclusive and downgrades back, so without it the rwsem's
+	 * count went wrong and the next opendir of the directory waited forever.
+	 */
+	inode_lock_shared(d->d_inode);
 	ret = f.f_op->iterate_shared(&f, &probe.ctx);
+	inode_unlock_shared(d->d_inode);
 	bridge_close(&f);
 	/*
 	 * The position the filesystem left behind is the cookie to resume from.
@@ -398,12 +435,16 @@ int lkpi_bridge_create(void *dirp, const char *name, unsigned int mode)
 
 	if (!dir->d_inode->i_op || !dir->d_inode->i_op->create)
 		return -EOPNOTSUPP;
+	inode_lock(dir->d_inode);
 	d = bridge_lookup_negative(dir, name);
-	if (IS_ERR(d))
+	if (IS_ERR(d)) {
+		inode_unlock(dir->d_inode);
 		return (int)PTR_ERR(d);
+	}
 	ret = dir->d_inode->i_op->create(&nop_mnt_idmap, dir->d_inode, d,
 	                                 (umode_t)mode, 0);
 	dput(d);
+	inode_unlock(dir->d_inode);
 	return ret;
 }
 
@@ -415,12 +456,16 @@ int lkpi_bridge_mkdir(void *dirp, const char *name, unsigned int mode)
 
 	if (!dir->d_inode->i_op || !dir->d_inode->i_op->mkdir)
 		return -EOPNOTSUPP;
+	inode_lock(dir->d_inode);
 	d = bridge_lookup_negative(dir, name);
-	if (IS_ERR(d))
+	if (IS_ERR(d)) {
+		inode_unlock(dir->d_inode);
 		return (int)PTR_ERR(d);
+	}
 	ret = dir->d_inode->i_op->mkdir(&nop_mnt_idmap, dir->d_inode, d,
 	                                (umode_t)mode);
 	dput(d);
+	inode_unlock(dir->d_inode);
 	return ret;
 }
 
@@ -432,11 +477,15 @@ int lkpi_bridge_symlink(void *dirp, const char *name, const char *target)
 
 	if (!dir->d_inode->i_op || !dir->d_inode->i_op->symlink)
 		return -EOPNOTSUPP;
+	inode_lock(dir->d_inode);
 	d = bridge_lookup_negative(dir, name);
-	if (IS_ERR(d))
+	if (IS_ERR(d)) {
+		inode_unlock(dir->d_inode);
 		return (int)PTR_ERR(d);
+	}
 	ret = dir->d_inode->i_op->symlink(&nop_mnt_idmap, dir->d_inode, d, target);
 	dput(d);
+	inode_unlock(dir->d_inode);
 	return ret;
 }
 
@@ -451,11 +500,15 @@ int lkpi_bridge_link(void *dirp, const char *name, void *targetp)
 		return -EOPNOTSUPP;
 	if (!target || !target->d_inode)
 		return -ENOENT;
+	inode_lock(dir->d_inode);
 	d = bridge_lookup_negative(dir, name);
-	if (IS_ERR(d))
+	if (IS_ERR(d)) {
+		inode_unlock(dir->d_inode);
 		return (int)PTR_ERR(d);
+	}
 	ret = dir->d_inode->i_op->link(target, dir->d_inode, d);
 	dput(d);
+	inode_unlock(dir->d_inode);
 	return ret;
 }
 
@@ -485,13 +538,20 @@ int lkpi_bridge_unlink(void *dirp, const char *name)
 
 	if (!dir->d_inode->i_op || !dir->d_inode->i_op->unlink)
 		return -EOPNOTSUPP;
+	inode_lock(dir->d_inode);
 	d = bridge_lookup_positive(dir, name);
-	if (IS_ERR(d))
+	if (IS_ERR(d)) {
+		inode_unlock(dir->d_inode);
 		return (int)PTR_ERR(d);
+	}
+	/* vfs_unlink holds the victim's lock too; ext4's orphan list asserts it. */
+	inode_lock_nested(d->d_inode, I_MUTEX_CHILD);
 	ret = dir->d_inode->i_op->unlink(dir->d_inode, d);
+	inode_unlock(d->d_inode);
 	if (ret == 0)
 		d_delete(d);
 	dput(d);
+	inode_unlock(dir->d_inode);
 	return ret;
 }
 
@@ -503,14 +563,47 @@ int lkpi_bridge_rmdir(void *dirp, const char *name)
 
 	if (!dir->d_inode->i_op || !dir->d_inode->i_op->rmdir)
 		return -EOPNOTSUPP;
+	inode_lock(dir->d_inode);
 	d = bridge_lookup_positive(dir, name);
-	if (IS_ERR(d))
+	if (IS_ERR(d)) {
+		inode_unlock(dir->d_inode);
 		return (int)PTR_ERR(d);
+	}
+	inode_lock_nested(d->d_inode, I_MUTEX_CHILD);
 	ret = dir->d_inode->i_op->rmdir(dir->d_inode, d);
+	inode_unlock(d->d_inode);
 	if (ret == 0)
 		d_delete(d);
 	dput(d);
+	inode_unlock(dir->d_inode);
 	return ret;
+}
+
+/*
+ * The directory locks the VFS holds around namespace operations: the
+ * filesystems assume them. Two directories are taken in address order.
+ */
+static void bridge_lock_dirs(struct inode *a, struct inode *b)
+{
+	if (a == b) {
+		inode_lock(a);
+		return;
+	}
+	if (a > b) {
+		struct inode *t = a;
+
+		a = b;
+		b = t;
+	}
+	inode_lock(a);
+	inode_lock_nested(b, I_MUTEX_PARENT2);
+}
+
+static void bridge_unlock_dirs(struct inode *a, struct inode *b)
+{
+	inode_unlock(a);
+	if (b != a)
+		inode_unlock(b);
 }
 
 int lkpi_bridge_rename(void *olddirp, const char *oldname, void *newdirp,
@@ -523,18 +616,27 @@ int lkpi_bridge_rename(void *olddirp, const char *oldname, void *newdirp,
 
 	if (!olddir->d_inode->i_op || !olddir->d_inode->i_op->rename)
 		return -EOPNOTSUPP;
+	bridge_lock_dirs(olddir->d_inode, newdir->d_inode);
 	from = bridge_lookup_positive(olddir, oldname);
-	if (IS_ERR(from))
-		return (int)PTR_ERR(from);
+	if (IS_ERR(from)) {
+		ret = (int)PTR_ERR(from);
+		goto out;
+	}
 	to = lookup_one_len(newname, newdir, (int)strlen(newname));
 	if (IS_ERR(to)) {
 		dput(from);
-		return (int)PTR_ERR(to);
+		ret = (int)PTR_ERR(to);
+		goto out;
 	}
+	/* vfs_rename locks the moved inode and any it replaces. */
+	lock_two_nondirectories(from->d_inode, to->d_inode);
 	ret = olddir->d_inode->i_op->rename(&nop_mnt_idmap, olddir->d_inode, from,
 	                                    newdir->d_inode, to, 0);
+	unlock_two_nondirectories(from->d_inode, to->d_inode);
 	dput(to);
 	dput(from);
+out:
+	bridge_unlock_dirs(olddir->d_inode, newdir->d_inode);
 	return ret;
 }
 
@@ -601,6 +703,78 @@ int lkpi_bridge_chmod(void *nodep, unsigned int mode)
 	ret = d->d_inode->i_op->setattr(&nop_mnt_idmap, d, &attr);
 	inode_unlock(d->d_inode);
 	return ret;
+}
+
+int lkpi_bridge_setattr(void *nodep, unsigned int mode, unsigned int uid,
+                        unsigned int gid, unsigned long long atime,
+                        unsigned long long mtime)
+{
+	struct dentry *d = nodep;
+	struct inode *inode;
+	struct iattr attr;
+	int ret = 0;
+
+	if (!d || !d->d_inode)
+		return -EINVAL;
+	inode = d->d_inode;
+	if (!inode->i_op || !inode->i_op->setattr)
+		return -EOPNOTSUPP;
+	memset(&attr, 0, sizeof(attr));
+	if ((inode->i_mode & 07777) != (mode & 07777)) {
+		attr.ia_valid |= ATTR_MODE;
+		attr.ia_mode = (umode_t)((mode & 07777) | (inode->i_mode & S_IFMT));
+	}
+	if (__kuid_val(inode->i_uid) != uid) {
+		attr.ia_valid |= ATTR_UID;
+		attr.ia_uid = KUIDT_INIT(uid);
+	}
+	if (__kgid_val(inode->i_gid) != gid) {
+		attr.ia_valid |= ATTR_GID;
+		attr.ia_gid = KGIDT_INIT(gid);
+	}
+	if ((unsigned long long)inode->i_atime.tv_sec != atime) {
+		attr.ia_valid |= ATTR_ATIME | ATTR_ATIME_SET;
+		attr.ia_atime.tv_sec = (time64_t)atime;
+	}
+	if ((unsigned long long)inode->i_mtime.tv_sec != mtime) {
+		attr.ia_valid |= ATTR_MTIME | ATTR_MTIME_SET;
+		attr.ia_mtime.tv_sec = (time64_t)mtime;
+	}
+	if (!attr.ia_valid)
+		return 0;
+	attr.ia_valid |= ATTR_CTIME;
+	attr.ia_ctime = current_time(inode);
+	inode_lock(inode);
+	ret = inode->i_op->setattr(&nop_mnt_idmap, d, &attr);
+	inode_unlock(inode);
+	return ret;
+}
+
+int lkpi_bridge_statfs(void *nodep, struct lkpi_bridge_statfs *out)
+{
+	struct dentry *d = nodep;
+	struct kstatfs st;
+	int ret;
+
+	if (!d || !d->d_sb || !d->d_sb->s_op || !d->d_sb->s_op->statfs || !out)
+		return -EOPNOTSUPP;
+	memset(&st, 0, sizeof(st));
+	ret = d->d_sb->s_op->statfs(d, &st);
+	if (ret)
+		return ret;
+	out->type = (unsigned long long)st.f_type;
+	out->bsize = (unsigned long long)st.f_bsize;
+	out->blocks = st.f_blocks;
+	out->bfree = st.f_bfree;
+	out->bavail = st.f_bavail;
+	out->files = st.f_files;
+	out->ffree = st.f_ffree;
+	out->fsid = ((unsigned long long)(u32)st.f_fsid.val[1] << 32) |
+	            (u32)st.f_fsid.val[0];
+	out->namelen = (unsigned long long)st.f_namelen;
+	out->frsize = (unsigned long long)(st.f_frsize ? st.f_frsize : st.f_bsize);
+	out->flags = (unsigned long long)st.f_flags;
+	return 0;
 }
 
 /* ── extended attributes ────────────────────────────────────────── */

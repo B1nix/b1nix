@@ -1591,6 +1591,7 @@ int filemap_fdatawrite(struct address_space *mapping);
 int sync_inode_metadata(struct inode *inode, int wait);
 int sync_filesystem(struct super_block *sb);
 void sync_inodes_sb(struct super_block *sb);
+void evict_inodes(struct super_block *sb);
 int write_inode_now(struct inode *inode, int sync);
 
 /* ── whence ─────────────────────────────────────────────────────── */

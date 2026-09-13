@@ -245,13 +245,13 @@ report_progress_line() {
 }
 
 # The point of the share is that a rebuilt test binary reaches the guest without
-# repacking half a gigabyte of root.ext4: 00-smoke.start's run_test prefers
+# repacking half a gigabyte of root.img: 00-smoke.start's run_test prefers
 # /mnt/host/bin/<name> over the rootfs copy.
 #
 # It was doing neither. The source was build/<arch>/bin, which this tree has
 # never produced -- the staged binaries live in build/<arch>/rootfs/bin -- so
 # bin/ in the share stayed empty and every run_test silently fell back to the
-# rootfs, i.e. to whatever root.ext4 happened to hold. And the entries were
+# rootfs, i.e. to whatever root.img happened to hold. And the entries were
 # SYMLINKS to absolute host paths: QEMU's 9p with security_model=none hands the
 # guest the link itself, and /Users/... does not resolve inside the guest, so
 # they would not have worked even with the right source.
@@ -425,7 +425,7 @@ run_qemu() {
 
 			# The root filesystem, as a disk rather than inside the image.
 			#
-			# The x86_64 smoke images stopped carrying root.ext4 as a boot
+			# The x86_64 smoke images stopped carrying root.img as a boot
 			# module (SMOKE_ROOT_MODULE in the Makefile): it is copied into
 			# memory in full before the kernel starts, which costs half a
 			# gigabyte per lane. The kernel finds the disk by its b1nix-root
@@ -452,8 +452,8 @@ run_qemu() {
 			if [ -z "${SMOKE_ROOT_MODULE:-}" ] &&
 			   [ "${B1NIX_ISO_NAME:-}" != "b1nix-blk.iso" ] &&
 			   [ "${B1NIX_ISO_NAME:-}" != "b1nix-switchroot.iso" ] &&
-			   [ -f "$PROJECT_DIR/build/$ARCH/root.ext4" ]; then
-				set -- "$@" -drive file="$PROJECT_DIR/build/$ARCH/root.ext4",format=raw,if=virtio,snapshot=on
+			   [ -f "$PROJECT_DIR/build/$ARCH/root.img" ]; then
+				set -- "$@" -drive file="$PROJECT_DIR/build/$ARCH/root.img",format=raw,if=virtio,snapshot=on
 			fi
 		else
 			set -- ${qemu_bin} ${machine_args} ${accel_args} ${mem_args} ${cpu_args} \
@@ -599,7 +599,7 @@ run_qemu() {
 		if [ "${SMOKE_RASPI:-0}" = "1" ]; then
 			set -- qemu-system-aarch64 -machine raspi4b \
 				-kernel "$PROJECT_DIR/build/aarch64/Image.rpi" \
-				-dtb "$PROJECT_DIR/tools/dts/bcm2711-rpi-4-b.dtb" \
+				-dtb "$PROJECT_DIR/tools/boards/dts/bcm2711-rpi-4-b.dtb" \
 				-sd "$RASPI_SD" \
 				-serial stdio -serial null \
 				-display none -monitor none -no-reboot \
@@ -638,12 +638,12 @@ run_qemu() {
 			# (which with a large TIMEOUT meant 8-25 min hangs). Generous default so a
 			# slow-but-alive module (a big mmap, a long GC) is not killed mid-work.
 			last_progress_ts=$start_ts
-			# Long enough that the guest's own 280s silence guard fires
-			# first: that path ends the instance cleanly and reports every
-			# check it ran, where killing from here counts them all as
-			# BLOCKED. The slow ones are the TLS handshakes and the in-guest
-			# build, which are silent for minutes on a loaded host.
-			stall_after=${STALL_TIMEOUT:-180}
+			# Longer than the guest's own silence watchdog (two dumps of
+			# b1nix.silence, 20 s each on x86_64, 45 s on aarch64), so that
+			# path fires first: it dumps the tasks and reports every check it
+			# ran, where killing from here counts them all as BLOCKED.
+			if [ "$ARCH" = aarch64 ]; then _stall_default=120; else _stall_default=60; fi
+			stall_after=${STALL_TIMEOUT:-$_stall_default}
 			while :; do
 				line_count=$(wc -l <"$log" | tr -d ' ')
 				if [ "$line_count" -gt "$reported_lines" ]; then
@@ -880,27 +880,7 @@ else
 fi
 pass "kernel builds without errors"
 echo "  build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso} ready"
-if [ -z "$MKE2FS" ] || [ ! -x "$MKE2FS" ]; then
-    # Both tools from the SAME e2fsprogs, and preferably not from PATH.
-    #
-    # Homebrew keeps e2fsprogs keg-only: it links mke2fs and nothing else, and
-    # on a machine with android-platform-tools installed even that one is
-    # theirs. So `command -v mke2fs` answered /opt/homebrew/bin/mke2fs, its
-    # directory holds no debugfs, and the ownership pass below silently did
-    # nothing -- the guest rootfs kept the build host's uid, /bin/su elevated
-    # to 501 instead of root, and six checks failed with no visible cause but
-    # one warning line in a three-thousand-line log.
-    _e2fsdir=""
-    for _d in /opt/homebrew/opt/e2fsprogs/sbin /usr/local/opt/e2fsprogs/sbin /sbin /usr/sbin; do
-        if [ -x "$_d/mke2fs" ] && [ -x "$_d/debugfs" ]; then _e2fsdir="$_d"; break; fi
-    done
-    if [ -n "$_e2fsdir" ]; then
-        MKE2FS="$_e2fsdir/mke2fs"; DEBUGFS="$_e2fsdir/debugfs"
-    else
-        MKE2FS=$(command -v mke2fs 2>/dev/null || printf '%s' /sbin/mke2fs)
-        DEBUGFS=$(command -v debugfs 2>/dev/null || printf '%s' /sbin/debugfs)
-    fi
-fi
+MKE2FS=${MKE2FS:-$(command -v mke2fs 2>/dev/null || printf '%s' /sbin/mke2fs)}
 if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
     echo "Error: mke2fs utility not found. Please install e2fsprogs."
     exit 1
@@ -920,7 +900,7 @@ _mkimg() {  # mkimg <instance-suffix>
         dd if=/dev/zero of="$_usb" bs=1M count=2 2>/dev/null
         dd if=/dev/zero of="$(disk_img vblk "$1")" bs=1M count=4 2>/dev/null
         rm -f "$_sata"
-        if [ -f "$PROJECT_DIR/build/$ARCH/root.ext4" ]; then
+        if [ -f "$PROJECT_DIR/build/$ARCH/root.img" ]; then
             # Clone, do not copy. Every lane gets its own writable root, and
             # that root is half a gigabyte -- ten lanes meant five gigabytes
             # moved before a single instance booted, which is most of the gap
@@ -928,11 +908,11 @@ _mkimg() {  # mkimg <instance-suffix>
             # on btrfs/xfs) can give each lane a copy-on-write clone instead,
             # which costs nothing until something writes. `cp -c` fails on a
             # filesystem that cannot do it, so fall back to the real copy.
-            cp -c "$PROJECT_DIR/build/$ARCH/root.ext4" "$_sata" 2>/dev/null ||
-                cp -f "$PROJECT_DIR/build/$ARCH/root.ext4" "$_sata"
+            cp -c "$PROJECT_DIR/build/$ARCH/root.img" "$_sata" 2>/dev/null ||
+                cp -f "$PROJECT_DIR/build/$ARCH/root.img" "$_sata"
             # Stamp it with THIS run's time. A clone carries the source's
             # mtime, and the prune below deletes anything in smoke_run older
-            # than an hour -- so once the build stopped rebuilding root.ext4
+            # than an hour -- so once the build stopped rebuilding root.img
             # every run (the stamps in the Makefile), the clone inherited an
             # mtime from hours ago and was deleted before QEMU could open it.
             # Every lane then died with "Could not open ... No such file or
@@ -940,18 +920,10 @@ _mkimg() {  # mkimg <instance-suffix>
             # from two separate changes that were each correct alone.
             touch "$_sata"
         else
-            "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q \
-                -L b1nix-root -d "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512m || {
+            ROOT_FS="${ROOT_FS:-ext4}" sh "$PROJECT_DIR/tools/images/mk-root-image.sh" "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512 >/dev/null || {
                 echo "Error: Failed to build aarch64 rootfs image."; exit 1
             }
-            _debugfs="$DEBUGFS"
-            if [ -x "$_debugfs" ]; then
-                ( cd "$PROJECT_DIR/build/$ARCH/rootfs" && find . -mindepth 1 ) |
-                    sed 's|^\.||' |
-                    awk '{ printf "sif %s uid 0\nsif %s gid 0\n", $0, $0 }' |
-                    "$_debugfs" -w -f - "$_sata" >/dev/null 2>&1 || true
-                DEBUGFS="$_debugfs" sh "$PROJECT_DIR/tools/images/stamp-root-modes.sh" "$_sata"
-            fi
+            rm -f "$_sata.manifest"
         fi
         "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_nvme" 2>/dev/null
         # A separate image for the AHCI controller: on this arch $_sata is the
@@ -1349,7 +1321,7 @@ launch_raspi() {
 		# the front of a 1 GiB one.
 		rm -f "$RASPI_SD"
 		dd if=/dev/zero of="$RASPI_SD" bs=1m count=1024 2>/dev/null
-		dd if="$PROJECT_DIR/build/$ARCH/root.ext4" of="$RASPI_SD" \
+		dd if="$PROJECT_DIR/build/$ARCH/root.img" of="$RASPI_SD" \
 			conv=notrunc 2>/dev/null
 		SMOKE_RASPI=1
 		# The board lane runs the minimal userspace profile. The full sys set
@@ -1753,10 +1725,10 @@ check_output "$LOG" "M94-INIT: ok \(default\|init=\|no-override-flags\)" "M94 in
 # is not in tools/configs/static-allowlist.txt with a reason. Run the same gate
 # the build uses, so a regression shows up as a failed check and not only as a
 # build error someone might bypass.
-if sh "$PROJECT_DIR/tools/check-dynamic.sh" "$PROJECT_DIR/build/$ARCH/rootfs" >/dev/null 2>&1; then
+if sh "$PROJECT_DIR/tools/check/check-dynamic.sh" "$PROJECT_DIR/build/$ARCH/rootfs" >/dev/null 2>&1; then
 	pass "rootfs has no unexpected statically linked executables"
 else
-	fail "rootfs has no unexpected statically linked executables" "$(sh "$PROJECT_DIR/tools/check-dynamic.sh" "$PROJECT_DIR/build/$ARCH/rootfs" 2>&1 | head -3 | tr '\n' ' ')"
+	fail "rootfs has no unexpected statically linked executables" "$(sh "$PROJECT_DIR/tools/check/check-dynamic.sh" "$PROJECT_DIR/build/$ARCH/rootfs" 2>&1 | head -3 | tr '\n' ' ')"
 fi
 check_output "$LOG" "M94-CTL: ok tmpfs-mount" "tmpfs mounts on a VFS directory (the /run an init system expects)"
 check_output "$LOG" "M94-CTL: ok tmpfs-state" "state written through a dirfd inside the tmpfs is visible afterwards"

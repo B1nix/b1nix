@@ -75,7 +75,7 @@ compiler-rt   compiler-rt
 # dropbear is four packages because Alpine ships each tool separately rather
 # than as one multi-call binary; busybox-binsh is the /bin/sh symlink.
 # runit is absent: Alpine links it statically, which the rootfs gate rejects
-# (tools/check-dynamic.sh). OpenRC is staged by tools/packages/stage-openrc.sh.
+# (tools/check/check-dynamic.sh). OpenRC is staged by tools/packages/stage-openrc.sh.
 #
 # Mesa's userspace is named here rather than left to the SONAME closure, which
 # is what used to drag it in: wlroots records libEGL.so.1, libgbm.so.1 and

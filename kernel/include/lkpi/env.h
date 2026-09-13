@@ -139,6 +139,9 @@ struct lkpi_task {
 	 * a GPU does — woke a task that had not yet slept, and the task then slept
 	 * out its whole timeout. */
 	volatile int wake_pending;
+	/* set_current_state() asked for a sleep and schedule() has not yet
+	 * carried it out; TASK_RUNNING takes it back. */
+	int sleep_requested;
 	/* The calling process's address space. b1nix's is not a struct mm_struct
 	 * and nothing here can walk it from another task — see find_vma() in
 	 * <linux/mm.h> — so this is always NULL and exists because imported code
@@ -193,6 +196,7 @@ struct lkpi_task *lkpi_current(void);
 int lkpi_wake_task(struct lkpi_task *t);
 /* Arm the park: what set_current_state() means here. */
 void lkpi_prepare_to_sleep(void);
+void lkpi_cancel_sleep(void);
 
 /* ── userspace access ───────────────────────────────────────────── */
 /* Return 0 on success, non-zero on fault — validated against the calling

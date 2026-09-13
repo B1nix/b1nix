@@ -491,17 +491,10 @@ void __iget(struct inode *inode)
 		atomic_inc(&inode->i_count);
 }
 
-void iput(struct inode *inode)
+static void evict(struct inode *inode)
 {
-	struct super_block *sb;
+	struct super_block *sb = inode->i_sb;
 	unsigned long flags;
-
-	if (!inode)
-		return;
-	if (!atomic_dec_and_test(&inode->i_count))
-		return;
-
-	sb = inode->i_sb;
 
 	spin_lock_irqsave(&inode->i_lock, flags);
 	inode->i_state |= I_FREEING;
@@ -532,6 +525,49 @@ void iput(struct inode *inode)
 		sb->s_op->free_inode(inode);
 	else
 		kfree(inode);
+}
+
+void iput(struct inode *inode)
+{
+	struct super_block *sb;
+	int drop;
+
+	if (!inode)
+		return;
+	if (!atomic_dec_and_test(&inode->i_count))
+		return;
+
+	sb = inode->i_sb;
+	drop = (sb && sb->s_op && sb->s_op->drop_inode) ?
+	       sb->s_op->drop_inode(inode) : generic_drop_inode(inode);
+	/*
+	 * A file that still has a name stays cached with no references, as
+	 * upstream's iput_final keeps it. Evicting it on the last put threw away
+	 * its page cache -- including data written and not yet flushed, which
+	 * btrfs holds as delalloc -- so `cp a b; mv b c` lost the file's contents
+	 * when the rename dropped b's dentry. The superblock evicts what is left
+	 * at unmount (evict_inodes).
+	 */
+	if (!drop && sb && (sb->s_flags & SB_ACTIVE))
+		return;
+	if (!drop)
+		filemap_write_and_wait(inode->i_mapping);
+	evict(inode);
+}
+
+/* Evict every cached inode nothing references any more. Called at unmount,
+ * after the dentries are gone and before the filesystem's put_super. */
+void evict_inodes(struct super_block *sb)
+{
+	struct inode *inode, *next;
+
+	list_for_each_entry_safe(inode, next, &sb->s_inodes, i_sb_list) {
+		if (atomic_read(&inode->i_count) != 0)
+			continue;
+		if (inode->i_state & (I_NEW | I_FREEING))
+			continue;
+		evict(inode);
+	}
 }
 
 int generic_drop_inode(struct inode *inode)

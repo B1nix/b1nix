@@ -178,7 +178,15 @@ int lkpi_diag_watch_report(u64 min_ms)
  * scheduler finds no live task and does nothing. */
 void lkpi_prepare_to_sleep(void)
 {
-	lkpi_current()->wake_pending = 0;
+	struct lkpi_task *t = lkpi_current();
+
+	t->wake_pending = 0;
+	t->sleep_requested = 1;
+}
+
+void lkpi_cancel_sleep(void)
+{
+	lkpi_current()->sleep_requested = 0;
 }
 
 int lkpi_wake_task(struct lkpi_task *t)
@@ -229,6 +237,8 @@ u64 lkpi_sleep_jiffies(u64 jiffies_count)
    */
   if (scheduler_wait_armed())
     scheduler_wait_cancel();
+  /* The timed sleep is what set_current_state() was arming. */
+  lkpi_current()->sleep_requested = 0;
 	}
 
 	/*
@@ -409,7 +419,21 @@ void lkpi_wait_commit(void)
   scheduler_wait_commit();
 }
 
-void lkpi_wait_cancel(void) { scheduler_wait_cancel(); }
+/* finish_wait() is called with a spinlock held as often as without one --
+ * btrfs's wait_on_state retakes the tree lock between schedule() and it. Turning
+ * interrupts on there broke the lock's interrupts-off section, and the holder
+ * was switched out with the lock taken. Under a lock the unlock restores the
+ * state instead. */
+void lkpi_wait_cancel(void)
+{
+	extern int lkpi_holding_spinlock(void);
+	extern void scheduler_wait_cancel_keep_irqs(void);
+
+	if (lkpi_holding_spinlock())
+		scheduler_wait_cancel_keep_irqs();
+	else
+		scheduler_wait_cancel();
+}
 
 void lkpi_schedule(void)
 {
@@ -417,10 +441,33 @@ void lkpi_schedule(void)
                   (u64)(usize)__builtin_frame_address(0));
   /* The second phase of a park, when one was armed; otherwise what a bare
    * schedule() asks for. See the note on schedule() in <linux/sched.h>. */
-  if (scheduler_wait_armed())
+  if (scheduler_wait_armed()) {
     scheduler_wait_commit();
-  else
-    scheduler_yield();
+    return;
+  }
+  /*
+   * set_current_state(TASK_INTERRUPTIBLE); schedule(); is a sleep until
+   * wake_up_process(), not a yield. As a yield, btrfs's cleaner thread spun
+   * through its idle loop forever, and the stride picker kept choosing it
+   * over the reclaim worker a blocked transaction was waiting on.
+   *
+   * Sleep in slices, returning on the wake or after a bounded wait: a waker
+   * that reaches the task through a wait queue rather than by task does not
+   * set wake_pending, and every such caller re-tests its condition after
+   * schedule() returns.
+   */
+  {
+    struct lkpi_task *t = lkpi_current();
+
+    if (t->sleep_requested) {
+      t->sleep_requested = 0;
+      for (int i = 0; i < 10 && !t->wake_pending; i++)
+        scheduler_sleep_ticks(1);
+      t->wake_pending = 0;
+      return;
+    }
+  }
+  scheduler_yield();
 }
 
 void lkpi_wake_all(void *chan)
@@ -842,6 +889,9 @@ void lkpi_might_sleep(const char *where)
       console_write("\n");
       arch_backtrace((u64)(usize)__builtin_frame_address(0),
                      (u64)(usize)__builtin_return_address(0));
+      /* Imported objects have no frame chain; the raw stack still names
+       * the path that got here with interrupts off. */
+      dump_raw_stack_with_symbols((u64)(usize)__builtin_frame_address(0), 400);
     }
   }
 

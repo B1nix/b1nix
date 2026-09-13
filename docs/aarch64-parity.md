@@ -12,7 +12,7 @@ a gap.
 |---|---|
 | QEMU `virt` (the smoke suite) | `sh tests/smoke.sh aarch64` — boots `build/aarch64/Image` directly (no GRUB ISO), root on virtio-blk over virtio-mmio; `make run-aarch64` for a bare boot |
 | Raspberry Pi 4 (QEMU `raspi4b`) | `make run-rpi4` / `run-rpi4-test`; in the suite with `SMOKE_RASPI_LANE=1` (SD card root, spin-table SMP, `M109-RPI` firmware/GPIO/timer checks) |
-| Sony Xperia 5 (bahamut) | `make bahamut` (normal boot), `bahamut-test` (smoke lane `BAHAMUT_SMOKE_LANE`, results on the panel with `b1nix.keep-running`); tools in `tools/sony-xperia-5/` |
+| Sony Xperia 5 (bahamut) | `make bahamut` (normal boot), `bahamut-test` (smoke lane `BAHAMUT_SMOKE_LANE`, results on the panel with `b1nix.keep-running`); tools in `tools/boards/sony-xperia-5/` |
 
 Suite layout on `virt`: the same lanes as x86_64 with AHCI, NVMe, xHCI, e1000,
 virtio-gpu and virtio-tablet reached over PCIe ECAM. The `sys` lane gets 2 CPUs

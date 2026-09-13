@@ -311,26 +311,32 @@ static usize g_last_pick_id = (usize)-1;
 static int  g_task_is_thread[TASK_SLOTS];
 static u64  g_task_tls_base[TASK_SLOTS];
 
-/* Non-preemptible depth, per CPU. Imported drivers ask for this around short
- * register polls; see lkpi_preempt_disable. Interrupts stay on, so the only
- * effect is that the timer tick does not yield here. */
-static volatile u32 g_preempt_depth[MAX_CPUS];
+/* Non-preemptible depth, per TASK. Imported drivers and the page cache ask for
+ * this around short sections; interrupts stay on, so the only effect is that
+ * the timer tick does not yield while it is non-zero.
+ *
+ * It was per CPU, and a section that ended on another CPU than it began --
+ * imported code that sleeps inside one, then resumes elsewhere -- left the
+ * first CPU's count positive for good. That CPU never preempted again: every
+ * kernel thread bound to it (the btrfs reclaim worker among them) stayed READY
+ * forever, which is the "READY tasks not picked" wedge. Kept with the task,
+ * the count travels with the code that raised it. */
+static volatile u32 g_task_preempt_depth[TASK_SLOTS];
+static usize task_index(const struct task *task);
 
 void scheduler_preempt_disable(void) {
   u64 flags = interrupts_save();
-  u32 cpu = (u32)percpu_read(cpu_id);
 
-  if (cpu < MAX_CPUS)
-    g_preempt_depth[cpu]++;
+  if (current_task)
+    g_task_preempt_depth[task_index(current_task)]++;
   interrupts_restore(flags);
 }
 
 void scheduler_preempt_enable(void) {
   u64 flags = interrupts_save();
-  u32 cpu = (u32)percpu_read(cpu_id);
 
-  if (cpu < MAX_CPUS && g_preempt_depth[cpu] > 0)
-    g_preempt_depth[cpu]--;
+  if (current_task && g_task_preempt_depth[task_index(current_task)] > 0)
+    g_task_preempt_depth[task_index(current_task)]--;
   interrupts_restore(flags);
 }
 static u64  g_task_child_tid_clear[TASK_SLOTS];
@@ -695,11 +701,15 @@ static usize next_task_id = 2;
 static int g_task_vfork_pending[TASK_SLOTS];
 static usize g_task_vfork_id[TASK_SLOTS];
 
+/* Pid 1 is reserved for the next user process. Only kthread_create_user may
+ * take it: a filesystem worker started while init's path is being looked up
+ * would otherwise become pid 1, and BusyBox init refuses to run as anything
+ * else. */
 static int g_reserve_init_pid = 0;
 
 /* Claim the next task id. Caller must hold g_tasks_lock. */
-static usize claim_task_id(void) {
-  if (g_reserve_init_pid) {
+static usize claim_task_id(int user) {
+  if (user && g_reserve_init_pid) {
     g_reserve_init_pid = 0;
     return 1;
   }
@@ -727,7 +737,7 @@ struct runqueue *sched_global_rq(void) { return &g_global_rq; }
  * ~256 KiB BSS for slots that may never run. Pointer table costs 512 B. */
 
 
-static struct task *find_unused_task(void);
+static struct task *find_unused_task(int user);
 static usize task_index(const struct task *task);
 extern u64 g_task_affinity_fwd_unused;
 
@@ -1189,7 +1199,7 @@ static u64 sched_birth_pass(void) {
   return seen ? min : g_min_pass;
 }
 
-static struct task *find_unused_task(void) {
+static struct task *find_unused_task(int user) {
   u64 flags;
   tasks_lock(&flags);
 
@@ -1217,6 +1227,7 @@ static struct task *find_unused_task(void) {
       memset(T(i), 0, sizeof(struct task));
       /* M29: clear side-table metadata so the reused slot starts clean. */
       g_task_is_thread[i] = 0;
+      g_task_preempt_depth[i] = 0;
       g_task_tls_base[i] = 0;
       g_task_child_tid_clear[i] = 0;
       g_task_saved_sigmask[i] = 0;
@@ -1297,7 +1308,7 @@ static struct task *find_unused_task(void) {
        * further clamps to the global /proc/sys/kernel/coredump-max). */
       g_task_rlimits[i][RLIMIT_CORE].rlim_cur = 1024 * 1024;
       T(i)->state = TASK_BLOCKED;
-      T(i)->id = claim_task_id();
+      T(i)->id = claim_task_id(user);
       tasks_unlock(flags);
       return T(i);
     }
@@ -1354,7 +1365,7 @@ static struct task *find_unused_task(void) {
   /* M77: default core-dump soft cap of 1 MiB. */
   g_task_rlimits[i][RLIMIT_CORE].rlim_cur = 1024 * 1024;
   T(i)->state = TASK_BLOCKED;
-  T(i)->id = claim_task_id();
+  T(i)->id = claim_task_id(user);
   tasks_unlock(flags);
   return T(i);
 }
@@ -2263,7 +2274,7 @@ extern void ap_worker_trampoline(void);
 
 static int kthread_create_impl(const char *name, kernel_thread_entry entry,
                                void *arg, void (*trampoline)(void),
-                               int stealable, int ap_runnable) {
+                               int stealable, int ap_runnable, int user) {
   /* Save and restore, never a bare enable.
    *
    * This turned interrupts ON for whatever called it, whatever state that
@@ -2276,7 +2287,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   struct task *parent_task = current_task;
   /* find_unused_task atomically claims the slot, marks it BLOCKED (reserved
    * until fully initialized), and assigns its id. */
-  struct task *task = find_unused_task();
+  struct task *task = find_unused_task(user);
   interrupts_restore(irqflags);
 
   if (task == 0) {
@@ -2375,7 +2386,10 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
     task->fd_table = 0;
     task->fd_flags = 0;
     task->fd_lock = 0;
-  } else if (parent_task) {
+  } else if (parent_task && (user || !parent_task->user_image)) {
+    /* Not for a kernel thread started inside a process's syscall: holding a
+     * copy of the process's descriptors, a filesystem worker kept the write
+     * end of a pipe open forever and the reader never saw end-of-file. */
     task->fd_capacity = parent_task->fd_capacity;
     task->fd_table = kzalloc(task->fd_capacity * sizeof(struct vfs_handle *));
     task->fd_flags = kzalloc(task->fd_capacity * sizeof(int));
@@ -2406,6 +2420,15 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
     memcpy(task->env, parent_task->env, sizeof(task->env));
     task->pml4_phys = 0;
     task->vma_list = 0;
+    /* A kernel thread started from inside a process's syscall (imported
+     * filesystems spawn workers on demand) is not that process's child: a
+     * waitpid(-1) would wait for it forever, and a kill of the process group
+     * would reach it. */
+    if (!user && parent_task->user_image) {
+      task->parent_id = 0;
+      task->process_group_id = task->id;
+      task->session_id = task->id;
+    }
   } else {
     task->cwd[0] = '/';
     task->cwd[1] = '\0';
@@ -2452,18 +2475,18 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
 }
 
 int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
-  return kthread_create_impl(name, entry, arg, kernel_thread_trampoline, 0, 0);
+  return kthread_create_impl(name, entry, arg, kernel_thread_trampoline, 0, 0, 0);
 }
 
 int kthread_create_user(const char *name, kernel_thread_entry entry, void *arg,
                         int ap_runnable) {
   return kthread_create_impl(name, entry, arg, kernel_thread_trampoline, 0,
-                             ap_runnable);
+                             ap_runnable, 1);
 }
 
 int sched_create_stealable_worker(const char *name, kernel_thread_entry entry,
                                   void *arg) {
-  int id = kthread_create_impl(name, entry, arg, ap_worker_trampoline, 1, 0);
+  int id = kthread_create_impl(name, entry, arg, ap_worker_trampoline, 1, 0, 0);
 
   /* Tell the other CPUs there is something to steal. On x86_64 this is a
    * reschedule IPI and mostly redundant — an idle AP is spinning on the
@@ -2569,7 +2592,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   }
 
   interrupts_disable();
-  struct task *child = find_unused_task();
+  struct task *child = find_unused_task(0);
   if (!child) {
     interrupts_enable();
     kfree(child_stack);
@@ -3823,7 +3846,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   if (!kstack) { kfree(cta); return -ENOMEM; }
 
   interrupts_disable();
-  struct task *child = find_unused_task();
+  struct task *child = find_unused_task(0);
   interrupts_enable();
   if (!child) { kfree(kstack); kfree(cta); return -EAGAIN; }
 
@@ -4218,6 +4241,8 @@ void scheduler_reap_dead_threads(void) {
  * below so scheduler_yield only walks the table while zombies may exist. The
  * sweep clears it again once no process zombie remains. */
 static int g_have_proc_zombies = 0;
+static char g_reaper_chan;
+static int g_reaper_started;
 
 /* Reap process zombies that can never be collected by waitpid because they have
  * no living parent — e.g. a daemon backgrounded by a shell that has since
@@ -4342,13 +4367,21 @@ int scheduler_yield(void) {
    * yield so the kernel-stack heap pressure of short-lived threads stays
    * bounded. Skip when no threads have ever been created — the walk is
    * O(g_task_hwm) which is nontrivial overhead on every yield otherwise. */
+  /* Reaping tears down address spaces and closes descriptors, which reaches
+   * filesystems -- an imported one takes its own spinlocks and may sleep, and
+   * doing that from inside the scheduler's own prologue switched tasks with a
+   * linuxkpi lock held. Once the reaper thread runs, the yield only wakes it. */
   extern int g_has_any_thread;
-  if (g_has_any_thread) scheduler_reap_dead_threads();
-
-  /* Reap orphaned process zombies (no living parent) so daemons whose shell
-   * parent has exited don't leak their slot/address space forever. Gated so
-   * the table walk only runs while a process zombie may exist. */
-  if (g_have_proc_zombies) scheduler_reap_orphan_zombies();
+  if (g_reaper_started) {
+    if (g_has_any_thread || g_have_proc_zombies)
+      scheduler_wake_all(&g_reaper_chan);
+  } else {
+    if (g_has_any_thread) scheduler_reap_dead_threads();
+    /* Reap orphaned process zombies (no living parent) so daemons whose shell
+     * parent has exited don't leak their slot/address space forever. Gated so
+     * the table walk only runs while a process zombie may exist. */
+    if (g_have_proc_zombies) scheduler_reap_orphan_zombies();
+  }
 
   /* Deliver pending signals for current task */
   if (current_task) {
@@ -5260,10 +5293,14 @@ int scheduler_wait_armed(void) {
          __atomic_load_n(&current_task->state, __ATOMIC_SEQ_CST) == TASK_BLOCKED;
 }
 
-void scheduler_wait_cancel(void) {
+void scheduler_wait_cancel_keep_irqs(void) {
   current_task->wait_chan = 0;
   current_task->wake_tick = 0;
   current_task->state = TASK_RUNNING;
+}
+
+void scheduler_wait_cancel(void) {
+  scheduler_wait_cancel_keep_irqs();
   interrupts_enable();
 }
 
@@ -5496,13 +5533,32 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
  * actually ended the run (m32_smoke's TLS section, which costs every check
  * after it in the lane) then produced no dump at all and had to be chased
  * blind. Output resuming means the instance moved on, so the budget resets. */
-/* 60 seconds of silence, in ticks. NOT a constant: the scheduler tick has been
- * programmed at 1 kHz since the LAPIC timer took it over, and the 100 that used
- * to be written here made this a SIX second watchdog -- short enough that an
- * ordinary slow test (a bounded probe loop, a TLS handshake) read as a wedge and
- * took the rest of the lane down with it. sched_tick_hz() reports what the timer
- * was actually armed with. */
-#define SILENCE_WATCHDOG_TICKS (60ull * sched_tick_hz())
+/* Seconds of guest time with no console output before a dump. Healthy smoke
+ * lanes are never silent for more than a few seconds, so a short budget ends a
+ * wedged lane in well under a minute instead of three; b1nix.silence=<s>
+ * overrides it for a workload that is legitimately quiet. Measured in the
+ * timer's real rate (sched_tick_hz), not an assumed 100 Hz. */
+#if defined(__aarch64__)
+#define SILENCE_WATCHDOG_DEFAULT_S 45u
+#else
+#define SILENCE_WATCHDOG_DEFAULT_S 20u
+#endif
+static u64 silence_watchdog_ticks(void) {
+  static u64 secs;
+  if (!secs) {
+    char buf[16];
+    secs = SILENCE_WATCHDOG_DEFAULT_S;
+    if (bootinfo_get_kv("b1nix.silence", buf, sizeof(buf)) && buf[0]) {
+      u64 v = 0;
+      for (const char *c = buf; *c >= '0' && *c <= '9'; c++)
+        v = v * 10 + (u64)(*c - '0');
+      if (v)
+        secs = v;
+    }
+  }
+  return secs * sched_tick_hz();
+}
+#define SILENCE_WATCHDOG_TICKS silence_watchdog_ticks()
 #define SILENCE_WATCHDOG_MAX_DUMPS 2
 extern volatile u64 g_console_write_seq;
 
@@ -5571,7 +5627,9 @@ static void serial_silence_watchdog(void) {
    * tail has left in it. */
   kmsg_capture_tail();
 
-  console_write("\nSMOKE-GUEST-WATCHDOG: no console output for 60s — task dump:\n");
+  console_write("\nSMOKE-GUEST-WATCHDOG: no console output for ");
+  console_write_dec(SILENCE_WATCHDOG_TICKS / sched_tick_hz());
+  console_write("s — task dump:\n");
   scheduler_dump_tasks();
 
   /* The same answer in one line per task, printed after the dump rather than
@@ -5846,7 +5904,7 @@ static void serial_silence_watchdog(void) {
   last_seq = g_console_write_seq;
 
   if (dumps >= SILENCE_WATCHDOG_MAX_DUMPS) {
-    panic("watchdog: deadlock or hang detected (silence for >120s)");
+    panic("watchdog: deadlock or hang detected (console silence)");
   }
 }
 
@@ -6049,7 +6107,7 @@ void scheduler_on_timer_tick(void) {
    * stalled behind it -- a worse failure than the one being chased. The
    * counter stays a diagnostic until the leak that makes it lie is found. */
   if (current_task->state == TASK_RUNNING &&
-      g_preempt_depth[(u32)percpu_read(cpu_id) % MAX_CPUS] == 0) {
+      g_task_preempt_depth[task_index(current_task)] == 0) {
     scheduler_yield();
   }
 }
@@ -10146,4 +10204,27 @@ void sched_nice_selftest(void) {
       console_write("\n");
     }
   }
+}
+
+/* Reaps dead threads and orphaned zombies outside scheduler_yield, in a
+ * context that may sleep. Woken by every yield that has something to reap,
+ * and on a timer so nothing waits long if no one yields. */
+static void reaper_thread(void *arg) {
+  (void)arg;
+  extern int g_has_any_thread;
+  for (;;) {
+    scheduler_block_on_timeout(&g_reaper_chan, SCHED_MS_TO_TICKS(100));
+    u64 flags = interrupts_save();
+    interrupts_disable();
+    if (g_has_any_thread)
+      scheduler_reap_dead_threads();
+    if (g_have_proc_zombies)
+      scheduler_reap_orphan_zombies();
+    interrupts_restore(flags);
+  }
+}
+
+void scheduler_start_reaper(void) {
+  if (kthread_create("reaper", reaper_thread, 0) >= 0)
+    g_reaper_started = 1;
 }

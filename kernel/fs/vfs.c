@@ -2424,6 +2424,40 @@ u32 vfs_node_dev(struct vfs_node *node) {
   return 0;
 }
 
+/* Attach `child` unless `parent` already has a live child of the same name,
+ * checked and linked under one tree-lock hold. Returns 1 when it attached, 0
+ * when a node of that name was already there (the caller then frees its own).
+ *
+ * A filesystem that materialises nodes on lookup needs the check atomic with
+ * the link: two tasks resolving the same new name -- one of them the creator --
+ * each attached a node, unlink later removed one, and the other kept the name
+ * visible after a successful unlink. O_EXCL then failed for everyone. */
+int vfs_attach_child_unique(struct vfs_node *parent, struct vfs_node *child) {
+  if (!parent || !child)
+    return 0;
+  if (child->inode && parent->inode && !child->inode->dev)
+    child->inode->dev = parent->inode->dev;
+  if (!child->parent)
+    child->parent = parent;
+  u64 flags;
+  vfs_tree_write_acquire(&flags);
+  struct vfs_node *tail = 0;
+  for (struct vfs_node *c = parent->first_child; c; c = c->next_sibling) {
+    if (!c->deleted && strcmp(c->name, child->name) == 0) {
+      vfs_tree_write_release(flags);
+      return 0;
+    }
+    tail = c;
+  }
+  child->next_sibling = 0;
+  if (tail)
+    tail->next_sibling = child;
+  else
+    parent->first_child = child;
+  vfs_tree_write_release(flags);
+  return 1;
+}
+
 void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child) {
   if (!parent || !child)
     return;
@@ -2435,6 +2469,11 @@ void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child) {
    * already carries its own id (devpts) keeps it. */
   if (child->inode && parent->inode && !child->inode->dev)
     child->inode->dev = parent->inode->dev;
+  /* ".." walks this pointer. Filesystems that attach children through here
+   * (lkpifs) never set it, so ".." on them stayed put and a relative symlink
+   * such as /var/run -> ../run resolved to itself until ELOOP. */
+  if (!child->parent)
+    child->parent = parent;
   u64 flags;
   vfs_tree_write_acquire(&flags);
   /* Appended, not prepended.
@@ -7308,6 +7347,17 @@ static struct vfs_node *next_child_by_seq(struct vfs_node *dir, u64 bound) {
 /* Remove from a filesystem's batch every name that an in-memory child of `dir`
  * already owns, so a merged listing reports each name once and the in-memory
  * node is the one it reports. Returns how many entries are left. */
+/* A child the directory's own filesystem materialised on lookup: a cached
+ * copy of a name its readdir already reports. Only the others -- device nodes
+ * attached in RAM under a /dev that is a directory on the root image -- are
+ * extra names to merge. */
+static int vfs_child_is_fs_cache(const struct vfs_node *dir,
+                                 const struct vfs_node *c) {
+  return dir->inode->readdir_lists_children && c->inode &&
+         dir->inode->release_cb &&
+         c->inode->release_cb == dir->inode->release_cb;
+}
+
 static isize vfs_drop_shadowed_entries(struct vfs_node *dir, struct dirent *buf,
                                        isize count) {
   isize kept = 0;
@@ -7317,7 +7367,7 @@ static isize vfs_drop_shadowed_entries(struct vfs_node *dir, struct dirent *buf,
   for (isize i = 0; i < count; i++) {
     int shadowed = 0;
     for (struct vfs_node *c = dir->first_child; c; c = c->next_sibling) {
-      if (c->deleted || !c->inode)
+      if (c->deleted || !c->inode || vfs_child_is_fs_cache(dir, c))
         continue;
       if (strcmp(c->name, buf[i].name) == 0) {
         shadowed = 1;
@@ -7430,7 +7480,6 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
      * a second cursor kept beside it would not come back with it. Below
      * VFS_DIR_MEM_CURSOR the cursor is the filesystem's own opaque cookie;
      * above it, the dir_seq of the last in-memory child handed out. */
-    int merge = !dir->inode->readdir_lists_children;
 
     while (!(h->offset & VFS_DIR_MEM_CURSOR)) {
       if (dir->inode->readdir_at_cb) {
@@ -7450,18 +7499,11 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
         h->offset = VFS_DIR_MEM_CURSOR; /* filesystem exhausted */
         break;
       }
-      if (!merge)
-        goto out;
       res = vfs_drop_shadowed_entries(dir, buf, res);
       if (res > 0)
         goto out;
       /* Every name in this batch was shadowed by an in-memory child. Returning
        * zero here would read as end-of-directory, so fetch the next batch. */
-    }
-
-    if (!merge) {
-      res = 0;
-      goto out;
     }
 
     u64 seq_above = (u64)(h->offset & ~VFS_DIR_MEM_CURSOR); /* 0 = no bound */
@@ -7470,6 +7512,12 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     vfs_tree_read_acquire(&tflags);
     struct vfs_node *child = next_child_by_seq(dir, seq_above);
     while (child && count < max_entries) {
+      if (vfs_child_is_fs_cache(dir, child)) {
+        seq_above = child->dir_seq;
+        h->offset = VFS_DIR_MEM_CURSOR | (usize)seq_above;
+        child = next_child_by_seq(dir, seq_above);
+        continue;
+      }
       copy_path(buf[count].name, 64, child->name);
       buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);

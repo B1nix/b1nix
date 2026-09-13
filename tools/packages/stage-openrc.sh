@@ -13,7 +13,7 @@ ARCH="${B1NIX_ARCH:-x86_64}"
 ROOTFS="$ROOT_DIR/build/$ARCH/rootfs"
 STAGE="$ROOT_DIR/build/$ARCH/ports/openrc/pkg"
 CONF="$ROOT_DIR/tools/configs/openrc"
-CIC="$ROOT_DIR/tools/copy-if-changed.sh"
+CIC="$ROOT_DIR/tools/build/copy-if-changed.sh"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE"

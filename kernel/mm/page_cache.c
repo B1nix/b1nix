@@ -1141,7 +1141,10 @@ static void writeback_page_locked(struct page_cache_entry *page) {
       /* Pin the entry across the unlocked write_cb: a concurrent
        * page_cache_invalidate_inode must orphan it (refcount != 0), not free
        * it out from under us. */
-      page->refcount++;
+      /* Atomic: lookups pin pages under their bucket lock alone, so a plain
+       * increment here raced theirs, lost counts, and freed an entry that
+       * was still on the LRU. */
+      __atomic_add_fetch(&page->refcount, 1, __ATOMIC_ACQ_REL);
       unlock_pc();
       void *virt_addr = (void *)(usize)(page->frame + vmm_direct_map_base());
       /* Say whose blocks these are before the filesystem turns the page into
@@ -1159,8 +1162,8 @@ static void writeback_page_locked(struct page_cache_entry *page) {
       page->inode->write_cb(&dummy, page->offset, virt_addr, size, 0);
       blk_clear_dirty_owner();
       lock_pc();
-      page->refcount--;
-      if (page->refcount == 0 && (page->flags & PAGE_CACHE_ORPHAN)) {
+      if (__atomic_sub_fetch(&page->refcount, 1, __ATOMIC_ACQ_REL) == 0 &&
+          (page->flags & PAGE_CACHE_ORPHAN)) {
         /* Invalidated while we were writing: finish its teardown here. */
         pmm_free_frame(page->frame);
         if (page->inode && page->inode->cached_pages)
