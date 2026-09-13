@@ -203,6 +203,8 @@ int boot_stack_is_guard_addr(u64 addr);
  * from a constant compiled into the kernel. Always NUL-terminated. */
 void arch_cpu_vendor(char *buf, usize len);
 void arch_cpu_model(char *buf, usize len);
+/* Space-separated feature names, as /proc/cpuinfo lists them. */
+void arch_cpu_flags(char *buf, usize len);
 
 int arch_xsave_enabled(void);
 u64 arch_xsave_mask(void);

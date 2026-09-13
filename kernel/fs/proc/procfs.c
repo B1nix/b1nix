@@ -506,6 +506,15 @@ static int r_cpuinfo(usize pid, struct sbuf *s) {
         sb_addf(s, "cpu MHz\t\t: %lu.%03lu\n", (unsigned long)(khz / 1000),
                 (unsigned long)(khz % 1000));
     }
+    {
+      char flags[768];
+      arch_cpu_flags(flags, sizeof(flags));
+#if defined(__aarch64__)
+      sb_addf(s, "Features\t: %s\n", flags);
+#else
+      sb_addf(s, "flags\t\t: %s\n", flags);
+#endif
+    }
     sb_puts(s, "\n");
   }
   return 0;

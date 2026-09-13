@@ -1,4 +1,5 @@
 #include <b1nix/arch.h>
+#include <string.h>
 #include <b1nix/console.h>
 #include <b1nix/lapic.h>
 #include <b1nix/memtype.h>
@@ -473,8 +474,22 @@ u32 arch_tsc_khz_from_cpuid(void) {
     return 0;
 
   cpuid_count(0x15, 0, &a, &b, &c, &d);
-  if (!a || !b || !c)
+  if (!a || !b)
     return 0;
+  if (!c) {
+    /* No crystal frequency: the crystal is base * a / b by leaf 16h's base
+     * frequency (Linux does this), so the TSC, crystal * b / a, is the base
+     * frequency itself. */
+    u32 base_mhz;
+    cpuid_count(0, 0, &a, &b, &c, &d);
+    if (a < 0x16)
+      return 0;
+    cpuid_count(0x16, 0, &base_mhz, &b, &c, &d);
+    base_mhz &= 0xffff;
+    if (!base_mhz)
+      return 0;
+    return (u32)((u64)base_mhz * 1000ull);
+  }
 
   /* crystal_hz * ratio / 1000, in 64-bit so a 100 MHz crystal times a ratio of
    * a few dozen cannot wrap on the way to kHz. */
@@ -852,5 +867,53 @@ void arch_halt(void) {
 
   for (;;) {
     __asm__ volatile("hlt");
+  }
+}
+
+/* The feature flags /proc/cpuinfo lists, by their Linux names, for the bits
+ * programs actually test (CPUID 1 EDX/ECX, 7.0 EBX/ECX/EDX, 80000001h). */
+void arch_cpu_flags(char *buf, usize len) {
+  static const struct { u8 leaf; u8 reg; u8 bit; const char *name; } F[] = {
+    {1,3,0,"fpu"},{1,3,4,"tsc"},{1,3,5,"msr"},{1,3,6,"pae"},{1,3,8,"cx8"},
+    {1,3,9,"apic"},{1,3,11,"sep"},{1,3,12,"mtrr"},{1,3,13,"pge"},{1,3,15,"cmov"},
+    {1,3,16,"pat"},{1,3,19,"clflush"},{1,3,23,"mmx"},{1,3,24,"fxsr"},
+    {1,3,25,"sse"},{1,3,26,"sse2"},{1,3,28,"ht"},
+    {1,2,0,"pni"},{1,2,1,"pclmulqdq"},{1,2,9,"ssse3"},{1,2,12,"fma"},
+    {1,2,13,"cx16"},{1,2,19,"sse4_1"},{1,2,20,"sse4_2"},{1,2,21,"x2apic"},
+    {1,2,22,"movbe"},{1,2,23,"popcnt"},{1,2,25,"aes"},{1,2,26,"xsave"},
+    {1,2,28,"avx"},{1,2,29,"f16c"},{1,2,30,"rdrand"},{1,2,31,"hypervisor"},
+    {0x81,3,11,"syscall"},{0x81,3,20,"nx"},{0x81,3,27,"rdtscp"},{0x81,3,29,"lm"},
+    {0x81,2,0,"lahf_lm"},{0x81,2,5,"abm"},
+    {7,1,0,"fsgsbase"},{7,1,3,"bmi1"},{7,1,5,"avx2"},{7,1,7,"smep"},
+    {7,1,8,"bmi2"},{7,1,9,"erms"},{7,1,10,"invpcid"},{7,1,16,"avx512f"},
+    {7,1,18,"rdseed"},{7,1,19,"adx"},{7,1,20,"smap"},{7,1,29,"sha_ni"},
+    {7,2,2,"umip"},{7,2,22,"rdpid"},
+  };
+  u32 r1[4] = {0}, r7[4] = {0}, r81[4] = {0}, a, b, c, d;
+  usize used = 0;
+
+  if (!buf || len == 0)
+    return;
+  buf[0] = 0;
+  cpuid_count(0, 0, &a, &b, &c, &d);
+  u32 max = a;
+  cpuid_count(1, 0, &r1[0], &r1[1], &r1[2], &r1[3]);
+  if (max >= 7)
+    cpuid_count(7, 0, &r7[0], &r7[1], &r7[2], &r7[3]);
+  cpuid_count(0x80000000u, 0, &a, &b, &c, &d);
+  if (a >= 0x80000001u)
+    cpuid_count(0x80000001u, 0, &r81[0], &r81[1], &r81[2], &r81[3]);
+  for (usize i = 0; i < sizeof(F) / sizeof(F[0]); i++) {
+    const u32 *r = F[i].leaf == 1 ? r1 : F[i].leaf == 7 ? r7 : r81;
+    if (!(r[F[i].reg] & (1u << F[i].bit)))
+      continue;
+    usize n = strlen(F[i].name);
+    if (used + n + 2 > len)
+      break;
+    if (used)
+      buf[used++] = ' ';
+    memcpy(buf + used, F[i].name, n);
+    used += n;
+    buf[used] = 0;
   }
 }

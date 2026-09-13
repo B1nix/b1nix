@@ -80,13 +80,13 @@ belongs to the milestone that owns the mechanism. See
 | M57 Multiprocess Model | done | socketpair, F_DUPFD_CLOEXEC, minimal Mojo core. |
 | M58 V8 | cancelled | d8 with all tiers worked; standalone engine removed, V8 comes with Alpine's Chromium. |
 | M59 EGL/GL for Browser | done | EGL over OSMesa (superseded with M52). |
-| M60 Ozone Platform | partial | Headless Ozone done; Wayland Ozone backend `deferred` (gated on M62). |
-| M61 Chromium Build Target | frozen | GN/Ninja target; base/net/ui/mojo compile; Blink/content `partial`. |
-| M62 content_shell | frozen | Link content_shell `in-progress`; render-to-bitmap `planned`. |
-| M63 Sandbox | partial | seccomp-bpf + NO_NEW_PRIVS done; namespaces/setuid sandbox `deferred`. |
+| M60 Ozone Platform | cancelled | Headless Ozone done; browser ports left the tree with M121 (Chromium comes from the distribution). |
+| M61 Chromium Build Target | cancelled | Own Chromium build dropped in M121; Alpine's Chromium runs on the kernel (M102). |
+| M62 content_shell | cancelled | Superseded by the distribution's browser (M121). |
+| M63 Sandbox | partial | seccomp-bpf, NO_NEW_PRIVS, mount/UTS/net namespaces (clone and unshare), unshare-shaped pid namespaces; user, IPC and cgroup namespaces and `CLONE_NEWPID` on clone are refused. |
 | M64 Clang/LLVM Toolchain | done | Cross clang++, native in-QEMU clang. |
-| M65 Install to Disk | partial | Disk image script; in-guest installer removed in M121. |
-| M66 Chromium Frontend | frozen | `planned` windowed browser UI. |
+| M65 Install to Disk | cancelled | Installer and disk-image script removed in M121; a distribution installs itself. |
+| M66 Chromium Frontend | cancelled | Userspace; superseded by the distribution's browser (M121). |
 | M67 Rust Toolchain Port | done | `x86_64-unknown-b1nix` target. |
 | M68 Native Rust Compiler | done | rustc 1.98.0 in-guest. |
 | M69 Dynamic Loading | retired | — |
@@ -104,15 +104,15 @@ belongs to the milestone that owns the mechanism. See
 
 - [x] Full `ptrace(2)` (regs/mem, SEIZE, syscall stops, events), Yama gating, `/proc/<pid>/task`, XSAVE state.
 - [x] Upstream Crashpad writes real minidumps unpatched, on x86_64 and aarch64.
-- [ ] `planned` `/proc/<pid>/cmdline` for processes that never called execve (fork/posix_spawn children show blank).
+- [x] `/proc/<pid>/cmdline` of a fork/clone child that has not exec'd is the parent's (`M80-SMOKE: ok fork-cmdline`).
 
 ## M81: Chromium GPU Acceleration
 
-- [ ] `planned` SwiftShader Vulkan/ANGLE `.so`s and VirGL acceleration for `content_shell`.
+- [ ] `cancelled` SwiftShader/ANGLE for `content_shell`: userspace, left the tree with M121. The kernel side (virtio-gpu/i915 DRM) is tracked in M101/M102.
 
 ## M82: System NSS / Kerberos (optional)
 
-- [ ] `planned` System NSS cert DB and MIT-krb5 GSSAPI if needed.
+- [ ] `cancelled` Userspace libraries; they come from the distribution (M121).
 
 ## Closed milestones M83–M100d
 
@@ -172,7 +172,7 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 
 - [x] `bpkg`, the in-guest package manager, retired in M121.
 - [x] 49 of 54 from-source ports replaced by pinned Alpine packages.
-- [ ] `wontfix` `musl`, `libcxx-musl`, `busybox`, `openrc`, `rust` stay from-source.
+- [x] The last from-source ports (`busybox`, `openrc`, `libcxx`, `rust`) moved to Alpine or were dropped in M121; only `musl` headers for `b1cc` are built.
 
 ## M105: PAM
 
@@ -223,7 +223,7 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 - [x] kwin_wayland + plasmashell on real DRM via elogind/eudev ([image](images/m113-plasma-drm.png)); `tests/kde-smoke.sh`.
 - [x] Boot to painted desktop 194 s → ~16 s; evdev input and DRM framebuffer console before the compositor.
 - [ ] `partial` kwin uses the legacy modeset path (`CURSOR_PLANE_HOTSPOT` is Linux 6.7; universal planes not offered).
-- [ ] `partial` Remaining costs: synchronous dirty-page writes on close (no writeback thread), dbus/elogind session stalls, vmm read-lock per copyin, lkpi header macro warnings.
+- [ ] `partial` Remaining costs: dbus/elogind session stalls, vmm read-lock per copyin. (Dirty pages now go through the `pcflush` writeback thread; the lkpi header macro warnings were fixed in M121.)
 
 ## M114: The layers under the missing applets
 
@@ -244,24 +244,18 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 ## M117: nice in the scheduler
 
 - [x] `nice()` stored and round-trips; the check uses a shared deadline on one pinned CPU (`M46-SMOKE: ok nice-applied`).
-- [ ] `partial` Stride is computed but does not bias the picker: `scheduler_set_priority()` writes only `g_task_nice[]`.
+- [x] Stride biases the picker on every CPU: x86_64 secondaries now preempt ring-3 ticks, which is what left a hog on an AP ignoring nice and affinity (`M80-SMOKE: ok nice-share`, ~9:1 for nice 0 vs 19).
 
 ## M118: Arch Linux userspace
 
-Detail in `tools/images/mk-arch-image.sh` and `tests/arch-smoke.sh`.
-
-- [x] Unprivileged image build from the official bootstrap tarball (systemd 261.2, glibc 2.44).
-- [x] Nine kernel faults fixed (`TCGETS2`, `/proc/self/fd` reopen flags, `CLONE_NEW*`, pidfds, `close_range`, `fchmodat2`, …).
-- [ ] `partial` Boot stops at unit credentials (post-`mount(2)` API missing); `arch-smoke` 2/31.
-- [ ] `partial` New mount API is all-or-nothing: partial implementations regressed Debian, so none is in the tree.
-- [ ] `partial` Graphics profile builds but is unexercised.
+Cancelled in M121: Debian is the glibc ABI lane, and a second systemd distribution duplicated it. The image and test scripts were removed; the nine kernel faults it found (`TCGETS2`, `/proc/self/fd` reopen flags, `CLONE_NEW*`, pidfds, `close_range`, `fchmodat2`, …) stay fixed. The new mount API it needed is tracked under the Debian lane.
 
 ## M119: Ask the processor instead of guessing
 
 - [x] `/proc/cpuinfo` names the real CPU (CPUID brand / `MIDR_EL1`).
 - [x] aarch64 CSPRNG seeded from `RNDR`; `TCR_EL1.IPS` from `ID_AA64MMFR0_EL1.PARange`.
-- [ ] `planned` x86_64 TSC frequency from CPUID 15h/16h, PIT calibration as fallback.
-- [ ] `planned` `flags`/`Features` line in `/proc/cpuinfo`.
+- [x] x86_64 TSC frequency from CPUID 15h (16h base frequency when the crystal is unreported), PIT calibration as fallback.
+- [x] `flags` (x86_64, CPUID) / `Features` (aarch64, ID registers) line in `/proc/cpuinfo`; `M80-SMOKE: ok cpu-flags` checks it against the processor.
 
 ## M120: Linux's own filesystems, through linuxkpi
 
@@ -290,4 +284,4 @@ Upstream Linux 6.6 `fs/btrfs`, `fs/ext4`, `fs/jbd2` built unpatched on our shim.
 - [x] `telinit` and the fake M39 inittab markers removed (M39 keeps its real serial-tty checks).
 - [x] The IOMMU instances end with `reboot -f`; the check passes only when QEMU (-no-reboot) then exits on its own.
 - [ ] `planned` Move the tests to the Linux ABI, then remove the native b1nix syscall ABI.
-- [ ] `planned` Debian lane to full parity as the glibc ABI check; decide Arch.
+- [ ] `planned` Debian lane to full parity as the glibc ABI check (needs the post-`mount(2)` API); the Arch lane was dropped.

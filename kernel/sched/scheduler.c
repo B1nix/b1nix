@@ -594,6 +594,19 @@ static u64   g_task_user_rip_shown;
  * in their flags — were indistinguishable from it and from each other. */
 static char *g_task_cmdline[TASK_SLOTS];
 static usize g_task_cmdline_len[TASK_SLOTS];
+
+/* A fork or clone child runs the parent's image until it execs, and its
+ * /proc/<pid>/cmdline is the parent's until then, as on Linux. It read blank:
+ * the vector was recorded only by execve. */
+static void task_inherit_cmdline(usize child, usize parent) {
+  usize len = g_task_cmdline_len[parent];
+  char *copy = (len && g_task_cmdline[parent]) ? (char *)kmalloc(len) : 0;
+
+  if (copy)
+    memcpy(copy, g_task_cmdline[parent], len);
+  g_task_cmdline[child] = copy;
+  g_task_cmdline_len[child] = copy ? len : 0;
+}
 /* M63: seccomp-bpf per-task state (side-tables — struct task cannot grow, see
  * the M29 LAPIC-PT note). g_task_seccomp holds the installed filter chain
  * (opaque to the scheduler; defined in seccomp.c); g_task_nnp is no_new_privs. */
@@ -2684,6 +2697,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
    * thread-local storage immediately after fork. Without this, the child's
    * FS base is 0 and any TLS access (e.g. musl's _Fork cleanup) crashes. */
   g_task_tls_base[c_idx] = g_task_tls_base[p_idx];
+  task_inherit_cmdline(c_idx, p_idx);
 
   // Copy parent's kernel stack
   void *parent_stack = parent->stack;
@@ -3908,6 +3922,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   }
   g_task_ctty_type[c_idx] = g_task_ctty_type[p_idx];
   g_task_ctty_index[c_idx] = g_task_ctty_index[p_idx];
+  task_inherit_cmdline(c_idx, p_idx);
   for (int r = 0; r < 16; r++)
     g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
 
@@ -10227,4 +10242,13 @@ static void reaper_thread(void *arg) {
 void scheduler_start_reaper(void) {
   if (kthread_create("reaper", reaper_thread, 0) >= 0)
     g_reaper_started = 1;
+}
+
+/* The AP half of the preemptive tick, for ticks that interrupted ring 3. */
+void scheduler_preempt_user_ap(void) {
+  if (!scheduler_started || !current_task)
+    return;
+  if (current_task->state == TASK_RUNNING &&
+      g_task_preempt_depth[task_index(current_task)] == 0)
+    scheduler_yield();
 }

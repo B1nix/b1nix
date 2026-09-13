@@ -65,6 +65,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <time.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1641,6 +1644,135 @@ static void test_cpu_freq(void) {
 }
 
 
+/* ── /proc/cpuinfo flags agree with what the processor itself reports ────── */
+
+static int word_in(const char *line, const char *word) {
+  size_t n = strlen(word);
+  for (const char *p = line; (p = strstr(p, word)); p += n) {
+    int start = (p == line || p[-1] == ' ' || p[-1] == '\t' || p[-1] == ':');
+    int end = (p[n] == ' ' || p[n] == '\n' || p[n] == '\0');
+    if (start && end)
+      return 1;
+  }
+  return 0;
+}
+
+static void test_cpu_flags(void) {
+  char cpuinfo[8192];
+  long cn = slurp("/proc/cpuinfo", cpuinfo, sizeof(cpuinfo) - 1);
+  if (cn <= 0) {
+    fail("cpu-flags", cn);
+    return;
+  }
+  cpuinfo[cn] = '\0';
+#if defined(__x86_64__)
+  char *line = strstr(cpuinfo, "\nflags");
+  if (!line) {
+    fail("cpu-flags", -1);
+    return;
+  }
+  char *eol = strchr(line + 1, '\n');
+  if (eol)
+    *eol = '\0';
+  /* Ask the processor directly and compare two bits either way. */
+  unsigned int a, b, c, d;
+  __asm__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0u));
+  int sse2 = (d >> 26) & 1, avx = (c >> 28) & 1;
+  int ok = word_in(line, "fpu") && sse2 == word_in(line, "sse2") &&
+           avx == word_in(line, "avx") && word_in(line, "lm");
+  check("cpu-flags", ok, (long)(sse2 | avx << 1));
+#else
+  char *line = strstr(cpuinfo, "Features");
+  if (!line) {
+    fail("cpu-flags", -1);
+    return;
+  }
+  char *eol = strchr(line, '\n');
+  if (eol)
+    *eol = '\0';
+  check("cpu-flags", word_in(line, "fp") && word_in(line, "asimd"), 0);
+#endif
+}
+
+/* ── a forked child that has not exec'd shows the parent's cmdline ──────── */
+
+static void test_fork_cmdline(void) {
+  char mine[512], theirs[512];
+  long mn = slurp("/proc/self/cmdline", mine, sizeof(mine));
+  int pfd[2];
+
+  if (mn <= 0 || pipe(pfd) != 0) {
+    fail("fork-cmdline", mn);
+    return;
+  }
+  pid_t child = fork();
+  if (child == 0) {
+    char c;
+    close(pfd[1]);
+    (void)!read(pfd[0], &c, 1); /* parked until the parent has looked */
+    _exit(0);
+  }
+  close(pfd[0]);
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)child);
+  long tn = slurp(path, theirs, sizeof(theirs));
+  close(pfd[1]);
+  waitpid(child, 0, 0);
+  check("fork-cmdline", tn == mn && memcmp(mine, theirs, (size_t)mn) == 0, tn);
+}
+
+/* ── nice changes a CPU hog's share, on whichever CPU it lands ──────────── */
+
+/* Count loop iterations for `ms` milliseconds of wall time, pinned to CPU 0. */
+static long nice_burn(int nice_val, int ms) {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(0, &set);
+  if (sched_setaffinity(0, sizeof(set), &set) != 0 ||
+      setpriority(PRIO_PROCESS, 0, nice_val) != 0)
+    return -1;
+  struct timespec t0, t;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  long n = 0;
+  for (;;) {
+    for (int i = 0; i < 4096; i++)
+      n++;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    if ((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000 >= ms)
+      return n;
+  }
+}
+
+static void test_nice_share(void) {
+  int p[2][2];
+  pid_t kid[2];
+  long r[2] = {0, 0};
+
+  for (int k = 0; k < 2; k++) {
+    if (pipe(p[k]) != 0) {
+      fail("nice-share", -1);
+      return;
+    }
+    kid[k] = fork();
+    if (kid[k] == 0) {
+      long n = nice_burn(k ? 19 : 0, 2000);
+      (void)!write(p[k][1], &n, sizeof(n));
+      _exit(0);
+    }
+  }
+  for (int k = 0; k < 2; k++) {
+    close(p[k][1]);
+    if (read(p[k][0], &r[k], sizeof(r[k])) != sizeof(r[k]))
+      r[k] = -1;
+    close(p[k][0]);
+    waitpid(kid[k], 0, 0);
+  }
+  /* Two hogs sharing one CPU: nice 19 has 1 ticket to nice 0's 20, so its
+   * share must be a small fraction. 4x is a wide margin under emulation. */
+  check("nice-share", r[0] > 0 && r[1] >= 0 && r[1] * 4 < r[0],
+        r[1] > 0 ? r[0] / r[1] : -1);
+}
+
 /* ── /proc/<pid>/maps names its files, and names the device they live on ─── */
 
 static void test_proc_maps(void) {
@@ -1701,6 +1833,9 @@ int main(void) {
   test_ptrace_ignored_signal();
   test_avx_context();
   test_cpu_freq();
+  test_cpu_flags();
+  test_fork_cmdline();
+  test_nice_share();
   test_exitkill();
   test_so_peercred();
   test_yama_scope();

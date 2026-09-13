@@ -2858,6 +2858,9 @@ fi
 check_output "$LOG" "M80-SMOKE: ok ptrace-listen" "PTRACE_LISTEN parks a seized tracee out of ptrace-stop until PTRACE_INTERRUPT"
 check_output "$LOG" "M80-SMOKE: ok ptrace-exitkill" "PTRACE_O_EXITKILL kills the tracee when its tracer exits"
 check_output "$LOG" "M80-SMOKE: ok cpu-freq" "the measured CPU clock is published in sysfs cpufreq and matches /proc/cpuinfo"
+check_output "$LOG" "M80-SMOKE: ok cpu-flags" "/proc/cpuinfo lists the feature flags the processor reports through CPUID / ID registers"
+check_output "$LOG" "M80-SMOKE: ok fork-cmdline" "a forked child that has not exec'd reads the parent's /proc/<pid>/cmdline, not a blank one"
+check_output "$LOG" "M80-SMOKE: ok nice-share" "M117: two CPU hogs pinned to one CPU split it by nice (19 gets a small fraction of nice 0's share), wherever they were forked"
 if [ "$ARCH" = "aarch64" ]; then
 	skipped "AVX/YMM state survives context switches and is visible in NT_X86_XSTATE" "AVX/YMM are x86 vector registers; this arch saves/restores its own V registers (see fpu.S) and M29 covers that"
 else

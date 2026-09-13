@@ -740,6 +740,14 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
 
       scheduler_on_timer_tick();
       usb_kbd_poll(); /* M37: drain the USB HID keyboard's interrupt endpoint */
+    } else if (frame->cs == 0x1B || frame->cs == 0x23) {
+      /* An AP preempts only a tick that landed in ring 3. Kernel-mode
+       * preemption on APs is still gated (see above), but user code holds no
+       * kernel lock, so nothing it interrupted can be left half done -- and
+       * without this a compute loop on an AP ran until it blocked, ignoring
+       * both nice and a sched_setaffinity that moved it elsewhere. */
+      extern void scheduler_preempt_user_ap(void);
+      scheduler_preempt_user_ap();
     }
     if (frame->cs == 0x1B || frame->cs == 0x23) {
       /* rseq(2): the tick may have preempted (and the task may have come back

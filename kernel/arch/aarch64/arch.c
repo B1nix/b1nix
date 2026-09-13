@@ -1,4 +1,5 @@
 #include <b1nix/arch.h>
+#include <string.h>
 #include <b1nix/console.h>
 #include <b1nix/lapic.h>
 #include <b1nix/irq.h>
@@ -729,3 +730,41 @@ u32 aarch64_platform_watchdog_disable(void)
  * of the architecture this port runs on, and encode_leaf() already sets UXN
  * for VMM_NO_EXECUTE. So the answer here is simply yes. */
 int arch_nx_enabled(void) { return 1; }
+
+/* The hwcap names /proc/cpuinfo's Features line uses, from the ID registers. */
+void arch_cpu_flags(char *buf, usize len)
+{
+	u64 isar0, pfr0;
+	usize used = 0;
+
+	if (!buf || len == 0)
+		return;
+	buf[0] = 0;
+	__asm__ volatile("mrs %0, id_aa64isar0_el1" : "=r"(isar0));
+	__asm__ volatile("mrs %0, id_aa64pfr0_el1" : "=r"(pfr0));
+	struct { int on; const char *name; } F[] = {
+		{ ((pfr0 >> 16) & 0xf) != 0xf, "fp" },
+		{ ((pfr0 >> 20) & 0xf) != 0xf, "asimd" },
+		{ 1, "evtstrm" },
+		{ ((isar0 >> 4) & 0xf) >= 1, "aes" },
+		{ ((isar0 >> 4) & 0xf) >= 2, "pmull" },
+		{ ((isar0 >> 8) & 0xf) >= 1, "sha1" },
+		{ ((isar0 >> 12) & 0xf) >= 1, "sha2" },
+		{ ((isar0 >> 16) & 0xf) >= 1, "crc32" },
+		{ ((isar0 >> 20) & 0xf) >= 2, "atomics" },
+		{ ((isar0 >> 12) & 0xf) >= 2, "sha512" },
+		{ ((isar0 >> 60) & 0xf) >= 1, "rng" },
+	};
+	for (usize i = 0; i < sizeof(F) / sizeof(F[0]); i++) {
+		if (!F[i].on)
+			continue;
+		usize n = strlen(F[i].name);
+		if (used + n + 2 > len)
+			break;
+		if (used)
+			buf[used++] = ' ';
+		memcpy(buf + used, F[i].name, n);
+		used += n;
+		buf[used] = 0;
+	}
+}
