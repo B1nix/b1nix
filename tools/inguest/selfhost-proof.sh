@@ -100,7 +100,7 @@ pid=$!
 
 start=$(date +%s)
 while :; do
-	if grep -qaE "M26-SELFHOST: ok kernel-elf|M26-SELFHOST: fail|KERNEL PANIC|\[PANIC\]" "$LOG" 2>/dev/null; then break; fi
+	if grep -qaE "M26-SELFHOST-USER: ok kernel-elf|M26-SELFHOST-USER: fail|selfhost: fail|KERNEL PANIC|\[PANIC\]" "$LOG" 2>/dev/null; then break; fi
 	kill -0 "$pid" 2>/dev/null || break
 	[ $(( $(date +%s) - start )) -ge "$TIMEOUT" ] && { echo "[selfhost-run] timeout ${TIMEOUT}s"; break; }
 	sleep 5
@@ -110,8 +110,8 @@ kill "$pid" 2>/dev/null || true; sleep 1; kill -9 "$pid" 2>/dev/null || true
 echo "==================== self-host run result ===================="
 grep -aiE "selfhost:|M26-SELFHOST|cc-fail|mount ram0|PANIC|page fault|#GP|#PF|out of memory" "$LOG" | tail -60
 echo "----"
-if grep -qa "M26-SELFHOST: ok kernel-elf" "$LOG"; then
-	echo "PASS: b1nix compiled and linked its own kernel with native clang + ld.lld"
+if grep -qa "M26-SELFHOST-USER: ok kernel-elf" "$LOG"; then
+	echo "PASS: b1nix compiled and linked its own kernel with clang + ld.lld"
 else
 	echo "FAIL — see $LOG"
 fi

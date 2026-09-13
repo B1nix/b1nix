@@ -42,8 +42,6 @@ void tlb_shootdown_all(void);
 #include <b1nix/version.h>
 
 
-#define MAX_EXEC_ARGS 256
-#define MAX_EXEC_ARG_LEN 4096
 static int copy_from_user(void *dst, const void *src, usize size);
 static int copy_to_user(void *dst, const void *src, usize size);
 static isize strncpy_from_user(char *dst, const char *src, usize size);
@@ -166,6 +164,18 @@ u64 kernel_random_u64(void) {
   return v;
 }
 
+/* An argv or envp vector, copied into the kernel.
+ *
+ * Bounded the way Linux bounds it: by the bytes the strings take (each vector
+ * gets a quarter of the user stack, where they will be placed), not by how
+ * many there are. A vector that does not fit is E2BIG. The old copy stopped
+ * at 256 entries and handed the kernel the first 256 as if they were all of
+ * them: a 684-argument ld.lld link ran on the first 256 objects and reported
+ * the rest of the kernel as undefined symbols. */
+#define EXEC_VECTOR_BYTES (USER_STACK_SIZE / 4)
+
+void free_kernel_array(char **k_array);
+
 static char **copy_user_array(const char **u_array) {
   if (!u_array)
     return NULL;
@@ -175,52 +185,71 @@ static char **copy_user_array(const char **u_array) {
       (!allow_kernel_ptrs && (u64)u_array >= USER_SPACE_LIMIT))
     return ERR_PTR(-EFAULT);
 
-  char **k_array = kmalloc(sizeof(char *) * (MAX_EXEC_ARGS + 1));
-  if (!k_array)
-    return ERR_PTR(-ENOMEM);
-  memset(k_array, 0, sizeof(char *) * (MAX_EXEC_ARGS + 1));
+  usize cap = 32, count = 0, budget = EXEC_VECTOR_BYTES;
+  char **k_array = kzalloc(sizeof(char *) * (cap + 1));
+  char *tmp = kmalloc(EXEC_VECTOR_BYTES);
+  long err = 0;
+  if (!k_array || !tmp) {
+    err = -ENOMEM;
+    goto out;
+  }
 
-  for (int i = 0; i < MAX_EXEC_ARGS; i++) {
-    if (!allow_kernel_ptrs && (u64)&u_array[i] >= USER_SPACE_LIMIT)
-      goto fault;
+  for (;;) {
+    const u64 slot = (u64)(usize)&u_array[count];
+    if (!allow_kernel_ptrs && slot >= USER_SPACE_LIMIT) {
+      err = -EFAULT;
+      goto out;
+    }
     const char *u_str;
-    if (copy_from_user(&u_str, &u_array[i], sizeof(char *)) < 0)
-      goto fault;
-
-    if (u_str == NULL) {
-      k_array[i] = NULL;
+    if (copy_from_user(&u_str, &u_array[count], sizeof(char *)) < 0) {
+      err = -EFAULT;
+      goto out;
+    }
+    if (u_str == NULL)
       break;
-    }
-
     if (!is_canonical((u64)u_str) ||
-        (!allow_kernel_ptrs && (u64)u_str >= USER_SPACE_LIMIT))
-      goto fault;
-
-    char tmp[MAX_EXEC_ARG_LEN];
-    if (syscall_copyinstr(tmp, MAX_EXEC_ARG_LEN, u_str) < 0)
-      goto fault;
-
-    usize len = strlen(tmp);
-    char *k_str = kmalloc(len + 1);
-    if (!k_str) {
-      for (int j = 0; j < i; j++)
-        kfree(k_array[j]);
-      kfree(k_array);
-      return ERR_PTR(-ENOMEM);
+        (!allow_kernel_ptrs && (u64)u_str >= USER_SPACE_LIMIT)) {
+      err = -EFAULT;
+      goto out;
     }
-    memcpy(k_str, tmp, len + 1);
-    k_array[i] = k_str;
+    int rc = syscall_copyinstr(tmp, budget, u_str);
+    if (rc == -ENAMETOOLONG) {
+      err = -E2BIG;
+      goto out;
+    }
+    if (rc < 0) {
+      err = -EFAULT;
+      goto out;
+    }
+    usize len = strlen(tmp);
+    budget -= len + 1;
+    if (count == cap) {
+      char **grown = kzalloc(sizeof(char *) * (cap * 2 + 1));
+      if (!grown) {
+        err = -ENOMEM;
+        goto out;
+      }
+      memcpy(grown, k_array, sizeof(char *) * cap);
+      kfree(k_array);
+      k_array = grown;
+      cap *= 2;
+    }
+    k_array[count] = kmalloc(len + 1);
+    if (!k_array[count]) {
+      err = -ENOMEM;
+      goto out;
+    }
+    memcpy(k_array[count], tmp, len + 1);
+    count++;
   }
 
+out:
+  kfree(tmp);
+  if (err) {
+    free_kernel_array(k_array);
+    return ERR_PTR(err);
+  }
   return k_array;
-
-fault:
-  for (int j = 0; j < MAX_EXEC_ARGS; j++) {
-    if (k_array[j])
-      kfree(k_array[j]);
-  }
-  kfree(k_array);
-  return ERR_PTR(-EFAULT);
 }
 
 void free_kernel_array(char **k_array) {
@@ -4876,6 +4905,43 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
 
 
 
+/* Carry the hardware dirty bits of MAP_SHARED file mappings in [start, end)
+ * over to the page cache before those translations go away.
+ *
+ * A store through such a mapping sets only the PTE's dirty bit. The cache
+ * entry is marked dirty once, when the page is first faulted in -- before any
+ * byte is written -- so a writeback that runs while the mapping is still being
+ * filled cleans it, and every later store is invisible to sync. Linux moves
+ * the PTE bit onto the page when it unmaps; without that, ld.lld's output
+ * (created, ftruncate'd, filled through a shared mapping, unmapped) reached the
+ * disk as zeros while the running system read it back correctly from cache. */
+void vma_harvest_shared_dirty(struct task *t, u64 start, u64 end) {
+  extern int paging_test_and_clear_dirty(u64 pml4_phys, u64 vaddr);
+  if (!t)
+    return;
+  for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
+    if (vma->end <= start || vma->start >= end)
+      continue;
+    if (!(vma->flags & MAP_SHARED) || !(vma->prot & PROT_WRITE))
+      continue;
+    if (!vma->node || !vma->node->inode || vma->node->inode->type != VFS_FILE)
+      continue;
+    struct vfs_inode *inode = vma->node->inode;
+    u64 lo = vma->start > start ? vma->start : start;
+    u64 hi = vma->end < end ? vma->end : end;
+    for (u64 v = lo; v < hi; v += PAGE_SIZE) {
+      if (!paging_test_and_clear_dirty(t->pml4_phys, v))
+        continue;
+      u64 file_page = ((u64)vma->offset + (v - vma->start)) & ~(u64)(PAGE_SIZE - 1);
+      struct page_cache_entry *page = page_cache_get_page(inode, file_page);
+      if (page) {
+        page_cache_mark_dirty(page);
+        page_cache_put_page(page);
+      }
+    }
+  }
+}
+
 static isize sys_munmap(void *addr, usize length) {
   u64 start = (u64)(usize)addr;
   if ((start & (PAGE_SIZE - 1)) != 0)
@@ -4894,6 +4960,8 @@ static isize sys_munmap(void *addr, usize length) {
   u64 end = start + ((length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
   if (end < start || end > 0x00007FFFFFFFFFFFULL)
     return -EINVAL;
+
+  vma_harvest_shared_dirty(t, start, end);
 
   /* Unmap in batches, one cross-CPU flush each.
    *

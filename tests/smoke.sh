@@ -665,6 +665,14 @@ run_qemu() {
 					# it stops exactly as before.
 					settle=${SMOKE_DONE_SETTLE:-0}
 					while [ "$settle" -gt 0 ]; do
+						# A lane that ends by resetting the machine is proved by
+						# QEMU leaving on its own (-no-reboot turns the reset
+						# into an exit), not by the marker the kernel printed
+						# just before it tried.
+						if ! kill -0 "$pid" 2>/dev/null; then
+							command echo "SMOKE-WATCHDOG: qemu-exited-after-done child=qemu log=$log" >>"$log"
+							break
+						fi
 						sleep 1
 						settle=$((settle - 1))
 						line_count=$(wc -l <"$log" | tr -d ' ')
@@ -1391,7 +1399,8 @@ launch_iommu() {
 			-device pcie-root-port,id=iommurp2,chassis=12,addr=0x1b \
 			-device nvme-subsys,id=iommusubsys,nqn=b1nix-iommu \
 			-device nvme,id=iommunvme,serial=deadbee2,subsys=iommusubsys,sriov_max_vfs=1,sriov_vq_flexible=2,sriov_vi_flexible=1,bus=iommurp2"
-		SMOKE_DONE_PATTERN="reboot: powering off|KERNEL PANIC|\[PANIC\]"
+		SMOKE_DONE_PATTERN="reboot: restarting|KERNEL PANIC|\[PANIC\]"
+		SMOKE_DONE_SETTLE=10
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[iommu]"
 		run_qemu "$IOMMU_LOG"
@@ -1410,7 +1419,8 @@ launch_amdvi() {
 		SWAP_IMG=$(disk_img swap amdvi)
 		B1NIX_ISO_NAME=b1nix-iommu.iso
 		EXTRA_QEMU_ARGS="-machine q35,kernel-irqchip=split -device amd-iommu,intremap=on"
-		SMOKE_DONE_PATTERN="reboot: powering off|KERNEL PANIC|\[PANIC\]"
+		SMOKE_DONE_PATTERN="reboot: restarting|KERNEL PANIC|\[PANIC\]"
+		SMOKE_DONE_SETTLE=10
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[amdvi]"
 		run_qemu "$AMDVI_LOG"
@@ -1800,6 +1810,8 @@ else
 	missing_marker "$LOG" "execve argv/envp marker emitted" "missing execve argv/envp support/unsupported marker"
 fi
 check_output "$LOG" "M13-SMOKE: ok execve-fail-deterministic" "failed execve returns deterministic child status"
+check_output "$LOG" "M13-SMOKE: ok execve-many-args" "execve passes a 1002-entry argv whole and in order"
+check_output "$LOG" "M13-SMOKE: ok execve-e2big" "an argv larger than the exec argument budget fails with E2BIG instead of being cut short"
 if grep -q "M13-SMOKE: ok builtin-exec" "$LOG" 2>/dev/null; then
 	pass "builtin exec path works through execve"
 elif grep -q "M13-SMOKE: unsupported builtin-exec" "$LOG" 2>/dev/null; then
@@ -1888,6 +1900,9 @@ check_output "$LOG" "swap: device=sdb" "swap attaches the second SATA disk under
 check_output "$LOG" "M14-SMOKE: ok mount-ext4-sata" "mount sda as ext4 successful"
 check_output "$LOG" "M14-SMOKE: ok mount-ext4-nvme" "mount nvme0n1 as ext4 successful"
 check_output "$LOG" "M14-SMOKE: ok ext4-persistence" "ext4 read, write, and remount persistence verified"
+check_output "$LOG" "M14-SMOKE: ok ext4-churn-cache" "files written in chunks and renamed over their previous versions read back exactly (freed inodes reused)"
+check_output "$LOG" "M14-SMOKE: ok ext4-churn-disk" "the same churned files read back exactly from the disk after a remount"
+check_output "$LOG" "M14-SMOKE: ok ext4-shared-mmap-durable" "a file filled through a shared mapping (ftruncate, store, sync mid-way, munmap) reaches the disk intact"
 check_output "$LOG" "M14-SMOKE: ok ext4-fifo-persistence" "a FIFO created with mkfifo is a real ext4 inode and survives umount/mount"
 check_output "$LOG" "M14-SMOKE: ok block-cache" "cached read and dirty write verified"
 check_output "$LOG" "M14-SMOKE: ok persistence" "persistence through sync, umount, and remount verified"
@@ -3076,6 +3091,8 @@ check_output "$INIT_LOG" "M108-SMOKE: ok init-shell" "the BusyBox-init boot reac
 check_output "$INIT_LOG" "M108-SMOKE: ok init-reaps-orphan" "BusyBox init reaps an orphaned grandchild re-parented to PID 1"
 check_output "$INIT_LOG" "M108-SMOKE: ok init-respawns-getty" "killing the inittab getty makes PID 1 respawn it as a new process"
 # ── M100b: VT-d DMA remapping ──
+check_iommu "$IOMMU_LOG" "reboot: restarting" "SYS_REBOOT restart reaches the kernel's reset path"
+check_iommu "$AMDVI_LOG" "SMOKE-WATCHDOG: qemu-exited-after-done" "the restart really resets the machine: QEMU (-no-reboot) exits on its own"
 check_iommu "$IOMMU_LOG" "iommu: VT-d at" "M100b: the DMAR table is parsed and the remapping unit is brought up"
 check_iommu "$IOMMU_LOG" "M100B-SMOKE: ok vtd-enable" "M100b: the unit reports translation enabled and pointing at our root table"
 check_iommu "$IOMMU_LOG" "M100B-SMOKE: ok vtd-map" "M100b: a mapping installed through the API is what the hardware page tables say"
@@ -3106,8 +3123,8 @@ check_iommu "$AMDVI_LOG" "M100D-SMOKE: ok amdvi-map" "M100d: a mapping is what t
 check_iommu "$AMDVI_LOG" "M100D-SMOKE: ok amdvi-unmap" "M100d: unmapping removes the translation"
 check_iommu "$AMDVI_LOG" "M100D-SMOKE: ok nvme-translated" "M100d: NVMe runs in a domain AMD-Vi translates, reads a block, and the event log stays empty"
 check_iommu "$AMDVI_LOG" "M100D-SMOKE: ok amdvi-command-ring" "M100d: the unit consumes commands from the ring, so invalidation is real"
-check_iommu "$AMDVI_LOG" "reboot: powering off" "M100d: the machine boots and shuts down with AMD-Vi translating"
-check_iommu "$IOMMU_LOG" "reboot: powering off" "M100b: the machine still boots and shuts down with translation on"
+check_iommu "$AMDVI_LOG" "reboot: restarting" "M100d: the machine boots and restarts with AMD-Vi translating"
+check_iommu "$IOMMU_LOG" "SMOKE-WATCHDOG: qemu-exited-after-done" "M100b: the machine still boots and resets with translation on"
 check_output "$INIT_LOG" "M108-SMOKE: done-init" "M108 BusyBox-init instance completes"
 # ── M86: per-thread CPU accounting + thread-directed signals ──
 check_output "$LOG" "M86-SMOKE: ok thread-cputime" "CLOCK_THREAD_CPUTIME_ID tracks CPU actually burned and stays flat while the thread sleeps"
@@ -3571,6 +3588,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 	check_output "$LOG" "M118-RTC: ok leap-year-january" "January of a leap year is not shifted a day (the old estimate was)"
 	check_output "$LOG" "M118-RTC: ok leap-2024" "Feb 29 of an ordinary leap year converts exactly"
 	check_output "$LOG" "M118-RTC: ok century-2100" "2100 is NOT a leap year (the 100-year rule)"
+	check_output "$LOG" "M118-RTC: ok slew-monotonic" "a backwards wall-clock correction is slewed, never stepped: the clock does not read an earlier time"
 
 	# ── M99: linuxkpi compatibility layer (in-kernel) ──
 	check_output "$LOG" "M99-SMOKE: ok idr" "M99: idr allocates unique ids, looks up the exact pointers, and reuses freed ids"

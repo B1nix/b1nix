@@ -553,6 +553,7 @@ KERNEL_SOURCES := \
 	kernel/lib/kprof.c \
 	kernel/lib/kprintf.c \
 	kernel/lib/ktime.c \
+	kernel/lib/wallclock.c \
 	kernel/lib/termios_abi.c \
 	kernel/lib/stdio.c \
 	kernel/lib/ftrace.c \
@@ -1059,26 +1060,6 @@ else
 I915_IMPORT_OBJECTS :=
 endif
 
-# The two files whose CODE changes with the filesystem-import flags — main.c
-# runs the imported filesystems' entry points, and lkpifs.c registers a type per
-# filesystem in the link.
-#
-# Their own stamp rather than DRM_FLAGS_STAMP: that hash is computed near the
-# top of this file, before the import block appends -DB1NIX_FS_IMPORT* to
-# COMMON_CFLAGS, so it cannot see them. Without a stamp that does, switching
-# B1NIX_FS_IMPORT leaves a stale object behind and the link fails on a missing
-# initcall — or, worse, succeeds against the wrong one.
-FS_IMPORT_FLAGS_HASH := $(firstword $(shell printf '%s' \
-	'$(B1NIX_FS_IMPORT)' | cksum))
-FS_IMPORT_FLAGS_STAMP := $(BUILD_DIR)/.fs-import-flags-$(FS_IMPORT_FLAGS_HASH)
-
-$(FS_IMPORT_FLAGS_STAMP):
-	@mkdir -p $(dir $@)
-	@rm -f $(BUILD_DIR)/.fs-import-flags-*
-	@touch $@
-
-$(BUILD_DIR)/kernel/main.o: $(FS_IMPORT_FLAGS_STAMP)
-$(BUILD_DIR)/kernel/fs/lkpifs.o: $(FS_IMPORT_FLAGS_STAMP)
 
 
 .PHONY: kernel-dist i915-fetch bootstrap
@@ -1091,7 +1072,7 @@ i915-fetch:
 # The imported filesystems, staged by tools/fs/fetch-linux-fs.sh and never
 # edited, exactly as the DRM import is.
 #
-# btrfs is ON by default on x86_64 when that tree is present, because it IS
+# btrfs is ON by default when that tree is present, because it IS
 # b1nix's btrfs now: the driver that used to be here was 5000 lines of our own
 # reading of the on-disk format, and the imported one is the format's own
 # implementation, checked by the same self-test and by the host's btrfs check
@@ -1099,12 +1080,33 @@ i915-fetch:
 # so at mount, the same way it does without the staged i915.
 FS_IMPORT_DIR := build/src/fs-6.6
 FS_IMPORT_GEN := build/src/fs-6.6-gen
-ifeq ($(ARCH),x86_64)
 ifneq ($(wildcard $(FS_IMPORT_DIR)/B1NIX-OBJECTS),)
 B1NIX_FS_IMPORT ?= btrfs
 endif
-endif
 B1NIX_FS_IMPORT ?= 0
+
+# The two files whose CODE changes with the filesystem-import flags — main.c
+# runs the imported filesystems' entry points, and lkpifs.c registers a type per
+# filesystem in the link.
+#
+# Their own stamp rather than DRM_FLAGS_STAMP: that hash is computed near the
+# top of this file, before the import block appends -DB1NIX_FS_IMPORT* to
+# COMMON_CFLAGS, so it cannot see them. Without a stamp that does, switching
+# B1NIX_FS_IMPORT leaves a stale object behind and the link fails on a missing
+# initcall — or, worse, succeeds against the wrong one. Computed here, after
+# B1NIX_FS_IMPORT has its value: above it the hash was of an empty string and
+# the stamp never changed.
+FS_IMPORT_FLAGS_HASH := $(firstword $(shell printf '%s' \
+	'$(B1NIX_FS_IMPORT)' | cksum))
+FS_IMPORT_FLAGS_STAMP := $(BUILD_DIR)/.fs-import-flags-$(FS_IMPORT_FLAGS_HASH)
+
+$(FS_IMPORT_FLAGS_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(BUILD_DIR)/.fs-import-flags-*
+	@touch $@
+
+$(BUILD_DIR)/kernel/main.o: $(FS_IMPORT_FLAGS_STAMP)
+$(BUILD_DIR)/kernel/fs/lkpifs.o: $(FS_IMPORT_FLAGS_STAMP)
 
 # B1NIX_FS_IMPORT=btrfs builds btrfs and what it stands on; =1 adds ext4 and
 # jbd2. The split is not arbitrary: btrfs needs the VFS, the page cache and the
@@ -1153,11 +1155,11 @@ FS_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(FS_IMPORT_SOURCES))
 # generator derived from the pinned source, and the forward declarations for
 # structs the imported headers name before defining.
 FS_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
-	-fno-stack-protector -fno-pic -mno-red-zone -w -g -MMD -MP \
+	-fno-stack-protector -fno-pic -w -g -MMD -MP \
 	-Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types \
 	$(FILE_PREFIX_MAP) \
 	-D__KERNEL__ -D__linux__ -DKBUILD_MODNAME='"b1nixfs"' \
-	-DCONFIG_X86=1 -DCONFIG_X86_64=1 \
+	$(DRM_IMPORT_ARCH_FLAGS) \
 	-DCONFIG_PRINTK=1 \
 	-DCONFIG_QUOTA=1 -DCONFIG_QUOTA_TREE=1 -DCONFIG_QFMT_V2=1 \
 	-DCONFIG_QUOTACTL=1 \

@@ -612,6 +612,9 @@ struct lkpi_kthread_arg {
 	int (*fn)(void *);
 	void *data;
 	u64 id;                  /* b1nix task id, so the current thread finds it */
+	/* The thread's own `current`, published by the thread itself: the handle
+	 * a waker must mark, since it is what the thread's sleep checks. */
+	struct lkpi_task *volatile task;
 	volatile int should_stop;
 	volatile int finished;
 	int ret;
@@ -634,12 +637,26 @@ static struct lkpi_kthread_arg *kthread_find(u64 id)
 	return a;
 }
 
+static struct lkpi_kthread_arg *kthread_find_task(struct lkpi_task *t)
+{
+	struct lkpi_kthread_arg *a;
+	u64 flags;
+
+	spin_lock_irqsave(&lkpi_kthread_lock, &flags);
+	for (a = lkpi_kthreads; a; a = a->next)
+		if (a->task == t)
+			break;
+	spin_unlock_irqrestore(&lkpi_kthread_lock, flags);
+	return a;
+}
+
 int kthread_create(const char *name, void (*entry)(void *arg), void *arg);
 
 static void lkpi_fs_kthread_entry(void *arg)
 {
 	struct lkpi_kthread_arg *a = arg;
 
+	a->task = lkpi_current();
 	a->ret = a->fn(a->data);
 	a->finished = 1;
 	/* Whoever is in kthread_stop() is parked on the record. */
@@ -664,7 +681,7 @@ int lkpi_kthread_should_stop(void)
  */
 int lkpi_kthread_stop(unsigned long handle)
 {
-	struct lkpi_kthread_arg *a = kthread_find(handle ? handle - 1 : 0);
+	struct lkpi_kthread_arg *a = kthread_find_task((struct lkpi_task *)handle);
 	struct lkpi_kthread_arg **pp;
 	u64 flags;
 	int ret;
@@ -704,6 +721,7 @@ struct lkpi_task *lkpi_fs_kthread_run(int (*threadfn)(void *data), void *data,
 	a->should_stop = 0;
 	a->finished = 0;
 	a->ret = 0;
+	a->task = NULL;
 	id = kthread_create(name ? name : "lkpi-fs", lkpi_fs_kthread_entry, a);
 	if (id < 0) {
 		lkpi_kfree(a);
@@ -714,17 +732,13 @@ struct lkpi_task *lkpi_fs_kthread_run(int (*threadfn)(void *data), void *data,
 	a->next = lkpi_kthreads;
 	lkpi_kthreads = a;
 	spin_unlock_irqrestore(&lkpi_kthread_lock, flags);
-	/*
-	 * The caller gets a task handle it only ever passes back to
-	 * wake_up_process and kthread_stop. b1nix identifies a task by id, and
-	 * there is no lookup from one to a `struct lkpi_task` — so the id is
-	 * returned as the handle, which is what lkpi_wake_task already accepts.
-	 *
-	 * That is a real narrowing: a caller that dereferenced the handle would
-	 * fault. Nothing in btrfs does — it stores the pointer and wakes it — and
-	 * a lookup is what this needs if one ever does.
-	 */
-	return (struct lkpi_task *)(unsigned long)(id + 1);
+	/* The handle is the thread's real `current`, which only the thread can
+	 * name; it publishes it first thing. A number standing in for a pointer
+	 * here was dereferenced by every wake: on aarch64 that faulted, on x86_64
+	 * it wrote into low physical memory and woke nobody. */
+	while (!a->task)
+		scheduler_yield();
+	return a->task;
 }
 
 /* The kernel profiler's report, and a plain sleep — both b1nix services the

@@ -178,6 +178,22 @@ void rtc_selftest(void) {
       console_write("\n");
     }
   }
+
+  /* A correction toward an earlier time is applied as a slower rate, never as
+   * a step: the clock must not read an earlier time than it just did. The two
+   * opposite slews cancel, so the wall clock is left as it was found. */
+  u64 prev = rtc_now_unix_nanos();
+  int backwards = 0;
+  wallclock_slew_ns(-250000000);
+  for (int i = 0; i < 200000; i++) {
+    u64 now = rtc_now_unix_nanos();
+    if (now < prev)
+      backwards = 1;
+    prev = now;
+  }
+  wallclock_slew_ns(250000000);
+  console_write(backwards ? "M118-RTC: FAIL slew-monotonic\n"
+                          : "M118-RTC: ok slew-monotonic\n");
 }
 
 /* Read the hardware clock. Retries until two consecutive reads agree and the
@@ -336,46 +352,17 @@ static int rtc_set_status_b(u8 bit, int on) {
   return 0;
 }
 
-u64 rtc_now_unix_seconds(void) {
-  if (!pl031_present())
-    return g_rtc_soft_seconds;
-  return *pl031_reg(PL031_DR);
-}
-
-/* The wall clock in nanoseconds, with a sub-second part that actually moves.
- *
- * This used to be the seconds reading multiplied by a billion, so every
- * timestamp on this arch had nanoseconds of exactly zero. Two changes inside
- * one second were then indistinguishable, which is precisely what a directory
- * mtime is asked to distinguish: anything that re-reads a directory only when
- * its mtime moved (make, ccache, systemd's unit cache, package managers) was
- * blind to a second write in the same second.
- *
- * Built the way x86_64 builds it: ONE monotonic source carries the sub-second
- * part, anchored to the seconds the RTC read at boot, so the composite never
- * walks backwards. The RTC is re-read only when it ticks a new second, which
- * keeps long-run drift bounded to the hardware's own. */
+/* The wall clock is monotonic time plus a base (kernel/lib/wallclock.c),
+ * anchored to the RTC the first time anyone asks. Reading the PL031 on every
+ * call gave a clock whose seconds and sub-second part came from two sources,
+ * and whose value could step whenever the RTC was reloaded. */
 u64 rtc_now_unix_nanos(void) {
-  static u64 anchor_sec;      /* RTC seconds at the last resync */
-  static u64 anchor_mono_ns;  /* monotonic reading at that moment */
-  static int anchored;
-
-  u64 sec = rtc_now_unix_seconds();
-  u64 mono = ktime_monotonic_ns();
-
-  if (!anchored || sec != anchor_sec) {
-    /* First call, or the RTC moved on: re-anchor so the sub-second part
-     * restarts from zero exactly when the second changes. */
-    anchor_sec = sec;
-    anchor_mono_ns = mono;
-    anchored = 1;
-  }
-
-  u64 sub = mono - anchor_mono_ns;
-  if (sub > 999999999ull)
-    sub = 999999999ull; /* the RTC is late; hold at the end of the second */
-  return sec * 1000000000ull + sub;
+  if (!wallclock_ready())
+    wallclock_init(pl031_present() ? *pl031_reg(PL031_DR) : g_rtc_soft_seconds);
+  return wallclock_now_ns();
 }
+
+u64 rtc_now_unix_seconds(void) { return rtc_now_unix_nanos() / 1000000000ull; }
 
 void rtc_set_unix_time(u64 sec) {
   u64 flags;
@@ -387,6 +374,7 @@ void rtc_set_unix_time(u64 sec) {
     g_rtc_soft_seconds = sec;
   }
   spin_unlock_irqrestore(&rtc_lock, flags);
+  wallclock_set_ns(sec * 1000000000ull);
 }
 
 #else

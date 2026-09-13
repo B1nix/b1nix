@@ -279,9 +279,13 @@ Upstream Linux 6.6 `fs/btrfs`, `fs/ext4`, `fs/jbd2` built unpatched on our shim.
 - [x] OpenRC is Alpine's 0.54 under BusyBox init; the `openrc-init` PID 1 instance is gone (Alpine does not build it), IOMMU instances boot the default init.
 - [x] libc++, libunwind and compiler-rt builtins are Alpine's (LLVM 17; libc++abi needs `libgcc_s`, accepted).
 - [x] Own native clang/Rust toolchain builds and the `b1nix-pkgs` download removed; nothing third-party is built from source.
-- [ ] `planned` Self-host (M26) on Alpine's clang17/lld: generate per-TU compile commands from the host build (lkpi/imported TUs need their flags) and stage the toolchain from packages; broken until then.
-- [ ] `planned` aarch64: build the imported filesystems (btrfs) so its M119/M95 checks run; `m40-linux-hello` blob is x86_64-only.
+- [x] Self-host (M26) on Alpine's clang17/lld with the host build's own per-TU commands: 653/653 compile and the link succeeds in-guest.
+- [x] execve no longer drops arguments past 256 (a 684-argument link ran on the first 256 objects); oversized vectors are E2BIG.
+- [ ] `partial` The self-hosted kernel.elf does not boot: native ext4 loses data written into a file extended by ftruncate (`M14-SMOKE: ext4-shared-mmap-durable` fails the same way with plain write()). Fix by moving to Linux's ext4 through lkpi.
+- [x] aarch64 builds the imported btrfs and prints debug tracing on test boots (the M40 personality line).
+- [ ] `partial` aarch64 smoke 1357/0, but one run in two wedged sys/posix: READY tasks not picked and futex wakes missed under TCG; not yet traced.
+- [x] Wall clock no longer runs backwards: NTP slewed by stepping whole seconds; now one monotonic-based wall clock on both arches, NTP offset in ns, slew at <=500 ppm.
 - [x] `telinit` and the fake M39 inittab markers removed (M39 keeps its real serial-tty checks).
-- [ ] `planned` A lane that really restarts the machine: `SYS_REBOOT` restart is untested since its marker was faked.
+- [x] The IOMMU instances end with `reboot -f`; the check passes only when QEMU (-no-reboot) then exits on its own.
 - [ ] `planned` Move the tests to the Linux ABI, then remove the native b1nix syscall ABI.
 - [ ] `planned` Debian lane to full parity as the glibc ABI check; decide Arch.

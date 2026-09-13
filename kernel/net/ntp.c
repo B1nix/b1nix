@@ -9,7 +9,6 @@
 #define NTP_MAX_STRATUM 15
 #define NTP_MAX_ABS_OFFSET_SEC (24u * 60u * 60u)
 #define NTP_STEP_THRESHOLD_SEC 3u
-#define NTP_SLEW_APPLY_TICKS 100u /* ~1s at 100Hz */
 #define NTP_INITIAL_RETRY_TICKS 2000u
 #define NTP_MAX_RETRY_TICKS 60000u
 #define NTP_PERIODIC_SYNC_TICKS 360000u
@@ -20,9 +19,7 @@ static volatile int ntp_inflight = 0;
 static volatile int ntp_synced = 0;
 static u64 ntp_last_send_ticks = 0;
 static u64 ntp_last_try_ticks = 0;
-static u64 ntp_last_slew_ticks = 0;
 static int ntp_registered = 0;
-static int ntp_pending_slew_sec = 0;
 static u32 ntp_last_client_tx_secs = 0;
 static u32 ntp_retry_ticks = NTP_INITIAL_RETRY_TICKS;
 /* M96 module parameter: the server the client resolves. Writable through
@@ -64,20 +61,21 @@ static void ntp_receive(const void *data, usize size) {
   if (dp < d0 && dp <= dn) full_ntp = c_prev;
   else if (dn < d0 && dn < dp) full_ntp = c_next;
   if (full_ntp < NTP_UNIX_EPOCH_DELTA) return;
-  u64 remote_unix = full_ntp - NTP_UNIX_EPOCH_DELTA;
-  u64 local_unix = rtc_now_unix_seconds();
-  long long delta = (long long)remote_unix - (long long)local_unix;
-  unsigned long long abs_delta =
-      (delta < 0) ? (unsigned long long)(-delta) : (unsigned long long)delta;
-  if (abs_delta > NTP_MAX_ABS_OFFSET_SEC) return;
+  /* The offset in nanoseconds, fraction included: at one-second resolution
+   * both sides are truncated, and the difference is rounding noise. */
+  u32 tx_frac = ((u32)p[44] << 24) | ((u32)p[45] << 16) | ((u32)p[46] << 8) | p[47];
+  i64 remote_ns = (i64)((full_ntp - NTP_UNIX_EPOCH_DELTA) * 1000000000ull) +
+                  (i64)(((u64)tx_frac * 1000000000ull) >> 32);
+  i64 delta_ns = remote_ns - (i64)rtc_now_unix_nanos();
+  u64 abs_ns = delta_ns < 0 ? (u64)-delta_ns : (u64)delta_ns;
+  if (abs_ns > (u64)NTP_MAX_ABS_OFFSET_SEC * 1000000000ull) return;
 
-  if (abs_delta >= NTP_STEP_THRESHOLD_SEC) {
-    rtc_set_unix_time(remote_unix);
-    ntp_pending_slew_sec = 0;
-  } else if (delta != 0) {
-    if (delta > 0) ntp_pending_slew_sec += (int)delta;
-    else ntp_pending_slew_sec -= (int)(-delta);
-  }
+  /* A large error is stepped; a small one is slewed, which never moves the
+   * wall clock backwards. */
+  if (abs_ns >= (u64)NTP_STEP_THRESHOLD_SEC * 1000000000ull)
+    wallclock_set_ns((u64)remote_ns);
+  else if (delta_ns != 0)
+    wallclock_slew_ns(delta_ns);
 
   ntp_synced = 1;
   ntp_inflight = 0;
@@ -113,18 +111,6 @@ void ntp_tick(u64 now_ticks) {
   if (!ntp_registered) {
     udp_register_handler(NTP_SRC_PORT, ntp_receive);
     ntp_registered = 1;
-  }
-
-  if (ntp_pending_slew_sec != 0 && now_ticks - ntp_last_slew_ticks >= NTP_SLEW_APPLY_TICKS) {
-    u64 now = rtc_now_unix_seconds();
-    if (ntp_pending_slew_sec > 0) {
-      rtc_set_unix_time(now + 1);
-      ntp_pending_slew_sec--;
-    } else {
-      rtc_set_unix_time(now - 1);
-      ntp_pending_slew_sec++;
-    }
-    ntp_last_slew_ticks = now_ticks;
   }
 
   if (ntp_inflight) {

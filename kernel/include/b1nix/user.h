@@ -12,8 +12,6 @@
  * it what it is and which channel to use, and then behaved like a process
  * that could not find its parent. sys_execve already copies up to 256 of
  * each; this is the limit that was throwing them away. */
-#define USER_MAX_ARGS 256
-#define USER_MAX_ENVS 256
 /* Total PT_LOAD segments across the executable and every DT_NEEDED object in the
  * eager-linked graph. Deep C++ chains reach many objects × ~4 segments each
  * (the Skia demo: 11 objects × 4 = 44), so 32 is too small — 64 leaves room. */

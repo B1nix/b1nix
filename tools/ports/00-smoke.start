@@ -48,9 +48,10 @@ elif grep -q 'b1nix.smoke=init' /proc/cmdline 2>/dev/null; then
     exit 0
 elif grep -q 'b1nix.smoke=iommu' /proc/cmdline 2>/dev/null; then
     # The IOMMU instances: the kernel's self-tests are the whole check and they
-    # have run by the time userspace is up. Power off through the real syscall;
-    # the kernel prints "reboot: powering off" itself.
-    ( sleep 1; /bin/poweroff -f ) &
+    # have run by the time userspace is up. End by RESTARTING through the real
+    # syscall, which is the one test of the reset path: the harness passes it
+    # only when QEMU (-no-reboot) then exits on its own.
+    ( sleep 1; /bin/reboot -f ) &
     exit 0
 else
     SMOKE_SYS=1

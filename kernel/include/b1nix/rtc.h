@@ -11,6 +11,14 @@ u64 rtc_now_unix_seconds(void);
 u64 rtc_now_unix_nanos(void);
 void rtc_set_unix_time(u64 unix_time_now);
 
+/* The wall clock itself (kernel/lib/wallclock.c): monotonic time plus a base.
+ * Set steps it; slew corrects it at a bounded rate and never moves it back. */
+void wallclock_init(u64 unix_seconds);
+int wallclock_ready(void);
+u64 wallclock_now_ns(void);
+void wallclock_set_ns(u64 unix_ns);
+void wallclock_slew_ns(i64 delta_ns);
+
 /* Seconds since the epoch for a civil (proleptic Gregorian) date, exact through
  * the 100/400-year leap rules. Exposed so the conversion can be tested against
  * known answers rather than trusted; see rtc_selftest(). */

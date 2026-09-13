@@ -8,8 +8,6 @@
 #define CMOS_DATA 0x71
 
 u64 rtc_boot_time_seconds = 0;
-/* Applied to the wall clock by settimeofday(2), in nanoseconds. */
-static i64 rtc_time_offset_ns = 0;
 
 static u8 read_cmos(u8 reg) {
   outb(CMOS_ADDR, reg);
@@ -84,6 +82,7 @@ void rtc_init(void) {
     year = (u16)(year < 70 ? year + 2000 : year + 1900);
 
   rtc_boot_time_seconds = rtc_civil_to_unix(year, month, day, hour, minute, second);
+  wallclock_init(rtc_boot_time_seconds);
 }
 
 
@@ -98,15 +97,13 @@ void rtc_init(void) {
  * timestamp and every timeout computed from the wall clock was equally
  * unreliable. */
 u64 rtc_now_unix_nanos(void) {
-  i64 ns = (i64)(rtc_boot_time_seconds * 1000000000ull) +
-           (i64)ktime_monotonic_ns() + rtc_time_offset_ns;
-  return ns < 0 ? 0 : (u64)ns;
+  if (!wallclock_ready())
+    return rtc_boot_time_seconds * 1000000000ull;
+  return wallclock_now_ns();
 }
 
 u64 rtc_now_unix_seconds(void) { return rtc_now_unix_nanos() / 1000000000ull; }
 
 void rtc_set_unix_time(u64 unix_time_now) {
-  i64 base = (i64)(rtc_boot_time_seconds * 1000000000ull) +
-             (i64)ktime_monotonic_ns();
-  rtc_time_offset_ns = (i64)(unix_time_now * 1000000000ull) - base;
+  wallclock_set_ns(unix_time_now * 1000000000ull);
 }

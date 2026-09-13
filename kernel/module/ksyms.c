@@ -100,6 +100,9 @@ EXPORT_SYMBOL(scheduler_get_uptime_ticks);
 EXPORT_SYMBOL(sched_tick_hz);
 EXPORT_SYMBOL(rtc_now_unix_seconds);
 EXPORT_SYMBOL(rtc_set_unix_time);
+EXPORT_SYMBOL(rtc_now_unix_nanos);
+EXPORT_SYMBOL(wallclock_set_ns);
+EXPORT_SYMBOL(wallclock_slew_ns);
 
 /* ── VFS ─────────────────────────────────────────────────────────────────── */
 EXPORT_SYMBOL(vfs_register_fs);

@@ -342,60 +342,67 @@ static char *kernel_strdup(const char *src) {
   return copy;
 }
 
-static int copy_string_vector(const char **src, int max_count,
-                              const char ***out, int *out_count,
-                              int source_is_user) {
-  const char **copy = kzalloc(sizeof(char *) * (max_count + 1));
-  int count = 0;
-  char tmp[1024];
+/* Copy an argv/envp vector into the image. No count limit: the strings are
+ * bounded by the room the initial stack has for them, which
+ * user_build_initial_stack() checks as it places them. */
+static int copy_string_vector(const char **src, const char ***out,
+                              int *out_count, int source_is_user) {
+  int cap = 32, count = 0;
+  const char **copy = kzalloc(sizeof(char *) * (usize)(cap + 1));
+  char *tmp = source_is_user ? kmalloc(USER_STACK_SIZE / 4) : 0;
 
-  if (!copy) {
-    console_write("copy_string_vector: kzalloc failed\n");
+  if (!copy || (source_is_user && !tmp)) {
+    console_write("copy_string_vector: out of memory\n");
+    kfree(copy);
+    kfree(tmp);
     return -1;
   }
-  if (src) {
-    for (; count < max_count; count++) {
-      const char *ptr = 0;
-      if (source_is_user) {
-        if (syscall_copyin(&ptr, src + count, sizeof(ptr)) != 0) {
-          console_write("copy_string_vector: syscall_copyin src failed at ");
-          console_write_dec(count);
-          console_write("\n");
-          return -1;
-        }
-      } else {
-        ptr = src[count];
-      }
-
-      if (!ptr)
-        break;
-
-      if (source_is_user) {
-        if (syscall_copyinstr(tmp, sizeof(tmp), ptr) != 0) {
-          console_write("copy_string_vector: syscall_copyinstr ptr failed at ");
-          console_write_dec(count);
-          console_write("\n");
-          return -1;
-        }
-      } else {
-        strncpy(tmp, ptr, sizeof(tmp));
-        tmp[sizeof(tmp) - 1] = '\0';
-      }
-
-      copy[count] = kernel_strdup(tmp);
-      if (!copy[count]) {
-        console_write("copy_string_vector: kernel_strdup failed at ");
-        console_write_dec(count);
-        console_write("\n");
-        return -1;
-      }
+  while (src) {
+    const char *ptr = 0;
+    if (source_is_user) {
+      if (syscall_copyin(&ptr, src + count, sizeof(ptr)) != 0)
+        goto fail;
+    } else {
+      ptr = src[count];
     }
+    if (!ptr)
+      break;
+    if (count == cap) {
+      const char **grown = kzalloc(sizeof(char *) * (usize)(cap * 2 + 1));
+      if (!grown)
+        goto fail;
+      memcpy(grown, copy, sizeof(char *) * (usize)cap);
+      kfree(copy);
+      copy = grown;
+      cap *= 2;
+    }
+    if (source_is_user) {
+      if (syscall_copyinstr(tmp, USER_STACK_SIZE / 4, ptr) != 0)
+        goto fail;
+      copy[count] = kernel_strdup(tmp);
+    } else {
+      copy[count] = kernel_strdup(ptr);
+    }
+    if (!copy[count])
+      goto fail;
+    count++;
   }
+  kfree(tmp);
   copy[count] = 0;
   *out = copy;
   if (out_count)
     *out_count = count;
   return 0;
+
+fail:
+  console_write("copy_string_vector: failed at ");
+  console_write_dec((u64)count);
+  console_write("\n");
+  for (int i = 0; i < count; i++)
+    kfree((void *)copy[i]);
+  kfree(copy);
+  kfree(tmp);
+  return -1;
 }
 
 static int user_stack_push_usize(char *stack, usize *sp, usize value) {
@@ -417,26 +424,31 @@ static usize user_stack_push_string(char *stack, usize *sp, const char *text) {
 
 static int user_build_initial_stack(struct user_loaded_image *image) {
   char *stack = image->address_space.stack_image;
-  usize argv_ptrs[USER_MAX_ARGS];
-  usize envp_ptrs[USER_MAX_ENVS];
   usize sp = USER_STACK_SIZE;
 
   if (!stack)
     return -1;
 
-  for (int i = image->argc - 1; i >= 0; i--) {
-    argv_ptrs[i] = user_stack_push_string(stack, &sp, image->argv[i]);
-    if (argv_ptrs[i] == 0) return -1;
-  }
-
   int envc = 0;
   if (image->envp) {
-    for (; envc < USER_MAX_ENVS && image->envp[envc]; envc++)
+    for (; image->envp[envc]; envc++)
       ;
+  }
+  /* Sized by the vectors, not a fixed table: a fixed one silently dropped
+   * every argument past its length. */
+  usize *argv_ptrs = kmalloc(sizeof(usize) * (usize)(image->argc + 1));
+  usize *envp_ptrs = kmalloc(sizeof(usize) * (usize)(envc + 1));
+  int rc = -1;
+  if (!argv_ptrs || !envp_ptrs)
+    goto out;
+
+  for (int i = image->argc - 1; i >= 0; i--) {
+    argv_ptrs[i] = user_stack_push_string(stack, &sp, image->argv[i]);
+    if (argv_ptrs[i] == 0) goto out;
   }
   for (int i = envc - 1; i >= 0; i--) {
     envp_ptrs[i] = user_stack_push_string(stack, &sp, image->envp[i]);
-    if (envp_ptrs[i] == 0) return -1;
+    if (envp_ptrs[i] == 0) goto out;
   }
 
   /* M92: Push the AT_EXECFN string data BEFORE the 16-byte alignment so its
@@ -445,7 +457,7 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
   usize execfn_va = 0;
   if (image->path) {
     execfn_va = user_stack_push_string(stack, &sp, image->path);
-    if (execfn_va == 0) return -1;
+    if (execfn_va == 0) goto out;
   }
 
   sp &= ~(usize)0xf;
@@ -460,7 +472,7 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
   usize words_per_16 = 16 / sizeof(usize);
   usize rem = total_slots % words_per_16;
   usize pad = rem ? (words_per_16 - rem) : 0;
-  if (sp < pad * sizeof(usize)) return -1;
+  if (sp < pad * sizeof(usize)) goto out;
   sp -= pad * sizeof(usize);
 
   usize rand_va = 0;
@@ -468,7 +480,7 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
     u64 rand_bytes[2];
     rand_bytes[0] = kernel_random_u64();
     rand_bytes[1] = kernel_random_u64();
-    if (sp < sizeof(rand_bytes)) return -1;
+    if (sp < sizeof(rand_bytes)) goto out;
     sp -= sizeof(rand_bytes);
     memcpy(stack + sp, rand_bytes, sizeof(rand_bytes));
     rand_va = USER_STACK_TOP - USER_STACK_SIZE + sp;
@@ -479,14 +491,14 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
    * NULL — each entry appears in the ABI's {a_type, a_val} order and AT_NULL
    * terminates the array at the high end. */
   usize auxv_end_sp = sp; /* high end of the auxv block, for /proc/<pid>/auxv */
-  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL  a_val */
-  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL  a_type */
-  if (user_stack_push_usize(stack, &sp, (usize)image->phdr_vaddr) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, AT_PHDR) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, 56) < 0) return -1;                    /* AT_PHENT = sizeof(Elf64_Phdr) */
-  if (user_stack_push_usize(stack, &sp, AT_PHENT) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, (usize)image->phnum) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, AT_PHNUM) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, 0) < 0) goto out; /* AT_NULL  a_val */
+  if (user_stack_push_usize(stack, &sp, 0) < 0) goto out; /* AT_NULL  a_type */
+  if (user_stack_push_usize(stack, &sp, (usize)image->phdr_vaddr) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, AT_PHDR) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, 56) < 0) goto out;                    /* AT_PHENT = sizeof(Elf64_Phdr) */
+  if (user_stack_push_usize(stack, &sp, AT_PHENT) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, (usize)image->phnum) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, AT_PHNUM) < 0) goto out;
   /* AT_ENTRY is always the EXECUTABLE's own entry point (what a real ld.so
    * jumps to once it's done linking), not the interpreter's — image->entry
    * only becomes the interpreter's entry (see PT_INTERP handling) as the
@@ -494,17 +506,17 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
   if (user_stack_push_usize(
           stack, &sp,
           (usize)(image->interp_base ? image->app_entry : image->entry)) < 0)
-    return -1;
-  if (user_stack_push_usize(stack, &sp, AT_ENTRY) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, PAGE_SIZE) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, AT_PAGESZ) < 0) return -1;
+    goto out;
+  if (user_stack_push_usize(stack, &sp, AT_ENTRY) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, PAGE_SIZE) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, AT_PAGESZ) < 0) goto out;
   /* AT_BASE: the interpreter's own load bias, so its self-relocation and
    * dl_iterate_phdr math agree with where the kernel actually placed it.
    * 0 for images with no real userspace interpreter (unchanged behaviour). */
-  if (user_stack_push_usize(stack, &sp, (usize)image->interp_base) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, AT_BASE) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, 100) < 0) return -1;                   /* AT_CLKTCK = 100 Hz tick */
-  if (user_stack_push_usize(stack, &sp, AT_CLKTCK) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, (usize)image->interp_base) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, AT_BASE) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, 100) < 0) goto out;                   /* AT_CLKTCK = 100 Hz tick */
+  if (user_stack_push_usize(stack, &sp, AT_CLKTCK) < 0) goto out;
   /* M108: publish the credentials the image will actually run with. For a
    * set-user-ID/set-group-ID exec those are not the caller's — see the
    * cred_override comment on struct user_loaded_image. */
@@ -514,50 +526,54 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
                                       : (usize)current_task->cred->euid;
   usize a_egid = image->cred_override ? (usize)image->cred_egid
                                       : (usize)current_task->cred->egid;
-  if (user_stack_push_usize(stack, &sp, a_uid) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, AT_UID) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, a_euid) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, AT_EUID) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, a_gid) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, AT_GID) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, a_egid) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, AT_EGID) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, a_uid) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, AT_UID) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, a_euid) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, AT_EUID) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, a_gid) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, AT_GID) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, a_egid) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, AT_EGID) < 0) goto out;
   /* AT_RANDOM points to the payload reserved above the auxv. */
-  if (user_stack_push_usize(stack, &sp, rand_va) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, AT_RANDOM) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;                     /* AT_HWCAP = 0 */
-  if (user_stack_push_usize(stack, &sp, AT_HWCAP) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, rand_va) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, AT_RANDOM) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, 0) < 0) goto out;                     /* AT_HWCAP = 0 */
+  if (user_stack_push_usize(stack, &sp, AT_HWCAP) < 0) goto out;
   /* AT_SECURE mirrors Linux's bprm->secureexec: set when the exec changed the
    * effective ids away from the real ones, i.e. exactly when a loader must not
    * honour LD_PRELOAD / LD_LIBRARY_PATH / $ORIGIN from the caller. */
   if (user_stack_push_usize(stack, &sp,
                             (a_euid != a_uid || a_egid != a_gid) ? 1 : 0) < 0)
-    return -1;
-  if (user_stack_push_usize(stack, &sp, AT_SECURE) < 0) return -1;
+    goto out;
+  if (user_stack_push_usize(stack, &sp, AT_SECURE) < 0) goto out;
   /* AT_EXECFN: program filename for /proc/self/exe. String data was pushed
    * earlier (before alignment); just push the pointer and type here. */
-  if (user_stack_push_usize(stack, &sp, execfn_va) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, AT_EXECFN) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, execfn_va) < 0) goto out;
+  if (user_stack_push_usize(stack, &sp, AT_EXECFN) < 0) goto out;
 
   /* The auxv block now spans [sp, auxv_end_sp) in this staging buffer; record
    * the equivalent user VA + length so /proc/<pid>/auxv can read it back. */
   image->auxv_vaddr = USER_STACK_TOP - USER_STACK_SIZE + sp;
   image->auxv_size = (u32)(auxv_end_sp - sp);
 
-  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, 0) < 0) goto out;
   for (int i = envc - 1; i >= 0; i--) {
-    if (user_stack_push_usize(stack, &sp, envp_ptrs[i]) < 0) return -1;
+    if (user_stack_push_usize(stack, &sp, envp_ptrs[i]) < 0) goto out;
   }
 
-  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, 0) < 0) goto out;
   for (int i = image->argc - 1; i >= 0; i--) {
-    if (user_stack_push_usize(stack, &sp, argv_ptrs[i]) < 0) return -1;
+    if (user_stack_push_usize(stack, &sp, argv_ptrs[i]) < 0) goto out;
   }
-  if (user_stack_push_usize(stack, &sp, (usize)image->argc) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, (usize)image->argc) < 0) goto out;
 
   image->address_space.stack_base = USER_STACK_TOP - USER_STACK_SIZE + sp;
   image->address_space.stack_size = USER_STACK_TOP - image->address_space.stack_base;
-  return 0;
+  rc = 0;
+out:
+  kfree(argv_ptrs);
+  kfree(envp_ptrs);
+  return rc;
 }
 
 static int user_image_read_vfs_file(const char *path, char **out_data,
@@ -1310,16 +1326,14 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   image->cred_euid = cred_euid;
   image->cred_egid = cred_egid;
 
-  if (copy_string_vector(argv, USER_MAX_ARGS, &image->argv, &image->argc,
-                         argv_is_user) != 0) {
+  if (copy_string_vector(argv, &image->argv, &image->argc, argv_is_user) != 0) {
     console_write("user_load_image: copy_string_vector argv failed\n");
     user_image_free(image);
     return 0;
   }
   if (argc > 0 && image->argc > argc)
     image->argc = argc;
-  if (copy_string_vector(envp, USER_MAX_ENVS, &image->envp, 0,
-                         envp_is_user) != 0) {
+  if (copy_string_vector(envp, &image->envp, 0, envp_is_user) != 0) {
     console_write("user_load_image: copy_string_vector envp failed\n");
     user_image_free(image);
     return 0;
@@ -1393,6 +1407,13 @@ void user_address_space_cleanup(struct task *t) {
   extern void eviction_unregister_all_pages(struct task *task);
   swap_free_all_slots(t->pml4_phys);
   eviction_unregister_all_pages(t);
+
+  /* Stores through shared file mappings are only in the PTEs; see
+   * vma_harvest_shared_dirty. */
+  {
+    extern void vma_harvest_shared_dirty(struct task *t, u64 start, u64 end);
+    vma_harvest_shared_dirty(t, 0, USER_SPACE_LIMIT);
+  }
 
   interrupts_disable();
   struct vm_area *vma = t->vma_list;
@@ -2211,7 +2232,7 @@ int user_spawn_env(const char *path, int argc, const char **argv,
    * this frame -- the image copies every string it is given -- so there is
    * nothing to free on any path out. */
   char interp[128], interp_opt[64];
-  /* 32, not USER_MAX_ARGS: this runs on the boot stack, whose headroom is
+  /* 32: this runs on the boot stack, whose headroom is
    * measured and reported, and nothing the kernel spawns directly carries
    * hundreds of arguments. Anything past the cap is dropped rather than
    * overrunning the array. */
