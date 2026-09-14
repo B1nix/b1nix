@@ -2,6 +2,7 @@
 # Build the image an imported filesystem is tested against.
 #
 #   make-lkpi-image.sh btrfs|ext4 [out.img]
+#   LKPI_BTRFS_COMPRESS=zstd|lzo|zlib  pack the btrfs tree compressed
 #
 # Made by the host's mkfs, not by us: the point of the import is to read and
 # write what another implementation created. ext4 keeps the features b1nix's
@@ -42,7 +43,8 @@ rm -f "$OUT"
 truncate -s "$SIZE" "$OUT"
 case "$FS" in
 btrfs)
-	mkfs.btrfs -q -L LKPITEST -m single -d single --nodesize 16384 --rootdir "$STAGE" "$OUT" ;;
+	mkfs.btrfs -q -L LKPITEST -m single -d single --nodesize 16384 \
+		${LKPI_BTRFS_COMPRESS:+--compress "$LKPI_BTRFS_COMPRESS"} --rootdir "$STAGE" "$OUT" ;;
 ext4)
 	mke2fs -q -t ext4 -O quota -L LKPIEXT4 -d "$STAGE" "$OUT" >/dev/null
 	# mke2fs leaves quota entries missing for the ids it just assigned; let
