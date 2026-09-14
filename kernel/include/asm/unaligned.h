@@ -28,4 +28,33 @@ static inline void put_unaligned_le32(u32 v, void *p)
 { __builtin_memcpy(p, &v, sizeof(v)); }
 static inline void put_unaligned_le64(u64 v, void *p)
 { __builtin_memcpy(p, &v, sizeof(v)); }
+/*
+ * The type-generic pair.
+ *
+ * Unlike the sized forms above, these take their width from the pointer's own
+ * type — btrfs reads a `__le64` field out of an on-disk directory item with
+ * `get_unaligned(&entry->offset)`. The access goes through a packed struct,
+ * which is what tells the compiler not to assume alignment it cannot have; a
+ * plain dereference would be free to use an instruction that requires it.
+ */
+#ifndef get_unaligned
+#define get_unaligned(ptr)                                                     \
+	__extension__({                                                            \
+		struct b1nix_unaligned_load {                                          \
+			__typeof__(*(ptr)) v;                                              \
+		} __attribute__((packed, may_alias));                                  \
+		((const struct b1nix_unaligned_load *)(ptr))->v;                       \
+	})
+#endif
+
+#ifndef put_unaligned
+#define put_unaligned(val, ptr)                                                \
+	do {                                                                       \
+		struct b1nix_unaligned_store {                                         \
+			__typeof__(*(ptr)) v;                                              \
+		} __attribute__((packed, may_alias));                                  \
+		((struct b1nix_unaligned_store *)(ptr))->v = (val);                    \
+	} while (0)
+#endif
+
 #endif

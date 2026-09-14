@@ -54,6 +54,7 @@ void kprintf(int level, const char *subsys, const char *fmt, ...)
 #define k_warn(subsys, ...)   kprintf(LOGLEVEL_WARNING, (subsys), __VA_ARGS__)
 #define k_notice(subsys, ...) kprintf(LOGLEVEL_NOTICE, (subsys), __VA_ARGS__)
 #define k_info(subsys, ...)   kprintf(LOGLEVEL_INFO, (subsys), __VA_ARGS__)
+#define k_debug(subsys, ...)  kprintf(LOGLEVEL_DEBUG, (subsys), __VA_ARGS__)
 /* A debug line in a hot path costs a formatting pass even when nothing prints
  * it. Test the level first. The trade is deliberate: a suppressed debug line
  * is not built, so it is absent from dmesg too; a run that wants them asks

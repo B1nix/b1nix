@@ -28,13 +28,37 @@ static int klog_overflow;
 
 /* ── kallsyms: post-link symbol blob (M35) ──
  * Walks the packed [u64 addr][asciz name] records the two-pass link emitted
- * into the .kallsyms section (see tools/kernel/gen_kallsyms.sh, linker.ld). Returns
+ * into the .kallsyms section (see tools/build/kernel/gen_kallsyms.sh, linker.ld). Returns
  * the name of the function containing `addr` and, via *off, the byte offset
  * into it. Names point into the loaded blob, valid for the kernel's lifetime. */
 extern const unsigned char __kallsyms_start[];
 extern const unsigned char __kallsyms_end[];
 
-const char *ksym_lookup(u64 addr, u64 *off)
+/*
+ * An index, because every %p in a kernel printf used to walk the whole blob.
+ *
+ * The scan below reads every record and every name in the table -- tens of
+ * thousands of bytes -- to answer one address, and vsnprintf calls it for
+ * each %p it formats. During a desktop start-up that was 8.5% of all the
+ * kernel's CPU time, spent looking up names for lines nobody had asked to be
+ * slow. The records are built into the image and never change, so one pass
+ * builds a sorted array of them and every later lookup is a binary search.
+ *
+ * The index is optional: it is built on the first lookup that happens with a
+ * usable heap and outside a fault, and every path falls back to the scan when
+ * it is not there. That keeps the early-boot and panic callers -- which is
+ * most of them, and the ones that must not allocate -- exactly as they were.
+ */
+struct ksym_entry {
+	u64 addr;
+	const char *name;
+};
+
+static struct ksym_entry *ksym_index;
+static usize ksym_index_n;
+static int ksym_index_tried;
+
+static const char *ksym_scan(u64 addr, u64 *off)
 {
 	const unsigned char *p = __kallsyms_start;
 	const unsigned char *end = __kallsyms_end;
@@ -58,6 +82,91 @@ const char *ksym_lookup(u64 addr, u64 *off)
 	if (best_name && off)
 		*off = addr - best_addr;
 	return best_name;
+}
+
+static usize ksym_count(void)
+{
+	const unsigned char *p = __kallsyms_start;
+	const unsigned char *end = __kallsyms_end;
+	usize n = 0;
+
+	while (p + 8 < end) {
+		p += 8;
+		while (p < end && *p)
+			p++;
+		p++;
+		n++;
+	}
+	return n;
+}
+
+/* Insertion into a nearly-sorted array: the linker emits the records in
+ * address order, so this is a linear pass in practice and correct even when
+ * it is not. Runs once. */
+void ksym_index_init(void)
+{
+	const unsigned char *p = __kallsyms_start;
+	const unsigned char *end = __kallsyms_end;
+	struct ksym_entry *idx;
+	usize n, i = 0;
+
+	if (ksym_index_tried)
+		return;
+	ksym_index_tried = 1;
+	n = ksym_count();
+	if (!n)
+		return;
+	idx = kmalloc(n * sizeof(*idx));
+	if (!idx)
+		return;
+	while (p + 8 < end && i < n) {
+		struct ksym_entry e;
+		usize j = i;
+
+		memcpy(&e.addr, p, 8);
+		p += 8;
+		e.name = (const char *)p;
+		while (p < end && *p)
+			p++;
+		p++;
+		while (j > 0 && idx[j - 1].addr > e.addr) {
+			idx[j] = idx[j - 1];
+			j--;
+		}
+		idx[j] = e;
+		i++;
+	}
+	ksym_index_n = i;
+	__atomic_store_n(&ksym_index, idx, __ATOMIC_RELEASE);
+}
+
+const char *ksym_lookup(u64 addr, u64 *off)
+{
+	struct ksym_entry *idx = __atomic_load_n(&ksym_index, __ATOMIC_ACQUIRE);
+	usize lo, hi, best;
+
+	if (!idx)
+		return ksym_scan(addr, off); /* before ksym_index_init(), and after a
+		                              * failed allocation */
+
+	lo = 0;
+	hi = ksym_index_n;
+	best = ksym_index_n;
+	while (lo < hi) {
+		usize mid = lo + (hi - lo) / 2;
+
+		if (idx[mid].addr <= addr) {
+			best = mid;
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	if (best >= ksym_index_n)
+		return 0;
+	if (off)
+		*off = addr - idx[best].addr;
+	return idx[best].name;
 }
 
 /* Print " <symbol+0xoff>" to console if `addr` resolves. */
@@ -320,28 +429,6 @@ void panic_backtrace(void)
 		console_write("\n");
 
 		rbp = (u64 *)(usize)new_rbp;
-		depth++;
-	}
-#else
-	u32 *ebp = 0;
-	__asm__ volatile("movl %%ebp, %0" : "=r"(ebp));
-	/* x86 32-bit: walk frame pointer chain */
-	while (ebp && depth < 16) {
-		u32 eip = ebp[1];
-		u32 new_ebp = ebp[0];
-
-		if (eip == 0) break;
-		if (new_ebp != 0 && new_ebp <= (u32)(usize)ebp) break;
-
-		console_write("  #");
-		console_write_dec(depth);
-		console_write(" 0x");
-		console_write_hex64(eip);
-
-		ksym_print(eip);
-		console_write("\n");
-
-		ebp = (u32 *)(usize)new_ebp;
 		depth++;
 	}
 #endif

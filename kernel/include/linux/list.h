@@ -362,4 +362,54 @@ static inline void list_bulk_move_tail(struct list_head *head,
 	head->prev = last;
 }
 
+/*
+ * Has an iteration reached the head again?
+ *
+ * The idiom it replaces — comparing the entry pointer against the head cast to
+ * the entry type — is undefined behaviour when the list member is not first,
+ * because the cast forms a pointer outside any object. This says the same thing
+ * without inventing that pointer.
+ */
+#define list_entry_is_head(pos, head, member) (&(pos)->member == (head))
+
+/*
+ * Is this node on no list at all?
+ *
+ * A hlist node's `pprev` is NULL exactly when it is not linked, which is why
+ * removing a node has to clear it — `hlist_del_init` does and `hlist_del` does
+ * not. An inode that has been unhashed is found this way, so a version that
+ * looked at `next` instead would call the last node on every list unhashed.
+ */
+static inline int hlist_unhashed(const struct hlist_node *h)
+{ return !h->pprev; }
+
+/*
+ * Move the entries up to and including `entry` from one list onto another.
+ *
+ * The cut is the point: jbd2 detaches the front of its checkpoint list in one
+ * step so the rest stays available while the detached part is written. Doing it
+ * entry by entry would leave the list observable in a half-moved state.
+ */
+static inline void list_cut_position(struct list_head *list,
+                                     struct list_head *head,
+                                     struct list_head *entry)
+{
+	if (list_empty(head) || !entry || entry == head) {
+		INIT_LIST_HEAD(list);
+		return;
+	}
+	list->next = head->next;
+	list->next->prev = list;
+	list->prev = entry;
+	entry->next = head;
+	head->next = entry->next;
+	head->next->prev = head;
+	list->prev->next = list;
+}
+
+/* Splice under RCU: the destination must be published only once the whole
+ * spliced range is linked, which is what the callback ordering is for. */
+void list_splice_init_rcu(struct list_head *list, struct list_head *head,
+                          void (*sync)(void));
+
 #endif

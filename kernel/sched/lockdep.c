@@ -254,7 +254,14 @@ static int spin_owner_report_lkpi(volatile int *lock) {
 	console_write("\n  holder: cpu ");
 	console_write_dec((u64)l->owner_cpu);
 	console_write(" task ");
-	console_write_dec(l->owner_task);
+	/* The sentinel lkpi_spin_lock stores when there is no current task. It
+	 * has to be spelled out: printed as a number it reads as an ordinary id,
+	 * and "an interrupt handler still holds this" is the one answer worth
+	 * telling apart from "some task does". */
+	if (l->owner_task == (u64)~0ull)
+		console_write("<none: irq or pre-scheduler>");
+	else
+		console_write_dec(l->owner_task);
 	console_write(" took it at 0x");
 	console_write_hex64(l->acquired_at);
 	ksym_print(l->acquired_at);

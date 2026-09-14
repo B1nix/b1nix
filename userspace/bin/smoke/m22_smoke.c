@@ -1,7 +1,7 @@
 /*
  * m22_smoke — utility smoke tests (pwd, ls, cp, ln, readlink, lstat,
- * grep, date, uname, id, whoami, ps, head, tail, wc, uuidgen, tree,
- * sha384sum, vmstat, path-norm, parent-perms, POSIX compliance).
+ * grep, date, uname, id, whoami, ps, head, tail, wc, tree, path-norm,
+ * parent-perms, POSIX compliance).
  * Ported from deleted kernel/user/programs.c m22_smoke_main() to
  * POSIX API.  Emits the same M22-SMOKE markers so smoke.sh checks
  * remain unchanged.
@@ -207,17 +207,8 @@ int main(void) {
   failures += m22_run("ps", "/bin/ps",
                        (char *[]){"/bin/ps", NULL});
 
-  failures += m22_run("uuidgen", "/bin/uuidgen",
-                       (char *[]){"/bin/uuidgen", NULL});
-
   failures += m22_run("tree", "/bin/tree",
                        (char *[]){"/bin/tree", "/etc", NULL});
-
-  failures += m22_run("sha384sum", "/bin/sha384sum",
-                       (char *[]){"/bin/sha384sum", "/tmp/m22.txt", NULL});
-
-  failures += m22_run("vmstat", "/bin/vmstat",
-                       (char *[]){"/bin/vmstat", NULL});
 
   failures += m22_check_posix_compliance();
 

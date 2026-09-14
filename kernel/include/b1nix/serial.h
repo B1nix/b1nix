@@ -9,6 +9,9 @@
 
 void serial_init(void);
 void serial_putc(char ch);
+/* Console-line batching into the UART FIFO; see serial.c. */
+void serial_batch_begin(void);
+void serial_batch_end(void);
 char serial_getc(void);
 int serial_has_data(void);
 void serial_write(const char *text);

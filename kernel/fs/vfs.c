@@ -18,7 +18,6 @@
 #include <b1nix/console.h>
 #include <b1nix/drm.h>
 #include <b1nix/errno.h>
-#include <b1nix/ext2.h>
 #include <b1nix/fat32.h>
 #include <b1nix/filelock.h>
 #include <b1nix/initramfs.h>
@@ -226,13 +225,26 @@ static u32 vfs_current_mnt_ns(void) {
   return namespace_current_id(NS_MNT);
 }
 
-/* Is mounts[i] a live entry the caller can see? */
-static int mount_visible(usize i) {
+/* Is mounts[i] a live entry a caller in mount namespace `ns` can see?
+ *
+ * The namespace is passed in because the answer is the same for every slot in
+ * one walk, and asking for it per slot is what made this the hottest lock in
+ * the kernel on a systemd guest: an Arch boot called namespace_id_of fourteen
+ * million times in nine seconds -- once per mount slot per path resolution --
+ * and each call took a global spinlock with interrupts off. A namespace
+ * cannot change under a task in the middle of its own syscall (setns only
+ * ever moves the caller), so one read per walk is exactly as correct as one
+ * per slot. */
+static int mount_visible_in(usize i, u32 ns) {
   if (!mounts[i].used)
     return 0;
   if (!namespace_active())
     return 1;
-  return mounts[i].mnt_ns == vfs_current_mnt_ns();
+  return mounts[i].mnt_ns == ns;
+}
+
+static int mount_visible(usize i) {
+  return mount_visible_in(i, vfs_current_mnt_ns());
 }
 
 /* How many mount entries (in any namespace) point at this root node? A cloned
@@ -286,11 +298,12 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   vfs_tree_read_acquire(&flags);
   struct vfs_node *curr = node;
   struct vfs_mount_entry *res = 0;
+  u32 walk_ns = vfs_current_mnt_ns(); /* once per walk, see mount_visible_in */
   while (curr) {
     /* The deepest ancestor that is some mount's root wins; among the entries
      * rooted at THAT node, the one mounted last does (see ::seq). */
     for (int i = 0; i < (int)mount_hwm; i++) {
-      if (mount_visible(i) && curr == mounts[i].root_node &&
+      if (mount_visible_in(i, walk_ns) && curr == mounts[i].root_node &&
           (!res || mounts[i].seq > res->seq))
         res = &mounts[i];
     }
@@ -304,7 +317,7 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
    * applying it here changed which filesystem's flags an unattached node was
    * judged by. */
   for (int i = 0; i < (int)mount_hwm; i++) {
-    if (mount_visible(i) && strcmp(mounts[i].target, "/") == 0) {
+    if (mount_visible_in(i, walk_ns) && strcmp(mounts[i].target, "/") == 0) {
       res = &mounts[i];
       goto out;
     }
@@ -349,8 +362,10 @@ static void mount_record_target(const char *target, struct vfs_node *node,
 static struct vfs_node *vfs_mount_point_of(const struct vfs_node *node) {
   if (!node || node == root_node || node->parent)
     return 0;
+  u32 walk_ns = vfs_current_mnt_ns();
+
   for (int i = 0; i < (int)mount_hwm; i++) {
-    if (!mount_visible(i) || mounts[i].root_node != node)
+    if (!mount_visible_in(i, walk_ns) || mounts[i].root_node != node)
       continue;
     /* The FIRST mount of this root is the one that gives it its name; a later
      * bind of the same filesystem somewhere else does not rename it. Taking a
@@ -1360,8 +1375,10 @@ static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node) {
     return node;
 
   struct vfs_node *mounted_root = 0;
+  u32 walk_ns = vfs_current_mnt_ns();
+
   for (int i = 0; i < (int)mount_hwm; i++) {
-    if (mount_visible(i) && mounts[i].root_node &&
+    if (mount_visible_in(i, walk_ns) && mounts[i].root_node &&
         strcmp(mounts[i].target, "/") == 0) {
       mounted_root = mounts[i].root_node;
     }
@@ -1928,8 +1945,10 @@ restart_traversal:
     if (strcmp(part, "..") == 0) {
       while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
         scheduler_yield();
+      u32 walk_ns = vfs_current_mnt_ns();
+
       for (int i = 0; i < (int)mount_hwm; i++) {
-        if (mount_visible(i) && current == mounts[i].root_node) {
+        if (mount_visible_in(i, walk_ns) && current == mounts[i].root_node) {
           struct vfs_node *mp = vfs_node_get(mounts[i].mount_point);
           __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
           vfs_inode_unlock_read(current->inode);
@@ -2004,8 +2023,10 @@ restart_traversal:
 
     /* find_child() already returns with refcount incremented */
     /* DOWNWARD MOUNT CROSSING */
+    u32 walk_ns = vfs_current_mnt_ns();
+
     for (int i = 0; i < (int)mount_hwm; i++) {
-      if (mount_visible(i) && child == mounts[i].mount_point) {
+      if (mount_visible_in(i, walk_ns) && child == mounts[i].mount_point) {
         struct vfs_node *root = vfs_node_get(mounts[i].root_node);
         vfs_node_put(child);
         child = root;
@@ -2224,8 +2245,10 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
     }
     int child_was_found = (child != NULL);
     if (child) {
+      u32 walk_ns = vfs_current_mnt_ns();
+
       for (int i = 0; i < (int)mount_hwm; i++) {
-        if (mount_visible(i) && child == mounts[i].mount_point) {
+        if (mount_visible_in(i, walk_ns) && child == mounts[i].mount_point) {
           vfs_node_put(child); /* Drop ref from find_child */
           child = vfs_node_get(mounts[i].root_node);
           break;
@@ -2400,6 +2423,40 @@ u32 vfs_node_dev(struct vfs_node *node) {
   return 0;
 }
 
+/* Attach `child` unless `parent` already has a live child of the same name,
+ * checked and linked under one tree-lock hold. Returns 1 when it attached, 0
+ * when a node of that name was already there (the caller then frees its own).
+ *
+ * A filesystem that materialises nodes on lookup needs the check atomic with
+ * the link: two tasks resolving the same new name -- one of them the creator --
+ * each attached a node, unlink later removed one, and the other kept the name
+ * visible after a successful unlink. O_EXCL then failed for everyone. */
+int vfs_attach_child_unique(struct vfs_node *parent, struct vfs_node *child) {
+  if (!parent || !child)
+    return 0;
+  if (child->inode && parent->inode && !child->inode->dev)
+    child->inode->dev = parent->inode->dev;
+  if (!child->parent)
+    child->parent = parent;
+  u64 flags;
+  vfs_tree_write_acquire(&flags);
+  struct vfs_node *tail = 0;
+  for (struct vfs_node *c = parent->first_child; c; c = c->next_sibling) {
+    if (!c->deleted && strcmp(c->name, child->name) == 0) {
+      vfs_tree_write_release(flags);
+      return 0;
+    }
+    tail = c;
+  }
+  child->next_sibling = 0;
+  if (tail)
+    tail->next_sibling = child;
+  else
+    parent->first_child = child;
+  vfs_tree_write_release(flags);
+  return 1;
+}
+
 void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child) {
   if (!parent || !child)
     return;
@@ -2411,6 +2468,11 @@ void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child) {
    * already carries its own id (devpts) keeps it. */
   if (child->inode && parent->inode && !child->inode->dev)
     child->inode->dev = parent->inode->dev;
+  /* ".." walks this pointer. Filesystems that attach children through here
+   * (lkpifs) never set it, so ".." on them stayed put and a relative symlink
+   * such as /var/run -> ../run resolved to itself until ELOOP. */
+  if (!child->parent)
+    child->parent = parent;
   u64 flags;
   vfs_tree_write_acquire(&flags);
   /* Appended, not prepended.
@@ -3803,7 +3865,7 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
       }
     } else {
       /* Plain ENOENT (or any other open error without O_CREAT) is a *normal*
-       * userspace event — gcc/cc1, init scripts, and shells probe many paths
+       * userspace event — compilers, init scripts, and shells probe many paths
        * that may not exist. Linux doesn't log it; neither should we. The
        * errno reaches userspace via the syscall return, that's enough. */
       res = (int)PTR_ERR(node);
@@ -4508,16 +4570,9 @@ void vfs_close_handle(struct vfs_handle *h, int owner_pid) {
 
   if (h->kind == VFS_HANDLE_NODE && h->node && h->node->inode) {
     filelock_release_all_by_pid_inode(owner_pid, h->node->inode);
-
-    if (h->flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR)) {
-      /* Hold the inode lock across the flush: writeback drops the page-cache
-       * lock around write_cb while reading the frame, and a concurrent
-       * ftruncate's page_cache_truncate_inode would otherwise memset that live
-       * frame mid-DMA. read/write/truncate all serialize on this same lock. */
-      vfs_inode_lock(h->node->inode);
-      page_cache_flush_inode(h->node->inode);
-      vfs_inode_unlock(h->node->inode);
-    }
+    /* Dirty pages are no longer written here: the writeback thread does it
+     * (page_cache_flush_dirty_inodes), and fsync, sync and umount force it.
+     * close(2) waiting for the disk was 1.6 s of a desktop start-up. */
   }
 
   if (h->ops && h->ops->close)
@@ -5119,7 +5174,8 @@ static u64 fs_magic_for_type(const char *fstype) {
     return 0x63677270ull;
   if (strcmp(fstype, "devpts") == 0)
     return 0x1cd1ull;
-  if (strcmp(fstype, "ext4") == 0 || strcmp(fstype, "ext2") == 0)
+  if (strcmp(fstype, "ext4") == 0 || strcmp(fstype, "ext3") == 0 ||
+      strcmp(fstype, "ext2") == 0)
     return 0xEF53ull;
   if (strcmp(fstype, "vfat") == 0 || strcmp(fstype, "fat32") == 0)
     return 0x4d44ull; /* MSDOS_SUPER_MAGIC */
@@ -5981,6 +6037,24 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
     }
   }
 
+  /* Input event devices (/dev/input/eventN): raw handles with no node, but
+   * libinput fstat(2)s every fd it opens right after open() and, on anything
+   * that is not a character device, treats it as "not a device" and drops it.
+   * That is why a mouse present, tagged and openable still never reached a
+   * cursor. Report the char-device identity the node carries, 13:64+index. */
+  if (ph && ph->kind == VFS_HANDLE_INPUT) {
+    extern int input_handle_index(struct vfs_handle *h);
+    int idx = input_handle_index(ph);
+    if (idx < 0)
+      return -EBADF;
+    memset(st, 0, sizeof(*st));
+    st->st_mode = B1NIX_S_IFCHR | 0600;
+    st->st_nlink = 1;
+    st->st_rdev = ((u64)13 << 8) | (u64)(64 + idx);
+    st->st_ino = (u64)(64 + idx);
+    st->st_blksize = 512;
+    return 0;
+  }
   /* Descriptors with no node of their own — the imported DRM core's objects,
    * which Linux backs with an anonymous inode. fstat on one has to work: a
    * compositor stats every descriptor it is handed, and an error here reads as
@@ -6086,8 +6160,7 @@ int vfs_fsync(int fd) {
    * This used to call the filesystem's fsync_cb -- which writes the super block
    * and issues a cache-flush command -- and only THEN write the file's own
    * dirty blocks back, followed by a second flush. So the first barrier came
-   * before the writeback it existed to make durable (ext4_vfs_fsync's comment
-   * describes the correct order; the code did not implement it), and every
+   * before the writeback it existed to make durable, and every
    * fsync paid for two barriers where one would do.
    *
    * It is worth real time: on the aarch64 sys lane, fsync was 47 s of a 176 s
@@ -6794,6 +6867,7 @@ int vfs_umount(const char *target) {
       module_put(owner);
 
       if (last_ref && root && root->inode && root->inode->blk_dev) {
+        vfs_writeback_dirty_inodes();
         blk_cache_flush(root->inode->blk_dev);
         blk_cache_invalidate(root->inode->blk_dev);
       }
@@ -7272,6 +7346,17 @@ static struct vfs_node *next_child_by_seq(struct vfs_node *dir, u64 bound) {
 /* Remove from a filesystem's batch every name that an in-memory child of `dir`
  * already owns, so a merged listing reports each name once and the in-memory
  * node is the one it reports. Returns how many entries are left. */
+/* A child the directory's own filesystem materialised on lookup: a cached
+ * copy of a name its readdir already reports. Only the others -- device nodes
+ * attached in RAM under a /dev that is a directory on the root image -- are
+ * extra names to merge. */
+static int vfs_child_is_fs_cache(const struct vfs_node *dir,
+                                 const struct vfs_node *c) {
+  return dir->inode->readdir_lists_children && c->inode &&
+         dir->inode->release_cb &&
+         c->inode->release_cb == dir->inode->release_cb;
+}
+
 static isize vfs_drop_shadowed_entries(struct vfs_node *dir, struct dirent *buf,
                                        isize count) {
   isize kept = 0;
@@ -7281,7 +7366,7 @@ static isize vfs_drop_shadowed_entries(struct vfs_node *dir, struct dirent *buf,
   for (isize i = 0; i < count; i++) {
     int shadowed = 0;
     for (struct vfs_node *c = dir->first_child; c; c = c->next_sibling) {
-      if (c->deleted || !c->inode)
+      if (c->deleted || !c->inode || vfs_child_is_fs_cache(dir, c))
         continue;
       if (strcmp(c->name, buf[i].name) == 0) {
         shadowed = 1;
@@ -7394,7 +7479,6 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
      * a second cursor kept beside it would not come back with it. Below
      * VFS_DIR_MEM_CURSOR the cursor is the filesystem's own opaque cookie;
      * above it, the dir_seq of the last in-memory child handed out. */
-    int merge = !dir->inode->readdir_lists_children;
 
     while (!(h->offset & VFS_DIR_MEM_CURSOR)) {
       if (dir->inode->readdir_at_cb) {
@@ -7414,18 +7498,11 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
         h->offset = VFS_DIR_MEM_CURSOR; /* filesystem exhausted */
         break;
       }
-      if (!merge)
-        goto out;
       res = vfs_drop_shadowed_entries(dir, buf, res);
       if (res > 0)
         goto out;
       /* Every name in this batch was shadowed by an in-memory child. Returning
        * zero here would read as end-of-directory, so fetch the next batch. */
-    }
-
-    if (!merge) {
-      res = 0;
-      goto out;
     }
 
     u64 seq_above = (u64)(h->offset & ~VFS_DIR_MEM_CURSOR); /* 0 = no bound */
@@ -7434,6 +7511,12 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     vfs_tree_read_acquire(&tflags);
     struct vfs_node *child = next_child_by_seq(dir, seq_above);
     while (child && count < max_entries) {
+      if (vfs_child_is_fs_cache(dir, child)) {
+        seq_above = child->dir_seq;
+        h->offset = VFS_DIR_MEM_CURSOR | (usize)seq_above;
+        child = next_child_by_seq(dir, seq_above);
+        continue;
+      }
       copy_path(buf[count].name, 64, child->name);
       buf[count].type = vfs_dirent_type(child->inode);
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
@@ -7518,10 +7601,58 @@ out:
   return res;
 }
 
+/* Dirty pages used to reach the disk only when the file was closed: close(2)
+ * held the inode lock and wrote every dirty page out before returning, and
+ * sync(2) did not look at the page cache at all. A desktop start-up writes a
+ * hundred megabytes of caches that way, each close waiting for the disk on
+ * the program's own critical path -- 1.6 s of close(2) while Plasma started.
+ * The page cache now lists the inodes that dirtied a page; this drains the
+ * list, the pcflush thread calls it twice a second, and sync, syncfs and
+ * umount call it first. */
+int vfs_writeback_dirty_inodes(void) {
+  struct vfs_inode *list = page_cache_take_dirty_inodes();
+  int n = 0;
+  while (list) {
+    struct vfs_inode *in = list;
+    list = in->dirty_next;
+    in->dirty_next = 0;
+    /* The inode lock across the flush, as close(2) held it: writeback drops
+     * the page-cache lock around write_cb, and a concurrent truncate would
+     * otherwise zero a frame that is mid-DMA. */
+    vfs_inode_lock(in);
+    page_cache_flush_inode(in);
+    vfs_inode_unlock(in);
+    vfs_inode_put(in);
+    n++;
+  }
+  return n;
+}
+
+static void writeback_thread(void *arg) {
+  (void)arg;
+  for (;;) {
+    scheduler_sleep_ticks(sched_tick_hz() / 2);
+    vfs_writeback_dirty_inodes();
+  }
+}
+
+void vfs_start_writeback(void) {
+  kthread_create("pcflush", writeback_thread, 0);
+}
+
 int vfs_sync(void) {
+  /* Dirty file pages first: they only reach the block cache through here,
+   * fsync, umount or the writeback thread. */
+  vfs_writeback_dirty_inodes();
   /* Flush in-memory filesystem structures to block cache first */
-  ext2_sync_all_fs();
   fat32_sync_all_fs();
+#ifdef B1NIX_FS_IMPORT
+  {
+    /* Imported filesystems commit their own transactions. */
+    extern void lkpifs_sync_all(void);
+    lkpifs_sync_all();
+  }
+#endif
 
   /* Then flush the entire block cache to physical hardware */
   blk_sync_all();
@@ -8829,6 +8960,12 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
   if (ret != 0)
     goto out;
 
+  /* A filesystem that keeps its own attributes takes it from here. */
+  if (node->inode->setxattr_cb) {
+    ret = node->inode->setxattr_cb(node, name, value, size, flags);
+    goto out;
+  }
+
   /* Exclusive inode lock: the xattr list is shared mutable inode state; a
    * concurrent setxattr/removexattr on another CPU would corrupt the list and
    * a concurrent getxattr could walk a freed node (UAF). */
@@ -8900,6 +9037,13 @@ isize vfs_getxattr(const char *path, const char *name, void *value,
   if (IS_ERR(node))
     return (isize)PTR_ERR(node);
 
+  if (node->inode->getxattr_cb) {
+    isize cb = node->inode->getxattr_cb(node, name, value, size);
+
+    vfs_node_put(node);
+    return cb;
+  }
+
   isize ret = -ENODATA;
   vfs_inode_lock_read(node->inode);
   for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next) {
@@ -8925,6 +9069,13 @@ isize vfs_listxattr(const char *path, char *list, usize size, int nofollow) {
   struct vfs_node *node = xattr_lookup(path, nofollow);
   if (IS_ERR(node))
     return (isize)PTR_ERR(node);
+
+  if (node->inode->listxattr_cb) {
+    isize cb = node->inode->listxattr_cb(node, list, size);
+
+    vfs_node_put(node);
+    return cb;
+  }
 
   vfs_inode_lock_read(node->inode);
   usize total = 0;
@@ -8960,6 +9111,11 @@ isize vfs_removexattr(const char *path, const char *name, int nofollow) {
   isize ret = xattr_check_write(node);
   if (ret != 0)
     goto out;
+
+  if (node->inode->removexattr_cb) {
+    ret = node->inode->removexattr_cb(node, name);
+    goto out;
+  }
 
   ret = -ENODATA;
   vfs_inode_lock(node->inode);
@@ -9054,6 +9210,7 @@ int vfs_fstatfs(int fd, struct b1nix_statfs *st) {
 }
 
 int vfs_syncfs(int fd) {
+  vfs_writeback_dirty_inodes();
   struct vfs_handle *handle = get_handle(fd);
   if (!handle || !handle->used)
     return -EBADF;

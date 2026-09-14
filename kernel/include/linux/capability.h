@@ -38,4 +38,36 @@ static inline bool perfmon_capable(void) { return false; }
 #define CAP_SYS_NICE 23
 #endif
 
+/*
+ * The capabilities a filesystem checks.
+ *
+ * The NUMBERS are ABI — userspace sets them in a file's security.capability
+ * xattr and b1nix's own capability code uses the same values — so they are
+ * upstream's rather than assigned here.
+ *
+ * capable() answers for the current task. A filesystem asks before letting a
+ * caller past a reserved-blocks limit or set an immutable flag; an
+ * implementation that always said yes would hand every user the root-only
+ * paths.
+ */
+#ifndef CAP_CHOWN
+#define CAP_CHOWN            0
+#define CAP_DAC_OVERRIDE     1
+#define CAP_DAC_READ_SEARCH  2
+#define CAP_FOWNER           3
+#define CAP_FSETID           4
+#define CAP_KILL             5
+#define CAP_SETGID           6
+#define CAP_SETUID           7
+#define CAP_LINUX_IMMUTABLE  9
+#define CAP_SYS_ADMIN        21
+#define CAP_SYS_RESOURCE     24
+#endif
+
+bool capable(int cap);
+struct inode;
+struct mnt_idmap;
+bool capable_wrt_inode_uidgid(struct mnt_idmap *idmap,
+                              const struct inode *inode, int cap);
+
 #endif

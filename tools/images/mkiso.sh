@@ -1,12 +1,12 @@
 #!/bin/sh
-# tools/mkiso.sh - build a bootable b1nix ISO with the Limine bootloader.
+# tools/images/mkiso.sh - build a bootable b1nix ISO with the Limine bootloader.
 #
 # Replaces grub-mkrescue (GPLv3) with Limine (BSD-2-Clause) + xorriso: it stages
 # the kernel, the Multiboot2 modules and Limine's own boot files into an ISO
 # root, expands boot/limine/limine.conf.in, then produces a BIOS+UEFI hybrid ISO
 # and installs the BIOS boot stages into it.
 #
-#   tools/mkiso.sh --stage DIR --out ISO --arch ARCH --kernel PATH \
+#   tools/images/mkiso.sh --stage DIR --out ISO --arch ARCH --kernel PATH \
 #                  [--cmdline STR] [--timeout N] [--module PATH:NAME]...
 #
 #   --stage    ISO root directory (created/reused; kernel + modules land here)

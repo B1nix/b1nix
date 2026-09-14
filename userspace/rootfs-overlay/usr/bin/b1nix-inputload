@@ -1,0 +1,62 @@
+#!/bin/sh
+# b1nix-inputload — synthetic pointer motion, so a load test needs no hands.
+#
+# The interesting graphics load is a mouse being moved: it is what makes the
+# compositor repaint, and measuring it used to mean someone sitting in front of
+# the panel with a hand on the mouse for the length of every run. The kernel
+# accepts Linux-format records written back to /dev/input/eventN, so the guest
+# can generate that stream itself and the numbers stop depending on a person.
+#
+# Usage: b1nix-inputload <device> <seconds> [pause-us-between-bursts]
+#
+# One burst is 24 reports (72 events); at the default 20 ms pause that is about
+# 3600 events a second, a little above what a real mouse produces -- on
+# purpose, since the point is to find the edge rather than to be typical.
+set -e
+DEV=${1:-/dev/input/event1}
+SECS=${2:-60}
+PAUSE=${3:-20000}
+
+[ -w "$DEV" ] || { echo "inputload: $DEV is not writable" >&2; exit 1; }
+
+# A report is three 24-byte struct input_event records: a relative X, a
+# relative Y, and the SYN that ends it. The timestamps are left zero -- the
+# kernel stamps its own on the way in.
+#
+# Half the burst goes down-right and half up-left, so the pointer sweeps back
+# and forth instead of pinning itself in a corner after the first second.
+# The burst is built once into a file and written back with cat, because cat
+# writes it in a single write(2). The kernel takes a write on an event node
+# only in whole 24-byte records, and a shell printf goes through stdio: a
+# 1728-byte burst left it as a 1024-byte write and a 704-byte one, and the
+# first was refused. That costs a fork per burst; run the same load against
+# /dev/null to measure what the fork alone is worth.
+PAT=/tmp/.inputload.$$
+emit_report() { # $1 = X value bytes, $2 = Y value bytes (LE, two's complement)
+	printf '\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\002\000\000\000'
+	printf "$1"
+	printf '\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\002\000\001\000'
+	printf "$2"
+	printf '\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000'
+}
+{
+	i=0
+	while [ $i -lt 12 ]; do emit_report '\006\000\000\000' '\004\000\000\000'; i=$((i + 1)); done
+	i=0
+	while [ $i -lt 12 ]; do emit_report '\372\377\377\377' '\374\377\377\377'; i=$((i + 1)); done
+} > "$PAT"
+
+# Count the bursts rather than watch a clock. Reading /proc/uptime here made
+# the run depend on that file's format, and one that did not carry a fraction
+# put the deadline in the past: the loop finished with zero bursts sent and
+# reported success. The pause is known, so the count is the duration.
+TOTAL=$(( SECS * 1000000 / PAUSE ))
+[ "$TOTAL" -gt 0 ] || TOTAL=1
+bursts=0
+while [ "$bursts" -lt "$TOTAL" ]; do
+	cat "$PAT" >> "$DEV" 2>/dev/null || break
+	bursts=$((bursts + 1))
+	usleep "$PAUSE" 2>/dev/null || sleep 1
+done
+rm -f "$PAT"
+echo "inputload: $bursts bursts of 24 reports to $DEV over ${SECS}s"

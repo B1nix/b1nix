@@ -241,7 +241,9 @@ struct device_attribute {
 
 #define __ATTR(_name, _mode, _show, _store) \
 	{ { #_name, _mode }, _show, _store }
+#undef __ATTR_RO /* defined by another shim header too; this copy is the one that took effect */
 #define __ATTR_RO(_name) __ATTR(_name, 0444, _name##_show, 0)
+#undef __ATTR_RW /* defined by another shim header too; this copy is the one that took effect */
 #define __ATTR_RW(_name) __ATTR(_name, 0644, _name##_show, _name##_store)
 
 #define DEVICE_ATTR(_name, _mode, _show, _store) \
@@ -261,8 +263,6 @@ void device_remove_file(struct device *dev,
 #define dev_info(dev, fmt, ...)  lkpi_printk("drm %s: " fmt, dev_name(dev), ##__VA_ARGS__)
 #define dev_notice(dev, fmt, ...) lkpi_printk("drm %s: " fmt, dev_name(dev), ##__VA_ARGS__)
 #define dev_dbg(dev, fmt, ...)   ((void)0)
-#define dev_err_once(dev, fmt, ...) dev_err(dev, fmt, ##__VA_ARGS__)
-#define dev_warn_once(dev, fmt, ...) dev_warn(dev, fmt, ##__VA_ARGS__)
 
 
 /* The rate-limited spellings. Nothing here suppresses anything — see
@@ -272,8 +272,11 @@ void device_remove_file(struct device *dev,
 #define dev_warn_ratelimited(dev, fmt, ...) dev_warn(dev, fmt, ##__VA_ARGS__)
 #define dev_info_ratelimited(dev, fmt, ...) dev_info(dev, fmt, ##__VA_ARGS__)
 #define dev_dbg_ratelimited(dev, fmt, ...)  dev_dbg(dev, fmt, ##__VA_ARGS__)
+#undef printk_ratelimited /* defined by another shim header too; this copy is the one that took effect */
 #define printk_ratelimited(fmt, ...)        printk(fmt, ##__VA_ARGS__)
+#undef pr_warn_ratelimited /* defined by another shim header too; this copy is the one that took effect */
 #define pr_warn_ratelimited(fmt, ...)       pr_warn(fmt, ##__VA_ARGS__)
+#undef pr_err_ratelimited /* defined by another shim header too; this copy is the one that took effect */
 #define pr_err_ratelimited(fmt, ...)        pr_err(fmt, ##__VA_ARGS__)
 #define pr_info_ratelimited(fmt, ...)       pr_info(fmt, ##__VA_ARGS__)
 

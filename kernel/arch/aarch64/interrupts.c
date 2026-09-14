@@ -578,6 +578,13 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 				watchdog_tick();
 				serial_tty_tick();
 				scheduler_on_timer_tick();
+			} else if ((frame->spsr & 0xFULL) == 0) {
+				/* A secondary preempts only a tick that landed in EL0,
+				 * as x86_64 does: user code holds no kernel lock, and
+				 * without this a hog on a secondary ignored nice and a
+				 * sched_setaffinity that moved it away. */
+				extern void scheduler_preempt_user_ap(void);
+				scheduler_preempt_user_ap();
 			}
 		}
 		irq_return_to_user(frame);
@@ -936,9 +943,12 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 		 * not a missing translation), bit1 = write, bit2 = from userspace. */
 		u32 dfsc = (u32)esr & 0x3f;
 		int translation_fault = (dfsc & 0x3c) == 0x04; /* 0b0001xx */
+		/* bit3: the interrupted context had IRQs unmasked (SPSR.I clear),
+		 * so the fault may do work that sleeps. */
 		u64 error_code = (translation_fault ? 0 : 1) |
 		                 ((esr & (1ULL << 6)) ? 2 : 0) |
-		                 (from_el0 ? 4 : 0);
+		                 (from_el0 ? 4 : 0) |
+		                 ((frame->spsr & (1ULL << 7)) ? 0 : 8);
 		if (vmm_handle_page_fault(far, error_code) == 0) {
 			if (from_el0)
 				arch_check_and_deliver_signals(frame);
@@ -1005,6 +1015,8 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 		 * before the task is torn down (same point x86_64 does it). */
 		{
 			extern void coredump_write(struct interrupt_frame *frame, int sig);
+			/* From EL0, so process context: the filesystem may sleep. */
+			interrupts_enable();
 			coredump_write(frame, sig);
 			console_write("coredump: wrote /tmp/core\n");
 		}
@@ -1076,6 +1088,31 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 	console_write_hex64(saved_regs[30]);
 	ksym_print(saved_regs[30]);
 	console_write("\n");
+
+	/* The frame chain from x29. The link register names only the innermost
+	 * caller, and a helper like list_del says nothing about who misused it.
+	 * Walked only within the task's kernel stack, so a corrupt fp stops it. */
+	{
+		u64 hi = aarch64_kstack_top();
+		u64 lo = hi > KERNEL_STACK_SIZE ? hi - KERNEL_STACK_SIZE : 0;
+		u64 fp = saved_regs[29];
+
+		console_write("Frames:\n");
+		for (int depth = 0; depth < 16; depth++) {
+			if (fp < lo || fp + 16 > hi || (fp & 7))
+				break;
+			u64 ret = ((u64 *)(usize)fp)[1];
+			u64 next = ((u64 *)(usize)fp)[0];
+
+			console_write("  0x");
+			console_write_hex64(ret);
+			ksym_print(ret);
+			console_write("\n");
+			if (next <= fp)
+				break;
+			fp = next;
+		}
+	}
 
 	panic_at("unhandled synchronous exception", __FILE__, __LINE__);
 }

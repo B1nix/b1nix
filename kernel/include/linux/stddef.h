@@ -22,4 +22,17 @@
 	(offsetof(TYPE, MEMBER) + sizeof(((TYPE *)0)->MEMBER))
 #endif
 
+/*
+ * The size of one member of a type, without an instance of it. Used all over
+ * the filesystems to check that an on-disk field is the width they think it is,
+ * inside static_assert.
+ */
+#ifndef sizeof_field
+#define sizeof_field(TYPE, MEMBER) sizeof((((TYPE *)0)->MEMBER))
+#endif
+#ifndef offsetofend
+#define offsetofend(TYPE, MEMBER) \
+	(offsetof(TYPE, MEMBER) + sizeof_field(TYPE, MEMBER))
+#endif
+
 #endif

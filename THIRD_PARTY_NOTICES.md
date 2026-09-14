@@ -36,32 +36,11 @@ not Linux's.
 
 ---
 
-## 2. What b1nix still builds from source
+## 2. What b1nix builds from source
 
-These are the ports whose build we still own, because Alpine cannot give us the
-same thing: they target b1nix specifically, or nothing equivalent is packaged.
-Everything else on the image comes from Alpine as a binary package (section 3).
-
-| Component | License Summary | Why we build it |
-| --- | --- | --- |
-| **musl libc** | MIT License | The C library, built as one blob (libc.so is also the dynamic loader) with b1nix's target and soname |
-| **BusyBox** | GPL-2.0-only | Built against our musl with our applet manifest |
-| **OpenRC** | BSD-2-Clause | init and service manager, built against our musl |
-| **libc++ / libc++abi** | Apache-2.0 WITH LLVM-exception | The C++ runtime, cross-built for the b1nix target |
-| **OpenPAM** | BSD-3-Clause | Authentication stack |
-| **OpenLibm** | MIT / ISC / freely-distributable | libm for the freestanding userspace |
-| **Skia** | BSD-3-Clause | 2D graphics library, cross-built (its own toolchain patches live in `tools/patches/skia`) |
-| **Crashpad** | Apache-2.0 | Crash capture |
-| **Cairo** | LGPL-2.1 OR MPL-1.1 | Static build for the M51 acceptance test |
-| **litehtml** | MIT License | HTML/CSS layout engine |
-| **libjxl** | BSD-3-Clause | JPEG XL |
-| **libharu** | Zlib / libpng License | PDF generation |
-| **libutf8proc** | MIT License | UTF-8 processing |
-
-Local modifications to any of these are in `tools/patches/<name>/`, and each one
-is there to teach a build about a target that does not exist upstream. Patches
-that existed because b1nix itself was wrong have been removed and the defects
-fixed; that is a standing rule, not a one-off cleanup.
+Nothing third-party. The kernel, its tests and `b1cc` are b1nix's own; every
+library and program on the image, musl included, is an Alpine binary package
+(section 3).
 
 ---
 
@@ -86,8 +65,8 @@ downloads, so it cannot fall behind the lock file.
 
 The bulk of what a user sees — sway, wlroots, foot, seatd, the Wayland
 libraries, GTK, Mesa's GL/EGL/GBM libraries, OpenSSL, curl, zsh, Dropbear,
-FreeType, Fontconfig, HarfBuzz, Pixman, the image and video codecs — is in that
-set.
+FreeType, Fontconfig, HarfBuzz, Pixman, the image and video codecs, and Chromium
+(which bundles Skia, BSD-3-Clause) — is in that set.
 
 ---
 

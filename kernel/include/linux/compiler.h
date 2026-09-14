@@ -97,4 +97,42 @@ static inline void cpu_relax(void) { lkpi_cpu_relax(); }
 #define __same_type(a, b) __builtin_types_compatible_p(__typeof__(a), __typeof__(b))
 #endif
 
+/*
+ * "This access races on purpose."
+ *
+ * Upstream's marks the expression so KCSAN does not report it. There is no
+ * sanitiser here, so it evaluates the expression and nothing else — but the
+ * macro must exist, because the annotation is written around the access itself
+ * and removing it would change what is read.
+ */
+#define data_race(expr) ({ __auto_type __v = (expr); __v; })
+
+/*
+ * `const` as a function attribute: the result depends only on the arguments and
+ * the function reads no memory. Spelled `__attribute_const__` because `const`
+ * is a keyword and the attribute cannot be named directly.
+ *
+ * Its absence is not a missed optimisation — it is a syntax error at the point
+ * of use, and a confusing one: `size_t strlen(const char *) __attribute_const__;`
+ * parses as a declaration of something CALLED __attribute_const__, so the
+ * compiler reports a redefinition with a mismatched type rather than an unknown
+ * attribute.
+ */
+#define __attribute_const__ __attribute__((__const__))
+#ifndef __nonstring
+#define __nonstring __attribute__((__nonstring__))
+#endif
+
+/*
+ * "Keep this out of its caller's frame."
+ *
+ * Inlining a function that holds a large local into a caller that already holds
+ * one adds both frames together, and the kernel stack is 16 KiB. Both
+ * filesystems mark their deepest helpers with it. It is a real attribute here,
+ * not a comment: b1nix's stacks are no larger.
+ */
+#ifndef noinline_for_stack
+#define noinline_for_stack noinline
+#endif
+
 #endif

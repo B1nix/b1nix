@@ -6,6 +6,8 @@
 /* Declared before anything names them: a struct first seen inside a member
  * list or a parameter list becomes a type in that scope, and its pointer then
  * refuses to match the file-scope one. */
+struct vm_area_struct;
+
 struct file;
 struct kobject;
 struct device;
@@ -26,14 +28,24 @@ struct class_attribute_string {
 };
 #define CLASS_ATTR_STRING(_name, _mode, _str) \
 	struct class_attribute_string class_attr_##_name = { { #_name, _mode }, _str }
+#ifndef S_IRUGO
 #define S_IRUGO 0444
-#define S_IWUSR 0200
+#endif
+#ifndef S_IWUSR
+#define S_IWUSR 00200
+#endif
 struct attribute;
+/*
+ * `is_visible` returns a MODE, not a boolean: zero hides the attribute and any
+ * other value is the permission bits it is published with. Declaring it int
+ * compiles at the definition and fails at every filesystem that assigns a
+ * umode_t-returning function to it.
+ */
 struct attribute_group {
 	const char *name;
 	struct attribute **attrs;
 	struct bin_attribute **bin_attrs;
-	int (*is_visible)(struct kobject *, struct attribute *, int);
+	umode_t (*is_visible)(struct kobject *, struct attribute *, int);
 };
 /* Format into a sysfs output buffer. The buffer is one page and the count is
  * what the read returns, which is why this exists rather than plain snprintf. */
@@ -149,5 +161,11 @@ static const struct attribute_group *_name##_groups[] = {                \
 	&_name##_group,                                                      \
 	NULL,                                                                \
 }
+
+/* Tell userspace a file's contents changed, so a poll on it returns. */
+struct kobject;
+void sysfs_notify(struct kobject *kobj, const char *dir, const char *attr);
+int sysfs_update_group(struct kobject *kobj,
+                       const struct attribute_group *grp);
 
 #endif

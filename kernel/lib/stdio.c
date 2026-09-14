@@ -15,6 +15,13 @@ struct va_format {
 	va_list *va;
 };
 
+/*
+ * The name of a block device, for "%pg". Defined by the linuxkpi block bridge;
+ * weak because a build without the filesystem import has no block devices in
+ * that form, and the conversion then falls back to the pointer.
+ */
+__attribute__((weak)) const char *lkpi_bdev_printk_name(const void *bdev);
+
 int putchar(int c)
 {
 	char ch = (char)c;
@@ -232,6 +239,58 @@ static int vsnprintf_impl(char *str, size_t size, const char *fmt, va_list args)
 				int l4 = 0;
 				print_hex_to(t4, &l4, (u64)(usize)p4);
 				append_number(str, size, &pos, t4, l4, 0, width, zero_pad);
+				break;
+			}
+			case 'U': {
+				/*
+				 * A UUID, printed the way every tool that reads one expects:
+				 * 8-4-4-4-12 lowercase hex. ext4 names the filesystem it has
+				 * mounted with %pUb — "b" for big-endian byte order, which is
+				 * the order a UUID is written in — and without this its mount
+				 * and unmount lines identified the filesystem by the address
+				 * of the sixteen bytes.
+				 */
+				i++;
+				if (fmt[i + 1] == 'b' || fmt[i + 1] == 'l' ||
+				    fmt[i + 1] == 'B' || fmt[i + 1] == 'L')
+					i++;   /* the byte-order suffix; only 'b' is produced here */
+				const unsigned char *u = va_arg(args, const unsigned char *);
+
+				if (u) {
+					static const char hex[] = "0123456789abcdef";
+
+					for (int b = 0; b < 16; b++) {
+						if (b == 4 || b == 6 || b == 8 || b == 10)
+							append_char(str, size, &pos, '-');
+						append_char(str, size, &pos, hex[u[b] >> 4]);
+						append_char(str, size, &pos, hex[u[b] & 0xf]);
+					}
+				} else {
+					append_string(str, size, &pos, "(null)");
+				}
+				break;
+			}
+			case 'g': {
+				/*
+				 * A block device, by name — "%pg" is how imported code names
+				 * a disk, and a superblock's s_id is built with it. Without
+				 * this every btrfs message identified the device by the
+				 * address of its structure.
+				 */
+				i++;
+				const void *bd = va_arg(args, const void *);
+				const char *nm = lkpi_bdev_printk_name ?
+					lkpi_bdev_printk_name(bd) : 0;
+
+				if (nm) {
+					append_string(str, size, &pos, nm);
+				} else {
+					append_string(str, size, &pos, "0x");
+					char tg[32];
+					int lg = 0;
+					print_hex_to(tg, &lg, (u64)(usize)bd);
+					append_number(str, size, &pos, tg, lg, 0, width, zero_pad);
+				}
 				break;
 			}
 			case 'V': {

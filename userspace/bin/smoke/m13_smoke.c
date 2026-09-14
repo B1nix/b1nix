@@ -196,6 +196,18 @@ int main(int argc, char **argv, char **envp) {
     }
     return (env_ok && argv_ok) ? 0 : 1;
   }
+  if (argc >= 2 && argv && argv[1] && strcmp(argv[1], "check-many-args") == 0) {
+    /* Every argument arrived, in order: a1..a<n> spell their own index. */
+    char want[16];
+    if (argc != 1002)
+      return 2;
+    for (int i = 2; i < argc; i++) {
+      snprintf(want, sizeof(want), "a%d", i);
+      if (!argv[i] || strcmp(argv[i], want) != 0)
+        return 3;
+    }
+    return 0;
+  }
   if (argc >= 3 && argv && argv[1] && strcmp(argv[1], "check-fd-open") == 0) {
     int fd = atoi(argv[2]);
     char c = 0;
@@ -384,6 +396,38 @@ int main(int argc, char **argv, char **envp) {
     } else {
       marker("M13-SMOKE: fail execve-argv-env\n");
     }
+  }
+
+  /* execve with a thousand arguments: all of them reach the new image, and a
+   * vector larger than the room for it fails with E2BIG instead of arriving
+   * cut short. The kernel used to keep the first 256 and drop the rest. */
+  {
+    static char *many[1003];
+    static char names[1003][8];
+    many[0] = "m13-smoke";
+    many[1] = "check-many-args";
+    for (int i = 2; i < 1002; i++) {
+      snprintf(names[i], sizeof(names[i]), "a%d", i);
+      many[i] = names[i];
+    }
+    many[1002] = NULL;
+    pid_t pm = fork();
+    if (pm == 0) {
+      char *e[] = {NULL};
+      execve("/bin/m13-smoke", many, e);
+      _exit(121);
+    }
+    marker(pm > 0 && wait_exit_ok(pm, 0) ? "M13-SMOKE: ok execve-many-args\n"
+                                         : "M13-SMOKE: fail execve-many-args\n");
+
+    static char big[70000];
+    memset(big, 'x', sizeof(big) - 1);
+    char *huge[] = {"m13-smoke", big, NULL};
+    char *e[] = {NULL};
+    errno = 0;
+    int r = execve("/bin/m13-smoke", huge, e);
+    marker(r < 0 && errno == E2BIG ? "M13-SMOKE: ok execve-e2big\n"
+                                   : "M13-SMOKE: fail execve-e2big\n");
   }
 
   /* sh -c with positional args */

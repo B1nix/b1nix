@@ -1,16 +1,24 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef LKPI_LINUX_SMP_H
 #define LKPI_LINUX_SMP_H
+
+/* The barriers are architecture's to define and <asm/barrier.h> defines them;
+ * this header used to carry its own smp_mb and left smp_rmb/smp_wmb undefined,
+ * so code that used all three resolved two of them and implicitly declared the
+ * third. */
+#include <asm/barrier.h>
 #include <lkpi/env.h>
 #include <linux/types.h>
+/* nr_cpu_ids and the for_each_*_cpu loops. Imported code uses them from files
+ * that include only <linux/smp.h>. */
+#include <linux/cpumask.h>
 static inline int smp_processor_id(void) { return (int)lkpi_cpu_id(); }
 #define raw_smp_processor_id() smp_processor_id()
 #define num_online_cpus()      lkpi_cpu_count()
-#define smp_mb()  __atomic_thread_fence(__ATOMIC_SEQ_CST)
-#define smp_rmb() __atomic_thread_fence(__ATOMIC_ACQUIRE)
-#define smp_wmb() __atomic_thread_fence(__ATOMIC_RELEASE)
-#define smp_load_acquire(p)     __atomic_load_n((p), __ATOMIC_ACQUIRE)
-#define smp_store_release(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+/* smp_mb/smp_rmb/smp_wmb and the acquire/release accessors come from
+ * <asm/barrier.h> above. They were defined here as well, which was a
+ * redefinition of the same names with the same meaning — harmless until one of
+ * the two changed. */
 
 /* Run a function on every CPU. b1nix has no cross-CPU call IPI exposed to
  * drivers; this runs it on the calling CPU only. Every caller here uses it to

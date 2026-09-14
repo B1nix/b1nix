@@ -377,6 +377,9 @@ static void mtd_publish_char(unsigned index)
 		return;
 	}
 	node->inode->mode = 0600;
+	/* Linux's MTD character major; mtdN is minor 2N (the odd minors were the
+	 * read-only nodes). libmtd identifies a device by these numbers. */
+	node->inode->rdev = ((u64)MTD_CHAR_MAJOR << 8) | (u64)(index * 2);
 	node->inode->read_cb = mtd_dev_read;
 	node->inode->write_cb = mtd_dev_write;
 	node->inode->ioctl_cb = mtd_dev_ioctl;
@@ -417,7 +420,8 @@ void mtd_init(void)
 			nm[8] = (char)('0' + found);
 			nm[9] = '\0';
 
-			g_mtd[found].name = "mtd0";
+			static const char *const mtd_names[MTD_MAX_DEVICES] = { "mtd0", "mtd1" };
+			g_mtd[found].name = mtd_names[found];
 			g_mtd_blk[found].name = nm;
 			g_mtd_blk[found].bus = BLK_BUS_MTD;
 			g_mtd_blk[found].block_size = 512;

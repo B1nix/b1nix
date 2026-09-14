@@ -102,9 +102,21 @@ struct kernel_symbol {
 
 #define __MODULE_INFO_CAT2(a, b) a##b
 #define __MODULE_INFO_CAT(a, b) __MODULE_INFO_CAT2(a, b)
+/*
+ * The leading NUL is not padding.
+ *
+ * A tool reading .modinfo finds a tag by searching for "name=" and checking
+ * that the byte BEFORE it is a NUL — that is how it tells a tag from the tail
+ * of some other value. BusyBox's modinfo does exactly this, and so the FIRST
+ * tag in the section, which has no NUL in front of it, was invisible: modinfo
+ * reported a module with no vermagic, which is the one field the whole tag is
+ * there for. Starting every tag with its own NUL costs one byte each and makes
+ * the section readable from any offset.
+ */
 #define MODULE_INFO(tag, value)                                                \
   static const char __MODULE_INFO_CAT(__modinfo_, __COUNTER__)[]               \
-      __attribute__((section(".modinfo"), used, aligned(1))) = #tag "=" value
+      __attribute__((section(".modinfo"), used, aligned(1))) =                 \
+          "\0" #tag "=" value
 
 #define MODULE_LICENSE(v) MODULE_INFO(license, v)
 #define MODULE_AUTHOR(v) MODULE_INFO(author, v)
@@ -117,7 +129,7 @@ struct kernel_symbol {
 /* Comma-separated module names this one needs loaded first, exactly the tag
  * depmod(8) reads to build modules.dep. It is declared rather than inferred so
  * the applet can regenerate the index from the .ko files alone — but it is not
- * trusted: tools/kernel/gen_modules_initramfs.sh recomputes the real
+ * trusted: tools/build/kernel/gen_modules_initramfs.sh recomputes the real
  * dependencies from the symbol graph and fails the build when the two
  * disagree, so a stale tag cannot ship. */
 #define MODULE_DEPENDS(v) MODULE_INFO(depends, v)

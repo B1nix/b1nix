@@ -23,6 +23,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/netlink.h>
 #include <b1nix/posix.h>
+#include <b1nix/spinlock.h>
 #include <b1nix/sysfs_attr.h>
 #include <b1nix/vfs.h>
 #include <stdio.h>
@@ -216,15 +217,43 @@ void sysfs_reg_attach_root(struct vfs_node *sys_root) {
 
 /* ── registration ───────────────────────────────────────────────── */
 
-struct sysfs_dir *sysfs_reg_find(struct sysfs_dir *parent, const char *name) {
-  if (!name)
-    return 0;
-  struct sysfs_dir *p = parent ? parent : &g_root;
+/*
+ * The registry's lists, and the lock over them.
+ *
+ * Registration is not a boot-time-only activity: a filesystem publishes its
+ * attributes when it is mounted, which happens on whatever CPU the mount runs
+ * on while other subsystems are still registering theirs. The lists were
+ * unlocked, and two CPUs pushing onto the same one produced an entry whose
+ * `next` pointed at nothing — the next traversal ran strcmp on a garbage
+ * name and took a general-protection fault, about one boot in two.
+ *
+ * Only the list surgery is under the lock. Creating the VFS nodes is not:
+ * that path allocates and takes VFS locks, and b1nix's lock order forbids
+ * holding a spinlock across it.
+ */
+static spinlock_t sysfs_reg_lock = SPINLOCK_INIT;
+
+/* Caller holds sysfs_reg_lock. */
+static struct sysfs_dir *reg_find_locked(struct sysfs_dir *p,
+                                         const char *name) {
   for (struct sysfs_dir *c = p->children; c; c = c->sibling) {
     if (strcmp(c->name, name) == 0)
       return c;
   }
   return 0;
+}
+
+struct sysfs_dir *sysfs_reg_find(struct sysfs_dir *parent, const char *name) {
+  if (!name)
+    return 0;
+  struct sysfs_dir *p = parent ? parent : &g_root;
+  struct sysfs_dir *found;
+  u64 flags;
+
+  spin_lock_irqsave(&sysfs_reg_lock, &flags);
+  found = reg_find_locked(p, name);
+  spin_unlock_irqrestore(&sysfs_reg_lock, flags);
+  return found;
 }
 
 struct sysfs_dir *sysfs_reg_dir(struct sysfs_dir *parent, const char *name) {
@@ -235,7 +264,11 @@ struct sysfs_dir *sysfs_reg_dir(struct sysfs_dir *parent, const char *name) {
   /* Naming an existing directory returns it. Two subsystems both publishing
    * under /sys/class must not end up with two /sys/class directories — which
    * is a mistake the network code made once already. */
-  struct sysfs_dir *existing = sysfs_reg_find(p, name);
+  u64 flags;
+
+  spin_lock_irqsave(&sysfs_reg_lock, &flags);
+  struct sysfs_dir *existing = reg_find_locked(p, name);
+  spin_unlock_irqrestore(&sysfs_reg_lock, flags);
   if (existing)
     return existing;
 
@@ -244,8 +277,20 @@ struct sysfs_dir *sysfs_reg_dir(struct sysfs_dir *parent, const char *name) {
     return 0;
   copy_name(d->name, sizeof(d->name), name);
   d->parent = p;
+
+  spin_lock_irqsave(&sysfs_reg_lock, &flags);
+  /* Re-check under the lock: another CPU may have created it while this one
+   * allocated, and two directories of the same name is the bug this returns
+   * an existing one to avoid. */
+  existing = reg_find_locked(p, name);
+  if (existing) {
+    spin_unlock_irqrestore(&sysfs_reg_lock, flags);
+    kfree(d);
+    return existing;
+  }
   d->sibling = p->children;
   p->children = d;
+  spin_unlock_irqrestore(&sysfs_reg_lock, flags);
 
   /* Already mounted: appear now rather than at the next mount. */
   if (p->node)
@@ -257,12 +302,19 @@ static int reg_attr(struct sysfs_dir *dir, const char *name, u16 mode,
                     sysfs_attr_show show, sysfs_attr_read_at read_at,
                     sysfs_attr_store store, void *ctx,
                     sysfs_attr_release release) {
+  u64 flags;
+
   if (!dir || !name || !*name || (!show && !read_at))
     return -EINVAL;
-  for (struct sysfs_attr *a = dir->attrs; a; a = a->next) {
-    if (strcmp(a->name, name) == 0)
+  spin_lock_irqsave(&sysfs_reg_lock, &flags);
+  for (struct sysfs_attr *e = dir->attrs; e; e = e->next) {
+    if (strcmp(e->name, name) == 0) {
+      spin_unlock_irqrestore(&sysfs_reg_lock, flags);
       return -EEXIST;
+    }
   }
+  spin_unlock_irqrestore(&sysfs_reg_lock, flags);
+
   struct sysfs_attr *a = kzalloc(sizeof(*a));
   if (!a)
     return -ENOMEM;
@@ -277,8 +329,18 @@ static int reg_attr(struct sysfs_dir *dir, const char *name, u16 mode,
   a->store = store;
   a->release = release;
   a->ctx = ctx;
+
+  spin_lock_irqsave(&sysfs_reg_lock, &flags);
+  for (struct sysfs_attr *e = dir->attrs; e; e = e->next) {
+    if (strcmp(e->name, name) == 0) {
+      spin_unlock_irqrestore(&sysfs_reg_lock, flags);
+      kfree(a);
+      return -EEXIST;
+    }
+  }
   a->next = dir->attrs;
   dir->attrs = a;
+  spin_unlock_irqrestore(&sysfs_reg_lock, flags);
 
   materialise_attr(dir, a);
   return 0;
@@ -321,13 +383,20 @@ static void drop_attr(struct sysfs_dir *dir, struct sysfs_attr *a,
 int sysfs_reg_attr_remove(struct sysfs_dir *dir, const char *name) {
   if (!dir || !name)
     return -EINVAL;
+  u64 flags;
+
+  spin_lock_irqsave(&sysfs_reg_lock, &flags);
   struct sysfs_attr **link = &dir->attrs;
   while (*link && strcmp((*link)->name, name) != 0)
     link = &(*link)->next;
-  if (!*link)
+  if (!*link) {
+    spin_unlock_irqrestore(&sysfs_reg_lock, flags);
     return -ENOENT;
+  }
   struct sysfs_attr *a = *link;
   *link = a->next;
+  spin_unlock_irqrestore(&sysfs_reg_lock, flags);
+
   drop_attr(dir, a, 1);
   return 0;
 }
@@ -335,13 +404,19 @@ int sysfs_reg_attr_remove(struct sysfs_dir *dir, const char *name) {
 int sysfs_reg_link_remove(struct sysfs_dir *dir, const char *name) {
   if (!dir || !name)
     return -EINVAL;
+  u64 flags;
+
+  spin_lock_irqsave(&sysfs_reg_lock, &flags);
   struct sysfs_link **link = &dir->links;
   while (*link && strcmp((*link)->name, name) != 0)
     link = &(*link)->next;
-  if (!*link)
+  if (!*link) {
+    spin_unlock_irqrestore(&sysfs_reg_lock, flags);
     return -ENOENT;
+  }
   struct sysfs_link *l = *link;
   *link = l->next;
+  spin_unlock_irqrestore(&sysfs_reg_lock, flags);
   if (l->node && l->node->inode) {
     l->node->inode->data = 0;
     l->node->inode->size = 0;
@@ -370,8 +445,15 @@ int sysfs_reg_link(struct sysfs_dir *dir, const char *name,
     return -ENOMEM;
   }
   memcpy(l->target, target, tl + 1);
-  l->next = dir->links;
-  dir->links = l;
+
+  {
+    u64 flags;
+
+    spin_lock_irqsave(&sysfs_reg_lock, &flags);
+    l->next = dir->links;
+    dir->links = l;
+    spin_unlock_irqrestore(&sysfs_reg_lock, flags);
+  }
 
   materialise_link(dir, l);
   return 0;

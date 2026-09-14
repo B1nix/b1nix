@@ -84,7 +84,7 @@ fi
 	exit 1
 }
 
-flock "$DIR/smoke_run/.qemu.lock" sh "$DIR/tools/run-debian-graphics.sh" "$TAG" || true
+flock "$DIR/smoke_run/.qemu.lock" sh "$DIR/tools/run/run-debian-graphics.sh" "$TAG" || true
 
 if [ ! -f "$LOG" ]; then
 	echo "GFX-SMOKE: FAIL no log at $LOG"
@@ -179,7 +179,7 @@ bestf=
 if [ -d "$FRAMES" ]; then
 	for f in "$FRAMES"/frame-*.ppm; do
 		[ -f "$f" ] || continue
-		line=$(python3 "$DIR/tools/ppm-colours.py" "$f" 2> /dev/null) || continue
+		line=$(python3 "$DIR/tools/run/ppm-colours.py" "$f" 2> /dev/null) || continue
 		n=$(echo "$line" | sed -n 's/.*unique=\([0-9]*\).*/\1/p')
 		[ -n "$n" ] || continue
 		if [ "$n" -gt "$best" ]; then

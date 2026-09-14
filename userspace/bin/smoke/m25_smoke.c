@@ -244,7 +244,7 @@ int main(void) {
   write(hello_fd, hello_src, strlen(hello_src));
   close(hello_fd);
 
-  // 3. Compile hello.c using /bin/tcc
+  // 3. Compile hello.c using /bin/b1cc
   char *tcc_hello_argv[] = {"b1cc", (char *)B1CC_TARGET, (char *)B1CC_PIC, (char *)B1CC_PIE, "/tmp/hello.c", "-o", "/tmp/hello", NULL};
   int compile_rc = compile_with_diag(tcc_hello_argv, "compile-hello");
   if (compile_rc != 0) {

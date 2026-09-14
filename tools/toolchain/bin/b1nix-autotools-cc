@@ -180,7 +180,7 @@ if [ "$B1NIX_ARCH" = "aarch64" ]; then
   # anything calling strtod) fails to compile ("ABI 'aapcs' does not support
   # it") even though userspace ELFs run in an environment that fully permits
   # floating point — kernel/dev/virtio_blk_mmio.c and every other userspace
-  # binary built via tools/b1nix-musl-cc never carried this flag.
+  # binary built via tools/toolchain/bin/b1nix-musl-cc never carried this flag.
   cflags+=("-Wall" "-Wextra" "-O2" "-Db1nix" "-D__b1nix__" "-D__unix__" "-D__STDC_NO_ATOMICS__")
 else
   cflags+=("-Wall" "-Wextra" "-O2" "-msoft-float" "-mno-implicit-float" "-Db1nix" "-D__b1nix__" "-D__unix__" "-D__STDC_NO_ATOMICS__")
@@ -365,7 +365,7 @@ with open(f, 'r+b') as fh:
 else
   # Everything else used to fall back to a fixed-address static link (the old
   # b1nix libc.a/crt0.o, or musl's libc.a through userspace/linker.ld). Those
-  # paths are gone: b1nix ships dynamic PIEs only, and tools/check-dynamic.sh
+  # paths are gone: b1nix ships dynamic PIEs only, and tools/check/check-dynamic.sh
   # rejects a static executable in the rootfs anyway. Failing here is the point
   # — a caller that cannot link dynamically has a problem to fix, not a flag to
   # switch.
@@ -374,7 +374,7 @@ else
   echo "  under tools/ports/ for the flags, and tools/configs/static-allowlist.txt" >&2
   echo "  for the (reasoned) exceptions." >&2
   if [ ! -f "$MUSL_SCRT1" ] || [ ! -f "$MUSL_SO" ]; then
-    echo "  musl's Scrt1.o/libc.so are missing — run tools/ports/build-musl.sh." >&2
+    echo "  musl's Scrt1.o/libc.so are missing — run tools/toolchain/build-musl.sh." >&2
   fi
   exit 1
 fi

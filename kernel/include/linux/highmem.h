@@ -21,4 +21,25 @@ static inline void kunmap(struct page *p) { (void)p; }
  * is slower for a bulk copy and not wrong. */
 #define kmap_local_page_prot(page, prot) ({ (void)(prot); kmap_local_page(page); })
 
+/*
+ * The folio spelling, with a byte offset into the folio rather than a page.
+ *
+ * The offset matters: upstream a folio can be several pages, so the mapping
+ * covers only the page the offset falls in and the caller may use at most to
+ * the end of it. One page per folio here makes that the whole folio, but the
+ * offset is still added — a version that ignored it would return the start of
+ * the folio and every caller would read from the wrong place.
+ */
+static inline void *kmap_local_folio(struct folio *folio, size_t offset)
+{
+	return (char *)page_address(folio_page(folio, 0)) + offset;
+}
+
+/* Zero and copy helpers that take the mapping into account, so a caller does
+ * not have to map and unmap around a memset. */
+void memzero_page(struct page *page, size_t offset, size_t len);
+void memcpy_to_page(struct page *page, size_t offset, const char *from,
+                    size_t len);
+void memcpy_from_page(char *to, struct page *page, size_t offset, size_t len);
+
 #endif

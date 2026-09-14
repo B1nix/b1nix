@@ -629,8 +629,7 @@ static void size_direct_map(const struct boot_info *boot_info) {
 
 void pmm_init(const struct boot_info *boot_info) {
   /* Convert the (higher-half) kernel symbols to physical addresses; the two
-   * reservation loops below then cover [0, kernel_end_phys). KERNEL_VMA is 0 on
-   * the identity-mapped 32-bit port, so this is a no-op there. */
+   * reservation loops below then cover [0, kernel_end_phys). */
   pmm.kernel_start = (u64)(usize)__kernel_start - KERNEL_VMA;
   pmm.kernel_end = align_up_u64((u64)(usize)__kernel_end - KERNEL_VMA, PAGE_SIZE);
   pmm.max_address = 0;
@@ -1202,13 +1201,25 @@ static void pmm_scrub_quarantine(void) {
  * traced to whoever put it there. A ring rather than a per-frame record: the
  * question is always about one frame that has just gone wrong, and its history
  * is a handful of entries old. */
-#define PT_TRACE_N 256
+#define PT_TRACE_N 1024
 static struct {
   u64 frame;
   u64 caller;
   int owned; /* 1 claimed as a table, 0 released, -1 freed to the allocator */
 } pt_trace[PT_TRACE_N];
 static u32 pt_trace_w;
+
+/* Claims come from any CPU, so the write cursor has to be claimed atomically:
+ * with a plain increment two CPUs pick the same slot, one entry is lost and
+ * the cursor ends up short of the number of entries actually written. That is
+ * how a frame with a real history printed none. */
+static void pt_trace_note(u64 frame, u64 caller, int owned) {
+  u32 at = __atomic_fetch_add(&pt_trace_w, 1u, __ATOMIC_RELAXED) % PT_TRACE_N;
+
+  pt_trace[at].frame = frame;
+  pt_trace[at].caller = caller;
+  pt_trace[at].owned = owned;
+}
 
 /* Atomically clear a frame's page-table claim, reporting whether this caller is
  * the one that held it.
@@ -1227,10 +1238,7 @@ int pmm_claim_page_table_release(u64 frame) {
   u8 prev = __atomic_fetch_and(&pmm.pt_frames[idx / 8], (u8)~bit,
                                __ATOMIC_SEQ_CST);
 
-  pt_trace[pt_trace_w].frame = frame;
-  pt_trace[pt_trace_w].caller = (u64)(usize)__builtin_return_address(0);
-  pt_trace[pt_trace_w].owned = 0;
-  pt_trace_w = (pt_trace_w + 1) % PT_TRACE_N;
+  pt_trace_note(frame, (u64)(usize)__builtin_return_address(0), 0);
 
   return (prev & bit) != 0;
 }
@@ -1239,15 +1247,21 @@ void pmm_note_page_table(u64 frame, int owned) {
   if (!pmm.pt_frames || frame >= pmm.max_address)
     return;
   usize idx = frame / PAGE_SIZE;
-  if (owned)
-    pmm.pt_frames[idx / 8] |= (u8)(1u << (idx % 8));
-  else
-    pmm.pt_frames[idx / 8] &= (u8)~(1u << (idx % 8));
+  u8 bit = (u8)(1u << (idx % 8));
 
-  pt_trace[pt_trace_w].frame = frame;
-  pt_trace[pt_trace_w].caller = (u64)(usize)__builtin_return_address(0);
-  pt_trace[pt_trace_w].owned = owned;
-  pt_trace_w = (pt_trace_w + 1) % PT_TRACE_N;
+  /* One byte of this bitmap covers eight consecutive frames, and page tables
+   * are handed out in bursts, so two CPUs claiming or releasing neighbouring
+   * frames land in the same byte routinely. A plain |= / &= is a read, a
+   * modify and a write: the loser's update is dropped. A lost clear leaves a
+   * stale claim, and the hand-out gate then panics on a frame that is free;
+   * a lost set loses the claim entirely, and a genuine double hand-out goes
+   * unnoticed. Both are the SMP faults this bitmap exists to catch. */
+  if (owned)
+    __atomic_fetch_or(&pmm.pt_frames[idx / 8], bit, __ATOMIC_SEQ_CST);
+  else
+    __atomic_fetch_and(&pmm.pt_frames[idx / 8], (u8)~bit, __ATOMIC_SEQ_CST);
+
+  pt_trace_note(frame, (u64)(usize)__builtin_return_address(0), owned);
 }
 
 /* Record a free as well, so the history reads as the whole life of a frame:
@@ -1255,10 +1269,7 @@ void pmm_note_page_table(u64 frame, int owned) {
  * frame that turns up free with no free in its history never went through the
  * ordinary path at all, which is a different bug from freeing it too early. */
 void pmm_note_free(u64 frame, u64 caller) {
-  pt_trace[pt_trace_w].frame = frame;
-  pt_trace[pt_trace_w].caller = caller;
-  pt_trace[pt_trace_w].owned = -1;
-  pt_trace_w = (pt_trace_w + 1) % PT_TRACE_N;
+  pt_trace_note(frame, caller, -1);
 }
 
 /* Print what happened to one frame, newest first. */
@@ -1267,8 +1278,10 @@ static void pmm_report_page_table_history(u64 frame) {
   console_write("pmm: history for 0x");
   console_write_hex64(frame);
   console_write(":\n");
+  u32 w = __atomic_load_n(&pt_trace_w, __ATOMIC_RELAXED);
+
   for (u32 i = 0; i < PT_TRACE_N; i++) {
-    u32 at = (pt_trace_w + PT_TRACE_N - 1 - i) % PT_TRACE_N;
+    u32 at = (w + PT_TRACE_N - 1 - i) % PT_TRACE_N;
 
     if (pt_trace[at].frame != frame)
       continue;
@@ -1310,6 +1323,12 @@ static void pmm_check_handout(u64 frame) {
                   " (caller 0x");
     console_write_hex64((u64)(usize)__builtin_return_address(0));
     console_write(")\n");
+    /* The history is the whole point of this report and it is about to be
+     * followed by a panic anyway: take the console the way the panic path
+     * does. Once it printed its header and nothing else for 38 seconds --
+     * the lock was held by a CPU waiting, in turn, on the allocator this
+     * CPU is holding. */
+    console_bust_lock();
     pmm_report_page_table_history(frame);
   }
   panic("pmm: page-table frame allocated twice");

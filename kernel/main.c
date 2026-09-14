@@ -30,13 +30,9 @@
 #include <b1nix/blk.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/tlb.h>
-#include <b1nix/ext2.h>
-#include <b1nix/ext1.h>
 #include <b1nix/fat32.h>
 #include <b1nix/exfat.h>
 #include <b1nix/ntfs.h>
-#include <b1nix/ext3.h>
-#include <b1nix/ext4.h>
 #include <b1nix/btrfs.h>
 #include <b1nix/fuse.h>
 #include <b1nix/fwcfgfs.h>
@@ -119,8 +115,18 @@ void lkpi_i915_register_card(struct drm_device *dev);
 extern int lkpi_initcall_drm_buddy_module_init(void);
 extern int lkpi_initcall_drm_display_helper_module_init(void);
 extern int lkpi_initcall_i915_init(void);
+extern void lkpi_i915_disable_display_power_saving(void);
 static void i915_module_init(void)
 {
+	/*
+	 * Keep the display power wells up so a commit never stalls waking one
+	 * inside the vblank-evasion critical section. See the note on
+	 * lkpi_i915_disable_display_power_saving(). Opt-in with b1nix.i915-no-dc
+	 * until it is proven on the panel; it must run before the initcall below,
+	 * which copies i915_modparams into the device.
+	 */
+	if (bootinfo_has_flag("b1nix.i915-no-dc"))
+		lkpi_i915_disable_display_power_saving();
 	/*
 	 * The OpRegion first, because the driver reads it during probe and there is
 	 * no second chance: the VBT inside is where the board's port wiring and
@@ -141,6 +147,7 @@ extern void virtio_input_init(void);
 
 /* Visual boot markers — see b1nix/bootmark.h. */
 #include <b1nix/bootmark.h>
+#include <b1nix/fb_console.h>
 
 /* Matches the console's own default; the phone build overrides both. */
 #ifndef FB_CONSOLE_FONT_SCALE
@@ -265,6 +272,28 @@ void boot_summary_set_root(const char *what) {
 const char *boot_summary_root(void) { return g_boot_root; }
 const char *boot_summary_init(void) { return g_boot_init; }
 
+/* Mount `dev` at / as whatever its superblock says it is: the root image is
+ * btrfs, older images and the boot modules are ext4. */
+static int mount_root_as_probed(const char *dev_name, const char **type_out)
+{
+	static const char *const fallback[] = {"ext4", "ext3", "ext2"};
+	struct block_device *dev = blk_get(dev_name);
+	const char *probed = dev ? blk_probe_fstype(dev) : "-";
+
+	if (probed[0] != '-' && vfs_mount(dev_name, "/", probed, 0) == 0) {
+		*type_out = probed;
+		return 0;
+	}
+	for (usize i = 0; i < sizeof(fallback) / sizeof(fallback[0]); i++) {
+		if (strcmp(fallback[i], probed) != 0 &&
+		    vfs_mount(dev_name, "/", fallback[i], 0) == 0) {
+			*type_out = fallback[i];
+			return 0;
+		}
+	}
+	return -1;
+}
+
 static struct block_device *find_device_by_label(const char *expected_label) {
 	char label[64];
 	for (usize i = 0; i < blk_count(); i++) {
@@ -378,10 +407,12 @@ static int mount_first_virtio_root(void)
 
 		if (!dev || !dev->name)
 			return -1;
-		if (vfs_mount(dev->name, "/", "ext4", 0) == 0) {
+		const char *type;
+
+		if (mount_root_as_probed(dev->name, &type) == 0) {
 			char buf[64];
 
-			snprintf(buf, sizeof(buf), "rootfs: %s mounted at /\n", dev->name);
+			snprintf(buf, sizeof(buf), "rootfs: %s mounted at / as %s\n", dev->name, type);
 			console_write(buf);
 			vfs_repopulate_after_root_mount();
 			return 0;
@@ -389,8 +420,24 @@ static int mount_first_virtio_root(void)
 	}
 }
 
+/* See b1nix.prof-at. */
+static void prof_dump_thread(void *arg)
+{
+	extern void b1nix_prof_dump_all(void);
+	u32 seconds = (u32)(usize)arg;
+
+	scheduler_sleep_ticks((u64)seconds * (u64)sched_tick_hz());
+	console_write("prof: dump at b1nix.prof-at\n");
+	b1nix_prof_dump_all();
+}
+
 void kernel_main(usize arg0, usize arg1)
 {
+#ifdef __x86_64__
+	/* Before the first console_write or frame allocation: both ask which CPU
+	 * they are on, and the answer must be "none yet", not a stray word. */
+	arch_gs_base_early();
+#endif
 	/* Before anything else that can go deep: the boot stack is still shallow
 	 * here, so this is the only point at which the unused part of it can be
 	 * painted and its high-water mark made measurable. */
@@ -530,6 +577,9 @@ void kernel_main(usize arg0, usize arg1)
 
 
 	kheap_use_direct_map();
+	/* Symbol lookups stop scanning the whole table now that they can index it:
+	 * every %p in a kernel printf used to walk tens of thousands of bytes. */
+	ksym_index_init();
 	k_info(NULL, "Step 7: KHeap switched to direct map");
 
 	/* Machines whose framebuffer the bootloader already set up. On one whose
@@ -674,11 +724,7 @@ void kernel_main(usize arg0, usize arg1)
 
 	vfs_init();
 	BOOTMARK(13);	/* VFS */
-	ext2_init();
-	ext1_init();
-	ext3_init();
 	fat32_init();
-	ext4_init();
 #ifdef __aarch64__
 	/* Walk the bus and give every device an address before any driver looks
 	 * for one. On a PC the firmware has already done this; nothing runs
@@ -686,6 +732,7 @@ void kernel_main(usize arg0, usize arg1)
 	 * program it — which a driver reports as "the register block is at 0",
 	 * not as "nobody assigned me an address". */
 	pci_init();
+	pci_sysfs_publish_all();
 	BOOTMARK(14);	/* PCI BUS SCAN (aarch64) */
 #endif
 	/* Both are PCI devices driven through MMIO, and this port has a PCI bus
@@ -706,6 +753,72 @@ void kernel_main(usize arg0, usize arg1)
 	fwcfgfs_init();
 	b1nix_debugfs_init();
 	tarfs_init();
+#ifdef B1NIX_FS_IMPORT
+	/*
+	 * The imported btrfs.
+	 *
+	 * Its own entry point is `static` and reachable only through the wrapper
+	 * <linux/init.h> emits from its late_initcall — see the note there. It
+	 * registers the filesystem type, allocates its caches and creates
+	 * /sys/fs/btrfs; nothing is mounted by it.
+	 *
+	 * After sysfs_init, because it publishes into /sys, and after
+	 * blk_cache_init, because a mount will read through the block cache.
+	 */
+	{
+		extern int lkpi_initcall_init_btrfs_fs(void);
+		int rc = lkpi_initcall_init_btrfs_fs();
+
+#if B1NIX_FS_IMPORT_EXT4
+		/*
+		 * ext4, and the two things it stands on: jbd2 (its journal) and
+		 * mbcache (the xattr block deduplication its own registration
+		 * expects to be there). Order matters — ext4's init registers with
+		 * both.
+		 */
+		{
+			extern int lkpi_initcall_journal_init(void);
+			extern int lkpi_initcall_mbcache_init(void);
+			extern int lkpi_initcall_ext4_init_fs(void);
+			extern int lkpi_initcall_dquot_init(void);
+			extern int lkpi_initcall_init_v2_quota_format(void);
+			int jrc = lkpi_initcall_journal_init();
+			int mrc = lkpi_initcall_mbcache_init();
+
+			/*
+			 * Quotas, before ext4: a filesystem with the quota feature turns
+			 * them on during its own mount, and it can only find the v2
+			 * format if that format has already registered itself.
+			 */
+			{
+				int qrc = lkpi_initcall_dquot_init();
+				int frc = lkpi_initcall_init_v2_quota_format();
+
+				if (qrc != 0 || frc != 0)
+					klog_warn("lkpi-fs: quota core init failed");
+			}
+			int erc = (jrc == 0 && mrc == 0) ? lkpi_initcall_ext4_init_fs()
+			                                 : -22;
+
+			if (erc != 0)
+				klog_error("lkpi-fs: imported ext4 failed to initialise");
+			else
+				klog_info("lkpi-fs: imported ext4 registered");
+		}
+#endif
+
+		if (rc != 0) {
+			klog_error("lkpi-fs: imported btrfs failed to initialise");
+		} else {
+			extern void lkpifs_init(void);
+
+			klog_info("lkpi-fs: imported btrfs registered");
+			/* And the bridge, which is what lets an ordinary
+			 * `mount -t btrfs` serve paths from it. */
+			lkpifs_init();
+		}
+	}
+#endif
 	BOOTMARK(17);	/* sysfs */
 	/* module_init_builtin_deps() used to be called here. It now runs after the
 	 * root is mounted (see the note at its remaining call site): the modules
@@ -774,6 +887,52 @@ void kernel_main(usize arg0, usize arg1)
 		extern void fb_console_selftest(void);
 		fb_console_selftest();
 	}
+#ifdef B1NIX_FS_IMPORT
+	/*
+	 * The imported filesystem's proof: mount a real btrfs image.
+	 *
+	 * Here rather than beside the registration above because it needs the
+	 * block devices, and those are probed later in this function. The device
+	 * is named on the command line so the harness can attach whichever disk
+	 * it made — hard-coding one would tie the test to the harness's ordering.
+	 */
+	{
+		static char lkpi_fs_dev[32];
+
+		/* Returns 1 on a match, not 0: the value is copied only then. */
+		if (bootinfo_get_kv("b1nix.lkpi-btrfs-test", lkpi_fs_dev,
+		                    sizeof(lkpi_fs_dev)) == 1) {
+			extern void lkpi_btrfs_mount_test_thread(void *arg);
+			extern void lkpi_btrfs_mount_watch_thread(void *arg);
+
+			/*
+			 * In a thread, not inline.
+			 *
+			 * Mounting a btrfs filesystem starts its worker threads and waits
+			 * for them — open_ctree reads the chunk tree through its own
+			 * workers — and nothing can wait for a thread before the
+			 * scheduler is running. Called from here directly, the mount
+			 * reached the superblock and then stopped forever.
+			 *
+			 * The buffer is static for the same reason: the thread outlives
+			 * this stack frame.
+			 */
+			if (kthread_create("lkpi-btrfs-test",
+			                   lkpi_btrfs_mount_test_thread,
+			                   lkpi_fs_dev) < 0)
+				klog_error("lkpi-fs: could not start the btrfs mount test");
+			/*
+			 * A watchdog beside it: if the mount has not finished after
+			 * twenty seconds it is wedged, and the profile says where. A
+			 * wedged mount otherwise reports nothing at all — the thread is
+			 * running, so no wait shows up in the task dump.
+			 */
+			if (kthread_create("lkpi-btrfs-watch",
+			                   lkpi_btrfs_mount_watch_thread, 0) < 0)
+				klog_error("lkpi-fs: could not start the mount watchdog");
+		}
+	}
+#endif
 #if defined(B1NIX_I915) && B1NIX_I915
 	/*
 	 * M102a: Intel i915. The driver's module init registers its PCI driver,
@@ -807,6 +966,10 @@ void kernel_main(usize arg0, usize arg1)
 
 		if (card)
 			lkpi_i915_register_card(card);
+		if (card && bootinfo_has_flag("b1nix.i915-mmio-bench")) {
+			extern void lkpi_i915_mmio_bench(struct drm_device *d);
+			lkpi_i915_mmio_bench(card);
+		}
 		/* And, when asked, whether the GT behind that card will run
 		 * anything: engines, address space, and one empty request per
 		 * engine taken to retirement. Costs nothing when the flag is
@@ -1057,9 +1220,9 @@ void kernel_main(usize arg0, usize arg1)
 						 * to keep the bootstrap initramfs as active root.
 						 * Otherwise (on real hardware or normal boots), we mount
 						 * loop0 as the primary rootfs at /. */
-						rc = vfs_mount(loop_dev->name, "/", "ext4", 0);
+						{ const char *loop_type; rc = mount_root_as_probed(loop_dev->name, &loop_type); }
 						if (rc == 0) {
-							snprintf(loop_buf, sizeof(loop_buf), "rootfs: %s mounted at / as ext4\n", loop_dev->name);
+							snprintf(loop_buf, sizeof(loop_buf), "rootfs: %s mounted at /\n", loop_dev->name);
 							console_write(loop_buf);
 							vfs_repopulate_after_root_mount();
 								if (mounted_iso_name[0] != '\0') {
@@ -1089,7 +1252,7 @@ void kernel_main(usize arg0, usize arg1)
 
 				if (rc != 0) {
 					k_err("rootfs", "liveiso mount failed, falling back to ram0...");
-					rc = vfs_mount("ram0", "/", "ext4", 0);
+					{ const char *ram_type; rc = mount_root_as_probed("ram0", &ram_type); }
 					if (rc == 0) {
 						k_warn("rootfs", "ram0 mounted at / (Live CD fallback)");
 						vfs_repopulate_after_root_mount();
@@ -1138,16 +1301,16 @@ void kernel_main(usize arg0, usize arg1)
 							}
 						}
 						if (rc != 0) {
-							const char *fs_types[] = {"ext4", "ext3", "ext2", "tarfs"};
-							for (int i = 0; i < 4; i++) {
-								rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
-								if (rc == 0) {
-									char mounted_buf[96];
-									snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, fs_types[i]);
-									console_write(mounted_buf);
-									vfs_repopulate_after_root_mount();
-									break;
-								}
+							const char *type = "tarfs";
+
+							rc = mount_root_as_probed(root_dev->name, &type);
+							if (rc != 0)
+								rc = vfs_mount(root_dev->name, "/", "tarfs", 0);
+							if (rc == 0) {
+								char mounted_buf[96];
+								snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, type);
+								console_write(mounted_buf);
+								vfs_repopulate_after_root_mount();
 							}
 						}
 					}
@@ -1169,16 +1332,15 @@ void kernel_main(usize arg0, usize arg1)
 				struct block_device *labelled = find_device_by_label("b1nix-root");
 
 				if (labelled) {
-					const char *fs_types[] = {"ext4", "ext3", "ext2"};
+					const char *type = "?";
 
-					for (int i = 0; i < 3 && rc != 0; i++)
-						rc = vfs_mount(labelled->name, "/", fs_types[i], 0);
+					rc = mount_root_as_probed(labelled->name, &type);
 					if (rc == 0) {
 						char buf[96];
 
 						snprintf(buf, sizeof(buf),
-						         "rootfs: %s (label b1nix-root) mounted at /\n",
-						         labelled->name);
+						         "rootfs: %s (label b1nix-root) mounted at / as %s\n",
+						         labelled->name, type);
 						console_write(buf);
 						boot_summary_set_root(labelled->name);
 						vfs_repopulate_after_root_mount();
@@ -1186,9 +1348,9 @@ void kernel_main(usize arg0, usize arg1)
 				}
 			}
 			if (rc != 0) {
-				rc = vfs_mount("ram0", "/", "ext4", 0);
+				{ const char *ram_type; rc = mount_root_as_probed("ram0", &ram_type); }
 				if (rc == 0) {
-					console_write("rootfs: ram0 mounted at / as ext4\n");
+					console_write("rootfs: ram0 mounted at /\n");
 					boot_summary_set_root("ram0");
 					vfs_repopulate_after_root_mount();
 				}
@@ -1201,22 +1363,20 @@ void kernel_main(usize arg0, usize arg1)
 				/* Try finding a block device by default label 'b1nix-root' (e.g. USB flash drive) */
 				struct block_device *root_dev = find_device_by_label("b1nix-root");
 				if (root_dev) {
-					const char *fs_types[] = {"ext4", "ext3", "ext2"};
-					for (int i = 0; i < 3; i++) {
-						rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
-						if (rc == 0) {
-							char mounted_buf[96];
-							snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s (label b1nix-root) mounted at / as %s\n", root_dev->name, fs_types[i]);
-							console_write(mounted_buf);
-							vfs_repopulate_after_root_mount();
-							break;
-						}
+					const char *type = "?";
+
+					rc = mount_root_as_probed(root_dev->name, &type);
+					if (rc == 0) {
+						char mounted_buf[96];
+						snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s (label b1nix-root) mounted at / as %s\n", root_dev->name, type);
+						console_write(mounted_buf);
+						vfs_repopulate_after_root_mount();
 					}
 				}
 				if (rc != 0) {
-					rc = vfs_mount("ram0", "/", "ext4", 0);
+					{ const char *ram_type; rc = mount_root_as_probed("ram0", &ram_type); }
 					if (rc == 0) {
-						console_write("rootfs: ram0 mounted at / as ext4\n");
+						console_write("rootfs: ram0 mounted at /\n");
 						boot_summary_set_root("ram0");
 						vfs_repopulate_after_root_mount();
 					} else {
@@ -1299,11 +1459,13 @@ void kernel_main(usize arg0, usize arg1)
 		extern int arch_smep_cpu_count(void);
 		int smep_cpus = arch_smep_cpu_count();
 
-		console_write("smep: active on ");
-		console_write_dec((u32)smep_cpus);
-		console_write(" of ");
-		console_write_dec((u32)get_online_cpu_count());
-		console_write(" CPUs\n");
+		char smep_line[64];
+
+		/* One write: an AP's message printed between the pieces of a
+		 * multi-call line ended up in the middle of it. */
+		snprintf(smep_line, sizeof(smep_line), "smep: active on %d of %d CPUs\n",
+		         smep_cpus, (int)get_online_cpu_count());
+		console_write(smep_line);
 	}
 
 	/* Do the cores agree about what a page-table entry means?
@@ -1431,6 +1593,40 @@ void kernel_main(usize arg0, usize arg1)
 		/* btrfs, when a disk carrying one is attached: read a filesystem
 		 * mkfs.btrfs wrote and check what comes back. */
 		btrfs_selftest();
+#ifdef B1NIX_FS_IMPORT
+		/* The same thing through the bridge: b1nix's VFS mounting an
+		 * imported filesystem and serving paths from it. Here rather than
+		 * beside the import's own registration because it mounts by PATH,
+		 * and there is no /mnt until the root filesystem is up. */
+		{
+			static char lkpi_bridge_dev[32];
+
+			if (bootinfo_get_kv("b1nix.lkpi-bridge-test", lkpi_bridge_dev,
+			                    sizeof(lkpi_bridge_dev)) == 1) {
+				extern void lkpifs_selftest(const char *dev);
+
+				lkpifs_selftest(lkpi_bridge_dev);
+			}
+#if B1NIX_FS_IMPORT_EXT4
+			/* And the same over ext4, on its own device. */
+			if (bootinfo_get_kv("b1nix.lkpi-ext4-test", lkpi_bridge_dev,
+			                    sizeof(lkpi_bridge_dev)) == 1) {
+				extern void lkpifs_selftest_type(const char *dev,
+				                                 const char *fstype,
+				                                 const char *mnt);
+				extern void lkpi_btrfs_mount_watch_thread(void *arg);
+
+				/* The same watchdog the btrfs self-test uses: a mount that
+				 * wedges reports nothing on its own, and this turns "it
+				 * hangs" into a function name. */
+				kthread_create("lkpi-mount-watch",
+				               lkpi_btrfs_mount_watch_thread, 0);
+				lkpifs_selftest_type(lkpi_bridge_dev, "ext4",
+				                     "/mnt/lkpi-ext4");
+			}
+#endif
+		}
+#endif
 		/* The nice/stride weighting, where the numbers live: the M46
 		 * userspace test can only observe the bias statistically. */
 		sched_nice_selftest();
@@ -1501,10 +1697,9 @@ void kernel_main(usize arg0, usize arg1)
 	/* Userspace on the secondaries is still off HERE, and the reason is
 	 * measured rather than assumed: with it on the suite scores 900-1300 of
 	 * ~1370 with wide variance, against 1369 and no blocked checks with it
-	 * off. The corruption behind that is characterised in
-	 * docs/aarch64-ap-userspace.md -- what it is not has been narrowed a long
-	 * way, what it is has not been found. b1nix.ap-userspace turns it on for
-	 * work on the bug. */
+	 * off. The corruption behind that has not been found (open item in
+	 * docs/aarch64-parity.md). b1nix.ap-userspace turns it on for work on
+	 * the bug. */
 #if defined(__aarch64__)
 	if (bootinfo_has_flag("b1nix.ap-userspace"))
 		g_ap_userspace_enabled = 1;
@@ -1519,6 +1714,18 @@ void kernel_main(usize arg0, usize arg1)
 	 * filesystems are up — kswapd keeps a free-frame headroom so userspace
 	 * allocations rarely stall in synchronous reclaim. */
 	kswapd_init();
+	scheduler_start_reaper();
+	vfs_start_writeback();
+	/* b1nix.prof-at=<seconds>: print the profile once, by itself, for a guest
+	 * that will never read /proc/b1nix-prof. */
+	{
+		u32 at = bootinfo_get_u32("b1nix.prof-at", 0);
+
+		if (at)
+			kthread_create("profdump", prof_dump_thread,
+			               (void *)(usize)at);
+	}
+	fb_console_start_flusher();
 
 	/* M99/M100 self-tests run here rather than in the block above: they create
 	 * kernel threads and park on wait channels, which needs the full
@@ -1623,14 +1830,11 @@ void kernel_main(usize arg0, usize arg1)
 
 	/* M94: Generic init path — honour `init=/path` from kernel cmdline.
 	 * Default PID 1 is /sbin/init, which is BusyBox's `init` applet (the
-	 * symlink is stamped by tools/ports/build-busybox.sh) — Alpine's layout.
+	 * symlink is stamped by tools/packages/stage-busybox.sh) — Alpine's layout.
 	 * BusyBox init supervises (reaps orphans, respawns getty, runs the
 	 * sysinit/shutdown phases) and /etc/inittab hands the service graph to
 	 * OpenRC, which stays the high-level init: `openrc sysinit`, `openrc boot`,
-	 * `openrc default`. OpenRC's own PID 1, /sbin/openrc-init, remains a
-	 * bootable configuration through `init=/sbin/openrc-init` (it owns the
-	 * /run/openrc/init.ctl control channel that openrc-shutdown and telinit
-	 * talk to), and is exercised by the `openrc` smoke instance.
+	 * `openrc default`.
 	 * `b1nix.single` maps to `init=/bin/sh` (standard single-user mode).
 	 * The old test orchestrator `/bin/init` can be selected via `init=/bin/init`. */
 	char init_path_buf[128];
@@ -1662,6 +1866,43 @@ void kernel_main(usize arg0, usize arg1)
 	         bootinfo_cmdline() ? bootinfo_cmdline() : "(none)");
 	console_write(init_log);
 	snprintf(g_boot_init, sizeof(g_boot_init), "%s pid=%d", init_path, init_pid);
+
+	/*
+	 * PID 1 is up: the kernel stops being the printer.
+	 *
+	 * Linux keeps its messages in a ring and lets userspace read them
+	 * (/dev/kmsg, journald, dmesg); the console is for what someone must see
+	 * even when nothing else runs. This kernel instead drew every info line
+	 * itself, on the console and, when the console lives on a DRM display,
+	 * into the same panel a compositor is using -- 1.8 M cycles a line with
+	 * interrupts off, for output the guest's own init is already collecting.
+	 *
+	 * From here the console carries warnings and worse. Everything is still
+	 * in the ring, /dev/kmsg still serves it, panics still print, and
+	 * `loglevel=` or a test boot (b1nix.test=1, whose whole grading is the
+	 * serial log) keeps whatever it asked for.
+	 */
+	/* A measurement asked for on the command line is output someone is
+	 * waiting to read, so those flags keep the console as it was. */
+	if (init_pid > 0 && !bootinfo_has_flag("b1nix.test=1") &&
+	    !bootinfo_get_kv("loglevel", 0, 0) &&
+	    !bootinfo_has_flag("b1nix.console-verbose") &&
+	    !bootinfo_has_flag("b1nix.drm-fps") &&
+	    !bootinfo_has_flag("b1nix.drm-tearwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-paintwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-crcwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-bandwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-scanwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-eventwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-bindwatch") &&
+	    !bootinfo_has_flag("b1nix.drm-gsmtrap") &&
+	    !bootinfo_has_flag("b1nix.drm-cadence") &&
+	    !bootinfo_get_u32("b1nix.drm-framedump", 0) &&
+	    !bootinfo_has_flag("b1nix.sysprof")) {
+		console_write("init: the console is userspace's now; the kernel keeps "
+		              "warnings (b1nix.console-verbose keeps it all)\n");
+		console_loglevel_set(CONSOLE_LOGLEVEL_QUIET);
+	}
 
 	/* A PID 1 that never started must say so, loudly, right here.
 	 *
@@ -1838,7 +2079,9 @@ void kernel_main(usize arg0, usize arg1)
 		 * cache — so the self-host fits in far less RAM. */
 		const char *sh_src =
 		    bootinfo_has_flag("b1nix.selfhostdisk") ? "sda" : "ram0";
-		int sh_mrc = vfs_mount(sh_src, "/mnt/build", "ext4", 0);
+		struct block_device *sh_dev = blk_get(sh_src);
+		const char *sh_type = sh_dev ? blk_probe_fstype(sh_dev) : "ext4";
+		int sh_mrc = vfs_mount(sh_src, "/mnt/build", sh_type[0] == '-' ? "ext4" : sh_type, 0);
 		char sh_buf[80];
 		snprintf(sh_buf, sizeof(sh_buf), "selfhost: mount %s -> /mnt/build: %d\n",
 		         sh_src, sh_mrc);

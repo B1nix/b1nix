@@ -80,6 +80,17 @@ int seq_puts(struct seq_file *m, const char *s)
 	return (int)len;
 }
 
+int seq_show_option(struct seq_file *m, const char *name, const char *value)
+{
+	seq_putc(m, ',');
+	seq_puts(m, name);
+	if (value) {
+		seq_putc(m, '=');
+		seq_puts(m, value);
+	}
+	return 0;
+}
+
 int seq_putc(struct seq_file *m, char c)
 {
 	char s[2] = { c, 0 };

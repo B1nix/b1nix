@@ -37,7 +37,10 @@ static int btrfs_probe_disk(struct block_device *dev) {
         const struct btrfs_super_block *sb =
             (const struct btrfs_super_block *)buf;
 
-        ok = memcmp(sb->magic, BTRFS_MAGIC, 8) == 0;
+        /* By label: the root disk is btrfs too, and must not be taken for
+         * the image tests/smoke.sh made with known content. */
+        ok = memcmp(sb->magic, BTRFS_MAGIC, 8) == 0 &&
+             strcmp(sb->label, "B1NIX-BTRFS") == 0;
     }
     kfree(buf);
     return ok;

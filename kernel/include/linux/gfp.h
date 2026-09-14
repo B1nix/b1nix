@@ -8,14 +8,9 @@
  * distinction that matters on Linux — may this allocation sleep — does not
  * exist here; the flags are accepted so callers compile, and __GFP_ZERO is
  * honoured because it changes the result. */
-#define __GFP_NOWARN  0x0200u
 #define __GFP_NOFAIL  0x1000u
-#define __GFP_NORETRY 0x4000u
 #define __GFP_ZERO_ALIAS __GFP_ZERO
-#define __GFP_COMP    0x2000u
 #define __GFP_NOFAIL  0x1000u
-#define __GFP_COMP    0x2000u
-#define __GFP_RETRY_MAYFAIL 0x0400u
 #define __GFP_HIGHMEM 0x0800u
 #define __GFP_DMA32   0x1000u
 #define GFP_USER      GFP_KERNEL
@@ -52,22 +47,56 @@ static inline unsigned int get_order(unsigned long size)
 #define __GFP_KSWAPD_RECLAIM 0
 
 
-#ifndef __GFP_ATOMIC
-#define __GFP_ATOMIC 0x80u
-#endif
-
-
-/* Whether an allocation with these flags may sleep. Everything here can except
- * GFP_ATOMIC, and callers use the answer to decide whether to take a lock
- * first — so getting it wrong is a deadlock, not a slowdown. */
+/* Whether an allocation with these flags may sleep: all but GFP_ATOMIC and
+ * GFP_NOWAIT. Callers use the answer to decide whether to cond_resched() or
+ * take a sleeping lock while a spinlock is held -- getting it wrong is a
+ * deadlock, not a slowdown. */
 static inline bool gfpflags_allow_blocking(gfp_t flags)
-{ return (flags & __GFP_ATOMIC) == 0; }
+{ return (flags & (GFP_ATOMIC | GFP_NOWAIT)) == 0; }
 
 
 /* Do not dip into emergency reserves for this allocation. b1nix's allocator
  * keeps no reserve to dip into, so the flag describes the only behaviour. */
 #ifndef __GFP_NOMEMALLOC
 #define __GFP_NOMEMALLOC 0x00020000u
+#endif
+
+/*
+ * The reclaim-recursion flags. __GFP_FS says the allocator MAY call back into a
+ * filesystem to free memory; a filesystem holding a transaction open must clear
+ * it (GFP_NOFS) or reclaim re-enters underneath it and deadlocks on the lock it
+ * already holds. __GFP_IO is the same statement one layer down.
+ *
+ * b1nix's reclaim does not call into a filesystem today, so clearing the flag
+ * changes nothing yet. The values still have to be distinct bits: the
+ * filesystems mask them in and out and compare the results.
+ */
+#ifndef __GFP_IO
+#define __GFP_IO   0x0040u
+#endif
+#ifndef __GFP_FS
+#define __GFP_FS   0x0080u
+#endif
+#ifndef __GFP_HIGHMEM
+#define __GFP_HIGHMEM 0x0002u
+#endif
+#ifndef __GFP_MOVABLE
+#define __GFP_MOVABLE 0x0008u
+#endif
+#ifndef __GFP_HARDWALL
+#define __GFP_HARDWALL 0x100000u
+#endif
+#ifndef GFP_NOFS
+#define GFP_NOFS   (GFP_KERNEL & ~__GFP_FS)
+#endif
+#ifndef GFP_NOIO
+#define GFP_NOIO   (GFP_KERNEL & ~(__GFP_FS | __GFP_IO))
+#endif
+#ifndef GFP_HIGHUSER
+#define GFP_HIGHUSER (GFP_KERNEL | __GFP_HIGHMEM)
+#endif
+#ifndef GFP_HIGHUSER_MOVABLE
+#define GFP_HIGHUSER_MOVABLE (GFP_HIGHUSER | __GFP_MOVABLE)
 #endif
 
 #endif

@@ -69,4 +69,13 @@ static inline u64 jiffies_to_nsecs(unsigned long j) { return (u64)j * 10000000ul
  * counter jiffies reads — there is no 32-bit wrap to work around. */
 static inline u64 get_jiffies_64(void) { return (u64)jiffies; }
 
+/*
+ * "Is this deadline in the past?" — written as a signed difference so that a
+ * jiffies counter wrapping does not invert the answer, which a plain `<` would.
+ */
+#define time_is_before_jiffies(a)     time_after(jiffies, a)
+#define time_is_after_jiffies(a)      time_before(jiffies, a)
+#define time_is_before_eq_jiffies(a)  time_after_eq(jiffies, a)
+#define time_is_after_eq_jiffies(a)   time_before_eq(jiffies, a)
+
 #endif

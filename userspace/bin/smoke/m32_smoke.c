@@ -574,7 +574,7 @@ static int test_tcp_client_server(void) {
    * inside a VFS syscall can strand an inode lock on ARM.
    *
    * SIGKILL, not SIGTERM: the instance's test runner starts with
-   * `trap '' ... TERM ...` (tools/ports/00-smoke.start) and SIG_IGN is
+   * `trap '' ... TERM ...` (tools/images/00-smoke.start) and SIG_IGN is
    * inherited across both fork and execve, so every process in the test tree
    * ignores SIGTERM. The kill silently did nothing, the waitpid below never
    * returned, and the lane died there — taking every check that runs after

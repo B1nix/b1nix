@@ -2,6 +2,7 @@
 #define B1NIX_ARCH_H
 
 #include <b1nix/types.h>
+#include <b1nix/kprof.h>
 
 #ifdef __aarch64__
 #include <b1nix/arch_aarch64.h>
@@ -30,6 +31,17 @@ u64 arch_kernel_stack_of_cpu(int cpu);
 #endif
 
 static inline void interrupts_disable(void) {
+  if (__builtin_expect(kprof_irqoff_on, 0)) {
+    u64 f;
+#ifdef __aarch64__
+    __asm__ volatile("mrs %0, daif; msr daifset, #2" : "=r"(f) : : "memory");
+#else
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
+#endif
+    if (KPROF_IRQ_WAS_ON(f))
+      kprof_irqoff_begin(__builtin_return_address(0));
+    return;
+  }
 #ifdef __aarch64__
   __asm__ volatile("msr daifset, #2" : : : "memory");
 #else
@@ -37,7 +49,20 @@ static inline void interrupts_disable(void) {
 #endif
 }
 
+/* Turning interrupts back on while a linuxkpi spinlock is held is the state
+ * that precedes the i915 probe hang: the holder can then be preempted, and
+ * everything waiting on the lock waits for a task that is not running. The
+ * acquire took them off, so something between the two puts them back, and the
+ * point of this hook is to name it at the instruction that does it.
+ *
+ * Defined out of line (kernel/lkpi/lock.c) so this header stays free of the
+ * lock bookkeeping; a load and a predicted branch when the count is zero. */
+void lkpi_lock_irq_on_check(u64 site);
+
 static inline void interrupts_enable(void) {
+  lkpi_lock_irq_on_check((u64)(usize)__builtin_return_address(0));
+  if (__builtin_expect(kprof_irqoff_on, 0))
+    kprof_irqoff_end();
 #ifdef __aarch64__
   __asm__ volatile("msr daifclr, #2" : : : "memory");
 #else
@@ -49,6 +74,8 @@ static inline void interrupts_enable(void) {
  * a wakeup delivered in between is lost and the CPU waits for the next one.
  * x86_64 spells it `sti; hlt`, and this arch `msr daifclr, #2; wfi`. */
 static inline void interrupts_enable_and_wait(void) {
+  if (__builtin_expect(kprof_irqoff_on, 0))
+    kprof_irqoff_end();
 #ifdef __aarch64__
   __asm__ volatile("msr daifclr, #2; wfi" : : : "memory");
 #else
@@ -96,10 +123,16 @@ static inline u64 interrupts_save(void) {
 #else
 #error "unsupported architecture"
 #endif
+  if (__builtin_expect(kprof_irqoff_on, 0) && KPROF_IRQ_WAS_ON(f))
+    kprof_irqoff_begin(__builtin_return_address(0));
   return f;
 }
 
 static inline void interrupts_restore(u64 f) {
+  if (KPROF_IRQ_WAS_ON(f))
+    lkpi_lock_irq_on_check((u64)(usize)__builtin_return_address(0));
+  if (__builtin_expect(kprof_irqoff_on, 0) && KPROF_IRQ_WAS_ON(f))
+    kprof_irqoff_end();
 #ifdef __aarch64__
   __asm__ volatile("msr daif, %0" : : "r"(f) : "memory");
 #elif defined(__x86_64__)
@@ -170,6 +203,8 @@ int boot_stack_is_guard_addr(u64 addr);
  * from a constant compiled into the kernel. Always NUL-terminated. */
 void arch_cpu_vendor(char *buf, usize len);
 void arch_cpu_model(char *buf, usize len);
+/* Space-separated feature names, as /proc/cpuinfo lists them. */
+void arch_cpu_flags(char *buf, usize len);
 
 int arch_xsave_enabled(void);
 u64 arch_xsave_mask(void);

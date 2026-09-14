@@ -18,7 +18,7 @@ fi
 
 # The chip describes itself: size and erase-block size come out of its own CFI
 # table, so this also proves the driver read that table rather than guessing.
-if /bin/flash_eraseall /dev/mtd0 > /tmp/mtd-erase.log 2>&1; then
+if /usr/sbin/flash_erase /dev/mtd0 0 0 > /tmp/mtd-erase.log 2>&1; then
 	echo "MTD-SMOKE: ok erase-all"
 else
 	echo "MTD-SMOKE: fail erase-all: $(head -2 /tmp/mtd-erase.log | tr '\n' ' ')"
@@ -73,7 +73,7 @@ else
 fi
 
 # And erasing brings them back, which is the other half of the same rule.
-if /bin/flash_eraseall /dev/mtd0 >/dev/null 2>&1; then
+if /usr/sbin/flash_erase /dev/mtd0 0 0 >/dev/null 2>&1; then
 	again="$(dd if=/dev/mtd0 bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
 	if [ "$again" = "ffffffff" ]; then
 		echo "MTD-SMOKE: ok erase-restores-ones"

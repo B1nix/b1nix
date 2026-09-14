@@ -129,7 +129,7 @@ int blk_cache_writeback_inode(struct block_device *dev, u32 fsid, u64 ino);
 /* In-flight: a CPU has claimed this entry and is doing its (lock-free, yielding)
  * block DMA into ->data. Eviction must skip BUSY entries, otherwise a second CPU
  * could pick the same slot and DMA a different block into it — corrupting both
- * (observed under -smp4 parallel builds as gcc reading garbage from a header). */
+ * (observed under -smp4 parallel builds as the compiler reading garbage from a header). */
 #define BLK_CACHE_BUSY  0x04
 
 struct block_buffer {
@@ -141,7 +141,7 @@ struct block_buffer {
     /* Singly-linked hash-chain index in the bcache, -1 = end of chain.
      * Lets bcache_find lookup an (bdev, block_no) pair without scanning the
      * full block_cache[] array. block_cache scales with RAM (~2 entries per
-     * MiB), so the old linear scan made gcc execve O(cache_size) per binary
+     * MiB), so the old linear scan made execve O(cache_size) per binary
      * page read — at 4 GiB guests that was 8K comparisons per file page,
      * dwarfing everything else. */
     i32 hash_next;

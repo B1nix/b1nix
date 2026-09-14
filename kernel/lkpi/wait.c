@@ -139,8 +139,24 @@ void remove_wait_queue(struct wait_queue_head *wq, struct wait_queue_entry *e)
 	lkpi_spin_unlock(&wq->lock);
 }
 
+/* Upstream's finish_wait uses list_del_init for the same reason: kjournald2
+ * parks on one DEFINE_WAIT entry in a loop, and a poisoned entry looked
+ * "already queued" to prepare_to_wait, so the next finish_wait deleted it a
+ * second time and wrote through the poison. */
+void lkpi_finish_wait_entry(struct wait_queue_head *wq, struct wait_queue_entry *e)
+{
+	if (!wq || !e)
+		return;
+	lkpi_spin_lock(&wq->lock);
+	if (e->entry.next && !list_empty(&e->entry))
+		list_del_init(&e->entry);
+	lkpi_spin_unlock(&wq->lock);
+}
+
 void __wake_up(struct wait_queue_head *wq, unsigned mode, int nr, void *key)
 {
+	extern int autoremove_wake_function(struct wait_queue_entry *entry,
+	                                    unsigned mode, int flags, void *key);
 	if (!wq)
 		return;
 
@@ -167,7 +183,11 @@ void __wake_up(struct wait_queue_head *wq, unsigned mode, int nr, void *key)
 		/* Read the successor now: the callback may unlink `e`. */
 		struct list_head *next = pos->next;
 
-		if (e->func) {
+		if (e->func == autoremove_wake_function) {
+			/* Unlinked under the lock, as upstream does: done unlocked it
+			 * raced the waiter's own finish_wait over the same links. */
+			list_del_init(&e->entry);
+		} else if (e->func) {
 			lkpi_spin_unlock(&wq->lock);
 			e->func(e, mode, 0, key);
 			lkpi_spin_lock(&wq->lock);

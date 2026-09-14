@@ -729,7 +729,28 @@ static int lazy_is_file_backed(u64 va) {
  * not copy them, and a writable MAP_PRIVATE mapping of a cached frame mapped
  * read-only + COW so the first store copies the page out of the cache instead
  * of rewriting the file for everyone else. */
-static int file_fill_fault(u64 *l3, usize i3, u64 va, u64 lazy_entry) {
+static int file_fill_fault_body(u64 *l3, usize i3, u64 va, u64 lazy_entry);
+
+/* The vector entered with IRQs masked, and filling a page from a file reads
+ * the filesystem -- the page cache's read-ahead included -- which may sleep
+ * (the imported btrfs does). This is process context, as a fault on x86_64
+ * is, so the fill runs with interrupts on. */
+static int file_fill_fault(u64 *l3, usize i3, u64 va, u64 lazy_entry,
+                           int may_sleep) {
+  u64 irq = interrupts_save();
+  int rc;
+
+  /* Only when the faulting context itself ran with IRQs on: a fault taken
+   * inside a masked section (a kernel copy under a spinlock) must stay
+   * masked, or a preemption lands in the middle of that section. */
+  if (may_sleep)
+    interrupts_enable();
+  rc = file_fill_fault_body(l3, i3, va, lazy_entry);
+  interrupts_restore(irq);
+  return rc;
+}
+
+static int file_fill_fault_body(u64 *l3, usize i3, u64 va, u64 lazy_entry) {
   struct vm_area *vma = vma_for(va);
   struct vfs_inode *in = (vma && vma->node) ? vma->node->inode : 0;
   int vma_shared = vma && (vma->flags & MAP_SHARED);
@@ -1014,7 +1035,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
                          swap_entry);
   if (rc == PF_NEEDS_FILE_FILL)
     return file_fill_fault(swap_l3, swap_i3, fault_addr & ~(PAGE_SIZE - 1),
-                           swap_entry);
+                           swap_entry, (error_code & 0xc) != 0);
   return rc;
 }
 
@@ -1532,6 +1553,7 @@ int paging_test_and_clear_dirty(u64 space, u64 vaddr) {
 void tlb_shootdown_all(void) { tlb_flush_all(); }
 
 void tlb_shootdown_page(u64 vaddr) { tlb_flush_page(vaddr); }
+void tlb_shootdown_current_mm(void) { tlb_flush_all(); }
 
 u64 vmm_virt_to_phys(void *virt) {
   u64 va = (u64)(usize)virt;

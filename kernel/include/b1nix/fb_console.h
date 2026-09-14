@@ -5,6 +5,10 @@
 
 void fb_console_init(void);
 void fb_console_clear(void);
+/* Stop drawing while a compositor owns the display, and redraw the log from
+ * the ring when it lets go. */
+void fb_console_set_hidden(int hidden);
+void fb_console_replay(void);
 void fb_console_putchar(char c);
 void fb_console_write(const char *str);
 void fb_console_blink_cursor(void);
@@ -14,6 +18,14 @@ void fb_console_freeze_top(void);
 void fb_console_set_top(u32 top_y);
 
 int fb_console_ready(void);
+/* A display that arrived after boot (a DRM framebuffer); see fb_console.c. */
+void fb_console_attach(void *pixels, unsigned pitch, unsigned width,
+                       unsigned height, unsigned bpp,
+                       void (*present)(unsigned x, unsigned y, unsigned w, unsigned h));
+void fb_console_present_all(void);
+/* Note that something changed; the fbflush thread presents it. */
+void fb_console_request_flush(void);
+void fb_console_start_flusher(void);
 u32 fb_console_width(void);
 u32 fb_console_height(void);
 u32 fb_console_pitch(void);

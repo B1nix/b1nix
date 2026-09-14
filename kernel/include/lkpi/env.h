@@ -26,6 +26,9 @@ u64 lkpi_ticks(void);            /* jiffies: 10 ms each, whatever the tick rate 
 /* Park for a number of jiffies; returns the jiffies left when woken early,
  * zero when the whole sleep elapsed. Not from atomic context. */
 u64 lkpi_sleep_jiffies(u64 jiffies_count);
+/* A sleep in milliseconds, for code that needs a finer step than the imported
+ * jiffy (10 ms). Sleeps the whole time asked for. */
+void lkpi_sleep_ms(unsigned ms);
 
 /* ── scheduling ─────────────────────────────────────────────────── */
 void lkpi_yield(void);
@@ -136,11 +139,55 @@ struct lkpi_task {
 	 * a GPU does — woke a task that had not yet slept, and the task then slept
 	 * out its whole timeout. */
 	volatile int wake_pending;
+	/* set_current_state() asked for a sleep and schedule() has not yet
+	 * carried it out; TASK_RUNNING takes it back. */
+	int sleep_requested;
 	/* The calling process's address space. b1nix's is not a struct mm_struct
 	 * and nothing here can walk it from another task — see find_vma() in
 	 * <linux/mm.h> — so this is always NULL and exists because imported code
 	 * passes current->mm along to a function that must fail to link. */
 	struct mm_struct *mm;
+	/*
+	 * The filesystem transaction this task currently has open.
+	 *
+	 * It lives on the task rather than being passed down because the code
+	 * that must know — an allocator deciding whether it may start a second
+	 * transaction, a writeback path deciding whether it may block — is called
+	 * from far below the code that opened one. jbd2 and both filesystems use
+	 * it exactly this way, and a shim that dropped it would let a nested
+	 * transaction start and deadlock against its own outer one.
+	 */
+	void *journal_info;
+	/*
+	 * Per-task flags. Only the allocation-scope bits are used here — a
+	 * filesystem tests PF_MEMALLOC_NOFS directly to decide whether it is
+	 * already inside a no-reclaim region rather than opening a nested one.
+	 * The bit values are in <linux/sched.h> with the rest of the PF_* set.
+	 */
+	unsigned int flags;
+	/*
+	 * Dirty-page throttling state.
+	 *
+	 * `nr_dirtied` counts pages this task has dirtied since it was last made
+	 * to wait, and `nr_dirtied_pause` is the count at which it must. btrfs
+	 * reads and resets both directly, around the writes it makes on a
+	 * caller's behalf. b1nix does not throttle dirtiers yet, so nothing acts
+	 * on them — but they are real fields, because the day it does, this is
+	 * the state it acts on.
+	 */
+	int nr_dirtied;
+	int nr_dirtied_pause;
+	/*
+	 * The I/O scheduling context.
+	 *
+	 * There is no I/O scheduler here, so nothing acts on it — but ext4 READS
+	 * the priority out of it to give its journal thread the same one as the
+	 * task that started the transaction, so it has to be a structure with
+	 * that field rather than an opaque pointer.
+	 */
+	struct io_context {
+		unsigned short ioprio;
+	} *io_context;
 };
 
 struct lkpi_task *lkpi_current(void);
@@ -149,6 +196,7 @@ struct lkpi_task *lkpi_current(void);
 int lkpi_wake_task(struct lkpi_task *t);
 /* Arm the park: what set_current_state() means here. */
 void lkpi_prepare_to_sleep(void);
+void lkpi_cancel_sleep(void);
 
 /* ── userspace access ───────────────────────────────────────────── */
 /* Return 0 on success, non-zero on fault — validated against the calling
@@ -364,5 +412,24 @@ int lkpi_display_present(const u32 *pixels, u32 width, u32 height);
 
 /* A kernel command-line flag, by name. 1 when present. */
 int lkpi_bootflag(const char *flag);
+
+/* A "key=value" kernel command-line option, as a number. def when absent or
+ * unparsable. */
+u32 lkpi_bootopt_u32(const char *key, u32 def);
+
+/* The same, as text. 1 when the key is on the command line. */
+int lkpi_bootopt_str(const char *key, char *out, unsigned out_size);
+
+/* Every task, with its state and where it parked. b1nix's own dump, reached
+ * from imported-side code that has found a thread that is not moving. */
+void lkpi_dump_tasks(void);
+
+/* A physical address as a kernel pointer, through the direct map. For imported
+ * code that has a DMA address and needs to look at the bytes behind it. */
+void *lkpi_phys_to_virt(u64 phys);
+
+/* "This wait has not finished in a long time", from the wait_event macro,
+ * which is the only place that knows the source line of the waiter. */
+void lkpi_wait_stall_report(const char *where, u64 seconds);
 
 #endif

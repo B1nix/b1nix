@@ -37,7 +37,7 @@ struct user {
   unsigned long long u_debugreg[8];
 };
 
-#else  /* i386 (frozen port) */
+#else  /* i386 (32-bit port removed; not built) */
 
 struct user_regs_struct {
   long ebx, ecx, edx, esi, edi, ebp, eax, xds, xes, xfs, xgs;

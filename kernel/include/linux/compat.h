@@ -2,8 +2,8 @@
 #ifndef LKPI_LINUX_COMPAT_H
 #define LKPI_LINUX_COMPAT_H
 #include <linux/types.h>
-/* 32-bit userspace on a 64-bit kernel. b1nix is x86_64-only and its 32-bit port
- * is frozen, so there is no compat ABI to translate and the types exist only
+/* 32-bit userspace on a 64-bit kernel. b1nix runs no 32-bit userspace, so
+ * there is no compat ABI to translate and the types exist only
  * for the ioctl tables that mention them. */
 typedef u32 compat_uptr_t;
 typedef u32 compat_size_t;

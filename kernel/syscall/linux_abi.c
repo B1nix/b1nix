@@ -657,12 +657,34 @@ static const struct lx_map lx_table[] = {
 
 #define LX_TABLE_LEN (sizeof(lx_table) / sizeof(lx_table[0]))
 
-u32 linux_syscall_to_b1nix(u64 linux_nr) {
+static u32 lx_scan(u64 linux_nr) {
 	for (usize i = 0; i < LX_TABLE_LEN; i++) {
 		if (lx_table[i].linux_nr == linux_nr)
 			return lx_table[i].b1nix_nr;
 	}
 	return LINUX_SYS_UNMAPPED;
+}
+
+/* Every system call a musl program makes comes through here, and the table
+ * is a list: read from the top, this was 5% of the kernel's tick samples
+ * while Plasma started. The Linux numbers are small and dense, so the answer
+ * for each is kept in a direct-index table filled on first use; 0 marks an
+ * entry not asked about yet (no mapping is 0, b1nix numbers start at 1), and
+ * a number beyond the table takes the scan. Filling a slot twice from two
+ * CPUs writes the same value, so plain stores are enough. */
+#define LX_DIRECT 512
+static u32 lx_direct[LX_DIRECT];
+
+u32 linux_syscall_to_b1nix(u64 linux_nr) {
+	if (linux_nr >= LX_DIRECT)
+		return lx_scan(linux_nr);
+	u32 v = __atomic_load_n(&lx_direct[linux_nr], __ATOMIC_RELAXED);
+	if (v)
+		return v == (u32)-1 ? LINUX_SYS_UNMAPPED : v;
+	v = lx_scan(linux_nr);
+	__atomic_store_n(&lx_direct[linux_nr],
+	                 v == LINUX_SYS_UNMAPPED ? (u32)-1 : v, __ATOMIC_RELAXED);
+	return v;
 }
 
 const char *linux_syscall_name(u64 linux_nr) {

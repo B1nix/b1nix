@@ -19,7 +19,7 @@
 # something static must be a visible, argued decision in a reviewed file, not a
 # quiet `-static` inside a port script.
 #
-# Usage: sh tools/check-dynamic.sh [rootfs-dir]
+# Usage: sh tools/check/check-dynamic.sh [rootfs-dir]
 
 set -eu
 

@@ -974,6 +974,12 @@ static void test_kthread_worker(void)
 		return;
 	}
 
+	/* Hold the worker inside a sleeping handler first, so the coalescing
+	 * check below cannot race the worker running the item it re-queues --
+	 * which it could, and on a fast machine did, when the items went first. */
+	kthread_init_work(&g_kw_slow, kw_slow_handler);
+	kthread_queue_work(worker, &g_kw_slow);
+
 	for (int i = 0; i < KW_ITEMS; i++) {
 		g_kw_items[i].index = (u32)i;
 		kthread_init_work(&g_kw_items[i].work, kw_handler);
@@ -984,10 +990,18 @@ static void test_kthread_worker(void)
 	if (kthread_queue_work(worker, &g_kw_items[KW_ITEMS - 1].work))
 		ok = 0;
 
+	/* A flush must actually wait for a sleeping handler, not just for it to
+	 * have been dequeued. */
+	kthread_flush_work(&g_kw_slow);
+	if (!g_kw_slow_done)
+		ok = 0;
+	if (g_kw_slow.seq != 1)
+		ok = 0;
+
 	kthread_flush_worker(worker);
 	if (g_kw_ran != KW_ITEMS)
 		ok = 0;
-	if (kthread_worker_executed(worker) != KW_ITEMS)
+	if (kthread_worker_executed(worker) != KW_ITEMS + 1)
 		ok = 0;
 	/* Submission order, which is the guarantee a submission thread is chosen
 	 * for in the first place. */
@@ -996,21 +1010,12 @@ static void test_kthread_worker(void)
 			ok = 0;
 	}
 
-	/* A flush must actually wait for a sleeping handler, not just for it to
-	 * have been dequeued. */
-	kthread_init_work(&g_kw_slow, kw_slow_handler);
-	kthread_queue_work(worker, &g_kw_slow);
-	kthread_flush_work(&g_kw_slow);
-	if (!g_kw_slow_done)
-		ok = 0;
-	if (g_kw_slow.seq != 1)
-		ok = 0;
-
 	/* An item may be requeued once it has run. */
+	g_kw_slow_done = 0;
 	if (!kthread_queue_work(worker, &g_kw_slow))
 		ok = 0;
 	kthread_flush_work(&g_kw_slow);
-	if (g_kw_slow.seq != 2)
+	if (!g_kw_slow_done || g_kw_slow.seq != 2)
 		ok = 0;
 
 	u64 executed = kthread_worker_executed(worker);

@@ -169,9 +169,32 @@ static void inotify_release(struct vfs_handle *h) {
   kfree(in);
 }
 
+/* FIONREAD: the bytes read(2) would return right now, as Linux answers it.
+ *
+ * It was ENOTTY, and that is what stopped a desktop: KDirWatch asks FIONREAD
+ * after poll(2) says the descriptor is readable and, refused, takes the
+ * answer to be zero bytes and reads nothing -- so the queue never drains,
+ * poll says readable again at once, and kactivitymanagerd made 110 000
+ * poll+ioctl rounds a second for as long as it lived. */
+#define INOTIFY_FIONREAD 0x541B
+static int inotify_ioctl(struct vfs_handle *h, u64 request, void *arg) {
+  if (request != INOTIFY_FIONREAD)
+    return -ENOTTY;
+  struct inotify_instance *in = (struct inotify_instance *)h->private_data;
+  int n = 0;
+  if (in) {
+    u64 flags;
+    spin_lock_irqsave(&in->lock, &flags);
+    for (int i = 0, at = in->head; i < in->count; i++, at = (at + 1) % INOTIFY_QUEUE)
+      n += (int)(sizeof(struct inotify_event) + in->ev[at].len);
+    spin_unlock_irqrestore(&in->lock, flags);
+  }
+  return syscall_copyout(arg, &n, sizeof(n)) == 0 ? 0 : -EFAULT;
+}
+
 static const struct vfs_file_ops inotify_ops = {
     .read = inotify_read,
-    .poll = inotify_poll,
+    .poll = inotify_poll, .ioctl = inotify_ioctl,
     .release = inotify_release,
 };
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-BB=/opt/busybox/bin/busybox
+BB=/bin/busybox
 echo "BB-W6: start accounts"
 
 # cryptpw: standard sha512-crypt of a known password with a fixed salt.

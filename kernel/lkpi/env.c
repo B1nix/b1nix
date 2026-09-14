@@ -9,9 +9,11 @@
  * meet. See <lkpi/env.h> for why that matters.
  */
 
+#include <b1nix/ktime.h>
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/klog.h>
+#include <linux/printk.h>
 #include <b1nix/lapic.h>
 #include <b1nix/memtype.h>
 #include <b1nix/mm.h>
@@ -51,8 +53,35 @@
  * simply rounds; a rate below it cannot happen (the timer is never programmed
  * slower than the PIT's 100 Hz), and the max() keeps the divisor sane if it
  * ever were. */
+/*
+ * jiffies, taken from a clock rather than from the timer tick.
+ *
+ * The tick counter only advances when a timer interrupt is delivered, so
+ * inside a section that masked interrupts it stands still -- and every wait in
+ * the imported tree that is written in milliseconds watches jiffies. i915's
+ * register read takes uncore->lock with spin_lock_irqsave and then waits for a
+ * forcewake ack; with the clock frozen by its own lock, that wait cannot time
+ * out, and the machine hung there in roughly one boot in five, reported as a
+ * spinlock lockup on a lock whose holder was inside fwtable_read32.
+ *
+ * The same trap is described for preempt_disable further down: the reading
+ * there is that a region which stops the clock must not exist. A counter that
+ * keeps running is the other half of that, and it is the half that a genuine
+ * irqsave region needs, since such a region legitimately cannot take the tick.
+ *
+ * The tick remains the fallback for as long as the TSC is not yet a clock --
+ * early boot, where interrupts are on and the tick does arrive.
+ */
+unsigned long lkpi_mmio_reads;
+unsigned long lkpi_mmio_writes;
+
 u64 lkpi_ticks(void)
 {
+	u64 ns = ktime_monotonic_ns();
+
+	if (ns)
+		return ns / 10000000ull; /* linux/jiffies.h fixes HZ at 100 */
+
 	u32 hz = sched_tick_hz();
 	u32 per_jiffy = hz / 100u;
 
@@ -144,12 +173,20 @@ int lkpi_diag_watch_report(u64 min_ms)
  * because the wait for it lasted 200 ms instead of two seconds. */
 /* Wake a task that parked in schedule_timeout, named by the snapshot above.
  *
- * The pid in that snapshot is b1nix's task id, and waking by id is safe against
- * the task having exited in the meantime: the scheduler finds no live task and
- * does nothing. */
+ * The pid in that snapshot is b1nix's task id plus one (see lkpi_current), and
+ * waking by id is safe against the task having exited in the meantime: the
+ * scheduler finds no live task and does nothing. */
 void lkpi_prepare_to_sleep(void)
 {
-	lkpi_current()->wake_pending = 0;
+	struct lkpi_task *t = lkpi_current();
+
+	t->wake_pending = 0;
+	t->sleep_requested = 1;
+}
+
+void lkpi_cancel_sleep(void)
+{
+	lkpi_current()->sleep_requested = 0;
 }
 
 int lkpi_wake_task(struct lkpi_task *t)
@@ -162,8 +199,17 @@ int lkpi_wake_task(struct lkpi_task *t)
 	t->wake_pending = 1;
 	/* Without the runqueue: this runs from fence callbacks, and those run from
 	 * interrupt handlers. See scheduler_wake_task_norq. */
-	scheduler_wake_task_norq((usize)t->pid);
+	/* Back to b1nix's numbering; see the note in lkpi_current(). */
+	scheduler_wake_task_norq((usize)(t->pid - 1));
 	return 1;
+}
+
+void lkpi_sleep_ms(unsigned ms)
+{
+	u64 deadline = scheduler_get_ticks() + ((u64)ms * (u64)sched_tick_hz()) / 1000u;
+
+	while (scheduler_get_ticks() < deadline)
+		scheduler_sleep_ticks(1);
 }
 
 u64 lkpi_sleep_jiffies(u64 jiffies_count)
@@ -191,6 +237,8 @@ u64 lkpi_sleep_jiffies(u64 jiffies_count)
    */
   if (scheduler_wait_armed())
     scheduler_wait_cancel();
+  /* The timed sleep is what set_current_state() was arming. */
+  lkpi_current()->sleep_requested = 0;
 	}
 
 	/*
@@ -334,7 +382,30 @@ void lkpi_irq_enable(void)
 
 int lkpi_irqs_enabled(void) { return interrupts_enabled(); }
 
-void lkpi_wait_prepare(void *chan) { scheduler_wait_prepare(chan); }
+/*
+ * Where each task last parked, by task id.
+ *
+ * A thread that stops shows up in the task dump as BLOCKED on a channel and
+ * nothing more: the channel is a heap address, and the code that parked on it
+ * is gone from the frame by then. One word per task, written on the way into
+ * the park, turns that into a return address the build can resolve.
+ */
+static void *g_wait_site[256];
+
+void lkpi_note_wait_site(void *site)
+{
+	struct task *t = current_task;
+	usize id = t ? (usize)t->id : 0;
+
+	if (id < sizeof(g_wait_site) / sizeof(g_wait_site[0]))
+		g_wait_site[id] = site;
+}
+
+void lkpi_wait_prepare(void *chan)
+{
+	lkpi_note_wait_site(__builtin_return_address(0));
+	scheduler_wait_prepare(chan);
+}
 
 void lkpi_wait_prepare_timeout(void *chan, u64 timeout_ticks)
 {
@@ -348,7 +419,21 @@ void lkpi_wait_commit(void)
   scheduler_wait_commit();
 }
 
-void lkpi_wait_cancel(void) { scheduler_wait_cancel(); }
+/* finish_wait() is called with a spinlock held as often as without one --
+ * btrfs's wait_on_state retakes the tree lock between schedule() and it. Turning
+ * interrupts on there broke the lock's interrupts-off section, and the holder
+ * was switched out with the lock taken. Under a lock the unlock restores the
+ * state instead. */
+void lkpi_wait_cancel(void)
+{
+	extern int lkpi_holding_spinlock(void);
+	extern void scheduler_wait_cancel_keep_irqs(void);
+
+	if (lkpi_holding_spinlock())
+		scheduler_wait_cancel_keep_irqs();
+	else
+		scheduler_wait_cancel();
+}
 
 void lkpi_schedule(void)
 {
@@ -356,10 +441,33 @@ void lkpi_schedule(void)
                   (u64)(usize)__builtin_frame_address(0));
   /* The second phase of a park, when one was armed; otherwise what a bare
    * schedule() asks for. See the note on schedule() in <linux/sched.h>. */
-  if (scheduler_wait_armed())
+  if (scheduler_wait_armed()) {
     scheduler_wait_commit();
-  else
-    scheduler_yield();
+    return;
+  }
+  /*
+   * set_current_state(TASK_INTERRUPTIBLE); schedule(); is a sleep until
+   * wake_up_process(), not a yield. As a yield, btrfs's cleaner thread spun
+   * through its idle loop forever, and the stride picker kept choosing it
+   * over the reclaim worker a blocked transaction was waiting on.
+   *
+   * Sleep in slices, returning on the wake or after a bounded wait: a waker
+   * that reaches the task through a wait queue rather than by task does not
+   * set wake_pending, and every such caller re-tests its condition after
+   * schedule() returns.
+   */
+  {
+    struct lkpi_task *t = lkpi_current();
+
+    if (t->sleep_requested) {
+      t->sleep_requested = 0;
+      for (int i = 0; i < 10 && !t->wake_pending; i++)
+        scheduler_sleep_ticks(1);
+      t->wake_pending = 0;
+      return;
+    }
+  }
+  scheduler_yield();
 }
 
 void lkpi_wake_all(void *chan)
@@ -407,8 +515,21 @@ struct lkpi_task *lkpi_current(void)
 
 	struct task *cur = current_task;
 	if (cur) {
-		t->pid = (int)cur->id;
-		t->tgid = (int)cur->id;
+		/*
+		 * b1nix's task id PLUS ONE.
+		 *
+		 * Imported code treats the pid as an identity it can compare, and
+		 * zero is not one: btrfs stores the locking task's pid in a tree
+		 * block and reports "already locked by pid=0, extent tree corruption
+		 * detected" when a later lock finds its own pid there — which for the
+		 * boot task, whose id is 0, is every buffer that has just been
+		 * unlocked. Linux has no pid 0 for anything doing filesystem work
+		 * either; it is the idle task.
+		 *
+		 * lkpi_wake_task subtracts the one again.
+		 */
+		t->pid = (int)cur->id + 1;
+		t->tgid = (int)cur->id + 1;
 		const char *name = cur->name;
 		usize i = 0;
 		for (; name && name[i] && i < sizeof(t->comm) - 1; i++)
@@ -768,6 +889,9 @@ void lkpi_might_sleep(const char *where)
       console_write("\n");
       arch_backtrace((u64)(usize)__builtin_frame_address(0),
                      (u64)(usize)__builtin_return_address(0));
+      /* Imported objects have no frame chain; the raw stack still names
+       * the path that got here with interrupts off. */
+      dump_raw_stack_with_symbols((u64)(usize)__builtin_frame_address(0), 400);
     }
   }
 
@@ -943,6 +1067,56 @@ int lkpi_display_present(const u32 *pixels, u32 width, u32 height)
 int lkpi_bootflag(const char *flag)
 {
 	return bootinfo_has_flag(flag);
+}
+
+int lkpi_bootopt_str(const char *key, char *out, unsigned out_size)
+{
+	return bootinfo_get_kv(key, out, out_size);
+}
+
+void *lkpi_phys_to_virt(u64 phys)
+{
+	return (void *)(usize)(vmm_direct_map_base() + phys);
+}
+
+void lkpi_dump_tasks(void)
+{
+	usize i;
+
+	(void)i;
+	scheduler_dump_tasks();
+	scheduler_dump_park_sites();
+}
+
+/*
+ * A wait that never ends used to be a thread that vanished.
+ *
+ * wait_event() is the shape imported code uses where it knows the other side
+ * will get there -- an atomic commit stalling on the previous one, a fence
+ * that will signal. When that does not hold on this kernel the thread parks
+ * for good and the machine only looks quiet. The macro is the one place with
+ * the waiter's file and line, so this is called from there.
+ */
+void lkpi_wait_stall_report(const char *where, u64 seconds)
+{
+	lkpi_printk("lkpi: wait at %s has not finished in %llu s\n", where,
+	            (unsigned long long)seconds);
+}
+
+u32 lkpi_bootopt_u32(const char *key, u32 def)
+{
+	char buf[32];
+	u32 val = 0;
+	const char *p = buf;
+
+	if (!bootinfo_get_kv(key, buf, sizeof(buf)) || !buf[0])
+		return def;
+	for (; *p; p++) {
+		if (*p < '0' || *p > '9')
+			return def;
+		val = val * 10u + (u32)(*p - '0');
+	}
+	return val;
 }
 
 /*

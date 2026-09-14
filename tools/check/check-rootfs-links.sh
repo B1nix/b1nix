@@ -18,7 +18,7 @@
 # matches on the bare name, so verifying anything stricter here would reject
 # images that actually run.
 #
-# Usage: sh tools/check-rootfs-links.sh [rootfs-dir]
+# Usage: sh tools/check/check-rootfs-links.sh [rootfs-dir]
 
 set -eu
 
@@ -34,8 +34,8 @@ ROOTFS="${1:-$PROJECT_DIR/build/$ARCH/rootfs}"
 PY=$(command -v python3 || true)
 [ -n "$PY" ] || { echo "check-rootfs-links: python3 not found" >&2; exit 1; }
 
-"$PY" - "$ROOTFS" "$(dirname "$0")/configs/unresolved-allowlist.txt" <<'PYEOF'
-import os, struct, sys
+"$PY" - "$ROOTFS" "$(dirname "$0")/../configs/unresolved-allowlist.txt" <<'PYEOF'
+import glob, os, struct, sys
 
 rootfs = sys.argv[1]
 

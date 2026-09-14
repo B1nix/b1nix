@@ -2,9 +2,9 @@
 # b1nix-musl-cc — Cross-compile C programs against the musl libc.
 #
 # Usage:
-#   tools/b1nix-musl-cc source.c -o output              # link dynamically (default)
-#   tools/b1nix-musl-cc -static source.c -o output     # link statically
-#   tools/b1nix-musl-cc -c source.c -o source.o         # compile only
+#   tools/toolchain/bin/b1nix-musl-cc source.c -o output              # link dynamically (default)
+#   tools/toolchain/bin/b1nix-musl-cc -static source.c -o output     # link statically
+#   tools/toolchain/bin/b1nix-musl-cc -c source.c -o source.o         # compile only
 #
 # Dynamic mode (default): produces a PIE ET_DYN that imports from ld-musl-x86_64.so.1
 #   via the kernel's in-kernel eager dynamic linker.
@@ -275,7 +275,7 @@ with open(f, 'r+b') as fh:
 " "$OUTPUT" 2>/dev/null || true
 
     # DT_NEEDED comes out as "libc.so" straight from the linker, because that
-    # is libc.so's DT_SONAME (set in tools/ports/build-musl.sh). It has to be
+    # is libc.so's DT_SONAME (set in tools/toolchain/build-musl.sh). It has to be
     # that exact name: musl's ld.so recognises a self-referential DT_NEEDED
     # only through a short reserved-prefix list ("libc.", "libpthread.", ...),
     # and anything else sends it off to re-open and re-map itself as a "new"

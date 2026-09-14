@@ -39,6 +39,8 @@
 #define SWAP_BITMAP_RAM_DIVISOR 32 /* bitmap uses <= ~3% of usable RAM */
 #define SWAP_SLOTS_MIN 4096        /* always allow at least ~16 MiB of swap */
 
+static int swap_device_is_free(struct block_device *dev);
+
 static struct block_device *swap_dev = 0;
 static u64 swap_start_lba = 0; // First LBA of swap area
 static u64 swap_sector_count = 0;
@@ -332,7 +334,61 @@ static struct block_device *swap_find_dedicated_disk(void)
      * first virtio disk is skipped for the same reason: it is the root. */
     if (!dev && !blk_nth_on_bus(BLK_BUS_ATA, 0) && !blk_nth_on_bus(BLK_BUS_NVME, 0))
         dev = blk_nth_on_bus(BLK_BUS_VIRTIO, SWAP_DISK_INDEX);
+    if (dev && !swap_device_is_free(dev))
+        return 0;
     return dev;
+}
+
+/*
+ * Does this disk already belong to something?
+ *
+ * The picker below takes the second virtio disk on a machine with no ATA and
+ * no NVMe, and then reserves its last quarter -- so attaching a scratch disk
+ * with a filesystem on it to such a guest hands a quarter of that filesystem
+ * to swap. Seen with a btrfs image attached to the Arch VM: the kernel
+ * announced "swap: device=vdb" over a filesystem systemd was about to mount,
+ * and only the absence of any swapping that boot kept the image intact.
+ *
+ * A device is free if it carries a swap signature (it was made for this) or
+ * carries no filesystem this kernel can recognise. Anything else keeps its
+ * disk.
+ */
+static int swap_device_is_free(struct block_device *dev)
+{
+    u8 buf[512];
+    int recognised = 0;
+
+    if (!dev || dev->block_count < 8)
+        return 0;
+
+    /* "SWAPSPACE2" sits at the end of the first page of a mkswap'd device. */
+    if (blk_read_cached(dev, 7, 1, buf) >= 0 &&
+        memcmp(buf + 512 - 10, "SWAPSPACE2", 10) == 0)
+        return 1;
+
+    /* ext2/3/4: magic 0xEF53 at byte 1080 (LBA 2, offset 56). */
+    if (blk_read_cached(dev, 2, 1, buf) >= 0 &&
+        buf[56] == 0x53 && buf[57] == 0xef)
+        recognised = 1;
+
+    /* btrfs: "_BHRfS_M" at byte 65600 (LBA 128, offset 64). */
+    if (!recognised && blk_read_cached(dev, 128, 1, buf) >= 0 &&
+        memcmp(buf + 64, "_BHRfS_M", 8) == 0)
+        recognised = 1;
+
+    /* FAT and XFS both name themselves in the first sector. */
+    if (!recognised && blk_read_cached(dev, 0, 1, buf) >= 0 &&
+        (memcmp(buf + 54, "FAT", 3) == 0 || memcmp(buf + 82, "FAT32", 5) == 0 ||
+         memcmp(buf, "XFSB", 4) == 0))
+        recognised = 1;
+
+    if (recognised) {
+        console_write("swap: ");
+        console_write(dev->name);
+        console_write(" carries a filesystem — leaving it alone\n");
+        return 0;
+    }
+    return 1;
 }
 
 static int swap_is_dedicated_disk(struct block_device *dev)

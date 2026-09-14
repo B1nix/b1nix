@@ -1240,7 +1240,7 @@ void nvme_msix_selftest(void)
 #else
 #define unit_iommu_active() iommu_active()
 #define unit_amdvi_active() amdvi_active()
-#define unit_smmu_active()  0
+#define unit_smmu_active()  smmuv3_active()
 #endif
 
 static int unit_active(void)

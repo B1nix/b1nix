@@ -17,6 +17,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/i2c.h>
 #include <b1nix/console.h>
+#include <b1nix/ktime.h>
 #include <b1nix/io.h>
 #include <b1nix/pci.h>
 #include <b1nix/posix.h>
@@ -121,9 +122,9 @@ static spinlock_t i2c_lock = SPINLOCK_INIT;
  * too short to let slow hardware answer or long enough to stall a boot. The
  * clock the kernel calibrates says what a millisecond is. */
 static int smb_wait_idle(void) {
-  u64 deadline = arch_tsc_monotonic_ns() + 50000000ull; /* 50 ms */
+  u64 deadline = ktime_monotonic_ns() + 50000000ull; /* 50 ms */
 
-  while (arch_tsc_monotonic_ns() < deadline) {
+  while (ktime_monotonic_ns() < deadline) {
     u8 s = inb((u16)(g_smb_base + SMB_HST_STS));
     if (!(s & SMB_STS_HOST_BUSY))
       return 0;
@@ -132,10 +133,10 @@ static int smb_wait_idle(void) {
 }
 
 static int smb_wait_done(void) {
-  u64 start = arch_tsc_monotonic_ns();
+  u64 start = ktime_monotonic_ns();
   u64 deadline = start + 250000000ull; /* 250 ms */
 
-  while (arch_tsc_monotonic_ns() < deadline) {
+  while (ktime_monotonic_ns() < deadline) {
     u8 s = inb((u16)(g_smb_base + SMB_HST_STS));
     if (s & (SMB_STS_DEV_ERR | SMB_STS_BUS_ERR | SMB_STS_FAILED)) {
       outb((u16)(g_smb_base + SMB_HST_STS), SMB_STS_ALL);
@@ -153,7 +154,7 @@ static int smb_wait_done(void) {
      * command up yet reads as one that has finished it. The grace used to be
      * "sixteen reads", which is a length of time only on one machine. */
     if (!(s & SMB_STS_HOST_BUSY) &&
-        arch_tsc_monotonic_ns() - start > 20000ull /* 20 µs */) {
+        ktime_monotonic_ns() - start > 20000ull /* 20 µs */) {
       outb((u16)(g_smb_base + SMB_HST_STS), SMB_STS_ALL);
       return 0;
     }

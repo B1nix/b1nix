@@ -1,0 +1,12 @@
+# Assign input event devices to the seat.
+#
+# 71-seat.rules tags the parent inputN (KERNEL=="input*") with "seat", but
+# libinput and logind act on the eventN character device, which that rule
+# does not match. Without a seat tag on eventN, logind does not list it among
+# the seat's devices and libinput's udev enumeration inside kwin comes back
+# empty: a mouse present, tagged ID_INPUT_MOUSE, and no cursor. Tag the event
+# node itself, and give it uaccess so the session user can open it -- the two
+# tags a real seat's input node carries.
+ACTION=="remove", GOTO="b1nix_seat_input_end"
+SUBSYSTEM=="input", KERNEL=="event[0-9]*", ENV{ID_INPUT}=="1", TAG+="seat", TAG+="uaccess"
+LABEL="b1nix_seat_input_end"

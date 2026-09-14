@@ -1460,6 +1460,7 @@ int xhci_probe(void)
 	}
 	if (!found)
 		return 0;
+	pci_bind_driver(&pci, "xhci_hcd");
 
 	xhci_pci_set_d0(&pci);
 

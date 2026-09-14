@@ -89,10 +89,47 @@ typedef struct wait_queue_head wait_queue_head_t;
 
 void init_waitqueue_head(struct wait_queue_head *wq);
 
+/*
+ * A wait queue initialised where it is defined, for the file-scope ones the
+ * imported code declares with DECLARE_WAIT_QUEUE_HEAD. The list has to point
+ * at itself — an empty list is a node whose two pointers are its own address,
+ * not a zeroed one — which is why this cannot simply be {0}.
+ */
+#define __WAIT_QUEUE_HEAD_INITIALIZER(name) {                                 \
+	.waiters = 0,                                                             \
+	.lock = { 0 },                                                            \
+	.head = { &(name).head, &(name).head },                                   \
+}
+
 /* Wake every waiter. Does not sleep; safe from an interrupt handler. */
 void wake_up(struct wait_queue_head *wq);
 /* Spelled separately because drivers use both names; identical behaviour. */
 void wake_up_all(struct wait_queue_head *wq);
+
+/*
+ * Is anyone waiting on this queue?
+ *
+ * The distinction between the two is the barrier, and it is not cosmetic.
+ * `waitqueue_active` is a plain read: the caller must already have a barrier
+ * between whatever it wrote and this test. `wq_has_sleeper` includes the
+ * barrier itself, for the common pattern of "publish state, then wake if
+ * anybody is waiting" — without it the CPU may hoist the read of the queue
+ * above the write of the state, see an empty queue, skip the wake, and leave a
+ * waiter that had just published itself asleep forever.
+ *
+ * btrfs uses both, deliberately and in different places.
+ */
+static inline int waitqueue_active(struct wait_queue_head *wq)
+{
+	return wq && wq->waiters != 0;
+}
+
+static inline int wq_has_sleeper(struct wait_queue_head *wq)
+{
+	/* The barrier that pairs with the waiter publishing itself. */
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	return waitqueue_active(wq);
+}
 
 /* Number of wake_up calls this queue has seen. */
 u64 waitqueue_wakeups(const struct wait_queue_head *wq);
@@ -116,13 +153,26 @@ void lkpi_wait_relax(void);
  * `condition` is an expression re-evaluated on every pass, exactly as in the
  * Linux macro, so it must be cheap and free of side effects.
  */
+#define LKPI_WAIT_STR_(x) #x
+#define LKPI_WAIT_STR(x) LKPI_WAIT_STR_(x)
+
 #define wait_event(wq, condition)                                              \
 	do {                                                                       \
 		if (!(condition)) {                                                    \
+			u64 lkpi__t0 = lkpi_ticks();                                       \
+			u64 lkpi__next = lkpi__t0 + 5ull * 100ull /* lkpi_ticks() is jiffies, 100 a second */;   \
 			lkpi_wait_enter(&(wq));                                            \
 			for (;;) {                                                         \
 				if (condition)                                                 \
 					break;                                                     \
+				if (lkpi_ticks() >= lkpi__next) {                              \
+					lkpi_wait_stall_report(                                    \
+					    __FILE__ ":" LKPI_WAIT_STR(__LINE__),                  \
+					    (lkpi_ticks() - lkpi__t0) /                            \
+					        100ull);                     \
+					lkpi__next = lkpi_ticks() +                                \
+					             5ull * 100ull /* lkpi_ticks() is jiffies, 100 a second */;          \
+				}                                                              \
 				if (!lkpi_wait_may_block()) {                                  \
 					lkpi_wait_relax();                                         \
 					continue;                                                  \
@@ -192,6 +242,9 @@ void __add_wait_queue(struct wait_queue_head *wq, struct wait_queue_entry *e);
 void __add_wait_queue_entry_tail(struct wait_queue_head *wq,
                                  struct wait_queue_entry *e);
 void __remove_wait_queue(struct wait_queue_head *wq, struct wait_queue_entry *e);
+/* finish_wait()'s half: unlink if still queued and leave the entry empty, so
+ * a loop that prepares the same entry again re-adds it. */
+void lkpi_finish_wait_entry(struct wait_queue_head *wq, struct wait_queue_entry *e);
 
 /* Wake the callback entries with a key, as well as the parked tasks. A NULL key
  * is what plain wake_up passes. */

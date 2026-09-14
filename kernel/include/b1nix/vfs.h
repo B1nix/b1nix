@@ -243,6 +243,18 @@ struct vfs_inode {
    * list of name/value pairs; NULL when the inode has no xattrs. */
   struct vfs_xattr *xattrs;
 
+  /* A filesystem that stores extended attributes ITSELF supplies these, and
+   * the in-memory list above is then unused for its inodes: an attribute set
+   * on an ext4 file has to reach ext4, not a list that dies with the mount.
+   * All four are optional; without them the list is the whole story, which is
+   * what tmpfs and the initramfs want. */
+  isize (*getxattr_cb)(struct vfs_node *node, const char *name, void *value,
+                       usize size);
+  int (*setxattr_cb)(struct vfs_node *node, const char *name,
+                     const void *value, usize size, int flags);
+  int (*removexattr_cb)(struct vfs_node *node, const char *name);
+  isize (*listxattr_cb)(struct vfs_node *node, char *list, usize size);
+
   /* Timestamps */
   u64 atime;
   u64 mtime;
@@ -269,6 +281,11 @@ struct vfs_inode {
    * first and skips the walk when the file it is closing has nothing to
    * write. */
   u32 dirty_pages;
+  /* Membership in the page cache's list of inodes with dirty pages, which
+   * the writeback thread drains. Both under the page-cache lock. The list
+   * holds a reference (vfs_inode_get) for as long as the inode is on it. */
+  struct vfs_inode *dirty_next;
+  u8 on_dirty_list;
   /* Pages of this inode currently in the page cache. Truncating or
    * invalidating a file walks every cached page in the machine to find its
    * own; a file with none can skip the walk entirely, which is the common
@@ -543,6 +560,7 @@ u32 vfs_mounting_fs_id(void);
 
 struct vfs_node *vfs_create_node(enum vfs_node_type type);
 void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child);
+int vfs_attach_child_unique(struct vfs_node *parent, struct vfs_node *child);
 /* Unlink `child` from `parent`'s sibling list. Used by synthetic filesystems
  * whose tree changes at runtime (a module removing its /sys/module entry).
  * The caller still owns its reference on the child. */
@@ -653,6 +671,14 @@ int vfs_remount(const char *target, u64 flags);
  * vfs_mounts() should ask for this rather than assume MAX_MOUNTS, and must
  * heap-allocate it. */
 usize vfs_mount_capacity(void);
+/* Inode references: the inode is freed at the last put when unlinked. */
+struct vfs_inode *vfs_inode_get(struct vfs_inode *inode);
+void vfs_inode_put(struct vfs_inode *inode);
+/* Write back the inodes the page cache reports dirty; sync, syncfs, umount
+ * and the pcflush thread call it. Returns how many inodes were flushed. */
+int vfs_writeback_dirty_inodes(void);
+/* Start the pcflush thread (needs the scheduler). */
+void vfs_start_writeback(void);
 int vfs_sync(void);
 isize vfs_getdents(int handle, struct dirent *buf, usize max_entries);
 int vfs_pipe(int pipefd[2]);

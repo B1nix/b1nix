@@ -27,6 +27,10 @@
  * its own without this file changing.
  */
 
+/* poll(2) constants and poll_table. They used to arrive through
+ * <linux/types.h>; that include was removed when fs.h became the full VFS —
+ * see the note there — so the users name it themselves now. */
+#include <linux/poll.h>
 #include <linux/pci.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
@@ -42,6 +46,10 @@
 #include <lkpi/drmdev.h>
 #include <lkpi/env.h>
 #include <drm/drm_mode.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_plane.h>
+#include <drm/drm_framebuffer.h>
+#include <linux/kthread.h>
 #include <asm/ioctl.h>
 #include <linux/atomic.h>
 #include <uapi/drm/i915_drm.h>
@@ -83,12 +91,15 @@ static unsigned g_drm_count;
  * the one a test that just brought a device up means. */
 static struct drm_device *g_dev;
 
+extern int drm_console_attach(struct drm_device *dev);
 void lkpi_drm_register_device(struct drm_device *dev, lkpi_drm_page_fn resolver)
 {
 	unsigned i;
 
 	if (!dev)
 		return;
+	/* The boot log onto this device's display, if nothing else draws one. */
+	(void)drm_console_attach(dev);
 	for (i = 0; i < g_drm_count; i++) {
 		if (g_drm[i].dev == dev) {
 			g_drm[i].resolver = resolver;
@@ -517,6 +528,110 @@ static void execbuf_account(void *user_arg, isize ret)
 	                                            __ATOMIC_RELAXED));
 }
 
+static u32 drm_primary_fb_id(void *file);
+
+/* Print every object/property/value triple in an atomic request. */
+static void drm_dump_atomic_request(void *file, void *user_arg)
+{
+	struct file *filp = file;
+	struct drm_file *file_priv = filp ? filp->private_data : 0;
+	struct drm_device *dev = file_priv ? file_priv->minor->dev : 0;
+
+	struct {
+		u32 flags;
+		u32 count_objs;
+		u64 objs_ptr;
+		u64 count_props_ptr;
+		u64 props_ptr;
+		u64 prop_values_ptr;
+		u64 reserved;
+		u64 user_data;
+	} req;
+	u32 objs[64], nprops[64], flat = 0;
+
+	if (!dev || lkpi_copy_from_user(&req, user_arg, sizeof(req)) != 0)
+		return;
+	if (!req.count_objs || req.count_objs > 64)
+		return;
+	if (lkpi_copy_from_user(objs, (void *)(usize)req.objs_ptr,
+	                        req.count_objs * sizeof(u32)) != 0)
+		return;
+	if (lkpi_copy_from_user(nprops, (void *)(usize)req.count_props_ptr,
+	                        req.count_objs * sizeof(u32)) != 0)
+		return;
+	for (u32 o = 0; o < req.count_objs; o++) {
+		for (u32 k = 0; k < nprops[o] && flat < 64; k++, flat++) {
+			u32 pid = 0;
+			u64 val = 0;
+
+			if (lkpi_copy_from_user(&pid,
+			        (void *)(usize)(req.props_ptr + flat * 4u),
+			        sizeof(pid)) != 0)
+				return;
+			if (lkpi_copy_from_user(&val,
+			        (void *)(usize)(req.prop_values_ptr + flat * 8u),
+			        sizeof(val)) != 0)
+				return;
+			{
+				/* By name. A refusal reported as "property 18" needs the
+				 * property table to read at all, and the table is right
+				 * here. */
+				struct drm_property *prop = drm_property_find(dev, 0, pid);
+
+				pr_info("drm:   object %u %s = %llu\n", objs[o],
+				        prop ? prop->name : "(unknown property)",
+				        (unsigned long long)val);
+			}
+		}
+	}
+}
+
+/* When the last atomic commit returned, for timing the event that follows. */
+static u64 drm_last_commit_ns;
+
+/* The framebuffer the request being handled names for the primary plane. */
+static u64 drm_want_fb;
+
+/* Flip completions handed to userspace, against the commits that asked for
+ * them. */
+unsigned drm_events_delivered;
+
+/* Framebuffer objects created, counted against the frames presented. */
+static unsigned drm_addfb_calls;
+
+/* The cookie the last atomic apply passed in. */
+static u64 drm_last_user_data;
+
+/* The object id of the first CRTC's primary plane. An atomic request names
+ * several planes and only this one carries what the screen shows. */
+static u32 drm_primary_plane_id(void *file)
+{
+	struct file *filp = file;
+	struct drm_file *file_priv = filp ? filp->private_data : 0;
+	struct drm_device *dev = file_priv ? file_priv->minor->dev : 0;
+	struct drm_crtc *crtc;
+
+	if (!dev)
+		return 0;
+	drm_for_each_crtc(crtc, dev)
+		if (crtc->state && crtc->state->active && crtc->primary)
+			return crtc->primary->base.id;
+	return 0;
+}
+
+/* The id of the plane FB_ID property, which is what an atomic request names
+ * when it wants a different buffer on screen. */
+static u32 drm_fb_id_prop(void *file)
+{
+	struct file *filp = file;
+	struct drm_file *file_priv = filp ? filp->private_data : 0;
+	struct drm_device *dev = file_priv ? file_priv->minor->dev : 0;
+
+	if (!dev || !dev->mode_config.prop_fb_id)
+		return 0;
+	return dev->mode_config.prop_fb_id->base.id;
+}
+
 isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 {
 	/* 0xc05064a7: DRM_IOCTL_MODE_GETCONNECTOR. */
@@ -528,6 +643,340 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 		if (r == 0)
 			debug_dump_connector_modes(user_arg);
 		return r;
+	}
+
+	/* How many buffers the client actually got.
+	 *
+	 * Two framebuffers alive could be a swapchain of two, or one buffer plus
+	 * the cursor -- and those mean opposite things when the scanned-out buffer
+	 * never changes. Counting the creations, with their size, separates them:
+	 * a compositor that asked for two full-screen buffers and got them is
+	 * choosing to reuse one, and a compositor that only ever asked for one was
+	 * refused somewhere. 0xc02064b2 is DRM_IOCTL_MODE_CREATE_DUMB, whose
+	 * request starts with HEIGHT and then width -- in that order, which is
+	 * worth spelling out because reading them the other way round makes every
+	 * buffer look rotated. */
+	if (lkpi_bootflag("b1nix.drm-fps") && (request & 0xffffffffu) == 0xc02064b2u) {
+		u32 req[3] = { 0, 0, 0 };
+		isize r;
+
+		lkpi_copy_from_user(req, user_arg, sizeof(req));
+		r = drm_ioctl((struct file *)file, (unsigned int)request,
+		              (unsigned long)(usize)user_arg);
+		pr_info("drm: create_dumb %ux%u %ubpp -> %d\n", req[1], req[0], req[2],
+		        (int)r);
+		return r;
+	}
+
+	/* What the atomic request actually asks for.
+	 *
+	 * The plane's framebuffer does not change from one commit to the next,
+	 * and the same compositor against the same driver on Linux does not
+	 * behave that way -- so the question is whether the FB_ID the client sets
+	 * arrives here at all. The request is four parallel arrays: the objects,
+	 * how many properties each carries, then the property ids and their
+	 * values, flat. Walking them says what was asked for, before any of this
+	 * kernel's own state is involved. */
+	if (lkpi_bootflag("b1nix.drm-fps") && (request & 0xffffffffu) == 0xc03864bcu) {
+		struct {
+			u32 flags;
+			u32 count_objs;
+			u64 objs_ptr;
+			u64 count_props_ptr;
+			u64 props_ptr;
+			u64 prop_values_ptr;
+			u64 reserved;
+			u64 user_data;
+		} req;
+		static unsigned seen_commits;
+		static u64 prim_a, prim_b;
+		static unsigned prim_a_n, prim_b_n, prim_other;
+		(void)prim_b_n;
+
+		if (lkpi_copy_from_user(&req, user_arg, sizeof(req)) == 0 &&
+		    req.count_objs && req.count_objs < 64) {
+			u32 nprops[64];
+
+			seen_commits++;
+			u32 objs[64];
+
+			if (lkpi_copy_from_user(nprops, (void *)(usize)req.count_props_ptr,
+			                        req.count_objs * sizeof(u32)) == 0 &&
+			    lkpi_copy_from_user(objs, (void *)(usize)req.objs_ptr,
+			                        req.count_objs * sizeof(u32)) == 0) {
+				u32 flat = 0;
+
+				/* Walk per object, so a property can be attributed to the
+				 * plane that carries it: FB_ID = 0 on the planes a
+				 * compositor leaves off says nothing, and printing those
+				 * first hides the one value that matters. */
+				for (u32 o = 0; o < req.count_objs && flat < 128; o++) {
+					for (u32 k = 0; k < nprops[o] && flat < 128; k++, flat++) {
+						u32 pid = 0;
+						u64 val = 0;
+
+						if (lkpi_copy_from_user(&pid,
+						        (void *)(usize)(req.props_ptr + flat * 4u),
+						        sizeof(pid)) != 0)
+							goto done_props;
+						if (lkpi_copy_from_user(&val,
+						        (void *)(usize)(req.prop_values_ptr +
+						                        flat * 8u),
+						        sizeof(val)) != 0)
+							goto done_props;
+						if (pid != drm_fb_id_prop(file) || !val)
+							continue;
+						if (objs[o] != drm_primary_plane_id(file))
+							continue;
+						/* Every distinct buffer the primary plane is asked
+						 * for, with how often. Printing the first few showed
+						 * one id over and over, which is either a compositor
+						 * reusing one buffer or a sample taken during
+						 * start-up; a tally over the whole run cannot be
+						 * mistaken for either. */
+						/* Two fixed slots latched onto whatever the first
+						 * two ids happened to be -- start-up buffers, in
+						 * every run -- and every later frame fell into
+						 * "others", so a compositor alternating two buffers
+						 * per frame read as one buffer plus noise. What the
+						 * question needs is only whether consecutive commits
+						 * name the SAME buffer. */
+						if (val == prim_a)
+							prim_a_n++;
+						else
+							prim_other++;
+						if (val != prim_a) {
+							prim_b = prim_a;
+							prim_b_n++;
+							prim_a = val;
+						}
+						drm_want_fb = val;
+					}
+				}
+			}
+done_props:;
+			if ((seen_commits % 120u) == 0)
+				pr_info("drm: primary plane: %u commit(s) repeated the buffer, %u changed it (now fb %llu, was fb %llu)\n",
+				        prim_a_n, prim_other, (unsigned long long)prim_a,
+				        (unsigned long long)prim_b);
+		}
+	}
+
+	/* Does an atomic commit change the framebuffer the primary plane shows?
+	 *
+	 * The scanned-out buffer never changes while flips keep completing, and
+	 * the compositor keeps two framebuffers alive -- so either its request
+	 * names the same one every time, or the commit does not carry it through.
+	 * Sampling the plane's own state either side of the ioctl answers that
+	 * without parsing the property arrays the request is built from.
+	 * 0xc03864bc is DRM_IOCTL_MODE_ATOMIC. */
+	if (lkpi_bootflag("b1nix.drm-fps") && (request & 0xffffffffu) == 0xc03864bcu) {
+		static unsigned carried, dropped;
+		u32 before = drm_primary_fb_id(file);
+		isize r = drm_ioctl((struct file *)file, (unsigned int)request,
+		                    (unsigned long)(usize)user_arg);
+		u32 after = drm_primary_fb_id(file);
+
+		/* A commit that asks for a DIFFERENT buffer than the one on the plane
+		 * is the only one that can end the tearing, and there is exactly one
+		 * of them in a run. Whether it succeeded, and whether the plane took
+		 * it, is the whole question -- a compositor whose swap is refused has
+		 * nowhere to go but the buffer it already has. */
+		{
+			/* Separate the tests from the applies. A compositor validates a
+			 * configuration with TEST_ONLY before committing it, and a test
+			 * that is refused is a configuration it will never try -- which
+			 * looks the same from outside as one it never wanted. */
+			static unsigned ok_apply, fail_apply, ok_test, fail_test;
+			static u32 last_apply_flags;
+			u32 flags = 0;
+
+			lkpi_copy_from_user(&flags, user_arg, sizeof(flags));
+			if (flags & 0x100u) {
+				if (r < 0)
+					fail_test++;
+				else
+					ok_test++;
+			} else {
+				if (r < 0)
+					fail_apply++;
+				else
+					ok_apply++;
+			}
+			/* The whole flags word, not just the test bit. 0x02 is
+			 * PAGE_FLIP_ASYNC: a flip that takes effect immediately instead
+			 * of at the next vertical blank, which tears by design and is
+			 * something a compositor only asks for when it is told the
+			 * driver offers it. */
+			if (!(flags & 0x100u))
+				last_apply_flags = flags;
+			if (((ok_apply + fail_apply + ok_test + fail_test) % 120u) == 0)
+				pr_info("drm: %u applies submitted, %u completion events delivered\n",
+				        ok_apply, drm_events_delivered);
+			if (((ok_apply + fail_apply + ok_test + fail_test) % 120u) == 0)
+				pr_info("drm: atomic applies %u ok %u failed, tests %u ok %u failed, apply flags 0x%x%s\n",
+				        ok_apply, fail_apply, ok_test, fail_test,
+				        last_apply_flags,
+				        (last_apply_flags & 0x2u) ? " (ASYNC/tearing)" : "");
+			/* One accepted request, printed the same way as a refused one.
+			 * The two differ in exactly the property this side would not
+			 * take, and that difference is easier to read than any amount of
+			 * reasoning about which check might have run. */
+			if (r >= 0 && (flags & 0x100u) && ok_test == 1) {
+				pr_info("drm: atomic test ACCEPTED, flags 0x%x, it asked:\n",
+				        flags);
+				drm_dump_atomic_request(file, user_arg);
+			}
+			if (r < 0 && (fail_apply + fail_test) <= 4) {
+				/* Everything the refused request asked for. EINVAL from an
+				 * atomic commit names nothing by itself, and a compositor
+				 * whose commit is refused carries the divergence forward --
+				 * so the properties it set are the only way to see which one
+				 * this side would not take. */
+				pr_info("drm: atomic %s REFUSED (%d), flags 0x%x, it asked:\n",
+				        (flags & 0x100u) ? "test" : "apply", (int)r, flags);
+				drm_dump_atomic_request(file, user_arg);
+			}
+		}
+		drm_want_fb = 0;
+
+		/* When the commit returned, so the event that follows can be timed
+		 * against it. A page flip completes at a vertical blank -- up to a
+		 * frame away, never immediately. A completion delivered at once is a
+		 * compositor told its buffer is free while the display is still
+		 * reading it, which is precisely the shape of the tearing here. */
+		drm_last_commit_ns = lkpi_monotonic_ns();
+		{
+			/* The cookie the request carries. A compositor matches a
+			 * completion to the flip it belongs to by this value and releases
+			 * the framebuffer that flip replaced; one that never matches
+			 * keeps every buffer but the newest marked as still in flight,
+			 * and has nowhere to draw but the one on screen. */
+			struct {
+				u32 flags;
+				u32 count_objs;
+				u64 objs_ptr;
+				u64 count_props_ptr;
+				u64 props_ptr;
+				u64 prop_values_ptr;
+				u64 reserved;
+				u64 user_data;
+			} rq;
+
+			if (lkpi_copy_from_user(&rq, user_arg, sizeof(rq)) == 0)
+				drm_last_user_data = rq.user_data;
+		}
+
+		if (before && after) {
+			if (before == after)
+				dropped++;
+			else
+				carried++;
+			if (((carried + dropped) % 120u) == 0)
+				pr_info("drm: atomic commits: %u changed the plane's framebuffer, %u left it\n",
+				        carried, dropped);
+		}
+		return r;
+	}
+
+	/* Framebuffers created, per second, against the frames drawn.
+	 *
+	 * A compositor normally makes one of these per buffer and keeps it. One
+	 * per FRAME means it is rebuilding the object every time it draws, and
+	 * because ids are handed back out again the same numbers keep appearing --
+	 * which is enough to make a sampler believe the screen never changed.
+	 * 0xc06464b8 is DRM_IOCTL_MODE_ADDFB2. */
+	if (lkpi_bootflag("b1nix.drm-fps") && (request & 0xffffffffu) == 0xc06464b8u) {
+		isize r = drm_ioctl((struct file *)file, (unsigned int)request,
+		                    (unsigned long)(usize)user_arg);
+
+		drm_addfb_calls++;
+		return r;
+	}
+
+	/* Mapping a dumb buffer.
+	 *
+	 * A compositor's swapchain is built by allocating buffers and mapping
+	 * each one; the first that cannot be mapped ends the loop, and a
+	 * swapchain of one buffer has nowhere to draw but the buffer on screen.
+	 * 0xc01064b3 is DRM_IOCTL_MODE_MAP_DUMB: handle in, offset out. */
+	if (lkpi_bootflag("b1nix.drm-fps") && (request & 0xffffffffu) == 0xc01064b3u) {
+		u64 arg[2] = { 0, 0 };
+		isize r;
+
+		lkpi_copy_from_user(arg, user_arg, sizeof(arg));
+		r = drm_ioctl((struct file *)file, (unsigned int)request,
+		              (unsigned long)(usize)user_arg);
+		lkpi_copy_from_user(arg, user_arg, sizeof(arg));
+		pr_info("drm: map_dumb handle %u -> offset 0x%llx (ret %d)\n",
+		        (u32)arg[0], (unsigned long long)arg[1], (int)r);
+		return r;
+	}
+
+	/* Buffers and framebuffers the client throws away.
+	 *
+	 * A swapchain that loses a slot has nothing left to rotate to. 0xc00464af
+	 * is DRM_IOCTL_MODE_RMFB and 0xc00464b4 DESTROY_DUMB; both take a single
+	 * id, which is enough to say which buffer went. */
+	if (lkpi_bootflag("b1nix.drm-fps") &&
+	    ((request & 0xffffffffu) == 0xc00464afu ||
+	     (request & 0xffffffffu) == 0xc00464b4u)) {
+		u32 id = 0;
+		isize r;
+
+		lkpi_copy_from_user(&id, user_arg, sizeof(id));
+		r = drm_ioctl((struct file *)file, (unsigned int)request,
+		              (unsigned long)(usize)user_arg);
+		pr_info("drm: %s %u -> %d\n",
+		        (request & 0xffffffffu) == 0xc00464afu ? "rmfb" : "destroy_dumb",
+		        id, (int)r);
+		return r;
+	}
+
+	/* Every capability the client asks about, with the answer.
+	 *
+	 * A compositor decides whether it can use the hardware cursor from these,
+	 * and it disables the cursor plane outright here -- while the same
+	 * compositor on virtio-gpu keeps a framebuffer for it. A cursor drawn into
+	 * the frame instead means a full repaint on every mouse movement, which is
+	 * what a person sitting in front of the panel would call glitching.
+	 * 0xc010640c is DRM_IOCTL_GET_CAP: capability in, value out. */
+	if (lkpi_bootflag("b1nix.drm-fps") && (request & 0xffffffffu) == 0xc010640cu) {
+		u64 cap[2] = { 0, 0 };
+		isize r;
+
+		lkpi_copy_from_user(cap, user_arg, sizeof(cap));
+		r = drm_ioctl((struct file *)file, (unsigned int)request,
+		              (unsigned long)(usize)user_arg);
+		lkpi_copy_from_user(cap, user_arg, sizeof(cap));
+		pr_info("drm: get_cap %llu -> %llu (ret %d)\n",
+		        (unsigned long long)cap[0], (unsigned long long)cap[1], (int)r);
+		return r;
+	}
+
+	/* What the compositor asks a legacy page flip to put on screen.
+	 *
+	 * The scanned-out framebuffer never changes while flips keep completing,
+	 * which is either the client naming the same buffer every time or this
+	 * side ignoring the one it named. The request carries the id, so the
+	 * question is answered by reading it. struct drm_mode_crtc_page_flip is
+	 * crtc_id, fb_id, flags, reserved, user_data -- the id is the second u32.
+	 * 0xc01864b0 is DRM_IOCTL_MODE_PAGE_FLIP. */
+	if (lkpi_bootflag("b1nix.drm-fps") && (request & 0xffffffffu) == 0xc01864b0u) {
+		static u32 last_fb;
+		static unsigned same, changed;
+		u32 hdr[2] = { 0, 0 };
+
+		if (lkpi_copy_from_user(hdr, user_arg, sizeof(hdr)) == 0) {
+			if (hdr[1] == last_fb)
+				same++;
+			else
+				changed++;
+			last_fb = hdr[1];
+			if (((same + changed) % 120u) == 0)
+				pr_info("drm: page flips requested: %u to a new framebuffer, %u to the same one\n",
+				        changed, same);
+		}
 	}
 
 	/* Atomic commits, with the flag that decides whether they touch hardware.
@@ -603,6 +1052,376 @@ isize lkpi_drm_ioctl(void *file, u64 request, void *user_arg)
 	return ret;
 }
 
+/*
+ * How the output actually behaves, once a second.
+ *
+ * "Torn" and "it froze" are the only descriptions available from the far side
+ * of a monitor, and neither says how often a frame landed or how long the
+ * longest stall was. Every completed page flip reaches the compositor as an
+ * event read from this fd, so counting the reads counts presented frames, and
+ * the largest gap between two of them is the freeze the eye saw.
+ */
+/* The framebuffer id the CRTC is scanning out, sampled when a flip completes.
+ * Reported as the number of DISTINCT ids seen in the second: one means every
+ * flip went to the same buffer, which is front-buffer rendering and tears by
+ * construction; two or three is the double or triple buffering that does not. */
+static u32 drm_fps_fb_last;
+static unsigned drm_fps_fb_changes;
+
+static unsigned drm_fps_fb_alive;
+static unsigned drm_fps_fb_fullscreen;
+
+/* The framebuffer id on the first CRTC's primary plane, or 0 if there is none
+ * to read. Shared by the flip sampler and the commit sampler. */
+static u32 drm_primary_fb_id(void *file)
+{
+	struct file *filp = file;
+	struct drm_file *file_priv = filp ? filp->private_data : 0;
+	struct drm_device *dev = file_priv ? file_priv->minor->dev : 0;
+	struct drm_crtc *crtc;
+
+	if (!dev)
+		return 0;
+	/* The CRTC that is actually on. i915 has several pipes and the one in use
+	 * is not the first: taking the first read an unused plane, whose fb is
+	 * NULL, and made every commit look as though it left the framebuffer
+	 * alone. Every conclusion drawn from that was about the wrong plane. */
+	drm_for_each_crtc(crtc, dev) {
+		if (!crtc->state || !crtc->state->active)
+			continue;
+		if (crtc->primary && crtc->primary->state &&
+		    crtc->primary->state->fb)
+			return crtc->primary->state->fb->base.id;
+	}
+	return 0;
+}
+
+/* Every plane the device offers, once: id, type, and the pixel formats it
+ * accepts. A compositor picks the cursor plane by these, and one that finds no
+ * format it can use falls back to drawing the cursor into the frame. */
+static void drm_dump_planes_once(struct drm_device *dev)
+{
+	static int done;
+	struct drm_plane *plane;
+
+	if (done || !dev)
+		return;
+	done = 1;
+	drm_for_each_plane(plane, dev) {
+		static const char *const kind[] = { "overlay", "primary", "cursor" };
+
+		pr_info("drm: plane %u is %s, %u format(s): %.4s %.4s %.4s\n",
+		        plane->base.id,
+		        plane->type <= 2 ? kind[plane->type] : "?",
+		        plane->format_count,
+		        plane->format_count > 0 ? (const char *)&plane->format_types[0]
+		                                : "----",
+		        plane->format_count > 1 ? (const char *)&plane->format_types[1]
+		                                : "----",
+		        plane->format_count > 2 ? (const char *)&plane->format_types[2]
+		                                : "----");
+	}
+}
+
+static void drm_fps_note_flip(struct file *filp)
+{
+	struct drm_file *file_priv = filp ? filp->private_data : 0;
+	struct drm_device *dev = file_priv ? file_priv->minor->dev : 0;
+	struct drm_crtc *crtc;
+	struct drm_framebuffer *fb;
+
+	if (!dev)
+		return;
+	drm_dump_planes_once(dev);
+	{
+		/* How many pipes the compositor turned on. Two swapchain buffers and
+		 * one framebuffer per output reads the same as one output with a
+		 * single-buffer swapchain, and only this tells them apart. */
+		static unsigned last_active = 999;
+		unsigned active = 0;
+		struct drm_crtc *c;
+
+		drm_for_each_crtc(c, dev)
+			if (c->state && c->state->active)
+				active++;
+		if (active != last_active) {
+			last_active = active;
+			pr_info("drm: %u crtc(s) active\n", active);
+		}
+	}
+	/* How many framebuffer objects the client is keeping. Sampling which one
+	 * a flip landed on says what is on screen; this says whether there was
+	 * ever anything else to put there. One live framebuffer is a compositor
+	 * drawing into the buffer being scanned out. */
+	drm_fps_fb_alive = 0;
+	drm_fps_fb_fullscreen = 0;
+	mutex_lock(&dev->mode_config.fb_lock);
+	{
+		/* Do the two full-screen buffers actually hold different memory?
+		 *
+		 * Everything else about the flip path checks out, and drawing into a
+		 * "back" buffer that shares pages with the front tears on every
+		 * change while looking, from the outside, exactly like a swapchain
+		 * that alternates. The GEM handle behind each framebuffer says it in
+		 * one line. Printed once. */
+		static int aliased_checked;
+
+		if (!aliased_checked && lkpi_bootflag("b1nix.drm-tearwatch")) {
+			struct drm_framebuffer *a = 0, *b = 0;
+			struct drm_framebuffer *f;
+
+			list_for_each_entry(f, &dev->mode_config.fb_list, head) {
+				if (f->width < 1024)
+					continue;
+				if (!a)
+					a = f;
+				else if (!b)
+					b = f;
+			}
+			if (a && b) {
+				aliased_checked = 1;
+				pr_info("drm: fb %u obj %p vs fb %u obj %p: %s\n",
+				        a->base.id, (void *)a->obj[0], b->base.id,
+				        (void *)b->obj[0],
+				        a->obj[0] == b->obj[0] ? "SAME OBJECT"
+				                               : "different objects");
+			}
+		}
+	}
+	list_for_each_entry(fb, &dev->mode_config.fb_list, head) {
+		drm_fps_fb_alive++;
+		/* Full-screen ones only are the swapchain. Counting every framebuffer
+		 * together with the cursor's made a single-buffer swapchain look like
+		 * a double-buffered one. */
+		if (fb->width >= 1024)
+			drm_fps_fb_fullscreen++;
+	}
+	mutex_unlock(&dev->mode_config.fb_lock);
+	drm_for_each_crtc(crtc, dev) {
+		u32 id;
+
+		if (!crtc->state || !crtc->state->active)
+			continue;
+		if (!crtc->primary || !crtc->primary->state ||
+		    !crtc->primary->state->fb)
+			continue;
+		id = crtc->primary->state->fb->base.id;
+		/* Transitions, not distinct ids: what matters is whether the buffer
+		 * on screen CHANGES from one completed flip to the next. A swapchain
+		 * that alternates gives one transition per flip; a plane left on the
+		 * same framebuffer gives none, and the compositor is then drawing
+		 * into what the display is reading. */
+		if (id != drm_fps_fb_last) {
+			drm_fps_fb_last = id;
+			drm_fps_fb_changes++;
+		}
+		return;
+	}
+}
+
+/* What a completion event actually carries.
+ *
+ * A compositor frees the framebuffer a flip replaced when the event for that
+ * flip arrives, and it matches the event to the flip by the user_data it
+ * passed in. An event with the wrong user_data, or a sequence that never
+ * advances, is one it cannot account for -- and a swapchain whose buffers are
+ * never released has nothing to rotate to, which is what the plane shows. */
+/*
+ * Where the beam is when the compositor is handed a flip completion.
+ *
+ * A completion says "the buffer you flipped away from is yours again". If it
+ * arrives before the hardware has actually latched the new surface, the
+ * compositor starts repainting the buffer the display is still reading, and
+ * the picture tears however well the flip itself was timed. Delivered right
+ * after the vertical blank, the beam is at the top of the frame; spread over
+ * the frame, the events are not vblank-locked at all.
+ */
+/* Supplied by the i915 display probe when that driver is in the link. A build
+ * without it (aarch64, or B1NIX_I915=0) has no display registers to read, so
+ * the watches that call these report nothing rather than fail to link. */
+__attribute__((weak)) u32 lkpi_i915_scanline(void) { return 0; }
+__attribute__((weak)) u32 lkpi_i915_live_surface(void) { return 0; }
+__attribute__((weak)) u32 lkpi_i915_armed_surface(void) { return 0; }
+__attribute__((weak)) void lkpi_i915_note_commit(void) { }
+
+static void drm_event_scanline_note(void)
+{
+	static u64 events, early, late;
+	static u32 lo = 0xffffffff, hi;
+	u32 line;
+
+	if (!lkpi_bootflag("b1nix.drm-tearwatch") &&
+	    !lkpi_bootflag("b1nix.drm-eventwatch"))
+		return;
+	/*
+	 * The completion the compositor is reading right now: has the flip it
+	 * reports actually landed?
+	 *
+	 * PLANE_SURF holds the address the driver armed, PLANE_SURFLIVE the one
+	 * the display engine is reading. While a flip is pending they differ, so
+	 * an event handed over in that state tells the compositor a frame is on
+	 * screen that is not, and the buffer it then considers free is the one
+	 * still being scanned.
+	 */
+	{
+		extern u32 lkpi_i915_live_surface(void);
+		extern u32 lkpi_i915_armed_surface(void);
+		static u64 seen, pending;
+		u32 live = lkpi_i915_live_surface();
+		u32 armed = lkpi_i915_armed_surface();
+
+		if (live || armed) {
+			seen++;
+			/*
+			 * Page granularity, because the two registers do not agree in
+			 * their low bits: PLANE_SURFLIVE reads back the address with the
+			 * plane's own offset folded in (a constant 0x20 here), so a raw
+			 * comparison calls every completion late and proves nothing.
+			 * What matters is whether the display engine is fetching the
+			 * page the flip armed.
+			 */
+			if ((live >> 12) != (armed >> 12))
+				pending++;
+			if ((seen % 60) == 0)
+				pr_info("drm: flip completions: %llu handed to the "
+				        "compositor, %llu of them while the hardware had "
+				        "NOT yet latched the new address\n",
+				        (unsigned long long)seen,
+				        (unsigned long long)pending);
+		}
+	}
+	line = lkpi_i915_scanline();
+	if (line == 0xffffffff)
+		return;
+	events++;
+	if (line < lo)
+		lo = line;
+	if (line > hi)
+		hi = line;
+	if (line < 100 || line >= 1080)
+		early++; /* at the top of the frame or in blanking: vblank-locked */
+	else
+		late++;
+	if ((events % 60) == 0) {
+		pr_info("drm: flip events: %llu at the top or in blanking, %llu in "
+		        "mid-frame (lines %u..%u)\n", (unsigned long long)early,
+		        (unsigned long long)late, lo, hi);
+		early = late = 0;
+		lo = 0xffffffff;
+		hi = 0;
+	}
+}
+
+static void drm_fps_note_event(const void *user_buf, isize len)
+{
+	struct {
+		u32 type;
+		u32 length;
+		u64 user_data;
+		u32 tv_sec;
+		u32 tv_usec;
+		u32 sequence;
+		u32 crtc_id;
+	} ev;
+	static unsigned reported;
+
+	if (reported >= 6 || (usize)len < sizeof(ev))
+		return;
+	if (lkpi_copy_from_user(&ev, user_buf, sizeof(ev)) != 0)
+		return;
+	reported++;
+	{
+		u64 now = lkpi_monotonic_ns();
+
+		if (drm_last_commit_ns && now > drm_last_commit_ns)
+			pr_info("drm: flip event arrived %u us after the commit returned\n",
+			        (unsigned)((now - drm_last_commit_ns) / 1000ull));
+		pr_info("drm: request carried user_data 0x%llx, event carries 0x%llx%s\n",
+		        (unsigned long long)drm_last_user_data,
+		        (unsigned long long)ev.user_data,
+		        drm_last_user_data == ev.user_data ? "" : "  <-- MISMATCH");
+	}
+	pr_info("drm: event type %u len %u user_data 0x%llx seq %u crtc %u at %u.%06u\n",
+	        ev.type, ev.length, (unsigned long long)ev.user_data,
+	        ev.sequence, ev.crtc_id, ev.tv_sec, ev.tv_usec);
+}
+
+static void drm_fps_note(void)
+{
+	static u64 window_start_ns;
+	static u64 last_ns;
+	static u32 frames;
+	static u64 max_gap_ns;
+	u64 now = lkpi_monotonic_ns();
+
+	if (!window_start_ns) {
+		window_start_ns = now;
+		last_ns = now;
+		return;
+	}
+	if (last_ns && now - last_ns > max_gap_ns)
+		max_gap_ns = now - last_ns;
+	/* A gap this long is a stall, not a still picture. Print who was asleep
+	 * and on what while it lasted -- the wait channel and the site that
+	 * parked each task is the only thing that names the waiter; the counters
+	 * above can only say that nobody was running. */
+	if (last_ns && now - last_ns > 1500000000ull) {
+		extern void scheduler_dump_tasks(void);
+		static unsigned dumped;
+
+		if (dumped < 3) {
+			dumped++;
+			pr_info("drm: %u ms without a frame — tasks:\n",
+			        (unsigned)((now - last_ns) / 1000000ull));
+			scheduler_dump_tasks();
+		}
+	}
+	last_ns = now;
+	frames++;
+
+	if (now - window_start_ns >= 1000000000ull) {
+		/* What the gap was made of. A second with a long gap and a high
+		 * user count is a compositor that was busy drawing; the same gap
+		 * against an idle count is something the system was waiting for. */
+		extern void kprof_tick_totals(u64 *user, u64 *kernel, u64 *idle);
+		extern void input_event_counts(u64 *pushed, u64 *delivered,
+		                               u64 *dropped);
+		static u64 last_u, last_k, last_i, last_in, last_drop;
+		u64 u = 0, k = 0, i = 0, in = 0, deliv = 0, drop = 0;
+
+		kprof_tick_totals(&u, &k, &i);
+		input_event_counts(&in, &deliv, &drop);
+		{
+			extern unsigned long lkpi_mmio_reads, lkpi_mmio_writes;
+			static unsigned long last_r, last_w;
+			unsigned long r = lkpi_mmio_reads, w = lkpi_mmio_writes;
+
+			pr_info("drm: %u framebuffer(s) alive (%u full-screen), scanout changed %u times, %u created\n",
+		        drm_fps_fb_alive, drm_fps_fb_fullscreen, drm_fps_fb_changes,
+		        drm_addfb_calls);
+		drm_fps_fb_changes = 0;
+		drm_addfb_calls = 0;
+		pr_info("drm: mmio %lu reads %lu writes in the last second\n",
+			        r - last_r, w - last_w);
+			last_r = r;
+			last_w = w;
+		}
+		pr_info("drm: fps %u, longest gap %u ms, ticks user %u kernel %u idle %u, input %u (dropped %u)\n",
+		        frames, (unsigned)(max_gap_ns / 1000000ull),
+		        (unsigned)(u - last_u), (unsigned)(k - last_k),
+		        (unsigned)(i - last_i), (unsigned)(in - last_in),
+		        (unsigned)(drop - last_drop));
+		last_u = u;
+		last_k = k;
+		last_i = i;
+		last_in = in;
+		last_drop = drop;
+		window_start_ns = now;
+		frames = 0;
+		max_gap_ns = 0;
+	}
+}
+
 isize lkpi_drm_read(void *file, void *user_buf, usize len)
 {
 	struct file *filp = file;
@@ -612,6 +1431,45 @@ isize lkpi_drm_read(void *file, void *user_buf, usize len)
 	if (!filp)
 		return -EBADF;
 	ret = (isize)drm_read(filp, (char __user *)user_buf, (size_t)len, &pos);
+	/* The completion check stands on its own.
+	 *
+	 * It used to sit inside the frame-rate block, so asking only for it got
+	 * a silent run: the question "was the flip finished when the compositor
+	 * was told" has nothing to do with counting frames per second. */
+	if (ret > 0 && lkpi_bootflag("b1nix.drm-eventwatch"))
+		drm_event_scanline_note();
+	/* The per-commit note is about which memory a framebuffer is made of,
+	 * which the binding watch needs and the frame-rate counter does not. */
+	if (ret > 0 && lkpi_bootflag("b1nix.drm-bindwatch")) {
+		extern void lkpi_i915_note_commit(void);
+
+		lkpi_i915_note_commit();
+	}
+	if (ret > 0 && lkpi_bootflag("b1nix.drm-fps")) {
+		/* Events, counted by the bytes they occupy rather than by reads: one
+		 * read can carry several. A compositor that submits more flips than
+		 * it is told completed has one buffer permanently in flight as far as
+		 * it knows, and nothing to draw into but the one on screen. */
+		extern unsigned drm_events_delivered;
+
+		drm_events_delivered += (unsigned)(ret / 32);
+		/* Which framebuffer each completed flip actually put on the screen.
+		 *
+		 * A compositor that draws into the buffer being scanned out tears no
+		 * matter how well the timing works, and every counter here would
+		 * still look healthy -- frames land, nothing is late, no commit
+		 * overruns. The one thing that tells the two apart is whether the
+		 * flips alternate between framebuffers or keep naming the same one. */
+		drm_fps_note_flip(filp);
+		drm_fps_note_event(user_buf, ret);
+		drm_event_scanline_note();
+		{
+			extern void lkpi_i915_note_commit(void);
+
+			lkpi_i915_note_commit();
+		}
+		drm_fps_note();
+	}
 	/* What a compositor's event loop actually receives. A page-flip completion
 	 * that is queued but never read leaves it waiting for a frame that, as far
 	 * as it can tell, never landed — and it tears the output down again. */
@@ -693,4 +1551,18 @@ int lkpi_drm_mmap_page_phys(void *file, u64 offset, u64 *out_phys)
 		pr_info("drm: mmap offset %llx page %llu: resolver says %d\n",
 		        (unsigned long long)offset, (unsigned long long)index, ret);
 	return ret;
+	/* Say so when a page of a mapped buffer cannot be resolved. A compositor
+	 * that cannot map its second buffer builds a swapchain of one and draws
+	 * into the buffer being displayed; from outside that looks like tearing
+	 * and nothing else. */
+	{
+		static unsigned mmap_fail_reported;
+
+		if (mmap_fail_reported < 8) {
+			mmap_fail_reported++;
+			pr_info("drm: mmap of offset 0x%llx page failed\n",
+			        (unsigned long long)offset);
+		}
+	}
+
 }

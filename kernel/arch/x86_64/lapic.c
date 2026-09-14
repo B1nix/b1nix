@@ -346,7 +346,24 @@ static struct percpu boot_cpu_data = {
     /* .runqueue.lock = 0 — zero-initialized by static storage */
 };
 
+/* Point GS at the boot CPU's structure before anything asks for it.
+ *
+ * get_percpu() is one %gs-relative load of the structure's own address, and
+ * that load is only NULL before percpu_init() if GS already points at a
+ * structure whose `self` is still zero. With the base the bootloader left
+ * (zero, or whatever it used), the load would read an arbitrary word instead
+ * -- the old rdmsr answered 0 there and every early caller relied on that.
+ * The first thing kernel_main does. */
+void arch_gs_base_early(void) {
+    u64 base = (u64)(usize)&boot_cpu_data;
+    u64 lo = base & 0xFFFFFFFF;
+    u64 hi = (base >> 32) & 0xFFFFFFFF;
+    __asm__ volatile("wrmsr" : : "c"(0xC0000101), "a"(lo), "d"(hi));
+}
+
 void arch_set_gs_base(u64 base) {
+    if (base)
+        ((struct percpu *)(usize)base)->self = (struct percpu *)(usize)base;
     u64 lo = base & 0xFFFFFFFF;
     u64 hi = (base >> 32) & 0xFFFFFFFF;
     /* WRMSR to IA32_GS_BASE (0xC0000101) */
@@ -394,6 +411,12 @@ static struct percpu *ap_cpu_data[MAX_CPUS];
 /* Read another CPU's current task (used by the TLB-shootdown timeout diagnostic
  * to name the stuck CPU). cpu 0 is the BSP (boot_cpu_data); APs live in
  * ap_cpu_data[]. Best-effort: no lock — the timeout path is already a panic. */
+struct percpu *percpu_for_cpu(int cpu) {
+    if (cpu == 0) return &boot_cpu_data;
+    if (cpu > 0 && cpu < MAX_CPUS) return ap_cpu_data[cpu];
+    return 0;
+}
+
 struct task *percpu_cur_task(int cpu) {
     if (cpu == 0) return (struct task *)boot_cpu_data.cur_task;
     if (cpu > 0 && cpu < MAX_CPUS && ap_cpu_data[cpu])
@@ -923,6 +946,7 @@ int smp_boot_aps(void) {
         if (!pcpu_raw) { console_write("smp: percpu alloc failed\n"); continue; }
         struct percpu *pcpu = (struct percpu *)(((u64)(usize)pcpu_raw + 4095) & ~(u64)4095);
         memset(pcpu, 0, sizeof(struct percpu));
+        pcpu->self = pcpu; /* the trampoline loads the MSR, not this */
         pcpu->cpu_id = cpu_id;
         pcpu->apic_id = apic_id;
 

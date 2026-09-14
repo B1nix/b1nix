@@ -45,7 +45,11 @@ static void kthread_worker_fn(void *arg)
 				worker->tail = 0;
 			work->next = 0;
 			work->pending = 0;
-			work->running = 1;
+			/* Counted before the handler runs: afterwards the item may be
+			 * gone (a handler that frees its own work is ordinary), so the
+			 * worker must not touch it again. current_work, compared by
+			 * address, is what says it is running. */
+			work->seq++;
 			worker->current_work = work;
 		}
 		u32 stop = worker->stop;
@@ -59,8 +63,6 @@ static void kthread_worker_fn(void *arg)
 				work->func(work);
 
 			spin_lock_irqsave((spinlock_t *)&worker->lock_word, &flags);
-			work->running = 0;
-			work->seq++;
 			worker->current_work = 0;
 			worker->executed++;
 			spin_unlock_irqrestore((spinlock_t *)&worker->lock_word, flags);
@@ -144,7 +146,7 @@ static int kthread_wait_until_idle(struct kthread_worker *worker,
 		spin_lock_irqsave((spinlock_t *)&worker->lock_word, &flags);
 		int busy;
 		if (work)
-			busy = (work->pending || work->running);
+			busy = (work->pending || worker->current_work == work);
 		else
 			busy = (worker->head != 0 || worker->current_work != 0);
 		spin_unlock_irqrestore((spinlock_t *)&worker->lock_word, flags);
@@ -165,7 +167,7 @@ static int kthread_wait_until_idle(struct kthread_worker *worker,
 		spin_lock_irqsave((spinlock_t *)&worker->lock_word, &flags);
 		int still;
 		if (work)
-			still = (work->pending || work->running);
+			still = (work->pending || worker->current_work == work);
 		else
 			still = (worker->head != 0 || worker->current_work != 0);
 		spin_unlock_irqrestore((spinlock_t *)&worker->lock_word, flags);

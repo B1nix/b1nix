@@ -156,11 +156,11 @@ struct sigevent {
 };
 
 /* 64-bit to match the kernel ABI (struct sigaction uses u64 sa_flags/sa_mask,
- * sigset_t is a u64 bitmask). `unsigned long` is 8 bytes on x86_64 but only 4 on
- * the 32-bit port, which shifted sa_restorer/sa_mask to the wrong offsets — the
- * kernel then read a garbage sa_restorer and killed any process that installed a
- * real signal handler (M15). Use a fixed 64-bit type so the layout matches on
- * both architectures. */
+ * sigset_t is a u64 bitmask). A 4-byte `unsigned long` (the former 32-bit port)
+ * shifted sa_restorer/sa_mask to the wrong offsets — the kernel then read a
+ * garbage sa_restorer and killed any process that installed a real signal
+ * handler (M15). Use a fixed 64-bit type so the layout does not
+ * depend on the width of `long`. */
 typedef unsigned long long sigset_t;
 
 struct sigaction {

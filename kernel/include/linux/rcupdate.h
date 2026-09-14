@@ -26,4 +26,13 @@ static inline unsigned long get_state_synchronize_rcu(void) { return 0; }
 static inline void cond_synchronize_rcu(unsigned long oldstate)
 { (void)oldstate; synchronize_rcu(); }
 
+/*
+ * Dereference under RCU with the caller asserting it holds something that makes
+ * that safe — a lock, rather than rcu_read_lock. The condition is checked by
+ * lockdep upstream and by nothing here, so the two spellings load the same way;
+ * the name still records which promise the caller is making.
+ */
+#define rcu_dereference_check(p, c) ({ (void)(c); rcu_dereference(p); })
+extern struct lockdep_map rcu_callback_map;
+
 #endif

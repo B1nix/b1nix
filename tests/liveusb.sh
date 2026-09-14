@@ -63,7 +63,7 @@ check "rootfs: liveiso mount requested" "the live-ISO path runs"
 check "isofs: mounted sd" "the boot medium is found by content and mounted at /mnt/iso"
 check "loop: loop0 backing /boot/rootfs.img" "the boot image on it is found and attached to loop0"
 
-check "rootfs: loop0 mounted at / as ext4" "the loop device the image was attached to is the one that mounts"
+check "rootfs: loop0 mounted at /" "the loop device the image was attached to is the one that mounts"
 check "M37-LIVEISO: ok isofs-loop-root" "the root switch completes rather than falling back to ram0"
 
 if grep -aq "rootfs: ram0 mounted at / (Live CD fallback)" "$LOG"; then

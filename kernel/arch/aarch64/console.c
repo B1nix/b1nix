@@ -365,6 +365,9 @@ void console_log_init(void)
 
 	if (bootinfo_has_flag("quiet"))
 		level = CONSOLE_LOGLEVEL_QUIET;
+	/* A test boot is graded on the serial log, debug tracing included. */
+	if (bootinfo_has_flag("b1nix.test=1"))
+		level = LOGLEVEL_DEBUG;
 	if (bootinfo_get_kv("loglevel", value, sizeof(value)) && value[0])
 		level = (int)bootinfo_get_u32("loglevel", (u32)level);
 	if (level < 0)

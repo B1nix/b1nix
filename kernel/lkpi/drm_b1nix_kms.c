@@ -176,7 +176,7 @@ static int b1nix_dumb_create(struct drm_file *file, struct drm_device *dev,
 	int ret;
 
 	if (args->bpp != 32)
-		return -EINVAL; /* the only format the pipe advertises */
+		return -EINVAL; /* XRGB8888 / ARGB8888, both 32bpp */
 
 	args->pitch = args->width * 4;
 	args->size = (u64)args->pitch * args->height;
@@ -421,6 +421,12 @@ static const struct drm_mode_config_funcs b1nix_mode_config_funcs = {
 
 static const u32 b1nix_formats[] = {
 	DRM_FORMAT_XRGB8888,
+	/* The cursor carries alpha: a compositor allocates its cursor plane as
+	 * ARGB8888 and, when the plane does not advertise it, fails to create
+	 * the cursor framebuffer at all ("Failed to create dumb framebuffer for
+	 * the cursor"). The scanout treats the two the same -- the ignored
+	 * alpha byte of XRGB is the meaningful one of ARGB. */
+	DRM_FORMAT_ARGB8888,
 };
 
 /* ── the virtgpu ioctls Mesa speaks ──────────────────────────────────────

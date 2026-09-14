@@ -4,10 +4,13 @@
  * M99 linuxkpi: completions. See kernel/include/lkpi/completion.h.
  */
 
+#include <lkpi/env.h>
 #include <b1nix/arch.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <lkpi/completion.h>
+
+int lkpi_printk(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* One global guard for the (tiny) critical sections that adjust `done`. A
  * per-completion lock would double the struct for no measurable benefit — the
@@ -58,13 +61,35 @@ int try_wait_for_completion(struct completion *c)
 	return got;
 }
 
+/*
+ * A completion that never comes used to be a machine that simply stopped.
+ *
+ * The untimed wait is the one imported code uses where it knows the other side
+ * must finish -- drm_atomic_helper_swap_state() stalls on the previous
+ * commit's hw_done that way. When that assumption does not hold on this
+ * kernel the thread parks for good and the only symptom is a subsystem that
+ * went quiet, with nothing saying which wait it was. Naming the caller after a
+ * few seconds costs nothing on a wait that completes.
+ */
 void wait_for_completion(struct completion *c)
 {
+	u64 start = scheduler_get_ticks();
+	u64 next_report = start + 5ull * (u64)sched_tick_hz();
+	void *caller = __builtin_return_address(0);
+
 	if (!c)
 		return;
 	for (;;) {
 		if (try_wait_for_completion(c))
 			return;
+		if (scheduler_get_ticks() >= next_report) {
+			lkpi_printk("lkpi: completion %p still not signalled after %llu s "
+			        "(waiter at %p)\n", (void *)c,
+			        (unsigned long long)((scheduler_get_ticks() - start) /
+			                             (u64)sched_tick_hz()),
+			        caller);
+			next_report = scheduler_get_ticks() + 5ull * (u64)sched_tick_hz();
+		}
 		if (!scheduler_can_block()) {
 			/* No scheduler yet (early boot) or interrupts are off: poll. The
 			 * completion can still be set by a device interrupt in the first

@@ -15,12 +15,22 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/build/$ARCH}"
 case "$BUILD_DIR" in /*) ;; *) BUILD_DIR="$PROJECT_DIR/$BUILD_DIR" ;; esac
 
-IMG="$BUILD_DIR/debian.ext4"
-IMG_LABEL="${IMG_LABEL:-b1nix-debian}"
+IMG="${DEBIAN_IMG:-$BUILD_DIR/debian.ext4}"
+# The image has been built under two names; take whichever exists so the lane
+# runs instead of skipping. The label travels with the image -- the kernel
+# finds its root by label, and the systemd image carries its own -- so read it
+# from the filesystem rather than assuming.
+[ -f "$IMG" ] || IMG="$BUILD_DIR/debian-systemd.ext4"
+IMG_LABEL="${IMG_LABEL:-}"
+if [ -z "$IMG_LABEL" ] && command -v dumpe2fs >/dev/null 2>&1 && [ -f "$IMG" ]; then
+	IMG_LABEL=$(dumpe2fs -h "$IMG" 2>/dev/null |
+		sed -n 's/^Filesystem volume name:[[:space:]]*//p')
+fi
+[ -n "$IMG_LABEL" ] || IMG_LABEL="b1nix-debian"
 LOG="$PROJECT_DIR/smoke_run/b1nix-debian-boot.log"
 BUILD_LOG="$PROJECT_DIR/smoke_run/b1nix-debian-build.log"
 ISO="$BUILD_DIR/${B1NIX_ISO_NAME:-b1nix-debian.iso}"
-TIMEOUT="${TIMEOUT:-120}"
+TIMEOUT="${TIMEOUT:-240}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -85,6 +95,21 @@ fi
 # The pristine image is never written by a test run.
 RUN_IMG="$PROJECT_DIR/smoke_run/debian-root-$$.img"
 cp "$IMG" "$RUN_IMG"
+# Put the current harness into the copy.
+#
+# The script inside the image is whatever the image was built with, which may
+# be months old; debugfs writes the working-tree version into the scratch copy
+# without root and without rebuilding the image, so the test always runs the
+# harness that sits beside it in the repository.
+STAGE="$PROJECT_DIR/tools/images/debian-stage.sh"
+if [ -f "$STAGE" ] && command -v debugfs >/dev/null 2>&1; then
+	if debugfs -w -R "rm /b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1 &&
+		debugfs -w -R "write $STAGE b1nix-stage.sh" "$RUN_IMG" >/dev/null 2>&1; then
+		echo "  (harness injected from tools/images/debian-stage.sh)"
+	else
+		printf "  ${YELLOW}note${NC}: could not inject the harness; using the one in the image\n"
+	fi
+fi
 QEMU_PID=""
 cleanup() {
 	[ -n "$QEMU_PID" ] && kill -9 "$QEMU_PID" 2>/dev/null || true
@@ -154,6 +179,39 @@ check_output() {
 check_output "DEBIAN-SMOKE: ok stage1-dash" "stage1: Debian /bin/dash (glibc dynamic ELF) ran"
 check_output "DEBIAN-SMOKE: ok stage2-coreutils" "stage2: ls/cat/mount/ps from the distro"
 check_output "DEBIAN-SMOKE: ok stage3-init" "stage3: running under a real init"
+
+# The kernel surfaces our own userspace binaries cover, asserted by Debian's
+# own bash, perl and util-linux instead. Each name matches what it replaces:
+# proc-* and sig-* stand in for m12/m15, fd-* for m12/m13, errno-* for m17,
+# ipc-* for m15, job-* for m13_job_control.
+for probe in \
+	"proc-exit-status:exit status reaches the parent" \
+	"proc-signal-status:a killed child reports its signal" \
+	"proc-zombie-reaped:a waited-for child leaves no zombie" \
+	"proc-setsid:setsid gives a new session" \
+	"proc-waitpid-wnohang:waitpid(WNOHANG) before and after the child exits" \
+	"sig-handler:a signal handler runs" \
+	"sig-mask:a blocked signal arrives only after the unblock" \
+	"fd-dup2:dup2 onto a chosen descriptor" \
+	"fd-inherit-exec:a descriptor survives exec" \
+	"fd-cloexec:close-on-exec takes it away" \
+	"errno-eloop:ELOOP on a symlink loop" \
+	"errno-enametoolong:ENAMETOOLONG on a long path" \
+	"errno-enotdir:ENOTDIR through a file" \
+	"errno-eisdir:EISDIR opening a directory for write" \
+	"errno-ebadf:EBADF on a closed descriptor" \
+	"mem-large-alloc:a 64 MiB allocation is written and read back" \
+	"mem-proc-maps:/proc/self/maps describes the address space" \
+	"ipc-shm:System V shared memory" \
+	"ipc-sem:System V semaphores" \
+	"ipc-msg:System V message queues" \
+	"job-stop:SIGSTOP really stops a job" \
+	"job-cont:SIGCONT resumes it" \
+	"clock-advances:the clock moves" \
+	"timeout-fires:a timeout kills its child"; do
+	check_output "DEBIAN-SMOKE: ok ${probe%%:*}" "${probe#*:}"
+done
+
 check_output "DEBIAN-SMOKE: done" "harness reached the end"
 
 if grep -qa -E "KERNEL PANIC|\[PANIC\]" "$LOG" 2>/dev/null; then

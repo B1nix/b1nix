@@ -7,9 +7,10 @@
 #include <linux/list.h>
 
 /* The page size, defined on this side of the boundary so <linux/mm.h> does not
- * have to reach into <b1nix/mm.h> for it. */
+ * have to reach into <b1nix/mm.h> for it. unsigned long, as on Linux: masks
+ * built from it must be as wide as the addresses they are applied to. */
 #ifndef PAGE_SIZE
-#define PAGE_SIZE 4096u
+#define PAGE_SIZE 4096UL
 #endif
 
 /*
@@ -38,6 +39,9 @@
  * exists, so every address space inherits it. Nothing here sleeps.
  */
 
+/* Declared before struct page, which points at one. */
+struct address_space;
+
 struct page {
 	u64 phys;            /* physical address of the frame */
 	volatile i32 count;  /* references; the frame is freed when it hits 0 */
@@ -56,7 +60,95 @@ struct page {
 	 * uses it for the LRU; b1nix has no page LRU, so it belongs entirely to
 	 * the allocator or driver holding the page. */
 	struct list_head lru;
+
+	/*
+	 * The page-cache half.
+	 *
+	 * A page that belongs to a file carries where it belongs: which mapping,
+	 * and which index within it. Both are NULL/zero for the anonymous pages a
+	 * driver allocates, and that is how the two kinds are told apart — a page
+	 * with a mapping may not simply be freed, because the mapping's index
+	 * still points at it.
+	 *
+	 * `flags` is the state: up-to-date, dirty, locked, under writeback. The
+	 * bit numbers are in <linux/mm.h> with the accessors, because it is the
+	 * accessors that give them meaning.
+	 */
+	struct address_space *mapping;
+	unsigned long index;
+	volatile unsigned long flags;
 };
+
+/*
+ * The page-state bits.
+ *
+ * Numbered here rather than in <linux/mm.h> because the field they describe is
+ * here, and because the b1nix-side implementation of the page cache
+ * (kernel/lkpi/filemap.c) must reach them without including a linux header —
+ * that file also includes <b1nix/sched.h>, and the two sides define
+ * `spinlock_t` differently.
+ *
+ * Each bit is a promise:
+ *   Locked     somebody owns the page; wait before touching its contents.
+ *   Uptodate   the contents match what is on disk. A reader may use the bytes.
+ *   Dirty      they do not, and the DISK is the stale one.
+ *   Writeback  an I/O is in flight writing it out.
+ *   Private    page->private holds something the owner put there.
+ *
+ * Uptodate and Dirty are independent: a page just written is both, a page just
+ * read is Uptodate and clean, and a page being filled is neither.
+ */
+enum lkpi_pageflags {
+	PG_locked,
+	PG_referenced,
+	PG_uptodate,
+	PG_dirty,
+	PG_lru,
+	PG_active,
+	PG_workingset,
+	PG_error,
+	PG_slab,
+	PG_owner_priv_1,
+	PG_arch_1,
+	PG_reserved,
+	PG_private,
+	PG_private_2,
+	PG_writeback,
+	PG_head,
+	PG_mappedtodisk,
+	PG_reclaim,
+	PG_swapbacked,
+	PG_unevictable,
+	PG_checked = PG_owner_priv_1,
+	PG_fscache = PG_private_2,
+	__NR_PAGEFLAGS,
+};
+
+/* Test, set and clear one of them, atomically. The b1nix side uses these; the
+ * Linux spellings in <linux/mm.h> are generated on top of the same bits. */
+static inline int lkpi_page_test(const struct page *p, int bit)
+{
+	return (__atomic_load_n((volatile unsigned long *)&p->flags,
+	                        __ATOMIC_ACQUIRE) >> bit) & 1ul;
+}
+static inline int lkpi_page_test_set(struct page *p, int bit)
+{
+	unsigned long mask = 1ul << bit;
+
+	return (__atomic_fetch_or((volatile unsigned long *)&p->flags, mask,
+	                          __ATOMIC_ACQ_REL) & mask) != 0;
+}
+static inline int lkpi_page_test_clear(struct page *p, int bit)
+{
+	unsigned long mask = 1ul << bit;
+
+	return (__atomic_fetch_and((volatile unsigned long *)&p->flags, ~mask,
+	                           __ATOMIC_ACQ_REL) & mask) != 0;
+}
+static inline void lkpi_page_set(struct page *p, int bit)
+{ (void)lkpi_page_test_set(p, bit); }
+static inline void lkpi_page_clear(struct page *p, int bit)
+{ (void)lkpi_page_test_clear(p, bit); }
 
 /* One page. NULL if no frame was available. `gfp` is accepted and ignored for
  * the same reason as in alloc_pages below. */
@@ -101,6 +193,11 @@ void *page_address(const struct page *page);
  * NULL when the frame was not allocated through b1nix.
  */
 struct page *pfn_to_page(unsigned long pfn);
+
+/* The page behind a direct-map address — a kmalloc'd buffer, in practice.
+ * NULL for anything else; see the definition for why that is the only honest
+ * answer for a vmapped one. */
+struct page *lkpi_page_from_virt(const void *addr);
 
 /* Reference counting, for pages shared between a driver and a buffer object. */
 void get_page(struct page *page);

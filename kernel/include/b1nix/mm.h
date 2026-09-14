@@ -4,14 +4,15 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/types.h>
 
+/* Also defined by <lkpi/page.h>, with the same 64-bit width. */
+#ifndef PAGE_SIZE
 #define PAGE_SIZE 4096ULL
+#endif
 
 /* KERNEL_VMA: the offset between a kernel symbol's virtual address and its
  * physical load address. Both kernels are higher-half (linked high, loaded at
  * 1M); subtract KERNEL_VMA to turn a kernel symbol into a physical address.
- * x86_64 uses the canonical -2GB window; x86 (32-bit) links into the direct map
- * (0x80000000) — the kernel's symbols are simply the direct-map view of its own
- * physical image, so no separate high window is needed. */
+ * x86_64 uses the canonical -2GB window. */
 #ifdef __x86_64__
 #define KERNEL_VMA 0xFFFFFFFF80000000ULL
 #elif defined(__aarch64__)
@@ -406,3 +407,14 @@ void eviction_unlock_range(struct task *task, u64 start, u64 end);
 void eviction_unlock_all(struct task *task);
 
 #endif
+
+/* What a page fault turned out to be, for the profile in pf_prof_dump().
+ * The handler names its case; the accounting adds the cycles up per class. */
+#define PF_CLASS_OTHER 0
+#define PF_CLASS_ANON 1
+#define PF_CLASS_FILE 2
+#define PF_CLASS_COW 3
+#define PF_CLASS_SWAP 4
+#define PF_CLASS_STACK 5
+#define PF_CLASS_KERNEL 6
+void pf_prof_class(int cpu, int cls);

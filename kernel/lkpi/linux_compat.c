@@ -24,6 +24,20 @@
 #include <stdio.h>
 #include <string.h>
 
+/*
+ * Drop the level header a message may begin with.
+ *
+ * Imported code writes the level into the message itself; b1nix's console has
+ * no notion of one, and printing the raw SOH and digit puts a control
+ * character in the log for every line.
+ */
+static const char *strip_level(const char *s)
+{
+	while (s[0] == '\001' && s[1])
+		s += 2;
+	return s;
+}
+
 int lkpi_printk(const char *fmt, ...)
 {
 	char buf[512];
@@ -35,7 +49,7 @@ int lkpi_printk(const char *fmt, ...)
 	/* One console_write for the whole line. Building a line from several
 	 * writes lets another CPU interleave into the middle of it, which is how
 	 * SMP log interleaving ate smoke-test markers before (M32B). */
-	console_write(buf);
+	console_write(strip_level(buf));
 	return n;
 }
 
@@ -43,14 +57,14 @@ int lkpi_vprintk(const char *fmt, va_list args)
 {
 	char buf[512];
 	int n = vsnprintf(buf, sizeof(buf), fmt, args);
-	console_write(buf);
+	console_write(strip_level(buf));
 	return n;
 }
 
 /* Referenced by imported code; see the headers that declare them for why each
  * is what it is. */
 int oops_in_progress = 0;
-struct resource iomem_resource = { 0, ~0ull, "iomem", 0, 0, 0, 0 };
+struct resource iomem_resource = { .start = 0, .end = ~0ull, .name = "iomem" };
 
 /* One acquire class for every reservation lock: ordering comes from the stamp,
  * so a second class would distinguish nothing. */
@@ -306,5 +320,10 @@ int dev_set_name(struct device *dev, const char *fmt, ...)
 	if (!copy)
 		return -ENOMEM;
 	dev->init_name = copy;
+	/* Upstream's dev_set_name names the embedded kobject too, and imported
+	 * code reads THAT: i915 builds the sysfs link to a connector's i2c
+	 * adapter out of `adapter->dev.kobj.name`, and a NULL there made
+	 * sysfs_create_link refuse with -EINVAL three times per boot. */
+	dev->kobj.name = copy;
 	return 0;
 }

@@ -318,6 +318,10 @@ static void test_getcpuclockid(void) {
   if (diff < 0)
     diff = -diff;
   if (via_id < 50000000LL || diff > 50000000LL) {
+    char line[128];
+    snprintf(line, sizeof(line), "M86-SMOKE: getcpuclockid via_id=%lldms own=%lldms",
+             via_id / 1000000, a.cpu_ns / 1000000);
+    marker(line);
     fail("getcpuclockid-match", (long)(diff / 1000000));
     return;
   }

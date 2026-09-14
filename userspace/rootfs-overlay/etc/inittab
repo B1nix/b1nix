@@ -9,15 +9,6 @@
 # OpenRC stays the *high-level* init system that owns the service graph
 # (/etc/init.d + /etc/runlevels, M94) and drives every runlevel below it.
 #
-# OpenRC's own PID 1, /sbin/openrc-init, is still a real bootable
-# configuration, selected with the M94 cmdline parameter:
-#
-#     init=/sbin/openrc-init
-#
-# It is worth keeping because it owns the /run/openrc/init.ctl control channel
-# that openrc-shutdown and telinit talk to, which BusyBox init has no
-# equivalent of. Both inits run the same services out of the same files.
-#
 # Format:  <id>:<runlevels>:<action>:<process>   (id/runlevels unused by BusyBox)
 
 # Bring the system up through OpenRC's own runlevels, in OpenRC's order.
@@ -28,11 +19,6 @@
 # Test hook: only does anything when the kernel cmdline carries b1nix.test=1
 # AND b1nix.smoke=init (see the script). On an ordinary boot it exits at once.
 ::wait:/bin/sh /etc/init-smoke.sh
-
-# Diagnostic hook: only does anything when the kernel cmdline carries
-# b1nix.swayprobe (see the script). On an ordinary boot it exits at once, so
-# this costs a fork and nothing else.
-::wait:/bin/sh /etc/sway-probe.sh
 
 # Diagnostic hook: only does anything when the kernel cmdline carries
 # b1nix.i915sway — sway on the passed-through GPU's real output.
@@ -46,7 +32,7 @@
 ::wait:/bin/sh /etc/kde.sh
 
 # Soak hook: only does anything when the kernel cmdline carries b1nix.soak=<list>
-# — the overnight stress instance (see /etc/soak.sh and tools/soak/).
+# — the overnight stress instance (see /etc/soak.sh and tools/run/soak/).
 ::wait:/bin/sh /etc/soak.sh
 
 # Diagnostic hook: only does anything when the kernel cmdline carries

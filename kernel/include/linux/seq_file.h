@@ -57,10 +57,17 @@ struct seq_file {
 	int owns_buf;
 	int rendered;
 	int (*single_show)(struct seq_file *m, void *v);
+	/* The open file this sequence is being written to. Both filesystems reach
+	 * it to find the superblock behind a /sys or /proc read. */
+	struct file *file;
 };
 
 int seq_printf(struct seq_file *m, const char *fmt, ...) __printf(2, 3);
 int seq_puts(struct seq_file *m, const char *s);
+/* A mount option whose value may contain characters that would end the field:
+ * upstream escapes them, and so should this once anything parses the output
+ * back. Nothing does yet, so the value is printed as it is. */
+int seq_show_option(struct seq_file *m, const char *name, const char *value);
 int seq_putc(struct seq_file *m, char c);
 /* Append raw bytes, for a binary blob such as an EDID. */
 int seq_write(struct seq_file *m, const void *data, usize len);
@@ -92,5 +99,25 @@ static inline bool seq_has_overflowed(struct seq_file *m) { (void)m; return fals
  * growth steps. */
 int single_open_size(struct file *file, int (*show)(struct seq_file *, void *),
                      void *data, usize size);
+
+/*
+ * The sentinel a seq_operations `start` returns for the header line.
+ *
+ * It is a pointer value that is deliberately not a valid object: `show` is
+ * called with it once, prints the header, and the iteration proper begins at
+ * the next `next`. Returning NULL instead would end the sequence before it
+ * started.
+ */
+#define SEQ_START_TOKEN ((void *)1)
+
+/*
+ * Print a string with the given characters escaped.
+ *
+ * Mount options go through it: a device name containing a space or a comma
+ * would otherwise produce a /proc/mounts line that cannot be parsed back.
+ */
+void seq_escape(struct seq_file *m, const char *s, const char *esc);
+void seq_escape_str(struct seq_file *m, const char *src, unsigned int flags,
+                    const char *esc);
 
 #endif

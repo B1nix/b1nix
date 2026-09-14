@@ -14,7 +14,6 @@
 #include <string.h>
 #ifdef __aarch64__
 #include "initramfs_modules.inc"
-#include "initramfs_openrc_init.inc"
 #include "initramfs_hello.inc"
 #include "initramfs_m8_aio_test.inc"
 #include "initramfs_m12_smoke.inc"
@@ -39,7 +38,6 @@
 #endif
 
 static const struct initramfs_file files[] = {
-    {"/sbin/openrc-init", (const char *)vfs_openrc_init_elf, sizeof(vfs_openrc_init_elf), INITRAMFS_EXECUTABLE},
     {"/bin/hello", (const char *)vfs_hello_elf, sizeof(vfs_hello_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m8_aio_test", (const char *)vfs_m8_aio_test_elf, sizeof(vfs_m8_aio_test_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m12_smoke", (const char *)vfs_m12_smoke_elf, sizeof(vfs_m12_smoke_elf), INITRAMFS_EXECUTABLE},
@@ -112,6 +110,7 @@ static const struct initramfs_file files[] = {
 #ifdef B1NIX_MUSL
 #include "initramfs_ld_musl_x86_64_so_1.inc"
 #endif
+
 
 static const struct initramfs_file files[] = {
     {"/bin/native_smoke", (const char *)vfs_native_smoke_elf,

@@ -28,8 +28,8 @@ start_system_bus() {
 		mkdir -p /run/dbus
 		dbus-daemon --system --fork > /tmp/kde-systembus.log 2>&1
 		__i=0
-		while [ $__i -lt 15 ] && [ ! -S /run/dbus/system_bus_socket ]; do
-			__i=$((__i + 1)); sleep 1
+		while [ $__i -lt 750 ] && [ ! -S /run/dbus/system_bus_socket ]; do
+			__i=$((__i + 1)); usleep 20000
 		done
 	fi
 	if [ ! -S /run/dbus/system_bus_socket ]; then
@@ -63,16 +63,56 @@ start_udev() {
 	mkdir -p /run/udev
 	pgrep -f "[u]devd" > /dev/null 2>&1 || 		setsid "$__udevd" --daemon > /tmp/kde-udevd.log 2>&1
 	__i=0
-	while [ $__i -lt 10 ]; do
+	while [ $__i -lt 50 ]; do
 		[ -e /run/udev/control ] && break
-		__i=$((__i + 1)); sleep 1
+		__i=$((__i + 1)); usleep 200000
 	done
 	# The coldplug replay, bounded: `udevadm settle` waits on a queue that a
 	# udevd which never started would never drain.
-	udevadm trigger --action=add --subsystem-match=drm > /tmp/kde-trigger.log 2>&1
+	# The daemon's own trace of the input events, on the console via syslog:
+	# `udevadm test` says the rules tag the mouse, the daemon's database says
+	# they did not, and only the daemon can say why.
+	udevadm control --log-priority=debug 2>/dev/null
+	udevadm trigger --action=add --subsystem-match=drm --subsystem-match=input > /tmp/kde-trigger.log 2>&1
 	udevadm trigger --action=add --subsystem-match=input >> /tmp/kde-trigger.log 2>&1
 	udevadm settle --timeout=20 >> /tmp/kde-trigger.log 2>&1
 	echo "KDE: udev db after trigger: [$(ls /run/udev/data 2>&1 | tr '\n' ' ' | cut -c1-160)]"
+	# What udev made of the input devices: ID_INPUT_MOUSE / ID_INPUT_KEYBOARD
+	# is what libinput (through the seat) goes by, and a device without them
+	# is invisible to the desktop however many events it produces.
+	# After the queue drains: trigger returns before udevd has run the rules,
+	# and a database read at once shows DEVNAME and nothing else.
+	# Wait for the rules to have run on the mouse, not merely for the queue:
+	# elogind enumerates the seat's devices when it starts and only learns of
+	# later ones from the daemon's broadcasts, so an input device tagged after
+	# elogind came up is one the session never gets.
+	__i=0
+	while [ $__i -lt 50 ] && ! udevadm info -q property -n /dev/input/event1 2>/dev/null | grep -q '^ID_INPUT='; do
+		__i=$((__i + 1)); usleep 200000
+	done
+	udevadm control --log-priority=err 2>/dev/null
+	for d in /dev/input/event*; do
+		echo "KDE: udev $d: $(udevadm info -q property -n $d 2>/dev/null | grep -E '^ID_INPUT|^ID_SEAT|^DEVNAME' | tr '\n' ' ')"
+	done
+	# The rule engine's own account of one device, when the mouse carries no
+	# ID_INPUT_MOUSE: which rules ran and what the input_id builtin saw.
+	if ! udevadm info -q property -n /dev/input/event1 2>/dev/null | grep -q ID_INPUT_MOUSE; then
+		echo "--- udev db files ---"
+		for f in /run/udev/data/c13:65 /run/udev/data/+input:input1 /run/udev/data/c226:1; do
+			echo "$f: $(tr '\n' '|' < $f 2>/dev/null | cut -c1-300)"
+		done
+		echo "--- seat tags: $(ls /run/udev/tags/seat/ 2>&1 | tr '\n' ' ')"
+		echo "--- char 13:65 -> $(readlink /sys/dev/char/13:65 2>&1) | 226:1 -> $(readlink /sys/dev/char/226:1 2>&1); path: $(udevadm info -q path -n /dev/input/event1 2>&1)"
+		echo "--- ls /sys/dev/char: $(ls -l /sys/dev/char/ 2>&1 | tr '\n' ' ' | cut -c1-300)"
+		echo "--- udevadm info by syspath ---"
+		udevadm info -q property -p /sys/class/input/event1 2>&1 | tr '\n' ' ' | cut -c1-300; echo
+		echo "--- udevadm test event1 ---"
+		udevadm test --action=add /sys/class/input/event1 2>&1 | grep -v "^$" | tail -20
+		echo "--- /sys/class/input/input1 ---"
+		ls -l /sys/class/input/ 2>&1 | head -8
+		cat /sys/class/input/input1/capabilities/ev /sys/class/input/input1/capabilities/rel /sys/class/input/input1/capabilities/key 2>&1
+		echo "--- end udev test ---"
+	fi
 	if [ -e /run/udev/data/c226:1 ]; then
 		echo "KDE: ok udev-tagged-card t=$(up)"
 		return 0
@@ -106,10 +146,10 @@ start_logind() {
 			--type=method_call --print-reply /org/freedesktop/DBus \
 			org.freedesktop.DBus.ListNames 2>/dev/null \
 			| grep -q org.freedesktop.login1; then
-			echo "KDE: ok logind t=$(up) after ${__i}s"
+			echo "KDE: ok logind t=$(up) after $((__i / 5))s"
 			return 0
 		fi
-		__i=$((__i + 1)); sleep 1
+		__i=$((__i + 1)); usleep 20000
 	done
 	echo "KDE: fail logind t=$(up): $(tail -3 /tmp/kde-elogind.log 2>/dev/null | tr '\n' ' ')"
 	return 1
@@ -133,7 +173,7 @@ enter_session() {
 	if pgrep -f "[g]etty.*tty1" > /dev/null 2>&1; then
 		echo "KDE: getty holds tty1, stopping it t=$(up)"
 		pkill -f "[g]etty.*tty1" 2>/dev/null
-		sleep 1
+		usleep 200000
 	fi
 	echo "KDE: tty1 held by: $(fuser /dev/tty1 2>&1 | tr '\n' ' ' | cut -c1-60)"
 
@@ -146,10 +186,16 @@ enter_session() {
 	# talks to /run/utmps/.utmpd-socket; the s6 IPC server behind that socket is
 	# not in this image, and login takes the failure as a length and faults in a
 	# memset. It stays as the fallback: a session without a seat beats none.
+	# The rule has to travel INSIDE the command runuser runs: `-l` builds a
+	# fresh environment, so anything exported out here is gone by the time the
+	# compositor starts, and a file in the home directory was not read either.
+	__kwin_dbg=
+	has_flag b1nix.kwin-debug && __kwin_dbg=1
 	if [ -x /sbin/runuser ]; then
 		echo "KDE: entering session via runuser (seat0, vt1) t=$(up)"
 		exec setsid env XDG_SEAT=seat0 XDG_VTNR=1 \
-			/sbin/runuser -l root -c "/bin/sh /etc/kde.sh" \
+			/sbin/runuser -l root -c \
+			  "${__kwin_dbg:+QT_LOGGING_RULES='kwin_*.debug=true' }/bin/sh /etc/kde.sh" \
 			> /dev/console 2>&1
 	fi
 	if [ -x /sbin/login-pam ]; then
@@ -167,15 +213,74 @@ has_flag() {
 	return 1
 }
 
+# The value of a `name=value` token on the kernel command line, or $2 if the
+# token is absent. Two arguments so a caller states its own default rather than
+# testing for an empty string it then has to interpret.
+flag_value() {
+	for tok in $(cat /proc/cmdline 2>/dev/null); do
+		case "$tok" in
+		"$1"=*) echo "${tok#*=}"; return 0;;
+		esac
+	done
+	echo "$2"
+}
+
+# Polls tick every 200 ms (busybox usleep; this sleep has no fractions), and
+# a loop bound is in ticks: "-lt 75" is fifteen seconds. Waiting a whole
+# second between checks cost the desktop three to four seconds of pure
+# granularity across the dozen things this script waits for.
 up() { cut -d' ' -f1 /proc/uptime; }
 
+#
+# The kernel's own profile, when asked for.
+#
+# b1nix.sysprof keeps a histogram of kernel instruction pointers sampled from
+# the timer tick; reading /proc/b1nix-prof dumps it to the serial line. Once
+# here, so it covers the boot up to this point (bootloader hand-off, root
+# mount, init), and once more when the desktop reports itself, so the two can
+# be subtracted.
+#
+kprof() {
+	has_flag b1nix.sysprof || return 0
+	echo "KDE: kprof $1 t=$(up)"
+	cat /proc/b1nix-prof > /dev/null 2>&1
+}
+
+# The histogram alone, cheap enough to take while something is running. The
+# full profile above prints for over a minute through the console, which is
+# both a wait and a distortion of whatever it was meant to measure.
+kprof_hist() {
+	has_flag b1nix.sysprof || return 0
+	echo "KDE: kprof-hist $1 t=$(up)"
+	cat /proc/b1nix-kprof > /dev/null 2>&1
+}
 echo "KDE: start t=$(up)"
+kprof boot
+
+# b1nix.kwin-debug turns on the compositor's own logging. Its DRM backend is
+# the only thing that can say why a swapchain stops rotating -- from the kernel
+# side all that is visible is a client asking for the same framebuffer again.
+if has_flag b1nix.kwin-debug; then
+	# Through a file, not the environment: the session is entered with
+	# `runuser -l`, which builds a fresh environment and drops anything
+	# exported here. Qt reads this path on its own.
+	mkdir -p /root/.config/QtProject
+	printf '[Rules]\nkwin_*.debug=true\n' > /root/.config/QtProject/qtlogging.ini
+	export QT_LOGGING_RULES="kwin_*.debug=true"
+fi
 
 export HOME=/root
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export XDG_RUNTIME_DIR=/run/user/0
 export XDG_SESSION_TYPE=wayland
 export XDG_CURRENT_DESKTOP=KDE
+# The cursor image. kwin defaults to a theme named "default", which the image
+# does not ship ("Failed to load cursor theme default", and no pointer is
+# drawn); breeze_cursors is what a KDE install carries. XCURSOR_PATH names
+# where the .../cursors directories live, as on any Linux desktop.
+export XCURSOR_THEME=breeze_cursors
+export XCURSOR_SIZE=24
+export XCURSOR_PATH=/usr/share/icons:/usr/share/pixmaps
 mkdir -p /run/user/0 /tmp /root /var/lib/kwin
 chmod 700 /run/user/0
 
@@ -263,6 +368,12 @@ CONF
 		echo "KDE: /run/dbus holds: $(ls -la /run/dbus 2>&1 | tr '\n' ' ' | cut -c1-160)"
 		echo "KDE: daemons: $(pgrep -f "[d]bus-daemon" | tr '\n' ' ')"
 	fi
+	# Get seatd going before anything waits for the bus: it is a different
+	# daemon with a different socket and nothing in the bus's start-up needs it.
+	if [ -z "${SEATD_STARTED:-}" ] && { [ -x /usr/sbin/seatd ] || [ -x /usr/bin/seatd ]; }; then
+		SEATD_VTBOUND=0 seatd -g root > /tmp/kde-seatd.log 2>&1 &
+		SEATD_STARTED=1
+	fi
 	if printf %s "$__probe" | grep -q org.freedesktop.DBus; then
 		echo "KDE: ok dbus t=$(up) (already running)"
 	else
@@ -271,8 +382,8 @@ CONF
 		setsid dbus-daemon --config-file=/etc/dbus-1/b1nix-system.conf --fork \
 			> /tmp/kde-dbus.log 2>&1
 		i=0
-		while [ $i -lt 15 ] && [ ! -S /run/dbus/system_bus_socket ]; do
-			i=$((i + 1)); sleep 1
+		while [ $i -lt 750 ] && [ ! -S /run/dbus/system_bus_socket ]; do
+			i=$((i + 1)); usleep 20000
 		done
 		if [ -S /run/dbus/system_bus_socket ]; then
 			echo "KDE: ok dbus t=$(up)"
@@ -289,9 +400,13 @@ fi
 # virtual backend needs none of it, so a failure here is only fatal to DRM.
 if [ -x /usr/sbin/seatd ] || [ -x /usr/bin/seatd ]; then
 	export LIBSEAT_BACKEND=seatd
-	SEATD_VTBOUND=0 seatd -g root > /tmp/kde-seatd.log 2>&1 &
+	# Started before the bus was waited for (see above): the two daemons do not
+	# depend on each other, and waiting for them in turn spent a fifth of a
+	# second doing nothing.
+	[ -n "${SEATD_STARTED:-}" ] || \
+		SEATD_VTBOUND=0 seatd -g root > /tmp/kde-seatd.log 2>&1 &
 	i=0
-	while [ $i -lt 20 ] && [ ! -S /run/seatd.sock ]; do i=$((i + 1)); sleep 1; done
+	while [ $i -lt 1000 ] && [ ! -S /run/seatd.sock ]; do i=$((i + 1)); usleep 20000; done
 	[ -S /run/seatd.sock ] && echo "KDE: ok seatd t=$(up)" \
 	                       || echo "KDE: no seatd socket t=$(up)"
 	echo "KDE: seatd says: $(tail -3 /tmp/kde-seatd.log 2>/dev/null | tr '\n' ' ')"
@@ -337,8 +452,8 @@ stop_session() {
 		pkill -TERM -x "$c" 2>/dev/null
 	done
 	i=0
-	while [ $i -lt 5 ] && pgrep -x plasmashell > /dev/null 2>&1; do
-		i=$((i + 1)); sleep 1
+	while [ $i -lt 25 ] && pgrep -x plasmashell > /dev/null 2>&1; do
+		i=$((i + 1)); usleep 200000
 	done
 	kill "$@" 2>/dev/null
 }
@@ -346,12 +461,15 @@ stop_session() {
 wait_kwin_socket() {
 	export XDG_RUNTIME_DIR=/run/user/0
 	__i=0
-	while [ $__i -lt 40 ] && [ ! -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; do
+	while [ $__i -lt 2000 ] && [ ! -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; do
 		__i=$((__i + 1))
-		sleep 1
+		usleep 20000
 	done
 	if [ -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; then
-		echo "KDE: ok kwin-socket t=$(up) after ${__i}s"
+		echo "KDE: ok kwin-socket t=$(up) after $((__i / 50))s"
+		echo "--- kwin input (libinput) ---"
+		grep -a -i "libinput\|input device\|Adding\|seat" /tmp/kde-kwin.log 2>/dev/null | head -20
+		echo "--- end kwin input ---"
 		return 0
 	fi
 	echo "KDE: fail kwin-socket t=$(up) (no $XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1})"
@@ -384,8 +502,8 @@ CONF
 	setsid dbus-daemon --config-file=/etc/dbus-1/b1nix-session.conf --fork \
 		> /tmp/kde-sessionbus.log 2>&1
 	i=0
-	while [ $i -lt 15 ] && [ ! -S /run/user/0/bus ]; do
-		i=$((i + 1)); sleep 1
+	while [ $i -lt 750 ] && [ ! -S /run/user/0/bus ]; do
+		i=$((i + 1)); usleep 20000
 	done
 	if [ -S /run/user/0/bus ]; then
 		echo "KDE: ok session-bus t=$(up)"
@@ -423,7 +541,7 @@ memsnap() {
 
 memsnap_loop() {
 	__i=0
-	while [ $__i -lt 40 ]; do
+	while [ $__i -lt 400 ]; do
 		sleep 5
 		__i=$((__i + 1))
 		memsnap "t$__i"
@@ -452,16 +570,16 @@ if [ -x /usr/bin/plasmashell ]; then
 		QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
 		LIBGL_ALWAYS_SOFTWARE=1 "$KAMD" > /tmp/kde-kamd.log 2>&1 &
 		i=0
-		while [ $i -lt 20 ]; do
+		while [ $i -lt 1000 ]; do
 			dbus-send --session --dest=org.freedesktop.DBus \
 				--type=method_call --print-reply \
 				/org/freedesktop/DBus \
 				org.freedesktop.DBus.ListNames 2>/dev/null \
 				| grep -q org.kde.ActivityManager && break
-			i=$((i + 1)); sleep 1
+			i=$((i + 1)); usleep 200000
 		done
-		if [ $i -lt 20 ]; then
-			echo "KDE: ok activity-manager t=$(up) after ${i}s"
+		if [ $i -lt 200 ]; then
+			echo "KDE: ok activity-manager t=$(up) after $((i / 50))s"
 		else
 			echo "KDE: fail activity-manager t=$(up): $(tail -3 /tmp/kde-kamd.log 2>/dev/null | tr '\n' ' ')"
 		fi
@@ -473,9 +591,13 @@ if [ -x /usr/bin/plasmashell ]; then
 	# client picks the wayland-egl buffer integration by default; with no GL
 	# driver Mesa falls through to zink, Vulkan is absent and EGL init faults at a
 	# null pointer inside Mesa. shm keeps Qt off that path entirely.
+	# org.kde.plasma.shell at info level, for the one line that says the
+	# desktop is up: "Plasma Shell startup completed". Nothing else marks it
+	# from inside the guest, and the terminal below must not open before it.
 	WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" QT_QPA_PLATFORM=wayland \
 	QT_QUICK_BACKEND=software LIBGL_ALWAYS_SOFTWARE=1 \
 	QT_WAYLAND_CLIENT_BUFFER_INTEGRATION=shm \
+	QT_LOGGING_RULES="org.kde.plasma.shell.info=true" \
 		timeout 900 plasmashell --no-respawn \
 			> /tmp/kde-plasmashell.log 2>&1 &
 	PLASMAPID=$!
@@ -486,20 +608,20 @@ if [ -x /usr/bin/plasmashell ]; then
 	# binds them, so `of "/bin/plasmashell"` in kwin's log is one process
 	# observing another. The plasmashell-side strings are kept only as a
 	# fallback; they do not appear in this build.
-	while [ $i -lt 45 ]; do
+	while [ $i -lt 225 ]; do
 		plasma_running || break
 		grep -aq 'of "/bin/plasmashell"' /tmp/kde-kwin.log 2>/dev/null && break
 		grep -aq "backingstore\|QQuickWindow\|Loading the desktop" \
 			/tmp/kde-plasmashell.log 2>/dev/null && break
-		i=$((i + 1)); sleep 1
+		i=$((i + 1)); usleep 200000
 	done
 	if [ $i -ge 45 ]; then
 		echo "KDE: plasmashell-no-paint-within ${i}s t=$(up)"
 	else
-		echo "KDE: ok plasmashell-bound t=$(up) after ${i}s"
+		echo "KDE: ok plasmashell-bound t=$(up) after $((i / 50))s"
 	fi
 	if plasma_running; then
-		echo "KDE: ok plasmashell-alive t=$(up) after ${i}s"
+		echo "KDE: ok plasmashell-alive t=$(up) after $((i / 50))s"
 	else
 		echo "KDE: fail plasmashell-died t=$(up)"
 		echo "--- plasmashell log ---"
@@ -508,11 +630,44 @@ if [ -x /usr/bin/plasmashell ]; then
 	# A witness window, so a black picture can be read. Black inside kwin but not
 	# on the host compositor puts the fault in kwin's nested presentation; black
 	# in both means client content is reaching no compositor at all.
+	# The shell first, then programs: a terminal that opens while plasmashell
+	# is still compiling its QML is what a person sees for ten seconds before
+	# the desktop, and it is the wrong order. Wait for plasmashell's own word.
+	# plasmashell's own word, over its bus interface: a panel exists once the
+	# shell has loaded its containments, which is when there is a desktop to
+	# look at. (The "startup completed" log line never showed under the
+	# logging rule; the bus does not depend on logging.)
+	i=0
+	__panels=0
+	while [ $i -lt 150 ]; do
+		__panels=$(qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "print(panels().length)" 2>/dev/null | tr -dc '0-9')
+		[ -n "$__panels" ] && [ "$__panels" -gt 0 ] && break
+		i=$((i + 1)); usleep 200000
+	done
+	if [ -n "$__panels" ] && [ "$__panels" -gt 0 ]; then
+		echo "KDE: ok plasma-panels=$__panels t=$(up) after $((i / 50))s"
+	else
+		echo "KDE: plasma-panels not reported in 30s t=$(up)"
+	fi
+	# The desktop is up HERE.
+	#
+	# SCANOUT-READY is printed six seconds later, after this function has
+	# launched a terminal, slept for it and dumped two logs -- so reading it as
+	# "time to a desktop" charges the kernel for the harness's own waiting.
+	# This marker says when the shell reported its panels.
+	echo "KDE: DESKTOP-UP t=$(up)"
 	if [ -x /usr/bin/foot ]; then
 		WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" foot > /tmp/kde-foot.log 2>&1 &
 		[ -n "${HOST_SOCK:-}" ] && \
 			WAYLAND_DISPLAY="$HOST_SOCK" foot > /tmp/kde-foot-host.log 2>&1 &
-		sleep 8
+		# Wait for the terminal, not for a fixed three seconds. Two flat sleeps
+		# here and below put six seconds between a desktop that was up and the
+		# marker that says so, and every reading of "time to a desktop" carried
+		# them.
+		i=0
+		while [ $i -lt 15 ] && ! pgrep -x foot > /dev/null 2>&1; do
+			i=$((i + 1)); usleep 200000
+		done
 	fi
 	# Print what the shell said either way: logging it only on death is how a run
 	# that produced a black window told us nothing.
@@ -521,7 +676,6 @@ if [ -x /usr/bin/plasmashell ]; then
 	echo "--- kwin log (last 15) ---"
 	tail -15 /tmp/kde-kwin.log 2>/dev/null
 	echo "--- end logs ---"
-	sleep 10
 else
 	echo "KDE: no plasmashell in the image t=$(up)"
 fi
@@ -544,7 +698,7 @@ CFG
 		sway > /tmp/kde-sway.log 2>&1 &
 	SWAYPID=$!
 	i=0
-	while [ $i -lt 25 ] && [ ! -S /run/user/0/wayland-1 ]; do i=$((i+1)); sleep 1; done
+	while [ $i -lt 1250 ] && [ ! -S /run/user/0/wayland-1 ]; do i=$((i+1)); usleep 20000; done
 	if [ ! -S /run/user/0/wayland-1 ]; then
 		echo "KDE: fail no-host-compositor t=$(up)"
 		echo "  sway said: $(tail -3 /tmp/kde-sway.log 2>/dev/null | tr '\n' ' ')"
@@ -561,13 +715,13 @@ CFG
 	# 600 s, because the screenshot is taken past t=240 with plasmashell in the
 	# sequence; a compositor killed earlier leaves the host's background in the
 	# picture.
-	WAYLAND_DISPLAY=wayland-1 timeout 600 kwin_wayland \
+	WAYLAND_DISPLAY=wayland-1 QT_LOGGING_RULES="kwin_libinput.debug=true" timeout 600 kwin_wayland \
 		--wayland-display wayland-1 \
 		--width 1280 --height 720 --socket wayland-2 --no-lockscreen \
 		${CLIENT:+"$CLIENT"} > /tmp/kde-kwin.log 2>&1 &
 	KWINPID=$!
 	i=0
-	while [ $i -lt 40 ] && [ ! -S /run/user/0/wayland-2 ]; do i=$((i+1)); sleep 1; done
+	while [ $i -lt 2000 ] && [ ! -S /run/user/0/wayland-2 ]; do i=$((i+1)); usleep 20000; done
 	if [ -S /run/user/0/wayland-2 ]; then
 		echo "KDE: ok nested-socket t=$(up)"
 	else
@@ -674,7 +828,7 @@ fi
 # terminal: it opens /dev/tty0 and puts it in graphics mode. b1nix has no VTs,
 # so no session object is created and every device open is refused before it
 # reaches the driver. Any other seat name skips the VT dance entirely.
-export XDG_SEAT=seat1
+export XDG_SEAT=seat0
 echo "KDE: tty0 present: $([ -e /dev/tty0 ] && echo yes || echo no)"
 
 export QT_PLUGIN_PATH=/usr/lib/qt6/plugins
@@ -702,14 +856,42 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 		# leftover socket makes the next one look successful.
 		rm -f /run/user/0/wayland-1
 		export QT_LOGGING_RULES="kwin_*.debug=true"
+		# env -u WAYLAND_DISPLAY/DISPLAY: KWin's usesLibinput() takes a set
+		# WAYLAND_DISPLAY to mean it is a nested client and skips libinput.
+		# b1nix.kde-fullrepaint: repaint the whole screen every frame.
+		#
+		# KWin normally repaints only what changed, and to do that it has to
+		# know how old the buffer it is drawing into is -- with two buffers,
+		# the damage of the last two frames. A wrong buffer age assembles a
+		# frame out of two, which on a moving picture is indistinguishable
+		# from a scanout tear by eye. The kernel's own flips are provably
+		# whole (b1nix.drm-fliptest with a moving bar), so this is the next
+		# thing to rule out, and KWIN_USE_BUFFER_AGE=0 is how.
+		# b1nix.kde-noscanout: composite everything, never hand a client's own
+		# buffer to the display.
+		#
+		# With direct scanout the picture on the glass IS the application's
+		# buffer, so an application that keeps drawing into it -- because it
+		# was told the buffer was free again -- paints into the frame being
+		# scanned. That looks exactly like a scanout tear while every flip in
+		# the kernel is correct, which is the state the measurements are in.
+		if has_flag b1nix.kde-noscanout; then
+			echo "KDE: direct scanout off (compositing every frame)"
+			export KWIN_DRM_NO_DIRECT_SCANOUT=1
+		fi
+		if has_flag b1nix.kde-fullrepaint; then
+			echo "KDE: full repaint per frame (buffer age off)"
+			export KWIN_USE_BUFFER_AGE=0
+		fi
+		env -u WAYLAND_DISPLAY -u DISPLAY \
 		timeout 900 /usr/bin/kwin_wayland --drm --socket wayland-1 \
 			--no-lockscreen > /tmp/kde-kwin.log 2>&1 &
 		KWINPID=$!
 		w=0
-		while [ $w -lt 15 ]; do
+		while [ $w -lt 75 ]; do
 			[ -S /run/user/0/wayland-1 ] && break
 			kill -0 $KWINPID 2>/dev/null || break
-			sleep 1
+			usleep 200000
 			w=$((w + 1))
 		done
 		if [ -S /run/user/0/wayland-1 ] && kill -0 $KWINPID 2>/dev/null &&
@@ -731,7 +913,13 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 		echo "KDE: done t=$(up)"
 		exit 0
 	fi
-	sleep 5
+	# Up to 5 s for the socket, not a flat 5 s: the fixed sleeps on this
+	# path added 24 s to a desktop that is up in 17.
+	__i=0
+	while [ $__i -lt 250 ] && [ ! -S "$XDG_RUNTIME_DIR/${KWIN_SOCK:-wayland-1}" ]; do
+		__i=$((__i + 1))
+		usleep 20000
+	done
 	prog_alive kwin_wayland $KWINPID && echo "KDE: ok alive t=$(up)" \
 	                                 || echo "KDE: fail died t=$(up)"
 
@@ -759,7 +947,74 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 	# framebuffer is worth capturing; the host watches the serial log for them.
 	has_flag b1nix.kde-memprof && memsnap "scanout-ready"
 	echo "KDE: SCANOUT-READY t=$(up)"
-	sleep 90
+	kprof scanout
+	# How long the desktop stays up. Ninety seconds is enough for the host to
+	# take its picture, and far too short for someone sitting in front of the
+	# panel with a mouse: the session used to close under them mid-test.
+	# b1nix.kde-hold=<seconds> on the kernel command line sets it.
+	# Under b1nix.sysprof, sample the kernel profile through the hold instead
+	# of once before it: what a desktop costs while someone is USING it is not
+	# what it costs sitting still, and the single dump at scanout only ever
+	# saw the latter.
+	__hold=$(flag_value b1nix.kde-hold 90)
+	# b1nix.inputload=<seconds> drives the pointer from inside the guest for
+	# that long, so a graphics load test does not need a person with a hand on
+	# the mouse. The counters that matter (frames, longest gap, events, drops)
+	# are printed by the kernel either way, so a run with this flag is
+	# comparable to one driven by hand and repeatable in a way that one is not.
+	__load=$(flag_value b1nix.inputload 0)
+	if [ "$__load" -gt 0 ] 2>/dev/null; then
+		echo "KDE: inputload ${__load}s t=$(up)"
+		# b1nix.inputload-dev names where the events go. Pointing it at
+		# /dev/null runs the identical harness -- same forks, same writes,
+		# same pacing -- without touching the input path, which is the
+		# control the measurement needs to separate the two costs.
+		/usr/bin/b1nix-inputload \
+			"$(flag_value b1nix.inputload-dev /dev/input/event1)" \
+			"$__load" &
+	fi
+	# b1nix.kde-damage keeps something on screen actually changing.
+	#
+	# A pointer moving over a still desktop damages nothing the compositor has
+	# to redraw -- the cursor rides its own plane -- so a run driven by the
+	# input load alone can show the primary plane holding one buffer for the
+	# whole test and say nothing about whether the compositor rotates its
+	# swapchain. A terminal printing the time does damage a window, every
+	# frame, which is the load the buffer question needs.
+	if has_flag b1nix.kde-damage && [ -x /usr/bin/foot ]; then
+		echo "KDE: damage load t=$(up)"
+		# Two loads, because they answer different questions.
+		#
+		# b1nix.kde-damage prints a scrolling line: content that MOVES, which
+		# is what a partial repaint can seam. b1nix.kde-damage-flat alternates
+		# two full-screen colours instead, which is what catches a frame
+		# assembled out of two whole states.
+		if has_flag b1nix.kde-damage-flat; then
+			WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" \
+				foot sh -c 'while :; do
+					printf "\033[41m\033[2J"; usleep 40000
+					printf "\033[44m\033[2J"; usleep 40000
+				done' > /tmp/kde-foot-damage.log 2>&1 &
+		else
+			WAYLAND_DISPLAY="${KWIN_SOCK:-wayland-2}" \
+				foot sh -c 'i=0; while :; do
+					i=$((i+1)); echo "line $i ============================"
+					usleep 30000
+				done' > /tmp/kde-foot-damage.log 2>&1 &
+		fi
+	fi
+	if has_flag b1nix.sysprof; then
+		__left=$__hold
+		while [ "$__left" -gt 0 ]; do
+			__step=30
+			[ "$__left" -lt 30 ] && __step=$__left
+			sleep "$__step"
+			__left=$((__left - __step))
+			kprof_hist "hold-$((__hold - __left))s"
+		done
+	else
+		sleep "$__hold"
+	fi
 	echo "KDE: SCANOUT-END t=$(up)"
 	has_flag b1nix.kde-memprof && memsnap "scanout-end"
 	[ -n "${__memloop:-}" ] && kill $__memloop 2>/dev/null
@@ -792,9 +1047,9 @@ fi
 KWINPID=$!
 
 w=0
-while [ $w -lt 60 ]; do
+while [ $w -lt 3000 ]; do
 	[ -S /run/user/0/wayland-1 ] && break
-	sleep 1
+	usleep 20000
 	w=$((w + 1))
 done
 

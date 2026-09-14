@@ -30,4 +30,10 @@ static inline void refcount_dec(refcount_t *r) { __atomic_fetch_sub(&r->refs, 1,
  * lives in <linux/spinlock.h>, which is the one of the two that may include the
  * other without a cycle. */
 
+/* Drop a reference and take the mutex only if it hit zero, atomically with
+ * respect to another caller doing the same — the same reasoning as
+ * atomic_dec_and_mutex_lock in <linux/mutex.h>. */
+struct mutex;
+int refcount_dec_and_mutex_lock(refcount_t *r, struct mutex *lock);
+
 #endif

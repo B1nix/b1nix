@@ -41,6 +41,22 @@ static inline void *kmalloc_array(usize n, usize size, gfp_t flags)
 
 static inline void kfree(const void *ptr) { lkpi_kfree((void *)ptr); }
 
+/*
+ * kvmalloc: try contiguous, fall back to virtually contiguous.
+ *
+ * The distinction is the whole point upstream — a 2 MiB allocation that does
+ * not need to be physically contiguous should not fail because memory is
+ * fragmented. b1nix's heap hands back a physically contiguous range or nothing,
+ * so this IS kmalloc here, and a caller asking for something too large fails
+ * rather than succeeding through vmalloc. That is a real limitation, not a
+ * naming detail: it is where a large ext4 mount on a fragmented heap would
+ * fail first.
+ */
+static inline void *kvmalloc(usize size, gfp_t flags)
+{
+	return lkpi_kmalloc(size, flags);
+}
+
 static inline void *kvzalloc(usize size, gfp_t flags)
 {
 	return lkpi_kmalloc(size, flags | __GFP_ZERO);
@@ -127,6 +143,29 @@ void kmem_cache_shrink(struct kmem_cache *c);
 
 #define SLAB_HWCACHE_ALIGN 0x00002000u
 #define SLAB_RECLAIM_ACCOUNT 0x00020000u
+/*
+ * The rest of the cache flags a filesystem passes.
+ *
+ * Every one of them is a hint to a reclaim and accounting machinery b1nix does
+ * not have, so none of them changes behaviour here — but they are distinct bits
+ * rather than zero, because callers OR them together and a zero would make two
+ * different requests compare equal in code that tests the mask.
+ *
+ * SLAB_TYPESAFE_BY_RCU is the exception worth watching: it is not a hint. It
+ * promises that a freed object's MEMORY stays a valid object of the same type
+ * until an RCU grace period passes, which is what makes a lockless lookup that
+ * races with a free safe. Nothing in the current object list depends on it, and
+ * if something does, this is where the promise has to become real.
+ */
+#define SLAB_TEMPORARY       0x00040000u
+#define SLAB_MEM_SPREAD      0x00080000u
+#define SLAB_ACCOUNT         0x00100000u
+#define SLAB_NOLEAKTRACE     0x00200000u
+#define SLAB_CONSISTENCY_CHECKS 0x00800000u
+#define SLAB_STORE_USER      0x01000000u
+#define SLAB_PANIC           0x02000000u
+#define SLAB_RED_ZONE        0x04000000u
+#define SLAB_POISON          0x08000000u
 #define SLAB_TYPESAFE_BY_RCU 0x00080000u
 #define KMEM_CACHE(__struct, __flags) \
 	kmem_cache_create(#__struct, sizeof(struct __struct), \
@@ -138,5 +177,42 @@ void kmem_cache_shrink(struct kmem_cache *c);
  * than corrupting something. */
 #define ZERO_SIZE_PTR ((void *)16)
 #define ZERO_OR_NULL_PTR(x) ((unsigned long)(x) <= (unsigned long)ZERO_SIZE_PTR)
+
+/*
+ * The size kmalloc will actually give for a request.
+ *
+ * Callers use it to grow into the slack they were going to be charged for
+ * anyway — a filesystem sizing a buffer asks first and takes the rounded size.
+ * Returning the request unchanged is always CORRECT (nobody may use more than
+ * they asked for), it just gives the slack away.
+ */
+size_t kmalloc_size_roundup(size_t size);
+
+/* Bulk allocation from a cache: `nr` objects into `p`, returning how many were
+ * actually produced. A short return is not an error — callers loop — and code
+ * that treats it as one leaks the objects it was given. */
+int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t gfp, size_t nr, void **p);
+void kmem_cache_free_bulk(struct kmem_cache *s, size_t nr, void **p);
+
+/* A cache whose objects may be copied to and from userspace, with the copyable
+ * window declared. b1nix does not enforce usercopy bounds, so the window is
+ * recorded and not checked — which is why the plain create is preferred
+ * anywhere the window is the whole object. */
+struct kmem_cache *kmem_cache_create_usercopy(const char *name,
+                                              unsigned int size,
+                                              unsigned int align,
+                                              unsigned int flags,
+                                              unsigned int useroffset,
+                                              unsigned int usersize,
+                                              void (*ctor)(void *));
+
+#ifndef GFP_KERNEL_ACCOUNT
+/* Charged to a memory cgroup. b1nix has no memory controller, so it allocates
+ * the same way — the distinction is who pays, not what is returned. */
+#define GFP_KERNEL_ACCOUNT GFP_KERNEL
+#endif
+#ifndef __GFP_WRITE
+#define __GFP_WRITE 0x800000u
+#endif
 
 #endif

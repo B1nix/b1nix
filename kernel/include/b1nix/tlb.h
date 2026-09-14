@@ -27,6 +27,7 @@ void tlb_shootdown_page(u64 vaddr);
  * paths that bulk-change a large region (e.g. paging_free_address_space).
  * Same synchronous contract. */
 void tlb_shootdown_all(void);
+void tlb_shootdown_current_mm(void);
 
 /* IPI handler entry point — called from x86_irq_handler_inner for
  * TLB_SHOOTDOWN_VECTOR. Must EOI itself. */

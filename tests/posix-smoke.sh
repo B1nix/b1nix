@@ -299,115 +299,113 @@ fi
 echo "M22-POLISH: done"
 
 # ── Optional upstream BusyBox package smoke tests ──
-if [ -x /opt/busybox/bin/busybox ]; then
+if [ -x /bin/busybox ]; then
   echo "BB-SMOKE: start"
 
-  # This source copy documents the generated initramfs script. The package is
-  # installed at /opt/busybox and never shadows the native /bin commands.
-  /opt/busybox/bin/busybox --list | grep -q "echo" && echo "BB-SMOKE: ok list"
+  /bin/busybox --list | grep -q "echo" && echo "BB-SMOKE: ok list"
 
 # 2. upstream BusyBox echo
-/opt/busybox/bin/busybox echo "hello bb" | grep -q "hello bb" && echo "BB-SMOKE: ok echo"
+/bin/busybox echo "hello bb" | grep -q "hello bb" && echo "BB-SMOKE: ok echo"
 
 # 3. upstream BusyBox printf
-/opt/busybox/bin/busybox printf "hello %s\n" bb | grep -q "hello bb" && echo "BB-SMOKE: ok printf"
+/bin/busybox printf "hello %s\n" bb | grep -q "hello bb" && echo "BB-SMOKE: ok printf"
 
 # 4. upstream BusyBox pwd
-/opt/busybox/bin/busybox pwd | grep -q "/" && echo "BB-SMOKE: ok pwd"
+/bin/busybox pwd | grep -q "/" && echo "BB-SMOKE: ok pwd"
 
 # 5. upstream BusyBox mkdir
-/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir
+/bin/busybox mkdir -p /tmp/bb_dir
 [ -d /tmp/bb_dir ] && echo "BB-SMOKE: ok mkdir"
 
 # 6. upstream BusyBox touch
-/opt/busybox/bin/busybox touch /tmp/bb_dir/bb_file
+/bin/busybox touch /tmp/bb_dir/bb_file
 [ -f /tmp/bb_dir/bb_file ] && echo "BB-SMOKE: ok touch"
 
 # 7. upstream BusyBox cat
 echo "content123" > /tmp/bb_dir/bb_file
-/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file | grep -q "content123" && echo "BB-SMOKE: ok cat"
+/bin/busybox cat /tmp/bb_dir/bb_file | grep -q "content123" && echo "BB-SMOKE: ok cat"
 
 # 8. upstream BusyBox cp
-/opt/busybox/bin/busybox cp /tmp/bb_dir/bb_file /tmp/bb_dir/bb_file_cp
-/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_cp | grep -q "content123" && [ -f /tmp/bb_dir/bb_file_cp ] && echo "BB-SMOKE: ok cp"
+/bin/busybox cp /tmp/bb_dir/bb_file /tmp/bb_dir/bb_file_cp
+/bin/busybox cat /tmp/bb_dir/bb_file_cp | grep -q "content123" && [ -f /tmp/bb_dir/bb_file_cp ] && echo "BB-SMOKE: ok cp"
 
 # 9. upstream BusyBox mv
-/opt/busybox/bin/busybox mv /tmp/bb_dir/bb_file_cp /tmp/bb_dir/bb_file_mv
-[ ! -f /tmp/bb_dir/bb_file_cp ] && [ -f /tmp/bb_dir/bb_file_mv ] && /opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_mv | grep -q "content123" && echo "BB-SMOKE: ok mv"
+/bin/busybox mv /tmp/bb_dir/bb_file_cp /tmp/bb_dir/bb_file_mv
+[ ! -f /tmp/bb_dir/bb_file_cp ] && [ -f /tmp/bb_dir/bb_file_mv ] && /bin/busybox cat /tmp/bb_dir/bb_file_mv | grep -q "content123" && echo "BB-SMOKE: ok mv"
 
 # 10. upstream BusyBox ln
-/opt/busybox/bin/busybox ln -s /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk
+/bin/busybox ln -s /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk
 # Verify it resolves correctly
-/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_lnk | grep -q "content123" && echo "BB-SMOKE: ok ln"
+/bin/busybox cat /tmp/bb_dir/bb_file_lnk | grep -q "content123" && echo "BB-SMOKE: ok ln"
 
 # 11. upstream BusyBox readlink
-/opt/busybox/bin/busybox readlink /tmp/bb_dir/bb_file_lnk | grep -q "bb_file_mv" && echo "BB-SMOKE: ok readlink"
+/bin/busybox readlink /tmp/bb_dir/bb_file_lnk | grep -q "bb_file_mv" && echo "BB-SMOKE: ok readlink"
 
 # 12. upstream BusyBox chmod
-/opt/busybox/bin/busybox chmod 755 /tmp/bb_dir/bb_file_mv
+/bin/busybox chmod 755 /tmp/bb_dir/bb_file_mv
 [ -x /tmp/bb_dir/bb_file_mv ] && echo "BB-SMOKE: ok chmod"
 
 # 13. upstream BusyBox test & [
-/opt/busybox/bin/busybox test -f /tmp/bb_dir/bb_file_mv && /opt/busybox/bin/busybox [ -d /tmp/bb_dir ] && echo "BB-SMOKE: ok test"
+/bin/busybox test -f /tmp/bb_dir/bb_file_mv && /bin/busybox [ -d /tmp/bb_dir ] && echo "BB-SMOKE: ok test"
 
 # 14. upstream BusyBox sort
 printf "b\nc\na\n" > /tmp/bb_dir/bb_sort
-/opt/busybox/bin/busybox sort /tmp/bb_dir/bb_sort | head -n 1 | grep -q "a" && echo "BB-SMOKE: ok sort"
+/bin/busybox sort /tmp/bb_dir/bb_sort | head -n 1 | grep -q "a" && echo "BB-SMOKE: ok sort"
 
 # 15. upstream BusyBox uniq
 printf "a\na\nb\n" > /tmp/bb_dir/bb_uniq
-/opt/busybox/bin/busybox uniq /tmp/bb_dir/bb_uniq | wc -l | grep -q "2" && echo "BB-SMOKE: ok uniq"
+/bin/busybox uniq /tmp/bb_dir/bb_uniq | wc -l | grep -q "2" && echo "BB-SMOKE: ok uniq"
 
 # First migration wave
-/opt/busybox/bin/busybox ls /tmp/bb_dir | grep -q "bb_file" && echo "BB-W1: ok ls"
-/opt/busybox/bin/busybox cmp /tmp/bb_dir/bb_file /tmp/bb_dir/bb_file && echo "BB-W1: ok cmp"
-printf "left:right\n" | /opt/busybox/bin/busybox cut -d: -f2 | grep -q "right" && echo "BB-W1: ok cut"
-/opt/busybox/bin/busybox env BB_W1=value | grep -q "BB_W1=value" && echo "BB-W1: ok env"
-BB_ID_OUT=$(/opt/busybox/bin/busybox id -u)
+/bin/busybox ls /tmp/bb_dir | grep -q "bb_file" && echo "BB-W1: ok ls"
+/bin/busybox cmp /tmp/bb_dir/bb_file /tmp/bb_dir/bb_file && echo "BB-W1: ok cmp"
+printf "left:right\n" | /bin/busybox cut -d: -f2 | grep -q "right" && echo "BB-W1: ok cut"
+/bin/busybox env BB_W1=value | grep -q "BB_W1=value" && echo "BB-W1: ok env"
+BB_ID_OUT=$(/bin/busybox id -u)
 [ "$BB_ID_OUT" = "0" ] && echo "BB-W1: ok id"
-/opt/busybox/bin/busybox printenv PATH >/dev/null && echo "BB-W1: ok printenv"
-printf "tee-data\n" | /opt/busybox/bin/busybox tee /tmp/bb_dir/bb_tee | grep -q "tee-data" && grep -q "tee-data" /tmp/bb_dir/bb_tee && echo "BB-W1: ok tee"
-printf "abc\n" | /opt/busybox/bin/busybox tr a-z A-Z | grep -q "ABC" && echo "BB-W1: ok tr"
-/opt/busybox/bin/busybox whoami | grep -q "root" && echo "BB-W1: ok whoami"
-/opt/busybox/bin/busybox seq 1 3 > /tmp/bb_dir/bb_seq
+/bin/busybox printenv PATH >/dev/null && echo "BB-W1: ok printenv"
+printf "tee-data\n" | /bin/busybox tee /tmp/bb_dir/bb_tee | grep -q "tee-data" && grep -q "tee-data" /tmp/bb_dir/bb_tee && echo "BB-W1: ok tee"
+printf "abc\n" | /bin/busybox tr a-z A-Z | grep -q "ABC" && echo "BB-W1: ok tr"
+/bin/busybox whoami | grep -q "root" && echo "BB-W1: ok whoami"
+/bin/busybox seq 1 3 > /tmp/bb_dir/bb_seq
 tail -n 1 /tmp/bb_dir/bb_seq | grep -q "3" && echo "BB-W1: ok seq"
-/opt/busybox/bin/busybox which ls | grep -q "/bin/ls" && echo "BB-W1: ok which"
-/opt/busybox/bin/busybox clear >/tmp/bb_dir/bb_clear && echo "BB-W1: ok clear"
-printf "AB" | /opt/busybox/bin/busybox hexdump | grep -q "4241" && echo "BB-W1: ok hexdump"
+/bin/busybox which ls | grep -q "/bin/ls" && echo "BB-W1: ok which"
+/bin/busybox clear >/tmp/bb_dir/bb_clear && echo "BB-W1: ok clear"
+printf "AB" | /bin/busybox hexdump | grep -q "4241" && echo "BB-W1: ok hexdump"
 
 # Second migration wave
 mkdir -p /tmp/bb_dir/w2/sub
 printf "alpha1\nbeta2\n" > /tmp/bb_dir/w2/sub/data.txt
-/opt/busybox/bin/busybox stat -c %s /tmp/bb_dir/w2/sub/data.txt | grep -q "13" && echo "BB-W2: ok stat"
-/opt/busybox/bin/busybox realpath /tmp/bb_dir/w2/sub/data.txt | grep -q "/tmp/bb_dir/w2/sub/data.txt" && echo "BB-W2: ok realpath"
-BB_TMP=$(/opt/busybox/bin/busybox mktemp -d /tmp/bb_dir/w2/tmp.XXXXXX)
+/bin/busybox stat -c %s /tmp/bb_dir/w2/sub/data.txt | grep -q "13" && echo "BB-W2: ok stat"
+/bin/busybox realpath /tmp/bb_dir/w2/sub/data.txt | grep -q "/tmp/bb_dir/w2/sub/data.txt" && echo "BB-W2: ok realpath"
+BB_TMP=$(/bin/busybox mktemp -d /tmp/bb_dir/w2/tmp.XXXXXX)
 [ -d "$BB_TMP" ] && echo "BB-W2: ok mktemp"
-/opt/busybox/bin/busybox find /tmp/bb_dir/w2 -name "*.txt" | grep -q "data.txt" && echo "BB-W2: ok find"
-/opt/busybox/bin/busybox grep -E "alpha[0-9]+" /tmp/bb_dir/w2/sub/data.txt | grep -q "alpha1" && echo "BB-W2: ok grep"
-/opt/busybox/bin/busybox grep -Ei "[A-Z]+[0-9]" /tmp/bb_dir/w2/sub/data.txt | grep -q "alpha1" && echo "BB-W2: ok grep-icase"
-printf "name-42\n" | /opt/busybox/bin/busybox sed "s/\([a-z]*\)-\([0-9]*\)/\2:\1/" | grep -q "42:name" && echo "BB-W2: ok sed"
-printf "left:right\n" | /opt/busybox/bin/busybox awk -F: '{ print NF }' | grep -q "2" && echo "BB-W2: ok awk"
-printf "one two\n" | /opt/busybox/bin/busybox xargs /opt/busybox/bin/busybox echo | grep -q "one two" && echo "BB-W2: ok xargs"
+/bin/busybox find /tmp/bb_dir/w2 -name "*.txt" | grep -q "data.txt" && echo "BB-W2: ok find"
+/bin/busybox grep -E "alpha[0-9]+" /tmp/bb_dir/w2/sub/data.txt | grep -q "alpha1" && echo "BB-W2: ok grep"
+/bin/busybox grep -Ei "[A-Z]+[0-9]" /tmp/bb_dir/w2/sub/data.txt | grep -q "alpha1" && echo "BB-W2: ok grep-icase"
+printf "name-42\n" | /bin/busybox sed "s/\([a-z]*\)-\([0-9]*\)/\2:\1/" | grep -q "42:name" && echo "BB-W2: ok sed"
+printf "left:right\n" | /bin/busybox awk -F: '{ print NF }' | grep -q "2" && echo "BB-W2: ok awk"
+printf "one two\n" | /bin/busybox xargs /bin/busybox echo | grep -q "one two" && echo "BB-W2: ok xargs"
 cp /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt
-/opt/busybox/bin/busybox diff /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt
+/bin/busybox diff /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt
 BB_DIFF_SAME=$?
 printf "changed\n" >> /tmp/bb_dir/w2/sub/same.txt
-/opt/busybox/bin/busybox diff /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt >/dev/null
+/bin/busybox diff /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt >/dev/null
 BB_DIFF_CHANGED=$?
 [ $BB_DIFF_SAME -eq 0 ] && [ $BB_DIFF_CHANGED -ne 0 ] && echo "BB-W2: ok diff"
 printf "abc" > /tmp/bb_dir/w2/abc
-/opt/busybox/bin/busybox cksum /tmp/bb_dir/w2/abc | grep -q "1219131554 3" && echo "BB-W2: ok cksum"
-/opt/busybox/bin/busybox md5sum /tmp/bb_dir/w2/abc | grep -q "900150983cd24fb0d6963f7d28e17f72" && echo "BB-W2: ok md5sum"
-/opt/busybox/bin/busybox sha256sum /tmp/bb_dir/w2/abc | grep -q "ba7816bf8f01cfea414140de5dae2223" && echo "BB-W2: ok sha256sum"
+/bin/busybox cksum /tmp/bb_dir/w2/abc | grep -q "1219131554 3" && echo "BB-W2: ok cksum"
+/bin/busybox md5sum /tmp/bb_dir/w2/abc | grep -q "900150983cd24fb0d6963f7d28e17f72" && echo "BB-W2: ok md5sum"
+/bin/busybox sha256sum /tmp/bb_dir/w2/abc | grep -q "ba7816bf8f01cfea414140de5dae2223" && echo "BB-W2: ok sha256sum"
 rm -rf /tmp/bb_dir/w2
 
 # 16. upstream BusyBox rm
-/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq
+/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq
 [ ! -f /tmp/bb_dir/bb_file_mv ] && [ ! -f /tmp/bb_dir/bb_file_lnk ] && echo "BB-SMOKE: ok rm"
 
 # 17. upstream BusyBox rmdir
-/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file
-/opt/busybox/bin/busybox rmdir /tmp/bb_dir
+/bin/busybox rm -f /tmp/bb_dir/bb_file
+/bin/busybox rmdir /tmp/bb_dir
 [ ! -d /tmp/bb_dir ] && echo "BB-SMOKE: ok rmdir"
 
   echo "BB-SMOKE: done"

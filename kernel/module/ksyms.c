@@ -3,11 +3,12 @@
  * This is the module ABI: every name here is resolvable from a .ko, nothing
  * else is. Keeping the whole table in one translation unit makes the surface
  * auditable — `grep EXPORT_SYMBOL kernel/module/ksyms.c` is the exhaustive
- * list, and tools/kernel/check-module-syms.sh diffs each built module's
+ * list, and tools/build/kernel/check-module-syms.sh diffs each built module's
  * undefined symbols against it so a missing export is a build failure rather
  * than an insmod failure.
  */
 
+#include <b1nix/ktime.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/blk.h>
 #include <b1nix/bootinfo.h>
@@ -35,6 +36,9 @@
  * express the wait in time, not in a count of port reads that means something
  * different on every machine — so it needs to be able to read a clock. */
 EXPORT_SYMBOL(arch_tsc_monotonic_ns);
+/* The clock a module should actually wait on: the raw TSC one above answers
+ * zero on a machine without an invariant TSC, this one falls back to the tick. */
+EXPORT_SYMBOL(ktime_monotonic_ns);
 /* A module compiled with the stack protector needs the runtime the kernel
  * provides (see kernel/lib/stdlib.c). */
 extern unsigned long __stack_chk_guard;
@@ -69,6 +73,10 @@ EXPORT_SYMBOL(console_write_hex32);
 EXPORT_SYMBOL(console_write_hex64);
 EXPORT_SYMBOL(panic);
 EXPORT_SYMBOL(bootinfo_has_flag);
+/* The key=value form beside it: a module reads its own tunables from the
+ * command line the same way the kernel does — the HDA driver takes the length
+ * of its test tone from b1nix.hda-tone-ms. */
+EXPORT_SYMBOL(bootinfo_get_kv);
 
 /* ── memory ──────────────────────────────────────────────────────────────── */
 EXPORT_SYMBOL(kmalloc);
@@ -92,6 +100,9 @@ EXPORT_SYMBOL(scheduler_get_uptime_ticks);
 EXPORT_SYMBOL(sched_tick_hz);
 EXPORT_SYMBOL(rtc_now_unix_seconds);
 EXPORT_SYMBOL(rtc_set_unix_time);
+EXPORT_SYMBOL(rtc_now_unix_nanos);
+EXPORT_SYMBOL(wallclock_set_ns);
+EXPORT_SYMBOL(wallclock_slew_ns);
 
 /* ── VFS ─────────────────────────────────────────────────────────────────── */
 EXPORT_SYMBOL(vfs_register_fs);
@@ -128,6 +139,7 @@ EXPORT_SYMBOL(blk_cache_invalidate_range);
 
 /* ── PCI / port I/O ──────────────────────────────────────────────────────── */
 EXPORT_SYMBOL(pci_find_class);
+EXPORT_SYMBOL(pci_bind_driver);
 EXPORT_SYMBOL(pci_config_read16);
 EXPORT_SYMBOL(pci_config_read32);
 EXPORT_SYMBOL(pci_config_write16);

@@ -8,7 +8,7 @@
 export PATH="/bin"
 export PIDFILE="/var/run/sshd.pid"
 export LOGFILE="/var/log/sshd.log"
-export PIDOF=/opt/busybox/bin/busybox
+export PIDOF=/bin/busybox
 
 case $1 in
   start)

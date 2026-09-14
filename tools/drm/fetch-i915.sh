@@ -95,12 +95,15 @@ if [ -n "$strays" ]; then
 fi
 
 # The object list, from upstream's own Makefile rather than chosen here. i915-y
-# is assembled from gem-y and gt-y as well, so all three are read; the line
+# is assembled from gem-y and gt-y as well, so all three are read, plus the one
+# set upstream gates on CONFIG_X86 (gt/intel_ggtt_gmch.o) — this is an x86
+# build and says so, and leaving that file out was the other half of the
+# pretence that it was not; the line
 # continuations are joined first, because an assignment spanning twenty lines is
 # still one assignment and reading it line by line loses most of it.
 sed -e :a -e '/\\$/N; s/\\\n//; ta' \
 	"$STAGE_DIR.tmp/drivers/gpu/drm/i915/Makefile" |
-	grep -E '^(i915-y|gem-y|gt-y)[[:space:]]*\+?=' |
+	grep -E '^(i915-y|gem-y|gt-y|gt-\$\(CONFIG_X86\))[[:space:]]*\+?=' |
 	grep -oE '[a-zA-Z0-9_/]+\.o' |
 	sed 's/\.o$/.c/' |
 	sort -u > "$STAGE_DIR.tmp/B1NIX-OBJECTS.all"

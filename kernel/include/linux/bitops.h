@@ -38,6 +38,18 @@ static inline int __test_and_set_bit(unsigned int nr, volatile unsigned long *ad
  * half-finished object. */
 static inline void clear_bit_unlock(unsigned int nr, volatile unsigned long *addr)
 { __atomic_fetch_and(&addr[BIT_WORD(nr)], ~BIT_MASK(nr), __ATOMIC_RELEASE); }
+/*
+ * The non-atomic release of a bit-lock.
+ *
+ * "Non-atomic" refers to the read-modify-write, not to the ordering: the store
+ * still has to be a release, or the next holder can see a half-finished object.
+ * It is used where the caller knows no other CPU is touching the SAME WORD —
+ * which for a buffer head is not the same as knowing nobody is touching the
+ * object.
+ */
+static inline void __clear_bit_unlock(unsigned int nr, volatile unsigned long *addr)
+{ __atomic_fetch_and(&addr[BIT_WORD(nr)], ~BIT_MASK(nr), __ATOMIC_RELEASE); }
+
 static inline int test_and_set_bit_lock(unsigned int nr, volatile unsigned long *addr)
 {
 	unsigned long old = __atomic_fetch_or(&addr[BIT_WORD(nr)], BIT_MASK(nr),
@@ -255,5 +267,80 @@ static inline int __test_and_clear_bit(unsigned int nr, volatile unsigned long *
 /* Index of the first zero bit in a word. */
 static inline unsigned long ffz(unsigned long word)
 { return (unsigned long)__builtin_ctzl(~word); }
+
+/*
+ * The little-endian bitmap operations.
+ *
+ * ext4's block and inode bitmaps are stored on disk as little-endian bit
+ * arrays: bit N lives in byte N/8, counting from the least significant bit. On
+ * a little-endian machine that is exactly what the native operations already
+ * do, so these are the same functions under different names — and both b1nix
+ * architectures are little-endian.
+ *
+ * They are still spelled out rather than #defined to the native names, because
+ * the names carry the promise. If this kernel is ever built big-endian, this is
+ * the one place that has to change, and it will be visible here rather than
+ * hidden behind an alias.
+ */
+static inline void __set_bit_le(int nr, void *addr)
+{ __set_bit((unsigned)nr, (volatile unsigned long *)addr); }
+static inline void __clear_bit_le(int nr, void *addr)
+{ __clear_bit((unsigned)nr, (volatile unsigned long *)addr); }
+static inline int test_bit_le(int nr, const void *addr)
+{ return test_bit((unsigned)nr, (const volatile unsigned long *)addr); }
+static inline int test_and_set_bit_le(int nr, void *addr)
+{ return test_and_set_bit((unsigned)nr, (volatile unsigned long *)addr); }
+static inline int test_and_clear_bit_le(int nr, void *addr)
+{ return test_and_clear_bit((unsigned)nr, (volatile unsigned long *)addr); }
+static inline unsigned long find_next_zero_bit_le(const void *addr,
+                                                  unsigned long size,
+                                                  unsigned long offset)
+{ return find_next_zero_bit((const unsigned long *)addr, size, offset); }
+static inline unsigned long find_next_bit_le(const void *addr,
+                                             unsigned long size,
+                                             unsigned long offset)
+{ return find_next_bit((const unsigned long *)addr, size, offset); }
+static inline unsigned long find_first_zero_bit_le(const void *addr,
+                                                   unsigned long size)
+{ return find_next_zero_bit_le(addr, size, 0); }
+
+/*
+ * The non-atomic little-endian test-and-set pair, and the "resume from here"
+ * iteration macros.
+ *
+ * `for_each_set_bit_from` starts at the caller's bit rather than at zero, which
+ * is what makes a scan resumable — restarting from zero turns a walk over a
+ * block bitmap into quadratic work on a full filesystem.
+ */
+static inline int __test_and_set_bit_le(int nr, void *addr)
+{ return __test_and_set_bit((unsigned)nr, (volatile unsigned long *)addr); }
+static inline int __test_and_clear_bit_le(int nr, void *addr)
+{
+	volatile unsigned long *p = (volatile unsigned long *)addr;
+	int was = test_bit((unsigned)nr, p);
+
+	__clear_bit((unsigned)nr, p);
+	return was;
+}
+
+#define for_each_set_bit_from(bit, addr, size)                                 \
+	for ((bit) = find_next_bit((addr), (size), (bit));                         \
+	     (bit) < (size);                                                       \
+	     (bit) = find_next_bit((addr), (size), (bit) + 1))
+#define for_each_clear_bit_from(bit, addr, size)                               \
+	for ((bit) = find_next_zero_bit((addr), (size), (bit));                    \
+	     (bit) < (size);                                                       \
+	     (bit) = find_next_zero_bit((addr), (size), (bit) + 1))
+
+/* Rotate. Written as a shift pair the compiler folds into one instruction; the
+ * mask on the count is what keeps a rotate by 32 from being undefined. */
+static inline u32 rol32(u32 word, unsigned int shift)
+{ return (word << (shift & 31)) | (word >> ((-shift) & 31)); }
+static inline u32 ror32(u32 word, unsigned int shift)
+{ return (word >> (shift & 31)) | (word << ((-shift) & 31)); }
+
+/* Population count over a byte range. ext4 counts free blocks in a bitmap with
+ * it, so it is on a path that runs once per block group at mount. */
+size_t memweight(const void *ptr, size_t bytes);
 
 #endif

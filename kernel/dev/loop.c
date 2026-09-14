@@ -143,6 +143,14 @@ struct loop_info64 {
   u64 lo_init[2];
 };
 
+/* LOOP_CONFIGURE's argument. */
+struct loop_config {
+  u32 fd;
+  u32 block_size;
+  struct loop_info64 info;
+  u64 reserved[8];
+};
+
 struct loop_info32 {
   int lo_number;
   u32 lo_device;
@@ -210,6 +218,65 @@ static int g_loops_inited;
 /* Whether slot i is currently in the block registry. A slot that is not
  * registered has no device and no minor number: it is not "a free loop
  * device", it is one that does not exist yet. */
+/* LOOP_SET_FD: associate a backing file. Shared with LOOP_CONFIGURE. */
+static int loop_set_fd(int idx, struct loop_device *lo, int backing_fd) {
+  struct vfs_handle *h = scheduler_fd_get(backing_fd);
+  if (!h || !h->node || !h->node->inode)
+    return -EBADF;
+  /* Only a regular file may back a loop device — a device node (especially
+   * the loop's own /dev/loopN) would recurse loop_read_blocks -> blkdev read
+   * -> loop_read_blocks into a stack overflow; a pipe/tty would block inside
+   * the block layer. */
+  if (h->node->inode->type != VFS_FILE)
+    return -EINVAL;
+  if (lo->backing_node)
+    return -EBUSY; /* already associated — CLR_FD first */
+  /* Pin the backing node: the setup process's fd will be closed (and the
+   * file may be unlinked) while the loop device lives on. Without this ref
+   * loop_read_blocks would dereference a freed node (UAF). */
+  lo->backing_node = vfs_node_get(h->node);
+  lo->offset = 0;
+  lo->sizelimit = 0;
+  lo->flags = 0;
+  /* Read-only follows the descriptor, so `losetup -r` really produces a
+   * device that refuses writes. */
+  lo->readonly = (h->flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR)) == 0;
+  loop_set_name_from_fd(lo, backing_fd);
+  lo->bdev.block_count = (h->node->inode->size + 511) / 512;
+  /* Drop any cached blocks keyed to this bdev from a previous association. */
+  blk_cache_invalidate(&lo->bdev);
+  loop_refresh_node_size(idx, lo);
+  return 0;
+}
+
+/* LOOP_SET_STATUS64 on an associated device. Shared with LOOP_CONFIGURE. */
+static int loop_apply_status64(int idx, struct loop_device *lo,
+                               const struct loop_info64 *info) {
+  if (!lo->backing_node)
+    return -ENXIO;
+  if (info->lo_encrypt_type != 0)
+    return -EOPNOTSUPP; /* there is no crypto transfer function */
+  u64 file_size = lo->backing_node->inode ? lo->backing_node->inode->size : 0;
+  if (info->lo_offset > file_size)
+    return -EINVAL;
+  lo->offset = info->lo_offset;
+  lo->sizelimit = info->lo_sizelimit;
+  lo->flags = info->lo_flags & ~(u32)LO_FLAGS_READ_ONLY;
+  if (info->lo_flags & LO_FLAGS_READ_ONLY)
+    lo->readonly = 1;
+  if (info->lo_file_name[0]) {
+    strncpy(lo->file_name, (const char *)info->lo_file_name,
+            sizeof(lo->file_name) - 1);
+    lo->file_name[sizeof(lo->file_name) - 1] = '\0';
+  }
+  u64 usable = loop_limit(lo);
+  lo->bdev.block_count =
+      usable > lo->offset ? (usable - lo->offset + 511) / 512 : 0;
+  blk_cache_invalidate(&lo->bdev);
+  loop_refresh_node_size(idx, lo);
+  return 0;
+}
+
 static int g_loop_registered[NUM_LOOPS];
 
 /* Bring one slot to its unassociated resting state. Called for every slot at
@@ -365,35 +432,22 @@ int loop_ioctl(struct vfs_node *node, u64 request, void *arg) {
     return -ENXIO;
   struct loop_device *lo = &g_loops[idx];
   switch (request) {
-  case 0x4C00: { /* LOOP_SET_FD: arg is the backing file descriptor */
-    int backing_fd = (int)(usize)arg;
-    struct vfs_handle *h = scheduler_fd_get(backing_fd);
-    if (!h || !h->node || !h->node->inode)
-      return -EBADF;
-    /* Only a regular file may back a loop device — a device node (especially
-     * the loop's own /dev/loopN) would recurse loop_read_blocks -> blkdev read
-     * -> loop_read_blocks into a stack overflow; a pipe/tty would block inside
-     * the block layer. */
-    if (h->node->inode->type != VFS_FILE)
-      return -EINVAL;
-    if (lo->backing_node)
-      return -EBUSY; /* already associated — CLR_FD first */
-    /* Pin the backing node: the setup process's fd will be closed (and the
-     * file may be unlinked) while the loop device lives on. Without this ref
-     * loop_read_blocks would dereference a freed node (UAF). */
-    lo->backing_node = vfs_node_get(h->node);
-    lo->offset = 0;
-    lo->sizelimit = 0;
-    lo->flags = 0;
-    /* Read-only follows the descriptor, so `losetup -r` really produces a
-     * device that refuses writes. */
-    lo->readonly = (h->flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR)) == 0;
-    loop_set_name_from_fd(lo, backing_fd);
-    lo->bdev.block_count = (h->node->inode->size + 511) / 512;
-    /* Drop any cached blocks keyed to this bdev from a previous association. */
-    blk_cache_invalidate(&lo->bdev);
-    loop_refresh_node_size(idx, lo);
-    return 0;
+  case 0x4C00: /* LOOP_SET_FD: arg is the backing file descriptor */
+    return loop_set_fd(idx, lo, (int)(usize)arg);
+  case 0x4C0A: { /* LOOP_CONFIGURE: SET_FD and SET_STATUS64 in one call */
+    struct loop_config cfg;
+    if (!arg)
+      return -EFAULT;
+    if (syscall_copyin(&cfg, arg, sizeof(cfg)) < 0)
+      return -EFAULT;
+    if (cfg.info.lo_encrypt_type != 0)
+      return -EOPNOTSUPP;
+    if (cfg.block_size != 0 && cfg.block_size != 512)
+      return -EINVAL; /* the loop device exposes 512-byte blocks only */
+    int rc = loop_set_fd(idx, lo, (int)cfg.fd);
+    if (rc < 0)
+      return rc;
+    return loop_apply_status64(idx, lo, &cfg.info);
   }
   case 0x4C01: { /* LOOP_CLR_FD */
     struct vfs_node *old = lo->backing_node;
@@ -458,27 +512,7 @@ int loop_ioctl(struct vfs_node *node, u64 request, void *arg) {
     struct loop_info64 info;
     if (syscall_copyin(&info, arg, sizeof(info)) < 0)
       return -EFAULT;
-    if (info.lo_encrypt_type != 0)
-      return -EOPNOTSUPP; /* there is no crypto transfer function */
-    u64 file_size = lo->backing_node->inode ? lo->backing_node->inode->size : 0;
-    if (info.lo_offset > file_size)
-      return -EINVAL;
-    lo->offset = info.lo_offset;
-    lo->sizelimit = info.lo_sizelimit;
-    lo->flags = info.lo_flags & ~(u32)LO_FLAGS_READ_ONLY;
-    if (info.lo_flags & LO_FLAGS_READ_ONLY)
-      lo->readonly = 1;
-    if (info.lo_file_name[0]) {
-      strncpy(lo->file_name, (const char *)info.lo_file_name,
-              sizeof(lo->file_name) - 1);
-      lo->file_name[sizeof(lo->file_name) - 1] = '\0';
-    }
-    u64 usable = loop_limit(lo);
-    lo->bdev.block_count =
-        usable > lo->offset ? (usable - lo->offset + 511) / 512 : 0;
-    blk_cache_invalidate(&lo->bdev);
-    loop_refresh_node_size(idx, lo);
-    return 0;
+    return loop_apply_status64(idx, lo, &info);
   }
   case 0x4C02: { /* LOOP_SET_STATUS */
     if (!lo->backing_node)
@@ -515,6 +549,6 @@ int loop_ioctl(struct vfs_node *node, u64 request, void *arg) {
     return 0;
   }
   default:
-    return -ENOTTY;
+    return -EINVAL; /* what Linux's loop driver answers for an unknown command */
   }
 }

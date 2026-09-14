@@ -278,8 +278,7 @@ struct task {
 
   /* Signal handling. pending_signals is updated with 8-byte __atomic ops from
    * ISR/signal/scheduler paths; force 8-byte alignment so those atomics are
-   * naturally aligned on i686 (where a bare u64 field is only 4-byte aligned —
-   * the lock-prefixed op stays correct but warns and pays a cache penalty).
+   * naturally aligned regardless of the surrounding field layout.
    * Tasks are kmalloc'd in chunks, so the small sizeof bump is harmless. */
   __attribute__((aligned(8))) u64 pending_signals; /* bitmask of pending signals */
   u64 blocked_signals;             /* bitmask of blocked signals */
@@ -393,6 +392,15 @@ void task_clear_cmdline(struct task *t);
  * then keeps working with x87+SSE only. */
 void *task_xsave_area(const struct task *t);
 int task_fpu_alloc(struct task *t);
+/* The task table has SCHED_MAX_TASKS rows and every side table the scheduler
+ * keeps (FPU area, nice, affinity, ...) is indexed by a task's row in it.
+ * task_slot_index() hands that row out so another subsystem can keep a
+ * per-task entry of its own without growing struct task. The per-CPU idle
+ * tasks live outside the table and answer with a row at or above
+ * SCHED_MAX_TASKS; they never return to userspace, so a table sized to the
+ * real tasks only needs to bounds-check. */
+#define SCHED_MAX_TASKS 4096
+usize task_slot_index(const struct task *t);
 /* ── M86: per-thread CPU time ─────────────────────────────────────────────── */
 /* USER_HZ: times(2) and /proc report CPU time in 10 ms clock ticks. The kernel
  * keeps nanoseconds and converts at the edge. */
@@ -432,6 +440,7 @@ u64  task_nivcsw(const struct task *t);
  * scheduler's context switch. */
 void sched_acct_enter_kernel(void);
 void sched_acct_leave_kernel(void);
+void sched_acct_skip_idle(void);
 void sched_acct_on_switch(struct task *prev);
 /* Last userspace RIP at the moment the LAPIC timer tick preempted this task
  * (0 for kernel tasks / never-preempted). Watchdog diagnostic: names the user
@@ -691,6 +700,9 @@ usize scheduler_address_space_users(u64 pml4_phys, usize *first_id,
  * addresses still on its stack. For a run that stalls with nothing to read:
  * started as a thread by b1nix.task-watch. */
 void scheduler_dump_tasks(void);
+/* Where each task last parked, by task id: the return address recorded on the
+ * way into scheduler_wait_prepare. */
+void scheduler_dump_park_sites(void);
 /* Record the system call this task just entered, for that dump. */
 void task_note_syscall(u64 number);
 /* True when the current context may park on a wait channel (scheduler live, real
@@ -840,6 +852,7 @@ u64  scheduler_peek_pending_signals(u64 mask);
 int  scheduler_consume_pending_signal(int sig);
 sighandler_t scheduler_get_sighandler(int sig);
 usize scheduler_get_pid(void);
+void scheduler_start_reaper(void);
 
 /* Reserve PID 1 for the next task created (the userspace init process). The
  * boot/idle task is PID 0, so 1 is otherwise never handed out. */

@@ -86,9 +86,9 @@ static inline unsigned long strtoul_l(const char *nptr, char **endptr, int base,
  * (<__support/musl/xlocale.h>) when libc++ is built with _LIBCPP_HAS_MUSL_LIBC —
  * which is how b1nix builds it, since b1nix's libc is musl-like and C-locale
  * only. Defining them here too would be a redefinition in any libc++ TU that
- * pulls <locale>. So in a libc++ build let libc++ provide them; the GCC
- * libstdc++ path (where _LIBCPP_HAS_MUSL_LIBC is never defined) still gets the
- * b1nix definitions it expects. The other *_l variants above are NOT in libc++'s
+ * pulls <locale>. So in a libc++ build let libc++ provide them; any other
+ * build (where _LIBCPP_HAS_MUSL_LIBC is not defined) still gets the b1nix
+ * definitions. The other *_l variants above are NOT in libc++'s
  * shim, so they stay unconditionally provided by the libc. */
 #ifndef _LIBCPP_HAS_MUSL_LIBC
 static inline long long strtoll_l(const char *nptr, char **endptr, int base, locale_t loc) {

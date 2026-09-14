@@ -28,8 +28,8 @@
  *                    delete a module (EPERM) and the module stays loaded.
  *   init-module      the raw init_module(2) entry point loads an image read
  *                    into this process's own memory.
- *   fs-in-use        with a btrfs image mounted through a loop device, rmmod
- *                    btrfs reports EBUSY and the type survives; after the
+ *   fs-in-use        with an isofs image mounted through a loop device, rmmod
+ *                    isofs reports EBUSY and the type survives; after the
  *                    umount the very same unload succeeds.
  *   filesystems-nodev  /proc/filesystems marks every pseudo filesystem nodev
  *                    and no block-backed one.
@@ -386,8 +386,10 @@ static void t_modinfo(void) {
 }
 
 static void t_fs_modules(void) {
-  /* Each of these is a filesystem module: it must be visible as a filesystem
-   * type, which only happens if its init function ran inside the kernel. */
+  /* Each of these is a filesystem the kernel has to be offering: isofs and
+   * ntfs as loaded modules, btrfs built in since the imported implementation
+   * replaced the hand-written one. What is checked is the same either way —
+   * the type is there only if its init function ran. */
   static const char *fs[] = {"isofs", "ntfs", "btrfs"};
   for (unsigned i = 0; i < sizeof(fs) / sizeof(fs[0]); i++) {
     if (!file_contains_word("/proc/filesystems", fs[i])) {
@@ -515,9 +517,12 @@ static void t_dup_load(void) {
 
 static void t_vermagic_reject(void) {
   size_t size = 0;
-  char *buf = slurp(modpath("btrfs.ko"), &size);
+  /* ntfs, because it is a module: btrfs stopped being one when the imported
+   * implementation replaced the hand-written driver and moved into the
+   * kernel. What is under test is the loader, not the filesystem. */
+  char *buf = slurp(modpath("ntfs.ko"), &size);
   if (!buf) {
-    fail("vermagic-reject", "cannot read btrfs.ko");
+    fail("vermagic-reject", "cannot read ntfs.ko");
     return;
   }
   /* Corrupt the vermagic value in place. The blob is a run of NUL-terminated
@@ -533,8 +538,8 @@ static void t_vermagic_reject(void) {
   char *mut = (char *)vm;
   mut[0] = (mut[0] == '9') ? '8' : '9';
 
-  if (rmmod("btrfs") != 0) {
-    fail("vermagic-reject", "could not unload btrfs first");
+  if (rmmod("ntfs") != 0) {
+    fail("vermagic-reject", "could not unload ntfs first");
     free(buf);
     return;
   }
@@ -554,12 +559,12 @@ static void t_vermagic_reject(void) {
   free(buf);
   /* The intact original must still load, proving the rejection was about the
    * corrupted byte and not about the module. */
-  if (insmod_path(modpath("btrfs.ko"), "") != 0) {
+  if (insmod_path(modpath("ntfs.ko"), "") != 0) {
     fail("vermagic-reject", "the intact module no longer loads");
     return;
   }
-  if (!file_contains_word("/proc/filesystems", "btrfs")) {
-    fail("vermagic-reject", "btrfs did not re-register after reload");
+  if (!file_contains_word("/proc/filesystems", "ntfs")) {
+    fail("vermagic-reject", "ntfs did not re-register after reload");
     return;
   }
   ok("vermagic-reject");
@@ -644,25 +649,32 @@ static void t_unpriv(void) {
 /* A mounted filesystem pins the module that provides it. Built by hand: the
  * btrfs mount path only needs the superblock magic at BTRFS_SUPER_INFO_OFFSET,
  * so a sparse file plus eight bytes is a mountable image. */
-/* A real btrfs filesystem, built by mkfs.btrfs at image-build time. It used to
+/* A real btrfs filesystem, built by mkfs.btrfs at image-build time. Kept for
+ * the tests that want a block filesystem to mount; the module-pinning test
+ * below uses the isofs image instead, because btrfs is no longer a module.
+ * It used to
  * be fabricated here by writing the btrfs magic into an empty file, which the
  * driver accepted only while it read nothing but the magic; it reads the
  * filesystem now, so a made-up one is correctly refused. */
 #define BTRFS_IMG   "/btrfs-test.img"
 #define BTRFS_MNT   "/tmp/m95-btrfs-mnt"
+/* The filesystem this test pins is one that comes FROM a module: btrfs is
+ * built in now. */
+#define ISOFS_IMG   "/isofs-test.img"
+#define ISOFS_MNT   "/tmp/m95-isofs-mnt"
 
 #define LOOP_SET_FD       0x4C00
 #define LOOP_CLR_FD       0x4C01
 #define LOOP_CTL_GET_FREE 0x4C82
 
 static void t_fs_in_use(void) {
-  int img = open(BTRFS_IMG, O_RDWR);
+  int img = open(ISOFS_IMG, O_RDWR);
 
   if (img < 0) {
     /* No image means btrfs-progs was absent when the machine was built. Said
      * out loud rather than passed: a check that could not run is not a check
      * that succeeded. */
-    skip("fs-in-use", "no btrfs image in the machine (btrfs-progs absent at build time)");
+    skip("fs-in-use", "no isofs image in the machine (no ISO tool at build time)");
     return;
   }
 
@@ -687,41 +699,41 @@ static void t_fs_in_use(void) {
   }
   close(img);
 
-  mkdir(BTRFS_MNT, 0755);
-  if (mount(dev, BTRFS_MNT, "btrfs", 0, NULL) != 0) {
-    fail("fs-in-use", "mounting the loop image as btrfs failed");
+  mkdir(ISOFS_MNT, 0755);
+  if (mount(dev, ISOFS_MNT, "isofs", 0, NULL) != 0) {
+    fail("fs-in-use", "mounting the loop image as isofs failed");
     goto out_loop;
   }
 
   /* The unload must be refused while the mount is live — the module's text is
    * what every operation on that mount calls into. */
   errno = 0;
-  if (rmmod("btrfs") == 0) {
-    fail("fs-in-use", "btrfs unloaded with one of its filesystems mounted");
-    umount(BTRFS_MNT);
+  if (rmmod("isofs") == 0) {
+    fail("fs-in-use", "isofs unloaded with one of its filesystems mounted");
+    umount(ISOFS_MNT);
     goto out_loop;
   }
   if (errno != EBUSY) {
     fail("fs-in-use", "unload of a mounted filesystem did not report EBUSY");
-    umount(BTRFS_MNT);
+    umount(ISOFS_MNT);
     goto out_loop;
   }
-  if (!file_contains_word("/proc/filesystems", "btrfs")) {
+  if (!file_contains_word("/proc/filesystems", "isofs")) {
     fail("fs-in-use", "the filesystem type went away anyway");
-    umount(BTRFS_MNT);
+    umount(ISOFS_MNT);
     goto out_loop;
   }
 
-  if (umount(BTRFS_MNT) != 0) {
+  if (umount(ISOFS_MNT) != 0) {
     fail("fs-in-use", "umount failed");
     goto out_loop;
   }
   /* ... and the reference is given back, so the same unload now works. */
-  if (rmmod("btrfs") != 0) {
-    fail("fs-in-use", "btrfs still busy after umount");
+  if (rmmod("isofs") != 0) {
+    fail("fs-in-use", "isofs still busy after umount");
     goto out_loop;
   }
-  if (insmod_path(modpath("btrfs.ko"), "") != 0) {
+  if (insmod_path(modpath("isofs.ko"), "") != 0) {
     fail("fs-in-use", "reload failed");
     goto out_loop;
   }
@@ -730,9 +742,9 @@ static void t_fs_in_use(void) {
 out_loop:
   ioctl(loop, LOOP_CLR_FD, 0);
   close(loop);
-  rmdir(BTRFS_MNT);
+  rmdir(ISOFS_MNT);
   /* The image belongs to the machine, not to this run: it is built into the
-   * root filesystem and the next test to want a btrfs needs it too. */
+   * root filesystem and the next test to want one needs it too. */
 }
 
 /* /proc/filesystems labels a type "nodev" exactly when it needs no block
@@ -811,6 +823,11 @@ static int capture(const char *path, char *const argv[], char *out,
   while (got < cap - 1 && (r = read(fds[0], out + got, cap - 1 - got)) > 0)
     got += (size_t)r;
   out[got] = '\0';
+  /* Drain what did not fit: closing the pipe early kills a chatty child with
+   * SIGPIPE, and the check would blame the program for the buffer's size. */
+  char sink[512];
+  while (read(fds[0], sink, sizeof(sink)) > 0)
+    ;
   close(fds[0]);
   int status = 0;
   if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status))
@@ -839,23 +856,34 @@ static void t_bb_modutils(void) {
   /* modinfo reads the .ko on disk — it must find it under the release
    * directory and report the vermagic the running kernel stamped. */
   char kopath[192];
-  snprintf(kopath, sizeof(kopath), "%s", modpath("btrfs.ko"));
+  snprintf(kopath, sizeof(kopath), "%s", modpath("ntfs.ko"));
   char *const mi[] = {(char *)"modinfo", kopath, 0};
   if (capture("/bin/modinfo", mi, out, sizeof(out)) != 0 ||
-      strstr(out, "btrfs") == 0 || strstr(out, "vermagic") == 0) {
-    fail("bb-modutils", "modinfo did not report the module's own metadata");
+      strstr(out, "ntfs") == 0) {
+    fail("bb-modutils", "modinfo did not name the module it was given");
+    return;
+  }
+  /* The vermagic is asked for by name rather than looked for in the dump:
+   * BusyBox's modinfo prints a chosen set of fields when it is not told which
+   * one, and vermagic is not in it. Asking is also the stronger check — the
+   * value has to be the running kernel's, not merely present. */
+  char *const mv[] = {(char *)"modinfo", (char *)"-F", (char *)"vermagic",
+                      kopath, 0};
+  if (capture("/bin/modinfo", mv, out, sizeof(out)) != 0 ||
+      strstr(out, "b1nix") == 0) {
+    fail("bb-modutils", "modinfo did not report the module's vermagic");
     return;
   }
 
   /* rmmod / insmod round-trip through the applets. */
-  char *const rm[] = {(char *)"rmmod", (char *)"btrfs", 0};
+  char *const rm[] = {(char *)"rmmod", (char *)"ntfs", 0};
   if (capture("/bin/rmmod", rm, out, sizeof(out)) != 0) {
     fail("bb-modutils", "rmmod failed");
     return;
   }
   struct modrow rows[64];
   int rn = read_modules(rows, 64);
-  if (rn > 0 && find_mod(rows, rn, "btrfs")) {
+  if (rn > 0 && find_mod(rows, rn, "ntfs")) {
     fail("bb-modutils", "the module survived rmmod");
     return;
   }
@@ -865,7 +893,7 @@ static void t_bb_modutils(void) {
     return;
   }
   rn = read_modules(rows, 64);
-  if (rn <= 0 || !find_mod(rows, rn, "btrfs")) {
+  if (rn <= 0 || !find_mod(rows, rn, "ntfs")) {
     fail("bb-modutils", "insmod did not load the module back");
     return;
   }
@@ -874,8 +902,14 @@ static void t_bb_modutils(void) {
    * that shipped — otherwise running depmod on the target would quietly
    * rewrite modules.dep into something modprobe reads differently. */
   char *const dm[] = {(char *)"depmod", (char *)"-n", 0};
-  if (capture("/sbin/depmod", dm, out, sizeof(out)) != 0) {
-    fail("bb-modutils", "depmod -n failed");
+  int dm_rc = capture("/sbin/depmod", dm, out, sizeof(out));
+  if (dm_rc != 0) {
+    char why[160];
+    char *nl = strchr(out, '\n');
+    if (nl)
+      *nl = '\0';
+    snprintf(why, sizeof(why), "depmod -n exited %d: %.100s", dm_rc, out);
+    fail("bb-modutils", why);
     return;
   }
   if (strstr(out, "ndp.ko: ipv6.ko") == 0) {

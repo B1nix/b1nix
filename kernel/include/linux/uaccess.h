@@ -48,11 +48,12 @@ static inline int access_ok(const void __user *addr, unsigned long size)
 	return (base + size) <= LKPI_USER_VA_END;
 }
 
-/* The uid/gid reported when a real one does not fit the 16-bit fields of an
- * old interface. b1nix never truncates, so it is the conventional value and
- * nothing produces it. */
-#define overflowuid 65534
-#define overflowgid 65534
+/* The overflow uid/gid used to live here as macros. They are variables in
+ * <linux/highuid.h> now, where the rest of the 16-bit conversion lives — a
+ * macro over those names turns the declaration there into a syntax error, and
+ * ext4 stores a 16-bit uid on disk, so it needs the real thing rather than a
+ * constant. */
+#include <linux/highuid.h>
 
 #define get_user(x, ptr)                                            \
 	({                                                              \
@@ -141,5 +142,16 @@ int kstrtoint_from_user(const char __user *s, usize count, unsigned int base, in
 int kstrtouint_from_user(const char __user *s, usize count, unsigned int base, unsigned int *res);
 int kstrtoull_from_user(const char __user *s, usize count, unsigned int base, unsigned long long *res);
 int kstrtobool_from_user(const char __user *s, usize count, bool *res);
+
+/*
+ * Copy to userspace without taking a fault.
+ *
+ * Returns -EFAULT rather than paging the destination in, which is the whole
+ * point: the caller holds a lock the fault handler would need. btrfs uses it
+ * inside its extent-buffer read, and a version that faulted would deadlock
+ * exactly where this one returns an error the caller retries outside the lock.
+ */
+long copy_to_user_nofault(void __user *dst, const void *src, size_t size);
+long copy_from_user_nofault(void *dst, const void __user *src, size_t size);
 
 #endif

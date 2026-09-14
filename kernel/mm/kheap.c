@@ -1289,6 +1289,24 @@ void kfree(void *ptr) {
   if (!is_canonical_addr(p))
     return;
   if (p >= KLARGE_START && p < KLARGE_END) {
+    /* A large block's header sits in the page below the pointer; unmapped
+     * means the block was already freed. Name the second free's caller
+     * instead of faulting on the header with no usable backtrace. */
+    if (!vmm_virt_to_phys((void *)(usize)((p - KLARGE_HEADER_SIZE) & ~0xfffULL))) {
+      static int reported;
+      u64 caller = (u64)(usize)__builtin_return_address(0);
+
+      if (reported++ < 4) {
+        console_write("kheap: double free of large block 0x");
+        console_write_hex64(p);
+        console_write(" from 0x");
+        console_write_hex64(caller);
+        ksym_print(caller);
+        console_write("\n");
+        dump_raw_stack_with_symbols((u64)(usize)__builtin_frame_address(0), 48);
+      }
+      panic("kheap: double free of a large block");
+    }
     klarge_free(ptr);
     return;
   }

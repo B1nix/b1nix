@@ -24,6 +24,7 @@ void tlb_shootdown_all(void);
 #include <b1nix/rtc.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/rseq.h>
+#include <b1nix/tlb.h>
 #include <b1nix/sched.h>
 #include <b1nix/blk.h>
 #include <b1nix/shm.h>
@@ -41,8 +42,6 @@ void tlb_shootdown_all(void);
 #include <b1nix/version.h>
 
 
-#define MAX_EXEC_ARGS 256
-#define MAX_EXEC_ARG_LEN 4096
 static int copy_from_user(void *dst, const void *src, usize size);
 static int copy_to_user(void *dst, const void *src, usize size);
 static isize strncpy_from_user(char *dst, const char *src, usize size);
@@ -165,6 +164,18 @@ u64 kernel_random_u64(void) {
   return v;
 }
 
+/* An argv or envp vector, copied into the kernel.
+ *
+ * Bounded the way Linux bounds it: by the bytes the strings take (each vector
+ * gets a quarter of the user stack, where they will be placed), not by how
+ * many there are. A vector that does not fit is E2BIG. The old copy stopped
+ * at 256 entries and handed the kernel the first 256 as if they were all of
+ * them: a 684-argument ld.lld link ran on the first 256 objects and reported
+ * the rest of the kernel as undefined symbols. */
+#define EXEC_VECTOR_BYTES (USER_STACK_SIZE / 4)
+
+void free_kernel_array(char **k_array);
+
 static char **copy_user_array(const char **u_array) {
   if (!u_array)
     return NULL;
@@ -174,52 +185,71 @@ static char **copy_user_array(const char **u_array) {
       (!allow_kernel_ptrs && (u64)u_array >= USER_SPACE_LIMIT))
     return ERR_PTR(-EFAULT);
 
-  char **k_array = kmalloc(sizeof(char *) * (MAX_EXEC_ARGS + 1));
-  if (!k_array)
-    return ERR_PTR(-ENOMEM);
-  memset(k_array, 0, sizeof(char *) * (MAX_EXEC_ARGS + 1));
+  usize cap = 32, count = 0, budget = EXEC_VECTOR_BYTES;
+  char **k_array = kzalloc(sizeof(char *) * (cap + 1));
+  char *tmp = kmalloc(EXEC_VECTOR_BYTES);
+  long err = 0;
+  if (!k_array || !tmp) {
+    err = -ENOMEM;
+    goto out;
+  }
 
-  for (int i = 0; i < MAX_EXEC_ARGS; i++) {
-    if (!allow_kernel_ptrs && (u64)&u_array[i] >= USER_SPACE_LIMIT)
-      goto fault;
+  for (;;) {
+    const u64 slot = (u64)(usize)&u_array[count];
+    if (!allow_kernel_ptrs && slot >= USER_SPACE_LIMIT) {
+      err = -EFAULT;
+      goto out;
+    }
     const char *u_str;
-    if (copy_from_user(&u_str, &u_array[i], sizeof(char *)) < 0)
-      goto fault;
-
-    if (u_str == NULL) {
-      k_array[i] = NULL;
+    if (copy_from_user(&u_str, &u_array[count], sizeof(char *)) < 0) {
+      err = -EFAULT;
+      goto out;
+    }
+    if (u_str == NULL)
       break;
-    }
-
     if (!is_canonical((u64)u_str) ||
-        (!allow_kernel_ptrs && (u64)u_str >= USER_SPACE_LIMIT))
-      goto fault;
-
-    char tmp[MAX_EXEC_ARG_LEN];
-    if (syscall_copyinstr(tmp, MAX_EXEC_ARG_LEN, u_str) < 0)
-      goto fault;
-
-    usize len = strlen(tmp);
-    char *k_str = kmalloc(len + 1);
-    if (!k_str) {
-      for (int j = 0; j < i; j++)
-        kfree(k_array[j]);
-      kfree(k_array);
-      return ERR_PTR(-ENOMEM);
+        (!allow_kernel_ptrs && (u64)u_str >= USER_SPACE_LIMIT)) {
+      err = -EFAULT;
+      goto out;
     }
-    memcpy(k_str, tmp, len + 1);
-    k_array[i] = k_str;
+    int rc = syscall_copyinstr(tmp, budget, u_str);
+    if (rc == -ENAMETOOLONG) {
+      err = -E2BIG;
+      goto out;
+    }
+    if (rc < 0) {
+      err = -EFAULT;
+      goto out;
+    }
+    usize len = strlen(tmp);
+    budget -= len + 1;
+    if (count == cap) {
+      char **grown = kzalloc(sizeof(char *) * (cap * 2 + 1));
+      if (!grown) {
+        err = -ENOMEM;
+        goto out;
+      }
+      memcpy(grown, k_array, sizeof(char *) * cap);
+      kfree(k_array);
+      k_array = grown;
+      cap *= 2;
+    }
+    k_array[count] = kmalloc(len + 1);
+    if (!k_array[count]) {
+      err = -ENOMEM;
+      goto out;
+    }
+    memcpy(k_array[count], tmp, len + 1);
+    count++;
   }
 
+out:
+  kfree(tmp);
+  if (err) {
+    free_kernel_array(k_array);
+    return ERR_PTR(err);
+  }
   return k_array;
-
-fault:
-  for (int j = 0; j < MAX_EXEC_ARGS; j++) {
-    if (k_array[j])
-      kfree(k_array[j]);
-  }
-  kfree(k_array);
-  return ERR_PTR(-EFAULT);
 }
 
 void free_kernel_array(char **k_array) {
@@ -1250,16 +1280,32 @@ static u64 sys_ioctl(int fd, u64 request, void *arg) {
    * request code and the descriptor are the whole question, and neither the
    * errno trace nor the VT layer's own trace could answer it once the refusal
    * came from somewhere other than the VT. `b1nix.trace-ioctl`. */
-  if (rc == -ENOTTY && bootinfo_has_flag("b1nix.trace-ioctl")) {
-    console_write("ioctl: ENOTTY req=0x");
-    console_write_hex64(request);
-    console_write(" fd=");
-    console_write_dec((u64)(u32)fd);
-    if (current_task) {
-      console_write(" by ");
-      console_write(current_task->name);
+  /* Which request on which descriptor, and what the descriptor IS.
+   *
+   * "errno 25 from syscall 16" names ioctl and no more; "fd 9" names nothing
+   * either once the descriptor was inherited. The kind (enum vfs_handle_kind)
+   * is what says which handler answered. The first 32 calls of each program
+   * name, refused or not: an event loop that retries a refused FIONREAD asks
+   * a hundred thousand times a second, and the interesting program starts
+   * after a hundred that are not. `b1nix.trace-ioctl`. */
+  if (bootinfo_has_flag("b1nix.trace-ioctl")) {
+    static char seen_name[16][16];
+    static unsigned seen_count[16];
+    const char *nm = current_task && current_task->name ? current_task->name : "?";
+    int slot = -1;
+    for (int k = 0; k < 16; k++) {
+      if (seen_name[k][0] && strncmp(seen_name[k], nm, 15) == 0) { slot = k; break; }
+      if (!seen_name[k][0]) { strncpy(seen_name[k], nm, 15); slot = k; break; }
     }
-    console_write("\n");
+    if (slot >= 0 && seen_count[slot] < 32) {
+      seen_count[slot]++;
+      struct vfs_handle *h = scheduler_fd_get(fd);
+      char line[192];
+      snprintf(line, sizeof(line), "ioctl: req=0x%lx fd=%d kind=%d node=%s rc=%d by %s\n",
+               (unsigned long)request, fd, h ? (int)h->kind : -1,
+               h && h->node ? h->node->name : "-", rc, nm);
+      console_write(line);
+    }
   }
   return (u64)rc;
 }
@@ -2880,10 +2926,8 @@ static void fill_b1nix_utsname(struct b1nix_utsname *uts) {
   copy_cstr(uts->version, sizeof(uts->version), "#1 SMP");
 #if defined(__aarch64__)
   copy_cstr(uts->machine, sizeof(uts->machine), "aarch64");
-#elif defined(__x86_64__)
-  copy_cstr(uts->machine, sizeof(uts->machine), "x86_64");
 #else
-  copy_cstr(uts->machine, sizeof(uts->machine), "i686");
+  copy_cstr(uts->machine, sizeof(uts->machine), "x86_64");
 #endif
 }
 
@@ -3430,7 +3474,7 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
   }
 
   u64 tick_ns = 1000000000ull / (u64)sched_tick_hz();
-  u64 deadline_ns = infinite ? 0 : arch_tsc_monotonic_ns() + timeout_ns;
+  u64 deadline_ns = infinite ? 0 : ktime_monotonic_ns() + timeout_ns;
 
   extern void *vfs_poll_chan;
 
@@ -3463,13 +3507,43 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
 
     int timed_out = 0;
     if (ready == 0 && !infinite && timeout_ns != 0 &&
-        arch_tsc_monotonic_ns() >= deadline_ns)
+        ktime_monotonic_ns() >= deadline_ns)
       timed_out = 1;
 
     if (ready > 0 || (!infinite && timeout_ns == 0) || timed_out) {
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
       syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
+      /* What poll answered, and about what kind of descriptor: an event
+       * loop that is told "readable" about something it then cannot read
+       * asks again at once, and the syscall trace shows only the pollfd
+       * pointer. First 32 answers per program name. `b1nix.trace-poll`. */
+      if (ready > 0 && bootinfo_has_flag("b1nix.trace-poll")) {
+        static char seen_name[16][16];
+        static unsigned seen_count[16];
+        const char *nm = current_task->name ? current_task->name : "?";
+        int slot = -1;
+        for (int k = 0; k < 16; k++) {
+          if (seen_name[k][0] && strncmp(seen_name[k], nm, 15) == 0) { slot = k; break; }
+          if (!seen_name[k][0]) { strncpy(seen_name[k], nm, 15); slot = k; break; }
+        }
+        if (slot >= 0 && seen_count[slot] < 32) {
+          seen_count[slot]++;
+          char line[256];
+          usize pos = (usize)snprintf(line, sizeof(line), "poll: %s nfds=%lu ready=%d:",
+                                      nm, (unsigned long)nfds, ready);
+          for (u64 i = 0; i < nfds && pos < sizeof(line) - 40; i++) {
+            if (!fds[i].revents)
+              continue;
+            struct vfs_handle *h = scheduler_fd_get(fds[i].fd);
+            pos += (usize)snprintf(line + pos, sizeof(line) - pos, " fd%d/k%d ev=%x re=%x",
+                                   fds[i].fd, h ? (int)h->kind : -1,
+                                   (unsigned)fds[i].events, (unsigned)fds[i].revents);
+          }
+          snprintf(line + pos, sizeof(line) - pos, "\n");
+          console_write(line);
+        }
+      }
       kfree(heap_fds);
       return (u64)ready;
     }
@@ -3493,7 +3567,7 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
      * seconds until unrelated traffic kicked the chan (netd's reactor wedge,
      * every socket() timing out with ETIMEDOUT meanwhile). */
     if (!infinite && timeout_ns != 0) {
-      u64 now_ns = arch_tsc_monotonic_ns();
+      u64 now_ns = ktime_monotonic_ns();
       u64 rest_ns = deadline_ns > now_ns ? deadline_ns - now_ns : 0;
       u64 ticks = (rest_ns + tick_ns - 1) / tick_ns;
       if (ticks == 0)
@@ -4348,7 +4422,7 @@ static u64 syscall_sleep_timespec(const struct timespec *ts, u64 *ticks_asked) {
   u64 tick_ns = 1000000000ULL / (u64)sched_tick_hz();
   u64 total_ns = (u64)ts->tv_sec * 1000000000ULL + (u64)ts->tv_nsec;
   u64 start_ticks = scheduler_get_uptime_ticks();
-  u64 deadline_ns = arch_tsc_monotonic_ns() + total_ns;
+  u64 deadline_ns = ktime_monotonic_ns() + total_ns;
   u64 asked_ticks = (total_ns + tick_ns - 1) / tick_ns;
   /* A sleep is bounded by BOTH clocks, and by whichever says "enough" first.
    *
@@ -4386,7 +4460,7 @@ static u64 syscall_sleep_timespec(const struct timespec *ts, u64 *ticks_asked) {
    * programs — is spun. Whether re-entry is allowed at all is the scheduler's
    * answer, not ours: see scheduler_sleep_ticks_state. */
   for (;;) {
-    u64 now_ns = arch_tsc_monotonic_ns();
+    u64 now_ns = ktime_monotonic_ns();
     if (now_ns >= deadline_ns)
       break;
     if (scheduler_get_uptime_ticks() >= tick_deadline)
@@ -4395,8 +4469,14 @@ static u64 syscall_sleep_timespec(const struct timespec *ts, u64 *ticks_asked) {
       break;
     u64 rest_ticks = (deadline_ns - now_ns) / tick_ns;
     if (!rest_ticks) {
-      scheduler_yield();
-      continue;
+      /* Spin a millisecond at most. At 1 kHz that is every tail; at a slower
+       * tick a sub-tick sleep spun whole -- usleep(2000) at 100 Hz was 2 ms of
+       * CPU -- so a longer tail sleeps one tick instead: late, never early. */
+      if (deadline_ns - now_ns <= 1000000ULL) {
+        scheduler_yield();
+        continue;
+      }
+      rest_ticks = 1;
     }
     /* Ask the scheduler to sleep and let IT decide whether this task may:
      * reading our own state here and calling on the answer is a race, because
@@ -4488,7 +4568,7 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
         if (n > FIXED_BATCH)
           n = FIXED_BATCH;
         usize nframes = vmm_unmap_range_collect(v, n, frames);
-        tlb_shootdown_all();
+        tlb_shootdown_current_mm();
         for (usize k = 0; k < nframes; k++)
           pmm_free_frame(frames[k]);
         v += (u64)n * PAGE_SIZE;
@@ -4831,6 +4911,43 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
 
 
 
+/* Carry the hardware dirty bits of MAP_SHARED file mappings in [start, end)
+ * over to the page cache before those translations go away.
+ *
+ * A store through such a mapping sets only the PTE's dirty bit. The cache
+ * entry is marked dirty once, when the page is first faulted in -- before any
+ * byte is written -- so a writeback that runs while the mapping is still being
+ * filled cleans it, and every later store is invisible to sync. Linux moves
+ * the PTE bit onto the page when it unmaps; without that, ld.lld's output
+ * (created, ftruncate'd, filled through a shared mapping, unmapped) reached the
+ * disk as zeros while the running system read it back correctly from cache. */
+void vma_harvest_shared_dirty(struct task *t, u64 start, u64 end) {
+  extern int paging_test_and_clear_dirty(u64 pml4_phys, u64 vaddr);
+  if (!t)
+    return;
+  for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
+    if (vma->end <= start || vma->start >= end)
+      continue;
+    if (!(vma->flags & MAP_SHARED) || !(vma->prot & PROT_WRITE))
+      continue;
+    if (!vma->node || !vma->node->inode || vma->node->inode->type != VFS_FILE)
+      continue;
+    struct vfs_inode *inode = vma->node->inode;
+    u64 lo = vma->start > start ? vma->start : start;
+    u64 hi = vma->end < end ? vma->end : end;
+    for (u64 v = lo; v < hi; v += PAGE_SIZE) {
+      if (!paging_test_and_clear_dirty(t->pml4_phys, v))
+        continue;
+      u64 file_page = ((u64)vma->offset + (v - vma->start)) & ~(u64)(PAGE_SIZE - 1);
+      struct page_cache_entry *page = page_cache_get_page(inode, file_page);
+      if (page) {
+        page_cache_mark_dirty(page);
+        page_cache_put_page(page);
+      }
+    }
+  }
+}
+
 static isize sys_munmap(void *addr, usize length) {
   u64 start = (u64)(usize)addr;
   if ((start & (PAGE_SIZE - 1)) != 0)
@@ -4849,6 +4966,8 @@ static isize sys_munmap(void *addr, usize length) {
   u64 end = start + ((length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
   if (end < start || end > 0x00007FFFFFFFFFFFULL)
     return -EINVAL;
+
+  vma_harvest_shared_dirty(t, start, end);
 
   /* Unmap in batches, one cross-CPU flush each.
    *
@@ -4895,7 +5014,7 @@ static isize sys_munmap(void *addr, usize length) {
       if (n > batch)
         n = batch;
       usize nframes = vmm_unmap_range_collect(v, n, frames);
-      tlb_shootdown_all();
+      tlb_shootdown_current_mm();
       for (usize i = 0; i < nframes; i++)
         pmm_free_frame(frames[i]);
       v += (u64)n * PAGE_SIZE;
@@ -5346,7 +5465,7 @@ static isize sys_madvise(void *addr, usize length, int advice) {
       if (n > MADV_BATCH)
         n = MADV_BATCH;
       usize nframes = vmm_unmap_range_collect(v, n, frames);
-      tlb_shootdown_all();
+      tlb_shootdown_current_mm();
       for (usize i = 0; i < nframes; i++)
         pmm_free_frame(frames[i]);
       /* Re-arm each page as lazy so the next touch refaults to a fresh zeroed
@@ -5774,11 +5893,65 @@ static u32 slowcall_ms(void) {
   return ms;
 }
 
+/* The same totals by (task name, call number): the per-number table said
+ * poll(2) was made two million times while a desktop started and could not
+ * say by whom. Keyed by the name's characters, not the task pointer, so a
+ * program's threads and its re-executions add up under one line. 4096 rows:
+ * a boot runs a few hundred distinct programs and each brings a dozen call
+ * numbers, and with 256 rows the table was full before the desktop's own
+ * processes existed (7.7 million calls dropped). */
+#define SYSPROF_PAIRS 4096
+struct sysprof_pair {
+  char name[16];
+  u32 nr;
+  u32 used;
+  u64 count;
+  u64 cycles;
+};
+static struct sysprof_pair g_sysprof_pair[SYSPROF_PAIRS];
+static u64 g_sysprof_pair_dropped;
+
+static void syscall_prof_account_task(u32 nr, u64 cycles) {
+  const char *nm = current_task && current_task->name ? current_task->name : "?";
+  char key[16];
+  u64 h = 1469598103934665603ull ^ nr;
+  usize n = 0;
+  for (; n < sizeof(key) - 1 && nm[n]; n++) {
+    key[n] = nm[n];
+    h = (h ^ (u8)nm[n]) * 1099511628211ull;
+  }
+  key[n] = 0;
+  for (u32 probe = 0; probe < 8; probe++) {
+    struct sysprof_pair *e = &g_sysprof_pair[(u32)(h >> 40) + probe & (SYSPROF_PAIRS - 1)];
+    u32 used = __atomic_load_n(&e->used, __ATOMIC_ACQUIRE);
+    if (!used) {
+      u32 expect = 0;
+      /* Claim, then fill; a reader that sees used==2 sees the name. */
+      if (__atomic_compare_exchange_n(&e->used, &expect, 1, 0,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        memcpy(e->name, key, sizeof(key));
+        e->nr = nr;
+        __atomic_store_n(&e->used, 2, __ATOMIC_RELEASE);
+        used = 2;
+      } else {
+        continue;
+      }
+    }
+    if (used == 2 && e->nr == nr && strcmp(e->name, key) == 0) {
+      __atomic_fetch_add(&e->count, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&e->cycles, cycles, __ATOMIC_RELAXED);
+      return;
+    }
+  }
+  __atomic_fetch_add(&g_sysprof_pair_dropped, 1, __ATOMIC_RELAXED);
+}
+
 static void syscall_prof_account(u32 nr, u64 cycles) {
   if (nr >= SYSPROF_SLOTS)
     return;
   __atomic_fetch_add(&g_sysprof_count[nr], 1, __ATOMIC_RELAXED);
   __atomic_fetch_add(&g_sysprof_cycles[nr], cycles, __ATOMIC_RELAXED);
+  syscall_prof_account_task(nr, cycles);
 }
 
 /* The ten call numbers that have cost the most, newest totals each time. A
@@ -5795,8 +5968,13 @@ void syscall_prof_reset(void) {
 void syscall_prof_dump(void) {
   if (!syscall_prof_enabled())
     return;
-  console_write("sysprof (nr count Mcycles):");
-  for (int rank = 0; rank < 12; rank++) {
+  /* Each line is built whole and written once: the console lock covers one
+   * console_write, and a line assembled from thirty of them came out with
+   * another CPU's message in the middle. */
+  char line[640];
+  usize pos = 0;
+  pos += (usize)snprintf(line + pos, sizeof(line) - pos, "sysprof (nr count Mcycles):");
+  for (int rank = 0; rank < 12 && pos < sizeof(line) - 48; rank++) {
     u32 best = 0;
     u64 bestc = 0;
 
@@ -5810,18 +5988,43 @@ void syscall_prof_dump(void) {
     }
     if (!bestc)
       break;
-    console_write(" ");
-    console_write_dec(best);
-    console_write(":");
-    console_write_dec(__atomic_load_n(&g_sysprof_count[best], __ATOMIC_RELAXED));
-    console_write(":");
-    console_write_dec(bestc / 1000000);
+    pos += (usize)snprintf(line + pos, sizeof(line) - pos, " %u:%lu:%lu", best,
+                           (unsigned long)(__atomic_load_n(&g_sysprof_count[best], __ATOMIC_RELAXED) & ~(1ull << 63)),
+                           (unsigned long)(bestc / 1000000));
     /* Mark it consumed for this pass, then restore below. */
     __atomic_fetch_or(&g_sysprof_count[best], 1ull << 63, __ATOMIC_RELAXED);
   }
   for (u32 n = 0; n < SYSPROF_SLOTS; n++)
     __atomic_fetch_and(&g_sysprof_count[n], ~(1ull << 63), __ATOMIC_RELAXED);
-  console_write("\n");
+  snprintf(line + pos, sizeof(line) - pos, "\n");
+  console_write(line);
+
+  pos = 0;
+  pos += (usize)snprintf(line + pos, sizeof(line) - pos, "sysprof by task (name/nr count Mcycles):");
+  u64 floor = ~0ull;
+  for (int rank = 0; rank < 12 && pos < sizeof(line) - 64; rank++) {
+    struct sysprof_pair *best = 0;
+    u64 bestc = 0;
+    for (u32 i = 0; i < SYSPROF_PAIRS; i++) {
+      struct sysprof_pair *e = &g_sysprof_pair[i];
+      u64 c = __atomic_load_n(&e->count, __ATOMIC_RELAXED);
+      if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) == 2 && c < floor && c > bestc) {
+        bestc = c;
+        best = e;
+      }
+    }
+    if (!best)
+      break;
+    floor = bestc;
+    pos += (usize)snprintf(line + pos, sizeof(line) - pos, " %s/%u:%lu:%lu", best->name, best->nr,
+                           (unsigned long)bestc,
+                           (unsigned long)(__atomic_load_n(&best->cycles, __ATOMIC_RELAXED) / 1000000));
+  }
+  if (g_sysprof_pair_dropped)
+    pos += (usize)snprintf(line + pos, sizeof(line) - pos, " dropped=%lu",
+                           (unsigned long)g_sysprof_pair_dropped);
+  snprintf(line + pos, sizeof(line) - pos, "\n");
+  console_write(line);
 }
 
 struct syscall_flight_entry {
@@ -7669,7 +7872,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
          * shared block above. */
         case LX_fchmodat2:
         case LX_fchmodat:
-          klog_info("audit: chmod called");
+          klog_debug("audit: chmod called");
           return (u64)vfs_chmod(resolved, (u16)arg2);
         case LX_fchownat:
           return (u64)vfs_chown(resolved, (u16)arg2, (u16)arg3);
@@ -9653,7 +9856,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* ioctl request codes are 32-bit; _IOR codes with the top bit set (e.g.
      * TIOCGPTN=0x80045430) arrive sign-extended through musl's `int request`.
      * Truncate so handlers' `case 0x80045430:` labels match. */
-    return (u64)vfs_ioctl((int)arg0, (u32)arg1, (void *)(usize)arg2);
+    /* Through sys_ioctl, not straight to the VFS: that is where the ioctl
+     * trace lives, and going around it meant no musl program's ioctl was
+     * ever traced -- the flag answered only the built-in programs. */
+    return sys_ioctl((int)arg0, (u32)arg1, (void *)(usize)arg2);
   case SYS_FCNTL:
     return (u64)sys_fcntl((int)arg0, (int)arg1, arg2);
   case SYS_DUP2:
@@ -9722,7 +9928,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_UMASK:
     return (u64)sys_umask((u16)arg0);
   case SYS_CHMOD:
-    klog_info("audit: chmod called");
+    klog_debug("audit: chmod called");
     return (u64)sys_chmod((const char *)(usize)arg0, (u16)arg1);
   case SYS_FCHMOD:
     return (u64)sys_fchmod((int)arg0, (u16)arg1);
@@ -9760,7 +9966,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)done;
   }
   case SYS_CHOWN:
-    klog_info("audit: chown called");
+    klog_debug("audit: chown called");
     return (u64)sys_chown((const char *)(usize)arg0, (u16)arg1, (u16)arg2);
   case SYS_FCHOWN:
     return (u64)sys_fchown((int)arg0, (u16)arg1, (u16)arg2);
@@ -10970,8 +11176,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)copied;
   case SYS_SYSINFO: {
     /* Linux struct sysinfo (sysinfo(2)). Mirror byte-for-byte the userspace
-     * <sys/sysinfo.h>: native `unsigned long` on both sides (32-bit i686 /
-     * 64-bit x86_64). b1nix has no per-buffer-cache accounting or swap-size
+     * <sys/sysinfo.h>: native 64-bit `unsigned long` on both sides. b1nix has no per-buffer-cache accounting or swap-size
      * API, so bufferram/sharedram/swap are 0; mem_unit stays 1 (bytes) so
      * BusyBox free does no scaling. */
     struct k_sysinfo {

@@ -1,6 +1,6 @@
 # Libraries allowed to carry an unresolved symbol in the rootfs.
 #
-# tools/check-rootfs-links.sh fails the build when a binary cannot load: a
+# tools/check/check-rootfs-links.sh fails the build when a binary cannot load: a
 # missing library, or a symbol nothing in its closure defines. That is the right
 # default -- the alternative is finding out inside the guest, where the only
 # evidence is a program that exits without a message.

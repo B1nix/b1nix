@@ -3,7 +3,7 @@
 Two different things live here, and telling them apart matters.
 
 **This kernel's own interfaces** — `b1nix/`, `syscall.h`, `sys/syscall.h`,
-`mojo/`, `linux/soundcard.h`, `tui.h`. These describe ioctls, structures and
+`mojo/`, `linux/soundcard.h`. These describe ioctls, structures and
 syscall numbers that exist only on b1nix, the way Linux's `uapi` headers
 describe Linux's. Nothing outside this tree can supply them.
 

@@ -1,6 +1,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/fb_console.h>
+#include <b1nix/klog.h>
 #include <b1nix/fb_panel.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
@@ -45,6 +46,9 @@ static inline void put_pixel(u32 x, u32 y, u32 color)
  * framebuffer is the scanout; on one whose display is a device, this is what
  * makes the characters appear. */
 static u32 dirty_x0, dirty_y0, dirty_x1, dirty_y1;
+/* Set by fb_console_attach(): a display that has to be told what changed
+ * (a DRM framebuffer) instead of one that is memory on a screen. */
+static void (*fb_present_hook)(unsigned x, unsigned y, unsigned w, unsigned h);
 
 static void fb_present_rect(u32 x, u32 y, u32 w, u32 h)
 {
@@ -68,10 +72,134 @@ void fb_console_flush(void)
 {
 	if (!fb_ptr || dirty_x1 == 0)
 		return;
-	fb_panel_present((const void *)fb_ptr, fb.pitch, fb.width, fb.height,
-	                 dirty_x0, dirty_y0, dirty_x1 - dirty_x0,
-	                 dirty_y1 - dirty_y0);
+	if (fb_present_hook)
+		fb_present_hook(dirty_x0, dirty_y0, dirty_x1 - dirty_x0,
+		                dirty_y1 - dirty_y0);
+	else
+		fb_panel_present((const void *)fb_ptr, fb.pitch, fb.width, fb.height,
+		                 dirty_x0, dirty_y0, dirty_x1 - dirty_x0,
+		                 dirty_y1 - dirty_y0);
 	dirty_x0 = dirty_y0 = dirty_x1 = dirty_y1 = 0;
+}
+
+/* Presenting is not for the console lock.
+ *
+ * console_write holds the console lock with interrupts off, and a display
+ * that has to be told what changed (a DRM framebuffer) is told through the
+ * driver, which takes mutexes and may sleep: presenting from there tripped
+ * "lkpi: cannot block" and wedged the machine the moment the console had
+ * moved onto i915. So a write only notes that there is something to show,
+ * and a thread with the right to sleep shows it, sixty times a second at
+ * most -- the same split fbcon makes between drawing and the deferred-io
+ * flush. Before the scheduler runs nothing presents, and nothing needs to:
+ * the bootloader's framebuffer is memory on a screen. */
+static volatile int fb_flush_wanted;
+static int fb_flusher_up;
+
+void fb_console_request_flush(void)
+{
+	if (!fb_present_hook) {
+		fb_console_flush(); /* memory on a screen: nothing to tell anyone */
+		return;
+	}
+	__atomic_store_n(&fb_flush_wanted, 1, __ATOMIC_RELEASE);
+}
+
+static void fb_console_flusher(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		scheduler_sleep_ticks(sched_tick_hz() / 60 ? sched_tick_hz() / 60 : 1);
+		if (__atomic_exchange_n(&fb_flush_wanted, 0, __ATOMIC_ACQ_REL))
+			fb_console_flush();
+	}
+}
+
+void fb_console_start_flusher(void)
+{
+	if (fb_flusher_up)
+		return;
+	fb_flusher_up = 1;
+	kthread_create("fbflush", fb_console_flusher, 0);
+}
+
+/* The log so far, redrawn onto a console that was hidden while a compositor
+ * had the display. Same replay fb_console_attach does for a display that
+ * arrived after boot. */
+void fb_console_replay(void)
+{
+	char *log;
+
+	if (!fb_ptr)
+		return;
+	cursor_x = 0;
+	cursor_y = fb_top;
+	fb_console_clear();
+	log = kmalloc(65536);
+	if (log) {
+		usize n = klog_read(log, 65536);
+		for (usize i = 0; i < n; i++)
+			fb_console_putchar(log[i]);
+		kfree(log);
+	}
+	fb_console_request_flush();
+}
+
+/* Everything, for a display that just came back (a compositor exited). */
+void fb_console_present_all(void)
+{
+	if (!fb_ptr)
+		return;
+	fb_present_rect(0, 0, fb.width, fb.height);
+	fb_console_flush();
+}
+
+/* A display that arrived after boot: a DRM device's framebuffer, vmapped.
+ * One buffer, drawn in place; `present` tells the device which rectangle
+ * changed. The log so far is replayed onto it, so a screen that was black
+ * through the boot shows the boot. */
+void fb_console_attach(void *pixels, unsigned pitch, unsigned width,
+                       unsigned height, unsigned bpp,
+                       void (*present)(unsigned x, unsigned y, unsigned w, unsigned h))
+{
+	if (!pixels || !width || !height)
+		return;
+	fb.address = (u64)(usize)pixels;
+	fb.pitch = pitch;
+	fb.width = width;
+	fb.height = height;
+	fb.bpp = bpp;
+	fb_ptr = (volatile u8 *)pixels;
+	/* Draw in RAM, copy to the device. The pixels handed over here are an
+	 * aperture mapping on a real GPU -- write-combined, and reading it back
+	 * is uncached: a scroll that reads the screen through it moved eight
+	 * megabytes per line and took the boot from 2.6 s to 18 s. The shadow
+	 * is ordinary memory; fb_flush_rect copies what changed. */
+	fb_shadow_size = (usize)pitch * height;
+	fb_shadow_frames = (fb_shadow_size + PAGE_SIZE - 1) / PAGE_SIZE;
+	{
+		u64 phys = pmm_alloc_frames(fb_shadow_frames);
+		fb_shadow = phys ? (u8 *)(usize)(vmm_direct_map_base() + phys) : (u8 *)pixels;
+		if (!phys)
+			fb_shadow_frames = 0;
+	}
+	fb_present_hook = present;
+	fb_top = 0;
+	cursor_x = 0;
+	cursor_y = 0;
+	memset(fb_shadow, 0, fb_shadow_size);
+	if ((const volatile u8 *)fb_shadow != fb_ptr)
+		memset(pixels, 0, fb_shadow_size);
+	fb_present_rect(0, 0, width, height);
+	/* The transcript so far. */
+	char *log = kmalloc(65536);
+	if (log) {
+		usize n = klog_read(log, 65536);
+		for (usize i = 0; i < n; i++)
+			fb_console_putchar(log[i]);
+		kfree(log);
+	}
+	fb_console_request_flush();
 }
 
 static void fb_flush_rect(u32 x, u32 y, u32 w, u32 h)
@@ -192,7 +320,7 @@ void fb_console_clear(void)
 		}
 	}
 	fb_present_rect(0, 0, fb.width, fb.height);
-	fb_console_flush();
+	fb_console_request_flush();
 }
 
 /* Each font pixel becomes this many screen pixels. One is right for a monitor;
@@ -305,34 +433,47 @@ static void fb_draw_char(char c, u32 x, u32 y)
     }
 }
 
-static void fb_console_scroll(void)
+/*
+ * No scrolling: at the bottom the screen starts again from the top.
+ *
+ * Scrolling moved the whole screen down in the shadow and then copied the
+ * whole screen out to the device -- about eight megabytes on a 1280x800
+ * panel -- and it did that from console_write, with interrupts off and the
+ * console lock held. One scroll per printed line made it the single largest
+ * interrupts-off cost in the kernel: 28 G cycles over 3832 lines of a
+ * desktop start-up, 87% of all the time this kernel spent with interrupts
+ * disabled. Batching the scroll into groups of lines cut that by two thirds
+ * and it was still the top entry.
+ *
+ * A kernel console is not a terminal with scrollback -- the whole log is in
+ * the ring and on the serial line -- so the cheap answer is to stop moving
+ * pixels at all: clear and continue from the top, one screen-sized fill per
+ * screenful of text instead of a copy per line.
+ */
+static void fb_console_wrap(void)
 {
-    u32 line_height = FB_CELL_H;
-    if (fb.height < line_height) return;
-
     u32 bytes_per_line = fb.pitch;
-    if (fb.height < fb_top + line_height) return;
-    u32 scroll_height = fb.height - line_height - fb_top;
+    u32 rows;
+
+    if (fb.height < fb_top + FB_CELL_H)
+        return;
+    rows = fb.height - fb_top;
 
     if (fb_shadow) {
         u8 *dst = fb_shadow + ((u64)fb_top * bytes_per_line);
-        u8 *src = dst + (line_height * bytes_per_line);
-        memmove(dst, src, scroll_height * bytes_per_line);
-
-        u8 *tail = dst + scroll_height * bytes_per_line;
         u64 bg64 = ((u64)bg_color << 32) | bg_color;
-        u64 *tail64 = (u64 *)(void *)tail;
-        u32 words = (line_height * bytes_per_line) / 8;
-        for (u32 i = 0; i < words; i++) tail64[i] = bg64;
-        fb_flush_rect(0, fb_top, fb.width, fb.height - fb_top);
-        fb_present_rect(0, fb_top, fb.width, fb.height - fb_top);
-    } else {
-        /* Safety fallback: avoid MMIO readback scrolling when no RAM shadow exists. */
-        fb_console_clear();
-        return;
-    }
+        u64 *w = (u64 *)(void *)dst;
+        u64 words = ((u64)rows * bytes_per_line) / 8;
 
-    cursor_y -= line_height;
+        for (u64 i = 0; i < words; i++)
+            w[i] = bg64;
+        fb_flush_rect(0, fb_top, fb.width, rows);
+        fb_present_rect(0, fb_top, fb.width, rows);
+    } else {
+        fb_console_clear();
+    }
+    cursor_x = 0;
+    cursor_y = fb_top;
 }
 
 static int cursor_visible = 0;
@@ -379,12 +520,33 @@ void fb_console_blink_cursor(void)
         }
     }
     fb_present_rect(cursor_x, y_base, 8 * FONT_SCALE, FONT_SCALE);
-    fb_console_flush();
+    fb_console_request_flush(); /* from the tick: never present here */
+}
+
+/*
+ * Nobody is looking: a compositor owns the display.
+ *
+ * The text console kept drawing every character and scrolling the whole
+ * screen while a desktop was on the panel -- work that costs about a
+ * megabyte of copying per line, under the console lock with interrupts off,
+ * for pixels no one can see. The log still reaches the serial line and the
+ * ring; only the drawing stops, and the ring is replayed when the display
+ * comes back.
+ */
+static int fb_console_hidden;
+
+void fb_console_set_hidden(int hidden)
+{
+    if (fb_console_hidden == !!hidden)
+        return;
+    fb_console_hidden = !!hidden;
+    if (!fb_console_hidden)
+        fb_console_replay();
 }
 
 void fb_console_putchar(char c)
 {
-    if (!fb_ptr || fb_dev_claimed()) return;
+    if (!fb_ptr || fb_dev_claimed() || fb_console_hidden) return;
 
     if (ansi_state == 1) {
         if (c == '[') {
@@ -467,9 +629,8 @@ void fb_console_putchar(char c)
         }
     }
 
-    while (cursor_y + FB_CELL_H > fb.height) {
-        fb_console_scroll();
-    }
+    if (cursor_y + FB_CELL_H > fb.height)
+        fb_console_wrap();
 }
 
 void fb_console_write(const char *str)

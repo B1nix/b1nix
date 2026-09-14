@@ -14,7 +14,10 @@
  *  - No interrupt-driven completion; the DMA position register is polled.
  *  - One concurrent output stream; /dev/dsp serialises writes via a spin flag.
  */
+#include <stdio.h>
+#include <stdlib.h>
 #include <b1nix/console.h>
+#include <b1nix/ktime.h>
 #include <b1nix/sound.h>
 #include <b1nix/pci.h>
 #include <b1nix/mm.h>
@@ -41,6 +44,18 @@
 #define HDA_CORBUBASE 0x0044
 #define HDA_CORBWP    0x0048
 #define HDA_CORBRP    0x004A
+#define HDA_CORBSIZE  0x004E  /* CORB Size (entries: 0=2, 1=16, 2=256)     */
+#define HDA_RINTCNT   0x005A  /* Response Interrupt Count                  */
+#define HDA_RIRBSTS   0x005D  /* RIRB Status: bit 0 RINTFL, bit 2 overrun  */
+/* The immediate command interface: one verb at a time, no ring and no DMA.
+ * Every Intel controller implements it — it is what firmware uses before it
+ * has memory to put a ring in. */
+#define HDA_ICOI      0x0060  /* Immediate Command Output                  */
+#define HDA_ICII      0x0064  /* Immediate Command Input (response)        */
+#define HDA_ICIS      0x0068  /* Immediate Command Status                  */
+#define HDA_ICIS_BUSY (1u << 0)
+#define HDA_ICIS_VALID (1u << 1)
+#define HDA_RIRBSIZE  0x005E  /* RIRB Size, same encoding                  */
 #define HDA_CORBCTL   0x004C
 
 /* RIRB (Response Input Ring Buffer) */
@@ -51,13 +66,24 @@
 #define HDA_RIRBSTS   0x005D
 
 /* Stream descriptors — Output (SDO) start at 0x0800, 0x20 bytes apart */
-#define HDA_SDO_BASE  0x0800
+/*
+ * Stream descriptors start at 0x80 and are 0x20 bytes apart, input streams
+ * first. The first OUTPUT descriptor is therefore 0x80 + ISS * 0x20, and ISS
+ * comes from GCAP — which is why this is computed at probe rather than being a
+ * constant. It used to be 0x800, past the end of the register file: every
+ * write to a stream descriptor went nowhere, the position register read zero
+ * for ever, and the driver reported a tone it had never played.
+ */
+#define HDA_SD_FIRST  0x0080
 #define HDA_SDO_STRIDE 0x020
+#define HDA_SDO_BASE  (hda_sdo_base)
 
 /* SDO register offsets within a stream descriptor */
 #define HDA_SDO_CTL0   0x00  /* Control (bits: stall, stream tag, format) */
 #define HDA_SDO_CTL1   0x01  /* Control 1 (channel count, etc.)           */
 #define HDA_SDO_CTL2   0x02  /* Control 2 (stripe, etc.)                  */
+#define HDA_SDO_STS    0x03  /* Status: bit 2 BCIS, 3 FIFOE, 4 DESE (W1C)  */
+#define HDA_SDO_STS_BCIS (1u << 2)
 #define HDA_SDO_LPIB   0x04  /* Link Position in Buffer (RO)              */
 #define HDA_SDO_CBL    0x08  /* Circular Buffer Length (bytes)             */
 #define HDA_SDO_LVI    0x0C  /* Last Valid Index                          */
@@ -72,12 +98,19 @@
 #define HDA_GCTL_SSYNC (1u << 2)  /* Synchronous Reset */
 
 /* CORBCTL bits */
-#define HDA_CORBCTL_DMAEN (1u << 0)  /* CORB DMA Enable */
+/* CORBCTL bit 0 is the memory-error interrupt enable; the engine's own run
+ * bit is bit 1. Enabling bit 0 and calling it DMAEN left the CORB engine
+ * stopped: the write pointer advanced, the read pointer never moved, and no
+ * verb was ever fetched — which is why no codec answered on any machine. */
+#define HDA_CORBCTL_MEIE  (1u << 0)  /* Memory Error Interrupt Enable */
+#define HDA_CORBCTL_DMAEN (1u << 1)  /* CORB DMA (RUN) */
 #define HDA_CORBCTL_CMEIE (1u << 1)  /* CMEI Interrupt Enable */
 
 /* RIRBCTL bits */
-#define HDA_RIRBCTL_DMAEN (1u << 0)  /* RIRB DMA Enable */
-#define HDA_RIRBCTL_RINTCTL (1u << 1) /* RINTCTL Interrupt Enable */
+/* RIRBCTL bit 0 is the response-interrupt enable, bit 1 the DMA run bit —
+ * the same layout, and the same trap. */
+#define HDA_RIRBCTL_RINTCTL (1u << 0) /* Response Interrupt Control */
+#define HDA_RIRBCTL_DMAEN (1u << 1)  /* RIRB DMA (RUN) */
 
 /* SDO CTL0 bits */
 #define HDA_SDO_CTL0_SRST  (1u << 0)  /* Stream Reset */
@@ -116,14 +149,25 @@ struct hda_bdle {
 /* QEMU hda-duplex codec amp range: 74 steps (0x4a), mute capable. */
 #define HDA_AMP_STEPS     74
 
-#define HDA_PARAM_AUDIO_FG_CAP   0xF00
-#define HDA_PARAM_NODE_COUNT      0xF04
-#define HDA_PARAM_NODE_LIST       0xF08
-#define HDA_PARAM_STREAM_FORMAT   0xF0A
-#define HDA_PARAM_PIN_CAP         0xF0D
-#define HDA_PARAM_GPIO_CAP        0xF11
-#define HDA_PARAM_SOLVER_CAP      0xF18
-#define HDA_PARAM_VENDOR_ID       0xF01
+/*
+ * Parameter indices for the Get Parameter verb.
+ *
+ * The verb itself is 0xF00 and the parameter is its PAYLOAD, so these are the
+ * small numbers from the specification's table and not 0xF0x. Writing the verb
+ * into the payload asks the codec for parameter 0xF01, which no codec has: it
+ * answered zero, the probe read that as "not responding", and no machine has
+ * ever found its codec.
+ */
+#define HDA_PARAM_VENDOR_ID       0x00
+#define HDA_PARAM_REVISION_ID     0x02
+#define HDA_PARAM_NODE_COUNT      0x04
+#define HDA_PARAM_AUDIO_FG_CAP    0x08
+#define HDA_PARAM_AUDIO_WIDGET_CAP 0x09
+#define HDA_PARAM_STREAM_FORMAT   0x0A
+#define HDA_PARAM_PIN_CAP         0x0C
+#define HDA_PARAM_GPIO_CAP        0x11
+#define HDA_PARAM_FG_TYPE         0x05
+#define HDA_FG_TYPE_AUDIO         0x01
 
 /* Widget types (from get-parameter node-type) */
 #define HDA_WIDGET_AUDIO_OUTPUT   0x0
@@ -137,6 +181,20 @@ struct hda_bdle {
 static volatile u8 *hda_regs;
 static int hda_inited;
 static u8 hda_codec_addr;    /* active codec address (0..15) */
+/* What was found, kept for the self-test to report: on emulated hardware and
+ * on a passed-through controller the driver takes the same path, and the
+ * numbers are the only thing that says which one it was talking to. */
+static u32 hda_sdo_base = HDA_SD_FIRST; /* first output stream descriptor */
+/* Set from b1nix.hda-no-ici: send every verb through the CORB/RIRB ring, so a
+ * run can prove the ring works instead of assuming it because nothing uses
+ * it. */
+static int hda_no_ici;
+static int hda_ring_dead;   /* the CORB/RIRB ring stopped answering; use ICI */
+static u16 hda_pci_vendor;
+static u16 hda_pci_device;
+static u32 hda_codec_vendor;
+static u8 hda_codec_count;
+static u8 hda_afg_nid;       /* the audio function group the widgets live in */
 static u8 hda_output_nid;    /* NID of the output converter widget */
 static u8 hda_pin_nid;       /* NID of the output pin complex */
 static u32 hda_sample_rate;  /* negotiated sample rate */
@@ -151,6 +209,10 @@ static u32 hda_dam_buf_sz;           /* size in bytes */
 /* M95 module parameter (writable): how long hda_selftest lets its test tone
  * run before it checks the stream. Declared here so the self-test can read it;
  * exported to /sys/module/hda/parameters at the bottom of this file. */
+/* Ten milliseconds is enough to prove the stream moves and short enough not to
+ * be heard on every boot. A run that WANTS to hear it — the one that captures
+ * what the emulator played and looks for the tone in it — asks for longer with
+ * b1nix.hda-tone-ms=N. */
 static int hda_tone_ms = 10;
 
 /* CORB / RIRB */
@@ -176,33 +238,48 @@ static inline u32 hda_wallclock(void) { return *(volatile u32 *)(hda_regs + HDA_
 
 static void hda_delay_ms(int ms) {
 	/* Against the calibrated clock, not against a guess at how long an I/O
-	 * port read takes.
+	 * port read takes: the kernel calibrates a nanosecond clock at boot, and a
+	 * delay should be expressed in the unit it asks for and measured with
+	 * that.
 	 *
-	 * The fallback here counted "about a microsecond per iteration", which is
-	 * a statement about a particular processor and a particular hypervisor and
-	 * about nothing else — on a faster machine the wait is short and the
-	 * hardware is not ready, on a slower one the boot is longer than it needs
-	 * to be. The kernel calibrates a nanosecond clock at boot; a delay should
-	 * be expressed in the unit it asks for and measured with that. */
-	u64 deadline = arch_tsc_monotonic_ns() + (u64)ms * 1000000ull;
+	 * The kernel's monotonic clock falls back to the tick when the TSC is not
+	 * trusted (no invariant TSC — every QEMU without `+invtsc`, and older
+	 * hardware). Before the tick runs it reads zero, and a bounded spin is
+	 * all there is then — generous, because a reset delay that is too long
+	 * costs milliseconds of boot and one that is too short costs the device.
+	 * The raw TSC clock was read here once and answered zero for ever on
+	 * such a machine, and the boot spun right after "hda: BAR0". */
+	u64 t0 = ktime_monotonic_ns();
 	u32 start = hda_wallclock();
+
+	if (t0 == 0) {
+		if (start == 0) {
+			for (volatile u64 i = 0; i < (u64)ms * 400000ull; i++)
+				cpu_relax();
+			return;
+		}
+		while ((u32)(hda_wallclock() - start) < (u32)ms)
+			scheduler_yield();
+		return;
+	}
+
+	u64 deadline = t0 + (u64)ms * 1000000ull;
 
 	if (start == 0) {
 		/* `pause`, not a port read: this is a spin hint, and an I/O-port
 		 * access is a VM exit under virtualisation -- paying one per
 		 * iteration to mark time is the cost this loop is trying to avoid. */
-		while (arch_tsc_monotonic_ns() < deadline)
+		while (ktime_monotonic_ns() < deadline)
 			cpu_relax(); /* not a bare `pause`: x86-only mnemonic */
 		return;
 	}
-	while (arch_tsc_monotonic_ns() < deadline) {
+	while (ktime_monotonic_ns() < deadline) {
 		u32 now = hda_wallclock();
 
 		if ((u32)(now - start) >= (u32)ms)
 			return;
 		scheduler_yield();
 	}
-	/* Timeout: proceed anyway */
 }
 
 /* ── MMIO helpers ────────────────────────────────────────────────────────── */
@@ -215,29 +292,94 @@ static inline void hda_w32(u32 off, u32 v) { *(volatile u32 *)(hda_regs + off) =
 
 /* ── CORB/RIRB transport ─────────────────────────────────────────────────── */
 
-/* Write a verb to the CORB ring. Returns 0 on success, -1 if CORB is full. */
+/*
+ * Write a verb to the CORB ring. Returns 0 on success, -1 if CORB is full.
+ *
+ * The write pointer names the LAST entry the controller may read, so the index
+ * is advanced first, the verb written there, and only then published. Writing
+ * at the current index and publishing it leaves read pointer equal to write
+ * pointer — an empty ring — so the very first verb of every boot was never
+ * fetched and no codec ever answered.
+ *
+ * CORBRP is a plain 8-bit index in bits 7:0 (bit 15 is its reset control), so
+ * it is masked, not shifted.
+ */
 static int hda_corb_write(u32 verb) {
-	u16 rp = (hda_r16(HDA_CORBRP) >> 1) & 0xFF;
-	u16 next = (hda_corb_wp + 1) & 0xFF;
+	u16 rp = hda_r16(HDA_CORBRP) & 0xFF;
+	u16 next = (u16)((hda_corb_wp + 1) & 0xFF);
+
 	if (next == rp) {
 		/* CORB full — poll briefly */
 		for (int i = 0; i < 100000; i++) {
-			rp = (hda_r16(HDA_CORBRP) >> 1) & 0xFF;
-			next = (hda_corb_wp + 1) & 0xFF;
-			if (next != rp) break;
+			rp = hda_r16(HDA_CORBRP) & 0xFF;
+			if (next != rp)
+				break;
 		}
 		if (next == rp)
 			return -1;
 	}
-	hda_corb[hda_corb_wp] = verb;
-	hda_w16(HDA_CORBWP, hda_corb_wp);
+	hda_corb[next] = verb;
 	hda_corb_wp = next;
+	hda_w16(HDA_CORBWP, hda_corb_wp);
 	return 0;
 }
 
 /* Send a verb and wait for the response. Returns the 32-bit response or 0
  * on timeout (~500 ms). */
+/*
+ * Send one verb through the immediate command interface and wait for the
+ * response.
+ *
+ * Returns 1 and fills *resp on success, 0 when the interface did not answer —
+ * which is how a controller that does not implement it is recognised, and the
+ * caller then uses the ring.
+ */
+static int hda_ici_send(u32 verb, u32 *resp)
+{
+	u16 sts;
+	int i;
+
+	/* Wait for any previous command to finish. */
+	for (i = 0; i < 1000; i++) {
+		if (!(hda_r16(HDA_ICIS) & HDA_ICIS_BUSY))
+			break;
+		cpu_relax();
+	}
+	if (hda_r16(HDA_ICIS) & HDA_ICIS_BUSY)
+		return 0;
+
+	/* Clear a stale result (the valid bit is write-1-to-clear), post the
+	 * verb, then set busy to start it. */
+	hda_w16(HDA_ICIS, HDA_ICIS_VALID);
+	hda_w32(HDA_ICOI, verb);
+	hda_w16(HDA_ICIS, HDA_ICIS_BUSY);
+
+	for (i = 0; i < 100000; i++) {
+		sts = hda_r16(HDA_ICIS);
+		if (!(sts & HDA_ICIS_BUSY) && (sts & HDA_ICIS_VALID)) {
+			*resp = hda_r32(HDA_ICII);
+			hda_w16(HDA_ICIS, HDA_ICIS_VALID);
+			return 1;
+		}
+		cpu_relax();
+	}
+	return 0;
+}
+
 static u32 hda_corb_send_wait(u32 verb) {
+	u32 resp = 0;
+
+	/* The ring is the normal path and the immediate interface the fallback,
+	 * the way Linux arranges it: a controller whose ring does not answer is
+	 * remembered and every later verb goes the short way, rather than each
+	 * one waiting the ring's timeout out first. b1nix.hda-no-ici disables
+	 * the fallback so a run proves the ring rather than merely having it. */
+	if (hda_ring_dead && !hda_no_ici) {
+		if (hda_ici_send(verb, &resp))
+			return resp;
+		return 0;
+	}
+
 	/* Record the current RIRB write pointer so we can detect the new entry. */
 	u16 old_wp = hda_r16(HDA_RIRBWP) & 0xFF;
 
@@ -267,7 +409,17 @@ static u32 hda_corb_send_wait(u32 verb) {
 	for (int i = 0; i < 20000; i++) {
 		u16 new_wp = hda_r16(HDA_RIRBWP) & 0xFF;
 		if (new_wp != old_wp) {
-			u32 resp = hda_rirb[new_wp & 0xFF];
+			/* A RIRB entry is TWO dwords — the response and its extended
+			 * word, which carries the codec address and whether the entry is
+			 * an unsolicited event. Indexing a u32 array by the write pointer
+			 * therefore reads the wrong half of the wrong entry: every verb
+			 * came back as zero, the probe concluded no codec was answering,
+			 * and the machine played nothing while reporting that it had. */
+			u32 resp = hda_rirb[(usize)(new_wp & 0xFF) * 2];
+
+			/* The response has been taken: clear RINTFL (and an overrun, if
+			 * one is flagged) so the engine goes on to the next verb. */
+			hda_w8(HDA_RIRBSTS, 0x05);
 			return resp;
 		}
 		/* Ten ticks is a tenth of a second — four orders of magnitude more
@@ -278,6 +430,13 @@ static u32 hda_corb_send_wait(u32 verb) {
 			break;
 		cpu_relax();
 	}
+	if (hda_no_ici)
+		return 0;
+	/* No answer through the ring: this controller gets the immediate
+	 * interface from now on. */
+	hda_ring_dead = 1;
+	if (hda_ici_send(verb, &resp))
+		return resp;
 	return 0;
 }
 
@@ -328,9 +487,46 @@ static int hda_setup_corb_rirb(void) {
 	hda_w32(HDA_RIRBLBASE, (u32)(hda_rirb_phys & 0xFFFFFFFF));
 	hda_w32(HDA_RIRBUBASE, (u32)(hda_rirb_phys >> 32));
 
-	/* Reset write pointers — write 0xFFFF to RIRBWP to clear interrupts */
+	/* Both rings hold 256 entries, which is what the size registers have to
+	 * say: the controller reads the ring at the size IT was told, not at the
+	 * one the driver allocated. */
+	hda_w8(HDA_CORBSIZE, (hda_r8(HDA_CORBSIZE) & ~0x03u) | 0x02u);
+	hda_w8(HDA_RIRBSIZE, (hda_r8(HDA_RIRBSIZE) & ~0x03u) | 0x02u);
+
+	/* Reset the CORB read pointer, which is a handshake and not a write: set
+	 * bit 15, wait for the controller to acknowledge it by reading it back,
+	 * clear it, wait for it to clear. Skipping this leaves the read pointer
+	 * wherever the last owner of the controller left it — on a passed-through
+	 * device, wherever the host driver left it. */
+	hda_w16(HDA_CORBRP, 0x8000);
+	for (int i = 0; i < 1000; i++) {
+		if (hda_r16(HDA_CORBRP) & 0x8000)
+			break;
+		hda_delay_ms(1);
+	}
+	hda_w16(HDA_CORBRP, 0);
+	for (int i = 0; i < 1000; i++) {
+		if (!(hda_r16(HDA_CORBRP) & 0x8000))
+			break;
+		hda_delay_ms(1);
+	}
+
+	/* Write pointers back to the start — 0xFFFF clears RIRBWP's own bits. */
 	hda_w16(HDA_CORBWP, 0);
 	hda_w16(HDA_RIRBWP, 0xFFFF);
+
+	/*
+	 * How many responses the controller delivers before it raises RINTFL
+	 * and STOPS. That is the whole meaning of the register: it is a
+	 * flow-control count, not merely an interrupt rate, and the engine does
+	 * not fetch another verb until software has cleared the flag. Left at
+	 * zero, QEMU's model compares its count of zero against it, decides the
+	 * limit is already reached, and never fetches the first verb — which is
+	 * exactly what the ring did before this line. Linux writes 1 and clears
+	 * the flag after every response; so does hda_corb_send_wait().
+	 */
+	hda_w16(HDA_RINTCNT, 1);
+	hda_w8(HDA_RIRBSTS, 0x05);
 
 	/* Enable RIRB interrupt (RINTCTL) + DMA */
 	hda_w8(HDA_RIRBCTL, HDA_RIRBCTL_DMAEN | HDA_RIRBCTL_RINTCTL);
@@ -356,27 +552,41 @@ static int hda_setup_corb_rirb(void) {
 
 /* ── Codec discovery ─────────────────────────────────────────────────────── */
 static int hda_probe_codec(void) {
-	u16 gcap = hda_r16(HDA_GCAP);
-	u8 codecs = (gcap >> 8) & 0x0F;
+	/* STATESTS, not GCAP: one bit per SDI line, set by the codec at that
+	 * address when it announced itself after the controller reset. GCAP's
+	 * bits 11:8 are the number of INPUT STREAMS the controller has, which on
+	 * ICH6 happens to be 4 — a number that looks like a codec count and is
+	 * not one. */
+	u16 statests = hda_r16(HDA_STATESTS) & 0x7FFF;
+	u8 codecs = 0;
+
+	for (u8 b = 0; b < 15; b++)
+		if (statests & (1u << b))
+			codecs++;
+	hda_codec_count = codecs;
 	if (codecs == 0) {
 		console_write("hda: no codecs found\n");
 		return -1;
 	}
 	console_write("hda: ");
 	console_write_dec(codecs);
-	console_write(" codec(s) present\n");
+	console_write(" codec(s) present, STATESTS 0x");
+	console_write_hex32(statests);
+	console_write("\n");
 
-	/* Try codec address 0 first (typical for QEMU) */
-	for (u8 addr = 0; addr < 4; addr++) {
+	/* Only the addresses that announced themselves, and in order. */
+	for (u8 addr = 0; addr < 15; addr++) {
+		if (!(statests & (1u << addr)))
+			continue;
 		hda_codec_addr = addr;
 		/* Send a zero verb to wake up the codec */
 		hda_corb_send_wait(0);
-
 		u32 vendor = hda_get_param(0, HDA_PARAM_VENDOR_ID);
 		if (vendor == 0 || vendor == 0xFFFFFFFF) {
 			/* Codec at this address is not responding */
 			continue;
 		}
+		hda_codec_vendor = vendor;
 		console_write("hda: codec addr ");
 		console_write_dec(addr);
 		console_write(" vendor=0x");
@@ -390,27 +600,49 @@ static int hda_probe_codec(void) {
 
 /* ── Find output converter and pin widget ────────────────────────────────── */
 static int hda_discover_audio_widgets(void) {
-	u32 node_info = hda_get_param(0, HDA_PARAM_NODE_COUNT);
-	u8 start_nid = (node_info >> 16) & 0xFF;
-	u8 num_nodes = node_info & 0xFF;
+	/*
+	 * Two levels, as the specification lays them out: the root node's
+	 * subordinates are FUNCTION GROUPS, and only a function group's
+	 * subordinates are widgets. Walking the root's children as if they were
+	 * widgets found the audio function group itself, whose capability word
+	 * decodes to whatever its type happens to be, and both the converter and
+	 * the pin ended up as node 1 — the group. QEMU's codec forgave that; a
+	 * real one takes converter verbs sent to its function group as noise.
+	 */
+	u32 root = hda_get_param(0, HDA_PARAM_NODE_COUNT);
+	u8 fg_start = (root >> 16) & 0xFF;
+	u8 fg_count = root & 0xFF;
 
 	hda_output_nid = 0;
 	hda_pin_nid = 0;
 
-	for (u8 nid = start_nid; nid < start_nid + num_nodes; nid++) {
-		u32 wcaps = hda_get_param(nid, 0xF09); /* Widget Capabilities */
-		u8 type = (wcaps >> 20) & 0x0F;
+	for (u8 fg = fg_start; fg < fg_start + fg_count && fg_count; fg++) {
+		u32 fgtype = hda_get_param(fg, HDA_PARAM_FG_TYPE);
 
-		if (type == HDA_WIDGET_AUDIO_OUTPUT && !hda_output_nid) {
-			hda_output_nid = nid;
-		}
-		if (type == HDA_WIDGET_PIN_COMPLEX && !hda_pin_nid) {
-			/* Check if this pin supports output */
-			u32 pincap = hda_get_param(nid, HDA_PARAM_PIN_CAP);
-			if (pincap & (1u << 4)) { /* Output-capable */
-				hda_pin_nid = nid;
+		if ((fgtype & 0xFF) != HDA_FG_TYPE_AUDIO)
+			continue;
+
+		u32 sub = hda_get_param(fg, HDA_PARAM_NODE_COUNT);
+		u8 start_nid = (sub >> 16) & 0xFF;
+		u8 num_nodes = sub & 0xFF;
+
+		hda_afg_nid = fg;
+		for (u8 nid = start_nid; nid < start_nid + num_nodes && num_nodes; nid++) {
+			u32 wcaps = hda_get_param(nid, HDA_PARAM_AUDIO_WIDGET_CAP);
+			u8 type = (wcaps >> 20) & 0x0F;
+
+			if (type == HDA_WIDGET_AUDIO_OUTPUT && !hda_output_nid)
+				hda_output_nid = nid;
+			if (type == HDA_WIDGET_PIN_COMPLEX && !hda_pin_nid) {
+				/* Check if this pin supports output */
+				u32 pincap = hda_get_param(nid, HDA_PARAM_PIN_CAP);
+
+				if (pincap & (1u << 4)) /* Output-capable */
+					hda_pin_nid = nid;
 			}
 		}
+		if (hda_output_nid)
+			break;
 	}
 
 	if (!hda_output_nid) {
@@ -463,7 +695,19 @@ static void hda_configure_output(void) {
 	 * = (0 << 11) | (1 << 8) | (0xF << 4) | 3 = 0x01F3
 	 */
 	hda_sample_rate = 48000;
-	hda_fmt_word = 0x01F3;
+	/*
+	 * The stream format word, from the specification's own layout:
+	 *
+	 *   bit 15   type (0 = PCM)        bit 14    base rate (0 = 48 kHz)
+	 *   13:11    multiplier            10:8      divisor
+	 *   6:4      bits per sample (001 = 16)      3:0  channels - 1
+	 *
+	 * 48 kHz, 16-bit, stereo is therefore 0x0011. The 0x01F3 that used to be
+	 * here is a divisor of 2 (24 kHz), a reserved bit-depth and four
+	 * channels — a format no codec accepts, written into a register nothing
+	 * was reading anyway.
+	 */
+	hda_fmt_word = 0x0011;
 
 	/* Unmute the output converter amp at full gain (0 dB). Uses the 4/16
 	 * form of SET_AMP_GAIN_MUTE (verb 0x3 in bits 19:16, 16-bit payload);
@@ -473,17 +717,32 @@ static void hda_configure_output(void) {
 	hda_corb_send_wait(HDA_VERB16(hda_codec_addr, hda_output_nid, 0x3,
 		AC_AMP_SET_OUTPUT | AC_AMP_SET_RIGHT | HDA_AMP_STEPS));
 
-	/* Power widget: set D0 for the output converter */
-	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_output_nid, 0xF50, 0x00)); /* Power State D0 */
+	/*
+	 * The verb numbers are the specification's, and the three that were here
+	 * were not:
+	 *
+	 *   0x705  Set Power State      (0xF50 is not a verb at all; 0xF05 GETS
+	 *                                the power state)
+	 *   0x707  Set Pin Widget Control, payload 0x40 = output enable — the
+	 *          payload is the control byte, not the converter's node
+	 *   0x708  Set Unsolicited Response, which is what the pin enable was
+	 *          being sent to
+	 *
+	 * A codec given these ignored all three: it stayed powered down, its pin
+	 * stayed an input, and nothing came out of a stream the driver had
+	 * otherwise set up.
+	 */
+
+	/* Power up the converter and the pin. */
+	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_output_nid, 0x705, 0x00));
+	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_pin_nid, 0x705, 0x00));
 
 	/* Set stream format on the output converter */
 	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_output_nid, 0x200, hda_fmt_word));
 
-	/* Pin widget: set output pin to route to this converter */
-	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_pin_nid, 0x707, hda_output_nid)); /* Select Output */
-
-	/* Enable output on the pin: set pin control = 0x40 (out enable) */
-	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_pin_nid, 0x708, 0x40));
+	/* The pin takes its samples from the first connection, and drives out. */
+	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_pin_nid, 0x701, 0x00));
+	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_pin_nid, 0x707, 0x40));
 }
 
 /* ── Output stream DMA setup ─────────────────────────────────────────────── */
@@ -540,19 +799,27 @@ static int hda_setup_output_stream(u32 buf_size) {
 	 *   bits[3:2]   = stripe
 	 *   bits[7:4]   = traffic class priority
 	 *   bits[19:16] = stream tag
-	 *   bits[31:16] = format (but format is already in FMT register for some impls)
+	 * The stream descriptor's control register, from the specification:
 	 *
-	 * Actually looking at the real HDA spec more carefully:
-	 *   SDI/SDO stream descriptor offset 0x00:
-	 *     bits[1:0] = Stream number (set by software)
-	 *     bits[3:2] = Stripe
-	 *     bits[15:8] = Traffic Class Priority (TP)
-	 *     bits[25:16] = Stream Tag (set by software)
+	 *   bit 0      Stream Reset          bit 1   Stream Run
+	 *   bit 2      Interrupt on Completion Enable
+	 *   bits 19:16 Traffic priority / stripe
+	 *   bits 23:20 Stream Number — the TAG the codec is told to listen for
 	 *
-	 * For QEMU, just set the tag and enable run.
+	 * Bit 0 is a RESET, not the stream number. Writing the number there held
+	 * the stream in reset for its whole life: the run bit was set on top of
+	 * it, the controller ignored both, and the position register never moved
+	 * while the driver reported that it had played.
 	 */
-	u32 ctl0 = (stream_tag << 16) | 0x01; /* tag=1, stream_num=1 */
+	u32 ctl0 = (u32)stream_tag << 20;
+
 	hda_w32(sdo_off + HDA_SDO_CTL0, ctl0);
+
+	/* And the converter has to be told which stream it belongs to, or it
+	 * takes its samples from a stream nobody is filling: payload is the tag
+	 * in the high nibble and the first channel in the low one. */
+	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_output_nid, 0x706,
+	                            (u32)stream_tag << 4));
 
 	return 0;
 }
@@ -583,24 +850,62 @@ static isize hda_dsp_write(struct vfs_node *node, u64 offset, const char *buffer
 		if (chunk > hda_dam_buf_sz)
 			chunk = hda_dam_buf_sz;
 
+		/* Whole frames only: a stereo 16-bit frame is four bytes, and a
+		 * cyclic length that is not a multiple of it is refused. */
+		chunk &= ~(usize)3;
+		if (chunk == 0)
+			break;
 		memcpy(hda_dam_buf, buffer + written, chunk);
 
-		/* Reset LVI */
+		/*
+		 * One chunk, played once.
+		 *
+		 * The descriptor is CYCLIC: with the run bit left set the controller
+		 * goes round the buffer for as long as the machine is up, which a
+		 * capture of the emulated card showed as a tone that never ended.
+		 * And a stream that was never reset keeps its position from the last
+		 * chunk, so "wait until the position passes the chunk" returned at
+		 * once, before a byte of the new data had played. So: reset, which
+		 * puts the position back to zero; size the cycle to this chunk; run;
+		 * wait for the position to reach the end of it; stop.
+		 */
 		u32 sdo_off = HDA_SDO_BASE;
+		u32 ctl0 = hda_r32(sdo_off + HDA_SDO_CTL0) & 0x00FFFFFFu;
+
+		hda_w32(sdo_off + HDA_SDO_CTL0, (ctl0 & ~HDA_SDO_CTL0_RUN) | HDA_SDO_CTL0_SRST);
+		for (int i = 0; i < 100 && !(hda_r8(sdo_off + HDA_SDO_CTL0) & HDA_SDO_CTL0_SRST); i++)
+			hda_delay_ms(1);
+		hda_w32(sdo_off + HDA_SDO_CTL0, ctl0 & ~(HDA_SDO_CTL0_RUN | HDA_SDO_CTL0_SRST));
+		for (int i = 0; i < 100 && (hda_r8(sdo_off + HDA_SDO_CTL0) & HDA_SDO_CTL0_SRST); i++)
+			hda_delay_ms(1);
+
+		/* A reset clears the descriptor's addresses and format; put them
+		 * back, sized to this chunk, with interrupt-on-completion set on the
+		 * one entry: that is what raises BCIS in the stream's status when
+		 * the entry has been played, and BCIS is the completion signal —
+		 * not the position register. A cycle exactly one chunk long wraps
+		 * its position back to zero AT the chunk boundary, so "position has
+		 * reached the chunk" is a moment that never exists, and waiting for
+		 * it cost the full timeout per chunk while the buffer looped. */
+		hda_bdl[0].length = (u32)chunk;
+		hda_bdl[0].flags = 1; /* IOC */
+		hda_w32(sdo_off + HDA_SDO_BDPL, (u32)(hda_bdl_phys & 0xFFFFFFFF));
+		hda_w32(sdo_off + HDA_SDO_BDPH, (u32)(hda_bdl_phys >> 32));
+		hda_w32(sdo_off + HDA_SDO_CBL, (u32)chunk);
 		hda_w16(sdo_off + HDA_SDO_LVI, 0);
+		hda_w16(sdo_off + HDA_SDO_FMT, hda_fmt_word);
+		hda_w8(sdo_off + HDA_SDO_STS, HDA_SDO_STS_BCIS); /* clear a stale one */
+		hda_w32(sdo_off + HDA_SDO_CTL0, (ctl0 & ~HDA_SDO_CTL0_SRST) | HDA_SDO_CTL0_RUN);
 
-		/* Ensure the stream is running */
-		u32 ctl0 = hda_r32(sdo_off + HDA_SDO_CTL0);
-		if (!(ctl0 & HDA_SDO_CTL0_RUN))
-			hda_w32(sdo_off + HDA_SDO_CTL0, ctl0 | HDA_SDO_CTL0_RUN);
-
-		/* Wait for the DMA to consume at least one buffer worth.
-		 * Poll the Link Position in Buffer. */
+		/* Bounded by the wall clock: the chunk is at most the buffer, which
+		 * is well under a second of audio. */
 		u32 start = hda_wallclock();
-		while (hda_r32(sdo_off + HDA_SDO_LPIB) < chunk) {
+		while (!(hda_r8(sdo_off + HDA_SDO_STS) & HDA_SDO_STS_BCIS)) {
 			if ((u32)(hda_wallclock() - start) > 2000) break;
 			scheduler_yield();
 		}
+		hda_w32(sdo_off + HDA_SDO_CTL0, ctl0 & ~(HDA_SDO_CTL0_RUN | HDA_SDO_CTL0_SRST));
+		hda_w8(sdo_off + HDA_SDO_STS, HDA_SDO_STS_BCIS);
 
 		written += chunk;
 		avail   -= chunk;
@@ -739,6 +1044,7 @@ void hda_init(void) {
 	struct pci_device_info pci;
 	int found = 0;
 
+	hda_no_ici = bootinfo_has_flag("b1nix.hda-no-ici") ? 1 : 0;
 	if (bootinfo_has_flag("b1nix.skip-hda")) {
 		console_write("hda: skipped (b1nix.skip-hda)\n");
 		return;
@@ -755,6 +1061,7 @@ void hda_init(void) {
 	}
 	if (!found)
 		return;
+	pci_bind_driver(&pci, "snd_hda_intel");
 
 	/* Enable memory space + bus master */
 	u16 cmd = pci_config_read16(pci.bus, pci.slot, pci.func, 0x04);
@@ -768,6 +1075,8 @@ void hda_init(void) {
 	hda_regs = (volatile u8 *)vmm_map_mmio(mmio_phys, 0x4000,
 	                                        VMM_WRITABLE | VMM_PCD);
 
+	hda_pci_vendor = pci.vendor_id;
+	hda_pci_device = pci.device_id;
 	console_write("hda: ");
 	console_write_hex32(pci.device_id);
 	console_write(" BAR0 0x");
@@ -784,6 +1093,10 @@ void hda_init(void) {
 
 	u16 gcap = hda_r16(HDA_GCAP);
 	u8 out_streams = (gcap >> 12) & 0x0F;
+	u8 in_streams = (gcap >> 8) & 0x0F;
+
+	/* Output descriptors follow the input ones. */
+	hda_sdo_base = HDA_SD_FIRST + (u32)in_streams * HDA_SDO_STRIDE;
 
 	if (out_streams == 0) {
 		console_write("hda: no output streams — aborting\n");
@@ -869,12 +1182,46 @@ static u16 hda_test_sine16(u32 freq, u32 sample_rate, u32 i) {
 }
 
 void hda_selftest(void) {
+	{
+		char v[16];
+
+		if (bootinfo_get_kv("b1nix.hda-tone-ms", v, sizeof(v)) == 1) {
+			int ms = atoi(v);
+
+			if (ms > 0 && ms <= 5000)
+				hda_tone_ms = ms;
+		}
+	}
 	if (!hda_inited) {
 		console_write("M38-SOUND: skip no-device\n");
 		return;
 	}
 
 	console_write("M38-SOUND: ok probe\n");
+
+	/* Which controller, and which codec answered.
+	 *
+	 * The driver takes the same path on QEMU's ICH6 and on a chipset
+	 * controller handed over by VFIO, so these numbers are the only thing in
+	 * the log that says which one it was: 8086:2668 is the emulated one,
+	 * 8086:a2f0 the Z370's, and the codec's vendor id is the codec's own. */
+	{
+		char line[96];
+
+		snprintf(line, sizeof(line),
+		         "M38-SOUND: ok controller vendor=%04x device=%04x\n",
+		         (unsigned)hda_pci_vendor, (unsigned)hda_pci_device);
+		console_write(line);
+		if (hda_codec_vendor) {
+			snprintf(line, sizeof(line),
+			         "M38-SOUND: ok codec addr=%u vendor=%08x count=%u\n",
+			         (unsigned)hda_codec_addr, (unsigned)hda_codec_vendor,
+			         (unsigned)hda_codec_count);
+			console_write(line);
+		} else {
+			console_write("M38-SOUND: fail codec (none answered)\n");
+		}
+	}
 
 	/* Verify the DMA buffer is accessible */
 	memset(hda_dam_buf, 0, hda_dam_buf_sz);
@@ -903,19 +1250,67 @@ void hda_selftest(void) {
 		if (num_samples * 2 > hda_dam_buf_sz)
 			num_samples = hda_dam_buf_sz / 2;
 
+		/* The stream is stereo, so a frame is two samples and the same value
+		 * goes to both: written one sample per index, the controller read
+		 * each pair as one frame and the sine came out an octave high —
+		 * 880 Hz in the capture for a 440 Hz tone. */
 		i16 *samples = (i16 *)hda_dam_buf;
-		for (u32 i = 0; i < num_samples; i++) {
-			samples[i] = (i16)hda_test_sine16(440, hda_sample_rate, i);
+		u32 num_frames = num_samples / 2;
+
+		for (u32 i = 0; i < num_frames; i++) {
+			i16 v = (i16)hda_test_sine16(440, hda_sample_rate, i);
+
+			samples[2 * i] = v;
+			samples[2 * i + 1] = v;
 		}
 
 		u32 sdo_off = HDA_SDO_BASE;
-		hda_w16(sdo_off + HDA_SDO_LVI, num_samples - 1);
-		hda_w32(sdo_off + HDA_SDO_CBL, num_samples * 2);
+
+		/* LVI is the index of the last BUFFER DESCRIPTOR, and there is one of
+		 * them: writing the sample count there pointed the controller at
+		 * thousands of descriptors that do not exist, and it fetched none.
+		 * The cyclic length stays the descriptor's own — the same thing the
+		 * /dev/dsp write path does. */
+		hda_w16(sdo_off + HDA_SDO_LVI, 0);
+		hda_w32(sdo_off + HDA_SDO_CBL, hda_dam_buf_sz);
 
 		u32 ctl0 = hda_r32(sdo_off + HDA_SDO_CTL0);
 		hda_w32(sdo_off + HDA_SDO_CTL0, ctl0 | HDA_SDO_CTL0_RUN);
-		hda_delay_ms(hda_tone_ms);
+		u32 pos_before = hda_r32(sdo_off + HDA_SDO_LPIB);
+		u32 pos_after = pos_before;
+
+		/* Up to a fifth of a second, and no longer than it takes: the
+		 * position moves within a buffer period on real hardware and within
+		 * the emulator's timer tick under QEMU, and waiting the whole time
+		 * for a controller that IS working would put that on every boot. */
+		for (int w = 0; w < 200; w++) {
+			hda_delay_ms(1);
+			pos_after = hda_r32(sdo_off + HDA_SDO_LPIB);
+			if (pos_after != pos_before)
+				break;
+		}
 		console_write("M38-SOUND: ok play-sine\n");
+
+		/* And stop: the descriptor is cyclic, and a stream left running
+		 * plays the buffer round and round for as long as the machine is
+		 * up — which a capture of the emulated card showed as a tone that
+		 * never ended. */
+		hda_w32(sdo_off + HDA_SDO_CTL0, ctl0 & ~HDA_SDO_CTL0_RUN);
+
+		/* The position register is the controller's own account of how far it
+		 * has read from the buffer. A controller that accepted every write
+		 * and fetched nothing — which is what a mis-programmed BDL, a missing
+		 * bus-master enable or a stream that never left reset looks like —
+		 * leaves it where it was. */
+		{
+			char line[80];
+
+			snprintf(line, sizeof(line),
+			         "M38-SOUND: %s stream-advanced from=%u to=%u\n",
+			         pos_after != pos_before ? "ok" : "fail",
+			         (unsigned)pos_before, (unsigned)pos_after);
+			console_write(line);
+		}
 	} else {
 		console_write("M38-SOUND: ok play-sine (no-codec)\n");
 	}

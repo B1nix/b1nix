@@ -31,6 +31,13 @@
 #define VM_DONTDUMP  0x0080
 #define VM_NORESERVE 0x0200
 #define VM_MIXEDMAP  0x1000
+/* A hint that this mapping would benefit from huge pages. There are none for
+ * file mappings here, so it is recorded and not acted on. */
+#define VM_HUGEPAGE  0x20000
+/* Bytes read from the file are stable while mapped — what MAP_SYNC promises for
+ * a DAX mapping. Declared so a filesystem can advertise it; nothing here can
+ * satisfy it, and `mmap_supported_flags` is how the VFS refuses it. */
+#define MAP_SYNC     0x080000
 
 #define PAGE_ALIGN(x)   ALIGN((x), PAGE_SIZE)
 #define PAGE_ALIGNED(x) IS_ALIGNED((u64)(x), PAGE_SIZE)
@@ -51,9 +58,76 @@ static inline void check_move_unevictable_folios(void *fbatch) { (void)fbatch; }
  * kept as its own type rather than an alias, because imported code holds both
  * kinds of pointer and mixing them would compile where it should not.
  */
-struct folio { struct page page; };
+/*
+ * `struct folio` mirrors `struct page` field for field.
+ *
+ * It is a separate type so that a folio pointer and a page pointer cannot be
+ * mixed up — imported code holds both — and it has its own members rather than
+ * embedding a page so that `folio->mapping` and `folio->index` work, which is
+ * how upstream's imported code spells them.
+ *
+ * The two layouts MUST agree, because page_folio() and folio_page() are casts.
+ * That is not left to inspection: FOLIO_MATCH below asserts every offset at
+ * compile time, so a field added to one and not the other is a build error
+ * rather than a pointer into the wrong word.
+ */
+struct folio {
+	/*
+	 * The union is upstream's, and it is not a space optimisation: imported
+	 * code reaches BOTH ways. It writes `folio->mapping` and `folio->index`
+	 * through the named fields, and it writes `&folio->page` to hand the
+	 * folio to an interface that still takes a page — btrfs's compression
+	 * path does exactly that. Only one of the two would compile; both are
+	 * used.
+	 */
+	union {
+		struct {
+			u64 phys;
+			volatile i32 count;
+			u32 order;
+			struct page *hash_next;
+			/* A pointer here where struct page has an unsigned long, which
+			 * is upstream's arrangement: the slot is the same word, and a
+			 * folio's users store a pointer in it (iomap keeps its per-folio
+			 * state there, ext4 its buffer heads). */
+			void *private;
+			struct list_head lru;
+			struct address_space *mapping;
+			unsigned long index;
+			volatile unsigned long flags;
+		};
+		struct page page;
+	};
+};
+
+/*
+ * The two layouts MUST agree, because page_folio() and folio_page() are casts
+ * and because the union above overlays them. That is not left to inspection:
+ * every offset is asserted at compile time, so a field added to one and not the
+ * other is a build error rather than a pointer into the wrong word.
+ */
+/* _Static_assert rather than static_assert: this header is included by
+ * b1nix-side files that do not force-include <linux/compiler_types.h>, where
+ * the one-argument spelling lives. */
+#define FOLIO_MATCH(pfield, ffield)                                            \
+	_Static_assert(offsetof(struct page, pfield) ==                            \
+	                   offsetof(struct folio, ffield),                         \
+	               "struct folio must mirror struct page: " #pfield)
+FOLIO_MATCH(phys, phys);
+FOLIO_MATCH(count, count);
+FOLIO_MATCH(order, order);
+FOLIO_MATCH(hash_next, hash_next);
+FOLIO_MATCH(private, private);
+FOLIO_MATCH(lru, lru);
+FOLIO_MATCH(mapping, mapping);
+FOLIO_MATCH(index, index);
+FOLIO_MATCH(flags, flags);
+_Static_assert(sizeof(struct page) == sizeof(struct folio),
+               "struct folio and struct page must be the same size");
+#undef FOLIO_MATCH
+
 static inline struct page *folio_page(struct folio *f, usize n)
-{ (void)n; return &f->page; }
+{ (void)n; return (struct page *)f; }
 static inline usize folio_nr_pages(struct folio *f) { (void)f; return 1; }
 /* The page within a folio that holds a given file index. One page per folio
  * here, so it is always that page. */
@@ -101,30 +175,260 @@ static inline void vm_flags_set(struct vm_area_struct *vma, unsigned long flags)
 static inline void vm_flags_clear(struct vm_area_struct *vma, unsigned long flags)
 { vma->vm_flags &= ~flags; }
 
-static inline void folio_mark_dirty(struct folio *f) { (void)f; }
-static inline void folio_mark_accessed(struct folio *f) { (void)f; }
+/*
+ * Page flags.
+ *
+ * These are the state machine of the page cache, and each one is a promise:
+ *
+ *   Uptodate  the contents match what is on disk. A reader may use the bytes.
+ *   Dirty     the contents differ and the DISK is the stale one.
+ *   Locked    somebody owns the page; wait before touching it.
+ *   Writeback an I/O is in flight writing it out.
+ *   Private   `page->private` holds something — for ext4, its buffer heads.
+ *
+ * Uptodate and Dirty are independent: a freshly written page is both, a page
+ * just read is Uptodate and clean, and a page being filled is neither. Code
+ * that treats them as one state corrupts data in the case it did not think of.
+ *
+ * The bit NUMBERS are ours; nothing outside this kernel sees them.
+ */
+/* The bit numbering is in <lkpi/page.h>, next to the field it describes; the
+ * accessors below are generated on top of it. */
 
-static inline unsigned long folio_pfn(struct folio *f)
-{ return (unsigned long)(page_to_phys(&f->page) >> PAGE_SHIFT); }
+/*
+ * Generated rather than written out, for the same reason the buffer-head ones
+ * are: three forms times twenty flags is sixty near-identical functions, and a
+ * typo in one of them sets the wrong bit — which does not fail to compile and
+ * does not fail at run time until a crash.
+ *
+ * The atomic forms are the default. `__SetPage*` is non-atomic and is only for
+ * a page nobody else can see yet.
+ */
+#define PAGEFLAG(uname, lname)                                                 \
+static inline int Page##uname(const struct page *page)                         \
+{ return (page->flags & (1UL << PG_##lname)) != 0; }                           \
+static inline void SetPage##uname(struct page *page)                           \
+{ __atomic_fetch_or((unsigned long *)&page->flags, 1UL << PG_##lname,          \
+                    __ATOMIC_SEQ_CST); }                                       \
+static inline void ClearPage##uname(struct page *page)                         \
+{ __atomic_fetch_and((unsigned long *)&page->flags, ~(1UL << PG_##lname),      \
+                     __ATOMIC_SEQ_CST); }                                      \
+static inline void __SetPage##uname(struct page *page)                         \
+{ page->flags |= (1UL << PG_##lname); }                                        \
+static inline void __ClearPage##uname(struct page *page)                       \
+{ page->flags &= ~(1UL << PG_##lname); }                                       \
+static inline int TestSetPage##uname(struct page *page)                        \
+{ return (__atomic_fetch_or((unsigned long *)&page->flags,                     \
+                            1UL << PG_##lname, __ATOMIC_SEQ_CST) &             \
+          (1UL << PG_##lname)) != 0; }                                         \
+static inline int TestClearPage##uname(struct page *page)                      \
+{ return (__atomic_fetch_and((unsigned long *)&page->flags,                    \
+                             ~(1UL << PG_##lname), __ATOMIC_SEQ_CST) &         \
+          (1UL << PG_##lname)) != 0; }
 
-static inline struct page *folio_file_page(struct folio *f, unsigned long index)
-{ (void)index; return &f->page; }
-static inline void folio_put(struct folio *f) { (void)f; }
-static inline void *folio_address(struct folio *f) { return page_address(&f->page); }
+PAGEFLAG(Locked, locked)
+PAGEFLAG(Referenced, referenced)
+PAGEFLAG(Uptodate, uptodate)
+PAGEFLAG(Dirty, dirty)
+PAGEFLAG(LRU, lru)
+PAGEFLAG(Active, active)
+PAGEFLAG(Workingset, workingset)
+PAGEFLAG(Error, error)
+PAGEFLAG(Private, private)
+PAGEFLAG(Private2, private_2)
+PAGEFLAG(Writeback, writeback)
+PAGEFLAG(MappedToDisk, mappedtodisk)
+PAGEFLAG(Reclaim, reclaim)
+PAGEFLAG(Checked, checked)
+PAGEFLAG(Reserved, reserved)
+PAGEFLAG(SwapBacked, swapbacked)
+PAGEFLAG(Unevictable, unevictable)
 
-struct folio_batch { unsigned char nr; struct page *folios[15]; };
-static inline void folio_batch_init(struct folio_batch *fb) { fb->nr = 0; }
-static inline unsigned folio_batch_add(struct folio_batch *fb, struct folio *f)
+/* The folio spellings of the same flags. One page per folio here, so each is
+ * the page form — but the names are kept apart because the types are. */
+#define FOLIOFLAG(lname, fname)                                                \
+static inline bool folio_test_##fname(struct folio *folio)                     \
+{ return (folio->flags & (1UL << PG_##lname)) != 0; }                      \
+static inline void folio_set_##fname(struct folio *folio)                      \
+{ __atomic_fetch_or((unsigned long *)&folio->flags, 1UL << PG_##lname,     \
+                    __ATOMIC_SEQ_CST); }                                       \
+static inline void folio_clear_##fname(struct folio *folio)                    \
+{ __atomic_fetch_and((unsigned long *)&folio->flags, ~(1UL << PG_##lname), \
+                     __ATOMIC_SEQ_CST); }
+
+FOLIOFLAG(locked, locked)
+FOLIOFLAG(uptodate, uptodate)
+FOLIOFLAG(dirty, dirty)
+FOLIOFLAG(writeback, writeback)
+FOLIOFLAG(private, private)
+FOLIOFLAG(error, error)
+FOLIOFLAG(referenced, referenced)
+FOLIOFLAG(reclaim, reclaim)
+FOLIOFLAG(checked, checked)
+FOLIOFLAG(mappedtodisk, mappedtodisk)
+FOLIOFLAG(workingset, workingset)
+FOLIOFLAG(lru, lru)
+FOLIOFLAG(active, active)
+FOLIOFLAG(swapbacked, swapbacked)
+FOLIOFLAG(unevictable, unevictable)
+FOLIOFLAG(private_2, private_2)
+
+/* Where in its file a page sits, and how big it is. `folio_pos` is in BYTES and
+ * `folio_index` in pages; the two differ by PAGE_SHIFT and mixing them up puts
+ * an I/O 4096 times too far into the file. */
+static inline unsigned long folio_index(struct folio *folio)
+{ return folio->index; }
+static inline loff_t folio_pos(struct folio *folio)
+{ return (loff_t)folio->index << PAGE_SHIFT; }
+static inline size_t folio_size(struct folio *folio)
+{ (void)folio; return PAGE_SIZE; }
+static inline struct address_space *folio_mapping(struct folio *folio)
+{ return folio->mapping; }
+static inline struct inode *folio_inode(struct folio *folio);
+static inline unsigned long page_index(struct page *page)
+{ return page->index; }
+static inline loff_t page_offset(struct page *page)
+{ return (loff_t)page->index << PAGE_SHIFT; }
+static inline void *page_private(struct page *page)
+{ return (void *)page->private; }
+static inline void set_page_private(struct page *page, unsigned long v)
+{ page->private = v; }
+static inline void *folio_get_private(struct folio *folio)
+{ return folio->private; }
+static inline void folio_attach_private(struct folio *folio, void *data)
 {
-	if (fb->nr < 15)
-		fb->folios[fb->nr++] = &f->page;
-	return 15 - fb->nr;
+	folio->private = data;
+	folio_set_private(folio);
+}
+static inline void *folio_detach_private(struct folio *folio)
+{
+	void *data = folio_get_private(folio);
+
+	folio->private = NULL;
+	folio_clear_private(folio);
+	return data;
 }
 
-static inline void __folio_batch_release(struct folio_batch *fb) { fb->nr = 0; }
+static inline void attach_page_private(struct page *page, void *data)
+{
+	get_page(page);
+	set_page_private(page, (unsigned long)data);
+	SetPagePrivate(page);
+}
+
+static inline void *detach_page_private(struct page *page)
+{
+	void *data = (void *)page_private(page);
+
+	if (!PagePrivate(page))
+		return NULL;
+	ClearPagePrivate(page);
+	set_page_private(page, 0);
+	put_page(page);
+	return data;
+}
+
+/* Where in its folio an address or offset sits, and how many filesystem blocks
+ * a folio holds. One page per folio here, so the folio forms are the page
+ * forms — spelled separately because the callers are counting different
+ * things and the day a folio is more than a page they must differ. */
+/*
+ * A macro, not a function: callers pass either a file offset or a POINTER into
+ * the folio — jbd2 passes `bh->b_data` — and a typed parameter would reject one
+ * of the two.
+ */
+#define offset_in_folio(folio, p) \
+	((unsigned long)(p) & (folio_size(folio) - 1))
+
+/* One whole page, copied. The length is PAGE_SIZE exactly — a caller with its
+ * own length wants memcpy. `clear_page` is the matching operation and is
+ * declared further down, next to the page allocator. */
+static inline void copy_page(void *to, const void *from)
+{ __builtin_memcpy(to, from, PAGE_SIZE); }
+
+void set_page_writeback(struct page *page);
+
+/*
+ * The page or folio behind a kernel virtual address.
+ *
+ * jbd2 uses it on the buffers it allocated with kmalloc, to find the folio a
+ * journal descriptor block lives in. It only works for addresses inside the
+ * direct map — which is where kmalloc's are — and answers NULL for anything
+ * else rather than fabricating a page for a vmapped address.
+ */
+struct page *virt_to_page(const void *addr);
+struct folio *virt_to_folio(const void *addr);
+
+void memcpy_from_folio(char *to, struct folio *folio, size_t offset,
+                       size_t len);
+void memcpy_to_folio(struct folio *folio, size_t offset, const char *from,
+                     size_t len);
+
+void folio_mark_dirty(struct folio *f);
+void folio_mark_accessed(struct folio *f);
+void folio_end_writeback(struct folio *folio);
+void folio_wait_writeback(struct folio *folio);
+void folio_start_writeback(struct folio *folio);
+
+static inline unsigned long folio_pfn(struct folio *f)
+{ return (unsigned long)(page_to_phys(folio_page(f, 0)) >> PAGE_SHIFT); }
+
+static inline struct page *folio_file_page(struct folio *f, unsigned long index)
+{ (void)index; return folio_page(f, 0); }
+static inline void folio_put(struct folio *f) { (void)f; }
+static inline void *folio_address(struct folio *f) { return page_address(folio_page(f, 0)); }
+
+/*
+ * A short array of folios collected in one pass.
+ *
+ * The entries are folios, not pages: imported code indexes `fbatch.folios[i]`
+ * and passes the result straight to folio_* functions. The batch holds
+ * REFERENCES — `folio_batch_release` drops them — so a batch that is filled and
+ * then forgotten leaks a reference per entry, and the pages are never
+ * reclaimed.
+ */
+#define PAGEVEC_SIZE 15
+
+struct folio_batch {
+	unsigned char nr;
+	bool percpu_pvec_drained;
+	struct folio *folios[PAGEVEC_SIZE];
+};
+
+static inline void folio_batch_init(struct folio_batch *fb)
+{
+	fb->nr = 0;
+	fb->percpu_pvec_drained = false;
+}
+
+/* Returns the room left, so a caller can stop before the next add fails. */
+static inline unsigned folio_batch_add(struct folio_batch *fb, struct folio *f)
+{
+	if (fb->nr < PAGEVEC_SIZE)
+		fb->folios[fb->nr++] = f;
+	return PAGEVEC_SIZE - fb->nr;
+}
+
 static inline unsigned folio_batch_count(struct folio_batch *fb)
 { return fb->nr; }
-static inline void folio_batch_release(struct folio_batch *fb) { fb->nr = 0; }
+
+void __folio_batch_release(struct folio_batch *fb);
+static inline void folio_batch_release(struct folio_batch *fb)
+{
+	if (fb->nr)
+		__folio_batch_release(fb);
+}
+
+/*
+ * Allocate several pages at once into a caller's array. Returns how many it
+ * managed, which may be fewer than asked — every caller loops until it has
+ * enough or gives up, and one that treated a short return as failure would
+ * throw away pages it had been given.
+ */
+unsigned long alloc_pages_bulk_array(gfp_t gfp, unsigned long nr_pages,
+                                     struct page **page_array);
+/* Park briefly after a failed allocation, before trying again. */
+void memalloc_retry_wait(gfp_t gfp_flags);
 
 /* NUMA node a device's memory should come from. One node here. */
 #define dev_to_node(dev) (-1)
@@ -157,6 +461,9 @@ struct page *pfn_to_page(unsigned long pfn);
 #define VM_FAULT_NOPAGE  0x0100
 #define VM_FAULT_SIGBUS  0x0002
 #define VM_FAULT_OOM     0x0001
+#define VM_FAULT_HWPOISON 0x0010
+#define VM_FAULT_RETRY   0x0400
+#define VM_FAULT_NOPAGE  0x0100
 #define VM_FAULT_RETRY   0x0400
 
 
@@ -164,8 +471,29 @@ struct page *pfn_to_page(unsigned long pfn);
  * GEM pages have no backing store to write back to — they are freed, not paged
  * — so the mark has nothing to act on and the page is already where it will
  * stay. */
-static inline void set_page_dirty(struct page *page) { (void)page; }
-static inline void set_page_dirty_lock(struct page *page) { (void)page; }
+/*
+ * Dirtying a page goes through the folio, which dispatches to the mapping's
+ * own dirty_folio. These were no-ops, and a no-op here means a filesystem
+ * never learns that anything changed: btrfs marks its metadata blocks dirty
+ * with exactly this call.
+ */
+static inline void set_page_dirty(struct page *page)
+{
+	if (page)
+		folio_mark_dirty(page_folio(page));
+}
+
+void lkpi_page_lock(struct page *page);
+void lkpi_page_unlock(struct page *page);
+
+static inline void set_page_dirty_lock(struct page *page)
+{
+	if (!page)
+		return;
+	lkpi_page_lock(page);
+	folio_mark_dirty(page_folio(page));
+	lkpi_page_unlock(page);
+}
 static inline void mark_page_accessed(struct page *page) { (void)page; }
 
 
@@ -205,19 +533,27 @@ unsigned long vm_mmap(struct file *file, unsigned long addr, unsigned long len,
 /*
  * Page-state predicates and setters.
  *
- * b1nix's struct page has no flags word that reclaim consults: driver pages are
- * allocated and freed, never scanned. So these report the state that is always
- * true here rather than reading a bit — there is no high memory (the whole of
- * RAM is in the direct map), no writeback in flight for anonymous pages, and no
- * reclaim queue to hint at. What is lost is the hinting, not correctness: every
- * caller treats a false answer as "no special handling needed".
+ * PageHighMem is always false: the whole of RAM is in the direct map, so no
+ * page ever needs mapping in to be touched.
+ *
+ * PageWriteback, SetPageReclaim and ClearPageReclaim used to be stubs here as
+ * well, from when a struct page had no flags word. They read and write the real
+ * bits now (see PAGEFLAG above) — a filesystem waits on writeback and a stub
+ * that always answered "not under writeback" would let a reader see a page
+ * whose I/O had not finished.
  */
 static inline int PageHighMem(const struct page *p) { (void)p; return 0; }
-static inline int PageWriteback(const struct page *p) { (void)p; return 0; }
-static inline void SetPageReclaim(struct page *p) { (void)p; }
-static inline void ClearPageReclaim(struct page *p) { (void)p; }
+/* The raw reference count, which ext4 waits on directly while truncating: it
+ * needs to know when it holds the ONLY reference. Named as upstream names the
+ * member so that `&page->_refcount` compiles. */
+#define _refcount count
+/* A page that is part of a multi-page compound allocation. There are none here:
+ * every page is its own folio (see the note on struct folio), so the answer is
+ * always no — and that is what keeps the compound paths in imported code
+ * unreachable rather than half-supported. */
+static inline int PageCompound(const struct page *p) { (void)p; return 0; }
 static inline int page_mapped(const struct page *p) { (void)p; return 0; }
-static inline int clear_page_dirty_for_io(struct page *p) { (void)p; return 0; }
+int clear_page_dirty_for_io(struct page *p);
 
 /* The n'th page after this one. Upstream has to go through the mem_map because
  * a page's neighbours in the array are its neighbours in memory; here a page
@@ -361,5 +697,64 @@ void si_meminfo(struct sysinfo *val);
  * pick a copy strategy from it; ttm_module.c reads boot_cpu_data with only
  * <linux/mm.h> in scope. */
 #include <linux/processor.h>
+
+/* Whole-page allocation in the address-not-page spelling, and the zeroing
+ * variant. `get_zeroed_page` is not an optimisation over allocate-then-memset:
+ * callers rely on the page being zero before anything else can see it. */
+unsigned long __get_free_pages(gfp_t gfp, unsigned int order);
+unsigned long get_zeroed_page(gfp_t gfp);
+void free_pages(unsigned long addr, unsigned int order);
+
+/* Declared at file scope: <linux/bvec.h> is not reached from here, and a
+ * struct first named inside a prototype is a type local to it — which then
+ * refuses to match the real one at the definition. */
+struct bio_vec;
+
+/* A page mapped for the duration of one bvec entry. */
+void *bvec_kmap_local(struct bio_vec *bvec);
+void memzero_bvec(struct bio_vec *bvec);
+void memcpy_page(struct page *dst_page, size_t dst_off, struct page *src_page,
+                 size_t src_off, size_t len);
+
+void dump_page(struct page *page, const char *reason);
+
+/*
+ * The shared page of zeros.
+ *
+ * One page, read-only, that everything needing zeroes can point at instead of
+ * allocating. iomap hands it to the block layer for a write of a hole. It takes
+ * an address argument upstream (some architectures have several); here there is
+ * one and the argument is ignored.
+ */
+struct page *lkpi_zero_page(void);
+#define ZERO_PAGE(vaddr) ({ (void)(vaddr); lkpi_zero_page(); })
+
+/*
+ * Where to place a mapping when the caller has no preference.
+ *
+ * Upstream's transparent-hugepage version aligns the result so a 2 MiB page can
+ * back it. There are no huge pages for file mappings here, so a filesystem that
+ * installs it gets the ordinary placement — which is correct, just not aligned.
+ */
+unsigned long thp_get_unmapped_area(struct file *filp, unsigned long addr,
+                                    unsigned long len, unsigned long pgoff,
+                                    unsigned long flags);
+
+/* Read-ahead marker: this page is the one whose read should trigger the next
+ * batch. It shares PG_reclaim upstream, which is safe because a page cannot be
+ * both being reclaimed and a read-ahead marker. */
+static inline int PageReadahead(const struct page *p)
+{ return (p->flags & (1UL << PG_reclaim)) != 0; }
+static inline void SetPageReadahead(struct page *p)
+{ SetPageReclaim(p); }
+static inline void ClearPageReadahead(struct page *p)
+{ ClearPageReclaim(p); }
+
+/* Assertions that print the offending page or folio. The object is what makes
+ * them useful, so it is passed through to the report rather than dropped. */
+#define VM_BUG_ON_PAGE(cond, page)   BUG_ON(cond)
+#define VM_BUG_ON_FOLIO(cond, folio) BUG_ON(cond)
+#define VM_WARN_ON_ONCE_FOLIO(cond, folio) WARN_ON(cond)
+#define VM_WARN_ON_FOLIO(cond, folio)      WARN_ON(cond)
 
 #endif

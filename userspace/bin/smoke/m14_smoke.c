@@ -18,6 +18,41 @@ static void marker(const char *text) {
   write(1, text, strlen(text));
 }
 
+
+/* The file an object-writing compiler leaves behind, generated from its name:
+ * a size between 40 and 110 KiB and bytes no other (round, file) pair shares. */
+static unsigned churn_size(int round, int i) {
+  return 40960u + (unsigned)((round * 7919 + i * 104729) % 71680);
+}
+
+static unsigned char churn_byte(int round, int i, unsigned off) {
+  unsigned x = (unsigned)round * 2654435761u ^ (unsigned)i * 40503u ^ off * 2246822519u;
+  x ^= x >> 13;
+  x *= 3266489917u;
+  return (unsigned char)(x ^ (x >> 16));
+}
+
+static int churn_verify(int round, int i, const char *path) {
+  static unsigned char buf[120000];
+  int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return 0;
+  unsigned want = churn_size(round, i), got = 0;
+  for (;;) {
+    ssize_t r = read(fd, buf + got, sizeof(buf) - got);
+    if (r <= 0)
+      break;
+    got += (unsigned)r;
+  }
+  close(fd);
+  if (got != want)
+    return 0;
+  for (unsigned o = 0; o < want; o++)
+    if (buf[o] != churn_byte(round, i, o))
+      return 0;
+  return 1;
+}
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
@@ -440,6 +475,169 @@ int main(int argc, char **argv) {
         }
       }
     }
+  }
+
+  /* 12. A linker's output: create, ftruncate to size, fill through a shared
+   * mapping, unmap. Half-way through, sync -- a writeback that cleans the
+   * pages while the mapping is still being written, and rewrites a page that
+   * was already cleaned. What is on the disk after a remount must be every
+   * byte that was stored, not the zeros of the truncate. */
+  {
+    enum { MAPSZ = 512 * 1024 };
+    int ok = 0;
+    long bad_at = -1, got_total = -1;
+    int bad_val = -1, want_val = -1;
+    int fd = open("/mnt/ext4/linker-out.elf", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd >= 0 && ftruncate(fd, MAPSZ) == 0) {
+      unsigned char *m = mmap(0, MAPSZ, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      if (m != MAP_FAILED) {
+        for (unsigned o2 = 0; o2 < MAPSZ / 2; o2++)
+          m[o2] = churn_byte(99, 1, o2);
+        sync();
+        for (unsigned o2 = MAPSZ / 2; o2 < MAPSZ; o2++)
+          m[o2] = churn_byte(99, 1, o2);
+        for (unsigned o2 = 0; o2 < 4096; o2++)   /* a cleaned page, stored again */
+          m[o2] = churn_byte(99, 2, o2);
+        munmap(m, MAPSZ);
+        close(fd);
+        fd = -1;
+        sync();
+        if (umount("/mnt/ext4") == 0 && mount("sda", "/mnt/ext4", "ext4", 0, NULL) == 0) {
+          static unsigned char back[MAPSZ];
+          int rfd = open("/mnt/ext4/linker-out.elf", O_RDONLY);
+          ssize_t got = 0;
+          while (rfd >= 0 && got < MAPSZ) {
+            ssize_t r = read(rfd, back + got, (size_t)(MAPSZ - got));
+            if (r <= 0)
+              break;
+            got += r;
+          }
+          if (rfd >= 0)
+            close(rfd);
+          got_total = (long)got;
+          ok = (got == MAPSZ);
+          for (unsigned o2 = 0; ok && o2 < MAPSZ; o2++)
+            if (back[o2] != churn_byte(99, o2 < 4096 ? 2 : 1, o2)) {
+              ok = 0;
+              bad_at = (long)o2;
+              bad_val = back[o2];
+              want_val = churn_byte(99, o2 < 4096 ? 2 : 1, o2);
+            }
+        }
+      }
+    }
+    if (fd >= 0)
+      close(fd);
+    unlink("/mnt/ext4/linker-out.elf");
+    if (ok) {
+      marker("M14-SMOKE: ok ext4-shared-mmap-durable\n");
+    } else {
+      char msg[160];
+      snprintf(msg, sizeof(msg),
+               "M14-SMOKE: fail ext4-shared-mmap-durable read=%ld bad_at=%ld got=%d want=%d\n",
+               got_total, bad_at, bad_val, want_val);
+      marker(msg);
+    }
+  }
+
+  /* 11. Object-file churn: what a compiler does to a build directory. Each
+   * file is written in uneven chunks to a temporary name and renamed over the
+   * previous version, so freed inodes are reused while their old pages may
+   * still be cached. Checked through the cache after every round, and from
+   * the disk after a remount. The in-guest kernel self-host read another
+   * object's bytes, and found a truncated one on disk, in exactly this pattern. */
+  {
+    enum { ROUNDS = 6, FILES = 30 };
+    static unsigned char wbuf[120000];
+    int cache_bad = -1, disk_bad = -1;
+    mkdir("/mnt/ext4/churn", 0755);
+    for (int round = 0; round < ROUNDS && cache_bad < 0; round++) {
+      /* Two files at a time, their chunks interleaved, so their blocks
+       * alternate on disk: each ends up with more extents than fit in the
+       * inode, and the extent tree has to grow an index block. */
+      for (int i = 0; i < FILES; i += 2) {
+        static unsigned char wbuf2[120000];
+        unsigned char *bufs[2] = {wbuf, wbuf2};
+        unsigned char heads[2][64];
+        char tmps[2][64], fins[2][64];
+        unsigned sizes[2], offs[2] = {0, 0};
+        int fds[2];
+        for (int k = 0; k < 2; k++) {
+          snprintf(tmps[k], sizeof(tmps[k]), "/mnt/ext4/churn/f%d.o-tmp", i + k);
+          snprintf(fins[k], sizeof(fins[k]), "/mnt/ext4/churn/f%d.o", i + k);
+          sizes[k] = churn_size(round, i + k);
+          for (unsigned o2 = 0; o2 < sizes[k]; o2++)
+            bufs[k][o2] = churn_byte(round, i + k, o2);
+          /* An object writer puts a placeholder header down, writes the
+           * sections, then goes back and fills the header in. */
+          memcpy(heads[k], bufs[k], sizeof(heads[k]));
+          memset(bufs[k], 0, sizeof(heads[k]));
+          fds[k] = open(tmps[k], O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        }
+        unsigned step = 4096 + 512;
+        while (offs[0] < sizes[0] || offs[1] < sizes[1]) {
+          for (int k = 0; k < 2; k++) {
+            if (fds[k] < 0 || offs[k] >= sizes[k])
+              continue;
+            unsigned len = sizes[k] - offs[k] < step ? sizes[k] - offs[k] : step;
+            if (write(fds[k], bufs[k] + offs[k], len) != (ssize_t)len)
+              offs[k] = sizes[k];
+            else
+              offs[k] += len;
+          }
+        }
+        for (int k = 0; k < 2; k++) {
+          if (fds[k] < 0)
+            continue;
+          (void)!pwrite(fds[k], heads[k], sizeof(heads[k]), 0);
+          close(fds[k]);
+          rename(tmps[k], fins[k]);
+        }
+      }
+      for (int i = 0; i < FILES; i++) {
+        char fin[64];
+        snprintf(fin, sizeof(fin), "/mnt/ext4/churn/f%d.o", i);
+        if (!churn_verify(round, i, fin)) {
+          cache_bad = round * 100 + i;
+          break;
+        }
+      }
+    }
+    if (cache_bad < 0) {
+      sync();
+      int um_ok = (umount("/mnt/ext4") == 0);
+      int m_ok = (mount("sda", "/mnt/ext4", "ext4", 0, NULL) == 0);
+      for (int i = 0; i < FILES && um_ok && m_ok; i++) {
+        char fin[64];
+        snprintf(fin, sizeof(fin), "/mnt/ext4/churn/f%d.o", i);
+        if (!churn_verify(ROUNDS - 1, i, fin)) {
+          disk_bad = i;
+          break;
+        }
+      }
+      if (!um_ok || !m_ok)
+        disk_bad = 1000;
+    }
+    char msg[128];
+    if (cache_bad < 0)
+      marker("M14-SMOKE: ok ext4-churn-cache\n");
+    else {
+      snprintf(msg, sizeof(msg), "M14-SMOKE: fail ext4-churn-cache round=%d file=%d\n",
+               cache_bad / 100, cache_bad % 100);
+      marker(msg);
+    }
+    if (cache_bad < 0 && disk_bad < 0)
+      marker("M14-SMOKE: ok ext4-churn-disk\n");
+    else if (cache_bad < 0) {
+      snprintf(msg, sizeof(msg), "M14-SMOKE: fail ext4-churn-disk file=%d\n", disk_bad);
+      marker(msg);
+    }
+    for (int i = 0; i < FILES; i++) {
+      char fin[64];
+      snprintf(fin, sizeof(fin), "/mnt/ext4/churn/f%d.o", i);
+      unlink(fin);
+    }
+    rmdir("/mnt/ext4/churn");
   }
 
   /* Clean up */

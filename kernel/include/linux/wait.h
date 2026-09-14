@@ -145,7 +145,7 @@ static inline void finish_wait(struct wait_queue_head *wq,
                                struct wait_queue_entry *entry)
 {
 	lkpi_wait_cancel();
-	remove_wait_queue(wq, entry);
+	lkpi_finish_wait_entry(wq, entry);
 }
 
 static inline void init_wait_entry(struct wait_queue_entry *entry, int flags)
@@ -170,5 +170,40 @@ static inline void init_wait_entry(struct wait_queue_entry *entry, int flags)
  * wake_up_var()/clear_and_wake_up_bit() without including <linux/wait_bit.h>
  * themselves. Included last: <linux/wait_bit.h> builds on the queues above. */
 #include <linux/wait_bit.h>
+
+/*
+ * Sleeping forms a filesystem uses.
+ *
+ * `wait_event_killable` returns -ERESTARTSYS when a fatal signal arrives and 0
+ * when the condition came true; a caller distinguishes them, so a version that
+ * always returned 0 would make an unkillable wait look like a satisfied one.
+ * Nothing here delivers fatal signals to these waiters yet, so it is the
+ * uninterruptible wait returning 0 — which is honest, and is the thing to
+ * revisit when a mount needs to be interruptible.
+ *
+ * `io_wait_event` is the same wait, marked as waiting for I/O for accounting
+ * b1nix does not keep.
+ */
+#define wait_event_killable(wq, condition) ({ wait_event(wq, condition); 0; })
+#define io_wait_event(wq, condition)       wait_event(wq, condition)
+#define wait_event_state(wq, condition, state) ({ wait_event(wq, condition); 0; })
+
+/*
+ * Returns 0, or -ERESTARTSYS when a signal is already pending in an
+ * interruptible state — callers assign it and bail out, so a void version
+ * turns an interrupted wait into a silent one.
+ */
+int prepare_to_wait_event(struct wait_queue_head *wq,
+                          struct wait_queue_entry *entry, int state);
+void prepare_to_wait_exclusive(struct wait_queue_head *wq,
+                               struct wait_queue_entry *entry, int state);
+void finish_wait(struct wait_queue_head *wq, struct wait_queue_entry *entry);
+
+/* The bit waits are implemented in <linux/wait_bit.h>, which this header
+ * reaches; declaring them again here conflicts with the definitions there. */
+
+/* A file-scope wait queue, initialised at its definition. */
+#define DECLARE_WAIT_QUEUE_HEAD(name) \
+	wait_queue_head_t name = __WAIT_QUEUE_HEAD_INITIALIZER(name)
 
 #endif

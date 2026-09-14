@@ -15,7 +15,9 @@
 
 #include <lkpi/dma-mapping.h>
 #include <lkpi/io.h>
+#include <lkpi/env.h>
 #include <lkpi/lock.h>
+#include <linux/printk.h>
 #include <lkpi/types.h>
 #include <stdio.h>
 #include <string.h>
@@ -928,11 +930,24 @@ int lkpi_mutex_trylock(struct lkpi_mutex *m)
 
 void lkpi_mutex_lock(struct lkpi_mutex *m)
 {
+	/* A mutex nobody releases used to be a thread that simply stopped, with
+	 * the log saying only that a subsystem went quiet. Naming the lock and
+	 * its owner after a few seconds costs nothing on a lock that is taken. */
+	u64 t0 = lkpi_ticks();
+	u64 report_at = t0 + 500ull; /* five seconds, lkpi_ticks() being jiffies */
+
 	if (!m)
 		return;
 	for (;;) {
 		if (lkpi_mutex_trylock(m))
 			return;
+		if (lkpi_ticks() >= report_at) {
+			lkpi_printk("lkpi: mutex %p held by task %lu for %llu s, waiter "
+			            "at %p\n", (void *)m, (unsigned long)m->owner,
+			            (unsigned long long)((lkpi_ticks() - t0) / 100ull),
+			            __builtin_return_address(0));
+			report_at = lkpi_ticks() + 500ull;
+		}
 		/* Two-phase wait: publish on the channel first, re-test under the
 		 * guard, and only park if the lock is still held. A release between
 		 * the test and the park therefore cannot be lost. */
@@ -944,7 +959,15 @@ void lkpi_mutex_lock(struct lkpi_mutex *m)
 			tlb_shootdown_poll();
 			continue;
 		}
-		scheduler_wait_prepare(m);
+		/* Park with a deadline rather than for good.
+		 *
+		 * An untimed park makes a lost wake indistinguishable from a lock
+		 * nobody releases: the waiter never runs again, so it never reports
+		 * anything either, and the only symptom is a thread that stopped. A
+		 * second's deadline changes nothing for a lock that is released --
+		 * the release wakes the waiter as before -- and turns the other case
+		 * into a line naming the lock and its holder. */
+		scheduler_wait_prepare_timeout(m, (u64)sched_tick_hz());
 		u64 flags;
 		spin_lock_irqsave(&m->guard, &flags);
 		int still_held = m->locked;

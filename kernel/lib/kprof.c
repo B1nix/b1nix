@@ -26,6 +26,8 @@
 #include <b1nix/console.h>
 #include <b1nix/klog.h>
 #include <b1nix/types.h>
+#include <b1nix/kprof.h>
+#include <b1nix/lapic.h>
 
 #define KPROF_SLOTS 8192u
 #define KPROF_GRAIN 16u
@@ -52,9 +54,114 @@ static u64 g_tick_total;
 static int kprof_enabled(void) {
   static int on = -1;
 
-  if (on < 0)
+  if (on < 0) {
     on = bootinfo_has_flag("b1nix.sysprof") ? 1 : 0;
+    __atomic_store_n(&kprof_irqoff_on, on, __ATOMIC_RELEASE);
+  }
   return on;
+}
+
+/* ── Interrupts-off sections, by the site that began them ─────────────────
+ * See kprof.h. Cycles from the free-running counter: a section cannot
+ * migrate, so the same CPU reads both ends. A task switch inside a section
+ * ends it on the switched-to side; the time is still real interrupts-off
+ * time on that CPU and is charged to the site that began it. */
+int kprof_irqoff_on;
+#define IRQOFF_SLOTS 1024u
+struct irqoff_slot {
+  u64 site;
+  u64 cycles;
+  u64 count;
+};
+static struct irqoff_slot g_irqoff[IRQOFF_SLOTS];
+static u64 g_irqoff_cycles, g_irqoff_sections, g_irqoff_dropped;
+
+static inline u64 irqoff_now(void) {
+#if defined(__aarch64__)
+  u64 c;
+  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(c));
+  return c;
+#else
+  return __builtin_ia32_rdtsc();
+#endif
+}
+
+void kprof_irqoff_begin(void *site) {
+  struct percpu *p = get_percpu();
+  if (!p || p->irqoff_site)
+    return;
+  p->irqoff_site = site;
+  p->irqoff_t0 = irqoff_now();
+}
+
+void kprof_irqoff_end(void) {
+  struct percpu *p = get_percpu();
+  if (!p || !p->irqoff_site)
+    return;
+  u64 site = (u64)(usize)p->irqoff_site;
+  u64 d = irqoff_now() - p->irqoff_t0;
+  p->irqoff_site = 0;
+  __atomic_fetch_add(&g_irqoff_cycles, d, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_irqoff_sections, 1, __ATOMIC_RELAXED);
+  u32 h = (u32)((site * 0x9e3779b97f4a7c15ULL) >> 54) & (IRQOFF_SLOTS - 1);
+  for (u32 probe = 0; probe < 16; probe++) {
+    u32 i = (h + probe) & (IRQOFF_SLOTS - 1);
+    u64 cur = __atomic_load_n(&g_irqoff[i].site, __ATOMIC_RELAXED);
+    if (cur == 0) {
+      u64 expect = 0;
+      if (!__atomic_compare_exchange_n(&g_irqoff[i].site, &expect, site, 0,
+                                       __ATOMIC_RELAXED, __ATOMIC_RELAXED) &&
+          expect != site)
+        continue;
+      cur = site;
+    }
+    if (cur == site) {
+      __atomic_fetch_add(&g_irqoff[i].cycles, d, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&g_irqoff[i].count, 1, __ATOMIC_RELAXED);
+      return;
+    }
+  }
+  __atomic_fetch_add(&g_irqoff_dropped, 1, __ATOMIC_RELAXED);
+}
+
+static void kprof_dump_irqoff(void) {
+  if (!kprof_irqoff_on)
+    return;
+  console_write("kprof: irqoff cycles=");
+  console_write_dec(g_irqoff_cycles);
+  console_write(" sections=");
+  console_write_dec(g_irqoff_sections);
+  console_write(" dropped=");
+  console_write_dec(g_irqoff_dropped);
+  console_write("\n");
+  /* Top 24 by cycles: pick the largest not yet printed, 24 times. */
+  u64 floor = ~0ull;
+  for (int n = 0; n < 24; n++) {
+    u64 best = 0;
+    usize bi = IRQOFF_SLOTS;
+    for (usize i = 0; i < IRQOFF_SLOTS; i++) {
+      u64 c = g_irqoff[i].cycles;
+      if (g_irqoff[i].site && c < floor && c > best) {
+        best = c;
+        bi = i;
+      }
+    }
+    if (bi == IRQOFF_SLOTS)
+      break;
+    floor = best;
+    console_write("  kprof-irqoff ");
+    console_write_dec(best);
+    console_write(" ");
+    console_write_dec(g_irqoff[bi].count);
+    console_write(" 0x");
+    console_write_hex64(g_irqoff[bi].site);
+    /* Name it here, the way the histogram does. An address alone has to be
+     * resolved against the exact kernel that produced it, and reading it back
+     * later against a rebuilt one -- as happened while chasing this -- names
+     * the wrong function with no sign that it did. */
+    ksym_print(g_irqoff[bi].site);
+    console_write("\n");
+  }
 }
 
 /* Called from the vector-64 handler with interrupts off. Must be cheap: it
@@ -88,6 +195,25 @@ static u64 kprof_weight(int cpu) {
     w = (now - last_ns[cpu]) / ns_per_tick;
   last_ns[cpu] = now;
   return w ? w : 1;
+}
+
+/* Where the machine's time went, summed over every CPU. For a caller that
+ * wants to say what a stall was made of: busy in userspace, busy in the
+ * kernel, or idle waiting for something. */
+void kprof_tick_totals(u64 *user, u64 *kernel, u64 *idle) {
+  u64 u = 0, k = 0, i = 0;
+
+  for (unsigned c = 0; c < KPROF_MAX_CPUS; c++) {
+    u += __atomic_load_n(&g_tick_mode[c][0], __ATOMIC_RELAXED);
+    k += __atomic_load_n(&g_tick_mode[c][1], __ATOMIC_RELAXED);
+    i += __atomic_load_n(&g_tick_mode[c][2], __ATOMIC_RELAXED);
+  }
+  if (user)
+    *user = u;
+  if (kernel)
+    *kernel = k;
+  if (idle)
+    *idle = i;
 }
 
 void kprof_tick(u64 rip, int in_user, int in_idle, int cpu) {
@@ -246,6 +372,8 @@ static void kprof_dump_raw(void) {
   }
 }
 
+void kprof_dump_histogram_pub(void) { kprof_dump_histogram(); }
+
 void kprof_dump(void) {
   u64 u = 0, k = 0, idl = 0;
 
@@ -281,4 +409,5 @@ void kprof_dump(void) {
 
   kprof_dump_histogram();
   kprof_dump_raw();
+  kprof_dump_irqoff();
 }

@@ -13,6 +13,11 @@
 #define _PAGE_DIRTY    0x040
 #define _PAGE_PAT      0x080
 
+/* The three bits that name a page's cache type — PWT, PCD and PAT. i915 keeps
+ * the caching from an I/O mapping and the rest of the protection from the VMA,
+ * and this is the mask that separates them. */
+#define _PAGE_CACHE_MASK (_PAGE_PWT | _PAGE_PCD | _PAGE_PAT)
+
 
 /* A page-table entry, as a value. Code that builds one directly names the type;
  * b1nix's own paging works in plain u64, and this is the same word under the

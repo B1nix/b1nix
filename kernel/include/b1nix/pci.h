@@ -16,6 +16,8 @@ struct pci_device_info {
 };
 
 void pci_init(void);
+/* Record that `driver` has claimed this function (sysfs `driver` links). */
+void pci_bind_driver(const struct pci_device_info *pci, const char *driver);
 u32 pci_config_read32(u8 bus, u8 slot, u8 func, u8 offset);
 u16 pci_config_read16(u8 bus, u8 slot, u8 func, u8 offset);
 u8 pci_config_read8(u8 bus, u8 slot, u8 func, u8 offset);

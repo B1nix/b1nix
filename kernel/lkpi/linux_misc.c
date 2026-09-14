@@ -185,6 +185,7 @@ struct lkpi_edid_cache {
 	u8 addr;
 	u8 data[256];
 	unsigned len;
+	u64 fail_until;
 };
 
 static struct lkpi_edid_cache g_edid_cache[8];
@@ -226,6 +227,16 @@ int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 			memcpy(msgs[1].buf, slot->data + offset, msgs[1].len);
 			return num;
 		}
+
+		/* Negative cache: a controller that just failed an EDID read fails the
+		 * same way for the next couple of seconds, each failure a multi-segment
+		 * GMBUS timeout of tens of ms. Under legacy IGD passthrough GMBUS has no
+		 * reference clock and never works, so a compositor polling the connector
+		 * turned every frame into hundreds of ms of futile i2c -- a desktop at a
+		 * tenth of a frame a second. The cooldown still lets a hotplug re-probe. */
+		if (slot && slot->adap == adap && slot->fail_until &&
+		    lkpi_monotonic_ns() < slot->fail_until)
+			return -ENODEV;
 	}
 
 	/*
@@ -267,6 +278,11 @@ int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 		memcpy(slot->data + offset, msgs[1].buf, msgs[1].len);
 		if ((unsigned)offset + msgs[1].len > slot->len)
 			slot->len = (unsigned)offset + msgs[1].len;
+		slot->fail_until = 0;
+	} else if (is_edid && slot && ret < 0 && slot->len == 0) {
+		/* Never read successfully -- a cached EDID is never dropped by a blip. */
+		slot->adap = adap;
+		slot->fail_until = lkpi_monotonic_ns() + 2000000000ull;
 	}
 
 	return ret;

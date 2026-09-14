@@ -23,6 +23,8 @@
 #include <b1nix/spinlock.h>
 #include <b1nix/tlb.h>
 #include <lkpi/ww_mutex.h>
+#include <lkpi/env.h>
+#include <linux/printk.h>
 
 /* Stamp source. Monotonic across the whole kernel, so any two contexts are
  * comparable no matter which driver created them. Starts at 1 so 0 is never a
@@ -108,6 +110,10 @@ int ww_mutex_trylock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 
 int ww_mutex_lock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 {
+	/* A modeset lock nobody drops is a compositor that stopped, with nothing
+	 * in the log naming the lock or its holder. */
+	u64 ww_report_at = lkpi_ticks() + 500ull;
+
 	if (!lock)
 		return -EINVAL;
 	if (ctx && ctx->done)
@@ -173,6 +179,12 @@ int ww_mutex_lock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 		 * wake to this channel — it cannot fall between the two. */
 		if (ctx)
 			__atomic_store_n(&ctx->parked_on, lock, __ATOMIC_SEQ_CST);
+		if (lkpi_ticks() >= ww_report_at) {
+			lkpi_printk("lkpi: ww_mutex %p held by task %lu, waiter at %p\n",
+			            (void *)lock, (unsigned long)lock->owner,
+			            __builtin_return_address(0));
+			ww_report_at = lkpi_ticks() + 500ull;
+		}
 		scheduler_wait_prepare(lock);
 		spin_lock_irqsave((spinlock_t *)&lock->guard, &flags);
 		int still_held = lock->locked;
@@ -189,6 +201,8 @@ int ww_mutex_lock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 
 void ww_mutex_lock_slow(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 {
+	u64 ww_report_at = lkpi_ticks() + 500ull;
+
 	if (!lock)
 		return;
 	/* The caller has released everything, so it holds no lock anyone could be
@@ -209,6 +223,12 @@ void ww_mutex_lock_slow(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 			cpu_relax();
 			tlb_shootdown_poll();
 			continue;
+		}
+		if (lkpi_ticks() >= ww_report_at) {
+			lkpi_printk("lkpi: ww_mutex %p held by task %lu, waiter at %p\n",
+			            (void *)lock, (unsigned long)lock->owner,
+			            __builtin_return_address(0));
+			ww_report_at = lkpi_ticks() + 500ull;
 		}
 		scheduler_wait_prepare(lock);
 		spin_lock_irqsave((spinlock_t *)&lock->guard, &flags);

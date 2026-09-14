@@ -42,6 +42,7 @@
 #include <b1nix/netdev.h>
 #include <b1nix/vnet.h>
 #include <b1nix/blk.h>
+#include <b1nix/mtd.h>
 #include <b1nix/pci.h>
 #include <b1nix/version.h>
 #include <stdarg.h>
@@ -505,6 +506,15 @@ static int r_cpuinfo(usize pid, struct sbuf *s) {
         sb_addf(s, "cpu MHz\t\t: %lu.%03lu\n", (unsigned long)(khz / 1000),
                 (unsigned long)(khz % 1000));
     }
+    {
+      char flags[768];
+      arch_cpu_flags(flags, sizeof(flags));
+#if defined(__aarch64__)
+      sb_addf(s, "Features\t: %s\n", flags);
+#else
+      sb_addf(s, "flags\t\t: %s\n", flags);
+#endif
+    }
     sb_puts(s, "\n");
   }
   return 0;
@@ -937,6 +947,39 @@ static int r_mountinfo(usize pid, struct sbuf *s) {
  * to report (a browser start-up that takes 95 s took 337 s with it on). A
  * reader that asks for the numbers when it wants them costs nothing in
  * between, so a script can take one sample per run and compare runs. */
+/* /proc/b1nix-kprof — the kernel-RIP histogram alone.
+ *
+ * b1nix-prof prints everything: the syscall table, the page-fault profile, the
+ * interrupts-off sections, the inode waits. That is the right thing to read
+ * once, and the wrong thing to sample repeatedly while something is running --
+ * the read itself took over a minute through the console and changed the
+ * behaviour being measured. This one is thirty lines and can be taken every
+ * few seconds. */
+static int r_b1nix_kprof(usize pid, struct sbuf *s) {
+  (void)pid;
+  (void)s;
+  {
+    extern void kprof_dump_histogram_pub(void);
+
+    kprof_dump_histogram_pub();
+  }
+  return 0;
+}
+
+/*
+ * The same dump, without a reader.
+ *
+ * Reading /proc/b1nix-prof is how the profile comes out, and that needs a
+ * guest that will read it -- fine for the KDE image, useless for a stock
+ * distribution whose init has never heard of this file. `b1nix.prof-at=<sec>`
+ * has the kernel print it once, by itself, that many seconds after boot.
+ */
+static int r_b1nix_prof(usize pid, struct sbuf *s);
+
+void b1nix_prof_dump_all(void) {
+  r_b1nix_prof(0, 0);
+}
+
 static int r_b1nix_prof(usize pid, struct sbuf *s) {
   (void)pid;
   extern void syscall_prof_dump(void);
@@ -945,6 +988,79 @@ static int r_b1nix_prof(usize pid, struct sbuf *s) {
   extern void kprof_dump(void);
   syscall_prof_dump();
   pf_prof_dump();
+  {
+    /* What the disk actually moved for those faults. */
+    u64 calls = 0, cpages = 0, rapages = 0;
+
+    page_cache_read_stats(&calls, &cpages, &rapages);
+    console_write("pcread: clusters=");
+    console_write_dec(calls);
+    console_write(" cluster-pages=");
+    console_write_dec(cpages);
+    console_write(" readahead-pages=");
+    console_write_dec(rapages);
+    console_write("\n");
+    {
+      u64 ino[8], pg[8];
+      unsigned i;
+
+      page_cache_read_top(8, ino, pg);
+      console_write("pcread top (ino:pages):");
+      for (i = 0; i < 8 && pg[i]; i++) {
+        console_write(" ");
+        console_write_dec(ino[i]);
+        console_write(":");
+        console_write_dec(pg[i]);
+      }
+      console_write("\n");
+    }
+    {
+      /* What the disk gave back for it: one request at a time, so this is
+       * latency times count, not bandwidth. */
+      console_write("vblk:");
+#if defined(__x86_64__)
+      /* virtio-blk over PCI; the aarch64 virtio-mmio driver keeps no counters. */
+      extern void virtio_blk_stats(u64 *reqs, u64 *read_sectors, u64 *wait_ns);
+      u64 reqs = 0, sectors = 0, wait_ns = 0;
+
+      virtio_blk_stats(&reqs, &sectors, &wait_ns);
+      console_write(" reqs=");
+      console_write_dec(reqs);
+      console_write(" read-MB=");
+      console_write_dec(sectors / 2048);
+      console_write(" wait-ms=");
+      console_write_dec(wait_ns / 1000000);
+      console_write(" avg-us=");
+      console_write_dec(reqs ? (wait_ns / reqs) / 1000 : 0);
+#endif
+      {
+        extern void blk_cache_stats(u64 *hits, u64 *misses);
+        u64 hits = 0, misses = 0;
+
+        blk_cache_stats(&hits, &misses);
+        console_write(" bcache-hits=");
+        console_write_dec(hits);
+        console_write(" misses=");
+        console_write_dec(misses);
+      }
+#if defined(__x86_64__)
+      {
+        extern void virtio_blk_lock_stats(u64 *free_now, u64 *waited,
+                                          u64 *yields);
+        u64 freen = 0, waited = 0, yields = 0;
+
+        virtio_blk_lock_stats(&freen, &waited, &yields);
+        console_write(" dev-free=");
+        console_write_dec(freen);
+        console_write(" dev-busy=");
+        console_write_dec(waited);
+        console_write(" busy-yields=");
+        console_write_dec(yields);
+      }
+#endif
+      console_write("\n");
+    }
+  }
   kprof_dump();
   {
     extern void vfs_inode_wait_stats(u64 *, u64 *, u64 *, const void **);
@@ -1033,7 +1149,7 @@ static int r_kallsyms(usize pid, struct sbuf *s) {
 /* Linux /proc/<pid>/stat and /proc/<pid>/comm expose the process "comm": the
  * basename of the executable, truncated to TASK_COMM_LEN-1 (15) chars — NOT the
  * full exec path. b1nix stores the exec path in t->name (e.g.
- * "/opt/busybox/bin/busybox"), so derive comm here. BusyBox procps
+ * "/bin/busybox"), so derive comm here. BusyBox procps
  * (pidof/pgrep/pkill/ps) match on this field, so getting it wrong silently
  * breaks process lookup by name. `out` must hold at least 16 bytes. */
 #define PROC_COMM_LEN 16
@@ -2983,6 +3099,21 @@ static int r_partitions(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/mtd: the MTD devices, as libmtd reads them when there is no
+ * /sys/class/mtd. Size and erase size in hex, the name quoted. */
+static int r_mtd(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "dev:    size   erasesize  name\n");
+  for (unsigned i = 0; i < MTD_MAX_DEVICES; i++) {
+    struct mtd_device *d = mtd_device_at(i);
+    if (!d || !d->present)
+      continue;
+    sb_addf(s, "mtd%u: %08x %08x \"%s\"\n", i, (unsigned)d->size,
+            (unsigned)d->erase_size, d->name);
+  }
+  return 0;
+}
+
 /* /proc/diskstats: Linux block-device I/O statistics.  BusyBox lsblk and
  * iostat read this to enumerate physical block devices.  We emit zero
  * counters — the name field is what matters for enumeration. */
@@ -3028,6 +3159,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
   procfs_mkchild(root, "b1nix-prof", VFS_DEVICE, r_b1nix_prof, 0);
+  procfs_mkchild(root, "b1nix-kprof", VFS_DEVICE, r_b1nix_kprof, 0);
   procfs_mkchild(root, "b1nix-tasks", VFS_DEVICE, r_b1nix_tasks, 0);
   procfs_mkchild(root, "b1nix-kheap", VFS_DEVICE, r_b1nix_kheap, 0);
   /* M107: /proc/kmsg — the same record stream as /dev/kmsg. klogd reads this
@@ -3043,6 +3175,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   }
   procfs_mkchild(root, "kallsyms", VFS_DEVICE, r_kallsyms, 0);
   procfs_mkchild(root, "partitions", VFS_DEVICE, r_partitions, 0);
+  procfs_mkchild(root, "mtd", VFS_DEVICE, r_mtd, 0);
   procfs_mkchild(root, "diskstats", VFS_DEVICE, r_diskstats, 0);
   procfs_mkchild(root, "swaps", VFS_DEVICE, r_swaps, 0);
   procfs_mkchild(root, "modules", VFS_DEVICE, r_modules, 0);

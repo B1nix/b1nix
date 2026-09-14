@@ -2487,6 +2487,91 @@ reap:
    * them; nothing is left to delete here. */
 }
 
+/* A UDP port is a namespace's own: the initial namespace holding one does not
+ * stop a socket in another namespace from binding the same number, and a
+ * second bind inside the initial namespace is still refused. */
+static void test_net_ns_udp_port(void) {
+  enum { PORT = NSIP_PORT + 7 };
+  struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(PORT)};
+  int held = socket(AF_INET, SOCK_DGRAM, 0);
+  if (held < 0 || bind(held, (struct sockaddr *)&a, sizeof(a)) != 0) {
+    fail("netns-udp-port-own", -1);
+    if (held >= 0)
+      close(held);
+    return;
+  }
+  int again = socket(AF_INET, SOCK_DGRAM, 0);
+  int dup_rc = again >= 0 ? bind(again, (struct sockaddr *)&a, sizeof(a)) : 0;
+  int dup_err = errno;
+  if (again >= 0)
+    close(again);
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    if (unshare(CLONE_NEWNET) != 0)
+      _exit(2);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+      _exit(3);
+    _exit(bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0 ? 0 : 4);
+  }
+  int status = 0;
+  if (pid > 0)
+    waitpid(pid, &status, 0);
+  close(held);
+  int child = (pid > 0 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+  if (dup_rc == 0 || dup_err != EADDRINUSE || child != 0)
+    note("netns-udp-port-own: dup_rc=%d errno=%d child=%d", dup_rc, dup_err, child);
+  check("netns-udp-port-own", dup_rc != 0 && dup_err == EADDRINUSE && child == 0, child);
+}
+
+/* A TCP listener belongs to its namespace: a connect from another namespace
+ * to the same address and port finds nobody listening. */
+static void test_net_ns_tcp_isolated(void) {
+  enum { PORT = NSIP_PORT + 8 };
+  struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(PORT)};
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  int l = socket(AF_INET, SOCK_STREAM, 0);
+  if (l < 0 || bind(l, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(l, 4) != 0) {
+    fail("netns-tcp-isolated", -1);
+    if (l >= 0)
+      close(l);
+    return;
+  }
+  pid_t pid = fork();
+  if (pid == 0) {
+    if (unshare(CLONE_NEWNET) != 0)
+      _exit(2);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    if (c < 0)
+      _exit(3);
+    if (connect(c, (struct sockaddr *)&a, sizeof(a)) == 0)
+      _exit(4);
+    if (errno != ECONNREFUSED && errno != ENETUNREACH)
+      _exit(5);
+    /* ...while the namespace's own listener on the same port is reachable,
+     * and a byte crosses it both ways through loopback. */
+    int own = socket(AF_INET, SOCK_STREAM, 0);
+    if (own < 0 || bind(own, (struct sockaddr *)&a, sizeof(a)) != 0 ||
+        listen(own, 4) != 0)
+      _exit(6);
+    int c2 = socket(AF_INET, SOCK_STREAM, 0);
+    if (c2 < 0 || connect(c2, (struct sockaddr *)&a, sizeof(a)) != 0)
+      _exit(7);
+    int acc = accept(own, 0, 0);
+    char ch = 0;
+    if (acc < 0 || write(c2, "n", 1) != 1 || read(acc, &ch, 1) != 1 || ch != 'n')
+      _exit(8);
+    _exit(0);
+  }
+  int status = 0;
+  if (pid > 0)
+    waitpid(pid, &status, 0);
+  close(l);
+  int child = (pid > 0 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+  check("netns-tcp-isolated", child == 0, child);
+}
+
 static void test_net_ns_ipv4(void) {
   void (*prev)(int) = signal(SIGPIPE, SIG_IGN);
   test_net_ns_ipv4_inner();
@@ -2685,9 +2770,29 @@ static int probe_super(const char *dev, char *uuid, size_t uuidcap, char *label,
     close(fd);
     return -1;
   }
+  if (sb[0x38] != 0x53 || sb[0x39] != 0xEF) {
+    /* Not ext2/3/4: a btrfs superblock sits at 64 KiB, magic at 0x40, fsid at
+     * 0x20 and the label at 0x12b. */
+    unsigned char bs[0x22b];
+    int ok = lseek(fd, 0x10000, SEEK_SET) == 0x10000 &&
+             read(fd, bs, sizeof(bs)) == (ssize_t)sizeof(bs) &&
+             memcmp(bs + 0x40, "_BHRfS_M", 8) == 0;
+    close(fd);
+    if (!ok)
+      return -1;
+    const unsigned char *u = bs + 0x20;
+    snprintf(uuid, uuidcap,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+             "%02x%02x%02x%02x%02x%02x",
+             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10],
+             u[11], u[12], u[13], u[14], u[15]);
+    char bl[257];
+    memcpy(bl, bs + 0x12b, 256);
+    bl[256] = '\0';
+    snprintf(label, labelcap, "%s", bl);
+    return 0;
+  }
   close(fd);
-  if (sb[0x38] != 0x53 || sb[0x39] != 0xEF)
-    return -1; /* not ext2/3/4 */
 
   const unsigned char *u = sb + 0x68;
   snprintf(uuid, uuidcap,
@@ -2717,7 +2822,7 @@ static int list_disks(char disks[][64], int max) {
  * first decided what the other saw — a path there, a bare name here. */
 static char g_fs_dev[64], g_fs_uuid[128], g_fs_label[128];
 
-/* Find a disk carrying an ext filesystem, and what its superblock says. */
+/* Find a disk carrying an ext or btrfs filesystem, and what its superblock says. */
 static int probe_disk(void) {
   static char disks[32][64];
   int ndisks = list_disks(disks, 32);
@@ -3581,6 +3686,7 @@ static void test_ioprio_applet(void) {
   ok("ioprio-applet");
 }
 
+#if !defined(__aarch64__) /* QEMU virt has no COM2: see the call site */
 /* ── 5. serial line configuration ───────────────────────────────────────── */
 
 /* COM2. The boot console is COM1, and reprogramming the line the log travels
@@ -3751,6 +3857,7 @@ static void test_serial_setserial(void) {
   close(fd);
   ok("serial-setserial");
 }
+#endif /* !__aarch64__ */
 
 /* ── derived limits ─────────────────────────────────────────────────────────
  * These two checks exist to show that a ceiling which used to be compiled in is
@@ -3912,6 +4019,8 @@ int main(void) {
   test_veth_pair();
   test_net_ns();
   test_net_ns_ipv4();
+  test_net_ns_udp_port();
+  test_net_ns_tcp_isolated();
   test_unlink_enoent();
 
   test_dev_nodes_listed();

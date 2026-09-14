@@ -57,6 +57,10 @@ u64 page_cache_dirty_pages(void);
 
 // Returns a referenced page cache entry. The caller must unref it when done.
 struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset);
+/* Detach the list of inodes that dirtied a page since the last call (linked
+ * through dirty_next, each holding a reference). vfs_writeback_dirty_inodes()
+ * is the caller: the flush needs the inode lock, which lives in vfs.c. */
+struct vfs_inode *page_cache_take_dirty_inodes(void);
 
 // Adds a new page cache entry. Takes ownership of the frame if successful.
 // Returns 0 on success, < 0 on error.
@@ -69,6 +73,15 @@ void page_cache_read_cluster(struct vfs_inode *inode, u64 offset,
  * "as much as is worth reading at once" should ask for this rather than name a
  * constant; page_cache_read_cluster clamps to it either way. */
 unsigned page_cache_cluster_pages(void);
+/* What the run has read from disk through the cache: cluster calls, pages
+ * asked for in them, and pages the read-ahead fetched. */
+void page_cache_read_stats(u64 *cluster_calls, u64 *cluster_pages,
+                           u64 *readahead_pages);
+/* The n files that were read most, by inode number and pages. */
+void page_cache_read_top(unsigned n, u64 *ino_out, u64 *pages_out);
+/* What a faulting read should ask for on this stream: the window the pattern
+ * has earned, not the ceiling. */
+unsigned page_cache_fault_cluster(const struct vfs_inode *inode, u64 offset);
 
 // Marks the page as dirty, meaning it needs to be written to disk.
 void page_cache_mark_dirty(struct page_cache_entry *page);
@@ -78,6 +91,7 @@ int page_cache_flush_inode(struct vfs_inode *inode);
 
 // Drop cached pages for an inode that is being destroyed.
 void page_cache_invalidate_inode(struct vfs_inode *inode);
+void page_cache_invalidate_stale(struct vfs_inode *inode);
 
 // Truncate-time invalidation: drop pages at/after new_size and zero the tail
 // of the partial page so a later re-grow reads zeros, not stale contents.

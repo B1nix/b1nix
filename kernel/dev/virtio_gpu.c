@@ -1,6 +1,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
+#include <b1nix/ktime.h>
 #include <b1nix/dma_fence.h>
 #include <b1nix/errno.h>
 #include <b1nix/gpu_scheduler.h>
@@ -1202,7 +1203,7 @@ struct b1nix_virgl_submit_abi {
  * draw state) far exceed one page; size it to hold a real draw. */
 #define VGPU_SUBMIT_BUF_BYTES (64u * 1024)
 /* mmap window per resource. Kept small enough that MAX_RES windows stay under
- * 2 GiB so the offset fits the 32-bit mmap offset arg on the i686 port. */
+ * 2 GiB of mmap offset space. */
 #define VGPU_UDEV_SLOT (64ull * 1024 * 1024)
 #define VGPU_UDEV_MAX_DIM 4096 /* 4096*4096*4 == one 64 MiB slot */
 
@@ -2258,13 +2259,13 @@ static int gfx_prof_on(void)
 
 static u64 gfx_prof_now(void)
 {
-	return gfx_prof_on() ? arch_tsc_monotonic_ns() : 0;
+	return gfx_prof_on() ? ktime_monotonic_ns() : 0;
 }
 
 static void gfx_prof_add(u64 *acc, u64 t0)
 {
 	if (t0)
-		*acc += arch_tsc_monotonic_ns() - t0;
+		*acc += ktime_monotonic_ns() - t0;
 }
 
 void virtio_gpu_prof_report(void)

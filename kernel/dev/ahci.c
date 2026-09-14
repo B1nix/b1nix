@@ -3,6 +3,7 @@
 #include <b1nix/ahci.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
+#include <b1nix/ktime.h>
 #include <b1nix/irq.h>
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
@@ -746,11 +747,11 @@ static void ahci_port_init(struct ahci_port_state *port,
  * Returns 0 when the slot cleared, -1 on the deadline. */
 static int ahci_wait_ci_clear_bounded(volatile struct ahci_port *p,
                                       u32 slot_mask, u64 timeout_ms) {
-  u64 deadline = arch_tsc_monotonic_ns() + timeout_ms * 1000000ull;
+  u64 deadline = ktime_monotonic_ns() + timeout_ms * 1000000ull;
   while (p->ci & slot_mask) {
     for (int i = 0; i < 256; i++)
       cpu_relax();
-    if (arch_tsc_monotonic_ns() >= deadline)
+    if (ktime_monotonic_ns() >= deadline)
       return (p->ci & slot_mask) ? -1 : 0;
   }
   return 0;
@@ -847,6 +848,7 @@ void ahci_init(void) {
     return;
   }
 
+  pci_bind_driver(&pci, "ahci");
   console_write("ahci: found controller v=0x");
   console_write_hex32(pci.vendor_id);
   console_write(" d=0x");

@@ -93,10 +93,21 @@ struct lockdep_map { int unused; };
 #define mutex_release(map, ip)                    do { } while (0)
 #define lock_acquire(map, subclass, trylock, read, check, nest, ip) \
 	do { } while (0)
+#ifndef lock_release
 #define lock_release(map, ip) do { } while (0)
+#endif
 
 
 /* The raw initialiser, which upstream's mutex_init macro expands to. */
 #define __mutex_init(m, name, key) do { (void)(name); (void)(key); mutex_init(m); } while (0)
+
+/*
+ * Take the mutex, telling the scheduler the wait is for I/O.
+ *
+ * Upstream the difference is accounting — the time counts as iowait rather than
+ * idle — not behaviour. b1nix does not separate the two, so this is the plain
+ * lock; the name is kept because the call sites are documenting why they wait.
+ */
+static inline void mutex_lock_io(struct mutex *m) { mutex_lock(m); }
 
 #endif

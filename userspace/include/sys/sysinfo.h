@@ -8,9 +8,8 @@
 
 /* Linux struct sysinfo ABI (see sysinfo(2)). The kernel SYS_SYSINFO handler
  * copies a byte-identical layout out, so the field widths here MUST mirror the
- * kernel's: both sides use native `unsigned long`, which is 32-bit on i686 and
- * 64-bit on x86_64 — identical per arch, so no padding mismatch. The trailing
- * _f[] pad keeps the struct at the historical 64-bit/32-bit size. */
+ * kernel's: both sides use native 64-bit `unsigned long`, so no padding mismatch.
+ * The trailing _f[] pad keeps the struct at its historical size. */
 struct sysinfo {
   long uptime;             /* seconds since boot */
   unsigned long loads[3];  /* 1, 5, 15 minute load averages (<<16 fixed point) */

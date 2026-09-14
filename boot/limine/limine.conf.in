@@ -1,11 +1,11 @@
 # Limine config template for the b1nix live/test ISOs (BSD-2-Clause bootloader;
 # replaces the GPLv3 GNU GRUB configuration this repo used to carry). Expanded
-# by tools/mkiso.sh, which substitutes four placeholders: the boot-menu timeout
+# by tools/images/mkiso.sh, which substitutes four placeholders: the boot-menu timeout
 # in seconds (0 boots entry 1 immediately), the build architecture used in the
 # menu titles, the kernel command line, and a whole-line MODULES placeholder
 # that becomes the module_path/module_string pair of every --module argument
 # (and disappears entirely when there are none). The placeholder names are
-# spelled out in tools/mkiso.sh rather than here, so this comment survives the
+# spelled out in tools/images/mkiso.sh rather than here, so this comment survives the
 # substitution intact.
 #
 # `resolution` asks Limine for the mode the kernel's Multiboot2 framebuffer tag
