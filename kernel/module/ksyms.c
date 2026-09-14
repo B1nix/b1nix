@@ -18,6 +18,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/arch.h>
 #include <b1nix/module.h>
+#include <b1nix/namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/netproto.h>
@@ -193,6 +194,12 @@ EXPORT_SYMBOL(net_get_prefix6_valid);
 EXPORT_SYMBOL(net_set_ip6);
 EXPORT_SYMBOL(net_set_gateway6);
 EXPORT_SYMBOL(net_set_prefix6);
+/* Per-namespace IPv6 state: ipv6.ko filters and sources by it, ndp.ko keys its
+   neighbour cache by the namespace a message arrived in. */
+EXPORT_SYMBOL(net_ip6_is_local);
+EXPORT_SYMBOL(net_ip6_source_for);
+EXPORT_SYMBOL(vfs_socket_push_raw_icmp6);
+EXPORT_SYMBOL(namespace_net_context);
 EXPORT_SYMBOL(tcp6_receive);
 EXPORT_SYMBOL(udp6_receive);
 EXPORT_SYMBOL(udp_register_handler);

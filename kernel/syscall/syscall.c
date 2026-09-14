@@ -4239,6 +4239,7 @@ static u64 sys_accept(int fd, void *addr, usize *addrlen) {
  * in the socket layer. */
 #define SYS_SOL_SOCKET_LEVEL 1
 #define SYS_SO_ATTACH_FILTER 26
+#define SYS_SO_BINDTODEVICE 25
 
 static u64 sys_setsockopt_attach_filter(int fd, const void *user_optval,
                                         usize optlen) {
@@ -4266,6 +4267,10 @@ static u64 sys_setsockopt_attach_filter(int fd, const void *user_optval,
 static u64 sys_setsockopt(int fd, int level, int optname,
                           const void *user_optval, usize optlen) {
   u8 kopt[64];
+  /* SO_BINDTODEVICE with a zero length is how a socket is unbound. */
+  if (level == SYS_SOL_SOCKET_LEVEL && optname == SYS_SO_BINDTODEVICE &&
+      optlen == 0)
+    return (u64)vfs_setsockopt(fd, level, optname, kopt, 0);
   if (!user_optval || optlen == 0)
     return (u64)-EINVAL;
   if (level == SYS_SOL_SOCKET_LEVEL && optname == SYS_SO_ATTACH_FILTER)

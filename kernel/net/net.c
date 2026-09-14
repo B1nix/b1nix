@@ -6,6 +6,7 @@
 #include <b1nix/net.h>
 #include <b1nix/netproto.h>
 #include <b1nix/netdev.h>
+#include <b1nix/netlink.h>
 #include <b1nix/packet.h>
 #include <b1nix/pci.h>
 #include <b1nix/ipi.h>
@@ -23,9 +24,11 @@
  */
 
 /* ── Active NIC registry ────────────────────────────────────────────────── */
-/* Sixteen, not eight: a veth pair costs two slots and a namespace usually gets
- * one pair on top of whatever the initial namespace already holds. */
-#define NET_MAX_NETDEVS 16
+/* A veth pair costs two slots and a namespace usually gets one pair on top of
+ * whatever the initial namespace already holds; a deleted device's slot is not
+ * reused (see netdev_unregister). The ceiling sits just under
+ * NETLINK_LO_IFINDEX, the index loopback is presented under. */
+#define NET_MAX_NETDEVS (NETLINK_LO_IFINDEX - 1)
 
 static struct netdev *netdev_best(void);
 static void net_reset_interface_state(struct netdev *nd);
@@ -120,8 +123,10 @@ int netdev_set_netns(struct netdev *nd, u32 ns)
 	 * hold an address: keeping the L3 configuration would leave it answering
 	 * for an address no cable reaches. The initial namespace is handled by
 	 * net_reset_interface_state() instead, which knows about DHCP. */
-	if (from != 0 && !netdev_active_ns(from))
+	if (from != 0 && !netdev_active_ns(from)) {
 		net_ns_clear_ipv4(from);
+		net_ns_clear_ipv6(from);
+	}
 	return 0;
 }
 
@@ -143,6 +148,7 @@ void net_ns_destroy(u32 ns)
 		nd->netns = 0;
 	}
 	net_ns_clear_ipv4(ns);
+	net_ns_clear_ipv6(ns);
 	route_flush_ns(ns);
 	arp_flush_ns(ns);
 }
@@ -221,8 +227,8 @@ int netdev_holds_address(struct netdev *nd)
 {
 	if (!nd || nd != netdev_active_ns(nd->netns))
 		return 0;
-	struct ipv4_addr ip = net_get_ip_ns(nd->netns);
-	return (ip.bytes[0] | ip.bytes[1] | ip.bytes[2] | ip.bytes[3]) != 0;
+	struct net_v4_addr_info one;
+	return net_ipv4_addr_list(nd->netns, &one, 1) != 0;
 }
 struct netdev *netdev_receiving(void) { return g_receiving_netdev; }
 
@@ -412,10 +418,21 @@ static struct mac_addr local_mac;
  *
  * M84: the netmask is real state (DHCP option 1), not a /24 assumption baked
  * into ipv4_send/procfs. It defines the on-link prefix the FIB installs. */
+/* Addresses beyond the primary one: `ip addr add` of a second address, or an
+ * ifconfig alias. Each carries its own prefix, so each has its own on-link
+ * route and is the source of whatever is sent onto that prefix. */
+struct net_v4_secondary {
+	int used;
+	struct ipv4_addr ip;
+	struct ipv4_addr mask;
+	char label[16];
+};
+
 struct net_ns_ipv4 {
 	struct ipv4_addr ip;
 	struct ipv4_addr gateway;
 	struct ipv4_addr netmask;
+	struct net_v4_secondary sec[NET_V4_MAX_ADDRS - 1];
 };
 
 static struct net_ns_ipv4 net_ns_v4[NS_MAX_NET];
@@ -428,13 +445,30 @@ static struct net_ns_ipv4 *net_v4(u32 ns)
 	return &net_ns_v4[ns < NS_MAX_NET ? ns : 0];
 }
 
-/* IPv6 interface state: link-local is derived from the MAC at probe time; the
- * global address / prefix / gateway are filled in by SLAAC (see ndp.c). */
-static struct in6_addr_k local_ip6_ll;       /* fe80::/64 link-local */
-static struct in6_addr_k local_ip6;          /* global (SLAAC), 0 until set */
-static struct in6_addr_k gateway_ip6;        /* router link-local */
-static struct in6_addr_k prefix6;            /* on-link /64 prefix */
-static int prefix6_valid;
+/* IPv6 interface state, one set per network namespace. The initial
+ * namespace's link-local is derived from the active NIC's MAC when that NIC is
+ * chosen; any other namespace's comes from the MAC of the interface moved into
+ * it. The global address / prefix / gateway are filled in by SLAAC (ndp.c),
+ * and `ip -6 addr add` assigns further addresses next to them. */
+struct net_ns_ipv6 {
+	struct in6_addr_k global;   /* SLAAC / DHCPv6, 0 until set */
+	struct in6_addr_k gateway;  /* router link-local */
+	struct in6_addr_k prefix;   /* on-link /64 prefix */
+	int prefix_valid;
+	struct {
+		int used;
+		struct in6_addr_k addr;
+		u8 plen;
+	} assigned[NET_V6_MAX_ADDRS];
+};
+
+static struct net_ns_ipv6 net_ns_v6[NS_MAX_NET];
+static struct in6_addr_k local_ip6_ll; /* the initial namespace's fe80::/64 */
+
+static struct net_ns_ipv6 *net_v6(u32 ns)
+{
+	return &net_ns_v6[ns < NS_MAX_NET ? ns : 0];
+}
 
 #define NET_MAX_ADAPTERS 8
 
@@ -477,21 +511,412 @@ void net_set_ip(struct ipv4_addr ip) { net_set_ip_ns(net_ns_ctx(), ip); }
 void net_set_gateway(struct ipv4_addr gw) { net_set_gateway_ns(net_ns_ctx(), gw); }
 void net_set_netmask(struct ipv4_addr m) { net_set_netmask_ns(net_ns_ctx(), m); }
 
-struct in6_addr_k net_get_ip6_ll(void) { return local_ip6_ll; }
-struct in6_addr_k net_get_ip6(void) { return local_ip6; }
-struct in6_addr_k net_get_gateway6(void) { return gateway_ip6; }
-struct in6_addr_k net_get_prefix6(void) { return prefix6; }
-int net_get_prefix6_valid(void) { return prefix6_valid; }
-void net_set_ip6(struct in6_addr_k a) { local_ip6 = a; }
-void net_set_gateway6(struct in6_addr_k a) { gateway_ip6 = a; }
-void net_set_prefix6(struct in6_addr_k p) { prefix6 = p; prefix6_valid = 1; }
+/* ── Every IPv4 address of a namespace ─────────────────────────────────── */
+
+static int ip4_is_zero(struct ipv4_addr a)
+{
+	return (a.bytes[0] | a.bytes[1] | a.bytes[2] | a.bytes[3]) == 0;
+}
+
+static int ip4_eq(struct ipv4_addr a, struct ipv4_addr b)
+{
+	return memcmp(a.bytes, b.bytes, 4) == 0;
+}
+
+static int ip4_same_prefix(struct ipv4_addr a, struct ipv4_addr b,
+                           struct ipv4_addr mask)
+{
+	if (ip4_is_zero(mask))
+		return 0;
+	for (int i = 0; i < 4; i++)
+		if ((a.bytes[i] & mask.bytes[i]) != (b.bytes[i] & mask.bytes[i]))
+			return 0;
+	return 1;
+}
+
+int net_ipv4_addr_add(u32 ns, struct ipv4_addr ip, struct ipv4_addr mask,
+                      const char *label)
+{
+	struct net_ns_ipv4 *v = net_v4(ns);
+	int is_alias = label && label[0];
+
+	if (ip4_is_zero(ip))
+		return -EINVAL;
+	/* The primary address again: a new prefix length for it. */
+	if (!is_alias && ip4_eq(v->ip, ip)) {
+		if (!ip4_is_zero(mask))
+			v->netmask = mask;
+		return 0;
+	}
+	struct net_v4_secondary *free_slot = 0;
+	for (usize i = 0; i < NET_V4_MAX_ADDRS - 1; i++) {
+		struct net_v4_secondary *s = &v->sec[i];
+		if (!s->used) {
+			if (!free_slot)
+				free_slot = s;
+			continue;
+		}
+		if (ip4_eq(s->ip, ip) || (is_alias && strcmp(s->label, label) == 0)) {
+			/* Re-adding an address updates it; re-addressing an alias moves
+			 * the alias. */
+			s->ip = ip;
+			if (!ip4_is_zero(mask))
+				s->mask = mask;
+			if (is_alias)
+				strncpy(s->label, label, sizeof(s->label) - 1);
+			return 0;
+		}
+	}
+	/* The first address an interface is given is its primary, unless it is
+	 * explicitly an alias. */
+	if (!is_alias && ip4_is_zero(v->ip)) {
+		v->ip = ip;
+		v->netmask = mask;
+		return 0;
+	}
+	if (!free_slot)
+		return -ENOSPC;
+	memset(free_slot, 0, sizeof(*free_slot));
+	free_slot->used = 1;
+	free_slot->ip = ip;
+	free_slot->mask = mask;
+	if (is_alias)
+		strncpy(free_slot->label, label, sizeof(free_slot->label) - 1);
+	return 0;
+}
+
+int net_ipv4_addr_del(u32 ns, struct ipv4_addr ip)
+{
+	struct net_ns_ipv4 *v = net_v4(ns);
+
+	if (ip4_is_zero(ip))
+		return -EADDRNOTAVAIL;
+	if (ip4_eq(v->ip, ip)) {
+		/* Deleting the primary promotes the next address rather than
+		 * silently dropping every other address with it. */
+		memset(&v->ip, 0, sizeof(v->ip));
+		memset(&v->netmask, 0, sizeof(v->netmask));
+		for (usize i = 0; i < NET_V4_MAX_ADDRS - 1; i++) {
+			struct net_v4_secondary *s = &v->sec[i];
+			if (!s->used || s->label[0])
+				continue;
+			v->ip = s->ip;
+			v->netmask = s->mask;
+			memset(s, 0, sizeof(*s));
+			break;
+		}
+		return 0;
+	}
+	for (usize i = 0; i < NET_V4_MAX_ADDRS - 1; i++) {
+		struct net_v4_secondary *s = &v->sec[i];
+		if (s->used && ip4_eq(s->ip, ip)) {
+			memset(s, 0, sizeof(*s));
+			return 0;
+		}
+	}
+	return -EADDRNOTAVAIL;
+}
+
+int net_ipv4_is_local_ns(u32 ns, struct ipv4_addr ip)
+{
+	struct net_ns_ipv4 *v = net_v4(ns);
+
+	if (ip4_is_zero(ip))
+		return 0;
+	if (ip4_eq(v->ip, ip))
+		return 1;
+	for (usize i = 0; i < NET_V4_MAX_ADDRS - 1; i++)
+		if (v->sec[i].used && ip4_eq(v->sec[i].ip, ip))
+			return 1;
+	return 0;
+}
+
+/* The address on the peer's prefix, as Linux's inet_select_addr() picks it;
+ * the primary when no address shares one (a destination behind a gateway, or
+ * a broadcast); any address at all before there is a primary. */
+struct ipv4_addr net_ipv4_source_for(u32 ns, struct ipv4_addr peer)
+{
+	struct net_ns_ipv4 *v = net_v4(ns);
+
+	if (!ip4_is_zero(v->ip) && ip4_same_prefix(v->ip, peer, v->netmask))
+		return v->ip;
+	for (usize i = 0; i < NET_V4_MAX_ADDRS - 1; i++)
+		if (v->sec[i].used && ip4_same_prefix(v->sec[i].ip, peer, v->sec[i].mask))
+			return v->sec[i].ip;
+	if (!ip4_is_zero(v->ip))
+		return v->ip;
+	for (usize i = 0; i < NET_V4_MAX_ADDRS - 1; i++)
+		if (v->sec[i].used)
+			return v->sec[i].ip;
+	return v->ip;
+}
+
+usize net_ipv4_addr_list(u32 ns, struct net_v4_addr_info *out, usize max)
+{
+	struct net_ns_ipv4 *v = net_v4(ns);
+	usize n = 0;
+
+	if (!out)
+		return 0;
+	if (!ip4_is_zero(v->ip) && n < max) {
+		memset(&out[n], 0, sizeof(out[n]));
+		out[n].ip = v->ip;
+		out[n].mask = v->netmask;
+		n++;
+	}
+	for (usize i = 0; i < NET_V4_MAX_ADDRS - 1 && n < max; i++) {
+		struct net_v4_secondary *s = &v->sec[i];
+		if (!s->used)
+			continue;
+		memset(&out[n], 0, sizeof(out[n]));
+		out[n].ip = s->ip;
+		out[n].mask = s->mask;
+		memcpy(out[n].label, s->label, sizeof(out[n].label));
+		out[n].secondary = (u8)(!ip4_is_zero(v->ip) &&
+		                        ip4_same_prefix(v->ip, s->ip, v->netmask));
+		n++;
+	}
+	return n;
+}
+
+int net_ipv4_alias_get(u32 ns, const char *label, struct net_v4_addr_info *out)
+{
+	struct net_ns_ipv4 *v = net_v4(ns);
+
+	if (!label || !label[0])
+		return -EINVAL;
+	for (usize i = 0; i < NET_V4_MAX_ADDRS - 1; i++) {
+		struct net_v4_secondary *s = &v->sec[i];
+		if (!s->used || strcmp(s->label, label) != 0)
+			continue;
+		if (out) {
+			memset(out, 0, sizeof(*out));
+			out->ip = s->ip;
+			out->mask = s->mask;
+			memcpy(out->label, s->label, sizeof(out->label));
+		}
+		return 0;
+	}
+	return -EADDRNOTAVAIL;
+}
+
+void net_ipv4_routes_refresh(u32 ns)
+{
+	struct net_ns_ipv4 *v = net_v4(ns);
+	int any = !ip4_is_zero(v->ip);
+
+	for (usize i = 0; i < NET_V4_MAX_ADDRS - 1; i++)
+		if (v->sec[i].used)
+			any = 1;
+	if (!any) {
+		route_flush_dynamic();
+		return;
+	}
+	route_configure_interface(v->ip, v->netmask, v->gateway);
+}
+
+/* ── IPv6 addresses ────────────────────────────────────────────────────── */
+
+static int in6_zero(const struct in6_addr_k *a)
+{
+	for (int i = 0; i < 16; i++)
+		if (a->bytes[i])
+			return 0;
+	return 1;
+}
+
+static int in6_prefix_match(const struct in6_addr_k *a,
+                            const struct in6_addr_k *b, u8 plen)
+{
+	u8 full = (u8)(plen / 8), rem = (u8)(plen % 8);
+
+	if (plen > 128)
+		return 0;
+	if (memcmp(a->bytes, b->bytes, full) != 0)
+		return 0;
+	if (rem) {
+		u8 m = (u8)(0xFF << (8 - rem));
+		if ((a->bytes[full] & m) != (b->bytes[full] & m))
+			return 0;
+	}
+	return 1;
+}
+
+static struct in6_addr_k ll_from_mac(struct mac_addr mac)
+{
+	struct in6_addr_k a;
+
+	memset(&a, 0, sizeof(a));
+	a.bytes[0] = 0xfe;
+	a.bytes[1] = 0x80;
+	a.bytes[8] = mac.bytes[0] ^ 0x02; /* flip U/L bit */
+	a.bytes[9] = mac.bytes[1];
+	a.bytes[10] = mac.bytes[2];
+	a.bytes[11] = 0xff;
+	a.bytes[12] = 0xfe;
+	a.bytes[13] = mac.bytes[3];
+	a.bytes[14] = mac.bytes[4];
+	a.bytes[15] = mac.bytes[5];
+	return a;
+}
+
+static struct in6_addr_k net_ip6_ll_ns(u32 ns)
+{
+	if (ns == 0)
+		return local_ip6_ll;
+	struct netdev *nd = netdev_active_ns(ns);
+	if (!nd) {
+		struct in6_addr_k zero;
+		memset(&zero, 0, sizeof(zero));
+		return zero;
+	}
+	return ll_from_mac(nd->mac);
+}
+
+struct in6_addr_k net_get_ip6_ll(void) { return net_ip6_ll_ns(net_ns_ctx()); }
+struct in6_addr_k net_get_ip6(void) { return net_v6(net_ns_ctx())->global; }
+struct in6_addr_k net_get_gateway6(void) { return net_v6(net_ns_ctx())->gateway; }
+struct in6_addr_k net_get_prefix6(void) { return net_v6(net_ns_ctx())->prefix; }
+int net_get_prefix6_valid(void) { return net_v6(net_ns_ctx())->prefix_valid; }
+void net_set_ip6(struct in6_addr_k a) { net_v6(net_ns_ctx())->global = a; }
+void net_set_gateway6(struct in6_addr_k a) { net_v6(net_ns_ctx())->gateway = a; }
+void net_set_prefix6(struct in6_addr_k p)
+{
+	struct net_ns_ipv6 *v = net_v6(net_ns_ctx());
+	v->prefix = p;
+	v->prefix_valid = 1;
+}
+
+void net_ns_clear_ipv6(u32 ns)
+{
+	memset(net_v6(ns), 0, sizeof(struct net_ns_ipv6));
+}
+
+int net_ipv6_addr_add(u32 ns, struct in6_addr_k a, u8 plen)
+{
+	struct net_ns_ipv6 *v = net_v6(ns);
+	int slot = -1;
+
+	if (in6_zero(&a) || a.bytes[0] == 0xff || plen > 128)
+		return -EINVAL;
+	for (int i = 0; i < NET_V6_MAX_ADDRS; i++) {
+		if (v->assigned[i].used &&
+		    memcmp(v->assigned[i].addr.bytes, a.bytes, 16) == 0) {
+			v->assigned[i].plen = plen;
+			return 0;
+		}
+		if (!v->assigned[i].used && slot < 0)
+			slot = i;
+	}
+	if (slot < 0)
+		return -ENOSPC;
+	v->assigned[slot].used = 1;
+	v->assigned[slot].addr = a;
+	v->assigned[slot].plen = plen;
+	return 0;
+}
+
+int net_ipv6_addr_del(u32 ns, struct in6_addr_k a)
+{
+	struct net_ns_ipv6 *v = net_v6(ns);
+
+	for (int i = 0; i < NET_V6_MAX_ADDRS; i++) {
+		if (v->assigned[i].used &&
+		    memcmp(v->assigned[i].addr.bytes, a.bytes, 16) == 0) {
+			memset(&v->assigned[i], 0, sizeof(v->assigned[i]));
+			return 0;
+		}
+	}
+	if (!in6_zero(&v->global) && memcmp(v->global.bytes, a.bytes, 16) == 0) {
+		memset(&v->global, 0, sizeof(v->global));
+		return 0;
+	}
+	return -EADDRNOTAVAIL;
+}
+
+usize net_ipv6_addr_list(u32 ns, struct net_v6_addr_info *out, usize max)
+{
+	struct net_ns_ipv6 *v = net_v6(ns);
+	usize n = 0;
+	struct in6_addr_k ll = net_ip6_ll_ns(ns);
+
+	if (!out)
+		return 0;
+	if (!in6_zero(&ll) && n < max) {
+		out[n].addr = ll;
+		out[n].plen = 64;
+		out[n].scope_link = 1;
+		n++;
+	}
+	if (!in6_zero(&v->global) && n < max) {
+		out[n].addr = v->global;
+		out[n].plen = 64;
+		out[n].scope_link = 0;
+		n++;
+	}
+	for (int i = 0; i < NET_V6_MAX_ADDRS && n < max; i++) {
+		if (!v->assigned[i].used)
+			continue;
+		out[n].addr = v->assigned[i].addr;
+		out[n].plen = v->assigned[i].plen;
+		out[n].scope_link = (u8)(v->assigned[i].addr.bytes[0] == 0xfe &&
+		                         (v->assigned[i].addr.bytes[1] & 0xc0) == 0x80);
+		n++;
+	}
+	return n;
+}
+
+int net_ip6_is_local(struct in6_addr_k a)
+{
+	u32 ns = net_ns_ctx();
+	struct net_ns_ipv6 *v = net_v6(ns);
+	struct in6_addr_k ll = net_ip6_ll_ns(ns);
+
+	if (in6_zero(&a))
+		return 0;
+	if (memcmp(ll.bytes, a.bytes, 16) == 0)
+		return 1;
+	if (!in6_zero(&v->global) && memcmp(v->global.bytes, a.bytes, 16) == 0)
+		return 1;
+	for (int i = 0; i < NET_V6_MAX_ADDRS; i++)
+		if (v->assigned[i].used &&
+		    memcmp(v->assigned[i].addr.bytes, a.bytes, 16) == 0)
+			return 1;
+	return 0;
+}
+
+/* Loopback for ::1, the link-local for link-local and multicast peers, else
+ * the assigned address on the destination's prefix, the SLAAC address, any
+ * assigned address, and the link-local as the last resort. */
+struct in6_addr_k net_ip6_source_for(struct in6_addr_k dst)
+{
+	u32 ns = net_ns_ctx();
+	struct net_ns_ipv6 *v = net_v6(ns);
+	int is_lo = 1;
+
+	for (int i = 0; i < 15; i++)
+		if (dst.bytes[i])
+			is_lo = 0;
+	if (is_lo && dst.bytes[15] == 1)
+		return dst;
+	if (dst.bytes[0] == 0xff || (dst.bytes[0] == 0xfe && (dst.bytes[1] & 0xc0) == 0x80))
+		return net_ip6_ll_ns(ns);
+	for (int i = 0; i < NET_V6_MAX_ADDRS; i++)
+		if (v->assigned[i].used && v->assigned[i].plen &&
+		    in6_prefix_match(&v->assigned[i].addr, &dst, v->assigned[i].plen))
+			return v->assigned[i].addr;
+	if (!in6_zero(&v->global))
+		return v->global;
+	for (int i = 0; i < NET_V6_MAX_ADDRS; i++)
+		if (v->assigned[i].used)
+			return v->assigned[i].addr;
+	return net_ip6_ll_ns(ns);
+}
 
 static void net_compute_link_local(void);
 
 static void net_reset_interface_state(struct netdev *nd)
 {
-	struct ipv4_addr zero4 = {{0, 0, 0, 0}};
-
 	/* nd == NULL: no interface is active any more (every one of them was taken
 	 * administratively down). Keep the last station address so /sys and ifconfig
 	 * still report the hardware, but drop every L3 fact. */
@@ -500,17 +925,13 @@ static void net_reset_interface_state(struct netdev *nd)
 	/* This is the initial namespace's interface changing under it. A namespace
 	 * that was handed an interface keeps its own configuration; nothing here
 	 * happened to it. */
-	net_set_ip_ns(0, zero4);
-	net_set_gateway_ns(0, zero4);
-	net_set_netmask_ns(0, zero4);
 	/* The FIB describes the old interface's topology; a switch invalidates
 	 * every autoconfigured route. */
 	route_flush_dynamic();
 	route6_flush_dynamic();
-	memset(&local_ip6, 0, sizeof(local_ip6));
-	memset(&gateway_ip6, 0, sizeof(gateway_ip6));
-	memset(&prefix6, 0, sizeof(prefix6));
-	prefix6_valid = 0;
+	/* Secondary addresses described the old interface too. */
+	net_ns_clear_ipv4(0);
+	net_ns_clear_ipv6(0);
 	net_compute_link_local();
 	arp_init();
 	net_proto_reset();
@@ -627,17 +1048,7 @@ int net_dhcp_try_failover(void)
  * compose the fe80::/64 link-local address. */
 static void net_compute_link_local(void)
 {
-	memset(&local_ip6_ll, 0, sizeof(local_ip6_ll));
-	local_ip6_ll.bytes[0] = 0xfe;
-	local_ip6_ll.bytes[1] = 0x80;
-	local_ip6_ll.bytes[8] = local_mac.bytes[0] ^ 0x02; /* flip U/L bit */
-	local_ip6_ll.bytes[9] = local_mac.bytes[1];
-	local_ip6_ll.bytes[10] = local_mac.bytes[2];
-	local_ip6_ll.bytes[11] = 0xff;
-	local_ip6_ll.bytes[12] = 0xfe;
-	local_ip6_ll.bytes[13] = local_mac.bytes[3];
-	local_ip6_ll.bytes[14] = local_mac.bytes[4];
-	local_ip6_ll.bytes[15] = local_mac.bytes[5];
+	local_ip6_ll = ll_from_mac(local_mac);
 }
 
 int net_is_ready(void) { return netdev_active() != 0; }
@@ -910,6 +1321,7 @@ void net_init(void)
 	memset(g_netdevs, 0, sizeof(g_netdevs));
 	memset(&local_mac, 0, sizeof(local_mac));
 	memset(net_ns_v4, 0, sizeof(net_ns_v4));
+	memset(net_ns_v6, 0, sizeof(net_ns_v6));
 	/* Default policy (everything looks in the main table) plus the standing
 	 * on-link IPv6 routes: fe80::/10, ::1/128 and ff02::/16 exist by
 	 * definition, so NDP works before any router advertisement. */

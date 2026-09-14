@@ -125,6 +125,9 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 /* ipv4_send() plus the per-packet flags above. */
 void ipv4_send_tx(struct ipv4_addr dst, u8 protocol, const void *payload,
                   usize size, u32 ip_tx_flags);
+/* Same, out of interface index `oif` when non-zero (SO_BINDTODEVICE). */
+void ipv4_send_tx_oif(struct ipv4_addr dst, u8 protocol, const void *payload,
+                      usize size, u32 ip_tx_flags, int oif);
 int ipv4_is_loopback(struct ipv4_addr ip);
 
 // IPv6 datapath (loopback + real-link via NDP)
@@ -184,6 +187,9 @@ u32 icmp_echo_reply_count(void);
 typedef void (*udp_port_handler_t)(const void *data, usize size);
 void udp_receive(struct ipv4_addr src, const void *data, usize size);
 void udp_send_net(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net, const void *payload, usize size);
+/* Same, out of interface index `oif` when non-zero (SO_BINDTODEVICE). */
+void udp_send_net_oif(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net,
+                      const void *payload, usize size, int oif);
 void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload, usize size);
 int udp_register_handler(u16 port, udp_port_handler_t handler);
 /* IPv6 UDP handlers also receive the datagram's source address. */
@@ -285,6 +291,9 @@ usize udp_binding_snapshot(struct net_sock_info *out, usize max);
 /* Deliver an inbound ICMP packet to every SOCK_RAW/ICMP socket (BusyBox ping),
  * prepending a synthetic IPv4 header. Called from icmp_receive(). */
 void vfs_socket_push_raw_icmp(struct ipv4_addr src, const void *icmp, usize len);
+/* Hand one ICMPv6 message to the raw ICMPv6 sockets of the current namespace. */
+void vfs_socket_push_raw_icmp6(struct in6_addr_k src, const void *icmp6,
+                               usize len);
 /* TCP over IPv6 (loopback ::1). */
 void tcp6_receive(struct in6_addr_k src, const void *data, usize size);
 struct tcp_conn *tcp_connect6(struct in6_addr_k dst_ip6, u16 dst_port);
@@ -324,6 +333,44 @@ void net_set_gateway_ns(u32 ns, struct ipv4_addr gw);
 void net_set_netmask_ns(u32 ns, struct ipv4_addr mask);
 /* Drop every IPv4 fact a namespace held (used when it is torn down). */
 void net_ns_clear_ipv4(u32 ns);
+
+/* A namespace holds more than one IPv4 address. The accessors above are the
+ * PRIMARY address (what DHCP binds and SIOCSIFADDR on the interface name
+ * sets); the ones below cover every address, secondaries and ifconfig aliases
+ * ("eth0:1") included. */
+struct net_v4_addr_info {
+	struct ipv4_addr ip;
+	struct ipv4_addr mask;
+	char label[16];  /* "" = the interface's own name */
+	u8 secondary;    /* same prefix as the primary (IFA_F_SECONDARY) */
+};
+#define NET_V4_MAX_ADDRS 8
+int net_ipv4_addr_add(u32 ns, struct ipv4_addr ip, struct ipv4_addr mask,
+                      const char *label);
+int net_ipv4_addr_del(u32 ns, struct ipv4_addr ip);
+int net_ipv4_is_local_ns(u32 ns, struct ipv4_addr ip);
+/* The address to send from towards `peer` (a destination or next hop). */
+struct ipv4_addr net_ipv4_source_for(u32 ns, struct ipv4_addr peer);
+usize net_ipv4_addr_list(u32 ns, struct net_v4_addr_info *out, usize max);
+int net_ipv4_alias_get(u32 ns, const char *label, struct net_v4_addr_info *out);
+/* Re-install the on-link route of every address plus the default route. */
+void net_ipv4_routes_refresh(u32 ns);
+
+/* IPv6 addresses of a namespace: its link-local, the SLAAC/DHCPv6 address and
+ * the administratively assigned ones. The unsuffixed forms answer in the
+ * current namespace context. */
+struct net_v6_addr_info {
+	struct in6_addr_k addr;
+	u8 plen;
+	u8 scope_link;
+};
+#define NET_V6_MAX_ADDRS 8
+int net_ipv6_addr_add(u32 ns, struct in6_addr_k a, u8 plen);
+int net_ipv6_addr_del(u32 ns, struct in6_addr_k a);
+usize net_ipv6_addr_list(u32 ns, struct net_v6_addr_info *out, usize max);
+int net_ip6_is_local(struct in6_addr_k a);
+struct in6_addr_k net_ip6_source_for(struct in6_addr_k dst);
+void net_ns_clear_ipv6(u32 ns);
 
 /* ── M84: IPv4 FIB (kernel/net/route.c) ──────────────────────────────────
  * Longest-prefix-match routing table. Addresses are host order (a.b.c.d ->

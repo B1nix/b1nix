@@ -73,6 +73,9 @@ static int in6_is_loopback(const struct in6_addr_k *a)
 }
 
 static int in6_is_multicast(const struct in6_addr_k *a);
+static void ipv6_send_src(struct netdev *dev, const struct in6_addr_k *src,
+                          struct in6_addr_k dst, u8 next_header,
+                          const void *payload, usize size);
 
 /* ICMPv6 checksum: 16-bit ones' complement over the IPv6 pseudo-header
  * (src, dst, 32-bit upper-layer length, next header) followed by the message. */
@@ -117,7 +120,11 @@ static void icmpv6_receive(const struct in6_addr_k *src,
 		/* Reply travels dst -> src, so the pseudo-header swaps addresses. */
 		u16 csum = icmpv6_checksum(dst, src, IP6_NH_ICMPV6, reply, size);
 		rhdr->checksum = bswap16(csum);
-		ipv6_send(*src, IP6_NH_ICMPV6, reply, size);
+		/* The reply comes from the address that was asked, not from
+		 * whichever address source selection would pick: a peer that
+		 * pinged one of several addresses expects that one to answer. */
+		ipv6_send_src(0, in6_is_multicast(dst) ? 0 : dst, *src, IP6_NH_ICMPV6,
+		              reply, size);
 		kfree(reply);
 	} else if (hdr->type == ICMP6_ECHO_REPLY) {
 		__atomic_add_fetch(&g_icmpv6_echo_replies, 1, __ATOMIC_RELAXED);
@@ -166,6 +173,13 @@ void ipv6_receive(const void *data, usize size)
 	 * be passed by pointer. */
 	struct in6_addr_k src = hdr->src, dst = hdr->dst;
 
+	/* A datagram for an address this namespace does not hold is not ours:
+	 * without this, every namespace on a link answered for every address on
+	 * it. Multicast (ND, MLD, all-nodes) and ::1 are accepted as before. */
+	if (!in6_is_multicast(&dst) && !in6_is_loopback(&dst) &&
+	    !net_ip6_is_local(dst))
+		return;
+
 	if (hdr->next_header == IP6_NH_ICMPV6) {
 		if (payload_len < 1)
 			return;
@@ -173,6 +187,9 @@ void ipv6_receive(const void *data, usize size)
 		                    payload_len) != 0)
 			return;
 		u8 type = ((const u8 *)payload)[0];
+		/* Raw ICMPv6 sockets see every message, each filtered by type on
+		 * its own socket; the kernel's handling below is unaffected. */
+		vfs_socket_push_raw_icmp6(src, payload, payload_len);
 		if ((type >= 133 && type <= 136) || type == ICMP6_MLD_QUERY ||
 		    type == ICMP6_MLD_REPORT || type == ICMP6_MLD_DONE ||
 		    type == ICMP6_MLDV2_REPORT) {
@@ -200,31 +217,15 @@ static int in6_is_link_local(const struct in6_addr_k *a)
 	return a->bytes[0] == 0xfe && (a->bytes[1] & 0xc0) == 0x80;
 }
 
-static int in6_is_zero(const struct in6_addr_k *a)
-{
-	for (int i = 0; i < 16; i++)
-		if (a->bytes[i])
-			return 0;
-	return 1;
-}
-
 /* Pick the source address for a destination: loopback for ::1, link-local for
  * link-local/multicast peers, otherwise the SLAAC global (falling back to
  * link-local until one is configured). */
 static struct in6_addr_k ipv6_select_source(const struct in6_addr_k *dst)
 {
-	if (in6_is_loopback(dst)) {
-		struct in6_addr_k lo;
-		memset(&lo, 0, sizeof(lo));
-		lo.bytes[15] = 1;
-		return lo;
-	}
-	if (in6_is_link_local(dst) || in6_is_multicast(dst))
-		return net_get_ip6_ll();
-	struct in6_addr_k g = net_get_ip6();
-	if (!in6_is_zero(&g))
-		return g;
-	return net_get_ip6_ll();
+	/* The namespace's own addresses decide (net.c): loopback for ::1, the
+	 * link-local for link-local and multicast peers, else the address on the
+	 * destination's prefix. */
+	return net_ip6_source_for(*dst);
 }
 
 /* Checksum-offload the upper layer: zero the L4 checksum field and recompute
@@ -297,8 +298,14 @@ static void ipv6_link_output(struct netdev *dev, struct in6_addr_k dst,
 	 * "compare the first 8 bytes, else use the single SLAAC router". */
 	struct in6_addr_k next_hop;
 	int oif = 0;
-	if (!route6_lookup_flow(dst, flow, &next_hop, 0, &oif))
+	if (in6_is_link_local(&dst)) {
+		/* fe80::/10 is on-link on every interface by definition, in every
+		 * namespace; the initial namespace's FIB spells that as a standing
+		 * route, a new namespace has no routes at all. */
+		next_hop = dst;
+	} else if (!route6_lookup_flow(dst, flow, &next_hop, 0, &oif)) {
 		return; /* unreachable: no route */
+	}
 	if (!dev && oif)
 		dev = netdev_by_index(oif);
 
@@ -318,6 +325,14 @@ static void ipv6_link_output(struct netdev *dev, struct in6_addr_k dst,
 void ipv6_send_via(struct netdev *dev, struct in6_addr_k dst, u8 next_header,
                    const void *payload, usize size)
 {
+	ipv6_send_src(dev, 0, dst, next_header, payload, size);
+}
+
+/* `src` NULL: select the source for the destination. */
+static void ipv6_send_src(struct netdev *dev, const struct in6_addr_k *src_in,
+                          struct in6_addr_k dst, u8 next_header,
+                          const void *payload, usize size)
+{
 	usize total = sizeof(struct ipv6_header) + size;
 	u8 *buffer = kzalloc(total);
 	if (!buffer)
@@ -331,7 +346,7 @@ void ipv6_send_via(struct netdev *dev, struct in6_addr_k dst, u8 next_header,
 	 * a directly-attached link. */
 	hdr->hop_limit = (next_header == IP6_NH_ICMPV6) ? 255
 	                                                : (u8)ipv6_hop_limit;
-	struct in6_addr_k src = ipv6_select_source(&dst);
+	struct in6_addr_k src = src_in ? *src_in : ipv6_select_source(&dst);
 	hdr->src = src;
 	hdr->dst = dst;
 

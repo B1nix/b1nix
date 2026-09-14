@@ -132,6 +132,7 @@ belongs to the milestone that owns the mechanism. See
 | M106 DNS resolver | done | Outbound name resolution, `/dev/fd`, `/proc/self/fd/N`, 64 KiB pipes. |
 | M107 BusyBox applets blocked on kernel subsystems | done | Netlink route, VTs, loop, kmsg, inotify, RTC, watchdog, SMBus; MTD/UBI `wontfix`. |
 | M108 Hand base tools to BusyBox | done | BusyBox `su`/`passwd`/`login`, BusyBox init as PID 1 with OpenRC. |
+| M109 Alpine applet parity | done | 283 of 321 applets; AF_PACKET, VLAN/bridge/bond/gretap, veth and four namespace kinds, pivot_root, `mdev` uevents; per-namespace TCP/UDP, several IPv4 addresses, IPv6 state, `udhcpc`. See [network-namespaces.md](network-namespaces.md). |
 | M110 Unix block-device names | done | `sda`/`vda`/`nvme0n1` from enumeration; device selection by bus/content. |
 | M111 Debian userspace and Linux-shaped boot log | done | Debian bookworm boots unmodified; levelled, timestamped kernel log. |
 | M112 systemd as PID 1 | done | Debian systemd 252 reaches `graphical.target`; cgroup v2, mount propagation, devtmpfs, Weston on DRM, PCI driver links. |
@@ -162,14 +163,6 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 ## M102c: nouveau
 
 - [ ] `planned` Pick generation (pre-Turing without signed firmware vs GSP); import unmodified, fix the shim.
-
-## M109: Alpine applet parity
-
-- [x] 283 of 321 applets built and each proved through `/bin`.
-- [x] AF_PACKET, VLAN/bridge/bonding/gretap, four namespace kinds with veth, pivot_root, uevent netlink for `mdev`, per-namespace IPv4 config.
-- [x] Single-device gaps triaged (`wontfix`: rfkill, floppy, `i2ctransfer`).
-- [x] TCP, UDP and loopback are per network namespace.
-- [ ] `partial` Namespaces still share IPv6 interface state, allow one IPv4 address each, and DHCP runs only in the initial namespace.
 
 ## M113: KDE Plasma
 

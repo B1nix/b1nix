@@ -267,14 +267,14 @@ struct nl_iface {
 
 /* Interfaces netlink can describe in one dump: every registered netdev plus
  * loopback. */
-#define NL_MAX_IFACES 16
+#define NL_MAX_IFACES NETLINK_LO_IFINDEX
 
 /* Fill `out` with every interface. Real NICs occupy the netdev registry's own
  * 1-based indices so a route's oif and /proc/net/route agree with what `ip`
  * prints; loopback gets NETLINK_LO_IFINDEX because it is not a netdev. */
 static usize nl_iface_table(struct nl_iface *out, usize max) {
   usize n = 0;
-  for (int idx = 1; n < max && idx <= NL_MAX_IFACES; idx++) {
+  for (int idx = 1; n < max && idx < NETLINK_LO_IFINDEX; idx++) {
     struct netdev *nd = netdev_by_index(idx);
     /* An index whose device has been deleted is a hole, not the end of the
      * table: the interfaces created after it are still there. */
@@ -387,15 +387,19 @@ static void nl_dump_links(struct nl_buf *b, u32 seq, u32 pid, u8 family) {
   }
 }
 
+/* ifa_flags: an address on the primary's prefix is a secondary. */
+#define NL_IFA_F_SECONDARY 0x01
+
 static void nl_emit_addr(struct nl_buf *b, u32 seq, u32 pid, u8 family,
                          u8 plen, u8 scope, int ifindex, const void *addr,
-                         u16 alen, const char *label, const u8 *bcast) {
+                         u16 alen, const char *label, const u8 *bcast,
+                         u8 flags) {
   usize off = nl_msg_begin(b, RTM_NEWADDR, NLM_F_MULTI, seq, pid);
   u8 ifa[8];
   memset(ifa, 0, sizeof(ifa));
   ifa[0] = family;
   ifa[1] = plen;
-  ifa[2] = 0; /* ifa_flags */
+  ifa[2] = flags;
   ifa[3] = scope;
   nl_store_u32(ifa + 4, (u32)ifindex);
   nl_put_bytes(b, ifa, sizeof(ifa));
@@ -412,23 +416,24 @@ static void nl_dump_addrs(struct nl_buf *b, u32 seq, u32 pid, u8 family) {
   struct nl_iface tab[NL_MAX_IFACES];
   usize n = nl_iface_table(tab, NL_MAX_IFACES);
   int active = netdev_index_of(netdev_active());
-  struct ipv4_addr ip = net_get_ip();
-  struct ipv4_addr mask = net_get_netmask();
-  u32 hmask = route_ipv4_to_host(mask);
-  u8 plen = nl_mask_to_plen(hmask);
+  u32 ns = namespace_net_context();
+  struct net_v4_addr_info v4[NET_V4_MAX_ADDRS];
+  usize n4 = net_ipv4_addr_list(ns, v4, NET_V4_MAX_ADDRS);
+  struct net_v6_addr_info v6[NET_V6_MAX_ADDRS + 2];
+  usize n6 = net_ipv6_addr_list(ns, v6, NET_V6_MAX_ADDRS + 2);
 
   for (usize i = 0; i < n; i++) {
     if (tab[i].loopback) {
       if (family == 0 || family == B1NIX_AF_INET) {
         u8 lo4[4] = {127, 0, 0, 1};
         nl_emit_addr(b, seq, pid, B1NIX_AF_INET, 8, RT_SCOPE_HOST,
-                     tab[i].index, lo4, 4, "lo", 0);
+                     tab[i].index, lo4, 4, "lo", 0, 0);
       }
       if (family == 0 || family == B1NIX_AF_INET6) {
         u8 lo6[16] = {0};
         lo6[15] = 1;
         nl_emit_addr(b, seq, pid, B1NIX_AF_INET6, 128, RT_SCOPE_HOST,
-                     tab[i].index, lo6, 16, 0, 0);
+                     tab[i].index, lo6, 16, 0, 0, 0);
       }
       continue;
     }
@@ -437,23 +442,19 @@ static void nl_dump_addrs(struct nl_buf *b, u32 seq, u32 pid, u8 family) {
      * that is what `ip addr` should show for a NIC DHCP has not bound. */
     if (tab[i].index != active)
       continue;
-    if ((family == 0 || family == B1NIX_AF_INET) &&
-        (ip.bytes[0] | ip.bytes[1] | ip.bytes[2] | ip.bytes[3])) {
-      u32 hip = route_ipv4_to_host(ip);
+    for (usize k = 0; (family == 0 || family == B1NIX_AF_INET) && k < n4; k++) {
+      u32 hmask = route_ipv4_to_host(v4[k].mask);
+      u32 hip = route_ipv4_to_host(v4[k].ip);
       struct ipv4_addr bc = route_host_to_ipv4(hip | ~hmask);
-      nl_emit_addr(b, seq, pid, B1NIX_AF_INET, plen, RT_SCOPE_UNIVERSE,
-                   tab[i].index, ip.bytes, 4, tab[i].name, bc.bytes);
+      nl_emit_addr(b, seq, pid, B1NIX_AF_INET, nl_mask_to_plen(hmask),
+                   RT_SCOPE_UNIVERSE, tab[i].index, v4[k].ip.bytes, 4,
+                   v4[k].label[0] ? v4[k].label : tab[i].name, bc.bytes,
+                   v4[k].secondary ? NL_IFA_F_SECONDARY : 0);
     }
-    if (family == 0 || family == B1NIX_AF_INET6) {
-      struct in6_addr_k ll = net_get_ip6_ll();
-      if (!nl_in6_is_zero(ll.bytes))
-        nl_emit_addr(b, seq, pid, B1NIX_AF_INET6, 64, RT_SCOPE_LINK,
-                     tab[i].index, ll.bytes, 16, 0, 0);
-      struct in6_addr_k g6 = net_get_ip6();
-      if (!nl_in6_is_zero(g6.bytes))
-        nl_emit_addr(b, seq, pid, B1NIX_AF_INET6, 64, RT_SCOPE_UNIVERSE,
-                     tab[i].index, g6.bytes, 16, 0, 0);
-    }
+    for (usize k = 0; (family == 0 || family == B1NIX_AF_INET6) && k < n6; k++)
+      nl_emit_addr(b, seq, pid, B1NIX_AF_INET6, v6[k].plen,
+                   v6[k].scope_link ? RT_SCOPE_LINK : RT_SCOPE_UNIVERSE,
+                   tab[i].index, v6[k].addr.bytes, 16, 0, 0, 0);
   }
 }
 
@@ -923,40 +924,59 @@ static int nl_do_addr(u16 type, const u8 *body, usize blen) {
   if (family == B1NIX_AF_INET) {
     if (!addr || alen < 4)
       return -EINVAL;
-    if (type == RTM_DELADDR) {
-      struct ipv4_addr cur = net_get_ip_ns(ns);
-      if (memcmp(cur.bytes, addr, 4) != 0)
-        return -EADDRNOTAVAIL;
-      struct ipv4_addr zero = {{0, 0, 0, 0}};
-      net_set_ip_ns(ns, zero);
-      net_set_netmask_ns(ns, zero);
-      route_flush_dynamic();
-      return 0;
-    }
     struct ipv4_addr ip;
     memcpy(ip.bytes, addr, 4);
-    struct ipv4_addr mask = route_host_to_ipv4(nl_plen_to_mask(plen));
-    net_set_ip_ns(ns, ip);
-    net_set_netmask_ns(ns, mask);
-    route_configure_interface(ip, mask, net_get_gateway_ns(ns));
-    return 0;
+    int rc;
+    if (type == RTM_DELADDR) {
+      rc = net_ipv4_addr_del(ns, ip);
+    } else {
+      /* An IFA_LABEL naming an alias ("eth0:1") files the address under it,
+       * as `ip addr add ... label eth0:1` does. */
+      char label[16];
+      label[0] = '\0';
+      if (a.ptr[IFA_LABEL] && a.len[IFA_LABEL] >= 2) {
+        usize l = a.len[IFA_LABEL] < sizeof(label) ? a.len[IFA_LABEL] : sizeof(label);
+        memcpy(label, a.ptr[IFA_LABEL], l);
+        label[l - 1] = '\0';
+        int has_colon = 0;
+        for (usize k = 0; label[k]; k++)
+          if (label[k] == ':')
+            has_colon = 1;
+        if (!has_colon)
+          label[0] = '\0';
+      }
+      rc = net_ipv4_addr_add(ns, ip, route_host_to_ipv4(nl_plen_to_mask(plen)),
+                             label);
+    }
+    if (rc == 0)
+      net_ipv4_routes_refresh(ns);
+    return rc;
   }
   if (family == B1NIX_AF_INET6) {
     if (!addr || alen < 16)
       return -EINVAL;
-    struct in6_addr_k a6;
+    struct in6_addr_k a6, prefix, zero;
     memcpy(a6.bytes, addr, 16);
+    memset(&zero, 0, sizeof(zero));
+    prefix = a6;
+    for (u32 bit = plen; bit < 128; bit++)
+      prefix.bytes[bit / 8] &= (u8)~(0x80 >> (bit % 8));
+    /* An assigned address brings its on-link prefix with it, unless it is a
+     * host address or link-local (fe80::/10 is on-link by definition). */
+    int routed = plen > 0 && plen < 128 &&
+                 !(a6.bytes[0] == 0xfe && (a6.bytes[1] & 0xc0) == 0x80);
+    int oif = netdev_index_of(nd);
     if (type == RTM_DELADDR) {
-      struct in6_addr_k cur = net_get_ip6();
-      if (memcmp(cur.bytes, a6.bytes, 16) != 0)
-        return -EADDRNOTAVAIL;
-      struct in6_addr_k zero;
-      memset(&zero, 0, sizeof(zero));
-      net_set_ip6(zero);
-      return 0;
+      int rc = net_ipv6_addr_del(ns, a6);
+      if (rc == 0 && routed)
+        (void)route6_del_table(prefix, plen, zero, RT_TABLE_MAIN);
+      return rc;
     }
-    net_set_ip6(a6);
-    return 0;
+    int rc = net_ipv6_addr_add(ns, a6, plen);
+    if (rc == 0 && routed &&
+        route6_add_table(prefix, plen, zero, RTF_UP, 0, oif, RT_TABLE_MAIN) != 0)
+      return -ENOBUFS;
+    return rc;
   }
   return -EAFNOSUPPORT;
 }

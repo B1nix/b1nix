@@ -1,3 +1,4 @@
+#include <b1nix/namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/netproto.h>
 #include <b1nix/netdev.h>
@@ -71,7 +72,10 @@ void udp_receive(struct ipv4_addr src, const void *data, usize size)
 
 	if (!vfs_socket_push_udp(dport_net, payload, payload_size, src.bytes, 0,
 	                         hdr->src_port)) {
-		for (int i = 0; i < MAX_UDP_HANDLERS; i++) {
+		/* The in-kernel consumers (the DHCP client above all) serve the
+		 * initial namespace. A DHCP reply broadcast into another namespace is
+		 * that namespace's business, not the kernel client's lease. */
+		for (int i = 0; namespace_net_context() == 0 && i < MAX_UDP_HANDLERS; i++) {
 			if (udp_handlers[i].handler && udp_handlers[i].port == dport) {
 				udp_handlers[i].handler(payload, payload_size);
 				return;
@@ -83,6 +87,12 @@ void udp_receive(struct ipv4_addr src, const void *data, usize size)
 }
 
 void udp_send_net(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net, const void *payload, usize size)
+{
+	udp_send_net_oif(dst, src_port_net, dst_port_net, payload, size, 0);
+}
+
+void udp_send_net_oif(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net,
+                      const void *payload, usize size, int oif)
 {
 	usize total_size = sizeof(struct udp_header) + size;
 	u8 *buffer = kzalloc(total_size);
@@ -100,7 +110,8 @@ void udp_send_net(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net, cons
 	memcpy(buffer + sizeof(struct udp_header), payload, size);
 
 	int is_loopback = ipv4_is_loopback(dst);
-	ipv4_send_tx(dst, 17 /* UDP */, buffer, total_size, IPV4_TX_F_CSUM_L4);
+	ipv4_send_tx_oif(dst, 17 /* UDP */, buffer, total_size, IPV4_TX_F_CSUM_L4,
+	                 oif);
 	kfree(buffer);
 	/* For loopback the packet was enqueued (not delivered synchronously) to
 	 * avoid re-entering TCP state machines.  UDP is stateless, so we can
@@ -199,7 +210,7 @@ void udp6_receive(struct in6_addr_k src, struct in6_addr_k dst,
 	usize payload_size = length - sizeof(struct udp_header);
 
 	u16 dport = bswap16(hdr->dst_port);
-	for (usize i = 0; i < udp6_handler_count; i++) {
+	for (usize i = 0; namespace_net_context() == 0 && i < udp6_handler_count; i++) {
 		if (udp6_handlers[i].port == dport && udp6_handlers[i].handler) {
 			udp6_handlers[i].handler(src, payload, payload_size);
 			return;

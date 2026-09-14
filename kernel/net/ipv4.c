@@ -58,9 +58,8 @@ int ipv4_is_loopback(struct ipv4_addr ip)
 	if (ip.bytes[0] == 0 && ip.bytes[1] == 0 &&
 	    ip.bytes[2] == 0 && ip.bytes[3] == 0)
 		return 1;
-	/* Sending to our own IP is also a local delivery (loopback). */
-	struct ipv4_addr my_ip = net_get_ip();
-	if (memcmp(ip.bytes, my_ip.bytes, 4) == 0)
+	/* Sending to any of our own addresses is also a local delivery. */
+	if (net_ipv4_is_local_ns(namespace_net_context(), ip))
 		return 1;
 	return 0;
 }
@@ -160,11 +159,9 @@ void ipv4_receive_flags(const void *data, usize size, u32 rx_flags)
 	u16 frag = bswap16(hdr->frag_offset);
 	if ((frag & 0x3fff) != 0) return;
 
-	struct ipv4_addr local = net_get_ip();
-	if (!ipv4_is_broadcast(hdr->dst) && !ipv4_is_loopback(hdr->dst) &&
-	    memcmp(hdr->dst.bytes, local.bytes, 4) != 0) {
+	/* ipv4_is_loopback() covers every address this namespace holds. */
+	if (!ipv4_is_broadcast(hdr->dst) && !ipv4_is_loopback(hdr->dst))
 		return;
-	}
 
 	const void *payload = (const u8 *)data + ihl;
 	usize payload_size = total_len - ihl;
@@ -246,17 +243,20 @@ static u32 ipv4_apply_l4_csum(u8 *buffer, usize total_size, u32 ip_tx_flags,
 
 static u16 ip_id_counter = 0;
 
-/* The source address to stamp on a frame leaving by `dev`.
+/* The source address to stamp on a frame leaving by `dev` towards `peer` (the
+ * next hop, or the destination of a broadcast).
  *
  * The address belongs to the namespace that OWNS the interface, not to
  * whichever namespace happened to call: a namespace can only transmit through
  * an interface of its own, so the two normally agree — and when a kernel path
  * hands over a device explicitly, the device is the authority. `fallback_ns`
  * covers the case where no interface was resolved at all, where the caller's
- * own namespace is the only answer there is. */
-static struct ipv4_addr ipv4_source_for(const struct netdev *dev, u32 fallback_ns)
+ * own namespace is the only answer there is. Among that namespace's addresses
+ * the one on the peer's prefix wins. */
+static struct ipv4_addr ipv4_source_for(const struct netdev *dev, u32 fallback_ns,
+                                        struct ipv4_addr peer)
 {
-	return net_get_ip_ns(dev ? dev->netns : fallback_ns);
+	return net_ipv4_source_for(dev ? dev->netns : fallback_ns, peer);
 }
 
 void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize size)
@@ -296,6 +296,14 @@ static u8 *ipv4_build(struct ipv4_addr src, struct ipv4_addr dst, u8 protocol,
 void ipv4_send_tx(struct ipv4_addr dst, u8 protocol, const void *payload,
                   usize size, u32 ip_tx_flags)
 {
+	ipv4_send_tx_oif(dst, protocol, payload, size, ip_tx_flags, 0);
+}
+
+/* `oif` != 0: the socket is bound to that interface (SO_BINDTODEVICE), and the
+ * datagram leaves by it whatever the route would have picked. */
+void ipv4_send_tx_oif(struct ipv4_addr dst, u8 protocol, const void *payload,
+                      usize size, u32 ip_tx_flags, int oif_bound)
+{
 	/* The namespace this send belongs to: the caller's, or the arriving
 	 * interface's when the send is a reply generated inside a receive path
 	 * (an ICMP echo reply, a TCP ACK). Every address decision below is made
@@ -326,9 +334,12 @@ void ipv4_send_tx(struct ipv4_addr dst, u8 protocol, const void *payload,
 
 	// Determine if broadcast or not
 	if (ipv4_is_broadcast(dst)) {
-		struct netdev *dev = netdev_active_ns(ns);
-		buffer = ipv4_build(ipv4_source_for(dev, ns), dst, protocol, payload,
-		                    size, &total_size);
+		struct netdev *dev = oif_bound ? netdev_by_index(oif_bound)
+		                               : netdev_active_ns(ns);
+		if (!dev)
+			return;
+		buffer = ipv4_build(ipv4_source_for(dev, ns, dst), dst, protocol,
+		                    payload, size, &total_size);
 		if (!buffer)
 			return;
 		for (int i = 0; i < 6; i++) dst_mac.bytes[i] = 0xFF;
@@ -359,10 +370,12 @@ void ipv4_send_tx(struct ipv4_addr dst, u8 protocol, const void *payload,
 	int oif = 0;
 	if (!route_lookup_ex(local, dst, flow, 0, &route_ip, 0, &oif))
 		return;
+	if (oif_bound)
+		oif = oif_bound;
 	struct netdev *dev = oif ? netdev_by_index(oif) : netdev_active_ns(ns);
 
-	buffer = ipv4_build(ipv4_source_for(dev, ns), dst, protocol, payload, size,
-	                    &total_size);
+	buffer = ipv4_build(ipv4_source_for(dev, ns, route_ip), dst, protocol,
+	                    payload, size, &total_size);
 	if (!buffer)
 		return;
 

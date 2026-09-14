@@ -29,7 +29,7 @@
 #include <b1nix/vnet.h>
 #include <string.h>
 
-#define VETH_MAX_DEVS 8
+#define VETH_MAX_DEVS 16
 
 struct veth_dev {
 	struct netdev nd;

@@ -218,7 +218,9 @@ int arp_resolve_dev(struct ipv4_addr ip, struct mac_addr *mac, struct netdev *de
 		req.proto_len = 4;
 		req.op = bswap16(ARP_OP_REQUEST);
 		req.sender_mac = net_get_mac();
-		req.sender_ip = net_get_ip();
+		/* The address on the target's prefix: asking from another one
+		 * would teach the neighbour a mapping for the wrong address. */
+		req.sender_ip = net_ipv4_source_for(ns, ip);
 		memset(req.target_mac.bytes, 0, 6);
 		req.target_ip = ip;
 
@@ -267,8 +269,10 @@ void arp_receive(const void *data, usize size)
 	}
 
 	if (bswap16(pkt->op) == ARP_OP_REQUEST) {
-		struct ipv4_addr my_ip = net_get_ip();
-		if (memcmp(pkt->target_ip.bytes, my_ip.bytes, 4) == 0 && my_ip.bytes[0] != 0) {
+		/* Any address this namespace holds is answered for, each with its
+		 * own identity. */
+		struct ipv4_addr my_ip = pkt->target_ip;
+		if (net_ipv4_is_local_ns(arp_ns(), my_ip)) {
 			struct arp_packet reply;
 			reply.hw_type = bswap16(ARP_HW_ETHERNET);
 			reply.proto_type = bswap16(ARP_PROTO_IPV4);

@@ -78,6 +78,9 @@ void net_proto_selftest(void);
 int net_proto_ipv6_available(void);
 void net_proto_ipv6_send(struct in6_addr_k dst, u8 next_header,
                          const void *payload, usize size);
+/* Same; returns 0 when no IPv6 datapath is loaded to take it. */
+int net_proto_ipv6_send_checked(struct in6_addr_k dst, u8 next_header,
+                                const void *payload, usize size);
 void net_proto_icmp6_unreach(struct in6_addr_k dst, u8 code, const void *quoted,
                              usize quoted_len);
 /* ND hooks, called from the IPv6 module. */

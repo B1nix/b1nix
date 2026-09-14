@@ -334,6 +334,12 @@ void route_configure_interface(struct ipv4_addr ip, struct ipv4_addr mask,
 			h_mask = 0xFFFFFF00u;
 	}
 
+	/* Every further address of the namespace brings its own prefix, so each
+	 * gets an on-link route of its own. Read before the lock: the address
+	 * table is not under route_lock. */
+	struct net_v4_addr_info extra[NET_V4_MAX_ADDRS];
+	usize n_extra = net_ipv4_addr_list(ns, extra, NET_V4_MAX_ADDRS);
+
 	u64 f;
 	spin_lock_irqsave(&route_lock, &f);
 	/* Only THIS namespace's autoconfigured routes go: the address being
@@ -348,6 +354,14 @@ void route_configure_interface(struct ipv4_addr ip, struct ipv4_addr mask,
 	if (h_ip != 0)
 		route_add_locked(ns, h_ip & h_mask, h_mask, 0, RTF_UP, 0, oif,
 		                 RT_TABLE_MAIN, 1);
+	for (usize i = 0; i < n_extra; i++) {
+		u32 e_ip = route_ipv4_to_host(extra[i].ip);
+		u32 e_mask = route_ipv4_to_host(extra[i].mask);
+		if (e_ip == h_ip || e_mask == 0)
+			continue; /* the primary, or an alias still waiting for a mask */
+		route_add_locked(ns, e_ip & e_mask, e_mask, 0, RTF_UP, 0, oif,
+		                 RT_TABLE_MAIN, 1);
+	}
 	if (h_gw != 0)
 		route_add_locked(ns, 0, 0, h_gw, RTF_UP | RTF_GATEWAY, 0, oif,
 		                 RT_TABLE_MAIN, 1);

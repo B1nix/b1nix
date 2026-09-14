@@ -15,6 +15,7 @@
 #include <b1nix/netlink.h>
 #include <b1nix/sock_filter.h>
 #include <b1nix/packet.h>
+#include <b1nix/netproto.h>
 
 /* Defined below, next to the option code it mirrors. */
 static void sock_apply_tcp_opts(struct vfs_socket_state *s);
@@ -200,7 +201,8 @@ void vfs_socket_push_raw_icmp(struct ipv4_addr src, const void *icmp,
   pkt[3] = (u8)(tot & 0xFF);
   pkt[8] = 64; /* TTL */
   pkt[9] = 1;  /* protocol = ICMP */
-  struct ipv4_addr myip = net_get_ip();
+  u32 ns = namespace_net_context();
+  struct ipv4_addr myip = net_ipv4_source_for(ns, src);
   pkt[12] = src.bytes[0];
   pkt[13] = src.bytes[1];
   pkt[14] = src.bytes[2];
@@ -215,11 +217,46 @@ void vfs_socket_push_raw_icmp(struct ipv4_addr src, const void *icmp,
     struct vfs_socket_state *s = raw_socks[i];
     if (!s || s->udp_q_count >= SOCK_DGRAM_Q_SLOTS)
       continue;
+    /* An ICMP socket hears its own namespace's ICMP, and only IPv4's. */
+    if (s->domain != B1NIX_AF_INET || s->netns != ns)
+      continue;
     u8 slot = s->udp_q_tail;
     usize copy =
         total > sizeof(s->udp_q_buf[slot]) ? sizeof(s->udp_q_buf[slot]) : total;
     memcpy(s->udp_q_buf[slot], pkt, copy);
     s->udp_q_len[slot] = copy;
+    s->udp_q_tail = (u8)((s->udp_q_tail + 1) % SOCK_DGRAM_Q_SLOTS);
+    s->udp_q_count++;
+    s->recv_len = s->udp_q_len[s->udp_q_head];
+    scheduler_wake_all(s);
+    scheduler_wake_all(vfs_poll_chan);
+  }
+}
+
+/* Raw ICMPv6 sockets (ping6). Unlike IPv4, an IPv6 raw socket reads the
+ * ICMPv6 message WITHOUT the IP header (RFC 3542); the source address is
+ * reported through recvfrom/recvmsg instead. ICMP6_FILTER decides per type. */
+void vfs_socket_push_raw_icmp6(struct in6_addr_k src, const void *icmp6,
+                               usize len) {
+  u32 ns = namespace_net_context();
+  if (!icmp6 || len < 4)
+    return;
+  u8 type = ((const u8 *)icmp6)[0];
+  for (int i = 0; i < MAX_RAW_SOCKS; i++) {
+    struct vfs_socket_state *s = raw_socks[i];
+    if (!s || s->domain != B1NIX_AF_INET6 || s->netns != ns || s->shut_rd)
+      continue;
+    if (s->icmp6_filter[type >> 5] & (1u << (type & 31)))
+      continue;
+    if (s->udp_q_count >= SOCK_DGRAM_Q_SLOTS)
+      continue;
+    u8 slot = s->udp_q_tail;
+    usize copy = len > sizeof(s->udp_q_buf[slot]) ? sizeof(s->udp_q_buf[slot]) : len;
+    memcpy(s->udp_q_buf[slot], icmp6, copy);
+    s->udp_q_len[slot] = copy;
+    memcpy(s->udp_q_src_ip[slot], src.bytes, 16);
+    s->udp_q_src_port[slot] = 0;
+    s->udp_q_src_is6[slot] = 1;
     s->udp_q_tail = (u8)((s->udp_q_tail + 1) % SOCK_DGRAM_Q_SLOTS);
     s->udp_q_count++;
     s->recv_len = s->udp_q_len[s->udp_q_head];
@@ -307,6 +344,17 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
   }
 
   if (s->domain == B1NIX_AF_INET6) {
+    if (s->type == B1NIX_SOCK_RAW) {
+      if (s->peer.in6.sin6_family != B1NIX_AF_INET6)
+        return -EDESTADDRREQ;
+      struct in6_addr_k dst;
+      memcpy(dst.bytes, s->peer.in6.sin6_addr.s6_addr, 16);
+      /* The caller wrote the ICMPv6 message; the IP layer picks the source
+       * and fills the checksum in, which RFC 3542 makes the kernel's job. */
+      if (!net_proto_ipv6_send_checked(dst, (u8)s->protocol, buf, len))
+        return -EAFNOSUPPORT;
+      return (isize)len;
+    }
     if (s->type == B1NIX_SOCK_DGRAM) {
       if (!s->connected && s->peer.in6.sin6_port == 0)
         return -ENOTCONN;
@@ -320,8 +368,8 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
                                 dst.bytes[15]}};
         if (s->local.in6.sin6_port == 0)
           s->local.in6.sin6_port = udp_autobind(h);
-        udp_send_net(v4, s->local.in6.sin6_port, s->peer.in6.sin6_port, buf,
-                     len);
+        udp_send_net_oif(v4, s->local.in6.sin6_port, s->peer.in6.sin6_port,
+                         buf, len, s->bind_ifindex);
         return (isize)len;
       }
       if (s->local.in6.sin6_port == 0)
@@ -350,9 +398,14 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
   if (s->type == B1NIX_SOCK_DGRAM) {
     if (!s->connected && s->peer.in.sin_port == 0)
       return -ENOTCONN;
+    /* A broadcast needs the socket to have asked for it (SO_BROADCAST). */
+    if (dst_ip.bytes[0] == 255 && dst_ip.bytes[1] == 255 &&
+        dst_ip.bytes[2] == 255 && dst_ip.bytes[3] == 255 && !s->so_broadcast)
+      return -EACCES;
     if (s->local.in.sin_port == 0)
       s->local.in.sin_port = udp_autobind(h);
-    udp_send_net(dst_ip, s->local.in.sin_port, s->peer.in.sin_port, buf, len);
+    udp_send_net_oif(dst_ip, s->local.in.sin_port, s->peer.in.sin_port, buf,
+                     len, s->bind_ifindex);
     return (isize)len;
   }
   if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
@@ -622,6 +675,12 @@ isize vfs_socket_recvfrom(int fd, void *buf, usize len, int flags, void *addr,
   if (s->domain != B1NIX_AF_INET && s->domain != B1NIX_AF_INET6) {
     *addrlen = 0;
     return vfs_socket_recv_h(h, buf, len, flags);
+  }
+  if (s->type == B1NIX_SOCK_RAW && s->domain == B1NIX_AF_INET6) {
+    isize rc = vfs_socket_recv_h(h, buf, len, flags);
+    usize n = rc >= 0 ? sock_fill_last_src(s, addr, *addrlen) : 0;
+    *addrlen = n;
+    return rc;
   }
   if (s->type == B1NIX_SOCK_RAW) {
     isize rc = vfs_socket_recv_h(h, buf, len, flags);
@@ -1050,23 +1109,33 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     struct k_ifconf ifc;
     if (syscall_copyin(&ifc, arg, sizeof(ifc)) != 0)
       return -EFAULT;
-    struct k_ifreq r;
-    memset(&r, 0, sizeof(r));
+    /* One entry per address, aliases under their own label ("eth0:1"), all
+     * on whichever interface holds the namespace's configuration. */
+    struct net_v4_addr_info addrs[NET_V4_MAX_ADDRS];
+    usize na = netdev_active()
+                   ? net_ipv4_addr_list(namespace_net_current(), addrs,
+                                        NET_V4_MAX_ADDRS)
+                   : 0;
     int n = 0;
-    if (netdev_active()) {
-      /* The configured interface is whichever one holds the lease, not
-       * necessarily the one that happens to be called eth0. */
-      netdev_ifname(netdev_index_of(netdev_active()), r.ifr_name,
-                    sizeof(r.ifr_name));
+    for (usize i = 0; i < na; i++) {
+      struct k_ifreq r;
+      memset(&r, 0, sizeof(r));
+      if (addrs[i].label[0])
+        memcpy(r.ifr_name, addrs[i].label, sizeof(r.ifr_name));
+      else
+        netdev_ifname(netdev_index_of(netdev_active()), r.ifr_name,
+                      sizeof(r.ifr_name));
       r.u.addr.sin_family = B1NIX_AF_INET;
-      r.u.addr.sin_addr = net_ip_as_be(net_get_ip());
-      n = 1;
+      r.u.addr.sin_addr = net_ip_as_be(addrs[i].ip);
+      if (ifc.buf) {
+        if (ifc.len < (n + 1) * (int)sizeof(r))
+          break;
+        if (syscall_copyout(ifc.buf + n * sizeof(r), &r, sizeof(r)) != 0)
+          return -EFAULT;
+      }
+      n++;
     }
-    if (ifc.buf && n && ifc.len >= (int)sizeof(r)) {
-      if (syscall_copyout(ifc.buf, &r, sizeof(r)) != 0)
-        return -EFAULT;
-    }
-    ifc.len = n * (int)sizeof(r);
+    ifc.len = n * (int)sizeof(struct k_ifreq);
     if (syscall_copyout(arg, &ifc, sizeof(ifc)) != 0)
       return -EFAULT;
     return 0;
@@ -1091,7 +1160,21 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   r.ifr_name[sizeof(r.ifr_name) - 1] = '\0';
   int if_idx;
   struct netdev *nd;
-  int is_lo = strcmp(r.ifr_name, "lo") == 0;
+  /* "eth0:1" is an ifconfig alias: an extra address on eth0 filed under that
+   * label. The interface commands answer for eth0; the address commands for
+   * the alias's own address. */
+  char alias[sizeof(r.ifr_name)];
+  alias[0] = '\0';
+  char base[sizeof(r.ifr_name)];
+  memcpy(base, r.ifr_name, sizeof(base));
+  for (usize i = 0; base[i]; i++) {
+    if (base[i] == ':') {
+      memcpy(alias, r.ifr_name, sizeof(alias));
+      base[i] = '\0';
+      break;
+    }
+  }
+  int is_lo = strcmp(base, "lo") == 0;
   if (is_lo) {
     if_idx = NETLINK_LO_IFINDEX;
     nd = 0;
@@ -1103,11 +1186,16 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
       return -ENODEV;
     if_idx = netdev_index_of(nd);
   } else {
-    if_idx = netdev_index_by_name(r.ifr_name);
+    if_idx = netdev_index_by_name(base);
     if (if_idx == 0)
       return -ENODEV;
     nd = netdev_by_index(if_idx);
   }
+  if (alias[0] && is_lo)
+    return -ENODEV;
+  struct net_v4_addr_info al;
+  int have_alias = alias[0] &&
+                   net_ipv4_alias_get(namespace_net_current(), alias, &al) == 0;
   /* Each network namespace holds one L3 configuration, owned by the interface
    * that namespace routes through: any other NIC is up but unaddressed. The
    * namespace is resolved from the caller, so the same ioctl on the same name
@@ -1117,10 +1205,11 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
 
   switch (request) {
   case SIOC_GIFADDR: {
-    if (!has_l3)
+    if (!has_l3 || (alias[0] && !have_alias))
       return -EADDRNOTAVAIL;
     struct ipv4_addr ip =
-        is_lo ? (struct ipv4_addr){{127, 0, 0, 1}} : net_get_ip();
+        is_lo ? (struct ipv4_addr){{127, 0, 0, 1}}
+              : (have_alias ? al.ip : net_get_ip());
     memset(&r.u, 0, sizeof(r.u));
     r.u.addr.sin_family = B1NIX_AF_INET;
     r.u.addr.sin_addr = net_ip_as_be(ip);
@@ -1130,10 +1219,11 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     /* M84: report the lease's real mask. No /24 fallback — inventing a mask
      * here disagreed with the prefix length RTM_GETADDR derives from the same
      * lease, and "no mask configured" is a real answer. */
-    if (!has_l3)
+    if (!has_l3 || (alias[0] && !have_alias))
       return -EADDRNOTAVAIL;
     struct ipv4_addr nm =
-        is_lo ? (struct ipv4_addr){{255, 0, 0, 0}} : net_get_netmask();
+        is_lo ? (struct ipv4_addr){{255, 0, 0, 0}}
+              : (have_alias ? al.mask : net_get_netmask());
     if ((nm.bytes[0] | nm.bytes[1] | nm.bytes[2] | nm.bytes[3]) == 0)
       return -EADDRNOTAVAIL;
     memset(&r.u, 0, sizeof(r.u));
@@ -1144,10 +1234,10 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   case SIOC_GIFBRDADDR: {
     /* Broadcast = address | ~netmask, derived from the lease (M84) rather
      * than assuming the last octet is the host part. */
-    if (!has_l3 || is_lo)
+    if (!has_l3 || is_lo || (alias[0] && !have_alias))
       return -EADDRNOTAVAIL;
-    struct ipv4_addr ip = net_get_ip();
-    struct ipv4_addr nm = net_get_netmask();
+    struct ipv4_addr ip = have_alias ? al.ip : net_get_ip();
+    struct ipv4_addr nm = have_alias ? al.mask : net_get_netmask();
     if ((nm.bytes[0] | nm.bytes[1] | nm.bytes[2] | nm.bytes[3]) == 0)
       return -EADDRNOTAVAIL;
     struct ipv4_addr bc;
@@ -1180,6 +1270,22 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     v.bytes[1] = (u8)((be >> 8) & 0xff);
     v.bytes[2] = (u8)((be >> 16) & 0xff);
     v.bytes[3] = (u8)((be >> 24) & 0xff);
+    if (alias[0]) {
+      /* The alias's own address: set, re-set, or (0.0.0.0) removed. */
+      int rc;
+      int zero = (v.bytes[0] | v.bytes[1] | v.bytes[2] | v.bytes[3]) == 0;
+      struct ipv4_addr none = {{0, 0, 0, 0}};
+      if (request == SIOC_SIFADDR)
+        rc = zero ? (have_alias ? net_ipv4_addr_del(ns, al.ip) : 0)
+                  : net_ipv4_addr_add(ns, v, have_alias ? al.mask : none, alias);
+      else
+        rc = have_alias ? net_ipv4_addr_add(ns, al.ip, v, alias)
+                        : -EADDRNOTAVAIL;
+      if (rc < 0)
+        return rc;
+      net_ipv4_routes_refresh(ns);
+      break;
+    }
     if (request == SIOC_SIFADDR)
       net_set_ip_ns(ns, v);
     else
@@ -1191,7 +1297,7 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     struct ipv4_addr cur_nm = net_get_netmask_ns(ns);
     if ((cur_ip.bytes[0] | cur_ip.bytes[1] | cur_ip.bytes[2] | cur_ip.bytes[3]) &&
         (cur_nm.bytes[0] | cur_nm.bytes[1] | cur_nm.bytes[2] | cur_nm.bytes[3]))
-      route_configure_interface(cur_ip, cur_nm, net_get_gateway_ns(ns));
+      net_ipv4_routes_refresh(ns);
     break;
   }
   case SIOC_GIFFLAGS:
@@ -1214,6 +1320,14 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
       return (r.u.flags & IFF_UP) ? 0 : -EOPNOTSUPP;
     if (!nd)
       return -ENODEV;
+    if (alias[0]) {
+      /* `ifconfig eth0:1 down` removes the alias; the interface stays up. */
+      if (!(r.u.flags & IFF_UP) && have_alias) {
+        net_ipv4_addr_del(ns, al.ip);
+        net_ipv4_routes_refresh(ns);
+      }
+      break;
+    }
     {
       int rc = netdev_set_admin_up(nd, (r.u.flags & IFF_UP) ? 1 : 0);
       if (rc < 0)
@@ -1282,6 +1396,7 @@ void vfs_socket_init_handle(struct vfs_handle *h, void *socket_state) {
 /* Linux-style atomic socket-type flags OR'd into the `type` argument (match
  * userspace <sys/socket.h>: SOCK_CLOEXEC=02000000, SOCK_NONBLOCK=00004000).
  * curl, dropbear, NetSurf and Rust std all create sockets this way. */
+#define B1NIX_IPPROTO_ICMPV6 58
 #define SOCK_TYPE_CLOEXEC  0x80000
 #define SOCK_TYPE_NONBLOCK 0x800
 
@@ -1301,8 +1416,13 @@ int vfs_socket(int domain, int type, int protocol) {
   /* Raw sockets are IPv4 (BusyBox ping/ICMP), netlink (BusyBox ip), or
    * ethernet (AF_PACKET: udhcpc, arping, tcpdump). */
   if (type == B1NIX_SOCK_RAW && domain != B1NIX_AF_INET &&
-      domain != B1NIX_AF_NETLINK && domain != B1NIX_AF_PACKET)
+      domain != B1NIX_AF_INET6 && domain != B1NIX_AF_NETLINK &&
+      domain != B1NIX_AF_PACKET)
     return -EAFNOSUPPORT;
+  /* IPv6 raw sockets carry ICMPv6 (ping6, NDP tools) and nothing else here. */
+  if (type == B1NIX_SOCK_RAW && domain == B1NIX_AF_INET6 &&
+      protocol != B1NIX_IPPROTO_ICMPV6)
+    return -EPROTONOSUPPORT;
   /* AF_PACKET is frames, not streams. */
   if (domain == B1NIX_AF_PACKET && type != B1NIX_SOCK_RAW &&
       type != B1NIX_SOCK_DGRAM)
@@ -1310,7 +1430,8 @@ int vfs_socket(int domain, int type, int protocol) {
   /* Reading and writing the wire directly is a privileged operation: it sees
    * every neighbour's traffic and can forge any frame. Linux gates it on
    * CAP_NET_RAW and so does this. */
-  if (domain == B1NIX_AF_PACKET) {
+  if (domain == B1NIX_AF_PACKET ||
+      (type == B1NIX_SOCK_RAW && domain == B1NIX_AF_INET6)) {
     struct cred *c = scheduler_get_current_cred();
     if (c && c->euid != ROOT_UID && !cred_has_cap(c, CAP_NET_RAW))
       return -EPERM;
@@ -1352,7 +1473,8 @@ int vfs_socket(int domain, int type, int protocol) {
     int res = unix_init_state(socket);
     if (res < 0) { kfree(socket); vfs_handle_release(h); return res; }
   }
-  if (type == B1NIX_SOCK_RAW && domain == B1NIX_AF_INET)
+  if (type == B1NIX_SOCK_RAW &&
+      (domain == B1NIX_AF_INET || domain == B1NIX_AF_INET6))
     raw_sock_register(socket);
   if (domain == B1NIX_AF_PACKET)
     packet_sock_register(socket);
@@ -2020,6 +2142,11 @@ int vfs_socket_wants_peer_pidfd(int fd) {
 #define SOCK_IPPROTO_TCP  6
 #define SOCK_IPPROTO_IPV6 41
 #define SOCK_SO_REUSEADDR 2
+#define SOCK_SO_BROADCAST 6
+/* The interface name travels as a string of up to IFNAMSIZ bytes. */
+#define SOCK_SO_BINDTODEVICE 25
+#define SOCK_SOL_ICMPV6   58
+#define SOCK_ICMP6_FILTER 1
 #define SOCK_SO_TYPE      3
 #define SOCK_SO_ERROR     4
 #define SOCK_SO_SNDBUF    7
@@ -2128,6 +2255,36 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     return 0;
   }
 
+  if (level == SOCK_SOL_SOCKET && optname == SOCK_SO_BINDTODEVICE) {
+    char name[16];
+    usize n = optlen < sizeof(name) - 1 ? optlen : sizeof(name) - 1;
+    memcpy(name, optval, n);
+    name[n] = '\0';
+    if (!name[0]) {
+      s->bind_ifindex = 0; /* an empty name unbinds */
+      return 0;
+    }
+    /* Binding is a privileged act on Linux (CAP_NET_RAW): it picks the
+     * interface a packet leaves by, whatever the routing table says. */
+    struct cred *c = scheduler_get_current_cred();
+    if (c && c->euid != ROOT_UID && !cred_has_cap(c, CAP_NET_RAW))
+      return -EPERM;
+    int idx = strcmp(name, "lo") == 0 ? NETLINK_LO_IFINDEX
+                                      : netdev_index_by_name(name);
+    if (!idx)
+      return -ENODEV;
+    s->bind_ifindex = idx;
+    return 0;
+  }
+  if (level == SOCK_SOL_ICMPV6 && optname == SOCK_ICMP6_FILTER) {
+    if (s->domain != B1NIX_AF_INET6 || s->type != B1NIX_SOCK_RAW)
+      return -ENOPROTOOPT;
+    if (optlen < sizeof(s->icmp6_filter))
+      return -EINVAL;
+    memcpy(s->icmp6_filter, optval, sizeof(s->icmp6_filter));
+    return 0;
+  }
+
   if (optlen < sizeof(int)) return -EINVAL;
   int v = *(const int *)optval;
 
@@ -2135,6 +2292,7 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     switch (optname) {
     case SOCK_SO_REUSEADDR:
     case SOCK_SO_REUSEPORT: s->so_reuseaddr = v ? 1 : 0; return 0;
+    case SOCK_SO_BROADCAST: s->so_broadcast = v ? 1 : 0; return 0;
     case SOCK_SO_KEEPALIVE:
       s->so_keepalive = v ? 1 : 0;
       /* On a connected TCP socket this is not a stored flag: it starts (or
@@ -2353,6 +2511,28 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     return 0;
   }
 
+  /* SO_BINDTODEVICE reads back as the interface NAME, and an unbound socket
+   * answers with an empty one. */
+  if (level == SOCK_SOL_SOCKET && optname == SOCK_SO_BINDTODEVICE) {
+    char name[16];
+    memset(name, 0, sizeof(name));
+    if (s->bind_ifindex)
+      netdev_ifname(s->bind_ifindex, name, sizeof(name));
+    usize n = s->bind_ifindex ? strlen(name) + 1 : 0;
+    if (*optlen < n) return -EINVAL;
+    memcpy(optval, name, n);
+    *optlen = n;
+    return 0;
+  }
+  if (level == SOCK_SOL_ICMPV6 && optname == SOCK_ICMP6_FILTER) {
+    if (s->domain != B1NIX_AF_INET6 || s->type != B1NIX_SOCK_RAW)
+      return -ENOPROTOOPT;
+    usize n = *optlen < sizeof(s->icmp6_filter) ? *optlen : sizeof(s->icmp6_filter);
+    memcpy(optval, s->icmp6_filter, n);
+    *optlen = n;
+    return 0;
+  }
+
   if (*optlen < sizeof(int)) return -EINVAL;
   int v = 0;
 
@@ -2376,6 +2556,7 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     case SOCK_SO_TIMESTAMP: v = s->so_timestamp; break;
     case SOCK_SO_TIMESTAMPNS: v = s->so_timestampns; break;
     case SOCK_SO_PASSSEC:   v = s->so_passsec; break;
+    case SOCK_SO_BROADCAST: v = s->so_broadcast; break;
     default:                return -ENOPROTOOPT;
     }
   } else if (level == SOCK_IPPROTO_TCP && optname == SOCK_TCP_NODELAY) {
@@ -2480,6 +2661,14 @@ int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len,
       struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
       if (s->netns != rx_ns)
         continue;
+      /* A socket bound to an interface hears only what arrived on it; a
+       * datagram with no receiving interface came in over loopback. */
+      if (s->bind_ifindex) {
+        struct netdev *rx = netdev_receiving();
+        int rx_idx = rx ? netdev_index_of(rx) : NETLINK_LO_IFINDEX;
+        if (rx_idx != s->bind_ifindex)
+          continue;
+      }
       if (s->udp_q_count >= SOCK_DGRAM_Q_SLOTS) {
         return 0;
       }

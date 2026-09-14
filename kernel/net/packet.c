@@ -25,7 +25,7 @@
 /* Same ceiling as the raw-ICMP and netlink registries: a handful of listeners
  * is all anything on this system opens, and a fixed table keeps the RX tap
  * (which runs from the net poll task) allocation-free. */
-#define MAX_PACKET_SOCKS 8
+#define MAX_PACKET_SOCKS 32
 static struct vfs_socket_state *packet_socks[MAX_PACKET_SOCKS];
 
 /* The queue slot geometry the generic recv path uses. */

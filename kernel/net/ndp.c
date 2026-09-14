@@ -13,6 +13,7 @@
 
 #include <b1nix/kprintf.h>
 #include <b1nix/errno.h>
+#include <b1nix/namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/console.h>
@@ -37,6 +38,10 @@ struct ndp_entry {
 	 * never overwrites one, and it reports NUD_PERMANENT — the same rule the
 	 * ARP cache follows for IPv4. */
 	int permanent;
+	/* The network namespace the mapping was learned in. Two namespaces may
+	 * hold the same address for different machines, so an entry answers only
+	 * lookups made in its own (the ARP cache follows the same rule). */
+	u32 ns;
 };
 static struct ndp_entry ndp_cache[NDP_CACHE_SIZE];
 
@@ -62,10 +67,23 @@ static int in6_is_zero(const struct in6_addr_k *a)
 	return 1;
 }
 
+static u32 ndp_ns(void) { return namespace_net_context(); }
+
+static struct ndp_entry *ndp_find(const struct in6_addr_k *ip, u32 ns)
+{
+	for (int i = 0; i < NDP_CACHE_SIZE; i++)
+		if (ndp_cache[i].valid && ndp_cache[i].ns == ns &&
+		    in6_eq(&ndp_cache[i].ip, ip))
+			return &ndp_cache[i];
+	return 0;
+}
+
 static void ndp_cache_put(struct in6_addr_k ip, struct mac_addr mac)
 {
+	u32 ns = ndp_ns();
 	for (int i = 0; i < NDP_CACHE_SIZE; i++) {
-		if (ndp_cache[i].valid && in6_eq(&ndp_cache[i].ip, &ip)) {
+		if (ndp_cache[i].valid && ndp_cache[i].ns == ns &&
+		    in6_eq(&ndp_cache[i].ip, &ip)) {
 			/* A permanent entry is what the administrator asked for; a
 			 * neighbour advertisement does not get to move it. */
 			if (!ndp_cache[i].permanent)
@@ -79,6 +97,7 @@ static void ndp_cache_put(struct in6_addr_k ip, struct mac_addr mac)
 			ndp_cache[i].mac = mac;
 			ndp_cache[i].valid = 1;
 			ndp_cache[i].permanent = 0;
+			ndp_cache[i].ns = ns;
 			return;
 		}
 	}
@@ -91,10 +110,11 @@ static void ndp_cache_put(struct in6_addr_k ip, struct mac_addr mac)
 static usize ndp_neigh_dump(struct neigh_info *out, usize max)
 {
 	usize n = 0;
+	u32 ns = ndp_ns();
 	if (!out)
 		return 0;
 	for (int i = 0; i < NDP_CACHE_SIZE && n < max; i++) {
-		if (!ndp_cache[i].valid)
+		if (!ndp_cache[i].valid || ndp_cache[i].ns != ns)
 			continue;
 		out[n].family = B1NIX_AF_INET6;
 		memcpy(out[n].addr, ndp_cache[i].ip.bytes, 16);
@@ -110,12 +130,12 @@ static usize ndp_neigh_dump(struct neigh_info *out, usize max)
 static int ndp_neigh_set(struct in6_addr_k ip, struct mac_addr mac,
                          int permanent)
 {
-	for (int i = 0; i < NDP_CACHE_SIZE; i++) {
-		if (ndp_cache[i].valid && in6_eq(&ndp_cache[i].ip, &ip)) {
-			ndp_cache[i].mac = mac;
-			ndp_cache[i].permanent = permanent ? 1 : 0;
-			return 0;
-		}
+	u32 ns = ndp_ns();
+	struct ndp_entry *e = ndp_find(&ip, ns);
+	if (e) {
+		e->mac = mac;
+		e->permanent = permanent ? 1 : 0;
+		return 0;
 	}
 	for (int i = 0; i < NDP_CACHE_SIZE; i++) {
 		if (!ndp_cache[i].valid) {
@@ -123,6 +143,7 @@ static int ndp_neigh_set(struct in6_addr_k ip, struct mac_addr mac,
 			ndp_cache[i].mac = mac;
 			ndp_cache[i].valid = 1;
 			ndp_cache[i].permanent = permanent ? 1 : 0;
+			ndp_cache[i].ns = ns;
 			return 0;
 		}
 	}
@@ -131,14 +152,12 @@ static int ndp_neigh_set(struct in6_addr_k ip, struct mac_addr mac,
 
 static int ndp_neigh_del(struct in6_addr_k ip)
 {
-	for (int i = 0; i < NDP_CACHE_SIZE; i++) {
-		if (ndp_cache[i].valid && in6_eq(&ndp_cache[i].ip, &ip)) {
-			ndp_cache[i].valid = 0;
-			ndp_cache[i].permanent = 0;
-			return 0;
-		}
-	}
-	return -ESRCH;
+	struct ndp_entry *e = ndp_find(&ip, ndp_ns());
+	if (!e)
+		return -ESRCH;
+	e->valid = 0;
+	e->permanent = 0;
+	return 0;
 }
 
 /* Solicited-node multicast address ff02::1:ffXX:XXXX for a target. */
@@ -158,9 +177,9 @@ static struct in6_addr_k solicited_node(const struct in6_addr_k *t)
 
 static int is_one_of_ours(const struct in6_addr_k *a)
 {
-	struct in6_addr_k ll = net_get_ip6_ll();
-	struct in6_addr_k g = net_get_ip6();
-	return in6_eq(a, &ll) || (!in6_is_zero(&g) && in6_eq(a, &g));
+	/* Every address of the namespace the solicitation arrived in: its
+	 * link-local, the SLAAC address and any assigned one. */
+	return net_ip6_is_local(*a);
 }
 
 /* Send a Neighbor Solicitation for `target` (to its solicited-node group),
@@ -217,11 +236,10 @@ static void ndp_send_rs(void)
 int ndp_resolve_dev(struct in6_addr_k ip, struct mac_addr *mac,
                     struct netdev *dev)
 {
-	for (int i = 0; i < NDP_CACHE_SIZE; i++) {
-		if (ndp_cache[i].valid && in6_eq(&ndp_cache[i].ip, &ip)) {
-			*mac = ndp_cache[i].mac;
-			return 1;
-		}
+	struct ndp_entry *e = ndp_find(&ip, ndp_ns());
+	if (e) {
+		*mac = e->mac;
+		return 1;
 	}
 	ndp_send_ns_dev(ip, dev);
 	return 0;

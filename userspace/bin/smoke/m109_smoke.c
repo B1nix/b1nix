@@ -2578,6 +2578,990 @@ static void test_net_ns_ipv4(void) {
   signal(SIGPIPE, prev == SIG_ERR ? SIG_DFL : prev);
 }
 
+/* ── namespaces held open by a child and entered with setns(2) ───────────
+ *
+ * The tests below drive two or three network namespaces at once. Rather than
+ * choreographing a child per namespace over pipes, a child only HOLDS each
+ * namespace (unshare, then block), and this process walks between them with
+ * setns(2) on /proc/<pid>/ns/net — which is what `nsenter --net` does. A
+ * socket keeps the namespace it was created in, so one made "over there" stays
+ * there after this process walks back.
+ */
+struct nsh {
+  pid_t pid;
+  int fd;   /* /proc/<pid>/ns/net */
+  int hold; /* closing this lets the holder exit */
+};
+
+static int g_init_netns = -1;
+
+static void nsh_drop(struct nsh *h) {
+  if (h->fd >= 0)
+    close(h->fd);
+  if (h->hold >= 0)
+    close(h->hold);
+  if (h->pid > 0)
+    waitpid(h->pid, NULL, 0);
+  h->fd = h->hold = -1;
+  h->pid = -1;
+}
+
+static int nsh_make(struct nsh *h) {
+  int p[2], r[2];
+  h->pid = -1;
+  h->fd = h->hold = -1;
+  if (pipe2(p, O_CLOEXEC) != 0)
+    return -1;
+  if (pipe2(r, O_CLOEXEC) != 0) {
+    close(p[0]);
+    close(p[1]);
+    return -1;
+  }
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(p[0]); close(p[1]); close(r[0]); close(r[1]);
+    return -1;
+  }
+  if (pid == 0) {
+    close(p[1]);
+    close(r[0]);
+    char c = unshare(CLONE_NEWNET) == 0 ? 'R' : 'E';
+    if (write(r[1], &c, 1) != 1)
+      _exit(1);
+    while (read(p[0], &c, 1) > 0) {
+    }
+    _exit(0);
+  }
+  close(p[0]);
+  close(r[1]);
+  char c = 0;
+  ssize_t n = read(r[0], &c, 1);
+  close(r[0]);
+  h->pid = pid;
+  h->hold = p[1];
+  if (n != 1 || c != 'R') {
+    nsh_drop(h);
+    return -1;
+  }
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/ns/net", (int)pid);
+  h->fd = open(path, O_RDONLY | O_CLOEXEC);
+  return h->fd >= 0 ? 0 : -1;
+}
+
+/* The netlink socket is namespace-bound like any other, so it is reopened on
+ * the far side of every move. */
+static int ns_enter(int fd) {
+  if (g_nl >= 0) {
+    close(g_nl);
+    g_nl = -1;
+  }
+  return setns(fd, CLONE_NEWNET);
+}
+
+static int ns_init_handle(void) {
+  if (g_init_netns < 0)
+    g_init_netns = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+  return g_init_netns;
+}
+
+/* Run a shell command and capture all of its stdout. */
+static int run_all(const char *cmd, char *out, size_t cap) {
+  out[0] = '\0';
+  FILE *f = popen(cmd, "r");
+  if (!f)
+    return -1;
+  size_t n = fread(out, 1, cap - 1, f);
+  out[n] = '\0';
+  int st = pclose(f);
+  return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+#define K_RTM_DELADDR 21
+#define K_RTM_GETADDR 22
+#define K_RTM_NEWNEIGH 28
+#define K_RTM_GETNEIGH 30
+#define K_NLM_F_DUMP 0x300
+#define K_NLMSG_DONE 3
+
+/* Dump the address or the neighbour table of the namespace this process is in,
+ * rendered one entry per line:
+ *   "addr <ifindex> <address>/<plen> <flags>"
+ *   "neigh <ifindex> <address> <mac>"
+ * Returns the number of entries, or -1 when the dump did not complete. */
+static int nl_dump_text(int type, int family, char *out, size_t cap) {
+  out[0] = '\0';
+  int fd = nl_connect();
+  if (fd < 0)
+    return -1;
+  unsigned char req[32];
+  size_t fixed = type == K_RTM_GETADDR ? 8 : 12;
+  memset(req, 0, sizeof(req));
+  nl_put_u32(req, (unsigned)(16 + fixed));
+  nl_put_u16(req + 4, (unsigned)type);
+  nl_put_u16(req + 6, NL_F_REQUEST | K_NLM_F_DUMP);
+  nl_put_u32(req + 8, ++g_nl_seq);
+  nl_put_u32(req + 12, (unsigned)getpid());
+  req[16] = (unsigned char)family;
+  if (send(fd, req, 16 + fixed, 0) < 0)
+    return -1;
+
+  size_t used = 0;
+  int count = 0;
+  unsigned char buf[4096];
+  for (int tries = 0; tries < 400; tries++) {
+    ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+    if (n < 0) {
+      if (errno != EAGAIN && errno != EWOULDBLOCK)
+        return -1;
+      usleep(5000);
+      continue;
+    }
+    size_t pos = 0;
+    while (pos + 16 <= (size_t)n) {
+      unsigned mlen = nl_get_u32(buf + pos);
+      unsigned mtype = (unsigned)buf[pos + 4] | ((unsigned)buf[pos + 5] << 8);
+      if (mlen < 16 || pos + mlen > (size_t)n)
+        break;
+      if (mtype == K_NLMSG_DONE)
+        return count;
+      if (mtype == NLMSG_ERROR_TYPE)
+        return -1;
+      const unsigned char *body = buf + pos + 16;
+      size_t blen = mlen - 16;
+      char addr[64] = "", mac[32] = "";
+      char line[160];
+      line[0] = '\0';
+      if (mtype == K_RTM_NEWADDR && blen >= 8) {
+        int fam = body[0];
+        const unsigned char *local = NULL, *any = NULL;
+        size_t ap = 8;
+        while (ap + 4 <= blen) {
+          unsigned alen = (unsigned)body[ap] | ((unsigned)body[ap + 1] << 8);
+          unsigned atype = (unsigned)body[ap + 2] | ((unsigned)body[ap + 3] << 8);
+          if (alen < 4 || ap + alen > blen)
+            break;
+          if (atype == K_IFA_LOCAL)
+            local = body + ap + 4;
+          if (atype == K_IFA_ADDRESS)
+            any = body + ap + 4;
+          ap += (alen + 3) & ~3u;
+        }
+        const unsigned char *a = local ? local : any;
+        if (a)
+          inet_ntop(fam == AF_INET6 ? AF_INET6 : AF_INET, a, addr, sizeof(addr));
+        snprintf(line, sizeof(line), "addr %u %s/%u %u\n", nl_get_u32(body + 4),
+                 addr, (unsigned)body[1], (unsigned)body[2]);
+      } else if (mtype == K_RTM_NEWNEIGH && blen >= 12) {
+        int fam = body[0];
+        size_t ap = 12;
+        while (ap + 4 <= blen) {
+          unsigned alen = (unsigned)body[ap] | ((unsigned)body[ap + 1] << 8);
+          unsigned atype = (unsigned)body[ap + 2] | ((unsigned)body[ap + 3] << 8);
+          if (alen < 4 || ap + alen > blen)
+            break;
+          if (atype == 1)
+            inet_ntop(fam == AF_INET6 ? AF_INET6 : AF_INET, body + ap + 4, addr,
+                      sizeof(addr));
+          if (atype == 2 && alen >= 10) {
+            const unsigned char *m = body + ap + 4;
+            snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],
+                     m[1], m[2], m[3], m[4], m[5]);
+          }
+          ap += (alen + 3) & ~3u;
+        }
+        snprintf(line, sizeof(line), "neigh %u %s %s\n", nl_get_u32(body + 4),
+                 addr, mac);
+      }
+      size_t ll = strlen(line);
+      if (ll && used + ll < cap) {
+        memcpy(out + used, line, ll + 1);
+        used += ll;
+        count++;
+      }
+      pos += (mlen + 3) & ~3u;
+    }
+  }
+  return -1;
+}
+
+/* `ip addr del <ip>/<plen> dev <ifindex>`. */
+static int addr_del_nl(int ifindex, const char *ip, int plen) {
+  struct in_addr a;
+  if (inet_aton(ip, &a) == 0)
+    return -1;
+  struct nlreq r;
+  nlr_init_addr(&r, K_RTM_DELADDR, 0, ifindex, plen);
+  nlr_attr(&r, K_IFA_LOCAL, &a.s_addr, 4);
+  nlr_attr(&r, K_IFA_ADDRESS, &a.s_addr, 4);
+  return nl_do(&r);
+}
+
+/* `ip -6 addr add <ip>/<plen> dev <ifindex>`. */
+static int addr6_add_nl(int ifindex, const char *ip, int plen) {
+  struct in6_addr a;
+  if (inet_pton(AF_INET6, ip, &a) != 1)
+    return -1;
+  struct nlreq r;
+  nlr_init_addr(&r, K_RTM_NEWADDR, NL_F_CREATE, ifindex, plen);
+  r.b[16] = AF_INET6;
+  nlr_attr(&r, K_IFA_LOCAL, &a, 16);
+  nlr_attr(&r, K_IFA_ADDRESS, &a, 16);
+  return nl_do(&r);
+}
+
+static int udp_bound(int port) {
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0)
+    return -1;
+  struct sockaddr_in me = {.sin_family = AF_INET, .sin_port = htons(port)};
+  if (bind(fd, (struct sockaddr *)&me, sizeof(me)) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static ssize_t udp_to(int fd, const char *ip, int port, const char *msg) {
+  struct sockaddr_in to = {.sin_family = AF_INET, .sin_port = htons(port)};
+  if (inet_aton(ip, &to.sin_addr) == 0)
+    return -1;
+  return sendto(fd, msg, strlen(msg), 0, (struct sockaddr *)&to, sizeof(to));
+}
+
+/* Wait for a datagram carrying `want` and report the address it came from. */
+static int udp_expect(int fd, const char *want, char *from, size_t cap) {
+  from[0] = '\0';
+  for (int i = 0; i < 8; i++) {
+    char buf[128];
+    struct sockaddr_in src;
+    ssize_t n = udp_wait(fd, buf, sizeof(buf) - 1, &src);
+    if (n < 0)
+      return -1;
+    buf[n] = '\0';
+    if (strcmp(buf, want) == 0) {
+      snprintf(from, cap, "%s", inet_ntoa(src.sin_addr));
+      return 0;
+    }
+  }
+  return -1;
+}
+
+/* ── several IPv4 addresses on one interface ──────────────────────────────
+ *
+ * Two namespaces joined by a veth pair, each end carrying an address on two
+ * different prefixes. One side is configured by rtnetlink (RTM_NEWADDR from
+ * this test and from BusyBox `ip addr add`), the other by the ioctls ifconfig
+ * uses, the second address as the alias "maB:1". Then:
+ *   netns-ipv4-multi-addr     both addresses coexist: RTM_GETADDR, `ip addr
+ *                             show` and SIOCGIFADDR on the alias list them,
+ *                             and each prefix has its on-link route;
+ *   netns-ipv4-source-select  a datagram to either prefix leaves with the
+ *                             address on THAT prefix as its source, and the
+ *                             reply comes back from the peer's matching one;
+ *   netns-ipv4-addr-del       deleting one address leaves the other working,
+ *                             with its route, and drops only the deleted one's;
+ *   netns-ipv4-multi-isolated none of it exists in the initial namespace.
+ */
+#define MA_PORT 7811
+
+static void test_net_ns_multi_addr(void) {
+  struct nsh ha = {-1, -1, -1}, hb = {-1, -1, -1};
+  int sa = -1, sb = -1;
+  if (ns_init_handle() < 0) {
+    failm("netns-ipv4-multi-addr", "no /proc/self/ns/net");
+    return;
+  }
+  if (link_add_veth("maA", "maB") != 0) {
+    failm("netns-ipv4-multi-addr", "veth pair");
+    return;
+  }
+  int ia = if_index("maA"), ib = if_index("maB");
+  if (nsh_make(&ha) != 0 || nsh_make(&hb) != 0) {
+    failm("netns-ipv4-multi-addr", "namespace holders");
+    goto out;
+  }
+  int mva = link_set_netns_pid(ia, ha.pid);
+  int mvb = link_set_netns_pid(ib, hb.pid);
+
+  /* A: both addresses by rtnetlink. */
+  int ea = ns_enter(ha.fd);
+  int ua = if_set_up("maA", 1);
+  int ixa = if_index("maA");
+  int a1 = ixa > 0 ? addr_add_nl(ixa, "10.98.0.1", 24) : -1;
+  int a2 = system("ip addr add 10.97.0.1/24 dev maA >/dev/null 2>&1");
+  char dump_a[2048], show_a[2048], route_a[4096] = {0};
+  int na = nl_dump_text(K_RTM_GETADDR, AF_INET, dump_a, sizeof(dump_a));
+  run_all("ip -4 addr show dev maA 2>&1", show_a, sizeof(show_a));
+  slurp("/proc/net/route", route_a, sizeof(route_a));
+
+  /* B: the address by SIOCSIFADDR, the second one as an ifconfig alias. */
+  int eb = ns_enter(hb.fd);
+  int ub = if_set_up("maB", 1);
+  int b1 = addr_set_ioctl("maB", "10.98.0.2", "255.255.255.0");
+  int b2 = addr_set_ioctl("maB:1", "10.97.0.2", "255.255.255.0");
+  char alias_b[32], prim_b[32], dump_b[2048], route_b[4096] = {0};
+  addr_get("maB:1", alias_b, sizeof(alias_b));
+  addr_get("maB", prim_b, sizeof(prim_b));
+  int nb = nl_dump_text(K_RTM_GETADDR, AF_INET, dump_b, sizeof(dump_b));
+  slurp("/proc/net/route", route_b, sizeof(route_b));
+
+  int multi_ok =
+      mva == 0 && mvb == 0 && ea == 0 && eb == 0 && ua == 0 && ub == 0 &&
+      a1 == 0 && a2 == 0 && b1 == 0 && b2 == 0 && na >= 2 && nb >= 2 &&
+      strstr(dump_a, " 10.98.0.1/24 ") && strstr(dump_a, " 10.97.0.1/24 ") &&
+      strstr(show_a, "inet 10.98.0.1/24") && strstr(show_a, "inet 10.97.0.1/24") &&
+      strstr(route_a, "0000620A") && strstr(route_a, "0000610A") &&
+      strstr(dump_b, " 10.98.0.2/24 ") && strstr(dump_b, " 10.97.0.2/24 ") &&
+      strcmp(alias_b, "10.97.0.2") == 0 && strcmp(prim_b, "10.98.0.2") == 0 &&
+      strstr(route_b, "0000620A") && strstr(route_b, "0000610A");
+  if (!multi_ok) {
+    note("netns-ipv4-multi-addr: mv=%d/%d enter=%d/%d up=%d/%d a=%d/%d b=%d/%d "
+         "alias=%s prim=%s", mva, mvb, ea, eb, ua, ub, a1, a2, b1, b2,
+         alias_b[0] ? alias_b : "-", prim_b[0] ? prim_b : "-");
+    for (char *q = dump_a; *q; q++)
+      if (*q == '\n') *q = ';';
+    for (char *q = dump_b; *q; q++)
+      if (*q == '\n') *q = ';';
+    for (char *q = show_a; *q; q++)
+      if (*q == '\n') *q = ';';
+    note("netns-ipv4-multi-addr: A=[%s] B=[%s]", dump_a, dump_b);
+    note("netns-ipv4-multi-addr: ip-show=[%.200s] routeA=%d/%d routeB=%d/%d",
+         show_a, strstr(route_a, "0000620A") != NULL,
+         strstr(route_a, "0000610A") != NULL,
+         strstr(route_b, "0000620A") != NULL,
+         strstr(route_b, "0000610A") != NULL);
+  }
+  check("netns-ipv4-multi-addr", multi_ok, 0);
+
+  /* Source selection, both ways. */
+  ns_enter(hb.fd);
+  sb = udp_bound(MA_PORT);
+  ns_enter(ha.fd);
+  sa = udp_bound(MA_PORT + 1);
+  ssize_t s97 = sa >= 0 ? udp_to(sa, "10.97.0.2", MA_PORT, "MA-97") : -1;
+  ssize_t s98 = sa >= 0 ? udp_to(sa, "10.98.0.2", MA_PORT, "MA-98") : -1;
+  char f97[32] = "", f98[32] = "", e97[32] = "", e98[32] = "";
+  int r97 = sb >= 0 ? udp_expect(sb, "MA-97", f97, sizeof(f97)) : -1;
+  int r98 = sb >= 0 ? udp_expect(sb, "MA-98", f98, sizeof(f98)) : -1;
+  ns_enter(hb.fd);
+  ssize_t b97 = r97 == 0 ? udp_to(sb, f97, MA_PORT + 1, "MA-97-BACK") : -1;
+  ssize_t b98 = r98 == 0 ? udp_to(sb, f98, MA_PORT + 1, "MA-98-BACK") : -1;
+  ns_enter(ha.fd);
+  int q97 = b97 > 0 ? udp_expect(sa, "MA-97-BACK", e97, sizeof(e97)) : -1;
+  int q98 = b98 > 0 ? udp_expect(sa, "MA-98-BACK", e98, sizeof(e98)) : -1;
+  int src_ok = s97 > 0 && s98 > 0 && r97 == 0 && r98 == 0 && q97 == 0 &&
+               q98 == 0 && strcmp(f97, "10.97.0.1") == 0 &&
+               strcmp(f98, "10.98.0.1") == 0 && strcmp(e97, "10.97.0.2") == 0 &&
+               strcmp(e98, "10.98.0.2") == 0;
+  if (!src_ok)
+    note("netns-ipv4-source-select: sent=%ld/%ld rx=%d/%d from=%s/%s back=%ld/%ld "
+         "echo=%d/%d from=%s/%s", (long)s97, (long)s98, r97, r98,
+         f97[0] ? f97 : "-", f98[0] ? f98 : "-", (long)b97, (long)b98, q97, q98,
+         e97[0] ? e97 : "-", e98[0] ? e98 : "-");
+  check("netns-ipv4-source-select", src_ok, 0);
+
+  /* Delete the first address; the second must carry on alone. */
+  int d1 = ixa > 0 ? addr_del_nl(ixa, "10.98.0.1", 24) : -1;
+  char dump_d[2048], route_d[4096] = {0}, now_a[32], fdel[32] = "";
+  int nd = nl_dump_text(K_RTM_GETADDR, AF_INET, dump_d, sizeof(dump_d));
+  slurp("/proc/net/route", route_d, sizeof(route_d));
+  addr_get("maA", now_a, sizeof(now_a));
+  ssize_t sdel = sa >= 0 ? udp_to(sa, "10.97.0.2", MA_PORT, "MA-DEL") : -1;
+  int rdel = sb >= 0 && sdel > 0 ? udp_expect(sb, "MA-DEL", fdel, sizeof(fdel)) : -1;
+  int del_ok = d1 == 0 && nd >= 1 && !strstr(dump_d, " 10.98.0.1/") &&
+               strstr(dump_d, " 10.97.0.1/24 ") && !strstr(route_d, "0000620A") &&
+               strstr(route_d, "0000610A") && strcmp(now_a, "10.97.0.1") == 0 &&
+               rdel == 0 && strcmp(fdel, "10.97.0.1") == 0;
+  if (!del_ok) {
+    for (char *q = dump_d; *q; q++)
+      if (*q == '\n') *q = ';';
+    note("netns-ipv4-addr-del: del=%d dump=[%s] route62=%d route61=%d addr=%s "
+         "rx=%d from=%s", d1, dump_d, strstr(route_d, "0000620A") != NULL,
+         strstr(route_d, "0000610A") != NULL, now_a[0] ? now_a : "-", rdel,
+         fdel[0] ? fdel : "-");
+  }
+  check("netns-ipv4-addr-del", del_ok, d1);
+
+  /* Out here none of it exists. */
+  ns_enter(g_init_netns);
+  {
+    char dump_i[4096], route_i[8192] = {0};
+    int ni = nl_dump_text(K_RTM_GETADDR, AF_INET, dump_i, sizeof(dump_i));
+    slurp("/proc/net/route", route_i, sizeof(route_i));
+    int leaked = strstr(dump_i, " 10.97.0.") || strstr(dump_i, " 10.98.0.") ||
+                 strstr(route_i, "0000620A") || strstr(route_i, "0000610A") ||
+                 if_index("maA") || if_index("maB");
+    if (ni < 0 || leaked)
+      note("netns-ipv4-multi-isolated: dump=%d leaked=%d", ni, leaked);
+    check("netns-ipv4-multi-isolated", ni >= 0 && !leaked, ni);
+  }
+
+out:
+  if (sa >= 0)
+    close(sa);
+  if (sb >= 0)
+    close(sb);
+  if (g_init_netns >= 0)
+    ns_enter(g_init_netns);
+  nsh_drop(&hb);
+  nsh_drop(&ha);
+  /* A pair that never left this namespace goes with an explicit delete. */
+  if (if_index("maA") > 0)
+    link_del(if_index("maA"));
+}
+
+/* ── IPv6 interface state per namespace ───────────────────────────────────
+ *
+ *   netns-ipv6-addr   each moved-in veth end carries its OWN link-local (the
+ *                     EUI-64 of its MAC) and the address assigned to it, and
+ *                     the initial namespace lists neither;
+ *   netns-ipv6-echo   an ICMPv6 echo from one namespace is answered by the
+ *                     other, from its assigned address and from its
+ *                     link-local, over a raw ICMPv6 socket;
+ *   netns-ipv6-neigh  each namespace's neighbour table holds the other end,
+ *                     and the initial namespace's holds neither.
+ */
+#define K_ICMP6_FILTER 1
+#define K_SOL_ICMPV6 58
+
+static void ll_from_mac(const unsigned char *mac, char *out, size_t cap) {
+  struct in6_addr a;
+  memset(&a, 0, sizeof(a));
+  a.s6_addr[0] = 0xfe;
+  a.s6_addr[1] = 0x80;
+  a.s6_addr[8] = mac[0] ^ 0x02;
+  a.s6_addr[9] = mac[1];
+  a.s6_addr[10] = mac[2];
+  a.s6_addr[11] = 0xff;
+  a.s6_addr[12] = 0xfe;
+  a.s6_addr[13] = mac[3];
+  a.s6_addr[14] = mac[4];
+  a.s6_addr[15] = mac[5];
+  inet_ntop(AF_INET6, &a, out, (socklen_t)cap);
+}
+
+static int if_mac(const char *name, unsigned char *mac, char *text, size_t cap) {
+  int s = socket(AF_INET, SOCK_DGRAM, 0);
+  if (s < 0)
+    return -1;
+  struct ifreq r;
+  memset(&r, 0, sizeof(r));
+  snprintf(r.ifr_name, sizeof(r.ifr_name), "%s", name);
+  int rc = ioctl(s, SIOCGIFHWADDR, &r);
+  close(s);
+  if (rc != 0)
+    return -1;
+  memcpy(mac, r.ifr_hwaddr.sa_data, 6);
+  snprintf(text, cap, "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2],
+           mac[3], mac[4], mac[5]);
+  return 0;
+}
+
+/* One echo request to `dst` (scope `scope` for a link-local) and its reply.
+ * Returns 0 when a reply with our identifier came back; `from` is its source. */
+static int icmp6_echo(int fd, const char *dst, int scope, unsigned id,
+                      char *from, size_t cap) {
+  struct sockaddr_in6 to;
+  memset(&to, 0, sizeof(to));
+  to.sin6_family = AF_INET6;
+  to.sin6_scope_id = (uint32_t)scope;
+  if (inet_pton(AF_INET6, dst, &to.sin6_addr) != 1)
+    return -1;
+  unsigned char req[24];
+  memset(req, 0, sizeof(req));
+  req[0] = 128; /* echo request; the kernel fills the checksum in */
+  req[4] = (unsigned char)(id >> 8);
+  req[5] = (unsigned char)id;
+  req[7] = 1;
+  memcpy(req + 8, "M109-V6-ECHO-REQ", 16);
+  if (sendto(fd, req, sizeof(req), 0, (struct sockaddr *)&to, sizeof(to)) !=
+      (ssize_t)sizeof(req))
+    return -2;
+  for (int i = 0; i < 400; i++) {
+    unsigned char buf[256];
+    struct sockaddr_in6 src;
+    socklen_t sl = sizeof(src);
+    ssize_t n = recvfrom(fd, buf, sizeof(buf), MSG_DONTWAIT,
+                         (struct sockaddr *)&src, &sl);
+    if (n < 0) {
+      if (errno != EAGAIN && errno != EWOULDBLOCK)
+        return -3;
+      usleep(10000);
+      continue;
+    }
+    if (n >= 24 && buf[0] == 129 && buf[4] == (unsigned char)(id >> 8) &&
+        buf[5] == (unsigned char)id && memcmp(buf + 8, req + 8, 16) == 0) {
+      inet_ntop(AF_INET6, &src.sin6_addr, from, (socklen_t)cap);
+      return 0;
+    }
+  }
+  return -4;
+}
+
+static void test_net_ns_ipv6(void) {
+  struct nsh ha = {-1, -1, -1}, hb = {-1, -1, -1};
+  int raw = -1;
+  if (ns_init_handle() < 0) {
+    failm("netns-ipv6-addr", "no /proc/self/ns/net");
+    return;
+  }
+  if (link_add_veth("v6A", "v6B") != 0) {
+    failm("netns-ipv6-addr", "veth pair");
+    return;
+  }
+  int ia = if_index("v6A"), ib = if_index("v6B");
+  if (nsh_make(&ha) != 0 || nsh_make(&hb) != 0) {
+    failm("netns-ipv6-addr", "namespace holders");
+    goto out;
+  }
+  int mva = link_set_netns_pid(ia, ha.pid);
+  int mvb = link_set_netns_pid(ib, hb.pid);
+
+  unsigned char mac_a[6], mac_b[6];
+  char mtxt_a[32] = "", mtxt_b[32] = "", ll_a[64] = "", ll_b[64] = "";
+  char dump_a[2048], dump_b[2048];
+
+  ns_enter(ha.fd);
+  int ixa = if_index("v6A");
+  int ua = if_set_up("v6A", 1);
+  int ma = if_mac("v6A", mac_a, mtxt_a, sizeof(mtxt_a));
+  int aa = ixa > 0 ? addr6_add_nl(ixa, "fd00:99::1", 64) : -1;
+  if (ma == 0)
+    ll_from_mac(mac_a, ll_a, sizeof(ll_a));
+  int na = nl_dump_text(K_RTM_GETADDR, AF_INET6, dump_a, sizeof(dump_a));
+
+  ns_enter(hb.fd);
+  int ixb = if_index("v6B");
+  int ub = if_set_up("v6B", 1);
+  int mb = if_mac("v6B", mac_b, mtxt_b, sizeof(mtxt_b));
+  int ab = ixb > 0 ? addr6_add_nl(ixb, "fd00:99::2", 64) : -1;
+  if (mb == 0)
+    ll_from_mac(mac_b, ll_b, sizeof(ll_b));
+  int nb = nl_dump_text(K_RTM_GETADDR, AF_INET6, dump_b, sizeof(dump_b));
+
+  ns_enter(g_init_netns);
+  char dump_i[4096];
+  int ni = nl_dump_text(K_RTM_GETADDR, AF_INET6, dump_i, sizeof(dump_i));
+
+  char want_a_ll[96], want_b_ll[96];
+  snprintf(want_a_ll, sizeof(want_a_ll), " %s/64 ", ll_a);
+  snprintf(want_b_ll, sizeof(want_b_ll), " %s/64 ", ll_b);
+  int addr_ok = mva == 0 && mvb == 0 && ua == 0 && ub == 0 && ma == 0 &&
+                mb == 0 && aa == 0 && ab == 0 && na >= 2 && nb >= 2 && ni >= 0 &&
+                strstr(dump_a, want_a_ll) && strstr(dump_a, " fd00:99::1/64 ") &&
+                !strstr(dump_a, "fd00:99::2") && !strstr(dump_a, ll_b) &&
+                strstr(dump_b, want_b_ll) && strstr(dump_b, " fd00:99::2/64 ") &&
+                !strstr(dump_b, "fd00:99::1") && !strstr(dump_b, ll_a) &&
+                !strstr(dump_i, ll_a) && !strstr(dump_i, ll_b) &&
+                !strstr(dump_i, "fd00:99::");
+  if (!addr_ok) {
+    for (char *q = dump_a; *q; q++)
+      if (*q == '\n') *q = ';';
+    for (char *q = dump_b; *q; q++)
+      if (*q == '\n') *q = ';';
+    for (char *q = dump_i; *q; q++)
+      if (*q == '\n') *q = ';';
+    note("netns-ipv6-addr: mv=%d/%d up=%d/%d mac=%d/%d add=%d/%d ll=%s/%s",
+         mva, mvb, ua, ub, ma, mb, aa, ab, ll_a, ll_b);
+    note("netns-ipv6-addr: A=[%.100s] B=[%.100s]", dump_a, dump_b);
+    note("netns-ipv6-addr: init=[%.200s]", dump_i);
+  }
+  check("netns-ipv6-addr", addr_ok, 0);
+
+  /* Echo from A to B's assigned address and to B's link-local. */
+  ns_enter(ha.fd);
+  raw = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+  int rawerr = raw < 0 ? errno : 0;
+  int filt_rc = -1;
+  if (raw >= 0) {
+    /* Pass echo replies only: bit set = blocked (RFC 3542). */
+    uint32_t filt[8];
+    memset(filt, 0xff, sizeof(filt));
+    filt[129 >> 5] &= ~(1u << (129 & 31));
+    filt_rc = setsockopt(raw, K_SOL_ICMPV6, K_ICMP6_FILTER, filt, sizeof(filt));
+  }
+  char from_g[64] = "", from_l[64] = "";
+  int eg = raw >= 0 ? icmp6_echo(raw, "fd00:99::2", 0, 0x6d01, from_g, sizeof(from_g)) : -9;
+  int el = raw >= 0 && ll_b[0]
+               ? icmp6_echo(raw, ll_b, ixa, 0x6d02, from_l, sizeof(from_l))
+               : -9;
+  int echo_ok = raw >= 0 && filt_rc == 0 && eg == 0 && el == 0 &&
+                strcmp(from_g, "fd00:99::2") == 0 && strcmp(from_l, ll_b) == 0;
+  if (!echo_ok)
+    note("netns-ipv6-echo: raw=%d errno=%d filter=%d global=%d from=%s ll=%d "
+         "from=%s", raw, rawerr, filt_rc, eg, from_g[0] ? from_g : "-", el,
+         from_l[0] ? from_l : "-");
+  check("netns-ipv6-echo", echo_ok, eg);
+
+  /* Neighbour state: each side learned the other; the initial namespace did
+   * not learn anything. */
+  char nb_a[2048], nb_b[2048], nb_i[4096];
+  int nna = nl_dump_text(K_RTM_GETNEIGH, AF_INET6, nb_a, sizeof(nb_a));
+  ns_enter(hb.fd);
+  int nnb = nl_dump_text(K_RTM_GETNEIGH, AF_INET6, nb_b, sizeof(nb_b));
+  ns_enter(g_init_netns);
+  int nni = nl_dump_text(K_RTM_GETNEIGH, AF_INET6, nb_i, sizeof(nb_i));
+  char want_na[128], want_nb[128];
+  snprintf(want_na, sizeof(want_na), " fd00:99::2 %s", mtxt_b);
+  snprintf(want_nb, sizeof(want_nb), " fd00:99::1 %s", mtxt_a);
+  int neigh_ok = nna >= 1 && nnb >= 1 && nni >= 0 && mtxt_a[0] && mtxt_b[0] &&
+                 strstr(nb_a, want_na) && strstr(nb_b, want_nb) &&
+                 !strstr(nb_a, mtxt_a) && !strstr(nb_b, mtxt_b) &&
+                 !strstr(nb_i, mtxt_a) && !strstr(nb_i, mtxt_b) &&
+                 !strstr(nb_i, "fd00:99::");
+  if (!neigh_ok) {
+    for (char *q = nb_a; *q; q++)
+      if (*q == '\n') *q = ';';
+    for (char *q = nb_b; *q; q++)
+      if (*q == '\n') *q = ';';
+    for (char *q = nb_i; *q; q++)
+      if (*q == '\n') *q = ';';
+    note("netns-ipv6-neigh: A=%d[%.90s] B=%d[%.90s] init=%d[%.60s]", nna, nb_a,
+         nnb, nb_b, nni, nb_i);
+  }
+  check("netns-ipv6-neigh", neigh_ok, 0);
+
+out:
+  if (raw >= 0)
+    close(raw);
+  if (g_init_netns >= 0)
+    ns_enter(g_init_netns);
+  nsh_drop(&hb);
+  nsh_drop(&ha);
+  if (if_index("v6A") > 0)
+    link_del(if_index("v6A"));
+}
+
+/* ── BusyBox udhcpc inside a network namespace ────────────────────────────
+ *
+ * The client is the real one; the server is a minimal DHCP responder written
+ * here, because Alpine's BusyBox does not carry udhcpd. The responder is built
+ * the way udhcpd builds its socket - SO_REUSEADDR, SO_BROADCAST, SO_BINDTODEVICE
+ * on UDP port 67 - and answers from a second namespace over a veth pair:
+ * DISCOVER and a selecting REQUEST by broadcast, a renewing REQUEST by unicast.
+ *
+ *   netns-dhcp-lease     udhcpc obtains a lease and its script installs the
+ *                        address, which SIOCGIFADDR and the FIB then show in
+ *                        the client namespace;
+ *   netns-dhcp-renew     SIGUSR1 makes udhcpc renew over its kernel socket
+ *                        (SO_BROADCAST + SO_BINDTODEVICE, unicast REQUEST and
+ *                        ACK) and it reports the same lease renewed;
+ *   netns-dhcp-isolated  the lease exists only in the client namespace: the
+ *                        server's namespace keeps its own address and the
+ *                        initial namespace has neither.
+ */
+#define DH_LEASE_IP "10.96.0.23"
+#define DH_SERVER_IP "10.96.0.1"
+#define DH_EVENTS "/tmp/m109-dhcp.events"
+#define DH_SCRIPT "/tmp/m109-udhcpc.sh"
+#define K_SO_BROADCAST 6
+#define K_SO_BINDTODEVICE 25
+
+static const unsigned char *dhcp_opt(const unsigned char *p, size_t n, int code) {
+  size_t i = 240;
+  while (i < n) {
+    int c = p[i];
+    if (c == 255)
+      break;
+    if (c == 0) {
+      i++;
+      continue;
+    }
+    if (i + 1 >= n || i + 2 + p[i + 1] > n)
+      break;
+    if (c == code)
+      return p + i;
+    i += 2 + p[i + 1];
+  }
+  return NULL;
+}
+
+static size_t dhcp_reply(unsigned char *out, const unsigned char *req, int type,
+                         struct in_addr yi, struct in_addr server) {
+  memset(out, 0, 300);
+  out[0] = 2; /* BOOTREPLY */
+  out[1] = 1;
+  out[2] = 6;
+  memcpy(out + 4, req + 4, 4);   /* xid */
+  memcpy(out + 10, req + 10, 2); /* flags */
+  memcpy(out + 12, req + 12, 4); /* ciaddr */
+  memcpy(out + 16, &yi.s_addr, 4);
+  memcpy(out + 20, &server.s_addr, 4);
+  memcpy(out + 24, req + 24, 4); /* giaddr */
+  memcpy(out + 28, req + 28, 16);
+  out[236] = 99; out[237] = 130; out[238] = 83; out[239] = 99;
+  size_t o = 240;
+  out[o++] = 53; out[o++] = 1; out[o++] = (unsigned char)type;
+  out[o++] = 54; out[o++] = 4;
+  memcpy(out + o, &server.s_addr, 4);
+  o += 4;
+  out[o++] = 51; out[o++] = 4;
+  out[o++] = 0; out[o++] = 0; out[o++] = 0x02; out[o++] = 0x58; /* 600 s */
+  out[o++] = 1; out[o++] = 4;
+  out[o++] = 255; out[o++] = 255; out[o++] = 255; out[o++] = 0;
+  out[o++] = 255;
+  return 300;
+}
+
+/* The responder. Runs in a child that was forked inside the server
+ * namespace; reports "offers acks renews" on `rep` when it is done. */
+static void dhcp_serve(int fd, int rep) {
+  struct in_addr lease, server;
+  inet_aton(DH_LEASE_IP, &lease);
+  inet_aton(DH_SERVER_IP, &server);
+  int offers = 0, acks = 0, renews = 0;
+  for (int i = 0; i < 3000 && renews == 0; i++) { /* ~30 s */
+    unsigned char buf[1024], out[300];
+    struct sockaddr_in src;
+    socklen_t sl = sizeof(src);
+    ssize_t n = recvfrom(fd, buf, sizeof(buf), MSG_DONTWAIT,
+                         (struct sockaddr *)&src, &sl);
+    if (n < 0) {
+      usleep(10000);
+      continue;
+    }
+    if (n < 244 || buf[0] != 1 || buf[236] != 99 || buf[239] != 99)
+      continue;
+    const unsigned char *t = dhcp_opt(buf, (size_t)n, 53);
+    if (!t || t[1] != 1)
+      continue;
+    struct sockaddr_in to = {.sin_family = AF_INET, .sin_port = htons(68)};
+    to.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    if (t[2] == 1) { /* DISCOVER */
+      dhcp_reply(out, buf, 2, lease, server);
+      if (sendto(fd, out, 300, 0, (struct sockaddr *)&to, sizeof(to)) == 300)
+        offers++;
+    } else if (t[2] == 3) { /* REQUEST */
+      struct in_addr ci;
+      memcpy(&ci.s_addr, buf + 12, 4);
+      if (ci.s_addr == 0) {
+        const unsigned char *want = dhcp_opt(buf, (size_t)n, 50);
+        if (!want || want[1] != 4 || memcmp(want + 2, &lease.s_addr, 4) != 0)
+          continue;
+        dhcp_reply(out, buf, 5, lease, server);
+        if (sendto(fd, out, 300, 0, (struct sockaddr *)&to, sizeof(to)) == 300)
+          acks++;
+      } else if (ci.s_addr == lease.s_addr) {
+        /* Renewing: the client owns the address and asks by unicast, and
+         * the answer goes back the same way. */
+        to.sin_addr = ci;
+        dhcp_reply(out, buf, 5, lease, server);
+        if (sendto(fd, out, 300, 0, (struct sockaddr *)&to, sizeof(to)) == 300)
+          renews++;
+      }
+    }
+  }
+  char msg[64];
+  snprintf(msg, sizeof(msg), "%d %d %d", offers, acks, renews);
+  if (write(rep, msg, strlen(msg) + 1) < 0)
+    _exit(1);
+}
+
+static int write_file(const char *path, const char *text);
+
+static int file_has(const char *path, const char *needle) {
+  char buf[1024] = {0};
+  if (slurp(path, buf, sizeof(buf)) <= 0)
+    return 0;
+  return strstr(buf, needle) != NULL;
+}
+
+static void test_net_ns_dhcp(void) {
+  struct nsh hs = {-1, -1, -1}, hc = {-1, -1, -1};
+  pid_t server = -1, client = -1;
+  int srv = -1, rep[2] = {-1, -1};
+  if (ns_init_handle() < 0) {
+    failm("netns-dhcp-lease", "no /proc/self/ns/net");
+    return;
+  }
+  unlink(DH_EVENTS);
+  if (write_file(DH_SCRIPT,
+                 "#!/bin/sh\n"
+                 "case \"$1\" in\n"
+                 "bound) ip addr add \"$ip/$mask\" dev \"$interface\" || exit 1\n"
+                 "  echo \"bound $ip $serverid\" >> " DH_EVENTS " ;;\n"
+                 "renew) echo \"renew $ip $serverid\" >> " DH_EVENTS " ;;\n"
+                 "esac\n"
+                 "exit 0\n") != 0 ||
+      chmod(DH_SCRIPT, 0755) != 0) {
+    failm("netns-dhcp-lease", "udhcpc script");
+    return;
+  }
+  if (link_add_veth("dhS", "dhC") != 0) {
+    failm("netns-dhcp-lease", "veth pair");
+    return;
+  }
+  int is = if_index("dhS"), ic = if_index("dhC");
+  if (nsh_make(&hs) != 0 || nsh_make(&hc) != 0 || pipe2(rep, O_CLOEXEC) != 0) {
+    failm("netns-dhcp-lease", "namespace holders");
+    goto out;
+  }
+  int mvs = link_set_netns_pid(is, hs.pid);
+  int mvc = link_set_netns_pid(ic, hc.pid);
+
+  /* The server side: an address, and a socket built as udhcpd builds it. */
+  ns_enter(hs.fd);
+  int ixs = if_index("dhS");
+  int us = if_set_up("dhS", 1);
+  int as = ixs > 0 ? addr_add_nl(ixs, DH_SERVER_IP, 24) : -1;
+  int one = 1;
+  srv = socket(AF_INET, SOCK_DGRAM, 0);
+  int o_reuse = srv >= 0 ? setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) : -1;
+  int o_bcast = srv >= 0 ? setsockopt(srv, SOL_SOCKET, K_SO_BROADCAST, &one, sizeof(one)) : -1;
+  int e_bcast = o_bcast ? errno : 0;
+  int o_bind = srv >= 0 ? setsockopt(srv, SOL_SOCKET, K_SO_BINDTODEVICE, "dhS", 4) : -1;
+  int e_bind = o_bind ? errno : 0;
+  char bound_dev[16] = "";
+  socklen_t bdl = sizeof(bound_dev);
+  int g_bind = srv >= 0 ? getsockopt(srv, SOL_SOCKET, K_SO_BINDTODEVICE, bound_dev, &bdl) : -1;
+  struct sockaddr_in me = {.sin_family = AF_INET, .sin_port = htons(67)};
+  int b67 = srv >= 0 ? bind(srv, (struct sockaddr *)&me, sizeof(me)) : -1;
+  int srv_ok = srv >= 0 && o_reuse == 0 && o_bcast == 0 && o_bind == 0 &&
+               g_bind == 0 && strcmp(bound_dev, "dhS") == 0 && b67 == 0;
+  if (srv_ok) {
+    server = fork();
+    if (server == 0) {
+      close(rep[0]);
+      dhcp_serve(srv, rep[1]);
+      _exit(0);
+    }
+  }
+  close(rep[1]);
+  rep[1] = -1;
+
+  /* The client side: BusyBox udhcpc, in the foreground of its own process. */
+  ns_enter(hc.fd);
+  int uc = if_set_up("dhC", 1);
+  if (srv_ok && server > 0) {
+    client = fork();
+    if (client == 0) {
+      int log = open("/tmp/m109-udhcpc.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (log >= 0) {
+        dup2(log, 1);
+        dup2(log, 2);
+      }
+      /* Through the multicall binary itself: the applet links are not
+       * necessarily on this process's PATH. */
+      execl("/bin/busybox", "udhcpc", "-f", "-i", "dhC", "-s", DH_SCRIPT, "-t", "8",
+             "-T", "1", "-A", "1", (char *)NULL);
+      _exit(127);
+    }
+  }
+  int bound = 0;
+  for (int i = 0; client > 0 && i < 200 && !bound; i++) { /* ~20 s */
+    bound = file_has(DH_EVENTS, "bound " DH_LEASE_IP " " DH_SERVER_IP);
+    if (!bound)
+      usleep(100000);
+  }
+  char leased[32], route_c[4096] = {0};
+  addr_get("dhC", leased, sizeof(leased));
+  slurp("/proc/net/route", route_c, sizeof(route_c));
+  int lease_ok = mvs == 0 && mvc == 0 && us == 0 && uc == 0 && as == 0 &&
+                 srv_ok && bound && strcmp(leased, DH_LEASE_IP) == 0 &&
+                 strstr(route_c, "0000600A") != NULL;
+  if (!lease_ok) {
+    char log[512] = {0};
+    slurp("/tmp/m109-udhcpc.log", log, sizeof(log));
+    for (char *q = log; *q; q++)
+      if (*q == '\n') *q = ';';
+    note("netns-dhcp-lease: mv=%d/%d up=%d/%d addr=%d sock=%d/%d(%d)/%d(%d)/%d:%s/%d "
+         "bound=%d leased=%s route=%d", mvs, mvc, us, uc, as, o_reuse, o_bcast,
+         e_bcast, o_bind, e_bind, g_bind, bound_dev[0] ? bound_dev : "-", b67,
+         bound, leased[0] ? leased : "-", strstr(route_c, "0000600A") != NULL);
+    note("netns-dhcp-lease: udhcpc=[%.200s]", log);
+  }
+  check("netns-dhcp-lease", lease_ok, bound);
+
+  /* Renew on request, over the kernel socket this time. */
+  int renewed = 0, alive = 0;
+  if (bound && client > 0) {
+    kill(client, SIGUSR1);
+    for (int i = 0; i < 150 && !renewed; i++) { /* ~15 s */
+      renewed = file_has(DH_EVENTS, "renew " DH_LEASE_IP " " DH_SERVER_IP);
+      if (!renewed)
+        usleep(100000);
+    }
+    alive = waitpid(client, NULL, WNOHANG) == 0;
+  }
+  char counts[64] = "";
+  if (client > 0) {
+    kill(client, SIGTERM);
+    waitpid(client, NULL, 0);
+    client = -1;
+  }
+  if (server > 0) {
+    ssize_t n = renewed ? read(rep[0], counts, sizeof(counts) - 1) : 0;
+    if (n <= 0)
+      kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+    server = -1;
+  }
+  int offers = -1, acks = -1, renews = -1;
+  sscanf(counts, "%d %d %d", &offers, &acks, &renews);
+  int renew_ok = renewed && alive && offers >= 1 && acks >= 1 && renews >= 1;
+  if (!renew_ok) {
+    char log[512] = {0};
+    slurp("/tmp/m109-udhcpc.log", log, sizeof(log));
+    for (char *q = log; *q; q++)
+      if (*q == '\n') *q = ';';
+    note("netns-dhcp-renew: renewed=%d alive=%d server=%s udhcpc=[%.200s]",
+         renewed, alive, counts[0] ? counts : "-", log);
+  }
+  check("netns-dhcp-renew", renew_ok, renewed);
+
+  /* The lease is the client namespace's alone. */
+  ns_enter(hs.fd);
+  char srv_now[32], dump_s[2048];
+  addr_get("dhS", srv_now, sizeof(srv_now));
+  int ns_s = nl_dump_text(K_RTM_GETADDR, AF_INET, dump_s, sizeof(dump_s));
+  ns_enter(g_init_netns);
+  char dump_i[4096], route_i[8192] = {0};
+  int ns_i = nl_dump_text(K_RTM_GETADDR, AF_INET, dump_i, sizeof(dump_i));
+  slurp("/proc/net/route", route_i, sizeof(route_i));
+  int iso_ok = lease_ok && ns_s >= 1 && ns_i >= 0 &&
+               strcmp(srv_now, DH_SERVER_IP) == 0 &&
+               !strstr(dump_s, " " DH_LEASE_IP "/") &&
+               !strstr(dump_i, " 10.96.0.") && !strstr(route_i, "0000600A");
+  if (!iso_ok)
+    note("netns-dhcp-isolated: lease=%d server-addr=%s server-has-lease=%d "
+         "init-has=%d init-route=%d", lease_ok, srv_now[0] ? srv_now : "-",
+         strstr(dump_s, " " DH_LEASE_IP "/") != NULL,
+         strstr(dump_i, " 10.96.0.") != NULL, strstr(route_i, "0000600A") != NULL);
+  check("netns-dhcp-isolated", iso_ok, 0);
+
+out:
+  if (client > 0) {
+    kill(client, SIGTERM);
+    waitpid(client, NULL, 0);
+  }
+  if (server > 0) {
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+  }
+  if (srv >= 0)
+    close(srv);
+  if (rep[0] >= 0)
+    close(rep[0]);
+  if (rep[1] >= 0)
+    close(rep[1]);
+  if (g_init_netns >= 0)
+    ns_enter(g_init_netns);
+  nsh_drop(&hc);
+  nsh_drop(&hs);
+  if (if_index("dhS") > 0)
+    link_del(if_index("dhS"));
+  unlink(DH_SCRIPT);
+}
+
+static void test_net_ns_more(void) {
+  void (*prev)(int) = signal(SIGPIPE, SIG_IGN);
+  test_net_ns_multi_addr();
+  test_net_ns_ipv6();
+  test_net_ns_dhcp();
+  signal(SIGPIPE, prev == SIG_ERR ? SIG_DFL : prev);
+}
+
 /* ── unlink of an in-memory node on an on-disk filesystem ─────────────────
  *
  * mknod(2) keeps a device node in memory even when its directory is on ext4 —
@@ -4021,6 +5005,7 @@ int main(void) {
   test_net_ns_ipv4();
   test_net_ns_udp_port();
   test_net_ns_tcp_isolated();
+  test_net_ns_more();
   test_unlink_enoent();
 
   test_dev_nodes_listed();

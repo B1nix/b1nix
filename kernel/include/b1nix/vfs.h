@@ -1011,6 +1011,15 @@ struct vfs_socket_state {
   void *sk_filter;
   int tcp_nodelay;
   int ipv6_v6only;
+  /* SO_BROADCAST: a datagram to the limited broadcast address is refused with
+   * EACCES unless the socket asked for it, as on Linux. */
+  int so_broadcast;
+  /* SO_BINDTODEVICE: the interface index the socket sends by and receives
+   * from, 0 when unbound. */
+  int bind_ifindex;
+  /* ICMP6_FILTER (RFC 3542) for a raw ICMPv6 socket: bit N set blocks type N.
+   * All clear, the default, passes everything. */
+  u32 icmp6_filter[8];
   int so_error;
   int so_rcvbuf;
   int so_sndbuf;

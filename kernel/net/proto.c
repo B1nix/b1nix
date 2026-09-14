@@ -201,6 +201,22 @@ void net_proto_ipv6_send(struct in6_addr_k dst, u8 next_header,
   proto_dispatch_leave();
 }
 
+/* Same, reporting whether any IPv6 datapath took the datagram. */
+int net_proto_ipv6_send_checked(struct in6_addr_k dst, u8 next_header,
+                                const void *payload, usize size) {
+  int sent = 0;
+  proto_dispatch_enter();
+  for (struct net_proto *p = proto_list; p; p = p->next) {
+    if (p->send6) {
+      p->send6(dst, next_header, payload, size);
+      sent = 1;
+      break;
+    }
+  }
+  proto_dispatch_leave();
+  return sent;
+}
+
 void net_proto_icmp6_unreach(struct in6_addr_k dst, u8 code, const void *quoted,
                              usize quoted_len) {
   proto_dispatch_enter();
