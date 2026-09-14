@@ -3613,6 +3613,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 	check_output "$LOG" "M101-SMOKE: ok rbtree-churn" "M101: the rbtree survives 4096 interleaved inserts and erases over heavily duplicated keys — the shape the DRM allocator builds — with the invariants and the cached leftmost checked after every operation"
 	check_output "$LOG" "M101-SMOKE: ok interval-tree" "M101: overlap queries agree with a brute-force scan, and every node's cached subtree maximum survives rebalancing"
 	check_output "$LOG" "M101-SMOKE: ok xarray" "M101: sparse indices across the full 64-bit range round-trip, iterate in order, and the tree folds back to genuinely empty on erase"
+	check_output "$LOG" "M101-SMOKE: ok maple-tree" "M101: the imported maple tree stores, walks and erases ranges across multi-level nodes, and destroying it frees every 256-byte-aligned node through kfree"
 	check_output "$LOG" "M101-SMOKE: ok kthread-worker" "M101: a caller-owned worker runs its items in submission order, coalesces a re-queue, and a flush waits for a sleeping handler"
 	check_output "$LOG" "M101-SMOKE: ok rcu" "M101: RCU read sections nest correctly, a grace period with no readers still completes, and deferred callbacks each run exactly once by the time rcu_barrier returns"
 	# Needs a reader running on ANOTHER CPU while synchronize_rcu waits — that

@@ -76,11 +76,18 @@ struct page *__page_cache_alloc(gfp_t gfp)
  * The mapping's reference is taken here and dropped by the removal. The folio
  * is published with its mapping and index already set, so that anything which
  * finds it in the array immediately sees where it belongs.
+ *
+ * Insert-only, under the array's lock: a slot that is already taken is left
+ * alone and the caller loses. Storing first and putting the previous entry
+ * back afterwards let two racing losers swap each other's folio back in, and
+ * the index ended up holding a folio its owner had already unmapped and freed
+ * -- every later lookup of that offset saw `mapping` mismatch and retried for
+ * ever (four execs of one library, all spinning in __filemap_get_folio).
  */
 int filemap_add_folio(struct address_space *mapping, struct folio *folio,
                       pgoff_t index, gfp_t gfp)
 {
-	void *old;
+	int err;
 
 	(void)gfp;
 	if (!mapping || !folio)
@@ -88,22 +95,16 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 	folio->mapping = mapping;
 	folio->index = index;
 	folio_get(folio);
-	old = xa_store(&mapping->i_pages, index, folio, GFP_KERNEL);
-	if (xa_err(old)) {
-		folio_put(folio);
+	xa_lock_irq(&mapping->i_pages);
+	err = __xa_insert(&mapping->i_pages, index, folio, GFP_KERNEL);
+	if (!err)
+		mapping->nrpages++;
+	xa_unlock_irq(&mapping->i_pages);
+	if (err) {
 		folio->mapping = NULL;
-		return xa_err(old);
-	}
-	if (old) {
-		/* Something was already there. That is a caller bug — two folios for
-		 * one offset — and the loser is the one just inserted, because the
-		 * other may already be locked by somebody. */
-		xa_store(&mapping->i_pages, index, old, GFP_KERNEL);
 		folio_put(folio);
-		folio->mapping = NULL;
-		return -EEXIST;
+		return err == -EBUSY ? -EEXIST : err;
 	}
-	mapping->nrpages++;
 	return 0;
 }
 
@@ -117,12 +118,20 @@ void filemap_remove_folio(struct folio *folio)
 {
 	struct address_space *mapping = folio ? folio->mapping : NULL;
 
+	void *old;
+
 	if (!mapping)
 		return;
-	xa_erase(&mapping->i_pages, folio->index);
-	folio->mapping = NULL;
-	if (mapping->nrpages)
+	/* Only the entry that is this folio: two removals racing on one folio
+	 * must drop the mapping's reference once, not twice. */
+	xa_lock_irq(&mapping->i_pages);
+	old = __xa_cmpxchg(&mapping->i_pages, folio->index, folio, NULL, 0);
+	if (old == folio && mapping->nrpages)
 		mapping->nrpages--;
+	xa_unlock_irq(&mapping->i_pages);
+	if (old != folio)
+		return;
+	folio->mapping = NULL;
 	/* The mapping's own reference, released now that nothing can find it. */
 	folio_put(folio);
 }

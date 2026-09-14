@@ -824,6 +824,15 @@ static void test_xarray(void)
 	m101_report("xarray", ok, seen);
 }
 
+/* The maple tree, likewise Linux's own (lib/maple_tree.c). */
+static void test_maple_tree(void)
+{
+	u64 seen = 0;
+	int ok = lkpi_maple_selftest(&seen);
+
+	m101_report("maple-tree", ok, seen);
+}
+
 /* ── kthread_worker ─────────────────────────────────────────────── */
 
 #define KW_ITEMS 16
@@ -1435,6 +1444,7 @@ void lkpi_selftest_m101(void)
 	test_rbtree_churn();
 	test_interval_tree();
 	test_xarray();
+	test_maple_tree();
 	test_kthread_worker();
 	test_rcu_basic();
 	test_pages();

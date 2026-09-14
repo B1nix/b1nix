@@ -82,5 +82,6 @@ void drm_kms_selftest(void);
  * Returns 1 when every check held; *seen is the number of entries the ordered
  * walk visited. */
 int lkpi_xarray_selftest(u64 *seen);
+int lkpi_maple_selftest(u64 *seen);
 
 #endif

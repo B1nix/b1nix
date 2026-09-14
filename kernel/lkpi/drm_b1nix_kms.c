@@ -910,8 +910,13 @@ static const struct drm_driver b1nix_drm_driver = {
 	/* DRIVER_RENDER: the driver ioctls below are served on the render node,
 	 * which is what a client that only wants to draw opens -- it needs no
 	 * master lease and no modeset rights. */
+	/* DRIVER_CURSOR_HOTSPOT: a compositor on a virtual GPU refuses atomic
+	 * modesetting unless it can say where a cursor's hotspot is (the host
+	 * draws the pointer), and DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT is granted
+	 * only to drivers that declare this. The pipe has no cursor plane, so the
+	 * compositor composites its cursor; the capability is what it asks. */
 	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC |
-			   DRIVER_RENDER,
+			   DRIVER_RENDER | DRIVER_CURSOR_HOTSPOT,
 	/* The name is not decoration: it is the FIRST thing Mesa's loader matches,
 	 * ahead of the PCI id, and it looks for "<name>_dri.so". Called "b1nix" it
 	 * sent every client hunting for a b1nix_dri.so that does not exist and

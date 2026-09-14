@@ -1021,6 +1021,10 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 	# The DRM backend's own account first and in full: the head of the log is
 	# Qt's plugin inventory, hundreds of lines that push every line about outputs,
 	# connectors and page flips past any cut.
+	# Which modesetting path kwin took on each GPU: atomic, or the legacy
+	# ioctls it falls back to (on a virtual GPU without cursor hotspots).
+	grep -a "Atomic Mode Setting\|atomic mode setting\|legacy" /tmp/kde-kwin.log 2>/dev/null |
+		head -4 | sed 's/^/KDE: kwin modeset: /'
 	echo "--- kwin drm ---"
 	grep -a "kwin_wayland_drm\|kwin_scene\|kwin_screencast\|DrmGpu\|drmMode\|kwin_core: Failed\|No suitable\|connector\|Connector\|modeset\|page flip\|pageflip" \
 		/tmp/kde-kwin.log 2>/dev/null | tail -60

@@ -11,6 +11,7 @@
 # frame every few seconds in between.
 #
 # Usage: sh tools/run/run-kde.sh [tag]
+#   KDE_KERNEL=path  boot another kernel against the same root image
 set -e
 DIR=$(cd "$(dirname "$0")/../.." && pwd)
 TAG=${1:-kde}
@@ -48,7 +49,7 @@ if [ "${KDE_ROOT:-disk}" = disk ]; then
 	CMDLINE="$CMDLINE${KDE_EXTRA_CMDLINE:+ $KDE_EXTRA_CMDLINE}"
 	sh "$DIR/tools/images/mkiso.sh" --stage "$DIR/build/x86_64/kde-run-iso" \
 		--out "$DIR/build/x86_64/b1nix-kde-run.iso" --arch x86_64 \
-		--kernel "$DIR/build/x86_64/kernel.elf" --timeout 0 \
+		--kernel "${KDE_KERNEL:-$DIR/build/x86_64/kernel.elf}" --timeout 0 \
 		--cmdline "$CMDLINE" > /dev/null
 	# The KDE group packs its own image (Makefile: ROOT_IMAGE); an older tree
 	# packed it under the shared name.

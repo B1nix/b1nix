@@ -44,15 +44,74 @@ void *lkpi_kcalloc(usize n, usize size, gfp_t flags)
 	return kzalloc(n * size);
 }
 
+/*
+ * Over-aligned objects.
+ *
+ * The heap aligns blocks to 16 bytes. A slab cache that asks for more -- the
+ * maple tree keeps a node's type in the low byte of a pointer to it, so its
+ * nodes are 256-byte aligned -- gets a larger block with the object at the next
+ * boundary inside it. The two words below the object record the block's own
+ * address and a tag, which is how kfree() tells such an object from a block
+ * start: upstream frees maple nodes with plain kfree(), not kmem_cache_free().
+ *
+ * The word the tag occupies is, for an ordinary heap or large block, its
+ * header's magic and padding, which never equal the tag.
+ */
+#define LKPI_ALIGNED_TAG 0xa11c0b1a5a11ed5aULL
+
+void *lkpi_kmalloc_aligned(usize size, usize align, gfp_t flags)
+{
+	void *base, *obj;
+
+	base = lkpi_kmalloc(size + align + 2 * sizeof(void *), flags);
+	if (!base)
+		return 0;
+	obj = (void *)((((usize)base + 2 * sizeof(void *)) + align - 1) &
+	               ~(align - 1));
+	((u64 *)obj)[-1] = (u64)(usize)base;
+	((u64 *)obj)[-2] = LKPI_ALIGNED_TAG;
+	return obj;
+}
+
+/* The block an aligned object lives in, or 0 for an ordinary pointer. The tag
+ * word is read only where it is certainly mapped: on the object's own page, or
+ * on the page below once that page is known to be present. */
+static void *lkpi_aligned_base(const void *ptr)
+{
+	usize p = (usize)ptr;
+	u64 *words = (u64 *)(p - 2 * sizeof(void *));
+
+	if ((p & (PAGE_SIZE - 1)) < 2 * sizeof(void *) &&
+	    !vmm_virt_to_phys((void *)((usize)words & ~(PAGE_SIZE - 1))))
+		return 0;
+	if (words[0] != LKPI_ALIGNED_TAG)
+		return 0;
+	return (void *)(usize)words[1];
+}
+
 usize lkpi_ksize(const void *ptr)
 {
+	void *base = ptr ? lkpi_aligned_base(ptr) : 0;
+
+	if (base)
+		return kmalloc_usable_size(base) - ((usize)ptr - (usize)base);
 	return kmalloc_usable_size(ptr);
 }
 
 void lkpi_kfree(void *ptr)
 {
-	if (ptr)
-		kfree(ptr);
+	void *base;
+
+	if (!ptr)
+		return;
+	base = lkpi_aligned_base(ptr);
+	if (base) {
+		/* Cleared first: a second free of the same object must not find a
+		 * tag and free the block again. */
+		((u64 *)ptr)[-2] = 0;
+		ptr = base;
+	}
+	kfree(ptr);
 }
 
 /* ── ioremap ────────────────────────────────────────────────────── */

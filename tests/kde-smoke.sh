@@ -68,6 +68,20 @@ else
 	ok "no-nested-compositor"
 fi
 
+# 1b. kwin drove the card with atomic modesetting.
+#
+# On a virtual GPU kwin falls back to the legacy ioctls unless the driver lets
+# it declare cursor hotspots (DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT); the line it
+# prints either way is kwin's own, so the guest cannot claim the path it did
+# not take.
+if grep -aq "KDE: kwin modeset: .*Using Atomic Mode Setting" "$LOG" &&
+   ! grep -aq "KDE: kwin modeset: .*legacy" "$LOG"; then
+	ok "atomic-modeset"
+else
+	bad "atomic-modeset (kwin did not take the atomic path)"
+	grep -a "KDE: kwin modeset:" "$LOG" | head -3
+fi
+
 # 2. udev catalogued the card, which is what gives it a seat.
 #
 # logind hands a device to a session only when the udev database says the

@@ -578,13 +578,11 @@ struct kmem_cache {
 };
 
 /*
- * The heap aligns every block to 16 bytes. A cache asking for more — the maple
- * tree packs a node's type into the low byte of a pointer to it, so its nodes
- * must be 256-byte aligned — gets an over-allocation with the object placed at
- * the next boundary inside it and the block's own address stored just below
- * the object, where kmem_cache_free finds it.
+ * The heap aligns every block to 16 bytes. A cache asking for more gets its
+ * objects from lkpi_kmalloc_aligned, which kfree() and ksize() recognise.
  */
 #define KMEM_HEAP_ALIGN 16u
+void *lkpi_kmalloc_aligned(usize size, usize align, gfp_t flags);
 
 static bool kmem_cache_needs_align(const struct kmem_cache *c)
 {
@@ -618,16 +616,9 @@ void kmem_cache_destroy(struct kmem_cache *c)
 
 static void *kmem_cache_alloc_raw(struct kmem_cache *c, gfp_t flags)
 {
-	void *base, *obj;
-
 	if (!kmem_cache_needs_align(c))
 		return kmalloc(c->size, flags);
-	base = kmalloc(c->size + c->align + sizeof(void *), flags);
-	if (!base)
-		return 0;
-	obj = (void *)ALIGN((unsigned long)base + sizeof(void *), c->align);
-	((void **)obj)[-1] = base;
-	return obj;
+	return lkpi_kmalloc_aligned(c->size, c->align, flags);
 }
 
 void *kmem_cache_alloc(struct kmem_cache *c, gfp_t flags)
@@ -656,10 +647,7 @@ void *kmem_cache_zalloc(struct kmem_cache *c, gfp_t flags)
 
 void kmem_cache_free(struct kmem_cache *c, void *obj)
 {
-	if (!obj)
-		return;
-	if (c && kmem_cache_needs_align(c))
-		obj = ((void **)obj)[-1];
+	(void)c;
 	kfree(obj);
 }
 

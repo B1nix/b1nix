@@ -169,8 +169,8 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 
 - [x] kwin_wayland + plasmashell on real DRM via elogind/eudev ([image](images/m113-plasma-drm.png)); `tests/kde-smoke.sh`.
 - [x] Boot to painted desktop 194 s → ~16 s; evdev input and DRM framebuffer console before the compositor.
-- [ ] `partial` kwin uses the legacy modeset path (`CURSOR_PLANE_HOTSPOT` needs Linux 6.7+; the DRM core is now 6.18.51, universal planes still not offered to kwin).
-- [ ] `partial` Remaining costs: dbus/elogind session stalls, vmm read-lock per copyin. (Dirty pages now go through the `pcflush` writeback thread; the lkpi header macro warnings were fixed in M121.)
+- [x] kwin takes atomic modesetting on virtio-gpu: the driver advertises `DRIVER_CURSOR_HOTSPOT` (DRM core 6.18.51); `atomic-modeset` check in `tests/kde-smoke.sh`.
+- [ ] `partial` Remaining costs: dbus/elogind session stalls, vmm read-lock per copyin. The 20 s `udevadm settle` stall was a page-cache insert race (concurrent execs of one library spun on a freed folio), fixed.
 
 ## M121: Kernel only
 

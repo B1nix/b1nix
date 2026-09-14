@@ -35,7 +35,8 @@ Linux's `include/linux` is not staged wholesale: the interfaces the imports
 stand on are reimplemented in `kernel/include/linux` and `kernel/lkpi`. A few
 headers that are data structures or pure macros rather than interfaces are
 carried there copied from Linux 6.18.51 and marked as such — `xarray.h`,
-`radix-tree.h`, `idr.h` (matching the staged `lib/{xarray,radix-tree,idr}.c`),
+`radix-tree.h`, `idr.h`, `maple_tree.h` (matching the staged
+`lib/{xarray,radix-tree,idr,maple_tree}.c`),
 `cleanup.h`, `args.h` and `unaligned.h` — under GPL-2.0, which b1nix's own
 GPL-2.0-only licence is compatible with.
 

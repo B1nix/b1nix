@@ -575,7 +575,11 @@ void kernel_main(usize arg0, usize arg1)
 	 * the rest of linuxkpi starts. */
 	{
 		extern void radix_tree_init(void);
+		extern void maple_tree_init(void);
 		radix_tree_init();
+		/* And the maple tree's node cache, which btrfs's lru cache (send,
+		 * backref walks) allocates from. */
+		maple_tree_init();
 	}
 	BOOTMARK(4);	/* green:   kernel heap up */
 
@@ -1911,7 +1915,9 @@ void kernel_main(usize arg0, usize arg1)
 	    !bootinfo_has_flag("b1nix.drm-gsmtrap") &&
 	    !bootinfo_has_flag("b1nix.drm-cadence") &&
 	    !bootinfo_get_u32("b1nix.drm-framedump", 0) &&
-	    !bootinfo_has_flag("b1nix.sysprof")) {
+	    !bootinfo_has_flag("b1nix.sysprof") &&
+	    !bootinfo_has_flag("b1nix.trace-sysfs") &&
+	    !bootinfo_has_flag("b1nix.trace-open")) {
 		console_write("init: the console is userspace's now; the kernel keeps "
 		              "warnings (b1nix.console-verbose keeps it all)\n");
 		console_loglevel_set(CONSOLE_LOGLEVEL_QUIET);

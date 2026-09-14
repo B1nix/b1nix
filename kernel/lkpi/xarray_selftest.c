@@ -12,10 +12,12 @@
 
 #include <linux/xarray.h>
 #include <linux/idr.h>
+#include <linux/maple_tree.h>
 #include <linux/slab.h>
 #include <lkpi/types.h>
 
 int lkpi_xarray_selftest(u64 *seen);
+int lkpi_maple_selftest(u64 *seen);
 
 #define XA_TEST_ENTRIES 200
 #define XA_TEST_STRIDE  1000003ul /* prime: indices share no prefixes */
@@ -119,6 +121,62 @@ int lkpi_xarray_selftest(u64 *seen)
 		idr_destroy(&idr);
 	}
 
+	*seen = walked;
+	return ok;
+}
+
+/*
+ * The maple tree, which btrfs's lru cache sits on. Its nodes come from a cache
+ * aligned to their own size -- the tree keeps a node's type in the low bits of
+ * the pointer -- and upstream frees them with plain kfree(). Enough ranges are
+ * stored to split nodes several levels deep, and the tree is emptied and
+ * destroyed so that every node goes back through that free.
+ */
+#define MT_TEST_RANGES 600
+#define MT_TEST_STEP   16ul
+
+int lkpi_maple_selftest(u64 *seen)
+{
+	DEFINE_MTREE(mt);
+	unsigned long index;
+	unsigned long walked = 0;
+	void *entry;
+	int ok = 1;
+	int i;
+
+	for (i = 0; i < MT_TEST_RANGES; i++) {
+		unsigned long first = (unsigned long)i * MT_TEST_STEP;
+
+		if (mtree_store_range(&mt, first, first + MT_TEST_STEP / 2 - 1,
+				      xa_mk_value(i), GFP_KERNEL))
+			ok = 0;
+	}
+	for (i = 0; i < MT_TEST_RANGES; i++) {
+		unsigned long first = (unsigned long)i * MT_TEST_STEP;
+
+		if (mtree_load(&mt, first) != xa_mk_value(i) ||
+		    mtree_load(&mt, first + MT_TEST_STEP / 2 - 1) != xa_mk_value(i) ||
+		    mtree_load(&mt, first + MT_TEST_STEP / 2))
+			ok = 0;
+	}
+	index = 0;
+	mt_for_each(&mt, entry, index, ULONG_MAX) {
+		if (entry != xa_mk_value(walked))
+			ok = 0;
+		walked++;
+	}
+	if (walked != MT_TEST_RANGES)
+		ok = 0;
+	/* Erase the odd ranges, which rebalances, then check what is left. */
+	for (i = 1; i < MT_TEST_RANGES; i += 2)
+		if (mtree_erase(&mt, (unsigned long)i * MT_TEST_STEP) != xa_mk_value(i))
+			ok = 0;
+	for (i = 0; i < MT_TEST_RANGES; i++)
+		if (!!mtree_load(&mt, (unsigned long)i * MT_TEST_STEP) != !(i & 1))
+			ok = 0;
+	mtree_destroy(&mt);
+	if (!mtree_empty(&mt))
+		ok = 0;
 	*seen = walked;
 	return ok;
 }
