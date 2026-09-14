@@ -170,7 +170,7 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 - [x] kwin_wayland + plasmashell on real DRM via elogind/eudev ([image](images/m113-plasma-drm.png)); `tests/kde-smoke.sh`.
 - [x] Boot to painted desktop 194 s → ~16 s; evdev input and DRM framebuffer console before the compositor.
 - [x] kwin takes atomic modesetting on virtio-gpu: the driver advertises `DRIVER_CURSOR_HOTSPOT` (DRM core 6.18.51); `atomic-modeset` check in `tests/kde-smoke.sh`.
-- [ ] `partial` Boot to desktop is back to ~13 s (from 23–25 s: reaper wake storm, whole-cache walk per inode flush, a page-cache insert race behind a 20 s `udevadm settle`). Remaining: file faults (~0.6 M cycles each), vmm read-lock per copyin.
+- [x] Boot to desktop ~7 s (from 23–25 s): reaper wake storm, whole-cache inode flush, page-cache insert race, poll wake storms, per-page lkpi reads, VMA list walks (per-space cache + copy-on-write index), PCI scans by port I/O; `tools/run/kde-boot-time.sh` measures it.
 
 ## M121: Kernel only
 
