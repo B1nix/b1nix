@@ -2985,6 +2985,10 @@ void tcp_robustness_smoke(void) {
         net_poll();
     }
 
+    /* The peer must not see the data -- and ACK it, freeing both queued
+     * segments -- before the SACK below arrives. The net task drains loopback
+     * on its own CPU, so without the hold a slow boot let it do exactly that. */
+    net_loopback_hold();
     int rc1 = cli2 ? tcp_send(cli2, "0123456789", 10) : -1;
     int rc2 = cli2 ? tcp_send(cli2, "abcdefghij", 10) : -1;
     struct tcp_retransmit_pkt *first = cli2 ? cli2->retransmit_queue : 0;
@@ -3018,6 +3022,7 @@ void tcp_robustness_smoke(void) {
 
       ok = (second->sacked == 1 && first->sacked == 0);
     }
+    net_loopback_release();
     console_write(ok ? "M84-TCP: ok sack-consume\n"
                      : "M84-TCP: FAIL sack-consume\n");
 

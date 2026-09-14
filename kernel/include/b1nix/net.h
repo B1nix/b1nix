@@ -30,6 +30,11 @@ void net_poll(void);
  * drains it in a clean context. is_v6 picks ipv4_receive vs ipv6_receive. */
 void net_loopback_enqueue(const void *ip_pkt, usize len, int is_v6);
 void net_loopback_drain(void);
+/* Hold loopback delivery: packets queue but nobody drains them until the
+ * release, which drains. For self-tests that must see a sender's state before
+ * the peer answers. */
+void net_loopback_hold(void);
+void net_loopback_release(void);
 int net_is_ready(void);
 void net_dump_info(void);
 void net_interrupt_handler(void);

@@ -1557,6 +1557,20 @@ void net_loopback_drain(void)
 	}
 }
 
+void net_loopback_hold(void)
+{
+	/* The drain flag is the hold: whoever owns it is the only drainer, and
+	 * the net task backs off while it is set. Wait out a drain in progress. */
+	while (__atomic_test_and_set(&net_lb_draining, __ATOMIC_ACQUIRE))
+		scheduler_yield();
+}
+
+void net_loopback_release(void)
+{
+	__atomic_clear(&net_lb_draining, __ATOMIC_RELEASE);
+	net_loopback_drain();
+}
+
 void net_poll(void)
 {
 	/* Drain loopback first, and unconditionally — loopback must work even
