@@ -1064,7 +1064,10 @@ void net_deliver_frame(struct netdev *dev, const void *frame, usize len,
  * sender: only a retransmit recovers it, which is why the depth should be the
  * one Linux found sufficient rather than a quarter of it. */
 #define NET_LOOPBACK_Q 1000
-struct net_loopback_pkt { u8 *data; usize len; int is_v6; };
+/* `ns` is the sender's network namespace: the queue is drained by whichever
+ * task gets there, and a packet resolved in the drainer's namespace missed its
+ * socket -- loopback TCP inside a namespace saw every data segment reset. */
+struct net_loopback_pkt { u8 *data; usize len; int is_v6; u32 ns; };
 static struct net_loopback_pkt net_loopback_q[NET_LOOPBACK_Q];
 static volatile u32 net_lb_head; /* consumer */
 static volatile u32 net_lb_tail; /* producer */
@@ -1097,6 +1100,7 @@ void net_loopback_enqueue(const void *ip_pkt, usize len, int is_v6)
 	net_loopback_q[net_lb_tail].data = copy;
 	net_loopback_q[net_lb_tail].len = len;
 	net_loopback_q[net_lb_tail].is_v6 = is_v6;
+	net_loopback_q[net_lb_tail].ns = namespace_net_context();
 	net_lb_tail = next;
 	if (!__atomic_load_n(&net_lb_draining, __ATOMIC_ACQUIRE))
 		kick_net_task = 1;
@@ -1123,9 +1127,11 @@ void net_loopback_drain(void)
 		u8 *data = net_loopback_q[net_lb_head].data;
 		usize len = net_loopback_q[net_lb_head].len;
 		int is_v6 = net_loopback_q[net_lb_head].is_v6;
+		u32 ns = net_loopback_q[net_lb_head].ns;
 		net_lb_head = (net_lb_head + 1) % NET_LOOPBACK_Q;
 		__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
 
+		u32 saved_ns = namespace_net_push_context(ns);
 		if (is_v6)
 			proto_deliver_ether(0x86DD, data, len);
 		else
@@ -1134,6 +1140,7 @@ void net_loopback_drain(void)
 			 * header, so every packet the stack sends to itself also proves the
 			 * software checksum path on the way back in. */
 			ipv4_receive(data, len);
+		namespace_net_pop_context(saved_ns);
 		kfree(data);
 	}
 }

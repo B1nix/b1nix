@@ -198,7 +198,7 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 - [x] 283 of 321 applets built and each proved through `/bin`.
 - [x] AF_PACKET, VLAN/bridge/bonding/gretap, four namespace kinds with veth, pivot_root, uevent netlink for `mdev`, per-namespace IPv4 config.
 - [x] Single-device gaps triaged (`wontfix`: rfkill, floppy, `i2ctransfer`).
-- [ ] `partial` Namespaces still share IPv6 interface state, allow one IPv4 address each, share one `EADDRINUSE` table, and DHCP runs only in the initial namespace.
+- [ ] `partial` Namespaces still share IPv6 interface state, allow one IPv4 address each, (TCP, UDP and loopback are per namespace), and DHCP runs only in the initial namespace.
 
 ## M110: Unix block-device names
 
@@ -266,7 +266,6 @@ Upstream Linux 6.6 `fs/btrfs`, `fs/ext4`, `fs/jbd2` built unpatched on our shim.
 - [x] The root filesystem is the imported btrfs (`mkfs.btrfs --rootdir`; `ROOT_FS=ext4` still builds the old image). x86_64 smoke 1419/1 on it. Bugs a real root exposed: out-of-order spinlock release re-enabled IRQs, `schedule()` spun instead of sleeping, linked inodes evicted with their delalloc data, lookup nodes shared page-cache keys, preempt count per CPU. Detail in [linuxkpi-fs.md](linuxkpi-fs.md).
 - [x] aarch64 root on the imported btrfs too (1364/2, both fails the native ext4 data disk). Fixed on the way: user page faults read with IRQs on, the workqueue no longer touches a finished work item, `set_mask_bits` writes its target's width.
 - [x] ext2/3/4 are the imported ext4; the native ext1/2/3/4 + journal drivers (5000 lines) are gone. x86_64 1424/0, aarch64 1366/0. Bugs it exposed: rename skipped `d_move`, a reused inode number served the dead file's cached pages, umount dropped unflushed pages, a bdev inode had no bdi.
-- [ ] `open` aarch64 blk lane, 1 run in 3: double `list_del` (poison 0x100/0x200) in a jbd2 thread during the M14 churn test.
 
 ## M121: Kernel only
 
@@ -280,7 +279,7 @@ Upstream Linux 6.6 `fs/btrfs`, `fs/ext4`, `fs/jbd2` built unpatched on our shim.
 - [x] execve no longer drops arguments past 256 (a 684-argument link ran on the first 256 objects); oversized vectors are E2BIG.
 - [x] The kernel built in-guest boots: on a btrfs build disk, extracted with `btrfs restore`, it mounts the btrfs root and runs userspace (`tools/selfhost/selfhost-proof.sh`, 653/653 in ~5 min). It took `sync(2)` writing out and committing imported filesystems, and a workqueue that no longer touches a freed work item.
 - [x] aarch64 builds the imported btrfs and prints debug tracing on test boots (the M40 personality line).
-- [ ] `partial` aarch64 smoke 1357/0, but one run in two wedged sys/posix: READY tasks not picked and futex wakes missed under TCG; not yet traced.
+- [ ] `partial` aarch64 wedges: two causes fixed (a timed sleeper halting on the boot CPU starved READY tasks; a jbd2 wait entry deleted twice), but sys/gfx lanes still wedge now and then; in both dumps the `reaper` kthread is current on the boot CPU as READY on no runqueue (`queued=NO`) — every yield wakes it once any thread has ever existed (its own block included), so it never stops being runnable; gating the wake on a pending death (tried 09-14) regressed x86_64 (AIO hang, heap corruption) and was reverted, and M86 `rusage-thread-burn` once credited a compute loop to system time.
 - [x] Wall clock no longer runs backwards: NTP slewed by stepping whole seconds; now one monotonic-based wall clock on both arches, NTP offset in ns, slew at <=500 ppm.
 - [x] `telinit` and the fake M39 inittab markers removed (M39 keeps its real serial-tty checks).
 - [x] The IOMMU instances end with `reboot -f`; the check passes only when QEMU (-no-reboot) then exits on its own.

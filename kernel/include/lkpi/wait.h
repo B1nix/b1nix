@@ -242,6 +242,9 @@ void __add_wait_queue(struct wait_queue_head *wq, struct wait_queue_entry *e);
 void __add_wait_queue_entry_tail(struct wait_queue_head *wq,
                                  struct wait_queue_entry *e);
 void __remove_wait_queue(struct wait_queue_head *wq, struct wait_queue_entry *e);
+/* finish_wait()'s half: unlink if still queued and leave the entry empty, so
+ * a loop that prepares the same entry again re-adds it. */
+void lkpi_finish_wait_entry(struct wait_queue_head *wq, struct wait_queue_entry *e);
 
 /* Wake the callback entries with a key, as well as the parked tasks. A NULL key
  * is what plain wake_up passes. */

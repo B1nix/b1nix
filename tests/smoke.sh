@@ -3025,6 +3025,8 @@ check_output "$LOG" "M109-SMOKE: ok net-ns-routes" "a route added inside a netwo
 check_output "$LOG" "M109-SMOKE: ok netns-ipv4-address" "an interface moved into a network namespace takes an address of its own - by SIOCSIFADDR on one side and RTM_NEWADDR on the other - and each namespace gets the on-link route that comes with it"
 check_output "$LOG" "M109-SMOKE: ok netns-ipv4-exchange" "a UDP datagram crosses a veth pair between two network namespaces and is echoed back, each packet carrying the sending namespace's own address as its source"
 check_output "$LOG" "M109-SMOKE: ok netns-ipv4-isolated" "neither namespaced address, its prefix, nor its interface exists in the initial namespace, whose own lease is unchanged"
+check_output "$LOG" "M109-SMOKE: ok netns-udp-port-own" "a UDP port bound in the initial network namespace can be bound again in another, and not twice in the same one"
+check_output "$LOG" "M109-SMOKE: ok netns-tcp-isolated" "a TCP listener in the initial network namespace is not reachable from another namespace at the same address and port, and that namespace's own listener there carries a loopback connection"
 check_output "$LOG" "M109-SMOKE: done" "M109 namespace suite completes"
 # ── M109: device nodes, findfs/blkid, and mount(MS_MOVE)/switch_root ──
 check_output "$BLK_LOG" "M109-SMOKE: ok dev-nodes-listed" "a readdir of /dev lists every block device /sys/block names, as a block special file"

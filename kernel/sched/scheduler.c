@@ -5534,11 +5534,47 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
         if (st == TASK_READY || st == TASK_DEAD || st == TASK_REAPING)
           break;
       }
+      /* Park again, giving the CPU to anything that became runnable since the
+       * yield above, before halting on it. A sleeper that only halted kept its CPU for the
+       * whole sleep: on aarch64, where user tasks run on the boot CPU alone,
+       * btrfs-cleaner's timed sleep starved a FIFO writer past the watchdog. */
+      {
+        int switched;
+        enum task_state running = TASK_RUNNING;
+
+        interrupts_disable();
+        if (current_task->state != TASK_RUNNING) {
+          /* Stopped, killed or woken by another CPU: that state is not ours
+           * to overwrite. */
+          interrupts_enable();
+          break;
+        }
+        task_lease_clear(current_task, __func__);
+        if (!__atomic_compare_exchange_n(&current_task->state, &running,
+                                         TASK_SLEEPING, 0, __ATOMIC_ACQUIRE,
+                                         __ATOMIC_RELAXED)) {
+          interrupts_enable();
+          break;
+        }
+        switched = scheduler_yield(); /* parked, so no ping-pong */
+        interrupts_enable();
+        if (switched)
+          continue;
+      }
       /* Idle, not the sleeper's CPU time: see scheduler_wait_commit. */
       sched_acct_leave_kernel();
       interrupts_enable_and_wait();
       sched_acct_skip_idle();
     }
+  }
+  {
+    /* Only a state this sleep owns becomes RUNNING again: a stop or a kill
+     * that landed meanwhile is the caller's to honour, not to erase. */
+    int st = __atomic_load_n(&current_task->state, __ATOMIC_ACQUIRE);
+    if (st == TASK_DEAD || st == TASK_REAPING)
+      return SLEEP_GONE;
+    if (st == TASK_STOPPED)
+      return SLEEP_RETRY;
   }
   current_task->state = TASK_RUNNING;
   return SLEEP_OK;

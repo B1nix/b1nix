@@ -5,6 +5,7 @@
 #include <b1nix/net.h>
 #include <b1nix/netproto.h>
 #include <b1nix/netdev.h>
+#include <b1nix/namespace.h>
 #include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
 #include <b1nix/posix.h>
@@ -241,6 +242,7 @@ struct tcp_retransmit_pkt {
 struct tcp_conn {
   int used;
   int state;
+  u32 netns;            /* the network namespace the connection lives in */
   u8 keepalive;         /* SO_KEEPALIVE */
   u8 keepalive_probes;  /* unanswered probes since the last activity */
   u32 keepidle;
@@ -910,13 +912,17 @@ static u16 tcp6_checksum(struct in6_addr_k src, struct in6_addr_k dst,
 
 /* Raw L3 transmit of an already-formed TCP segment, choosing IPv4 or IPv6
  * by address family. Does not touch the checksum (used for retransmits). */
+/* `ns` is the connection's namespace: retransmits and keepalives run from
+ * a timer, whose own namespace says nothing about where the segment goes. */
 static void tcp_l3_send(u8 family, struct ipv4_addr v4,
                         const struct in6_addr_k *v6, const void *pkt,
-                        usize len, u32 tx_flags) {
+                        usize len, u32 tx_flags, u32 ns) {
+  u32 saved = namespace_net_push_context(ns);
   if (family == B1NIX_AF_INET6)
     net_proto_ipv6_send(*v6, IP_PROTO_TCP, pkt, len);
   else
     ipv4_send_tx(v4, IP_PROTO_TCP, pkt, len, tx_flags);
+  namespace_net_pop_context(saved);
 }
 
 /*
@@ -945,7 +951,8 @@ static u32 tcp_set_checksum(u8 family, struct ipv4_addr v4,
 static void tcp_conn_emit(struct tcp_conn *conn, u8 *pkt, usize len) {
   u32 tx = tcp_set_checksum(conn->family, conn->remote_ip, &conn->remote_ip6,
                             pkt, len);
-  tcp_l3_send(conn->family, conn->remote_ip, &conn->remote_ip6, pkt, len, tx);
+  tcp_l3_send(conn->family, conn->remote_ip, &conn->remote_ip6, pkt, len, tx,
+              conn->netns);
 }
 
 /* ── Allocate local port ── */
@@ -960,8 +967,10 @@ static u16 tcp_alloc_port(void) {
 static struct tcp_conn *tcp_find_conn_af(u8 family, struct ipv4_addr v4,
                                          const struct in6_addr_k *v6,
                                          u16 remote_port, u16 local_port) {
+  /* The same four-tuple may exist once per namespace. */
+  u32 ns = namespace_net_context();
   for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
-    if (!tcp_conns[i].used)
+    if (!tcp_conns[i].used || tcp_conns[i].netns != ns)
       continue;
     if (tcp_conns[i].remote_port != remote_port ||
         tcp_conns[i].local_port != local_port ||
@@ -1024,6 +1033,7 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
 
   memset(conn, 0, sizeof(*conn));
   conn->used = 1;
+  conn->netns = namespace_net_current();
   conn->keepidle = TCP_KEEPIDLE_DEFAULT;
   conn->keepintvl = TCP_KEEPINTVL_DEFAULT;
   conn->keepcnt = TCP_KEEPCNT_DEFAULT;
@@ -1350,6 +1360,7 @@ struct tcp_conn *tcp_listen(u16 local_port, int backlog) {
       tcp_conns[i].used = 1;
       tcp_conns[i].state = TCP_LISTEN;
       tcp_conns[i].local_port = local_port;
+      tcp_conns[i].netns = namespace_net_current();
       struct tcp_conn *res = &tcp_conns[i];
       tcp_unlock();
       irq_restore(irq);
@@ -1384,6 +1395,7 @@ int tcp_pending_connections_af(u16 local_port, int family, int v6only) {
             : (tcp_conns[i].family == B1NIX_AF_INET);
     if (tcp_conns[i].used && tcp_conns[i].accept_pending &&
         tcp_conns[i].local_port == local_port && family_ok &&
+        tcp_conns[i].netns == namespace_net_current() &&
         !tcp_conns[i].handed_to_user) {
       tcp_unlock();
       irq_restore(irq);
@@ -1407,6 +1419,7 @@ struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip,
     if (tcp_conns[i].used && tcp_conns[i].accept_pending &&
         tcp_conns[i].local_port == local_port &&
         tcp_conns[i].family == B1NIX_AF_INET &&
+        tcp_conns[i].netns == namespace_net_current() &&
         !tcp_conns[i].handed_to_user) {
       tcp_conns[i].handed_to_user = 1;
       tcp_conns[i].accept_pending = 0;
@@ -1445,6 +1458,7 @@ struct tcp_conn *tcp_accept6(u16 local_port, struct in6_addr_k *client_ip6,
                     (!v6only && tcp_conns[i].family == B1NIX_AF_INET);
     if (tcp_conns[i].used && tcp_conns[i].accept_pending &&
         tcp_conns[i].local_port == local_port && family_ok &&
+        tcp_conns[i].netns == namespace_net_current() &&
         !tcp_conns[i].handed_to_user) {
       tcp_conns[i].handed_to_user = 1;
       tcp_conns[i].accept_pending = 0;
@@ -1915,7 +1929,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           u32 tx = tcp_set_checksum(conn->family, conn->remote_ip,
                                     &conn->remote_ip6, resend_data, resend_len);
           tcp_l3_send(conn->family, conn->remote_ip, &conn->remote_ip6,
-                      resend_data, resend_len, tx);
+                      resend_data, resend_len, tx, conn->netns);
         }
         irq = irq_save();
         tcp_lock();
@@ -1960,7 +1974,8 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
     /* Check for listener */
     for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
       if (tcp_conns[i].used && tcp_conns[i].state == TCP_LISTEN &&
-          tcp_conns[i].local_port == dst_port) {
+          tcp_conns[i].local_port == dst_port &&
+          tcp_conns[i].netns == namespace_net_context()) {
         /* Found a listener, create a new connection for the client */
         struct tcp_conn *new_conn = 0;
         for (int j = 0; j < (int)resource_caps_tcp_max(); j++) {
@@ -1972,6 +1987,7 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         if (new_conn) {
           memset(new_conn, 0, sizeof(*new_conn));
           new_conn->used = 1;
+          new_conn->netns = tcp_conns[i].netns;
           new_conn->keepidle = TCP_KEEPIDLE_DEFAULT;
           new_conn->keepintvl = TCP_KEEPINTVL_DEFAULT;
           new_conn->keepcnt = TCP_KEEPCNT_DEFAULT;
@@ -2129,7 +2145,8 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
       irq_restore(irq);
 
       u32 tx = tcp_set_checksum(family, v4src, &v6src, rst, sizeof(rst));
-      tcp_l3_send(family, v4src, &v6src, rst, sizeof(rst), tx);
+      tcp_l3_send(family, v4src, &v6src, rst, sizeof(rst), tx,
+                  namespace_net_context());
       return;
     }
     tcp_unlock();
@@ -2653,6 +2670,7 @@ void tcp_timer_tick(void) {
         u8 family = conn->family;
         struct ipv4_addr remote_ip = conn->remote_ip;
         struct in6_addr_k remote_ip6 = conn->remote_ip6;
+        u32 conn_ns = conn->netns;
         u8 stack_buf[1500];
         usize pkt_len = rp->len;
         if (pkt_len > sizeof(stack_buf))
@@ -2667,7 +2685,8 @@ void tcp_timer_tick(void) {
         
         u32 tx = tcp_set_checksum(family, remote_ip, &remote_ip6, stack_buf,
                                   pkt_len);
-        tcp_l3_send(family, remote_ip, &remote_ip6, stack_buf, pkt_len, tx);
+        tcp_l3_send(family, remote_ip, &remote_ip6, stack_buf, pkt_len, tx,
+                    conn_ns);
         
         irq = irq_save();
         tcp_lock();

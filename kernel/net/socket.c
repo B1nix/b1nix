@@ -115,16 +115,30 @@ static u16 ntoh16(u16 value) {
  *
  * Assigns an unused ephemeral port, registers the binding and returns it in
  * network byte order. Returns 0 when the table is full. */
+/* Is `port_net` bound in namespace `ns`? A port belongs to its namespace, as
+ * delivery (vfs_socket_push_udp) already assumed: two namespaces may each hold
+ * it for their own socket. */
+static int udp_port_taken(u16 port_net, u32 ns) {
+  for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
+    struct vfs_handle *bh = udp_bindings[i].handle;
+    if (!udp_bindings[i].used || udp_bindings[i].port != port_net)
+      continue;
+    if (bh && bh->used && bh->kind == VFS_HANDLE_SOCKET &&
+        ((struct vfs_socket_state *)bh->private_data)->netns != ns)
+      continue;
+    return 1;
+  }
+  return 0;
+}
+
 static u16 udp_autobind(struct vfs_handle *h) {
   static u16 next_ephemeral = 49152;
   for (int attempt = 0; attempt < 16384; attempt++) {
     u16 port_host = next_ephemeral;
     next_ephemeral = (u16)(port_host >= 65535 ? 49152 : port_host + 1);
     u16 port_net = ntoh16(port_host); /* a 16-bit swap is its own inverse */
-    int taken = 0;
-    for (int i = 0; i < MAX_UDP_BINDINGS; i++)
-      if (udp_bindings[i].used && udp_bindings[i].port == port_net) { taken = 1; break; }
-    if (taken) continue;
+    if (udp_port_taken(port_net, ((struct vfs_socket_state *)h->private_data)->netns))
+      continue;
     for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
       if (!udp_bindings[i].used) {
         udp_bindings[i].used = 1;
@@ -1495,12 +1509,8 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
         return s->local.in6.sin6_port ? 0 : -ENOBUFS;
       }
       u16 port = s->local.in6.sin6_port;
-      if (!s->so_reuseaddr) {
-        for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
-          if (udp_bindings[i].used && udp_bindings[i].port == port)
-            return -EADDRINUSE;
-        }
-      }
+      if (!s->so_reuseaddr && udp_port_taken(port, s->netns))
+        return -EADDRINUSE;
       for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
         if (!udp_bindings[i].used) {
           udp_bindings[i].used = 1;
@@ -1526,13 +1536,8 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
       return s->local.in.sin_port ? 0 : -ENOBUFS;
     }
     u16 port = s->local.in.sin_port;
-    if (!s->so_reuseaddr) {
-      for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
-        if (udp_bindings[i].used && udp_bindings[i].port == port) {
-          return -EADDRINUSE;
-        }
-      }
-    }
+    if (!s->so_reuseaddr && udp_port_taken(port, s->netns))
+      return -EADDRINUSE;
     for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
       if (!udp_bindings[i].used) {
         udp_bindings[i].used = 1;

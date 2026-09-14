@@ -145,7 +145,7 @@ static inline void finish_wait(struct wait_queue_head *wq,
                                struct wait_queue_entry *entry)
 {
 	lkpi_wait_cancel();
-	remove_wait_queue(wq, entry);
+	lkpi_finish_wait_entry(wq, entry);
 }
 
 static inline void init_wait_entry(struct wait_queue_entry *entry, int flags)
