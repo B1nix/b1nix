@@ -824,6 +824,16 @@ static void test_xarray(void)
 	m101_report("xarray", ok, seen);
 }
 
+/* CRC-32C, which every btrfs block read verifies: detail 1 when the CPU's
+ * instruction is doing it, 0 for the table. */
+static void test_crc32c(void)
+{
+	u64 hw = 0;
+	int ok = lkpi_crc32c_selftest(&hw);
+
+	m101_report("crc32c", ok, hw);
+}
+
 /* The maple tree, likewise Linux's own (lib/maple_tree.c). */
 static void test_maple_tree(void)
 {
@@ -1445,6 +1455,7 @@ void lkpi_selftest_m101(void)
 	test_interval_tree();
 	test_xarray();
 	test_maple_tree();
+	test_crc32c();
 	test_kthread_worker();
 	test_rcu_basic();
 	test_pages();

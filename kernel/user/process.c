@@ -1419,6 +1419,11 @@ void user_address_space_cleanup(struct task *t) {
   struct vm_area *vma = t->vma_list;
   t->vma_list = NULL;
   interrupts_enable();
+  /* This task's cached mappings are about to be freed, and an exec reuses the
+   * slot for a different list. */
+  vma_cache_forget(t);
+  vma_cache_invalidate_space(t->pml4_phys);
+  vma_idx_drop_space(t->pml4_phys);
 
 
   while (vma) {
@@ -1445,7 +1450,7 @@ void user_address_space_cleanup(struct task *t) {
     /* Not only this task's cache: a thread of the same address space that has
      * not been torn down yet still caches out of this very list. */
     vma_cache_forget(t);
-    vma_cache_invalidate_all();
+    vma_cache_invalidate_space(t->pml4_phys);
     kfree(vma);
     vma = next;
   }

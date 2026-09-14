@@ -967,6 +967,7 @@ void lkpi_mutex_init(struct lkpi_mutex *m)
 		return;
 	m->locked = 0;
 	m->owner = 0;
+	m->waiters = 0;
 	m->guard = SPINLOCK_INIT;
 }
 
@@ -1035,11 +1036,17 @@ void lkpi_mutex_lock(struct lkpi_mutex *m)
 		u64 flags;
 		spin_lock_irqsave(&m->guard, &flags);
 		int still_held = m->locked;
-		spin_unlock_irqrestore(&m->guard, flags);
 		if (still_held)
+			m->waiters++;
+		spin_unlock_irqrestore(&m->guard, flags);
+		if (still_held) {
 			scheduler_wait_commit();
-		else
+			spin_lock_irqsave(&m->guard, &flags);
+			m->waiters--;
+			spin_unlock_irqrestore(&m->guard, flags);
+		} else {
 			scheduler_wait_cancel();
+		}
 	}
 }
 
@@ -1055,8 +1062,10 @@ void lkpi_mutex_unlock(struct lkpi_mutex *m)
 	}
 	m->locked = 0;
 	m->owner = 0;
+	int waiters = m->waiters != 0;
 	spin_unlock_irqrestore(&m->guard, flags);
-	scheduler_wake_all(m);
+	if (waiters)
+		scheduler_wake_all(m);
 }
 
 

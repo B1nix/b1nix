@@ -59,7 +59,7 @@ static int pf_prof_enabled(void) {
  * about what to fix: a file mapping wants a wider read-ahead, an anonymous
  * page wants a cheaper zero-fill, a copy-on-write fault wants fewer copies.
  * The handler names the case it took and the accounting adds it up. */
-#define PF_CLASS_MAX 7
+#define PF_CLASS_MAX 8
 static u64 g_pf_class_count[PF_CLASS_MAX];
 static u64 g_pf_class_cycles[PF_CLASS_MAX];
 static int g_pf_class_cur[64];
@@ -93,7 +93,7 @@ void pf_prof_dump(void) {
   console_write_dec(__atomic_load_n(&g_pf_cycles, __ATOMIC_RELAXED) / 1000000);
   {
     static const char *const names[PF_CLASS_MAX] = {
-        "other", "anon", "file", "cow", "swap", "stack", "kernel",
+        "other", "anon", "file", "cow", "swap", "stack", "kernel", "file-read",
     };
     for (int i = 0; i < PF_CLASS_MAX; i++) {
       u64 n = __atomic_load_n(&g_pf_class_count[i], __ATOMIC_RELAXED);

@@ -2418,6 +2418,8 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
              * machine has long outgrown. A read-only mapping only: a private
              * writable page must not be filled from a shared cache entry it
              * would then copy. */
+            if (!page)
+              pf_note_class(PF_CLASS_FILE_READ);
             if (!page && !mark_dirty && vma->node->inode->read_cb) {
               /* As much as this stream has earned, not the ceiling: see
                * page_cache_fault_cluster. */

@@ -568,9 +568,43 @@ static int r_gpuinfo(usize pid, struct sbuf *s) {
 static int r_stat(usize pid, struct sbuf *s) {
   (void)pid;
   u64 ticks = scheduler_get_uptime_ticks();
-  sb_puts(s, "cpu  0 0 0 0 0 0 0 0 0 0\n");
+  /* Real CPU times, in USER_HZ (100) as the format requires, from the tick
+   * distribution every CPU keeps: user, nice, system, idle, iowait, irq,
+   * softirq, steal, guest, guest_nice. Zeros here told every monitor --
+   * top, a desktop's load applet, a test timing a stall -- that the machine
+   * had never run anything. */
+  {
+    extern void kprof_tick_cpu(unsigned cpu, u64 *user, u64 *kernel, u64 *idle);
+    usize n = (g_max_cpus > 0) ? (usize)g_max_cpus : 1;
+    u32 hz = sched_tick_hz() ? sched_tick_hz() : 100;
+    u64 tu = 0, tk = 0, ti = 0;
+
+    for (usize c = 0; c < n; c++) {
+      u64 u, k, i;
+
+      kprof_tick_cpu((unsigned)c, &u, &k, &i);
+      tu += u;
+      tk += k;
+      ti += i;
+    }
+    sb_addf(s, "cpu  %lu 0 %lu %lu 0 0 0 0 0 0\n", (unsigned long)(tu * 100 / hz),
+            (unsigned long)(tk * 100 / hz), (unsigned long)(ti * 100 / hz));
+    for (usize c = 0; c < n; c++) {
+      u64 u, k, i;
+
+      kprof_tick_cpu((unsigned)c, &u, &k, &i);
+      sb_addf(s, "cpu%lu %lu 0 %lu %lu 0 0 0 0 0 0\n", (unsigned long)c,
+              (unsigned long)(u * 100 / hz), (unsigned long)(k * 100 / hz),
+              (unsigned long)(i * 100 / hz));
+    }
+  }
   sb_addf(s, "ctxt %lu\n", (unsigned long)ticks);
-  sb_addf(s, "btime 0\n");
+  {
+    u64 now = vfs_get_unix_time();
+    u64 up = ticks / (sched_tick_hz() ? sched_tick_hz() : 100);
+
+    sb_addf(s, "btime %lu\n", (unsigned long)(now > up ? now - up : 0));
+  }
   sb_addf(s, "processes %lu\n", (unsigned long)scheduler_task_count());
   return 0;
 }

@@ -56,6 +56,11 @@ void wake_up(struct wait_queue_head *wq)
 	 * the counter must never see a value that predates its own wakeup. */
 	__atomic_fetch_add(&wq->wakeups, 1ull, __ATOMIC_ACQ_REL);
 	lkpi_wake_all(wq);
+	if (__atomic_load_n(&wq->polled, __ATOMIC_SEQ_CST)) {
+		extern void *vfs_poll_chan;
+
+		lkpi_wake_all(vfs_poll_chan);
+	}
 	__wake_up(wq, 0, 0, 0);
 }
 

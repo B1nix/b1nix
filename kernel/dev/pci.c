@@ -65,8 +65,36 @@ u32 pci_config_read32(u8 bus, u8 slot, u8 func, u8 offset)
 	return p ? *p : 0xFFFFFFFFu;
 }
 #else
+/* Slots the boot enumeration found empty.
+ *
+ * Each driver that looks for its device walks every bus and slot itself, and
+ * each read of an empty slot is two port writes the hypervisor has to trap:
+ * sixteen such walks cost a KVM guest more than a second of its boot in
+ * outl/inl. A slot with nothing at function 0 has nothing at any function, and
+ * nothing appears later -- there is no hot-plug here -- so once pci_init has
+ * looked, a read of an empty slot's identity answers "no device" without
+ * touching the ports. Every other read still goes to the hardware. */
+static u8 g_pci_slot_empty[256 * 32 / 8];
+static int g_pci_slot_map_ready;
+
+static inline int pci_slot_known_empty(u8 bus, u8 slot)
+{
+	u32 bit = (u32)bus * 32u + slot;
+
+	return g_pci_slot_map_ready && (g_pci_slot_empty[bit / 8] >> (bit % 8)) & 1;
+}
+
+static void pci_mark_slot_empty(u8 bus, u8 slot)
+{
+	u32 bit = (u32)bus * 32u + slot;
+
+	g_pci_slot_empty[bit / 8] |= (u8)(1u << (bit % 8));
+}
+
 u32 pci_config_read32(u8 bus, u8 slot, u8 func, u8 offset)
 {
+	if (offset < 4 && pci_slot_known_empty(bus, slot))
+		return 0xFFFFFFFFu;
 	outl(PCI_CONFIG_ADDRESS, pci_get_config_address(bus, slot, func, offset));
 	return inl(PCI_CONFIG_DATA);
 }
@@ -274,8 +302,12 @@ void pci_init(void)
 	k_info("pci", "enumerating devices");
 	for (u16 bus = 0; bus < 256; bus++) {
 		for (u8 slot = 0; slot < 32; slot++) {
-			if (pci_config_read16((u8)bus, slot, 0, 0) == 0xFFFF)
+			if (pci_config_read16((u8)bus, slot, 0, 0) == 0xFFFF) {
+#ifndef __aarch64__
+				pci_mark_slot_empty((u8)bus, slot);
+#endif
 				continue;
+			}
 			u8 htype = pci_config_read8((u8)bus, slot, 0, 0x0E);
 			u8 nfuncs = (htype & 0x80) ? 8 : 1;
 			for (u8 func = 0; func < nfuncs; func++) {
@@ -308,6 +340,9 @@ void pci_init(void)
 			}
 		}
 	}
+#ifndef __aarch64__
+	g_pci_slot_map_ready = 1;
+#endif
 }
 
 /* See the declaration in <b1nix/pci.h>. */

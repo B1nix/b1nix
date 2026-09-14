@@ -49,6 +49,7 @@ void lkpi_rwsem_init(struct lkpi_rwsem *s)
 	s->readers = 0;
 	s->writer = 0;
 	s->writers_waiting = 0;
+	s->readers_waiting = 0;
 	s->owner = 0;
 	s->guard = SPINLOCK_INIT;
 }
@@ -89,11 +90,17 @@ void lkpi_rwsem_down_read(struct lkpi_rwsem *s)
 		u64 flags;
 		spin_lock_irqsave(&s->guard, &flags);
 		int blocked = s->writer || s->writers_waiting != 0;
-		spin_unlock_irqrestore(&s->guard, flags);
 		if (blocked)
+			s->readers_waiting++;
+		spin_unlock_irqrestore(&s->guard, flags);
+		if (blocked) {
 			scheduler_wait_commit();
-		else
+			spin_lock_irqsave(&s->guard, &flags);
+			s->readers_waiting--;
+			spin_unlock_irqrestore(&s->guard, flags);
+		} else {
 			scheduler_wait_cancel();
+		}
 	}
 }
 
@@ -106,10 +113,10 @@ void lkpi_rwsem_up_read(struct lkpi_rwsem *s)
 	spin_lock_irqsave(&s->guard, &flags);
 	if (s->readers > 0)
 		s->readers--;
-	last = (s->readers == 0);
+	/* Only the reader that emptied the semaphore can have unblocked a writer,
+	 * and only a writer that is waiting needs telling. */
+	last = (s->readers == 0) && s->writers_waiting != 0;
 	spin_unlock_irqrestore(&s->guard, flags);
-	/* Only the reader that emptied the semaphore can have unblocked a writer;
-	 * waking on every up_read would be a thundering herd on a hot inode. */
 	if (last)
 		scheduler_wake_all(s);
 }
@@ -176,11 +183,15 @@ void lkpi_rwsem_up_write(struct lkpi_rwsem *s)
 	if (!s)
 		return;
 	u64 flags;
+	int waiters;
+
 	spin_lock_irqsave(&s->guard, &flags);
 	s->writer = 0;
 	s->owner = 0;
+	waiters = s->writers_waiting != 0 || s->readers_waiting != 0;
 	spin_unlock_irqrestore(&s->guard, flags);
-	scheduler_wake_all(s);
+	if (waiters)
+		scheduler_wake_all(s);
 }
 
 void lkpi_rwsem_downgrade_write(struct lkpi_rwsem *s)

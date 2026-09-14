@@ -73,6 +73,11 @@ typedef struct wait_queue_entry wait_queue_entry_t;
 struct wait_queue_head {
 	volatile u64 wakeups; /* wake_up calls; diagnostics and self-test */
 	volatile u32 waiters; /* tasks currently parked or about to park */
+	/* Set by poll_wait: a poll() or epoll sleeper tests readiness on this
+	 * queue, so wake_up must reach b1nix's poll channel too. Queues nobody
+	 * polls -- page locks, workqueues, a filesystem's I/O completions -- leave
+	 * it clear and wake only their own waiters. */
+	volatile u32 polled;
 	/* Guards `head`. Named `lock` because imported code takes it directly —
 	 * i915's fence code holds it across a walk of the entry list. Spelled as
 	 * the underlying struct rather than `spinlock_t`, which is the name

@@ -418,4 +418,6 @@ void eviction_unlock_all(struct task *task);
 #define PF_CLASS_SWAP 4
 #define PF_CLASS_STACK 5
 #define PF_CLASS_KERNEL 6
+/* A file page that was not cached and had to be read in. */
+#define PF_CLASS_FILE_READ 7
 void pf_prof_class(int cpu, int cls);

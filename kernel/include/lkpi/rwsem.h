@@ -32,6 +32,10 @@ struct lkpi_rwsem {
 	 * acquire is reportable rather than a silent self-deadlock. */
 	volatile usize owner;
 	volatile int guard; /* a b1nix spinlock; see the note in <lkpi/lock.h> */
+	/* Readers parked behind a writer. With writers_waiting, what a release
+	 * checks before waking the semaphore's channel -- a scan of every task,
+	 * done for nobody on most releases. */
+	volatile u32 readers_waiting;
 };
 
 void lkpi_rwsem_init(struct lkpi_rwsem *s);

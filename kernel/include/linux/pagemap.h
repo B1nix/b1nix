@@ -437,8 +437,8 @@ int filemap_invalidate_inode(struct inode *inode, bool flush, loff_t start,
 /*
  * Grow a readahead window to cover more of the file. The caller must cope
  * with getting less than it asked for — upstream stops at the first folio it
- * cannot add — and here readahead does not populate a window at all (see
- * page_cache_ra_unbounded), so it never grows.
+ * cannot add — and here the window is never grown: btrfs asks for it to cover
+ * a whole compressed extent, and the pages it leaves out are read on demand.
  */
 static inline void readahead_expand(struct readahead_control *ractl,
                                     loff_t new_start, size_t new_len)

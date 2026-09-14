@@ -480,18 +480,15 @@ void lkpi_schedule(void)
 
 void lkpi_wake_all(void *chan)
 {
-	scheduler_wake_all(chan);
 	/*
-	 * And the pollers.
-	 *
-	 * Imported code wakes its own wait queue; b1nix's poll() sleeps on one
-	 * shared channel and re-tests readiness when woken, so a queue it has never
-	 * heard of leaves it asleep with the event already waiting. That is what
-	 * kept a compositor blocked in poll() on the card: the page-flip completion
-	 * was queued, readable, and nobody told the sleeper. Waking the poll channel
-	 * costs a re-test that finds nothing when the wake was for something else.
+	 * Only the channel's own waiters. A poll() or epoll sleeper parks on
+	 * b1nix's shared poll channel, and wake_up() reaches it for the queues
+	 * poll_wait has marked (the DRM event queue that once left a compositor
+	 * asleep on a queued page flip is one). Waking that channel here, for
+	 * every page lock, workqueue and I/O completion, woke every poller in the
+	 * machine 67 000 times during one desktop start-up.
 	 */
-	scheduler_wake_all(vfs_poll_chan);
+	scheduler_wake_all(chan);
 }
 
 /*

@@ -22,7 +22,7 @@ struct rw_semaphore {
 	struct lkpi_rwsem sem;
 };
 
-#define __RWSEM_INITIALIZER(name) { { 0, 0, 0, 0, 0 } }
+#define __RWSEM_INITIALIZER(name) { { 0, 0, 0, 0, 0, 0 } }
 #define DECLARE_RWSEM(name) \
 	struct rw_semaphore name = __RWSEM_INITIALIZER(name)
 

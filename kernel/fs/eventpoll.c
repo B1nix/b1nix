@@ -1,3 +1,4 @@
+#include <b1nix/kprintf.h>
 #include <b1nix/ktime.h>
 #include <b1nix/lapic.h>
 /* M56 — Event-loop and IPC primitives: eventfd, timerfd, signalfd and epoll,
@@ -323,6 +324,7 @@ int vfs_pidfd_open(usize pid, int flags) {
 static volatile int g_armed_timerfds = 0;
 
 struct timerfd_state {
+  struct timerfd_state *all_next, *all_prev; /* g_timerfds, under g_timerfd_list_lock */
   volatile int lock;
   int armed;
   int clockid;       /* which clock an ABSTIME deadline is measured against */
@@ -330,6 +332,45 @@ struct timerfd_state {
   u64 interval_ticks; /* 0 = one-shot */
   u64 expirations;   /* accumulated, cleared on read */
 };
+
+/* Wake pollers when a timerfd deadline arrives, not on every tick.
+ *
+ * The tick hook woke every poll and epoll sleeper in the machine on each of
+ * the thousand ticks a second any timerfd was armed -- and a desktop always has
+ * one. KDE's start-up spent 750 000 poll waits and 324 000 epoll waits on it,
+ * each a context switch and a rescan that found nothing.
+ *
+ * g_timerfd_due is the earliest deadline still in the future among the armed
+ * timerfds. Anything that moves a deadline lowers it; the tick that reaches it
+ * wakes the pollers once and recomputes it from every timerfd. A deadline
+ * already past is not in the minimum: that timer is readable, a poll scan sees
+ * so without being woken again, and consuming it moves its deadline forward
+ * through timerfd_note_deadline. */
+static struct timerfd_state *g_timerfds;
+static volatile int g_timerfd_list_lock;
+static volatile u64 g_timerfd_due = ~0ull;
+
+static u64 timerfd_list_acquire(void) {
+  u64 flags = interrupts_save();
+  interrupts_disable();
+  while (__atomic_test_and_set(&g_timerfd_list_lock, __ATOMIC_ACQUIRE))
+    ;
+  return flags;
+}
+
+static void timerfd_list_release(u64 flags) {
+  __atomic_clear(&g_timerfd_list_lock, __ATOMIC_RELEASE);
+  interrupts_restore(flags);
+}
+
+static void timerfd_note_deadline(u64 tick) {
+  u64 cur = __atomic_load_n(&g_timerfd_due, __ATOMIC_ACQUIRE);
+
+  while (tick && tick < cur &&
+         !__atomic_compare_exchange_n(&g_timerfd_due, &cur, tick, 0,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    ;
+}
 
 /* Compute and fold in any expirations that have elapsed since the last update.
  * Caller holds t->lock. */
@@ -350,6 +391,7 @@ static void timerfd_advance(struct timerfd_state *t) {
     u64 ticks = 1 + elapsed / t->interval_ticks;
     t->expirations += ticks;
     t->next_tick += ticks * t->interval_ticks;
+    timerfd_note_deadline(t->next_tick);
   }
 }
 
@@ -405,6 +447,17 @@ static void timerfd_release(struct vfs_handle *h) {
     return;
   if (t->armed)
     __atomic_sub_fetch(&g_armed_timerfds, 1, __ATOMIC_RELAXED);
+  {
+    u64 flags = timerfd_list_acquire();
+
+    if (t->all_prev)
+      t->all_prev->all_next = t->all_next;
+    else
+      g_timerfds = t->all_next;
+    if (t->all_next)
+      t->all_next->all_prev = t->all_prev;
+    timerfd_list_release(flags);
+  }
   kfree(t);
   h->private_data = 0;
 }
@@ -436,6 +489,17 @@ int vfs_timerfd_create(int clockid, int flags) {
   if (!h) {
     kfree(t);
     return -ENFILE;
+  }
+  /* On the list only once the handle owns it: from here every failure path
+   * releases through timerfd_release, which takes it off again. */
+  {
+    u64 lflags = timerfd_list_acquire();
+
+    t->all_next = g_timerfds;
+    if (g_timerfds)
+      g_timerfds->all_prev = t;
+    g_timerfds = t;
+    timerfd_list_release(lflags);
   }
   h->private_data = t;
   h->ops = &timerfd_ops;
@@ -577,16 +641,35 @@ int vfs_timerfd_settime(int fd, int flags,
     t->expirations = 0;
     if (!was_armed)
       __atomic_add_fetch(&g_armed_timerfds, 1, __ATOMIC_RELAXED);
+    timerfd_note_deadline(t->next_tick);
   }
   __atomic_clear(&t->lock, __ATOMIC_RELEASE);
   return 0;
 }
 
-/* Called from the timer ISR (scheduler_on_timer_tick). Wakes blocked pollers
- * when timerfds are armed so they re-scan and notice fired timers. */
+/* Called from the timer ISR (scheduler_on_timer_tick): wake the pollers when
+ * the earliest timerfd deadline has arrived, then find the next one. */
 void eventpoll_timer_tick(void) {
-  if (__atomic_load_n(&g_armed_timerfds, __ATOMIC_RELAXED) > 0)
-    scheduler_wake_all(vfs_poll_chan);
+  if (__atomic_load_n(&g_armed_timerfds, __ATOMIC_RELAXED) == 0)
+    return;
+  u64 now = scheduler_get_uptime_ticks();
+  if (now < __atomic_load_n(&g_timerfd_due, __ATOMIC_ACQUIRE))
+    return;
+  /* Recompute before waking: a deadline set meanwhile lowers the fresh value
+   * rather than being overwritten by it. */
+  u64 flags = timerfd_list_acquire();
+  u64 next = ~0ull;
+
+  __atomic_store_n(&g_timerfd_due, ~0ull, __ATOMIC_RELEASE);
+  for (struct timerfd_state *t = g_timerfds; t; t = t->all_next) {
+    u64 d = t->next_tick;
+
+    if (t->armed && d > now && d < next)
+      next = d;
+  }
+  timerfd_list_release(flags);
+  timerfd_note_deadline(next);
+  scheduler_wake_all(vfs_poll_chan);
 }
 
 /* ---- signalfd ---------------------------------------------------------- */
@@ -1147,6 +1230,15 @@ int vfs_epoll_wait(int epfd, struct b1nix_epoll_event *events, int maxevents,
     if (nready > 0 || timeout == 0 || timed_out) {
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
+      if (timed_out && timeout >= 100 && bootinfo_has_flag("b1nix.trace-timeouts")) {
+        static unsigned told;
+        if (told < 64) {
+          told++;
+          kprintf(LOGLEVEL_WARNING, NULL, "epoll-timeout: %s pid %lu after %d ms, %d watches",
+                  current_task->name ? current_task->name : "?",
+                  (unsigned long)current_task->id, timeout, ep->capacity);
+        }
+      }
       return nready;
     }
 

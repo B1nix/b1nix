@@ -1019,15 +1019,20 @@ static void vfs_inode_lock_read(struct vfs_inode *inode) {
      * vfs_inode_unlock_write -> scheduler_wake_all(&rw_lock) on another CPU,
      * landing between the failed CAS and the block, is lost and this reader
      * sleeps on the inode forever (a silent -smp wedge on the file read path). */
+    /* Announce the wait before the re-check: an unlock that lands after the
+     * re-check sees the count, and one before it is seen by the re-check. */
+    __atomic_add_fetch(&inode->rw_waiters, 1, __ATOMIC_SEQ_CST);
     scheduler_wait_prepare((void *)&inode->rw_lock);
-    val = inode->rw_lock;
+    val = __atomic_load_n(&inode->rw_lock, __ATOMIC_SEQ_CST);
     if (val >= 0 &&
         __atomic_compare_exchange_n(&inode->rw_lock, &val, val + 1, 0,
-                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
       scheduler_wait_cancel();
+      __atomic_sub_fetch(&inode->rw_waiters, 1, __ATOMIC_SEQ_CST);
       break;
     }
     scheduler_wait_commit();
+    __atomic_sub_fetch(&inode->rw_waiters, 1, __ATOMIC_SEQ_CST);
   }
   /* INODE rwlock is a sleeping lock — scheduler_block_on can wake the
    * caller on a different CPU than it slept on, so the release-CPU and
@@ -1039,9 +1044,10 @@ static void vfs_inode_lock_read(struct vfs_inode *inode) {
 
 static void vfs_inode_unlock_read(struct vfs_inode *inode) {
   LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_INODE);
-  if (__atomic_add_fetch(&inode->rw_lock, -1, __ATOMIC_RELEASE) == 0) {
+  if (__atomic_add_fetch(&inode->rw_lock, -1, __ATOMIC_SEQ_CST) == 0) {
     vfs_inode_lock_clear_note(inode);
-    scheduler_wake_all((void *)&inode->rw_lock);
+    if (__atomic_load_n(&inode->rw_waiters, __ATOMIC_SEQ_CST))
+      scheduler_wake_all((void *)&inode->rw_lock);
   }
 }
 
@@ -1215,15 +1221,18 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
     if (!wait_start)
       wait_start = vfs_lock_tsc();
     /* SMP-safe block — see vfs_inode_lock_read for the lost-wakeup rationale. */
+    __atomic_add_fetch(&inode->rw_waiters, 1, __ATOMIC_SEQ_CST);
     scheduler_wait_prepare((void *)&inode->rw_lock);
     val = 0;
     if (__atomic_compare_exchange_n(&inode->rw_lock, &val, -1, 0,
-                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
       scheduler_wait_cancel();
+      __atomic_sub_fetch(&inode->rw_waiters, 1, __ATOMIC_SEQ_CST);
       vfs_inode_wait_note(vfs_lock_tsc() - wait_start, inode->rw_site);
       break;
     }
     scheduler_wait_commit();
+    __atomic_sub_fetch(&inode->rw_waiters, 1, __ATOMIC_SEQ_CST);
   }
   vfs_inode_lock_note(inode, __builtin_return_address(0));
   /* Sleeping lock — see read-lock variant for why this uses _GLOBAL. */
@@ -1234,8 +1243,9 @@ static void vfs_inode_unlock_write(struct vfs_inode *inode) {
   vfs_wlock_untrack(inode);
   LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_INODE);
   vfs_inode_lock_clear_note(inode);
-  __atomic_store_n(&inode->rw_lock, 0, __ATOMIC_RELEASE);
-  scheduler_wake_all((void *)&inode->rw_lock);
+  __atomic_store_n(&inode->rw_lock, 0, __ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&inode->rw_waiters, __ATOMIC_SEQ_CST))
+    scheduler_wake_all((void *)&inode->rw_lock);
 }
 
 /* The watchdog resolves a blocked task's wait channel to a heap block. When

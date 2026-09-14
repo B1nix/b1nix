@@ -903,7 +903,13 @@ int task_running_somewhere(struct task *t);
 struct task *sched_prev_task_this_cpu(void);
 
 
-void vma_cache_invalidate_all(void);
+/* Invalidate every task's VMA lookup cache for one address space. */
+void vma_cache_invalidate_space(u64 pml4_phys);
+/* Forget the mapping index of an address space whose mappings are about to be
+ * freed. */
+void vma_idx_drop_space(u64 pml4_phys);
+/* A mapping ending at or below addr to start a walk from, or NULL (the head). */
+struct vm_area *vma_walk_start(struct task *t, u64 addr);
 /* Free a mapping once no page-fault walker can still be holding it. */
 void vma_retire(struct vm_area *vma);
 void vma_retire_poll(void);

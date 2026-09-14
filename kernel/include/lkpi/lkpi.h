@@ -83,5 +83,6 @@ void drm_kms_selftest(void);
  * walk visited. */
 int lkpi_xarray_selftest(u64 *seen);
 int lkpi_maple_selftest(u64 *seen);
+int lkpi_crc32c_selftest(u64 *hw);
 
 #endif

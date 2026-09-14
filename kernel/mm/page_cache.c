@@ -291,6 +291,24 @@ static void page_cache_process_deferred_free(void) {
  * root both mounted, two unrelated files sharing an ino number served each
  * other's pages (observed: read() of libpam.so.2 returning another mapping's
  * live pointers instead of its .plt bytes). */
+/* How many cached entries each (fs_id, ino) has, folded into a small table.
+ *
+ * A new file on an imported filesystem asks the cache to drop pages a deleted
+ * file with the same inode number may have left (page_cache_invalidate_stale),
+ * and answering that walked every cached page in the machine -- on each file
+ * creation, which a desktop start-up does hundreds of times. A zero here says
+ * no entry with that key exists, so the walk is skipped; a collision only
+ * costs the walk that used to happen anyway. Kept exactly: entries enter and
+ * leave the hash in three places, all counted, all under pc_lock. */
+#define PC_KEY_COUNT_SLOTS 4096u
+static u32 pc_key_count[PC_KEY_COUNT_SLOTS];
+
+static u32 pc_key_slot(u32 fs_id, u64 ino) {
+  u64 v = (ino ^ ((u64)fs_id << 32)) * 0x9e3779b97f4a7c15ULL;
+
+  return (u32)(v >> 52) & (PC_KEY_COUNT_SLOTS - 1);
+}
+
 static u32 pc_hash(struct vfs_inode *inode, u64 offset) {
   u64 val = (inode ? inode->ino : 0) ^ ((u64)(inode ? inode->fs_id : 0) << 32) ^
             (offset >> 12);
@@ -1063,6 +1081,7 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   pmm_ref_frame(new_entry->frame);
   new_entry->hash_next = hash_table[h];
   hash_table[h] = new_entry;
+  pc_key_count[pc_key_slot(new_entry->key_fsid, new_entry->key_ino)]++;
   if (inode)
     __atomic_add_fetch(&inode->cached_pages, 1, __ATOMIC_RELEASE);
   unlock_bucket(h, bflags_h);
@@ -1307,6 +1326,7 @@ static void pc_invalidate(struct vfs_inode *inode, u32 fs_id, u64 ino,
         while (hcurr) {
           if (hcurr == curr) {
             *prev = hcurr->hash_next;
+            pc_key_count[pc_key_slot(curr->key_fsid, curr->key_ino)]--;
             break;
           }
           prev = &hcurr->hash_next;
@@ -1365,6 +1385,9 @@ void page_cache_invalidate_stale(struct vfs_inode *inode) {
     return;
   if (__atomic_load_n(&g_pc_resident_pages, __ATOMIC_ACQUIRE) == 0)
     return;
+  if (__atomic_load_n(&pc_key_count[pc_key_slot(inode->fs_id, inode->ino)],
+                      __ATOMIC_ACQUIRE) == 0)
+    return;
   pc_invalidate(0, inode->fs_id, inode->ino, inode);
 }
 
@@ -1403,6 +1426,7 @@ static int pc_unlink_unreferenced(struct page_cache_entry *victim) {
   while (hcurr) {
     if (hcurr == victim) {
       *prev = hcurr->hash_next;
+      pc_key_count[pc_key_slot(victim->key_fsid, victim->key_ino)]--;
       break;
     }
     prev = &hcurr->hash_next;

@@ -120,6 +120,10 @@ enum lkpi_pageflags {
 	PG_swapbacked,
 	PG_unevictable,
 	PG_dropbehind,
+	/* Someone is parked waiting for Locked or Writeback to clear. Set by the
+	 * waiter before it re-tests; taken by the clearer, which wakes only when
+	 * it was set -- the wake is a scan of every task. */
+	PG_waiters,
 	PG_checked = PG_owner_priv_1,
 	PG_owner_2 = PG_private_2,
 	PG_readahead = PG_reclaim,

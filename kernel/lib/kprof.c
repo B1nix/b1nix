@@ -66,6 +66,29 @@ static int kprof_enabled(void) {
  * migrate, so the same CPU reads both ends. A task switch inside a section
  * ends it on the switched-to side; the time is still real interrupts-off
  * time on that CPU and is charged to the site that began it. */
+/* b1nix.sysprof-task=<name>: only the kernel time of tasks whose name contains
+ * it, so one program's share is not lost in everybody's. 1 when unset. */
+static int kprof_task_match(void) {
+  static char want[32];
+  static int have = -1;
+
+  if (have < 0)
+    have = bootinfo_get_kv("b1nix.sysprof-task", want, sizeof(want)) ? 1 : 0;
+  if (!have)
+    return 1;
+  const char *nm = current_task && current_task->name ? current_task->name : "";
+
+  for (usize i = 0; nm[i]; i++) {
+    usize k = 0;
+
+    while (want[k] && nm[i + k] == want[k])
+      k++;
+    if (!want[k])
+      return 1;
+  }
+  return 0;
+}
+
 int kprof_irqoff_on;
 #define IRQOFF_SLOTS 1024u
 struct irqoff_slot {
@@ -101,6 +124,8 @@ void kprof_irqoff_end(void) {
   u64 site = (u64)(usize)p->irqoff_site;
   u64 d = irqoff_now() - p->irqoff_t0;
   p->irqoff_site = 0;
+  if (!kprof_task_match())
+    return;
   __atomic_fetch_add(&g_irqoff_cycles, d, __ATOMIC_RELAXED);
   __atomic_fetch_add(&g_irqoff_sections, 1, __ATOMIC_RELAXED);
   u32 h = (u32)((site * 0x9e3779b97f4a7c15ULL) >> 54) & (IRQOFF_SLOTS - 1);
@@ -122,6 +147,96 @@ void kprof_irqoff_end(void) {
     }
   }
   __atomic_fetch_add(&g_irqoff_dropped, 1, __ATOMIC_RELAXED);
+}
+
+/* ── Waits, by the function that armed them ───────────────────────────────
+ * Every scheduler_wait_prepare under b1nix.sysprof, counted against its
+ * caller. The interrupts-off table charges a wait's context switch to
+ * scheduler_wait_prepare itself, which says that the machine waits a great
+ * deal and not who does. */
+#define WAITSITE_SLOTS 512u
+struct site_table {
+  struct { u64 site; u64 count; } slot[WAITSITE_SLOTS];
+  u64 dropped;
+};
+static struct site_table g_waitsite, g_pollwake, g_bcachesite, g_wakesite;
+
+static void site_count(struct site_table *tb, void *site) {
+  if (!kprof_enabled() || !site)
+    return;
+  u64 key = (u64)(usize)site;
+  u32 h = (u32)((key * 0x9e3779b97f4a7c15ULL) >> 55) & (WAITSITE_SLOTS - 1);
+  for (u32 probe = 0; probe < 16; probe++) {
+    u32 i = (h + probe) & (WAITSITE_SLOTS - 1);
+    u64 cur = __atomic_load_n(&tb->slot[i].site, __ATOMIC_RELAXED);
+    if (cur == 0) {
+      u64 expect = 0;
+      if (!__atomic_compare_exchange_n(&tb->slot[i].site, &expect, key, 0,
+                                       __ATOMIC_RELAXED, __ATOMIC_RELAXED) &&
+          expect != key)
+        continue;
+      cur = key;
+    }
+    if (cur == key) {
+      __atomic_fetch_add(&tb->slot[i].count, 1, __ATOMIC_RELAXED);
+      return;
+    }
+  }
+  __atomic_fetch_add(&tb->dropped, 1, __ATOMIC_RELAXED);
+}
+
+void kprof_wait_site(void *site) { site_count(&g_waitsite, site); }
+
+/* Wakes of the shared poll channel, by the function that issued them: which
+ * readiness event keeps every poll and epoll sleeper in the machine busy. */
+void kprof_pollwake_site(void *site) { site_count(&g_pollwake, site); }
+
+/* Block-cache lock acquisitions, by caller: which filesystem path takes the
+ * cache's one lock hundreds of thousands of times. */
+void kprof_bcache_site(void *site) { site_count(&g_bcachesite, site); }
+
+/* Every scheduler_wake_all, by caller (the task filter applies). */
+void kprof_wake_site(void *site) {
+  if (kprof_task_match())
+    site_count(&g_wakesite, site);
+}
+
+static void site_dump(struct site_table *tb, const char *title, const char *tag) {
+  u64 floor = ~0ull;
+
+  if (!kprof_enabled())
+    return;
+  console_write(title);
+  console_write(" (dropped=");
+  console_write_dec(tb->dropped);
+  console_write(")\n");
+  for (int n = 0; n < 16; n++) {
+    u64 best = 0;
+    usize bi = WAITSITE_SLOTS;
+    for (usize i = 0; i < WAITSITE_SLOTS; i++) {
+      u64 c = tb->slot[i].count;
+      if (tb->slot[i].site && c < floor && c > best) {
+        best = c;
+        bi = i;
+      }
+    }
+    if (bi == WAITSITE_SLOTS)
+      break;
+    floor = best;
+    console_write(tag);
+    console_write_dec(best);
+    console_write(" 0x");
+    console_write_hex64(tb->slot[bi].site);
+    ksym_print(tb->slot[bi].site);
+    console_write("\n");
+  }
+}
+
+static void kprof_dump_waitsites(void) {
+  site_dump(&g_waitsite, "kprof: waits by caller", "  kprof-wait ");
+  site_dump(&g_pollwake, "kprof: poll-channel wakes by caller", "  kprof-pollwake ");
+  site_dump(&g_bcachesite, "kprof: block-cache lock by caller", "  kprof-bcache ");
+  site_dump(&g_wakesite, "kprof: wake_all by caller", "  kprof-wake ");
 }
 
 static void kprof_dump_irqoff(void) {
@@ -216,6 +331,18 @@ void kprof_tick_totals(u64 *user, u64 *kernel, u64 *idle) {
     *idle = i;
 }
 
+/* One CPU's share of the same distribution, in ticks: /proc/stat's per-CPU
+ * rows. */
+void kprof_tick_cpu(unsigned cpu, u64 *user, u64 *kernel, u64 *idle) {
+  if (cpu >= KPROF_MAX_CPUS) {
+    *user = *kernel = *idle = 0;
+    return;
+  }
+  *user = __atomic_load_n(&g_tick_mode[cpu][0], __ATOMIC_RELAXED);
+  *kernel = __atomic_load_n(&g_tick_mode[cpu][1], __ATOMIC_RELAXED);
+  *idle = __atomic_load_n(&g_tick_mode[cpu][2], __ATOMIC_RELAXED);
+}
+
 void kprof_tick(u64 rip, int in_user, int in_idle, int cpu) {
   int mode = in_user ? 0 : (in_idle ? 2 : 1);
   u64 weight = kprof_weight(cpu);
@@ -227,9 +354,22 @@ void kprof_tick(u64 rip, int in_user, int in_idle, int cpu) {
   if (waitprof_enabled() && cpu == 0)
     sched_waitprof_tick(mode == 2);
 
-  if (mode != 1 || !kprof_enabled())
+  if (!kprof_enabled())
     return;
+  if (mode != 1) {
+    /* The boot task is the boot CPU's idle task, so kernel_main's own work is
+     * counted as idle; b1nix.sysprof-idle puts those samples in the histogram
+     * too, where the halt loop shows up as itself. */
+    static int with_idle = -1;
 
+    if (with_idle < 0)
+      with_idle = bootinfo_has_flag("b1nix.sysprof-idle") ? 1 : 0;
+    if (mode != 2 || !with_idle)
+      return;
+  }
+
+  if (!kprof_task_match())
+    return;
   __atomic_fetch_add(&g_kprof_samples, weight, __ATOMIC_RELAXED);
 
   u64 key = rip & ~(u64)(KPROF_GRAIN - 1);
@@ -410,4 +550,10 @@ void kprof_dump(void) {
   kprof_dump_histogram();
   kprof_dump_raw();
   kprof_dump_irqoff();
+  kprof_dump_waitsites();
+  {
+    extern void sched_wakelat_dump(void);
+
+    sched_wakelat_dump();
+  }
 }

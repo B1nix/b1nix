@@ -192,6 +192,14 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 		if (chunk > want)
 			chunk = want;
 
+		/* A miss reads the rest of the request ahead in one batch instead of
+		 * a page at a time -- see page_cache_ra_unbounded. */
+		if (!xa_load(&mapping->i_pages, index))
+			page_cache_sync_readahead(mapping, &file->f_ra, file, index,
+			                          (unsigned long)((offset + want +
+			                                           PAGE_SIZE - 1) >>
+			                                          PAGE_SHIFT));
+
 		folio = read_mapping_folio(mapping, index, file);
 		if (IS_ERR(folio)) {
 			if (copied)

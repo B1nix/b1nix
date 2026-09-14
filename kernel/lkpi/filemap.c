@@ -54,6 +54,25 @@ struct folio_batch {
 
 /* ── the page lock ──────────────────────────────────────────────── */
 
+static inline void page_note_waiter(struct page *page)
+{
+	__atomic_fetch_or((volatile unsigned long *)&page->flags,
+	                  1ul << PG_waiters, __ATOMIC_SEQ_CST);
+}
+
+/* After clearing the bit a waiter waits on: wake only if one said it waits.
+ * The waiter sets the bit after it is on the channel and before it re-tests:
+ * an unlock that consumed an earlier setting cannot then leave a later waiter
+ * parked with the bit clear. */
+static inline void page_wake_waiters(struct page *page)
+{
+	unsigned long old = __atomic_fetch_and((volatile unsigned long *)&page->flags,
+	                                       ~(1ul << PG_waiters), __ATOMIC_SEQ_CST);
+
+	if (old & (1ul << PG_waiters))
+		scheduler_wake_all(page);
+}
+
 void lock_page(struct page *page)
 {
 	if (!page)
@@ -73,6 +92,7 @@ void lock_page(struct page *page)
 		 * bit is still set — an unlock between the two is then already
 		 * visible to the re-test rather than lost. */
 		scheduler_wait_prepare(page);
+		page_note_waiter(page);
 		if (lkpi_page_test(page, PG_locked))
 			scheduler_wait_commit();
 		else
@@ -90,7 +110,7 @@ void unlock_page(struct page *page)
 	if (!page)
 		return;
 	lkpi_page_clear(page, PG_locked);
-	scheduler_wake_all(page);
+	page_wake_waiters(page);
 }
 
 void wait_on_page_locked(struct page *page)
@@ -104,6 +124,7 @@ void wait_on_page_locked(struct page *page)
 			continue;
 		}
 		scheduler_wait_prepare(page);
+		page_note_waiter(page);
 		if (lkpi_page_test(page, PG_locked))
 			scheduler_wait_commit();
 		else
@@ -151,7 +172,7 @@ void end_page_writeback(struct page *page)
 	if (!page)
 		return;
 	lkpi_page_clear(page, PG_writeback);
-	scheduler_wake_all(page);
+	page_wake_waiters(page);
 }
 
 void wait_on_page_writeback(struct page *page)
@@ -165,6 +186,7 @@ void wait_on_page_writeback(struct page *page)
 			continue;
 		}
 		scheduler_wait_prepare(page);
+		page_note_waiter(page);
 		if (lkpi_page_test(page, PG_writeback))
 			scheduler_wait_commit();
 		else

@@ -218,6 +218,10 @@ struct vfs_inode {
   enum vfs_node_type type;
   u32 flags;
   volatile int rw_lock; /* >0: readers, -1: writer, 0: free */
+  /* Tasks inside the slow path of taking rw_lock. An unlock wakes the lock's
+   * channel only when this is non-zero: most releases have nobody waiting,
+   * and the wake is a scan of every task. */
+  volatile u32 rw_waiters;
   /* Who last took rw_lock, and from where. A leaked inode lock is otherwise
    * anonymous: the watchdog can see a task parked on &inode->rw_lock but not
    * which caller took the lock and failed to drop it, and the holder is by

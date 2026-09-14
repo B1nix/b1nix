@@ -63,9 +63,9 @@ start_udev() {
 	mkdir -p /run/udev
 	pgrep -f "[u]devd" > /dev/null 2>&1 || 		setsid "$__udevd" --daemon > /tmp/kde-udevd.log 2>&1
 	__i=0
-	while [ $__i -lt 50 ]; do
+	while [ $__i -lt 500 ]; do
 		[ -e /run/udev/control ] && break
-		__i=$((__i + 1)); usleep 200000
+		__i=$((__i + 1)); usleep 20000
 	done
 	# The coldplug replay, bounded: `udevadm settle` waits on a queue that a
 	# udevd which never started would never drain.
@@ -87,8 +87,8 @@ start_udev() {
 	# later ones from the daemon's broadcasts, so an input device tagged after
 	# elogind came up is one the session never gets.
 	__i=0
-	while [ $__i -lt 50 ] && ! udevadm info -q property -n /dev/input/event1 2>/dev/null | grep -q '^ID_INPUT='; do
-		__i=$((__i + 1)); usleep 200000
+	while [ $__i -lt 500 ] && ! udevadm info -q property -n /dev/input/event1 2>/dev/null | grep -q '^ID_INPUT='; do
+		__i=$((__i + 1)); usleep 20000
 	done
 	udevadm control --log-priority=err 2>/dev/null
 	for d in /dev/input/event*; do
@@ -439,9 +439,16 @@ CLIENT=""
 # program -- and timeout exits on its own while its child keeps running (a
 # kernel defect of ours, tracked separately). Testing the recorded pid reports
 # healthy programs as dead. Ask by name, and fall back to the pid.
+# With a pid, ask about that process: the wait loops call this every 20 ms,
+# and pgrep reads every /proc entry each time -- thousands of reads competing
+# with the very start-up being waited for. The pid is the `timeout` wrapper,
+# which lives exactly as long as the program under it.
 prog_alive() {
-	pgrep -x "$1" > /dev/null 2>&1 && return 0
-	[ -n "${2:-}" ] && kill -0 "$2" 2>/dev/null
+	if [ -n "${2:-}" ]; then
+		kill -0 "$2" 2>/dev/null
+		return
+	fi
+	pgrep -x "$1" > /dev/null 2>&1
 }
 
 # Shut the session down from the top: clients first, then the compositor.
@@ -570,16 +577,16 @@ if [ -x /usr/bin/plasmashell ]; then
 		QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
 		LIBGL_ALWAYS_SOFTWARE=1 "$KAMD" > /tmp/kde-kamd.log 2>&1 &
 		i=0
-		while [ $i -lt 1000 ]; do
+		while [ $i -lt 4000 ]; do
 			dbus-send --session --dest=org.freedesktop.DBus \
 				--type=method_call --print-reply \
 				/org/freedesktop/DBus \
 				org.freedesktop.DBus.ListNames 2>/dev/null \
 				| grep -q org.kde.ActivityManager && break
-			i=$((i + 1)); usleep 200000
+			i=$((i + 1)); usleep 50000
 		done
-		if [ $i -lt 200 ]; then
-			echo "KDE: ok activity-manager t=$(up) after $((i / 50))s"
+		if [ $i -lt 800 ]; then
+			echo "KDE: ok activity-manager t=$(up) after $((i / 20))s"
 		else
 			echo "KDE: fail activity-manager t=$(up): $(tail -3 /tmp/kde-kamd.log 2>/dev/null | tr '\n' ' ')"
 		fi
@@ -608,15 +615,15 @@ if [ -x /usr/bin/plasmashell ]; then
 	# binds them, so `of "/bin/plasmashell"` in kwin's log is one process
 	# observing another. The plasmashell-side strings are kept only as a
 	# fallback; they do not appear in this build.
-	while [ $i -lt 225 ]; do
+	while [ $i -lt 2250 ]; do
 		plasma_running || break
 		grep -aq 'of "/bin/plasmashell"' /tmp/kde-kwin.log 2>/dev/null && break
 		grep -aq "backingstore\|QQuickWindow\|Loading the desktop" \
 			/tmp/kde-plasmashell.log 2>/dev/null && break
-		i=$((i + 1)); usleep 200000
+		i=$((i + 1)); usleep 20000
 	done
-	if [ $i -ge 45 ]; then
-		echo "KDE: plasmashell-no-paint-within ${i}s t=$(up)"
+	if [ $i -ge 450 ]; then
+		echo "KDE: plasmashell-no-paint-within $((i / 50))s t=$(up)"
 	else
 		echo "KDE: ok plasmashell-bound t=$(up) after $((i / 50))s"
 	fi
@@ -639,13 +646,13 @@ if [ -x /usr/bin/plasmashell ]; then
 	# logging rule; the bus does not depend on logging.)
 	i=0
 	__panels=0
-	while [ $i -lt 150 ]; do
+	while [ $i -lt 600 ]; do
 		__panels=$(qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "print(panels().length)" 2>/dev/null | tr -dc '0-9')
 		[ -n "$__panels" ] && [ "$__panels" -gt 0 ] && break
-		i=$((i + 1)); usleep 200000
+		i=$((i + 1)); usleep 50000
 	done
 	if [ -n "$__panels" ] && [ "$__panels" -gt 0 ]; then
-		echo "KDE: ok plasma-panels=$__panels t=$(up) after $((i / 50))s"
+		echo "KDE: ok plasma-panels=$__panels t=$(up) after $((i / 20))s"
 	else
 		echo "KDE: plasma-panels not reported in 30s t=$(up)"
 	fi
@@ -837,7 +844,11 @@ export QT_QPA_PLATFORM_PLUGIN_PATH=/usr/lib/qt6/plugins/platforms
 # Does the Qt runtime work here at all? Bounded, because --version once
 # returned nothing and never came back: whatever blocks there blocks everything
 # after it.
-if timeout 20 kwin_wayland --version > /tmp/kde-version.log 2>&1; then
+# Behind b1nix.kde-diag: a full Qt start-up of its own, half a second before
+# the compositor that answers the same question by starting.
+if ! has_flag b1nix.kde-diag; then
+	:
+elif timeout 20 kwin_wayland --version > /tmp/kde-version.log 2>&1; then
 	echo "KDE: kwin says: $(head -1 /tmp/kde-version.log 2>/dev/null)"
 else
 	echo "KDE: fail version-timeout (Qt cannot start) t=$(up)"
@@ -888,10 +899,10 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 			--no-lockscreen > /tmp/kde-kwin.log 2>&1 &
 		KWINPID=$!
 		w=0
-		while [ $w -lt 75 ]; do
+		while [ $w -lt 750 ]; do
 			[ -S /run/user/0/wayland-1 ] && break
 			kill -0 $KWINPID 2>/dev/null || break
-			usleep 200000
+			usleep 20000
 			w=$((w + 1))
 		done
 		if [ -S /run/user/0/wayland-1 ] && kill -0 $KWINPID 2>/dev/null &&

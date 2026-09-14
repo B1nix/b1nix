@@ -35,61 +35,47 @@
 /* ── read-ahead ─────────────────────────────────────────────────── */
 
 /*
- * Read-ahead is a hint, and here it is not taken.
+ * Read-ahead, as upstream does it: the missing folios of a range are allocated,
+ * locked and put in the cache, and the filesystem's `readahead` operation reads
+ * them together -- btrfs builds one bio for the run and verifies the whole
+ * batch in one pass of its end-io worker.
  *
- * b1nix's block layer does its own read-ahead, below this cache and with the
- * device's geometry in view (see blk_readahead_for). A second layer of it here
- * would issue the same reads twice — once speculatively through the page cache
- * and once again inside the block cache — so the window is recorded and the
- * pages are read on demand.
+ * Without it every page of a buffered read went through read_folio on its own:
+ * one bio, one trip through btrfs's end-io workqueue, one wait on the page lock
+ * per 4 KiB. A desktop start-up demand-paging its libraries off a btrfs root
+ * took 46 000 such waits. b1nix's own page cache already asks for clusters of
+ * 16-64 pages at a time; this is what lets such a cluster reach the device as
+ * one read.
  *
- * That costs latency on a sequential read of a file whose blocks the block
- * cache has not already fetched. It is the first thing to measure once a
- * filesystem is mounted and readable.
+ * The readahead_control carries the batch still to be handed out: `_index` is
+ * the next folio's index and `_nr_pages` how many remain. readahead_folio()
+ * gives one back locked, having dropped the reference allocation took -- the
+ * cache's own reference keeps it -- and the filesystem unlocks it when its I/O
+ * completes. A failure is not an error here: the folio stays not up to date,
+ * and read_folio on the demand path tries again.
  */
-void page_cache_sync_readahead(struct address_space *mapping,
-                               struct file_ra_state *ra, struct file *file,
-                               pgoff_t index, unsigned long req_count)
-{
-	(void)mapping; (void)file;
-	if (ra) {
-		ra->start = index;
-		ra->size = (unsigned int)req_count;
-	}
-}
+#define LKPI_RA_MAX_PAGES 64u
 
-void page_cache_async_readahead(struct address_space *mapping,
-                                struct file_ra_state *ra, struct file *file,
-                                struct folio *folio, unsigned long req_count)
-{
-	page_cache_sync_readahead(mapping, ra, file, folio_next_index(folio),
-	                          req_count);
-}
-
-void page_cache_ra_unbounded(struct readahead_control *rac,
-                             unsigned long nr_to_read, unsigned long lookahead)
-{
-	(void)rac; (void)nr_to_read; (void)lookahead;
-}
-
-/*
- * The read-ahead control's own iteration.
- *
- * A filesystem's `readahead` operation walks it and submits the folios it
- * finds. Nothing populates one here — see above — so the walk ends
- * immediately, which is what makes the operation a no-op rather than a wrong
- * one.
- */
 struct folio *readahead_folio(struct readahead_control *rac)
 {
-	(void)rac;
-	return NULL;
+	struct folio *folio;
+
+	if (!rac || !rac->_nr_pages)
+		return NULL;
+	folio = xa_load(&rac->mapping->i_pages, rac->_index);
+	rac->_index++;
+	rac->_nr_pages--;
+	if (!folio)
+		return NULL;
+	folio_put(folio);
+	return folio;
 }
 
 struct page *readahead_page(struct readahead_control *rac)
 {
-	(void)rac;
-	return NULL;
+	struct folio *folio = readahead_folio(rac);
+
+	return folio ? folio_page(folio, 0) : NULL;
 }
 
 unsigned readahead_page_batch(struct readahead_control *rac,
@@ -103,6 +89,97 @@ size_t readahead_batch_length(struct readahead_control *rac)
 {
 	(void)rac;
 	return 0;
+}
+
+/* Hand the gathered run to the filesystem, then release whatever it did not
+ * take: those folios are unlocked and left not up to date, and their
+ * allocation reference dropped. */
+static void lkpi_read_pages(struct readahead_control *rac)
+{
+	const struct address_space_operations *aops = rac->mapping->a_ops;
+	struct folio *folio;
+
+	if (!rac->_nr_pages)
+		return;
+	if (aops && aops->readahead) {
+		aops->readahead(rac);
+		while ((folio = readahead_folio(rac)) != NULL)
+			folio_unlock(folio);
+	} else if (aops && aops->read_folio) {
+		while ((folio = readahead_folio(rac)) != NULL)
+			aops->read_folio(rac->file, folio);
+	} else {
+		while ((folio = readahead_folio(rac)) != NULL)
+			folio_unlock(folio);
+	}
+}
+
+void page_cache_ra_unbounded(struct readahead_control *rac,
+                             unsigned long nr_to_read, unsigned long lookahead)
+{
+	struct address_space *mapping = rac->mapping;
+	struct inode *inode = mapping->host;
+	pgoff_t index = rac->_index;
+	pgoff_t end_index;
+	loff_t isize = i_size_read(inode);
+
+	(void)lookahead;
+	if (isize <= 0)
+		return;
+	end_index = (pgoff_t)((isize - 1) >> PAGE_SHIFT);
+	if (nr_to_read > LKPI_RA_MAX_PAGES)
+		nr_to_read = LKPI_RA_MAX_PAGES;
+	rac->_nr_pages = 0;
+	for (unsigned long i = 0; i < nr_to_read; i++) {
+		pgoff_t at = index + i;
+		struct folio *folio;
+
+		if (at > end_index)
+			break;
+		if (xa_load(&mapping->i_pages, at)) {
+			/* Already cached: the run so far goes out, a new one starts
+			 * after this folio. */
+			lkpi_read_pages(rac);
+			rac->_index = at + 1;
+			continue;
+		}
+		folio = filemap_alloc_folio(mapping_gfp_mask(mapping), 0);
+		if (!folio)
+			break;
+		folio_lock(folio);
+		if (filemap_add_folio(mapping, folio, at, mapping_gfp_mask(mapping))) {
+			folio_unlock(folio);
+			folio_put(folio);
+			lkpi_read_pages(rac);
+			rac->_index = at + 1;
+			continue;
+		}
+		if (!rac->_nr_pages)
+			rac->_index = at;
+		rac->_nr_pages++;
+	}
+	lkpi_read_pages(rac);
+}
+
+void page_cache_sync_readahead(struct address_space *mapping,
+                               struct file_ra_state *ra, struct file *file,
+                               pgoff_t index, unsigned long req_count)
+{
+	DEFINE_READAHEAD(rac, file, ra, mapping, index);
+
+	if (ra) {
+		ra->start = index;
+		ra->size = (unsigned int)req_count;
+	}
+	page_cache_ra_unbounded(&rac, req_count, 0);
+}
+
+void page_cache_async_readahead(struct address_space *mapping,
+                                struct file_ra_state *ra, struct file *file,
+                                struct folio *folio, unsigned long req_count)
+{
+	page_cache_sync_readahead(mapping, ra, file, folio_next_index(folio),
+	                          req_count);
 }
 
 /* ── mount options, the old parser ──────────────────────────────── */

@@ -1,3 +1,4 @@
+#include <b1nix/kprof.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/lapic.h>
 #include <b1nix/blk.h>
@@ -200,8 +201,9 @@ static void bcache_hash_insert(i32 idx) {
  * the owning core can't be preempted mid-section and the field stays stable. */
 static volatile int bcache_owner_cpu = -1;
 
-static u64 bcache_acquire(void) {
+__attribute__((noinline)) static u64 bcache_acquire(void) {
   u64 flags;
+  kprof_bcache_site(__builtin_return_address(0));
   spin_lock_irqsave(&bcache_lock, &flags);
   struct percpu *p = get_percpu();
   bcache_owner_cpu = p ? (int)p->cpu_id : -1;
@@ -1690,8 +1692,22 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
         }
         memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
         g_bcache_hits++;
-        bcache_release(flags);
         blk_stat_hits++;
+        /* The sectors that follow are usually cached too: copy the run under
+         * this one acquisition instead of taking the lock, with interrupts
+         * off, once per 512 bytes -- a desktop start-up took it 400 000
+         * times. Bounded so the section stays short. */
+        for (u32 run = 1; run < 128 && i + 1 < count; run++) {
+          struct block_buffer *next = bcache_find(dev, lba + i + 1);
+
+          if (!next || (next->flags & BLK_CACHE_BUSY))
+            break;
+          i++;
+          memcpy(buf8 + i * CACHE_BLOCK_SIZE, next->data, CACHE_BLOCK_SIZE);
+          g_bcache_hits++;
+          blk_stat_hits++;
+        }
+        bcache_release(flags);
         break;
       }
       blk_stat_misses++;
@@ -2859,8 +2875,13 @@ void blk_cache_invalidate(struct block_device *dev) {
     last = part->start_lba + dev->block_count;
     dev = part->parent;
   }
+  u64 flags = bcache_acquire();
   for (usize i = 0; i < block_cache_n; i++) {
-    u64 flags = bcache_acquire();
+    /* Let interrupts in every so often rather than on every slot. */
+    if (i && (i & 255) == 0) {
+      bcache_release(flags);
+      flags = bcache_acquire();
+    }
     if (block_cache[i].bdev == dev && block_cache[i].block_no >= first &&
         block_cache[i].block_no < last) {
       if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
@@ -2877,8 +2898,8 @@ void blk_cache_invalidate(struct block_device *dev) {
       block_cache[i].bdev = 0;
       block_cache[i].block_no = 0;
     }
-    bcache_release(flags);
   }
+  bcache_release(flags);
 }
 
 /* ── /dev block-device nodes (for BusyBox blkid/fdisk) ──

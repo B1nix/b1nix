@@ -630,9 +630,9 @@ void e1000_selftest(void)
 	e1000_print_mac(e1000_mac);
 	console_write("\n");
 
-	/* Poll the link-up bit (bounded). */
+	/* Poll the link-up bit, for up to a second of real time. */
 	int up = 0;
-	for (int i = 0; i < 200; i++) {
+	for (u64 i = 0; i < SCHED_MS_TO_TICKS(1000); i++) {
 		if (e1000_read(E1000_STATUS) & STATUS_LU) { up = 1; break; }
 		scheduler_sleep_ticks(1);
 	}
@@ -680,10 +680,21 @@ void e1000_selftest(void)
 	else
 		console_write("M37-E1000: FAIL tx\n");
 
-	/* Poll for an ARP reply from 10.0.2.2 (bounded ~2s). */
+	/* Poll for an ARP reply from the gateway, for two seconds of real time,
+	 * asking again every quarter second.
+	 *
+	 * The bound was 200 ticks, written when a tick was 10 ms; at 1 kHz it is
+	 * 200 ms. That was enough only while boot reached this point two seconds
+	 * in: once the PCI scan stopped costing a second, the request went out
+	 * before the emulated link would pass traffic, the one request was lost,
+	 * and every lane but the slowest reported no reply. */
 	int got = 0;
 	u8 frame[E1000_BUF_SZ];
-	for (int i = 0; i < 200 && !got; i++) {
+	u64 wait_ticks = SCHED_MS_TO_TICKS(2000);
+	u64 resend_ticks = SCHED_MS_TO_TICKS(250);
+	for (u64 i = 0; i < wait_ticks && !got; i++) {
+		if (i && resend_ticks && i % resend_ticks == 0)
+			(void)e1000_xmit(eth, arp, sizeof(arp));
 		usize len;
 		while ((len = e1000_selftest_recv(frame, sizeof(frame))) > 0) {
 			if (len >= 42 &&

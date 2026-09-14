@@ -17,6 +17,16 @@ extern int kprof_irqoff_on;
 void kprof_tick_totals(u64 *user, u64 *kernel, u64 *idle);
 void kprof_irqoff_begin(void *site);
 void kprof_irqoff_end(void);
+/* Count a wait against the function that armed it (b1nix.sysprof). */
+void kprof_wait_site(void *site);
+/* Ticks one CPU spent in user, kernel and idle since boot. */
+void kprof_tick_cpu(unsigned cpu, u64 *user, u64 *kernel, u64 *idle);
+/* Count a wake of the shared poll channel against its caller (b1nix.sysprof). */
+void kprof_pollwake_site(void *site);
+/* Count a block-cache lock acquisition against its caller (b1nix.sysprof). */
+void kprof_bcache_site(void *site);
+/* Count a scheduler_wake_all against its caller (b1nix.sysprof). */
+void kprof_wake_site(void *site);
 
 /* The site is the helper's return address. The helpers are static inline
  * but the compiler emits out-of-line copies of them in most units, and a

@@ -77,6 +77,9 @@ struct lkpi_mutex {
 	volatile u32 locked;
 	volatile usize owner;
 	volatile int guard; /* a b1nix spinlock; see the note above */
+	/* Tasks parked on it, counted under guard: an unlock with none skips the
+	 * wake, which is a scan of every task. */
+	volatile u32 waiters;
 };
 
 void lkpi_mutex_init(struct lkpi_mutex *m);

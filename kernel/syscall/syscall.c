@@ -415,19 +415,14 @@ int syscall_copyinstr(char *dst, usize dst_size, const char *user_src) {
     // ELF64 user processes may only copy strings from userspace VMAs.
     if (curr >= USER_SPACE_LIMIT) return -EFAULT;
 
-    // Find the VMA covering the current address
-    struct vm_area *vma = current_task->vma_list;
-    int found = 0;
-    while (vma) {
-      if (curr >= vma->start && curr < vma->end) {
-        if (!(vma->prot & PROT_READ)) return -EFAULT;
-        found = 1;
-        break;
-      }
-      vma = vma->next;
-    }
+    /* The mapping covering it: vma_lookup's cache and sorted walk, not a
+     * scan of the whole list per string -- every path a program names goes
+     * through here, and a desktop's processes hold a thousand mappings. */
+    struct vm_area *vma = vma_lookup(current_task, curr);
+    int found = vma != 0;
 
     if (!found) return -EFAULT;
+    if (!(vma->prot & PROT_READ)) return -EFAULT;
 
     // Determine chunk size: up to VMA end or buffer end
     u64 remaining_in_vma = (vma && found && vma->end > curr) ? (vma->end - curr) : (PAGE_SIZE - (curr & (PAGE_SIZE - 1)));
@@ -488,20 +483,12 @@ static int is_user_range_valid(const void *src, usize size, int write) {
 
   // Verify that the entire range is covered by VMAs with correct permissions
   for (u64 v = start; v < end; ) {
-    struct vm_area *vma = t->vma_list;
-    int found = 0;
-    while (vma) {
-      if (v >= vma->start && v < vma->end) {
-        if (write && !(vma->prot & PROT_WRITE)) return 0;
-        if (!write && !(vma->prot & PROT_READ)) return 0;
+    struct vm_area *vma = vma_lookup(t, v);
 
-        v = vma->end; // Move to end of this VMA
-        found = 1;
-        break;
-      }
-      vma = vma->next;
-    }
-    if (!found) return 0;
+    if (!vma) return 0;
+    if (write && !(vma->prot & PROT_WRITE)) return 0;
+    if (!write && !(vma->prot & PROT_READ)) return 0;
+    v = vma->end; // Move to end of this VMA
   }
 
   return 1;
@@ -3514,6 +3501,18 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
       syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
+      if (timed_out && timeout_ns >= 100000000ull &&
+          bootinfo_has_flag("b1nix.trace-timeouts")) {
+        static unsigned told;
+        if (told < 64) {
+          told++;
+          kprintf(LOGLEVEL_WARNING, NULL, "poll-timeout: %s pid %lu after %lu ms, %lu fds, first fd %d ev 0x%x",
+                 current_task->name ? current_task->name : "?",
+                 (unsigned long)current_task->id,
+                 (unsigned long)(timeout_ns / 1000000), (unsigned long)nfds,
+                 nfds ? fds[0].fd : -1, nfds ? (unsigned)fds[0].events : 0);
+        }
+      }
       /* What poll answered, and about what kind of descriptor: an event
        * loop that is told "readable" about something it then cannot read
        * asks again at once, and the syscall trace shows only the pollfd
@@ -4611,9 +4610,10 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
         u64 ovflags;
         int overlap = 0;
         vma_list_lock(&ovflags);
-        for (struct vm_area *curr_vma = t->vma_list; curr_vma;
+        for (struct vm_area *curr_vma = t->vma_list;
+             curr_vma && curr_vma->start < vaddr + length;
              curr_vma = curr_vma->next) {
-          if (!(curr_vma->start >= vaddr + length || curr_vma->end <= vaddr)) {
+          if (curr_vma->end > vaddr) {
             overlap = 1;
             break;
           }
@@ -4930,8 +4930,12 @@ void vma_harvest_shared_dirty(struct task *t, u64 start, u64 end) {
   extern int paging_test_and_clear_dirty(u64 pml4_phys, u64 vaddr);
   if (!t)
     return;
-  for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
-    if (vma->end <= start || vma->start >= end)
+  struct vm_area *from = vma_walk_start(t, start);
+
+  for (struct vm_area *vma = from ? from->next : t->vma_list; vma; vma = vma->next) {
+    if (vma->start >= end)
+      break; /* the list is in address order: nothing past here overlaps */
+    if (vma->end <= start)
       continue;
     if (!(vma->flags & MAP_SHARED) || !(vma->prot & PROT_WRITE))
       continue;
@@ -5336,9 +5340,13 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
 
   // 2. Update VMAs (handle splitting if necessary)
   struct task *t = current_task;
-  struct vm_area *vma = t->vma_list;
+  struct vm_area *vma = vma_walk_start(t, start);
+
+  vma = vma ? vma->next : t->vma_list;
   while (vma) {
-    if (vma->start >= end || vma->end <= start) {
+    if (vma->start >= end)
+      break; /* in address order: nothing further along overlaps */
+    if (vma->end <= start) {
       vma = vma->next;
       continue;
     }
@@ -5440,16 +5448,8 @@ static isize sys_madvise(void *addr, usize length, int advice) {
   u64 frames[MADV_BATCH];
 
   for (u64 v = start; v < end;) {
-    struct vm_area *vma = t->vma_list;
-    struct vm_area *cover = 0;
+    struct vm_area *cover = vma_lookup(t, v);
 
-    while (vma) {
-      if (v >= vma->start && v < vma->end) {
-        cover = vma;
-        break;
-      }
-      vma = vma->next;
-    }
     if (!cover)
       return -ENOMEM; /* unmapped page in range */
 
@@ -6204,6 +6204,38 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
           if (strncmp(nm + i, want + p, e - p) == 0)
             trace_this = 1;
         p = want[e] ? e + 1 : e;
+      }
+    }
+    /* b1nix.trace-nr=<n,n,...> narrows it to those calls: the blocking ones
+     * are what a stall is made of, and a whole start-up of every call does
+     * not fit the log. */
+    if (trace_this) {
+      static char nrs[96];
+      static int have_nrs = -1;
+
+      if (have_nrs < 0)
+        have_nrs = bootinfo_get_kv("b1nix.trace-nr", nrs, sizeof(nrs)) ? 1 : 0;
+      if (have_nrs) {
+        int match = 0;
+        u64 v = 0;
+        int any = 0;
+
+        for (usize i = 0;; i++) {
+          char c = nrs[i];
+
+          if (c >= '0' && c <= '9') {
+            v = v * 10 + (u64)(c - '0');
+            any = 1;
+            continue;
+          }
+          if (any && v == number)
+            match = 1;
+          v = 0;
+          any = 0;
+          if (!c)
+            break;
+        }
+        trace_this = match;
       }
     }
   }

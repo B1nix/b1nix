@@ -15,6 +15,7 @@
 #include <b1nix/sysv_ipc.h>
 #include <b1nix/kmsg.h>
 #include <b1nix/ktime.h>
+#include <b1nix/kprintf.h>
 #include <b1nix/sched.h>
 #include <b1nix/klog.h>
 #include <b1nix/syscall.h>
@@ -1387,6 +1388,10 @@ static struct task *find_unused_task(int user) {
  * find_unused_task). The store also publishes any prior writes (e.g. the
  * kfree of the task's resources) before the slot becomes claimable again. */
 static void free_task_slot(struct task *t) {
+  /* The mapping lookup cache and free-area hint are per slot and hold raw
+   * pointers into this task's list: the next owner of the slot must not find
+   * them, whatever its address space's generation happens to read. */
+  vma_cache_forget(t);
   /* The slot is about to become claimable by a new task, so this is the last
    * moment the id means anything: release the pid-namespace number here rather
    * than at exit, where the task is still a zombie its parent must be able to
@@ -1936,11 +1941,66 @@ static void sched_sigwait_notify(struct task *t, int sig)
 		scheduler_wake_all(&t->pending_signals);
 }
 
+/* Wake-to-run latency, under b1nix.sysprof: how long a task that was made
+ * READY waited before a CPU switched to it. A desktop whose CPUs are mostly
+ * idle while its threads hand work to each other is waiting here if it is
+ * waiting anywhere in the scheduler. Buckets are decades from 10 us. */
+static u64 g_task_wake_ns[TASK_SLOTS];
+#define WAKELAT_BUCKETS 6
+static u64 g_wakelat_count[WAKELAT_BUCKETS];
+static u64 g_wakelat_total_ns;
+static int g_wakelat_on = -1;
+
+static inline int wakelat_enabled(void) {
+  if (g_wakelat_on < 0)
+    g_wakelat_on = bootinfo_has_flag("b1nix.sysprof") ? 1 : 0;
+  return g_wakelat_on;
+}
+
+static void wakelat_switch_in(struct task *t) {
+  usize i = task_index(t);
+  u64 w = g_task_wake_ns[i];
+
+  if (!w)
+    return;
+  g_task_wake_ns[i] = 0;
+  u64 d = ktime_monotonic_ns() - w;
+  unsigned b = 0;
+  for (u64 lim = 10000; b < WAKELAT_BUCKETS - 1 && d >= lim; lim *= 10)
+    b++;
+  __atomic_fetch_add(&g_wakelat_count[b], 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_wakelat_total_ns, d, __ATOMIC_RELAXED);
+}
+
+void sched_wakelat_dump(void) {
+  static const char *const names[WAKELAT_BUCKETS] = {
+      "<10us", "<100us", "<1ms", "<10ms", "<100ms", ">=100ms"};
+  u64 n = 0;
+
+  if (!wakelat_enabled())
+    return;
+  for (unsigned b = 0; b < WAKELAT_BUCKETS; b++)
+    n += g_wakelat_count[b];
+  console_write("wakelat: wakes=");
+  console_write_dec(n);
+  console_write(" total_ms=");
+  console_write_dec(g_wakelat_total_ns / 1000000);
+  for (unsigned b = 0; b < WAKELAT_BUCKETS; b++) {
+    console_write(" ");
+    console_write(names[b]);
+    console_write("=");
+    console_write_dec(g_wakelat_count[b]);
+  }
+  console_write("\n");
+}
+
 static void sched_wake_enqueue(struct task *t) {
   if (t) {
     usize i = task_index(t);
 
     sched_waitprof_wake(t);
+    if (wakelat_enabled())
+      g_task_wake_ns[i] = ktime_monotonic_ns();
 
     if (g_task_pass[i] < g_min_pass)
       g_task_pass[i] = g_min_pass;
@@ -4366,7 +4426,43 @@ void scheduler_reap_orphan_zombies(void) {
 
 
 
+static int scheduler_yield_inner(void);
+
+/* b1nix.trace-bootwait: every time the boot task (pid 0, which runs the whole
+ * of kernel_main) stops running for 10 ms or more, say how long and who put it
+ * to sleep. A boot that is idle on the boot CPU for most of its two seconds is
+ * waiting on something, and this is the list of what. */
 int scheduler_yield(void) {
+  static int on = -1;
+  struct task *me = current_task;
+
+  if (on < 0)
+    on = bootinfo_has_flag("b1nix.trace-bootwait") ? 1 : 0;
+  if (!on || !me || me->id != 0 || me->state == TASK_RUNNING ||
+      me->state == TASK_READY)
+    return scheduler_yield_inner();
+  void *c0 = __builtin_return_address(0);
+  u64 t0 = ktime_monotonic_ns();
+  int r = scheduler_yield_inner();
+  u64 d = ktime_monotonic_ns() - t0;
+
+  if (d >= 10000000ull) {
+    u64 *fp = (u64 *)__builtin_frame_address(0);
+    u64 c1 = 0, c2 = 0;
+
+    if (fp && fp[0]) {
+      u64 *fp1 = (u64 *)(usize)fp[0];
+      c1 = fp1[1];
+      if (fp1[0])
+        c2 = ((u64 *)(usize)fp1[0])[1];
+    }
+    kprintf(LOGLEVEL_WARNING, NULL, "bootwait: %lu ms at %pS <- %pS <- %pS",
+            (unsigned long)(d / 1000000), c0, (void *)(usize)c1, (void *)(usize)c2);
+  }
+  return r;
+}
+
+static int scheduler_yield_inner(void) {
   const u64 yield_caller_pc = (u64)(usize)__builtin_return_address(0);
   {
     /* Giving up the CPU while holding a linuxkpi spinlock strands every waiter
@@ -4949,6 +5045,8 @@ int scheduler_yield(void) {
 #endif
 
   g_last_switch_tick = scheduler_ticks;
+  if (wakelat_enabled())
+    wakelat_switch_in(new_task);
   arch_context_switch(&old_task->context, &new_task->context,
                       &old_task->stack_released);
 
@@ -5209,6 +5307,7 @@ void scheduler_wait_prepare(void *chan) {
 
   if (current_task && (usize)current_task->id < SCHED_MAX_TASKS)
     g_park_site[current_task->id] = __builtin_return_address(0);
+  kprof_wait_site(__builtin_return_address(0));
 
   interrupts_disable();
   if (current_task == 0)
@@ -5431,6 +5530,13 @@ void scheduler_wake_all(void *chan) {
    * caller that had IRQs off off. */
   u64 flags = interrupts_save();
 
+  {
+    extern void *vfs_poll_chan;
+
+    if (chan == vfs_poll_chan)
+      kprof_pollwake_site(__builtin_return_address(0));
+    kprof_wake_site(__builtin_return_address(0));
+  }
   int woken = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *t = T(i);
@@ -9403,6 +9509,10 @@ static spinlock_t g_vma_lock = SPINLOCK_INIT;
 void vma_list_lock(u64 *flags) { spin_lock_irqsave(&g_vma_lock, flags); }
 void vma_list_unlock(u64 flags) { spin_unlock_irqrestore(&g_vma_lock, flags); }
 
+static struct vm_area *vma_known_before(struct task *t, u64 addr, int need_end);
+static void vma_idx_insert_locked(struct task *t, struct vm_area *vma);
+static void vma_idx_remove_locked(u64 pml4, struct vm_area *vma);
+
 void vma_insert(struct task *t, struct vm_area *vma) {
   if (!t || !vma)
     return;
@@ -9410,6 +9520,15 @@ void vma_insert(struct task *t, struct vm_area *vma) {
   u64 vflags;
   vma_list_lock(&vflags);
   struct vm_area **link = &t->vma_list;
+  /* Start at a mapping known to lie below the new one rather than at the head:
+   * the placement search usually just stopped behind the very node this goes
+   * after. Checked under the list lock, where no unlink can be under way. */
+  {
+    struct vm_area *before = vma_known_before(t, vma->start, 0);
+
+    if (before)
+      link = &before->next;
+  }
 
   while (*link && (*link)->start < vma->start)
     link = &(*link)->next;
@@ -9417,6 +9536,7 @@ void vma_insert(struct task *t, struct vm_area *vma) {
   /* Publish the node only after its own next pointer is set, so a walker
    * that is not holding the lock never sees a half-linked entry. */
   __atomic_store_n(link, vma, __ATOMIC_RELEASE);
+  vma_idx_insert_locked(t, vma);
   vma_list_unlock(vflags);
   /* Only a new head has to be published to the threads sharing this address
    * space — they hold the head pointer, not the list. Publishing on every
@@ -9432,7 +9552,9 @@ void vma_insert(struct task *t, struct vm_area *vma) {
  * the mapping just used — into a pointer comparison. chromium runs with
  * thousands of mappings, and every fault used to walk them.
  */
-static struct vm_area *g_vma_cache[TASK_SLOTS];
+#define VMA_CACHE_WAYS 4
+static struct vm_area *g_vma_cache[TASK_SLOTS][VMA_CACHE_WAYS];
+static u8 g_vma_cache_next[TASK_SLOTS];
 
 /* The cache is stamped, not merely cleared.
  *
@@ -9441,19 +9563,31 @@ static struct vm_area *g_vma_cache[TASK_SLOTS];
  * a pointer to a struct that had already been kfree'd, and went on serving
  * faults out of it: a mapping that no longer existed answered for an address
  * that by then belonged to somebody else's fresh mmap, and the page installed
- * there was written into a range its owner believed untouched. That is the
- * foreign data found in a freshly mapped destination, and it is why the
- * failure needed several cores and several threads to show itself.
+ * there was written into a range its owner believed untouched.
  *
- * A counter bumped on every unlink invalidates every task's cache at once, at
- * the cost of one atomic on a path that already frees memory and shoots down
- * TLBs. Per-address-space stamping would keep more of the cache alive, but
- * unlinking is rare and correctness here is worth more than the hit rate. */
-static u64 g_vma_cache_gen[TASK_SLOTS];
-static u64 g_vma_gen;
+ * The stamp belongs to the address space. It was one counter for the whole
+ * machine, so every munmap anywhere emptied every process's cache -- a desktop
+ * unmaps thousands of times while it starts, and the cache was cold for all of
+ * it, each fault walking a list of a thousand mappings. The counters are kept
+ * in a small table indexed by the page-table root: threads of one space share
+ * a counter, and two spaces that collide in the table only invalidate each
+ * other more often than needed, never less. */
+#define VMA_GEN_SLOTS 256u
+static u64 g_vma_cache_gen[TASK_SLOTS][VMA_CACHE_WAYS];
+/* And the exact space each entry was cached from. The generation table is
+ * shared by hash, so two spaces can read the same counter value: a slot
+ * reused by another process, or a pml4 frame reused after exec, must never
+ * match an entry that points into a list that has been freed. */
+static u64 g_vma_cache_pml4[TASK_SLOTS][VMA_CACHE_WAYS];
+static u64 g_vma_gen[VMA_GEN_SLOTS];
 
-void vma_cache_invalidate_all(void) {
-  __atomic_add_fetch(&g_vma_gen, 1, __ATOMIC_SEQ_CST);
+static inline u64 *vma_gen_of(u64 pml4_phys) {
+  return &g_vma_gen[(u32)((pml4_phys >> 12) * 0x9e3779b97f4a7c15ULL >> 56) &
+                    (VMA_GEN_SLOTS - 1)];
+}
+
+void vma_cache_invalidate_space(u64 pml4_phys) {
+  __atomic_add_fetch(vma_gen_of(pml4_phys), 1, __ATOMIC_SEQ_CST);
 }
 
 /* Freeing a mapping while a fault is walking the list.
@@ -9493,6 +9627,226 @@ static void vma_retire_drain_locked(void) {
   }
 }
 
+/* An address-ordered index of one address space's mappings.
+ *
+ * The list stays the authority -- a hundred places walk it -- and a process
+ * with thousands of mappings (a QML shell JIT-compiles into hundreds of them)
+ * paid for every lookup, placement, unmap and protection change with a walk
+ * of it: a third of plasmashell's kernel time. The index answers "which
+ * mapping starts at or below this address" by binary search.
+ *
+ * It is copied on write. Every change to the list that adds or removes a node
+ * happens under the list lock, and the index is replaced there by a new array
+ * with the one entry added or removed -- a copy of a compact array, not a walk
+ * of the list, which is what made rebuilding a snapshot too slow. Readers take
+ * it without the lock as counted walkers, so an array or a mapping they hold
+ * is freed only once no walker is inside.
+ *
+ * What the index holds is always on the list: the only two places that free a
+ * mapping (vma_delete_range, and the teardown of the whole space) take it out
+ * first. What the list holds need not be in the index -- a node linked by hand
+ * elsewhere is simply not found -- so every answer is checked against the
+ * mapping's own start and end, and a miss falls back to walking from the
+ * nearest indexed node. */
+struct vma_index {
+  u64 pml4;
+  /* Where the free-area search resumes: the lowest address below which no
+   * gap is known to be unused. A placement moves it up to what it handed out;
+   * removing a mapping moves it down to where that mapping began. A hint, so
+   * written without the lock and carried into each replacement copy. */
+  volatile u64 free_hint;
+  u32 n;
+  struct vma_index *retired_next;
+  struct {
+    u64 start;
+    struct vm_area *v;
+  } e[];
+};
+#define VMA_IDX_SLOTS 256u
+static struct vma_index *volatile g_vma_idx[VMA_IDX_SLOTS];
+static struct vma_index *g_vma_idx_retired;
+
+static inline u32 vma_idx_slot(u64 pml4) {
+  return (u32)((pml4 >> 12) * 0x9e3779b97f4a7c15ULL >> 56) & (VMA_IDX_SLOTS - 1);
+}
+
+/* Caller is a counted walker or holds the list lock. */
+static struct vma_index *vma_idx_of(u64 pml4) {
+  struct vma_index *ix;
+
+  if (!pml4)
+    return 0;
+  ix = __atomic_load_n(&g_vma_idx[vma_idx_slot(pml4)], __ATOMIC_ACQUIRE);
+  return (ix && ix->pml4 == pml4) ? ix : 0;
+}
+
+static void vma_idx_drain_locked(void) {
+  if (!g_vma_idx_retired ||
+      __atomic_load_n(&g_vma_walkers, __ATOMIC_SEQ_CST) != 0)
+    return;
+  struct vma_index *ix = g_vma_idx_retired;
+
+  g_vma_idx_retired = 0;
+  while (ix) {
+    struct vma_index *next = ix->retired_next;
+
+    kfree(ix);
+    ix = next;
+  }
+}
+
+static void vma_idx_publish_locked(u32 slot, struct vma_index *ix) {
+  struct vma_index *old = g_vma_idx[slot];
+
+  __atomic_store_n(&g_vma_idx[slot], ix, __ATOMIC_RELEASE);
+  if (old) {
+    old->retired_next = g_vma_idx_retired;
+    g_vma_idx_retired = old;
+  }
+  vma_idx_drain_locked();
+}
+
+static struct vma_index *vma_idx_alloc(u64 pml4, u32 n) {
+  struct vma_index *ix = kmalloc(sizeof(*ix) + (usize)n * sizeof(ix->e[0]));
+
+  if (ix) {
+    ix->pml4 = pml4;
+    ix->n = n;
+    ix->free_hint = 0;
+    ix->retired_next = 0;
+  }
+  return ix;
+}
+
+/* First entry whose start is above addr. */
+static u32 vma_idx_upper(const struct vma_index *ix, u64 addr) {
+  u32 lo = 0, hi = ix->n;
+
+  while (lo < hi) {
+    u32 mid = lo + (hi - lo) / 2;
+
+    if (ix->e[mid].start <= addr)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return lo;
+}
+
+/* Built from the list the first time the space is edited under the lock, then
+ * kept by the edits. A slot another space already holds is left to it: that
+ * space goes without an index, which costs it walks, not answers. */
+static void vma_idx_insert_locked(struct task *t, struct vm_area *vma) {
+  u64 pml4 = t ? t->pml4_phys : 0;
+  u32 slot;
+  struct vma_index *ix, *nx;
+
+  if (!pml4 || !vma)
+    return;
+  slot = vma_idx_slot(pml4);
+  ix = g_vma_idx[slot];
+  if (ix && ix->pml4 != pml4)
+    return;
+  if (!ix) {
+    u32 n = 0;
+
+    for (struct vm_area *v = t->vma_list; v; v = v->next)
+      if (++n > 65536u)
+        return;
+    nx = vma_idx_alloc(pml4, n);
+    if (!nx)
+      return;
+    u32 i = 0;
+    u64 prev = 0;
+    for (struct vm_area *v = t->vma_list; v && i < n; v = v->next) {
+      if (i && v->start < prev)
+        continue; /* out of order: leave it to the walk */
+      nx->e[i].start = v->start;
+      nx->e[i].v = v;
+      prev = v->start;
+      i++;
+    }
+    nx->n = i;
+    vma_idx_publish_locked(slot, nx);
+    return;
+  }
+  u32 at = vma_idx_upper(ix, vma->start);
+
+  nx = vma_idx_alloc(pml4, ix->n + 1);
+  if (!nx) {
+    /* Cannot record it: an index that misses a node is still correct, but
+     * drop this one anyway rather than let it age. */
+    vma_idx_publish_locked(slot, 0);
+    return;
+  }
+  nx->free_hint = ix->free_hint;
+  memcpy(nx->e, ix->e, (usize)at * sizeof(ix->e[0]));
+  nx->e[at].start = vma->start;
+  nx->e[at].v = vma;
+  memcpy(nx->e + at + 1, ix->e + at, (usize)(ix->n - at) * sizeof(ix->e[0]));
+  vma_idx_publish_locked(slot, nx);
+}
+
+static void vma_idx_remove_locked(u64 pml4, struct vm_area *vma) {
+  struct vma_index *ix = vma_idx_of(pml4);
+  u32 slot = vma_idx_slot(pml4);
+
+  if (!ix)
+    return;
+  u32 at = ix->n;
+  for (u32 i = 0; i < ix->n; i++) {
+    if (ix->e[i].v == vma) {
+      at = i;
+      break;
+    }
+  }
+  if (at == ix->n)
+    return;
+  struct vma_index *nx = vma_idx_alloc(pml4, ix->n - 1);
+
+  if (!nx) {
+    /* The one thing the index must never keep is a node that is about to be
+     * freed: without memory for a copy, the index goes. */
+    vma_idx_publish_locked(slot, 0);
+    return;
+  }
+  nx->free_hint = ix->free_hint < vma->start ? ix->free_hint : vma->start;
+  memcpy(nx->e, ix->e, (usize)at * sizeof(ix->e[0]));
+  memcpy(nx->e + at, ix->e + at + 1, (usize)(ix->n - at - 1) * sizeof(ix->e[0]));
+  vma_idx_publish_locked(slot, nx);
+}
+
+/* The whole space is going: its mappings are freed right after this. */
+void vma_idx_drop_space(u64 pml4) {
+  u64 flags;
+
+  if (!pml4)
+    return;
+  vma_list_lock(&flags);
+  if (vma_idx_of(pml4))
+    vma_idx_publish_locked(vma_idx_slot(pml4), 0);
+  vma_list_unlock(flags);
+}
+
+/* The indexed mapping starting highest at or below addr (need_end: ending at
+ * or below it). Caller is a counted walker or holds the lock. */
+static struct vm_area *vma_idx_before(u64 pml4, u64 addr, int need_end) {
+  struct vma_index *ix = vma_idx_of(pml4);
+
+  if (!ix)
+    return 0;
+  u32 up = vma_idx_upper(ix, addr);
+
+  while (up > 0) {
+    struct vm_area *v = ix->e[up - 1].v;
+
+    if (!need_end || v->end <= addr)
+      return v;
+    up--;
+  }
+  return 0;
+}
+
 /* Hand a mapping over to be freed once no walker can be holding it. */
 void vma_retire(struct vm_area *vma) {
   u64 flags;
@@ -9523,13 +9877,32 @@ struct vm_area *vma_lookup(struct task *t, u64 addr) {
     return 0;
 
   usize slot = task_index(t);
-  u64 gen = __atomic_load_n(&g_vma_gen, __ATOMIC_ACQUIRE);
-  struct vm_area *hit = g_vma_cache[slot];
 
-  /* The cached mapping is only trusted while nothing has been unlinked from
-   * any list since it was cached; a freed one would be a use-after-free. */
-  if (hit && g_vma_cache_gen[slot] == gen && addr >= hit->start && addr < hit->end)
-    return hit;
+  /* A walker from here on, cache included: a cached mapping unlinked and
+   * retired on another CPU between the stamp check and the reads below must
+   * not be freed under them. */
+  __atomic_add_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
+  u64 gen = __atomic_load_n(vma_gen_of(t->pml4_phys), __ATOMIC_ACQUIRE);
+
+  /* A cached mapping that starts at or below the address is also where the
+   * walk can begin: nothing has been unlinked from this space since it was
+   * cached, so it is still on the list, and no mapping ahead of it can cover
+   * an address at or past its start without overlapping it. */
+  struct vm_area *from = t->vma_list;
+
+  for (unsigned w = 0; w < VMA_CACHE_WAYS; w++) {
+    struct vm_area *hit = g_vma_cache[slot][w];
+
+    if (!hit || g_vma_cache_gen[slot][w] != gen ||
+        g_vma_cache_pml4[slot][w] != t->pml4_phys || hit->start > addr)
+      continue;
+    if (addr < hit->end) {
+      __atomic_sub_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
+      return hit;
+    }
+    if (!from || hit->start > from->start)
+      from = hit;
+  }
 
   /* Deliberately NOT under the list lock.
    *
@@ -9540,28 +9913,105 @@ struct vm_area *vma_lookup(struct task *t, u64 addr) {
    *
    * What makes the lockless read safe enough is that a node is published only
    * after its own next pointer is set (see vma_insert/vma_split), so a walker
-   * never lands mid-splice. The remaining exposure is a mapping freed while
-   * this walk holds it — pre-existing, and not something a spinlock in the
-   * fault path can pay for. */
-  __atomic_add_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
-  for (struct vm_area *v = t->vma_list; v && v->start <= addr; v = v->next) {
+   * never lands mid-splice, and a retired node is not freed while any walker
+   * is counted. */
+  struct vm_area *found = 0;
+  {
+    struct vm_area *ixv = vma_idx_before(t->pml4_phys, addr, 0);
+
+    if (ixv && addr < ixv->end)
+      found = ixv;
+    else if (ixv && (!from || ixv->start > from->start))
+      from = ixv;
+  }
+
+  for (struct vm_area *v = found ? 0 : from; v && v->start <= addr; v = v->next) {
     if (addr < v->end) {
-      /* Stamp first, publish second: a walker that reads the pointer must
-       * never find it paired with a generation newer than the one it was
-       * cached under. */
-      g_vma_cache_gen[slot] = gen;
-      __atomic_store_n(&g_vma_cache[slot], v, __ATOMIC_RELEASE);
-      __atomic_sub_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
-      return v;
+      found = v;
+      break;
     }
   }
+  if (found) {
+    unsigned w = g_vma_cache_next[slot]++ % VMA_CACHE_WAYS;
+
+    /* Stamp first, publish second: a walker that reads the pointer must
+     * never find it paired with a generation newer than the one it was
+     * cached under. */
+    g_vma_cache_gen[slot][w] = gen;
+    g_vma_cache_pml4[slot][w] = t->pml4_phys;
+    __atomic_store_n(&g_vma_cache[slot][w], found, __ATOMIC_RELEASE);
+  }
   __atomic_sub_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
-  return 0;
+  return found;
+}
+
+static struct vm_area *g_vma_free_hint[TASK_SLOTS];
+
+static u64 g_vma_free_hint_gen[TASK_SLOTS];
+static u64 g_vma_free_hint_pml4[TASK_SLOTS];
+
+/* A mapping of `t`'s list that lies before `addr` -- starting below it, or
+ * with need_end, ending at or below it -- taken from what this thread has
+ * cached, and still on the list: nothing has been unlinked from the space
+ * since it was cached. The highest such, so a walk from it is shortest.
+ * Caller holds the list lock or is a counted walker. */
+static struct vm_area *vma_known_before(struct task *t, u64 addr, int need_end) {
+  usize slot = task_index(t);
+  u64 gen = __atomic_load_n(vma_gen_of(t->pml4_phys), __ATOMIC_ACQUIRE);
+  struct vm_area *best = 0;
+
+  for (unsigned w = 0; w <= VMA_CACHE_WAYS; w++) {
+    struct vm_area *v;
+
+    if (w < VMA_CACHE_WAYS) {
+      v = g_vma_cache[slot][w];
+      if (!v || g_vma_cache_gen[slot][w] != gen ||
+          g_vma_cache_pml4[slot][w] != t->pml4_phys)
+        continue;
+    } else {
+      v = g_vma_free_hint[slot];
+      if (!v || g_vma_free_hint_gen[slot] != gen ||
+          g_vma_free_hint_pml4[slot] != t->pml4_phys)
+        continue;
+    }
+    if (v->start >= addr || (need_end && v->end > addr))
+      continue;
+    if (!best || v->start > best->start)
+      best = v;
+  }
+  {
+    struct vm_area *ixv = vma_idx_before(t->pml4_phys, addr - 1, need_end);
+
+    if (addr && ixv && ixv->start < addr && (!need_end || ixv->end <= addr) &&
+        (!best || ixv->start > best->start))
+      best = ixv;
+  }
+  return best;
+}
+
+/* Where a walk for [addr, ...) can begin: a mapping on this task's list that
+ * ends at or below addr, or NULL for the head. Caller is a counted walker or
+ * holds the address-space mutex. */
+struct vm_area *vma_walk_start(struct task *t, u64 addr) {
+  struct vm_area *v;
+
+  if (!t)
+    return 0;
+  /* Counted while the index array is read: a replaced array is freed only
+   * when no walker is inside. The mapping returned is kept alive by the
+   * caller's address-space mutex, as a list walk always was. */
+  __atomic_add_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
+  v = vma_known_before(t, addr, 1);
+  __atomic_sub_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
+  return v;
 }
 
 void vma_cache_forget(struct task *t) {
-  if (t)
-    g_vma_cache[task_index(t)] = 0;
+  if (!t)
+    return;
+  for (unsigned w = 0; w < VMA_CACHE_WAYS; w++)
+    g_vma_cache[task_index(t)][w] = 0;
+  g_vma_free_hint[task_index(t)] = 0;
 }
 
 /* What every thread of this address space believes the mapping list to be.
@@ -9615,7 +10065,19 @@ void vma_report_space(u64 start, u64 end) {
   }
 }
 
+static u64 vm_find_free_area_walk(struct task *t, usize length, int no_hint);
+
+/* A counted walker for the whole search: the hint and the list it follows are
+ * read without the list lock, and a mapping unlinked meanwhile is only freed
+ * once no walker is inside. */
 u64 vm_find_free_area(struct task *t, usize length) {
+  __atomic_add_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
+  u64 r = vm_find_free_area_walk(t, length, 0);
+  __atomic_sub_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
+  return r;
+}
+
+static u64 vm_find_free_area_walk(struct task *t, usize length, int no_hint) {
 #if defined(__aarch64__)
   /* AArch64 keeps the whole kernel half — RAM identity map and device windows
    * — in L0[0], and that top-level entry is SHARED by pointer with every
@@ -9654,6 +10116,48 @@ u64 vm_find_free_area(struct task *t, usize length) {
    */
   u64 candidate = start;
   u64 vflags;
+  usize slot = task_index(t);
+  u64 gen = __atomic_load_n(vma_gen_of(t->pml4_phys), __ATOMIC_ACQUIRE);
+  struct vm_area *from = t->vma_list;
+  struct vm_area *last_passed = 0;
+
+  /* Resume where the previous search for this thread ended.
+   *
+   * A desktop's processes map thousands of times, and each search walked the
+   * list from the first mapping to the end of the occupied range. Until
+   * something is unlinked from this space the mapping the last search stopped
+   * behind is still on the list, and every gap below it was already too small
+   * for what was being placed then or has been filled since -- so the search
+   * starts after it. The first unlink bumps the generation, and the next
+   * search starts from the bottom again and finds whatever was freed. A gap
+   * below the hint that a smaller request could still use is skipped until
+   * then; address space is the cheap resource here. */
+  struct vma_index *fix = vma_idx_of(t->pml4_phys);
+  int used_hint = 0;
+
+  if (no_hint) {
+    /* the retry from the bottom */
+  } else if (fix) {
+    /* The space's own hint: it survives unmaps, which lower it to the gap they
+     * open, so the search neither restarts from the bottom after every munmap
+     * nor skips memory that was given back. */
+    u64 h = __atomic_load_n(&fix->free_hint, __ATOMIC_ACQUIRE);
+
+    if (h > start) {
+      struct vm_area *b = vma_idx_before(t->pml4_phys, h, 0);
+
+      candidate = h;
+      from = b ? b : t->vma_list;
+      used_hint = 1;
+    }
+  } else if (g_vma_free_hint[slot] && g_vma_free_hint_gen[slot] == gen &&
+             g_vma_free_hint_pml4[slot] == t->pml4_phys &&
+             g_vma_free_hint[slot]->end >= start) {
+    from = g_vma_free_hint[slot]->next;
+    candidate = g_vma_free_hint[slot]->end;
+    last_passed = g_vma_free_hint[slot];
+    used_hint = 1;
+  }
 
   /* Under the list lock: this walk is the one that hung when the list was a
    * ring, and it must not run while another thread is relinking it. */
@@ -9666,20 +10170,29 @@ u64 vm_find_free_area(struct task *t, usize length) {
    * of hanging the caller in the kernel where nothing can kill it. No process
    * legitimately holds anywhere near this many mappings. */
   unsigned steps = 0;
-  for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
+  for (struct vm_area *vma = from; vma; vma = vma->next) {
     if (++steps > 1000000u) {
       console_write("vma: walk did not terminate — list is circular, pid ");
       console_write_dec(t->id);
       console_write("\n");
       return (u64)-1;
     }
-    if (vma->end <= candidate)
+    if (vma->end <= candidate) {
+      last_passed = vma;
       continue; /* entirely below the candidate */
+    }
     if (vma->start >= candidate + length)
       break;    /* the gap before this mapping is big enough */
     candidate = vma->end;
-    if (candidate + length > end || candidate + length < candidate)
+    last_passed = vma;
+    if (candidate + length > end || candidate + length < candidate) {
+      if (used_hint) {
+        /* Nothing above the hint: the gaps below it are still there. */
+        g_vma_free_hint[slot] = 0;
+        return vm_find_free_area_walk(t, length, 1);
+      }
       return (u64)-1;
+    }
   }
 
   /* The break is an obstacle too, and the VMA walk above cannot see it.
@@ -9718,13 +10231,27 @@ u64 vm_find_free_area(struct task *t, usize length) {
       }
     }
   }
-  if (candidate + length > end || candidate + length < candidate)
+  if (candidate + length > end || candidate + length < candidate) {
+    if (used_hint) {
+      g_vma_free_hint[slot] = 0;
+      return vm_find_free_area_walk(t, length, 1);
+    }
     return (u64)-1;
+  }
+  if (fix && !(t->heap_start && candidate >= t->heap_start))
+    __atomic_store_n(&fix->free_hint, candidate, __ATOMIC_RELEASE);
+  /* Only a hint that ended the unconstrained walk: the break reservation
+   * above can move the candidate past mappings the hint did not see. */
+  if (last_passed && last_passed->end <= candidate &&
+      !(t->heap_start && candidate >= t->heap_start)) {
+    g_vma_free_hint[slot] = last_passed;
+    g_vma_free_hint_gen[slot] = gen;
+    g_vma_free_hint_pml4[slot] = t->pml4_phys;
+  }
   return candidate;
 }
 
 struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr) {
-  (void)t;
   struct vm_area *new_vma = kzalloc(sizeof(struct vm_area));
   if (!new_vma)
     return 0;
@@ -9751,6 +10278,7 @@ struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr) {
   vma_list_lock(&svflags);
   new_vma->next = vma->next;
   __atomic_store_n(&vma->next, new_vma, __ATOMIC_RELEASE);
+  vma_idx_insert_locked(t, new_vma);
   vma_list_unlock(svflags);
 
   return new_vma;
@@ -9758,9 +10286,21 @@ struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr) {
 
 void vma_delete_range(struct task *task, u64 start, u64 end) {
   struct vm_area **curr = &task->vma_list;
+  /* From the last cached mapping wholly below the range, not the head. */
+  {
+    struct vm_area *before;
+
+    __atomic_add_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
+    before = vma_known_before(task, start, 1);
+    if (before)
+      curr = &before->next;
+    __atomic_sub_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
+  }
   while (*curr) {
     struct vm_area *vma = *curr;
-    if (vma->start >= end || vma->end <= start) {
+    if (vma->start >= end)
+      break; /* in address order: nothing further along overlaps */
+    if (vma->end <= start) {
       curr = &vma->next;
       continue;
     }
@@ -9784,13 +10324,17 @@ void vma_delete_range(struct task *task, u64 start, u64 end) {
       u64 dvflags;
       vma_list_lock(&dvflags);
       __atomic_store_n(curr, vma->next, __ATOMIC_RELEASE);
+      vma_idx_remove_locked(task->pml4_phys, vma);
+      /* Inside the lock: an insertion that starts from a cached mapping
+       * checks the generation under this lock, and must never see this
+       * unlink done with the old generation still current. */
+      vma_cache_invalidate_space(task->pml4_phys);
       vma_list_unlock(dvflags);
     }
     /* Every task's lookup cache may be pointing at what is about to be freed,
      * not just this one's: the list belongs to the address space, and its
      * threads each cache out of it. */
     vma_cache_forget(task);
-    vma_cache_invalidate_all();
     if (vma->node) {
       if (vma->node->inode && vma->node->inode->mmap_close_cb)
         vma->node->inode->mmap_close_cb(vma->node);
@@ -10427,9 +10971,71 @@ static void reaper_thread(void *arg) {
   }
 }
 
+/* b1nix.cputop: every half second, the tasks that used the most CPU since the
+ * last report, user/system in ms. What a start-up that looks idle from the
+ * machine-wide counters is actually doing, per process, without a tool in the
+ * guest to ask. */
+static u64 g_cputop_prev[TASK_SLOTS];
+static u64 g_cputop_prev_sys[TASK_SLOTS];
+static usize g_cputop_prev_id[TASK_SLOTS];
+
+static void cputop_thread(void *arg) {
+  (void)arg;
+  for (;;) {
+    scheduler_sleep_ticks(SCHED_MS_TO_TICKS(500));
+    struct { usize i; u64 d; u64 ds; } top[6];
+    int ntop = 0;
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *t = T(i);
+      if (t->state == TASK_UNUSED)
+        continue;
+      u64 now = g_task_utime_ns[i] + g_task_stime_ns[i];
+      int same = g_cputop_prev_id[i] == t->id;
+      u64 prev = same ? g_cputop_prev[i] : now;
+      u64 prev_s = same ? g_cputop_prev_sys[i] : g_task_stime_ns[i];
+      u64 d = now > prev ? now - prev : 0;
+      u64 ds = g_task_stime_ns[i] > prev_s ? g_task_stime_ns[i] - prev_s : 0;
+      g_cputop_prev[i] = now;
+      g_cputop_prev_sys[i] = g_task_stime_ns[i];
+      g_cputop_prev_id[i] = t->id;
+      if (d < 5000000ull)
+        continue;
+      int k = ntop < 6 ? ntop++ : 5;
+      if (k == 5 && ntop == 6 && d <= top[5].d)
+        continue;
+      top[k].i = i;
+      top[k].d = d;
+      top[k].ds = ds;
+      for (; k > 0 && top[k].d > top[k - 1].d; k--) {
+        __typeof__(top[0]) x = top[k];
+        top[k] = top[k - 1];
+        top[k - 1] = x;
+      }
+    }
+    char line[256];
+    usize n = 0;
+    n += (usize)snprintf(line + n, sizeof(line) - n, "cputop:");
+    for (int k = 0; k < ntop && n < sizeof(line) - 1; k++) {
+      struct task *t = T(top[k].i);
+      const char *nm = t->name ? t->name : "?";
+      const char *base = nm;
+      for (const char *c = nm; *c; c++)
+        if (*c == '/')
+          base = c + 1;
+      n += (usize)snprintf(line + n, sizeof(line) - n, " %s/%lu=%lu(s%lu)", base,
+                           (unsigned long)t->id,
+                           (unsigned long)(top[k].d / 1000000),
+                           (unsigned long)(top[k].ds / 1000000));
+    }
+    kprintf(LOGLEVEL_WARNING, NULL, "%s", line);
+  }
+}
+
 void scheduler_start_reaper(void) {
   if (kthread_create("reaper", reaper_thread, 0) >= 0)
     g_reaper_started = 1;
+  if (bootinfo_has_flag("b1nix.cputop"))
+    kthread_create("cputop", cputop_thread, 0);
 }
 
 /* The AP half of the preemptive tick, for ticks that interrupted ring 3. */
