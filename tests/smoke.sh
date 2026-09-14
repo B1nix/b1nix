@@ -7,6 +7,13 @@ set -e
 
 ARCH="${1:-x86_64}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# The root image the lanes boot. A package group builds its own
+# (`make B1NIX_GPU_DRV=1` packs root-gpudrv.img); pointing the suite at root.img
+# regardless ran the accelerated check on an image with no DRI driver in it.
+if [ -z "${SMOKE_ROOT_IMG:-}" ]; then
+	SMOKE_ROOT_IMG="$PROJECT_DIR/build/$ARCH/root.img"
+	[ "${B1NIX_GPU_DRV:-0}" = "1" ] && SMOKE_ROOT_IMG="$PROJECT_DIR/build/$ARCH/root-gpudrv.img"
+fi
 
 OS="$(uname -s)"
 # SMOKE_JOBS caps the build parallelism. A machine shared with another build
@@ -452,8 +459,8 @@ run_qemu() {
 			if [ -z "${SMOKE_ROOT_MODULE:-}" ] &&
 			   [ "${B1NIX_ISO_NAME:-}" != "b1nix-blk.iso" ] &&
 			   [ "${B1NIX_ISO_NAME:-}" != "b1nix-switchroot.iso" ] &&
-			   [ -f "$PROJECT_DIR/build/$ARCH/root.img" ]; then
-				set -- "$@" -drive file="$PROJECT_DIR/build/$ARCH/root.img",format=raw,if=virtio,snapshot=on
+			   [ -f "$SMOKE_ROOT_IMG" ]; then
+				set -- "$@" -drive file="$SMOKE_ROOT_IMG",format=raw,if=virtio,snapshot=on
 			fi
 		else
 			set -- ${qemu_bin} ${machine_args} ${accel_args} ${mem_args} ${cpu_args} \
@@ -900,7 +907,7 @@ _mkimg() {  # mkimg <instance-suffix>
         dd if=/dev/zero of="$_usb" bs=1M count=2 2>/dev/null
         dd if=/dev/zero of="$(disk_img vblk "$1")" bs=1M count=4 2>/dev/null
         rm -f "$_sata"
-        if [ -f "$PROJECT_DIR/build/$ARCH/root.img" ]; then
+        if [ -f "$SMOKE_ROOT_IMG" ]; then
             # Clone, do not copy. Every lane gets its own writable root, and
             # that root is half a gigabyte -- ten lanes meant five gigabytes
             # moved before a single instance booted, which is most of the gap
@@ -908,8 +915,8 @@ _mkimg() {  # mkimg <instance-suffix>
             # on btrfs/xfs) can give each lane a copy-on-write clone instead,
             # which costs nothing until something writes. `cp -c` fails on a
             # filesystem that cannot do it, so fall back to the real copy.
-            cp -c "$PROJECT_DIR/build/$ARCH/root.img" "$_sata" 2>/dev/null ||
-                cp -f "$PROJECT_DIR/build/$ARCH/root.img" "$_sata"
+            cp -c "$SMOKE_ROOT_IMG" "$_sata" 2>/dev/null ||
+                cp -f "$SMOKE_ROOT_IMG" "$_sata"
             # Stamp it with THIS run's time. A clone carries the source's
             # mtime, and the prune below deletes anything in smoke_run older
             # than an hour -- so once the build stopped rebuilding root.img

@@ -57,6 +57,6 @@ accelerated path on a host GPU through virglrenderer:
 
 ```sh
 make B1NIX_GPU_DRV=1 iso-gfx
-SKIP_BUILD=1 SMOKE_INSTANCES=gfx GPU_DEVICE=virtio-gpu-gl-pci \
+B1NIX_GPU_DRV=1 SKIP_BUILD=1 SMOKE_INSTANCES=gfx GPU_DEVICE=virtio-gpu-gl-pci \
     GPU_DISPLAY=egl-headless sh tests/smoke.sh x86_64
 ```

@@ -126,6 +126,7 @@ belongs to the milestone that owns the mechanism. See
 | M100b IOMMU (VT-d) | done | DMAR, second-level tables, NVMe domain, fault blocking. |
 | M100c IOMMU domains/IR | done | Per-device domains, ACS/ARI grouping, interrupt remapping. |
 | M100d AMD-Vi | done | IVRS, device table, command ring, NVMe in translated domain. |
+| M101 linuxkpi for DRM | done | Upstream DRM core unmodified; atomic commits, `/dev/dri/card1`, master lease; virgl GLES on the host GPU draws a composed frame (`RENDER-SMOKE: ok accel-frame`, see [render-path.md](render-path.md)). |
 | M104 Alpine packages | done | From-source ports replaced by pinned Alpine packages; `bpkg` retired. |
 | M105 PAM | done | OpenPAM + `pam_unix.so`; dropbear authenticates through PAM. |
 | M106 DNS resolver | done | Outbound name resolution, `/dev/fd`, `/proc/self/fd/N`, 64 KiB pipes. |
@@ -141,14 +142,6 @@ belongs to the milestone that owns the mechanism. See
 | M118 Arch Linux userspace | cancelled | Duplicated the Debian lane (M121); the kernel faults it found stay fixed. |
 | M119 Ask the processor instead of guessing | done | Real CPU name, `RNDR`, PARange, TSC from CPUID, cpuinfo flags/Features. |
 | M120 Linux's own filesystems, through linuxkpi | done | btrfs, ext4 and jbd2 from Linux 6.6 unpatched; btrfs root on both arches, ext2/3/4 are the imported ext4, native ext drivers removed. See [linuxkpi-fs.md](linuxkpi-fs.md). |
-
-## M101: linuxkpi for DRM — run upstream drivers unmodified
-
-Vendor drivers are imported verbatim; every fix goes into our shim.
-
-- [x] Upstream Linux 6.6 `drivers/gpu/drm` core (41 objects) builds unmodified on our primitives (kref, ww_mutex, xarray, RCU, kobject…).
-- [x] In-kernel client proves atomic commits by reading scanout pixels; `/dev/dri/card1` served to ring 3, DRM master lease works.
-- [ ] `partial` Hardware rendering as a second path (software stays first-class, chosen by `render-select.sh`): accelerated frame not yet produced — the node serves no `DRM_IOCTL_VIRTGPU_*`. See [render-path.md](render-path.md).
 
 ## M102a: Intel i915 (Gen8/Gen9.5) + Mesa iris
 
