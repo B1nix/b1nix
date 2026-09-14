@@ -47,11 +47,16 @@ case "${ROOT_FS:-btrfs}" in
 btrfs)
 	command -v mkfs.btrfs >/dev/null 2>&1 || { echo "mk-root-image: mkfs.btrfs not found (btrfs-progs)" >&2; exit 1; }
 	# Single profiles: DUP metadata would make mkfs grow the file past SIZE_MB.
+	# ROOT_BTRFS_COMPRESS=zstd packs the tree compressed (the imported btrfs
+	# reads zstd) and ROOT_BTRFS_SHRINK=1 drops the free space: a root loaded
+	# whole into RAM by the boot loader has to fit below 4 GiB on small machines.
 	unshare -r mkfs.btrfs -q -f -L b1nix-root -m single -d single \
+		${ROOT_BTRFS_COMPRESS:+--compress "$ROOT_BTRFS_COMPRESS"} \
+		${ROOT_BTRFS_SHRINK:+--shrink} \
 		--rootdir "$ROOTFS" "$TMP"
 	;;
 ext4)
-	# Features the native ext4 driver reads; ext4-lkpi reads these too.
+	# A conservative feature set, readable by older tools too.
 	unshare -r mke2fs -q -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file \
 		-L b1nix-root -d "$ROOTFS" "$TMP"
 	;;

@@ -117,6 +117,20 @@ int netconsole_flush(void)
 static void netconsole_thread(void *arg)
 {
 	(void)arg;
+	/* Nothing leaves before the interface has an address. Draining earlier
+	 * consumed the ring into datagrams the stack could only drop, so a bare
+	 * metal boot shipped nothing from before DHCP -- which is all of it that
+	 * matters. Then give ARP a moment: the first datagram to the collector
+	 * starts the resolution, and a burst behind it would be dropped too. */
+	for (;;) {
+		struct ipv4_addr ip = net_get_ip();
+
+		if (ip.bytes[0] | ip.bytes[1] | ip.bytes[2] | ip.bytes[3])
+			break;
+		scheduler_sleep_ticks(SCHED_MS_TO_TICKS(100));
+	}
+	udp_send(netcon_dst, NETCON_SRC_PORT, netcon_dst_port, "\n", 1);
+	scheduler_sleep_ticks(SCHED_MS_TO_TICKS(1000));
 	for (;;) {
 		netconsole_flush();
 		/* 20 ms cadence: fast enough that a bare-metal boot log arrives while

@@ -10,7 +10,7 @@
 #define KLOG_ERROR 3
 #define KLOG_PANIC 4
 
-#define KLOG_BUF_SIZE 65536
+#define KLOG_BUF_SIZE (1024 * 1024) /* a bare-metal boot ships its whole log over netconsole */
 
 /* Core logging functions */
 void klog_debug(const char *msg);

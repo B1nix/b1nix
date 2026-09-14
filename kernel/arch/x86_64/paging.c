@@ -52,7 +52,11 @@ static inline void vmm_read_release(u64 flags) {
 /* DIRECT_MAP_SIZE is shared with the pmm via <b1nix/mm.h> (the pmm clamps
  * usable RAM to it so no frame is ever allocated outside the direct map). */
 #define MMIO_MAP_BASE 0xffffa00000000000ULL
-#define MMIO_MAP_SIZE (512ULL * 1024ULL * 1024ULL)
+/* A GPU's mappable aperture alone can be a gigabyte (a laptop's firmware set
+ * one up that exhausted a 512 MiB window during i915's GGTT init), and a
+ * discrete card's BARs are larger still. The DRM vmap area starts a terabyte
+ * above the base, so 64 GiB costs nothing but address space. */
+#define MMIO_MAP_SIZE (64ULL * 1024ULL * 1024ULL * 1024ULL)
 
 static u64 *kernel_pml4_virt;
 static u64 kernel_pml4_phys;

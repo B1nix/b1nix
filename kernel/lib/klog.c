@@ -15,7 +15,7 @@
 
 
 
-/* Kernel log ring buffer — KLOG_BUF_SIZE comes from <b1nix/klog.h> (64 KiB) so
+/* Kernel log ring buffer — KLOG_BUF_SIZE comes from <b1nix/klog.h> (1 MiB) so
  * the whole boot (PCI/driver/dhcp output, fed in via klog_putc from
  * console_putc) survives until the shell, where `dmesg` can read it back. */
 

@@ -151,7 +151,7 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 - [x] GT runs (execlists, GGTT/PPGTT, completion IRQs); `EXECBUFFER2` served; `gl_probe` renders with Mesa iris.
 - [x] sway on gles2/iris submits: the `-ENOSPC` from `eb_reserve` was a dma-buf `lseek(SEEK_END)` answering 0, so iris softpinned an 8 MiB imported BO over its neighbours.
 - [x] sway on gles2/iris reaches the panel and screenshots (legacy and q35 machines): a `MAX_SCHEDULE_TIMEOUT` wait wrapped and made the first modeset return `-ETIME`.
-- [ ] `planned` Bare metal on Gen8 laptop with netconsole logs.
+- [x] Bare metal on a ThinkPad T480 (UHD 620): sway on iris on the panel, boot log over netconsole, booted over PXE (`tools/run/pxe-serve.sh`). Fixed on the way: a 512 MiB MMIO window, the console drawing into the GPU aperture, netconsole dropping the pre-DHCP log.
 
 ## M102b: amdgpu on RX 6600 (render-only) + radeonsi
 
@@ -194,5 +194,6 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 - [x] Wall clock no longer runs backwards: NTP slewed by stepping whole seconds; now one monotonic-based wall clock on both arches, NTP offset in ns, slew at <=500 ppm.
 - [x] `telinit` and the fake M39 inittab markers removed (M39 keeps its real serial-tty checks).
 - [x] The IOMMU instances end with `reboot -f`; the check passes only when QEMU (-no-reboot) then exits on its own.
+- [ ] `open` The imported btrfs reads zstd-compressed files as zeros (a root packed with `ROOT_BTRFS_COMPRESS=zstd` cannot start init); fixing it would halve a PXE/live root module.
 - [ ] `planned` Move the tests to the Linux ABI, then remove the native b1nix syscall ABI.
 - [ ] `planned` Debian lane to full parity as the glibc ABI check (needs the post-`mount(2)` API); the Arch lane was dropped.

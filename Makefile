@@ -2880,7 +2880,7 @@ endif
 	done 2>/dev/null || true
 	@# Repacked, and stamped with the ownership every file in it must have,
 	@# only when the staged tree actually changed. See the script.
-	@ROOT_IMAGE_FORCE='$(ROOT_IMAGE_FORCE)' ROOT_FS='$(ROOT_FS)' \
+	@ROOT_IMAGE_FORCE='$(ROOT_IMAGE_FORCE)' ROOT_FS='$(ROOT_FS)' ROOT_BTRFS_COMPRESS='$(ROOT_BTRFS_COMPRESS)' ROOT_BTRFS_SHRINK='$(ROOT_BTRFS_SHRINK)' \
 		sh tools/images/mk-root-image.sh $(BUILD_DIR)/rootfs $(ROOT_IMAGE) $(ROOT_IMAGE_SIZE)
 
 # Everything in the rootfs links dynamically against /lib/libc.so. This gate

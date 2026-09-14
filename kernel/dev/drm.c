@@ -42,7 +42,7 @@
 /* Kernel virtual window used to give each scatter-gather object a linear view.
  * One DRM_MAP_STRIDE slot per object, so slot i is always at the same address
  * and no VA allocator is needed. Placed above the MMIO window (which starts at
- * 0xffffa000_00000000 and is 512 MiB long) with a terabyte of clearance. */
+ * 0xffffa000_00000000 and is 64 GiB long) with a terabyte of clearance. */
 /* aarch64 shares the kernel half as the single top-level entry L0[0], which
  * spans 0..512 GiB — an x86-shaped address up at 0xffffa1xx would be private
  * to whichever address space created it, which is exactly what this window

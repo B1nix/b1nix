@@ -38,6 +38,11 @@ fi
 # its parts instead of guessed at.
 up() { cut -d" " -f1 /proc/uptime 2>/dev/null || echo "?"; }
 echo "I915-SWAY: start t=$(up)"
+# A live boot's root is packed to its contents (ROOT_BTRFS_SHRINK) and has no
+# room for the compositor's logs and sockets: give /tmp its own memory.
+if ! grep -q " /tmp " /proc/mounts 2>/dev/null; then
+	mount -t tmpfs -o mode=1777 tmpfs /tmp && echo "I915-SWAY: /tmp on tmpfs"
+fi
 
 # A heap-churn check, when asked for one, instead of the compositor: the same
 # shape of work with none of the graphics, so a run costs seconds.

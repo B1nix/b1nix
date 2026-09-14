@@ -811,7 +811,13 @@ int drm_console_attach(struct drm_device *dev)
 		return 0;
 	if (g_bootloader_fb < 0)
 		g_bootloader_fb = fb_console_ready() ? 1 : 0;
-	if (g_bootloader_fb) {
+	/* The bootloader's framebuffer is only the console's to keep beside an
+	 * emulated card. On real hardware it lies inside the GPU aperture, and
+	 * once the driver rebuilds the GTT those addresses belong to its own
+	 * buffers: a ThinkPad's boot log kept drawing into sway's, which showed
+	 * as garbage and half-black frames on the panel. The console moves onto
+	 * a buffer the driver owns, as Linux retires efifb. */
+	if (g_bootloader_fb && is_virtual(dev)) {
 		drm_info(dev, "console: the bootloader framebuffer keeps the console\n");
 		return 0;
 	}
@@ -839,6 +845,7 @@ int drm_console_attach(struct drm_device *dev)
 	fb_console_attach(g_slot[next].map.vaddr, g_slot[next].buf->fb->pitches[0],
 	                  g_slot[next].width, g_slot[next].height, 32,
 	                  console_present);
+	fb_console_set_hidden(0); /* hidden at probe; see pci_register_driver */
 	g_cur = next; /* the old slot stays registered and idle: restore does
 	               * nothing for a slot the console has left */
 	return 0;

@@ -1248,6 +1248,8 @@ static struct pci_dev *lkpi_pci_publish(u8 bus, u8 slot, u8 func);
  * tears down everything it built during module init, and "no device of yours is
  * present" is not a registration failure.
  */
+extern void fb_console_set_hidden(int hidden);
+
 int pci_register_driver(struct pci_driver *drv)
 {
 	u32 bus, slot, func;
@@ -1289,8 +1291,18 @@ int pci_register_driver(struct pci_driver *drv)
 				device_initialize(&pdev->dev);
 				dev_set_name(&pdev->dev, "%04x:%02x:%02x.%u",
 				             0, bus, slot, func);
-				if (drv->probe(pdev, id) != 0)
+				/* A display driver rebuilds the GTT the bootloader's
+				 * framebuffer lives in, so the text console stops drawing
+				 * there before probe; drm_console shows it again on a
+				 * buffer the driver owns. A failed probe hands it back. */
+				int is_display = (probe_key.class >> 16) == 0x03;
+				if (is_display)
+					fb_console_set_hidden(1);
+				if (drv->probe(pdev, id) != 0) {
 					pdev->dev.driver = 0;
+					if (is_display)
+						fb_console_set_hidden(0);
+				}
 			}
 		}
 	}
