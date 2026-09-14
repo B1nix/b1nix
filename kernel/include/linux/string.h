@@ -14,7 +14,7 @@ static inline char *strim(char *s) { return s; }
  * the source fills it exactly, and callers then read past the end.
  * Returns the length copied, or -E2BIG on truncation.
  */
-static inline isize strscpy(char *dst, const char *src, usize size)
+static inline isize sized_strscpy(char *dst, const char *src, usize size)
 {
 	if (size == 0)
 		return -7 /* -E2BIG */;
@@ -29,9 +29,9 @@ static inline isize strscpy(char *dst, const char *src, usize size)
 
 /* As above, then zero-fills the rest of the buffer — for a field that is
  * compared or hashed whole. */
-static inline isize strscpy_pad(char *dst, const char *src, usize size)
+static inline isize sized_strscpy_pad(char *dst, const char *src, usize size)
 {
-	isize r = strscpy(dst, src, size);
+	isize r = sized_strscpy(dst, src, size);
 	usize len = (r < 0) ? size - 1 : (usize)r;
 	for (usize i = len; i < size; i++)
 		dst[i] = 0;
@@ -137,12 +137,25 @@ size_t strspn(const char *s, const char *accept);
 char *strpbrk(const char *cs, const char *ct);
 char *strsep(char **s, const char *ct);
 char *strim(char *s);
+/*
+ * Upstream's calling forms (6.9+): strscpy(dst, src) sizes the destination
+ * from its array type; strscpy(dst, src, size) is the explicit form.
+ */
+#include <linux/args.h>
+#define __strscpy0(dst, src, ...) sized_strscpy(dst, src, sizeof(dst))
+#define __strscpy1(dst, src, size) sized_strscpy(dst, src, size)
+#define strscpy(dst, src, ...) \
+	CONCATENATE(__strscpy, COUNT_ARGS(__VA_ARGS__))(dst, src, __VA_ARGS__)
+#define __strscpy_pad0(dst, src, ...) sized_strscpy_pad(dst, src, sizeof(dst))
+#define __strscpy_pad1(dst, src, size) sized_strscpy_pad(dst, src, size)
+#define strscpy_pad(dst, src, ...) \
+	CONCATENATE(__strscpy_pad, COUNT_ARGS(__VA_ARGS__))(dst, src, __VA_ARGS__)
+
 char *strreplace(char *str, char old, char new);
 /* Copy with truncation, returning the length of the SOURCE — so a caller can
  * tell that truncation happened. strscpy returns the copied length or -E2BIG,
  * which is the interface to prefer for exactly that reason. */
 size_t strlcpy(char *dest, const char *src, size_t size);
-ssize_t strscpy(char *dest, const char *src, size_t count);
 void *kmemdup(const void *src, size_t len, gfp_t gfp);
 char *kstrdup(const char *s, gfp_t gfp);
 char *kstrndup(const char *s, size_t max, gfp_t gfp);
@@ -166,5 +179,55 @@ char *kmemdup_nul(const char *s, size_t len, gfp_t gfp);
 #define memset_after(obj, v, member)                                          \
 	memset((char *)(obj) + offsetofend(__typeof__(*(obj)), member), (v),      \
 	       sizeof(*(obj)) - offsetofend(__typeof__(*(obj)), member))
+
+/* The first byte equal to `c` in the n bytes at `s`, or NULL. */
+static inline void *memchr(const void *s, int c, usize n)
+{
+	const unsigned char *p = s;
+
+	for (; n; n--, p++)
+		if (*p == (unsigned char)c)
+			return (void *)p;
+	return NULL;
+}
+
+/*
+ * Copy a NUL-terminated string into a fixed, non-terminated byte array and pad
+ * the rest (strtomem_pad), and the reverse: a non-terminated array into a
+ * terminated string, zero-filled (memtostr_pad). Both size the destination
+ * from its array type, so they only take arrays.
+ */
+#define strtomem_pad(dest, src, pad) do {                                   \
+	const usize __dlen = sizeof(dest);                                  \
+	const usize __slen = strnlen(src, __dlen);                          \
+	memcpy(dest, src, __slen);                                          \
+	memset((char *)(dest) + __slen, pad, __dlen - __slen);              \
+} while (0)
+#define memtostr_pad(dest, src) do {                                        \
+	const usize __dlen = sizeof(dest);                                  \
+	const usize __slen = strnlen(src, sizeof(src));                     \
+	const usize __n = __slen < __dlen - 1 ? __slen : __dlen - 1;        \
+	memcpy(dest, src, __n);                                             \
+	memset((char *)(dest) + __n, 0, __dlen - __n);                      \
+} while (0)
+
+/* Index of `str` in a NULL-terminated or fixed-size array of names compared
+ * sysfs-style (a trailing newline ignored), or -EINVAL. */
+int __sysfs_match_string(const char * const *array, size_t n, const char *str);
+#define sysfs_match_string(_a, _s) __sysfs_match_string(_a, ARRAY_SIZE(_a), _s)
+
+/* Are all n bytes zero? */
+static inline bool mem_is_zero(const void *s, usize n)
+{ return n == 0 || (!((const unsigned char *)s)[0] && !memchr_inv(s, 0, n)); }
+
+/* Like strchr, but a missing character yields the terminator, not NULL. */
+static inline char *strchrnul(const char *s, int c)
+{
+	while (*s && *s != (char)c)
+		s++;
+	return (char *)s;
+}
+
+void *kmemdup_array(const void *src, size_t count, size_t element_size, gfp_t gfp);
 
 #endif

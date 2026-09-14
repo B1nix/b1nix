@@ -34,6 +34,8 @@
 /* A hint that this mapping would benefit from huge pages. There are none for
  * file mappings here, so it is recorded and not acted on. */
 #define VM_HUGEPAGE  0x20000
+/* MAP_SYNC: writes through the mapping are durable when the fault returns. */
+#define VM_SYNC      0x00800000
 /* Bytes read from the file are stable while mapped — what MAP_SYNC promises for
  * a DAX mapping. Declared so a filesystem can advertise it; nothing here can
  * satisfy it, and `mmap_supported_flags` is how the VFS refuses it. */
@@ -272,6 +274,9 @@ FOLIOFLAG(active, active)
 FOLIOFLAG(swapbacked, swapbacked)
 FOLIOFLAG(unevictable, unevictable)
 FOLIOFLAG(private_2, private_2)
+FOLIOFLAG(owner_2, owner_2)
+FOLIOFLAG(readahead, readahead)
+FOLIOFLAG(dropbehind, dropbehind)
 
 /* Where in its file a page sits, and how big it is. `folio_pos` is in BYTES and
  * `folio_index` in pages; the two differ by PAGE_SHIFT and mixing them up puts
@@ -284,7 +289,8 @@ static inline size_t folio_size(struct folio *folio)
 { (void)folio; return PAGE_SIZE; }
 static inline struct address_space *folio_mapping(struct folio *folio)
 { return folio->mapping; }
-static inline struct inode *folio_inode(struct folio *folio);
+/* A macro: struct address_space is not complete in this header. */
+#define folio_inode(folio) ((folio)->mapping->host)
 static inline unsigned long page_index(struct page *page)
 { return page->index; }
 static inline loff_t page_offset(struct page *page)
@@ -391,6 +397,7 @@ static inline void *folio_address(struct folio *f) { return page_address(folio_p
 
 struct folio_batch {
 	unsigned char nr;
+	unsigned char i;            /* next entry folio_batch_next() returns */
 	bool percpu_pvec_drained;
 	struct folio *folios[PAGEVEC_SIZE];
 };
@@ -398,7 +405,15 @@ struct folio_batch {
 static inline void folio_batch_init(struct folio_batch *fb)
 {
 	fb->nr = 0;
+	fb->i = 0;
 	fb->percpu_pvec_drained = false;
+}
+
+static inline struct folio *folio_batch_next(struct folio_batch *fb)
+{
+	if (fb->i == fb->nr)
+		return NULL;
+	return fb->folios[fb->i++];
 }
 
 /* Returns the room left, so a caller can stop before the next add fails. */
@@ -756,5 +771,34 @@ static inline void ClearPageReadahead(struct page *p)
 #define VM_BUG_ON_FOLIO(cond, folio) BUG_ON(cond)
 #define VM_WARN_ON_ONCE_FOLIO(cond, folio) WARN_ON(cond)
 #define VM_WARN_ON_FOLIO(cond, folio)      WARN_ON(cond)
+
+/* A folio is always one page here (see folio_nr_pages). */
+static inline unsigned int folio_order(const struct folio *folio)
+{ (void)folio; return 0; }
+static inline unsigned int folio_shift(const struct folio *folio)
+{ return PAGE_SHIFT + folio_order(folio); }
+static inline int page_ref_count(const struct page *page)
+{ return page->count; }
+static inline int folio_ref_count(const struct folio *folio)
+{ return folio->count; }
+/* All of RAM is in the direct map: nothing is highmem, and a kmap of part of
+ * a folio is never a partial mapping. */
+static inline bool folio_test_highmem(const struct folio *folio)
+{ (void)folio; return false; }
+static inline bool folio_test_partial_kmap(const struct folio *folio)
+{ (void)folio; return false; }
+
+static inline struct page *phys_to_page(phys_addr_t pa)
+{ return pfn_to_page((unsigned long)(pa >> PAGE_SHIFT)); }
+
+/* Fill the NULL slots of `page_array` with fresh pages; returns how many
+ * slots are now filled. The 6.14 name for alloc_pages_bulk_array. */
+#define alloc_pages_bulk(gfp, nr_pages, page_array) \
+	alloc_pages_bulk_array((gfp), (nr_pages), (page_array))
+
+/* The direct-map address of a physical address; all of RAM is mapped. */
+static inline void *phys_to_virt(phys_addr_t pa)
+{ return (char *)page_address(phys_to_page(pa)) + (pa & ~PAGE_MASK); }
+
 
 #endif

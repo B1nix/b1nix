@@ -16,7 +16,7 @@
  * `fsx_*` is the XFS extension. btrfs answers it; the fields have to exist.
  */
 
-struct fileattr {
+struct file_kattr {
 	u32 flags;
 	u32 fsx_xflags;
 	u32 fsx_extsize;
@@ -27,18 +27,18 @@ struct fileattr {
 	bool fsx_valid : 1;
 };
 
-void fileattr_fill_xflags(struct fileattr *fa, u32 xflags);
-void fileattr_fill_flags(struct fileattr *fa, u32 flags);
+void fileattr_fill_xflags(struct file_kattr *fa, u32 xflags);
+void fileattr_fill_flags(struct file_kattr *fa, u32 flags);
 
-static inline bool fileattr_has_fsx(const struct fileattr *fa)
+static inline bool fileattr_has_fsx(const struct file_kattr *fa)
 {
 	return fa->fsx_valid &&
 	       (fa->fsx_xflags || fa->fsx_extsize != 0 || fa->fsx_projid ||
 	        fa->fsx_cowextsize != 0);
 }
 
-int vfs_fileattr_get(struct dentry *dentry, struct fileattr *fa);
+int vfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa);
 int vfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
-                     struct fileattr *fa);
+                     struct file_kattr *fa);
 
 #endif

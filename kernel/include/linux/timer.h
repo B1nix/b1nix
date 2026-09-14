@@ -53,4 +53,8 @@ int timer_delete(struct timer_list *timer);
  * what it would get anyway. */
 #define TIMER_IRQSAFE 0x00200000
 
+/* from_timer's 6.16 name. */
+#define timer_container_of(var, callback_timer, timer_fieldname) \
+	container_of(callback_timer, __typeof__(*var), timer_fieldname)
+
 #endif

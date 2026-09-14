@@ -177,6 +177,7 @@ static void hrtimer_trampoline(struct timer_list *t)
 	if (!h->function)
 		return;
 	if (h->function(h) == HRTIMER_RESTART && h->interval_ns) {
+		h->node.expires = ktime_add(h->node.expires, (ktime_t)h->interval_ns);
 		u64 ticks = (h->interval_ns + LKPI_TICK_NS - 1) / LKPI_TICK_NS;
 
 		mod_timer(&h->timer, jiffies + (ticks ? ticks : 1));
@@ -199,6 +200,8 @@ void hrtimer_start(struct hrtimer *t, ktime_t when, enum hrtimer_mode mode)
 		return;
 
 	s64 ns = ktime_to_ns(when);
+
+	t->node.expires = (mode == HRTIMER_MODE_ABS) ? when : ktime_add(ktime_get(), when);
 
 	/* An absolute deadline is turned into a delay against now; a relative one
 	 * already is. Getting this backwards arms a timer decades out, which looks
@@ -574,9 +577,23 @@ struct kmem_cache {
 	void (*ctor)(void *);
 };
 
-struct kmem_cache *kmem_cache_create(const char *name, unsigned int size,
-                                     unsigned int align, unsigned long flags,
-                                     void (*ctor)(void *))
+/*
+ * The heap aligns every block to 16 bytes. A cache asking for more — the maple
+ * tree packs a node's type into the low byte of a pointer to it, so its nodes
+ * must be 256-byte aligned — gets an over-allocation with the object placed at
+ * the next boundary inside it and the block's own address stored just below
+ * the object, where kmem_cache_free finds it.
+ */
+#define KMEM_HEAP_ALIGN 16u
+
+static bool kmem_cache_needs_align(const struct kmem_cache *c)
+{
+	return c->align > KMEM_HEAP_ALIGN;
+}
+
+struct kmem_cache *__kmem_cache_create_args(const char *name, unsigned int size,
+                                            struct kmem_cache_args *args,
+                                            unsigned long flags)
 {
 	struct kmem_cache *c = kzalloc(sizeof(*c), GFP_KERNEL);
 
@@ -585,8 +602,12 @@ struct kmem_cache *kmem_cache_create(const char *name, unsigned int size,
 		return 0;
 	c->name = name;
 	c->size = size;
-	c->align = align;
-	c->ctor = ctor;
+	c->align = args ? args->align : 0;
+	/* A power of two is what upstream requires; anything else is rounded
+	 * rather than trusted, since the mask arithmetic below depends on it. */
+	if (c->align & (c->align - 1))
+		c->align = (unsigned int)roundup_pow_of_two(c->align);
+	c->ctor = args ? args->ctor : 0;
 	return c;
 }
 
@@ -595,12 +616,26 @@ void kmem_cache_destroy(struct kmem_cache *c)
 	kfree(c);
 }
 
+static void *kmem_cache_alloc_raw(struct kmem_cache *c, gfp_t flags)
+{
+	void *base, *obj;
+
+	if (!kmem_cache_needs_align(c))
+		return kmalloc(c->size, flags);
+	base = kmalloc(c->size + c->align + sizeof(void *), flags);
+	if (!base)
+		return 0;
+	obj = (void *)ALIGN((unsigned long)base + sizeof(void *), c->align);
+	((void **)obj)[-1] = base;
+	return obj;
+}
+
 void *kmem_cache_alloc(struct kmem_cache *c, gfp_t flags)
 {
 	if (!c)
 		return 0;
 
-	void *obj = kmalloc(c->size, flags);
+	void *obj = kmem_cache_alloc_raw(c, flags);
 
 	/* The constructor runs on a freshly allocated object, as upstream's does.
 	 * A cache with a constructor and a caller that also initialises is the
@@ -612,13 +647,118 @@ void *kmem_cache_alloc(struct kmem_cache *c, gfp_t flags)
 
 void *kmem_cache_zalloc(struct kmem_cache *c, gfp_t flags)
 {
-	return c ? kzalloc(c->size, flags) : 0;
+	void *obj = c ? kmem_cache_alloc_raw(c, flags) : 0;
+
+	if (obj)
+		memset(obj, 0, c->size);
+	return obj;
 }
 
 void kmem_cache_free(struct kmem_cache *c, void *obj)
 {
-	(void)c;
+	if (!obj)
+		return;
+	if (c && kmem_cache_needs_align(c))
+		obj = ((void **)obj)[-1];
 	kfree(obj);
+}
+
+/* ── sheaves ────────────────────────────────────────────────────── */
+
+/*
+ * A sheaf is filled with `size` objects up front, so the draws from it cannot
+ * fail. Refilling tops it up to at least `size`, reallocating it when its
+ * capacity is too small; returning it frees whatever was not drawn.
+ */
+static struct slab_sheaf *sheaf_alloc(unsigned int capacity, gfp_t gfp)
+{
+	struct slab_sheaf *sheaf;
+
+	sheaf = kzalloc(struct_size(sheaf, objects, capacity), gfp);
+	if (sheaf)
+		sheaf->capacity = capacity;
+	return sheaf;
+}
+
+static int sheaf_fill(struct kmem_cache *s, gfp_t gfp, struct slab_sheaf *sheaf,
+                      unsigned int size)
+{
+	while (sheaf->size < size) {
+		void *obj = kmem_cache_alloc(s, gfp);
+
+		if (!obj)
+			return -ENOMEM;
+		sheaf->objects[sheaf->size++] = obj;
+	}
+	return 0;
+}
+
+struct slab_sheaf *kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp,
+                                            unsigned int size)
+{
+	struct slab_sheaf *sheaf = sheaf_alloc(size, gfp);
+
+	if (!sheaf)
+		return 0;
+	if (sheaf_fill(s, gfp, sheaf, size)) {
+		kmem_cache_return_sheaf(s, gfp, sheaf);
+		return 0;
+	}
+	return sheaf;
+}
+
+int kmem_cache_refill_sheaf(struct kmem_cache *s, gfp_t gfp,
+                            struct slab_sheaf **sheafp, unsigned int size)
+{
+	struct slab_sheaf *sheaf = *sheafp;
+
+	if (!sheaf) {
+		sheaf = kmem_cache_prefill_sheaf(s, gfp, size);
+		if (!sheaf)
+			return -ENOMEM;
+		*sheafp = sheaf;
+		return 0;
+	}
+	if (sheaf->capacity < size) {
+		struct slab_sheaf *bigger = sheaf_alloc(size, gfp);
+
+		if (!bigger)
+			return -ENOMEM;
+		memcpy(bigger->objects, sheaf->objects,
+		       sheaf->size * sizeof(sheaf->objects[0]));
+		bigger->size = sheaf->size;
+		kfree(sheaf);
+		sheaf = bigger;
+		*sheafp = sheaf;
+	}
+	return sheaf_fill(s, gfp, sheaf, size);
+}
+
+void kmem_cache_return_sheaf(struct kmem_cache *s, gfp_t gfp,
+                             struct slab_sheaf *sheaf)
+{
+	(void)gfp;
+	if (!sheaf)
+		return;
+	while (sheaf->size)
+		kmem_cache_free(s, sheaf->objects[--sheaf->size]);
+	kfree(sheaf);
+}
+
+void *kmem_cache_alloc_from_sheaf(struct kmem_cache *s, gfp_t gfp,
+                                  struct slab_sheaf *sheaf)
+{
+	void *obj;
+
+	(void)s;
+	if (!sheaf->size)
+		return 0;
+	obj = sheaf->objects[--sheaf->size];
+	/* The object was constructed when the sheaf was filled; a zeroing request
+	 * is honoured at draw time, as upstream's is. */
+	if (gfp & __GFP_ZERO)
+		memset(obj, 0, s->size);
+	return obj;
 }
 
 void kmem_cache_shrink(struct kmem_cache *c)
@@ -1073,6 +1213,21 @@ void lkpi_cpuinfo_init(void)
   }
 #endif
 
+  boot_cpu_data.x86_vendor = X86_VENDOR_UNKNOWN;
+#if defined(__x86_64__)
+  {
+    u32 a0 = 0, b0 = 0, c0 = 0, d0 = 0;
+
+    __asm__ volatile("cpuid"
+                     : "=a"(a0), "=b"(b0), "=c"(c0), "=d"(d0)
+                     : "a"(0u), "c"(0u));
+    /* "GenuineIntel" and "AuthenticAMD", as EBX:EDX:ECX. */
+    if (b0 == 0x756e6547u && d0 == 0x49656e69u && c0 == 0x6c65746eu)
+      boot_cpu_data.x86_vendor = X86_VENDOR_INTEL;
+    else if (b0 == 0x68747541u && d0 == 0x69746e65u && c0 == 0x444d4163u)
+      boot_cpu_data.x86_vendor = X86_VENDOR_AMD;
+  }
+#endif
   boot_cpu_data.x86 = (u8)((eax >> 8) & 0xf);
   boot_cpu_data.x86_model = (u8)((eax >> 4) & 0xf);
   /* Extended family and model, as the encoding requires above family 0xf. */
@@ -1556,7 +1711,7 @@ struct page *shmem_read_mapping_page_gfp(struct address_space *mapping,
 {
 	struct folio *folio = shmem_read_folio_gfp(mapping, index, gfp);
 
-	return folio ? folio_page(folio, 0) : ERR_PTR(-ENOMEM);
+	return IS_ERR(folio) ? ERR_CAST(folio) : folio_page(folio, 0);
 }
 
 struct page *shmem_read_mapping_page(struct address_space *mapping,

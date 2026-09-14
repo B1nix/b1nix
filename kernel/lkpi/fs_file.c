@@ -134,10 +134,13 @@ void init_sync_kiocb(struct kiocb *kiocb, struct file *filp)
 	kiocb->ki_pos = filp ? filp->f_pos : 0;
 }
 
-int kiocb_set_rw_flags(struct kiocb *ki, unsigned int flags)
+int kiocb_set_rw_flags(struct kiocb *ki, rwf_t flags, int rw_type)
 {
 	int kiocb_flags = 0;
 
+	(void)rw_type;
+	/* RWF_ATOMIC and RWF_DONTCACHE are refused: no file here advertises
+	 * FMODE_CAN_ATOMIC_WRITE or FOP_DONTCACHE support through this path. */
 	if (flags & ~(RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT | RWF_APPEND))
 		return -EOPNOTSUPP;
 	if (flags & RWF_NOWAIT)
@@ -326,7 +329,7 @@ ssize_t generic_perform_write(struct kiocb *iocb, struct iov_iter *i)
 	while (iov_iter_count(i)) {
 		size_t offset = (size_t)(pos & (PAGE_SIZE - 1));
 		size_t bytes = PAGE_SIZE - offset;
-		struct page *page = NULL;
+		struct folio *folio = NULL;
 		void *fsdata = NULL;
 		size_t copied;
 		int status;
@@ -334,18 +337,19 @@ ssize_t generic_perform_write(struct kiocb *iocb, struct iov_iter *i)
 		if (bytes > iov_iter_count(i))
 			bytes = iov_iter_count(i);
 
-		status = a_ops->write_begin(file, mapping, pos, (unsigned)bytes,
-		                            &page, &fsdata);
+		status = a_ops->write_begin(iocb, mapping, pos, (unsigned)bytes,
+		                            &folio, &fsdata);
 		if (status < 0) {
 			if (written)
 				break;
 			return status;
 		}
 
-		copied = copy_page_from_iter_atomic(page, offset, bytes, i);
+		copied = copy_page_from_iter_atomic(folio_page(folio, 0), offset,
+		                                    bytes, i);
 
-		status = a_ops->write_end(file, mapping, pos, (unsigned)bytes,
-		                          (unsigned)copied, page, fsdata);
+		status = a_ops->write_end(iocb, mapping, pos, (unsigned)bytes,
+		                          (unsigned)copied, folio, fsdata);
 		if (status < 0) {
 			if (written)
 				break;
@@ -766,9 +770,11 @@ int filemap_fault(struct vm_fault *vmf)
 	return VM_FAULT_SIGBUS;
 }
 
-void filemap_map_pages(struct vm_fault *vmf, pgoff_t start, pgoff_t end)
+/* Map nothing ahead of the fault: the fault handler itself answers. */
+vm_fault_t filemap_map_pages(struct vm_fault *vmf, pgoff_t start, pgoff_t end)
 {
 	(void)vmf; (void)start; (void)end;
+	return 0;
 }
 
 int filemap_page_mkwrite(struct vm_fault *vmf)

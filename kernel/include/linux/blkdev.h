@@ -123,6 +123,9 @@ struct block_device {
 	void *bd_b1nix;
 	atomic_t bd_openers;
 	struct list_head bd_list;
+	/* bd_inode->i_mapping. 6.10 replaced bd_inode with this in the interface
+	 * filesystems see; both are kept because the glue still reaches the inode. */
+	struct address_space *bd_mapping;
 };
 
 /* ── how a device is opened ─────────────────────────────────────── */
@@ -407,5 +410,37 @@ extern struct bio_set fs_bio_set;
 struct io_comp_batch;
 int iocb_bio_iopoll(struct kiocb *kiocb, struct io_comp_batch *iob,
                     unsigned int flags);
+
+/* Upstream reaches the VFS from here (via <linux/file.h>), and 6.x headers
+ * such as <linux/iomap.h> call i_blocksize() relying on it. */
+#include <linux/fs.h>
+
+/*
+ * Block devices opened as files (6.9+): the file carries the holder and the
+ * open mode, file_bdev() gets the device back, and bdev_fput() is the close.
+ */
+struct file *bdev_file_open_by_path(const char *path, blk_mode_t mode,
+                                    void *holder, const struct blk_holder_ops *hops);
+struct file *bdev_file_open_by_dev(dev_t dev, blk_mode_t mode, void *holder,
+                                   const struct blk_holder_ops *hops);
+struct block_device *file_bdev(struct file *bdev_file);
+void bdev_fput(struct file *bdev_file);
+
+static inline struct queue_limits *bdev_limits(struct block_device *bdev)
+{ return &bdev_get_queue(bdev)->limits; }
+
+/* No device here advertises atomic writes or unmapping write-zeroes. */
+static inline bool bdev_can_atomic_write(struct block_device *bdev)
+{ (void)bdev; return false; }
+static inline unsigned int bdev_atomic_write_unit_min_bytes(struct block_device *bdev)
+{ (void)bdev; return 0; }
+static inline unsigned int bdev_atomic_write_unit_max_bytes(struct block_device *bdev)
+{ (void)bdev; return 0; }
+static inline unsigned int bdev_write_zeroes_unmap_sectors(struct block_device *bdev)
+{ (void)bdev; return 0; }
+
+/* The calling task's I/O priority: the default class, as for every task. */
+static inline int get_current_ioprio(void)
+{ return IOPRIO_PRIO_VALUE(IOPRIO_CLASS_NONE, 0); }
 
 #endif

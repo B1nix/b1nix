@@ -89,4 +89,19 @@ void dma_fence_enable_sw_signaling(struct dma_fence *fence);
  * sleep-on-signal behaviour in its ops table. */
 i64 dma_fence_default_wait(struct dma_fence *fence, int intr, i64 timeout);
 
+/* The names a fence reports, until it is signalled; after that the driver
+ * that created it may be gone, so fixed names are returned instead. */
+static inline const char *dma_fence_driver_name(struct dma_fence *fence)
+{
+	if (!test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags))
+		return fence->ops->get_driver_name(fence);
+	return "detached-driver";
+}
+static inline const char *dma_fence_timeline_name(struct dma_fence *fence)
+{
+	if (!test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags))
+		return fence->ops->get_timeline_name(fence);
+	return "signaled-timeline";
+}
+
 #endif

@@ -327,10 +327,14 @@ struct super_block *sget_fc(struct fs_context *fc,
 	if (set) {
 		err = set(sb, fc);
 		if (err) {
+			/* Still the context's: its free releases it. */
+			sb->s_fs_info = NULL;
 			destroy_super(sb);
 			return ERR_PTR(err);
 		}
 	}
+	/* The superblock owns it now; a later free of the context must not. */
+	fc->s_fs_info = NULL;
 	down_write(&sb->s_umount);
 	hlist_add_head(&sb->s_instances, &fc->fs_type->fs_supers);
 	return sb;
@@ -609,7 +613,7 @@ int sb_set_blocksize(struct super_block *sb, int size)
 	sb->s_blocksize = (unsigned long)size;
 	sb->s_blocksize_bits = (unsigned char)blksize_bits((unsigned int)size);
 	if (sb->s_bdev)
-		set_blocksize(sb->s_bdev, size);
+		bdev_set_blocksize(sb->s_bdev, size);
 	return size;
 }
 
@@ -793,7 +797,7 @@ struct vfsmount *vfs_kern_mount(struct file_system_type *type, int flags,
 		fc.fs_type = type;
 		fc.purpose = FS_CONTEXT_FOR_MOUNT;
 		fc.sb_flags = (unsigned int)flags;
-		fc.source = (char *)name;
+		fc.source = name ? kstrdup(name, GFP_KERNEL) : NULL;
 		fc.user_ns = &init_user_ns;
 		err = type->init_fs_context(&fc);
 		if (!err && fc.ops && fc.ops->get_tree)
@@ -801,6 +805,7 @@ struct vfsmount *vfs_kern_mount(struct file_system_type *type, int flags,
 		root = err ? ERR_PTR(err) : fc.root;
 		if (fc.ops && fc.ops->free)
 			fc.ops->free(&fc);
+		kfree(fc.source);
 	} else {
 		root = ERR_PTR(-EINVAL);
 	}
@@ -822,6 +827,70 @@ struct vfsmount *vfs_kern_mount(struct file_system_type *type, int flags,
 	 * succeed and deactivate_super() then wait on itself forever.
 	 */
 	up_write(&mnt->mnt_sb->s_umount);
+	return mnt;
+}
+
+/*
+ * Copy a mount context for a second mount of the same filesystem — btrfs
+ * mounts the whole filesystem through a duplicate, then picks the subvolume
+ * out of that mount. The filesystem's own dup copies its private options; the
+ * pointers the copy must not share are cleared first, as upstream does.
+ */
+struct fs_context *vfs_dup_fs_context(struct fs_context *src_fc)
+{
+	struct fs_context *fc;
+	int ret;
+
+	if (!src_fc->ops || !src_fc->ops->dup)
+		return ERR_PTR(-EOPNOTSUPP);
+	fc = kmemdup(src_fc, sizeof(*fc), GFP_KERNEL);
+	if (!fc)
+		return ERR_PTR(-ENOMEM);
+	fc->fs_private = NULL;
+	fc->s_fs_info = NULL;
+	fc->source = NULL;
+	fc->security = NULL;
+	fc->root = NULL;
+	ret = fc->ops->dup(fc, src_fc);
+	if (ret < 0) {
+		put_fs_context(fc);
+		return ERR_PTR(ret);
+	}
+	fc->need_free = true;
+	return fc;
+}
+
+/* Release a heap-allocated context: its root, if a get_tree left one, the
+ * filesystem's private state, and the context itself. */
+void put_fs_context(struct fs_context *fc)
+{
+	if (fc->root) {
+		struct super_block *sb = fc->root->d_sb;
+
+		dput(fc->root);
+		fc->root = NULL;
+		deactivate_super(sb);
+	}
+	if (fc->ops && fc->ops->free)
+		fc->ops->free(fc);
+	kfree(fc->source);
+	kfree(fc);
+}
+
+/* A vfsmount for the root a get_tree produced. It takes its own references
+ * on the root and the superblock, so the context can be put straight after. */
+struct vfsmount *vfs_create_mount(struct fs_context *fc)
+{
+	struct vfsmount *mnt;
+
+	if (!fc->root)
+		return ERR_PTR(-EINVAL);
+	mnt = kzalloc(sizeof(*mnt), GFP_KERNEL);
+	if (!mnt)
+		return ERR_PTR(-ENOMEM);
+	mnt->mnt_root = dget(fc->root);
+	mnt->mnt_sb = fc->root->d_sb;
+	atomic_inc(&mnt->mnt_sb->s_active);
 	return mnt;
 }
 

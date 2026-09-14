@@ -61,4 +61,8 @@ void kthread_unpark(struct lkpi_task *k);
 bool kthread_should_park(void);
 void kthread_parkme(void);
 
+/* Create a worker and start it (6.14); the worker starts on creation here. */
+#define kthread_run_worker(flags, namefmt, ...) \
+	kthread_create_worker(flags, namefmt, ##__VA_ARGS__)
+
 #endif

@@ -46,4 +46,8 @@ static inline struct gpio_desc *gpiod_get(struct device *dev, const char *con_id
 { (void)dev; (void)con_id; (void)flags; return ERR_PTR(-ENOENT); }
 static inline void gpiod_put(struct gpio_desc *desc) { (void)desc; }
 
+static inline struct gpio_desc *devm_gpiod_get(struct device *dev, const char *con_id,
+                                               enum gpiod_flags flags)
+{ (void)dev; (void)con_id; (void)flags; return ERR_PTR(-ENOENT); }
+
 #endif

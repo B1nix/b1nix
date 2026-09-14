@@ -18,7 +18,12 @@
 
 #define MAX_ERRNO 4095
 #define IS_ERR_VALUE(x) ((usize)(void *)(x) >= (usize)-MAX_ERRNO)
-static inline void *ERR_PTR(long error) { return (void *)(usize)error; }
+static inline void *__lkpi_err_ptr(long error) { return (void *)(usize)error; }
+/* A constant expression when the errno is one, so BUILD_BUG_ON can compare two
+ * error pointers (it demands a constant; see <linux/kernel.h>). */
+#define ERR_PTR(error)                                               \
+	(__builtin_constant_p(error) ? (void *)(usize)(long)(error)  \
+	                             : __lkpi_err_ptr(error))
 static inline long PTR_ERR(const void *ptr) { return (long)(usize)ptr; }
 static inline bool IS_ERR(const void *ptr) { return IS_ERR_VALUE((usize)ptr); }
 static inline bool IS_ERR_OR_NULL(const void *ptr)

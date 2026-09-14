@@ -14,6 +14,7 @@
  * the quirk.
  */
 struct cpuinfo_x86 {
+	u8 x86_vendor;       /* X86_VENDOR_*, from the CPUID vendor string */
 	u8 x86;              /* family */
 	u8 x86_model;
 	u8 x86_stepping;
@@ -22,6 +23,10 @@ struct cpuinfo_x86 {
 	 * Real: the flush loops step by it. */
 	unsigned int x86_clflush_size;
 };
+
+#define X86_VENDOR_INTEL   0
+#define X86_VENDOR_AMD     2
+#define X86_VENDOR_UNKNOWN 0xff
 
 extern struct cpuinfo_x86 boot_cpu_data;
 

@@ -55,4 +55,7 @@ void *irq_get_chip_data(unsigned int irq);
 void handle_simple_irq(struct irq_desc *desc);
 int generic_handle_irq(unsigned int irq);
 
+/* The form callable with interrupts enabled; generic_handle_irq here is. */
+#define generic_handle_irq_safe(irq) generic_handle_irq(irq)
+
 #endif

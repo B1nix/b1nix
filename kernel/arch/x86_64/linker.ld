@@ -59,8 +59,9 @@ SECTIONS
 	 * per exported kernel symbol, plus the name strings. The module loader
 	 * walks __ksymtab_start..__ksymtab_end to resolve a .ko's undefined
 	 * symbols. Placed after .text/.rodata/.data so growing it never shifts a
-	 * function address. */
-	.ksymtab ALIGN(8) : AT(ADDR(.ksymtab) - KERNEL_VMA) {
+	 * function address. 16, not 8: the name strings placed inside it are
+	 * 16-aligned, and the output section takes the largest input alignment. */
+	.ksymtab ALIGN(16) : AT(ADDR(.ksymtab) - KERNEL_VMA) {
 		__ksymtab_start = .;
 		KEEP(*(.ksymtab))
 		__ksymtab_end = .;

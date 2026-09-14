@@ -3,6 +3,7 @@
 #define LKPI_LINUX_ATOMIC_H
 
 #include <b1nix/types.h>
+#include <lkpi/kref.h>
 
 /* <b1nix/types.h>, not <linux/types.h>: that header includes this one (through
  * refcount.h), and a cycle leaves the atomics undefined at the point refcount
@@ -24,9 +25,8 @@
  * everything relaxed would break the algorithms that rely on the barrier.
  */
 
-typedef struct {
-	volatile int counter;
-} atomic_t;
+/* struct lkpi_atomic is declared with the kref, which holds one. */
+typedef struct lkpi_atomic atomic_t;
 
 typedef struct {
 	/* i64, matching what the 64-bit atomics take and return: a `long`
@@ -300,5 +300,9 @@ static inline int atomic_dec_if_positive(atomic_t *v)
 			return c - 1;
 	}
 }
+
+#define ATOMIC64_INIT(i) { (i) }
+
+#define try_cmpxchg64(ptr, oldp, new_val) try_cmpxchg(ptr, oldp, new_val)
 
 #endif

@@ -1282,6 +1282,27 @@ void *kzalloc(usize size) {
   return kzalloc_internal(size, (u64)__builtin_return_address(0));
 }
 
+/* The bytes a live allocation may use: the block's 16-aligned payload, or a
+ * large block's requested size. 0 for anything that is not a live kheap block. */
+usize kmalloc_usable_size(const void *ptr) {
+  u64 p = (u64)(usize)ptr;
+
+  if (!ptr || !is_canonical_addr(p))
+    return 0;
+  if (p >= KLARGE_START && p < KLARGE_END) {
+    const struct klarge_header *h =
+        (const struct klarge_header *)((u8 *)ptr - KLARGE_HEADER_SIZE);
+    return h->size;
+  }
+  if (heap.base != 0 && (p < heap.base + KHEAP_HEADER_SIZE || p >= heap.end))
+    return 0;
+  {
+    const struct kheap_block *b =
+        (const struct kheap_block *)((u8 *)ptr - KHEAP_HEADER_SIZE);
+    return b->magic == KHEAP_MAGIC ? b->size : 0;
+  }
+}
+
 void kfree(void *ptr) {
   if (!ptr)
     return;

@@ -812,121 +812,16 @@ static void test_interval_tree(void)
 
 /* ── xarray ─────────────────────────────────────────────────────── */
 
-#define XA_TEST_ENTRIES 200
-
-static u32 g_xa_values[XA_TEST_ENTRIES];
-
-struct xa_walk_state {
-	u64 prev;
-	int first;
-	usize seen;
-	int ordered;
-};
-
-static int xa_walk_cb(u64 index, void *entry, void *data)
-{
-	struct xa_walk_state *st = data;
-	if (!st->first && index <= st->prev)
-		st->ordered = 0;
-	st->first = 0;
-	st->prev = index;
-	st->seen++;
-	(void)entry;
-	return 0;
-}
-
+/*
+ * The xarray is Linux's own lib/xarray.c, so the exercise lives on the Linux
+ * side of the boundary (kernel/lkpi/xarray_selftest.c) and reports back here.
+ */
 static void test_xarray(void)
 {
-	int ok = 1;
-	struct xarray xa;
-	xa_init(&xa);
+	u64 seen = 0;
+	int ok = lkpi_xarray_selftest(&seen);
 
-	if (!xa_empty(&xa) || xa_count(&xa) != 0)
-		ok = 0;
-	if (xa_load(&xa, 0) || xa_load(&xa, 123456789ull))
-		ok = 0;
-
-	/* Indices spread far apart, which is the case a flat array cannot serve:
-	 * a few small ones, then values needing every level of the tree. */
-	for (int i = 0; i < XA_TEST_ENTRIES; i++) {
-		g_xa_values[i] = 0x5A000000u + (u32)i;
-		u64 index = (u64)i * 1000003ull; /* prime stride: no shared prefixes */
-		if (xa_store(&xa, index, &g_xa_values[i]) != 0)
-			ok = 0;
-	}
-	if (xa_count(&xa) != XA_TEST_ENTRIES || xa_empty(&xa))
-		ok = 0;
-
-	/* Every stored pointer comes back, verified through the value behind it. */
-	for (int i = 0; i < XA_TEST_ENTRIES; i++) {
-		u32 *p = xa_load(&xa, (u64)i * 1000003ull);
-		if (p != &g_xa_values[i] || *p != 0x5A000000u + (u32)i)
-			ok = 0;
-		/* A neighbouring index was never stored and must miss. */
-		if (xa_load(&xa, (u64)i * 1000003ull + 1))
-			ok = 0;
-	}
-
-	/* Overwrite must replace, not add. */
-	if (xa_store(&xa, 0, &g_xa_values[1]) != 0)
-		ok = 0;
-	if (xa_load(&xa, 0) != &g_xa_values[1])
-		ok = 0;
-	if (xa_count(&xa) != XA_TEST_ENTRIES)
-		ok = 0;
-	if (xa_store(&xa, 0, &g_xa_values[0]) != 0)
-		ok = 0;
-
-	/* The whole 64-bit range has to work, not just small indices. */
-	static u32 top;
-	if (xa_store(&xa, ~0ull, &top) != 0)
-		ok = 0;
-	if (xa_load(&xa, ~0ull) != &top)
-		ok = 0;
-	if (xa_erase(&xa, ~0ull) != &top)
-		ok = 0;
-
-	/* Iteration must be in ascending index order and hit everything once. */
-	struct xa_walk_state st = { .prev = 0, .first = 1, .seen = 0, .ordered = 1 };
-	xa_for_each(&xa, xa_walk_cb, &st);
-	if (st.seen != XA_TEST_ENTRIES || !st.ordered)
-		ok = 0;
-
-	/* Erase returns what was there; erasing twice returns NULL. */
-	for (int i = 0; i < XA_TEST_ENTRIES; i += 2) {
-		if (xa_erase(&xa, (u64)i * 1000003ull) != &g_xa_values[i])
-			ok = 0;
-		if (xa_erase(&xa, (u64)i * 1000003ull))
-			ok = 0;
-	}
-	if (xa_count(&xa) != XA_TEST_ENTRIES / 2)
-		ok = 0;
-	for (int i = 1; i < XA_TEST_ENTRIES; i += 2) {
-		if (xa_load(&xa, (u64)i * 1000003ull) != &g_xa_values[i])
-			ok = 0;
-	}
-
-	/* Storing NULL is an erase, as the header promises. */
-	if (xa_store(&xa, 1000003ull, 0) != 0)
-		ok = 0;
-	if (xa_load(&xa, 1000003ull))
-		ok = 0;
-
-	/* Emptying it must make it genuinely empty again — the check that the
-	 * tree's nodes were folded away rather than left as a skeleton. */
-	for (int i = 1; i < XA_TEST_ENTRIES; i += 2)
-		xa_erase(&xa, (u64)i * 1000003ull);
-	if (!xa_empty(&xa) || xa_count(&xa) != 0)
-		ok = 0;
-
-	/* Reusable after being emptied. */
-	if (xa_store(&xa, 42, &g_xa_values[0]) != 0)
-		ok = 0;
-	if (xa_load(&xa, 42) != &g_xa_values[0])
-		ok = 0;
-	xa_destroy(&xa);
-
-	m101_report("xarray", ok, st.seen);
+	m101_report("xarray", ok, seen);
 }
 
 /* ── kthread_worker ─────────────────────────────────────────────── */

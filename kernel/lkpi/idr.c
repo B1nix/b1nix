@@ -23,7 +23,7 @@
  * is "the slot is not empty", so a reserved id needs a value that is not NULL
  * and is not a pointer anyone could have passed — an address no allocation can
  * return. It never escapes: every read maps it back to NULL, which is exactly
- * what Linux's idr_find reports for an id whose value is NULL.
+ * what Linux's lkpi_idr_find reports for an id whose value is NULL.
  */
 #define IDR_RESERVED ((void *)(usize)1)
 
@@ -33,7 +33,7 @@ static inline void *idr_decode(void *slot)
 	return slot == IDR_RESERVED ? 0 : slot;
 }
 
-void idr_init_base(struct idr *idr, u32 base)
+void lkpi_idr_init_base(struct lkpi_idr *idr, u32 base)
 {
 	if (!idr)
 		return;
@@ -45,7 +45,7 @@ void idr_init_base(struct idr *idr, u32 base)
 	idr->lock = SPINLOCK_INIT;
 }
 
-void idr_destroy(struct idr *idr)
+void lkpi_idr_destroy(struct lkpi_idr *idr)
 {
 	if (!idr)
 		return;
@@ -63,7 +63,7 @@ void idr_destroy(struct idr *idr)
 
 /* Grow to at least `need` slots. Caller holds the lock; the allocation happens
  * with interrupts disabled, which kmalloc supports (it never blocks). */
-static int idr_grow_locked(struct idr *idr, u32 need)
+static int idr_grow_locked(struct lkpi_idr *idr, u32 need)
 {
 	if (need <= idr->capacity)
 		return 0;
@@ -94,14 +94,14 @@ static int idr_grow_locked(struct idr *idr, u32 need)
 }
 
 /* Translate an external id into a slot index, or -1 when it is below base. */
-static long idr_slot_of(const struct idr *idr, u32 id)
+static long idr_slot_of(const struct lkpi_idr *idr, u32 id)
 {
 	if (id < idr->base)
 		return -1;
 	return (long)(id - idr->base);
 }
 
-int idr_alloc(struct idr *idr, void *ptr, u32 start, u32 end)
+int lkpi_idr_alloc(struct lkpi_idr *idr, void *ptr, u32 start, u32 end)
 {
 	if (!idr)
 		return -EINVAL;
@@ -146,7 +146,7 @@ int idr_alloc(struct idr *idr, void *ptr, u32 start, u32 end)
 	return -ENOSPC;
 }
 
-int idr_alloc_at(struct idr *idr, void *ptr, u32 id)
+int lkpi_idr_alloc_at(struct lkpi_idr *idr, void *ptr, u32 id)
 {
 	if (!idr)
 		return -EINVAL;
@@ -171,7 +171,7 @@ int idr_alloc_at(struct idr *idr, void *ptr, u32 id)
 	return 0;
 }
 
-void *idr_find(struct idr *idr, u32 id)
+void *lkpi_idr_find(struct lkpi_idr *idr, u32 id)
 {
 	if (!idr)
 		return 0;
@@ -185,7 +185,7 @@ void *idr_find(struct idr *idr, u32 id)
 	return p;
 }
 
-void *idr_remove(struct idr *idr, u32 id)
+void *lkpi_idr_remove(struct lkpi_idr *idr, u32 id)
 {
 	if (!idr)
 		return 0;
@@ -207,7 +207,7 @@ void *idr_remove(struct idr *idr, u32 id)
 	return p;
 }
 
-u32 idr_count(struct idr *idr)
+u32 lkpi_idr_count(struct lkpi_idr *idr)
 {
 	if (!idr)
 		return 0;
@@ -218,7 +218,7 @@ u32 idr_count(struct idr *idr)
 	return n;
 }
 
-int idr_for_each(struct idr *idr, int (*fn)(int id, void *ptr, void *data),
+int lkpi_idr_for_each(struct lkpi_idr *idr, int (*fn)(int id, void *ptr, void *data),
                  void *data)
 {
 	if (!idr || !fn)
@@ -245,7 +245,7 @@ int idr_for_each(struct idr *idr, int (*fn)(int id, void *ptr, void *data),
 	return visited;
 }
 
-void *idr_replace(struct idr *idr, void *ptr, u32 id)
+void *lkpi_idr_replace(struct lkpi_idr *idr, void *ptr, u32 id)
 {
 	if (!idr)
 		return 0;
@@ -265,7 +265,7 @@ void *idr_replace(struct idr *idr, void *ptr, u32 id)
 	return old;
 }
 
-u32 idr_max_allocated(struct idr *idr)
+u32 lkpi_idr_max_allocated(struct lkpi_idr *idr)
 {
 	if (!idr)
 		return 0;

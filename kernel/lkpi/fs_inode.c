@@ -143,8 +143,8 @@ static void inode_init_always(struct super_block *sb, struct inode *inode)
 	inode->i_data.gfp_mask = GFP_KERNEL;
 	xa_init(&inode->i_data.i_pages);
 	init_rwsem(&inode->i_data.invalidate_lock);
-	spin_lock_init(&inode->i_data.private_lock);
-	INIT_LIST_HEAD(&inode->i_data.private_list);
+	spin_lock_init(&inode->i_data.i_private_lock);
+	INIT_LIST_HEAD(&inode->i_data.i_private_list);
 	inode->i_mapping = &inode->i_data;
 }
 
@@ -1180,4 +1180,34 @@ struct backing_dev_info *inode_to_bdi(struct inode *inode)
 	if (inode->i_sb && inode->i_sb->s_bdi)
 		return inode->i_sb->s_bdi;
 	return &lkpi_default_bdi;
+}
+
+/* ── 6.x inode helpers ──────────────────────────────────────────── */
+
+/* All three timestamps of a new inode set to one "now". */
+struct timespec64 simple_inode_init_ts(struct inode *inode)
+{
+	struct timespec64 ts = inode_set_ctime_current(inode);
+
+	inode_set_atime_to_ts(inode, ts);
+	inode_set_mtime_to_ts(inode, ts);
+	return ts;
+}
+
+/* The 6.18 name of generic_delete_inode: drop on last reference, always. */
+int inode_just_drop(struct inode *inode)
+{
+	return generic_delete_inode(inode);
+}
+
+/*
+ * iget5_locked whose `test` may run under RCU without the hash lock. This
+ * table's walk holds the lock around `test` either way, which satisfies a
+ * test written for the weaker guarantee.
+ */
+struct inode *iget5_locked_rcu(struct super_block *sb, unsigned long hashval,
+                               int (*test)(struct inode *, void *),
+                               int (*set)(struct inode *, void *), void *data)
+{
+	return iget5_locked(sb, hashval, test, set, data);
 }

@@ -78,6 +78,8 @@ struct fs_parse_result {
 		int int_32;
 		unsigned int uint_32;
 		u64 uint_64;
+		kuid_t uid;
+		kgid_t gid;
 	};
 };
 

@@ -59,7 +59,7 @@
 #define DRM_VMAP_WINDOW_TOTAL (DRM_MAP_STRIDE * DRM_MAX_OBJECTS)
 
 struct drm_client {
-  struct idr handles;
+  struct lkpi_idr handles;
   u32 next_fb_id;
   u32 sequence;
   int event_pending;
@@ -162,7 +162,7 @@ static void drm_bo_free(struct drm_buffer *bo) {
 static struct drm_buffer *find_buffer(struct drm_client *client, u32 handle) {
   if (!client)
     return 0;
-  struct drm_buffer *bo = idr_find(&client->handles, handle);
+  struct drm_buffer *bo = lkpi_idr_find(&client->handles, handle);
   return (bo && bo->owner == client) ? bo : 0;
 }
 
@@ -352,7 +352,7 @@ static int drm_ioctl_create_dumb(struct drm_client *client, void *arg) {
   buffer->pitch = d.width * 4;
   buffer->in_use = 1;
 
-  int handle = idr_alloc(&client->handles, buffer, 1, 0);
+  int handle = lkpi_idr_alloc(&client->handles, buffer, 1, 0);
   if (handle < 0) {
     drm_bo_free(buffer);
     return handle;
@@ -363,7 +363,7 @@ static int drm_ioctl_create_dumb(struct drm_client *client, void *arg) {
   d.pitch = buffer->pitch;
   d.size = buffer->size;
   if (syscall_copyout(arg, &d, sizeof(d)) < 0) {
-    idr_remove(&client->handles, buffer->handle);
+    lkpi_idr_remove(&client->handles, buffer->handle);
     buffer->owner = 0;
     buffer->pending_free = 1;
     maybe_free_buffer(buffer);
@@ -480,7 +480,7 @@ static int drm_ioctl_destroy_dumb(struct drm_client *client, void *arg) {
     return -EINVAL;
   if (buffer_has_fb(buffer))
     return -EBUSY;
-  idr_remove(&client->handles, d.handle);
+  lkpi_idr_remove(&client->handles, d.handle);
   buffer->owner = 0;
   buffer->pending_free = 1;
   maybe_free_buffer(buffer);
@@ -549,7 +549,7 @@ static void drm_release(struct vfs_handle *h) {
         maybe_free_buffer(&buffers[i]);
       }
     }
-    idr_destroy(&client->handles);
+    lkpi_idr_destroy(&client->handles);
     kfree(client);
   }
   h->private_data = 0;
@@ -607,11 +607,11 @@ int drm_dev_open(int flags) {
   if (!client)
     return -ENOMEM;
   /* GEM handles start at 1: zero is "no handle" in every DRM ABI. */
-  idr_init_base(&client->handles, 1);
+  lkpi_idr_init_base(&client->handles, 1);
   client->next_fb_id = 1;
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_NODE);
   if (!h) {
-    idr_destroy(&client->handles);
+    lkpi_idr_destroy(&client->handles);
     kfree(client);
     return -ENFILE;
   }

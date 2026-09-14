@@ -44,7 +44,7 @@ struct attribute;
 struct attribute_group {
 	const char *name;
 	struct attribute **attrs;
-	struct bin_attribute **bin_attrs;
+	const struct bin_attribute *const *bin_attrs;
 	umode_t (*is_visible)(struct kobject *, struct attribute *, int);
 };
 /* Format into a sysfs output buffer. The buffer is one page and the count is
@@ -62,9 +62,9 @@ struct bin_attribute {
 	 * the kobject too, but a driver publishing one attribute per connector
 	 * needs to know which connector — and this is where it puts that. */
 	void *private;
-	ssize_t (*read)(struct file *, struct kobject *, struct bin_attribute *,
+	ssize_t (*read)(struct file *, struct kobject *, const struct bin_attribute *,
 	                char *, loff_t, size_t);
-	ssize_t (*write)(struct file *, struct kobject *, struct bin_attribute *,
+	ssize_t (*write)(struct file *, struct kobject *, const struct bin_attribute *,
 	                 char *, loff_t, size_t);
 	/* Mapping the attribute's contents instead of reading them. Nothing here
 	 * calls it — b1nix's sysfs serves attributes through read — so an

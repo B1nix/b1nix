@@ -90,4 +90,12 @@ static inline int rwsem_is_contended(struct rw_semaphore *s)
 #define down_write_killable(s)                 (down_write(s), 0)
 #define down_write_killable_nested(s, subclass) (down_write(s), 0)
 
+/* Assertions about who holds a rwsem. Without lockdep the owner is not
+ * recorded, so only "held at all" can be checked. */
+#define rwsem_assert_held_write(s)          WARN_ON(!rwsem_is_locked(s))
+#define rwsem_assert_held_write_nolockdep(s) WARN_ON(!rwsem_is_locked(s))
+/* A read acquisition a signal may interrupt. Nothing here delivers signals to
+ * a waiter, so it always acquires. */
+#define down_read_interruptible(s)          (down_read(s), 0)
+
 #endif

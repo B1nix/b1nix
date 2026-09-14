@@ -153,4 +153,15 @@ static inline void percpu_counter_sync(struct percpu_counter *fbc)
 static inline bool percpu_counter_initialized(struct percpu_counter *fbc)
 { return fbc != NULL; }
 
+/* Initialise an array of counters. */
+static inline int percpu_counter_init_many(struct percpu_counter *fbc, s64 amount,
+                                           gfp_t gfp, u32 nr_counters)
+{
+	u32 i;
+
+	for (i = 0; i < nr_counters; i++)
+		percpu_counter_init(&fbc[i], amount, gfp);
+	return 0;
+}
+
 #endif

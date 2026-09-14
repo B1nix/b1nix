@@ -119,7 +119,10 @@ enum lkpi_pageflags {
 	PG_reclaim,
 	PG_swapbacked,
 	PG_unevictable,
+	PG_dropbehind,
 	PG_checked = PG_owner_priv_1,
+	PG_owner_2 = PG_private_2,
+	PG_readahead = PG_reclaim,
 	PG_fscache = PG_private_2,
 	__NR_PAGEFLAGS,
 };
@@ -165,6 +168,8 @@ struct page *alloc_pages(u32 gfp, u32 order);
 
 void __free_page(struct page *page);
 void __free_pages(struct page *page, u32 order);
+/* Make each page of a 2^order run freeable on its own. */
+void split_page(struct page *page, unsigned int order);
 
 static inline u64 page_to_phys(const struct page *page)
 {

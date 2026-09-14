@@ -41,8 +41,19 @@ void done_path_create(struct path *path, struct dentry *dentry);
 struct dentry *lookup_one_len(const char *name, struct dentry *base, int len);
 struct dentry *lookup_one_len_unlocked(const char *name, struct dentry *base,
                                        int len);
-struct dentry *lookup_one(struct mnt_idmap *idmap, const char *name,
-                          struct dentry *base, int len);
+/* The 6.16 lookups, by qstr. The _noperm forms skip the permission check the
+ * others make; with one user namespace and no LSM the check always passes. */
+struct dentry *lookup_one(struct mnt_idmap *idmap, struct qstr *name,
+                          struct dentry *base);
+struct dentry *lookup_one_unlocked(struct mnt_idmap *idmap, struct qstr *name,
+                                   struct dentry *base);
+struct dentry *lookup_one_positive_unlocked(struct mnt_idmap *idmap,
+                                            struct qstr *name,
+                                            struct dentry *base);
+struct dentry *lookup_noperm(struct qstr *name, struct dentry *base);
+struct dentry *lookup_noperm_unlocked(struct qstr *name, struct dentry *base);
+struct dentry *lookup_noperm_positive_unlocked(struct qstr *name,
+                                               struct dentry *base);
 struct dentry *lookup_positive_unlocked(const char *name, struct dentry *base,
                                         int len);
 

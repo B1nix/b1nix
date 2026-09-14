@@ -55,4 +55,7 @@ static inline bool of_property_present(const struct device_node *np,
 /* Callers reach the DSI host list's lock through this header's chain upstream. */
 #include <linux/mutex.h>
 
+/* Upstream's of.h brings the firmware-node property interface with it. */
+#include <linux/property.h>
+
 #endif

@@ -4,6 +4,8 @@
 
 #include <linux/types.h>
 #include <linux/list.h>
+/* struct folio_batch, embedded in the writeback cursor. */
+#include <linux/mm.h>
 
 /*
  * What a writeback pass is being asked to do.
@@ -73,6 +75,11 @@ struct writeback_control {
 	 */
 	unsigned no_cgroup_owner : 1;
 	unsigned punt_to_cgroup : 1;
+	/* writeback_iter()'s cursor: the batch in hand, the next index to look
+	 * up, and the first error met in a WB_SYNC_ALL pass. */
+	struct folio_batch fbatch;
+	pgoff_t index;
+	int saved_err;
 };
 
 /*
@@ -91,8 +98,8 @@ static inline void wbc_attach_fdatawrite_inode(struct writeback_control *wbc,
 static inline void wbc_detach_inode(struct writeback_control *wbc)
 { (void)wbc; }
 static inline void wbc_account_cgroup_owner(struct writeback_control *wbc,
-                                            struct page *page, size_t bytes)
-{ (void)wbc; (void)page; (void)bytes; }
+                                            struct folio *folio, size_t bytes)
+{ (void)wbc; (void)folio; (void)bytes; }
 static inline struct cgroup_subsys_state *
 wbc_blkcg_css(struct writeback_control *wbc)
 { (void)wbc; return NULL; }
@@ -126,5 +133,11 @@ int write_cache_pages(struct address_space *mapping,
                                        void *),
                       void *data);
 void __inode_attach_wb(struct inode *inode, struct folio *folio);
+
+/* Iterate a mapping's folios for ->writepages (6.10+). Start with folio NULL
+ * and pass each returned folio back in, until it returns NULL. */
+struct folio *writeback_iter(struct address_space *mapping,
+                             struct writeback_control *wbc, struct folio *folio,
+                             int *error);
 
 #endif

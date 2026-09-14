@@ -343,4 +343,7 @@ static inline u32 ror32(u32 word, unsigned int shift)
  * it, so it is on a path that runs once per block group at mount. */
 size_t memweight(const void *ptr, size_t bytes);
 
+#define __assign_bit(nr, addr, value) \
+	((value) ? __set_bit((nr), (addr)) : __clear_bit((nr), (addr)))
+
 #endif

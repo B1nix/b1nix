@@ -74,6 +74,7 @@ int cancel_delayed_work(struct delayed_work *dwork);
 /* Sleep until `work` is neither pending nor running. Returns 1 if it had to
  * wait. Must not be called from the queue's own thread. */
 int flush_work(struct work_struct *work);
+int cancel_work(struct work_struct *work);
 
 /* Sleep until the queue's backlog is empty and nothing is running. */
 void flush_workqueue(struct workqueue_struct *wq);

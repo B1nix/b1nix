@@ -22,4 +22,10 @@
 #define __O_SYNC   04000000
 #define O_SYNC     (__O_SYNC | O_DSYNC)
 #define O_PATH     010000000
+
+/* 64-bit only: every open is a large-file open. */
+#ifndef force_o_largefile
+#define force_o_largefile() (true)
+#endif
+
 #endif

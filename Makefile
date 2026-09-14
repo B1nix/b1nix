@@ -13,6 +13,11 @@ export B1NIX_HEADERS_INSTALLED := 1
 # SHARED and read-only across isolated builds — never rebuilt per task.
 BUILD_ROOT ?= build
 BUILD_DIR := $(BUILD_ROOT)/$(ARCH)
+
+# The Linux release linuxkpi imports from: the filesystems, the DRM core and
+# i915 are staged out of this one tarball (tools/fs, tools/drm pin its SHA256).
+# One shim serves all three, so they move together.
+LKPI_LINUX_VERSION ?= 6.18.51
 INC_DIR := $(BUILD_DIR)/inc
 # The compiled-in fallback kernel command line, delivered as a generated header
 # (see the rule below for why it is not a -D).
@@ -274,8 +279,8 @@ ifeq ($(B1NIX_BROWSER),1)
 # concretely. Named files rather than directories: a directory can exist and be
 # empty, and an interrupted fetch leaves exactly that.
 MUSL_SYSROOT_MARKER := $(BUILD_DIR)/ports/musl/install/include/stdio.h
-I915_SOURCE_MARKER := $(BUILD_DIR)/../src/i915-6.6/B1NIX-OBJECTS
-DRM_CORE_MARKER := $(BUILD_DIR)/../src/drm-core-6.6/include/drm/drm_device.h
+I915_SOURCE_MARKER := $(BUILD_DIR)/../src/i915-$(LKPI_LINUX_VERSION)/B1NIX-OBJECTS
+DRM_CORE_MARKER := $(BUILD_DIR)/../src/drm-core-$(LKPI_LINUX_VERSION)/include/drm/drm_device.h
 
 PKGROOT := build/$(ARCH)/pkgroot-browser
 ROOT_VARIANT := -browser
@@ -682,13 +687,11 @@ KERNEL_SOURCES += \
 	kernel/lkpi/ww_mutex.c \
 	kernel/lkpi/rbtree.c \
 	kernel/lkpi/interval_tree.c \
-	kernel/lkpi/xarray.c \
 	kernel/lkpi/kthread_worker.c \
 	kernel/lkpi/rcu.c \
 	kernel/lkpi/page.c \
 	kernel/lkpi/device.c \
 	kernel/lkpi/devres.c \
-	kernel/lkpi/ida.c \
 	kernel/lkpi/lock.c \
 	kernel/lkpi/rwsem.c \
 	kernel/lkpi/crc32.c \
@@ -788,7 +791,6 @@ KERNEL_SOURCES += \
 	kernel/lkpi/dma_fence_chain.c \
 	kernel/lkpi/dma_resv.c \
 	kernel/lkpi/i2c_bit.c \
-	kernel/lkpi/ida.c \
 	kernel/lkpi/interval_tree.c \
 	kernel/lkpi/linux_compat.c \
 	kernel/lkpi/linux_file.c \
@@ -798,7 +800,6 @@ KERNEL_SOURCES += \
 	kernel/lkpi/timer.c \
 	kernel/lkpi/wait.c \
 	kernel/lkpi/ww_mutex.c \
-	kernel/lkpi/xarray.c \
 	kernel/lkpi/rwsem.c \
 	kernel/lkpi/crc32.c \
 	kernel/lkpi/filemap.c \
@@ -857,7 +858,7 @@ endif
 # The staged tree is produced by tools/drm/fetch-drm-core.sh and is not tracked.
 # Nothing under it is ever edited: a patch to imported source is a bug in the
 # shim.
-DRM_IMPORT_DIR := build/src/drm-core-6.6
+DRM_IMPORT_DIR := build/src/drm-core-$(LKPI_LINUX_VERSION)
 
 # Which files to build comes from the staged tree's own B1NIX-OBJECTS, which
 # fetch-drm-core.sh derived from upstream's drm-y. Choosing them here instead
@@ -893,6 +894,9 @@ endif
 
 # -mno-red-zone is not repeated below: it is an x86 flag, and
 # DRM_IMPORT_ARCH_FLAGS above already carries it on the arch that has one.
+# CONFIG_DRM_CLIENT: the in-kernel DRM client, which b1nix's console is built
+# on; 6.12+ compiles its event hooks out without it. CONFIG_DRM_PANEL: the panel
+# registry i915's DSI panels use (i915 selects it).
 # Flags for the b1nix-side objects that include the imported Linux headers:
 # b1nix's own warnings, with the imported include roots (and the i915-shim
 # roots that must stay behind them) searched as system headers, since warnings
@@ -904,6 +908,7 @@ DRM_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
 	$(FILE_PREFIX_MAP) \
 	-D__KERNEL__ -D__linux__ -DKBUILD_MODNAME='"drm"' \
 	$(DRM_IMPORT_ARCH_FLAGS) \
+	-DCONFIG_DRM_CLIENT=1 -DCONFIG_DRM_PANEL=1 \
 	-isystem $(CLANG_RESOURCE_INC) \
 	-I kernel/include -I kernel/include/uapi \
 	-I $(DRM_IMPORT_DIR)/include -I $(DRM_IMPORT_DIR)/include/uapi \
@@ -947,7 +952,8 @@ LKPI_IMPORT_SOURCES := \
 	kernel/lkpi/drm_b1nix_kms.c \
 	kernel/lkpi/drm_chardev.c \
 	kernel/lkpi/drm_console.c \
-	kernel/lkpi/linux_support.c
+	kernel/lkpi/linux_support.c \
+	kernel/lkpi/xarray_selftest.c
 
 LKPI_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(LKPI_IMPORT_SOURCES))
 
@@ -980,7 +986,7 @@ DRM_IMPORT_OBJECTS += $(LKPI_IMPORT_OBJECTS)
 #     for someone who staged it to read it.
 #
 # When the driver builds, the second gate is the one to remove — not the first.
-I915_IMPORT_DIR := build/src/i915-6.6
+I915_IMPORT_DIR := build/src/i915-$(LKPI_LINUX_VERSION)
 # Intel's driver, imported from Linux and compiled against that import — an
 # x86 GPU on an x86 machine. aarch64 has no such device and no staged import,
 # so default it off there rather than failing the build on a missing i915_drv.h.
@@ -1030,7 +1036,9 @@ I915_IMPORT_OBJECTS += $(I915_SHIM_OBJECTS)
 # file's directory first, so if a future rebase ever brings a real i915_trace.h
 # back into the staged tree, that one wins and this stops being reachable —
 # which is a visible change rather than a silent one.
-I915_IMPORT_CFLAGS := $(DRM_IMPORT_CFLAGS) \
+# -DI915: upstream's own subdir-ccflags. The display code is shared with xe
+# and picks i915's side of its #ifdefs by it.
+I915_IMPORT_CFLAGS := $(DRM_IMPORT_CFLAGS) -DI915 \
 	-I $(I915_IMPORT_DIR)/drivers/gpu/drm/i915 \
 	-I $(I915_IMPORT_DIR)/drivers/gpu/drm/i915/display \
 	-I $(DRM_IMPORT_DIR)/drivers/gpu/drm \
@@ -1061,7 +1069,7 @@ endif
 
 .PHONY: kernel-dist i915-fetch bootstrap
 i915-fetch:
-	@sh tools/drm/fetch-i915.sh
+	@LINUX_VERSION=$(LKPI_LINUX_VERSION) sh tools/drm/fetch-i915.sh
 
 
 # ── linuxkpi-fs: btrfs, ext4 and jbd2, imported ───────────────────────────
@@ -1076,8 +1084,11 @@ i915-fetch:
 # implementation, checked by the same self-test and by the host's btrfs check
 # afterwards. A machine without the staged sources builds without it and says
 # so at mount, the same way it does without the staged i915.
-FS_IMPORT_DIR := build/src/fs-6.6
-FS_IMPORT_GEN := build/src/fs-6.6-gen
+# The Linux release the filesystems are imported from (tools/fs/fetch-linux-fs.sh
+# pins its tarball).
+FS_LINUX_VERSION ?= $(LKPI_LINUX_VERSION)
+FS_IMPORT_DIR := build/src/fs-$(FS_LINUX_VERSION)
+FS_IMPORT_GEN := build/src/fs-$(FS_LINUX_VERSION)-gen
 ifneq ($(wildcard $(FS_IMPORT_DIR)/B1NIX-OBJECTS),)
 B1NIX_FS_IMPORT ?= 1
 endif
@@ -1132,6 +1143,8 @@ endif
 # The b1nix side of the bridge (kernel/fs/lkpifs.c) calls into the imported
 # filesystem, so it is only built when that filesystem is in the link.
 KERNEL_SOURCES += kernel/fs/lkpifs.c
+# The release it came from, for the registration message.
+$(BUILD_DIR)/kernel/fs/lkpifs.o: COMMON_CFLAGS += -DLKPI_FS_LINUX_VERSION='"$(FS_LINUX_VERSION)"'
 # btrfs is in the image rather than a .ko, which modules.builtin records.
 MODULES_BUILTIN += fs/btrfs/btrfs
 FS_IMPORT_ALL_NAMES := $(shell cat $(FS_IMPORT_DIR)/B1NIX-OBJECTS 2>/dev/null)
@@ -1241,8 +1254,8 @@ endif
 
 .PHONY: fs-fetch fs-probe
 fs-fetch:
-	@sh tools/fs/fetch-linux-fs.sh
-	@sh tools/fs/gen-shim-headers.sh
+	@LINUX_VERSION=$(FS_LINUX_VERSION) sh tools/fs/fetch-linux-fs.sh
+	@LINUX_VERSION=$(FS_LINUX_VERSION) sh tools/fs/gen-shim-headers.sh
 fs-probe:
 	@sh tools/fs/probe-headers.sh --syntax
 
@@ -1446,11 +1459,11 @@ $(MUSL_SYSROOT_MARKER):
 
 $(I915_SOURCE_MARKER):
 	@echo "  BOOTSTRAP imported i915 sources (one-time)"
-	@sh tools/drm/fetch-i915.sh
+	@LINUX_VERSION=$(LKPI_LINUX_VERSION) sh tools/drm/fetch-i915.sh
 
 $(DRM_CORE_MARKER):
 	@echo "  BOOTSTRAP imported DRM core sources (one-time)"
-	@sh tools/drm/fetch-drm-core.sh
+	@LINUX_VERSION=$(LKPI_LINUX_VERSION) sh tools/drm/fetch-drm-core.sh
 
 bootstrap: $(MUSL_SYSROOT_MARKER) $(I915_SOURCE_MARKER) $(DRM_CORE_MARKER)
 

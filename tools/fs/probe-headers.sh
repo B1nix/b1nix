@@ -19,7 +19,7 @@
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-LINUX_VERSION="${LINUX_VERSION:-6.6}"
+LINUX_VERSION="${LINUX_VERSION:-6.18.51}"
 STAGE_DIR="$ROOT_DIR/build/src/fs-${LINUX_VERSION}"
 GEN_DIR="$ROOT_DIR/build/src/fs-${LINUX_VERSION}-gen"
 CC="${CC:-clang}"

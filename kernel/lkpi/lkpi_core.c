@@ -44,6 +44,11 @@ void *lkpi_kcalloc(usize n, usize size, gfp_t flags)
 	return kzalloc(n * size);
 }
 
+usize lkpi_ksize(const void *ptr)
+{
+	return kmalloc_usable_size(ptr);
+}
+
 void lkpi_kfree(void *ptr)
 {
 	if (ptr)

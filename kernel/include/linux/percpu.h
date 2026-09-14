@@ -22,6 +22,8 @@
  */
 
 #define DEFINE_PER_CPU(type, name) type name
+#define EXPORT_PER_CPU_SYMBOL(var)     extern int lkpi_export_marker_unused
+#define EXPORT_PER_CPU_SYMBOL_GPL(var) extern int lkpi_export_marker_unused
 #define DECLARE_PER_CPU(type, name) extern type name
 #define DEFINE_PER_CPU_SHARED_ALIGNED(type, name) type name
 #define __percpu
@@ -29,7 +31,7 @@
 /* Every CPU sees the same object, so the id is ignored — deliberately, not by
  * omission: the alternative is an array nothing indexes correctly on a kernel
  * with no per-CPU sections. */
-#define per_cpu(var, cpu)      ({ (void)(cpu); (var); })
+#define per_cpu(var, cpu)      (*({ (void)(cpu); &(var); }))
 #define per_cpu_ptr(ptr, cpu)  ({ (void)(cpu); (ptr); })
 #define this_cpu_ptr(ptr)      (ptr)
 #define get_cpu_ptr(ptr)       (ptr)

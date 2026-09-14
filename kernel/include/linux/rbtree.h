@@ -139,4 +139,32 @@ rb_find(const void *key, const struct rb_root *tree,
 	return NULL;
 }
 
+/* Find an equal node in a cached-leftmost tree, or insert `node` and return
+ * NULL. Linux's own. */
+static inline struct rb_node *
+rb_find_add_cached(struct rb_node *node, struct rb_root_cached *tree,
+                   int (*cmp)(const struct rb_node *new, const struct rb_node *exist))
+{
+	bool leftmost = true;
+	struct rb_node **link = &tree->rb_root.rb_node;
+	struct rb_node *parent = NULL;
+	int c;
+
+	while (*link) {
+		parent = *link;
+		c = cmp(node, parent);
+		if (c < 0) {
+			link = &parent->rb_left;
+		} else if (c > 0) {
+			link = &parent->rb_right;
+			leftmost = false;
+		} else {
+			return parent;
+		}
+	}
+	rb_link_node(node, parent, link);
+	rb_insert_color_cached(node, tree, leftmost);
+	return NULL;
+}
+
 #endif

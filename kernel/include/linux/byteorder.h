@@ -32,18 +32,6 @@
 #define swab32(x) __builtin_bswap32((u32)(x))
 #define swab64(x) __builtin_bswap64((u64)(x))
 
-#define get_unaligned_le16(p) le16_to_cpu(*(const __le16 *)(p))
-#define get_unaligned_le32(p) le32_to_cpu(*(const __le32 *)(p))
-#define get_unaligned_le64(p) le64_to_cpu(*(const __le64 *)(p))
-#define get_unaligned_be16(p) be16_to_cpu(*(const __be16 *)(p))
-#define get_unaligned_be32(p) be32_to_cpu(*(const __be32 *)(p))
-#define get_unaligned_be64(p) be64_to_cpu(*(const __be64 *)(p))
-#define put_unaligned_le16(v, p) (*(__le16 *)(p) = cpu_to_le16(v))
-#define put_unaligned_le32(v, p) (*(__le32 *)(p) = cpu_to_le32(v))
-#define put_unaligned_le64(v, p) (*(__le64 *)(p) = cpu_to_le64(v))
-#define put_unaligned_be16(v, p) (*(__be16 *)(p) = cpu_to_be16(v))
-#define put_unaligned_be32(v, p) (*(__be32 *)(p) = cpu_to_be32(v))
-#define put_unaligned_be64(v, p) (*(__be64 *)(p) = cpu_to_be64(v))
 /*
  * Add to a little-endian field in place.
  *
@@ -60,5 +48,8 @@ static inline void le64_add_cpu(__le64 *var, u64 val)
 { *var = cpu_to_le64(le64_to_cpu(*var) + val); }
 static inline void be32_add_cpu(__be32 *var, u32 val)
 { *var = cpu_to_be32(be32_to_cpu(*var) + val); }
+
+/* get_unaligned_* / put_unaligned_*: the upstream helpers, as functions. */
+#include <linux/unaligned.h>
 
 #endif

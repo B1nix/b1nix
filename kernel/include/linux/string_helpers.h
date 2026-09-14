@@ -8,4 +8,7 @@ static inline const char *str_enabled_disabled(bool v)
 { return v ? "enabled" : "disabled"; }
 static inline const char *str_enable_disable(bool v)
 { return v ? "enable" : "disable"; }
+
+#define str_no_yes(v) str_yes_no(!(v))
+
 #endif

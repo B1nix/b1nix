@@ -109,6 +109,7 @@ enum req_flag_bits {
 	__REQ_SWAP,
 	__REQ_DRV,
 	__REQ_FS_PRIVATE,
+	__REQ_ATOMIC,
 	__REQ_NR_BITS,
 };
 
@@ -131,6 +132,7 @@ enum req_flag_bits {
 #define REQ_SWAP               (1ULL << __REQ_SWAP)
 #define REQ_DRV                (1ULL << __REQ_DRV)
 #define REQ_FS_PRIVATE         (1ULL << __REQ_FS_PRIVATE)
+#define REQ_ATOMIC             (1ULL << __REQ_ATOMIC)
 
 /* btrfs names its own bit off REQ_DRV; the definition is upstream's and lives
  * in btrfs's own headers, but the base bit has to be here. */
@@ -227,6 +229,7 @@ struct bio {
 	unsigned short bi_flags;
 	unsigned short bi_ioprio;
 	blk_status_t bi_status;
+	u8 bi_write_hint;           /* the inode's i_write_hint, for the device */
 
 	struct bvec_iter bi_iter;
 

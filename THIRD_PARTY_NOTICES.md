@@ -8,20 +8,22 @@ The GNU General Public License, version 2 only (`GPL-2.0-only`, see [LICENSE](LI
 
 | Component | Staged at | Version / Revision | License | Upstream / Reference |
 | --- | --- | --- | --- | --- |
-| **Linux DRM core** (`drivers/gpu/drm`, `include/drm`, `include/uapi/drm`, `drivers/video/{hdmi,nomodeset}.c`) | `build/src/drm-core-6.6/` | Linux 6.6, SHA-256 `d926a06c…8e56d0` | MIT (`drivers/gpu/drm`, `include/drm`); GPL-2.0 WITH Linux-syscall-note (`include/uapi/drm`) | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz> |
+| **Linux DRM core** (`drivers/gpu/drm`, `include/drm`, `include/uapi/drm`, `drivers/video/{hdmi,nomodeset}.c`, `drivers/gpu/buddy.c`, `include/linux/gpu_buddy.h`) | `build/src/drm-core-6.18.51/` | Linux 6.18.51, SHA-256 `ba2f60f8…58df613` | MIT (`drivers/gpu/drm`, `include/drm`, the buddy allocator); GPL-2.0 WITH Linux-syscall-note (`include/uapi/drm`) | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.51.tar.xz> |
+| **Linux filesystems** (`fs/{btrfs,ext4,jbd2,iomap,quota}`, `fs/mbcache.c`, `lib/{maple_tree,xarray,radix-tree,idr,xxhash}.c`, `lib/{zlib_*,lzo,zstd}`) | `build/src/fs-6.18.51/` | Linux 6.18.51, SHA-256 `ba2f60f8…58df613` | GPL-2.0-only (zstd: BSD-3-Clause OR GPL-2.0) | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.51.tar.xz> |
 
-| **Intel i915** (`drivers/gpu/drm/i915`) | `build/src/i915-6.6/` | Linux 6.6, SHA-256 `d926a06c…8e56d0` | MIT, and the historical X11-style permission grant on the untagged files | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz> |
+| **Intel i915** (`drivers/gpu/drm/i915`) | `build/src/i915-6.18.51/` | Linux 6.18.51, SHA-256 `ba2f60f8…58df613` | MIT, and the historical X11-style permission grant on the untagged files | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.51.tar.xz> |
 
 i915 is staged **only on request** (`make i915-fetch`), and built only when asked
 for (`B1NIX_I915=1`): it is 13 MiB and 262 objects, and a kernel built without a
 GPU should not pay for it. A tree that has not been staged changes nothing about
 the build.
 
-Five files are **not staged**, because they are plain `GPL-2.0` with no
+Seven files are **not staged**, because they are plain `GPL-2.0` with no
 permissive alternative — unlike the DRM core, whose GPL-touched files are all
-`GPL-2.0 or MIT`. Four are pure ftrace plumbing (`i915_trace.h`,
-`i915_trace_points.c`, `display/intel_display_trace.{c,h}`) and are replaced by
-MIT tracepoint headers of our own; the fifth (`display/intel_acpi.c`) is
+`GPL-2.0 or MIT`. Six are pure ftrace plumbing (`i915_trace.h`,
+`i915_trace_points.c`, `display/intel_display_trace.{c,h}`,
+`intel_uncore_trace.{c,h}`) and are replaced by tracepoint headers of our own;
+the seventh (`display/intel_acpi.c`) is
 `CONFIG_ACPI`-only and is not in `i915-y`. `tools/drm/fetch-i915.sh` refuses to
 finish if any other `GPL-2.0`-only file appears outside the selftests, so this
 stays a decision someone made rather than something discovered later.
@@ -29,10 +31,13 @@ stays a decision someone made rather than something discovered later.
 The DRM core is **imported and never edited** — see [`docs/drm-import.md`](docs/drm-import.md).
 `tools/drm/fetch-drm-core.sh` pins the release and verifies the checksum before
 extracting, the same way the port scripts under `tools/ports/` pin theirs.
-Nothing under Linux's `include/linux` is staged: those headers are GPL-2.0
-without exception, and are exactly what b1nix reimplements from scratch in
-`kernel/include/linux` and `kernel/lkpi` — our own code, under b1nix's licence,
-not Linux's.
+Linux's `include/linux` is not staged wholesale: the interfaces the imports
+stand on are reimplemented in `kernel/include/linux` and `kernel/lkpi`. A few
+headers that are data structures or pure macros rather than interfaces are
+carried there copied from Linux 6.18.51 and marked as such — `xarray.h`,
+`radix-tree.h`, `idr.h` (matching the staged `lib/{xarray,radix-tree,idr}.c`),
+`cleanup.h`, `args.h` and `unaligned.h` — under GPL-2.0, which b1nix's own
+GPL-2.0-only licence is compatible with.
 
 ---
 

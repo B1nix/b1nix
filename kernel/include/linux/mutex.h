@@ -110,4 +110,14 @@ struct lockdep_map { int unused; };
  */
 static inline void mutex_lock_io(struct mutex *m) { mutex_lock(m); }
 
+/* guard(mutex)(&m): held to the end of the scope. */
+#include <linux/cleanup.h>
+/* The guard's error-pointer test compares an unsigned long with -MAX_ERRNO,
+ * which is upstream's code and not a sign bug. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"
+DEFINE_GUARD(mutex, struct mutex *, mutex_lock(_T), mutex_unlock(_T))
+DEFINE_GUARD_COND(mutex, _try, mutex_trylock(_T))
+#pragma GCC diagnostic pop
+
 #endif

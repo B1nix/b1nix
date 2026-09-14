@@ -154,4 +154,10 @@ int kstrtobool_from_user(const char __user *s, usize count, bool *res);
 long copy_to_user_nofault(void __user *dst, const void *src, size_t size);
 long copy_from_user_nofault(void *dst, const void __user *src, size_t size);
 
+/* The copy i915's pwrite uses for a pinned destination; the ordinary checked
+ * copy, whose return convention (bytes not copied) it shares. */
+static inline unsigned long
+copy_from_user_inatomic_nontemporal(void *to, const void __user *from, unsigned long n)
+{ return copy_from_user(to, from, n); }
+
 #endif

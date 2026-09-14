@@ -25,8 +25,13 @@ set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
-LINUX_VERSION="${LINUX_VERSION:-6.6}"
-LINUX_SHA256="d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0"
+LINUX_VERSION="${LINUX_VERSION:-6.18.51}"
+# Pinned tarballs, checked against kernel.org's signed sha256sums.asc.
+case "$LINUX_VERSION" in
+6.6)     LINUX_SHA256="d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0" ;;
+6.18.51) LINUX_SHA256="ba2f60f858bf4d1f929101faa356c93dc8b925b17aaa9f95eabd4627758df613" ;;
+*) echo "fetch-i915: no pinned SHA256 for linux-$LINUX_VERSION" >&2; exit 1 ;;
+esac
 TARBALL="linux-${LINUX_VERSION}.tar.xz"
 URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${TARBALL}"
 
@@ -63,14 +68,16 @@ mkdir -p "$STAGE_DIR.tmp"
 tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
 	"linux-${LINUX_VERSION}/drivers/gpu/drm/i915"
 
-# The four GPL-2.0 tracepoint files, removed from the staged tree rather than
+# The GPL-2.0 tracepoint files, removed from the staged tree rather than
 # merely left out of the object list: the point is that no GPL-2.0 source lands
 # in the tree at all, and a header sitting there unbuilt would still be there to
 # be included by accident.
 rm -f "$STAGE_DIR.tmp/drivers/gpu/drm/i915/i915_trace.h" \
       "$STAGE_DIR.tmp/drivers/gpu/drm/i915/i915_trace_points.c" \
       "$STAGE_DIR.tmp/drivers/gpu/drm/i915/display/intel_display_trace.h" \
-      "$STAGE_DIR.tmp/drivers/gpu/drm/i915/display/intel_display_trace.c"
+      "$STAGE_DIR.tmp/drivers/gpu/drm/i915/display/intel_display_trace.c" \
+      "$STAGE_DIR.tmp/drivers/gpu/drm/i915/intel_uncore_trace.h" \
+      "$STAGE_DIR.tmp/drivers/gpu/drm/i915/intel_uncore_trace.c"
 
 # display/intel_acpi.c is GPL-2.0 too, and is the ACPI _DSM enumeration i915
 # builds only under CONFIG_ACPI — it is not in i915-y and nothing here would
@@ -109,7 +116,7 @@ sed -e :a -e '/\\$/N; s/\\\n//; ta' \
 	sort -u > "$STAGE_DIR.tmp/B1NIX-OBJECTS.all"
 
 # Without the tracepoint TUs, which are not staged.
-grep -vxE 'i915_trace_points\.c|display/intel_display_trace\.c' \
+grep -vxE 'i915_trace_points\.c|display/intel_display_trace\.c|intel_uncore_trace\.c' \
 	"$STAGE_DIR.tmp/B1NIX-OBJECTS.all" > "$STAGE_DIR.tmp/B1NIX-OBJECTS"
 
 # The OpRegion, which upstream builds only under CONFIG_ACPI and which is
@@ -127,7 +134,8 @@ source:  linux-${LINUX_VERSION}
 sha256:  ${LINUX_SHA256}
 url:     ${URL}
 staged:  drivers/gpu/drm/i915 (MIT and X11-style permission grants)
-removed: i915_trace.h, i915_trace_points.c, display/intel_display_trace.{c,h}
+removed: i915_trace.h, i915_trace_points.c, display/intel_display_trace.{c,h},
+         intel_uncore_trace.{c,h}
          — plain GPL-2.0, pure ftrace plumbing, replaced by MIT shim headers;
          display/intel_acpi.c — plain GPL-2.0, CONFIG_ACPI-only, not in i915-y.
 rule:    imported source is never edited; fixes belong in kernel/lkpi.

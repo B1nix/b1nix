@@ -39,4 +39,7 @@ int dma_fence_chain_find_seqno(struct dma_fence **pfence, u64 seqno);
  * ops against them to recognise a chain. */
 extern const struct dma_fence_ops dma_fence_chain_ops;
 
+static inline bool dma_fence_is_chain(struct dma_fence *fence)
+{ return fence->ops == &dma_fence_chain_ops; }
+
 #endif

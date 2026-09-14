@@ -195,4 +195,7 @@ struct vm_fault;
 
 
 
+/* The integer type device-id tables store driver data in (uapi mod_devicetable). */
+typedef unsigned long kernel_ulong_t;
+
 #endif

@@ -119,7 +119,8 @@ int get_tree_block_key(struct fs_context *fc,
 
 int vfs_parse_fs_param(struct fs_context *fc, struct fs_parameter *param);
 int vfs_parse_fs_string(struct fs_context *fc, const char *key,
-                        const char *value, size_t v_size);
+                        const char *value);
+struct vfsmount *fc_mount_longterm(struct fs_context *fc);
 int generic_parse_monolithic(struct fs_context *fc, void *data);
 struct fs_context *fs_context_for_mount(struct file_system_type *fs_type,
                                         unsigned int sb_flags);
@@ -140,5 +141,8 @@ int logfc_error(struct fs_context *fc, const char *fmt, ...);
 #define warnf(fc, fmt, ...)   ((void)(fc))
 #define errorf(fc, fmt, ...)  logfc_error(fc, fmt, ##__VA_ARGS__)
 #define invalf(fc, fmt, ...)  (errorf(fc, fmt, ##__VA_ARGS__), -EINVAL)
+
+struct fs_context *vfs_dup_fs_context(struct fs_context *src_fc);
+struct vfsmount *vfs_create_mount(struct fs_context *fc);
 
 #endif

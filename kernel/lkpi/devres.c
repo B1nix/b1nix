@@ -143,6 +143,32 @@ int devm_add_action(struct device *dev, void (*action)(void *), void *data)
 	return 0;
 }
 
+/* Run one registered action now and forget it, so the device's teardown does
+ * not run it a second time. */
+void devm_release_action(struct device *dev, void (*action)(void *), void *data)
+{
+	struct devres_node **link, *found = 0;
+
+	if (!dev)
+		return;
+	lkpi_mutex_lock(&dev->devres_lock);
+	for (link = &dev->devres; *link; link = &(*link)->next) {
+		struct devres_action *a = devres_payload(*link);
+
+		if ((*link)->release == devres_action_release &&
+		    a->action == action && a->data == data) {
+			found = *link;
+			*link = found->next;
+			break;
+		}
+	}
+	lkpi_mutex_unlock(&dev->devres_lock);
+	if (!found)
+		return;
+	action(data);
+	lkpi_kfree(found);
+}
+
 int devm_add_action_or_reset(struct device *dev, void (*action)(void *),
                              void *data)
 {

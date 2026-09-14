@@ -70,4 +70,7 @@ int ___ratelimit(struct ratelimit_state *rs, const char *func);
 #define pr_notice_ratelimited(fmt, ...) pr_notice(fmt, ##__VA_ARGS__)
 #endif
 
+static inline int ratelimit_state_get_miss(struct ratelimit_state *rs)
+{ return rs->missed; }
+
 #endif

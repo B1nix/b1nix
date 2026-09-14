@@ -19,6 +19,15 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include "display/intel_display_types.h"
+#include "display/intel_display_core.h"
+#include "display/intel_display_regs.h"
+#include "display/intel_cursor_regs.h"
+#include "display/intel_pipe_crc_regs.h"
+#include "display/skl_universal_plane_regs.h"
+#include "display/intel_dpll_mgr.h"
+#include "display/intel_color_regs.h"
+#include "display/intel_display_power.h"
+#include "display/intel_cdclk.h"
 #include "display/intel_gmbus_regs.h"
 #include "display/intel_cdclk.h"
 #include "i915_reg.h"
@@ -168,7 +177,7 @@ static u32 tearwatch_vdisplay(void)
 static int i915_tearwatch_thread(void *arg)
 {
 	struct drm_i915_private *i915 = to_i915_checked(tearwatch_i915);
-	struct drm_i915_private *dev_priv = i915; /* PIPEDSL() names it */
+	struct intel_display *display = i915->display;
 	u32 last_live = 0;
 	int have_last = 0;
 	u64 in_active = 0, in_blank = 0, changes = 0, straddle = 0, loose = 0;
@@ -225,7 +234,7 @@ static int i915_tearwatch_thread(void *arg)
 				continue;
 			}
 			dsl = intel_uncore_read_fw(&i915->uncore,
-			                           PIPEDSL(pipe)) & 0x1fffff;
+			                           PIPEDSL(display, pipe)) & 0x1fffff;
 			surf = intel_uncore_read_fw(&i915->uncore,
 			                            PLANE_SURFLIVE(pipe, PLANE_PRIMARY));
 			/* One count per frame: the scanline counter wrapping is the
@@ -374,10 +383,10 @@ static int i915_tearwatch_thread(void *arg)
 				local_irq_save(irqflags);
 				for (spins = 0; spins < 4000; spins++) {
 					u32 dsl_before = intel_uncore_read_fw(&i915->uncore,
-					                     PIPEDSL(pipe)) & 0x1fffff;
+					                     PIPEDSL(display, pipe)) & 0x1fffff;
 					u64 pte = readq(&((u64 __iomem *)ggtt->gsm)[idx]);
 					u32 dsl_after = intel_uncore_read_fw(&i915->uncore,
-					                    PIPEDSL(pipe)) & 0x1fffff;
+					                    PIPEDSL(display, pipe)) & 0x1fffff;
 
 					samples++;
 					if (!have_prev) {
@@ -501,7 +510,7 @@ static int i915_tearwatch_thread(void *arg)
 				continue;
 			for (;;) {
 				dsl = intel_uncore_read_fw(&i915->uncore,
-				                           PIPEDSL(pipe)) & 0x1fffff;
+				                           PIPEDSL(display, pipe)) & 0x1fffff;
 				if (prev_dsl != 0xffffffff && dsl < prev_dsl)
 					break;
 				prev_dsl = dsl;
@@ -523,7 +532,7 @@ static int i915_tearwatch_thread(void *arg)
 			}
 			/* Wait until the beam is near the bottom, then look again. */
 			while ((intel_uncore_read_fw(&i915->uncore,
-			                             PIPEDSL(pipe)) & 0x1fffff) <
+			                             PIPEDSL(display, pipe)) & 0x1fffff) <
 			       vdisplay - 32u)
 				;
 			for (y = 0; y < vdisplay; y += 8) {
@@ -601,7 +610,7 @@ static int i915_tearwatch_thread(void *arg)
 			 * scanout rather than across a flip. */
 			for (;;) {
 				dsl = intel_uncore_read_fw(&i915->uncore,
-				                           PIPEDSL(pipe)) & 0x1fffff;
+				                           PIPEDSL(display, pipe)) & 0x1fffff;
 				if (prev_dsl != 0xffffffff && dsl < prev_dsl)
 					break;
 				prev_dsl = dsl;
@@ -689,9 +698,9 @@ static int i915_tearwatch_thread(void *arg)
 				}
 				pr_info("i915: bandwatch:   cursor ctl %08x pos %08x "
 				        "base %08x\n",
-				        intel_uncore_read_fw(&i915->uncore, CURCNTR(pipe)),
-				        intel_uncore_read_fw(&i915->uncore, CURPOS(pipe)),
-				        intel_uncore_read_fw(&i915->uncore, CURBASE(pipe)));
+				        intel_uncore_read_fw(&i915->uncore, CURCNTR(display, pipe)),
+				        intel_uncore_read_fw(&i915->uncore, CURPOS(display, pipe)),
+				        intel_uncore_read_fw(&i915->uncore, CURBASE(display, pipe)));
 				pr_info("i915: bandwatch: %llu frame(s): %llu unchanged, "
 				        "%llu changed everywhere, %llu changed in PART of "
 				        "the picture (worst %llu of 16 bands)\n",
@@ -815,11 +824,11 @@ static int i915_tearwatch_thread(void *arg)
 			local_irq_save(irqflags);
 		for (spins = 0; spins < 4000; spins++) {
 			dsl_before = intel_uncore_read_fw(&i915->uncore,
-			                                  PIPEDSL(pipe)) & 0x1fffff;
+			                                  PIPEDSL(display, pipe)) & 0x1fffff;
 			live = intel_uncore_read_fw(&i915->uncore,
 			                            PLANE_SURFLIVE(pipe, PLANE_PRIMARY));
 			dsl_after = intel_uncore_read_fw(&i915->uncore,
-			                                 PIPEDSL(pipe)) & 0x1fffff;
+			                                 PIPEDSL(display, pipe)) & 0x1fffff;
 			samples++;
 			if (!have_last) {
 				/* The first reading is a starting point, not a change. */
@@ -1040,10 +1049,11 @@ u32 lkpi_i915_armed_surface(void)
 u32 lkpi_i915_scanline(void)
 {
 	struct drm_i915_private *dev_priv = to_i915_checked(tearwatch_i915);
+	struct intel_display *display = dev_priv->display;
 
 	if (!dev_priv)
 		return 0xffffffff;
-	return intel_uncore_read_fw(&dev_priv->uncore, PIPEDSL(PIPE_A)) & 0x1fffff;
+	return intel_uncore_read_fw(&dev_priv->uncore, PIPEDSL(display, PIPE_A)) & 0x1fffff;
 }
 
 /*
@@ -1286,7 +1296,7 @@ void lkpi_i915_note_commit(void)
 static int i915_crcwatch_thread(void *arg)
 {
 	struct drm_i915_private *i915 = to_i915_checked(tearwatch_i915);
-	struct drm_i915_private *dev_priv = i915;
+	struct intel_display *display = i915->display;
 	u32 seen[64], count[64];
 	unsigned n_seen = 0;
 	u64 frames = 0, reports = 0;
@@ -1319,7 +1329,7 @@ static int i915_crcwatch_thread(void *arg)
 			continue;
 		}
 		if (enabled != pipe) {
-			intel_uncore_write_fw(&i915->uncore, PIPE_CRC_CTL(pipe),
+			intel_uncore_write_fw(&i915->uncore, PIPE_CRC_CTL(display, pipe),
 			                      PIPE_CRC_ENABLE |
 			                      PIPE_CRC_SOURCE_DMUX_SKL);
 			enabled = pipe;
@@ -1331,7 +1341,7 @@ static int i915_crcwatch_thread(void *arg)
 		}
 
 		/* One sample per frame: wait for the scanline counter to wrap. */
-		dsl = intel_uncore_read_fw(&i915->uncore, PIPEDSL(pipe)) & 0x1fffff;
+		dsl = intel_uncore_read_fw(&i915->uncore, PIPEDSL(display, pipe)) & 0x1fffff;
 		if (dsl >= prev_dsl) {
 			prev_dsl = dsl;
 			continue;
@@ -1351,9 +1361,9 @@ static int i915_crcwatch_thread(void *arg)
 		 * even enabled and whether it is what is moving.
 		 */
 		{
-			u32 ccntr = intel_uncore_read_fw(&i915->uncore, CURCNTR(pipe));
-			u32 cbase = intel_uncore_read_fw(&i915->uncore, CURBASE(pipe));
-			u32 cpos = intel_uncore_read_fw(&i915->uncore, CURPOS(pipe));
+			u32 ccntr = intel_uncore_read_fw(&i915->uncore, CURCNTR(display, pipe));
+			u32 cbase = intel_uncore_read_fw(&i915->uncore, CURBASE(display, pipe));
+			u32 cpos = intel_uncore_read_fw(&i915->uncore, CURPOS(display, pipe));
 
 			if (ccntr != cur_ctl || cbase != cur_base || cpos != cur_pos) {
 				cur_moves++;
@@ -1376,13 +1386,13 @@ static int i915_crcwatch_thread(void *arg)
 		 */
 		if (!latch_checked) {
 			u32 dsl_a = intel_uncore_read_fw(&i915->uncore,
-			                                 PIPEDSL(pipe)) & 0x1fffff;
+			                                 PIPEDSL(display, pipe)) & 0x1fffff;
 			u32 crc_a = intel_uncore_read_fw(&i915->uncore,
 			                                 PIPE_CRC_RES_1_IVB(pipe));
 			u32 dsl_b, crc_b;
 
 			while (((dsl_b = intel_uncore_read_fw(&i915->uncore,
-			                                      PIPEDSL(pipe)) & 0x1fffff)
+			                                      PIPEDSL(display, pipe)) & 0x1fffff)
 			        < 800) && dsl_b >= dsl_a)
 				;
 			crc_b = intel_uncore_read_fw(&i915->uncore,
@@ -1692,7 +1702,7 @@ static void *fd_map_ggtt(struct i915_ggtt *ggtt, u32 ggtt_addr)
 static int i915_framedump_thread(void *arg)
 {
 	struct drm_i915_private *i915 = to_i915_checked(tearwatch_i915);
-	struct drm_i915_private *dev_priv = i915;
+	struct intel_display *display = i915->display;
 	struct i915_ggtt *ggtt;
 	u32 frames = lkpi_bootopt_u32("b1nix.drm-framedump", 1);
 	u32 at = lkpi_bootopt_u32("b1nix.drm-framedump-at", 45);
@@ -1729,7 +1739,7 @@ static int i915_framedump_thread(void *arg)
 			continue;
 		}
 		width = stride / 4u;
-		dsl0 = intel_uncore_read_fw(&i915->uncore, PIPEDSL(pipe));
+		dsl0 = intel_uncore_read_fw(&i915->uncore, PIPEDSL(display, pipe));
 
 		pr_info("FD: frame %u pipe %c surf %08x stride %u %ux%u step %ux%u "
 		        "dsl %u\n", n, 'A' + pipe, surf, stride, width, vdisplay,
@@ -1768,7 +1778,7 @@ static int i915_framedump_thread(void *arg)
 				        (x - got * step) / step, line);
 			}
 		}
-		dsl1 = intel_uncore_read_fw(&i915->uncore, PIPEDSL(pipe));
+		dsl1 = intel_uncore_read_fw(&i915->uncore, PIPEDSL(display, pipe));
 		pr_info("FD: frame %u end dsl %u surf now %08x\n", n, dsl1,
 		        intel_uncore_read_fw(&i915->uncore,
 		                             PLANE_SURFLIVE(pipe, PLANE_PRIMARY)));
@@ -1851,17 +1861,18 @@ void lkpi_i915_dump_pipe_state(struct drm_device *dev)
 	 * exactly that name, so any other name fails to compile.
 	 */
 	struct drm_i915_private *dev_priv = to_i915_checked(dev);
+	struct intel_display *display = dev_priv->display;
 	u32 conf, dsl1, dsl2, frm1, frm2;
 
-	conf = intel_uncore_read(&dev_priv->uncore, TRANSCONF(PIPE_A));
-	dsl1 = intel_uncore_read(&dev_priv->uncore, PIPEDSL(PIPE_A));
-	frm1 = intel_uncore_read(&dev_priv->uncore, PIPE_FRMCOUNT_G4X(PIPE_A));
+	conf = intel_uncore_read(&dev_priv->uncore, TRANSCONF(display, PIPE_A));
+	dsl1 = intel_uncore_read(&dev_priv->uncore, PIPEDSL(display, PIPE_A));
+	frm1 = intel_uncore_read(&dev_priv->uncore, PIPE_FRMCOUNT_G4X(display, PIPE_A));
 
 	/* Longer than a frame at 60 Hz, so a running pipe must have advanced. */
 	udelay(20000);
 
-	dsl2 = intel_uncore_read(&dev_priv->uncore, PIPEDSL(PIPE_A));
-	frm2 = intel_uncore_read(&dev_priv->uncore, PIPE_FRMCOUNT_G4X(PIPE_A));
+	dsl2 = intel_uncore_read(&dev_priv->uncore, PIPEDSL(display, PIPE_A));
+	frm2 = intel_uncore_read(&dev_priv->uncore, PIPE_FRMCOUNT_G4X(display, PIPE_A));
 
 	pr_info("i915-probe: TRANSCONF %08x (enabled %d) scanline %u->%u frame %u->%u\n",
 	        conf, (int)((conf >> 31) & 1), dsl1, dsl2, frm1, frm2);
@@ -1882,7 +1893,7 @@ void lkpi_i915_dump_pipe_state(struct drm_device *dev)
 	 */
 	{
 		u32 func = intel_uncore_read(&dev_priv->uncore,
-		                             TRANS_DDI_FUNC_CTL(TRANSCODER_A));
+		                             TRANS_DDI_FUNC_CTL(display, TRANSCODER_A));
 		enum port p;
 
 		pr_info("i915-probe: TRANS_DDI_FUNC_CTL %08x (enabled %d, port select %u)\n",
@@ -1977,19 +1988,21 @@ void lkpi_i915_dump_vblank_state(struct drm_device *dev)
 void lkpi_i915_crc_begin(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = to_i915_checked(dev);
+	struct intel_display *display = dev_priv->display;
 
 	/* DMUX is the pipe's own output, past every plane and the blender —
 	 * exactly what the transcoder takes. */
-	intel_uncore_write(&dev_priv->uncore, PIPE_CRC_CTL(PIPE_A),
+	intel_uncore_write(&dev_priv->uncore, PIPE_CRC_CTL(display, PIPE_A),
 	                   PIPE_CRC_ENABLE | PIPE_CRC_SOURCE_DMUX_SKL);
-	intel_uncore_posting_read(&dev_priv->uncore, PIPE_CRC_CTL(PIPE_A));
+	intel_uncore_posting_read(&dev_priv->uncore, PIPE_CRC_CTL(display, PIPE_A));
 }
 
 void lkpi_i915_crc_end(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = to_i915_checked(dev);
+	struct intel_display *display = dev_priv->display;
 
-	intel_uncore_write(&dev_priv->uncore, PIPE_CRC_CTL(PIPE_A), 0);
+	intel_uncore_write(&dev_priv->uncore, PIPE_CRC_CTL(display, PIPE_A), 0);
 }
 
 /*
@@ -2003,10 +2016,11 @@ void lkpi_i915_crc_end(struct drm_device *dev)
 u32 lkpi_i915_crc_sample(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = to_i915_checked(dev);
+	struct intel_display *display = dev_priv->display;
 	u32 start, seen;
 	unsigned spins;
 
-	start = intel_uncore_read(&dev_priv->uncore, PIPE_FRMCOUNT_G4X(PIPE_A));
+	start = intel_uncore_read(&dev_priv->uncore, PIPE_FRMCOUNT_G4X(display, PIPE_A));
 	for (seen = 0; seen < 2; seen++) {
 		u32 target = start + seen + 1;
 
@@ -2014,7 +2028,7 @@ u32 lkpi_i915_crc_sample(struct drm_device *dev)
 		 * and gives up rather than hanging if the pipe stops. */
 		for (spins = 0; spins < 200; spins++) {
 			if (intel_uncore_read(&dev_priv->uncore,
-			                      PIPE_FRMCOUNT_G4X(PIPE_A)) >= target)
+			                      PIPE_FRMCOUNT_G4X(display, PIPE_A)) >= target)
 				break;
 			udelay(1000);
 		}
@@ -2037,8 +2051,9 @@ u32 lkpi_i915_crc_sample(struct drm_device *dev)
 void lkpi_i915_dump_infoframes(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = to_i915_checked(dev);
+	struct intel_display *display = dev_priv->display;
 	u32 dip = intel_uncore_read(&dev_priv->uncore,
-	                            HSW_TVIDEO_DIP_CTL(TRANSCODER_A));
+	                            HSW_TVIDEO_DIP_CTL(display, TRANSCODER_A));
 
 	pr_info("i915-probe: VIDEO_DIP_CTL %08x (enable %d, AVI %d)\n",
 	        dip, (int)((dip & VIDEO_DIP_ENABLE) ? 1 : 0),
@@ -2141,11 +2156,12 @@ void lkpi_i915_dump_edid(struct drm_device *dev)
 void lkpi_i915_gmbus_recover(struct drm_device *dev)
 {
 	struct drm_i915_private *i915 = to_i915_checked(dev);
+	struct intel_display *display = i915->display;
 	u32 stat;
 
 	if (!i915)
 		return;
-	stat = intel_uncore_read(&i915->uncore, GMBUS2(i915));
+	stat = intel_uncore_read(&i915->uncore, GMBUS2(display));
 	if (!(stat & (GMBUS_INUSE | GMBUS_ACTIVE)))
 		return;
 
@@ -2153,19 +2169,20 @@ void lkpi_i915_gmbus_recover(struct drm_device *dev)
 	        (unsigned)stat);
 	/* Abandon the cycle: clear the software-ready bit and any pending
 	 * interrupt, deselect the pin, then drop the semaphore. */
-	intel_uncore_write(&i915->uncore, GMBUS1(i915), GMBUS_SW_CLR_INT);
-	intel_uncore_write(&i915->uncore, GMBUS1(i915), 0);
-	intel_uncore_write(&i915->uncore, GMBUS0(i915), 0);
-	intel_uncore_write(&i915->uncore, GMBUS4(i915), 0);
-	intel_uncore_write(&i915->uncore, GMBUS2(i915), GMBUS_INUSE);
-	intel_uncore_posting_read(&i915->uncore, GMBUS2(i915));
+	intel_uncore_write(&i915->uncore, GMBUS1(display), GMBUS_SW_CLR_INT);
+	intel_uncore_write(&i915->uncore, GMBUS1(display), 0);
+	intel_uncore_write(&i915->uncore, GMBUS0(display), 0);
+	intel_uncore_write(&i915->uncore, GMBUS4(display), 0);
+	intel_uncore_write(&i915->uncore, GMBUS2(display), GMBUS_INUSE);
+	intel_uncore_posting_read(&i915->uncore, GMBUS2(display));
 	pr_info("i915-probe: GMBUS after release: %x\n",
-	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS2(i915)));
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS2(display)));
 }
 
 void lkpi_i915_dump_gmbus(struct drm_device *dev)
 {
 	struct drm_i915_private *i915 = to_i915_checked(dev);
+	struct intel_display *display = i915->display;
 	u32 saved, probe;
 
 	if (!i915)
@@ -2180,10 +2197,10 @@ void lkpi_i915_dump_gmbus(struct drm_device *dev)
 	 * it back separates those two, and it is safe: the value is restored, and
 	 * this runs before anything else drives the bus.
 	 */
-	saved = intel_uncore_read(&i915->uncore, GMBUS0(i915));
-	intel_uncore_write(&i915->uncore, GMBUS0(i915), 0x4);
-	probe = intel_uncore_read(&i915->uncore, GMBUS0(i915));
-	intel_uncore_write(&i915->uncore, GMBUS0(i915), saved);
+	saved = intel_uncore_read(&i915->uncore, GMBUS0(display));
+	intel_uncore_write(&i915->uncore, GMBUS0(display), 0x4);
+	probe = intel_uncore_read(&i915->uncore, GMBUS0(display));
+	intel_uncore_write(&i915->uncore, GMBUS0(display), saved);
 	pr_info("i915-probe: gmbus write test: wrote 4, read back %x (saved %x)\n",
 	        (unsigned)probe, (unsigned)saved);
 	/* The clock the GMBUS engine runs on. A controller with no reference clock
@@ -2191,19 +2208,20 @@ void lkpi_i915_dump_gmbus(struct drm_device *dev)
 	 * like from the driver's side. */
 	pr_info("i915-probe: rawclk reg %x, rawclk_freq %u kHz\n",
 	        (unsigned)intel_uncore_read(&i915->uncore, PCH_RAWCLK_FREQ),
-	        (unsigned)i915->display.cdclk.hw.ref);
+	        (unsigned)display->cdclk.hw.ref);
 	pr_info("i915-probe: gmbus base %x GMBUS0 %x GMBUS1 %x GMBUS2 %x GMBUS4 %x GMBUS5 %x\n",
-	        (unsigned)GMBUS_MMIO_BASE(i915),
-	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS0(i915)),
-	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS1(i915)),
-	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS2(i915)),
-	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS4(i915)),
-	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS5(i915)));
+	        (unsigned)__GMBUS_MMIO_BASE(display),
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS0(display)),
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS1(display)),
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS2(display)),
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS4(display)),
+	        (unsigned)intel_uncore_read(&i915->uncore, GMBUS5(display)));
 }
 
 void lkpi_i915_dump_port_state(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = to_i915_checked(dev);
+	struct intel_display *display = dev_priv->display;
 	/*
 	 * A display power reference for the duration of the dump.
 	 *
@@ -2213,7 +2231,7 @@ void lkpi_i915_dump_port_state(struct drm_device *dev)
 	 * this investigation after the wrong thing twice.
 	 */
 	intel_wakeref_t dump_wakeref =
-		intel_display_power_get(dev_priv, POWER_DOMAIN_DISPLAY_CORE);
+		intel_display_power_get(display, POWER_DOMAIN_DISPLAY_CORE);
 	u32 func, ctrl1, ctrl2, status, sdeisr, buf1, buf2, iir;
 	enum transcoder dump_transcoder;
 	enum port port;
@@ -2235,7 +2253,7 @@ void lkpi_i915_dump_port_state(struct drm_device *dev)
 
 		for (unsigned i = 0; i < 3; i++) {
 			u32 conf = intel_uncore_read(&dev_priv->uncore,
-			                             TRANSCONF(candidates[i]));
+			                             TRANSCONF(display, candidates[i]));
 
 			if (conf & TRANSCONF_ENABLE) {
 				chosen = candidates[i];
@@ -2245,16 +2263,16 @@ void lkpi_i915_dump_port_state(struct drm_device *dev)
 		dump_transcoder = chosen;
 		pr_info("i915-probe: TRANSCONF A %x B %x C %x, dumping %d\n",
 		        (unsigned)intel_uncore_read(&dev_priv->uncore,
-		                                    TRANSCONF(TRANSCODER_A)),
+		                                    TRANSCONF(display, TRANSCODER_A)),
 		        (unsigned)intel_uncore_read(&dev_priv->uncore,
-		                                    TRANSCONF(TRANSCODER_B)),
+		                                    TRANSCONF(display, TRANSCODER_B)),
 		        (unsigned)intel_uncore_read(&dev_priv->uncore,
-		                                    TRANSCONF(TRANSCODER_C)),
+		                                    TRANSCONF(display, TRANSCODER_C)),
 		        (int)chosen);
 	}
 
 	func = intel_uncore_read(&dev_priv->uncore,
-	                         TRANS_DDI_FUNC_CTL(dump_transcoder));
+	                         TRANS_DDI_FUNC_CTL(display, dump_transcoder));
 	/* Bits 30:28 name the port the transcoder feeds; 1 is DDI B. */
 	port = (enum port)(((func >> 28) & 0x7) ? ((func >> 28) & 0x7) : 0);
 
@@ -2329,8 +2347,8 @@ void lkpi_i915_dump_port_state(struct drm_device *dev)
 	 * value-1), which is 148.5 MHz of pixel clock.
 	 */
 	{
-		u32 ht = intel_uncore_read(&dev_priv->uncore, TRANS_HTOTAL(dump_transcoder));
-		u32 vt = intel_uncore_read(&dev_priv->uncore, TRANS_VTOTAL(dump_transcoder));
+		u32 ht = intel_uncore_read(&dev_priv->uncore, TRANS_HTOTAL(display, dump_transcoder));
+		u32 vt = intel_uncore_read(&dev_priv->uncore, TRANS_VTOTAL(display, dump_transcoder));
 		u32 c1 = intel_uncore_read(&dev_priv->uncore, DPLL_CFGCR1(SKL_DPLL1));
 		u32 c2 = intel_uncore_read(&dev_priv->uncore, DPLL_CFGCR2(SKL_DPLL1));
 
@@ -2384,7 +2402,7 @@ void lkpi_i915_dump_port_state(struct drm_device *dev)
 
 		for (i = 0; i < 4; i++)
 			w[i] = intel_uncore_read(&dev_priv->uncore,
-			                         HSW_TVIDEO_DIP_AVI_DATA(TRANSCODER_A, i));
+			                         HSW_TVIDEO_DIP_AVI_DATA(display, TRANSCODER_A, i));
 		for (i = 0; i < 16; i++)
 			b[i] = (unsigned char)((w[i / 4] >> ((i % 4) * 8)) & 0xff);
 		/* Header (3 bytes) plus the 13 payload bytes an AVI InfoFrame has. */
@@ -2414,7 +2432,7 @@ void lkpi_i915_dump_port_state(struct drm_device *dev)
 
 		for (i = 0; i < 8; i++)
 			w[i] = intel_uncore_read(&dev_priv->uncore,
-			                         HSW_TVIDEO_DIP_AVI_DATA(TRANSCODER_A, i));
+			                         HSW_TVIDEO_DIP_AVI_DATA(display, TRANSCODER_A, i));
 		for (i = 0; i < 32; i++)
 			b[i] = (unsigned char)((w[i / 4] >> ((i % 4) * 8)) & 0xff);
 		/* Header is three bytes; an AVI InfoFrame's body is thirteen. */
@@ -2439,7 +2457,7 @@ void lkpi_i915_dump_port_state(struct drm_device *dev)
 	 */
 	{
 		u32 gcp = intel_uncore_read(&dev_priv->uncore,
-		                            HSW_TVIDEO_DIP_GCP(TRANSCODER_A));
+		                            HSW_TVIDEO_DIP_GCP(display, TRANSCODER_A));
 
 		pr_info("i915-probe: GCP %08x (av_mute %d, default_phase %d, "
 		        "color_indication %d)\n", gcp,
@@ -2539,7 +2557,7 @@ void lkpi_i915_dump_port_state(struct drm_device *dev)
 	        (unsigned)((func & TRANS_DDI_BPC_MASK) >> 20),
 	        (int)((iir & GEN8_PIPE_FIFO_UNDERRUN) ? 1 : 0), sdeisr);
 	lkpi_i915_dump_gmbus(dev);
-	intel_display_power_put(dev_priv, POWER_DOMAIN_DISPLAY_CORE, dump_wakeref);
+	intel_display_power_put(display, POWER_DOMAIN_DISPLAY_CORE, dump_wakeref);
 }
 
 /*
@@ -2556,13 +2574,14 @@ void lkpi_i915_dump_port_state(struct drm_device *dev)
 void lkpi_i915_crc_watch(struct drm_device *dev, unsigned seconds)
 {
 	struct drm_i915_private *dev_priv = to_i915_checked(dev);
+	struct intel_display *display = dev_priv->display;
 	u32 first = 0, first_w2 = 0, first_buf = 0;
 	enum port port = PORT_C;
 	unsigned i;
 
-	intel_uncore_write(&dev_priv->uncore, PIPE_CRC_CTL(PIPE_A),
+	intel_uncore_write(&dev_priv->uncore, PIPE_CRC_CTL(display, PIPE_A),
 	                   PIPE_CRC_ENABLE | PIPE_CRC_SOURCE_DMUX_SKL);
-	intel_uncore_posting_read(&dev_priv->uncore, PIPE_CRC_CTL(PIPE_A));
+	intel_uncore_posting_read(&dev_priv->uncore, PIPE_CRC_CTL(display, PIPE_A));
 
 	for (i = 0; i < seconds; i++) {
 		u32 crc, start;
@@ -2576,10 +2595,10 @@ void lkpi_i915_crc_watch(struct drm_device *dev, unsigned seconds)
 		 * monitor was plainly something else.
 		 */
 		start = intel_uncore_read(&dev_priv->uncore,
-		                          PIPE_FRMCOUNT_G4X(PIPE_A));
+		                          PIPE_FRMCOUNT_G4X(display, PIPE_A));
 		for (spins = 0; spins < 200; spins++) {
 			if (intel_uncore_read(&dev_priv->uncore,
-			                      PIPE_FRMCOUNT_G4X(PIPE_A)) != start)
+			                      PIPE_FRMCOUNT_G4X(display, PIPE_A)) != start)
 				break;
 			udelay(1000);
 		}
@@ -2614,7 +2633,7 @@ void lkpi_i915_crc_watch(struct drm_device *dev, unsigned seconds)
 				         buf != first_buf) ? "  CHANGED" : "");
 		}
 	}
-	intel_uncore_write(&dev_priv->uncore, PIPE_CRC_CTL(PIPE_A), 0);
+	intel_uncore_write(&dev_priv->uncore, PIPE_CRC_CTL(display, PIPE_A), 0);
 }
 
 /* ── mapping i915 objects into userspace ──────────────────────────── */
@@ -2673,6 +2692,31 @@ static int i915_gem_page_phys(struct drm_vma_offset_node *node, u64 index,
 	return 0;
 }
 
+static bool lkpi_i915_no_power_saving;
+
+void lkpi_i915_disable_display_power_saving(void)
+{
+	lkpi_i915_no_power_saving = true;
+}
+
+/*
+ * 6.x keeps these as per-device display parameters copied at probe from a
+ * static module-parameter block nothing outside the driver can reach, so the
+ * request is applied to the device once it exists: PSR and FBC are decided at
+ * each atomic check, and the DC state is pinned through the driver's own
+ * target-state call.
+ */
+static void lkpi_i915_apply_power_saving(struct intel_display *display)
+{
+	if (!lkpi_i915_no_power_saving)
+		return;
+	display->params.enable_psr = 0;
+	display->params.enable_fbc = 0;
+	intel_display_power_set_target_dc_state(display, DC_STATE_DISABLE);
+	pr_info("i915-probe: display power saving pinned off (DC/PSR/FBC) "
+	        "for vblank-evasion determinism\n");
+}
+
 /* Publish this device to the bridge, so userspace can open and map it. */
 void lkpi_i915_register_card(struct drm_device *dev)
 {
@@ -2695,7 +2739,7 @@ void lkpi_i915_register_card(struct drm_device *dev)
 
 		if (i915) {
 			u32 before = intel_uncore_read(&i915->uncore, PCH_RAWCLK_FREQ);
-			u32 freq = intel_read_rawclk(i915);
+			u32 freq = intel_read_rawclk(i915->display);
 			u32 after = intel_uncore_read(&i915->uncore, PCH_RAWCLK_FREQ);
 
 			pr_info("i915-probe: rawclk %u kHz, PCH_RAWCLK_FREQ %x -> %x\n",
@@ -2711,6 +2755,7 @@ void lkpi_i915_register_card(struct drm_device *dev)
 	}
 
 	lkpi_i915_gmbus_recover(dev);
+	lkpi_i915_apply_power_saving(to_i915_checked(dev)->display);
 
 	/*
 	 * Which south bridge the driver decided it is sitting next to.
@@ -2726,9 +2771,8 @@ void lkpi_i915_register_card(struct drm_device *dev)
 	 * PCH_NONE is 0. Printed unconditionally because it decides whether display
 	 * detection can work at all on this machine type.
 	 */
-	pr_info("i915-probe: pch_type %d pch_id %04x\n",
-	        (int)to_i915_checked(dev)->pch_type,
-	        (unsigned)to_i915_checked(dev)->pch_id);
+	pr_info("i915-probe: pch_type %d\n",
+	        (int)to_i915_checked(dev)->display->pch_type);
 
 	lkpi_drm_register_device(dev, i915_gem_page_phys);
 	lkpi_i915_start_tearwatch(dev);
@@ -2752,14 +2796,6 @@ void lkpi_i915_register_card(struct drm_device *dev)
  * i915_modparams, which i915_params_copy() folds into i915->params at probe.
  * Reachable because i915_drv.h declares the extern; nothing imported changes.
  */
-void lkpi_i915_disable_display_power_saving(void)
-{
-	i915_modparams.enable_dc = 0;
-	i915_modparams.enable_psr = 0;
-	i915_modparams.enable_fbc = 0;
-	pr_info("i915-probe: display power saving pinned off (DC/PSR/FBC) "
-	        "for vblank-evasion determinism\n");
-}
 
 /*
  * Time a raw MMIO read of a display register, to tell a direct-mapped BAR
@@ -2773,6 +2809,7 @@ void lkpi_i915_disable_display_power_saving(void)
 void lkpi_i915_mmio_bench(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = to_i915_checked(dev);
+	struct intel_display *display = dev_priv->display;
 	const unsigned iters = 4000;
 	volatile u32 sink = 0;
 	u64 t0, t1;
@@ -2783,11 +2820,11 @@ void lkpi_i915_mmio_bench(struct drm_device *dev)
 
 	/* Warm the mapping, then time the read loop with interrupts disabled so
 	 * nothing else is charged to it. */
-	sink += intel_uncore_read_fw(&dev_priv->uncore, PIPEDSL(PIPE_A));
+	sink += intel_uncore_read_fw(&dev_priv->uncore, PIPEDSL(display, PIPE_A));
 
 	t0 = lkpi_monotonic_ns();
 	for (i = 0; i < iters; i++)
-		sink += intel_uncore_read_fw(&dev_priv->uncore, PIPEDSL(PIPE_A));
+		sink += intel_uncore_read_fw(&dev_priv->uncore, PIPEDSL(display, PIPE_A));
 	t1 = lkpi_monotonic_ns();
 
 	pr_info("i915-probe: mmio-bench %u raw reads in %llu ns = %llu ns/read "
@@ -2804,16 +2841,16 @@ void lkpi_i915_mmio_bench(struct drm_device *dev)
 	 * safe to hammer once its value is put back.
 	 */
 	{
-		u32 orig = intel_uncore_read_fw(&dev_priv->uncore, SWF1(0));
+		u32 orig = intel_uncore_read_fw(&dev_priv->uncore, SWF1(display, 0));
 		u64 w0, w1;
 
 		w0 = lkpi_monotonic_ns();
 		for (i = 0; i < iters; i++)
-			intel_uncore_write_fw(&dev_priv->uncore, SWF1(0),
+			intel_uncore_write_fw(&dev_priv->uncore, SWF1(display, 0),
 			                      0xb1000000u | i);
 		w1 = lkpi_monotonic_ns();
 
-		intel_uncore_write_fw(&dev_priv->uncore, SWF1(0), orig);
+		intel_uncore_write_fw(&dev_priv->uncore, SWF1(display, 0), orig);
 
 		pr_info("i915-probe: mmio-bench %u raw writes in %llu ns = %llu "
 		        "ns/write\n",

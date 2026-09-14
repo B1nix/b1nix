@@ -78,4 +78,6 @@ static inline u64 get_jiffies_64(void) { return (u64)jiffies; }
 #define time_is_before_eq_jiffies(a)  time_after_eq(jiffies, a)
 #define time_is_after_eq_jiffies(a)   time_before_eq(jiffies, a)
 
+#define secs_to_jiffies(_secs) msecs_to_jiffies((unsigned int)(_secs) * 1000u)
+
 #endif

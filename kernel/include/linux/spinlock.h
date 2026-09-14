@@ -24,9 +24,13 @@
 
 typedef struct lkpi_spinlock spinlock_t;
 typedef struct lkpi_spinlock raw_spinlock_t;
+/* The struct tag, for code that names it rather than the typedef. */
+#define raw_spinlock lkpi_spinlock
 typedef struct lkpi_spinlock rwlock_t;
 
 #define DEFINE_SPINLOCK(name) spinlock_t name
+/* A statically unlocked spinlock: all-zero, the state spin_lock_init leaves. */
+#define __SPIN_LOCK_UNLOCKED(name) { 0 }
 
 static inline void spin_lock_init(spinlock_t *l) { lkpi_spin_lock_init(l); }
 static inline void spin_lock(spinlock_t *l) { lkpi_spin_lock(l); }
@@ -156,5 +160,11 @@ static inline bool refcount_dec_and_lock_irqsave(refcount_t *r, spinlock_t *lock
 #define read_unlock_irqrestore(l, f)  spin_unlock_irqrestore(l, f)
 #define write_lock_irqsave(l, f)      spin_lock_irqsave(l, &(f))
 #define write_unlock_irqrestore(l, f) spin_unlock_irqrestore(l, f)
+
+/* Is the lock held by anyone? */
+static inline int spin_is_locked(spinlock_t *l) { return l->raw != 0; }
+/* Should a long rwlock hold be broken for a waiter? No waiter is visible here,
+ * so a holder is never asked to. */
+#define rwlock_needbreak(l) ({ (void)(l); 0; })
 
 #endif

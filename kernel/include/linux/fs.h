@@ -48,6 +48,7 @@
  * and vfs_pressure_ratio to size its shrinker. */
 #include <linux/srcu.h>
 #include <linux/dcache.h>
+#include <linux/uuid.h>
 /* pfn_t, for the DAX interfaces named in <linux/dax.h>. */
 #include <linux/pfn_t.h>
 /* `enum migrate_mode` appears in address_space_operations below, and both
@@ -153,7 +154,7 @@ struct shrink_control;
 struct mtd_info;
 struct workqueue_struct;
 struct kstatfs;
-struct fileattr;
+struct file_kattr;
 struct posix_acl;
 struct dquot_operations;
 struct quotactl_ops;
@@ -197,7 +198,7 @@ struct qstr {
 	const unsigned char *name;
 };
 
-#define QSTR_INIT(n, l) { { { .hash = 0, .len = (l) } }, .name = (n) }
+#define QSTR_INIT(n, l) { { { .hash = 0, .len = (l) } }, .name = (const unsigned char *)(n) }
 #define hashlen_hash(hashlen) ((u32)(hashlen))
 #define hashlen_len(hashlen)  ((u32)((hashlen) >> 32))
 
@@ -271,6 +272,12 @@ struct kstat {
 	u32 dio_mem_align;
 	u32 dio_offset_align;
 	u64 change_cookie;
+	u64 subvol;
+	u32 atomic_write_unit_min;
+	u32 atomic_write_unit_max;
+	u32 atomic_write_unit_max_opt;
+	u32 atomic_write_segments_max;
+	u32 dio_read_offset_align;
 };
 
 #define STATX_TYPE        0x00000001U
@@ -292,6 +299,8 @@ struct kstat {
 #define STATX_ATTR_COMPRESSED 0x00000004
 
 #define STATX_DIOALIGN    0x00002000U
+#define STATX_SUBVOL      0x00008000U
+#define STATX_WRITE_ATOMIC 0x00010000U
 #define STATX_ATTR_ENCRYPTED 0x00000800
 #define STATX_ATTR_VERITY    0x00100000
 #define STATX_ATTR_DAX       0x00200000
@@ -370,12 +379,12 @@ struct address_space_operations {
 	int (*writepages)(struct address_space *, struct writeback_control *);
 	bool (*dirty_folio)(struct address_space *, struct folio *);
 	void (*readahead)(struct readahead_control *);
-	int (*write_begin)(struct file *, struct address_space *mapping,
-	                   loff_t pos, unsigned len, struct page **pagep,
+	int (*write_begin)(const struct kiocb *, struct address_space *mapping,
+	                   loff_t pos, unsigned len, struct folio **foliop,
 	                   void **fsdata);
-	int (*write_end)(struct file *, struct address_space *mapping,
+	int (*write_end)(const struct kiocb *, struct address_space *mapping,
 	                 loff_t pos, unsigned len, unsigned copied,
-	                 struct page *page, void *fsdata);
+	                 struct folio *folio, void *fsdata);
 	sector_t (*bmap)(struct address_space *, sector_t);
 	void (*invalidate_folio)(struct folio *, size_t offset, size_t len);
 	bool (*release_folio)(struct folio *, gfp_t);
@@ -386,7 +395,7 @@ struct address_space_operations {
 	int (*launder_folio)(struct folio *);
 	bool (*is_partially_uptodate)(struct folio *, size_t from, size_t count);
 	void (*is_dirty_writeback)(struct folio *, bool *dirty, bool *wb);
-	int (*error_remove_page)(struct address_space *, struct page *);
+	int (*error_remove_folio)(struct address_space *, struct folio *);
 	int (*swap_activate)(struct swap_info_struct *sis, struct file *file,
 	                     sector_t *span);
 	void (*swap_deactivate)(struct file *file);
@@ -412,9 +421,11 @@ struct address_space {
 	const struct address_space_operations *a_ops;
 	unsigned long flags;
 	errseq_t wb_err;
-	spinlock_t private_lock;
-	struct list_head private_list;
-	void *private_data;
+	/* Upstream names these i_private_*: they belong to the owning inode's
+	 * filesystem (buffer heads, btrfs's subpage state). */
+	spinlock_t i_private_lock;
+	struct list_head i_private_list;
+	void *i_private_data;
 };
 
 /* address_space flags */
@@ -427,6 +438,8 @@ struct address_space {
 #define AS_LARGE_FOLIO_SUPPORT 6
 #define AS_RELEASE_ALWAYS 7
 #define AS_STABLE_WRITES 8
+/* The mapping backs a file only the kernel uses (btrfs's btree inode). */
+#define AS_KERNEL_FILE  9
 
 static inline void mapping_set_error(struct address_space *mapping, int error)
 {
@@ -492,6 +505,7 @@ static inline void mapping_set_error(struct address_space *mapping, int error)
 #define IOP_XATTR     0x0008
 #define IOP_DEFAULT_READLINK 0x0010
 #define IOP_MGTIME    0x0020
+#define IOP_CACHED_LINK 0x0040
 
 struct inode {
 	umode_t i_mode;
@@ -558,6 +572,7 @@ struct inode {
 		const char *i_link;     /* fast symlink body, inline in the inode */
 		unsigned int i_dir_seq;
 	};
+	int i_linklen;              /* strlen(i_link) when IOP_CACHED_LINK */
 
 	u32 i_generation;
 	void *i_private;
@@ -566,11 +581,54 @@ struct inode {
 	struct posix_acl *i_default_acl;
 };
 
-static inline void inode_set_ctime_to_ts(struct inode *inode,
-                                         struct timespec64 ts)
+static inline struct timespec64 inode_set_ctime_to_ts(struct inode *inode,
+                                                      struct timespec64 ts)
 {
 	inode->__i_ctime = ts;
+	return ts;
 }
+
+/*
+ * The per-field timestamp accessors 6.7 introduced. Upstream split the
+ * timespec64s into sec/nsec pairs behind them; here the fields stay whole —
+ * the b1nix side of the bridge reads them — and only the interface is added.
+ */
+static inline time64_t inode_get_atime_sec(const struct inode *inode)
+{ return inode->i_atime.tv_sec; }
+static inline long inode_get_atime_nsec(const struct inode *inode)
+{ return inode->i_atime.tv_nsec; }
+static inline struct timespec64 inode_get_atime(const struct inode *inode)
+{ return inode->i_atime; }
+static inline struct timespec64 inode_set_atime_to_ts(struct inode *inode,
+                                                      struct timespec64 ts)
+{ inode->i_atime = ts; return ts; }
+static inline struct timespec64 inode_set_atime(struct inode *inode,
+                                                time64_t sec, long nsec)
+{
+	struct timespec64 ts = { .tv_sec = sec, .tv_nsec = nsec };
+
+	return inode_set_atime_to_ts(inode, ts);
+}
+static inline time64_t inode_get_mtime_sec(const struct inode *inode)
+{ return inode->i_mtime.tv_sec; }
+static inline long inode_get_mtime_nsec(const struct inode *inode)
+{ return inode->i_mtime.tv_nsec; }
+static inline struct timespec64 inode_get_mtime(const struct inode *inode)
+{ return inode->i_mtime; }
+static inline struct timespec64 inode_set_mtime_to_ts(struct inode *inode,
+                                                      struct timespec64 ts)
+{ inode->i_mtime = ts; return ts; }
+static inline struct timespec64 inode_set_mtime(struct inode *inode,
+                                                time64_t sec, long nsec)
+{
+	struct timespec64 ts = { .tv_sec = sec, .tv_nsec = nsec };
+
+	return inode_set_mtime_to_ts(inode, ts);
+}
+static inline time64_t inode_get_ctime_sec(const struct inode *inode)
+{ return inode->__i_ctime.tv_sec; }
+static inline long inode_get_ctime_nsec(const struct inode *inode)
+{ return inode->__i_ctime.tv_nsec; }
 
 static inline struct timespec64 inode_get_ctime(const struct inode *inode)
 {
@@ -579,6 +637,19 @@ static inline struct timespec64 inode_get_ctime(const struct inode *inode)
 
 struct timespec64 current_time(struct inode *inode);
 struct timespec64 inode_set_ctime_current(struct inode *inode);
+/* Set all three timestamps of a new inode to now; returns the time used. */
+struct timespec64 simple_inode_init_ts(struct inode *inode);
+
+static inline void inode_set_cached_link(struct inode *inode, char *link,
+                                         int linklen)
+{
+	inode->i_link = link;
+	inode->i_linklen = linklen;
+	inode->i_opflags |= IOP_CACHED_LINK;
+}
+
+static inline int icount_read(const struct inode *inode)
+{ return atomic_read(&inode->i_count); }
 
 static inline struct timespec64 inode_set_ctime(struct inode *inode,
                                                 time64_t sec, long nsec)
@@ -938,6 +1009,25 @@ char *dentry_path_raw(const struct dentry *dentry, char *buf, int buflen);
 void d_set_d_op(struct dentry *dentry, const struct dentry_operations *op);
 int d_set_mounted(struct dentry *dentry);
 
+/* A qstr for a C string, built in place (6.14+). */
+#define QSTR_LEN(n, l) ((struct qstr)QSTR_INIT(n, l))
+#define QSTR(n) QSTR_LEN(n, strlen(n))
+
+/*
+ * A stable copy of a dentry's name, for a caller that needs the name after
+ * the dentry may have been renamed. The copy is taken under the dentry's
+ * lock; release frees it.
+ */
+struct name_snapshot {
+	struct qstr name;
+	unsigned char inline_name[DNAME_INLINE_LEN];
+};
+void take_dentry_name_snapshot(struct name_snapshot *name, struct dentry *dentry);
+void release_dentry_name_snapshot(struct name_snapshot *name);
+
+/* The dentry operations every dentry of a superblock starts with. */
+void set_default_d_op(struct super_block *sb, const struct dentry_operations *ops);
+
 /* ── file ───────────────────────────────────────────────────────── */
 
 struct path;
@@ -999,6 +1089,11 @@ struct file {
 #define FMODE_CAN_ODIRECT     0x400000
 #define FMODE_BUF_RASYNC      0x40000000
 #define FMODE_BUF_WASYNC      0x80000000
+/* Bits the numbering above leaves free; the values are not ABI. */
+#define FMODE_CAN_ATOMIC_WRITE 0x10000
+#define FMODE_BACKING         0x2000000
+/* No fanotify pre-content hooks here, so no file is ever watched by one. */
+#define FMODE_FSNOTIFY_HSM(mode) 0
 
 #define no_llseek NULL
 #define noop_llseek NULL
@@ -1041,6 +1136,9 @@ struct kiocb {
 #define IOCB_NOIO       (1 << 9)
 #define IOCB_ALLOC_CACHE (1 << 10)
 #define IOCB_DIO_CALLER_COMP (1 << 11)
+/* RWF_ATOMIC and RWF_DONTCACHE, whose values the iocb flags share. */
+#define IOCB_ATOMIC     0x00000040
+#define IOCB_DONTCACHE  0x00000080
 
 static inline bool is_sync_kiocb(struct kiocb *kiocb)
 {
@@ -1049,8 +1147,23 @@ static inline bool is_sync_kiocb(struct kiocb *kiocb)
 
 /* ── operations vectors ─────────────────────────────────────────── */
 
+/* Capabilities a file_operations table declares about itself (6.10+). */
+typedef unsigned int fop_flags_t;
+#define FOP_BUFFER_RASYNC      ((fop_flags_t)(1 << 0))
+#define FOP_BUFFER_WASYNC      ((fop_flags_t)(1 << 1))
+#define FOP_MMAP_SYNC          ((fop_flags_t)(1 << 2))
+#define FOP_DIO_PARALLEL_WRITE ((fop_flags_t)(1 << 3))
+#define FOP_HUGE_PAGES         ((fop_flags_t)(1 << 4))
+#define FOP_UNSIGNED_OFFSET    ((fop_flags_t)(1 << 5))
+#define FOP_ASYNC_LOCK         ((fop_flags_t)(1 << 6))
+#define FOP_DONTCACHE          ((fop_flags_t)(1 << 7))
+
+struct vm_area_desc;
+struct file_lease;
+
 struct file_operations {
 	struct module *owner;
+	fop_flags_t fop_flags;
 	loff_t (*llseek)(struct file *, loff_t, int);
 	ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);
 	ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *);
@@ -1079,7 +1192,7 @@ struct file_operations {
 	ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *,
 	                       size_t, unsigned int);
 	void (*splice_eof)(struct file *file);
-	int (*setlease)(struct file *, int, struct file_lock **, void **);
+	int (*setlease)(struct file *, int, struct file_lease **, void **);
 	long (*fallocate)(struct file *file, int mode, loff_t offset, loff_t len);
 	void (*show_fdinfo)(struct seq_file *m, struct file *f);
 	ssize_t (*copy_file_range)(struct file *, loff_t, struct file *, loff_t,
@@ -1089,6 +1202,9 @@ struct file_operations {
 	                           loff_t len, unsigned int remap_flags);
 	int (*fadvise)(struct file *, loff_t, loff_t, int);
 	int (*uring_cmd)(struct io_uring_cmd *ioucmd, unsigned int issue_flags);
+	int (*uring_cmd_iopoll)(struct io_uring_cmd *, struct io_comp_batch *,
+	                        unsigned int poll_flags);
+	int (*mmap_prepare)(struct vm_area_desc *);
 };
 
 struct inode_operations {
@@ -1104,7 +1220,8 @@ struct inode_operations {
 	int (*unlink)(struct inode *, struct dentry *);
 	int (*symlink)(struct mnt_idmap *, struct inode *, struct dentry *,
 	               const char *);
-	int (*mkdir)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t);
+	struct dentry *(*mkdir)(struct mnt_idmap *, struct inode *, struct dentry *,
+	                        umode_t);
 	int (*rmdir)(struct inode *, struct dentry *);
 	int (*mknod)(struct mnt_idmap *, struct inode *, struct dentry *,
 	             umode_t, dev_t);
@@ -1124,8 +1241,9 @@ struct inode_operations {
 	int (*set_acl)(struct mnt_idmap *, struct dentry *, struct posix_acl *,
 	               int);
 	int (*fileattr_set)(struct mnt_idmap *idmap, struct dentry *dentry,
-	                    struct fileattr *fa);
-	int (*fileattr_get)(struct dentry *dentry, struct fileattr *fa);
+	                    struct file_kattr *fa);
+	int (*fileattr_get)(struct dentry *dentry, struct file_kattr *fa);
+	struct offset_ctx *(*get_offset_ctx)(struct inode *inode);
 };
 
 enum freeze_holder {
@@ -1209,6 +1327,20 @@ struct super_operations {
 #define SB_I_PERSB_BDI     0x00000200
 #define SB_I_TS_EXPIRY_WARNED 0x00000400
 #define SB_I_RETIRED       0x00000800
+#define SB_I_NOUMASK       0x00001000
+#define SB_I_NOIDMAP       0x00002000
+#define SB_I_ALLOW_HSM     0x00004000
+
+/* s_encoding_flags */
+#define SB_ENC_STRICT_MODE_FL        (1 << 0)
+#define SB_ENC_NO_COMPAT_FALLBACK_FL (1 << 1)
+/* Built without CONFIG_UNICODE: there are no casefolded names to be strict
+ * about, and nothing to fall back from. */
+#define sb_has_strict_encoding(sb) (0)
+#define sb_no_casefold_compat_fallback(sb) (1)
+static inline bool generic_ci_validate_strict_name(struct inode *dir,
+                                                   const struct qstr *name)
+{ (void)dir; (void)name; return true; }
 
 enum sb_writers_level {
 	SB_FREEZE_WRITE = 1,
@@ -1272,8 +1404,9 @@ struct super_block {
 	time64_t s_time_min;
 	time64_t s_time_max;
 	char s_id[32];
-	u8 s_uuid[16];
+	uuid_t s_uuid;
 	u8 s_uuid_len;
+	char s_sysfs_name[36 + 1];
 	unsigned int s_max_links;
 	fmode_t s_mode;
 	struct mutex s_vfs_rename_mutex;
@@ -1292,7 +1425,7 @@ struct super_block {
 	 * than a pointer because its lifetime is the superblock's, and both
 	 * filesystems take its address to rename it once they know the device.
 	 */
-	struct shrinker s_shrink;
+	struct shrinker *s_shrink;
 };
 
 static inline bool sb_rdonly(const struct super_block *sb)
@@ -1318,6 +1451,20 @@ bool sb_start_intwrite_trylock(struct super_block *sb);
 void sb_end_intwrite(struct super_block *sb);
 
 int sb_set_blocksize(struct super_block *sb, int size);
+
+static inline void super_set_uuid(struct super_block *sb, const u8 *uuid,
+                                  unsigned len)
+{
+	if (len > sizeof(sb->s_uuid))
+		len = sizeof(sb->s_uuid);
+	sb->s_uuid_len = len;
+	memcpy(&sb->s_uuid, uuid, len);
+}
+
+/* The name under /sys/fs/<type>/. b1nix has no per-superblock sysfs
+ * directory, but the name is recorded for anything that prints it. */
+static inline void super_set_sysfs_name_bdev(struct super_block *sb)
+{ strscpy(sb->s_sysfs_name, sb->s_id, sizeof(sb->s_sysfs_name)); }
 int sb_min_blocksize(struct super_block *sb, int size);
 
 struct file_system_type {
@@ -1339,6 +1486,8 @@ struct file_system_type {
 #define FS_USERNS_MOUNT       8
 #define FS_DISALLOW_NOTIFY_PERM 16
 #define FS_ALLOW_IDMAP        32
+#define FS_MGTIME             64
+#define FS_LBS                128
 #define FS_RENAME_DOES_D_MOVE 32768
 
 int register_filesystem(struct file_system_type *fs);
@@ -1504,7 +1653,8 @@ void inode_io_list_del(struct inode *inode);
 /* Set the block size a block device's own page cache uses. Fails if the size
  * is not a power of two within the device's limits — which is a real answer: a
  * filesystem asking for a block size the device cannot address must not mount. */
-int set_blocksize(struct block_device *bdev, int size);
+int set_blocksize(struct file *file, int size);
+int bdev_set_blocksize(struct block_device *bdev, int size);
 
 #define MAY_EXEC   0x00000001
 #define MAY_WRITE  0x00000002
@@ -1657,6 +1807,10 @@ static inline int call_mmap(struct file *file, struct vm_area_struct *vma)
 	           : -ENODEV;
 }
 
+/* Map a file into a VMA through its own operations (6.17's name). */
+static inline int vfs_mmap(struct file *file, struct vm_area_struct *vma)
+{ return call_mmap(file, vma); }
+
 
 /* ── the rest of the VFS surface a filesystem calls ─────────────── */
 
@@ -1712,6 +1866,26 @@ struct inode *find_inode_by_ino_rcu(struct super_block *sb, unsigned long ino);
 struct inode *alloc_inode_sb(struct super_block *sb, struct kmem_cache *cache,
                              gfp_t gfp);
 int generic_drop_inode(struct inode *inode);
+/* The 6.18 name for the test generic_drop_inode makes. */
+static inline int inode_generic_drop(struct inode *inode)
+{ return !inode->i_nlink || inode_unhashed(inode); }
+int inode_just_drop(struct inode *inode);
+struct inode *iget5_locked_rcu(struct super_block *sb, unsigned long hashval,
+                               int (*test)(struct inode *, void *),
+                               int (*set)(struct inode *, void *), void *data);
+void generic_set_sb_d_ops(struct super_block *sb);
+/* Atomic writes: a device without the capability (all of them here) never
+ * gets RWF_ATOMIC through, so these report the capability as absent. */
+struct block_device;
+void generic_fill_statx_atomic_writes(struct kstat *stat,
+                                      unsigned int unit_min,
+                                      unsigned int unit_max,
+                                      unsigned int unit_max_opt);
+int generic_atomic_write_valid(struct kiocb *iocb, struct iov_iter *iter);
+int mnt_get_write_access(struct vfsmount *mnt);
+void mnt_put_write_access(struct vfsmount *mnt);
+/* The path a backing file (overlayfs) was opened for; never set here. */
+const struct path *backing_file_user_path(const struct file *f);
 void init_special_inode(struct inode *inode, umode_t mode, dev_t rdev);
 void invalidate_inode_buffers(struct inode *inode);
 void truncate_pagecache_range(struct inode *inode, loff_t offset, loff_t end);
@@ -1776,6 +1950,7 @@ int finish_open_simple(struct file *file, int error);
 int get_anon_bdev(dev_t *dev);
 void free_anon_bdev(dev_t dev);
 int set_anon_super(struct super_block *sb, void *data);
+int set_anon_super_fc(struct super_block *sb, struct fs_context *fc);
 int super_setup_bdi(struct super_block *sb);
 int super_setup_bdi_name(struct super_block *sb, char *fmt, ...);
 struct dentry *mount_subtree(struct vfsmount *mnt, const char *path);
@@ -1820,7 +1995,7 @@ extern struct kobject *fs_kobj;
 
 /* kiocb setup and the write-side helpers built on it. */
 void init_sync_kiocb(struct kiocb *kiocb, struct file *filp);
-int kiocb_set_rw_flags(struct kiocb *ki, unsigned int flags);
+int kiocb_set_rw_flags(struct kiocb *ki, rwf_t flags, int rw_type);
 static inline bool iocb_is_dsync(const struct kiocb *iocb)
 {
 	return (iocb->ki_flags & IOCB_DSYNC) ||
@@ -1922,6 +2097,21 @@ int vfs_fsync(struct file *file, int datasync);
 struct mnt_idmap { int dummy; };
 
 typedef unsigned long ino_t;
+
+/*
+ * A debugfs file defined as a get/set pair over one value.
+ *
+ * The generated fops are what the macro is for: a read renders the value with
+ * the given format, a write parses it back. The format string is part of the
+ * definition rather than the read callback, which is why the macro takes it as
+ * a trailing argument and why leaving the macro undefined made every use look
+ * like a syntax error at the format string.
+ */
+#define DEFINE_SIMPLE_ATTRIBUTE(__fops, __get, __set, __fmt)              \
+	static int __fops##_open(struct inode *inode, struct file *file)      \
+	{ (void)inode; (void)file; return 0; }                                \
+	static const struct file_operations __fops = { .open = __fops##_open }
+
 
 #include <linux/file.h>
 

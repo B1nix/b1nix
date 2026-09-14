@@ -167,4 +167,17 @@ size_t copy_page_from_iter_atomic(struct page *page, size_t offset,
 size_t copy_folio_from_iter_atomic(struct folio *folio, size_t offset,
                                    size_t bytes, struct iov_iter *i);
 
+/* One user buffer as an iterator. */
+static inline void iov_iter_ubuf(struct iov_iter *i, unsigned int direction,
+                                 void __user *buf, size_t count)
+{
+	*i = (struct iov_iter) {
+		.iter_type = ITER_UBUF,
+		.data_source = direction,
+		.ubuf = buf,
+		.count = count,
+		.nr_segs = 1,
+	};
+}
+
 #endif

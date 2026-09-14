@@ -40,4 +40,11 @@ static inline struct page *bvec_page(const struct bio_vec *bv)
 	return bv->bv_page;
 }
 
+/* The physical and virtual address of a segment's first byte. Every page is
+ * in the direct map here, so the virtual form always exists. */
+static inline phys_addr_t bvec_phys(const struct bio_vec *bvec)
+{ return page_to_phys(bvec->bv_page) + bvec->bv_offset; }
+static inline void *bvec_virt(struct bio_vec *bvec)
+{ return (char *)page_address(bvec->bv_page) + bvec->bv_offset; }
+
 #endif

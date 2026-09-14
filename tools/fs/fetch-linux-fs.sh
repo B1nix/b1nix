@@ -39,8 +39,13 @@ set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
-LINUX_VERSION="${LINUX_VERSION:-6.6}"
-LINUX_SHA256="d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0"
+LINUX_VERSION="${LINUX_VERSION:-6.18.51}"
+# Pinned tarballs, checked against kernel.org's signed sha256sums.asc.
+case "$LINUX_VERSION" in
+6.6)     LINUX_SHA256="d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0" ;;
+6.18.51) LINUX_SHA256="ba2f60f858bf4d1f929101faa356c93dc8b925b17aaa9f95eabd4627758df613" ;;
+*) echo "fetch-linux-fs: no pinned SHA256 for linux-$LINUX_VERSION" >&2; exit 1 ;;
+esac
 TARBALL="linux-${LINUX_VERSION}.tar.xz"
 URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${TARBALL}"
 
@@ -96,6 +101,12 @@ tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
 #                 another kernel could notice
 #   fs/mbcache    ext4's xattr block deduplication cache
 #   lib/maple_tree ext4 uses it for its extent status tree
+#   lib/xarray, lib/radix-tree, lib/idr
+#                 the xarray and the two older interfaces built on it. 6.x
+#                 btrfs walks its extent-buffer tree by mark with xa_state
+#                 cursors, which is the data structure itself rather than an
+#                 interface a shim can stand in for. The DRM core uses the same
+#                 three, so they are linked for the whole kernel.
 #   include/linux/{jbd2,journal-head,iomap,mbcache,maple_tree}.h — their own
 #                 interfaces,
 #                 which belong to the imported code, not to the shim
@@ -107,6 +118,10 @@ tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
 	"linux-${LINUX_VERSION}/fs/iomap" \
 	"linux-${LINUX_VERSION}/fs/mbcache.c" \
 	"linux-${LINUX_VERSION}/lib/maple_tree.c" \
+	"linux-${LINUX_VERSION}/lib/xarray.c" \
+	"linux-${LINUX_VERSION}/lib/radix-tree.c" \
+	"linux-${LINUX_VERSION}/lib/radix-tree.h" \
+	"linux-${LINUX_VERSION}/lib/idr.c" \
 	"linux-${LINUX_VERSION}/fs/internal.h" \
 	"linux-${LINUX_VERSION}/lib/zlib_inflate" \
 	"linux-${LINUX_VERSION}/lib/zlib_deflate" \
@@ -193,6 +208,9 @@ emit_objs() {
 	# read for either, so naming them is the honest form.
 	echo "fs/mbcache.c"
 	echo "lib/maple_tree.c"
+	echo "lib/xarray.c"
+	echo "lib/radix-tree.c"
+	echo "lib/idr.c"
 	# The compression libraries. Every .c under them is built — unlike the
 	# filesystems, these directories contain nothing that is conditional, and
 	# their own Makefiles list the same set with paths this loop would have to

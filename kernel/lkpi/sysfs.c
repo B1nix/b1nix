@@ -61,7 +61,7 @@ static isize lkpi_attr_show(void *ctx, char *buf, usize cap)
 		if (!c->bin_attr->read)
 			return -EACCES;
 		return c->bin_attr->read(0, c->kobj,
-		                         (struct bin_attribute *)c->bin_attr, buf, 0,
+		                         c->bin_attr, buf, 0,
 		                         cap);
 	}
 	if (!c->dev_attr || !c->dev_attr->show)
@@ -79,7 +79,7 @@ static isize lkpi_attr_store(void *ctx, const char *buf, usize len)
 		if (!c->bin_attr->write)
 			return -EACCES;
 		return c->bin_attr->write(0, c->kobj,
-		                          (struct bin_attribute *)c->bin_attr,
+		                          c->bin_attr,
 		                          (char *)buf, 0, len);
 	}
 	if (!c->dev_attr || !c->dev_attr->store)
@@ -172,7 +172,7 @@ static int publish_group(void *dir, struct device *dev, struct kobject *kobj,
 
 	if (grp->bin_attrs) {
 		for (usize i = 0; grp->bin_attrs[i]; i++) {
-			struct bin_attribute *b = grp->bin_attrs[i];
+			const struct bin_attribute *b = grp->bin_attrs[i];
 			struct lkpi_attr_ctx *c = attr_ctx(dev, 0, b, kobj);
 			if (!c)
 				return -ENOMEM;

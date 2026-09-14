@@ -116,4 +116,14 @@
 #include <linux/swap.h>
 #include <linux/writeback.h>
 
+/*
+ * The pre-2019 ida spellings. The 6.6 driver still calls them; Linux removed
+ * them in 6.9, and <linux/idr.h> is now that newer header. The end is
+ * exclusive and 0 means no upper bound, as it was.
+ */
+#include <linux/idr.h>
+#define ida_simple_get(ida, start, end, gfp) \
+	ida_alloc_range(ida, start, (end) ? (end) - 1 : ~0u, gfp)
+#define ida_simple_remove(ida, id) ida_free(ida, id)
+
 #endif

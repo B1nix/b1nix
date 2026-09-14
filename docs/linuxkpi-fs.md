@@ -1,20 +1,24 @@
 # Imported Linux filesystems: btrfs, ext4, jbd2
 
-btrfs, ext4 and jbd2 are compiled **unmodified** from Linux 6.6 on top of
+btrfs, ext4 and jbd2 are compiled **unmodified** from Linux 6.18.51 on top of
 b1nix's linuxkpi (`kernel/include/linux`, `kernel/lkpi/`). There is no patch
 directory: **a patch to anything under the staged tree is a bug in the shim.**
 All three are GPL-2.0-only like b1nix (see `THIRD_PARTY_NOTICES.md`).
 
 ## Staging and build
 
-- `tools/fs/fetch-linux-fs.sh` stages Linux 6.6 (pinned by version + SHA-256)
-  into `build/src/fs-6.6` (untracked): `fs/{btrfs,ext4,jbd2,iomap,quota}`,
-  `fs/mbcache.c`, `lib/maple_tree.c`, `lib/{zlib_*,lzo,zstd,xxhash.c}`, and the
-  headers belonging to those subsystems. Nothing else from `include/linux` —
-  that is what the shim reimplements.
+- `tools/fs/fetch-linux-fs.sh` stages the release `LKPI_LINUX_VERSION` names in
+  the Makefile (pinned by version + SHA-256; the DRM core and i915 come from the
+  same one) into `build/src/fs-<ver>` (untracked): `fs/{btrfs,ext4,jbd2,iomap,quota}`,
+  `fs/mbcache.c`, `lib/{maple_tree,xarray,radix-tree,idr}.c`,
+  `lib/{zlib_*,lzo,zstd,xxhash.c}`, and the headers belonging to those
+  subsystems. The xarray, radix tree and idr are linked for the whole kernel:
+  6.x btrfs walks its extent-buffer tree by mark with `xa_state` cursors, and
+  the DRM core uses the same three. Nothing else from `include/linux` — that is
+  what the shim reimplements.
 - Object lists come from upstream's Makefiles (unconditional `-y` sets only;
   ACLs, fs-verity, fscrypt, check-integrity, ref-verify are not built).
-- `tools/fs/gen-shim-headers.sh` generates into `build/src/fs-6.6-gen`: no-op
+- `tools/fs/gen-shim-headers.sh` generates into `build/src/fs-<ver>-gen`: no-op
   `trace_*` macros (from the text, plus token-pasted ones the compiler reports;
   `*_enabled` → `0`) and forward declarations for structs first named inside a
   prototype.
@@ -26,7 +30,7 @@ All three are GPL-2.0-only like b1nix (see `THIRD_PARTY_NOTICES.md`).
 | Value | Links | Default |
 |---|---|---|
 | `btrfs` | btrfs + iomap/maple_tree/compression libs | — |
-| `1` | additionally ext4, jbd2, mbcache (`-DB1NIX_FS_IMPORT_EXT4=1`) | when `build/src/fs-6.6/B1NIX-OBJECTS` exists |
+| `1` | additionally ext4, jbd2, mbcache (`-DB1NIX_FS_IMPORT_EXT4=1`) | when `build/src/fs-<ver>/B1NIX-OBJECTS` exists |
 | `0` | nothing | otherwise |
 
 Both non-zero values also build `kernel/fs/lkpifs.c`. The imported code gets

@@ -95,6 +95,31 @@ void sort(void *base, usize num, usize size,
 	}
 }
 
+/* sort() with a context pointer handed to the comparison. Same stable
+ * insertion sort. */
+void sort_r(void *base, usize num, usize size,
+            int (*cmp)(const void *, const void *, const void *),
+            void (*swap_fn)(void *, void *, int, const void *),
+            const void *priv)
+{
+	if (!base || !cmp || num < 2 || size == 0)
+		return;
+
+	char *arr = (char *)base;
+	for (usize i = 1; i < num; i++) {
+		for (usize j = i; j > 0; j--) {
+			char *cur = arr + j * size;
+			char *prev = cur - size;
+			if (cmp(prev, cur, priv) <= 0)
+				break;
+			if (swap_fn)
+				swap_fn(prev, cur, (int)size, priv);
+			else
+				sort_swap_bytes(prev, cur, size);
+		}
+	}
+}
+
 void list_sort(void *priv, struct list_head *head,
                int (*cmp)(void *priv, const struct list_head *a,
                           const struct list_head *b))
@@ -348,8 +373,7 @@ void eventfd_ctx_put(struct eventfd_ctx *ctx)
 	(void)ctx;
 }
 
-void eventfd_signal(struct eventfd_ctx *ctx, u64 n)
+void eventfd_signal(struct eventfd_ctx *ctx)
 {
 	(void)ctx;
-	(void)n;
 }

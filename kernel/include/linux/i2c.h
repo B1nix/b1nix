@@ -3,6 +3,10 @@
 #define LKPI_LINUX_I2C_H
 #include <b1nix/i2c.h>
 #include <linux/device.h>
+/* guid_t, which upstream reaches through <linux/acpi.h> from here. */
+#include <linux/uuid.h>
+/* dev_fwnode(), reached from here upstream as well. */
+#include <linux/property.h>
 /* Onto b1nix's i2c. DRM uses it for DDC — reading an EDID off a monitor — so
  * this is one of the few here that a display driver genuinely exercises. */
 struct i2c_lock_operations;
@@ -14,7 +18,8 @@ struct i2c_adapter {
 	 * set it. */
 	int nr;
 	struct device dev;
-	const char *name;
+	/* An array, as upstream's is: drivers strscpy() a name into it. */
+	char name[48];
 	void *algo_data;
 	/* Optional cross-transfer bus locking; see the note further down. NULL
 	 * here, so the core's per-transfer serialisation is what applies. */

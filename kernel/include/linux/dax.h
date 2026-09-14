@@ -29,9 +29,11 @@ struct vm_fault;
 #define DAX_NEVER  1
 #define DAX_ALWAYS 2
 
-static inline bool daxdev_mapping_supported(struct vm_area_struct *vma,
+/* Without DAX only a mapping that does not ask for MAP_SYNC is supported. */
+static inline bool daxdev_mapping_supported(unsigned long vm_flags,
+                                            const struct inode *inode,
                                             struct dax_device *dax_dev)
-{ (void)vma; (void)dax_dev; return false; }
+{ (void)inode; (void)dax_dev; return !(vm_flags & VM_SYNC); }
 static inline bool dax_compatible(struct dax_device *dax_dev, ...)
 { (void)dax_dev; return false; }
 static inline struct dax_device *fs_dax_get_by_bdev(struct block_device *bdev,
@@ -67,5 +69,16 @@ static inline int dax_zero_range(struct inode *inode, loff_t pos, loff_t len,
 static inline int dax_truncate_page(struct inode *inode, loff_t pos,
                                     bool *did_zero, const struct iomap_ops *ops)
 { (void)inode; (void)pos; (void)did_zero; (void)ops; return -EOPNOTSUPP; }
+
+/* No DAX: there is no direct-mapped page to wait out, so a layout break has
+ * nothing to do. */
+static inline int dax_break_layout(struct inode *inode, loff_t start, loff_t end,
+                                   void (cb)(struct inode *))
+{ (void)inode; (void)start; (void)end; (void)cb; return 0; }
+static inline int dax_break_layout_inode(struct inode *inode,
+                                         void (cb)(struct inode *))
+{ return dax_break_layout(inode, 0, LLONG_MAX, cb); }
+static inline void dax_break_layout_final(struct inode *inode)
+{ (void)inode; }
 
 #endif

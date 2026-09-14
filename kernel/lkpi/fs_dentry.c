@@ -396,6 +396,53 @@ void d_set_d_op(struct dentry *dentry, const struct dentry_operations *op)
 		dentry->d_flags |= DCACHE_OP_DELETE;
 }
 
+void set_default_d_op(struct super_block *sb, const struct dentry_operations *ops)
+{
+	sb->s_d_op = ops;
+}
+
+/*
+ * Copy a dentry's name out under its lock. A short name goes into the
+ * snapshot itself; a long one into an allocation, since the dentry's own
+ * external buffer is freed by the next rename.
+ */
+void take_dentry_name_snapshot(struct name_snapshot *name, struct dentry *dentry)
+{
+	unsigned int len;
+	char *buf;
+
+	spin_lock(&dentry->d_lockref.lock);
+	len = dentry->d_name.len;
+	name->name = dentry->d_name;
+	if (len < DNAME_INLINE_LEN) {
+		memcpy(name->inline_name, dentry->d_name.name, len);
+		name->inline_name[len] = 0;
+		name->name.name = name->inline_name;
+		spin_unlock(&dentry->d_lockref.lock);
+		return;
+	}
+	spin_unlock(&dentry->d_lockref.lock);
+
+	/* Allocated outside the lock, then re-copied under it; a rename in the
+	 * gap that changed the length leaves the snapshot with the shorter of
+	 * the two, still terminated. */
+	buf = kmalloc(len + 1, GFP_KERNEL | __GFP_NOFAIL);
+	spin_lock(&dentry->d_lockref.lock);
+	if (dentry->d_name.len < len)
+		len = dentry->d_name.len;
+	memcpy(buf, dentry->d_name.name, len);
+	buf[len] = 0;
+	name->name.len = len;
+	spin_unlock(&dentry->d_lockref.lock);
+	name->name.name = (const unsigned char *)buf;
+}
+
+void release_dentry_name_snapshot(struct name_snapshot *name)
+{
+	if (name->name.name != name->inline_name)
+		kfree(name->name.name);
+}
+
 int d_set_mounted(struct dentry *dentry)
 {
 	(void)dentry;
@@ -493,14 +540,11 @@ int kern_path(const char *name, unsigned int flags, struct path *path)
 	return -ENOENT;
 }
 
-struct dentry *lookup_one(struct mnt_idmap *idmap, const char *name,
-                          struct dentry *base, int len)
+static struct dentry *lookup_qstr(struct qstr *name, struct dentry *base)
 {
-	struct qstr q = { { { .hash = 0, .len = (u32)len } }, .name =
-	                      (const unsigned char *)name };
+	struct qstr q = *name;
 	struct dentry *dentry;
 
-	(void)idmap;
 	if (!base || !base->d_inode || !base->d_inode->i_op ||
 	    !base->d_inode->i_op->lookup)
 		return ERR_PTR(-ENOTDIR);
@@ -526,27 +570,70 @@ struct dentry *lookup_one(struct mnt_idmap *idmap, const char *name,
 	return dentry;
 }
 
+struct dentry *lookup_one(struct mnt_idmap *idmap, struct qstr *name,
+                          struct dentry *base)
+{
+	(void)idmap;
+	return lookup_qstr(name, base);
+}
+
+struct dentry *lookup_noperm(struct qstr *name, struct dentry *base)
+{
+	return lookup_qstr(name, base);
+}
+
+struct dentry *lookup_noperm_unlocked(struct qstr *name, struct dentry *base)
+{
+	return lookup_qstr(name, base);
+}
+
+struct dentry *lookup_one_unlocked(struct mnt_idmap *idmap, struct qstr *name,
+                                   struct dentry *base)
+{
+	(void)idmap;
+	return lookup_qstr(name, base);
+}
+
+/* "Positive": a name that does not exist is -ENOENT rather than a negative
+ * dentry the caller would have to check for. */
+static struct dentry *lookup_positive(struct qstr *name, struct dentry *base)
+{
+	struct dentry *dentry = lookup_qstr(name, base);
+
+	if (!IS_ERR(dentry) && d_is_negative(dentry)) {
+		dput(dentry);
+		return ERR_PTR(-ENOENT);
+	}
+	return dentry;
+}
+
+struct dentry *lookup_noperm_positive_unlocked(struct qstr *name,
+                                               struct dentry *base)
+{
+	return lookup_positive(name, base);
+}
+
+struct dentry *lookup_one_positive_unlocked(struct mnt_idmap *idmap,
+                                            struct qstr *name,
+                                            struct dentry *base)
+{
+	(void)idmap;
+	return lookup_positive(name, base);
+}
+
 struct dentry *lookup_one_len(const char *name, struct dentry *base, int len)
 {
-	return lookup_one(&nop_mnt_idmap, name, base, len);
+	return lookup_noperm(&QSTR_LEN(name, (u32)len), base);
 }
 
 struct dentry *lookup_one_len_unlocked(const char *name, struct dentry *base,
                                        int len)
 {
-	return lookup_one(&nop_mnt_idmap, name, base, len);
+	return lookup_noperm(&QSTR_LEN(name, (u32)len), base);
 }
 
 struct dentry *lookup_positive_unlocked(const char *name, struct dentry *base,
                                         int len)
 {
-	struct dentry *dentry = lookup_one(&nop_mnt_idmap, name, base, len);
-
-	if (!IS_ERR(dentry) && d_is_negative(dentry)) {
-		/* "Positive" means the name exists. A negative answer is turned into
-		 * ENOENT here so the caller does not have to check twice. */
-		dput(dentry);
-		return ERR_PTR(-ENOENT);
-	}
-	return dentry;
+	return lookup_positive(&QSTR_LEN(name, (u32)len), base);
 }

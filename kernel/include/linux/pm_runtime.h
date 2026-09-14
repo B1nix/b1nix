@@ -81,8 +81,8 @@ static inline int pm_runtime_put(struct device *dev)
  * was taken. ign_usage_count selects whether a device held active purely by
  * other references counts; b1nix tracks only the usage count, so both spellings
  * answer from it. */
-static inline int pm_runtime_get_if_active(struct device *dev, bool ign_usage_count)
-{ (void)ign_usage_count; return pm_runtime_get_if_in_use(dev); }
+static inline int pm_runtime_get_if_active(struct device *dev)
+{ return pm_runtime_get_if_in_use(dev); }
 
 
 

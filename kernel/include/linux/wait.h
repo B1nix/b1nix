@@ -95,6 +95,9 @@ int default_wake_function(struct wait_queue_entry *entry, unsigned mode,
                           int flags, void *key);
 int autoremove_wake_function(struct wait_queue_entry *entry, unsigned mode,
                              int flags, void *key);
+/* Marks the entry woken (WQ_FLAG_WOKEN) before the default wake. */
+int woken_wake_function(struct wait_queue_entry *entry, unsigned mode,
+                        int flags, void *key);
 
 /*
  * The linkage is initialised here, not left to prepare_to_wait().

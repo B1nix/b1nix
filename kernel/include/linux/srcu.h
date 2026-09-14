@@ -33,4 +33,9 @@ static inline void synchronize_srcu(struct srcu_struct *s)
  * for the expedited form to be faster than. */
 #define synchronize_srcu_expedited(sp) synchronize_srcu(sp)
 
+/* Fetch an SRCU-protected pointer. The read section above is an RCU one, so
+ * this is rcu_dereference. */
+#define srcu_dereference_check(p, ssp, c) ({ (void)(ssp); (void)(c); rcu_dereference(p); })
+#define srcu_dereference(p, ssp)          srcu_dereference_check((p), (ssp), 0)
+
 #endif

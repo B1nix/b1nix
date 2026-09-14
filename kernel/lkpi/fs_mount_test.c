@@ -436,7 +436,14 @@ static int lkpi_btrfs_write_test(struct dentry *root)
 			if (!IS_ERR(d))
 				dput(d);
 		} else {
-			rc = dir->i_op->mkdir(&nop_mnt_idmap, dir, d, S_IFDIR | 0755);
+			struct dentry *de = dir->i_op->mkdir(&nop_mnt_idmap, dir, d,
+			                                     S_IFDIR | 0755);
+
+			rc = IS_ERR(de) ? (int)PTR_ERR(de) : 0;
+			if (!IS_ERR_OR_NULL(de)) {
+				dput(d);
+				d = de;
+			}
 			if (rc || !d->d_inode) {
 				lkpi_printk("LKPI-FS: FAIL btrfs-mkdir ret=%d\n", rc);
 				failures++;

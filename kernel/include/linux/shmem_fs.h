@@ -65,4 +65,12 @@ struct address_space;
 struct folio *shmem_read_folio_gfp(struct address_space *mapping,
                                    unsigned long index, gfp_t gfp);
 
+#include <linux/pagemap.h>
+struct swap_iocb;
+int shmem_writeout(struct folio *folio, struct swap_iocb **plug,
+                   struct list_head *folio_list);
+static inline struct folio *shmem_read_folio(struct address_space *mapping,
+                                             pgoff_t index)
+{ return shmem_read_folio_gfp(mapping, index, mapping_gfp_mask(mapping)); }
+
 #endif

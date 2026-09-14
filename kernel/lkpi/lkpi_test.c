@@ -46,8 +46,8 @@ static int idr_walk_cb(int id, void *ptr, void *data)
 
 static void test_idr(void)
 {
-	struct idr idr;
-	idr_init_base(&idr, 1);
+	struct lkpi_idr idr;
+	lkpi_idr_init_base(&idr, 1);
 
 	/* 64 distinct objects, each identified by its own address. */
 	static u32 objects[64];
@@ -55,7 +55,7 @@ static void test_idr(void)
 	int ok = 1;
 	for (int i = 0; i < 64; i++) {
 		objects[i] = 0xAB0000u + (u32)i;
-		ids[i] = idr_alloc(&idr, &objects[i], 0, 0);
+		ids[i] = lkpi_idr_alloc(&idr, &objects[i], 0, 0);
 		if (ids[i] < 0)
 			ok = 0;
 	}
@@ -70,46 +70,46 @@ static void test_idr(void)
 	/* Lookup must return the exact pointer that was stored, checked by
 	 * reading the value the test wrote into the object. */
 	for (int i = 0; i < 64 && ok; i++) {
-		u32 *p = idr_find(&idr, (u32)ids[i]);
+		u32 *p = lkpi_idr_find(&idr, (u32)ids[i]);
 		if (p != &objects[i] || *p != 0xAB0000u + (u32)i)
 			ok = 0;
 	}
-	if (idr_count(&idr) != 64)
+	if (lkpi_idr_count(&idr) != 64)
 		ok = 0;
 
 	u32 seen = 0;
-	idr_for_each(&idr, idr_walk_cb, &seen);
+	lkpi_idr_for_each(&idr, idr_walk_cb, &seen);
 	if (seen != 64)
 		ok = 0;
 
 	/* Removal returns the stored pointer and makes the id miss. */
-	void *removed = idr_remove(&idr, (u32)ids[7]);
-	if (removed != &objects[7] || idr_find(&idr, (u32)ids[7]) != 0 ||
-	    idr_count(&idr) != 63)
+	void *removed = lkpi_idr_remove(&idr, (u32)ids[7]);
+	if (removed != &objects[7] || lkpi_idr_find(&idr, (u32)ids[7]) != 0 ||
+	    lkpi_idr_count(&idr) != 63)
 		ok = 0;
 
 	/* The freed id is the one handed out next (dense reuse). */
-	int reused = idr_alloc(&idr, &objects[7], 0, 0);
+	int reused = lkpi_idr_alloc(&idr, &objects[7], 0, 0);
 	if (reused != ids[7])
 		ok = 0;
 
 	/* Explicit placement and its conflict case. */
-	if (idr_alloc_at(&idr, &objects[0], 9999) != 0)
+	if (lkpi_idr_alloc_at(&idr, &objects[0], 9999) != 0)
 		ok = 0;
-	if (idr_alloc_at(&idr, &objects[1], 9999) != -EBUSY)
+	if (lkpi_idr_alloc_at(&idr, &objects[1], 9999) != -EBUSY)
 		ok = 0;
-	if (idr_find(&idr, 9999) != &objects[0])
+	if (lkpi_idr_find(&idr, 9999) != &objects[0])
 		ok = 0;
 
 	/* A bounded range must be honoured. */
-	int bounded = idr_alloc(&idr, &objects[2], 5000, 5001);
+	int bounded = lkpi_idr_alloc(&idr, &objects[2], 5000, 5001);
 	if (bounded != 5000)
 		ok = 0;
-	int full = idr_alloc(&idr, &objects[3], 5000, 5001);
+	int full = lkpi_idr_alloc(&idr, &objects[3], 5000, 5001);
 	if (full != -ENOSPC)
 		ok = 0;
 
-	idr_destroy(&idr);
+	lkpi_idr_destroy(&idr);
 	lkpi_report("idr", ok, 0);
 }
 

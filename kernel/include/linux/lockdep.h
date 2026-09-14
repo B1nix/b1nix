@@ -91,4 +91,15 @@ struct pin_cookie { int unused; };
 #define lock_is_held(l)      1
 #define lock_is_held_type(l, r) 1
 
+/* Dynamically allocated lock classes; nothing to register without lockdep. */
+#define lockdep_register_key(key)   do { (void)(key); } while (0)
+#define lockdep_unregister_key(key) do { (void)(key); } while (0)
+#ifndef SINGLE_DEPTH_NESTING
+#define SINGLE_DEPTH_NESTING 1
+#endif
+
+/* Might this touch user memory (and so sleep on a fault)? Checked only with
+ * lockdep upstream; here it asserts what might_sleep asserts, nothing. */
+#define might_fault() might_sleep()
+
 #endif

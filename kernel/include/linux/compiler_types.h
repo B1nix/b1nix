@@ -24,4 +24,21 @@
 #define static_assert(expr, ...) _Static_assert(expr, #expr)
 #endif
 
+/* A name no other use of the same prefix in this translation unit can collide
+ * with; the scoped guards in <linux/cleanup.h> declare their variables with it. */
+#ifndef __UNIQUE_ID
+#define ___PASTE(a, b) a##b
+#define __PASTE(a, b) ___PASTE(a, b)
+#define __UNIQUE_ID(prefix) __PASTE(__PASTE(__UNIQUE_ID_, prefix), __COUNTER__)
+#endif
+
+/* Scoped diagnostic suppression. The imported code is built with -w, so there
+ * is nothing to suppress; each form is a declaration that consumes the `;`
+ * that follows it at file or block scope. */
+#ifndef __diag_push
+#define __diag_push()                   _Static_assert(1, "")
+#define __diag_pop()                    _Static_assert(1, "")
+#define __diag_ignore_all(option, comment) _Static_assert(1, "")
+#endif
+
 #endif

@@ -5,4 +5,8 @@
 void sort(void *base, usize num, usize size,
           int (*cmp)(const void *, const void *),
           void (*swap_fn)(void *, void *, int));
+void sort_r(void *base, usize num, usize size,
+            int (*cmp)(const void *, const void *, const void *),
+            void (*swap_fn)(void *, void *, int, const void *),
+            const void *priv);
 #endif

@@ -22,6 +22,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
+#include <linux/shmem_fs.h>
 #include <linux/printk.h>
 #include <lkpi/env.h>
 #include <lkpi/drmdev.h>
@@ -164,6 +165,34 @@ struct fd fdget(unsigned int fd)
 	 * always does — b1nix has no "borrowed without a reference" fast path. */
 	out.flags = out.file ? 1u : 0u;
 	return out;
+}
+
+struct file *get_file(struct file *f)
+{
+	atomic64_add(1, &f->f_count);
+	return f;
+}
+
+struct file *get_file_active(struct file **f)
+{
+	for (;;) {
+		struct file *file = READ_ONCE(*f);
+		i64 count;
+
+		if (!file)
+			return NULL;
+		count = atomic64_read(&file->f_count);
+		if (count == 0)
+			return NULL;
+		if (atomic64_cmpxchg(&file->f_count, count, count + 1) == count)
+			return file;
+	}
+}
+
+/* An O_PATH descriptor resolves the same way: fget does not refuse one. */
+struct fd fdget_raw(unsigned int fd)
+{
+	return fdget(fd);
 }
 
 void fdput(struct fd f)
@@ -404,28 +433,29 @@ static int shmem_file_release(struct inode *inode, struct file *file)
 /* Hand back the page for this offset so the caller can copy into it. The pair
  * exists because the page cache normally has to be told a write is coming;
  * here the page is simply allocated if it is not there yet. */
-static int shmem_write_begin(struct file *file, struct address_space *mapping,
-                             loff_t pos, unsigned len, struct page **pagep,
-                             void **fsdata)
+static int shmem_write_begin(const struct kiocb *iocb,
+                             struct address_space *mapping, loff_t pos,
+                             unsigned len, struct folio **foliop, void **fsdata)
 {
 	struct folio *folio;
 
-	(void)file;
+	(void)iocb;
 	(void)len;
 	(void)fsdata;
 	folio = shmem_read_folio_gfp(mapping, (unsigned long)(pos >> PAGE_SHIFT),
 	                             GFP_KERNEL);
-	if (!folio)
-		return -ENOMEM;
-	*pagep = folio_page(folio, 0);
+	if (IS_ERR(folio))
+		return (int)PTR_ERR(folio);
+	*foliop = folio;
 	return 0;
 }
 
-static int shmem_write_end(struct file *file, struct address_space *mapping,
-                           loff_t pos, unsigned len, unsigned copied,
-                           struct page *page, void *fsdata)
+static int shmem_write_end(const struct kiocb *iocb,
+                           struct address_space *mapping, loff_t pos,
+                           unsigned len, unsigned copied, struct folio *folio,
+                           void *fsdata)
 {
-	(void)file; (void)mapping; (void)pos; (void)len; (void)page; (void)fsdata;
+	(void)iocb; (void)mapping; (void)pos; (void)len; (void)folio; (void)fsdata;
 	/* Nothing to mark: the page is the storage, not a cache of it. */
 	return (int)copied;
 }
@@ -433,6 +463,19 @@ static int shmem_write_end(struct file *file, struct address_space *mapping,
 /* Writing a page back to its backing store. There is none — these pages are the
  * store — so this reports success without doing anything, which is what leaves
  * the data where it already is. */
+/*
+ * Swap out a folio (6.16). There is no swap behind these objects, so the
+ * folio stays dirty in memory and the caller is told to keep it active — the
+ * answer upstream gives when it has nowhere to write. The folio stays locked.
+ */
+int shmem_writeout(struct folio *folio, struct swap_iocb **plug,
+                   struct list_head *folio_list)
+{
+	(void)plug; (void)folio_list;
+	folio_mark_dirty(folio);
+	return AOP_WRITEPAGE_ACTIVATE;
+}
+
 static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 {
 	(void)page; (void)wbc;
@@ -523,10 +566,10 @@ struct folio *shmem_read_folio_gfp(struct address_space *mapping,
 
 	(void)gfp;
 	if (!sh || index >= sh->npages)
-		return 0;
+		return ERR_PTR(-EINVAL);
 	if (!sh->pages[index].phys) {
 		if (!lkpi_pagevec_populate(sh->pages, index))
-			return 0;
+			return ERR_PTR(-ENOMEM);
 		/* Zeroed on first use: a GEM object must not hand a process the
 		 * contents of whatever last owned the frame. */
 		__builtin_memset(page_address(&sh->pages[index]), 0, PAGE_SIZE);

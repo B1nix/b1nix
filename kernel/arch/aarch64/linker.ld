@@ -25,7 +25,7 @@ SECTIONS
 
 	/* M95 module loader: resolve_ksym walks __ksymtab_start..__ksymtab_end
 	 * to bind a .ko's undefined symbols (mirrors the x86_64 script). */
-	.ksymtab ALIGN(8) : {
+	.ksymtab ALIGN(16) : {
 		__ksymtab_start = .;
 		KEEP(*(.ksymtab))
 		__ksymtab_end = .;

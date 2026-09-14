@@ -15,7 +15,7 @@
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-LINUX_VERSION="${LINUX_VERSION:-6.6}"
+LINUX_VERSION="${LINUX_VERSION:-6.18.51}"
 STAGE_DIR="$ROOT_DIR/build/src/fs-${LINUX_VERSION}"
 GEN_DIR="$ROOT_DIR/build/src/fs-${LINUX_VERSION}-gen"
 
@@ -93,7 +93,7 @@ if [ -f "$STAGE_DIR/B1NIX-OBJECTS" ] && "$CC" --version >/dev/null 2>&1; then
 	RES="$("$CC" -print-resource-dir)/include"
 	extra="$(mktemp)"
 	for f in $(cat "$STAGE_DIR/B1NIX-OBJECTS"); do
-		"$CC" -std=gnu11 -nostdinc -ffreestanding -fno-builtin -w -fsyntax-only \
+		"$CC" -std=gnu11 -nostdinc -ffreestanding -fno-builtin -w -fsyntax-only -ferror-limit=0 \
 			-D__KERNEL__ -D__linux__ -DKBUILD_MODNAME='"b1nixfs"' \
 			-DCONFIG_X86=1 -DCONFIG_X86_64=1 \
 			-isystem "$RES" \

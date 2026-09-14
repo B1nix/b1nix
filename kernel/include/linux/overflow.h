@@ -64,4 +64,37 @@ static inline usize struct_size_helper(usize base, usize n, usize elem)
 	                      !overflows_type(x, *(T *)0),                   \
 	                      1)
 
+/*
+ * An on-stack instance of a struct with a trailing flexible array of `count`
+ * elements; `name` is a pointer to it. The raw form is zeroed.
+ */
+#define __DEFINE_FLEX(type, name, member, count, trailer...)                  \
+	union {                                                               \
+		u8 bytes[sizeof(type) + sizeof(((type *)0)->member[0]) * (count)]; \
+		type obj;                                                     \
+	} name##_u trailer;                                                   \
+	type *name = (type *)&name##_u
+#define DEFINE_RAW_FLEX(type, name, member, count) \
+	__DEFINE_FLEX(type, name, member, count, = { })
+
+/* Does [start, start + size) reach past max? Written so start + size cannot
+ * itself overflow. */
+#define range_overflows(start, size, max) ({                    \
+	__typeof__(start) start__ = (start);                    \
+	__typeof__(size) size__ = (size);                       \
+	__typeof__(max) max__ = (max);                          \
+	start__ >= max__ || size__ > max__ - start__;           \
+})
+#define range_overflows_t(type, start, size, max) \
+	range_overflows((type)(start), (type)(size), (type)(max))
+#define range_end_overflows(start, size, max) ({                \
+	__typeof__(start) start__ = (start);                    \
+	__typeof__(size) size__ = (size);                       \
+	__typeof__(max) max__ = (max);                          \
+	start__ > max__ || size__ > max__ - start__;            \
+})
+
+#define range_end_overflows_t(type, start, size, max) \
+	range_end_overflows((type)(start), (type)(size), (type)(max))
+
 #endif

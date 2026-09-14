@@ -113,10 +113,9 @@ void *memdup_user(const void *user_src, usize len);
 #define kmalloc_node(size, flags, node) lkpi_kmalloc((size), (flags))
 char *kvasprintf(gfp_t flags, const char *fmt, __builtin_va_list ap);
 
-/* Usable size of an allocation. kheap does not report it, so this returns the
- * size asked for — never more, so a caller that writes up to ksize() stays
- * inside its own block. */
-static inline usize ksize(const void *p) { (void)p; return 0; }
+/* Usable size of an allocation, which may exceed what was asked for. */
+usize lkpi_ksize(const void *p);
+static inline usize ksize(const void *p) { return lkpi_ksize(p); }
 
 #define ARCH_KMALLOC_MINALIGN 8
 
@@ -132,14 +131,86 @@ static inline usize ksize(const void *p) { (void)p; return 0; }
  */
 struct kmem_cache;
 
-struct kmem_cache *kmem_cache_create(const char *name, unsigned int size,
-                                     unsigned int align, unsigned long flags,
-                                     void (*ctor)(void *));
+/*
+ * The cache parameters beyond name, size and flags (6.12+). `align` and `ctor`
+ * are honoured; the usercopy window and the free-pointer offset are hints to
+ * SLUB's hardening and layout, and a sheaf capacity sizes SLUB's per-CPU
+ * batches — the sheaf interface below works without it.
+ */
+struct kmem_cache_args {
+	unsigned int align;
+	unsigned int useroffset;
+	unsigned int usersize;
+	unsigned int freeptr_offset;
+	bool use_freeptr_offset;
+	void (*ctor)(void *);
+	unsigned int sheaf_capacity;
+};
+
+struct kmem_cache *__kmem_cache_create_args(const char *name,
+                                            unsigned int size,
+                                            struct kmem_cache_args *args,
+                                            unsigned long flags);
+
+static inline struct kmem_cache *
+kmem_cache_create_legacy(const char *name, unsigned int size,
+                         unsigned int align, unsigned long flags,
+                         void (*ctor)(void *))
+{
+	struct kmem_cache_args args = { .align = align, .ctor = ctor };
+
+	return __kmem_cache_create_args(name, size, &args, flags);
+}
+
+static inline struct kmem_cache *
+__kmem_cache_default_args(const char *name, unsigned int size,
+                          struct kmem_cache_args *args, unsigned long flags)
+{
+	struct kmem_cache_args defaults = { 0 };
+
+	(void)args;
+	return __kmem_cache_create_args(name, size, &defaults, flags);
+}
+
+/* Both spellings upstream accepts: (name, size, args, flags) and the legacy
+ * (name, size, align, flags, ctor), told apart by the third argument's type. */
+#define kmem_cache_create(__name, __object_size, __args, ...)               \
+	_Generic((__args),                                                      \
+		struct kmem_cache_args *: __kmem_cache_create_args,             \
+		void *: __kmem_cache_default_args,                              \
+		default: kmem_cache_create_legacy)(__name, __object_size, __args, __VA_ARGS__)
+
+/*
+ * Sheaves: a batch of preallocated objects a caller holds so that later
+ * allocations in a context that must not fail are served from it. The maple
+ * tree takes one before a write and draws its nodes from it under a lock.
+ */
+struct slab_sheaf {
+	unsigned int capacity;
+	unsigned int size;
+	void *objects[];
+};
+struct slab_sheaf *kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp,
+                                            unsigned int size);
+int kmem_cache_refill_sheaf(struct kmem_cache *s, gfp_t gfp,
+                            struct slab_sheaf **sheafp, unsigned int size);
+void kmem_cache_return_sheaf(struct kmem_cache *s, gfp_t gfp,
+                             struct slab_sheaf *sheaf);
+void *kmem_cache_alloc_from_sheaf(struct kmem_cache *s, gfp_t gfp,
+                                  struct slab_sheaf *sheaf);
+static inline unsigned int kmem_cache_sheaf_size(struct slab_sheaf *sheaf)
+{ return sheaf->size; }
 void kmem_cache_destroy(struct kmem_cache *c);
 void *kmem_cache_alloc(struct kmem_cache *c, gfp_t flags);
 void *kmem_cache_zalloc(struct kmem_cache *c, gfp_t flags);
 void kmem_cache_free(struct kmem_cache *c, void *obj);
 void kmem_cache_shrink(struct kmem_cache *c);
+/* Allocation onto a list_lru, which lets reclaim find the object. There is no
+ * such reclaim here, so the LRU is not recorded. */
+struct list_lru;
+static inline void *kmem_cache_alloc_lru(struct kmem_cache *c, struct list_lru *lru,
+                                         gfp_t flags)
+{ (void)lru; return kmem_cache_alloc(c, flags); }
 
 #define SLAB_HWCACHE_ALIGN 0x00002000u
 #define SLAB_RECLAIM_ACCOUNT 0x00020000u
@@ -168,8 +239,8 @@ void kmem_cache_shrink(struct kmem_cache *c);
 #define SLAB_POISON          0x08000000u
 #define SLAB_TYPESAFE_BY_RCU 0x00080000u
 #define KMEM_CACHE(__struct, __flags) \
-	kmem_cache_create(#__struct, sizeof(struct __struct), \
-	                  __alignof__(struct __struct), (__flags), 0)
+	kmem_cache_create_legacy(#__struct, sizeof(struct __struct), \
+	                         __alignof__(struct __struct), (__flags), 0)
 
 
 /* The pointer a zero-sized allocation returns: not NULL, so a caller cannot
@@ -214,5 +285,17 @@ struct kmem_cache *kmem_cache_create_usercopy(const char *name,
 #ifndef __GFP_WRITE
 #define __GFP_WRITE 0x800000u
 #endif
+
+/* Scope-bound frees: `void *p __free(kfree) = kmalloc(...)`. */
+#include <linux/cleanup.h>
+/* The error-pointer test is spelled out: <linux/err.h> can reach this header
+ * before it has defined IS_ERR_OR_NULL. */
+DEFINE_FREE(kfree, void *, if (_T && (unsigned long)_T < (unsigned long)-4095) kfree(_T))
+DEFINE_FREE(kvfree, void *, if (_T && (unsigned long)_T < (unsigned long)-4095) kvfree(_T))
+
+/* A NUL-terminated copy of `len` user bytes. */
+void *memdup_user_nul(const void *user_src, usize len);
+/* A copy of n * size user bytes, refusing a product that overflows. */
+void *memdup_array_user(const void *src, usize n, usize size);
 
 #endif

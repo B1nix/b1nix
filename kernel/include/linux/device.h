@@ -211,6 +211,7 @@ void devm_kfree(struct device *dev, void *ptr);
 
 /* Register an arbitrary cleanup to run with the rest. */
 int devm_add_action(struct device *dev, void (*action)(void *), void *data);
+void devm_release_action(struct device *dev, void (*action)(void *), void *data);
 int devm_add_action_or_reset(struct device *dev, void (*action)(void *),
                              void *data);
 
@@ -259,6 +260,14 @@ void device_remove_file(struct device *dev,
                         const struct device_attribute *attr);
 
 #define dev_err(dev, fmt, ...)   lkpi_printk("drm %s: " fmt, dev_name(dev), ##__VA_ARGS__)
+/* Report a probe failure and return the error. -EPROBE_DEFER is the "not yet"
+ * that is retried rather than printed. */
+#define dev_err_probe(dev, err, fmt, ...) ({                                   \
+	int __err = (err);                                                     \
+	if (__err != -EPROBE_DEFER)                                            \
+		dev_err(dev, "error %d: " fmt, __err, ##__VA_ARGS__);          \
+	__err;                                                                 \
+})
 #define dev_warn(dev, fmt, ...)  lkpi_printk("drm %s: " fmt, dev_name(dev), ##__VA_ARGS__)
 #define dev_info(dev, fmt, ...)  lkpi_printk("drm %s: " fmt, dev_name(dev), ##__VA_ARGS__)
 #define dev_notice(dev, fmt, ...) lkpi_printk("drm %s: " fmt, dev_name(dev), ##__VA_ARGS__)
@@ -347,7 +356,7 @@ struct bus_type {
 	const struct attribute_group **bus_groups;
 	const struct attribute_group **dev_groups;
 	const struct attribute_group **drv_groups;
-	int (*match)(struct device *dev, struct device_driver *drv);
+	int (*match)(struct device *dev, const struct device_driver *drv);
 	int (*uevent)(const struct device *dev, struct kobj_uevent_env *env);
 	int (*probe)(struct device *dev);
 	void (*remove)(struct device *dev);

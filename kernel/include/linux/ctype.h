@@ -15,4 +15,8 @@ static inline int isalnum(int c) { return isalpha(c) || isdigit(c); }
 static inline int isprint(int c) { return c >= 0x20 && c < 0x7f; }
 static inline int tolower(int c) { return isupper(c) ? c + 32 : c; }
 static inline int toupper(int c) { return islower(c) ? c - 32 : c; }
+
+static inline int isgraph(int c) { return c > 0x20 && c < 0x7f; }
+static inline int isascii(int c) { return (unsigned int)c <= 0x7f; }
+
 #endif

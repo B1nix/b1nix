@@ -28,31 +28,37 @@
  * refcount_t which holds the counter — because imported code reaches through
  * both names (kref.refcount.refs) rather than only calling the API.
  */
+/* The counter is Linux's atomic_t, one type under both names: 6.x code runs
+ * atomic operations on refcount.refs directly (btrfs's extent buffers do). */
+struct lkpi_atomic {
+	volatile i32 counter;
+};
+
 typedef struct {
-	volatile i32 refs;
+	struct lkpi_atomic refs;
 } lkpi_refcount_t;
 
 struct kref {
 	lkpi_refcount_t refcount;
 };
 
-#define lkpi_kref_counter(kref) ((kref)->refcount.refs)
+#define lkpi_kref_counter(kref) ((kref)->refcount.refs.counter)
 
 typedef void (*kref_release_t)(struct kref *kref);
 
 static inline void kref_init(struct kref *kref)
 {
-	__atomic_store_n(&kref->refcount.refs, 1, __ATOMIC_RELEASE);
+	__atomic_store_n(&kref->refcount.refs.counter, 1, __ATOMIC_RELEASE);
 }
 
 static inline i32 kref_read(const struct kref *kref)
 {
-	return __atomic_load_n(&kref->refcount.refs, __ATOMIC_ACQUIRE);
+	return __atomic_load_n(&kref->refcount.refs.counter, __ATOMIC_ACQUIRE);
 }
 
 static inline void kref_get(struct kref *kref)
 {
-	__atomic_fetch_add(&kref->refcount.refs, 1, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&kref->refcount.refs.counter, 1, __ATOMIC_RELAXED);
 }
 
 /*
@@ -65,9 +71,9 @@ static inline void kref_get(struct kref *kref)
  */
 static inline int kref_get_unless_zero(struct kref *kref)
 {
-	i32 old = __atomic_load_n(&kref->refcount.refs, __ATOMIC_ACQUIRE);
+	i32 old = __atomic_load_n(&kref->refcount.refs.counter, __ATOMIC_ACQUIRE);
 	while (old > 0) {
-		if (__atomic_compare_exchange_n(&kref->refcount.refs, &old, old + 1, 1,
+		if (__atomic_compare_exchange_n(&kref->refcount.refs.counter, &old, old + 1, 1,
 		                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 			return 1;
 		/* old now holds the value that was actually there; retry. */
@@ -85,7 +91,7 @@ static inline int kref_get_unless_zero(struct kref *kref)
  */
 static inline int kref_put(struct kref *kref, kref_release_t release)
 {
-	if (__atomic_fetch_sub(&kref->refcount.refs, 1, __ATOMIC_ACQ_REL) == 1) {
+	if (__atomic_fetch_sub(&kref->refcount.refs.counter, 1, __ATOMIC_ACQ_REL) == 1) {
 		if (release)
 			release(kref);
 		return 1;

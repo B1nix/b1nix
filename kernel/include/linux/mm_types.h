@@ -60,4 +60,23 @@ struct vm_operations_struct {
 	                        pgoff_t end_pgoff);
 };
 struct mm_struct;
+
+/*
+ * What an mmap_prepare hook sees (6.17): the mapping as it is about to be
+ * created, before a VMA exists. A hook adjusts the flags and installs its
+ * operations; the mmap path copies them into the VMA it then creates.
+ */
+struct vm_area_desc {
+	struct mm_struct *const mm;
+	struct file *const file;
+	unsigned long start;
+	unsigned long end;
+	pgoff_t pgoff;
+	struct file *vm_file;
+	unsigned long vm_flags;
+	pgprot_t page_prot;
+	const struct vm_operations_struct *vm_ops;
+	void *private_data;
+};
+
 #endif

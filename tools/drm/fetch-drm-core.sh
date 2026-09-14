@@ -22,8 +22,13 @@ set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
-LINUX_VERSION="${LINUX_VERSION:-6.6}"
-LINUX_SHA256="d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0"
+LINUX_VERSION="${LINUX_VERSION:-6.18.51}"
+# Pinned tarballs, checked against kernel.org's signed sha256sums.asc.
+case "$LINUX_VERSION" in
+6.6)     LINUX_SHA256="d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0" ;;
+6.18.51) LINUX_SHA256="ba2f60f858bf4d1f929101faa356c93dc8b925b17aaa9f95eabd4627758df613" ;;
+*) echo "fetch-drm-core: no pinned SHA256 for linux-$LINUX_VERSION" >&2; exit 1 ;;
+esac
 TARBALL="linux-${LINUX_VERSION}.tar.xz"
 URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${TARBALL}"
 
@@ -114,6 +119,18 @@ tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
 	"linux-${LINUX_VERSION}/drivers/video/hdmi.c" \
 	"linux-${LINUX_VERSION}/drivers/video/nomodeset.c"
 
+# The GPU buddy allocator. 6.18 moved it out of the DRM core into
+# drivers/gpu/buddy.c with its interface in include/linux/gpu_buddy.h, leaving
+# drm_buddy.c a thin wrapper; both files are MIT, so the allocator is imported
+# with the core rather than reimplemented in the shim.
+if tar -tf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/buddy.c" >/dev/null 2>&1; then
+	tar -xf "$TAR_PATH" -C "$STAGE_DIR.tmp" --strip-components=1 \
+		"linux-${LINUX_VERSION}/drivers/gpu/buddy.c" \
+		"linux-${LINUX_VERSION}/include/linux/gpu_buddy.h"
+	# Relative to drivers/gpu/drm, where every other entry lives.
+	echo "../buddy.c" >> "$STAGE_DIR.tmp/B1NIX-OBJECTS.extra"
+fi
+
 # The object list, taken from upstream's own Makefile rather than chosen here.
 # Not every file in drivers/gpu/drm is meant to be built — Kconfig selects them,
 # and drm_of.c for instance is device-tree-only and collides with its own
@@ -143,10 +160,18 @@ tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/Makefile" |
 	grep -oE 'drm_[a-z0-9_]+\.o' |
 	sed 's/\.o$/.c/' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
 
+# The in-kernel DRM client (6.12+ gates it on CONFIG_DRM_CLIENT, which every
+# fbdev emulation selects). b1nix's console is a DRM client, so it is built.
+tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/Makefile" |
+	sed -e :a -e '/\\$/N; s/\\\n//; ta' |
+	grep -E '^drm-\$\(CONFIG_DRM_CLIENT\)' |
+	grep -oE 'drm_[a-z0-9_]+\.o' |
+	sed 's/\.o$/.c/' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+
 # drm_display_helper-y and ttm-y, from the same Makefiles, for the same reason.
 tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/display/Makefile" |
 	sed -e :a -e '/\\$/N; s/\\\n//; ta' |
-	grep -E '^drm_display_helper-(y|\$\(CONFIG_DRM_DISPLAY_(DP|HDCP|HDMI)_HELPER\))' |
+	grep -E '^drm_display_helper-(y|\$\(CONFIG_DRM_DISPLAY_(DP|DSC|HDCP|HDMI)_HELPER\))' |
 	grep -oE 'drm_[a-z0-9_]+\.o' |
 	sed -e 's/\.o$/.c/' -e 's|^|display/|' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
 
@@ -156,23 +181,20 @@ tar -xOf "$TAR_PATH" "linux-${LINUX_VERSION}/drivers/gpu/drm/ttm/Makefile" |
 	grep -oE 'ttm_[a-z0-9_]+\.o' |
 	sed -e 's/\.o$/.c/' -e 's|^|ttm/|' >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
 
-# Two files upstream builds only under a CONFIG that i915 selects: the buddy
-# allocator its memory regions are built on, and the DSI host interface its
-# panel code speaks. They are staged already — they sit in drivers/gpu/drm —
+# Files upstream builds only under a CONFIG that i915 selects: the buddy
+# allocator its memory regions are built on, the DSI host interface its panel
+# code speaks, and (6.12+, CONFIG_DRM_PANEL) the panel abstraction its DSI
+# panels register with. They are staged already — they sit in drivers/gpu/drm —
 # but they are not in drm-y, so they are named here rather than discovered at
-# link time.
-#
-# drm_panel.c is deliberately NOT here. It is the CONFIG_DRM_PANEL abstraction
-# for panels described by device tree, and <drm/drm_panel.h> defines its own
-# entry points as inline stubs when that option is off — so building the .c file
-# too is a redefinition, not a missing symbol. i915 drives its panels natively
-# and references none of it.
-printf '%s\n' drm_buddy.c drm_mipi_dsi.c >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+# link time. The kernel is built with CONFIG_DRM_PANEL to match.
+printf '%s\n' drm_buddy.c drm_mipi_dsi.c drm_panel.c >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
 
 # hdmi.c is not in either list — upstream builds it alongside the video helpers —
 # but the core links against its infoframe helpers, so it is part of what has to
 # be built here.
 echo "hdmi.c" >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+[ -f "$STAGE_DIR.tmp/B1NIX-OBJECTS.extra" ] && cat "$STAGE_DIR.tmp/B1NIX-OBJECTS.extra" >> "$STAGE_DIR.tmp/B1NIX-OBJECTS"
+rm -f "$STAGE_DIR.tmp/B1NIX-OBJECTS.extra"
 
 sort -u -o "$STAGE_DIR.tmp/B1NIX-OBJECTS" "$STAGE_DIR.tmp/B1NIX-OBJECTS"
 
@@ -184,7 +206,8 @@ url:    ${URL}
 staged: drivers/gpu/drm/*.[ch], drivers/gpu/drm/{display,ttm},
         include/drm, include/uapi/drm,
         include/linux/hdmi.h, include/video/nomodeset.h,
-        drivers/video/{hdmi,nomodeset}.c  (all MIT)
+        drivers/video/{hdmi,nomodeset}.c,
+        drivers/gpu/buddy.c, include/linux/gpu_buddy.h  (all MIT)
 rule:   imported source is never edited; fixes belong in kernel/lkpi.
 EOF
 

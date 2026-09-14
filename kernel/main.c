@@ -113,7 +113,7 @@ void lkpi_i915_register_card(struct drm_device *dev);
  * timeout — the modeset messages are the ones worth having.
  */
 #define B1NIX_DRM_DEBUG_MASK 0x04UL
-extern int lkpi_initcall_drm_buddy_module_init(void);
+extern int lkpi_initcall_gpu_buddy_module_init(void);
 extern int lkpi_initcall_drm_display_helper_module_init(void);
 extern int lkpi_initcall_i915_init(void);
 extern void lkpi_i915_disable_display_power_saving(void);
@@ -138,7 +138,7 @@ static void i915_module_init(void)
 	(void)fw_cfg_place_igd_opregion(0, 2, 0);
 
 	drm_core_bringup();
-	(void)lkpi_initcall_drm_buddy_module_init();
+	(void)lkpi_initcall_gpu_buddy_module_init();
 	(void)lkpi_initcall_drm_display_helper_module_init();
 	(void)lkpi_initcall_i915_init();
 }
@@ -569,6 +569,14 @@ void kernel_main(usize arg0, usize arg1)
 
 	kheap_init();
 	k_info(NULL, "Step 4: KHeap initialized");
+	/* Linux's xarray allocates its nodes from the radix-tree node cache, which
+	 * this creates from the heap. Before anything stores into an xarray, idr
+	 * or page cache — the imported filesystems register and mount long before
+	 * the rest of linuxkpi starts. */
+	{
+		extern void radix_tree_init(void);
+		radix_tree_init();
+	}
 	BOOTMARK(4);	/* green:   kernel heap up */
 
 	void *heap_probe = kzalloc(64);

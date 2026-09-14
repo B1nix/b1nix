@@ -138,8 +138,8 @@ static struct inode *bdev_make_inode(struct block_device *bdev)
 	inode->i_data.gfp_mask = GFP_KERNEL;
 	xa_init(&inode->i_data.i_pages);
 	init_rwsem(&inode->i_data.invalidate_lock);
-	spin_lock_init(&inode->i_data.private_lock);
-	INIT_LIST_HEAD(&inode->i_data.private_list);
+	spin_lock_init(&inode->i_data.i_private_lock);
+	INIT_LIST_HEAD(&inode->i_data.i_private_list);
 	spin_lock_init(&inode->i_lock);
 	init_rwsem(&inode->i_rwsem);
 	INIT_HLIST_NODE(&inode->i_hash);
@@ -285,6 +285,7 @@ static struct block_device *bdev_for(struct b1nix_block_device *dev)
 		kfree(link);
 		return NULL;
 	}
+	link->bdev.bd_mapping = link->bdev.bd_inode->i_mapping;
 
 	spin_lock_irqsave(&bdev_link_lock, flags);
 	/* Re-check: another caller may have created one while we allocated. Theirs
@@ -414,7 +415,7 @@ struct request_queue *bdev_get_queue(struct block_device *bdev)
 	return bdev && bdev->bd_disk ? bdev->bd_disk->queue : NULL;
 }
 
-int set_blocksize(struct block_device *bdev, int size)
+int bdev_set_blocksize(struct block_device *bdev, int size)
 {
 	/*
 	 * The size a filesystem will address the device in. It may be larger than
@@ -441,6 +442,12 @@ int set_blocksize(struct block_device *bdev, int size)
 	if (bdev)
 		bdev->bd_block_size = (unsigned int)size;
 	return 0;
+}
+
+/* 6.10+: the device is named by the file it was opened as. */
+int set_blocksize(struct file *file, int size)
+{
+	return bdev_set_blocksize(file_bdev(file), size);
 }
 
 struct device *disk_to_dev(struct gendisk *disk)
@@ -673,3 +680,104 @@ void blk_update_request(struct request *rq, blk_status_t error,
 }
 
 struct cgroup_subsys_state * const blkcg_root_css;
+
+/* ── block devices as files ─────────────────────────────────────── */
+
+/*
+ * The file is a handle on an open of the device, not something installed in a
+ * descriptor table: the holder rides in private_data so the close releases the
+ * same exclusive claim the open took.
+ */
+static struct file *bdev_file_for(struct block_device *bdev, blk_mode_t mode,
+                                  void *holder)
+{
+	struct file *file;
+
+	if (IS_ERR(bdev))
+		return ERR_CAST(bdev);
+	file = kzalloc(sizeof(*file), GFP_KERNEL);
+	if (!file) {
+		blkdev_put(bdev, holder);
+		return ERR_PTR(-ENOMEM);
+	}
+	file->f_inode = bdev->bd_inode;
+	file->f_mapping = bdev->bd_mapping;
+	file->f_mode = FMODE_READ | ((mode & BLK_OPEN_WRITE) ? FMODE_WRITE : 0);
+	file->private_data = holder;
+	atomic_long_set(&file->f_count, 1);
+	return file;
+}
+
+struct file *bdev_file_open_by_path(const char *path, blk_mode_t mode,
+                                    void *holder, const struct blk_holder_ops *hops)
+{
+	return bdev_file_for(blkdev_get_by_path(path, mode, holder, hops), mode,
+	                     holder);
+}
+
+struct file *bdev_file_open_by_dev(dev_t dev, blk_mode_t mode, void *holder,
+                                   const struct blk_holder_ops *hops)
+{
+	return bdev_file_for(blkdev_get_by_dev(dev, mode, holder, hops), mode,
+	                     holder);
+}
+
+struct block_device *file_bdev(struct file *bdev_file)
+{
+	return bdev_file->f_inode->i_private;
+}
+
+void bdev_fput(struct file *bdev_file)
+{
+	if (!bdev_file)
+		return;
+	if (atomic64_sub_return(1, &bdev_file->f_count) != 0)
+		return;
+	blkdev_put(file_bdev(bdev_file), bdev_file->private_data);
+	kfree(bdev_file);
+}
+
+int bio_split_rw_at(struct bio *bio, const struct queue_limits *lim,
+                    unsigned *segs, unsigned max_bytes)
+{
+	(void)lim;
+	if (segs)
+		*segs = bio->bi_vcnt;
+	if (bio->bi_iter.bi_size <= max_bytes)
+		return 0;
+	return (int)(max_bytes >> SECTOR_SHIFT);
+}
+
+/*
+ * Read or write `len` bytes of a kernel buffer at `sector`, waiting for it.
+ * The buffer need not be page-aligned or physically contiguous: each page it
+ * spans is added as its own segment.
+ */
+int bdev_rw_virt(struct block_device *bdev, sector_t sector, void *data,
+                 size_t len, enum req_op op)
+{
+	unsigned int nr = (unsigned int)(DIV_ROUND_UP(offset_in_page(data) + len,
+	                                              PAGE_SIZE));
+	struct bio *bio = bio_alloc(bdev, nr, op, GFP_KERNEL);
+	size_t done = 0;
+	int ret;
+
+	if (!bio)
+		return -ENOMEM;
+	bio->bi_iter.bi_sector = sector;
+	while (done < len) {
+		void *p = (char *)data + done;
+		unsigned int off = (unsigned int)offset_in_page(p);
+		unsigned int chunk = (unsigned int)min_t(size_t, PAGE_SIZE - off,
+		                                         len - done);
+
+		if (bio_add_page(bio, virt_to_page(p), chunk, off) != (int)chunk) {
+			bio_put(bio);
+			return -EIO;
+		}
+		done += chunk;
+	}
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+	return ret;
+}

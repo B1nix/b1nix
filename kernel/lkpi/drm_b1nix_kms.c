@@ -326,7 +326,7 @@ static void b1nix_pipe_update(struct drm_simple_display_pipe *pipe,
 	obj = fb->obj[0];
 	if (!obj)
 		return;
-	if (drm_gem_vmap_unlocked(obj, &map) != 0)
+	if (drm_gem_vmap(obj, &map) != 0)
 		return;
 
 	const u32 *src = map.vaddr;
@@ -371,7 +371,7 @@ static void b1nix_pipe_update(struct drm_simple_display_pipe *pipe,
 	g_record.centre = src[(usize)(h / 2) * (fb->pitches[0] / 4) + (w / 2)];
 
 	lkpi_scanout_present(src, w, h, dx, dy, dw, dh);
-	drm_gem_vunmap_unlocked(obj, &map);
+	drm_gem_vunmap(obj, &map);
 }
 
 static const struct drm_simple_display_pipe_funcs b1nix_pipe_funcs = {
@@ -920,7 +920,6 @@ static const struct drm_driver b1nix_drm_driver = {
 	 * honest name is the one its driver is called by everywhere else. */
 	.name = "virtio_gpu",
 	.desc = "virtio GPU",
-	.date = "20260808",
 	/* 0.1, which is what upstream's virtio_gpu reports. A driver that takes
 	 * another driver's name should answer its version too, and some versions
 	 * of Mesa's virgl winsys refuse a major other than 0 outright. It was
@@ -1143,7 +1142,7 @@ void drm_kms_selftest(void)
 
 	if (paint_pattern(buffer, b->width, b->height) != 0) {
 		import_report("render", 0, 0);
-		drm_client_framebuffer_delete(buffer);
+		drm_client_buffer_delete(buffer);
 		drm_client_release(&b->client);
 		return;
 	}
@@ -1176,7 +1175,7 @@ void drm_kms_selftest(void)
 	                g_record.centre == PIX_C;
 	import_report("scanout-pixels", pixels_ok && ok, g_record.width);
 
-	drm_client_framebuffer_delete(buffer);
+	drm_client_buffer_delete(buffer);
 	drm_client_release(&b->client);
 	lkpi_printk("M101-KMS: done\n");
 }

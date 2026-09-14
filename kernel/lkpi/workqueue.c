@@ -488,6 +488,40 @@ int cancel_delayed_work(struct delayed_work *dwork)
 	return removed;
 }
 
+/*
+ * Take a queued item off its queue without waiting for one already running.
+ * Returns whether it was pending. The queue's accepted count goes back down
+ * with it, so flush_workqueue does not wait for an item that will never run.
+ */
+int cancel_work(struct work_struct *work)
+{
+	if (!work || !work->wq)
+		return 0;
+	struct workqueue_struct *wq = work->wq;
+	struct work_struct *prev = 0;
+	u64 flags;
+	int removed = 0;
+
+	spin_lock_irqsave((spinlock_t *)&wq->lock, &flags);
+	for (struct work_struct *w = wq->head; w; prev = w, w = w->next) {
+		if (w != work)
+			continue;
+		if (prev)
+			prev->next = w->next;
+		else
+			wq->head = w->next;
+		if (wq->tail == w)
+			wq->tail = prev;
+		w->next = 0;
+		w->pending = 0;
+		wq->queued--;
+		removed = 1;
+		break;
+	}
+	spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
+	return removed;
+}
+
 int flush_work(struct work_struct *work)
 {
 	if (!work)

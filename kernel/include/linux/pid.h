@@ -18,4 +18,11 @@ static inline pid_t task_pid_vnr(void *task) { (void)task; return 0; }
 static inline pid_t task_pid_nr(void *task) { (void)task; return 0; }
 
 #define pid_nr(p) ((p) ? (p)->nr : 0)
+
+/* The task behind a pid handle. get_task_pid() records no identity here (see
+ * kernel/lkpi/linux_support.c), so there is never a task to return. */
+struct lkpi_task;
+static inline struct lkpi_task *pid_task(struct pid *pid, int type)
+{ (void)pid; (void)type; return 0; }
+
 #endif

@@ -402,7 +402,8 @@ static inline void bio_set_polled(struct bio *bio, struct kiocb *kiocb)
 { (void)bio; (void)kiocb; }
 
 struct iov_iter;
-int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter);
+int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
+                           unsigned len_align_mask);
 int bio_iov_vecs_to_alloc(struct iov_iter *iter, int max_segs);
 
 /* Split a bio at the device's limits, for a caller that submits the remainder
@@ -411,5 +412,27 @@ int bio_iov_vecs_to_alloc(struct iov_iter *iter, int max_segs);
 struct bio *bio_split_rw(struct bio *bio, const struct queue_limits *lim,
                          unsigned *segs, struct bio_set *bs,
                          unsigned max_bytes);
+
+static inline void bio_list_merge_init(struct bio_list *bl, struct bio_list *bl2)
+{
+	bio_list_merge(bl, bl2);
+	bio_list_init(bl2);
+}
+
+/* No zoned devices: a zone-append bio is never built. */
+static inline bool bio_is_zone_append(struct bio *bio)
+{ (void)bio; return false; }
+
+/*
+ * Where to split a bio so its first part fits `max_bytes`: the sector count of
+ * that part, or 0 when the whole bio already fits. The block cache takes any
+ * segment layout, so the byte limit is the only one there is.
+ */
+int bio_split_rw_at(struct bio *bio, const struct queue_limits *lim,
+                    unsigned *segs, unsigned max_bytes);
+
+/* Synchronous I/O of a kernel buffer at a sector. */
+int bdev_rw_virt(struct block_device *bdev, sector_t sector, void *data,
+                 size_t len, enum req_op op);
 
 #endif

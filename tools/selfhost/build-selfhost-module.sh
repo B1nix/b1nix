@@ -48,9 +48,12 @@ done
 cp "$SELFBUILD" "$STAGE/bin/selfhost-build"
 RESDIR="$(cd "$STAGE" && ls -d usr/lib/llvm17/lib/clang/* | head -1)"
 
+# The imported Linux release, as the Makefile pins it.
+LV="$(sed -n 's/^LKPI_LINUX_VERSION ?= //p' "$ROOT_DIR/Makefile")"
+
 echo "=== [2/4] sources ==="
 tar -C "$ROOT_DIR" -cf - --exclude='*.o' --exclude='*.d' --exclude='.git' \
-	kernel build/src/fs-6.6 build/src/fs-6.6-gen build/src/drm-core-6.6 build/src/i915-6.6 \
+	kernel "build/src/fs-$LV" "build/src/fs-$LV-gen" "build/src/drm-core-$LV" "build/src/i915-$LV" \
 	"build/$ARCH/inc" | tar -C "$STAGE/src" -xf -
 find "$ROOT_DIR/build/$ARCH" -maxdepth 1 -type f \( -name '*.h' -o -name '*.inc' \) \
 	-exec cp {} "$STAGE/src/build/$ARCH/" \;

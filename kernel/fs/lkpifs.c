@@ -4,7 +4,7 @@
  * The bridge, b1nix side: a VFS filesystem served by imported Linux code.
  *
  * `mount -t btrfs /dev/sda /mnt` mounts a real btrfs with the unmodified
- * Linux 6.6 filesystem compiled into this kernel (see docs/linuxkpi-fs.md), and
+ * Linux filesystem compiled into this kernel (see docs/linuxkpi-fs.md), and
  * every path under it is served by that code — open, read, write, readdir,
  * create, unlink, rename and the rest.
  *
@@ -972,11 +972,11 @@ static struct vfs_fs lkpifs_ext_types[] = {
 void lkpifs_init(void)
 {
 	vfs_register_fs(&lkpifs_btrfs);
-	klog_info("lkpifs: btrfs registered (imported Linux 6.6 btrfs)");
+	klog_info("lkpifs: btrfs registered (imported Linux " LKPI_FS_LINUX_VERSION " btrfs)");
 #if B1NIX_FS_IMPORT_EXT4
 	for (usize i = 0; i < sizeof(lkpifs_ext_types) / sizeof(lkpifs_ext_types[0]); i++)
 		vfs_register_fs(&lkpifs_ext_types[i]);
-	klog_info("lkpifs: ext4/ext3/ext2 registered (imported Linux 6.6 ext4)");
+	klog_info("lkpifs: ext4/ext3/ext2 registered (imported Linux " LKPI_FS_LINUX_VERSION " ext4)");
 #endif
 }
 

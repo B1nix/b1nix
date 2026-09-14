@@ -74,6 +74,7 @@ struct lkpi_bio {
 	unsigned short bi_flags;
 	unsigned short bi_ioprio;
 	u8 bi_status;
+	u8 bi_write_hint;
 
 	struct bvec_iter bi_iter;
 

@@ -7,4 +7,10 @@
 #define PCI_VENDOR_ID_REDHAT_QUMRANET    0x1af4
 #define PCI_SUBVENDOR_ID_REDHAT_QUMRANET 0x1af4
 #define PCI_SUBDEVICE_ID_QEMU            0x1100
+
+/* PCI base classes (the top byte of the class code), which are the spec's. */
+#define PCI_BASE_CLASS_DISPLAY 0x03
+
+#define PCI_CLASS_BRIDGE_HOST 0x0600
+
 #endif

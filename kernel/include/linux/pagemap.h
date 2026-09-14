@@ -278,8 +278,7 @@ void page_cache_sync_readahead(struct address_space *mapping,
                                pgoff_t index, unsigned long req_count);
 void page_cache_async_readahead(struct address_space *mapping,
                                 struct file_ra_state *ra, struct file *file,
-                                struct folio *folio, pgoff_t index,
-                                unsigned long req_count);
+                                struct folio *folio, unsigned long req_count);
 
 #define readahead_for_each(rac, folio)                                         \
 	while (((folio) = readahead_folio(rac)) != NULL)
@@ -305,7 +304,7 @@ static inline loff_t page_file_offset(struct page *page)
 #define page_cache_next_miss(mapping, index, max) (index)
 
 int filemap_fault(struct vm_fault *vmf);
-void filemap_map_pages(struct vm_fault *vmf, pgoff_t start, pgoff_t end);
+vm_fault_t filemap_map_pages(struct vm_fault *vmf, pgoff_t start, pgoff_t end);
 int filemap_page_mkwrite(struct vm_fault *vmf);
 
 /* ── the rest of the page-cache surface ─────────────────────────── */
@@ -369,8 +368,6 @@ void folio_set_bh(struct buffer_head *bh, struct folio *folio,
 
 int redirty_page_for_writepage(struct writeback_control *wbc,
                                struct page *page);
-int generic_error_remove_page(struct address_space *mapping,
-                              struct page *page);
 bool noop_dirty_folio(struct address_space *mapping, struct folio *folio);
 ssize_t noop_direct_IO(struct kiocb *iocb, struct iov_iter *iter);
 bool block_is_partially_uptodate(struct folio *folio, size_t from,
@@ -392,5 +389,59 @@ int vmf_fs_error(int err);
 
 void flush_dcache_page(struct page *page);
 void flush_dcache_folio(struct folio *folio);
+
+/* Uncached buffered I/O (RWF_DONTCACHE): a folio dropped once written. */
+#define FGP_DONTCACHE      0x00000100
+
+static inline bool folio_contains(const struct folio *folio, pgoff_t index)
+{ return index - folio->index < folio_nr_pages((struct folio *)folio); }
+
+/* No large folios in this page cache: every mapping is order 0. */
+static inline unsigned int mapping_max_folio_order(const struct address_space *mapping)
+{ (void)mapping; return 0; }
+static inline size_t mapping_max_folio_size(const struct address_space *mapping)
+{ return PAGE_SIZE << mapping_max_folio_order(mapping); }
+static inline void mapping_set_folio_order_range(struct address_space *mapping,
+                                                 unsigned int min, unsigned int max)
+{ (void)mapping; (void)min; (void)max; }
+static inline void mapping_set_folio_min_order(struct address_space *mapping,
+                                               unsigned int min)
+{ (void)mapping; (void)min; }
+static inline void mapping_clear_stable_writes(struct address_space *mapping)
+{ clear_bit(AS_STABLE_WRITES, &mapping->flags); }
+
+/* The folio a buffered write copies into, locked and in the cache. */
+static inline struct folio *write_begin_get_folio(const struct kiocb *iocb,
+                                                  struct address_space *mapping,
+                                                  pgoff_t index, size_t len)
+{
+	fgf_t fgp_flags = FGP_WRITEBEGIN;
+
+	(void)len;
+	if (iocb && (iocb->ki_flags & IOCB_DONTCACHE))
+		fgp_flags |= FGP_DONTCACHE;
+	return __filemap_get_folio(mapping, index, fgp_flags,
+	                           mapping_gfp_mask(mapping));
+}
+
+/* A folio of 2^order pages outside any mapping. Only order 0 exists here. */
+static inline struct folio *folio_alloc(gfp_t gfp, unsigned int order)
+{ return order ? NULL : filemap_alloc_folio(gfp, 0); }
+
+int generic_error_remove_folio(struct address_space *mapping, struct folio *folio);
+
+/* Flush (optionally), then drop every cached folio in [start, end]. */
+int filemap_invalidate_inode(struct inode *inode, bool flush, loff_t start,
+                             loff_t end);
+
+/*
+ * Grow a readahead window to cover more of the file. The caller must cope
+ * with getting less than it asked for — upstream stops at the first folio it
+ * cannot add — and here readahead does not populate a window at all (see
+ * page_cache_ra_unbounded), so it never grows.
+ */
+static inline void readahead_expand(struct readahead_control *ractl,
+                                    loff_t new_start, size_t new_len)
+{ (void)ractl; (void)new_start; (void)new_len; }
 
 #endif

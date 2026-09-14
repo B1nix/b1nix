@@ -5,6 +5,8 @@
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <linux/string.h>
+/* struct qstr, which the inline name helpers below read. */
+#include <linux/fs.h>
 
 /*
  * Filesystem-level encryption, which b1nix does not implement.
@@ -172,11 +174,11 @@ static inline int fscrypt_fname_disk_to_usr(const struct inode *inode,
 
 /* Contents. Nothing is ever encrypted, so nothing here is ever reached from a
  * correct caller; each returns the error that says so. */
-static inline struct page *fscrypt_encrypt_pagecache_blocks(struct page *page,
-                                                            unsigned int len,
-                                                            unsigned int offs,
+static inline struct page *fscrypt_encrypt_pagecache_blocks(struct folio *folio,
+                                                            size_t len,
+                                                            size_t offs,
                                                             gfp_t gfp_flags)
-{ (void)page; (void)len; (void)offs; (void)gfp_flags; return ERR_PTR(-EOPNOTSUPP); }
+{ (void)folio; (void)len; (void)offs; (void)gfp_flags; return ERR_PTR(-EOPNOTSUPP); }
 static inline int fscrypt_decrypt_pagecache_blocks(struct folio *folio,
                                                    size_t len, size_t offs)
 { (void)folio; (void)len; (void)offs; return -EOPNOTSUPP; }

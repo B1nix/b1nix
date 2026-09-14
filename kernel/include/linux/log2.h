@@ -18,7 +18,12 @@ static inline int __ilog2_u64(u64 n) { return n ? fls64(n) - 1 : 0; }
 #define ilog2(n) (__builtin_constant_p(n)                                  \
 	? ((n) < 2 ? 0 : 63 - __builtin_clzll((unsigned long long)(n)))        \
 	: __ilog2_u64(n))
-#define order_base_2(n) ilog2(__roundup_pow_of_two(n))
+static inline int __order_base_2(unsigned long n)
+{ return n > 1 ? fls64(n - 1) : 0; }
+/* Constant when the argument is: bit-field widths are sized with it. */
+#define order_base_2(n) (__builtin_constant_p(n)                            \
+	? ((n) < 2 ? 0 : const_ilog2((n) - 1) + 1)                          \
+	: __order_base_2(n))
 /*
  * ilog2 of a compile-time constant, as a constant expression.
  *

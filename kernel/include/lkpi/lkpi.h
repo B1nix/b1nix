@@ -36,7 +36,6 @@
 #include <lkpi/page.h>
 #include <lkpi/rbtree.h>
 #include <lkpi/rcu.h>
-#include <lkpi/xarray.h>
 #include <lkpi/scatterlist.h>
 #include <lkpi/wait.h>
 #include <lkpi/workqueue.h>
@@ -78,5 +77,10 @@ void drm_kms_device_init(void);
 /* M101: register a device with the imported core and render one frame through
  * it, all the way to the scanout. */
 void drm_kms_selftest(void);
+
+/* Exercise the imported xarray through its own API (kernel/lkpi/xarray_selftest.c).
+ * Returns 1 when every check held; *seen is the number of entries the ordered
+ * walk visited. */
+int lkpi_xarray_selftest(u64 *seen);
 
 #endif

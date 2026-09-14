@@ -47,6 +47,7 @@ struct folio;
 #define LKPI_PAGEVEC_SIZE 15
 struct folio_batch {
 	unsigned char nr;
+	unsigned char i;
 	_Bool percpu_pvec_drained;
 	struct folio *folios[LKPI_PAGEVEC_SIZE];
 };
@@ -124,6 +125,16 @@ static inline struct page *lkpi_folio_page(struct folio *folio)
 void folio_lock(struct folio *folio) { lock_page(lkpi_folio_page(folio)); }
 int folio_trylock(struct folio *folio) { return trylock_page(lkpi_folio_page(folio)); }
 void folio_unlock(struct folio *folio) { unlock_page(lkpi_folio_page(folio)); }
+
+/* The end of a read: up to date if it succeeded, and unlocked either way —
+ * the uptodate bit goes on before the lock comes off, so a waiter woken by
+ * the unlock sees the result. */
+void folio_end_read(struct folio *folio, _Bool success)
+{
+	if (success)
+		lkpi_page_test_set(lkpi_folio_page(folio), PG_uptodate);
+	unlock_page(lkpi_folio_page(folio));
+}
 void folio_wait_locked(struct folio *folio)
 { wait_on_page_locked(lkpi_folio_page(folio)); }
 
@@ -253,6 +264,7 @@ void __folio_batch_release(struct folio_batch *fbatch)
 		if (fbatch->folios[i])
 			put_page(lkpi_folio_page(fbatch->folios[i]));
 	fbatch->nr = 0;
+	fbatch->i = 0;
 }
 
 /* ── small copies ───────────────────────────────────────────────── */

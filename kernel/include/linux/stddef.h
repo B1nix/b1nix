@@ -12,6 +12,8 @@
  * spells it. */
 #define DECLARE_FLEX_ARRAY(type, name) \
 	struct { struct { } __empty_##name; type name[]; }
+/* The uapi spelling, which on-disk format headers use. */
+#define __DECLARE_FLEX_ARRAY(type, name) DECLARE_FLEX_ARRAY(type, name)
 
 /* The offset just past a member — offsetof plus its size. Used for the
  * compile-time layout assertions upstream puts next to structures two code

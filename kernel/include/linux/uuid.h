@@ -53,4 +53,13 @@ int uuid_parse(const char *uuid, uuid_t *u);
 extern const guid_t guid_null;
 extern const uuid_t uuid_null;
 
+static inline void guid_copy(guid_t *dst, const guid_t *src)
+{ memcpy(dst, src, UUID_SIZE); }
+static inline bool guid_is_null(const guid_t *guid)
+{
+	static const guid_t zero;
+
+	return memcmp(guid, &zero, UUID_SIZE) == 0;
+}
+
 #endif

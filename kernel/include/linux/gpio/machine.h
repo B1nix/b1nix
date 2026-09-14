@@ -20,4 +20,7 @@ static inline void gpiod_remove_lookup_table(struct gpiod_lookup_table *t) { (vo
  * above — so the entry exists to let a driver's table compile. */
 #define GPIO_LOOKUP(_chip_label, _chip_hwnum, _con_id, _flags) { 0 }
 
+#define GPIO_LOOKUP_IDX(_key, _chip_hwnum, _con_id, _idx, _flags) \
+	((struct gpiod_lookup){ .key = (_key), .chip_hwnum = (_chip_hwnum), .con_id = (_con_id) })
+
 #endif

@@ -135,5 +135,11 @@ struct inodes_stat_t {
 #define RWF_SYNC   0x00000004
 #define RWF_NOWAIT 0x00000008
 #define RWF_APPEND 0x00000010
+#define RWF_NOAPPEND 0x00000020
+#define RWF_ATOMIC 0x00000040
+#define RWF_DONTCACHE 0x00000080
+
+typedef int __kernel_rwf_t;
+typedef __kernel_rwf_t rwf_t;
 
 #endif

@@ -459,7 +459,7 @@ unsigned filemap_get_folios_tag(struct address_space *mapping, pgoff_t *start,
 		 * the folio itself, which gives the same answer for the two tags a
 		 * filesystem uses — DIRTY and WRITEBACK are folio flags.
 		 */
-		if (tag.v == XA_MARK_1.v)
+		if (tag == XA_MARK_1)
 			match = folio_test_writeback(folio);
 		else
 			match = folio_test_dirty(folio);
@@ -870,12 +870,32 @@ bool filemap_release_folio(struct folio *folio, gfp_t gfp)
 	return true;
 }
 
-int generic_error_remove_page(struct address_space *mapping, struct page *page)
+int generic_error_remove_folio(struct address_space *mapping, struct folio *folio)
 {
 	if (!mapping)
 		return -EINVAL;
-	filemap_remove_folio(page_folio(page));
+	filemap_remove_folio(folio);
 	return 0;
+}
+
+int filemap_invalidate_inode(struct inode *inode, bool flush, loff_t start,
+                             loff_t end)
+{
+	struct address_space *mapping = inode->i_mapping;
+
+	if (!mapping || !mapping->nrpages || end < start)
+		goto out;
+	/* Hold off new folios while the range is emptied. */
+	filemap_invalidate_lock(mapping);
+	if (mapping->nrpages) {
+		if (flush)
+			filemap_fdatawrite_range(mapping, start, end);
+		invalidate_inode_pages2_range(mapping, start / PAGE_SIZE,
+		                              end / PAGE_SIZE);
+	}
+	filemap_invalidate_unlock(mapping);
+out:
+	return filemap_check_errors(mapping);
 }
 
 /*
@@ -960,73 +980,4 @@ void flush_dcache_page(struct page *page)
 void flush_dcache_folio(struct folio *folio)
 {
 	(void)folio;
-}
-
-/* ── the xarray marks the page cache uses ───────────────────────── */
-
-/*
- * The marks are not maintained in the array (see filemap_get_folios_tag): the
- * two a filesystem uses — DIRTY and WRITEBACK — are folio flags, and the tagged
- * search reads them from the folio.
- *
- * These exist because imported code clears a mark directly on the array while
- * holding its lock. Clearing the folio's flag instead keeps the one source of
- * truth consistent; a version that did nothing would leave a folio marked
- * dirty after writeback claimed it.
- */
-void __xa_clear_mark(struct xarray *xa, unsigned long index, xa_mark_t mark)
-{
-	struct folio *folio = xa_load(xa, index);
-
-	if (!folio)
-		return;
-	if (mark.v == XA_MARK_0.v)
-		folio_clear_dirty(folio);
-	else if (mark.v == XA_MARK_1.v)
-		folio_clear_writeback(folio);
-}
-
-void __xa_set_mark(struct xarray *xa, unsigned long index, xa_mark_t mark)
-{
-	struct folio *folio = xa_load(xa, index);
-
-	if (!folio)
-		return;
-	if (mark.v == XA_MARK_0.v)
-		folio_set_dirty(folio);
-	else if (mark.v == XA_MARK_1.v)
-		folio_set_writeback(folio);
-}
-
-void xa_set_mark(struct xarray *xa, unsigned long index, xa_mark_t mark)
-{
-	__xa_set_mark(xa, index, mark);
-}
-
-void xa_clear_mark(struct xarray *xa, unsigned long index, xa_mark_t mark)
-{
-	__xa_clear_mark(xa, index, mark);
-}
-
-bool xa_get_mark(struct xarray *xa, unsigned long index, xa_mark_t mark)
-{
-	struct folio *folio = xa_load(xa, index);
-
-	if (!folio)
-		return false;
-	if (mark.v == XA_MARK_0.v)
-		return folio_test_dirty(folio);
-	if (mark.v == XA_MARK_1.v)
-		return folio_test_writeback(folio);
-	return false;
-}
-
-bool xa_marked(const struct xarray *xa, xa_mark_t mark)
-{
-	(void)xa;
-	(void)mark;
-	/* "Is anything marked?" — answered conservatively as yes, because a false
-	 * negative would skip a writeback pass entirely while a false positive
-	 * costs one walk that finds nothing. */
-	return true;
 }

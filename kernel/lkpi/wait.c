@@ -223,6 +223,15 @@ int default_wake_function(struct wait_queue_entry *entry, unsigned mode,
 	return 1;
 }
 
+int woken_wake_function(struct wait_queue_entry *entry, unsigned mode,
+                        int flags, void *key)
+{
+	/* Recorded before the wake, so a waiter re-checking the flag after it
+	 * returns from its sleep sees it (wait_woken's protocol). */
+	__atomic_fetch_or(&entry->flags, WQ_FLAG_WOKEN, __ATOMIC_SEQ_CST);
+	return default_wake_function(entry, mode, flags, key);
+}
+
 int autoremove_wake_function(struct wait_queue_entry *entry, unsigned mode,
                              int flags, void *key)
 {

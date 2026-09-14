@@ -44,8 +44,7 @@ extern const struct file_operations relay_file_operations;
  * above — so none of them is ever called. */
 struct dentry;
 struct rchan_callbacks {
-	int (*subbuf_start)(struct rchan_buf *buf, void *subbuf, void *prev_subbuf,
-	                    usize prev_padding);
+	int (*subbuf_start)(struct rchan_buf *buf, void *subbuf, void *prev_subbuf);
 	struct dentry *(*create_buf_file)(const char *filename, struct dentry *parent,
 	                                  umode_t mode, struct rchan_buf *buf,
 	                                  int *is_global);

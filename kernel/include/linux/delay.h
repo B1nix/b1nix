@@ -18,4 +18,15 @@ static inline void usleep_range(unsigned long lo, unsigned long hi)
 static inline unsigned long msleep_interruptible(unsigned int msecs)
 { msleep(msecs); return 0; }
 
+/* A sleep of about `usecs`: busy-wait when shorter than the sleep granularity. */
+static inline void fsleep(unsigned long usecs)
+{
+	if (usecs <= 10)
+		udelay(usecs);
+	else if (usecs < 20000)
+		usleep_range(usecs, usecs + (usecs >> 2));
+	else
+		msleep((unsigned int)((usecs + 999) / 1000));
+}
+
 #endif

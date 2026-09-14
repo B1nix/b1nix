@@ -56,4 +56,8 @@ static inline bool dmi_match(int slot, const char *str)
 
 #define DMI_BIOS_DATE 3
 
+/* No DMI table is read, so nothing matches. */
+static inline const struct dmi_system_id *dmi_first_match(const struct dmi_system_id *list)
+{ (void)list; return 0; }
+
 #endif

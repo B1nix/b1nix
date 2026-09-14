@@ -20,4 +20,11 @@
  */
 u32 crc32c(u32 crc, const void *address, unsigned int length);
 
+/* Which CRC implementations have an architecture-accelerated form. These are
+ * the generic table-driven ones, so none. */
+#define CRC32_LE_OPTIMIZATION BIT(0)
+#define CRC32_BE_OPTIMIZATION BIT(1)
+#define CRC32C_OPTIMIZATION   BIT(2)
+static inline u32 crc32_optimizations(void) { return 0; }
+
 #endif

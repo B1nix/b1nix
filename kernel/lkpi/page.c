@@ -99,9 +99,52 @@ struct page *lkpi_alloc_page(void)
 	return page;
 }
 
+/*
+ * Splitting a run into independently freeable pages.
+ *
+ * A run's struct pages are one allocation, so a page freed out of a split run
+ * cannot be kfree'd on its own. Each page instead records that it was split,
+ * its index in the run and the run's order; freeing it releases its frame, and
+ * the array goes when the last page of it does.
+ */
+#define LKPI_PAGE_SPLIT       (1u << 31)
+#define LKPI_PAGE_SPLIT_SHIFT 21
+#define LKPI_PAGE_INDEX_MASK  ((1u << LKPI_PAGE_SPLIT_SHIFT) - 1)
+
+void split_page(struct page *page, unsigned int order)
+{
+	usize n = (usize)1 << order;
+
+	for (usize i = 0; i < n; i++)
+		page[i].order = LKPI_PAGE_SPLIT | (order << LKPI_PAGE_SPLIT_SHIFT) | (u32)i;
+}
+
+static int lkpi_free_split_page(struct page *page)
+{
+	struct page *head;
+	usize n;
+
+	if (!(page->order & LKPI_PAGE_SPLIT))
+		return 0;
+	head = page - (page->order & LKPI_PAGE_INDEX_MASK);
+	n = (usize)1 << ((page->order & ~LKPI_PAGE_SPLIT) >> LKPI_PAGE_SPLIT_SHIFT);
+	if (page->phys) {
+		lkpi_page_unregister(page);
+		pmm_free_frame(page->phys);
+		page->phys = 0;
+	}
+	for (usize i = 0; i < n; i++)
+		if (head[i].phys)
+			return 1;
+	lkpi_kfree(head);
+	return 1;
+}
+
 void __free_pages(struct page *page, u32 order)
 {
 	if (!page)
+		return;
+	if (lkpi_free_split_page(page))
 		return;
 	usize n = (usize)1 << order;
 	for (usize i = 0; i < n; i++) {
@@ -114,6 +157,8 @@ void __free_pages(struct page *page, u32 order)
 void __free_page(struct page *page)
 {
 	if (!page)
+		return;
+	if (lkpi_free_split_page(page))
 		return;
 	lkpi_page_unregister(page);
 	pmm_free_frame(page->phys);

@@ -99,4 +99,20 @@ static inline bool gfpflags_allow_blocking(gfp_t flags)
 #define GFP_HIGHUSER_MOVABLE (GFP_HIGHUSER | __GFP_MOVABLE)
 #endif
 
+/* One past the highest allocation-flag bit used above (__GFP_WRITE, bit 23).
+ * The xarray keeps its per-array mark flags in the bits from here up, so a
+ * new flag above bit 23 must move this too. */
+/* Access to emergency reserves, and allocation pinned to the given node.
+ * Neither changes what the heap does here; distinct bits keep masks honest. */
+#define __GFP_HIGH     0x00040000u
+#define __GFP_THISNODE 0x00080000u
+
+#define __GFP_BITS_SHIFT 24
+#define __GFP_BITS_MASK  ((gfp_t)((1u << __GFP_BITS_SHIFT) - 1))
+/* The zone modifiers, which say where memory comes from rather than how the
+ * allocation behaves; a radix tree strips them from the mask it stores. */
+#define GFP_ZONEMASK     (__GFP_DMA32 | __GFP_HIGHMEM | __GFP_MOVABLE)
+/* Memory-cgroup accounting, which b1nix does not have. */
+#define __GFP_ACCOUNT    0
+
 #endif

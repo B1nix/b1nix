@@ -261,6 +261,7 @@ void kheap_bounds(u64 *base, u64 *current, u64 *end);
 void *kmalloc(usize size);
 void *kzalloc(usize size);
 void kfree(void *ptr);
+usize kmalloc_usable_size(const void *ptr);
 
 void vmm_init(void);
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags);

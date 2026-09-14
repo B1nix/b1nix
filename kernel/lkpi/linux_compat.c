@@ -148,6 +148,34 @@ void *memdup_user(const void *user_src, usize len)
 	return dst;
 }
 
+void *memdup_user_nul(const void *user_src, usize len)
+{
+	char *dst = lkpi_kmalloc(len + 1, GFP_KERNEL);
+
+	if (!dst)
+		return ERR_PTR(-ENOMEM);
+	if (lkpi_copy_from_user(dst, user_src, len) != 0) {
+		lkpi_kfree(dst);
+		return ERR_PTR(-EFAULT);
+	}
+	dst[len] = 0;
+	return dst;
+}
+
+void *memdup_array_user(const void *src, usize n, usize size)
+{
+	if (size && n > (usize)-1 / size)
+		return ERR_PTR(-EOVERFLOW);
+	return memdup_user(src, n * size);
+}
+
+void *kmemdup_array(const void *src, usize count, usize element_size, gfp_t gfp)
+{
+	if (element_size && count > (usize)-1 / element_size)
+		return 0;
+	return kmemdup(src, count * element_size, gfp);
+}
+
 void print_hex_dump(const char *level, const char *prefix, int prefix_type,
                     int rowsize, int groupsize, const void *buf, usize len,
                     _Bool ascii)

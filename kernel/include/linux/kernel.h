@@ -374,4 +374,62 @@ extern enum system_states system_state;
  * because btrfs reads on-disk fields from files that include neither. */
 #include <asm/unaligned.h>
 
+/* Unsigned min/max: both sides widened to u64 so a mixed-sign comparison
+ * cannot flip. MIN/MAX are the constant-expression forms. */
+#define umin(x, y) min_t(u64, (x), (y))
+#define umax(x, y) max_t(u64, (x), (y))
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
+
+/* Constant-expression typed min/max. */
+#define MIN_T(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
+#define MAX_T(type, a, b) ((type)(a) > (type)(b) ? (type)(a) : (type)(b))
+
+/* Integer square root, rounded down. */
+static inline unsigned long int_sqrt(unsigned long x)
+{
+	unsigned long b, m, y = 0;
+
+	if (x <= 1)
+		return x;
+	m = 1UL << ((63 - __builtin_clzl(x)) & ~1UL);
+	while (m != 0) {
+		b = y + m;
+		y >>= 1;
+		if (x >= b) {
+			x -= b;
+			y += m;
+		}
+		m >>= 2;
+	}
+	return y;
+}
+
+/* The smallest and largest element of a non-empty array. */
+#define __minmax_array(op, array, len) ({                          \
+	__typeof__(&(array)[0]) __array = (array);                 \
+	__typeof__(len) __len = (len);                             \
+	__typeof__(__array[0] + 0) __element = __array[--__len];   \
+	while (__len--)                                            \
+		__element = op(__element, __array[__len]);         \
+	__element; })
+#define min_array(array, len) __minmax_array(min, array, len)
+#define max_array(array, len) __minmax_array(max, array, len)
+
+/* base^exp in u64, by squaring. */
+static inline u64 int_pow(u64 base, unsigned int exp)
+{
+	u64 result = 1;
+
+	while (exp) {
+		if (exp & 1)
+			result *= base;
+		exp >>= 1;
+		base *= base;
+	}
+	return result;
+}
+
 #endif

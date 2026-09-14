@@ -7,5 +7,5 @@
 struct eventfd_ctx;
 struct eventfd_ctx *eventfd_ctx_fdget(int fd);
 void eventfd_ctx_put(struct eventfd_ctx *ctx);
-void eventfd_signal(struct eventfd_ctx *ctx, u64 n);
+void eventfd_signal(struct eventfd_ctx *ctx);
 #endif

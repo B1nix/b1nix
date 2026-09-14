@@ -42,4 +42,31 @@ void memcpy_to_page(struct page *page, size_t offset, const char *from,
                     size_t len);
 void memcpy_from_page(char *to, struct page *page, size_t offset, size_t len);
 
+void flush_dcache_folio(struct folio *folio);
+
+/* Zero a folio from `offset` to its end through the address it is already
+ * mapped at; returns the address to unmap. */
+static inline void *folio_zero_tail(struct folio *folio, size_t offset,
+                                    void *kaddr)
+{
+	memset(kaddr, 0, folio_size(folio) - offset);
+	flush_dcache_folio(folio);
+	return kaddr;
+}
+
+/* Copy `len` bytes into a folio at `offset` and zero the rest of it. */
+static inline void folio_fill_tail(struct folio *folio, size_t offset,
+                                   const char *from, size_t len)
+{
+	char *to = (char *)folio_address(folio) + offset;
+
+	memcpy(to, from, len);
+	folio_zero_tail(folio, offset + len, to + len);
+}
+
+/* A mapping usable from a panic handler. Every page is in the direct map, so
+ * it is the page's own address. */
+static inline void *kmap_local_page_try_from_panic(const struct page *page)
+{ return page_address(page); }
+
 #endif

@@ -30,12 +30,13 @@ int drm_console_driver_map(struct drm_framebuffer *fb, void **vaddr)
 	if (!fb || !fb->dev || !fb->dev->driver ||
 	    strcmp(fb->dev->driver->name, "i915"))
 		return -EOPNOTSUPP;
-	vma = intel_pin_and_fence_fb_obj(fb, false, &view, false, &flags);
+	/* As intel_fbdev pins its own: no fence, the view's own alignment. */
+	vma = intel_fb_pin_to_ggtt(fb, &view, 0, 0, 0, false, &flags);
 	if (IS_ERR(vma))
 		return PTR_ERR(vma);
 	p = i915_vma_pin_iomap(vma);
 	if (IS_ERR(p)) {
-		intel_unpin_fb_vma(vma, flags);
+		intel_fb_unpin_vma(vma, flags);
 		return PTR_ERR(p);
 	}
 	*vaddr = (void __force *)p;

@@ -18,7 +18,7 @@
 
 #include <linux/types.h>
 #include <linux/kernel.h>
-#include <drm/intel-gtt.h>
+#include <drm/intel/intel-gtt.h>
 
 void intel_gmch_gtt_get(u64 *gtt_total, phys_addr_t *mappable_base,
                         resource_size_t *mappable_end)
@@ -57,3 +57,16 @@ void intel_gmch_gtt_insert_sg_entries(struct sg_table *st, unsigned int pg_start
 void intel_gmch_gtt_clear_range(unsigned int first_entry,
                                 unsigned int num_entries)
 { (void)first_entry; (void)num_entries; }
+
+/* No GMCH GTT exists (intel_gmch_probe reports none), so there is no entry
+ * to read: not present. */
+dma_addr_t intel_gmch_gtt_read_entry(unsigned int pg, bool *is_present,
+                                     bool *is_local)
+{
+	(void)pg;
+	if (is_present)
+		*is_present = false;
+	if (is_local)
+		*is_local = false;
+	return 0;
+}

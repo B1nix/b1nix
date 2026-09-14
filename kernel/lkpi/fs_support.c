@@ -25,6 +25,7 @@
 #include <linux/seq_file.h>
 #include <linux/miscdevice.h>
 #include <linux/fileattr.h>
+#include <linux/exportfs.h>
 #include <linux/fiemap.h>
 #include <linux/raid/pq.h>
 #include <linux/raid/xor.h>
@@ -59,11 +60,10 @@ void page_cache_sync_readahead(struct address_space *mapping,
 
 void page_cache_async_readahead(struct address_space *mapping,
                                 struct file_ra_state *ra, struct file *file,
-                                struct folio *folio, pgoff_t index,
-                                unsigned long req_count)
+                                struct folio *folio, unsigned long req_count)
 {
-	(void)folio;
-	page_cache_sync_readahead(mapping, ra, file, index, req_count);
+	page_cache_sync_readahead(mapping, ra, file, folio_next_index(folio),
+	                          req_count);
 }
 
 void page_cache_ra_unbounded(struct readahead_control *rac,
@@ -470,8 +470,10 @@ void memzero_bvec(struct bio_vec *bvec)
  * pages pinned, which needs the mm side of the bridge — so it is refused rather
  * than half-done, and the caller falls back to the buffered path.
  */
-int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
+int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
+                           unsigned len_align_mask)
 {
+	(void)len_align_mask;
 	if (!iov_iter_is_bvec(iter))
 		return -EINVAL;
 
@@ -600,6 +602,113 @@ int write_cache_pages(struct address_space *mapping,
 	if (wbc->range_cyclic)
 		mapping->writeback_index = index;
 	return ret;
+}
+
+/*
+ * The ->writepages iterator, Linux's own (mm/page-writeback.c) over this page
+ * cache's tagged lookup. The folio handed out is locked and has had its dirty
+ * bit cleared for I/O; the caller writes it and passes it back in.
+ */
+static xa_mark_t wbc_to_tag(struct writeback_control *wbc)
+{
+	if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
+		return PAGECACHE_TAG_TOWRITE;
+	return PAGECACHE_TAG_DIRTY;
+}
+
+static pgoff_t wbc_end(struct writeback_control *wbc)
+{
+	if (wbc->range_cyclic)
+		return (pgoff_t)-1;
+	return (pgoff_t)(wbc->range_end >> PAGE_SHIFT);
+}
+
+static bool folio_prepare_writeback(struct address_space *mapping,
+                                    struct writeback_control *wbc,
+                                    struct folio *folio)
+{
+	/* Truncated or invalidated under us: nothing to write. */
+	if (unlikely(folio->mapping != mapping))
+		return false;
+	/* Somebody else wrote it. */
+	if (!folio_test_dirty(folio))
+		return false;
+	if (folio_test_writeback(folio)) {
+		if (wbc->sync_mode == WB_SYNC_NONE)
+			return false;
+		folio_wait_writeback(folio);
+	}
+	BUG_ON(folio_test_writeback(folio));
+	return folio_clear_dirty_for_io(folio);
+}
+
+static struct folio *writeback_get_folio(struct address_space *mapping,
+                                         struct writeback_control *wbc)
+{
+	struct folio *folio;
+
+retry:
+	folio = folio_batch_next(&wbc->fbatch);
+	if (!folio) {
+		folio_batch_release(&wbc->fbatch);
+		cond_resched();
+		filemap_get_folios_tag(mapping, &wbc->index, wbc_end(wbc),
+		                       wbc_to_tag(wbc), &wbc->fbatch);
+		folio = folio_batch_next(&wbc->fbatch);
+		if (!folio)
+			return NULL;
+	}
+
+	folio_lock(folio);
+	if (unlikely(!folio_prepare_writeback(mapping, wbc, folio))) {
+		folio_unlock(folio);
+		goto retry;
+	}
+	return folio;
+}
+
+struct folio *writeback_iter(struct address_space *mapping,
+                             struct writeback_control *wbc, struct folio *folio,
+                             int *error)
+{
+	if (!folio) {
+		folio_batch_init(&wbc->fbatch);
+		wbc->saved_err = *error = 0;
+		if (wbc->range_cyclic)
+			wbc->index = mapping->writeback_index;
+		else
+			wbc->index = (pgoff_t)(wbc->range_start >> PAGE_SHIFT);
+		if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
+			tag_pages_for_writeback(mapping, wbc->index, wbc_end(wbc));
+	} else {
+		wbc->nr_to_write -= (long)folio_nr_pages(folio);
+
+		WARN_ON_ONCE(*error > 0);
+		/* An integrity pass writes everything it tagged and reports the
+		 * first error at the end; background writeback stops at the first
+		 * error or when the budget runs out. */
+		if (wbc->sync_mode == WB_SYNC_ALL) {
+			if (*error && !wbc->saved_err)
+				wbc->saved_err = *error;
+		} else {
+			if (*error || wbc->nr_to_write <= 0)
+				goto done;
+		}
+	}
+
+	folio = writeback_get_folio(mapping, wbc);
+	if (!folio) {
+		if (wbc->range_cyclic)
+			mapping->writeback_index = 0;
+		*error = wbc->saved_err;
+	}
+	return folio;
+
+done:
+	if (wbc->range_cyclic)
+		mapping->writeback_index = folio_next_index(folio);
+	folio_batch_release(&wbc->fbatch);
+	return NULL;
 }
 
 void tag_pages_for_writeback(struct address_space *mapping, pgoff_t start,
@@ -733,14 +842,14 @@ unsigned char fs_ftype_to_dtype(unsigned int filetype)
 	}
 }
 
-void fileattr_fill_flags(struct fileattr *fa, u32 flags)
+void fileattr_fill_flags(struct file_kattr *fa, u32 flags)
 {
 	memset(fa, 0, sizeof(*fa));
 	fa->flags = flags;
 	fa->flags_valid = true;
 }
 
-void fileattr_fill_xflags(struct fileattr *fa, u32 xflags)
+void fileattr_fill_xflags(struct file_kattr *fa, u32 xflags)
 {
 	memset(fa, 0, sizeof(*fa));
 	fa->fsx_xflags = xflags;
@@ -1067,190 +1176,6 @@ void btrfs_finish_ordered_zoned(void *ordered)
 	      "devices");
 }
 
-/*
- * btrfs's own sanity tests.
- *
- * Built only with CONFIG_BTRFS_FS_RUN_SANITY_TESTS, which is off, but one call
- * site references this unconditionally. It is unreachable for the same reason
- * the tests are absent.
- */
-void *alloc_test_extent_buffer(void *fs_info, u64 start)
-{
-	(void)fs_info; (void)start;
-	panic("lkpi: btrfs self-test allocator reached without the self-tests");
-}
-
-/* ── the radix-tree spellings ───────────────────────────────────── */
-
-/*
- * The tree IS the xarray (see <linux/radix-tree.h>); these are the operations
- * the older interface has that the newer one does not.
- *
- * The tags are the interesting ones: upstream they live in the tree's own
- * nodes, so a tagged search visits only tagged entries. Here they are kept in a
- * small side table, which makes a tagged search a walk of the range — the same
- * answer, proportional to the range rather than to the tagged entries. btrfs
- * uses them to mark filesystems needing a commit, where the range is the number
- * of mounted filesystems.
- */
-#define LKPI_RADIX_TAGS 3
-#define LKPI_RADIX_TAG_ENTRIES 256
-
-static struct {
-	const struct radix_tree_root *root;
-	unsigned long index;
-	unsigned int tag;
-	bool used;
-} radix_tags[LKPI_RADIX_TAG_ENTRIES];
-static spinlock_t radix_tag_lock;
-static int radix_tag_lock_ready;
-
-static void radix_tag_lock_init(void)
-{
-	if (!radix_tag_lock_ready) {
-		spin_lock_init(&radix_tag_lock);
-		radix_tag_lock_ready = 1;
-	}
-}
-
-void *radix_tree_tag_set(struct radix_tree_root *root, unsigned long index,
-                         unsigned int tag)
-{
-	unsigned long flags;
-	unsigned int i;
-	void *entry = xa_load(&root->xa, index);
-
-	if (tag >= LKPI_RADIX_TAGS)
-		return entry;
-	radix_tag_lock_init();
-	spin_lock_irqsave(&radix_tag_lock, flags);
-	for (i = 0; i < LKPI_RADIX_TAG_ENTRIES; i++)
-		if (radix_tags[i].used && radix_tags[i].root == root &&
-		    radix_tags[i].index == index && radix_tags[i].tag == tag)
-			break;
-	if (i == LKPI_RADIX_TAG_ENTRIES) {
-		for (i = 0; i < LKPI_RADIX_TAG_ENTRIES; i++)
-			if (!radix_tags[i].used) {
-				radix_tags[i].used = true;
-				radix_tags[i].root = root;
-				radix_tags[i].index = index;
-				radix_tags[i].tag = tag;
-				break;
-			}
-	}
-	spin_unlock_irqrestore(&radix_tag_lock, flags);
-	return entry;
-}
-
-void *radix_tree_tag_clear(struct radix_tree_root *root, unsigned long index,
-                           unsigned int tag)
-{
-	unsigned long flags;
-	unsigned int i;
-	void *entry = xa_load(&root->xa, index);
-
-	radix_tag_lock_init();
-	spin_lock_irqsave(&radix_tag_lock, flags);
-	for (i = 0; i < LKPI_RADIX_TAG_ENTRIES; i++)
-		if (radix_tags[i].used && radix_tags[i].root == root &&
-		    radix_tags[i].index == index && radix_tags[i].tag == tag)
-			radix_tags[i].used = false;
-	spin_unlock_irqrestore(&radix_tag_lock, flags);
-	return entry;
-}
-
-int radix_tree_tagged(const struct radix_tree_root *root, unsigned int tag)
-{
-	unsigned long flags;
-	unsigned int i;
-	int found = 0;
-
-	radix_tag_lock_init();
-	spin_lock_irqsave(&radix_tag_lock, flags);
-	for (i = 0; i < LKPI_RADIX_TAG_ENTRIES; i++)
-		if (radix_tags[i].used && radix_tags[i].root == root &&
-		    radix_tags[i].tag == tag) {
-			found = 1;
-			break;
-		}
-	spin_unlock_irqrestore(&radix_tag_lock, flags);
-	return found;
-}
-
-unsigned int radix_tree_gang_lookup(const struct radix_tree_root *root,
-                                    void **results, unsigned long first_index,
-                                    unsigned int max_items)
-{
-	unsigned long index = first_index;
-	unsigned int found = 0;
-	unsigned long scanned = 0;
-
-	/*
-	 * The walk is by index, and bounded: an unbounded one over a sparse tree
-	 * would run to ULONG_MAX looking for entries that are not there. The
-	 * bound is generous relative to what btrfs stores (one entry per mounted
-	 * filesystem, per device) and is why a gang lookup here cannot be used as
-	 * a general iterator.
-	 */
-	while (found < max_items && scanned < 65536) {
-		void *entry = xa_load(&((struct radix_tree_root *)root)->xa, index);
-
-		if (entry)
-			results[found++] = entry;
-		index++;
-		scanned++;
-	}
-	return found;
-}
-
-unsigned int radix_tree_gang_lookup_tag(const struct radix_tree_root *root,
-                                        void **results,
-                                        unsigned long first_index,
-                                        unsigned int max_items,
-                                        unsigned int tag)
-{
-	unsigned long flags;
-	unsigned int i;
-	unsigned int found = 0;
-
-	radix_tag_lock_init();
-	spin_lock_irqsave(&radix_tag_lock, flags);
-	for (i = 0; i < LKPI_RADIX_TAG_ENTRIES && found < max_items; i++) {
-		void *entry;
-
-		if (!radix_tags[i].used || radix_tags[i].root != root ||
-		    radix_tags[i].tag != tag || radix_tags[i].index < first_index)
-			continue;
-		entry = xa_load(&((struct radix_tree_root *)root)->xa,
-		                radix_tags[i].index);
-		if (entry)
-			results[found++] = entry;
-	}
-	spin_unlock_irqrestore(&radix_tag_lock, flags);
-	return found;
-}
-
-/*
- * Preload / preload_end.
- *
- * Upstream reserves nodes so a later insert under a spinlock cannot fail for
- * memory, and disables preemption until the end. b1nix's allocator does not
- * fail that way, so there is nothing to reserve — but the non-preemptible
- * region between them is real, because callers insert under a spinlock they
- * take after this returns.
- */
-int radix_tree_preload(gfp_t gfp_mask)
-{
-	(void)gfp_mask;
-	lkpi_preempt_disable();
-	return 0;
-}
-
-void radix_tree_preload_end(void)
-{
-	lkpi_preempt_enable();
-}
-
 /* ── slab bulk operations ───────────────────────────────────────── */
 
 int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t gfp, size_t nr, void **p)
@@ -1321,3 +1246,102 @@ void workqueue_set_max_active(struct workqueue_struct *wq, int max_active)
 /* The buffer-head write helpers live in kernel/lkpi/fs_buffer.c, which is
  * built with the filesystem import: btrfs reaches them only on its
  * inline-data path, and ext4 is built on them throughout. */
+
+/* ── 6.x VFS helpers ────────────────────────────────────────────── */
+
+/* Built without CONFIG_UNICODE or CONFIG_FS_ENCRYPTION, so there are no
+ * casefold or encrypted-name dentry operations to install. */
+void generic_set_sb_d_ops(struct super_block *sb)
+{
+	(void)sb;
+}
+
+/* Record that the atomic-write fields were considered; the capability itself
+ * is reported only when the device has a unit size, which none here does. */
+void generic_fill_statx_atomic_writes(struct kstat *stat, unsigned int unit_min,
+                                      unsigned int unit_max,
+                                      unsigned int unit_max_opt)
+{
+	stat->result_mask |= STATX_WRITE_ATOMIC;
+	if (unit_min) {
+		stat->atomic_write_unit_min = unit_min;
+		stat->atomic_write_unit_max = unit_max;
+		stat->atomic_write_unit_max_opt = unit_max_opt;
+		stat->atomic_write_segments_max = 1;
+	}
+}
+
+int generic_atomic_write_valid(struct kiocb *iocb, struct iov_iter *iter)
+{
+	size_t len = iov_iter_count(iter);
+
+	if (!is_power_of_2(len))
+		return -EINVAL;
+	if (!IS_ALIGNED(iocb->ki_pos, len))
+		return -EINVAL;
+	if (!(iocb->ki_flags & IOCB_DIRECT))
+		return -EOPNOTSUPP;
+	return 0;
+}
+
+/* The 6.8 names of __mnt_want_write/__mnt_drop_write. */
+int mnt_get_write_access(struct vfsmount *mnt)
+{
+	return __mnt_want_write(mnt);
+}
+
+void mnt_put_write_access(struct vfsmount *mnt)
+{
+	__mnt_drop_write(mnt);
+}
+
+/* No stacking filesystem here opens backing files. */
+const struct path *backing_file_user_path(const struct file *f)
+{
+	return &f->f_path;
+}
+
+int __sysfs_match_string(const char * const *array, size_t n, const char *str)
+{
+	size_t index;
+
+	for (index = 0; index < n; index++) {
+		const char *item = array[index];
+
+		if (!item)
+			break;
+		if (sysfs_streq(item, str))
+			return (int)index;
+	}
+	return -EINVAL;
+}
+
+/* export_operations->encode_fh for 32-bit inode numbers: (ino, generation),
+ * plus the parent's when one is asked for. Linux's own, from fs/libfs.c. */
+int generic_encode_ino32_fh(struct inode *inode, __u32 *fh, int *max_len,
+                            struct inode *parent)
+{
+	struct fid *fid = (void *)fh;
+	int len = *max_len;
+	int type = FILEID_INO32_GEN;
+
+	if (parent && (len < 4)) {
+		*max_len = 4;
+		return FILEID_INVALID;
+	} else if (len < 2) {
+		*max_len = 2;
+		return FILEID_INVALID;
+	}
+
+	len = 2;
+	fid->i32.ino = (u32)inode->i_ino;
+	fid->i32.gen = inode->i_generation;
+	if (parent) {
+		fid->i32.parent_ino = (u32)parent->i_ino;
+		fid->i32.parent_gen = parent->i_generation;
+		len = 4;
+		type = FILEID_INO32_GEN_PARENT;
+	}
+	*max_len = len;
+	return type;
+}

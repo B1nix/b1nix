@@ -97,4 +97,65 @@ void bitmap_cut(const unsigned long *src, unsigned long *dst,
 void bitmap_next_set_region(unsigned long *bitmap, unsigned int *rs,
                             unsigned int *re, unsigned int end);
 
+/* Runs of set bits: [b, e) for each, b the first set bit and e the first clear
+ * one after it. */
+#define for_each_set_bitrange(b, e, addr, size)                 \
+	for ((b) = 0;                                           \
+	     (b) = find_next_bit((addr), (size), b),            \
+	     (e) = find_next_zero_bit((addr), (size), (b) + 1), \
+	     (b) < (size);                                      \
+	     (b) = (e) + 1)
+
+#ifndef BITMAP_FIRST_WORD_MASK
+#define BITMAP_FIRST_WORD_MASK(start) (~0UL << ((start) & (BITS_PER_LONG - 1)))
+#endif
+
+/* An n-bit value (n <= BITS_PER_LONG) at a bit offset, possibly spanning two
+ * words; bitmap_write is its inverse. Linux's own implementation. */
+static inline unsigned long bitmap_read(const unsigned long *map,
+                                        unsigned long start, unsigned long nbits)
+{
+	size_t index = BIT_WORD(start);
+	unsigned long offset = start % BITS_PER_LONG;
+	unsigned long space = BITS_PER_LONG - offset;
+	unsigned long value_low, value_high;
+
+	if (unlikely(!nbits || nbits > BITS_PER_LONG))
+		return 0;
+	if (space >= nbits)
+		return (map[index] >> offset) & BITMAP_LAST_WORD_MASK(nbits);
+	value_low = map[index] & BITMAP_FIRST_WORD_MASK(start);
+	value_high = map[index + 1] & BITMAP_LAST_WORD_MASK(start + nbits);
+	return (value_low >> offset) | (value_high << space);
+}
+
+static inline
+void bitmap_write(unsigned long *map, unsigned long value,
+		  unsigned long start, unsigned long nbits)
+{
+	size_t index;
+	unsigned long offset;
+	unsigned long space;
+	unsigned long mask;
+	bool fit;
+
+	if (unlikely(!nbits || nbits > BITS_PER_LONG))
+		return;
+
+	mask = BITMAP_LAST_WORD_MASK(nbits);
+	value &= mask;
+	offset = start % BITS_PER_LONG;
+	space = BITS_PER_LONG - offset;
+	fit = space >= nbits;
+	index = BIT_WORD(start);
+
+	map[index] &= (fit ? (~(mask << offset)) : ~BITMAP_FIRST_WORD_MASK(start));
+	map[index] |= value << offset;
+	if (fit)
+		return;
+
+	map[index + 1] &= BITMAP_FIRST_WORD_MASK(start + nbits);
+	map[index + 1] |= (value >> space);
+}
+
 #endif

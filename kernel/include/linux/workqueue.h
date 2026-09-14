@@ -155,4 +155,16 @@ unsigned int work_busy(struct work_struct *work);
 
 #define system_freezable_wq lkpi_system_wq()
 
+/* 6.17's name for the default unbound pool, which here is the one pool. */
+#define system_dfl_wq     (lkpi_system_wq())
+#define WQ_MAX_ACTIVE     512
+
+/* 6.17: the pool is per-CPU. One pool here, so the distinction is moot. */
+#define WQ_PERCPU 0
+
+/* Queue on a NUMA node's CPUs. One node here. */
+#define queue_work_node(node, wq, work) ({ (void)(node); queue_work((wq), (work)); })
+
+#define cancel_work(w) cancel_work(w)
+
 #endif

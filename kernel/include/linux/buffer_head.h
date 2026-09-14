@@ -277,8 +277,9 @@ struct buffer_head *alloc_buffer_head(gfp_t gfp_flags);
 void free_buffer_head(struct buffer_head *bh);
 /* Takes a page, not a folio: 6.6 still spells it that way, and ext4 calls it
  * as `create_empty_buffers(&folio->page, ...)`. */
-void create_empty_buffers(struct page *page, unsigned long blocksize,
-                          unsigned long b_state);
+struct buffer_head *create_empty_buffers(struct folio *folio,
+                                         unsigned long blocksize,
+                                         unsigned long b_state);
 int try_to_free_buffers(struct folio *folio);
 
 /* Point a buffer at a device block. `map_bh` is the whole of what "mapped"
@@ -297,17 +298,19 @@ static inline void map_bh(struct buffer_head *bh, struct super_block *sb,
 /* get_block_t is declared in <linux/fs.h>, where upstream keeps it: fs/iomap's
  * internal.h names it while including only that. */
 
-int __block_write_begin(struct page *page, loff_t pos, unsigned len,
+int __block_write_begin(struct folio *folio, loff_t pos, unsigned len,
                         get_block_t *get_block);
 int block_read_full_folio(struct folio *folio, get_block_t *get_block);
 int block_write_full_page(struct page *page, get_block_t *get_block,
                           struct writeback_control *wbc);
 int block_write_begin(struct address_space *mapping, loff_t pos, unsigned len,
-                      struct page **pagep, get_block_t *get_block);
-int block_write_end(struct file *file, struct address_space *mapping,
-                    loff_t pos, unsigned len, unsigned copied,
-                    struct page *page, void *fsdata);
-int block_commit_write(struct page *page, unsigned from, unsigned to);
+                      struct folio **foliop, get_block_t *get_block);
+int block_write_end(loff_t pos, unsigned len, unsigned copied,
+                    struct folio *folio);
+int generic_write_end(const struct kiocb *iocb, struct address_space *mapping,
+                      loff_t pos, unsigned len, unsigned copied,
+                      struct folio *folio, void *fsdata);
+void block_commit_write(struct folio *folio, size_t from, size_t to);
 int block_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf,
                        get_block_t get_block);
 bool block_dirty_folio(struct address_space *mapping, struct folio *folio);
@@ -316,8 +319,8 @@ int block_truncate_page(struct address_space *mapping, loff_t from,
                         get_block_t *get_block);
 sector_t generic_block_bmap(struct address_space *mapping, sector_t block,
                             get_block_t *get_block);
-int cont_write_begin(struct file *file, struct address_space *mapping,
-                     loff_t pos, unsigned len, struct page **pagep,
+int cont_write_begin(const struct kiocb *iocb, struct address_space *mapping,
+                     loff_t pos, unsigned len, struct folio **foliop,
                      void **fsdata, get_block_t *get_block, loff_t *bytes);
 int nobh_truncate_page(struct address_space *mapping, loff_t from,
                        get_block_t *get_block);
@@ -349,5 +352,14 @@ static inline void clean_bdev_bh_alias(struct buffer_head *bh)
  * so it is the ordinary getblk — the name records the requirement. */
 struct buffer_head *getblk_unmovable(struct block_device *bdev, sector_t block,
                                      unsigned size);
+
+struct buffer_head *__find_get_block_nonatomic(struct block_device *bdev,
+                                               sector_t block, unsigned size);
+static inline struct buffer_head *
+sb_find_get_block_nonatomic(struct super_block *sb, sector_t block)
+{ return __find_get_block_nonatomic(sb->s_bdev, block, sb->s_blocksize); }
+struct buffer_head *bdev_getblk(struct block_device *bdev, sector_t block,
+                                unsigned size, gfp_t gfp);
+void folio_zero_new_buffers(struct folio *folio, size_t from, size_t to);
 
 #endif

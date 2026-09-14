@@ -342,7 +342,7 @@ static void fliptest_teardown(struct fliptest *f)
 
 	for (i = 0; i < 2; i++)
 		if (f->buf[i])
-			drm_client_framebuffer_delete(f->buf[i]);
+			drm_client_buffer_delete(f->buf[i]);
 	if (f->inited)
 		drm_client_release(&f->client);
 	memset(f, 0, sizeof(*f));
@@ -655,7 +655,7 @@ static void slot_release(struct console_slot *s)
 	if (!s->used || s->registered)
 		return;
 	if (s->buf)
-		drm_client_framebuffer_delete(s->buf);
+		drm_client_buffer_delete(s->buf);
 	s->buf = NULL;
 	drm_client_release(&s->client);
 	memset(s, 0, sizeof(*s));

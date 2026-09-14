@@ -24,6 +24,11 @@ struct hrtimer {
 	struct timer_list timer;
 	enum hrtimer_restart (*function)(struct hrtimer *);
 	u64 interval_ns;
+	/* The absolute monotonic expiry, under upstream's name for it: the DRM
+	 * vblank timer reads it back as the time of the vblank it simulates. */
+	struct {
+		ktime_t expires;
+	} node;
 };
 
 void hrtimer_init(struct hrtimer *t, int clock_id, enum hrtimer_mode mode);
@@ -35,5 +40,17 @@ static inline void hrtimer_start_range_ns(struct hrtimer *t, ktime_t when,
                                           u64 range_ns, enum hrtimer_mode mode)
 { (void)range_ns; hrtimer_start(t, when, mode); }
 static inline u64 hrtimer_forward_now(struct hrtimer *t, ktime_t interval)
-{ t->interval_ns = (u64)ktime_to_ns(interval); return 1; }
+{
+	t->interval_ns = (u64)ktime_to_ns(interval);
+	t->node.expires = ktime_add(ktime_get(), interval);
+	return 1;
+}
+/* 6.13: initialise with the callback in one call. */
+static inline void hrtimer_setup(struct hrtimer *t,
+                                 enum hrtimer_restart (*function)(struct hrtimer *),
+                                 int clock_id, enum hrtimer_mode mode)
+{
+	hrtimer_init(t, clock_id, mode);
+	t->function = function;
+}
 #endif

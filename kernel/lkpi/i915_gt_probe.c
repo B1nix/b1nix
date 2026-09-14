@@ -199,7 +199,7 @@ static int gt_probe_nop(struct intel_gt *gt, int *executed_out, int *engines_out
 		 * difference, the fault is not in the interrupt path at all — it is
 		 * that the GT is never marked awake while a request is in flight.
 		 */
-		intel_gt_pm_get(gt);
+		intel_wakeref_t wakeref = intel_gt_pm_get(gt);
 		pr_info("i915-gt: gt awake=%d before unprompted wait\n",
 		        intel_gt_pm_is_awake(gt));
 		rq = i915_request_create(unprompted_engine->kernel_context);
@@ -300,7 +300,7 @@ static int gt_probe_nop(struct intel_gt *gt, int *executed_out, int *engines_out
 				        unprompted_engine->name);
 			i915_request_put(rq);
 		}
-		intel_gt_pm_put(gt);
+		intel_gt_pm_put(gt, wakeref);
 	}
 
 	*executed_out = executed;

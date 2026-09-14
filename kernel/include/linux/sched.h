@@ -203,4 +203,11 @@ int set_task_ioprio(struct lkpi_task *task, int ioprio);
  * them; a second set of the same macros is a redefinition rather than a
  * parallel spelling. */
 
+/* Upstream's sched.h reaches the signal predicates the filesystems test in
+ * their long loops. */
+#include <linux/sched/signal.h>
+
+/* Completions, which the scheduler header reaches in the imported drivers. */
+#include <linux/completion.h>
+
 #endif

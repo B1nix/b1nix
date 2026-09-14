@@ -2,6 +2,10 @@
 #ifndef LKPI_LINUX_DEBUGFS_H
 #define LKPI_LINUX_DEBUGFS_H
 #include <linux/types.h>
+/* DEFINE_SHOW_ATTRIBUTE below builds a struct file_operations. */
+#include <linux/fs.h>
+/* Upstream's debugfs.h brings the seq_file interface its show files use. */
+#include <linux/seq_file.h>
 /*
  * debugfs, over the same registry that backs /sys attributes, rooted at
  * /sys/kernel/debug. b1nix has no separate debugfs mount and does not need one:
@@ -35,20 +39,6 @@ struct dentry *debugfs_create_file(const char *name, umode_t mode,
 void debugfs_remove(struct dentry *d);
 void debugfs_remove_recursive(struct dentry *d);
 
-/*
- * A debugfs file defined as a get/set pair over one value.
- *
- * The generated fops are what the macro is for: a read renders the value with
- * the given format, a write parses it back. The format string is part of the
- * definition rather than the read callback, which is why the macro takes it as
- * a trailing argument and why leaving the macro undefined made every use look
- * like a syntax error at the format string.
- */
-#define DEFINE_SIMPLE_ATTRIBUTE(__fops, __get, __set, __fmt)              \
-	static int __fops##_open(struct inode *inode, struct file *file)      \
-	{ (void)inode; (void)file; return 0; }                                \
-	static const struct file_operations __fops = { .open = __fops##_open }
-
 #define DEFINE_DEBUGFS_ATTRIBUTE(__fops, __get, __set, __fmt) \
 	DEFINE_SIMPLE_ATTRIBUTE(__fops, __get, __set, __fmt)
 
@@ -56,6 +46,14 @@ void debugfs_remove_recursive(struct dentry *d);
 	static int __name##_open(struct inode *inode, struct file *file)      \
 	{ (void)inode; (void)file; return 0; }                                \
 	static const struct file_operations __name##_fops = { .open = __name##_open }
+
+/* The same with a write handler; debugfs files are not served here, so the
+ * handler is named (the caller defines it) and never reached. */
+#define DEFINE_SHOW_STORE_ATTRIBUTE(__name)                               \
+	static int __name##_open(struct inode *inode, struct file *file)      \
+	{ (void)inode; (void)file; return 0; }                                \
+	static const struct file_operations __name##_fops = {                 \
+		.open = __name##_open, .write = __name##_write }
 
 
 /* The typed creators. debugfs_create_file already exists above; these are the

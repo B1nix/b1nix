@@ -122,7 +122,9 @@ void *lkpi_bridge_mount(const char *fstype, const char *source,
 		fc.fs_type = type;
 		fc.purpose = FS_CONTEXT_FOR_MOUNT;
 		fc.sb_flags = (unsigned int)flags;
-		fc.source = (char *)source;
+		/* Heap-owned, as upstream's is: btrfs hands it to a duplicate context
+		 * whose put frees it. */
+		fc.source = source ? kstrdup(source, GFP_KERNEL) : NULL;
 		fc.user_ns = &init_user_ns;
 		err = type->init_fs_context(&fc);
 		if (!err && fc.ops && fc.ops->get_tree)
@@ -132,6 +134,7 @@ void *lkpi_bridge_mount(const char *fstype, const char *source,
 		root = err ? ERR_PTR(err) : fc.root;
 		if (fc.ops && fc.ops->free)
 			fc.ops->free(&fc);
+		kfree(fc.source);
 	} else {
 		return NULL;
 	}
@@ -221,7 +224,7 @@ int lkpi_bridge_attr(void *nodep, struct lkpi_bridge_attr *out)
 	out->blocks = (unsigned long long)inode->i_blocks;
 	out->flags = 0;
 	if (inode->i_op && inode->i_op->fileattr_get) {
-		struct fileattr fa;
+		struct file_kattr fa;
 
 		memset(&fa, 0, sizeof(fa));
 		if (inode->i_op->fileattr_get(d, &fa) == 0)
@@ -234,7 +237,7 @@ int lkpi_bridge_set_flags(void *nodep, unsigned int flags)
 {
 	struct dentry *d = nodep;
 	struct inode *inode;
-	struct fileattr fa;
+	struct file_kattr fa;
 	int ret;
 
 	if (!d || !d->d_inode)
@@ -459,7 +462,7 @@ int lkpi_bridge_create(void *dirp, const char *name, unsigned int mode)
 int lkpi_bridge_mkdir(void *dirp, const char *name, unsigned int mode)
 {
 	struct dentry *dir = dirp;
-	struct dentry *d;
+	struct dentry *d, *de;
 	int ret;
 
 	if (!dir->d_inode->i_op || !dir->d_inode->i_op->mkdir)
@@ -470,8 +473,15 @@ int lkpi_bridge_mkdir(void *dirp, const char *name, unsigned int mode)
 		inode_unlock(dir->d_inode);
 		return (int)PTR_ERR(d);
 	}
-	ret = dir->d_inode->i_op->mkdir(&nop_mnt_idmap, dir->d_inode, d,
-	                                (umode_t)mode);
+	/* 6.15+: NULL when `d` was instantiated, an error pointer, or a
+	 * different dentry the filesystem used instead — which replaces `d`. */
+	de = dir->d_inode->i_op->mkdir(&nop_mnt_idmap, dir->d_inode, d,
+	                               (umode_t)mode);
+	ret = IS_ERR(de) ? (int)PTR_ERR(de) : 0;
+	if (!IS_ERR_OR_NULL(de)) {
+		dput(d);
+		d = de;
+	}
 	dput(d);
 	inode_unlock(dir->d_inode);
 	return ret;

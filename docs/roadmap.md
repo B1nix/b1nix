@@ -142,7 +142,7 @@ belongs to the milestone that owns the mechanism. See
 | M117 nice in the scheduler | done | Stride weights by nice on every CPU; APs preempt ring-3 ticks. |
 | M118 Arch Linux userspace | cancelled | Duplicated the Debian lane (M121); the kernel faults it found stay fixed. |
 | M119 Ask the processor instead of guessing | done | Real CPU name, `RNDR`, PARange, TSC from CPUID, cpuinfo flags/Features. |
-| M120 Linux's own filesystems, through linuxkpi | done | btrfs, ext4 and jbd2 from Linux 6.6 unpatched; btrfs root on both arches, ext2/3/4 are the imported ext4, native ext drivers removed. See [linuxkpi-fs.md](linuxkpi-fs.md). |
+| M120 Linux's own filesystems, through linuxkpi | done | btrfs, ext4 and jbd2 from Linux 6.18.51 unpatched (moved from 6.6 with the DRM core and i915); btrfs root on both arches, ext2/3/4 are the imported ext4, native ext drivers removed. See [linuxkpi-fs.md](linuxkpi-fs.md). |
 
 ## M102a: Intel i915 (Gen8/Gen9.5) + Mesa iris
 
@@ -153,6 +153,7 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 - [x] sway on gles2/iris submits: the `-ENOSPC` from `eb_reserve` was a dma-buf `lseek(SEEK_END)` answering 0, so iris softpinned an 8 MiB imported BO over its neighbours.
 - [x] sway on gles2/iris reaches the panel and screenshots (legacy and q35 machines): a `MAX_SCHEDULE_TIMEOUT` wait wrapped and made the first modeset return `-ETIME`.
 - [x] Bare metal on a ThinkPad T480 (UHD 620): sway on iris on the panel, boot log over netconsole, booted over PXE (`tools/run/pxe-serve.sh`). Fixed on the way: a 512 MiB MMIO window, the console drawing into the GPU aperture, netconsole dropping the pre-DHCP log.
+- [ ] `partial` DRM core and i915 moved to Linux 6.18.51 LTS with the filesystems: both smoke lanes pass; i915 on the T480 panel not yet re-proven on the new import.
 
 ## M102b: amdgpu on RX 6600 (render-only) + radeonsi
 
@@ -168,7 +169,7 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 
 - [x] kwin_wayland + plasmashell on real DRM via elogind/eudev ([image](images/m113-plasma-drm.png)); `tests/kde-smoke.sh`.
 - [x] Boot to painted desktop 194 s → ~16 s; evdev input and DRM framebuffer console before the compositor.
-- [ ] `partial` kwin uses the legacy modeset path (`CURSOR_PLANE_HOTSPOT` is Linux 6.7; universal planes not offered).
+- [ ] `partial` kwin uses the legacy modeset path (`CURSOR_PLANE_HOTSPOT` needs Linux 6.7+; the DRM core is now 6.18.51, universal planes still not offered to kwin).
 - [ ] `partial` Remaining costs: dbus/elogind session stalls, vmm read-lock per copyin. (Dirty pages now go through the `pcflush` writeback thread; the lkpi header macro warnings were fixed in M121.)
 
 ## M121: Kernel only

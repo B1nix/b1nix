@@ -35,6 +35,7 @@
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
+#include <drm/drm_auth.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_vma_manager.h>
 #include <linux/errno.h>
@@ -59,6 +60,21 @@
  * dispatches on its own ops, so a file_operations struct here would be one more
  * indirection nothing reads. */
 int drm_open(struct inode *inode, struct file *filp);
+
+/*
+ * The operations a DRM file carries. Nothing dispatches through them — the
+ * char device calls the core directly — but drm_open checks their flags, and
+ * their address is what marks a file as one this layer opened (see
+ * lkpi_drm_file_is_drm).
+ */
+static const struct file_operations lkpi_drm_fops = {
+	.fop_flags = FOP_UNSIGNED_OFFSET,
+};
+/* drm_internal.h is the core's private header and not on this file's include
+ * path; these are the pieces of it needed here. */
+struct drm_minor *drm_minor_acquire(struct xarray *minor_xa, unsigned int minor_id);
+void drm_minor_release(struct drm_minor *minor);
+extern struct xarray drm_minors_xa;
 int drm_release(struct inode *inode, struct file *filp);
 ssize_t drm_read(struct file *filp, char __user *buffer, size_t count,
                  loff_t *offset);
@@ -222,6 +238,9 @@ int lkpi_drm_open(u32 minor, u32 flags, void **out_file)
 	filp->f_flags = (flags & LKPI_DRM_O_NONBLOCK) ? O_NONBLOCK : 0;
 	filp->f_mode = FMODE_READ | ((flags & LKPI_DRM_O_WRITE) ? FMODE_WRITE : 0);
 	atomic64_set(&filp->f_count, 1);
+	/* drm_open refuses a file whose operations do not declare unsigned
+	 * offsets (a GEM mmap offset has the top bit set). */
+	filp->f_op = &lkpi_drm_fops;
 
 	ret = drm_open(inode, filp);
 	if (ret == 0 && lkpi_bootflag("b1nix.drm-debug")) {
@@ -299,16 +318,14 @@ int lkpi_drm_file_minor(void *file, u32 *out)
  * is a struct drm_file is the entire question: on a dma-buf's file it points at
  * a struct dma_buf, and reading ->minor out of it faults on an address made of
  * the neighbouring bytes. What separates the two without dereferencing anything
- * is f_op. lkpi_drm_open leaves it null — the DRM char device dispatches on its
- * own ops and never needs one — while every anon-inode file, dma-buf above all,
- * is created with the ops that define it. A null f_op is therefore the mark of
- * a file this layer opened itself.
+ * is f_op: lkpi_drm_open installs lkpi_drm_fops, which nothing else uses, while
+ * every anon-inode file, dma-buf above all, carries the ops that define it.
  */
 int lkpi_drm_file_is_drm(void *file)
 {
 	struct file *f = (struct file *)file;
 
-	return f && !f->f_op && f->private_data;
+	return f && f->f_op == &lkpi_drm_fops && f->private_data;
 }
 
 void *lkpi_drm_clone_file(void *file)
@@ -336,9 +353,6 @@ void lkpi_drm_file_set_handle(void *file, void *handle)
 		f->f_handle = handle;
 }
 
-/* drm_internal.h is not on the include path for this file — it is the core's
- * private header — and this is the one thing needed out of it. */
-struct drm_minor *drm_minor_acquire(unsigned int minor_id);
 
 /* The first registered DRM device. Found through the minor registry rather than
  * through a driver's drvdata, so this works for any driver and needs no
@@ -348,12 +362,17 @@ struct drm_device *lkpi_drm_first_device(void)
 	unsigned int id;
 
 	for (id = 0; id < 64; id++) {
-		struct drm_minor *minor = drm_minor_acquire(id);
+		struct drm_minor *minor = drm_minor_acquire(&drm_minors_xa, id);
+		struct drm_device *dev;
 
 		if (IS_ERR_OR_NULL(minor))
 			continue;
-		if (minor->dev)
-			return minor->dev;
+		/* A registered device outlives this lookup; the reference the
+		 * acquire took is dropped rather than leaked per call. */
+		dev = minor->dev;
+		drm_minor_release(minor);
+		if (dev)
+			return dev;
 	}
 	return NULL;
 }

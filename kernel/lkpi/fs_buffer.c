@@ -186,10 +186,10 @@ fail:
 	return NULL;
 }
 
-void create_empty_buffers(struct page *page, unsigned long blocksize,
-                          unsigned long b_state)
+struct buffer_head *create_empty_buffers(struct folio *folio,
+                                         unsigned long blocksize,
+                                         unsigned long b_state)
 {
-	struct folio *folio = page_folio(page);
 	struct buffer_head *head = folio_create_buffers(folio, blocksize, b_state);
 	struct buffer_head *bh = head;
 
@@ -201,6 +201,7 @@ void create_empty_buffers(struct page *page, unsigned long blocksize,
 			bh = bh->b_this_page;
 		} while (bh && bh != head);
 	}
+	return head;
 }
 
 int try_to_free_buffers(struct folio *folio)
@@ -342,6 +343,62 @@ struct buffer_head *__find_get_block(struct block_device *bdev, sector_t block,
                                      unsigned size)
 {
 	return getblk_common(bdev, block, size, 0);
+}
+
+/* The lookup that may sleep on the folio lock. This one never takes it
+ * without sleeping allowed, so the two are the same. */
+struct buffer_head *__find_get_block_nonatomic(struct block_device *bdev,
+                                               sector_t block, unsigned size)
+{
+	return getblk_common(bdev, block, size, 0);
+}
+
+struct buffer_head *bdev_getblk(struct block_device *bdev, sector_t block,
+                                unsigned size, gfp_t gfp)
+{
+	return __getblk_gfp(bdev, block, size, gfp);
+}
+
+/*
+ * After a write_begin that allocated blocks, zero the parts of the new blocks
+ * the copy did not reach, so a short copy does not expose stale disk contents.
+ * Linux's own, from fs/buffer.c.
+ */
+void folio_zero_new_buffers(struct folio *folio, size_t from, size_t to)
+{
+	size_t block_start, block_end;
+	struct buffer_head *head, *bh;
+
+	BUG_ON(!folio_test_locked(folio));
+	head = folio_buffers(folio);
+	if (!head)
+		return;
+
+	bh = head;
+	block_start = 0;
+	do {
+		block_end = block_start + bh->b_size;
+
+		if (buffer_new(bh)) {
+			if (block_end > from && block_start < to) {
+				if (!folio_test_uptodate(folio)) {
+					size_t start, xend;
+
+					start = max(from, block_start);
+					xend = min(to, block_end);
+
+					folio_zero_segment(folio, start, xend);
+					set_buffer_uptodate(bh);
+				}
+
+				clear_buffer_new(bh);
+				mark_buffer_dirty(bh);
+			}
+		}
+
+		block_start = block_end;
+		bh = bh->b_this_page;
+	} while (bh != head);
 }
 
 /* ── I/O ────────────────────────────────────────────────────────── */
@@ -784,14 +841,14 @@ int __block_write_begin_int(struct folio *folio, loff_t pos, unsigned len,
 	return err;
 }
 
-int __block_write_begin(struct page *page, loff_t pos, unsigned len,
+int __block_write_begin(struct folio *folio, loff_t pos, unsigned len,
                         get_block_t *get_block)
 {
-	return __block_write_begin_int(page_folio(page), pos, len, get_block, NULL);
+	return __block_write_begin_int(folio, pos, len, get_block, NULL);
 }
 
 int block_write_begin(struct address_space *mapping, loff_t pos, unsigned len,
-                      struct page **pagep, get_block_t *get_block)
+                      struct folio **foliop, get_block_t *get_block)
 {
 	pgoff_t index = (pgoff_t)(pos >> PAGE_SHIFT);
 	struct folio *folio;
@@ -807,7 +864,7 @@ int block_write_begin(struct address_space *mapping, loff_t pos, unsigned len,
 		folio_put(folio);
 		return err;
 	}
-	*pagep = folio_page(folio, 0);
+	*foliop = folio;
 	return 0;
 }
 
@@ -856,38 +913,43 @@ static int block_write_end_common(struct folio *folio, loff_t pos,
 	return 0;
 }
 
-int block_write_end(struct file *file, struct address_space *mapping,
-                    loff_t pos, unsigned len, unsigned copied,
-                    struct page *page, void *fsdata)
+int block_write_end(loff_t pos, unsigned len, unsigned copied,
+                    struct folio *folio)
 {
-	struct folio *folio = page_folio(page);
 	int err;
 
-	(void)file;
-	(void)mapping;
-	(void)fsdata;
+	/*
+	 * A short copy into a folio that was not up to date cannot be half
+	 * recorded: the buffers it missed hold whatever write_begin left, so the
+	 * write counts as nothing and the caller retries. Upstream's rule.
+	 */
+	if (unlikely(copied < len) && !folio_test_uptodate(folio))
+		copied = 0;
 	err = block_write_end_common(folio, pos, len, copied);
 	return err ? err : (int)copied;
 }
 
-int generic_write_end(struct file *file, struct address_space *mapping,
+int generic_write_end(const struct kiocb *iocb, struct address_space *mapping,
                       loff_t pos, unsigned len, unsigned copied,
-                      struct page *page, void *fsdata)
+                      struct folio *folio, void *fsdata)
 {
-	int ret = block_write_end(file, mapping, pos, len, copied, page, fsdata);
-	struct folio *folio = page_folio(page);
+	int ret;
 
+	(void)iocb;
+	(void)mapping;
+	(void)fsdata;
+	ret = block_write_end(pos, len, copied, folio);
 	folio_unlock(folio);
 	folio_put(folio);
 	return ret;
 }
 
-int block_commit_write(struct page *page, unsigned from, unsigned to)
+void block_commit_write(struct folio *folio, size_t from, size_t to)
 {
-	struct folio *folio = page_folio(page);
-	loff_t pos = ((loff_t)folio->index << PAGE_SHIFT) + from;
+	loff_t pos = ((loff_t)folio->index << PAGE_SHIFT) + (loff_t)from;
 
-	return block_write_end_common(folio, pos, to - from, to - from);
+	block_write_end_common(folio, pos, (unsigned)(to - from),
+	                       (unsigned)(to - from));
 }
 
 /*

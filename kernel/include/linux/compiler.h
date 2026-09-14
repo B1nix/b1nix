@@ -15,6 +15,7 @@
 #define __kernel
 #define __iomem
 #define __force
+#define __bitwise
 #define __must_check
 #define __maybe_unused  __attribute__((unused))
 #define __always_unused __attribute__((unused))
@@ -39,8 +40,8 @@
 #define __weak          __attribute__((weak))
 #define __section(s)    __attribute__((section(s)))
 #define __counted_by(m)
-#define __free(f)
-#define __cleanup(f)
+/* Scope-exit cleanup; __free() and the guards are built on it in <linux/cleanup.h>. */
+#define __cleanup(f)    __attribute__((__cleanup__(f)))
 #define fallthrough     __attribute__((fallthrough))
 
 #define likely(x)   __builtin_expect(!!(x), 1)

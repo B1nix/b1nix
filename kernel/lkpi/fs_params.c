@@ -360,7 +360,7 @@ struct kmem_cache *kmem_cache_create_usercopy(const char *name,
 	(void)usersize;
 	/* The usercopy window is what hardened usercopy checks a copy_to_user
 	 * against. b1nix has no such check, so the cache is an ordinary one. */
-	return kmem_cache_create(name, size, align, flags, ctor);
+	return kmem_cache_create_legacy(name, size, align, flags, ctor);
 }
 
 /* ── file handles ───────────────────────────────────────────────── */

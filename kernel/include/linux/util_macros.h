@@ -34,4 +34,11 @@
 		}                                                               \
 		__fc_i;                                                         \
 	})
+
+/* The if-without-else that makes a filtering for_each macro safe inside an
+ * outer if/else (moved here from <drm/drm_util.h> in 6.13). */
+#ifndef for_each_if
+#define for_each_if(condition) if (!(condition)) {} else
+#endif
+
 #endif
