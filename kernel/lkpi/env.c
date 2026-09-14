@@ -217,11 +217,17 @@ u64 lkpi_sleep_jiffies(u64 jiffies_count)
 	u32 hz = sched_tick_hz();
 	u32 per_jiffy = hz / 100u;
 	u64 ticks, deadline, now;
+	int infinite;
 
 	if (per_jiffy < 1u)
 		per_jiffy = 1u;
-	ticks = jiffies_count * per_jiffy;
-	deadline = scheduler_get_ticks() + ticks;
+	/* MAX_SCHEDULE_TIMEOUT means "until woken". Multiplied out it wrapped, the
+	 * deadline landed in the past, and the sleep returned 0 at once: an i915
+	 * wait for a scanout buffer the GPU was still rendering reported -ETIME,
+	 * and sway's first modeset on iris failed whenever the render was slow. */
+	infinite = jiffies_count > (~0ULL >> 2) / per_jiffy;
+	ticks = infinite ? 0 : jiffies_count * per_jiffy;
+	deadline = infinite ? ~0ULL : scheduler_get_ticks() + ticks;
 	{
   watch_note_park((u64)(usize)__builtin_return_address(0),
                   (u64)(usize)__builtin_frame_address(0));
@@ -292,6 +298,8 @@ u64 lkpi_sleep_jiffies(u64 jiffies_count)
 	 * signalled, saw a remainder of zero, and answered -ETIME for a request
 	 * the hardware had already retired.
 	 */
+	if (infinite)
+		return jiffies_count;
 	now = scheduler_get_ticks();
 	if (now >= deadline)
 		return 0;
@@ -580,6 +588,30 @@ void lkpi_handle_inherit_node(void *handle, void *source)
 	h->node = vfs_node_get(src->node);
 	h->ops = src->ops;
 	h->flags = src->flags;
+}
+
+static long long (*g_lkpi_file_llseek)(void *file, long long off, int whence);
+
+static isize lkpi_anon_lseek(struct vfs_handle *h, isize off, int whence)
+{
+	if (!g_lkpi_file_llseek || !h->private_data)
+		return -ESPIPE;
+	return (isize)g_lkpi_file_llseek(h->private_data, off, whence);
+}
+
+static const struct vfs_file_ops lkpi_anon_file_ops = {
+	.lseek = lkpi_anon_lseek,
+};
+
+void lkpi_handle_set_llseek(void *handle,
+                            long long (*llseek)(void *file, long long off, int whence))
+{
+	struct vfs_handle *h = (struct vfs_handle *)handle;
+
+	if (!h || h->node || h->ops || !llseek)
+		return;
+	g_lkpi_file_llseek = llseek;
+	h->ops = &lkpi_anon_file_ops;
 }
 
 void lkpi_handle_attach_drm_minor(void *handle, u32 minor)

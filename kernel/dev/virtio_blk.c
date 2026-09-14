@@ -194,7 +194,7 @@ static u64 vblk_spin_ns(int is_read) {
 static u64 vblk_read_spin_ns(void) { return vblk_spin_ns(1); }
 static u64 vblk_write_spin_ns(void) { return vblk_spin_ns(0); }
 
-#define VIRTIO_BLK_STALL_REPORT_TICKS 200 /* 2 s at 10 ms a tick */
+#define VIRTIO_BLK_STALL_REPORT_TICKS SCHED_MS_TO_TICKS(2000) /* 2 s, at any tick rate */
 #define VIRTIO_BLK_STALL_REPORT_MAX   8
 
 static int virtio_blk_irq(void *ctx) {

@@ -220,6 +220,15 @@ int get_unused_fd_flags(unsigned int flags)
 	return fd;
 }
 
+static long long lkpi_file_llseek(void *file, long long off, int whence)
+{
+	struct file *f = (struct file *)file;
+
+	if (!f->f_op || !f->f_op->llseek)
+		return -ESPIPE;
+	return (long long)f->f_op->llseek(f, (loff_t)off, whence);
+}
+
 void fd_install(unsigned int fd, struct file *f)
 {
 	void *h = lkpi_fd_lookup((int)fd);
@@ -241,6 +250,8 @@ void fd_install(unsigned int fd, struct file *f)
 			lkpi_handle_attach_drm_minor(h, minor);
 	}
 	lkpi_handle_set_private(h, f);
+	if (f->f_op && f->f_op->llseek)
+		lkpi_handle_set_llseek(h, lkpi_file_llseek);
 	if (!f->f_handle)
 		f->f_handle = h;
 }

@@ -51,10 +51,15 @@ inittab under `b1nix.i915sway`.
   background pixels separately, with renderer `Mesa Intel(R) UHD Graphics 630
   (CFL GT2)` (the renderer string is checked so llvmpipe cannot pass).
 
+- **Compositor on iris.** sway on gles2/iris composes on the panel
+  (`b1nix.i915gl`, image built with `B1NIX_GPU_DRV=1`, run with
+  `NO_VIRTIO_GPU=1` so wlroots does not take the virtio card for EGL). Two shim
+  bugs stood in the way: a dma-buf `lseek(SEEK_END)` answered 0, so iris
+  softpinned an imported 8 MiB BO over its neighbours (`-ENOSPC`); and a
+  `MAX_SCHEDULE_TIMEOUT` sleep wrapped to an immediate timeout, so waiting for
+  a scanout buffer still being rendered failed the modeset with `-ETIME`.
+  `MACHINE=q35` works too with `IGD_DEV_EXTRA=addr=02.0,x-igd-opregion=on`.
+
 ## Open
 
-- **Compositor on iris.** sway on the gles2/iris renderer was last seen getting
-  `-ENOSPC` from its third `EXECBUFFER2` (earlier batches in the same context
-  succeed) — `eb_reserve` failing to bind softpin addresses, not submission
-  itself. Offsets are dumped under `b1nix.i915-execbuf`.
 - **Bare metal on Gen8** (HP Pavilion), logs over netconsole, ISO from USB.

@@ -227,6 +227,10 @@ void lkpi_handle_inherit_node(void *handle, void *source);
  * descriptor the DRM core creates for itself has no node otherwise, and a
  * program that stats it sees an anonymous file rather than the card. */
 void lkpi_handle_attach_drm_minor(void *handle, u32 minor);
+/* A descriptor with no device node behind it (an anon-inode file such as a
+ * dma-buf) seeks through `llseek`, handed the file it carries. */
+void lkpi_handle_set_llseek(void *handle,
+                            long long (*llseek)(void *file, long long off, int whence));
 void lkpi_handle_set_private(void *handle, void *priv);
 
 /* Install a handle in the calling process's table. Returns the descriptor, or

@@ -149,7 +149,8 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 
 - [x] i915 imported unmodified; sway drives the passed-through UHD 630 at 1920x1080 ([image](images/m102a-sway-on-monitor.jpg)) and survives client churn.
 - [x] GT runs (execlists, GGTT/PPGTT, completion IRQs); `EXECBUFFER2` served; `gl_probe` renders with Mesa iris.
-- [ ] `planned` Compositor submissions fail: sway on gles2/iris gets `-ENOSPC` from `eb_reserve` (softpin binding path).
+- [x] sway on gles2/iris submits: the `-ENOSPC` from `eb_reserve` was a dma-buf `lseek(SEEK_END)` answering 0, so iris softpinned an 8 MiB imported BO over its neighbours.
+- [x] sway on gles2/iris reaches the panel and screenshots (legacy and q35 machines): a `MAX_SCHEDULE_TIMEOUT` wait wrapped and made the first modeset return `-ETIME`.
 - [ ] `planned` Bare metal on Gen8 laptop with netconsole logs.
 
 ## M102b: amdgpu on RX 6600 (render-only) + radeonsi

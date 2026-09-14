@@ -38,7 +38,27 @@ static int dma_buf_file_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+/* Upstream's dma_buf_llseek: SEEK_END reports the buffer's size, which is how
+ * an importer learns it. Mesa sizes a PRIME-imported BO this way; answered 0,
+ * iris softpinned an 8 MiB scanout buffer as if it were empty, on top of its
+ * neighbours, and the next EXECBUFFER2 failed with -ENOSPC. */
+static loff_t dma_buf_llseek(struct file *file, loff_t offset, int whence)
+{
+	struct dma_buf *dmabuf = file ? (struct dma_buf *)file->private_data : 0;
+
+	if (!dmabuf)
+		return -EBADF;
+	if (offset != 0)
+		return -EINVAL;
+	if (whence == SEEK_END)
+		return (loff_t)dmabuf->size;
+	if (whence == SEEK_SET)
+		return 0;
+	return -EINVAL;
+}
+
 static const struct file_operations dma_buf_fops = {
+	.llseek = dma_buf_llseek,
 	.release = dma_buf_file_release,
 };
 

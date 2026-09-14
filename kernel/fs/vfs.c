@@ -5245,6 +5245,9 @@ isize vfs_lseek(int handle, isize offset, int whence) {
   struct vfs_handle *h = get_handle(handle);
   if (!h)
     return -EBADF;
+  /* A descriptor that seeks by its own rule (an imported driver's file). */
+  if (h->ops && h->ops->lseek)
+    return h->ops->lseek(h, offset, whence);
   /* A pipe, socket or anonymous object has no file position. POSIX says
    * ESPIPE, not EBADF — GNU head asks to seek backwards on standard input
    * and takes EBADF as "this descriptor is broken", which is how a plain
