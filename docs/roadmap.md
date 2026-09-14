@@ -170,7 +170,7 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 - [x] kwin_wayland + plasmashell on real DRM via elogind/eudev ([image](images/m113-plasma-drm.png)); `tests/kde-smoke.sh`.
 - [x] Boot to painted desktop 194 s → ~16 s; evdev input and DRM framebuffer console before the compositor.
 - [x] kwin takes atomic modesetting on virtio-gpu: the driver advertises `DRIVER_CURSOR_HOTSPOT` (DRM core 6.18.51); `atomic-modeset` check in `tests/kde-smoke.sh`.
-- [ ] `partial` Remaining costs: dbus/elogind session stalls, vmm read-lock per copyin. The 20 s `udevadm settle` stall was a page-cache insert race (concurrent execs of one library spun on a freed folio), fixed.
+- [ ] `partial` Boot to desktop is back to ~13 s (from 23–25 s: reaper wake storm, whole-cache walk per inode flush, a page-cache insert race behind a 20 s `udevadm settle`). Remaining: file faults (~0.6 M cycles each), vmm read-lock per copyin.
 
 ## M121: Kernel only
 
@@ -184,7 +184,7 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 - [x] execve no longer drops arguments past 256 (a 684-argument link ran on the first 256 objects); oversized vectors are E2BIG.
 - [x] The kernel built in-guest boots: on a btrfs build disk, extracted with `btrfs restore`, it mounts the btrfs root and runs userspace (`tools/selfhost/selfhost-proof.sh`, 653/653 in ~5 min). It took `sync(2)` writing out and committing imported filesystems, and a workqueue that no longer touches a freed work item.
 - [x] aarch64 builds the imported btrfs and prints debug tracing on test boots (the M40 personality line).
-- [ ] `partial` aarch64 wedges: two causes fixed (a timed sleeper halting on the boot CPU starved READY tasks; a jbd2 wait entry deleted twice), but sys/gfx lanes still wedge now and then; in both dumps the `reaper` kthread is current on the boot CPU as READY on no runqueue (`queued=NO`) — every yield wakes it once any thread has ever existed (its own block included), so it never stops being runnable; gating the wake on a pending death (tried 09-14) regressed x86_64 (AIO hang, heap corruption) and was reverted, and M86 `rusage-thread-burn` once credited a compute loop to system time.
+- [ ] `partial` aarch64 wedges: three causes fixed (a timed sleeper halting on the boot CPU starved READY tasks; a jbd2 wait entry deleted twice; the `reaper` woken by every yield once any thread or waiting zombie existed — it now wakes only for a death to reap, flags cleared before each sweep), but sys/gfx lanes may still wedge now and then; M86 `rusage-thread-burn` once credited a compute loop to system time.
 - [x] Wall clock no longer runs backwards: NTP slewed by stepping whole seconds; now one monotonic-based wall clock on both arches, NTP offset in ns, slew at <=500 ppm.
 - [x] `telinit` and the fake M39 inittab markers removed (M39 keeps its real serial-tty checks).
 - [x] The IOMMU instances end with `reboot -f`; the check passes only when QEMU (-no-reboot) then exits on its own.

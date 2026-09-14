@@ -1226,7 +1226,42 @@ int page_cache_flush_inode(struct vfs_inode *inode) {
    * head again is the same fix the eviction loop already carries, and it costs
    * a list walk per dirty page of one inode, not per page in the machine.
    * Bounded: writeback clears DIRTY, so no page is chosen twice. */
+  if (inode->flags & VFS_NODE_MEMORY_BACKED)
+    return 0; /* nothing of an in-memory file is ever written anywhere */
+
   lock_pc();
+  /* A file much smaller than the cache: ask the hash for each of its offsets
+   * instead of walking every cached page in the machine. Plasma stats and
+   * rewrites small config files all through its start-up, and each of those
+   * flushes paid for the whole LRU. No read-ahead is armed -- this looks in
+   * the chains directly. A dirty page past EOF (or a size that moved under
+   * us) is left for the walk below, which still runs when the count says
+   * something was not found. */
+  {
+    u64 npages = (inode->size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    if (npages < __atomic_load_n(&g_pc_resident_pages, __ATOMIC_ACQUIRE) / 8) {
+      for (u64 i = 0; i < npages && written < want; i++) {
+        u64 off = i * PAGE_SIZE;
+        u32 h = pc_hash(inode, off);
+        u64 bflags_h = lock_bucket(h);
+        struct page_cache_entry *flush = 0;
+
+        for (struct page_cache_entry *e = hash_table[h]; e; e = e->hash_next) {
+          if (e->inode == inode && pc_key_eq(e, inode, off)) {
+            if (e->flags & PAGE_CACHE_DIRTY)
+              flush = e;
+            break;
+          }
+        }
+        unlock_bucket(h, bflags_h);
+        if (flush) {
+          writeback_page_locked(flush);
+          written++;
+        }
+      }
+    }
+  }
   while (written < want) {
     struct page_cache_entry *flush = 0;
     struct page_cache_entry *heads[2] = { lru_head, active_head };
@@ -1234,8 +1269,7 @@ int page_cache_flush_inode(struct vfs_inode *inode) {
     for (int li = 0; li < 2 && !flush; li++) {
       for (struct page_cache_entry *curr = heads[li]; curr;
            curr = curr->lru_next) {
-        if (curr->inode == inode && (curr->flags & PAGE_CACHE_DIRTY) &&
-            !(inode->flags & VFS_NODE_MEMORY_BACKED)) {
+        if (curr->inode == inode && (curr->flags & PAGE_CACHE_DIRTY)) {
           flush = curr;
           break;
         }

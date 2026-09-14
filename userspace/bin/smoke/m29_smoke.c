@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <dirent.h>
 #include "syscall.h"
 #include <syslog.h>
 
@@ -643,6 +644,101 @@ static void *t_cancel_loop(void *arg) {
   return (void *)0xABCD;
 }
 
+/* execve from a multithreaded process: every other thread goes (POSIX), the
+ * image runs as the only thread of the same pid, and the old address space is
+ * released exactly once. The child spins three threads and re-executes this
+ * binary in probe mode, which reports how many threads its pid has. */
+#define EXEC_THREADS_ROUNDS 20
+static char exec_self_path[256];
+
+static void *exec_spin(void *arg) {
+  volatile unsigned long n = 0;
+  (void)arg;
+  for (;;)
+    n++;
+  return 0;
+}
+
+static int exec_probe_main(const char *want_pid) {
+  DIR *d = opendir("/proc/self/task");
+  int n = 0;
+  struct dirent *e;
+
+  /* Exec'd from a thread other than the leader: the process keeps its pid. */
+  if (want_pid && atoi(want_pid) != (int)getpid())
+    return 103;
+
+  if (!d)
+    return 100;
+  while ((e = readdir(d)))
+    if (e->d_name[0] != '.')
+      n++;
+  closedir(d);
+  return n;
+}
+
+static void *exec_from_thread(void *arg) {
+  char pidbuf[16];
+  snprintf(pidbuf, sizeof(pidbuf), "%d", (int)(long)arg);
+  char *argv[] = { exec_self_path, "exec-probe", pidbuf, 0 };
+  execv(exec_self_path, argv);
+  _exit(102);
+}
+
+static int test_exec_threads(void) {
+  for (int round = 0; round < EXEC_THREADS_ROUNDS; round++) {
+    pid_t pid = fork();
+    if (pid < 0) { fail("exec-threads-fork"); return -1; }
+    if (pid == 0) {
+      pthread_t th;
+      for (int i = 0; i < 3; i++)
+        if (pthread_create(&th, 0, exec_spin, 0) != 0)
+          _exit(101);
+      char *argv[] = { exec_self_path, "exec-probe", 0 };
+      execv(exec_self_path, argv);
+      _exit(102);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) {
+      fail("exec-threads-wait"); return -1;
+    }
+    if (WEXITSTATUS(status) != 1) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), "exec-threads (round %d: %d threads after exec)",
+               round, WEXITSTATUS(status));
+      fail(buf);
+      return -1;
+    }
+  }
+  ok("exec-threads");
+
+  /* The same from a thread that is not the leader, while the leader spins. */
+  for (int round = 0; round < EXEC_THREADS_ROUNDS; round++) {
+    pid_t pid = fork();
+    if (pid < 0) { fail("exec-nonleader-fork"); return -1; }
+    if (pid == 0) {
+      pthread_t th;
+      for (int i = 0; i < 2; i++)
+        if (pthread_create(&th, 0, exec_spin, 0) != 0)
+          _exit(101);
+      if (pthread_create(&th, 0, exec_from_thread, (void *)(long)getpid()) != 0)
+        _exit(101);
+      exec_spin(0);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 1) {
+      char buf[96];
+      snprintf(buf, sizeof(buf), "exec-nonleader (round %d: status 0x%x)", round,
+               status);
+      fail(buf);
+      return -1;
+    }
+  }
+  ok("exec-nonleader");
+  return 0;
+}
+
 static int test_cancel(void) {
   /* setcancelstate round-trip on the calling thread. */
   int old = -1;
@@ -673,7 +769,14 @@ static int test_cancel(void) {
   return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "exec-probe") == 0)
+    return exec_probe_main(argc > 2 ? argv[2] : 0);
+  {
+    ssize_t n = readlink("/proc/self/exe", exec_self_path, sizeof(exec_self_path) - 1);
+    if (n > 0)
+      exec_self_path[n] = 0;
+  }
   emit("M29-PTHREAD: start\n");
   /* Run every test even if one fails: the subsystems are independent (a failure
    * in the CLONE_VM stress race must not hide the syslog/utmp/locale/iconv/
@@ -695,6 +798,7 @@ int main(void) {
   rc |= test_iconv();
   rc |= test_time_hammer();
   rc |= test_cancel();
+  rc |= test_exec_threads();
   emit("M29-PTHREAD: done\n");
   return rc ? 1 : 0;
 }

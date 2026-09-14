@@ -2467,6 +2467,8 @@ check_output "$LOG" "M29-PTHREAD: ok locale" "setlocale + localeconv + nl_langin
 check_output "$LOG" "M29-PTHREAD: ok iconv" "iconv UTF-8/Latin-1/ASCII conversion + error semantics work"
 check_output "$LOG" "M29-PTHREAD: ok time-hammer" "tight gettimeofday/clock_gettime loop is crash-free and monotonic"
 check_output "$LOG" "M29-PTHREAD: ok cancel" "pthread_cancel deferred cancellation + setcancelstate work"
+check_output "$LOG" "M29-PTHREAD: ok exec-threads" "execve from a process with running threads leaves the new image as the only thread of its pid, twenty times over"
+check_output "$LOG" "M29-PTHREAD: ok exec-nonleader" "execve from a thread that is not the leader keeps the process pid and leaves the new image as its only thread"
 check_output "$LOG" "M29-PTHREAD: done" "M29 pthread smoke completes"
 # ── M31 User Security / Passwords / Setuid ──
 check_output "$LOG" "M31-SEC: start" "M31 user-security smoke starts"

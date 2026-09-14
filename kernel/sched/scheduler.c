@@ -4167,6 +4167,32 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   return (int)child->id;
 }
 
+/* What the reaper has to do, set by whoever creates the work.
+ *
+ * Waking the reaper on every yield once any thread had ever existed -- and
+ * while any zombie at all was waiting for its parent -- ran the table sweeps
+ * millions of times a desktop start-up (2.6 M reaper passes in 20 s of KDE),
+ * the zombie sweep scanning the whole table for each zombie's parent.
+ *
+ * A sweep clears its flag BEFORE it walks and sets it again for anything it
+ * had to leave behind (a thread still switching off its stack, a zombie whose
+ * claim raced), so work published during the walk is never lost. A zombie
+ * whose parent is alive is not left behind: it is that parent's to wait for,
+ * and the parent's own death sets the flag that sweeps it. */
+static int g_dead_threads_pending;
+static int g_have_proc_zombies;
+
+static void reap_request_threads(void) {
+  __atomic_store_n(&g_dead_threads_pending, 1, __ATOMIC_RELEASE);
+}
+
+/* A death outside the thread-exit path -- a signal, exit_group, a process
+ * exit -- may be a thread's as well as a process's, so it asks for both. */
+static void reap_request_zombies(void) {
+  __atomic_store_n(&g_have_proc_zombies, 1, __ATOMIC_RELEASE);
+  reap_request_threads();
+}
+
 void scheduler_reap_dead_threads(void) {
   /* Called from scheduler_yield with interrupts already disabled. Free the
    * kernel stack + slot of any DEAD thread (is_thread=1) whose
@@ -4179,19 +4205,25 @@ void scheduler_reap_dead_threads(void) {
    * last-user teardown the whole address space — pml4, page tables, vmas —
    * leaked on every unjoined multithreaded exit until PMM OOM. */
   usize task_hwm = g_task_hwm;
+  int left = 0;
+
+  __atomic_store_n(&g_dead_threads_pending, 0, __ATOMIC_RELEASE);
   for (usize i = 0; i < task_hwm; i++) {
     struct task *t = T(i);
-    if (!t || t == current_task) continue;
+    if (!t) continue;
     if (t->state != TASK_DEAD) continue;
     if (!task_is_thread(t)) continue;
+    /* Not reapable yet: still on a CPU, or its stack not yet released. */
+    if (t == current_task || task_running_somewhere(t) ||
+        !__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) {
+      left = 1;
+      continue;
+    }
     /* stack_released only says that the task's saved SP no longer names the
      * outgoing CPU's stack. It does not say that another CPU has stopped
      * executing the task: a task can be marked DEAD by that CPU while its
      * exit-side scheduler_yield is still unwinding. Never clear the slot
      * until no CPU identifies it as current. */
-    if (task_running_somewhere(t)) continue;
-    if (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) continue;
-
     /* Claim DEAD->REAPING first. Load-bearing twice over: (a) a racing
      * reaper/waitpid on another CPU must not double-free this slot, and
      * (b) user_address_space_cleanup below re-enables IRQs mid-walk, so a
@@ -4250,12 +4282,10 @@ void scheduler_reap_dead_threads(void) {
     if (t->name) { kfree((void *)t->name); t->name = 0; }
     free_task_slot(t);
   }
+  if (left)
+    reap_request_threads();
 }
 
-/* Set when a process (non-thread) becomes a zombie; gates the orphan sweep
- * below so scheduler_yield only walks the table while zombies may exist. The
- * sweep clears it again once no process zombie remains. */
-static int g_have_proc_zombies = 0;
 static char g_reaper_chan;
 static int g_reaper_started;
 
@@ -4271,14 +4301,17 @@ static int g_reaper_started;
 void scheduler_reap_orphan_zombies(void) {
   int still_have = 0;
   usize task_hwm = g_task_hwm;
+
+  __atomic_store_n(&g_have_proc_zombies, 0, __ATOMIC_RELEASE);
   for (usize i = 0; i < task_hwm; i++) {
     struct task *t = T(i);
-    if (t == current_task) continue;
     if (t->state != TASK_DEAD) continue;
     if (task_is_thread(t)) continue; /* threads: scheduler_reap_dead_threads */
-    if (task_running_somewhere(t)) continue;
-    still_have = 1;
-    if (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) continue;
+    if (t == current_task || task_running_somewhere(t) ||
+        !__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) {
+      still_have = 1; /* may turn out to be an orphan once it is off-CPU */
+      continue;
+    }
 
     int has_live_parent = 0;
     for (usize p = 0; p < task_hwm; p++) {
@@ -4294,8 +4327,10 @@ void scheduler_reap_orphan_zombies(void) {
     /* Claim DEAD->REAPING so a racing waitpid on another CPU can't double-free. */
     enum task_state expected = TASK_DEAD;
     if (!__atomic_compare_exchange_n(&t->state, &expected, TASK_REAPING, 0,
-                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      still_have = 1;
       continue;
+    }
     if (t == current_task)
       panic("sched: reaping the task that is running");
 
@@ -4325,7 +4360,8 @@ void scheduler_reap_orphan_zombies(void) {
     if (t->stack) { kfree(t->stack); t->stack = 0; }
     free_task_slot(t);
   }
-  g_have_proc_zombies = still_have;
+  if (still_have)
+    __atomic_store_n(&g_have_proc_zombies, 1, __ATOMIC_RELEASE);
 }
 
 
@@ -4388,14 +4424,18 @@ int scheduler_yield(void) {
    * linuxkpi lock held. Once the reaper thread runs, the yield only wakes it. */
   extern int g_has_any_thread;
   if (g_reaper_started) {
-    if (g_has_any_thread || g_have_proc_zombies)
+    if (__atomic_load_n(&g_dead_threads_pending, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&g_have_proc_zombies, __ATOMIC_ACQUIRE))
       scheduler_wake_all(&g_reaper_chan);
   } else {
-    if (g_has_any_thread) scheduler_reap_dead_threads();
+    if (g_has_any_thread &&
+        __atomic_load_n(&g_dead_threads_pending, __ATOMIC_ACQUIRE))
+      scheduler_reap_dead_threads();
     /* Reap orphaned process zombies (no living parent) so daemons whose shell
      * parent has exited don't leak their slot/address space forever. Gated so
      * the table walk only runs while a process zombie may exist. */
-    if (g_have_proc_zombies) scheduler_reap_orphan_zombies();
+    if (__atomic_load_n(&g_have_proc_zombies, __ATOMIC_ACQUIRE))
+      scheduler_reap_orphan_zombies();
   }
 
   /* Deliver pending signals for current task */
@@ -6554,6 +6594,102 @@ void scheduler_exit_group(int exit_code) {
   scheduler_exit_current(exit_code);
 }
 
+/* execve's point of no return in a multithreaded process: every other thread
+ * of the group goes, and exec waits until each one is fully reaped.
+ *
+ * Without this the siblings kept running on the old address space while exec
+ * freed its mappings and page tables under them, and each still named the old
+ * pml4 and VMA list -- so their eventual teardown walked a list that was gone
+ * and freed a page-table root that belonged to someone else by then.
+ *
+ * The caller marks itself exiting for the duration: a sibling acting on its
+ * SIGKILL kills its group, and must not take the exec'ing thread with it.
+ *
+ * A thread that is not the leader takes the leader's place first, as on Linux:
+ * it becomes the process -- pid, parent, group, session, terminal, the
+ * process-wide accounting -- and the old leader becomes an ordinary thread
+ * under the exec'ing thread's former tid, so it dies as one: no SIGCHLD for a
+ * process that is still alive, and no children handed to init. */
+static void exec_take_leadership(usize idx, usize tgid) {
+  struct task *me = current_task;
+  u64 flags;
+  usize li = TASK_SLOTS;
+
+  tasks_lock(&flags);
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (i != idx && T(i)->state != TASK_UNUSED && T(i)->id == tgid) {
+      li = i;
+      break;
+    }
+  }
+  if (li < TASK_SLOTS) {
+    struct task *leader = T(li);
+    usize old_tid = me->id;
+
+    /* The exec'ing thread's own children belong to the process it becomes. */
+    for (usize i = 0; i < g_task_hwm; i++)
+      if (T(i)->state != TASK_UNUSED && T(i)->parent_id == old_tid)
+        T(i)->parent_id = tgid;
+#define EXEC_SWAP(a, b) do { __typeof__(a) _t = (a); (a) = (b); (b) = _t; } while (0)
+    EXEC_SWAP(me->id, leader->id);
+    EXEC_SWAP(me->parent_id, leader->parent_id);
+    EXEC_SWAP(me->process_group_id, leader->process_group_id);
+    EXEC_SWAP(me->session_id, leader->session_id);
+    EXEC_SWAP(g_task_ctty_type[idx], g_task_ctty_type[li]);
+    EXEC_SWAP(g_task_ctty_index[idx], g_task_ctty_index[li]);
+    EXEC_SWAP(g_task_cutime_ns[idx], g_task_cutime_ns[li]);
+    EXEC_SWAP(g_task_cstime_ns[idx], g_task_cstime_ns[li]);
+    EXEC_SWAP(g_task_start_tick[idx], g_task_start_tick[li]);
+    EXEC_SWAP(g_task_pidfs_ino[idx], g_task_pidfs_ino[li]);
+    EXEC_SWAP(g_task_alarm_ticks[idx], g_task_alarm_ticks[li]);
+    EXEC_SWAP(g_task_alarm_interval_ticks[idx], g_task_alarm_interval_ticks[li]);
+    EXEC_SWAP(g_task_execed[idx], g_task_execed[li]);
+#undef EXEC_SWAP
+    for (int r = 0; r < 16; r++)
+      g_task_rlimits[idx][r] = g_task_rlimits[li][r];
+    g_task_is_thread[idx] = 0;
+    g_task_is_thread[li] = 1;
+    /* Not a leader any more: nothing may treat its park as the group's. */
+    g_task_parked_leader[li] = 0;
+  }
+  tasks_unlock(flags);
+}
+
+void scheduler_exec_zap_threads(void) {
+  usize idx, tgid;
+
+  if (!current_task)
+    return;
+  idx = task_index(current_task);
+  tgid = g_task_tgid[idx];
+  if (!tgid)
+    return;
+  g_task_exiting[idx] = 1;
+  if (tgid != current_task->id)
+    exec_take_leadership(idx, tgid);
+  {
+    u64 flags = interrupts_save();
+    terminate_group_siblings(current_task);
+    interrupts_restore(flags);
+  }
+  for (;;) {
+    int live = 0;
+    u64 flags = interrupts_save();
+
+    for (usize i = 0; i < g_task_hwm; i++) {
+      if (i != idx && T(i)->state != TASK_UNUSED && g_task_tgid[i] == tgid) {
+        live = 1;
+        break;
+      }
+    }
+    interrupts_restore(flags);
+    if (!live)
+      break;
+    scheduler_block_on_timeout(&g_task_exiting[idx], 1);
+  }
+  g_task_exiting[idx] = 0;
+}
+
 /* M86: exit(2) — as opposed to exit_group(2) — ends ONE thread, even when that
  * thread is the group leader. musl's pthread_exit() from main relies on exactly
  * this: it leaves the main thread and the process must keep running until the
@@ -6947,6 +7083,7 @@ void scheduler_exit_current(int exit_code) {
       nvme_release_io_lock_of((u64)current_task->id);
     }
     current_task->state = TASK_DEAD;
+    reap_request_threads();
     scheduler_yield();
     panic("dead thread resumed");
   }
@@ -7009,7 +7146,7 @@ void scheduler_exit_current(int exit_code) {
       nvme_release_io_lock_of((u64)current_task->id);
     }
   current_task->state = TASK_DEAD;
-  g_have_proc_zombies = 1; /* arm the orphan sweep in scheduler_yield */
+  reap_request_zombies(); /* arm the orphan sweep in scheduler_yield */
 
   EXIT_STAGE(40);
   post_sigchld_to_parent(current_task->parent_id, 0);
@@ -9940,7 +10077,7 @@ void scheduler_deliver_pending_signals(void) {
       nvme_release_io_lock_of((u64)current_task->id);
     }
       current_task->state = TASK_DEAD;
-      g_have_proc_zombies = 1;
+      reap_request_zombies();
       post_sigchld_to_parent(current_task->parent_id, 0);
       scheduler_notify_wait_event(current_task->parent_id);
       return;
@@ -10002,7 +10139,7 @@ void scheduler_deliver_pending_signals(void) {
       nvme_release_io_lock_of((u64)current_task->id);
     }
         current_task->state = TASK_DEAD;
-        g_have_proc_zombies = 1;
+        reap_request_zombies();
         post_sigchld_to_parent(current_task->parent_id, 0);
         scheduler_notify_wait_event(current_task->parent_id);
         return;
@@ -10281,9 +10418,10 @@ static void reaper_thread(void *arg) {
     scheduler_block_on_timeout(&g_reaper_chan, SCHED_MS_TO_TICKS(100));
     u64 flags = interrupts_save();
     interrupts_disable();
-    if (g_has_any_thread)
+    if (g_has_any_thread &&
+        __atomic_load_n(&g_dead_threads_pending, __ATOMIC_ACQUIRE))
       scheduler_reap_dead_threads();
-    if (g_have_proc_zombies)
+    if (__atomic_load_n(&g_have_proc_zombies, __ATOMIC_ACQUIRE))
       scheduler_reap_orphan_zombies();
     interrupts_restore(flags);
   }

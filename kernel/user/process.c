@@ -1499,8 +1499,12 @@ static int user_run_elf_image(struct user_loaded_image *image) {
      * background job exec'ing repeatedly (`while true; do sleep 5; done &`)
      * kept inheriting the write end, so the substitution's reader never saw
      * EOF and `X=$(cmd | cmd)` hung forever. */
-    if (replacing)
+    if (replacing) {
+      extern void scheduler_exec_zap_threads(void);
+
+      scheduler_exec_zap_threads();
       scheduler_fd_close_on_exec();
+    }
     /* M86: the old image's resident set is about to be released — record its
      * peak first, so getrusage after an execve still reports the largest
      * footprint this process ever had. */
