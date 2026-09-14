@@ -143,17 +143,37 @@ void delete_from_page_cache(struct page *page)
 
 /* ── finding ────────────────────────────────────────────────────── */
 
-struct folio *filemap_get_folio(struct address_space *mapping, pgoff_t index)
+/*
+ * The first folio at or after *index and no further than last, with a
+ * reference, or NULL; *index is left at the one found.
+ *
+ * Under the array's lock. A removal erases the entry under that lock and only
+ * then drops the mapping's reference, so an entry seen here still holds that
+ * reference while this one is taken. Looked up and pinned without the lock,
+ * a folio removed in between was freed first and the pin incremented a count
+ * inside freed heap memory -- a heap block's header, a btrfs extent buffer's
+ * folio with its mapping gone.
+ */
+static struct folio *filemap_find_get(struct address_space *mapping,
+                                      unsigned long *index, unsigned long last)
 {
 	struct folio *folio;
 
+	xa_lock_irq(&mapping->i_pages);
+	folio = xa_find(&mapping->i_pages, index, last, XA_PRESENT);
+	if (folio)
+		folio_get(folio);
+	xa_unlock_irq(&mapping->i_pages);
+	return folio;
+}
+
+struct folio *filemap_get_folio(struct address_space *mapping, pgoff_t index)
+{
+	unsigned long at = index;
+
 	if (!mapping)
 		return NULL;
-	folio = xa_load(&mapping->i_pages, index);
-	if (!folio)
-		return NULL;
-	folio_get(folio);
-	return folio;
+	return filemap_find_get(mapping, &at, index);
 }
 
 struct folio *filemap_lock_folio(struct address_space *mapping, pgoff_t index)
@@ -401,19 +421,18 @@ size_t memcpy_from_file_folio(char *to, struct folio *folio, loff_t pos,
 unsigned filemap_get_folios(struct address_space *mapping, pgoff_t *start,
                             pgoff_t end, struct folio_batch *fbatch)
 {
-	unsigned long index;
-	void *entry;
+	unsigned long index = *start;
+	struct folio *folio;
 	unsigned found = 0;
 
-	xa_for_each_start(&mapping->i_pages, index, entry, *start) {
-		struct folio *folio = entry;
-
-		if (index > end || found >= PAGEVEC_SIZE)
-			break;
-		folio_get(folio);
+	while (index <= end && found < PAGEVEC_SIZE &&
+	       (folio = filemap_find_get(mapping, &index, end)) != NULL) {
 		fbatch->folios[fbatch->nr++] = folio;
 		found++;
 		*start = (pgoff_t)index + 1;
+		if (index == end)
+			break;
+		index++;
 	}
 	if (!found)
 		*start = end == (pgoff_t)-1 ? end : end + 1;
@@ -446,8 +465,8 @@ unsigned filemap_get_folios_tag(struct address_space *mapping, pgoff_t *start,
                                 pgoff_t end, xa_mark_t tag,
                                 struct folio_batch *fbatch)
 {
-	unsigned long index;
-	void *entry;
+	unsigned long index = *start;
+	struct folio *folio;
 	unsigned found = 0;
 	pgoff_t next = 0;
 
@@ -457,12 +476,10 @@ unsigned filemap_get_folios_tag(struct address_space *mapping, pgoff_t *start,
 	 * by index does not finish. It was 2^64 lookups behind an fsync that
 	 * appeared to hang.
 	 */
-	xa_for_each_start(&mapping->i_pages, index, entry, *start) {
-		struct folio *folio = entry;
+	while (found < PAGEVEC_SIZE &&
+	       (folio = filemap_find_get(mapping, &index, end)) != NULL) {
 		bool match;
 
-		if (index > end || found >= PAGEVEC_SIZE)
-			break;
 		/*
 		 * The tags are not maintained in the array; the state is read from
 		 * the folio itself, which gives the same answer for the two tags a
@@ -472,12 +489,16 @@ unsigned filemap_get_folios_tag(struct address_space *mapping, pgoff_t *start,
 			match = folio_test_writeback(folio);
 		else
 			match = folio_test_dirty(folio);
-		if (!match)
-			continue;
-		folio_get(folio);
-		fbatch->folios[fbatch->nr++] = folio;
-		found++;
-		next = (pgoff_t)index;
+		if (match) {
+			fbatch->folios[fbatch->nr++] = folio;
+			found++;
+			next = (pgoff_t)index;
+		} else {
+			folio_put(folio);
+		}
+		if (index >= end)
+			break;
+		index++;
 	}
 	/* Resume after the last one taken; when nothing matched the range is
 	 * exhausted, and saying so is what ends the caller's loop. */
@@ -512,8 +533,8 @@ void truncate_inode_pages_range(struct address_space *mapping, loff_t lstart,
 	pgoff_t start = (pgoff_t)(lstart >> PAGE_SHIFT);
 	pgoff_t end = (lend == (loff_t)-1) ? (pgoff_t)-1
 	                                   : (pgoff_t)(lend >> PAGE_SHIFT);
-	unsigned long index;
-	void *entry;
+	unsigned long index = start;
+	struct folio *folio;
 
 	if (!mapping)
 		return;
@@ -525,12 +546,7 @@ void truncate_inode_pages_range(struct address_space *mapping, loff_t lstart,
 	 * handful of folios. It showed up as a mount that never finished, with
 	 * 96% of the kernel's samples inside this function's xa_load.
 	 */
-	xa_for_each_start(&mapping->i_pages, index, entry, start) {
-		struct folio *folio = entry;
-
-		if (index > end)
-			break;
-		folio_get(folio);
+	while ((folio = filemap_find_get(mapping, &index, end)) != NULL) {
 		folio_lock(folio);
 		if (folio->mapping == mapping) {
 			folio_clear_dirty(folio);
@@ -538,6 +554,9 @@ void truncate_inode_pages_range(struct address_space *mapping, loff_t lstart,
 		}
 		folio_unlock(folio);
 		folio_put(folio);
+		if (index >= end)
+			break;
+		index++;
 	}
 }
 
@@ -570,19 +589,14 @@ void truncate_setsize(struct inode *inode, loff_t newsize)
 unsigned long invalidate_mapping_pages(struct address_space *mapping,
                                        pgoff_t start, pgoff_t end)
 {
-	unsigned long index;
-	void *entry;
+	unsigned long index = start;
+	struct folio *folio;
 	unsigned long dropped = 0;
 
 	if (!mapping)
 		return 0;
 	/* Over the entries, for the reason in truncate_inode_pages_range. */
-	xa_for_each_start(&mapping->i_pages, index, entry, start) {
-		struct folio *folio = entry;
-
-		if (index > end)
-			break;
-		folio_get(folio);
+	while ((folio = filemap_find_get(mapping, &index, end)) != NULL) {
 		if (folio_trylock(folio)) {
 			/* Only CLEAN folios: an invalidate must not lose a write that
 			 * has not reached the disk. A dirty one is left alone, which is
@@ -595,6 +609,9 @@ unsigned long invalidate_mapping_pages(struct address_space *mapping,
 			folio_unlock(folio);
 		}
 		folio_put(folio);
+		if (index >= end)
+			break;
+		index++;
 	}
 	return dropped;
 }
@@ -670,21 +687,19 @@ int filemap_flush(struct address_space *mapping)
 int filemap_fdatawait_range(struct address_space *mapping, loff_t start_byte,
                             loff_t end_byte)
 {
-	unsigned long index;
 	pgoff_t start = (pgoff_t)(start_byte >> PAGE_SHIFT);
 	pgoff_t end = (pgoff_t)(end_byte >> PAGE_SHIFT);
-	void *entry;
+	unsigned long index = start;
+	struct folio *folio;
 
 	if (!mapping)
 		return 0;
-	xa_for_each_start(&mapping->i_pages, index, entry, start) {
-		struct folio *folio = entry;
-
-		if (index > end)
-			break;
-		folio_get(folio);
+	while ((folio = filemap_find_get(mapping, &index, end)) != NULL) {
 		folio_wait_writeback(folio);
 		folio_put(folio);
+		if (index >= end)
+			break;
+		index++;
 	}
 	return filemap_check_errors(mapping);
 }
@@ -694,21 +709,19 @@ int filemap_fdatawait_range_keep_errors(struct address_space *mapping,
 {
 	/* Same wait, but the mapping's error is left for the next reader — which
 	 * is the difference the name records. */
-	unsigned long index;
 	pgoff_t start = (pgoff_t)(start_byte >> PAGE_SHIFT);
 	pgoff_t end = (pgoff_t)(end_byte >> PAGE_SHIFT);
-	void *entry;
+	unsigned long index = start;
+	struct folio *folio;
 
 	if (!mapping)
 		return 0;
-	xa_for_each_start(&mapping->i_pages, index, entry, start) {
-		struct folio *folio = entry;
-
-		if (index > end)
-			break;
-		folio_get(folio);
+	while ((folio = filemap_find_get(mapping, &index, end)) != NULL) {
 		folio_wait_writeback(folio);
 		folio_put(folio);
+		if (index >= end)
+			break;
+		index++;
 	}
 	return 0;
 }
@@ -769,38 +782,39 @@ int file_write_and_wait_range(struct file *file, loff_t lstart, loff_t lend)
 bool filemap_range_has_page(struct address_space *mapping, loff_t start,
                             loff_t end)
 {
-	unsigned long index;
 	pgoff_t first = (pgoff_t)(start >> PAGE_SHIFT);
 	pgoff_t last = (pgoff_t)(end >> PAGE_SHIFT);
-	void *entry;
+	unsigned long index = first;
+	struct folio *folio;
 
 	if (!mapping)
 		return false;
-	xa_for_each_start(&mapping->i_pages, index, entry, first) {
-		if (index > last)
-			break;
-		return true;
-	}
-	return false;
+	folio = filemap_find_get(mapping, &index, last);
+	if (!folio)
+		return false;
+	folio_put(folio);
+	return true;
 }
 
 bool filemap_range_needs_writeback(struct address_space *mapping, loff_t start,
                                    loff_t end)
 {
-	unsigned long index;
 	pgoff_t first = (pgoff_t)(start >> PAGE_SHIFT);
 	pgoff_t last = (pgoff_t)(end >> PAGE_SHIFT);
-	void *entry;
+	unsigned long index = first;
+	struct folio *folio;
 
 	if (!mapping)
 		return false;
-	xa_for_each_start(&mapping->i_pages, index, entry, first) {
-		struct folio *folio = entry;
+	while ((folio = filemap_find_get(mapping, &index, last)) != NULL) {
+		bool busy = folio_test_dirty(folio) || folio_test_writeback(folio);
 
-		if (index > last)
-			break;
-		if (folio_test_dirty(folio) || folio_test_writeback(folio))
+		folio_put(folio);
+		if (busy)
 			return true;
+		if (index >= last)
+			break;
+		index++;
 	}
 	return false;
 }

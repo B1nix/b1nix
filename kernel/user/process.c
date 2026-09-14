@@ -2536,7 +2536,10 @@ resolve:
   }
 
   /* Past the point of no return: nothing below returns to sys_execve, so the
-   * caller's array is ours to release too. */
+   * caller's array is ours to release too. After a `#!` hop `path` is a string
+   * of our_argv, so the task's new name is copied out of it first. */
+  char *new_name = strdup(path);
+
   if (our_argv)
     free_kernel_array(our_argv);
   free_kernel_array((char **)caller_argv);
@@ -2574,7 +2577,7 @@ resolve:
   if (current_task->name) {
     kfree((void *)current_task->name);
   }
-  current_task->name = strdup(path);
+  current_task->name = new_name;
   /* Record the whole vector, not just the path: /proc/<pid>/cmdline is defined
    * as the arguments a process was started with, and helper processes of a
    * multi-process program differ from it only in those arguments. */
