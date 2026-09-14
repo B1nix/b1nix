@@ -18,7 +18,6 @@
 #include <b1nix/console.h>
 #include <b1nix/drm.h>
 #include <b1nix/errno.h>
-#include <b1nix/ext2.h>
 #include <b1nix/fat32.h>
 #include <b1nix/filelock.h>
 #include <b1nix/initramfs.h>
@@ -5175,7 +5174,8 @@ static u64 fs_magic_for_type(const char *fstype) {
     return 0x63677270ull;
   if (strcmp(fstype, "devpts") == 0)
     return 0x1cd1ull;
-  if (strcmp(fstype, "ext4") == 0 || strcmp(fstype, "ext2") == 0)
+  if (strcmp(fstype, "ext4") == 0 || strcmp(fstype, "ext3") == 0 ||
+      strcmp(fstype, "ext2") == 0)
     return 0xEF53ull;
   if (strcmp(fstype, "vfat") == 0 || strcmp(fstype, "fat32") == 0)
     return 0x4d44ull; /* MSDOS_SUPER_MAGIC */
@@ -6160,8 +6160,7 @@ int vfs_fsync(int fd) {
    * This used to call the filesystem's fsync_cb -- which writes the super block
    * and issues a cache-flush command -- and only THEN write the file's own
    * dirty blocks back, followed by a second flush. So the first barrier came
-   * before the writeback it existed to make durable (ext4_vfs_fsync's comment
-   * describes the correct order; the code did not implement it), and every
+   * before the writeback it existed to make durable, and every
    * fsync paid for two barriers where one would do.
    *
    * It is worth real time: on the aarch64 sys lane, fsync was 47 s of a 176 s
@@ -7646,7 +7645,6 @@ int vfs_sync(void) {
    * fsync, umount or the writeback thread. */
   vfs_writeback_dirty_inodes();
   /* Flush in-memory filesystem structures to block cache first */
-  ext2_sync_all_fs();
   fat32_sync_all_fs();
 #ifdef B1NIX_FS_IMPORT
   {

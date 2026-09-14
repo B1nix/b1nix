@@ -1250,12 +1250,10 @@ int page_cache_flush_inode(struct vfs_inode *inode) {
   return 0;
 }
 
-void page_cache_invalidate_inode(struct vfs_inode *inode) {
-  if (!inode)
-    return;
-  if (__atomic_load_n(&inode->cached_pages, __ATOMIC_ACQUIRE) == 0)
-    return;
-
+/* Drop the pages matching `match`: one inode's, or (with inode NULL) every page
+ * under (fs_id, ino) that belongs to an inode other than `keep`. */
+static void pc_invalidate(struct vfs_inode *inode, u32 fs_id, u64 ino,
+                          struct vfs_inode *keep) {
   int invalidated = 0;
   lock_pc();
   /* Walk BOTH LRU lists (inactive then active) — pages of this inode can sit on
@@ -1265,7 +1263,9 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
     struct page_cache_entry *curr = heads[li];
     while (curr) {
       struct page_cache_entry *next = curr->lru_next;
-      if (curr->inode == inode) {
+      if (inode ? curr->inode == inode
+                : (curr->inode && curr->inode != keep &&
+                   curr->key_ino == ino && curr->key_fsid == fs_id)) {
         u32 h = pc_hash(curr->inode, curr->offset);
         u64 bflags_h = lock_bucket(h);
         struct page_cache_entry **prev = &hash_table[h];
@@ -1306,12 +1306,32 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
 
   if (bootinfo_has_flag("b1nix.debug.heap") && invalidated > 0) {
     console_write("[M26DIAG] pc_invalidate inode=0x");
-    console_write_hex64((u64)(usize)inode);
+    console_write_hex64((u64)(usize)(inode ? inode : keep));
     console_write(" pages=");
     console_write_dec(invalidated);
     m26_diag_task();
     console_write("\n");
   }
+}
+
+void page_cache_invalidate_inode(struct vfs_inode *inode) {
+  if (!inode)
+    return;
+  if (__atomic_load_n(&inode->cached_pages, __ATOMIC_ACQUIRE) == 0)
+    return;
+  pc_invalidate(inode, 0, 0, 0);
+}
+
+/* A filesystem that reuses inode numbers hands a new file the number of one
+ * that was deleted, and the cache is keyed by that number: pages the deleted
+ * file left cached then answered for the new one, and its writes went into
+ * them. Called when `inode` is born under (fs_id, ino). */
+void page_cache_invalidate_stale(struct vfs_inode *inode) {
+  if (!inode || !inode->ino)
+    return;
+  if (__atomic_load_n(&g_pc_resident_pages, __ATOMIC_ACQUIRE) == 0)
+    return;
+  pc_invalidate(0, inode->fs_id, inode->ino, inode);
 }
 
 /*

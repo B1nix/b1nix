@@ -115,6 +115,7 @@ static int lkpifs_lookup(struct vfs_node *dir, const char *name);
 static int lkpifs_create(struct vfs_node *dir, const char *name,
                          const char *full_path, u32 mode);
 static int lkpifs_mkdir(struct vfs_node *dir, const char *name, u32 mode);
+static int lkpifs_mknod(struct vfs_node *dir, const char *name, u32 mode);
 static int lkpifs_unlink(struct vfs_node *dir, const char *name);
 static int lkpifs_rmdir(struct vfs_node *dir, const char *name);
 static int lkpifs_rename(struct vfs_node *old_dir, const char *old_name,
@@ -126,6 +127,8 @@ static int lkpifs_symlink(struct vfs_node *dir, const char *name,
 static int lkpifs_truncate(struct vfs_node *node, u64 length);
 static int lkpifs_setattr(struct vfs_node *node);
 static int lkpifs_statfs(struct vfs_node *node, struct b1nix_statfs *st);
+static int lkpifs_fitrim(struct vfs_node *node, u64 start, u64 len, u64 minlen,
+                         u64 *trimmed);
 static int lkpifs_fsync(struct vfs_node *node);
 /* ── extended attributes ────────────────────────────────────────── */
 
@@ -248,6 +251,7 @@ static void install_ops(struct vfs_node *node, void *handle,
 	node->inode->lookup_cb = lkpifs_lookup;
 	node->inode->create_cb = lkpifs_create;
 	node->inode->mkdir_cb = lkpifs_mkdir;
+	node->inode->mknod_cb = lkpifs_mknod;
 	node->inode->unlink_cb = lkpifs_unlink;
 	node->inode->rmdir_cb = lkpifs_rmdir;
 	node->inode->rename_cb = lkpifs_rename;
@@ -260,6 +264,7 @@ static void install_ops(struct vfs_node *node, void *handle,
 	node->inode->getattr_cb = lkpifs_getattr;
 	node->inode->setflags_cb = lkpifs_setflags;
 	node->inode->statfs_cb = lkpifs_statfs;
+	node->inode->fitrim_cb = lkpifs_fitrim;
 	node->inode->getxattr_cb = lkpifs_getxattr;
 	node->inode->setxattr_cb = lkpifs_setxattr;
 	node->inode->removexattr_cb = lkpifs_removexattr;
@@ -406,6 +411,22 @@ static void lkpifs_release_subtree(struct vfs_node *node)
 	}
 }
 
+/* Write out what the page cache still holds for this subtree. vfs_umount's own
+ * writeback runs after the umount callback, by which time the handles its
+ * writes would go through are gone: a file written and unmounted without a
+ * sync came back empty. */
+static void lkpifs_flush_subtree(struct vfs_node *node)
+{
+	struct vfs_node *child;
+
+	if (!node)
+		return;
+	for (child = node->first_child; child; child = child->next_sibling)
+		lkpifs_flush_subtree(child);
+	if (node->inode && node_info(node))
+		page_cache_flush_inode(node->inode);
+}
+
 static int lkpifs_umount(struct vfs_node *root)
 {
 	struct lkpifs_node *info = node_info(root);
@@ -414,6 +435,7 @@ static int lkpifs_umount(struct vfs_node *root)
 
 	if (!info)
 		return 0;
+	lkpifs_flush_subtree(root);
 	for (child = root->first_child; child; child = child->next_sibling)
 		lkpifs_release_subtree(child);
 	handle = info->handle;
@@ -510,8 +532,9 @@ static int lkpifs_emit(void *arg, const char *name, int len,
 	 * against; everything else is listed as a plain file, which is what the
 	 * caller's stat then corrects. */
 	f->buf[f->count].type = (u32)(type == 4 ? VFS_DIRECTORY
-	                                        : (type == 10 ? VFS_SYMLINK
-	                                                      : VFS_FILE));
+	                              : type == 10 ? VFS_SYMLINK
+	                              : type == 1 ? VFS_FIFO
+	                                          : VFS_FILE);
 	f->buf[f->count].is_dir = (type == 4);
 	f->buf[f->count].is_exec = 0;
 	f->buf[f->count].size = 0;
@@ -601,6 +624,7 @@ static int lkpifs_create(struct vfs_node *dir, const char *name,
 	}
 	if (child) {
 		child->inode->fs_id = dir->inode->fs_id; /* see lkpifs_lookup */
+		page_cache_invalidate_stale(child->inode);
 		vfs_node_put(child);
 	}
 	return 0;
@@ -624,6 +648,34 @@ static int lkpifs_mkdir(struct vfs_node *dir, const char *name, u32 mode)
 		if (handle) {
 			install_ops(child, handle, info->linux_name);
 		}
+	}
+	if (child) {
+		child->inode->fs_id = dir->inode->fs_id; /* see lkpifs_lookup */
+		vfs_node_put(child);
+	}
+	return 0;
+}
+
+/* A FIFO as a real inode. vfs_mknod has already put the node in place and
+ * keeps its type VFS_FIFO, so opens go to the pipe path; the ops attached
+ * here serve its attributes and its unlink. */
+static int lkpifs_mknod(struct vfs_node *dir, const char *name, u32 mode)
+{
+	struct lkpifs_node *info = node_info(dir);
+	struct vfs_node *child;
+	int rc;
+
+	if (!info || !info->handle || !name)
+		return -EINVAL;
+	rc = lkpi_bridge_mknod(info->handle, name, (mode & 07777u) | 0010000u);
+	if (rc)
+		return rc;
+	child = find_child(dir, name);
+	if (child && child->inode && !node_info(child)) {
+		void *handle = lkpi_bridge_lookup(info->handle, name);
+
+		if (handle)
+			install_ops(child, handle, info->linux_name);
 	}
 	if (child) {
 		child->inode->fs_id = dir->inode->fs_id; /* see lkpifs_lookup */
@@ -799,6 +851,21 @@ static int lkpifs_setattr(struct vfs_node *node)
 	                           node->inode->mtime);
 }
 
+static int lkpifs_fitrim(struct vfs_node *node, u64 start, u64 len, u64 minlen,
+                         u64 *trimmed)
+{
+	void *handle = node_handle(node);
+	unsigned long long t = 0;
+	int rc;
+
+	if (!handle)
+		return -EINVAL;
+	rc = lkpi_bridge_fitrim(handle, start, len, minlen, &t);
+	if (rc == 0)
+		*trimmed = t;
+	return rc;
+}
+
 static int lkpifs_statfs(struct vfs_node *node, struct b1nix_statfs *st)
 {
 	struct lkpi_bridge_statfs b;
@@ -893,10 +960,12 @@ static struct vfs_node *lkpifs_mount_ext4(const char *source, u64 flags,
 	return lkpifs_mount_type("ext4", source, flags);
 }
 
-static struct vfs_fs lkpifs_ext4 = {
-	.name = "ext4-lkpi",
-	.mount = lkpifs_mount_ext4,
-	.umount = lkpifs_umount,
+/* ext4 is also b1nix's ext3 and ext2, as it is Linux's: one driver reads all
+ * three formats, registered under each name so a mount shows the one asked. */
+static struct vfs_fs lkpifs_ext_types[] = {
+	{ .name = "ext4", .mount = lkpifs_mount_ext4, .umount = lkpifs_umount },
+	{ .name = "ext3", .mount = lkpifs_mount_ext4, .umount = lkpifs_umount },
+	{ .name = "ext2", .mount = lkpifs_mount_ext4, .umount = lkpifs_umount },
 };
 #endif
 
@@ -905,8 +974,9 @@ void lkpifs_init(void)
 	vfs_register_fs(&lkpifs_btrfs);
 	klog_info("lkpifs: btrfs registered (imported Linux 6.6 btrfs)");
 #if B1NIX_FS_IMPORT_EXT4
-	vfs_register_fs(&lkpifs_ext4);
-	klog_info("lkpifs: ext4-lkpi registered (imported Linux 6.6 ext4)");
+	for (usize i = 0; i < sizeof(lkpifs_ext_types) / sizeof(lkpifs_ext_types[0]); i++)
+		vfs_register_fs(&lkpifs_ext_types[i]);
+	klog_info("lkpifs: ext4/ext3/ext2 registered (imported Linux 6.6 ext4)");
 #endif
 }
 

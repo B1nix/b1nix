@@ -1089,6 +1089,31 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 	ksym_print(saved_regs[30]);
 	console_write("\n");
 
+	/* The frame chain from x29. The link register names only the innermost
+	 * caller, and a helper like list_del says nothing about who misused it.
+	 * Walked only within the task's kernel stack, so a corrupt fp stops it. */
+	{
+		u64 hi = aarch64_kstack_top();
+		u64 lo = hi > KERNEL_STACK_SIZE ? hi - KERNEL_STACK_SIZE : 0;
+		u64 fp = saved_regs[29];
+
+		console_write("Frames:\n");
+		for (int depth = 0; depth < 16; depth++) {
+			if (fp < lo || fp + 16 > hi || (fp & 7))
+				break;
+			u64 ret = ((u64 *)(usize)fp)[1];
+			u64 next = ((u64 *)(usize)fp)[0];
+
+			console_write("  0x");
+			console_write_hex64(ret);
+			ksym_print(ret);
+			console_write("\n");
+			if (next <= fp)
+				break;
+			fp = next;
+		}
+	}
+
 	panic_at("unhandled synchronous exception", __FILE__, __LINE__);
 }
 

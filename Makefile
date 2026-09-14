@@ -585,10 +585,6 @@ KERNEL_SOURCES := \
 	kernel/fs/inotify.c \
 	kernel/fs/fat/fat32.c \
 	kernel/fs/fat/exfat.c \
-	kernel/fs/ext4/ext2.c \
-	kernel/fs/ext4/ext1.c \
-	kernel/fs/ext4/ext3.c \
-	kernel/fs/ext4/ext4.c \
 	kernel/fs/proc/procfs.c \
 	kernel/fs/ramfs/tmpfs.c \
 	kernel/fs/mount_api.c \
@@ -596,7 +592,6 @@ KERNEL_SOURCES := \
 	kernel/fs/cgroup/cgroup.c \
 	kernel/fs/sysfs/sysfs.c \
 	kernel/fs/sysfs/sysfs_attr.c \
-	kernel/fs/ext4/journal.c \
 	kernel/fs/filelock.c \
 	kernel/fs/fuse/fuse.c \
 	kernel/fs/9p.c \
@@ -1072,7 +1067,8 @@ i915-fetch:
 # The imported filesystems, staged by tools/fs/fetch-linux-fs.sh and never
 # edited, exactly as the DRM import is.
 #
-# btrfs is ON by default when that tree is present, because it IS
+# btrfs and ext4 are ON by default when that tree is present (ext2/3/4 mounts
+# go to the imported ext4; b1nix.native-ext4 keeps the old driver). btrfs IS
 # b1nix's btrfs now: the driver that used to be here was 5000 lines of our own
 # reading of the on-disk format, and the imported one is the format's own
 # implementation, checked by the same self-test and by the host's btrfs check
@@ -1081,13 +1077,13 @@ i915-fetch:
 FS_IMPORT_DIR := build/src/fs-6.6
 FS_IMPORT_GEN := build/src/fs-6.6-gen
 ifneq ($(wildcard $(FS_IMPORT_DIR)/B1NIX-OBJECTS),)
-B1NIX_FS_IMPORT ?= btrfs
+B1NIX_FS_IMPORT ?= 1
 endif
 B1NIX_FS_IMPORT ?= 0
 
-# The two files whose CODE changes with the filesystem-import flags — main.c
-# runs the imported filesystems' entry points, and lkpifs.c registers a type per
-# filesystem in the link.
+# The files whose CODE changes with the filesystem-import flags — main.c
+# runs the imported filesystems' entry points, lkpifs.c registers a type per
+# filesystem in the link, and vfs.c and syscall.c test them too.
 #
 # Their own stamp rather than DRM_FLAGS_STAMP: that hash is computed near the
 # top of this file, before the import block appends -DB1NIX_FS_IMPORT* to
@@ -1107,6 +1103,8 @@ $(FS_IMPORT_FLAGS_STAMP):
 
 $(BUILD_DIR)/kernel/main.o: $(FS_IMPORT_FLAGS_STAMP)
 $(BUILD_DIR)/kernel/fs/lkpifs.o: $(FS_IMPORT_FLAGS_STAMP)
+$(BUILD_DIR)/kernel/fs/vfs.o: $(FS_IMPORT_FLAGS_STAMP)
+$(BUILD_DIR)/kernel/syscall/syscall.o: $(FS_IMPORT_FLAGS_STAMP)
 
 # B1NIX_FS_IMPORT=btrfs builds btrfs and what it stands on; =1 adds ext4 and
 # jbd2. The split is not arbitrary: btrfs needs the VFS, the page cache and the
@@ -2427,7 +2425,7 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(INITRAMFS_MODULES_IN
 	@$(CIC) $(INC_DIR)/.modules-stage/modules.dep $(INC_DIR)/.modules-stage/modules.alias $(INC_DIR)/.modules-stage/modules.builtin $(BUILD_DIR)/rootfs/lib/modules/$(B1NIX_RELEASE)/
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@mkdir -p $(BUILD_DIR)/rootfs/proc $(BUILD_DIR)/rootfs/sys $(BUILD_DIR)/rootfs/mnt
-	@mkdir -p $(BUILD_DIR)/rootfs/mnt/ext1 $(BUILD_DIR)/rootfs/mnt/ext2 $(BUILD_DIR)/rootfs/mnt/ext3 $(BUILD_DIR)/rootfs/mnt/ext4 $(BUILD_DIR)/rootfs/mnt/ext4nvme
+	@mkdir -p $(BUILD_DIR)/rootfs/mnt/ext2 $(BUILD_DIR)/rootfs/mnt/ext3 $(BUILD_DIR)/rootfs/mnt/ext4 $(BUILD_DIR)/rootfs/mnt/ext4nvme
 	@# Only when it is not already that link: recreating it stamps a new
 	@# timestamp on the staging root and repacks the image behind it.
 	@[ "$$(readlink $(BUILD_DIR)/rootfs/persist 2>/dev/null)" = "." ] || \

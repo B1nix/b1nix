@@ -15,6 +15,7 @@
  */
 
 #include <linux/fs.h>
+#include <linux/blkdev.h>
 #include <linux/fileattr.h>
 #include <linux/statfs.h>
 #include <linux/fs_context.h>
@@ -476,6 +477,29 @@ int lkpi_bridge_mkdir(void *dirp, const char *name, unsigned int mode)
 	return ret;
 }
 
+/* A special file: mknod(2) is only used for FIFOs today, which carry no
+ * device number. */
+int lkpi_bridge_mknod(void *dirp, const char *name, unsigned int mode)
+{
+	struct dentry *dir = dirp;
+	struct dentry *d;
+	int ret;
+
+	if (!dir->d_inode->i_op || !dir->d_inode->i_op->mknod)
+		return -EOPNOTSUPP;
+	inode_lock(dir->d_inode);
+	d = bridge_lookup_negative(dir, name);
+	if (IS_ERR(d)) {
+		inode_unlock(dir->d_inode);
+		return (int)PTR_ERR(d);
+	}
+	ret = dir->d_inode->i_op->mknod(&nop_mnt_idmap, dir->d_inode, d,
+	                                (umode_t)mode, 0);
+	dput(d);
+	inode_unlock(dir->d_inode);
+	return ret;
+}
+
 int lkpi_bridge_symlink(void *dirp, const char *name, const char *target)
 {
 	struct dentry *dir = dirp;
@@ -639,6 +663,11 @@ int lkpi_bridge_rename(void *olddirp, const char *oldname, void *newdirp,
 	lock_two_nondirectories(from->d_inode, to->d_inode);
 	ret = olddir->d_inode->i_op->rename(&nop_mnt_idmap, olddir->d_inode, from,
 	                                    newdir->d_inode, to, 0);
+	/* As vfs_rename does: the moved dentry takes the new name. Without it the
+	 * cache still answered the old name with the moved inode, so the next
+	 * create of that name wrote into the file just renamed away. */
+	if (ret == 0 && !(olddir->d_sb->s_type->fs_flags & FS_RENAME_DOES_D_MOVE))
+		d_move(from, to);
 	unlock_two_nondirectories(from->d_inode, to->d_inode);
 	dput(to);
 	dput(from);
@@ -755,6 +784,39 @@ int lkpi_bridge_setattr(void *nodep, unsigned int mode, unsigned int uid,
 	ret = inode->i_op->setattr(&nop_mnt_idmap, d, &attr);
 	inode_unlock(inode);
 	return ret;
+}
+
+/* FITRIM. The ioctl copies its range from user memory, so the filesystems'
+ * own trim entry points are called with a kernel copy instead. */
+/* ext4 is in the link only with B1NIX_FS_IMPORT=1, a flag these objects are
+ * not built with: a weak reference resolves to NULL without it. */
+int ext4_trim_fs(struct super_block *sb, struct fstrim_range *range) __attribute__((weak));
+struct btrfs_fs_info;
+int btrfs_trim_fs(struct btrfs_fs_info *fs_info, struct fstrim_range *range);
+
+int lkpi_bridge_fitrim(void *nodep, unsigned long long start,
+                       unsigned long long len, unsigned long long minlen,
+                       unsigned long long *trimmed)
+{
+	struct dentry *d = nodep;
+	struct super_block *sb = d ? d->d_sb : NULL;
+	struct fstrim_range range = {.start = start, .len = len, .minlen = minlen};
+	int ret = -EOPNOTSUPP;
+
+	if (!sb || !sb->s_type || !sb->s_bdev || !trimmed)
+		return -EINVAL;
+	if (!bdev_max_discard_sectors(sb->s_bdev))
+		return -EOPNOTSUPP;
+	if (sb_rdonly(sb))
+		return -EROFS;
+	if (strcmp(sb->s_type->name, "btrfs") == 0)
+		ret = btrfs_trim_fs(sb->s_fs_info, &range);
+	else if (strcmp(sb->s_type->name, "ext4") == 0 && ext4_trim_fs)
+		ret = ext4_trim_fs(sb, &range);
+	if (ret < 0)
+		return ret;
+	*trimmed = range.len;
+	return 0;
 }
 
 int lkpi_bridge_statfs(void *nodep, struct lkpi_bridge_statfs *out)

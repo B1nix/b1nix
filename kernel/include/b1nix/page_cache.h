@@ -91,6 +91,7 @@ int page_cache_flush_inode(struct vfs_inode *inode);
 
 // Drop cached pages for an inode that is being destroyed.
 void page_cache_invalidate_inode(struct vfs_inode *inode);
+void page_cache_invalidate_stale(struct vfs_inode *inode);
 
 // Truncate-time invalidation: drop pages at/after new_size and zero the tail
 // of the partial page so a later re-grow reads zeros, not stale contents.

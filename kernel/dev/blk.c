@@ -2447,8 +2447,7 @@ static void blk_flush_matching(struct block_device *dev, u64 first, u64 last,
  *
  * fsync issued two barriers per call: one from the filesystem's fsync_cb and
  * one from here. Two is one too many, and the first of them was issued BEFORE
- * the writeback it was supposed to make durable -- ext4_vfs_fsync's own comment
- * describes the order the code did not have. Splitting the barrier off lets
+ * the writeback it was supposed to make durable. Splitting the barrier off lets
  * vfs_fsync put the writeback first and pay for exactly one. */
 int blk_cache_writeback_inode(struct block_device *dev, u32 fsid, u64 ino) {
   if (!dev)

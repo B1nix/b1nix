@@ -1168,7 +1168,16 @@ int sb_is_blkdev_sb(struct super_block *sb)
 	return 0;
 }
 
+/* A block device's own inode belongs to no mounted superblock -- upstream it
+ * lives on the bdev pseudo-filesystem and answers with its disk's bdi. ext4
+ * asks that of bd_inode on every superblock commit, and NULL faulted there. */
+extern struct backing_dev_info lkpi_default_bdi;
+
 struct backing_dev_info *inode_to_bdi(struct inode *inode)
 {
-	return inode && inode->i_sb ? inode->i_sb->s_bdi : NULL;
+	if (!inode)
+		return NULL;
+	if (inode->i_sb && inode->i_sb->s_bdi)
+		return inode->i_sb->s_bdi;
+	return &lkpi_default_bdi;
 }

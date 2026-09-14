@@ -193,7 +193,7 @@ static struct device lkpi_bdi_device = {
 	.kobj = { .name = "lkpi-fs" },
 };
 
-static struct backing_dev_info lkpi_default_bdi = {
+struct backing_dev_info lkpi_default_bdi = {
 	.dev = &lkpi_bdi_device,
 	/* 32 pages of read-ahead: the same window b1nix's block layer uses by
 	 * default. A filesystem that knows better — btrfs, from its stripe

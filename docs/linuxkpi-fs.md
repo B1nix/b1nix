@@ -25,8 +25,8 @@ All three are GPL-2.0-only like b1nix (see `THIRD_PARTY_NOTICES.md`).
 
 | Value | Links | Default |
 |---|---|---|
-| `btrfs` | btrfs + iomap/maple_tree/compression libs | x86_64 when `build/src/fs-6.6/B1NIX-OBJECTS` exists |
-| `1` | additionally ext4, jbd2, mbcache (`-DB1NIX_FS_IMPORT_EXT4=1`) | — |
+| `btrfs` | btrfs + iomap/maple_tree/compression libs | — |
+| `1` | additionally ext4, jbd2, mbcache (`-DB1NIX_FS_IMPORT_EXT4=1`) | when `build/src/fs-6.6/B1NIX-OBJECTS` exists |
 | `0` | nothing | otherwise |
 
 Both non-zero values also build `kernel/fs/lkpifs.c`. The imported code gets
@@ -40,8 +40,8 @@ warnings; shim files keep full `-Wall -Wextra`. b1nix's `u64` is
 `kernel/fs/lkpifs.c` registers imported filesystems with b1nix's VFS:
 
 - `btrfs` — the imported btrfs **is** b1nix's btrfs; there is no native driver.
-- `ext4-lkpi` — imported ext4 (only with `B1NIX_FS_IMPORT=1`); the native
-  `ext4` driver keeps its name.
+- `ext4`, `ext3`, `ext2` — the imported ext4 under each name (only with
+  `B1NIX_FS_IMPORT=1`); there is no native driver either.
 
 The bridge is split because the two VFS models cannot share a translation unit:
 `kernel/lkpi/fs_bridge.c` (Linux side) performs operations and returns opaque
@@ -77,10 +77,10 @@ shim follow because a root exercised them:
 |---|---|
 | `b1nix.lkpi-btrfs-test=<dev>` | `kernel/lkpi/fs_mount_test.c`: mount, read, RW ops, unmount directly through the Linux API |
 | `b1nix.lkpi-bridge-test=<dev>` | `lkpifs_selftest()`: the same through b1nix paths under `/mnt/lkpi` |
-| `b1nix.lkpi-ext4-test=<dev>` | bridge self-test over `ext4-lkpi` |
+| `b1nix.lkpi-ext4-test=<dev>` | bridge self-test over the imported `ext4` |
 
 Images: `tools/fs/make-lkpi-image.sh btrfs|ext4`
-(ext4 keeps features the native driver cannot read). The judge is the host:
+(ext4 with the full default feature set). The judge is the host:
 `btrfs check` / `btrfs restore`, `e2fsck -fn`. The smoke `blk` lane mounts a
 `mkfs.btrfs` image through the imported driver (`M119-BTRFS:` markers).
 

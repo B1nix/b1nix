@@ -265,7 +265,8 @@ Upstream Linux 6.6 `fs/btrfs`, `fs/ext4`, `fs/jbd2` built unpatched on our shim.
 - [x] `initial` btrfs mount/read/write verified by host `btrfs check`; `mount -t btrfs-lkpi` bridges b1nix VFS to it.
 - [x] The root filesystem is the imported btrfs (`mkfs.btrfs --rootdir`; `ROOT_FS=ext4` still builds the old image). x86_64 smoke 1419/1 on it. Bugs a real root exposed: out-of-order spinlock release re-enabled IRQs, `schedule()` spun instead of sleeping, linked inodes evicted with their delalloc data, lookup nodes shared page-cache keys, preempt count per CPU. Detail in [linuxkpi-fs.md](linuxkpi-fs.md).
 - [x] aarch64 root on the imported btrfs too (1364/2, both fails the native ext4 data disk). Fixed on the way: user page faults read with IRQs on, the workqueue no longer touches a finished work item, `set_mask_bits` writes its target's width.
-- [ ] `planned` Move ext4 to Linux's ext4 through lkpi and retire the native driver (the M14 data disks and `ROOT_FS=ext4`); needs buffer-head write helpers (`block_page_mkwrite` is still `-EOPNOTSUPP`).
+- [x] ext2/3/4 are the imported ext4; the native ext1/2/3/4 + journal drivers (5000 lines) are gone. x86_64 1424/0, aarch64 1366/0. Bugs it exposed: rename skipped `d_move`, a reused inode number served the dead file's cached pages, umount dropped unflushed pages, a bdev inode had no bdi.
+- [ ] `open` aarch64 blk lane, 1 run in 3: double `list_del` (poison 0x100/0x200) in a jbd2 thread during the M14 churn test.
 
 ## M121: Kernel only
 

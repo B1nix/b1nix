@@ -30,13 +30,9 @@
 #include <b1nix/blk.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/tlb.h>
-#include <b1nix/ext2.h>
-#include <b1nix/ext1.h>
 #include <b1nix/fat32.h>
 #include <b1nix/exfat.h>
 #include <b1nix/ntfs.h>
-#include <b1nix/ext3.h>
-#include <b1nix/ext4.h>
 #include <b1nix/btrfs.h>
 #include <b1nix/fuse.h>
 #include <b1nix/fwcfgfs.h>
@@ -284,15 +280,6 @@ static int mount_root_as_probed(const char *dev_name, const char **type_out)
 	struct block_device *dev = blk_get(dev_name);
 	const char *probed = dev ? blk_probe_fstype(dev) : "-";
 
-#if B1NIX_FS_IMPORT_EXT4
-	/* An ext2/3/4 root goes to Linux's own ext4 when it is built in;
-	 * b1nix.native-ext4 keeps the native driver. */
-	if (strncmp(probed, "ext", 3) == 0 && !bootinfo_has_flag("b1nix.native-ext4") &&
-	    vfs_mount(dev_name, "/", "ext4-lkpi", 0) == 0) {
-		*type_out = "ext4-lkpi";
-		return 0;
-	}
-#endif
 	if (probed[0] != '-' && vfs_mount(dev_name, "/", probed, 0) == 0) {
 		*type_out = probed;
 		return 0;
@@ -737,11 +724,7 @@ void kernel_main(usize arg0, usize arg1)
 
 	vfs_init();
 	BOOTMARK(13);	/* VFS */
-	ext2_init();
-	ext1_init();
-	ext3_init();
 	fat32_init();
-	ext4_init();
 #ifdef __aarch64__
 	/* Walk the bus and give every device an address before any driver looks
 	 * for one. On a PC the firmware has already done this; nothing runs
@@ -1638,7 +1621,7 @@ void kernel_main(usize arg0, usize arg1)
 				 * hangs" into a function name. */
 				kthread_create("lkpi-mount-watch",
 				               lkpi_btrfs_mount_watch_thread, 0);
-				lkpifs_selftest_type(lkpi_bridge_dev, "ext4-lkpi",
+				lkpifs_selftest_type(lkpi_bridge_dev, "ext4",
 				                     "/mnt/lkpi-ext4");
 			}
 #endif
