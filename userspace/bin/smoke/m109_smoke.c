@@ -2685,9 +2685,29 @@ static int probe_super(const char *dev, char *uuid, size_t uuidcap, char *label,
     close(fd);
     return -1;
   }
+  if (sb[0x38] != 0x53 || sb[0x39] != 0xEF) {
+    /* Not ext2/3/4: a btrfs superblock sits at 64 KiB, magic at 0x40, fsid at
+     * 0x20 and the label at 0x12b. */
+    unsigned char bs[0x22b];
+    int ok = lseek(fd, 0x10000, SEEK_SET) == 0x10000 &&
+             read(fd, bs, sizeof(bs)) == (ssize_t)sizeof(bs) &&
+             memcmp(bs + 0x40, "_BHRfS_M", 8) == 0;
+    close(fd);
+    if (!ok)
+      return -1;
+    const unsigned char *u = bs + 0x20;
+    snprintf(uuid, uuidcap,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+             "%02x%02x%02x%02x%02x%02x",
+             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10],
+             u[11], u[12], u[13], u[14], u[15]);
+    char bl[257];
+    memcpy(bl, bs + 0x12b, 256);
+    bl[256] = '\0';
+    snprintf(label, labelcap, "%s", bl);
+    return 0;
+  }
   close(fd);
-  if (sb[0x38] != 0x53 || sb[0x39] != 0xEF)
-    return -1; /* not ext2/3/4 */
 
   const unsigned char *u = sb + 0x68;
   snprintf(uuid, uuidcap,
@@ -2717,7 +2737,7 @@ static int list_disks(char disks[][64], int max) {
  * first decided what the other saw — a path there, a bare name here. */
 static char g_fs_dev[64], g_fs_uuid[128], g_fs_label[128];
 
-/* Find a disk carrying an ext filesystem, and what its superblock says. */
+/* Find a disk carrying an ext or btrfs filesystem, and what its superblock says. */
 static int probe_disk(void) {
   static char disks[32][64];
   int ndisks = list_disks(disks, 32);
@@ -3581,6 +3601,7 @@ static void test_ioprio_applet(void) {
   ok("ioprio-applet");
 }
 
+#if !defined(__aarch64__) /* QEMU virt has no COM2: see the call site */
 /* ── 5. serial line configuration ───────────────────────────────────────── */
 
 /* COM2. The boot console is COM1, and reprogramming the line the log travels
@@ -3751,6 +3772,7 @@ static void test_serial_setserial(void) {
   close(fd);
   ok("serial-setserial");
 }
+#endif /* !__aarch64__ */
 
 /* ── derived limits ─────────────────────────────────────────────────────────
  * These two checks exist to show that a ceiling which used to be compiled in is

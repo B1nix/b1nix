@@ -309,23 +309,6 @@ usize memweight(const void *ptr, usize bytes)
 	return n;
 }
 
-/* Set some bits and clear others in one atomic step, reporting whether the
- * word changed. Two operations would let a reader see the half-updated value —
- * for an inode's flags, a file briefly neither immutable nor mutable. */
-int set_mask_bits(unsigned long *ptr, unsigned long mask, unsigned long bits)
-{
-	unsigned long old, new;
-
-	do {
-		old = __atomic_load_n(ptr, __ATOMIC_RELAXED);
-		new = (old & ~mask) | bits;
-		if (new == old)
-			return 0;
-	} while (!__atomic_compare_exchange_n(ptr, &old, new, 0, __ATOMIC_ACQ_REL,
-	                                      __ATOMIC_RELAXED));
-	return 1;
-}
-
 /* ── rate limiting and reports ──────────────────────────────────── */
 
 /*

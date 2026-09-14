@@ -4469,8 +4469,14 @@ static u64 syscall_sleep_timespec(const struct timespec *ts, u64 *ticks_asked) {
       break;
     u64 rest_ticks = (deadline_ns - now_ns) / tick_ns;
     if (!rest_ticks) {
-      scheduler_yield();
-      continue;
+      /* Spin a millisecond at most. At 1 kHz that is every tail; at a slower
+       * tick a sub-tick sleep spun whole -- usleep(2000) at 100 Hz was 2 ms of
+       * CPU -- so a longer tail sleeps one tick instead: late, never early. */
+      if (deadline_ns - now_ns <= 1000000ULL) {
+        scheduler_yield();
+        continue;
+      }
+      rest_ticks = 1;
     }
     /* Ask the scheduler to sleep and let IT decide whether this task may:
      * reading our own state here and calling on the answer is a race, because

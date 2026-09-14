@@ -330,7 +330,25 @@ unsigned long long memparse(const char *ptr, char **retptr);
  * word changed. Two separate operations would let a concurrent reader see the
  * half-updated value — which for an inode's flags is a file that is briefly
  * neither immutable nor mutable. */
-bool set_mask_bits(unsigned long *ptr, unsigned long mask, unsigned long bits);
+/*
+ * Type-generic, as upstream's macro is. A function on unsigned long took
+ * &inode->i_flags -- an unsigned int -- and compare-exchanged eight bytes over
+ * a four-byte field: the neighbour was overwritten on x86_64, and aarch64's
+ * exclusive load faulted on the alignment.
+ */
+#define set_mask_bits(ptr, mask, bits)                                         \
+	({                                                                         \
+		const typeof(*(ptr)) mask__ = (mask), bits__ = (bits);                 \
+		typeof(*(ptr)) old__, new__;                                           \
+		do {                                                                   \
+			old__ = __atomic_load_n((ptr), __ATOMIC_RELAXED);                  \
+			new__ = (old__ & ~mask__) | bits__;                                \
+		} while (new__ != old__ &&                                             \
+		         !__atomic_compare_exchange_n((ptr), &old__, new__, 0,         \
+		                                      __ATOMIC_ACQ_REL,                 \
+		                                      __ATOMIC_RELAXED));              \
+		new__;                                                                 \
+	})
 
 /* Print the current call stack. Real: it is what a filesystem calls when it
  * finds an inconsistency it is going to continue past, and a silent version

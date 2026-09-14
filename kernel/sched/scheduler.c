@@ -5204,11 +5204,15 @@ void scheduler_wait_commit(void) {
    * the existing rule visible.
    */
   if (!switched && current_task && current_task->wait_irq_was_on) {
+    /* The halted span is idle time, yet current_task still names the waiter:
+     * close its interval now and drop the span, or the next flush bills it. */
+    sched_acct_leave_kernel();
 #if defined(__x86_64__)
     __asm__ volatile("sti; hlt" : : : "memory");
 #elif defined(__aarch64__)
     __asm__ volatile("msr daifclr, #2; wfi" : : : "memory");
 #endif
+    sched_acct_skip_idle();
   }
   /* Drop any unfired deadline armed by scheduler_wait_prepare_timeout: an
    * explicit wake_all may have resumed us before it elapsed, and a stale
@@ -5530,7 +5534,10 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
         if (st == TASK_READY || st == TASK_DEAD || st == TASK_REAPING)
           break;
       }
+      /* Idle, not the sleeper's CPU time: see scheduler_wait_commit. */
+      sched_acct_leave_kernel();
       interrupts_enable_and_wait();
+      sched_acct_skip_idle();
     }
   }
   current_task->state = TASK_RUNNING;
@@ -6202,6 +6209,13 @@ void sched_acct_leave_kernel(void) {
   if (!scheduler_started)
     return;
   acct_flush(current_task, 0);
+}
+
+void sched_acct_skip_idle(void) {
+  struct percpu *pcpu = get_percpu();
+  if (!scheduler_started || !pcpu || pcpu->cpu_id >= MAX_CPUS)
+    return;
+  g_acct_stamp[pcpu->cpu_id] = acct_rdtsc();
 }
 
 void sched_acct_on_switch(struct task *prev) {

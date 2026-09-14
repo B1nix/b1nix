@@ -440,6 +440,7 @@ u64  task_nivcsw(const struct task *t);
  * scheduler's context switch. */
 void sched_acct_enter_kernel(void);
 void sched_acct_leave_kernel(void);
+void sched_acct_skip_idle(void);
 void sched_acct_on_switch(struct task *prev);
 /* Last userspace RIP at the moment the LAPIC timer tick preempted this task
  * (0 for kernel tasks / never-preempted). Watchdog diagnostic: names the user

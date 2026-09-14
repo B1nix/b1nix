@@ -1061,6 +1061,7 @@ void hda_init(void) {
 	}
 	if (!found)
 		return;
+	pci_bind_driver(&pci, "snd_hda_intel");
 
 	/* Enable memory space + bus master */
 	u16 cmd = pci_config_read16(pci.bus, pci.slot, pci.func, 0x04);

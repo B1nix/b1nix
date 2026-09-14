@@ -22,6 +22,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
+#include <b1nix/spinlock.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/posix.h>
 #include <b1nix/vfs.h>
@@ -209,6 +210,9 @@ static void apply_attr(struct vfs_node *node, const struct lkpi_bridge_attr *a)
 	node->inode->atime = a->atime;
 	node->inode->mtime = a->mtime;
 	node->inode->ctime = a->ctime;
+	node->inode->atime_nsec = a->atime_nsec;
+	node->inode->mtime_nsec = a->mtime_nsec;
+	node->inode->ctime_nsec = a->ctime_nsec;
 	/* The attribute byte the VFS enforces (immutable, append-only) is the
 	 * filesystem's; keep the rest of attr, which the VFS owns. */
 	node->inode->attr = (node->inode->attr & ~VFS_ATTR_USER_MASK) |
@@ -298,6 +302,43 @@ static struct vfs_node *make_node(void *handle, const char *name,
 
 /* ── mounting ───────────────────────────────────────────────────── */
 
+/* Mounted roots, for sync(2). The VFS's own sync only reaches filesystems it
+ * knows by name and the block cache; an imported filesystem keeps its changes
+ * in a transaction until its sync_fs commits it, so without this a sync left
+ * everything since the last periodic commit off the disk. */
+#define LKPIFS_MAX_MOUNTS 32
+static void *g_lkpifs_roots[LKPIFS_MAX_MOUNTS];
+static spinlock_t g_lkpifs_roots_lock = SPINLOCK_INIT;
+
+static void lkpifs_roots_set(void *old, void *new)
+{
+	u64 flags;
+
+	spin_lock_irqsave(&g_lkpifs_roots_lock, &flags);
+	for (int i = 0; i < LKPIFS_MAX_MOUNTS; i++)
+		if (g_lkpifs_roots[i] == old) {
+			g_lkpifs_roots[i] = new;
+			break;
+		}
+	spin_unlock_irqrestore(&g_lkpifs_roots_lock, flags);
+}
+
+void lkpifs_sync_all(void)
+{
+	for (int i = 0; i < LKPIFS_MAX_MOUNTS; i++) {
+		u64 flags;
+		void *root;
+
+		spin_lock_irqsave(&g_lkpifs_roots_lock, &flags);
+		root = g_lkpifs_roots[i];
+		spin_unlock_irqrestore(&g_lkpifs_roots_lock, flags);
+		/* sync_fs sleeps; an unmount racing a sync is the caller's to
+		 * exclude, as on Linux (the mount is busy while synced). */
+		if (root)
+			lkpi_bridge_sync_fs(root);
+	}
+}
+
 static struct vfs_node *lkpifs_mount_type(const char *linux_name,
                                           const char *source, u64 flags)
 {
@@ -327,6 +368,7 @@ static struct vfs_node *lkpifs_mount_type(const char *linux_name,
 		lkpi_bridge_unmount(root_handle);
 		return ERR_PTR(-ENOMEM);
 	}
+	lkpifs_roots_set(0, root_handle);
 	/* The root's handle belongs to the mount, not to the node: releasing it
 	 * is an unmount, which umount_cb does. */
 	snprintf(msg, sizeof(msg), "lkpifs: mounted %s from %s (imported %s)",
@@ -376,8 +418,10 @@ static int lkpifs_umount(struct vfs_node *root)
 		lkpifs_release_subtree(child);
 	handle = info->handle;
 	info->handle = 0;
-	if (handle)
+	if (handle) {
+		lkpifs_roots_set(handle, 0);
 		lkpi_bridge_unmount(handle);
+	}
 	return 0;
 }
 

@@ -305,8 +305,12 @@ struct bio_vec bio_iter_iovec(struct lkpi_bio *bio, struct bvec_iter iter)
 
 /* ── completion and chaining ────────────────────────────────────── */
 
+/* BIO_CHAIN's bit in bi_flags (enum order in <linux/blk_types.h>). */
+#define LKPI_BIO_CHAIN 4
+
 void bio_inc_remaining(struct lkpi_bio *bio)
 {
+	bio->bi_flags |= (1U << LKPI_BIO_CHAIN);
 	__atomic_fetch_add(&bio->__bi_remaining, 1, __ATOMIC_ACQ_REL);
 }
 
@@ -335,9 +339,19 @@ void bio_endio(struct lkpi_bio *bio)
 {
 	if (!bio)
 		return;
-	/* Not finished while a chained child is still outstanding. */
-	if (__atomic_sub_fetch(&bio->__bi_remaining, 1, __ATOMIC_ACQ_REL) > 0)
-		return;
+	/*
+	 * Not finished while a chained child is still outstanding -- but the
+	 * count means something only on a bio that was chained, as upstream's
+	 * bio_remaining_done has it. Decrementing it on every call broke a bio
+	 * whose completion runs bio_endio more than once: the count went through
+	 * zero, end_io ran twice, the bio was put twice, and the second
+	 * decrement landed in a freed btrfs_bio.
+	 */
+	if (bio->bi_flags & (1U << LKPI_BIO_CHAIN)) {
+		if (__atomic_sub_fetch(&bio->__bi_remaining, 1, __ATOMIC_ACQ_REL) > 0)
+			return;
+		bio->bi_flags &= (unsigned short)~(1U << LKPI_BIO_CHAIN);
+	}
 	if (bio->bi_end_io)
 		bio->bi_end_io(bio);
 }

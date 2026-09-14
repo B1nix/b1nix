@@ -303,13 +303,8 @@ endif
 # with the archive timestamps it left with, so the image is found up to date.
 # It also means a KDE image survives a smoke run: tools/run/run-kde.sh boots it as
 # a disk with no rebuild.
-# Root filesystem type: btrfs (imported) or ext4. aarch64 stays on ext4 until
-# the imported btrfs is stable there (docs/roadmap.md M120).
-ifeq ($(ARCH),aarch64)
-ROOT_FS ?= ext4
-else
+# Root filesystem type: btrfs (imported) or ext4.
 ROOT_FS ?= btrfs
-endif
 ROOT_IMAGE := $(BUILD_DIR)/root$(ROOT_VARIANT).img
 CURL_ELF := $(PKGROOT)/usr/bin/curl
 DROPBEAR_ELF := $(PKGROOT)/usr/sbin/dropbear

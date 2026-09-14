@@ -45,6 +45,7 @@ int virtio_init_device(struct virtio_device *dev, u16 vendor, u16 device)
 
 	// Acknowledge and Driver
 	virtio_set_status(dev, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+	pci_bind_driver(&pci_info, "virtio-pci");
 
 	return 1;
 }

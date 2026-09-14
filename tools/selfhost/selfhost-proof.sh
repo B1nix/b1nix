@@ -54,6 +54,8 @@ if [ "${SELFHOST_DISK:-0}" = "1" ]; then
 else
 	CMDLINE="$MODE_FLAG b1nix.selfhostbuild"
 fi
+# SELFHOST_CMDLINE_EXTRA appends kernel flags (b1nix.pmm-poison, ...).
+CMDLINE="$CMDLINE ${SELFHOST_CMDLINE_EXTRA:-}"
 echo "=== [1] pack self-contained ISO (cmdline: $CMDLINE) ==="
 ISODIR="$OUT/iso"
 rm -rf "$ISODIR"

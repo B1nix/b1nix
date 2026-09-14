@@ -563,4 +563,14 @@ rm -rf /tmp/bb_dir/w2
 [ ! -d /tmp/bb_dir ] && echo "BB-SMOKE: ok rmdir"
 echo "BB-SMOKE: done"
 fi
+# M114: a device a driver claimed carries the binding both ways.
+for d in /sys/bus/pci/devices/*; do
+  [ -L "$d/driver" ] || continue
+  drv=$(basename "$(readlink "$d/driver")")
+  if [ -L "/sys/bus/pci/drivers/$drv/$(basename "$d")" ] &&
+     [ -e "$d/driver/$(basename "$d")/vendor" ]; then
+    echo "M114-SMOKE: ok pci-driver-link $drv"
+    break
+  fi
+done
 echo "POSIX-SMOKE: done"

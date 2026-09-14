@@ -1841,3 +1841,30 @@ void pci_sysfs_publish_all(void) {
 		}
 	}
 }
+
+/* A driver has taken this function: publish the binding the way Linux does,
+ * `driver` in the device's directory and the device under
+ * /sys/bus/pci/drivers/<name>/. udev, lspci -k and anything asking "which
+ * driver runs this card" read those two links; without them every device
+ * looked unclaimed. */
+void pci_bind_driver(const struct pci_device_info *pci, const char *driver) {
+	char slotname[20], target[128];
+
+	if (!pci || !driver || !driver[0])
+		return;
+	snprintf(slotname, sizeof(slotname), "%04x:%02x:%02x.%u", 0,
+	         (unsigned)pci->bus, (unsigned)pci->slot, (unsigned)pci->func);
+	struct sysfs_dir *devices = sysfs_reg_dir(0, "devices");
+	struct sysfs_dir *root = sysfs_reg_dir(devices, "pci0000:00");
+	struct sysfs_dir *dev = sysfs_reg_dir(root, slotname);
+	struct sysfs_dir *bus = sysfs_reg_dir(sysfs_reg_dir(0, "bus"), "pci");
+	struct sysfs_dir *drv = sysfs_reg_dir(sysfs_reg_dir(bus, "drivers"), driver);
+
+	if (!dev || !drv || sysfs_reg_find(dev, "driver"))
+		return;
+	snprintf(target, sizeof(target), "../../../bus/pci/drivers/%s", driver);
+	(void)sysfs_reg_link(dev, "driver", target);
+	snprintf(target, sizeof(target), "../../../../devices/pci0000:00/%s",
+	         slotname);
+	(void)sysfs_reg_link(drv, slotname, target);
+}

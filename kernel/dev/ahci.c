@@ -848,6 +848,7 @@ void ahci_init(void) {
     return;
   }
 
+  pci_bind_driver(&pci, "ahci");
   console_write("ahci: found controller v=0x");
   console_write_hex32(pci.vendor_id);
   console_write(" d=0x");

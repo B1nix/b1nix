@@ -7648,6 +7648,13 @@ int vfs_sync(void) {
   /* Flush in-memory filesystem structures to block cache first */
   ext2_sync_all_fs();
   fat32_sync_all_fs();
+#ifdef B1NIX_FS_IMPORT
+  {
+    /* Imported filesystems commit their own transactions. */
+    extern void lkpifs_sync_all(void);
+    lkpifs_sync_all();
+  }
+#endif
 
   /* Then flush the entire block cache to physical hardware */
   blk_sync_all();

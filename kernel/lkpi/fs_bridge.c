@@ -214,6 +214,9 @@ int lkpi_bridge_attr(void *nodep, struct lkpi_bridge_attr *out)
 	out->atime = (unsigned long long)inode->i_atime.tv_sec;
 	out->mtime = (unsigned long long)inode->i_mtime.tv_sec;
 	out->ctime = (unsigned long long)inode_get_ctime(inode).tv_sec;
+	out->atime_nsec = (unsigned int)inode->i_atime.tv_nsec;
+	out->mtime_nsec = (unsigned int)inode->i_mtime.tv_nsec;
+	out->ctime_nsec = (unsigned int)inode_get_ctime(inode).tv_nsec;
 	out->blocks = (unsigned long long)inode->i_blocks;
 	out->flags = 0;
 	if (inode->i_op && inode->i_op->fileattr_get) {
@@ -331,6 +334,10 @@ int lkpi_bridge_sync_fs(void *rootp)
 	if (!root)
 		return -EINVAL;
 	sb = root->d_sb;
+	/* In sync(2)'s order: the dirty data first, then the commit. btrfs keeps
+	 * written data as delalloc until writeback, and a commit alone put a
+	 * file's size on the disk with nothing in its extents. */
+	sync_inodes_sb(sb);
 	if (sb->s_op && sb->s_op->sync_fs)
 		return sb->s_op->sync_fs(sb, 1);
 	return 0;

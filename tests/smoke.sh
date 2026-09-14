@@ -920,7 +920,7 @@ _mkimg() {  # mkimg <instance-suffix>
             # from two separate changes that were each correct alone.
             touch "$_sata"
         else
-            ROOT_FS="${ROOT_FS:-ext4}" sh "$PROJECT_DIR/tools/images/mk-root-image.sh" "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512 >/dev/null || {
+            ROOT_FS="${ROOT_FS:-btrfs}" sh "$PROJECT_DIR/tools/images/mk-root-image.sh" "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512 >/dev/null || {
                 echo "Error: Failed to build aarch64 rootfs image."; exit 1
             }
             rm -f "$_sata.manifest"
@@ -2146,6 +2146,7 @@ check_output "$LOG" "EXT-STRESS: start" "EXT-STRESS starts"
 check_output "$LOG" "M24-STRESS: start" "M24 scheduler stress starts"
 check_output "$LOG" "ok eloop" "circular symlink returns ELOOP"
 check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete"
+check_output "$LOG" "M114-SMOKE: ok pci-driver-link" "a PCI function a driver claimed has a driver link, and the driver's directory lists it back"
 
 check_output "$LOG" "M22-POLISH: start" "M22 Polish starts"
 check_output "$LOG" "M22-POLISH: ok utility-flags" "M22 Polish utility flags verify"

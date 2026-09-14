@@ -490,6 +490,7 @@ int e1000_probe(void)
 	}
 	if (!found)
 		return 0;
+	pci_bind_driver(&pci, "e1000");
 
 	/* Enable memory space + bus-master, and make sure INTx delivery is not
 	 * disabled: firmware can leave PCI command bit 10 set, and then the device

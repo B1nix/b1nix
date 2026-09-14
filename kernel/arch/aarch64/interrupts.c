@@ -578,6 +578,13 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 				watchdog_tick();
 				serial_tty_tick();
 				scheduler_on_timer_tick();
+			} else if ((frame->spsr & 0xFULL) == 0) {
+				/* A secondary preempts only a tick that landed in EL0,
+				 * as x86_64 does: user code holds no kernel lock, and
+				 * without this a hog on a secondary ignored nice and a
+				 * sched_setaffinity that moved it away. */
+				extern void scheduler_preempt_user_ap(void);
+				scheduler_preempt_user_ap();
 			}
 		}
 		irq_return_to_user(frame);

@@ -215,7 +215,7 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 - [x] Debian systemd 252 reaches `graphical.target` (32/32 checks; `make systemd-image`, `make systemd-smoke`).
 - [x] cgroup v2 (`pids` enforced only), mount propagation/bind/remount, real devtmpfs; ~40 Linux-ABI defects fixed.
 - [x] Debian Weston draws on `/dev/dri/card1` ([image](images/m112-debian-weston.png)), `tests/debian-graphics-smoke.sh` 12 checks.
-- [ ] `partial` PCI topology under `/sys/devices` published, but no `driver` link (kernel records no binding).
+- [x] PCI functions claimed by virtio, AHCI, e1000, HDA and xHCI carry `driver` links both ways (`M114-SMOKE: ok pci-driver-link`).
 - Note: `tests/systemd-smoke.sh` does not rebuild `debian-systemd.ext4`; run `PROFILE=systemd sh tools/images/mk-debian-image.sh` first.
 
 ## M113: KDE Plasma
@@ -264,7 +264,7 @@ Upstream Linux 6.6 `fs/btrfs`, `fs/ext4`, `fs/jbd2` built unpatched on our shim.
 - [x] 105 imported TUs link (`B1NIX_FS_IMPORT=btrfs`, `=1` adds ext4).
 - [x] `initial` btrfs mount/read/write verified by host `btrfs check`; `mount -t btrfs-lkpi` bridges b1nix VFS to it.
 - [x] The root filesystem is the imported btrfs (`mkfs.btrfs --rootdir`; `ROOT_FS=ext4` still builds the old image). x86_64 smoke 1419/1 on it. Bugs a real root exposed: out-of-order spinlock release re-enabled IRQs, `schedule()` spun instead of sleeping, linked inodes evicted with their delalloc data, lookup nodes shared page-cache keys, preempt count per CPU. Detail in [linuxkpi-fs.md](linuxkpi-fs.md).
-- [ ] `partial` aarch64 root on the imported btrfs: user page faults now read with IRQs on, but three lanes still hit memory corruption (page-cache LRU, `end_bio_extent_readpage` NULL, `set_mask_bits` alignment). aarch64 keeps an ext4 root meanwhile (1359/3).
+- [x] aarch64 root on the imported btrfs too (1364/2, both fails the native ext4 data disk). Fixed on the way: user page faults read with IRQs on, the workqueue no longer touches a finished work item, `set_mask_bits` writes its target's width.
 - [ ] `planned` Move ext4 to Linux's ext4 through lkpi and retire the native driver (the M14 data disks and `ROOT_FS=ext4`); needs buffer-head write helpers (`block_page_mkwrite` is still `-EOPNOTSUPP`).
 
 ## M121: Kernel only
@@ -277,7 +277,7 @@ Upstream Linux 6.6 `fs/btrfs`, `fs/ext4`, `fs/jbd2` built unpatched on our shim.
 - [x] Own native clang/Rust toolchain builds and the `b1nix-pkgs` download removed; nothing third-party is built from source.
 - [x] Self-host (M26) on Alpine's clang17/lld with the host build's own per-TU commands: 653/653 compile and the link succeeds in-guest.
 - [x] execve no longer drops arguments past 256 (a 684-argument link ran on the first 256 objects); oversized vectors are E2BIG.
-- [ ] `partial` The self-hosted kernel.elf did not boot: native ext4 lost data written into a file extended by ftruncate (`M14-SMOKE: ext4-shared-mmap-durable` still fails on the native-ext4 data disk). The build disk is btrfs now; boot of the guest-built kernel not yet re-run.
+- [x] The kernel built in-guest boots: on a btrfs build disk, extracted with `btrfs restore`, it mounts the btrfs root and runs userspace (`tools/selfhost/selfhost-proof.sh`, 653/653 in ~5 min). It took `sync(2)` writing out and committing imported filesystems, and a workqueue that no longer touches a freed work item.
 - [x] aarch64 builds the imported btrfs and prints debug tracing on test boots (the M40 personality line).
 - [ ] `partial` aarch64 smoke 1357/0, but one run in two wedged sys/posix: READY tasks not picked and futex wakes missed under TCG; not yet traced.
 - [x] Wall clock no longer runs backwards: NTP slewed by stepping whole seconds; now one monotonic-based wall clock on both arches, NTP offset in ns, slew at <=500 ppm.

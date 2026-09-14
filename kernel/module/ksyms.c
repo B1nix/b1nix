@@ -139,6 +139,7 @@ EXPORT_SYMBOL(blk_cache_invalidate_range);
 
 /* ── PCI / port I/O ──────────────────────────────────────────────────────── */
 EXPORT_SYMBOL(pci_find_class);
+EXPORT_SYMBOL(pci_bind_driver);
 EXPORT_SYMBOL(pci_config_read16);
 EXPORT_SYMBOL(pci_config_read32);
 EXPORT_SYMBOL(pci_config_write16);

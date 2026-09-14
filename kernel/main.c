@@ -749,6 +749,7 @@ void kernel_main(usize arg0, usize arg1)
 	 * program it — which a driver reports as "the register block is at 0",
 	 * not as "nobody assigned me an address". */
 	pci_init();
+	pci_sysfs_publish_all();
 	BOOTMARK(14);	/* PCI BUS SCAN (aarch64) */
 #endif
 	/* Both are PCI devices driven through MMIO, and this port has a PCI bus

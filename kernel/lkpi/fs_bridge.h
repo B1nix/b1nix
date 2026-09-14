@@ -24,6 +24,7 @@ struct lkpi_bridge_attr {
 	unsigned long long mtime;
 	unsigned long long ctime;
 	unsigned int flags;	/* FS_IOC_GETFLAGS attribute bits */
+	unsigned int atime_nsec, mtime_nsec, ctime_nsec;
 };
 
 /* Called once per directory entry. Return 0 to stop the walk. */

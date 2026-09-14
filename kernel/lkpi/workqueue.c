@@ -73,6 +73,59 @@ void INIT_DELAYED_WORK(struct delayed_work *dwork, work_func_t func)
 	dwork->work.func = func;
 }
 
+/*
+ * The items a worker thread is inside right now, by address.
+ *
+ * A handler may free the item it was called with -- btrfs's bio completion
+ * frees the btrfs_bio that embeds its work_struct -- so nothing here may touch
+ * the item once its handler has been called. Clearing a `running` field in it
+ * afterwards wrote into freed memory, and the page cache entry that had taken
+ * the block by then had its LRU link overwritten. flush_work asks this table
+ * instead, as upstream's worker pool compares current_work by address.
+ */
+#define WQ_RUNNING_SLOTS 256
+static struct work_struct *g_wq_running[WQ_RUNNING_SLOTS];
+static spinlock_t g_wq_running_lock = SPINLOCK_INIT;
+
+static int wq_running_enter(struct work_struct *w)
+{
+	u64 flags;
+	int slot = -1;
+
+	spin_lock_irqsave(&g_wq_running_lock, &flags);
+	for (int i = 0; i < WQ_RUNNING_SLOTS; i++)
+		if (!g_wq_running[i]) {
+			g_wq_running[i] = w;
+			slot = i;
+			break;
+		}
+	spin_unlock_irqrestore(&g_wq_running_lock, flags);
+	return slot;
+}
+
+static void wq_running_leave(int slot)
+{
+	u64 flags;
+
+	if (slot < 0)
+		return;
+	spin_lock_irqsave(&g_wq_running_lock, &flags);
+	g_wq_running[slot] = 0;
+	spin_unlock_irqrestore(&g_wq_running_lock, flags);
+}
+
+static int wq_is_running(const struct work_struct *w)
+{
+	u64 flags;
+	int found = 0;
+
+	spin_lock_irqsave(&g_wq_running_lock, &flags);
+	for (int i = 0; i < WQ_RUNNING_SLOTS && !found; i++)
+		found = (g_wq_running[i] == w);
+	spin_unlock_irqrestore(&g_wq_running_lock, flags);
+	return found;
+}
+
 /* Pop the head of the FIFO. Caller must NOT hold the lock. */
 static struct work_struct *wq_dequeue(struct workqueue_struct *wq)
 {
@@ -86,7 +139,8 @@ static struct work_struct *wq_dequeue(struct workqueue_struct *wq)
 		w->next = 0;
 		w->pending = 0;
 		w->wq = 0;
-		w->running = 1;
+		/* Before the handler: see g_wq_running. */
+		w->seq++;
 	}
 	spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 	return w;
@@ -199,6 +253,7 @@ static void workqueue_thread(void *arg)
 				scheduler_wait_commit();
 			continue;
 		}
+		int slot = wq_running_enter(w);
 		if (w->func) {
 			u64 bflags;
 
@@ -212,10 +267,10 @@ static void workqueue_thread(void *arg)
 			wq->busy--;
 			spin_unlock_irqrestore((spinlock_t *)&wq->lock, bflags);
 		}
+		/* `w` may be freed from here on: only its address is used. */
+		wq_running_leave(slot);
 		u64 flags;
 		spin_lock_irqsave((spinlock_t *)&wq->lock, &flags);
-		w->running = 0;
-		w->seq++;
 		wq->processed++;
 		spin_unlock_irqrestore((spinlock_t *)&wq->lock, flags);
 		/* Wake anyone in flush_work/flush_workqueue. */
@@ -438,7 +493,7 @@ int flush_work(struct work_struct *work)
 	if (!work)
 		return 0;
 	int waited = 0;
-	while (work->pending || work->running) {
+	while (work->pending || wq_is_running(work)) {
 		waited = 1;
 		if (!scheduler_can_block()) {
 			cpu_relax();
@@ -446,7 +501,7 @@ int flush_work(struct work_struct *work)
 			continue;
 		}
 		scheduler_wait_prepare_timeout(work, 1);
-		if (!work->pending && !work->running)
+		if (!work->pending && !wq_is_running(work))
 			scheduler_wait_cancel();
 		else
 			scheduler_wait_commit();
