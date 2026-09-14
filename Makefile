@@ -567,6 +567,8 @@ KERNEL_SOURCES := \
 	kernel/module/module.c \
 	kernel/module/ksyms.c \
 	kernel/dev/demon_splash.c \
+	kernel/dev/panic_screen.c \
+	kernel/dev/panic_otter.c \
 	kernel/mm/pmm.c \
 	kernel/mm/vma_trace.c \
 	kernel/mm/page_cache.c \

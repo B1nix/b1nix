@@ -59,11 +59,26 @@ static struct console_ticket console_lock;
  * a section that was busted out from under it. */
 static volatile u32 console_lock_held_ticket;
 
+/* Re-entries by the CPU that holds the console through the explicit
+ * console_lock_*_irqsave API (the panic path, pmm's fault reports, the VT
+ * repaint): console_write and friends from inside such a section print
+ * straight through instead of queueing behind their own ticket, which is a
+ * turn that never comes -- every x86_64 panic used to sit out the full bypass
+ * spin (tens of seconds) before its first line. Only the holder touches it. */
+static u32 console_lock_depth;
+int console_lock_held_here(void);
+
 static void console_lock_acquire(void)
 {
 	extern void tlb_shootdown_poll(void);
-	u32 me = __atomic_fetch_add(&console_lock.next, 1u, __ATOMIC_SEQ_CST);
+	u32 me;
 	u64 spins = 0;
+
+	if (console_lock_held_here()) {
+		console_lock_depth++;
+		return;
+	}
+	me = __atomic_fetch_add(&console_lock.next, 1u, __ATOMIC_SEQ_CST);
 
 	while (__atomic_load_n(&console_lock.owner, __ATOMIC_ACQUIRE) != me) {
 		__asm__ volatile("pause");
@@ -91,6 +106,13 @@ static void console_lock_acquire(void)
 
 static void console_lock_release(void)
 {
+	if (console_lock_depth && console_lock_held_here()) {
+		/* The outer section may never release (a panic does not), so
+		 * whatever this write batched for the UART goes out now. */
+		serial_batch_end();
+		console_lock_depth--;
+		return;
+	}
 	serial_batch_end();
 	/* Advance the queue only if it is still standing where this section
 	 * left it. A bust (or a bypass) moves `owner` on without us, and an
@@ -577,6 +599,7 @@ void console_bust_lock(void)
 	                 __atomic_load_n(&console_lock.next, __ATOMIC_ACQUIRE),
 	                 __ATOMIC_RELEASE);
 	__atomic_store_n(&console_lock_owner, 0, __ATOMIC_RELEASE);
+	console_lock_depth = 0;
 	console_log_panic_flush();
 }
 
@@ -590,6 +613,11 @@ void console_lock_acquire_irqsave(u64 *flags)
 
 void console_lock_release_irqrestore(u64 flags)
 {
+	if (console_lock_depth && console_lock_held_here()) {
+		console_lock_depth--;
+		interrupts_restore(flags);
+		return;
+	}
 	__atomic_store_n(&console_lock_owner, 0, __ATOMIC_RELEASE);
 	console_lock_release();
 	interrupts_restore(flags);

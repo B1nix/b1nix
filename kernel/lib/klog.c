@@ -11,6 +11,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/ftrace.h>
 #include <b1nix/bootinfo.h>
+#include <b1nix/panic_screen.h>
 
 
 
@@ -872,6 +873,12 @@ void panic_at(const char *message, const char *file, int line)
 	}
 	console_write("\n");
 	serial_write("\n");
+
+	/* After the marker, never before it: the harness greps the log for the
+	 * first "KERNEL PANIC" line. The banner is serial-only; the display gets
+	 * the panic screen, and everything below is drawn underneath it. */
+	panic_screen_serial_banner();
+	panic_screen_show(message, file, line, 0, 0);
 
 	/* Print current CPU & Task state */
 	struct percpu *pc = get_percpu();

@@ -450,10 +450,23 @@ static void fb_draw_char(char c, u32 x, u32 y)
  * pixels at all: clear and continue from the top, one screen-sized fill per
  * screenful of text instead of a copy per line.
  */
+/* Set once a panic owns the screen; see fb_console_panic_begin(). */
+static int fb_panic;
+static int fb_panic_full;
+static int fb_panic_off; /* painting faulted: hands off */
+
 static void fb_console_wrap(void)
 {
     u32 bytes_per_line = fb.pitch;
     u32 rows;
+
+    /* A panic keeps its first screenful -- the reason, registers and the
+     * backtrace -- instead of wiping it for the task table that follows. The
+     * rest goes to the serial port and the log ring as always. */
+    if (fb_panic) {
+        fb_panic_full = 1;
+        return;
+    }
 
     if (fb.height < fb_top + FB_CELL_H)
         return;
@@ -546,7 +559,12 @@ void fb_console_set_hidden(int hidden)
 
 void fb_console_putchar(char c)
 {
-    if (!fb_ptr || fb_dev_claimed() || fb_console_hidden) return;
+    if (!fb_ptr) return;
+    if (fb_panic) {
+        if (fb_panic_full) return;
+    } else if (fb_dev_claimed() || fb_console_hidden) {
+        return;
+    }
 
     if (ansi_state == 1) {
         if (c == '[') {
@@ -650,6 +668,109 @@ u32 fb_console_height(void) { return fb.height; }
 u32 fb_console_pitch(void) { return fb.pitch; }
 u8 fb_console_bpp(void) { return fb.bpp; }
 volatile void *fb_console_frontbuffer(void) { return (volatile void *)fb_ptr; }
+
+/*
+ * The panic screen's drawing surface (kernel/dev/panic_screen.c).
+ *
+ * A panic draws whatever else owns the display: a compositor that hid the
+ * console or mapped /dev/fb0 is not going to run again. Nothing here
+ * allocates, locks or presents -- a device that needs to be told about new
+ * pixels is told by nobody, because telling it may sleep; a scanned-out buffer
+ * shows them as they are written.
+ */
+static void panic_px(u32 x, u32 y, u32 color)
+{
+	u64 off = (u64)y * fb.pitch + (u64)x * (fb.bpp / 8);
+
+	if (fb.bpp == 24) {
+		volatile u8 *p = fb_ptr + off;
+
+		p[0] = (u8)color;
+		p[1] = (u8)(color >> 8);
+		p[2] = (u8)(color >> 16);
+	} else {
+		*(volatile u32 *)(void *)(fb_ptr + off) = color;
+	}
+	if (fb_shadow && (const volatile u8 *)fb_shadow != fb_ptr &&
+	    off + 4 <= fb_shadow_size)
+		*(u32 *)(void *)(fb_shadow + off) = color;
+}
+
+int fb_console_panic_begin(void)
+{
+	if (fb_panic_off || !fb_ptr || !fb.width || !fb.height ||
+	    (fb.bpp != 32 && fb.bpp != 24))
+		return -1;
+	fb_panic = 1;
+	fb_panic_full = 0;
+	fb_console_hidden = 0;
+	ansi_state = 0;
+	cursor_visible = 0;
+	ansi_cursor_hidden = 1;
+	g_font = &font8x8_basic[0][0];
+	g_font_h = 8;
+	g_font_stride = 8;
+	g_font_count = 128;
+	return 0;
+}
+
+void fb_console_panic_fill(u32 x, u32 y, u32 w, u32 h, u32 color)
+{
+	if (!fb_panic || fb_panic_off || x >= fb.width || y >= fb.height)
+		return;
+	if (w > fb.width - x)
+		w = fb.width - x;
+	if (h > fb.height - y)
+		h = fb.height - y;
+	for (u32 py = y; py < y + h; py++)
+		for (u32 px = x; px < x + w; px++)
+			panic_px(px, py, color);
+}
+
+u32 fb_console_panic_text(u32 x, u32 y, const char *s, u32 scale, u32 color)
+{
+	if (!fb_panic || fb_panic_off || !s || !scale)
+		return x;
+	for (; *s; s++, x += 8 * scale) {
+		const u8 *glyph;
+
+		if (x + 8 * scale > fb.width)
+			break;
+		glyph = font8x8_basic[(unsigned char)*s & 0x7f];
+		for (u32 gy = 0; gy < 8; gy++) {
+			for (u32 gx = 0; gx < 8; gx++) {
+				if (!((glyph[gy] >> (7 - gx)) & 1))
+					continue;
+				fb_console_panic_fill(x + gx * scale, y + gy * scale,
+				                      scale, scale, color);
+			}
+		}
+	}
+	return x;
+}
+
+void fb_console_panic_region(u32 top, u32 scale, u32 fg, u32 bg)
+{
+	if (!fb_panic || fb_panic_off)
+		return;
+	if (scale < 1)
+		scale = 1;
+	FONT_SCALE = scale;
+	fg_color = fg;
+	bg_color = bg;
+	fb_top = top < fb.height ? top : fb.height;
+	cursor_x = 0;
+	cursor_y = fb_top;
+	fb_panic_full = fb_top + FB_CELL_H > fb.height;
+}
+
+/* Painting faulted: leave the display alone for the rest of the panic. */
+void fb_console_panic_abort(void)
+{
+	fb_panic_off = 1;
+	fb_panic = 1;
+	fb_panic_full = 1;
+}
 
 /*
  * Test mode: prove that a character written to the console really lands in the

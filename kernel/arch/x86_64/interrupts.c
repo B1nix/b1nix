@@ -23,6 +23,7 @@ void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/serial_tty.h>
 #include <b1nix/watchdog.h>
 #include <b1nix/net.h>
+#include <b1nix/panic_screen.h>
 #include <b1nix/tlb.h>
 #include <b1nix/types.h>
 #include <stdio.h>
@@ -1187,6 +1188,10 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     panic("nested exception in fault handler");
   }
   in_fault_dump[dump_cpu] = 1;
+  /* A fault in kernel mode ends in "[PANIC]" below whatever happens next, so
+   * the screen can say so now and the dump is drawn underneath it. */
+  if ((frame->cs & 3) == 0)
+    panic_screen_show(name, 0, 0, frame->rip, frame->rbp);
   console_write(name);
   console_write("\nvector: 0x");
   console_write_hex64(frame->vector);

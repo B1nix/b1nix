@@ -32,6 +32,16 @@ u32 fb_console_pitch(void);
 u8 fb_console_bpp(void);
 volatile void *fb_console_frontbuffer(void);
 
+/* Panic takeover, for kernel/dev/panic_screen.c only. begin() claims the
+ * display whatever else owns it (-1: no usable framebuffer); fill/text paint
+ * without presenting; region() puts the console's text below `top` and stops
+ * it at the bottom of the screen instead of wrapping; abort() stops drawing. */
+int fb_console_panic_begin(void);
+void fb_console_panic_fill(u32 x, u32 y, u32 w, u32 h, u32 color);
+u32 fb_console_panic_text(u32 x, u32 y, const char *s, u32 scale, u32 color);
+void fb_console_panic_region(u32 top, u32 scale, u32 fg, u32 bg);
+void fb_console_panic_abort(void);
+
 /* M107 console fonts. `stride` is the per-glyph byte pitch of `glyphs` (32 for
  * the PIO_FONT layout, == height for a packed face); glyphs are 8 pixels wide,
  * MSB on the left, and the buffer must outlive the call (the console keeps the

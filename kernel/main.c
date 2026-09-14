@@ -19,6 +19,7 @@
 #include <b1nix/module.h>
 #include <b1nix/netdev.h>
 #include <b1nix/panic.h>
+#include <b1nix/panic_screen.h>
 #include <b1nix/sched.h>
 #include <b1nix/serial.h>
 #include <b1nix/serial_tty.h>
@@ -1726,6 +1727,10 @@ void kernel_main(usize arg0, usize arg1)
 			               (void *)(usize)at);
 	}
 	fb_console_start_flusher();
+
+	/* b1nix.panic-demo: show the panic screen on purpose, with the machine
+	 * fully up (tasks, kallsyms, display) so every part of it has content. */
+	panic_screen_demo();
 
 	/* M99/M100 self-tests run here rather than in the block above: they create
 	 * kernel threads and park on wait channels, which needs the full

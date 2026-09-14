@@ -2,6 +2,7 @@
 #include <b1nix/fb_console.h>
 #include <b1nix/console.h>
 #include <b1nix/panic.h>
+#include <b1nix/panic_screen.h>
 #include <b1nix/sched.h>
 #include <b1nix/irq.h>
 #include <b1nix/spinlock.h>
@@ -1023,6 +1024,11 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 		scheduler_exit_current(TASK_EXIT_SIGNALED | sig);
 		arch_halt();
 	}
+
+	/* Fatal from here on (this ends in panic_at): paint the screen first so
+	 * the dump below is drawn underneath it. */
+	panic_screen_show("unhandled synchronous exception", 0, 0, elr,
+	                  saved_regs[29]);
 
 	/* The interrupted SP_EL1 is where SAVE_REGS started, i.e. just above the
 	 * frame it built. Derived rather than parked in a per-CPU word: the
