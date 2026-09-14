@@ -12,10 +12,11 @@ AArch64 is a second target of this same kernel, not a milestone: each gap
 belongs to the milestone that owns the mechanism. See
 [aarch64-parity.md](aarch64-parity.md).
 
-## Closed milestones M0–M79
+## Closed milestones
 
 | Milestone | Status | Summary |
 |---|---|---|
+| Milestone | Status | Summary |
 | M0 Boot and Diagnostics | done | Freestanding kernel ELF, Multiboot2 boot, serial/VGA, panic, klog. |
 | M1 Architecture Layer | done | Exceptions, timer interrupts, context switch, faults → signals. |
 | M2 Memory | done | PMM, higher-half paging, kheap, swap, per-process tables, COW, mmap/mprotect. |
@@ -99,40 +100,25 @@ belongs to the milestone that owns the mechanism. See
 | M76 USB Host Stack | done | xHCI, USB core, mass storage. |
 | M77 Resource Caps | done | Dynamic caps for TCP, pipes, core dumps, SHMMAX. |
 | M79 Audio Stack | done | HDA/AC'97, mixer, ALSA shim. |
-
-## M80: Kernel ptrace + Crash Capture
-
-- [x] Full `ptrace(2)` (regs/mem, SEIZE, syscall stops, events), Yama gating, `/proc/<pid>/task`, XSAVE state.
-- [x] Upstream Crashpad writes real minidumps unpatched, on x86_64 and aarch64.
-- [x] `/proc/<pid>/cmdline` of a fork/clone child that has not exec'd is the parent's (`M80-SMOKE: ok fork-cmdline`).
-
-## M81: Chromium GPU Acceleration
-
-- [ ] `cancelled` SwiftShader/ANGLE for `content_shell`: userspace, left the tree with M121. The kernel side (virtio-gpu/i915 DRM) is tracked in M101/M102.
-
-## M82: System NSS / Kerberos (optional)
-
-- [ ] `cancelled` Userspace libraries; they come from the distribution (M121).
-
-## Closed milestones M83–M100d
-
+| M80 Kernel ptrace + Crash Capture | done | Full `ptrace(2)`, Yama, `/proc/<pid>/task`, XSAVE state, crash capture, fork child cmdline. |
+| M81 Chromium GPU Acceleration | cancelled | Userspace (M121); the kernel side is M101/M102. |
+| M82 System NSS / Kerberos | cancelled | Userspace libraries come from the distribution (M121). |
 | Milestone | Status | Summary |
-|---|---|---|
 | M83 Unicode ctype | done | Provided by musl (M92). |
 | M84 IP routing + TCP | done | IPv4/IPv6 FIB, policy routing, ECMP, SACK, window scale, DHCPv6. |
 | M85 libc Tier-A pass | retired | — |
 | M86 Per-thread CPU accounting | done | Thread/process CPU clocks, tkill/tgkill, exit vs exit_group. |
 | M87 Loader + Rust proc-macros | retired | — |
-| M88 Kernel correctness | done | PROT_NONE guards, ext4 indirect blocks. |
-| M89 LLVM libc++ | done | Shared libc++ everywhere; GCC shared libs removed. |
-| M90 GCC-free toolchain | done | Pure LLVM cross, native and Rust toolchains. |
-| M91 Skia | done | Standalone Skia (demo superseded with M52). |
-| M92 musl libc | done | musl as dynamic libc, ring-3 init/netd, ext4 primary root. |
+| M88 Kernel correctness | done | PROT_NONE guards. |
+| M89 LLVM libc++ | retired | libc++ comes from Alpine (M121). |
+| M90 GCC-free toolchain | done | Pure LLVM cross toolchain. |
+| M91 Skia | retired | Userspace (M121). |
+| M92 musl libc | done | musl as dynamic libc, ring-3 init. |
 | M93 Ring 0 Cleanup | done | In-kernel dynamic linker and build orchestrator removed. |
 | M94 Foreign Userspace | done | `init=`, all-dynamic rootfs, stock Alpine minirootfs boots. |
 | M95 LKM framework | done | W^X module loader, init/finit/delete_module, fs/HDA modules. |
 | M96 LKM network + params | done | Protocol registry, module params, modules.dep/alias, IPv6 as module. |
-| M97 GNU-free ISO | done | Limine, bmake, samurai, curl, zsh. |
+| M97 GNU-free ISO | done | Limine ISO. |
 | M98 Driver Infrastructure | done | netconsole, PAT/WC, PCI caps, MSI/MSI-X, stolen memory decode. See [driver-infrastructure.md](driver-infrastructure.md). |
 | M99 linuxkpi layer | done | Own headers: idr, workqueue, dma-mapping, bounce, IOMMU-aware. |
 | M100 DRM Core | done | dma-fence, GPU scheduler, sg-backed GEM on virtio-gpu. |
@@ -140,6 +126,21 @@ belongs to the milestone that owns the mechanism. See
 | M100b IOMMU (VT-d) | done | DMAR, second-level tables, NVMe domain, fault blocking. |
 | M100c IOMMU domains/IR | done | Per-device domains, ACS/ARI grouping, interrupt remapping. |
 | M100d AMD-Vi | done | IVRS, device table, command ring, NVMe in translated domain. |
+| M104 Alpine packages | done | From-source ports replaced by pinned Alpine packages; `bpkg` retired. |
+| M105 PAM | done | OpenPAM + `pam_unix.so`; dropbear authenticates through PAM. |
+| M106 DNS resolver | done | Outbound name resolution, `/dev/fd`, `/proc/self/fd/N`, 64 KiB pipes. |
+| M107 BusyBox applets blocked on kernel subsystems | done | Netlink route, VTs, loop, kmsg, inotify, RTC, watchdog, SMBus; MTD/UBI `wontfix`. |
+| M108 Hand base tools to BusyBox | done | BusyBox `su`/`passwd`/`login`, BusyBox init as PID 1 with OpenRC. |
+| M110 Unix block-device names | done | `sda`/`vda`/`nvme0n1` from enumeration; device selection by bus/content. |
+| M111 Debian userspace and Linux-shaped boot log | done | Debian bookworm boots unmodified; levelled, timestamped kernel log. |
+| M112 systemd as PID 1 | done | Debian systemd 252 reaches `graphical.target`; cgroup v2, mount propagation, devtmpfs, Weston on DRM, PCI driver links. |
+| M114 The layers under the missing applets | done | `readahead`, `TIOCCONS`, software RAID, NBD, ATAPI, CFI NOR MTD, `nsenter`/`unshare`. |
+| M115 Kernel boot and syscall stacks | done | 256 KiB stacks with guard pages; peak usage asserted. |
+| M116 One page-table entry, two meanings | done | `VMM_SHARED` off the GLOBAL bit, no `CR4.PGE` on APs; fixed SMP `SIGILL`. |
+| M117 nice in the scheduler | done | Stride weights by nice on every CPU; APs preempt ring-3 ticks. |
+| M118 Arch Linux userspace | cancelled | Duplicated the Debian lane (M121); the kernel faults it found stay fixed. |
+| M119 Ask the processor instead of guessing | done | Real CPU name, `RNDR`, PARange, TSC from CPUID, cpuinfo flags/Features. |
+| M120 Linux's own filesystems, through linuxkpi | done | btrfs, ext4 and jbd2 from Linux 6.6 unpatched; btrfs root on both arches, ext2/3/4 are the imported ext4, native ext drivers removed. See [linuxkpi-fs.md](linuxkpi-fs.md). |
 
 ## M101: linuxkpi for DRM — run upstream drivers unmodified
 
@@ -168,55 +169,13 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 
 - [ ] `planned` Pick generation (pre-Turing without signed firmware vs GSP); import unmodified, fix the shim.
 
-## M104: Alpine packages
-
-- [x] `bpkg`, the in-guest package manager, retired in M121.
-- [x] 49 of 54 from-source ports replaced by pinned Alpine packages.
-- [x] The last from-source ports (`busybox`, `openrc`, `libcxx`, `rust`) moved to Alpine or were dropped in M121; only `musl` headers for `b1cc` are built.
-
-## M105: PAM
-
-- [x] OpenPAM + `pam_unix.so`; dropbear authenticates through PAM.
-
-## M106: DNS resolver
-
-- [x] Outbound name resolution (fixed UDP source port, `recvfrom`/`recvmsg` sender address).
-- [x] `/dev/fd`, `/proc/self/fd/N` opens and 64 KiB pipes.
-
-## M107: BusyBox applets blocked on kernel subsystems
-
-- [x] Netlink route sockets, VTs, loop devices, `/proc` maps/fd, kmsg/syslog, inotify extensions, RTC, watchdog, SMBus.
-- [ ] `wontfix` MTD/UBI applets (no flash on any target; later partly covered by M114 NOR MTD).
-
-## M108: Hand base tools to BusyBox
-
-- [x] `su`/`passwd`/`login`/`id` etc. are BusyBox applets with a safe setuid copy; shadow locking race fixed.
-- [x] BusyBox init as PID 1 with OpenRC; execve refreshes creds/caps/fsuid.
-
 ## M109: Alpine applet parity
 
 - [x] 283 of 321 applets built and each proved through `/bin`.
 - [x] AF_PACKET, VLAN/bridge/bonding/gretap, four namespace kinds with veth, pivot_root, uevent netlink for `mdev`, per-namespace IPv4 config.
 - [x] Single-device gaps triaged (`wontfix`: rfkill, floppy, `i2ctransfer`).
-- [ ] `partial` Namespaces still share IPv6 interface state, allow one IPv4 address each, (TCP, UDP and loopback are per namespace), and DHCP runs only in the initial namespace.
-
-## M110: Unix block-device names
-
-- [x] `sda`/`vda`/`nvme0n1` naming derived from enumeration index; old names removed; USB storage in the `sd` sequence.
-- [x] Device selection by bus/content instead of name prefix; live-USB loop root switch fixed (`tests/liveusb.sh`).
-
-## M111: Debian userspace and Linux-shaped boot log
-
-- [x] Debian bookworm (glibc, dash, coreutils, sysvinit PID 1) boots unmodified (`make debian-image`, `make debian-smoke`).
-- [x] Timestamped, levelled, subsystem-prefixed kernel log shared by console, `dmesg` and `/dev/kmsg`.
-
-## M112: systemd as PID 1
-
-- [x] Debian systemd 252 reaches `graphical.target` (32/32 checks; `make systemd-image`, `make systemd-smoke`).
-- [x] cgroup v2 (`pids` enforced only), mount propagation/bind/remount, real devtmpfs; ~40 Linux-ABI defects fixed.
-- [x] Debian Weston draws on `/dev/dri/card1` ([image](images/m112-debian-weston.png)), `tests/debian-graphics-smoke.sh` 12 checks.
-- [x] PCI functions claimed by virtio, AHCI, e1000, HDA and xHCI carry `driver` links both ways (`M114-SMOKE: ok pci-driver-link`).
-- Note: `tests/systemd-smoke.sh` does not rebuild `debian-systemd.ext4`; run `PROFILE=systemd sh tools/images/mk-debian-image.sh` first.
+- [x] TCP, UDP and loopback are per network namespace.
+- [ ] `partial` Namespaces still share IPv6 interface state, allow one IPv4 address each, and DHCP runs only in the initial namespace.
 
 ## M113: KDE Plasma
 
@@ -224,48 +183,6 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 - [x] Boot to painted desktop 194 s → ~16 s; evdev input and DRM framebuffer console before the compositor.
 - [ ] `partial` kwin uses the legacy modeset path (`CURSOR_PLANE_HOTSPOT` is Linux 6.7; universal planes not offered).
 - [ ] `partial` Remaining costs: dbus/elogind session stalls, vmm read-lock per copyin. (Dirty pages now go through the `pcflush` writeback thread; the lkpi header macro warnings were fixed in M121.)
-
-## M114: The layers under the missing applets
-
-- [x] `readahead(2)`, `TIOCCONS`, software RAID (b1nix format, no resync), NBD client, ATAPI read-only CD-ROM.
-- [x] MTD over CFI NOR flash (`/dev/mtd0`, `/dev/mtdblock0`); NAND out of scope.
-- [x] `nsenter`/`unshare` enabled and checked for real isolation.
-
-## M115: Kernel boot and syscall stacks
-
-- [x] Boot and syscall stacks raised to 256 KiB with unmapped guard pages (the `iommu` flake was a boot-stack overflow).
-- [x] Guards and peak usage are reported and asserted by the suite.
-
-## M116: One page-table entry, two meanings
-
-- [x] `VMM_SHARED` moved off bit 8 (GLOBAL) and APs no longer set `CR4.PGE`; fixes SMP `SIGILL`/`#GP` on valid instructions.
-- [x] `SMP-CPUSTATE` censuses CR0/CR4/XCR0/EFER across CPUs; graphics lane back to 4 CPUs.
-
-## M117: nice in the scheduler
-
-- [x] `nice()` stored and round-trips; the check uses a shared deadline on one pinned CPU (`M46-SMOKE: ok nice-applied`).
-- [x] Stride biases the picker on every CPU: x86_64 secondaries now preempt ring-3 ticks, which is what left a hog on an AP ignoring nice and affinity (`M80-SMOKE: ok nice-share`, ~9:1 for nice 0 vs 19).
-
-## M118: Arch Linux userspace
-
-Cancelled in M121: Debian is the glibc ABI lane, and a second systemd distribution duplicated it. The image and test scripts were removed; the nine kernel faults it found (`TCGETS2`, `/proc/self/fd` reopen flags, `CLONE_NEW*`, pidfds, `close_range`, `fchmodat2`, …) stay fixed. The new mount API it needed is tracked under the Debian lane.
-
-## M119: Ask the processor instead of guessing
-
-- [x] `/proc/cpuinfo` names the real CPU (CPUID brand / `MIDR_EL1`).
-- [x] aarch64 CSPRNG seeded from `RNDR`; `TCR_EL1.IPS` from `ID_AA64MMFR0_EL1.PARange`.
-- [x] x86_64 TSC frequency from CPUID 15h (16h base frequency when the crystal is unreported), PIT calibration as fallback.
-- [x] `flags` (x86_64, CPUID) / `Features` (aarch64, ID registers) line in `/proc/cpuinfo`; `M80-SMOKE: ok cpu-flags` checks it against the processor.
-
-## M120: Linux's own filesystems, through linuxkpi
-
-Upstream Linux 6.6 `fs/btrfs`, `fs/ext4`, `fs/jbd2` built unpatched on our shim. Detail in [linuxkpi-fs.md](linuxkpi-fs.md).
-
-- [x] 105 imported TUs link (`B1NIX_FS_IMPORT=btrfs`, `=1` adds ext4).
-- [x] `initial` btrfs mount/read/write verified by host `btrfs check`; `mount -t btrfs-lkpi` bridges b1nix VFS to it.
-- [x] The root filesystem is the imported btrfs (`mkfs.btrfs --rootdir`; `ROOT_FS=ext4` still builds the old image). x86_64 smoke 1419/1 on it. Bugs a real root exposed: out-of-order spinlock release re-enabled IRQs, `schedule()` spun instead of sleeping, linked inodes evicted with their delalloc data, lookup nodes shared page-cache keys, preempt count per CPU. Detail in [linuxkpi-fs.md](linuxkpi-fs.md).
-- [x] aarch64 root on the imported btrfs too (1364/2, both fails the native ext4 data disk). Fixed on the way: user page faults read with IRQs on, the workqueue no longer touches a finished work item, `set_mask_bits` writes its target's width.
-- [x] ext2/3/4 are the imported ext4; the native ext1/2/3/4 + journal drivers (5000 lines) are gone. x86_64 1424/0, aarch64 1366/0. Bugs it exposed: rename skipped `d_move`, a reused inode number served the dead file's cached pages, umount dropped unflushed pages, a bdev inode had no bdi.
 
 ## M121: Kernel only
 
