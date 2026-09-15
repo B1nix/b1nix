@@ -16,7 +16,6 @@ belongs to the milestone that owns the mechanism. See
 
 | Milestone | Status | Summary |
 |---|---|---|
-| Milestone | Status | Summary |
 | M0 Boot and Diagnostics | done | Freestanding kernel ELF, Multiboot2 boot, serial/VGA, panic, klog. |
 | M1 Architecture Layer | done | Exceptions, timer interrupts, context switch, faults → signals. |
 | M2 Memory | done | PMM, higher-half paging, kheap, swap, per-process tables, COW, mmap/mprotect. |
@@ -88,7 +87,7 @@ belongs to the milestone that owns the mechanism. See
 | M64 Clang/LLVM Toolchain | done | Cross clang++, native in-QEMU clang. |
 | M65 Install to Disk | cancelled | Installer and disk-image script removed in M121; a distribution installs itself. |
 | M66 Chromium Frontend | cancelled | Userspace; superseded by the distribution's browser (M121). |
-| M67 Rust Toolchain Port | done | `x86_64-unknown-b1nix` target. |
+| M67 Rust Toolchain Port | retired | `x86_64-unknown-b1nix` target spoke the native ABI; its blob and checks are in `archive/` (M121). |
 | M68 Native Rust Compiler | done | rustc 1.98.0 in-guest. |
 | M69 Dynamic Loading | retired | — |
 | M70 Interrupt-Driven I/O | done | ISR→wakeup completions replace busy-poll. |
@@ -136,6 +135,7 @@ belongs to the milestone that owns the mechanism. See
 | M110 Unix block-device names | done | `sda`/`vda`/`nvme0n1` from enumeration; device selection by bus/content. |
 | M111 Debian userspace and Linux-shaped boot log | done | Debian bookworm boots unmodified; levelled, timestamped kernel log. |
 | M112 systemd as PID 1 | done | Debian systemd 252 reaches `graphical.target`; cgroup v2, mount propagation, devtmpfs, Weston on DRM, PCI driver links. |
+| M113 KDE Plasma | done | kwin_wayland + plasmashell on atomic DRM via elogind/eudev; painted desktop in ~7 s (from 194 s); `tests/kde-smoke.sh`. |
 | M114 The layers under the missing applets | done | `readahead`, `TIOCCONS`, software RAID, NBD, ATAPI, CFI NOR MTD, `nsenter`/`unshare`. |
 | M115 Kernel boot and syscall stacks | done | 256 KiB stacks with guard pages; peak usage asserted. |
 | M116 One page-table entry, two meanings | done | `VMM_SHARED` off the GLOBAL bit, no `CR4.PGE` on APs; fixed SMP `SIGILL`. |
@@ -143,6 +143,7 @@ belongs to the milestone that owns the mechanism. See
 | M118 Arch Linux userspace | cancelled | Duplicated the Debian lane (M121); the kernel faults it found stay fixed. |
 | M119 Ask the processor instead of guessing | done | Real CPU name, `RNDR`, PARange, TSC from CPUID, cpuinfo flags/Features. |
 | M120 Linux's own filesystems, through linuxkpi | done | btrfs, ext4 and jbd2 from Linux 6.18.51 unpatched (moved from 6.6 with the DRM core and i915); btrfs root on both arches, ext2/3/4 are the imported ext4, native ext drivers removed. See [linuxkpi-fs.md](linuxkpi-fs.md). |
+| M121 Kernel only | done | Own userspace replaced by Alpine and Debian packages, native syscall ABI archived (`archive/kernel/native-abi/`); self-hosted kernel boots; Debian glibc lane 41/41; aarch64 wedges, zstd btrfs and a dentry-list heap corruption fixed. |
 
 ## M102a: Intel i915 (Gen8/Gen9.5) + Mesa iris
 
@@ -165,29 +166,3 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 
 - [ ] `planned` Pick generation (pre-Turing without signed firmware vs GSP); import unmodified, fix the shim.
 
-## M113: KDE Plasma
-
-- [x] kwin_wayland + plasmashell on real DRM via elogind/eudev ([image](images/m113-plasma-drm.png)); `tests/kde-smoke.sh`.
-- [x] Boot to painted desktop 194 s → ~16 s; evdev input and DRM framebuffer console before the compositor.
-- [x] kwin takes atomic modesetting on virtio-gpu: the driver advertises `DRIVER_CURSOR_HOTSPOT` (DRM core 6.18.51); `atomic-modeset` check in `tests/kde-smoke.sh`.
-- [x] Boot to desktop ~7 s (from 23–25 s): reaper wake storm, whole-cache inode flush, page-cache insert race, poll wake storms, per-page lkpi reads, VMA list walks (per-space cache + copy-on-write index), PCI scans by port I/O; `tools/run/kde-boot-time.sh` measures it.
-
-## M121: Kernel only
-
-- [x] Own apps removed: `bpkg`, `b1fetch`, installer, `mc`/`ne` (M16).
-- [x] BusyBox is Alpine's 1.36.1 at `/bin/busybox`; `flash_erase`, `getfattr`, `lsblk`, `uuidgen` come from their own packages.
-- [x] Kernel gaps the real tools exposed: `LOOP_CONFIGURE`, `/proc/mtd` and MTD char numbers, `modules.builtin`.
-- [x] OpenRC is Alpine's 0.54 under BusyBox init; the `openrc-init` PID 1 instance is gone (Alpine does not build it), IOMMU instances boot the default init.
-- [x] libc++, libunwind and compiler-rt builtins are Alpine's (LLVM 17; libc++abi needs `libgcc_s`, accepted).
-- [x] Own native clang/Rust toolchain builds and the `b1nix-pkgs` download removed; nothing third-party is built from source.
-- [x] Self-host (M26) on Alpine's clang17/lld with the host build's own per-TU commands: 653/653 compile and the link succeeds in-guest.
-- [x] execve no longer drops arguments past 256 (a 684-argument link ran on the first 256 objects); oversized vectors are E2BIG.
-- [x] The kernel built in-guest boots: on a btrfs build disk, extracted with `btrfs restore`, it mounts the btrfs root and runs userspace (`tools/selfhost/selfhost-proof.sh`, 653/653 in ~5 min). It took `sync(2)` writing out and committing imported filesystems, and a workqueue that no longer touches a freed work item.
-- [x] aarch64 builds the imported btrfs and prints debug tracing on test boots (the M40 personality line).
-- [ ] `partial` aarch64 wedges: three causes fixed (a timed sleeper halting on the boot CPU starved READY tasks; a jbd2 wait entry deleted twice; the `reaper` woken by every yield once any thread or waiting zombie existed — it now wakes only for a death to reap, flags cleared before each sweep), but sys/gfx lanes may still wedge now and then; M86 `rusage-thread-burn` once credited a compute loop to system time.
-- [x] Wall clock no longer runs backwards: NTP slewed by stepping whole seconds; now one monotonic-based wall clock on both arches, NTP offset in ns, slew at <=500 ppm.
-- [x] `telinit` and the fake M39 inittab markers removed (M39 keeps its real serial-tty checks).
-- [x] The IOMMU instances end with `reboot -f`; the check passes only when QEMU (-no-reboot) then exits on its own.
-- [ ] `open` The imported btrfs reads zstd-compressed files as zeros (a root packed with `ROOT_BTRFS_COMPRESS=zstd` cannot start init); fixing it would halve a PXE/live root module.
-- [ ] `planned` Move the tests to the Linux ABI, then remove the native b1nix syscall ABI.
-- [ ] `planned` Debian lane to full parity as the glibc ABI check (needs the post-`mount(2)` API); the Arch lane was dropped.
