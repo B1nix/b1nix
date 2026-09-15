@@ -550,6 +550,40 @@ static u64 timerfd_now_ticks(int clockid) {
   return scheduler_get_uptime_ticks();
 }
 
+/* The time left before the next expiry and the reload interval, as
+ * timerfd_gettime(2) reports them; all zero for a disarmed timer. Caller holds
+ * t->lock. */
+static void timerfd_current_locked(const struct timerfd_state *t,
+                                   struct b1nix_itimerspec *out) {
+  memset(out, 0, sizeof(*out));
+  if (!t->armed || t->next_tick == 0)
+    return;
+  u64 now = scheduler_get_uptime_ticks();
+  u64 rem = t->next_tick > now ? t->next_tick - now : 0;
+  out->it_value.tv_sec = (i64)(rem / TICKS_PER_SEC);
+  out->it_value.tv_nsec =
+      (i64)((rem % TICKS_PER_SEC) * (1000000000ULL / TICKS_PER_SEC));
+  out->it_interval.tv_sec = (i64)(t->interval_ticks / TICKS_PER_SEC);
+  out->it_interval.tv_nsec = (i64)((t->interval_ticks % TICKS_PER_SEC) *
+                                   (1000000000ULL / TICKS_PER_SEC));
+}
+
+int vfs_timerfd_gettime(int fd, struct b1nix_itimerspec *cur) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h)
+    return -EBADF;
+  if (h->kind != VFS_HANDLE_TIMERFD)
+    return -EINVAL;
+  struct timerfd_state *t = (struct timerfd_state *)h->private_data;
+  if (!t)
+    return -EINVAL;
+  while (__atomic_test_and_set(&t->lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  timerfd_current_locked(t, cur);
+  __atomic_clear(&t->lock, __ATOMIC_RELEASE);
+  return 0;
+}
+
 int vfs_timerfd_settime(int fd, int flags,
                         const struct b1nix_itimerspec *new_value,
                         struct b1nix_itimerspec *old_value) {
@@ -610,19 +644,8 @@ int vfs_timerfd_settime(int fd, int flags,
   while (__atomic_test_and_set(&t->lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 
-  if (old_value) {
-    memset(old_value, 0, sizeof(*old_value));
-    if (t->armed && t->next_tick != 0) {
-      u64 now = scheduler_get_uptime_ticks();
-      u64 rem = t->next_tick > now ? t->next_tick - now : 0;
-      old_value->it_value.tv_sec = (i64)(rem / TICKS_PER_SEC);
-      old_value->it_value.tv_nsec =
-          (i64)((rem % TICKS_PER_SEC) * (1000000000ULL / TICKS_PER_SEC));
-      old_value->it_interval.tv_sec = (i64)(t->interval_ticks / TICKS_PER_SEC);
-      old_value->it_interval.tv_nsec = (i64)((t->interval_ticks % TICKS_PER_SEC) *
-                                             (1000000000ULL / TICKS_PER_SEC));
-    }
-  }
+  if (old_value)
+    timerfd_current_locked(t, old_value);
 
   int was_armed = t->armed;
   if (disarm || value == 0) {
@@ -699,9 +722,7 @@ static isize signalfd_read(struct vfs_handle *h, char *buf, usize len) {
                                             produced * sizeof(*si));
       memset(si, 0, sizeof(*si));
       si->ssi_signo = (u32)sig;
-      if (current_task && current_task->user_image &&
-          ((struct user_loaded_image *)current_task->user_image)->personality ==
-              PERSONALITY_LINUX) {
+      if (current_task && current_task->user_image) {
         si->ssi_signo = (u32)b1nix_signo_to_linux(sig);
       }
       si->ssi_pid = (u32)scheduler_get_pid();

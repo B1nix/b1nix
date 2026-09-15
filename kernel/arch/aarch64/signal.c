@@ -48,28 +48,22 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
   }
 
   struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
-  /* SA_SIGINFO: hand the handler a siginfo_t. The third argument (ucontext)
-   * is left null — nothing in the ported userspace reads uc_mcontext on this
-   * arch yet, and a half-filled one would be worse than an obvious null.
-   * ponytail: add the aarch64 sigcontext layout when something needs it. */
-  int is_siginfo = (sa->sa_flags & SA_SIGINFO) != 0;
-  int is_linux = img && img->personality == PERSONALITY_LINUX;
+  /* SA_SIGINFO: hand the handler a Linux siginfo_t and ucontext_t. */
+  int is_siginfo = img && (sa->sa_flags & SA_SIGINFO);
   u64 si_addr = 0;
   u64 uc_addr = 0;
   u64 top = user_sp & ~0xFULL;
   if (is_siginfo) {
-    usize si_size = is_linux ? sizeof(struct linux_siginfo)
-                             : sizeof(struct b1nix_native_siginfo);
-    si_addr = (top - si_size) & ~0xFULL;
+    si_addr = (top - sizeof(struct linux_siginfo)) & ~0xFULL;
     top = si_addr;
   }
-  /* Linux-personality SA_SIGINFO handlers get a real ucontext_t as their third
+  /* SA_SIGINFO handlers get a real ucontext_t as their third
    * argument. It used to be null here, and a null is what Crashpad recorded as
    * the crashing thread's context — its handler then read the register set from
    * address 0, got EIO, and wrote no minidump at all. Like the x86_64 side,
    * this snapshot is informational: sigreturn restores from b1nix's own frame,
    * so a handler that edits uc_mcontext is not obeyed yet. */
-  if (is_siginfo && is_linux) {
+  if (is_siginfo) {
     uc_addr = (top - sizeof(struct linux_ucontext_aarch64)) & ~0xFULL;
     top = uc_addr;
   }
@@ -100,7 +94,7 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
     return;
   }
 
-  if (is_siginfo && is_linux) {
+  if (is_siginfo) {
     struct linux_siginfo si;
     memset(&si, 0, sizeof(si));
     si.si_signo = b1nix_signo_to_linux(sig);
@@ -167,17 +161,6 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
       scheduler_exit_current(-SIGSEGV);
       return;
     }
-  } else if (is_siginfo) {
-    struct b1nix_native_siginfo si;
-    memset(&si, 0, sizeof(si));
-    si.si_signo = sig;
-    si.si_code = si_code;
-    si.si_value.sival_ptr = si_val.sival_ptr;
-    if (syscall_copyout((void *)(usize)si_addr, &si, sizeof(si)) < 0) {
-      console_write("signal: failed to build native siginfo\n");
-      scheduler_exit_current(-SIGSEGV);
-      return;
-    }
   }
 
   t->blocked_signals |= sa->sa_mask;
@@ -187,7 +170,7 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
   frame->elr = (u64)(usize)sa->sa_handler;
   frame->sp_el0 = frame_base;
   frame->x30 = restorer;
-  if (is_linux) {
+  if (img) {
     int lx = b1nix_signo_to_linux(sig);
     frame->x0 = (u64)(lx ? lx : sig);
   } else {

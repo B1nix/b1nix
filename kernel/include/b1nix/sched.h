@@ -765,7 +765,6 @@ struct task *scheduler_task_owning_stack(u64 sp);
 const char *scheduler_state_name(int state);
 void scheduler_get_ctty(int *type, int *index);
 void scheduler_set_ctty(struct task *t, int type, int index);
-void scheduler_set_stdout(int fd);
 int scheduler_get_stdout(void);
 void scheduler_fd_table_init_current(void);
 int scheduler_fd_alloc(struct vfs_handle *handle);

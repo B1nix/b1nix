@@ -1,8 +1,6 @@
 /*
- * M92: b1nix native ABI smoke test — raw syscall verification.
- *
- * Uses raw x86_64 syscall instructions with b1nix syscall numbers
- * to verify the kernel works correctly. No libc dependency.
+ * M92: raw Linux syscall smoke test — the syscall instruction itself, with
+ * the arch's Linux numbers and no libc wrapper in between.
  */
 
 static void test_all(void);
@@ -43,23 +41,6 @@ static void test_all(void);
 #define BX_exit           __NR_exit
 #define BX_clock_gettime  __NR_clock_gettime
 #define BX_SIGUSR1        SIGUSR1
-#else
-/* b1nix syscall numbers (kernel/include/b1nix/syscall.h) */
-#define BX_write          1
-#define BX_open           7
-#define BX_close          9
-#define BX_stat          11
-#define BX_unlink        20
-#define BX_getpid        42
-#define BX_kill          50
-#define BX_signal        51
-#define BX_brk           57
-#define BX_mmap          58
-#define BX_munmap        59
-#define BX_exit          60
-#define BX_clock_gettime 100
-/* b1nix signal numbers (from linux_abi.c lx_signo_to_b1nix_tbl) */
-#define BX_SIGUSR1      19
 #endif
 
 
@@ -174,17 +155,10 @@ static volatile int sig_hit = 0;
 static void handler(int s) { (void)s; sig_hit = 1; }
 
 static void test_signal(void) {
-#ifdef __linux__
   struct sigaction act;
   memset(&act, 0, sizeof(act));
   act.sa_handler = handler;
   long rc = sys(BX_signal, BX_SIGUSR1, (long)&act, 0, 8, 0, 0);
-#else
-  /* b1nix struct sigaction: handler(8) + flags(8) + restorer(8) + mask(8) = 32 bytes */
-  unsigned long long act[4] = {0};
-  act[0] = (unsigned long long)(void (*)(int))handler;
-  long rc = sys(BX_signal, BX_SIGUSR1, (long)act, 0, 8, 0, 0);
-#endif
   if (rc == 0) {
     long pid = sys(BX_getpid, 0, 0, 0, 0, 0, 0);
     sys(BX_kill, pid, BX_SIGUSR1, 0, 0, 0, 0);

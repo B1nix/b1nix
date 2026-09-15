@@ -135,12 +135,11 @@ static void evdev_view_init(void) {
   t->abs_max = 32767;
 }
 
-/* Under the Linux personality: the 24-byte record, and only the events the
- * device's capabilities announce. */
+/* A user program gets the 24-byte Linux record, and only the events the
+ * device's capabilities announce; a kernel reader gets the b1nix record. */
 static int linux_reader(void) {
   struct task *t = current_task;
-  return t && t->user_image &&
-         ((struct user_loaded_image *)t->user_image)->personality == PERSONALITY_LINUX;
+  return t && t->user_image;
 }
 
 static int view_offers(int dev, u16 type, u16 code) {
@@ -372,8 +371,8 @@ static isize input_write(struct vfs_handle *h, const char *buf, usize len) {
   struct input_client *c = (struct input_client *)h->private_data;
   if (!c)
     return -EINVAL;
-  /* The record size matches the reader: a Linux-personality task writes the
-   * 24-byte struct input_event, a native one the 16-byte b1nix record. Only
+  /* The record size matches the reader: a user program writes the 24-byte
+   * struct input_event, a kernel writer the 16-byte b1nix record. Only
    * type/code/value are used; the kernel stamps the time. Reading one size
    * and writing another (input_read converts, input_write did not) meant a
    * Linux program's event injection -- what a uinput-style writer or a test

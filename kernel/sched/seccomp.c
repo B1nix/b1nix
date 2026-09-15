@@ -15,6 +15,7 @@
 
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
+#include <b1nix/linux_abi.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/seccomp.h>
@@ -299,10 +300,11 @@ int seccomp_set_mode_strict(void) {
   return 0;
 }
 
-/* Strict-mode allow-list (b1nix syscall numbers). */
+/* Strict-mode allow-list. The filter sees the caller's own (Linux) number,
+ * before translation. */
 static int strict_allows(u64 nr) {
-  return nr == SYS_READ || nr == SYS_WRITE || nr == SYS_EXIT ||
-         nr == SYS_SIGRETURN;
+  return nr == LINUX_NR_READ || nr == LINUX_NR_WRITE || nr == LINUX_NR_EXIT ||
+         nr == LINUX_NR_RT_SIGRETURN;
 }
 
 int seccomp_filter_syscall(u64 number, u64 a0, u64 a1, u64 a2, u64 a3,

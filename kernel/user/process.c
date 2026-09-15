@@ -680,85 +680,6 @@ static int user_read_at(int fd, u64 off, void *buf, usize n) {
   return 0;
 }
 
-/* M40 — decide whether an ELF64 image is a Linux binary. Two independent
- * signals, either of which is conclusive:
- *   1. EI_OSABI (e_ident[7]) == ELFOSABI_LINUX.
- *   2. A PT_NOTE program header containing a GNU NT_GNU_ABI_TAG note whose first
- *      descriptor word (the OS) is GNU_ABI_OS_LINUX. This is what glibc-linked
- *      static Linux binaries carry; b1nix freestanding binaries never emit it.
- * Returns 1 for a Linux binary, 0 otherwise. The streaming loader passes the fd
- * and the in-memory phdr table; each PT_NOTE segment is read from the file into
- * a small bounded buffer, so a crafted note table cannot drive an OOB read. */
-static int elf64_is_linux_binary(int fd, const struct elf64_ehdr *ehdr,
-                                 const struct elf64_phdr *phdrs) {
-  if (ehdr->e_ident[EI_OSABI] == ELFOSABI_LINUX)
-    return 1;
-
-  /* b1nix's userspace is musl, and this musl port uses the Linux x86_64 syscall
-   * numbers (arch_prctl=158, clone=56, exit=60, ...). Any binary that requests
-   * the musl program interpreter therefore speaks the Linux ABI and must run
-   * with PERSONALITY_LINUX so those numbers are translated — regardless of its
-   * EI_OSABI byte, which b1nix's own clang/lld toolchain leaves at SYSV(0) with
-   * no GNU ABI-tag note. Without this, ld.so's __init_tp() gets -ENOSYS from an
-   * untranslated arch_prctl(ARCH_SET_FS) and deliberately executes `hlt`, which
-   * #GPs in ring 3. */
-  for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    const struct elf64_phdr *ph = &phdrs[i];
-    if (ph->p_type != PT_INTERP)
-      continue;
-    char interp[64];
-    u64 ilen = ph->p_filesz < sizeof(interp) ? ph->p_filesz : sizeof(interp);
-    if (ilen == 0 || user_read_at(fd, ph->p_offset, interp, (usize)ilen) != 0)
-      continue;
-    interp[ilen - 1] = '\0'; /* the on-disk string is NUL-terminated */
-    if (strcmp(interp, "/lib/ld-musl-x86_64.so.1") == 0 ||
-        strcmp(interp, "/lib/ld-musl-aarch64.so.1") == 0 ||
-        strcmp(interp, "/lib/ld-musl-i386.so.1") == 0)
-      return 1;
-  }
-
-  for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    const struct elf64_phdr *ph = &phdrs[i];
-    if (ph->p_type != PT_NOTE)
-      continue;
-    /* GNU ABI-tag notes are tiny; read a bounded prefix of the note segment
-     * into a stack buffer and walk it. A note past this prefix cannot be the
-     * leading ABI tag, and the OSABI check above is the primary signal. */
-    unsigned char nb[512];
-    u64 end = ph->p_filesz < sizeof(nb) ? ph->p_filesz : sizeof(nb);
-    if (end < 12)
-      continue;
-    if (user_read_at(fd, ph->p_offset, nb, (usize)end) != 0)
-      continue;
-    /* Walk the note records: [namesz(4)][descsz(4)][type(4)][name, 4-aligned]
-     * [desc, 4-aligned]. Offsets are relative to the buffer start. */
-    u64 off = 0;
-    while (off + 12 <= end) {
-      u32 namesz = *(const u32 *)(nb + off);
-      u32 descsz = *(const u32 *)(nb + off + 4);
-      u32 type = *(const u32 *)(nb + off + 8);
-      u64 name_off = off + 12;
-      u64 name_pad = ((u64)namesz + 3) & ~3ULL;
-      u64 desc_off = name_off + name_pad;
-      u64 desc_pad = ((u64)descsz + 3) & ~3ULL;
-      u64 next = desc_off + desc_pad;
-      if (next < off || next > end) /* malformed / wrap / past buffer */
-        break;
-      if (type == NT_GNU_ABI_TAG && namesz == 4 && descsz >= 4 &&
-          name_off + 4 <= end &&
-          nb[name_off] == 'G' && nb[name_off + 1] == 'N' &&
-          nb[name_off + 2] == 'U' && nb[name_off + 3] == '\0' &&
-          desc_off + 4 <= end) {
-        u32 os = *(const u32 *)(nb + desc_off);
-        if (os == GNU_ABI_OS_LINUX)
-          return 1;
-      }
-      off = next;
-    }
-  }
-  return 0;
-}
-
 static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   int rc = -1;
   struct elf64_phdr *phdrs = 0;
@@ -875,19 +796,11 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     image->real_path = kernel_strdup(real);
   }
 
-  /* M40: tag the binary personality. A Linux binary gets its syscall numbers
-   * translated at dispatch time. */
-  if (elf64_is_linux_binary(fd, ehdr, phdrs)) {
-    image->personality = PERSONALITY_LINUX;
-    /* Debug level, not unconditional. One line per exec is one line per
-     * `grep` a shell script forks, which on a board whose console is a
-     * 45-column panel is most of what is on the screen. kprintf composes the
-     * whole line before writing it, so the interleaving this used to avoid by
-     * hand is still avoided. */
-    k_debug("elf", "Linux personality detected: %s", path);
-  } else {
-    image->personality = PERSONALITY_B1NIX;
-  }
+  /* Every user image speaks the Linux ABI, as on Linux itself: EI_OSABI is not
+   * consulted (a static musl binary leaves it at SYSV with no ABI note), and
+   * the syscall numbers are translated at dispatch time. Debug level: one line
+   * per exec is one line per `grep` a shell script forks. */
+  k_debug("elf", "Linux personality detected: %s", path);
 
   /* M30: PIE / ET_DYN support. For ET_DYN the segment vaddrs are 0-based
    * and the loader gets to choose where to place the image. We use a
@@ -1962,13 +1875,10 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       }
       u8 *code = (u8 *)(usize)(vmm_direct_map_base() + tframe);
       memset(code, 0, PAGE_SIZE);
-      /* A Linux-personality task's syscalls are number-translated, so the
-       * trampoline must invoke Linux rt_sigreturn (15) — which maps back to
-       * SYS_SIGRETURN — not b1nix's SYS_SIGRETURN (99), which Linux would
-       * re-translate to sysinfo. */
-      u32 sigret_nr = (image->personality == PERSONALITY_LINUX)
-                          ? LINUX_NR_RT_SIGRETURN
-                          : (u32)SYS_SIGRETURN;
+      /* A user task's syscalls are number-translated, so the trampoline must
+       * invoke Linux rt_sigreturn — which maps back to SYS_SIGRETURN — not
+       * b1nix's SYS_SIGRETURN (99), which Linux would re-translate to sysinfo. */
+      u32 sigret_nr = LINUX_NR_RT_SIGRETURN;
 #if defined(__aarch64__)
       /* movz x8, #sigret_nr ; svc #0 — the syscall number register on
        * aarch64 is x8, and the handler returns here through x30. */

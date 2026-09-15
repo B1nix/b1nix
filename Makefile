@@ -126,10 +126,6 @@ INITRAMFS_TESTFONT_INC := $(INC_DIR)/initramfs_testfont.inc
 # M40: a committed static Linux x86_64 ELF blob (tools/blobs/linux_hello.bin)
 # embedded as /bin/m40-linux-hello to validate the Linux ABI compat layer.
 INITRAMFS_M40_LINUX_INC := $(INC_DIR)/initramfs_m40_linux.inc
-# M67: a prebuilt static Rust (x86_64-unknown-b1nix) ELF blob
-# (tools/blobs/hello_b1nix.elf, a committed prebuilt) embedded as
-# /bin/m67-rust to validate the Rust std cross-toolchain at runtime. x86_64-only.
-INITRAMFS_M67_RUST_INC := $(INC_DIR)/initramfs_m67_rust.inc
 # M53: NetSurf framebuffer browser + resources + test page.
 
 # Applet manifest for /bin replacement (M42 items 3 and 4).
@@ -564,7 +560,6 @@ KERNEL_SOURCES := \
 	kernel/lib/ftrace.c \
 	kernel/lib/ftrace_demo.c \
 	kernel/lib/stdlib.c \
-	kernel/lib/unistd.c \
 	kernel/lib/sha512.c \
 	kernel/lib/crypt.c \
 	kernel/mm/kheap.c \
@@ -1830,12 +1825,6 @@ $(INITRAMFS_M40_LINUX_INC): tools/blobs/linux_hello.bin
 	@mkdir -p $(dir $@)
 	$(XXD) -i -n vfs_m40_linux_hello tools/blobs/linux_hello.bin > $@
 
-# M67: embed the committed prebuilt static Rust ELF blob. Checked in so the
-# kernel build needs no Rust toolchain. Same pattern as the M40 Linux blob above.
-$(INITRAMFS_M67_RUST_INC): tools/blobs/hello_b1nix.elf
-	@mkdir -p $(dir $@)
-	$(XXD) -i -n vfs_m67_rust_elf tools/blobs/hello_b1nix.elf > $@
-
 # Self-contained TLS test PKI (CA + server cert/key) embedded under
 # /etc/tls-test for the M32 loopback HTTPS smoke. No network dependency.
 TLS_TEST_DIR := build/tls-test
@@ -2843,10 +2832,6 @@ endif
 	@if [ -f tools/blobs/linux_abi_test$(M40_BLOB_SUFFIX).bin ]; then \
 		$(CIC) tools/blobs/linux_abi_test$(M40_BLOB_SUFFIX).bin $(BUILD_DIR)/rootfs/bin/m40-linux-abi; \
 		chmod +x $(BUILD_DIR)/rootfs/bin/m40-linux-abi; \
-	fi
-	@if [ -f tools/blobs/hello_b1nix.elf ]; then \
-		$(CIC) tools/blobs/hello_b1nix.elf $(BUILD_DIR)/rootfs/bin/m67-rust; \
-		chmod +x $(BUILD_DIR)/rootfs/bin/m67-rust; \
 	fi
 	@# Trim rootfs: remove LLVM static archives and shared lib (200+ MB) that
 	@# are only needed for self-hosting, not for smoke.

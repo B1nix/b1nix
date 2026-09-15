@@ -8316,14 +8316,6 @@ void scheduler_dump_tasks(void) {
   console_write("TASK-DUMP: end\n");
 }
 
-void scheduler_set_stdout(int fd) {
-  interrupts_disable();
-  if (current_task != 0) {
-    current_task->stdout_fd = fd;
-  }
-  interrupts_enable();
-}
-
 int scheduler_get_stdout(void) {
   int fd = -1;
   interrupts_disable();

@@ -246,6 +246,7 @@ enum {
   SYS_SETNS            = 259, /* setns(fd, nstype) */
   /* readahead(fd, offset, count) -- matched with the kernel header. */
   SYS_READAHEAD        = 260,
+  SYS_TIMERFD_GETTIME  = 261,
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

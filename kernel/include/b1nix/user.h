@@ -35,17 +35,6 @@ enum user_image_kind {
 	USER_IMAGE_ELF32 = 3,
 };
 
-/* M40 — binary personality. b1nix native binaries use the b1nix syscall ABI
- * (numbers in <b1nix/syscall.h>); Linux binaries use the Linux x86_64 syscall
- * ABI (same CPU calling convention, different numbers). The ELF loader detects
- * a Linux binary (via EI_OSABI==ELFOSABI_LINUX or a GNU .note.ABI-tag with
- * OS=Linux) and tags the image PERSONALITY_LINUX; syscall_dispatch_impl then
- * translates Linux syscall numbers to the native handlers for such tasks. */
-enum user_personality {
-	PERSONALITY_B1NIX = 0,
-	PERSONALITY_LINUX = 1,
-};
-
 struct vfs_node;
 
 struct user_image_segment {
@@ -105,9 +94,6 @@ struct user_loaded_image {
 	 * mapped at exec. arch_build_signal_frame points the handler's return here
 	 * instead of trusting a userspace-supplied sa_restorer. 0 = not mapped. */
 	u64 sigreturn_trampoline;
-	/* M40: binary personality (see enum user_personality). Set by the ELF64
-	 * loader; PERSONALITY_LINUX activates Linux syscall-number translation. */
-	enum user_personality personality;
 	/* Demand-paged file backing (self-host RAM floor). exe_node is the ref-held
 	 * VFS node of a disk-backed (read_cb) executable whose read-only segments are
 	 * demand-paged from the page cache; 0 = fully eager (initramfs / ineligible). */

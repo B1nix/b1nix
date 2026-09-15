@@ -31,6 +31,9 @@
 #define LINUX_NR_RT_SIGACTION 134
 #define LINUX_NR_RT_SIGPROCMASK 135
 #define LINUX_NR_RT_SIGRETURN 139
+#define LINUX_NR_READ        63
+#define LINUX_NR_WRITE       64
+#define LINUX_NR_EXIT        93
 #define LINUX_NR_KILL        129
 #define LINUX_NR_TKILL       130
 #define LINUX_NR_TGKILL      131
@@ -78,6 +81,9 @@
 #define LINUX_NR_RT_SIGACTION 13
 #define LINUX_NR_RT_SIGPROCMASK 14
 #define LINUX_NR_RT_SIGRETURN 15
+#define LINUX_NR_READ        0
+#define LINUX_NR_WRITE       1
+#define LINUX_NR_EXIT        60
 #define LINUX_NR_KILL        62
 #define LINUX_NR_TKILL       200
 #define LINUX_NR_TGKILL      234

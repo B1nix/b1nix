@@ -7,8 +7,6 @@ int net_is_ready(void)
 	return 0;
 }
 
-void net_dump_info(void) {}
-
 struct mac_addr net_get_mac(void)
 {
 	return (struct mac_addr){{0, 0, 0, 0, 0, 0}};

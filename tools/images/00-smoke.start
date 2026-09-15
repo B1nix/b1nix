@@ -220,7 +220,7 @@ run_test /bin/m92_abi_smoke posix
 
 if [ "$SMOKE_SYS" = "1" ]; then
     for s in /etc/posix-smoke.sh /etc/initctl-smoke.sh /etc/zsh-smoke.sh \
-             /etc/m40-smoke.sh /etc/m67-smoke.sh; do
+             /etc/m40-smoke.sh; do
         [ -x "$s" ] || continue
         case "$s" in
             /etc/zsh-smoke.sh) /bin/zsh "$s" ;;

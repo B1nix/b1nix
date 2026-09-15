@@ -2,7 +2,6 @@
 #include <string.h>
 #include <stdarg.h>
 #include <b1nix/klog.h>
-#include <b1nix/syscall.h>
 
 /*
  * A format string bundled with its arguments, for %pV. Declared here as well as
@@ -21,20 +20,6 @@ struct va_format {
  * that form, and the conversion then falls back to the pointer.
  */
 __attribute__((weak)) const char *lkpi_bdev_printk_name(const void *bdev);
-
-int putchar(int c)
-{
-	char ch = (char)c;
-	syscall_dispatch(SYS_WRITE, 1, (u64)(usize)&ch, 1, 0, 0, 0);
-	return c;
-}
-
-int puts(const char *s)
-{
-	syscall_dispatch(SYS_WRITE, 1, (u64)(usize)s, strlen(s), 0, 0, 0);
-	putchar('\n');
-	return 0;
-}
 
 static void print_dec_to(char *tmp, int *len, u64 value)
 {
@@ -437,13 +422,3 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list args)
 	return vsnprintf_impl(str, size, fmt, args);
 }
 
-int printf(const char *fmt, ...)
-{
-	char buf[512];
-	va_list args;
-	va_start(args, fmt);
-	int len = vsnprintf_impl(buf, sizeof(buf), fmt, args);
-	va_end(args);
-	syscall_dispatch(SYS_WRITE, 1, (u64)(usize)buf, len, 0, 0, 0);
-	return len;
-}

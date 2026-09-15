@@ -76,10 +76,6 @@ void icmp_receive(struct ipv4_addr src, const void *data, usize size) {
 	}
 }
 
-u32 icmp_echo_reply_count(void) {
-	return __atomic_load_n(&g_icmp_echo_replies, __ATOMIC_RELAXED);
-}
-
 void icmp_send_dest_unreachable(struct ipv4_addr dst, u8 code) {
   u8 payload[8];
   memset(payload, 0, sizeof(payload));

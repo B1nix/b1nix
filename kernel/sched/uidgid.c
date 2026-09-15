@@ -184,20 +184,6 @@ int cred_set_uid(struct cred *cred, u16 uid)
     return 0;
 }
 
-int cred_set_euid(struct cred *cred, u16 euid)
-{
-    if (!cred) return -EINVAL;
-    if (!cred_has_cap(cred, CAP_SETUID)) {
-        if (euid != cred->uid && euid != cred->suid && euid != cred->euid) {
-            return -EPERM;
-        }
-    }
-    cred->euid = euid;
-    cred_refresh_caps(cred);
-    cred_sync_fsids(cred);
-    return 0;
-}
-
 int cred_set_gid(struct cred *cred, u16 gid)
 {
     if (!cred) return -EINVAL;
@@ -299,21 +285,6 @@ int cred_setresgid(struct cred *cred, int rgid, int egid, int sgid)
     if (rgid != -1) cred->gid = (u16)rgid;
     if (egid != -1) cred->egid = (u16)egid;
     if (sgid != -1) cred->sgid = (u16)sgid;
-    cred_refresh_caps(cred);
-    cred_sync_fsids(cred);
-    return 0;
-}
-
-int cred_set_egid(struct cred *cred, u16 egid)
-{
-    if (!cred) return -EINVAL;
-    int is_privileged = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
-    if (!is_privileged) {
-        if (egid != cred->gid && egid != cred->sgid && egid != cred->egid) {
-            return -EPERM;
-        }
-    }
-    cred->egid = egid;
     cred_refresh_caps(cred);
     cred_sync_fsids(cred);
     return 0;

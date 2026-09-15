@@ -132,6 +132,38 @@ static int test_timerfd(void) {
     return ok;
 }
 
+/* timerfd_gettime reports what is left of an armed timer and its interval, and
+ * all zeros once it is disarmed. It used to be routed to timerfd_create, so the
+ * "time left" call opened a new descriptor instead. */
+static int test_timerfd_gettime(void) {
+    int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (tfd < 0)
+        return 0;
+    struct itimerspec its, cur;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec = 5;
+    its.it_interval.tv_nsec = 250 * 1000 * 1000;
+    int ok = timerfd_settime(tfd, 0, &its, NULL) == 0;
+    memset(&cur, 0xff, sizeof(cur));
+    ok = ok && timerfd_gettime(tfd, &cur) == 0 &&
+         (cur.it_value.tv_sec == 4 || cur.it_value.tv_sec == 5) &&
+         cur.it_value.tv_nsec >= 0 && cur.it_value.tv_nsec < 1000000000L &&
+         cur.it_interval.tv_sec == 0 &&
+         cur.it_interval.tv_nsec == 250 * 1000 * 1000;
+    memset(&its, 0, sizeof(its));
+    ok = ok && timerfd_settime(tfd, 0, &its, NULL) == 0;
+    memset(&cur, 0xff, sizeof(cur));
+    ok = ok && timerfd_gettime(tfd, &cur) == 0 && cur.it_value.tv_sec == 0 &&
+         cur.it_value.tv_nsec == 0 && cur.it_interval.tv_sec == 0 &&
+         cur.it_interval.tv_nsec == 0;
+    int bad = open("/dev/null", O_RDONLY);
+    ok = ok && bad >= 0 && timerfd_gettime(bad, &cur) < 0 && errno == EINVAL;
+    if (bad >= 0)
+        close(bad);
+    close(tfd);
+    return ok;
+}
+
 static int test_signalfd(void) {
     /* Block the test signal so it stays pending (handler delivery is what
      * signalfd replaces) and create the signalfd watching it. */
@@ -252,6 +284,8 @@ int main(int argc, char **argv) {
 
     if (test_timerfd())  marker("M56-SMOKE: ok timerfd\n");
     else                 marker("M56-SMOKE: FAIL timerfd\n");
+    if (test_timerfd_gettime()) marker("M56-SMOKE: ok timerfd-gettime\n");
+    else                        marker("M56-SMOKE: FAIL timerfd-gettime\n");
 
     if (test_signalfd()) marker("M56-SMOKE: ok signalfd\n");
     else                 marker("M56-SMOKE: FAIL signalfd\n");

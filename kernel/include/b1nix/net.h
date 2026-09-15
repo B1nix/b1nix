@@ -36,7 +36,6 @@ void net_loopback_drain(void);
 void net_loopback_hold(void);
 void net_loopback_release(void);
 int net_is_ready(void);
-void net_dump_info(void);
 void net_interrupt_handler(void);
 /* Acknowledge every registered interface sitting on `irq` and wake net_task if
  * any of them claimed the interrupt. Returns 1 when claimed. */
@@ -186,7 +185,6 @@ void ipv6_realink_smoke(void);
 // ICMP
 void icmp_receive(struct ipv4_addr src, const void *data, usize size);
 void icmp_send_dest_unreachable(struct ipv4_addr dst, u8 code);
-u32 icmp_echo_reply_count(void);
 
 // UDP
 typedef void (*udp_port_handler_t)(const void *data, usize size);
@@ -219,13 +217,10 @@ int net_dhcp_try_failover(void);
 void ntp_tick(u64 now_ticks);
 
 // DNS
-void dns_resolve(const char *domain);
 void dns_receive(const void *data, usize size);
-/* Synchronous resolve: send a query and poll the network until an A record
- * arrives or a short timeout elapses. Returns 0 and fills out[4] on success,
- * -1 on timeout/failure. */
-int dns_resolve_sync(const char *domain, u8 out[4]);
-/* Internal-service variant: same lookup without console diagnostics. */
+/* Synchronous resolve without console diagnostics: send a query and poll the
+ * network until an A record arrives or a short timeout elapses. Returns 0 and
+ * fills out[4] on success, -1 on timeout/failure. */
 int dns_resolve_sync_quiet(const char *domain, u8 out[4]);
 /* Last A-record result captured by dns_receive (1 if available, fills out). */
 int dns_last_result(u8 out[4]);

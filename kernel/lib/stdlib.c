@@ -3,24 +3,8 @@
 #include <b1nix/sched.h>
 #include <stdlib.h>
 #include <string.h>
-#include <b1nix/syscall.h>
 #include <b1nix/mm.h>
 #include <b1nix/arch.h>
-
-void abort(void)
-{
-	/* Print message then exit */
-	const char *msg = "abort() called\n";
-	syscall_dispatch(SYS_WRITE, (u64)(usize)msg, strlen(msg), 0, 0, 0, 0);
-	syscall_dispatch(SYS_EXIT, 1, 0, 0, 0, 0, 0);
-	while (1);
-}
-
-void exit(int status)
-{
-	syscall_dispatch(SYS_EXIT, (u64)status, 0, 0, 0, 0, 0);
-	while (1);
-}
 
 void *malloc(size_t size)
 {
@@ -90,7 +74,6 @@ u64 __udivmoddi4(u64 num, u64 den, u64 *rem) {
 
 u64 __udivdi3(u64 num, u64 den) { return __udivmoddi4(num, den, NULL); }
 u64 __umoddi3(u64 num, u64 den) { u64 rem; __udivmoddi4(num, den, &rem); return rem; }
-
 
 /* Stack-protector runtime.
  *

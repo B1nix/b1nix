@@ -174,11 +174,6 @@ static void dns_resolve_start(const char *domain, int verbose)
 	}
 }
 
-void dns_resolve(const char *domain)
-{
-	dns_resolve_start(domain, 1);
-}
-
 void dns_receive(const void *data, usize size)
 {
 	if (size < sizeof(struct dns_header)) return;
@@ -280,11 +275,6 @@ static int dns_resolve_sync_impl(const char *domain, u8 out[4], int verbose)
 	if (!g_dns_have) return -1;
 	memcpy(out, g_dns_ip, 4);
 	return 0;
-}
-
-int dns_resolve_sync(const char *domain, u8 out[4])
-{
-	return dns_resolve_sync_impl(domain, out, 1);
 }
 
 int dns_resolve_sync_quiet(const char *domain, u8 out[4])

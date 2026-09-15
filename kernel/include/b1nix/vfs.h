@@ -731,6 +731,7 @@ int vfs_timerfd_create(int clockid, int flags);
 int vfs_timerfd_settime(int fd, int flags,
                         const struct b1nix_itimerspec *new_value,
                         struct b1nix_itimerspec *old_value);
+int vfs_timerfd_gettime(int fd, struct b1nix_itimerspec *cur);
 int vfs_signalfd(int fd, u64 mask, int flags);
 int vfs_epoll_create(int flags);
 int vfs_epoll_ctl(int epfd, int op, int fd, struct b1nix_epoll_event *event);

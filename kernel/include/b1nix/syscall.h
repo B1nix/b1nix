@@ -288,14 +288,14 @@ enum {
 	 * block layer already reads ahead internally, and this is the same thing
 	 * asked for explicitly by a program that knows what it is about to read. */
 	SYS_READAHEAD        = 260,
+	/* timerfd_gettime(fd, curr_value): time to the next expiry and interval. */
+	SYS_TIMERFD_GETTIME  = 261,
 };
 
 /* Aliases: linux_abi.c references these generic names; map to the versioned ones. */
 #define SYS_EVENTFD      SYS_EVENTFD2
 #define SYS_EPOLL_CREATE SYS_EPOLL_CREATE1
 #define SYS_SIGNALFD     SYS_SIGNALFD4
-/* timerfd_gettime is not separately numbered in b1nix — fall back to create */
-#define SYS_TIMERFD_GETTIME SYS_TIMERFD_CREATE
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */
 #define B1NIX_CLONE_VM       0x00000100

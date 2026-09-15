@@ -476,11 +476,13 @@ if [ -r /proc/diskstats ] || [ -r /proc/blkcache ]; then
 fi
 dd if=/dev/urandom of=/tmp/bb_dir/w12.bin bs=4096 count=64 2>/dev/null
 /bin/sync
-if /bin/readahead /tmp/bb_dir/w12.bin 2>/dev/null; then
+bb_w12_sum="$(/bin/busybox md5sum < /tmp/bb_dir/w12.bin | cut -d' ' -f1)"
+if /bin/readahead /tmp/bb_dir/w12.bin 2>/dev/null &&
+   ! /bin/readahead /tmp/bb_dir/w12-missing.bin 2>/dev/null; then
 	# The file is warm now: read it back and check the contents survive the
 	# round trip, which is what a prefetch must not disturb.
 	if [ "$(/bin/busybox md5sum < /tmp/bb_dir/w12.bin | cut -d' ' -f1)" \
-	     = "$(/bin/busybox md5sum < /tmp/bb_dir/w12.bin | cut -d' ' -f1)" ]; then
+	     = "$bb_w12_sum" ]; then
 		echo "BB-W12: ok readahead"
 	else
 		echo "BB-W12: FAIL readahead (contents differ after prefetch)"

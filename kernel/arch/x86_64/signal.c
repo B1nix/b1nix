@@ -43,22 +43,13 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
       user_rsp = alt_top;
   }
   struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
-  /* SA_SIGINFO: the handler is the 3-arg form and needs a siginfo_t in RSI and a
-   * ucontext_t in RDX. The Linux personality uses the Linux siginfo/ucontext
-   * layout; native b1nix programs (M74 — RT signals / sigqueue / POSIX timers)
-   * use the native siginfo_t (a null ucontext: the payload of interest is
-   * si_value, which handlers read from the siginfo). Both are placed ABOVE the
-   * sigframe so the handler's downward stack growth never clobbers them. */
-  int is_siginfo = img && img->personality == PERSONALITY_LINUX &&
-                   (sa->sa_flags & SA_SIGINFO);
-  int is_native_siginfo = img && img->personality != PERSONALITY_LINUX &&
-                          (sa->sa_flags & SA_SIGINFO);
+  /* SA_SIGINFO: the handler is the 3-arg form and needs a Linux siginfo_t in
+   * RSI and a ucontext_t in RDX. Both are placed ABOVE the sigframe so the
+   * handler's downward stack growth never clobbers them. */
+  int is_siginfo = img && (sa->sa_flags & SA_SIGINFO);
   u64 si_addr = 0, uc_addr = 0;
   u64 top = user_rsp;
-  if (is_native_siginfo) {
-    si_addr = (top - sizeof(struct b1nix_native_siginfo)) & ~0xFULL;
-    top = si_addr;
-  } else if (is_siginfo) {
+  if (is_siginfo) {
     si_addr = (top - sizeof(struct linux_siginfo)) & ~0xFULL;
     uc_addr = (si_addr - sizeof(struct linux_ucontext)) & ~0xFULL;
     top = uc_addr;
@@ -154,28 +145,6 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
       scheduler_exit_current(-SIGSEGV);
       return;
     }
-  } else if (is_native_siginfo) {
-    /* Native SA_SIGINFO: hand the handler a native siginfo_t carrying the RT
-     * payload in si_value. ucontext (RDX) is null — the payload of interest is
-     * the value, not the saved register set. */
-    struct b1nix_native_siginfo si;
-    memset(&si, 0, sizeof(si));
-    si.si_signo = sig;
-    si.si_code = si_code;
-    si.si_value.sival_ptr = si_val.sival_ptr;
-    { /* M80: fault address for a CPU-fault signal (see the Linux branch). */
-      int fsig = 0, fcode = 0;
-      u64 faddr = 0;
-      if (ptrace_fault_info(t, &fsig, &faddr, &fcode) && fsig == sig) {
-        si.si_code = fcode;
-        si.si_addr = (void *)(usize)faddr;
-      }
-    }
-    if (syscall_copyout((void *)(usize)si_addr, &si, sizeof(si)) < 0) {
-      console_write("signal: failed to build native siginfo\n");
-      scheduler_exit_current(-SIGSEGV);
-      return;
-    }
   }
 
   /* Block mask for handler execution. */
@@ -185,8 +154,8 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
 
   frame->rip = (u64)(usize)sa->sa_handler;
   frame->rsp = restorer_slot;
-  /* A Linux-personality handler expects the Linux signal number, not b1nix's. */
-  if (img && img->personality == PERSONALITY_LINUX) {
+  /* A user handler expects the Linux signal number, not b1nix's. */
+  if (img) {
     int lx = b1nix_signo_to_linux(sig);
     frame->rdi = (u64)(lx ? lx : sig);
   } else {
@@ -195,9 +164,6 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
   if (is_siginfo) {
     frame->rsi = si_addr; /* siginfo_t * */
     frame->rdx = uc_addr; /* ucontext_t * */
-  } else if (is_native_siginfo) {
-    frame->rsi = si_addr; /* native siginfo_t * */
-    frame->rdx = 0;       /* ucontext_t * (not provided) */
   }
   frame->vector = 0; /* Force return via iretq to honor the modified rip */
   /* Note: do NOT update saved_user_rsp here — it already holds the original

@@ -9,17 +9,11 @@
  * Deliberately self-contained: raw syscall inline asm, no libc, no
  * stdio buffering. Smoke just greps the marker. */
 
-#include "syscall.h"
+/* Linux syscall numbers for the target arch (musl's table, no libc code). */
+#include <sys/syscall.h>
 
-#ifdef __linux__
-#undef SYS_WRITE
-#undef SYS_EXIT
-#define SYS_WRITE 1
-#define SYS_EXIT 60
-#endif
-
-/* Hand-rolled syscall (no libc): RAX=number, args in RDI/RSI/RDX, return
- * in RAX. Matches the b1nix x86_64 ABI documented in docs/abi.md. */
+/* Hand-rolled Linux syscall (no libc): number and three arguments in the
+ * arch's syscall registers, result in the first return register. */
 #ifdef __x86_64__
 static long raw_syscall(long n, long a, long b, long c) {
   long ret;
@@ -86,8 +80,8 @@ static int my_strlen(const char *s) {
 void _start(void) {
   for (int i = 0; i < 3; i++) {
     char *p = messages[i];
-    raw_syscall(SYS_WRITE, 1, (long)p, my_strlen(p));
+    raw_syscall(SYS_write, 1, (long)p, my_strlen(p));
   }
-  raw_syscall(SYS_EXIT, 0, 0, 0);
+  raw_syscall(SYS_exit, 0, 0, 0);
   for (;;) {}
 }

@@ -123,17 +123,31 @@ static void test_kill(void) {
     fail("seccomp-kill");
 }
 
+/* Strict mode keeps write(2) and kills on anything else: the child's byte must
+ * arrive through the pipe, and getpid must then end it with SIGSYS. Checking
+ * only the kill passed while the allow-list held numbers no caller used. */
 static void test_strict(void) {
+  int pfd[2];
+  if (pipe(pfd) != 0) {
+    fail("seccomp-strict");
+    return;
+  }
   pid_t c = fork();
   if (c == 0) {
+    close(pfd[0]);
     if (seccomp(SECCOMP_SET_MODE_STRICT, 0, 0) != 0)
       _exit(2);
+    syscall(SYS_write, pfd[1], "s", 1); /* allowed */
     syscall(SYS_GETPID); /* not in the strict allow-list -> killed */
     _exit(99);
   }
+  close(pfd[1]);
+  char got = 0;
+  ssize_t n = read(pfd[0], &got, 1);
+  close(pfd[0]);
   int st = 0;
   waitpid(c, &st, 0);
-  if (WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS)
+  if (n == 1 && got == 's' && WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS)
     ok("seccomp-strict");
   else
     fail("seccomp-strict");

@@ -1961,6 +1961,7 @@ check_output "$LOG" "M56-SMOKE: ok eventfd" "eventfd counter write/read + semaph
 check_output "$LOG" "M56-SMOKE: ok timerfd-epoll" "a repeating timerfd wakes epoll_wait on schedule (the frame clock every event loop runs on)"
 check_output "$LOG" "M56-SMOKE: ok epoll" "epoll_wait wakes on a ready fd and times out when idle"
 check_output "$LOG" "M56-SMOKE: ok timerfd" "timerfd fires and is pollable via epoll"
+check_output "$LOG" "M56-SMOKE: ok timerfd-gettime" "timerfd_gettime reports the time left and the interval, and zeros once disarmed"
 check_output "$LOG" "M56-SMOKE: ok signalfd" "signalfd delivers a raised signal as a readable record"
 check_output "$LOG" "M56-SMOKE: ok seal" "F_SEAL_WRITE on a sealable memfd rejects writes"
 check_output "$LOG" "M56-SMOKE: done" "M56 smoke completes"
@@ -2082,16 +2083,6 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 	check_output "$LOG" "M40-ABI: ok ptrace-peek" "PTRACE_PEEKDATA reads the tracee's memory through its own page tables"
 	check_output "$LOG" "M40-ABI: ok ptrace-cont" "PTRACE_CONT resumes the tracee, which then runs to exit"
 	check_output "$LOG" "M40-ABI: done" "M40 Linux ABI conformance completes with no failures"
-fi
-
-# ── M67 Rust cross-toolchain (x86_64 only: it runs a Rust std program) ──
-if [ "$ARCH" = "x86_64" ]; then
-	section "M67 Rust Cross-Toolchain"
-	check_output "$LOG" "M67-RUST: start" "M67 Rust std smoke starts"
-	check_output "$LOG" "rust on b1nix squares=\[0, 1, 4, 9, 16\] sum=30" "Rust Vec/String/HashMap + iterator sum ran (println! reached the console)"
-	check_output "$LOG" "thread returned 42" "Rust std::thread::spawn + join works (futex bridge to native SYS_FUTEX)"
-	check_output "$LOG" "M67-RUST: ok run-std" "static Rust ELF ran and exited 0"
-	check_output "$LOG" "M67-RUST: done" "M67 Rust smoke completes"
 fi
 
 # ── M119 Developer-Centric Filesystems (fwcfgfs, debugfs, tarfs) ──
