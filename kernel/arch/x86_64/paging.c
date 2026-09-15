@@ -2441,8 +2441,8 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
             } else if (vma->node->inode->read_cb) {
               isize res = vma->node->inode->read_cb(vma->node, file_page, (char *)new_frame_virt, PAGE_SIZE, 0);
               if (res >= 0) {
-                if (page_cache_add_page(vma->node->inode, file_page, frame) == 0) {
-                  pmm_ref_frame(frame); // cache ref + VMA ref
+                if (page_cache_fault_install(vma->node->inode, file_page,
+                                             &frame, mark_dirty)) {
                   /* The frame now belongs to the page cache as well, so it is
                    * shared exactly like the hit path above — every later mapper
                    * of this file page, and every read()/pread(), is served from
@@ -2460,14 +2460,6 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
                    * garbage and died on a #UD, and even a plain read() of the
                    * file returned the runtime pointers instead of its code. */
                   shared_cache_frame = 1;
-                  if (mark_dirty) {
-                    struct page_cache_entry *pe =
-                        page_cache_get_page(vma->node->inode, file_page);
-                    if (pe) {
-                      page_cache_mark_dirty(pe);
-                      page_cache_put_page(pe);
-                    }
-                  }
                 }
               } else {
                 pmm_free_frame(frame);
@@ -2496,18 +2488,9 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
                        (const char *)vma->node->inode->data + file_page,
                        copy_size);
               }
-              if (page_cache_add_page(vma->node->inode, file_page, frame) == 0) {
-                pmm_ref_frame(frame); /* cache ref + VMA ref */
+              if (page_cache_fault_install(vma->node->inode, file_page,
+                                           &frame, mark_dirty))
                 shared_cache_frame = 1;
-                if (mark_dirty) {
-                  struct page_cache_entry *pe =
-                      page_cache_get_page(vma->node->inode, file_page);
-                  if (pe) {
-                    page_cache_mark_dirty(pe);
-                    page_cache_put_page(pe);
-                  }
-                }
-              }
             }
           } else if (vma->node->inode->read_cb) {
             isize res = vma->node->inode->read_cb(vma->node, file_offset, (char *)new_frame_virt, PAGE_SIZE, 0);

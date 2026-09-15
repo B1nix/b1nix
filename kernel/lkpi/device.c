@@ -160,24 +160,25 @@ int lkpi_pm_runtime_put_sync(struct lkpi_device *dev)
 	return 0;
 }
 
+/*
+ * The status queries take no lock, as Linux's do (they read the status word).
+ *
+ * The lock is held across the driver's runtime_suspend/runtime_resume, and a
+ * driver sleeping in one of those waits for other work to finish -- work that
+ * may itself ask whether the device is suspended. Taking the lock for that
+ * question deadlocked the passed-through GPU a minute into a KDE session: the
+ * suspending task held the lock waiting for a worker, and the worker waited on
+ * the lock to read one field. A read that races a transition sees either side
+ * of it, which is all a caller outside the transition could ever know.
+ */
 i32 lkpi_pm_runtime_usage(struct lkpi_device *dev)
 {
-	if (!dev)
-		return 0;
-	lkpi_mutex_lock(&dev->lock);
-	i32 usage = dev->usage;
-	lkpi_mutex_unlock(&dev->lock);
-	return usage;
+	return dev ? (i32)__atomic_load_n(&dev->usage, __ATOMIC_ACQUIRE) : 0;
 }
 
 int lkpi_pm_runtime_suspended(struct lkpi_device *dev)
 {
-	if (!dev)
-		return 0;
-	lkpi_mutex_lock(&dev->lock);
-	int suspended = dev->suspended != 0;
-	lkpi_mutex_unlock(&dev->lock);
-	return suspended;
+	return dev ? __atomic_load_n(&dev->suspended, __ATOMIC_ACQUIRE) != 0 : 0;
 }
 
 /* ── uevents ────────────────────────────────────────────────────── */

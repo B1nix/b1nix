@@ -2021,27 +2021,46 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
   return 0;
 }
 
-/* POSIX: Fsync/Sync support - Flush all dirty blocks to physical storage */
-void blk_flush_buffer(struct block_buffer *buf) {
-  if (!buf || !(buf->flags & BLK_CACHE_DIRTY))
-    return;
+/* Write one dirty slot back. Called with bcache_lock held and the slot VALID,
+ * DIRTY and not BUSY; returns with the lock held again.
+ *
+ * The slot is CLAIMED across the device write. Without the claim a writer
+ * could copy newer data into it and set DIRTY while the DMA was still reading
+ * the old bytes, and clearing DIRTY afterwards then threw that newer write
+ * away: the cache went on serving it, the medium kept the old block, and a
+ * multi-block structure came back from the disk with a new head and an old
+ * tail. Writers wait on BUSY, so what is written is what DIRTY describes. */
+static void bcache_flush_one(struct block_buffer *buf, u64 *flags) {
+  int ok;
 
-  if (buf->bdev && buf->bdev->write_blocks) {
-    /* Only clear DIRTY when the device actually accepted the write. Clearing it
-     * unconditionally on a failed write silently loses the data and lets
-     * blk_sync_all()/umount report success (R3-13). Leave it dirty for retry. */
-    /* Success is a non-negative return, not a zero one.
-     *
-     * write_blocks answers with the number of blocks it wrote — ahci and
-     * virtio-blk both `return (int)count` — and only a negative value is an
-     * error. Testing for zero declared every successful multi-block write a
-     * failure: the blocks stayed DIRTY and were written again on the next
-     * pass, and each coalesced run was followed by a per-block retry loop
-     * that "failed" in the same way. Measured on a KDE start-up, 211587 of
-     * 228027 write commands were a single block and nothing ever came clean. */
-    if (buf->bdev->write_blocks(buf->bdev, buf->block_no, 1, buf->data) >= 0)
-      buf->flags &= ~BLK_CACHE_DIRTY;
+  buf->flags |= BLK_CACHE_BUSY;
+  bcache_release(*flags);
+  /* Only a non-negative return is success, and only then may DIRTY go: a
+   * failed write that cleared it would lose the data and let a later sync
+   * report success (R3-13). write_blocks answers with the number of blocks
+   * written, so zero-is-success would declare every multi-block write a
+   * failure. */
+  ok = buf->bdev->write_blocks(buf->bdev, buf->block_no, 1, buf->data) >= 0;
+  *flags = bcache_acquire();
+  buf->flags &= ~BLK_CACHE_BUSY;
+  if (ok)
+    buf->flags &= ~BLK_CACHE_DIRTY;
+}
+
+/* POSIX: Fsync/Sync support - flush one cache entry to physical storage. */
+void blk_flush_buffer(struct block_buffer *buf) {
+  if (!buf)
+    return;
+  u64 flags = bcache_acquire();
+  while (buf->flags & BLK_CACHE_BUSY) {
+    bcache_release(flags);
+    scheduler_yield();
+    flags = bcache_acquire();
   }
+  if ((buf->flags & BLK_CACHE_VALID) && (buf->flags & BLK_CACHE_DIRTY) &&
+      buf->bdev && buf->bdev->write_blocks)
+    bcache_flush_one(buf, &flags);
+  bcache_release(flags);
 }
 
 /* Give back the claims blk_flush_matching took, clearing DIRTY on the ones the
@@ -2305,7 +2324,7 @@ static void bcache_drain_all(void) {
       if (b->flags & BLK_CACHE_BUSY)
         continue;
       if (!set) {
-        blk_flush_buffer(b);
+        bcache_flush_one(b, &flags);
         continue;
       }
       if (n == cap) {
@@ -2393,6 +2412,11 @@ static void blk_flush_matching(struct block_device *dev, u64 first, u64 last,
   usize n = 0;
   u8 *bounce = 0;
   usize base = 0;
+  int busy_seen;
+
+again:
+  busy_seen = 0;
+  base = 0;
 
   while (base < block_cache_n) {
     usize stop = base + SCAN_CHUNK;
@@ -2413,11 +2437,16 @@ static void blk_flush_matching(struct block_device *dev, u64 first, u64 last,
       if (ino && !(b->dirty_ino == 0 ||
                    (b->dirty_ino == ino && b->dirty_fsid == fsid)))
         continue;
-      /* Already in flight somewhere else — leave it to whoever claimed it. */
-      if (b->flags & BLK_CACHE_BUSY)
+      /* Already in flight somewhere else. Not ours to write -- but a sync
+       * that returns before it lands lets the filesystem's barrier, and the
+       * super block after it, reach the disk ahead of the data they name.
+       * Remember it and wait below. */
+      if (b->flags & BLK_CACHE_BUSY) {
+        busy_seen = 1;
         continue;
+      }
       if (!set) {
-        blk_flush_buffer(b); /* no memory for the set: the old behaviour */
+        bcache_flush_one(b, &flags); /* no memory for the set */
         continue;
       }
       if (n == cap) {
@@ -2462,11 +2491,16 @@ static void blk_flush_matching(struct block_device *dev, u64 first, u64 last,
     }
     base = resume;
   }
-  if (set) {
-    if (n)
-      blk_flush_sorted(set, n, &bounce);
-    kfree(set);
+  if (set && n) {
+    blk_flush_sorted(set, n, &bounce);
+    n = 0;
   }
+  if (busy_seen) {
+    scheduler_yield();
+    goto again;
+  }
+  if (set)
+    kfree(set);
   if (bounce)
     kfree(bounce);
 }
@@ -2783,7 +2817,15 @@ void blk_cache_invalidate_range(struct block_device *dev, u64 lba, u32 count) {
     u64 flags = bcache_acquire();
     struct block_buffer *e = bcache_find(dev, lba + i);
 
-    if (e && !(e->flags & BLK_CACHE_BUSY)) {
+    /* A copy in flight is still a copy: skipping it left a stale block that
+     * later reads would be served from. */
+    if (e && (e->flags & BLK_CACHE_BUSY)) {
+      bcache_release(flags);
+      scheduler_yield();
+      i--;
+      continue;
+    }
+    if (e) {
       bcache_hash_remove((i32)(e - block_cache));
       e->flags &= ~(BLK_CACHE_VALID | BLK_CACHE_DIRTY);
     }
@@ -2896,11 +2938,23 @@ void blk_cache_invalidate(struct block_device *dev) {
     }
     if (block_cache[i].bdev == dev && block_cache[i].block_no >= first &&
         block_cache[i].block_no < last) {
-      if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
-        struct block_buffer *buf = &block_cache[i];
+      /* In flight: a reader filling it or a writer draining it holds the
+       * claim, and zeroing the slot under it frees it for reuse while that
+       * I/O still ends by clearing BUSY and DIRTY -- on whatever the slot
+       * holds by then. Wait for it, then look at this slot again. */
+      if (block_cache[i].flags & BLK_CACHE_BUSY) {
         bcache_release(flags);
-        blk_flush_buffer(buf);
+        scheduler_yield();
         flags = bcache_acquire();
+        i--;
+        continue;
+      }
+      if ((block_cache[i].flags & BLK_CACHE_VALID) &&
+          (block_cache[i].flags & BLK_CACHE_DIRTY) && block_cache[i].bdev &&
+          block_cache[i].bdev->write_blocks) {
+        bcache_flush_one(&block_cache[i], &flags);
+        i--; /* the lock was dropped: re-examine the slot */
+        continue;
       }
       /* Unhash before zeroing — otherwise the chain head ends up pointing
        * at a slot whose (bdev, block_no) keys are 0, polluting future

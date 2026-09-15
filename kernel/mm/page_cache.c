@@ -1099,6 +1099,42 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   return 0;
 }
 
+int page_cache_fault_install(struct vfs_inode *inode, u64 offset, u64 *frame,
+                             int mark_dirty) {
+  /* Two faults on one file page -- two render threads of a client drawing into
+   * its shared-memory buffer -- both miss the cache and both fill a frame. Only
+   * one can be published. The other used to map its own frame anyway, so that
+   * thread's writes went to a page nobody else could see: the compositor read
+   * the cached one and showed 4 KiB of stale zeros in the window, for as long
+   * as the client kept that buffer. The loser adopts the winner's frame. */
+  for (int tries = 0; tries < 4; tries++) {
+    struct page_cache_entry *page;
+    int rc = page_cache_add_page(inode, offset, *frame);
+
+    if (rc == 0) {
+      pmm_ref_frame(*frame); /* cache ref + mapping ref */
+      if (mark_dirty && (page = page_cache_get_page(inode, offset))) {
+        page_cache_mark_dirty(page);
+        page_cache_put_page(page);
+      }
+      return 1;
+    }
+    if (rc != -EEXIST)
+      return 0;
+    page = page_cache_get_page(inode, offset);
+    if (!page)
+      continue; /* evicted since: publish ours after all */
+    pmm_free_frame(*frame);
+    *frame = page->frame;
+    pmm_ref_frame(*frame); /* mapping ref */
+    if (mark_dirty)
+      page_cache_mark_dirty(page);
+    page_cache_put_page(page);
+    return 1;
+  }
+  return 0;
+}
+
 /* Inodes with dirty pages, for the writeback thread.
  *
  * Dirty pages used to reach the disk only when the file was closed: close(2)
@@ -1465,6 +1501,11 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
          * anyway. */
         if (pc_unlink_unreferenced(curr)) {
           lru_remove(curr);
+          if (curr->flags & PAGE_CACHE_DIRTY) {
+            __atomic_sub_fetch(&g_pc_dirty_pages, 1, __ATOMIC_RELEASE);
+            if (curr->inode && curr->inode->dirty_pages)
+              __atomic_sub_fetch(&curr->inode->dirty_pages, 1, __ATOMIC_RELEASE);
+          }
           pmm_free_frame(curr->frame);
           /* Before clearing the owner, not after: the old order read
            * curr->inode when it had just been set to 0, so the inode's page

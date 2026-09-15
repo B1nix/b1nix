@@ -1632,7 +1632,8 @@ void lkpi_i915_start_tearwatch(struct drm_device *dev)
 	    /* Not a thread of its own: it only needs the device pointer so the
 	     * event path can read the plane registers. */
 	    !lkpi_bootflag("b1nix.drm-eventwatch") &&
-	    !lkpi_bootopt_u32("b1nix.drm-framedump", 0))
+	    !lkpi_bootopt_u32("b1nix.drm-framedump", 0) &&
+	    !lkpi_bootflag("b1nix.drm-framedump-key"))
 		return;
 	tearwatch_i915 = dev;
 	if (lkpi_bootflag("b1nix.drm-tearwatch") ||
@@ -1644,7 +1645,8 @@ void lkpi_i915_start_tearwatch(struct drm_device *dev)
 		lkpi_fs_kthread_run(i915_tearwatch_thread, 0, "i915-tearwatch");
 	if (lkpi_bootflag("b1nix.drm-crcwatch"))
 		lkpi_fs_kthread_run(i915_crcwatch_thread, 0, "i915-crcwatch");
-	if (lkpi_bootopt_u32("b1nix.drm-framedump", 0)) {
+	if (lkpi_bootopt_u32("b1nix.drm-framedump", 0) ||
+	    lkpi_bootflag("b1nix.drm-framedump-key")) {
 		pr_info("i915: framedump: %u frame(s) from t+%us every %ums\n",
 		        lkpi_bootopt_u32("b1nix.drm-framedump", 0),
 		        lkpi_bootopt_u32("b1nix.drm-framedump-at", 45),
@@ -1680,6 +1682,8 @@ static unsigned fd_step(void)
 	return (s == 1u || s == 2u || s == 4u || s == 8u) ? s : 4u;
 }
 #define FD_CHUNK  100u	/* pixels per log line: 200 hex chars, well under 512 */
+#define FD_CHUNK_RGB 64u	/* 6 hex digits per pixel with b1nix.drm-framedump-rgb */
+extern volatile unsigned int ps2_kbd_scrolllock_presses;
 
 static void *fd_map_ggtt(struct i915_ggtt *ggtt, u32 ggtt_addr)
 {
@@ -1707,17 +1711,31 @@ static int i915_framedump_thread(void *arg)
 	u32 frames = lkpi_bootopt_u32("b1nix.drm-framedump", 1);
 	u32 at = lkpi_bootopt_u32("b1nix.drm-framedump-at", 45);
 	u32 every = lkpi_bootopt_u32("b1nix.drm-framedump-every", 250);
-	u32 n;
+	bool on_key = lkpi_bootflag("b1nix.drm-framedump-key");
+	bool rgb = lkpi_bootflag("b1nix.drm-framedump-rgb");
+	u32 chunk = rgb ? FD_CHUNK_RGB : FD_CHUNK;
+	unsigned int seen_key = ps2_kbd_scrolllock_presses;
+	u32 n, total = 0;
 
 	(void)arg;
 	if (!i915)
 		return 0;
 	ggtt = to_gt(i915)->ggtt;
-	pr_info("i915: framedump thread up\n");
-	while (at--)
-		lkpi_sleep_ms(1000);
+	pr_info("i915: framedump thread up%s%s\n",
+	        on_key ? ", Scroll Lock or F12 triggers" : "", rgb ? ", rgb" : "");
+	if (!on_key)
+		while (at--)
+			lkpi_sleep_ms(1000);
 
-	for (n = 0; n < frames; n++) {
+next_burst:
+	if (on_key) {
+		while (ps2_kbd_scrolllock_presses == seen_key)
+			lkpi_sleep_ms(20);
+		seen_key = ps2_kbd_scrolllock_presses;
+		pr_info("FD: key burst at %llu ms\n",
+		        (unsigned long long)(ktime_get_ns() / 1000000ull));
+	}
+	for (n = total; n < total + frames; n++) {
 		int pipe = tearwatch_pipe();
 		u32 vdisplay = tearwatch_vdisplay();
 		u32 surf, stride, dsl0, dsl1, y;
@@ -1749,16 +1767,16 @@ static int i915_framedump_thread(void *arg)
 			u32 x = 0;
 
 			while (x < width) {
-				char line[2 * FD_CHUNK + 1];
-				u32 got = 0;
+				char line[6 * FD_CHUNK_RGB + 1];
+				u32 got = 0, len = 0;
 
-				while (got < FD_CHUNK && x < width) {
+				while (got < chunk && x < width) {
 					const volatile u32 *pw = fd_map_ggtt(ggtt,
 					                           surf + y * stride + x * 4u);
 					u32 lum = 0;
+					u32 v = pw ? fd_read32(pw) : 0;
 
 					if (pw) {
-						u32 v = fd_read32(pw);
 						const u8 px[4] = { (u8)v, (u8)(v >> 8),
 						                   (u8)(v >> 16), (u8)(v >> 24) };
 						/* XRGB8888: B, G, R. A rough luminance is
@@ -1768,12 +1786,19 @@ static int i915_framedump_thread(void *arg)
 						if (lum > 255)
 							lum = 255;
 					}
-					line[got * 2] = "0123456789abcdef"[lum >> 4];
-					line[got * 2 + 1] = "0123456789abcdef"[lum & 15];
+					if (rgb) {
+						int sh;
+
+						for (sh = 20; sh >= 0; sh -= 4)
+							line[len++] = "0123456789abcdef"[(v >> sh) & 15];
+					} else {
+						line[len++] = "0123456789abcdef"[lum >> 4];
+						line[len++] = "0123456789abcdef"[lum & 15];
+					}
 					got++;
 					x += step;
 				}
-				line[got * 2] = 0;
+				line[len] = 0;
 				pr_info("FD%u %u %u %s\n", n, y,
 				        (x - got * step) / step, line);
 			}
@@ -1784,6 +1809,9 @@ static int i915_framedump_thread(void *arg)
 		                             PLANE_SURFLIVE(pipe, PLANE_PRIMARY)));
 		lkpi_sleep_ms(every);
 	}
+	total = n;
+	if (on_key)
+		goto next_burst;
 	pr_info("FD: done\n");
 	return 0;
 }

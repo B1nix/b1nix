@@ -1488,6 +1488,27 @@ static int sched_ap_idle_cpu_of(const struct task *t) {
  * cur_task somewhere with stack_released==0 is therefore actively running (it
  * was woken BLOCKED->READY mid-flight and kept running) and will not publish
  * stack_released soon — the picker must not wait on it. */
+int task_claim(struct task *t) {
+  int one = 1;
+  enum task_state expected = TASK_READY;
+
+  if (task_running_somewhere(t))
+    return 0;
+  if (!__atomic_compare_exchange_n(&t->stack_released, &one, 0, 0,
+                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+    return 0;
+  /* Holding the lease, re-ask: a task that is some CPU's current task with a
+   * published lease is the stale-lease shape (sched_handoff_recover), and it is
+   * still executing. */
+  if (task_running_somewhere(t) ||
+      !__atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING, 0,
+                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    __atomic_store_n(&t->stack_released, 1, __ATOMIC_RELEASE);
+    return 0;
+  }
+  return 1;
+}
+
 int task_running_somewhere(struct task *t) {
   for (int c = 0; c < g_max_cpus; c++) {
     struct percpu *pc = get_percpu_n(c);
@@ -1688,9 +1709,11 @@ static struct task *pick_next_task(void) {
       if (t != current_task && task_running_somewhere(t))
         continue;
       enum task_state expected = TASK_READY;
-      if (__atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING,
-                                      0, __ATOMIC_ACQUIRE,
-                                      __ATOMIC_RELAXED)) {
+      if (t != current_task
+              ? task_claim(t)
+              : __atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING,
+                                            0, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_RELAXED)) {
         /* The stack is this CPU's again from here on. */
         __atomic_store_n(&t->stack_released, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&g_task_switching_out[task_index(t)], 0,
@@ -1782,9 +1805,11 @@ static struct task *pick_next_task(void) {
        * starting a fresh scan here can spin under contention without ever
        * settling, so the cleaner shape is "treat as no-work and try again". */
       enum task_state expected = TASK_READY;
-      if (__atomic_compare_exchange_n(&best_task->state, &expected,
-                                      TASK_RUNNING, 0, __ATOMIC_ACQUIRE,
-                                      __ATOMIC_RELAXED)) {
+      if (best_task != current_task
+              ? task_claim(best_task)
+              : __atomic_compare_exchange_n(&best_task->state, &expected,
+                                            TASK_RUNNING, 0, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_RELAXED)) {
         __atomic_store_n(&best_task->stack_released, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&g_task_switching_out[task_index(best_task)], 0,
                          __ATOMIC_RELEASE);
@@ -8679,6 +8704,69 @@ sched_sigwait_notify(T(p), SIGCHLD);
   }
 }
 
+/*
+ * The calling task stops itself on a job-control signal.
+ *
+ * Every stop is taken this way, by the task on its own CPU. kill() used to
+ * write TASK_STOPPED into the target from the sender's CPU, and a target
+ * running there wrote its own state straight over it -- a child spinning in
+ * sched_yield() carried on with stop_report_pending set and a state that was
+ * never STOPPED again, so waitpid(WUNTRACED) waited for it for ever (about one
+ * posix lane in five). The report flag goes up before the state, so a waiter
+ * that sees STOPPED also sees something to report. A thread pulled into its
+ * group's stop parks without a report of its own.
+ */
+/*
+ * Stop a task that is parked, from another CPU. Returns 1 if it was stopped.
+ *
+ * Only a task that is off every CPU and asleep can be stopped this way, and
+ * only by CAS: its context is saved, so nothing can write its state over the
+ * stop, and a continue later puts it back into the wait it was in -- a sleep
+ * carries on sleeping, as a stopped `sleep 60` must. Waking it to stop itself
+ * instead ended that sleep with EINTR and the sleeper exited. A task that is
+ * running, or about to, is left to take the pending signal on its own CPU
+ * (scheduler_self_stop).
+ */
+static int stop_parked_task(struct task *t, int sig) {
+  if (t == current_task || ptrace_is_traced(t) || task_running_somewhere(t))
+    return 0;
+  for (int tries = 0; tries < 2; tries++) {
+    enum task_state expected = (enum task_state)__atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
+
+    if (expected != TASK_BLOCKED && expected != TASK_SLEEPING)
+      return 0;
+    if (__atomic_compare_exchange_n(&t->state, &expected, TASK_STOPPED, 0,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      t->last_stop_signal = sig;
+      __atomic_fetch_and(&t->pending_signals, ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
+      t->stop_report_pending = 1;
+      post_sigchld_to_parent(t->parent_id, 1);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+void scheduler_self_stop(int sig) {
+  struct task *t = current_task;
+  usize ix;
+
+  if (!t)
+    return;
+  ix = task_index(t);
+  t->last_stop_signal = sig;
+  __atomic_fetch_and(&t->pending_signals, ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
+  if (g_task_stop_quiet[ix]) {
+    g_task_stop_quiet[ix] = 0;
+    t->state = TASK_STOPPED;
+    return;
+  }
+  t->stop_report_pending = 1;
+  t->state = TASK_STOPPED;
+  post_sigchld_to_parent(t->parent_id, 1);
+  scheduler_notify_wait_event(t->parent_id);
+}
+
 /* OOM reclaim: SIGKILL the current userspace task — the one whose allocation
  * the PMM cannot satisfy — so its address space is torn down and its memory
  * reclaimed, instead of returning ENOMEM forever (which a JS engine or any
@@ -8730,16 +8818,13 @@ int scheduler_kill(usize task_id, int sig) {
 sched_sigwait_notify(T(i), sig);
 
       if (T(i) != current_task && !ptrace_is_traced(T(i)) &&
-          (sig == SIGSTOP || sig == SIGTSTP ||
-           sig == SIGTTIN || sig == SIGTTOU)) {
-        __atomic_fetch_and(&T(i)->pending_signals, ~(1ULL << (sig - 1)),
-                           __ATOMIC_RELAXED);
-        T(i)->last_stop_signal = sig;
-        T(i)->stop_report_pending = 1;
-        T(i)->state = TASK_STOPPED;
-        post_sigchld_to_parent(T(i)->parent_id, 1);
+          (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU)) {
+        /* Parked: stopped where it sleeps. Otherwise it takes the pending
+         * stop itself on its own CPU; waking it would cut a sleep short. */
+        int parked = stop_parked_task(T(i), sig);
         interrupts_restore(flags);
-        scheduler_notify_wait_event(T(i)->parent_id);
+        if (parked)
+          scheduler_notify_wait_event(T(i)->parent_id);
         return 0;
       }
 
@@ -9169,17 +9254,13 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
 sched_sigwait_notify(T(i), sig);
 
       if (T(i) != current_task && !ptrace_is_traced(T(i)) &&
-          (sig == SIGSTOP || sig == SIGTSTP ||
-           sig == SIGTTIN || sig == SIGTTOU)) {
-        __atomic_fetch_and(&T(i)->pending_signals, ~(1ULL << (sig - 1)),
-                           __ATOMIC_RELAXED);
-        T(i)->last_stop_signal = sig;
-        T(i)->stop_report_pending = 1;
-        T(i)->state = TASK_STOPPED;
-        post_sigchld_to_parent(T(i)->parent_id, 1);
-        interrupts_restore(flags);
-        scheduler_notify_wait_event(T(i)->parent_id);
-        flags = interrupts_save();
+          (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU)) {
+        /* See scheduler_kill. */
+        if (stop_parked_task(T(i), sig)) {
+          interrupts_restore(flags);
+          scheduler_notify_wait_event(T(i)->parent_id);
+          flags = interrupts_save();
+        }
         sent++;
         continue;
       }
@@ -10728,20 +10809,8 @@ void scheduler_deliver_pending_signals(void) {
          * the signal pending; the return-to-user path picks it up. */
         if (ptrace_is_traced(current_task))
           continue;
-        current_task->state = TASK_STOPPED;
-        current_task->last_stop_signal = sig;
-        /* M86: a group stop reports to the parent ONCE, from the thread-group
-         * leader. Siblings that were pulled into the same stop park silently —
-         * otherwise waitpid(WUNTRACED) reports the job stopped once per
-         * thread. */
-        if (g_task_stop_quiet[task_index(current_task)]) {
-          g_task_stop_quiet[task_index(current_task)] = 0;
-        } else {
-          current_task->stop_report_pending = 1;
-          scheduler_notify_wait_event(current_task->parent_id);
-        }
-        __atomic_fetch_and(&current_task->pending_signals,
-                           ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
+        /* M86: a group stop reports to the parent once, from the leader. */
+        scheduler_self_stop(sig);
         continue;
       case SIGCHLD:
       case SIGURG:

@@ -1920,6 +1920,7 @@ void kernel_main(usize arg0, usize arg1)
 	    !bootinfo_has_flag("b1nix.drm-gsmtrap") &&
 	    !bootinfo_has_flag("b1nix.drm-cadence") &&
 	    !bootinfo_get_u32("b1nix.drm-framedump", 0) &&
+	    !bootinfo_has_flag("b1nix.drm-framedump-key") &&
 	    !bootinfo_has_flag("b1nix.sysprof") &&
 	    !bootinfo_has_flag("b1nix.trace-sysfs") &&
 	    !bootinfo_has_flag("b1nix.trace-open")) {

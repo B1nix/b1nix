@@ -549,11 +549,7 @@ void ap_main(u32 cpu_id) {
             t = NULL;
         }
         if (t) {
-            enum task_state expected = TASK_READY;
-
-            if (!__atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING,
-                                             0, __ATOMIC_ACQUIRE,
-                                             __ATOMIC_RELAXED)) {
+            if (!task_claim(t)) {
                 rq_enqueue(&pcpu->runqueue, t);
                 t = NULL;
             } else {

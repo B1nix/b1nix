@@ -521,11 +521,18 @@ bool mapping_tagged(struct address_space *mapping, xa_mark_t tag)
 /* ── truncate and invalidate ────────────────────────────────────── */
 
 /*
- * Drop every cached folio in a range.
+ * Drop every cached folio in a byte range; lend is inclusive, -1 means to the
+ * end of the file.
  *
- * Dirty folios are dropped too — that is what makes this a truncate rather
- * than a writeback: the bytes are going away, and writing them out first would
- * be work whose result is immediately discarded.
+ * Only folios that lie wholly inside the range go. A folio that straddles an
+ * edge keeps the bytes outside the range and has the ones inside zeroed, as
+ * upstream's truncate_inode_partial_folio does. Dropping it whole threw away
+ * data below the new end of file: a shrink to the middle of a page lost the
+ * start of that page, and on ext4 with delayed allocation -- where the bytes
+ * existed only in this folio -- the file came back with zeros there.
+ *
+ * Dirty folios in the range are dropped too: the bytes are going away, and
+ * writing them out first would be work whose result is immediately discarded.
  */
 void truncate_inode_pages_range(struct address_space *mapping, loff_t lstart,
                                 loff_t lend)
@@ -547,16 +554,32 @@ void truncate_inode_pages_range(struct address_space *mapping, loff_t lstart,
 	 * 96% of the kernel's samples inside this function's xa_load.
 	 */
 	while ((folio = filemap_find_get(mapping, &index, end)) != NULL) {
+		unsigned long next = (unsigned long)((folio_pos(folio) +
+		                                      (loff_t)folio_size(folio)) >> PAGE_SHIFT);
+
 		folio_lock(folio);
 		if (folio->mapping == mapping) {
-			folio_clear_dirty(folio);
-			filemap_remove_folio(folio);
+			loff_t fstart = folio_pos(folio);
+			loff_t fend = fstart + (loff_t)folio_size(folio) - 1;
+
+			if (fstart >= lstart && (lend == (loff_t)-1 || fend <= lend)) {
+				folio_clear_dirty(folio);
+				filemap_remove_folio(folio);
+			} else {
+				loff_t zs = fstart > lstart ? fstart : lstart;
+				loff_t ze = (lend == (loff_t)-1 || fend < lend) ? fend : lend;
+
+				if (ze >= zs)
+					folio_zero_range(folio, (size_t)(zs - fstart),
+					                 (size_t)(ze - zs + 1));
+			}
 		}
 		folio_unlock(folio);
+		/* The folio may span several indices; resume past its end. */
+		index = next;
 		folio_put(folio);
-		if (index >= end)
+		if (index == 0 || index > end)
 			break;
-		index++;
 	}
 }
 

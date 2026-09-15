@@ -65,6 +65,11 @@ struct vfs_inode *page_cache_take_dirty_inodes(void);
 // Adds a new page cache entry. Takes ownership of the frame if successful.
 // Returns 0 on success, < 0 on error.
 int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame);
+/* Page fault: publish a freshly filled *frame as the cached page, or adopt the
+ * one another fault published first. Returns 1 with *frame the cache frame and
+ * one reference for the mapping, 0 if the page could not be cached. */
+int page_cache_fault_install(struct vfs_inode *inode, u64 offset, u64 *frame,
+                             int mark_dirty);
 /* Fill a run of pages from one filesystem read. See page_cache.c. */
 void page_cache_read_cluster(struct vfs_inode *inode, u64 offset,
                              unsigned pages);

@@ -798,17 +798,7 @@ static int file_fill_fault_body(u64 *l3, usize i3, u64 va, u64 lazy_entry) {
         pmm_free_frame(frame);
         return -1;
       }
-      if (page_cache_add_page(in, file_page, frame) == 0) {
-        pmm_ref_frame(frame);         /* cache reference + this mapping's */
-        cache_frame = 1;
-        if (mark_dirty) {
-          struct page_cache_entry *pe = page_cache_get_page(in, file_page);
-          if (pe) {
-            page_cache_mark_dirty(pe);
-            page_cache_put_page(pe);
-          }
-        }
-      }
+      cache_frame = page_cache_fault_install(in, file_page, &frame, mark_dirty);
     } else if (in->data) {
       /* A file whose contents live in memory: initramfs, and everything the
        * VFS creates — which includes POSIX shared memory, since shm_open is
@@ -822,10 +812,7 @@ static int file_fill_fault_body(u64 *l3, usize i3, u64 va, u64 lazy_entry) {
           n = PAGE_SIZE;
         memcpy(phys_to_virt(frame), (const char *)in->data + file_page, n);
       }
-      if (page_cache_add_page(in, file_page, frame) == 0) {
-        pmm_ref_frame(frame);
-        cache_frame = 1;
-      }
+      cache_frame = page_cache_fault_install(in, file_page, &frame, mark_dirty);
     }
   } else if (in->read_cb) {
     /* Not a regular file (a device, say): no page cache, read straight in. */

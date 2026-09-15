@@ -717,6 +717,8 @@ u64 kernel_random_u64(void);
 void scheduler_wake_task(usize task_id);
 void scheduler_wake_all(void *chan);
 void scheduler_notify_wait_event(usize parent_id);
+/* The calling task stops on a job-control signal and reports it. */
+void scheduler_self_stop(int sig);
 void scheduler_sleep_ticks(u64 ticks);
 void scheduler_on_timer_tick(void);
 void scheduler_exit_current(int exit_code) __attribute__((noreturn));
@@ -896,6 +898,15 @@ void vma_cache_forget(struct task *t);
  * can mark a live task READY, and the lease stays published for as long as it
  * runs. Every path that claims a task to run must consult this. */
 int task_running_somewhere(struct task *t);
+/* Claim a READY task for this CPU.
+ *
+ * The kernel-stack lease is the ownership token: arch_context_switch publishes
+ * it (1) only after the outgoing CPU has saved the context and left the stack,
+ * and a claimer takes it with a CAS 1 -> 0. Exactly one CPU can win that CAS, so
+ * exactly one CPU may load the saved context -- whatever a waker did to the
+ * state meanwhile. The state CAS READY -> RUNNING follows; losing it hands the
+ * lease back. Returns 1 when this CPU owns the task. */
+int task_claim(struct task *t);
 /* The task this CPU was running immediately before the one it is switching to,
  * or NULL outside that window. SP still belongs to it until
  * arch_context_switch loads the incoming stack pointer. */

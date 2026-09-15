@@ -285,11 +285,7 @@ static void arch_deliver_signals_body(struct interrupt_frame *frame) {
                     }
                 } else if (i == SIGSTOP || i == SIGTSTP ||
                            i == SIGTTIN || i == SIGTTOU) {
-                    current_task->state = TASK_STOPPED;
-                    current_task->last_stop_signal = i;
-                    current_task->stop_report_pending = 1;
-                    __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
-                    scheduler_notify_wait_event(current_task->parent_id);
+                    scheduler_self_stop(i);
                     interrupts_enable();
                     scheduler_yield();
                     return;

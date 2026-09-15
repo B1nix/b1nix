@@ -240,6 +240,10 @@ static void kbd_handle_keypad(u8 scancode)
 
 extern void ps2_mouse_handle_byte(u8 data);
 
+/* Scroll Lock or F12 presses, for diagnostics a person at the screen triggers
+ * (b1nix.drm-framedump-key). */
+volatile unsigned int ps2_kbd_scrolllock_presses;
+
 void ps2_kbd_handle_byte(u8 scancode)
 {
 	if (kbd_debug_enabled) {
@@ -256,6 +260,8 @@ void ps2_kbd_handle_byte(u8 scancode)
 	/* M47: mirror the raw make/break stream to /dev/input/event0 before the
 	 * console line discipline consumes it (keymaps live in userspace). */
 	input_kbd_scancode(scancode, extended_scancode);
+	if (!extended_scancode && (scancode == 0x46 || scancode == 0x58))
+		ps2_kbd_scrolllock_presses++;
 
 	if (scancode & 0x80) {
 		// Key release

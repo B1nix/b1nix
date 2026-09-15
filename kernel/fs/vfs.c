@@ -39,6 +39,7 @@
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/vfs.h>
+#include <b1nix/kprintf.h>
 #include <b1nix/posix.h>
 #include <stdio.h>
 #include <string.h>
@@ -7498,6 +7499,15 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
         u64 next = (u64)h->offset;
         res = dir->inode->readdir_at_cb(dir, (u64)h->offset, buf, max_entries,
                                         &next);
+        /* A filesystem cookie carrying the in-memory phase bit cannot be
+         * stored: it would read back as "filesystem done". Refuse it loudly
+         * rather than truncate the listing. */
+        if (res > 0 && (next & VFS_DIR_MEM_CURSOR)) {
+          k_err("vfs", "readdir cookie 0x%llx collides with the cursor phase bit",
+                (unsigned long long)next);
+          res = -EOVERFLOW;
+          goto out;
+        }
         if (res > 0)
           h->offset = (usize)next;
       } else {

@@ -397,11 +397,7 @@ struct task *sched_steal_task(void) {
         if (t->state == TASK_READY && t->stealable &&
             __atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE) &&
             !task_running_somewhere(t)) {
-            enum task_state expected = TASK_READY;
-
-            if (__atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING,
-                                            0, __ATOMIC_ACQUIRE,
-                                            __ATOMIC_RELAXED)) {
+            if (task_claim(t)) {
                 /* The stack belongs to this CPU from here on. */
                 __atomic_store_n(&t->stack_released, 0, __ATOMIC_RELEASE);
                 return t;

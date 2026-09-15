@@ -550,6 +550,17 @@ static u64 find_early_mem(const struct boot_info *boot_info, usize size) {
     if (k_end > start && k_start < end) {
       search_addr = k_end;
     }
+#if defined(__x86_64__)
+    /* Nothing below 1 MiB. Firmware reports the low 640 KiB as available, and
+     * the frame allocator does keep it (everything under the kernel is marked
+     * used), but this search ran before that and put the bitmaps at physical
+     * 0 -- where the AP start-up trampoline is copied later, at 0x8000. The
+     * trampoline's bytes landed in the page-table claim bitmap on a small
+     * guest and in the allocation bitmap itself on a larger one: frames with
+     * no history came out as live page tables, or as free while in use. */
+    if (search_addr < 0x100000ULL)
+      search_addr = 0x100000ULL;
+#endif
 
     /* Step past everything that already owns memory here. Repeated, because
      * moving clear of one reservation can land on the next. */

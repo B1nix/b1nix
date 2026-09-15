@@ -389,6 +389,15 @@ int lkpi_bridge_iterate(void *dirp, unsigned long long cookie,
 	ret = bridge_open(&f, d, 0);
 	if (ret)
 		return ret;
+	/*
+	 * Directory cookies no wider than 32 bits, as Linux gives a 32-bit
+	 * caller. ext4's 64-bit htree cookie is (major hash >> 1) << 32 | minor,
+	 * which sets bit 62 for half of all names -- the bit the VFS cursor
+	 * reserves for "the filesystem's half of the listing is done". Every
+	 * getdents batch that ended on such a name ended the listing, and a
+	 * large directory lost about half its entries.
+	 */
+	f.f_mode |= FMODE_32BITHASH;
 	if (!f.f_op || !f.f_op->iterate_shared) {
 		bridge_close(&f);
 		return -ENOTDIR;
