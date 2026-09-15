@@ -35,6 +35,7 @@ struct msg_queue {
   u64 qbytes;   /* capacity in bytes */
   u64 cbytes;   /* bytes currently queued */
   u64 stime, rtime, ctime;
+  u32 lspid, lrpid; /* last msgsnd / msgrcv caller */
 };
 
 static struct msg_queue g_queues[MSGMNI];
@@ -133,6 +134,7 @@ isize sysv_msgsnd(int msqid, i64 mtype, const void *text, usize size,
       q->msgs[slot].text = copy;
       q->cbytes += size;
       q->stime = vfs_get_unix_time();
+      q->lspid = (u32)scheduler_get_pid();
       spin_unlock_irqrestore(&g_msg_lock, flags);
       scheduler_wake_all(msg_chan(msqid));
       return (isize)size;
@@ -207,6 +209,7 @@ isize sysv_msgrcv(int msqid, i64 msgtyp, void *text, usize size, int msgflg,
       m->used = 0;
       m->text = 0;
       q->rtime = vfs_get_unix_time();
+      q->lrpid = (u32)scheduler_get_pid();
       spin_unlock_irqrestore(&g_msg_lock, flags);
       kfree(freed);
       scheduler_wake_all(msg_chan(msqid)); /* a blocked sender may fit now */
@@ -240,6 +243,9 @@ int sysv_msgctl_stat(int msqid, struct sysv_msqid_info *out) {
   out->msg_ctime = q->ctime;
   out->msg_qnum = qnum;
   out->msg_qbytes = q->qbytes;
+  out->msg_cbytes = q->cbytes;
+  out->msg_lspid = q->lspid;
+  out->msg_lrpid = q->lrpid;
   spin_unlock_irqrestore(&g_msg_lock, flags);
   return 0;
 }

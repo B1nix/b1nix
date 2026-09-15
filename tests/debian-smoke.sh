@@ -182,7 +182,7 @@ check_output "DEBIAN-SMOKE: ok stage3-init" "stage3: running under a real init"
 
 # The kernel surfaces our own userspace binaries cover, asserted by Debian's
 # own bash, perl and util-linux instead. Each name matches what it replaces:
-# proc-* and sig-* stand in for m12/m15, fd-* for m12/m13, errno-* for m17,
+# proc-* and sig-* stand in for m12/m15, fd-* for m12/m13, errno-* and rename-* for m17,
 # ipc-* for m15, job-* for m13_job_control.
 for probe in \
 	"proc-exit-status:exit status reaches the parent" \
@@ -208,7 +208,18 @@ for probe in \
 	"job-stop:SIGSTOP really stops a job" \
 	"job-cont:SIGCONT resumes it" \
 	"clock-advances:the clock moves" \
-	"timeout-fires:a timeout kills its child"; do
+	"timeout-fires:a timeout kills its child" \
+	"exec-many-args:execve carries 5000 arguments" \
+	"exec-e2big:an oversized argument is E2BIG" \
+	"mq-posix:POSIX message queue send and receive" \
+	"sig-ignore:an ignored signal is dropped" \
+	"fd-o-path:an O_PATH descriptor cannot be read" \
+	"errno-o-nofollow:O_NOFOLLOW on a symlink is ELOOP" \
+	"rename-noreplace:renameat2(RENAME_NOREPLACE) refuses an existing target" \
+	"rename-einval:renameat2 with conflicting flags is EINVAL" \
+	"mem-mremap:mremap grows a mapping" \
+	"perm-eacces:nobody cannot open a root-only file" \
+	"errno-erofs:a read-only mount refuses writes"; do
 	check_output "DEBIAN-SMOKE: ok ${probe%%:*}" "${probe#*:}"
 done
 

@@ -43,6 +43,14 @@ static void print_hex_case_to(char *tmp, int *len, u64 value, int upper)
 	tmp[(*len)++] = hex[value % 16];
 }
 
+/* %o: file modes are octal, and /proc tables print them that way. */
+static void print_oct_to(char *tmp, int *len, u64 value)
+{
+	if (value >= 8)
+		print_oct_to(tmp, len, value / 8);
+	tmp[(*len)++] = (char)('0' + value % 8);
+}
+
 static void print_hex_to(char *tmp, int *len, u64 value)
 {
 	print_hex_case_to(tmp, len, value, 0);
@@ -180,6 +188,13 @@ static int vsnprintf_impl(char *str, size_t size, const char *fmt, va_list args)
 			int len = 0;
 			print_hex_case_to(tmp, &len, va_arg(args, unsigned int),
 			                  fmt[i] == 'X');
+			append_number(str, size, &pos, tmp, len, 0, width, zero_pad);
+			break;
+		}
+		case 'o': {
+			char tmp[32];
+			int len = 0;
+			print_oct_to(tmp, &len, va_arg(args, unsigned int));
 			append_number(str, size, &pos, tmp, len, 0, width, zero_pad);
 			break;
 		}
@@ -383,6 +398,13 @@ static int vsnprintf_impl(char *str, size_t size, const char *fmt, va_list args)
 				int len = 0;
 				print_hex_case_to(tmp, &len, va_arg(args, unsigned long),
 				                  fmt[i] == 'X');
+				append_number(str, size, &pos, tmp, len, 0, width, zero_pad);
+				break;
+			}
+			case 'o': {
+				char tmp[32];
+				int len = 0;
+				print_oct_to(tmp, &len, va_arg(args, unsigned long));
 				append_number(str, size, &pos, tmp, len, 0, width, zero_pad);
 				break;
 			}

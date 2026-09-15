@@ -38,6 +38,8 @@
 #include <b1nix/sched.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <b1nix/shm.h>
+#include <b1nix/sysv_ipc.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/vnet.h>
@@ -913,6 +915,73 @@ static int r_filesystems(usize pid, struct sbuf *s) {
 
 /* The mount table is sized from RAM now, so a buffer for it belongs on the heap
  * — MAX_MOUNTS entries is ~2 MiB, and this used to be a stack array. */
+/* /proc/sysvipc/{shm,sem,msg} — the System V IPC tables in Linux's columns.
+ * util-linux ipcs reads these rather than iterating the *ctl calls, so without
+ * them it listed nothing even while segments, sets and queues existed. */
+static int r_sysvipc_shm(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "       key      shmid perms                  size  cpid  lpid "
+             "nattch   uid   gid  cuid  cgid      atime      dtime      ctime "
+             "                  rss                  swap\n");
+  for (int id = 0; id < SHMMNI; id++) {
+    struct shmid_ds ds;
+    if (shmctl(id, IPC_STAT, &ds) != 0)
+      continue;
+    sb_addf(s,
+            "%10d %10d  %4o %21lu %5u %5u  %5u %5u %5u %5u %5u %10llu %10llu "
+            "%10llu %21lu %21lu\n",
+            (int)ds.shm_perm.key, id, (unsigned)(ds.shm_perm.mode & 0777),
+            (unsigned long)ds.shm_segsz, (unsigned)ds.shm_cpid,
+            (unsigned)ds.shm_lpid, (unsigned)ds.shm_nattch,
+            (unsigned)ds.shm_perm.uid, (unsigned)ds.shm_perm.gid,
+            (unsigned)ds.shm_perm.cuid, (unsigned)ds.shm_perm.cgid,
+            (unsigned long long)ds.shm_atime, (unsigned long long)ds.shm_dtime,
+            (unsigned long long)ds.shm_ctime,
+            (unsigned long)(ds.shm_npages * PAGE_SIZE), 0ul);
+  }
+  return 0;
+}
+
+static int r_sysvipc_sem(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "       key      semid perms      nsems   uid   gid  cuid  cgid "
+             "     otime      ctime\n");
+  for (int id = 0; id < SEMMNI; id++) {
+    struct sysv_semid_info si;
+    if (sysv_semctl_stat(id, &si) != 0)
+      continue;
+    sb_addf(s, "%10d %10d  %4o %10llu %5u %5u %5u %5u %10llu %10llu\n",
+            (int)si.sem_perm.key, id, (unsigned)(si.sem_perm.mode & 0777),
+            (unsigned long long)si.sem_nsems, (unsigned)si.sem_perm.uid,
+            (unsigned)si.sem_perm.gid, (unsigned)si.sem_perm.cuid,
+            (unsigned)si.sem_perm.cgid, (unsigned long long)si.sem_otime,
+            (unsigned long long)si.sem_ctime);
+  }
+  return 0;
+}
+
+static int r_sysvipc_msg(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "       key      msqid perms      cbytes       qnum lspid lrpid "
+             "  uid   gid  cuid  cgid      stime      rtime      ctime\n");
+  for (int id = 0; id < MSGMNI; id++) {
+    struct sysv_msqid_info mi;
+    if (sysv_msgctl_stat(id, &mi) != 0)
+      continue;
+    sb_addf(s,
+            "%10d %10d  %4o  %10llu %10llu %5u %5u %5u %5u %5u %5u %10llu "
+            "%10llu %10llu\n",
+            (int)mi.msg_perm.key, id, (unsigned)(mi.msg_perm.mode & 0777),
+            (unsigned long long)mi.msg_cbytes, (unsigned long long)mi.msg_qnum,
+            (unsigned)mi.msg_lspid, (unsigned)mi.msg_lrpid,
+            (unsigned)mi.msg_perm.uid, (unsigned)mi.msg_perm.gid,
+            (unsigned)mi.msg_perm.cuid, (unsigned)mi.msg_perm.cgid,
+            (unsigned long long)mi.msg_stime, (unsigned long long)mi.msg_rtime,
+            (unsigned long long)mi.msg_ctime);
+  }
+  return 0;
+}
+
 static int r_mounts(usize pid, struct sbuf *s) {
   (void)pid;
   usize cap = vfs_mount_capacity();
@@ -3204,6 +3273,14 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);
   procfs_mkchild(root, "cgroups", VFS_DEVICE, r_cgroups, 0);
   procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
+  {
+    struct vfs_node *ipc = procfs_mkchild(root, "sysvipc", VFS_DIRECTORY, 0, 0);
+    if (ipc) {
+      procfs_mkchild(ipc, "shm", VFS_DEVICE, r_sysvipc_shm, 0);
+      procfs_mkchild(ipc, "sem", VFS_DEVICE, r_sysvipc_sem, 0);
+      procfs_mkchild(ipc, "msg", VFS_DEVICE, r_sysvipc_msg, 0);
+    }
+  }
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
   procfs_mkchild(root, "b1nix-prof", VFS_DEVICE, r_b1nix_prof, 0);
   procfs_mkchild(root, "b1nix-kprof", VFS_DEVICE, r_b1nix_kprof, 0);

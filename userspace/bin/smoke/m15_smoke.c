@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -22,6 +24,36 @@
 static volatile int g_sigusr1_hits = 0;
 
 static void marker(const char *text) { write(1, text, strlen(text)); }
+
+/* Does a /proc/sysvipc table carry a row with this key (column 0) and id
+ * (column 1)? When col >= 0, that column must also read `want`. */
+static int proc_sysvipc_has(const char *path, long key, long id, int col,
+                            long want) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return 0;
+  char line[512];
+  int found = 0;
+  fgets(line, sizeof(line), f); /* header */
+  while (!found && fgets(line, sizeof(line), f)) {
+    long v[8] = {0};
+    int n = 0;
+    char *p = line;
+    while (n < 8) {
+      char *end;
+      long x = strtol(p, &end, n == 2 ? 8 : 10);
+      if (end == p)
+        break;
+      v[n++] = x;
+      p = end;
+    }
+    if (n >= 2 && v[0] == key && v[1] == id &&
+        (col < 0 || (col < n && v[col] == want)))
+      found = 1;
+  }
+  fclose(f);
+  return found;
+}
 
 static void sigusr1_handler(int sig) {
   (void)sig;
@@ -144,6 +176,45 @@ int main(int argc, char **argv) {
     } else {
       marker("M15-SMOKE: fail ipc-mq open\n");
     }
+  }
+
+  /* 5b) /proc/sysvipc lists live System V objects: a segment (attached, so
+   * nattch is 1), a semaphore set and a message queue, each by key and id. */
+  {
+    int shmid = shmget(0x5159, 4096, IPC_CREAT | 0600);
+    int semid = semget(0x515a, 2, IPC_CREAT | 0600);
+    int msqid = msgget(0x515b, IPC_CREAT | 0600);
+    void *att = shmid >= 0 ? shmat(shmid, NULL, 0) : (void *)-1;
+    int created = shmid >= 0 && semid >= 0 && msqid >= 0 && att != (void *)-1;
+    int in_shm = proc_sysvipc_has("/proc/sysvipc/shm", 0x5159, shmid, 6, 1);
+    int in_sem = proc_sysvipc_has("/proc/sysvipc/sem", 0x515a, semid, 3, 2);
+    int in_msg = proc_sysvipc_has("/proc/sysvipc/msg", 0x515b, msqid, -1, 0);
+    int ok = created && in_shm && in_sem && in_msg;
+    if (!ok) {
+      char d[160];
+      snprintf(d, sizeof(d),
+               "M15-SMOKE: note proc-sysvipc shm=%d sem=%d msg=%d att=%d rows=%d/%d/%d\n",
+               shmid, semid, msqid, att != (void *)-1, in_shm, in_sem, in_msg);
+      marker(d);
+      for (int k = 0; k < 2; k++) {
+        FILE *f = fopen(k ? "/proc/sysvipc/sem" : "/proc/sysvipc/shm", "r");
+        char line[256];
+        while (f && fgets(line, sizeof(line), f))
+          marker(line);
+        if (f)
+          fclose(f);
+      }
+    }
+    if (att != (void *)-1)
+      shmdt(att);
+    if (shmid >= 0)
+      shmctl(shmid, IPC_RMID, NULL);
+    if (semid >= 0)
+      semctl(semid, 0, IPC_RMID);
+    if (msqid >= 0)
+      msgctl(msqid, IPC_RMID, NULL);
+    ok = ok && !proc_sysvipc_has("/proc/sysvipc/shm", 0x5159, shmid, -1, 0);
+    marker(ok ? "M15-SMOKE: ok proc-sysvipc\n" : "M15-SMOKE: fail proc-sysvipc\n");
   }
 
   /* 5) Shared memory semantics. */

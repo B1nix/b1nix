@@ -1941,6 +1941,7 @@ check_output "$LOG" "M15-SMOKE: ok signal-handler" "userspace signal handler is 
 check_output "$LOG" "M15-SMOKE: ok signal-mask" "blocked signal is delivered after sigprocmask unblock"
 check_output "$LOG" "M15-SMOKE: ok ipc-mq" "message queue roundtrip works"
 check_output "$LOG" "M15-SMOKE: ok shm" "shared memory create/map/read/write lifecycle works"
+check_output "$LOG" "M15-SMOKE: ok proc-sysvipc" "/proc/sysvipc lists a live shm segment (with its attach count), a semaphore set and a message queue by key and id, and drops a removed segment"
 check_output "$LOG" "M15-SMOKE: ok shm-exit-cleanup" "shm attachment released on exit (IPC_RMID no longer blocked)"
 check_output "$LOG" "M15-SMOKE: ok shm-kill-cleanup" "shm attachment released when a child is SIGKILL'd (OOM path) + fork nattch accounting"
 check_output "$LOG" "M15-SMOKE: ok semaphore" "cooperative semaphore baseline works"

@@ -74,6 +74,9 @@ struct sysv_msqid_info {
   u64 msg_ctime;
   u64 msg_qnum;
   u64 msg_qbytes;
+  u64 msg_cbytes;
+  u32 msg_lspid;
+  u32 msg_lrpid;
 };
 
 int sysv_msgget(u32 key, int msgflg);

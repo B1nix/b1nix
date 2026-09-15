@@ -7,6 +7,7 @@
 #include <b1nix/spinlock.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/panic.h>
+#include <b1nix/vfs.h>
 
 /* Global lock for the shm_segments[] and proc_attaches[] tables. Held only
  * around bookkeeping (segment/slot allocation, shm_nattch, the attach table);
@@ -187,7 +188,7 @@ int shmget(u32 key, usize size, int shmflg)
     seg->ds.shm_segsz = size;
     seg->ds.shm_atime = 0;
     seg->ds.shm_dtime = 0;
-    seg->ds.shm_ctime = 0;
+    seg->ds.shm_ctime = vfs_get_unix_time();
     seg->ds.shm_cpid = (u16)pid;
     seg->ds.shm_lpid = (u16)pid;
     seg->ds.shm_nattch = 0;
@@ -293,7 +294,7 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     /* Finalize the attach record under the lock. */
     spin_lock_irqsave(&shm_lock, &flags);
     pa->attaches[slot].virtual_addr = vaddr;
-    seg->ds.shm_atime = 0; /* Would use a timestamp */
+    seg->ds.shm_atime = vfs_get_unix_time();
     spin_unlock_irqrestore(&shm_lock, flags);
 
     console_write("shm: attached id=");
@@ -346,7 +347,7 @@ int shmdt(const void *shmaddr)
             pa->attaches[i].virtual_addr = 0;
             if (seg->ds.shm_nattch > 0)
                 seg->ds.shm_nattch--;
-            seg->ds.shm_dtime = 0;
+            seg->ds.shm_dtime = vfs_get_unix_time();
             break;
         }
     }
@@ -420,7 +421,7 @@ int shmctl(int shmid, int cmd, struct shmid_ds *buf)
             seg->ds.shm_perm.uid = buf->shm_perm.uid;
             seg->ds.shm_perm.gid = buf->shm_perm.gid;
             seg->ds.shm_perm.mode = buf->shm_perm.mode;
-            seg->ds.shm_ctime = 0;
+            seg->ds.shm_ctime = vfs_get_unix_time();
             rc = 0;
         }
         break;

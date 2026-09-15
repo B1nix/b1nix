@@ -273,6 +273,10 @@ if command -v ipcmk >/dev/null 2>&1 && command -v ipcs >/dev/null 2>&1; then
 			ok "ipc-$_kind"
 		else
 			bad "ipc-$_kind (id $_id not listed by ipcs $_flag)"
+			# Say what ipcs saw and what the kernel table holds, so a miss
+			# tells a parsing problem from an empty table.
+			ipcs "$_flag" 2>&1 | sed 's/^/DEBIAN-SMOKE: note ipcs: /' | head -8
+			cat /proc/sysvipc/"$_kind" 2>&1 | sed 's/^/DEBIAN-SMOKE: note proc: /' | head -4
 		fi
 		ipcrm "$_flag" "$_id" >/dev/null 2>&1 || bad "ipc-$_kind-rm" $?
 	}
@@ -321,6 +325,88 @@ if command -v timeout >/dev/null 2>&1; then
 	expect timeout-fires 124 $?
 else
 	bad timeout-fires 127
+fi
+
+# ── Stage 11: the rest of our own tests' kernel surfaces ───────────────────
+# exec limits (m13), POSIX mq, signal ignore and permissions (m15), O_PATH,
+# O_NOFOLLOW, renameat2 and EROFS (m17), mremap (m12) -- through glibc and
+# perl rather than our libc. Raw syscall numbers are x86_64's.
+n=$(/bin/sh -c 'echo $#' _ $(seq 1 5000) 2>/tmp/b1nix-many-err)
+expect exec-many-args 5000 "${n:-0}"
+[ "${n:-0}" = 5000 ] || sed 's/^/DEBIAN-SMOKE: note exec-many-args: /' /tmp/b1nix-many-err
+if command -v perl >/dev/null 2>&1; then
+	perl -e '
+		use POSIX qw(:errno_h :fcntl_h);
+		sub res { my ($label, $good) = @_;
+			print "DEBIAN-SMOKE: ", ($good ? "ok" : "FAIL"), " $label\n"; }
+		# E2BIG: one argument larger than the whole argument area.
+		my $big = "x" x (8 * 1024 * 1024);
+		my $pid = fork();
+		if ($pid == 0) { exec("/bin/true", $big); exit(($! + 0) == E2BIG ? 0 : 1); }
+		waitpid($pid, 0);
+		res("exec-e2big", ($? >> 8) == 0);
+		# POSIX message queue: open, send, receive, unlink.
+		my $name = "/b1nix-mq\0";
+		my $attr = pack("q4", 0, 4, 64, 0);
+		my $mq = syscall(240, $name, O_RDWR | O_CREAT, 0600, $attr);
+		my $msg = "hello";
+		my $sent = $mq >= 0 && syscall(242, $mq, $msg, 5, 0, 0) == 0;
+		my $buf = "\0" x 64;
+		my $prio = pack("L", 0);
+		my $got = $mq >= 0 ? syscall(243, $mq, $buf, 64, $prio, 0) : -1;
+		res("mq-posix", $sent && $got == 5 && substr($buf, 0, 5) eq "hello"
+		    && syscall(241, $name) == 0);
+		# An ignored signal is dropped, not delivered.
+		$SIG{USR1} = "IGNORE";
+		kill "USR1", $$;
+		res("sig-ignore", 1);
+		# O_PATH: a descriptor to the name, not the contents.
+		my $fd = POSIX::open("/etc/os-release", 010000000);
+		my $rbuf;
+		my $rd = defined $fd ? POSIX::read($fd, $rbuf, 1) : 0;
+		res("fd-o-path", defined $fd && !defined $rd && ($! + 0) == EBADF);
+		# O_NOFOLLOW on a symlink is ELOOP.
+		unlink "/tmp/b1nix-nf"; symlink "/etc/os-release", "/tmp/b1nix-nf";
+		my $nf = POSIX::open("/tmp/b1nix-nf", O_RDONLY | 0400000);
+		res("errno-o-nofollow", !defined $nf && ($! + 0) == ELOOP);
+		# renameat2: NOREPLACE refuses an existing target, bad flags are EINVAL.
+		open(my $a, ">", "/tmp/b1nix-ra"); close $a;
+		open(my $b, ">", "/tmp/b1nix-rb"); close $b;
+		my ($ra, $rb) = ("/tmp/b1nix-ra\0", "/tmp/b1nix-rb\0");
+		my $r = syscall(316, -100, $ra, -100, $rb, 1);
+		res("rename-noreplace", $r == -1 && ($! + 0) == EEXIST);
+		$r = syscall(316, -100, $ra, -100, $rb, 3);
+		res("rename-einval", $r == -1 && ($! + 0) == EINVAL);
+		# mremap grows a mapping.
+		my $m = syscall(9, 0, 4096, 3, 0x22, -1, 0);
+		my $g = $m > 0 ? syscall(25, $m, 4096, 8192, 1) : -1;
+		res("mem-mremap", $m > 0 && $g > 0 && syscall(11, $g, 8192) == 0);
+		# Permissions: nobody cannot read a root-only file.
+		open(my $s, ">", "/tmp/b1nix-secret"); close $s;
+		chmod 0600, "/tmp/b1nix-secret";
+		$pid = fork();
+		if ($pid == 0) {
+			$) = "65534 65534"; $> = 65534;
+			my $o = POSIX::open("/tmp/b1nix-secret", O_RDONLY);
+			exit(!defined $o && ($! + 0) == EACCES ? 0 : 1);
+		}
+		waitpid($pid, 0);
+		res("perm-eacces", ($? >> 8) == 0);
+	' || bad surfaces-perl $?
+fi
+# EROFS: a read-only mount refuses the open for write.
+mkdir -p /tmp/b1nix-ro
+if mount -t tmpfs -o ro tmpfs /tmp/b1nix-ro 2>/dev/null; then
+	if ( : > /tmp/b1nix-ro/file ) 2>/tmp/b1nix-ro-err; then
+		bad "errno-erofs (write succeeded)"
+	elif grep -q "Read-only" /tmp/b1nix-ro-err; then
+		ok errno-erofs
+	else
+		bad "errno-erofs ($(cat /tmp/b1nix-ro-err))"
+	fi
+	umount /tmp/b1nix-ro 2>/dev/null
+else
+	bad "errno-erofs (mount -o ro failed)"
 fi
 
 echo "DEBIAN-SMOKE: done"
