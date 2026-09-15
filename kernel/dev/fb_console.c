@@ -68,17 +68,20 @@ static void fb_present_rect(u32 x, u32 y, u32 w, u32 h)
 /* Send whatever has been drawn since the last flush. A panel that has to hand
  * frames to a device pays one command per flush rather than one per glyph,
  * which is the difference between a console and a slideshow. */
+static void fb_console_present(u32 x0, u32 y0, u32 x1, u32 y1)
+{
+	if (fb_present_hook)
+		fb_present_hook(x0, y0, x1 - x0, y1 - y0);
+	else
+		fb_panel_present((const void *)fb_ptr, fb.pitch, fb.width, fb.height,
+		                 x0, y0, x1 - x0, y1 - y0);
+}
+
 void fb_console_flush(void)
 {
 	if (!fb_ptr || dirty_x1 == 0)
 		return;
-	if (fb_present_hook)
-		fb_present_hook(dirty_x0, dirty_y0, dirty_x1 - dirty_x0,
-		                dirty_y1 - dirty_y0);
-	else
-		fb_panel_present((const void *)fb_ptr, fb.pitch, fb.width, fb.height,
-		                 dirty_x0, dirty_y0, dirty_x1 - dirty_x0,
-		                 dirty_y1 - dirty_y0);
+	fb_console_present(dirty_x0, dirty_y0, dirty_x1, dirty_y1);
 	dirty_x0 = dirty_y0 = dirty_x1 = dirty_y1 = 0;
 }
 
@@ -95,11 +98,18 @@ void fb_console_flush(void)
  * the bootloader's framebuffer is memory on a screen. */
 static volatile int fb_flush_wanted;
 static int fb_flusher_up;
+static int fb_panic; /* set once a panic owns the screen */
 
 void fb_console_request_flush(void)
 {
-	if (!fb_present_hook) {
-		fb_console_flush(); /* memory on a screen: nothing to tell anyone */
+	/* Straight to the screen only until the flusher runs, and while a panic
+	 * owns it: then nothing else will ever present. Afterwards a bootloader
+	 * framebuffer is deferred like a DRM one. Presented per write, a scroll
+	 * copied the whole screen for every line of text -- eight megabytes a
+	 * line at 1080p, under the console lock with interrupts off -- and the
+	 * console crawled as fast as that copy did. */
+	if ((!fb_present_hook && !fb_flusher_up) || fb_panic) {
+		fb_console_flush();
 		return;
 	}
 	__atomic_store_n(&fb_flush_wanted, 1, __ATOMIC_RELEASE);
@@ -110,8 +120,21 @@ static void fb_console_flusher(void *arg)
 	(void)arg;
 	for (;;) {
 		scheduler_sleep_ticks(sched_tick_hz() / 60 ? sched_tick_hz() / 60 : 1);
-		if (__atomic_exchange_n(&fb_flush_wanted, 0, __ATOMIC_ACQ_REL))
-			fb_console_flush();
+		if (!__atomic_exchange_n(&fb_flush_wanted, 0, __ATOMIC_ACQ_REL))
+			continue;
+		/* The damage is taken and cleared under the console lock, so a line
+		 * drawn meanwhile is not lost from it; the copy runs outside, where a
+		 * DRM present may sleep. A glyph drawn during the copy is shown by the
+		 * next pass, which its own write has already asked for. */
+		u64 flags;
+		u32 x0, y0, x1, y1;
+
+		console_lock_acquire_irqsave(&flags);
+		x0 = dirty_x0; y0 = dirty_y0; x1 = dirty_x1; y1 = dirty_y1;
+		dirty_x0 = dirty_y0 = dirty_x1 = dirty_y1 = 0;
+		console_lock_release_irqrestore(flags);
+		if (fb_ptr && x1)
+			fb_console_present(x0, y0, x1, y1);
 	}
 }
 
@@ -450,8 +473,8 @@ static void fb_draw_char(char c, u32 x, u32 y)
  * pixels at all: clear and continue from the top, one screen-sized fill per
  * screenful of text instead of a copy per line.
  */
-/* Set once a panic owns the screen; see fb_console_panic_begin(). */
-static int fb_panic;
+/* fb_panic (declared above): set once a panic owns the screen; see
+ * fb_console_panic_begin(). */
 static int fb_panic_full;
 static int fb_panic_off; /* painting faulted: hands off */
 

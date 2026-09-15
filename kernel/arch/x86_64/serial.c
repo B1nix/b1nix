@@ -87,6 +87,30 @@ void serial_port_putc(int idx, char ch)
 	(void)ch;
 }
 
+/* Sixteen bytes per status read, the depth of the transmit FIFO, written as
+ * one string instruction: under a hypervisor a byte at a time is two exits a
+ * byte, and a shell printing to the serial terminal ran at 60 KiB a second. */
+void serial_port_write(int idx, const char *buf, usize len)
+{
+	if (idx < 0 || idx >= SERIAL_NPORTS || !serial_detected[idx])
+		return;
+	while (len) {
+		u32 n = len < 16 ? (u32)len : 16u;
+		u64 deadline = serial_tsc() + SERIAL_TX_WAIT_CYCLES;
+
+		for (;;) {
+			if (!serial_line_busy[idx] && (inb(serial_base[idx] + 5) & 0x20)) {
+				outsb(serial_base[idx], (const u8 *)buf, n);
+				break;
+			}
+			if (serial_tsc() >= deadline)
+				break; /* dropped, as serial_port_putc does */
+		}
+		buf += n;
+		len -= n;
+	}
+}
+
 int serial_port_has_data(int idx)
 {
 	if (idx < 0 || idx >= SERIAL_NPORTS || !serial_detected[idx])
@@ -218,6 +242,8 @@ u16 serial_port_base(int idx)
  * page-table frame "allocated twice", and a heap list link holding text.
  * Now only the owner batches; everyone else writes the byte straight out. */
 static int serial_batch_owner; /* cpu_id + 1, 0 = nobody */
+/* console=hvc0: where the console's bytes go instead of the UART. */
+static void (*serial_divert)(const char *buf, usize len);
 static char serial_batch[16];
 static unsigned serial_batch_n;
 
@@ -235,14 +261,20 @@ static void serial_batch_flush(void)
 	if (n > sizeof(serial_batch))
 		n = sizeof(serial_batch);
 	serial_batch_n = 0;
+	if (serial_divert) {
+		serial_divert(serial_batch, n);
+		return;
+	}
 	int idx = 0;
 	if (!serial_detected[idx])
 		return;
 	u64 deadline = serial_tsc() + SERIAL_TX_WAIT_CYCLES;
 	do {
 		if (!serial_line_busy[idx] && (inb(serial_base[idx] + 5) & 0x20)) {
-			for (unsigned i = 0; i < n; i++)
-				outb(serial_base[idx], (u8)serial_batch[i]);
+			/* One string instruction rather than a loop of outb: a
+			 * hypervisor exits once for the whole run instead of once per
+			 * byte, which is what the console's speed under QEMU is. */
+			outsb(serial_base[idx], (const u8 *)serial_batch, n);
 			return;
 		}
 	} while (serial_tsc() < deadline);
@@ -264,8 +296,27 @@ void serial_batch_end(void)
 	}
 }
 
+void serial_console_divert(void (*sink)(const char *buf, usize len))
+{
+	serial_batch_end();
+	serial_divert = sink;
+}
+
 void serial_putc(char ch)
 {
+	if (serial_divert) {
+		/* The batch is flushed to the sink instead; see serial_batch_flush. */
+		if (serial_batch_owner && serial_batch_owner == serial_this_cpu()) {
+			if (serial_batch_n >= sizeof(serial_batch))
+				serial_batch_flush();
+			serial_batch[serial_batch_n++] = ch;
+			if (serial_batch_n == sizeof(serial_batch))
+				serial_batch_flush();
+			return;
+		}
+		serial_divert(&ch, 1);
+		return;
+	}
 	if (!serial_batch_owner || serial_batch_owner != serial_this_cpu()) {
 		serial_port_putc(0, ch);
 		return;

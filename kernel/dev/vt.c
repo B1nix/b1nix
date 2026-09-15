@@ -23,11 +23,14 @@
 #include <b1nix/termios_abi.h>
 #include <b1nix/vt.h>
 #include <b1nix/console.h>
+#include <b1nix/fb.h>
+#include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
 #include <b1nix/fb_console.h>
 #include <b1nix/mm.h>
 #include <b1nix/posix.h>
 #include <b1nix/sched.h>
+#include <b1nix/serial.h>
 #include <b1nix/sysfs_attr.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/syscall.h>
@@ -560,19 +563,60 @@ static isize vt_node_write(struct vfs_node *node, u64 offset, const char *buf,
     return -ENXIO;
   if (vt_alloc_cells(v) < 0)
     return -ENOMEM;
+  /* One console section for the whole buffer, as console_write takes: the
+   * serial port gets the text in FIFO-sized batches and the screen is asked
+   * to present once. Character by character, each byte was its own pair of
+   * UART register accesses -- a shell printing to tty1 ran at 30 KiB a
+   * second under QEMU. */
+  u64 clk = 0;
+  int active = idx == g_active;
+  /*
+   * A program's output on a terminal belongs on that terminal's screen, and
+   * only there -- as on Linux, where writing to tty1 reaches neither the
+   * serial port nor the kernel log. It went through console_putc_raw, which
+   * copies every byte into the log ring, /dev/kmsg and the UART, so a shell
+   * on the screen printed at the speed of an emulated 16550 and filled the
+   * kernel log with its own output. With no framebuffer (VGA text) the
+   * console path is the only way onto the glass and is kept. b1nix.vt-mirror
+   * restores the copy for a headless machine whose only view is the serial
+   * transcript.
+   */
+  int screen_only = fb_console_ready() && !bootinfo_has_flag("b1nix.vt-mirror");
+
+  if (active) {
+    console_lock_acquire_irqsave(&clk);
+#if defined(__x86_64__)
+    serial_batch_begin();
+#endif
+  }
   for (usize i = 0; i < size; i++) {
     char c = buf[i];
     if ((v->termios.c_oflag & B1NIX_OPOST) && c == '\n') {
       vt_record(v, '\r');
-      if (idx == g_active)
-        console_putc_raw('\r');
+      if (active) {
+        if (screen_only) {
+          if (!fb_dev_claimed())
+            fb_console_putchar('\r');
+        } else {
+          console_putc_raw('\r');
+        }
+      }
     }
     vt_record(v, c);
-    if (idx == g_active) {
-      g_replaying = 1; /* the record above already happened */
-      console_putc_raw(c);
-      g_replaying = 0;
+    if (active) {
+      if (screen_only) {
+        if (!fb_dev_claimed())
+          fb_console_putchar(c);
+      } else {
+        g_replaying = 1; /* the record above already happened */
+        console_putc_raw(c);
+        g_replaying = 0;
+      }
     }
+  }
+  if (active) {
+    fb_console_request_flush();
+    console_lock_release_irqrestore(clk);
   }
   return (isize)size;
 }

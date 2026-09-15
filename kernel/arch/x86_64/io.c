@@ -5,6 +5,17 @@ void outb(u16 port, u8 value)
 	__asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
 }
 
+/* A run of bytes to one port as a single string instruction: under a
+ * hypervisor that is one exit for the run, where a loop of outb is one per
+ * byte. */
+void outsb(u16 port, const u8 *buf, u32 count)
+{
+	u64 left = count;
+	const u8 *src = buf;
+
+	__asm__ volatile("rep outsb" : "=S"(src), "=c"(left) : "S"(src), "c"(left), "d"(port));
+}
+
 u8 inb(u16 port)
 {
 	u8 value;

@@ -21,7 +21,14 @@ OUT=$DIR/smoke_run/$TAG-frames
 RUN_SECONDS=${RUN_SECONDS:-420}
 
 rm -rf "$OUT"; mkdir -p "$OUT"
-rm -f "$MON" "$LOG"
+# The console runs on virtio-console (console=hvc0): a page of text per
+# notification instead of an emulated UART byte. What the kernel prints before
+# that device is up still goes to the UART. The two halves are joined into
+# $LOG when the run ends, so everything reading the log sees one transcript.
+SERIAL_LOG=$LOG.serial
+HVC_LOG=$LOG.hvc
+rm -f "$MON" "$LOG" "$SERIAL_LOG" "$HVC_LOG"
+logs_have() { grep -aq "$1" "$SERIAL_LOG" "$HVC_LOG" 2>/dev/null; }
 
 #
 # The root filesystem is a disk, not a boot module.
@@ -46,7 +53,7 @@ if [ "${KDE_ROOT:-disk}" = disk ]; then
 	# KDE_CMDLINE replaces the whole line, so the KDE loop needs no ISO build
 	# at all: `B1NIX_KDE=1 make root-image` for the root and this for the boot.
 	[ -n "${KDE_CMDLINE:-}" ] && CMDLINE="$KDE_CMDLINE"
-	CMDLINE="$CMDLINE${KDE_EXTRA_CMDLINE:+ $KDE_EXTRA_CMDLINE}"
+	CMDLINE="$CMDLINE${KDE_EXTRA_CMDLINE:+ $KDE_EXTRA_CMDLINE} console=hvc0"
 	sh "$DIR/tools/images/mkiso.sh" --stage "$DIR/build/x86_64/kde-run-iso" \
 		--out "$DIR/build/x86_64/b1nix-kde-run.iso" --arch x86_64 \
 		--kernel "${KDE_KERNEL:-$DIR/build/x86_64/kernel.elf}" --timeout 0 \
@@ -75,7 +82,9 @@ qemu-system-x86_64 $ACCEL \
 	-device virtio-tablet-pci,id=vtablet \
 	-display none -no-reboot \
 	-monitor "unix:$MON,server,nowait" \
-	-serial "file:$LOG" -serial null &
+	-device virtio-serial-pci,disable-legacy=on \
+	-chardev "file,id=hvc0,path=$HVC_LOG" -device virtconsole,chardev=hvc0 \
+	-serial "file:$SERIAL_LOG" -serial null &
 QPID=$!
 trap 'kill $QPID 2>/dev/null || true' EXIT INT TERM
 
@@ -88,13 +97,13 @@ shot=0
 ready=0
 while [ "$i" -lt "$RUN_SECONDS" ]; do
 	kill -0 $QPID 2>/dev/null || break
-	if [ "$ready" = 0 ] && grep -aq "SCANOUT-READY" "$LOG" 2>/dev/null; then
+	if [ "$ready" = 0 ] && logs_have "SCANOUT-READY"; then
 		ready=1
 		echo "[run-kde] scanout ready at t=${i}s"
 	fi
 	# Frames are taken from the moment the compositor is up, not only after
 	# the desktop reports itself: a run that dies early still leaves evidence.
-	if [ "$ready" = 1 ] || grep -aq "ok drm-card\|ok nested-socket" "$LOG" 2>/dev/null; then
+	if [ "$ready" = 1 ] || logs_have "ok drm-card\|ok nested-socket"; then
 		if [ $((i % ${KDE_SHOT_EVERY:-5})) -eq 0 ]; then
 			shot=$((shot + 1))
 			#
@@ -111,7 +120,7 @@ while [ "$i" -lt "$RUN_SECONDS" ]; do
 				mon "screendump $OUT/frame-$(printf %03d $shot).ppm" || true
 		fi
 	fi
-	grep -aq "SCANOUT-END\|KDE: done" "$LOG" 2>/dev/null && break
+	logs_have "SCANOUT-END\|KDE: done" && break
 	i=$((i + 1))
 	sleep 1
 done
@@ -122,6 +131,8 @@ wait $QPID 2>/dev/null || true
 # still running afterwards -- twice in one afternoon. Whatever the reason,
 # the process that writes this run's serial log has no business outliving
 # the run: name it by that log and make sure.
-pkill -9 -f -- "-serial file:$LOG" 2>/dev/null || true
+pkill -9 -f -- "-serial file:$SERIAL_LOG" 2>/dev/null || true
+cat "$SERIAL_LOG" "$HVC_LOG" > "$LOG" 2>/dev/null
+rm -f "$SERIAL_LOG" "$HVC_LOG"
 echo "[run-kde] log: $LOG"
 echo "[run-kde] frames: $(ls -1 "$OUT" 2>/dev/null | wc -l) in $OUT"

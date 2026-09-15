@@ -492,6 +492,20 @@ else
 fi
 rm -f /tmp/bb_dir/w12.bin
 
+# /dev/hvc0: a terminal on the virtio console. termios has to answer as on any
+# tty, and what is written must reach the host -- the harness reads the text
+# back from the console's output file, not from this transcript.
+if [ -e /dev/hvc0 ]; then
+	if stty -F /dev/hvc0 -echo 2>/dev/null; then
+		echo "HVC-SMOKE: ok termios"
+	else
+		echo "HVC-SMOKE: FAIL termios"
+	fi
+	printf 'HVC-SMOKE: ok tty-write\n' > /dev/hvc0
+else
+	echo "HVC-SMOKE: FAIL no-device"
+fi
+
 # Job control as ps/top see it: a sleeper stopped with SIGSTOP reads 'T' in
 # /proc/<pid>/stat, and 'S' (or R) again after SIGCONT. Our own job-control
 # test checks this through waitpid; the Debian lane reads it from /proc.

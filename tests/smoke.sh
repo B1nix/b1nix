@@ -323,6 +323,9 @@ run_qemu() {
 	# anything gets the device at all.
 	AUDIO_WAV="${AUDIO_WAV:-${log%.log}-audio.wav}"
 	rm -f "$AUDIO_WAV"
+	# What the guest wrote to its virtio console (/dev/hvc0), per instance.
+	local hvc_out="${log%.log}-hvc.out"
+	rm -f "$hvc_out"
   
 	if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 		local filter_dump_args=""
@@ -543,7 +546,9 @@ run_qemu() {
 				-device AC97,audiodev=audio0 \
 				-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
 				-device virtio-tablet-pci,id=vtablet \
-				-device virtio-tablet-pci,id=vtouch
+				-device virtio-tablet-pci,id=vtouch \
+				-device virtio-serial-pci,disable-legacy=on \
+				-chardev file,id=hvc0,path="$hvc_out" -device virtconsole,chardev=hvc0
 			if [ -n "${AHCI_IMG:-}" ] && [ -f "${AHCI_IMG:-}" ]; then
 				set -- "$@" \
 					-device ich9-ahci,id=ahci0 \
@@ -581,6 +586,8 @@ run_qemu() {
 			-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
 			-device virtio-tablet-pci,id=vtablet \
 			-device virtio-tablet-pci,id=vtouch \
+			-device virtio-serial-pci,disable-legacy=on \
+			-chardev file,id=hvc0,path="$hvc_out" -device virtconsole,chardev=hvc0 \
 			-audiodev wav,id=audio0,path="$AUDIO_WAV" \
 			-device intel-hda,id=hda -device hda-duplex,bus=hda.0,audiodev=audio0 \
 			-device AC97,audiodev=audio0 \
@@ -2345,6 +2352,9 @@ check_output "$LOG" "BB-W11: ok unshare-net" "unshare -n gives a network namespa
 check_output "$LOG" "BB-W11: ok nsenter-uts" "nsenter -t <pid> -u reads the hostname of the namespace that process is in"
 check_output "$LOG" "BB-W11: done" "the namespace tools wave completes"
 check_output "$LOG" "BB-W12: ok readahead" "readahead(2) warms a file's blocks and leaves its contents intact"
+check_output "$LOG" "HVC-SMOKE: ok termios" "/dev/hvc0 answers termios like any terminal"
+check_output "${SYS_LOG%.log}-hvc.out" "HVC-SMOKE: ok kernel-write" "the kernel's virtio console reaches the host"
+check_output "${SYS_LOG%.log}-hvc.out" "HVC-SMOKE: ok tty-write" "text written to /dev/hvc0 reaches the host through the virtio console"
 check_output "$LOG" "BB-W12: ok job-stop-state" "a sleeper stopped with SIGSTOP reads 'T' in /proc/<pid>/stat"
 check_output "$LOG" "BB-W12: ok job-cont-state" "the same sleeper reads S/R again after SIGCONT"
 check_output "$LOG" "BB-W12: ok raid-assemble" "raidautorun assembles a mirror from the superblocks its members carry"

@@ -669,6 +669,7 @@ KERNEL_SOURCES += \
  	kernel/dev/serial_tty.c \
  	kernel/dev/virtio_gpu.c \
  	kernel/dev/virtio_input.c \
+ 	kernel/dev/virtio_console.c \
 	kernel/dev/drm.c \
 	kernel/dev/drm_card1.c \
 	kernel/dev/netconsole.c \
@@ -768,6 +769,7 @@ KERNEL_SOURCES += \
 	kernel/dev/drm_card1.c \
 	kernel/dev/virtio_gpu.c \
 	kernel/dev/virtio_input.c \
+	kernel/dev/virtio_console.c \
 	kernel/lkpi/lkpi_core.c \
 	kernel/lkpi/idr.c \
 	kernel/lkpi/completion.c \
@@ -2018,16 +2020,16 @@ SMOKE_CMDLINE_switchroot=b1nix.test=1 b1nix.smoke=switchroot root=initramfs init
 # trap that costs a whole passthrough boot to notice. This has its own name, so
 # one make invocation can produce the passthrough image and the smoke images
 # from the same kernel and the same root.img.
-SMOKE_CMDLINE_pass=b1nix.i915sway b1nix.use-cage b1nix.drm-debug b1nix.drm-debug-atomic
+SMOKE_CMDLINE_pass=b1nix.i915sway b1nix.use-cage b1nix.drm-debug b1nix.drm-debug-atomic console=hvc0
 # The same run under sway rather than cage, for the questions only the
 # compositor can answer. cage 0.1.5 has no debug switch at all — its -d means
 # "no client-side decorations" — so it says nothing about which modes it saw or
 # which one it chose; sway -d logs both, on the same wlroots.
 # The connector surface only: enumerate from ring 3 and stop. Seconds, not
 # minutes, and it carries the buffer-bounds check against a real EDID.
-SMOKE_CMDLINE_pass-probe=b1nix.i915sway b1nix.drm-probe-only b1nix.drm-enumerate b1nix.drm-debug
-SMOKE_CMDLINE_pass-sway=b1nix.i915sway b1nix.sway-clients b1nix.bright b1nix.drm-debug b1nix.vma-check
-SMOKE_CMDLINE_pass-headless=b1nix.i915sway b1nix.sway-headless b1nix.vma-check
+SMOKE_CMDLINE_pass-probe=b1nix.i915sway b1nix.drm-probe-only b1nix.drm-enumerate b1nix.drm-debug console=hvc0
+SMOKE_CMDLINE_pass-sway=b1nix.i915sway b1nix.sway-clients b1nix.bright b1nix.drm-debug b1nix.vma-check console=hvc0
+SMOKE_CMDLINE_pass-headless=b1nix.i915sway b1nix.sway-headless b1nix.vma-check console=hvc0
 # The browser, under cage on the passed-through GPU. Its packages are fetched at
 # run time — 248 MB installed is not something to carry in an image for a test
 # that is run occasionally.
@@ -2037,11 +2039,11 @@ SMOKE_CMDLINE_pass-headless=b1nix.i915sway b1nix.sway-headless b1nix.vma-check
 # second one fails at "query renderer texture formats" and takes the whole
 # DRM backend down with it, leaving the compositor without wl_shm and the
 # browser with no way to hand over a buffer.
-SMOKE_CMDLINE_pass-chromium=b1nix.i915sway b1nix.chromium b1nix.task-watch b1nix.wlr-card b1nix.user-stack b1nix.sway-headless b1nix.window-wait=200 b1nix.wayland-control
+SMOKE_CMDLINE_pass-chromium=b1nix.i915sway b1nix.chromium b1nix.task-watch b1nix.wlr-card b1nix.user-stack b1nix.sway-headless b1nix.window-wait=200 b1nix.wayland-control console=hvc0
 # The same cage run with a frame built to be photographed: saturated colour
 # across the whole screen and a client whose output changes, so a camera shot
 # says whether the panel is showing our picture rather than merely being lit.
-SMOKE_CMDLINE_pass-bright=b1nix.i915sway b1nix.use-cage b1nix.bright b1nix.drm-debug
+SMOKE_CMDLINE_pass-bright=b1nix.i915sway b1nix.use-cage b1nix.bright b1nix.drm-debug console=hvc0
 
 # The browser image without the root filesystem inside it.
 #

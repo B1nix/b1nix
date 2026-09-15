@@ -145,6 +145,7 @@ static void i915_module_init(void)
 #endif
 extern void virtio_gpu_dev_init(void);
 extern void virtio_input_init(void);
+extern void virtio_console_init(void);
 
 /* Visual boot markers — see b1nix/bootmark.h. */
 #include <b1nix/bootmark.h>
@@ -1060,6 +1061,7 @@ void kernel_main(usize arg0, usize arg1)
 	}
 #endif
 	virtio_input_init(); /* absolute pointer (virtio-tablet) — grab-free mouse */
+	virtio_console_init(); /* /dev/hvc0, console=hvc0 */
 
 
 

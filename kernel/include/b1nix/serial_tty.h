@@ -12,7 +12,9 @@ int serial_tty_open(int idx, int flags); /* returns fd or -errno */
 int serial_tty_path_index(const char *resolved_path); /* -1 if not a ttySn */
 int serial_tty_present(int idx);
 int serial_tty_claimed(int idx); /* open handles exist: tty owns its UART RX */
-void serial_tty_tick(void);      /* BSP timer tick: drain UART RX */
+void serial_tty_tick(void);
+void serial_tty_hvc_attach(void);                   /* virtio-console up: /dev/hvc0 */
+void serial_tty_hvc_input(const char *buf, usize n); /* host input for hvc0 */      /* BSP timer tick: drain UART RX */
 
 /* M39 self-test hooks. */
 void serial_tty_test_inject(int idx, const char *buf, usize n);

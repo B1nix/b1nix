@@ -26,13 +26,20 @@
 #include <b1nix/serial_tty.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/syscall.h>
+#include <b1nix/virtio_console.h>
 #include <string.h>
+
+/* The UART lines, then hvc0: a virtio console served by the same line
+ * discipline (kernel/dev/virtio_console.c). */
+#define STTY_HVC SERIAL_NPORTS
+#define STTY_COUNT (SERIAL_NPORTS + 1)
 
 #define STTY_BUF 4096
 #define STTY_LINE 1024
 
 struct serial_tty {
-  int com;          /* serial_port_* index backing this tty */
+  int com;          /* serial_port_* index backing this tty; -1 for hvc0 */
+  int hvc;          /* output and input go through virtio-console */
   char name[8];     /* device node name, e.g. "ttyS0" */
   int registered;   /* /dev node exists (port detected at boot) */
   volatile int open_count; /* live handles; >0 = tty owns its UART RX */
@@ -58,7 +65,16 @@ struct serial_tty {
   usize session_id;
 };
 
-static struct serial_tty sttys[SERIAL_NPORTS];
+static struct serial_tty sttys[STTY_COUNT];
+
+static void stty_register_node(struct serial_tty *t);
+
+static void stty_out(struct serial_tty *t, const char *buf, usize n) {
+  if (t->hvc)
+    virtio_console_write(buf, n);
+  else
+    serial_port_write(t->com, buf, n);
+}
 
 static usize rb_next(usize i) { return (i + 1) % STTY_BUF; }
 
@@ -87,8 +103,11 @@ static void stty_echo(struct serial_tty *t, u8 c) {
   console_lock_acquire_irqsave(&flags);
   if ((t->termios.c_oflag & B1NIX_OPOST) &&
       (t->termios.c_oflag & B1NIX_ONLCR) && c == '\n')
-    serial_port_putc(t->com, '\r');
-  serial_port_putc(t->com, (char)c);
+    stty_out(t, "\r", 1);
+  {
+    char ch = (char)c;
+    stty_out(t, &ch, 1);
+  }
   console_lock_release_irqrestore(flags);
 }
 
@@ -263,14 +282,23 @@ static isize stty_write(struct vfs_handle *h, const char *buf, usize size) {
    * a byte in the middle of this buffer and vice versa — observed corrupting
    * test markers under SMP exec churn (busybox stdout vs. kernel exec log,
    * both landing on COM1). */
+  int onlcr = (t->termios.c_oflag & B1NIX_OPOST) &&
+              (t->termios.c_oflag & B1NIX_ONLCR);
+  char out[64];
+  usize n = 0;
   u64 flags;
+
   console_lock_acquire_irqsave(&flags);
   for (usize i = 0; i < size; i++) {
-    if ((t->termios.c_oflag & B1NIX_OPOST) &&
-        (t->termios.c_oflag & B1NIX_ONLCR) && buf[i] == '\n')
-      serial_port_putc(t->com, '\r');
-    serial_port_putc(t->com, buf[i]);
+    if (n + 2 > sizeof(out)) {
+      stty_out(t, out, n);
+      n = 0;
+    }
+    if (onlcr && buf[i] == '\n')
+      out[n++] = '\r';
+    out[n++] = buf[i];
   }
+  stty_out(t, out, n);
   console_lock_release_irqrestore(flags);
   return (isize)size;
 }
@@ -327,6 +355,8 @@ static u32 stty_rate_to_cbaud(u32 rate) {
 static void stty_cflag_from_hw(struct serial_tty *t) {
   u32 baud = 0;
   u8 bits = 8, parity = 0, stop = 1;
+  if (t->hvc)
+    return; /* no line to read: the defaults stand */
   if (serial_port_get_line(t->com, &baud, &bits, &parity, &stop) < 0)
     return;
   u32 cflag = t->termios.c_cflag & ~(STTY_CBAUD | STTY_CSIZE | STTY_CSTOPB |
@@ -344,8 +374,8 @@ static void stty_cflag_from_hw(struct serial_tty *t) {
  * the line alone, which is what a caller that never looked at c_cflag means. */
 static int stty_apply_cflag(struct serial_tty *t, u32 cflag) {
   u32 rate = stty_cbaud_to_rate(cflag);
-  if (rate == 0)
-    return 0;
+  if (rate == 0 || t->hvc)
+    return 0; /* hvc0 has no baud rate to set; any setting is accepted */
   u8 bits = (u8)(5 + ((cflag & STTY_CSIZE) >> 4));
   u8 stop = (cflag & STTY_CSTOPB) ? 2 : 1;
   u8 parity = 0;
@@ -364,6 +394,8 @@ static int stty_apply_cflag(struct serial_tty *t, u32 cflag) {
 #define TIOCM_DSR  0x100
 
 static int stty_modem_get(struct serial_tty *t) {
+  if (t->hvc)
+    return TIOCM_CAR | TIOCM_DSR | TIOCM_CTS; /* always connected */
   u8 mcr = serial_port_get_mcr(t->com);
   u8 msr = serial_port_get_msr(t->com);
   int bits = 0;
@@ -377,6 +409,8 @@ static int stty_modem_get(struct serial_tty *t) {
 }
 
 static void stty_modem_set(struct serial_tty *t, int bits) {
+  if (t->hvc)
+    return;
   u8 mcr = (u8)(serial_port_get_mcr(t->com) & ~0x03);
   if (bits & TIOCM_DTR) mcr |= 0x01;
   if (bits & TIOCM_RTS) mcr |= 0x02;
@@ -597,19 +631,19 @@ static const struct vfs_file_ops stty_ops = {
 /* ── public API ── */
 
 int serial_tty_present(int idx) {
-  if (idx < 0 || idx >= SERIAL_NPORTS)
+  if (idx < 0 || idx >= STTY_COUNT)
     return 0;
   return sttys[idx].registered;
 }
 
 int serial_tty_claimed(int idx) {
-  if (idx < 0 || idx >= SERIAL_NPORTS)
+  if (idx < 0 || idx >= STTY_COUNT)
     return 0;
   return sttys[idx].open_count > 0;
 }
 
 int serial_tty_open(int idx, int flags) {
-  if (idx < 0 || idx >= SERIAL_NPORTS || !sttys[idx].registered)
+  if (idx < 0 || idx >= STTY_COUNT || !sttys[idx].registered)
     return -ENXIO;
   struct serial_tty *t = &sttys[idx];
 
@@ -645,7 +679,7 @@ int serial_tty_open(int idx, int flags) {
 
 /* Map a /dev path to a serial tty index; -1 if it is not one of ours. */
 int serial_tty_path_index(const char *resolved_path) {
-  for (int i = 0; i < SERIAL_NPORTS; i++) {
+  for (int i = 0; i < STTY_COUNT; i++) {
     if (!sttys[i].registered)
       continue;
     char full[16];
@@ -662,12 +696,14 @@ int serial_tty_path_index(const char *resolved_path) {
  * A tty only owns its UART receive side while open; otherwise COM1 bytes are
  * left for the merged boot console and COM2 bytes are left in the FIFO. */
 void serial_tty_tick(void) {
-  for (int i = 0; i < SERIAL_NPORTS; i++) {
+  for (int i = 0; i < STTY_COUNT; i++) {
     struct serial_tty *t = &sttys[i];
     if (!t->registered || t->open_count == 0)
       continue;
     char c;
     int got = 0;
+    if (t->hvc)
+      continue; /* fed by virtio_console_poll */
     while ((c = serial_port_getc(t->com)) != 0) {
       stty_input_char(t, (u8)c);
       got = 1;
@@ -685,7 +721,7 @@ void serial_tty_tick(void) {
 /* Test hook (M39 self-test): feed bytes through the line discipline as if
  * they arrived from the UART, without real hardware input. */
 void serial_tty_test_inject(int idx, const char *buf, usize n) {
-  if (idx < 0 || idx >= SERIAL_NPORTS || !sttys[idx].registered)
+  if (idx < 0 || idx >= STTY_COUNT || !sttys[idx].registered)
     return;
   for (usize i = 0; i < n; i++)
     stty_input_char(&sttys[idx], (u8)buf[i]);
@@ -695,41 +731,69 @@ void serial_tty_test_inject(int idx, const char *buf, usize n) {
 /* Expose per-tty state for the M39 self-test (termios/pgrp independence is
  * asserted against the boot console's globals). */
 usize serial_tty_fg_pgrp(int idx) {
-  if (idx < 0 || idx >= SERIAL_NPORTS)
+  if (idx < 0 || idx >= STTY_COUNT)
     return 0;
   return sttys[idx].fg_pgrp;
 }
 
 void serial_tty_init(void) {
   memset(sttys, 0, sizeof(sttys));
-  for (int i = 0; i < SERIAL_NPORTS; i++) {
+  for (int i = 0; i < STTY_COUNT; i++) {
     struct serial_tty *t = &sttys[i];
     t->com = i;
     t->name[0] = 't'; t->name[1] = 't'; t->name[2] = 'y'; t->name[3] = 'S';
     t->name[4] = (char)('0' + i);
     t->name[5] = '\0';
     stty_reset(t);
-    if (serial_port_present(i))
+    if (i < SERIAL_NPORTS && serial_port_present(i))
       t->registered = 1;
   }
+  sttys[STTY_HVC].com = -1;
+  sttys[STTY_HVC].hvc = 1;
+  memcpy(sttys[STTY_HVC].name, "hvc0", 5);
 }
 
 /* Create the /dev/ttySn nodes for detected ports. Called from vfs_init and
  * again from vfs_repopulate_after_root_mount (opens are intercepted by path
  * in vfs_open_flags; the nodes exist so stat()/ls resolve). */
 void serial_tty_register_nodes(void) {
-  for (int i = 0; i < SERIAL_NPORTS; i++) {
+  for (int i = 0; i < STTY_COUNT; i++) {
     if (!sttys[i].registered)
       continue;
-    char path[16];
-    strcpy(path, "/dev/");
-    strcat(path, sttys[i].name);
-    struct vfs_node *node = vfs_add_node(path, VFS_DEVICE, 0, 0, 0);
-    if (node && !IS_ERR(node)) {
-      node->inode->mode = 0620;
-      node->inode->uid = 0;
-      node->inode->gid = 5; /* group tty */
-      vfs_node_put(node);
-    }
+    stty_register_node(&sttys[i]);
   }
+}
+
+static void stty_register_node(struct serial_tty *t) {
+  char path[16];
+  strcpy(path, "/dev/");
+  strcat(path, t->name);
+  struct vfs_node *node = vfs_add_node(path, VFS_DEVICE, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->mode = 0620;
+    node->inode->uid = 0;
+    node->inode->gid = 5; /* group tty */
+    vfs_node_put(node);
+  }
+}
+
+/* virtio-console is up: hvc0 exists from now on. */
+void serial_tty_hvc_attach(void) {
+  struct serial_tty *t = &sttys[STTY_HVC];
+
+  if (t->registered)
+    return;
+  t->registered = 1;
+  stty_register_node(t);
+}
+
+/* Bytes from the host for hvc0. Kept only while it is open, as a UART's are. */
+void serial_tty_hvc_input(const char *buf, usize n) {
+  struct serial_tty *t = &sttys[STTY_HVC];
+
+  if (!t->registered || t->open_count == 0)
+    return;
+  for (usize i = 0; i < n; i++)
+    stty_input_char(t, (u8)buf[i]);
+  scheduler_wake_all(vfs_poll_chan);
 }

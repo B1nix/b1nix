@@ -348,6 +348,15 @@ if [ -n "${INPUT_MOUSE:-}" ]; then
 	DEV_ARGS="$DEV_ARGS -object input-linux,id=mouse0,evdev=$INPUT_MOUSE"
 fi
 
+# The guest console on virtio-console (images built with console=hvc0): a page
+# of text per notification instead of an emulated UART byte. Boot messages from
+# before the device is up stay on the UART in $LOG; the rest lands in $HVC_LOG
+# and is appended to $LOG when the run ends.
+HVC_LOG="$LOG.hvc"
+rm -f "$HVC_LOG"
+DEV_ARGS="$DEV_ARGS -device virtio-serial-pci,disable-legacy=on -chardev file,id=hvc0,path=$HVC_LOG -device virtconsole,chardev=hvc0"
+log_has() { grep -aq "$1" "$LOG" "$HVC_LOG" 2>/dev/null; }
+
 echo "b1nix + $IGD_BDF via VFIO ($MACHINE), ${MEM_MB}M, log: $LOG"
 
 set +e
@@ -393,7 +402,7 @@ qemu_pid=$!
 # The timeout stays as the ceiling for a run that never gets there.
 (
 	while kill -0 "$qemu_pid" 2>/dev/null; do
-		if grep -aq "KDE: done\|B1NIX-TEST: done\|KERNEL PANIC" "$LOG" 2>/dev/null; then
+		if log_has "KDE: done\|B1NIX-TEST: done\|KERNEL PANIC"; then
 			sleep 1        # let the last lines land
 			kill "$qemu_pid" 2>/dev/null
 			exit 0
@@ -410,7 +419,7 @@ captured=0
 finished=0
 waited=0
 while kill -0 "$qemu_pid" 2>/dev/null && [ "$waited" -lt "$TIMEOUT" ]; do
-	if grep -aq "mirror: frame presented" "$LOG" 2>/dev/null; then
+	if log_has "mirror: frame presented"; then
 		if [ -S "$MON" ]; then
 			printf 'screendump %s\n' "$SHOT" | timeout 10 socat - "unix-connect:$MON" >/dev/null 2>&1
 			captured=1
@@ -420,15 +429,15 @@ while kill -0 "$qemu_pid" 2>/dev/null && [ "$waited" -lt "$TIMEOUT" ]; do
 	# The compositor run says when it is finished, and there is nothing to be
 	# gained by holding the machine to the timeout after that — see the
 	# shutdown below for why it matters that this exit is a clean one.
-	if grep -aq "I915-SWAY: done" "$LOG" 2>/dev/null; then
+	if log_has "I915-SWAY: done"; then
 		finished=1
 		break
 	fi
 	# A named failure ends the run immediately. Waiting out the timeout after
 	# the guest has already said what went wrong costs the whole budget and
 	# adds nothing to the log.
-	if grep -aq "I915-SWAY: FAIL" "$LOG" 2>/dev/null; then
-		echo "guest reported: $(grep -a 'I915-SWAY: FAIL' "$LOG" | tail -1)"
+	if log_has "I915-SWAY: FAIL"; then
+		echo "guest reported: $(cat "$LOG" "$HVC_LOG" 2>/dev/null | grep -a 'I915-SWAY: FAIL' | tail -1)"
 		finished=1
 		break
 	fi
@@ -467,6 +476,7 @@ fi
 wait "$qemu_pid" 2>/dev/null
 rc=$?
 set -e
+[ -f "$HVC_LOG" ] && cat "$HVC_LOG" >> "$LOG" && rm -f "$HVC_LOG"
 
 # 124 is timeout's own code: the guest was still running, which for a driver
 # bring-up is a result rather than a failure.

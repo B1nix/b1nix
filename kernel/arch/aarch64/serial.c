@@ -187,8 +187,19 @@ void serial_init(void)
 	}
 }
 
+static void (*serial_divert)(const char *buf, usize len);
+
+void serial_console_divert(void (*sink)(const char *buf, usize len))
+{
+	serial_divert = sink;
+}
+
 void serial_putc(char c)
 {
+	if (serial_divert) {
+		serial_divert(&c, 1);
+		return;
+	}
 	if (serial_absent())
 		return;
 
@@ -269,6 +280,14 @@ char serial_getc(void)
 int serial_port_present(int idx)
 {
 	return (idx == 0) && !serial_absent();
+}
+
+void serial_port_putc(int idx, char ch);
+
+void serial_port_write(int idx, const char *buf, usize len)
+{
+	for (usize i = 0; i < len; i++)
+		serial_port_putc(idx, buf[i]);
 }
 
 void serial_port_putc(int idx, char ch)

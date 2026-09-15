@@ -4,6 +4,7 @@
 #include <b1nix/types.h>
 
 void outb(u16 port, u8 value);
+void outsb(u16 port, const u8 *buf, u32 count);
 u8 inb(u16 port);
 void outw(u16 port, u16 value);
 u16 inw(u16 port);

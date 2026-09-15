@@ -52,6 +52,11 @@ u8 serial_port_get_msr(int idx);
 /* The I/O port this line lives at, for TIOCGSERIAL. 0 = absent. */
 u16 serial_port_base(int idx);
 void serial_port_putc(int idx, char ch);
+/* A buffer to port `idx`, as few register accesses as the UART allows. */
+void serial_port_write(int idx, const char *buf, usize len);
+/* Send the kernel console's serial output to `sink` instead of the UART from
+ * now on (console=hvc0). NULL puts it back. */
+void serial_console_divert(void (*sink)(const char *buf, usize len));
 char serial_port_getc(int idx);
 int serial_port_has_data(int idx);
 
