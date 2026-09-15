@@ -245,18 +245,6 @@ void bio_set_dev(struct lkpi_bio *bio, struct lkpi_block_device *bdev)
 	bio->bi_bdev = bdev;
 }
 
-void zero_fill_bio(struct lkpi_bio *bio)
-{
-	unsigned short i;
-
-	for (i = 0; i < bio->bi_vcnt; i++) {
-		struct bio_vec *bv = &bio->bi_io_vec[i];
-
-		memset((char *)page_address(bv->bv_page) + bv->bv_offset, 0,
-		       bv->bv_len);
-	}
-}
-
 /*
  * Consume `bytes` from an iterator.
  *
@@ -301,6 +289,27 @@ struct bio_vec bio_iter_iovec(struct lkpi_bio *bio, struct bvec_iter iter)
 	if (bv.bv_len > iter.bi_size)
 		bv.bv_len = iter.bi_size;
 	return bv;
+}
+
+/*
+ * Zero what is left of the I/O, from the bio's current iterator on.
+ *
+ * Not the whole vector: a decompressing reader (btrfs) advances the iterator
+ * past the bytes it filled and then calls this for the tail the extent did not
+ * cover. Zeroing from entry 0 wiped every byte it had just decompressed, so a
+ * compressed file read back as zeros without any error.
+ */
+void zero_fill_bio(struct lkpi_bio *bio)
+{
+	struct bvec_iter iter = bio->bi_iter;
+
+	while (iter.bi_size) {
+		struct bio_vec bv = bio_iter_iovec(bio, iter);
+
+		memset((char *)page_address(bv.bv_page) + bv.bv_offset, 0,
+		       bv.bv_len);
+		bio_advance_iter_single(bio, &iter, bv.bv_len);
+	}
 }
 
 /* ── completion and chaining ────────────────────────────────────── */

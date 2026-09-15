@@ -26,7 +26,7 @@
  *
  * The large file's content is a formula (line N is N, zero-padded), so the
  * guest derives what it should see rather than being told. */
-static int btrfs_probe_disk(struct block_device *dev) {
+static int btrfs_probe_disk(struct block_device *dev, const char *label) {
     u8 *buf = kmalloc(4096);
 
     if (!buf)
@@ -40,7 +40,7 @@ static int btrfs_probe_disk(struct block_device *dev) {
         /* By label: the root disk is btrfs too, and must not be taken for
          * the image tests/smoke.sh made with known content. */
         ok = memcmp(sb->magic, BTRFS_MAGIC, 8) == 0 &&
-             strcmp(sb->label, "B1NIX-BTRFS") == 0;
+             strcmp(sb->label, label) == 0;
     }
     kfree(buf);
     return ok;
@@ -85,18 +85,111 @@ static int btrfs_expect_file(const char *path, const char *want) {
     return 0;
 }
 
-void btrfs_selftest(void) {
-    const char *dev_name = 0;
+static const char *btrfs_find_disk(const char *label) {
     usize n = blk_count();
 
     for (usize i = 0; i < n; i++) {
         struct block_device *d = blk_at(i);
 
-        if (d && d->name && btrfs_probe_disk(d)) {
-            dev_name = d->name;
+        if (d && d->name && btrfs_probe_disk(d, label))
+            return d->name;
+    }
+    return 0;
+}
+
+/* A second image, packed by mkfs.btrfs with --compress zstd: every data extent
+ * of zbig.bin is a zstd frame, and no byte of it can be read without running
+ * the decompressor. The file is the same "%014d\n" formula as big.bin but long
+ * enough to span many compressed extents (btrfs caps one at 128 KiB of data),
+ * and all of it is compared, not one line. */
+static void btrfs_zstd_selftest(void) {
+    const char *dev_name = btrfs_find_disk("B1NIX-BTRFSZ");
+
+    if (!dev_name)
+        return;
+
+    console_write("M121-BTRFS-ZSTD: start\n");
+    if (vfs_mkdir("/mnt/btrfsz", 0755) < 0 && vfs_find_node("/mnt/btrfsz") == 0) {
+        console_write("M121-BTRFS-ZSTD: FAIL mkdir\n");
+        return;
+    }
+    int rc = vfs_mount(dev_name, "/mnt/btrfsz", "btrfs", 0);
+
+    if (rc < 0) {
+        char line[96];
+
+        snprintf(line, sizeof(line), "M121-BTRFS-ZSTD: FAIL mount rc=%d\n", rc);
+        console_write(line);
+        return;
+    }
+    console_write("M121-BTRFS-ZSTD: ok mount\n");
+
+    /* Must match the generator in tests/smoke.sh. */
+    const u64 line_len = 15;
+    const u64 lines = 70000;
+    const usize chunk = 65536;
+    int fd = vfs_open_flags("/mnt/btrfsz/zbig.bin", B1NIX_O_RDONLY);
+    char *buf = kmalloc(chunk);
+    int ok = fd >= 0 && buf != 0;
+    u64 off = 0;
+    struct b1nix_stat st = {0};
+
+    if (ok && (vfs_fstat(fd, &st) != 0 || (u64)st.st_size != lines * line_len)) {
+        char line[96];
+
+        snprintf(line, sizeof(line), "M121-BTRFS-ZSTD: diag size=%lld\n",
+                 (long long)st.st_size);
+        console_write(line);
+        ok = 0;
+    }
+    while (ok && off < lines * line_len) {
+        isize r = vfs_read(fd, buf, chunk);
+
+        if (r <= 0) {
+            ok = 0;
             break;
         }
+        for (isize i = 0; i < r && ok; i++) {
+            u64 pos = off + (u64)i;
+            u64 col = pos % line_len;
+            u64 num = pos / line_len;
+            char want = '\n';
+
+            if (col < line_len - 1) {
+                u64 v = num;
+
+                for (u64 k = line_len - 2; k > col; k--)
+                    v /= 10;
+                want = (char)('0' + v % 10);
+            }
+            if (buf[i] != want) {
+                char line[128];
+
+                snprintf(line, sizeof(line),
+                         "M121-BTRFS-ZSTD: diag offset=%llu got=0x%02x "
+                         "want=0x%02x\n",
+                         (unsigned long long)pos, (unsigned)(u8)buf[i],
+                         (unsigned)(u8)want);
+                console_write(line);
+                ok = 0;
+            }
+        }
+        off += (u64)r;
     }
+    if (buf)
+        kfree(buf);
+    if (fd >= 0)
+        vfs_close(fd);
+    console_write(ok ? "M121-BTRFS-ZSTD: ok read\n"
+                     : "M121-BTRFS-ZSTD: FAIL read\n");
+    console_write("M121-BTRFS-ZSTD: done\n");
+}
+
+void btrfs_selftest(void) {
+    btrfs_zstd_selftest();
+
+    const char *dev_name = btrfs_find_disk("B1NIX-BTRFS");
+
     if (!dev_name)
         return; /* no btrfs disk attached to this instance */
 

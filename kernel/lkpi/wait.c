@@ -193,9 +193,13 @@ void __wake_up(struct wait_queue_head *wq, unsigned mode, int nr, void *key)
 			 * raced the waiter's own finish_wait over the same links. */
 			list_del_init(&e->entry);
 		} else if (e->func) {
-			lkpi_spin_unlock(&wq->lock);
+			/* Under the lock, as upstream calls it. Dropped around the call,
+			 * the waiter behind `e` could finish its wait and free its entry
+			 * meanwhile; the walk then followed the saved `next` into freed
+			 * memory, and unlinking there wrote a list pointer over whatever
+			 * the heap had put in its place -- a heap block header, seen as a
+			 * corrupted VMA or argv block on the next free. */
 			e->func(e, mode, 0, key);
-			lkpi_spin_lock(&wq->lock);
 		}
 		woken++;
 		if (nr && woken >= nr)

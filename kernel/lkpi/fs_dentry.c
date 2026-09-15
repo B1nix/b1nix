@@ -80,7 +80,13 @@ static struct dentry *d_alloc_common(struct dentry *parent,
 		/* The parent holds a reference for as long as this child exists,
 		 * which is what stops a directory being freed under its contents. */
 		dget(parent);
+		/* Under the parent's lock, as upstream's d_lock: two tasks creating
+		 * in one directory, or one creating while another's dput leaves it,
+		 * otherwise splice the same list at once and leave a link into a
+		 * freed dentry for the next list operation to write through. */
+		lkpi_spin_lock(&parent->d_lockref.lock);
 		list_add(&dentry->d_child, &parent->d_subdirs);
+		lkpi_spin_unlock(&parent->d_lockref.lock);
 	} else {
 		/* Its own parent: that is what makes IS_ROOT true and what stops a
 		 * path walk stepping off the top. */
@@ -142,20 +148,26 @@ void dput(struct dentry *dentry)
 			 * a dead pointer — btrfs notices and warns about exactly this
 			 * when it destroys the inode.
 			 */
+			spin_lock(&dentry->d_inode->i_lock);
 			if (!hlist_unhashed(&dentry->d_u))
 				hlist_del_init(&dentry->d_u);
+			spin_unlock(&dentry->d_inode->i_lock);
 			if (dentry->d_op && dentry->d_op->d_iput)
 				dentry->d_op->d_iput(dentry, dentry->d_inode);
 			else
 				iput(dentry->d_inode);
 			dentry->d_inode = NULL;
 		}
-		if (!list_empty(&dentry->d_child))
-			list_del_init(&dentry->d_child);
+		parent = (dentry->d_parent == dentry) ? NULL : dentry->d_parent;
+		if (parent) {
+			lkpi_spin_lock(&parent->d_lockref.lock);
+			if (!list_empty(&dentry->d_child))
+				list_del_init(&dentry->d_child);
+			lkpi_spin_unlock(&parent->d_lockref.lock);
+		}
 		if (dentry->d_name.name != dentry->d_iname)
 			kfree(dentry->d_name.name);
 
-		parent = (dentry->d_parent == dentry) ? NULL : dentry->d_parent;
 		kfree(dentry);
 		dentry = parent;
 	}
@@ -168,8 +180,11 @@ void d_instantiate(struct dentry *dentry, struct inode *inode)
 	/* The dentry takes over the caller's reference on the inode; that is why
 	 * a failed d_instantiate path must iput and a successful one must not. */
 	dentry->d_inode = inode;
-	if (inode)
+	if (inode) {
+		spin_lock(&inode->i_lock);
 		hlist_add_head(&dentry->d_u, &inode->i_dentry);
+		spin_unlock(&inode->i_lock);
+	}
 }
 
 void d_instantiate_new(struct dentry *dentry, struct inode *inode)
@@ -274,12 +289,22 @@ struct dentry *d_make_root(struct inode *root_inode)
 
 struct dentry *d_find_any_alias(struct inode *inode)
 {
-	struct dentry *alias;
+	struct dentry *alias, *found = NULL;
 
-	if (!inode || hlist_empty(&inode->i_dentry))
+	if (!inode)
 		return NULL;
-	alias = hlist_entry(inode->i_dentry.first, struct dentry, d_u);
-	return dget(alias);
+	/* A dentry is freed as soon as its count reaches zero, and it leaves this
+	 * list only after that: one found here at zero is already being freed, so
+	 * it is skipped rather than resurrected. */
+	spin_lock(&inode->i_lock);
+	hlist_for_each_entry(alias, &inode->i_dentry, d_u) {
+		if (lockref_get_not_zero(&alias->d_lockref)) {
+			found = alias;
+			break;
+		}
+	}
+	spin_unlock(&inode->i_lock);
+	return found;
 }
 
 struct dentry *d_find_alias(struct inode *inode)
@@ -291,13 +316,11 @@ void d_prune_aliases(struct inode *inode)
 {
 	/* Drop the dentries nothing else is holding. Only the unreferenced ones:
 	 * one somebody has open is not ours to remove. */
-	struct hlist_node *n;
-	struct dentry *dentry;
-
-	hlist_for_each_entry_safe(dentry, n, &inode->i_dentry, d_u) {
-		if (dentry->d_lockref.count == 0)
-			dput(dentry);
-	}
+	/* Nothing to do: a dentry here is freed the moment its last reference
+	 * goes, so none that nothing holds is ever left on the alias list. One
+	 * seen at zero is another task's dput in progress, and a dput from here
+	 * freed it a second time. */
+	(void)inode;
 }
 
 /* ── removing ───────────────────────────────────────────────────── */
@@ -323,8 +346,10 @@ void d_delete(struct dentry *dentry)
 		/* Off the alias list before the reference goes: the iput may be
 		 * the last one, and btrfs warns on destroying an inode that still
 		 * lists a dentry. */
+		spin_lock(&inode->i_lock);
 		if (!hlist_unhashed(&dentry->d_u))
 			hlist_del_init(&dentry->d_u);
+		spin_unlock(&inode->i_lock);
 		dentry->d_inode = NULL;
 		iput(inode);
 	}
@@ -370,10 +395,16 @@ void d_move(struct dentry *dentry, struct dentry *target)
 	dentry->d_name.hash = target->d_name.hash;
 
 	if (dentry->d_parent != target->d_parent) {
+		struct dentry *new_parent = target->d_parent;
+
+		lkpi_spin_lock(&old_parent->d_lockref.lock);
 		list_del_init(&dentry->d_child);
-		dentry->d_parent = target->d_parent;
-		dget(target->d_parent);
-		list_add(&dentry->d_child, &target->d_parent->d_subdirs);
+		lkpi_spin_unlock(&old_parent->d_lockref.lock);
+		dentry->d_parent = new_parent;
+		dget(new_parent);
+		lkpi_spin_lock(&new_parent->d_lockref.lock);
+		list_add(&dentry->d_child, &new_parent->d_subdirs);
+		lkpi_spin_unlock(&new_parent->d_lockref.lock);
 		dput(old_parent);
 	}
 	d_drop(target);
