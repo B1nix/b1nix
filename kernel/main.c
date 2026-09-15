@@ -1606,6 +1606,9 @@ void kernel_main(usize arg0, usize arg1)
 		/* btrfs, when a disk carrying one is attached: read a filesystem
 		 * mkfs.btrfs wrote and check what comes back. */
 		btrfs_selftest();
+		/* The block cache under a concurrent reader and writer, checked
+		 * against the medium; only with the disk tests/smoke.sh marks. */
+		blk_cache_selftest();
 #ifdef B1NIX_FS_IMPORT
 		/* The same thing through the bridge: b1nix's VFS mounting an
 		 * imported filesystem and serving paths from it. Here rather than

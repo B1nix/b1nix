@@ -2060,9 +2060,14 @@ static const char *user_module_at(struct task *t, u64 addr, u64 *off) {
 
 static void user_bt_line(const char *tag, int idx, u64 addr, struct task *t) {
   u64 off = 0;
+  /* Counted while the mapping's name is in use: another thread of the
+   * faulting process can still be unmapping. */
+  vma_walker_enter();
   const char *mod = user_module_at(t, addr, &off);
-  if (!mod)
+  if (!mod) {
+    vma_walker_exit();
     return;
+  }
   console_write("  ");
   console_write(tag);
   if (idx >= 0) {
@@ -2077,6 +2082,7 @@ static void user_bt_line(const char *tag, int idx, u64 addr, struct task *t) {
   console_write("+0x");
   console_write_hex64(off);
   console_write("\n");
+  vma_walker_exit();
 }
 
 /* Print what ring 3 was doing when it faulted: the faulting instruction, then

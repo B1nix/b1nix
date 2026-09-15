@@ -61,6 +61,10 @@ struct block_device {
 	 * only reaches the backing file's page cache, so fsync() on /dev/loopN has
 	 * to continue down that second level. Real disks leave this NULL. */
 	int (*flush)(struct block_device *dev);
+	/* Bumped under the block cache lock by every cached write to this device.
+	 * A read-ahead, which reads the disk with that lock dropped, checks it
+	 * before publishing what it read (kernel/dev/blk.c). */
+	u64 cache_write_gen;
 	/* Optional: make a range of blocks read back as zeroes without the caller
 	 * having to DMA a zero-filled buffer at the device. Only set by a driver
 	 * whose device negotiated the capability (virtio-blk's WRITE ZEROES today).
@@ -263,6 +267,8 @@ void blk_cache_flush(struct block_device *dev);
 void blk_flush_buffer(struct block_buffer *buf);
 void blk_sync_all(void);
 void blk_cache_invalidate(struct block_device *dev);
+/* Concurrent read/write/evict check against a disk tests/smoke.sh marks. */
+void blk_cache_selftest(void);
 /* `b1nix.blk-torture`: rewrite one multi-sector range repeatedly and check the
  * medium keeps up. Test mode only; silent unless asked for. */
 void blk_cache_torture_test(void);

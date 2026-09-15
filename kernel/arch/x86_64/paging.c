@@ -2315,12 +2315,14 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
      * fallback for a miss; the hit path is what the sixty-five thousand
      * anonymous faults of a start-up actually take. */
     if (!va) {
+      vma_walker_enter();
       for (struct vm_area *v = current_task->vma_list; v; v = v->next) {
         if (page_aligned >= v->start && page_aligned < v->end) {
           va = v;
           break;
         }
       }
+      vma_walker_exit();
     }
     if (va && page_aligned >= va->start && page_aligned < va->end &&
         va->node && va->node->inode) {

@@ -587,6 +587,9 @@ static int fault_anon_user_page(u64 va) {
   /* Only inside a mapping the task actually owns, and never a PROT_NONE
    * reservation. The VMA list is sorted by start. */
   struct vm_area *hit = 0;
+  int protnone = 0;
+  /* Counted: a sibling thread's munmap can retire mappings this walk passes. */
+  vma_walker_enter();
   for (struct vm_area *v = current_task->vma_list; v && v->start <= va;
        v = v->next) {
     if (va < v->end) {
@@ -598,12 +601,16 @@ static int fault_anon_user_page(u64 va) {
         console_write("-0x");
         console_write_hex64(v->end);
         console_write("\n");
-        return -1;
+        protnone = 1;
+        break;
       }
       hit = v;
       break;
     }
   }
+  vma_walker_exit();
+  if (protnone)
+    return -1;
   /* Fallbacks for the two regions a task legitimately touches without a VMA
    * describing the exact page: its brk heap and the stack growth window. A
    * blanket "anything above the load base" rule was materialising a fresh page
@@ -702,12 +709,17 @@ static int swap_in_fault(u64 *l3, usize i3, u64 va, u64 entry) {
 static struct vm_area *vma_for(u64 va) {
   if (!current_task)
     return 0;
+  struct vm_area *hit = 0;
+  vma_walker_enter();
   for (struct vm_area *v = current_task->vma_list; v && v->start <= va;
        v = v->next) {
-    if (va < v->end)
-      return v;
+    if (va < v->end) {
+      hit = v;
+      break;
+    }
   }
-  return 0;
+  vma_walker_exit();
+  return hit;
 }
 
 /* Is the lazy page at `va` backed by a file rather than by nothing? */
@@ -1800,10 +1812,14 @@ u64 paging_user_resident(u64 pml4_phys, u64 start, u64 end) {
     }
     if ((e2 & 0x3ULL) != D_TABLE) { va = next_l2; continue; }
 
+    /* One L3 table, resolved once: scan its entries directly rather than
+     * walking all four levels again for every page. */
     u64 *l3 = table_from_entry(e2);
-    if ((l3[l3_index(va)] & 0x3ULL) == D_PAGE)
-      count++;
-    va += PAGE_SIZE;
+    u64 stop = next_l2 < end ? next_l2 : end;
+
+    for (usize i = l3_index(va); va < stop; i++, va += PAGE_SIZE)
+      if ((l3[i] & 0x3ULL) == D_PAGE)
+        count++;
   }
   return count;
 }

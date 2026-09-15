@@ -910,6 +910,11 @@ void vma_cache_invalidate_space(u64 pml4_phys);
 void vma_idx_drop_space(u64 pml4_phys);
 /* A mapping ending at or below addr to start a walk from, or NULL (the head). */
 struct vm_area *vma_walk_start(struct task *t, u64 addr);
+/* Bracket a walk of a task's mapping list made without that address space's
+ * mutator lock (another task's list, or before taking one's own): a mapping
+ * unlinked meanwhile is not freed until the walk leaves. */
+void vma_walker_enter(void);
+void vma_walker_exit(void);
 /* Free a mapping once no page-fault walker can still be holding it. */
 void vma_retire(struct vm_area *vma);
 void vma_retire_poll(void);

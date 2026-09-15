@@ -3368,8 +3368,12 @@ u64 task_rss_sample(struct task *t, int force) {
   g_task_rss_sample_tick[idx] = now;
   u64 resident = 0;
   if (t->pml4_phys) {
+    /* Counted: the unmap paths sample before taking the address-space lock,
+     * so a sibling thread can unlink and retire a mapping under this walk. */
+    vma_walker_enter();
     for (struct vm_area *v = t->vma_list; v; v = v->next)
       resident += paging_user_resident(t->pml4_phys, v->start, v->end);
+    vma_walker_exit();
   }
   if (resident > g_task_maxrss_pages[idx])
     g_task_maxrss_pages[idx] = resident;
@@ -3387,8 +3391,12 @@ u64 task_rss_current_pages(struct task *t) {
     return 0;
   u64 resident = 0;
   if (t->pml4_phys) {
+    /* Counted: the unmap paths sample before taking the address-space lock,
+     * so a sibling thread can unlink and retire a mapping under this walk. */
+    vma_walker_enter();
     for (struct vm_area *v = t->vma_list; v; v = v->next)
       resident += paging_user_resident(t->pml4_phys, v->start, v->end);
+    vma_walker_exit();
   }
   usize idx = task_index(t);
   if (resident > g_task_maxrss_pages[idx])
@@ -3401,8 +3409,10 @@ u64 task_vsize_bytes(const struct task *t) {
   if (!t)
     return 0;
   u64 total = 0;
+  vma_walker_enter();
   for (struct vm_area *v = t->vma_list; v; v = v->next)
     total += v->end > v->start ? v->end - v->start : 0;
+  vma_walker_exit();
   return total;
 }
 
@@ -9931,6 +9941,18 @@ struct vm_area *vma_lookup(struct task *t, u64 addr) {
       break;
     }
   }
+  /* A miss from a starting point the cache or index picked is checked once
+   * more from the head: two mappings can share a start (an empty one beside a
+   * real one), and a walk begun past the real one never sees it. Misses are
+   * the rare case -- faults on unmapped addresses and EFAULT copies. */
+  if (!found && from != t->vma_list) {
+    for (struct vm_area *v = t->vma_list; v && v->start <= addr; v = v->next) {
+      if (addr < v->end) {
+        found = v;
+        break;
+      }
+    }
+  }
   if (found) {
     unsigned w = g_vma_cache_next[slot]++ % VMA_CACHE_WAYS;
 
@@ -9992,6 +10014,14 @@ static struct vm_area *vma_known_before(struct task *t, u64 addr, int need_end) 
 /* Where a walk for [addr, ...) can begin: a mapping on this task's list that
  * ends at or below addr, or NULL for the head. Caller is a counted walker or
  * holds the address-space mutex. */
+void vma_walker_enter(void) {
+  __atomic_add_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
+}
+
+void vma_walker_exit(void) {
+  __atomic_sub_fetch(&g_vma_walkers, 1, __ATOMIC_SEQ_CST);
+}
+
 struct vm_area *vma_walk_start(struct task *t, u64 addr) {
   struct vm_area *v;
 

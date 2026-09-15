@@ -1735,6 +1735,7 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
       entry->flags |= BLK_CACHE_BUSY;
       entry->flags &= ~(BLK_CACHE_VALID | BLK_CACHE_DIRTY);
       bcache_hash_insert((i32)(entry - block_cache));
+      u64 gen_before_read = dev->cache_write_gen;
       bcache_release(flags);
 
       /* Read-ahead: pull a contiguous run starting at current_lba in ONE device
@@ -1800,6 +1801,13 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
        * is already cached or in-flight, and stop if every slot is busy. Uses
        * the same LRU eviction as a normal miss (bcache_evict), so this never
        * costs more device commands than the pre-read-ahead path did. */
+      /* The read-ahead blocks were read with the lock dropped and nothing
+       * claimed. A write that landed meanwhile may already be flushed and its
+       * slot recycled, and publishing what the disk said BEFORE it would hand
+       * later reads the old contents. Only the requested block, held BUSY for
+       * the whole read, is certain; the prefetch is skipped. */
+      if (dev->cache_write_gen != gen_before_read)
+        run = 1;
       for (u32 j = 1; j < run; j++) {
         u64 ra_lba = current_lba + j;
         if (bcache_find(dev, ra_lba))
@@ -1807,8 +1815,11 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
         struct block_buffer *slot = bcache_evict(&flags);
         if (!slot)
           break; /* all slots in-flight — stop prefetch */
-        /* bcache_evict may have dropped the lock for a dirty write-back; the
-         * key could have been filled meanwhile — don't create a duplicate. */
+        /* bcache_evict may have dropped the lock for a dirty write-back: the
+         * key could have been filled meanwhile (no duplicate), or a write
+         * could have landed (no stale publish). */
+        if (dev->cache_write_gen != gen_before_read)
+          break;
         if (bcache_find(dev, ra_lba))
           continue;
         slot->bdev = dev;
@@ -1982,6 +1993,7 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
        * claim is needed here — unlike the read path. */
       memcpy(entry->data, buf8 + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE);
       entry->flags |= BLK_CACHE_DIRTY; /* write-back: flush later */
+      dev->cache_write_gen++;
       {
         unsigned os = blk_owner_slot();
 
@@ -3082,4 +3094,233 @@ void blk_create_dev_nodes(void) {
     blk_wire_dev_node(node, dev, i);
     node->inode->mode = 0660;
   }
+}
+
+/* ── Block cache self-test ───────────────────────────────────────────────
+ *
+ * Runs only when a disk whose first sector starts with BCACHE_TEST_MAGIC is
+ * attached (tests/smoke.sh builds one for the blk instance). A writer thread
+ * stamps random runs of sectors with (lba, generation) while a reader thread
+ * reads random runs through the cache, with read-ahead, on the same disk; the
+ * disk is larger than the cache, so both keep evicting. Then everything is
+ * flushed and each written sector is read back from the DEVICE, bypassing the
+ * cache, and must carry the generation the writer last gave it. A cache that
+ * loses or resurrects a write is caught by that comparison, not by a read that
+ * might itself be served from the same wrong cache entry. */
+#define BCACHE_TEST_MAGIC "B1NIX-BCACHE-TEST"
+#define BCACHE_TEST_RUNS 3000
+/* Sectors at the start of the disk both threads keep hitting. */
+#define BCACHE_TEST_HOT 2048
+
+struct bcache_test {
+  struct block_device *dev;
+  u64 nsect;
+  u32 *gens;
+  volatile u32 gen;
+  volatile int writer_done;
+  volatile int reader_done;
+  volatile u32 cross_reads;
+  u64 rng_w, rng_r;
+};
+
+static u64 bcache_test_rand(u64 *s) {
+  u64 x = *s;
+  x ^= x << 13;
+  x ^= x >> 7;
+  x ^= x << 17;
+  *s = x;
+  return x;
+}
+
+static void bcache_test_stamp(u8 *sec, u64 lba, u32 gen) {
+  memcpy(sec, &lba, sizeof(lba));
+  memcpy(sec + 8, &gen, sizeof(gen));
+  for (usize i = 12; i < CACHE_BLOCK_SIZE; i++)
+    sec[i] = (u8)(lba * 31u + gen * 7u + i);
+}
+
+/* 1 when the sector is either untouched (all zero) or a whole, self-consistent
+ * stamp of THIS lba. */
+static int bcache_test_sane(const u8 *sec, u64 lba, u32 *gen_out) {
+  u64 got_lba;
+  u32 gen;
+
+  memcpy(&got_lba, sec, sizeof(got_lba));
+  memcpy(&gen, sec + 8, sizeof(gen));
+  *gen_out = gen;
+  if (got_lba == 0 && gen == 0)
+    return 1;
+  if (got_lba != lba)
+    return 0;
+  for (usize i = 12; i < CACHE_BLOCK_SIZE; i++)
+    if (sec[i] != (u8)(lba * 31u + gen * 7u + i))
+      return 0;
+  return 1;
+}
+
+static void bcache_test_writer(void *arg) {
+  struct bcache_test *t = arg;
+  u8 *buf = kmalloc(64 * CACHE_BLOCK_SIZE);
+
+  if (buf) {
+    for (u32 r = 0; r < BCACHE_TEST_RUNS; r++) {
+      u32 n = 1 + (u32)(bcache_test_rand(&t->rng_w) % 64);
+      /* Every other run in the hot region the reader prefetches from; the
+       * rest scattered over the whole disk, which keeps the cache evicting. */
+      u64 span = (r & 1) ? BCACHE_TEST_HOT : t->nsect;
+      u64 lba = 1 + bcache_test_rand(&t->rng_w) % (span - n - 1);
+
+      for (u32 k = 0; k < n; k++) {
+        u32 g = __atomic_add_fetch(&t->gen, 1, __ATOMIC_RELAXED);
+
+        bcache_test_stamp(buf + k * CACHE_BLOCK_SIZE, lba + k, g);
+      }
+      if (blk_write_cached(t->dev, lba, n, buf) == 0) {
+        for (u32 k = 0; k < n; k++) {
+          u32 g;
+
+          memcpy(&g, buf + k * CACHE_BLOCK_SIZE + 8, sizeof(g));
+          t->gens[lba + k] = g;
+        }
+      }
+      if (r % 64 == 63)
+        blk_cache_flush(t->dev);
+    }
+    kfree(buf);
+  }
+  t->writer_done = 1;
+}
+
+static void bcache_test_reader(void *arg) {
+  struct bcache_test *t = arg;
+  u8 *buf = kmalloc(128 * CACHE_BLOCK_SIZE);
+
+  while (buf && !t->writer_done) {
+    u32 n = 1 + (u32)(bcache_test_rand(&t->rng_r) % 8);
+    u64 lba = 1 + bcache_test_rand(&t->rng_r) % (BCACHE_TEST_HOT - n - 1);
+
+    if (blk_read_cached(t->dev, lba, n, buf) != 0)
+      continue;
+    for (u32 k = 0; k < n; k++) {
+      u32 g;
+
+      if (!bcache_test_sane(buf + k * CACHE_BLOCK_SIZE, lba + k, &g))
+        t->cross_reads++;
+    }
+  }
+  kfree(buf);
+  t->reader_done = 1;
+}
+
+void blk_cache_selftest(void) {
+  struct block_device *dev = 0;
+  u8 sec[CACHE_BLOCK_SIZE];
+  usize n = blk_count();
+
+  for (usize i = 0; i < n && !dev; i++) {
+    struct block_device *d = blk_at(i);
+
+    if (!d || d->block_size != CACHE_BLOCK_SIZE || !d->read_blocks ||
+        !d->write_blocks || d->block_count < 1024)
+      continue;
+    if (d->read_blocks(d, 0, 1, sec) >= 0 &&
+        memcmp(sec, BCACHE_TEST_MAGIC, sizeof(BCACHE_TEST_MAGIC) - 1) == 0)
+      dev = d;
+  }
+  if (!dev)
+    return;
+
+  console_write("BCACHE-TEST: start\n");
+  struct bcache_test *t = kzalloc(sizeof(*t));
+  u64 nsect = dev->block_count;
+
+  if (t)
+    t->gens = kzalloc((usize)nsect * sizeof(u32));
+  if (!t || !t->gens) {
+    console_write("BCACHE-TEST: FAIL no memory\n");
+    if (t)
+      kfree(t);
+    return;
+  }
+  t->dev = dev;
+  t->nsect = nsect;
+  t->rng_w = 0x9e3779b97f4a7c15ull;
+  t->rng_r = 0xd1b54a32d192ed03ull;
+
+  if (kthread_create("bcache-test-w", bcache_test_writer, t) < 0 ||
+      kthread_create("bcache-test-r", bcache_test_reader, t) < 0) {
+    console_write("BCACHE-TEST: FAIL threads\n");
+    return; /* the threads may still run: t is left allocated for them */
+  }
+  while (!t->writer_done || !t->reader_done)
+    scheduler_sleep_ticks(10);
+
+  blk_cache_flush(dev);
+  u8 *raw = kmalloc(64 * CACHE_BLOCK_SIZE);
+  u64 lost = 0, torn = 0, first_bad = 0;
+
+  for (u64 lba = 1; raw && lba < nsect; lba += 64) {
+    u32 cnt = (u32)(nsect - lba < 64 ? nsect - lba : 64);
+
+    if (dev->read_blocks(dev, lba, cnt, raw) < 0) {
+      torn++;
+      break;
+    }
+    for (u32 k = 0; k < cnt; k++) {
+      u32 want = t->gens[lba + k], got;
+
+      if (!want)
+        continue;
+      if (!bcache_test_sane(raw + k * CACHE_BLOCK_SIZE, lba + k, &got)) {
+        if (!first_bad)
+          first_bad = lba + k;
+        torn++;
+      } else if (got != want) {
+        if (!first_bad)
+          first_bad = lba + k;
+        lost++;
+      }
+    }
+  }
+  /* And through the cache: a stale clean copy never reaches the disk, so
+   * only a cached read can show it. */
+  u64 cache_stale = 0;
+
+  for (u64 lba = 1; raw && lba < nsect; lba += 64) {
+    u32 cnt = (u32)(nsect - lba < 64 ? nsect - lba : 64);
+
+    if (blk_read_cached(dev, lba, cnt, raw) != 0) {
+      cache_stale++;
+      break;
+    }
+    for (u32 k = 0; k < cnt; k++) {
+      u32 want = t->gens[lba + k], got;
+
+      if (want && (!bcache_test_sane(raw + k * CACHE_BLOCK_SIZE, lba + k, &got) ||
+                   got != want))
+        cache_stale++;
+    }
+  }
+  if (raw)
+    kfree(raw);
+
+  {
+    char line[160];
+
+    snprintf(line, sizeof(line),
+             "BCACHE-TEST: sectors=%llu cross-reads=%u stale=%llu torn=%llu first-bad=%llu cache-stale=%llu\n",
+             (unsigned long long)nsect, (unsigned)t->cross_reads,
+             (unsigned long long)lost, (unsigned long long)torn,
+             (unsigned long long)first_bad, (unsigned long long)cache_stale);
+    console_write(line);
+  }
+  console_write(t->cross_reads == 0 ? "BCACHE-TEST: ok reads-consistent\n"
+                                    : "BCACHE-TEST: FAIL reads-consistent\n");
+  console_write(lost == 0 && torn == 0 ? "BCACHE-TEST: ok medium-matches\n"
+                                       : "BCACHE-TEST: FAIL medium-matches\n");
+  console_write(cache_stale == 0 ? "BCACHE-TEST: ok cache-matches\n"
+                                 : "BCACHE-TEST: FAIL cache-matches\n");
+  console_write("BCACHE-TEST: done\n");
+  kfree(t->gens);
+  kfree(t);
 }

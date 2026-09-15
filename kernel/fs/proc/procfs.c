@@ -1569,6 +1569,8 @@ static int r_pid_statm(usize pid, struct sbuf *s) {
     return 0;
   }
   unsigned long size = 0, resident = 0, shared = 0, text = 0, data = 0;
+  /* Another task's list, walked without its address-space lock. */
+  vma_walker_enter();
   for (struct vm_area *v = t->vma_list; v; v = v->next) {
     unsigned long pages = (unsigned long)((v->end - v->start) / PAGE_SIZE);
     size += pages;
@@ -1581,6 +1583,7 @@ static int r_pid_statm(usize pid, struct sbuf *s) {
     if (t->pml4_phys)
       resident += paging_user_resident(t->pml4_phys, v->start, v->end);
   }
+  vma_walker_exit();
   /* The walk above already measured the resident set, so let the peak tracker
    * see it too (M86) — a `ps`/`top` poll then also refreshes ru_maxrss. */
   task_rss_sample(t, 0);
@@ -1653,7 +1656,7 @@ static void procfs_maps_add(struct procfs_map_ent *m, usize *n, usize max,
   (*n)++;
 }
 
-static int r_pid_maps(usize pid, struct sbuf *s) {
+static int r_pid_maps_walked(usize pid, struct sbuf *s) {
   struct task *t = scheduler_task_by_pid(pid);
   if (!t)
     return 0;
@@ -1804,6 +1807,16 @@ static int r_pid_maps(usize pid, struct sbuf *s) {
   }
   kfree(m);
   return 0;
+}
+
+/* Another task's mapping list, read without its address-space lock, and the
+ * names taken from its mappings are used until the text is formatted: the
+ * whole read is one counted walk, so nothing it points at is freed under it. */
+static int r_pid_maps(usize pid, struct sbuf *s) {
+  vma_walker_enter();
+  int rc = r_pid_maps_walked(pid, s);
+  vma_walker_exit();
+  return rc;
 }
 
 /* ── /proc/<pid> directory builder ── */

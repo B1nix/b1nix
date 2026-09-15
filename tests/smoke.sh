@@ -1212,6 +1212,28 @@ with open('$_bdir/big.bin','wb') as f:
 				BTRFS_READY=1
 			fi
 			rm -rf "$_bdir"
+			# The same formula, long enough for many compressed extents,
+			# packed with zstd. btrfs only keeps an extent compressed when
+			# that saves space, so the host confirms that zstd extents
+			# really are on the image before the guest is asked to read them.
+			_zdir="$PROJECT_DIR/smoke_run/btrfsz-root-$$"
+			BTRFSZ_IMG=$(disk_img btrfsz blk)
+			rm -rf "$_zdir"; mkdir -p "$_zdir"
+			rm -f "$BTRFSZ_IMG"; truncate -s 256M "$BTRFSZ_IMG"
+			if python3 -c "
+with open('$_zdir/zbig.bin','wb') as f:
+    for i in range(70000):
+        f.write(b'%014d\n' % i)
+" && mkfs.btrfs -q -L B1NIX-BTRFSZ -m single -d single --nodesize 16384 \
+				--compress zstd --rootdir "$_zdir" "$BTRFSZ_IMG" 2>/dev/null &&
+				btrfs inspect-internal dump-tree -t fs "$BTRFSZ_IMG" 2>/dev/null |
+				grep -q "compression 3"; then
+				EXTRA_BTRFSZ="-drive file=$BTRFSZ_IMG,if=none,id=btrfszdisk,format=raw -device $vblk_device,drive=btrfszdisk"
+			else
+				# No image means no checks: the verdict below keys off it.
+				rm -f "$BTRFSZ_IMG"
+			fi
+			rm -rf "$_zdir"
 		fi
 		EXTRA_QEMU_ARGS="-drive file=$(disk_img usb blk),if=none,id=usbdisk,format=raw -device usb-storage,bus=xhci.0,drive=usbdisk \
 			-drive file=$(disk_img vblk blk),if=none,id=vblkdisk,format=raw,discard=unmap -device $vblk_device,drive=vblkdisk"
@@ -1219,6 +1241,14 @@ with open('$_bdir/big.bin','wb') as f:
 			EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS \
 			-drive file=$BTRFS_IMG,if=none,id=btrfsdisk,format=raw -device $vblk_device,drive=btrfsdisk"
 		fi
+		[ -n "$EXTRA_BTRFSZ" ] && EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS $EXTRA_BTRFSZ"
+		# A raw disk for the kernel's block cache self-test, marked in its
+		# first sector, and larger than the cache so reads and writes evict.
+		BCACHE_IMG=$(disk_img bcache blk)
+		rm -f "$BCACHE_IMG"; truncate -s 64M "$BCACHE_IMG"
+		command printf 'B1NIX-BCACHE-TEST' | dd of="$BCACHE_IMG" conv=notrunc 2>/dev/null
+		EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS \
+			-drive file=$BCACHE_IMG,if=none,id=bcachedisk,format=raw -device $vblk_device,drive=bcachedisk"
 		export BTRFS_READY
 		if [ -n "$_bios" ]; then
 			EXTRA_QEMU_ARGS="$EXTRA_QEMU_ARGS \
@@ -1575,7 +1605,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	for _i in sys blk posix gfx init switchroot iommu amdvi smp; do
+	for _i in sys sysnet blk posix gfx init switchroot iommu amdvi smp; do
 	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" "$(disk_img vblk "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
@@ -3330,6 +3360,15 @@ check_output "$BLK_LOG" "M109-SMOKE: done" "M109 suite completes"
 # Decided here rather than carried from the lane: the lane runs in a subshell,
 # so a variable exported there never reaches this point, and the checks were
 # silently skipped on every run.
+check_output "$BLK_LOG" "BCACHE-TEST: ok reads-consistent" "block cache: reads racing a writer and eviction always see a whole sector of the right block"
+check_output "$BLK_LOG" "BCACHE-TEST: ok cache-matches" "block cache: after the run every sector read through the cache holds its last generation (no stale copy resurrected by read-ahead)"
+check_output "$BLK_LOG" "BCACHE-TEST: ok medium-matches" "block cache: after a flush every sector on the disk holds the last generation written to it"
+if [ -f "$(disk_img btrfsz blk)" ]; then
+	check_output "$BLK_LOG" "M121-BTRFS-ZSTD: ok mount" "btrfs: an image mkfs.btrfs packed with zstd mounts"
+	check_output "$BLK_LOG" "M121-BTRFS-ZSTD: ok read" "btrfs: every byte of a file stored in zstd extents decompresses to what mkfs.btrfs was given"
+else
+	skipped "btrfs zstd read" "no zstd-compressed btrfs image on this host (btrfs-progs without zstd, or mkfs kept the extents uncompressed)"
+fi
 if command -v mkfs.btrfs >/dev/null 2>&1; then
 	check_output "$BLK_LOG" "M119-BTRFS: ok mount" "btrfs: the chunk tree maps logical addresses, the root tree names the FS tree, and the mount stands up"
 	check_output "$BLK_LOG" "M119-BTRFS: ok inline-file" "btrfs: a small file, whose bytes btrfs keeps inline in the tree leaf"
@@ -3350,7 +3389,9 @@ if command -v mkfs.btrfs >/dev/null 2>&1; then
 	# filesystem this kernel wrote is one that btrfs-progs still recognises.
 	# Reading our own writes back proves far less: a driver consistent with
 	# itself agrees with itself and with nothing else.
-	if command -v btrfs >/dev/null 2>&1; then
+	# Only after a blk instance really made the image: a SMOKE_INSTANCES run
+	# without blk has none, and its checks are already reported as blocked.
+	if command -v btrfs >/dev/null 2>&1 && [ -f "$(disk_img btrfs blk)" ]; then
 		_bchk="$PROJECT_DIR/smoke_run/btrfs-check-blk.log"
 		if btrfs check --readonly "$(disk_img btrfs blk)" >"$_bchk" 2>&1; then
 			pass "btrfs check accepts the filesystem after the guest wrote to it"
@@ -3822,8 +3863,10 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-for _i in sys blk posix gfx init switchroot iommu amdvi smp; do
-    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")"
+for _i in sys sysnet blk posix gfx init switchroot iommu amdvi smp; do
+    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" \
+          "$(disk_img vblk "$_i")" "$(disk_img ahci "$_i")" "$(disk_img btrfs "$_i")" "$(disk_img btrfsz "$_i")" \
+          "$(disk_img bcache "$_i")"
 done
 echo ""
 

@@ -5729,6 +5729,34 @@ static u64 sys_brk(u64 addr) {
         continue;
       }
 
+      /* Grow the break's own mapping when it ends right here rather than
+       * adding a second one. The loader starts the break as an empty mapping
+       * at heap_start; a new mapping beside it had the SAME start, the index
+       * then held two entries for one address, and vma_lookup could pick the
+       * empty one and walk straight past the real heap -- a glibc path kept
+       * in the break failed its copy-in with EFAULT. */
+      {
+        struct vm_area *grown = 0;
+        u64 vflags;
+
+        vma_list_lock(&vflags);
+        for (struct vm_area *v = t->vma_list; v; v = v->next) {
+          if (v->end == from && v->start >= t->heap_start && !v->node &&
+              v->prot == (PROT_READ | PROT_WRITE) &&
+              v->flags == (MAP_PRIVATE | MAP_ANONYMOUS) &&
+              (!v->next || v->next->start >= chunk_end)) {
+            __atomic_store_n(&v->end, chunk_end, __ATOMIC_RELEASE);
+            grown = v;
+            break;
+          }
+        }
+        vma_list_unlock(vflags);
+        if (grown) {
+          from = chunk_end;
+          continue;
+        }
+      }
+
       struct vm_area *heap = kzalloc(sizeof(struct vm_area));
 
       if (!heap)
@@ -5737,16 +5765,12 @@ static u64 sys_brk(u64 addr) {
       heap->end = chunk_end;
       heap->prot = PROT_READ | PROT_WRITE;
       heap->flags = MAP_PRIVATE | MAP_ANONYMOUS;
-      /* In address order, like every other insertion: the list is walked by
-       * address in several places and a front-inserted node breaks them. */
-      {
-        struct vm_area **link = &t->vma_list;
-
-        while (*link && (*link)->start < heap->start)
-          link = &(*link)->next;
-        heap->next = *link;
-        *link = heap;
-      }
+      /* Through vma_insert, in address order like every other insertion, and
+       * into the address space's index too. Linked by hand, the break was on
+       * the list but absent from the index, so vma_lookup missed it and every
+       * path a glibc program kept in its malloc'd break failed its copy-in
+       * with EFAULT -- `ls /` said "Bad address". */
+      vma_insert(t, heap);
       from = chunk_end;
     }
   } else if (addr < old_brk) {
@@ -9159,11 +9183,18 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         if (eviction_lock_range(current_task, PAGE_SIZE, USER_STACK_TOP) != 0)
           return (u64)-ENOMEM;
         if (arg0 & 1) { /* MCL_CURRENT: populate what is mapped right now */
+          int populated = 1;
+          vma_walker_enter();
           for (struct vm_area *v = current_task->vma_list; v; v = v->next) {
             if (mlock_populate(v->start, v->end) != 0) {
-              eviction_unlock_all(current_task);
-              return (u64)-ENOMEM;
+              populated = 0;
+              break;
             }
+          }
+          vma_walker_exit();
+          if (!populated) {
+            eviction_unlock_all(current_task);
+            return (u64)-ENOMEM;
           }
         }
         return 0;
@@ -10634,10 +10665,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* scheduler_get_priority already returns the Linux 20-nice encoding. */
     return (u64)(isize)scheduler_get_priority(pid);
   }
-  case SYS_BRK:
+  case SYS_BRK: {
     /* A shrinking brk drops pages — same reason as munmap. */
     task_rss_sample(current_task, 0);
-    return sys_brk(arg0);
+    /* It adds and removes mappings, so it serialises with the other address
+     * space mutators. */
+    unsigned vma_slot = vma_mutator_lock();
+    u64 r = sys_brk(arg0);
+    vma_mutator_unlock(vma_slot);
+    return r;
+  }
   case SYS_MMAP: {
     unsigned vma_slot = vma_mutator_lock();
     u64 r = sys_mmap((void *)(usize)arg0, (usize)arg1, (int)arg2, (int)arg3,
