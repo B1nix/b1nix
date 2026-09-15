@@ -894,6 +894,13 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 			echo "KDE: full repaint per frame (buffer age off)"
 			export KWIN_USE_BUFFER_AGE=0
 		fi
+		# b1nix.kwin-env=NAME=VALUE[,NAME=VALUE...]: any other compositor or
+		# Mesa switch, for the experiment that needs one without a new image.
+		for __kv in $(flag_value b1nix.kwin-env "" | tr ',' ' '); do
+			case "$__kv" in
+			[A-Z_]*=*) echo "KDE: kwin env $__kv"; export "$__kv" ;;
+			esac
+		done
 		env -u WAYLAND_DISPLAY -u DISPLAY \
 		timeout 900 /usr/bin/kwin_wayland --drm --socket wayland-1 \
 			--no-lockscreen > /tmp/kde-kwin.log 2>&1 &
@@ -1039,6 +1046,11 @@ if [ -n "${DRM_CANDIDATES:-}" ]; then
 	echo "--- kwin drm ---"
 	grep -a "kwin_wayland_drm\|kwin_scene\|kwin_screencast\|DrmGpu\|drmMode\|kwin_core: Failed\|No suitable\|connector\|Connector\|modeset\|page flip\|pageflip" \
 		/tmp/kde-kwin.log 2>/dev/null | tail -60
+	# What Mesa and EGL said, which the Qt plugin chatter below buries: a
+	# buffer the GPU driver refuses to import shows up here and nowhere else.
+	echo "--- kwin egl ---"
+	grep -a "libEGL\|MESA\|Mesa\|iris\|EGL_\|dmabuf\|DMA-BUF\|dma_buf" \
+		/tmp/kde-kwin.log 2>/dev/null | sort | uniq -c | sort -rn | head -40
 	echo "--- kwin log ---"
 	grep -av "MetaData\|Keys\|IID\|qt.qpa.plugin: Found\|ELF load\|elf: load" \
 		/tmp/kde-kwin.log 2>/dev/null | head -60

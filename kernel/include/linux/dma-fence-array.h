@@ -12,17 +12,22 @@
  * that have no order between them. The array owns a reference on each member and
  * drops them all when it is released.
  */
+struct dma_fence_array;
+
+/* One per member: a callback block is a list node, and it can sit on only one
+ * member's callback list. */
+struct dma_fence_array_cb {
+	struct dma_fence_cb cb;
+	struct dma_fence_array *array;
+};
+
 struct dma_fence_array {
 	struct dma_fence base;
 	spinlock_t lock;
 	unsigned int num_fences;
 	atomic_t num_pending;
 	struct dma_fence **fences;
-	/* One callback block for the whole array, not one per member: every member
-	 * decrements the same counter, so they can share it — and dma_fence's
-	 * callback list links through the block, so a member that is still pending
-	 * when another signals keeps it alive. */
-	struct dma_fence_cb cb_storage;
+	struct dma_fence_array_cb *callbacks;
 };
 
 struct dma_fence_array *dma_fence_array_create(int num_fences,

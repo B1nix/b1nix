@@ -192,14 +192,26 @@ long dma_resv_wait_timeout(struct dma_resv *obj, enum dma_resv_usage usage,
 	}
 }
 
+struct dma_fence_array;
+struct dma_fence_array *dma_fence_array_create(int num_fences,
+                                               struct dma_fence **fences,
+                                               u64 context, unsigned seqno,
+                                               _Bool signal_on_any);
+
+/*
+ * One fence for every fence of `usage`: none, the only one, or an array over
+ * all of them — upstream's contract. i915 asks this of every framebuffer it
+ * prepares for a flip, and a buffer rendered on the GPU carries several fences;
+ * refusing that case failed each page flip after the first modeset.
+ */
 int dma_resv_get_singleton(struct dma_resv *obj, enum dma_resv_usage usage,
                            struct dma_fence **fence)
 {
 	if (!obj || !fence)
 		return -EINVAL;
 
-	struct dma_fence *found = 0;
 	u32 matching = 0;
+	struct dma_fence *found = 0;
 	for (u32 i = 0; i < obj->count; i++) {
 		if (!usage_matches(obj->fences[i].usage, usage))
 			continue;
@@ -207,14 +219,34 @@ int dma_resv_get_singleton(struct dma_resv *obj, enum dma_resv_usage usage,
 		found = obj->fences[i].fence;
 	}
 
-	if (matching > 1) {
-		/* Returning one of several would tell the caller the others are
-		 * covered when they are not, and it would stop waiting too early. */
-		*fence = 0;
-		return -ENOSYS;
+	if (matching <= 1) {
+		*fence = found ? dma_fence_get(found) : 0;
+		return 0;
 	}
 
-	*fence = found ? dma_fence_get(found) : 0;
+	/* The array takes ownership of the table and of a reference on each
+	 * member. */
+	struct dma_fence **fences = (struct dma_fence **)lkpi_kcalloc(
+		matching, sizeof(*fences), GFP_KERNEL);
+	if (!fences)
+		return -ENOMEM;
+	u32 n = 0;
+	for (u32 i = 0; i < obj->count && n < matching; i++) {
+		if (usage_matches(obj->fences[i].usage, usage))
+			fences[n++] = dma_fence_get(obj->fences[i].fence);
+	}
+
+	struct dma_fence_array *array = dma_fence_array_create(
+		(int)n, fences, dma_fence_context_alloc(1), 1, 0);
+	if (!array) {
+		while (n--)
+			dma_fence_put(fences[n]);
+		lkpi_kfree(fences);
+		*fence = 0;
+		return -ENOMEM;
+	}
+	/* struct dma_fence is the array's first member. */
+	*fence = (struct dma_fence *)array;
 	return 0;
 }
 

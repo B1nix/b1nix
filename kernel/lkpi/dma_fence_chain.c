@@ -61,10 +61,9 @@ void dma_fence_chain_free(struct dma_fence_chain *chain)
 /*
  * The ops a chain link carries.
  *
- * Their only job here is identity: imported code recognises a chain by
- * comparing fence->ops against this table, which is why the table has to exist
- * and has to be the one every link points at. The names are what a diagnostic
- * prints.
+ * Imported code recognises a chain by comparing fence->ops against this table,
+ * so every link points at it; and a chain is never signalled by anyone, so its
+ * state is what `signaled` reports from the links.
  */
 static const char *chain_driver_name(struct dma_fence *fence)
 { (void)fence; return "dma_fence_chain"; }
@@ -72,9 +71,27 @@ static const char *chain_driver_name(struct dma_fence *fence)
 static const char *chain_timeline_name(struct dma_fence *fence)
 { (void)fence; return "unbound"; }
 
+/*
+ * Complete when every link is: each link's own fence, down to the fence the
+ * first link was built on. Asked of each member, so a driver-backed member
+ * answers from its hardware state.
+ */
+static _Bool chain_signaled(struct dma_fence *fence)
+{
+	struct dma_fence_chain *chain;
+
+	while ((chain = to_dma_fence_chain(fence)) != 0) {
+		if (chain->fence && !dma_fence_is_signaled(chain->fence))
+			return 0;
+		fence = chain->prev;
+	}
+	return !fence || dma_fence_is_signaled(fence);
+}
+
 const struct dma_fence_ops dma_fence_chain_ops = {
 	.get_driver_name = chain_driver_name,
 	.get_timeline_name = chain_timeline_name,
+	.signaled = chain_signaled,
 };
 
 void dma_fence_chain_init(struct dma_fence_chain *chain, struct dma_fence *prev,

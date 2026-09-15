@@ -1126,7 +1126,10 @@ endif
 	@printf 'm108pw:$$6$$m108pwsalt$$YvQPFIRKzF9l53ejsICs/u66sJBq6NfeOai7reDJDsOGog0q.k7t7bHAfGgVrOs3Ni0rrwKmaEwEWvZv3Tl9V1:20000:0:99999:7:::\n' >> $(ETCSTAGE)/shadow
 	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\npamtest:x:1001:pamtest\nm108user:x:1002:\nm108peer:x:1003:\nm108pw:x:1004:\n" > $(ETCSTAGE)/group
 	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/bin/m108shell\n/bin/busybox\n" > $(ETCSTAGE)/shells
-	@$(CIC) $(ETCSTAGE)/passwd $(ETCSTAGE)/shadow $(ETCSTAGE)/group $(ETCSTAGE)/shells $(ROOTFS)/etc/
+	@$(CIC) $(ETCSTAGE)/passwd $(ETCSTAGE)/group $(ETCSTAGE)/shells $(ROOTFS)/etc/
+	@# 0400 is what stamp-root-modes.sh leaves; compared against anything else
+	@# the copy differs on every build and the root image is repacked.
+	@$(CIC) --mode 0400 $(ETCSTAGE)/shadow $(ROOTFS)/etc/
 	@# rootfs-overlay: /etc/rc, posix/zsh smoke scripts,
 	@# sshd init.d, bb-w6/bb-w2b fixtures — real files (not embedded kernel C
 	@# strings) copied verbatim onto the ext4 root. cp -R preserves the tree

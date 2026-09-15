@@ -21,6 +21,7 @@
 #include <linux/io.h>
 #include <linux/interrupt.h>
 #include <linux/shrinker.h>
+#include <linux/srcu.h>
 #include <linux/io-mapping.h>
 #include <linux/irq_work.h>
 #include <linux/ktime.h>
@@ -240,19 +241,27 @@ bool hrtimer_active(const struct hrtimer *t)
 /* ── dma-fence-array ────────────────────────────────────────────── */
 
 /*
- * One fence over several, signalled when the last member is.
+ * One fence over several, signalled when the last member is (or the first, with
+ * signal_on_any).
  *
- * The pending count is what makes it work: each member gets a callback, every
- * callback decrements, and the array signals on the transition to zero. The
- * callback also has to cope with a member that was already signalled when it
- * was added — dma_fence_add_callback reports that rather than calling back — so
- * the count is decremented in that case too, or the array would never complete.
+ * Each member gets its own callback block, and each armed block holds a
+ * reference on the array: a member can outlive every other holder of the array,
+ * and its callback list still links through the block. A member that was
+ * already signalled when it was added is refused with -ENOENT and never calls
+ * back, so it is counted off here instead.
  */
 static const char *fence_array_get_driver_name(struct dma_fence *fence)
 { (void)fence; return "dma_fence_array"; }
 
 static const char *fence_array_get_timeline_name(struct dma_fence *fence)
 { (void)fence; return "unbound"; }
+
+static _Bool fence_array_signaled(struct dma_fence *fence)
+{
+	struct dma_fence_array *array = (struct dma_fence_array *)fence;
+
+	return atomic_read(&array->num_pending) <= 0;
+}
 
 static void fence_array_release(struct dma_fence *fence)
 {
@@ -261,12 +270,14 @@ static void fence_array_release(struct dma_fence *fence)
 	for (unsigned int i = 0; i < array->num_fences; i++)
 		dma_fence_put(array->fences[i]);
 	kfree(array->fences);
+	kfree(array->callbacks);
 	kfree(array);
 }
 
 static const struct dma_fence_ops dma_fence_array_ops = {
 	.get_driver_name = fence_array_get_driver_name,
 	.get_timeline_name = fence_array_get_timeline_name,
+	.signaled = fence_array_signaled,
 	.release = fence_array_release,
 };
 
@@ -275,14 +286,30 @@ bool dma_fence_is_array(struct dma_fence *fence)
 	return fence && fence->ops == &dma_fence_array_ops;
 }
 
+/* The signal path writes the fence's error, so the one a member reported is
+ * handed to it rather than stored ahead of it. */
+static void fence_array_signal(struct dma_fence_array *array)
+{
+	int error = array->base.error;
+
+	if (error)
+		dma_fence_signal_error(&array->base, error);
+	else
+		dma_fence_signal(&array->base);
+}
+
 static void fence_array_member_signalled(struct dma_fence *f,
                                          struct dma_fence_cb *cb)
 {
-	struct dma_fence_array *array = container_of(cb, struct dma_fence_array,
-	                                             cb_storage);
-	(void)f;
+	struct dma_fence_array_cb *acb =
+		container_of(cb, struct dma_fence_array_cb, cb);
+	struct dma_fence_array *array = acb->array;
+
+	if (f->error && !array->base.error)
+		array->base.error = f->error;
 	if (atomic_dec_and_test(&array->num_pending))
-		dma_fence_signal(&array->base);
+		fence_array_signal(array);
+	dma_fence_put(&array->base);
 }
 
 struct dma_fence_array *dma_fence_array_create(int num_fences,
@@ -298,6 +325,12 @@ struct dma_fence_array *dma_fence_array_create(int num_fences,
 	array = kzalloc(sizeof(*array), GFP_KERNEL);
 	if (!array)
 		return 0;
+	array->callbacks = kcalloc((size_t)num_fences, sizeof(*array->callbacks),
+	                           GFP_KERNEL);
+	if (!array->callbacks) {
+		kfree(array);
+		return 0;
+	}
 
 	spin_lock_init(&array->lock);
 	dma_fence_init(&array->base, &dma_fence_array_ops, &array->lock, context,
@@ -308,12 +341,17 @@ struct dma_fence_array *dma_fence_array_create(int num_fences,
 	atomic_set(&array->num_pending, signal_on_any ? 1 : num_fences);
 
 	for (int i = 0; i < num_fences; i++) {
-		if (dma_fence_add_callback(fences[i], &array->cb_storage,
+		struct dma_fence_array_cb *acb = &array->callbacks[i];
+
+		acb->array = array;
+		dma_fence_get(&array->base);
+		if (dma_fence_add_callback(fences[i], &acb->cb,
 		                           fence_array_member_signalled) != 0) {
-			/* Already signalled: the callback will never run, so account
-			 * for it here or the array waits for a member that is done. */
+			dma_fence_put(&array->base);
+			if (fences[i]->error && !array->base.error)
+				array->base.error = fences[i]->error;
 			if (atomic_dec_and_test(&array->num_pending)) {
-				dma_fence_signal(&array->base);
+				fence_array_signal(array);
 				break;
 			}
 		}
@@ -2598,3 +2636,16 @@ int set_pages_array_wc(struct page **pages, int n)
 { (void)pages; (void)n; return -EOPNOTSUPP; }
 int set_pages_array_wb(struct page **pages, int n)
 { (void)pages; (void)n; return -EOPNOTSUPP; }
+
+/* ── SRCU ── see <linux/srcu.h> ───────────────────────────────────── */
+
+void synchronize_srcu(struct srcu_struct *s)
+{
+	for (int pass = 0; pass < 2; pass++) {
+		u32 old = __atomic_load_n(&s->idx, __ATOMIC_ACQUIRE) & 1u;
+
+		__atomic_store_n(&s->idx, old ^ 1u, __ATOMIC_RELEASE);
+		while (__atomic_load_n(&s->readers[old], __ATOMIC_ACQUIRE) != 0)
+			lkpi_sleep_ms(1);
+	}
+}

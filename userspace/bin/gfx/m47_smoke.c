@@ -35,12 +35,13 @@ struct lx_input_event {
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <stdint.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 static void marker(const char *text) {
@@ -312,6 +313,10 @@ static int test_input_open(void) {
 	return 0;
 }
 
+static void on_alarm(int sig) {
+	(void)sig;
+}
+
 static int test_input_events(void) {
 	/* In test mode the kernel injects a mouse event burst once a client has
 	 * event1 open (input_m47_inject_start, kernel/dev/input.c). */
@@ -322,12 +327,14 @@ static int test_input_events(void) {
 	}
 
 	int saw_rel_x = 0, saw_rel_y = 0, saw_btn = 0, saw_syn = 0;
-	/* Read until SYN or ~5 s of nonblocking retries. */
-	for (int spins = 0; spins < 100000 && !saw_syn; spins++) {
+	/* Read until the button report's SYN, waiting in poll() for at most 5 s. */
+	for (int waits = 0; waits < 50 && !saw_syn; ) {
 		struct lx_input_event evs[8];
 		int n = (int)read(fd, evs, sizeof(evs));
 		if (n < 0 && errno == EAGAIN) {
-			sched_yield();
+			struct pollfd pfd = {.fd = fd, .events = POLLIN};
+			poll(&pfd, 1, 100);
+			waits++;
 			continue;
 		}
 		if (n <= 0 || (n % (int)sizeof(struct lx_input_event)) != 0)
@@ -343,18 +350,57 @@ static int test_input_events(void) {
 			if (evs[i].type == B1NIX_EV_KEY && evs[i].code == B1NIX_BTN_LEFT &&
 			    evs[i].value == 1)
 				saw_btn = 1;
-			if (evs[i].type == B1NIX_EV_SYN)
+			/* The SYN that ends the button's report: the open in
+			 * test_input_open started a burst of its own, whose
+			 * motion-only report can arrive first. */
+			if (evs[i].type == B1NIX_EV_SYN && saw_btn)
 				saw_syn = 1;
 		}
 	}
-	close(fd);
-
-	if (saw_rel_x && saw_rel_y && saw_btn && saw_syn) {
+	if (saw_rel_x && saw_rel_y && saw_btn && saw_syn)
 		marker("M47-GFX: ok input-event\n");
-		return 0;
+	else
+		marker("M47-GFX: fail input-event\n");
+
+	/* The motion-only report that follows, read blocking. Nothing but the
+	 * report itself can wake this read, so a lost wake shows up as the alarm
+	 * rather than as a slow pass. */
+	int flags = fcntl(fd, F_GETFL);
+	int motion = 0;
+	if (flags >= 0 && fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0) {
+		/* No SA_RESTART (which signal() implies): the alarm has to end the
+		 * read, not restart it. */
+		struct sigaction sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = on_alarm;
+		sigaction(SIGALRM, &sa, 0);
+		alarm(4);
+		struct timespec t0, t1;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		while (!motion) {
+			struct lx_input_event evs[8];
+			int n = (int)read(fd, evs, sizeof(evs));
+			if (n <= 0 || (n % (int)sizeof(struct lx_input_event)) != 0)
+				break;
+			for (int i = 0; i < n / (int)sizeof(struct lx_input_event); i++)
+				if (evs[i].type == B1NIX_EV_REL && evs[i].code == B1NIX_REL_X &&
+				    evs[i].value == 5)
+					motion = 1;
+		}
+		alarm(0);
+		/* The report is sent a second after the button's. Arriving with the
+		 * alarm instead means the read slept through it and only found it on
+		 * the way out -- the lost wake this checks for. */
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+		if (motion && ms >= 2500)
+			motion = 0;
 	}
-	marker("M47-GFX: fail input-event\n");
-	return -1;
+	close(fd);
+	marker(motion ? "M47-GFX: ok input-motion-wake\n"
+	              : "M47-GFX: fail input-motion-wake\n");
+
+	return (saw_rel_x && saw_rel_y && saw_btn && saw_syn && motion) ? 0 : -1;
 }
 
 int main(int argc, char **argv) {

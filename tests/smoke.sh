@@ -3525,6 +3525,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 	fi
 	check_output "$LOG" "M47-GFX: ok input-open" "M47: input devices open + EAGAIN"
 	check_output "$LOG" "M47-GFX: ok input-event" "M47: injected mouse events received"
+	check_output "$LOG" "M47-GFX: ok input-motion-wake" "M47: a report of pointer motion alone wakes a blocked evdev reader"
 	check_output "$LOG" "M47-GFX: done" "M47 smoke completed"
 
 	check_output "$LOG" "M48-FDPASS: ok scm-rights" "M48: SCM_RIGHTS fd transfer"

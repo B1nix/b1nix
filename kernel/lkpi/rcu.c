@@ -28,11 +28,21 @@ static volatile u32 g_rcu_idx;
  * bucket reached zero". */
 static volatile i32 g_rcu_readers[2];
 
-/* Per-CPU read-side state. Safe without a lock because the owning CPU has
- * interrupts disabled for the whole time these are non-zero. */
-static u32 g_rcu_nesting[MAX_CPUS];
-static u32 g_rcu_bucket[MAX_CPUS];
-static u64 g_rcu_flags[MAX_CPUS];
+/* Read-side state, per task: nesting, the bucket joined, and the interrupt
+ * state to restore.
+ *
+ * It was per CPU, which holds only while a section never leaves its CPU. Some
+ * do -- a section that re-enables interrupts, or an SRCU reader that sleeps --
+ * and one that ended on another CPU decremented that CPU's count and left its
+ * own stuck at one: from then on no RCU reader there ever restored interrupts,
+ * and every driver thread that ran on it afterwards found them off. Keyed by
+ * the scheduler's task slot, a section ends where its task is. An interrupt
+ * handler nests into the section of the task it interrupted, and is done
+ * before that task runs again. */
+#define RCU_TASK_SLOTS 4096
+static u32 g_rcu_nesting[RCU_TASK_SLOTS];
+static u32 g_rcu_bucket[RCU_TASK_SLOTS];
+static u64 g_rcu_flags[RCU_TASK_SLOTS];
 
 /* Only one grace period runs at a time; concurrent ones would each flip the
  * index and could then wait on a bucket the other already drained. */
@@ -50,27 +60,27 @@ static struct kthread_worker *g_rcu_worker;
 static struct kthread_work g_rcu_work;
 static volatile u64 g_rcu_batches_done;
 
-static u32 rcu_cpu(void)
+static usize rcu_slot(void)
 {
-	struct percpu *pc = get_percpu();
-	u32 id = pc ? pc->cpu_id : 0;
-	return (id < MAX_CPUS) ? id : 0;
+	usize slot = scheduler_current_slot();
+
+	return slot < RCU_TASK_SLOTS ? slot : 0;
 }
 
 void rcu_read_lock(void)
 {
 	u64 flags = interrupts_save();
-	u32 cpu = rcu_cpu();
+	usize slot = rcu_slot();
 
-	if (g_rcu_nesting[cpu]++ == 0) {
+	if (g_rcu_nesting[slot]++ == 0) {
 		/* Join whichever bucket is current. A flip racing this either happens
 		 * before the load — in which case we join the new bucket and cannot
 		 * hold that writer up — or after, in which case we are in the bucket it
 		 * is about to wait on, which is exactly what makes it wait for us. */
 		u32 idx = __atomic_load_n(&g_rcu_idx, __ATOMIC_ACQUIRE) & 1u;
-		g_rcu_bucket[cpu] = idx;
+		g_rcu_bucket[slot] = idx;
 		__atomic_fetch_add(&g_rcu_readers[idx], 1, __ATOMIC_ACQ_REL);
-		g_rcu_flags[cpu] = flags;
+		g_rcu_flags[slot] = flags;
 		return;
 	}
 	/* Nested: interrupts were already off, so the saved state that matters is
@@ -80,13 +90,13 @@ void rcu_read_lock(void)
 
 void rcu_read_unlock(void)
 {
-	u32 cpu = rcu_cpu();
-	if (g_rcu_nesting[cpu] == 0)
+	usize slot = rcu_slot();
+	if (g_rcu_nesting[slot] == 0)
 		return; /* unbalanced unlock; ignore rather than corrupt the count */
 
-	if (--g_rcu_nesting[cpu] == 0) {
-		u32 idx = g_rcu_bucket[cpu] & 1u;
-		u64 flags = g_rcu_flags[cpu];
+	if (--g_rcu_nesting[slot] == 0) {
+		u32 idx = g_rcu_bucket[slot] & 1u;
+		u64 flags = g_rcu_flags[slot];
 		__atomic_fetch_sub(&g_rcu_readers[idx], 1, __ATOMIC_ACQ_REL);
 		interrupts_restore(flags);
 	}
@@ -95,7 +105,7 @@ void rcu_read_unlock(void)
 int rcu_read_lock_held(void)
 {
 	u64 flags = interrupts_save();
-	int held = g_rcu_nesting[rcu_cpu()] != 0;
+	int held = g_rcu_nesting[rcu_slot()] != 0;
 	interrupts_restore(flags);
 	return held;
 }

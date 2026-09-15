@@ -814,7 +814,7 @@ int drm_console_attach(struct drm_device *dev)
 	/* The bootloader's framebuffer is only the console's to keep beside an
 	 * emulated card. On real hardware it lies inside the GPU aperture, and
 	 * once the driver rebuilds the GTT those addresses belong to its own
-	 * buffers: a ThinkPad's boot log kept drawing into sway's, which showed
+	 * buffers: a UHD 620 laptop's boot log kept drawing into sway's, which showed
 	 * as garbage and half-black frames on the panel. The console moves onto
 	 * a buffer the driver owns, as Linux retires efifb. */
 	if (g_bootloader_fb && is_virtual(dev)) {

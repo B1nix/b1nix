@@ -803,7 +803,9 @@ echo "--- clients ---"
 swaymsg -t get_tree 2>&1 | head -60
 echo "--- end clients ---"
 
-if grim /tmp/desktop.png 2>>/tmp/sway.log; then
+# Bounded: a compositor that stopped producing frames leaves grim waiting for
+# one forever, and the log that says why is printed only after it returns.
+if timeout 30 grim /tmp/desktop.png 2>>/tmp/sway.log; then
 	echo "I915-SWAY: ok grim $(wc -c < /tmp/desktop.png) bytes"
 	echo "---PNG-desktop---"
 	base64 /tmp/desktop.png

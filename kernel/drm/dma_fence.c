@@ -289,20 +289,20 @@ int dma_fence_add_callback_data(struct dma_fence *f, struct dma_fence_cb *cb,
 {
 	if (!f || !cb || !func)
 		return -EINVAL;
-	cb->func = func;
-	cb->data = data;
 	INIT_LIST_HEAD(&cb->node);
 
 	lkpi_spin_lock(f->lock);
 	if (fence_signaled(f)) {
 		lkpi_spin_unlock(f->lock);
-		/* The callback takes the cb, not the data — the same signature the
-		 * deferred path uses. Passing `data` here instead handed the callback
-		 * the payload where it expected the cb, and its first dereference
-		 * faulted. */
-		func(f, cb);
+		/* -ENOENT and no call, as upstream: every imported caller runs its
+		 * handler itself on -ENOENT, so calling it here too ran it twice —
+		 * intel_fb's frees the callback block, i915_sw_fence's completes a
+		 * wait that was counted once. func stays unset, which is what
+		 * drm_syncobj tests to see whether an entry was ever armed. */
 		return -ENOENT;
 	}
+	cb->func = func;
+	cb->data = data;
 	list_add(&cb->node, &f->cb_list);
 	lkpi_spin_unlock(f->lock);
 	/*
@@ -450,7 +450,21 @@ i64 dma_fence_wait_timeout(struct dma_fence *f, int intr, u64 timeout_ticks)
 			tlb_shootdown_poll();
 			continue;
 		}
-		scheduler_wait_prepare_timeout(f, deadline - now);
+		/*
+		 * A fence the driver can answer for is asked again every tick.
+		 *
+		 * Nothing wakes this channel when such a fence completes: i915's
+		 * breadcrumbs set the signalled bit and run the callbacks without
+		 * passing through dma_fence_signal(), and a composite fence (a chain)
+		 * is never signalled at all -- it is complete when its links are. Parked
+		 * until the deadline, every page flip waiting on a GPU-rendered buffer
+		 * cost the full fence timeout: a desktop on the GPU at one frame a
+		 * second, CPUs idle.
+		 */
+		u64 slice = deadline - now;
+		if (f->ops && f->ops->signaled && slice > 1)
+			slice = 1;
+		scheduler_wait_prepare_timeout(f, slice);
 		if (fence_signaled(f))
 			scheduler_wait_cancel();
 		else

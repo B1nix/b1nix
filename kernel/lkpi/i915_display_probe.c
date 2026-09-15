@@ -2717,11 +2717,22 @@ static void lkpi_i915_apply_power_saving(struct intel_display *display)
 	        "for vblank-evasion determinism\n");
 }
 
+static struct drm_device *port_dump_i915;
+
+/* The port dump for callers outside the driver (b1nix.port-watch, the card's
+ * ioctl watch), which hold no device of their own. */
+void lkpi_i915_dump_port_state_pub(void)
+{
+	if (port_dump_i915)
+		lkpi_i915_dump_port_state(port_dump_i915);
+}
+
 /* Publish this device to the bridge, so userspace can open and map it. */
 void lkpi_i915_register_card(struct drm_device *dev)
 {
 	if (!dev)
 		return;
+	port_dump_i915 = dev;
 
 	/*
 	 * Re-run the raw-clock setup before anything uses the bus.

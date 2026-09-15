@@ -3,6 +3,7 @@
 #include <b1nix/console.h>
 #include <b1nix/input.h>
 #include <b1nix/io.h>
+#include <b1nix/ioapic.h>
 #include <b1nix/sched.h>
 #include <b1nix/ps2_mouse.h>
 
@@ -150,7 +151,14 @@ void ps2_mouse_init(void)
         return;
     }
 
-    x86_pic_unmask(12);
+    /* Unmask only. ioapic_init already routed IRQ12 as the ISA line it is --
+     * edge-triggered, active high -- and x86_pic_unmask reprograms an IOAPIC
+     * entry with PCI semantics (level, active low), which left the mouse
+     * silent on every IOAPIC machine. */
+    if (ioapic_active())
+        ioapic_unmask_irq(12);
+    else
+        x86_pic_unmask(12);
     mouse_ready = 1;
     console_write("ps2_mouse: initialized on irq12\n");
 }

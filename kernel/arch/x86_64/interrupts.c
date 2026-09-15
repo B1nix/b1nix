@@ -1,3 +1,4 @@
+#include <b1nix/input.h>
 #include <b1nix/arch_x86_64.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
@@ -737,6 +738,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
        * another edge; draining an empty controller is harmless. */
       ps2_kbd_interrupt_handler();
       virtio_input_poll(); /* drain virtio-tablet absolute-pointer events */
+      input_tick();
       serial_tty_tick(); /* M39: drain UART RX for open /dev/ttySn sessions */
 
       scheduler_on_timer_tick();

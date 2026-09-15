@@ -184,6 +184,34 @@ void input_event_counts(u64 *pushed, u64 *delivered, u64 *dropped) {
     *dropped = __atomic_load_n(&input_stat_dropped, __ATOMIC_RELAXED);
 }
 
+/* A frame at 120 Hz -- twice the panel's rate, so no frame can be built from a
+ * stale position, and still eight times fewer wakes than a gaming mouse's
+ * report rate produces. */
+#define INPUT_MOTION_WAKE_MS 8
+static u64 last_motion_wake_ms;
+/* Devices with a report whose wake the spacing held back. Their queues are no
+ * longer empty, so no later report would wake the reader either; the next
+ * report or the timer tick pays it. */
+static volatile u32 wake_owed;
+
+static void input_wake_readers(int dev) {
+  scheduler_wake_all(vfs_poll_chan);
+  /* A blocking read() parks on the device, not on the poll channel. */
+  scheduler_wake_all(&devs[dev]);
+}
+
+void input_tick(void) {
+  u32 owed = __atomic_load_n(&wake_owed, __ATOMIC_RELAXED);
+
+  if (!owed ||
+      ktime_monotonic_ns() / 1000000ull - last_motion_wake_ms < INPUT_MOTION_WAKE_MS)
+    return;
+  owed = __atomic_exchange_n(&wake_owed, 0u, __ATOMIC_ACQ_REL);
+  for (int dev = 0; dev < INPUT_NDEVS; dev++)
+    if (owed & (1u << dev))
+      input_wake_readers(dev);
+}
+
 void input_event_push(int dev, u16 type, u16 code, i32 value) {
   if (dev < 0 || dev >= INPUT_NDEVS || !devs[dev].registered)
     return;
@@ -200,20 +228,21 @@ void input_event_push(int dev, u16 type, u16 code, i32 value) {
    * motion is not: the screen cannot show more than one position per frame,
    * and a client redraws once per frame however many times it was told the
    * pointer moved. So motion wakes are spaced, and everything else is not.
-   *
-   * The number is a frame at 120 Hz -- twice the panel's rate, so no frame can
-   * be built from a stale position, and still eight times fewer wakes than a
-   * gaming mouse's report rate produces. */
-#define INPUT_MOTION_WAKE_MS 8
-  static u64 last_motion_wake_ms;
-  static int report_has_key; /* set by a key/button, read by its SYN */
+ */
+  /* Per device, per report: whether it carries a key or a button, and whether
+   * it found a client's queue empty. The wake decision is made at the SYN that
+   * ends the report, when the report's own events already fill the queue, so
+   * emptiness has to be remembered from its first event -- tested at the SYN
+   * it was never true, and pointer motion woke nobody. */
+  static int report_has_key[INPUT_NDEVS];
+  static int report_found_empty[INPUT_NDEVS];
   int urgent;
 
   if (type == B1NIX_EV_KEY)
-    report_has_key = 1;
-  urgent = (type == B1NIX_EV_SYN) ? report_has_key : 0;
+    report_has_key[dev] = 1;
+  urgent = (type == B1NIX_EV_SYN) ? report_has_key[dev] : 0;
   if (type == B1NIX_EV_SYN)
-    report_has_key = 0;
+    report_has_key[dev] = 0;
   u64 now_ms = ktime_monotonic_ns() / 1000000ull;
   u64 flags;
   int was_empty = 0;
@@ -262,11 +291,22 @@ void input_event_push(int dev, u16 type, u16 code, i32 value) {
    *
    * Outside the lock: scheduler_wake_all takes its own, and this one is held
    * by interrupt handlers. */
-  if (type == B1NIX_EV_SYN && (was_empty || urgent) &&
-      (urgent || now_ms - last_motion_wake_ms >= INPUT_MOTION_WAKE_MS)) {
+  if (was_empty)
+    report_found_empty[dev] = 1;
+  if (type != B1NIX_EV_SYN)
+    return;
+  was_empty = report_found_empty[dev];
+  report_found_empty[dev] = 0;
+  int owed = (__atomic_load_n(&wake_owed, __ATOMIC_RELAXED) >> dev) & 1;
+  if (was_empty || urgent || owed) {
+    if (!urgent && now_ms - last_motion_wake_ms < INPUT_MOTION_WAKE_MS) {
+      __atomic_fetch_or(&wake_owed, 1u << dev, __ATOMIC_ACQ_REL);
+      return;
+    }
+    __atomic_fetch_and(&wake_owed, ~(1u << dev), __ATOMIC_ACQ_REL);
     if (!urgent)
       last_motion_wake_ms = now_ms;
-    scheduler_wake_all(vfs_poll_chan);
+    input_wake_readers(dev);
   }
 }
 
@@ -697,6 +737,15 @@ static void m47_inject_thread(void *arg) {
     input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_X, 7);
     input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_Y, -3);
     input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_KEY, B1NIX_BTN_LEFT, 1);
+    input_event_sync(INPUT_DEV_MOUSE);
+    /* Then a report of motion alone, after the reader has drained the first
+     * and gone back to sleep. A button makes a report urgent and wakes the
+     * reader however the queue looked; motion wakes only on the queue edge,
+     * and for as long as that edge was tested at the SYN it never fired. */
+    scheduler_sleep_ticks(SCHED_MS_TO_TICKS(1000));
+    if (input_dev_open_seq(INPUT_DEV_MOUSE) != served)
+      continue; /* a newer open is owed its own burst first */
+    input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_X, 5);
     input_event_sync(INPUT_DEV_MOUSE);
   }
 }

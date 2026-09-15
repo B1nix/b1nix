@@ -1,3 +1,4 @@
+#include <b1nix/input.h>
 #include <b1nix/types.h>
 #include <b1nix/fb_console.h>
 #include <b1nix/console.h>
@@ -578,6 +579,7 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 			if ((aff0 & 0xff) == g_boot_aff0) {
 				watchdog_tick();
 				serial_tty_tick();
+				input_tick();
 				scheduler_on_timer_tick();
 			} else if ((frame->spsr & 0xFULL) == 0) {
 				/* A secondary preempts only a tick that landed in EL0,

@@ -611,6 +611,75 @@ void lkpi_handle_set_llseek(void *handle,
 	h->ops = &lkpi_anon_file_ops;
 }
 
+static const struct lkpi_file_bridge *g_lkpi_file_bridge;
+
+void lkpi_file_bridge_register(const struct lkpi_file_bridge *bridge)
+{
+	g_lkpi_file_bridge = bridge;
+}
+
+static isize lkpi_owned_lseek(struct vfs_handle *h, isize off, int whence)
+{
+	if (!g_lkpi_file_bridge || !h->private_data)
+		return -ESPIPE;
+	return (isize)g_lkpi_file_bridge->llseek(h->private_data, off, whence);
+}
+
+static int lkpi_owned_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd)
+{
+	unsigned mask;
+
+	if (!g_lkpi_file_bridge || !h->private_data) {
+		pfd->revents = B1NIX_POLLNVAL;
+		return 0;
+	}
+	mask = g_lkpi_file_bridge->poll(h->private_data);
+	/* Linux's low poll bits and b1nix's are the same values. */
+	pfd->revents = (short)(mask & (B1NIX_POLLIN | B1NIX_POLLOUT | B1NIX_POLLERR |
+	                               B1NIX_POLLHUP));
+	return 0;
+}
+
+static int lkpi_owned_ioctl(struct vfs_handle *h, u64 request, void *arg)
+{
+	long rc;
+
+	if (!g_lkpi_file_bridge || !h->private_data)
+		return -ENOTTY;
+	rc = g_lkpi_file_bridge->ioctl(h->private_data, (unsigned int)request,
+	                               (unsigned long)(usize)arg);
+	return rc < -0x7fffffff ? -EIO : (int)rc;
+}
+
+static void lkpi_owned_release(struct vfs_handle *h)
+{
+	if (g_lkpi_file_bridge && h->private_data)
+		g_lkpi_file_bridge->put(h->private_data);
+	h->private_data = 0;
+}
+
+static const struct vfs_file_ops lkpi_owned_file_ops = {
+	.lseek = lkpi_owned_lseek,
+	.poll = lkpi_owned_poll,
+	.ioctl = lkpi_owned_ioctl,
+	.release = lkpi_owned_release,
+};
+
+void lkpi_handle_set_owned_file(void *handle)
+{
+	struct vfs_handle *h = (struct vfs_handle *)handle;
+
+	if (h && !h->node)
+		h->ops = &lkpi_owned_file_ops;
+}
+
+void *lkpi_fd_owned_file(int fd)
+{
+	struct vfs_handle *h = scheduler_fd_get(fd);
+
+	return (h && h->ops == &lkpi_owned_file_ops) ? h->private_data : 0;
+}
+
 void lkpi_handle_attach_drm_minor(void *handle, u32 minor)
 {
 	struct vfs_handle *h = (struct vfs_handle *)handle;

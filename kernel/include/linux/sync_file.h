@@ -3,9 +3,18 @@
 #define LKPI_LINUX_SYNC_FILE_H
 #include <linux/dma-fence.h>
 #include <linux/file.h>
-/* A fence wrapped in a descriptor, so userspace can wait on GPU work. Needs the
- * anonymous-inode path first; declared here, wired when that lands. */
-struct sync_file { struct file *file; struct dma_fence *fence; };
+#include <linux/wait.h>
+/* A fence wrapped in a descriptor, so userspace can wait on GPU work: poll it
+ * for completion, ask it for its state, merge two into one. */
+struct sync_file {
+	struct file *file;
+	struct dma_fence *fence;
+	wait_queue_head_t wq;
+	unsigned long flags;
+	struct dma_fence_cb cb;
+	char user_name[32];
+};
+extern const struct file_operations sync_file_fops;
 struct sync_file *sync_file_create(struct dma_fence *fence);
 struct dma_fence *sync_file_get_fence(int fd);
 

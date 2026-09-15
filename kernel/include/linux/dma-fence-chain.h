@@ -13,11 +13,13 @@ struct dma_fence_chain {
 	u64 prev_seqno;
 };
 /* Recover the chain from the fence embedded in it, or NULL if this fence is
- * not a chain link. Distinguishing them is the caller's job on Linux too — the
- * ops table is what tells them apart. */
+ * not a chain link: the ops table is what tells them apart. */
+extern const struct dma_fence_ops dma_fence_chain_ops;
 static inline struct dma_fence_chain *to_dma_fence_chain(struct dma_fence *f)
 {
-	return f ? container_of(f, struct dma_fence_chain, base) : 0;
+	return (f && f->ops == &dma_fence_chain_ops)
+	               ? container_of(f, struct dma_fence_chain, base)
+	               : 0;
 }
 
 struct dma_fence_chain *dma_fence_chain_alloc(void);

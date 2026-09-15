@@ -109,12 +109,13 @@ static void test_dma_fence(void)
 	/* A wait on an already-signalled fence returns immediately. */
 	if (dma_fence_wait_uninterruptible(&g_fence) != 0)
 		ok = 0;
-	/* A callback added after the fact runs immediately and says so. */
+	/* A callback added after the fact is refused with -ENOENT and not run:
+	 * the caller handles the already-signalled case itself. */
 	struct dma_fence_cb late;
 	u32 late_payload = 0;
 	if (dma_fence_add_callback_data(&g_fence, &late, fence_cb, &late_payload) !=
 	        -ENOENT ||
-	    late_payload != 0xB0B0B0B0u)
+	    late_payload != 0 || g_cb_hits != 1)
 		ok = 0;
 
 	drm_report("fence-signal", ok, g_cb_hits);

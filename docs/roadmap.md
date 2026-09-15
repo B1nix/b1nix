@@ -126,6 +126,7 @@ belongs to the milestone that owns the mechanism. See
 | M100c IOMMU domains/IR | done | Per-device domains, ACS/ARI grouping, interrupt remapping. |
 | M100d AMD-Vi | done | IVRS, device table, command ring, NVMe in translated domain. |
 | M101 linuxkpi for DRM | done | Upstream DRM core unmodified; atomic commits, `/dev/dri/card1`, master lease; virgl GLES on the host GPU draws a composed frame (`RENDER-SMOKE: ok accel-frame`, see [render-path.md](render-path.md)). |
+| M102a Intel i915 + Mesa iris | done | i915 from Linux 6.18.51 unmodified; sway on iris on the passed-through UHD 630 and on a UHD 620 laptop panel over PXE; fence arrays for multi-fence flips. See [i915-gen9-passthrough.md](i915-gen9-passthrough.md). |
 | M104 Alpine packages | done | From-source ports replaced by pinned Alpine packages; `bpkg` retired. |
 | M105 PAM | done | OpenPAM + `pam_unix.so`; dropbear authenticates through PAM. |
 | M106 DNS resolver | done | Outbound name resolution, `/dev/fd`, `/proc/self/fd/N`, 64 KiB pipes. |
@@ -145,17 +146,6 @@ belongs to the milestone that owns the mechanism. See
 | M120 Linux's own filesystems, through linuxkpi | done | btrfs, ext4 and jbd2 from Linux 6.18.51 unpatched (moved from 6.6 with the DRM core and i915); btrfs root on both arches, ext2/3/4 are the imported ext4, native ext drivers removed. See [linuxkpi-fs.md](linuxkpi-fs.md). |
 | M121 Kernel only | done | Own userspace replaced by Alpine and Debian packages, native syscall ABI archived (`archive/kernel/native-abi/`); self-hosted kernel boots; Debian glibc lane 41/41; aarch64 wedges, zstd btrfs and a dentry-list heap corruption fixed. |
 
-## M102a: Intel i915 (Gen8/Gen9.5) + Mesa iris
-
-Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
-
-- [x] i915 imported unmodified; sway drives the passed-through UHD 630 at 1920x1080 ([image](images/m102a-sway-on-monitor.jpg)) and survives client churn.
-- [x] GT runs (execlists, GGTT/PPGTT, completion IRQs); `EXECBUFFER2` served; `gl_probe` renders with Mesa iris.
-- [x] sway on gles2/iris submits: the `-ENOSPC` from `eb_reserve` was a dma-buf `lseek(SEEK_END)` answering 0, so iris softpinned an 8 MiB imported BO over its neighbours.
-- [x] sway on gles2/iris reaches the panel and screenshots (legacy and q35 machines): a `MAX_SCHEDULE_TIMEOUT` wait wrapped and made the first modeset return `-ETIME`.
-- [x] Bare metal on a ThinkPad T480 (UHD 620): sway on iris on the panel, boot log over netconsole, booted over PXE (`tools/run/pxe-serve.sh`). Fixed on the way: a 512 MiB MMIO window, the console drawing into the GPU aperture, netconsole dropping the pre-DHCP log.
-- [ ] `partial` DRM core and i915 moved to Linux 6.18.51 LTS with the filesystems: both smoke lanes pass; i915 on the T480 panel not yet re-proven on the new import.
-
 ## M102b: amdgpu on RX 6600 (render-only) + radeonsi
 
 - [ ] `planned` Build without DC; scanout on GOP framebuffer, render offscreen and blit.
@@ -165,4 +155,75 @@ Detail in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).
 ## M102c: nouveau
 
 - [ ] `planned` Pick generation (pre-Turing without signed firmware vs GSP); import unmodified, fix the shim.
+
+## M122: Close the known corruption and SMP defects
+
+- [ ] `planned` Block cache loses the tail of a multi-sector write (found through btrfs, which now bypasses the cache; ext4 still writes through `blk_write_cached`): suspects are duplicate (dev, lba) slots from the `raced` branch and `blk_flush_matching` collecting buffers with the lock dropped. Fix the cache, then drop the btrfs bypass.
+- [ ] `planned` Double free of a `user_loaded_image` large block reaped from PID 1 (`klarge_free` ← `user_image_free` ← `scheduler_waitpid`): quiet since 09-15 without a root cause; audit the image refcount across exec, fork and clone.
+- [ ] `planned` Two CPUs picking one task (`vmstress` at `SMP=6`, 4+ threads): no longer reproduces, never proven closed; prove the switch-out/claim ordering instead of relying on the gate.
+- [ ] `planned` i915 `uncore->lock` lockup during probe in about one passthrough run in five.
+- [ ] `planned` Done when multi-CPU soak runs (1–6 CPUs) stay clean and `btrfs check` / `e2fsck` pass after stress writes that verify through `read_blocks`.
+
+## M123: Namespaces complete enough for containers
+
+- [ ] `planned` User namespaces: uid/gid maps, capabilities scoped to the owning namespace, `setgroups` rules; the prerequisite for rootless containers and an unprivileged Chromium sandbox.
+- [ ] `planned` IPC namespaces for SysV IPC and POSIX mqueue; cgroup namespaces rooting `/sys/fs/cgroup` at the caller's cgroup.
+- [ ] `planned` `CLONE_NEWPID` on `clone`/`clone3` with a real per-namespace PID 1 (orphan reaping, kill-on-exit of the namespace) instead of the unshare-only shape; time namespaces.
+- [ ] `planned` Proof with distribution tools: `bwrap`, rootless `podman`, `systemd-nspawn`, `unshare -Urpf`; closes M63.
+
+## M124: Missing modern system calls
+
+- [ ] `planned` Process and threading: `openat2` (`RESOLVE_*`), `pidfd_getfd`, `kcmp`, futex2 (`futex_waitv`, `futex_wake`, `futex_wait`), `process_mrelease`, `process_madvise`, `sched_setattr`/`sched_getattr`.
+- [ ] `planned` Security: Landlock, `memfd_secret`, protection keys (`pkey_alloc`/`pkey_mprotect`), the key retention service (`keyctl`, `add_key`, `request_key`) used by systemd, ssh and NFS.
+- [ ] `planned` Filesystems and memory: `quotactl`, `statmount`/`listmount`, `cachestat`, `remap_file_pages`; `mbind` and `get_mempolicy`/`set_mempolicy` answering as a single-node Linux does.
+- [ ] `planned` Each call gets a probe in the Debian lane that checks results, not just the absence of `-ENOSYS`; the unmapped-syscall log line stays silent through Plasma and Chromium.
+
+## M125: io_uring
+
+- [ ] `planned` `io_uring_setup`/`io_uring_enter`/`io_uring_register`: shared SQ/CQ rings mapped into the process, registered files and buffers.
+- [ ] `planned` Operations: read/write (fixed and vectored), fsync, poll, accept/connect/send/recv, timeouts, cancel, linked requests.
+- [ ] `planned` Completion from the existing ISR→wakeup paths (M70) rather than a thread per request; SQPOLL later.
+- [ ] `planned` Proof with liburing's test suite and a distribution consumer (QEMU, fio).
+
+## M126: Observability
+
+- [ ] `planned` `perf_event_open`: software counters, timer-driven sampling with user and kernel call chains, then PMU hardware counters; the distribution's `perf record`/`perf top` work.
+- [ ] `planned` `userfaultfd` (missing, write-protect, minor faults) for CRIU and live migration; `fanotify` for file access monitoring.
+- [ ] `planned` eBPF: import Linux's verifier and interpreter through linuxkpi (as with the filesystems), kprobes/tracepoints as attach points; JIT later.
+- [ ] `planned` Replace ad-hoc profiling hooks where `perf` now answers the same question.
+
+## M127: Resource control
+
+- [ ] `planned` cgroup v2 controllers: memory (limits, accounting per cgroup), cpu (weights on the stride scheduler, quotas), io, pids.
+- [ ] `planned` OOM killer that picks by cgroup and `oom_score_adj`, with an honest `memory.events`; PSI (`/proc/pressure/*`).
+- [ ] `planned` Compressed swap: zram block device and/or zswap in front of the existing swap.
+- [ ] `planned` Proof: systemd slices enforce `MemoryMax`/`CPUWeight`; a runaway process is killed inside its cgroup, not system-wide.
+
+## M128: Large memory and NUMA
+
+- [ ] `planned` Direct map and PMM beyond 64 GiB verified on real hardware or a large QEMU guest (M41 verified 16 GiB); 5-level paging where the CPU supports LA57.
+- [ ] `planned` NUMA topology from ACPI SRAT/SLIT; per-node PMM zones and node-local allocation for kernel and page cache.
+- [ ] `planned` Memory policies behind `mbind`/`set_mempolicy` become real on multi-node machines; `/sys/devices/system/node`.
+- [ ] `planned` Transparent huge pages for anonymous memory, with the page tables and COW paths that implies.
+
+## M129: Power management
+
+- [ ] `planned` Idle: cpuidle with ACPI `_CST`/intel_idle-style MWAIT C-states instead of plain HLT; tickless idle CPUs.
+- [ ] `planned` Frequency: cpufreq with intel_pstate/HWP and ACPI `_PSS`; governors exposed under `/sys/devices/system/cpu`.
+- [ ] `planned` Suspend: s2idle first, then ACPI S3 with device suspend/resume ordering (NVMe, xHCI, i915, e1000e); `systemctl suspend` returns to a working desktop.
+- [ ] `planned` Battery and thermals on a laptop: ACPI battery/AC, thermal zones, vendor ACPI hotkeys; measured idle power against Linux on the same machine.
+
+## M130: More hardware through linuxkpi
+
+- [ ] `planned` Wi-Fi: iwlwifi with mac80211 and cfg80211 imported unmodified, nl80211 for `iw`/`wpa_supplicant`/iwd; an Intel Wireless-AC 8265 associates with WPA2/WPA3.
+- [ ] `planned` Storage and network drivers from Linux through the shim (nvme, e1000e, igb/igc, r8169) alongside or in place of the native ones where Linux's version is better.
+- [ ] `planned` Bluetooth (btusb, HCI core) and USB audio/webcam class drivers where the shim already carries USB.
+- [ ] `planned` GPUs continue as M102b (amdgpu) and M102c (nouveau); a patch to imported source still means a shim bug.
+
+## M131: KVM
+
+- [ ] `planned` Import Linux's KVM (x86 core + VMX, then SVM) through linuxkpi; `/dev/kvm` with the vCPU ioctl ABI.
+- [ ] `planned` EPT/NPT second-level paging, in-kernel LAPIC/IOAPIC, eventfd-based irqfd/ioeventfd, VMX nested off.
+- [ ] `planned` Distribution QEMU with `-accel kvm` boots Alpine, then b1nix itself, inside b1nix; on bare metal and nested under the host's KVM.
+- [ ] `planned` aarch64 KVM (VHE) after x86 works.
 

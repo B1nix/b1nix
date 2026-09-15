@@ -23,7 +23,9 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/shmem_fs.h>
+#include <linux/poll.h>
 #include <linux/printk.h>
+#include <linux/sync_file.h>
 #include <lkpi/env.h>
 #include <lkpi/drmdev.h>
 #include <lkpi/env.h>
@@ -258,8 +260,65 @@ static long long lkpi_file_llseek(void *file, long long off, int whence)
 	return (long long)f->f_op->llseek(f, (loff_t)off, whence);
 }
 
+static unsigned lkpi_file_poll(void *file)
+{
+	struct file *f = (struct file *)file;
+
+	/* poll_wait marks the queue as polled before the mask is read, so the
+	 * wake that follows reaches b1nix's poll channel. */
+	if (!f->f_op || !f->f_op->poll)
+		return EPOLLIN;
+	return (unsigned)f->f_op->poll(f, 0);
+}
+
+static long lkpi_file_ioctl(void *file, unsigned int cmd, unsigned long arg)
+{
+	struct file *f = (struct file *)file;
+
+	if (!f->f_op || !f->f_op->unlocked_ioctl)
+		return -ENOTTY;
+	return f->f_op->unlocked_ioctl(f, cmd, arg);
+}
+
+static void lkpi_file_put(void *file)
+{
+	fput((struct file *)file);
+}
+
+static const struct lkpi_file_bridge lkpi_file_bridge = {
+	.llseek = lkpi_file_llseek,
+	.poll = lkpi_file_poll,
+	.ioctl = lkpi_file_ioctl,
+	.put = lkpi_file_put,
+};
+
+/*
+ * A descriptor that owns its file.
+ *
+ * fd_install hands the file's reference to the descriptor, as upstream does;
+ * the descriptor's poll, ioctl and seek go to the file's operations and its last
+ * close drops that reference. Used for files whose creator relies on exactly
+ * that (sync_file); dma-buf and DRM descriptors keep their own arrangement.
+ */
+static void lkpi_fd_install_owned(unsigned int fd, struct file *f)
+{
+	void *h = lkpi_fd_lookup((int)fd);
+
+	if (!h || !f)
+		return;
+	lkpi_file_bridge_register(&lkpi_file_bridge);
+	lkpi_handle_set_private(h, f);
+	lkpi_handle_set_owned_file(h);
+	if (!f->f_handle)
+		f->f_handle = h;
+}
+
 void fd_install(unsigned int fd, struct file *f)
 {
+	if (f && f->f_op == &sync_file_fops) {
+		lkpi_fd_install_owned(fd, f);
+		return;
+	}
 	void *h = lkpi_fd_lookup((int)fd);
 	if (!h || !f)
 		return;

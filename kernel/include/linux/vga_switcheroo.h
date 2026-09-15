@@ -4,8 +4,8 @@
 #include <linux/types.h>
 /* Muxing a laptop's display between integrated and discrete GPUs. Handling it
  * needs ACPI methods b1nix cannot evaluate, so every entry point reports
- * absence — on the Pavilion that means the panel stays on whichever GPU the
- * firmware left it. */
+ * absence — on a hybrid-graphics laptop that means the panel stays on
+ * whichever GPU the firmware left it. */
 struct pci_dev;
 enum vga_switcheroo_state { VGA_SWITCHEROO_OFF, VGA_SWITCHEROO_ON };
 /* Zero, which is what upstream returns when VGA switcheroo is not configured:

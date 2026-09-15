@@ -62,8 +62,8 @@ inittab under `b1nix.i915sway`.
 
 ## Open
 
-- **Bare metal on Gen8** (HP Pavilion) is still untested. A ThinkPad T480
-  (Kaby Lake R, UHD 620) runs sway on iris on its panel: boot it over PXE with
+- **Bare metal on Gen8** is still untested. A Kaby Lake R laptop (UHD 620)
+  runs sway on iris on its panel: boot it over PXE with
   `tools/run/pxe-serve.sh <iso-stage>` and collect the log with
   `b1nix.netconsole=<host>:<port>`. A root module has to fit below 4 GiB for
   Limine, so the live root is packed tight (ext4, ~340 MiB).

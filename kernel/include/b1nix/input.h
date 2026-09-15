@@ -48,6 +48,8 @@ void input_init(void);
  * A B1NIX_EV_SYN event marks the end of one hardware report. */
 void input_event_push(int dev, u16 type, u16 code, i32 value);
 void input_event_sync(int dev);
+/* Timer tick: pays motion wakes the spacing held back. */
+void input_tick(void);
 
 /* Keyboard helper: translates one PS/2 byte stream step into an EV_KEY
  * event (called from the kbd driver with the pre-0xE0 state). */

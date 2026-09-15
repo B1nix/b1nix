@@ -2590,7 +2590,7 @@ endif
 		mkdir -p $(BUILD_DIR)/rootfs/sbin; \
 		for f in build/$(ARCH)/pkg/pam/sbin/*; do \
 			case "$$(basename $$f)" in \
-			unix_chkpwd) $(CIC) --osabi-linux "$$f" $(BUILD_DIR)/rootfs/sbin/unix_chkpwd ;; \
+			unix_chkpwd) $(CIC) --osabi-linux --mode 4755 "$$f" $(BUILD_DIR)/rootfs/sbin/unix_chkpwd ;; \
 			*)           $(CIC) "$$f" $(BUILD_DIR)/rootfs/sbin/ ;; \
 			esac; \
 		done; \

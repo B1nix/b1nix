@@ -233,6 +233,24 @@ void lkpi_handle_set_llseek(void *handle,
                             long long (*llseek)(void *file, long long off, int whence));
 void lkpi_handle_set_private(void *handle, void *priv);
 
+/* What a descriptor needs from the Linux file it carries, implemented on the
+ * Linux side (linux_file.c) and registered once. */
+struct lkpi_file_bridge {
+	long long (*llseek)(void *file, long long off, int whence);
+	/* Linux poll mask (EPOLLIN, EPOLLERR, ...) of the file right now. */
+	unsigned (*poll)(void *file);
+	long (*ioctl)(void *file, unsigned int cmd, unsigned long arg);
+	void (*put)(void *file);
+};
+void lkpi_file_bridge_register(const struct lkpi_file_bridge *bridge);
+/* The descriptor owns a reference to the file: poll, ioctl and seek reach the
+ * file's operations, and the last close drops the reference. */
+void lkpi_handle_set_owned_file(void *handle);
+/* The file behind `fd` when that descriptor was set up by
+ * lkpi_handle_set_owned_file, NULL for anything else -- a pipe's private data
+ * is not a struct file. */
+void *lkpi_fd_owned_file(int fd);
+
 /* Install a handle in the calling process's table. Returns the descriptor, or
  * negative on failure — in which case the handle is still the caller's. */
 int lkpi_fd_install(void *handle);
