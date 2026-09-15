@@ -75,6 +75,12 @@
 #define ENODATA         61  /* No data available (no such xattr) */
 
 /* Internal kernel errors */
+#define EDQUOT 122
+#define ENOKEY 126
+#define EKEYEXPIRED 127
+#define EKEYREVOKED 128
+#define EKEYREJECTED 129
+#define EBADFD 77
 #define ERESTARTSYS     512 /* Restart system call */
 
 /* Helper: convert negative error to -errno */

@@ -219,7 +219,29 @@ for probe in \
 	"rename-einval:renameat2 with conflicting flags is EINVAL" \
 	"mem-mremap:mremap grows a mapping" \
 	"perm-eacces:nobody cannot open a root-only file" \
-	"errno-erofs:a read-only mount refuses writes"; do
+	"errno-erofs:a read-only mount refuses writes" \
+	"mempolicy-mbind:mbind binds to the one node and refuses a node that does not exist" \
+	"mempolicy-get-set:set_mempolicy is read back by get_mempolicy" \
+	"mempolicy-mems-allowed:get_mempolicy(MPOL_F_MEMS_ALLOWED) reports node 0" \
+	"pkey:protection keys answer as on a CPU without them" \
+	"sched-attr:sched_setattr sets nice, sched_getattr reads it, SCHED_FIFO is refused" \
+	"kcmp:kcmp tells a dup from another file and two address spaces apart" \
+	"pidfd-getfd:pidfd_getfd copies a descriptor, close-on-exec" \
+	"process-madvise:process_madvise applies reclaim advice and refuses the rest" \
+	"process-mrelease:process_mrelease refuses a live process and accepts a killed one" \
+	"cachestat:cachestat counts the cached pages of a file just read" \
+	"futex2-wait:futex_wait answers EAGAIN and times out on an absolute deadline" \
+	"futex2-wake:futex_wake wakes a waiter in another process" \
+	"futex2-waitv:futex_waitv reports which futex woke it" \
+	"openat2-no-symlinks:openat2(RESOLVE_NO_SYMLINKS) refuses a symlink" \
+	"openat2-beneath:openat2(RESOLVE_BENEATH) refuses .. and absolute escapes" \
+	"openat2-in-root:openat2(RESOLVE_IN_ROOT) resolves / at the directory" \
+	"openat2-magiclinks-size:openat2 refuses magic links and a short open_how" \
+	"statmount-listmount:listmount finds the mounts and statmount describes them by unique id" \
+	"remap-file-pages:remap_file_pages shows another file page in the range" \
+	"keys:add_key, keyctl read/describe/update/revoke and request_key behave as on Linux" \
+	"landlock:a Landlock ruleset confines a process to one directory, symlinks included" \
+	"quotactl:quotactl validates its target and reports that quotas are unsupported"; do
 	check_output "DEBIAN-SMOKE: ok ${probe%%:*}" "${probe#*:}"
 done
 

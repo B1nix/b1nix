@@ -13,6 +13,7 @@
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <b1nix/landlock.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -2318,6 +2319,17 @@ int user_execve_current(const char *path, const char **argv,
   const char **caller_argv = argv;
 
 resolve:
+  {
+    /* Landlock: the program (and every interpreter a #! line names) needs
+     * EXECUTE where it lives. */
+    int lrc = landlock_check_path(path, LL_EXECUTE);
+
+    if (lrc) {
+      if (our_argv)
+        free_kernel_array(our_argv);
+      return lrc;
+    }
+  }
   node = vfs_find_node(path);
   if (!node || IS_ERR(node)) {
     if (our_argv)

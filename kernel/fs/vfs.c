@@ -39,6 +39,7 @@
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/vfs.h>
+#include <b1nix/landlock.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/posix.h>
 #include <stdio.h>
@@ -2604,6 +2605,29 @@ struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind) {
   return h;
 }
 
+/* A descriptor for a node the caller already holds, e.g. the file behind a
+ * mapping. Takes its own reference on the node. */
+int vfs_fd_for_node(struct vfs_node *node, int flags) {
+  extern const struct vfs_file_ops node_file_ops;
+  struct vfs_handle *h;
+  int fd;
+
+  if (!node)
+    return -EINVAL;
+  h = alloc_raw_handle(VFS_HANDLE_NODE);
+  if (!h)
+    return -ENFILE;
+  vfs_node_get(node);
+  h->node = node;
+  h->ops = &node_file_ops;
+  h->flags = flags;
+  h->offset = 0;
+  fd = scheduler_fd_alloc(h);
+  if (fd < 0)
+    vfs_handle_release(h);
+  return fd;
+}
+
 void vfs_handle_retain(struct vfs_handle *h) {
   if (!h || h->used != 1 || h->refcount <= 0)
     return;
@@ -3490,6 +3514,9 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   int res = 0;
   if (!path)
     return -EINVAL;
+  res = landlock_check_open(path, flags);
+  if (res)
+    return res;
   /* What a graphics client actually looks at while deciding a device exists.
    *
    * Chromium enumerates GPUs through sysfs and reports finding none, while the
@@ -4754,6 +4781,16 @@ int vfs_mknod(const char *path, u32 mode, u64 dev) {
   if (!path)
     return -EINVAL;
   u32 fmt = mode & B1NIX_S_IFMT;
+  {
+    u64 need = fmt == B1NIX_S_IFCHR  ? LL_MAKE_CHAR
+               : fmt == B1NIX_S_IFBLK ? LL_MAKE_BLOCK
+               : fmt == B1NIX_S_IFIFO ? LL_MAKE_FIFO
+               : fmt == B1NIX_S_IFSOCK ? LL_MAKE_SOCK
+                                       : LL_MAKE_REG;
+    int lrc = landlock_check_parent(path, need);
+    if (lrc)
+      return lrc;
+  }
   if (fmt == 0 || fmt == B1NIX_S_IFREG)
     return vfs_create(path, mode & 07777);
   int is_dev = (fmt == B1NIX_S_IFBLK || fmt == B1NIX_S_IFCHR);
@@ -5026,6 +5063,11 @@ out_unlock:
 }
 
 int vfs_mkdir(const char *path, u32 mode) {
+  if (path) {
+    int lrc = landlock_check_parent(path, LL_MAKE_DIR);
+    if (lrc)
+      return lrc;
+  }
   char *resolved = kmalloc(VFS_MAX_PATH);
   if (!resolved)
     return -ENOMEM;
@@ -5442,6 +5484,12 @@ static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
 }
 
 static int vfs_remove_node(const char *path, int is_rmdir) {
+  {
+    int lrc = landlock_check_parent(path, is_rmdir ? LL_REMOVE_DIR
+                                                   : LL_REMOVE_FILE);
+    if (lrc)
+      return lrc;
+  }
   char r_path[VFS_MAX_PATH];
   vfs_resolve_path(path, r_path);
   char p_path[VFS_MAX_PATH], name[VFS_NAME_MAX];
@@ -5482,6 +5530,9 @@ int vfs_unlink(const char *path) {
 
 int vfs_link(const char *target, const char *link_path) {
   int res = 0;
+  if (target && link_path &&
+      (res = landlock_check_move(target, link_path, 0, 1)))
+    return res;
   struct vfs_node *target_node = vfs_find_node(target);
   struct vfs_node *parent = 0;
   if (IS_ERR(target_node)) {
@@ -5586,6 +5637,8 @@ int vfs_symlink(const char *target, const char *link_path) {
   int res = 0;
   if (!target || target[0] == '\0')
     return -EINVAL;
+  if (link_path && (res = landlock_check_parent(link_path, LL_MAKE_SYM)))
+    return res;
 
   char parent_path[VFS_MAX_PATH], name[VFS_NAME_MAX];
   if (split_parent_path(link_path, parent_path, sizeof(parent_path), name, sizeof(name)) < 0)
@@ -5945,7 +5998,17 @@ out_put_parents:
 }
 
 int vfs_rename(const char *old_path, const char *new_path) {
-  int res = vfs_rename_internal(old_path, new_path);
+  int res = 0;
+  if (old_path && new_path) {
+    struct b1nix_stat lst;
+    int is_dir = vfs_lstat(old_path, &lst) == 0 &&
+                 (lst.st_mode & B1NIX_S_IFMT) == B1NIX_S_IFDIR;
+
+    res = landlock_check_move(old_path, new_path, is_dir, 0);
+    if (res)
+      return res;
+  }
+  res = vfs_rename_internal(old_path, new_path);
   /* M107 inotify: a rename is IN_MOVED_FROM on the source directory and
    * IN_MOVED_TO on the destination, sharing a cookie. Resolved after the
    * rename so the destination lookup finds the entry that now exists. */
@@ -7296,6 +7359,283 @@ int vfs_mount_id_for_path(const char *path) {
   return best_id;
 }
 
+/* quotactl(2): the mount a quota command names -- by the block device it is
+ * mounted from, or by any descriptor on it. Returns 0 with the filesystem
+ * type, or the errno Linux gives for the name. */
+int vfs_quota_target(const char *special, int fd, char *fstype, usize cap) {
+  u32 ns = vfs_current_mnt_ns();
+
+  if (special) {
+    struct b1nix_stat st;
+    char r[VFS_MAX_PATH];
+
+    vfs_resolve_path(special, r);
+    int rc = vfs_stat(r, &st);
+    if (rc)
+      return rc;
+    if ((st.st_mode & B1NIX_S_IFMT) != B1NIX_S_IFBLK)
+      return -ENOTBLK;
+    const char *base = strrchr(r, '/');
+    base = base ? base + 1 : r;
+    for (usize i = 0; i < mount_hwm; i++) {
+      const char *src = mounts[i].source;
+      const char *sb = strrchr(src, '/');
+
+      if (!mount_visible_in(i, ns))
+        continue;
+      if (!strcmp(src, r) || (sb && !strcmp(sb + 1, base)) || !strcmp(src, base)) {
+        copy_path(fstype, cap, mounts[i].fstype);
+        return 0;
+      }
+    }
+    return -ENODEV;
+  }
+  struct vfs_node *n = vfs_find_node_by_fd(fd);
+  if (IS_ERR(n))
+    return -EBADF;
+  struct vfs_mount_entry *m = vfs_get_mount_for_node(n);
+  if (!m)
+    return -ENODEV;
+  copy_path(fstype, cap, m->fstype);
+  return 0;
+}
+
+/* ── statmount(2) / listmount(2) ─────────────────────────────────────────
+ *
+ * Mounts named by a 64-bit id that is never reused, as Linux's mnt_id_unique:
+ * the creation sequence, offset past the 32-bit ids mountinfo prints so the
+ * two can never be confused. */
+#define MNT_UNIQUE_ID_OFFSET (1ULL << 32)
+
+static u64 mount_unique_id(usize i) { return MNT_UNIQUE_ID_OFFSET + mounts[i].seq; }
+
+/* The visible slot with this unique id, or -1. */
+static isize mount_slot_by_unique(u64 id, u32 ns) {
+  for (usize i = 0; i < mount_hwm; i++)
+    if (mount_visible_in(i, ns) && mount_unique_id(i) == id)
+      return (isize)i;
+  return -1;
+}
+
+/* The mount a target lies under: the visible mount, other than itself, whose
+ * target is the longest proper prefix; the latest wins a tie, as a path lookup
+ * does. The root mount is its own parent. */
+static isize mount_parent_slot(usize i, u32 ns) {
+  const char *t = mounts[i].target;
+  isize best = -1;
+  usize best_len = 0;
+
+  if (!strcmp(t, "/"))
+    return (isize)i;
+  for (usize j = 0; j < mount_hwm; j++) {
+    if (j == i || !mount_visible_in(j, ns))
+      continue;
+    const char *pt = mounts[j].target;
+    usize pl = strlen(pt);
+    int prefix = (pl == 1 && pt[0] == '/') ||
+                 (!strncmp(t, pt, pl) && t[pl] == '/');
+
+    if (!prefix || strlen(t) == pl)
+      continue;
+    if (best < 0 || pl > best_len ||
+        (pl == best_len && mounts[j].seq > mounts[best].seq)) {
+      best = (isize)j;
+      best_len = pl;
+    }
+  }
+  return best < 0 ? (isize)i : best;
+}
+
+static int mount_is_descendant(usize i, usize ancestor, u32 ns) {
+  for (int depth = 0; depth < 64; depth++) {
+    isize p = mount_parent_slot(i, ns);
+
+    if ((usize)p == i)
+      return 0;
+    if ((usize)p == ancestor)
+      return 1;
+    i = (usize)p;
+  }
+  return 0;
+}
+
+u64 vfs_mount_unique_id_for_path(const char *path) {
+  int old = vfs_mount_id_for_path(path);
+  u32 ns = vfs_current_mnt_ns();
+  usize index = 0;
+
+  if (old <= 0)
+    return 0;
+  for (usize i = 0; i < mount_hwm; i++) {
+    if (!mount_visible_in(i, ns))
+      continue;
+    if ((int)++index == old)
+      return mount_unique_id(i);
+  }
+  return 0;
+}
+
+/* The 1-based position mountinfo prints for slot i. */
+static u32 mount_old_id(usize slot, u32 ns) {
+  u32 index = 0;
+
+  for (usize i = 0; i <= slot && i < mount_hwm; i++)
+    if (mount_visible_in(i, ns))
+      index++;
+  return index;
+}
+
+#define LSMT_ROOT 0xffffffffffffffffULL
+#define LISTMOUNT_REVERSE 1
+
+isize vfs_listmount(u64 parent_id, u64 last_id, u64 *ids, usize nr, int reverse) {
+  u32 ns = vfs_current_mnt_ns();
+  isize root = -1;
+  usize count = 0;
+
+  if (parent_id == LSMT_ROOT) {
+    for (usize i = 0; i < mount_hwm; i++)
+      if (mount_visible_in(i, ns) && !strcmp(mounts[i].target, "/") &&
+          (root < 0 || mounts[i].seq > mounts[root].seq))
+        root = (isize)i;
+  } else {
+    root = mount_slot_by_unique(parent_id, ns);
+  }
+  if (root < 0)
+    return -ENOENT;
+  /* In id order, starting past last_id: repeatedly take the next id. */
+  u64 cursor = last_id;
+  while (count < nr) {
+    isize pick = -1;
+
+    for (usize i = 0; i < mount_hwm; i++) {
+      if (!mount_visible_in(i, ns) || (usize)root == i ||
+          !mount_is_descendant(i, (usize)root, ns))
+        continue;
+      u64 id = mount_unique_id(i);
+      if (reverse ? (cursor && id >= cursor) : (id <= cursor))
+        continue;
+      if (pick < 0 || (reverse ? id > mount_unique_id((usize)pick)
+                               : id < mount_unique_id((usize)pick)))
+        pick = (isize)i;
+    }
+    if (pick < 0)
+      break;
+    cursor = mount_unique_id((usize)pick);
+    ids[count++] = cursor;
+  }
+  return (isize)count;
+}
+
+#define STATMOUNT_SB_BASIC      0x0001
+#define STATMOUNT_MNT_BASIC     0x0002
+#define STATMOUNT_PROPAGATE_FROM 0x0004
+#define STATMOUNT_MNT_ROOT      0x0008
+#define STATMOUNT_MNT_POINT     0x0010
+#define STATMOUNT_FS_TYPE       0x0020
+#define STATMOUNT_MNT_NS_ID     0x0040
+#define STATMOUNT_MNT_OPTS      0x0080
+#define STATMOUNT_SB_SOURCE     0x0200
+#define STATMOUNT_SUPPORTED \
+  (STATMOUNT_SB_BASIC | STATMOUNT_MNT_BASIC | STATMOUNT_PROPAGATE_FROM | \
+   STATMOUNT_MNT_ROOT | STATMOUNT_MNT_POINT | STATMOUNT_FS_TYPE | \
+   STATMOUNT_MNT_NS_ID | STATMOUNT_MNT_OPTS | STATMOUNT_SB_SOURCE)
+
+static void put32(char *b, usize off, u32 v) { memcpy(b + off, &v, 4); }
+static void put64(char *b, usize off, u64 v) { memcpy(b + off, &v, 8); }
+
+/* Fill a struct statmount (512-byte header plus strings) into kbuf. Returns
+ * the size used, or -EOVERFLOW when bufsize cannot hold it. */
+isize vfs_statmount(u64 id, u64 mask, char *kbuf, usize bufsize) {
+  enum { HDR = 512 };
+  u32 ns = vfs_current_mnt_ns();
+  isize i = mount_slot_by_unique(id, ns);
+  usize str = 0;
+
+  if (i < 0)
+    return -ENOENT;
+  if (bufsize < HDR)
+    return -EOVERFLOW;
+  memset(kbuf, 0, HDR);
+  u64 got = 0;
+  struct vfs_mount_entry *m = &mounts[i];
+#define PUTSTR(field_off, text) do {                                   \
+    const char *t_ = (text);                                            \
+    usize l_ = strlen(t_) + 1;                                          \
+    if (HDR + str + l_ > bufsize)                                       \
+      return -EOVERFLOW;                                                \
+    memcpy(kbuf + HDR + str, t_, l_);                                   \
+    put32(kbuf, (field_off), (u32)str);                                 \
+    str += l_;                                                          \
+  } while (0)
+
+  if (mask & STATMOUNT_SB_BASIC) {
+    struct b1nix_stat st;
+    u32 sbf = (m->flags & B1NIX_MS_RDONLY) ? 1u : 0u; /* SB_RDONLY */
+
+    if (vfs_stat(m->target[0] ? m->target : "/", &st) == 0) {
+      put32(kbuf, 16, (u32)(st.st_dev >> 8));
+      put32(kbuf, 20, (u32)(st.st_dev & 0xff));
+    }
+    put64(kbuf, 24, fs_magic_for_type(m->fstype));
+    put32(kbuf, 32, sbf);
+    got |= STATMOUNT_SB_BASIC;
+  }
+  if (mask & STATMOUNT_MNT_BASIC) {
+    isize par = mount_parent_slot((usize)i, ns);
+    u64 attr = 0;
+
+    if (m->flags & B1NIX_MS_RDONLY) attr |= 0x1;  /* MOUNT_ATTR_RDONLY */
+    if (m->flags & 2) attr |= 0x2;                /* NOSUID */
+    if (m->flags & 4) attr |= 0x4;                /* NODEV */
+    if (m->flags & 8) attr |= 0x8;                /* NOEXEC */
+    if (m->flags & 1024) attr |= 0x10;            /* NOATIME */
+    if (m->flags & 2048) attr |= 0x80;            /* NODIRATIME */
+    if (m->flags & (1 << 24)) attr |= 0x20;       /* STRICTATIME */
+    put64(kbuf, 40, mount_unique_id((usize)i));
+    put64(kbuf, 48, mount_unique_id((usize)par));
+    put32(kbuf, 56, mount_old_id((usize)i, ns));
+    put32(kbuf, 60, mount_old_id((usize)par, ns));
+    put64(kbuf, 64, attr);
+    put64(kbuf, 72, m->propagation ? m->propagation : (1u << 18) /* MS_PRIVATE */);
+    put64(kbuf, 80, m->peer_group);
+    put64(kbuf, 88, 0);
+    got |= STATMOUNT_MNT_BASIC;
+  }
+  if (mask & STATMOUNT_PROPAGATE_FROM) {
+    put64(kbuf, 96, 0);
+    got |= STATMOUNT_PROPAGATE_FROM;
+  }
+  if (mask & STATMOUNT_MNT_NS_ID) {
+    put64(kbuf, 112, (u64)ns);
+    got |= STATMOUNT_MNT_NS_ID;
+  }
+  if (mask & STATMOUNT_FS_TYPE) {
+    PUTSTR(36, m->fstype[0] ? m->fstype : "none");
+    got |= STATMOUNT_FS_TYPE;
+  }
+  if (mask & STATMOUNT_MNT_ROOT) {
+    PUTSTR(104, "/");
+    got |= STATMOUNT_MNT_ROOT;
+  }
+  if (mask & STATMOUNT_MNT_POINT) {
+    PUTSTR(108, m->target[0] ? m->target : "/");
+    got |= STATMOUNT_MNT_POINT;
+  }
+  if (mask & STATMOUNT_MNT_OPTS) {
+    PUTSTR(4, (m->flags & B1NIX_MS_RDONLY) ? "ro" : "rw");
+    got |= STATMOUNT_MNT_OPTS;
+  }
+  if (mask & STATMOUNT_SB_SOURCE) {
+    PUTSTR(124, m->source[0] ? m->source : "none");
+    got |= STATMOUNT_SB_SOURCE;
+  }
+#undef PUTSTR
+  put32(kbuf, 0, (u32)(HDR + str));
+  put64(kbuf, 8, got);
+  return (isize)(HDR + str);
+}
+
 /* Is this path the root of a mount -- the directory a filesystem is mounted
  * ON, rather than somewhere below it?
  *
@@ -7809,6 +8149,15 @@ static inline u64 ftr_now(void) {
 }
 
 int vfs_ftruncate(int fd, u64 length) {
+  {
+    char lp[VFS_MAX_PATH];
+
+    if (vfs_fd_abspath(fd, lp, sizeof(lp)) == 0) {
+      int lrc = landlock_check_path(lp, LL_TRUNCATE);
+      if (lrc)
+        return lrc;
+    }
+  }
   u64 ftr_t0 = ftr_now();
   struct vfs_handle *h = get_handle(fd);
   if (!h || !h->used)

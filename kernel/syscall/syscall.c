@@ -31,6 +31,7 @@ void tlb_shootdown_all(void);
 #include <b1nix/sysv_ipc.h>
 #include <b1nix/sock_filter.h>
 #include <b1nix/syscall.h>
+#include "linux_modern.h"
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
 #include <b1nix/module.h>
@@ -966,11 +967,19 @@ static int sys_statx(int dirfd, const char *user_path, int flags,
    * before it will mount anything: without an answer it reported "Failed to
    * determine whether /proc is a mount point" for each API filesystem in turn
    * and then "Failed to mount API filesystems", and PID 1 exited. */
-  if (mask & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE)) {
+  if (mask & STATX_MNT_ID_UNIQUE) {
+    /* The never-reused id statmount and listmount speak; it wins when both
+     * forms are asked for, as on Linux. */
+    u64 uid = resolved[0] ? vfs_mount_unique_id_for_path(resolved) : 0;
+    if (uid) {
+      sx.stx_mnt_id = uid;
+      sx.stx_mask |= STATX_MNT_ID_UNIQUE;
+    }
+  } else if (mask & STATX_MNT_ID) {
     int mid = resolved[0] ? vfs_mount_id_for_path(resolved) : 0;
     if (mid > 0) {
       sx.stx_mnt_id = (u64)mid;
-      sx.stx_mask |= mask & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE);
+      sx.stx_mask |= STATX_MNT_ID;
     }
   }
 
@@ -2810,6 +2819,7 @@ static isize sys_linux_getdents_common(int fd, u64 user_buf, usize count,
 
   usize written = 0;
   isize emitted = 0;
+  int no_room = 0;
   for (;;) {
     isize before = vfs_lseek(fd, 0, B1NIX_SEEK_CUR);
     if (before < 0)
@@ -2843,6 +2853,7 @@ static isize sys_linux_getdents_common(int fd, u64 user_buf, usize count,
     if (written + reclen > count) {
       /* No room: push this entry back so the next call re-reads it. */
       vfs_lseek(fd, before, B1NIX_SEEK_SET);
+      no_room = 1;
       break;
     }
 
@@ -2877,12 +2888,14 @@ static isize sys_linux_getdents_common(int fd, u64 user_buf, usize count,
     emitted++;
   }
 
-  if (emitted == 0) {
-    /* Either the directory ended (cursor did not move) or the caller's buffer
-     * cannot hold even one record. */
-    isize now = vfs_lseek(fd, 0, B1NIX_SEEK_CUR);
-    return (now == start) ? 0 : -EINVAL;
-  }
+  /* Nothing written: the directory ended, or the caller's buffer cannot hold
+   * even one record. Only the second is EINVAL. The cursor moving is not a
+   * sign of it: the step from the filesystem's entries to the in-memory ones
+   * moves the cursor while emitting nothing, at the end of every such
+   * directory. */
+  (void)start;
+  if (emitted == 0)
+    return no_room ? -EINVAL : 0;
   return (isize)written;
 }
 
@@ -5047,6 +5060,51 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
  * touched. MADV_DONTNEED (and MADV_FREE, see below) drop the backing pages of
  * an anonymous range so the next access lazily refaults to a fresh zeroed page;
  * the hint advices are accepted as no-ops. */
+isize linux_modern_mprotect(u64 addr, u64 len, u64 prot) {
+  return sys_mprotect((void *)(usize)addr, (usize)len, (int)prot);
+}
+
+/* remap_file_pages(2): Linux has emulated it since 3.16 by mapping the same
+ * file again at the requested offset over the range, and so does this. The
+ * range must lie inside one shared file mapping. */
+isize linux_modern_remap_file_pages(u64 start, u64 size, u64 prot, u64 pgoff,
+                                    u64 flags) {
+  const u64 map_nonblock = 0x10000;
+  struct vm_area *v;
+  u64 vflags;
+
+  if (prot || (flags & ~map_nonblock))
+    return -EINVAL;
+  start &= ~(u64)(PAGE_SIZE - 1);
+  size = (size + PAGE_SIZE - 1) & ~(u64)(PAGE_SIZE - 1);
+  if (!size || start + size < start || pgoff + (size >> 12) < pgoff)
+    return -EINVAL;
+  vma_list_lock(&vflags);
+  v = vma_lookup(current_task, start);
+  if (!v || !(v->flags & MAP_SHARED) || !v->node || start + size > v->end) {
+    vma_list_unlock(vflags);
+    return -EINVAL;
+  }
+  struct vfs_node *node = v->node;
+  int vprot = (int)v->prot;
+  vfs_node_get(node);
+  vma_list_unlock(vflags);
+
+  int fd = vfs_fd_for_node(node, (vprot & PROT_WRITE) ? B1NIX_O_RDWR
+                                                      : B1NIX_O_RDONLY);
+  vfs_node_put(node);
+  if (fd < 0)
+    return fd;
+  u64 r = sys_mmap((void *)(usize)start, (usize)size, vprot,
+                   MAP_SHARED | MAP_FIXED, fd, (isize)(pgoff << 12));
+  vfs_close(fd);
+  return (i64)r < 0 ? (isize)r : 0;
+}
+
+int linux_modern_open_flags(int linux_flags) {
+  return linux_open_flags_to_b1nix(linux_flags);
+}
+
 static isize sys_madvise(void *addr, usize length, int advice) {
   u64 start = (u64)(usize)addr;
   if ((start & (PAGE_SIZE - 1)) != 0)
@@ -7312,6 +7370,14 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       if (number == LX_fspick)
         return (u64)-EOPNOTSUPP;
 
+      {
+        u64 modern_ret;
+
+        if (linux_modern_syscall(number, arg0, arg1, arg2, arg3, arg4, arg5,
+                                 &modern_ret))
+          return modern_ret;
+      }
+
       /* pidfd_open(pid, flags): take a reference to a process. */
       if (number == LX_pidfd_open)
         return (u64)(isize)vfs_pidfd_open((usize)arg0, (int)arg1);
@@ -8506,7 +8572,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         int fd = vfs_open_flags(resolved, B1NIX_O_WRONLY);
         if (fd < 0)
           return (u64)fd;
-        int rc = vfs_ftruncate(fd, arg1);
+        int rc = vfs_ftruncate(fd, arg1); /* checks Landlock's TRUNCATE */
         vfs_close(fd);
         return (u64)rc;
       }

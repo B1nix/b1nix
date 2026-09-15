@@ -617,6 +617,7 @@ int vfs_create(const char *path, u32 mode);
 int vfs_mkdir(const char *path, u32 mode);
 isize vfs_list(const char *dir_path, const char **names, usize max_names);
 struct vfs_node *vfs_find_node_by_fd(int fd);
+int vfs_fd_for_node(struct vfs_node *node, int flags);
 int vfs_stat(const char *path, struct b1nix_stat *st);
 int vfs_lstat(const char *path, struct b1nix_stat *st);
 int vfs_statfs(const char *path, struct b1nix_statfs *st);
@@ -659,6 +660,11 @@ isize vfs_mounts_info(struct vfs_mount_info *out, usize max_entries);
 /* The mount id of the mount a path lives on — the first field of that mount's
  * /proc/<pid>/mountinfo row. 0 when no mount matches. */
 int vfs_mount_id_for_path(const char *path);
+/* statmount/listmount: mounts by their never-reused 64-bit id. */
+u64 vfs_mount_unique_id_for_path(const char *path);
+int vfs_quota_target(const char *special, int fd, char *fstype, usize cap);
+isize vfs_listmount(u64 parent_id, u64 last_id, u64 *ids, usize nr, int reverse);
+isize vfs_statmount(u64 id, u64 mask, char *kbuf, usize bufsize);
 /* Whether a path is the root of a mount rather than somewhere below one --
  * what statx(2) reports as STATX_ATTR_MOUNT_ROOT, and the only way a systemd
  * from 256 onwards asks whether something is a mount point. */
@@ -860,7 +866,9 @@ enum vfs_handle_kind {
   /* fsopen(2): a filesystem being configured, before it exists. */
   VFS_HANDLE_FSCTX,
   /* fsmount(2) / open_tree(2): a mount that is attached nowhere. */
-  VFS_HANDLE_MOUNTFD
+  VFS_HANDLE_MOUNTFD,
+  /* landlock_create_ruleset(2): a sandbox policy being built. */
+  VFS_HANDLE_LANDLOCK
 };
 
 struct vfs_file_ops {

@@ -26,6 +26,7 @@
 #include <b1nix/spinlock.h>
 #include <b1nix/syscall.h>
 #include <string.h>
+#include "../syscall/linux_modern.h"
 
 #define FUTEX_BUCKETS 64
 
@@ -222,6 +223,148 @@ static u64 futex_key_word_for(u64 uaddr, int priv) {
 #define FUTEX_MS_PER_TICK (1000u / sched_tick_hz())
 
 void futex_watch_arm(u64 uaddr);
+
+/* Unlink a waiter from whichever bucket holds it now; 1 if it was queued. */
+static int futex_unlink_waiter(struct futex_waiter *w) {
+  for (unsigned pass = 0; pass < 2; pass++) {
+    unsigned hh = (pass == 0) ? w->bucket : 0;
+    unsigned last = (pass == 0) ? w->bucket : FUTEX_BUCKETS - 1;
+
+    for (; hh <= last; hh++) {
+      struct futex_bucket *ob = &g_futex[hh];
+      u64 flags;
+
+      spin_lock_irqsave(&ob->lock, &flags);
+      for (struct futex_waiter **pp = &ob->head; *pp; pp = &(*pp)->next) {
+        if (*pp == w) {
+          *pp = w->next;
+          spin_unlock_irqrestore(&ob->lock, flags);
+          return 1;
+        }
+      }
+      spin_unlock_irqrestore(&ob->lock, flags);
+    }
+  }
+  return 0;
+}
+
+/* futex_waitv: sleep until any of `n` futexes is woken.
+ *
+ * Every waiter is queued, each after its word is checked under its own bucket
+ * lock, before the task parks; a wake of any of them sets that waiter's flag
+ * and wakes the task by id, which the prepare/commit park cannot miss. A word
+ * that no longer holds its value unqueues everything and answers EAGAIN, as
+ * Linux does. Returns the index of a woken futex. */
+int scheduler_futex_waitv(struct scheduler_futex_vec *v, int n, u64 timeout_ms) {
+  struct futex_waiter *ws;
+  u64 deadline = 0;
+
+  if (n <= 0)
+    return -EINVAL;
+  for (int i = 0; i < n; i++)
+    if (v[i].uaddr & 0x3)
+      return -EINVAL;
+  if (timeout_ms) {
+    u64 t = (timeout_ms + (FUTEX_MS_PER_TICK - 1)) / FUTEX_MS_PER_TICK;
+
+    deadline = scheduler_get_ticks() + (t ? t : 1);
+  }
+  ws = kzalloc((usize)n * sizeof(*ws));
+  if (!ws)
+    return -ENOMEM;
+
+  for (;;) {
+    int queued = 0, rc = 0;
+
+    for (int i = 0; i < n; i++) {
+      struct futex_waiter *w = &ws[i];
+      int priv = (v[i].priv & B1NIX_FUTEX_PRIVATE) ? 1 : 0;
+      u64 key_pml4 = futex_key_pml4_for(v[i].uaddr, priv);
+      u64 key_word = futex_key_word_for(v[i].uaddr, priv);
+      unsigned h = futex_hash(key_pml4, key_word);
+      struct futex_bucket *b = &g_futex[h];
+      int cur = 0;
+      u64 flags;
+
+      memset(w, 0, sizeof(*w));
+      spin_lock_irqsave(&b->lock, &flags);
+      if (futex_read_word(v[i].uaddr, &cur) != 0) {
+        spin_unlock_irqrestore(&b->lock, flags);
+        rc = -EFAULT;
+        break;
+      }
+      if (cur != v[i].val) {
+        spin_unlock_irqrestore(&b->lock, flags);
+        rc = -EAGAIN;
+        break;
+      }
+      w->key_pml4 = key_pml4;
+      w->key_uaddr = key_word;
+      w->diag_vaddr = v[i].uaddr;
+      w->diag_pml4 = current_task->pml4_phys;
+      w->task_id = current_task->id;
+      w->wait_chan = (void *)ws;
+      w->expect = v[i].val;
+      w->bucket = h;
+      w->next = b->head;
+      b->head = w;
+      spin_unlock_irqrestore(&b->lock, flags);
+      queued = i + 1;
+    }
+
+    if (rc == 0) {
+      int any = 0;
+      u64 left = 0;
+
+      for (int i = 0; i < n; i++)
+        if (__atomic_load_n(&ws[i].woken, __ATOMIC_ACQUIRE))
+          any = 1;
+      if (deadline) {
+        u64 now = scheduler_get_ticks();
+
+        left = now < deadline ? deadline - now : 0;
+      }
+      if (!any && (!deadline || left)) {
+        if (deadline)
+          scheduler_wait_prepare_timeout(ws, left);
+        else
+          scheduler_wait_prepare(ws);
+        any = 0;
+        for (int i = 0; i < n; i++)
+          if (__atomic_load_n(&ws[i].woken, __ATOMIC_ACQUIRE))
+            any = 1;
+        if (any)
+          scheduler_wait_cancel();
+        else
+          scheduler_wait_commit();
+      }
+    }
+
+    int woken = -1;
+    for (int i = 0; i < queued; i++) {
+      futex_unlink_waiter(&ws[i]);
+      if (woken < 0 && __atomic_load_n(&ws[i].woken, __ATOMIC_ACQUIRE))
+        woken = i;
+    }
+    if (rc) {
+      kfree(ws);
+      return rc;
+    }
+    if (woken >= 0) {
+      kfree(ws);
+      return woken;
+    }
+    if (deadline && scheduler_get_ticks() >= deadline) {
+      kfree(ws);
+      return -ETIMEDOUT;
+    }
+    if (scheduler_signal_pending()) {
+      kfree(ws);
+      return -EINTR;
+    }
+    /* A spurious resume: queue again and re-check every word. */
+  }
+}
 
 int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
   if ((uaddr & 0x3) != 0) return -EINVAL;

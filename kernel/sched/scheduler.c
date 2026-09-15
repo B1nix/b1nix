@@ -17,6 +17,7 @@
 #include <b1nix/ktime.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/sched.h>
+#include "../syscall/linux_modern.h"
 #include <b1nix/klog.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
@@ -1268,6 +1269,7 @@ static struct task *find_unused_task(int user) {
       g_task_alarm_interval_ticks[i] = 0;
       g_task_execed[i] = 0;
       g_task_nice[i] = 0;
+      linux_modern_task_reset(i);
       g_task_fdlock_owner[i] = 0;
       g_task_exiting[i] = 0;
       g_task_tgid[i] = 0;
@@ -1436,6 +1438,8 @@ static void free_task_slot(struct task *t) {
  * called from pick_next_task to choose a scan start point, so an O(active)
  * walk is fine. Returns 0 (a safe default scan origin) if the pointer is not
  * one of ours — e.g., an AP's idle task lives outside the chunked table. */
+usize scheduler_task_index(const struct task *task) { return task_index(task); }
+
 static usize task_index(const struct task *task) {
   /* The chunk that answered last time answers first: lookups come in runs
    * for the same task, and the walk below was 4% of kernel time while a
@@ -2766,6 +2770,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   g_task_alarm_ticks[c_idx] = 0;
       g_task_alarm_interval_ticks[c_idx] = 0;
   g_task_nice[c_idx] = g_task_nice[p_idx]; /* POSIX: nice survives fork */
+  linux_modern_fork_inherit(p_idx, c_idx); /* memory policy */
   g_task_tgid[c_idx] = child->id;          /* child is its own thread group leader */
   /* M63: the child inherits the parent's seccomp filter chain (shared,
    * refcounted) and no_new_privs — a fork can only ever be as restricted. */
@@ -4020,6 +4025,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   task_inherit_cmdline(c_idx, p_idx);
   for (int r = 0; r < 16; r++)
     g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
+  linux_modern_fork_inherit(p_idx, c_idx);
 
   /* Address-space inheritance. */
   if ((flags & B1NIX_CLONE_VM) && !(flags & B1NIX_CLONE_THREAD)) {

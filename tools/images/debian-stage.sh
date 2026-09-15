@@ -409,6 +409,269 @@ else
 	bad "errno-erofs (mount -o ro failed)"
 fi
 
+# ── Stage 12: system calls Linux added later (M124) ────────────────────────
+# Called by number from perl, and judged by their results: a call that merely
+# stops answering ENOSYS proves nothing. x86_64 numbers.
+if command -v perl >/dev/null 2>&1; then
+	mkdir -p /tmp/b1nix-o2/root/etc /tmp/b1nix-o2/dir
+	echo inroot > /tmp/b1nix-o2/root/etc/hostname
+	ln -sf /tmp/b1nix-o2/dir /tmp/b1nix-o2/link
+	mkdir -p /tmp/b1nix-ll && ln -sf /etc/passwd /tmp/b1nix-ll/escape && rm -f /tmp/b1nix-ll-outside
+	perl -e '
+		use POSIX qw(:errno_h :fcntl_h);
+		sub res { my ($label, $good, $why) = @_;
+			print "DEBIAN-SMOKE: ", ($good ? "ok" : "FAIL"), " $label",
+			      ($good ? "" : " ($why)"), "\n"; }
+		sub err { return $! + 0; }
+		my $PAGE = 4096;
+		my $me = $$ + 0;
+		my $map = syscall(9, 0, 3 * $PAGE, 3, 0x22, -1, 0);   # mmap RW anon
+
+		# Memory policy on a one-node machine.
+		my $one = pack("Q", 1); my $two = pack("Q", 2);
+		my $r = syscall(237, $map, $PAGE, 2, $one, 64, 0);   # mbind BIND {0}
+		my $r2 = syscall(237, $map, $PAGE, 2, $two, 64, 0);  # node 1: no such node
+		my $e2 = err();
+		res("mempolicy-mbind", $r == 0 && $r2 == -1 && $e2 == EINVAL, "r=$r r2=$r2 e=$e2");
+		$r = syscall(238, 2, $one, 64);                      # set_mempolicy BIND
+		my $mode = pack("l", -1); my $mask = pack("Q", 0);
+		$r2 = syscall(239, $mode, $mask, 64, 0, 0);          # get_mempolicy
+		res("mempolicy-get-set", $r == 0 && $r2 == 0 && unpack("l", $mode) == 2 &&
+		    unpack("Q", $mask) == 1, "set=$r get=$r2 mode=" . unpack("l", $mode));
+		$mask = pack("Q", 0);
+		$r = syscall(239, 0, $mask, 64, 0, 4);               # MPOL_F_MEMS_ALLOWED
+		res("mempolicy-mems-allowed", $r == 0 && unpack("Q", $mask) == 1, "r=$r");
+		syscall(238, 0, 0, 0);
+
+		# Protection keys without the CPU feature: only the default key exists.
+		$r = syscall(330, 0, 0); my $ea = err();
+		$r2 = syscall(329, $map, $PAGE, 1, -1);              # key -1 = mprotect
+		my $r3 = syscall(329, $map, $PAGE, 1, 1); my $e3 = err();
+		syscall(10, $map, $PAGE, 3);
+		res("pkey", $r == -1 && $ea == ENOSPC && $r2 == 0 && $r3 == -1 && $e3 == EINVAL,
+		    "alloc=$r/$ea mprot=$r2 bad=$r3/$e3");
+
+		# sched_getattr / sched_setattr.
+		my $attr = "\0" x 56;
+		$r = syscall(315, 0, $attr, 56, 0);
+		my ($sz, $pol, $fl, $nice) = unpack("L L Q l", $attr);
+		my $set = pack("L L Q l L Q Q Q L L", 56, 0, 0, 7, 0, 0, 0, 0, 0, 0);
+		$r2 = syscall(314, 0, $set, 0);
+		my $prio = getpriority(0, 0);
+		my $fifo = pack("L L Q l L Q Q Q L L", 56, 1, 0, 0, 10, 0, 0, 0, 0, 0);
+		$r3 = syscall(314, 0, $fifo, 0); $e3 = err();
+		res("sched-attr", $r == 0 && $sz == 56 && $pol == 0 && $r2 == 0 && $prio == 7 &&
+		    $r3 == -1 && $e3 == EINVAL, "get=$r size=$sz set=$r2 prio=$prio fifo=$r3/$e3");
+
+		# kcmp: a descriptor and its dup are one file; parent and child are two
+		# address spaces.
+		open(my $fh, "<", "/etc/passwd");
+		my $fd = fileno($fh); my $dup = POSIX::dup($fd);
+		open(my $gh, "<", "/etc/group"); my $gfd = fileno($gh);
+		my $pid = fork();
+		if ($pid == 0) { sleep 3; exit 0; }
+		$r = syscall(312, $me, $me, 0, $fd, $dup);
+		$r2 = syscall(312, $me, $me, 0, $fd, $gfd);
+		$r3 = syscall(312, $me, $pid, 1, 0, 0);
+		my $r4 = syscall(312, $me, $me, 1, 0, 0);
+		res("kcmp", $r == 0 && ($r2 == 1 || $r2 == 2) && ($r3 == 1 || $r3 == 2) && $r4 == 0,
+		    "dup=$r other=$r2 vm=$r3 self=$r4");
+
+		# pidfd_getfd: take a copy of our own descriptor through a pidfd.
+		my $pidfd = syscall(434, $me, 0);
+		my $got = syscall(438, $pidfd, $fd, 0);
+		my @a = stat($fh); open(my $ch, "<&=", $got); my @b = stat($ch);
+		my $cloexec = fcntl($ch, F_GETFD, 0);
+		res("pidfd-getfd", $pidfd >= 0 && $got >= 0 && $a[1] == $b[1] && ($cloexec & 1),
+		    "pidfd=$pidfd got=$got ino=$a[1]/$b[1] fdflags=$cloexec");
+
+		# process_madvise: advice on our own range answers its length.
+		my $iov = pack("Q Q", $map, 2 * $PAGE);
+		$r = syscall(440, $pidfd, $iov, 1, 20, 0);            # MADV_COLD
+		$r2 = syscall(440, $pidfd, $iov, 1, 4, 0); $e2 = err(); # MADV_DONTNEED: refused
+		res("process-madvise", $r == 2 * $PAGE && $r2 == -1 && $e2 == EINVAL, "cold=$r dontneed=$r2/$e2");
+
+		# process_mrelease: a live process is refused, a killed one accepted.
+		my $cpidfd = syscall(434, $pid, 0);
+		$r = syscall(448, $cpidfd, 0); $ea = err();
+		kill 9, $pid;
+		$r2 = syscall(448, $cpidfd, 0);
+		waitpid($pid, 0);
+		res("process-mrelease", $r == -1 && $ea == EINVAL && $r2 == 0, "live=$r/$ea killed=$r2");
+
+		# cachestat: a file just read is in the page cache.
+		open(my $ph, "<", "/usr/bin/perl"); my $buf; read($ph, $buf, 65536);
+		my $range = pack("Q Q", 0, 65536); my $cs = "\0" x 40;
+		$r = syscall(451, fileno($ph), $range, $cs, 0);
+		my ($cached) = unpack("Q", $cs);
+		$r2 = syscall(451, fileno($ph), $range, $cs, 1); $e2 = err();
+		res("cachestat", $r == 0 && $cached > 0 && $r2 == -1 && $e2 == EINVAL, "r=$r cached=$cached flags=$r2/$e2");
+
+		# futex2: EAGAIN on a changed word, ETIMEDOUT on an absolute deadline,
+		# and a real wake across a shared mapping.
+		# The words live in a file mapped shared, so a write through the file is
+		# what the mapping sees -- no pointer arithmetic from perl.
+		open(my $wf, "+>", "/tmp/b1nix-futex"); syswrite($wf, pack("L L", 5, 9) . ("\0" x 4088));
+		my $sh = syscall(9, 0, $PAGE, 3, 0x01, fileno($wf), 0);  # MAP_SHARED
+		$r = syscall(455, $sh, 4, 0xffffffff, 2, 0, 1); $ea = err();
+		my $now = pack("q q", 0, 0); syscall(228, 1, $now);
+		my ($s, $ns) = unpack("q q", $now); $ns += 50000000; if ($ns >= 1000000000) { $s++; $ns -= 1000000000; }
+		my $dl = pack("q q", $s, $ns);
+		$r2 = syscall(455, $sh, 5, 0xffffffff, 2, $dl, 1); $e2 = err();
+		res("futex2-wait", $r == -1 && $ea == EAGAIN && $r2 == -1 && $e2 == ETIMEDOUT, "eagain=$r/$ea timeout=$r2/$e2");
+		$pid = fork();
+		if ($pid == 0) { my $w = syscall(455, $sh, 5, 0xffffffff, 2, 0, 1); exit($w == 0 ? 0 : 1); }
+		my $woken = 0;
+		for (my $i = 0; $i < 50 && !$woken; $i++) { select(undef, undef, undef, 0.05); $woken = syscall(454, $sh, 0xffffffff, 1, 2); }
+		waitpid($pid, 0);
+		res("futex2-wake", $woken == 1 && ($? >> 8) == 0, "woken=$woken child=" . ($? >> 8));
+		# futex_waitv: the second of two futexes is the one woken.
+		$pid = fork();
+		if ($pid == 0) {
+			my $v = pack("Q Q L L Q Q L L", 5, $sh, 2, 0, 9, $sh + 4, 2, 0);
+			my $w = syscall(449, $v, 2, 0, 0, 1);
+			exit($w == 1 ? 0 : 10 + ($w < 0 ? 0 : $w));
+		}
+		$woken = 0;
+		for (my $i = 0; $i < 50 && !$woken; $i++) { select(undef, undef, undef, 0.05); $woken = syscall(454, $sh + 4, 0xffffffff, 1, 2); }
+		waitpid($pid, 0);
+		res("futex2-waitv", $woken == 1 && ($? >> 8) == 0, "woken=$woken child=" . ($? >> 8));
+
+		# openat2 and its RESOLVE_ flags.
+		sub how { my ($fl, $rs) = @_; my $h = pack("Q Q Q", $fl, 0, $rs); return $h; }
+		my ($p1, $h1) = ("/tmp/b1nix-o2/link/\0", how(0200000, 0x04)); my $o = syscall(437, -100, $p1, $h1, 24); my $eo = err();
+		res("openat2-no-symlinks", $o == -1 && $eo == ELOOP, "r=$o e=$eo");
+		opendir(my $dh, "/tmp/b1nix-o2/root"); my $dfd = POSIX::open("/tmp/b1nix-o2/root", O_RDONLY);
+		my ($p2, $h2) = ("../dir\0", how(0200000, 0x08)); $o = syscall(437, $dfd, $p2, $h2, 24); $eo = err();
+		my ($p3, $h3) = ("/etc\0", how(0200000, 0x08)); my $o2 = syscall(437, $dfd, $p3, $h3, 24); my $eo2 = err();
+		res("openat2-beneath", $o == -1 && $eo == EXDEV && $o2 == -1 && $eo2 == EXDEV, "dotdot=$o/$eo abs=$o2/$eo2");
+		my ($p4, $h4) = ("/etc/hostname\0", how(0, 0x10)); $o = syscall(437, $dfd, $p4, $h4, 24);
+		my $txt = ""; if ($o >= 0) { open(my $ih, "<&=", $o); $txt = <$ih>; chomp $txt; }
+		res("openat2-in-root", $o >= 0 && $txt eq "inroot", "r=$o text=$txt");
+		my ($p5, $h5) = ("/proc/self/exe\0", how(0, 0x02)); $o = syscall(437, -100, $p5, $h5, 24); $eo = err();
+		my ($p6, $h6) = ("/etc/passwd\0", how(0, 0)); $o2 = syscall(437, -100, $p6, $h6, 23); $eo2 = err();
+		my $o3 = syscall(437, -100, $p6, $h6, 24);
+		res("openat2-magiclinks-size", $o == -1 && $eo == ELOOP && $o2 == -1 && $eo2 == EINVAL && $o3 >= 0,
+		    "magic=$o/$eo short=$o2/$eo2 plain=$o3");
+
+		# listmount / statmount: every mount under the root, and / described.
+		my $req = pack("L L Q Q", 24, 0, 0xffffffffffffffff, 0);
+		my $ids = "\0" x (8 * 256);
+		my $n = syscall(458, $req, $ids, 256, 0);
+		my @ids = $n > 0 ? unpack("Q$n", $ids) : ();
+		# statx(STATX_MNT_ID_UNIQUE) on / names the root mount.
+		my $sx = "\0" x 256; my $slash = "/\0";
+		my $sr = syscall(332, -100, $slash, 0, 0x4000, $sx);
+		my $rootid = unpack("Q", substr($sx, 0x90, 8));
+		my $sreq = pack("L L Q Q", 24, 0, $rootid, 0x0002 | 0x0010 | 0x0020);
+		my $smb = "\0" x 4096;
+		$r = syscall(457, $sreq, $smb, 4096, 0);
+		my ($ssize, $optoff, $smask) = unpack("L L Q", $smb);
+		my $mntid = unpack("Q", substr($smb, 40, 8));
+		my $fstoff = unpack("L", substr($smb, 36, 4));
+		my $mpoff = unpack("L", substr($smb, 108, 4));
+		my $fstype = unpack("Z*", substr($smb, 512 + $fstoff));
+		my $mpoint = unpack("Z*", substr($smb, 512 + $mpoff));
+		my $procid = 0;
+		foreach my $id (@ids) {
+			my $q = pack("L L Q Q", 24, 0, $id, 0x0010); my $b = "\0" x 1024;
+			if (syscall(457, $q, $b, 1024, 0) == 0) {
+				my $mp = unpack("Z*", substr($b, 512 + unpack("L", substr($b, 108, 4))));
+				$procid = $id if $mp eq "/proc";
+			}
+		}
+		my $bad = pack("L L Q Q", 24, 0, 12345, 0x2); my $bb = "\0" x 1024;
+		$r2 = syscall(457, $bad, $bb, 1024, 0); $e2 = err();
+		res("statmount-listmount", $n > 0 && $sr == 0 && $rootid > 4294967296 && $r == 0 &&
+		    $mntid == $rootid && ($smask & 0x32) == 0x32 && $mpoint eq "/" && $fstype ne "" &&
+		    $procid > 0 && $r2 == -1 && $e2 == ENOENT,
+		    "n=$n statx=$sr root=$rootid stat=$r id=$mntid mask=$smask mp=$mpoint fs=$fstype proc=$procid bad=$r2/$e2");
+
+		# remap_file_pages: page 0 of a two-page shared file mapping comes to show
+		# file page 1.
+		open(my $rf, "+>", "/tmp/b1nix-remap"); syswrite($rf, ("A" x 4096) . ("B" x 4096));
+		my $rm = syscall(9, 0, 8192, 3, 0x01, fileno($rf), 0);
+		$r = syscall(216, $rm, 4096, 0, 1, 0);
+		my $gotc = $r == 0 ? unpack("P1", pack("Q", $rm)) : "?";   # read through the mapping
+		$r2 = syscall(216, $rm, 4096, 1, 1, 0); $e2 = err();
+		res("remap-file-pages", $r == 0 && $gotc eq "B" && $r2 == -1 && $e2 == EINVAL, "r=$r page0=$gotc prot=$r2/$e2");
+
+		# The key retention service.
+		my ($ktype, $kdesc, $kpay) = ("user\0", "b1nix:probe\0", "secret-bytes");
+		my $kid = syscall(248, $ktype, $kdesc, $kpay, length($kpay), -3);   # add_key into @s
+		my $kbuf = "\0" x 64;
+		my $kn = syscall(250, 11, $kid, $kbuf, 64);                        # KEYCTL_READ
+		my $kd = "\0" x 256;
+		my $dn = syscall(250, 6, $kid, $kd, 256);                          # KEYCTL_DESCRIBE
+		my $found = syscall(249, $ktype, $kdesc, 0, 0);                    # request_key
+		my $upd = "updated"; my $ur = syscall(250, 2, $kid, $upd, length($upd));
+		$kbuf = "\0" x 64; my $kn2 = syscall(250, 11, $kid, $kbuf, 64);
+		my $rv = syscall(250, 3, $kid);                                    # REVOKE
+		my $kn3 = syscall(250, 11, $kid, $kbuf, 64); my $ek = err();
+		my ($lt, $ld, $lp) = ("logon\0", "svc:pw\0", "hidden");
+		my $lid = syscall(248, $lt, $ld, $lp, length($lp), -3);
+		my $lr = syscall(250, 11, $lid, $kbuf, 64); my $el = err();
+		my ($nd) = ("b1nix:nothing\0");
+		my $miss = syscall(249, $ktype, $nd, 0, 0); my $em = err();
+		res("keys", $kid > 0 && $kn == 12 && $dn > 0 && unpack("Z*", $kd) =~ /^user;0;0;[0-9a-f]{8};b1nix:probe$/ &&
+		    $found == $kid && $ur == 0 && $kn2 == 7 && $rv == 0 && $kn3 == -1 && $ek == 128 &&
+		    $lid > 0 && $lr == -1 && $el == EOPNOTSUPP && $miss == -1 && $em == 126,
+		    "add=$kid read=$kn desc=" . unpack("Z*", $kd) . " req=$found upd=$ur read2=$kn2 revoke=$rv/$kn3/$ek logon=$lid/$lr/$el miss=$miss/$em");
+
+		# Landlock: a child confines itself to one directory.
+		my $vers = syscall(444, 0, 0, 1);
+		my $emptyattr = pack("Q", 0);
+		my $er = syscall(444, $emptyattr, 8, 0); my $eer = err();
+		my $netattr = pack("Q Q", 4, 1);
+		my $nr = syscall(444, $netattr, 16, 0); my $enr = err();
+		$pid = fork();
+		if ($pid == 0) {
+			my $bits = 0;
+			my $attr = pack("Q", 1 | 2 | 4 | 8 | 256);   # EXECUTE WRITE READ READ_DIR MAKE_REG
+			my $rs = syscall(444, $attr, 8, 0);
+			my $dirfd = POSIX::open("/tmp/b1nix-ll", O_RDONLY);
+			my $rule = pack("Q l", 2 | 4 | 8 | 256, $dirfd);
+			my $ar = syscall(445, $rs, 1, $rule, 0);
+			syscall(157, 38, 1, 0, 0, 0);                  # PR_SET_NO_NEW_PRIVS
+			my $rr = syscall(446, $rs, 0);
+			$bits |= 1 if $rs >= 0 && $ar == 0 && $rr == 0;
+			$bits |= 2 if open(my $w, ">", "/tmp/b1nix-ll/ok");
+			$bits |= 4 if !open(my $p, "<", "/etc/passwd") && ($! + 0) == EACCES;
+			$bits |= 8 if !open(my $c, ">", "/tmp/b1nix-ll-outside") && ($! + 0) == EACCES;
+			$bits |= 16 if !open(my $l, "<", "/tmp/b1nix-ll/escape") && ($! + 0) == EACCES;
+			exit($bits);
+		}
+		waitpid($pid, 0); my $llbits = $? >> 8;
+		$pid = fork();
+		if ($pid == 0) {
+			$) = "65534 65534"; $> = 65534;
+			my $attr = pack("Q", 4); my $rs = syscall(444, $attr, 8, 0);
+			my $rr = syscall(446, $rs, 0);
+			exit($rr == -1 && ($! + 0) == EPERM ? 0 : 1);
+		}
+		waitpid($pid, 0); my $nnp = $? >> 8;
+		res("landlock", $vers == 3 && $er == -1 && $eer == ENOMSG && $nr == -1 && $enr == EINVAL &&
+		    $llbits == 31 && $nnp == 0 && !-e "/tmp/b1nix-ll-outside",
+		    "abi=$vers empty=$er/$eer net=$nr/$enr bits=$llbits nnp=$nnp");
+
+		# quotactl: the ABI is answered, quotas are not supported by any
+		# filesystem here (ENOSYS), and a bad target is named as such.
+		my $qsync = 0x800001 << 8;
+		my $qget = (0x800007 << 8) | 0;
+		my ($dev, $notdev) = ("/dev/vda\0", "/etc/passwd\0");
+		my $qa = "\0" x 128;
+		$r = syscall(179, $qget, $dev, 0, $qa); my $eq = err();
+		$r2 = syscall(179, $qget, $notdev, 0, $qa); my $eq2 = err();
+		my $badtype = (0x800007 << 8) | 9;
+		$r3 = syscall(179, $badtype, $dev, 0, $qa); $e3 = err();
+		my $qfd = POSIX::open("/tmp", O_RDONLY);
+		my $r4 = syscall(443, $qfd, $qget, 0, $qa); my $e4 = err();
+		res("quotactl", $r == -1 && ($eq == ENOSYS || $eq == ENODEV) && $r2 == -1 && $eq2 == ENOTBLK &&
+		    $r3 == -1 && $e3 == EINVAL && $r4 == -1 && $e4 == ENOSYS,
+		    "dev=$r/$eq notdev=$r2/$eq2 type=$r3/$e3 fd=$r4/$e4");
+	' || bad modern-perl $?
+fi
+
 echo "DEBIAN-SMOKE: done"
 
 # Let QEMU exit on its own where possible; the host harness kills it on timeout
