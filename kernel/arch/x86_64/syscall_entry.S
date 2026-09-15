@@ -96,6 +96,13 @@ x86_syscall_entry:
      * the pushes above): rax@0 rbx@8 rcx@16 rdx@24 rbp@32 rdi@40 rsi@48 r8@56
      * r9@64 r10@72 r11@80 ...  Syscall args are number=rax, arg0=rdi, arg1=rsi,
      * arg2=rdx, arg3=r10, arg4=r8, arg5=r9. */
+    /* M86: close the task's user-time interval before `sti` below. Closed in
+     * C, a timer interrupt taken right after `sti` could switch the task out
+     * first, and the switch bills the open interval -- the compute that ran up
+     * to this SYSCALL -- as system time. Clobbers only caller-saved registers;
+     * the arguments are loaded from the frame afterwards. */
+    call sched_acct_enter_kernel
+
     movq 0(%rbp),  %rdi    /* number */
     movq 40(%rbp), %rsi    /* arg0 (saved rdi) */
     movq 48(%rbp), %rdx    /* arg1 (saved rsi) */

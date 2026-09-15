@@ -2353,6 +2353,8 @@ check_output "$LOG" "BB-W11: ok unshare-net" "unshare -n gives a network namespa
 check_output "$LOG" "BB-W11: ok nsenter-uts" "nsenter -t <pid> -u reads the hostname of the namespace that process is in"
 check_output "$LOG" "BB-W11: done" "the namespace tools wave completes"
 check_output "$LOG" "BB-W12: ok readahead" "readahead(2) warms a file's blocks and leaves its contents intact"
+check_output "$LOG" "BB-W12: ok job-stop-state" "a sleeper stopped with SIGSTOP reads 'T' in /proc/<pid>/stat"
+check_output "$LOG" "BB-W12: ok job-cont-state" "the same sleeper reads S/R again after SIGCONT"
 check_output "$LOG" "BB-W12: ok raid-assemble" "raidautorun assembles a mirror from the superblocks its members carry"
 check_output "$LOG" "BB-W12: ok raid-mirrors-both-members" "a write through the array lands on BOTH members, read back from each member directly"
 check_output "$LOG" "BB-W12: ok nbd-node" "/dev/nbd0 exists before anything is attached and refuses to read while empty"

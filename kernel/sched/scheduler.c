@@ -5670,8 +5670,7 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
        * here with the bit set and never died, and the process it belonged to
        * waited for it in exit_group and never finished. From outside, the
        * process looked alive; it was unable to die. */
-      if (__atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE) &
-          ~current_task->blocked_signals)
+      if (scheduler_signal_pending())
         break;
       /* Someone woke us, or the task is being torn down. terminate_group_
        * siblings and the ordinary wake paths promote a SLEEPING task to READY;

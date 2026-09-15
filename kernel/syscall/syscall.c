@@ -4469,7 +4469,10 @@ static u64 syscall_sleep_timespec(const struct timespec *ts, u64 *ticks_asked) {
       break;
     if (scheduler_get_uptime_ticks() >= tick_deadline)
       break;
-    if (scheduler_signal_pending_any())
+    /* Only a signal that will act ends the sleep. A SIGCONT (or SIGCHLD,
+     * SIGWINCH) left at its default is ignored, and Linux sleeps on through
+     * it: ending here returned `sleep 30` the moment its job was continued. */
+    if (scheduler_signal_pending())
       break;
     u64 rest_ticks = (deadline_ns - now_ns) / tick_ns;
     if (!rest_ticks) {
@@ -6135,7 +6138,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     entry->comm[0] = '\0';
   }
 
-  sched_acct_enter_kernel();
+  /* The user-time interval was closed by the arch entry, before interrupts were
+   * enabled (M86). */
   u64 r = syscall_dispatch_traced(number, arg0, arg1, arg2, arg3, arg4, arg5,
                                   frame);
   sched_acct_leave_kernel();

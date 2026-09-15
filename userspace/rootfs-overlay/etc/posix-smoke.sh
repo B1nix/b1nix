@@ -490,6 +490,30 @@ else
 fi
 rm -f /tmp/bb_dir/w12.bin
 
+# Job control as ps/top see it: a sleeper stopped with SIGSTOP reads 'T' in
+# /proc/<pid>/stat, and 'S' (or R) again after SIGCONT. Our own job-control
+# test checks this through waitpid; the Debian lane reads it from /proc.
+sleep 30 &
+bb_js_pid=$!
+sleep 0.2
+kill -STOP $bb_js_pid
+sleep 0.2
+bb_js_st=$(cut -d' ' -f3 /proc/$bb_js_pid/stat 2>/dev/null)
+kill -CONT $bb_js_pid
+sleep 0.2
+bb_js_st2=$(cut -d' ' -f3 /proc/$bb_js_pid/stat 2>/dev/null)
+kill -KILL $bb_js_pid 2>/dev/null
+wait $bb_js_pid 2>/dev/null
+if [ "$bb_js_st" = "T" ]; then
+	echo "BB-W12: ok job-stop-state"
+else
+	echo "BB-W12: FAIL job-stop-state (state=$bb_js_st)"
+fi
+case "$bb_js_st2" in
+S|R|D) echo "BB-W12: ok job-cont-state" ;;
+*) echo "BB-W12: FAIL job-cont-state (state=$bb_js_st2)" ;;
+esac
+
 # Software RAID: build a mirror out of two loop devices, write through the
 # array, then read each MEMBER directly and require both to carry the data.
 # That is the property a mirror exists for, and nothing short of reading the

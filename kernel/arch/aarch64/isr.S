@@ -249,6 +249,12 @@ sync_el0:
 	cmp x3, #0x15       // 0x15 = SVC instruction in AArch64 state
 	b.ne 1f
 
+	// M86: close the task's user-time interval while IRQs are still masked.
+	// Closed later, in C, a timer IRQ taken right after the unmask below could
+	// switch the task out first, and the switch bills the open interval --
+	// the compute that ran up to this SVC -- as system time.
+	bl sched_acct_enter_kernel
+
 	// Syscall dispatch:
 	// x8 = syscall number
 	// x0..x5 = syscall arguments
