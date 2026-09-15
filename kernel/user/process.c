@@ -1177,9 +1177,11 @@ void user_image_free(struct user_loaded_image *image) {
   }
 
   for (usize i = 0; i < image->segment_count; i++) {
-    if (image->segments[i].data) {
-      kfree(image->segments[i].data);
-    }
+    void *staged = __atomic_exchange_n(&image->segments[i].data, (void *)0,
+                                       __ATOMIC_ACQ_REL);
+
+    if (staged)
+      kfree(staged);
   }
 
   if (image->address_space.stack_image) {
@@ -1576,8 +1578,18 @@ static int user_run_elf_image(struct user_loaded_image *image) {
         fvma->offset = (isize)seg_file_base;
         vma_insert(current_task, fvma);
       }
-      kfree(segment->data);
-      segment->data = 0;
+      /* Take the pointer before freeing it: the task's image is already
+       * installed, so a reaper that finds this task dead runs
+       * user_image_free over the same slots. Whoever takes the pointer frees
+       * it; the other sees NULL. Freeing first and clearing after left a
+       * window in which both freed the same block. */
+      {
+        void *staged = __atomic_exchange_n(&segment->data, (void *)0,
+                                           __ATOMIC_ACQ_REL);
+
+        if (staged)
+          kfree(staged);
+      }
       continue;
     }
 
@@ -1660,9 +1672,12 @@ static int user_run_elf_image(struct user_loaded_image *image) {
      * builds a fresh image. Holding it would pin tens of MB per process for
      * the image's whole lifetime (cc1's text segment alone is ~16MB), which
      * is the dominant kheap leak that OOMs the in-guest self-host build. */
-    if (segment->data) {
-      kfree(segment->data);
-      segment->data = 0;
+    {
+      void *staged = __atomic_exchange_n(&segment->data, (void *)0,
+                                         __ATOMIC_ACQ_REL);
+
+      if (staged)
+        kfree(staged);
     }
   }
 

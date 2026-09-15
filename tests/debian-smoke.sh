@@ -21,6 +21,14 @@ IMG="${DEBIAN_IMG:-$BUILD_DIR/debian.ext4}"
 # finds its root by label, and the systemd image carries its own -- so read it
 # from the filesystem rather than assuming.
 [ -f "$IMG" ] || IMG="$BUILD_DIR/debian-systemd.ext4"
+# The systemd image boots systemd, whose units are the systemd lane's own; the
+# harness these checks look for is never started from it, and every probe then
+# reports FAIL for a reason that has nothing to do with the kernel. Run the
+# harness as PID 1 there instead -- it is injected into the scratch copy below,
+# so it works on whichever image is present.
+case "$IMG" in
+*debian-systemd.ext4) DEBIAN_INIT="${DEBIAN_INIT:-/b1nix-stage.sh}" ;;
+esac
 IMG_LABEL="${IMG_LABEL:-}"
 if [ -z "$IMG_LABEL" ] && command -v dumpe2fs >/dev/null 2>&1 && [ -f "$IMG" ]; then
 	IMG_LABEL=$(dumpe2fs -h "$IMG" 2>/dev/null |

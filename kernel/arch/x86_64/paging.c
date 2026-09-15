@@ -4,6 +4,7 @@
 #include <b1nix/user.h>
 #include <b1nix/lockdep.h>
 #include <b1nix/sched.h>
+#include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/rwlock.h>
 #include <b1nix/vfs.h>
@@ -251,11 +252,13 @@ static u64 table_to_phys(u64 *table) {
   return phys;
 }
 
-static u64 *alloc_page_table(void) {
+/* A page table, or NULL when there are no frames left. Callers that cannot
+ * fail (the boot-time maps) check for NULL and panic themselves; a fork or a
+ * fault returns ENOMEM instead of killing the machine. */
+static u64 *alloc_page_table_try(void) {
   u64 frame = pmm_alloc_frame();
-  if (frame == 0) {
-    panic("vmm: OOM during page table allocation");
-  }
+  if (frame == 0)
+    return 0;
 
   /* Page tables are dereferenced via the direct map once it is ready
    * (frame + DIRECT_MAP_BASE), so any frame below DIRECT_MAP_SIZE is
@@ -277,6 +280,16 @@ static u64 *alloc_page_table(void) {
 
   memset(table, 0, PAGE_SIZE);
   return table;
+}
+
+/* For the paths that have no way to report a failure: the kernel's own maps,
+ * built before any userspace exists. */
+static u64 *alloc_page_table(void) {
+  u64 *t = alloc_page_table_try();
+
+  if (!t)
+    panic("vmm: OOM during page table allocation");
+  return t;
 }
 
 /* Turn a 2 MiB entry into a page table the caller already allocated. Splitting
@@ -339,7 +352,7 @@ static u64 *reachable_table(u64 entry) {
   return table_from_entry(entry);
 }
 
-static u64 *ensure_child_table(u64 *parent, usize index) {
+static u64 *ensure_child_table_try(u64 *parent, usize index) {
   /* Physical address zero is never a page table — it is the bottom of memory,
    * where the BIOS data area and early kernel structures live. A parent that
    * lands exactly on the start of the direct map means the caller followed an
@@ -454,7 +467,7 @@ static u64 *ensure_child_table(u64 *parent, usize index) {
         result = (expected & HUGE_PAGE_FLAG) ? split_huge_page(parent, index)
                                              : table_from_entry(expected);
       else
-        result = ensure_child_table(parent, index);
+        result = ensure_child_table_try(parent, index);
     }
   } else if ((parent[index] & HUGE_PAGE_FLAG) != 0) {
     result = split_huge_page(parent, index);
@@ -506,6 +519,16 @@ static u64 *ensure_child_table(u64 *parent, usize index) {
   }
   return result;
 }
+
+/* For the maps that cannot fail: the kernel's own, built before userspace. */
+static u64 *ensure_child_table(u64 *parent, usize index) {
+  u64 *t = ensure_child_table_try(parent, index);
+
+  if (!t)
+    panic("vmm: OOM during page table allocation");
+  return t;
+}
+
 
 void vmm_map_page_in_table(u64 *pml4, u64 virtual_address, u64 physical_address, u64 flags) {
   u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
@@ -690,11 +713,17 @@ int paging_install_guard_page(u64 virtual_address) {
  * IRQs-off critical section. Split out of vmm_map_page so the page-fault
  * handler — which also holds vmm_lock at commit time — can install without
  * re-entering the non-recursive rwlock. */
-static void vmm_map_page_locked(u64 virtual_address, u64 physical_address,
-                                u64 flags) {
+/* Returns 0, or -1 when a page table could not be allocated: a large kernel
+ * allocation can then give its frames back and fail, instead of the machine
+ * dying on a map it could not complete. */
+static int vmm_map_page_locked(u64 virtual_address, u64 physical_address,
+                               u64 flags) {
   u64 *pml4 = get_current_pml4();
-  u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
-  u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
+  u64 *pdpt = ensure_child_table_try(pml4, pml4_index(virtual_address));
+  u64 *pd = pdpt ? ensure_child_table_try(pdpt, pdpt_index(virtual_address)) : 0;
+
+  if (!pd)
+    return -1;
   if ((flags & VMM_USER) != 0) {
     __atomic_or_fetch(&pml4[pml4_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
     __atomic_or_fetch(&pdpt[pdpt_index(virtual_address)], VMM_USER, __ATOMIC_SEQ_CST);
@@ -713,6 +742,7 @@ static void vmm_map_page_locked(u64 virtual_address, u64 physical_address,
   pt[pt_index(virtual_address)] =
       (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
   invalidate_page(virtual_address);
+  return 0;
 }
 
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
@@ -727,8 +757,10 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
 
   u64 _vmflags;
   vmm_write_acquire(&_vmflags);
-  vmm_map_page_locked(virtual_address, physical_address, flags);
+  int rc = vmm_map_page_locked(virtual_address, physical_address, flags);
   vmm_write_release(_vmflags);
+  if (rc)
+    panic("vmm: OOM during page table allocation");
 
   if ((flags & VMM_USER) && (flags & VMM_PRESENT)) {
     extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
@@ -743,15 +775,22 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
  * thousands of pages, so it was tens of thousands of irqsave round trips
  * against CPUs that are handling faults meanwhile. The mapping work per page
  * is unchanged; only the locking leaves the loop. */
-void vmm_map_range(u64 base, const u64 *frames, usize n, u64 flags) {
+int vmm_map_range_try(u64 base, const u64 *frames, usize n, u64 flags) {
   u64 _vmflags;
+  int rc = 0;
 
   if (!frames || n == 0)
-    return;
+    return 0;
   vmm_write_acquire(&_vmflags);
-  for (usize i = 0; i < n; i++)
-    vmm_map_page_locked(base + i * PAGE_SIZE, frames[i], flags);
+  for (usize i = 0; i < n && !rc; i++)
+    rc = vmm_map_page_locked(base + i * PAGE_SIZE, frames[i], flags);
   vmm_write_release(_vmflags);
+  return rc ? -ENOMEM : 0;
+}
+
+void vmm_map_range(u64 base, const u64 *frames, usize n, u64 flags) {
+  if (vmm_map_range_try(base, frames, n, flags) != 0)
+    panic("vmm: OOM during page table allocation");
 }
 
 void *vmm_map_mmio(u64 physical_address, usize size, u64 flags) {
@@ -2955,7 +2994,7 @@ u64 paging_create_address_space(void) {
  * nothing. */
 void tlb_shootdown_poll(void);
 
-static void clone_table(u64 *src_table, u64 *dst_table, int level) {
+static int clone_table(u64 *src_table, u64 *dst_table, int level) {
   tlb_shootdown_poll();
   for (usize i = 0; i < 512; i++) {
     if (!(src_table[i] & VMM_PRESENT)) {
@@ -2974,9 +3013,13 @@ static void clone_table(u64 *src_table, u64 *dst_table, int level) {
     if (level < 3) {
       // PML4, PDPT, or PD -> recurse
       u64 *src_child = table_from_entry(entry);
-      u64 *dst_child = alloc_page_table();
+      u64 *dst_child = alloc_page_table_try();
+
+      if (!dst_child)
+        return -1;
       dst_table[i] = table_to_phys(dst_child) | (entry & ~PAGE_ENTRY_ADDRESS_MASK);
-      clone_table(src_child, dst_child, level + 1);
+      if (clone_table(src_child, dst_child, level + 1) != 0)
+        return -1;
     } else {
       // PT -> copy frame and handle CoW
       u64 frame = entry & PAGE_ENTRY_ADDRESS_MASK;
@@ -3001,13 +3044,18 @@ static void clone_table(u64 *src_table, u64 *dst_table, int level) {
       }
     }
   }
+  return 0;
 }
 
 u64 paging_clone_address_space(u64 src_pml4_phys) {
   u64 real_src_phys = src_pml4_phys ? src_pml4_phys : kernel_pml4_phys;
   u64 *src_pml4 = (u64 *)(usize)(real_src_phys + DIRECT_MAP_BASE);
-  u64 *dst_pml4 = alloc_page_table();
-  u64 dst_pml4_phys = table_to_phys(dst_pml4);
+  u64 *dst_pml4 = alloc_page_table_try();
+  u64 dst_pml4_phys;
+
+  if (!dst_pml4)
+    return 0; /* out of memory: the caller reports ENOMEM */
+  dst_pml4_phys = table_to_phys(dst_pml4);
 
   /* M28 #7 T4: serialize page-table reads against concurrent vmm_map_page
    * /vmm_unmap_page writes. Without BKL the syscall path lets two CPUs run
@@ -3020,12 +3068,19 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
   vmm_write_acquire(&_vmflags);
 
   // Clone user-half entries (0-255)
-  for (usize i = 0; i < 256; i++) {
+  int failed = 0;
+  for (usize i = 0; i < 256 && !failed; i++) {
     if (src_pml4[i] & VMM_PRESENT) {
       u64 *src_pdpt = table_from_entry(src_pml4[i]);
-      u64 *dst_pdpt = alloc_page_table();
+      u64 *dst_pdpt = alloc_page_table_try();
+
+      if (!dst_pdpt) {
+        failed = 1;
+        break;
+      }
       dst_pml4[i] = table_to_phys(dst_pdpt) | (src_pml4[i] & ~PAGE_ENTRY_ADDRESS_MASK);
-      clone_table(src_pdpt, dst_pdpt, 1);
+      if (clone_table(src_pdpt, dst_pdpt, 1) != 0)
+        failed = 1;
     }
   }
 
@@ -3063,6 +3118,13 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
       tlb_shootdown_current_mm();
   }
 
+  if (failed) {
+    /* Give back everything the half-made space holds -- its tables and the
+     * references it took on the parent's pages -- and report the failure. The
+     * parent's pages are marked COW by now, which is correct either way. */
+    paging_free_address_space(dst_pml4_phys);
+    return 0;
+  }
   return dst_pml4_phys;
 }
 

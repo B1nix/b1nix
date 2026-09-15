@@ -2953,6 +2953,14 @@ smoke:
 	@echo "Running parallel full smoke tests for $(ARCH)..."
 	sh tests/smoke.sh $(ARCH)
 
+# Filesystem writes judged by the filesystems' own tools: ext4 and btrfs are
+# written from every guest CPU, then e2fsck, btrfs check and a host-side
+# extraction compare every file against the guest's manifest. SMP/MEM_MB/
+# SOAK_SCALE tune the load; run it alone (concurrent QEMUs starve each other).
+.PHONY: fsverify
+fsverify:
+	sh tools/run/soak/fsverify.sh $(FSVERIFY_NAME)
+
 smoke-quick:
 	@echo "Running quick smoke tests for $(ARCH)..."
 	SMOKE_QUICK=1 sh tests/smoke.sh $(ARCH)

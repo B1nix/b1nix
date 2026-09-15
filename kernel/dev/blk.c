@@ -184,6 +184,7 @@ static void bcache_hash_remove(i32 idx) {
 static void bcache_hash_insert(i32 idx) {
   struct block_buffer *b = &block_cache[idx];
   u32 h = bcache_bucket(b->bdev, b->block_no);
+
   b->hash_next = bcache_hash[h];
   bcache_hash[h] = idx;
 }
@@ -1177,8 +1178,15 @@ static usize bcache_writeback_run(usize anchor, u64 *flags_inout) {
   /* Walk back to the first block of the contiguous dirty region before
    * extending forward. The anchor is whichever slot the caller landed on,
    * which is usually the MIDDLE of a run: starting the command there splits
-   * one filesystem block into two device writes. */
-  for (usize back = 0; back < run_max && base > 0; back++) {
+   * one filesystem block into two device writes.
+   *
+   * At most run_max - 1 blocks back, so the anchor itself is still inside the
+   * run the forward loop builds. Walking the full run_max put the anchor one
+   * block past the end of the write, and the eviction caller clears DIRTY on
+   * the anchor whether or not the run reached it: that block's contents were
+   * dropped, and the next read of it returned what the disk held before. One
+   * lost metadata block is what `btrfs check` reports as a csum mismatch. */
+  for (usize back = 0; back + 1 < run_max && base > 0; back++) {
     struct block_buffer *e = bcache_find(wdev, base - 1);
 
     if (!e || !(e->flags & BLK_CACHE_DIRTY) || (e->flags & BLK_CACHE_BUSY))
@@ -1284,7 +1292,17 @@ static struct block_buffer *bcache_evict(u64 *flags_inout) {
      * pressure — a documented limitation. The sync/fsync path in
      * blk_flush_buffer keeps DIRTY on failure so explicit syncs don't lose
      * data silently (R3-13). */
-    bcache_writeback_run((usize)oldest_idx, flags_inout);
+    usize wrote = bcache_writeback_run((usize)oldest_idx, flags_inout);
+
+    /* A run that landed but did not cover this block leaves it dirty, and
+     * recycling it here would drop it. Hand the caller nothing instead: the
+     * retry sweeps the hand on and takes a different victim. A run that
+     * FAILED is the documented loss above -- the slot is recycled either way,
+     * because a device that refuses writes would otherwise spin here. */
+    if (wrote > 0 && (entry->flags & BLK_CACHE_DIRTY)) {
+      entry->flags &= ~BLK_CACHE_BUSY;
+      return 0;
+    }
     entry->flags &= ~(BLK_CACHE_DIRTY | BLK_CACHE_BUSY);
   }
   /* Unlink from its old hash chain — its (bdev, block_no) is about to be

@@ -300,14 +300,19 @@ static struct buffer_head *getblk_common(struct block_device *bdev,
 	bh = bh_in_folio(folio, offset, size);
 	if (!bh) {
 		/*
-		 * The folio is already divided a different way. Upstream grows a new
-		 * page for the new size; here the mismatch means two block sizes on
-		 * one device, which neither filesystem does after mount — and
-		 * silently returning a buffer of the wrong size would corrupt it.
+		 * The folio is divided for a different block size: the leftovers of
+		 * an earlier mount of the same device. Free that division and build
+		 * the one being asked for, which is what upstream does before it
+		 * grows a folio. try_to_free_buffers refuses while any buffer is
+		 * dirty, locked or held, so a size still in use is never dropped.
 		 */
-		folio_unlock(folio);
-		folio_put(folio);
-		return NULL;
+		if (!create || !try_to_free_buffers(folio) ||
+		    !folio_create_buffers(folio, size, 0) ||
+		    !(bh = bh_in_folio(folio, offset, size))) {
+			folio_unlock(folio);
+			folio_put(folio);
+			return NULL;
+		}
 	}
 	if (!bh->b_bdev) {
 		bh->b_bdev = bdev;

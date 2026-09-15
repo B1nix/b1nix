@@ -67,3 +67,14 @@ inittab under `b1nix.i915sway`.
   `tools/run/pxe-serve.sh <iso-stage>` and collect the log with
   `b1nix.netconsole=<host>:<port>`. A root module has to fit below 4 GiB for
   Limine, so the live root is packed tight (ext4, ~340 MiB).
+
+## The uncore->lock probe lockup (unreproducible)
+
+Roughly one passthrough boot in five used to die with `SPINLOCK LOCKUP` on
+`uncore->lock` early in probe. On 2026-09-16 it did not reproduce in 30
+probe-only boots on the current kernel, nor in 30 on a kernel from before that
+day's work, so no fix can be claimed for it and there is nothing to test
+against. The loop that produced those numbers: a probe-only ISO
+(`b1nix.i915sway b1nix.drm-probe-only b1nix.drm-debug console=hvc0`) booted
+through `tools/run/run-i915-passthrough.sh`, graded on `I915-SWAY: probe only,
+done` against `lockup|spin_lock_stuck|KERNEL PANIC`.

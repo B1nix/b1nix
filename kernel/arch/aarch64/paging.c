@@ -6,6 +6,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/sched.h>
+#include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/user.h>
@@ -158,14 +159,22 @@ static void tlb_flush_page(u64 va) {
                     : "memory");
 }
 
-static u64 *alloc_table(void) {
+static u64 *alloc_table_try(void) {
   u64 frame = pmm_alloc_frame();
-  if (!frame) {
-    panic("aarch64 vmm: OOM allocating page table");
-  }
+  if (!frame)
+    return 0;
   u64 *table = phys_to_virt(frame);
   memset(table, 0, PAGE_SIZE);
   return table;
+}
+
+/* For the maps that cannot fail: the kernel's own. */
+static u64 *alloc_table(void) {
+  u64 *t = alloc_table_try();
+
+  if (!t)
+    panic("aarch64 vmm: OOM allocating page table");
+  return t;
 }
 
 static u64 *table_from_entry(u64 entry) {
@@ -234,7 +243,10 @@ static u64 *ensure_child(u64 *parent, usize index, int parent_level) {
     parent[index] = virt_to_phys(child) | D_TABLE;
     return child;
   }
-  u64 *child = alloc_table();
+  u64 *child = alloc_table_try();
+
+  if (!child)
+    return 0;
   parent[index] = virt_to_phys(child) | D_TABLE;
   return child;
 }
@@ -447,22 +459,30 @@ void vmm_init(void) {
   console_write("aarch64: vmm_init (real per-process 4-level paging active)\n");
 }
 
-static void map_page_locked(u64 virtual_address, u64 physical_address,
-                            u64 flags) {
+/* Returns 0, or -1 when a page table could not be allocated. */
+static int map_page_locked(u64 virtual_address, u64 physical_address,
+                           u64 flags) {
   u64 *l0 = get_l0_for_va(virtual_address);
   u64 *l1 = ensure_child(l0, l0_index(virtual_address), 0);
-  u64 *l2 = ensure_child(l1, l1_index(virtual_address), 1);
-  u64 *l3 = ensure_child(l2, l2_index(virtual_address), 2);
+  u64 *l2 = l1 ? ensure_child(l1, l1_index(virtual_address), 1) : 0;
+  u64 *l3 = l2 ? ensure_child(l2, l2_index(virtual_address), 2) : 0;
+
+  if (!l3)
+    return -1;
   l3[l3_index(virtual_address)] = encode_leaf(physical_address, flags | VMM_PRESENT);
   tlb_flush_page(virtual_address);
+  return 0;
 }
 
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
   u64 f;
+  int rc;
 
   vmm_write_acquire(&f);
-  map_page_locked(virtual_address, physical_address, flags);
+  rc = map_page_locked(virtual_address, physical_address, flags);
   vmm_write_release(f);
+  if (rc)
+    panic("aarch64 vmm: OOM during page table allocation");
 }
 
 void vmm_unmap_page(u64 virtual_address) {
@@ -1154,13 +1174,22 @@ void paging_unmap_range_from_space(u64 pml4_phys, u64 base, usize npages) {
   vmm_write_release(f);
 }
 
-void vmm_map_range(u64 base, const u64 *frames, usize n, u64 flags) {
+int vmm_map_range_try(u64 base, const u64 *frames, usize n, u64 flags) {
   u64 f;
+  int rc = 0;
 
+  if (!frames || n == 0)
+    return 0;
   vmm_write_acquire(&f);
-  for (usize i = 0; i < n; i++)
-    map_page_locked(base + i * PAGE_SIZE, frames[i], flags);
+  for (usize i = 0; i < n && !rc; i++)
+    rc = map_page_locked(base + i * PAGE_SIZE, frames[i], flags);
   vmm_write_release(f);
+  return rc ? -ENOMEM : 0;
+}
+
+void vmm_map_range(u64 base, const u64 *frames, usize n, u64 flags) {
+  if (vmm_map_range_try(base, frames, n, flags) != 0)
+    panic("aarch64 vmm: OOM during page table allocation");
 }
 
 /* Unmap a range and hand back the frames the caller now owns.

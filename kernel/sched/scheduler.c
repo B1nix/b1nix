@@ -1566,6 +1566,14 @@ static void sched_handoff_recover(struct task *t, const char *where) {
   if (t && __atomic_load_n(&g_task_switching_out[task_index(t)],
                            __ATOMIC_ACQUIRE))
     return;
+  /* Nor one that is executing: its context is live, not saved. The callers
+   * test this in their wait loop, but the test belongs here too -- this is the
+   * one place that publishes a lease without a context switch behind it, and
+   * the exclusivity argument (only the CPU that wins the lease CAS may load a
+   * task's context) rests on the lease being published only for a task that is
+   * neither mid-switch nor running. */
+  if (t && task_running_somewhere(t))
+    return;
   if (!reported) {
     reported = 1;
     console_write("sched: stale kernel-stack lease (");
@@ -2895,6 +2903,27 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
       ctid_staged = 1;
   }
   child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
+  if (!child->pml4_phys) {
+    /* No memory for the child's page tables: a fork that cannot be made is an
+     * error, not a dead kernel. Only what this function has given the child so
+     * far goes back -- its own name, its reference on the parent's image, and
+     * its kernel stack. Its credentials are still the parent's (task_init_cred
+     * runs later), and freeing those was a double free of the parent's. */
+    if (child->user_image) {
+      user_image_free(child->user_image);
+      child->user_image = 0;
+    }
+    child->cred = 0;
+    if (child->name) {
+      kfree((void *)child->name);
+      child->name = 0;
+    }
+    kfree(child_stack);
+    child->stack = 0;
+    interrupts_enable();
+    free_task_slot(child);
+    return -ENOMEM;
+  }
 
   /* paging_clone_address_space just flipped every writable user page in the
    * PARENT's page tables to read-only/COW, but the parent keeps running on the
@@ -4041,6 +4070,8 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
     extern void paging_reload_cr3(void);
     extern void tlb_shootdown_current_mm(void);
     child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
+    if (!child->pml4_phys)
+      goto clone_nomem;
     /* The clone flipped the parent's writable user pages to COW in place, and
      * every CPU that has one of those translations cached must be told —
      * not merely this one.
@@ -4115,6 +4146,14 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
     kfree(kstack);
     kfree(cta);
     return -EINVAL;
+  }
+  if (0) {
+clone_nomem:
+    /* The COW copy of the address space could not be made. */
+    free_task_slot(child);
+    kfree(kstack);
+    kfree(cta);
+    return -ENOMEM;
   }
 
   /* FD-table inheritance. */
@@ -4644,6 +4683,37 @@ static int scheduler_yield_inner(void) {
      * store, so other CPUs observe "READY but not yet released" and skip. */
     task_lease_clear(old_task, __func__);
     old_task->state = TASK_READY;
+  }
+
+  /* One task, one CPU.
+   *
+   * Every pick path is supposed to guarantee this -- the lease CAS, the
+   * running-somewhere test, the mid-switch flag -- but the failure it guards
+   * against is silent: the second CPU resumes on a stack the first is still
+   * using, both push frames over each other, and the fault lands wherever the
+   * overwritten return address points, with nothing left to say why. The test
+   * is a walk of at most MAX_CPUS pointers, once per switch, and it names the
+   * two CPUs while the evidence is still on the stack. */
+  if (new_task != old_task) {
+    struct percpu *self = get_percpu();
+    int self_id = self ? self->cpu_id : -1;
+
+    for (int c = 0; c < g_max_cpus; c++) {
+      struct percpu *pc = get_percpu_n(c);
+
+      if (!pc || c == self_id || (struct task *)pc->cur_task != new_task)
+        continue;
+      console_write("sched: pid ");
+      console_write_dec((u64)new_task->id);
+      console_write(" name=");
+      console_write(new_task->name ? new_task->name : "(none)");
+      console_write(" is already current on cpu ");
+      console_write_dec((u64)c);
+      console_write("; cpu ");
+      console_write_dec((u64)self_id);
+      console_write(" was about to run it too\n");
+      panic("two CPUs on one task");
+    }
   }
 
   /* Catch a corrupted kernel-stack pointer AT the switch instead of letting

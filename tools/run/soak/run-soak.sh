@@ -127,6 +127,7 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
 	-drive file="$ROOT_IMG",format=raw,if=virtio,snapshot=on \
 	-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 	$SOAK_GPU_ARGS \
+	${SOAK_EXTRA_ARGS:-} \
 	-vga none -display none \
 	-serial stdio \
 	-no-reboot \

@@ -257,6 +257,81 @@ soak_gfx() {
 	[ "$alive" = 1 ] && [ "$failures" = 0 ]
 }
 
+# Filesystem writes judged from outside.
+#
+# The host attaches an ext4 disk (labelled b1nix-fsv-ext4) and a btrfs disk
+# (b1nix-fsv-btrfs). Writers on every CPU create, rewrite in place, truncate,
+# rename and delete files of random sizes; at the end the survivors' checksums
+# are printed as `FSV-MAN <fs> <sha256> <path>` and the filesystem is
+# unmounted. Nothing here decides the verdict: the host runs e2fsck and
+# btrfs check on the images and compares every file it extracts from them --
+# without this kernel's code in the path -- against the manifest.
+fsv_writer() {
+	dir=$1; id=$2; n=$3
+	k=0
+	while [ $k -lt $n ]; do
+		f=$dir/w$id-$k
+		dd if=/dev/urandom of=$f bs=4096 count=$((1 + RANDOM % 48)) 2>/dev/null || return 1
+		case $((k % 7)) in
+		1) dd if=/dev/urandom of=$f bs=512 seek=$((RANDOM % 64)) count=$((1 + RANDOM % 32)) conv=notrunc 2>/dev/null || return 1 ;;
+		2) [ -f $dir/w$id-$((k - 1)) ] && { mv $dir/w$id-$((k - 1)) $dir/r$id-$k || return 1; } ;;
+		3) truncate -s $((RANDOM * 3)) $f 2>/dev/null || dd if=/dev/null of=$f bs=1 seek=$((RANDOM * 3)) 2>/dev/null ;;
+		4) rm -f $dir/w$id-$((k - 3)) ;;
+		5) cat $f $f > $f.cat && mv $f.cat $f || return 1 ;;
+		esac
+		k=$((k + 1))
+	done
+	return 0
+}
+
+soak_fsverify() {
+	cpus=$(grep -c ^processor /proc/cpuinfo 2>/dev/null)
+	threads=${SOAK_THREADS:-$cpus}
+	n=$((60 * SOAK_SCALE / 100))
+	rc=0
+	for fs in ext4 btrfs; do
+		dev=$(blkid 2>/dev/null | grep "LABEL=\"b1nix-fsv-$fs\"" | cut -d: -f1)
+		if [ -z "$dev" ]; then
+			echo "SOAK-FSVERIFY: fail no disk labelled b1nix-fsv-$fs"
+			return 1
+		fi
+		mnt=/mnt/fsv-$fs
+		mkdir -p $mnt
+		mount -t $fs $dev $mnt || { echo "SOAK-FSVERIFY: fail mount $fs $dev"; return 1; }
+		mkdir -p $mnt/d
+		pids=""
+		t=0
+		while [ $t -lt $threads ]; do
+			fsv_writer $mnt/d $t $n &
+			pids="$pids $!"
+			t=$((t + 1))
+		done
+		for p in $pids; do
+			wait $p || { echo "SOAK-FSVERIFY: fail writer on $fs"; rc=1; }
+		done
+		sync
+		(cd $mnt/d && find . -type f | sort | while read -r f; do
+			echo "FSV-MAN $fs $(sha256sum < "$f" | cut -d' ' -f1) ${f#./}"
+		done)
+		echo "FSV-FILES $fs $(find $mnt/d -type f | wc -l)"
+		# Read everything back through a fresh mount: the filesystem checks its
+		# own checksums on the way, so a block that disagrees with its checksum
+		# is reported by the guest and not only by the host's fsck.
+		if umount $mnt && mount -t $fs $dev $mnt; then
+			__bad=0
+			for f in $(find $mnt/d -type f); do
+				cat "$f" > /dev/null 2>>/tmp/fsv-reread-$fs.err || __bad=$((__bad + 1))
+			done
+			echo "FSV-REREAD $fs unreadable=$__bad"
+		else
+			echo "FSV-REREAD $fs remount-failed"
+		fi
+		umount $mnt || { echo "SOAK-FSVERIFY: fail umount $fs"; rc=1; }
+	done
+	sync
+	return $rc
+}
+
 for w in $(echo "$SPEC" | tr ',' ' '); do
 	case "$w" in
 	all)
@@ -293,6 +368,7 @@ for w in $(echo "$SPEC" | tr ',' ' '); do
 	# hundreds of small programs, so a startup that is milliseconds too slow is
 	# minutes across a run.
 	exec)  run_one exec soak_exec ;;
+	fsverify) run_one fsverify soak_fsverify ;;
 	gfx)   run_one gfx   soak_gfx ;;
 	# vm-<ops>: the same address-space workload with only some of its
 	# operations, for bisecting which one a fault needs. The list is passed

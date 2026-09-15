@@ -33,6 +33,13 @@
 /* ── the registry ───────────────────────────────────────────────── */
 
 static struct file_system_type *file_systems;
+/* Guards every type's fs_supers list: mounts add to it, unmounts remove from
+ * it, and the memory reclaimer walks it from kswapd. */
+static DEFINE_MUTEX(sb_instances_lock);
+unsigned long lkpi_fs_reclaim(unsigned long want);
+/* b1nix's frame allocator: who to ask for file pages when its own cache is
+ * empty. */
+extern void pmm_set_fs_reclaim(unsigned long (*fn)(unsigned long));
 static spinlock_t fs_type_lock;
 static int fs_type_lock_ready;
 
@@ -210,6 +217,7 @@ static struct super_block *alloc_super(struct file_system_type *type, int flags)
 
 	if (!sb)
 		return NULL;
+	pmm_set_fs_reclaim(lkpi_fs_reclaim);
 
 	INIT_LIST_HEAD(&sb->s_list);
 	INIT_LIST_HEAD(&sb->s_inodes);
@@ -274,6 +282,7 @@ struct super_block *sget(struct file_system_type *type,
 	int err;
 
 	if (test) {
+		mutex_lock(&sb_instances_lock);
 		hlist_for_each_entry(sb, &type->fs_supers, s_instances) {
 			if (!test(sb, data))
 				continue;
@@ -281,9 +290,11 @@ struct super_block *sget(struct file_system_type *type,
 			 * held, which is the state the caller expects from either
 			 * branch. */
 			atomic_inc(&sb->s_active);
+			mutex_unlock(&sb_instances_lock);
 			down_write(&sb->s_umount);
 			return sb;
 		}
+		mutex_unlock(&sb_instances_lock);
 	}
 
 	sb = alloc_super(type, flags);
@@ -297,7 +308,9 @@ struct super_block *sget(struct file_system_type *type,
 		}
 	}
 	down_write(&sb->s_umount);
+	mutex_lock(&sb_instances_lock);
 	hlist_add_head(&sb->s_instances, &type->fs_supers);
+	mutex_unlock(&sb_instances_lock);
 	return sb;
 }
 
@@ -311,13 +324,16 @@ struct super_block *sget_fc(struct fs_context *fc,
 	int err;
 
 	if (test) {
+		mutex_lock(&sb_instances_lock);
 		hlist_for_each_entry(sb, &fc->fs_type->fs_supers, s_instances) {
 			if (!test(sb, fc))
 				continue;
 			atomic_inc(&sb->s_active);
+			mutex_unlock(&sb_instances_lock);
 			down_write(&sb->s_umount);
 			return sb;
 		}
+		mutex_unlock(&sb_instances_lock);
 	}
 
 	sb = alloc_super(fc->fs_type, (int)fc->sb_flags);
@@ -336,7 +352,9 @@ struct super_block *sget_fc(struct fs_context *fc,
 	/* The superblock owns it now; a later free of the context must not. */
 	fc->s_fs_info = NULL;
 	down_write(&sb->s_umount);
+	mutex_lock(&sb_instances_lock);
 	hlist_add_head(&sb->s_instances, &fc->fs_type->fs_supers);
+	mutex_unlock(&sb_instances_lock);
 	return sb;
 }
 
@@ -367,8 +385,99 @@ void generic_shutdown_super(struct super_block *sb)
 			sb->s_op->put_super(sb);
 	}
 	sb->s_flags &= ~SB_ACTIVE;
+	mutex_lock(&sb_instances_lock);
 	if (!hlist_unhashed(&sb->s_instances))
 		hlist_del_init(&sb->s_instances);
+	mutex_unlock(&sb_instances_lock);
+}
+
+/*
+ * Give cached file pages back to the frame allocator.
+ *
+ * The filesystems keep their file data in these mappings, and nothing ever
+ * shrank them: a guest that wrote a few hundred megabytes through ext4 or btrfs
+ * ran out of frames with all of it still cached, and a fork's page table
+ * allocation then had nothing to take. Called from kswapd when the kernel's
+ * own page cache has nothing left to evict.
+ *
+ * A folio goes only when it is clean, not under writeback, holds no reference
+ * beyond the mapping's and ours, and its filesystem agrees to let go of its
+ * private state (buffer heads, extent maps) -- upstream's mapping_evict_folio.
+ * An unmount holds s_umount for write, so a superblock whose read side cannot
+ * be taken without waiting is skipped.
+ */
+static unsigned long reclaim_mapping(struct address_space *mapping,
+                                    unsigned long want)
+{
+	unsigned long index = 0, dropped = 0;
+	struct folio *folio;
+
+	while (dropped < want &&
+	       (folio = filemap_get_folio_ge(mapping, &index)) != NULL) {
+		if (folio_trylock(folio)) {
+			if (folio->mapping == mapping && !folio_test_dirty(folio) &&
+			    !folio_test_writeback(folio) &&
+			    (!folio_get_private(folio) ||
+			     filemap_release_folio(folio, GFP_NOFS)) &&
+			    !folio_get_private(folio) &&
+			    folio_ref_count(folio) <= 2) {
+				filemap_remove_folio(folio);
+				dropped++;
+			}
+			folio_unlock(folio);
+		}
+		folio_put(folio);
+		if (++index == 0)
+			break;
+	}
+	return dropped;
+}
+
+unsigned long lkpi_fs_reclaim(unsigned long want)
+{
+	struct file_system_type *type;
+	unsigned long dropped = 0;
+
+	mutex_lock(&sb_instances_lock);
+	for (type = file_systems; type && dropped < want; type = type->next) {
+		struct super_block *sb;
+
+		hlist_for_each_entry(sb, &type->fs_supers, s_instances) {
+			struct inode *inode, *held = NULL;
+			unsigned long flags;
+
+			if (dropped >= want)
+				break;
+			if (!(sb->s_flags & SB_ACTIVE) || !down_read_trylock(&sb->s_umount))
+				continue;
+			spin_lock_irqsave(&sb->s_inode_list_lock, flags);
+			list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+				struct inode *got;
+
+				if (dropped >= want)
+					break;
+				if (!inode->i_mapping || !inode->i_mapping->nrpages)
+					continue;
+				got = igrab(inode);
+				if (!got)
+					continue;
+				spin_unlock_irqrestore(&sb->s_inode_list_lock, flags);
+				/* The previous inode's reference is dropped outside the
+				 * list lock; the one held now keeps our place in the list. */
+				if (held)
+					iput(held);
+				held = got;
+				dropped += reclaim_mapping(got->i_mapping, want - dropped);
+				spin_lock_irqsave(&sb->s_inode_list_lock, flags);
+			}
+			spin_unlock_irqrestore(&sb->s_inode_list_lock, flags);
+			if (held)
+				iput(held);
+			up_read(&sb->s_umount);
+		}
+	}
+	mutex_unlock(&sb_instances_lock);
+	return dropped;
 }
 
 void deactivate_locked_super(struct super_block *sb)
@@ -400,6 +509,9 @@ void kill_block_super(struct super_block *sb)
 		/* The device is released after the filesystem is done with it, never
 		 * before: put_super writes the last of the metadata. */
 		sync_blockdev(bdev);
+		/* And forget the device's cached pages: they belong to the block size
+		 * this filesystem chose, and the next mount must not find them. */
+		invalidate_bdev(bdev);
 		blkdev_put(bdev, sb);
 		sb->s_bdev = NULL;
 	}
@@ -448,6 +560,10 @@ static int test_bdev_super(struct super_block *sb, void *data)
  * opened first (so a bad path fails before anything is allocated), the
  * superblock is filled second, and only a successful fill publishes a root.
  */
+/* Which step of the last failed mount gave up: 1 the device, 2 the superblock,
+ * 3 the filesystem's own fill_super. Reported with the error by the caller. */
+int lkpi_mount_stage;
+
 int get_tree_bdev(struct fs_context *fc,
                   int (*fill_super)(struct super_block *sb,
                                     struct fs_context *fc))
@@ -462,12 +578,15 @@ int get_tree_bdev(struct fs_context *fc,
 
 	mode = sb_open_mode(fc->sb_flags);
 	bdev = blkdev_get_by_path(fc->source, mode, fc, &fs_holder_ops);
-	if (IS_ERR(bdev))
+	if (IS_ERR(bdev)) {
+		lkpi_mount_stage = 1;
 		return PTR_ERR(bdev);
+	}
 
 	sb = sget(fc->fs_type, test_bdev_super, set_bdev_super,
 	          (int)fc->sb_flags, bdev);
 	if (IS_ERR(sb)) {
+		lkpi_mount_stage = 2;
 		blkdev_put(bdev, fc);
 		return PTR_ERR(sb);
 	}
@@ -489,6 +608,7 @@ int get_tree_bdev(struct fs_context *fc,
 
 	err = fill_super(sb, fc);
 	if (err) {
+		lkpi_mount_stage = 3;
 		deactivate_locked_super(sb);
 		return err;
 	}

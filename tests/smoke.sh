@@ -1918,6 +1918,8 @@ check_output "$LOG" "M14-SMOKE: ok mount-ext4-nvme" "mount nvme0n1 as ext4 succe
 check_output "$LOG" "M14-SMOKE: ok ext4-persistence" "ext4 read, write, and remount persistence verified"
 check_output "$LOG" "M14-SMOKE: ok ext4-churn-cache" "files written in chunks and renamed over their previous versions read back exactly (freed inodes reused)"
 check_output "$LOG" "M14-SMOKE: ok ext4-churn-disk" "the same churned files read back exactly from the disk after a remount"
+check_output "$LOG" "M14-SMOKE: ok ext4-bigdir" "a 400-entry ext4 directory lists every name, before and after a remount"
+check_output "$LOG" "M14-SMOKE: ok ext4-truncate-tail" "truncating into the middle of a page keeps the bytes below the cut"
 check_output "$LOG" "M14-SMOKE: ok ext4-shared-mmap-durable" "a file filled through a shared mapping (ftruncate, store, sync mid-way, munmap) reaches the disk intact"
 check_output "$LOG" "M14-SMOKE: ok ext4-fifo-persistence" "a FIFO created with mkfifo is a real ext4 inode and survives umount/mount"
 check_output "$LOG" "M14-SMOKE: ok block-cache" "cached read and dirty write verified"

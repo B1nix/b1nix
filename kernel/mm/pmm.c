@@ -93,6 +93,14 @@ static usize kswapd_high_watermark(void) {
 
 static void pmm_scrub_quarantine(void);
 
+/* File pages held by imported filesystems (linuxkpi mappings), which the
+ * kernel's own page cache knows nothing about. */
+static unsigned long (*pmm_fs_reclaim)(unsigned long want);
+
+void pmm_set_fs_reclaim(unsigned long (*fn)(unsigned long)) {
+  pmm_fs_reclaim = fn;
+}
+
 static void kswapd_thread(void *arg) {
   (void)arg;
   for (;;) {
@@ -110,6 +118,8 @@ static void kswapd_thread(void *arg) {
       pmm_enter_reclaim();
       usize ev = page_cache_evict(batch);
       pmm_leave_reclaim();
+      if (ev < batch && pmm_fs_reclaim)
+        ev += (usize)pmm_fs_reclaim(batch - ev);
       if (ev == 0)
         break;
       scheduler_yield();

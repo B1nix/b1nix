@@ -167,6 +167,13 @@ static struct folio *filemap_find_get(struct address_space *mapping,
 	return folio;
 }
 
+/* The first cached folio at or after *index, with a reference. */
+struct folio *filemap_get_folio_ge(struct address_space *mapping,
+                                   unsigned long *index)
+{
+	return mapping ? filemap_find_get(mapping, index, ULONG_MAX) : NULL;
+}
+
 struct folio *filemap_get_folio(struct address_space *mapping, pgoff_t index)
 {
 	unsigned long at = index;
@@ -621,6 +628,11 @@ unsigned long invalidate_mapping_pages(struct address_space *mapping,
 	/* Over the entries, for the reason in truncate_inode_pages_range. */
 	while ((folio = filemap_find_get(mapping, &index, end)) != NULL) {
 		if (folio_trylock(folio)) {
+			/* Let the filesystem drop what hangs off the folio first --
+			 * buffer heads, extent state -- or the folio goes and they stay. */
+			if (folio_get_private(folio) && !folio_test_dirty(folio) &&
+			    !folio_test_writeback(folio))
+				filemap_release_folio(folio, GFP_NOFS);
 			/* Only CLEAN folios: an invalidate must not lose a write that
 			 * has not reached the disk. A dirty one is left alone, which is
 			 * why this returns a count rather than succeeding. */

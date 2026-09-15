@@ -505,7 +505,20 @@ int sync_blockdev_range(struct block_device *bdev, loff_t lstart, loff_t lend)
 
 void invalidate_bdev(struct block_device *bdev)
 {
-	if (bdev && bdev->bd_b1nix)
+	if (!bdev)
+		return;
+	/*
+	 * The device's own page cache goes too, not only b1nix's block cache.
+	 * Those folios carry the buffer heads a filesystem reads its metadata
+	 * through, and they are sized for the block size that filesystem chose.
+	 * Left behind after an unmount, the next mount finds a folio whose
+	 * buffers are the wrong size, gets NULL from __getblk, and reports
+	 * ENOMEM -- an unmount followed by a mount of the same device failed
+	 * every time, with hundreds of megabytes free.
+	 */
+	if (bdev->bd_inode && bdev->bd_inode->i_mapping)
+		invalidate_mapping_pages(bdev->bd_inode->i_mapping, 0, (pgoff_t)-1);
+	if (bdev->bd_b1nix)
 		lkpi_blk_invalidate(bdev->bd_b1nix);
 }
 

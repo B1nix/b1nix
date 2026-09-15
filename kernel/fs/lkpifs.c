@@ -361,9 +361,14 @@ static struct vfs_node *lkpifs_mount_type(const char *linux_name,
 	root_handle = lkpi_bridge_mount(linux_name, source,
 	                                (flags & MS_RDONLY) ? 1ul : 0ul);
 	if (!root_handle) {
+		extern int lkpi_bridge_last_mount_error;
+		extern int lkpi_mount_stage;
+
 		snprintf(msg, sizeof(msg),
-		         "lkpifs: %s could not mount %s through the imported code",
-		         linux_name, source);
+		         "lkpifs: %s could not mount %s through the imported code "
+		         "(err %d at stage %d)",
+		         linux_name, source, lkpi_bridge_last_mount_error,
+		         lkpi_mount_stage);
 		klog_warn(msg);
 		return ERR_PTR(-EINVAL);
 	}

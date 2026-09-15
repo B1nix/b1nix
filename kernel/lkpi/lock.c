@@ -341,15 +341,29 @@ void lkpi_spin_unlock(struct lkpi_spinlock *l)
 		console_write_dec((u64)percpu_read(cpu_id));
 		console_write("\n");
 	}
-	/* Counted on the CPU releasing it: interrupts have been off since the
-	 * outermost acquire, so that is the CPU that took it. */
+	/* Counted back on the CPU that TOOK it, not the one releasing it.
+	 *
+	 * Releasing on another CPU is a violation (reported above), but it does
+	 * happen, and crediting the release to the wrong CPU left the acquiring
+	 * CPU's count positive for the rest of the boot. Everything keyed on that
+	 * count then described a machine that did not exist: the next task to
+	 * yield on that CPU was told it held a linuxkpi spinlock and the scheduler
+	 * panicked naming it, though the lock belonged to a task that had let go
+	 * of it long before, and the interrupt-restore path below stopped firing
+	 * because the count never reached zero again.
+	 */
 	u32 here = percpu_read(cpu_id);
+	u32 owner = (cpu >= 0 && (u32)cpu < MAX_CPUS) ? (u32)cpu : here;
 	int last = 1;
 
-	if (here < MAX_CPUS && lkpi_locks_held[here] > 0) {
-		lkpi_locks_held[here]--;
-		last = lkpi_locks_held[here] == 0;
-		f = last ? lkpi_irq_saved[here] : 0;
+	if (owner < MAX_CPUS && lkpi_locks_held[owner] > 0) {
+		lkpi_locks_held[owner]--;
+		last = lkpi_locks_held[owner] == 0;
+		/* The saved state belongs to the CPU that turned interrupts off. On
+		 * the CPU that took the lock that is the recorded word; anywhere else
+		 * only this lock's own flags describe what to go back to. */
+		if (last && owner == here)
+			f = lkpi_irq_saved[owner];
 	}
 	l->flags = 0;
 	l->owner_cpu = -1;

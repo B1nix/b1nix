@@ -640,6 +640,110 @@ int main(int argc, char **argv) {
     rmdir("/mnt/ext4/churn");
   }
 
+  /* A directory larger than one getdents batch, listed whole.
+   *
+   * ext4 hands out a hash as the directory cursor, and half of those hashes
+   * used to collide with the bit the VFS cursor keeps for its own phase: the
+   * listing stopped at the first such name and the rest of the directory was
+   * invisible while every file in it opened by name. Counted after a remount
+   * as well, so the answer cannot come from anything cached. */
+  {
+    enum { BIGDIR_FILES = 400 };
+    int made = 0;
+
+    mkdir("/mnt/ext4/bigdir", 0755);
+    for (int i = 0; i < BIGDIR_FILES; i++) {
+      char path[64];
+
+      snprintf(path, sizeof(path), "/mnt/ext4/bigdir/file-%03d", i);
+      int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+      if (fd >= 0) {
+        made++;
+        close(fd);
+      }
+    }
+    sync();
+    int seen = 0, seen_after = 0;
+    DIR *d = opendir("/mnt/ext4/bigdir");
+    if (d) {
+      struct dirent *e;
+
+      while ((e = readdir(d)) != NULL)
+        if (strncmp(e->d_name, "file-", 5) == 0)
+          seen++;
+      closedir(d);
+    }
+    if (umount("/mnt/ext4") == 0 &&
+        mount("sda", "/mnt/ext4", "ext4", 0, NULL) == 0) {
+      d = opendir("/mnt/ext4/bigdir");
+      if (d) {
+        struct dirent *e;
+
+        while ((e = readdir(d)) != NULL)
+          if (strncmp(e->d_name, "file-", 5) == 0)
+            seen_after++;
+        closedir(d);
+      }
+    }
+    char msg[128];
+    if (made == BIGDIR_FILES && seen == BIGDIR_FILES &&
+        seen_after == BIGDIR_FILES) {
+      marker("M14-SMOKE: ok ext4-bigdir\n");
+    } else {
+      snprintf(msg, sizeof(msg),
+               "M14-SMOKE: fail ext4-bigdir made=%d listed=%d after-remount=%d\n",
+               made, seen, seen_after);
+      marker(msg);
+    }
+    for (int i = 0; i < BIGDIR_FILES; i++) {
+      char path[64];
+
+      snprintf(path, sizeof(path), "/mnt/ext4/bigdir/file-%03d", i);
+      unlink(path);
+    }
+    rmdir("/mnt/ext4/bigdir");
+  }
+
+  /* Truncating to the middle of a page keeps the bytes below the cut.
+   *
+   * The page holding the new end of file was dropped whole instead of having
+   * its tail zeroed, and with delayed allocation those bytes lived nowhere
+   * else: the file came back with zeros from the page boundary onwards. */
+  {
+    enum { TRUNC_KEEP = 4096 + 37 };
+    unsigned char *buf = malloc(8192);
+    int ok = 0;
+
+    if (buf) {
+      for (int i = 0; i < 8192; i++)
+        buf[i] = (unsigned char)(i * 31 + 7);
+      int fd = open("/mnt/ext4/trunc.bin", O_CREAT | O_RDWR | O_TRUNC, 0644);
+
+      if (fd >= 0) {
+        ok = write(fd, buf, 8192) == 8192 && ftruncate(fd, TRUNC_KEEP) == 0;
+        close(fd);
+      }
+      sync();
+      if (ok && umount("/mnt/ext4") == 0 &&
+          mount("sda", "/mnt/ext4", "ext4", 0, NULL) == 0) {
+        unsigned char *back = malloc(TRUNC_KEEP);
+
+        fd = open("/mnt/ext4/trunc.bin", O_RDONLY);
+        ok = fd >= 0 && back && read(fd, back, TRUNC_KEEP) == TRUNC_KEEP &&
+             memcmp(back, buf, TRUNC_KEEP) == 0;
+        if (fd >= 0)
+          close(fd);
+        free(back);
+      } else {
+        ok = 0;
+      }
+      free(buf);
+    }
+    marker(ok ? "M14-SMOKE: ok ext4-truncate-tail\n"
+              : "M14-SMOKE: fail ext4-truncate-tail\n");
+    unlink("/mnt/ext4/trunc.bin");
+  }
+
   /* Clean up */
   unlink("/mnt/ext4/large_file.txt");
   unlink("/mnt/ext4/persist.txt");

@@ -158,11 +158,15 @@ belongs to the milestone that owns the mechanism. See
 
 ## M122: Close the known corruption and SMP defects
 
-- [ ] `planned` Block cache loses the tail of a multi-sector write (found through btrfs, which now bypasses the cache; ext4 still writes through `blk_write_cached`): suspects are duplicate (dev, lba) slots from the `raced` branch and `blk_flush_matching` collecting buffers with the lock dropped. Fix the cache, then drop the btrfs bypass.
-- [ ] `planned` Double free of a `user_loaded_image` large block reaped from PID 1 (`klarge_free` ← `user_image_free` ← `scheduler_waitpid`): quiet since 09-15 without a root cause; audit the image refcount across exec, fork and clone.
-- [ ] `planned` Two CPUs picking one task (`vmstress` at `SMP=6`, 4+ threads): no longer reproduces, never proven closed; prove the switch-out/claim ordering instead of relying on the gate.
-- [ ] `planned` i915 `uncore->lock` lockup during probe in about one passthrough run in five.
-- [ ] `planned` Done when multi-CPU soak runs (1–6 CPUs) stay clean and `btrfs check` / `e2fsck` pass after stress writes that verify through `read_blocks`.
+Details and evidence: [m122-corruption-and-smp.md](m122-corruption-and-smp.md).
+
+- [x] `done` Block cache loses the tail of a multi-sector write: an unclaimed single-block writeback cleared DIRTY on data written during its DMA, invalidate zeroed slots with I/O in flight, and a sync returned before in-flight writes landed. Found with it: truncate dropping the straddling page and ext4 directories losing half their entries to a cursor bit.
+- [x] `done` Double free of a `user_loaded_image` large block from PID 1: exec installs the image before it frees the segments' staging buffers, so a reaper running `user_image_free` in that window freed the same block twice. Each site now claims the pointer with an atomic exchange. About one init-lane run in ten before, 0 in 60 after.
+- [x] `done` PMM metadata at physical 0 was overwritten by the AP start-up trampoline at 0x8000 — page-table claims on a small guest, the allocation bitmap itself on a large one. Early metadata now starts at 1 MiB.
+- [x] `done` Two CPUs picking one task: a claim is a CAS on the kernel-stack lease, and the lease is published only by the context switch (after the context is saved) or by the stale-lease recovery, which refuses a task that is mid-switch or running. At most one CPU can hold the lease, so at most one can load a task's context. 30/30 `SMP=6` soak runs.
+- [ ] `deferred` i915 `uncore->lock` lockup during probe: 0/30 boots on the current kernel and 0/30 on the kernel from before this work — it does not reproduce at all any more, so no fix can be claimed and nothing can be tested. Kept in [i915-gen9-passthrough.md](i915-gen9-passthrough.md) for the next time it appears.
+- [ ] `partial` Multi-CPU soak and the filesystems' own tools: `tools/run/soak/fsverify.sh` writes from every CPU to ext4 and btrfs, then `e2fsck`, `btrfs check --check-data-csum` and a host-side extraction compare every file against the guest's manifest, and the guest re-reads both filesystems through a fresh mount. Clean at 1, 2 and 4 CPUs and in 15/15 vm/spawn plus 2/2 `all` soak runs at 6. Two defects found at 6 CPUs and scale 300 are fixed: a write-back run could leave its anchor block outside the write while eviction cleared that block's DIRTY flag (one lost metadata block -- the `btrfs check` csum mismatch), and a device could not be mounted again after being unmounted. 10/10 heavy runs clean since, which at a two-in-thirty-one rate is not yet proof. The `#GP` through a corrupted kernel stack has not reappeared and is not explained; the switch path now names a task two CPUs are about to run.
+- [x] `done` Out of memory is an error, not a panic: heap growth, page-table allocation, `fork` and large allocations report ENOMEM.
 
 ## M123: Namespaces complete enough for containers
 
@@ -173,10 +177,12 @@ belongs to the milestone that owns the mechanism. See
 
 ## M124: Missing modern system calls
 
-- [ ] `planned` Process and threading: `openat2` (`RESOLVE_*`), `pidfd_getfd`, `kcmp`, futex2 (`futex_waitv`, `futex_wake`, `futex_wait`), `process_mrelease`, `process_madvise`, `sched_setattr`/`sched_getattr`.
-- [ ] `planned` Security: Landlock, `memfd_secret`, protection keys (`pkey_alloc`/`pkey_mprotect`), the key retention service (`keyctl`, `add_key`, `request_key`) used by systemd, ssh and NFS.
-- [ ] `planned` Filesystems and memory: `quotactl`, `statmount`/`listmount`, `cachestat`, `remap_file_pages`; `mbind` and `get_mempolicy`/`set_mempolicy` answering as a single-node Linux does.
-- [ ] `planned` Each call gets a probe in the Debian lane that checks results, not just the absence of `-ENOSYS`; the unmapped-syscall log line stays silent through Plasma and Chromium.
+Per-call state: [m124-modern-syscalls.md](m124-modern-syscalls.md).
+
+- [x] `done` Process and threading: `openat2` (`RESOLVE_*`), `pidfd_getfd`, `kcmp`, futex2 (`futex_waitv`, `futex_wake`, `futex_wait`), `process_mrelease`, `process_madvise`, `sched_setattr`/`sched_getattr`.
+- [ ] `partial` Security: the key retention service (`keyctl`, `add_key`, `request_key`) and Landlock (ABI 3, filesystem rights enforced in the VFS and on exec) are implemented; protection keys answer as a CPU without them, and `memfd_secret` is not implemented (it needs pages removed from the kernel direct map).
+- [ ] `partial` Filesystems and memory: `statmount`/`listmount` with never-reused mount ids, `cachestat`, `remap_file_pages`, and `mbind`/`get_mempolicy`/`set_mempolicy`/`set_mempolicy_home_node` with single-node semantics; `quotactl` validates its target and reports that no filesystem here has quotas.
+- [x] `done` Each call is probed in the Debian lane by its result and errno (63/63), and the unmapped-syscall log line stays silent through a Plasma session. Chromium was not run.
 
 ## M125: io_uring
 

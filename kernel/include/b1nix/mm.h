@@ -234,6 +234,8 @@ void pmm_free_frame(u64 frame);
 void pmm_note_page_table(u64 frame, int owned);
 int pmm_frame_is_page_table(u64 frame);
 u16 pmm_get_refcount(u64 frame);
+/* Reclaim hook for file pages cached outside the kernel page cache. */
+void pmm_set_fs_reclaim(unsigned long (*fn)(unsigned long));
 u64 pmm_total_usable_memory(void);
 u64 pmm_phys_total_memory(void);
 u64 pmm_free_memory_estimate(void);
@@ -293,6 +295,9 @@ usize vmm_unmap_range_nosync(u64 base, usize npages, u64 *frames_out);
 usize vmm_unmap_range_collect(u64 base, usize npages, u64 *frames_out);
 /* Map n frames starting at base, taking the page-table lock once. */
 void vmm_map_range(u64 base, const u64 *frames, usize n, u64 flags);
+/* The same, reporting -ENOMEM instead of panicking when a page table cannot be
+ * allocated. */
+int vmm_map_range_try(u64 base, const u64 *frames, usize n, u64 flags);
 /* Lazy marker plus the protection its page will get when it faults in. */
 void vmm_set_lazy_flags(u64 virtual_address, u64 flags);
 void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address);

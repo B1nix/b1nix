@@ -685,7 +685,12 @@ static int is_canonical_addr(u64 addr) {
 
 #include <b1nix/bootinfo.h>
 
-static void heap_grow(usize minimum_bytes) {
+/* Grow the heap by whole pages. Returns 0, or -1 when the frame allocator has
+ * nothing left: an allocation that cannot be served is an allocation that
+ * fails, not a dead machine -- the caller of kmalloc already has to handle
+ * NULL, and under memory pressure the OOM killer needs the kernel alive to
+ * pick a victim. */
+static int heap_grow(usize minimum_bytes) {
   static u64 grow_calls;
   usize pages = (minimum_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
   grow_calls++;
@@ -707,9 +712,8 @@ static void heap_grow(usize minimum_bytes) {
 
   for (usize i = 0; i < pages; i++) {
     u64 frame = pmm_alloc_frame();
-    if (!frame) {
-      panic("kheap: OOM during heap growth");
-    }
+    if (!frame)
+      return -1;
 
     u64 vaddr = heap.end;
     /* Growing must only ever map fresh address space. If this VA already
@@ -737,6 +741,7 @@ static void heap_grow(usize minimum_bytes) {
 
     heap.end += PAGE_SIZE;
   }
+  return 0;
 }
 
 void kheap_init(void) {
@@ -745,7 +750,8 @@ void kheap_init(void) {
   heap.end = KHEAP_START;
   heap.last_block = 0;
   for (int i = 0; i < NBUCKETS; i++) free_lists[i] = 0;
-  heap_grow(PAGE_SIZE);
+  if (heap_grow(PAGE_SIZE) != 0)
+    panic("kheap: no memory for the first heap page"); /* boot, not pressure */
 
   console_write("kheap: start 0x");
   console_write_hex64(heap.current);
@@ -997,11 +1003,14 @@ static void *klarge_alloc(usize size, u64 caller) {
   enum { KLARGE_MAP_BATCH = 256 };
   u64 map_batch[KLARGE_MAP_BATCH];
   usize batch_n = 0;
+  usize mapped = 0; /* pages whose mapping is in place, for the unwind */
 
   for (usize i = 0; i < npages; i++) {
     u64 frame = pmm_alloc_frame();
     if (!frame) {
-      for (usize j = 0; j < i; j++) {
+      mapped = i;
+klarge_oom:
+      for (usize j = 0; j < mapped; j++) {
         u64 vaddr = base + j * PAGE_SIZE;
         u64 fr = vmm_virt_to_phys((void *)(usize)vaddr);
         vmm_unmap_page(vaddr);
@@ -1023,14 +1032,26 @@ static void *klarge_alloc(usize size, u64 caller) {
      * thousands of irqsave round trips against CPUs taking faults meanwhile. */
     map_batch[batch_n++] = frame;
     if (batch_n == KLARGE_MAP_BATCH) {
-      vmm_map_range(base + (i + 1 - batch_n) * PAGE_SIZE, map_batch, batch_n,
-                    VMM_PRESENT | VMM_WRITABLE);
+      if (vmm_map_range_try(base + (i + 1 - batch_n) * PAGE_SIZE, map_batch,
+                            batch_n, VMM_PRESENT | VMM_WRITABLE) != 0) {
+        /* Not even the page tables fit: give the frames of this batch back
+         * and unwind exactly as a frame shortage does. */
+        for (usize b = 0; b < batch_n; b++)
+          pmm_free_frame(map_batch[b]);
+        mapped = i + 1 - batch_n;
+        goto klarge_oom;
+      }
       batch_n = 0;
     }
   }
-  if (batch_n)
-    vmm_map_range(base + (npages - batch_n) * PAGE_SIZE, map_batch, batch_n,
-                  VMM_PRESENT | VMM_WRITABLE);
+  if (batch_n &&
+      vmm_map_range_try(base + (npages - batch_n) * PAGE_SIZE, map_batch,
+                        batch_n, VMM_PRESENT | VMM_WRITABLE) != 0) {
+    for (usize b = 0; b < batch_n; b++)
+      pmm_free_frame(map_batch[b]);
+    mapped = npages - batch_n;
+    goto klarge_oom;
+  }
 
   struct klarge_header *h = (struct klarge_header *)(usize)base;
   h->magic = KLARGE_MAGIC;
@@ -1238,7 +1259,11 @@ static void *kmalloc_internal(usize size, u64 caller) {
   u64 next = aligned_current + KHEAP_HEADER_SIZE + size;
 
   if (next > heap.end) {
-    heap_grow(KHEAP_HEADER_SIZE + size);
+    if (heap_grow(KHEAP_HEADER_SIZE + size) != 0) {
+      kheap_validate("kmalloc_oom");
+      heap_release(flags);
+      return 0; /* out of memory: the caller checks for NULL */
+    }
     aligned_current = align_up_u64(heap.current, 16);
     next = aligned_current + KHEAP_HEADER_SIZE + size;
   }

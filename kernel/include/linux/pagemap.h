@@ -111,6 +111,8 @@ static inline pgoff_t linear_page_index(struct vm_area_struct *vma,
 /* ── finding and creating ───────────────────────────────────────── */
 
 struct folio *filemap_get_folio(struct address_space *mapping, pgoff_t index);
+struct folio *filemap_get_folio_ge(struct address_space *mapping,
+                                   unsigned long *index);
 struct folio *filemap_lock_folio(struct address_space *mapping, pgoff_t index);
 struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
                                   fgf_t fgp_flags, gfp_t gfp);

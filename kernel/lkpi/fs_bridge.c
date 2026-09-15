@@ -97,6 +97,11 @@ static void bridge_close(struct file *f)
 
 /* ── mounting ───────────────────────────────────────────────────── */
 
+/* Why the last mount attempt failed, for the caller's message: the bridge can
+ * only answer NULL, and "invalid argument" reads like a corrupt filesystem
+ * whatever the real reason was. */
+int lkpi_bridge_last_mount_error;
+
 void *lkpi_bridge_mount(const char *fstype, const char *source,
                         unsigned long flags)
 {
@@ -138,8 +143,13 @@ void *lkpi_bridge_mount(const char *fstype, const char *source,
 	} else {
 		return NULL;
 	}
-	if (IS_ERR(root) || !root || !root->d_inode)
+	if (IS_ERR(root) || !root || !root->d_inode) {
+		/* Say why: the caller can only report EINVAL, and a mount that fails
+		 * for want of the device reads exactly like a corrupt filesystem. */
+		lkpi_bridge_last_mount_error =
+		    IS_ERR(root) ? (int)PTR_ERR(root) : (root ? -ENOENT : -EIO);
 		return NULL;
+	}
 	{
 		struct bridge_mount *bm = kzalloc(sizeof(*bm), GFP_KERNEL);
 
