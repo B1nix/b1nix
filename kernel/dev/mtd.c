@@ -54,7 +54,13 @@ static void mtd_reset(volatile u8 *base)
 
 /* Wait for the chip to finish, and report what it says rather than assuming it
  * worked: an erase that failed leaves the block readable but unchanged, which
- * looks exactly like success to a caller that does not ask. */
+ * looks exactly like success to a caller that does not ask.
+ *
+ * The chip is left in status mode. Callers return it to read-array mode once, after their whole run of
+ * commands, not after each one. Leaving array mode is what makes an emulated
+ * chip (QEMU's pflash_cfi01) stop mapping its contents directly, and every
+ * switch back remaps guest memory: resetting after each of 1024 block erases
+ * made erasing a 4 MiB chip take three seconds. */
 static int mtd_wait(volatile u8 *base)
 {
 	base[0] = CFI_CMD_STATUS;
@@ -63,12 +69,10 @@ static int mtd_wait(volatile u8 *base)
 
 		if (!(sr & CFI_SR_READY))
 			continue;
-		mtd_reset(base);
 		if (sr & (CFI_SR_ERASE_ERR | CFI_SR_PROGRAM_ERR))
 			return -1;
 		return 0;
 	}
-	mtd_reset(base);
 	return -1;
 }
 
@@ -142,16 +146,21 @@ int mtd_erase(struct mtd_device *d, u32 offset, u32 len)
 	if (offset % d->erase_size || len % d->erase_size)
 		return -1;
 
+	int rc = 0;
+
 	for (u32 at = offset; at < offset + len; at += d->erase_size) {
 		volatile u8 *blk = d->base + at;
 
 		blk[0] = CFI_CMD_CLEAR_SR;
 		blk[0] = CFI_CMD_ERASE;
 		blk[0] = CFI_CMD_CONFIRM;
-		if (mtd_wait(d->base) != 0)
-			return -1;
+		if (mtd_wait(d->base) != 0) {
+			rc = -1;
+			break;
+		}
 	}
-	return 0;
+	mtd_reset(d->base);
+	return rc;
 }
 
 int mtd_write(struct mtd_device *d, u32 offset, const void *buf, u32 len)
@@ -160,16 +169,21 @@ int mtd_write(struct mtd_device *d, u32 offset, const void *buf, u32 len)
 		return -1;
 
 	const u8 *in = buf;
+	int rc = 0;
+
 	for (u32 i = 0; i < len; i++) {
 		volatile u8 *at = d->base + offset + i;
 
 		at[0] = CFI_CMD_CLEAR_SR;
 		at[0] = CFI_CMD_PROGRAM;
 		at[0] = in[i];
-		if (mtd_wait(d->base) != 0)
-			return -1;
+		if (mtd_wait(d->base) != 0) {
+			rc = -1;
+			break;
+		}
 	}
-	return 0;
+	mtd_reset(d->base);
+	return rc;
 }
 
 struct mtd_device *mtd_device_at(unsigned index)

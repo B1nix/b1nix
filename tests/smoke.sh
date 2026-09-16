@@ -286,10 +286,12 @@ _prepare_hostshare() {
 	# just wrote.
 	_lock="$_hs/.refresh.lock"
 	_tries=0
+	# Polled at 50 ms within the same 30 s bound: the refresh takes ~0.1 s,
+	# and a one-second retry staggered every lane start by a second.
 	while ! mkdir "$_lock" 2>/dev/null; do
 		_tries=$((_tries + 1))
-		[ "$_tries" -ge 30 ] && return 0
-		sleep 1
+		[ "$_tries" -ge 600 ] && return 0
+		sleep 0.05
 	done
 
 	# Refreshed in place rather than rebuilt: `ln -f` replaces an entry that is
@@ -696,7 +698,16 @@ run_qemu() {
 					# stall/timeout guards still apply. A lane that does not set
 					# it stops exactly as before.
 					settle=${SMOKE_DONE_SETTLE:-0}
+					# SMOKE_DONE_UNTIL ends the settle early: the window is
+					# for markers printed after the done one, and once the
+					# last of them is in there is nothing left to wait for.
+					# Polled at 0.2 s, so the window stays in seconds.
+					settle=$((settle * 5))
 					while [ "$settle" -gt 0 ]; do
+						if [ -n "${SMOKE_DONE_UNTIL:-}" ] &&
+						   grep -qa -E "$SMOKE_DONE_UNTIL" "$log" 2>/dev/null; then
+							break
+						fi
 						# A lane that ends by resetting the machine is proved by
 						# QEMU leaving on its own (-no-reboot turns the reset
 						# into an exit), not by the marker the kernel printed
@@ -705,7 +716,7 @@ run_qemu() {
 							command echo "SMOKE-WATCHDOG: qemu-exited-after-done child=qemu log=$log" >>"$log"
 							break
 						fi
-						sleep 1
+						sleep 0.2
 						settle=$((settle - 1))
 						line_count=$(wc -l <"$log" | tr -d ' ')
 						if [ "$line_count" -gt "$reported_lines" ]; then
@@ -786,12 +797,57 @@ run_qemu() {
 }
 
 # Check that a pattern appears in the log
+# Literal markers each lane log is known to contain, loaded once after the
+# guests stop (tools/check/grade-index.py). A listed marker passes without a
+# grep fork; anything unlisted is asked of grep exactly as before.
+GRADE_NL='
+'
+grade_index_build() {
+	_gi_dir="$PROJECT_DIR/smoke_run/.grade-index-$ARCH"
+	rm -rf "$_gi_dir"
+	command -v python3 >/dev/null 2>&1 || return 0
+	python3 "$PROJECT_DIR/tools/check/grade-index.py" "$PROJECT_DIR/tests/smoke.sh" "$_gi_dir" \
+		LOG="$LOG" SMP_LOG="$SMP_LOG" SYS_LOG="$SYS_LOG" SYSNET_LOG="$SYSNET_LOG" \
+		BLK_LOG="$BLK_LOG" POSIX_LOG="$POSIX_LOG" GFX_LOG="$GFX_LOG" INIT_LOG="$INIT_LOG" \
+		SWITCHROOT_LOG="$SWITCHROOT_LOG" IOMMU_LOG="$IOMMU_LOG" AMDVI_LOG="$AMDVI_LOG" \
+		RASPI_LOG="$RASPI_LOG" 2>/dev/null || return 0
+	for _gi_var in LOG SMP_LOG SYS_LOG SYSNET_LOG BLK_LOG POSIX_LOG GFX_LOG INIT_LOG \
+	               SWITCHROOT_LOG IOMMU_LOG AMDVI_LOG RASPI_LOG; do
+		[ -f "$_gi_dir/$_gi_var.hits" ] || continue
+		eval "GRADE_HITS_$_gi_var=\"\$GRADE_NL\$(cat \"\$_gi_dir/\$_gi_var.hits\")\$GRADE_NL\""
+	done
+	GRADE_INDEXED=1
+}
+
+grade_index_has() {
+	[ "${GRADE_INDEXED:-0}" = "1" ] || return 1
+	case "$1" in
+	"$LOG") _gi_hits=$GRADE_HITS_LOG ;;
+	"$SMP_LOG") _gi_hits=$GRADE_HITS_SMP_LOG ;;
+	"$SYS_LOG") _gi_hits=$GRADE_HITS_SYS_LOG ;;
+	"$SYSNET_LOG") _gi_hits=$GRADE_HITS_SYSNET_LOG ;;
+	"$BLK_LOG") _gi_hits=$GRADE_HITS_BLK_LOG ;;
+	"$POSIX_LOG") _gi_hits=$GRADE_HITS_POSIX_LOG ;;
+	"$GFX_LOG") _gi_hits=$GRADE_HITS_GFX_LOG ;;
+	"$INIT_LOG") _gi_hits=$GRADE_HITS_INIT_LOG ;;
+	"$SWITCHROOT_LOG") _gi_hits=$GRADE_HITS_SWITCHROOT_LOG ;;
+	"$IOMMU_LOG") _gi_hits=$GRADE_HITS_IOMMU_LOG ;;
+	"$AMDVI_LOG") _gi_hits=$GRADE_HITS_AMDVI_LOG ;;
+	"$RASPI_LOG") _gi_hits=$GRADE_HITS_RASPI_LOG ;;
+	*) return 1 ;;
+	esac
+	case "$_gi_hits" in
+	*"$GRADE_NL$2$GRADE_NL"*) return 0 ;;
+	esac
+	return 1
+}
+
 check_output() {
 	local log="$1"
 	local pattern="$2"
 	local desc="$3"
 
-	if grep -q "$pattern" "$log" 2>/dev/null; then
+	if grade_index_has "$log" "$pattern" || grep -q "$pattern" "$log" 2>/dev/null; then
 		pass "$desc"
 	elif { [ "$log" = "$LOG" ] && any_instance_wedged; } || log_wedged "$log"; then
 		blocked "$desc" "instance died before this ran: $pattern"
@@ -884,8 +940,14 @@ else
 		if [ "$ARCH" != "aarch64" ]; then
 			SYSNET_ISO_TARGET="iso-sysnet"
 		fi
+		# aarch64 lanes boot build/aarch64/Image directly with -kernel and a
+		# root disk; no command line opens an ISO. Building the lane ISOs there
+		# repacked seven images (two of them 268 MB), ~10 s, on every kernel
+		# change. What the lanes do use is the kernel and the checked root.
+		LANE_TARGETS="iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-iommu iso-init iso-switchroot"
+		[ "$ARCH" = "aarch64" ] && LANE_TARGETS="check-dynamic build/$ARCH/kernel.elf"
 		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
-			iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-iommu iso-init iso-switchroot \
+			$LANE_TARGETS \
 			>"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
@@ -897,7 +959,7 @@ else
 				cp -f "build/$ARCH/Image" "build/$ARCH/Image.rpi"
 			rm -f "build/$ARCH/kernel.elf" "build/$ARCH/Image"
 			make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
-				iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-iommu iso-init iso-switchroot \
+				$LANE_TARGETS \
 				>>"$BUILD_LOG" 2>&1 || {
 				print_build_failure
 				exit 1
@@ -917,39 +979,40 @@ if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
     echo "Error: mke2fs utility not found. Please install e2fsprogs."
     exit 1
 fi
+# Each lane gets its own copy of a few small formatted disks. Formatting them
+# per lane ran mke2fs twenty times, and mke2fs ends with an fsync: on a busy
+# btrfs host that was seconds, once over a minute, of every run. Each disk
+# role (sata, nvme, ahci) is formatted once into a template and the lanes get
+# copies -- reflinks where the filesystem has them. The roles stay distinct
+# images, so no machine sees two disks with one filesystem UUID.
+_MKIMG_TMPL="$PROJECT_DIR/smoke_run/.disk-templates-$$"
+_mkimg_ext4() {  # _mkimg_ext4 <template-name> [mke2fs label args...]
+    _tn=$1; _t="$_MKIMG_TMPL/$1.img"; shift
+    [ -f "$_t" ] && return 0
+    mkdir -p "$_MKIMG_TMPL"
+    dd if=/dev/zero of="$_t.tmp" bs=1M count=4 2>/dev/null
+    "$MKE2FS" -F -t ext4 "$@" -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_t.tmp" 2>/dev/null ||
+        "$MKE2FS" -F -t ext4 "$@" -q "$_t.tmp" 2>/dev/null || {
+            echo "Error: Failed to format the $_tn disk template as ext4."; exit 1
+        }
+    mv -f "$_t.tmp" "$_t"
+}
+_mkimg_copy() {  # _mkimg_copy <template-name> <dest>
+    cp --reflink=auto -f "$_MKIMG_TMPL/$1.img" "$2" 2>/dev/null ||
+        cp -f "$_MKIMG_TMPL/$1.img" "$2"
+}
 _mkimg() {  # mkimg <instance-suffix>
     _sata=$(disk_img sata "$1"); _nvme=$(disk_img nvme "$1"); _swap=$(disk_img swap "$1")
     _usb=$(disk_img usb "$1")
     if [ "$ARCH" = "aarch64" ]; then
-        # aarch64 has no GRUB ISO: QEMU virt boots kernel.elf directly, so the
-        # rootfs the other arches ship inside the ISO is delivered on the
-        # virtio-blk disk instead (kernel/main.c mounts virtio-blk0 at /).
-        dd if=/dev/zero of="$_nvme" bs=1M count=4 2>/dev/null
         dd if=/dev/zero of="$_swap" bs=1M count=2 2>/dev/null
-        # The blk lane attaches this one as USB storage, and the one below as a
-        # second virtio-blk disk; without them QEMU refuses to start and the
-        # whole lane reads as blocked.
         dd if=/dev/zero of="$_usb" bs=1M count=2 2>/dev/null
         dd if=/dev/zero of="$(disk_img vblk "$1")" bs=1M count=4 2>/dev/null
         rm -f "$_sata"
         if [ -f "$SMOKE_ROOT_IMG" ]; then
-            # Clone, do not copy. Every lane gets its own writable root, and
-            # that root is half a gigabyte -- ten lanes meant five gigabytes
-            # moved before a single instance booted, which is most of the gap
-            # between "iso ready" and the first lane starting. APFS (and Linux
-            # on btrfs/xfs) can give each lane a copy-on-write clone instead,
-            # which costs nothing until something writes. `cp -c` fails on a
-            # filesystem that cannot do it, so fall back to the real copy.
             cp -c "$SMOKE_ROOT_IMG" "$_sata" 2>/dev/null ||
+                cp --reflink=auto -f "$SMOKE_ROOT_IMG" "$_sata" 2>/dev/null ||
                 cp -f "$SMOKE_ROOT_IMG" "$_sata"
-            # Stamp it with THIS run's time. A clone carries the source's
-            # mtime, and the prune below deletes anything in smoke_run older
-            # than an hour -- so once the build stopped rebuilding root.img
-            # every run (the stamps in the Makefile), the clone inherited an
-            # mtime from hours ago and was deleted before QEMU could open it.
-            # Every lane then died with "Could not open ... No such file or
-            # directory", 1343 checks BLOCKED, in under thirty seconds --
-            # from two separate changes that were each correct alone.
             touch "$_sata"
         else
             ROOT_FS="${ROOT_FS:-btrfs}" sh "$PROJECT_DIR/tools/images/mk-root-image.sh" "$PROJECT_DIR/build/$ARCH/rootfs" "$_sata" 512 >/dev/null || {
@@ -957,41 +1020,25 @@ _mkimg() {  # mkimg <instance-suffix>
             }
             rm -f "$_sata.manifest"
         fi
-        "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_nvme" 2>/dev/null
-        # A separate image for the AHCI controller: on this arch $_sata is the
-        # ROOT disk (virtio-blk), and QEMU will not open one file for writing
-        # twice.
-        dd if=/dev/zero of="$(disk_img ahci "$1")" bs=1M count=4 2>/dev/null
-        "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q \
-            "$(disk_img ahci "$1")" 2>/dev/null
+        _mkimg_ext4 nvme-plain
+        _mkimg_copy nvme-plain "$_nvme"
+        _mkimg_ext4 ahci-plain
+        _mkimg_copy ahci-plain "$(disk_img ahci "$1")"
         return 0
     fi
-    dd if=/dev/zero of="$_sata" bs=1M count=4 2>/dev/null
-    dd if=/dev/zero of="$_nvme" bs=1M count=4 2>/dev/null
     dd if=/dev/zero of="$_swap" bs=1M count=2 2>/dev/null
-    # USB mass storage: only its identity is under test (which sd* letter it
-    # lands on, and that it reports itself removable), so it stays unformatted.
     dd if=/dev/zero of="$_usb" bs=1M count=2 2>/dev/null
-    # virtio-blk scratch disk: the one block device nothing else on the system
-    # owns, so the durability self-test may write to it. Unformatted on purpose.
     dd if=/dev/zero of="$(disk_img vblk "$1")" bs=1M count=4 2>/dev/null
-    "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_sata" 2>/dev/null || {
-        "$MKE2FS" -F -t ext4 -q "$_sata" 2>/dev/null || {
-            echo "Error: Failed to format sata $1 image as ext4."; exit 1
-        }
-    }
-    # The NVMe image carries a volume label: `findfs LABEL=` has to have
-    # something to find (M109). Not "b1nix-root" — that name selects the root.
-    "$MKE2FS" -F -t ext4 -L m109label -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_nvme" 2>/dev/null || {
-        "$MKE2FS" -F -t ext4 -L m109label -q "$_nvme" 2>/dev/null || {
-            echo "Error: Failed to format nvme $1 image as ext4."; exit 1
-        }
-    }
+    _mkimg_ext4 sata-plain
+    _mkimg_copy sata-plain "$_sata"
+    _mkimg_ext4 nvme-m109 -L m109label
+    _mkimg_copy nvme-m109 "$_nvme"
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
     _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg smp; _mkimg switchroot
 }
+rm -rf "$_MKIMG_TMPL"
 
 # Define logs
 LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-$ARCH.log"
@@ -1093,9 +1140,12 @@ if [ "$SMOKE_PARALLEL" = "1" ] && { [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMO
 		# does not reach it inside its window, runs to the stall timeout, and
 		# starves every instance queued behind it. Give it a few seconds to
 		# finish speaking instead.
+		# The settle ends as soon as the NVMe-through-SMMU verdict, the last of
+		# them, is in the log; the eight seconds remain the bound.
 		[ "$ARCH" = "aarch64" ] && {
 			SMOKE_DONE_PATTERN="M24B-SMP: ok work-stealing|M24B-SMP: skip single-cpu|$SMOKE_DONE_PATTERN"
 			SMOKE_DONE_SETTLE=${SMOKE_DONE_SETTLE:-8}
+			SMOKE_DONE_UNTIL="(ok|FAIL|skip) nvme-translated|M100E-SMOKE: skip smmuv3"
 		}
 		SMOKE_PROGRESS_MODE=smp
 		PROGRESS_PREFIX="[smp]  "
@@ -1476,9 +1526,14 @@ launch_smp_solo() {
 		# init, long after the selftest marker, so cutting the instance at the
 		# selftest made that check permanently unreachable (reported BLOCKED).
 		SMOKE_DONE_PATTERN="M24B-BKL: instance ran-on-ap|M24B-SMP: fail work-stealing|KERNEL PANIC|\[PANIC\]"
+		# aarch64 grades this log for the ITS and SMMUv3 markers too, and the
+		# NVMe-through-SMMU read is the last of them: stop on its verdict
+		# rather than on the work-stealing marker plus a blind eight-second
+		# settle, which held the whole suite ~8 s before the pool started.
 		[ "$ARCH" = "aarch64" ] && {
 			SMOKE_DONE_PATTERN="M24B-SMP: skip single-cpu|$SMOKE_DONE_PATTERN"
 			SMOKE_DONE_SETTLE=${SMOKE_DONE_SETTLE:-8}
+			SMOKE_DONE_UNTIL="(ok|FAIL|skip) nvme-translated|M100E-SMOKE: skip smmuv3"
 		}
 		SMOKE_PROGRESS_MODE=smp
 		PROGRESS_PREFIX="[smp]  "
@@ -1521,8 +1576,9 @@ run_slot_pool() {
 			_queue="$_queue $_n"
 		fi
 	done
+	_free=0
 	for _n in $_queue; do
-		_done=0
+		_done=$_free
 		while [ "$_done" = "0" ]; do
 			for _p in $_pids; do
 				if ! kill -0 "$_p" 2>/dev/null; then
@@ -1534,10 +1590,17 @@ run_slot_pool() {
 					break
 				fi
 			done
-			[ "$_done" = "0" ] && sleep 1
+			[ "$_done" = "0" ] && sleep 0.2
 		done
 		launch_slot "$_n"
-		[ -n "$_slot_pid" ] && _pids="$_pids $_slot_pid"
+		# A launcher that started nothing (iommu and amdvi on aarch64) leaves
+		# the freed slot free for the next instance instead of spending it.
+		if [ -n "$_slot_pid" ]; then
+			_pids="$_pids $_slot_pid"
+			_free=0
+		else
+			_free=1
+		fi
 	done
 	for _p in $_pids; do wait "$_p" 2>/dev/null || true; done
 }
@@ -1604,6 +1667,7 @@ else
 	wait $pid_sys
 	wait $pid_smp
 fi
+grade_index_build
 
 if [ "$SMOKE_QUICK" = "1" ]; then
 	echo ""

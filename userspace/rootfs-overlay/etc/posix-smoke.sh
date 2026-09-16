@@ -52,7 +52,14 @@ set -- /tmp/m33_g/*.txt; [ "$#" = "2" ] && echo "M33-SHELL: ok glob-star"
 M33TRAP=none
 trap 'M33TRAP=delivered' USR1
 /bin/kill -USR1 $$ &
-for M33I in 1 2 3 4 5 6 7 8; do /bin/true; [ "$M33TRAP" = delivered ] && break; done
+# The trap runs between commands once the signal lands. Eight quick /bin/true
+# runs bet on the background kill being scheduled within them, which a loaded
+# host lost; poll for up to two seconds instead.
+M33I=0
+while [ "$M33I" -lt 100 ] && [ "$M33TRAP" != delivered ]; do
+	/bin/usleep 20000
+	M33I=$((M33I + 1))
+done
 [ "$M33TRAP" = delivered ] && echo "M33-SHELL: ok async-trap"
 trap - USR1
 rm -rf /tmp/m33_g /tmp/m33_hd

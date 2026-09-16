@@ -741,8 +741,11 @@ static void m47_inject_thread(void *arg) {
     /* Then a report of motion alone, after the reader has drained the first
      * and gone back to sleep. A button makes a report urgent and wakes the
      * reader however the queue looked; motion wakes only on the queue edge,
-     * and for as long as that edge was tested at the SYN it never fired. */
-    scheduler_sleep_ticks(SCHED_MS_TO_TICKS(1000));
+     * and for as long as that edge was tested at the SYN it never fired.
+     * 300 ms: the reader drains the first report and blocks within
+     * milliseconds even under TCG; a full second was idle lane time, paid
+     * twice because m47_smoke opens the device twice. */
+    scheduler_sleep_ticks(SCHED_MS_TO_TICKS(300));
     if (input_dev_open_seq(INPUT_DEV_MOUSE) != served)
       continue; /* a newer open is owed its own burst first */
     input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_X, 5);

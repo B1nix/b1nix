@@ -94,18 +94,19 @@ render_run_case() {
 		> "/tmp/render-$_label-sway.log" 2>&1 &
 	_swaypid=$!
 
+	# Polled every 100 ms within the same 40 s.
 	_i=0
 	_sock=""
-	while [ $_i -lt 40 ]; do
+	while [ $_i -lt 400 ]; do
 		_sock=$(ls -1 "$XDG_RUNTIME_DIR" 2>/dev/null |
 			grep '^wayland-[0-9]*$' | head -1)
 		[ -n "$_sock" ] && break
 		kill -0 $_swaypid 2>/dev/null || break
 		_i=$((_i + 1))
-		sleep 1
+		usleep 100000
 	done
 	if [ -z "$_sock" ]; then
-		echo "RENDER-SMOKE: $_label no-socket after ${_i}s"
+		echo "RENDER-SMOKE: $_label no-socket after $((_i / 10))s"
 		tail -20 "/tmp/render-$_label-sway.log"
 		kill $_swaypid 2>/dev/null
 		wait $_swaypid 2>/dev/null
@@ -128,11 +129,16 @@ render_run_case() {
 		# before the first repaint. Capture until the colour is there, or
 		# until the deadline says it never will be; the last attempt is
 		# the one that reports, so a real failure still prints the pixels.
+		# The wait before each capture grows from a quarter second to two:
+		# the repaint usually lands at once, and a fixed two seconds per
+		# capture was eight seconds of every gfx lane. Twelve attempts keep
+		# the old twenty-second deadline.
 		_try=0
 		_shot=0
-		while [ $_try -lt 10 ]; do
+		_wait=250000
+		while [ $_try -lt 12 ]; do
 			_try=$((_try + 1))
-			[ $_try -eq 10 ] && _last=1 || _last=0
+			[ $_try -eq 12 ] && _last=1 || _last=0
 			# Ask for the colour on every attempt, and re-resolve the
 			# IPC socket first. The command used to be sent once,
 			# before the loop: sway answers Wayland clients as soon as
@@ -146,7 +152,8 @@ render_run_case() {
 			export SWAYSOCK
 			${TMO:+$TMO 20} swaymsg output '*' background "#$_c" \
 				solid_color >> "/tmp/render-$_label-sway.log" 2>&1
-			sleep 2
+			usleep $_wait
+			[ $_wait -lt 2000000 ] && _wait=$((_wait * 2))
 			if ! ${TMO:+$TMO 30} grim -t ppm \
 				"/tmp/render-$_label-$_c.ppm" \
 				2>>"/tmp/render-$_label-sway.log"; then
@@ -176,8 +183,8 @@ render_run_case() {
 
 	kill $_swaypid 2>/dev/null
 	_w=0
-	while kill -0 $_swaypid 2>/dev/null && [ $_w -lt 10 ]; do
-		sleep 1
+	while kill -0 $_swaypid 2>/dev/null && [ $_w -lt 100 ]; do
+		usleep 100000
 		_w=$((_w + 1))
 	done
 	kill -9 $_swaypid 2>/dev/null

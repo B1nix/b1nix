@@ -388,7 +388,7 @@ static int test_input_events(void) {
 					motion = 1;
 		}
 		alarm(0);
-		/* The report is sent a second after the button's. Arriving with the
+		/* The report is sent 300 ms after the button's. Arriving with the
 		 * alarm instead means the read slept through it and only found it on
 		 * the way out -- the lost wake this checks for. */
 		clock_gettime(CLOCK_MONOTONIC, &t1);

@@ -12,6 +12,7 @@
  * resolution is finer than a scheduler tick, that it agrees with sleeping, and
  * that timers actually fire.
  */
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 #include <time.h>
 #include <sys/timerfd.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <signal.h>
 #include <poll.h>
 
@@ -186,59 +188,73 @@ static long long wait_fired(long long budget_ns)
 	}
 }
 
+/* Report through one write(2), so lines from the three concurrent children
+ * below cannot interleave mid-line. */
+static void say(const char *fmt, ...)
+{
+	char line[160];
+	va_list ap;
+
+	va_start(ap, fmt);
+	int n = vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (n > 0)
+		write(1, line, (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1);
+}
+
 /* One second asked for, one second delivered -- within a generous half-second
  * either way, which is still ten times tighter than the error being caught. */
 static int fired_on_time(const char *what, long long took_ns)
 {
 	if (took_ns < 0) {
-		printf("CLOCK: FAIL %s (never fired)\n", what);
+		say("CLOCK: FAIL %s (never fired)\n", what);
 		return 1;
 	}
 	if (took_ns < 500000000LL) {
-		printf("CLOCK: FAIL %s (fired EARLY after %lld ms, asked for 1000)\n",
+		say("CLOCK: FAIL %s (fired EARLY after %lld ms, asked for 1000)\n",
 		       what, took_ns / 1000000);
 		return 1;
 	}
 	if (took_ns > 1500000000LL) {
-		printf("CLOCK: FAIL %s (fired LATE after %lld ms, asked for 1000)\n",
+		say("CLOCK: FAIL %s (fired LATE after %lld ms, asked for 1000)\n",
 		       what, took_ns / 1000000);
 		return 1;
 	}
-	printf("CLOCK: ok %s (asked 1000 ms, fired after %lld ms)\n", what,
+	say("CLOCK: ok %s (asked 1000 ms, fired after %lld ms)\n", what,
 	       took_ns / 1000000);
 	return 0;
 }
 
-static int test_alarm_keeps_time(void)
+static int keep_alarm(void)
 {
-	struct sigaction sa, old;
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = on_alarm;
-	sigaction(SIGALRM, &sa, &old);
-
 	/* alarm(2) counts in whole seconds, so one second is the shortest
 	 * honest request it can be given. */
 	g_fired = 0;
 	alarm(1);
 	long long took = wait_fired(6000000000LL);
 	alarm(0);
-	int bad = fired_on_time("alarm-keeps-time", took);
+	return fired_on_time("alarm-keeps-time", took);
+}
 
+static int keep_itimer(void)
+{
 	/* setitimer, same second, through the itimerval path. */
 	struct itimerval itv;
 	memset(&itv, 0, sizeof(itv));
 	itv.it_value.tv_sec = 1;
 	g_fired = 0;
 	if (setitimer(ITIMER_REAL, &itv, NULL) < 0) {
-		printf("CLOCK: FAIL itimer-keeps-time (setitimer errno %d)\n", errno);
-		bad++;
-	} else {
-		took = wait_fired(6000000000LL);
-		memset(&itv, 0, sizeof(itv));
-		setitimer(ITIMER_REAL, &itv, NULL);
-		bad += fired_on_time("itimer-keeps-time", took);
+		say("CLOCK: FAIL itimer-keeps-time (setitimer errno %d)\n", errno);
+		return 1;
 	}
+	long long took = wait_fired(6000000000LL);
+	memset(&itv, 0, sizeof(itv));
+	setitimer(ITIMER_REAL, &itv, NULL);
+	return fired_on_time("itimer-keeps-time", took);
+}
 
+static int keep_posix_timer(void)
+{
 	/* And the POSIX timer, which is what timeout(1) actually arms. */
 	timer_t tid;
 	struct sigevent sev;
@@ -246,26 +262,61 @@ static int test_alarm_keeps_time(void)
 	sev.sigev_notify = SIGEV_SIGNAL;
 	sev.sigev_signo = SIGALRM;
 	if (timer_create(CLOCK_REALTIME, &sev, &tid) < 0) {
-		printf("CLOCK: FAIL posix-timer-keeps-time (timer_create errno %d)\n",
-		       errno);
-		bad++;
-	} else {
-		struct itimerspec its;
-		memset(&its, 0, sizeof(its));
-		its.it_value.tv_sec = 1;
-		g_fired = 0;
-		if (timer_settime(tid, 0, &its, NULL) < 0) {
-			printf("CLOCK: FAIL posix-timer-keeps-time (timer_settime errno "
-			       "%d)\n", errno);
-			bad++;
-		} else {
-			took = wait_fired(6000000000LL);
-			bad += fired_on_time("posix-timer-keeps-time", took);
-		}
-		timer_delete(tid);
+		say("CLOCK: FAIL posix-timer-keeps-time (timer_create errno %d)\n",
+		    errno);
+		return 1;
 	}
+	struct itimerspec its;
+	memset(&its, 0, sizeof(its));
+	its.it_value.tv_sec = 1;
+	g_fired = 0;
+	int bad;
+	if (timer_settime(tid, 0, &its, NULL) < 0) {
+		say("CLOCK: FAIL posix-timer-keeps-time (timer_settime errno %d)\n",
+		    errno);
+		bad = 1;
+	} else {
+		bad = fired_on_time("posix-timer-keeps-time", wait_fired(6000000000LL));
+	}
+	timer_delete(tid);
+	return bad;
+}
 
-	sigaction(SIGALRM, &old, NULL);
+/* The three one-second timers are each a process's own (the alarm, the real
+ * itimer and a POSIX timer all belong to the process that armed them), so each
+ * runs in a child of its own and the three seconds are waited once, not three
+ * times over. */
+static int test_alarm_keeps_time(void)
+{
+	static int (*const cases[])(void) = { keep_alarm, keep_itimer,
+	                                      keep_posix_timer };
+	const int ncases = (int)(sizeof(cases) / sizeof(cases[0]));
+	pid_t pids[3];
+	int bad = 0;
+
+	for (int i = 0; i < ncases; i++) {
+		pids[i] = fork();
+		if (pids[i] == 0) {
+			struct sigaction sa;
+			memset(&sa, 0, sizeof(sa));
+			sa.sa_handler = on_alarm;
+			sigaction(SIGALRM, &sa, NULL);
+			_exit(cases[i]() ? 1 : 0);
+		}
+		if (pids[i] < 0) {
+			say("CLOCK: FAIL keeps-time (fork errno %d)\n", errno);
+			bad++;
+		}
+	}
+	for (int i = 0; i < ncases; i++) {
+		int st = 0;
+
+		if (pids[i] <= 0)
+			continue;
+		if (waitpid(pids[i], &st, 0) != pids[i] || !WIFEXITED(st) ||
+		    WEXITSTATUS(st) != 0)
+			bad++;
+	}
 	return bad;
 }
 

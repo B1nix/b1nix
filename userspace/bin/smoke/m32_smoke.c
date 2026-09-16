@@ -617,28 +617,37 @@ static int test_tcp_client_server(void) {
     execve("/bin/m32_nettool", srv_argv, srv_envp);
     _exit(127);
   }
-  sleep(1);
-  curl_pid = fork();
-  if (curl_pid < 0) {
-    fail("curl-https-selfsigned-fork");
-    return -1;
+  /* Retry only while curl reports the server not listening yet (exit 7):
+   * that is a refused connect, not the rejection under test, and it must not
+   * pass for one. The sleep(1) this replaces guessed at the start-up instead. */
+  for (int attempt = 0; attempt < 40; attempt++) {
+    if (attempt)
+      usleep(50000);
+    curl_pid = fork();
+    if (curl_pid < 0) {
+      fail("curl-https-selfsigned-fork");
+      return -1;
+    }
+    if (curl_pid == 0) {
+      char *curl_bad_argv[] = {
+        "/bin/curl", "--connect-timeout", "2", "-sS",
+        "https://127.0.0.1:4444/", NULL
+      };
+      char *curl_bad_envp[] = {NULL};
+      execve("/bin/curl", curl_bad_argv, curl_bad_envp);
+      _exit(127);
+    }
+    waitpid(curl_pid, &curl_status, 0);
+    if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) != 7)
+      break;
   }
-  if (curl_pid == 0) {
-    char *curl_bad_argv[] = {
-      "/bin/curl", "--connect-timeout", "2", "-sS",
-      "https://127.0.0.1:4444/", NULL
-    };
-    char *curl_bad_envp[] = {NULL};
-    execve("/bin/curl", curl_bad_argv, curl_bad_envp);
-    _exit(127);
-  }
-  waitpid(curl_pid, &curl_status, 0);
   /* Same single-shot-server hang guard as the positive path: terminate before
    * reaping so a refused connect (server not yet bound under load) can't leave
    * us blocked in waitpid. SIGKILL for the same reason as above: the test tree
    * inherits an ignored SIGTERM from the runner's trap. */
   { int srv_status = 0; waitpid(tls_srv, &srv_status, 0); }
-  if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) == 0) {
+  if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) == 0 ||
+      WEXITSTATUS(curl_status) == 7) {
     fail("curl-https-selfsigned-reject");
     return -1;
   }
@@ -966,7 +975,9 @@ static int test_ipv6_v6only(void) {
 }
 
 
-static int run_server6_http(unsigned short port) {
+/* `ready_fd` gets one byte once the socket listens, so the client starts the
+ * moment it can connect instead of after a guessed second. */
+static int run_server6_http(unsigned short port, int ready_fd) {
   int lfd = socket(AF_INET6, SOCK_STREAM, 0);
   if (lfd < 0) return 1;
   struct sockaddr_in6 a;
@@ -977,6 +988,10 @@ static int run_server6_http(unsigned short port) {
   if (bind(lfd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(lfd, 1) < 0) {
     close(lfd);
     return 2;
+  }
+  if (ready_fd >= 0) {
+    (void)write(ready_fd, "r", 1);
+    close(ready_fd);
   }
   int cfd = accept(lfd, 0, 0);
   if (cfd < 0) {
@@ -1005,11 +1020,24 @@ static int run_server6_http(unsigned short port) {
 
 static int test_curl_ipv6(void) {
   unsigned short port = 3267;
+  int ready[2];
+  if (pipe(ready) != 0) { fail("curl-ipv6"); return -1; }
   int pid = fork();
   if (pid < 0) { fail("curl-ipv6"); return -1; }
-  if (pid == 0) _exit(run_server6_http(port));
-
-  sleep(1);
+  if (pid == 0) {
+    close(ready[0]);
+    _exit(run_server6_http(port, ready[1]));
+  }
+  close(ready[1]);
+  {
+    /* Listening, or gone: either way the read returns. Bounded, so a server
+     * stuck before listen() still lets the client report the failure. */
+    struct pollfd rp = {.fd = ready[0], .events = POLLIN};
+    char r;
+    if (poll(&rp, 1, 5000) > 0)
+      (void)read(ready[0], &r, 1);
+    close(ready[0]);
+  }
   int cpid = fork();
   if (cpid < 0) { fail("curl-ipv6"); return -1; }
   if (cpid == 0) {
@@ -2128,8 +2156,27 @@ int main(int argc, char **argv) {
   if (test_crypto() != 0)              return 1;
   if (test_dropbear_keygen() != 0)     return 1;
   if (test_socket_options() != 0)      return 1;
-  if (test_idle_connection() != 0)     return 1;
-  if (test_tcp_keepalive() != 0)       return 1;
+  {
+    /* The keepalive check and its keepalive-off control each hold a
+     * connection idle for three seconds. They use different ports and share
+     * nothing, so the control waits in a child while the keepalive check
+     * waits here: the same two idle periods, observed once, not back to back. */
+    pid_t idle = fork();
+
+    if (idle == 0)
+      _exit(test_idle_connection() == 0 ? 0 : 1);
+    int keep_rc = test_tcp_keepalive();
+    int idle_status = 0;
+    int idle_rc = 1;
+
+    if (idle > 0 && waitpid(idle, &idle_status, 0) == idle &&
+        WIFEXITED(idle_status))
+      idle_rc = WEXITSTATUS(idle_status);
+    if (idle < 0)
+      idle_rc = test_idle_connection();
+    if (idle_rc != 0 || keep_rc != 0)
+      return 1;
+  }
   test_external_net();
   if (test_getnameinfo() != 0)         return 1;
   if (test_v4mapped_udp() != 0)        return 1;

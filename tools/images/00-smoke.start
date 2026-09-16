@@ -51,7 +51,8 @@ elif grep -q 'b1nix.smoke=iommu' /proc/cmdline 2>/dev/null; then
     # have run by the time userspace is up. End by RESTARTING through the real
     # syscall, which is the one test of the reset path: the harness passes it
     # only when QEMU (-no-reboot) then exits on its own.
-    ( sleep 1; /bin/reboot -f ) &
+    # A fifth of a second for this script to exit first, not a whole one.
+    ( /bin/usleep 200000; /bin/reboot -f ) &
     exit 0
 else
     SMOKE_SYS=1
@@ -76,19 +77,24 @@ run_test() {
     # from /mnt/host/bin and then emitted not one marker, not even their start
     # line. Copying keeps the delivery path and drops the exec path, and leaves
     # argv[0] as the canonical /bin/... the tests were written against.
+    # This instance's tests only. The copy below used to run first, so every
+    # lane pulled every other lane's binaries across 9P before skipping them.
+    case "$inst" in
+        sys) [ "$SMOKE_SYS" = "1" ] || return ;;
+        sysnet) [ "$SMOKE_SYSNET" = "1" ] || return ;;
+        blk) [ "$SMOKE_BLK" = "1" ] || return ;;
+        posix) [ "$SMOKE_POSIX" = "1" ] || return ;;
+        gfx) [ "$SMOKE_GFX" = "1" ] || return ;;
+        *) return ;;
+    esac
+
     bname="${bin##*/}"
     if [ -x "/mnt/host/bin/$bname" ]; then
         cp -f "/mnt/host/bin/$bname" "$bin" 2>/dev/null || bin="/mnt/host/bin/$bname"
     fi
     [ -x "$bin" ] || return
 
-    case "$inst" in
-        sys) [ "$SMOKE_SYS" = "1" ] && "$bin" ;;
-        sysnet) [ "$SMOKE_SYSNET" = "1" ] && "$bin" ;;
-        blk) [ "$SMOKE_BLK" = "1" ] && "$bin" ;;
-        posix) [ "$SMOKE_POSIX" = "1" ] && "$bin" ;;
-        gfx) [ "$SMOKE_GFX" = "1" ] && "$bin" ;;
-    esac
+    "$bin"
 }
 
 # m47_smoke owns /dev/fb0 for its fb-persist check: it writes pixels, unmaps,
@@ -192,7 +198,10 @@ run_test /bin/m29_smoke posix
 run_test /bin/m31_smoke posix
 run_test /bin/m73_smoke posix
 run_test /bin/m80_smoke posix
-run_test /bin/m108_smoke posix
+# m108 (su's fixed 3 s failed-login delay) and m42 (three alarm(1) waits) run on
+# sys: posix was the pool's tail at 22 s while sys finished at 9 s, and both
+# are self-contained and graded from the combined log.
+run_test /bin/m108_smoke sys
 run_test /bin/m86_smoke posix
 run_test /bin/m95_smoke posix
 run_test /bin/m96_smoke posix
@@ -203,7 +212,7 @@ run_test /bin/m107_smoke posix
 run_test /bin/m109_uevent_smoke posix
 run_test /bin/m63_smoke posix
 run_test /bin/m71_aslr posix
-run_test /bin/m42_w5pre_smoke posix
+run_test /bin/m42_w5pre_smoke sys
 run_test /bin/m46_smoke posix
 run_test /bin/lock_smoke posix
 run_test /bin/futex_stress posix

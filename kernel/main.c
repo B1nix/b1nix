@@ -1790,7 +1790,16 @@ void kernel_main(usize arg0, usize arg1)
 		 * on its completion. Not x86-only: the flush is a command each driver
 		 * already implements, and the scratch write now picks a disk nothing
 		 * has mounted (see blk_durability_selftest). */
-		blk_durability_selftest();
+		/* Which smoke lane this boot is, if any: some self-tests below are
+		 * graded from one lane's log and cost the others time for nothing. */
+		char smoke_lane[16] = "";
+
+		if (bootinfo_get_kv("b1nix.smoke", smoke_lane, sizeof(smoke_lane)) <= 0)
+			smoke_lane[0] = '\0';
+		/* Graded from the blk lane alone; a flush through every other lane's
+		 * disk was up to 3.7 s of an aarch64 boot. */
+		if (!smoke_lane[0] || strcmp(smoke_lane, "blk") == 0)
+			blk_durability_selftest();
 		/* The block cache under concurrent readers, writers and evictions. */
 		blk_cache_torture_test();
 		/* linuxkpi and the DRM core are shim layers over this kernel's own
@@ -1798,15 +1807,27 @@ void kernel_main(usize arg0, usize arg1)
 		 * workqueue, a dma-fence or the GPU scheduler, and their sources are
 		 * built for both arches. They were only inside the guard above
 		 * because the IOMMU tests they sat next to are genuinely x86. */
-		lkpi_selftest();      /* M99: idr, completion, workqueue, sg, dma, fw */
-		dma_fence_selftest(); /* M100: dma-fence */
-		drm_sched_selftest(); /* M100: GPU scheduler + scatter-gather BOs */
-		lkpi_selftest_m101(); /* M101: kref, waitqueue, ww_mutex, rbtree, RCU */
+		/* Once per smoke run, not once per lane. These exercise the shim
+		 * layers themselves, whatever devices a lane attaches, and their
+		 * markers are graded from the combined log; repeating them in every
+		 * instance was 0.75 s of each x86_64 boot and 2.6 s of each aarch64
+		 * one (TCG). The sys lane runs them, and so does any test boot that
+		 * names no lane. The GPU interrupt test depends on the lane's device
+		 * and stays everywhere. */
+		int shim_selftests = !smoke_lane[0] || strcmp(smoke_lane, "sys") == 0;
+		if (shim_selftests) {
+			lkpi_selftest();      /* M99: idr, completion, workqueue, sg, dma, fw */
+			dma_fence_selftest(); /* M100: dma-fence */
+			drm_sched_selftest(); /* M100: GPU scheduler + scatter-gather BOs */
+			lkpi_selftest_m101(); /* M101: kref, waitqueue, ww_mutex, rbtree, RCU */
+		}
 		virtio_gpu_irq_selftest(); /* the scanout's completion interrupt */
-		drm_import_selftest(); /* M101: the imported DRM core actually runs */
-		drm_kms_selftest();    /* M101: a device on it, rendering to the scanout */
-		kheap_selftest();      /* the allocator splits blocks it reuses */
-		sysfs_attr_selftest(); /* M101: its /sys and debugfs files, read back */
+		if (shim_selftests) {
+			drm_import_selftest(); /* M101: the imported DRM core actually runs */
+			drm_kms_selftest();    /* M101: a device on it, rendering to the scanout */
+			kheap_selftest();      /* the allocator splits blocks it reuses */
+			sysfs_attr_selftest(); /* M101: its /sys and debugfs files, read back */
+		}
 
 		/* How much of the boot CPU's stack the whole of kernel_main actually
 		 * used, reported last so it covers every probe and self-test above.

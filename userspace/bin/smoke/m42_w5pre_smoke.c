@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/time.h>
 #include <poll.h>
 #include <time.h>
 #include <sys/resource.h>
@@ -25,6 +26,18 @@
 
 static void emit(const char *s) {
     write(1, s, strlen(s));
+}
+
+/* SIGALRM a fifth of a second from now. These checks need a signal to arrive
+ * while the call waits, not a particular delay; alarm(2) cannot ask for less
+ * than a second, and three of those were three seconds of the lane. The
+ * timer's own accuracy is clock_sanity's subject. */
+static void arm_sigalrm_ms(long ms) {
+    struct itimerval it;
+    memset(&it, 0, sizeof(it));
+    it.it_value.tv_sec = ms / 1000;
+    it.it_value.tv_usec = (ms % 1000) * 1000;
+    setitimer(ITIMER_REAL, &it, NULL);
 }
 
 static void ok(const char *name) {
@@ -258,7 +271,7 @@ int main(void) {
 
     // Alarm / sigsuspend test
     g_sigalrm_count = 0;
-    alarm(1);
+    arm_sigalrm_ms(200);
     sigset_t susp_mask;
     sigfillset(&susp_mask);
     sigdelset(&susp_mask, SIGALRM);
@@ -320,7 +333,7 @@ int main(void) {
     sigemptyset(&alrm_mask);
     sigaddset(&alrm_mask, SIGALRM);
     sigprocmask(SIG_BLOCK, &alrm_mask, NULL);
-    alarm(1);
+    arm_sigalrm_ms(200);
     sigset_t poll_mask;
     sigfillset(&poll_mask);
     sigdelset(&poll_mask, SIGALRM);
@@ -366,7 +379,7 @@ int main(void) {
     // Wait, b1nix waitpid is interruptible. Let's verify.
     // If we set up alarm(1) again, and then call waitpid(child, &status, 0):
     // waitpid should return -1 with EINTR.
-    alarm(1);
+    arm_sigalrm_ms(200);
     int status = 0;
     int w_rc = waitpid(child, &status, 0);
     if (w_rc != -1 || errno != EINTR) {

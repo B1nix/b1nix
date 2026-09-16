@@ -1161,11 +1161,16 @@ endif
 		esac; \
 	done
 	@mkdir -p $(ROOTFS)/bin
+	@# The links already in place are listed by one find; only the missing
+	@# ones fork an ln. A readlink per applet was 0.8 s of every build that
+	@# changed nothing.
+	@find $(ROOTFS)/bin -maxdepth 1 -type l -lname /bin/busybox 2>/dev/null | \
+		sed 's|.*/||' > $(ROOTFS)/../.busybox-links
 	@awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$1); gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); if ($$2 == "upstream") print $$1; }' ../tools/configs/applet-manifest.conf | \
 		grep -vE '^(su|passwd|login)$$' | \
+		awk 'NR == FNR { have[$$0] = 1; next } !($$0 in have)' $(ROOTFS)/../.busybox-links - | \
 		while read -r cmd; do \
-			[ "$$(readlink "$(ROOTFS)/bin/$$cmd" 2>/dev/null)" = "/bin/busybox" ] || \
-				ln -sfn /bin/busybox "$(ROOTFS)/bin/$$cmd"; \
+			ln -sfn /bin/busybox "$(ROOTFS)/bin/$$cmd"; \
 		done
 	@$(call link_if_changed,/bin/busybox,$(ROOTFS)/bin/sh)
 	@$(call link_if_changed,/bin/busybox,$(ROOTFS)/bin/ash)

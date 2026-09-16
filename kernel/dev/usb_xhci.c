@@ -925,7 +925,11 @@ static void usb_probe_port(u32 port, u32 speed)
 		console_write("xhci: port reset failed\n");
 		return;
 	}
-	udelay(300000); /* 300 ms recovery delay after reset (TRSTRCY) */
+	/* Reset recovery (TRSTRCY): USB 2.0 7.1.7.5 allows a device 10 ms after
+	 * reset before it must answer, and Linux waits exactly that on a root
+	 * port. reset_port() has already seen the port enabled. This was a
+	 * 300 ms busy-wait, paid on every boot that probes a port. */
+	udelay(10000);
 
 	/* Read actual speed after reset completes. */
 	u32 portsc = rd32(op_base, XHCI_OP_PORTS + (port - 1) * 0x10);

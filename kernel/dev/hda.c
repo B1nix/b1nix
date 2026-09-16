@@ -446,18 +446,33 @@ static u32 hda_get_param(u8 nid, u32 param) {
 }
 
 /* ── HDA controller reset sequence ───────────────────────────────────────── */
+/* Wait, up to 100 ms, for CRST to read back as `want`. The controller reports
+ * each transition through the bit itself (HDA 1.0a 3.3.7); waiting a fixed
+ * 50 ms either side was 100 ms of every boot for a change that lands at once. */
+static int hda_wait_crst(u32 want) {
+	for (int ms = 0; ms < 100; ms++) {
+		if ((hda_r32(HDA_GCTL) & HDA_GCTL_CRST) == want)
+			return 0;
+		hda_delay_ms(1);
+	}
+	return -1;
+}
+
 static void hda_controller_reset(void) {
 	/* Assert reset */
 	hda_w32(HDA_GCTL, hda_r32(HDA_GCTL) & ~HDA_GCTL_CRST);
-	hda_delay_ms(50);
+	if (hda_wait_crst(0) != 0)
+		console_write("hda: controller did not enter reset\n");
 
 	/* Clear reset */
 	hda_w32(HDA_GCTL, hda_r32(HDA_GCTL) | HDA_GCTL_CRST);
-	hda_delay_ms(50);
+	if (hda_wait_crst(HDA_GCTL_CRST) != 0)
+		console_write("hda: controller did not leave reset\n");
 
-	/* Verify reset completed */
-	u32 gsts = hda_r32(HDA_GSTS);
-	(void)gsts;
+	/* Codecs have 521 us after the controller leaves reset to request their
+	 * addresses (HDA 1.0a 4.3); STATESTS is read after that. Linux waits a
+	 * millisecond here too. */
+	hda_delay_ms(1);
 }
 
 /* ── CORB/RIRB DMA setup ─────────────────────────────────────────────────── */
