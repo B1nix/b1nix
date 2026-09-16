@@ -101,7 +101,7 @@ ident() {
   stat -f '%z %m' "$1"
 }
 stamp_now() {
-  printf 'v1 arch=%s timeout=%s cmdline=%s\n' "$ARCH" "$TIMEOUT" "$CMDLINE"
+  printf 'v2 arch=%s timeout=%s cmdline=%s\n' "$ARCH" "$TIMEOUT" "$CMDLINE"
   printf 'kernel %s\n' "$(ident "$KERNEL")"
   printf 'conf %s\n' "$(ident "$ROOT_DIR/boot/limine/limine.conf.in")"
   printf 'self %s\n' "$(ident "$SELF")"
@@ -126,7 +126,13 @@ rm -f "$STAMP"
 
 # ── stage the ISO root ─────────────────────────────────────────────────────
 mkdir -p "$STAGE/boot/limine" "$STAGE/EFI/BOOT"
-cp -f "$KERNEL" "$STAGE/boot/kernel.elf"
+# Without DWARF. The boot loader reads the kernel off the emulated CD at about
+# 15 MB/s, and three quarters of the ELF is debug info nothing at boot uses:
+# backtraces and kprof symbolise through the embedded kallsyms. 52 MB took 3 s
+# on every boot; build/<arch>/kernel.elf keeps the debug info for gdb.
+OBJCOPY="${OBJCOPY:-$(command -v llvm-objcopy || command -v objcopy)}"
+[ -n "$OBJCOPY" ] || { echo "mkiso: llvm-objcopy or objcopy is required" >&2; exit 1; }
+"$OBJCOPY" --strip-debug "$KERNEL" "$STAGE/boot/kernel.elf"
 
 # Limine's own boot files. limine-bios.sys must live next to limine.conf in one
 # of the directories Limine scans (we use /boot/limine); the two *-cd.bin El

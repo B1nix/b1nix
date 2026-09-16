@@ -1613,7 +1613,12 @@ static int ssh_start_server(const char *portspec) {
    * the definition of "bound and listening"; closing it straight away leaves
    * dropbear with one dropped connection, which it is entitled to see. */
   {
-    unsigned short port = (unsigned short)atoi(portspec);
+    /* The port is what follows the address: "127.0.0.1:2222". atoi() of the
+     * whole string read 127, so every probe knocked on the wrong port, was
+     * refused, and the loop sat out its full five seconds before the login
+     * test connected to the real one. */
+    const char *colon = strrchr(portspec, ':');
+    unsigned short port = (unsigned short)atoi(colon ? colon + 1 : portspec);
 
     for (int waited = 0; waited < 5000; waited += 50) {
       int probe = socket(AF_INET, SOCK_STREAM, 0);

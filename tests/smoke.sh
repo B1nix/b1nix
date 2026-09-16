@@ -336,7 +336,16 @@ run_qemu() {
 
 		local qemu_bin="qemu-system-x86_64"
 		local machine_args=""
-		local kernel_args="-cdrom $PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}"
+		# The boot image on an AHCI CD drive, not `-cdrom`. The boot loader reads
+		# the kernel and its modules through the BIOS, and on the PIIX IDE
+		# controller that is PIO ATAPI: 15.9 s for a 256 MB root module and 1.1 s
+		# for a plain image, against 1.6 s and 0.4 s through AHCI. The drive sits
+		# on the last port of the lane's own AHCI controller when it has one (the
+		# kernel drives the first controller it finds, and the disks on ports 0
+		# and 1 keep the names the checks expect), else on a controller of its own.
+		local iso_path="$PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}"
+		local kernel_args="-drive file=$iso_path,if=none,id=bootcd,format=raw,media=cdrom,readonly=on"
+		local boot_cd_bus=""
 		local accel_args=""
 		if [ "$ARCH" = "aarch64" ]; then
 			qemu_bin="qemu-system-aarch64"
@@ -429,7 +438,7 @@ run_qemu() {
 
 		if [ "$ARCH" = "x86_64" ]; then
 			set -- ${qemu_bin} ${accel_args} ${mem_args} ${cpu_args} \
-				-cdrom "$PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}" \
+				${kernel_args} \
 				-serial stdio -serial null -display ${GPU_DISPLAY:-none} -monitor none -no-reboot \
 				-device isa-debug-exit,iobase=0xf4,iosize=0x04
 
@@ -554,6 +563,7 @@ run_qemu() {
 					-device ich9-ahci,id=ahci0 \
 					-drive if=none,file="$AHCI_IMG",format=raw,id=sata0 \
 					-device ide-hd,drive=sata0,bus=ahci0.0
+				boot_cd_bus=ahci0.5
 				if [ -n "${SWAP_IMG:-}" ] && [ -f "${SWAP_IMG:-}" ]; then
 					set -- "$@" \
 						-drive if=none,file="$SWAP_IMG",format=raw,id=sata1 \
@@ -601,8 +611,16 @@ run_qemu() {
 				-fsdev local,path="$PROJECT_DIR/smoke_run/hostshare",security_model=none,id=fsdev9p \
 				-device virtio-9p-pci,fsdev=fsdev9p,mount_tag=hostshare \
 				${EXTRA_QEMU_ARGS:-}
+			boot_cd_bus=ahci.5
 		else
 			set -- "$@" -nic none -vga none ${EXTRA_QEMU_ARGS:-}
+		fi
+		if [ "$ARCH" = "x86_64" ]; then
+			if [ -z "$boot_cd_bus" ]; then
+				set -- "$@" -device ich9-ahci,id=bootahci
+				boot_cd_bus=bootahci.0
+			fi
+			set -- "$@" -device ide-cd,drive=bootcd,bus=$boot_cd_bus,bootindex=0
 		fi
 
 		# The Raspberry Pi lane drives a different machine entirely: RAM and

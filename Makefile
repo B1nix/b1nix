@@ -2601,10 +2601,12 @@ endif
 		done; \
 	fi
 	@mkdir -p $(PAMSTAGE)
-	@printf '# M104 smoke policy (userspace/bin/smoke/m104_pam_smoke.c)\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/m104-pam-smoke
+	@# The two smoke policies authenticate with nodelay: a rejected password is
+	@# what they check, and pam_unix's two-second failure delay is only wall time.
+	@printf '# M104 smoke policy (userspace/bin/smoke/m104_pam_smoke.c)\nauth       required     pam_unix.so nodelay\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/m104-pam-smoke
 	@printf '# Default policy for services without a specific /etc/pam.d/<service> file.\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/other
 	@printf '# b1nix PAM policy for dropbear sshd\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/sshd
-	@printf '# M108 smoke policy (userspace/bin/smoke/m108_smoke.c): pam_unix.so reads\n# the same /etc/shadow "$$6$$" hashes BusyBox su/passwd read and write.\nauth       required     pam_unix.so\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/m108-smoke
+	@printf '# M108 smoke policy (userspace/bin/smoke/m108_smoke.c): pam_unix.so reads\n# the same /etc/shadow "$$6$$" hashes BusyBox su/passwd read and write.\nauth       required     pam_unix.so nodelay\naccount    required     pam_unix.so\nsession    required     pam_unix.so\n' > $(PAMSTAGE)/m108-smoke
 	@$(CIC) $(PAMSTAGE)/m104-pam-smoke $(PAMSTAGE)/other $(PAMSTAGE)/sshd $(PAMSTAGE)/m108-smoke $(BUILD_DIR)/rootfs/etc/pam.d/
 	@# M108: the su/passwd/init smoke ELF links libpam.so as DT_NEEDED.
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m108_smoke >/dev/null 2>&1 || true

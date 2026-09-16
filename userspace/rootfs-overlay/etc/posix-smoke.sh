@@ -450,8 +450,16 @@ fi
 # read back ITS hostname rather than ours.
 /bin/unshare -u -- /bin/sh -c '/bin/hostname bb-w11-target; /bin/sleep 20' &
 bb_w11_pid=$!
-/bin/sleep 2
-bb_w11_seen="$(/bin/nsenter -t $bb_w11_pid -u /bin/hostname 2>/dev/null)"
+# Ask until the target has named itself, within the two seconds this used to
+# sleep unconditionally.
+bb_w11_try=0
+bb_w11_seen=
+while [ $bb_w11_try -lt 40 ]; do
+	bb_w11_seen="$(/bin/nsenter -t $bb_w11_pid -u /bin/hostname 2>/dev/null)"
+	[ "$bb_w11_seen" = "bb-w11-target" ] && break
+	bb_w11_try=$((bb_w11_try + 1))
+	/bin/usleep 50000
+done
 if [ "$bb_w11_seen" = "bb-w11-target" ] && [ "$(/bin/hostname)" = "$bb_w11_parent" ]; then
 	echo "BB-W11: ok nsenter-uts"
 else
