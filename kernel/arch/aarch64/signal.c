@@ -250,7 +250,11 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
           console_write_dec(i);
           console_write("\n");
         }
-        scheduler_exit_current(128 + i);
+        /* Killed by signal i is the TASK_EXIT_SIGNALED flag, as on x86_64:
+         * 128+i reads as a normal exit(137) in waitpid. It came out right
+         * only because the scheduler ran the death a second time on the way
+         * out, which also overwrote a parent's REAPING claim. */
+        scheduler_exit_current(TASK_EXIT_SIGNALED | i);
       }
     } else {
       /* SIG_IGN */

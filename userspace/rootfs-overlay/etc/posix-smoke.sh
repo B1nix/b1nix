@@ -309,6 +309,15 @@ echo "BB-W3: start procps"
 /bin/busybox free | /bin/busybox grep -q "Mem:" && echo "BB-W3: ok free"
 /bin/busybox dmesg | /bin/busybox grep -qi "b1nix" && echo "BB-W3: ok dmesg"
 /bin/busybox sleep 30 &
+# The background job is only "busybox" once it has exec'd. On a loaded host the
+# lookups below could run while it was still a forked shell, and find nothing
+# to match; wait for the name, within five seconds.
+bb_w3_pid=$!
+bb_w3_try=0
+while [ "$(cat /proc/$bb_w3_pid/comm 2>/dev/null)" != "busybox" ] && [ $bb_w3_try -lt 100 ]; do
+	/bin/usleep 50000
+	bb_w3_try=$((bb_w3_try + 1))
+done
 /bin/busybox pidof busybox | /bin/busybox grep -q "[0-9]" && echo "BB-W3: ok pidof"
 /bin/busybox pgrep busybox | /bin/busybox grep -q "[0-9]" && echo "BB-W3: ok pgrep"
 /bin/busybox pkill busybox && echo "BB-W3: ok pkill"

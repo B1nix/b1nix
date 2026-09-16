@@ -10794,6 +10794,22 @@ int scheduler_is_pgrp_in_session(usize pgrp, usize session_id) {
 void scheduler_deliver_pending_signals(void) {
   if (!current_task)
     return;
+  /* A task that has already died delivers nothing more.
+   *
+   * The fatal branches below mark the task DEAD and return; the task goes on
+   * running to its final switch-out, and the SIGKILL it died of is still
+   * pending. The next pass through here (any return towards user mode on the
+   * way out) ran the death a second time and stored TASK_DEAD over the
+   * TASK_REAPING a parent's waitpid had already claimed. The reaper then
+   * claimed the same task DEAD->REAPING as well, and both tore its address
+   * space down: soak's gfx phase took a physical-frame double free in about
+   * one run in eight. */
+  {
+    enum task_state st = __atomic_load_n(&current_task->state, __ATOMIC_ACQUIRE);
+
+    if (st == TASK_DEAD || st == TASK_REAPING)
+      return;
+  }
 
   /* Acquire-load the pending set: another CPU's scheduler_kill publishes new
    * bits with a release fetch_or. blocked_signals is task-local. */

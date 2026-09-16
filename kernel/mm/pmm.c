@@ -1424,6 +1424,9 @@ void pmm_free_frame(u64 frame) {
     console_write("pmm_free_frame: frame 0x");
     console_write_hex64(frame);
     console_write(" was already unreferenced — double free!\n");
+    /* Who dropped the last reference first: the second free is only half
+     * of the story, and the other half is in the free notes. */
+    pmm_report_frame_free_site(frame);
     panic("pmm_free_frame: double-free of physical frame");
   }
 

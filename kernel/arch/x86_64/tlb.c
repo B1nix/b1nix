@@ -34,6 +34,8 @@ enum tlb_op {
 };
 
 static spinlock_t      g_tlb_lock    = SPINLOCK_INIT;
+/* The CPU inside a shootdown round, +1 (0 = none), for tlb_describe_lock. */
+static volatile int    g_tlb_holder_cpu = 0;
 static volatile int    g_tlb_op      = TLB_OP_NONE;
 static volatile u64    g_tlb_vaddr   = 0;
 static volatile int    g_tlb_pending = 0;
@@ -186,6 +188,7 @@ static void tlb_shootdown_dispatch(int op, u64 vaddr, u64 pml4) {
     }
     if (count == 0)
         return;
+    __atomic_store_n(&g_tlb_holder_cpu, self + 1, __ATOMIC_RELEASE);
 
     /* Open a new generation so targets (via IPI or poll) ACK it exactly once.
      * Bumped before the op release so a handler that observes op != NONE also
@@ -244,6 +247,40 @@ static void tlb_shootdown_dispatch(int op, u64 vaddr, u64 pml4) {
     }
 
     __atomic_store_n(&g_tlb_op, TLB_OP_NONE, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_tlb_holder_cpu, 0, __ATOMIC_RELEASE);
+}
+
+/* For a lockup report on the shootdown lock: the round in flight, and the
+ * CPUs it is still waiting for and what they run. A CPU spinning on this lock
+ * cannot tell a slow round from one that will never finish without it. */
+void tlb_describe_lock(const void *lock) {
+    if (lock != (const void *)&g_tlb_lock)
+        return;
+    extern struct task *percpu_cur_task(int cpu);
+    int holder = __atomic_load_n(&g_tlb_holder_cpu, __ATOMIC_ACQUIRE) - 1;
+    u64 gen = __atomic_load_n(&g_tlb_gen, __ATOMIC_RELAXED);
+    u64 targets = __atomic_load_n(&g_tlb_targets, __ATOMIC_RELAXED);
+
+    console_write("\n  tlb round: holder cpu ");
+    if (holder < 0)
+        console_write("none");
+    else
+        console_write_dec((u64)holder);
+    console_write(" op=");
+    console_write_dec((u64)(u32)__atomic_load_n(&g_tlb_op, __ATOMIC_RELAXED));
+    console_write(" pending=");
+    console_write_dec((u64)(u32)__atomic_load_n(&g_tlb_pending, __ATOMIC_RELAXED));
+    for (int c = 0; c < MAX_CPUS; c++) {
+        if (!((targets >> c) & 1))
+            continue;
+        if (__atomic_load_n(&g_tlb_acked_gen[c], __ATOMIC_RELAXED) == gen)
+            continue;
+        struct task *t = percpu_cur_task(c);
+        console_write("\n  tlb round: cpu ");
+        console_write_dec((u64)c);
+        console_write(" has not acked, running ");
+        console_write(t && t->name ? t->name : "?");
+    }
 }
 
 void tlb_shootdown_page(u64 vaddr) {
