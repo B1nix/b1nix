@@ -6,6 +6,8 @@
 #include <b1nix/mm.h>
 #include <b1nix/types.h>
 #include <b1nix/io.h>
+#include <b1nix/spinlock.h>
+#include <b1nix/vdso.h>
 
 #define X86_TSS_SELECTOR 0x28
 
@@ -290,11 +292,16 @@ static void cpuid_count(u32 leaf, u32 sub, u32 *a, u32 *b, u32 *c, u32 *d) {
  * files. */
 static u32 g_cpu_khz;
 
+static void tsc_vdso_publish(void);
+
 void arch_set_cpu_khz(u32 khz) {
   /* Ignore an implausible measurement rather than publishing it: a value from
    * a window the hypervisor stretched is worse than no value. */
-  if (khz >= 100000u && khz <= 20000000u)
+  if (khz >= 100000u && khz <= 20000000u) {
     g_cpu_khz = khz;
+    /* The clock converts with this rate, so the vDSO must too. */
+    tsc_vdso_publish();
+  }
 }
 
 void arch_udelay(u32 us) {
@@ -378,6 +385,11 @@ void arch_cpu_model(char *buf, usize len) {
 static u64 g_tsc_base;      /* counter value the monotonic clock starts from */
 static int g_tsc_usable;    /* invariant TSC + a calibrated frequency */
 static u64 g_tsc_last_ns;   /* last value handed out, for monotonicity */
+/* A CPU read the counter lower than an earlier read on another CPU, or could
+ * not be checked at all. The kernel's clock survives that through the clamp in
+ * arch_tsc_monotonic_ns; the vDSO has no clamp, so it stops offering the
+ * counter. */
+static volatile int g_tsc_warped;
 
 static inline u64 arch_rdtsc_ordered(void) {
   u32 lo, hi;
@@ -415,6 +427,109 @@ void arch_tsc_clock_init(void) {
     return; /* never calibrated */
   g_tsc_base = arch_rdtsc_ordered();
   g_tsc_usable = 1;
+  tsc_vdso_publish();
+}
+
+/* Publish the counter parameters to the vDSO data page.
+ *
+ * The vDSO repeats arch_tsc_monotonic_ns() in userspace with one difference:
+ * it cannot keep g_tsc_last_ns, so it has no clamp. That is only equivalent
+ * while no CPU's counter reads behind another's, which is what the warp check
+ * below establishes for every CPU as it comes up. Until the counter is usable,
+ * or once a warp was seen, the page says "system call" and the kernel's clamped
+ * path stays the only one. */
+static void tsc_vdso_publish(void) {
+  u64 flags;
+  struct vdso_data *d = vdso_write_begin(&flags);
+
+  d->clock_mode = (g_tsc_usable && g_cpu_khz && !g_tsc_warped)
+                      ? VDSO_CLOCK_X86_TSC
+                      : VDSO_CLOCK_SYSCALL;
+  d->counter_base = g_tsc_base;
+  d->counter_div = g_cpu_khz;
+  d->counter_scale = 1000000ull; /* kHz -> ns: see arch_tsc_monotonic_ns */
+  vdso_write_end(flags);
+}
+
+/* ── TSC synchronisation check (for the vDSO) ───────────────────────────────
+ *
+ * Two CPUs take turns reading the counter under one lock. Holding the lock
+ * orders the reads in real time, so on synchronised counters every read is at
+ * least the one before it, whichever CPU took it; a smaller value is a warp —
+ * this CPU's counter runs behind. The boot CPU and each AP run their halves at
+ * the same time while the AP comes up: the AP samples until the boot CPU says
+ * its window is over, and the boot CPU samples for the window. */
+static spinlock_t g_tsc_warp_lock = SPINLOCK_INIT;
+static u64 g_tsc_warp_last;
+static volatile int g_tsc_warp_ap_running;
+static volatile int g_tsc_warp_bsp_done;
+
+#define TSC_WARP_WINDOW_MS 10u   /* both CPUs sampling concurrently */
+#define TSC_WARP_WAIT_MS   1000u /* for the AP to start, and to stop */
+
+static void tsc_warp_sample(void) {
+  u64 flags;
+
+  spin_lock_irqsave(&g_tsc_warp_lock, &flags);
+  u64 now = arch_rdtsc_ordered();
+  if (now < g_tsc_warp_last)
+    g_tsc_warped = 1;
+  else
+    g_tsc_warp_last = now;
+  spin_unlock_irqrestore(&g_tsc_warp_lock, flags);
+}
+
+void arch_tsc_warp_prepare(void) {
+  g_tsc_warp_bsp_done = 0;
+  g_tsc_warp_ap_running = 0;
+}
+
+/* The AP's half, from ap_main. Stops when the boot CPU is done, or after
+ * TSC_WARP_WAIT_MS of its own if the boot CPU never comes. */
+void arch_tsc_warp_check_ap(void) {
+  if (!g_tsc_usable)
+    return;
+  u64 limit = (u64)g_cpu_khz * TSC_WARP_WAIT_MS;
+  u64 start = arch_rdtsc_ordered();
+
+  g_tsc_warp_ap_running = 1;
+  while (!g_tsc_warp_bsp_done && arch_rdtsc_ordered() - start < limit)
+    tsc_warp_sample();
+  g_tsc_warp_ap_running = 0;
+}
+
+/* The boot CPU's half, once the AP reported ready. Returns 0 when this AP's
+ * counter was found in step with every CPU checked so far. */
+int arch_tsc_warp_check_bsp(void) {
+  if (!g_tsc_usable)
+    return 0;
+  u64 khz = g_cpu_khz;
+  u64 start = arch_rdtsc_ordered();
+  int verified = 0;
+
+  while (!g_tsc_warp_ap_running &&
+         arch_rdtsc_ordered() - start < khz * TSC_WARP_WAIT_MS)
+    __asm__ volatile("pause");
+  if (g_tsc_warp_ap_running) {
+    u64 window = arch_rdtsc_ordered();
+
+    while (g_tsc_warp_ap_running &&
+           arch_rdtsc_ordered() - window < khz * TSC_WARP_WINDOW_MS)
+      tsc_warp_sample();
+    /* Only a window the AP sampled through to the end counts. */
+    verified = g_tsc_warp_ap_running;
+  }
+  g_tsc_warp_bsp_done = 1;
+  start = arch_rdtsc_ordered();
+  while (g_tsc_warp_ap_running &&
+         arch_rdtsc_ordered() - start < khz * TSC_WARP_WAIT_MS)
+    __asm__ volatile("pause");
+
+  if (!verified)
+    g_tsc_warped = 1; /* a CPU nobody could check is not known to be in step */
+  if (g_tsc_warped)
+    tsc_vdso_publish();
+  return g_tsc_warped ? -1 : 0;
 }
 
 int arch_tsc_clock_ready(void) { return g_tsc_usable; }
@@ -649,6 +764,18 @@ static void x86_enable_xsave(void) {
   g_xsave_enabled = 1;
 }
 
+/* Clear CR4.TSD (bit 2) on this CPU. With it set, RDTSC outside ring 0 raises
+ * #GP, and the vDSO reads the counter from userspace. Firmware and bootloaders
+ * leave it clear; this says so rather than assuming. Per-CPU, like all of CR4. */
+static void x86_allow_user_rdtsc(void) {
+  u64 cr4;
+  __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+  if (cr4 & (1ull << 2)) {
+    cr4 &= ~(1ull << 2);
+    __asm__ volatile("movq %0, %%cr4" : : "r"(cr4) : "memory");
+  }
+}
+
 static void x86_enable_sse(void) {
   u64 cr0;
   __asm__ volatile("movq %%cr0, %0" : "=r"(cr0));
@@ -671,6 +798,10 @@ static void x86_enable_sse(void) {
    * A thread that set its TLS pointer on one core and then ran on another
    * would fault on WRFSBASE if only the first core had the bit. */
   x86_enable_fsgsbase();
+
+  /* Per-CPU too: every core a process can migrate to must let it read the
+   * counter the vDSO reads. */
+  x86_allow_user_rdtsc();
 }
 
 

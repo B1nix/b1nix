@@ -2690,6 +2690,24 @@ check_output "$LOG" "UNIX-SMOKE: ok listen-no-hup" "a LISTENING unix socket repo
 # in every harness reported a timeout after N/10 seconds.
 check_output "$LOG" "CLOCK: ok alarm-keeps-time" "alarm(2) fires one second after it was asked for, measured against CLOCK_MONOTONIC rather than counted in ticks"
 check_output "$LOG" "CLOCK: ok itimer-keeps-time" "setitimer(ITIMER_REAL) keeps the time it was given"
+# The vDSO: clock readings a process takes without entering the kernel
+# (kernel/user/vdso.c, kernel/vdso/). Each marker is printed by
+# userspace/bin/smoke/vdso_smoke.c only after the property was checked.
+check_output "$LOG" "VDSO-SMOKE: ok auxv-ehdr" "AT_SYSINFO_EHDR points at an ELF exporting the clock functions under Linux's symbol version, with DT_HASH"
+check_output "$LOG" "VDSO-SMOKE: ok maps" "/proc/self/maps shows [vdso] r-xp at AT_SYSINFO_EHDR and [vvar] r--p directly below it"
+check_output "$LOG" "VDSO-SMOKE: ok agree-realtime" "every vDSO CLOCK_REALTIME reading lies between system calls made just before and after it"
+check_output "$LOG" "VDSO-SMOKE: ok agree-monotonic " "every vDSO CLOCK_MONOTONIC reading lies between system calls made just before and after it"
+check_output "$LOG" "VDSO-SMOKE: ok agree-monotonic-raw" "every vDSO CLOCK_MONOTONIC_RAW reading lies between system calls made just before and after it"
+check_output "$LOG" "VDSO-SMOKE: ok agree-boottime" "every vDSO CLOCK_BOOTTIME reading lies between system calls made just before and after it"
+check_output "$LOG" "VDSO-SMOKE: ok agree-other" "vDSO gettimeofday/time/clock_getres match their system calls; clocks it does not compute and bad arguments still get the kernel's answer"
+check_output "$LOG" "VDSO-SMOKE: ok no-syscall" "libc clock_gettime/gettimeofday/time keep working under a seccomp filter that fails those system calls - they never enter the kernel"
+check_output "$LOG" "VDSO-SMOKE: ok monotonic " "600000 consecutive vDSO readings of the monotonic clocks never step back"
+check_output "$LOG" "VDSO-SMOKE: ok monotonic-threads" "threads on different CPUs reading CLOCK_MONOTONIC in turn never see it go back"
+check_output "$LOG" "VDSO-SMOKE: ok fork" "a forked child inherits a working vDSO, and one that unmaps it leaves the parent's intact"
+check_output "$LOG" "VDSO-SMOKE: ok exec" "an exec'd image gets its own working vDSO mapping"
+check_output "$LOG" "VDSO-SMOKE: ok mprotect" "[vvar]/[vdso] cannot be made writable (EACCES), nor [vvar] executable"
+check_output "$LOG" "VDSO-SMOKE: ok cost" "a vDSO clock_gettime costs less than the system call"
+check_output "$LOG" "VDSO-SMOKE: done fail=0" "the vDSO smoke completes with no failure"
 check_output "$LOG" "CLOCK: ok posix-timer-keeps-time" "timer_create/timer_settime keeps the time it was given - this is the timer timeout(1) arms, so it is the one that decides whether every bounded command in the suite is measuring anything"
 check_output "$LOG" "UNIX-SMOKE: ok shutdown-wr-poll" "a peer's shutdown(SHUT_WR) makes this socket poll readable, and POLLRDHUP for a caller that asked - without it an event loop never wakes to read the EOF"
 check_output "$LOG" "UNIX-SMOKE: ok shutdown-wr-eof" "after the queued bytes, a peer's shutdown(SHUT_WR) reads as end-of-file rather than blocking for ever"

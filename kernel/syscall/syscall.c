@@ -40,6 +40,7 @@ void tlb_shootdown_all(void);
 #include <b1nix/aio.h>
 #include <string.h>
 #include <stdio.h>
+#include <b1nix/vdso.h>
 #include <b1nix/version.h>
 
 
@@ -4588,6 +4589,7 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   vma->flags = (u32)flags;
   vma->node = node ? vfs_node_get(node) : 0;
   vma->offset = offset;
+  vma->special = 0;
   vma->next = 0;
   vma_insert(t, vma);
   if (vma->node && vma->node->inode && vma->node->inode->mmap_open_cb)
@@ -5016,6 +5018,22 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
     return -EINVAL;
 
   u64 flags = vmm_user_flags_from_prot(prot);
+
+  /* [vvar] and [vdso] are the kernel's frames, shared by every process: a
+   * writable mapping of them would be a write into all of them. Linux gives
+   * these mappings no "may write" permission and answers EACCES, and [vvar],
+   * which holds data, is not allowed to become executable either. Checked
+   * before anything changes, so a refused call leaves the range untouched. */
+  if (prot & (PROT_WRITE | PROT_EXEC)) {
+    for (struct vm_area *v = current_task->vma_list; v && v->start < end;
+         v = v->next) {
+      if (v->end <= start || v->special == VMA_SPECIAL_NONE)
+        continue;
+      if ((prot & PROT_WRITE) ||
+          (v->special == VMA_SPECIAL_VVAR && (prot & PROT_EXEC)))
+        return -EACCES;
+    }
+  }
 
   // 1. Update hardware page tables
   {
@@ -9830,8 +9848,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)sys_removexattr((const char *)(usize)arg0,
                                 (const char *)(usize)arg1, (int)arg2);
   case SYS_GETCPU: {
+    /* getcpu(unsigned *cpu, unsigned *node, struct getcpu_cache *): the
+     * answers go through the pointers (either may be NULL) and the call
+     * returns 0, as on Linux. Returning the CPU number instead made libc's
+     * sched_getcpu() read an unset variable on CPU 0 (a 0 return means
+     * "written") and report nothing reliable anywhere. One NUMA node. */
     struct percpu *p = get_percpu();
-    return (u64)(p ? p->cpu_id : 0);
+    u32 cpu = p ? (u32)p->cpu_id : 0;
+    u32 node = 0;
+    if (arg0 && syscall_copyout((void *)(usize)arg0, &cpu, sizeof(cpu)) != 0)
+      return (u64)-EFAULT;
+    if (arg1 && syscall_copyout((void *)(usize)arg1, &node, sizeof(node)) != 0)
+      return (u64)-EFAULT;
+    return 0;
   }
   case SYS_GETUID: {
     struct cred *c = scheduler_get_current_cred();

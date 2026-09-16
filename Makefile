@@ -641,6 +641,7 @@ KERNEL_SOURCES := \
 	kernel/sched/ptrace.c \
 	kernel/sched/seccomp.c \
 	kernel/user/process.c \
+	kernel/user/vdso.c \
 	$(ARCH_SOURCES)
 
 # PCI is not x86-only any more: QEMU virt has a PCIe host bridge reached
@@ -1963,6 +1964,63 @@ $(AP_TRAMPOLINE_OFFSETS): $(AP_TRAMP_OBJ)
 $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+
+# ── vDSO (a user-mode shared object embedded in the kernel) ──
+# Not kernel code: position-independent, small code model, its own link. It
+# shares the kernel's rule of touching no FPU/SIMD state, so the ABI of the
+# functions it exports is the plain integer one on both arches. The result is
+# checked before it is embedded -- no relocations (nothing would apply them) and
+# one loadable segment starting at the file header (the kernel maps it
+# verbatim) -- and turned into a byte array kernel/user/vdso.c includes.
+VDSO_DIR := $(BUILD_DIR)/vdso
+VDSO_SO := $(VDSO_DIR)/vdso.so
+VDSO_INC := $(INC_DIR)/vdso_image.inc
+ifeq ($(ARCH),x86_64)
+VDSO_ARCH_CFLAGS := --target=$(TARGET) -mno-red-zone -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx
+VDSO_LDS_DEFINE := -DVDSO_X86_64
+else
+VDSO_ARCH_CFLAGS := --target=$(TARGET) -march=armv8-a -mgeneral-regs-only
+VDSO_LDS_DEFINE := -DVDSO_AARCH64
+endif
+VDSO_CFLAGS := $(VDSO_ARCH_CFLAGS) -std=c11 -O2 -fPIC -ffreestanding -fno-builtin \
+	-fno-stack-protector -fno-common -fvisibility=hidden -fno-jump-tables \
+	-fasynchronous-unwind-tables $(FILE_PREFIX_MAP) -Wall -Wextra -MMD -MP -I kernel/include
+VDSO_LDFLAGS := -shared --hash-style=both --soname=linux-vdso.so.1 --build-id=sha1 \
+	--eh-frame-hdr -z max-page-size=4096 -z noexecstack -z norelro --no-undefined
+
+$(VDSO_DIR)/vdso.o: kernel/vdso/vdso.c
+	@mkdir -p $(dir $@)
+	$(CC) $(VDSO_CFLAGS) -c $< -o $@
+
+$(VDSO_DIR)/vdso_arch.o: kernel/vdso/vdso_$(ARCH).S
+	@mkdir -p $(dir $@)
+	$(CC) $(VDSO_ARCH_CFLAGS) -MMD -MP -c $< -o $@
+
+$(VDSO_DIR)/vdso.lds: kernel/vdso/vdso.lds.S
+	@mkdir -p $(dir $@)
+	$(CC) -E -P -undef -x c $(VDSO_LDS_DEFINE) $< -o $@
+
+$(VDSO_SO): $(VDSO_DIR)/vdso.o $(VDSO_DIR)/vdso_arch.o $(VDSO_DIR)/vdso.lds
+	$(LD) $(VDSO_LDFLAGS) -T $(VDSO_DIR)/vdso.lds -o $@.dbg \
+		$(VDSO_DIR)/vdso.o $(VDSO_DIR)/vdso_arch.o
+	$(OBJCOPY) --strip-all $@.dbg $@.tmp
+	@if ! $(READELF) -r $@.tmp | grep -q 'There are no relocations'; then \
+		echo "vdso: $@ needs relocations; it must be position-independent without them" >&2; \
+		$(READELF) -r $@.tmp >&2; rm -f $@.tmp; exit 1; \
+	fi
+	@if [ "$$($(READELF) -lW $@.tmp | grep -c '^ *LOAD ')" != 1 ] || \
+	   ! $(READELF) -lW $@.tmp | grep -Eq '^ *LOAD +0x0+ 0x0+ '; then \
+		echo "vdso: $@ must have exactly one PT_LOAD at offset 0, address 0" >&2; \
+		rm -f $@.tmp; exit 1; \
+	fi
+	@mv $@.tmp $@
+
+$(VDSO_INC): $(VDSO_SO)
+	@mkdir -p $(dir $@)
+	$(XXD) -i -n vdso_image $< > $@
+
+$(BUILD_DIR)/kernel/user/vdso.o: $(VDSO_INC)
+-include $(VDSO_DIR)/vdso.d $(VDSO_DIR)/vdso_arch.d
 
 # What a release carries instead of the build tree's kernel.
 #

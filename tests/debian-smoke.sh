@@ -249,7 +249,8 @@ for probe in \
 	"remap-file-pages:remap_file_pages shows another file page in the range" \
 	"keys:add_key, keyctl read/describe/update/revoke and request_key behave as on Linux" \
 	"landlock:a Landlock ruleset confines a process to one directory, symlinks included" \
-	"quotactl:quotactl validates its target and reports that quotas are unsupported"; do
+	"quotactl:quotactl validates its target and reports that quotas are unsupported" \
+	"vdso-glibc:glibc time() and date(1) read the clock through the vDSO, under a seccomp filter that fails the clock system calls"; do
 	check_output "DEBIAN-SMOKE: ok ${probe%%:*}" "${probe#*:}"
 done
 

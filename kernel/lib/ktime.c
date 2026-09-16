@@ -1,6 +1,7 @@
 #include <b1nix/arch.h>
 #include <b1nix/ktime.h>
 #include <b1nix/sched.h>
+#include <b1nix/vdso.h>
 
 /* Nanoseconds per scheduler tick, at whatever rate the timer was armed with.
  * Hardcoding 10 ms here dated from a 100 Hz tick and made the pre-TSC clock
@@ -38,6 +39,15 @@ void ktime_switch_to_tsc(void)
 	ktime_base_ns = ktime_tick_ns();
 	ktime_tsc_origin = tsc_ns;
 	__atomic_store_n(&ktime_tsc_active, 1, __ATOMIC_RELEASE);
+
+	/* The wall clock is built on this clock, so the vDSO needs the handover
+	 * to compute CLOCK_REALTIME; before it, only the system call can. */
+	u64 flags;
+	struct vdso_data *d = vdso_write_begin(&flags);
+	d->ktime_base_ns = ktime_base_ns;
+	d->ktime_origin_ns = ktime_tsc_origin;
+	d->ktime_active = 1;
+	vdso_write_end(flags);
 }
 
 u64 ktime_monotonic_ns(void)

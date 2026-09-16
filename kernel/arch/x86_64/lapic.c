@@ -521,6 +521,10 @@ void ap_main(u32 cpu_id) {
      * stays in ring 0), required before the cooperative phase touches userspace. */
     x86_ap_arch_init((int)cpu_id);
 
+    /* This CPU's half of the TSC synchronisation check; the boot CPU is
+     * running its half now, waiting on smp_boot_aps. */
+    arch_tsc_warp_check_ap();
+
     /* The AP idle context. ap_main never returns, so this local persists for
      * the AP's lifetime; a stolen worker switches back into it when it parks. */
     struct cpu_context idle_ctx;
@@ -781,6 +785,18 @@ static int smp_wait_ready(u64 flag_addr, u64 timeout_ns) {
     return *(volatile u32 *)(usize)flag_addr ? 1 : 0;
 }
 
+/* Run the boot CPU's half of the TSC synchronisation check against the AP that
+ * just came up, and say what it found. */
+static void smp_report_tsc_sync(u32 apic_id) {
+    if (!arch_tsc_clock_ready())
+        return;
+    int rc = arch_tsc_warp_check_bsp();
+    console_write("smp: TSC of AP ");
+    console_write_dec(apic_id);
+    console_write(rc == 0 ? " in step with the boot CPU\n"
+                          : " not in step (or unchecked): vDSO clocks use the system call\n");
+}
+
 /* Bring up Application Processors.
  * Returns number of CPUs successfully brought up (including BSP). */
 int smp_boot_aps(void) {
@@ -994,6 +1010,7 @@ int smp_boot_aps(void) {
          * physical 0x8000, so the vector is 0x08 (0x8000 >> 12), NOT 0x80 —
          * vector 0x80 would start the AP at 0x80000, where there is no code. */
         console_write("smp: sending SIPI...\n");
+        arch_tsc_warp_prepare();
         lapic_send_ipi(apic_id, LAPIC_ICR_STARTUP | 0x08);
 
         /* Wait for ready flag */
@@ -1002,6 +1019,7 @@ int smp_boot_aps(void) {
             console_write("smp: AP ");
             console_write_dec(apic_id);
             console_write(" ready!\n");
+            smp_report_tsc_sync(apic_id);
             ap_count++;
             goto ap_done;
         }
@@ -1013,6 +1031,7 @@ int smp_boot_aps(void) {
             console_write("smp: AP ");
             console_write_dec(apic_id);
             console_write(" ready!\n");
+            smp_report_tsc_sync(apic_id);
             ap_count++;
             goto ap_done;
         }

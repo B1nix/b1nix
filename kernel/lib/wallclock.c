@@ -11,6 +11,7 @@
 #include <b1nix/ktime.h>
 #include <b1nix/rtc.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/vdso.h>
 
 #define SLEW_PPM 500
 
@@ -19,6 +20,22 @@ static i64 g_base_ns;    /* wall time at monotonic zero */
 static i64 g_slew_ns;    /* correction still to be applied */
 static u64 g_slew_mono;  /* monotonic time the pending correction started at */
 static int g_inited;
+
+/* Mirror the wall-clock state into the vDSO data page. Called with g_wall_lock
+ * held after every change, so the page never shows a combination this file
+ * did not hold. */
+static void wallclock_vdso_publish(void)
+{
+	u64 flags;
+	struct vdso_data *d = vdso_write_begin(&flags);
+
+	d->wall_base_ns = g_base_ns;
+	d->wall_slew_ns = g_slew_ns;
+	d->wall_slew_mono_ns = g_slew_mono;
+	d->wall_slew_div = 1000000u / SLEW_PPM;
+	d->wall_ready = (u32)g_inited;
+	vdso_write_end(flags);
+}
 
 /* How much of the pending correction has been applied by `mono`. */
 static i64 slew_applied(u64 mono)
@@ -39,6 +56,7 @@ void wallclock_init(u64 unix_seconds)
 	if (!g_inited) {
 		g_base_ns = (i64)(unix_seconds * 1000000000ull) - (i64)ktime_monotonic_ns();
 		g_inited = 1;
+		wallclock_vdso_publish();
 	}
 	spin_unlock_irqrestore(&g_wall_lock, flags);
 }
@@ -65,6 +83,7 @@ void wallclock_set_ns(u64 unix_ns)
 	g_base_ns = (i64)unix_ns - (i64)ktime_monotonic_ns();
 	g_slew_ns = 0;
 	g_inited = 1;
+	wallclock_vdso_publish();
 	spin_unlock_irqrestore(&g_wall_lock, flags);
 }
 
@@ -77,5 +96,6 @@ void wallclock_slew_ns(i64 delta_ns)
 	g_base_ns += done;
 	g_slew_ns = g_slew_ns - done + delta_ns;
 	g_slew_mono = mono;
+	wallclock_vdso_publish();
 	spin_unlock_irqrestore(&g_wall_lock, flags);
 }

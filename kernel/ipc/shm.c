@@ -287,6 +287,7 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     vma->flags = MAP_SHARED;
     vma->node = 0;
     vma->offset = 0;
+    vma->special = 0;
 
     /* Insert VMA into current_task, in address order. */
     vma_insert(current_task, vma);

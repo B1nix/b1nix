@@ -27,6 +27,7 @@
 #include <b1nix/spinlock.h>
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
+#include <b1nix/vdso.h>
 #include <string.h>
 
 #define PTRACE_MAX 32
@@ -330,8 +331,16 @@ static int ptrace_access(struct task *t, u64 addr, u64 *value, int write) {
   extern u64 vmm_direct_map_base(void);
   u64 direct = vmm_direct_map_base();
   u8 buf[8];
-  if (write)
+  if (write) {
     memcpy(buf, value, 8);
+    /* The vDSO's frames are mapped into every process; a poke here would
+     * patch all of them. Refuse before writing any byte of the word. */
+    for (usize i = 0; i < 8; i++) {
+      u64 phys = paging_user_phys(t->pml4_phys, addr + i);
+      if (phys && vdso_frame_is_shared(phys))
+        return -EIO;
+    }
+  }
 
   for (usize i = 0; i < 8; i++) {
     u64 va = addr + i;
@@ -409,6 +418,10 @@ static isize ptrace_copy_range(struct task *t, u64 addr, void *buf, usize len,
       done += got;
       continue;
     }
+    /* Same rule as ptrace_access: never write through to the vDSO frames
+     * every process shares. */
+    if (write && vdso_frame_is_shared(phys))
+      break;
     u8 *kva = (u8 *)(usize)(phys + direct);
     if (write)
       memcpy(kva, p + done, chunk);

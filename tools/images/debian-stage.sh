@@ -672,6 +672,35 @@ if command -v perl >/dev/null 2>&1; then
 	' || bad modern-perl $?
 fi
 
+# glibc reads the clock through the vDSO. A seccomp filter makes clock_gettime,
+# gettimeofday and time fail in the kernel (ENOTRECOVERABLE); a raw call proves
+# the filter is live, and then glibc's time() (perl's builtin) and date(1)
+# (clock_gettime) must still answer, which they can only do without the call.
+# x86_64 numbers; the aarch64 image does not run this harness.
+if [ -x /usr/bin/perl ] && [ "$(uname -m)" = x86_64 ]; then
+	perl -e '
+		open(my $m, "<", "/proc/self/maps") or exit 2;
+		my $maps = join("", <$m>);
+		exit 3 unless $maps =~ /\[vdso\]/ && $maps =~ /\[vvar\]/;
+		sub stmt { pack("S C C L", $_[0], 0, 0, $_[1]) }
+		sub jeq { pack("S C C L", 0x15, $_[1], 0, $_[0]) }  # BPF_JMP|BPF_JEQ|BPF_K
+		my $prog = stmt(0x20, 0)                              # A = seccomp_data.nr
+		         . jeq(228, 3) . jeq(96, 2) . jeq(201, 1)
+		         . stmt(0x06, 0x7fff0000)                     # RET ALLOW
+		         . stmt(0x06, 0x00050000 | 131);              # RET ERRNO(ENOTRECOVERABLE)
+		my $fprog = pack("S x6 p", 6, $prog);
+		exit 4 unless syscall(157, 38, 1, 0, 0, 0) == 0;      # PR_SET_NO_NEW_PRIVS
+		exit 5 unless syscall(317, 1, 0, $fprog) == 0;        # SECCOMP_SET_MODE_FILTER
+		my $ts = "\0" x 16;
+		exit 6 unless syscall(228, 1, $ts) == -1 && ($! + 0) == 131;
+		my $t = time;
+		exit 7 unless $t > 1000000000;
+		my $d = `/bin/date +%s`;
+		exit 8 unless $? == 0 && $d =~ /^(\d+)$/ && $1 >= $t;
+		exit 0;
+	' && ok vdso-glibc || bad vdso-glibc $?
+fi
+
 echo "DEBIAN-SMOKE: done"
 
 # Let QEMU exit on its own where possible; the host harness kills it on timeout

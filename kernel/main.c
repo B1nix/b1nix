@@ -173,6 +173,7 @@ extern void lkpi_cpuinfo_init(void);
 #include <b1nix/memtype.h>
 #include <b1nix/netconsole.h>
 #include <b1nix/pci.h>
+#include <b1nix/vdso.h>
 #include <lkpi/lkpi.h>
 
 
@@ -570,6 +571,9 @@ void kernel_main(usize arg0, usize arg1)
 
 	kheap_init();
 	k_info(NULL, "Step 4: KHeap initialized");
+	/* The vDSO's frames, while memory is plentiful and before anything the
+	 * clock code publishes into its data page. */
+	vdso_init();
 	/* Linux's xarray allocates its nodes from the radix-tree node cache, which
 	 * this creates from the heap. Before anything stores into an xarray, idr
 	 * or page cache — the imported filesystems register and mount long before

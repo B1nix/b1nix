@@ -8,6 +8,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
+#include <b1nix/vdso.h>
 
 extern void interrupts_init(void);
 
@@ -145,6 +146,24 @@ static inline u64 cntfrq(void)
 }
 
 void arch_tsc_clock_init(void) { /* nothing to calibrate: CNTFRQ_EL0 says it */ }
+
+/* Publish the counter to the vDSO data page: arch_tsc_monotonic_ns() below is
+ * the formula it repeats, from a zero base. There is no clamp to give up here —
+ * the generic timer's counter is one system-wide count, and the virtual offset
+ * is the same on every CPU (zero, from boot.S, or the hypervisor's single
+ * per-VM offset), so no CPU reads it behind another. */
+void arch_counter_vdso_publish(void)
+{
+	u64 f = cntfrq();
+	u64 flags;
+	struct vdso_data *d = vdso_write_begin(&flags);
+
+	d->clock_mode = f ? VDSO_CLOCK_ARM64_CNTVCT : VDSO_CLOCK_SYSCALL;
+	d->counter_base = 0;
+	d->counter_div = f;
+	d->counter_scale = 1000000000ull; /* Hz -> ns */
+	vdso_write_end(flags);
+}
 
 int arch_tsc_clock_ready(void) { return cntfrq() != 0; }
 

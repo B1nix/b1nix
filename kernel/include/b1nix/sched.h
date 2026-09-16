@@ -201,6 +201,9 @@ struct vm_area {
   u32 flags;
   struct vfs_node *node;
   isize offset;
+  /* VMA_SPECIAL_* (<b1nix/vdso.h>): a kernel-owned mapping with rules of its
+   * own — [vvar] and [vdso]. 0 for everything a process mapped itself. */
+  u32 special;
   struct vm_area *next;
   /* Only while retired: the list of mappings unlinked but not yet freed,
    * because a page-fault walker may still be holding one. See vma_retire. */

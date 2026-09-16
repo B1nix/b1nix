@@ -12,6 +12,7 @@
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
+#include <b1nix/vdso.h>
 #include <b1nix/vfs.h>
 #include <b1nix/landlock.h>
 #include <stdio.h>
@@ -101,6 +102,7 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define AT_SECURE  23
 #define AT_RANDOM  25
 #define AT_EXECFN  31
+#define AT_SYSINFO_EHDR 33
 #define DT_JMPREL  23
 #define DT_PLTREL  20
 
@@ -469,7 +471,11 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
    * NULL(1), auxv(6+). sp is 16-aligned right now, so after the pushes it stays
    * 16-aligned iff total_slots*sizeof(usize) is a multiple of 16. Pad with as
    * many zero words as needed to reach the next 16-byte boundary. */
-  usize total_slots = 35 + (usize)image->argc + (usize)envc;
+  /* The vDSO's address goes into the auxv, so it is chosen here, before the
+   * mapping exists; user_run_elf_image maps it at exactly this address. */
+  image->vdso_base = vdso_choose_base();
+  usize total_slots = 35 + (image->vdso_base ? 2u : 0u) + (usize)image->argc +
+                      (usize)envc;
   usize words_per_16 = 16 / sizeof(usize);
   usize rem = total_slots % words_per_16;
   usize pad = rem ? (words_per_16 - rem) : 0;
@@ -551,6 +557,12 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
    * earlier (before alignment); just push the pointer and type here. */
   if (user_stack_push_usize(stack, &sp, execfn_va) < 0) goto out;
   if (user_stack_push_usize(stack, &sp, AT_EXECFN) < 0) goto out;
+  /* AT_SYSINFO_EHDR: the vDSO's ELF header, where libc finds clock_gettime
+   * and friends that need no system call. Left out when there is no vDSO. */
+  if (image->vdso_base) {
+    if (user_stack_push_usize(stack, &sp, (usize)image->vdso_base) < 0) goto out;
+    if (user_stack_push_usize(stack, &sp, AT_SYSINFO_EHDR) < 0) goto out;
+  }
 
   /* The auxv block now spans [sp, auxv_end_sp) in this staging buffer; record
    * the equivalent user VA + length so /proc/<pid>/auxv can read it back. */
@@ -1917,6 +1929,14 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       }
       image->sigreturn_trampoline = tva;
     }
+  }
+
+  /* [vvar] and [vdso], at the address the auxv already names. */
+  {
+    int vrc = vdso_map_current(image);
+
+    if (vrc < 0)
+      return vrc;
   }
 
   if ((image->address_space.stack_base & 0xFULL) != 0) {

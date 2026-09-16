@@ -185,6 +185,21 @@ u32 arch_cpu_max_khz(void);
 /* Exact TSC rate in kHz from CPUID leaf 15h, or 0 when the CPU does not
  * publish one and it has to be measured instead. */
 u32 arch_tsc_khz_from_cpuid(void);
+#if defined(__aarch64__)
+/* Publish the generic timer's counter to the vDSO data page (aarch64 arch.c).
+ * Called once EL0 may read CNTVCT_EL0. */
+void arch_counter_vdso_publish(void);
+#endif
+#if defined(__x86_64__)
+/* TSC synchronisation check run while each AP comes up (x86_64 arch.c): the
+ * vDSO reads the counter without the kernel's cross-CPU clamp, so it may only
+ * do so on counters that never read behind one another. prepare before the
+ * SIPI, the AP half from ap_main, the boot-CPU half once the AP is ready
+ * (0 = in step). */
+void arch_tsc_warp_prepare(void);
+void arch_tsc_warp_check_ap(void);
+int  arch_tsc_warp_check_bsp(void);
+#endif
 
 /* Boot-stack accounting (x86_64: kernel/arch/x86_64/arch.c).
  *

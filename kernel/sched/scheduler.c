@@ -3604,6 +3604,17 @@ int scheduler_set_affinity(usize pid, u64 mask) {
   /* A mask that permits no online CPU would make the task unschedulable. */
   if ((mask & online_mask) == 0)
     return -EINVAL;
+  /* The same for a process confined to the boot CPU: while secondaries only
+   * run kernel workers (g_ap_userspace_enabled clear, the aarch64 default), a
+   * process pinned to a secondary alone is accepted and then never runs —
+   * and whoever waits on it, a joining thread or a lock it holds, waits for
+   * ever. Linux answers EINVAL for a mask outside the CPUs a task may use. */
+  {
+    extern volatile int g_ap_userspace_enabled;
+
+    if (t->user_image && !g_ap_userspace_enabled && !(mask & 1ULL))
+      return -EINVAL;
+  }
   g_task_affinity[task_index(t)] = mask & online_mask;
   return 0;
 }

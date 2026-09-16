@@ -46,6 +46,7 @@
 #include <b1nix/blk.h>
 #include <b1nix/mtd.h>
 #include <b1nix/pci.h>
+#include <b1nix/vdso.h>
 #include <b1nix/version.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1751,13 +1752,21 @@ static int r_pid_maps_walked(usize pid, struct sbuf *s) {
     return 0;
   usize n = 0;
 
-  /* mmap'd regions (the only ones the VMA list tracks). */
-  for (struct vm_area *v = t->vma_list; v && n < cap; v = v->next)
+  /* mmap'd regions (the only ones the VMA list tracks). The kernel's own
+   * [vvar]/[vdso] pair carries its name on the VMA: debuggers and libc
+   * backtraces look for "[vdso]" by name to find its symbols. */
+  for (struct vm_area *v = t->vma_list; v && n < cap; v = v->next) {
+    const char *name = (v->node && v->node->name[0]) ? v->node->name : 0;
+
+    if (v->special == VMA_SPECIAL_VVAR)
+      name = "[vvar]";
+    else if (v->special == VMA_SPECIAL_VDSO)
+      name = "[vdso]";
     procfs_maps_add(m, &n, cap, v->start, v->end, (int)v->prot,
                     (v->flags & 0x1) != 0, v->offset,
                     (v->node && v->node->inode) ? v->node->inode->ino : 0,
-                    v->node ? vfs_node_dev(v->node) : 0,
-                    (v->node && v->node->name[0]) ? v->node->name : 0);
+                    v->node ? vfs_node_dev(v->node) : 0, name);
+  }
 
   /* Name the mappings that belong to the loaded image. The executable's and
    * the interpreter's segments are mapped by the kernel loader, so they reach

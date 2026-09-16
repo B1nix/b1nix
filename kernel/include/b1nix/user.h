@@ -29,6 +29,11 @@
 /* Stack growth window reserved below USER_STACK_TOP. The loader describes it
  * with one VMA and procfs labels that VMA [stack], so both must agree. */
 #define USER_STACK_MAX_SIZE (8ULL * 1024ULL * 1024ULL)
+/* The [vvar]/[vdso] pair ends one guard page below this address: the bottom of
+ * the program interpreter's region (USER_LDSO_LOAD_BASE in process.c), above
+ * the eager linker's shared-object range and far from both the mmap arena
+ * growing up from 4 GiB and the stack/TLS/trampoline block at the top. */
+#define USER_VDSO_AREA_TOP 0x0000700000000000ULL
 
 enum user_image_kind {
 	USER_IMAGE_ELF64 = 2,
@@ -136,6 +141,10 @@ struct user_loaded_image {
 	 * app_entry preserves the executable's own entry point for AT_ENTRY. */
 	u64 app_entry;
 	u64 interp_base;
+	/* Where the vDSO's ELF header is mapped (AT_SYSINFO_EHDR); the [vvar]
+	 * page is the one below it. Chosen before the initial stack is built,
+	 * mapped by user_run_elf_image. 0 = this image has no vDSO. */
+	u64 vdso_base;
 	/* M80: where the auxiliary vector ended up on the initial user stack, so
 	 * /proc/<pid>/auxv can read it back out of the process's own address space
 	 * (a crash reporter reads AT_PHDR/AT_ENTRY/AT_BASE from there to locate the

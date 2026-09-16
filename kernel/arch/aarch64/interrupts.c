@@ -331,12 +331,29 @@ static void timer_rearm(void)
 	__asm__ volatile("msr cntv_cval_el0, %0" : : "r"(cval));
 }
 
+/* Let EL0 read CNTVCT_EL0 on this CPU (CNTKCTL_EL1.EL0VCTEN, bit 1): the vDSO
+ * reads the virtual counter directly. The other bits — EL0 access to the
+ * physical counter and to either timer's registers — stay as they were, off. */
+static void timer_allow_el0_counter(void)
+{
+	u64 v;
+
+	__asm__ volatile("mrs %0, cntkctl_el1" : "=r"(v));
+	v |= 1ull << 1;
+	__asm__ volatile("msr cntkctl_el1, %0" : : "r"(v));
+}
+
 static void timer_init(void)
 {
 	irq_unmask(TIMER_IRQ);
 
 	u64 freq;
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+
+	/* Every CPU grants EL0 the counter before it runs a process: this one
+	 * here, the secondaries in timer_init_cpu. Only then is it published. */
+	timer_allow_el0_counter();
+	arch_counter_vdso_publish();
 
 	u64 interval = timer_interval_ticks(freq);
 	__asm__ volatile("msr cntv_tval_el0, %0" : : "r"(interval));
@@ -356,6 +373,7 @@ void timer_init_cpu(void)
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
 	if (!freq)
 		return;
+	timer_allow_el0_counter();
 	irq_unmask(TIMER_IRQ);
 	__asm__ volatile("msr cntv_tval_el0, %0" : : "r"(timer_interval_ticks(freq)));
 	__asm__ volatile("msr cntv_ctl_el0, %0" : : "r"(1ULL));
