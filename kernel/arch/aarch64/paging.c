@@ -650,7 +650,6 @@ static int fault_anon_user_page(u64 va) {
   u64 frame = pmm_alloc_frame();
   if (!frame)
     return -1;
-  memset(phys_to_virt(frame), 0, PAGE_SIZE);
 
   u64 flags = VMM_PRESENT | VMM_USER;
   /* Honour the mapping's protection instead of always mapping writable. */
@@ -795,7 +794,6 @@ static int file_fill_fault_body(u64 *l3, usize i3, u64 va, u64 lazy_entry) {
   u64 frame = pmm_alloc_frame();
   if (!frame)
     return -1;
-  memset(phys_to_virt(frame), 0, PAGE_SIZE);
 
   u64 file_offset = (u64)vma->offset + (va - vma->start);
   u64 file_page = file_offset & ~(PAGE_SIZE - 1);
@@ -967,7 +965,6 @@ static int handle_page_fault_locked(u64 fault_addr, u64 error_code,
           }
           u64 frame = pmm_alloc_frame();
           if (!frame) return -1;
-          memset(phys_to_virt(frame), 0, PAGE_SIZE);
           l3[i3] = encode_leaf(frame, entry | VMM_PRESENT);
           tlb_flush_page(va);
           return 0;

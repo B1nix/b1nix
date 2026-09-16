@@ -450,9 +450,20 @@ else
 STACK_PROTECTOR_FLAG := -fno-stack-protector
 endif
 
+# Optimisation, for the kernel and the Linux code imported into it alike.
+#
+# Nothing set one, so every object was built at -O0: the kernel spent its CPU
+# time in unoptimised C, and upstream btrfs/ext4/DRM -- written and tested
+# optimised -- ran in a shape nobody else runs them in. The companions are
+# Linux's own: no strict aliasing and no null-check deletion (kernel code does
+# both on purpose), and frame pointers, which the backtraces and kprof walk.
+# `make KERNEL_OPT=-O0` for a debugging session.
+KERNEL_OPT ?= -O2 -fno-strict-aliasing -fno-delete-null-pointer-checks -fno-omit-frame-pointer
+
 COMMON_CFLAGS := \
 	-std=c11 \
 	-g \
+	$(KERNEL_OPT) \
 	$(FILE_PREFIX_MAP) \
 	-ffreestanding \
 	-fno-builtin \
@@ -904,7 +915,7 @@ endif
 lkpi_shim_cflags = $(subst -I kernel/include/i915-shim,-isystem kernel/include/i915-shim,$(subst -I build/src/,-isystem build/src/,$(filter-out -w,$(1)))) -Wall -Wextra
 
 DRM_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
-	-fno-stack-protector -fno-pic -w -g -MMD -MP \
+	-fno-stack-protector -fno-pic -w -g -MMD -MP $(KERNEL_OPT) \
 	$(FILE_PREFIX_MAP) \
 	-D__KERNEL__ -D__linux__ -DKBUILD_MODNAME='"drm"' \
 	$(DRM_IMPORT_ARCH_FLAGS) \
@@ -1168,7 +1179,7 @@ FS_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(FS_IMPORT_SOURCES))
 # generator derived from the pinned source, and the forward declarations for
 # structs the imported headers name before defining.
 FS_IMPORT_CFLAGS := -std=gnu11 -nostdinc -ffreestanding -fno-builtin \
-	-fno-stack-protector -fno-pic -w -g -MMD -MP \
+	-fno-stack-protector -fno-pic -w -g -MMD -MP $(KERNEL_OPT) \
 	-Wno-incompatible-pointer-types -Wno-incompatible-function-pointer-types \
 	$(FILE_PREFIX_MAP) \
 	-D__KERNEL__ -D__linux__ -DKBUILD_MODNAME='"b1nixfs"' \
@@ -1329,7 +1340,16 @@ ifeq ($(ARCH),aarch64)
 	$(OBJCOPY) -O binary $@ $(BUILD_DIR)/Image
 endif
 
-$(BUILD_DIR)/%.o: %.c
+# make does not watch flags: a KERNEL_OPT change must rebuild every object.
+KERNEL_OPT_HASH := $(firstword $(shell printf '%s' '$(KERNEL_OPT)' | cksum))
+KERNEL_OPT_STAMP := $(BUILD_DIR)/.kernel-opt-$(KERNEL_OPT_HASH)
+
+$(KERNEL_OPT_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(BUILD_DIR)/.kernel-opt-*
+	@touch $@
+
+$(BUILD_DIR)/%.o: %.c $(KERNEL_OPT_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) $(INSTRUMENT_FLAGS) -c $< -o $@
 

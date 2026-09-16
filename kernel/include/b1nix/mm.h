@@ -214,6 +214,7 @@ void pmm_init(const struct boot_info *boot_info);
 /* Variant B — start the background reclaim (kswapd) kernel thread. Call once the
  * scheduler and page cache are up. */
 void kswapd_init(void);
+/* A zeroed frame, or 0. Every path zeroes, so callers must not zero again. */
 u64 pmm_alloc_frame(void);
 u64 pmm_alloc_frames(usize count);
 

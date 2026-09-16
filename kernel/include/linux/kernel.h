@@ -145,9 +145,14 @@
 	} while (0)
 #define __BUILD_BUG_ON_CAT(a, b) a##b
 #define __BUILD_BUG_ON_ID(line) __BUILD_BUG_ON_CAT(__build_bug_on_, line)
+/* Upstream's compiletime_assert: the call survives only if the optimiser
+ * could not fold `e` to false. Requiring __builtin_constant_p(e) as well
+ * rejected assertions upstream accepts -- drm_edid.c checks fields of its
+ * const mode table, which folds after inlining but is never a constant
+ * expression. */
 #define BUILD_BUG_ON_MSG(e, msg)                               \
 	do {                                                       \
-		if (!__builtin_constant_p(!!(e)) || (e))               \
+		if (e)                                                 \
 			__BUILD_BUG_FAILED(__BUILD_BUG_ON_ID(__LINE__), msg); \
 	} while (0)
 #else

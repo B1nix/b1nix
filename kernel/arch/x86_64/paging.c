@@ -2277,7 +2277,6 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
         return -1;
       }
     }
-    memset((void *)((u64)frame + DIRECT_MAP_BASE), 0, PAGE_SIZE);
 
     // Commit under vmm_lock. Re-check that the leaf is still absent — another
     // CPU faulting the same anonymous address may have installed it while we
@@ -2416,7 +2415,6 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       }
     }
     void *new_frame_virt = (void *)((u64)frame + DIRECT_MAP_BASE);
-    memset(new_frame_virt, 0, PAGE_SIZE);
 
     // File-backed fill happens OUTSIDE vmm_lock (read_cb / blk_*_cached block).
     int shared_cache_frame = 0;
@@ -2542,6 +2540,23 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
         break;
       }
       vma = vma->next;
+    }
+
+    /* A write into a writable private mapping of a cached file page. The
+     * commit below would map the cache frame read-only + COW, and the retried
+     * store would fault a second time only to make the copy. Make it now:
+     * every library's relocated .data/.got page took two faults per exec. */
+    if (shared_cache_frame && !vma_shared && vma &&
+        (vma->prot & PROT_WRITE) && (error_code & PF_WRITE)) {
+      u64 priv = pmm_alloc_frame();
+
+      if (priv) {
+        memcpy((void *)(priv + DIRECT_MAP_BASE),
+               (void *)(frame + DIRECT_MAP_BASE), PAGE_SIZE);
+        pmm_unref_frame(frame);
+        frame = priv;
+        shared_cache_frame = 0;
+      }
     }
 
     // Commit: re-read the leaf; only install if it is still the same LAZY PTE.

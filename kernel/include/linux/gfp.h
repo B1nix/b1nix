@@ -10,9 +10,12 @@
  * honoured because it changes the result. */
 #define __GFP_NOFAIL  0x1000u
 #define __GFP_ZERO_ALIAS __GFP_ZERO
-#define __GFP_NOFAIL  0x1000u
 #define __GFP_HIGHMEM 0x0800u
-#define __GFP_DMA32   0x1000u
+/* Linux's value, and lkpi/types.h's GFP_DMA32. It was 0x1000 -- the same bit as
+ * __GFP_NOFAIL -- and outside GFP_ZONEMASK, where the radix tree keeps its
+ * ROOT_IS_IDR flag (4); upstream asserts that, and the assertion only runs
+ * once the imported code is built optimised. */
+#define __GFP_DMA32   GFP_DMA32
 #define GFP_USER      GFP_KERNEL
 #define GFP_HIGHUSER  GFP_KERNEL
 
