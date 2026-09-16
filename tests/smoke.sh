@@ -1062,7 +1062,7 @@ if [ "$SMOKE_PARALLEL" = "1" ] && { [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMO
 		# "skip single-cpu" and there is nothing further this lane can show. With
 		# only the marker above, the instance never stopped early — it ran the
 		# ENTIRE sys set a second time (~735 markers, ~10 minutes of wall time)
-		# just to hit the stall timeout, while holding one of the three slots the
+		# just to hit the stall timeout, while holding one of the pool slots the
 		# other lanes were queued for.
 		# aarch64 has no userspace-on-AP phase yet (kernel/arch/aarch64/smp.c
 		# says what is missing), so the work-stealing verdict is where this
@@ -1089,7 +1089,7 @@ fi
 
 # ── Post-SMP instances as launcher functions ──
 # 4 categories: sys (kernel+ipc+elf+diag), blk (storage), posix (shell+coreutils),
-# gfx (graphics). 3 slots run concurrently; when one finishes, the next starts
+# gfx (graphics). SMOKE_MAX_CONCURRENT slots run concurrently; when one finishes, the next starts
 # immediately. gfx is last so it doesn't block faster instances.
 launch_sys() {
 	(
@@ -1469,7 +1469,7 @@ launch_smp_solo() {
 	pid_smp=$!
 }
 
-# ── Dynamic slot pool: 3 concurrent, fill freed slots immediately ──
+# ── Dynamic slot pool: N concurrent, fill freed slots immediately ──
 # Polls finished PIDs every second (POSIX-sh compatible) rather than waiting
 # on full batches, so a fast instance exiting early makes room for the next one
 # without blocking on the others.
@@ -1525,18 +1525,16 @@ run_slot_pool() {
 }
 
 if [ "$SMOKE_PARALLEL" = "1" ]; then
-	# Three, because four is not faster -- not because four breaks.
+	# Five, measured. Three was chosen while the two root-module lanes spent
+	# 35 s each inside the boot loader and the host was idle-waiting on them;
+	# with the module packed tight the lanes are CPU-bound and five wins:
+	# x86_64 81-101 s -> 59-60 s, aarch64 146 s -> 93 s, all green. Six is no
+	# faster (x86_64 75 s, aarch64 90 s) on an 8-thread host.
 	#
-	# It did break, once: 232 s with 90 checks BLOCKED and two lanes panicking
-	# "deadlock or hang detected". That turned out to be the GUEST's own
-	# silence watchdog measuring wall time, so a starved-but-healthy machine
-	# accused itself of a deadlock. The watchdog now discounts the time the
-	# host did not give it (see serial_silence_watchdog), and four lanes come
-	# out at 114 s and 1385/0/0 -- against 112 s at three.
-	#
-	# So the host really is saturated at three and there is nothing to win by
-	# going wider; it simply no longer costs correctness to try.
-	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
+	# Oversubscription no longer costs correctness: the guest's silence
+	# watchdog discounts the time the host did not give it (see
+	# serial_silence_watchdog).
+	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-5}
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
 	# Longest first, measured by WALL time rather than by the guest clock.
 	#

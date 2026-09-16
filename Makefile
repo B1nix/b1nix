@@ -2127,11 +2127,11 @@ SMOKE_ROOT_MODULE ?=
 
 # The two lanes that receive the root filesystem as a boot module get a trimmed
 # copy of it. The module is read off the emulated CD and copied into memory
-# before the kernel starts: 512 MB takes 33 s that way, against 4 s of actual
-# work in the switchroot lane. The image is that large because it is a
-# comfortable writable root on a disk, and 317 MB of it is free space these
-# lanes never touch. Same contents, room left to write in, a third of the read.
-ROOT_MODULE_SIZE ?= 288
+# before the kernel starts, at about 15 MB/s: every megabyte in it is paid for
+# in boot time. Same contents, packed tight and zstd-compressed (477 MB -> 256
+# MB, 35 s -> 18 s to the kernel), plus this much room to write in (MB).
+ROOT_MODULE_ROOM ?= 96
+ROOT_MODULE_COMPRESS ?= zstd
 ROOT_MODULE = $(BUILD_DIR)/root-module.img
 
 iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
@@ -2140,7 +2140,7 @@ iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-init iso-switchroot i
 	@# build asked for it or not. That is how images meant to be forty
 	@# megabytes kept coming out at five hundred and fifty.
 	@$(if $(or $(SMOKE_ROOT_MODULE),$(filter iso-blk iso-switchroot,$@)),,rm -f $(BUILD_DIR)/$@/boot/rootfs.img)
-	@$(if $(filter iso-blk iso-switchroot,$@),sh tools/images/trim-root-module.sh $(BUILD_DIR)/rootfs $(ROOT_IMAGE) $(ROOT_MODULE) $(ROOT_MODULE_SIZE),)
+	@$(if $(filter iso-blk iso-switchroot,$@),ROOT_FS='$(ROOT_FS)' ROOT_MODULE_COMPRESS='$(ROOT_MODULE_COMPRESS)' sh tools/images/trim-root-module.sh $(BUILD_DIR)/rootfs $(ROOT_IMAGE) $(ROOT_MODULE) $(ROOT_MODULE_ROOM),)
 	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
