@@ -575,6 +575,9 @@ static u64   g_task_pass[TASK_SLOTS];
  * slot. 0 means "any CPU". */
 static u64 g_task_affinity[TASK_SLOTS];
 static u64   g_min_pass = 0;
+/* How far ahead of virtual time a woken task may keep its pass: 200 turns at
+ * the nice-0 stride. */
+#define SCHED_WAKE_MAX_LEAD (200u * 50u)
 /* Last userspace RIP of each task, captured by the LAPIC timer tick when it
  * preempts a ring-3 task (see task_set_user_rip). Consumed by the silence
  * watchdog task dump to name the user function a wedged thread group spins
@@ -1730,7 +1733,8 @@ static struct task *pick_next_task(void) {
         __atomic_store_n(&t->stack_released, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&g_task_switching_out[task_index(t)], 0,
                          __ATOMIC_RELEASE);
-        g_min_pass = g_task_pass[task_index(t)];
+        /* Not g_min_pass: this path takes the queue's head, not the lowest
+         * pass, and virtual time must not jump to whatever that task held. */
         g_pick_rq++; g_last_pick_id = t->id;
         return t;
       }
@@ -1774,6 +1778,33 @@ static struct task *pick_next_task(void) {
       max_priority = priority;
       min_pass = pass;
       best_task = t;
+    }
+  }
+
+  /* Bound how far behind the lowest pass any candidate may wait.
+   *
+   * Stride order is only fair among tasks whose passes were kept on one scale,
+   * and one global virtual time cannot keep them there once tasks are pinned:
+   * the CPU that runs only kernel threads advances it while the CPU carrying
+   * pinned CPU-bound threads stays far behind. A task woken onto that second
+   * CPU arrived 170 million ahead of soak's cpustress burners (stride 50 each)
+   * and waited for ever. Pull such a candidate to within SCHED_WAKE_MAX_LEAD of
+   * the minimum: it then runs within two hundred nice-0 turns, and tasks inside
+   * the window keep their order. */
+  if (best_task) {
+    for (usize offset = 1; offset <= g_task_hwm; offset++) {
+      usize index = (start + offset) % g_task_hwm;
+      struct task *t = T(index);
+
+      if (!t || t->state != TASK_READY || t->stealable ||
+          t->priority != max_priority)
+        continue;
+      if (on_ap && !t->ap_runnable)
+        continue;
+      if (pcpu && !sched_task_allowed_on_cpu(t, pcpu->cpu_id))
+        continue;
+      if (g_task_pass[index] > min_pass + SCHED_WAKE_MAX_LEAD)
+        g_task_pass[index] = min_pass + SCHED_WAKE_MAX_LEAD;
     }
   }
 
@@ -1825,7 +1856,10 @@ static struct task *pick_next_task(void) {
         __atomic_store_n(&best_task->stack_released, 0, __ATOMIC_RELEASE);
         __atomic_store_n(&g_task_switching_out[task_index(best_task)], 0,
                          __ATOMIC_RELEASE);
-        g_min_pass = g_task_pass[task_index(best_task)];
+        /* The lowest pass this CPU may run, so virtual time. Forward only:
+         * two CPUs publishing their own minimum must not move it back. */
+        if (g_task_pass[task_index(best_task)] > g_min_pass)
+          g_min_pass = g_task_pass[task_index(best_task)];
         g_pick_scan++; g_last_pick_id = best_task->id;
         return best_task;
       }
@@ -2041,6 +2075,13 @@ static void sched_wake_enqueue(struct task *t) {
 
     if (g_task_pass[i] < g_min_pass)
       g_task_pass[i] = g_min_pass;
+    /* Nor far ahead of it. A waker whose pass was raised to an inflated
+     * virtual time sat behind every CPU-bound task for as many turns as the
+     * gap: soak's cpustress main thread woke 200 million ahead of its own 18
+     * burners (stride 50 each) and never ran again. Two hundred nice-0 turns
+     * is lead enough for a task that has genuinely run more. */
+    if (g_task_pass[i] > g_min_pass + SCHED_WAKE_MAX_LEAD)
+      g_task_pass[i] = g_min_pass + SCHED_WAKE_MAX_LEAD;
   }
   sched_rq_enqueue_current(t);
 }
