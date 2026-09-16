@@ -1,7 +1,7 @@
 # M122: corruption and SMP defects
 
 What was found, what was fixed, and what the evidence for each is. Everything
-below is on x86_64 and aarch64 full smoke (1448/0 and 1395/0) unless a line
+below is on x86_64 and aarch64 full smoke (1464/0 and 1411/0) unless a line
 says otherwise.
 
 ## Proof harness: fsverify
@@ -15,8 +15,10 @@ The verdict is taken on the host with tools that are not this kernel:
 exactly.
 
 Result after the fixes: clean at 1, 2 and 4 CPUs with a 1 GiB guest and up to
-1080 files per filesystem. At 6 CPUs and scale 300 three of thirty-one runs failed --
-see "Not closed" -- and 11/12 earlier at 384 MiB (the twelfth was an OOM).
+1080 files per filesystem, and at 6 CPUs and scale 300 in 14/14 runs of the
+closing campaign (after two of thirty-one failed before the write-back fix
+below). Alongside it, 10/10 `soak all` runs at 6 CPUs and 26/26 of the `gfx`
+workload that exposed the double reap.
 
 On the passed-through UHD 630 the same fix is checked on the frame the display
 engine reads: boot KDE with `b1nix.drm-framedump-key b1nix.drm-framedump-rgb
@@ -74,54 +76,47 @@ black runs inside the terminal window; after it, none.
   waker did to its state meanwhile. 30/30 `SMP=6` vm-none/vm/spawn soak runs
   clean.
 
-## Not closed
+- **One task reaped twice** (`pmm_free_frame: double-free of physical frame`,
+  `unmap_page_from_pml4` <- `user_address_space_cleanup` <- `scheduler_waitpid`,
+  about one `gfx` soak run in eight). The fatal-signal branches of
+  `scheduler_deliver_pending_signals` mark the task DEAD and return, with the
+  SIGKILL still pending; the dying task runs on to its final switch-out, and
+  every further pass through delivery ran the death again and stored TASK_DEAD
+  over the TASK_REAPING its parent's `waitpid` had claimed. The reaper then
+  claimed the same task, and both freed its address space and kernel stack.
+  Found by recording, per CPU, the root being torn down with each freed frame:
+  both frees named one root and one task. A dead task now delivers nothing.
+  aarch64 had relied on the repeat: its return-to-user path exited a
+  default-action kill with `128 + sig`, which waitpid reads as a normal exit,
+  and the second pass happened to overwrite it; it now reports the signal.
+  0/26 `gfx` runs after, 3/20 before. This is also the most likely source of
+  the kernel stack overwritten under a `#GP` below: a stack freed while its
+  task was still being torn down.
+- **Starvation under pinned CPU-bound threads.** One global stride virtual time
+  cannot keep tasks pinned to different CPUs on one scale: a woken task landed
+  170 million passes behind soak's pinned `cpustress` burners and never ran
+  (`vm` then `cpu` hung every time). A candidate's pass is now held within 200
+  nice-0 turns of the lowest one its CPU can run.
 
-- **One data block with a bad checksum, twice** (`btrfs check`:
-  `mirror 1 bytenr ... csum ... expected ...`), in two of thirty-one fsverify runs at 6 CPUs
-  and scale 300. Every file extracted from that image still matched the
-  guest's manifest, so the data block on the disk is the newest version and its
-  checksum entry is not: a lost metadata write. The image is kept at
-  `smoke_run/final/fsv/f6-smp6/btrfs.img` and `btrfs check --check-data-csum`
-  names the block (`mirror 1 bytenr 203378688`).
+## Watched, not reproduced
 
-  A write-back run that drops a dirty block was found by reading the code.
-  `bcache_writeback_run` walks back from its anchor to the start of the
-  contiguous dirty region and then writes forward for at most `run_max`
-  blocks -- so a walk of the full `run_max` leaves the anchor one block past
-  the end of the command. The eviction caller cleared the anchor's DIRTY flag
-  regardless, and that block's contents were dropped: the next read of it
-  returns what the disk held before. Exactly one lost metadata block, under
-  memory pressure, on a device whose maximum transfer bounds `run_max` -- the
-  shape observed. The walk back now stops one short of `run_max`, and eviction
-  refuses to recycle a block a landed run did not cover.
-
-- **A `#GP` with `rip` a small integer**, once, in the same setting: the fault
-  is inside the TLB-shootdown IPI handler and the return address on the kernel
-  stack had been overwritten. Same shape as the two-CPUs-one-stack family,
-  which the lease CAS was meant to close, so either that fix is incomplete or
-  something else writes into a kernel stack. The switch path now refuses to
-  run a task that is already some CPU's current task -- a walk of at most
-  MAX_CPUS pointers per switch -- so if it is the two-CPUs-one-stack shape the
-  next occurrence panics with both CPU numbers instead of faulting at a wild
-  address.
-- **A task switched out holding a linuxkpi spinlock.** Once, in an `all`
-  workload at `SMP=6` and scale 400: the per-CPU held-lock count was still set
-  from another task (`filemap_find_get`'s xarray lock, taken by task 254) when
-  a second task yielded on that CPU, and the guard panicked
-  ("yield while holding an lkpi spinlock").
-
-  The count was the bug. A release credited itself to the CPU doing the
-  releasing, and a lock released on a different CPU than it was taken on --
-  which the tree already reports, and which happens -- left the acquiring
-  CPU's count positive for the rest of the boot. Everything keyed on that
-  count then described a machine that did not exist: the next task to yield
-  there was panicked for a lock it never held, and the interrupt-restore path
-  stopped firing because the count never reached zero again. A release is now
-  credited to the CPU that took the lock.
-- **Memory pressure.** The panics are gone -- heap growth, page-table
-  allocation, `fork` and large allocations report ENOMEM and the OOM killer
-  runs -- but fsverify at 384 MiB with scale 200 still does not finish: usually
-  the guest degrades honestly (btrfs aborts its transaction with ENOMEM, fork
-  fails), and once it ended in a TLB-shootdown stall
-  (`tlb: STUCK cpu N task=kswapd`), which was not reproduced again. Belongs to
-  M127.
+- **The btrfs checksum miss** (`mirror 1 bytenr ...` in two of thirty-one heavy
+  fsverify runs): the write-back anchor fix above covers the observed shape;
+  0/24 heavy runs since.
+- **A `#GP` with `rip` a small integer**, once: the return address on a kernel
+  stack had been overwritten. The double reap above freed a kernel stack while
+  its task was still being torn down, which produces exactly that; it has not
+  reappeared. The switch path still refuses to run a task that is already some
+  CPU's current task, so a two-CPUs-one-stack case would panic by name.
+- **Only with the host overcommitted about 3x** (a full smoke run and an
+  `all` soak started together on 8 host threads): a spinlock lockup on the
+  TLB-shootdown lock in the spawn phase (2 of 9 such runs, 0 of 6 since) and
+  once a `BCACHE-TEST` writer left BLOCKED on a virtio-blk completion. Neither
+  reproduces on an unloaded host or under synthetic host CPU load. A lockup on
+  the shootdown lock now names the round in flight: holder CPU, operation,
+  pending count, and each CPU that has not acknowledged with the task it runs.
+- **Memory pressure.** Heap growth, page-table allocation, `fork` and large
+  allocations report ENOMEM, but fsverify at 384 MiB with scale 200 still
+  degrades rather than finishing. Belongs to M127.
+- **i915 `uncore->lock` lockup during probe**: 0/30 boots before and after; kept
+  in [i915-gen9-passthrough.md](i915-gen9-passthrough.md).

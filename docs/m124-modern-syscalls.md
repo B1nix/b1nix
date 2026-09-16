@@ -25,3 +25,24 @@ values, not merely the absence of ENOSYS.
 | `memfd_secret` | planned | Needs pages removed from the kernel direct map, which has no attribute-changing API yet. |
 
 The unmapped-syscall log line is checked through the KDE smoke run.
+
+## vDSO
+
+`kernel/vdso/` builds a small shared object per architecture (C, no relocations,
+`--hash-style=both`), mapped at exec as `[vdso]` with a read-only `[vvar]` page
+before it and announced by `AT_SYSINFO_EHDR`. x86_64 exports
+`__vdso_clock_gettime`, `__vdso_gettimeofday`, `__vdso_time` and
+`__vdso_clock_getres` (`LINUX_2.6`); aarch64 exports `__kernel_clock_gettime`,
+`__kernel_gettimeofday` and `__kernel_clock_getres` (`LINUX_2.6.39`).
+
+`[vvar]` (`struct vdso_data`, `kernel/include/b1nix/vdso.h`) holds a sequence
+count and exactly the parameters of the kernel's own clock formulas: counter
+base and divisor, the ktime origin, the wall clock base and slew. REALTIME,
+MONOTONIC, MONOTONIC_RAW and BOOTTIME are computed in user mode; every other
+clock, and any machine whose counter is not trusted, makes the system call. On
+x86_64 the TSC is published only when it is invariant, calibrated, and read in
+step by each AP against the boot CPU at bring-up, so readings agree with the
+kernel's clamped path. `vdso_smoke` proves the calls do not enter the kernel
+(under a seccomp filter refusing them) and agree with the raw system calls;
+the Debian lane's `vdso-glibc` probe does the same for glibc.
+
