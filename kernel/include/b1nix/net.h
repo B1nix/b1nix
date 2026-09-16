@@ -255,6 +255,8 @@ struct tcp_conn;
 struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port);
 struct tcp_conn *tcp_connect_async(struct ipv4_addr dst_ip, u16 dst_port);
 int tcp_is_established(struct tcp_conn *conn);
+/* Errno of a failed active open (ECONNREFUSED, ETIMEDOUT), else 0. */
+int tcp_connect_error(struct tcp_conn *conn);
 int tcp_is_readable(struct tcp_conn *conn);
 usize tcp_bytes_available(struct tcp_conn *conn);
 int tcp_is_close_wait(struct tcp_conn *conn);

@@ -1266,7 +1266,7 @@ int vfs_epoll_wait(int epfd, struct b1nix_epoll_event *events, int maxevents,
     if (scheduler_signal_pending()) {
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
-      return -ERESTARTSYS;
+      return -ERESTARTNOHAND;
     }
 
     scheduler_wait_commit();

@@ -2012,7 +2012,6 @@ check_output "$LOG" "MM-SMOKE: done" "MM smoke completes"
 if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
 	section "M40 Linux ABI Compatibility"
 	check_output "$LOG" "M40-LINUX: start" "M40 Linux ABI smoke starts"
-	check_output "$LOG" "elf: Linux personality detected: /bin/m40-linux-hello" "loader tags the static Linux binary with the Linux personality"
 	check_output "$LOG" "M40-LINUX: hello from a static linux binary" "translated Linux write(1,...) reached the console"
 	check_output "$LOG" "M40-LINUX: ok fstat" "Linux fstat(2) result is translated to the Linux struct stat layout (st_mode at offset 24)"
 	check_output "$LOG" "M40-LINUX: ok uname" "Linux uname(2) result is translated to the Linux struct utsname layout (machine at offset 260)"

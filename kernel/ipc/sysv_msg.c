@@ -147,7 +147,7 @@ isize sysv_msgsnd(int msqid, i64 mtype, const void *text, usize size,
     }
     if (scheduler_signal_pending()) {
       kfree(copy);
-      return -ERESTARTSYS;
+      return -ERESTARTNOHAND;
     }
     scheduler_block_on(msg_chan(msqid));
   }
@@ -220,7 +220,7 @@ isize sysv_msgrcv(int msqid, i64 msgtyp, void *text, usize size, int msgflg,
     if (msgflg & SYSV_IPC_NOWAIT)
       return -ENOMSG;
     if (scheduler_signal_pending())
-      return -ERESTARTSYS;
+      return -ERESTARTNOHAND;
     scheduler_block_on(msg_chan(msqid));
   }
 }

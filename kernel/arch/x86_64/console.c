@@ -469,11 +469,6 @@ void console_log_init(void)
 	 * an explicit `loglevel=` always wins over it. */
 	if (bootinfo_has_flag("quiet"))
 		level = CONSOLE_LOGLEVEL_QUIET;
-	/* The smoke lanes grade the serial log and some of what they grade is
-	 * debug-level tracing (which binary got which personality); they see
-	 * everything. A desktop's console shows info and worse, as Linux does. */
-	if (bootinfo_has_flag("b1nix.test=1"))
-		level = LOGLEVEL_DEBUG;
 	if (bootinfo_get_kv("loglevel", value, sizeof(value)) && value[0])
 		level = (int)bootinfo_get_u32("loglevel", (u32)level);
 	if (level < 0)
@@ -600,7 +595,13 @@ void console_bust_lock(void)
 	                 __ATOMIC_RELEASE);
 	__atomic_store_n(&console_lock_owner, 0, __ATOMIC_RELEASE);
 	console_lock_depth = 0;
-	console_log_panic_flush();
+	/* Only a boot that has not parsed its command line yet needs the held
+	 * lines released here. Every ring-3 fault report busts the lock too, and
+	 * forcing the console to debug level from there left it at debug for the
+	 * rest of the boot: three loader lines per exec, each a millisecond of
+	 * interrupts-off UART output. A real panic raises the level itself. */
+	if (!con_configured)
+		console_log_panic_flush();
 }
 
 void console_lock_acquire_irqsave(u64 *flags)

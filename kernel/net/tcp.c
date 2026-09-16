@@ -356,6 +356,9 @@ struct tcp_conn {
   int accept_pending;
   u64 accept_since;
   u64 time_wait_since;
+  /* Why an active open failed (ECONNREFUSED, ETIMEDOUT), for the poll and
+   * SO_ERROR of a non-blocking connect; 0 while it is pending or succeeded. */
+  int connect_error;
   struct tcp_retransmit_pkt *retransmit_queue;
 };
 
@@ -1186,6 +1189,17 @@ struct tcp_conn *tcp_connect6(struct in6_addr_k dst_ip6, u16 dst_port) {
       tcp_connect_start_af(B1NIX_AF_INET6, z4, dst_ip6, dst_port));
 }
 
+int tcp_connect_error(struct tcp_conn *conn) {
+  if (!conn)
+    return 0;
+  u64 irq = irq_save();
+  tcp_lock();
+  int err = conn->state == TCP_CLOSED ? conn->connect_error : 0;
+  tcp_unlock();
+  irq_restore(irq);
+  return err;
+}
+
 int tcp_is_established(struct tcp_conn *conn) {
   if (!conn)
     return 0;
@@ -1491,7 +1505,7 @@ struct tcp_conn *tcp_accept6(u16 local_port, struct in6_addr_k *client_ip6,
 /* ── TCP send data ── */
 int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
   if (!conn)
-    return -1;
+    return -ENOTCONN;
   if (len == 0)
     return 0;
 
@@ -1506,18 +1520,18 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
   usize packet_len = sizeof(struct tcp_header) + to_alloc;
   u8 *packet = kzalloc(packet_len);
   if (!packet)
-    return -1;
+    return -ENOBUFS;
 
   struct tcp_retransmit_pkt *rp = kmalloc(sizeof(struct tcp_retransmit_pkt));
   if (!rp) {
     kfree(packet);
-    return -1;
+    return -ENOBUFS;
   }
   rp->data = kmalloc(packet_len);
   if (!rp->data) {
     kfree(rp);
     kfree(packet);
-    return -1;
+    return -ENOBUFS;
   }
 
   u64 irq = irq_save();
@@ -1529,7 +1543,10 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
     kfree(rp->data);
     kfree(rp);
     kfree(packet);
-    return -1;
+    /* The connection is gone or closing. -1 reached userspace as EPERM,
+     * which dropbear and mbedTLS then reported as "Operation not
+     * permitted" for a peer that had simply hung up. */
+    return -EPIPE;
   }
 
   u32 window = conn->snd_wnd < conn->cwnd ? conn->snd_wnd : conn->cwnd;
@@ -2279,6 +2296,13 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
       }
     } else if (flags & TCP_RST) {
       conn->state = TCP_CLOSED;
+      conn->connect_error = ECONNREFUSED;
+      /* A non-blocking connect is waiting in poll for this answer. Without
+       * the wake it learned of the refusal only from its own timeout: curl's
+       * first HTTPS attempt against a server not listening yet sat out the
+       * full two seconds of --connect-timeout. */
+      extern void *vfs_poll_chan;
+      scheduler_wake_all(vfs_poll_chan);
     }
     break;
 
@@ -2654,6 +2678,8 @@ void tcp_timer_tick(void) {
       }
       if (now - rp->timestamp >= 50) { // 500ms
         if (rp->retries >= 5) {
+          if (conn->state == TCP_SYN_SENT)
+            conn->connect_error = ETIMEDOUT;
           conn->state = TCP_CLOSED;
           tcp_unlock();
           irq_restore(irq);

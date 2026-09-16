@@ -821,6 +821,15 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
           pfd->revents |= B1NIX_POLLHUP;
         }
       }
+    } else if (s->tcp_conn && !s->listening) {
+      /* A non-blocking connect that failed is writable with an error, as on
+       * Linux: the caller learns why from SO_ERROR. */
+      int err = tcp_connect_error((struct tcp_conn *)s->tcp_conn);
+      if (err) {
+        pfd->revents |= B1NIX_POLLOUT | B1NIX_POLLERR | B1NIX_POLLHUP;
+        if (!s->so_error)
+          s->so_error = err;
+      }
     } else if (s->listening) {
       u16 port = ntoh16(s->local.in.sin_port);
       if (tcp_pending_connections_af(port, s->domain, s->ipv6_v6only)) {

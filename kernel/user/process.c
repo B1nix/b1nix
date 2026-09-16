@@ -799,9 +799,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
 
   /* Every user image speaks the Linux ABI, as on Linux itself: EI_OSABI is not
    * consulted (a static musl binary leaves it at SYSV with no ABI note), and
-   * the syscall numbers are translated at dispatch time. Debug level: one line
-   * per exec is one line per `grep` a shell script forks. */
-  k_debug("elf", "Linux personality detected: %s", path);
+   * the syscall numbers are translated at dispatch time. */
 
   /* M30: PIE / ET_DYN support. For ET_DYN the segment vaddrs are 0-based
    * and the loader gets to choose where to place the image. We use a

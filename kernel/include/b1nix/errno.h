@@ -82,6 +82,9 @@
 #define EKEYREJECTED 129
 #define EBADFD 77
 #define ERESTARTSYS     512 /* Restart system call */
+/* Restart only if no handler runs: select, poll, epoll_wait and the SysV IPC
+ * waits return EINTR after a handler whatever SA_RESTART says, as on Linux. */
+#define ERESTARTNOHAND  514
 
 /* Helper: convert negative error to -errno */
 #define ERR_PTR(err) ((void *)(isize)(err))

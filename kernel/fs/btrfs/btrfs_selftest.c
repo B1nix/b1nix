@@ -27,13 +27,22 @@
  * The large file's content is a formula (line N is N, zero-padded), so the
  * guest derives what it should see rather than being told. */
 static int btrfs_probe_disk(struct block_device *dev, const char *label) {
-    u8 *buf = kmalloc(4096);
+    /* In the device's own blocks. The read counts blocks of dev->block_size,
+     * and asking a 2048-byte CD for "8 sectors" into a 4 KiB buffer wrote
+     * 16 KiB into it: the heap block past it held a CPU's current-task
+     * pointer, and the next timer tick took a #GP on it. */
+    u32 bsize = (u32)dev->block_size;
+
+    if (bsize == 0 || BTRFS_SUPER_INFO_OFFSET % bsize != 0)
+        return 0;
+    u32 count = (u32)((BTRFS_SUPER_INFO_SIZE + bsize - 1) / bsize);
+    u8 *buf = kmalloc((usize)count * bsize);
 
     if (!buf)
         return 0;
     int ok = 0;
 
-    if (blk_read_cached(dev, BTRFS_SUPER_INFO_OFFSET / 512, 8, buf) >= 0) {
+    if (blk_read_cached(dev, BTRFS_SUPER_INFO_OFFSET / bsize, count, buf) >= 0) {
         const struct btrfs_super_block *sb =
             (const struct btrfs_super_block *)buf;
 

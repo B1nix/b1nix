@@ -225,7 +225,7 @@ int sysv_semop(int semid, const struct sysv_sembuf *ops, usize nops,
     spin_unlock_irqrestore(&g_sem_lock, flags);
 
     if (scheduler_signal_pending()) {
-      rc = -ERESTARTSYS;
+      rc = -ERESTARTNOHAND;
     } else if (timeout_ms >= 0) {
       scheduler_block_on_timeout(sem_chan(semid), deadline);
       rc = (scheduler_get_uptime_ticks() >= deadline) ? -EAGAIN : 0;

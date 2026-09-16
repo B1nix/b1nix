@@ -6,6 +6,7 @@
 
 #define BTRFS_MAGIC "_BHRfS_M"
 #define BTRFS_SUPER_INFO_OFFSET 65536 // 64KB
+#define BTRFS_SUPER_INFO_SIZE 4096
 
 struct btrfs_disk_key {
     u64 objectid;

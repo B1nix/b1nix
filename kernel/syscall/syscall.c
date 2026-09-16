@@ -3281,15 +3281,16 @@ static u64 sys_poll_ns(struct b1nix_pollfd *user_fds, u64 nfds,
       return (u64)ready;
     }
 
-    /* Interrupted by a caught signal? Abort with -ERESTARTSYS so the dispatch
-     * tail returns EINTR (or restarts under SA_RESTART) and delivers the
-     * handler. Checked with IRQs still disabled (from wait_prepare) so a signal
-     * posted concurrently is not missed before we sleep. */
+    /* Interrupted by a caught signal? Abort with -ERESTARTNOHAND so the
+     * dispatch tail returns EINTR and delivers the handler; poll is never
+     * restarted after a handler, SA_RESTART or not. Checked with IRQs still
+     * disabled (from wait_prepare) so a signal posted concurrently is not
+     * missed before we sleep. */
     if (select_poll_signal_pending()) {
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
       kfree(heap_fds);
-      return (u64)-ERESTARTSYS;
+      return (u64)-ERESTARTNOHAND;
     }
 
     /* Re-arm the timer deadline EVERY iteration, after wait_prepare: an
@@ -6256,7 +6257,7 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #if defined(__aarch64__)
     int restarted = 0;
 #endif
-    if (ret == (u64)-ERESTARTSYS) {
+    if (ret == (u64)-ERESTARTSYS || ret == (u64)-ERESTARTNOHAND) {
       u64 pending = __atomic_load_n(&current_task->pending_signals,
                                     __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
       int restart = 1;
@@ -6264,7 +6265,12 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
         if (pending & (1ULL << (i - 1))) {
           struct sigaction *sa = &current_task->sigactions[i - 1];
           if (sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL) {
-            if (!(sa->sa_flags & SA_RESTART)) {
+            /* A handler runs. ERESTARTNOHAND calls (select, poll,
+             * epoll_wait, SysV IPC) then fail with EINTR regardless of
+             * SA_RESTART: dropbear's SIGTERM handler, installed through
+             * signal() and so with SA_RESTART, only sets a flag its select
+             * loop checks, and a restarted select never let it look. */
+            if (ret == (u64)-ERESTARTNOHAND || !(sa->sa_flags & SA_RESTART)) {
               restart = 0;
             }
             break;
@@ -11150,7 +11156,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 
     current_task->wake_tick = 0;
     if (select_eintr) {
-      ret = (u64)-ERESTARTSYS;
+      ret = (u64)-ERESTARTNOHAND;
       break;
     }
 
