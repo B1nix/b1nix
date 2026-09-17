@@ -453,6 +453,24 @@ if command -v perl >/dev/null 2>&1; then
 		res("pkey", $r == -1 && $ea == ENOSPC && $r2 == 0 && $r3 == -1 && $e3 == EINVAL,
 		    "alloc=$r/$ea mprot=$r2 bad=$r3/$e3");
 
+		# memfd_secret: shared mappings only; the owner reads and writes it
+		# through the mapping (here via read(2) into it), /proc/self/mem cannot.
+		my $sfd = syscall(447, 0);
+		my $strunc = $sfd >= 0 ? syscall(77, $sfd, $PAGE) : -1;
+		my $spriv = $sfd >= 0 ? syscall(9, 0, $PAGE, 3, 0x02, $sfd, 0) : 0;
+		my $esp = err();
+		my $smap = $sfd >= 0 ? syscall(9, 0, $PAGE, 3, 0x01, $sfd, 0) : -1;
+		pipe(my $spr, my $spw); syswrite($spw, "b1nix-secret"); close $spw;
+		my $sread = $smap > 0 ? syscall(0, fileno($spr), $smap, 12) : -1;
+		my $sseen = $sread == 12 ? unpack("P12", pack("Q", $smap)) : "";
+		open(my $smem, "<", "/proc/self/mem");
+		my $sbuf = "";
+		sysseek($smem, $smap, 0);
+		my $smr = sysread($smem, $sbuf, 12); my $esm = err();
+		res("memfd-secret", $sfd >= 0 && $strunc == 0 && $spriv == -1 && $esp == EINVAL &&
+		    $sseen eq "b1nix-secret" && !defined $smr && $esm == EIO,
+		    "fd=$sfd trunc=$strunc priv=$spriv/$esp read=$sread mem=$esm");
+
 		# sched_getattr / sched_setattr.
 		my $attr = "\0" x 56;
 		$r = syscall(315, 0, $attr, 56, 0);
@@ -656,8 +674,9 @@ if command -v perl >/dev/null 2>&1; then
 		    $llbits == 31 && $nnp == 0 && !-e "/tmp/b1nix-ll-outside",
 		    "abi=$vers empty=$er/$eer net=$nr/$enr bits=$llbits nnp=$nnp");
 
-		# quotactl: the ABI is answered, quotas are not supported by any
-		# filesystem here (ENOSYS), and a bad target is named as such.
+		# quotactl: the root ext4 has quota operations but no quota turned on
+		# (ESRCH), a bad target is named as such, and a filesystem with no
+		# quota operations at all (proc) is ENOSYS.
 		my $qsync = 0x800001 << 8;
 		my $qget = (0x800007 << 8) | 0;
 		my ($dev, $notdev) = ("/dev/vda\0", "/etc/passwd\0");
@@ -666,9 +685,9 @@ if command -v perl >/dev/null 2>&1; then
 		$r2 = syscall(179, $qget, $notdev, 0, $qa); my $eq2 = err();
 		my $badtype = (0x800007 << 8) | 9;
 		$r3 = syscall(179, $badtype, $dev, 0, $qa); $e3 = err();
-		my $qfd = POSIX::open("/tmp", O_RDONLY);
+		my $qfd = POSIX::open("/proc", O_RDONLY);
 		my $r4 = syscall(443, $qfd, $qget, 0, $qa); my $e4 = err();
-		res("quotactl", $r == -1 && ($eq == ENOSYS || $eq == ENODEV) && $r2 == -1 && $eq2 == ENOTBLK &&
+		res("quotactl", $r == -1 && $eq == ESRCH && $r2 == -1 && $eq2 == ENOTBLK &&
 		    $r3 == -1 && $e3 == EINVAL && $r4 == -1 && $e4 == ENOSYS,
 		    "dev=$r/$eq notdev=$r2/$eq2 type=$r3/$e3 fd=$r4/$e4");
 	' || bad modern-perl $?

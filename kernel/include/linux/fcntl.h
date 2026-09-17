@@ -28,4 +28,7 @@
 #define force_o_largefile() (true)
 #endif
 
+/* The directory a relative path is resolved against when no descriptor is
+ * named. ABI value. */
+#define AT_FDCWD -100
 #endif

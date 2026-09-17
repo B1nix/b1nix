@@ -191,6 +191,14 @@ struct lkpi_task {
 };
 
 struct lkpi_task *lkpi_current(void);
+/* Set aside the filesystem transaction this task has open (journal_info) for
+ * I/O that enters another filesystem on its behalf, and put it back after.
+ * Linux's loop driver does its backing-file I/O in a worker thread of its own,
+ * so the lower filesystem never takes the upper one's journal handle for one
+ * of its own; the loop device here does it in the caller, and without this an
+ * ext4 on a loop file read btrfs's inode update through jbd2's handle. */
+void *lkpi_fs_context_leave(void);
+void lkpi_fs_context_restore(void *saved);
 /* Wake a task parked in schedule_timeout, or about to park. Returns 1 if a
  * wake was posted. Safe from interrupt context. */
 int lkpi_wake_task(struct lkpi_task *t);

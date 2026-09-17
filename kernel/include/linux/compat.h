@@ -12,4 +12,6 @@ typedef u32 compat_uint_t;
 typedef u64 compat_u64;
 static inline void *compat_ptr(compat_uptr_t uptr) { return (void *)(usize)uptr; }
 static inline int in_compat_syscall(void) { return 0; }
+/* No 32-bit tasks, so never the i386 64-bit alignment of a compat structure. */
+static inline bool compat_need_64bit_alignment_fixup(void) { return false; }
 #endif

@@ -832,41 +832,24 @@ struct block_device *blk_get(const char *name) {
 usize blk_count(void) { return blk_device_count; }
 
 /* Device number for a registered block device, in the classic dev_t packing
- * (major << 8 | minor) that /proc/<pid>/maps and stat's st_dev use. The major
- * follows the device class the way Linux assigns it — a tool that recognises
- * 8 as "SCSI/SATA disk" or 259 as "NVMe" reads b1nix's numbers correctly — and
- * the minor is the device's registration index, which is stable for a boot.
- * Returns 0 for a device that is not registered (no such dev_t exists). */
+ * (major << 8 | minor) that /proc/<pid>/maps and stat's st_dev use: the minor
+ * is the device's registration index, which is stable for a boot. Returns 0
+ * for a device that is not registered (no such dev_t exists). */
 u32 blk_devno(struct block_device *dev) {
   if (!dev || !dev->name)
     return 0;
-  usize index = 0;
-  int found = 0;
   for (usize i = 0; i < blk_device_count; i++) {
-    if (blk_devices[i] == dev) {
-      index = i;
-      found = 1;
-      break;
-    }
+    /* The one numbering userspace sees everywhere else: the device node's
+     * st_rdev, /sys/dev/block, the uevent's MAJOR/MINOR (see
+     * blk_wire_dev_node). A mount's st_dev used to be numbered per device
+     * type instead -- loop 7, virtio 254 -- so the directory of a filesystem
+     * on /dev/loop0 named a different device than /dev/loop0 itself, and
+     * every tool that finds a mount by comparing the two (quota-tools, for
+     * one) found nothing. */
+    if (blk_devices[i] == dev)
+      return (BLK_SYSFS_MAJOR << 8) | (u32)(i & 0xFF);
   }
-  if (!found)
-    return 0;
-
-  u32 major;
-  const char *n = dev->name;
-  if (strncmp(n, "nvme", 4) == 0)
-    major = 259; /* nvme */
-  else if (strncmp(n, "sd", 2) == 0)
-    major = 8; /* SCSI/SATA disk */
-  else if (strncmp(n, "vd", 2) == 0)
-    major = 254; /* virtio-blk */
-  else if (strncmp(n, "ram", 3) == 0)
-    major = 1; /* ramdisk */
-  else if (strncmp(n, "loop", 4) == 0)
-    major = 7; /* loop */
-  else
-    major = 240; /* local/experimental range for anything else */
-  return (major << 8) | (u32)(index & 0xFF);
+  return 0;
 }
 
 struct block_device *blk_at(usize index) {
@@ -1514,17 +1497,20 @@ static void blk_io_begin(struct block_device *dev) {
   u32 peak = blk_gate_peak;
   spin_unlock_irqrestore(&blk_gate_lock, flags);
 
+  /* One write per line: a line assembled from several writes gets another
+   * writer's output spliced into the middle of it, timestamp and all. */
   if (blk_limits_verbose && report_peak) {
-    console_write("blk: io-gate depth ");
-    console_write_dec(peak);
-    console_write(" of ");
-    console_write_dec(blk_io_waiters);
-    console_write("\n");
+    char line[64];
+    snprintf(line, sizeof(line), "blk: io-gate depth %u of %u\n",
+             (unsigned)peak, (unsigned)blk_io_waiters);
+    console_write(line);
   }
   if (blk_limits_verbose && report_full) {
-    console_write("blk: io-gate full at ");
-    console_write_dec(blk_io_waiters);
-    console_write(" waiters - priority order dropped\n");
+    char line[80];
+    snprintf(line, sizeof(line),
+             "blk: io-gate full at %u waiters - priority order dropped\n",
+             (unsigned)blk_io_waiters);
+    console_write(line);
   }
   if (slot < 0) {
     /* More concurrent requests than the wait table holds: fall back to

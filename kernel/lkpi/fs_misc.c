@@ -135,6 +135,30 @@ struct lkpi_kgid current_fsgid_val(void)
 	return gid;
 }
 
+struct lkpi_kuid current_euid_val(void)
+{
+	const struct cred *cred = scheduler_get_current_cred();
+	struct lkpi_kuid uid = { .val = cred ? (u32)cred->euid : 0u };
+
+	return uid;
+}
+
+/* Linux's in_egroup_p: the effective group or a supplementary one. Unlike
+ * in_group_p below, being root does not make the caller a member. */
+int in_egroup_p(struct lkpi_kgid grp)
+{
+	const struct cred *cred = scheduler_get_current_cred();
+
+	if (!cred)
+		return 0;
+	if (cred->egid == grp.val)
+		return 1;
+	for (int i = 0; i < cred->ngroups && i < MAX_GROUPS; i++)
+		if (cred->groups[i] == grp.val)
+			return 1;
+	return 0;
+}
+
 /* The umask a new file's mode is masked with. */
 unsigned short current_umask(void)
 {

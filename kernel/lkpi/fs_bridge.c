@@ -852,13 +852,18 @@ int lkpi_bridge_setattr(void *nodep, unsigned int mode, unsigned int uid,
 		attr.ia_valid |= ATTR_MODE;
 		attr.ia_mode = (umode_t)((mode & 07777) | (inode->i_mode & S_IFMT));
 	}
+	/* Both names of each id (<linux/fs.h> struct iattr): the quota transfer a
+	 * chown makes reads the vfs* pair, and with it left zero every chown moved
+	 * the file's usage to root. */
 	if (__kuid_val(inode->i_uid) != uid) {
 		attr.ia_valid |= ATTR_UID;
 		attr.ia_uid = KUIDT_INIT(uid);
+		attr.ia_vfsuid = attr.ia_uid;
 	}
 	if (__kgid_val(inode->i_gid) != gid) {
 		attr.ia_valid |= ATTR_GID;
 		attr.ia_gid = KGIDT_INIT(gid);
+		attr.ia_vfsgid = attr.ia_gid;
 	}
 	if ((unsigned long long)inode->i_atime.tv_sec != atime) {
 		attr.ia_valid |= ATTR_ATIME | ATTR_ATIME_SET;

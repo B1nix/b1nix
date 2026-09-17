@@ -80,6 +80,16 @@ int lkpi_bridge_rename(void *olddir, const char *oldname, void *newdir,
                        const char *newname);
 int lkpi_bridge_readlink(void *node, char *buf, unsigned long len);
 int lkpi_bridge_truncate(void *node, unsigned long long size);
+/* quotactl(2) on the filesystem `node` lives on. `addr` is the caller's user
+ * pointer. For Q_QUOTAON, `path_node` is the quota file (or NULL and
+ * `path_err` why it could not be named). */
+int lkpi_bridge_quotactl(void *node, unsigned int cmd, unsigned int id,
+                         void *addr, void *path_node, int path_err);
+void lkpi_bridge_quota_sync(void *root, int type);
+/* Is any quota limit enforced on the filesystem `node` lives on? */
+int lkpi_bridge_quota_enforced(void *node);
+/* Does the command change the filesystem (and so need it writable)? */
+int lkpi_bridge_quotactl_cmd_writes(unsigned int cmd);
 int lkpi_bridge_chmod(void *node, unsigned int mode);
 
 /* Extended attributes. A negative return is -errno; getxattr and listxattr

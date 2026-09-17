@@ -510,6 +510,20 @@ void lkpi_wake_all(void *chan)
  * task and reused only when the slot is. */
 static struct lkpi_task g_lkpi_task[4096];
 
+void *lkpi_fs_context_leave(void)
+{
+	struct lkpi_task *t = lkpi_current();
+	void *saved = t->journal_info;
+
+	t->journal_info = NULL;
+	return saved;
+}
+
+void lkpi_fs_context_restore(void *saved)
+{
+	lkpi_current()->journal_info = saved;
+}
+
 struct lkpi_task *lkpi_current(void)
 {
 	usize slot = scheduler_current_slot();

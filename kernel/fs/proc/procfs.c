@@ -989,6 +989,86 @@ static int r_sys_file_max(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* ── sysctl tables registered by imported code ──
+ *
+ * kernel/lkpi/fs_sysctl.c registers each entry of a table as it is handed one
+ * at boot; every proc mount then carries a file per entry under its path,
+ * whose content the entry's own handler produces. Registration is boot-time
+ * only, so the table is filled before any proc mount reads it. */
+struct procfs_sysctl_entry {
+  char path[48];
+  char name[32];
+  u16 mode;
+  long (*read)(void *entry, char *buf, unsigned long cap);
+  void *entry;
+};
+#define PROCFS_SYSCTL_MAX 32
+static struct procfs_sysctl_entry g_sysctl[PROCFS_SYSCTL_MAX];
+static usize g_sysctl_n;
+
+void procfs_sysctl_register(const char *path, const char *name,
+                            unsigned int mode,
+                            long (*read)(void *entry, char *buf, unsigned long cap),
+                            void *entry) {
+  if (g_sysctl_n >= PROCFS_SYSCTL_MAX) {
+    klog_warn("procfs: sysctl table full; entry not published");
+    return;
+  }
+  struct procfs_sysctl_entry *e = &g_sysctl[g_sysctl_n];
+  snprintf(e->path, sizeof(e->path), "%s", path);
+  snprintf(e->name, sizeof(e->name), "%s", name);
+  e->mode = (u16)mode;
+  e->read = read;
+  e->entry = entry;
+  g_sysctl_n++;
+}
+
+/* `pid` carries the entry's index + 1 (see procfs_sysctl_publish). */
+static int r_sysctl_entry(usize pid, struct sbuf *s) {
+  if (pid == 0 || pid > g_sysctl_n)
+    return -ENOENT;
+  struct procfs_sysctl_entry *e = &g_sysctl[pid - 1];
+  char buf[256];
+  long n = e->read(e->entry, buf, sizeof(buf));
+  if (n < 0)
+    return (int)n;
+  for (long k = 0; k < n; k++)
+    sb_putc(s, buf[k]);
+  return 0;
+}
+
+/* Create the published entries under a new mount's /proc/sys. */
+static void procfs_sysctl_publish(struct vfs_node *sysd) {
+  for (usize i = 0; i < g_sysctl_n; i++) {
+    struct procfs_sysctl_entry *e = &g_sysctl[i];
+    struct vfs_node *dir = sysd;
+    char comp[48];
+    const char *p = e->path;
+
+    while (dir && *p) {
+      usize len = 0;
+      while (p[len] && p[len] != '/')
+        len++;
+      if (len >= sizeof(comp))
+        len = sizeof(comp) - 1;
+      memcpy(comp, p, len);
+      comp[len] = '\0';
+      p += len;
+      while (*p == '/')
+        p++;
+      if (!comp[0])
+        continue;
+      struct vfs_node *next = find_child(dir, comp);
+      dir = next ? next : procfs_mkchild(dir, comp, VFS_DIRECTORY, 0, 0);
+    }
+    if (!dir)
+      continue;
+    struct vfs_node *f = procfs_mkchild(dir, e->name, VFS_DEVICE, r_sysctl_entry, i + 1);
+    if (f)
+      f->inode->mode = e->mode;
+  }
+}
+
 /* ── M77 writable resource caps (runtime-tunable hard caps) ── */
 
 static int r_sys_shmmax(usize pid, struct sbuf *s) {
@@ -3924,6 +4004,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
     struct vfs_node *fsd = procfs_mkchild(sysd, "fs", VFS_DIRECTORY, 0, 0);
     if (fsd)
       procfs_mkchild(fsd, "file-max", VFS_DEVICE, r_sys_file_max, 0);
+    procfs_sysctl_publish(sysd);
     struct vfs_node *snet = procfs_mkchild(sysd, "net", VFS_DIRECTORY, 0, 0);
     struct vfs_node *ipv4 =
         snet ? procfs_mkchild(snet, "ipv4", VFS_DIRECTORY, 0, 0) : 0;

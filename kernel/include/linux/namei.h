@@ -5,6 +5,7 @@
 #include <linux/types.h>
 #include <linux/path.h>
 #include <linux/fs.h>
+#include <linux/fcntl.h>
 
 /*
  * Path resolution, as a filesystem calls into it.

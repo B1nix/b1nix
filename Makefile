@@ -1139,6 +1139,7 @@ $(BUILD_DIR)/kernel/main.o: $(FS_IMPORT_FLAGS_STAMP)
 $(BUILD_DIR)/kernel/fs/lkpifs.o: $(FS_IMPORT_FLAGS_STAMP)
 $(BUILD_DIR)/kernel/fs/vfs.o: $(FS_IMPORT_FLAGS_STAMP)
 $(BUILD_DIR)/kernel/syscall/syscall.o: $(FS_IMPORT_FLAGS_STAMP)
+$(BUILD_DIR)/kernel/syscall/linux_modern.o: $(FS_IMPORT_FLAGS_STAMP)
 
 # B1NIX_FS_IMPORT=btrfs builds btrfs and what it stands on; =1 adds ext4 and
 # jbd2. The split is not arbitrary: btrfs needs the VFS, the page cache and the
@@ -1245,7 +1246,8 @@ $(BUILD_DIR)/$(FS_IMPORT_DIR)/%.o: $(FS_IMPORT_DIR)/%.c $(DRM_FLAGS_STAMP) \
 # -w is dropped for these: they ARE ours, and stay warning-clean.
 FS_LKPI_SOURCES := \
 	kernel/lkpi/fs_xattr.c \
-	kernel/lkpi/fs_quota.c \
+	kernel/lkpi/fs_quotactl.c \
+	kernel/lkpi/fs_sysctl.c \
 	kernel/lkpi/crypto_shash.c \
 	kernel/lkpi/fs_abi_check.c \
 	kernel/lkpi/fs_filemap.c \

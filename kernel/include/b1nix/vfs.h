@@ -381,6 +381,12 @@ struct vfs_inode {
   void (*owner_cb)(struct vfs_node *node);
   isize (*write_cb)(struct vfs_node *node, u64 offset, const char *buffer,
                     usize size, int flags);
+  /* Must write(2) reach the filesystem now rather than the page cache? A
+   * cached write is accepted before the filesystem has seen it, so a refusal
+   * the filesystem makes at write time -- EDQUOT from an enforced quota -- has
+   * nowhere to go. When this answers 1, write_cb takes the bytes directly and
+   * the cache only mirrors them. NULL: always cached. */
+  int (*write_through_cb)(struct vfs_node *node);
   int (*create_cb)(struct vfs_node *dir, const char *name,
                    const char *full_path, u32 mode);
   int (*mkdir_cb)(struct vfs_node *dir, const char *name, u32 mode);
@@ -704,7 +710,8 @@ isize vfs_mounts_info(struct vfs_mount_info *out, usize max_entries);
 int vfs_mount_id_for_path(const char *path);
 /* statmount/listmount: mounts by their never-reused 64-bit id. */
 u64 vfs_mount_unique_id_for_path(const char *path);
-int vfs_quota_target(const char *special, int fd, char *fstype, usize cap);
+int vfs_quota_target(const char *special, int fd, struct vfs_node **node,
+                     u64 *mnt_flags);
 isize vfs_listmount(u64 parent_id, u64 last_id, u64 *ids, usize nr, int reverse);
 isize vfs_statmount(u64 id, u64 mask, char *kbuf, usize bufsize);
 /* Whether a path is the root of a mount rather than somewhere below one --

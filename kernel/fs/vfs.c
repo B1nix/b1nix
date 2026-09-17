@@ -4680,7 +4680,35 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
     h->offset = node->inode->size;
   u64 offset = posp ? *posp : h->offset;
   isize res = 0;
-  if (node->inode->type == VFS_FILE && node->inode->write_cb) {
+  if (node->inode->type == VFS_FILE && node->inode->write_cb &&
+      node->inode->write_through_cb && node->inode->write_through_cb(node)) {
+    res = node->inode->write_cb(node, offset, buf, size, h->flags);
+    if (res > 0) {
+      /* The filesystem holds the bytes now; a cached page of this range must
+       * show them too, for read(2) and for a mapping. Pages dirty for other
+       * reasons stay dirty. */
+      for (u64 cur = offset; cur < offset + (u64)res;) {
+        u64 page_aligned = cur & ~((u64)PAGE_SIZE - 1);
+        usize page_off = (usize)(cur & ((u64)PAGE_SIZE - 1));
+        usize chunk = PAGE_SIZE - page_off;
+        if (chunk > (usize)(offset + (u64)res - cur))
+          chunk = (usize)(offset + (u64)res - cur);
+        struct page_cache_entry *pe =
+            page_cache_get_page(node->inode, page_aligned);
+        if (pe) {
+          char *dst = (char *)(usize)(pe->frame + vmm_direct_map_base());
+          memcpy(dst + page_off, buf + (usize)(cur - offset), chunk);
+          page_cache_put_page(pe);
+        }
+        cur += chunk;
+      }
+      u64 newpos = offset + (u64)res;
+      if (posp) *posp = newpos; else h->offset = newpos;
+      if (newpos > node->inode->size)
+        node->inode->size = newpos;
+      vfs_update_times(node->inode, VFS_MTIME | VFS_CTIME);
+    }
+  } else if (node->inode->type == VFS_FILE && node->inode->write_cb) {
     usize remaining = size;
     usize total_written = 0;
     u64 curr_offset = offset;
@@ -8282,10 +8310,12 @@ int vfs_mount_id_for_path(const char *path) {
   return best_id;
 }
 
-/* quotactl(2): the mount a quota command names -- by the block device it is
- * mounted from, or by any descriptor on it. Returns 0 with the filesystem
- * type, or the errno Linux gives for the name. */
-int vfs_quota_target(const char *special, int fd, char *fstype, usize cap) {
+/* quotactl(2): the filesystem a quota command names -- by the block device it
+ * is mounted from, or by any descriptor on it. Returns 0 with a referenced node
+ * on that filesystem (the caller puts it) and the mount's flags, or the errno
+ * Linux gives for the name. */
+int vfs_quota_target(const char *special, int fd, struct vfs_node **node,
+                     u64 *mnt_flags) {
   u32 ns = vfs_current_mnt_ns();
 
   if (special) {
@@ -8304,22 +8334,24 @@ int vfs_quota_target(const char *special, int fd, char *fstype, usize cap) {
       const char *src = mounts[i].source;
       const char *sb = strrchr(src, '/');
 
-      if (!mount_visible_in(i, ns))
+      if (!mount_visible_in(i, ns) || !mounts[i].root_node)
         continue;
       if (!strcmp(src, r) || (sb && !strcmp(sb + 1, base)) || !strcmp(src, base)) {
-        copy_path(fstype, cap, mounts[i].fstype);
+        *node = vfs_node_get(mounts[i].root_node);
+        *mnt_flags = mounts[i].flags;
         return 0;
       }
     }
     return -ENODEV;
   }
-  struct vfs_node *n = vfs_find_node_by_fd(fd);
+  struct vfs_node *n = vfs_find_node_by_fd(fd); /* borrowed */
   if (IS_ERR(n))
     return -EBADF;
   struct vfs_mount_entry *m = vfs_get_mount_for_node(n);
   if (!m)
     return -ENODEV;
-  copy_path(fstype, cap, m->fstype);
+  *node = vfs_node_get(n);
+  *mnt_flags = m->flags;
   return 0;
 }
 

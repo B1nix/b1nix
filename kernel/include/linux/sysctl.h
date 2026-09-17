@@ -31,10 +31,15 @@ static inline struct ctl_table_header *register_sysctl(const char *path,
 { (void)path; (void)table; return NULL; }
 static inline void unregister_sysctl_table(struct ctl_table_header *h)
 { (void)h; }
-/* The init-time form, whose result upstream deliberately ignores. */
-static inline void register_sysctl_init(const char *path,
-                                        struct ctl_table *table)
-{ (void)path; (void)table; }
+/* The init-time form, whose result upstream deliberately ignores. Tables
+ * registered this way ARE published, read-only, under /proc/sys: the quota
+ * core's statistics are one, and quota-tools decides whether the kernel has
+ * quota support at all by whether /proc/sys/fs/quota exists
+ * (kernel/lkpi/fs_sysctl.c). */
+void lkpi_register_sysctl_init(const char *path, const struct ctl_table *table,
+                               usize n);
+#define register_sysctl_init(path, table) \
+	lkpi_register_sysctl_init((path), (table), sizeof(table) / sizeof((table)[0]))
 
 int proc_doulongvec_minmax(struct ctl_table *, int, void *, size_t *, loff_t *);
 

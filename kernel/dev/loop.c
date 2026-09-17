@@ -7,6 +7,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/posix.h>
+#include <lkpi/env.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -62,7 +63,9 @@ static int loop_read_blocks(struct block_device *dev, u64 lba, u32 count, void *
      * Going straight to inode->read_cb would return whatever is on disk while
      * the file's own cached pages held newer data. */
     loop->in_io = 1;
+    void *fs_ctx = lkpi_fs_context_leave();
     isize read_bytes = vfs_node_pread(node, buffer, size, offset);
+    lkpi_fs_context_restore(fs_ctx);
     loop->in_io = 0;
     if (read_bytes < 0) {
         return (int)read_bytes;
@@ -102,7 +105,9 @@ static int loop_write_blocks(struct block_device *dev, u64 lba, u32 count,
      * backing file back returned the pre-write bytes (and a later writeback of
      * those clean-looking pages could undo the loop write entirely). */
     loop->in_io = 1;
+    void *fs_ctx = lkpi_fs_context_leave();
     isize written = vfs_node_pwrite(node, (const char *)buffer, size, offset);
+    lkpi_fs_context_restore(fs_ctx);
     loop->in_io = 0;
     if (written < 0)
         return (int)written;

@@ -30,6 +30,12 @@ struct cred {
 const struct cred *current_cred(void);
 kuid_t current_fsuid_val(void);
 kgid_t current_fsgid_val(void);
+/* The effective ids, which permission checks outside the filesystem use (the
+ * quota commands a user may run on their own usage, for one). */
+kuid_t current_euid_val(void);
+#define current_euid() current_euid_val()
+/* Is the caller's effective group, or one of its supplementary groups, `grp`? */
+int in_egroup_p(kgid_t grp);
 
 #define current_fsuid() current_fsuid_val()
 #define current_fsgid() current_fsgid_val()

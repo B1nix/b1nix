@@ -52,6 +52,25 @@
  *                          program has no keys and the initial PKRU
  *   pkey-exec-only         mprotect(PROT_EXEC) alone makes code callable but
  *                          unreadable (SEGV_PKUERR on a read)
+ *
+ * Quotas, on an ext4 made by the distribution's mkfs.ext4 -O quota and mounted
+ * from a loop device (one sequence: each step builds on the last):
+ *   quota-format           Q_GETFMT is QFMT_VFS_V1, Q_GETINFO reports the
+ *                          quota as a system file, Q_XGETQSTAT accounting on
+ *   quota-usage            a user's files are charged to that user: space and
+ *                          inodes in Q_GETQUOTA
+ *   quota-enforce          Q_SETQUOTA limits plus Q_QUOTAON: a write past the
+ *                          hard limit fails with EDQUOT, one within it works
+ *   quota-next             Q_GETNEXTQUOTA finds the next id with usage
+ *   quota-permissions      a user reads its own usage but not another's
+ *                          (EPERM), and cannot set limits (EPERM)
+ *   quota-fd               quotactl_fd answers through a descriptor, and a
+ *                          filesystem without quotas is ENOSYS
+ *   quota-off              Q_QUOTAOFF lifts enforcement, accounting stays
+ *   quota-tools            quota-tools' setquota sets a limit Q_GETQUOTA reads
+ *                          back, and repquota lists the user
+ *   quota-persist          limits survive umount and mount, and e2fsck -fn
+ *                          finds the quota files consistent with the usage
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -65,7 +84,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/quota.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -922,6 +944,348 @@ static void check_pkey_exec_only(int r) {
     reportf(r, "PROT_READ|PROT_EXEC did not make it readable");
 }
 
+/* ── quotas ───────────────────────────────────────────────────────────────── */
+
+#define NR_quotactl_fd 443
+#ifndef Q_GETNEXTQUOTA
+#define Q_GETNEXTQUOTA 0x800009
+#endif
+#define QFMT_VFS_V1_ 4
+#define DQF_SYS_FILE_ 0x10000
+#define Q_XGETQSTAT_ ((('X' << 8) + 5) << 0)
+#define FS_QUOTA_UDQ_ACCT_ 1
+#define FS_QUOTA_UDQ_ENFD_ 2
+#define LOOP_SET_FD_ 0x4C00
+#define LOOP_CLR_FD_ 0x4C01
+#define LOOP_CTL_GET_FREE_ 0x4C82
+#define QIMG "/tmp/m124-quota.img"
+#define QMNT "/tmp/m124-quota"
+#define QUSER 1000
+
+struct fs_qfilestat_ {
+  uint64_t qfs_ino, qfs_nblks;
+  uint32_t qfs_nextents;
+};
+struct fs_quota_stat_ {
+  int8_t qs_version;
+  uint16_t qs_flags;
+  int8_t qs_pad;
+  struct fs_qfilestat_ qs_uquota, qs_gquota;
+  uint32_t qs_incoredqs;
+  int32_t qs_btimelimit, qs_itimelimit, qs_rtbtimelimit;
+  uint16_t qs_bwarnlimit, qs_iwarnlimit;
+};
+struct if_nextdqblk_ {
+  uint64_t dqb_bhardlimit, dqb_bsoftlimit, dqb_curspace, dqb_ihardlimit,
+      dqb_isoftlimit, dqb_curinodes, dqb_btime, dqb_itime;
+  uint32_t dqb_valid, dqb_id;
+};
+
+static char g_qdev[32];
+
+static int sh(const char *cmd) {
+  int st = system(cmd);
+  return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static int quota_mount(void) {
+  return mount(g_qdev, QMNT, "ext4", 0, 0);
+}
+
+/* Build the filesystem with the distribution's tools and attach it. */
+static int quota_setup(char *why, size_t n) {
+  unlink(QIMG);
+  mkdir(QMNT, 0755);
+  int fd = open(QIMG, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0 || ftruncate(fd, 32 << 20) != 0) {
+    snprintf(why, n, "image errno %d", errno);
+    return -1;
+  }
+  close(fd);
+  if (sh("mkfs.ext4 -q -F -O quota -E quotatype=usrquota:grpquota " QIMG
+         " >/dev/null 2>&1") != 0) {
+    snprintf(why, n, "mkfs.ext4 -O quota failed");
+    return -1;
+  }
+  int ctl = open("/dev/loop-control", O_RDWR);
+  int idx = ctl >= 0 ? ioctl(ctl, LOOP_CTL_GET_FREE_, 0) : -1;
+  if (ctl >= 0)
+    close(ctl);
+  snprintf(g_qdev, sizeof(g_qdev), "/dev/loop%d", idx);
+  int lo = idx >= 0 ? open(g_qdev, O_RDWR) : -1;
+  int img = open(QIMG, O_RDWR);
+  if (lo < 0 || img < 0 || ioctl(lo, LOOP_SET_FD_, img) != 0) {
+    snprintf(why, n, "loop attach errno %d", errno);
+    return -1;
+  }
+  close(img);
+  close(lo);
+  if (quota_mount() != 0) {
+    snprintf(why, n, "mount %s errno %d", g_qdev, errno);
+    return -1;
+  }
+  if (mkdir(QMNT "/u", 0755) != 0 || chown(QMNT "/u", QUSER, QUSER) != 0) {
+    snprintf(why, n, "user directory errno %d", errno);
+    return -1;
+  }
+  return 0;
+}
+
+static void quota_teardown(void) {
+  umount(QMNT);
+  int lo = open(g_qdev, O_RDWR);
+  if (lo >= 0) {
+    ioctl(lo, LOOP_CLR_FD_, 0);
+    close(lo);
+  }
+  unlink(QIMG);
+}
+
+/* Write `kb` KiB as the quota user into `name`; returns 0, or the errno. */
+static int write_as_user(const char *name, int kb) {
+  pid_t c = fork();
+  if (c == 0) {
+    if (setgid(QUSER) || setuid(QUSER))
+      _exit(200);
+    int fd = open(name, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0)
+      _exit(errno & 0xff);
+    char buf[1024];
+    memset(buf, 'q', sizeof(buf));
+    for (int i = 0; i < kb; i++) {
+      if (write(fd, buf, sizeof(buf)) != (ssize_t)sizeof(buf))
+        _exit(errno ? errno & 0xff : 201);
+    }
+    if (fsync(fd) != 0)
+      _exit(errno & 0xff);
+    _exit(0);
+  }
+  int st;
+  waitpid(c, &st, 0);
+  return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
+}
+
+static int getq(int id, struct dqblk *d) {
+  memset(d, 0, sizeof(*d));
+  return quotactl(QCMD(Q_GETQUOTA, USRQUOTA), g_qdev, id, (caddr_t)d);
+}
+
+/* Run fn as the quota user; it returns 0 or a small failure code. */
+static int as_user(int (*fn)(void)) {
+  pid_t c = fork();
+  if (c == 0) {
+    if (setgid(QUSER) || setuid(QUSER))
+      _exit(200);
+    _exit(fn());
+  }
+  int st;
+  waitpid(c, &st, 0);
+  return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
+}
+
+static int user_quota_rights(void) {
+  struct dqblk d;
+  if (quotactl(QCMD(Q_GETQUOTA, USRQUOTA), g_qdev, QUSER, (caddr_t)&d) != 0)
+    return 1;
+  errno = 0;
+  if (quotactl(QCMD(Q_GETQUOTA, USRQUOTA), g_qdev, 0, (caddr_t)&d) != -1 ||
+      errno != EPERM)
+    return 2;
+  d.dqb_valid = QIF_BLIMITS;
+  errno = 0;
+  if (quotactl(QCMD(Q_SETQUOTA, USRQUOTA), g_qdev, QUSER, (caddr_t)&d) != -1 ||
+      errno != EPERM)
+    return 3;
+  return 0;
+}
+
+static void quota_suite(void) {
+  char why[200];
+  static const char *const names[] = {
+      "quota-format", "quota-usage", "quota-enforce", "quota-next",
+      "quota-permissions", "quota-fd", "quota-off", "quota-tools",
+      "quota-persist"};
+  enum { N = sizeof(names) / sizeof(names[0]) };
+  int i = 0;
+
+  if (quota_setup(why, sizeof(why)) != 0) {
+    for (; i < N; i++)
+      fail(names[i], why);
+    quota_teardown();
+    return;
+  }
+#define STEP_FAIL(...)                                                         \
+  do {                                                                         \
+    snprintf(why, sizeof(why), __VA_ARGS__);                                   \
+    for (; i < N; i++)                                                         \
+      fail(names[i], why);                                                     \
+    quota_teardown();                                                          \
+    return;                                                                    \
+  } while (0)
+
+  /* quota-format */
+  {
+    uint32_t fmt = 0;
+    struct dqinfo info;
+    struct fs_quota_stat_ qs;
+    if (quotactl(QCMD(Q_GETFMT, USRQUOTA), g_qdev, 0, (caddr_t)&fmt) != 0 ||
+        fmt != QFMT_VFS_V1_)
+      STEP_FAIL("Q_GETFMT %u errno %d", fmt, errno);
+    if (quotactl(QCMD(Q_GETINFO, USRQUOTA), g_qdev, 0, (caddr_t)&info) != 0 ||
+        !(info.dqi_flags & DQF_SYS_FILE_))
+      STEP_FAIL("Q_GETINFO flags %x errno %d", info.dqi_flags, errno);
+    memset(&qs, 0, sizeof(qs));
+    if (quotactl(QCMD(Q_XGETQSTAT_, USRQUOTA), g_qdev, 0, (caddr_t)&qs) != 0 ||
+        !(qs.qs_flags & FS_QUOTA_UDQ_ACCT_) || (qs.qs_flags & FS_QUOTA_UDQ_ENFD_))
+      STEP_FAIL("Q_XGETQSTAT flags %x errno %d", qs.qs_flags, errno);
+    ok(names[i++]);
+  }
+
+  /* quota-usage */
+  {
+    struct dqblk d;
+    int w = write_as_user(QMNT "/u/a", 64);
+    if (w != 0)
+      STEP_FAIL("write as user %d: %d", QUSER, w);
+    if (getq(QUSER, &d) != 0 || d.dqb_curspace < 64 * 1024 || d.dqb_curinodes != 2)
+      STEP_FAIL("usage space %llu inodes %llu errno %d",
+                (unsigned long long)d.dqb_curspace,
+                (unsigned long long)d.dqb_curinodes, errno);
+    ok(names[i++]);
+  }
+
+  /* quota-enforce */
+  {
+    struct dqblk d;
+    getq(QUSER, &d);
+    d.dqb_bhardlimit = 256; /* 1 KiB blocks */
+    d.dqb_bsoftlimit = 0;
+    d.dqb_valid = QIF_BLIMITS;
+    if (quotactl(QCMD(Q_SETQUOTA, USRQUOTA), g_qdev, QUSER, (caddr_t)&d) != 0)
+      STEP_FAIL("Q_SETQUOTA errno %d", errno);
+    if (quotactl(QCMD(Q_QUOTAON, USRQUOTA), g_qdev, QFMT_VFS_V1_, 0) != 0)
+      STEP_FAIL("Q_QUOTAON errno %d", errno);
+    int within = write_as_user(QMNT "/u/b", 32);
+    int beyond = write_as_user(QMNT "/u/c", 512);
+    if (within != 0 || beyond != EDQUOT)
+      STEP_FAIL("within the limit %d, beyond it %d (want 0 and EDQUOT)", within,
+                beyond);
+    if (getq(QUSER, &d) != 0 || d.dqb_bhardlimit != 256 ||
+        d.dqb_curspace > 256 * 1024)
+      STEP_FAIL("after: limit %llu space %llu",
+                (unsigned long long)d.dqb_bhardlimit,
+                (unsigned long long)d.dqb_curspace);
+    ok(names[i++]);
+  }
+
+  /* quota-next */
+  {
+    struct if_nextdqblk_ nd;
+    memset(&nd, 0, sizeof(nd));
+    if (quotactl(QCMD(Q_GETNEXTQUOTA, USRQUOTA), g_qdev, 1, (caddr_t)&nd) != 0 ||
+        nd.dqb_id != QUSER || nd.dqb_bhardlimit != 256)
+      STEP_FAIL("Q_GETNEXTQUOTA from 1: id %u limit %llu errno %d", nd.dqb_id,
+                (unsigned long long)nd.dqb_bhardlimit, errno);
+    ok(names[i++]);
+  }
+
+  /* quota-permissions */
+  {
+    int r = as_user(user_quota_rights);
+    if (r != 0)
+      STEP_FAIL("as the user: step %d", r);
+    ok(names[i++]);
+  }
+
+  /* quota-fd */
+  {
+    struct dqblk d;
+    int dfd = open(QMNT, O_RDONLY | O_DIRECTORY);
+    int tfd = open("/tmp", O_RDONLY | O_DIRECTORY);
+    memset(&d, 0, sizeof(d));
+    if (dfd < 0 ||
+        syscall(NR_quotactl_fd, dfd, QCMD(Q_GETQUOTA, USRQUOTA), QUSER, &d) != 0 ||
+        d.dqb_bhardlimit != 256)
+      STEP_FAIL("quotactl_fd errno %d", errno);
+    errno = 0;
+    char other[64];
+    int other_ok = tfd >= 0 &&
+                   syscall(NR_quotactl_fd, tfd, QCMD(Q_GETQUOTA, USRQUOTA),
+                           QUSER, &d) == -1 &&
+                   (errno == ENOSYS || errno == ENOTSUP);
+    snprintf(other, sizeof(other), "%d", errno);
+    if (!other_ok) {
+      /* /tmp may itself be ext4 with quotas off: that answers ESRCH/EINVAL.
+       * /proc never has quota operations. */
+      int pfd = open("/proc", O_RDONLY | O_DIRECTORY);
+      errno = 0;
+      other_ok = pfd >= 0 &&
+                 syscall(NR_quotactl_fd, pfd, QCMD(Q_GETQUOTA, USRQUOTA), QUSER,
+                         &d) == -1 &&
+                 errno == ENOSYS;
+      snprintf(other, sizeof(other), "/tmp %s, /proc %d", other, errno);
+    }
+    if (!other_ok)
+      STEP_FAIL("no-quota filesystem: %s (want ENOSYS)", other);
+    close(dfd);
+    if (tfd >= 0)
+      close(tfd);
+    ok(names[i++]);
+  }
+
+  /* quota-off */
+  {
+    struct fs_quota_stat_ qs;
+    if (quotactl(QCMD(Q_QUOTAOFF, USRQUOTA), g_qdev, 0, 0) != 0)
+      STEP_FAIL("Q_QUOTAOFF errno %d", errno);
+    memset(&qs, 0, sizeof(qs));
+    if (quotactl(QCMD(Q_XGETQSTAT_, USRQUOTA), g_qdev, 0, (caddr_t)&qs) != 0 ||
+        !(qs.qs_flags & FS_QUOTA_UDQ_ACCT_) || (qs.qs_flags & FS_QUOTA_UDQ_ENFD_))
+      STEP_FAIL("after Q_QUOTAOFF flags %x errno %d", qs.qs_flags, errno);
+    int w = write_as_user(QMNT "/u/d", 512);
+    if (w != 0)
+      STEP_FAIL("write past the limit with enforcement off: %d", w);
+    ok(names[i++]);
+  }
+
+  /* quota-tools */
+  {
+    struct dqblk d;
+    if (sh("setquota -u 1000 0 4096 0 100 " QMNT " >/dev/null 2>&1") != 0)
+      STEP_FAIL("setquota failed");
+    if (getq(QUSER, &d) != 0 || d.dqb_bhardlimit != 4096 ||
+        d.dqb_ihardlimit != 100)
+      STEP_FAIL("after setquota: blocks %llu inodes %llu",
+                (unsigned long long)d.dqb_bhardlimit,
+                (unsigned long long)d.dqb_ihardlimit);
+    if (sh("repquota -u " QMNT " 2>/dev/null | grep -q '^#1000 \\|^1000 \\|4096'") != 0)
+      STEP_FAIL("repquota does not list the user");
+    ok(names[i++]);
+  }
+
+  /* quota-persist */
+  {
+    struct dqblk d;
+    if (umount(QMNT) != 0 || quota_mount() != 0)
+      STEP_FAIL("remount errno %d", errno);
+    if (getq(QUSER, &d) != 0 || d.dqb_bhardlimit != 4096 ||
+        d.dqb_curspace < 64 * 1024)
+      STEP_FAIL("after remount: limit %llu space %llu errno %d",
+                (unsigned long long)d.dqb_bhardlimit,
+                (unsigned long long)d.dqb_curspace, errno);
+    if (umount(QMNT) != 0)
+      STEP_FAIL("umount errno %d", errno);
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "e2fsck -fn %s >/dev/null 2>&1", g_qdev);
+    int fsck = sh(cmd);
+    if (fsck != 0)
+      STEP_FAIL("e2fsck -fn exit %d", fsck);
+    ok(names[i++]);
+  }
+#undef STEP_FAIL
+  quota_teardown();
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && strcmp(argv[1], "--pkey-exec-probe") == 0)
     return pkey_exec_probe(argv[2]);
@@ -953,6 +1317,7 @@ int main(int argc, char **argv) {
     run("pkey-fork-exec", check_pkey_fork_exec);
     run("pkey-exec-only", check_pkey_exec_only);
   }
+  quota_suite();
   marker(g_fail ? "M124-SMOKE: done with failures\n" : "M124-SMOKE: done\n");
   return 0;
 }

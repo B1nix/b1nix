@@ -1549,7 +1549,7 @@ launch_pku() {
 		NVME_IMG=$(disk_img nvme pku)
 		SWAP_IMG=$(disk_img swap pku)
 		B1NIX_ISO_NAME=b1nix-pku.iso
-		SMOKE_ACCEL="-accel tcg -cpu max"
+		SMOKE_ACCEL=${SMOKE_PKU_ACCEL:-"-accel tcg -cpu max"}
 		SMOKE_SMP=1
 		SMOKE_DONE_PATTERN="reboot: restarting|KERNEL PANIC|\[PANIC\]"
 		SMOKE_DONE_SETTLE=5
@@ -3030,6 +3030,15 @@ check_output "$LOG" "M124-SMOKE: ok secret-foreign-refused" "/proc/self/mem (EIO
 check_output "$LOG" "M124-SMOKE: ok secret-memlock" "secret mappings count against RLIMIT_MEMLOCK for a task without CAP_IPC_LOCK"
 check_output "$LOG" "M124-SMOKE: ok secret-scrubbed" "a page freed by one secret file reads as zeros in the next, whether its hidden block was kept or released"
 check_output "$LOG" "M124-SMOKE: ok secret-many" "600 secret pages across more than one hidden 2 MiB block each keep their own contents"
+check_output "$LOG" "M124-SMOKE: ok quota-format" "an ext4 made with mkfs.ext4 -O quota reports QFMT_VFS_V1, its quota as a system file, and accounting on through quotactl"
+check_output "$LOG" "M124-SMOKE: ok quota-usage" "a user's files are charged to that user's quota: space and inodes in Q_GETQUOTA"
+check_output "$LOG" "M124-SMOKE: ok quota-enforce" "Q_SETQUOTA limits enforced after Q_QUOTAON: a write past the hard limit fails with EDQUOT, one within it succeeds"
+check_output "$LOG" "M124-SMOKE: ok quota-next" "Q_GETNEXTQUOTA finds the next id with usage and names it"
+check_output "$LOG" "M124-SMOKE: ok quota-permissions" "a user reads its own quota but not another's (EPERM) and cannot set limits (EPERM)"
+check_output "$LOG" "M124-SMOKE: ok quota-fd" "quotactl_fd answers through a descriptor, and a filesystem without quota operations is ENOSYS"
+check_output "$LOG" "M124-SMOKE: ok quota-off" "Q_QUOTAOFF lifts enforcement while accounting stays on"
+check_output "$LOG" "M124-SMOKE: ok quota-tools" "quota-tools' setquota sets limits Q_GETQUOTA reads back, and repquota lists the user"
+check_output "$LOG" "M124-SMOKE: ok quota-persist" "quota limits survive umount and mount, and e2fsck -fn finds the quota files consistent"
 check_output "$LOG" "M124-SMOKE: done" "M124 suite completes"
 # Protection keys. The lanes above run on the host's CPU; one without PKU must
 # answer as Linux does there. The pku lane (TCG -cpu max) has the hardware.

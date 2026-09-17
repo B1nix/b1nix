@@ -108,6 +108,7 @@ static isize lkpifs_read(struct vfs_node *node, u64 offset, char *buffer,
                          usize size, int flags);
 static isize lkpifs_write(struct vfs_node *node, u64 offset,
                           const char *buffer, usize size, int flags);
+static int lkpifs_write_through(struct vfs_node *node);
 static isize lkpifs_readdir_at(struct vfs_node *dir, u64 cookie,
                                struct dirent *buf, usize max_entries,
                                u64 *next_cookie);
@@ -247,6 +248,7 @@ static void install_ops(struct vfs_node *node, void *handle,
 
 	node->inode->read_cb = lkpifs_read;
 	node->inode->write_cb = lkpifs_write;
+	node->inode->write_through_cb = lkpifs_write_through;
 	node->inode->readdir_at_cb = lkpifs_readdir_at;
 	node->inode->lookup_cb = lkpifs_lookup;
 	node->inode->create_cb = lkpifs_create;
@@ -514,6 +516,15 @@ static isize lkpifs_write(struct vfs_node *node, u64 offset,
 			node->inode->size = (usize)end;
 	}
 	return (isize)ret;
+}
+
+/* A filesystem enforcing quota limits refuses a write that would exceed one,
+ * and that refusal is write(2)'s EDQUOT only if the write reaches it. */
+static int lkpifs_write_through(struct vfs_node *node)
+{
+	void *handle = node_handle(node);
+
+	return handle && lkpi_bridge_quota_enforced(handle);
 }
 
 struct lkpifs_dir_fill {
@@ -944,6 +955,44 @@ static void lkpifs_release(struct vfs_node *node)
 	if (info->handle)
 		lkpi_bridge_put(info->handle);
 	kfree(info);
+}
+
+/* ── quotas ─────────────────────────────────────────────────────── */
+
+/* quotactl(2) on the filesystem `on_fs` lives on; see kernel/lkpi/fs_quotactl.c.
+ * A node on any other filesystem has no quota operations, which Linux reports
+ * as ENOSYS. */
+int lkpifs_quotactl(struct vfs_node *on_fs, u32 cmd, u32 id, u64 addr,
+                    struct vfs_node *quota_file, int path_err, int readonly)
+{
+	void *handle = node_handle(on_fs);
+	void *file = 0;
+
+	if (!handle)
+		return -ENOSYS;
+	if (readonly && lkpi_bridge_quotactl_cmd_writes(cmd))
+		return -EROFS;
+	if (quota_file) {
+		file = node_handle(quota_file);
+		if (!file)
+			path_err = -EXDEV; /* not on an imported filesystem at all */
+	}
+	return lkpi_bridge_quotactl(handle, cmd, id, (void *)(usize)addr, file,
+	                            path_err);
+}
+
+void lkpifs_quota_sync_all(int type)
+{
+	for (int i = 0; i < LKPIFS_MAX_MOUNTS; i++) {
+		u64 flags;
+		void *root;
+
+		spin_lock_irqsave(&g_lkpifs_roots_lock, &flags);
+		root = g_lkpifs_roots[i];
+		spin_unlock_irqrestore(&g_lkpifs_roots_lock, flags);
+		if (root)
+			lkpi_bridge_quota_sync(root, type);
+	}
 }
 
 /* ── the types on offer ─────────────────────────────────────────── */

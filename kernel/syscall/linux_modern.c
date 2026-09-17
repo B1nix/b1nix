@@ -1151,65 +1151,97 @@ static isize lm_listmount(u64 ureq, u64 uids, u64 nr, u64 flags) {
 
 #define Q_SYNC         0x800001
 #define Q_QUOTAON      0x800002
-#define Q_QUOTAOFF     0x800003
-#define Q_GETFMT       0x800004
-#define Q_GETINFO      0x800005
-#define Q_SETINFO      0x800006
-#define Q_GETQUOTA     0x800007
-#define Q_SETQUOTA     0x800008
-#define Q_GETNEXTQUOTA 0x800009
 #define LM_MAXQUOTAS   3
 
-/* The address is validated, the permissions checked and the target resolved
- * exactly as Linux does; the answer after that is the one Linux gives for a
- * filesystem with no quota support, which is what every filesystem here is.
- * XFS-style (Q_X*) commands meet the same answer. */
-static isize lm_quota_common(const char *special, int fd, u64 cmd, u64 id) {
-  u32 c = (u32)cmd >> 8;
-  u32 type = (u32)cmd & 0xff;
-  char fstype[16];
-  struct cred *cr = current_task->cred;
+/* The target is named the way the Linux system call names it; everything
+ * after that -- the permission check, the command and its argument copies --
+ * is upstream's own fs/quota/quota.c (kernel/lkpi/fs_quotactl.c), because the
+ * filesystems with quota support here are the imported ones. On any other
+ * filesystem the answer is Linux's for one without quota operations. */
+#ifdef B1NIX_FS_IMPORT
+extern int lkpifs_quotactl(struct vfs_node *on_fs, u32 cmd, u32 id, u64 addr,
+                           struct vfs_node *quota_file, int path_err,
+                           int readonly);
+extern void lkpifs_quota_sync_all(int type);
+#endif
 
-  (void)id;
-  if (type >= LM_MAXQUOTAS)
-    return -EINVAL;
-  switch (c) {
-  case Q_GETFMT & 0xffffff:
-  case Q_GETINFO & 0xffffff:
-  case Q_SYNC & 0xffffff:
-    break;
-  case Q_GETQUOTA & 0xffffff:
-  case Q_GETNEXTQUOTA & 0xffffff:
-    /* Someone else's usage needs CAP_SYS_ADMIN. */
-    if (!cred_has_cap(cr, CAP_SYS_ADMIN) &&
-        !((type == 0 && id == cr->euid) || (type == 1 && id == cr->egid)))
-      return -EPERM;
-    break;
-  default:
-    if (!cred_has_cap(cr, CAP_SYS_ADMIN))
-      return -EPERM;
-  }
-  int rc = vfs_quota_target(special, fd, fstype, sizeof(fstype));
-  if (rc)
-    return rc;
+static isize lm_quota_run(struct vfs_node *on_fs, u64 mnt_flags, u64 cmd,
+                          u64 id, u64 addr, struct vfs_node *quota_file,
+                          int path_err, int by_fd) {
+#ifdef B1NIX_FS_IMPORT
+  return lkpifs_quotactl(on_fs, (u32)cmd, (u32)id, addr, quota_file, path_err,
+                         by_fd && (mnt_flags & MS_RDONLY));
+#else
+  (void)on_fs, (void)mnt_flags, (void)cmd, (void)id, (void)addr;
+  (void)quota_file, (void)path_err, (void)by_fd;
   return -ENOSYS;
+#endif
 }
 
 static isize lm_quotactl(u64 cmd, u64 uspecial, u64 id, u64 addr) {
   char special[VFS_MAX_PATH];
+  u32 cmds = (u32)cmd >> 8;
+  u32 type = (u32)cmd & 0xff;
 
-  (void)addr;
-  if (!uspecial)
-    return ((u32)cmd >> 8) == (Q_SYNC & 0xffffff) ? 0 : -EINVAL;
+  if (type >= LM_MAXQUOTAS)
+    return -EINVAL;
+  if (!uspecial) {
+    if (cmds != Q_SYNC)
+      return -ENODEV;
+#ifdef B1NIX_FS_IMPORT
+    lkpifs_quota_sync_all((int)type);
+#endif
+    return 0;
+  }
   int cs = syscall_copyinstr(special, sizeof(special), (const char *)(usize)uspecial);
   if (cs < 0)
     return cs;
-  return lm_quota_common(special, -1, cmd, id);
+
+  /* Q_QUOTAON's argument is the quota file, resolved before the device, and
+   * a failure is only reported if the filesystem needs the file. */
+  struct vfs_node *qfile = 0;
+  int path_err = 0;
+  if (cmds == Q_QUOTAON) {
+    char qpath[VFS_MAX_PATH];
+    int qs = addr ? syscall_copyinstr(qpath, sizeof(qpath), (const char *)(usize)addr)
+                  : -EFAULT;
+    if (qs < 0) {
+      path_err = qs;
+    } else {
+      qfile = vfs_find_node(qpath);
+      if (IS_ERR(qfile) || !qfile) {
+        path_err = qfile ? (int)PTR_ERR(qfile) : -ENOENT;
+        qfile = 0;
+      }
+    }
+  }
+
+  struct vfs_node *on_fs = 0;
+  u64 mnt_flags = 0;
+  isize rc = vfs_quota_target(special, -1, &on_fs, &mnt_flags);
+  if (rc == 0) {
+    rc = lm_quota_run(on_fs, mnt_flags, cmd, id, addr, qfile, path_err, 0);
+    vfs_node_put(on_fs);
+  }
+  if (qfile)
+    vfs_node_put(qfile);
+  return rc;
 }
 
 static isize lm_quotactl_fd(u64 fd, u64 cmd, u64 id, u64 addr) {
-  (void)addr;
-  return lm_quota_common(0, (int)fd, cmd, id);
+  struct vfs_node *on_fs = 0;
+  u64 mnt_flags = 0;
+  isize rc = vfs_quota_target(0, (int)fd, &on_fs, &mnt_flags);
+
+  if (rc)
+    return rc;
+  if (((u32)cmd & 0xff) >= LM_MAXQUOTAS) {
+    vfs_node_put(on_fs);
+    return -EINVAL;
+  }
+  rc = lm_quota_run(on_fs, mnt_flags, cmd, id, addr, 0, -EINVAL, 1);
+  vfs_node_put(on_fs);
+  return rc;
 }
 
 /* ── dispatch ────────────────────────────────────────────────────── */
