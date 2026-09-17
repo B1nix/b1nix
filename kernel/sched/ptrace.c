@@ -18,6 +18,7 @@
  * target, exactly as Linux's ptrace_may_access does.
  */
 
+#include <b1nix/secretmem.h>
 #include <b1nix/user_namespace.h>
 #include <b1nix/arch.h>
 #include <b1nix/errno.h>
@@ -347,7 +348,7 @@ static int ptrace_access(struct task *t, u64 addr, u64 *value, int write) {
   for (usize i = 0; i < 8; i++) {
     u64 va = addr + i;
     u64 phys = paging_user_phys(t->pml4_phys, va);
-    if (!phys)
+    if (!phys || secretmem_frame_is_hidden(phys & ~(u64)(PAGE_SIZE - 1)))
       return -EIO;
     u8 *p = (u8 *)(usize)(phys + direct);
     if (write)
@@ -423,6 +424,9 @@ static isize ptrace_copy_range(struct task *t, u64 addr, void *buf, usize len,
     /* Same rule as ptrace_access: never write through to the vDSO frames
      * every process shares. */
     if (write && vdso_frame_is_shared(phys))
+      break;
+    /* memfd_secret: not even the kernel reads it (Linux fails the GUP). */
+    if (secretmem_frame_is_hidden(phys & ~(u64)(PAGE_SIZE - 1)))
       break;
     u8 *kva = (u8 *)(usize)(phys + direct);
     if (write)

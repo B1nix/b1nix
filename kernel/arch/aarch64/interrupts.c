@@ -767,6 +767,7 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 	 * userspace has no "lower EL" EC of its own, and classifying those as
 	 * kernel faults panicked the machine over a bad user instruction. */
 	int from_el0 = (frame->spsr & 0xFULL) == 0;
+	int pf_rc = -1;
 	int is_abort = (ec == EC_INSN_ABORT_LOWER || ec == EC_DATA_ABORT_LOWER ||
 	                ec == EC_INSN_ABORT_SAME || ec == EC_DATA_ABORT_SAME);
 
@@ -1001,7 +1002,8 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 		                 ((esr & (1ULL << 6)) ? 2 : 0) |
 		                 (from_el0 ? 4 : 0) |
 		                 ((frame->spsr & (1ULL << 7)) ? 0 : 8);
-		if (vmm_handle_page_fault(far, error_code) == 0) {
+		pf_rc = vmm_handle_page_fault(far, error_code);
+		if (pf_rc == 0) {
 			if (from_el0)
 				arch_check_and_deliver_signals(frame);
 			return;
@@ -1014,13 +1016,15 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 	if (from_el0) {
 		int sig = SIGTERM;
 		if (ec == EC_INSN_ABORT_LOWER || ec == EC_DATA_ABORT_LOWER)
-			sig = SIGSEGV;
+			sig = pf_rc == VMM_FAULT_SIGBUS ? SIGBUS : SIGSEGV;
 		else if (ec == 0x00 /* EC_UNKNOWN */ || ec == 0x26 /* SP alignment */ || ec == 0x22 /* PC alignment */)
 			sig = SIGILL;
 		else
 			sig = SIGILL;
 
-		if (sig == SIGSEGV) {
+		if (sig == SIGBUS) {
+			ptrace_record_fault(current_task, sig, far, B1NIX_BUS_ADRERR);
+		} else if (sig == SIGSEGV) {
 			u32 dfsc = (u32)esr & 0x3f;
 			int translation_fault = (dfsc & 0x3c) == 0x04;
 			ptrace_record_fault(current_task, sig, far,

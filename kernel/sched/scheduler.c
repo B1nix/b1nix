@@ -17,6 +17,7 @@
 #include <b1nix/kmsg.h>
 #include <b1nix/ktime.h>
 #include <b1nix/kprintf.h>
+#include <b1nix/secretmem.h>
 #include <b1nix/sched.h>
 #include "../syscall/linux_modern.h"
 #include <b1nix/klog.h>
@@ -7270,6 +7271,18 @@ static void robust_futex_death(struct task *t, u64 uaddr, u32 tid,
   u64 fr = paging_user_frame(t->pml4_phys, uaddr & ~(u64)(PAGE_SIZE - 1));
   if (!fr)
     return;
+  if (secretmem_frame_is_hidden(fr)) {
+    /* No kernel view of this page: go through the dying thread's own mapping,
+     * which is still the live address space. Not atomic against a sibling in
+     * another process, but a secret mapping is shared only by descendants. */
+    if ((uval & FUTEX_TID_BITS) != tid)
+      return;
+    u32 mval = (uval & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED_BIT;
+    if (syscall_copyout((void *)(usize)uaddr, &mval, sizeof(mval)) == 0 &&
+        (uval & FUTEX_WAITERS_BIT))
+      scheduler_futex_wake_addr(uaddr, 1);
+    return;
+  }
   u32 *word = (u32 *)(usize)(fr + vmm_direct_map_base() +
                              (uaddr & (PAGE_SIZE - 1)));
   for (int tries = 0; tries < 16; tries++) {
@@ -7358,7 +7371,11 @@ static void thread_release_ctid(struct task *t) {
     (void)vmm_handle_page_fault(ctid, PF_USER | PF_WRITE);
     fr = paging_user_frame(t->pml4_phys, page);
   }
-  if (fr) {
+  if (fr && secretmem_frame_is_hidden(fr)) {
+    /* The store above went through the thread's own mapping; there is no
+     * kernel view of this page to verify it through. */
+    thread_exit_trace(t->id, ctid, fr, 0);
+  } else if (fr) {
     volatile u32 *word =
         (volatile u32 *)(usize)(fr + vmm_direct_map_base() +
                                 (ctid & (PAGE_SIZE - 1)));
@@ -8541,7 +8558,8 @@ void scheduler_dump_tasks(void) {
             u64 page = fp & ~(u64)(PAGE_SIZE - 1);
             u64 pf = paging_user_frame(T(i)->pml4_phys, page);
 
-            if (!pf || (fp & 7) || (fp & (PAGE_SIZE - 1)) > PAGE_SIZE - 16)
+            if (!pf || (fp & 7) || (fp & (PAGE_SIZE - 1)) > PAGE_SIZE - 16 ||
+                secretmem_frame_is_hidden(pf))
               break;
             const volatile u64 *f =
                 (const volatile u64 *)(usize)(pf + vmm_direct_map_base() +
@@ -8608,7 +8626,7 @@ void scheduler_dump_tasks(void) {
           /* Skip, do not stop: a thread's stack is lazily backed, so the
            * first slots above rsp are often not mapped yet and stopping there
            * printed nothing at all. */
-          if (!frame)
+          if (!frame || secretmem_frame_is_hidden(frame))
             continue;
           value = *(volatile u64 *)(usize)(frame + vmm_direct_map_base() +
                                            (addr & (PAGE_SIZE - 1)));

@@ -222,6 +222,7 @@ int ptrace_fault_info(struct task *t, int *signo, u64 *addr, int *code);
 #define B1NIX_SEGV_MAPERR 1
 #define B1NIX_SEGV_ACCERR 2
 #define B1NIX_SI_KERNEL 0x80
+#define B1NIX_BUS_ADRERR 2
 
 int ptrace_is_traced(struct task *t);
 /* pid of the task tracing `t`, or 0 — waitpid uses it to report a tracee's

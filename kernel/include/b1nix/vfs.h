@@ -128,6 +128,10 @@ enum vfs_node_type {
  * some pages; there is nothing behind it to write to. */
 #define VFS_NODE_MEMORY_BACKED 0x10000000u
 
+/* inode->flags: a memfd_secret(2) file. Its pages are in no kernel mapping, so
+ * nothing may read them through the direct map (see kernel/mm/secretmem.c). */
+#define VFS_NODE_SECRETMEM 0x08000000u
+
 /* inode->attr: the ext2/3/4 i_flags low byte, shared verbatim with userspace
  * through FS_IOC_GETFLAGS/FS_IOC_SETFLAGS (chattr/lsattr).
  *   enforced by the VFS:  IMMUTABLE, APPEND
@@ -439,6 +443,11 @@ struct vfs_inode {
                                   u64 *out_phys);
   /* Mapping-lifetime hooks. Called once per VMA, including fork copies and
    * VMA splits, with a matching close on munmap/exec/exit. */
+  /* Pages a mapping of this file gets on demand, from the fault handler: the
+   * frame for the page-aligned `file_page`, with a reference taken for the
+   * mapping. A negative return fails the fault. Used by a file whose pages are
+   * neither in the page cache nor in inode->data (memfd_secret). */
+  int (*mmap_fault_cb)(struct vfs_node *node, u64 file_page, u64 *out_phys);
   void (*mmap_open_cb)(struct vfs_node *node);
   void (*mmap_close_cb)(struct vfs_node *node);
   void (*mmap_range_open_cb)(struct vfs_node *node, u64 offset, usize length);
@@ -742,6 +751,8 @@ int vfs_dup(int oldfd);
 int vfs_dup2(int oldfd, int newfd);
 int vfs_ftruncate(int fd, u64 length);
 int vfs_memfd_create(const char *name, u32 flags);
+/* memfd_secret(2); `cloexec` sets FD_CLOEXEC on the new descriptor. */
+int vfs_memfd_secret(int cloexec);
 int vfs_fcntl(int fd, int cmd, u64 arg);
 int vfs_ioctl(int fd, u64 request, void *arg);
 

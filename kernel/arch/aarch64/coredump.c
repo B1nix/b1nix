@@ -8,6 +8,7 @@
  * aarch64's pr_reg is `struct user_pt_regs` (x0..x30, sp, pc, pstate).
  */
 
+#include <b1nix/secretmem.h>
 #include <b1nix/arch_aarch64.h>
 #include <b1nix/mm.h>
 #include <b1nix/posix.h>
@@ -97,6 +98,8 @@ static int collect_segs(struct task *t, struct core_seg *segs, u64 *total,
   int n = 0;
   u64 sum = 0;
   for (struct vm_area *v = t->vma_list; v && n < CORE_MAX_SEGS; v = v->next) {
+    if (secretmem_vma(v))
+      continue; /* never dumped, as on Linux */
     u32 flags = ((v->prot & 0x1) ? PF_R : 0) | ((v->prot & 0x2) ? PF_W : 0) |
                 ((v->prot & 0x4) ? PF_X : 0);
     u64 a = v->start & ~(u64)(PAGE_SIZE - 1);

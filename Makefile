@@ -581,6 +581,7 @@ KERNEL_SOURCES := \
 	kernel/dev/panic_screen.c \
 	kernel/dev/panic_otter.c \
 	kernel/mm/pmm.c \
+	kernel/mm/secretmem.c \
 	kernel/mm/vma_trace.c \
 	kernel/mm/page_cache.c \
 	kernel/mm/swap.c \

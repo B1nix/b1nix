@@ -938,6 +938,10 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     return;
   }
 
+  /* The page-fault path's verdict when the page exists in no form a mapping
+   * can supply (past the end of its file): SIGBUS rather than SIGSEGV. */
+  int pf_sigbus = 0;
+
   // Page fault handling for Demand Paging
   if (frame->vector == 14) {
     u64 fault_addr = read_cr2();
@@ -975,7 +979,10 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     }
 
     u64 pf_t0 = pf_prof_enabled() ? pf_prof_now() : 0;
-    int handled = vmm_handle_page_fault(fault_addr, error_code) == 0;
+    int pf_rc = vmm_handle_page_fault(fault_addr, error_code);
+    int handled = pf_rc == 0;
+
+    pf_sigbus = pf_rc == VMM_FAULT_SIGBUS;
 
     if (pf_t0)
       pf_prof_account(pf_prof_now() - pf_t0);
@@ -1700,7 +1707,7 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
       sig = SIGSEGV;
       break; /* #GP general protection */
     case 14:
-      sig = SIGSEGV;
+      sig = pf_sigbus ? SIGBUS : SIGSEGV;
       break; /* #PF page fault */
     default:
       sig = SIGTERM;
@@ -1720,7 +1727,9 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
      * other fault reports the instruction pointer with SI_KERNEL. The record is
      * what the task's own SA_SIGINFO handler and a tracer's PTRACE_GETSIGINFO
      * both read back. */
-    if (frame->vector == 14)
+    if (frame->vector == 14 && sig == SIGBUS)
+      ptrace_record_fault(current_task, sig, read_cr2(), B1NIX_BUS_ADRERR);
+    else if (frame->vector == 14)
       ptrace_record_fault(current_task, sig, read_cr2(),
                           (frame->error_code & 1) ? B1NIX_SEGV_ACCERR
                                                   : B1NIX_SEGV_MAPERR);

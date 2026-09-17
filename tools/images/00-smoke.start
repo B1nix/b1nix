@@ -212,6 +212,7 @@ run_test /bin/m107_smoke posix
 run_test /bin/m109_uevent_smoke posix
 run_test /bin/m63_smoke posix
 run_test /bin/m123_smoke posix
+run_test /bin/m124_smoke posix
 # M123: the same namespaces through Alpine's unshare, nsenter and bubblewrap.
 if [ "$SMOKE_POSIX" = "1" ] && [ -x /etc/m123-tools-smoke.sh ]; then
     /bin/sh /etc/m123-tools-smoke.sh

@@ -57,6 +57,7 @@
 #define LM_quotactl_fd      443
 #define LM_pidfd_getfd      438
 #define LM_process_madvise  440
+#define LM_memfd_secret     447
 #define LM_process_mrelease 448
 #define LM_futex_waitv      449
 #define LM_set_mempolicy_home_node 450
@@ -65,6 +66,8 @@
 #define LM_futex_wait       455
 #define LM_statmount        457
 #define LM_listmount        458
+
+#define LM_O_CLOEXEC 02000000
 
 /* ── per-task state ──────────────────────────────────────────────── */
 
@@ -1290,6 +1293,14 @@ int linux_modern_syscall(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4,
     break;
   case LM_openat2:
     r = lm_openat2(a0, a1, a2, a3);
+    break;
+  case LM_memfd_secret:
+    /* O_CLOEXEC is the only flag, and it has one value on every architecture
+     * this kernel runs on. */
+    if (a0 & ~(u64)LM_O_CLOEXEC)
+      r = -EINVAL;
+    else
+      r = vfs_memfd_secret((a0 & LM_O_CLOEXEC) != 0);
     break;
   default:
     if (landlock_syscall(nr, a0, a1, a2, a3, ret))

@@ -39,6 +39,7 @@
 #include <b1nix/serial_tty.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
+#include <b1nix/secretmem.h>
 #include <b1nix/vfs.h>
 #include <b1nix/landlock.h>
 #include <b1nix/kprintf.h>
@@ -4486,6 +4487,8 @@ static isize node_read_impl(struct vfs_handle *h, char *buf, usize size,
    * a reference and an open file. */
   if (h->flags & B1NIX_O_PATH)
     return -EBADF;
+  if (h->node->inode->flags & VFS_NODE_SECRETMEM)
+    return -EINVAL; /* see node_write_impl */
   struct vfs_node *node = vfs_node_get(h->node);
   u64 offset = posp ? *posp : h->offset;
   vfs_inode_lock(node->inode);
@@ -4646,6 +4649,9 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
     return -EBADF;
   if (!h->node)
     return -EBADF;
+  /* memfd_secret: the contents are reachable only through a mapping. */
+  if (h->node->inode->flags & VFS_NODE_SECRETMEM)
+    return -EINVAL;
   struct vfs_node *node = vfs_node_get(h->node);
   /* M56 sealing: a sealed-for-write memfd rejects all writes (EPERM). */
   if (node->inode->seals & B1NIX_F_SEAL_WRITE) {
@@ -9487,6 +9493,45 @@ int vfs_memfd_create(const char *name, u32 flags) {
     return fd == -ENOMEM ? -ENOMEM : -EMFILE;
   }
   if (flags & B1NIX_MFD_CLOEXEC)
+    scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
+  return fd;
+}
+
+int vfs_memfd_secret(int cloexec) {
+  if (!secretmem_available())
+    return -ENOSYS;
+  struct vfs_node *node = vfs_create_node(VFS_FILE);
+  if (!node)
+    return -ENOMEM;
+  copy_path(node->name, sizeof(node->name), "secretmem");
+  node->deleted = 1;
+  node->inode->nlink = 0;
+  node->inode->mode = 0600;
+  const struct cred *cred = get_current_cred();
+  node->inode->uid = cred ? cred->euid : ROOT_UID;
+  node->inode->gid = cred ? cred->egid : ROOT_GID;
+  vfs_init_times(node->inode);
+  int rc = secretmem_attach(node);
+  if (rc) {
+    vfs_node_put(node);
+    return rc;
+  }
+
+  struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_NODE);
+  if (!h) {
+    vfs_node_put(node);
+    return -ENFILE;
+  }
+  h->node = node;
+  h->ops = &node_file_ops;
+  h->flags = B1NIX_O_RDWR;
+
+  int fd = scheduler_fd_alloc(h);
+  if (fd < 0) {
+    vfs_handle_release(h);
+    return fd == -ENOMEM ? -ENOMEM : -EMFILE;
+  }
+  if (cloexec)
     scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
   return fd;
 }

@@ -1,3 +1,4 @@
+#include <b1nix/secretmem.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
@@ -386,6 +387,16 @@ static void pmm_return_frame(u64 frame) {
       pmm_report_page_table_history_pub(frame);
       panic("pmm: page-table frame returned to the allocator");
     }
+  }
+  /* A frame hidden from the kernel's mappings (memfd_secret) has no direct-map
+   * address, and the allocator writes its free-list header through one. The
+   * pool unhides a chunk before it frees it; reaching here otherwise is a
+   * reference-count bug in a secret mapping. */
+  if (secretmem_frame_is_hidden(frame)) {
+    console_write("pmm: returning hidden secretmem frame 0x");
+    console_write_hex64(frame);
+    console_write("\n");
+    panic("pmm: secret frame returned to the allocator");
   }
   if (buddy_release(frame, 0) == 0) return;
   usize idx = frame_index(frame);
@@ -1432,6 +1443,14 @@ void pmm_free_frame(u64 frame) {
 
 
   if (!now_zero) return;  /* still referenced elsewhere (CoW sibling) */
+
+  /* See pmm_return_frame: the parking below writes through the direct map. */
+  if (secretmem_frame_is_hidden(frame)) {
+    console_write("pmm: last reference to hidden secretmem frame 0x");
+    console_write_hex64(frame);
+    console_write(" dropped\n");
+    panic("pmm: secret frame freed while hidden");
+  }
 
   pmm_note_free_site(frame, (u64)(usize)__builtin_return_address(0));
 

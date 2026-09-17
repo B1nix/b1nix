@@ -1,3 +1,4 @@
+#include <b1nix/secretmem.h>
 #include <b1nix/arch.h>
 #include <b1nix/fw_cfg.h>
 #include <b1nix/io.h>
@@ -670,6 +671,7 @@ void kernel_main(usize arg0, usize arg1)
 	 * the PMM and the heap, both of which are already up. */
 	page_cache_init();
 	BOOTMARK(9);	/* page cache */
+	secretmem_init();
 
 	initramfs_init();
 	BOOTMARK(10);	/* initramfs */

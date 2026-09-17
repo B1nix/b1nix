@@ -625,6 +625,12 @@ void vmm_set_lazy(u64 virtual_address) {
  * grow the break — the pages themselves are materialised here on first touch.
  * Without this every malloc'd page past the initially-mapped ones faulted, and
  * the fault was fatal (musl-linked ash died dereferencing its own globals). */
+/* Results of the locked fault walk that must be finished outside the lock: a
+ * page read back from swap, one read from a file, one a file hands over. */
+#define PF_NEEDS_SWAP_IN 1
+#define PF_NEEDS_FILE_FILL 2
+#define PF_NEEDS_FILE_CB 3
+
 static int fault_anon_user_page(u64 va) {
   if (!current_task)
     return -1;
@@ -655,6 +661,8 @@ static int fault_anon_user_page(u64 va) {
   vma_walker_exit();
   if (protnone)
     return -1;
+  if (hit && hit->node && hit->node->inode && hit->node->inode->mmap_fault_cb)
+    return PF_NEEDS_FILE_CB; /* finished outside the lock */
   /* Fallbacks for the two regions a task legitimately touches without a VMA
    * describing the exact page: its brk heap and the stack growth window. A
    * blanket "anything above the load base" rule was materialising a fresh page
@@ -765,6 +773,41 @@ static struct vm_area *vma_for(u64 va) {
   return hit;
 }
 
+/* A page of a mapping whose file hands out its own frames (mmap_fault_cb):
+ * memfd_secret's pages are in no page cache and have no kernel address to copy
+ * from, so the file names the frame and it is mapped as it is. Runs without
+ * the page-table lock, like the other fills: the file may allocate. */
+static int file_cb_fault(u64 va) {
+  struct vm_area *vma = vma_for(va);
+  struct vfs_inode *in = (vma && vma->node) ? vma->node->inode : 0;
+
+  if (!in || !in->mmap_fault_cb || vma->prot == PROT_NONE)
+    return -1;
+  u64 file_page = ((u64)vma->offset + (va - vma->start)) & ~(PAGE_SIZE - 1);
+  u64 frame;
+  int cb = in->mmap_fault_cb(vma->node, file_page, &frame);
+
+  if (cb == -EFAULT)
+    return VMM_FAULT_SIGBUS;
+  if (cb != 0)
+    return -1;
+
+  u64 flags = vmm_user_flags_from_prot((int)vma->prot) | VMM_PRESENT |
+              VMM_SHARED;
+  u64 f;
+  int rc = 0;
+  vmm_write_acquire(&f);
+  u64 *l3 = leaf_table_for(current_task->pml4_phys, va);
+  if (l3 && (l3[l3_index(va)] & 0x3ULL) == D_PAGE)
+    rc = 1; /* serviced concurrently */
+  else if (map_page_locked(va, frame, flags) != 0)
+    rc = -1;
+  vmm_write_release(f);
+  if (rc != 0)
+    pmm_free_frame(frame); /* the mapping reference taken for us */
+  return rc < 0 ? -1 : 0;
+}
+
 /* Is the lazy page at `va` backed by a file rather than by nothing? */
 static int lazy_is_file_backed(u64 va) {
   struct vm_area *v = vma_for(va);
@@ -814,6 +857,8 @@ static int file_fill_fault_body(u64 *l3, usize i3, u64 va, u64 lazy_entry) {
 
   if (!in)
     return -1;
+  if (in->mmap_fault_cb)
+    return file_cb_fault(va);
 
   u64 frame = pmm_alloc_frame();
   if (!frame)
@@ -902,8 +947,6 @@ static int file_fill_fault_body(u64 *l3, usize i3, u64 va, u64 lazy_entry) {
 /* The lock is held by the caller. Returns a positive value for the cases that
  * must be finished outside it: a page read back from swap, or one read from a
  * file — both are block I/O, and both block. */
-#define PF_NEEDS_SWAP_IN 1
-#define PF_NEEDS_FILE_FILL 2
 static int handle_page_fault_locked(u64 fault_addr, u64 error_code,
                                     u64 **swap_l3, usize *swap_i3,
                                     u64 *swap_entry) {
@@ -1073,6 +1116,8 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   if (rc == PF_NEEDS_SWAP_IN)
     return swap_in_fault(swap_l3, swap_i3, fault_addr & ~(PAGE_SIZE - 1),
                          swap_entry);
+  if (rc == PF_NEEDS_FILE_CB)
+    return file_cb_fault(fault_addr & ~(PAGE_SIZE - 1));
   if (rc == PF_NEEDS_FILE_FILL)
     return file_fill_fault(swap_l3, swap_i3, fault_addr & ~(PAGE_SIZE - 1),
                            swap_entry, (error_code & 0xc) != 0);
@@ -1859,4 +1904,122 @@ u64 paging_user_resident(u64 pml4_phys, u64 start, u64 end) {
         count++;
   }
   return count;
+}
+
+/* ── memory the kernel's own mappings must not reach ─────────────────────
+ *
+ * memfd_secret(2) frames have to disappear from the kernel's view. On this
+ * port RAM has exactly one kernel alias, the identity map, and it lives in the
+ * L0[0] subtree every address space shares by pointer — so a single edit
+ * reaches them all.
+ *
+ * Hidden 2 MiB at a time, and only a block nobody is using: the caller hands
+ * over a whole free block. That is what makes break-before-make possible here:
+ * the block's entry is invalidated and flushed before anything replaces it,
+ * and since no code or data lives in it, nothing faults in between. The 1 GiB
+ * block above it is split the way ensure_child splits one (identical
+ * translations, then a flush), since that one does hold the running kernel. */
+
+#define HIDE_BLOCK BLOCK_SIZE_L2
+
+static u64 *hide_l2_for(u64 base, u64 **spare) {
+  u64 e0 = kernel_l0_virt[l0_index(base)];
+  if ((e0 & 0x3ULL) != D_TABLE)
+    return 0;
+  u64 *l1 = table_from_entry(e0);
+  usize i1 = l1_index(base);
+  if ((l1[i1] & 0x3ULL) == D_BLOCK && spare && *spare) {
+    u64 old = l1[i1];
+    u64 attrs = old & ~ADDR_MASK & ~0x3ULL;
+    u64 gib = old & ADDR_MASK;
+    for (usize i = 0; i < 512; i++)
+      (*spare)[i] = (gib + i * BLOCK_SIZE_L2) | attrs | D_BLOCK;
+    l1[i1] = virt_to_phys(*spare) | D_TABLE;
+    *spare = 0;
+  }
+  if ((l1[i1] & 0x3ULL) != D_TABLE)
+    return 0;
+  return table_from_entry(l1[i1]);
+}
+
+void paging_unhide_frames_2m(u64 base);
+
+int paging_hide_frames_2m(u64 base) {
+  if (base & (HIDE_BLOCK - 1))
+    return -EINVAL;
+  u64 *spare = alloc_table_try();
+  if (!spare)
+    return -ENOMEM;
+  u64 f;
+  int rc = 0;
+  vmm_write_acquire(&f);
+  u64 *l2 = hide_l2_for(base, &spare);
+  if (!l2) {
+    rc = -EINVAL;
+  } else {
+    usize i2 = l2_index(base);
+    u64 e2 = l2[i2];
+    if ((e2 & 0x3ULL) == D_BLOCK && (e2 & ADDR_MASK) == base) {
+      l2[i2] = 0;
+    } else if ((e2 & 0x3ULL) == D_TABLE) {
+      u64 *l3 = table_from_entry(e2);
+      for (usize i = 0; i < 512; i++)
+        if ((l3[i] & 0x3ULL) == D_PAGE &&
+            (l3[i] & ADDR_MASK) == base + i * PAGE_SIZE)
+          l3[i] = 0;
+    } else {
+      rc = -EINVAL; /* not RAM this map knows */
+    }
+    /* Verified, not assumed: nothing in the table may still map the block. */
+    e2 = l2[i2];
+    int survives = (e2 & 0x3ULL) == D_BLOCK;
+    if ((e2 & 0x3ULL) == D_TABLE) {
+      u64 *l3 = table_from_entry(e2);
+      for (usize i = 0; i < 512; i++)
+        if ((l3[i] & 0x3ULL) == D_PAGE && (l3[i] & ADDR_MASK) >= base &&
+            (l3[i] & ADDR_MASK) < base + HIDE_BLOCK)
+          survives = 1;
+    }
+    if (!rc && survives) {
+      console_write("paging: 0x");
+      console_write_hex64(base);
+      console_write(" still mapped after hiding; refused\n");
+      rc = -EFAULT;
+    }
+  }
+  vmm_write_release(f);
+  tlb_flush_all(); /* IS: every CPU */
+  if (spare)
+    pmm_free_frame(virt_to_phys(spare));
+  if (rc == -EFAULT)
+    paging_unhide_frames_2m(base);
+  return rc;
+}
+
+void paging_unhide_frames_2m(u64 base) {
+  u64 f;
+  vmm_write_acquire(&f);
+  u64 *l2 = hide_l2_for(base, 0);
+  if (l2) {
+    usize i2 = l2_index(base);
+    u64 leaf = ATTR_NORMAL | DIRECT_LEAF_FLAGS;
+    if (l2[i2] == 0) {
+      l2[i2] = base | leaf | D_BLOCK;
+    } else if ((l2[i2] & 0x3ULL) == D_TABLE) {
+      u64 *l3 = table_from_entry(l2[i2]);
+      for (usize i = 0; i < 512; i++)
+        if (l3[i] == 0)
+          l3[i] = (base + i * PAGE_SIZE) | leaf | D_PAGE;
+    }
+  }
+  vmm_write_release(f);
+}
+
+u64 paging_reserve_kernel_va(usize size) {
+  u64 len = ((u64)size + PAGE_SIZE - 1) & ~(u64)(PAGE_SIZE - 1);
+  if (mmio_next + len > MMIO_WINDOW_END)
+    return 0;
+  u64 va = mmio_next;
+  mmio_next += len;
+  return va;
 }

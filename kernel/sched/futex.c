@@ -17,6 +17,7 @@
  * primitives this milestone needs (mutex / condvar / join).
  */
 
+#include <b1nix/secretmem.h>
 #include <b1nix/vfs.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
@@ -416,7 +417,7 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
       u64 frame = paging_user_frame(current_task->pml4_phys,
                                     uaddr & ~(u64)(PAGE_SIZE - 1));
 
-      if (frame) {
+      if (frame && !secretmem_frame_is_hidden(frame)) {
         u32 truth = *(volatile u32 *)(usize)(frame + vmm_direct_map_base() +
                                              (uaddr & (PAGE_SIZE - 1)));
 
@@ -930,7 +931,7 @@ void futex_dump_waiters(void) {
         extern u64 vmm_direct_map_base(void);
         u64 frame = paging_user_frame(w->diag_pml4,
                                       w->diag_vaddr & ~(u64)(PAGE_SIZE - 1));
-        if (frame) {
+        if (frame && !secretmem_frame_is_hidden(frame)) {
           u32 cur = *(volatile u32 *)(usize)(frame + vmm_direct_map_base() +
                                              (w->diag_vaddr & (PAGE_SIZE - 1)));
           console_write(" cur=");

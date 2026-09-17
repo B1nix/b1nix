@@ -140,6 +140,11 @@ static inline u64 vmm_user_flags_from_prot(int prot) {
   return flags;
 }
 
+/* vmm_handle_page_fault's answer for an access to a page a file mapping
+ * cannot supply, such as one past the end of the file: SIGBUS, where every
+ * other failure is SIGSEGV. */
+#define VMM_FAULT_SIGBUS (-7)
+
 /* mmap flags */
 #define MAP_SHARED 0x01
 #define MAP_PRIVATE 0x02

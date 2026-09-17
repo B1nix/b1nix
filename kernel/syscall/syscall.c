@@ -27,6 +27,7 @@ void tlb_shootdown_all(void);
 #include <b1nix/rseq.h>
 #include <b1nix/tlb.h>
 #include <b1nix/sched.h>
+#include <b1nix/secretmem.h>
 #include <b1nix/blk.h>
 #include <b1nix/shm.h>
 #include <b1nix/sysv_ipc.h>
@@ -4160,6 +4161,12 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
     // Offset must be page-aligned
     if ((offset & (PAGE_SIZE - 1)) != 0)
       return (u64)-EINVAL;
+    if (node->inode && (node->inode->flags & VFS_NODE_SECRETMEM)) {
+      int sc = secretmem_mmap_check(t, (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1),
+                                    flags);
+      if (sc)
+        return (u64)sc;
+    }
   }
 
   // Align length to page size
@@ -5250,6 +5257,8 @@ static isize sys_msync(void *addr, usize length, int flags) {
     if (!vma->node || !vma->node->inode ||
         vma->node->inode->type != VFS_FILE)
       continue;
+    if (secretmem_vma(vma))
+      continue; /* nothing behind it to write to, and no kernel view of it */
     struct vfs_inode *inode = vma->node->inode;
     if (!inode->write_cb)
       continue;
@@ -9469,6 +9478,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                                 (usize)rc) < 0)
               return moved ? (u64)moved : (u64)-EFAULT;
           }
+          /* A page that cannot be reached is EFAULT here (Linux fails the
+           * page pin), where /proc/<pid>/mem reports the same thing as EIO. */
+          if (rc == -EIO)
+            rc = -EFAULT;
           if (rc <= 0)
             return moved ? (u64)moved : (u64)rc;
           moved += (usize)rc;

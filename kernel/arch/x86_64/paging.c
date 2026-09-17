@@ -1948,6 +1948,37 @@ static inline void pf_note_class(int cls)
 	pf_prof_class(pc ? (int)pc->cpu_id : 0, cls);
 }
 
+/* A page of a mapping whose file hands out its own frames (mmap_fault_cb):
+ * memfd_secret's pages are in no page cache and have no kernel address to
+ * copy from, so the file names the frame and it is mapped as it is. */
+static int fault_from_file_cb(struct vm_area *vma, u64 page_aligned) {
+  if (vma->prot == PROT_NONE)
+    return -1;
+  u64 file_page =
+      ((u64)vma->offset + (page_aligned - vma->start)) & ~(PAGE_SIZE - 1);
+  u64 frame;
+  int cb = vma->node->inode->mmap_fault_cb(vma->node, file_page, &frame);
+  if (cb == -EFAULT)
+    return VMM_FAULT_SIGBUS;
+  if (cb != 0)
+    return -1;
+
+  u64 flags = vmm_user_flags_from_prot((int)vma->prot) | VMM_PRESENT |
+              VMM_USER | VMM_SHARED;
+  u64 cflags;
+  int rc = 0;
+  vmm_write_acquire(&cflags);
+  u64 *slot = pf_leaf_pte_ptr(page_aligned);
+  if (slot && (*slot & VMM_PRESENT))
+    rc = 1; /* serviced concurrently */
+  else if (vmm_map_page_locked(page_aligned, frame, flags) != 0)
+    rc = -1;
+  vmm_write_release(cflags);
+  if (rc != 0)
+    pmm_free_frame(frame); /* the mapping reference taken for us */
+  return rc < 0 ? -1 : 0;
+}
+
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
   u64 page_aligned = fault_addr & ~(PAGE_SIZE - 1);
@@ -2201,6 +2232,15 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
         return -1; /* no access -> SIGSEGV */
       }
     }
+    {
+      struct vm_area *fv = anon_vma;
+
+      if (!fv && !(error_code & PF_USER) && current_task)
+        fv = vma_lookup(current_task, page_aligned);
+      if (fv && page_aligned >= fv->start && page_aligned < fv->end &&
+          fv->node && fv->node->inode && fv->node->inode->mmap_fault_cb)
+        return fault_from_file_cb(fv, page_aligned);
+    }
     /* Zero-page dedup: a fresh anonymous heap page has no content, so point
      * the mapping at the single shared read-only zero page instead of
      * allocating a frame. The first store faults into the COW path and
@@ -2373,6 +2413,9 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       }
       vma_walker_exit();
     }
+    if (va && page_aligned >= va->start && page_aligned < va->end &&
+        va->node && va->node->inode && va->node->inode->mmap_fault_cb)
+      return fault_from_file_cb(va, page_aligned);
     if (va && page_aligned >= va->start && page_aligned < va->end &&
         va->node && va->node->inode) {
       struct vfs_inode *in = va->node->inode;
@@ -2959,12 +3002,19 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   return -1; // Unhandled
 }
 
+static void spaces_reserve(void);
+static void spaces_unreserve(void);
+static void spaces_add(u64 pml4_phys);
+static void spaces_remove(u64 pml4_phys);
+
 u64 paging_create_address_space(void) {
+  spaces_reserve();
   u64 *pml4 = alloc_page_table();
   u64 pml4_phys = table_to_phys(pml4);
 
   u64 _vmflags;
   vmm_read_acquire(&_vmflags);
+  spaces_add(pml4_phys);
 
   // Clone kernel-half entries (256-511)
   for (usize i = 256; i < 512; i++) {
@@ -3076,11 +3126,14 @@ static int clone_table(u64 *src_table, u64 *dst_table, int level) {
 u64 paging_clone_address_space(u64 src_pml4_phys) {
   u64 real_src_phys = src_pml4_phys ? src_pml4_phys : kernel_pml4_phys;
   u64 *src_pml4 = (u64 *)(usize)(real_src_phys + DIRECT_MAP_BASE);
+  spaces_reserve();
   u64 *dst_pml4 = alloc_page_table_try();
   u64 dst_pml4_phys;
 
-  if (!dst_pml4)
+  if (!dst_pml4) {
+    spaces_unreserve();
     return 0; /* out of memory: the caller reports ENOMEM */
+  }
   dst_pml4_phys = table_to_phys(dst_pml4);
 
   /* M28 #7 T4: serialize page-table reads against concurrent vmm_map_page
@@ -3092,6 +3145,7 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
    * also writes back to src PT entries, so we need the write side. */
   u64 _vmflags;
   vmm_write_acquire(&_vmflags);
+  spaces_add(dst_pml4_phys);
 
   // Clone user-half entries (0-255)
   int failed = 0;
@@ -3559,6 +3613,7 @@ void paging_free_address_space(u64 pml4_phys) {
 
     if (!pmm_claim_page_table_release(pml4_phys))
       return; /* another thread is already tearing this space down */
+    spaces_remove(pml4_phys);
 
     /* This space is going away and its PML4 frame is about to go back to the
      * allocator. Any CPU still recording it as "loaded" must be made to write
@@ -3890,4 +3945,263 @@ void vmm_report_frame_aliases(struct task *t) {
 
   kfree(set);
   kfree(addr);
+}
+
+/* ── memory the kernel's own mappings must not reach ─────────────────────
+ *
+ * memfd_secret(2) promises pages that only the processes mapping them can
+ * read, so the kernel's aliases of those frames have to go. There are three:
+ * the direct map, the kernel-image window (physical 0-1 GiB at KERNEL_VMA),
+ * and the identity window. The first two sit in the kernel half, whose tables
+ * every address space shares by pointer. The identity window does not: each
+ * address space holds a private copy of it (paging_create_address_space), so
+ * removing a frame from it means visiting every address space that exists.
+ *
+ * The frames are hidden 2 MiB at a time. Every alias of a whole 2 MiB block
+ * is a single huge-page entry, so hiding one clears an entry rather than
+ * splitting it, and no page table has to be allocated under the lock. */
+
+/* Every live address space's PML4, for the edits that must reach all of them.
+ * An entry is added where the space is created, inside the page-table lock,
+ * so a space is never visible to a walker before it is registered; and removed
+ * before its tables are freed. The walk holds g_spaces_lock throughout, which
+ * is what keeps a concurrent release from freeing tables under it. */
+static spinlock_t g_spaces_lock = SPINLOCK_INIT;
+static u64 *g_spaces;
+static usize g_spaces_cap;
+/* Slots promised to creators that have not yet taken the page-table lock. */
+static usize g_spaces_reserved;
+
+/* Make room for one more address space. Runs before the page-table lock is
+ * taken, because growing the table allocates. */
+static void spaces_reserve(void) {
+  for (;;) {
+    u64 flags;
+    spin_lock_irqsave(&g_spaces_lock, &flags);
+    if (g_spaces_reserved < g_spaces_cap) {
+      g_spaces_reserved++;
+      spin_unlock_irqrestore(&g_spaces_lock, flags);
+      return;
+    }
+    usize want = g_spaces_cap ? g_spaces_cap * 2 : 256;
+    spin_unlock_irqrestore(&g_spaces_lock, flags);
+
+    u64 *grown = kzalloc(want * sizeof(u64));
+    if (!grown)
+      panic("paging: no memory to track address spaces");
+    u64 *old = 0;
+    spin_lock_irqsave(&g_spaces_lock, &flags);
+    if (g_spaces_cap < want) {
+      for (usize i = 0; i < g_spaces_cap; i++)
+        grown[i] = g_spaces[i];
+      old = g_spaces;
+      g_spaces = grown;
+      g_spaces_cap = want;
+      grown = 0;
+    }
+    spin_unlock_irqrestore(&g_spaces_lock, flags);
+    kfree(grown ? grown : old);
+  }
+}
+
+static void spaces_unreserve(void) {
+  u64 flags;
+  spin_lock_irqsave(&g_spaces_lock, &flags);
+  g_spaces_reserved--;
+  spin_unlock_irqrestore(&g_spaces_lock, flags);
+}
+
+/* Fill a reserved slot. Called with the page-table lock held. */
+static void spaces_add(u64 pml4_phys) {
+  u64 flags;
+  spin_lock_irqsave(&g_spaces_lock, &flags);
+  for (usize i = 0; i < g_spaces_cap; i++) {
+    if (g_spaces[i] == 0) {
+      g_spaces[i] = pml4_phys;
+      spin_unlock_irqrestore(&g_spaces_lock, flags);
+      return;
+    }
+  }
+  spin_unlock_irqrestore(&g_spaces_lock, flags);
+  panic("paging: address-space registry full despite a reservation");
+}
+
+static void spaces_remove(u64 pml4_phys) {
+  u64 flags;
+  spin_lock_irqsave(&g_spaces_lock, &flags);
+  for (usize i = 0; i < g_spaces_cap; i++) {
+    if (g_spaces[i] == pml4_phys) {
+      g_spaces[i] = 0;
+      g_spaces_reserved--;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&g_spaces_lock, flags);
+}
+
+#define HIDE_BLOCK (2ULL * 1024 * 1024)
+#define HIDE_HUGE_ENTRY(base) ((base) | VMM_PRESENT | VMM_WRITABLE | HUGE_PAGE_FLAG)
+
+/* The PD slot covering `va` in the table rooted at `pml4`, or NULL when a
+ * level above it is absent or is itself a leaf. */
+static u64 *hide_pd_slot(u64 *pml4, u64 va) {
+  u64 pml4e = pml4[pml4_index(va)];
+  if (!(pml4e & VMM_PRESENT))
+    return 0;
+  u64 pdpte = table_from_entry(pml4e)[pdpt_index(va)];
+  if (!(pdpte & VMM_PRESENT) || (pdpte & HUGE_PAGE_FLAG))
+    return 0;
+  return &table_from_entry(pdpte)[pd_index(va)];
+}
+
+/* Remove the kernel's translation of [base, base + 2 MiB) at virtual `va`
+ * from one table. `pt_too` also clears matching supervisor leaves where the
+ * block was already split into 4 KiB entries. */
+static void hide_block_at(u64 *pml4, u64 va, u64 base, int pt_too) {
+  u64 *slot = hide_pd_slot(pml4, va);
+  if (!slot || !(*slot & VMM_PRESENT))
+    return;
+  if (*slot & HUGE_PAGE_FLAG) {
+    if ((*slot & PAGE_ENTRY_ADDRESS_MASK) == base && !(*slot & VMM_USER))
+      *slot = 0;
+    return;
+  }
+  if (!pt_too)
+    return;
+  u64 *pt = table_from_entry(*slot);
+  for (usize i = 0; i < 512; i++) {
+    u64 e = pt[i];
+    if ((e & VMM_PRESENT) && !(e & VMM_USER) &&
+        (e & PAGE_ENTRY_ADDRESS_MASK) == base + i * PAGE_SIZE)
+      pt[i] = 0;
+  }
+}
+
+/* Put back what hide_block_at removed. Only an entry that is still empty is
+ * refilled: anything else was installed since and belongs to its owner. */
+static void unhide_block_at(u64 *pml4, u64 va, u64 base, int pt_too) {
+  u64 *slot = hide_pd_slot(pml4, va);
+  if (!slot)
+    return;
+  if (*slot == 0) {
+    *slot = HIDE_HUGE_ENTRY(base);
+    return;
+  }
+  if (!pt_too || !(*slot & VMM_PRESENT) || (*slot & HUGE_PAGE_FLAG))
+    return;
+  u64 *pt = table_from_entry(*slot);
+  for (usize i = 0; i < 512; i++) {
+    if (pt[i] == 0)
+      pt[i] = (base + i * PAGE_SIZE) | VMM_PRESENT | VMM_WRITABLE;
+  }
+}
+
+static void hide_all_aliases(u64 base, int hide) {
+  void (*op)(u64 *, u64, u64, int) = hide ? hide_block_at : unhide_block_at;
+
+  /* The kernel half: shared by every address space. */
+  op(kernel_pml4_virt, DIRECT_MAP_BASE + base, base, 1);
+  if (base + HIDE_BLOCK <= 0x40000000ULL)
+    op(kernel_pml4_virt, KERNEL_VMA + base, base, 1);
+
+  /* The identity window: the kernel's own copy, and every process's. A
+   * process's split tables are only cleared, never refilled — a hole where a
+   * user mapping once split the block is what that address space had before
+   * the frames were hidden. */
+  op(kernel_pml4_virt, base, base, 1);
+  u64 flags;
+  spin_lock_irqsave(&g_spaces_lock, &flags);
+  for (usize i = 0; i < g_spaces_cap; i++) {
+    if (!g_spaces[i])
+      continue;
+    u64 *pml4 = (u64 *)(usize)(g_spaces[i] + DIRECT_MAP_BASE);
+    op(pml4, base, base, hide);
+  }
+  spin_unlock_irqrestore(&g_spaces_lock, flags);
+}
+
+/* Does any translation of [base, base + 2 MiB) survive in the table rooted at
+ * `pml4` at virtual `va`? A present huge entry covering the block, or any
+ * present supervisor leaf onto one of its frames, is a survivor. */
+static int alias_survives(u64 *pml4, u64 va, u64 base) {
+  u64 *slot = hide_pd_slot(pml4, va);
+  if (!slot || !(*slot & VMM_PRESENT))
+    return 0;
+  if (*slot & HUGE_PAGE_FLAG)
+    return (*slot & PAGE_ENTRY_ADDRESS_MASK) == base;
+  u64 *pt = table_from_entry(*slot);
+  for (usize i = 0; i < 512; i++) {
+    u64 e = pt[i];
+    if ((e & VMM_PRESENT) && !(e & VMM_USER) &&
+        (e & PAGE_ENTRY_ADDRESS_MASK) >= base &&
+        (e & PAGE_ENTRY_ADDRESS_MASK) < base + HIDE_BLOCK)
+      return 1;
+  }
+  return 0;
+}
+
+/* Checked after every hide, under the lock: the promise is that no kernel
+ * translation of these frames exists anywhere, so it is verified rather than
+ * assumed. Returns the number of tables still holding one. */
+static int hidden_block_survivors(u64 base) {
+  int n = alias_survives(kernel_pml4_virt, DIRECT_MAP_BASE + base, base);
+  if (base + HIDE_BLOCK <= 0x40000000ULL)
+    n += alias_survives(kernel_pml4_virt, KERNEL_VMA + base, base);
+  n += alias_survives(kernel_pml4_virt, base, base);
+  u64 flags;
+  spin_lock_irqsave(&g_spaces_lock, &flags);
+  for (usize i = 0; i < g_spaces_cap; i++) {
+    if (!g_spaces[i])
+      continue;
+    n += alias_survives((u64 *)(usize)(g_spaces[i] + DIRECT_MAP_BASE), base,
+                        base);
+  }
+  spin_unlock_irqrestore(&g_spaces_lock, flags);
+  return n;
+}
+
+int paging_hide_frames_2m(u64 base) {
+  if ((base & (HIDE_BLOCK - 1)) || base + HIDE_BLOCK > DIRECT_MAP_SIZE)
+    return -EINVAL;
+  u64 flags;
+  vmm_write_acquire(&flags);
+  hide_all_aliases(base, 1);
+  int survivors = hidden_block_survivors(base);
+  if (survivors)
+    hide_all_aliases(base, 0);
+  addrspace_epoch_bump();
+  vmm_write_release(flags);
+  if (survivors) {
+    console_write("paging: 0x");
+    console_write_hex64(base);
+    console_write(" still mapped in ");
+    console_write_dec((u64)survivors);
+    console_write(" table(s) after hiding; refused\n");
+    return -EFAULT;
+  }
+  /* Every CPU, whatever it runs: the identity window is in every address
+   * space, and nothing here is a global translation (CR4.PGE stays off). */
+  extern void tlb_shootdown_all(void);
+  tlb_shootdown_all();
+  return 0;
+}
+
+void paging_unhide_frames_2m(u64 base) {
+  u64 flags;
+  vmm_write_acquire(&flags);
+  hide_all_aliases(base, 0);
+  vmm_write_release(flags);
+}
+
+/* A kernel virtual range nothing else will be handed, for mappings the caller
+ * manages itself. Carved from the MMIO window at boot. */
+u64 paging_reserve_kernel_va(usize size) {
+  u64 len = ((u64)size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  u64 va = (mmio_next + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  if (va + len > MMIO_MAP_BASE + MMIO_MAP_SIZE)
+    return 0;
+  mmio_next = va + len;
+  if (paging_reserve_kernel_path(va, len) != 0)
+    return 0;
+  return va;
 }
