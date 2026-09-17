@@ -2384,6 +2384,10 @@ resolve:
   u16 file_mode = node->inode->mode;
   u32 file_uid = node->inode->uid;
   u32 file_gid = node->inode->gid;
+  /* Set-user/group-ID is not honoured on a nosuid mount, nor for a task that
+   * asked for no_new_privs. */
+  if (vfs_node_is_nosuid(node) || task_no_new_privs(current_task))
+    file_mode &= (u16)~06000;
 
   /* POSIX `#!` interpreter files: rewrite the exec into
    * "interpreter [optional-arg] script-path argv[1..]". One level only —
@@ -2468,12 +2472,10 @@ resolve:
    * calling execve. The task's own credentials are still only changed after a
    * successful load below — a failed exec must never leave the caller
    * privileged. */
-  u32 new_euid = current_task->cred->euid;
-  u32 new_egid = current_task->cred->egid;
-  if (file_mode & 04000) /* S_ISUID */
-    new_euid = file_uid;
-  if (file_mode & 02000) /* S_ISGID */
-    new_egid = file_gid;
+  struct cred preview = *current_task->cred; /* no reference: never freed */
+  cred_exec_transform(&preview, file_mode, file_uid, file_gid, 1);
+  u32 new_euid = preview.euid;
+  u32 new_egid = preview.egid;
 
   struct user_loaded_image *image =
       user_load_image(path, 0, argv, envp, 0, 0, 1, new_euid, new_egid);
@@ -2502,24 +2504,11 @@ resolve:
 
   vfs_close_on_exec();
 
-  /* POSIX: Apply SUID/SGID bits */
-  if (file_mode & 04000) { /* S_ISUID */
-    current_task->cred->euid = file_uid;
-    current_task->cred->suid = file_uid;
-  }
-  if (file_mode & 02000) { /* S_ISGID */
-    current_task->cred->egid = file_gid;
-    current_task->cred->sgid = file_gid;
-  }
-  /* The rest of the credential has to follow the effective ids, exactly as it
-   * does for every setuid()/setgid() path. Writing euid/egid on their own left
-   * a setuid-root binary with root's euid but the caller's capabilities and
-   * fsuid: /bin/su could neither setgroups() (no CAP_SETGID) nor read
-   * /etc/shadow (the VFS judges access by fsuid). Refresh unconditionally —
-   * fsuid and the capability set must track euid on every exec, not only when
-   * a suid bit is present. */
-  cred_refresh_caps(current_task->cred);
-  cred_sync_fsids(current_task->cred);
+  /* POSIX set-user/group-ID and the capability sets the new image runs with.
+   * The whole credential follows: a setuid-root binary needs root's
+   * capabilities and fsuid as well as its euid (/bin/su calls setgroups() and
+   * reads /etc/shadow), and every exec recomputes them, suid bit or not. */
+  cred_exec_transform(current_task->cred, file_mode, file_uid, file_gid, 1);
 
   // POSIX: Reset caught signals to default action across execve.
   // Ignored signals (SIG_IGN) remain ignored.

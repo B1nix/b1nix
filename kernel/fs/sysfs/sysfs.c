@@ -1101,6 +1101,6 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
 void sysfs_init(void) {
   sysfs_fs.name = "sysfs";
   sysfs_fs.mount = sysfs_mount_cb;
-  sysfs_fs.flags = VFS_FS_NODEV;
+  sysfs_fs.flags = VFS_FS_NODEV | VFS_FS_USERNS_MOUNT;
   vfs_register_fs(&sysfs_fs);
 }

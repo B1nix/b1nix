@@ -807,26 +807,13 @@ void lkpi_scanout_mode(u32 *width, u32 *height)
 
 /* ── capabilities ────────────────────────────────────────────────── */
 
-/* Linux's capability numbers are not b1nix's -- CAP_SYS_ADMIN is 21 there and
- * 20 here, and the two lists diverge from CAP_SYS_RAWIO onwards. Imported code
- * passes Linux's, so the translation belongs here, at the one file that is
- * allowed to see both headers. Only the capabilities imported drivers actually
- * ask about are mapped; anything else is refused rather than guessed at, which
- * is the answer a driver can act on safely. */
+/* capable() for imported code. The capability numbers are Linux's on both
+ * sides, and the answer is for the initial user namespace, as capable() is. */
 int lkpi_capable(int cap)
 {
   struct cred *c = scheduler_get_current_cred();
-  int b1nix_cap;
 
-  if (!c)
-    return 0;
-  switch (cap) {
-  case 17: b1nix_cap = CAP_SYS_RAWIO; break; /* Linux CAP_SYS_RAWIO */
-  case 21: b1nix_cap = CAP_SYS_ADMIN; break; /* Linux CAP_SYS_ADMIN */
-  case 23: b1nix_cap = CAP_SYS_NICE; break;  /* Linux CAP_SYS_NICE  */
-  default: return 0;
-  }
-  return cred_has_cap(c, b1nix_cap) ? 1 : 0;
+  return c && cred_has_cap(c, cap) ? 1 : 0;
 }
 
 int lkpi_scanout_pci_id(u16 *vendor, u16 *device, u8 *bus, u8 *slot, u8 *func)

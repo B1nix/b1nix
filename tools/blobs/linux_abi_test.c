@@ -1179,9 +1179,9 @@ static void test_capdrop(void) {
     unsigned hdr[2] = {0x20080522u, 0}; /* _LINUX_CAPABILITY_VERSION_3 */
     unsigned caps[6] = {0, 0, 0, 0, 0, 0};
     long before = sys2(SYS_capget, hdr, caps);
-    /* CAP_SYS_TIME is bit 24 of the low word. Drop just that one. */
-    unsigned keep_eff = caps[0] & ~(1u << 24);
-    unsigned keep_perm = caps[1] & ~(1u << 24);
+    /* CAP_SYS_TIME is bit 25 of the low word. Drop just that one. */
+    unsigned keep_eff = caps[0] & ~(1u << 25);
+    unsigned keep_perm = caps[1] & ~(1u << 25);
     unsigned set[6] = {keep_eff, keep_perm, caps[2],
                        caps[3],  caps[4],   caps[5]};
     long cs = sys2(SYS_capset, hdr, set);
@@ -1194,7 +1194,7 @@ static void test_capdrop(void) {
     /* And the drop must be visible through capget. */
     unsigned after[6] = {0, 0, 0, 0, 0, 0};
     long ag = sys2(SYS_capget, hdr, after);
-    int dropped = (ag == 0 && !(after[1] & (1u << 24)));
+    int dropped = (ag == 0 && !(after[1] & (1u << 25)));
 
     int rc = (before == 0 && cs == 0 && st == -1 /* EPERM */ && dropped) ? 0 : 1;
     sys1(SYS_exit_group, rc);

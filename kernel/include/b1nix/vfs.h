@@ -463,6 +463,10 @@ struct vfs_node {
 /* A filesystem that needs no block device (procfs, sysfs, tmpfs, ...). Only
  * affects how /proc/filesystems labels the entry, exactly as Linux does. */
 #define VFS_FS_NODEV 0x1
+/* Linux FS_USERNS_MOUNT: a task holding CAP_SYS_ADMIN only inside a user
+ * namespace may mount this type (in a mount namespace that namespace owns).
+ * Every other type needs the capability in the initial user namespace. */
+#define VFS_FS_USERNS_MOUNT 0x4
 /* This type's mount callback can build a superblock with no mountpoint: it
  * ignores the `data` argument (the target path) and populates nothing by
  * absolute path. The new mount API (fsopen/fsconfig/fsmount) creates a
@@ -550,6 +554,13 @@ void vfs_repopulate_after_root_mount(void);
 void vfs_resolve_path(const char *path, char *out);
 int vfs_get_node_path(struct vfs_node *node, char *buf, usize buf_len);
 int vfs_node_is_readonly(struct vfs_node *node);
+/* Linux may_mount(): CAP_SYS_ADMIN over the user namespace that owns the
+ * caller's mount namespace. Every call that changes the mount table asks. */
+int vfs_may_mount(void);
+/* May a task outside the initial user namespace mount `fstype`? */
+int vfs_fs_userns_mountable(const char *fstype);
+/* Is the node on a mount whose set-user-ID bits are ignored? */
+int vfs_node_is_nosuid(struct vfs_node *node);
 struct vfs_node *find_child(struct vfs_node *parent, const char *name);
 struct vfs_node *vfs_find_node(const char *path);
 struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
@@ -574,6 +585,9 @@ void vfs_detach_child(struct vfs_node *parent, struct vfs_node *child);
 u32 vfs_node_dev(struct vfs_node *node);
 isize vfs_readdir_children(struct vfs_node *dir, usize offset,
                            struct dirent *buf, usize max_entries);
+isize vfs_readdir_children_filtered(struct vfs_node *dir, usize offset,
+                                    struct dirent *buf, usize max_entries,
+                                    int (*keep)(struct vfs_node *child));
 
 /* Permission-aware operations */
 int vfs_open(const char *path);

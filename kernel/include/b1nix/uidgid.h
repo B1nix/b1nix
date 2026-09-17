@@ -92,9 +92,8 @@ struct cred {
    SECBIT(SECURE_KEEP_CAPS) | SECBIT(SECURE_NO_CAP_AMBIENT_RAISE))
 #define SECURE_ALL_LOCKS (SECURE_ALL_BITS << 1)
 
-/* Every capability b1nix defines (CAP_CHOWN..CAP_AUDIT_CONTROL and the few
- * above them) — the set a root task holds. */
-#define CAP_LAST 36
+/* Every capability b1nix defines — the set a root task holds. */
+#define CAP_LAST 40
 #define CAP_FULL_SET ((CAP_LAST >= 63) ? ~0ULL : ((1ULL << (CAP_LAST + 1)) - 1))
 
 /* Recompute the capability sets after a UID change: a root task holds
@@ -115,45 +114,51 @@ enum ring_level {
     RING_USER = 3,
 };
 
-/* ── Capabilities (for fine-grained privilege control) ── */
-#define CAP_CHOWN           0
-#define CAP_DAC_OVERRIDE    1
-#define CAP_DAC_READ_SEARCH 2
-#define CAP_FOWNER          3
-#define CAP_FSETID          4
-#define CAP_KILL            5
-#define CAP_SETGID          6
-#define CAP_SETUID          7
-#define CAP_SETPCAP         8
-#define CAP_NET_BIND_SERVICE 9
-#define CAP_NET_BROADCAST   10
-#define CAP_NET_ADMIN       11
-#define CAP_NET_RAW         12
-#define CAP_IPC_LOCK        13
-#define CAP_IPC_OWNER       14
-#define CAP_SYS_MODULE      15
-#define CAP_SYS_RAWIO       16
-#define CAP_SYS_CHROOT      17
-#define CAP_SYS_PTRACE      18
-#define CAP_SYS_PACCT       19
-#define CAP_SYS_ADMIN       20
-#define CAP_SYS_BOOT        21
-#define CAP_SYS_NICE        22
-#define CAP_SYS_RESOURCE    23
-#define CAP_SYS_TIME        24
-#define CAP_SYS_TTY_CONFIG  25
-#define CAP_MKNOD           26
-#define CAP_LEASE           27
-#define CAP_AUDIT_WRITE     28
-#define CAP_AUDIT_CONTROL   29
-#define CAP_SETFCAP         30
-#define CAP_MAC_OVERRIDE    31
-#define CAP_MAC_ADMIN       32
-#define CAP_SYSLOG          33
-#define CAP_WAKE_ALARM      34
-#define CAP_BLOCK_SUSPEND   35
-#define CAP_AUDIT_READ      36
-#define CAP_LAST_CAP        36
+/* ── Capabilities (for fine-grained privilege control) ──
+ * Linux's numbers: capget(2)/capset(2), prctl(PR_CAPBSET_*, PR_CAP_AMBIENT)
+ * and /proc/<pid>/status carry them to and from userspace unchanged. */
+#define CAP_CHOWN            0
+#define CAP_DAC_OVERRIDE     1
+#define CAP_DAC_READ_SEARCH  2
+#define CAP_FOWNER           3
+#define CAP_FSETID           4
+#define CAP_KILL             5
+#define CAP_SETGID           6
+#define CAP_SETUID           7
+#define CAP_SETPCAP          8
+#define CAP_LINUX_IMMUTABLE  9
+#define CAP_NET_BIND_SERVICE 10
+#define CAP_NET_BROADCAST    11
+#define CAP_NET_ADMIN        12
+#define CAP_NET_RAW          13
+#define CAP_IPC_LOCK         14
+#define CAP_IPC_OWNER        15
+#define CAP_SYS_MODULE       16
+#define CAP_SYS_RAWIO        17
+#define CAP_SYS_CHROOT       18
+#define CAP_SYS_PTRACE       19
+#define CAP_SYS_PACCT        20
+#define CAP_SYS_ADMIN        21
+#define CAP_SYS_BOOT         22
+#define CAP_SYS_NICE         23
+#define CAP_SYS_RESOURCE     24
+#define CAP_SYS_TIME         25
+#define CAP_SYS_TTY_CONFIG   26
+#define CAP_MKNOD            27
+#define CAP_LEASE            28
+#define CAP_AUDIT_WRITE      29
+#define CAP_AUDIT_CONTROL    30
+#define CAP_SETFCAP          31
+#define CAP_MAC_OVERRIDE     32
+#define CAP_MAC_ADMIN        33
+#define CAP_SYSLOG           34
+#define CAP_WAKE_ALARM       35
+#define CAP_BLOCK_SUSPEND    36
+#define CAP_AUDIT_READ       37
+#define CAP_PERFMON          38
+#define CAP_BPF              39
+#define CAP_CHECKPOINT_RESTORE 40
+#define CAP_LAST_CAP         40
 
 #define CAP_MAX CAP_LAST_CAP
 
@@ -193,6 +198,11 @@ int  cred_setresgid(struct cred *cred, int rgid, int egid, int sgid);
 /* Permission checks */
 int  cred_can_access(const struct cred *cred, u32 file_uid, u32 file_gid, u16 file_mode, u32 access_mask);
 int  cred_has_cap(const struct cred *cred, int cap);
+/* execve: apply set-user/group-ID and recompute the capability sets (Linux
+ * cap_bprm_creds_from_file for a file without file capabilities). Returns
+ * non-zero when the effective ids differ from the real ones afterwards. */
+int  cred_exec_transform(struct cred *c, u16 file_mode, u32 file_kuid,
+                         u32 file_kgid, int honour_setid);
 int  cred_has_cap_effective(const struct cred *cred, int cap);
 
 /* securebits(7). The setter enforces the LOCKED bits and requires CAP_SETPCAP,

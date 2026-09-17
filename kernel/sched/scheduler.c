@@ -7,6 +7,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/cgroup.h>
 #include <b1nix/namespace.h>
+#include <b1nix/user_namespace.h>
 #include <b1nix/panic.h>
 #include <b1nix/posix.h>
 #include <b1nix/runqueue.h>
@@ -9509,10 +9510,11 @@ static int signal_permitted(const struct task *target, int sig) {
   const struct cred *them = target ? target->cred : 0;
   if (!me || !them)
     return 1; /* kernel context, or a task with no credentials */
-  if (cred_has_cap(me, CAP_KILL))
-    return 1;
   if (me->euid == them->uid || me->euid == them->suid ||
       me->uid == them->uid || me->uid == them->suid)
+    return 1;
+  /* CAP_KILL over the target's user namespace (Linux kill_ok_by_cred). */
+  if (ns_capable_cred(me, them->user_ns, CAP_KILL))
     return 1;
   if (sig == SIGCONT && current_task &&
       target->session_id == current_task->session_id)
@@ -9555,6 +9557,12 @@ int scheduler_kill_thread_group_user(usize pid, int sig) {
   }
   if (!allowed)
     return -EPERM;
+  /* The init of a PID namespace ignores, from inside its namespace, every
+   * signal it has no handler for, and from outside all but SIGKILL/SIGSTOP.
+   * The call still succeeds: the signal was sent and discarded. */
+  if (sig > 0 && !namespace_pid_signal_allowed(
+                     t, sig, t->sigactions[sig - 1].sa_handler != SIG_DFL))
+    return 0;
   return scheduler_kill_thread_group(pid, sig);
 }
 
@@ -9571,8 +9579,12 @@ static int kill_many_user(usize pgrp, int sig, int all) {
     int eligible = t->state != TASK_UNUSED && t->state != TASK_DEAD &&
                    t->state != TASK_REAPING && !task_is_thread(t) &&
                    t->pml4_phys != 0;
+    /* kill(-1): every process the caller's PID namespace can name, except
+     * the caller, the machine's init and the namespace's own init. */
     if (eligible && all)
-      eligible = (t != current_task && t->id != 1);
+      eligible = (t != current_task && t->id != 1 &&
+                  namespace_pid_visible(t->id) &&
+                  namespace_pid_to_user(t->id) != 1);
     if (eligible && !all)
       eligible = (t->process_group_id == pgrp);
     usize id = t->id;
@@ -9583,7 +9595,9 @@ static int kill_many_user(usize pgrp, int sig, int all) {
     found++;
     if (!allowed)
       continue;
-    if (sig != 0)
+    if (sig != 0 &&
+        namespace_pid_signal_allowed(
+            t, sig, t->sigactions[sig - 1].sa_handler != SIG_DFL))
       scheduler_kill(id, sig);
     sent++;
   }

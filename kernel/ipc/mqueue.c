@@ -799,6 +799,6 @@ static int mq_umount_cb(struct vfs_node *root_node) {
 
 static struct vfs_fs mqueue_fs = {
     .name = "mqueue", .mount = mq_mount_cb, .umount = mq_umount_cb,
-    .flags = VFS_FS_NODEV};
+    .flags = VFS_FS_NODEV | VFS_FS_USERNS_MOUNT};
 
 void mqueue_init(void) { vfs_register_fs(&mqueue_fs); }

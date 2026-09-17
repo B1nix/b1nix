@@ -81,9 +81,11 @@ static struct vfs_node *tmpfs_mount_cb(const char *source, u64 flags,
  * type systemd builds through fsopen/fsmount for a unit's credentials and
  * runtime directories. */
 static struct vfs_fs tmpfs_fs = {.name = "tmpfs", .mount = tmpfs_mount_cb,
-                                 .flags = VFS_FS_NODEV | VFS_FS_DETACHABLE};
+                                 .flags = VFS_FS_NODEV | VFS_FS_DETACHABLE |
+                                          VFS_FS_USERNS_MOUNT};
 static struct vfs_fs ramfs_fs = {.name = "ramfs", .mount = tmpfs_mount_cb,
-                                 .flags = VFS_FS_NODEV | VFS_FS_DETACHABLE};
+                                 .flags = VFS_FS_NODEV | VFS_FS_DETACHABLE |
+                                          VFS_FS_USERNS_MOUNT};
 static struct vfs_node *devtmpfs_mount_cb(const char *source, u64 flags,
                                           void *data) {
   struct vfs_node *root = tmpfs_mount_cb(source, flags, data);

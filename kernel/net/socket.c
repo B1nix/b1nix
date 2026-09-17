@@ -1,5 +1,6 @@
 #include <b1nix/vfs.h>
 #include <b1nix/namespace.h>
+#include <b1nix/user_namespace.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/klog.h>
 #include <stdio.h>
@@ -2439,6 +2440,10 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     struct b1nix_ucred cred;
     int rc = unix_peer_cred(s, &cred);
     if (rc < 0) return rc;
+    /* The peer as the caller's PID and user namespaces name it. */
+    cred.pid = (int)namespace_pid_to_user((usize)cred.pid);
+    cred.uid = current_from_kuid(cred.uid);
+    cred.gid = current_from_kgid(cred.gid);
     usize need = sizeof(cred);
     if (*optlen < need) return -EINVAL;
     memcpy(optval, &cred, need);
@@ -2475,7 +2480,7 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
       return -ERANGE;
     }
     for (usize i = 0; i < count; i++)
-      ((u32 *)optval)[i] = (u32)pcred->groups[i];
+      ((u32 *)optval)[i] = current_from_kgid(pcred->groups[i]);
     *optlen = need;
     return 0;
   }

@@ -28,6 +28,7 @@
  * works or the whole family must be withdrawn together.
  */
 
+#include <b1nix/uidgid.h>
 #include <b1nix/vfs.h>
 #include <b1nix/sched.h>
 #include <b1nix/errno.h>
@@ -241,6 +242,13 @@ int vfs_fsopen(const char *fstype, u32 flags) {
     return -EINVAL;
   if (flags & ~(u32)FSOPEN_CLOEXEC)
     return -EINVAL;
+  if (!vfs_may_mount())
+    return -EPERM;
+  {
+    const struct cred *c = scheduler_get_current_cred();
+    if (c && c->user_ns != 0 && !vfs_fs_userns_mountable(fstype))
+      return -EPERM;
+  }
 
   struct fsctx_state *ctx = kzalloc(sizeof(*ctx));
   if (!ctx)
@@ -352,6 +360,8 @@ int vfs_fsconfig(int fd, u32 cmd, const char *key, const char *value,
 int vfs_fsmount(int fsfd, u32 flags, u32 attr_flags) {
   if (flags & ~(u32)FSMOUNT_CLOEXEC)
     return -EINVAL;
+  if (!vfs_may_mount())
+    return -EPERM;
   /* Only the attributes that mean something get through: an unknown bit is a
    * caller asking for a guarantee this kernel would not be providing. */
   if (attr_flags & ~(u32)(MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID |
@@ -394,6 +404,8 @@ int vfs_open_tree(const char *path, u32 flags) {
    * on them. */
   if (!(flags & OPEN_TREE_CLONE))
     return vfs_open_flags(path, B1NIX_O_PATH);
+  if (!vfs_may_mount())
+    return -EPERM;
 
   int id = vfs_detached_clone_path(path, (flags & AT_RECURSIVE) ? 1 : 0);
   if (id < 0)
@@ -411,6 +423,8 @@ int vfs_move_mount_fd(int from_fd, const char *from_path, const char *to_path,
   (void)flags;
   if (!to_path || !to_path[0])
     return -EINVAL;
+  if (!vfs_may_mount())
+    return -EPERM;
 
   /* The descriptor form: a detached mount finally gets a place. This is the
    * one that matters — it is how everything fsopen built becomes reachable. */
@@ -437,6 +451,8 @@ int vfs_mount_setattr_fd(int fd, const char *path, u32 flags,
                          const struct b1nix_mount_attr *attr) {
   if (!attr)
     return -EINVAL;
+  if (!vfs_may_mount())
+    return -EPERM;
   /* There is no mount idmapping here, and a caller asking for one is asking
    * for a guarantee about who owns the files it is about to see. */
   if (attr->userns_fd)

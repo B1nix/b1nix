@@ -1673,16 +1673,15 @@ static isize sys_access_kpath(const char *kpath, int mode) {
       return -EACCES;
     }
 
+    /* Linux do_faccessat(): judged as the REAL ids, and with capabilities
+     * only when the real uid is root in the caller's user namespace. The
+     * copy holds no namespace reference and is never freed. */
     struct cred access_cred = *cred;
-    access_cred.euid = cred->uid;
-    access_cred.egid = cred->gid;
-    if (access_cred.euid == ROOT_UID && (mode & X_OK) &&
-        (node->inode->mode & 0111) == 0) {
-      vfs_node_put(node);
-      return -EACCES;
-    }
-    if (!cred_can_access(&access_cred, node->inode->uid, node->inode->gid,
-                         node->inode->mode, (u32)mode)) {
+    access_cred.fsuid = cred->uid;
+    access_cred.fsgid = cred->gid;
+    if (cred->uid != make_kuid(cred->user_ns, 0))
+      access_cred.cap_permitted = 0;
+    if (!vfs_get_node_perm(node, &access_cred, (u32)mode)) {
       vfs_node_put(node);
       return -EACCES;
     }
@@ -2501,12 +2500,7 @@ static isize sys_readahead(int fd, u64 offset, usize count) {
 }
 
 static isize sys_pivot_root(const char *user_new, const char *user_old) {
-  /* Replacing the root of every process is CAP_SYS_ADMIN territory, and Linux
-   * gates it there too. */
-  struct cred *c = scheduler_get_current_cred();
-  if (c && c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_ADMIN))
-    return -EPERM;
-
+  /* CAP_SYS_ADMIN over the mount namespace's owner: vfs_pivot_root asks. */
   char *knew = kmalloc(VFS_MAX_PATH);
   char *kold = kmalloc(VFS_MAX_PATH);
   if (!knew || !kold) {
@@ -3702,7 +3696,12 @@ static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
       c->cmsg_len = cmsg_len;
       c->cmsg_level = K_SOL_SOCKET;
       c->cmsg_type = K_SCM_CREDENTIALS;
-      memcpy((u8 *)c + sizeof(*c), &cred, sizeof(cred));
+      /* The sender, as the receiver's PID and user namespaces name it. */
+      struct b1nix_ucred ucred = cred;
+      ucred.pid = (int)namespace_pid_to_user((usize)cred.pid);
+      ucred.uid = current_from_kuid(cred.uid);
+      ucred.gid = current_from_kgid(cred.gid);
+      memcpy((u8 *)c + sizeof(*c), &ucred, sizeof(ucred));
       control_len += space;
     } else {
       ctrunc = 1;
@@ -8626,9 +8625,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           return (u64)-EFAULT;
         u32 v[3];
         if (number == LX_getresuid) {
-          v[0] = c->uid; v[1] = c->euid; v[2] = c->suid;
+          v[0] = current_from_kuid(c->uid);
+          v[1] = current_from_kuid(c->euid);
+          v[2] = current_from_kuid(c->suid);
         } else {
-          v[0] = c->gid; v[1] = c->egid; v[2] = c->sgid;
+          v[0] = current_from_kgid(c->gid);
+          v[1] = current_from_kgid(c->egid);
+          v[2] = current_from_kgid(c->sgid);
         }
         if (syscall_copyout((void *)(usize)arg0, &v[0], sizeof(u32)) != 0 ||
             syscall_copyout((void *)(usize)arg1, &v[1], sizeof(u32)) != 0 ||
@@ -8645,8 +8648,16 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         struct cred *c = scheduler_get_current_cred();
         if (!c)
           return (u64)-EINVAL;
-        return (u64)(number == LX_setfsuid ? cred_set_fsuid(c, (u32)arg0)
-                                   : cred_set_fsgid(c, (u32)arg0));
+        /* An unmapped id changes nothing; the previous value is still the
+         * answer, in the caller's terms. */
+        if (number == LX_setfsuid) {
+          u32 k = current_make_kuid((u32)arg0);
+          return (u64)current_from_kuid(k == UID_INVALID ? c->fsuid
+                                                         : cred_set_fsuid(c, k));
+        }
+        u32 k = current_make_kgid((u32)arg0);
+        return (u64)current_from_kgid(k == GID_INVALID ? c->fsgid
+                                                       : cred_set_fsgid(c, k));
       }
 
       /* capget(125)/capset(126): the task's real capability sets. A root task
@@ -8724,8 +8735,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 
       /* sethostname(170) / setdomainname(171). */
       if (number == LX_sethostname || number == LX_setdomainname) {
+        /* CAP_SYS_ADMIN over the user namespace owning the caller's UTS
+         * namespace: a container's root may rename its own. */
         struct cred *c = scheduler_get_current_cred();
-        if (!c || (!cred_has_cap(c, CAP_SYS_ADMIN)))
+        if (!c || !ns_capable_cred(c,
+                                   namespace_owner(NS_UTS,
+                                                   namespace_current_id(NS_UTS)),
+                                   CAP_SYS_ADMIN))
           return (u64)-EPERM;
         if (!arg0)
           return (u64)-EFAULT;
@@ -8987,7 +9003,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * reference for as long as a task (or a fork child) names it. */
       if (number == LX_chroot) {
         struct cred *c = scheduler_get_current_cred();
-        if (!c || (!cred_has_cap(c, CAP_SYS_CHROOT)))
+        if (!c || !ns_capable_cred(c, c->user_ns, CAP_SYS_CHROOT))
           return (u64)-EPERM;
         char kpath[VFS_MAX_PATH], resolved[VFS_MAX_PATH];
         int cs = syscall_copyinstr(kpath, sizeof(kpath),
@@ -9754,71 +9770,73 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)-EFAULT;
     return 0;
   }
+  /* Every id a task names or is told is in its own user namespace; the
+   * credential holds kernel ids (kernel/sched/user_namespace.c). */
   case SYS_GETUID: {
     struct cred *c = scheduler_get_current_cred();
-    return c ? c->uid : 0;
+    return c ? current_from_kuid(c->uid) : 0;
   }
   case SYS_GETEUID: {
     struct cred *c = scheduler_get_current_cred();
-    return c ? c->euid : 0;
+    return c ? current_from_kuid(c->euid) : 0;
   }
   case SYS_GETGID: {
     struct cred *c = scheduler_get_current_cred();
-    return c ? c->gid : 0;
+    return c ? current_from_kgid(c->gid) : 0;
   }
   case SYS_GETEGID: {
     struct cred *c = scheduler_get_current_cred();
-    return c ? c->egid : 0;
+    return c ? current_from_kgid(c->egid) : 0;
   }
   case SYS_SETUID: {
     klog_info("audit: setuid called");
     struct cred *c = scheduler_get_current_cred();
     if (!c) return (u64)-EACCES;
-    int rc = cred_set_uid(c, (u32)arg0);
-    return rc == 0 ? 0 : (u64)-EPERM;
+    u32 k = current_make_kuid((u32)arg0);
+    if (k == UID_INVALID)
+      return (u64)-EINVAL;
+    return (u64)(isize)cred_set_uid(c, k);
   }
   case SYS_SETGID: {
     klog_info("audit: setgid called");
     struct cred *c = scheduler_get_current_cred();
     if (!c) return (u64)-EACCES;
-    int rc = cred_set_gid(c, (u32)arg0);
-    return rc == 0 ? 0 : (u64)-EPERM;
+    u32 k = current_make_kgid((u32)arg0);
+    if (k == GID_INVALID)
+      return (u64)-EINVAL;
+    return (u64)(isize)cred_set_gid(c, k);
   }
-  case SYS_SETREUID: {
-    klog_info("audit: setreuid called");
-    struct cred *c = scheduler_get_current_cred();
-    if (!c) return (u64)-EACCES;
-    return cred_setreuid(c, (int)(isize)arg0, (int)(isize)arg1) == 0
-               ? 0
-               : (u64)-EPERM;
-  }
-  case SYS_SETREGID: {
-    klog_info("audit: setregid called");
-    struct cred *c = scheduler_get_current_cred();
-    if (!c) return (u64)-EACCES;
-    return cred_setregid(c, (int)(isize)arg0, (int)(isize)arg1) == 0
-               ? 0
-               : (u64)-EPERM;
-  }
-  case SYS_SETRESUID: {
-    struct cred *c = scheduler_get_current_cred();
-    if (!c) return (u64)-EACCES;
-    int ruid = (int)(isize)arg0;
-    int euid = (int)(isize)arg1;
-    int suid = (int)(isize)arg2;
-    return cred_setresuid(c, ruid, euid, suid) == 0
-               ? 0
-               : (u64)-EPERM;
-  }
+  case SYS_SETREUID:
+  case SYS_SETREGID:
+  case SYS_SETRESUID:
   case SYS_SETRESGID: {
     struct cred *c = scheduler_get_current_cred();
     if (!c) return (u64)-EACCES;
-    int rgid = (int)(isize)arg0;
-    int egid = (int)(isize)arg1;
-    int sgid = (int)(isize)arg2;
-    return cred_setresgid(c, rgid, egid, sgid) == 0
-               ? 0
-               : (u64)-EPERM;
+    int is_uid = (number == SYS_SETREUID || number == SYS_SETRESUID);
+    klog_info(number == SYS_SETREUID   ? "audit: setreuid called"
+              : number == SYS_SETREGID ? "audit: setregid called"
+              : is_uid                 ? "audit: setresuid called"
+                                       : "audit: setresgid called");
+    int nargs = (number == SYS_SETRESUID || number == SYS_SETRESGID) ? 3 : 2;
+    int k[3] = {-1, -1, -1};
+    u64 a[3] = {arg0, arg1, arg2};
+    for (int i = 0; i < nargs; i++) {
+      if ((u32)a[i] == 0xFFFFFFFFu)
+        continue; /* -1: leave unchanged */
+      u32 id = is_uid ? current_make_kuid((u32)a[i])
+                      : current_make_kgid((u32)a[i]);
+      if (id == UID_INVALID)
+        return (u64)-EINVAL;
+      k[i] = (int)id;
+    }
+    int rc;
+    switch (number) {
+    case SYS_SETREUID: rc = cred_setreuid(c, k[0], k[1]); break;
+    case SYS_SETREGID: rc = cred_setregid(c, k[0], k[1]); break;
+    case SYS_SETRESUID: rc = cred_setresuid(c, k[0], k[1], k[2]); break;
+    default: rc = cred_setresgid(c, k[0], k[1], k[2]); break;
+    }
+    return (u64)(isize)rc;
   }
   case SYS_WAITID: {
     usize wid = (usize)(isize)(int)arg1;
@@ -9909,7 +9927,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     if (!user_list) return (u64)-EFAULT;
     u32 k_list[MAX_GROUPS];
     for (int i = 0; i < c->ngroups && i < MAX_GROUPS; i++) {
-      k_list[i] = c->groups[i];
+      k_list[i] = current_from_kgid(c->groups[i]);
     }
     if (syscall_copyout(user_list, k_list, c->ngroups * sizeof(u32)) != 0) {
       return (u64)-EFAULT;
@@ -9920,7 +9938,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     klog_info("audit: setgroups called");
     struct cred *c = scheduler_get_current_cred();
     if (!c) return (u64)-EACCES;
-    if (!cred_has_cap(c, CAP_SETGID)) {
+    /* CAP_SETGID in the caller's user namespace, and a namespace whose gid map
+     * is written and whose /proc/<pid>/setgroups did not say "deny". */
+    if (!ns_capable_cred(c, c->user_ns, CAP_SETGID) ||
+        !userns_may_setgroups(c->user_ns)) {
       return (u64)-EPERM;
     }
     usize size = (usize)arg0;
@@ -9934,6 +9955,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       if (syscall_copyin(k_list, user_list, size * sizeof(u32)) != 0) {
         return (u64)-EFAULT;
       }
+    }
+    for (usize i = 0; i < size; i++) {
+      k_list[i] = current_make_kgid(k_list[i]);
+      if (k_list[i] == GID_INVALID)
+        return (u64)-EINVAL;
     }
     for (usize i = 0; i < size; i++) {
       c->groups[i] = k_list[i];

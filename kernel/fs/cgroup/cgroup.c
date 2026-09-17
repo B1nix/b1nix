@@ -1027,7 +1027,7 @@ static int cg_umount_cb(struct vfs_node *root_node) {
 
 static struct vfs_fs cgroup2_fs = {
     .name = "cgroup2", .mount = cg_mount_cb, .umount = cg_umount_cb,
-    .flags = VFS_FS_NODEV};
+    .flags = VFS_FS_NODEV | VFS_FS_USERNS_MOUNT};
 
 void cgroup_init(void) { vfs_register_fs(&cgroup2_fs); }
 

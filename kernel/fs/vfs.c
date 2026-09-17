@@ -27,6 +27,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/module.h>
 #include <b1nix/namespace.h>
+#include <b1nix/user_namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/lockdep.h>
 #include <b1nix/page_cache.h>
@@ -167,6 +168,11 @@ struct vfs_mount_entry {
    * remount was recorded and then never consulted. A slot index cannot answer
    * this because slots are reused (a namespace clone lands in freed ones). */
   u64 seq;
+  /* Flags a less privileged mount namespace inherited and may not clear:
+   * without this, `unshare -Ur` followed by a remount could lift a read-only
+   * or nosuid mount its creator was never allowed to change (Linux
+   * MNT_LOCK_READONLY and friends). */
+  u64 locked_flags;
 };
 /* Monotonic mount counter — see vfs_mount_entry::seq. Never reset, never
  * reused. */
@@ -424,6 +430,22 @@ static struct vfs_fs *find_fs(const char *name) {
     curr = curr->next;
   }
   return NULL;
+}
+
+/* The mount flags a remount in a less privileged namespace may not clear. */
+#define MNT_LOCKABLE_FLAGS (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC)
+
+int vfs_may_mount(void) {
+  const struct cred *c = scheduler_get_current_cred();
+  if (!c)
+    return 1; /* kernel context */
+  return ns_capable_cred(c, namespace_owner(NS_MNT, vfs_current_mnt_ns()),
+                         CAP_SYS_ADMIN);
+}
+
+int vfs_fs_userns_mountable(const char *fstype) {
+  struct vfs_fs *fs = fstype ? find_fs(fstype) : 0;
+  return fs && (fs->flags & VFS_FS_USERNS_MOUNT);
 }
 
 /* Dcache sizing (B2 audit): pool + hash table are sized to RAM at
@@ -1418,6 +1440,28 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
 
 extern struct cred *scheduler_get_current_cred(void);
 
+/* Linux check_sticky(): in a sticky directory only the file's owner, the
+ * directory's owner, or CAP_FOWNER over the file may remove or rename it. */
+static int vfs_sticky_denied(const struct cred *cred,
+                             const struct vfs_inode *dir,
+                             const struct vfs_inode *inode) {
+  if (!cred || !(dir->mode & B1NIX_S_ISVTX))
+    return 0;
+  if (cred->fsuid == inode->uid || cred->fsuid == dir->uid)
+    return 0;
+  return !capable_wrt_inode_uidgid(cred, inode->uid, inode->gid, CAP_FOWNER);
+}
+
+/* Is `gid` one the caller is in (fsgid or a supplementary group)? */
+static int vfs_in_group(const struct cred *cred, u32 gid) {
+  if (cred->fsgid == gid)
+    return 1;
+  for (int i = 0; i < cred->ngroups && i < MAX_GROUPS; i++)
+    if (cred->groups[i] == gid)
+      return 1;
+  return 0;
+}
+
 int vfs_check_access(struct vfs_node *node, int requested_access) {
   if (!node)
     return -ENOENT;
@@ -1430,20 +1474,41 @@ int vfs_check_access(struct vfs_node *node, int requested_access) {
   return -EACCES;
 }
 
+static int vfs_mode_permits(const struct vfs_inode *inode,
+                            const struct cred *cred, u32 mask);
+
 int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
                       u32 mask) {
   if (!node || !node->inode || !cred)
     return 0;
   struct vfs_inode *inode = node->inode;
-  /* Filesystem access is judged by fsuid, which mirrors euid unless
-   * setfsuid(2) moved it. */
-  if (cred->fsuid == ROOT_UID)
+  if (vfs_mode_permits(inode, cred, mask))
     return 1;
-  if (cred_has_cap(cred, CAP_DAC_OVERRIDE))
+  /* Linux generic_permission(): what the mode bits refused, a capability may
+   * still allow -- held in the caller's user namespace, over an inode whose
+   * owner and group are both mapped there. A directory can be read and
+   * searched with CAP_DAC_READ_SEARCH and anything done to it with
+   * CAP_DAC_OVERRIDE; a file can be read with the former, and read or written
+   * with the latter, but executed only if some execute bit is set. */
+  if (inode->type == VFS_DIRECTORY) {
+    if (!(mask & 2) && capable_wrt_inode_uidgid(cred, inode->uid, inode->gid,
+                                                CAP_DAC_READ_SEARCH))
+      return 1;
+    return capable_wrt_inode_uidgid(cred, inode->uid, inode->gid,
+                                    CAP_DAC_OVERRIDE);
+  }
+  if (mask == 4 && capable_wrt_inode_uidgid(cred, inode->uid, inode->gid,
+                                            CAP_DAC_READ_SEARCH))
     return 1;
-  if (!(mask & 2) && cred_has_cap(cred, CAP_DAC_READ_SEARCH))
+  if ((!(mask & 1) || (inode->mode & 0111)) &&
+      capable_wrt_inode_uidgid(cred, inode->uid, inode->gid, CAP_DAC_OVERRIDE))
     return 1;
+  return 0;
+}
 
+/* The mode bits (and ACL) alone, judged by fsuid/fsgid. */
+static int vfs_mode_permits(const struct vfs_inode *inode,
+                            const struct cred *cred, u32 mask) {
   if (inode->acl_count > 0) {
     u16 matched_perms = 0;
     int mask_found = 0;
@@ -1457,25 +1522,25 @@ int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
     for (int i = 0; i < inode->acl_count; i++) {
       switch (inode->acls[i].tag) {
       case ACL_USER_OBJ:
-        if (cred->euid == inode->uid) {
+        if (cred->fsuid == inode->uid) {
           matched_perms = inode->acls[i].perms;
           goto acl_check;
         }
         break;
       case ACL_USER:
-        if (cred->euid == inode->acls[i].qualifier) {
+        if (cred->fsuid == inode->acls[i].qualifier) {
           matched_perms = inode->acls[i].perms;
           goto acl_check;
         }
         break;
       case ACL_GROUP_OBJ:
-        if (cred->egid == inode->gid) {
+        if (cred->fsgid == inode->gid) {
           matched_perms = inode->acls[i].perms;
           goto acl_check;
         }
         break;
       case ACL_GROUP:
-        if (cred->egid == inode->acls[i].qualifier) {
+        if (cred->fsgid == inode->acls[i].qualifier) {
           matched_perms = inode->acls[i].perms;
           goto acl_check;
         }
@@ -1987,6 +2052,17 @@ restart_traversal:
       continue;
     }
 
+    /* A component that is not a directory is ENOTDIR before any permission
+     * question: search permission is a property of directories (Linux checks
+     * it in may_lookup, on a directory inode). */
+    if (current->inode->type != VFS_DIRECTORY) {
+      vfs_inode_unlock_read(current->inode);
+      vfs_node_put(current);
+      kfree(curr_path);
+      kfree(parent_path);
+      return ERR_PTR(-ENOTDIR);
+    }
+
     /* POSIX: Check directory traversal permission (execute bit) */
     if (vfs_check_access(current, X_OK) != 0) {
       vfs_inode_unlock_read(current->inode);
@@ -1994,14 +2070,6 @@ restart_traversal:
       kfree(curr_path);
       kfree(parent_path);
       return ERR_PTR(-EACCES);
-    }
-
-    if (current->inode->type != VFS_DIRECTORY) {
-      vfs_inode_unlock_read(current->inode);
-      vfs_node_put(current);
-      kfree(curr_path);
-      kfree(parent_path);
-      return ERR_PTR(-ENOTDIR);
     }
 
     /* A directory whose children go stale (see lookup_refresh) gets the
@@ -2571,6 +2639,48 @@ isize vfs_readdir_children(struct vfs_node *dir, usize offset,
   for (struct vfs_node *child = dir->first_child;
        child && count < max_entries; child = child->next_sibling) {
     if (child->deleted)
+      continue;
+    if (idx >= start) {
+      copy_path(buf[count].name, 64, child->name);
+      buf[count].type = vfs_dirent_type(child->inode);
+      buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
+      buf[count].is_exec = 0;
+      buf[count].size = child->inode->size;
+      buf[count].ino = child->inode->ino;
+      count++;
+    }
+    idx++;
+  }
+  vfs_tree_read_release(flags);
+  return (isize)count;
+}
+
+/* The same walk, listing only the children `keep` accepts. `keep` runs under
+ * the tree read lock and must not take VFS locks. */
+isize vfs_readdir_children_filtered(struct vfs_node *dir, usize offset,
+                                    struct dirent *buf, usize max_entries,
+                                    int (*keep)(struct vfs_node *child)) {
+  if (!dir || !buf || !keep)
+    return -EINVAL;
+  usize start = offset, idx = 0, count = 0;
+  for (int dot = 0; dot < 2; dot++, idx++) {
+    if (idx < start || count >= max_entries)
+      continue;
+    copy_path(buf[count].name, 64, dot ? ".." : ".");
+    buf[count].type = (u32)VFS_DIRECTORY;
+    buf[count].is_dir = 1;
+    buf[count].is_exec = 1;
+    buf[count].size = 0;
+    buf[count].ino = (dot && dir->parent && dir->parent->inode)
+                         ? dir->parent->inode->ino
+                         : (dir->inode ? dir->inode->ino : 0);
+    count++;
+  }
+  u64 flags;
+  vfs_tree_read_acquire(&flags);
+  for (struct vfs_node *child = dir->first_child;
+       child && count < max_entries; child = child->next_sibling) {
+    if (child->deleted || !keep(child))
       continue;
     if (idx >= start) {
       copy_path(buf[count].name, 64, child->name);
@@ -4845,8 +4955,7 @@ int vfs_mknod(const char *path, u32 mode, u64 dev) {
    * no check, any process could mknod a block node for the root disk somewhere
    * it can write and read the filesystem straight out from under its
    * permissions. Linux gates it on CAP_MKNOD and so does this. */
-  if (is_dev && cred && cred->euid != ROOT_UID &&
-      !cred_has_cap(cred, CAP_MKNOD)) {
+  if (is_dev && cred && !cred_has_cap(cred, CAP_MKNOD)) {
     res = -EPERM;
     goto out_unlock;
   }
@@ -5161,8 +5270,9 @@ static int vfs_stat_node(struct vfs_node *node, struct b1nix_stat *st) {
   vfs_inode_lock_read(inode);
   memset(st, 0, sizeof(*st));
   st->st_ino = inode->ino;
-  st->st_uid = inode->uid;
-  st->st_gid = inode->gid;
+  /* Owner and group as the caller's user namespace names them. */
+  st->st_uid = current_from_kuid(inode->uid);
+  st->st_gid = current_from_kgid(inode->gid);
   st->st_size = inode->size;
   st->st_blksize = 512;
   st->st_blocks = (inode->size + 511) / 512;
@@ -5416,10 +5526,8 @@ static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
   struct vfs_node *prev = 0, *child = parent->first_child;
   while (child) {
     if (!child->deleted && strcmp(child->name, name) == 0) {
-      if (cred && (parent->inode->mode & B1NIX_S_ISVTX)) {
-        if (cred->euid != ROOT_UID && cred->euid != child->inode->uid && cred->euid != parent->inode->uid)
-          return -EACCES;
-      }
+      if (vfs_sticky_denied(cred, parent->inode, child->inode))
+        return -EACCES;
       /* M109 chattr: an immutable or append-only file keeps its name — Linux
        * refuses to unlink either one, and so does this. */
       if (child->inode->attr & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND))
@@ -5840,11 +5948,9 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
   }
 
   const struct cred *cred = get_current_cred();
-  if (cred && (old_parent->inode->mode & B1NIX_S_ISVTX)) {
-    if (cred->euid != ROOT_UID && cred->euid != node->inode->uid && cred->euid != old_parent->inode->uid) {
-      res = -EACCES;
-      goto out_put_parents;
-    }
+  if (vfs_sticky_denied(cred, old_parent->inode, node->inode)) {
+    res = -EACCES;
+    goto out_put_parents;
   }
 
   /* Рекурсивная защита */
@@ -5895,11 +6001,9 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
   /* POSIX type-consistency checks */
   existing = find_child(new_parent, new_n);
   if (existing) {
-    if (cred && (new_parent->inode->mode & B1NIX_S_ISVTX)) {
-      if (cred->euid != ROOT_UID && cred->euid != existing->inode->uid && cred->euid != new_parent->inode->uid) {
-        res = -EACCES;
-        goto out_unlock;
-      }
+    if (vfs_sticky_denied(cred, new_parent->inode, existing->inode)) {
+      res = -EACCES;
+      goto out_unlock;
     }
     if (node->inode->type == VFS_DIRECTORY &&
         existing->inode->type != VFS_DIRECTORY) {
@@ -6060,7 +6164,7 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
     st->st_ino = devpts_ino(idx);
     st->st_mode = B1NIX_S_IFCHR | 0620;
     st->st_nlink = 1;
-    st->st_gid = 5; /* tty */
+    st->st_gid = current_from_kgid(5); /* tty */
     st->st_rdev = ((u64)136 << 8) | (u64)idx;
     st->st_blksize = 512;
     return 0;
@@ -6362,6 +6466,19 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags) {
   if (!target || target[0] == '\0' || !fstype)
     return -EINVAL;
+  if (!vfs_may_mount())
+    return -EPERM;
+  /* A task that is privileged only inside a user namespace mounts only the
+   * types built for it, and nothing it mounts has device nodes that work. */
+  {
+    const struct cred *c = scheduler_get_current_cred();
+    if (c && c->user_ns != 0) {
+      struct vfs_fs *want = find_fs(fstype);
+      if (want && !(want->flags & VFS_FS_USERNS_MOUNT))
+        return -EPERM;
+      flags |= MS_NODEV;
+    }
+  }
 
   struct vfs_node *target_node = vfs_find_node(target);
   if (IS_ERR(target_node)) {
@@ -6526,6 +6643,8 @@ static int path_is_under(const char *path, const char *under) {
 }
 
 int vfs_set_propagation(const char *target, u64 flags) {
+  if (!vfs_may_mount())
+    return -EPERM;
   u32 type = (u32)(flags & MS_PROPAGATION_MASK);
   /* Exactly one propagation type, as Linux requires. */
   if (type != MS_SHARED && type != MS_SLAVE && type != MS_PRIVATE &&
@@ -6567,6 +6686,8 @@ int vfs_set_propagation(const char *target, u64 flags) {
 }
 
 int vfs_remount(const char *target, u64 flags) {
+  if (!vfs_may_mount())
+    return -EPERM;
   char canon[VFS_MAX_PATH];
   struct vfs_node *node = vfs_find_node(target);
   if (IS_ERR(node))
@@ -6577,6 +6698,15 @@ int vfs_remount(const char *target, u64 flags) {
   int found = 0;
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
+  /* A flag locked on any of the entries refuses the whole remount. */
+  for (usize i = 0; i < mount_hwm; i++) {
+    if (!mount_visible(i) || strcmp(mounts[i].target, canon) != 0)
+      continue;
+    if (mounts[i].locked_flags & ~flags & MNT_LOCKABLE_FLAGS) {
+      __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+      return -EPERM;
+    }
+  }
   for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i) || strcmp(mounts[i].target, canon) != 0)
       continue;
@@ -6639,6 +6769,8 @@ static void mount_record_target(const char *target, struct vfs_node *node,
 }
 
 int vfs_bind_mount(const char *source, const char *target, u64 flags) {
+  if (!vfs_may_mount())
+    return -EPERM;
   /* A bind needs something to bind. An empty source resolves to the root
    * directory, so accepting one here quietly bind-mounts the whole filesystem
    * over the target -- the loudest possible way to answer a caller that simply
@@ -6789,6 +6921,8 @@ static int retarget_under(char *path, usize path_size, const char *from,
 }
 
 int vfs_move_mount(const char *source, const char *target) {
+  if (!vfs_may_mount())
+    return -EPERM;
   if (!source || !source[0] || !target || !target[0])
     return -EINVAL;
 
@@ -6892,6 +7026,8 @@ int vfs_device_is_mounted(const char *name) {
 int vfs_umount(const char *target) {
   if (!target)
     return -EINVAL;
+  if (!vfs_may_mount())
+    return -EPERM;
 
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
@@ -6989,6 +7125,8 @@ static void vfs_pivot_reroot_mp(struct vfs_mount_entry *m) {
 }
 
 int vfs_pivot_root(const char *new_root, const char *put_old) {
+  if (!vfs_may_mount())
+    return -EPERM;
   if (!new_root || !put_old || !new_root[0] || !put_old[0])
     return -EINVAL;
 
@@ -7175,6 +7313,8 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
 int vfs_mnt_ns_clone(u32 from_ns, u32 to_ns) {
   if (to_ns == from_ns)
     return -EINVAL;
+  int unprivileged =
+      namespace_owner(NS_MNT, to_ns) != namespace_owner(NS_MNT, from_ns);
 
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
@@ -7207,6 +7347,14 @@ int vfs_mnt_ns_clone(u32 from_ns, u32 to_ns) {
         mount_hwm = j + 1;
       mounts[j] = mounts[i];
       mounts[j].mnt_ns = to_ns;
+      /* Copied into a namespace another user namespace owns: the copy's
+       * access flags are what that owner was given, not what it may change,
+       * and a shared mount only receives events from where it came from. */
+      if (unprivileged) {
+        mounts[j].locked_flags |= mounts[i].flags & MNT_LOCKABLE_FLAGS;
+        if (mounts[j].propagation == MS_SHARED)
+          mounts[j].propagation = MS_SLAVE;
+      }
       /* A shared mount's copy is its PEER: that is what "shared" means, and it
        * is why a later mount under either of them shows up under both. A
        * private mount's copy is unrelated to the original. */
@@ -8026,6 +8174,11 @@ int vfs_node_is_readonly(struct vfs_node *node) {
   return 0;
 }
 
+int vfs_node_is_nosuid(struct vfs_node *node) {
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(node);
+  return mnt && (mnt->flags & MS_NOSUID);
+}
+
 int vfs_dup(int oldfd) {
   struct vfs_handle *old_handle = scheduler_fd_get(oldfd);
   if (!old_handle)
@@ -8680,13 +8833,13 @@ static int vfs_ioctl_fsflags(struct vfs_node *node, int nr, void *arg) {
     return -EROFS;
 
   const struct cred *cred = get_current_cred();
-  if (cred && cred->euid != ROOT_UID && cred->euid != inode->uid)
+  if (cred && !cred_inode_owner_or_capable(cred, inode->uid, inode->gid))
     return -EPERM;
-  /* Only root may raise or lower immutable/append-only. Letting the owner do
-   * it would make both flags decorative: the owner would simply take the flag
-   * off and then do whatever it was meant to prevent. */
-  if (cred && cred->euid != ROOT_UID &&
-      ((attr ^ inode->attr) & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND)))
+  /* Raising or lowering immutable/append-only takes CAP_LINUX_IMMUTABLE.
+   * Letting the owner do it would make both flags decorative: the owner would
+   * simply take the flag off and then do whatever it was meant to prevent. */
+  if (cred && ((attr ^ inode->attr) & (VFS_ATTR_IMMUTABLE | VFS_ATTR_APPEND)) &&
+      !cred_has_cap(cred, CAP_LINUX_IMMUTABLE))
     return -EPERM;
 
   /* A filesystem that cannot store the flags says so rather than accepting
@@ -8717,7 +8870,7 @@ static int vfs_ioctl_fitrim(struct vfs_node *node, void *arg) {
   if (!arg || syscall_copyin(&range, arg, sizeof(range)) < 0)
     return -EFAULT;
   const struct cred *cred = get_current_cred();
-  if (cred && cred->euid != ROOT_UID)
+  if (cred && !cred_has_cap(cred, CAP_SYS_ADMIN))
     return -EPERM;
   if (!node->inode->fitrim_cb)
     return -EOPNOTSUPP;
@@ -9108,6 +9261,50 @@ void vfs_close_on_exec(void) {
 
 /* ── Permission Management Functions ── */
 
+/* The mode bits chmod(2) actually stores: Linux drops the set-group-ID bit
+ * when the caller is not in the file's group and lacks CAP_FSETID over it, so
+ * a file cannot be made setgid to a group its owner is not a member of. */
+static u16 vfs_chmod_bits(const struct cred *cred,
+                          const struct vfs_inode *inode, u16 mode) {
+  u16 bits = mode & 07777;
+  if ((bits & B1NIX_S_ISGID) && !vfs_in_group(cred, inode->gid) &&
+      !capable_wrt_inode_uidgid(cred, inode->uid, inode->gid, CAP_FSETID))
+    bits &= (u16)~B1NIX_S_ISGID;
+  return bits;
+}
+
+/* chown(2)'s rules (Linux chown_ok/chgrp_ok). `uid`/`gid` are kernel ids, -1
+ * meaning "unchanged". The owner may "change" the owner to itself and the group
+ * to one it is in; anything else takes CAP_CHOWN over the inode. A regular
+ * file loses set-user-ID, and set-group-ID where group execution makes it
+ * meaningful. */
+static int vfs_chown_inode(const struct cred *cred, struct vfs_inode *inode,
+                           u32 uid, u32 gid) {
+  /* The ids arrive in the caller's user namespace (-1 = unchanged). */
+  if (uid != (u32)-1 && (uid = make_kuid(cred->user_ns, uid)) == UID_INVALID)
+    return -EINVAL;
+  if (gid != (u32)-1 && (gid = make_kgid(cred->user_ns, gid)) == GID_INVALID)
+    return -EINVAL;
+  int uid_ok = uid == (u32)-1 ||
+               (cred->fsuid == inode->uid && uid == inode->uid);
+  int gid_ok = gid == (u32)-1 ||
+               (cred->fsuid == inode->uid &&
+                (gid == inode->gid || vfs_in_group(cred, gid)));
+  if (!(uid_ok && gid_ok) &&
+      !capable_wrt_inode_uidgid(cred, inode->uid, inode->gid, CAP_CHOWN))
+    return -EPERM;
+  if (uid != (u32)-1)
+    inode->uid = uid;
+  if (gid != (u32)-1)
+    inode->gid = gid;
+  if (inode->type != VFS_DIRECTORY && (uid != (u32)-1 || gid != (u32)-1)) {
+    inode->mode &= (u16)~B1NIX_S_ISUID;
+    if ((inode->mode & (B1NIX_S_ISGID | 0010)) == (B1NIX_S_ISGID | 0010))
+      inode->mode &= (u16)~B1NIX_S_ISGID;
+  }
+  return 0;
+}
+
 int vfs_chmod(const char *path, u16 mode) {
   struct vfs_node *node = vfs_find_node(path);
   if (IS_ERR(node))
@@ -9120,14 +9317,13 @@ int vfs_chmod(const char *path, u16 mode) {
     goto out;
   }
 
-  if (cred->euid != ROOT_UID && cred->euid != node->inode->uid) {
-    if (!cred_has_cap(cred, CAP_FOWNER)) {
-      res = -EPERM;
-      goto out;
-    }
+  if (!cred_inode_owner_or_capable(cred, node->inode->uid, node->inode->gid)) {
+    res = -EPERM;
+    goto out;
   }
 
-  node->inode->mode = (node->inode->mode & ~07777) | (mode & 07777);
+  node->inode->mode =
+      (node->inode->mode & ~07777) | vfs_chmod_bits(cred, node->inode, mode);
   vfs_update_times(node->inode, VFS_CTIME);
   vfs_inotify_notify(node, IN_ATTRIB, 0); /* M107 */
   if (node->inode->setattr_cb) {
@@ -9153,11 +9349,9 @@ int vfs_utime(const char *path, u64 atime, u64 mtime) {
   }
 
   /* POSIX: setting explicit times needs ownership (or CAP_FOWNER). */
-  if (cred->euid != ROOT_UID && cred->euid != node->inode->uid) {
-    if (!cred_has_cap(cred, CAP_FOWNER)) {
-      res = -EPERM;
-      goto out;
-    }
+  if (!cred_inode_owner_or_capable(cred, node->inode->uid, node->inode->gid)) {
+    res = -EPERM;
+    goto out;
   }
 
   /* utimes(2) names whole seconds; the sub-second halves it does not name are
@@ -9189,13 +9383,12 @@ int vfs_fchmod(int fd, u16 mode) {
   if (!cred)
     return -EACCES;
 
-  if (cred->euid != ROOT_UID && cred->euid != handle->node->inode->uid) {
-    if (!cred_has_cap(cred, CAP_FOWNER))
-      return -EPERM;
-  }
+  if (!cred_inode_owner_or_capable(cred, handle->node->inode->uid,
+                                   handle->node->inode->gid))
+    return -EPERM;
 
-  handle->node->inode->mode =
-      (handle->node->inode->mode & ~07777) | (mode & 07777);
+  handle->node->inode->mode = (handle->node->inode->mode & ~07777) |
+                              vfs_chmod_bits(cred, handle->node->inode, mode);
   vfs_update_times(handle->node->inode, VFS_CTIME);
   if (handle->node->inode->setattr_cb)
     return handle->node->inode->setattr_cb(handle->node);
@@ -9217,16 +9410,9 @@ static int vfs_chown_common(const char *path, u32 uid, u32 gid, int nofollow) {
     goto out;
   }
 
-  /* Only root can change owner */
-  if (!cred_has_cap(cred, CAP_CHOWN)) {
-    res = -EPERM;
+  res = vfs_chown_inode(cred, node->inode, uid, gid);
+  if (res != 0)
     goto out;
-  }
-
-  if (uid != (u32)-1)
-    node->inode->uid = uid;
-  if (gid != (u32)-1)
-    node->inode->gid = gid;
   vfs_update_times(node->inode, VFS_CTIME);
   vfs_inotify_notify(node, IN_ATTRIB, 0); /* M107 */
   if (node->inode->setattr_cb) {
@@ -9256,10 +9442,8 @@ int vfs_set_acl(struct vfs_node *node, const struct acl_entry *acl) {
   if (!cred)
     return -1;
 
-  if (cred->euid != ROOT_UID && cred->euid != node->inode->uid) {
-    if (!cred_has_cap(cred, CAP_FOWNER))
-      return -1;
-  }
+  if (!cred_inode_owner_or_capable(cred, node->inode->uid, node->inode->gid))
+    return -1;
 
   if (node->inode->acl_count >= ACL_MAX_ENTRIES)
     return -1;
@@ -9305,8 +9489,7 @@ static int xattr_check_write(struct vfs_node *node) {
   const struct cred *cred = get_current_cred();
   if (!cred)
     return -EACCES;
-  if (cred->euid != ROOT_UID && cred->euid != node->inode->uid &&
-      !cred_has_cap(cred, CAP_FOWNER))
+  if (!cred_inode_owner_or_capable(cred, node->inode->uid, node->inode->gid))
     return -EPERM;
   return 0;
 }
@@ -9520,13 +9703,9 @@ int vfs_fchown(int fd, u32 uid, u32 gid) {
   if (!cred)
     return -EACCES;
 
-  if (!cred_has_cap(cred, CAP_CHOWN))
-    return -EPERM;
-
-  if (uid != (u32)-1)
-    handle->node->inode->uid = uid;
-  if (gid != (u32)-1)
-    handle->node->inode->gid = gid;
+  int rc = vfs_chown_inode(cred, handle->node->inode, uid, gid);
+  if (rc != 0)
+    return rc;
   handle->node->inode->ctime = vfs_get_unix_time();
   if (handle->node->inode->setattr_cb)
     return handle->node->inode->setattr_cb(handle->node);

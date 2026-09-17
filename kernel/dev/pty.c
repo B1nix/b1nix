@@ -21,6 +21,7 @@
 #include <b1nix/posix.h>
 #include <b1nix/syscall.h>
 #include <b1nix/klog.h>
+#include <b1nix/user_namespace.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -634,7 +635,8 @@ int pty_open_slave(int index, int flags) {
   if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
     access_mask |= R_OK;
 
-  if (cred && !cred_can_access(cred, p->uid, p->gid, 0620, access_mask))
+  if (cred && !cred_can_access(cred, p->uid, p->gid, 0620, access_mask) &&
+      !capable_wrt_inode_uidgid(cred, p->uid, p->gid, CAP_DAC_OVERRIDE))
     return -EACCES;
 
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_PTY_SLAVE);

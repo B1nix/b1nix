@@ -184,7 +184,7 @@ int ns_capable_cred(const struct cred *c, u32 ns, int cap) {
   u32 mine = c->user_ns;
   for (int depth = 0; depth <= NS_MAX_LEVEL + 1; depth++) {
     if (ns == mine)
-      return (c->cap_permitted & (1ULL << cap)) != 0;
+      return (c->cap_effective & (1ULL << cap)) != 0;
     if (userns[ns].level <= userns[mine].level)
       return 0;
     u32 parent = userns[ns].parent;

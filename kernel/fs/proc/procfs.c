@@ -211,7 +211,51 @@ static struct procfs_node *pn_of(struct vfs_node *node) {
   return (struct procfs_node *)node->inode->data;
 }
 
-/* Derive the pid for a per-process file from its parent directory's name. */
+/* ── instances ─────────────────────────────────────────────────────────────
+ * Every mount of proc is its own tree, and belongs to the PID namespace of the
+ * task that mounted it (M123): the numbered directories are that namespace's
+ * numbers, and a task that namespace cannot name has no directory. That is
+ * what `unshare -pf --mount-proc` and every container runtime rely on. */
+#define PROCFS_MAX_INSTANCES 64
+static struct {
+  struct vfs_node *root;
+  u32 pidns;
+} procfs_instances[PROCFS_MAX_INSTANCES];
+static spinlock_t procfs_instance_lock = SPINLOCK_INIT;
+
+static u32 procfs_pidns_of(struct vfs_node *node) {
+  struct vfs_node *root = node;
+  for (int depth = 0; root && root->parent && depth < 16; depth++)
+    root = root->parent;
+  u32 ns = 0;
+  u64 f;
+  spin_lock_irqsave(&procfs_instance_lock, &f);
+  for (int i = 0; i < PROCFS_MAX_INSTANCES; i++)
+    if (procfs_instances[i].root == root) {
+      ns = procfs_instances[i].pidns;
+      break;
+    }
+  spin_unlock_irqrestore(&procfs_instance_lock, f);
+  return ns;
+}
+
+/* A decimal directory name, or 0 for anything else. */
+static usize procfs_parse_pid(const char *name) {
+  usize v = 0;
+  if (!name[0])
+    return 0;
+  for (const char *c = name; *c; c++) {
+    if (*c < '0' || *c > '9')
+      return 0;
+    v = v * 10 + (usize)(*c - '0');
+  }
+  return v;
+}
+
+/* Derive the pid for a per-process file from its parent directory's name. The
+ * result is the kernel's own id: a directory name is a number in the
+ * instance's PID namespace, and one the namespace does not have names nothing
+ * (0). */
 static usize pid_from_parent(struct vfs_node *node) {
   if (!node->parent)
     return 0;
@@ -223,10 +267,10 @@ static usize pid_from_parent(struct vfs_node *node) {
     return pid_from_parent(node->parent);
   if (name[0] == 's') /* "self" */
     return scheduler_get_pid();
-  usize v = 0;
-  for (const char *c = name; *c >= '0' && *c <= '9'; c++)
-    v = v * 10 + (usize)(*c - '0');
-  return v;
+  usize v = procfs_parse_pid(name);
+  if (!v)
+    return 0;
+  return namespace_pid_from_ns(procfs_pidns_of(node), v);
 }
 
 static isize procfs_read_cb(struct vfs_node *node, u64 offset, char *buffer,
@@ -314,7 +358,6 @@ static isize procfs_write_cb(struct vfs_node *node, u64 offset,
 }
 
 /* ── node construction ── */
-static struct vfs_node *procfs_root;
 
 static struct vfs_node *procfs_mkchild(struct vfs_node *parent,
                                        const char *name,
@@ -1311,28 +1354,62 @@ static int r_pid_status(usize pid, struct sbuf *s) {
   proc_comm(t, comm);
   sb_addf(s, "Name:\t%s\n", comm);
   sb_addf(s, "State:\t%s\n", state_long(st));
-  sb_addf(s, "Pid:\t%lu\n", (unsigned long)t->id);
-  sb_addf(s, "PPid:\t%lu\n", (unsigned long)t->parent_id);
+  /* Every pid is the reader's number for it; one the reader's PID namespace
+   * cannot name (the parent of a namespace's init) reads as 0, as on Linux. */
+  sb_addf(s, "Pid:\t%lu\n", (unsigned long)namespace_pid_to_user(t->id));
+  sb_addf(s, "PPid:\t%lu\n",
+          (unsigned long)namespace_pid_to_user(t->parent_id));
   /* Thread-group identity and size. A crash reporter reads Tgid to map a thread
    * back to its process and Threads to know how many /proc/<pid>/task entries
    * it must dump; gdb reads TracerPid to refuse to attach twice. */
-  sb_addf(s, "Tgid:\t%lu\n", (unsigned long)task_tgid(t));
-  sb_addf(s, "TracerPid:\t%lu\n", (unsigned long)ptrace_tracer_pid(t));
+  sb_addf(s, "Tgid:\t%lu\n", (unsigned long)namespace_pid_to_user(task_tgid(t)));
+  sb_addf(s, "TracerPid:\t%lu\n",
+          (unsigned long)namespace_pid_to_user(ptrace_tracer_pid(t)));
+  {
+    /* NStgid/NSpid/NSpgid/NSsid: the task's number in the reader's namespace
+     * and in every namespace below it down to its own. */
+    const struct {
+      const char *name;
+      usize id;
+    } rows[] = {{"NStgid", task_tgid(t)},
+                {"NSpid", t->id},
+                {"NSpgid", t->process_group_id},
+                {"NSsid", t->session_id}};
+    u32 mine = namespace_current_id(NS_PID);
+    for (usize r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+      usize chain[NS_MAX_LEVEL + 1];
+      int n = namespace_pid_chain(rows[r].id, mine, chain, NS_MAX_LEVEL + 1);
+      sb_addf(s, "%s:", rows[r].name);
+      for (int i = 0; i < n; i++)
+        sb_addf(s, "\t%lu", (unsigned long)chain[i]);
+      if (n == 0)
+        sb_addf(s, "\t%lu", (unsigned long)namespace_pid_to_user(rows[r].id));
+      sb_puts(s, "\n");
+    }
+  }
   /* Linux prints four ids per line — real, effective, saved and filesystem —
    * and a Groups line, and every /proc parser (Crashpad's included) reads all
    * of them. Three fields is not a shorter version of this format, it is an
    * unparseable one. */
   if (t->cred) {
-    sb_addf(s, "Uid:\t%u\t%u\t%u\t%u\n", t->cred->uid, t->cred->euid,
-            t->cred->suid, t->cred->fsuid);
-    sb_addf(s, "Gid:\t%u\t%u\t%u\t%u\n", t->cred->gid, t->cred->egid,
-            t->cred->sgid, t->cred->fsgid);
+    const struct cred *tc = t->cred;
+    /* In the reader's user namespace, as Linux renders them. */
+    sb_addf(s, "Uid:\t%u\t%u\t%u\t%u\n", current_from_kuid(tc->uid),
+            current_from_kuid(tc->euid), current_from_kuid(tc->suid),
+            current_from_kuid(tc->fsuid));
+    sb_addf(s, "Gid:\t%u\t%u\t%u\t%u\n", current_from_kgid(tc->gid),
+            current_from_kgid(tc->egid), current_from_kgid(tc->sgid),
+            current_from_kgid(tc->fsgid));
     /* Linux terminates every entry on the Groups line with a space, including
      * the last one; parsers rely on that trailing separator. */
-    sb_addf(s, "Groups:\t%u \n", t->cred->gid);
+    sb_puts(s, "Groups:\t");
+    for (int g = 0; g < tc->ngroups && g < MAX_GROUPS; g++)
+      sb_addf(s, "%u ", current_from_kgid(tc->groups[g]));
+    sb_puts(s, "\n");
   }
-  sb_addf(s, "PGid:\t%lu\n", (unsigned long)t->process_group_id);
-  sb_addf(s, "Sid:\t%lu\n", (unsigned long)t->session_id);
+  sb_addf(s, "PGid:\t%lu\n",
+          (unsigned long)namespace_pid_to_user(t->process_group_id));
+  sb_addf(s, "Sid:\t%lu\n", (unsigned long)namespace_pid_to_user(t->session_id));
   {
     usize tgid = task_tgid(t);
     usize nthreads = 0;
@@ -1606,9 +1683,11 @@ static int r_pid_stat(usize pid, struct sbuf *s) {
           /* 42-44 */ "0 0 0 "
           /* 45-48 */ "%lu %lu %lu 0 "
           /* 49-52 */ "0 0 0 0\n",
-          (unsigned long)t->id, comm,
-          scheduler_state_name((int)t->state), (unsigned long)t->parent_id,
-          (unsigned long)t->process_group_id, (unsigned long)t->session_id,
+          (unsigned long)namespace_pid_to_user(t->id), comm,
+          scheduler_state_name((int)t->state),
+          (unsigned long)namespace_pid_to_user(t->parent_id),
+          (unsigned long)namespace_pid_to_user(t->process_group_id),
+          (unsigned long)namespace_pid_to_user(t->session_id),
           (unsigned long)task_utime(t), (unsigned long)task_stime(t),
           (unsigned long)task_cutime(t), (unsigned long)task_cstime(t),
           t->priority, nthreads, (unsigned long)task_start_ticks(t),
@@ -2471,18 +2550,22 @@ static isize procfs_root_readlink(struct vfs_node *node, u64 offset, char *buf,
  * Rendered rather than stored, because the answer differs per reader. */
 static isize procfs_self_readlink(struct vfs_node *node, u64 offset, char *buf,
                                   usize size, int flags) {
-  (void)node;
   (void)offset;
   (void)flags;
   char num[24];
   usize len;
+  /* The caller's number in this instance's PID namespace; a task the
+   * namespace cannot name has no "self" here, as on Linux. */
+  usize vpid = namespace_pid_to_ns(procfs_pidns_of(node), scheduler_get_pid());
+  if (!vpid)
+    return -ENOENT;
 
   /* Absolute, where Linux writes a bare pid. A relative target has to be
    * resolved against the directory the link sits in, and this resolver starts
    * from the root instead -- so "36" looked for /36, found nothing, and handed
    * back the root directory rather than an error. Naming the whole path costs
    * a reader nothing and removes the question. */
-  snprintf(num, sizeof(num), "/proc/%lu", (unsigned long)scheduler_get_pid());
+  snprintf(num, sizeof(num), "/proc/%lu", (unsigned long)vpid);
   len = strlen(num);
   if (len > size)
     len = size;
@@ -2593,8 +2676,11 @@ static isize procfs_mem_write(struct vfs_node *node, u64 offset,
  * its own whose tgid is the thread-group leader's pid (task_tgid), so the
  * per-thread files are the ordinary per-pid renderers pointed at the tid. */
 static void procfs_make_tiddir(struct vfs_node *taskdir, usize tid) {
+  usize vtid = namespace_pid_to_ns(procfs_pidns_of(taskdir), tid);
+  if (!vtid)
+    return;
   char name[16];
-  snprintf(name, sizeof(name), "%lu", (unsigned long)tid);
+  snprintf(name, sizeof(name), "%lu", (unsigned long)vtid);
   if (find_child(taskdir, name))
     return;
   struct vfs_node *d = procfs_mkchild(taskdir, name, VFS_DIRECTORY, 0, 0);
@@ -2647,8 +2733,10 @@ static isize procfs_task_readdir(struct vfs_node *dir, usize offset,
         }
         tid = tid * 10 + (usize)(*q - '0');
       }
+      if (numeric)
+        tid = namespace_pid_from_ns(procfs_pidns_of(dir), tid);
       if (numeric) {
-        struct task *t = scheduler_task_by_pid(tid);
+        struct task *t = tid ? scheduler_task_by_pid(tid) : 0;
         /* Gone, or dead and merely not reaped yet — both must leave the
          * listing, or a caller counting threads never sees the count drop. */
         if (!t || !t->id || task_tgid(t) != tgid || t->state == TASK_DEAD ||
@@ -2721,12 +2809,10 @@ static void procfs_task_getattr(struct vfs_node *node) {
 }
 
 static int procfs_task_lookup(struct vfs_node *dir, const char *name) {
-  usize tid = 0;
-  for (const char *q = name; *q; q++) {
-    if (*q < '0' || *q > '9')
-      return -1;
-    tid = tid * 10 + (usize)(*q - '0');
-  }
+  usize tid = namespace_pid_from_ns(procfs_pidns_of(dir),
+                                    procfs_parse_pid(name));
+  if (!tid)
+    return -1;
   usize pid = pid_from_parent(dir);
   struct task *leader = scheduler_task_by_pid(pid);
   struct task *t = scheduler_task_by_pid(tid);
@@ -2965,41 +3051,54 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
  * root readdir_cb so `ls /proc` / `ps` see fresh pids. */
 static volatile int procfs_refresh_lock;
 
-static void procfs_refresh(void) {
+static void procfs_refresh(struct vfs_node *root) {
   while (__sync_lock_test_and_set(&procfs_refresh_lock, 1))
     ;
+  u32 pidns = procfs_pidns_of(root);
   usize slots = scheduler_task_slots();
   for (usize i = 0; i < slots; i++) {
     struct task *t = scheduler_task_slot(i);
-    if (!t || t->id == 0)
+    if (!t || t->id == 0 || t->state == TASK_UNUSED)
+      continue;
+    usize vpid = namespace_pid_to_ns(pidns, t->id);
+    if (!vpid)
       continue;
     char name[16];
-    snprintf(name, sizeof(name), "%lu", (unsigned long)t->id);
-    if (find_child(procfs_root, name))
+    snprintf(name, sizeof(name), "%lu", (unsigned long)vpid);
+    if (find_child(root, name))
       continue;
-    procfs_make_piddir(procfs_root, name, 0 /* derive from name */);
+    procfs_make_piddir(root, name, 0 /* derive from name */);
   }
   __sync_lock_release(&procfs_refresh_lock);
 }
 
-/* Root directory listing: materialise pid dirs, then mirror the default
- * ramfs-style child walk. */
+/* A numbered directory is listed only while the instance's namespace still
+ * names a task by it; everything else in the root always is. */
+static int procfs_root_keep(struct vfs_node *child) {
+  usize v = procfs_parse_pid(child->name);
+  if (!v)
+    return 1;
+  usize pid = namespace_pid_from_ns(procfs_pidns_of(child), v);
+  struct task *t = pid ? scheduler_task_by_pid(pid) : 0;
+  return t && t->state != TASK_UNUSED;
+}
+
+/* Root directory listing: materialise pid dirs, then walk the children. */
 static isize procfs_root_readdir(struct vfs_node *dir, usize offset,
                                  struct dirent *buf, usize max_entries) {
-  procfs_refresh();
-  return vfs_readdir_children(dir, offset, buf, max_entries);
+  procfs_refresh(dir);
+  return vfs_readdir_children_filtered(dir, offset, buf, max_entries,
+                                       procfs_root_keep);
 }
 
 /* Resolve /proc/<pid> on a direct lookup. Without this, a pid directory exists
  * only after somebody has listed /proc — a crash reporter that is handed a pid
  * and opens /proc/<pid>/task straight away would get ENOENT. */
 static int procfs_root_lookup(struct vfs_node *dir, const char *name) {
-  usize pid = 0;
-  for (const char *q = name; *q; q++) {
-    if (*q < '0' || *q > '9')
-      return -1;
-    pid = pid * 10 + (usize)(*q - '0');
-  }
+  usize v = procfs_parse_pid(name);
+  if (!v)
+    return -1;
+  usize pid = namespace_pid_from_ns(procfs_pidns_of(dir), v);
   if (!pid || !scheduler_task_by_pid(pid))
     return -1;
   if (find_child(dir, name))
@@ -3389,7 +3488,30 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   root->inode->readdir_cb = procfs_root_readdir;
   root->inode->lookup_cb = procfs_root_lookup;
   root->inode->readdir_lists_children = 1;
-  procfs_root = root;
+  {
+    /* The instance belongs to the mounting task's PID namespace, and holds it
+     * for as long as the mount lives. */
+    u32 pidns = namespace_current_id(NS_PID);
+    int slot = -1;
+    if (namespace_get(NS_PID, pidns) != 0)
+      pidns = 0;
+    u64 f;
+    spin_lock_irqsave(&procfs_instance_lock, &f);
+    for (int i = 0; i < PROCFS_MAX_INSTANCES; i++)
+      if (!procfs_instances[i].root) {
+        procfs_instances[i].root = root;
+        procfs_instances[i].pidns = pidns;
+        slot = i;
+        break;
+      }
+    spin_unlock_irqrestore(&procfs_instance_lock, f);
+    if (slot < 0) {
+      namespace_put(NS_PID, pidns);
+      root->deleted = 1;
+      vfs_node_put(root);
+      return ERR_PTR(-ENOSPC);
+    }
+  }
 
   procfs_mkchild(root, "meminfo", VFS_DEVICE, r_meminfo, 0);
   procfs_mkchild(root, "uptime", VFS_DEVICE, r_uptime, 0);
@@ -3501,10 +3623,30 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   return root;
 }
 
+static int procfs_umount_cb(struct vfs_node *root) {
+  u32 pidns = 0;
+  int found = 0;
+  u64 f;
+  spin_lock_irqsave(&procfs_instance_lock, &f);
+  for (int i = 0; i < PROCFS_MAX_INSTANCES; i++)
+    if (procfs_instances[i].root == root) {
+      pidns = procfs_instances[i].pidns;
+      procfs_instances[i].root = 0;
+      procfs_instances[i].pidns = 0;
+      found = 1;
+      break;
+    }
+  spin_unlock_irqrestore(&procfs_instance_lock, f);
+  if (found)
+    namespace_put(NS_PID, pidns);
+  return 0;
+}
+
 static struct vfs_fs procfs_fs = {
     .name = "procfs",
     .mount = procfs_mount_cb,
-    .flags = VFS_FS_NODEV,
+    .umount = procfs_umount_cb,
+    .flags = VFS_FS_NODEV | VFS_FS_USERNS_MOUNT,
 };
 
 /* Linux calls this filesystem "proc"; `mount -t proc proc /proc` from an init
