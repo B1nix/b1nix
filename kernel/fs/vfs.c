@@ -4214,6 +4214,22 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   struct vfs_walk_mount open_mnt = {0, 0, 0};
   struct vfs_node *node =
       vfs_find_node_walk(resolved, follow_final, 0, &open_mnt);
+  /* A pty slave reached under another name -- bound over /dev/console by a
+   * container manager, which is how systemd-nspawn gives the container its
+   * terminal -- is the same terminal as /dev/pts/<n>. */
+  if (!IS_ERR(node) && node->inode->fs_id == DEVPTS_FSID &&
+      node->inode->type == VFS_DEVICE && (node->inode->rdev >> 8) == 136) {
+    int access_mask = 0;
+    if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
+      access_mask |= W_OK;
+    if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
+      access_mask |= R_OK;
+    int idx = (int)(node->inode->rdev & 0xff);
+    int acc = vfs_check_access(node, access_mask);
+    vfs_node_put(node);
+    kfree(resolved);
+    return acc < 0 ? acc : pty_open_slave(idx, flags);
+  }
   if (IS_ERR(node)) {
     if (PTR_ERR(node) == -ENOENT && (flags & B1NIX_O_CREAT)) {
       /* Use internal version to avoid redundant resolution/logging */
@@ -6583,9 +6599,16 @@ int vfs_fd_abspath(int fd, char *buf, usize size) {
   const char *parts[64];
   int n = 0;
   u64 flags;
+  /* Named from the caller's root: under chroot(2) a descriptor's path is what
+   * a lookup from that root reaches it by (Linux d_path). The global name
+   * resolves to nothing there -- systemd-nspawn chroots into the container
+   * and then walks /sys/fs/cgroup one openat(dirfd, ...) at a time. */
+  struct vfs_node *task_root = scheduler_get_root_node();
   vfs_tree_read_acquire(&flags);
   int steps = 0;
   for (struct vfs_node *c = node; c && n < 64 && steps < 256; steps++) {
+    if (task_root && c == task_root)
+      break;
     /* Crossing a mount seam upwards: the mount root contributes no name of its
      * own — the mount point's name is the one on the path. */
     struct vfs_node *mp = vfs_mount_point_of(c);
@@ -8174,11 +8197,38 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries) {
  * r_mountinfo numbers the rows it prints. The mount a path lives on is the
  * visible mount whose target is the longest prefix of it, latest wins.
  * Returns 0 when nothing matches, which cannot happen once / is mounted. */
+/* The visible-list position (+1) of mount `seq`, 0 when it is not visible. */
+static int mount_id_of_seq(u64 seq) {
+  usize index = 0;
+  for (usize i = 0; seq && i < mount_hwm; i++) {
+    if (!mount_visible(i))
+      continue;
+    index++;
+    if (mounts[i].seq == seq)
+      return (int)index;
+  }
+  return 0;
+}
+
 int vfs_mount_id_for_path(const char *path) {
   if (!path || path[0] != '/')
     return 0;
   char resolved[VFS_MAX_PATH];
   vfs_resolve_path(path, resolved);
+
+  /* The mount the walk actually ends in. Names alone cannot say: a mount
+   * namespace copied from the host still holds the host's "/proc", and under
+   * chroot "/proc" is the container's directory, not that mount. */
+  {
+    struct vfs_walk_mount wm = {0, 0, 0};
+    struct vfs_node *n = vfs_find_node_walk(resolved, 1, 0, &wm);
+    if (!IS_ERR(n)) {
+      vfs_node_put(n);
+      int id = mount_id_of_seq(wm.seq);
+      if (id)
+        return id;
+    }
+  }
 
   int best_id = 0;
   usize best_len = 0;
@@ -8502,13 +8552,24 @@ int vfs_path_is_mount_root(const char *path) {
   while (rlen > 1 && resolved[rlen - 1] == '/')
     resolved[--rlen] = '\0';
 
+  /* The directory is a mount root when it IS the root of the mount the walk
+   * ended in. When the walk could not tell which mount that is (it started at
+   * a chroot or went through a descriptor), any mount rooted at the node. */
+  struct vfs_walk_mount wm = {0, 0, 0};
+  struct vfs_node *n = vfs_find_node_walk(resolved, 0, 0, &wm);
+  if (IS_ERR(n))
+    return 0;
+  int is_root = 0;
   for (usize i = 0; i < mount_hwm; i++) {
-    if (!mount_visible(i))
+    if (!mount_visible(i) || mounts[i].root_node != n)
       continue;
-    if (strcmp(mounts[i].target, resolved) == 0)
-      return 1;
+    if (!wm.seq || mounts[i].seq == wm.seq) {
+      is_root = 1;
+      break;
+    }
   }
-  return 0;
+  vfs_node_put(n);
+  return is_root;
 }
 
 /* Directory cursor, high bit: the filesystem's half of a merged listing is
@@ -8950,8 +9011,12 @@ int vfs_get_node_path(struct vfs_node *node, char *buf, usize buf_len) {
   int count = 0;
   struct vfs_node *curr = node;
   int steps = 0;
+  /* From the caller's root, as vfs_fd_abspath. */
+  struct vfs_node *task_root = scheduler_get_root_node();
   while (curr && count < 128 && steps < 256) {
     steps++;
+    if (task_root && curr == task_root)
+      break;
     /* Same mount seam as in vfs_fd_abspath: step from a mount root to the node
      * it covers instead of stopping at its NULL parent. */
     struct vfs_node *mp = vfs_mount_point_of(curr);

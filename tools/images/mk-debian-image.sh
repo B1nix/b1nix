@@ -95,7 +95,10 @@ systemd)
 	# udev is systemd-udevd and its rules: without it nothing ever writes
 	# /run/udev/data, so no device carries the "systemd" tag and no .device
 	# unit can ever activate.
-	PACKAGES="${PACKAGES:-systemd systemd-sysv udev dbus procps libproc2-0 libncursesw6}"
+	# systemd-container is systemd-nspawn, the distribution's own container
+	# manager: what the namespaces probe runs (M123).
+	PACKAGES="${PACKAGES:-systemd systemd-sysv udev dbus procps libproc2-0 libncursesw6 \
+systemd-container}"
 	RESOLVE_DEPS="${RESOLVE_DEPS:-1}"
 	;;
 graphics)

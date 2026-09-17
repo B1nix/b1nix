@@ -490,6 +490,8 @@ u64 scheduler_get_affinity(usize pid);
 /* swapoff(2): page every address space's swapped pages back in. */
 usize scheduler_swapin_all_tasks(void);
 int  scheduler_setrlimit(int resource, const struct rlimit *rlim);
+int  scheduler_setrlimit_task(struct task *target, int resource,
+                              const struct rlimit *rlim);
 
 /* Per-CPU current task. `current_task` is the task running on THIS CPU; each
  * core has its own slot in struct percpu (cur_task), so APs and the BSP never

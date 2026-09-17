@@ -250,7 +250,8 @@ for probe in \
 	"keys:add_key, keyctl read/describe/update/revoke and request_key behave as on Linux" \
 	"landlock:a Landlock ruleset confines a process to one directory, symlinks included" \
 	"quotactl:quotactl validates its target and reports that quotas are unsupported" \
-	"vdso-glibc:glibc time() and date(1) read the clock through the vDSO, under a seccomp filter that fails the clock system calls"; do
+	"vdso-glibc:glibc time() and date(1) read the clock through the vDSO, under a seccomp filter that fails the clock system calls" \
+	"nspawn:systemd-nspawn runs a command as PID 1 of new namespaces, with the machine name as hostname and a /proc of its own"; do
 	check_output "DEBIAN-SMOKE: ok ${probe%%:*}" "${probe#*:}"
 done
 

@@ -3771,24 +3771,32 @@ int scheduler_getrlimit(int resource, struct rlimit *rlim) {
   return 0;
 }
 int scheduler_setrlimit(int resource, const struct rlimit *rlim) {
-  if (resource < 0 || resource >= 16 || !rlim || !current_task)
+  return scheduler_setrlimit_task(current_task, resource, rlim);
+}
+
+/* The limits of `target`'s process (every thread sharing its address space),
+ * set by the calling task: prlimit(2) on another pid, or setrlimit on itself.
+ * Raising a hard limit is a privilege of the CALLER. */
+int scheduler_setrlimit_task(struct task *target, int resource,
+                             const struct rlimit *rlim) {
+  if (resource < 0 || resource >= 16 || !rlim || !target)
     return -EINVAL;
   if (rlim->rlim_cur > rlim->rlim_max)
     return -EINVAL;
   const struct cred *cred = scheduler_get_current_cred();
-  usize idx = task_index(current_task);
+  usize idx = task_index(target);
   if (cred && cred->euid != ROOT_UID) {
     if (rlim->rlim_max > g_task_rlimits[idx][resource].rlim_max) {
       return -EPERM;
     }
   }
   g_task_rlimits[idx][resource] = *rlim;
-  if (current_task->pml4_phys != 0) {
+  if (target->pml4_phys != 0) {
     for (usize i = 0; i < g_task_hwm; i++) {
       struct task *t = T(i);
       if (t->state == TASK_UNUSED || t->state == TASK_REAPING)
         continue;
-      if (t->pml4_phys == current_task->pml4_phys)
+      if (t->pml4_phys == target->pml4_phys)
         g_task_rlimits[i][resource] = *rlim;
     }
   }

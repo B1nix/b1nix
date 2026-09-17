@@ -3419,10 +3419,14 @@ static int copyin_message(const struct syscall_msghdr *user_msg,
     return -EFAULT;
   /* IOV_MAX is 1024 on Linux; sixteen was our own invention and chromium's
    * Mojo channel writes more than that in one message. */
-  if (msg->msg_iovlen < 1 || msg->msg_iovlen > SYSCALL_IOV_MAX ||
-      !msg->msg_iov)
-    return -EINVAL;
-  if (syscall_copyin(iov, msg->msg_iov,
+  /* No iovec at all is a message with no bytes, which is how systemd's
+   * send_one_fd() passes a descriptor: the ancillary data is the message. */
+  if (msg->msg_iovlen < 0 || msg->msg_iovlen > SYSCALL_IOV_MAX)
+    return -EMSGSIZE;
+  if (msg->msg_iovlen > 0 && !msg->msg_iov)
+    return -EFAULT;
+  if (msg->msg_iovlen > 0 &&
+      syscall_copyin(iov, msg->msg_iov,
                      (usize)msg->msg_iovlen * sizeof(*iov)) < 0)
     return -EFAULT;
 
@@ -6583,21 +6587,48 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         }
         return (u64)wr;
       }
-      /* prlimit64(302): (pid, resource, new, old) — self only. RLIMIT_*
-       * numbers and struct rlimit {u64 cur, max} match Linux. musl routes
-       * both getrlimit and setrlimit through here. */
+      /* prlimit64(pid, resource, new, old). RLIMIT_* numbers and struct
+       * rlimit {u64 cur, max} match Linux; musl routes getrlimit and
+       * setrlimit through here with pid 0. Another process's limits need
+       * the caller's ids to match all of the target's, or CAP_SYS_RESOURCE
+       * over its user namespace (Linux check_prlimit_permission) --
+       * systemd-nspawn reads PID 1's before it starts a container. */
       if (number == LINUX_NR_PRLIMIT64) {
-        if (arg0 != 0 && namespace_pid_from_user((usize)arg0) !=
-                             scheduler_get_pid())
-          return (u64)-EPERM;
+        struct task *t = current_task;
+        if (arg0 != 0) {
+          usize kpid = namespace_pid_from_user((usize)arg0);
+          t = kpid ? scheduler_task_by_pid(kpid) : 0;
+          if (!t)
+            return (u64)-ESRCH;
+        }
+        if ((int)arg1 < 0 || (int)arg1 >= 16)
+          return (u64)-EINVAL;
+        struct rlimit nl;
+        if (arg2 && syscall_copyin(&nl, (const void *)(usize)arg2,
+                                   sizeof(nl)) < 0)
+          return (u64)-EFAULT;
+        if (t != current_task) {
+          const struct cred *c = scheduler_get_current_cred();
+          const struct cred *tc = t->cred;
+          int id_match = c && tc && c->uid == tc->euid &&
+                         c->uid == tc->suid && c->uid == tc->uid &&
+                         c->gid == tc->egid && c->gid == tc->sgid &&
+                         c->gid == tc->gid;
+          if (!id_match &&
+              !(c && tc && ns_capable_cred(c, cred_userns(tc),
+                                           CAP_SYS_RESOURCE)))
+            return (u64)-EPERM;
+        }
         if (arg3) {
-          isize gr = sys_getrlimit((int)arg1, (struct rlimit *)(usize)arg3);
+          struct rlimit ol;
+          int gr = scheduler_getrlimit_task(t, (int)arg1, &ol);
           if (gr < 0)
             return (u64)gr;
+          if (syscall_copyout((void *)(usize)arg3, &ol, sizeof(ol)) < 0)
+            return (u64)-EFAULT;
         }
         if (arg2)
-          return (u64)sys_setrlimit((int)arg1,
-                                    (const struct rlimit *)(usize)arg2);
+          return (u64)scheduler_setrlimit_task(t, (int)arg1, &nl);
         return 0;
       }
       /* SysV shm (shmget 29 / shmat 30 / shmctl 31 / shmdt 67): argument

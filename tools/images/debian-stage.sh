@@ -345,8 +345,10 @@ if command -v perl >/dev/null 2>&1; then
 		if ($pid == 0) { exec("/bin/true", $big); exit(($! + 0) == E2BIG ? 0 : 1); }
 		waitpid($pid, 0);
 		res("exec-e2big", ($? >> 8) == 0);
-		# POSIX message queue: open, send, receive, unlink.
-		my $name = "/b1nix-mq\0";
+		# POSIX message queue: open, send, receive, unlink. The system call
+		# takes the name without the leading slash mq_open(3) strips (a "/"
+		# in it is EACCES on Linux).
+		my $name = "b1nix-mq\0";
 		my $attr = pack("q4", 0, 4, 64, 0);
 		my $mq = syscall(240, $name, O_RDWR | O_CREAT, 0600, $attr);
 		my $msg = "hello";
@@ -699,6 +701,53 @@ if [ -x /usr/bin/perl ] && [ "$(uname -m)" = x86_64 ]; then
 		exit 8 unless $? == 0 && $d =~ /^(\d+)$/ && $1 >= $t;
 		exit 0;
 	' && ok vdso-glibc || bad vdso-glibc $?
+fi
+
+# ── Stage 13: namespaces through systemd-nspawn (M123) ─────────────────────
+# Debian's own container manager starts a command in new PID, mount, UTS, IPC
+# and cgroup namespaces over a tree that shares the host's /usr read-only.
+# Judged from inside: PID 1, the machine name as hostname, a /proc that shows
+# only the container, and a PID namespace that is not the harness's.
+if [ -x /usr/bin/systemd-nspawn ]; then
+	# What an init has set up by the time a container manager runs: the
+	# cgroup v2 hierarchy and a tmpfs /run (nspawn keeps its state there and
+	# refuses to clean up a disk file system).
+	mountpoint -q /sys/fs/cgroup 2>/dev/null ||
+		mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
+	mountpoint -q /run 2>/dev/null || mount -t tmpfs -o mode=0755 tmpfs /run
+	ct=/tmp/b1nix-nspawn
+	rm -rf "$ct"
+	mkdir -p "$ct/usr" "$ct/etc" "$ct/proc" "$ct/sys" "$ct/dev" "$ct/run" \
+		"$ct/tmp" "$ct/var"
+	binds="--bind-ro=/usr"
+	for d in bin sbin lib lib64; do
+		if [ -L "/$d" ]; then
+			ln -s "$(readlink "/$d")" "$ct/$d"
+		elif [ -d "/$d" ]; then
+			mkdir -p "$ct/$d"
+			binds="$binds --bind-ro=/$d"
+		fi
+	done
+	cp /usr/lib/os-release "$ct/etc/os-release" 2>/dev/null ||
+		cp /etc/os-release "$ct/etc/os-release"
+	hostns=$(readlink /proc/self/ns/pid)
+	# nspawn picks the container's cgroup layout from the systemd version it
+	# finds in the tree; this tree has none of its own (/usr is bound in
+	# later), which would mean the v1 layout this kernel does not have. The
+	# variable is nspawn's documented way to say "unified".
+	out=$(SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1 \
+		timeout 120 systemd-nspawn -q --register=no --keep-unit -D "$ct" \
+		$binds -M b1nix-ns /bin/sh -c \
+		'echo $$; hostname; ls /proc | grep -c "^[0-9]"; readlink /proc/self/ns/pid' \
+		2>&1 </dev/null)
+	# The container's output comes through its console pty: CR LF line ends.
+	set -- $(echo "$out" | tr -d '\r' | tr '\n' ' ')
+	if [ "$1" = "1" ] && [ "$2" = "b1nix-ns" ] && [ "$3" -ge 1 ] 2>/dev/null &&
+	   [ "$3" -le 3 ] && [ -n "$4" ] && [ "$4" != "$hostns" ]; then
+		ok nspawn
+	else
+		bad "nspawn ($(echo "$out" | tail -15 | tr '\n' '|'))"
+	fi
 fi
 
 echo "DEBIAN-SMOKE: done"
