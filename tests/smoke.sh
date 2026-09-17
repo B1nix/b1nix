@@ -3002,6 +3002,7 @@ check_output "$LOG" "M123-SMOKE: done" "M123 namespace suite completes"
 check_output "$LOG" "M123-TOOLS: ok unshare-Urpf" "util-linux unshare -Urpf --mount-proc as an unprivileged user: root in its user namespace, pid 1, a proc mount of its own"
 check_output "$LOG" "M123-TOOLS: ok nsenter-userns" "util-linux nsenter joins another process's user and UTS namespaces by pid"
 check_output "$LOG" "M123-TOOLS: ok bwrap-sandbox" "bubblewrap --unshare-all as an unprivileged user: read-only root, own /proc, /dev, /tmp, hostname, loopback only"
+check_output "$LOG" "M123-PODMAN: ok rootless-run" "rootless podman + crun run a container as an unprivileged user: root inside mapped to the user plus its subordinate range, pid 1, own hostname and /proc"
 check_output "$LOG" "M73-SMOKE: done" "M73 modern-I/O suite completes"
 # ── M80: ptrace register sets, /proc introspection, crash capture ──
 check_output "$LOG" "M80-SMOKE: ok proc-task" "/proc/<pid>/task lists one dir per thread, with the right Tgid"

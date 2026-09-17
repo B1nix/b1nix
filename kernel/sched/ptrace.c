@@ -18,6 +18,7 @@
  * target, exactly as Linux's ptrace_may_access does.
  */
 
+#include <b1nix/user_namespace.h>
 #include <b1nix/arch.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
@@ -229,15 +230,16 @@ int ptrace_may_access(struct task *t) {
     return 1;
   const struct cred *c = scheduler_get_current_cred();
   const struct cred *tc = t->cred;
+  /* CAP_SYS_PTRACE counts over the target's user namespace. */
   if (c && tc && c->euid != ROOT_UID && c->euid != tc->uid &&
-      !cred_has_cap(c, CAP_SYS_PTRACE))
+      !ns_capable_cred(c, cred_userns(tc), CAP_SYS_PTRACE))
     return 0;
   if (!g_ptrace_scope)
     return 1;
   /* Restricted scope: ownership is not enough — the tracer must be an ancestor
    * of the target or the tracer the target itself nominated. CAP_SYS_PTRACE
    * still overrides, as it does under Linux's yama. */
-  if (c && cred_has_cap(c, CAP_SYS_PTRACE))
+  if (c && tc && ns_capable_cred(c, cred_userns(tc), CAP_SYS_PTRACE))
     return 1;
   usize me = scheduler_get_pid();
   if (is_ancestor_of(me, t))

@@ -1447,6 +1447,24 @@ int vfs_socket(int domain, int type, int protocol) {
       return -EPERM;
   }
 
+  /* ICMP datagram ("ping") sockets. Linux lets the groups in
+   * net.ipv4.ping_group_range open them; this kernel does not implement the
+   * protocol, and a datagram socket that silently became UDP is not one. */
+  if (type == B1NIX_SOCK_DGRAM &&
+      ((domain == B1NIX_AF_INET && protocol == 1) ||
+       (domain == B1NIX_AF_INET6 && protocol == B1NIX_IPPROTO_ICMPV6))) {
+    u32 lo, hi;
+    const struct cred *c = scheduler_get_current_cred();
+    net_ping_group_range(namespace_net_current(), &lo, &hi);
+    int allowed = 0;
+    if (c) {
+      allowed = c->egid >= lo && c->egid <= hi;
+      for (int g = 0; !allowed && g < c->ngroups; g++)
+        allowed = c->groups[g] >= lo && c->groups[g] <= hi;
+    }
+    return allowed ? -EPROTONOSUPPORT : -EACCES;
+  }
+
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_SOCKET);
   if (!h) return -ENFILE;
 

@@ -20,6 +20,8 @@
 #include <b1nix/sched.h>
 #include <b1nix/seccomp.h>
 #include <b1nix/syscall.h>
+#include <b1nix/uidgid.h>
+#include <b1nix/user_namespace.h>
 #include <string.h>
 
 /* BPF program length cap (Linux uses BPF_MAXINSNS = 4096). */
@@ -267,6 +269,16 @@ int seccomp_set_mode_filter(u32 flags, const void *user_prog) {
   if (syscall_copyin(prog, fp.filter, bytes) < 0) {
     kfree(prog);
     return -EFAULT;
+  }
+
+  /* A filter outlives exec, so installing one without no_new_privs could make
+   * a setuid program misbehave in ways its author never allowed for: that
+   * takes CAP_SYS_ADMIN in the caller's user namespace (Linux
+   * seccomp_prepare_filter). */
+  if (!task_no_new_privs(current_task) &&
+      !ns_capable(cred_userns(current_task->cred), CAP_SYS_ADMIN)) {
+    kfree(prog);
+    return -EACCES;
   }
 
   struct seccomp_filter *f = kzalloc(sizeof(*f));

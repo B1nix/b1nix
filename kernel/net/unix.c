@@ -522,10 +522,81 @@ int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr,
     return 0;
   }
 
-  /* Create VFS node */
-  struct vfs_node *node = vfs_add_node(addr->sun_path, VFS_SOCKET, s, 0, 0);
+  /* The socket file goes into the directory the path names, found the way
+   * any lookup finds it: relative to the working directory, through mounts
+   * and through /proc/<pid>/fd links. conmon binds "/proc/self/fd/<dirfd>/attach"
+   * to keep the path short; creating that string literally put the socket
+   * somewhere no one would look, and the chmod of the real path that follows
+   * failed with ENOENT. */
+  char sun[sizeof(addr->sun_path) + 1];
+  usize sl = 0;
+  while (sl < sizeof(addr->sun_path) &&
+         sl + offsetof(struct b1nix_sockaddr_un, sun_path) < addrlen &&
+         addr->sun_path[sl])
+    sl++;
+  memcpy(sun, addr->sun_path, sl);
+  sun[sl] = '\0';
+  if (!sl)
+    return -EINVAL;
+  char *abs = kmalloc(VFS_MAX_PATH);
+  char *where = kmalloc(VFS_MAX_PATH);
+  if (!abs || !where) {
+    kfree(abs);
+    kfree(where);
+    return -ENOMEM;
+  }
+  /* Absolute and normalised; split into the directory and the new name. */
+  vfs_resolve_path(sun, abs);
+  char base[VFS_NAME_MAX];
+  char *slash = strrchr(abs, '/');
+  int rc = 0;
+  if (!slash || !slash[1] || strlen(slash + 1) >= sizeof(base)) {
+    rc = slash && !slash[1] ? -EINVAL : -ENAMETOOLONG;
+  } else {
+    strcpy(base, slash + 1);
+    if (slash == abs)
+      abs[1] = '\0'; /* the directory is "/" */
+    else
+      *slash = '\0';
+    struct vfs_node *dir = vfs_find_node(abs);
+    if (IS_ERR(dir)) {
+      rc = (int)PTR_ERR(dir);
+    } else {
+      if (dir->inode->type != VFS_DIRECTORY)
+        rc = -ENOTDIR;
+      else if (vfs_check_access(dir, 3 /* W_OK | X_OK */) != 0)
+        rc = -EACCES;
+      else if (vfs_get_node_path(dir, where, VFS_MAX_PATH) != 0)
+        rc = -ENAMETOOLONG;
+      vfs_node_put(dir);
+    }
+    if (!rc) {
+      usize wl = strlen(where);
+      if (wl + 1 + strlen(base) >= VFS_MAX_PATH)
+        rc = -ENAMETOOLONG;
+      else
+        snprintf(where + wl, VFS_MAX_PATH - wl, "%s%s",
+                 (wl == 1 && where[0] == '/') ? "" : "/", base);
+    }
+    if (!rc) {
+      /* An existing name, of any kind, is EADDRINUSE: bind never replaces. */
+      struct vfs_node *old = vfs_find_node(where);
+      if (!IS_ERR(old)) {
+        vfs_node_put(old);
+        rc = -EADDRINUSE;
+      }
+    }
+  }
+  kfree(abs);
+  if (rc) {
+    kfree(where);
+    return rc;
+  }
+  /* The reference add_node returns is kept: the file outlives the socket. */
+  struct vfs_node *node = vfs_add_node(where, VFS_SOCKET, s, 0, 0);
+  kfree(where);
   if (IS_ERR(node)) return (int)PTR_ERR(node);
-  
+
   s->local.un = *addr;
   s->local_un_len = addrlen;
   s->bound = 1;

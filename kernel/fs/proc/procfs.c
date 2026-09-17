@@ -854,6 +854,57 @@ static int r_sys_osrelease(usize pid, struct sbuf *s) {
 
 /* /proc/sys/kernel/overflow{uid,gid}: the id a user namespace reports for a
  * kernel id it has no mapping for (bubblewrap reads both before it maps). */
+/* /proc/sys/net/ipv4/ping_group_range: two group ids in the reader's user
+ * namespace, for the reader's network namespace. */
+static int r_sys_ping_group_range(usize pid, struct sbuf *s) {
+  (void)pid;
+  u32 lo, hi;
+  net_ping_group_range(namespace_net_current(), &lo, &hi);
+  sb_addf(s, "%u\t%u\n", current_from_kgid(lo), current_from_kgid(hi));
+  return 0;
+}
+
+static int w_sys_ping_group_range(usize pid, const char *buf, usize len) {
+  (void)pid;
+  if (!net_ns_capable(CAP_NET_ADMIN))
+    return -EPERM;
+  u64 v[2];
+  usize i = 0;
+  for (int k = 0; k < 2; k++) {
+    while (i < len && (buf[i] == ' ' || buf[i] == '\t'))
+      i++;
+    if (i >= len || buf[i] < '0' || buf[i] > '9')
+      return -EINVAL;
+    v[k] = 0;
+    while (i < len && buf[i] >= '0' && buf[i] <= '9') {
+      v[k] = v[k] * 10 + (u64)(buf[i] - '0');
+      if (v[k] > 0xFFFFFFFFull)
+        return -EINVAL;
+      i++;
+    }
+  }
+  u32 lo = current_make_kgid((u32)v[0]);
+  u32 hi = current_make_kgid((u32)v[1]);
+  if (lo == GID_INVALID || hi == GID_INVALID)
+    return -EINVAL;
+  /* A reversed range is how the feature is turned off (Linux stores "1 0"). */
+  if (v[1] < v[0] || hi < lo) {
+    lo = 1;
+    hi = 0;
+  }
+  net_ping_group_range_set(namespace_net_current(), lo, hi);
+  return (int)len;
+}
+
+/* A network namespace's sysctls belong to the root of the user namespace that
+ * owns it, so a container's root can tune its own network. */
+static void procfs_net_sysctl_owner(struct vfs_node *node) {
+  u32 userns = namespace_owner(NS_NET, namespace_net_current());
+  u32 uid = make_kuid(userns, 0), gid = make_kgid(userns, 0);
+  node->inode->uid = uid == UID_INVALID ? 0 : uid;
+  node->inode->gid = gid == GID_INVALID ? 0 : gid;
+}
+
 static int r_sys_overflowuid(usize pid, struct sbuf *s) {
   (void)pid;
   sb_addf(s, "%u\n", UID_OVERFLOW);
@@ -2124,6 +2175,8 @@ struct procfs_fd_snap {
  * A descriptor that holds no VFS node (a pipe, a socket, an eventfd) returns
  * NULL: the resolver then falls back to the "pipe:[7]"-style string, which is
  * exactly what it did before, so nothing that worked stops working. */
+static int procfs_fd_mnt_flags(struct vfs_node *link, u32 *flags);
+
 static struct vfs_node *procfs_fd_magic_link(struct vfs_node *link) {
   if (!link || !link->parent)
     return ERR_PTR(-ENOENT);
@@ -2175,6 +2228,7 @@ static void procfs_fd_symlink(struct vfs_node *dir, int fd, const char *target) 
      * path or a prefix of the new one, never two paths run together.
      */
     existing->inode->magic_link_cb = procfs_fd_magic_link;
+    existing->inode->magic_link_mnt_flags_cb = procfs_fd_mnt_flags;
     char *buf = (char *)existing->inode->data;
     if (buf) {
       usize tl = strlen(target);
@@ -2206,6 +2260,7 @@ static void procfs_fd_symlink(struct vfs_node *dir, int fd, const char *target) 
   n->inode->mode = 0777;
   n->inode->nlink = 1;
   n->inode->magic_link_cb = procfs_fd_magic_link;
+  n->inode->magic_link_mnt_flags_cb = procfs_fd_mnt_flags;
   n->parent = dir;
   n->refcount++;
   vfs_attach_child(dir, n);
@@ -2698,6 +2753,51 @@ static void procfs_make_symlink(struct vfs_node *dir, const char *name,
   vfs_attach_child(dir, n);
 }
 
+/* /proc/<pid>/exe is a magic link: it names the file exec ran, not its path
+ * again -- which may since be unlinked, replaced or on a mount that is gone. */
+static struct vfs_node *procfs_exe_magic_link(struct vfs_node *link) {
+  struct task *t = link ? scheduler_task_by_pid(pid_from_parent(link)) : 0;
+  struct user_loaded_image *img = t ? t->user_image : 0;
+  if (!img || !img->exe_file)
+    return 0; /* no file behind it: the readlink text is all there is */
+  return vfs_node_get(img->exe_file);
+}
+
+static int procfs_exe_mnt_flags(struct vfs_node *link, u32 *flags) {
+  struct task *t = link ? scheduler_task_by_pid(pid_from_parent(link)) : 0;
+  struct user_loaded_image *img = t ? t->user_image : 0;
+  if (!img || !img->exe_mnt_flags_set)
+    return -ENOENT;
+  *flags = img->exe_mnt_flags;
+  return 0;
+}
+
+/* A descriptor's link hands on the mount flags the file was opened with. */
+static int procfs_fd_mnt_flags(struct vfs_node *link, u32 *flags) {
+  if (!link || !link->parent)
+    return -ENOENT;
+  int fd = 0;
+  for (const char *q = link->name; *q; q++) {
+    if (*q < '0' || *q > '9')
+      return -ENOENT;
+    fd = fd * 10 + (*q - '0');
+  }
+  struct task *t = scheduler_task_by_pid(pid_from_parent(link->parent));
+  if (!t)
+    return -ENOENT;
+  int rc = -ENOENT;
+  u64 irq;
+  spin_lock_irqsave(&t->fd_lock, &irq);
+  struct vfs_handle *h =
+      (t->fd_table && (usize)fd < t->fd_capacity) ? t->fd_table[fd] : 0;
+  if (h && h->used && h->mnt_flags_set) {
+    *flags = h->mnt_flags;
+    rc = 0;
+  }
+  spin_unlock_irqrestore(&t->fd_lock, irq);
+  return rc;
+}
+
 static void procfs_make_exe_symlink(struct vfs_node *dir, usize pid) {
   (void)pid; /* resolved dynamically from dir name via pid_from_parent */
   if (find_child(dir, "exe"))
@@ -2707,6 +2807,8 @@ static void procfs_make_exe_symlink(struct vfs_node *dir, usize pid) {
     return;
   memcpy(n->name, "exe", 4);
   n->inode->read_cb = procfs_exe_readlink;
+  n->inode->magic_link_cb = procfs_exe_magic_link;
+  n->inode->magic_link_mnt_flags_cb = procfs_exe_mnt_flags;
   n->inode->size = 256;
   n->inode->mode = 0777;
   n->inode->nlink = 1;
@@ -3721,6 +3823,16 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
     struct vfs_node *fsd = procfs_mkchild(sysd, "fs", VFS_DIRECTORY, 0, 0);
     if (fsd)
       procfs_mkchild(fsd, "file-max", VFS_DEVICE, r_sys_file_max, 0);
+    struct vfs_node *snet = procfs_mkchild(sysd, "net", VFS_DIRECTORY, 0, 0);
+    struct vfs_node *ipv4 =
+        snet ? procfs_mkchild(snet, "ipv4", VFS_DIRECTORY, 0, 0) : 0;
+    struct vfs_node *pgr =
+        ipv4 ? procfs_mkchild_writable(ipv4, "ping_group_range",
+                                       r_sys_ping_group_range,
+                                       w_sys_ping_group_range)
+             : 0;
+    if (pgr)
+      pgr->inode->owner_cb = procfs_net_sysctl_owner;
   }
 
   struct vfs_node *netd = procfs_mkchild(root, "net", VFS_DIRECTORY, 0, 0);

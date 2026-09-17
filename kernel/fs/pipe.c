@@ -170,7 +170,14 @@ static int pipe_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   pfd->revents = 0;
   if (h->kind == VFS_HANDLE_PIPE_READ) {
     if (pipe->size > 0) pfd->revents |= B1NIX_POLLIN;
-    if (pipe->writers == 0) pfd->revents |= B1NIX_POLLHUP;
+    /* A FIFO's reader hangs up only once a writer has come and gone since it
+     * opened (Linux compares the writer count at open, pipe->w_counter). A
+     * reader opened O_NONBLOCK before any writer waits in poll for the first
+     * one: that is how crun holds a container back until `crun start`, and
+     * reporting POLLHUP straight away let the container run first. */
+    if (pipe->writers == 0 &&
+        (!h->node || pipe->writer_opens != (u32)h->offset))
+      pfd->revents |= B1NIX_POLLHUP;
   } else if (h->kind == VFS_HANDLE_PIPE_WRITE) {
     if (pipe->size < PIPE_BUFFER_SIZE) pfd->revents |= B1NIX_POLLOUT;
     if (pipe->readers == 0) pfd->revents |= B1NIX_POLLERR;
@@ -442,6 +449,9 @@ int vfs_fifo_open(struct vfs_node *node, int flags) {
   h->node = vfs_node_get(node);
   h->private_data = fifo;
   h->flags = flags;
+  /* A pipe has no file position; a FIFO's read end keeps the writer count it
+   * was opened at, for pipe_poll. */
+  h->offset = fifo->writer_opens;
   h->ops = (acc == B1NIX_O_RDWR)  ? &fifo_rdwr_ops
            : want_write           ? &fifo_write_ops
                                   : &fifo_read_ops;

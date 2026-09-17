@@ -15,6 +15,7 @@
  * Network rules (ABI 4) and scoping (ABI 6) are not implemented; a ruleset
  * that asks for them is refused as on a kernel whose ABI is 3.
  */
+#include <b1nix/user_namespace.h>
 #include <b1nix/errno.h>
 #include <b1nix/landlock.h>
 #include <b1nix/mm.h>
@@ -437,7 +438,8 @@ static isize ll_restrict_self(u64 rfd, u64 flags) {
   if (flags)
     return -EINVAL;
   /* Unprivileged only once no_new_privs promises exec cannot undo it. */
-  if (!task_no_new_privs(current_task) && !(c && cred_has_cap(c, CAP_SYS_ADMIN)))
+  if (!task_no_new_privs(current_task) &&
+      !(c && ns_capable_cred(c, cred_userns(c), CAP_SYS_ADMIN)))
     return -EPERM;
   struct ll_ruleset *src = ruleset_from_fd((int)rfd, &err);
   if (!src)

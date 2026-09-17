@@ -335,6 +335,9 @@ void net_set_gateway_ns(u32 ns, struct ipv4_addr gw);
 void net_set_netmask_ns(u32 ns, struct ipv4_addr mask);
 /* Drop every IPv4 fact a namespace held (used when it is torn down). */
 void net_ns_clear_ipv4(u32 ns);
+/* net.ipv4.ping_group_range of network namespace `ns`, as kernel gids. */
+void net_ping_group_range(u32 ns, u32 *lo, u32 *hi);
+void net_ping_group_range_set(u32 ns, u32 lo, u32 hi);
 
 /* A namespace holds more than one IPv4 address. The accessors above are the
  * PRIMARY address (what DHCP binds and SIOCSIFADDR on the interface name

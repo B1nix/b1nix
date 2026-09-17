@@ -343,6 +343,9 @@ void scheduler_preempt_enable(void) {
   interrupts_restore(flags);
 }
 static u64  g_task_child_tid_clear[TASK_SLOTS];
+/* set_robust_list(2): the user address of the thread's robust mutex list head
+ * (0: none registered). Walked when the thread exits or execs. */
+static u64  g_task_robust_list[TASK_SLOTS];
 static u64  g_task_saved_sigmask[TASK_SLOTS];
 static int  g_task_has_saved_sigmask[TASK_SLOTS];
 /* sigaltstack side-table (per-task alternate signal stack). Kept here, NOT in
@@ -1254,6 +1257,7 @@ static struct task *find_unused_task(int user) {
       g_task_preempt_depth[i] = 0;
       g_task_tls_base[i] = 0;
       g_task_child_tid_clear[i] = 0;
+      g_task_robust_list[i] = 0;
       g_task_saved_sigmask[i] = 0;
       g_task_has_saved_sigmask[i] = 0;
       g_task_altstack_sp[i] = 0;
@@ -1360,6 +1364,7 @@ static struct task *find_unused_task(int user) {
   g_task_is_thread[i] = 0;
   g_task_tls_base[i] = 0;
   g_task_child_tid_clear[i] = 0;
+  g_task_robust_list[i] = 0;
   g_task_saved_sigmask[i] = 0;
   g_task_has_saved_sigmask[i] = 0;
   g_task_altstack_sp[i] = 0;
@@ -2703,7 +2708,7 @@ int scheduler_fork_clone(u64 flags, u64 parent_tid_addr, u64 child_tid_addr) {
   if (pid < 0)
     return pid;
   if ((flags & B1NIX_CLONE_PARENT_SETTID) && parent_tid_addr) {
-    u32 v = (u32)pid;
+    u32 v = (u32)namespace_pid_to_user((usize)pid);
     syscall_copyout((void *)(usize)parent_tid_addr, &v, sizeof(v));
   }
   if (flags & B1NIX_CLONE_CHILD_CLEARTID) {
@@ -2947,10 +2952,19 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   /* CLONE_CHILD_SETTID: stage the child's id in the parent's copy of the word
    * so the clone carries it into the child, and restore the parent's value
    * once the pages are shared COW (see the comment on scheduler_fork_clone). */
+  /* The credential and the namespaces first: the id written there is the
+   * child's own view of it, which is only known once the child is numbered in
+   * its PID namespace (Linux writes it from the child, in schedule_tail). */
+  task_init_cred(child);
+  /* M109/M123: a fork inherits the parent's namespaces, or enters the ones
+   * clone(CLONE_NEW*) prepared. After the credential exists: a new user
+   * namespace is recorded in it. */
+  namespace_fork_inherit(parent, child, 0);
   u32 ctid_saved = 0;
   int ctid_staged = 0;
   if (child_tid_addr) {
-    u32 v = (u32)child->id;
+    u32 v = (u32)namespace_pid_to_ns(namespace_task_id(child, NS_PID),
+                                     child->id);
     if (syscall_copyin(&ctid_saved, (const void *)(usize)child_tid_addr,
                        sizeof(ctid_saved)) == 0 &&
         syscall_copyout((void *)(usize)child_tid_addr, &v, sizeof(v)) == 0)
@@ -2967,6 +2981,9 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
       user_image_free(child->user_image);
       child->user_image = 0;
     }
+    /* Its own copy of the credential (task_init_cred ran above); the
+     * namespace references go with the slot. */
+    cred_free(child->cred);
     child->cred = 0;
     if (child->name) {
       kfree((void *)child->name);
@@ -3051,12 +3068,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
    * from. */
   cgroup_fork_inherit(parent->id, child->id);
 
-  // 5. Clone credentials and file descriptors
-  task_init_cred(child);
-  /* M109/M123: a fork inherits the parent's namespaces, or enters the ones
-   * clone(CLONE_NEW*) prepared. After the credential exists: a new user
-   * namespace is recorded in it. */
-  namespace_fork_inherit(parent, child, 0);
+  // 5. Clone file descriptors (the credential was made above)
   child->fd_capacity = parent->fd_capacity;
   child->fd_table = kzalloc(child->fd_capacity * sizeof(struct vfs_handle *));
   child->fd_flags = kzalloc(child->fd_capacity * sizeof(int));
@@ -3159,6 +3171,13 @@ void task_set_no_new_privs(struct task *t, int v) {
 u64 task_child_tid_clear(const struct task *t) {
   if (!t) return 0;
   return g_task_child_tid_clear[task_index(t)];
+}
+u64 task_robust_list(const struct task *t) {
+  return t ? g_task_robust_list[task_index(t)] : 0;
+}
+void task_set_robust_list(struct task *t, u64 head) {
+  if (t)
+    g_task_robust_list[task_index(t)] = head;
 }
 void task_set_child_tid_clear(struct task *t, u64 addr) {
   if (!t) return;
@@ -4315,6 +4334,13 @@ clone_nomem:
   /* Userspace ELF tasks may run on Application Processors. */
   child->ap_runnable = parent->ap_runnable;
 
+  /* M80: a new thread runs userspace code too, so give it its own XSAVE area
+   * before it can be scheduled. */
+  task_fpu_alloc(child);
+  /* M109: the child starts in the parent's namespaces, threads included — a
+   * thread of a process that unshared is in that process's namespaces. */
+  namespace_fork_inherit(parent, child, flags);
+  cgroup_fork_inherit(parent->id, child->id);
   /* M92: CLONE_PARENT_SETTID — write child TID to parent's location.
    * CLONE_CHILD_SETTID — write child TID to child's location (in its address
    * space). Both are needed by musl pthread_create for pthread_join.
@@ -4324,23 +4350,19 @@ clone_nomem:
    * the kernel — and if this write ran afterwards it put the dead thread's tid
    * back, leaving pthread_join parked forever on a thread that no longer
    * exists (the M29 stress wedge on -smp 2). Linux writes the tids in
-   * copy_process for the same reason, before wake_up_new_task. */
-  if ((flags & B1NIX_CLONE_PARENT_SETTID) && parent_tid_addr) {
-    /* parent_tid_addr is in the parent's address space (same mm for threads). */
-    syscall_copyout((void *)(usize)parent_tid_addr, &child->id, sizeof(u32));
+   * copy_process for the same reason, before wake_up_new_task.
+   *
+   * The tid as the process's PID namespace numbers it, so after the
+   * namespaces are inherited; a thread shares them with its creator, so the
+   * creator's view is the child's. */
+  if ((flags & (B1NIX_CLONE_PARENT_SETTID | B1NIX_CLONE_CHILD_SETTID))) {
+    u32 vtid = (u32)namespace_pid_to_user(child->id);
+    /* Both addresses are in the one address space the threads share. */
+    if ((flags & B1NIX_CLONE_PARENT_SETTID) && parent_tid_addr)
+      syscall_copyout((void *)(usize)parent_tid_addr, &vtid, sizeof(u32));
+    if ((flags & B1NIX_CLONE_CHILD_SETTID) && child_tid_addr)
+      syscall_copyout((void *)(usize)child_tid_addr, &vtid, sizeof(u32));
   }
-  if ((flags & B1NIX_CLONE_CHILD_SETTID) && child_tid_addr) {
-    /* child_tid_addr is in the child's address space (same mm for threads). */
-    syscall_copyout((void *)(usize)child_tid_addr, &child->id, sizeof(u32));
-  }
-
-  /* M80: a new thread runs userspace code too, so give it its own XSAVE area
-   * before it can be scheduled. */
-  task_fpu_alloc(child);
-  /* M109: the child starts in the parent's namespaces, threads included — a
-   * thread of a process that unshared is in that process's namespaces. */
-  namespace_fork_inherit(parent, child, flags);
-  cgroup_fork_inherit(parent->id, child->id);
 
   /* M80: PTRACE_O_TRACECLONE / TRACEVFORK — same as fork, with the event that
    * matches how this child was created. */
@@ -7190,7 +7212,96 @@ void scheduler_dump_thread_exits(void) {
  * and pthread_join then slept forever on a word that stayed at the dead
  * thread's tid (the M29 stress wedge). Idempotent: the address is cleared as it
  * is consumed, so a second call does nothing. */
+/* Robust futexes (Linux exit_robust_list). A thread registers the list of
+ * robust mutexes it holds; when it dies, each one whose futex word still names
+ * it as owner is marked FUTEX_OWNER_DIED, keeping the waiters bit, and one
+ * waiter is woken to take it over and get EOWNERDEAD. Without this a process
+ * sharing a lock with one that crashed -- podman's lock segment, any
+ * pthread_mutexattr_setrobust user -- waits on it forever. The walk reads the
+ * dying thread's own address space, so it runs only for the current task. */
+#define ROBUST_LIST_LIMIT 2048
+#define FUTEX_WAITERS_BIT 0x80000000u
+#define FUTEX_OWNER_DIED_BIT 0x40000000u
+#define FUTEX_TID_BITS 0x3fffffffu
+
+struct robust_list_head_user {
+  u64 next;
+  i64 futex_offset;
+  u64 list_op_pending;
+};
+
+/* One futex word: cmpxchg it on the physical page so a concurrent unlock in a
+ * process sharing the page cannot be overwritten. */
+static void robust_futex_death(struct task *t, u64 uaddr, u32 tid,
+                               int pending) {
+  extern u64 paging_user_frame(u64 pml4_phys, u64 vaddr);
+  extern u64 vmm_direct_map_base(void);
+  if (uaddr & 3)
+    return; /* futex words are aligned */
+  u32 uval;
+  if (syscall_copyin(&uval, (const void *)(usize)uaddr, sizeof(uval)) != 0)
+    return;
+  /* A lock that was being taken when the thread died and is still free: a
+   * waiter may have been told to wait for it; let one look again. */
+  if (pending && uval == 0) {
+    scheduler_futex_wake_addr(uaddr, 1);
+    return;
+  }
+  u64 fr = paging_user_frame(t->pml4_phys, uaddr & ~(u64)(PAGE_SIZE - 1));
+  if (!fr)
+    return;
+  u32 *word = (u32 *)(usize)(fr + vmm_direct_map_base() +
+                             (uaddr & (PAGE_SIZE - 1)));
+  for (int tries = 0; tries < 16; tries++) {
+    u32 cur = *word;
+    if ((cur & FUTEX_TID_BITS) != tid)
+      return;
+    u32 mval = (cur & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED_BIT;
+    if (__atomic_compare_exchange_n(word, &cur, mval, 0, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+      if (cur & FUTEX_WAITERS_BIT)
+        scheduler_futex_wake_addr(uaddr, 1);
+      return;
+    }
+  }
+}
+
+void scheduler_robust_list_release(struct task *t) {
+  if (!t || t != current_task)
+    return;
+  u64 head = task_robust_list(t);
+  if (!head)
+    return;
+  task_set_robust_list(t, 0);
+  struct robust_list_head_user h;
+  if (syscall_copyin(&h, (const void *)(usize)head, sizeof(h)) != 0)
+    return;
+  /* The tid the thread's mutexes were locked with: its id in its own PID
+   * namespace. */
+  u32 tid = (u32)namespace_pid_to_user(t->id);
+  /* Bit 0 of an entry marks a priority-inheritance mutex, which this kernel
+   * does not implement (FUTEX_LOCK_PI); such entries are skipped. */
+  u64 pending = h.list_op_pending & ~(u64)1;
+  int pending_pi = (int)(h.list_op_pending & 1);
+  u64 entry = h.next;
+  for (int limit = 0; limit < ROBUST_LIST_LIMIT && (entry & ~(u64)1) != head;
+       limit++) {
+    u64 addr = entry & ~(u64)1;
+    u64 next;
+    if (syscall_copyin(&next, (const void *)(usize)addr, sizeof(next)) != 0)
+      break;
+    if (addr != pending && !(entry & 1))
+      robust_futex_death(t, addr + (u64)h.futex_offset, tid, 0);
+    entry = next;
+  }
+  if (pending && !pending_pi)
+    robust_futex_death(t, pending + (u64)h.futex_offset, tid, 1);
+}
+
 static void thread_release_ctid(struct task *t) {
+  /* Robust mutexes first, as Linux's mm_release does: the clear-child-tid
+   * wake below may be what lets another thread go and take one. */
+  scheduler_robust_list_release(t);
   /* Not gated on task_is_thread: a MAIN thread leaving through pthread_exit()
    * registers the very same word (musl points set_tid_address at its
    * __thread_list_lock before calling exit(2)), and a leader that skipped this
@@ -9778,12 +9889,15 @@ const char *scheduler_get_cwd(void) {
   return current_task->cwd;
 }
 
+_Static_assert(sizeof(((struct task *)0)->cwd) == VFS_MAX_PATH,
+               "task cwd must hold any path the VFS resolves");
+
 int scheduler_set_cwd(const char *path) {
   if (!current_task || !path || path[0] == '\0')
-    return -1;
+    return -ENOENT;
   usize len = strlen(path);
   if (len >= sizeof(current_task->cwd))
-    return -1;
+    return -ENAMETOOLONG;
   memcpy(current_task->cwd, path, len + 1);
   return 0;
 }

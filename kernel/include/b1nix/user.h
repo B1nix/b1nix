@@ -107,6 +107,12 @@ struct user_loaded_image {
 	 * the system: every dynamically linked exec maps it, and it is the same
 	 * 723 KiB file every time. */
 	struct vfs_node *interp_node;
+	/* The file exec ran (after any #! hop), held for /proc/<pid>/exe, and the
+	 * access flags of the mount it was reached through: what an open of that
+	 * link reports, even once the file is unlinked or its mount detached. */
+	struct vfs_node *exe_file;
+	u32 exe_mnt_flags;
+	int exe_mnt_flags_set;
 	int demand_paged;
 	/* M92: executable's program header table info for AT_PHDR/AT_PHNUM auxv.
 	 * phdr_vaddr is the in-process VA where the ELF program headers are mapped;
@@ -177,6 +183,11 @@ int user_spawn(const char *path, int argc, const char **argv);
 int user_spawn_env(const char *path, int argc, const char **argv,
                    const char **envp);
 int user_execve_current(const char *path, const char **argv, const char **envp);
+/* execveat(fd, "", AT_EMPTY_PATH): the same, for a program reached through an
+ * open file whose mount flags are `mnt_flags` (when `mnt_flags_set`). */
+int user_execve_current_flags(const char *path, const char **argv,
+                              const char **envp, u32 mnt_flags,
+                              int mnt_flags_set);
 struct task;
 void user_address_space_cleanup(struct task *t);
 /* Full executable path of a task (the loaded image's path), for /proc/<pid>/exe.

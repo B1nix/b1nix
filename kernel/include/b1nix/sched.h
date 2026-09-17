@@ -270,7 +270,10 @@ struct task {
   int priority;
   int exit_code;
   usize parent_id;
-  char cwd[64];
+  /* The working directory, as an absolute path: as long as any path the VFS
+   * resolves (VFS_MAX_PATH). At 64 bytes a chdir into a container runtime's
+   * state directory failed outright. */
+  char cwd[256];
   u64 user_brk;
   u64 heap_start;
   u16 umask;
@@ -363,6 +366,11 @@ u64  task_tls_base(const struct task *t);
 void task_set_tls_base(struct task *t, u64 base);
 u64  task_child_tid_clear(const struct task *t);
 void task_set_child_tid_clear(struct task *t, u64 addr);
+/* set_robust_list(2) registration (0: none), and the exit/exec walk that marks
+ * the robust mutexes a dying thread still holds FUTEX_OWNER_DIED. */
+u64  task_robust_list(const struct task *t);
+void task_set_robust_list(struct task *t, u64 head);
+void scheduler_robust_list_release(struct task *t);
 u64  task_saved_sigmask(const struct task *t);
 int  task_has_saved_sigmask(const struct task *t);
 void task_set_saved_sigmask(struct task *t, u64 mask, int has_saved);

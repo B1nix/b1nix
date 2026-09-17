@@ -19,6 +19,8 @@ for spec in \
 	"4755 bin/m31_setuid" \
 	"4755 bin/busybox-suid" \
 	"4755 sbin/unix_chkpwd" \
+	"4755 usr/bin/newuidmap" \
+	"4755 usr/bin/newgidmap" \
 	"0400 etc/shadow" \
 	"1777 tmp" \
 	"1777 var/tmp" \

@@ -133,10 +133,40 @@ int netdev_set_netns(struct netdev *nd, u32 ns)
 /* Tear a network namespace down: everything created in it goes with it, and a
  * physical NIC that was moved into it returns to the initial namespace rather
  * than becoming unreachable (this is what Linux does too). */
+/* net.ipv4.ping_group_range, per network namespace: the kernel group ids
+ * allowed to open ICMP datagram ("ping") sockets. Linux's default is the empty
+ * range "1 0"; `set` says a namespace was given another. */
+static struct {
+	u32 lo, hi;
+	u8 set;
+} g_ping_group_range[NS_MAX_NET];
+
+void net_ping_group_range(u32 ns, u32 *lo, u32 *hi)
+{
+	if (ns < NS_MAX_NET && g_ping_group_range[ns].set) {
+		*lo = g_ping_group_range[ns].lo;
+		*hi = g_ping_group_range[ns].hi;
+	} else {
+		*lo = 1;
+		*hi = 0;
+	}
+}
+
+void net_ping_group_range_set(u32 ns, u32 lo, u32 hi)
+{
+	if (ns >= NS_MAX_NET)
+		return;
+	g_ping_group_range[ns].lo = lo;
+	g_ping_group_range[ns].hi = hi;
+	g_ping_group_range[ns].set = 1;
+}
+
 void net_ns_destroy(u32 ns)
 {
 	if (ns == 0)
 		return;
+	if (ns < NS_MAX_NET)
+		g_ping_group_range[ns].set = 0;
 	for (usize i = 0; i < g_netdev_count; i++) {
 		struct netdev *nd = g_netdevs[i];
 		if (!nd || nd->netns != ns)

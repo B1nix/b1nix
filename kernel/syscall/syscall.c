@@ -1073,15 +1073,20 @@ static u64 sys_execve(const char *user_path, const char **user_argv,
 static u64 sys_execveat(int dirfd, const char *user_path, const char **user_argv,
                         const char **user_envp, int flags) {
   char resolved[VFS_MAX_PATH];
+  u32 fd_mnt_flags = 0;
+  int fd_mnt_flags_set = 0;
 
   if (flags & AT_EMPTY_PATH) {
     /* The program to run IS the file already open at dirfd; user_path is empty.
-     * Recover its path from the fd and exec that. */
+     * Recover its path from the fd and exec that -- on the mount the fd was
+     * opened through. */
     struct vfs_handle *h = scheduler_fd_get(dirfd);
     if (!h || !h->used || h->kind != VFS_HANDLE_NODE || !h->node)
       return (u64)-EBADF;
     if (vfs_get_node_path(h->node, resolved, VFS_MAX_PATH) < 0)
       return (u64)-EBADF;
+    fd_mnt_flags = h->mnt_flags;
+    fd_mnt_flags_set = h->mnt_flags_set;
   } else {
     char kpath[VFS_MAX_PATH];
     if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0)
@@ -1116,8 +1121,9 @@ static u64 sys_execveat(int dirfd, const char *user_path, const char **user_argv
     return (u64)PTR_ERR(kenvp);
   }
 
-  u64 res = (u64)user_execve_current(resolved, (const char **)kargv,
-                                     (const char **)kenvp);
+  u64 res = (u64)user_execve_current_flags(resolved, (const char **)kargv,
+                                           (const char **)kenvp, fd_mnt_flags,
+                                           fd_mnt_flags_set);
   free_kernel_array(kargv);
   free_kernel_array(kenvp);
   return res;
@@ -6072,6 +6078,9 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
          * rather than guessed -- a wrong guess would dereference an integer. */
         const char *upath = 0;
         switch (number) {
+        case 2:   /* open */
+        case 4:   /* stat */
+        case 6:   /* lstat */
         case 21:  /* access */
         case 59:  /* execve */
         case 83:  /* mkdir */
@@ -6789,8 +6798,6 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_clock_nanosleep 115
 #define LX_set_tid_address 96
 #define LX_prlimit64       261
-#define LX_set_robust_list 99
-#define LX_get_robust_list 100
 #define LX_FUTEX           98
 #define LX_ioctl           29
 #define LX_nanosleep       101
@@ -6932,8 +6939,6 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_clock_nanosleep 230
 #define LX_set_tid_address 218
 #define LX_prlimit64       302
-#define LX_set_robust_list 273
-#define LX_get_robust_list 274
 #define LX_FUTEX           202
 #define LX_ioctl           16
 #define LX_nanosleep       35
@@ -7583,7 +7588,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
             if (rflags & RENAME_NOREPLACE) {
               struct vfs_node *existing = vfs_find_node(new_resolved);
 
-              if (existing) {
+              /* An absent destination comes back as ERR_PTR(-ENOENT), not
+               * NULL; putting that underflowed a refcount at a wild address. */
+              if (existing && !IS_ERR(existing)) {
                 vfs_node_put(existing);
                 return (u64)-EEXIST;
               }
@@ -7836,15 +7843,6 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                             (usize)n * sizeof(struct b1nix_epoll_event)) < 0)
           return (u64)-EFAULT;
         return (u64)n;
-      }
-      if (number == LX_set_robust_list) {
-        /* set_robust_list(head, len): store the robust futex list head.
-         * Stub — return 0 (b1nix doesn't use robust futexes yet). */
-        return 0;
-      }
-      if (number == LX_get_robust_list) {
-        /* get_robust_list(pid, head_ptr, len_ptr): not implemented. */
-        return (u64)-ENOSYS;
       }
       /* clone3(&args, size) — what glibc 2.34+ reaches for first in
        * pthread_create and posix_spawn. It is the same thread creation as
@@ -10370,8 +10368,15 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     unsigned int op = (unsigned int)arg0;
     if (op == SECCOMP_SET_MODE_FILTER)
       return (u64)seccomp_set_mode_filter((u32)arg1, (const void *)(usize)arg2);
-    if (op == SECCOMP_SET_MODE_STRICT)
+    /* Strict mode takes no flags and no argument. libseccomp probes for
+     * seccomp(2) with exactly that mistake -- SECCOMP_SET_MODE_STRICT, flags 1
+     * -- and counts on EINVAL: entering strict mode instead killed the prober
+     * (podman) at its next system call. */
+    if (op == SECCOMP_SET_MODE_STRICT) {
+      if (arg1 != 0 || arg2 != 0)
+        return (u64)-EINVAL;
       return (u64)seccomp_set_mode_strict();
+    }
     return (u64)-EINVAL;
   }
   case SYS_PRCTL: {
@@ -10435,6 +10440,18 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return (u64)-EFAULT;
       return 0;
     }
+    /* PR_SET_CHILD_SUBREAPER (36) / PR_GET_CHILD_SUBREAPER (37): orphans of
+     * the process's descendants come to it rather than to init. conmon (the
+     * container monitor podman starts) makes itself one and gives up when it
+     * cannot; service managers and container inits do the same. */
+    if (option == 36)
+      return (u64)scheduler_set_child_subreaper(current_task, arg1 != 0);
+    if (option == 37) {
+      int on = scheduler_get_child_subreaper(current_task);
+      if (syscall_copyout((void *)(usize)arg1, &on, sizeof(on)) != 0)
+        return (u64)-EFAULT;
+      return 0;
+    }
     /* PR_GET_PDEATHSIG (2). */
     if (option == 2) {
       int sig = scheduler_get_pdeathsig(current_task->id);
@@ -10479,7 +10496,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       struct cred *c = scheduler_get_current_cred();
       if (!c || (int)arg1 < 0 || (int)arg1 > CAP_LAST)
         return (u64)-EINVAL;
-      if (!cred_has_cap(c, CAP_SETPCAP))
+      /* CAP_SETPCAP in the caller's own user namespace: a container's root
+       * trims its bounding set before it runs anything. */
+      if (!ns_capable_cred(c, cred_userns(c), CAP_SETPCAP))
         return (u64)-EPERM;
       /* The bounding set is a CEILING on what may be gained, not a statement
        * about what is held: dropping a capability from it must not take that
@@ -11272,18 +11291,44 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     break;
 
   case SYS_SET_ROBUST_LIST:
-    /* Remembered, not acted on. A robust mutex held by a thread that dies is
-     * still not released — that needs the list walked at exit, which is not
-     * implemented. Accepting the registration is what libc expects, and it
-     * costs nothing; the previous mapping onto sync(2) cost a full filesystem
-     * flush per thread created. */
+    /* set_robust_list(head, len): len is the size of struct robust_list_head
+     * (three words), and anything else is a caller built for another ABI.
+     * The list is walked when the thread exits or execs. */
+    if (arg1 != 3 * sizeof(u64)) {
+      ret = (u64)-EINVAL;
+      break;
+    }
+    task_set_robust_list(current_task, (u64)arg0);
     ret = 0;
     break;
-  case SYS_GET_ROBUST_LIST:
-    /* Nothing is stored, so report an empty registration rather than claim a
-     * list exists. */
-    ret = (u64)-ENOSYS;
+  case SYS_GET_ROBUST_LIST: {
+    /* get_robust_list(pid, head_ptr, len_ptr). musl probes it before it will
+     * make a mutex robust, so ENOSYS here made every robust mutex fail with
+     * ENOSYS (podman's lock manager could not start). Another thread's list
+     * is readable by whoever may trace it. */
+    struct task *t = current_task;
+    if (arg0) {
+      usize kpid = namespace_pid_from_user((usize)arg0);
+      t = kpid ? scheduler_task_by_pid(kpid) : 0;
+      if (!t) {
+        ret = (u64)-ESRCH;
+        break;
+      }
+      if (t != current_task && !ptrace_may_access(t)) {
+        ret = (u64)-EPERM;
+        break;
+      }
+    }
+    u64 head = task_robust_list(t);
+    u64 len = 3 * sizeof(u64);
+    if (syscall_copyout((void *)(usize)arg1, &head, sizeof(head)) != 0 ||
+        syscall_copyout((void *)(usize)arg2, &len, sizeof(len)) != 0) {
+      ret = (u64)-EFAULT;
+      break;
+    }
+    ret = 0;
     break;
+  }
 
   case SYS_SET_TID_ADDRESS:
     /* set_tid_address(tidptr): store the clear-child-tid pointer and return
@@ -11292,7 +11337,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* Returns the caller's THREAD id, like gettid — musl stores it as the
      * thread's own tid during __init_tls, and a process-wide value there makes
      * every thread believe it is the group leader. */
-    ret = current_task ? (u64)current_task->id : 0;
+    ret = current_task ? ns_pid_out((u64)current_task->id) : 0;
     break;
 
   case SYS_WRITEV:

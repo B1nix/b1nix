@@ -1209,6 +1209,8 @@ void user_image_free(struct user_loaded_image *image) {
     vfs_node_put(image->exe_node);
   if (image->interp_node)
     vfs_node_put(image->interp_node);
+  if (image->exe_file)
+    vfs_node_put(image->exe_file);
 
   kfree(image);
 }
@@ -1434,6 +1436,9 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       extern void scheduler_exec_zap_threads(void);
 
       scheduler_exec_zap_threads();
+      /* The robust mutexes this thread holds live in the image being
+       * replaced: release them as an exit would (Linux exec_mm_release). */
+      scheduler_robust_list_release(current_task);
       scheduler_fd_close_on_exec();
     }
     /* M86: the old image's resident set is about to be released — record its
@@ -2340,8 +2345,16 @@ const char *user_task_exe_path(struct task *t) {
 
 int user_execve_current(const char *path, const char **argv,
                         const char **envp) {
+  return user_execve_current_flags(path, argv, envp, 0, 0);
+}
+
+int user_execve_current_flags(const char *path, const char **argv,
+                              const char **envp, u32 given_mnt_flags,
+                              int given_mnt_flags_set) {
   int interp_level = 0;
   struct vfs_node *node;
+  u32 exe_mnt_flags = 0;
+  int exe_mnt_flags_set = 0;
   /* The caller's argv belongs to the caller: sys_execve frees it on every
    * error return. A "#!" line replaces argv with an array of our own, and
    * freeing the caller's here meant sys_execve freed it a second time when the
@@ -2363,11 +2376,18 @@ resolve:
       return lrc;
     }
   }
-  node = vfs_find_node(path);
+  node = vfs_find_node_mnt_flags(path, &exe_mnt_flags, &exe_mnt_flags_set);
   if (!node || IS_ERR(node)) {
     if (our_argv)
       free_kernel_array(our_argv);
     return node ? (int)PTR_ERR(node) : -ENOENT;
+  }
+  /* The program named by an open file is on that file's mount, whatever the
+   * path to it resolves to now. An interpreter a #! line names is looked up
+   * afresh. */
+  if (interp_level == 0 && given_mnt_flags_set) {
+    exe_mnt_flags = given_mnt_flags;
+    exe_mnt_flags_set = 1;
   }
 
   /* POSIX: Check execute permission */
@@ -2465,7 +2485,8 @@ resolve:
     }
   }
 
-  vfs_node_put(node);
+  /* Kept for /proc/<pid>/exe (see user_loaded_image::exe_file). */
+  struct vfs_node *exe_file = node;
 
   /* M108: work out the post-exec effective ids BEFORE loading, so the auxv the
    * loader builds describes the image that is about to run rather than the one
@@ -2489,8 +2510,12 @@ resolve:
      * the heap's canaries catch only if something reallocates it in between. */
     if (our_argv)
       free_kernel_array(our_argv);
+    vfs_node_put(exe_file);
     return -ENOEXEC;
   }
+  image->exe_file = exe_file;
+  image->exe_mnt_flags = exe_mnt_flags;
+  image->exe_mnt_flags_set = exe_mnt_flags_set;
 
   /* Past the point of no return: nothing below returns to sys_execve, so the
    * caller's array is ours to release too. After a `#!` hop `path` is a string

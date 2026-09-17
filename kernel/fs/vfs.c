@@ -2065,8 +2065,14 @@ void vfs_resolve_path(const char *path, char *out) {
 
 /* POSIX: Iterative path resolution with symlink loop detection to prevent stack
  * overflow */
+struct vfs_walk_mount {
+  u64 seq;       /* the mount the walk ended in; 0 when not known */
+  u32 flags;     /* its access flags */
+  int known;     /* flags are meaningful */
+};
 static struct vfs_node *vfs_find_node_walk(const char *path, int follow_final,
-                                           int symlink_depth, u64 *mnt_out);
+                                           int symlink_depth,
+                                           struct vfs_walk_mount *out);
 static u32 vfs_node_type_mode(const struct vfs_node *node);
 
 static inline struct vfs_node *
@@ -2074,9 +2080,22 @@ vfs_find_node_internal(const char *path, int follow_final, int symlink_depth) {
   return vfs_find_node_walk(path, follow_final, symlink_depth, 0);
 }
 
+/* The access flags of mount `seq` in the caller's namespace. */
+#define MNT_ACCESS_FLAGS (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC)
+static int mount_flags_of_seq(u64 seq, u32 *flags) {
+  u32 ns = vfs_current_mnt_ns();
+  for (usize i = 0; seq && i < mount_hwm; i++) {
+    if (mount_visible_in(i, ns) && mounts[i].seq == seq) {
+      *flags = (u32)(mounts[i].flags & MNT_ACCESS_FLAGS);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static struct vfs_node *
 vfs_find_node_walk(const char *path, int follow_final, int symlink_depth,
-                   u64 *mnt_out) {
+                   struct vfs_walk_mount *mnt_out) {
   if (!root_node || !path)
     return ERR_PTR(-ENOENT);
 
@@ -2107,6 +2126,9 @@ vfs_find_node_walk(const char *path, int follow_final, int symlink_depth,
   /* The mount the walk is in (see vfs_mount_entry::parent_seq); not known
    * from a chroot's root or a descriptor's node until a mount is crossed. */
   u64 cur_mnt = 0;
+  /* Flags a magic link handed on, for a walk that ends on its target. */
+  u32 link_flags = 0;
+  int link_flags_known = 0;
   if (!task_root)
     current = vfs_cross_root_mount(current, &cur_mnt);
   vfs_inode_lock_read(current->inode);
@@ -2144,8 +2166,16 @@ restart_traversal:
       kfree(curr_path);
       kfree(parent_path);
       vfs_inode_unlock_read(current->inode);
-      if (mnt_out)
-        *mnt_out = cur_mnt;
+      if (mnt_out) {
+        mnt_out->seq = cur_mnt;
+        mnt_out->known = 0;
+        if (cur_mnt)
+          mnt_out->known = mount_flags_of_seq(cur_mnt, &mnt_out->flags);
+        else if (link_flags_known) {
+          mnt_out->flags = link_flags;
+          mnt_out->known = 1;
+        }
+      }
       return current;
     }
 
@@ -2245,7 +2275,10 @@ restart_traversal:
 
     /* find_child() already returns with refcount incremented */
     /* DOWNWARD MOUNT CROSSING */
+    u64 before_mnt = cur_mnt;
     child = vfs_follow_mounts(child, vfs_current_mnt_ns(), &cur_mnt);
+    if (cur_mnt != before_mnt)
+      link_flags_known = 0;
 
     vfs_inode_lock_read(child->inode);
     if (child->inode && child->inode->ino && child->inode->fs_id) {
@@ -2276,8 +2309,13 @@ restart_traversal:
         return ERR_PTR(-ELOOP);
       }
       struct vfs_node *(*mcb)(struct vfs_node *) = current->inode->magic_link_cb;
+      int (*mfcb)(struct vfs_node *, u32 *) =
+          current->inode->magic_link_mnt_flags_cb;
       vfs_inode_unlock_read(current->inode);
       struct vfs_node *tgtn = mcb(current);
+      if (tgtn && !IS_ERR(tgtn)) {
+        link_flags_known = mfcb && mfcb(current, &link_flags) == 0;
+      }
       if (IS_ERR(tgtn)) {
         vfs_node_put(current);
         kfree(curr_path);
@@ -2411,8 +2449,25 @@ struct vfs_node *vfs_find_node(const char *path) {
  * the walk could not tell) — what a new mount on that node is attached to. */
 static struct vfs_node *vfs_find_node_mnt(const char *path, u64 *mnt) {
   char resolved[VFS_MAX_PATH];
+  struct vfs_walk_mount wm = {0, 0, 0};
   vfs_resolve_path(path, resolved);
-  return vfs_find_node_walk(resolved, 1, 0, mnt);
+  struct vfs_node *n = vfs_find_node_walk(resolved, 1, 0, &wm);
+  if (mnt)
+    *mnt = wm.seq;
+  return n;
+}
+
+struct vfs_node *vfs_find_node_mnt_flags(const char *path, u32 *flags,
+                                         int *known) {
+  char resolved[VFS_MAX_PATH];
+  struct vfs_walk_mount wm = {0, 0, 0};
+  vfs_resolve_path(path, resolved);
+  struct vfs_node *n = vfs_find_node_walk(resolved, 1, 0, &wm);
+  if (flags)
+    *flags = wm.flags;
+  if (known)
+    *known = wm.known;
+  return n;
 }
 
 static struct vfs_node *vfs_find_node_no_follow(const char *path) {
@@ -4156,7 +4211,9 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   /* O_NOFOLLOW stops at the last component; every component before it is still
    * followed, which is what the flag means. */
   const int follow_final = (flags & B1NIX_O_NOFOLLOW) ? 0 : 1;
-  struct vfs_node *node = vfs_find_node_internal(resolved, follow_final, 0);
+  struct vfs_walk_mount open_mnt = {0, 0, 0};
+  struct vfs_node *node =
+      vfs_find_node_walk(resolved, follow_final, 0, &open_mnt);
   if (IS_ERR(node)) {
     if (PTR_ERR(node) == -ENOENT && (flags & B1NIX_O_CREAT)) {
       /* Use internal version to avoid redundant resolution/logging */
@@ -4351,6 +4408,8 @@ make_handle:;
     goto out;
   }
   h->node = node; /* Already has ref from find_node */
+  h->mnt_flags = open_mnt.flags;
+  h->mnt_flags_set = (u8)open_mnt.known;
   /* The name this descriptor was opened under (see vfs_handle::open_path).
    * `resolved` is already absolute and lexically normalised. */
   {
@@ -5591,12 +5650,28 @@ static int vfs_statfs_node(struct vfs_node *node, struct b1nix_statfs *st) {
   return 0;
 }
 
+/* f_flags: the access flags of the mount (ST_RDONLY, ST_NOSUID, ST_NODEV and
+ * ST_NOEXEC have the MS_* values). Known ones come from the walk or the open
+ * file; otherwise the mount the node's tree belongs to. */
+static void vfs_statfs_set_flags(struct vfs_node *node, struct b1nix_statfs *st,
+                                 u32 flags, int known) {
+  if (!known) {
+    struct vfs_mount_entry *mnt = vfs_get_mount_for_node(node);
+    flags = mnt ? (u32)(mnt->flags & MNT_ACCESS_FLAGS) : 0;
+  }
+  st->f_flags = flags & MNT_ACCESS_FLAGS;
+}
+
 int vfs_statfs(const char *path, struct b1nix_statfs *st) {
-  struct vfs_node *node = vfs_find_node(path);
+  u32 mflags = 0;
+  int mknown = 0;
+  struct vfs_node *node = vfs_find_node_mnt_flags(path, &mflags, &mknown);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
 
   int res = vfs_statfs_node(node, st);
+  if (res == 0)
+    vfs_statfs_set_flags(node, st, mflags, mknown);
   if (bootinfo_has_flag("b1nix.trace-statfs")) {
     char line[192];
     snprintf(line, sizeof(line),
@@ -6419,6 +6494,8 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
       break;
     }
     if (anon_mode) {
+      if (ph->anon_perm_set)
+        anon_mode = (anon_mode & ~07777u) | ph->anon_perm;
       memset(st, 0, sizeof(*st));
       st->st_mode = anon_mode;
       st->st_nlink = 1;
@@ -7414,11 +7491,15 @@ static int vfs_umount_one(const char *canon, int detach, u32 group,
     __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
     return -EINVAL;
   }
-  /* The root mount itself cannot go; a mount stacked over it can. */
+  /* The root mount itself cannot go; a mount stacked over it can. Linux lets
+   * MNT_DETACH take the namespace's root away from under its tasks, which this
+   * table cannot express (a walk always starts at the root mount): that is
+   * EINVAL, the answer Linux gives for the next attempt, and what container
+   * runtimes detaching "." until it fails stop on. */
   if (strcmp(canon, "/") == 0 && !group &&
       (!mounts[i].mount_point || mounts[i].mount_point == root_node)) {
     __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-    return -EBUSY;
+    return detach ? -EINVAL : -EBUSY;
   }
 
   /* Basic busy check: if root_node has other refs than our mount entry.
@@ -7522,9 +7603,17 @@ int vfs_umount2(const char *target, int flags) {
   }
   u32 group = top >= 0 ? mounts[top].pivot_group : 0;
   u64 top_seq = top >= 0 ? mounts[top].seq : 0;
+  /* The namespace's root mount (see vfs_umount_one): refused before anything
+   * below it is touched, or a detach that fails would still have emptied the
+   * tree. */
+  int is_root = top >= 0 && !group && strcmp(canon, "/") == 0 &&
+                (!mounts[top].mount_point ||
+                 mounts[top].mount_point == root_node);
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   if (top < 0)
     return -EINVAL;
+  if (is_root)
+    return (flags & UMOUNT_MNT_DETACH) ? -EINVAL : -EBUSY;
   if (!(flags & UMOUNT_MNT_DETACH))
     return vfs_umount_one(canon, 0, 0, 0, top_seq);
 
@@ -9992,8 +10081,17 @@ int vfs_fchmod(int fd, u16 mode) {
   struct vfs_handle *handle = get_handle(fd);
   if (!handle || !handle->used)
     return -EBADF;
-  if (handle->kind != VFS_HANDLE_NODE || !handle->node)
-    return -EINVAL;
+  if (handle->kind != VFS_HANDLE_NODE || !handle->node) {
+    /* An O_PATH descriptor refers to nothing that can change (EBADF on
+     * Linux); every other nodeless object has its own inode. Its owner is
+     * whoever made it, which this kernel does not record, so the holder of
+     * the descriptor is taken to be that owner. */
+    if (handle->kind == VFS_HANDLE_NONE)
+      return -EBADF;
+    handle->anon_perm = mode & 07777;
+    handle->anon_perm_set = 1;
+    return 0;
+  }
 
   const struct cred *cred = get_current_cred();
   if (!cred)
@@ -10370,7 +10468,11 @@ int vfs_fstatfs(int fd, struct b1nix_statfs *st) {
     return 0;
   }
 
-  return vfs_statfs_node(handle->node, st);
+  int res = vfs_statfs_node(handle->node, st);
+  if (res == 0)
+    vfs_statfs_set_flags(handle->node, st, handle->mnt_flags,
+                         handle->mnt_flags_set);
+  return res;
 }
 
 int vfs_syncfs(int fd) {

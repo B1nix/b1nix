@@ -15,3 +15,4 @@
 /bin/m40-linux-abi    # M40: freestanding Linux-ABI conformance blob (tools/blobs/linux_abi_test.c) — raw Linux syscalls, no libc, so the translation layer is what gets tested rather than a b1nix libc
 /bin/native_smoke     # M26: built inside the guest by the native toolchain, whose default output is what is being proven
 /bin/b1cc_selfsmoke   # M32: the on-device b1cc self-host driver also runs from the minimal initramfs, which ships no shared libc.so — userspace/Makefile links it against musl's libc.a on purpose (see the rule's comment)
+/usr/bin/catatonit      # M123: Alpine's catatonit package, unmodified — podman bind-mounts it into containers as their init (--init) and keeps it as the rootless pause process, so upstream builds it static on purpose: it must run in a container root that has no libc

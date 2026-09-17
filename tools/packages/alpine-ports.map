@@ -99,7 +99,8 @@ programs      zsh curl libcurl samurai bmake dropbear dropbear-ssh \
               mtdev fribidi libdisplay-info libxft \
               libseat vulkan-loader xcb-util-renderutil tiff libpciaccess \
               attr lsblk uuidgen mtd-utils-flash \
-              util-linux-misc setpriv bubblewrap
+              util-linux-misc setpriv bubblewrap \
+              podman crun
 
 # The browser. Baked into the image at build time rather than installed in the
 # guest: the closure is ~175 packages and installing it over the network inside

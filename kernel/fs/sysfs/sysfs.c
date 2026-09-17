@@ -1051,6 +1051,14 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
   sysfs_mkchild(kern, "version", VFS_DEVICE, g_kversion);
   sysfs_mkchild(kern, "domainname", VFS_DEVICE, g_domainname);
 
+  /* /sys/fs/cgroup: the mount point of the cgroup2 hierarchy, which Linux's
+   * sysfs provides empty. OpenRC's cgroups service and podman look for the
+   * hierarchy exactly there, and without the directory there is nowhere to
+   * mount it. */
+  struct vfs_node *fsd = sysfs_mkchild(root, "fs", VFS_DIRECTORY, 0);
+  if (fsd)
+    sysfs_mkchild(fsd, "cgroup", VFS_DIRECTORY, 0);
+
   struct vfs_node *dev = sysfs_mkchild(root, "devices", VFS_DIRECTORY, 0);
   struct vfs_node *sys = sysfs_mkchild(dev, "system", VFS_DIRECTORY, 0);
   struct vfs_node *cpu = sysfs_mkchild(sys, "cpu", VFS_DIRECTORY, 0);

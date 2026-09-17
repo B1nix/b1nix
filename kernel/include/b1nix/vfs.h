@@ -354,6 +354,10 @@ struct vfs_inode {
    * stored target string" -- which is what a pipe or socket descriptor gets,
    * so their behaviour is unchanged. */
   struct vfs_node *(*magic_link_cb)(struct vfs_node *link);
+  /* For a magic link: the flags (MS_RDONLY, MS_NOSUID, MS_NODEV, MS_NOEXEC) of
+   * the mount the object it names was reached through, which the link hands
+   * on to whatever opens through it. Returns 0 when it knows them. */
+  int (*magic_link_mnt_flags_cb)(struct vfs_node *link, u32 *flags);
   /* Run lookup_cb even when the child is already there, so it can REFRESH it.
    * /proc/<pid>/fd is the case that needs it: a descriptor number is reused as
    * soon as it is closed, and a symlink materialised once and then found by
@@ -568,6 +572,10 @@ int vfs_fs_userns_mountable(const char *fstype);
 int vfs_node_is_nosuid(struct vfs_node *node);
 struct vfs_node *find_child(struct vfs_node *parent, const char *name);
 struct vfs_node *vfs_find_node(const char *path);
+/* The same, also giving the access flags of the mount the node was reached
+ * through (*known = 0 when the walk could not tell). */
+struct vfs_node *vfs_find_node_mnt_flags(const char *path, u32 *flags,
+                                         int *known);
 struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
                               void *data, usize size, u32 flags);
 struct vfs_node *vfs_node_get(struct vfs_node *node);
@@ -1149,6 +1157,22 @@ struct vfs_handle {
    * (pipes, sockets, eventfds) and when the allocation failed, in which case
    * readers fall back to the node's own path. */
   char *open_path;
+  /* Permission bits fchmod(2) set on a descriptor that has no node (a pipe, a
+   * socket, an anonymous inode), with anon_perm_set saying they were set.
+   * Linux gives such an object an inode whose mode fchmod changes and fstat
+   * reports; conmon restricts its console socket this way and gives up when
+   * it cannot. */
+  u16 anon_perm;
+  u8 anon_perm_set;
+  /* The access flags of the mount the file was opened through, taken when it
+   * was opened (mnt_flags_set says they were known). Linux keeps the mount
+   * itself with an open file; what callers read back from it is these flags,
+   * through fstatfs(2) f_flags -- and they must survive the mount being
+   * detached: runc and crun protect their own binary by executing it through
+   * a read-only bind mount they detach at once, and then check that
+   * /proc/self/exe is on a read-only mount. */
+  u32 mnt_flags;
+  u8 mnt_flags_set;
 };
 
 /* Internal handle management for subsystems */
