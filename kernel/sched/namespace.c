@@ -27,6 +27,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
+#include <b1nix/vdso.h>
 #include <b1nix/vfs.h>
 #include <stdio.h>
 #include <string.h>
@@ -519,7 +520,12 @@ void namespace_fork_inherit(struct task *parent, struct task *child,
   cr->used = !ns_row_trivial(cr);
   if (ids[NS_PID])
     pidns_enter_locked(ids[NS_PID], child, thread);
+  u32 parent_time = (pr && pr->used) ? pr->id[NS_TIME] : 0;
   spin_unlock_irqrestore(&ns_lock, f);
+  /* A child born into another time namespace must not read its clocks from
+   * the page its parent's address space showed. */
+  if (!thread && ids[NS_TIME] != parent_time)
+    vdso_timens_update(child);
 }
 
 void namespace_task_exit(struct task *t) {
@@ -1003,6 +1009,8 @@ int namespace_setns(int fd, int nstype) {
     ns_install_locked(me, r, k, targets[k]);
   }
   spin_unlock_irqrestore(&ns_lock, f);
+  if (rc == 0 && want[NS_TIME])
+    vdso_timens_update(me);
   ns_kick_reaper();
   return rc;
 }
@@ -1318,6 +1326,20 @@ i64 namespace_time_offset(int clock) {
   if (clock == TIMENS_CLOCK_BOOTTIME)
     return time_data[id].boottime;
   return 0;
+}
+
+i64 namespace_clock_offset(int clockid) {
+  switch (clockid) {
+  case 1: /* CLOCK_MONOTONIC */
+  case 4: /* CLOCK_MONOTONIC_RAW */
+  case 6: /* CLOCK_MONOTONIC_COARSE */
+    return namespace_time_offset(TIMENS_CLOCK_MONOTONIC);
+  case 7: /* CLOCK_BOOTTIME */
+  case 9: /* CLOCK_BOOTTIME_ALARM */
+    return namespace_time_offset(TIMENS_CLOCK_BOOTTIME);
+  default:
+    return 0;
+  }
 }
 
 static void timens_fmt(char *buf, usize len, usize *pos, const char *name,

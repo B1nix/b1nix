@@ -93,6 +93,10 @@ u64 vdso_choose_base(void);
  * 0 on success (or when there is nothing to map), -errno otherwise. */
 int vdso_map_current(struct user_loaded_image *image);
 
+/* A task's time namespace changed (a fork into a new one, setns): point its
+ * [vvar] at the page for that namespace. */
+void vdso_timens_update(struct task *t);
+
 /* Bytes of the vDSO mapping (a whole number of pages), 0 when absent. */
 u64 vdso_text_size(void);
 

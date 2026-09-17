@@ -21,6 +21,7 @@
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
+#include <b1nix/namespace.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/user.h>
@@ -47,6 +48,10 @@ static struct vdso_data *g_data = &g_boot_data;
 static spinlock_t g_vdso_lock = SPINLOCK_INIT;
 
 static u64 g_data_frame;
+/* The [vvar] page of every task in a time namespace other than the initial one
+ * (M123). It never describes a clock, so the vDSO hands every reading to the
+ * system call, which applies the namespace's offsets. */
+static u64 g_timens_frame;
 static u64 g_text_frames[VDSO_MAX_PAGES];
 static usize g_text_pages;
 
@@ -139,6 +144,19 @@ void vdso_init(void)
 		return;
 	}
 	memset((void *)(usize)(direct + data_frame), 0, PAGE_SIZE);
+	u64 timens_frame = pmm_alloc_frame();
+	if (!timens_frame) {
+		pmm_free_frame(data_frame);
+		console_write("vdso: no frame for the time-namespace page; processes get no vDSO\n");
+		return;
+	}
+	{
+		struct vdso_data *tp =
+		    (struct vdso_data *)(usize)(direct + timens_frame);
+		memset(tp, 0, PAGE_SIZE);
+		tp->version = VDSO_DATA_VERSION;
+		tp->clock_mode = VDSO_CLOCK_SYSCALL;
+	}
 
 	for (usize i = 0; i < pages; i++) {
 		u64 f = pmm_alloc_frame();
@@ -147,6 +165,7 @@ void vdso_init(void)
 			for (usize k = 0; k < i; k++)
 				pmm_free_frame(g_text_frames[k]);
 			pmm_free_frame(data_frame);
+			pmm_free_frame(timens_frame);
 			console_write("vdso: no frames for the image; processes get no vDSO\n");
 			return;
 		}
@@ -169,6 +188,7 @@ void vdso_init(void)
 	page->version = VDSO_DATA_VERSION;
 	g_data = page;
 	g_data_frame = data_frame;
+	g_timens_frame = timens_frame;
 	g_text_pages = pages;
 	spin_unlock_irqrestore(&g_vdso_lock, flags);
 
@@ -200,6 +220,32 @@ u64 vdso_choose_base(void)
 	return end - vdso_text_size();
 }
 
+/* The data frame a task's [vvar] must show. */
+static u64 vdso_vvar_frame_for(const struct task *t)
+{
+	return namespace_task_id(t, NS_TIME) ? g_timens_frame : g_data_frame;
+}
+
+void vdso_timens_update(struct task *t)
+{
+	if (!t || !g_text_pages || !t->pml4_phys)
+		return;
+	u64 want = vdso_vvar_frame_for(t);
+	for (struct vm_area *v = t->vma_list; v; v = v->next) {
+		if (v->special != VMA_SPECIAL_VVAR)
+			continue;
+		u64 have = paging_user_frame(t->pml4_phys, v->start);
+		if (have == want)
+			return;
+		pmm_ref_frame(want);
+		paging_set_page_in_space(t->pml4_phys, v->start, want,
+		                         vmm_user_flags_from_prot(PROT_READ) | VMM_PRESENT);
+		if (have)
+			pmm_free_frame(have);
+		return;
+	}
+}
+
 int vdso_map_current(struct user_loaded_image *image)
 {
 	u64 base = image ? image->vdso_base : 0;
@@ -222,9 +268,10 @@ int vdso_map_current(struct user_loaded_image *image)
 
 	/* Each mapping takes its own reference; the kernel's stays, so unmapping
 	 * or exiting never frees a frame every other process still uses. */
-	vmm_map_page(vvar, g_data_frame,
+	u64 vvar_frame = vdso_vvar_frame_for(current_task);
+	vmm_map_page(vvar, vvar_frame,
 	             vmm_user_flags_from_prot(PROT_READ) | VMM_PRESENT);
-	pmm_ref_frame(g_data_frame);
+	pmm_ref_frame(vvar_frame);
 	for (usize i = 0; i < g_text_pages; i++) {
 		vmm_map_page(base + (u64)i * PAGE_SIZE, g_text_frames[i],
 		             vmm_user_flags_from_prot(PROT_READ | PROT_EXEC) | VMM_PRESENT);
@@ -252,7 +299,7 @@ int vdso_frame_is_shared(u64 frame)
 	frame &= ~(u64)(PAGE_SIZE - 1);
 	if (!g_text_pages)
 		return 0;
-	if (frame == g_data_frame)
+	if (frame == g_data_frame || frame == g_timens_frame)
 		return 1;
 	for (usize i = 0; i < g_text_pages; i++)
 		if (frame == g_text_frames[i])

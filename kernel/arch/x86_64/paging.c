@@ -918,6 +918,17 @@ void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address) {
   vmm_write_release(_vmflags);
 }
 
+void paging_set_page_in_space(u64 pml4_phys, u64 virtual_address,
+                              u64 physical_address, u64 flags) {
+  u64 _vmflags;
+  vmm_write_acquire(&_vmflags);
+  u64 *pml4 = pml4_phys ? (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE)
+                         : kernel_pml4_virt;
+  vmm_map_page_in_table(pml4, virtual_address, physical_address,
+                        flags | VMM_PRESENT);
+  vmm_write_release(_vmflags);
+}
+
 /* Unmap a whole run from another address space under ONE lock acquisition.
  *
  * Teardown walks every page of every mapping, and taking the VMM write lock per

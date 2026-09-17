@@ -211,6 +211,10 @@ int namespace_net_live(u32 ns);
 #define TIMENS_CLOCK_BOOTTIME 7
 /* The offsets of the caller's namespace, in nanoseconds (signed). */
 i64 namespace_time_offset(int clock);
+/* The same for a Linux clock id: the monotonic offset for CLOCK_MONOTONIC and
+ * its _RAW/_COARSE forms, the boottime one for CLOCK_BOOTTIME(_ALARM), 0 for
+ * every other clock. */
+i64 namespace_clock_offset(int clockid);
 /* Offsets of the time namespace a task's children are born into, as written to
  * /proc/<pid>/timens_offsets. Settable only before any task has entered it. */
 int namespace_time_offsets_render(const struct task *t, char *buf, usize len);

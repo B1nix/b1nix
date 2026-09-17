@@ -1404,6 +1404,31 @@ static char tty_line[TTY_INPUT_SIZE];
 static usize tty_line_pos;
 static usize tty_line_len;
 
+/* Step from a mountpoint to what is mounted there, and on through every mount
+ * stacked on top of that (Linux follow_mount). A second mount on the same path
+ * has the first one's root as its mountpoint, so stopping after one step shows
+ * the filesystem that was covered — `mount -t proc proc /proc` in a new mount
+ * namespace listed the host's processes. Of several entries at one node the
+ * one mounted last wins. Takes and returns a referenced node. */
+static struct vfs_node *vfs_follow_mounts(struct vfs_node *child, u32 walk_ns) {
+  for (int hops = 0; hops < 16; hops++) {
+    int best = -1;
+    for (int i = 0; i < (int)mount_hwm; i++) {
+      if (!mount_visible_in(i, walk_ns) || child != mounts[i].mount_point ||
+          !mounts[i].root_node)
+        continue;
+      if (best < 0 || mounts[i].seq > mounts[best].seq)
+        best = i;
+    }
+    if (best < 0 || mounts[best].root_node == child)
+      break;
+    struct vfs_node *root = vfs_node_get(mounts[best].root_node);
+    vfs_node_put(child);
+    child = root;
+  }
+  return child;
+}
+
 static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node) {
   if (!node || node != root_node)
     return node;
@@ -1468,6 +1493,10 @@ int vfs_check_access(struct vfs_node *node, int requested_access) {
   const struct cred *cred = get_current_cred();
   if (!cred)
     return -EACCES;
+  /* A synthetic filesystem whose owner follows something live (/proc/<pid>)
+   * brings the inode up to date first. */
+  if (node->inode && node->inode->getattr_cb)
+    node->inode->getattr_cb(node);
   if (vfs_get_node_perm(node, cred, (u32)requested_access)) {
     return 0;
   }
@@ -2103,16 +2132,7 @@ restart_traversal:
 
     /* find_child() already returns with refcount incremented */
     /* DOWNWARD MOUNT CROSSING */
-    u32 walk_ns = vfs_current_mnt_ns();
-
-    for (int i = 0; i < (int)mount_hwm; i++) {
-      if (mount_visible_in(i, walk_ns) && child == mounts[i].mount_point) {
-        struct vfs_node *root = vfs_node_get(mounts[i].root_node);
-        vfs_node_put(child);
-        child = root;
-        break;
-      }
-    }
+    child = vfs_follow_mounts(child, vfs_current_mnt_ns());
 
     vfs_inode_lock_read(child->inode);
     if (child->inode && child->inode->ino && child->inode->fs_id) {
@@ -2324,17 +2344,8 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
       child = find_child(current, part);
     }
     int child_was_found = (child != NULL);
-    if (child) {
-      u32 walk_ns = vfs_current_mnt_ns();
-
-      for (int i = 0; i < (int)mount_hwm; i++) {
-        if (mount_visible_in(i, walk_ns) && child == mounts[i].mount_point) {
-          vfs_node_put(child); /* Drop ref from find_child */
-          child = vfs_node_get(mounts[i].root_node);
-          break;
-        }
-      }
-    }
+    if (child)
+      child = vfs_follow_mounts(child, vfs_current_mnt_ns());
     int is_leaf =
         (!rest || rest[0] == '\0' || (rest[0] == '/' && rest[1] == '\0'));
 
@@ -8943,6 +8954,10 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
       return vfs_ioctl_fsflags(node, nr, arg);
     if (type == 'X' && nr == 121)
       return vfs_ioctl_fitrim(node, arg);
+    /* A synthetic file with an ioctl surface of its own: the NS_GET_* calls
+     * on a namespace handle (nsfs). */
+    if (node->inode->ioctl_cb)
+      return node->inode->ioctl_cb(node, request, arg);
     return -EINVAL;
   }
 

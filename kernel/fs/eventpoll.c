@@ -19,6 +19,7 @@
 
 #include <b1nix/vfs.h>
 #include <b1nix/errno.h>
+#include <b1nix/namespace.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/arch.h>
@@ -630,8 +631,12 @@ int vfs_timerfd_settime(int fd, int flags,
       value = value > now_clock ? value - now_clock : 1;
     } else {
       u64 now_ns = ktime_monotonic_ns();
-      u64 want_ns = (u64)new_value->it_value.tv_sec * 1000000000ull +
-                    (u64)new_value->it_value.tv_nsec;
+      /* The deadline is on the clock as the caller's time namespace reads
+       * it (M123); the timer runs on the kernel's. */
+      i64 want_ns_signed = (i64)new_value->it_value.tv_sec * 1000000000LL +
+                           (i64)new_value->it_value.tv_nsec -
+                           namespace_clock_offset(t->clockid);
+      u64 want_ns = want_ns_signed > 0 ? (u64)want_ns_signed : 0;
       u64 tick_ns = 1000000000ull / TICKS_PER_SEC;
       u64 delay_ns = want_ns > now_ns ? want_ns - now_ns : 0;
 

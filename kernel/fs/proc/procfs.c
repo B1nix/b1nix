@@ -223,19 +223,28 @@ static struct {
 } procfs_instances[PROCFS_MAX_INSTANCES];
 static spinlock_t procfs_instance_lock = SPINLOCK_INIT;
 
-static u32 procfs_pidns_of(struct vfs_node *node) {
-  struct vfs_node *root = node;
-  for (int depth = 0; root && root->parent && depth < 16; depth++)
-    root = root->parent;
-  u32 ns = 0;
+/* The instance root `node` lies under (or is), or NULL. A mount root keeps a
+ * parent pointer into the filesystem it is mounted on, so the walk stops at
+ * the first ancestor that is a registered root rather than at the top. */
+static struct vfs_node *procfs_root_of(struct vfs_node *node, u32 *pidns) {
   u64 f;
   spin_lock_irqsave(&procfs_instance_lock, &f);
-  for (int i = 0; i < PROCFS_MAX_INSTANCES; i++)
-    if (procfs_instances[i].root == root) {
-      ns = procfs_instances[i].pidns;
-      break;
-    }
+  for (int depth = 0; node && depth < 16; depth++, node = node->parent) {
+    for (int i = 0; i < PROCFS_MAX_INSTANCES; i++)
+      if (procfs_instances[i].root == node) {
+        if (pidns)
+          *pidns = procfs_instances[i].pidns;
+        spin_unlock_irqrestore(&procfs_instance_lock, f);
+        return node;
+      }
+  }
   spin_unlock_irqrestore(&procfs_instance_lock, f);
+  return 0;
+}
+
+static u32 procfs_pidns_of(struct vfs_node *node) {
+  u32 ns = 0;
+  procfs_root_of(node, &ns);
   return ns;
 }
 
@@ -357,6 +366,36 @@ static isize procfs_write_cb(struct vfs_node *node, u64 offset,
   return (isize)pn->write(pid, buffer, size);
 }
 
+/* ── ownership ──
+ * Everything under /proc/<pid> belongs to the task's effective uid and gid, as
+ * on Linux: that is what lets an unprivileged process write its own
+ * /proc/self/uid_map after unshare(CLONE_NEWUSER), and what makes the files of
+ * another user's process unreadable where the mode says so. Refreshed before
+ * every stat and permission check, because the task's ids can change. */
+static void procfs_owner_getattr(struct vfs_node *node) {
+  u32 pidns = 0;
+  struct vfs_node *root = procfs_root_of(node, &pidns);
+  if (!root || node == root)
+    return;
+  struct vfs_node *top = node;
+  while (top->parent && top->parent != root)
+    top = top->parent;
+  usize pid;
+  if (strcmp(top->name, "self") == 0 || strcmp(top->name, "thread-self") == 0) {
+    pid = scheduler_get_pid();
+  } else {
+    usize v = procfs_parse_pid(top->name);
+    if (!v)
+      return; /* a system file: stays root's */
+    pid = namespace_pid_from_ns(pidns, v);
+  }
+  struct task *t = pid ? scheduler_task_by_pid(pid) : 0;
+  if (!t || !t->cred)
+    return;
+  node->inode->uid = t->cred->euid;
+  node->inode->gid = t->cred->egid;
+}
+
 /* ── node construction ── */
 
 static struct vfs_node *procfs_mkchild(struct vfs_node *parent,
@@ -374,6 +413,7 @@ static struct vfs_node *procfs_mkchild(struct vfs_node *parent,
   n->inode->mode = (type == VFS_DIRECTORY) ? 0555 : 0444;
   n->inode->uid = 0;
   n->inode->gid = 0;
+  n->inode->getattr_cb = procfs_owner_getattr;
   n->inode->nlink = (type == VFS_DIRECTORY) ? 2 : 1;
   /* A /proc file is served through a device-style read callback, but to
    * anyone who stats it it is a REGULAR FILE — that is what it is on Linux,
@@ -508,8 +548,10 @@ static int r_uptime(usize pid, struct sbuf *s) {
    * Hundredths are printed as two digits, derived rather than assumed: this
    * once printed `ticks % 100` and called it centiseconds, which is true at
    * one tick rate and no other, and unpadded it turned five milliseconds past
-   * the second into ".5", i.e. half a second. */
-  u64 ns = ktime_monotonic_ns();
+   * the second into ".5", i.e. half a second. The reader's time namespace
+   * shifts it, as it shifts CLOCK_BOOTTIME (M123). */
+  i64 shifted = (i64)ktime_monotonic_ns() + namespace_clock_offset(7);
+  u64 ns = shifted > 0 ? (u64)shifted : 0;
   u64 sec = ns / 1000000000ull;
   u64 cs = (ns % 1000000000ull) / 10000000ull;
 
@@ -2783,6 +2825,7 @@ static isize procfs_task_readdir(struct vfs_node *dir, usize offset,
  * left behind waits for a process that is already gone. Computed at stat time
  * because it changes with every clone and every thread exit. */
 static void procfs_task_getattr(struct vfs_node *node) {
+  procfs_owner_getattr(node);
   usize pid = pid_from_parent(node);
   struct task *leader = scheduler_task_by_pid(pid);
 
@@ -2889,6 +2932,7 @@ static void procfs_make_ns_link(struct vfs_node *dir, const char *name) {
   n->name[nl] = '\0';
   n->inode->read_cb = procfs_ns_readlink;
   n->inode->magic_link_cb = procfs_ns_magic;
+  n->inode->getattr_cb = procfs_owner_getattr;
   n->inode->size = 32;
   n->inode->mode = 0777;
   n->inode->nlink = 1;

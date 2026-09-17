@@ -211,6 +211,7 @@ run_test /bin/m107_smoke posix
 # sequential group.
 run_test /bin/m109_uevent_smoke posix
 run_test /bin/m63_smoke posix
+run_test /bin/m123_smoke posix
 run_test /bin/m71_aslr posix
 run_test /bin/m42_w5pre_smoke sys
 run_test /bin/m46_smoke posix

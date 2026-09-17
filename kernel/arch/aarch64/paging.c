@@ -485,6 +485,27 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
     panic("aarch64 vmm: OOM during page table allocation");
 }
 
+void paging_set_page_in_space(u64 pml4_phys, u64 virtual_address,
+                              u64 physical_address, u64 flags) {
+  u64 f;
+
+  vmm_write_acquire(&f);
+  u64 *l0 = (virtual_address >= 0x8000000000000000ULL || !pml4_phys)
+                ? kernel_l0_virt
+                : phys_to_virt(pml4_phys);
+  u64 *l1 = ensure_child(l0, l0_index(virtual_address), 0);
+  u64 *l2 = l1 ? ensure_child(l1, l1_index(virtual_address), 1) : 0;
+  u64 *l3 = l2 ? ensure_child(l2, l2_index(virtual_address), 2) : 0;
+  if (l3) {
+    l3[l3_index(virtual_address)] =
+        encode_leaf(physical_address, flags | VMM_PRESENT);
+    tlb_flush_page(virtual_address);
+  }
+  vmm_write_release(f);
+  if (!l3)
+    panic("aarch64 vmm: OOM during page table allocation");
+}
+
 void vmm_unmap_page(u64 virtual_address) {
   paging_unmap_page_from_space(current_task ? current_task->pml4_phys : 0,
                                 virtual_address);

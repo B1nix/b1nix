@@ -7714,13 +7714,32 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return (u64)rc;
       }
       if (number == LX_clock_nanosleep) {
-        /* clock_nanosleep(clock_id, flags, request, remain).
-         * flags=0 → relative sleep. Convert the timespec to ticks and sleep. */
-        (void)arg0; /* clock_id — ignore, use relative */
+        /* clock_nanosleep(clock_id, flags, request, remain). With
+         * TIMER_ABSTIME the request is a deadline on `clock_id` — for the
+         * monotonic and boottime clocks as the caller's time namespace reads
+         * them — and the sleep is the time left until it. */
         (void)arg3; /* remain — not implemented */
         struct timespec ts;
         if (syscall_copyin(&ts, (const void *)(usize)arg2, sizeof(ts)) != 0)
           return (u64)-EFAULT;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
+          return (u64)-EINVAL;
+        if (arg1 & 1 /* TIMER_ABSTIME */) {
+          int clk = (int)arg0;
+          i64 now;
+          if (clk == 0 || clk == 5 || clk == 8)
+            now = (i64)rtc_now_unix_nanos();
+          else if (clk == 1 || clk == 4 || clk == 6 || clk == 7 || clk == 9)
+            now = (i64)arch_tsc_monotonic_ns() + namespace_clock_offset(clk);
+          else
+            return (u64)-EINVAL;
+          i64 want = ts.tv_sec * 1000000000LL + ts.tv_nsec;
+          i64 left = want > now ? want - now : 0;
+          if (left == 0)
+            return 0;
+          ts.tv_sec = left / 1000000000LL;
+          ts.tv_nsec = left % 1000000000LL;
+        }
         (void)syscall_sleep_timespec(&ts, 0);
         return 0;
       }
@@ -10859,16 +10878,18 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     u64 mono_ns = (clk_id == 6 || clk_id == 5) ? 0 : arch_tsc_monotonic_ns();
 
     if (clk_id == 1 || clk_id == 4 ||
-        clk_id == 6 || clk_id == 7) {
-      if (mono_ns) {
-        ktp.tv_sec = (i64)(mono_ns / 1000000000ull);
-        ktp.tv_nsec = (i64)(mono_ns % 1000000000ull);
-      } else {
+        clk_id == 6 || clk_id == 7 || clk_id == 9) {
+      if (!mono_ns) {
         u64 tsec = 0, tnsec = 0;
         sc_ticks_to_time(ticks, &tsec, &tnsec, 1000000000ull);
-        ktp.tv_sec = (i64)tsec;
-        ktp.tv_nsec = (i64)tnsec;
+        mono_ns = tsec * 1000000000ull + tnsec;
       }
+      /* M123: a time namespace shifts these clocks, and only these. */
+      i64 shifted = (i64)mono_ns + namespace_clock_offset(clk_id);
+      if (shifted < 0)
+        shifted = 0;
+      ktp.tv_sec = shifted / 1000000000LL;
+      ktp.tv_nsec = shifted % 1000000000LL;
     } else {
       /* CLOCK_REALTIME / CLOCK_REALTIME_COARSE: epoch-based wall clock, taken
        * whole from one source. Composing the seconds from the tick counter and

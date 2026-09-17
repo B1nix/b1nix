@@ -6786,6 +6786,13 @@ static void reparent_children_and_signal_orphans(struct task *exiting) {
     struct task *child = T(i);
     if (child->state != TASK_UNUSED && child->parent_id == exiting->id) {
       child->parent_id = find_new_reaper(exiting, child->id);
+      /* A child that is already a zombie told its OLD parent, which is going
+       * away: the adopter has to hear about it, or nothing ever reaps it
+       * (Linux reparent_leader). */
+      if (child->state == TASK_DEAD && !task_is_thread(child)) {
+        post_sigchld_to_parent(child->parent_id, 0);
+        scheduler_notify_wait_event(child->parent_id);
+      }
       /* Deliver the parent-death signal before the child is reparented to
        * init, which is the only moment at which "my parent died" is still a
        * fact rather than history. */

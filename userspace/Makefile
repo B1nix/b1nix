@@ -354,6 +354,8 @@ BINARIES += $(BUILD)/bin/m100_smoke
 # M119: Developer-Centric Filesystems (fwcfgfs, debugfs, tarfs)
 BINARIES += $(BUILD)/bin/m119_smoke
 BINARIES += $(BUILD)/bin/m63_smoke
+# M123: user, PID, IPC, cgroup and time namespaces.
+BINARIES += $(BUILD)/bin/m123_smoke
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke
 BINARIES += $(BUILD)/bin/m46_smoke
 BINARIES += $(BUILD)/bin/m73_smoke

@@ -302,6 +302,10 @@ int vmm_map_range_try(u64 base, const u64 *frames, usize n, u64 flags);
 /* Lazy marker plus the protection its page will get when it faults in. */
 void vmm_set_lazy_flags(u64 virtual_address, u64 flags);
 void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address);
+/* Point one user page of another address space at `physical_address` (the
+ * frame reference is the caller's to manage). */
+void paging_set_page_in_space(u64 pml4_phys, u64 virtual_address,
+                              u64 physical_address, u64 flags);
 /* Move a range's leaf page-table entries to another address in the current
  * address space, leaving the pages themselves where they are. The destination
  * must already be mapped (lazily is enough) so no table has to be allocated. */
