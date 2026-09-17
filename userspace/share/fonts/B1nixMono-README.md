@@ -51,4 +51,3 @@ Use `specimens/multiscript-sample.txt` to verify system fallback behavior.
 - `dist/` - generated binaries
 - `specimens/terminal-sample.txt` - sample terminal text
 - `specimens/multiscript-sample.txt` - Unicode fallback sample
-- `docs/unicode-strategy.md` - multiscript support approach

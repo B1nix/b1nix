@@ -1199,7 +1199,7 @@ int vmf_fs_error(int err)
 /*
  * RAID-6 parity, and RAID-5's XOR.
  *
- * lib/raid6 is not imported (see docs/linuxkpi-fs.md), so these have no
+ * lib/raid6 is not imported (see docs/filesystems-and-storage.md), so these have no
  * implementation. They PANIC rather than doing nothing: a silent no-op would
  * write a stripe whose parity is zeros, which reads back fine until a disk
  * fails and then reconstructs garbage. Failing at the first raid5/raid6 write

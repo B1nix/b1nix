@@ -547,7 +547,7 @@ if is_systemd_profile; then
 	#
 	# NOT serial-getty@ttyS0.service: it is BoundTo=dev-ttyS0.device, and a
 	# .device unit becomes active only once udev tells systemd about the device
-	# (see docs/debian-systemd-boot.md). console-getty.service is systemd's own
+	# (no udev in that path). console-getty.service is systemd's own
 	# unit for this case — what a container gets — and depends on nothing but
 	# /dev/console existing.
 	mkdir -p "$ROOTFS/etc/systemd/system/getty.target.wants"

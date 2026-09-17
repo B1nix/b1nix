@@ -28,7 +28,7 @@ the seventh (`display/intel_acpi.c`) is
 finish if any other `GPL-2.0`-only file appears outside the selftests, so this
 stays a decision someone made rather than something discovered later.
 
-The DRM core is **imported and never edited** — see [`docs/drm-import.md`](docs/drm-import.md).
+The DRM core is **imported and never edited** — see [`docs/drivers-and-graphics.md`](docs/drivers-and-graphics.md).
 `tools/drm/fetch-drm-core.sh` pins the release and verifies the checksum before
 extracting, the same way the port scripts under `tools/ports/` pin theirs.
 Linux's `include/linux` is not staged wholesale: the interfaces the imports

@@ -9,8 +9,17 @@ default image) and Debian (the glibc ABI lane). The repository keeps the kernel,
 its tests, the image and test scripts, and `b1cc`. See M121.
 
 AArch64 is a second target of this same kernel, not a milestone: each gap
-belongs to the milestone that owns the mechanism. See
-[aarch64-parity.md](aarch64-parity.md).
+belongs to the milestone that owns the mechanism.
+
+What the finished milestones built is described by subject, a few milestones
+per guide: [platforms.md](platforms.md) (targets, AArch64, distribution
+userspace), [memory-and-scheduling.md](memory-and-scheduling.md),
+[processes-and-system-calls.md](processes-and-system-calls.md),
+[filesystems-and-storage.md](filesystems-and-storage.md),
+[networking.md](networking.md),
+[isolation-and-security.md](isolation-and-security.md) and
+[drivers-and-graphics.md](drivers-and-graphics.md). Build rules are in
+[build-conventions.md](build-conventions.md).
 
 ## Closed milestones
 
@@ -102,7 +111,6 @@ belongs to the milestone that owns the mechanism. See
 | M80 Kernel ptrace + Crash Capture | done | Full `ptrace(2)`, Yama, `/proc/<pid>/task`, XSAVE state, crash capture, fork child cmdline. |
 | M81 Chromium GPU Acceleration | cancelled | Userspace (M121); the kernel side is M101/M102. |
 | M82 System NSS / Kerberos | cancelled | Userspace libraries come from the distribution (M121). |
-| Milestone | Status | Summary |
 | M83 Unicode ctype | done | Provided by musl (M92). |
 | M84 IP routing + TCP | done | IPv4/IPv6 FIB, policy routing, ECMP, SACK, window scale, DHCPv6. |
 | M85 libc Tier-A pass | retired | — |
@@ -118,21 +126,21 @@ belongs to the milestone that owns the mechanism. See
 | M95 LKM framework | done | W^X module loader, init/finit/delete_module, fs/HDA modules. |
 | M96 LKM network + params | done | Protocol registry, module params, modules.dep/alias, IPv6 as module. |
 | M97 GNU-free ISO | done | Limine ISO. |
-| M98 Driver Infrastructure | done | netconsole, PAT/WC, PCI caps, MSI/MSI-X, stolen memory decode. See [driver-infrastructure.md](driver-infrastructure.md). |
+| M98 Driver Infrastructure | done | netconsole, PAT/WC, PCI caps, MSI/MSI-X, stolen memory decode. |
 | M99 linuxkpi layer | done | Own headers: idr, workqueue, dma-mapping, bounce, IOMMU-aware. |
 | M100 DRM Core | done | dma-fence, GPU scheduler, sg-backed GEM on virtio-gpu. |
 | M100a DMA bounce pool | done | Boot-reserved <4 GiB pool with stats. |
 | M100b IOMMU (VT-d) | done | DMAR, second-level tables, NVMe domain, fault blocking. |
 | M100c IOMMU domains/IR | done | Per-device domains, ACS/ARI grouping, interrupt remapping. |
 | M100d AMD-Vi | done | IVRS, device table, command ring, NVMe in translated domain. |
-| M101 linuxkpi for DRM | done | Upstream DRM core unmodified; atomic commits, `/dev/dri/card1`, master lease; virgl GLES on the host GPU draws a composed frame (`RENDER-SMOKE: ok accel-frame`, see [render-path.md](render-path.md)). |
-| M102a Intel i915 + Mesa iris | done | i915 from Linux 6.18.51 unmodified; sway on iris on the passed-through UHD 630 and on a UHD 620 laptop panel over PXE; fence arrays for multi-fence flips. See [i915-gen9-passthrough.md](i915-gen9-passthrough.md). |
+| M101 linuxkpi for DRM | done | Upstream DRM core unmodified; atomic commits, `/dev/dri/card1`, master lease; virgl GLES on the host GPU draws a composed frame (`RENDER-SMOKE: ok accel-frame`). |
+| M102a Intel i915 + Mesa iris | done | i915 from Linux 6.18.51 unmodified; sway on iris on the passed-through UHD 630 and on a UHD 620 laptop panel over PXE; fence arrays for multi-fence flips. |
 | M104 Alpine packages | done | From-source ports replaced by pinned Alpine packages; `bpkg` retired. |
 | M105 PAM | done | OpenPAM + `pam_unix.so`; dropbear authenticates through PAM. |
 | M106 DNS resolver | done | Outbound name resolution, `/dev/fd`, `/proc/self/fd/N`, 64 KiB pipes. |
 | M107 BusyBox applets blocked on kernel subsystems | done | Netlink route, VTs, loop, kmsg, inotify, RTC, watchdog, SMBus; MTD/UBI `wontfix`. |
 | M108 Hand base tools to BusyBox | done | BusyBox `su`/`passwd`/`login`, BusyBox init as PID 1 with OpenRC. |
-| M109 Alpine applet parity | done | 283 of 321 applets; AF_PACKET, VLAN/bridge/bond/gretap, veth and four namespace kinds, pivot_root, `mdev` uevents; per-namespace TCP/UDP, several IPv4 addresses, IPv6 state, `udhcpc`. See [network-namespaces.md](network-namespaces.md). |
+| M109 Alpine applet parity | done | 283 of 321 applets; AF_PACKET, VLAN/bridge/bond/gretap, veth and four namespace kinds, pivot_root, `mdev` uevents; per-namespace TCP/UDP, several IPv4 addresses, IPv6 state, `udhcpc`. |
 | M110 Unix block-device names | done | `sda`/`vda`/`nvme0n1` from enumeration; device selection by bus/content. |
 | M111 Debian userspace and Linux-shaped boot log | done | Debian bookworm boots unmodified; levelled, timestamped kernel log. |
 | M112 systemd as PID 1 | done | Debian systemd 252 reaches `graphical.target`; cgroup v2, mount propagation, devtmpfs, Weston on DRM, PCI driver links. |
@@ -143,8 +151,10 @@ belongs to the milestone that owns the mechanism. See
 | M117 nice in the scheduler | done | Stride weights by nice on every CPU; APs preempt ring-3 ticks. |
 | M118 Arch Linux userspace | cancelled | Duplicated the Debian lane (M121); the kernel faults it found stay fixed. |
 | M119 Ask the processor instead of guessing | done | Real CPU name, `RNDR`, PARange, TSC from CPUID, cpuinfo flags/Features. |
-| M120 Linux's own filesystems, through linuxkpi | done | btrfs, ext4 and jbd2 from Linux 6.18.51 unpatched (moved from 6.6 with the DRM core and i915); btrfs root on both arches, ext2/3/4 are the imported ext4, native ext drivers removed. See [linuxkpi-fs.md](linuxkpi-fs.md). |
+| M120 Linux's own filesystems, through linuxkpi | done | btrfs, ext4 and jbd2 from Linux 6.18.51 unpatched (moved from 6.6 with the DRM core and i915); btrfs root on both arches, ext2/3/4 are the imported ext4, native ext drivers removed. |
 | M121 Kernel only | done | Own userspace replaced by Alpine and Debian packages, native syscall ABI archived (`archive/kernel/native-abi/`); self-hosted kernel boots; Debian glibc lane 41/41; aarch64 wedges, zstd btrfs and a dentry-list heap corruption fixed. |
+| M122 Known corruption and SMP defects | done | Block-cache writeback claims, PMM metadata off the AP trampoline, page-cache insert race, task claim by lease CAS, no double reap; proven by `fsverify` at 6 CPUs (14/14) and soak runs. |
+| M123 Namespaces for containers | done | User, IPC, cgroup, PID (real init) and time namespaces; mount table tracks attachment for binds and `pivot_root`; `unshare`, `bwrap`, rootless `podman` and `systemd-nspawn` run. |
 
 ## M102b: amdgpu on RX 6600 (render-only) + radeonsi
 
@@ -156,28 +166,9 @@ belongs to the milestone that owns the mechanism. See
 
 - [ ] `planned` Pick generation (pre-Turing without signed firmware vs GSP); import unmodified, fix the shim.
 
-## M122: Close the known corruption and SMP defects
-
-Details and evidence: [m122-corruption-and-smp.md](m122-corruption-and-smp.md).
-
-- [x] `done` Block cache: a multi-sector write lost its tail (unclaimed single-block writeback, invalidate during I/O, a sync returning early) and write-back could drop its anchor block; with them, truncate dropping the straddling page and ext4 directories losing entries to a cursor bit.
-- [x] `done` Memory ownership: PMM metadata no longer sits under the AP trampoline, an exec staging buffer is claimed before it is freed, and out of memory is ENOMEM rather than a panic.
-- [x] `done` Scheduler: a task is claimed by CAS on its kernel-stack lease; a dead task delivers no more signals, so `waitpid` and the reaper can no longer both reap it (a physical-frame double free, and the likely source of the old overwritten-stack `#GP`); pinned CPU-bound threads no longer starve a woken task.
-- [x] `done` Proof at 6 CPUs with the filesystems' own tools (`tools/run/soak/fsverify.sh`: `e2fsck`, `btrfs check --check-data-csum`, host-side extraction): 14/14 heavy fsverify, 10/10 `soak all`, 26/26 `gfx` soak.
-- [x] `done` Watched, not reproduced: two events seen only with the host overcommitted 3x (a shootdown-lock lockup, now reported with the round in flight; a `BCACHE-TEST` stall) and the i915 probe lockup (0/30, kept in [i915-gen9-passthrough.md](i915-gen9-passthrough.md)).
-
-## M123: Namespaces complete enough for containers
-
-Details and known gaps: [m123-namespaces.md](m123-namespaces.md).
-
-- [x] `done` User namespaces: uid/gid maps with Linux's write rules, capabilities scoped to the owning namespace, `setgroups` rules; mounts, ptrace, kill and `prlimit` checked against the owning namespace.
-- [x] `done` IPC namespaces for SysV IPC and POSIX mqueue (an `mqueue` filesystem per namespace); cgroup namespaces rooting `/sys/fs/cgroup` at the caller's cgroup.
-- [x] `done` `CLONE_NEWPID` on `clone`/`clone3` with a real per-namespace PID 1 (orphan reaping, signal protection, kill-on-exit), per-mount procfs; time namespaces for the monotonic and boot clocks.
-- [x] `done` Proof with distribution tools on x86_64 and aarch64: `unshare -Urpf`, `nsenter`, `bwrap --unshare-all` and rootless `podman`+`crun` as an unprivileged user; `systemd-nspawn` in the Debian lane. Closes M63.
-
 ## M124: Missing modern system calls
 
-Per-call state: [m124-modern-syscalls.md](m124-modern-syscalls.md).
+Per-call state: [processes-and-system-calls.md](processes-and-system-calls.md).
 
 - [x] `done` Process and threading: `openat2` (`RESOLVE_*`), `pidfd_getfd`, `kcmp`, futex2 (`futex_waitv`, `futex_wake`, `futex_wait`), `process_mrelease`, `process_madvise`, `sched_setattr`/`sched_getattr`.
 - [ ] `partial` Security: the key retention service (`keyctl`, `add_key`, `request_key`) and Landlock (ABI 3, filesystem rights enforced in the VFS and on exec) are implemented; protection keys answer as a CPU without them, and `memfd_secret` is not implemented (it needs pages removed from the kernel direct map).

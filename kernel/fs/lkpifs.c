@@ -4,7 +4,7 @@
  * The bridge, b1nix side: a VFS filesystem served by imported Linux code.
  *
  * `mount -t btrfs /dev/sda /mnt` mounts a real btrfs with the unmodified
- * Linux filesystem compiled into this kernel (see docs/linuxkpi-fs.md), and
+ * Linux filesystem compiled into this kernel (see docs/filesystems-and-storage.md), and
  * every path under it is served by that code — open, read, write, readdir,
  * create, unlink, rename and the rest.
  *

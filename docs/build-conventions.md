@@ -1,9 +1,17 @@
 # Build and smoke conventions
 
-## 1. A per-file tool loop must be skippable
+Three rules that keep the build fast and the smoke results honest.
 
-Recipes that run `readelf`/`nm`/etc. once per file over hundreds of files
-dominate no-op build time. Guard them with a stamp:
+## A per-file tool loop must be skippable
+
+A recipe that runs `readelf`, `nm` or a similar tool once per file over
+hundreds of files dominates the time of a build that has nothing to do. Guard
+such a loop with a stamp file under `$(BUILD_DIR)`, so that wiping the build
+tree redoes the work. Skip the loop only when the destination still exists and
+the newest input is not newer than the stamp. Compare just the newest input
+(`ls -t | head -1`), which costs one stat sweep. The existing examples are
+`$(PKGROOT)/.installed`, `.pkg-libs.stamp`, `.soname-copies.stamp` and
+`.soname-prune.stamp`:
 
 ```make
 	@stamp="$(BUILD_DIR)/.my-step.stamp"; \
@@ -16,24 +24,17 @@ dominate no-op build time. Guard them with a stamp:
 	touch "$$stamp"
 ```
 
-- Stamp under `$(BUILD_DIR)`, so wiping the build tree redoes the work.
-- Check the destination exists, so removed output is regenerated.
-- Compare only the newest input (`ls -t | head -1`): one stat sweep.
+## A smoke lane states its identity
 
-Existing examples: `$(PKGROOT)/.installed`, `.pkg-libs.stamp`,
-`.soname-copies.stamp`, `.soname-prune.stamp`.
+A lane's name defaults to `B1NIX_ISO_NAME`, which works only while every lane
+has an image of its own. A lane that boots another lane's image (as `sysnet`
+boots `sys`'s) must set `SMOKE_LANE` itself. Otherwise its markers are graded
+as the other lane's, and all of its own checks look missing.
 
-## 2. A smoke lane states its identity
+## No kernel wait is bounded in wall-clock time
 
-Lane names default to `B1NIX_ISO_NAME`, which only works when each lane has its
-own image. A lane that reuses another's image (e.g. `sysnet` on `sys`'s) must
-set `SMOKE_LANE` explicitly; otherwise its markers are graded as the other lane
-and its own checks all appear "missing".
-
-## 3. No kernel wait is bounded in wall-clock time
-
-On a busy host, guest vCPUs get a fraction of a core. Timeouts in the kernel
-must subtract stolen time: `serial_silence_watchdog()`
-(`kernel/sched/scheduler.c`) measures silence as ticks minus `g_stolen_ticks`.
-A genuinely wedged guest accrues no steal and is still caught. Before calling a
-failure "host flakiness", check whether the check measured wall time.
+On a busy host a guest's vCPUs get only a fraction of a core, so a timeout
+inside the kernel has to subtract stolen time. `serial_silence_watchdog()` in
+`kernel/sched/scheduler.c` measures silence as ticks minus `g_stolen_ticks`: a
+guest that is really wedged accrues no steal and is still caught. Before calling
+a failure host flakiness, check whether the failing check measured wall time.

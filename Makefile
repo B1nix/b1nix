@@ -1177,7 +1177,7 @@ FS_IMPORT_OBJECTS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(FS_IMPORT_SOURCES))
 # these filesystems with GCC, where both are warnings, and relies on it: a
 # `u64 *` handed a `loff_t *`, and a struct first named inside a
 # function-pointer parameter list. Both are upstream's own code and neither can
-# be fixed without editing it. See docs/linuxkpi-fs.md.
+# be fixed without editing it. See docs/filesystems-and-storage.md.
 #
 # The two generated headers are force-included: the tracepoint no-ops the
 # generator derived from the pinned source, and the forward declarations for
@@ -1682,8 +1682,8 @@ $(PAM_LIB): $(PKG_DEPS)
 # Alpine's package, not a from-source port: it is the same zlib, built for the
 # same musl and the same architecture, and taking it deletes a build script
 # along with the duty to keep it building. tools/packages/alpine-fetch.sh pins
-# every package's sha256 in tools/packages/alpine.lock. First of the migration
-# described in docs/ports-migration-plan.md.
+# every package's sha256 in tools/packages/alpine.lock; the package model is
+# summarised in docs/platforms.md.
 #
 # Both shapes come down: libz.so.1 is what binaries link and what the image
 # carries, and libz.a is still wanted by the ports that have not moved yet

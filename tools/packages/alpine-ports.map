@@ -11,7 +11,7 @@
 # nothing — tools/packages/alpine-fetch.sh fails on exactly that rather than
 # letting the linker fall back to the static archive.
 #
-# Read by tools/packages/pkg-prefix.sh. See docs/ports-migration-plan.md.
+# Read by tools/packages/pkg-prefix.sh. See docs/platforms.md.
 
 musl          musl musl-dev linux-headers
 zlib          zlib zlib-dev zlib-static

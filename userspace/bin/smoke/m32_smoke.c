@@ -804,7 +804,7 @@ static int curl_fetch(const char *url, const char *family) {
    * reproduced): the stuck curl is spinning in userspace, so the poller
    * competes with it for the one CPU this arch has instead of letting it run
    * out. The stall this was meant to bound is a real defect — see
-   * docs/aarch64-parity.md — and it belongs in the kernel, not here. */
+   * docs/platforms.md — and it belongs in the kernel, not here. */
   int st = 0;
   waitpid(pid, &st, 0);
   return WIFEXITED(st) ? WEXITSTATUS(st) : -1;

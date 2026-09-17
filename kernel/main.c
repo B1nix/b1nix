@@ -1720,7 +1720,7 @@ void kernel_main(usize arg0, usize arg1)
 	 * measured rather than assumed: with it on the suite scores 900-1300 of
 	 * ~1370 with wide variance, against 1369 and no blocked checks with it
 	 * off. The corruption behind that has not been found (open item in
-	 * docs/aarch64-parity.md). b1nix.ap-userspace turns it on for work on
+	 * docs/platforms.md). b1nix.ap-userspace turns it on for work on
 	 * the bug. */
 #if defined(__aarch64__)
 	if (bootinfo_has_flag("b1nix.ap-userspace"))

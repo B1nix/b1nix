@@ -1455,7 +1455,7 @@ void paging_switch_address_space(u64 pml4_phys) {
  * existing later (e1000 read its MAC at probe, then took a level-3 translation
  * fault on the same registers from process context). Several address-space
  * bugs have been fixed since; if it returns, the thing to chase is who frees
- * the tables — see docs/aarch64-parity.md. */
+ * the tables — see docs/platforms.md. */
 #define MMIO_WINDOW_BASE 0x6800000000ULL /* 416 GiB */
 #define MMIO_WINDOW_END  0x7000000000ULL /* 448 GiB */
 

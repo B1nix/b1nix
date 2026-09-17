@@ -278,7 +278,7 @@ sync_el0:
 	// DRM event span the CPU forever with the event's sender unable to run.
 	//
 	// This is the SVC path only. The fault vectors stay masked on purpose —
-	// see docs/aarch64-parity.md on why blocking work must not happen there.
+	// see docs/platforms.md on why blocking work must not happen there.
 	msr daifclr, #2
 
 	bl syscall_dispatch_impl
