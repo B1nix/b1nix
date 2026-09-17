@@ -366,6 +366,11 @@ struct vfs_inode {
    * to enter — a stored 2 says "fewer than . and .. alone", which fails its
    * check and kills the process. NULL everywhere else. */
   void (*getattr_cb)(struct vfs_node *node);
+  /* Bring uid/gid up to date before a permission decision, for a synthetic
+   * file whose owner follows something live (every file under /proc/<pid> belongs to the
+   * task's effective ids). Only ownership: unlike getattr_cb it must not
+   * touch anything a concurrent writer relies on, such as the size. */
+  void (*owner_cb)(struct vfs_node *node);
   isize (*write_cb)(struct vfs_node *node, u64 offset, const char *buffer,
                     usize size, int flags);
   int (*create_cb)(struct vfs_node *dir, const char *name,

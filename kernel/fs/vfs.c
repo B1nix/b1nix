@@ -1494,9 +1494,9 @@ int vfs_check_access(struct vfs_node *node, int requested_access) {
   if (!cred)
     return -EACCES;
   /* A synthetic filesystem whose owner follows something live (/proc/<pid>)
-   * brings the inode up to date first. */
-  if (node->inode && node->inode->getattr_cb)
-    node->inode->getattr_cb(node);
+   * brings the inode's ownership up to date first. */
+  if (node->inode && node->inode->owner_cb)
+    node->inode->owner_cb(node);
   if (vfs_get_node_perm(node, cred, (u32)requested_access)) {
     return 0;
   }

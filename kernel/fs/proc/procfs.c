@@ -414,6 +414,7 @@ static struct vfs_node *procfs_mkchild(struct vfs_node *parent,
   n->inode->uid = 0;
   n->inode->gid = 0;
   n->inode->getattr_cb = procfs_owner_getattr;
+  n->inode->owner_cb = procfs_owner_getattr;
   n->inode->nlink = (type == VFS_DIRECTORY) ? 2 : 1;
   /* A /proc file is served through a device-style read callback, but to
    * anyone who stats it it is a REGULAR FILE — that is what it is on Linux,
@@ -2933,6 +2934,7 @@ static void procfs_make_ns_link(struct vfs_node *dir, const char *name) {
   n->inode->read_cb = procfs_ns_readlink;
   n->inode->magic_link_cb = procfs_ns_magic;
   n->inode->getattr_cb = procfs_owner_getattr;
+  n->inode->owner_cb = procfs_owner_getattr;
   n->inode->size = 32;
   n->inode->mode = 0777;
   n->inode->nlink = 1;
