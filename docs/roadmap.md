@@ -83,7 +83,7 @@ belongs to the milestone that owns the mechanism. See
 | M60 Ozone Platform | cancelled | Headless Ozone done; browser ports left the tree with M121 (Chromium comes from the distribution). |
 | M61 Chromium Build Target | cancelled | Own Chromium build dropped in M121; Alpine's Chromium runs on the kernel (M102). |
 | M62 content_shell | cancelled | Superseded by the distribution's browser (M121). |
-| M63 Sandbox | partial | seccomp-bpf, NO_NEW_PRIVS, mount/UTS/net namespaces (clone and unshare), unshare-shaped pid namespaces; user, IPC and cgroup namespaces and `CLONE_NEWPID` on clone are refused. |
+| M63 Sandbox | done | seccomp-bpf, NO_NEW_PRIVS, every namespace kind; completed by M123. |
 | M64 Clang/LLVM Toolchain | done | Cross clang++, native in-QEMU clang. |
 | M65 Install to Disk | cancelled | Installer and disk-image script removed in M121; a distribution installs itself. |
 | M66 Chromium Frontend | cancelled | Userspace; superseded by the distribution's browser (M121). |
@@ -168,10 +168,12 @@ Details and evidence: [m122-corruption-and-smp.md](m122-corruption-and-smp.md).
 
 ## M123: Namespaces complete enough for containers
 
-- [ ] `planned` User namespaces: uid/gid maps, capabilities scoped to the owning namespace, `setgroups` rules; the prerequisite for rootless containers and an unprivileged Chromium sandbox.
-- [ ] `planned` IPC namespaces for SysV IPC and POSIX mqueue; cgroup namespaces rooting `/sys/fs/cgroup` at the caller's cgroup.
-- [ ] `planned` `CLONE_NEWPID` on `clone`/`clone3` with a real per-namespace PID 1 (orphan reaping, kill-on-exit of the namespace) instead of the unshare-only shape; time namespaces.
-- [ ] `planned` Proof with distribution tools: `bwrap`, rootless `podman`, `systemd-nspawn`, `unshare -Urpf`; closes M63.
+Details and known gaps: [m123-namespaces.md](m123-namespaces.md).
+
+- [x] `done` User namespaces: uid/gid maps with Linux's write rules, capabilities scoped to the owning namespace, `setgroups` rules; mounts, ptrace, kill and `prlimit` checked against the owning namespace.
+- [x] `done` IPC namespaces for SysV IPC and POSIX mqueue (an `mqueue` filesystem per namespace); cgroup namespaces rooting `/sys/fs/cgroup` at the caller's cgroup.
+- [x] `done` `CLONE_NEWPID` on `clone`/`clone3` with a real per-namespace PID 1 (orphan reaping, signal protection, kill-on-exit), per-mount procfs; time namespaces for the monotonic and boot clocks.
+- [x] `done` Proof with distribution tools on x86_64 and aarch64: `unshare -Urpf`, `nsenter`, `bwrap --unshare-all` and rootless `podman`+`crun` as an unprivileged user; `systemd-nspawn` in the Debian lane. Closes M63.
 
 ## M124: Missing modern system calls
 

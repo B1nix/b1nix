@@ -7406,7 +7406,8 @@ int vfs_move_mount(const char *source, const char *target) {
       return -EINVAL;
   }
 
-  struct vfs_node *src_node = vfs_find_node(src);
+  u64 src_mnt = 0;
+  struct vfs_node *src_node = vfs_find_node_mnt(src, &src_mnt);
   if (IS_ERR(src_node))
     return (int)PTR_ERR(src_node);
   u64 dst_mnt = 0;
@@ -7424,12 +7425,20 @@ int vfs_move_mount(const char *source, const char *target) {
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 
+  /* The mount the source path resolves to. Several can share a root node --
+   * systemd binds "/" recursively onto /run/systemd/unit-root and then moves
+   * that bind to "/" -- and taking the first one with the right root moved the
+   * machine's root mount instead of the bind. */
   int midx = -1;
   for (usize i = 0; i < mount_hwm; i++) {
-    if (mounts[i].used && mounts[i].root_node == src_node) {
+    if (!mount_visible(i) || mounts[i].root_node != src_node)
+      continue;
+    if (src_mnt && mounts[i].seq == src_mnt) {
       midx = (int)i;
       break;
     }
+    if (midx < 0 && !src_mnt)
+      midx = (int)i;
   }
   if (midx < 0) {
     __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
