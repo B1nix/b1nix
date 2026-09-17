@@ -625,7 +625,7 @@ static const struct lx_map lx_table[] = {
 	{LX_setresuid,       SYS_SETRESUID,     "setresuid"},
 	{LX_setresgid,       SYS_SETRESGID,     "setresgid"},
 	/* mount takes (source, target, fstype, flags[, data-ignored]);
-	 * umount2's flags argument is ignored by sys_umount. */
+	 * umount2 passes its flags (MNT_DETACH, ...) through to sys_umount. */
 	{LX_pivot_root,      SYS_PIVOT_ROOT,    "pivot_root"},
 	/* readahead(fd, offset, count): same three arguments on both ABIs. */
 	{LX_readahead,       SYS_READAHEAD,     "readahead"},

@@ -852,6 +852,52 @@ static int r_sys_osrelease(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/sys/kernel/overflow{uid,gid}: the id a user namespace reports for a
+ * kernel id it has no mapping for (bubblewrap reads both before it maps). */
+static int r_sys_overflowuid(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%u\n", UID_OVERFLOW);
+  return 0;
+}
+
+static int r_sys_overflowgid(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%u\n", GID_OVERFLOW);
+  return 0;
+}
+
+/* /proc/sys/user/max_<kind>_namespaces: how many namespaces of each kind can
+ * exist besides the initial one. */
+static int r_sys_max_ns(usize pid, struct sbuf *s, u32 max) {
+  (void)pid;
+  sb_addf(s, "%u\n", max - 1);
+  return 0;
+}
+static int r_sys_max_user_ns(usize p, struct sbuf *s) {
+  return r_sys_max_ns(p, s, NS_MAX_USER);
+}
+static int r_sys_max_pid_ns(usize p, struct sbuf *s) {
+  return r_sys_max_ns(p, s, NS_MAX_PID);
+}
+static int r_sys_max_ipc_ns(usize p, struct sbuf *s) {
+  return r_sys_max_ns(p, s, NS_MAX_IPC);
+}
+static int r_sys_max_mnt_ns(usize p, struct sbuf *s) {
+  return r_sys_max_ns(p, s, NS_MAX_MNT);
+}
+static int r_sys_max_net_ns(usize p, struct sbuf *s) {
+  return r_sys_max_ns(p, s, NS_MAX_NET);
+}
+static int r_sys_max_uts_ns(usize p, struct sbuf *s) {
+  return r_sys_max_ns(p, s, NS_MAX_UTS);
+}
+static int r_sys_max_cgroup_ns(usize p, struct sbuf *s) {
+  return r_sys_max_ns(p, s, NS_MAX_CGROUP);
+}
+static int r_sys_max_time_ns(usize p, struct sbuf *s) {
+  return r_sys_max_ns(p, s, NS_MAX_TIME);
+}
+
 static int r_sys_pid_max(usize pid, struct sbuf *s) {
   (void)pid;
   sb_addf(s, "%lu\n", (unsigned long)scheduler_max_tasks());
@@ -1080,6 +1126,18 @@ static int r_sysvipc_msg(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* The per-mount options mounts and mountinfo print: access mode first, then
+ * the flags that restrict it. Tools read them back to remount with "the flags
+ * it already has plus one" (bubblewrap does for every bind), and a flag missing
+ * here is a flag such a remount tries to clear. */
+static const char *mount_opts(u64 flags, char *buf, usize len) {
+  snprintf(buf, len, "%s%s%s%s", (flags & MS_RDONLY) ? "ro" : "rw",
+           (flags & MS_NOSUID) ? ",nosuid" : "",
+           (flags & MS_NODEV) ? ",nodev" : "",
+           (flags & MS_NOEXEC) ? ",noexec" : "");
+  return buf;
+}
+
 static int r_mounts(usize pid, struct sbuf *s) {
   (void)pid;
   usize cap = vfs_mount_capacity();
@@ -1092,7 +1150,8 @@ static int r_mounts(usize pid, struct sbuf *s) {
     const char *src = ents[i].source[0] ? ents[i].source : "none";
     const char *tgt = ents[i].target[0] ? ents[i].target : "/";
     const char *fstype = ents[i].fstype[0] ? ents[i].fstype : "none";
-    const char *opts = (ents[i].flags & B1NIX_MS_RDONLY) ? "ro" : "rw";
+    char ob[32];
+    const char *opts = mount_opts(ents[i].flags, ob, sizeof(ob));
     /* device mountpoint fstype options dump pass */
     sb_addf(s, "%s %s %s %s 0 0\n", src, tgt, fstype, opts);
   }
@@ -1117,7 +1176,8 @@ static int r_mountinfo(usize pid, struct sbuf *s) {
     const char *src = ents[i].source[0] ? ents[i].source : "none";
     const char *tgt = ents[i].target[0] ? ents[i].target : "/";
     const char *fstype = ents[i].fstype[0] ? ents[i].fstype : "none";
-    const char *opts = (ents[i].flags & B1NIX_MS_RDONLY) ? "ro" : "rw";
+    char ob[32];
+    const char *opts = mount_opts(ents[i].flags, ob, sizeof(ob));
     int maj = 0, min = (int)i;
     const char *devname = src;
     if (strncmp(devname, "/dev/", 5) == 0)
@@ -2603,12 +2663,12 @@ static isize procfs_self_readlink(struct vfs_node *node, u64 offset, char *buf,
   if (!vpid)
     return -ENOENT;
 
-  /* Absolute, where Linux writes a bare pid. A relative target has to be
-   * resolved against the directory the link sits in, and this resolver starts
-   * from the root instead -- so "36" looked for /36, found nothing, and handed
-   * back the root directory rather than an error. Naming the whole path costs
-   * a reader nothing and removes the question. */
-  snprintf(num, sizeof(num), "/proc/%lu", (unsigned long)vpid);
+  /* A bare number, as Linux writes it: relative to the directory the link
+   * sits in. An absolute "/proc/<n>" named the instance by where proc happens
+   * to be mounted in the initial namespace, and stopped resolving the moment a
+   * sandbox moved it — bubblewrap reads /proc/self/fd through a /proc that is
+   * /oldroot/proc after its pivot_root. */
+  snprintf(num, sizeof(num), "%lu", (unsigned long)vpid);
   len = strlen(num);
   if (len > size)
     len = size;
@@ -3613,6 +3673,8 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
       procfs_mkchild(kern, "osrelease", VFS_DEVICE, r_sys_osrelease, 0);
       procfs_mkchild(kern, "version", VFS_DEVICE, r_version, 0);
       procfs_mkchild(kern, "pid_max", VFS_DEVICE, r_sys_pid_max, 0);
+      procfs_mkchild(kern, "overflowuid", VFS_DEVICE, r_sys_overflowuid, 0);
+      procfs_mkchild(kern, "overflowgid", VFS_DEVICE, r_sys_overflowgid, 0);
       procfs_mkchild(kern, "cap_last_cap", VFS_DEVICE, r_sys_cap_last_cap, 0);
       procfs_mkchild(kern, "threads-max", VFS_DEVICE, r_sys_threads_max, 0);
       struct vfs_node *rnd =
@@ -3637,6 +3699,24 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
                               w_sys_pipe_max);
       procfs_mkchild_writable(kern, "coredump-max-bytes", r_sys_coredump_max,
                               w_sys_coredump_max);
+    }
+    struct vfs_node *userd = procfs_mkchild(sysd, "user", VFS_DIRECTORY, 0, 0);
+    if (userd) {
+      static const struct {
+        const char *name;
+        procfs_render render;
+      } nsmax[] = {
+          {"max_user_namespaces", r_sys_max_user_ns},
+          {"max_pid_namespaces", r_sys_max_pid_ns},
+          {"max_ipc_namespaces", r_sys_max_ipc_ns},
+          {"max_mnt_namespaces", r_sys_max_mnt_ns},
+          {"max_net_namespaces", r_sys_max_net_ns},
+          {"max_uts_namespaces", r_sys_max_uts_ns},
+          {"max_cgroup_namespaces", r_sys_max_cgroup_ns},
+          {"max_time_namespaces", r_sys_max_time_ns},
+      };
+      for (usize i = 0; i < sizeof(nsmax) / sizeof(nsmax[0]); i++)
+        procfs_mkchild(userd, nsmax[i].name, VFS_DEVICE, nsmax[i].render, 0);
     }
     struct vfs_node *fsd = procfs_mkchild(sysd, "fs", VFS_DIRECTORY, 0, 0);
     if (fsd)

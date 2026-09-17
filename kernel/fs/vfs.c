@@ -173,10 +173,28 @@ struct vfs_mount_entry {
    * or nosuid mount its creator was never allowed to change (Linux
    * MNT_LOCK_READONLY and friends). */
   u64 locked_flags;
+  /* Nonzero for the mounts pivot_root(".", ".") stacked over the new root: the
+   * old root and everything that was mounted on it. They keep their spelling —
+   * the old root is still at "/", only covering the new one — so a path cannot
+   * tell them from the new root's own mounts; this can, and MNT_DETACH of "/"
+   * takes exactly this group. */
+  u32 pivot_group;
+  /* The mount this one is attached to (its `seq`; 0 when not known — a mount
+   * made through a /proc/<pid>/fd link, or placed by a pivot). A mountpoint
+   * node is not enough to say where a mount is: a bind shares its nodes with
+   * the tree it came from, so a directory can be reached through two mounts,
+   * and a mount made through one of them (bubblewrap's tmpfs on
+   * /newroot/dev, reached through a bind of "/") is not there when the walk
+   * comes in through the other (/oldroot/dev). Linux's mnt_parent. */
+  u64 parent_seq;
+  /* For a copy a recursive bind made: the seq of the entry it copies, so the
+   * copies of deeper mounts can find the copy of their parent. */
+  u64 copied_from;
 };
 /* Monotonic mount counter — see vfs_mount_entry::seq. Never reset, never
  * reused. */
 static u64 mount_seq_next = 1;
+static u32 pivot_group_next = 1;
 
 /* Sized at vfs_init() from RAM, never reallocated — see MAX_MOUNTS in vfs.h for
  * the floor, the ceiling, and why this one is sized rather than grown. Until
@@ -262,6 +280,24 @@ static usize mount_root_refs(struct vfs_node *root) {
   usize n = 0;
   for (usize i = 0; i < mount_hwm; i++)
     if (mounts[i].used && mounts[i].root_node == root)
+      n++;
+  return n;
+}
+
+/* Mount entries, in any namespace, whose root lies in the filesystem `root`
+ * belongs to. A bind mount of a subdirectory keeps the filesystem alive just
+ * as a mount of its root does: counting only entries rooted at the same node
+ * tore a tmpfs down while a bind of one of its directories was still the
+ * root of a container. */
+static usize mount_fs_refs(struct vfs_node *root) {
+  u32 fs_id = (root && root->inode) ? root->inode->fs_id : 0;
+  if (!fs_id)
+    return mount_root_refs(root);
+  usize n = 0;
+  for (usize i = 0; i < mount_hwm; i++)
+    if (mounts[i].used && mounts[i].root_node &&
+        mounts[i].root_node->inode &&
+        mounts[i].root_node->inode->fs_id == fs_id)
       n++;
   return n;
 }
@@ -368,9 +404,36 @@ static void mount_record_target(const char *target, struct vfs_node *node,
  * The machine root names itself for the same reason: a recursive bind of "/"
  * somewhere else (systemd's unit-root) must not rename "/" to that place. */
 static struct vfs_node *vfs_mount_point_of(const struct vfs_node *node) {
-  if (!node || node == root_node || node->parent)
+  if (!node || node == root_node)
     return 0;
   u32 walk_ns = vfs_current_mnt_ns();
+
+  /* The root mount names its root "/" whichever entry came first, and even
+   * when that root is a directory with a name of its own: after a pivot the
+   * new root can share its root node with a mount still in the old tree
+   * (bubblewrap binds the host "/" as the sandbox root while the host's own
+   * root sits under /oldroot, and its root is a bind of <tmpfs>/newroot), and
+   * naming it through that one walks back into the old tree and round again. */
+  for (int i = 0; i < (int)mount_hwm; i++) {
+    if (mount_visible_in(i, walk_ns) && mounts[i].root_node == node &&
+        mounts[i].mount_point == root_node &&
+        strcmp(mounts[i].target, "/") == 0)
+      return root_node;
+  }
+  if (node->parent)
+    return 0;
+  /* Next, an old root pivot_root(".", ".") stacked over "/": it is at "/" too,
+   * whatever other place its root is also mounted at. */
+  int stacked = -1;
+  for (int i = 0; i < (int)mount_hwm; i++) {
+    if (mount_visible_in(i, walk_ns) && mounts[i].root_node == node &&
+        mounts[i].pivot_group && strcmp(mounts[i].target, "/") == 0 &&
+        mounts[i].mount_point != node &&
+        (stacked < 0 || mounts[i].seq > mounts[stacked].seq))
+      stacked = i;
+  }
+  if (stacked >= 0)
+    return mounts[stacked].mount_point;
 
   for (int i = 0; i < (int)mount_hwm; i++) {
     if (!mount_visible_in(i, walk_ns) || mounts[i].root_node != node)
@@ -1410,45 +1473,71 @@ static usize tty_line_len;
  * the filesystem that was covered — `mount -t proc proc /proc` in a new mount
  * namespace listed the host's processes. Of several entries at one node the
  * one mounted last wins. Takes and returns a referenced node. */
-static struct vfs_node *vfs_follow_mounts(struct vfs_node *child, u32 walk_ns) {
+static struct vfs_node *vfs_follow_mounts(struct vfs_node *child, u32 walk_ns,
+                                          u64 *cur_mnt) {
+  /* `*cur_mnt` is the mount the walk is in (0: not known, any will do); it
+   * is updated as mounts are crossed. A NULL `cur_mnt` does not track. A mount
+   * of a node onto itself does not move the walk, but what is stacked on it
+   * hangs off it: `floor` keeps the next hop from picking it again. */
+  u64 floor = 0;
   for (int hops = 0; hops < 16; hops++) {
+    u64 cur = cur_mnt ? *cur_mnt : 0;
     int best = -1;
     for (int i = 0; i < (int)mount_hwm; i++) {
       if (!mount_visible_in(i, walk_ns) || child != mounts[i].mount_point ||
-          !mounts[i].root_node)
+          !mounts[i].root_node || mounts[i].seq <= floor)
+        continue;
+      if (cur && mounts[i].parent_seq && mounts[i].parent_seq != cur)
         continue;
       if (best < 0 || mounts[i].seq > mounts[best].seq)
         best = i;
     }
-    if (best < 0 || mounts[best].root_node == child)
+    if (best < 0)
       break;
+    if (cur_mnt)
+      *cur_mnt = mounts[best].seq;
+    if (mounts[best].root_node == child) {
+      if (!cur_mnt)
+        break;
+      floor = mounts[best].seq;
+      continue;
+    }
     struct vfs_node *root = vfs_node_get(mounts[best].root_node);
     vfs_node_put(child);
     child = root;
+    floor = 0;
   }
   return child;
 }
 
-static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node) {
+static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node,
+                                             u64 *cur_mnt) {
   if (!node || node != root_node)
     return node;
 
-  struct vfs_node *mounted_root = 0;
   u32 walk_ns = vfs_current_mnt_ns();
-
+  /* The root mount is the "/" entry attached to root_node stacked last; what
+   * pivot_root(".", ".") parked on top of it is found by following mounts from
+   * there, like any other stack. A lower old root the pivot left at "/" is
+   * under that old root, not a candidate. */
+  int best = -1;
   for (int i = 0; i < (int)mount_hwm; i++) {
-    if (mount_visible_in(i, walk_ns) && mounts[i].root_node &&
-        strcmp(mounts[i].target, "/") == 0) {
-      mounted_root = mounts[i].root_node;
-    }
+    if (!mount_visible_in(i, walk_ns) || !mounts[i].root_node ||
+        strcmp(mounts[i].target, "/") != 0 ||
+        (mounts[i].mount_point && mounts[i].mount_point != root_node) ||
+        mounts[i].pivot_group)
+      continue;
+    if (best < 0 || mounts[i].seq > mounts[best].seq)
+      best = i;
   }
-
-  if (!mounted_root || mounted_root == node)
+  if (cur_mnt)
+    *cur_mnt = best >= 0 ? mounts[best].seq : 0;
+  if (best < 0 || mounts[best].root_node == node)
     return node;
 
-  vfs_node_get(mounted_root);
+  struct vfs_node *mounted_root = vfs_node_get(mounts[best].root_node);
   vfs_node_put(node);
-  return mounted_root;
+  return vfs_follow_mounts(mounted_root, walk_ns, cur_mnt);
 }
 
 void virtio_blk_init(void);
@@ -1976,8 +2065,18 @@ void vfs_resolve_path(const char *path, char *out) {
 
 /* POSIX: Iterative path resolution with symlink loop detection to prevent stack
  * overflow */
-static struct vfs_node *
+static struct vfs_node *vfs_find_node_walk(const char *path, int follow_final,
+                                           int symlink_depth, u64 *mnt_out);
+static u32 vfs_node_type_mode(const struct vfs_node *node);
+
+static inline struct vfs_node *
 vfs_find_node_internal(const char *path, int follow_final, int symlink_depth) {
+  return vfs_find_node_walk(path, follow_final, symlink_depth, 0);
+}
+
+static struct vfs_node *
+vfs_find_node_walk(const char *path, int follow_final, int symlink_depth,
+                   u64 *mnt_out) {
   if (!root_node || !path)
     return ERR_PTR(-ENOENT);
 
@@ -2005,8 +2104,11 @@ vfs_find_node_internal(const char *path, int follow_final, int symlink_depth) {
   struct vfs_node *start = task_root ? task_root : root_node;
   vfs_node_get(start);
   struct vfs_node *current = start;
+  /* The mount the walk is in (see vfs_mount_entry::parent_seq); not known
+   * from a chroot's root or a descriptor's node until a mount is crossed. */
+  u64 cur_mnt = 0;
   if (!task_root)
-    current = vfs_cross_root_mount(current);
+    current = vfs_cross_root_mount(current, &cur_mnt);
   vfs_inode_lock_read(current->inode);
 
   /* One component, at the size a name may actually be. This was 64 while
@@ -2042,6 +2144,8 @@ restart_traversal:
       kfree(curr_path);
       kfree(parent_path);
       vfs_inode_unlock_read(current->inode);
+      if (mnt_out)
+        *mnt_out = cur_mnt;
       return current;
     }
 
@@ -2053,18 +2157,27 @@ restart_traversal:
         scheduler_yield();
       u32 walk_ns = vfs_current_mnt_ns();
 
+      /* At the root of the mount the walk is in, ".." leaves through that
+       * mount's mountpoint. */
+      int up = -1;
       for (int i = 0; i < (int)mount_hwm; i++) {
-        if (mount_visible_in(i, walk_ns) && current == mounts[i].root_node) {
-          struct vfs_node *mp = vfs_node_get(mounts[i].mount_point);
-          __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-          vfs_inode_unlock_read(current->inode);
-          vfs_node_put(current);
-          current = mp;
-          vfs_inode_lock_read(current->inode);
-          continue;
-        }
+        if (mount_visible_in(i, walk_ns) && current == mounts[i].root_node &&
+            mounts[i].mount_point && mounts[i].mount_point != current &&
+            (!cur_mnt || mounts[i].seq == cur_mnt) &&
+            (up < 0 || mounts[i].seq > mounts[up].seq))
+          up = i;
       }
-      __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+      if (up >= 0) {
+        struct vfs_node *mp = vfs_node_get(mounts[up].mount_point);
+        cur_mnt = mounts[up].parent_seq;
+        __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+        vfs_inode_unlock_read(current->inode);
+        vfs_node_put(current);
+        current = mp;
+        vfs_inode_lock_read(current->inode);
+      } else {
+        __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+      }
 
       /* ".." must not escape a chroot: at the task's root it resolves to
        * itself, exactly as it does at the real filesystem root. */
@@ -2132,7 +2245,7 @@ restart_traversal:
 
     /* find_child() already returns with refcount incremented */
     /* DOWNWARD MOUNT CROSSING */
-    child = vfs_follow_mounts(child, vfs_current_mnt_ns());
+    child = vfs_follow_mounts(child, vfs_current_mnt_ns(), &cur_mnt);
 
     vfs_inode_lock_read(child->inode);
     if (child->inode && child->inode->ino && child->inode->fs_id) {
@@ -2174,6 +2287,7 @@ restart_traversal:
       if (tgtn) {
         vfs_node_put(current);
         current = tgtn; /* referenced by the callback */
+        cur_mnt = 0;
         vfs_inode_lock_read(current->inode);
         /* Anything relative resolved from here on hangs off the node's own
          * place in the tree, not off /proc/<pid>/fd. */
@@ -2267,7 +2381,7 @@ restart_traversal:
       vfs_node_put(current);
       vfs_node_get(root_node);
       current = root_node;
-      current = vfs_cross_root_mount(current);
+      current = vfs_cross_root_mount(current, &cur_mnt);
       vfs_inode_lock_read(current->inode);
       parent_path[0] = '/';
       parent_path[1] = '\0';
@@ -2291,6 +2405,14 @@ struct vfs_node *vfs_find_node(const char *path) {
   char resolved[VFS_MAX_PATH];
   vfs_resolve_path(path, resolved);
   return vfs_find_node_internal(resolved, 1, 0);
+}
+
+/* The same, also naming the mount the node was reached in (its seq, 0 when
+ * the walk could not tell) — what a new mount on that node is attached to. */
+static struct vfs_node *vfs_find_node_mnt(const char *path, u64 *mnt) {
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(path, resolved);
+  return vfs_find_node_walk(resolved, 1, 0, mnt);
 }
 
 static struct vfs_node *vfs_find_node_no_follow(const char *path) {
@@ -2320,7 +2442,8 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
   const char *rest = path;
   struct vfs_node *current = root_node;
   vfs_node_get(current);
-  current = vfs_cross_root_mount(current);
+  u64 cur_mnt = 0;
+  current = vfs_cross_root_mount(current, &cur_mnt);
   /* Note: vfs_cross_root_mount already manages refcount correctly.
    * If it redirected, it got the new root (+1) and put the old one (-1).
    * current now holds one reference valid throughout the loop below. */
@@ -2345,7 +2468,7 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
     }
     int child_was_found = (child != NULL);
     if (child)
-      child = vfs_follow_mounts(child, vfs_current_mnt_ns());
+      child = vfs_follow_mounts(child, vfs_current_mnt_ns(), &cur_mnt);
     int is_leaf =
         (!rest || rest[0] == '\0' || (rest[0] == '/' && rest[1] == '\0'));
 
@@ -3081,6 +3204,32 @@ static void zero_init_node(void) {
       VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IWGRP | VFS_IROTH | VFS_IWOTH;
 }
 
+/* /dev/full: reads like /dev/zero, and every write fails with ENOSPC — what a
+ * program's disk-full handling is tested against. Sandboxes (bubblewrap's
+ * --dev) bind it into the tree they build along with null and zero. */
+static isize full_write(struct vfs_node *node, u64 offset, const char *buffer,
+                        usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)buffer;
+  (void)flags;
+  return size ? -ENOSPC : 0;
+}
+
+static void full_init_node(void) {
+  struct vfs_node *n = add_node("/dev/full", VFS_DEVICE, 0, 0, 0);
+  if (!n || IS_ERR(n))
+    return;
+  n->inode->read_cb = zero_read;
+  n->inode->write_cb = full_write;
+  n->inode->poll_cb = null_poll;
+  n->inode->mode = 0666;
+  n->inode->uid = 0;
+  n->inode->gid = 0;
+  n->inode->rdev = ((u64)1 << 8) | (u64)7;
+  vfs_node_put(n);
+}
+
 static void random_init_nodes(void) {
   static const char *names[2] = {"/dev/urandom", "/dev/random"};
   for (int i = 0; i < 2; i++) {
@@ -3106,6 +3255,7 @@ static void null_init_node(void) {
   }
   random_init_nodes();
   zero_init_node();
+  full_init_node();
   struct vfs_node *l = add_node("/dev/log", VFS_DEVICE, 0, 0, 0);
   if (l) {
     l->inode->write_cb = log_write;
@@ -3201,6 +3351,43 @@ static int devpts_lookup(struct vfs_node *dir, const char *name) {
   return 0;
 }
 
+/* The "devpts" filesystem type. A mount is a directory of the machine's pty
+ * slaves (materialised on lookup, as /dev/pts is) with the multiplexer as
+ * pts/ptmx — which is what a sandbox building its own /dev mounts and then
+ * points /dev/ptmx at (bubblewrap, systemd-nspawn, container runtimes). The
+ * slaves are the machine's: one pty numbering, as Linux without newinstance. */
+static struct vfs_node *devpts_mount_cb(const char *source, u64 flags,
+                                        void *data) {
+  (void)source;
+  (void)flags;
+  (void)data;
+  struct vfs_node *dir = vfs_create_node(VFS_DIRECTORY);
+  if (!dir)
+    return ERR_PTR(-ENOMEM);
+  dir->inode->mode = 0755;
+  dir->inode->nlink = 2;
+  dir->inode->lookup_cb = devpts_lookup;
+  dir->inode->dev = DEVPTS_FSID;
+  struct vfs_node *ptmx = vfs_create_node(VFS_DEVICE);
+  if (!ptmx) {
+    dir->deleted = 1;
+    vfs_node_put(dir);
+    return ERR_PTR(-ENOMEM);
+  }
+  memcpy(ptmx->name, "ptmx", 5);
+  ptmx->inode->mode = 0666;
+  ptmx->inode->rdev = ((u64)5 << 8) | (u64)2;
+  ptmx->inode->dev = DEVPTS_FSID;
+  ptmx->inode->ino = 0x7fffffffu; /* above every slave: pts/N is N + 1 */
+  ptmx->parent = dir;
+  vfs_attach_child(dir, ptmx);
+  return dir;
+}
+
+static struct vfs_fs devpts_fs = {.name = "devpts",
+                                  .mount = devpts_mount_cb,
+                                  .flags = VFS_FS_NODEV | VFS_FS_USERNS_MOUNT};
+
 static void vfs_init_stdio(void) {
   scheduler_fd_table_init_current();
   int tty = vfs_open_flags("/dev/tty", B1NIX_O_RDWR);
@@ -3269,6 +3456,7 @@ void vfs_init(void) {
    * opens are intercepted in vfs_open_flags; the nodes exist so stat()/ls and
    * ptsname() paths resolve. */
   pty_init();
+  vfs_register_fs(&devpts_fs);
   add_node("/dev/ptmx", VFS_DEVICE, 0, 0, 0);
   struct vfs_node *ptsdir = add_node("/dev/pts", VFS_DIRECTORY, 0, 0, 0);
   if (ptsdir)
@@ -3404,6 +3592,17 @@ void vfs_populate_dev(void) {
     node->inode->uid = 0;
     node->inode->gid = 0;
     node->inode->rdev = ((u64)1 << 8) | (u64)5; /* /dev/zero */
+    vfs_node_put(node);
+  }
+  node = add_node("/dev/full", VFS_DEVICE, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->read_cb = zero_read;
+    node->inode->write_cb = full_write;
+    node->inode->poll_cb = null_poll;
+    node->inode->mode = 0666;
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    node->inode->rdev = ((u64)1 << 8) | (u64)7; /* /dev/full */
     vfs_node_put(node);
   }
 
@@ -3815,8 +4014,9 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
   /* M32b pseudo-terminals: /dev/ptmx allocates a fresh master; /dev/pts/<N>
    * binds to that pair's slave. These are dynamic handles, not VFS nodes, so
    * intercept the open before the path lookup. */
-  if (strcmp(resolved, "/dev/ptmx") == 0) {
-    struct vfs_node *ptmx_node = vfs_find_node("/dev/ptmx");
+  if (strcmp(resolved, "/dev/ptmx") == 0 ||
+      strcmp(resolved, "/dev/pts/ptmx") == 0) {
+    struct vfs_node *ptmx_node = vfs_find_node(resolved);
     if (!IS_ERR(ptmx_node)) {
       int access_mask = 0;
       if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
@@ -4084,7 +4284,13 @@ static int vfs_open_flags_mode_inner(const char *path, int flags, u16 mode) {
    * succeed and then hand back a descriptor that cannot be written. Worse,
    * O_TRUNC took effect below with no check at all, so a sandboxed process
    * could empty a file on a filesystem the kernel believed was read-only. */
-  if (access_mask & W_OK) {
+  /* A device, FIFO or socket is not written ON the filesystem: opening
+   * /dev/null for writing on a read-only mount is what every sandbox with a
+   * read-only root does (Linux checks EROFS for files, directories and links
+   * only). */
+  u32 wfmt = vfs_node_type_mode(node);
+  if ((access_mask & W_OK) && wfmt != B1NIX_S_IFCHR && wfmt != B1NIX_S_IFBLK &&
+      wfmt != B1NIX_S_IFIFO && wfmt != B1NIX_S_IFSOCK) {
     struct vfs_mount_entry *wmnt = vfs_get_mount_for_node(node);
     if (wmnt && (wmnt->flags & MS_RDONLY)) {
       res = -EROFS;
@@ -6448,6 +6654,9 @@ static void vfs_mount_propagate(int midx) {
     mounts[slot].mnt_ns = mounts[i].mnt_ns;
     mounts[slot].peer_group = child_group;
     mounts[slot].seq = mount_seq_next++;
+    mounts[slot].pivot_group = 0;
+    mounts[slot].parent_seq =
+        mounts[midx].parent_seq == mounts[parent].seq ? mounts[i].seq : 0;
     /* The bound goes up BEFORE the slot is published: a scan reads the bound
      * and then the entries, so with the two in the other order a reader could
      * take the old bound, skip this slot and conclude the mount is not there —
@@ -6491,10 +6700,8 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
     }
   }
 
-  struct vfs_node *target_node = vfs_find_node(target);
-  if (IS_ERR(target_node)) {
-    return (int)PTR_ERR(target_node);
-  }
+  u64 parent_mnt = 0;
+  struct vfs_node *target_node = vfs_find_node_mnt(target, &parent_mnt);
   if (IS_ERR(target_node))
     return (int)PTR_ERR(target_node);
   if (target_node->inode->type != VFS_DIRECTORY) {
@@ -6568,6 +6775,9 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   mounts[midx].owner = fs->owner;
   mounts[midx].mnt_ns = vfs_current_mnt_ns();
   mounts[midx].seq = mount_seq_next++;
+  mounts[midx].pivot_group = 0;
+  mounts[midx].parent_seq = parent_mnt;
+  mounts[midx].copied_from = 0;
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   if (bootinfo_has_flag("b1nix.trace-mount")) {
     char ml[192];
@@ -6709,17 +6919,24 @@ int vfs_remount(const char *target, u64 flags) {
   int found = 0;
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
-  /* A flag locked on any of the entries refuses the whole remount. */
+  /* A remount changes the mount the path resolves to: the one stacked last
+   * there. The ones it covers keep their flags — and their locks, which a
+   * mount the caller stacked on top has no say over (bubblewrap binds
+   * /dev/null over the copy of the host's /dev/null a recursive bind of "/"
+   * made, then remounts its own). */
+  int top = -1;
   for (usize i = 0; i < mount_hwm; i++) {
     if (!mount_visible(i) || strcmp(mounts[i].target, canon) != 0)
       continue;
-    if (mounts[i].locked_flags & ~flags & MNT_LOCKABLE_FLAGS) {
-      __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-      return -EPERM;
-    }
+    if (top < 0 || mounts[i].seq > mounts[top].seq)
+      top = (int)i;
   }
-  for (usize i = 0; i < mount_hwm; i++) {
-    if (!mount_visible(i) || strcmp(mounts[i].target, canon) != 0)
+  if (top >= 0 && (mounts[top].locked_flags & ~flags & MNT_LOCKABLE_FLAGS)) {
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    return -EPERM;
+  }
+  for (usize i = 0; top >= 0 && i < mount_hwm; i++) {
+    if ((int)i != top)
       continue;
     /* MS_REMOUNT changes the mount's flags and nothing else. The propagation
      * bits are not mount flags and are not touched by a remount. */
@@ -6779,6 +6996,99 @@ static void mount_record_target(const char *target, struct vfs_node *node,
   copy_path(out, out_len, target ? target : "");
 }
 
+/* "/a/b/" and "/a/b" name one mount point; the table keeps the second. */
+static void path_strip_trailing_slash(char *path) {
+  usize l = strlen(path);
+  while (l > 1 && path[l - 1] == '/')
+    path[--l] = '\0';
+}
+
+/* The recursive half of MS_BIND|MS_REC (Linux copy_tree): every mount of the
+ * caller's namespace below the source that existed before the bind is copied
+ * onto the bind, oldest first so stacks keep their order. Below the source
+ * means attached, directly or through other copied mounts, to `src_mnt` (the
+ * mount the source was found in) at a path under `src`. A copy hangs on the
+ * same node as its original — the bind shares the source's nodes — and on the
+ * copy of its parent, so a walk through the bind finds it and a walk through
+ * the original tree does not, and unmounting one tree leaves the other whole.
+ * Unbindable mounts are not copied. A copy that finds no free slot is
+ * skipped. Called with vfs_mount_lock held; `bind` is the new entry. */
+static void vfs_bind_copy_submounts(const char *src, u64 src_mnt, int bind) {
+  const char *dst = mounts[bind].target;
+  u64 bind_seq = mounts[bind].seq;
+  usize slen = strlen(src);
+  u32 ns = vfs_current_mnt_ns();
+  u64 last = 0;
+  for (;;) {
+    int next = -1;
+    for (usize i = 0; i < mount_hwm; i++) {
+      if (!mount_visible_in(i, ns) || mounts[i].seq >= bind_seq ||
+          mounts[i].seq <= last || !mounts[i].root_node ||
+          mounts[i].propagation == MS_UNBINDABLE ||
+          strcmp(mounts[i].target, src) == 0 ||
+          !path_is_under(mounts[i].target, src))
+        continue;
+      if (next < 0 || mounts[i].seq < mounts[next].seq)
+        next = (int)i;
+    }
+    if (next < 0)
+      return;
+    last = mounts[next].seq;
+
+    /* Its parent in the copy: the bind itself for a mount on the source's
+     * mount, the copy of its parent for one deeper (the copies are the
+     * entries made since the bind whose originals are recorded in `source`
+     * order below), or unknown when the original's was. */
+    u64 parent = 0;
+    if (mounts[next].parent_seq) {
+      if (mounts[next].parent_seq == src_mnt) {
+        parent = bind_seq;
+      } else {
+        for (usize k = 0; k < mount_hwm; k++) {
+          if (mount_visible_in(k, ns) && mounts[k].seq > bind_seq &&
+              mounts[k].copied_from == mounts[next].parent_seq) {
+            parent = mounts[k].seq;
+            break;
+          }
+        }
+        if (!parent)
+          continue; /* not below the source after all */
+      }
+    }
+
+    char target[VFS_MAX_PATH];
+    const char *tail = mounts[next].target + (slen == 1 ? 0 : slen);
+    if (dst[0] == '/' && dst[1] == '\0')
+      copy_path(target, sizeof(target), tail);
+    else
+      snprintf(target, sizeof(target), "%s%s", dst, tail);
+
+    int j = -1;
+    for (usize k = 0; k < mount_slots; k++)
+      if (!mounts[k].used) {
+        j = (int)k;
+        break;
+      }
+    if (j < 0)
+      continue;
+    if ((usize)j + 1 > mount_hwm)
+      mount_hwm = (usize)j + 1;
+    mounts[j] = mounts[next];
+    copy_path(mounts[j].target, sizeof(mounts[j].target), target);
+    mounts[j].seq = mount_seq_next++;
+    mounts[j].parent_seq = parent;
+    mounts[j].copied_from = mounts[next].seq;
+    mounts[j].pivot_group = 0;
+    mounts[j].propagation = MS_PRIVATE;
+    mounts[j].peer_group = 0;
+    vfs_node_get(mounts[j].root_node);
+    if (mounts[j].mount_point)
+      vfs_node_get(mounts[j].mount_point);
+    if (mounts[j].owner && !try_module_get(mounts[j].owner))
+      mounts[j].owner = 0;
+  }
+}
+
 int vfs_bind_mount(const char *source, const char *target, u64 flags) {
   if (!vfs_may_mount())
     return -EPERM;
@@ -6788,10 +7098,11 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
    * passed NULL because it meant a remount. Linux answers EINVAL. */
   if (!source || !source[0])
     return -EINVAL;
-  struct vfs_node *src = vfs_find_node(source);
+  u64 src_mnt = 0, parent_mnt = 0;
+  struct vfs_node *src = vfs_find_node_mnt(source, &src_mnt);
   if (IS_ERR(src))
     return (int)PTR_ERR(src);
-  struct vfs_node *tgt = vfs_find_node(target);
+  struct vfs_node *tgt = vfs_find_node_mnt(target, &parent_mnt);
   if (IS_ERR(tgt)) {
     vfs_node_put(src);
     return (int)PTR_ERR(tgt);
@@ -6841,6 +7152,41 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
    * resolver, which takes that same lock. */
   char rectgt[VFS_MAX_PATH];
   mount_record_target(target, tgt, rectgt, sizeof(rectgt));
+  path_strip_trailing_slash(rectgt);
+  /* MS_REC copies the mounts below the source too, so it needs the source's
+   * name in the table's terms. */
+  char recsrc[VFS_MAX_PATH];
+  recsrc[0] = '\0';
+  if ((flags & MS_REC) && src->inode->type == VFS_DIRECTORY) {
+    mount_record_target(source, src, recsrc, sizeof(recsrc));
+    path_strip_trailing_slash(recsrc);
+  }
+
+  /* A bind is a copy of the mount the source lives on (Linux clone_mnt): it
+   * carries that mount's access flags and the locks on them, so binding a path
+   * elsewhere is no way to shed a read-only or nosuid mount a less privileged
+   * namespace inherited. */
+  u64 src_flags = 0, src_locked = 0;
+  {
+    /* The mount the source was found in, when the walk could say — the
+     * source's nodes can be on several mounts with different flags (a
+     * read-only bind of "/" shares every node with the root it binds). */
+    struct vfs_mount_entry *sm = 0;
+    while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+      scheduler_yield();
+    for (usize i = 0; src_mnt && i < mount_hwm; i++)
+      if (mount_visible(i) && mounts[i].seq == src_mnt)
+        sm = &mounts[i];
+    if (sm) {
+      src_flags = sm->flags & MNT_LOCKABLE_FLAGS;
+      src_locked = sm->locked_flags;
+    }
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    if (!sm && (sm = vfs_get_mount_for_node(src)) != 0) {
+      src_flags = sm->flags & MNT_LOCKABLE_FLAGS;
+      src_locked = sm->locked_flags;
+    }
+  }
 
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
@@ -6868,12 +7214,19 @@ int vfs_bind_mount(const char *source, const char *target, u64 flags) {
   copy_path(mounts[midx].source, sizeof(mounts[midx].source), source);
   copy_path(mounts[midx].target, sizeof(mounts[midx].target), rectgt);
   copy_path(mounts[midx].fstype, sizeof(mounts[midx].fstype), "bind");
-  mounts[midx].flags = flags & ~(u64)(MS_BIND | MS_REC | MS_PROPAGATION_MASK);
+  mounts[midx].flags =
+      (flags & ~(u64)(MS_BIND | MS_REC | MS_PROPAGATION_MASK)) | src_flags;
+  mounts[midx].locked_flags = src_locked;
   mounts[midx].owner = 0;
   mounts[midx].mnt_ns = vfs_current_mnt_ns();
   mounts[midx].seq = mount_seq_next++;
+  mounts[midx].pivot_group = 0;
+  mounts[midx].parent_seq = parent_mnt;
+  mounts[midx].copied_from = 0;
   mounts[midx].propagation = MS_PRIVATE;
   mounts[midx].peer_group = 0;
+  if (recsrc[0])
+    vfs_bind_copy_submounts(recsrc, src_mnt, midx);
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   return 0;
 }
@@ -6956,7 +7309,8 @@ int vfs_move_mount(const char *source, const char *target) {
   struct vfs_node *src_node = vfs_find_node(src);
   if (IS_ERR(src_node))
     return (int)PTR_ERR(src_node);
-  struct vfs_node *dst_node = vfs_find_node(dst);
+  u64 dst_mnt = 0;
+  struct vfs_node *dst_node = vfs_find_node_mnt(dst, &dst_mnt);
   if (IS_ERR(dst_node)) {
     vfs_node_put(src_node);
     return (int)PTR_ERR(dst_node);
@@ -6997,6 +7351,7 @@ int vfs_move_mount(const char *source, const char *target) {
     retarget_under(mounts[i].target, sizeof(mounts[i].target), src, dst);
   }
   mounts[midx].mount_point = dst_node; /* takes over the lookup reference */
+  mounts[midx].parent_seq = dst_mnt;
   copy_path(mounts[midx].target, sizeof(mounts[midx].target), dst);
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
@@ -7034,75 +7389,187 @@ int vfs_device_is_mounted(const char *name) {
   return 0;
 }
 
-int vfs_umount(const char *target) {
-  if (!target)
+/* Take one mount entry out of the caller's namespace: the one stacked last at
+ * `canon` among those in pivot group `group` (0: any), other than the one
+ * created as `skip_seq` (0: none) — or exactly the one created as `want_seq`
+ * when that is nonzero. `detach` (MNT_DETACH) skips the busy check -- the
+ * filesystem stays alive for whoever still holds it and goes when they let
+ * go. */
+static int vfs_umount_one(const char *canon, int detach, u32 group,
+                          u64 skip_seq, u64 want_seq) {
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+
+  int i = -1;
+  for (usize k = 0; k < mount_hwm; k++) {
+    if (!mount_visible(k) || strcmp(mounts[k].target, canon) != 0 ||
+        (group && mounts[k].pivot_group != group) ||
+        (skip_seq && mounts[k].seq == skip_seq) ||
+        (want_seq && mounts[k].seq != want_seq))
+      continue;
+    if (i < 0 || mounts[k].seq > mounts[i].seq)
+      i = (int)k;
+  }
+  if (i < 0) {
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    return -EINVAL;
+  }
+  /* The root mount itself cannot go; a mount stacked over it can. */
+  if (strcmp(canon, "/") == 0 && !group &&
+      (!mounts[i].mount_point || mounts[i].mount_point == root_node)) {
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    return -EBUSY;
+  }
+
+  /* Basic busy check: if root_node has other refs than our mount entry.
+   * Acquire-load: pairs with the atomic refcount updates so a ref taken
+   * on another CPU just before umount is observed. */
+  if (!detach &&
+      __atomic_load_n(&mounts[i].root_node->refcount, __ATOMIC_ACQUIRE) >
+          (int)mount_root_refs(mounts[i].root_node)) {
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    return -EBUSY;
+  }
+
+  struct vfs_node *root = mounts[i].root_node;
+  struct vfs_node *mp = mounts[i].mount_point;
+  u32 fs_id = (root && root->inode) ? root->inode->fs_id : 0;
+  /* The filesystem is only really going away when this was its last mount
+   * entry across every namespace — another namespace's copy still uses it,
+   * so tearing the superblock down here would pull it out from under the
+   * tasks in that namespace. */
+  int last_ref = (mount_fs_refs(root) <= 1);
+
+  /* Call filesystem umount callback if available (e.g. JBD RECOVER flag) */
+  if (last_ref && mounts[i].fstype[0]) {
+    struct vfs_fs *fs = filesystems;
+    while (fs) {
+      if (strcmp(fs->name, mounts[i].fstype) == 0) {
+        if (fs->umount && root)
+          fs->umount(root);
+        break;
+      }
+      fs = fs->next;
+    }
+  }
+
+  struct module *owner = mounts[i].owner;
+  mounts[i].used = 0;
+  mounts[i].owner = 0;
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  module_put(owner);
+
+  if (last_ref && root && root->inode && root->inode->blk_dev) {
+    vfs_writeback_dirty_inodes();
+    blk_cache_flush(root->inode->blk_dev);
+    blk_cache_invalidate(root->inode->blk_dev);
+  }
+
+  vfs_node_put(root);
+  vfs_node_put(mp);
+  if (last_ref)
+    icache_invalidate_fs(fs_id);
+  return 0;
+}
+
+#define UMOUNT_MNT_FORCE  0x1
+#define UMOUNT_MNT_DETACH 0x2
+#define UMOUNT_MNT_EXPIRE 0x4
+#define UMOUNT_NOFOLLOW   0x8
+
+int vfs_umount2(const char *target, int flags) {
+  if (!target || !target[0])
+    return -EINVAL;
+  if (flags & ~(UMOUNT_MNT_FORCE | UMOUNT_MNT_DETACH | UMOUNT_MNT_EXPIRE |
+                UMOUNT_NOFOLLOW))
+    return -EINVAL;
+  /* MNT_EXPIRE is a two-step protocol for idle mounts and never combines
+   * with the other two. */
+  if ((flags & UMOUNT_MNT_EXPIRE) &&
+      (flags & (UMOUNT_MNT_FORCE | UMOUNT_MNT_DETACH)))
     return -EINVAL;
   if (!vfs_may_mount())
     return -EPERM;
 
+  /* The target as the mount table records it: relative to the working
+   * directory, normalised. */
+  char canon[VFS_MAX_PATH];
+  vfs_resolve_path(target, canon);
+
+  /* The mount the path resolves to, when the walk can say: of several at one
+   * spelling it is the one on top, and after pivot_root(".", ".") that is the
+   * old root, not the newest entry. */
+  u64 walked = 0;
+  {
+    struct vfs_node *n = vfs_find_node_mnt(canon, &walked);
+    if (IS_ERR(n))
+      walked = 0;
+    else
+      vfs_node_put(n);
+  }
+  int top = -1;
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
-
-  for (usize i = 0; i < mount_hwm; i++) {
-    if (mount_visible(i) && strcmp(mounts[i].target, target) == 0) {
-      if (strcmp(target, "/") == 0) {
-        __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-        return -EBUSY;
-      }
-
-      /* Basic busy check: if root_node has other refs than our mount entry.
-       * Acquire-load: pairs with the atomic refcount updates so a ref taken
-       * on another CPU just before umount is observed. */
-      if (__atomic_load_n(&mounts[i].root_node->refcount, __ATOMIC_ACQUIRE) >
-          (int)mount_root_refs(mounts[i].root_node)) {
-        __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-        return -EBUSY;
-      }
-
-      struct vfs_node *root = mounts[i].root_node;
-      struct vfs_node *mp = mounts[i].mount_point;
-      u32 fs_id = (root && root->inode) ? root->inode->fs_id : 0;
-      /* The filesystem is only really going away when this was its last mount
-       * entry across every namespace — another namespace's copy still uses it,
-       * so tearing the superblock down here would pull it out from under the
-       * tasks in that namespace. */
-      int last_ref = (mount_root_refs(root) <= 1);
-
-      /* Call filesystem umount callback if available (e.g. JBD RECOVER flag) */
-      if (last_ref && mounts[i].fstype[0]) {
-        struct vfs_fs *fs = filesystems;
-        while (fs) {
-          if (strcmp(fs->name, mounts[i].fstype) == 0) {
-            if (fs->umount && root)
-              fs->umount(root);
-            break;
-          }
-          fs = fs->next;
-        }
-      }
-
-      struct module *owner = mounts[i].owner;
-      mounts[i].used = 0;
-      mounts[i].owner = 0;
-      __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-      module_put(owner);
-
-      if (last_ref && root && root->inode && root->inode->blk_dev) {
-        vfs_writeback_dirty_inodes();
-        blk_cache_flush(root->inode->blk_dev);
-        blk_cache_invalidate(root->inode->blk_dev);
-      }
-
-      vfs_node_put(root);
-      vfs_node_put(mp);
-      if (last_ref)
-        icache_invalidate_fs(fs_id);
-      return 0;
+  for (usize k = 0; k < mount_hwm; k++) {
+    if (!mount_visible(k) || strcmp(mounts[k].target, canon) != 0)
+      continue;
+    if (walked && mounts[k].seq == walked) {
+      top = (int)k;
+      break;
     }
+    if (top < 0 || mounts[k].seq > mounts[top].seq)
+      top = (int)k;
   }
+  u32 group = top >= 0 ? mounts[top].pivot_group : 0;
+  u64 top_seq = top >= 0 ? mounts[top].seq : 0;
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-  return -EINVAL;
+  if (top < 0)
+    return -EINVAL;
+  if (!(flags & UMOUNT_MNT_DETACH))
+    return vfs_umount_one(canon, 0, 0, 0, top_seq);
+
+  /* The pivot group the detached mount belongs to: the old root
+   * pivot_root(".", ".") stacked on "/" shares its spelling with the new
+   * root's mounts, and only the group says which tree an entry is in. */
+  /* Detaching the stacked old root takes its whole group: everything that was
+   * mounted on it. Otherwise the subtree is the mounts below the target in the
+   * target's own group. */
+  int whole_group = group && strcmp(canon, "/") == 0;
+
+  /* MNT_DETACH takes the whole subtree with it (Linux umount_tree): the mounts
+   * below the target go first, deepest first, so none is left pointing into a
+   * filesystem that is no longer attached anywhere. */
+  for (;;) {
+    char deepest[VFS_MAX_PATH];
+    usize best = 0;
+    deepest[0] = '\0';
+    while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+      scheduler_yield();
+    for (usize k = 0; k < mount_hwm; k++) {
+      if (!mount_visible(k) || mounts[k].seq == top_seq ||
+          mounts[k].pivot_group != group)
+        continue;
+      if (!whole_group && (strcmp(mounts[k].target, canon) == 0 ||
+                           !path_is_under(mounts[k].target, canon)))
+        continue;
+      /* +1: a group member at "/" (a lower old root) still counts. */
+      usize l = strlen(mounts[k].target) + 1;
+      if (l > best) {
+        best = l;
+        copy_path(deepest, sizeof(deepest), mounts[k].target);
+      }
+    }
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    if (!best)
+      break;
+    /* The stacked entry itself goes last. */
+    if (vfs_umount_one(deepest, 1, group, top_seq, 0) != 0)
+      break;
+  }
+  return vfs_umount_one(canon, 1, group, 0, top_seq);
 }
+
+int vfs_umount(const char *target) { return vfs_umount2(target, 0); }
 
 /* pivot_root(2) — make new_root the root and park the old one at put_old.
  *
@@ -7131,8 +7598,20 @@ int vfs_umount(const char *target) {
 static void vfs_pivot_reroot_mp(struct vfs_mount_entry *m) {
   struct vfs_node *prev = m->mount_point;
   m->mount_point = vfs_node_get(root_node);
+  m->parent_seq = 0;
   if (prev)
     vfs_node_put(prev);
+}
+
+/* Working directories are kept as paths: a task of the pivoting namespace
+ * standing inside the new root is now standing at the same directory under its
+ * new name. */
+static void vfs_pivot_rebase_cwds(u32 mntns, const char *new_abs) {
+  for (usize i = 0; i < scheduler_task_slots(); i++) {
+    struct task *t = scheduler_task_slot(i);
+    if (t && namespace_task_id(t, NS_MNT) == mntns)
+      retarget_under(t->cwd, sizeof(t->cwd), new_abs, "/");
+  }
 }
 
 int vfs_pivot_root(const char *new_root, const char *put_old) {
@@ -7155,9 +7634,13 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
   if (strcmp(new_abs, "/") == 0)
     rc = -EBUSY; /* the new root must not be the current one */
   /* put_old has to live under new_root, or unmounting the old root later
-   * would have to reach through the old root to find it. */
+   * would have to reach through the old root to find it. put_old == new_root
+   * is the exception Linux documents for pivot_root(".", "."): the old root is
+   * stacked on top of the new one, to be detached right after. */
   usize nlen = strlen(new_abs);
-  if (!rc && (strncmp(old_abs, new_abs, nlen) != 0 || old_abs[nlen] != '/'))
+  int stack = strcmp(old_abs, new_abs) == 0;
+  if (!rc && !stack &&
+      (strncmp(old_abs, new_abs, nlen) != 0 || old_abs[nlen] != '/'))
     rc = -EINVAL;
   if (rc) {
     kfree(new_abs);
@@ -7165,7 +7648,32 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
     return rc;
   }
 
-  struct vfs_node *old_mp = vfs_find_node(old_abs);
+  /* The mounts the paths are in: new_root has to be the root of the one it
+   * is in, and "/" names the mount that is the root now. */
+  u64 new_mnt = 0, root_mnt = 0, old_parent = 0;
+  {
+    struct vfs_node *n = vfs_find_node_mnt(new_abs, &new_mnt);
+    if (IS_ERR(n)) {
+      kfree(new_abs);
+      kfree(old_abs);
+      return (int)PTR_ERR(n);
+    }
+    int is_root = 0;
+    while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+      scheduler_yield();
+    for (usize i = 0; new_mnt && i < mount_hwm; i++)
+      if (mount_visible(i) && mounts[i].seq == new_mnt)
+        is_root = mounts[i].root_node == n;
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    vfs_node_put(n);
+    if (!is_root)
+      new_mnt = 0;
+    n = vfs_find_node_mnt("/", &root_mnt);
+    if (!IS_ERR(n))
+      vfs_node_put(n);
+  }
+
+  struct vfs_node *old_mp = vfs_find_node_mnt(old_abs, &old_parent);
   if (IS_ERR(old_mp) || !old_mp) {
     kfree(new_abs);
     kfree(old_abs);
@@ -7187,11 +7695,15 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
     vfs_node_get(mp);
     vfs_node_put(old_mp);
     old_mp = mp;
+    old_parent = 0; /* no longer the mount the walk ended in */
   }
 
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 
+  /* Everything below is confined to the caller's mount namespace: a pivot in
+   * a container moves the container's mounts and no one else's. */
+  u32 pivot_ns = vfs_current_mnt_ns();
   int nidx = -1, oidx = -1, freeidx = -1;
   for (usize i = 0; i < mount_slots; i++) {
     if (!mounts[i].used) {
@@ -7199,13 +7711,49 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
         freeidx = (int)i;
       continue;
     }
-    if (strcmp(mounts[i].target, new_abs) == 0 && mounts[i].root_node)
-      nidx = (int)i;
-    else if (strcmp(mounts[i].target, "/") == 0)
-      oidx = (int)i;
+    if (mounts[i].mnt_ns != pivot_ns)
+      continue;
+    /* Of several entries at new_root (a bind of it onto itself, the usual
+     * preparation for a pivot) the one stacked last is the root. */
+    if (strcmp(mounts[i].target, new_abs) == 0 && mounts[i].root_node) {
+      if (nidx < 0 || mounts[i].seq > mounts[nidx].seq)
+        nidx = (int)i;
+    } else if (strcmp(mounts[i].target, "/") == 0) {
+      if (oidx < 0 || mounts[i].seq > mounts[oidx].seq)
+        oidx = (int)i;
+    }
   }
 
-  if (nidx < 0) {
+  /* The walks above name the two mounts exactly; the names are the fallback
+   * for a mount the walk could not place. For the new root, follow what is
+   * stacked on the entry found by name (a bind recorded under another
+   * spelling of the same path still covers it). */
+  for (usize i = 0; i < mount_hwm; i++) {
+    if (!mounts[i].used || mounts[i].mnt_ns != pivot_ns)
+      continue;
+    if (new_mnt && mounts[i].seq == new_mnt)
+      nidx = (int)i;
+    if (stack && root_mnt && mounts[i].seq == root_mnt &&
+        (int)i != nidx)
+      oidx = (int)i;
+  }
+  for (int hops = 0; !new_mnt && nidx >= 0 && hops < 16; hops++) {
+    int up = -1;
+    for (usize i = 0; i < mount_hwm; i++) {
+      if (!mounts[i].used || mounts[i].mnt_ns != pivot_ns ||
+          (int)i == nidx || !mounts[i].root_node ||
+          mounts[i].mount_point != mounts[nidx].root_node ||
+          mounts[i].seq < mounts[nidx].seq)
+        continue;
+      if (up < 0 || mounts[i].seq > mounts[up].seq)
+        up = (int)i;
+    }
+    if (up < 0)
+      break;
+    nidx = up;
+  }
+
+  if (nidx < 0 || (stack && oidx < 0)) {
     /* Linux says EINVAL when new_root is not a mount point, and it means it:
      * pivoting onto a plain directory would leave "/" naming a subtree of the
      * filesystem it is supposed to be replacing. */
@@ -7224,6 +7772,44 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
    * once the pivot has happened. */
   const char *put_old_new = old_abs + nlen; /* begins with '/' by the check above */
 
+  if (stack) {
+    /* The new root's mounts drop the prefix; everything else is on the old
+     * root and stays where it is on it, the old root going to "/" above the
+     * new one. The group marks the old tree, which the paths no longer can. */
+    u32 group = pivot_group_next++;
+    for (usize i = 0; i < mount_hwm; i++) {
+      if (!mounts[i].used || (int)i == nidx || mounts[i].mnt_ns != pivot_ns)
+        continue;
+      const char *t = mounts[i].target;
+      if (strcmp(t, new_abs) == 0) {
+        mounts[i].target[0] = '/';
+        mounts[i].target[1] = '\0';
+        vfs_pivot_reroot_mp(&mounts[i]);
+      } else if (strncmp(t, new_abs, nlen) == 0 && t[nlen] == '/') {
+        memmove(mounts[i].target, t + nlen, strlen(t + nlen) + 1);
+      } else {
+        mounts[i].pivot_group = group;
+      }
+    }
+    /* The new root becomes the root mount, the newest "/" attached to
+     * root_node; the old root covers it. */
+    mounts[nidx].target[0] = '/';
+    mounts[nidx].target[1] = '\0';
+    vfs_pivot_reroot_mp(&mounts[nidx]);
+    mounts[nidx].parent_seq = 0;
+    struct vfs_node *prev_mp = mounts[oidx].mount_point;
+    mounts[oidx].mount_point = vfs_node_get(mounts[nidx].root_node);
+    mounts[oidx].parent_seq = mounts[nidx].seq;
+    if (prev_mp)
+      vfs_node_put(prev_mp);
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+    vfs_node_put(old_mp);
+    vfs_pivot_rebase_cwds(pivot_ns, new_abs);
+    kfree(new_abs);
+    kfree(old_abs);
+    return 0;
+  }
+
   char *tmp = kmalloc(VFS_MAX_PATH);
   if (!tmp) {
     __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
@@ -7234,7 +7820,8 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
   }
 
   for (usize i = 0; i < mount_hwm; i++) {
-    if (!mounts[i].used || (int)i == nidx || (int)i == oidx)
+    if (!mounts[i].used || (int)i == nidx || (int)i == oidx ||
+        mounts[i].mnt_ns != pivot_ns)
       continue;
     if (strcmp(mounts[i].target, new_abs) == 0) {
       /* Another entry naming the new root itself — the same doubling as
@@ -7268,6 +7855,7 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
     strncpy(mounts[oidx].target, put_old_new, VFS_MAX_PATH - 1);
     mounts[oidx].target[VFS_MAX_PATH - 1] = '\0';
     mounts[oidx].mount_point = vfs_node_get(old_mp);
+    mounts[oidx].parent_seq = old_parent;
     if (prev_mp)
       vfs_node_put(prev_mp);
   } else if (freeidx >= 0) {
@@ -7290,6 +7878,14 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
     mounts[freeidx].root_node = vfs_node_get(root_node);
     mounts[freeidx].mount_point = vfs_node_get(old_mp);
     mounts[freeidx].owner = 0;
+    mounts[freeidx].mnt_ns = pivot_ns;
+    mounts[freeidx].propagation = MS_PRIVATE;
+    mounts[freeidx].peer_group = 0;
+    mounts[freeidx].locked_flags = 0;
+    mounts[freeidx].seq = mount_seq_next++;
+    mounts[freeidx].pivot_group = 0;
+    mounts[freeidx].parent_seq = old_parent;
+    mounts[freeidx].copied_from = 0;
   } else {
     __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
     vfs_node_put(old_mp);
@@ -7302,15 +7898,20 @@ int vfs_pivot_root(const char *new_root, const char *put_old) {
   mounts[nidx].target[0] = '/';
   mounts[nidx].target[1] = '\0';
   vfs_pivot_reroot_mp(&mounts[nidx]);
+  mounts[nidx].parent_seq = 0;
 
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   vfs_node_put(old_mp);
+  vfs_pivot_rebase_cwds(pivot_ns, new_abs);
   kfree(new_abs);
   kfree(old_abs);
 
   /* Same duty a root mount has: the device nodes made during early boot lived
-   * on the old root and are not reachable from the new one. */
-  vfs_repopulate_after_root_mount();
+   * on the old root and are not reachable from the new one. That is the
+   * machine switching roots; a container pivoting into its own tree gets
+   * exactly the /dev it built. */
+  if (pivot_ns == 0)
+    vfs_repopulate_after_root_mount();
   return 0;
 }
 

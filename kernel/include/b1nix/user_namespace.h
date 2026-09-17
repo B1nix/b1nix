@@ -62,6 +62,9 @@ int userns_is_ancestor(u32 ancestor, u32 ns);
 int ns_capable_cred(const struct cred *c, u32 ns, int cap);
 /* The calling task. */
 int ns_capable(u32 ns, int cap);
+/* `cap` over the calling task's network namespace — what configuring its
+ * interfaces, routes and raw sockets asks for. */
+int net_ns_capable(int cap);
 /* CAP_* over an inode: held in the caller's own namespace, and the inode's
  * owner and group both mapped there (Linux's capable_wrt_inode_uidgid). */
 int capable_wrt_inode_uidgid(const struct cred *c, u32 kuid, u32 kgid, int cap);

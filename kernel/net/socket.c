@@ -1263,7 +1263,7 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     /* `ifconfig <if> <addr> netmask <mask>`. The address is the NAMESPACE's,
      * assigned through the interface that namespace routes through — which is
      * a veth end inside a namespace and the NIC in the initial one. */
-    if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+    if (!net_ns_capable(CAP_NET_ADMIN))
       return -EPERM;
     if (is_lo)
       return -EOPNOTSUPP;
@@ -1324,7 +1324,7 @@ static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   case SIOC_SIFFLAGS:
     /* `ifconfig <if> up|down`. Only IFF_UP is something this kernel can act
      * on; the rest of the flag word describes properties it does not have. */
-    if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+    if (!net_ns_capable(CAP_NET_ADMIN))
       return -EPERM;
     if (is_lo)
       return (r.u.flags & IFF_UP) ? 0 : -EOPNOTSUPP;
@@ -1443,7 +1443,7 @@ int vfs_socket(int domain, int type, int protocol) {
   if (domain == B1NIX_AF_PACKET ||
       (type == B1NIX_SOCK_RAW && domain == B1NIX_AF_INET6)) {
     struct cred *c = scheduler_get_current_cred();
-    if (c && c->euid != ROOT_UID && !cred_has_cap(c, CAP_NET_RAW))
+    if (c && !net_ns_capable(CAP_NET_RAW))
       return -EPERM;
   }
 
@@ -1600,7 +1600,9 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
       memcpy(&nl, addr, sizeof(nl));
     nl.nl_family = B1NIX_AF_NETLINK;
     if (nl.nl_pid == 0) {
-      nl.nl_pid = (u32)scheduler_get_pid();
+      /* The process id as the caller's PID namespace numbers it, which is what
+       * a program compares against getpid() (Linux netlink_autobind). */
+      nl.nl_pid = (u32)namespace_pid_to_user(scheduler_get_pid());
       /* Only the uevent protocol keeps a socket registry, and only there does
        * a duplicate port id matter (it decides which socket a unicast device
        * handoff reaches). Every other netlink protocol keeps the pid, which is
@@ -2277,7 +2279,7 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     /* Binding is a privileged act on Linux (CAP_NET_RAW): it picks the
      * interface a packet leaves by, whatever the routing table says. */
     struct cred *c = scheduler_get_current_cred();
-    if (c && c->euid != ROOT_UID && !cred_has_cap(c, CAP_NET_RAW))
+    if (c && !net_ns_capable(CAP_NET_RAW))
       return -EPERM;
     int idx = strcmp(name, "lo") == 0 ? NETLINK_LO_IFINDEX
                                       : netdev_index_by_name(name);

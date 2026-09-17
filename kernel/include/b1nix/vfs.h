@@ -656,6 +656,8 @@ int vfs_fsync(int fd);
 int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags);
 int vfs_umount(const char *target);
+/* umount2(2): MNT_DETACH, MNT_FORCE, MNT_EXPIRE, UMOUNT_NOFOLLOW. */
+int vfs_umount2(const char *target, int flags);
 /* pivot_root(2): new_root becomes "/", the old root moves to put_old (which
  * must be a directory underneath new_root). */
 int vfs_pivot_root(const char *new_root, const char *put_old);

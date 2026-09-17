@@ -199,6 +199,10 @@ int ns_capable(u32 ns, int cap) {
   return ns_capable_cred(scheduler_get_current_cred(), ns, cap);
 }
 
+int net_ns_capable(int cap) {
+  return ns_capable(namespace_owner(NS_NET, namespace_net_current()), cap);
+}
+
 int capable_wrt_inode_uidgid(const struct cred *c, u32 kuid, u32 kgid,
                              int cap) {
   if (!c)

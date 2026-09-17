@@ -24,6 +24,8 @@
 #include <b1nix/vfs.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
+#include <b1nix/sched.h>
+#include <b1nix/uidgid.h>
 #include <string.h>
 
 static int tmpfs_statfs(struct vfs_node *node, struct b1nix_statfs *st) {
@@ -70,8 +72,12 @@ static struct vfs_node *tmpfs_mount_cb(const char *source, u64 flags,
   if (!root)
     return ERR_PTR(-ENOMEM);
   root->inode->mode = 0755;
-  root->inode->uid = 0;
-  root->inode->gid = 0;
+  /* The root belongs to whoever mounted it, as Linux's shmem does: a sandbox
+   * that mounts a tmpfs from inside a user namespace has to be able to build
+   * in it, and root outside that namespace is not an id it can name. */
+  const struct cred *c = scheduler_get_current_cred();
+  root->inode->uid = c ? c->fsuid : 0;
+  root->inode->gid = c ? c->fsgid : 0;
   root->inode->statfs_cb = tmpfs_statfs;
   return root;
 }

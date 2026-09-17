@@ -2999,6 +2999,9 @@ check_output "$LOG" "M123-SMOKE: ok timens-locked" "time namespace offsets are f
 check_output "$LOG" "M123-SMOKE: ok ns-links" "/proc/<pid>/ns entries are kind:[inode] links whose handles stat to that inode"
 check_output "$LOG" "M123-SMOKE: ok ns-handle-keeps-alive" "an open namespace handle keeps a memberless namespace, and setns(2) into it still works"
 check_output "$LOG" "M123-SMOKE: done" "M123 namespace suite completes"
+check_output "$LOG" "M123-TOOLS: ok unshare-Urpf" "util-linux unshare -Urpf --mount-proc as an unprivileged user: root in its user namespace, pid 1, a proc mount of its own"
+check_output "$LOG" "M123-TOOLS: ok nsenter-userns" "util-linux nsenter joins another process's user and UTS namespaces by pid"
+check_output "$LOG" "M123-TOOLS: ok bwrap-sandbox" "bubblewrap --unshare-all as an unprivileged user: read-only root, own /proc, /dev, /tmp, hostname, loopback only"
 check_output "$LOG" "M73-SMOKE: done" "M73 modern-I/O suite completes"
 # ── M80: ptrace register sets, /proc introspection, crash capture ──
 check_output "$LOG" "M80-SMOKE: ok proc-task" "/proc/<pid>/task lists one dir per thread, with the right Tgid"

@@ -37,6 +37,7 @@
 #include <b1nix/klog.h>
 #include <stdio.h>
 #include <b1nix/uidgid.h>
+#include <b1nix/user_namespace.h>
 #include <b1nix/vnet.h>
 #include <b1nix/vfs.h>
 #include <string.h>
@@ -711,12 +712,14 @@ static int nl_do_setlink(const u8 *body, usize blen) {
     return -EINVAL; /* nothing asked for */
   if (change & ~(u32)NL_IFF_UP)
     return -EOPNOTSUPP;
-  if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+  if (!net_ns_capable(CAP_NET_ADMIN))
     return -EPERM;
   if (index == NETLINK_LO_IFINDEX)
-    /* Loopback is up for as long as the kernel runs; taking it down would
-     * break every local socket and b1nix has no way to honour it. */
-    return -EOPNOTSUPP;
+    /* Loopback is up for as long as the kernel runs, so bringing it up is
+     * already done — which is the first thing a sandbox with a fresh network
+     * namespace does (bubblewrap, systemd-nspawn). Taking it down would break
+     * every local socket and b1nix has no way to honour it. */
+    return (flags & NL_IFF_UP) ? 0 : -EOPNOTSUPP;
   struct netdev *nd = netdev_by_index(index);
   if (!nd)
     return -ENODEV;
@@ -727,7 +730,7 @@ static int nl_do_setlink(const u8 *body, usize blen) {
  * namespace. This is the operation a veth pair exists for — one end stays
  * here, the other goes there, and that link is the only way across. */
 static int nl_do_netns(const u8 *body, const struct nl_attrs *a) {
-  if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+  if (!net_ns_capable(CAP_NET_ADMIN))
     return -EPERM;
   int index = (int)nl_load_u32(body + 4);
   struct netdev *dev = netdev_by_index(index);
@@ -759,7 +762,7 @@ static int nl_do_netns(const u8 *body, const struct nl_attrs *a) {
  * IFLA_MASTER and no flag change. */
 static int nl_do_master(const u8 *body, usize blen, const struct nl_attrs *a) {
   (void)blen;
-  if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+  if (!net_ns_capable(CAP_NET_ADMIN))
     return -EPERM;
   int index = (int)nl_load_u32(body + 4);
   struct netdev *dev = netdev_by_index(index);
@@ -783,7 +786,7 @@ static int nl_do_newlink_create(const u8 *body, usize blen,
                                 const struct nl_attrs *a) {
   (void)body;
   (void)blen;
-  if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+  if (!net_ns_capable(CAP_NET_ADMIN))
     return -EPERM;
   if (!a->ptr[IFLA_IFNAME] || a->len[IFLA_IFNAME] < 2)
     return -EINVAL; /* an unnamed interface is not something to create */
@@ -874,7 +877,7 @@ static int nl_do_newlink_create(const u8 *body, usize blen,
 static int nl_do_dellink(const u8 *body, usize blen) {
   if (blen < 16)
     return -EINVAL;
-  if (!cred_has_cap(scheduler_get_current_cred(), CAP_NET_ADMIN))
+  if (!net_ns_capable(CAP_NET_ADMIN))
     return -EPERM;
   int index = (int)nl_load_u32(body + 4);
   struct nl_attrs a;
@@ -901,9 +904,23 @@ static int nl_do_addr(u16 type, const u8 *body, usize blen) {
   struct nl_iface iface;
   if (ifindex && ifindex != NETLINK_LO_IFINDEX && !nl_iface_by_index(ifindex, &iface))
     return -ENODEV;
-  /* Loopback's addresses are constants, not configuration. */
-  if (ifindex == NETLINK_LO_IFINDEX)
+  /* Loopback's addresses are constants, not configuration: adding the one it
+   * already has (127.0.0.1/8, ::1/128) is done, anything else is refused. */
+  if (ifindex == NETLINK_LO_IFINDEX) {
+    if (type != RTM_NEWADDR || !addr)
+      return -EOPNOTSUPP;
+    if (!net_ns_capable(CAP_NET_ADMIN))
+      return -EPERM;
+    static const u8 v4[4] = {127, 0, 0, 1};
+    static const u8 v6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    if (family == B1NIX_AF_INET && alen == 4 && plen == 8 &&
+        memcmp(addr, v4, 4) == 0)
+      return 0;
+    if (family == B1NIX_AF_INET6 && alen == 16 && plen == 128 &&
+        memcmp(addr, v6, 16) == 0)
+      return 0;
     return -EOPNOTSUPP;
+  }
   /* Each network namespace owns one L3 configuration, held by the interface it
    * routes through. Inside a namespace created by unshare(CLONE_NEWNET) that
    * is the veth end moved into it, so `ip addr add ... dev veth1` configures

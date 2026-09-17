@@ -2436,7 +2436,7 @@ static isize sys_mount(const char *user_src, const char *user_target,
   return (isize)res;
 }
 
-static isize sys_umount(const char *user_target) {
+static isize sys_umount(const char *user_target, int flags) {
   char *ktarget = kmalloc(VFS_MAX_PATH);
   if (!ktarget)
     return -ENOMEM;
@@ -2446,7 +2446,7 @@ static isize sys_umount(const char *user_target) {
   }
   ktarget[VFS_MAX_PATH - 1] = '\0';
 
-  int res = vfs_umount(ktarget);
+  int res = vfs_umount2(ktarget, flags);
   kfree(ktarget);
   return (isize)res;
 }
@@ -10813,7 +10813,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)sys_mount((const char *)(usize)arg0, (const char *)(usize)arg1,
                           (const char *)(usize)arg2, arg3);
   case SYS_UMOUNT:
-    return (u64)sys_umount((const char *)(usize)arg0);
+    return (u64)sys_umount((const char *)(usize)arg0, (int)arg1);
 
   case SYS_PIVOT_ROOT:
     return (u64)sys_pivot_root((const char *)(usize)arg0,
