@@ -1,5 +1,6 @@
 #include <b1nix/arch_x86_64.h>
 #include <b1nix/linux_abi.h>
+#include <b1nix/pkeys.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/rseq.h>
 #include <b1nix/sched.h>
@@ -71,6 +72,7 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
   struct b1nix_sigframe sf;
   memset(&sf, 0, sizeof(sf));
   sf.magic = B1NIX_SIGFRAME_MAGIC;
+  sf.pkru = arch_pkru_user_get();
   if (task_has_saved_sigmask(t)) {
     sf.old_blocked_signals = task_saved_sigmask(t);
     task_clear_saved_sigmask(t);
@@ -111,6 +113,12 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
       if (ptrace_fault_info(t, &fsig, &faddr, &fcode) && fsig == sig) {
         si.si_code = fcode;
         memcpy((u8 *)&si + 16, &faddr, sizeof(faddr));
+        /* _sigfault._addr_pkey._pkey: after the address and 8 bytes of the
+         * union's padding. */
+        if (fcode == B1NIX_SEGV_PKUERR) {
+          u32 pk = ptrace_fault_pkey(t);
+          memcpy((u8 *)&si + 32, &pk, sizeof(pk));
+        }
       }
     }
 
@@ -166,6 +174,10 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
     frame->rdx = uc_addr; /* ucontext_t * */
   }
   frame->vector = 0; /* Force return via iretq to honor the modified rip */
+  /* The handler starts from the initial key rights, whatever the interrupted
+   * code had (Linux resets PKRU on signal delivery); sigreturn restores them. */
+  if (arch_pkeys_enabled())
+    arch_pkeys_signal_rights();
   /* Note: do NOT update saved_user_rsp here — it already holds the original
    * user RSP and will be refreshed by the SYSCALL entry on the next entry.
    * Updating it with restorer_slot (the modified RSP) would be wrong. */
@@ -191,6 +203,10 @@ static void arch_deliver_signals_body(struct interrupt_frame *frame);
 
 void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
   arch_deliver_signals_body(frame);
+  /* Every return to user mode passes here: put back key rights a kernel copy
+   * had to clear (arch_pkru_kernel_fault). */
+  if (frame && (frame->cs == 0x1B || frame->cs == 0x23))
+    arch_pkru_return_to_user();
 
   /* Returning to ring 3 only: a kernel-mode return can land here while the task
    * is still parked inside sigsuspend itself, and the temporary mask has to
@@ -400,6 +416,8 @@ u64 sys_sigreturn(struct interrupt_frame *frame) {
   sf.saved_frame.rflags |= 0x200ULL;
 
   t->blocked_signals = sf.old_blocked_signals;
+  if (arch_pkeys_enabled())
+    arch_pkru_user_set((u32)sf.pkru);
   memcpy(frame, &sf.saved_frame, sizeof(*frame));
   t->saved_user_rsp = frame->rsp;
 

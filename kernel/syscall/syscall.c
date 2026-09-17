@@ -27,6 +27,7 @@ void tlb_shootdown_all(void);
 #include <b1nix/rseq.h>
 #include <b1nix/tlb.h>
 #include <b1nix/sched.h>
+#include <b1nix/pkeys.h>
 #include <b1nix/secretmem.h>
 #include <b1nix/blk.h>
 #include <b1nix/shm.h>
@@ -427,6 +428,8 @@ int syscall_copyinstr(char *dst, usize dst_size, const char *user_src) {
 
     if (!found) return -EFAULT;
     if (!(vma->prot & PROT_READ)) return -EFAULT;
+    if (arch_pkeys_enabled() && !arch_pkey_allows(vma->pkey, 0))
+      return -EFAULT;
 
     // Determine chunk size: up to VMA end or buffer end
     u64 remaining_in_vma = (vma && found && vma->end > curr) ? (vma->end - curr) : (PAGE_SIZE - (curr & (PAGE_SIZE - 1)));
@@ -457,6 +460,25 @@ static int is_user_range_valid(const void *src, usize size, int write) {
 
   if (end < start) return 0; // Overflow
   if (end > USER_SPACE_LIMIT) return 0; // Not in userspace
+
+  /* Protection keys bind the kernel's copies too: a page whose key the
+   * thread's rights refuse is EFAULT, as the copy's fault would be on Linux.
+   * Checked first, because the CPU enforces them on the copy itself. */
+  if (arch_pkeys_enabled()) {
+    extern u64 vmm_query_leaf_pte(u64 vaddr);
+    for (u64 v = start & ~(u64)(PAGE_SIZE - 1); v < end; v += PAGE_SIZE) {
+      u64 pte = vmm_query_leaf_pte(v);
+      int key;
+      if (pte & (VMM_PRESENT | VMM_LAZY | VMM_SWAPPED)) {
+        key = VMM_PKEY_OF(pte);
+      } else {
+        struct vm_area *kv = vma_lookup(t, v);
+        key = (kv && v >= kv->start && v < kv->end) ? kv->pkey : 0;
+      }
+      if (!arch_pkey_allows(key, write))
+        return 0;
+    }
+  }
 
   /* Fast path: ask the page tables, not the VMA list.
    *
@@ -4346,6 +4368,15 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
 
   // Allocate and map physical frames
   u64 vmm_flags = vmm_user_flags_from_prot(prot);
+  /* With key hardware, a PROT_EXEC-only mapping is made unreadable through the
+   * address space's execute-only key, as Linux does. */
+  int map_pkey = 0;
+  if (prot == PROT_EXEC && arch_pkeys_enabled()) {
+    int xo = arch_execute_only_pkey();
+    if (xo > 0)
+      map_pkey = xo;
+  }
+  vmm_flags |= VMM_PKEY_BITS(map_pkey);
   /* MAP_SHARED|MAP_ANONYMOUS has no name and no file, so the only processes
    * that can ever see it are this one and its children — which makes fork the
    * whole point of the mapping. Without the shared bit its leaves look like
@@ -4554,6 +4585,7 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   vma->node = node ? vfs_node_get(node) : 0;
   vma->offset = offset;
   vma->special = 0;
+  vma->pkey = (u8)map_pkey;
   vma->next = 0;
   vma_insert(t, vma);
   if (vma->node && vma->node->inode && vma->node->inode->mmap_open_cb)
@@ -4841,6 +4873,17 @@ static u64 sys_mremap(void *old_addr, usize old_len, usize new_len, int flags,
                        MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
   if (mmap_failed(fresh))
     return fresh;
+  /* The moved mapping keeps its protection key: the entries being moved carry
+   * it already, and the rest of the destination has to as well. */
+  if (vma->pkey) {
+    extern void paging_mprotect_range(u64 start, u64 end, u64 flags);
+    struct vm_area *nv = vma_lookup(t, fresh);
+    if (nv)
+      nv->pkey = vma->pkey;
+    paging_mprotect_range(fresh, fresh + new_len,
+                          vmm_user_flags_from_prot((int)vma->prot) |
+                              VMM_PKEY_BITS(vma->pkey));
+  }
   /* This allocation does not go through the dispatcher, so it would otherwise
    * be missing from the trace — and it is the very range whose contents are in
    * question. */
@@ -4966,7 +5009,26 @@ void syscall_release_vma_locks(struct task *t) {
   }
 }
 
-static isize sys_mprotect(void *addr, usize length, int prot) {
+/* The key a mapping ends up with after mprotect (Linux's
+ * arch_override_mprotect_pkey): the one asked for; for PROT_EXEC alone the
+ * execute-only key; a mapping leaving execute-only goes back to key 0; any
+ * other mapping keeps its own. */
+static int mprotect_pkey_for(int old_pkey, u32 old_prot, int prot, int pkey) {
+  if (pkey != -1)
+    return pkey;
+  if (prot == PROT_EXEC) {
+    int xo = arch_execute_only_pkey();
+    if (xo > 0)
+      return xo;
+  } else if (old_prot == PROT_EXEC && old_pkey && arch_pkey_is_exec_only(old_pkey)) {
+    return 0;
+  }
+  return old_pkey;
+}
+
+/* mprotect(2) and pkey_mprotect(2); `pkey` -1 leaves each mapping's key to
+ * mprotect_pkey_for. */
+static isize sys_mprotect_pkey(void *addr, usize length, int prot, int pkey) {
   u64 start = (u64)(usize)addr;
   if (!is_canonical(start))
     return -EINVAL;
@@ -4975,6 +5037,8 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
   if (length == 0)
     return 0;
   if ((prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0)
+    return -EINVAL;
+  if (pkey != -1 && !arch_pkey_is_allocated(pkey))
     return -EINVAL;
 
   u64 end = (start + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -4999,16 +5063,20 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
     }
   }
 
-  // 1. Update hardware page tables
-  {
-    extern void paging_mprotect_range(u64 start, u64 end, u64 flags);
+  extern void paging_mprotect_range(u64 start, u64 end, u64 flags);
+  struct task *t = current_task;
 
+  /* Without keys every page gets the same entry: one walk, as before. */
+  if (!arch_pkeys_enabled()) {
     paging_mprotect_range(start, end, flags);
   }
 
-  // 2. Update VMAs (handle splitting if necessary)
-  struct task *t = current_task;
+  // Update VMAs (handle splitting if necessary), and with keys the tables one
+  // mapping at a time, since each mapping may keep a key of its own.
   struct vm_area *vma = vma_walk_start(t, start);
+  u64 cursor = start;
+  /* Pages under no mapping (the break) have key 0 unless one was asked for. */
+  int hole_pkey = pkey != -1 ? pkey : mprotect_pkey_for(0, 0, prot, -1);
 
   vma = vma ? vma->next : t->vma_list;
   while (vma) {
@@ -5030,23 +5098,39 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
       // The current VMA is now exactly within [start, end]
     }
 
+    if (arch_pkeys_enabled()) {
+      int k = mprotect_pkey_for(vma->pkey, vma->prot, prot, pkey);
+      if (cursor < vma->start)
+        paging_mprotect_range(cursor, vma->start,
+                              flags | VMM_PKEY_BITS(hole_pkey));
+      paging_mprotect_range(vma->start, vma->end, flags | VMM_PKEY_BITS(k));
+      vma->pkey = (u8)k;
+      cursor = vma->end;
+    }
     vma->prot = (u32)prot;
     vma = vma->next;
   }
+  if (arch_pkeys_enabled() && cursor < end)
+    paging_mprotect_range(cursor, end, flags | VMM_PKEY_BITS(hole_pkey));
 
   scheduler_sync_vma_head(t->pml4_phys, t->vma_list);
   vma_audit("mprotect");
   return 0;
 }
 
+static isize sys_mprotect(void *addr, usize length, int prot) {
+  return sys_mprotect_pkey(addr, length, prot, -1);
+}
+
+isize linux_modern_pkey_mprotect(u64 addr, u64 len, u64 prot, u64 pkey) {
+  return sys_mprotect_pkey((void *)(usize)addr, (usize)len, (int)prot,
+                           (int)(i64)pkey);
+}
+
 /* madvise(addr, length, advice). Only the calling process's own mapping is
  * touched. MADV_DONTNEED (and MADV_FREE, see below) drop the backing pages of
  * an anonymous range so the next access lazily refaults to a fresh zeroed page;
  * the hint advices are accepted as no-ops. */
-isize linux_modern_mprotect(u64 addr, u64 len, u64 prot) {
-  return sys_mprotect((void *)(usize)addr, (usize)len, (int)prot);
-}
-
 /* remap_file_pages(2): Linux has emulated it since 3.16 by mapping the same
  * file again at the requested offset over the range, and so does this. The
  * range must lie inside one shared file mapping. */

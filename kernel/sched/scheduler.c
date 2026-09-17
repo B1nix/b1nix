@@ -17,6 +17,7 @@
 #include <b1nix/kmsg.h>
 #include <b1nix/ktime.h>
 #include <b1nix/kprintf.h>
+#include <b1nix/pkeys.h>
 #include <b1nix/secretmem.h>
 #include <b1nix/sched.h>
 #include "../syscall/linux_modern.h"
@@ -2846,6 +2847,7 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
       g_task_alarm_interval_ticks[c_idx] = 0;
   g_task_nice[c_idx] = g_task_nice[p_idx]; /* POSIX: nice survives fork */
   linux_modern_fork_inherit(p_idx, c_idx); /* memory policy */
+  arch_pkru_fork(parent, child);
   g_task_tgid[c_idx] = child->id;          /* child is its own thread group leader */
   /* M63: the child inherits the parent's seccomp filter chain (shared,
    * refcounted) and no_new_privs — a fork can only ever be as restricted. */
@@ -4163,6 +4165,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   for (int r = 0; r < 16; r++)
     g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
   linux_modern_fork_inherit(p_idx, c_idx);
+  arch_pkru_fork(parent, child);
 
   /* Address-space inheritance. */
   if ((flags & B1NIX_CLONE_VM) && !(flags & B1NIX_CLONE_THREAD)) {
@@ -5123,6 +5126,9 @@ static int scheduler_yield_inner(void) {
    * other tasks and FP-heavy programs (e.g. cc1) corrupt silently. */
   task_fpu_save(old_task);
   old_task->fpu_initialized = 1;
+  /* Each thread's protection-key rights (x86 PKRU) travel with it, as the
+   * FPU register file does. */
+  arch_pkru_switch(old_task, new_task);
   if (!g_clean_fpu_ready) {
     /* old_task's state is already saved above; capture_clean reinits the live
      * FPU, which is fine since new_task's state is loaded immediately after. */
@@ -5306,6 +5312,7 @@ static int scheduler_yield_inner(void) {
     arch_set_fs_base(fsbase);
   }
   task_fpu_restore(old_task);
+  arch_pkru_switch(new_task, old_task);
 #endif
   if (restore_irqs)
     interrupts_enable();

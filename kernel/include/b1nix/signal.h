@@ -10,6 +10,9 @@ struct b1nix_sigframe {
   u64 magic;
   u64 old_blocked_signals;
   struct interrupt_frame saved_frame;
+  /* The interrupted thread's protection-key rights (x86 PKRU), put back by
+   * sigreturn; the handler itself runs with the initial rights. */
+  u64 pkru;
 } __attribute__((packed));
 
 /* M74: native siginfo_t handed to an SA_SIGINFO handler. Layout MUST match the

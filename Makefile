@@ -486,7 +486,7 @@ ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -m
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
 ASM_SOURCES := kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
-ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_panel.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c
+ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_panel.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c kernel/arch/x86_64/pkeys.c
 else ifeq ($(ARCH),aarch64)
 TARGET := aarch64-unknown-elf
 ARCH_CFLAGS := --target=$(TARGET) -mcpu=cortex-a53 -mgeneral-regs-only -DAARCH64
@@ -1319,7 +1319,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 print-%:
 	@echo '$($*)'
 
-.PHONY: all analyze objects FORCE iso iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-init iso-switchroot iso-live iso-test iso-full check-dynamic iso-pass-chromium-disk iso-pass-chromium-disk-impl \
+.PHONY: all analyze objects FORCE iso iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-pku iso-init iso-switchroot iso-live iso-test iso-full check-dynamic iso-pass-chromium-disk iso-pass-chromium-disk-impl \
 	iso-chromium-min-disk iso-chromium-min-disk-impl \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
@@ -2089,6 +2089,9 @@ SMOKE_CMDLINE_blk=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.
 # The IOMMU instances (VT-d and AMD-Vi): the kernel's own self-tests only, then a
 # poweroff. b1nix.acs-keep names the root port tests/smoke.sh pins at 00:1b.0.
 SMOKE_CMDLINE_iommu=b1nix.test=1 b1nix.smoke=iommu b1nix.acs-keep=00:1b.0
+# M124 protection keys: a CPU that has them (TCG -cpu max; the KVM lanes run on
+# whatever the host is). m124_smoke alone, then a restart.
+SMOKE_CMDLINE_pku=b1nix.test=1 b1nix.smoke=pku
 # M108 init: the default boot, checked as such. PID 1 is /sbin/init (BusyBox
 # init, no `init=` needed) and /etc/inittab drives OpenRC's runlevels under it.
 # This instance runs no part of the ordinary suite — it exists to prove the
@@ -2225,7 +2228,7 @@ ROOT_MODULE_ROOM ?= 96
 ROOT_MODULE_COMPRESS ?= zstd
 ROOT_MODULE = $(BUILD_DIR)/root-module.img
 
-iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
+iso-sys iso-sysnet iso-gfx iso-posix iso-blk iso-iommu iso-pku iso-init iso-switchroot iso-pass iso-pass-sway iso-pass-bright iso-pass-probe iso-pass-headless iso-pass-chromium: root-image check-dynamic $(KERNEL_ELF)
 	@# The stage directory is reused between builds, so a module staged by an
 	@# earlier one is still sitting in it and lands in the image whether this
 	@# build asked for it or not. That is how images meant to be forty

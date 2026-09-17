@@ -296,6 +296,7 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     vma->node = 0;
     vma->offset = 0;
     vma->special = 0;
+    vma->pkey = 0;
     vma_insert(current_task, vma);
 
     spin_lock_irqsave(&shm_lock, &flags);

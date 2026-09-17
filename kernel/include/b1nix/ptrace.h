@@ -217,10 +217,14 @@ void ptrace_exit_stop(struct task *t, int exit_code);
  * returns 1 when a record exists for `t`. */
 void ptrace_record_fault(struct task *t, int signo, u64 addr, int code);
 int ptrace_fault_info(struct task *t, int *signo, u64 *addr, int *code);
+/* After ptrace_record_fault of a SEGV_PKUERR: the key that refused it. */
+void ptrace_record_fault_pkey(struct task *t, u32 pkey);
+u32 ptrace_fault_pkey(struct task *t);
 
 /* Linux si_code values for the fault signals. */
 #define B1NIX_SEGV_MAPERR 1
 #define B1NIX_SEGV_ACCERR 2
+#define B1NIX_SEGV_PKUERR 4
 #define B1NIX_SI_KERNEL 0x80
 #define B1NIX_BUS_ADRERR 2
 

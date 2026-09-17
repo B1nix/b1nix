@@ -9,6 +9,7 @@
 #include <b1nix/rwlock.h>
 #include <b1nix/vfs.h>
 #include <b1nix/page_cache.h>
+#include <b1nix/pkeys.h>
 #include <b1nix/panic.h>
 #include <b1nix/klog.h>
 #include <stdio.h>
@@ -1964,7 +1965,7 @@ static int fault_from_file_cb(struct vm_area *vma, u64 page_aligned) {
     return -1;
 
   u64 flags = vmm_user_flags_from_prot((int)vma->prot) | VMM_PRESENT |
-              VMM_USER | VMM_SHARED;
+              VMM_USER | VMM_SHARED | VMM_PKEY_BITS(vma->pkey);
   u64 cflags;
   int rc = 0;
   vmm_write_acquire(&cflags);
@@ -1987,6 +1988,17 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
   if (!is_canonical(fault_addr)) {
     panic("Non-canonical address fault!");
+  }
+
+  /* A protection key refused the access. Nothing about the page is wrong, so
+   * nothing here can service it: from user mode it is the program's SIGSEGV
+   * (SEGV_PKUERR). From the kernel it is a copy that passed the key check
+   * before another thread changed the page's key; let that copy finish. */
+  if (error_code & PF_PK) {
+    if (!(error_code & PF_USER) && arch_pkru_kernel_fault())
+      return 0;
+    fault_note(0, 0, "protection key refused the access");
+    return -1;
   }
 
   extern void eviction_evict_page(void);
@@ -2263,6 +2275,14 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     u64 anon_user_flags =
         anon_vma ? vmm_user_flags_from_prot((int)anon_vma->prot) : VMM_USER;
     u64 anon_exec_bits = anon_user_flags & VMM_NO_EXECUTE;
+    /* The mapping's protection key, whoever faulted: a page a system call
+     * touches first must still carry the key of the mapping it belongs to. */
+    if (arch_pkeys_enabled() && current_task) {
+      struct vm_area *kv =
+          anon_vma ? anon_vma : vma_lookup(current_task, page_aligned);
+      if (kv && page_aligned >= kv->start && page_aligned < kv->end)
+        anon_exec_bits |= VMM_PKEY_BITS(kv->pkey);
+    }
 
     u64 zero_pg = (error_code & PF_WRITE) ? 0 : pmm_zero_page();
     if (zero_pg) {
@@ -2450,6 +2470,9 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
           (current_task && vma_lookup(current_task, page_aligned)))
         zflags |= VMM_USER;
       if (*slot & VMM_NO_EXECUTE) zflags |= VMM_NO_EXECUTE;
+      zflags |= (va && page_aligned >= va->start && page_aligned < va->end)
+                    ? VMM_PKEY_BITS(va->pkey)
+                    : (*slot & VMM_PKEY_MASK);
       *slot = pmm_zero_page() | zflags;
       if (vma_trace_faults_enabled())
         vma_trace_record("pf-lazy-zero", page_aligned, page_aligned + PAGE_SIZE);
@@ -2666,6 +2689,8 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
      * process's address space by construction, whoever faulted it in. */
     if ((error_code & PF_USER) || vma)
       flags |= VMM_USER;
+    /* The mapping's key where there is a mapping; the marker's otherwise. */
+    flags |= vma ? VMM_PKEY_BITS(vma->pkey) : (*slot & VMM_PKEY_MASK);
     if (vma_shared) flags |= VMM_SHARED;
     /* A writable MAP_PRIVATE file page must NOT map the shared page-cache
      * frame writable: the first store (e.g. ld.so applying relocations to a
@@ -2833,6 +2858,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     u64 flags = VMM_PRESENT | VMM_WRITABLE;
     if (*slot & VMM_USER) flags |= VMM_USER;
     if (*slot & VMM_NO_EXECUTE) flags |= VMM_NO_EXECUTE;
+    flags |= *slot & VMM_PKEY_MASK;
     *slot = new_frame | flags;
     if (vma_trace_faults_enabled())
       vma_trace_record("pf-cow-a", page_aligned, page_aligned + PAGE_SIZE);
@@ -3198,6 +3224,8 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
       tlb_shootdown_current_mm();
   }
 
+  if (!failed)
+    arch_pkeys_mm_clone(real_src_phys, dst_pml4_phys);
   if (failed) {
     /* Give back everything the half-made space holds -- its tables and the
      * references it took on the parent's pages -- and report the failure. The
@@ -3614,6 +3642,7 @@ void paging_free_address_space(u64 pml4_phys) {
     if (!pmm_claim_page_table_release(pml4_phys))
       return; /* another thread is already tearing this space down */
     spaces_remove(pml4_phys);
+    arch_pkeys_mm_release(pml4_phys);
 
     /* This space is going away and its PML4 frame is about to go back to the
      * allocator. Any CPU still recording it as "loaded" must be made to write
@@ -3708,6 +3737,7 @@ static void swap_in_recursive(u64 *table, int level, u64 base_addr, u64 pml4_phy
           u64 flags = VMM_PRESENT | VMM_WRITABLE;
           if (entry & VMM_USER) flags |= VMM_USER;
           if (entry & VMM_NO_EXECUTE) flags |= VMM_NO_EXECUTE;
+          flags |= entry & VMM_PKEY_MASK;
           table[i] = new_frame | flags;
           invalidate_page(vaddr);
           

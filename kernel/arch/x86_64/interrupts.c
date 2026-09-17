@@ -941,10 +941,15 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   /* The page-fault path's verdict when the page exists in no form a mapping
    * can supply (past the end of its file): SIGBUS rather than SIGSEGV. */
   int pf_sigbus = 0;
+  /* CR2 as the fault left it. The handler below runs with interrupts on, and
+   * any fault taken meanwhile — by an interrupt handler, or by another task
+   * this one is preempted for — rewrites CR2, so a later read can name some
+   * other fault's address. */
+  u64 pf_cr2 = frame->vector == 14 ? read_cr2() : 0;
 
   // Page fault handling for Demand Paging
   if (frame->vector == 14) {
-    u64 fault_addr = read_cr2();
+    u64 fault_addr = pf_cr2;
     u64 error_code = frame->error_code;
     /* Handle the fault with interrupts as the faulting code had them.
      *
@@ -1727,10 +1732,19 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
      * other fault reports the instruction pointer with SI_KERNEL. The record is
      * what the task's own SA_SIGINFO handler and a tracer's PTRACE_GETSIGINFO
      * both read back. */
-    if (frame->vector == 14 && sig == SIGBUS)
-      ptrace_record_fault(current_task, sig, read_cr2(), B1NIX_BUS_ADRERR);
-    else if (frame->vector == 14)
-      ptrace_record_fault(current_task, sig, read_cr2(),
+    if (frame->vector == 14 && sig == SIGBUS) {
+      ptrace_record_fault(current_task, sig, pf_cr2, B1NIX_BUS_ADRERR);
+    } else if (frame->vector == 14 && (frame->error_code & PF_PK)) {
+      /* Refused by a protection key: si_pkey names the mapping's key. */
+      u64 cr2 = pf_cr2;
+      struct vm_area *pv = vma_lookup(current_task, cr2);
+      ptrace_record_fault(current_task, sig, cr2, B1NIX_SEGV_PKUERR);
+      ptrace_record_fault_pkey(current_task,
+                               (pv && cr2 >= pv->start && cr2 < pv->end)
+                                   ? pv->pkey
+                                   : 0);
+    } else if (frame->vector == 14)
+      ptrace_record_fault(current_task, sig, pf_cr2,
                           (frame->error_code & 1) ? B1NIX_SEGV_ACCERR
                                                   : B1NIX_SEGV_MAPERR);
     else

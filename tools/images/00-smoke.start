@@ -46,6 +46,16 @@ elif grep -q 'b1nix.smoke=init' /proc/cmdline 2>/dev/null; then
     # never written on any other instance.
     : > /tmp/m108-openrc-local-ran
     exit 0
+elif grep -q 'b1nix.smoke=pku' /proc/cmdline 2>/dev/null; then
+    # M124 protection keys on an emulated CPU that has them. Under TCG the
+    # whole suite would take the better part of an hour, so this instance runs
+    # the one binary whose subject is the CPU feature, then restarts.
+    mkdir -p /mnt/host 2>/dev/null || true
+    mount -t 9p hostshare /mnt/host 2>/dev/null || true
+    [ -x /mnt/host/bin/m124_smoke ] && cp -f /mnt/host/bin/m124_smoke /bin/m124_smoke
+    /bin/m124_smoke
+    ( /bin/usleep 200000; /bin/reboot -f ) &
+    exit 0
 elif grep -q 'b1nix.smoke=iommu' /proc/cmdline 2>/dev/null; then
     # The IOMMU instances: the kernel's self-tests are the whole check and they
     # have run by the time userspace is up. End by RESTARTING through the real

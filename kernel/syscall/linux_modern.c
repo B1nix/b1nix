@@ -4,14 +4,16 @@
  * process_madvise/process_mrelease, cachestat, futex2 and openat2.
  *
  * Each answers the way Linux answers on a machine of this shape -- one NUMA
- * node, no protection-key hardware, one scheduling class -- rather than with
- * ENOSYS, and each is exercised by a probe that checks the result.
+ * node, protection keys only where the CPU has them, one scheduling class --
+ * rather than with ENOSYS, and each is exercised by a probe that checks the
+ * result.
  */
 #include <b1nix/errno.h>
 #include <b1nix/ktime.h>
 #include <b1nix/landlock.h>
 #include <b1nix/mm.h>
 #include <b1nix/page_cache.h>
+#include <b1nix/pkeys.h>
 #include <b1nix/posix.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/sched.h>
@@ -337,22 +339,18 @@ static isize lm_set_mempolicy_home_node(u64 start, u64 len, u64 node,
 
 /* ── protection keys ─────────────────────────────────────────────── */
 
-#define PKEY_DISABLE_ACCESS 0x1
-#define PKEY_DISABLE_WRITE  0x2
-
-/* Linux sizes the key space from the CPU: without the feature only key 0
- * exists, and it is the default key every mapping carries, never allocatable.
- * So pkey_alloc answers ENOSPC, pkey_free of anything EINVAL, and
- * pkey_mprotect behaves as mprotect for key -1 (and 0) only. */
+/* The keys themselves are the architecture's (x86 PKU); on a CPU without them
+ * pkey_alloc answers ENOSPC and pkey_free EINVAL, as Linux does. */
 static isize lm_pkey_alloc(u64 flags, u64 init) {
   if (flags || (init & ~(u64)(PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE)))
     return -EINVAL;
-  return -ENOSPC;
+  return arch_pkey_alloc((u32)init);
 }
 
 static isize lm_pkey_free(u64 pkey) {
-  (void)pkey;
-  return -EINVAL;
+  if ((i64)pkey < 0 || pkey > 0xffff)
+    return -EINVAL;
+  return arch_pkey_free((int)pkey);
 }
 
 /* ── sched_setattr / sched_getattr ───────────────────────────────── */
@@ -1240,11 +1238,8 @@ int linux_modern_syscall(u64 nr, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4,
     r = lm_pkey_free(a0);
     break;
   case LM_pkey_mprotect:
-    /* Key -1 is "no key": plain mprotect. Any other key was never allocated. */
-    if ((i64)a3 != -1)
-      r = -EINVAL;
-    else
-      r = linux_modern_mprotect(a0, a1, a2);
+    /* Key -1 is "no key": plain mprotect. Any other key must be allocated. */
+    r = linux_modern_pkey_mprotect(a0, a1, a2, a3);
     break;
   case LM_sched_setattr:
     r = lm_sched_setattr(a0, a1, a2);

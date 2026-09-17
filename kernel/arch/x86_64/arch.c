@@ -928,6 +928,8 @@ int x86_check_cpu_state_uniform(void) {
   return ok;
 }
 
+void x86_enable_pku(int bsp);
+
 void arch_init(void) {
   x86_tss_init();
   x86_idt_init();
@@ -938,6 +940,7 @@ void arch_init(void) {
   x86_enable_write_protect();
   x86_enable_smep(1);
   x86_enable_sse();
+  x86_enable_pku(1);
   /* M98: program this CPU's IA32_PAT so VMM_WC means write-combining. */
   pat_init_cpu();
   x86_record_cpu_state(0);
@@ -977,6 +980,7 @@ void x86_ap_arch_init(int cpu) {
   pat_init_cpu();         /* per-CPU IA32_PAT: WC PTEs mean WC on this core too */
   x86_enable_write_protect();
   x86_enable_smep(0);     /* per-CPU CR4 bit; the AP is past its trampoline here */
+  x86_enable_pku(0);      /* per-CPU CR4.PKE, only where the boot CPU has it */
   /* Software-enable this AP's LAPIC + TPR/LVT setup. Without this the AP's
    * LAPIC stays in its reset (software-disabled) state and every locally-
    * delivered vector — including the LAPIC timer we arm later in ap_main
@@ -1018,7 +1022,7 @@ void arch_cpu_flags(char *buf, usize len) {
     {7,1,0,"fsgsbase"},{7,1,3,"bmi1"},{7,1,5,"avx2"},{7,1,7,"smep"},
     {7,1,8,"bmi2"},{7,1,9,"erms"},{7,1,10,"invpcid"},{7,1,16,"avx512f"},
     {7,1,18,"rdseed"},{7,1,19,"adx"},{7,1,20,"smap"},{7,1,29,"sha_ni"},
-    {7,2,2,"umip"},{7,2,22,"rdpid"},
+    {7,2,2,"umip"},{7,2,3,"pku"},{7,2,4,"ospke"},{7,2,22,"rdpid"},
   };
   u32 r1[4] = {0}, r7[4] = {0}, r81[4] = {0}, a, b, c, d;
   usize used = 0;

@@ -27,6 +27,31 @@
  *                          the next, whether its block was kept or released
  *   secret-many            600 pages (more than one hidden 2 MiB block) each
  *                          keep their own contents
+ *
+ * Protection keys, on a CPU without them (the ordinary lanes' KVM CPUs):
+ *   pkey-absent            pkey_alloc is ENOSPC, pkey_free EINVAL,
+ *                          pkey_mprotect with key -1 is mprotect and with any
+ *                          other key EINVAL, and nothing claims pku in cpuinfo
+ * and on one with them (the pku lane, TCG -cpu max):
+ *   pkey-cpuinfo           /proc/cpuinfo lists pku and ospke
+ *   pkey-alloc             keys 1..15 in order, then ENOSPC; a freed key is
+ *                          handed out again; bad flags, rights and frees EINVAL
+ *   pkey-rights            pkey_alloc's rights land in the caller's PKRU
+ *   pkey-access-disable    a page under a key its PKRU access-disables faults
+ *                          on read with SIGSEGV/SEGV_PKUERR naming the key
+ *   pkey-write-disable     write-disable lets reads through and faults writes
+ *   pkey-mprotect-keeps    plain mprotect keeps a mapping's key; pkey_mprotect
+ *                          of an unallocated key is EINVAL
+ *   pkey-kernel-copy       write(2) from and read(2) into a key-refused page
+ *                          are EFAULT, and work once the rights allow them
+ *   pkey-threads           a new thread starts with its creator's PKRU, and
+ *                          rights one thread changes are its own
+ *   pkey-signal            a handler runs with the initial rights, and the
+ *                          interrupted rights are back after it returns
+ *   pkey-fork-exec         a fork child keeps the keys and rights; an exec'd
+ *                          program has no keys and the initial PKRU
+ *   pkey-exec-only         mprotect(PROT_EXEC) alone makes code callable but
+ *                          unreadable (SEGV_PKUERR on a read)
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -47,6 +72,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -473,7 +499,432 @@ static void check_secret_many(int r) {
   }
 }
 
-int main(void) {
+
+/* ── protection keys ──────────────────────────────────────────────────────── */
+
+#define PKRU_INIT 0x55555554u
+#define PKEY_DISABLE_ACCESS 0x1
+#define PKEY_DISABLE_WRITE 0x2
+
+static int pkey_alloc_(unsigned long flags, unsigned long rights) {
+  return (int)syscall(SYS_pkey_alloc, flags, rights);
+}
+static int pkey_free_(int k) { return (int)syscall(SYS_pkey_free, k); }
+static int pkey_mprotect_(void *a, size_t n, int prot, int k) {
+  return (int)syscall(SYS_pkey_mprotect, a, n, prot, k);
+}
+
+/* The whole of a /proc file: a read may return less than the file holds. */
+static ssize_t read_all(const char *path, char *b, size_t cap) {
+  int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return -1;
+  size_t n = 0;
+  for (;;) {
+    ssize_t got = read(fd, b + n, cap - 1 - n);
+    if (got <= 0)
+      break;
+    n += (size_t)got;
+    if (n == cap - 1)
+      break;
+  }
+  close(fd);
+  b[n] = 0;
+  return (ssize_t)n;
+}
+
+static int cpu_has_pkeys(void) {
+  char b[16384];
+  return read_all("/proc/cpuinfo", b, sizeof(b)) > 0 && strstr(b, " ospke") != 0;
+}
+
+#if defined(__x86_64__)
+static unsigned rdpkru_(void) {
+  unsigned a, d;
+  __asm__ volatile("rdpkru" : "=a"(a), "=d"(d) : "c"(0));
+  (void)d;
+  return a;
+}
+static void wrpkru_(unsigned v) { __asm__ volatile("wrpkru" : : "a"(v), "c"(0), "d"(0)); }
+#else
+static unsigned rdpkru_(void) { return 0; }
+static void wrpkru_(unsigned v) { (void)v; }
+#endif
+
+static void set_rights(int k, unsigned rights) {
+  unsigned v = rdpkru_();
+  v &= ~(3u << (2 * k));
+  wrpkru_(v | (rights << (2 * k)));
+}
+
+static void check_pkey_absent(int r) {
+  errno = 0;
+  if (pkey_alloc_(0, 0) != -1 || errno != ENOSPC) {
+    reportf(r, "pkey_alloc not ENOSPC (errno %d)", errno);
+    return;
+  }
+  errno = 0;
+  if (pkey_free_(1) != -1 || errno != EINVAL) {
+    reportf(r, "pkey_free(1) not EINVAL (errno %d)", errno);
+    return;
+  }
+  char *p = mmap(0, PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED || pkey_mprotect_(p, PG, PROT_READ, -1) != 0) {
+    reportf(r, "pkey_mprotect(-1) errno %d", errno);
+    return;
+  }
+  errno = 0;
+  if (pkey_mprotect_(p, PG, PROT_READ, 1) != -1 || errno != EINVAL)
+    reportf(r, "pkey_mprotect(1) not EINVAL (errno %d)", errno);
+}
+
+static void check_pkey_cpuinfo(int r) {
+  char b[16384];
+  if (read_all("/proc/cpuinfo", b, sizeof(b)) <= 0) {
+    reportf(r, "read /proc/cpuinfo errno %d", errno);
+    return;
+  }
+  if (!strstr(b, " pku ") || !strstr(b, " ospke"))
+    reportf(r, "flags lack pku/ospke");
+}
+
+static void check_pkey_alloc(int r) {
+  for (int want = 1; want < 16; want++) {
+    int k = pkey_alloc_(0, 0);
+    if (k != want) {
+      reportf(r, "allocation %d returned %d errno %d", want, k, errno);
+      return;
+    }
+  }
+  errno = 0;
+  if (pkey_alloc_(0, 0) != -1 || errno != ENOSPC) {
+    reportf(r, "16th key not ENOSPC (errno %d)", errno);
+    return;
+  }
+  if (pkey_free_(7) != 0 || pkey_alloc_(0, 0) != 7) {
+    reportf(r, "freed key 7 not handed out again");
+    return;
+  }
+  if (pkey_free_(9) != 0) {
+    reportf(r, "pkey_free(9) errno %d", errno);
+    return;
+  }
+  errno = 0;
+  if (pkey_free_(9) != -1 || errno != EINVAL) {
+    reportf(r, "double pkey_free not EINVAL (errno %d)", errno);
+    return;
+  }
+  errno = 0;
+  if (pkey_free_(16) != -1 || errno != EINVAL) {
+    reportf(r, "pkey_free(16) not EINVAL (errno %d)", errno);
+    return;
+  }
+  errno = 0;
+  if (pkey_alloc_(1, 0) != -1 || errno != EINVAL) {
+    reportf(r, "flags accepted (errno %d)", errno);
+    return;
+  }
+  errno = 0;
+  if (pkey_alloc_(0, 4) != -1 || errno != EINVAL)
+    reportf(r, "rights 4 accepted (errno %d)", errno);
+}
+
+static void check_pkey_rights(int r) {
+  int a = pkey_alloc_(0, PKEY_DISABLE_ACCESS);
+  int w = pkey_alloc_(0, PKEY_DISABLE_WRITE);
+  int n = pkey_alloc_(0, 0);
+  unsigned v = rdpkru_();
+  if (a < 0 || w < 0 || n < 0) {
+    reportf(r, "alloc errno %d", errno);
+    return;
+  }
+  if (((v >> (2 * a)) & 3) != 1 || ((v >> (2 * w)) & 3) != 2 ||
+      ((v >> (2 * n)) & 3) != 0)
+    reportf(r, "PKRU %08x for keys %d/%d/%d", v, a, w, n);
+}
+
+static char *keyed_page(int *key_out, int rights) {
+  int k = pkey_alloc_(0, 0);
+  char *p = mmap(0, PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (k < 0 || p == MAP_FAILED)
+    return 0;
+  p[0] = 'k'; /* resident before the key: both kinds of entry get covered */
+  if (pkey_mprotect_(p, PG, PROT_READ | PROT_WRITE, k) != 0)
+    return 0;
+  set_rights(k, (unsigned)rights);
+  *key_out = k;
+  return p;
+}
+
+static int fault_with(void (*fn)(char *), char *p) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = on_fault;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGSEGV, &sa, 0);
+  g_sig = 0;
+  if (sigsetjmp(g_jmp, 1) == 0) {
+    fn(p);
+    return 0;
+  }
+  return 1;
+}
+
+static void touch_read(char *p) { volatile char c = p[1]; (void)c; }
+static void touch_write(char *p) { p[2] = 'w'; }
+
+/* si_pkey: _sigfault._addr_pkey._pkey, 32 bytes into siginfo_t. */
+static volatile unsigned g_pkey_seen;
+static void on_pkey_fault(int sig, siginfo_t *si, void *uc) {
+  (void)uc;
+  g_sig = sig;
+  g_code = si->si_code;
+  g_addr = si->si_addr;
+  memcpy((void *)&g_pkey_seen, (char *)si + 32, sizeof(unsigned));
+  siglongjmp(g_jmp, 1);
+}
+
+static int keyed_fault(void (*fn)(char *), char *p) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = on_pkey_fault;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGSEGV, &sa, 0);
+  g_sig = 0;
+  if (sigsetjmp(g_jmp, 1) == 0) {
+    fn(p);
+    return 0;
+  }
+  return 1;
+}
+
+#define SEGV_PKUERR_ 4
+
+static void check_pkey_access_disable(int r) {
+  int k;
+  char *p = keyed_page(&k, PKEY_DISABLE_ACCESS);
+  if (!p) {
+    reportf(r, "setup errno %d", errno);
+    return;
+  }
+  if (!keyed_fault(touch_read, p) || g_sig != SIGSEGV || g_code != SEGV_PKUERR_ ||
+      g_addr != p + 1 || g_pkey_seen != (unsigned)k) {
+    reportf(r, "read: signal %d code %d addr %p pkey %u (want key %d at %p)",
+            g_sig, g_code, g_addr, g_pkey_seen, k, (void *)(p + 1));
+    return;
+  }
+  set_rights(k, 0);
+  if (fault_with(touch_read, p) || p[0] != 'k')
+    reportf(r, "read with the rights cleared faulted");
+}
+
+static void check_pkey_write_disable(int r) {
+  int k;
+  char *p = keyed_page(&k, PKEY_DISABLE_WRITE);
+  if (!p) {
+    reportf(r, "setup errno %d", errno);
+    return;
+  }
+  if (fault_with(touch_read, p)) {
+    reportf(r, "read under write-disable faulted (code %d)", g_code);
+    return;
+  }
+  if (!keyed_fault(touch_write, p) || g_code != SEGV_PKUERR_ ||
+      g_pkey_seen != (unsigned)k) {
+    reportf(r, "write: faulted=%d code %d pkey %u", g_sig, g_code, g_pkey_seen);
+    return;
+  }
+  set_rights(k, 0);
+  if (fault_with(touch_write, p) || p[2] != 'w')
+    reportf(r, "write with the rights cleared failed");
+}
+
+static void check_pkey_mprotect_keeps(int r) {
+  int k;
+  char *p = keyed_page(&k, 0);
+  if (!p) {
+    reportf(r, "setup errno %d", errno);
+    return;
+  }
+  /* A page never touched before the key, too. */
+  char *q = mmap(0, 4 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                 -1, 0);
+  if (q == MAP_FAILED || pkey_mprotect_(q, 4 * PG, PROT_READ | PROT_WRITE, k) ||
+      mprotect(p, PG, PROT_READ) || mprotect(q, 4 * PG, PROT_READ | PROT_WRITE)) {
+    reportf(r, "mprotect errno %d", errno);
+    return;
+  }
+  set_rights(k, PKEY_DISABLE_ACCESS);
+  if (!keyed_fault(touch_read, p) || g_pkey_seen != (unsigned)k) {
+    reportf(r, "mprotect dropped the key of a resident page");
+    return;
+  }
+  if (!keyed_fault(touch_read, q + 3 * PG) || g_code != SEGV_PKUERR_ ||
+      g_pkey_seen != (unsigned)k) {
+    reportf(r, "a page first touched after the key lacks it (code %d)", g_code);
+    return;
+  }
+  set_rights(k, 0);
+  errno = 0;
+  if (pkey_mprotect_(q, PG, PROT_READ, 14) != -1 || errno != EINVAL)
+    reportf(r, "unallocated key 14 accepted (errno %d)", errno);
+}
+
+static void check_pkey_kernel_copy(int r) {
+  int k;
+  char *p = keyed_page(&k, PKEY_DISABLE_ACCESS);
+  int pp[2];
+  if (!p || pipe(pp) != 0) {
+    reportf(r, "setup errno %d", errno);
+    return;
+  }
+  errno = 0;
+  if (write(pp[1], p, 4) != -1 || errno != EFAULT) {
+    reportf(r, "write from a refused page not EFAULT (errno %d)", errno);
+    return;
+  }
+  if (write(pp[1], "abcd", 4) != 4) {
+    reportf(r, "pipe write errno %d", errno);
+    return;
+  }
+  errno = 0;
+  if (read(pp[0], p + 8, 4) != -1 || errno != EFAULT) {
+    reportf(r, "read into a refused page not EFAULT (errno %d)", errno);
+    return;
+  }
+  set_rights(k, 0);
+  /* A read that failed may or may not have consumed the bytes; offer them
+   * again so either way the next four read "abcd". */
+  if (write(pp[1], "abcd", 4) != 4 || read(pp[0], p + 8, 4) != 4 ||
+      memcmp(p + 8, "abcd", 4) != 0 || write(pp[1], p, 1) != 1)
+    reportf(r, "copies with the rights cleared failed (errno %d)", errno);
+}
+
+static volatile unsigned g_thread_pkru_start, g_thread_pkru_after;
+static void *pkey_thread(void *arg) {
+  g_thread_pkru_start = rdpkru_();
+  set_rights((int)(long)arg, PKEY_DISABLE_WRITE);
+  g_thread_pkru_after = rdpkru_();
+  return 0;
+}
+
+static void check_pkey_threads(int r) {
+  int k = pkey_alloc_(0, PKEY_DISABLE_ACCESS);
+  if (k < 0) {
+    reportf(r, "alloc errno %d", errno);
+    return;
+  }
+  unsigned mine = rdpkru_();
+  pthread_t t;
+  if (pthread_create(&t, 0, pkey_thread, (void *)(long)k) != 0) {
+    reportf(r, "pthread_create failed");
+    return;
+  }
+  pthread_join(t, 0);
+  if (g_thread_pkru_start != mine) {
+    reportf(r, "thread started with %08x, creator had %08x", g_thread_pkru_start,
+            mine);
+    return;
+  }
+  if (((g_thread_pkru_after >> (2 * k)) & 3) != 2 || rdpkru_() != mine)
+    reportf(r, "thread's change leaked (thread %08x, creator had %08x, now %08x)",
+            g_thread_pkru_after, mine, rdpkru_());
+}
+
+static volatile unsigned g_handler_pkru;
+static void on_usr1(int sig) {
+  (void)sig;
+  g_handler_pkru = rdpkru_();
+}
+
+static void check_pkey_signal(int r) {
+  int k = pkey_alloc_(0, 0);
+  if (k < 0) {
+    reportf(r, "alloc errno %d", errno);
+    return;
+  }
+  set_rights(k, PKEY_DISABLE_WRITE);
+  unsigned before = rdpkru_();
+  signal(SIGUSR1, on_usr1);
+  raise(SIGUSR1);
+  if (g_handler_pkru != PKRU_INIT) {
+    reportf(r, "handler ran with %08x", g_handler_pkru);
+    return;
+  }
+  if (rdpkru_() != before)
+    reportf(r, "after the handler %08x, before %08x", rdpkru_(), before);
+}
+
+static void check_pkey_fork_exec(int r) {
+  int k = pkey_alloc_(0, PKEY_DISABLE_WRITE);
+  if (k < 0) {
+    reportf(r, "alloc errno %d", errno);
+    return;
+  }
+  unsigned mine = rdpkru_();
+  pid_t c = fork();
+  if (c == 0) {
+    int ok_rights = rdpkru_() == mine;
+    int ok_key = pkey_free_(k) == 0;
+    _exit(ok_rights && ok_key ? 0 : 1);
+  }
+  int st;
+  waitpid(c, &st, 0);
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    reportf(r, "fork child lost the key or the rights");
+    return;
+  }
+  char karg[8];
+  snprintf(karg, sizeof(karg), "%d", k);
+  c = fork();
+  if (c == 0) {
+    execl("/proc/self/exe", "m124_smoke", "--pkey-exec-probe", karg, (char *)0);
+    _exit(2);
+  }
+  waitpid(c, &st, 0);
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+    reportf(r, "exec'd program: status %d (1 = key or rights survived exec)",
+            WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+}
+
+/* In the exec'd image: no key but 0 is allocated, and PKRU is the initial one. */
+static int pkey_exec_probe(const char *karg) {
+  int k = atoi(karg);
+  errno = 0;
+  int freed = pkey_free_(k);
+  return (freed == -1 && errno == EINVAL && rdpkru_() == PKRU_INIT) ? 0 : 1;
+}
+
+static void check_pkey_exec_only(int r) {
+  char *p = mmap(0, PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) {
+    reportf(r, "mmap errno %d", errno);
+    return;
+  }
+  /* mov $42, %eax; ret */
+  static const unsigned char code[] = {0xb8, 42, 0, 0, 0, 0xc3};
+  memcpy(p, code, sizeof(code));
+  if (mprotect(p, PG, PROT_EXEC) != 0) {
+    reportf(r, "mprotect(PROT_EXEC) errno %d", errno);
+    return;
+  }
+  int (*fn)(void) = (int (*)(void))(void *)p;
+  if (fn() != 42) {
+    reportf(r, "execute-only code did not run");
+    return;
+  }
+  if (!keyed_fault(touch_read, p) || g_code != SEGV_PKUERR_) {
+    reportf(r, "read of execute-only page: faulted %d code %d", g_sig, g_code);
+    return;
+  }
+  /* And back: readable again once it is not execute-only. */
+  if (mprotect(p, PG, PROT_READ | PROT_EXEC) != 0 || p[0] != (char)0xb8)
+    reportf(r, "PROT_READ|PROT_EXEC did not make it readable");
+}
+
+int main(int argc, char **argv) {
+  if (argc == 3 && strcmp(argv[1], "--pkey-exec-probe") == 0)
+    return pkey_exec_probe(argv[2]);
   marker("M124-SMOKE: start\n");
   run("secret-create", check_secret_create);
   run("secret-size-once", check_secret_size_once);
@@ -487,6 +938,21 @@ int main(void) {
   run("secret-memlock", check_secret_memlock);
   run("secret-scrubbed", check_secret_scrubbed);
   run("secret-many", check_secret_many);
+  if (!cpu_has_pkeys()) {
+    run("pkey-absent", check_pkey_absent);
+  } else {
+    run("pkey-cpuinfo", check_pkey_cpuinfo);
+    run("pkey-alloc", check_pkey_alloc);
+    run("pkey-rights", check_pkey_rights);
+    run("pkey-access-disable", check_pkey_access_disable);
+    run("pkey-write-disable", check_pkey_write_disable);
+    run("pkey-mprotect-keeps", check_pkey_mprotect_keeps);
+    run("pkey-kernel-copy", check_pkey_kernel_copy);
+    run("pkey-threads", check_pkey_threads);
+    run("pkey-signal", check_pkey_signal);
+    run("pkey-fork-exec", check_pkey_fork_exec);
+    run("pkey-exec-only", check_pkey_exec_only);
+  }
   marker(g_fail ? "M124-SMOKE: done with failures\n" : "M124-SMOKE: done\n");
   return 0;
 }

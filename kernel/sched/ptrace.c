@@ -575,6 +575,8 @@ struct ptrace_fault {
   int signo;
   int code;
   u64 addr;
+  /* SEGV_PKUERR: the protection key of the page (siginfo si_pkey). */
+  u32 pkey;
 };
 static struct ptrace_fault g_faults[PTRACE_MAX];
 
@@ -598,8 +600,37 @@ void ptrace_record_fault(struct task *t, int signo, u64 addr, int code) {
     slot->signo = signo;
     slot->code = code;
     slot->addr = addr;
+    slot->pkey = 0;
   }
   spin_unlock_irqrestore(&g_ptrace_lock, flags);
+}
+
+void ptrace_record_fault_pkey(struct task *t, u32 pkey) {
+  if (!t)
+    return;
+  u64 flags;
+  spin_lock_irqsave(&g_ptrace_lock, &flags);
+  for (usize i = 0; i < PTRACE_MAX; i++)
+    if (g_faults[i].used && g_faults[i].pid == t->id) {
+      g_faults[i].pkey = pkey;
+      break;
+    }
+  spin_unlock_irqrestore(&g_ptrace_lock, flags);
+}
+
+u32 ptrace_fault_pkey(struct task *t) {
+  u32 pkey = 0;
+  if (!t)
+    return 0;
+  u64 flags;
+  spin_lock_irqsave(&g_ptrace_lock, &flags);
+  for (usize i = 0; i < PTRACE_MAX; i++)
+    if (g_faults[i].used && g_faults[i].pid == t->id) {
+      pkey = g_faults[i].pkey;
+      break;
+    }
+  spin_unlock_irqrestore(&g_ptrace_lock, flags);
+  return pkey;
 }
 
 int ptrace_fault_info(struct task *t, int *signo, u64 *addr, int *code) {

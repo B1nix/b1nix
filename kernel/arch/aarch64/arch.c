@@ -9,6 +9,8 @@
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/vdso.h>
+#include <b1nix/pkeys.h>
+#include <b1nix/errno.h>
 
 extern void interrupts_init(void);
 
@@ -860,3 +862,24 @@ void arch_cpu_flags(char *buf, usize len)
 		buf[used] = 0;
 	}
 }
+
+/* Memory protection keys: arm64 implements them with the Permission Overlay
+ * Extension, which no CPU this port runs on has. Linux on such a CPU answers
+ * as below — no key can be allocated and PKRU does not exist. */
+int arch_pkeys_enabled(void) { return 0; }
+int arch_pkey_alloc(u32 rights) { (void)rights; return -ENOSPC; }
+int arch_pkey_free(int pkey) { (void)pkey; return -EINVAL; }
+int arch_pkey_is_allocated(int pkey) { (void)pkey; return 0; }
+int arch_execute_only_pkey(void) { return -1; }
+int arch_pkey_is_exec_only(int pkey) { (void)pkey; return 0; }
+int arch_pkey_allows(int pkey, int write) { (void)pkey, (void)write; return 1; }
+u32 arch_pkru_user_get(void) { return 0; }
+void arch_pkru_user_set(u32 value) { (void)value; }
+int arch_pkru_kernel_fault(void) { return 0; }
+void arch_pkru_return_to_user(void) {}
+void arch_pkru_switch(struct task *prev, struct task *next) { (void)prev, (void)next; }
+void arch_pkru_fork(struct task *parent, struct task *child) { (void)parent, (void)child; }
+void arch_pkeys_exec(void) {}
+void arch_pkeys_signal_rights(void) {}
+void arch_pkeys_mm_clone(u64 parent_root, u64 child_root) { (void)parent_root, (void)child_root; }
+void arch_pkeys_mm_release(u64 root) { (void)root; }

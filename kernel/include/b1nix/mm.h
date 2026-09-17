@@ -140,6 +140,18 @@ static inline u64 vmm_user_flags_from_prot(int prot) {
   return flags;
 }
 
+/* Protection key of a user page (x86 PKU): bits 62:59 of the entry. Nothing
+ * else may use them; an architecture without keys never sets them. */
+#if defined(__x86_64__)
+#define VMM_PKEY_SHIFT 59
+#define VMM_PKEY_MASK (0xFULL << VMM_PKEY_SHIFT)
+#else
+#define VMM_PKEY_SHIFT 59
+#define VMM_PKEY_MASK 0ULL
+#endif
+#define VMM_PKEY_BITS(pkey) (((u64)(pkey) << VMM_PKEY_SHIFT) & VMM_PKEY_MASK)
+#define VMM_PKEY_OF(entry) ((int)(((entry) & VMM_PKEY_MASK) >> VMM_PKEY_SHIFT))
+
 /* vmm_handle_page_fault's answer for an access to a page a file mapping
  * cannot supply, such as one past the end of the file: SIGBUS, where every
  * other failure is SIGSEGV. */
@@ -180,6 +192,8 @@ static inline u64 vmm_user_flags_from_prot(int prot) {
 #define PF_PRESENT (1ULL << 0)
 #define PF_WRITE (1ULL << 1)
 #define PF_USER (1ULL << 2)
+/* x86: the access was refused by a protection key (PKRU), not by the entry. */
+#define PF_PK (1ULL << 5)
 #define PF_RESERVED (1ULL << 3)
 #define PF_INSTR (1ULL << 4)
 

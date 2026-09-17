@@ -204,6 +204,9 @@ struct vm_area {
   /* VMA_SPECIAL_* (<b1nix/vdso.h>): a kernel-owned mapping with rules of its
    * own — [vvar] and [vdso]. 0 for everything a process mapped itself. */
   u32 special;
+  /* Protection key every page of the mapping carries (pkey_mprotect); 0 is
+   * the default key, and the only one without key hardware. */
+  u8 pkey;
   struct vm_area *next;
   /* Only while retired: the list of mappings unlinked but not yet freed,
    * because a page-fault walker may still be holding one. See vma_retire. */

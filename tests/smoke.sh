@@ -427,6 +427,9 @@ run_qemu() {
 				accel_args="-accel hvf -cpu host"
 			fi
 		fi
+		# A lane whose subject is a CPU feature the host may not have names its
+		# own accelerator and model (the pku lane: TCG, -cpu max).
+		[ -n "${SMOKE_ACCEL:-}" ] && accel_args="$SMOKE_ACCEL"
 
 		# RAM: QEMU's default (128 MiB) starves the graphics tests (setcrtc,
 		# console-reclaim), so the headroom stays.
@@ -944,7 +947,7 @@ else
 		# root disk; no command line opens an ISO. Building the lane ISOs there
 		# repacked seven images (two of them 268 MB), ~10 s, on every kernel
 		# change. What the lanes do use is the kernel and the checked root.
-		LANE_TARGETS="iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-iommu iso-init iso-switchroot"
+		LANE_TARGETS="iso-sys $SYSNET_ISO_TARGET iso-blk iso-posix iso-gfx iso-iommu iso-pku iso-init iso-switchroot"
 		[ "$ARCH" = "aarch64" ] && LANE_TARGETS="check-dynamic build/$ARCH/kernel.elf"
 		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} \
 			$LANE_TARGETS \
@@ -1036,7 +1039,7 @@ _mkimg() {  # mkimg <instance-suffix>
 }
 _mkimg sys
 [ "$SMOKE_PARALLEL" = "1" ] && {
-    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg smp; _mkimg switchroot
+    _mkimg sysnet; _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg init; _mkimg iommu; _mkimg amdvi; _mkimg pku; _mkimg smp; _mkimg switchroot
 }
 rm -rf "$_MKIMG_TMPL"
 
@@ -1052,6 +1055,7 @@ INIT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-init-$ARCH.log"
 SWITCHROOT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-switchroot-$ARCH.log"
 IOMMU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-iommu-$ARCH.log"
 AMDVI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-amdvi-$ARCH.log"
+PKU_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-pku-$ARCH.log"
 RASPI_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-raspi-$ARCH.log"
 
 # Prune leftovers from earlier runs.
@@ -1533,6 +1537,31 @@ launch_amdvi() {
 	pid_amdvi=$!
 }
 
+# M124: protection keys on a CPU that has them. The KVM lanes get the host's
+# CPU, and a host without PKU cannot lend it; QEMU's TCG models it, so this lane
+# boots its own small image there and runs m124_smoke alone. aarch64 keys need
+# the Permission Overlay Extension, which QEMU does not model.
+launch_pku() {
+	[ "$ARCH" = "aarch64" ] && return 0
+	(
+		SATA_IMG=$(disk_img sata pku)
+		AHCI_IMG=$(disk_img ahci pku)
+		NVME_IMG=$(disk_img nvme pku)
+		SWAP_IMG=$(disk_img swap pku)
+		B1NIX_ISO_NAME=b1nix-pku.iso
+		SMOKE_ACCEL="-accel tcg -cpu max"
+		SMOKE_SMP=1
+		SMOKE_DONE_PATTERN="reboot: restarting|KERNEL PANIC|\[PANIC\]"
+		SMOKE_DONE_SETTLE=5
+		STALL_TIMEOUT=${SMOKE_PKU_STALL:-600}
+		TIMEOUT=${SMOKE_PKU_TIMEOUT:-1500}
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[pku]  "
+		run_qemu "$PKU_LOG"
+	) &
+	pid_pku=$!
+}
+
 launch_smp_solo() {
 	(
 		SATA_IMG=$(disk_img sata smp)
@@ -1645,7 +1674,7 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	# in the bootloader, before the guest clock starts: switchroot does 4 s of
 	# work and takes 37 s. Ordered by guest time they started last and the whole
 	# suite ended when they did.
-	_inst_list="switchroot blk sysnet posix sys gfx iommu init amdvi"
+	_inst_list="pku switchroot blk sysnet posix sys gfx iommu init amdvi"
 	# The Raspberry Pi lane is off by default, and not because it is broken.
 	#
 	# It is the one instance no accelerator can take: HVF needs -cpu host and
@@ -1674,14 +1703,14 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	if [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMOKE_INSTANCES " | grep -q " smp "; then
 		_ran_list="$_ran_list smp"
 	fi
-	for _known in sys sysnet blk posix gfx init switchroot iommu amdvi raspi smp; do
+	for _known in sys sysnet blk posix gfx init switchroot iommu amdvi pku raspi smp; do
 		case " $_ran_list " in
 		*" $_known "*) continue ;;
 		esac
 		rm -f "$PROJECT_DIR/smoke_run/b1nix-smoke-$_known-$ARCH.log"
 	done
 	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
-	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$RASPI_LOG" 2>/dev/null >"$LOG" || true
+	cat "$SYS_LOG" "$SYSNET_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$INIT_LOG" "$SWITCHROOT_LOG" "$IOMMU_LOG" "$AMDVI_LOG" "$PKU_LOG" "$RASPI_LOG" 2>/dev/null >"$LOG" || true
 else
 	launch_sys
 	launch_smp_solo
@@ -1706,7 +1735,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	for _i in sys sysnet blk posix gfx init switchroot iommu amdvi smp; do
+	for _i in sys sysnet blk posix gfx init switchroot iommu amdvi pku smp; do
 	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" "$(disk_img vblk "$_i")"
 	done
 	[ "$FAILED" -eq 0 ]
@@ -3002,6 +3031,40 @@ check_output "$LOG" "M124-SMOKE: ok secret-memlock" "secret mappings count again
 check_output "$LOG" "M124-SMOKE: ok secret-scrubbed" "a page freed by one secret file reads as zeros in the next, whether its hidden block was kept or released"
 check_output "$LOG" "M124-SMOKE: ok secret-many" "600 secret pages across more than one hidden 2 MiB block each keep their own contents"
 check_output "$LOG" "M124-SMOKE: done" "M124 suite completes"
+# Protection keys. The lanes above run on the host's CPU; one without PKU must
+# answer as Linux does there. The pku lane (TCG -cpu max) has the hardware.
+if grep -qa "M124-SMOKE: ok pkey-cpuinfo" "$POSIX_LOG" 2>/dev/null; then
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-cpuinfo" "/proc/cpuinfo lists pku and ospke once CR4.PKE is set"
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-alloc" "pkey_alloc hands out keys 1..15 in order and then ENOSPC, reuses a freed key, and refuses bad flags, rights and frees with EINVAL"
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-rights" "pkey_alloc's access rights land in the calling thread's PKRU"
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-access-disable" "a read of a page whose key PKRU access-disables raises SIGSEGV with SEGV_PKUERR, the address and the key"
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-write-disable" "write-disable lets reads through and refuses writes with SEGV_PKUERR"
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-mprotect-keeps" "plain mprotect keeps a mapping's key, pages touched after pkey_mprotect carry it, and an unallocated key is EINVAL"
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-kernel-copy" "write(2) from and read(2) into a key-refused page are EFAULT, and succeed once the rights allow them"
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-threads" "a new thread starts with its creator's PKRU and its own changes stay its own"
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-signal" "a signal handler runs with the initial key rights, and the interrupted rights are restored by sigreturn"
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-fork-exec" "a fork child keeps the keys and rights; an exec'd program starts with no keys and the initial PKRU"
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-exec-only" "mprotect(PROT_EXEC) alone makes code callable but unreadable through the execute-only key"
+else
+	check_output "$POSIX_LOG" "M124-SMOKE: ok pkey-absent" "on a CPU without protection keys pkey_alloc is ENOSPC, pkey_free EINVAL, and pkey_mprotect takes only key -1"
+fi
+if [ "$ARCH" = "x86_64" ]; then
+	check_output "$PKU_LOG" "pku: protection keys enabled" "CR4.PKE is set on a CPU that has protection keys"
+	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-cpuinfo" "/proc/cpuinfo lists pku and ospke once CR4.PKE is set (pku lane)"
+	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-alloc" "pkey_alloc hands out keys 1..15 in order and then ENOSPC, reuses a freed key, and refuses bad flags, rights and frees with EINVAL (pku lane)"
+	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-rights" "pkey_alloc's access rights land in the calling thread's PKRU (pku lane)"
+	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-access-disable" "a read of a page whose key PKRU access-disables raises SIGSEGV with SEGV_PKUERR, the address and the key (pku lane)"
+	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-write-disable" "write-disable lets reads through and refuses writes with SEGV_PKUERR (pku lane)"
+	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-mprotect-keeps" "plain mprotect keeps a mapping's key, pages touched after pkey_mprotect carry it, and an unallocated key is EINVAL (pku lane)"
+	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-kernel-copy" "write(2) from and read(2) into a key-refused page are EFAULT, and succeed once the rights allow them (pku lane)"
+	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-threads" "a new thread starts with its creator's PKRU and its own changes stay its own (pku lane)"
+	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-signal" "a signal handler runs with the initial key rights, and the interrupted rights are restored by sigreturn (pku lane)"
+	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-fork-exec" "a fork child keeps the keys and rights; an exec'd program starts with no keys and the initial PKRU (pku lane)"
+	check_output "$PKU_LOG" "M124-SMOKE: ok pkey-exec-only" "mprotect(PROT_EXEC) alone makes code callable but unreadable through the execute-only key (pku lane)"
+	check_output "$PKU_LOG" "M124-SMOKE: done" "the M124 suite completes under TCG with protection keys"
+else
+	skipped "protection keys with the hardware" "arm64 keys need the Permission Overlay Extension, which QEMU does not model"
+fi
 # ── M123: namespaces complete enough for containers (m123_smoke) ──
 check_output "$LOG" "M123-SMOKE: ok userns-unpriv" "an unprivileged task creates a user namespace, reads the overflow uid until it maps itself, then is root with every capability there"
 check_output "$LOG" "M123-SMOKE: ok userns-map-rules" "uid_map is written once; an unprivileged task maps only its own id, and gid_map only after setgroups is denied"
@@ -4021,7 +4084,7 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-for _i in sys sysnet blk posix gfx init switchroot iommu amdvi smp; do
+for _i in sys sysnet blk posix gfx init switchroot iommu amdvi pku smp; do
     rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")" "$(disk_img usb "$_i")" \
           "$(disk_img vblk "$_i")" "$(disk_img ahci "$_i")" "$(disk_img btrfs "$_i")" "$(disk_img btrfsz "$_i")" \
           "$(disk_img bcache "$_i")"

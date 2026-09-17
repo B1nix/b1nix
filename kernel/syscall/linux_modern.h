@@ -15,7 +15,7 @@ void linux_keys_task_reset(usize row);
 void linux_keys_fork_inherit(usize parent_row, usize child_row);
 
 /* From syscall.c, where the implementations live. */
-isize linux_modern_mprotect(u64 addr, u64 len, u64 prot);
+isize linux_modern_pkey_mprotect(u64 addr, u64 len, u64 prot, u64 pkey);
 int linux_modern_open_flags(int linux_flags);
 isize linux_modern_remap_file_pages(u64 start, u64 size, u64 prot, u64 pgoff,
                                     u64 flags);

@@ -1,3 +1,4 @@
+#include <b1nix/pkeys.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
@@ -1957,6 +1958,8 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   /* A freshly started program expects a clean FPU/MXCSR (SysV ABI). Reset the
    * live FPU here since exec replaces the image without a context switch. */
   arch_fpu_init_current();
+  /* A new program: only protection key 0, and the initial key rights. */
+  arch_pkeys_exec();
   /* arch_fpu_init_current() resets the LIVE FPU to the masked ABI default but
    * leaves this task's fpu_state save-area untouched — and for a fresh slot
    * that area is still the kzalloc'd zero, i.e. FCW=0x0000 (all x87 exceptions
