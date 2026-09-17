@@ -16,6 +16,7 @@
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
+#include <b1nix/namespace.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/sysv_ipc.h>
@@ -26,6 +27,7 @@
 struct sem_slot {
   int used;
   u32 key;
+  u32 ns; /* IPC namespace */
   usize nsems;
   u16 vals[SEMMSL];
   usize pid[SEMMSL];  /* last process to operate on each semaphore (GETPID) */
@@ -54,31 +56,40 @@ static spinlock_t g_sem_lock = SPINLOCK_INIT;
  * everyone sleeping on it and each re-evaluates its own operation array. */
 static void *sem_chan(int semid) { return (void *)&g_sets[semid]; }
 
+/* A set id names a set only inside the caller's IPC namespace. */
 static int sem_id_valid(int semid) {
-  return semid >= 0 && semid < SEMMNI && g_sets[semid].used;
+  return semid >= 0 && semid < SEMMNI && g_sets[semid].used &&
+         g_sets[semid].ns == ipc_current_ns();
 }
 
 static int sem_may_control(const struct sem_slot *s) {
-  const struct cred *c = scheduler_get_current_cred();
-  if (!c)
-    return 1;
-  return c->euid == 0 || c->euid == s->perm.uid || c->euid == s->perm.cuid;
+  return ipc_may_control(&s->perm, s->ns);
+}
+
+/* Read (0400) or alter (0200) access to a set. Caller holds g_sem_lock. */
+static int sem_access(int semid, u16 acc) {
+  return ipc_check_perm(&g_sets[semid].perm, g_sets[semid].ns, acc);
 }
 
 int sysv_semget(u32 key, int nsems, int semflg) {
   if (nsems < 0 || nsems > SEMMSL)
     return -EINVAL;
 
+  u32 ns = ipc_current_ns();
   u64 flags;
   spin_lock_irqsave(&g_sem_lock, &flags);
 
   if (key != 0 /* IPC_PRIVATE */) {
     for (int i = 0; i < SEMMNI; i++) {
-      if (!g_sets[i].used || g_sets[i].key != key)
+      if (!g_sets[i].used || g_sets[i].ns != ns || g_sets[i].key != key)
         continue;
       if ((semflg & IPC_CREAT) && (semflg & IPC_EXCL)) {
         spin_unlock_irqrestore(&g_sem_lock, flags);
         return -EEXIST;
+      }
+      if (sem_access(i, (u16)(semflg & 0777)) != 0) {
+        spin_unlock_irqrestore(&g_sem_lock, flags);
+        return -EACCES;
       }
       if (nsems > 0 && (usize)nsems > g_sets[i].nsems) {
         spin_unlock_irqrestore(&g_sem_lock, flags);
@@ -104,6 +115,7 @@ int sysv_semget(u32 key, int nsems, int semflg) {
     memset(&g_sets[i], 0, sizeof(g_sets[i]));
     g_sets[i].used = 1;
     g_sets[i].key = key;
+    g_sets[i].ns = ns;
     g_sets[i].nsems = (usize)nsems;
     const struct cred *c = scheduler_get_current_cred();
     g_sets[i].perm.uid = g_sets[i].perm.cuid = c ? c->euid : 0;
@@ -201,6 +213,14 @@ int sysv_semop(int semid, const struct sysv_sembuf *ops, usize nops,
       spin_unlock_irqrestore(&g_sem_lock, flags);
       return -EINVAL;
     }
+    int alter = 0;
+    for (usize i = 0; i < nops; i++)
+      if (ops[i].sem_op != 0)
+        alter = 1;
+    if (sem_access(semid, alter ? 0200 : 0400) != 0) {
+      spin_unlock_irqrestore(&g_sem_lock, flags);
+      return -EACCES;
+    }
     int rc = sem_try_ops(semid, ops, nops, pid);
     if (rc == 0) {
       spin_unlock_irqrestore(&g_sem_lock, flags);
@@ -264,6 +284,10 @@ int sysv_semctl_stat(int semid, struct sysv_semid_info *out) {
     spin_unlock_irqrestore(&g_sem_lock, flags);
     return -EINVAL;
   }
+  if (sem_access(semid, 0400) != 0) {
+    spin_unlock_irqrestore(&g_sem_lock, flags);
+    return -EACCES;
+  }
   out->sem_perm = g_sets[semid].perm;
   out->sem_otime = g_sets[semid].otime;
   out->sem_ctime = g_sets[semid].ctime;
@@ -272,7 +296,7 @@ int sysv_semctl_stat(int semid, struct sysv_semid_info *out) {
   return 0;
 }
 
-int sysv_semctl_set(int semid, u16 uid, u16 gid, u16 mode) {
+int sysv_semctl_set(int semid, u32 uid, u32 gid, u16 mode) {
   u64 flags;
   spin_lock_irqsave(&g_sem_lock, &flags);
   if (!sem_id_valid(semid)) {
@@ -316,7 +340,9 @@ int sysv_semctl_getval(int semid, int semnum) {
   u64 flags;
   spin_lock_irqsave(&g_sem_lock, &flags);
   int rc = -EINVAL;
-  if (sem_id_valid(semid) && semnum >= 0 &&
+  if (sem_id_valid(semid) && sem_access(semid, 0400) != 0)
+    rc = -EACCES;
+  else if (sem_id_valid(semid) && semnum >= 0 &&
       (usize)semnum < g_sets[semid].nsems)
     rc = (int)g_sets[semid].vals[semnum];
   spin_unlock_irqrestore(&g_sem_lock, flags);
@@ -332,6 +358,10 @@ int sysv_semctl_setval(int semid, int semnum, int val) {
       (usize)semnum >= g_sets[semid].nsems) {
     spin_unlock_irqrestore(&g_sem_lock, flags);
     return -EINVAL;
+  }
+  if (sem_access(semid, 0200) != 0) {
+    spin_unlock_irqrestore(&g_sem_lock, flags);
+    return -EACCES;
   }
   g_sets[semid].vals[semnum] = (u16)val;
   g_sets[semid].ctime = vfs_get_unix_time();
@@ -352,6 +382,10 @@ int sysv_semctl_getall(int semid, u16 *out, usize count) {
     spin_unlock_irqrestore(&g_sem_lock, flags);
     return -EINVAL;
   }
+  if (sem_access(semid, 0400) != 0) {
+    spin_unlock_irqrestore(&g_sem_lock, flags);
+    return -EACCES;
+  }
   for (usize i = 0; i < g_sets[semid].nsems; i++)
     out[i] = g_sets[semid].vals[i];
   int n = (int)g_sets[semid].nsems;
@@ -365,6 +399,10 @@ int sysv_semctl_setall(int semid, const u16 *vals, usize count) {
   if (!sem_id_valid(semid) || count < g_sets[semid].nsems) {
     spin_unlock_irqrestore(&g_sem_lock, flags);
     return -EINVAL;
+  }
+  if (sem_access(semid, 0200) != 0) {
+    spin_unlock_irqrestore(&g_sem_lock, flags);
+    return -EACCES;
   }
   for (usize i = 0; i < g_sets[semid].nsems; i++) {
     if (vals[i] > SEMVMX) {
@@ -387,7 +425,9 @@ int sysv_semctl_getcnt(int semid, int semnum, int want_zero) {
   u64 flags;
   spin_lock_irqsave(&g_sem_lock, &flags);
   int rc = -EINVAL;
-  if (sem_id_valid(semid) && semnum >= 0 &&
+  if (sem_id_valid(semid) && sem_access(semid, 0400) != 0)
+    rc = -EACCES;
+  else if (sem_id_valid(semid) && semnum >= 0 &&
       (usize)semnum < g_sets[semid].nsems)
     rc = (int)(want_zero ? g_sets[semid].zcnt[semnum]
                          : g_sets[semid].ncnt[semnum]);
@@ -399,7 +439,9 @@ int sysv_semctl_getpid(int semid, int semnum) {
   u64 flags;
   spin_lock_irqsave(&g_sem_lock, &flags);
   int rc = -EINVAL;
-  if (sem_id_valid(semid) && semnum >= 0 &&
+  if (sem_id_valid(semid) && sem_access(semid, 0400) != 0)
+    rc = -EACCES;
+  else if (sem_id_valid(semid) && semnum >= 0 &&
       (usize)semnum < g_sets[semid].nsems)
     rc = (int)g_sets[semid].pid[semnum];
   spin_unlock_irqrestore(&g_sem_lock, flags);
@@ -429,4 +471,37 @@ void sysv_sem_task_cleanup(usize pid) {
   spin_unlock_irqrestore(&g_sem_lock, flags);
   if (woke >= 0)
     scheduler_wake_all(sem_chan(woke));
+}
+
+int sysv_sem_stat_index(int idx, struct sysv_semid_info *out) {
+  u64 flags;
+  spin_lock_irqsave(&g_sem_lock, &flags);
+  int rc = -EINVAL;
+  if (sem_id_valid(idx)) {
+    out->sem_perm = g_sets[idx].perm;
+    out->sem_otime = g_sets[idx].otime;
+    out->sem_ctime = g_sets[idx].ctime;
+    out->sem_nsems = g_sets[idx].nsems;
+    rc = 0;
+  }
+  spin_unlock_irqrestore(&g_sem_lock, flags);
+  return rc;
+}
+
+/* The IPC namespace is gone: its sets with it. Sleepers wake to EIDRM. */
+void sysv_sem_ns_destroy(u32 ns) {
+  for (int i = 0; i < SEMMNI; i++) {
+    u64 flags;
+    spin_lock_irqsave(&g_sem_lock, &flags);
+    int hit = g_sets[i].used && g_sets[i].ns == ns;
+    if (hit) {
+      g_sets[i].used = 0;
+      for (usize u = 0; u < SEM_UNDO_MAX; u++)
+        if (g_undo[u].used && g_undo[u].semid == i)
+          g_undo[u].used = 0;
+    }
+    spin_unlock_irqrestore(&g_sem_lock, flags);
+    if (hit)
+      scheduler_wake_all(sem_chan(i));
+  }
 }

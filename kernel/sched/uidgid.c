@@ -3,6 +3,8 @@
 #include <b1nix/errno.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/mm.h>
+#include <b1nix/namespace.h>
+#include <b1nix/user_namespace.h>
 
 /* ── Global user and group tables ── */
 static struct user  users[MAX_USERS];
@@ -50,7 +52,7 @@ void uidgid_init(void)
 
 /* ── User management ── */
 
-int user_add(u16 uid, u16 gid, const char *name)
+int user_add(u32 uid, u32 gid, const char *name)
 {
     if (user_count >= MAX_USERS) return -1;
     if (user_find_by_uid(uid)) return -1;
@@ -66,7 +68,7 @@ int user_add(u16 uid, u16 gid, const char *name)
     return 0;
 }
 
-const struct user *user_find_by_uid(u16 uid)
+const struct user *user_find_by_uid(u32 uid)
 {
     for (int i = 0; i < user_count; i++) {
         if (users[i].uid == uid) return &users[i];
@@ -84,7 +86,7 @@ const struct user *user_find_by_name(const char *name)
 
 /* ── Group management ── */
 
-int group_add(u16 gid, const char *name)
+int group_add(u32 gid, const char *name)
 {
     if (group_count >= MAX_GROUPS) return -1;
     if (group_find_by_gid(gid)) return -1;
@@ -100,7 +102,7 @@ int group_add(u16 gid, const char *name)
     return 0;
 }
 
-int group_add_member(u16 gid, u16 uid)
+int group_add_member(u32 gid, u32 uid)
 {
     struct group *g = (struct group *)group_find_by_gid(gid);
     if (!g) return -1;
@@ -115,7 +117,7 @@ int group_add_member(u16 gid, u16 uid)
     return 0;
 }
 
-const struct group *group_find_by_gid(u16 gid)
+const struct group *group_find_by_gid(u32 gid)
 {
     for (int i = 0; i < group_count; i++) {
         if (groups[i].gid == gid) return &groups[i];
@@ -155,15 +157,20 @@ struct cred *cred_dup(const struct cred *src)
     struct cred *c = kzalloc(sizeof(struct cred));
     if (!c) return 0;
     memcpy(c, src, sizeof(struct cred));
+    /* The copy names the same user namespace, and holds its own reference. */
+    if (c->user_ns && namespace_get(NS_USER, c->user_ns) != 0)
+        c->user_ns = 0;
     return c;
 }
 
 void cred_free(struct cred *cred)
 {
-    if (cred) kfree(cred);
+    if (!cred) return;
+    namespace_put(NS_USER, cred->user_ns);
+    kfree(cred);
 }
 
-int cred_set_uid(struct cred *cred, u16 uid)
+int cred_set_uid(struct cred *cred, u32 uid)
 {
     if (!cred) return -EINVAL;
     /* Only root can change real UID, or if we have CAP_SETUID */
@@ -184,7 +191,7 @@ int cred_set_uid(struct cred *cred, u16 uid)
     return 0;
 }
 
-int cred_set_gid(struct cred *cred, u16 gid)
+int cred_set_gid(struct cred *cred, u32 gid)
 {
     if (!cred) return -EINVAL;
     int is_privileged = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
@@ -211,17 +218,17 @@ int cred_setreuid(struct cred *cred, int ruid, int euid)
 {
     if (!cred) return -EINVAL;
     int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETUID));
-    u16 old_uid = cred->uid;
+    u32 old_uid = cred->uid;
     if (ruid != -1 && !priv &&
-        (u16)ruid != cred->uid && (u16)ruid != cred->euid)
+        (u32)ruid != cred->uid && (u32)ruid != cred->euid)
         return -EPERM;
     if (euid != -1 && !priv &&
-        (u16)euid != cred->uid && (u16)euid != cred->euid &&
-        (u16)euid != cred->suid)
+        (u32)euid != cred->uid && (u32)euid != cred->euid &&
+        (u32)euid != cred->suid)
         return -EPERM;
-    if (ruid != -1) cred->uid = (u16)ruid;
-    if (euid != -1) cred->euid = (u16)euid;
-    if (ruid != -1 || (euid != -1 && (u16)euid != old_uid))
+    if (ruid != -1) cred->uid = (u32)ruid;
+    if (euid != -1) cred->euid = (u32)euid;
+    if (ruid != -1 || (euid != -1 && (u32)euid != old_uid))
         cred->suid = cred->euid;
     cred_refresh_caps(cred);
     cred_sync_fsids(cred);
@@ -233,17 +240,17 @@ int cred_setregid(struct cred *cred, int rgid, int egid)
 {
     if (!cred) return -EINVAL;
     int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
-    u16 old_gid = cred->gid;
+    u32 old_gid = cred->gid;
     if (rgid != -1 && !priv &&
-        (u16)rgid != cred->gid && (u16)rgid != cred->egid)
+        (u32)rgid != cred->gid && (u32)rgid != cred->egid)
         return -EPERM;
     if (egid != -1 && !priv &&
-        (u16)egid != cred->gid && (u16)egid != cred->egid &&
-        (u16)egid != cred->sgid)
+        (u32)egid != cred->gid && (u32)egid != cred->egid &&
+        (u32)egid != cred->sgid)
         return -EPERM;
-    if (rgid != -1) cred->gid = (u16)rgid;
-    if (egid != -1) cred->egid = (u16)egid;
-    if (rgid != -1 || (egid != -1 && (u16)egid != old_gid))
+    if (rgid != -1) cred->gid = (u32)rgid;
+    if (egid != -1) cred->egid = (u32)egid;
+    if (rgid != -1 || (egid != -1 && (u32)egid != old_gid))
         cred->sgid = cred->egid;
     cred_refresh_caps(cred);
     cred_sync_fsids(cred);
@@ -255,16 +262,16 @@ int cred_setresuid(struct cred *cred, int ruid, int euid, int suid)
     if (!cred) return -EINVAL;
     int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETUID));
     if (!priv) {
-        if (ruid != -1 && (u16)ruid != cred->uid && (u16)ruid != cred->euid && (u16)ruid != cred->suid)
+        if (ruid != -1 && (u32)ruid != cred->uid && (u32)ruid != cred->euid && (u32)ruid != cred->suid)
             return -EPERM;
-        if (euid != -1 && (u16)euid != cred->uid && (u16)euid != cred->euid && (u16)euid != cred->suid)
+        if (euid != -1 && (u32)euid != cred->uid && (u32)euid != cred->euid && (u32)euid != cred->suid)
             return -EPERM;
-        if (suid != -1 && (u16)suid != cred->uid && (u16)suid != cred->euid && (u16)suid != cred->suid)
+        if (suid != -1 && (u32)suid != cred->uid && (u32)suid != cred->euid && (u32)suid != cred->suid)
             return -EPERM;
     }
-    if (ruid != -1) cred->uid = (u16)ruid;
-    if (euid != -1) cred->euid = (u16)euid;
-    if (suid != -1) cred->suid = (u16)suid;
+    if (ruid != -1) cred->uid = (u32)ruid;
+    if (euid != -1) cred->euid = (u32)euid;
+    if (suid != -1) cred->suid = (u32)suid;
     cred_refresh_caps(cred);
     cred_sync_fsids(cred);
     return 0;
@@ -275,16 +282,16 @@ int cred_setresgid(struct cred *cred, int rgid, int egid, int sgid)
     if (!cred) return -EINVAL;
     int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
     if (!priv) {
-        if (rgid != -1 && (u16)rgid != cred->gid && (u16)rgid != cred->egid && (u16)rgid != cred->sgid)
+        if (rgid != -1 && (u32)rgid != cred->gid && (u32)rgid != cred->egid && (u32)rgid != cred->sgid)
             return -EPERM;
-        if (egid != -1 && (u16)egid != cred->gid && (u16)egid != cred->egid && (u16)egid != cred->sgid)
+        if (egid != -1 && (u32)egid != cred->gid && (u32)egid != cred->egid && (u32)egid != cred->sgid)
             return -EPERM;
-        if (sgid != -1 && (u16)sgid != cred->gid && (u16)sgid != cred->egid && (u16)sgid != cred->sgid)
+        if (sgid != -1 && (u32)sgid != cred->gid && (u32)sgid != cred->egid && (u32)sgid != cred->sgid)
             return -EPERM;
     }
-    if (rgid != -1) cred->gid = (u16)rgid;
-    if (egid != -1) cred->egid = (u16)egid;
-    if (sgid != -1) cred->sgid = (u16)sgid;
+    if (rgid != -1) cred->gid = (u32)rgid;
+    if (egid != -1) cred->egid = (u32)egid;
+    if (sgid != -1) cred->sgid = (u32)sgid;
     cred_refresh_caps(cred);
     cred_sync_fsids(cred);
     return 0;
@@ -292,7 +299,7 @@ int cred_setresgid(struct cred *cred, int rgid, int egid, int sgid)
 
 /* ── Permission checks ── */
 
-int cred_can_access(const struct cred *cred, u16 file_uid, u16 file_gid, u16 file_mode, u32 access_mask)
+int cred_can_access(const struct cred *cred, u32 file_uid, u32 file_gid, u16 file_mode, u32 access_mask)
 {
     if (!cred) return 0;
 
@@ -395,10 +402,10 @@ void cred_sync_fsids(struct cred *cred)
                      (1ULL << CAP_DAC_READ_SEARCH) | (1ULL << CAP_FOWNER) | \
                      (1ULL << CAP_FSETID) | (1ULL << CAP_MKNOD))
 
-u16 cred_set_fsuid(struct cred *cred, u16 fsuid)
+u32 cred_set_fsuid(struct cred *cred, u32 fsuid)
 {
     if (!cred) return 0;
-    u16 prev = cred->fsuid;
+    u32 prev = cred->fsuid;
     /* A task may set fsuid to any of its own UIDs, or to anything at all with
      * CAP_SETUID. An unpermitted value leaves fsuid unchanged — and, as Linux
      * documents, is reported only by the returned previous value. */
@@ -417,10 +424,10 @@ u16 cred_set_fsuid(struct cred *cred, u16 fsuid)
     return prev;
 }
 
-u16 cred_set_fsgid(struct cred *cred, u16 fsgid)
+u32 cred_set_fsgid(struct cred *cred, u32 fsgid)
 {
     if (!cred) return 0;
-    u16 prev = cred->fsgid;
+    u32 prev = cred->fsgid;
     if (fsgid == cred->gid || fsgid == cred->egid || fsgid == cred->sgid ||
         fsgid == cred->fsgid || cred_has_cap(cred, CAP_SETGID))
         cred->fsgid = fsgid;

@@ -468,6 +468,11 @@ static u8 g_task_exit_stage[TASK_SLOTS];
  * a spurious signalled death (M29 stress-exit-code). */
 static u8    g_task_exiting[TASK_SLOTS];
 
+/* prctl(PR_SET_CHILD_SUBREAPER): the process adopts the orphans of its
+ * descendants instead of their PID namespace's init. Kept on the thread-group
+ * leader's slot. */
+static u8    g_task_subreaper[TASK_SLOTS];
+
 /*
  * Depth of kernel critical sections a task is inside — sections it must be
  * allowed to finish even when a fatal signal arrives.
@@ -1350,6 +1355,7 @@ static struct task *find_unused_task(int user) {
   g_task_hwm = i + 1;
   g_task_pass[i] = sched_birth_pass();
   g_task_affinity[i] = 0;
+  g_task_subreaper[i] = 0;
   g_task_is_thread[i] = 0;
   g_task_tls_base[i] = 0;
   g_task_child_tid_clear[i] = 0;
@@ -1401,14 +1407,14 @@ static void free_task_slot(struct task *t) {
    * moment the id means anything: release the pid-namespace number here rather
    * than at exit, where the task is still a zombie its parent must be able to
    * name. */
-  namespace_task_reaped(t->id);
+  namespace_task_reaped(t);
   /* And the namespace row itself, for the same reason and at the same moment.
    * namespace_task_exit() only runs on the scheduler_exit_current path, so a
    * task reaped by any other route left its row behind -- keyed by pid, which
    * is about to be handed to somebody else. The next owner then translated
    * every pid it named through a namespace it was not in and got ESRCH for
    * live processes. */
-  namespace_task_exit(t->id);
+  namespace_task_exit(t);
   /* M63: drop the task's seccomp filter chain (unref; frees at zero) BEFORE
    * taking tasks_lock — filter_unref calls kfree and tasks_lock is a leaf lock
    * that must not nest the heap lock. Idempotent: clears the side-table slot. */
@@ -2722,6 +2728,12 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
     if (cg_err < 0)
       return cg_err;
   }
+  /* A PID namespace whose init has exited takes no new members. */
+  {
+    int ns_err = namespace_fork_allowed();
+    if (ns_err < 0)
+      return ns_err;
+  }
   /* "User" forks resume the child by iret'ing through the interrupt_frame.
    * All user tasks are real ELF processes (ELF32/ELF64) in Ring 3. */
   struct user_loaded_image *parent_img = parent->user_image;
@@ -3034,13 +3046,16 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
     extern void shm_fork_inherit(usize parent_pid, usize child_pid);
     shm_fork_inherit(parent->id, child->id);
   }
-  /* M109: a fork inherits the parent's namespaces. */
-  namespace_fork_inherit(parent->id, child->id);
-  /* ...and its cgroup, which is where its resource limits come from. */
+  /* The cgroup the parent is in, which is where its resource limits come
+   * from. */
   cgroup_fork_inherit(parent->id, child->id);
 
   // 5. Clone credentials and file descriptors
   task_init_cred(child);
+  /* M109/M123: a fork inherits the parent's namespaces, or enters the ones
+   * clone(CLONE_NEW*) prepared. After the credential exists: a new user
+   * namespace is recorded in it. */
+  namespace_fork_inherit(parent, child, 0);
   child->fd_capacity = parent->fd_capacity;
   child->fd_table = kzalloc(child->fd_capacity * sizeof(struct vfs_handle *));
   child->fd_flags = kzalloc(child->fd_capacity * sizeof(int));
@@ -4018,6 +4033,11 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
     if (cg_err < 0)
       return cg_err;
   }
+  {
+    int ns_err = namespace_fork_allowed();
+    if (ns_err < 0)
+      return ns_err;
+  }
 
   struct clone_thread_args *cta = kzalloc(sizeof(*cta));
   if (!cta) return -ENOMEM;
@@ -4318,7 +4338,7 @@ clone_nomem:
   task_fpu_alloc(child);
   /* M109: the child starts in the parent's namespaces, threads included — a
    * thread of a process that unshared is in that process's namespaces. */
-  namespace_fork_inherit(parent->id, child->id);
+  namespace_fork_inherit(parent, child, flags);
   cgroup_fork_inherit(parent->id, child->id);
 
   /* M80: PTRACE_O_TRACECLONE / TRACEVFORK — same as fork, with the event that
@@ -6696,6 +6716,67 @@ static int pdeathsig_of(usize pid) {
   return 0;
 }
 
+static struct task *find_live_task(usize id);
+
+/* Live tasks in `t`'s thread group, `t` included. */
+usize scheduler_thread_group_count(const struct task *t) {
+  if (!t)
+    return 0;
+  usize tgid = g_task_tgid[task_index(t)];
+  if (!tgid)
+    tgid = t->id;
+  usize n = 0;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *x = T(i);
+    if (x->state == TASK_UNUSED || x->state == TASK_DEAD ||
+        x->state == TASK_REAPING)
+      continue;
+    usize xt = g_task_tgid[i] ? g_task_tgid[i] : x->id;
+    if (xt == tgid)
+      n++;
+  }
+  return n;
+}
+
+int scheduler_set_child_subreaper(struct task *t, int on) {
+  if (!t)
+    return -EINVAL;
+  usize tgid = g_task_tgid[task_index(t)];
+  struct task *leader = tgid && tgid != t->id ? find_live_task(tgid) : t;
+  if (!leader)
+    leader = t;
+  g_task_subreaper[task_index(leader)] = on ? 1 : 0;
+  return 0;
+}
+
+int scheduler_get_child_subreaper(struct task *t) {
+  if (!t)
+    return 0;
+  usize tgid = g_task_tgid[task_index(t)];
+  struct task *leader = tgid && tgid != t->id ? find_live_task(tgid) : t;
+  return g_task_subreaper[task_index(leader ? leader : t)];
+}
+
+/* Linux find_new_reaper(): the nearest ancestor of the exiting task that is a
+ * child subreaper, as long as it is in the same PID namespace; otherwise the
+ * init of the orphan's PID namespace; otherwise the machine's init. */
+static usize find_new_reaper(struct task *exiting, usize orphan_pid) {
+  u32 ns = namespace_task_id(exiting, NS_PID);
+  usize p = exiting->parent_id;
+  for (int depth = 0; p > 1 && depth < 128; depth++) {
+    struct task *a = find_live_task(p);
+    if (!a || namespace_task_id(a, NS_PID) != ns)
+      break;
+    if (g_task_subreaper[task_index(a)] && !g_task_exiting[task_index(a)])
+      return a->id;
+    p = a->parent_id;
+  }
+  usize nsinit = namespace_pid_orphan_reaper(orphan_pid);
+  if (nsinit && nsinit != exiting->id)
+    return nsinit;
+  return 1;
+}
+
 static void reparent_children_and_signal_orphans(struct task *exiting) {
   /* is_pgrp_orphaned ignores `exiting` as a parent, so a group with several of
    * our children is judged orphaned even though some have not been reparented
@@ -6703,7 +6784,7 @@ static void reparent_children_and_signal_orphans(struct task *exiting) {
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *child = T(i);
     if (child->state != TASK_UNUSED && child->parent_id == exiting->id) {
-      child->parent_id = 1;
+      child->parent_id = find_new_reaper(exiting, child->id);
       /* Deliver the parent-death signal before the child is reparented to
        * init, which is the only moment at which "my parent died" is still a
        * fact rather than history. */
@@ -7209,7 +7290,7 @@ void scheduler_exit_current(int exit_code) {
   /* M109: drop this task's namespace row. The namespaces themselves are
    * reclaimed later, from unshare/setns — releasing a mount namespace means
    * dropping VFS references, which has no business running here. */
-  namespace_task_exit(current_task->id);
+  namespace_task_exit(current_task);
   cgroup_task_exit(current_task->id);
   {
     /* Close this thread's last CPU interval before handing its time over. */
@@ -10845,6 +10926,9 @@ void scheduler_deliver_pending_signals(void) {
         return;
       current_task->exit_code = TASK_EXIT_SIGNALED | SIGKILL;
       terminate_group_siblings(current_task);
+      /* Before reparenting: a dying PID-namespace init must no longer be
+       * offered as the reaper of its own children. */
+      namespace_task_exit(current_task);
       /* Reparent children + signal newly-orphaned stopped pgrps and drop our
        * futex waiters — this path used to skip all of that (M46-3). It runs
        * inside the scheduler so it must NOT do the yield-based fd teardown that
@@ -10909,6 +10993,7 @@ void scheduler_deliver_pending_signals(void) {
       case SIGPROF:
         current_task->exit_code = TASK_EXIT_SIGNALED | sig;
         terminate_group_siblings(current_task);
+        namespace_task_exit(current_task);
         /* Reparent + orphan-pgrp signalling + futex cleanup, as for SIGKILL
          * above (M46-3). No yield-based teardown — we are inside the scheduler. */
         reparent_children_and_signal_orphans(current_task);

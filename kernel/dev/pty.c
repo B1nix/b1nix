@@ -89,8 +89,8 @@ struct pty {
   struct b1nix_winsize winsize;
   usize fg_pgrp;     /* foreground process group for job control + signals */
   usize session_id;  /* session that claimed this pty via TIOCSCTTY */
-  u16 uid;
-  u16 gid;
+  u32 uid;
+  u32 gid;
 };
 
 static struct pty **ptys;

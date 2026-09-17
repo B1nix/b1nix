@@ -49,5 +49,9 @@ isize netlink_socket_send(struct vfs_socket_state *s, const void *buf,
 void netlink_uevent_register(struct vfs_socket_state *s);
 void netlink_uevent_unregister(struct vfs_socket_state *s);
 void netlink_uevent_broadcast(const void *payload, usize len);
+/* Queue `payload` on netlink socket `h` as a message from the kernel. */
+struct vfs_handle;
+int netlink_kernel_unicast(struct vfs_handle *h, const void *payload,
+                           usize len);
 
 #endif

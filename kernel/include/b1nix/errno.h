@@ -44,6 +44,7 @@
 #define ENOMSG          42  /* No message of desired type */
 #define EIDRM           43  /* Identifier removed */
 #define EOVERFLOW       75  /* Value too large for defined data type */
+#define EUSERS          87  /* Too many users */
 #define ESTALE         116  /* Stale file handle */
 #define ENOTEMPTY       39  /* Directory not empty */
 #define ELOOP           40  /* Too many symbolic links */

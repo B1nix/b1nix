@@ -159,12 +159,17 @@ int main(int argc, char **argv) {
     if (mq != (mqd_t)-1) {
       const char *msg = "m15-test-msg";
       int send_rc = mq_send(mq, msg, strlen(msg), 0);
-      char buf[32];
+      /* POSIX: the receive buffer must hold the queue's mq_msgsize, whatever
+       * the size of the message waiting in it (EMSGSIZE otherwise). */
+      struct mq_attr attr;
+      static char buf[65536];
       unsigned int rx_prio = 1;
       memset(buf, 0, sizeof(buf));
-      /* mq_receive returns the message byte count; the 4th arg is the priority
-       * (0 here, since mq_send used priority 0), NOT the length. */
-      int recv_rc = mq_receive(mq, buf, sizeof(buf), &rx_prio);
+      int recv_rc = -1;
+      if (mq_getattr(mq, &attr) == 0 && attr.mq_msgsize <= (long)sizeof(buf))
+        /* mq_receive returns the message byte count; the 4th arg is the
+         * priority (0 here, since mq_send used priority 0), NOT the length. */
+        recv_rc = mq_receive(mq, buf, (size_t)attr.mq_msgsize, &rx_prio);
       mq_close(mq);
       int unlink_rc = mq_unlink("/m15_q");
       if (send_rc == 0 && recv_rc == (int)strlen(msg) && rx_prio == 0 &&

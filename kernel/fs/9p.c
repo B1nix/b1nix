@@ -626,8 +626,8 @@ static int p9_vfs_lookup(struct vfs_node *dir, const char *name) {
 
   strncpy(child->name, name, VFS_NAME_MAX - 1);
   child->name[VFS_NAME_MAX - 1] = '\0';
-  child->inode->uid = (u16)ga.uid;
-  child->inode->gid = (u16)ga.gid;
+  child->inode->uid = (u32)ga.uid;
+  child->inode->gid = (u32)ga.gid;
   child->inode->nlink = (int)ga.nlink;
   child->inode->atime = ga.atime_sec;
   child->inode->atime_nsec = (u32)ga.atime_nsec;
@@ -843,8 +843,8 @@ static void p9_vfs_getattr(struct vfs_node *node) {
   struct p9_rgetattr ga;
   if (p9_proto_getattr(info->p9dev, info->fid, P9_GETATTR_ALL, &ga) == 0) {
     node->inode->size = (usize)ga.size;
-    node->inode->uid = (u16)ga.uid;
-    node->inode->gid = (u16)ga.gid;
+    node->inode->uid = (u32)ga.uid;
+    node->inode->gid = (u32)ga.gid;
     node->inode->mode = (u16)ga.mode;
     node->inode->nlink = (int)ga.nlink;
     node->inode->atime = ga.atime_sec;

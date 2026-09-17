@@ -795,6 +795,11 @@ int scheduler_kill_all_user(int sig);
 /* prctl(PR_SET_PDEATHSIG): signo 0 clears. Delivered when the caller's parent
  * exits, just before the caller is reparented to init. */
 int scheduler_set_pdeathsig(usize pid, int signo);
+/* prctl(PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER). */
+int scheduler_set_child_subreaper(struct task *t, int on);
+int scheduler_get_child_subreaper(struct task *t);
+/* Live tasks in `t`'s thread group, `t` included. */
+usize scheduler_thread_group_count(const struct task *t);
 int scheduler_get_pdeathsig(usize pid);
 /* prctl(PR_SET_NAME): the comm a task chose for itself, or NULL when it never
  * did (in which case comm is the basename of what it executed). */

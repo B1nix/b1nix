@@ -149,7 +149,7 @@ enum vfs_node_type {
 struct acl_entry {
   u16 tag;       /* ACL_USER_OBJ, ACL_USER, ACL_GROUP_OBJ, ACL_GROUP, ACL_MASK,
                     ACL_OTHER */
-  u16 qualifier; /* UID or GID (for ACL_USER, ACL_GROUP) */
+  u32 qualifier; /* UID or GID (for ACL_USER, ACL_GROUP) */
   u16 perms;     /* Permission bitmask */
 };
 
@@ -235,8 +235,8 @@ struct vfs_inode {
   void *data;
 
   /* Ownership and permissions */
-  u16 uid;
-  u16 gid;
+  u32 uid;
+  u32 gid;
   u16 mode;
 
   /* ACL support */
@@ -630,9 +630,9 @@ int vfs_rename(const char *old_path, const char *new_path);
 int vfs_rmdir(const char *path);
 int vfs_fstat(int fd, struct b1nix_stat *st);
 int vfs_fd_abspath(int fd, char *buf, usize size);
-/* M109: the namespace a /proc/<pid>/ns/<kind> descriptor pinned at open time,
- * or -EBADF / -EINVAL when the descriptor is not one. */
-int vfs_fd_ns_pin(int fd, u32 *pin_out);
+/* The namespace a namespace descriptor (an open /proc/<pid>/ns/<kind>) stands
+ * for, or -EBADF / -EINVAL when the descriptor is not one. */
+int vfs_fd_ns(int fd, int *kind, u32 *id);
 int vfs_fsync(int fd);
 int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags);
@@ -819,10 +819,10 @@ extern void *vfs_poll_chan;
 int vfs_chmod(const char *path, u16 mode);
 int vfs_fchmod(int fd, u16 mode);
 int vfs_utime(const char *path, u64 atime, u64 mtime);
-int vfs_chown(const char *path, u16 uid, u16 gid);
+int vfs_chown(const char *path, u32 uid, u32 gid);
 /* lchown(2): the symlink itself is the target, not what it points at. */
-int vfs_lchown(const char *path, u16 uid, u16 gid);
-int vfs_fchown(int fd, u16 uid, u16 gid);
+int vfs_lchown(const char *path, u32 uid, u32 gid);
+int vfs_fchown(int fd, u32 uid, u32 gid);
 int vfs_fstatfs(int fd, struct b1nix_statfs *st);
 int vfs_syncfs(int fd);
 int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
@@ -1111,12 +1111,6 @@ struct vfs_handle {
   void *private_data; /* Used for pipe, socket, etc. */
   const struct vfs_file_ops *ops;
   int flags;
-  /* M109: a /proc/<pid>/ns/<kind> descriptor pins the namespace it named at
-   * open(), the way Linux's nsfs does. Resolving it again at setns(2) time
-   * would follow the task instead of the namespace, so a caller could never
-   * hold a handle on the namespace it is about to leave. 0 = not an ns
-   * handle; see procfs_ns_open_cb(). */
-  u32 ns_pin;
   /* The absolute path this descriptor was opened at.
    *
    * A node can be reached by more than one name -- a bind mount gives the same
@@ -1135,13 +1129,6 @@ struct vfs_handle {
    * readers fall back to the node's own path. */
   char *open_path;
 };
-
-/* Encoding of vfs_handle::ns_pin. */
-#define VFS_NS_PIN_VALID 0x80000000u
-#define VFS_NS_PIN_MAKE(kind, id)                                              \
-  (VFS_NS_PIN_VALID | ((u32)(kind) << 24) | ((u32)(id) & 0xFFFFFFu))
-#define VFS_NS_PIN_KIND(p) (int)(((p) >> 24) & 0x7Fu)
-#define VFS_NS_PIN_ID(p) ((p) & 0xFFFFFFu)
 
 /* Internal handle management for subsystems */
 struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind);

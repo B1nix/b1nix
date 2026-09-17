@@ -2382,8 +2382,8 @@ resolve:
   }
 
   u16 file_mode = node->inode->mode;
-  u16 file_uid = node->inode->uid;
-  u16 file_gid = node->inode->gid;
+  u32 file_uid = node->inode->uid;
+  u32 file_gid = node->inode->gid;
 
   /* POSIX `#!` interpreter files: rewrite the exec into
    * "interpreter [optional-arg] script-path argv[1..]". One level only —

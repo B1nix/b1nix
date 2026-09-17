@@ -45,7 +45,7 @@ int sysv_semget(u32 key, int nsems, int semflg);
 int sysv_semop(int semid, const struct sysv_sembuf *ops, usize nops,
                i64 timeout_ms);
 int sysv_semctl_stat(int semid, struct sysv_semid_info *out);
-int sysv_semctl_set(int semid, u16 uid, u16 gid, u16 mode);
+int sysv_semctl_set(int semid, u32 uid, u32 gid, u16 mode);
 int sysv_semctl_rmid(int semid);
 int sysv_semctl_getval(int semid, int semnum);
 int sysv_semctl_setval(int semid, int semnum, int val);
@@ -86,9 +86,27 @@ isize sysv_msgsnd(int msqid, i64 mtype, const void *text, usize size,
 isize sysv_msgrcv(int msqid, i64 msgtyp, void *text, usize size, int msgflg,
                   i64 *out_type);
 int sysv_msgctl_stat(int msqid, struct sysv_msqid_info *out);
-int sysv_msgctl_set(int msqid, u16 uid, u16 gid, u16 mode, u64 qbytes);
+int sysv_msgctl_set(int msqid, u32 uid, u32 gid, u16 mode, u64 qbytes);
 int sysv_msgctl_rmid(int msqid);
 
 void sysv_ipc_init(void);
+
+/* ── rules every SysV object follows (kernel/ipc/ipc_ns.c) ──
+ *
+ * Every object belongs to the IPC namespace it was created in, and a key or an
+ * id only ever finds objects of the caller's namespace. */
+u32 ipc_current_ns(void);
+/* Linux ipcperms(): may the caller use `perm` for the rwx bits in `flag`
+ * (written as the owner triplet, e.g. 0600 for read and write)? The owner or
+ * creator is judged by the owner bits, a member of either group by the group
+ * bits; CAP_IPC_OWNER in the namespace's user namespace overrides. */
+int ipc_check_perm(const struct ipc_perm *perm, u32 ns, u16 flag);
+/* IPC_SET / IPC_RMID: the owner, the creator, or CAP_SYS_ADMIN over the
+ * namespace. */
+int ipc_may_control(const struct ipc_perm *perm, u32 ns);
+void sysv_sem_ns_destroy(u32 ns);
+void sysv_msg_ns_destroy(u32 ns);
+int sysv_sem_stat_index(int idx, struct sysv_semid_info *out);
+int sysv_msg_stat_index(int idx, struct sysv_msqid_info *out);
 
 #endif

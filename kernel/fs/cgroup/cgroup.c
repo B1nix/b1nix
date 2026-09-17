@@ -39,6 +39,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/inotify.h>
 #include <b1nix/mm.h>
+#include <b1nix/namespace.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/vfs.h>
@@ -75,10 +76,16 @@ struct cgroup {
   int populated;        /* last value published in cgroup.events */
   int scratch;          /* cg_events_refresh's single-pass accumulator */
   int is_root;
+  /* cgroup namespaces rooted here. A removed cgroup a namespace still names
+   * stays allocated (off every list, with no directory) until they let go. */
+  int ns_refs;
+  int removed;
 };
 
 static struct cgroup *cg_root;
 static struct cgroup *cg_all; /* singly linked list of every live cgroup */
+/* Live mounts of the hierarchy: one superblock, however many places. */
+static int cg_mounts;
 static spinlock_t cg_lock = SPINLOCK_INIT;
 
 /* ── membership ──────────────────────────────────────────────────────────── */
@@ -180,6 +187,39 @@ static int cg_is_ancestor(const struct cgroup *anc, const struct cgroup *cg) {
     if (c == anc)
       return 1;
   return 0;
+}
+
+/* ── cgroup namespaces ───────────────────────────────────────────────────── */
+
+/* The cgroup the calling task's cgroup namespace is rooted at. Caller holds
+ * cg_lock. */
+static struct cgroup *cg_ns_root_locked(void) {
+  struct cgroup *r = namespace_cgroup_root(namespace_current_id(NS_CGROUP));
+  return (r && !r->removed) ? r : cg_root;
+}
+
+void *cgroup_ns_root_get(usize pid) {
+  u64 flags;
+  spin_lock_irqsave(&cg_lock, &flags);
+  struct cgroup *cg = cg_root ? cg_of(pid) : 0;
+  if (cg == cg_root)
+    cg = 0; /* the real root needs no reference */
+  if (cg)
+    cg->ns_refs++;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  return cg;
+}
+
+void cgroup_ns_root_put(void *root) {
+  struct cgroup *cg = root;
+  if (!cg)
+    return;
+  u64 flags;
+  spin_lock_irqsave(&cg_lock, &flags);
+  int free_it = --cg->ns_refs == 0 && cg->removed;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  if (free_it)
+    kfree(cg);
 }
 
 /* ── task counting ───────────────────────────────────────────────────────── */
@@ -317,12 +357,25 @@ static usize cg_append_u64(char *buf, usize cap, usize len, u64 v) {
   return len;
 }
 
-/* The absolute v2 path of a cgroup, "/" for the root. */
-static int cg_path(struct cgroup *cg, char *buf, usize len) {
-  const char *parts[32];
+/* The v2 path of a cgroup as seen from `root` — "/" for the root itself, and,
+ * as Linux prints it, a path through ".." for a cgroup outside that subtree. */
+static int cg_path(struct cgroup *cg, struct cgroup *root, char *buf,
+                   usize len) {
+  const char *parts[64];
   int n = 0;
-  for (struct cgroup *c = cg; c && !c->is_root && n < 32; c = c->parent)
-    parts[n++] = c->dir ? c->dir->name : "?";
+  /* Climb from `root` to the nearest common ancestor, one ".." per step. */
+  struct cgroup *common = root;
+  while (common && !common->is_root && !cg_is_ancestor(common, cg) && n < 32) {
+    parts[n++] = "..";
+    common = common->parent;
+  }
+  const char *down[32];
+  int nd = 0;
+  for (struct cgroup *c = cg; c && c != common && !c->is_root && nd < 32;
+       c = c->parent)
+    down[nd++] = c->dir ? c->dir->name : "?";
+  for (int i = nd - 1; i >= 0 && n < 64; i--)
+    parts[n++] = down[i];
   if (n == 0) {
     if (len < 2)
       return -ENAMETOOLONG;
@@ -331,7 +384,7 @@ static int cg_path(struct cgroup *cg, char *buf, usize len) {
     return 1;
   }
   usize pos = 0;
-  for (int i = n - 1; i >= 0; i--) {
+  for (int i = 0; i < n; i++) {
     usize pl = strlen(parts[i]);
     if (pos + 1 + pl + 1 > len)
       return -ENAMETOOLONG;
@@ -363,7 +416,11 @@ static usize cg_render(struct cgroup *cg, enum cg_file kind, char *buf,
       /* cgroup.procs lists processes, cgroup.threads lists every thread. */
       if (kind == CGF_PROCS && task_tgid(t) != t->id)
         continue;
-      len = cg_append_u64(buf, cap, len, (u64)t->id);
+      /* In the reader's PID namespace; a task it cannot name is not listed. */
+      usize vpid = namespace_pid_to_user(t->id);
+      if (!vpid)
+        continue;
+      len = cg_append_u64(buf, cap, len, (u64)vpid);
       len = cg_append(buf, cap, len, "\n");
     }
     spin_unlock_irqrestore(&cg_lock, flags);
@@ -550,10 +607,26 @@ static isize cg_write_cb(struct vfs_node *node, u64 offset, const char *buffer,
   case CGF_PROCS:
   case CGF_THREADS: {
     int ok = 0;
-    u64 pid = cg_parse_u64(buffer, size, &ok);
+    u64 upid = cg_parse_u64(buffer, size, &ok);
     if (!ok)
       return -EINVAL;
-    int r = cg_attach_process(cg, (usize)pid, fn->kind == CGF_THREADS);
+    /* 0 is the writer itself, as on Linux. */
+    usize pid = upid ? namespace_pid_from_user((usize)upid)
+                     : (fn->kind == CGF_THREADS ? scheduler_current_task_id()
+                                                : scheduler_get_pid());
+    if (!pid)
+      return -ESRCH;
+    /* A task inside a cgroup namespace may only move tasks between cgroups
+     * of its own subtree: the source and the destination both have to be
+     * below its namespace root. */
+    spin_lock_irqsave(&cg_lock, &lock_flags);
+    struct cgroup *nsroot = cg_ns_root_locked();
+    int inside = cg_is_ancestor(nsroot, cg) &&
+                 cg_is_ancestor(nsroot, cg_of(pid));
+    spin_unlock_irqrestore(&cg_lock, lock_flags);
+    if (!inside)
+      return -ENOENT;
+    int r = cg_attach_process(cg, pid, fn->kind == CGF_THREADS);
     return r < 0 ? r : (isize)size;
   }
   case CGF_SUBTREE_CONTROL: {
@@ -866,7 +939,15 @@ static int cg_rmdir_cb(struct vfs_node *dir, const char *name) {
   }
   child->inode->data = 0;
   cg_forget(cg);
-  kfree(cg);
+  /* A cgroup namespace rooted here keeps the struct (never the directory):
+   * its members still need somewhere to measure their paths from. */
+  spin_lock_irqsave(&cg_lock, &flags);
+  cg->dir = 0;
+  cg->removed = 1;
+  int keep = cg->ns_refs > 0;
+  spin_unlock_irqrestore(&cg_lock, flags);
+  if (!keep)
+    kfree(cg);
   return 0;
 }
 
@@ -876,8 +957,19 @@ static struct vfs_node *cg_mount_cb(const char *source, u64 flags, void *data) {
   (void)source;
   (void)flags;
   (void)data;
-  if (cg_root)
-    return ERR_PTR(-EBUSY); /* one unified hierarchy, as on Linux */
+  /* One unified hierarchy, as on Linux: every mount after the first shows the
+   * same tree, rooted where the mounting task's cgroup namespace is. */
+  u64 lf;
+  spin_lock_irqsave(&cg_lock, &lf);
+  if (cg_root) {
+    struct cgroup *r = cg_ns_root_locked();
+    struct vfs_node *dir = r->dir ? r->dir : cg_root->dir;
+    vfs_node_get(dir);
+    cg_mounts++;
+    spin_unlock_irqrestore(&cg_lock, lf);
+    return dir;
+  }
+  spin_unlock_irqrestore(&cg_lock, lf);
   struct vfs_node *root = vfs_create_node(VFS_DIRECTORY);
   if (!root)
     return ERR_PTR(-ENOMEM);
@@ -892,6 +984,7 @@ static struct vfs_node *cg_mount_cb(const char *source, u64 flags, void *data) {
     return ERR_PTR(-ENOMEM);
   }
   cg_root = cg;
+  cg_mounts = 1;
   cg_populate(cg);
   return root;
 }
@@ -900,6 +993,10 @@ static int cg_umount_cb(struct vfs_node *root_node) {
   (void)root_node;
   u64 flags;
   spin_lock_irqsave(&cg_lock, &flags);
+  if (--cg_mounts > 0) {
+    spin_unlock_irqrestore(&cg_lock, flags);
+    return 0;
+  }
   for (u32 i = 0; i < CG_SLOTS; i++) {
     cg_members[i].pid = 0;
     cg_members[i].cg = 0;
@@ -907,11 +1004,23 @@ static int cg_umount_cb(struct vfs_node *root_node) {
   struct cgroup *c = cg_all;
   cg_all = 0;
   cg_root = 0;
-  spin_unlock_irqrestore(&cg_lock, flags);
+  /* What a namespace still roots itself at survives, detached. */
+  struct cgroup *to_free = 0;
   while (c) {
     struct cgroup *next = c->next;
-    kfree(c);
+    c->dir = 0;
+    c->removed = 1;
+    if (c->ns_refs == 0) {
+      c->next = to_free;
+      to_free = c;
+    }
     c = next;
+  }
+  spin_unlock_irqrestore(&cg_lock, flags);
+  while (to_free) {
+    struct cgroup *next = to_free->next;
+    kfree(to_free);
+    to_free = next;
   }
   return 0;
 }
@@ -1009,7 +1118,8 @@ int cgroup_path_of(usize pid, char *buf, usize len) {
   u64 flags;
   spin_lock_irqsave(&cg_lock, &flags);
   struct cgroup *cg = cg_of(pid);
-  int r = cg_path(cg, buf, len);
+  /* Seen from the reader's cgroup namespace, as Linux renders it. */
+  int r = cg_path(cg, cg_ns_root_locked(), buf, len);
   spin_unlock_irqrestore(&cg_lock, flags);
   return r;
 }

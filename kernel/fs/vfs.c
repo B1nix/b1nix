@@ -2600,7 +2600,6 @@ struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind) {
   h->used = 1;
   h->refcount = 1;
   h->kind = kind;
-  h->ns_pin = 0; /* M109: only a /proc/<pid>/ns/<kind> open sets this */
   h->open_path = 0;
   return h;
 }
@@ -6156,18 +6155,16 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
   return vfs_stat_node(node, st);
 }
 
-/* M109: the namespace a /proc/<pid>/ns/<kind> descriptor pinned when it was
- * opened. setns(2) reads it here rather than re-deriving it from the path,
- * which would follow the task instead of the namespace. */
-int vfs_fd_ns_pin(int fd, u32 *pin_out) {
+/* The namespace a descriptor on an nsfs node stands for. The node holds its
+ * own reference on the namespace, so the answer is the namespace the
+ * descriptor was opened on, whatever the task it came from did since. */
+int vfs_fd_ns(int fd, int *kind, u32 *id) {
   struct vfs_handle *h = get_handle(fd);
-  if (!h || h->kind != VFS_HANDLE_NODE)
+  if (!h || !h->used)
     return -EBADF;
-  if (!(h->ns_pin & VFS_NS_PIN_VALID))
+  if (h->kind != VFS_HANDLE_NODE)
     return -EINVAL;
-  if (pin_out)
-    *pin_out = h->ns_pin;
-  return 0;
+  return nsfs_node_ns(h->node, kind, id);
 }
 
 /* Absolute path of an open fd, written NUL-terminated into buf. Backs the libc
@@ -9207,7 +9204,7 @@ int vfs_fchmod(int fd, u16 mode) {
 
 /* Shared body of chown/lchown: `nofollow` selects whether a trailing symlink is
  * resolved (chown) or is itself the target (lchown). */
-static int vfs_chown_common(const char *path, u16 uid, u16 gid, int nofollow) {
+static int vfs_chown_common(const char *path, u32 uid, u32 gid, int nofollow) {
   struct vfs_node *node =
       nofollow ? vfs_find_node_no_follow(path) : vfs_find_node(path);
   if (IS_ERR(node))
@@ -9226,9 +9223,9 @@ static int vfs_chown_common(const char *path, u16 uid, u16 gid, int nofollow) {
     goto out;
   }
 
-  if (uid != (u16)-1)
+  if (uid != (u32)-1)
     node->inode->uid = uid;
-  if (gid != (u16)-1)
+  if (gid != (u32)-1)
     node->inode->gid = gid;
   vfs_update_times(node->inode, VFS_CTIME);
   vfs_inotify_notify(node, IN_ATTRIB, 0); /* M107 */
@@ -9242,12 +9239,12 @@ out:
   return res;
 }
 
-int vfs_chown(const char *path, u16 uid, u16 gid) {
+int vfs_chown(const char *path, u32 uid, u32 gid) {
   return vfs_chown_common(path, uid, gid, 0);
 }
 
 /* lchown(2): change the ownership of a symlink itself. */
-int vfs_lchown(const char *path, u16 uid, u16 gid) {
+int vfs_lchown(const char *path, u32 uid, u32 gid) {
   return vfs_chown_common(path, uid, gid, 1);
 }
 
@@ -9512,7 +9509,7 @@ out:
   return ret;
 }
 
-int vfs_fchown(int fd, u16 uid, u16 gid) {
+int vfs_fchown(int fd, u32 uid, u32 gid) {
   struct vfs_handle *handle = get_handle(fd);
   if (!handle || !handle->used)
     return -EBADF;
@@ -9526,9 +9523,9 @@ int vfs_fchown(int fd, u16 uid, u16 gid) {
   if (!cred_has_cap(cred, CAP_CHOWN))
     return -EPERM;
 
-  if (uid != (u16)-1)
+  if (uid != (u32)-1)
     handle->node->inode->uid = uid;
-  if (gid != (u16)-1)
+  if (gid != (u32)-1)
     handle->node->inode->gid = gid;
   handle->node->inode->ctime = vfs_get_unix_time();
   if (handle->node->inode->setattr_cb)

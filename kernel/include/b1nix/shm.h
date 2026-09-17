@@ -40,15 +40,21 @@
 
 /* ── Data Structures ── */
 
+/* The ids in here are KERNEL ids (see <b1nix/user_namespace.h>); the syscall
+ * layer translates them for the caller. */
 struct ipc_perm {
-    u16  uid;           /* Owner's user ID */
-    u16  gid;           /* Owner's group ID */
-    u16  cuid;          /* Creator's user ID */
-    u16  cgid;          /* Creator's group ID */
-    u16  mode;          /* Read/write permission */
+    u32  uid;           /* Owner's user ID */
+    u32  gid;           /* Owner's group ID */
+    u32  cuid;          /* Creator's user ID */
+    u32  cgid;          /* Creator's group ID */
+    u16  mode;          /* Read/write permission, plus SHM_DEST */
     u16  seq;           /* Slot usage sequence number */
     u32  key;           /* IPC key */
 };
+
+/* shm mode bit: IPC_RMID was asked while attached; the segment goes away at
+ * its last detach and can no longer be found by key. */
+#define SHM_DEST    01000
 
 struct shmid_ds {
     struct ipc_perm shm_perm;    /* Operation permissions */
@@ -56,15 +62,16 @@ struct shmid_ds {
     u64            shm_atime;    /* Last attach time */
     u64            shm_dtime;    /* Last detach time */
     u64            shm_ctime;    /* Last change time */
-    u16            shm_cpid;     /* PID of creator */
-    u16            shm_lpid;     /* PID of last shmop */
-    u16            shm_nattch;   /* Number of current attaches */
-    u16            shm_npages;   /* Number of pages allocated */
+    usize          shm_cpid;     /* kernel id of the creator */
+    usize          shm_lpid;     /* kernel id of the last shmat/shmdt caller */
+    u32            shm_nattch;   /* Number of current attaches */
+    u32            shm_npages;   /* Number of pages allocated */
 };
 
 struct shm_segment {
     int   used;
     u32   key;                /* IPC key */
+    u32   ns;                 /* IPC namespace */
     struct shmid_ds ds;
     /* Array of physical page frames backing the segment. Allocated (kmalloc)
      * on shmget to the segment's actual size — M77 made SHMMAX a runtime cap,
@@ -86,10 +93,19 @@ struct shm_attach {
 /* ── API ── */
 
 void shm_init(void);
+/* Each returns a negative errno on failure; shmat returns it cast to a
+ * pointer. Ids name segments of the caller's IPC namespace only. */
 int  shmget(u32 key, usize size, int shmflg);
 void *shmat(int shmid, const void *shmaddr, int shmflg);
 int  shmdt(const void *shmaddr);
+/* IPC_STAT fills *buf (after a read-permission check), IPC_SET takes uid, gid
+ * and mode from it (kernel ids), IPC_RMID ignores it. */
 int  shmctl(int shmid, int cmd, struct shmid_ds *buf);
+/* The segment at table index `idx` if it belongs to the caller's IPC
+ * namespace, without a permission check — /proc/sysvipc/shm. */
+int  shm_stat_index(int idx, struct shmid_ds *out);
+/* Drop every segment of an IPC namespace that is going away. */
+void shm_ns_destroy(u32 ns);
 
 /* For per-process tracking need to know current task id */
 struct shm_attach *shm_get_process_attaches(usize pid);

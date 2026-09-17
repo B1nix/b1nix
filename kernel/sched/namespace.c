@@ -1,119 +1,105 @@
-/* M109 — per-process namespaces for unshare(1)/nsenter(1).
+/* Per-task namespaces: the core (M109, completed in M123).
  *
- * Four kinds, all real:
+ * Eight kinds, all real:
  *
- *   UTS   — each namespace owns a hostname and a domainname. Every reader in
- *           the tree (uname(2), /proc/sys/kernel/hostname, /sys/kernel/hostname)
- *           already went through kernel_hostname_get(), so routing that one
- *           function through the caller's namespace makes all of them agree.
- *   MOUNT — a namespace is a private copy of the VFS mount table. Table entries
- *           carry a namespace id and every scan skips the ones that do not
- *           belong to the caller, so a mount made inside a namespace is
- *           invisible outside it (kernel/fs/vfs.c).
+ *   UTS    — a hostname and a domainname.
+ *   MOUNT  — a private copy of the VFS mount table (kernel/fs/vfs.c).
+ *   PID    — a numbering over the kernel's flat task ids, with its own init
+ *            (kernel/sched/pid_namespace.c).
+ *   NET    — interfaces, routes, neighbours and socket bindings (kernel/net/).
+ *   USER   — uid/gid maps and capabilities relative to a namespace
+ *            (kernel/sched/user_namespace.c). Carried in the task's cred.
+ *   IPC    — SysV IPC objects and POSIX message queues (kernel/ipc/).
+ *   CGROUP — the cgroup a task's view of the hierarchy is rooted at.
+ *   TIME   — offsets of CLOCK_MONOTONIC and CLOCK_BOOTTIME.
  *
- *   PID   — a TRANSLATION over the kernel's one flat task-id space. A task
- *           created into a namespace is numbered from 1 there (and in every
- *           namespace between it and the initial one) and is invisible to any
- *           namespace that is not an ancestor of its own. As on Linux,
- *           unshare(CLONE_NEWPID) does not move the caller — it chooses the
- *           namespace its future children are born into.
- *   NET   — interfaces, routes, neighbours and socket bindings each carry the
- *           id of the namespace they belong to, and every enumeration and
- *           lookup filters on the caller's (kernel/net/). A veth pair is how a
- *           frame crosses from one namespace to another.
- *
- * Which namespaces a task is in lives in a side table keyed by task id —
- * struct task must not grow (see kernel/mm/eviction.c for the same
- * constraint). A task with no row is in the initial namespace of every kind,
- * which is every task until something unshares, so a normal boot allocates no
- * rows and namespace_active() keeps the VFS fast paths free of any lookup.
+ * This file holds what every kind shares: the id tables with their reference
+ * counts and owners, per-task membership, the reaper that tears down the kinds
+ * whose release takes locks a dying task must not take, clone/unshare/setns,
+ * and nsfs — the objects /proc/<pid>/ns/<kind> resolves to.
  */
 
+#include <b1nix/cgroup.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
-#include <b1nix/namespace.h>
+#include <b1nix/mm.h>
+#include <b1nix/posix.h>
 #include <b1nix/sched.h>
-#include <b1nix/spinlock.h>
+#include <b1nix/syscall.h>
+#include <b1nix/uidgid.h>
+#include <b1nix/vfs.h>
+#include <stdio.h>
 #include <string.h>
 
-#define NS_MAX_TASKS 64 /* tasks that are NOT in the initial namespaces */
-#define NS_MAX_UTS 8    /* slot 0 is the initial UTS namespace */
-/* Mount namespaces. Eight was enough while the only caller was `unshare -m`
- * from a shell; a systemd machine puts every sandboxed unit and every
- * generator in one of its own, and runs out during the boot -- at which point
- * clone(CLONE_NEWNS) answers ENOSPC and the unit fails to start for a reason
- * that has nothing to do with the unit. The cost is one int per slot here plus
- * whatever mount entries a namespace actually holds. */
-#define NS_MAX_MNT 64   /* slot 0 is the initial mount namespace */
-#define NS_MAX_PID 8    /* slot 0 is the initial pid namespace */
-/* Tasks a non-initial pid namespace can number at once. */
-#define PIDNS_MAX_TASKS 64
+#include "ns_internal.h"
+
+/* Linux CLONE_* bits unshare(2) accepts besides CLONE_NEW*. */
+#define LX_CLONE_VM      0x00000100ULL
+#define LX_CLONE_FS      0x00000200ULL
+#define LX_CLONE_FILES   0x00000400ULL
+#define LX_CLONE_SIGHAND 0x00000800ULL
+#define LX_CLONE_PARENT  0x00008000ULL
+#define LX_CLONE_THREAD  0x00010000ULL
+#define LX_CLONE_SYSVSEM 0x00040000ULL
+
+spinlock_t ns_lock = SPINLOCK_INIT;
+int ns_any;
+
+static struct ns_slot uts_slots[NS_MAX_UTS];
+static struct ns_slot mnt_slots[NS_MAX_MNT];
+static struct ns_slot pid_slots[NS_MAX_PID];
+static struct ns_slot net_slots[NS_MAX_NET];
+static struct ns_slot user_slots[NS_MAX_USER];
+static struct ns_slot ipc_slots[NS_MAX_IPC];
+static struct ns_slot cgroup_slots[NS_MAX_CGROUP];
+static struct ns_slot time_slots[NS_MAX_TIME];
+
+struct ns_slot *const ns_slots[NS_KIND_COUNT] = {
+    [NS_UTS] = uts_slots,       [NS_MNT] = mnt_slots,
+    [NS_PID] = pid_slots,       [NS_NET] = net_slots,
+    [NS_USER] = user_slots,     [NS_IPC] = ipc_slots,
+    [NS_CGROUP] = cgroup_slots, [NS_TIME] = time_slots,
+};
+
+const u32 ns_max[NS_KIND_COUNT] = {
+    [NS_UTS] = NS_MAX_UTS,       [NS_MNT] = NS_MAX_MNT,
+    [NS_PID] = NS_MAX_PID,       [NS_NET] = NS_MAX_NET,
+    [NS_USER] = NS_MAX_USER,     [NS_IPC] = NS_MAX_IPC,
+    [NS_CGROUP] = NS_MAX_CGROUP, [NS_TIME] = NS_MAX_TIME,
+};
 
 #define NS_NAME_MAX 65
 
-struct ns_row {
-  int used;
-  usize pid;
-  u32 id[NS_KIND_COUNT];
-  /* Linux's pid_ns_for_children: unshare/setns of a PID namespace takes effect
-   * on the tasks this one goes on to create, never on itself. */
-  u32 pid_children;
-  /* Namespaces the NEXT child is born into, prepared by clone(2) before the
-   * fork and consumed by namespace_fork_inherit. 0 in a slot means "inherit".
-   *
-   * It is done ahead of the fork, not after it, because the child is runnable
-   * the moment the fork returns: a namespace handed to it afterwards is a
-   * namespace it may already have left the kernel without. Cloning a mount
-   * table also allocates and takes VFS locks, which the fork's tail — running
-   * with interrupts disabled — is no place for. */
-  u32 child_ns[NS_KIND_COUNT];
-};
-
-/* One entry per task numbered in a non-initial pid namespace.
- *
- * A dead entry keeps its numbers. It has to: waitpid(2) reaps the task and
- * only then translates the pid it is about to return, so deleting the mapping
- * at reap time made every wait for a specific child inside a namespace answer
- * 0. Keeping it is safe because the kernel's task ids are handed out by a
- * monotonic counter and never recycled, so a stale pair can never come to name
- * a different task. The slot is reclaimed when the table has no free one. */
-struct pidns_slot {
-  usize vnr;  /* the number this namespace knows the task by; 0 = free */
-  usize gid;  /* the kernel's own task id */
-  u8 dead;    /* the task is gone; the number is kept for the reaper */
-};
-
-struct pid_ns {
-  int used;
-  u32 parent;     /* enclosing namespace; 0 is the initial one */
-  usize next_vnr; /* next number to hand out */
-  struct pidns_slot map[PIDNS_MAX_TASKS];
-};
-
-struct uts_ns {
-  int used;
+struct uts_data {
   char host[NS_NAME_MAX];
   char domain[NS_NAME_MAX];
 };
+static struct uts_data uts_data[NS_MAX_UTS];
 
-static struct ns_row ns_rows[NS_MAX_TASKS];
-static struct uts_ns uts_ns[NS_MAX_UTS];
-static int mnt_ns_used[NS_MAX_MNT];
-static struct pid_ns pid_ns[NS_MAX_PID];
-static int net_ns_used[NS_MAX_NET];
+struct time_data {
+  i64 monotonic;
+  i64 boottime;
+};
+static struct time_data time_data[NS_MAX_TIME];
 
-/* Non-zero once at least one row exists. Read without the lock on the VFS fast
- * path: the worst a stale zero can do is one lookup that predates an unshare
- * the calling task has not returned from yet. */
-static int ns_any;
+/* The cgroup each cgroup namespace is rooted at (a referenced struct cgroup,
+ * opaque here). Slot 0 is the real root and stays NULL. */
+static void *cgroup_roots[NS_MAX_CGROUP];
 
-static spinlock_t ns_lock = SPINLOCK_INIT;
+static struct ns_row ns_rows[SCHED_MAX_TASKS];
+
+/* nsfs inode numbers of the initial namespaces are Linux's fixed ones, so a
+ * program that compares against them (they are well known) gets the answer it
+ * expects. Namespaces created later count up from past them. */
+static const u64 ns_initial_inum[NS_KIND_COUNT] = {
+    [NS_IPC] = 0xEFFFFFFFu,    [NS_UTS] = 0xEFFFFFFEu,
+    [NS_USER] = 0xEFFFFFFDu,   [NS_PID] = 0xEFFFFFFCu,
+    [NS_CGROUP] = 0xEFFFFFFBu, [NS_TIME] = 0xEFFFFFFAu,
+    [NS_NET] = 0xF0000000u,    [NS_MNT] = 0xF0000001u,
+};
+static u64 ns_next_inum = 0xF0000002u;
+
 static int ns_ready;
-
-/* The pid-namespace map, defined further down beside the rest of the pid
- * machinery; the task lifetime hooks above it have to reach them. */
-static void pidns_enter_locked(u32 ns, usize gid);
-static void pidns_leave_locked(usize gid);
 
 static void ns_copy_name(char *dst, usize len, const char *src) {
   if (!dst || len == 0)
@@ -125,34 +111,35 @@ static void ns_copy_name(char *dst, usize len, const char *src) {
   dst[i] = '\0';
 }
 
-/* Initialise the initial namespaces on first use — there is no ordering
- * guarantee between the scheduler and an early sethostname(). */
-static void ns_ensure_init(void) {
+/* Initial namespaces exist from the first use: there is no ordering guarantee
+ * between the scheduler and an early sethostname(). */
+static void ns_ensure_init_locked(void) {
   if (ns_ready)
     return;
   ns_ready = 1;
-  uts_ns[0].used = 1;
-  ns_copy_name(uts_ns[0].host, sizeof(uts_ns[0].host), "b1nix");
-  ns_copy_name(uts_ns[0].domain, sizeof(uts_ns[0].domain), "(none)");
-  mnt_ns_used[0] = 1;
-  pid_ns[0].used = 1;
-  pid_ns[0].parent = 0;
-  pid_ns[0].next_vnr = 1;
-  net_ns_used[0] = 1;
+  for (int k = 0; k < NS_KIND_COUNT; k++) {
+    ns_slots[k][0].used = 1;
+    ns_slots[k][0].entered = 1;
+    ns_slots[k][0].refs = 1; /* never released */
+    ns_slots[k][0].owner = 0;
+    ns_slots[k][0].inum = ns_initial_inum[k];
+  }
+  ns_copy_name(uts_data[0].host, sizeof(uts_data[0].host), "b1nix");
+  ns_copy_name(uts_data[0].domain, sizeof(uts_data[0].domain), "(none)");
+  pidns_init_locked(0, 0);
 }
 
 const char *namespace_kind_name(int kind) {
   switch (kind) {
-  case NS_UTS:
-    return "uts";
-  case NS_MNT:
-    return "mnt";
-  case NS_PID:
-    return "pid";
-  case NS_NET:
-    return "net";
-  default:
-    return "";
+  case NS_UTS: return "uts";
+  case NS_MNT: return "mnt";
+  case NS_PID: return "pid";
+  case NS_NET: return "net";
+  case NS_USER: return "user";
+  case NS_IPC: return "ipc";
+  case NS_CGROUP: return "cgroup";
+  case NS_TIME: return "time";
+  default: return "";
   }
 }
 
@@ -165,357 +152,1054 @@ int namespace_kind_from_name(const char *name) {
   return -1;
 }
 
+u64 namespace_kind_flag(int kind) {
+  switch (kind) {
+  case NS_UTS: return B1NIX_CLONE_NEWUTS;
+  case NS_MNT: return B1NIX_CLONE_NEWNS;
+  case NS_PID: return B1NIX_CLONE_NEWPID;
+  case NS_NET: return B1NIX_CLONE_NEWNET;
+  case NS_USER: return B1NIX_CLONE_NEWUSER;
+  case NS_IPC: return B1NIX_CLONE_NEWIPC;
+  case NS_CGROUP: return B1NIX_CLONE_NEWCGROUP;
+  case NS_TIME: return B1NIX_CLONE_NEWTIME;
+  default: return 0;
+  }
+}
+
+int namespace_kind_from_flag(u64 flag) {
+  for (int k = 0; k < NS_KIND_COUNT; k++)
+    if (namespace_kind_flag(k) == flag)
+      return k;
+  return -1;
+}
+
 int namespace_active(void) { return ns_any; }
 
-/* ── the side table ─────────────────────────────────────────────────────── */
+/* ── reference counting ─────────────────────────────────────────────────── */
 
-static struct ns_row *ns_find_locked(usize pid) {
-  for (usize i = 0; i < NS_MAX_TASKS; i++)
-    if (ns_rows[i].used && ns_rows[i].pid == pid)
-      return &ns_rows[i];
-  return 0;
+/* Mount, network, IPC and cgroup namespaces cannot be torn down where their
+ * last reference is usually dropped — an exiting task, with the VFS and socket
+ * locks off limits. They become zombies and this thread finishes them. */
+static void *ns_reaper_chan = (void *)&ns_reaper_chan;
+static int ns_reaper_started;
+static volatile int ns_reaper_pending;
+
+static int ns_kind_deferred(int kind) {
+  return kind == NS_MNT || kind == NS_NET || kind == NS_IPC ||
+         kind == NS_CGROUP;
 }
 
-static struct ns_row *ns_get_or_add_locked(usize pid) {
-  struct ns_row *r = ns_find_locked(pid);
-  if (r)
-    return r;
-  for (usize i = 0; i < NS_MAX_TASKS; i++) {
-    if (ns_rows[i].used)
+u32 ns_alloc_locked(int kind, u32 owner) {
+  ns_ensure_init_locked();
+  struct ns_slot *s = ns_slots[kind];
+  for (u32 i = 1; i < ns_max[kind]; i++) {
+    if (s[i].used)
       continue;
-    ns_rows[i].used = 1;
-    ns_rows[i].pid = pid;
-    for (int k = 0; k < NS_KIND_COUNT; k++)
-      ns_rows[i].id[k] = 0;
-    ns_rows[i].pid_children = 0;
+    s[i].used = 1;
+    s[i].zombie = 0;
+    s[i].entered = 0;
+    s[i].refs = 1;
+    s[i].owner = owner;
+    s[i].inum = ns_next_inum++;
+    /* A user namespace's owner is its parent; either way the reference keeps
+     * the owner alive for as long as this namespace is. */
+    ns_get_locked(NS_USER, owner);
     ns_any = 1;
-    return &ns_rows[i];
+    return i;
   }
   return 0;
 }
 
-/* Is any live row still in namespace `id` of kind `kind`? */
-static int ns_id_referenced_locked(int kind, u32 id) {
-  for (usize i = 0; i < NS_MAX_TASKS; i++)
-    if (ns_rows[i].used && ns_rows[i].id[kind] == id)
-      return 1;
-  return 0;
+void ns_get_locked(int kind, u32 id) {
+  if (id == 0 || kind < 0 || kind >= NS_KIND_COUNT || id >= ns_max[kind])
+    return;
+  ns_slots[kind][id].refs++;
 }
 
-static void ns_recompute_any_locked(void) {
-  for (usize i = 0; i < NS_MAX_TASKS; i++)
-    if (ns_rows[i].used)
-      return;
-  ns_any = 0;
-}
-
-/* Release namespaces nothing points at any more. Called from the paths that
- * allocate (unshare/setns) rather than from task exit: tearing a mount
- * namespace down means dropping VFS references, which must not happen on the
- * exit path where the caller is already unwinding. Must be called with the
- * lock NOT held — vfs_mnt_ns_destroy() takes VFS locks. */
-/* Is namespace `id` of kind `kind` still wanted by a live row? A pid
- * namespace also counts as referenced while a row is still aiming its future
- * children at it — an unshare that has not forked yet must not be collected. */
-static int ns_kind_referenced_locked(int kind, u32 id) {
-  if (ns_id_referenced_locked(kind, id))
-    return 1;
-  if (kind == NS_PID)
-    for (usize i = 0; i < NS_MAX_TASKS; i++)
-      if (ns_rows[i].used && ns_rows[i].pid_children == id)
-        return 1;
-  return 0;
-}
-
-static void ns_gc(void) {
-  u32 dead[NS_MAX_MNT];
-  int ndead = 0;
-  u32 dead_net[NS_MAX_NET];
-  int ndead_net = 0;
-
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  ns_ensure_init();
-  for (u32 i = 1; i < NS_MAX_UTS; i++)
-    if (uts_ns[i].used && !ns_id_referenced_locked(NS_UTS, i))
-      uts_ns[i].used = 0;
-  for (u32 i = 1; i < NS_MAX_MNT; i++) {
-    if (!mnt_ns_used[i] || ns_id_referenced_locked(NS_MNT, i))
-      continue;
-    mnt_ns_used[i] = 0;
-    dead[ndead++] = i;
+void ns_put_locked(int kind, u32 id) {
+  if (id == 0 || kind < 0 || kind >= NS_KIND_COUNT || id >= ns_max[kind])
+    return;
+  struct ns_slot *s = &ns_slots[kind][id];
+  if (!s->used || s->refs == 0) {
+    console_write("namespace: reference underflow on ");
+    console_write(namespace_kind_name(kind));
+    console_write(" namespace ");
+    console_write_dec(id);
+    console_write("\n");
+    return;
   }
-  for (u32 i = 1; i < NS_MAX_PID; i++) {
-    if (!pid_ns[i].used || ns_kind_referenced_locked(NS_PID, i))
-      continue;
-    memset(&pid_ns[i], 0, sizeof(pid_ns[i]));
+  if (--s->refs != 0)
+    return;
+  if (ns_kind_deferred(kind)) {
+    s->zombie = 1;
+    ns_reaper_pending = 1;
+    return;
   }
-  for (u32 i = 1; i < NS_MAX_NET; i++) {
-    if (!net_ns_used[i] || ns_id_referenced_locked(NS_NET, i))
-      continue;
-    net_ns_used[i] = 0;
-    dead_net[ndead_net++] = i;
+  u32 owner = s->owner;
+  switch (kind) {
+  case NS_PID:
+    pidns_release_locked(id);
+    break;
+  case NS_USER:
+    userns_release_locked(id);
+    break;
+  case NS_UTS:
+    memset(&uts_data[id], 0, sizeof(uts_data[id]));
+    break;
+  case NS_TIME:
+    memset(&time_data[id], 0, sizeof(time_data[id]));
+    break;
+  default:
+    break;
   }
-  spin_unlock_irqrestore(&ns_lock, flags);
-
-  for (int i = 0; i < ndead; i++)
-    vfs_mnt_ns_destroy(dead[i]);
-  /* Interfaces, routes and neighbours outlive their namespace otherwise, and a
-   * later namespace reusing the slot would inherit them. */
-  for (int i = 0; i < ndead_net; i++)
-    net_ns_destroy(dead_net[i]);
+  s->used = 0;
+  ns_put_locked(NS_USER, owner);
 }
 
-u32 namespace_id_of(usize pid, int kind) {
-  if (kind < 0 || kind >= NS_KIND_COUNT || !ns_any)
+static int ns_live_locked(int kind, u32 id) {
+  if (kind < 0 || kind >= NS_KIND_COUNT || id >= ns_max[kind])
     return 0;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  struct ns_row *r = ns_find_locked(pid);
-  u32 id = r ? r->id[kind] : 0;
-  spin_unlock_irqrestore(&ns_lock, flags);
-  return id;
+  if (id == 0)
+    return 1;
+  return ns_slots[kind][id].used && !ns_slots[kind][id].zombie;
+}
+
+static void ns_kick_reaper(void);
+
+int namespace_get(int kind, u32 id) {
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  ns_ensure_init_locked();
+  int ok = ns_live_locked(kind, id);
+  if (ok)
+    ns_get_locked(kind, id);
+  spin_unlock_irqrestore(&ns_lock, f);
+  return ok ? 0 : -EINVAL;
+}
+
+void namespace_put(int kind, u32 id) {
+  if (id == 0)
+    return;
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  ns_put_locked(kind, id);
+  spin_unlock_irqrestore(&ns_lock, f);
+  ns_kick_reaper();
+}
+
+u64 namespace_inum(int kind, u32 id) {
+  if (kind < 0 || kind >= NS_KIND_COUNT || id >= ns_max[kind])
+    return 0;
+  if (id == 0)
+    return ns_initial_inum[kind];
+  return ns_slots[kind][id].inum;
+}
+
+u32 namespace_owner(int kind, u32 id) {
+  if (kind < 0 || kind >= NS_KIND_COUNT || id >= ns_max[kind] || id == 0)
+    return 0;
+  return ns_slots[kind][id].owner;
+}
+
+static void ns_reaper_thread(void *arg) {
+  (void)arg;
+  for (;;) {
+    u64 f;
+    spin_lock_irqsave(&ns_lock, &f);
+    if (!ns_reaper_pending) {
+      scheduler_wait_prepare(ns_reaper_chan);
+      spin_unlock_irqrestore(&ns_lock, f);
+      scheduler_wait_commit();
+      continue;
+    }
+    ns_reaper_pending = 0;
+    /* Collect under the lock, tear down outside it, then free the slots: the
+     * ids must stay allocated until nothing in the VFS or the net layer can
+     * still carry them, or a new namespace would inherit the leftovers. */
+    struct {
+      int kind;
+      u32 id;
+      void *cg;
+    } dead[32];
+    int n = 0;
+    for (int k = 0; k < NS_KIND_COUNT && n < (int)(sizeof(dead) / sizeof(dead[0])); k++) {
+      if (!ns_kind_deferred(k))
+        continue;
+      for (u32 i = 1; i < ns_max[k] && n < (int)(sizeof(dead) / sizeof(dead[0])); i++) {
+        struct ns_slot *s = &ns_slots[k][i];
+        if (!s->used || !s->zombie || s->zombie == 2)
+          continue;
+        s->zombie = 2; /* being torn down */
+        dead[n].kind = k;
+        dead[n].id = i;
+        dead[n].cg = 0;
+        if (k == NS_CGROUP) {
+          dead[n].cg = cgroup_roots[i];
+          cgroup_roots[i] = 0;
+        }
+        n++;
+      }
+    }
+    if (n == (int)(sizeof(dead) / sizeof(dead[0])))
+      ns_reaper_pending = 1; /* more than one batch */
+    spin_unlock_irqrestore(&ns_lock, f);
+
+    for (int i = 0; i < n; i++) {
+      switch (dead[i].kind) {
+      case NS_MNT: vfs_mnt_ns_destroy(dead[i].id); break;
+      case NS_NET: net_ns_destroy(dead[i].id); break;
+      case NS_IPC: ipc_ns_destroy(dead[i].id); break;
+      case NS_CGROUP: cgroup_ns_root_put(dead[i].cg); break;
+      default: break;
+      }
+    }
+
+    spin_lock_irqsave(&ns_lock, &f);
+    for (int i = 0; i < n; i++) {
+      struct ns_slot *s = &ns_slots[dead[i].kind][dead[i].id];
+      u32 owner = s->owner;
+      s->used = 0;
+      s->zombie = 0;
+      ns_put_locked(NS_USER, owner);
+    }
+    spin_unlock_irqrestore(&ns_lock, f);
+  }
+}
+
+static void ns_kick_reaper(void) {
+  if (!__atomic_load_n(&ns_reaper_pending, __ATOMIC_RELAXED))
+    return;
+  if (!ns_reaper_started) {
+    if (!scheduler_can_block())
+      return; /* the next kick from a task context starts it */
+    ns_reaper_started = 1;
+    if (kthread_create("ns-reaper", ns_reaper_thread, 0) < 0) {
+      ns_reaper_started = 0;
+      return;
+    }
+  }
+  scheduler_wake_all(ns_reaper_chan);
+}
+
+/* ── per-task membership ────────────────────────────────────────────────── */
+
+struct ns_row *ns_row_of(const struct task *t) {
+  if (!t)
+    return 0;
+  usize idx = task_slot_index(t);
+  if (idx >= SCHED_MAX_TASKS)
+    return 0;
+  return &ns_rows[idx];
+}
+
+u32 namespace_task_id(const struct task *t, int kind) {
+  if (!t || kind < 0 || kind >= NS_KIND_COUNT)
+    return 0;
+  if (kind == NS_USER)
+    return t->cred ? cred_userns(t->cred) : 0;
+  if (!ns_any)
+    return 0;
+  const struct ns_row *r = ns_row_of(t);
+  return (r && r->used) ? r->id[kind] : 0;
+}
+
+u32 namespace_task_children_id(const struct task *t, int kind) {
+  if (!ns_any || !t)
+    return namespace_task_id(t, kind);
+  const struct ns_row *r = ns_row_of(t);
+  if (!r || !r->used)
+    return namespace_task_id(t, kind);
+  if (kind == NS_PID)
+    return r->pid_children;
+  if (kind == NS_TIME)
+    return r->time_children;
+  return namespace_task_id(t, kind);
 }
 
 u32 namespace_current_id(int kind) {
-  if (!ns_any)
+  if (kind != NS_USER && !ns_any)
     return 0;
-  return namespace_id_of(scheduler_get_pid(), kind);
+  return namespace_task_id(current_task, kind);
 }
 
-void namespace_fork_inherit(usize parent_pid, usize child_pid) {
-  if (!ns_any)
+u32 namespace_id_of(usize pid, int kind) {
+  if (kind != NS_USER && !ns_any)
+    return 0;
+  struct task *t = scheduler_task_by_pid(pid);
+  return t ? namespace_task_id(t, kind) : 0;
+}
+
+/* Drop every reference a row holds and mark it unused. */
+static void ns_row_clear_locked(struct ns_row *r) {
+  if (!r->used)
     return;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
+  for (int k = 0; k < NS_KIND_COUNT; k++) {
+    if (k != NS_USER)
+      ns_put_locked(k, r->id[k]);
+    r->id[k] = 0;
+  }
+  ns_put_locked(NS_PID, r->pid_children);
+  ns_put_locked(NS_TIME, r->time_children);
+  r->pid_children = 0;
+  r->time_children = 0;
+  if (r->child_valid)
+    for (int k = 0; k < NS_KIND_COUNT; k++) {
+      ns_put_locked(k, r->child[k]);
+      r->child[k] = 0;
+    }
+  r->child_valid = 0;
+  r->used = 0;
+}
 
-  /* Whatever this pid used to belong to, it does not any more.
-   *
-   * Rows are keyed by pid, and pids are reused. This function only ever WROTE
-   * the child's row, and only when the parent had one -- so a child forked by
-   * an un-namespaced parent silently kept the row of whichever dead task last
-   * held its number. Every pid the caller then named was translated through a
-   * namespace it was not in, and the translation returned 0: kill(2) answered
-   * ESRCH for a process that was alive and blocked. Seen as
-   * "kill: no pid 190 for caller 191 (translation); slot state=3".
-   *
-   * Cleared before the inherit below, so a genuine inheritance still lands. */
-  {
-    struct ns_row *stale = ns_find_locked(child_pid);
+/* Does the row name anything but initial namespaces? */
+static int ns_row_trivial(const struct ns_row *r) {
+  for (int k = 0; k < NS_KIND_COUNT; k++)
+    if (r->id[k])
+      return 0;
+  return !r->pid_children && !r->time_children && !r->child_valid;
+}
 
-    if (stale) {
-      stale->used = 0;
-      stale->pid = 0;
-      stale->pid_children = 0;
+void namespace_fork_inherit(struct task *parent, struct task *child,
+                            u64 clone_flags) {
+  struct ns_row *cr = ns_row_of(child);
+  if (!cr)
+    return;
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  ns_ensure_init_locked();
+  /* The slot may have been left by a task that never went through the exit
+   * hooks (a kernel thread); nothing of that task may carry over. */
+  ns_row_clear_locked(cr);
+
+  struct ns_row *pr = ns_row_of(parent);
+  int thread = (clone_flags & LX_CLONE_THREAD) != 0;
+  u16 ids[NS_KIND_COUNT] = {0};
+  u16 given[NS_KIND_COUNT] = {0}; /* references handed over, not taken */
+  if (pr && pr->used) {
+    for (int k = 0; k < NS_KIND_COUNT; k++)
+      if (k != NS_USER)
+        ids[k] = pr->id[k];
+    if (!thread) {
+      ids[NS_PID] = pr->pid_children;
+      ids[NS_TIME] = pr->time_children;
+    }
+    if (pr->child_valid && !thread) {
       for (int k = 0; k < NS_KIND_COUNT; k++) {
-        stale->id[k] = 0;
-        stale->child_ns[k] = 0;
-      }
-    }
-    pidns_leave_locked(child_pid);
-  }
-
-  struct ns_row *p = ns_find_locked(parent_pid);
-  if (p) {
-    u32 copy[NS_KIND_COUNT];
-    for (int k = 0; k < NS_KIND_COUNT; k++)
-      copy[k] = p->id[k];
-    /* A pending CLONE_NEWPID applies here and only here: the child is born in
-     * it, the parent stays where it was, and the child's own children follow
-     * the child. That is what makes the first child pid 1. */
-    if (p->pid_children)
-      copy[NS_PID] = p->pid_children;
-    /* Namespaces clone(CLONE_NEW*) prepared for exactly this child. */
-    for (int k = 0; k < NS_KIND_COUNT; k++)
-      if (p->child_ns[k]) {
-        copy[k] = p->child_ns[k];
-        p->child_ns[k] = 0; /* one child, not every child after it */
-      }
-    struct ns_row *c = ns_get_or_add_locked(child_pid);
-    if (c) {
-      for (int k = 0; k < NS_KIND_COUNT; k++)
-        c->id[k] = copy[k];
-      c->pid_children = 0;
-      for (int k = 0; k < NS_KIND_COUNT; k++)
-        c->child_ns[k] = 0;
-      if (copy[NS_PID])
-        pidns_enter_locked(copy[NS_PID], child_pid);
-    }
-  }
-  ns_recompute_any_locked();
-  spin_unlock_irqrestore(&ns_lock, flags);
-}
-
-/* The task's slot has been released. Its number is only MARKED dead here, not
- * dropped: waitpid(2) reaps the task and only then translates the pid it is
- * about to return, so a number deleted at reap time is already gone by the
- * time the answer needs it. See struct pidns_slot. */
-void namespace_task_reaped(usize pid) {
-  /* Release any receive-context slot the task still holds. Push and pop are
-   * paired inside one call frame, so this should never find one — but a pid is
-   * reused, and a slot left behind would answer for its next owner. */
-  namespace_net_release(pid);
-  if (!ns_ready)
-    return;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  pidns_leave_locked(pid);
-  spin_unlock_irqrestore(&ns_lock, flags);
-}
-
-void namespace_task_exit(usize pid) {
-  if (!ns_any)
-    return;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  struct ns_row *r = ns_find_locked(pid);
-  if (r) {
-    r->used = 0;
-    r->pid = 0;
-    r->pid_children = 0;
-    ns_recompute_any_locked();
-  }
-  spin_unlock_irqrestore(&ns_lock, flags);
-}
-
-/* ── PID namespaces ───────────────────────────────────────────────────────
- *
- * The kernel numbers tasks once, globally. A pid namespace is a translation
- * table over that: `map` pairs the number this namespace uses (`vnr`) with the
- * kernel's own id (`gid`). The initial namespace needs no table — there the
- * two are the same number, which is what makes an unnamespaced boot free.
- *
- * A task is entered into its own namespace AND into every namespace between
- * that one and the initial namespace, because an ancestor must be able to name
- * (and signal, and wait for) a task inside a namespace it created. A namespace
- * that is not an ancestor has no entry, and therefore no way to name it — that
- * is the isolation. */
-
-static int pidns_is_ancestor_locked(u32 ancestor, u32 of) {
-  if (ancestor >= NS_MAX_PID || of >= NS_MAX_PID)
-    return 0;
-  for (u32 n = of;; n = pid_ns[n].parent) {
-    if (n == ancestor)
-      return 1;
-    if (n == 0)
-      return 0;
-    if (!pid_ns[n].used)
-      return 0;
-  }
-}
-
-/* Number `gid` in `ns` and in every namespace up to (but not including) the
- * initial one. Best effort: a namespace whose table is full simply cannot name
- * the task, which is reported as "no such process" rather than as a wrong one. */
-static void pidns_enter_locked(u32 ns, usize gid) {
-  for (u32 n = ns; n != 0 && n < NS_MAX_PID && pid_ns[n].used;
-       n = pid_ns[n].parent) {
-    struct pid_ns *pn = &pid_ns[n];
-    int taken = 0;
-    for (usize i = 0; i < PIDNS_MAX_TASKS; i++)
-      if (pn->map[i].vnr && pn->map[i].gid == gid)
-        taken = 1;
-    if (taken)
-      continue;
-    usize slot = PIDNS_MAX_TASKS;
-    for (usize i = 0; i < PIDNS_MAX_TASKS; i++) {
-      if (!pn->map[i].vnr) {
-        slot = i;
-        break;
-      }
-    }
-    /* Nothing free: take the oldest number belonging to a task that has been
-     * reaped. Only now does a dead entry stop being answerable, which is late
-     * enough that no waiter is still holding its number. */
-    if (slot == PIDNS_MAX_TASKS) {
-      usize oldest = 0;
-      for (usize i = 0; i < PIDNS_MAX_TASKS; i++) {
-        if (!pn->map[i].dead)
+        if (!pr->child[k])
           continue;
-        if (slot == PIDNS_MAX_TASKS || pn->map[i].vnr < oldest) {
-          slot = i;
-          oldest = pn->map[i].vnr;
+        if (k == NS_USER) {
+          /* The child's credential is already a copy of the parent's; it moves
+           * into the new namespace with the reference clone prepared. */
+          if (child->cred)
+            cred_enter_userns_locked(child->cred, pr->child[k]);
+          else
+            ns_put_locked(NS_USER, pr->child[k]);
+        } else {
+          ids[k] = pr->child[k];
+          given[k] = 1;
         }
+        pr->child[k] = 0;
       }
+      pr->child_valid = 0;
     }
-    if (slot == PIDNS_MAX_TASKS)
-      continue; /* full of live tasks — the task is simply not nameable here */
-    pn->map[slot].vnr = pn->next_vnr++;
-    pn->map[slot].gid = gid;
-    pn->map[slot].dead = 0;
+  }
+  for (int k = 0; k < NS_KIND_COUNT; k++) {
+    if (k == NS_USER)
+      continue;
+    cr->id[k] = ids[k];
+    if (ids[k] && !given[k])
+      ns_get_locked(k, ids[k]);
+  }
+  cr->pid_children = ids[NS_PID];
+  ns_get_locked(NS_PID, ids[NS_PID]);
+  cr->time_children = ids[NS_TIME];
+  ns_get_locked(NS_TIME, ids[NS_TIME]);
+  if (ids[NS_TIME])
+    time_slots[ids[NS_TIME]].entered = 1;
+  cr->used = !ns_row_trivial(cr);
+  if (ids[NS_PID])
+    pidns_enter_locked(ids[NS_PID], child, thread);
+  spin_unlock_irqrestore(&ns_lock, f);
+}
+
+void namespace_task_exit(struct task *t) {
+  struct ns_row *r = ns_row_of(t);
+  if (!r || !ns_any)
+    return;
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  u32 pidns = r->used ? r->id[NS_PID] : 0;
+  if (pidns)
+    pidns_task_exit_locked(t, pidns);
+  ns_row_clear_locked(r);
+  spin_unlock_irqrestore(&ns_lock, f);
+  if (pidns)
+    pidns_run_zaps();
+  ns_kick_reaper();
+}
+
+void namespace_task_reaped(struct task *t) {
+  if (!t)
+    return;
+  /* Release any receive-context slot the task still holds: push and pop pair
+   * inside one call frame, but a slot left behind would answer for the next
+   * owner of the id. */
+  namespace_net_release(t->id);
+  if (!ns_any)
+    return;
+  /* A task can reach its reap without having gone through an exit path (a
+   * fork that failed after the child was numbered): do what exit would. */
+  namespace_task_exit(t);
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  pidns_task_reaped_locked(t->id);
+  spin_unlock_irqrestore(&ns_lock, f);
+}
+
+/* ── creating namespaces ────────────────────────────────────────────────── */
+
+/* A set of namespaces being built for unshare(2) or a clone(2) child. Each
+ * non-zero entry holds one reference. */
+struct ns_set {
+  u32 id[NS_KIND_COUNT];
+};
+
+static void ns_set_release(struct ns_set *set) {
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  for (int k = 0; k < NS_KIND_COUNT; k++) {
+    ns_put_locked(k, set->id[k]);
+    set->id[k] = 0;
+  }
+  spin_unlock_irqrestore(&ns_lock, f);
+  ns_kick_reaper();
+}
+
+static usize thread_group_size(void) {
+  return scheduler_thread_group_count(current_task);
+}
+
+/* Build every namespace `flags` asks for, as the calling task would get them.
+ * `userns` is the user namespace the new namespaces are owned by (a new one if
+ * the set creates it). The caller checks privileges. */
+static int ns_build(u64 flags, struct ns_set *set) {
+  memset(set, 0, sizeof(*set));
+  struct task *me = current_task;
+  const struct cred *c = me ? me->cred : 0;
+  if (!c)
+    return -EPERM;
+
+  if (flags & B1NIX_CLONE_NEWUSER) {
+    int rc = userns_create(c);
+    if (rc < 0)
+      return rc;
+    set->id[NS_USER] = (u32)rc;
+  }
+  u32 owner = set->id[NS_USER] ? set->id[NS_USER] : cred_userns(c);
+
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  ns_ensure_init_locked();
+  struct ns_row *r = ns_row_of(me);
+  int used = r && r->used;
+  u32 cur_uts = used ? r->id[NS_UTS] : 0;
+  u32 cur_pid = used ? r->id[NS_PID] : 0;
+  u32 cur_pid_children = used ? r->pid_children : 0;
+  u32 cur_time_children = used ? r->time_children : 0;
+  u32 cur_mnt = used ? r->id[NS_MNT] : 0;
+  int rc = 0;
+
+  if (flags & B1NIX_CLONE_NEWPID) {
+    /* Linux copy_pid_ns: a task whose children already go to a namespace other
+     * than its own cannot stack another one on top before it forks. */
+    if (cur_pid_children != cur_pid) {
+      rc = -EINVAL;
+      goto fail_locked;
+    }
+    if (pidns_level_locked(cur_pid) + 1 >= NS_MAX_LEVEL) {
+      rc = -ENOSPC;
+      goto fail_locked;
+    }
+  }
+
+  for (int k = 0; k < NS_KIND_COUNT; k++) {
+    if (k == NS_USER || !(flags & namespace_kind_flag(k)))
+      continue;
+    u32 id = ns_alloc_locked(k, owner);
+    if (!id) {
+      rc = -ENOSPC;
+      goto fail_locked;
+    }
+    set->id[k] = id;
+    switch (k) {
+    case NS_UTS:
+      /* A new UTS namespace starts as a copy of the one being left. */
+      uts_data[id] = uts_data[ns_live_locked(NS_UTS, cur_uts) ? cur_uts : 0];
+      break;
+    case NS_PID:
+      pidns_init_locked(id, cur_pid);
+      break;
+    case NS_TIME:
+      time_data[id] = time_data[cur_time_children];
+      break;
+    case NS_CGROUP:
+      /* The root is taken outside the lock below. */
+      break;
+    default:
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&ns_lock, f);
+
+  if (set->id[NS_CGROUP]) {
+    void *root = cgroup_ns_root_get(scheduler_get_pid());
+    spin_lock_irqsave(&ns_lock, &f);
+    cgroup_roots[set->id[NS_CGROUP]] = root;
+    spin_unlock_irqrestore(&ns_lock, f);
+  }
+  /* The mount-table copy takes VFS locks and must not run under ns_lock. */
+  if (set->id[NS_MNT]) {
+    int mrc = vfs_mnt_ns_clone(cur_mnt, set->id[NS_MNT]);
+    if (mrc != 0) {
+      ns_set_release(set);
+      return mrc;
+    }
+  }
+  return 0;
+
+fail_locked:
+  spin_unlock_irqrestore(&ns_lock, f);
+  ns_set_release(set);
+  return rc;
+}
+
+/* The privilege Linux asks for before creating the non-user namespaces of a
+ * set: CAP_SYS_ADMIN in the user namespace that will own them. A set that
+ * creates that user namespace passes by construction — its creator holds every
+ * capability there. */
+static int ns_may_create(u64 flags) {
+  if (!(flags & (B1NIX_CLONE_NS_ALL & ~(u64)B1NIX_CLONE_NEWUSER)))
+    return 1;
+  if (flags & B1NIX_CLONE_NEWUSER)
+    return 1;
+  const struct cred *c = scheduler_get_current_cred();
+  return c && ns_capable_cred(c, cred_userns(c), CAP_SYS_ADMIN);
+}
+
+int namespace_fork_prepare(u64 flags) {
+  u64 want = flags & B1NIX_CLONE_NS_ALL;
+  /* CLONE_NEWTIME's bit is inside CSIGNAL on clone(2); the syscall layer only
+   * passes it from clone3. */
+  if ((flags & (B1NIX_CLONE_NEWNS | B1NIX_CLONE_NEWUSER)) &&
+      (flags & LX_CLONE_FS))
+    return -EINVAL;
+  if ((flags & (B1NIX_CLONE_NEWUSER | B1NIX_CLONE_NEWPID)) &&
+      (flags & (LX_CLONE_THREAD | LX_CLONE_PARENT)))
+    return -EINVAL;
+  if (!want)
+    return 0;
+  if (!ns_may_create(want))
+    return -EPERM;
+
+  struct ns_set set;
+  int rc = ns_build(want, &set);
+  if (rc < 0)
+    return rc;
+
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  struct ns_row *r = ns_row_of(current_task);
+  if (!r) {
+    spin_unlock_irqrestore(&ns_lock, f);
+    ns_set_release(&set);
+    return -EINVAL;
+  }
+  /* A previous prepare whose fork never ran (the caller was interrupted
+   * between the two) must not leak into this child. */
+  if (r->child_valid)
+    for (int k = 0; k < NS_KIND_COUNT; k++) {
+      ns_put_locked(k, r->child[k]);
+      r->child[k] = 0;
+    }
+  for (int k = 0; k < NS_KIND_COUNT; k++)
+    r->child[k] = (u16)set.id[k];
+  r->child_valid = 1;
+  r->used = 1;
+  spin_unlock_irqrestore(&ns_lock, f);
+  ns_kick_reaper();
+  return 0;
+}
+
+void namespace_fork_prepare_abort(void) {
+  if (!ns_any)
+    return;
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  struct ns_row *r = ns_row_of(current_task);
+  if (r && r->child_valid) {
+    for (int k = 0; k < NS_KIND_COUNT; k++) {
+      ns_put_locked(k, r->child[k]);
+      r->child[k] = 0;
+    }
+    r->child_valid = 0;
+    if (ns_row_trivial(r))
+      r->used = 0;
+  }
+  spin_unlock_irqrestore(&ns_lock, f);
+  ns_kick_reaper();
+}
+
+int namespace_fork_allowed(void) {
+  if (!ns_any)
+    return 0;
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  struct ns_row *r = ns_row_of(current_task);
+  u32 target = 0;
+  if (r && r->used)
+    target = (r->child_valid && r->child[NS_PID]) ? r->child[NS_PID]
+                                                   : r->pid_children;
+  int dying = target ? pidns_dying_locked(target) : 0;
+  spin_unlock_irqrestore(&ns_lock, f);
+  return dying ? -ENOMEM : 0;
+}
+
+int namespace_unshare(u64 flags) {
+  const u64 allowed = LX_CLONE_THREAD | LX_CLONE_FS | LX_CLONE_SIGHAND |
+                      LX_CLONE_VM | LX_CLONE_FILES | LX_CLONE_SYSVSEM |
+                      B1NIX_CLONE_NS_ALL;
+  if (flags & ~allowed)
+    return -EINVAL;
+  /* Linux check_unshare_flags: a new user namespace implies a private
+   * thread group and fs; a new mount namespace a private fs. */
+  if (flags & B1NIX_CLONE_NEWUSER)
+    flags |= LX_CLONE_THREAD | LX_CLONE_FS;
+  if (flags & B1NIX_CLONE_NEWNS)
+    flags |= LX_CLONE_FS;
+  if ((flags & (LX_CLONE_THREAD | LX_CLONE_SIGHAND | LX_CLONE_VM)) &&
+      thread_group_size() > 1)
+    return -EINVAL;
+
+  u64 want = flags & B1NIX_CLONE_NS_ALL;
+  if (!want)
+    return 0; /* CLONE_FS/FILES/SYSVSEM: this task already owns all of them */
+  if (!ns_may_create(want))
+    return -EPERM;
+
+  struct ns_set set;
+  int rc = ns_build(want, &set);
+  if (rc < 0)
+    return rc;
+
+  struct task *me = current_task;
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  struct ns_row *r = ns_row_of(me);
+  if (!r) {
+    spin_unlock_irqrestore(&ns_lock, f);
+    ns_set_release(&set);
+    return -EINVAL;
+  }
+  if (!r->used) {
+    memset(r, 0, sizeof(*r));
+    r->used = 1;
+  }
+  for (int k = 0; k < NS_KIND_COUNT; k++) {
+    u32 id = set.id[k];
+    if (!(want & namespace_kind_flag(k)))
+      continue;
+    switch (k) {
+    case NS_USER:
+      cred_enter_userns_locked(me->cred, id);
+      break;
+    case NS_PID:
+      /* The caller stays where it is; its children are born in the new one. */
+      ns_put_locked(NS_PID, r->pid_children);
+      r->pid_children = (u16)id;
+      break;
+    case NS_TIME:
+      ns_put_locked(NS_TIME, r->time_children);
+      r->time_children = (u16)id;
+      break;
+    default:
+      ns_put_locked(k, r->id[k]);
+      r->id[k] = (u16)id;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&ns_lock, f);
+  ns_kick_reaper();
+  return 0;
+}
+
+/* ── setns(2) ───────────────────────────────────────────────────────────── */
+
+/* Validate entering namespace (kind, id) — Linux's per-kind ->install checks.
+ * Caller holds ns_lock. */
+static int ns_install_check_locked(int kind, u32 id, const struct cred *c,
+                                   const struct ns_row *r) {
+  if (!ns_live_locked(kind, id))
+    return -EINVAL;
+  u32 mine = cred_userns(c);
+  u32 owner = kind == NS_USER ? id : (id ? ns_slots[kind][id].owner : 0);
+  switch (kind) {
+  case NS_USER:
+    /* Entering the namespace one is already in would re-grant the full
+     * capability set; threaded processes may not change user namespace. */
+    if (id == mine)
+      return -EINVAL;
+    if (thread_group_size() > 1)
+      return -EINVAL;
+    if (!ns_capable_cred(c, id, CAP_SYS_ADMIN))
+      return -EPERM;
+    return 0;
+  case NS_MNT:
+    if (!ns_capable_cred(c, owner, CAP_SYS_ADMIN) ||
+        !ns_capable_cred(c, mine, CAP_SYS_CHROOT) ||
+        !ns_capable_cred(c, mine, CAP_SYS_ADMIN))
+      return -EPERM;
+    return 0;
+  case NS_PID: {
+    u32 active = (r && r->used) ? r->id[NS_PID] : 0;
+    if (!ns_capable_cred(c, owner, CAP_SYS_ADMIN) ||
+        !ns_capable_cred(c, mine, CAP_SYS_ADMIN))
+      return -EPERM;
+    /* Only the active namespace or a descendant of it: going the other way
+     * would hand the caller numbers it is not entitled to name. */
+    if (!pidns_is_ancestor_locked(active, id))
+      return -EINVAL;
+    return 0;
+  }
+  case NS_TIME:
+    if (thread_group_size() > 1)
+      return -EUSERS;
+    /* fall through */
+  default:
+    if (!ns_capable_cred(c, owner, CAP_SYS_ADMIN) ||
+        !ns_capable_cred(c, mine, CAP_SYS_ADMIN))
+      return -EPERM;
+    return 0;
   }
 }
 
-static void pidns_leave_locked(usize gid) {
-  for (u32 n = 1; n < NS_MAX_PID; n++)
-    for (usize i = 0; i < PIDNS_MAX_TASKS; i++)
-      if (pid_ns[n].map[i].vnr && pid_ns[n].map[i].gid == gid)
-        pid_ns[n].map[i].dead = 1;
+/* Enter namespace (kind, id): the reference is taken here. */
+static void ns_install_locked(struct task *me, struct ns_row *r, int kind,
+                              u32 id) {
+  if (!r->used) {
+    memset(r, 0, sizeof(*r));
+    r->used = 1;
+  }
+  switch (kind) {
+  case NS_USER:
+    ns_get_locked(NS_USER, id);
+    cred_enter_userns_locked(me->cred, id);
+    break;
+  case NS_PID:
+    ns_get_locked(NS_PID, id);
+    ns_put_locked(NS_PID, r->pid_children);
+    r->pid_children = (u16)id;
+    break;
+  case NS_TIME:
+    /* setns into a time namespace moves the caller itself (its clocks change
+     * at once) and its future children. */
+    ns_get_locked(NS_TIME, id);
+    ns_get_locked(NS_TIME, id);
+    ns_put_locked(NS_TIME, r->time_children);
+    ns_put_locked(NS_TIME, r->id[NS_TIME]);
+    r->time_children = (u16)id;
+    r->id[NS_TIME] = (u16)id;
+    if (id)
+      time_slots[id].entered = 1;
+    break;
+  default:
+    ns_get_locked(kind, id);
+    ns_put_locked(kind, r->id[kind]);
+    r->id[kind] = (u16)id;
+    break;
+  }
+  if (ns_row_trivial(r))
+    r->used = 0;
 }
 
-static usize pidns_vnr_locked(u32 ns, usize gid) {
-  if (ns == 0)
-    return gid;
-  if (ns >= NS_MAX_PID || !pid_ns[ns].used)
-    return 0;
-  for (usize i = 0; i < PIDNS_MAX_TASKS; i++)
-    if (pid_ns[ns].map[i].vnr && pid_ns[ns].map[i].gid == gid)
-      return pid_ns[ns].map[i].vnr;
+int namespace_setns(int fd, int nstype) {
+  struct task *me = current_task;
+  const struct cred *c = me ? me->cred : 0;
+  if (!c)
+    return -EPERM;
+  struct vfs_handle *h = vfs_handle_acquire(fd);
+  if (!h)
+    return -EBADF;
+
+  u32 targets[NS_KIND_COUNT] = {0};
+  u8 want[NS_KIND_COUNT] = {0};
+  int rc = 0;
+  int by_pidfd = h->kind == VFS_HANDLE_PIDFD;
+
+  if (by_pidfd) {
+    /* setns(pidfd, flags): every namespace named in `flags`, taken from the
+     * process the pidfd refers to, entered as one operation. */
+    u64 flags = (u64)(u32)nstype;
+    if (!flags || (flags & ~(u64)B1NIX_CLONE_NS_ALL)) {
+      vfs_handle_release(h);
+      return -EINVAL;
+    }
+    struct task *t = scheduler_task_by_pid(vfs_pidfd_pid(h));
+    if (!t || t->state == TASK_DEAD || t->state == TASK_REAPING ||
+        t->state == TASK_UNUSED) {
+      vfs_handle_release(h);
+      return -ESRCH;
+    }
+    for (int k = 0; k < NS_KIND_COUNT; k++) {
+      if (!(flags & namespace_kind_flag(k)))
+        continue;
+      want[k] = 1;
+      targets[k] = namespace_task_id(t, k);
+    }
+  } else {
+    int kind;
+    u32 id;
+    if (h->kind != VFS_HANDLE_NODE || nsfs_node_ns(h->node, &kind, &id) != 0) {
+      vfs_handle_release(h);
+      return -EINVAL;
+    }
+    /* A non-zero nstype is the caller telling us what it believes the handle
+     * is; disagreeing with it is an error. */
+    if (nstype != 0 && namespace_kind_flag(kind) != (u64)(u32)nstype) {
+      vfs_handle_release(h);
+      return -EINVAL;
+    }
+    want[kind] = 1;
+    targets[kind] = id;
+  }
+  vfs_handle_release(h);
+
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  ns_ensure_init_locked();
+  struct ns_row *r = ns_row_of(me);
+  if (!r) {
+    spin_unlock_irqrestore(&ns_lock, f);
+    return -EINVAL;
+  }
+  /* The user namespace first: every later check is made with the credential
+   * the caller will have once it is inside, as Linux does. With a pidfd the
+   * caller may already share the target's user namespace; that one is then
+   * simply not re-entered. */
+  if (want[NS_USER] && targets[NS_USER] == cred_userns(c) && by_pidfd)
+    want[NS_USER] = 0;
+  if (want[NS_USER]) {
+    rc = ns_install_check_locked(NS_USER, targets[NS_USER], c, r);
+    if (rc == 0)
+      ns_install_locked(me, r, NS_USER, targets[NS_USER]);
+  }
+  for (int k = 0; k < NS_KIND_COUNT && rc == 0; k++) {
+    if (k == NS_USER || !want[k])
+      continue;
+    rc = ns_install_check_locked(k, targets[k], me->cred, r);
+  }
+  for (int k = 0; k < NS_KIND_COUNT && rc == 0; k++) {
+    if (k == NS_USER || !want[k])
+      continue;
+    ns_install_locked(me, r, k, targets[k]);
+  }
+  spin_unlock_irqrestore(&ns_lock, f);
+  ns_kick_reaper();
+  return rc;
+}
+
+/* ── nsfs ───────────────────────────────────────────────────────────────── */
+
+/* st_dev of every namespace handle, Linux's nsfs device (0:4). */
+#define NSFS_DEV 4u
+#define NSFS_PIN_VALID 0x80000000u
+
+static void nsfs_release(struct vfs_node *node);
+static int nsfs_ioctl_cb(struct vfs_node *node, u64 request, void *arg);
+
+struct vfs_node *nsfs_node(int kind, u32 id) {
+  if (kind < 0 || kind >= NS_KIND_COUNT)
+    return ERR_PTR(-EINVAL);
+  if (namespace_get(kind, id) != 0)
+    return ERR_PTR(-ENOENT);
+  struct vfs_node *n = vfs_create_node(VFS_FILE);
+  if (!n) {
+    namespace_put(kind, id);
+    return ERR_PTR(-ENOMEM);
+  }
+  snprintf(n->name, sizeof(n->name), "%s:[%llu]", namespace_kind_name(kind),
+           (unsigned long long)namespace_inum(kind, id));
+  n->inode->ino = namespace_inum(kind, id);
+  n->inode->dev = NSFS_DEV;
+  n->inode->mode = 0444;
+  n->inode->uid = 0;
+  n->inode->gid = 0;
+  n->inode->data = (void *)(usize)(NSFS_PIN_VALID | ((u32)kind << 24) | id);
+  n->inode->release_cb = nsfs_release;
+  n->inode->ioctl_cb = nsfs_ioctl_cb;
+  /* No name in any directory: the node dies with its last reference, and that
+   * is what releases the namespace. */
+  n->deleted = 1;
+  return n;
+}
+
+int nsfs_node_ns(struct vfs_node *node, int *kind, u32 *id) {
+  if (!node || !node->inode || node->inode->release_cb != nsfs_release)
+    return -EINVAL;
+  u32 pin = (u32)(usize)node->inode->data;
+  if (!(pin & NSFS_PIN_VALID))
+    return -EINVAL;
+  if (kind)
+    *kind = (int)((pin >> 24) & 0x7F);
+  if (id)
+    *id = pin & 0xFFFFFF;
   return 0;
 }
 
-static usize pidns_gid_locked(u32 ns, usize vnr) {
-  if (ns == 0)
-    return vnr;
-  if (ns >= NS_MAX_PID || !pid_ns[ns].used)
-    return 0;
-  for (usize i = 0; i < PIDNS_MAX_TASKS; i++)
-    if (pid_ns[ns].map[i].vnr == vnr)
-      return pid_ns[ns].map[i].gid;
+static void nsfs_release(struct vfs_node *node) {
+  int kind;
+  u32 id;
+  if (nsfs_node_ns(node, &kind, &id) != 0)
+    return;
+  node->inode->data = 0;
+  node->inode->nlink = 0; /* free the inode along with the node */
+  namespace_put(kind, id);
+}
+
+/* <linux/nsfs.h> */
+#define NS_GET_USERNS    0xb701
+#define NS_GET_PARENT    0xb702
+#define NS_GET_NSTYPE    0xb703
+#define NS_GET_OWNER_UID 0xb704
+
+int nsfs_ioctl(struct vfs_node *node, u64 request, u64 arg) {
+  int kind;
+  u32 id;
+  if (nsfs_node_ns(node, &kind, &id) != 0)
+    return -ENOTTY;
+  switch (request) {
+  case NS_GET_NSTYPE:
+    return (int)namespace_kind_flag(kind);
+  case NS_GET_USERNS:
+  case NS_GET_PARENT: {
+    int want_kind = NS_USER;
+    u32 target;
+    const struct cred *c = scheduler_get_current_cred();
+    u32 mine = c ? cred_userns(c) : 0;
+    u64 f;
+    spin_lock_irqsave(&ns_lock, &f);
+    if (request == NS_GET_USERNS) {
+      target = kind == NS_USER ? userns_parent_locked(id)
+                               : (id ? ns_slots[kind][id].owner : 0);
+      if (kind == NS_USER && id == 0) {
+        spin_unlock_irqrestore(&ns_lock, f);
+        return -EPERM;
+      }
+    } else if (kind == NS_USER) {
+      if (id == 0) {
+        spin_unlock_irqrestore(&ns_lock, f);
+        return -EPERM;
+      }
+      target = userns_parent_locked(id);
+    } else if (kind == NS_PID) {
+      if (id == 0) {
+        spin_unlock_irqrestore(&ns_lock, f);
+        return -EPERM;
+      }
+      want_kind = NS_PID;
+      target = pidns_parent_locked(id);
+    } else {
+      spin_unlock_irqrestore(&ns_lock, f);
+      return -EINVAL;
+    }
+    spin_unlock_irqrestore(&ns_lock, f);
+    /* Linux will not hand out a namespace above the caller's own user
+     * namespace: that would be a way out of it. */
+    if (want_kind == NS_USER && !userns_is_ancestor(mine, target))
+      return -EPERM;
+    if (want_kind == NS_PID) {
+      u32 active = namespace_current_id(NS_PID);
+      u64 g;
+      spin_lock_irqsave(&ns_lock, &g);
+      int ok = pidns_is_ancestor_locked(active, target);
+      spin_unlock_irqrestore(&ns_lock, g);
+      if (!ok)
+        return -EPERM;
+    }
+    struct vfs_node *n = nsfs_node(want_kind, target);
+    if (IS_ERR(n))
+      return (int)PTR_ERR(n);
+    int fd = vfs_fd_for_node(n, B1NIX_O_RDONLY);
+    vfs_node_put(n);
+    if (fd >= 0)
+      scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
+    return fd;
+  }
+  case NS_GET_OWNER_UID: {
+    if (kind != NS_USER)
+      return -EINVAL;
+    u32 uid = current_from_kuid(userns_owner_kuid(id));
+    if (!arg)
+      return -EFAULT;
+    return syscall_copyout((void *)(usize)arg, &uid, sizeof(uid)) < 0 ? -EFAULT
+                                                                      : 0;
+  }
+  default:
+    return -ENOTTY;
+  }
+}
+
+static int nsfs_ioctl_cb(struct vfs_node *node, u64 request, void *arg) {
+  return nsfs_ioctl(node, request, (u64)(usize)arg);
+}
+
+/* ── UTS ────────────────────────────────────────────────────────────────── */
+
+static struct uts_data *uts_current_locked(void) {
+  ns_ensure_init_locked();
+  u32 id = namespace_current_id(NS_UTS);
+  if (!ns_live_locked(NS_UTS, id))
+    id = 0;
+  return &uts_data[id];
+}
+
+void namespace_uts_get_host(char *buf, usize len) {
+  if (!buf || len == 0)
+    return;
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  ns_copy_name(buf, len, uts_current_locked()->host);
+  spin_unlock_irqrestore(&ns_lock, f);
+}
+
+void namespace_uts_get_domain(char *buf, usize len) {
+  if (!buf || len == 0)
+    return;
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  ns_copy_name(buf, len, uts_current_locked()->domain);
+  spin_unlock_irqrestore(&ns_lock, f);
+}
+
+int namespace_uts_set_host(const char *name) {
+  if (!name)
+    return -EFAULT;
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  struct uts_data *u = uts_current_locked();
+  ns_copy_name(u->host, sizeof(u->host), name);
+  spin_unlock_irqrestore(&ns_lock, f);
   return 0;
 }
 
-/* The pid namespace of the task `pid` belongs to. */
-static u32 pidns_of_locked(usize pid) {
-  struct ns_row *r = ns_find_locked(pid);
-  return r ? r->id[NS_PID] : 0;
-}
-
-usize namespace_pid_to_user(usize kernel_pid) {
-  if (!ns_any || kernel_pid == 0)
-    return kernel_pid;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  u32 ns = pidns_of_locked(scheduler_get_pid());
-  usize v = ns == 0 ? kernel_pid : pidns_vnr_locked(ns, kernel_pid);
-  spin_unlock_irqrestore(&ns_lock, flags);
-  return v;
-}
-
-usize namespace_pid_from_user(usize user_pid) {
-  if (!ns_any || user_pid == 0)
-    return user_pid;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  u32 ns = pidns_of_locked(scheduler_get_pid());
-  usize g = ns == 0 ? user_pid : pidns_gid_locked(ns, user_pid);
-  spin_unlock_irqrestore(&ns_lock, flags);
-  return g;
-}
-
-int namespace_pid_visible(usize kernel_pid) {
-  return namespace_pid_to_user(kernel_pid) != 0;
-}
-
-int namespace_pid_visible_from(usize observer_pid, usize kernel_pid) {
-  if (!ns_any)
-    return 1;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  u32 ns = pidns_of_locked(observer_pid);
-  int vis = ns == 0 ? 1 : (pidns_vnr_locked(ns, kernel_pid) != 0);
-  spin_unlock_irqrestore(&ns_lock, flags);
-  return vis;
+int namespace_uts_set_domain(const char *name) {
+  if (!name)
+    return -EFAULT;
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  struct uts_data *u = uts_current_locked();
+  ns_copy_name(u->domain, sizeof(u->domain), name);
+  spin_unlock_irqrestore(&ns_lock, f);
+  return 0;
 }
 
 /* ── network namespaces ───────────────────────────────────────────────────
@@ -524,25 +1208,16 @@ int namespace_pid_visible_from(usize observer_pid, usize kernel_pid) {
  * A socket call, an ioctl or a netlink message belongs to the caller. A frame
  * being demultiplexed belongs to the interface it arrived on, which may be in
  * a namespace no running task is currently in — so the receive path pushes a
- * context around the delivery, exactly as g_receiving_netdev already does.
+ * context around the delivery.
  *
- * That context is PER TASK, not one word for the machine. Two CPUs demultiplex
+ * That context is PER TASK, not one word for the machine: two CPUs demultiplex
  * frames at the same time, and a delivery can sleep (a reply generated inside
- * it waits for ARP), so a single global would let one task's receive context
- * become another task's answer to "which namespace am I in?" — which is a
- * frame stamped with, or delivered to, the wrong namespace's address.
- *
- * Each slot is claimed by its owner and read by nobody else, so the only
- * shared step is claiming a free one. A task with no slot is not inside a
- * receive path and gets the namespace it belongs to. */
+ * it waits for ARP). Keyed by the task's own id, not the thread group's, so
+ * one thread's receive context never answers for another. */
 
-/* Keyed by the task's own id, the same number namespace_task_reaped() releases
- * with: scheduler_get_pid() is the thread-group id, so keying on it would give
- * every thread of a process one shared entry and hand one thread's receive
- * context to another -- exactly the sharing this table replaced. */
 #define NS_RX_SLOTS 32
 struct ns_rx_slot {
-  usize key; /* pid + 1, so that 0 means "free" */
+  usize key; /* task id + 1, so that 0 means "free" */
   u32 ns;
 };
 static struct ns_rx_slot ns_rx[NS_RX_SLOTS];
@@ -558,11 +1233,7 @@ static struct ns_rx_slot *ns_rx_find(usize key) {
   return 0;
 }
 
-u32 namespace_net_current(void) {
-  if (!ns_any)
-    return 0;
-  return namespace_id_of(scheduler_get_pid(), NS_NET);
-}
+u32 namespace_net_current(void) { return namespace_current_id(NS_NET); }
 
 u32 namespace_net_context(void) {
   if (__atomic_load_n(&ns_rx_live, __ATOMIC_RELAXED)) {
@@ -599,11 +1270,10 @@ u32 namespace_net_push_context(u32 ns) {
     }
   }
   /* Every slot taken. The delivery still happens; it resolves in the calling
-   * task's own namespace, which is what it did before this table existed. */
+   * task's own namespace. */
   return 0;
 }
 
-/* Give up the slot of a task that is gone. */
 void namespace_net_release(usize pid) {
   if (!__atomic_load_n(&ns_rx_live, __ATOMIC_RELAXED))
     return;
@@ -630,443 +1300,139 @@ void namespace_net_pop_context(u32 saved) {
 }
 
 int namespace_net_live(u32 ns) {
-  if (ns == 0)
-    return 1;
-  if (ns >= NS_MAX_NET)
-    return 0;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  int live = net_ns_used[ns];
-  spin_unlock_irqrestore(&ns_lock, flags);
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  int live = ns_live_locked(NS_NET, ns);
+  spin_unlock_irqrestore(&ns_lock, f);
   return live;
 }
 
-/* ── UTS ────────────────────────────────────────────────────────────────── */
+/* ── time namespaces ────────────────────────────────────────────────────── */
 
-static struct uts_ns *uts_current_locked(void) {
-  ns_ensure_init();
-  u32 id = 0;
-  if (ns_any) {
-    struct ns_row *r = ns_find_locked(scheduler_get_pid());
-    if (r)
-      id = r->id[NS_UTS];
-  }
-  if (id >= NS_MAX_UTS || !uts_ns[id].used)
-    id = 0;
-  return &uts_ns[id];
-}
-
-void namespace_uts_get_host(char *buf, usize len) {
-  if (!buf || len == 0)
-    return;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  ns_copy_name(buf, len, uts_current_locked()->host);
-  spin_unlock_irqrestore(&ns_lock, flags);
-}
-
-void namespace_uts_get_domain(char *buf, usize len) {
-  if (!buf || len == 0)
-    return;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  ns_copy_name(buf, len, uts_current_locked()->domain);
-  spin_unlock_irqrestore(&ns_lock, flags);
-}
-
-int namespace_uts_set_host(const char *name) {
-  if (!name)
-    return -EFAULT;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  struct uts_ns *u = uts_current_locked();
-  ns_copy_name(u->host, sizeof(u->host), name);
-  spin_unlock_irqrestore(&ns_lock, flags);
-  return 0;
-}
-
-int namespace_uts_set_domain(const char *name) {
-  if (!name)
-    return -EFAULT;
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  struct uts_ns *u = uts_current_locked();
-  ns_copy_name(u->domain, sizeof(u->domain), name);
-  spin_unlock_irqrestore(&ns_lock, flags);
-  return 0;
-}
-
-/* ── unshare(2) / setns(2) ──────────────────────────────────────────────── */
-
-static int ns_unshare_uts(usize pid) {
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  u32 slot = 0;
-  for (u32 i = 1; i < NS_MAX_UTS; i++) {
-    if (uts_ns[i].used)
-      continue;
-    slot = i;
-    break;
-  }
-  if (!slot) {
-    spin_unlock_irqrestore(&ns_lock, flags);
-    return -ENOSPC;
-  }
-  struct ns_row *r = ns_get_or_add_locked(pid);
-  if (!r) {
-    spin_unlock_irqrestore(&ns_lock, flags);
-    return -ENOSPC;
-  }
-  /* A new UTS namespace starts as a copy of the one being left, exactly as
-   * Linux does — `unshare -u` with no sethostname still reports the old
-   * name. */
-  struct uts_ns *old = uts_current_locked();
-  uts_ns[slot].used = 1;
-  ns_copy_name(uts_ns[slot].host, sizeof(uts_ns[slot].host), old->host);
-  ns_copy_name(uts_ns[slot].domain, sizeof(uts_ns[slot].domain), old->domain);
-  r->id[NS_UTS] = slot;
-  spin_unlock_irqrestore(&ns_lock, flags);
-  return 0;
-}
-
-static int ns_unshare_mnt(usize pid) {
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  u32 slot = 0;
-  for (u32 i = 1; i < NS_MAX_MNT; i++) {
-    if (mnt_ns_used[i])
-      continue;
-    slot = i;
-    break;
-  }
-  if (!slot) {
-    spin_unlock_irqrestore(&ns_lock, flags);
-    return -ENOSPC;
-  }
-  struct ns_row *r = ns_get_or_add_locked(pid);
-  if (!r) {
-    spin_unlock_irqrestore(&ns_lock, flags);
-    return -ENOSPC;
-  }
-  u32 from = r->id[NS_MNT];
-  mnt_ns_used[slot] = 1; /* claimed, so no concurrent unshare takes it */
-  spin_unlock_irqrestore(&ns_lock, flags);
-
-  /* The copy takes VFS locks and must not run under ns_lock. */
-  int rc = vfs_mnt_ns_clone(from, slot);
-
-  spin_lock_irqsave(&ns_lock, &flags);
-  if (rc != 0) {
-    mnt_ns_used[slot] = 0;
-    spin_unlock_irqrestore(&ns_lock, flags);
-    vfs_mnt_ns_destroy(slot);
-    return rc;
-  }
-  r = ns_get_or_add_locked(pid);
-  if (r)
-    r->id[NS_MNT] = slot;
-  spin_unlock_irqrestore(&ns_lock, flags);
-  return 0;
-}
-
-/* unshare(CLONE_NEWPID). Linux does not move the caller into the new
- * namespace — it records it as the namespace the caller's future children are
- * created in, which is why `unshare -p` needs a fork before anything is
- * numbered from 1. Doing the same here keeps the caller's own pid, and every
- * pid it already knows, meaningful. */
-static int ns_unshare_pid(usize pid) {
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  ns_ensure_init();
-  u32 slot = 0;
-  for (u32 i = 1; i < NS_MAX_PID; i++) {
-    if (pid_ns[i].used)
-      continue;
-    slot = i;
-    break;
-  }
-  if (!slot) {
-    spin_unlock_irqrestore(&ns_lock, flags);
-    return -ENOSPC;
-  }
-  struct ns_row *r = ns_get_or_add_locked(pid);
-  if (!r) {
-    spin_unlock_irqrestore(&ns_lock, flags);
-    return -ENOSPC;
-  }
-  memset(&pid_ns[slot], 0, sizeof(pid_ns[slot]));
-  pid_ns[slot].used = 1;
-  pid_ns[slot].parent = r->pid_children ? r->pid_children : r->id[NS_PID];
-  pid_ns[slot].next_vnr = 1;
-  r->pid_children = slot;
-  spin_unlock_irqrestore(&ns_lock, flags);
-  return 0;
-}
-
-static int ns_unshare_net(usize pid) {
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  ns_ensure_init();
-  u32 slot = 0;
-  for (u32 i = 1; i < NS_MAX_NET; i++) {
-    if (net_ns_used[i])
-      continue;
-    slot = i;
-    break;
-  }
-  if (!slot) {
-    spin_unlock_irqrestore(&ns_lock, flags);
-    return -ENOSPC;
-  }
-  struct ns_row *r = ns_get_or_add_locked(pid);
-  if (!r) {
-    spin_unlock_irqrestore(&ns_lock, flags);
-    return -ENOSPC;
-  }
-  net_ns_used[slot] = 1;
-  r->id[NS_NET] = slot;
-  spin_unlock_irqrestore(&ns_lock, flags);
-  /* A fresh network namespace starts empty, exactly as Linux's does: no
-   * interfaces (not even the physical one), no routes, no neighbours. The
-   * loopback datapath is per-namespace in the sense that it never leaves it. */
-  return 0;
-}
-
-int namespace_unshare(u64 flags) {
-  /* Namespaces b1nix does not have. Refusing is the honest answer: a task that
-   * believed unshare(CLONE_NEWUSER) had worked would go on to trust an id
-   * mapping that does not exist. */
-  if (flags & (B1NIX_CLONE_NEWUSER | B1NIX_CLONE_NEWIPC | B1NIX_CLONE_NEWCGROUP))
-    return -EINVAL;
-  u64 want = flags & (B1NIX_CLONE_NEWNS | B1NIX_CLONE_NEWUTS |
-                      B1NIX_CLONE_NEWPID | B1NIX_CLONE_NEWNET);
-  if (!want)
-    return 0; /* CLONE_FS/FILES/SYSVSEM: this task already owns all of them */
-
-  ns_gc();
-  usize pid = scheduler_get_pid();
-
-  if (want & B1NIX_CLONE_NEWUTS) {
-    int rc = ns_unshare_uts(pid);
-    if (rc != 0)
-      return rc;
-  }
-  if (want & B1NIX_CLONE_NEWNS) {
-    int rc = ns_unshare_mnt(pid);
-    if (rc != 0)
-      return rc;
-  }
-  if (want & B1NIX_CLONE_NEWPID) {
-    int rc = ns_unshare_pid(pid);
-    if (rc != 0)
-      return rc;
-  }
-  if (want & B1NIX_CLONE_NEWNET) {
-    int rc = ns_unshare_net(pid);
-    if (rc != 0)
-      return rc;
-  }
-  return 0;
-}
-
-/* clone(CLONE_NEW*): build the namespaces the next child is born into.
- *
- * Called by the PARENT, before the fork, with interrupts enabled — cloning a
- * mount table allocates and takes VFS locks. namespace_fork_inherit then
- * stamps the child with what was prepared here, under the same lock that makes
- * the child visible, so there is no window in which the child exists outside
- * the namespaces it asked for.
- *
- * Ignoring the flags instead — which is what happened before this existed —
- * is not a smaller version of the feature, it is the wrong answer: a process
- * that asked for a private mount namespace and quietly got the shared one goes
- * on to remount things "for itself", and every one of those mounts is
- * everyone's. */
-int namespace_child_prepare(u64 flags) {
-  u64 want = flags & (B1NIX_CLONE_NEWNS | B1NIX_CLONE_NEWUTS |
-                      B1NIX_CLONE_NEWNET);
-  if (!want)
+i64 namespace_time_offset(int clock) {
+  u32 id = namespace_current_id(NS_TIME);
+  if (!id)
     return 0;
-
-  ns_gc();
-  usize pid = scheduler_get_pid();
-  u32 prepared[NS_KIND_COUNT] = {0};
-
-  u64 lf;
-  spin_lock_irqsave(&ns_lock, &lf);
-  ns_ensure_init();
-  struct ns_row *r = ns_get_or_add_locked(pid);
-  if (!r) {
-    spin_unlock_irqrestore(&ns_lock, lf);
-    return -ENOSPC;
-  }
-  u32 from_mnt = r->id[NS_MNT];
-
-  if (want & B1NIX_CLONE_NEWUTS) {
-    u32 slot = 0;
-    for (u32 i = 1; i < NS_MAX_UTS; i++)
-      if (!uts_ns[i].used) { slot = i; break; }
-    if (!slot) {
-      spin_unlock_irqrestore(&ns_lock, lf);
-      return -ENOSPC;
-    }
-    struct uts_ns *old = uts_current_locked();
-    uts_ns[slot].used = 1;
-    ns_copy_name(uts_ns[slot].host, sizeof(uts_ns[slot].host), old->host);
-    ns_copy_name(uts_ns[slot].domain, sizeof(uts_ns[slot].domain), old->domain);
-    prepared[NS_UTS] = slot;
-  }
-  if (want & B1NIX_CLONE_NEWNET) {
-    u32 slot = 0;
-    for (u32 i = 1; i < NS_MAX_NET; i++)
-      if (!net_ns_used[i]) { slot = i; break; }
-    if (!slot) {
-      if (prepared[NS_UTS])
-        uts_ns[prepared[NS_UTS]].used = 0;
-      spin_unlock_irqrestore(&ns_lock, lf);
-      return -ENOSPC;
-    }
-    net_ns_used[slot] = 1;
-    prepared[NS_NET] = slot;
-  }
-  u32 mnt_slot = 0;
-  if (want & B1NIX_CLONE_NEWNS) {
-    for (u32 i = 1; i < NS_MAX_MNT; i++)
-      if (!mnt_ns_used[i]) { mnt_slot = i; break; }
-    if (!mnt_slot) {
-      if (prepared[NS_UTS])
-        uts_ns[prepared[NS_UTS]].used = 0;
-      if (prepared[NS_NET])
-        net_ns_used[prepared[NS_NET]] = 0;
-      spin_unlock_irqrestore(&ns_lock, lf);
-      return -ENOSPC;
-    }
-    mnt_ns_used[mnt_slot] = 1; /* claimed, so no concurrent unshare takes it */
-  }
-  spin_unlock_irqrestore(&ns_lock, lf);
-
-  /* The mount-table copy takes VFS locks and must not run under ns_lock. */
-  if (mnt_slot) {
-    int rc = vfs_mnt_ns_clone(from_mnt, mnt_slot);
-    if (rc != 0) {
-      spin_lock_irqsave(&ns_lock, &lf);
-      mnt_ns_used[mnt_slot] = 0;
-      if (prepared[NS_UTS])
-        uts_ns[prepared[NS_UTS]].used = 0;
-      if (prepared[NS_NET])
-        net_ns_used[prepared[NS_NET]] = 0;
-      spin_unlock_irqrestore(&ns_lock, lf);
-      vfs_mnt_ns_destroy(mnt_slot);
-      return rc;
-    }
-    prepared[NS_MNT] = mnt_slot;
-  }
-
-  spin_lock_irqsave(&ns_lock, &lf);
-  r = ns_get_or_add_locked(pid);
-  if (r)
-    for (int k = 0; k < NS_KIND_COUNT; k++)
-      if (prepared[k])
-        r->child_ns[k] = prepared[k];
-  spin_unlock_irqrestore(&ns_lock, lf);
+  if (clock == TIMENS_CLOCK_MONOTONIC)
+    return time_data[id].monotonic;
+  if (clock == TIMENS_CLOCK_BOOTTIME)
+    return time_data[id].boottime;
   return 0;
 }
 
-/* The fork failed, so nothing will ever be born into what was prepared. */
-void namespace_child_prepare_abort(void) {
-  if (!ns_any)
-    return;
-  usize pid = scheduler_get_pid();
-  u32 drop_mnt = 0;
-  u64 lf;
-  spin_lock_irqsave(&ns_lock, &lf);
-  struct ns_row *r = ns_find_locked(pid);
-  if (r) {
-    if (r->child_ns[NS_UTS])
-      uts_ns[r->child_ns[NS_UTS]].used = 0;
-    if (r->child_ns[NS_NET])
-      net_ns_used[r->child_ns[NS_NET]] = 0;
-    drop_mnt = r->child_ns[NS_MNT];
-    if (drop_mnt)
-      mnt_ns_used[drop_mnt] = 0;
-    for (int k = 0; k < NS_KIND_COUNT; k++)
-      r->child_ns[k] = 0;
+static void timens_fmt(char *buf, usize len, usize *pos, const char *name,
+                       i64 off) {
+  i64 sec = off / 1000000000LL;
+  i64 nsec = off % 1000000000LL;
+  if (nsec < 0) {
+    nsec += 1000000000LL;
+    sec -= 1;
   }
-  spin_unlock_irqrestore(&ns_lock, lf);
-  if (drop_mnt)
-    vfs_mnt_ns_destroy(drop_mnt);
+  if (*pos < len)
+    *pos += (usize)snprintf(buf + *pos, len - *pos, "%s %lld %lld\n", name,
+                            (long long)sec, (long long)nsec);
 }
 
-int namespace_setns(int kind, u32 target) {
-  if (kind < 0 || kind >= NS_KIND_COUNT)
-    return -EINVAL;
+int namespace_time_offsets_render(const struct task *t, char *buf, usize len) {
+  u32 id = namespace_task_children_id(t, NS_TIME);
+  usize pos = 0;
+  timens_fmt(buf, len, &pos, "monotonic", id ? time_data[id].monotonic : 0);
+  timens_fmt(buf, len, &pos, "boottime", id ? time_data[id].boottime : 0);
+  return (int)(pos < len ? pos : len);
+}
 
-  usize pid = scheduler_get_pid();
-  u64 flags;
-  spin_lock_irqsave(&ns_lock, &flags);
-  ns_ensure_init();
-  if (target != 0) {
-    int live;
-    switch (kind) {
-    case NS_UTS: live = target < NS_MAX_UTS && uts_ns[target].used; break;
-    case NS_MNT: live = target < NS_MAX_MNT && mnt_ns_used[target]; break;
-    case NS_PID: live = target < NS_MAX_PID && pid_ns[target].used; break;
-    default:     live = target < NS_MAX_NET && net_ns_used[target]; break;
-    }
-    if (!live) {
-      spin_unlock_irqrestore(&ns_lock, flags);
+/* Parse "<clock> <secs> <nsecs>" lines. The clock is a name or a clock id. */
+int namespace_time_offsets_write(struct task *t, const char *buf, usize len) {
+  u32 id = namespace_task_children_id(t, NS_TIME);
+  if (!id)
+    return -EACCES; /* the initial namespace's clocks are not movable */
+  const struct cred *c = scheduler_get_current_cred();
+  if (!c || !ns_capable_cred(c, namespace_owner(NS_TIME, id), CAP_SYS_TIME))
+    return -EPERM;
+  i64 mono = 0, boot = 0;
+  int have_mono = 0, have_boot = 0;
+  usize i = 0;
+  while (i < len) {
+    char line[96];
+    usize n = 0;
+    while (i < len && buf[i] != '\n' && n + 1 < sizeof(line))
+      line[n++] = buf[i++];
+    if (i < len && buf[i] != '\n')
       return -EINVAL;
+    i++;
+    line[n] = '\0';
+    if (n == 0)
+      continue;
+    char *p = line;
+    char name[16];
+    usize nl = 0;
+    while (*p && *p != ' ' && nl + 1 < sizeof(name))
+      name[nl++] = *p++;
+    name[nl] = '\0';
+    int clk;
+    if (strcmp(name, "monotonic") == 0 || strcmp(name, "1") == 0)
+      clk = TIMENS_CLOCK_MONOTONIC;
+    else if (strcmp(name, "boottime") == 0 || strcmp(name, "7") == 0)
+      clk = TIMENS_CLOCK_BOOTTIME;
+    else
+      return -EINVAL;
+    i64 vals[2];
+    for (int v = 0; v < 2; v++) {
+      while (*p == ' ')
+        p++;
+      int neg = 0;
+      if (*p == '-') {
+        neg = 1;
+        p++;
+      }
+      if (*p < '0' || *p > '9')
+        return -EINVAL;
+      i64 x = 0;
+      while (*p >= '0' && *p <= '9') {
+        if (x > (i64)922337203685477580LL)
+          return -ERANGE;
+        x = x * 10 + (*p++ - '0');
+      }
+      vals[v] = neg ? -x : x;
+    }
+    while (*p == ' ')
+      p++;
+    if (*p)
+      return -EINVAL;
+    if (vals[1] < 0 || vals[1] >= 1000000000LL)
+      return -EINVAL;
+    /* Linux bounds a monotonic/boottime offset so the shifted clock can never
+     * go negative: no further back than the clock itself has run. */
+    i64 off = vals[0] * 1000000000LL + vals[1];
+    if (clk == TIMENS_CLOCK_MONOTONIC) {
+      mono = off;
+      have_mono = 1;
+    } else {
+      boot = off;
+      have_boot = 1;
     }
   }
-  /* setns(CLONE_NEWPID) is the same deal as unshare: the caller keeps its own
-   * number and its children are born in the namespace it joined. A caller may
-   * only aim at its own namespace or one descended from it — going the other
-   * way would hand it numbers it is not entitled to name. */
-  if (kind == NS_PID) {
-    struct ns_row *pr = ns_find_locked(pid);
-    u32 mine = pr ? pr->id[NS_PID] : 0;
-    if (!pidns_is_ancestor_locked(mine, target)) {
-      spin_unlock_irqrestore(&ns_lock, flags);
-      return -EINVAL;
-    }
-    if (!pr)
-      pr = ns_get_or_add_locked(pid);
-    if (!pr) {
-      spin_unlock_irqrestore(&ns_lock, flags);
-      return -ENOSPC;
-    }
-    pr->pid_children = (target == mine) ? 0 : target;
-    spin_unlock_irqrestore(&ns_lock, flags);
-    ns_gc();
+  u64 f;
+  spin_lock_irqsave(&ns_lock, &f);
+  int rc = 0;
+  if (!ns_live_locked(NS_TIME, id))
+    rc = -EINVAL;
+  else if (time_slots[id].entered)
+    rc = -EACCES; /* offsets are fixed once a task lives in the namespace */
+  else {
+    if (have_mono)
+      time_data[id].monotonic = mono;
+    if (have_boot)
+      time_data[id].boottime = boot;
+  }
+  spin_unlock_irqrestore(&ns_lock, f);
+  return rc < 0 ? rc : (int)len;
+}
+
+/* ── cgroup namespaces ──────────────────────────────────────────────────── */
+
+void *namespace_cgroup_root(u32 cgns) {
+  if (cgns == 0 || cgns >= NS_MAX_CGROUP)
     return 0;
-  }
-  struct ns_row *r = ns_find_locked(pid);
-  if (!r && target == 0) {
-    spin_unlock_irqrestore(&ns_lock, flags);
-    return 0; /* already in the initial namespace of this kind */
-  }
-  if (!r)
-    r = ns_get_or_add_locked(pid);
-  if (!r) {
-    spin_unlock_irqrestore(&ns_lock, flags);
-    return -ENOSPC;
-  }
-  r->id[kind] = target;
-  /* Joining a network namespace re-points every later socket, ioctl and
-   * netlink message at that namespace's interfaces; nothing already open is
-   * rewritten, which matches Linux (a socket keeps the namespace it was
-   * created in). */
-  int drop = r->pid_children ? 0 : 1;
-  for (int k = 0; k < NS_KIND_COUNT; k++)
-    if (r->id[k])
-      drop = 0;
-  if (drop) {
-    r->used = 0;
-    r->pid = 0;
-    ns_recompute_any_locked();
-  }
-  spin_unlock_irqrestore(&ns_lock, flags);
-
-  ns_gc();
-  return 0;
+  return cgroup_roots[cgns];
 }

@@ -33,6 +33,7 @@
 #include <b1nix/page_cache.h>
 #include <b1nix/module.h>
 #include <b1nix/namespace.h>
+#include <b1nix/user_namespace.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
@@ -926,16 +927,20 @@ static int r_sysvipc_shm(usize pid, struct sbuf *s) {
              "                  rss                  swap\n");
   for (int id = 0; id < SHMMNI; id++) {
     struct shmid_ds ds;
-    if (shmctl(id, IPC_STAT, &ds) != 0)
+    if (shm_stat_index(id, &ds) != 0)
       continue;
     sb_addf(s,
             "%10d %10d  %4o %21lu %5u %5u  %5u %5u %5u %5u %5u %10llu %10llu "
             "%10llu %21lu %21lu\n",
-            (int)ds.shm_perm.key, id, (unsigned)(ds.shm_perm.mode & 0777),
-            (unsigned long)ds.shm_segsz, (unsigned)ds.shm_cpid,
-            (unsigned)ds.shm_lpid, (unsigned)ds.shm_nattch,
-            (unsigned)ds.shm_perm.uid, (unsigned)ds.shm_perm.gid,
-            (unsigned)ds.shm_perm.cuid, (unsigned)ds.shm_perm.cgid,
+            (int)ds.shm_perm.key, id, (unsigned)(ds.shm_perm.mode & 01777),
+            (unsigned long)ds.shm_segsz,
+            (unsigned)namespace_pid_to_user(ds.shm_cpid),
+            (unsigned)namespace_pid_to_user(ds.shm_lpid),
+            (unsigned)ds.shm_nattch,
+            (unsigned)current_from_kuid(ds.shm_perm.uid),
+            (unsigned)current_from_kgid(ds.shm_perm.gid),
+            (unsigned)current_from_kuid(ds.shm_perm.cuid),
+            (unsigned)current_from_kgid(ds.shm_perm.cgid),
             (unsigned long long)ds.shm_atime, (unsigned long long)ds.shm_dtime,
             (unsigned long long)ds.shm_ctime,
             (unsigned long)(ds.shm_npages * PAGE_SIZE), 0ul);
@@ -949,13 +954,16 @@ static int r_sysvipc_sem(usize pid, struct sbuf *s) {
              "     otime      ctime\n");
   for (int id = 0; id < SEMMNI; id++) {
     struct sysv_semid_info si;
-    if (sysv_semctl_stat(id, &si) != 0)
+    if (sysv_sem_stat_index(id, &si) != 0)
       continue;
     sb_addf(s, "%10d %10d  %4o %10llu %5u %5u %5u %5u %10llu %10llu\n",
             (int)si.sem_perm.key, id, (unsigned)(si.sem_perm.mode & 0777),
-            (unsigned long long)si.sem_nsems, (unsigned)si.sem_perm.uid,
-            (unsigned)si.sem_perm.gid, (unsigned)si.sem_perm.cuid,
-            (unsigned)si.sem_perm.cgid, (unsigned long long)si.sem_otime,
+            (unsigned long long)si.sem_nsems,
+            (unsigned)current_from_kuid(si.sem_perm.uid),
+            (unsigned)current_from_kgid(si.sem_perm.gid),
+            (unsigned)current_from_kuid(si.sem_perm.cuid),
+            (unsigned)current_from_kgid(si.sem_perm.cgid),
+            (unsigned long long)si.sem_otime,
             (unsigned long long)si.sem_ctime);
   }
   return 0;
@@ -967,16 +975,19 @@ static int r_sysvipc_msg(usize pid, struct sbuf *s) {
              "  uid   gid  cuid  cgid      stime      rtime      ctime\n");
   for (int id = 0; id < MSGMNI; id++) {
     struct sysv_msqid_info mi;
-    if (sysv_msgctl_stat(id, &mi) != 0)
+    if (sysv_msg_stat_index(id, &mi) != 0)
       continue;
     sb_addf(s,
             "%10d %10d  %4o  %10llu %10llu %5u %5u %5u %5u %5u %5u %10llu "
             "%10llu %10llu\n",
             (int)mi.msg_perm.key, id, (unsigned)(mi.msg_perm.mode & 0777),
             (unsigned long long)mi.msg_cbytes, (unsigned long long)mi.msg_qnum,
-            (unsigned)mi.msg_lspid, (unsigned)mi.msg_lrpid,
-            (unsigned)mi.msg_perm.uid, (unsigned)mi.msg_perm.gid,
-            (unsigned)mi.msg_perm.cuid, (unsigned)mi.msg_perm.cgid,
+            (unsigned)namespace_pid_to_user(mi.msg_lspid),
+            (unsigned)namespace_pid_to_user(mi.msg_lrpid),
+            (unsigned)current_from_kuid(mi.msg_perm.uid),
+            (unsigned)current_from_kgid(mi.msg_perm.gid),
+            (unsigned)current_from_kuid(mi.msg_perm.cuid),
+            (unsigned)current_from_kgid(mi.msg_perm.cgid),
             (unsigned long long)mi.msg_stime, (unsigned long long)mi.msg_rtime,
             (unsigned long long)mi.msg_ctime);
   }
@@ -2725,47 +2736,152 @@ static int procfs_task_lookup(struct vfs_node *dir, const char *name) {
   return 0;
 }
 
-/* ── /proc/<pid>/ns/{uts,mnt,pid,net} (M109) ────────────────────────────────
- * The handles nsenter(1) opens and hands to setns(2). Linux makes these magic
- * symlinks whose text is "<kind>:[<inode>]"; b1nix makes them plain files with
- * the same text, so open() works without a target that has to exist, and
- * `readlink`-style comparison of two tasks' handles still tells you whether
- * they share a namespace. Kinds b1nix has only one of (pid, net) are here too
- * and always name the initial namespace — that is the truth, and nsenter needs
- * the file to exist to say so. */
-static int r_pid_ns(usize pid, struct sbuf *s, int kind) {
-  u32 id = namespace_id_of(pid, kind);
-  /* Same shape as Linux's nsfs inode numbers, one range per kind. */
-  u32 ino = 4026531835u + (u32)kind * 64u + id;
-  sb_addf(s, "%s:[%u]\n", namespace_kind_name(kind), ino);
+/* ── /proc/<pid>/ns/<kind> (M109, M123) ─────────────────────────────────────
+ * Magic links, as on Linux: readlink gives "<kind>:[<inode>]", and opening one
+ * steps to an nsfs node that holds a reference on the namespace — which is what
+ * setns(2) is handed, what a bind mount of the link keeps alive, and what
+ * stat(2) reports the namespace's inode number for. pid_for_children and
+ * time_for_children name the namespace the task's next children are born in. */
+static int procfs_ns_target(struct vfs_node *link, int *kind, u32 *id) {
+  usize pid = pid_from_parent(link);
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t || t->state == TASK_UNUSED)
+    return -ENOENT;
+  int children = 0;
+  char name[16];
+  usize nl = 0;
+  for (const char *c = link->name; *c && *c != '_' && nl + 1 < sizeof(name); c++)
+    name[nl++] = *c;
+  name[nl] = '\0';
+  if (strcmp(link->name, "pid_for_children") == 0 ||
+      strcmp(link->name, "time_for_children") == 0)
+    children = 1;
+  int k = namespace_kind_from_name(name);
+  if (k < 0)
+    return -ENOENT;
+  *kind = k;
+  *id = children ? namespace_task_children_id(t, k) : namespace_task_id(t, k);
   return 0;
 }
 
-/* Pin the namespace the handle names at open(), the way Linux's nsfs does.
- * Resolving it again when setns(2) runs would follow the TASK, so a caller
- * could never hold a handle on the namespace it is about to leave — and
- * "join a namespace, then come back" is the whole of what nsenter does. */
-static int procfs_ns_open_cb(struct vfs_node *node, struct vfs_handle *h) {
-  struct procfs_node *pn = pn_of(node);
-  usize pid = (pn && pn->pid) ? pn->pid : pid_from_parent(node);
-  int kind = namespace_kind_from_name(node->name);
-  if (kind < 0)
-    return 0;
-  h->ns_pin = VFS_NS_PIN_MAKE(kind, namespace_id_of(pid, kind));
-  return 0;
+static isize procfs_ns_readlink(struct vfs_node *node, u64 offset, char *buf,
+                                usize size, int flags) {
+  (void)offset;
+  (void)flags;
+  int kind;
+  u32 id;
+  int rc = procfs_ns_target(node, &kind, &id);
+  if (rc < 0)
+    return rc;
+  char tmp[48];
+  int n = snprintf(tmp, sizeof(tmp), "%s:[%llu]", namespace_kind_name(kind),
+                   (unsigned long long)namespace_inum(kind, id));
+  usize len = n < 0 ? 0 : (usize)n;
+  if (len > size)
+    len = size;
+  memcpy(buf, tmp, len);
+  return (isize)len;
 }
 
-static int r_pid_ns_uts(usize pid, struct sbuf *s) {
-  return r_pid_ns(pid, s, NS_UTS);
+static struct vfs_node *procfs_ns_magic(struct vfs_node *link) {
+  int kind;
+  u32 id;
+  int rc = procfs_ns_target(link, &kind, &id);
+  if (rc < 0)
+    return ERR_PTR(rc);
+  return nsfs_node(kind, id);
 }
-static int r_pid_ns_mnt(usize pid, struct sbuf *s) {
-  return r_pid_ns(pid, s, NS_MNT);
+
+static void procfs_make_ns_link(struct vfs_node *dir, const char *name) {
+  if (find_child(dir, name))
+    return;
+  struct vfs_node *n = vfs_create_node(VFS_SYMLINK);
+  if (!n)
+    return;
+  usize nl = strlen(name);
+  memcpy(n->name, name, nl);
+  n->name[nl] = '\0';
+  n->inode->read_cb = procfs_ns_readlink;
+  n->inode->magic_link_cb = procfs_ns_magic;
+  n->inode->size = 32;
+  n->inode->mode = 0777;
+  n->inode->nlink = 1;
+  n->parent = dir;
+  n->refcount++;
+  vfs_attach_child(dir, n);
 }
-static int r_pid_ns_pid(usize pid, struct sbuf *s) {
-  return r_pid_ns(pid, s, NS_PID);
+
+/* ── /proc/<pid>/{uid_map,gid_map,projid_map,setgroups} (M123) ──────────── */
+static int r_pid_idmap(usize pid, struct sbuf *s, int which) {
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -ENOENT;
+  char tmp[USERNS_MAP_EXTENTS * 34 + 1];
+  int n = userns_map_render(t, which, tmp, sizeof(tmp));
+  if (n > 0) {
+    tmp[n < (int)sizeof(tmp) ? n : (int)sizeof(tmp) - 1] = '\0';
+    sb_puts(s, tmp);
+  }
+  return 0;
 }
-static int r_pid_ns_net(usize pid, struct sbuf *s) {
-  return r_pid_ns(pid, s, NS_NET);
+static int r_pid_uid_map(usize pid, struct sbuf *s) {
+  return r_pid_idmap(pid, s, USERNS_UID_MAP);
+}
+static int r_pid_gid_map(usize pid, struct sbuf *s) {
+  return r_pid_idmap(pid, s, USERNS_GID_MAP);
+}
+static int r_pid_projid_map(usize pid, struct sbuf *s) {
+  return r_pid_idmap(pid, s, USERNS_PROJID_MAP);
+}
+static int w_pid_idmap(usize pid, const char *buf, usize len, int which) {
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -ESRCH;
+  return (int)userns_map_write(t, which, buf, len);
+}
+static int w_pid_uid_map(usize pid, const char *buf, usize len) {
+  return w_pid_idmap(pid, buf, len, USERNS_UID_MAP);
+}
+static int w_pid_gid_map(usize pid, const char *buf, usize len) {
+  return w_pid_idmap(pid, buf, len, USERNS_GID_MAP);
+}
+static int w_pid_projid_map(usize pid, const char *buf, usize len) {
+  return w_pid_idmap(pid, buf, len, USERNS_PROJID_MAP);
+}
+static int r_pid_setgroups(usize pid, struct sbuf *s) {
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -ENOENT;
+  char tmp[16];
+  userns_setgroups_render(t, tmp, sizeof(tmp));
+  sb_puts(s, tmp);
+  return 0;
+}
+static int w_pid_setgroups(usize pid, const char *buf, usize len) {
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -ESRCH;
+  return (int)userns_setgroups_write(t, buf, len);
+}
+
+/* ── /proc/<pid>/timens_offsets (M123) ──────────────────────────────────── */
+static int r_pid_timens_offsets(usize pid, struct sbuf *s) {
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -ENOENT;
+  char tmp[128];
+  int n = namespace_time_offsets_render(t, tmp, sizeof(tmp));
+  if (n > 0) {
+    tmp[n < (int)sizeof(tmp) ? n : (int)sizeof(tmp) - 1] = '\0';
+    sb_puts(s, tmp);
+  }
+  return 0;
+}
+static int w_pid_timens_offsets(usize pid, const char *buf, usize len) {
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -ESRCH;
+  return namespace_time_offsets_write(t, buf, len);
 }
 
 static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
@@ -2792,15 +2908,19 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_make_symlink(d, "root", procfs_root_readlink);
   struct vfs_node *nsdir = procfs_mkchild(d, "ns", VFS_DIRECTORY, 0, pid);
   if (nsdir) {
-    static const procfs_render ns_render[NS_KIND_COUNT] = {
-        r_pid_ns_uts, r_pid_ns_mnt, r_pid_ns_pid, r_pid_ns_net};
-    for (int k = 0; k < NS_KIND_COUNT; k++) {
-      struct vfs_node *n = procfs_mkchild(nsdir, namespace_kind_name(k),
-                                          VFS_DEVICE, ns_render[k], pid);
-      if (n)
-        n->inode->open_cb = procfs_ns_open_cb;
-    }
+    for (int k = 0; k < NS_KIND_COUNT; k++)
+      procfs_make_ns_link(nsdir, namespace_kind_name(k));
+    procfs_make_ns_link(nsdir, "pid_for_children");
+    procfs_make_ns_link(nsdir, "time_for_children");
   }
+  procfs_mkchild_writable_pid(d, "uid_map", r_pid_uid_map, w_pid_uid_map, pid);
+  procfs_mkchild_writable_pid(d, "gid_map", r_pid_gid_map, w_pid_gid_map, pid);
+  procfs_mkchild_writable_pid(d, "projid_map", r_pid_projid_map,
+                              w_pid_projid_map, pid);
+  procfs_mkchild_writable_pid(d, "setgroups", r_pid_setgroups, w_pid_setgroups,
+                              pid);
+  procfs_mkchild_writable_pid(d, "timens_offsets", r_pid_timens_offsets,
+                              w_pid_timens_offsets, pid);
   struct vfs_node *fddir = procfs_mkchild(d, "fd", VFS_DIRECTORY, 0, 0);
   if (fddir) {
     fddir->inode->readdir_cb = procfs_fd_readdir;

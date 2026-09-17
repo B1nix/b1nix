@@ -208,8 +208,8 @@ static void apply_attr(struct vfs_node *node, const struct lkpi_bridge_attr *a)
 	node->inode->size = (usize)a->size;
 	node->inode->mode = (u16)(a->mode & 07777u);
 	node->inode->nlink = (int)a->nlink;
-	node->inode->uid = (u16)a->uid;
-	node->inode->gid = (u16)a->gid;
+	node->inode->uid = (u32)a->uid;
+	node->inode->gid = (u32)a->gid;
 	node->inode->atime = a->atime;
 	node->inode->mtime = a->mtime;
 	node->inode->ctime = a->ctime;

@@ -11,7 +11,9 @@
 #include <b1nix/arch.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
+#include <b1nix/namespace.h>
 #include <b1nix/sched.h>
+#include <b1nix/user_namespace.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/sysv_ipc.h>
 #include <b1nix/uidgid.h>
@@ -29,6 +31,7 @@ struct msg_entry {
 struct msg_queue {
   int used;
   u32 key;
+  u32 ns; /* IPC namespace */
   struct ipc_perm perm;
   struct msg_entry msgs[MSGTQL];
   u64 next_seq;
@@ -44,28 +47,36 @@ static spinlock_t g_msg_lock = SPINLOCK_INIT;
 
 static void *msg_chan(int id) { return (void *)&g_queues[id]; }
 
+/* A queue id names a queue only inside the caller's IPC namespace. */
 static int msg_id_valid(int id) {
-  return id >= 0 && id < MSGMNI && g_queues[id].used;
+  return id >= 0 && id < MSGMNI && g_queues[id].used &&
+         g_queues[id].ns == ipc_current_ns();
 }
 
 static int msg_may_control(const struct msg_queue *q) {
-  const struct cred *c = scheduler_get_current_cred();
-  if (!c)
-    return 1;
-  return c->euid == 0 || c->euid == q->perm.uid || c->euid == q->perm.cuid;
+  return ipc_may_control(&q->perm, q->ns);
+}
+
+static int msg_access(int id, u16 acc) {
+  return ipc_check_perm(&g_queues[id].perm, g_queues[id].ns, acc);
 }
 
 int sysv_msgget(u32 key, int msgflg) {
+  u32 ns = ipc_current_ns();
   u64 flags;
   spin_lock_irqsave(&g_msg_lock, &flags);
 
   if (key != 0 /* IPC_PRIVATE */) {
     for (int i = 0; i < MSGMNI; i++) {
-      if (!g_queues[i].used || g_queues[i].key != key)
+      if (!g_queues[i].used || g_queues[i].ns != ns || g_queues[i].key != key)
         continue;
       if ((msgflg & IPC_CREAT) && (msgflg & IPC_EXCL)) {
         spin_unlock_irqrestore(&g_msg_lock, flags);
         return -EEXIST;
+      }
+      if (msg_access(i, (u16)(msgflg & 0777)) != 0) {
+        spin_unlock_irqrestore(&g_msg_lock, flags);
+        return -EACCES;
       }
       spin_unlock_irqrestore(&g_msg_lock, flags);
       return i;
@@ -82,6 +93,7 @@ int sysv_msgget(u32 key, int msgflg) {
     memset(&g_queues[i], 0, sizeof(g_queues[i]));
     g_queues[i].used = 1;
     g_queues[i].key = key;
+    g_queues[i].ns = ns;
     g_queues[i].qbytes = MSGMAX * MSGTQL;
     const struct cred *c = scheduler_get_current_cred();
     g_queues[i].perm.uid = g_queues[i].perm.cuid = c ? c->euid : 0;
@@ -118,6 +130,11 @@ isize sysv_msgsnd(int msqid, i64 mtype, const void *text, usize size,
       spin_unlock_irqrestore(&g_msg_lock, flags);
       kfree(copy);
       return -EINVAL;
+    }
+    if (msg_access(msqid, 0200) != 0) {
+      spin_unlock_irqrestore(&g_msg_lock, flags);
+      kfree(copy);
+      return -EACCES;
     }
     struct msg_queue *q = &g_queues[msqid];
     int slot = -1;
@@ -161,6 +178,10 @@ isize sysv_msgrcv(int msqid, i64 msgtyp, void *text, usize size, int msgflg,
     if (!msg_id_valid(msqid)) {
       spin_unlock_irqrestore(&g_msg_lock, flags);
       return -EINVAL;
+    }
+    if (msg_access(msqid, 0400) != 0) {
+      spin_unlock_irqrestore(&g_msg_lock, flags);
+      return -EACCES;
     }
     struct msg_queue *q = &g_queues[msqid];
 
@@ -232,6 +253,10 @@ int sysv_msgctl_stat(int msqid, struct sysv_msqid_info *out) {
     spin_unlock_irqrestore(&g_msg_lock, flags);
     return -EINVAL;
   }
+  if (msg_access(msqid, 0400) != 0) {
+    spin_unlock_irqrestore(&g_msg_lock, flags);
+    return -EACCES;
+  }
   struct msg_queue *q = &g_queues[msqid];
   usize qnum = 0;
   for (int i = 0; i < MSGTQL; i++)
@@ -250,7 +275,7 @@ int sysv_msgctl_stat(int msqid, struct sysv_msqid_info *out) {
   return 0;
 }
 
-int sysv_msgctl_set(int msqid, u16 uid, u16 gid, u16 mode, u64 qbytes) {
+int sysv_msgctl_set(int msqid, u32 uid, u32 gid, u16 mode, u64 qbytes) {
   u64 flags;
   spin_lock_irqsave(&g_msg_lock, &flags);
   if (!msg_id_valid(msqid)) {
@@ -261,9 +286,10 @@ int sysv_msgctl_set(int msqid, u16 uid, u16 gid, u16 mode, u64 qbytes) {
     spin_unlock_irqrestore(&g_msg_lock, flags);
     return -EPERM;
   }
-  struct cred *c = scheduler_get_current_cred();
-  /* Only root may RAISE the capacity, exactly as Linux gates msg_qbytes. */
-  if (qbytes > g_queues[msqid].qbytes && !(c && c->euid == 0)) {
+  /* Raising the capacity takes CAP_SYS_RESOURCE, as Linux gates msg_qbytes. */
+  if (qbytes > g_queues[msqid].qbytes &&
+      !ns_capable(namespace_owner(NS_IPC, g_queues[msqid].ns),
+                  CAP_SYS_RESOURCE)) {
     spin_unlock_irqrestore(&g_msg_lock, flags);
     return -EPERM;
   }
@@ -302,6 +328,56 @@ int sysv_msgctl_rmid(int msqid) {
     kfree(to_free[i]);
   scheduler_wake_all(msg_chan(msqid));
   return 0;
+}
+
+int sysv_msg_stat_index(int idx, struct sysv_msqid_info *out) {
+  u64 flags;
+  spin_lock_irqsave(&g_msg_lock, &flags);
+  if (!msg_id_valid(idx)) {
+    spin_unlock_irqrestore(&g_msg_lock, flags);
+    return -EINVAL;
+  }
+  struct msg_queue *q = &g_queues[idx];
+  usize qnum = 0;
+  for (int i = 0; i < MSGTQL; i++)
+    if (q->msgs[i].used)
+      qnum++;
+  out->msg_perm = q->perm;
+  out->msg_stime = q->stime;
+  out->msg_rtime = q->rtime;
+  out->msg_ctime = q->ctime;
+  out->msg_qnum = qnum;
+  out->msg_qbytes = q->qbytes;
+  out->msg_cbytes = q->cbytes;
+  out->msg_lspid = q->lspid;
+  out->msg_lrpid = q->lrpid;
+  spin_unlock_irqrestore(&g_msg_lock, flags);
+  return 0;
+}
+
+/* The IPC namespace is gone: drop its queues and their messages. */
+void sysv_msg_ns_destroy(u32 ns) {
+  for (int id = 0; id < MSGMNI; id++) {
+    char *to_free[MSGTQL];
+    usize nfree = 0;
+    u64 flags;
+    spin_lock_irqsave(&g_msg_lock, &flags);
+    int hit = g_queues[id].used && g_queues[id].ns == ns;
+    if (hit) {
+      for (int i = 0; i < MSGTQL; i++) {
+        if (g_queues[id].msgs[i].used && g_queues[id].msgs[i].text)
+          to_free[nfree++] = g_queues[id].msgs[i].text;
+        g_queues[id].msgs[i].used = 0;
+        g_queues[id].msgs[i].text = 0;
+      }
+      g_queues[id].used = 0;
+    }
+    spin_unlock_irqrestore(&g_msg_lock, flags);
+    for (usize i = 0; i < nfree; i++)
+      kfree(to_free[i]);
+    if (hit)
+      scheduler_wake_all(msg_chan(id));
+  }
 }
 
 void sysv_ipc_init(void) {

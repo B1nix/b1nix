@@ -3,43 +3,40 @@
 
 #include <b1nix/types.h>
 
-/* Maximum message size */
-#define MQ_MAX_MSG_SIZE  256
-/* Maximum number of messages per queue */
-#define MQ_MAX_MSGS      64
-/* Maximum total queues */
-#define MQ_MAX_QUEUES    16
+/* POSIX message queues (kernel/ipc/mqueue.c).
+ *
+ * A queue is a file in its IPC namespace's mqueue filesystem, and a message
+ * queue descriptor is an ordinary descriptor on that file: close(2), poll(2),
+ * dup(2), fork and exec all work on it the way they do on Linux. Mounting
+ * "mqueue" shows the queues of the mounting task's IPC namespace.
+ *
+ * Limits are Linux's defaults (/proc/sys/fs/mqueue): an unprivileged caller
+ * may ask for at most MQ_MSG_MAX messages of MQ_MSGSIZE_MAX bytes; with
+ * CAP_SYS_RESOURCE the hard limits apply. */
 
-struct mq_msg {
-    u32   len;
-    u8    data[MQ_MAX_MSG_SIZE];
-};
+#define MQ_PRIO_MAX           32768
+#define MQ_MSG_DEFAULT        10
+#define MQ_MSGSIZE_DEFAULT    8192
+#define MQ_MSG_MAX            10
+#define MQ_MSGSIZE_MAX        8192
+#define MQ_MSG_HARDMAX        65536
+#define MQ_MSGSIZE_HARDMAX    (16 * 1024 * 1024)
+#define MQ_QUEUES_MAX         256
 
-struct mqueue {
-    char   name[64];
-    int    used;
-    int    refcount;
+void mqueue_init(void);
 
-    /* Circular buffer */
-    struct mq_msg msgs[MQ_MAX_MSGS];
-    u32    head;  /* read index */
-    u32    tail;  /* write index */
-    u32    count; /* number of messages */
+/* The Linux system calls, with Linux argument layouts. `oflag` for mq_open is
+ * already in the kernel's O_* encoding. */
+int mqueue_open(const char *name, int oflag, u32 mode, const void *user_attr);
+int mqueue_unlink(const char *name);
+isize mqueue_timedsend(int fd, const void *user_msg, usize len, u32 prio,
+                       const void *user_timeout);
+isize mqueue_timedreceive(int fd, void *user_msg, usize len, void *user_prio,
+                          const void *user_timeout);
+int mqueue_notify(int fd, const void *user_sigevent);
+int mqueue_getsetattr(int fd, const void *user_new, void *user_old);
 
-    /* Blocking support */
-    usize  readers_waiting;
-    usize  writers_waiting;
-};
-
-/* ── Kernel API ──
- * Handles are table indices (0..MQ_MAX_QUEUES-1), never raw kernel pointers:
- * a userspace handle must not be a dereferenceable kernel address, or any
- * process could pass an arbitrary kernel VA and read/write through it. */
-void       mqueue_init(void);
-int        mqueue_create(const char *name);          /* returns mqd or -errno */
-int        mqueue_send(int mqd, const void *data, u32 len);
-int        mqueue_receive(int mqd, void *data, u32 *len);
-void       mqueue_close(int mqd);
-int        mqueue_unlink(const char *name);
+/* Drop every queue of an IPC namespace that is going away. */
+void mqueue_ns_destroy(u32 ns);
 
 #endif /* B1NIX_MQUEUE_H */

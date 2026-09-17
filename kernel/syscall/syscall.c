@@ -16,6 +16,7 @@
 void tlb_shootdown_all(void);
 #include <b1nix/mqueue.h>
 #include <b1nix/namespace.h>
+#include <b1nix/user_namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/inotify.h>
@@ -1551,7 +1552,7 @@ static isize sys_linux_utimensat(int dirfd, const char *user_path,
   return vfs_utime(resolved, atime, mtime);
 }
 
-static isize sys_chown(const char *user_path, u16 uid, u16 gid) {
+static isize sys_chown(const char *user_path, u32 uid, u32 gid) {
   char *kpath = kmalloc(VFS_MAX_PATH);
   if (!kpath)
     return -ENOMEM;
@@ -1568,7 +1569,7 @@ static isize sys_chown(const char *user_path, u16 uid, u16 gid) {
   return vfs_chown(resolved, uid, gid);
 }
 
-static isize sys_fchown(int fd, u16 uid, u16 gid) {
+static isize sys_fchown(int fd, u32 uid, u32 gid) {
   return vfs_fchown(fd, uid, gid);
 }
 
@@ -2616,89 +2617,31 @@ static u64 ns_pid_out(u64 kernel_pid) {
   return (u64)v;
 }
 
-/* The CLONE_NEW* flags b1nix has namespaces for. clone(2) may ask for them at
- * the same time as it makes the child, and until now it did not get them:
- * scheduler_fork_clone inherits the parent's namespaces and the flags were
- * dropped on the floor.
- *
- * Dropping them is not a missing feature, it is a wrong answer. A caller that
- * asked for a private mount namespace and was given the shared one goes on to
- * remount things "for itself" -- and every one of those mounts is everybody's.
- * systemd forks its generators with CLONE_NEWNS and then remounts the root
- * read-only inside what it believes is its own namespace: the root really went
- * read-only, PID 1's own log descriptor started answering EROFS, and the boot
- * went silent from that point on with no error anywhere to say why. */
-#define CLONE_NS_FLAGS                                                         \
-  (B1NIX_CLONE_NEWNS | B1NIX_CLONE_NEWUTS | B1NIX_CLONE_NEWNET)
-
 /* Prepare, in the parent, the namespaces a clone(CLONE_NEW*) asks for.
  *
  * It must happen here and not in the child: a forked child does not return
  * through this C code at all -- it resumes at x86_fork_child_trampoline and
- * goes straight back to ring 3 -- and even if it did, it is runnable the
- * instant the fork returns, so anything done to it afterwards can be too late.
+ * goes straight back to ring 3 -- and it is runnable the instant the fork
+ * returns, so anything done to it afterwards can be too late.
  *
- * CLONE_NEWPID is refused rather than ignored. On clone it means the child is
- * pid 1 of a fresh numbering, which is not what this kernel's unshare-shaped
- * machinery does, and a process that believes it got a private pid namespace
- * and did not is worse off than one told plainly that it cannot have one. */
+ * Ignoring the flags is not a smaller version of the feature, it is a wrong
+ * answer: systemd forks its generators with CLONE_NEWNS and remounts the root
+ * read-only inside what it believes is its own namespace.
+ *
+ * clone(2) carries the exit signal in its low byte, where clone3's
+ * CLONE_NEWTIME lives; `flags` here must already have that byte removed for a
+ * clone(2) caller. */
 static int clone_prepare_namespaces(u64 flags) {
-  /* The namespaces this kernel does not have, refused rather than ignored --
-   * the same answer unshare(2) already gives, so the two calls agree about
-   * what exists.
-   *
-   * Ignoring CLONE_NEWUSER was not a harmless omission. systemd probes for
-   * id-mapped mounts by cloning into a user namespace and then writing the
-   * child's /proc/<pid>/uid_map; with the flag dropped it got an ordinary
-   * child, and the write failed with ENOENT because there is no such file.
-   * That ENOENT is fatal to the unit -- "Failed to set up special execution
-   * directory in /run" -- so journald could not start. Told plainly that user
-   * namespaces do not exist, systemd records "not supported" and carries on. */
-  if (flags & (B1NIX_CLONE_NEWUSER | B1NIX_CLONE_NEWIPC |
-               B1NIX_CLONE_NEWCGROUP | B1NIX_CLONE_NEWPID))
-    return -EINVAL;
-  if (!(flags & CLONE_NS_FLAGS))
-    return 0;
-  return namespace_child_prepare(flags);
+  return namespace_fork_prepare(flags);
 }
 
-/* ── M109: unshare(2) / setns(2) ────────────────────────────────────────── */
-static isize sys_unshare(u64 flags) {
-  struct cred *c = scheduler_get_current_cred();
-  if (!c || !cred_has_cap(c, CAP_SYS_ADMIN))
-    return -EPERM;
-  return namespace_unshare(flags);
-}
+/* ── M109/M123: unshare(2) / setns(2) ───────────────────────────────────────
+ * Both check privileges themselves: creating a user namespace needs none, and
+ * every other kind needs CAP_SYS_ADMIN in the user namespace that will own it. */
+static isize sys_unshare(u64 flags) { return namespace_unshare(flags); }
 
 static isize sys_setns(int fd, int nstype) {
-  struct cred *c = scheduler_get_current_cred();
-  if (!c || !cred_has_cap(c, CAP_SYS_ADMIN))
-    return -EPERM;
-
-  /* The descriptor is a /proc/<pid>/ns/<kind> handle, which is what nsenter(1)
-   * opens; it carries the namespace it named at open() time. */
-  u32 pin = 0;
-  int rc = vfs_fd_ns_pin(fd, &pin);
-  if (rc != 0)
-    return rc;
-  int kind = VFS_NS_PIN_KIND(pin);
-  u32 id = VFS_NS_PIN_ID(pin);
-
-  /* A non-zero nstype is the caller telling us what it believes the handle is;
-   * disagreeing with it is an error, not something to paper over. */
-  if (nstype != 0) {
-    int want = -1;
-    switch ((unsigned)nstype) {
-    case B1NIX_CLONE_NEWUTS: want = NS_UTS; break;
-    case B1NIX_CLONE_NEWNS:  want = NS_MNT; break;
-    case B1NIX_CLONE_NEWPID: want = NS_PID; break;
-    case B1NIX_CLONE_NEWNET: want = NS_NET; break;
-    default: return -EINVAL;
-    }
-    if (want != kind)
-      return -EINVAL;
-  }
-  return namespace_setns(kind, id);
+  return namespace_setns(fd, nstype);
 }
 
 static void fill_b1nix_utsname(struct b1nix_utsname *uts) {
@@ -6708,54 +6651,40 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LXN_TIMER_CREATE     222
 #define LXN_SYSLOG           103
 #endif
-      /* POSIX mq (musl): mq_open(240), mq_unlink(241), mq_timedsend(242),
-       * mq_timedreceive(243). b1nix mqds are small table indices that would
-       * collide with real fds once musl close()es the mqd, so hand userspace
-       * mqd+LXMQ_BASE and strip it on the way back in. */
-#define LXMQ_BASE 0x100000
-      if (number == LXN_MQ_OPEN || number == LXN_MQ_UNLINK) {
-        char mqname[64];
-        if (syscall_copyinstr(mqname, sizeof(mqname),
-                              (const char *)(usize)arg0) < 0)
-          return (u64)-EFAULT;
-        if (number == LXN_MQ_UNLINK)
-          return (u64)mqueue_unlink(mqname);
-        int mqd = mqueue_create(mqname);
-        return mqd < 0 ? (u64)mqd : (u64)(mqd + LXMQ_BASE);
-      }
-      if (number == LXN_MQ_TIMEDSEND || number == LXN_MQ_TIMEDRECEIVE) {
-        int mqd = (int)arg0 - LXMQ_BASE;
-        if (mqd < 0 || mqd >= MQ_MAX_QUEUES)
-          return (u64)-EBADF;
-        char kbuf[MQ_MAX_MSG_SIZE];
-        if (number == LXN_MQ_TIMEDSEND) { /* mq_timedsend(mqd, ptr, len, prio, abstime) */
-          if (arg2 > MQ_MAX_MSG_SIZE)
-            return (u64)-EMSGSIZE;
-          if (syscall_copyin(kbuf, (const void *)(usize)arg1, (usize)arg2) < 0)
+      /* POSIX message queues: mq_open(240), mq_unlink(241), mq_timedsend(242),
+       * mq_timedreceive(243), mq_notify(244), mq_getsetattr(245) — or 180..185
+       * on aarch64. A queue descriptor is an ordinary descriptor on a file of
+       * the caller's IPC namespace's mqueue filesystem (kernel/ipc/mqueue.c). */
+      if (number >= LXN_MQ_OPEN && number <= LXN_MQ_OPEN + 5) {
+        switch (number - LXN_MQ_OPEN) {
+        case 0:
+        case 1: {
+          char mqname[256];
+          if (syscall_copyinstr(mqname, sizeof(mqname),
+                                (const char *)(usize)arg0) < 0)
             return (u64)-EFAULT;
-          return (u64)mqueue_send(mqd, kbuf, (u32)arg2);
+          if (number == LXN_MQ_UNLINK)
+            return (u64)(isize)mqueue_unlink(mqname);
+          return (u64)(isize)mqueue_open(
+              mqname, linux_open_flags_to_b1nix((int)arg1), (u32)arg2,
+              (const void *)(usize)arg3);
         }
-        u32 klen = 0; /* mq_timedreceive(mqd, ptr, maxlen, prio*, abstime) */
-        int mrc = mqueue_receive(mqd, kbuf, &klen);
-        if (mrc < 0)
-          return (u64)mrc;
-        if (klen > arg2)
-          return (u64)-EMSGSIZE;
-        if (syscall_copyout((void *)(usize)arg1, kbuf, klen) < 0)
-          return (u64)-EFAULT;
-        /* Report the message priority (b1nix mqueues are FIFO, so 0). musl's
-         * mq_receive passes msg_prio through as arg3 and expects it filled. */
-        if (arg3) {
-          u32 prio = 0;
-          if (syscall_copyout((void *)(usize)arg3, &prio, sizeof(prio)) < 0)
-            return (u64)-EFAULT;
+        case 2:
+          return (u64)mqueue_timedsend((int)arg0, (const void *)(usize)arg1,
+                                       (usize)arg2, (u32)arg3,
+                                       (const void *)(usize)arg4);
+        case 3:
+          return (u64)mqueue_timedreceive((int)arg0, (void *)(usize)arg1,
+                                          (usize)arg2, (void *)(usize)arg3,
+                                          (const void *)(usize)arg4);
+        case 4:
+          return (u64)(isize)mqueue_notify((int)arg0,
+                                           (const void *)(usize)arg1);
+        default:
+          return (u64)(isize)mqueue_getsetattr((int)arg0,
+                                               (const void *)(usize)arg1,
+                                               (void *)(usize)arg2);
         }
-        return (u64)klen;
-      }
-      if (number == LXN_CLOSE && arg0 >= LXMQ_BASE &&
-          arg0 < LXMQ_BASE + MQ_MAX_QUEUES) {
-        mqueue_close((int)(arg0 - LXMQ_BASE));
-        return 0;
       }
       /* getpriority(140)/setpriority(141): Linux prepends a `which` argument
        * (PRIO_PROCESS=0 only here) and getpriority returns 20-nice so the
@@ -7096,55 +7025,6 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define RENAME_EXCHANGE  (1u << 1)
 #define RENAME_WHITEOUT  (1u << 2)
 
-      /* POSIX mq (musl): mq_open(240), mq_unlink(241), mq_timedsend(242),
-       * mq_timedreceive(243). b1nix mqds are small table indices that would
-       * collide with real fds once musl close()es the mqd, so hand userspace
-       * mqd+LXMQ_BASE and strip it on the way back in. */
-#define LXMQ_BASE 0x100000
-      if (number == LX_mq_open || number == LX_mq_unlink) {
-        char mqname[64];
-        if (syscall_copyinstr(mqname, sizeof(mqname),
-                              (const char *)(usize)arg0) < 0)
-          return (u64)-EFAULT;
-        if (number == LX_mq_unlink)
-          return (u64)mqueue_unlink(mqname);
-        int mqd = mqueue_create(mqname);
-        return mqd < 0 ? (u64)mqd : (u64)(mqd + LXMQ_BASE);
-      }
-      if (number == LX_mq_timedsend || number == LX_mq_timedreceive) {
-        int mqd = (int)arg0 - LXMQ_BASE;
-        if (mqd < 0 || mqd >= MQ_MAX_QUEUES)
-          return (u64)-EBADF;
-        char kbuf[MQ_MAX_MSG_SIZE];
-        if (number == LX_mq_timedsend) { /* mq_timedsend(mqd, ptr, len, prio, abstime) */
-          if (arg2 > MQ_MAX_MSG_SIZE)
-            return (u64)-EMSGSIZE;
-          if (syscall_copyin(kbuf, (const void *)(usize)arg1, (usize)arg2) < 0)
-            return (u64)-EFAULT;
-          return (u64)mqueue_send(mqd, kbuf, (u32)arg2);
-        }
-        u32 klen = 0; /* mq_timedreceive(mqd, ptr, maxlen, prio*, abstime) */
-        int mrc = mqueue_receive(mqd, kbuf, &klen);
-        if (mrc < 0)
-          return (u64)mrc;
-        if (klen > arg2)
-          return (u64)-EMSGSIZE;
-        if (syscall_copyout((void *)(usize)arg1, kbuf, klen) < 0)
-          return (u64)-EFAULT;
-        /* Report the message priority (b1nix mqueues are FIFO, so 0). musl's
-         * mq_receive passes msg_prio through as arg3 and expects it filled. */
-        if (arg3) {
-          u32 prio = 0;
-          if (syscall_copyout((void *)(usize)arg3, &prio, sizeof(prio)) < 0)
-            return (u64)-EFAULT;
-        }
-        return (u64)klen;
-      }
-      if (number == LX_close && arg0 >= LXMQ_BASE &&
-          arg0 < LXMQ_BASE + MQ_MAX_QUEUES) {
-        mqueue_close((int)(arg0 - LXMQ_BASE));
-        return 0;
-      }
       /* getpriority(140)/setpriority(141): Linux prepends a `which` argument
        * (PRIO_PROCESS=0 only here) and getpriority returns 20-nice so the
        * result is never negative; musl converts it back with 20-ret. */
@@ -7532,7 +7412,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
            * a fallback that cannot work for a file with no name. */
           if (number == LX_fchownat && (at_flags & AT_EMPTY_PATH) &&
               dirfd != AT_FDCWD)
-            return (u64)vfs_fchown(dirfd, (u16)arg2, (u16)arg3);
+            return (u64)vfs_fchown(dirfd, (u32)arg2, (u32)arg3);
           if (!(at_flags & AT_EMPTY_PATH) || dirfd == AT_FDCWD)
             return (u64)-ENOENT;
           int rc = vfs_fd_abspath(dirfd, kpath, sizeof(kpath));
@@ -7650,7 +7530,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           klog_debug("audit: chmod called");
           return (u64)vfs_chmod(resolved, (u16)arg2);
         case LX_fchownat:
-          return (u64)vfs_chown(resolved, (u16)arg2, (u16)arg3);
+          return (u64)vfs_chown(resolved, (u32)arg2, (u32)arg3);
         case LX_faccessat2: /* same shape, flags are just advisory here */
         case LX_faccessat: {
           /* arg0=dirfd, arg1=path, arg2=mode, arg3=flags.
@@ -8010,7 +7890,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           isize kid =
               scheduler_fork_clone(flags, ca.parent_tid, ca.child_tid);
           if (kid < 0)
-            namespace_child_prepare_abort();
+            namespace_fork_prepare_abort();
           /* CLONE_INTO_CGROUP: move the child out of the cgroup it inherited
            * and into the one the descriptor names. Done before the caller is
            * told the pid, so nothing can observe it in the wrong group. */
@@ -8126,13 +8006,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                                 sizeof(probe)) < 0)
               return (u64)-EFAULT;
           }
-          int nsrc = clone_prepare_namespaces(flags);
+          int nsrc = clone_prepare_namespaces(flags & ~0xffULL);
           if (nsrc < 0)
             return (u64)(isize)nsrc;
           isize kid = scheduler_fork_clone(
               flags, (flags & LX_CLONE_PIDFD) ? 0 : parent_tid, child_tid);
           if (kid < 0)
-            namespace_child_prepare_abort();
+            namespace_fork_prepare_abort();
           if ((flags & LX_CLONE_PIDFD) && kid > 0) {
             /* Runs in the parent only: the child returns 0 from the fork. */
             int pfd = vfs_pidfd_open((usize)kid, 0);
@@ -8625,7 +8505,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         if (cs < 0)
           return (u64)(isize)cs; /* ENAMETOOLONG must not become EFAULT */
         vfs_resolve_path(kpath, resolved);
-        return (u64)vfs_lchown(resolved, (u16)arg1, (u16)arg2);
+        return (u64)vfs_lchown(resolved, (u32)arg1, (u32)arg2);
       }
 
       /* pause(34): x86_64-only — aarch64 musl uses rt_sigsuspend(133) instead. */
@@ -8765,8 +8645,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         struct cred *c = scheduler_get_current_cred();
         if (!c)
           return (u64)-EINVAL;
-        return (u64)(number == LX_setfsuid ? cred_set_fsuid(c, (u16)arg0)
-                                   : cred_set_fsgid(c, (u16)arg0));
+        return (u64)(number == LX_setfsuid ? cred_set_fsuid(c, (u32)arg0)
+                                   : cred_set_fsgid(c, (u32)arg0));
       }
 
       /* capget(125)/capset(126): the task's real capability sets. A root task
@@ -9287,7 +9167,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return (u64)(isize)sysv_semop((int)arg0, ops, nops, timeout_ms);
       }
       if (number == LX_semctl) { /* semctl(semid, semnum, cmd, arg) */
-        int semid = (int)arg0, semnum = (int)arg1, cmd = (int)arg2;
+        int semid = (int)arg0, semnum = (int)arg1, cmd = (int)arg2 & ~0x100;
         switch (cmd) {
         case GETVAL:
           return (u64)(isize)sysv_semctl_getval(semid, semnum);
@@ -9341,10 +9221,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
               return (u64)(isize)rc;
             memset(&lds, 0, sizeof(lds));
             lds.key = (i32)info.sem_perm.key;
-            lds.uid = info.sem_perm.uid;
-            lds.gid = info.sem_perm.gid;
-            lds.cuid = info.sem_perm.cuid;
-            lds.cgid = info.sem_perm.cgid;
+            lds.uid = current_from_kuid(info.sem_perm.uid);
+            lds.gid = current_from_kgid(info.sem_perm.gid);
+            lds.cuid = current_from_kuid(info.sem_perm.cuid);
+            lds.cgid = current_from_kgid(info.sem_perm.cgid);
             lds.mode = info.sem_perm.mode;
             lds.seq = info.sem_perm.seq;
             lds.sem_otime = (i64)info.sem_otime;
@@ -9356,8 +9236,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           }
           if (syscall_copyin(&lds, (const void *)(usize)arg3, sizeof(lds)) < 0)
             return (u64)-EFAULT;
-          return (u64)(isize)sysv_semctl_set(semid, (u16)lds.uid, (u16)lds.gid,
-                                             lds.mode);
+          {
+            u32 kuid = current_make_kuid(lds.uid);
+            u32 kgid = current_make_kgid(lds.gid);
+            if (kuid == UID_INVALID || kgid == GID_INVALID)
+              return (u64)-EINVAL;
+            return (u64)(isize)sysv_semctl_set(semid, kuid, kgid, lds.mode);
+          }
         }
         default:
           return (u64)-EINVAL;
@@ -9392,7 +9277,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return (u64)n;
       }
       if (number == LX_msgctl) { /* msgctl(msqid, cmd, buf) */
-        int msqid = (int)arg0, cmd = (int)arg1;
+        int msqid = (int)arg0, cmd = (int)arg1 & ~0x100; /* IPC_64 */
         struct lx_msqid_ds {
           i32 key; u32 uid, gid, cuid, cgid; u16 mode, __pad1;
           u16 seq, __pad2; u64 __unused1, __unused2;
@@ -9409,10 +9294,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
             return (u64)(isize)rc;
           memset(&lds, 0, sizeof(lds));
           lds.key = (i32)info.msg_perm.key;
-          lds.uid = info.msg_perm.uid;
-          lds.gid = info.msg_perm.gid;
-          lds.cuid = info.msg_perm.cuid;
-          lds.cgid = info.msg_perm.cgid;
+          lds.uid = current_from_kuid(info.msg_perm.uid);
+          lds.gid = current_from_kgid(info.msg_perm.gid);
+          lds.cuid = current_from_kuid(info.msg_perm.cuid);
+          lds.cgid = current_from_kgid(info.msg_perm.cgid);
+          lds.msg_lspid = (i32)namespace_pid_to_user(info.msg_lspid);
+          lds.msg_lrpid = (i32)namespace_pid_to_user(info.msg_lrpid);
+          lds.msg_cbytes = info.msg_cbytes;
           lds.mode = info.msg_perm.mode;
           lds.seq = info.msg_perm.seq;
           lds.msg_stime = (i64)info.msg_stime;
@@ -9427,8 +9315,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         if (cmd == IPC_SET) {
           if (syscall_copyin(&lds, (const void *)(usize)arg2, sizeof(lds)) < 0)
             return (u64)-EFAULT;
-          return (u64)(isize)sysv_msgctl_set(msqid, (u16)lds.uid, (u16)lds.gid,
-                                             lds.mode, lds.msg_qbytes);
+          u32 kuid = current_make_kuid(lds.uid);
+          u32 kgid = current_make_kgid(lds.gid);
+          if (kuid == UID_INVALID || kgid == GID_INVALID)
+            return (u64)-EINVAL;
+          return (u64)(isize)sysv_msgctl_set(msqid, kuid, kgid, lds.mode,
+                                             lds.msg_qbytes);
         }
         return (u64)-EINVAL;
       }
@@ -9720,9 +9612,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   }
   case SYS_CHOWN:
     klog_debug("audit: chown called");
-    return (u64)sys_chown((const char *)(usize)arg0, (u16)arg1, (u16)arg2);
+    return (u64)sys_chown((const char *)(usize)arg0, (u32)arg1, (u32)arg2);
   case SYS_FCHOWN:
-    return (u64)sys_fchown((int)arg0, (u16)arg1, (u16)arg2);
+    return (u64)sys_fchown((int)arg0, (u32)arg1, (u32)arg2);
 
   case SYS_FORK:
     return ns_pid_out((u64)scheduler_fork_current());
@@ -9882,14 +9774,14 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     klog_info("audit: setuid called");
     struct cred *c = scheduler_get_current_cred();
     if (!c) return (u64)-EACCES;
-    int rc = cred_set_uid(c, (u16)arg0);
+    int rc = cred_set_uid(c, (u32)arg0);
     return rc == 0 ? 0 : (u64)-EPERM;
   }
   case SYS_SETGID: {
     klog_info("audit: setgid called");
     struct cred *c = scheduler_get_current_cred();
     if (!c) return (u64)-EACCES;
-    int rc = cred_set_gid(c, (u16)arg0);
+    int rc = cred_set_gid(c, (u32)arg0);
     return rc == 0 ? 0 : (u64)-EPERM;
   }
   case SYS_SETREUID: {
@@ -9914,9 +9806,6 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     int ruid = (int)(isize)arg0;
     int euid = (int)(isize)arg1;
     int suid = (int)(isize)arg2;
-    if (ruid < -1 || ruid > 0xFFFF || euid < -1 || euid > 0xFFFF ||
-        suid < -1 || suid > 0xFFFF)
-      return (u64)-EINVAL;
     return cred_setresuid(c, ruid, euid, suid) == 0
                ? 0
                : (u64)-EPERM;
@@ -9927,9 +9816,6 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     int rgid = (int)(isize)arg0;
     int egid = (int)(isize)arg1;
     int sgid = (int)(isize)arg2;
-    if (rgid < -1 || rgid > 0xFFFF || egid < -1 || egid > 0xFFFF ||
-        sgid < -1 || sgid > 0xFFFF)
-      return (u64)-EINVAL;
     return cred_setresgid(c, rgid, egid, sgid) == 0
                ? 0
                : (u64)-EPERM;
@@ -10050,7 +9936,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       }
     }
     for (usize i = 0; i < size; i++) {
-      c->groups[i] = (u16)k_list[i];
+      c->groups[i] = k_list[i];
     }
     c->ngroups = (int)size;
     return 0;
@@ -10636,45 +10522,6 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     console_write_dec(pmm_free_memory_estimate() / (1024ULL * 1024ULL));
     console_write(" MB\n");
     return 0;
-  case SYS_MQ_OPEN: {
-    char name[64];
-    if (syscall_copyinstr(name, sizeof(name), (const char *)(usize)arg0) < 0)
-      return (u64)-EFAULT;
-    /* Returns a table index (mqd), not a kernel pointer — see mqueue.h. */
-    return (u64)mqueue_create(name);
-  }
-  case SYS_MQ_SEND: {
-    u32 len = (u32)arg2;
-    if (len > 256) /* MQ_MAX_MSG_SIZE */
-      return (u64)-EINVAL;
-    char kbuf[256];
-    if (len > 0) {
-      if (syscall_copyin(kbuf, (const void *)(usize)arg1, len) != 0)
-        return (u64)-EFAULT;
-    }
-    return (u64)mqueue_send((int)arg0, kbuf, len);
-  }
-  case SYS_MQ_RECEIVE: {
-    char kbuf[256];
-    u32 klen = 0;
-    int ret = mqueue_receive((int)arg0, kbuf, &klen);
-    if (ret == 0) {
-      if (arg2 && syscall_copyout((void *)(usize)arg2, &klen, sizeof(u32)) != 0)
-        return (u64)-EFAULT;
-      if (arg1 && klen > 0 && syscall_copyout((void *)(usize)arg1, kbuf, klen) != 0)
-        return (u64)-EFAULT;
-    }
-    return (u64)ret;
-  }
-  case SYS_MQ_CLOSE:
-    mqueue_close((int)arg0);
-    return 0;
-  case SYS_MQ_UNLINK: {
-    char name[64];
-    if (syscall_copyinstr(name, sizeof(name), (const char *)(usize)arg0) < 0)
-      return (u64)-EFAULT;
-    return (u64)mqueue_unlink(name);
-  }
   case SYS_SHMGET:
     return (u64)shmget((u32)arg0, (usize)arg1, (int)arg2);
   case SYS_SHMAT:
@@ -10682,19 +10529,52 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_SHMDT:
     return (u64)shmdt((const void *)(usize)arg0);
   case SYS_SHMCTL: {
+    /* Linux struct shmid64_ds (x86_64 and asm-generic agree): ipc64_perm,
+     * then segsz, the three times, cpid, lpid, nattch. Ids leave in the
+     * caller's user and PID namespaces and arrive from them. */
+    struct lx_shmid_ds {
+      i32 key; u32 uid, gid, cuid, cgid; u16 mode, __pad1;
+      u16 seq, __pad2; u64 __unused1, __unused2;
+      u64 shm_segsz; i64 shm_atime, shm_dtime, shm_ctime;
+      i32 shm_cpid, shm_lpid; u64 shm_nattch; u64 __unused4, __unused5;
+    } lds;
     int shmid = (int)arg0;
-    int cmd = (int)arg1;
+    int cmd = (int)arg1 & ~0x100; /* IPC_64 */
     struct shmid_ds kds;
-    if (cmd == 2 /* IPC_SET */ && arg2) {
-      if (syscall_copyin(&kds, (const void *)(usize)arg2, sizeof(kds)) != 0)
+    memset(&kds, 0, sizeof(kds));
+    if (cmd == IPC_SET) {
+      if (!arg2 || syscall_copyin(&lds, (const void *)(usize)arg2,
+                                  sizeof(lds)) != 0)
+        return (u64)-EFAULT;
+      kds.shm_perm.uid = current_make_kuid(lds.uid);
+      kds.shm_perm.gid = current_make_kgid(lds.gid);
+      if (kds.shm_perm.uid == UID_INVALID || kds.shm_perm.gid == GID_INVALID)
+        return (u64)-EINVAL;
+      kds.shm_perm.mode = lds.mode;
+    } else if (cmd == IPC_STAT && !arg2) {
+      return (u64)-EFAULT;
+    }
+    int ret = shmctl(shmid, cmd, &kds);
+    if (ret == 0 && cmd == IPC_STAT) {
+      memset(&lds, 0, sizeof(lds));
+      lds.key = (i32)kds.shm_perm.key;
+      lds.uid = current_from_kuid(kds.shm_perm.uid);
+      lds.gid = current_from_kgid(kds.shm_perm.gid);
+      lds.cuid = current_from_kuid(kds.shm_perm.cuid);
+      lds.cgid = current_from_kgid(kds.shm_perm.cgid);
+      lds.mode = kds.shm_perm.mode;
+      lds.seq = kds.shm_perm.seq;
+      lds.shm_segsz = kds.shm_segsz;
+      lds.shm_atime = (i64)kds.shm_atime;
+      lds.shm_dtime = (i64)kds.shm_dtime;
+      lds.shm_ctime = (i64)kds.shm_ctime;
+      lds.shm_cpid = (i32)namespace_pid_to_user(kds.shm_cpid);
+      lds.shm_lpid = (i32)namespace_pid_to_user(kds.shm_lpid);
+      lds.shm_nattch = kds.shm_nattch;
+      if (syscall_copyout((void *)(usize)arg2, &lds, sizeof(lds)) != 0)
         return (u64)-EFAULT;
     }
-    int ret = shmctl(shmid, cmd, arg2 ? &kds : 0);
-    if (ret == 0 && cmd == 1 /* IPC_STAT */ && arg2) {
-      if (syscall_copyout((void *)(usize)arg2, &kds, sizeof(kds)) != 0)
-        return (u64)-EFAULT;
-    }
-    return (u64)ret;
+    return (u64)(isize)ret;
   }
   case SYS_SOCKET:
     return (u64)vfs_socket((int)arg0, (int)arg1, (int)arg2);

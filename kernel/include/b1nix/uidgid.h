@@ -12,36 +12,36 @@
 
 /* ── User structure ── */
 struct user {
-    u16  uid;
-    u16  gid;       /* Primary group */
+    u32  uid;
+    u32  gid;       /* Primary group */
     char name[32];
 };
 
 /* ── Group structure ── */
 struct group {
-    u16  gid;
+    u32  gid;
     char name[32];
-    u16  members[MAX_USERS];
+    u32  members[MAX_USERS];
     int  member_count;
 };
 
 /* ── Credentials (attached to each task) ── */
 struct cred {
-    u16  uid;       /* Real user ID */
-    u16  euid;      /* Effective user ID (for permission checks) */
-    u16  suid;      /* Saved set-user-ID */
-    u16  gid;       /* Real group ID */
-    u16  egid;      /* Effective group ID */
-    u16  sgid;      /* Saved set-group-ID */
-    u16  groups[MAX_GROUPS]; /* Supplementary groups */
+    u32  uid;       /* Real user ID */
+    u32  euid;      /* Effective user ID (for permission checks) */
+    u32  suid;      /* Saved set-user-ID */
+    u32  gid;       /* Real group ID */
+    u32  egid;      /* Effective group ID */
+    u32  sgid;      /* Saved set-group-ID */
+    u32  groups[MAX_GROUPS]; /* Supplementary groups */
     int  ngroups;
     u16  umask;
     /* Filesystem IDs. POSIX checks file access against these rather than the
      * effective IDs; they track euid/egid unless setfsuid(2)/setfsgid(2) moves
      * them, which is how a server drops filesystem privilege for one operation
      * while keeping the effective ID it needs for signals. */
-    u16  fsuid;
-    u16  fsgid;
+    u32  fsuid;
+    u32  fsgid;
     /* Capability sets. A root task starts with everything; a task can drop
      * capabilities it holds (capset), and dropping one is irreversible without
      * CAP_SETPCAP. Bit N corresponds to CAP_* value N. */
@@ -69,6 +69,10 @@ struct cred {
      * from what it wanted, call PR_SET_SECUREBITS, get EINVAL from that too,
      * and fail the service at step SECUREBITS (status 213). */
     u32  securebits;
+    /* M123: the user namespace the capability sets above are held in. Every
+     * uid and gid here is a kernel id; the namespace is how they read to the
+     * task (see <b1nix/user_namespace.h>). A credential holds a reference. */
+    u32  user_ns;
 };
 
 /* securebits(7) bit numbers, as Linux's <linux/securebits.h>. Each flag has a
@@ -99,8 +103,8 @@ void cred_refresh_caps(struct cred *cred);
 /* Keep fsuid/fsgid in step with euid/egid (the default POSIX behaviour). */
 void cred_sync_fsids(struct cred *cred);
 /* setfsuid(2)/setfsgid(2): return the PREVIOUS value, changed or not. */
-u16 cred_set_fsuid(struct cred *cred, u16 fsuid);
-u16 cred_set_fsgid(struct cred *cred, u16 fsgid);
+u32 cred_set_fsuid(struct cred *cred, u32 fsuid);
+u32 cred_set_fsgid(struct cred *cred, u32 fsgid);
 /* capset(2): install the three sets, bounded by what the task already holds. */
 int cred_capset(struct cred *cred, u64 eff, u64 perm, u64 inh);
 
@@ -165,29 +169,29 @@ struct cap_data {
 void uidgid_init(void);
 
 /* User management */
-int  user_add(u16 uid, u16 gid, const char *name);
-const struct user *user_find_by_uid(u16 uid);
+int  user_add(u32 uid, u32 gid, const char *name);
+const struct user *user_find_by_uid(u32 uid);
 const struct user *user_find_by_name(const char *name);
 
 /* Group management */
-int  group_add(u16 gid, const char *name);
-int  group_add_member(u16 gid, u16 uid);
-const struct group *group_find_by_gid(u16 gid);
+int  group_add(u32 gid, const char *name);
+int  group_add_member(u32 gid, u32 uid);
+const struct group *group_find_by_gid(u32 gid);
 
 /* Credential management for tasks */
 struct cred *cred_create_default(void);
 struct cred *cred_dup(const struct cred *src);
 void         cred_free(struct cred *cred);
 
-int  cred_set_uid(struct cred *cred, u16 uid);
-int  cred_set_gid(struct cred *cred, u16 gid);
+int  cred_set_uid(struct cred *cred, u32 uid);
+int  cred_set_gid(struct cred *cred, u32 gid);
 int  cred_setreuid(struct cred *cred, int ruid, int euid);
 int  cred_setregid(struct cred *cred, int rgid, int egid);
 int  cred_setresuid(struct cred *cred, int ruid, int euid, int suid);
 int  cred_setresgid(struct cred *cred, int rgid, int egid, int sgid);
 
 /* Permission checks */
-int  cred_can_access(const struct cred *cred, u16 file_uid, u16 file_gid, u16 file_mode, u32 access_mask);
+int  cred_can_access(const struct cred *cred, u32 file_uid, u32 file_gid, u16 file_mode, u32 access_mask);
 int  cred_has_cap(const struct cred *cred, int cap);
 int  cred_has_cap_effective(const struct cred *cred, int cap);
 

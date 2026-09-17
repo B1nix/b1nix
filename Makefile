@@ -629,6 +629,7 @@ KERNEL_SOURCES := \
 	kernel/ipc/shm.c \
 	kernel/ipc/sysv_sem.c \
 	kernel/ipc/sysv_msg.c \
+	kernel/ipc/ipc_ns.c \
 	kernel/sched/uidgid.c \
 	kernel/sched/runqueue.c \
 	kernel/sched/lockdep.c \
@@ -637,6 +638,8 @@ KERNEL_SOURCES := \
 	kernel/sched/m28_heapbench.c \
 	kernel/sched/futex.c \
 	kernel/sched/namespace.c \
+	kernel/sched/pid_namespace.c \
+	kernel/sched/user_namespace.c \
 	kernel/sched/rseq.c \
 	kernel/sched/ptrace.c \
 	kernel/sched/seccomp.c \

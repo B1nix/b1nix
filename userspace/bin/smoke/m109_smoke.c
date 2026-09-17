@@ -1464,6 +1464,16 @@ static int slurp(const char *path, char *buf, size_t len) {
   return (int)n;
 }
 
+/* A /proc/<pid>/ns entry is a magic link: its identity is what readlink(2)
+ * reports ("uts:[4026531838]"), as on Linux, where reading one is EINVAL. */
+static int nslink(const char *path, char *buf, size_t len) {
+  ssize_t n = readlink(path, buf, len - 1);
+  if (n < 0)
+    return -1;
+  buf[n] = '\0';
+  return (int)n;
+}
+
 static void chomp(char *s) {
   size_t n = strlen(s);
   while (n && (s[n - 1] == '\n' || s[n - 1] == '\r'))
@@ -1542,11 +1552,11 @@ static void test_uts(void) {
   char p[64], mine_uts[128] = {0}, kid_uts[128] = {0};
   char mine_mnt[128] = {0}, kid_mnt[128] = {0};
   snprintf(p, sizeof(p), "/proc/%d/ns/uts", (int)pid);
-  int have = (slurp("/proc/self/ns/uts", mine_uts, sizeof(mine_uts)) > 0 &&
-              slurp(p, kid_uts, sizeof(kid_uts)) > 0);
+  int have = (nslink("/proc/self/ns/uts", mine_uts, sizeof(mine_uts)) > 0 &&
+              nslink(p, kid_uts, sizeof(kid_uts)) > 0);
   snprintf(p, sizeof(p), "/proc/%d/ns/mnt", (int)pid);
-  have = have && (slurp("/proc/self/ns/mnt", mine_mnt, sizeof(mine_mnt)) > 0 &&
-                  slurp(p, kid_mnt, sizeof(kid_mnt)) > 0);
+  have = have && (nslink("/proc/self/ns/mnt", mine_mnt, sizeof(mine_mnt)) > 0 &&
+                  nslink(p, kid_mnt, sizeof(kid_mnt)) > 0);
   chomp(mine_uts);
   chomp(kid_uts);
   chomp(mine_mnt);
@@ -1716,7 +1726,7 @@ static void test_pid_ns(void) {
     /* Linux does not move the caller: this process keeps the number it had. */
     pid_t mine = getpid();
     char myns[64] = {0};
-    slurp("/proc/self/ns/pid", myns, sizeof(myns));
+    nslink("/proc/self/ns/pid", myns, sizeof(myns));
     chomp(myns);
 
     pid_t kid = fork();
@@ -1728,7 +1738,7 @@ static void test_pid_ns(void) {
       pid_t p = getpid();
       pid_t pp = getppid();
       char kidns[64] = {0};
-      slurp("/proc/self/ns/pid", kidns, sizeof(kidns));
+      nslink("/proc/self/ns/pid", kidns, sizeof(kidns));
       chomp(kidns);
 
       pid_t g = fork();
@@ -1813,7 +1823,7 @@ static void test_pid_ns(void) {
    * one that unshared is still in ours — that is what "affects children only"
    * means, and it is visible in /proc. */
   char mine_ns[64] = {0};
-  slurp("/proc/self/ns/pid", mine_ns, sizeof(mine_ns));
+  nslink("/proc/self/ns/pid", mine_ns, sizeof(mine_ns));
   chomp(mine_ns);
   check("pid-ns-handles",
         strncmp(kid_ns, "pid:[", 5) == 0 && strcmp(kid_ns, mine_ns) != 0 &&

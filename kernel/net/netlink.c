@@ -738,13 +738,12 @@ static int nl_do_netns(const u8 *body, const struct nl_attrs *a) {
 
   u32 target;
   if (a->ptr[IFLA_NET_NS_FD]) {
-    u32 pin = 0;
-    int rc = vfs_fd_ns_pin((int)nl_attr_u32(a, IFLA_NET_NS_FD, 0), &pin);
+    int kind;
+    int rc = vfs_fd_ns((int)nl_attr_u32(a, IFLA_NET_NS_FD, 0), &kind, &target);
     if (rc != 0)
       return rc;
-    if (VFS_NS_PIN_KIND(pin) != NS_NET)
+    if (kind != NS_NET)
       return -EINVAL;
-    target = VFS_NS_PIN_ID(pin);
   } else {
     /* The pid is the caller's number for a task, so it goes through the pid
      * namespace before it names anything. */
@@ -1226,6 +1225,20 @@ static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
   s->recv_len = s->udp_q_len[s->udp_q_head];
   scheduler_wake_all(s);
   scheduler_wake_all(vfs_poll_chan);
+}
+
+/* A message the kernel addresses to one netlink socket directly, not through a
+ * request or a group: mq_notify(SIGEV_THREAD) wakes the thread libc parked on
+ * such a socket with the cookie it registered. */
+int netlink_kernel_unicast(struct vfs_handle *h, const void *payload,
+                           usize len) {
+  if (!h || h->kind != VFS_HANDLE_SOCKET || !h->private_data)
+    return -EBADF;
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  if (s->domain != B1NIX_AF_NETLINK)
+    return -EBADF;
+  netlink_enqueue(s, (const u8 *)payload, len);
+  return 0;
 }
 
 /* Chop a finished multipart reply into datagrams on nlmsghdr boundaries so no
