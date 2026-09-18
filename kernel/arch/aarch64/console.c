@@ -132,10 +132,73 @@ static int con_state = CON_AT_BOL;
 static int con_pfx_digit;
 static int con_line_muted;
 
+/* ── The phone's log, kept across a reset ─────────────────────────────────
+ *
+ * The Xperia 5 has no serial port, and the panel holds 45 columns of a boot
+ * that often ends in a reset the secure world triggers without a panic. So on
+ * SM8150 every character also goes into the console zone of the ramoops
+ * carveout, in the format Linux's persistent_ram uses. After the reset the
+ * Android kernel on slot B finds a valid zone and hands it out whole as
+ * /sys/fs/pstore/console-ramoops-0.
+ *
+ * Where the zone is comes from that kernel, not from guessing: its ramoops
+ * parameters on this phone are mem 0x100000@0xffc00000, record 0x1000,
+ * console 0x40000, ftrace 0, pmsg 0x40000, ecc 0. ramoops lays the dump
+ * records out first (mem - console - ftrace - pmsg = 0x80000) and the console
+ * zone right after them: 0xffc80000, 0x40000 bytes. The zone is outside the
+ * gigabyte this kernel's page allocator is given, so nothing else writes it. */
+#include "platform.h"
+
+#define RAMOOPS_CONSOLE_BASE 0xffc80000ull
+#define RAMOOPS_CONSOLE_SIZE 0x40000u
+#define PERSISTENT_RAM_SIG   0x43474244u /* "DBGC" */
+
+static int g_ramoops_on;
+static u32 g_ramoops_start, g_ramoops_used;
+
+static void ramoops_putc(char c)
+{
+	/* The platform defaults to QEMU virt until the device tree is read, so
+	 * the answer is asked again until it is SM8150; lines before that are
+	 * lost, which is only the first few. */
+	if (!g_ramoops_on) {
+		if (platform_type() != PLATFORM_SM8150)
+			return;
+		volatile u32 *h0 = (volatile u32 *)(usize)RAMOOPS_CONSOLE_BASE;
+
+		h0[0] = PERSISTENT_RAM_SIG;
+		h0[1] = 0; /* start */
+		h0[2] = 0; /* size */
+		g_ramoops_on = 1;
+	}
+
+	u32 cap = RAMOOPS_CONSOLE_SIZE - 12;
+	volatile u32 *hdr = (volatile u32 *)(usize)RAMOOPS_CONSOLE_BASE;
+	volatile u8 *data = (volatile u8 *)(usize)(RAMOOPS_CONSOLE_BASE + 12);
+
+	data[g_ramoops_start] = (u8)c;
+	g_ramoops_start = (g_ramoops_start + 1) % cap;
+	if (g_ramoops_used < cap)
+		g_ramoops_used++;
+	hdr[1] = g_ramoops_start;
+	hdr[2] = g_ramoops_used;
+}
+
+/* The zone, header and all, for a copy of the log elsewhere (kernel/dev/ufs.c
+ * mirrors it to flash). NULL until it is live. */
+const u8 *console_ramoops_zone(u32 *size)
+{
+	if (!g_ramoops_on)
+		return 0;
+	*size = RAMOOPS_CONSOLE_SIZE;
+	return (const u8 *)(usize)RAMOOPS_CONSOLE_BASE;
+}
+
 static void console_emit_raw(char c)
 {
 	klog_putc(c);
 	kmsg_putc(c);
+	ramoops_putc(c);
 	if (con_line_muted)
 		return;
 	console_draw(c);
@@ -154,21 +217,21 @@ static void console_emit_offscreen(char c)
 {
 	klog_putc(c);
 	kmsg_putc(c);
+	ramoops_putc(c);
 	if (con_line_muted)
 		return;
 	serial_putc(c);
 }
 
-/* The bracketed monotonic timestamp every kernel log line opens with, in the
- * shape dmesg uses: "[    3.472918] ". Stamped when the line's first character
- * arrives, from ktime_monotonic_ns() -- the same clock /proc/uptime reports.
- * Without it aarch64 lines carried no time at all, so nothing in a log could
- * be ordered against anything else. */
+/* The bracketed monotonic timestamp every kernel log line opens with: "[0.00] ".
+ * Stamped when the line's first character arrives, from ktime_monotonic_ns().
+ * Adaptive and compact: no arbitrary leading whitespace; increments dynamically
+ * as uptime advances, with two decimal places (10 ms resolution). */
 static void console_emit_timestamp(void)
 {
 	u64 ns = ktime_monotonic_ns();
 	u64 sec = ns / 1000000000ull;
-	u64 usec = (ns % 1000000000ull) / 1000ull;
+	u64 csec = (ns % 1000000000ull) / 10000000ull; /* 0..99 hundredths */
 	char digits[24];
 	int n = 0;
 
@@ -181,13 +244,12 @@ static void console_emit_timestamp(void)
 			sec /= 10;
 		}
 	}
-	for (int pad = n; pad < 5; pad++)
-		console_emit_offscreen(' ');
+	/* Adaptive time: no leading spaces, digits grow incrementally */
 	for (int i = n - 1; i >= 0; i--)
 		console_emit_offscreen(digits[i]);
 	console_emit_offscreen('.');
-	for (u64 div = 100000; div > 0; div /= 10)
-		console_emit_offscreen((char)('0' + (usec / div) % 10));
+	console_emit_offscreen((char)('0' + (csec / 10)));
+	console_emit_offscreen((char)('0' + (csec % 10)));
 	console_emit_offscreen(']');
 	console_emit_offscreen(' ');
 }
@@ -277,11 +339,13 @@ void console_write(const char *str)
 		 * non-recursive spinlock here would wedge that CPU on itself. */
 		for (const char *p = str; *p; p++)
 			console_sink(*p);
+		fb_console_request_flush();
 		return;
 	}
 	console_lock_acquire_irqsave(&flags);
 	for (const char *p = str; *p; p++)
 		console_sink(*p);
+	fb_console_request_flush();
 	console_lock_release_irqrestore(flags);
 }
 
@@ -346,6 +410,7 @@ void console_write_raw(const char *text)
 	g_console_write_seq++;
 	for (const char *p = text; *p; p++)
 		console_putc_raw(*p);
+	fb_console_request_flush();
 }
 
 static int con_loglevel = LOGLEVEL_DEBUG;
@@ -391,6 +456,8 @@ void console_log_panic_flush(void)
 {
 	con_loglevel = LOGLEVEL_DEBUG;
 	con_configured = 1;
+	con_line_muted = 0;
+	con_state = CON_AT_BOL;
 }
 
 int console_loglevel_get(void)

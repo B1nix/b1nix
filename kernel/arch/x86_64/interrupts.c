@@ -1194,8 +1194,19 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   in_fault_dump[dump_cpu] = 1;
   /* A fault in kernel mode ends in "[PANIC]" below whatever happens next, so
    * the screen can say so now and the dump is drawn underneath it. */
-  if ((frame->cs & 3) == 0)
+  if ((frame->cs & 3) == 0) {
+    char fault[96];
+
+    if (frame->vector == 14)
+      snprintf(fault, sizeof(fault), "vector %lu err 0x%lx CR2 0x%016lx",
+               (unsigned long)frame->vector, (unsigned long)frame->error_code,
+               (unsigned long)read_cr2());
+    else
+      snprintf(fault, sizeof(fault), "vector %lu err 0x%lx",
+               (unsigned long)frame->vector, (unsigned long)frame->error_code);
+    panic_screen_fault(fault);
     panic_screen_show(name, 0, 0, frame->rip, frame->rbp);
+  }
   console_write(name);
   console_write("\nvector: 0x");
   console_write_hex64(frame->vector);

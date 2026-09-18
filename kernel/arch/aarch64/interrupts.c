@@ -19,6 +19,7 @@
 #include <b1nix/gicv3.h>
 #include <b1nix/net.h>
 #include "platform.h"
+#include <stdio.h>
 
 /* GICv2, wherever this board puts it. Initialized via platform_gicd_base() /
  * platform_gicc_base() and updated from device tree if needed. */
@@ -1047,8 +1048,17 @@ static void aarch64_sync_handler_inner(u64 esr, u64 elr, u64 far,
 		arch_halt();
 	}
 
-	/* Fatal from here on (this ends in panic_at): paint the screen first so
-	 * the dump below is drawn underneath it. */
+	/* Fatal from here on (this ends in panic_at): flush console and paint the
+	 * screen first so the dump below is drawn underneath it. */
+	console_log_panic_flush();
+	{
+		char fault[96];
+
+		snprintf(fault, sizeof(fault), "EC 0x%02x ESR 0x%08x FAR 0x%016lx",
+		         (unsigned)((esr >> 26) & 0x3f), (unsigned)esr,
+		         (unsigned long)far);
+		panic_screen_fault(fault);
+	}
 	panic_screen_show("unhandled synchronous exception", 0, 0, elr,
 	                  saved_regs[29]);
 

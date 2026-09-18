@@ -9623,6 +9623,18 @@ static int vfs_ioctl_fsflags(struct vfs_node *node, int nr, void *arg) {
   if (!inode->setflags_cb)
     return -EOPNOTSUPP;
 
+  /* Data written before the chattr must reach the filesystem first. On Linux a
+   * write() is already in the filesystem's page cache when the flag goes on;
+   * here it may still sit in ours, and an imported filesystem refuses the
+   * later writeback of an immutable file (ext4_write_checks), losing it. */
+  if (inode->type == VFS_FILE) {
+    vfs_inode_lock(inode);
+    int ferr = page_cache_flush_inode(inode);
+    vfs_inode_unlock(inode);
+    if (ferr < 0)
+      return ferr;
+  }
+
   u32 old = inode->attr;
   inode->attr = attr;
   int err = inode->setflags_cb(node, attr);

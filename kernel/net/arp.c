@@ -2,6 +2,7 @@
 #include <b1nix/namespace.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
+#include <b1nix/sched.h>
 #include <b1nix/console.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
@@ -209,7 +210,21 @@ int arp_resolve_dev(struct ipv4_addr ip, struct mac_addr *mac, struct netdev *de
 
 	int smoke_probe = bootinfo_has_flag("b1nix.test=1") &&
 	                  !arp_smoke_request_logged;
-	if (!found || smoke_probe) {
+	/* One request per address per 200 ms. Callers retry every tick while
+	 * they wait (ipv4_send polls up to 25 times), and each retry used to put
+	 * another broadcast on the wire: ~30 requests for one resolution, where
+	 * one answer was all it needed. ponytail: remembers only the last address
+	 * asked for; a per-entry timestamp if concurrent resolutions ever matter. */
+	static struct ipv4_addr last_ip;
+	static u64 last_tick;
+	u64 now = scheduler_get_uptime_ticks();
+	int recent = !found && last_tick &&
+	             memcmp(last_ip.bytes, ip.bytes, 4) == 0 &&
+	             now - last_tick < SCHED_MS_TO_TICKS(200);
+
+	if ((!found && !recent) || smoke_probe) {
+		last_ip = ip;
+		last_tick = now;
 		// Send ARP request
 		struct arp_packet req;
 		req.hw_type = bswap16(ARP_HW_ETHERNET);
@@ -258,7 +273,11 @@ void arp_receive(const void *data, usize size)
 
 	if (bswap16(pkt->hw_type) != ARP_HW_ETHERNET || bswap16(pkt->proto_type) != ARP_PROTO_IPV4) return;
 
-	arp_cache_put(pkt->sender_ip, pkt->sender_mac);
+	/* An ARP probe (RFC 5227) is sent from 0.0.0.0 while its sender is still
+	 * checking its address is free: there is no mapping in it to learn. */
+	if (pkt->sender_ip.bytes[0] | pkt->sender_ip.bytes[1] |
+	    pkt->sender_ip.bytes[2] | pkt->sender_ip.bytes[3])
+		arp_cache_put(pkt->sender_ip, pkt->sender_mac);
 	arp_smoke_mark_resolution();
 	
 	if (bswap16(pkt->op) == ARP_OP_REPLY) {

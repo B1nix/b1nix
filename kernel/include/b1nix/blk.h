@@ -20,6 +20,7 @@ enum blk_bus {
 	BLK_BUS_NBD,     /* a remote export reached over TCP */
 	BLK_BUS_MTD,     /* raw flash, through the MTD layer */
 	BLK_BUS_MMC,     /* SD/MMC — named mmcblk* */
+	BLK_BUS_UFS,     /* Universal Flash Storage — SCSI, so named sd* */
 };
 
 /* What one command to this device may carry. Linux keeps the same three
@@ -53,6 +54,12 @@ struct block_device {
 	/* enum blk_bus. A partition inherits its parent's bus. */
 	u8 bus;
 	usize block_size;
+	/* The medium's own logical block size when it differs from block_size.
+	 * Every driver hands the block cache 512-byte sectors, but a partition
+	 * table is written in the medium's units: on a 4 KiB UFS LUN the GPT
+	 * header sits at byte 4096 and every LBA in it counts 4 KiB blocks. 0
+	 * means the same as block_size. */
+	u32 lb_size;
 	u64 block_count;
 	int (*read_blocks)(struct block_device *dev, u64 lba, u32 count, void *buffer);
 	int (*write_blocks)(struct block_device *dev, u64 lba, u32 count, const void *buffer);
@@ -240,6 +247,12 @@ int blk_is_partition(struct block_device *dev);
 struct block_device *blk_partition_parent(struct block_device *dev);
 int blk_partition_number(struct block_device *dev);
 int blk_rescan_partitions(struct block_device *dev);
+/* Where a partition starts on its parent, in the parent's block_size units,
+ * and the name its GPT entry carries ("system_a", "userdata"), ASCII-folded.
+ * The name is "" for an MBR partition and NULL for a device that is not a
+ * partition. */
+u64 blk_partition_start(struct block_device *dev);
+const char *blk_partition_label(struct block_device *dev);
 
 /* Create a /dev/<name> node for every registered block device (read/write
  * translated to cached block I/O + BLK* size ioctls). Call once after all

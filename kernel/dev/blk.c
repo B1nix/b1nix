@@ -15,8 +15,12 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MAX_BLK_DEVICES 64
-#define MAX_BLK_PARTITIONS 64
+/* A phone's UFS carries six LUNs and about ninety GPT partitions between
+ * them; 64 slots registered the first few LUNs and silently dropped the rest.
+ * The minor number is the registry index packed into eight bits, so 255 is
+ * the ceiling. */
+#define MAX_BLK_DEVICES 255
+#define MAX_BLK_PARTITIONS 200
 /* Block-cache sizing (B2 audit): pool capacity is now scaled to actual RAM
  * at blk_cache_init() time so small machines don't waste ~140 KB on a 256-
  * entry pool and big machines aren't starved. ~1 entry per 512 KiB of usable
@@ -110,6 +114,7 @@ struct partition_device {
   struct block_device blk;
   struct block_device *parent;
   u64 start_lba;
+  char gpt_name[37];
 };
 
 static struct partition_device partitions[MAX_BLK_PARTITIONS];
@@ -581,10 +586,10 @@ static void make_partition_name(const char *parent, usize number, char *out,
            (unsigned)number);
 }
 
-static void register_partition(struct block_device *parent, usize number,
+static struct partition_device *register_partition(struct block_device *parent, usize number,
                                u64 start_lba, u64 block_count) {
   if (!parent || start_lba == 0 || block_count == 0)
-    return;
+    return 0;
   struct partition_device *part = 0;
   for (usize i = 0; i < partition_count; i++) {
     if (!partitions[i].parent) {
@@ -594,7 +599,7 @@ static void register_partition(struct block_device *parent, usize number,
   }
   if (!part) {
     if (partition_count >= MAX_BLK_PARTITIONS)
-      return;
+      return 0;
     part = &partitions[partition_count++];
   }
   memset(part, 0, sizeof(*part));
@@ -605,7 +610,7 @@ static void register_partition(struct block_device *parent, usize number,
   make_partition_name(parent->name, number, name, sizeof(name));
   char *persistent_name = kmalloc(strlen(name) + 1);
   if (!persistent_name)
-    return;
+    return 0;
   memcpy(persistent_name, name, strlen(name) + 1);
 
   part->blk.name = persistent_name;
@@ -627,12 +632,25 @@ static void register_partition(struct block_device *parent, usize number,
   console_write(" blocks=");
   console_write_dec(block_count);
   console_write("\n");
+  return part;
 }
 
 /* ── Partition introspection (backs sysfs /sys/block) ── */
 
 int blk_is_partition(struct block_device *dev) {
   return dev && dev->read_blocks == partition_read;
+}
+
+u64 blk_partition_start(struct block_device *dev) {
+  if (!blk_is_partition(dev))
+    return 0;
+  return ((struct partition_device *)dev->priv)->start_lba;
+}
+
+const char *blk_partition_label(struct block_device *dev) {
+  if (!blk_is_partition(dev))
+    return 0;
+  return ((struct partition_device *)dev->priv)->gpt_name;
 }
 
 struct block_device *blk_partition_parent(struct block_device *dev) {
@@ -671,13 +689,17 @@ static int scan_gpt(struct block_device *dev, const u8 *mbr) {
   if (!has_protective)
     return 0;
 
+  /* Every LBA in a GPT counts the medium's logical blocks. The cache speaks
+   * 512-byte sectors, so on a 4 KiB medium the header is sector 8 and each
+   * LBA read out of the table is multiplied by 8 before it is used. */
+  u64 scale = (dev->lb_size > CACHE_BLOCK_SIZE) ? dev->lb_size / CACHE_BLOCK_SIZE : 1;
   u8 header[CACHE_BLOCK_SIZE];
-  if (blk_read_cached(dev, 1, 1, header) < 0)
+  if (blk_read_cached(dev, scale, 1, header) < 0)
     return 0;
   if (memcmp(header, "EFI PART", 8) != 0)
     return 0;
 
-  u64 entries_lba = le64(header + 72);
+  u64 entries_lba = le64(header + 72) * scale;
   u32 entry_count = le32(header + 80);
   u32 entry_size = le32(header + 84);
   if (entry_count == 0 || entry_size < 128 || entry_size > 512)
@@ -711,7 +733,21 @@ static int scan_gpt(struct block_device *dev, const u8 *mbr) {
     u64 last_lba = le64(entry + 40);
     if (last_lba < first_lba)
       continue;
-    register_partition(dev, i + 1, first_lba, last_lba - first_lba + 1);
+    struct partition_device *part = register_partition(
+        dev, i + 1, first_lba * scale, (last_lba - first_lba + 1) * scale);
+    if (part) {
+      /* UTF-16LE, 36 code units. Partition names are ASCII in practice;
+       * anything else is folded to '?' rather than dropped, so two names
+       * cannot collapse into one. */
+      usize n = 0;
+      for (; n < 36; n++) {
+        u16 ch = le16(entry + 56 + n * 2);
+        if (ch == 0)
+          break;
+        part->gpt_name[n] = (ch < 0x80) ? (char)ch : '?';
+      }
+      part->gpt_name[n] = 0;
+    }
     found++;
   }
   return found > 0;

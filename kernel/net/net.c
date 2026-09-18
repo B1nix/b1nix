@@ -1269,6 +1269,11 @@ void net_init(void)
 		extern int virtio_net_mmio_init(void);
 		virtio_net_mmio_init();
 	}
+	/* A phone's USB port as an Ethernet adapter (b1nix.usb-gadget). */
+	{
+		extern int dwc3_gadget_probe(void);
+		dwc3_gadget_probe();
+	}
 #endif
 	virtio_net_probe();
 	e1000_probe();

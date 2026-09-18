@@ -45,6 +45,18 @@
 
 extern char __kernel_text_start[], __kernel_text_end[];
 
+static char ps_fault[96];
+
+void panic_screen_fault(const char *detail)
+{
+	usize n = 0;
+
+	if (detail)
+		for (; detail[n] && n < sizeof(ps_fault) - 1; n++)
+			ps_fault[n] = detail[n];
+	ps_fault[n] = 0;
+}
+
 static int ps_is_text(u64 addr)
 {
 	return addr >= (u64)(usize)__kernel_text_start &&
@@ -88,14 +100,25 @@ static u32 ps_line(u32 x, u32 y, const char *s, usize len, u32 cols,
 {
 	char buf[PS_LINE_MAX + 1];
 
+	/* Wrapped, not cut: on a narrow panel the tail of a line is the part
+	 * that says where (FAR, the file). Four rows at most. */
 	if (cols > PS_LINE_MAX)
 		cols = PS_LINE_MAX;
-	if (len > cols)
-		len = cols;
-	memcpy(buf, s, len);
-	buf[len] = '\0';
-	fb_console_panic_text(x, y, buf, scale, color);
-	return y + 10 * scale;
+	if (!cols)
+		return y + 10 * scale;
+	for (int row = 0; row < 4; row++) {
+		usize n = len > cols ? cols : len;
+
+		memcpy(buf, s, n);
+		buf[n] = '\0';
+		fb_console_panic_text(x, y, buf, scale, color);
+		y += 10 * scale;
+		s += n;
+		len -= n;
+		if (!len)
+			break;
+	}
+	return y;
 }
 
 /* "LABEL  value" on one line. */
@@ -155,36 +178,50 @@ static void ps_paint(const char *reason, const char *file, int line, u64 pc,
 	struct task *t = pc_cpu ? pc_cpu->cur_task : 0;
 	u64 lo, hi;
 
-	/* One unit of text magnification per 640x400 of screen. */
+	/* A portrait panel (a phone) stacks the otter above the text and sizes
+	 * the text by its width alone: at one unit per 640x400 a 1080x2520 panel
+	 * got 8-pixel type that no photograph of it could read. */
+	int portrait = h > w + w / 4;
+
+	/* One unit of text magnification per 640x400 of screen, or per 360
+	 * pixels of width on a portrait one. */
 	u = w / 640 < h / 400 ? w / 640 : h / 400;
+	if (portrait)
+		u = w / 360;
 	if (u < 1)
 		u = 1;
 	m = 12 * u;
 	pad = 6 * u;
 
 	/* The largest whole-pixel otter that takes at most two fifths of the
-	 * width and under half the height. */
-	os = (w * 2 / 5) / panic_otter_width;
-	if ((h * 9 / 20) / panic_otter_height < os)
-		os = (h * 9 / 20) / panic_otter_height;
+	 * width and under half the height -- three fifths and a quarter when it
+	 * sits on top. */
+	os = (w * (portrait ? 3 : 2) / 5) / panic_otter_width;
+	if ((portrait ? h / 4 : h * 9 / 20) / panic_otter_height < os)
+		os = (portrait ? h / 4 : h * 9 / 20) / panic_otter_height;
 	if (os < 1)
 		os = 1;
 	art_w = panic_otter_width * os;
 	art_h = panic_otter_height * os;
 
 	fb_console_panic_fill(0, 0, w, h, PS_BACKGROUND);
-	fb_console_panic_fill(m, m, art_w + 2 * pad, art_h + 2 * pad, PS_CARD);
-	ps_draw_otter(m + pad, m + pad, os);
+	{
+		u32 card_x = portrait ? (w - art_w) / 2 - pad : m;
+
+		fb_console_panic_fill(card_x, m, art_w + 2 * pad, art_h + 2 * pad,
+		                      PS_CARD);
+		ps_draw_otter(card_x + pad, m + pad, os);
+	}
 	card_bottom = m + art_h + 2 * pad;
 
-	col_x = m + art_w + 2 * pad + m;
+	col_x = portrait ? m : m + art_w + 2 * pad + m;
 	col_w = w > col_x + m ? w - col_x - m : 0;
 	cols = col_w / (8 * u);
 
 	ts = 3 * u;
 	while (ts > 1 && (u32)strlen(PS_TITLE_TEXT) * 8 * ts > col_w)
 		ts--;
-	y = m;
+	y = portrait ? card_bottom + m : m;
 	fb_console_panic_text(col_x, y, PS_TITLE_TEXT, ts, PS_TITLE);
 	y += 8 * ts + 3 * u;
 	fb_console_panic_fill(col_x, y, col_w, 2 * u, PS_RULE);
@@ -222,6 +259,8 @@ static void ps_paint(const char *reason, const char *file, int line, u64 pc,
 		snprintf(buf, sizeof(buf), "%u   (no task)",
 		         (unsigned)(pc_cpu ? pc_cpu->cpu_id : 0));
 	y = ps_field(col_x, y, "CPU   ", buf, cols, u);
+	if (ps_fault[0])
+		y = ps_field(col_x, y, "FAULT ", ps_fault, cols, u);
 	{
 		u64 ns = ktime_monotonic_ns();
 
@@ -265,8 +304,17 @@ static void ps_paint(const char *reason, const char *file, int line, u64 pc,
 	fb_console_panic_fill(m, y, w > 2 * m ? w - 2 * m : 0, u, PS_RULE);
 	y += u + m / 2;
 
-	/* The dump in small type: as much of it as fits. */
-	fb_console_panic_region(y, u > 1 ? u - 1 : 1, PS_TEXT, PS_BACKGROUND);
+	/* The dump in readable type: scale u in portrait mode, or u-1 in landscape */
+	fb_console_panic_region(y, portrait ? u : (u > 1 ? u - 1 : 1), PS_TEXT, PS_BACKGROUND);
+
+	/* Replay recent kernel boot log so the lower console displays live context */
+	{
+		static char ps_klog_buf[4096];
+		usize n = klog_read(ps_klog_buf, sizeof(ps_klog_buf));
+		for (usize i = 0; i < n; i++) {
+			fb_console_putchar(ps_klog_buf[i]);
+		}
+	}
 }
 
 void panic_screen_show(const char *reason, const char *file, int line, u64 pc,
@@ -288,10 +336,60 @@ void panic_screen_show(const char *reason, const char *file, int line, u64 pc,
 		}
 		return;
 	}
+
+	/* Guarantee console is unmuted and flushed for serial diagnosis */
+	console_log_panic_flush();
+
+	/* Output unified Crash Card to serial console */
+	console_write("\n================================================================================\n");
+	console_write("KERNEL PANIC: ");
+	console_write(reason ? reason : "(unknown error)");
+	console_write("\n================================================================================\n");
+	if (file && file[0]) {
+		console_write("  LOCATION: ");
+		console_write(file);
+		console_write(":");
+		console_write_dec((u64)line);
+		console_write("\n");
+	}
+	if (ps_fault[0]) {
+		console_write("  FAULT:    ");
+		console_write(ps_fault);
+		console_write("\n");
+	}
+	if (pc) {
+		console_write("  PC:       0x");
+		console_write_hex64(pc);
+		ksym_print(pc);
+		console_write("\n");
+	}
+	if (fp) {
+		console_write("  FP:       0x");
+		console_write_hex64(fp);
+		console_write("\n");
+	}
+	{
+		struct percpu *pc_cpu = get_percpu();
+		struct task *t = pc_cpu ? pc_cpu->cur_task : 0;
+		console_write("  CPU:      ");
+		console_write_dec(pc_cpu ? (u64)pc_cpu->cpu_id : 0);
+		if (t) {
+			console_write(" | TASK: pid=");
+			console_write_dec((u64)t->id);
+			console_write(" ('");
+			console_write(t->name ? t->name : "none");
+			console_write("')");
+		}
+		console_write("\n");
+	}
+	console_write("--------------------------------------------------------------------------------\n");
+	panic_screen_serial_banner();
+
 	if (fb_console_panic_begin() == 0) {
 		if (!fp)
 			fp = (u64)(usize)__builtin_frame_address(0);
 		ps_paint(reason, file, line, pc, fp);
+		fb_console_present_all();
 	}
 	__atomic_store_n(&state, -1, __ATOMIC_RELEASE);
 }

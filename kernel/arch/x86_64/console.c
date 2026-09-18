@@ -308,12 +308,11 @@ static void console_emit_timestamp(void)
 {
 	u64 ns = ktime_monotonic_ns();
 	u64 sec = ns / 1000000000ull;
-	u64 usec = (ns % 1000000000ull) / 1000ull;
+	u64 csec = (ns % 1000000000ull) / 10000000ull; /* 0..99 hundredths */
 	char stamp[32];
 	usize pos = 0;
 
 	stamp[pos++] = '[';
-	/* Seconds, right-aligned in five columns like Linux's "[    3.472918]". */
 	char digits[24];
 	int n = 0;
 	if (sec == 0) {
@@ -324,16 +323,12 @@ static void console_emit_timestamp(void)
 			sec /= 10;
 		}
 	}
-	for (int pad = n; pad < 5; pad++)
-		stamp[pos++] = ' ';
+	/* Adaptive time: no leading spaces, digits grow incrementally */
 	for (int i = n - 1; i >= 0; i--)
 		stamp[pos++] = digits[i];
 	stamp[pos++] = '.';
-	for (u64 div = 100000; div > 0; div /= 10) {
-		stamp[pos++] = (char)('0' + (usec / div) % 10);
-		if (div == 1)
-			break;
-	}
+	stamp[pos++] = (char)('0' + (csec / 10));
+	stamp[pos++] = (char)('0' + (csec % 10));
 	stamp[pos++] = ']';
 	stamp[pos++] = ' ';
 

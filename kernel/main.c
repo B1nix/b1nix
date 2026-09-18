@@ -20,6 +20,7 @@
 #include <b1nix/netdev.h>
 #include <b1nix/panic.h>
 #include <b1nix/panic_screen.h>
+#include <b1nix/splash.h>
 #include <b1nix/sched.h>
 #include <b1nix/serial.h>
 #include <b1nix/serial_tty.h>
@@ -45,6 +46,7 @@
 #include <b1nix/iommu.h>
 #include <b1nix/smmuv3.h>
 #include <b1nix/nvme.h>
+#include <b1nix/ufs.h>
 #include <lkpi/dma-mapping.h>
 #include <b1nix/filelock.h>
 #include <b1nix/errno.h>
@@ -456,14 +458,12 @@ void kernel_main(usize arg0, usize arg1)
 	serial_tty_init();
 	console_init();
 	console_write("\n========================================\n");
-	/* Name the machine that was actually detected. This line said "on RPi4!"
-	 * unconditionally, so every QEMU virt boot claimed to be a Raspberry Pi -
-	 * and the harness check that greps for "b1nix kernel" stopped matching. */
 	console_write(" b1nix kernel booting on ");
 #ifdef __aarch64__
 	console_write(platform_name());
+	console_write(" (aarch64)");
 #else
-	console_write("PC");
+	console_write("PC (x86_64)");
 #endif
 	console_write("\n========================================\n");
 
@@ -529,12 +529,16 @@ void kernel_main(usize arg0, usize arg1)
 	BOOTMARK(0);	/* white:   kernel_main entered */
 
 	k_info(NULL, "b1nix kernel starting...");
-	k_info(NULL, "boot: multiboot2 magic 0x%08x, info at 0x%08x", (u32)arg0,
+#ifndef __aarch64__
+	k_info("boot", "multiboot2 magic 0x%08x, info at 0x%08x", (u32)arg0,
 	       (u32)arg1);
 
 	if (arg0 != 0x36d76289) {
-		k_warn(NULL, "Warning: Multiboot2 magic mismatch");
+		k_warn("boot", "Warning: Multiboot2 magic mismatch");
 	}
+#else
+	k_info("boot", "FDT blob at 0x%016lx", (u64)arg0);
+#endif
 
 	k_info(NULL, "Step 1: Bootinfo parsed");
 	/* The command line as the kernel actually received it. Every flag in this
@@ -560,13 +564,8 @@ void kernel_main(usize arg0, usize arg1)
 	 * exists; subsystems read the values back at allocation time. */
 	resource_caps_init();
 
-	u64 frame = pmm_alloc_frame();
-	console_write("Step 3: PMM probe frame: 0x");
-	console_write_hex64(frame);
-	console_write("\n");
-
 	vmm_init();
-	k_info(NULL, "Step 3.5: VMM initialized");
+	k_info(NULL, "Step 3: VMM initialized");
 	BOOTMARK(3);	/* yellow:  VMM initialised */
 
 	kheap_init();
@@ -588,54 +587,36 @@ void kernel_main(usize arg0, usize arg1)
 	}
 	BOOTMARK(4);	/* green:   kernel heap up */
 
-	void *heap_probe = kzalloc(64);
-	console_write("Step 5: KHeap probe allocation: 0x");
-	console_write_hex64((u64)(usize)heap_probe);
-	console_write("\n");
-
-
 	kheap_use_direct_map();
 	/* Symbol lookups stop scanning the whole table now that they can index it:
 	 * every %p in a kernel printf used to walk tens of thousands of bytes. */
 	ksym_index_init();
-	k_info(NULL, "Step 7: KHeap switched to direct map");
+	k_info(NULL, "Step 5: KHeap switched to direct map");
 
 	/* Machines whose framebuffer the bootloader already set up. On one whose
 	 * display is a device this finds nothing and the second call, after
 	 * virtio_gpu_init(), is the one that takes. */
 	fb_console_init();
 	if (fb_console_ready())
-		k_info(NULL, "Step 8: FB Console initialized");
+		k_info(NULL, "Step 6: FB Console & Splash initialized");
 
 	/* The splash goes HERE, not at the top of kernel_main where it used to
 	 * live: up there the framebuffer console does not exist yet, so every
 	 * character went to the log ring and the serial port and none of it was
 	 * ever drawn. On a board whose only console is the panel that made the
-	 * banner invisible on the one machine it was drawn for.
-	 *
-	 * It is ~100 columns of ASCII art, so it is rendered at scale 1 and the
-	 * console put back afterwards — at the magnification that makes a phone's
-	 * log readable the panel holds 45 columns and the art wraps into noise. */
-	/* Opt-in, via b1nix.splash.
-	 *
-	 * The art is ~30 rows and is never scrolled away -- the console starts
-	 * below it -- so on a panel that holds 45 columns and about 70 rows it
-	 * costs nearly half the readable surface, permanently, while the output
-	 * that says whether the machine works scrolls past underneath. It goes
-	 * back to being the default once this board boots clean; until then the
-	 * panel is a diagnostic instrument, not a banner. */
-	if (bootinfo_has_flag("b1nix.splash")) {
-		extern void demon_splash_show(void);
-		demon_splash_show();
+	 * banner invisible on the one machine it was drawn for. */
+	if (!bootinfo_has_flag("b1nix.nosplash")) {
+		b1nix_splash_show();
 	}
 	BOOTMARK(5);	/* cyan:    past fb_console_init */
 
 	scheduler_init();
-	k_info(NULL, "Step 9: Scheduler initialized");
+	k_info(NULL, "Step 7: Scheduler initialized");
 	BOOTMARK(6);	/* blue:    scheduler initialised */
 
 	uidgid_init();
 	arch_init();
+	k_info(NULL, "Step 8: Architecture core initialized");
 	BOOTMARK(7);	/* arch_init */
 	/* Hand the monotonic clock over to the architecture's fine counter as soon
 	 * as one exists. This lived inside the x86_64 block below, next to the
@@ -661,6 +642,14 @@ void kernel_main(usize arg0, usize arg1)
 	 * ACPI. No-op (PIC stays in charge) when no IOAPIC was reported. */
 	ioapic_init();
 
+	if (lapic_timer_start_periodic_ms(1)) {
+		k_info("timer", "LAPIC periodic timer armed at 1 kHz; masking PIT IRQ0");
+		ioapic_mask_irq(0);
+	} else {
+		k_warn("timer", "LAPIC calibration unavailable, keeping PIT IRQ0 active");
+	}
+#endif
+
 	/* Every PCI function, one stamped line each, before any driver claims
 	 * one. pci_init() existed and had no caller, so hardware b1nix has no
 	 * driver for was invisible in a boot log — the first thing anyone asks
@@ -671,33 +660,8 @@ void kernel_main(usize arg0, usize arg1)
 	 * a device with no node in /sys/devices has no parent for udev to match a
 	 * rule against, and libdrm cannot answer what bus a card sits on. */
 	pci_sysfs_publish_all();
+	k_info(NULL, "Step 9: Bus & device discovery");
 
-	/* M28-A: switch the BSP scheduler tick from PIT IRQ0 (vector 32) to the
-	 * per-CPU LAPIC timer (vector 64) at 100 Hz. APs arm the same timer when
-	 * they enter the cooperative phase in ap_main, so every core now ticks
-	 * itself instead of relying on the BSP-only PIT route. */
-	/* One millisecond, not ten.
-	 *
-	 * The tick is the finest deadline the kernel can honour: a sleep, a
-	 * timeout, a poll interval can be no shorter and no more precise. At
-	 * 100 Hz the smallest of them was ten milliseconds, so a usleep(500) — or
-	 * any of the countless short waits a threaded program makes — cost twenty
-	 * times what it asked, and a five-hundred-iteration handoff took seven and
-	 * a half seconds instead of half a second. Linux ships 250 or 1000 Hz for
-	 * the same reason.
-	 *
-	 * The cost is the interrupt itself, ten times as often. It is a timer
-	 * interrupt on a calibrated LAPIC — a few hundred cycles — against
-	 * millisecond-scale waits it makes honest, and the rate is programmed
-	 * here and read back through sched_tick_hz() by everything that converts
-	 * between time and ticks, so nothing else has to be told. */
-	if (lapic_timer_start_periodic_ms(1)) {
-		k_info("timer", "LAPIC periodic timer armed at 1 kHz; masking PIT IRQ0");
-		ioapic_mask_irq(0);
-	} else {
-		k_warn("timer", "LAPIC calibration unavailable, keeping PIT IRQ0 active");
-	}
-#endif
 	blk_cache_init();
 	BOOTMARK(8);	/* block cache */
 	/* Before initramfs and the filesystems, not after: the page cache's hash
@@ -743,16 +707,7 @@ void kernel_main(usize arg0, usize arg1)
 	vfs_init();
 	BOOTMARK(13);	/* VFS */
 	fat32_init();
-#ifdef __aarch64__
-	/* Walk the bus and give every device an address before any driver looks
-	 * for one. On a PC the firmware has already done this; nothing runs
-	 * before the kernel on QEMU virt, so every BAR reads zero until we
-	 * program it — which a driver reports as "the register block is at 0",
-	 * not as "nobody assigned me an address". */
-	pci_init();
-	pci_sysfs_publish_all();
-	BOOTMARK(14);	/* PCI BUS SCAN (aarch64) */
-#endif
+	BOOTMARK(14);	/* PCI bus already discovered at Step 9 */
 	/* Both are PCI devices driven through MMIO, and this port has a PCI bus
 	 * now (kernel/dev/pci.c over the ECAM window), so they probe on every
 	 * arch. On a machine that has no such controller the probe simply finds
@@ -761,6 +716,11 @@ void kernel_main(usize arg0, usize arg1)
 	BOOTMARK(15);	/* AHCI */
 	nvme_init();
 	BOOTMARK(16);	/* NVMe */
+	/* UFS: QEMU's PCI controller, or a phone's internal storage (the
+	 * Qualcomm node, opt-in with b1nix.ufs). Before the root mount, so a
+	 * partition labelled b1nix-root on it can become /. */
+	ufs_init();
+	ufs_selftest();
 	exfat_init();
 	tmpfs_init();
 	cgroup_init();   /* cgroup v2 — systemd mounts it before anything else */
@@ -904,6 +864,9 @@ void kernel_main(usize arg0, usize arg1)
 	if (bootinfo_has_flag("b1nix.test=1")) {
 		extern void fb_console_selftest(void);
 		fb_console_selftest();
+	}
+	if (!bootinfo_has_flag("b1nix.nosplash")) {
+		b1nix_splash_show();
 	}
 #ifdef B1NIX_FS_IMPORT
 	/*
@@ -1437,6 +1400,10 @@ void kernel_main(usize arg0, usize arg1)
 	module_init_builtin_deps();
 
 	k_info(NULL, "Step 11: Drivers initialized");
+	/* The splash again, for a framebuffer that only a driver provided. */
+	if (!bootinfo_has_flag("b1nix.nosplash")) {
+		b1nix_splash_show();
+	}
 
 #if defined(__aarch64__)
 	/* The secondary CPUs, over PSCI. They run stealable kernel workers only
@@ -1929,6 +1896,10 @@ void kernel_main(usize arg0, usize arg1)
 	 * `loglevel=` or a test boot (b1nix.test=1, whose whole grading is the
 	 * serial log) keeps whatever it asked for.
 	 */
+	if (init_pid > 0) {
+		k_info(NULL, "Step 12: Handing over to init (PID %d)", (int)init_pid);
+		b1nix_splash_dismiss();
+	}
 	/* A measurement asked for on the command line is output someone is
 	 * waiting to read, so those flags keep the console as it was. */
 	if (init_pid > 0 && !bootinfo_has_flag("b1nix.test=1") &&

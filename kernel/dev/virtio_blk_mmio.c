@@ -335,6 +335,11 @@ static int vblk_mmio_flush(struct block_device *dev) {
   return do_vblk_req(inst, 0, 0, 0, VIRTIO_BLK_T_FLUSH) < 0 ? -1 : 0;
 }
 
+static u32 vblk_cfg32(volatile struct virtio_mmio_regs *regs, u32 off)
+{
+  return *(volatile u32 *)(regs->config + off);
+}
+
 static int vblk_mmio_read(struct block_device *dev, u64 lba, u32 count,
                           void *buffer) {
   return do_vblk_req((struct vblk_mmio_instance *)dev->priv, lba, count,
@@ -527,8 +532,11 @@ void virtio_blk_mmio_init(void) {
 
     regs->status |= VIRTIO_STATUS_DRIVER_OK;
 
-    u64 capacity;
-    memcpy(&capacity, (const void *)regs->config, sizeof(capacity));
+    /* Device config is MMIO: read it one aligned 32-bit access at a time.
+     * memcpy is free to use byte loads with writeback, and a hypervisor that
+     * emulates MMIO from the fault syndrome (HVF) cannot decode those: QEMU
+     * aborted on this very read. */
+    u64 capacity = (u64)vblk_cfg32(regs, 0) | ((u64)vblk_cfg32(regs, 4) << 32);
 
     inst->blk.block_size = 512;
     inst->blk.block_count = capacity;
@@ -537,15 +545,11 @@ void virtio_blk_mmio_init(void) {
     if (want & VIRTIO_BLK_F_FLUSH)
       inst->blk.flush = vblk_mmio_flush;
     if (want & VIRTIO_BLK_F_DISCARD) {
-      memcpy(&inst->max_discard_sectors,
-             (const void *)(regs->config + VBLK_CFG_MAX_DISCARD_SECTORS),
-             sizeof(u32));
+      inst->max_discard_sectors = vblk_cfg32(regs, VBLK_CFG_MAX_DISCARD_SECTORS);
       inst->blk.discard = vblk_mmio_discard;
     }
     if (want & VIRTIO_BLK_F_WRITE_ZEROES) {
-      memcpy(&inst->max_write_zeroes_sectors,
-             (const void *)(regs->config + VBLK_CFG_MAX_WZ_SECTORS),
-             sizeof(u32));
+      inst->max_write_zeroes_sectors = vblk_cfg32(regs, VBLK_CFG_MAX_WZ_SECTORS);
       inst->blk.write_zeroes = vblk_mmio_write_zeroes;
     }
     inst->blk.priv = inst;

@@ -12,6 +12,7 @@
 #include <b1nix/ftrace.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/panic_screen.h>
+#include <b1nix/fb_console.h>
 
 
 
@@ -388,7 +389,6 @@ void panic_backtrace(void)
 {
 	int depth = 0;
 	console_write("\n--- Kernel Backtrace ---\n");
-	serial_write("\n--- Kernel Backtrace ---\n");
 
 #ifdef __aarch64__
 	u64 *rbp = 0;
@@ -448,7 +448,6 @@ void klog_dump_recent(usize max_bytes)
 		return;
 
 	console_write("\n--- Recent Kernel Log Messages ---\n");
-	serial_write("\n--- Recent Kernel Log Messages ---\n");
 
 	char tmp[128];
 	usize tmp_idx = 0;
@@ -460,19 +459,16 @@ void klog_dump_recent(usize max_bytes)
 			tmp[tmp_idx++] = ch;
 			if (tmp_idx == sizeof(tmp) - 1) {
 				tmp[tmp_idx] = '\0';
-				console_write(tmp);
-				serial_write(tmp);
+				console_write_raw(tmp);
 				tmp_idx = 0;
 			}
 		}
 	}
 	if (tmp_idx > 0) {
 		tmp[tmp_idx] = '\0';
-		console_write(tmp);
-		serial_write(tmp);
+		console_write_raw(tmp);
 	}
 	console_write("\n--- End Recent Log ---\n\n");
-	serial_write("\n--- End Recent Log ---\n\n");
 }
 
 static const char *klog_task_state_str(int st)
@@ -857,27 +853,13 @@ void panic_at(const char *message, const char *file, int line)
 	 * runner then waited out its full 320-second silence allowance before
 	 * killing it. Three such lanes is most of the wall clock of a failing run.
 	 */
-	console_write("\nKERNEL PANIC: ");
-	console_write(message ? message : "(no message)");
-	serial_write("\nKERNEL PANIC: ");
-	serial_write(message ? message : "(no message)");
-
-	if (file && file[0]) {
-		console_write(" at ");
-		console_write(file);
-		console_write(":");
-		console_write_dec((u64)line);
-
-		serial_write(" at ");
-		serial_write(file);
-	}
-	console_write("\n");
-	serial_write("\n");
-
-	/* After the marker, never before it: the harness greps the log for the
-	 * first "KERNEL PANIC" line. The banner is serial-only; the display gets
-	 * the panic screen, and everything below is drawn underneath it. */
-	panic_screen_serial_banner();
+	/* The marker every harness looks for, emitted before anything else.
+	 *
+	 * tests/smoke.sh ends an instance on "KERNEL PANIC" or "[PANIC]".
+	 * panic_screen_show() guarantees that console_log_panic_flush() runs,
+	 * prints the unified ASCII Crash Card with "KERNEL PANIC: <message>",
+	 * prints the ASCII otter banner, and paints the panic screen.
+	 */
 	panic_screen_show(message, file, line, 0, 0);
 
 	/* Print current CPU & Task state */
@@ -951,6 +933,9 @@ void panic_at(const char *message, const char *file, int line)
 
 	/* Dump held locks if lockdep enabled */
 	lockdep_dump_all();
+
+	/* Ensure final panic dump is fully presented on display */
+	fb_console_present_all();
 
 	arch_halt();
 }

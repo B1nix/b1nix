@@ -22,6 +22,11 @@ static u32 cursor_y;
  * splash is drawn once and then stays put while the log scrolls underneath.
  * Zero, and the console owns the whole panel as it always did. */
 static u32 fb_top;
+#ifndef FB_CONSOLE_FONT_SCALE
+#define FB_CONSOLE_FONT_SCALE 1
+#endif
+static u32 FONT_SCALE = FB_CONSOLE_FONT_SCALE;
+
 static u32 fg_color = 0x00FFFFFF;
 static u32 bg_color = 0x00000000;
 volatile u8 *fb_ptr = 0;
@@ -312,6 +317,14 @@ void fb_console_init(void)
 		memset(fb_shadow, 0, fb_shadow_size);
 	}
 
+	/* Automatically adapt font scale for vertical / mobile panels */
+	if (fb.height > fb.width + fb.width / 4) {
+		if (fb.width >= 1000)
+			FONT_SCALE = 3;
+		else if (fb.width >= 500)
+			FONT_SCALE = 2;
+	}
+
 	cursor_x = 0;
 	cursor_y = fb_top;
 
@@ -346,14 +359,7 @@ void fb_console_clear(void)
 	fb_console_request_flush();
 }
 
-/* Each font pixel becomes this many screen pixels. One is right for a monitor;
- * a 1080x2520 phone panel at that scale is 135 columns of 8-pixel text, which
- * is present on screen but not readable by a person holding it. The phone
- * build passes 3. */
-#ifndef FB_CONSOLE_FONT_SCALE
-#define FB_CONSOLE_FONT_SCALE 1
-#endif
-static u32 FONT_SCALE = FB_CONSOLE_FONT_SCALE;
+
 
 /* Change the magnification at runtime. The boot splash is ~100 columns of
  * ASCII art: at the scale that makes the log readable on a phone the panel

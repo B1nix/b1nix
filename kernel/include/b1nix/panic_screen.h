@@ -26,6 +26,12 @@ extern const char *const panic_otter_ascii[]; /* NULL-terminated, <= 80 columns 
 void panic_screen_show(const char *reason, const char *file, int line, u64 pc,
                        u64 frame_ptr);
 
+/* The architecture's own account of a fault -- vector, error code and CR2 on
+ * x86_64, EC, ESR and FAR on aarch64 -- shown as FAULT on the panic screen.
+ * Set by the exception handler before panic_screen_show; a software panic
+ * leaves it empty. Copied, so a stack buffer is fine. */
+void panic_screen_fault(const char *detail);
+
 /* The ASCII otter, to the serial port only. */
 void panic_screen_serial_banner(void);
 
