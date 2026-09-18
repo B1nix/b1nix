@@ -589,12 +589,10 @@ while [ "$round" -lt 16 ]; do
 	# This loop used to run `readelf -h | grep` and then `readelf -d` on every
 	# path in the install list, one process each. The KDE group installs 43 000
 	# files, most of them breeze's SVG icons, and the pass took two hours on a
-	# rebuild that then pulled nothing. readelf takes many files at once and
-	# labels each with a "File:" line; whatever is not an ELF is an error on
-	# stderr and nothing on stdout, and only EXEC and DYN have a dynamic
-	# section, so there is no need to ask the type first. /dev/null is passed
-	# with every batch because readelf prints the "File:" label only when given
-	# more than one operand, and the last batch may hold a single file.
+	# rebuild that then pulled nothing. readelf takes many files at once, and
+	# only EXEC and DYN have a dynamic section, so there is no need to ask the
+	# type first; the NEEDED lines are all that is read, so the per-file label
+	# does not matter.
 	#
 	# Programs name their libraries the same way libraries do: every ELF is
 	# examined, not only *.so*, because a package whose point is an executable
@@ -605,11 +603,23 @@ while [ "$round" -lt 16 ]; do
 	# resolves on the HOST, whose udevadm needs libc.so.6 and
 	# libsystemd-shared, neither of which any Alpine index provides.
 	#
-	while IFS= read -r so; do
-		[ -f "$so" ] && [ ! -L "$so" ] && printf '%s\n' "$so"
-	done < "$INSTALLED" |
+	# Only ELF files reach readelf: llvm-readelf (macOS) stops at the first
+	# operand that is not an object, silently skipping the rest of the batch,
+	# so a stray SVG or /dev/null hid every library after it. One python pass
+	# reads four bytes per file, which keeps this cheap on the KDE group.
+	python3 -c '
+import os, sys
+for p in sys.stdin.read().splitlines():
+    if os.path.isfile(p) and not os.path.islink(p):
+        try:
+            with open(p, "rb") as f:
+                if f.read(4) == b"\x7fELF":
+                    print(p)
+        except OSError:
+            pass
+' < "$INSTALLED" |
 		sed "s/'/'\\\\''/g; s/.*/'&'/" |
-		xargs "$READELF" -dW /dev/null 2>/dev/null |
+		xargs "$READELF" -dW 2>/dev/null |
 		sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' |
 		grep -v '^libc\.musl-\|^ld-musl-' | sort -u |
 		comm -23 - "$PRESENT" > "$PRESENT.missing"

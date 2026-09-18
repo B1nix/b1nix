@@ -56,9 +56,28 @@ btrfs)
 		--rootdir "$ROOTFS" "$TMP"
 	;;
 ext4)
-	# A conservative feature set, readable by older tools too.
-	unshare -r mke2fs -q -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file \
-		-L b1nix-root -d "$ROOTFS" "$TMP"
+	# Features the native ext4 driver reads; ext4-lkpi reads these too.
+	if command -v unshare >/dev/null 2>&1; then
+		unshare -r mke2fs -q -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file \
+			-L b1nix-root -d "$ROOTFS" "$TMP"
+	else
+		# No user namespaces (macOS): pack as the building user, then give
+		# every inode to root with debugfs. Homebrew keeps e2fsprogs keg-only,
+		# and a bare mke2fs on PATH may be Android platform-tools' copy.
+		E2=""
+		for d in /opt/homebrew/opt/e2fsprogs/sbin /usr/local/opt/e2fsprogs/sbin /sbin /usr/sbin; do
+			[ -x "$d/debugfs" ] && [ -x "$d/mke2fs" ] && { E2="$d/"; break; }
+		done
+		[ -n "$E2" ] || { echo "mk-root-image: debugfs not found (e2fsprogs)" >&2; exit 1; }
+		"${E2}mke2fs" -q -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file \
+			-L b1nix-root -E root_owner=0:0 -d "$ROOTFS" "$TMP"
+		(cd "$ROOTFS" && find . \( -type f -o -type d -o -type l \) -print) |
+			sed -e 's|^\.||' -e '/^$/d' |
+			awk '{ printf "sif \"%s\" uid 0\nsif \"%s\" gid 0\n", $0, $0 }' > "$TMP.own"
+		"${E2}debugfs" -w -f "$TMP.own" "$TMP" >/dev/null 2>&1 ||
+			{ rm -f "$TMP.own"; echo "mk-root-image: ownership pass failed" >&2; exit 1; }
+		rm -f "$TMP.own"
+	fi
 	;;
 *)
 	echo "mk-root-image: unknown ROOT_FS=$ROOT_FS" >&2; exit 1 ;;

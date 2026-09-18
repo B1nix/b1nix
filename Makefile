@@ -17,7 +17,7 @@ BUILD_DIR := $(BUILD_ROOT)/$(ARCH)
 # The Linux release linuxkpi imports from: the filesystems, the DRM core and
 # i915 are staged out of this one tarball (tools/fs, tools/drm pin its SHA256).
 # One shim serves all three, so they move together.
-LKPI_LINUX_VERSION ?= 6.18.51
+export LKPI_LINUX_VERSION ?= 6.18.51
 INC_DIR := $(BUILD_DIR)/inc
 # The compiled-in fallback kernel command line, delivered as a generated header
 # (see the rule below for why it is not a -D).
@@ -577,7 +577,7 @@ KERNEL_SOURCES := \
 	kernel/mm/module_alloc.c \
 	kernel/module/module.c \
 	kernel/module/ksyms.c \
-	kernel/dev/demon_splash.c \
+	kernel/dev/b1nix_splash.c \
 	kernel/dev/panic_screen.c \
 	kernel/dev/panic_otter.c \
 	kernel/mm/pmm.c \
@@ -653,6 +653,7 @@ ifneq ($(filter $(ARCH),aarch64),)
 # AHCI and NVMe are PCI devices driven entirely through MMIO — nothing in them
 # is x86-specific — so with a working PCI bus they belong here too.
 KERNEL_SOURCES += kernel/dev/pci.c kernel/dev/ahci.c kernel/dev/nvme.c \
+	kernel/dev/ufs.c \
 	kernel/dev/virtio.c \
 	kernel/dev/r8169.c \
 	kernel/dev/smmuv3.c
@@ -673,6 +674,7 @@ KERNEL_SOURCES += \
 	kernel/dev/r8169.c \
 	kernel/dev/ahci.c \
 	kernel/dev/nvme.c \
+	kernel/dev/ufs.c \
 	kernel/dev/ps2_kbd.c \
 	kernel/dev/vt.c \
 	kernel/dev/kmsg.c \
@@ -763,6 +765,7 @@ ifeq ($(ARCH),aarch64)
 KERNEL_SOURCES += \
 	kernel/net/sock_filter.c \
 	kernel/dev/bcm2711_emmc.c \
+	kernel/dev/dwc3_gadget.c \
 	kernel/dev/bcm2835_mbox.c \
 	kernel/dev/bcm2835_gpio.c \
 	kernel/dev/bcm2835_systimer.c \
@@ -2474,6 +2477,38 @@ bahamut-fast:
 		FB_FONT_SCALE=$(BAHAMUT_FONT_SCALE) build/aarch64/kernel.elf
 	sh tools/boards/sony-xperia-5/mkramdisk_bahamut.sh
 	python3 tools/boards/sony-xperia-5/mkbootimg_bahamut.py
+
+# The same board with its rootfs on the phone's own UFS flash instead of in the
+# boot image: kernel/dev/ufs.c (b1nix.ufs) finds the ext4 labelled b1nix-root
+# that tools/boards/sony-xperia-5/flash_ufs_rootfs.sh writes to system_a. The
+# boot image keeps the trimmed ramdisk as a rescue system, relabelled so it
+# cannot win the root selection; the kernel falls back to it by name when UFS
+# does not come up. BAHAMUT_ROOTFS_MB sizes the rootfs image.
+# The USB Ethernet gadget rides along (kernel/dev/dwc3_gadget.c): usb0 at
+# 172.16.42.1, DHCP off so nothing clears that address, sshd listening beyond
+# loopback, and the kernel log as UDP to the host end (172.16.42.2:6666). It
+# probes after UFS but before the root mount, so a gadget bring-up that hangs
+# costs the boot — `make bahamut-ufs BAHAMUT_USB_GADGET=`
+# builds without it. The gadget has no interrupt wired up and is polled from
+# net_task, whose idle backoff (10 ticks, 100 ms on this board's 100 Hz tick)
+# became the link's round-trip time; b1nix.net-idle-ticks=1 polls every tick.
+BAHAMUT_USB_GADGET ?= b1nix.usb-gadget b1nix.net=off b1nix.ssh-external b1nix.netconsole=172.16.42.2:6666 b1nix.net-idle-ticks=1
+BAHAMUT_UFS_CMDLINE ?= "b1nix.loglevel=6 b1nix.ufs $(BAHAMUT_USB_GADGET)"
+BAHAMUT_ROOTFS_MB ?= 1024
+BAHAMUT_RESCUE_MB ?= 46
+.PHONY: bahamut-ufs
+bahamut-ufs:
+	@rm -f build/aarch64/kernel.elf build/aarch64/Image
+	$(MAKE) ARCH=aarch64 KERNEL_BASE=$(BAHAMUT_KERNEL_BASE) \
+		FB_BOOT_MARKERS=$(BAHAMUT_SPLASH_FB) \
+		KERNEL_CMDLINE=$(BAHAMUT_UFS_CMDLINE) \
+		FB_FONT_SCALE=$(BAHAMUT_FONT_SCALE) build/aarch64/kernel.elf
+	RAMDISK_LABEL=b1nix-rescue RAMDISK_MB=$(BAHAMUT_RESCUE_MB) FORCE_RAMDISK=1 sh tools/boards/sony-xperia-5/mkramdisk_bahamut.sh \
+		build/aarch64/rootfs build/aarch64/bahamut-rescue.ext4
+	ROOTFS_MB=$(BAHAMUT_ROOTFS_MB) sh tools/boards/sony-xperia-5/mkrootfs_bahamut.sh
+	BAHAMUT_BOOTARGS=$(BAHAMUT_UFS_CMDLINE) python3 tools/boards/sony-xperia-5/mkbootimg_bahamut.py \
+		build/aarch64/Image tools/boards/dts/sm8150-sony-bahamut.dtb \
+		build/aarch64/b1nix_bahamut_boot.img build/aarch64/bahamut-rescue.ext4
 
 run-rpi4: $(BUILD_DIR)/Image
 	@command -v qemu-system-aarch64 >/dev/null || (echo "missing qemu-system-aarch64"; exit 1)

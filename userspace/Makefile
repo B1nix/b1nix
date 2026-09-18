@@ -76,7 +76,7 @@ MUSL_CRTN    := $(MUSL_LIB)/crtn.o
 # through ld.lld directly, so nothing supplies the builtins implicitly.
 LIBCXX_PREFIX  := ../build/$(B1NIX_ARCH)/pkg/libcxx
 LIBCXX_INCLUDE := $(LIBCXX_PREFIX)/include/c++/v1
-LIBCXX_LINK    := -L$(LIBCXX_PREFIX)/lib -l:libc++.so.1 -l:libc++abi.so.1
+LIBCXX_LINK    := -L$(LIBCXX_PREFIX)/lib -l:libc++.so.1 -l:libc++abi.so.1 -l:libunwind.so.1
 BUILTINS_LIB   := $(firstword $(wildcard \
                    ../build/$(B1NIX_ARCH)/pkg/compiler-rt/lib/llvm*/lib/clang/*/lib/linux/libclang_rt.builtins-$(B1NIX_ARCH).a))
 
@@ -292,7 +292,7 @@ BINARIES += $(BUILD)/bin/m101t_smoke
 # -D__user= is what `make headers_install` does when it sanitises a uapi header
 # for userspace: the annotation is a sparse marker with no meaning outside the
 # kernel, and the raw staged tree has not been through that step.
-$(BUILD)/bin/m101t_smoke: CFLAGS += -I ../build/src/drm-core-6.6/include/uapi \
+$(BUILD)/bin/m101t_smoke: CFLAGS += -I ../build/src/drm-core-$(LKPI_LINUX_VERSION)/include/uapi \
 	-D__user=
 BINARIES += $(BUILD)/bin/m51_smoke
 BINARIES += $(BUILD)/bin/m51_pixman_smoke

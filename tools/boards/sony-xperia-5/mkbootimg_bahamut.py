@@ -141,7 +141,7 @@ def pack_boot_img(kernel_path, dtb_path, output_path, ramdisk_path=None):
 if __name__ == "__main__":
     b1nix_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     default_kernel = os.path.join(b1nix_root, "build", "aarch64", "Image")
-    default_dtb = os.path.join(b1nix_root, "tools", "dts", "sm8150-sony-bahamut.dtb")
+    default_dtb = os.path.join(b1nix_root, "tools", "boards", "dts", "sm8150-sony-bahamut.dtb")
     default_out = os.path.join(b1nix_root, "build", "aarch64", "b1nix_bahamut_boot.img")
     default_ramdisk = os.path.join(b1nix_root, "build", "aarch64", "bahamut-ramdisk.ext4")
 

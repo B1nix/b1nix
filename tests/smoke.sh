@@ -1363,6 +1363,27 @@ launch_gfx() {
 		# Cairo/HarfBuzz client tests do not fit in the default 1 GiB: the
 		# instance OOM-kills the compositor mid-run and then panics in kheap growth.
 		SMOKE_MEM_MB=${SMOKE_MEM_MB:-1536}
+		# A UFS controller with one 4 KiB-block LUN, laid out like a phone's:
+		# a GPT holding an ext4 made on the host (ufsroot) and a partition the
+		# driver must refuse to write (ufsfenced). kernel/dev/ufs.c checks
+		# itself against it (UFS-SMOKE). On this lane, not blk: blk pins the
+		# USB stick to sdc, and a UFS LUN probes first and would take it.
+		# aarch64 only — the only arch this was run on.
+		if [ "$ARCH" = "aarch64" ]; then
+			_ufsfs="$PROJECT_DIR/smoke_run/ufsroot-gfx.ext4"
+			_ufsimg=$(disk_img ufs gfx)
+			rm -f "$_ufsfs" "$_ufsimg"
+			truncate -s 24M "$_ufsfs"
+			"$MKE2FS" -q -F -t ext4 -b 4096 -L ufs-smoke \
+				-O ^metadata_csum,^64bit,^flex_bg,^huge_file "$_ufsfs" 2>/dev/null &&
+			python3 "$PROJECT_DIR/tests/mkgpt4k.py" "$_ufsimg" 64 \
+				"ufsroot:32:$_ufsfs" ufsfenced:8 &&
+			EXTRA_QEMU_ARGS="-drive file=$_ufsimg,if=none,id=ufsdisk,format=raw \
+				-device ufs,id=ufs0 -device ufs-lu,drive=ufsdisk,lun=0" &&
+			SMOKE_EXTRA_CMDLINE="${SMOKE_EXTRA_CMDLINE:-} b1nix.ufs-rw=ufsroot" &&
+			export EXTRA_QEMU_ARGS SMOKE_EXTRA_CMDLINE
+			rm -f "$_ufsfs"
+		fi
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[gfx]   "
 		# Drive the VirGL 3D-accelerated GPU on the graphics instance when the
@@ -3428,6 +3449,14 @@ check_output "$LOG" "nvme: registered nvme0n1" "NVMe namespace registered as nvm
 # instance carries two SATA disks and one USB stick, so the stick must be the
 # THIRD sd disk — sdc. A per-driver counter would have made it sda, and the old
 # scheme would have made it usb0; both are what this pins down.
+if [ "$ARCH" = "aarch64" ]; then
+	check_output "$GFX_LOG" "UFS-SMOKE: ok lun-4k-block" "UFS: a LUN answers READ CAPACITY with its 4 KiB logical block, as a phone's does"
+	check_output "$GFX_LOG" "UFS-SMOKE: ok gpt-4k-names" "UFS: the GPT is read in 4 KiB units and partitions carry their GPT names"
+	check_output "$GFX_LOG" "UFS-SMOKE: ok ext4-label-through-gpt" "UFS: an ext4 made on the host is found through the 512-byte view of a 4 KiB partition"
+	check_output "$GFX_LOG" "UFS-SMOKE: ok write-readback-partial-block" "UFS: sectors inside a logical block are read, patched and written back, and survive a cache drop"
+	check_output "$GFX_LOG" "UFS-SMOKE: ok fence-refuses-unlisted-partition" "UFS: writes land only in a partition named by b1nix.ufs-rw or labelled b1nix-root; the GPT and every other partition are refused"
+	check_output "$GFX_LOG" "UFS-SMOKE: ok inherit-live-link" "UFS: probing a controller someone else already brought up keeps its link and reads the same bytes"
+fi
 check_output "$BLK_LOG" "usb: registered sdc" "USB storage takes the next name in the sd sequence AHCI already used (sdc, after sda and sdb)"
 check_output "$BLK_LOG" "M14-SMOKE: ok removable-is-a-fact" "/sys/block reports exactly one removable disk, it is the USB stick, and it is named sd* like any other SCSI disk"
 check_output "$BLK_LOG" "swap: device=sdb" "swap still takes the second ATA disk, not whichever disk happens to be second in the sd sequence"

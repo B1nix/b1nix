@@ -20,7 +20,15 @@ ROOT="$(dirname "$(dirname "$(dirname "$DIR")")")"
 SRC="${1:-$ROOT/build/aarch64/rootfs}"
 OUT="${2:-$ROOT/build/aarch64/bahamut-ramdisk.ext4}"
 SIZE_MB="${RAMDISK_MB:-52}"
-STAGE="$ROOT/build/aarch64/bahamut-ramdisk-stage"
+# FULL_ROOTFS=1 stages the whole tree instead of the trimmed shell environment:
+# that is the rootfs flashed to the phone's UFS (see mkrootfs_bahamut.sh), which
+# has gigabytes to spend instead of the boot image's 55 MiB.
+FULL_ROOTFS="${FULL_ROOTFS:-0}"
+# The label decides who becomes /. The kernel mounts the first device labelled
+# b1nix-root and only then falls back to ram0 by name — so a ramdisk riding
+# along with a UFS root must NOT carry that label, or it may win the race.
+LABEL="${RAMDISK_LABEL:-b1nix-root}"
+STAGE="$OUT.stage"
 
 if [ -f "$OUT" ] && [ "${FORCE_RAMDISK:-0}" != "1" ]; then
     echo "[*] Reusing existing ramdisk $OUT"
@@ -46,6 +54,23 @@ command -v "$DEBUGFS" >/dev/null 2>&1 || { echo "[!] debugfs not found (brew ins
 echo "[*] Staging from $SRC"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
+
+if [ "$FULL_ROOTFS" = "1" ]; then
+    cp -a "$SRC/." "$STAGE/"
+    # Nothing in OpenRC's runlevels starts sshd — the image's /etc/rc does,
+    # and BusyBox init never runs that. On the phone SSH over the USB gadget
+    # is the way in, so start it from the default runlevel's local.d.
+    mkdir -p "$STAGE/etc/local.d"
+    printf '#!/bin/sh\n# Xperia 5: SSH over the USB Ethernet gadget (usb0).\n/bin/sh /etc/init.d/sshd start\n' \
+        > "$STAGE/etc/local.d/50-sshd.start"
+    chmod 755 "$STAGE/etc/local.d/50-sshd.start"
+    # The phone has no serial port and a forced power-off clears RAM (and with
+    # it the ramoops log), so keep the kernel log on the flash too: Android on
+    # slot B reads it back out of system_a.
+    printf '#!/bin/sh\n# Xperia 5: keep the kernel log on flash (/var/log/b1nix-boot.log).\n(\n  for t in 0 20 60; do\n    sleep $t\n    dmesg > /var/log/b1nix-boot.log\n    sync\n  done\n) &\n' \
+        > "$STAGE/etc/local.d/10-bootlog.start"
+    chmod 755 "$STAGE/etc/local.d/10-bootlog.start"
+else
 
 # Directories copied whole. /lib is NOT among them: it is 64 MiB of shared
 # objects for a graphics and browser stack that cannot run here anyway.
@@ -98,14 +123,15 @@ for f in ld-musl-aarch64.so.1 libc.so; do
     [ -e "$SRC/lib/$f" ] && cp -a "$SRC/lib/$f" "$STAGE/lib/" || \
         { echo "[!] missing $SRC/lib/$f — nothing would run"; exit 1; }
 done
+fi
 
 echo "[*] Staged size: $(du -sm "$STAGE" | cut -f1) MiB (budget ${SIZE_MB})"
 
 rm -f "$OUT"
-dd if=/dev/zero of="$OUT" bs=1048576 count="$SIZE_MB" 2>/dev/null
+truncate -s "${SIZE_MB}M" "$OUT"
 # The kernel's ext4 driver does not implement these features — see CLAUDE.md.
 "$MKE2FS" -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q \
-    -L b1nix-root -E root_owner=0:0 -d "$STAGE" "$OUT"
+    -L "$LABEL" -E root_owner=0:0 -d "$STAGE" "$OUT"
 
 # mke2fs -d stamps the BUILD HOST's uid/gid on every file; a Unix root
 # filesystem belongs to root, and things that check ownership break otherwise.
@@ -115,5 +141,6 @@ dd if=/dev/zero of="$OUT" bs=1048576 count="$SIZE_MB" 2>/dev/null
 "$DEBUGFS" -w -f "$OUT.own" "$OUT" >/dev/null 2>&1 || \
     { echo "[!] debugfs ownership pass failed"; exit 1; }
 rm -f "$OUT.own"
+rm -rf "$STAGE"
 
 echo "[OK] $OUT ($(du -m "$OUT" | cut -f1) MiB)"
