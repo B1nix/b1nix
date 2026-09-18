@@ -30,6 +30,10 @@ static u64 g_gicc_base;
 static u64 g_gicr_base;   /* GICv3 redistributor region */
 static u64 g_gicr_size;
 static u64 g_emmc2_base;   /* BCM2711 EMMC2 (SD card) */
+static u64 g_ufshc_base;   /* Qualcomm UFS host controller */
+static u64 g_qcom_gcc_base; /* Qualcomm global clock controller */
+static u64 g_dwc3_base;    /* Synopsys DWC3 USB controller (first one) */
+static u64 g_qcom_hsphy_base; /* its Synopsys femto high-speed PHY */
 /* The rest of a Raspberry Pi's SoC. Every one of these is zero on a board
  * whose tree does not describe it, which is how each driver decides whether
  * it has anything to drive. */
@@ -249,6 +253,10 @@ u64 fdt_gicr_size(void) { return g_gicr_size; }
 int fdt_gic_is_v3(void) { return g_gic_is_v3; }
 u64 fdt_its_base(void) { return g_its_base; }
 u64 fdt_emmc2_base(void) { return g_emmc2_base; }
+u64 fdt_ufshc_base(void) { return g_ufshc_base; }
+u64 fdt_qcom_gcc_base(void) { return g_qcom_gcc_base; }
+u64 fdt_dwc3_base(void) { return g_dwc3_base; }
+u64 fdt_qcom_hsphy_base(void) { return g_qcom_hsphy_base; }
 u64 fdt_mbox_base(void) { return g_mbox_base; }
 u64 fdt_gpio_base(void) { return g_gpio_base; }
 u64 fdt_pm_base(void) { return g_pm_base; }
@@ -623,6 +631,17 @@ static void fdt_finish_node(struct fdt_node *node, int depth)
 			{ "brcm,bcm2835-pm-wdt",      &g_pm_base },
 			{ "brcm,bcm2835-system-timer", &g_systimer_base },
 			{ "brcm,bcm2711-genet-v5",    &g_genet_base },
+			/* Qualcomm. Matched whatever `status` says: the SM8150 SoC
+			 * tree ships these disabled and the board overlay enables
+			 * them, and the drivers are opt-in on the command line
+			 * (b1nix.ufs, b1nix.usb-gadget) for exactly that reason. */
+			{ "qcom,ufshc",               &g_ufshc_base },
+			{ "qcom,sm8150-ufshc",        &g_ufshc_base },
+			{ "qcom,gcc-sm8150-v2",       &g_qcom_gcc_base },
+			{ "qcom,gcc-sm8150",          &g_qcom_gcc_base },
+			{ "snps,dwc3",                &g_dwc3_base },
+			{ "qcom,usb-hsphy-snps-femto", &g_qcom_hsphy_base },
+			{ "qcom,sm8150-usb-hs-phy",   &g_qcom_hsphy_base },
 		};
 
 		for (u32 i = 0; i < sizeof(bcm) / sizeof(bcm[0]); i++) {
@@ -1169,12 +1188,44 @@ void bootinfo_fdt_scan(u64 dtb_address)
 	 * large hole above every carveout - 0xa8800000 to 0xffb00000, per the
 	 * SM8150 tree - and use a gigabyte of it. Parse the carveouts when this
 	 * kernel needs more than a gigabyte on a phone.
+	 *
+	 * That gigabyte is clipped to the RAM banks ABL writes into /memory. The
+	 * static tree's node is empty, and the real one is not contiguous: the
+	 * first bank ends at 0xbcc00000 and the next starts at 0xc0000000. The
+	 * 52 MiB between them belong to the hypervisor. Handed to the page
+	 * allocator, the first page from there hung the CPU on its first access:
+	 * no fault, no interrupt, at the same point of every boot.
 	 */
 	if (platform_type() == PLATFORM_SM8150) {
-		global_bootinfo.memory_region_count = 1;
-		global_bootinfo.memory_regions[0].base = 0xa9000000ULL;
-		global_bootinfo.memory_regions[0].length = 0x40000000ULL;
-		global_bootinfo.memory_regions[0].type = BOOT_MEMORY_AVAILABLE;
+		const u64 win_lo = 0xa9000000ULL, win_hi = 0xe9000000ULL;
+		struct boot_memory_region banks[BOOTINFO_MAX_MEMORY_REGIONS];
+		u32 nbanks = g_ram_from_fdt ? global_bootinfo.memory_region_count : 0;
+		u32 n = 0;
+
+		memcpy(banks, global_bootinfo.memory_regions, sizeof(banks));
+		for (u32 i = 0; i < nbanks; i++) {
+			u64 lo = banks[i].base, hi = banks[i].base + banks[i].length;
+
+			if (lo < win_lo)
+				lo = win_lo;
+			if (hi > win_hi)
+				hi = win_hi;
+			if (hi <= lo)
+				continue;
+			global_bootinfo.memory_regions[n].base = lo;
+			global_bootinfo.memory_regions[n].length = hi - lo;
+			global_bootinfo.memory_regions[n].type = BOOT_MEMORY_AVAILABLE;
+			n++;
+		}
+		/* No banks from the loader: only the part below the hole, which
+		 * every SM8150 map seen so far has as RAM. */
+		if (!n) {
+			global_bootinfo.memory_regions[0].base = win_lo;
+			global_bootinfo.memory_regions[0].length = 0xbcc00000ULL - win_lo;
+			global_bootinfo.memory_regions[0].type = BOOT_MEMORY_AVAILABLE;
+			n = 1;
+		}
+		global_bootinfo.memory_region_count = n;
 
 		/* The framebuffer the bootloader left lit. Its address is the
 		 * cont_splash_region carveout; the panel is the Xperia 5's 1080x2520

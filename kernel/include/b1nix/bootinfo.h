@@ -161,6 +161,13 @@ u64 fdt_pci_mmio_size(void);
 /* The BCM2711's EMMC2 host, the SD card controller a Raspberry Pi 4 boots
  * from. Zero when the tree describes none. */
 u64 fdt_emmc2_base(void);
+/* Qualcomm SoC blocks (SM8150): the UFS host controller, the global clock
+ * controller its clocks and power domain live in, and the first Synopsys
+ * DWC3 USB core. Zero when the tree describes none. */
+u64 fdt_ufshc_base(void);
+u64 fdt_qcom_gcc_base(void);
+u64 fdt_dwc3_base(void);
+u64 fdt_qcom_hsphy_base(void);
 #endif
 
 /* Print what the device tree claimed about the ramdisk and whether it was
