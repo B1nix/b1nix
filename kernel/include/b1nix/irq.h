@@ -26,15 +26,15 @@ typedef int (*irq_handler_fn)(void *ctx);
  * share a line. Returns 0 on success, -1 if the line is out of range or its
  * sharer table is full. Does NOT unmask — call irq_unmask() once the device is
  * configured to raise interrupts. */
-int irq_register_handler(u8 irq, irq_handler_fn fn, void *ctx);
+int irq_register_handler(u32 irq, irq_handler_fn fn, void *ctx);
 
 /* Remove a (fn, ctx) handler previously registered on `irq`. Returns 0 if found
  * and cleared, -1 otherwise. Safe against a concurrent dispatcher. */
-int irq_unregister_handler(u8 irq, irq_handler_fn fn, void *ctx);
+int irq_unregister_handler(u32 irq, irq_handler_fn fn, void *ctx);
 
 /* Route and unmask the line at the IOAPIC (or legacy 8259). Thin wrapper over
  * the arch x86_pic_unmask so drivers don't reach into arch code directly. */
-void irq_unmask(u8 irq);
+void irq_unmask(u32 irq);
 
 /* Dispatch every handler registered for `irq` (called from the arch IRQ entry).
  * Returns the OR of the handlers' return values (1 if any claimed it). */

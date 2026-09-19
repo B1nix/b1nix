@@ -27,8 +27,28 @@ extern int oops_in_progress;
 		if (__c) lkpi_printk("drm: " fmt, ##__VA_ARGS__); \
 		__c;                                              \
 	})
-#define WARN_ONCE(cond, fmt, ...) WARN(cond, fmt, ##__VA_ARGS__)
-#define WARN_ON_ONCE(cond) WARN_ON(cond)
+/* Once per call site, as upstream: a condition an imported path reaches on
+ * every commit otherwise fills the console with the same line. */
+#define WARN_ONCE(cond, fmt, ...)                                 \
+	({                                                            \
+		static int __warned;                                      \
+		int __c = !!(cond);                                       \
+		if (__c && !__warned) {                                   \
+			__warned = 1;                                         \
+			lkpi_printk("drm: " fmt, ##__VA_ARGS__);              \
+		}                                                         \
+		__c;                                                      \
+	})
+#define WARN_ON_ONCE(cond)                                        \
+	({                                                            \
+		static int __warned;                                      \
+		int __c = !!(cond);                                       \
+		if (__c && !__warned) {                                   \
+			__warned = 1;                                         \
+			lkpi_printk("drm: WARN_ON_ONCE(%s)\n", #cond);        \
+		}                                                         \
+		__c;                                                      \
+	})
 
 /*
  * Taint flags.

@@ -2384,6 +2384,11 @@ static isize sys_mount(const char *user_src, const char *user_target,
   const char *dop = "";
   if (flags & MS_REMOUNT) {
     dop = "remount";
+    /* Going read-only is how a clean shutdown ends (OpenRC's mount-ro, busybox
+     * umount -r): what is still dirty has to reach the disk now, because the
+     * mount stops taking writes and the machine resets right after. */
+    if (flags & MS_RDONLY)
+      (void)sys_sync();
     dres = vfs_remount(ktarget, flags);
   } else if (flags & MS_BIND) {
     dop = "bind";

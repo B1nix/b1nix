@@ -1,6 +1,7 @@
 #include <b1nix/kprintf.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
+#include <b1nix/klog.h>
 #include <b1nix/console.h>
 #include <b1nix/bootinfo.h>
 #include <string.h>
@@ -60,19 +61,12 @@ void icmp_receive(struct ipv4_addr src, const void *data, usize size) {
 		kfree(reply);
 	} else if (hdr->type == ICMP_TYPE_ECHO_REPLY) {
 		__atomic_add_fetch(&g_icmp_echo_replies, 1, __ATOMIC_RELAXED);
-		console_write("ping: reply from ");
-		console_write_dec(src.bytes[0]);
-		console_write(".");
-		console_write_dec(src.bytes[1]);
-		console_write(".");
-		console_write_dec(src.bytes[2]);
-		console_write(".");
-		console_write_dec(src.bytes[3]);
-		console_write(" bytes=");
-		console_write_dec(size);
-		console_write(" seq=");
-		console_write_dec(hdr->seq); // Wait, seq might be swapped? Standard ping uses network byte order or host. Let's assume it's just what we sent.
-		console_write("\n");
+		/* To the log, not the console: this fires for every reply, whoever
+		 * sent the request, and a userspace ping printed each one again
+		 * over the shell it was typed into. */
+		k_info("net", "ping: reply from %u.%u.%u.%u bytes=%u seq=%u",
+		       src.bytes[0], src.bytes[1], src.bytes[2], src.bytes[3],
+		       (unsigned)size, (unsigned)hdr->seq);
 	}
 }
 

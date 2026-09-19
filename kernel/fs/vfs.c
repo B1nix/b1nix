@@ -7638,9 +7638,13 @@ int vfs_umount2(const char *target, int flags) {
   /* The namespace's root mount (see vfs_umount_one): refused before anything
    * below it is touched, or a detach that fails would still have emptied the
    * tree. */
-  int is_root = top >= 0 && !group && strcmp(canon, "/") == 0 &&
-                (!mounts[top].mount_point ||
-                 mounts[top].mount_point == root_node);
+  /* Whatever sits on top at "/" outside a pivot group is the root, whether it
+   * was mounted on the synthetic root node or over the initramfs's own root
+   * (a disk root mounted after the initramfs one: the phone's UFS, the rescue
+   * ramdisk). Only the first case used to count, so OpenRC's mount-ro -- whose
+   * "umount -r /" relies on EBUSY to fall back to a read-only remount --
+   * unmounted the running root, and the rest of the shutdown found no shell. */
+  int is_root = top >= 0 && !group && strcmp(canon, "/") == 0;
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   if (top < 0)
     return -EINVAL;

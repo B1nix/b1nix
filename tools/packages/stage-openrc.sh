@@ -43,5 +43,21 @@ printf '%s\n' "$want" | while read -r rel; do
 		ln -sfn "/etc/init.d/${rel#*/}" "$ROOTFS/etc/runlevels/$rel"
 done
 
+# hwdrivers and machine-id need a service called "dev", which Alpine's mdev or
+# udev provides and this image has neither of: the kernel mounts /dev itself.
+# In no runlevel, they only made every dependency scan warn.
+rm -f "$ROOTFS/etc/init.d/hwdrivers" "$ROOTFS/etc/init.d/machine-id"
+
+# The kernel mounts / (b1nix.ufs, virtio, the ramdisk -- the device differs by
+# board), so there is nothing to list; without the file OpenRC said so on
+# every boot.
+[ -f "$ROOTFS/etc/fstab" ] ||
+	printf '# / is mounted by the kernel; nothing else is mounted at boot.\n' >"$ROOTFS/etc/fstab"
+
+# swclock's reference time (see runlevels): the build's, until the first
+# shutdown saves a later one.
+mkdir -p "$ROOTFS/var/lib/misc"
+touch "$ROOTFS/var/lib/misc/openrc-shutdowntime"
+
 # Left behind by the from-source port, which installed under /libexec/openrc.
 rm -rf "$ROOTFS/libexec/openrc" "$ROOTFS/sbin/openrc-init" "$ROOTFS/sbin/openrc-shutdown"

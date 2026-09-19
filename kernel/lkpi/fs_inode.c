@@ -1162,10 +1162,13 @@ bool fsuidgid_has_mapping(struct super_block *sb, struct mnt_idmap *idmap)
 
 int sb_is_blkdev_sb(struct super_block *sb)
 {
-	/* True only for the block device's own pseudo-filesystem, which b1nix
-	 * does not have: every superblock here belongs to a real filesystem. */
-	(void)sb;
-	return 0;
+	/* Upstream the block device's own pseudo-filesystem. b1nix has none: a
+	 * block device's inode (fs_bdev.c) has no superblock at all, and it is
+	 * the only kind that does not. Answering "no" for it sent jbd2's revoke
+	 * cancel down the path for buffers outside the device's mapping, where it
+	 * looked the buffer up again, found itself and warned
+	 * (WARN_ON_ONCE(bh2 == bh)) on every commit. */
+	return sb == NULL;
 }
 
 /* A block device's own inode belongs to no mounted superblock -- upstream it

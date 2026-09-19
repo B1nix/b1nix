@@ -56,8 +56,10 @@ extern void vector_table_el1(void);
  * M70 table) ── device drivers register a completion handler against a GIC
  * interrupt ID instead of the dispatcher hard-coding one. QEMU virt's
  * virtio-mmio transports sit at SPI 16..47, i.e. GIC INTID 48..79
- * (kernel/dev/virtio_blk_mmio.c) — size the table generously above that. */
-#define IRQ_LINES 128
+ * (kernel/dev/virtio_blk_mmio.c). A phone's SPIs go much higher (SM8150:
+ * DWC3 at INTID 165, UFS at 297), so the table covers every INTID a GIC can
+ * have below the special range. */
+#define IRQ_LINES 1020
 #define IRQ_SHARERS 4
 struct irq_action {
   irq_handler_fn fn;
@@ -66,7 +68,7 @@ struct irq_action {
 static struct irq_action g_irq_actions[IRQ_LINES][IRQ_SHARERS];
 static spinlock_t g_irq_lock = SPINLOCK_INIT;
 
-int irq_register_handler(u8 irq, irq_handler_fn fn, void *ctx) {
+int irq_register_handler(u32 irq, irq_handler_fn fn, void *ctx) {
   if (irq >= IRQ_LINES || fn == 0)
     return -1;
   u64 flags;
@@ -83,7 +85,7 @@ int irq_register_handler(u8 irq, irq_handler_fn fn, void *ctx) {
   return -1;
 }
 
-int irq_unregister_handler(u8 irq, irq_handler_fn fn, void *ctx) {
+int irq_unregister_handler(u32 irq, irq_handler_fn fn, void *ctx) {
   if (irq >= IRQ_LINES || fn == 0)
     return -1;
   u64 flags;
@@ -117,7 +119,7 @@ int irq_dispatch(int irq) {
 /* GICD_ISENABLER/IPRIORITYR/ITARGETSR are already programmed for every SPI
  * line at boot (gic_init() below loops over all of them) — unmasking a
  * specific line for a driver only needs the enable bit set. */
-void irq_unmask(u8 irq) {
+void irq_unmask(u32 irq) {
   /* On a GICv3 the enable bit for an SGI or a PPI lives in this CPU's
    * redistributor, not in the distributor — a write here would be dropped, and
    * the timer would simply never fire. */
@@ -397,7 +399,9 @@ void interrupts_init(void)
 	{
 		u64 v;
 		__asm__ volatile("mrs %0, mpidr_el1" : "=r"(v));
-		g_boot_aff0 = (u8)(v & 0xff);
+		/* aff1:aff0, as smp.c keys CPUs: on SM8150 every core has aff0 = 0,
+		 * and each would have run the machine-wide half of the tick. */
+		g_boot_aff0 = (u8)(((v >> 4) & 0xf0) | (v & 0x0f));
 	}
 
 	/* sync_el1 runs on its own stack so a corrupt SP_EL1 cannot make the entry
@@ -538,12 +542,29 @@ void aarch64_irq_handler(struct interrupt_frame *frame)
 		sched_acct_leave_kernel();
 }
 
+/* Interrupts taken per INTID, for /proc/interrupts. Plain increments: a rate,
+ * not a ledger. */
+static u64 g_irq_counts[IRQ_LINES];
+
+u64 arch_irq_count(u32 irq)
+{
+	return irq < IRQ_LINES ? g_irq_counts[irq] : 0;
+}
+
+u32 arch_irq_lines(void)
+{
+	return IRQ_LINES;
+}
+
 static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 {
 	u32 iar = gicv3_present() ? gicv3_ack() : GICC_IAR;
 	/* v3 acknowledges a 24-bit INTID; v2's is 10 bits and the rest of the
 	 * word is the sending CPU for an SGI. */
 	u32 irq = gicv3_present() ? (iar & 0xffffffu) : (iar & 0x3ff);
+
+	if (irq < IRQ_LINES)
+		g_irq_counts[irq]++;
 
 	/* 1023 is the "no interrupt pending" answer on both versions; there is
 	 * nothing to end. */
@@ -596,7 +617,7 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 		{
 			u64 aff0;
 			__asm__ volatile("mrs %0, mpidr_el1" : "=r"(aff0));
-			if ((aff0 & 0xff) == g_boot_aff0) {
+			if ((u8)(((aff0 >> 4) & 0xf0) | (aff0 & 0x0f)) == g_boot_aff0) {
 				watchdog_tick();
 				serial_tty_tick();
 				virtio_console_poll();

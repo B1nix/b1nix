@@ -1058,6 +1058,23 @@ static int w_sys_ptrace_scope(usize pid, const char *buf, usize len) {
   return (int)len;
 }
 
+#ifdef __aarch64__
+/* /proc/last_kmsg: the previous boot's console, as Android names it. Filled
+ * on the Xperia 5 from the flash copy of the log (kernel/dev/ufs.c), empty
+ * where there is none. */
+const u8 *console_last_boot_log(u32 *len);
+
+static int r_last_kmsg(usize pid, struct sbuf *s) {
+  u32 len = 0;
+  const u8 *log = console_last_boot_log(&len);
+  (void)pid;
+  sb_grow(s, len);
+  for (u32 i = 0; i < len; i++)
+    sb_putc(s, (char)log[i]);
+  return 0;
+}
+#endif
+
 static int w_sys_tcp_max(usize pid, const char *buf, usize len) {
   (void)pid;
   u64 v;
@@ -1438,6 +1455,23 @@ static int r_cmdline(usize pid, struct sbuf *s) {
   return 0;
 }
 
+#if defined(__aarch64__)
+/* /proc/interrupts: INTID and how many times it was taken, lines that have
+ * fired only. Linux prints a column per CPU and the controller's name; one
+ * total is what telling "the interrupt arrives" from "it does not" needs. */
+static int r_interrupts(usize pid, struct sbuf *s) {
+  extern u64 arch_irq_count(u32 irq);
+  extern u32 arch_irq_lines(void);
+  (void)pid;
+  for (u32 i = 0; i < arch_irq_lines(); i++) {
+    u64 n = arch_irq_count(i);
+    if (n)
+      sb_addf(s, "%4u: %10lu\n", i, (unsigned long)n);
+  }
+  return 0;
+}
+#endif
+
 static int r_kallsyms(usize pid, struct sbuf *s) {
   (void)pid;
   extern const unsigned char __kallsyms_start[];
@@ -1499,7 +1533,9 @@ static const char *state_long(const char *abbr) {
 static int r_pid_status(usize pid, struct sbuf *s) {
   struct task *t = scheduler_task_by_pid(pid);
   if (!t) {
-    sb_addf(s, "Name:\t(gone)\nState:\tZ (zombie)\nPid:\t%lu\n",
+    /* PPid always: OpenRC's kill_all walks PPid up the chain and reports a
+     * status without one as unreadable. */
+    sb_addf(s, "Name:\t(gone)\nState:\tZ (zombie)\nPid:\t%lu\nPPid:\t0\n",
             (unsigned long)pid);
     return 0;
   }
@@ -1511,8 +1547,18 @@ static int r_pid_status(usize pid, struct sbuf *s) {
   /* Every pid is the reader's number for it; one the reader's PID namespace
    * cannot name (the parent of a namespace's init) reads as 0, as on Linux. */
   sb_addf(s, "Pid:\t%lu\n", (unsigned long)namespace_pid_to_user(t->id));
-  sb_addf(s, "PPid:\t%lu\n",
-          (unsigned long)namespace_pid_to_user(t->parent_id));
+  /* Kernel threads are children of pid 2, which is what Linux's kthreadd is
+   * and what OpenRC's kill_all walks PPid up to: a chain that ends there is
+   * a kernel thread and is left alone. Ended at 0 instead, every thread here
+   * looked like a user process to it. Pid 2 itself is this kernel's first
+   * thread, playing kthreadd's part with PPid 0. */
+  {
+    usize ppid = t->parent_id;
+
+    if (t->pml4_phys == 0 && t->id > 2)
+      ppid = 2;
+    sb_addf(s, "PPid:\t%lu\n", (unsigned long)namespace_pid_to_user(ppid));
+  }
   /* Thread-group identity and size. A crash reporter reads Tgid to map a thread
    * back to its process and Threads to know how many /proc/<pid>/task entries
    * it must dump; gdb reads TracerPid to refuse to attach twice. */
@@ -1839,7 +1885,9 @@ static int r_pid_stat(usize pid, struct sbuf *s) {
           /* 49-52 */ "0 0 0 0\n",
           (unsigned long)namespace_pid_to_user(t->id), comm,
           scheduler_state_name((int)t->state),
-          (unsigned long)namespace_pid_to_user(t->parent_id),
+          /* As in status: kernel threads are pid 2's children. */
+          (unsigned long)namespace_pid_to_user(
+              t->pml4_phys == 0 && t->id > 2 ? 2 : t->parent_id),
           (unsigned long)namespace_pid_to_user(t->process_group_id),
           (unsigned long)namespace_pid_to_user(t->session_id),
           (unsigned long)task_utime(t), (unsigned long)task_stime(t),
@@ -3741,6 +3789,9 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
     }
   }
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
+#if defined(__aarch64__)
+  procfs_mkchild(root, "interrupts", VFS_DEVICE, r_interrupts, 0);
+#endif
   procfs_mkchild(root, "b1nix-prof", VFS_DEVICE, r_b1nix_prof, 0);
   procfs_mkchild(root, "b1nix-kprof", VFS_DEVICE, r_b1nix_kprof, 0);
   procfs_mkchild(root, "b1nix-tasks", VFS_DEVICE, r_b1nix_tasks, 0);
@@ -3757,6 +3808,9 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
     }
   }
   procfs_mkchild(root, "kallsyms", VFS_DEVICE, r_kallsyms, 0);
+#ifdef __aarch64__
+  procfs_mkchild(root, "last_kmsg", VFS_DEVICE, r_last_kmsg, 0);
+#endif
   procfs_mkchild(root, "partitions", VFS_DEVICE, r_partitions, 0);
   procfs_mkchild(root, "mtd", VFS_DEVICE, r_mtd, 0);
   procfs_mkchild(root, "diskstats", VFS_DEVICE, r_diskstats, 0);

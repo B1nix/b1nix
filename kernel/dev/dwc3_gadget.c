@@ -42,6 +42,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
+#include <b1nix/irq.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/types.h>
 #include <b1nix/arch.h>
@@ -227,8 +228,15 @@ struct gadget {
 
 static struct gadget g;
 
+/* tests/dwc3-model builds this file on the host against a model of the
+ * controller, which supplies its own register accessors. */
+#ifndef DWC3_MODEL
 static inline u32 rd(u64 base, u32 off) { return *(volatile u32 *)(usize)(base + off); }
 static inline void wr(u64 base, u32 off, u32 v) { *(volatile u32 *)(usize)(base + off) = v; }
+#else
+u32 rd(u64 base, u32 off);
+void wr(u64 base, u32 off, u32 v);
+#endif
 static void set_mask(u64 base, u32 off, u32 mask, u32 val)
 {
 	wr(base, off, (rd(base, off) & ~mask) | (val & mask));
@@ -409,6 +417,18 @@ static int ep_start(u32 phys, u32 len, u32 type, int zlp)
 		return -1;
 	g.busy[phys] = 1;
 	return 0;
+}
+
+/* Has the controller finished the transfer on `phys`? It clears HWO in the
+ * TRBs it is done with (both of them, for a zero-length tail). Read instead
+ * of trusting the completion event alone: an event lost to a full event
+ * buffer left the endpoint "busy" for ever -- "tx dropped, endpoint busy"
+ * on every frame after a long UFS write, and the link was dead. */
+static int ep_trb_done(u32 phys)
+{
+	const u8 *t = g.ep_mem[phys];
+
+	return !(get_le32(t + 12) & TRB_HWO) && !(get_le32(t + 28) & TRB_HWO);
 }
 
 /* Bytes the last transfer on `phys` moved: requested minus what the TRB says
@@ -716,47 +736,27 @@ static void process_events(void)
 
 /* ── netdev ───────────────────────────────────────────────────────────────── */
 
-/* First frames each way, one line each: direction, ethertype, IP protocol,
- * ports, length. Enough to tell "never arrived" from "arrived and dropped" from
- * "never sent" without a packet capture on either end. */
-static void trace_frame(const char *dir, const u8 *f, u32 len)
+/* The dwc3 core's interrupt, GIC SPI 133 in the Xperia 5
+ * device tree. */
+#define DWC3_IRQ (32 + 133)
+
+/* Interrupt half of the event buffer, as Linux's dwc3 does it: a non-empty
+ * buffer masks itself (GEVNTSIZ.INTMASK) so the level line drops, and
+ * net_task -- which net_handle_irq wakes on a 1 -- processes the events and
+ * unmasks in gadget_poll. */
+static int gadget_irq_ack(struct netdev *nd)
 {
-	static u32 traced;
+	static int said;
 
-	if (len < 14)
-		return;
-	u16 et = (u16)((f[12] << 8) | f[13]);
-	if (et == 0x86dd || traced++ >= 300)
-		return;
-	console_write("usb-gadget: ");
-	console_write(dir);
-	console_write(" len=");
-	console_write_dec(len);
-	console_write(" et=0x");
-	console_write_hex64(et);
-	if (et == 0x0806 && len >= 42) {
-		console_write(f[21] == 1 ? " arp-req" : " arp-rep");
-		console_write(" target=");
-		console_write_dec(f[41]);
+	(void)nd;
+	if (!(rd(g.base, GEVNTCOUNT) & 0xfffc))
+		return 0;
+	wr(g.base, GEVNTSIZ, EVT_BUF_SIZE | GEVNTSIZ_INTMASK);
+	if (!said) {
+		said = 1;
+		say("interrupts arrive\n");
 	}
-	if (et == 0x0800 && len >= 34) {
-		const u8 *ip = f + 14;
-		u32 ihl = (u32)(ip[0] & 0xf) * 4;
-
-		console_write(" proto=");
-		console_write_dec(ip[9]);
-		console_write(" src=");
-		console_write_dec(ip[15]);
-		console_write(" dst=");
-		console_write_dec(ip[19]);
-		if ((ip[9] == 6 || ip[9] == 17) && len >= 14 + ihl + 4) {
-			console_write(" sport=");
-			console_write_dec(((u32)ip[ihl] << 8) | ip[ihl + 1]);
-			console_write(" dport=");
-			console_write_dec(((u32)ip[ihl + 2] << 8) | ip[ihl + 3]);
-		}
-	}
-	console_write("\n");
+	return 1;
 }
 
 static void gadget_poll(struct netdev *nd)
@@ -765,7 +765,26 @@ static void gadget_poll(struct netdev *nd)
 
 	(void)nd;
 	spin_lock_irqsave(&g.lock, &flags);
-	process_events();
+	/* Events taken, then unmask -- and look again. An event that arrived
+	 * while the buffer was masked keeps the line high through the unmask,
+	 * and if the GIC has this SPI as edge-triggered (the tree does not say,
+	 * and nothing here programs ICFGR) that is no new edge: it sat until the
+	 * next idle poll, 100 ms. With the count read back as empty after the
+	 * unmask, the next event raises the line from low. */
+	do {
+		process_events();
+		if (g.nd.irq_ack)
+			wr(g.base, GEVNTSIZ, EVT_BUF_SIZE);
+	} while (g.nd.irq_ack && (rd(g.base, GEVNTCOUNT) & 0xfffc));
+	if (g.busy[EP_RX] && !g.rx_ready && !g.rx_delivering && ep_trb_done(EP_RX)) {
+		u32 got = ep_actual(EP_RX, RX_BUF_LEN);
+
+		g.busy[EP_RX] = 0;
+		if (got >= 14 && g.data_alt)
+			g.rx_ready = got;
+		else if (g.data_alt)
+			rx_start();
+	}
 	u32 n = g.rx_ready;
 	if (n && !g.rx_delivering) {
 		g.rx_ready = 0;
@@ -782,7 +801,6 @@ static void gadget_poll(struct netdev *nd)
 	 * (it was, on the host's first packet). */
 	static u8 rx_frame[RX_BUF_LEN];
 	memcpy(rx_frame, ep_data(EP_RX), n);
-	trace_frame("rx", rx_frame, n);
 	/* Checksums need no second look on this link: every USB data packet
 	 * carries its own CRC16. And a macOS host marks the ECM interface
 	 * PARTIAL_CSUM and hands over TCP with the checksum left for the
@@ -810,8 +828,20 @@ static int gadget_transmit(struct netdev *nd, const u8 hdr[14],
 	 * giving up on this one. */
 	for (int i = 0; i < 200 && g.busy[EP_TX]; i++) {
 		process_events();
+		if (g.busy[EP_TX] && ep_trb_done(EP_TX))
+			g.busy[EP_TX] = 0;
 		if (g.busy[EP_TX])
 			arch_udelay(50);
+	}
+	static u32 stuck;
+
+	/* A transfer the host never collects holds the endpoint for good; end
+	 * it after a run of frames dropped behind it. */
+	if (g.busy[EP_TX] && ++stuck >= 100) {
+		ep_end(EP_TX);
+		stuck = 0;
+	} else if (!g.busy[EP_TX]) {
+		stuck = 0;
 	}
 	if (!g.data_alt || g.busy[EP_TX]) {
 		static u32 dropped;
@@ -828,7 +858,6 @@ static int gadget_transmit(struct netdev *nd, const u8 hdr[14],
 
 		memcpy(d, hdr, 14);
 		memcpy(d + 14, payload, payload_len);
-		trace_frame("tx", d, len);
 		rc = ep_start(EP_TX, len, TRBCTL_NORMAL, (len % maxp) == 0);
 	}
 	spin_unlock_irqrestore(&g.lock, flags);
@@ -1063,11 +1092,16 @@ int dwc3_gadget_probe(void)
 	memcpy(g.nd.mac.bytes, dev_mac, 6);
 	memcpy(g.nd.ifname, "usb0", 5);
 	g.nd.name = "dwc3-ecm";
-	g.nd.irq = -1;
 	g.nd.transmit = gadget_transmit;
 	g.nd.poll = gadget_poll;
 	g.nd.link_up = gadget_link_up;
+	g.nd.irq = DWC3_IRQ;
+	g.nd.irq_ack = gadget_irq_ack;
 	netdev_register(&g.nd);
+	/* Polling at net_task's idle rate stays the fallback: whether the SPI
+	 * reaches this kernel is the hypervisor's to decide. */
+	irq_unmask(DWC3_IRQ);
+	wr(g.base, GEVNTSIZ, EVT_BUF_SIZE);
 	say("running, waiting for a host\n");
 	BOOTMARK(309);
 	return 1;

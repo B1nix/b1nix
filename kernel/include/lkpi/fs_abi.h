@@ -102,6 +102,10 @@ struct lkpi_bio {
 #define LKPI_REQ_OP_FLUSH  2
 #define LKPI_REQ_OP_DISCARD 3
 #define LKPI_REQ_OP_WRITE_ZEROES 9
+/* Ordering flags above the op byte (enum req_flag_bits; fs_abi_check.c holds
+ * them to it). */
+#define LKPI_REQ_FUA       (1u << 17)
+#define LKPI_REQ_PREFLUSH  (1u << 18)
 
 #define LKPI_BLK_STS_OK    0
 #define LKPI_BLK_STS_IOERR 10

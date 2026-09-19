@@ -471,6 +471,13 @@ static u8 g_task_exit_stage[TASK_SLOTS];
  * and overwrite its exit_group(0) code with SIGNALED|SIGKILL, so waitpid reports
  * a spurious signalled death (M29 stress-exit-code). */
 static u8    g_task_exiting[TASK_SLOTS];
+/* Set by an explicit wake of a timed sleeper, taken by its sleep loop. A woken
+ * sleeper is switched back in RUNNING -- exactly what a yield that found no
+ * other work returns -- so its state cannot tell the loop it was woken, and it
+ * slept out the whole deadline anyway: net_task, woken by the NIC interrupt,
+ * still answered on its 100 ms idle beat. The waker does not touch wake_tick
+ * (see scheduler_wake_all's note); this is the channel instead. */
+static u8    g_sleep_woken[TASK_SLOTS];
 
 /* prctl(PR_SET_CHILD_SUBREAPER): the process adopts the orphans of its
  * descendants instead of their PID namespace's init. Kept on the thread-group
@@ -5372,6 +5379,7 @@ void scheduler_wake_task(usize task_id) {
     if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
                                     0, __ATOMIC_ACQUIRE,
                                     __ATOMIC_RELAXED)) {
+      __atomic_store_n(&g_sleep_woken[task_index(T(i))], 1, __ATOMIC_RELEASE);
       sched_wake_enqueue(T(i));
       woke = 1;
       break;
@@ -5838,6 +5846,7 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
 
   current_task->wake_tick = scheduler_ticks + ticks;
   sched_note_deadline(current_task->wake_tick);
+  __atomic_store_n(&g_sleep_woken[task_index(current_task)], 0, __ATOMIC_RELAXED);
   /* A timed sleep waits on the clock, not on a channel. Leaving the previous
    * wait's channel in place invites a wake meant for that channel to cut this
    * sleep short, now that wakers no longer clear it. */
@@ -5893,6 +5902,9 @@ int scheduler_sleep_ticks_state(u64 ticks, int strict) {
         if (st == TASK_READY || st == TASK_DEAD || st == TASK_REAPING)
           break;
       }
+      if (__atomic_exchange_n(&g_sleep_woken[task_index(current_task)], 0,
+                              __ATOMIC_ACQ_REL))
+        break;
       /* Park again, giving the CPU to anything that became runnable since the
        * yield above, before halting on it. A sleeper that only halted kept its CPU for the
        * whole sleep: on aarch64, where user tasks run on the boot CPU alone,
@@ -8211,8 +8223,9 @@ void scheduler_wake_task_norq(usize task_id) {
     if (!__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
       expected = TASK_SLEEPING;
-      __atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
-                                  __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+      if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        __atomic_store_n(&g_sleep_woken[task_index(T(i))], 1, __ATOMIC_RELEASE);
     }
     break;
   }
@@ -9146,6 +9159,23 @@ int scheduler_kill(usize task_id, int sig) {
         interrupts_restore(flags);
         return 0;
       }
+      /* POSIX: generating SIGCONT discards pending stop signals, and
+       * generating a stop signal discards a pending SIGCONT. Without the first
+       * half a stop posted to a task asleep in the kernel -- which only takes
+       * it on wakeup -- outlived the SIGCONT sent right after it: OpenRC's
+       * kill_all brackets every pass with kill(-1, SIGSTOP) ... kill(-1,
+       * SIGCONT), and openrc-run, waiting in waitpid for kill_all itself,
+       * woke into the stale stop and never ran again. Every shutdown hung
+       * after "Killing remaining processes". */
+      if (sig == SIGCONT)
+        __atomic_fetch_and(&T(i)->pending_signals,
+                           ~((1ULL << (SIGSTOP - 1)) | (1ULL << (SIGTSTP - 1)) |
+                             (1ULL << (SIGTTIN - 1)) | (1ULL << (SIGTTOU - 1))),
+                           __ATOMIC_RELEASE);
+      else if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN ||
+               sig == SIGTTOU)
+        __atomic_fetch_and(&T(i)->pending_signals, ~(1ULL << (SIGCONT - 1)),
+                           __ATOMIC_RELEASE);
       /* SIGKILL and SIGSTOP cannot be blocked/ignored. Atomic RMW: post-BKL
        * the target task (or another killer) may concurrently set/clear its own
        * pending bits, so a plain |= would drop a racing update. */
@@ -9219,6 +9249,8 @@ int scheduler_tkill(usize tgid, usize tid, int sig) {
     return -ESRCH;
   if (tgid && found_tgid != tgid)
     return -ESRCH;
+  if (t->pml4_phys == 0)
+    return 0; /* a kernel thread: see scheduler_kill_thread_group_user */
   return scheduler_kill(tid, sig);
 }
 
@@ -9653,7 +9685,15 @@ int scheduler_kill_thread_group_user(usize pid, int sig) {
   u64 flags = interrupts_save();
   struct task *t = find_live_task(pid);
   int allowed = t ? signal_permitted(t, sig) : -1;
+  int kthread = t && t->pml4_phys == 0;
   interrupts_restore(flags);
+  /* A kernel thread takes no signals from userspace, as on Linux, where
+   * kill(2) on one succeeds and does nothing. OpenRC's killprocs signals
+   * every process that /proc does not show descending from pid 2, and this
+   * kernel's threads did not: it SIGKILLed net_task and the filesystem's
+   * workers on every shutdown, and the phone never finished rebooting. */
+  if (kthread && allowed >= 0)
+    return 0;
   if (allowed < 0) {
     /* A zombie is still a process. POSIX (and Linux) let kill(2) name a child
      * that has exited but not been reaped: the signal has nowhere to go and is

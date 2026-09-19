@@ -1,44 +1,5 @@
 .section .text.boot
 
-// ── Visual boot markers ─────────────────────────────────────────────────────
-//
-// The Pi strobes below say how far the boot got over a serial cable. A phone
-// has no cable, so on a board whose bootloader leaves a framebuffer scanning
-// the same information is painted into it instead: one coloured band per
-// stage, stacked down the top of the screen. The panel is already live — the
-// bootloader's splash is being scanned out of this very buffer — so a band
-// appears the instant the store retires, with no driver, no clock and no
-// display init of any kind.
-//
-// Enabled by -DB1NIX_FB_BOOT_MARKERS=<phys addr> (see the `bahamut` target).
-// Off everywhere else: it is a raw store to a fixed physical address.
-//
-// Clobbers x9-x12 only, which are dead at every call site (x19 holds the DTB
-// pointer and x20 the CPU id — neither is touched).
-// Xperia 5 panel: 1080x2520, 32bpp, so 4320 bytes per row. 40-row bands leave
-// the marker column well clear of anything the console later draws.
-#define FBMARK_WIDTH  1080
-#define FBMARK_PITCH  4320
-#define FBMARK_ROWS   40
-
-.macro FBMARK slot, colour
-#ifdef B1NIX_FB_BOOT_MARKERS
-	ldr	x9, =B1NIX_FB_BOOT_MARKERS
-	// Byte offset of this band, built with a multiply: the product does not
-	// fit a single MOV immediate, and `ldr =(expr)` is not a relocatable
-	// expression the assembler will take.
-	mov	x10, #(\slot * FBMARK_ROWS)
-	mov	x11, #FBMARK_PITCH
-	mul	x10, x10, x11
-	add	x9, x9, x10
-	ldr	w11, =\colour
-	mov	x12, #(FBMARK_ROWS * FBMARK_WIDTH)
-9990:	str	w11, [x9], #4
-	subs	x12, x12, #1
-	b.ne	9990b
-	dsb	sy
-#endif
-.endm
 
 .global _start
 .type _start, %function
@@ -71,7 +32,6 @@ _start_kernel:
 	// Save DTB address from x0 to x19 FIRST (before any register clobber)
 	mov x19, x0
 
-	FBMARK 0, 0xFFFF0000		// red:    reached _start_kernel
 
 	// Early raw UART strobe directly in assembly (PL011 & Mini UART)
 #ifdef B1NIX_PI_EARLY_UART
@@ -111,7 +71,6 @@ _start_kernel:
 	// Down to EL1, whichever level this CPU was handed to us at.
 	bl .drop_to_el1
 
-	FBMARK 1, 0xFFFFFF00		// yellow: running at EL1
 
 	// Marker 'E' = EL1 drop completed
 #ifdef B1NIX_PI_EARLY_UART
@@ -157,7 +116,6 @@ _start_kernel:
 	br x8
 .relocated:
 
-	FBMARK 2, 0xFF00FF00		// green:  link address matches load address
 
 	// Marker 'R' = Relocation step done
 #ifdef B1NIX_PI_EARLY_UART
@@ -279,7 +237,6 @@ _start_kernel:
 	msr sctlr_el1, x0
 	isb
 
-	FBMARK 3, 0xFF00FFFF		// cyan:   MMU on, this store went through a page table
 
 	// Marker 'M' = MMU enabled!
 #ifdef B1NIX_PI_EARLY_UART
@@ -330,7 +287,6 @@ _start_kernel:
 	str w3, [x2]
 #endif
 	
-	FBMARK 4, 0xFF0000FF		// blue:   stack and BSS ready, entering C
 
 	// Jump to kernel_main
 	bl kernel_main
@@ -445,8 +401,12 @@ _ap_start:
 	// PSCI's CPU_ON can carry it in a context id and a spin-table release
 	// cannot — the firmware's parked loop enters with x0 = 0 — so both paths
 	// use the affinity the CPU reports about itself.
+	// Keyed on aff1:aff0, a nibble each, as cpu_key() in smp.c: a DynamIQ
+	// SoC numbers its cores in aff1 and leaves aff0 at 0.
 	mrs x0, mpidr_el1
-	and x0, x0, #0xff
+	ubfx x2, x0, #8, #4
+	and x0, x0, #0xf
+	orr x0, x0, x2, lsl #4
 	ldr x1, =g_aff0_to_cpu
 	ldrb w20, [x1, x0]
 

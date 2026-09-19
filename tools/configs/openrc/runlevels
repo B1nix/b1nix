@@ -1,7 +1,14 @@
 # <runlevel> <service> -- linked into /etc/runlevels by stage-openrc.sh.
 # The kernel mounts /proc, /sys and /dev itself, so sysinit needs only procfs.
 sysinit procfs
+# No RTC driver: the clock starts at 1970 and every file looks written in the
+# future ("clock skew detected"). swclock sets it from a file's mtime, which
+# the image stamps at build time and shutdown refreshes.
+sysinit swclock
 boot hostname
 default local
 shutdown killprocs
 shutdown savecache
+# Remount / read-only before the reset, so the next mount finds the journal
+# clean instead of replaying it.
+shutdown mount-ro

@@ -351,10 +351,18 @@ int lkpi_bridge_sync_fs(void *rootp)
 	/* In sync(2)'s order: the dirty data first, then the commit. btrfs keeps
 	 * written data as delalloc until writeback, and a commit alone put a
 	 * file's size on the disk with nothing in its extents. */
+	/* Under s_umount for read, as iterate_supers() holds it upstream: quota
+	 * writeback asserts it, and it is what keeps an unmount out from under
+	 * the sync. Held for write means an unmount or remount is running, and
+	 * that syncs the filesystem itself. */
+	if (!down_read_trylock(&sb->s_umount))
+		return 0;
 	sync_inodes_sb(sb);
+	int ret = 0;
 	if (sb->s_op && sb->s_op->sync_fs)
-		return sb->s_op->sync_fs(sb, 1);
-	return 0;
+		ret = sb->s_op->sync_fs(sb, 1);
+	up_read(&sb->s_umount);
+	return ret;
 }
 
 /* ── directories ────────────────────────────────────────────────── */

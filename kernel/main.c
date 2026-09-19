@@ -1410,20 +1410,15 @@ void kernel_main(usize arg0, usize arg1)
 	 * for now (kernel/arch/aarch64/smp.c says what is still missing before
 	 * userspace can run on one), which is what the M24b work-stealing and
 	 * M28 heap-benchmark checks exercise. */
-	/* Secondary CPUs are off on this board until PSCI works there.
+	/* Secondary CPUs stay off on this board: PSCI CPU_ON does not return.
 	 *
-	 * The Snapdragon's firmware declares method = "smc" and this kernel now
-	 * issues one, with the MPIDR its own device tree gives (0x100 for the
-	 * second core, read with the /cpus node's two address cells — verified).
-	 * The call does not return. Not "returns an error": control never comes
-	 * back from EL3, so there is no status to report and nothing to retry.
-	 * Why is genuinely open — the entry point, the power-domain state ATF
-	 * expects, and whether it dislikes being called with caches on are all
-	 * still unexamined.
-	 *
-	 * A machine with one core is a working machine, and everything after this
-	 * point is what the board is actually being brought up for. Pass
-	 * b1nix.smp to try anyway. */
+	 * The firmware declares method = "smc" and gets one, for MPIDR 0x100.
+	 * Two real faults are fixed and it still does not come back (the panel
+	 * stops on step 81, 91 never shows): the call's asm now lists x4-x17 as
+	 * clobbered (SMCCC 1.0), and the per-CPU table is keyed on aff1:aff0,
+	 * since every SM8150 core has aff0 = 0. Still open: the entry point,
+	 * the power-domain state the firmware expects, and whether Qualcomm's
+	 * hypervisor handles CPU_ON from this VM at all. b1nix.smp tries anyway. */
 	BOOTMARK(69);
 	if (platform_type() != PLATFORM_SM8150 || bootinfo_has_flag("b1nix.smp"))
 		smp_boot_aps();
@@ -1864,6 +1859,19 @@ void kernel_main(usize arg0, usize arg1)
 	/* init must be PID 1: real init systems (openrc-init, sysvinit) bail out
 	 * with `if (getpid() != 1) return 1;`. The boot task is PID 0 and ids from
 	 * 2 up went to the kernel threads started above, so 1 is still free. */
+	/* No clock older than the system it runs. A board with no RTC driver (the
+	 * Xperia 5) starts at 1970, and OpenRC's first act is to find /etc/init.d
+	 * written in the future: "clock skew detected" on every boot, before its
+	 * own swclock could run. So the clock is lifted to that directory's mtime
+	 * if it is behind -- what systemd does with its build-time epoch and
+	 * fake-hwclock with a saved stamp. A real RTC is already past it. */
+	{
+		struct b1nix_stat st;
+
+		if (vfs_stat("/etc/init.d", &st) == 0 &&
+		    wallclock_now_ns() / 1000000000ull < st.st_mtim.tv_sec)
+			wallclock_set_ns(st.st_mtim.tv_sec * 1000000000ull);
+	}
 	scheduler_reserve_init_pid();
 	int init_pid = user_spawn(init_path, 0, 0);
 	if (init_pid > 0)

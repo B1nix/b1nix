@@ -2489,11 +2489,12 @@ bahamut-fast:
 # loopback, and the kernel log as UDP to the host end (172.16.42.2:6666). It
 # probes after UFS but before the root mount, so a gadget bring-up that hangs
 # costs the boot — `make bahamut-ufs BAHAMUT_USB_GADGET=`
-# builds without it. The gadget has no interrupt wired up and is polled from
-# net_task, whose idle backoff (10 ticks, 100 ms on this board's 100 Hz tick)
-# became the link's round-trip time; b1nix.net-idle-ticks=1 polls every tick.
-BAHAMUT_USB_GADGET ?= b1nix.usb-gadget b1nix.net=off b1nix.ssh-external b1nix.netconsole=172.16.42.2:6666 b1nix.net-idle-ticks=1
-BAHAMUT_UFS_CMDLINE ?= "b1nix.loglevel=6 b1nix.ufs $(BAHAMUT_USB_GADGET)"
+# builds without it. The gadget raises the dwc3 interrupt (SPI 133), which
+# wakes net_task; net_task's idle polling stays as the fallback.
+BAHAMUT_USB_GADGET ?= b1nix.usb-gadget b1nix.net=off b1nix.ssh-external b1nix.netconsole=172.16.42.2:6666
+# boot_a/boot_b writable so a new kernel can be written over ssh:
+#   gzip -c boot.img | ssh root@172.16.42.1 'gunzip -c > /dev/sda38'
+BAHAMUT_UFS_CMDLINE ?= "b1nix.loglevel=6 b1nix.ufs b1nix.ufs-rw=boot_a,boot_b $(BAHAMUT_USB_GADGET)"
 BAHAMUT_ROOTFS_MB ?= 1024
 BAHAMUT_RESCUE_MB ?= 46
 .PHONY: bahamut-ufs

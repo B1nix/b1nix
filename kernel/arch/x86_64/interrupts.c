@@ -477,7 +477,7 @@ static struct irq_action g_irq_actions[IRQ_LINES][IRQ_SHARERS];
  * or deadlocks against, a writer even when an IRQ fires mid-registration. */
 static spinlock_t g_irq_lock = SPINLOCK_INIT;
 
-int irq_register_handler(u8 irq, irq_handler_fn fn, void *ctx) {
+int irq_register_handler(u32 irq, irq_handler_fn fn, void *ctx) {
   if (irq >= IRQ_LINES || fn == 0)
     return -1;
   u64 flags;
@@ -574,7 +574,7 @@ int msi_dispatch(int vector) {
  * matching slot was found and cleared, -1 otherwise. The fn is cleared with a
  * RELEASE store so a concurrent dispatcher sees the old handler in full or sees
  * it gone — never a torn entry. */
-int irq_unregister_handler(u8 irq, irq_handler_fn fn, void *ctx) {
+int irq_unregister_handler(u32 irq, irq_handler_fn fn, void *ctx) {
   if (irq >= IRQ_LINES || fn == 0)
     return -1;
   u64 flags;
@@ -604,7 +604,7 @@ int irq_dispatch(int irq) {
   return handled;
 }
 
-void irq_unmask(u8 irq) { x86_pic_unmask(irq); }
+void irq_unmask(u32 irq) { if (irq < 256) x86_pic_unmask((u8)irq); }
 
 void x86_pic_unmask(u8 irq) {
   /* IOAPIC mode: program a redirection entry instead of poking the (now

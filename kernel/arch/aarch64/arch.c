@@ -391,11 +391,23 @@ void arch_xsave_capture_clean(void *area, u64 mask) { (void)area; (void)mask; }
 
 static void psci_call(u32 fn)
 {
+	extern int fdt_psci_use_smc(void);
 	register u64 x0 __asm__("x0") = fn;
-	/* Try HVC first (QEMU virt's conduit), then SMC for boards that use it.
-	 * A successful call never returns. */
-	__asm__ volatile("hvc #0" : "+r"(x0) : : "memory");
-	__asm__ volatile("smc #0" : "+r"(x0) : : "memory");
+
+	/* The conduit the device tree names, as CPU_ON uses (smp.c). This used
+	 * to try HVC first and SMC after, and on a Snapdragon an HVC from EL1
+	 * lands in Qualcomm's hypervisor instead of the PSCI firmware. A
+	 * successful call never returns; x4-x17 are SMCCC 1.0's to clobber. */
+	if (fdt_psci_use_smc())
+		__asm__ volatile("smc #0" : "+r"(x0) :
+		                 : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
+		                   "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+		                   "x16", "x17", "memory");
+	else
+		__asm__ volatile("hvc #0" : "+r"(x0) :
+		                 : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
+		                   "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+		                   "x16", "x17", "memory");
 }
 
 #include <b1nix/bcm2835.h>
@@ -410,9 +422,16 @@ void arch_psci_poweroff(void)
 
 void arch_psci_reset(void)
 {
+	/* PSCI SYSTEM_RESET first: on the SM8150 it resets the phone now that
+	 * the call goes out over SMC as the device tree says (it used to leave
+	 * as HVC and never return). The APSS watchdog bite stays behind it as
+	 * the fallback for firmware that ignores the call. */
+	extern void aarch64_platform_watchdog_bite(void);
+
 	if (bcm2835_pm_ready())
 		bcm2835_pm_reset();
 	psci_call(PSCI_SYSTEM_RESET);
+	aarch64_platform_watchdog_bite();
 }
 
 void arch_halt(void)
@@ -574,9 +593,9 @@ void pf_prof_dump(void) {}
 
 /* ── Visual boot markers, C side ─────────────────────────────────────────────
  *
- * The companion to FBMARK in boot.S. Those five bands prove the assembly
- * prologue ran; this carries the same signal through kernel_main, which is
- * where a board with no serial cable otherwise goes dark.
+ * Carries the boot's progress through kernel_main, which is where a board
+ * with no serial cable otherwise goes dark. (The colour bands boot.S used to
+ * paint for its own prologue are gone: they sat in the middle of the splash.)
  *
  * It draws ONE number, very large, overwriting the previous one: the index of
  * the last milestone reached. Bands and coloured squares were the first two
@@ -593,9 +612,9 @@ void pf_prof_dump(void) {}
 #ifdef B1NIX_FB_BOOT_MARKERS
 #define FBD_PITCH  4320
 #define FBD_PX     (FBD_PITCH / 4)
-#define FBD_X      80   /* top-left of the readout */
-#define FBD_Y      1400 /* well above screen bottom so all 4 rows are 100% visible */
-#define FBD_SCALE  10   /* one font pixel becomes 10 screen pixels */
+#define FBD_X      16   /* top-left corner, clear of the splash title */
+#define FBD_Y      8
+#define FBD_SCALE  4    /* one font pixel becomes 4 screen pixels */
 #define FBD_GLYPH_W 5
 #define FBD_GLYPH_H 7
 
@@ -645,11 +664,16 @@ static void fbd_digit(u32 x0, u32 y0, int d, u32 colour)
 static int fbd_value[FBD_ROWS_MAX];
 static int fbd_shown[FBD_ROWS_MAX];
 
+/* One line, in reading order: the milestone first (white), then the facts
+ * (grey), each a three-digit field with a digit's width between fields. */
 static void fbd_paint(int row, int value)
 {
 	u32 gw = FBD_GLYPH_W * FBD_SCALE;
 	u32 gh = FBD_GLYPH_H * FBD_SCALE;
-	u32 y = FBD_Y + (u32)row * (gh + FBD_SCALE * 2);
+	u32 field = (gw + FBD_SCALE) * 4;
+	u32 x = FBD_X + (u32)row * field;
+	u32 y = FBD_Y;
+	u32 colour = row ? 0xFF8A93A6u : 0xFFFFFFFFu;
 	int d[3];
 
 	if (value < 0)
@@ -660,13 +684,13 @@ static void fbd_paint(int row, int value)
 	d[1] = (value / 10) % 10;
 	d[2] = value % 10;
 
-	fbd_fill(FBD_X, y, (gw + FBD_SCALE) * 3, gh, 0xFF000000u);
+	fbd_fill(x, y, (gw + FBD_SCALE) * 3, gh, 0xFF0F1117u);
 	for (int i = 0; i < 3; i++) {
 		if (i == 0 && value < 100)
 			continue;
 		if (i == 1 && value < 10)
 			continue;
-		fbd_digit(FBD_X + (u32)i * (gw + FBD_SCALE), y, d[i], 0xFFFFFFFFu);
+		fbd_digit(x + (u32)i * (gw + FBD_SCALE), y, d[i], colour);
 	}
 }
 
@@ -738,6 +762,23 @@ u32 aarch64_platform_watchdog_disable(void)
 	wdt[QCOM_WDT_EN / 4] = 0;
 	__asm__ volatile("dsb sy" ::: "memory");
 	return wdt[QCOM_WDT_EN / 4];
+}
+
+/* Reset the board by letting the watchdog bite: pet, bark out of the way, bite
+ * almost at once, enable, and wait. Returns only on a board without it. */
+void aarch64_platform_watchdog_bite(void)
+{
+	volatile u32 *wdt = (volatile u32 *)(usize)QCOM_WDT_BASE;
+
+	if (platform_type() != PLATFORM_SM8150)
+		return;
+	wdt[QCOM_WDT_RST / 4] = 1;
+	wdt[QCOM_WDT_BARK / 4] = 0x7FFFFFFFu;
+	wdt[QCOM_WDT_BITE / 4] = 0x20;      /* sleep-clock ticks: about 1 ms */
+	wdt[QCOM_WDT_EN / 4] = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (;;)
+		__asm__ volatile("wfi");
 }
 
 /* Is no-execute available for user mappings?

@@ -2783,9 +2783,9 @@ check_output "$LOG" "M84-DHCP6: ok malformed-rejected" "a truncated DHCPv6 optio
 echo ""
 echo "[RUN] M110 boot-log format checks..."
 check_log_timestamps "$LOG" "every kernel log line carries a monotonic timestamp"
-check_output "$LOG" "^\[ *[0-9][0-9]*\.[0-9][0-9][0-9][0-9][0-9][0-9]\] b1nix kernel starting" \
-	"the first kernel line is stamped in the dmesg [ssss.uuuuuu] form"
-check_output "$LOG" "^\[ *[0-9][0-9]*\.[0-9][0-9][0-9][0-9][0-9][0-9]\] pci [0-9a-f][0-9a-f]*:" \
+check_output "$LOG" "^\[[0-9][0-9]*\.[0-9][0-9]\] b1nix kernel starting" \
+	"the first kernel line is stamped in the compact [s.cc] form"
+check_output "$LOG" "^\[[0-9][0-9]*\.[0-9][0-9]\] pci [0-9a-f][0-9a-f]*:" \
 	"PCI lines are prefixed with the device they are about"
 check_output "$LOG" "M110-LOG: ok clock-monotonic" \
 	"the log clock never runs backwards"

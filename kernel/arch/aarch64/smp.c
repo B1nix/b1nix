@@ -180,9 +180,19 @@ static u64 mpidr(void)
 	return v & 0x00ffffffu;
 }
 
+/* The CPU's slot in g_aff0_to_cpu: affinity 0 and affinity 1, a nibble each.
+ * QEMU virt numbers its cores in aff0; a DynamIQ SoC (SM8150) numbers them in
+ * aff1 -- 0x000, 0x100, 0x200 -- with aff0 always 0, so keyed on aff0 alone
+ * every core of the phone resolved to one slot, the boot CPU's. boot.S
+ * computes the same key for a secondary's first lookup. */
+static inline u32 cpu_key(u64 m)
+{
+	return (u32)(((m >> 4) & 0xf0) | (m & 0x0f));
+}
+
 struct percpu *aarch64_get_percpu(void)
 {
-	return &g_percpu[g_aff0_to_cpu[mpidr() & 0xff]];
+	return &g_percpu[g_aff0_to_cpu[cpu_key(mpidr())]];
 }
 
 /* Which affinity-0 value each CPU index actually booted with.
@@ -206,7 +216,7 @@ void aarch64_percpu_record_self(u32 cpu)
 {
 	if (cpu >= AARCH64_ASM_CPUS)
 		return;
-	g_cpu_aff0[cpu] = (u8)(mpidr() & 0xff);
+	g_cpu_aff0[cpu] = (u8)cpu_key(mpidr());
 	__atomic_store_n(&g_cpu_aff0_valid[cpu], 1, __ATOMIC_RELEASE);
 }
 
@@ -214,7 +224,7 @@ void aarch64_percpu_record_self(u32 cpu)
  * else's per-CPU block. Cheap: one system register read and two loads. */
 int aarch64_percpu_self_mismatch(void)
 {
-	u64 aff0 = mpidr() & 0xff;
+	u64 aff0 = cpu_key(mpidr());
 	u32 idx = g_aff0_to_cpu[aff0];
 
 	if (idx >= AARCH64_ASM_CPUS)
@@ -239,7 +249,7 @@ void percpu_init(void)
 	g_percpu[0].cpu_id = 0;
 	g_percpu[0].cur_task = 0;
 	g_percpu[0].cpu_online = 1;
-	g_aff0_to_cpu[mpidr() & 0xff] = 0;
+	g_aff0_to_cpu[cpu_key(mpidr())] = 0;
 	aarch64_percpu_record_self(0);
 }
 
@@ -269,16 +279,23 @@ static long psci_cpu_on(u64 target_mpidr, u64 entry_phys, u64 context_id)
 	 * so guessing wrong does not fail, it kills the boot. */
 	extern int fdt_psci_use_smc(void);
 
+	/* SMCCC 1.0, which is what PSCI firmware may implement, lets the callee
+	 * clobber x4-x17. Unlisted, they were the compiler's to keep live across
+	 * the call; QEMU never touches them, and firmware that does returned into
+	 * a caller with its registers rewritten -- the SM8150 "CPU_ON never
+	 * returns". */
 	if (fdt_psci_use_smc())
 		__asm__ volatile("smc #0"
 		                 : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
 		                 :
-		                 : "memory");
+		                 : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+		                   "x12", "x13", "x14", "x15", "x16", "x17", "memory");
 	else
 		__asm__ volatile("hvc #0"
 		                 : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
 		                 :
-		                 : "memory");
+		                 : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+		                   "x12", "x13", "x14", "x15", "x16", "x17", "memory");
 	return (long)x0;
 }
 
@@ -330,7 +347,7 @@ void aarch64_ap_main(u64 cpu)
 	 * reading and writing the BOOT CPU's per-CPU block -- including cur_task.
 	 * Printed once per CPU at bring-up, where it is free. */
 	{
-		u64 aff0 = mpidr() & 0xff;
+		u64 aff0 = cpu_key(mpidr());
 		g_ap_percpu_selfcheck[cpu & 7] =
 		    (u32)((aff0 << 16) | (u32)g_aff0_to_cpu[aff0]);
 	}
@@ -556,7 +573,7 @@ int smp_boot_aps(void)
 		/* The same stack, recorded for scheduler_setup_ap_idle: this CPU's
 		 * idle task runs on it. */
 		g_percpu[index].kernel_stack_virt = g_ap_sp[index];
-		g_aff0_to_cpu[target & 0xff] = (u8)index;
+		g_aff0_to_cpu[cpu_key(target)] = (u8)index;
 		g_ap_percpu_selfcheck[index & 7] = 0xffffffffu;
 
 		if (fdt_cpu_enable_method() == FDT_ENABLE_METHOD_SPIN_TABLE) {

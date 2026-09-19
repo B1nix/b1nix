@@ -156,6 +156,34 @@ static int con_line_muted;
 static int g_ramoops_on;
 static u32 g_ramoops_start, g_ramoops_used;
 
+/* The previous boot's log. Not from this zone: the bootloader fills it with
+ * 0xff across every reset. kernel/dev/ufs.c finds the flash copy of it
+ * instead, before its first mirror overwrites that; /proc/last_kmsg. */
+static u8 g_last_log[RAMOOPS_CONSOLE_SIZE];
+static u32 g_last_len;
+
+/* Keep a copy of a zone (header and ring) as the previous boot's log. */
+void console_keep_previous_zone(const u8 *zone)
+{
+	const u32 *h = (const u32 *)zone;
+	const u8 *d = zone + 12;
+	u32 cap = RAMOOPS_CONSOLE_SIZE - 12, start = h[1], used = h[2];
+
+	if (h[0] != PERSISTENT_RAM_SIG || start >= cap || used > cap)
+		return;
+	u32 from = used < cap ? 0 : start;
+
+	for (u32 i = 0; i < used; i++)
+		g_last_log[i] = d[(from + i) % cap];
+	g_last_len = used;
+}
+
+const u8 *console_last_boot_log(u32 *len)
+{
+	*len = g_last_len;
+	return g_last_log;
+}
+
 static void ramoops_putc(char c)
 {
 	/* The platform defaults to QEMU virt until the device tree is read, so

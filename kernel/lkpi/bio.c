@@ -498,6 +498,17 @@ void submit_bio(struct lkpi_bio *bio)
 		break;
 	}
 
+	/* The write-back block cache sits between this and the medium, and a
+	 * journal's safety is entirely in these two flags. jbd2 writes its commit
+	 * block, and later the journal superblock's new tail, with PREFLUSH|FUA:
+	 * everything before must be on the medium first, and this block must be
+	 * there when the bio completes. Ignored, the cache wrote back in LBA
+	 * order, and a phone reset left a commit without its transaction or a
+	 * tail moved past blocks never checkpointed -- block bitmaps that
+	 * disagreed with their descriptors, and files that vanished on replay. */
+	if (op == LKPI_REQ_OP_WRITE && (bio->bi_opf & LKPI_REQ_PREFLUSH))
+		blk_cache_flush(dev);
+
 	/*
 	 * Walk the vector from where the iterator has got to, not from entry
 	 * zero: a split bio shares its parent's vector, and starting at zero
@@ -525,6 +536,9 @@ void submit_bio(struct lkpi_bio *bio)
 		sector += len >> LKPI_SECTOR_SHIFT;
 		bio->bi_iter.bi_size -= len;
 	}
+
+	if (!failed && op == LKPI_REQ_OP_WRITE && (bio->bi_opf & LKPI_REQ_FUA))
+		blk_cache_flush(dev);
 
 	bio->bi_iter.bi_sector = sector;
 	bio->bi_status = failed ? LKPI_BLK_STS_IOERR : LKPI_BLK_STS_OK;

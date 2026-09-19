@@ -43,6 +43,7 @@
 #include <b1nix/bootmark.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
+#include <b1nix/irq.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
@@ -89,6 +90,7 @@
 #define HCS_READY       (HCS_DP | HCS_UTRLRDY | HCS_UTMRLRDY | HCS_UCRDY)
 
 #define IS_UTRCS        (1u << 0)
+#define IE_UTRCE        (1u << 0)
 #define IS_UE           (1u << 2)
 #define IS_ULSS         (1u << 8)
 #define IS_UCCS         (1u << 10)
@@ -141,6 +143,8 @@
 #define UFS_MAX_LUNS  8u
 /* DMA memory the SM8150 controller may reach; see probe_host. */
 #define QCOM_UFS_DMA_BASE 0xf0000000ull
+/* ufshc@1d84000: GIC SPI 265, from the Xperia 5 device tree. */
+#define QCOM_UFS_IRQ (32 + 265)
 
 #define SCSI_TEST_UNIT_READY 0x00
 #define SCSI_READ_CAPACITY10 0x25
@@ -163,6 +167,8 @@ struct ufs_host {
 	u32 index;              /* ufs<N>, for messages */
 	int quiet;              /* probing LUNs that may not exist */
 	u32 bounce_bytes;       /* DMA bounce buffer size */
+	int irq;                /* completion interrupt, -1 = polled only */
+	volatile u32 irq_hits;  /* completions the interrupt reported */
 };
 
 struct ufs_rw_window {
@@ -306,6 +312,58 @@ static int dme_set(struct ufs_host *h, u16 attr, u32 value)
 
 /* ── Transfer requests (slot 0 only) ─────────────────────────────────────── */
 
+/* Transfer-request completion: acknowledge it (the line is level-triggered
+ * and stays up until IS is cleared) and wake whoever waits in utp_exec. */
+static int ufs_irq(void *ctx)
+{
+	struct ufs_host *h = ctx;
+
+	if (!(rd(h, REG_IS) & IS_UTRCS))
+		return 0;
+	wr(h, REG_IS, IS_UTRCS);
+	/* Said once: whether the interrupt arrives at all is the question on a
+	 * board whose hypervisor routes it, and requests wait asleep from now. */
+	if (h->irq_hits++ == 0)
+		ufs_msg(h, "completion interrupts arrive; requests now sleep\n");
+	scheduler_wake_all(h);
+	return 1;
+}
+
+/* Wait for slot 0's doorbell to clear. Polled until the interrupt has shown
+ * that it arrives -- on a phone the hypervisor decides whether an SPI reaches
+ * us, and a sleep that only a watchdog tick ended would cost 10 ms a
+ * request -- and asleep from then on, so a single core runs something else
+ * while the flash works. */
+static int utp_wait(struct ufs_host *h, u32 timeout_ms)
+{
+	u64 deadline = scheduler_get_ticks() + SCHED_MS_TO_TICKS(timeout_ms);
+
+	for (u32 t = 0; t < 20; t++) {
+		if (!(rd(h, REG_UTRLDBR) & 1u))
+			return 0;
+		arch_udelay(5);
+	}
+	if (h->irq >= 0 && h->irq_hits && scheduler_can_block()) {
+		while (rd(h, REG_UTRLDBR) & 1u) {
+			if (scheduler_get_ticks() > deadline)
+				return -1;
+			scheduler_wait_prepare_timeout(h, 1);
+			if (!(rd(h, REG_UTRLDBR) & 1u)) {
+				scheduler_wait_cancel();
+				break;
+			}
+			scheduler_wait_commit();
+		}
+		return 0;
+	}
+	for (u32 t = 0; t < timeout_ms * 10u; t++) {
+		if (!(rd(h, REG_UTRLDBR) & 1u))
+			return 0;
+		arch_udelay(100);
+	}
+	return (rd(h, REG_UTRLDBR) & 1u) ? -1 : 0;
+}
+
 /*
  * Build UTRD 0 around whatever the caller put in the command UPIU, ring the
  * doorbell and wait. `dd` is the data direction, `data_len` the bytes the
@@ -343,12 +401,7 @@ static int utp_exec(struct ufs_host *h, u32 dd, u32 data_len, u32 timeout_ms)
 	wr(h, REG_IS, IS_UTRCS);
 	wr(h, REG_UTRLDBR, 1u);
 
-	for (u32 t = 0; t < timeout_ms * 10u; t++) {
-		if (!(rd(h, REG_UTRLDBR) & 1u))
-			break;
-		arch_udelay(100);
-	}
-	if (rd(h, REG_UTRLDBR) & 1u) {
+	if (utp_wait(h, timeout_ms) != 0) {
 		ufs_msg(h, "request timed out, clearing slot\n");
 		wr(h, REG_UTRLCLR, ~1u);
 		wait_reg(h, REG_UTRLDBR, 1u, 0, 1000);
@@ -584,8 +637,14 @@ static void lu_open_writable_partitions(struct ufs_lu *lu)
 		int named = gpt && in_list(allow, gpt);
 		int ours = blk_probe_label(p, label, sizeof(label)) == 0 &&
 		           strcmp(label, "b1nix-root") == 0;
-		if (!named && !ours)
+		if (!named && !ours) {
+			/* Read-only to everything above: a write the fence
+			 * refuses only at write-back stays dirty in the block
+			 * cache for ever, and every later flush and every read
+			 * of the partition waits on it. */
+			p->write_blocks = 0;
 			continue;
+		}
 		if (lu->rw_count >= sizeof(lu->rw) / sizeof(lu->rw[0]))
 			break;
 		lu->rw[lu->rw_count].start = blk_partition_start(p);
@@ -914,7 +973,7 @@ static void qcom_smmu_report(void)
 	}
 }
 
-static void probe_host(u64 base, int is_qcom)
+static void probe_host(u64 base, int is_qcom, int irq)
 {
 	if (g_host_count >= sizeof(g_hosts) / sizeof(g_hosts[0]))
 		return;
@@ -924,6 +983,7 @@ static void probe_host(u64 base, int is_qcom)
 	h->base = base;
 	h->is_qcom = is_qcom;
 	h->index = g_host_count;
+	h->irq = -1;
 
 	/* Panel readout on the phone: 2xx is the UFS step reached. A step is held
 	 * on screen for 300 ms, because a register the secure world forbids does
@@ -1019,6 +1079,18 @@ static void probe_host(u64 base, int is_qcom)
 	                          "link started from reset\n");
 	g_host_count++;
 
+	/* Completion interrupts, and only those: IE is written whole, because a
+	 * source left enabled by the bootloader (a UIC error, say) is one this
+	 * handler never acknowledges, and a level-triggered line nobody clears
+	 * keeps the CPU in the interrupt handler for good. */
+	if (irq > 0 && irq_register_handler((u32)irq, ufs_irq, h) == 0) {
+		h->irq = irq;
+		wr(h, REG_IS, IS_UTRCS);
+		wr(h, REG_IE, IE_UTRCE);
+		irq_unmask((u32)irq);
+		ufs_msg_hex(h, "completion interrupt ", (u64)irq);
+	}
+
 	for (u8 lun = 0; lun < UFS_MAX_LUNS; lun++) {
 		u64 count;
 		u32 bsize;
@@ -1075,6 +1147,15 @@ static void ufs_log_flush(void)
 
 	if (!g_log_part || !zone || !size)
 		return;
+	/* Only when something was logged since the last copy: the header's
+	 * write position moves with every byte. 256 KiB every two seconds of an
+	 * idle phone was flash wear for nothing. */
+	static u32 last_pos = ~0u;
+	u32 pos = ((const volatile u32 *)zone)[1];
+
+	if (pos == last_pos)
+		return;
+	last_pos = pos;
 	static u8 buf[0x40000];
 
 	memcpy(buf, zone, size);
@@ -1116,6 +1197,17 @@ static void ufs_log_start(void)
 			continue;
 		g_log_part = p;
 		g_log_sector = start / 512;
+		/* What is there now is the previous boot's last mirror: keep it
+		 * before the first flush replaces it (/proc/last_kmsg). */
+#ifdef __aarch64__
+		{
+			extern void console_keep_previous_zone(const u8 *zone);
+			static u8 prev[0x40000];
+
+			if (p->read_blocks(p, g_log_sector, sizeof(prev) / 512, prev) == 0)
+				console_keep_previous_zone(prev);
+		}
+#endif
 		console_write("ufs: kernel log mirrored to ");
 		console_write(p->name);
 		console_write(" at MiB ");
@@ -1140,7 +1232,8 @@ void ufs_init(void)
 		pci_enable_decode(pci.bus, pci.slot, pci.func);
 		pci_enable_bus_master(pci.bus, pci.slot, pci.func);
 		pci_bind_driver(&pci, "ufshcd");
-		probe_host(vmm_direct_map_base() + bar.base, 0);
+		probe_host(vmm_direct_map_base() + bar.base, 0,
+		           pci_intx_line(pci.bus, pci.slot, pci.func));
 	}
 
 #if defined(__aarch64__)
@@ -1160,7 +1253,7 @@ void ufs_init(void)
 			qcom_ufs_clocks_on(gcc);
 		BOOTMARK(202);
 		qcom_smmu_report();
-		probe_host(fdt_ufshc_base(), 1);
+		probe_host(fdt_ufshc_base(), 1, QCOM_UFS_IRQ);
 		BOOTMARK(209);
 		ufs_log_start();
 	}
@@ -1241,7 +1334,8 @@ void ufs_selftest(void)
 	u64 rstart = blk_partition_start(root) + s;
 	int allowed = disk->read_blocks(disk, rstart, 1, back) == 0 &&
 	              disk->write_blocks(disk, rstart, 1, back) == 0;
-	mark(refused && allowed, "fence-refuses-unlisted-partition");
+	mark(refused && allowed && !fenced->write_blocks,
+	     "fence-refuses-unlisted-partition");
 
 	/* Hand the live controller to probe again, as a kernel booted by a
 	 * bootloader that used the disk finds it: the inherit path must keep the
