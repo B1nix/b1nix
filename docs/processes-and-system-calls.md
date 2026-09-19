@@ -71,10 +71,30 @@ that the call no longer answers ENOSYS.
 - **Landlock ABI 3** confines filesystem access in layered rulesets, and
   symlinks cannot escape.
 
-Three calls give the answers of a system without the feature. Protection keys
-answer as on a CPU without PKU. `quotactl` validates its target and then says
-no filesystem here has quotas. `memfd_secret` does not exist yet, because pages
-cannot be removed from the kernel direct map.
+- **Protection keys** (x86 PKU, `kernel/arch/x86_64/pkeys.c`) where the CPU has
+  them: each thread's PKRU travels with it across a context switch, a signal
+  handler starts from the initial rights and `sigreturn` puts back the
+  interrupted ones, `pkey_alloc`/`pkey_free` keep a per-address-space
+  allocation map that `fork` copies and `execve` clears, and `pkey_mprotect`
+  writes the key into the page-table entries — including the lazy ones a page
+  is faulted in from. A `PROT_EXEC`-only mapping goes under the address
+  space's execute-only key, so its code runs and cannot be read. An access the
+  keys refuse is `SIGSEGV` with `SEGV_PKUERR` and `si_pkey`; the kernel's own
+  copies to and from a refused page are `EFAULT`, as they are on Linux. A CPU
+  without the feature answers as Linux does there: `pkey_alloc` is `ENOSPC`.
+- **`memfd_secret`** (`kernel/mm/secretmem.c`) hands out pages that are in no
+  kernel mapping at all: they are taken, 2 MiB at a time, out of the direct
+  map, the kernel-image window and every address space's identity window, and
+  the removal is verified before a page is handed over. The file is mapped
+  shared or not at all, its size is set once, `read`/`write` on the descriptor
+  are `EINVAL`, and `/proc/<pid>/mem`, `process_vm_readv` and
+  `PTRACE_PEEKDATA` cannot reach the pages. They count against
+  `RLIMIT_MEMLOCK`, are never swapped, never dumped in a core, and are wiped
+  before the memory goes back to the allocator.
+- **`quotactl` / `quotactl_fd`** are Linux's own `fs/quota/quota.c`, imported
+  whole (`kernel/lkpi/fs_quotactl.c`): b1nix names the filesystem and the
+  command handlers are upstream's. See
+  [filesystems-and-storage.md](filesystems-and-storage.md).
 
 The robust futex list is kept per thread. When a thread exits or execs, every
 robust mutex it still holds is marked `FUTEX_OWNER_DIED` and a waiter is woken,

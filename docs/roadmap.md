@@ -171,10 +171,10 @@ userspace), [memory-and-scheduling.md](memory-and-scheduling.md),
 Per-call state: [processes-and-system-calls.md](processes-and-system-calls.md).
 
 - [x] `done` Process and threading: `openat2` (`RESOLVE_*`), `pidfd_getfd`, `kcmp`, futex2 (`futex_waitv`, `futex_wake`, `futex_wait`), `process_mrelease`, `process_madvise`, `sched_setattr`/`sched_getattr`.
-- [ ] `partial` Security: the key retention service (`keyctl`, `add_key`, `request_key`) and Landlock (ABI 3, filesystem rights enforced in the VFS and on exec) are implemented; protection keys answer as a CPU without them, and `memfd_secret` is not implemented (it needs pages removed from the kernel direct map).
-- [ ] `partial` Filesystems and memory: `statmount`/`listmount` with never-reused mount ids, `cachestat`, `remap_file_pages`, and `mbind`/`get_mempolicy`/`set_mempolicy`/`set_mempolicy_home_node` with single-node semantics; `quotactl` validates its target and reports that no filesystem here has quotas.
+- [x] `done` Security: the key retention service (`keyctl`, `add_key`, `request_key`), Landlock (ABI 3, enforced in the VFS and on exec), protection keys (x86 PKU: per-thread PKRU, `pkey_alloc`/`pkey_free`/`pkey_mprotect`, execute-only mappings, `SEGV_PKUERR`), and `memfd_secret`, whose pages are removed from every kernel mapping of physical memory.
+- [x] `done` Filesystems and memory: `statmount`/`listmount` with never-reused mount ids, `cachestat`, `remap_file_pages`, `mbind`/`get_mempolicy`/`set_mempolicy`/`set_mempolicy_home_node` with single-node semantics, and `quotactl`/`quotactl_fd` on the imported filesystems — ext4's own quotas, enforced.
 - [x] `done` A vDSO on x86_64 and aarch64: `clock_gettime`, `gettimeofday`, `time` and `clock_getres` without entering the kernel for the TSC/CNTVCT clocks (32 ns vs 262 ns per call on KVM); musl and glibc both use it.
-- [x] `done` Each call is probed in the Debian lane by its result and errno (63/63), and the unmapped-syscall log line stays silent through a Plasma session. Chromium was not run.
+- [x] `done` Each call is probed in the Debian lane by its result and errno (66/66) and in `m124_smoke` on both arches; protection keys are proved on a CPU that has them in the `pku` lane (QEMU TCG `-cpu max`), and quotas against the distribution's own `mkfs.ext4 -O quota`, `setquota`, `repquota` and `e2fsck`. The unmapped-syscall log line stays silent through a Plasma session. Chromium was not run.
 
 ## M125: io_uring
 

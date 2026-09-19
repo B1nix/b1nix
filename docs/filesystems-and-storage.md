@@ -54,6 +54,39 @@ fs-verity and fscrypt. The host is the judge in the tests: images made by
 `tools/fs/make-lkpi-image.sh` are checked afterwards with `btrfs check` and
 `e2fsck`.
 
+## Disk quotas (M124)
+
+Linux's quota core — `fs/quota/{dquot,quota_tree,quota_v2,kqid}.c` — is
+imported, and so is the system call's own `fs/quota/quota.c`: b1nix has a
+system-call layer of its own, so that file is compiled inside
+`kernel/lkpi/fs_quotactl.c`, which names the superblock the way `quotactl_fd`
+does and leaves every command to upstream's handlers. `quotactl(2)` finds its
+filesystem by the block device it was mounted from and `quotactl_fd(2)` by any
+descriptor on it; a filesystem with no quota operations answers `ENOSYS`, as
+Linux does.
+
+An ext4 made with `mke2fs -O quota` therefore behaves as it does on Linux:
+usage is accounted from the mount, `Q_QUOTAON` turns enforcement on, a write
+past a hard limit fails with `EDQUOT`, `quota-tools` (`setquota`, `repquota`,
+`quotaon`) drive it, the limits survive a remount, and `e2fsck -fn` finds the
+quota inodes consistent with the usage afterwards. Three things had to be true
+for that:
+
+- A `chown` transfers the file's usage. The shim's `struct iattr` carries each
+  id under both names, and `dquot_transfer` reads the `vfs*` pair — filling
+  only `ia_uid` moved every chowned file's usage to root.
+- A write reaches the filesystem while the caller is still there to be told
+  `EDQUOT`. b1nix's page cache takes writes and pushes them later, so a
+  filesystem enforcing a quota asks for them directly
+  (`inode->write_through_cb`) and the cache only mirrors what was written.
+- The quota core's `/proc/sys/fs/quota` table is published
+  (`kernel/lkpi/fs_sysctl.c`): `quota-tools` decides whether the kernel has
+  quota support at all by whether that directory exists.
+
+There is no quota on tmpfs, and mount options are not yet passed to the
+imported filesystems, so `mount -o usrquota` does not turn enforcement on —
+`quotaon` does.
+
 ## Block devices
 
 The block layer has a cache shared by every filesystem (M14). A write that
