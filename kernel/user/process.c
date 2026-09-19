@@ -2542,6 +2542,17 @@ resolve:
       current_task->sigactions[sig - 1].sa_handler = SIG_DFL;
     }
   }
+  /* And the alternate signal stack is not preserved either (POSIX execve).
+   * Kept, it pointed into the old image: a Go program's exec'd child (podman
+   * starting catatonit) inherited the runtime's gsignal stack, and the first
+   * SA_ONSTACK handler it ran was given a frame at an address the new image
+   * does not map -- "signal: failed to build user frame", then SIGSEGV. */
+  {
+    kstack_t off = {0};
+
+    off.ss_flags = SS_DISABLE;
+    task_set_altstack(current_task, &off);
+  }
 
   if (current_task->name) {
     kfree((void *)current_task->name);

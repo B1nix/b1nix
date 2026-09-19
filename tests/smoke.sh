@@ -1696,14 +1696,7 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	check_output "$LOG" "b1nix kernel" "kernel banner appears"
 	check_output "$LOG" "B1NIX-QUICK: ok native" "native userspace smoke passes"
 	check_output "$LOG" "B1NIX-QUICK: done" "quick smoke completes"
-	# See the note at the full-suite copy of this check: aarch64 keeps
-	# userspace off secondaries on purpose, so the marker cannot appear there.
-	if [ "$ARCH" = "aarch64" ]; then
-		skipped "SMP work-stealing passes" \
-			"aarch64 keeps userspace off secondaries (pass b1nix.ap-userspace to re-enable)"
-	else
-		check_output "$SMP_LOG" "M24B-BKL: instance ran-on-ap" "SMP work-stealing passes"
-	fi
+	check_output "$SMP_LOG" "M24B-BKL: instance ran-on-ap" "SMP work-stealing passes"
 	if grep -q -E "KERNEL PANIC|\[PANIC\]" "$LOG" "$SMP_LOG" 2>/dev/null; then
 		fail "quick smoke completes without panic" "PANIC detected in log"
 	else
@@ -2890,6 +2883,7 @@ check_output "$LOG" "M77-CAPS: done" "M77 writable resource-cap sysctls complete
 # ── M42 wave-5 prerequisites: POSIX limits, VFS, pattern matching & signal /
 #    job control (the gate before enabling the upstream ash shell) ──
 check_output "$LOG" "M42-W5PRE: start" "M42 wave-5 prerequisite suite starts"
+check_output "$LOG" "M42-W5PRE: ok exec-drops-altstack" "execve drops the alternate signal stack, and an SA_ONSTACK handler in the new image still runs"
 check_output "$LOG" "M42-W5PRE: ok rlimit-enforcement" "RLIMIT_NOFILE limits the open fd count"
 check_output "$LOG" "M42-W5PRE: ok getrlimit-setrlimit" "getrlimit/setrlimit sets limits correctly"
 check_output "$LOG" "M42-W5PRE: ok dup" "dup() returns lowest available descriptor"
@@ -3960,21 +3954,8 @@ if [ "$ARCH" = "aarch64" ]; then
 	check_output "$SMP_LOG" "M100E-SMOKE: ok smmuv3-unmap" "removing it makes the address stop resolving"
 	check_output "$SMP_LOG" "M100E-SMOKE: ok nvme-translated" "a real controller runs in its own domain: the read returns the right bytes and the unit records no fault"
 	# Userspace on a secondary, not just kernel workers: the process reads its
-	# own CPU id and reports which one it ran on.
-	#
-	# aarch64 deliberately does not do this yet. Running userspace on a
-	# secondary is what corrupts memory on this port -- a CPU was caught
-	# executing with SP inside another task's kernel stack -- so the kernel
-	# leaves g_ap_userspace_enabled clear there and the secondaries run kernel
-	# workers only. Reported as a skip with the reason rather than a pass:
-	# the capability genuinely is not there. b1nix.ap-userspace turns it back
-	# on for work on the underlying bug.
-	if [ "$ARCH" = "aarch64" ]; then
-		skipped "a userspace process runs on a secondary CPU" \
-			"aarch64 keeps userspace off secondaries (pass b1nix.ap-userspace to re-enable)"
-	else
-		check_output "$LOG" "M24B-BKL: instance ran-on-ap" "a userspace process runs on a secondary CPU"
-	fi
+	# own CPU id and reports which one it ran on. Both arches.
+	check_output "$LOG" "M24B-BKL: instance ran-on-ap" "a userspace process runs on a secondary CPU"
 	if grep -q -E "KERNEL PANIC|\[PANIC\]" "$SMP_LOG" 2>/dev/null; then
 		fail "SMP self-test completes without panic" "PANIC detected in log"
 	else

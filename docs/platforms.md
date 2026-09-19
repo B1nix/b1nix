@@ -52,11 +52,12 @@ At the system-call boundary AArch64 uses the asm-generic numbers, and some
 carry a real `fpsimd_context`, and ptrace reports FP state as
 `user_fpsimd_state`.
 
-Two things are still off. Userspace does not run on secondary CPUs unless
-`b1nix.ap-userspace` is given: with it, a secondary was once caught running
-with its stack pointer inside another task's kernel stack, and the cause was
-never found. The kernel heap does not return tail pages either, because live
-kernel stacks were found in returned ranges. Chromium has no AArch64 entry in
+Userspace runs on the secondary CPUs, as on x86_64. It was kept off for a
+long time because a secondary was once caught running with its stack pointer
+inside another task's kernel stack; that no longer reproduces, and
+`b1nix.no-ap-userspace` keeps the secondaries on kernel workers if it comes
+back. One thing is still off: the kernel heap does not return tail pages,
+because live kernel stacks were found in returned ranges. Chromium has no AArch64 entry in
 the package lock, and i915 is x86-only.
 
 When porting a mechanism to AArch64: read the x86_64 implementation first,

@@ -3,6 +3,7 @@
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/sched.h>
+#include <b1nix/spinlock.h>
 #include <b1nix/console.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
@@ -52,6 +53,7 @@ struct arp_entry {
 	u32 ns;
 };
 static struct arp_entry arp_table[ARP_TABLE_SIZE];
+static spinlock_t arp_lock; /* see arp_store */
 static int arp_smoke_resolution_logged;
 static int arp_smoke_request_logged;
 static int arp_smoke_reply_logged;
@@ -84,6 +86,9 @@ void arp_init(void)
 /* Everything a namespace that is going away had learned. */
 void arp_flush_ns(u32 ns)
 {
+	u64 flags;
+
+	spin_lock_irqsave(&arp_lock, &flags);
 	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
 		if (arp_table[i].ns != ns)
 			continue;
@@ -92,6 +97,7 @@ void arp_flush_ns(u32 ns)
 		arp_table[i].oif = 0;
 		arp_table[i].ns = 0;
 	}
+	spin_unlock_irqrestore(&arp_lock, flags);
 }
 
 /* The interface a mapping belongs to: the one currently delivering frames when
@@ -104,31 +110,65 @@ static int arp_current_oif(void)
 	return netdev_index_of(nd);
 }
 
-static void arp_cache_put(struct ipv4_addr ip, struct mac_addr mac)
+/* The table is shared by every CPU: the receive path (net_task, or a sender
+ * whose veth delivers synchronously) learns entries while a sender on another
+ * core looks them up. Unlocked, two CPUs could claim the same free slot and one
+ * entry was lost -- the sender then waited out its 25 ticks for a resolution
+ * that never came and dropped the datagram (M109 netns-ipv4-source-select,
+ * once userspace ran on the secondaries). Never held across a transmit: a veth
+ * delivers in the caller's context and comes straight back in here. */
+static unsigned arp_evict_next;
+
+/* Record ip -> mac in `ns`. `admin`: an `ip neigh` change, which may set or
+ * clear `permanent`; otherwise a learned mapping, which never overrides a
+ * pinned one. With the table full, a learned entry replaces a non-permanent
+ * one (round robin) rather than being dropped. Returns 0 or -ENOSPC. */
+static int arp_store(u32 ns, struct ipv4_addr ip, struct mac_addr mac, int oif,
+                     int admin, int permanent)
 {
-	u32 ns = arp_ns();
+	u64 flags;
+	int rc = 0, slot = -1;
+
+	spin_lock_irqsave(&arp_lock, &flags);
 	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
 		if (arp_table[i].valid && arp_table[i].ns == ns &&
 		    memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
-			/* An administratively pinned entry outranks the wire. */
-			if (arp_table[i].permanent)
-				return;
+			if (!admin && arp_table[i].permanent)
+				goto out; /* a pinned entry outranks the wire */
 			arp_table[i].mac = mac;
-			arp_table[i].oif = arp_current_oif();
-			return;
+			arp_table[i].oif = oif;
+			if (admin)
+				arp_table[i].permanent = permanent ? 1 : 0;
+			goto out;
 		}
+		if (slot < 0 && !arp_table[i].valid)
+			slot = i;
 	}
-	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (!arp_table[i].valid) {
-			arp_table[i].ip = ip;
-			arp_table[i].mac = mac;
-			arp_table[i].valid = 1;
-			arp_table[i].permanent = 0;
-			arp_table[i].oif = arp_current_oif();
-			arp_table[i].ns = ns;
-			return;
-		}
+	for (int n = 0; slot < 0 && n < ARP_TABLE_SIZE; n++) {
+		int i = (int)(arp_evict_next++ % ARP_TABLE_SIZE);
+
+		if (!arp_table[i].permanent)
+			slot = i;
 	}
+	if (slot < 0) {
+		rc = -ENOSPC;
+		goto out;
+	}
+	arp_table[slot].valid = 0;
+	arp_table[slot].ip = ip;
+	arp_table[slot].mac = mac;
+	arp_table[slot].permanent = permanent ? 1 : 0;
+	arp_table[slot].oif = oif;
+	arp_table[slot].ns = ns;
+	arp_table[slot].valid = 1;
+out:
+	spin_unlock_irqrestore(&arp_lock, flags);
+	return rc;
+}
+
+static void arp_cache_put(struct ipv4_addr ip, struct mac_addr mac)
+{
+	arp_store(arp_ns(), ip, mac, arp_current_oif(), 0, 0);
 }
 
 /* ── M107: neighbour-table administration (rtnetlink RTM_*NEIGH, `ip neigh`) ── */
@@ -137,6 +177,9 @@ usize arp_snapshot(struct neigh_info *out, usize max)
 {
 	usize n = 0;
 	u32 ns = arp_ns();
+	u64 flags;
+
+	spin_lock_irqsave(&arp_lock, &flags);
 	for (int i = 0; i < ARP_TABLE_SIZE && n < max; i++) {
 		if (!arp_table[i].valid || arp_table[i].ns != ns)
 			continue;
@@ -149,39 +192,22 @@ usize arp_snapshot(struct neigh_info *out, usize max)
 		out[n].oif = arp_table[i].oif;
 		n++;
 	}
+	spin_unlock_irqrestore(&arp_lock, flags);
 	return n;
 }
 
 int arp_neigh_set(struct ipv4_addr ip, struct mac_addr mac, int permanent)
 {
-	int oif = arp_current_oif();
-	u32 ns = arp_ns();
-	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (arp_table[i].valid && arp_table[i].ns == ns &&
-		    memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
-			arp_table[i].mac = mac;
-			arp_table[i].permanent = permanent ? 1 : 0;
-			arp_table[i].oif = oif;
-			return 0;
-		}
-	}
-	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (!arp_table[i].valid) {
-			arp_table[i].ip = ip;
-			arp_table[i].mac = mac;
-			arp_table[i].valid = 1;
-			arp_table[i].permanent = permanent ? 1 : 0;
-			arp_table[i].oif = oif;
-			arp_table[i].ns = ns;
-			return 0;
-		}
-	}
-	return -ENOSPC;
+	return arp_store(arp_ns(), ip, mac, arp_current_oif(), 1, permanent);
 }
 
 int arp_neigh_del(struct ipv4_addr ip)
 {
 	u32 ns = arp_ns();
+	u64 flags;
+	int rc = -ESRCH;
+
+	spin_lock_irqsave(&arp_lock, &flags);
 	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
 		if (arp_table[i].valid && arp_table[i].ns == ns &&
 		    memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
@@ -189,16 +215,21 @@ int arp_neigh_del(struct ipv4_addr ip)
 			arp_table[i].permanent = 0;
 			arp_table[i].oif = 0;
 			arp_table[i].ns = 0;
-			return 0;
+			rc = 0;
+			break;
 		}
 	}
-	return -ESRCH;
+	spin_unlock_irqrestore(&arp_lock, flags);
+	return rc;
 }
 
 int arp_resolve_dev(struct ipv4_addr ip, struct mac_addr *mac, struct netdev *dev)
 {
 	int found = 0;
 	u32 ns = arp_ns();
+	u64 flags;
+
+	spin_lock_irqsave(&arp_lock, &flags);
 	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
 		if (arp_table[i].valid && arp_table[i].ns == ns &&
 		    memcmp(arp_table[i].ip.bytes, ip.bytes, 4) == 0) {
@@ -207,6 +238,7 @@ int arp_resolve_dev(struct ipv4_addr ip, struct mac_addr *mac, struct netdev *de
 			break;
 		}
 	}
+	spin_unlock_irqrestore(&arp_lock, flags);
 
 	int smoke_probe = bootinfo_has_flag("b1nix.test=1") &&
 	                  !arp_smoke_request_logged;

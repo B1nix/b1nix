@@ -1410,21 +1410,8 @@ void kernel_main(usize arg0, usize arg1)
 	 * for now (kernel/arch/aarch64/smp.c says what is still missing before
 	 * userspace can run on one), which is what the M24b work-stealing and
 	 * M28 heap-benchmark checks exercise. */
-	/* Secondary CPUs stay off on this board: PSCI CPU_ON does not return.
-	 *
-	 * The firmware declares method = "smc" and gets one, for MPIDR 0x100.
-	 * Two real faults are fixed and it still does not come back (the panel
-	 * stops on step 81, 91 never shows): the call's asm now lists x4-x17 as
-	 * clobbered (SMCCC 1.0), and the per-CPU table is keyed on aff1:aff0,
-	 * since every SM8150 core has aff0 = 0. Still open: the entry point,
-	 * the power-domain state the firmware expects, and whether Qualcomm's
-	 * hypervisor handles CPU_ON from this VM at all. b1nix.smp tries anyway. */
 	BOOTMARK(69);
-	if (platform_type() != PLATFORM_SM8150 || bootinfo_has_flag("b1nix.smp"))
-		smp_boot_aps();
-	else
-		console_write("smp: AP bring-up skipped on this board "
-		              "(PSCI CPU_ON does not return; pass b1nix.smp to try)\n");
+	smp_boot_aps();
 	BOOTMARK(70);
 #endif
 
@@ -1668,28 +1655,17 @@ void kernel_main(usize arg0, usize arg1)
 	 * under the Big Kernel Lock. From here, userspace runs on Application
 	 * Processors too.
 	 *
-	 * Not on aarch64 yet. Two CPUs executing kernel paths in parallel is what
-	 * this port has not made safe: the surviving failure is a secondary found
-	 * running with SP inside ANOTHER task's kernel stack (caught directly:
-	 * cpu 1, task 'ap-idle', sp owned by 'boot'), after which it returns
-	 * through whatever that frame holds. A secondary still boots, still takes
-	 * its own timer interrupts and still runs stealable kernel workers, so the
-	 * M101 RCU grace-period check -- which needs a reader on a second core --
-	 * still has one. Set b1nix.ap-userspace to opt back in while working on it.
-	 *
-	 * x86_64 is unchanged: it has run userspace on APs since M28. */
-	/* Userspace on the secondaries is still off HERE, and the reason is
-	 * measured rather than assumed: with it on the suite scores 900-1300 of
-	 * ~1370 with wide variance, against 1369 and no blocked checks with it
-	 * off. The corruption behind that has not been found (open item in
-	 * docs/platforms.md). b1nix.ap-userspace turns it on for work on
-	 * the bug. */
+	 * aarch64 too, since 2026-09-19: the suite that used to score 900-1300
+	 * of ~1370 with userspace on the secondaries (a CPU found executing on
+	 * another task's kernel stack) now matches the one-CPU run exactly, twice
+	 * over, with a process verifiably running on cpu 1. b1nix.no-ap-userspace
+	 * keeps the secondaries on kernel workers, should it come back. */
 #if defined(__aarch64__)
-	if (bootinfo_has_flag("b1nix.ap-userspace"))
-		g_ap_userspace_enabled = 1;
-	else
+	if (bootinfo_has_flag("b1nix.no-ap-userspace"))
 		console_write("smp: secondaries stay on kernel workers "
-		              "(pass b1nix.ap-userspace to run userspace on them)\n");
+		              "(b1nix.no-ap-userspace)\n");
+	else
+		g_ap_userspace_enabled = 1;
 #else
 	g_ap_userspace_enabled = 1;
 #endif

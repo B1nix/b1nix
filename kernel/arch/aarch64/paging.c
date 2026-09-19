@@ -336,7 +336,10 @@ static int range_has_ram(u64 base, u64 len) {
   return 0;
 }
 
-#define DIRECT_LEAF_FLAGS (AP_EL1_RW | D_AF | D_UXN)
+/* Inner Shareable, as every other mapping here: RAM left Non-shareable gets no
+ * coherency between cores, so a spinlock another CPU released can stay "held"
+ * in this one's cache for ever. QEMU does not model it; the SM8150 does. */
+#define DIRECT_LEAF_FLAGS (AP_EL1_RW | D_AF | D_UXN | SH_INNER)
 
 /* Fill `l1` (an L1 table, one entry per GiB) so that [0, limit) is mapped by
  * the rule above. `alloc_l2` supplies the tables the mixed blocks need, and

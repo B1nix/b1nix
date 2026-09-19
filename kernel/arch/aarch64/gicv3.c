@@ -147,6 +147,18 @@ void gicv3_cpu_init(void) {
 	__asm__ volatile("msr S3_0_C12_C12_4, %0" : : "r"((u64)0));  /* ICC_CTLR_EL1: EOImode 0 */
 	__asm__ volatile("isb");
 	__asm__ volatile("msr S3_0_C12_C12_7, %0\n\tisb" : : "r"((u64)1)); /* enable group 1 */
+
+	*(volatile u32 *)(usize)(rd + GICR_ISENABLER0_OFF) = 1u << GICV3_SGI_RESCHED;
+}
+
+/* The reschedule SGI to every CPU but this one (ICC_SGI1R_EL1.IRM). The stores
+ * that made work runnable are ordered before it, so the woken CPU sees them. */
+void gicv3_send_resched_others(void) {
+	if (!g_present)
+		return;
+	__asm__ volatile("dsb ishst" ::: "memory");
+	__asm__ volatile("msr S3_0_C12_C11_5, %0\n\tisb"
+	                 : : "r"((1ULL << 40) | ((u64)GICV3_SGI_RESCHED << 24)));
 }
 
 /* Distributor bring-up, once for the machine. Returns 0 when the device tree

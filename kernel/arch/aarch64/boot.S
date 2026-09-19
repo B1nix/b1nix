@@ -1,6 +1,17 @@
 .section .text.boot
 
 
+
+// PSTATE.PAN = 0 where the CPU has PAN (ID_AA64MMFR1_EL1.PAN != 0); the
+// instruction is UNDEFINED without it. The kernel reads user memory directly.
+.macro CLEAR_PAN
+	mrs x0, id_aa64mmfr1_el1
+	ubfx x0, x0, #20, #4
+	cbz x0, 9990f
+	.inst 0xd500409f	// msr pan, #0
+9990:
+.endm
+
 .global _start
 .type _start, %function
 
@@ -232,10 +243,12 @@ _start_kernel:
 	orr x0, x0, #(1 << 2)   // C = 1 (data cache)
 	orr x0, x0, #(1 << 12)  // I = 1 (instruction cache)
 	bic x0, x0, #(1 << 19)  // WXN = 0 (writable ≠ XN)
+	orr x0, x0, #(1 << 23)  // SPAN = 1: exception entry leaves PSTATE.PAN alone
 	bic x0, x0, #(1 << 25)  // EE = 0 (little-endian)
 	orr x0, x0, #(1 << 0)   // M = 1
 	msr sctlr_el1, x0
 	isb
+	CLEAR_PAN
 
 
 	// Marker 'M' = MMU enabled!
@@ -455,10 +468,17 @@ _ap_start:
 	orr x0, x0, #(1 << 2)		// C = 1 (data cache), as on the BSP
 	orr x0, x0, #(1 << 12)		// I = 1 (instruction cache), as on the BSP
 	bic x0, x0, #(1 << 19)		// WXN = 0
+	// SPAN = 1. The value firmware leaves here is its own: on the SM8150 a
+	// CPU started by PSCI CPU_ON had SPAN clear, so every exception entry set
+	// PSTATE.PAN and the kernel's first copy from user memory on that CPU was
+	// a permission fault (init, memcpy in a syscall, ESR 0x9600000f). The boot
+	// CPU got a bootloader value with it set, and QEMU resets it set.
+	orr x0, x0, #(1 << 23)
 	bic x0, x0, #(1 << 25)		// EE = 0
 	orr x0, x0, #(1 << 0)		// M = 1
 	msr sctlr_el1, x0
 	isb
+	CLEAR_PAN
 
 	// Exception vectors: shared with the BSP, but VBAR_EL1 is per-CPU.
 	ldr x0, =vector_table_el1

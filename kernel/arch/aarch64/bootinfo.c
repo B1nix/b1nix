@@ -706,7 +706,7 @@ static void fdt_finish_node(struct fdt_node *node, int depth)
 	 * HVC; a phone runs ATF at EL3 and answers on SMC, and an HVC issued at
 	 * EL1 with no hypervisor behind it is an exception, not a failed call —
 	 * which is why this has to be read rather than guessed. */
-	if (depth == 1 && strcmp(node->name, "psci") == 0 && node->method) {
+	if (depth == 2 && strcmp(node->name, "psci") == 0 && node->method) {
 		g_psci_use_smc = strcmp(node->method, "smc") == 0;
 		g_psci_from_fdt = 1;
 	}

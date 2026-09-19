@@ -30,6 +30,7 @@
 #include <b1nix/runqueue.h>
 #include <b1nix/sched.h>
 #include <b1nix/bootmark.h>
+#include <b1nix/gicv3.h>
 
 /* PSCI 0.2+ 64-bit calls. CPU_ON takes (target MPIDR, entry point, context id)
  * and returns 0 on success; the entry point is physical, since the CPU it
@@ -262,6 +263,21 @@ int get_online_cpu_count(void)
 			n++;
 	}
 	return n ? n : 1;
+}
+
+/* Clean [p, p+len) to the point of coherency. A CPU that CPU_ON releases runs
+ * _ap_start with the MMU and caches off, so its loads go to RAM and never see
+ * what this CPU still holds dirty in its cache. */
+static void dcache_clean_poc(const void *p, usize len)
+{
+	u64 ctr, line;
+	u64 a, end = (u64)(usize)p + len;
+
+	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	line = 4ull << ((ctr >> 16) & 0xf); /* DminLine: log2 of words */
+	for (a = (u64)(usize)p & ~(line - 1); a < end; a += line)
+		__asm__ volatile("dc cvac, %0" : : "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
 }
 
 static long psci_cpu_on(u64 target_mpidr, u64 entry_phys, u64 context_id)
@@ -583,6 +599,14 @@ int smp_boot_aps(void)
 			 * it has returned. An SMC that never comes back leaves the
 			 * first of those on screen, which is the one thing the return
 			 * code cannot tell us. */
+			/* What _ap_start reads before its MMU is on -- which CPU it
+			 * is, and where the page tables are -- plus its stack, from RAM:
+			 * nothing had written them back. On QEMU, which models no cache,
+			 * the uncleaned lines were never a problem; on a real core the
+			 * new CPU read zeroes, took index 0 and a root table of 0. */
+			dcache_clean_poc(g_aff0_to_cpu, sizeof(g_aff0_to_cpu));
+			dcache_clean_poc(&g_ap_ttbr0, sizeof(g_ap_ttbr0));
+			dcache_clean_poc(g_ap_sp, sizeof(g_ap_sp));
 			BOOTMARK(80 + index);
 			long rc = psci_cpu_on(target, (u64)(usize)&_ap_start, index);
 			BOOTMARK(90 + index);
@@ -601,10 +625,18 @@ int smp_boot_aps(void)
 		 * is accepted, and a spin-table write returns before the CPU polls. The bound is generous and the failure is reported, not
 		 * fatal — a machine that comes up with fewer CPUs than its tree lists
 		 * is still a working machine. */
+		/* Bounded in time, not iterations: a vCPU on a loaded host can take
+		 * longer to be scheduled than any fixed spin count allows. */
 		int ready = 0;
-		for (int spin = 0; spin < 500000 && !ready; spin++) {
+		u64 freq, now, deadline;
+
+		__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+		__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(now));
+		deadline = now + 2 * freq;
+		while (!ready && now < deadline) {
 			ready = __atomic_load_n(&g_percpu[index].cpu_online, __ATOMIC_ACQUIRE);
 			cpu_relax();
+			__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(now));
 		}
 		if (!ready) {
 			/* Its stack and block stay allocated on purpose: the CPU may
@@ -643,10 +675,14 @@ int smp_boot_aps(void)
 	return get_online_cpu_count();
 }
 
-/* A CPU parked in the WFE above wakes on an event; making work runnable is
- * one. The x86_64 counterpart sends a reschedule IPI, which this does not need
- * — SEV is a broadcast event, and the loop re-checks the runqueues on waking. */
+/* Wake the other CPUs to look at the runqueues. SEV reaches a secondary still
+ * in the phase-1 WFE loop; a CPU idling in the full scheduler waits in WFI,
+ * which SEV does not end, so it gets the reschedule SGI as well. Without it a
+ * task made READY for such a CPU waited for that CPU's own next tick: a 200 us
+ * ppoll took two ticks, 21 ms. */
 void ipi_reschedule_all(void)
 {
 	__asm__ volatile("sev" ::: "memory");
+	if (get_online_cpu_count() > 1)
+		gicv3_send_resched_others();
 }

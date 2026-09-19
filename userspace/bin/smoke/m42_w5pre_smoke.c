@@ -71,8 +71,59 @@ static void sigusr1_handler(int sig) {
     g_sigusr1_count++;
 }
 
-int main(void) {
+/* The exec'd half of exec-drops-altstack: no alternate stack may have
+ * survived the exec, and an SA_ONSTACK handler must still run (on the ordinary
+ * stack). Exit status says which part failed. */
+static int altstack_child(void) {
+    stack_t cur;
+    if (sigaltstack(NULL, &cur) != 0 || !(cur.ss_flags & SS_DISABLE))
+        return 2;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigusr1_handler;
+    sa.sa_flags = SA_ONSTACK;
+    sigaction(SIGUSR1, &sa, NULL);
+    raise(SIGUSR1);
+    return g_sigusr1_count == 1 ? 0 : 3;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--altstack-child") == 0)
+        return altstack_child();
     emit("M42-W5PRE: start\n");
+
+    /* execve drops the alternate signal stack (POSIX). The parent sets one,
+     * the child execs this program again, and the new image must not find it:
+     * a stack left over points into memory the new image does not have, and
+     * the first SA_ONSTACK handler then died building its frame there (podman
+     * starting catatonit from a Go process). */
+    {
+        static char altbuf[64 * 1024];
+        stack_t ss;
+        memset(&ss, 0, sizeof(ss));
+        ss.ss_sp = altbuf;
+        ss.ss_size = sizeof(altbuf);
+        int set = sigaltstack(&ss, NULL);
+        pid_t pid = set == 0 ? fork() : -1;
+        if (pid == 0) {
+            execl("/proc/self/exe", argv[0], "--altstack-child", (char *)0);
+            execl(argv[0], argv[0], "--altstack-child", (char *)0);
+            _exit(9);
+        }
+        int st = 0;
+        int waited = pid > 0 && waitpid(pid, &st, 0) == pid;
+        ss.ss_flags = SS_DISABLE;
+        sigaltstack(&ss, NULL);
+        if (waited && WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+            ok("exec-drops-altstack");
+        } else {
+            char b[96];
+            snprintf(b, sizeof(b), "exec-drops-altstack: set=%d pid=%d status=0x%x\n",
+                     set, (int)pid, st);
+            emit(b);
+            fail("exec-drops-altstack");
+        }
+    }
 
     /* 1. RLIMIT_NOFILE resource limits */
     struct rlimit rlim;

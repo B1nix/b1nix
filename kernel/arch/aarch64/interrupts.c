@@ -572,6 +572,13 @@ static void aarch64_irq_handler_inner(struct interrupt_frame *frame)
 		return;
 	}
 
+	/* Nothing to do but leave WFI: the idle loop that was sleeping there looks
+	 * at the runqueues again on its own. */
+	if (irq == GICV3_SGI_RESCHED && gicv3_present()) {
+		gic_eoi(iar);
+		return;
+	}
+
 	if (irq == TIMER_IRQ) {
 		timer_rearm();
 

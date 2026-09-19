@@ -34,7 +34,51 @@ static struct netdev *netdev_best(void);
 static void net_reset_interface_state(struct netdev *nd);
 
 static struct netdev *g_netdev;
-static struct netdev *g_receiving_netdev;
+/* The interface a frame is being received on, and how deeply deliveries are
+ * nested, PER TASK. Both were single words for the machine, which held only
+ * while one CPU ran the whole network stack: with userspace on the secondaries
+ * a sender's synchronous veth delivery and net_task's poll of the NIC run at
+ * once, and each overwrote the other's receiving interface mid-frame -- a
+ * datagram then demultiplexed as if it had come in on the wrong device, in the
+ * wrong namespace, and vanished (M109 netns-ipv4-source-select). A delivery
+ * can sleep (a reply inside it waits for ARP), so per CPU would not do either.
+ * Keyed by task id + 1 (0 = free), claimed for the length of a delivery. */
+#define NET_RX_SLOTS 32
+struct net_rx_slot {
+	usize key;
+	struct netdev *dev;
+	int depth;
+};
+static struct net_rx_slot net_rx[NET_RX_SLOTS];
+
+static struct net_rx_slot *net_rx_self(int claim)
+{
+	usize key = scheduler_current_task_id() + 1;
+
+	for (int i = 0; i < NET_RX_SLOTS; i++)
+		if (__atomic_load_n(&net_rx[i].key, __ATOMIC_ACQUIRE) == key)
+			return &net_rx[i];
+	if (!claim)
+		return 0;
+	for (int i = 0; i < NET_RX_SLOTS; i++) {
+		usize expect = 0;
+
+		if (__atomic_compare_exchange_n(&net_rx[i].key, &expect, key, 0,
+		                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+			net_rx[i].dev = 0;
+			net_rx[i].depth = 0;
+			return &net_rx[i];
+		}
+	}
+	return 0;
+}
+
+/* Give the slot back once nothing of this task's is being received. */
+static void net_rx_done(struct net_rx_slot *slot)
+{
+	if (slot && !slot->depth && !slot->dev)
+		__atomic_store_n(&slot->key, 0, __ATOMIC_RELEASE);
+}
 static struct netdev *g_netdevs[NET_MAX_NETDEVS];
 static usize g_netdev_count;
 
@@ -215,8 +259,9 @@ void netdev_unregister(struct netdev *nd)
 		g_netdev = next;
 		net_reset_interface_state(next);
 	}
-	if (g_receiving_netdev == nd)
-		g_receiving_netdev = 0;
+	for (int i = 0; i < NET_RX_SLOTS; i++)
+		if (net_rx[i].dev == nd)
+			net_rx[i].dev = 0;
 }
 
 /* The device a namespace routes through — the one its IPv4 configuration
@@ -260,7 +305,12 @@ int netdev_holds_address(struct netdev *nd)
 	struct net_v4_addr_info one;
 	return net_ipv4_addr_list(nd->netns, &one, 1) != 0;
 }
-struct netdev *netdev_receiving(void) { return g_receiving_netdev; }
+struct netdev *netdev_receiving(void)
+{
+	struct net_rx_slot *slot = net_rx_self(0);
+
+	return slot ? slot->dev : 0;
+}
 
 /* M84: interface indices. Registration order defines a stable 1-based index
  * (0 means "unspecified" in the FIB — route out of whatever is active), and
@@ -1247,7 +1297,7 @@ static void net_task(void *arg)
 void net_init(void)
 {
 	g_netdev = 0;
-	g_receiving_netdev = 0;
+	memset(net_rx, 0, sizeof(net_rx));
 	g_netdev_count = 0;
 	memset(g_netdevs, 0, sizeof(g_netdevs));
 	memset(&local_mac, 0, sizeof(local_mac));
@@ -1382,25 +1432,26 @@ int netdev_transmit_frame(struct netdev *nd, const u8 hdr[14],
  * bridge port on a bond is three, and anything past that is a stacking loop
  * rather than a configuration. */
 #define NET_RX_MAX_DEPTH 4
-static volatile int net_rx_depth;
-
 void net_deliver_frame(struct netdev *dev, const void *frame, usize len,
                        u32 rx_flags)
 {
 	if (!dev || !frame || len < 14)
 		return;
-	if (__atomic_fetch_add(&net_rx_depth, 1, __ATOMIC_ACQUIRE) >=
-	    NET_RX_MAX_DEPTH) {
-		__atomic_fetch_sub(&net_rx_depth, 1, __ATOMIC_RELEASE);
+	struct net_rx_slot *slot = net_rx_self(1);
+
+	if (!slot || slot->depth >= NET_RX_MAX_DEPTH) {
+		net_rx_done(slot);
 		return;
 	}
-	struct netdev *prev = g_receiving_netdev;
-	g_receiving_netdev = dev;
+	slot->depth++;
+	struct netdev *prev = slot->dev;
+	slot->dev = dev;
 	u32 prev_ns = namespace_net_push_context(dev->netns);
 	ethernet_receive_flags(frame, len, rx_flags);
 	namespace_net_pop_context(prev_ns);
-	g_receiving_netdev = prev;
-	__atomic_fetch_sub(&net_rx_depth, 1, __ATOMIC_RELEASE);
+	slot->dev = prev;
+	slot->depth--;
+	net_rx_done(slot);
 }
 
 /* ── Loopback deferral queue (see net.h) ── */
@@ -1518,14 +1569,24 @@ void net_poll(void)
 
 	tcp_timer_tick();
 
+	/* Restores what was there rather than clearing it: a sender waiting for
+	 * ARP inside a delivery polls from here, and the delivery it returns to
+	 * still needs its own receiving interface. */
+	struct net_rx_slot *slot = net_rx_self(1);
+	struct netdev *prev = slot ? slot->dev : 0;
+
 	for (usize i = 0; i < g_netdev_count; i++) {
 		struct netdev *polled = g_netdevs[i];
 		if (!polled || !polled->poll)
 			continue;
-		g_receiving_netdev = polled;
+		if (slot)
+			slot->dev = polled;
 		u32 prev_ns = namespace_net_push_context(polled->netns);
 		polled->poll(polled);
 		namespace_net_pop_context(prev_ns);
 	}
-	g_receiving_netdev = 0;
+	if (slot) {
+		slot->dev = prev;
+		net_rx_done(slot);
+	}
 }
