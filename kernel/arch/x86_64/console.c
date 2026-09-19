@@ -521,6 +521,15 @@ void console_log_panic_flush(void)
  * without an in-guest dump the only evidence is a truncated log. */
 volatile u64 g_console_write_seq;
 
+/* The ramoops console zone, which kernel/dev/ufs.c mirrors to flash. That zone
+ * is an SM8150 board's reserved SRAM; this machine has none, so the mirror has
+ * nothing to copy -- the driver is built for both arches and asks either way. */
+const u8 *console_ramoops_zone(u32 *size)
+{
+	(void)size;
+	return 0;
+}
+
 void console_write(const char *text)
 {
 	u64 flags;
