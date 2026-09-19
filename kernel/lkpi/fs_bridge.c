@@ -166,6 +166,61 @@ void *lkpi_bridge_mount(const char *fstype, const char *source,
 	return root;
 }
 
+/*
+ * Remount read-only or read-write, as reconfigure_super() does upstream: a
+ * reconfigure context over the mount's root, the filesystem's ->reconfigure
+ * under s_umount held for write, then the new flags on the superblock.
+ *
+ * ext4 does the real work in __ext4_remount: going read-only it syncs, writes
+ * the journal out and marks the superblock clean. Without it a "read-only"
+ * remount only changed b1nix's own mount flags, and the next mount replayed
+ * the journal ("recovery complete") after every clean shutdown.
+ *
+ * A filesystem on the old interface (no init_fs_context) keeps the previous
+ * behaviour: its data is synced and nothing else changes.
+ */
+int lkpi_bridge_remount(void *rootp, unsigned long flags)
+{
+	struct dentry *root = rootp;
+	struct super_block *sb;
+	struct file_system_type *type;
+	struct fs_context fc;
+	unsigned int want = (flags & SB_RDONLY) ? SB_RDONLY : 0;
+	int err;
+
+	if (!root || !root->d_sb)
+		return -EINVAL;
+	sb = root->d_sb;
+	type = sb->s_type;
+	if ((sb->s_flags & SB_RDONLY) == want)
+		return 0;
+	if (!type || !type->init_fs_context) {
+		lkpi_bridge_sync_fs(root);
+		return 0;
+	}
+	memset(&fc, 0, sizeof(fc));
+	fc.fs_type = type;
+	fc.purpose = FS_CONTEXT_FOR_RECONFIGURE;
+	fc.root = root;
+	fc.sb_flags = want;
+	fc.sb_flags_mask = SB_RDONLY;
+	fc.user_ns = &init_user_ns;
+	err = type->init_fs_context(&fc);
+	if (!err && !(fc.ops && fc.ops->reconfigure))
+		err = -EOPNOTSUPP;
+	if (!err) {
+		down_write(&sb->s_umount);
+		err = fc.ops->reconfigure(&fc);
+		if (!err)
+			sb->s_flags = (sb->s_flags & ~fc.sb_flags_mask) |
+			              (fc.sb_flags & fc.sb_flags_mask);
+		up_write(&sb->s_umount);
+	}
+	if (fc.ops && fc.ops->free)
+		fc.ops->free(&fc);
+	return err;
+}
+
 void lkpi_bridge_unmount(void *rootp)
 {
 	struct dentry *root = rootp;

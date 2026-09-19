@@ -476,14 +476,22 @@ struct lkpi_task *kthread_create_on_node(int (*threadfn)(void *data),
                                          void *data, int node,
                                          const char namefmt[], ...)
 {
+	char name[16]; /* TASK_COMM_LEN */
+	va_list ap;
+
 	(void)node;
 	/*
+	 * `namefmt` is a format and callers pass arguments for it: jbd2 names its
+	 * thread "jbd2/%s" after the device. Handed on unformatted, that was the
+	 * name /proc and ps showed. The scheduler copies the string.
+	 *
 	 * b1nix's kthread entry returns void and Linux's returns int, so the
-	 * adapter is on the other side of the boundary (kernel/lkpi/fs_misc.c) —
-	 * it is also where the name is turned into b1nix's plain string, since
-	 * `namefmt` is a format here and btrfs passes arguments for it.
+	 * adapter is on the other side of the boundary (kernel/lkpi/fs_misc.c).
 	 */
-	return lkpi_fs_kthread_run(threadfn, data, namefmt);
+	va_start(ap, namefmt);
+	vsnprintf(name, sizeof(name), namefmt, ap);
+	va_end(ap);
+	return lkpi_fs_kthread_run(threadfn, data, name);
 }
 
 /* The b1nix side owns the stop flag and the join; see kernel/lkpi/fs_misc.c. */

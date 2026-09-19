@@ -408,6 +408,10 @@ struct vfs_inode {
                    u64 *trimmed);
   int (*statfs_cb)(struct vfs_node *node, struct b1nix_statfs *st);
   int (*fsync_cb)(struct vfs_node *node);
+  /* On a mount's root: mount(MS_REMOUNT) changed the flags; tell the
+   * filesystem (going read-only is where it writes itself out clean). NULL
+   * leaves the remount a change of b1nix's own mount flags. */
+  int (*remount_cb)(struct vfs_node *root, u64 flags);
   int (*poll_cb)(struct vfs_node *node, struct b1nix_pollfd *pfd);
   /* Called once per open(), after the handle exists, so a device can attach
    * per-descriptor state (h->private_data) and take over h->ops. Without it a

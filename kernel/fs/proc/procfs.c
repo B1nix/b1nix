@@ -1507,7 +1507,9 @@ static void proc_comm(const struct task *t, char out[PROC_COMM_LEN]) {
    * this" check reads. */
   const char *chosen = t ? scheduler_comm_override(t->id) : 0;
   const char *name = chosen ? chosen : ((t && t->name) ? t->name : "?");
-  const char *base = strrchr(name, '/');
+  /* The basename of an exec path. A kernel thread's name is not a path, and a
+   * '/' in it is part of the name, as in Linux's "jbd2/sda1-8". */
+  const char *base = (t && t->pml4_phys == 0) ? 0 : strrchr(name, '/');
   base = base ? base + 1 : name;
   if (!*base) /* trailing slash, e.g. a directory exec path */
     base = name;
@@ -3226,11 +3228,20 @@ static int w_pid_timens_offsets(usize pid, const char *buf, usize len) {
   return namespace_time_offsets_write(t, buf, len);
 }
 
+/* Marks a pid directory as the root's own listing (vfs_child_is_fs_cache: same
+ * release_cb as the directory). A pid directory outlives its task -- they are
+ * never pruned -- and the VFS lists every in-memory child a second time, after
+ * the filesystem's readdir, unless it is marked so. Unmarked, the dead pids the
+ * root readdir filters out came back through that second pass: ps and
+ * OpenRC's kill_all read "(gone)" for them. Nothing to release. */
+static void procfs_listed_release(struct vfs_node *node) { (void)node; }
+
 static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
                                            const char *name, usize pid) {
   struct vfs_node *d = procfs_mkchild(parent, name, VFS_DIRECTORY, 0, 0);
   if (!d)
     return 0;
+  d->inode->release_cb = procfs_listed_release;
   procfs_make_exe_symlink(d, pid);
   procfs_mkchild(d, "status", VFS_DEVICE, r_pid_status, pid);
   procfs_mkchild(d, "cmdline", VFS_DEVICE, r_pid_cmdline, pid);
@@ -3744,6 +3755,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   root->inode->readdir_cb = procfs_root_readdir;
   root->inode->lookup_cb = procfs_root_lookup;
   root->inode->readdir_lists_children = 1;
+  root->inode->release_cb = procfs_listed_release;
   {
     /* The instance belongs to the mounting task's PID namespace, and holds it
      * for as long as the mount lives. */

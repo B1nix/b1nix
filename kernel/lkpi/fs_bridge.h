@@ -59,6 +59,8 @@ long lkpi_bridge_write(void *node, unsigned long long off, const char *buf,
                        unsigned long len);
 int lkpi_bridge_sync(void *node);
 int lkpi_bridge_sync_fs(void *root);
+/* Read-only (flags & 1) or read-write, through the filesystem's reconfigure. */
+int lkpi_bridge_remount(void *root, unsigned long flags);
 
 int lkpi_bridge_iterate(void *dir, unsigned long long cookie,
                         unsigned long long *next, lkpi_bridge_emit_fn emit,

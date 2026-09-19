@@ -7043,7 +7043,15 @@ int vfs_remount(const char *target, u64 flags) {
     mounts[i].flags = (flags & ~(u64)(MS_REMOUNT | MS_PROPAGATION_MASK));
     found = 1;
   }
+  struct vfs_node *mroot = found ? mounts[top].root_node : 0;
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+  /* The filesystem's half, outside the table lock: it may sleep. A bind
+   * remount (MS_BIND) changes one mount's flags, not the superblock. */
+  if (mroot && mroot->inode && mroot->inode->remount_cb && !(flags & MS_BIND)) {
+    int rc = mroot->inode->remount_cb(mroot, flags);
+    if (rc != 0)
+      return rc;
+  }
   if (!found && bootinfo_has_flag("b1nix.trace-mount")) {
     char rl[320];
     snprintf(rl, sizeof(rl), "remount: no mount recorded at '%s'", canon);

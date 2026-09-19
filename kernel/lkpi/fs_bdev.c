@@ -102,16 +102,13 @@ static int bdev_read_folio(struct file *file, struct folio *folio)
 static int bdev_writepages(struct address_space *mapping,
                            struct writeback_control *wbc)
 {
-	(void)mapping;
+	extern int lkpi_write_dirty_buffers(struct address_space *mapping);
+
 	(void)wbc;
-	/*
-	 * Nothing writes the device through its page cache yet: a filesystem's
-	 * metadata writes go through its own bios, and this mapping exists to be
-	 * READ from. Reporting success for a writeback that did nothing would be
-	 * a lie, and reporting an error would fail an fsync that had nothing to
-	 * do — so it reports that it wrote nothing, which is true.
-	 */
-	return 0;
+	/* A filesystem marks buffers of this mapping dirty and expects a writeback
+	 * of it to write them: jbd2's recovery does exactly that. Each dirty buffer
+	 * goes out through its own bio. */
+	return lkpi_write_dirty_buffers(mapping) < 0 ? -EIO : 0;
 }
 
 static const struct address_space_operations bdev_aops = {
@@ -487,8 +484,25 @@ bool bdev_iter_is_aligned(struct block_device *bdev, struct iov_iter *iter)
 
 int sync_blockdev(struct block_device *bdev)
 {
+	extern int lkpi_write_dirty_buffers(struct address_space *mapping);
+
 	if (!bdev || !bdev->bd_b1nix)
 		return 0;
+	/*
+	 * The device's dirty buffers first, as upstream's filemap_write_and_wait
+	 * on bd_mapping does, then b1nix's block cache to the medium.
+	 *
+	 * This used to flush the block cache only. jbd2's recovery replays every
+	 * committed transaction into the device's buffers, marks them dirty, calls
+	 * this -- and then marks the journal empty, with FUA. The replayed blocks
+	 * were never written: after any unclean shutdown the transactions the
+	 * journal existed to save were dropped, and ext4 found block bitmaps
+	 * disagreeing with their group descriptors (on the phone, after every
+	 * forced reset).
+	 */
+	if (bdev->bd_inode && bdev->bd_inode->i_mapping &&
+	    lkpi_write_dirty_buffers(bdev->bd_inode->i_mapping) < 0)
+		return -EIO;
 	lkpi_blk_flush(bdev->bd_b1nix);
 	return 0;
 }

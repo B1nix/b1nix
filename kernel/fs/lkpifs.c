@@ -344,6 +344,11 @@ void lkpifs_sync_all(void)
 	}
 }
 
+static int lkpifs_remount(struct vfs_node *root, u64 flags)
+{
+	return lkpi_bridge_remount(node_handle(root), (flags & MS_RDONLY) ? 1ul : 0ul);
+}
+
 static struct vfs_node *lkpifs_mount_type(const char *linux_name,
                                           const char *source, u64 flags)
 {
@@ -378,6 +383,7 @@ static struct vfs_node *lkpifs_mount_type(const char *linux_name,
 		lkpi_bridge_unmount(root_handle);
 		return ERR_PTR(-ENOMEM);
 	}
+	root->inode->remount_cb = lkpifs_remount;
 	lkpifs_roots_set(0, root_handle);
 	/* The root's handle belongs to the mount, not to the node: releasing it
 	 * is an unmount, which umount_cb does. */
