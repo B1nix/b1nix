@@ -54,6 +54,7 @@
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
+#include <linux/fs.h>
 #include <linux/errno.h>
 #include <linux/iosys-map.h>
 #include <linux/pci.h>
@@ -306,6 +307,7 @@ static void b1nix_pipe_enable(struct drm_simple_display_pipe *pipe,
 static void b1nix_pipe_disable(struct drm_simple_display_pipe *pipe)
 {
 	(void)pipe;
+	lkpi_scanout_release();
 }
 
 /*
@@ -906,7 +908,17 @@ static const struct drm_ioctl_desc b1nix_drm_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(VIRTGPU_WAIT, b1nix_ioctl_wait, DRM_RENDER_ALLOW),
 };
 
+/* b1nix serves the device's file operations itself (kernel/lkpi/drm_chardev.c),
+ * so these are never called. They exist because the imported PRIME export
+ * reads dev->driver->fops->owner for every dma-buf it makes, and a driver
+ * without fops panicked the first compositor that exported a dumb buffer
+ * (wlroots does, for every scanout buffer). */
+static const struct file_operations b1nix_drm_fops = {
+	.owner = THIS_MODULE,
+};
+
 static const struct drm_driver b1nix_drm_driver = {
+	.fops = &b1nix_drm_fops,
 	/* DRIVER_RENDER: the driver ioctls below are served on the render node,
 	 * which is what a client that only wants to draw opens -- it needs no
 	 * master lease and no modeset rights. */
@@ -967,6 +979,11 @@ static int b1nix_drm_bringup(struct b1nix_drm *b)
 		u16 vendor = 0, device = 0;
 		u8 bus = 0, slot = 0, func = 0;
 
+		/* A boot framebuffer has no PCI function behind it (the phone has
+		 * no PCI at all, and a config read there would not return); the
+		 * parent is a display-class stub. */
+		if (lkpi_scanout_is_bootfb())
+			goto parent_ready;
 		if (lkpi_scanout_pci_id(&vendor, &device, &bus, &slot, &func) != 0)
 			return -ENODEV;
 		b->pdev.bus_nr = bus;
@@ -980,6 +997,7 @@ static int b1nix_drm_bringup(struct b1nix_drm *b)
 		b->pdev.subsystem_vendor = vendor;
 		b->pdev.subsystem_device = 0x0010;
 		pci_read_config_byte(&b->pdev, 0x08, &b->pdev.revision);
+parent_ready:
 		b->pdev.class = 0x030000; /* display / VGA-compatible */
 		/* Imported code reads pdev->bus->number rather than bus_nr; a null
 		 * bus pointer is a fault waiting for the first reader. */

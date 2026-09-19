@@ -316,6 +316,9 @@ int lkpi_vsnprintf(char *buf, usize cap, const char *fmt, __builtin_va_list ap);
  */
 int lkpi_scanout_ready(void);
 void lkpi_scanout_mode(u32 *width, u32 *height);
+/* The scanout is the bootloader's framebuffer, not a virtio-gpu (see env.c). */
+int lkpi_scanout_is_bootfb(void);
+void lkpi_scanout_release(void);
 
 /* Where the scanout device sits on the PCI bus, and what it says it is.
  *

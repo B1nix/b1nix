@@ -1059,6 +1059,29 @@ static int w_sys_ptrace_scope(usize pid, const char *buf, usize len) {
 }
 
 #ifdef __aarch64__
+/* /proc/sys/kernel/touch: the Xperia 5 touchscreen (kernel/dev/sec_ts.c) is
+ * started by writing 1; reading gives its state (1 running, <0 the step that
+ * failed, 0 not started). */
+int sec_ts_start(void);
+int sec_ts_state(void);
+
+void sec_ts_describe(char *buf, usize len);
+
+static int r_sys_touch(usize pid, struct sbuf *s) {
+  char line[160];
+  (void)pid;
+  sec_ts_describe(line, sizeof(line));
+  sb_addf(s, "%s", line);
+  return 0;
+}
+
+static int w_sys_touch(usize pid, const char *buf, usize len) {
+  (void)pid;
+  if (len && buf[0] == '1')
+    sec_ts_start();
+  return (int)len;
+}
+
 /* /proc/last_kmsg: the previous boot's console, as Android names it. Filled
  * on the Xperia 5 from the flash copy of the log (kernel/dev/ufs.c), empty
  * where there is none. */
@@ -3845,6 +3868,9 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
       procfs_mkchild(kern, "overflowgid", VFS_DEVICE, r_sys_overflowgid, 0);
       procfs_mkchild(kern, "cap_last_cap", VFS_DEVICE, r_sys_cap_last_cap, 0);
       procfs_mkchild(kern, "threads-max", VFS_DEVICE, r_sys_threads_max, 0);
+#ifdef __aarch64__
+      procfs_mkchild_writable(kern, "touch", r_sys_touch, w_sys_touch);
+#endif
       struct vfs_node *rnd =
           procfs_mkchild(kern, "random", VFS_DIRECTORY, 0, 0);
       if (rnd) {

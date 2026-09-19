@@ -32,6 +32,7 @@
 #include <b1nix/sysfs_attr.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/virtio_gpu.h>
+#include <b1nix/fb_console.h>
 #include <b1nix/tlb.h>
 #include <b1nix/drm.h>
 #include <b1nix/vfs.h>
@@ -798,11 +799,39 @@ int lkpi_vsnprintf(char *buf, usize cap, const char *fmt, __builtin_va_list ap)
 
 /* ── the scanout ────────────────────────────────────────────────── */
 
-int lkpi_scanout_ready(void) { return virtio_gpu_ready(); }
+/* No virtio-gpu, but a framebuffer the bootloader left lit (the Xperia 5's
+ * panel): with b1nix.drm-bootfb the DRM device scans out into that instead,
+ * so a compositor gets a card0 on a machine with no display driver of ours.
+ * Opt-in, because it takes the panel away from the kernel console. */
+int lkpi_scanout_is_bootfb(void)
+{
+  return !virtio_gpu_ready() && fb_console_ready() && fb_console_bpp() == 32 &&
+         bootinfo_has_flag("b1nix.drm-bootfb");
+}
+
+int lkpi_scanout_ready(void)
+{
+  return virtio_gpu_ready() || lkpi_scanout_is_bootfb();
+}
 
 void lkpi_scanout_mode(u32 *width, u32 *height)
 {
+  if (lkpi_scanout_is_bootfb()) {
+    *width = fb_console_width();
+    *height = fb_console_height();
+    return;
+  }
   virtio_gpu_get_mode(width, height);
+}
+
+/* The console gives the panel up while a DRM client draws, and gets it back
+ * (and repaints) when the pipe is disabled. */
+void lkpi_scanout_release(void)
+{
+  if (!lkpi_scanout_is_bootfb())
+    return;
+  fb_console_set_hidden(0);
+  fb_console_present_all();
 }
 
 /* ── capabilities ────────────────────────────────────────────────── */
@@ -917,6 +946,26 @@ int lkpi_virgl_capset_ids(u64 *mask) { return virtio_gpu_virgl_capset_ids(mask);
 int lkpi_scanout_present(const u32 *pixels, u32 width, u32 height, u32 dirty_x,
                          u32 dirty_y, u32 dirty_w, u32 dirty_h)
 {
+  if (lkpi_scanout_is_bootfb()) {
+    volatile u8 *front = (volatile u8 *)fb_console_frontbuffer();
+    u32 pitch = fb_console_pitch();
+
+    if (!front || width > fb_console_width() || height > fb_console_height())
+      return -1;
+    fb_console_set_hidden(1);
+    if (dirty_x + dirty_w > width)
+      dirty_w = width - dirty_x;
+    if (dirty_y + dirty_h > height)
+      dirty_h = height - dirty_y;
+    for (u32 y = dirty_y; y < dirty_y + dirty_h; y++) {
+      volatile u32 *dst = (volatile u32 *)(front + (u64)y * pitch) + dirty_x;
+      const u32 *src = pixels + (u64)y * width + dirty_x;
+
+      for (u32 x = 0; x < dirty_w; x++)
+        dst[x] = src[x];
+    }
+    return 0;
+  }
   /* The damage rectangle comes from the atomic commit that produced this
    * frame — a caller with nothing better to say passes the whole frame. The
    * cursor arguments say "leave it as it is" rather than moving or hiding it. */

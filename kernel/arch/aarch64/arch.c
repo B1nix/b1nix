@@ -764,6 +764,38 @@ u32 aarch64_platform_watchdog_disable(void)
 	return wdt[QCOM_WDT_EN / 4];
 }
 
+/* b1nix.watchdog: keep the APSS watchdog armed (bite at 15 s) and pet it from
+ * a kernel thread every second. A machine that stops scheduling -- a CPU
+ * spinning with interrupts off, a register read that never returns -- is then
+ * reset instead of sitting dead until somebody holds the power key, and the
+ * log mirror's last copy becomes /proc/last_kmsg on the next boot. */
+static void watchdog_pet_thread(void *arg)
+{
+	volatile u32 *wdt = (volatile u32 *)(usize)QCOM_WDT_BASE;
+
+	(void)arg;
+	for (;;) {
+		wdt[QCOM_WDT_RST / 4] = 1;
+		scheduler_sleep_ticks(sched_tick_hz());
+	}
+}
+
+void aarch64_platform_watchdog_arm(void)
+{
+	volatile u32 *wdt = (volatile u32 *)(usize)QCOM_WDT_BASE;
+	const u32 ticks = 15u * 32768u;	/* sleep-clock ticks */
+
+	if (platform_type() != PLATFORM_SM8150 || !bootinfo_has_flag("b1nix.watchdog"))
+		return;
+	wdt[QCOM_WDT_RST / 4] = 1;
+	wdt[QCOM_WDT_BARK / 4] = ticks;
+	wdt[QCOM_WDT_BITE / 4] = ticks;
+	wdt[QCOM_WDT_EN / 4] = 1;
+	__asm__ volatile("dsb sy" ::: "memory");
+	kthread_create("wdog-pet", watchdog_pet_thread, 0);
+	console_write("watchdog: armed, 15 s\n");
+}
+
 /* Reset the board by letting the watchdog bite: pet, bark out of the way, bite
  * almost at once, enable, and wait. Returns only on a board without it. */
 void aarch64_platform_watchdog_bite(void)

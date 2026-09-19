@@ -377,8 +377,18 @@ static isize input_read(struct vfs_handle *h, char *buf, usize size) {
         continue; /* not part of this device's Linux contract */
       struct linux_input_event le;
       u32 hz = sched_tick_hz() ? sched_tick_hz() : 100;
-      le.tv_sec = (i64)(e->time_ticks / hz);
-      le.tv_usec = (i64)((e->time_ticks % hz) * (1000000ull / hz));
+      /* On CLOCK_MONOTONIC, which is what libinput asks for (EVIOCSCLOCKID)
+       * and compares against: the tick count starts late in boot, and
+       * stamps taken from it ran ~9 s behind every timer libinput armed
+       * ("scheduled expiry is in the past"). The event's age in ticks,
+       * taken back from the monotonic clock now. */
+      u64 now_ticks = scheduler_get_uptime_ticks();
+      u64 age_ns = now_ticks > e->time_ticks
+                       ? (now_ticks - e->time_ticks) * (1000000000ull / hz) : 0;
+      u64 now_ns = ktime_monotonic_ns();
+      u64 at_ns = now_ns > age_ns ? now_ns - age_ns : 0;
+      le.tv_sec = (i64)(at_ns / 1000000000ull);
+      le.tv_usec = (i64)((at_ns % 1000000000ull) / 1000ull);
       le.type = e->type;
       le.code = e->code;
       le.value = e->value;

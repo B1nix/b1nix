@@ -332,6 +332,13 @@ static int ep_cmd(u32 phys, u32 cmd, u32 p0, u32 p1, u32 p2)
 {
 	u32 reg = DEPCMD_BASE + phys * 0x10;
 
+	/* The TRBs and buffers this command hands over were written through a
+	 * different mapping than the controller's registers, and Device ordering
+	 * holds only within one peripheral: without the barrier the controller
+	 * could fetch a TRB before its HWO bit had landed. The boot CPU got away
+	 * with it; transmits from the secondaries' A76 cores did not (bulk IN
+	 * wedged, "tx dropped, endpoint busy"). Linux's dwc3 has the same wmb. */
+	__asm__ volatile("dsb sy" ::: "memory");
 	wr(g.base, reg + 0x08, p0);
 	wr(g.base, reg + 0x04, p1);
 	wr(g.base, reg + 0x00, p2);
@@ -727,6 +734,9 @@ static void process_events(void)
 
 	if (!count)
 		return;
+	/* The count is a register, the events are DMA'd memory: read them only
+	 * after the count, not speculatively before it. */
+	__asm__ volatile("dsb sy" ::: "memory");
 	for (u32 done = 0; done < count; done += 4) {
 		handle_event(get_le32(g.evt + g.evt_pos));
 		g.evt_pos = (g.evt_pos + 4) % EVT_BUF_SIZE;

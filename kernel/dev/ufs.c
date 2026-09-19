@@ -1165,6 +1165,27 @@ static void ufs_log_flush(void)
 	blk_cache_flush(blk_partition_parent(g_log_part));
 }
 
+/* The same copy from a panic: no block cache, no sleeping. If the UFS host is
+ * mid-command (possibly the very command that panicked), leave it alone --
+ * waiting would hang, and a half-issued command cannot be interleaved with. */
+void ufs_log_panic_flush(void)
+{
+	u32 size = 0;
+	extern const u8 *console_ramoops_zone(u32 *size);
+	const u8 *zone = console_ramoops_zone(&size);
+	static u8 buf[0x40000];
+
+	if (!g_log_part || !zone || !size || size > sizeof(buf))
+		return;
+	struct block_device *disk = blk_partition_parent(g_log_part);
+	struct ufs_lu *lu = disk ? (struct ufs_lu *)disk->priv : 0;
+
+	if (!lu || __atomic_load_n(&lu->host->io_busy, __ATOMIC_ACQUIRE))
+		return;
+	memcpy(buf, zone, size);
+	g_log_part->write_blocks(g_log_part, g_log_sector, size / 512, buf);
+}
+
 static void ufs_log_thread(void *arg)
 {
 	(void)arg;

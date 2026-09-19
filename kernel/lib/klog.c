@@ -8,6 +8,7 @@
 #include <b1nix/lockdep.h>
 #include <b1nix/kprintf.h>
 #include <b1nix/vfs.h>
+#include <b1nix/bootinfo.h>
 #include <b1nix/mm.h>
 #include <b1nix/ftrace.h>
 #include <b1nix/bootinfo.h>
@@ -937,7 +938,38 @@ void panic_at(const char *message, const char *file, int line)
 	/* Ensure final panic dump is fully presented on display */
 	fb_console_present_all();
 
+	panic_reboot_if_asked();
 	arch_halt();
+}
+
+/* panic=N, as on Linux: restart N seconds after a panic instead of halting.
+ * On a machine nobody can reach with a cable (the Xperia 5), this is what
+ * turns a panic into a report: the log is pushed to flash first and read back
+ * after the restart as /proc/last_kmsg. */
+void panic_reboot_if_asked(void)
+{
+	char val[16];
+	u64 secs = 0;
+
+	if (!bootinfo_get_kv("panic", val, sizeof(val)))
+		return;
+	for (const char *p = val; *p >= '0' && *p <= '9'; p++)
+		secs = secs * 10 + (u64)(*p - '0');
+	if (!secs)
+		return;
+	{
+		extern void ufs_log_panic_flush(void);
+		ufs_log_panic_flush();
+	}
+	console_write("panic: restarting in ");
+	console_write_dec(secs);
+	console_write(" s\n");
+	fb_console_present_all();
+	for (u64 i = 0; i < secs * 1000; i++)
+		arch_udelay(1000);
+#if defined(__aarch64__)
+	arch_psci_reset();
+#endif
 }
 
 

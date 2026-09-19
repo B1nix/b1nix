@@ -80,6 +80,8 @@ void dump_task_signals(struct task *t);
 
 void panic_at(const char *message, const char *file, int line) __attribute__((noreturn));
 void panic(const char *message) __attribute__((noreturn));
+/* Restart after a panic when the command line says panic=N (seconds). */
+void panic_reboot_if_asked(void);
 
 #define panic(msg) panic_at((msg), __FILE__, __LINE__)
 

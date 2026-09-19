@@ -720,6 +720,13 @@ void kernel_main(usize arg0, usize arg1)
 	 * Qualcomm node, opt-in with b1nix.ufs). Before the root mount, so a
 	 * partition labelled b1nix-root on it can become /. */
 	ufs_init();
+#ifdef __aarch64__
+	{
+		/* After the log mirror is up, so a watchdog reset leaves a log. */
+		extern void aarch64_platform_watchdog_arm(void);
+		aarch64_platform_watchdog_arm();
+	}
+#endif
 	ufs_selftest();
 	exfat_init();
 	tmpfs_init();

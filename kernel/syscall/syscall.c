@@ -7570,6 +7570,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           klog_debug("audit: chmod called");
           return (u64)vfs_chmod(resolved, (u16)arg2);
         case LX_fchownat:
+          /* arg4 = flags. With AT_SYMLINK_NOFOLLOW (0x100) the link itself
+           * changes owner -- how apk (and tar, cp -a) sets the owner of every
+           * symlink it unpacks. Following it failed with ENOENT whenever the
+           * target did not exist yet, which is the normal case mid-install:
+           * each such link was an apk error, and the install exited 1. */
+          if ((int)arg4 & 0x100)
+            return (u64)vfs_lchown(resolved, (u32)arg2, (u32)arg3);
           return (u64)vfs_chown(resolved, (u32)arg2, (u32)arg3);
         case LX_faccessat2: /* same shape, flags are just advisory here */
         case LX_faccessat: {

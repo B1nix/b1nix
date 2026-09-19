@@ -654,6 +654,7 @@ ifneq ($(filter $(ARCH),aarch64),)
 # is x86-specific — so with a working PCI bus they belong here too.
 KERNEL_SOURCES += kernel/dev/pci.c kernel/dev/ahci.c kernel/dev/nvme.c \
 	kernel/dev/ufs.c \
+	kernel/dev/sec_ts.c \
 	kernel/dev/virtio.c \
 	kernel/dev/r8169.c \
 	kernel/dev/smmuv3.c
@@ -675,6 +676,7 @@ KERNEL_SOURCES += \
 	kernel/dev/ahci.c \
 	kernel/dev/nvme.c \
 	kernel/dev/ufs.c \
+	kernel/dev/sec_ts.c \
 	kernel/dev/ps2_kbd.c \
 	kernel/dev/vt.c \
 	kernel/dev/kmsg.c \
@@ -2494,7 +2496,9 @@ bahamut-fast:
 BAHAMUT_USB_GADGET ?= b1nix.usb-gadget b1nix.net=off b1nix.ssh-external b1nix.netconsole=172.16.42.2:6666
 # boot_a/boot_b writable so a new kernel can be written over ssh:
 #   gzip -c boot.img | ssh root@172.16.42.1 'gunzip -c > /dev/sda38'
-BAHAMUT_UFS_CMDLINE ?= "b1nix.loglevel=6 b1nix.ufs b1nix.ufs-rw=boot_a,boot_b $(BAHAMUT_USB_GADGET)"
+# panic=10: restart after a panic, whose log is then /proc/last_kmsg.
+# b1nix.drm-bootfb: /dev/dri/card* scans out into the panel ABL left lit.
+BAHAMUT_UFS_CMDLINE ?= "b1nix.loglevel=6 b1nix.ufs b1nix.ufs-rw=boot_a,boot_b panic=10 b1nix.watchdog b1nix.drm-bootfb $(BAHAMUT_USB_GADGET)"
 BAHAMUT_ROOTFS_MB ?= 1024
 BAHAMUT_RESCUE_MB ?= 46
 .PHONY: bahamut-ufs
