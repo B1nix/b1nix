@@ -500,6 +500,7 @@ void kernel_main(usize arg0, usize arg1)
 	 * point and the panic path releases it. */
 #ifdef __aarch64__
 	bootinfo_init_from_fdt(arg0);
+	(void)arg1;	/* the FDT is the only boot argument on this arch */
 	/* Before anything else can take longer than the bark timeout: a board
 	 * whose bootloader left a watchdog armed resets mid-boot otherwise. */
 	{

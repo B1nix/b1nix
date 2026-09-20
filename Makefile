@@ -1357,13 +1357,17 @@ ifeq ($(ARCH),aarch64)
 	$(OBJCOPY) -O binary $@ $(BUILD_DIR)/Image
 endif
 
-# make does not watch flags: a KERNEL_OPT change must rebuild every object.
-KERNEL_OPT_HASH := $(firstword $(shell printf '%s' '$(KERNEL_OPT)' | cksum))
-KERNEL_OPT_STAMP := $(BUILD_DIR)/.kernel-opt-$(KERNEL_OPT_HASH)
+# make does not watch flags: a change to KERNEL_OPT or to any -D the build
+# passes (FB_BOOT_MARKERS, FB_FONT_SCALE, ...) must rebuild every object. The
+# phone and the QEMU builds share $(BUILD_DIR); without this a `make bahamut`
+# left arch.o painting boot markers into a framebuffer QEMU virt does not have.
+KERNEL_FLAGS_HASH := $(firstword $(shell printf '%s' \
+	'$(KERNEL_OPT) $(COMMON_CFLAGS) $(ARCH_CFLAGS)' | cksum))
+KERNEL_OPT_STAMP := $(BUILD_DIR)/.kernel-flags-$(KERNEL_FLAGS_HASH)
 
 $(KERNEL_OPT_STAMP):
 	@mkdir -p $(dir $@)
-	@rm -f $(BUILD_DIR)/.kernel-opt-*
+	@rm -f $(BUILD_DIR)/.kernel-flags-* $(BUILD_DIR)/.kernel-opt-*
 	@touch $@
 
 $(BUILD_DIR)/%.o: %.c $(KERNEL_OPT_STAMP)
@@ -1973,7 +1977,7 @@ $(AP_TRAMPOLINE_OFFSETS): $(AP_TRAMP_OBJ)
 		| sed 's/0x00*\([0-9a-f]\)/0x\1/' >> $@
 	@printf '#endif\n' >> $@
 
-$(BUILD_DIR)/%.o: %.S
+$(BUILD_DIR)/%.o: %.S $(KERNEL_OPT_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
