@@ -455,6 +455,7 @@ void drm_card1_init(void) {
       }
     }
     node->inode->mmap_handle_page_phys_cb = card1_mmap_page_phys;
+    node->inode->mmap_wc = 1;
     g_cards[g_card_count].node = node;
     g_cards[g_card_count].minor = minor;
     g_card_count++;
@@ -518,6 +519,7 @@ void drm_card1_init(void) {
       node->inode->mode = 0666;
       node->inode->rdev = ((u64)226 << 8) | (u64)num;
       node->inode->mmap_handle_page_phys_cb = card1_mmap_page_phys;
+    node->inode->mmap_wc = 1;
       /* And in sysfs, under the same device as its card — that pairing is what
        * lets Mesa match an EGL device to the node it should render on. */
       if (g_cards[i].have_ident)

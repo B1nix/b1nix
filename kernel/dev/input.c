@@ -188,7 +188,16 @@ void input_event_counts(u64 *pushed, u64 *delivered, u64 *dropped) {
  * stale position, and still eight times fewer wakes than a gaming mouse's
  * report rate produces. */
 #define INPUT_MOTION_WAKE_MS 8
+/* b1nix.input-wake-ms overrides it (0: wake on every report), for measuring
+ * what the spacing does to a compositor dragging a window. */
+static u32 motion_wake_ms = INPUT_MOTION_WAKE_MS;
 static u64 last_motion_wake_ms;
+/* b1nix.input-stats: one line a second while reports arrive -- how many, how
+ * many woke a reader at once, how many were held by the spacing, and the
+ * longest gap between two reports and the longest hold. Timing as state. */
+static int input_stats_on;
+static u64 st_reports, st_woke, st_held, st_last_report_ns, st_max_gap_ns,
+           st_hold_since_ns, st_max_hold_ns, st_line_ns;
 /* Devices with a report whose wake the spacing held back. Their queues are no
  * longer empty, so no later report would wake the reader either; the next
  * report or the timer tick pays it. */
@@ -204,9 +213,16 @@ void input_tick(void) {
   u32 owed = __atomic_load_n(&wake_owed, __ATOMIC_RELAXED);
 
   if (!owed ||
-      ktime_monotonic_ns() / 1000000ull - last_motion_wake_ms < INPUT_MOTION_WAKE_MS)
+      ktime_monotonic_ns() / 1000000ull - last_motion_wake_ms < motion_wake_ms)
     return;
   owed = __atomic_exchange_n(&wake_owed, 0u, __ATOMIC_ACQ_REL);
+  if (input_stats_on && st_hold_since_ns) {
+    u64 held = ktime_monotonic_ns() - st_hold_since_ns;
+
+    if (held > st_max_hold_ns)
+      st_max_hold_ns = held;
+    st_hold_since_ns = 0;
+  }
   for (int dev = 0; dev < INPUT_NDEVS; dev++)
     if (owed & (1u << dev))
       input_wake_readers(dev);
@@ -298,14 +314,54 @@ void input_event_push(int dev, u16 type, u16 code, i32 value) {
   was_empty = report_found_empty[dev];
   report_found_empty[dev] = 0;
   int owed = (__atomic_load_n(&wake_owed, __ATOMIC_RELAXED) >> dev) & 1;
+  if (input_stats_on && dev == INPUT_DEV_MOUSE) {
+    u64 now_ns = ktime_monotonic_ns();
+
+    st_reports++;
+    if (st_last_report_ns && now_ns - st_last_report_ns > st_max_gap_ns)
+      st_max_gap_ns = now_ns - st_last_report_ns;
+    st_last_report_ns = now_ns;
+    if (now_ns - st_line_ns >= 1000000000ull) {
+      if (st_line_ns) {
+        console_write("input: mouse reports ");
+        console_write_dec(st_reports);
+        console_write(", woke at once ");
+        console_write_dec(st_woke);
+        console_write(", held by spacing ");
+        console_write_dec(st_held);
+        console_write(", max gap ");
+        console_write_dec(st_max_gap_ns / 1000);
+        console_write(" us, max hold ");
+        console_write_dec(st_max_hold_ns / 1000);
+        console_write(" us\n");
+      }
+      st_line_ns = now_ns;
+      st_reports = st_woke = st_held = st_max_gap_ns = st_max_hold_ns = 0;
+    }
+  }
   if (was_empty || urgent || owed) {
-    if (!urgent && now_ms - last_motion_wake_ms < INPUT_MOTION_WAKE_MS) {
+    if (!urgent && now_ms - last_motion_wake_ms < motion_wake_ms) {
       __atomic_fetch_or(&wake_owed, 1u << dev, __ATOMIC_ACQ_REL);
+      if (input_stats_on && dev == INPUT_DEV_MOUSE) {
+        st_held++;
+        if (!st_hold_since_ns)
+          st_hold_since_ns = ktime_monotonic_ns();
+      }
       return;
     }
     __atomic_fetch_and(&wake_owed, ~(1u << dev), __ATOMIC_ACQ_REL);
     if (!urgent)
       last_motion_wake_ms = now_ms;
+    if (input_stats_on && dev == INPUT_DEV_MOUSE) {
+      st_woke++;
+      if (st_hold_since_ns) {
+        u64 held = ktime_monotonic_ns() - st_hold_since_ns;
+
+        if (held > st_max_hold_ns)
+          st_max_hold_ns = held;
+        st_hold_since_ns = 0;
+      }
+    }
     input_wake_readers(dev);
   }
 }
@@ -929,6 +985,13 @@ static void input_sysfs_publish(int i) {
 }
 
 void input_init(void) {
+  motion_wake_ms = bootinfo_get_u32("b1nix.input-wake-ms", INPUT_MOTION_WAKE_MS);
+  input_stats_on = bootinfo_has_flag("b1nix.input-stats");
+  if (motion_wake_ms != INPUT_MOTION_WAKE_MS) {
+    console_write("input: motion wake spacing ");
+    console_write_dec(motion_wake_ms);
+    console_write(" ms\n");
+  }
   evdev_view_init();
   struct vfs_node *dir = vfs_add_node("/dev/input", VFS_DIRECTORY, 0, 0, 0);
   if (!IS_ERR(dir) && dir)

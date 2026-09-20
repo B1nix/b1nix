@@ -11,6 +11,7 @@
 #include <b1nix/kmsg.h>
 #include <b1nix/linux_abi.h>
 #include <b1nix/mm.h>
+#include <b1nix/memtype.h>
 
 /* arch/x86_64/tlb.c; a no-op on a single-CPU boot. */
 void tlb_shootdown_all(void);
@@ -4477,6 +4478,13 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
      * be physically adjacent, so resolve one page at a time instead of
      * extrapolating from a single base. */
     struct vfs_handle *handle = scheduler_fd_get(fd);
+    u64 dev_flags = vmm_flags | VMM_SHARED | VMM_PRESENT;
+#if defined(__x86_64__)
+    /* A framebuffer the display engine reads straight from memory: the
+     * compositor's stores must not sit in the cache (see mmap_wc). */
+    if (node->inode->mmap_wc && pat_available())
+      dev_flags |= VMM_WC;
+#endif
     for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
       u64 phys = 0;
       int rc = node->inode->mmap_handle_page_phys_cb(
@@ -4486,7 +4494,7 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
           vmm_unmap_page(u);
         return (u64)(rc < 0 ? rc : -EINVAL);
       }
-      vmm_map_page(v, phys, vmm_flags | VMM_SHARED | VMM_PRESENT);
+      vmm_map_page(v, phys, dev_flags);
       pmm_ref_frame(phys);
     }
   } else if (node && node->inode && node->inode->type == VFS_DEVICE &&

@@ -447,6 +447,12 @@ struct vfs_inode {
    * for one page at a time. The two are mutually exclusive; this one wins. */
   int (*mmap_handle_page_phys_cb)(struct vfs_handle *handle, u64 offset,
                                   u64 *out_phys);
+  /* Those pages are read by a device that does not snoop the CPU's caches (a
+   * display engine scanning a framebuffer), so userspace's mapping of them
+   * must be write-combining: a cacheable mapping leaves the frame in the
+   * cache and the device reads whatever has been evicted so far. Linux maps
+   * i915's dumb buffers WC for the same reason. */
+  int mmap_wc;
   /* Mapping-lifetime hooks. Called once per VMA, including fork copies and
    * VMA splits, with a matching close on munmap/exec/exit. */
   /* Pages a mapping of this file gets on demand, from the fault handler: the

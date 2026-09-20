@@ -584,6 +584,7 @@ KERNEL_SOURCES := \
 	kernel/mm/secretmem.c \
 	kernel/mm/vma_trace.c \
 	kernel/mm/page_cache.c \
+	kernel/mm/page_audit.c \
 	kernel/mm/swap.c \
 	kernel/mm/eviction.c \
 	kernel/sched/scheduler.c \

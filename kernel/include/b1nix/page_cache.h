@@ -105,6 +105,12 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size);
 // Decrease refcount. If 0, page is eligible for eviction (stays in cache).
 void page_cache_put_page(struct page_cache_entry *page);
 
+/* Page audit (kernel/mm/page_audit.c): every MAP_SHARED file page's PTE frame
+ * against the cache's. b1nix.pageaudit=<s> runs it periodically; the summary
+ * form is /proc/b1nix-pageaudit. */
+void page_audit_init(void);
+usize page_audit_summary(char *buf, usize size);
+
 // Evicts up to target_pages unused pages, writing dirty ones back first.
 usize page_cache_evict(usize target_pages);
 

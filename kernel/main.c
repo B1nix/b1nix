@@ -732,6 +732,7 @@ void kernel_main(usize arg0, usize arg1)
 	}
 #endif
 	ufs_selftest();
+	page_audit_init();
 	exfat_init();
 	tmpfs_init();
 	cgroup_init();   /* cgroup v2 — systemd mounts it before anything else */
@@ -1911,7 +1912,10 @@ void kernel_main(usize arg0, usize arg1)
 	    !bootinfo_has_flag("b1nix.drm-gsmtrap") &&
 	    !bootinfo_has_flag("b1nix.drm-cadence") &&
 	    !bootinfo_get_u32("b1nix.drm-framedump", 0) &&
+	    !bootinfo_get_u32("b1nix.drm-framecap", 0) &&
 	    !bootinfo_has_flag("b1nix.drm-framedump-key") &&
+	    !bootinfo_get_u32("b1nix.pageaudit", 0) &&
+	    !bootinfo_has_flag("b1nix.input-stats") &&
 	    !bootinfo_has_flag("b1nix.sysprof") &&
 	    !bootinfo_has_flag("b1nix.trace-sysfs") &&
 	    !bootinfo_has_flag("b1nix.trace-open")) {

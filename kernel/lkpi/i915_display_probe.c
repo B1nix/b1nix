@@ -105,6 +105,7 @@ static int tearwatch_pipe(void)
 }
 
 static int i915_framedump_thread(void *arg);
+static int i915_framecap_thread(void *arg);
 static void *fd_map_ggtt(struct i915_ggtt *ggtt, u32 ggtt_addr);
 
 /*
@@ -1633,6 +1634,7 @@ void lkpi_i915_start_tearwatch(struct drm_device *dev)
 	     * event path can read the plane registers. */
 	    !lkpi_bootflag("b1nix.drm-eventwatch") &&
 	    !lkpi_bootopt_u32("b1nix.drm-framedump", 0) &&
+	    !lkpi_bootopt_u32("b1nix.drm-framecap", 0) &&
 	    !lkpi_bootflag("b1nix.drm-framedump-key"))
 		return;
 	tearwatch_i915 = dev;
@@ -1653,6 +1655,8 @@ void lkpi_i915_start_tearwatch(struct drm_device *dev)
 		        lkpi_bootopt_u32("b1nix.drm-framedump-every", 250));
 		lkpi_fs_kthread_run(i915_framedump_thread, 0, "i915-framedump");
 	}
+	if (lkpi_bootopt_u32("b1nix.drm-framecap", 0))
+		lkpi_fs_kthread_run(i915_framecap_thread, 0, "i915-framecap");
 }
 
 
@@ -1813,6 +1817,302 @@ next_burst:
 	if (on_key)
 		goto next_burst;
 	pr_info("FD: done\n");
+	return 0;
+}
+
+
+/*
+ * Frame capture: what the display was given, frame by frame, as evidence.
+ *
+ * A window that "tears" while it is dragged can only come about three ways,
+ * and each leaves a different mark:
+ *   1. the display engine latched a new surface in the middle of a scan
+ *      (b1nix.drm-tearwatch sees that: SURFLIVE changing with PIPEDSL in the
+ *      active lines);
+ *   2. somebody wrote into the surface while the display was reading it --
+ *      caught here by hashing the whole surface right after the latch and
+ *      again near the end of the same frame: a front buffer is not written
+ *      between flips, so any difference is a write during scanout;
+ *   3. the compositor handed over a frame that was already wrong -- caught
+ *      here by copying the surface within the first milliseconds after the
+ *      latch, while it is still exactly what the display shows, into a ring
+ *      of the last N frames. The ring is streamed out on Scroll Lock / F12
+ *      in the FD<n> format tools/run/fd-image.py reassembles.
+ *
+ * b1nix.drm-framecap=<N> keeps N frames (8 MiB each at 1080p). The poll is
+ * 1 ms, so the copy starts within a millisecond or two of the latch and takes
+ * a few more; the second hash is taken 13 ms after the latch was noticed.
+ */
+#define FC_MAX_FRAMES 16u
+
+struct fc_frame {
+	u8 *data, *end_data;   /* at the latch, and near the end of the frame */
+	u32 surf, dsl_latch, dsl_copied, dsl_end;
+	u64 t_latch_ns, dt_prev_us, hash_copy, hash_end;
+	/* Where the two copies differ: a bounding box in pixels and the number
+	 * of differing pixels, for a frame written during scanout. */
+	u32 bx0, by0, bx1, by1, diff_px;
+	int valid, front_written;
+};
+
+static u64 fc_hash(const void *p, u32 bytes, u64 h)
+{
+	const u64 *w = p;
+	u32 n = bytes / 8, i;
+
+	for (i = 0; i < n; i++)
+		h = (h ^ w[i]) * 1099511628211ull;
+	return h;
+}
+
+/* One page of the surface, read from memory rather than from a cache line
+ * that predates the compositor's write-combining stores. */
+static int fc_copy_page(struct i915_ggtt *ggtt, u32 addr, u8 *dst)
+{
+	const u8 *src = fd_map_ggtt(ggtt, addr);
+	u32 l;
+
+	if (!src)
+		return -1;
+	for (l = 0; l < 4096; l += 64)
+		asm volatile("clflush (%0)" :: "r"(src + l) : "memory");
+	asm volatile("mfence" ::: "memory");
+	memcpy(dst, src, 4096);
+	return 0;
+}
+
+/* A second copy of the surface into dst, hashed on the way. */
+static u64 fc_copy_live(struct i915_ggtt *ggtt, u32 surf, u32 bytes, u8 *dst)
+{
+	u64 h = 1469598103934665603ull;
+	u32 off;
+
+	for (off = 0; off < bytes; off += 4096) {
+		if (fc_copy_page(ggtt, surf + off, dst + off))
+			return 0;
+		h = fc_hash(dst + off, 4096, h);
+	}
+	return h;
+}
+
+static void fc_diff_box(struct fc_frame *f, u32 width, u32 vdisplay, u32 stride)
+{
+	u32 x, y;
+
+	f->bx0 = width; f->by0 = vdisplay; f->bx1 = 0; f->by1 = 0; f->diff_px = 0;
+	for (y = 0; y < vdisplay; y++) {
+		const u32 *a = (const u32 *)(f->data + y * stride);
+		const u32 *b = (const u32 *)(f->end_data + y * stride);
+
+		for (x = 0; x < width; x++) {
+			if (a[x] == b[x])
+				continue;
+			f->diff_px++;
+			if (x < f->bx0) f->bx0 = x;
+			if (x > f->bx1) f->bx1 = x;
+			if (y < f->by0) f->by0 = y;
+			if (y > f->by1) f->by1 = y;
+		}
+	}
+}
+
+static void fc_emit(struct fc_frame *f, u32 k, u32 width, u32 vdisplay, u32 stride)
+{
+	unsigned step = fd_step();
+	u32 y;
+
+	pr_info("FC: frame %u surf %08x latch dsl %u copied dsl %u end dsl %u "
+	        "since previous flip %llu us hash %016llx/%016llx "
+	        "front-written-during-scanout %d box %u,%u-%u,%u px %u\n", k,
+	        f->surf, f->dsl_latch, f->dsl_copied, f->dsl_end,
+	        (unsigned long long)f->dt_prev_us,
+	        (unsigned long long)f->hash_copy, (unsigned long long)f->hash_end,
+	        f->front_written, f->bx0, f->by0, f->bx1, f->by1, f->diff_px);
+	/* The latch copy as FD<k>, and for a written frame the end-of-frame
+	 * copy as FD<k+1000>, both in fd-image.py's format. */
+	for (y = 0; y < vdisplay; y += step) {
+		u32 x = 0;
+
+		while (x < width) {
+			char line[6 * FD_CHUNK_RGB + 1];
+			u32 got = 0, len = 0;
+
+			while (got < FD_CHUNK_RGB && x < width) {
+				u32 v = *(const u32 *)(f->data + y * stride + x * 4u);
+				int sh;
+
+				for (sh = 20; sh >= 0; sh -= 4)
+					line[len++] = "0123456789abcdef"[(v >> sh) & 15];
+				got++;
+				x += step;
+			}
+			line[len] = 0;
+			pr_info("FD%u %u %u %s\n", k, y, (x - got * step) / step, line);
+		}
+	}
+	if (f->front_written != 1)
+		return;
+	for (y = 0; y < vdisplay; y += step) {
+		u32 x = 0;
+
+		while (x < width) {
+			char line[6 * FD_CHUNK_RGB + 1];
+			u32 got = 0, len = 0;
+
+			while (got < FD_CHUNK_RGB && x < width) {
+				u32 v = *(const u32 *)(f->end_data + y * stride + x * 4u);
+				int sh;
+
+				for (sh = 20; sh >= 0; sh -= 4)
+					line[len++] = "0123456789abcdef"[(v >> sh) & 15];
+				got++;
+				x += step;
+			}
+			line[len] = 0;
+			pr_info("FD%u %u %u %s\n", k + 1000, y, (x - got * step) / step, line);
+		}
+	}
+}
+
+static int i915_framecap_thread(void *arg)
+{
+	struct drm_i915_private *i915 = to_i915_checked(tearwatch_i915);
+	struct intel_display *display = i915->display;
+	struct i915_ggtt *ggtt;
+	struct fc_frame ring[FC_MAX_FRAMES];
+	u32 n = lkpi_bootopt_u32("b1nix.drm-framecap", 8);
+	unsigned int seen_key = ps2_kbd_scrolllock_presses;
+	u32 vdisplay = 0, stride = 0, bytes = 0, width = 0;
+	u32 last_surf = 0, seq = 0, i;
+	u64 last_flip_ns = 0;
+	int pipe;
+
+	(void)arg;
+	if (!i915)
+		return 0;
+	ggtt = to_gt(i915)->ggtt;
+	if (n < 1)
+		n = 1;
+	if (n > FC_MAX_FRAMES)
+		n = FC_MAX_FRAMES;
+	memset(ring, 0, sizeof(ring));
+
+	/* A mode first: the ring is sized from it. */
+	for (;;) {
+		pipe = tearwatch_pipe();
+		vdisplay = tearwatch_vdisplay();
+		if (pipe >= 0 && vdisplay) {
+			stride = intel_uncore_read_fw(&i915->uncore,
+			                              PLANE_STRIDE(pipe, PLANE_PRIMARY));
+			stride = (stride & 0x3ff) * 64u;
+			if (stride)
+				break;
+		}
+		lkpi_sleep_ms(200);
+	}
+	width = stride / 4u;
+	bytes = stride * vdisplay;
+	for (i = 0; i < n; i++) {
+		ring[i].data = vmalloc(bytes);
+		ring[i].end_data = vmalloc(bytes);
+		if (!ring[i].data || !ring[i].end_data) {
+			n = i;
+			break;
+		}
+	}
+	pr_info("i915: framecap: %u frames of %u bytes (%ux%u), Scroll Lock or "
+	        "F12 streams the ring\n", n, bytes, width, vdisplay);
+	if (!n)
+		return 0;
+
+	for (;;) {
+		u32 surf, dsl;
+
+		if (ps2_kbd_scrolllock_presses != seen_key) {
+			u32 k, first = seq >= n ? seq - n : 0;
+
+			seen_key = ps2_kbd_scrolllock_presses;
+			pr_info("FC: key at %llu ms, streaming frames %u..%u\n",
+			        (unsigned long long)(ktime_get_ns() / 1000000ull),
+			        first, seq ? seq - 1 : 0);
+			for (k = first; k < seq; k++) {
+				struct fc_frame *f = &ring[k % n];
+
+				if (f->valid)
+					fc_emit(f, k, width, vdisplay, stride);
+			}
+			pr_info("FC: done\n");
+			last_surf = 0;
+		}
+		pipe = tearwatch_pipe();
+		if (pipe < 0) {
+			lkpi_sleep_ms(200);
+			continue;
+		}
+		surf = intel_uncore_read_fw(&i915->uncore,
+		                            PLANE_SURFLIVE(pipe, PLANE_PRIMARY));
+		if (surf == last_surf) {
+			lkpi_sleep_ms(1);
+			continue;
+		}
+		{
+			struct fc_frame *f = &ring[seq % n];
+			u64 t0 = ktime_get_ns(), h = 1469598103934665603ull;
+			u32 off;
+			int bad = 0;
+
+			dsl = intel_uncore_read_fw(&i915->uncore, PIPEDSL(display, pipe));
+			f->valid = 0;
+			f->surf = surf;
+			f->dsl_latch = dsl;
+			f->t_latch_ns = t0;
+			f->dt_prev_us = last_flip_ns ? (t0 - last_flip_ns) / 1000 : 0;
+			for (off = 0; off < bytes; off += 4096) {
+				if (fc_copy_page(ggtt, surf + off, f->data + off)) {
+					bad = 1;
+					break;
+				}
+				h = fc_hash(f->data + off, 4096, h);
+			}
+			f->hash_copy = h;
+			f->dsl_copied = intel_uncore_read_fw(&i915->uncore,
+			                                     PIPEDSL(display, pipe));
+			last_surf = surf;
+			last_flip_ns = t0;
+			if (bad) {
+				seq++;
+				continue;
+			}
+			/* Near the end of the same frame: the surface must still
+			 * hash the same, or it was written while scanned out. */
+			{
+				u64 el = (ktime_get_ns() - t0) / 1000000ull;
+
+				if (el < 13)
+					lkpi_sleep_ms(13 - (u32)el);
+			}
+			if (intel_uncore_read_fw(&i915->uncore,
+			                         PLANE_SURFLIVE(pipe, PLANE_PRIMARY)) == surf) {
+				f->hash_end = fc_copy_live(ggtt, surf, bytes, f->end_data);
+				f->dsl_end = intel_uncore_read_fw(&i915->uncore,
+				                                  PIPEDSL(display, pipe));
+				f->front_written = f->hash_end != f->hash_copy;
+				if (f->front_written)
+					fc_diff_box(f, width, vdisplay, stride);
+			} else {
+				f->hash_end = 0;
+				f->dsl_end = 0xffffffff;
+				f->front_written = -1;	/* flipped away before the check */
+			}
+			if (f->front_written == 1)
+				pr_info("FC: frame %u surf %08x WRITTEN during scanout "
+				        "(latch dsl %u, checked dsl %u) box %u,%u-%u,%u "
+				        "px %u\n", seq, surf, f->dsl_latch, f->dsl_end,
+				        f->bx0, f->by0, f->bx1, f->by1, f->diff_px);
+			f->valid = 1;
+			seq++;
+		}
+	}
 	return 0;
 }
 

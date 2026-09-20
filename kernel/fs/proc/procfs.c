@@ -1545,6 +1545,18 @@ static int r_b1nix_tasks(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/b1nix-pageaudit — reading it runs the shared-mapping page audit
+ * (kernel/mm/page_audit.c): each mismatch goes to the console, the totals are
+ * the file's text. */
+static int r_b1nix_pageaudit(usize pid, struct sbuf *s) {
+  char buf[256];
+
+  (void)pid;
+  page_audit_summary(buf, sizeof(buf));
+  sb_puts(s, buf);
+  return 0;
+}
+
 /* /proc/b1nix-kheap — reading it prints the kernel heap's live/free blocks by
  * size class to the console. The counterpart to b1nix-tasks: that one answers
  * "what is every task waiting on", this one answers "what is the heap holding",
@@ -3919,6 +3931,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "b1nix-prof", VFS_DEVICE, r_b1nix_prof, 0);
   procfs_mkchild(root, "b1nix-kprof", VFS_DEVICE, r_b1nix_kprof, 0);
   procfs_mkchild(root, "b1nix-tasks", VFS_DEVICE, r_b1nix_tasks, 0);
+  procfs_mkchild(root, "b1nix-pageaudit", VFS_DEVICE, r_b1nix_pageaudit, 0);
   procfs_mkchild(root, "b1nix-kheap", VFS_DEVICE, r_b1nix_kheap, 0);
   /* M107: /proc/kmsg — the same record stream as /dev/kmsg. klogd reads this
    * one and expects it to block until a message arrives. */
