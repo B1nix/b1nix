@@ -30,8 +30,11 @@ lane. Kernel milestones that a phase depends on are named where they block.
   chroot) and `tools/packages/publish-repo.sh` (aptly, signed static tree);
   package versions derived from `git describe`, never typed.
 - [ ] `planned` The signing key and its rotation note, the apt pinning that
-  keeps Debian's `linux-image-*` out, `/etc/os-release`, `SECURITY.md`, the
-  DCO note.
+  keeps Debian's `linux-image-*` out, `/etc/os-release`. `SECURITY.md` and
+  `CONTRIBUTING.md` are written; the address in them is filled in when the
+  domain exists.
+- [ ] `planned` Package contents follow [packaging.md](packaging.md), which is
+  the contract this phase implements.
 - [ ] `planned` Proof: a Debian trixie container adds the repo, `apt install
   b1nix-kernel` succeeds, `dpkg -L` shows the kernel in `/boot`, and pinning
   refuses Debian's kernel.
@@ -65,8 +68,12 @@ Detail in [../kernel/roadmap.md](../kernel/roadmap.md) under M127.
 
 ## Phase D: live ISO and installer
 
-- [ ] `planned` Live ISO from the same debootstrap root: squashfs, overlayfs,
-  autologin into Plasma, the known-issues page on first boot.
+- [ ] `planned` Netinstall ISO from the same debootstrap root: a graphical
+  installer environment, the base system carried for an offline install, the
+  desktop pulled over the network, the known-issues page shown before the first
+  step.
+- [ ] `planned` The size budget fixed as a number (target 900 MB–1.4 GB) and
+  asserted by the lane.
 - [ ] `planned` Calamares with our branding, the btrfs subvolume layout
   (`@`, `@home`, `@snapshots`), ext4 offered, LUKS optional, and a
   `shellprocess` module that installs Limine instead of Calamares' bootloader
@@ -74,15 +81,19 @@ Detail in [../kernel/roadmap.md](../kernel/roadmap.md) under M127.
 - [ ] `planned` The apt snapshot hook and the documented rescue recipe
   (boot the ISO, chroot, reinstall the previous kernel).
 - [ ] `planned` Lane `INSTALL-SMOKE`: unattended install onto a blank disk in
-  QEMU, then boot the installed disk to a login. Exercises Qt, udisks, parted,
+  QEMU, then boot the installed disk to a login; a second run with the network
+  unplugged must still produce a bootable console system. Exercises Qt, udisks, parted,
   loop devices, GPT writes, btrfs and fsync.
 
 ## Phase E: public release 1 — Гнилиці
 
 - [ ] `planned` CI builds packages and both images on a tag, signs them, and
-  publishes to GitHub Releases and Pages; a build manifest beside each image.
+  publishes to GitHub Releases and Pages; a build manifest beside each image,
+  and `b1nix-kernel-dbg` attached to the release.
 - [ ] `planned` The website's four pages: install guide, hardware support,
   known issues, FAQ.
+- [ ] `planned` [release-checklist.md](release-checklist.md) is followed
+  literally; a step that needs judgement is rewritten until it does not.
 - [ ] `planned` `docs/release-checklist.md` run end to end on the reference
   machines (the Intel-graphics laptop, the T480 over PXE, QEMU on both arches).
 - [ ] `planned` Kernel `1.0.0` cut with the release.
@@ -105,9 +116,17 @@ Detail in [../kernel/roadmap.md](../kernel/roadmap.md) under M127.
   other than us, fed by `b1nix-report`.
 - [ ] `planned` Whatever release 1's issue tracker says is most broken.
 
+## Cleanup
+
+Not a phase: filler work between phases, tracked in [cleanup.md](cleanup.md).
+Two items come before phase A, because they would otherwise be packaged by
+accident — `archive/`, and whatever the Alpine rootfs overlay sets that the
+distribution must not inherit.
+
 ## Running alongside
 
-Kernel work does not stop for the phases. M130 (Wi-Fi), M129 (power and
+Kernel work does not stop for the phases. What each remaining gap costs the
+distribution is in [../kernel/abi-gaps.md](../kernel/abi-gaps.md). M130 (Wi-Fi), M129 (power and
 suspend), M125 (io_uring) and M126 (perf, eBPF) each land as a
 `b1nix-kernel` release the overlay ships; the self-host build lane stays as a
 kernel test on release tags.

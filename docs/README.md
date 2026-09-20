@@ -22,8 +22,12 @@ lands when something is installable. They meet in
 | [kernel/networking.md](kernel/networking.md) | Network stack and drivers |
 | [kernel/isolation-and-security.md](kernel/isolation-and-security.md) | Namespaces, capabilities, keys, hardening |
 | [kernel/drivers-and-graphics.md](kernel/drivers-and-graphics.md) | linuxkpi, DRM, i915, the desktop path |
+| [kernel/abi-gaps.md](kernel/abi-gaps.md) | What the kernel lacks, and which package it breaks |
 | [kernel/build-conventions.md](kernel/build-conventions.md) | Build and smoke conventions |
 | [kernel/xperia5-ufs-usb.md](kernel/xperia5-ufs-usb.md) | The SM8150 phone target |
 | [distro/roadmap.md](distro/roadmap.md) | Distribution phases and releases |
 | [distro/plan.md](distro/plan.md) | The full distribution plan, including what gets cut |
+| [distro/packaging.md](distro/packaging.md) | What each overlay package contains and does |
+| [distro/cleanup.md](distro/cleanup.md) | The kernel-only era's leftovers, and how to prove one is dead |
+| [distro/release-checklist.md](distro/release-checklist.md) | The mechanical checklist for cutting a release |
 | [versioning.md](versioning.md) | Kernel, ABI, release and package versions |

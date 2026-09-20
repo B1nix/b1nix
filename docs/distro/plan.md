@@ -21,6 +21,7 @@ to drop when time runs out. The kernel's own milestones are in
 - [Security](#security)
 - [Bootloader and disk layout](#bootloader-and-disk-layout)
 - [Update, rollback and recovery](#update-rollback-and-recovery)
+- [The image and its size](#the-image-and-its-size)
 - [The desktop](#the-desktop)
 - [Hardware support](#hardware-support)
 - [Bug reporting](#bug-reporting)
@@ -43,7 +44,7 @@ to drop when time runs out. The kernel's own milestones are in
 | Base | Debian trixie: glibc, systemd, apt |
 | Packages | Debian archive as-is + own overlay repo (10–20 packages) |
 | Build | Release artifacts on the Linux host; a self-host lane on b1nix as a kernel test |
-| Installer | Calamares |
+| Installer | Calamares, netinstall: the ISO carries the base system, the desktop comes over the network |
 | Hosting | GitHub Releases (ISO) + GitHub Pages (apt repo), no domain at first |
 | Bootloader | Limine on both arches; kernel and initramfs on the ESP |
 | Root filesystem | btrfs with subvolumes, ext4 offered in the installer |
@@ -76,6 +77,10 @@ Own packages, and nothing more:
 | `b1nix-installer-config` | Calamares branding and module configuration |
 | `b1nix-tools` | `b1nix-report`, the netconsole collector, the gdb-stub helper, the boot-timeline script |
 | `b1cc` | already ours |
+
+Package by package, with contents, dependencies and maintainer scripts:
+[packaging.md](packaging.md). What the kernel-only era left behind, and how to
+prove a leftover is dead before deleting it: [cleanup.md](cleanup.md).
 
 Plus patched Debian packages, only when a bug cannot be fixed in the kernel.
 Each one carries a `debian/changelog` entry naming the kernel gap it works
@@ -195,8 +200,8 @@ page". None of it is hard; all of it is easy to forget.
 - **Kernel hardening already in the tree** stays on by default — heap canaries,
   the checks that trip `kheap_validate()`. A hardening flag disabled for
   performance gets a line in the release notes.
-- **Security contact**: a `SECURITY.md` with an address and a 90-day
-  disclosure norm. No CVE process while the audience is enthusiasts, but a
+- **Security contact**: [`SECURITY.md`](../../SECURITY.md) with an address and
+  a 90-day disclosure norm. No CVE process while the audience is enthusiasts, but a
   security fix is a point release, not a "next time" item.
 - **The distribution's own attack surface** is mostly Debian's, and Debian's
   security updates flow through `apt` untouched. What we own is the kernel:
@@ -257,21 +262,63 @@ that, or the first bad update ends someone's interest permanently.
   the installed root with a documented three-line recipe, reinstall the
   previous kernel. Documented in the install guide, tested in the release
   checklist.
+- **Debug symbols are available but not installed.** The shipped kernel is
+  stripped (7.9 MB against 53 MB linked); `b1nix-kernel-dbg` carries the DWARF
+  in the repo and on the release page, matched by build id, so a user's panic
+  can be symbolised without a private build.
 - **`b1nix-report` on a failed boot.** The netconsole and serial paths already
   exist for development; the shipped system should be able to write a panic
   log somewhere that survives a reboot (pstore, or a file on the ESP) so a
   user can attach it to an issue.
+
+## The image and its size
+
+GitHub Releases refuses a file over 2 GB, and a live ISO with Plasma is 2.5–4 GB
+in every distribution that ships one. Rather than host elsewhere before there is
+a domain, the ISO is a **netinstall**: it installs a base system from its own
+contents and pulls the desktop from the network.
+
+The consequences are real and are not hidden from the user:
+
+- **Installing the desktop needs a working network.** There is no Wi-Fi until
+  M130, so at release 1 that means a cable. The install guide says this on the
+  first screen, not in a footnote, and the installer checks for a link before
+  offering the desktop.
+- **The kernel's network stack becomes part of the installer.** DNS, TCP, TLS
+  through `apt`, and an Ethernet driver that binds on the user's machine — a
+  path that used to fail into a smoke log now fails in front of a person. It
+  gets its own lane assertions.
+- **The base system installs offline.** The ISO carries enough to produce a
+  bootable console system with no network at all: kernel, base Debian, the
+  overlay. A user with no cable still ends up with something that boots, and
+  can add the desktop later with `apt install b1nix-desktop`. This is the
+  difference between "needs network" and "useless without network", and it is
+  worth the few hundred megabytes it costs.
+- **The ISO is not 300 MB.** Calamares is Qt, so the installer environment
+  carries a graphical stack; with the offline base included, the honest target
+  is **900 MB–1.4 GB**, comfortably under the limit but nowhere near a classic
+  netinst. The number is fixed at phase D, written into the lane, and a release
+  that exceeds it either drops content or explains itself.
+- **A mirror is a dependency at install time.** If `deb.debian.org` is
+  unreachable, the desktop step fails. The installer treats that as a
+  recoverable step, not a failed install: the base system is already on disk.
+
+The size is enforced, not hoped for: `INSTALL-SMOKE` fails if the ISO exceeds
+the budget, and the release checklist records the actual size.
 
 ## The desktop
 
 - **Plasma on Wayland**, which is what the tree already drives, with an X11
   session installed as the fallback while the compositor path still has known
   bugs.
+- **Plasma minimal, not `kde-standard`**: every extra application is another
+  way to find a kernel bug in a release. The exact Depends/Recommends/Suggests
+  split is in [packaging.md](packaging.md#b1nix-desktop).
 - **Default applications**: a terminal, a file manager, a text editor, a
-  browser, an image viewer, a settings app. All from Debian, chosen once and
-  listed in `b1nix-desktop`. A browser is the hardest consumer in the system
-  and therefore the most valuable default — Firefox ESR from Debian, with
-  Chromium as the known-harder test rather than the default.
+  browser, an image viewer, a settings app. A browser is the hardest consumer
+  in the system and therefore the most valuable default — Firefox ESR from
+  Debian, with Chromium a Suggests: the known-harder test rather than the
+  default.
 - **First boot**: a wizard for user, locale, keyboard, timezone, network. If
   Calamares already asked, the wizard does not ask again — on a live install it
   does nothing but show the known-issues page once.
@@ -341,8 +388,8 @@ The existing smoke suite is the backbone; the distribution adds lanes on top.
   the first tier of bugs in a from-scratch kernel).
 - **Hardware in the loop** — the T480 over PXE and the phone over fastboot, run
   manually at a release, with the checklist below.
-- **The release checklist** lives in `docs/release-checklist.md` and is
-  mechanical: verify the lanes, the reference machines, the rescue recipe, the
+- **The release checklist** lives in [release-checklist.md](release-checklist.md)
+  and is mechanical: verify the lanes, the reference machines, the rescue recipe, the
   signature verification instructions, the known-issues list and the upgrade
   path from the previous release.
 
@@ -379,9 +426,8 @@ later, so it is contained:
   a documented scope.
 - **A build manifest** beside each ISO: every Debian package version that went
   in, the kernel git commit, the toolchain versions.
-- **Size budget** for the ISO, stated and enforced by the lane (GitHub's
-  2 GB per-file limit is the hard ceiling; a desktop ISO should sit far below
-  it).
+- **Size budget** for the ISO, stated and enforced by the lane — see
+  [The image and its size](#the-image-and-its-size).
 - **Artifacts per release**: amd64 ISO, arm64 phone image, `SHA256SUMS` + the
   signature, the build manifest, the release notes, the known-issues list.
 - **Release notes** written from the git log but organised for a user: what is
@@ -407,8 +453,8 @@ The website is the distribution's face and can be a handful of static pages:
 ## Community
 
 - **Issue tracker** on GitHub, with the templates above.
-- **A contribution guide**: DCO sign-off, the commit-message rules already in
-  the tree, how to run the lanes before sending a patch, what "no fake passes"
+- **A contribution guide**: [`CONTRIBUTING.md`](../../CONTRIBUTING.md) — DCO
+  sign-off, the commit-message rules already in the tree, how to run the lanes before sending a patch, what "no fake passes"
   means for a contributor.
 - **A chat or forum** only when there is someone to answer in it; a dead
   channel reads worse than none.
