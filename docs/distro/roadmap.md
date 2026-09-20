@@ -50,11 +50,13 @@ ship to.
 - [ ] `planned` Limine integration: the config template, the `b1nix-kernel`
   postinst that writes it, the ESP layout (kernel and initramfs on FAT at
   `/boot`), two-kernel retention and the fallback entry.
-- [ ] `planned` Boot counting: the ESP counter seeded by the postinst, cleared
-  by a unit on a good boot, reflected in Limine's entry order.
-- [ ] `planned` Lane `DISTRO-SMOKE`: the image boots, `systemctl
-  is-system-running` is `running` or a known `degraded` set, `apt update`
-  works, and a deliberately broken kernel falls back after three tries.
+- [ ] `planned` Boot counting as designed in
+  [boot-counting.md](boot-counting.md): the initramfs hook decrements, a unit
+  marks the boot good, the postinst seeds and regenerates `limine.conf`.
+- [ ] `planned` Lane `DISTRO-SMOKE`, to the contract in [lanes.md](lanes.md):
+  the image boots, `systemctl is-system-running` matches the known-degraded
+  list, `apt update` works, and a deliberately broken kernel falls back after
+  three tries.
 
 ## Phase C: cgroup v2
 
@@ -90,8 +92,11 @@ Detail in [../kernel/roadmap.md](../kernel/roadmap.md) under M127.
 - [ ] `planned` CI builds packages and both images on a tag, signs them, and
   publishes to GitHub Releases and Pages; a build manifest beside each image,
   and `b1nix-kernel-dbg` attached to the release.
-- [ ] `planned` The website's four pages: install guide, hardware support,
-  known issues, FAQ.
+- [ ] `planned` The website's four pages: install guide (drafted in
+  [install-guide.md](install-guide.md)), hardware support (generated from
+  [b1nix-report.md](b1nix-report.md) submissions), known issues, FAQ.
+- [ ] `planned` The pipeline in [ci.md](ci.md), starting with the measurement
+  job that decides what can run in the cloud at all.
 - [ ] `planned` [release-checklist.md](release-checklist.md) is followed
   literally; a step that needs judgement is rewritten until it does not.
 - [ ] `planned` `docs/release-checklist.md` run end to end on the reference

@@ -249,11 +249,10 @@ that, or the first bad update ends someone's interest permanently.
 - **Two kernels always.** `b1nix-kernel` keeps the previous version installed
   and both entries in the bootloader; the previous one is the fallback, and
   the postinst refuses to remove the only known-good kernel.
-- **Boot counting.** The bootloader marks an entry as tried; a boot that
-  reaches the graphical target marks it good. Three failed tries fall back to
-  the previous kernel automatically. This is `systemd-boot`'s
-  `boot-counting`/`bootctl` model and it is worth adopting rather than
-  inventing.
+- **Boot counting.** Three failed tries fall back to the previous kernel
+  automatically. Limine cannot write to disk, so unlike systemd-boot's version
+  this is ours to build: the design, and the reasons each piece sits where it
+  does, are in [boot-counting.md](boot-counting.md).
 - **Filesystem snapshots.** The root is btrfs by default, so the apt hook
   snapshots the `@` subvolume before every upgrade and keeps the last few. The
   bootloader does not read them; recovery is documented as "boot the previous
@@ -342,9 +341,9 @@ the budget, and the release checklist records the actual size.
 - **A hardware compatibility list** on the website, generated from real
   reports, with four states per machine: boots, installs, desktop works,
   daily-usable. Empty honesty beats an aspirational list.
-- **`b1nix-report`** collects what a report needs — CPU, PCI/USB ids, firmware
-  versions, the boot log, which drivers bound — into one file the user can
-  attach. It is also what feeds the compatibility list.
+- **`b1nix-report`** collects what a report needs into one plain-text file the
+  user can read before sending. Fields, privacy rules and the list it feeds:
+  [b1nix-report.md](b1nix-report.md).
 - **Reference machines** that must work at every release, because they are the
   ones on hand: the Intel-graphics laptop, the T480 over PXE, the SM8150
   phone, and QEMU on both arches. Everything else is best-effort.
@@ -372,6 +371,9 @@ the budget, and the release checklist records the actual size.
 ## Quality gates
 
 The existing smoke suite is the backbone; the distribution adds lanes on top.
+
+What a lane must look like — naming, stages, the known-degraded list — is in
+[lanes.md](lanes.md).
 
 - `DISTRO-SMOKE` — the installed image boots to a systemd target,
   `systemctl is-system-running` is `running` or a known `degraded` set,
@@ -417,6 +419,8 @@ later, so it is contained:
 
 ## Release engineering
 
+- **The pipeline** is specified in [ci.md](ci.md), including why the lanes may
+  have to stay on this machine.
 - **Built on the host** with `sbuild` in a pinned trixie chroot;
   `tools/packages/build-deb.sh` and `tools/packages/publish-repo.sh` are the
   only entry points, and both are runnable by hand and from CI.
@@ -438,7 +442,8 @@ later, so it is contained:
 The website is the distribution's face and can be a handful of static pages:
 
 - **Install guide** — verify the signature, write the USB, boot, Secure Boot
-  note, run Calamares, first boot, how to get back if it does not boot.
+  note, run Calamares, first boot, how to get back if it does not boot. Drafted
+  in [install-guide.md](install-guide.md).
 - **Hardware support** — the compatibility list and how to add to it.
 - **Known issues** — per release, honest, linked from the ISO's first boot.
 - **FAQ** — what b1nix is, why a Debian userspace, what is actually ours, is it
