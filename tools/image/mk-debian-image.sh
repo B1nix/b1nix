@@ -86,7 +86,15 @@ DEB_ARCH="${DEB_ARCH:-amd64}"
 # it goes stale on the first point release.
 case "$PROFILE" in
 sysvinit)
-	PACKAGES="${PACKAGES:-procps libproc2-0 libncursesw6 sysvinit-core sysvinit-utils}"
+	# FIO=1 adds Debian's own fio, which has an io_uring engine of its own
+	# (not liburing's): the second consumer M125 is proved against. It needs
+	# dependency resolution, which this profile otherwise does without.
+	_fio_pkgs=""
+	if [ "${FIO:-0}" = "1" ]; then
+		_fio_pkgs=" fio"
+		RESOLVE_DEPS="${RESOLVE_DEPS:-1}"
+	fi
+	PACKAGES="${PACKAGES:-procps libproc2-0 libncursesw6 sysvinit-core sysvinit-utils$_fio_pkgs}"
 	RESOLVE_DEPS="${RESOLVE_DEPS:-0}"
 	;;
 systemd)
@@ -459,6 +467,18 @@ log "staging /b1nix-stage.sh"
 # image, so a change to it takes effect without rebuilding 800 MB of Debian.
 cp "$(dirname "$0")/debian-stage.sh" "$ROOTFS/b1nix-stage.sh"
 chmod 0755 "$ROOTFS/b1nix-stage.sh"
+
+# liburing's own test suite (M125), when tools/image/fetch-liburing.sh has
+# built it. 217 static binaries, about 180 MiB, so the image grows to hold them
+# and the whole thing is opt-in: LIBURING=1, or just having built them.
+LIBURING_DIR="${LIBURING_DIR:-$BUILD_DIR/liburing}"
+if [ "${LIBURING:-auto}" != "0" ] && [ -d "$LIBURING_DIR" ] &&
+	ls "$LIBURING_DIR"/*.t >/dev/null 2>&1; then
+	log "staging liburing's test suite ($(ls "$LIBURING_DIR"/*.t | wc -l) tests)"
+	mkdir -p "$ROOTFS/opt/liburing"
+	cp "$LIBURING_DIR"/*.t "$ROOTFS/opt/liburing/"
+	chmod 0755 "$ROOTFS/opt/liburing"/*.t
+fi
 
 # /etc/inittab is OUR harness configuration for the case where the kernel boots
 # the distro's /sbin/init instead of the stage script directly. sysvinit-core
@@ -1827,6 +1847,14 @@ fi
 # ── 5. ext4 image ───────────────────────────────────────────────────────────
 # b1nix's ext4 driver does NOT implement metadata_csum, 64bit, flex_bg or
 # huge_file — those flags are mandatory, not a preference.
+# The suite is a fifth of a gigabyte on its own, so the image is sized from
+# what is actually in the tree rather than from a constant that was right
+# before it was staged.
+if [ -d "$ROOTFS/opt/liburing" ]; then
+	_lu_mb=$(du -sm "$ROOTFS/opt/liburing" | cut -f1)
+	IMG_SIZE_MB=$((IMG_SIZE_MB + _lu_mb + 64))
+fi
+
 log "building $IMG (${IMG_SIZE_MB} MiB, label $IMG_LABEL)"
 rm -f "$IMG"
 mke2fs -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file,^orphan_file -q \

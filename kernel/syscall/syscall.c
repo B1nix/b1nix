@@ -6265,6 +6265,8 @@ static u64 syscall_dispatch_traced(u64 number, u64 arg0, u64 arg1, u64 arg2,
         case 431: /* fsconfig */
         case 432: /* fsmount */
         case 442: /* mount_setattr */
+        case 426: /* io_uring_enter */
+        case 427: /* io_uring_register */
           ufd = (int)arg0;
           break;
         case 247: /* waitid: the id is a descriptor when idtype is P_PIDFD */

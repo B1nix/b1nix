@@ -598,6 +598,7 @@ KERNEL_SOURCES := \
 	kernel/fs/vfs.c \
 	kernel/fs/landlock.c \
 	kernel/fs/aio.c \
+	kernel/fs/io_uring.c \
 	kernel/fs/vfs_slab.c \
 	kernel/fs/pipe.c \
 	kernel/fs/eventpoll.c \

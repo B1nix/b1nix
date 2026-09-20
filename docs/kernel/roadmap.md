@@ -187,10 +187,10 @@ Per-call state: [processes-and-system-calls.md](processes-and-system-calls.md).
 
 ## M125: io_uring
 
-- [ ] `planned` `io_uring_setup`/`io_uring_enter`/`io_uring_register`: shared SQ/CQ rings mapped into the process, registered files and buffers.
-- [ ] `planned` Operations: read/write (fixed and vectored), fsync, poll, accept/connect/send/recv, timeouts, cancel, linked requests.
-- [ ] `planned` Completion from the existing ISR→wakeup paths (M70) rather than a thread per request; SQPOLL later.
-- [ ] `planned` Proof with liburing's test suite and a distribution consumer (QEMU, fio).
+- [x] `partial` `io_uring_setup`/`io_uring_enter`/`io_uring_register`: shared SQ/CQ rings mapped into the process, registered files (including the sparse and update forms) and registered buffers. The ABI is Linux 6.18.51's uapi header, vendored rather than retyped.
+- [x] `done` Operations: read/write (fixed and vectored), fsync, poll, accept/connect/send/recv, timeouts, cancel, linked requests — and nothing else pretends to work: an unimplemented opcode is `EINVAL` and `IORING_REGISTER_PROBE` says so.
+- [x] `done` Completion from the existing ISR→wakeup paths (M70) rather than a thread per request: a request that would block is armed on its file's readiness and retried from `io_uring_enter`'s wait on `vfs_poll_chan`. SQPOLL and IOPOLL are refused at setup, not faked.
+- [x] `done` Proof: 30 checks in the posix lane drive the rings by hand; liburing 2.12's own 217 tests run in the Debian lane (89 pass, 48 skip, 72 fail and 8 hang — almost all on features refused at setup); `fio --ioengine=io_uring` moves data, plain and with registered files and buffers.
 
 ## M126: Observability
 

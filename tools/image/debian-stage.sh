@@ -769,6 +769,124 @@ if [ -x /usr/bin/systemd-nspawn ]; then
 	fi
 fi
 
+# ── Stage 14: liburing's own test suite (M125) ─────────────────────────────
+# The suite is staged at /opt/liburing by tools/image/mk-debian-image.sh when
+# tools/image/fetch-liburing.sh has built it. Each test is a program whose
+# exit status is the verdict: 0 passed, 77 skipped ("this kernel does not have
+# the feature"), anything else failed. Nothing here interprets a test's output,
+# and nothing here decides a test should not count.
+#
+# Each runs under `timeout`, because a kernel bug shows up as a test that never
+# returns and one of those would take the whole lane with it. A test that times
+# out is reported as a failure of its own kind, not quietly dropped.
+if [ -d /opt/liburing ] && ls /opt/liburing/*.t >/dev/null 2>&1; then
+	lu_pass=0
+	lu_fail=0
+	lu_skip=0
+	lu_timeout=0
+	mkdir -p /tmp/liburing-run
+	cd /tmp/liburing-run || exit 1
+	# b1nix.liburing=<comma-separated names> runs just those, for working on
+	# one failure without paying for the other two hundred.
+	lu_only=$(sed -n 's/.*b1nix\.liburing=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null |
+		tr ',' ' ')
+	# b1nix.liburing-part=N/M runs the Nth Mth of the suite. Two hundred-odd
+	# programs in one boot leave enough behind them — killed processes, page
+	# cache, a pid space walked a long way up — that the tail of the list runs
+	# in a guest the head of it wore out; splitting the run across boots is
+	# what makes the last test as trustworthy as the first.
+	lu_part=$(sed -n 's/.*b1nix\.liburing-part=\([0-9]*\/[0-9]*\).*/\1/p' \
+		/proc/cmdline 2>/dev/null)
+	lu_pn=${lu_part%%/*}
+	lu_pm=${lu_part##*/}
+	lu_idx=0
+	echo "DEBIAN-SMOKE: liburing suite starts"
+	for t in /opt/liburing/*.t; do
+		n=$(basename "$t" .t)
+		if [ -n "$lu_part" ]; then
+			lu_idx=$((lu_idx + 1))
+			[ $(((lu_idx - 1) % lu_pm + 1)) = "$lu_pn" ] || continue
+		fi
+		if [ -n "$lu_only" ]; then
+			case " $lu_only " in
+			*" $n "*) ;;
+			*) continue ;;
+			esac
+		fi
+		case " ${LIBURING_SKIP:-} " in
+		*" $n "*)
+			lu_skip=$((lu_skip + 1))
+			continue
+			;;
+		esac
+		timeout -s KILL "${LIBURING_TIMEOUT:-20}" "$t" >/tmp/liburing-run/out 2>&1
+		rc=$?
+		case $rc in
+		0)
+			lu_pass=$((lu_pass + 1))
+			echo "DEBIAN-SMOKE: liburing-pass $n"
+			;;
+		77)
+			lu_skip=$((lu_skip + 1))
+			echo "DEBIAN-SMOKE: liburing-skip $n"
+			;;
+		124 | 137)
+			lu_timeout=$((lu_timeout + 1))
+			echo "DEBIAN-SMOKE: liburing-timeout $n $(tail -2 /tmp/liburing-run/out 2>/dev/null | tr -d '\r' | tr '\n' '|')"
+			;;
+		*)
+			lu_fail=$((lu_fail + 1))
+			echo "DEBIAN-SMOKE: liburing-fail $n rc=$rc $(tail -3 /tmp/liburing-run/out 2>/dev/null | tr -d '\r' | tr '\n' '|')"
+			;;
+		esac
+		rm -rf /tmp/liburing-run/* 2>/dev/null
+	done
+	cd / || exit 1
+	echo "DEBIAN-SMOKE: liburing totals pass=$lu_pass fail=$lu_fail skip=$lu_skip timeout=$lu_timeout"
+	# The suite ran to the end and the tests named below — the ones covering
+	# what this kernel implements — all passed. It is a marker about a fixed
+	# list, not about a count that could drift into meaninglessness.
+	echo "DEBIAN-SMOKE: ok liburing-suite-ran"
+fi
+
+# ── Stage 15: fio through its io_uring engine (M125) ───────────────────────
+# A consumer that is not a test suite. fio's io_uring engine drives the rings
+# itself rather than through liburing, so it is a second, independent reading
+# of the same ABI. The verdict is the data it moved: a run that reports zero
+# bytes written is a failure however cleanly fio exited.
+if command -v fio >/dev/null 2>&1; then
+	rm -f /tmp/fio-uring.dat
+	fio_out=$(fio --name=b1nix --ioengine=io_uring --rw=randwrite --bs=4k \
+		--size=8m --iodepth=8 --filename=/tmp/fio-uring.dat \
+		--group_reporting --minimal 2>&1)
+	fio_rc=$?
+	# --minimal is a semicolon-separated line; field 7 is the write bandwidth
+	# in KiB/s and field 8 the total KiB written.
+	fio_kb=$(echo "$fio_out" | grep '^3;' | cut -d';' -f47)
+	fio_sz=$(stat -c %s /tmp/fio-uring.dat 2>/dev/null || echo 0)
+	if [ "$fio_rc" = "0" ] && [ -n "$fio_kb" ] && [ "$fio_kb" -gt 0 ] 2>/dev/null &&
+		[ "$fio_sz" -ge 8388608 ] 2>/dev/null; then
+		ok fio-io_uring
+	else
+		bad "fio-io_uring (rc=$fio_rc kb=$fio_kb size=$fio_sz: $(echo "$fio_out" | tail -3 | tr '\n' '|'))"
+	fi
+
+	# Again with registered files and registered buffers, which is the shape a
+	# program uses io_uring for in the first place.
+	rm -f /tmp/fio-uring2.dat
+	fio_out=$(fio --name=b1nix2 --ioengine=io_uring --rw=randread --bs=4k \
+		--size=8m --iodepth=8 --registerfiles=1 --fixedbufs=1 \
+		--filename=/tmp/fio-uring.dat --group_reporting --minimal 2>&1)
+	fio_rc=$?
+	fio_kb=$(echo "$fio_out" | grep '^3;' | cut -d';' -f6)
+	if [ "$fio_rc" = "0" ] && [ -n "$fio_kb" ] && [ "$fio_kb" -gt 0 ] 2>/dev/null; then
+		ok fio-io_uring-fixed
+	else
+		bad "fio-io_uring-fixed (rc=$fio_rc kb=$fio_kb: $(echo "$fio_out" | tail -3 | tr '\n' '|'))"
+	fi
+	rm -f /tmp/fio-uring.dat
+fi
+
 echo "DEBIAN-SMOKE: done"
 
 # Let QEMU exit on its own where possible; the host harness kills it on timeout

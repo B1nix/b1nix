@@ -649,6 +649,9 @@ isize vfs_write(int handle, const char *buffer, usize size);
  * (thread-safe pread/pwrite; non-seekable handles return ESPIPE). */
 isize vfs_pread(int handle, char *buffer, usize size, u64 offset);
 isize vfs_pwrite(int handle, const char *buffer, usize size, u64 offset);
+isize vfs_pread_h(struct vfs_handle *h, char *buf, usize size, u64 offset);
+isize vfs_pwrite_h(struct vfs_handle *h, const char *buf, usize size,
+                   u64 offset);
 /* Same, for kernel-internal users that hold a node rather than a descriptor
  * (the loop driver). They go through the page cache exactly as read()/write()
  * do, which inode->read_cb/write_cb do not. */
@@ -691,6 +694,7 @@ int vfs_fd_abspath(int fd, char *buf, usize size);
  * for, or -EBADF / -EINVAL when the descriptor is not one. */
 int vfs_fd_ns(int fd, int *kind, u32 *id);
 int vfs_fsync(int fd);
+int vfs_fsync_h(struct vfs_handle *h);
 int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags);
 int vfs_umount(const char *target);
@@ -824,6 +828,14 @@ int vfs_bind(int fd, const void *addr, usize addrlen);
 int vfs_listen(int fd, int backlog);
 int vfs_accept(int fd, void *addr, usize *addrlen);
 int vfs_connect(int fd, const void *addr, usize addrlen);
+/* The handle-taking halves, for a caller that holds the open file rather than a
+ * descriptor number (io_uring's registered files). vfs_accept_h still installs
+ * the accepted socket into current_task's descriptor table. */
+int vfs_accept_h(struct vfs_handle *h, void *addr, usize *addrlen);
+int vfs_connect_h(struct vfs_handle *h, const void *addr, usize addrlen);
+isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len,
+                        int flags);
+isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags);
 isize vfs_socket_send(int fd, const void *buf, usize len, int flags);
 /* Does a zero-length write on this descriptor put a message on the wire?
  * True only for a message-oriented AF_UNIX socket, where an empty datagram is

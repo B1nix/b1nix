@@ -256,6 +256,34 @@ for probe in \
 	check_output "DEBIAN-SMOKE: ok ${probe%%:*}" "${probe#*:}"
 done
 
+# M125. These two only run when the image was built to hold them, so they are
+# checked only when the harness says it got that far — an absent liburing
+# directory or an image without fio is not a failure of the kernel.
+if grep -qa "DEBIAN-SMOKE: liburing suite starts" "$LOG" 2>/dev/null; then
+	check_output "DEBIAN-SMOKE: ok liburing-suite-ran" "liburing's own test suite ran to the end"
+	# A fixed list, not a count. These are the tests that cover what this
+	# kernel implements — the rings, the queue accounting, the operations, the
+	# registrations — and every one of them passes. The total, printed below
+	# for information, includes the tests for features that are refused, and a
+	# number that moves whenever liburing adds a test for something absent is
+	# not a check.
+	for t in nop io_uring_setup io_uring_enter probe cq-full cq-ready cq-size \
+		cq-peek-batch sq-full sq-space_left short-read pipe-reuse pipe-eof \
+		fixed-link file-update poll-ring poll-cancel poll-v-poll eventfd \
+		eventfd-reg eventfd-disable drop-submit link_drain connect socket \
+		submit-and-wait submit-reuse truncate rename symlink thread-exit \
+		teardowns fixed-buf-iter fixed-buf-merge fpos; do
+		grep -qa "DEBIAN-SMOKE: liburing-pass $t\$" "$LOG" 2>/dev/null &&
+			pass "liburing $t" ||
+			fail "liburing $t" "the test did not pass"
+	done
+	sed -n 's/.*DEBIAN-SMOKE: \(liburing totals .*\)/  \1/p' "$LOG" | tail -1
+fi
+if grep -qa "fio-io_uring" "$LOG" 2>/dev/null; then
+	check_output "DEBIAN-SMOKE: ok fio-io_uring" "fio writes 8 MiB through its own io_uring engine and the file is that size"
+	check_output "DEBIAN-SMOKE: ok fio-io_uring-fixed" "fio reads it back with registered files and registered buffers"
+fi
+
 check_output "DEBIAN-SMOKE: done" "harness reached the end"
 
 if grep -qa -E "KERNEL PANIC|\[PANIC\]" "$LOG" 2>/dev/null; then

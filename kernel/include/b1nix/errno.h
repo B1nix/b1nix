@@ -82,6 +82,10 @@
 #define EKEYREVOKED 128
 #define EKEYREJECTED 129
 #define EBADFD 77
+/* io_uring returns both: ETIME when a timeout request expires, ECANCELED
+ * for every request a cancel or a failed link took down. Linux's values. */
+#define ETIME 62
+#define ECANCELED 125
 #define ERESTARTSYS     512 /* Restart system call */
 /* Restart only if no handler runs: select, poll, epoll_wait and the SysV IPC
  * waits return EINTR after a handler whatever SA_RESTART says, as on Linux. */

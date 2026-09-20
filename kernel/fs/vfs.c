@@ -4920,11 +4920,14 @@ const struct vfs_file_ops node_file_ops = {
     .poll = node_poll,
 };
 
+/* The handle-based halves of read/write/pread/pwrite/fsync live beside the
+ * fd-taking ones (vfs_handle_read/vfs_handle_write, vfs_pread_h, vfs_pwrite_h,
+ * vfs_fsync_h). io_uring holds a REFERENCE to the open file, not a descriptor
+ * number: a registered file stays usable after the descriptor that registered
+ * it is closed, which is the whole point of registering it. So the fd-taking
+ * form is the thin half and the work lives in the handle-taking one. */
 isize vfs_read(int fd, char *buf, usize size) {
-  struct vfs_handle *h = get_handle(fd);
-  if (!h || !h->ops || !h->ops->read)
-    return -EBADF;
-  return h->ops->read(h, buf, size);
+  return vfs_handle_read(get_handle(fd), buf, size);
 }
 
 int vfs_read_is_direct(int fd) {
@@ -4944,8 +4947,7 @@ isize vfs_read_user(int fd, void *user_buf, usize size) {
  * explicit offsets). Only seekable regular-file handles qualify — a pipe/socket
  * returns ESPIPE. Thread-safe when several threads share the open-file
  * description, unlike an lseek-save-restore around a plain read/write. */
-isize vfs_pread(int fd, char *buf, usize size, u64 offset) {
-  struct vfs_handle *h = get_handle(fd);
+isize vfs_pread_h(struct vfs_handle *h, char *buf, usize size, u64 offset) {
   if (!h)
     return -EBADF;
   if (h->kind != VFS_HANDLE_NODE || !h->node)
@@ -4954,8 +4956,12 @@ isize vfs_pread(int fd, char *buf, usize size, u64 offset) {
   return node_read_impl(h, buf, size, &pos);
 }
 
-isize vfs_pwrite(int fd, const char *buf, usize size, u64 offset) {
-  struct vfs_handle *h = get_handle(fd);
+isize vfs_pread(int fd, char *buf, usize size, u64 offset) {
+  return vfs_pread_h(get_handle(fd), buf, size, offset);
+}
+
+isize vfs_pwrite_h(struct vfs_handle *h, const char *buf, usize size,
+                   u64 offset) {
   if (!h)
     return -EBADF;
   if (h->kind != VFS_HANDLE_NODE || !h->node)
@@ -4965,6 +4971,10 @@ isize vfs_pwrite(int fd, const char *buf, usize size, u64 offset) {
     return -EROFS;
   u64 pos = offset;
   return node_write_impl(h, buf, size, &pos);
+}
+
+isize vfs_pwrite(int fd, const char *buf, usize size, u64 offset) {
+  return vfs_pwrite_h(get_handle(fd), buf, size, offset);
 }
 
 /* Positioned I/O on a node with no open-file description behind it. A
@@ -5033,6 +5043,14 @@ struct vfs_handle *vfs_handle_acquire(int fd) {
 isize vfs_handle_write(struct vfs_handle *h, const void *buf, usize size) {
   if (!h || !h->ops || !h->ops->write)
     return -EBADF;
+
+  /* A read-only mount refuses the write here rather than in vfs_write, because
+   * a caller that holds the open file and not its descriptor number — io_uring
+   * with a registered file — goes straight through this door. */
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(h->node);
+  if (mnt && (mnt->flags & MS_RDONLY))
+    return -EROFS;
+
   return h->ops->write(h, (const char *)buf, size);
 }
 
@@ -5043,15 +5061,7 @@ isize vfs_handle_read(struct vfs_handle *h, void *buf, usize size) {
 }
 
 isize vfs_write(int fd, const char *buf, usize size) {
-  struct vfs_handle *h = get_handle(fd);
-  if (!h || !h->ops || !h->ops->write)
-    return -EBADF;
-
-  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(h->node);
-  if (mnt && (mnt->flags & MS_RDONLY))
-    return -EROFS;
-
-  return h->ops->write(h, buf, size);
+  return vfs_handle_write(get_handle(fd), buf, size);
 }
 
 int vfs_poll(int fd, struct b1nix_pollfd *pfd) {
@@ -6713,10 +6723,15 @@ int vfs_fd_abspath(int fd, char *buf, usize size) {
 }
 
 int vfs_fsync(int fd) {
-  struct vfs_handle *h = scheduler_fd_get(fd);
+  return vfs_fsync_h(scheduler_fd_get(fd));
+}
+
+int vfs_fsync_h(struct vfs_handle *h) {
   if (!h || h->kind != VFS_HANDLE_NODE)
     return -EBADF;
   struct vfs_node *node = h->node;
+  if (!node || !node->inode)
+    return -EBADF;
 
   /* Everything this file owns reaches the medium first, and the device barrier
    * is issued once, at the end.

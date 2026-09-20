@@ -27,7 +27,7 @@ a full Plasma session is what M124 used as its own proof.
 | Gap | What it breaks | Milestone | Observed |
 |---|---|---|---|
 | cgroup v2 controllers (memory, cpu, io, pids), PSI | systemd slices, `MemoryMax`/`CPUWeight`, `systemd-oomd`, `systemctl status` accounting, container limits under podman | M127 | systemd runs as PID 1 (M112) but the resource-control half of its model has nothing behind it |
-| io_uring | Modern userspace that assumes it; a distribution QEMU and `fio` | M125 | — |
+| io_uring: SQPOLL, IOPOLL, provided-buffer rings, multishot, `SENDMSG`/`RECVMSG`, `URING_CMD`, the filesystem opcodes | A program that needs one of these; the ring itself works (M125) and each absence is refused at setup or reported by `IORING_REGISTER_PROBE` | — | liburing's suite in the Debian lane names them |
 | `perf_event_open`, eBPF, kprobes | `perf record`/`perf top`, `bpftrace`, anything in Debian that profiles | M126 | — |
 | `userfaultfd`, `fanotify` | CRIU, live migration, file-access monitoring | M126 | — |
 | Suspend (s2idle, S3), cpufreq, cpuidle | `systemctl suspend`, battery life, a laptop that can be closed | M129 | — |

@@ -364,6 +364,8 @@ BINARIES += $(BUILD)/bin/m63_smoke
 BINARIES += $(BUILD)/bin/m123_smoke
 # M124: memfd_secret, protection keys and quotas.
 BINARIES += $(BUILD)/bin/m124_smoke
+# M125: io_uring.
+BINARIES += $(BUILD)/bin/m125_smoke
 # M127: cgroup v2 resource control, the OOM killer and PSI.
 BINARIES += $(BUILD)/bin/m127_smoke
 # reboot(RESTART2, "bootloader"): the iommu lane ends through it.

@@ -21,6 +21,17 @@ and read-only NTFS are native drivers (M43). NTFS, isofs and a few other pieces
 are loadable modules. `/dev/fuse` exists but is only a placeholder: FUSE
 filesystems do not work yet.
 
+9p's `readdir` is wrong and is the sys lane's `M110-9P: ok readdir` failure.
+`p9_vfs_readdir` (`kernel/fs/9p.c`) passes the VFS's entry INDEX straight to
+`Treaddir` as its offset, but 9P's offset is the opaque cookie the previous
+entry carried (`next_off`, which that function reads and throws away). A second
+call therefore asks the server to resume from a position that means nothing, and
+the listing either loses entries or repeats them until the caller never
+finishes — `fail readdir-find-file` on a loaded host, a hang on a quiet one. The
+fix is to remember the cookie the last call ended on and resume from it. This
+predates M125 and reproduces unchanged at its branch point; it is named here
+because the milestone's full-suite run is what found it.
+
 ## Linux's own ext4 and btrfs (M120)
 
 btrfs, ext4 and jbd2 are compiled unmodified from Linux 6.18.51 on top of the

@@ -1768,7 +1768,14 @@ static usize unix_reported_addrlen(const struct b1nix_sockaddr_un *un) {
 }
 
 int vfs_accept(int fd, void *addr, usize *addrlen) {
-  struct vfs_handle *h = scheduler_fd_get(fd);
+  return vfs_accept_h(scheduler_fd_get(fd), addr, addrlen);
+}
+
+/* The handle-taking half. io_uring holds the listening socket by reference, not
+ * by descriptor number — see the note above vfs_read in kernel/fs/vfs.c. The
+ * accepted socket is still installed into CURRENT_TASK's descriptor table, so
+ * this must be called from the task that is to own the connection. */
+int vfs_accept_h(struct vfs_handle *h, void *addr, usize *addrlen) {
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
@@ -1919,7 +1926,10 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
 }
 
 int vfs_connect(int fd, const void *addr, usize addrlen) {
-  struct vfs_handle *h = scheduler_fd_get(fd);
+  return vfs_connect_h(scheduler_fd_get(fd), addr, addrlen);
+}
+
+int vfs_connect_h(struct vfs_handle *h, const void *addr, usize addrlen) {
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;

@@ -917,8 +917,33 @@ static int lkpifs_fsync(struct vfs_node *node)
 {
 	void *handle = node_handle(node);
 
-	if (!handle)
-		return -EINVAL;
+	if (!handle) {
+		/*
+		 * The name is gone. lkpifs_drop_child released the imported
+		 * filesystem's handle when the file was unlinked, deliberately,
+		 * so the inode could be evicted while the mount is still live
+		 * (the note above it says why); a descriptor already open on
+		 * that file keeps working, and fsync(2) on it must keep working
+		 * too. It returns 0 on Linux, and EINVAL here is what liburing's
+		 * sync_file_range test found.
+		 *
+		 * There is nothing of the file's own left to sync: vfs_fsync_h
+		 * flushed its page cache and wrote this inode's blocks back
+		 * before calling in here. What is left is the barrier, and the
+		 * superblock can still issue that — reached through the nearest
+		 * ancestor that does have a handle.
+		 */
+		struct vfs_node *p = node->parent;
+
+		while (p) {
+			void *ph = node_handle(p);
+
+			if (ph)
+				return lkpi_bridge_sync_fs(ph);
+			p = p->parent;
+		}
+		return 0;
+	}
 	if (node->inode->type == VFS_DIRECTORY)
 		return lkpi_bridge_sync_fs(handle);
 	return lkpi_bridge_sync(handle);
