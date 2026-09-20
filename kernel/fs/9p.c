@@ -703,51 +703,85 @@ static isize p9_vfs_readdir(struct vfs_node *dir, usize offset,
   /* Open dir if needed */
   p9_proto_lopen(p9dev, info->fid, B1NIX_O_RDONLY | B1NIX_O_DIRECTORY);
 
-  struct p9_buffer req, resp;
-  p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
-
-  p9_put_u32(&req, 0);
-  p9_put_u8(&req, P9_TREADDIR);
-  p9_put_u16(&req, 1);
-  p9_put_u32(&req, info->fid);
-  p9_put_u64(&req, (u64)offset);
-  p9_put_u32(&req, (u32)(p9dev->msize - 24));
-
-  usize actual_resp = 0;
-  int err = virtio_9p_transact(p9dev, req.offset, p9dev->msize, &actual_resp);
-  if (err < 0)
-    return err;
-
-  p9_buf_init(&resp, p9dev->resp_buf, actual_resp);
-  p9_get_u32(&resp);
-  u8 type = p9_get_u8(&resp);
-  p9_get_u16(&resp);
-
-  if (type != P9_RREADDIR)
-    return -EIO;
-
-  u32 count = p9_get_u32(&resp);
+  /* TREADDIR's offset is the SERVER's cookie — the `next_off` the server gave
+   * with the last entry it returned — and not the number of entries already
+   * read. The VFS asks by entry index, so the directory is re-read from the
+   * start and the first `offset` entries are skipped. That is what a 9P client
+   * without per-open state can do, and it terminates; passing the index
+   * straight through as a cookie does not. A directory bigger than one reply
+   * needs several TREADDIRs, so this loops until the server returns nothing.
+   *
+   * Passing the index as a cookie is what wedged the M110 9P check: the host's
+   * shared /bin has more entries than one 65 KiB reply carries, so the second
+   * getdents64 asked for a cookie the server read as a position near the
+   * beginning, the same names came back for ever, and the reader never
+   * finished. */
+  u64 cookie = 0;
+  usize skipped = 0;
   usize entries_read = 0;
-  usize start_offset = resp.offset;
 
-  while (resp.offset < start_offset + count && entries_read < max_entries) {
-    struct p9_qid qid;
-    if (p9_get_qid(&resp, &qid) < 0)
-      break;
-    u64 next_off = p9_get_u64(&resp);
-    (void)next_off;
-    u8 dtype = p9_get_u8(&resp);
-    char name[VFS_NAME_MAX];
-    if (p9_get_str(&resp, name, sizeof(name)) < 0)
-      break;
+  while (entries_read < max_entries) {
+    struct p9_buffer req, resp;
 
-    strncpy(buf[entries_read].name, name, 63);
-    buf[entries_read].name[63] = '\0';
-    buf[entries_read].ino = qid.path;
-    buf[entries_read].type = (dtype == 4) ? (u32)VFS_DIRECTORY : (u32)VFS_FILE;
-    buf[entries_read].is_dir = (dtype == 4);
-    buf[entries_read].size = 0;
-    entries_read++;
+    p9_buf_init(&req, p9dev->req_buf, p9dev->msize);
+    p9_put_u32(&req, 0);
+    p9_put_u8(&req, P9_TREADDIR);
+    p9_put_u16(&req, 1);
+    p9_put_u32(&req, info->fid);
+    p9_put_u64(&req, cookie);
+    p9_put_u32(&req, (u32)(p9dev->msize - 24));
+
+    usize actual_resp = 0;
+    int err = virtio_9p_transact(p9dev, req.offset, p9dev->msize, &actual_resp);
+
+    if (err < 0)
+      return entries_read ? (isize)entries_read : err;
+
+    p9_buf_init(&resp, p9dev->resp_buf, actual_resp);
+    p9_get_u32(&resp);
+    u8 type = p9_get_u8(&resp);
+
+    p9_get_u16(&resp);
+    if (type != P9_RREADDIR)
+      return entries_read ? (isize)entries_read : -EIO;
+
+    u32 count = p9_get_u32(&resp);
+
+    if (count == 0)
+      break; /* end of directory */
+
+    usize start_offset = resp.offset;
+    int progressed = 0;
+
+    while (resp.offset < start_offset + count && entries_read < max_entries) {
+      struct p9_qid qid;
+
+      if (p9_get_qid(&resp, &qid) < 0)
+        break;
+      u64 next_off = p9_get_u64(&resp);
+      u8 dtype = p9_get_u8(&resp);
+      char name[VFS_NAME_MAX];
+
+      if (p9_get_str(&resp, name, sizeof(name)) < 0)
+        break;
+      cookie = next_off;
+      progressed = 1;
+      if (skipped < offset) {
+        skipped++;
+        continue;
+      }
+      strncpy(buf[entries_read].name, name, 63);
+      buf[entries_read].name[63] = '\0';
+      buf[entries_read].ino = qid.path;
+      buf[entries_read].type = (dtype == 4) ? (u32)VFS_DIRECTORY : (u32)VFS_FILE;
+      buf[entries_read].is_dir = (dtype == 4);
+      buf[entries_read].size = 0;
+      entries_read++;
+    }
+    /* A reply that carried no usable entry would loop for ever on the same
+     * cookie; stop instead of asking again. */
+    if (!progressed)
+      break;
   }
 
   return (isize)entries_read;
