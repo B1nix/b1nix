@@ -428,6 +428,23 @@ static int  g_task_execed[TASK_SLOTS];
 /* POSIX nice value (-20..19, 0 default) — see scheduler_set_priority for why
  * this is NOT task->priority. Inherited across fork. */
 static int  g_task_nice[TASK_SLOTS];
+/* Scheduling policy, as sched_setscheduler(2) names them. This kernel has one
+ * runnable class — the stride scheduler — so the only policies it can offer
+ * honestly are the three that are all fair-share and differ in how small a
+ * share they ask for:
+ *
+ *   SCHED_OTHER (0)  the default
+ *   SCHED_BATCH (3)  the same share, for work that is not interactive
+ *   SCHED_IDLE  (5)  whatever is left when nothing else wants the CPU
+ *
+ * SCHED_FIFO, SCHED_RR and SCHED_DEADLINE stay refused: accepting them would
+ * promise real-time behaviour that does not exist here, and a caller that
+ * believes it has a real-time thread makes different decisions.
+ *
+ * Debian's units ask for this in the ordinary course of a boot —
+ * e2scrub_reap.service carries CPUSchedulingPolicy=idle, and systemd fails
+ * the unit outright (status 214/SETSCHEDULER) when the call is refused. */
+static int  g_task_sched_policy[TASK_SLOTS];
 
 /* Stride for one nice value: how far a task's pass advances each time it gives
  * the CPU up. The scheduler then always picks the smallest pass among equal
@@ -450,6 +467,38 @@ int sched_stride_for_nice(int nice) {
   int tickets = 20 - nice;
 
   return 1000 / tickets;
+}
+
+/* The stride a task actually gets: its nice value, unless its policy says it
+ * wants less than any nice value can express.
+ *
+ * SCHED_IDLE is not "nice 19": nice 19 still competes, and idle is meant to
+ * yield to everything that is not idle. Three times the largest nice stride is
+ * the same shape of answer Linux gives (weight 3 against nice 19's 15) — a
+ * share small enough to disappear under load without ever being zero, because
+ * a task that can never run is a hang, not a policy. */
+int sched_stride_for_policy(int policy, int nice) {
+  int stride = sched_stride_for_nice(nice);
+
+  if (policy == SCHED_IDLE) {
+    int idle = sched_stride_for_nice(19) * 3;
+    return stride > idle ? stride : idle;
+  }
+  return stride;
+}
+
+/* sched_setscheduler(2): the three fair-share policies, and nothing else. */
+int sched_set_policy(struct task *t, int policy) {
+  if (policy != SCHED_OTHER && policy != SCHED_BATCH && policy != SCHED_IDLE)
+    return -EINVAL;
+  if (!t)
+    return -ESRCH;
+  g_task_sched_policy[task_index(t)] = policy;
+  return 0;
+}
+
+int sched_get_policy(struct task *t) {
+  return t ? g_task_sched_policy[task_index(t)] : SCHED_OTHER;
 }
 
 static struct rlimit g_task_rlimits[TASK_SLOTS][16];
@@ -1291,6 +1340,7 @@ static struct task *find_unused_task(int user) {
       g_task_alarm_interval_ticks[i] = 0;
       g_task_execed[i] = 0;
       g_task_nice[i] = 0;
+      g_task_sched_policy[i] = SCHED_OTHER;
       linux_modern_task_reset(i);
       g_task_fdlock_owner[i] = 0;
       g_task_exiting[i] = 0;
@@ -2846,6 +2896,8 @@ int scheduler_fork_ctid(u64 child_tid_addr) {
   g_task_alarm_ticks[c_idx] = 0;
       g_task_alarm_interval_ticks[c_idx] = 0;
   g_task_nice[c_idx] = g_task_nice[p_idx]; /* POSIX: nice survives fork */
+  /* and so does the policy, which is what SCHED_RESET_ON_FORK exists to undo */
+  g_task_sched_policy[c_idx] = g_task_sched_policy[p_idx];
   linux_modern_fork_inherit(p_idx, c_idx); /* memory policy */
   arch_pkru_fork(parent, child);
   g_task_tgid[c_idx] = child->id;          /* child is its own thread group leader */
@@ -4783,7 +4835,8 @@ static int scheduler_yield_inner(void) {
   if (old_task->state == TASK_RUNNING) {
     /* Stride Scheduler: increment pass of yielding task by its stride */
     usize old_idx = task_index(old_task);
-    int stride = sched_stride_for_nice(g_task_nice[old_idx]);
+    int stride = sched_stride_for_policy(g_task_sched_policy[old_idx],
+                                         g_task_nice[old_idx]);
     g_task_pass[old_idx] += stride;
 
     /* M28 T4: claim the kernel stack BEFORE publishing state=READY. Under T4

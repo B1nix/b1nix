@@ -154,6 +154,11 @@ run_build() { # name staged-dir
 	_name="$1"
 	_dst="$2"
 	_rel="${_dst#"$ROOT_DIR"/}"
+	# The version string carries the commit, so every rebuild leaves a
+	# .changes behind naming .debs that have since been moved to $OUT. lintian
+	# then exits non-zero over a missing file rather than over a tag, and the
+	# build looks broken when it is not.
+	rm -f "$OUT/src/${_name}_"*.changes "$OUT/src/${_name}_"*.buildinfo
 	log "building $_name in the $SUITE chroot"
 	sh "$CHROOT" run "cd '/src/$_rel' && dpkg-buildpackage -b -us -uc" ||
 		die "$_name failed to build -- the rendered source is at $_dst"
@@ -186,5 +191,19 @@ done
 
 # dpkg-buildpackage writes beside the source directory, which is $OUT/src.
 find "$OUT/src" -maxdepth 1 -name '*.deb' -exec mv -f {} "$OUT/" \;
+
+# Keep one version of each package. Between tags the version carries the
+# commit, so every rebuild adds a file rather than replacing one, and
+# publish-repo then sees an older build beside the new one and refuses the
+# whole publish over a version that sorts backwards. The output directory holds
+# what was built now; the repository is the place with history.
+for d in "$OUT"/*.deb; do
+	[ -f "$d" ] || continue
+	_pkg=$(basename "$d" | sed 's/_.*//')
+	_ver=$(basename "$d" | sed 's/^[^_]*_//; s/_[^_]*$//')
+	[ "$_ver" != "$DEB_VERSION" ] || continue
+	log "removing superseded $(basename "$d")"
+	rm -f "$d"
+done
 log "packages in $OUT:"
 ls -1 "$OUT"/*.deb 2>/dev/null | sed 's|.*/|  |' >&2 || die "no .deb was produced"

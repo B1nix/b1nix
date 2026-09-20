@@ -150,7 +150,12 @@ enter() {
 		# LC_ALL=C keeps the locale of the host out of the chroot: every perl
 		# tool in there otherwise warns about locales it does not have, which
 		# buries the output that matters.
-		LC_ALL=C LANG=C chroot "$r" /bin/sh -c "$CHROOT_CMD"
+		# A PATH of the chroot, not of the host: the host PATH has no
+		# /usr/sbin, and dpkg refuses to configure a package when it cannot
+		# find ldconfig or start-stop-daemon ("2 expected programs not found").
+		LC_ALL=C LANG=C \
+		PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+			chroot "$r" /bin/sh -c "$CHROOT_CMD"
 	'
 }
 

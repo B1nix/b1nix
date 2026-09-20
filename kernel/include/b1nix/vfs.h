@@ -741,6 +741,15 @@ int vfs_remount(const char *target, u64 flags);
  * vfs_mounts() should ask for this rather than assume MAX_MOUNTS, and must
  * heap-allocate it. */
 usize vfs_mount_capacity(void);
+
+/* A counter that moves whenever the mount table changes.
+ *
+ * Linux reports a mount change by making /proc/self/mountinfo poll-ready with
+ * POLLPRI|POLLERR, and that notification is not a convenience: systemd starts
+ * a mount unit, runs mount(8), and then waits to be told the mount appeared.
+ * Without the wake-up it decides the mount never happened and fails the unit
+ * with "Result: protocol" -- while the filesystem is, in fact, mounted. */
+u64 vfs_mount_generation(void);
 /* Inode references: the inode is freed at the last put when unlinked. */
 struct vfs_inode *vfs_inode_get(struct vfs_inode *inode);
 void vfs_inode_put(struct vfs_inode *inode);

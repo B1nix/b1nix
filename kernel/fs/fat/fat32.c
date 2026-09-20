@@ -584,6 +584,26 @@ static struct vfs_fs fat32_vfs = {
     .mount = fat32_vfs_mount_cb,
 };
 
+/* The names Linux answers to for the same filesystem. Every fstab, every
+ * installer and every /etc/fstab systemd generates says "vfat" -- Linux has
+ * not called it "fat32" since the three drivers were merged -- so a kernel
+ * that only knows "fat32" answers "unknown filesystem type 'vfat'" and the EFI
+ * system partition never mounts. The boot-counting state lives on that
+ * partition, which is how this showed up: a machine whose /boot was empty
+ * because nothing could mount it.
+ *
+ * "msdos" is the same driver on Linux too, short names and all; this one reads
+ * long names either way, which is a superset and not a lie about the format. */
+static struct vfs_fs vfat_vfs = {
+    .name = "vfat",
+    .mount = fat32_vfs_mount_cb,
+};
+
+static struct vfs_fs msdos_vfs = {
+    .name = "msdos",
+    .mount = fat32_vfs_mount_cb,
+};
+
 int fat32_mount(struct block_device *dev, const char *mount_point) {
     if (!dev) return -ENODEV;
     return vfs_mount(dev->name, mount_point, "fat32", 0);
@@ -591,4 +611,6 @@ int fat32_mount(struct block_device *dev, const char *mount_point) {
 
 void fat32_init(void) {
     vfs_register_fs(&fat32_vfs);
+    vfs_register_fs(&vfat_vfs);
+    vfs_register_fs(&msdos_vfs);
 }

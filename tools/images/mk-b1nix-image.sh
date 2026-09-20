@@ -97,6 +97,11 @@ in_rootfs "apt-get update -qq" || die "apt-get update failed in the root tree"
 # image then carries yesterday kernel while every timestamp says otherwise --
 # which cost an afternoon of chasing a fix that was already in the tree.
 in_rootfs "apt-get clean" || die "could not clear the apt cache in the root tree"
+# A build interrupted mid-install leaves dpkg half-configured, and every later
+# run then refuses with "dpkg was interrupted". Finishing the previous run is
+# the repair dpkg itself asks for, and it costs nothing when there is nothing
+# to finish.
+in_rootfs "dpkg --configure -a" >/dev/null 2>&1 || true
 in_rootfs "DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall b1nix-kernel b1nix-kernel-$RELEASE b1nix-base-files b1nix-tools" ||
 	die "installing the overlay failed"
 
@@ -120,7 +125,13 @@ in_rootfs "ESP=/boot ROOT_SPEC=LABEL=$ROOT_LABEL /usr/sbin/b1nix-update-bootload
 in_rootfs "sed -i 's|^root:[^:]*:|root::|' /etc/shadow" || true
 in_rootfs "systemctl enable b1nix-boot-good.service" ||
 	log "could not enable b1nix-boot-good.service -- the fallback will never be cleared"
-in_rootfs "systemctl enable serial-getty@ttyS0.service" || true
+# No serial getty. systemd will not start one until `dev-ttyS0.device` exists,
+# and that unit is created from a udev event this kernel does not send for the
+# serial port -- so the job waits its 90 seconds, fails, and takes the rest of
+# the boot with it often enough to make the lane useless. The console is read
+# through -serial anyway. The missing uevent is a kernel gap with its own entry
+# in docs/kernel/abi-gaps.md, not something to paper over here.
+in_rootfs "systemctl disable serial-getty@ttyS0.service" >/dev/null 2>&1 || true
 # Put the shipped source back, and take the local one away: the installed
 # system points at the published repository, not at a path on the build host.
 [ ! -f "$SHIPPED_SOURCE.build-disabled" ] || mv "$SHIPPED_SOURCE.build-disabled" "$SHIPPED_SOURCE"
@@ -187,6 +198,15 @@ say "state=$(systemctl is-system-running 2>/dev/null)"
 systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | while read -r u; do
 	[ -n "$u" ] || continue
 	say "failed-unit=$u"
+	# Why, not just which. A list of unit names sends the reader back into the
+	# guest; the status lines usually name the syscall or the path that failed.
+	systemctl status --no-pager --lines=0 "$u" 2>/dev/null |
+		grep -E "Process|Failed|error|Invalid|Operation|status=|Result" | head -3 |
+		while read -r why; do say "why[$u]=$why"; done
+	# And what the unit itself said before it died. journald works now, so the
+	# message that names the failing path or call is usually right here.
+	journalctl -u "$u" --no-pager -n 3 -o cat 2>/dev/null |
+		while read -r jl; do say "log[$u]=$jl"; done
 done
 
 # The boot state, as the machine sees it: which entry booted, how many tries it
@@ -199,7 +219,10 @@ fi
 
 # apt against a repository shared from the host over 9p: no network needed, and
 # it proves the whole path -- mount, read, index parse, install.
-if mount -t 9p -o trans=virtio,version=9p2000.L,ro b1nixrepo /mnt 2>/dev/null; then
+# No options: this kernel's 9p takes the tag and nothing else, which is how
+# the tree's own lanes mount hostshare. trans=/version=/ro made mount(8) answer
+# "bad option" before the kernel ever saw the call.
+if mount -t 9p b1nixrepo /mnt 2>/tmp/9p.err; then
 	say "repo-mounted=yes"
 	printf 'deb [trusted=yes] file:/mnt trixie main\n' >/etc/apt/sources.list.d/b1nix-smoke.list
 	if apt-get update -qq -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/b1nix-smoke.list \
@@ -213,10 +236,27 @@ if mount -t 9p -o trans=virtio,version=9p2000.L,ro b1nixrepo /mnt 2>/dev/null; t
 		fi
 	else
 		say "apt-update=FAIL"
+		apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/b1nix-smoke.list \
+			-o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0 2>&1 |
+			tail -3 | while read -r l; do say "apt-err=$l"; done
 	fi
 else
 	say "repo-mounted=no"
+	while read -r l; do say "9p-err=$l"; done </tmp/9p.err
 fi
+
+# What the kernel says about /tmp, next to what systemd thinks of it. A mount
+# unit that reports "Result: protocol" means systemd could not see its mount
+# appear, so the interesting question is whether the mount is there at all and
+# under which name.
+say "tmp-mounted=$(awk '$5 == "/tmp" {print $5, $9; found=1} END {if (!found) print "no"}' /proc/self/mountinfo | head -1)"
+say "runlock-mounted=$(awk '$5 == "/run/lock" {print $5, $9; found=1} END {if (!found) print "no"}' /proc/self/mountinfo | head -1)"
+say "mountinfo-lines=$(wc -l </proc/self/mountinfo)"
+say "dev-vda=$(ls /dev/vda* 2>&1 | tr '\n' ' ')"
+say "boot-mount-try=$(mount /boot 2>&1 | head -1; echo rc=$?)"
+say "boot-mounted=$(awk '$5 == "/boot" {print $9; found=1} END {if (!found) print "no"}' /proc/self/mountinfo | head -1)"
+# The policy calls Debian units use, answered by the kernel rather than guessed.
+say "sched-idle=$(chrt --idle 0 true 2>&1 | head -1; echo rc=$?)"
 
 say "done"
 systemctl poweroff --no-block 2>/dev/null || { sync; echo o >/proc/sysrq-trigger; }
@@ -242,8 +282,13 @@ UNIT
 in_rootfs "systemctl enable b1nix-smoke.service" || die "could not enable the smoke unit"
 
 printf 'b1nix\n' >"$ROOTFS/etc/hostname"
+# By device, not by label. A label is resolved through /dev/disk/by-label,
+# which udev creates -- and systemd-udevd does not come up on this kernel yet,
+# so a label in fstab means /boot is never mounted and the boot-counting state
+# is invisible to the running system. The image knows its own layout: the ESP
+# is the second partition of the only virtio disk.
 printf 'LABEL=%s / ext4 defaults 0 1\n' "$ROOT_LABEL" >"$ROOTFS/etc/fstab"
-printf 'LABEL=B1NIX-ESP /boot vfat defaults 0 2\n' >>"$ROOTFS/etc/fstab"
+printf '/dev/vda2 /boot vfat defaults,nofail 0 2\n' >>"$ROOTFS/etc/fstab"
 
 if [ "$PROFILE" = "broken" ]; then
 	# A second kernel that boots and then cannot bring userspace up: the

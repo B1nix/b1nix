@@ -1344,8 +1344,35 @@ static int r_mounts(usize pid, struct sbuf *s) {
  * field 3 is the synthetic 8:<blk-index> used by /sys/block + /proc/partitions
  * for a `/dev/<blk>` source, else 0:<mount-index>. Layout:
  *   id parent maj:min root mountpoint opts - fstype source superopts */
+/* What the last reader of /proc/self/mountinfo saw.
+ *
+ * Linux wakes a poll on this file with POLLPRI|POLLERR when the mount table
+ * changes, and systemd depends on it: it starts a mount unit, runs mount(8),
+ * and waits to be told the mount appeared. Without the wake-up it decides the
+ * mount never happened and fails the unit with "Result: protocol" on a machine
+ * where the filesystem is mounted -- which is exactly what Debian's tmp.mount
+ * and run-lock.mount did here.
+ *
+ * One generation for the whole system rather than one per open file: this
+ * kernel's procfs nodes carry no per-descriptor state, and the watcher that
+ * matters is systemd's single monitor. A second watcher would see an event it
+ * has already consumed, which costs it a re-read and nothing else. */
+static u64 g_mountinfo_seen;
+
+static int mountinfo_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+  (void)node;
+  pfd->revents = 0;
+  if (vfs_mount_generation() != __atomic_load_n(&g_mountinfo_seen,
+                                                __ATOMIC_ACQUIRE))
+    pfd->revents |= B1NIX_POLLPRI | B1NIX_POLLERR;
+  return 0;
+}
+
 static int r_mountinfo(usize pid, struct sbuf *s) {
   (void)pid;
+  /* Reading is what acknowledges the change: the next poll is quiet until the
+   * table moves again. */
+  __atomic_store_n(&g_mountinfo_seen, vfs_mount_generation(), __ATOMIC_RELEASE);
   usize cap = vfs_mount_capacity();
   struct b1nix_mount_entry *ents = kmalloc(cap * sizeof(*ents));
 
@@ -3372,7 +3399,11 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_mkchild(d, "comm", VFS_DEVICE, r_pid_comm, pid);
   procfs_mkchild(d, "stat", VFS_DEVICE, r_pid_stat, pid);
   procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, pid);
-  procfs_mkchild(d, "mountinfo", VFS_DEVICE, r_mountinfo, pid);
+  {
+    struct vfs_node *mi = procfs_mkchild(d, "mountinfo", VFS_DEVICE, r_mountinfo, pid);
+    if (mi)
+      mi->inode->poll_cb = mountinfo_poll;
+  }
   procfs_mkchild(d, "mounts", VFS_DEVICE, r_mounts, pid);
   procfs_mkchild(d, "environ", VFS_DEVICE, r_pid_environ, pid);
   procfs_mkchild(d, "statm", VFS_DEVICE, r_pid_statm, pid);

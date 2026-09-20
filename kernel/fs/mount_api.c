@@ -386,8 +386,21 @@ int vfs_fsconfig(int fd, u32 cmd, const char *key, const char *value,
     return rc;
   case FSCONFIG_SET_BINARY:
   case FSCONFIG_SET_FD:
-    mount_api_trace("fsconfig-unsupported", cmd, key, -EOPNOTSUPP);
-    return -EOPNOTSUPP;
+    /* No filesystem here takes a blob or a descriptor as a parameter value, so
+     * every key arriving this way is a key that does not exist -- and Linux
+     * answers EINVAL for a parameter a filesystem does not have, not
+     * EOPNOTSUPP.
+     *
+     * The difference is not cosmetic. systemd probes with a deliberately
+     * absent option, `adefinitelynotexistingmountoption`, to find out whether
+     * the kernel validates option names at all; EOPNOTSUPP tells it the whole
+     * mechanism is missing rather than that the one option is, and it then
+     * draws the wrong conclusion about every option after that. */
+    rc = fsctx_apply_option(ctx, key, 0);
+    if (rc == 0)
+      rc = -EINVAL; /* a known key still cannot take this kind of value */
+    mount_api_trace("fsconfig-novalue", cmd, key, rc);
+    return rc;
   default:
     mount_api_trace("fsconfig-unknown", cmd, key, -EINVAL);
     return -EINVAL;
@@ -566,6 +579,12 @@ int vfs_mount_setattr_fd(int fd, const char *path, u32 flags,
       return -EINVAL;
     int rc = vfs_detached_set_attr(m->detached_id, attr->attr_set,
                                    attr->attr_clr);
+    if (bootinfo_has_flag("b1nix.trace-mount")) {
+      char line[128];
+      snprintf(line, sizeof(line), "mount-api: setattr detached id=%d -> %d",
+               m->detached_id, rc);
+      klog_info(line);
+    }
     if (rc < 0)
       return rc;
     if (attr->propagation) {

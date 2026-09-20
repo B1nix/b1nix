@@ -76,9 +76,18 @@ ship to.
 - [ ] `partial` `/boot` is not mounted in the running system: the ESP is in
   `/etc/fstab` by label and the mount does not happen, so the boot-counting
   state is invisible to userspace and no boot is ever marked good.
-- [ ] `planned` systemd's own `tmp.mount`, `run-lock.mount` and its mount
-  namespacing still fail, although `mount(8)` with the same options now works
-  — the remaining refusal is on a path systemd takes and `mount(8)` does not.
+- [x] `done` systemd's mount namespacing works: `vfs_set_propagation` and
+  `vfs_remount` match a mount by its node as well as by its path, which is what
+  a bind into a prepared root needs. `systemd-udevd`, `systemd-logind`,
+  `systemd-journald`, `dbus-broker` and `systemd-sysctl` all start now — the
+  failed-unit list went from twelve to four.
+- [ ] `partial` Four units still fail, each with its own cause, all listed in
+  [../kernel/abi-gaps.md](../kernel/abi-gaps.md): `tmp.mount` and
+  `run-lock.mount` (the mount succeeds but is reported under the wrong path),
+  `e2scrub_reap` (`sched_setscheduler`) and `systemd-sysusers`.
+- [x] `initial` The repository reaches the guest over 9p — mounted by tag with
+  no options, which is all this kernel's 9p takes. `apt-get update` against it
+  still fails on a `symlink()` and on apt's `store:` method.
 - [ ] `planned` Boot counting as designed in
   [boot-counting.md](boot-counting.md): the initramfs hook decrements, a unit
   marks the boot good, the postinst seeds and regenerates `limine.conf`.
