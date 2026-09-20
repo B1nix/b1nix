@@ -1,0 +1,24 @@
+#!/bin/sh
+# b1nix-kernel-@RELEASE@ postrm: take this release's initramfs and boot entry
+# away once the kernel itself is gone.
+set -e
+
+RELEASE="@RELEASE@"
+ESP="${ESP:-/boot}"
+
+case "$1" in
+remove | purge)
+	rm -f "$ESP/initrd-$RELEASE"
+	if [ -x /usr/sbin/b1nix-update-bootloader ]; then
+		# Regenerating from what is left on the ESP is what drops the entry
+		# and, if this was the default, promotes another kernel.
+		/usr/sbin/b1nix-update-bootloader ||
+			echo "b1nix-kernel: updating the boot configuration failed" >&2
+	fi
+	;;
+upgrade | failed-upgrade | abort-install | abort-upgrade | disappear) ;;
+esac
+
+#DEBHELPER#
+
+exit 0

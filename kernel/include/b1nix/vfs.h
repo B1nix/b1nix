@@ -15,6 +15,11 @@
 #define MS_NODEV 4
 #define MS_NOEXEC 8
 #define MS_REMOUNT 32
+/* The atime policy bits, with Linux's values. They belong to the VFS rather
+ * than to any filesystem, so every mount path has to take them: refusing one
+ * of them fails the mount, and Debian's tmpfs units pass them by name. */
+#define MS_NOATIME 1024
+#define MS_NODIRATIME 2048
 #define MS_BIND 4096
 /* Move an existing mount to another mountpoint, without unmounting it. */
 #define MS_MOVE 8192

@@ -1,0 +1,36 @@
+#!/bin/sh
+# b1nix-kernel-@RELEASE@ postinst: build the initramfs for this release and
+# rewrite the boot configuration so the new kernel is the default while the
+# previous one stays installed and bootable.
+set -e
+
+RELEASE="@RELEASE@"
+ESP="${ESP:-/boot}"
+
+case "$1" in
+configure)
+	if command -v mkinitramfs >/dev/null 2>&1; then
+		# mkinitramfs, not update-initramfs: the generated file is named
+		# initrd-<release> to match the Limine entry, and update-initramfs
+		# insists on Debian's own initrd.img-<version> naming.
+		if [ -d "/lib/modules/$RELEASE" ] || [ -d "/usr/lib/modules/$RELEASE" ]; then
+			mkinitramfs -o "$ESP/initrd-$RELEASE" "$RELEASE" ||
+				echo "b1nix-kernel: building the initramfs for $RELEASE failed" >&2
+		else
+			echo "b1nix-kernel: no module directory for $RELEASE; skipping the initramfs" >&2
+		fi
+	else
+		echo "b1nix-kernel: mkinitramfs not found; no initramfs was built" >&2
+	fi
+
+	if [ -x /usr/sbin/b1nix-update-bootloader ]; then
+		/usr/sbin/b1nix-update-bootloader ||
+			echo "b1nix-kernel: updating the boot configuration failed" >&2
+	fi
+	;;
+abort-upgrade | abort-remove | abort-deconfigure) ;;
+esac
+
+#DEBHELPER#
+
+exit 0

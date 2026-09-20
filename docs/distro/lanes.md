@@ -16,6 +16,7 @@ stage* failed, and they must never pass by accident.
 
 | Lane | What it proves | Phase |
 |---|---|---|
+| `PKG-SMOKE` | the overlay packages build, publish and install into a clean Debian | A |
 | `DISTRO-SMOKE` | the installed image boots to a systemd target, apt works, the two-kernel fallback works | B |
 | `INSTALL-SMOKE` | Calamares installs onto a blank disk, and the installed disk boots | D |
 | `DESKTOP-SMOKE` | login, browser, sound, and suspend once it exists | D |

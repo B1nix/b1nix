@@ -1,0 +1,59 @@
+#!/bin/sh
+# Mark the running kernel's boot entry as good: it reached a usable system, so
+# it stops spending tries and becomes the fallback for whatever is installed
+# next.
+#
+# Run by b1nix-boot-good.service once the system is up. Failing to write is
+# never a boot failure -- it logs and exits 0, because a full or read-only ESP
+# must not turn a working machine into a failing unit.
+set -u
+
+ESP="${ESP:-/boot}"
+STATE="$ESP/b1nix/boot-state"
+SETTLE="${SETTLE:-30}"
+
+log() { printf 'b1nix-boot-good: %s\n' "$*"; }
+
+entry=""
+for arg in $(cat /proc/cmdline 2>/dev/null); do
+	case "$arg" in
+	b1nix.entry=*) entry="${arg#b1nix.entry=}" ;;
+	b1nix.no-boot-count) log "counting disabled on the command line"; exit 0 ;;
+	esac
+done
+[ -n "$entry" ] || { log "no b1nix.entry= on the command line -- nothing to mark"; exit 0; }
+[ -f "$STATE" ] || { log "no state file at $STATE -- nothing to mark"; exit 0; }
+
+# The desktop appearing and freezing a second later is not a good boot. Waiting
+# is cheap: nothing else depends on this unit.
+[ "$SETTLE" -le 0 ] || sleep "$SETTLE"
+
+tries=$(sed -n 's/.*\btries=\([0-9]*\).*/\1/p' "$STATE" | head -1)
+[ -n "$tries" ] || tries=3
+
+tmp="$STATE.new"
+if awk -v r="$entry" -v t="$tries" '
+	$1 == "entry=" r {
+		printf "entry=%s tries=%s good=1\n", r, t
+		seen = 1
+		next
+	}
+	{ print }
+	END { if (!seen) printf "entry=%s tries=%s good=1\n", r, t }
+' "$STATE" >"$tmp" 2>/dev/null; then
+	sed -i "s/^default=.*/default=$entry/" "$tmp" 2>/dev/null || true
+	mv "$tmp" "$STATE" 2>/dev/null || { log "could not replace $STATE"; rm -f "$tmp"; exit 0; }
+else
+	log "could not write $tmp -- leaving the state alone"
+	rm -f "$tmp" 2>/dev/null || true
+	exit 0
+fi
+
+rm -f "$ESP/b1nix/fallback-pending" 2>/dev/null || true
+sync 2>/dev/null || true
+log "entry $entry marked good"
+
+# A fallback that happened earlier left the configuration pointing at whatever
+# Limine wrote last; regenerating it now puts the good kernel first again.
+[ ! -x /usr/sbin/b1nix-update-bootloader ] || /usr/sbin/b1nix-update-bootloader || true
+exit 0

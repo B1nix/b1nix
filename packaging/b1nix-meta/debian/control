@@ -1,0 +1,67 @@
+Source: b1nix-meta
+Section: admin
+Priority: optional
+Maintainer: b1nix maintainers <maintainers@b1nix.invalid>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://github.com/B1nix/b1nix
+Rules-Requires-Root: no
+
+Package: b1nix-base-files
+Architecture: all
+Priority: required
+Depends: ${misc:Depends}
+Description: b1nix system identification and apt configuration
+ What turns an installed Debian into b1nix: /etc/os-release, the apt source for
+ the b1nix overlay and its signing key, and the apt preference that keeps
+ Debian's own linux-image packages from being pulled in by a dependency.
+ .
+ The overlay's URL lives here and nowhere else, so that moving it later is a
+ package update rather than an instruction every user has to follow by hand.
+
+Package: b1nix-desktop
+Architecture: all
+Depends: ${misc:Depends},
+         plasma-desktop,
+         plasma-workspace-wayland,
+         sddm,
+         pipewire,
+         pipewire-pulse,
+         wireplumber,
+         network-manager,
+         plasma-nm,
+         xdg-desktop-portal-kde,
+         konsole,
+         fonts-dejavu,
+         fonts-noto-core,
+         fonts-noto-color-emoji,
+         b1nix-base-files
+Recommends: dolphin,
+            kate,
+            firefox-esr,
+            gwenview,
+            ark,
+            spectacle,
+            plasma-systemmonitor,
+            cups,
+            system-config-printer
+Suggests: chromium, libreoffice, kdenlive
+Description: b1nix desktop (metapackage)
+ Plasma on Wayland with the applications a desktop needs and nothing more.
+ This is a dependency list, not a collection of files.
+ .
+ Depends is what a desktop cannot boot without; Recommends is expected but
+ removable, and the system still works when it is gone; Suggests is named so
+ that it can be found, and is never installed by default.
+
+Package: b1nix-tools
+Architecture: all
+Depends: ${misc:Depends}, pciutils, usbutils
+Description: diagnostic tools for b1nix
+ b1nix-report collects everything a bug report needs -- release, kernel and its
+ build id, CPU, PCI and USB identifiers, which drivers bound, failed units and
+ the boot log -- into one plain-text file that the reporter can read before
+ sending it.
+ .
+ The same file feeds the hardware compatibility list, so its header format is
+ stable across releases.
