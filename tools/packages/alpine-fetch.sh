@@ -4,7 +4,7 @@
 # Most of tools/ports/ rebuilds, from source, on every fresh checkout, software
 # that Alpine already builds for exactly this target: musl, x86_64, dynamically
 # linked. Fetching their binary costs a download and removes both the build
-# script and the obligation to keep it working (docs/platforms.md).
+# script and the obligation to keep it working (docs/kernel/platforms.md).
 #
 # This is the host-side, image-build-time path, and it pins instead of verifying
 # signatures:

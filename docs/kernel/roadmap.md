@@ -1,12 +1,20 @@
-# Roadmap
+# Kernel roadmap
 
 Status: `[x]` completed · `initial` usable first implementation · `partial`
 incomplete or limited · `planned` not implemented · `deferred` postponed ·
 `wontfix` declined.
 
-b1nix is a kernel. Userspace comes from existing distributions: Alpine (the
-default image) and Debian (the glibc ABI lane). The repository keeps the kernel,
-its tests, the image and test scripts, and `b1cc`. See M121.
+This is the kernel's roadmap. The distribution built on it has its own, in
+[../distro/roadmap.md](../distro/roadmap.md); its phases name the kernel
+milestones they block on, and M127 is ahead of M125 because systemd's model
+rests on cgroup v2.
+
+Userspace is not written here. It comes from existing distributions — Debian
+trixie for the distribution itself and the glibc ABI lane, Alpine for the fast
+smoke image. The repository keeps the kernel, its tests, the image and test
+scripts, `b1cc`, and the distribution's packaging. See M121 for how the
+userspace of this tree was dropped, and the distribution roadmap for what
+replaced it.
 
 AArch64 is a second target of this same kernel, not a milestone: each gap
 belongs to the milestone that owns the mechanism.
@@ -19,7 +27,8 @@ userspace), [memory-and-scheduling.md](memory-and-scheduling.md),
 [networking.md](networking.md),
 [isolation-and-security.md](isolation-and-security.md) and
 [drivers-and-graphics.md](drivers-and-graphics.md). Build rules are in
-[build-conventions.md](build-conventions.md).
+[build-conventions.md](build-conventions.md). Version numbers, and which one
+answers which question, are in [../versioning.md](../versioning.md).
 
 ## Closed milestones
 
@@ -191,6 +200,9 @@ Per-call state: [processes-and-system-calls.md](processes-and-system-calls.md).
 - [ ] `planned` Replace ad-hoc profiling hooks where `perf` now answers the same question.
 
 ## M127: Resource control
+
+Ahead of M125 and M126: it blocks phase C of
+[../distro/roadmap.md](../distro/roadmap.md), and no ISO ships before it.
 
 - [ ] `planned` cgroup v2 controllers: memory (limits, accounting per cgroup), cpu (weights on the stride scheduler, quotas), io, pids.
 - [ ] `planned` OOM killer that picks by cgroup and `oom_score_adj`, with an honest `memory.events`; PSI (`/proc/pressure/*`).

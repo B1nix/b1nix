@@ -1691,7 +1691,7 @@ $(PAM_LIB): $(PKG_DEPS)
 # same musl and the same architecture, and taking it deletes a build script
 # along with the duty to keep it building. tools/packages/alpine-fetch.sh pins
 # every package's sha256 in tools/packages/alpine.lock; the package model is
-# summarised in docs/platforms.md.
+# summarised in docs/kernel/platforms.md.
 #
 # Both shapes come down: libz.so.1 is what binaries link and what the image
 # carries, and libz.a is still wanted by the ports that have not moved yet
@@ -2074,7 +2074,7 @@ SMOKE_CMDLINE_sys=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.
 # has to be baked into an image of its own, because the cmdline comes from the
 # ISO's bootloader config and nothing at launch can override it. aarch64 passes
 # it as DTB bootargs and needs no second image; giving the lane one here is what
-# makes rule 2 of docs/build-conventions.md ("a lane names itself") true on
+# makes rule 2 of docs/kernel/build-conventions.md ("a lane names itself") true on
 # both arches. Without it the lane booted with b1nix.smoke=sys, ran the sys half
 # a second time, and the 91 network checks were run by nobody.
 SMOKE_CMDLINE_sysnet=$(SMOKE_EXTRA_CMDLINE) b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=sysnet
@@ -2824,7 +2824,7 @@ endif
 	@# Same skip as the packaged-library loop above, for the same reason: a
 	@# readelf spawn per file, several hundred files, an answer that changes
 	@# only when the staged libraries do. One convention, applied everywhere it
-	@# applies -- see docs/build-conventions.md.
+	@# applies -- see docs/kernel/build-conventions.md.
 	@stamp="$(BUILD_DIR)/.soname-copies.stamp"; \
 	newest=$$(ls -t $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.* 2>/dev/null | head -1); \
 	if [ -n "$$newest" ] && [ -f "$$stamp" ] && [ ! "$$newest" -nt "$$stamp" ]; then \
@@ -2985,7 +2985,7 @@ endif
 	@# Same skip as the packaged-library loop above, for the same reason: a
 	@# readelf spawn per file, several hundred files, an answer that changes
 	@# only when the staged libraries do. One convention, applied everywhere it
-	@# applies -- see docs/build-conventions.md.
+	@# applies -- see docs/kernel/build-conventions.md.
 	@stamp="$(BUILD_DIR)/.soname-prune.stamp"; \
 	newest=$$(ls -t $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.* 2>/dev/null | head -1); \
 	if [ -n "$$newest" ] && [ -f "$$stamp" ] && [ ! "$$newest" -nt "$$stamp" ]; then \

@@ -11,14 +11,14 @@ unmodified from Linux through an in-tree linuxkpi layer.
 > Interfaces, disk formats, security behavior and build workflows may change.
 
 Implementation status per milestone is tracked in
-[docs/roadmap.md](docs/roadmap.md).
+[docs/kernel/roadmap.md](docs/kernel/roadmap.md), and the distribution's in [docs/distro/roadmap.md](docs/distro/roadmap.md); [docs/README.md](docs/README.md) indexes both.
 
 ## Architectures
 
 | `ARCH=` | Status |
 | --- | --- |
 | `x86_64` (default) | Primary target: QEMU (KVM) and real hardware |
-| `aarch64` | Second target of the same kernel: QEMU `virt`, Raspberry Pi 4, Sony Xperia 5 ([tools/boards/sony-xperia-5](tools/boards/sony-xperia-5/README.md)); gaps in [docs/platforms.md](docs/platforms.md) |
+| `aarch64` | Second target of the same kernel: QEMU `virt`, Raspberry Pi 4, Sony Xperia 5 ([tools/boards/sony-xperia-5](tools/boards/sony-xperia-5/README.md)); gaps in [docs/kernel/platforms.md](docs/kernel/platforms.md) |
 
 ## Host Requirements
 
